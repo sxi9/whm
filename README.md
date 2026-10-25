@@ -6,7 +6,9 @@ server** — Linux users and quotas, Apache/NGINX and PHP-FPM, BIND DNS, Exim/Do
 MySQL/MariaDB, FTP, SSL/ACME, systemd services, IPs, security, backups, transfers and
 resellers — built on Node.js 22, Express, React and SQLite.
 
-- Design of record: [`BLUEPRINT.md`](BLUEPRINT.md) · Progress: [`CHECKLIST.md`](CHECKLIST.md) · Conventions: [`CLAUDE.md`](CLAUDE.md)
+- Design of record: [`BLUEPRINT.md`](BLUEPRINT.md) · Progress: [`CHECKLIST.md`](CHECKLIST.md) · Conventions: [`CLAUDE.md`](CLAUDE.md) · Screenshots: [`docs/screenshots/`](docs/screenshots/README.md)
+
+![WHM home dashboard](docs/screenshots/02-dashboard.png)
 
 ## Architecture in one paragraph
 
