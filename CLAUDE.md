@@ -141,6 +141,12 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 - **Next:** finish vitest suites, then fan out P2 categories (Account Information/Functions
   remainder, DNS, Database Services, Service Configuration, Server Status remainder) with
   real `web`/`dns`/`db`/`mail` agent ops; add pages to `client/src/pages/registry.js`.
+- **Deploy + tests:** `scripts/install.sh` (prod install, `--upgrade`), `deploy/*.service`
+  + config templates, `scripts/whm-cli.js` (status / reset-password / create-admin /
+  unlock-ip), `e2e/ui-check.cjs` (Playwright: login → create account → pages; run with
+  `BASE=… PASSWORD=… node e2e/ui-check.cjs` against a served build). vitest: server 93,
+  agent 42. Phase 2 category build runs as a 3-wave workflow (see task #4); after each
+  wave: run both suites + vite build + e2e, update CHECKLIST.md, commit, push, next wave.
 - **Frontend rules learned:** import icons by name (never `import * as icons`), resolve
   category icons through `client/src/icons.js`; wrap raw tables in `.table-wrap`; JSX
   string attributes do not interpolate — use `{`template`}`.

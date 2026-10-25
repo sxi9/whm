@@ -63,6 +63,7 @@ cp .env.example .env         # monolithic mode, ./data, port 2086
 npm run dev                  # API with --watch on :2086 + Vite dev server on :5173 (proxies /api)
 npm test                     # vitest: server + agent suites
 npm run build && WHM_SERVE_CLIENT=true npm start    # production-style single process
+BASE=http://127.0.0.1:2086 PASSWORD='<root password>' node e2e/ui-check.cjs   # browser end-to-end check (needs playwright)
 ```
 
 In development the API runs in **monolithic mode** (the op catalog executes in-process, so
