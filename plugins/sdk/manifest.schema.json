@@ -1,0 +1,774 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://whm.local/schemas/plugin-manifest.schema.json",
+  "title": "WHM plugin manifest (plugin.json)",
+  "description": "Binding contract for WHM plugin manifests. Generated from plugins/sdk/validate-manifest.js constants; the hand-written validator is authoritative for cross-reference rules (sidebar routes must match pages, cron jobs must be declared, schedule \"setting:<key>\" must point at a cron-typed setting, scope-dependent sections require their permission).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "name",
+    "version",
+    "description",
+    "author",
+    "license",
+    "engines",
+    "main",
+    "permissions"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string",
+      "description": "Reverse-DNS plugin id with at least three segments, e.g. \"net.example.hello\".",
+      "pattern": "^[a-z][a-z0-9-]*(\\.[a-z][a-z0-9-]*){2,}$",
+      "maxLength": 128
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "version": {
+      "$ref": "#/$defs/semver"
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "author": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "pattern": "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://"
+        }
+      }
+    },
+    "license": {
+      "type": "string",
+      "minLength": 1,
+      "description": "SPDX identifier or \"proprietary\"."
+    },
+    "homepage": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https?://"
+    },
+    "engines": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "whm"
+      ],
+      "properties": {
+        "whm": {
+          "$ref": "#/$defs/semverRange",
+          "description": "Host versions this plugin supports. Its lower bound is the minimum host version."
+        },
+        "node": {
+          "$ref": "#/$defs/semverRange"
+        }
+      }
+    },
+    "main": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$))[A-Za-z0-9_./-]+\\.c?js$",
+      "description": "Entry module, relative to the plugin directory."
+    },
+    "permissions": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/permission"
+      },
+      "description": "Every scope the plugin will ever use. The host gates each ctx call against this list."
+    },
+    "hooks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/hook"
+      }
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sidebar": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/sidebarEntry"
+          }
+        },
+        "pages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/page"
+          }
+        }
+      }
+    },
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fields"
+      ],
+      "properties": {
+        "groups": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "label"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "fields": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/settingField"
+          }
+        }
+      }
+    },
+    "jobs": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z][a-zA-Z0-9_-]*$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/job"
+      }
+    },
+    "cron": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/cronEntry"
+      }
+    },
+    "isolation": {
+      "type": "string",
+      "enum": [
+        "in-process",
+        "process"
+      ],
+      "default": "in-process"
+    },
+    "i18n": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "default"
+      ],
+      "properties": {
+        "default": {
+          "type": "string",
+          "pattern": "^[a-z]{2}(-[A-Z]{2})?$"
+        },
+        "dir": {
+          "type": "string",
+          "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$))[A-Za-z0-9_./-]+$"
+        }
+      }
+    },
+    "keywords": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 32
+      }
+    }
+  },
+  "$defs": {
+    "semver": {
+      "type": "string",
+      "pattern": "^v?(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"
+    },
+    "semverRange": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Subset of npm range grammar: *, x, 1.x, ^1.2.3, ~1.2, >=1.0.0 <2.0.0, 1.0.0 - 2.0.0, A || B.",
+      "pattern": "^[0-9A-Za-z.*^~<>=|\\s+-]+$"
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "Server Configuration",
+        "Support",
+        "Networking Setup",
+        "Security Center",
+        "Server Contacts",
+        "Resellers",
+        "Service Configuration",
+        "Locales",
+        "Backup",
+        "Clusters",
+        "System Reboot",
+        "Server Status",
+        "Account Information",
+        "Account Functions",
+        "Multi Account Functions",
+        "Transfers",
+        "Themes",
+        "Packages",
+        "DNS Functions",
+        "Database Services",
+        "IP Functions",
+        "Software",
+        "Email",
+        "System Health",
+        "cPanel",
+        "SSL/TLS",
+        "Market",
+        "Restart Services",
+        "Development",
+        "Plugins"
+      ],
+      "description": "One of the 30 WHM sidebar categories (BLUEPRINT.md §13)."
+    },
+    "fixedPermission": {
+      "type": "string",
+      "enum": [
+        "accounts:read",
+        "accounts:write",
+        "packages:read",
+        "dns:read",
+        "backups:read",
+        "backups:write",
+        "backups:restore",
+        "settings:own",
+        "store:own",
+        "schedule",
+        "jobs",
+        "events:emit",
+        "ui:sidebar",
+        "api:routes",
+        "contacts:notify",
+        "system:read",
+        "audit:write",
+        "crypto:own",
+        "fs:own"
+      ]
+    },
+    "agentOpPermission": {
+      "type": "string",
+      "pattern": "^agent:op:(user|web|dns|mail|db|ftp|svc|net|ssl|sec|sys|fs)\\.[a-z][a-zA-Z0-9]*(\\.[a-z][a-zA-Z0-9]*)*$",
+      "description": "agent:op:<family.op> — explicit, no wildcards."
+    },
+    "netOutboundPermission": {
+      "type": "string",
+      "pattern": "^net:outbound:(\\*\\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(:([1-9]\\d{0,4}))?$",
+      "description": "net:outbound:<host>[:port]; \"*.example.com\" matches sub-domains only."
+    },
+    "permission": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/fixedPermission"
+        },
+        {
+          "$ref": "#/$defs/agentOpPermission"
+        },
+        {
+          "$ref": "#/$defs/netOutboundPermission"
+        }
+      ]
+    },
+    "hostEvent": {
+      "type": "string",
+      "enum": [
+        "account.created",
+        "account.modified",
+        "account.suspended",
+        "account.unsuspended",
+        "account.terminated",
+        "package.changed",
+        "backup.started",
+        "backup.completed",
+        "backup.failed",
+        "backup.restored",
+        "dns.zone.changed",
+        "ssl.issued",
+        "ssl.expiring",
+        "login.failed",
+        "login.succeeded",
+        "service.restarted",
+        "service.failed",
+        "plugin.installed",
+        "plugin.enabled",
+        "plugin.disabled",
+        "plugin.uninstalled",
+        "panel.started"
+      ]
+    },
+    "pluginEvent": {
+      "type": "string",
+      "pattern": "^([a-z][a-z0-9-]*\\.){3,}[a-z][a-z0-9_]*$",
+      "description": "\"<pluginId>.<event>\" — events emitted by plugins."
+    },
+    "hookStage": {
+      "type": "string",
+      "enum": [
+        "pre",
+        "post"
+      ],
+      "default": "post"
+    },
+    "hook": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event",
+        "handler"
+      ],
+      "properties": {
+        "event": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/hostEvent"
+            },
+            {
+              "$ref": "#/$defs/pluginEvent"
+            }
+          ]
+        },
+        "stage": {
+          "$ref": "#/$defs/hookStage"
+        },
+        "handler": {
+          "type": "string",
+          "pattern": "^[a-zA-Z_][a-zA-Z0-9_]*$",
+          "description": "Name of a function exported in module.exports.hooks."
+        }
+      }
+    },
+    "sidebarEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "category",
+        "label",
+        "route",
+        "icon"
+      ],
+      "properties": {
+        "category": {
+          "$ref": "#/$defs/category"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "route": {
+          "$ref": "#/$defs/uiRoute"
+        },
+        "icon": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$",
+          "description": "lucide icon name (kebab-case)."
+        }
+      }
+    },
+    "uiRoute": {
+      "type": "string",
+      "pattern": "^\\/(?:[a-z0-9][a-z0-9_-]*(?:\\/[a-z0-9][a-z0-9_-]*)*)?$",
+      "description": "Page route relative to /plugins/<id>."
+    },
+    "apiRoute": {
+      "type": "string",
+      "pattern": "^\\/(?:[A-Za-z0-9_.:-]+(?:\\/[A-Za-z0-9_.:-]+)*)?$",
+      "description": "Route path on the plugin router (relative to /api/plugins/<id>)."
+    },
+    "pageKind": {
+      "type": "string",
+      "enum": [
+        "settings",
+        "table",
+        "form",
+        "action",
+        "markdown",
+        "html"
+      ]
+    },
+    "page": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "route",
+        "title",
+        "kind"
+      ],
+      "properties": {
+        "route": {
+          "$ref": "#/$defs/uiRoute"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1
+        },
+        "kind": {
+          "$ref": "#/$defs/pageKind"
+        },
+        "icon": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]*$"
+        },
+        "description": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/apiRoute"
+        },
+        "columns": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "key",
+              "label"
+            ],
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/settingField"
+          }
+        },
+        "job": {
+          "type": "string",
+          "pattern": "^[a-z][a-zA-Z0-9_-]*$"
+        },
+        "confirm": {
+          "type": "boolean"
+        },
+        "content": {
+          "type": "string"
+        },
+        "file": {
+          "type": "string",
+          "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$))[A-Za-z0-9_./-]+$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "table"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "source"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "form"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "source",
+              "fields"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "action"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "job"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "markdown"
+              }
+            }
+          },
+          "then": {
+            "anyOf": [
+              {
+                "required": [
+                  "content"
+                ]
+              },
+              {
+                "required": [
+                  "file"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "html"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "file"
+            ]
+          }
+        }
+      ]
+    },
+    "settingType": {
+      "type": "string",
+      "enum": [
+        "text",
+        "number",
+        "select",
+        "multiselect",
+        "toggle",
+        "password",
+        "cron",
+        "textarea"
+      ]
+    },
+    "settingField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "type",
+        "label"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z][a-zA-Z0-9_]*$"
+        },
+        "type": {
+          "$ref": "#/$defs/settingType"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "help": {
+          "type": "string"
+        },
+        "default": {
+          "description": "Must validate against the field type. Forbidden for password fields."
+        },
+        "required": {
+          "type": "boolean",
+          "default": false
+        },
+        "group": {
+          "type": "string"
+        },
+        "options": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "value",
+              "label"
+            ],
+            "properties": {
+              "value": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        "min": {
+          "type": "number"
+        },
+        "max": {
+          "type": "number"
+        },
+        "integer": {
+          "type": "boolean"
+        },
+        "minLength": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maxLength": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pattern": {
+          "type": "string",
+          "format": "regex"
+        },
+        "placeholder": {
+          "type": "string"
+        },
+        "secret": {
+          "type": "boolean",
+          "description": "Stored encrypted and masked in the UI (password fields are always secret)."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "enum": [
+                  "select",
+                  "multiselect"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "options"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "options"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "password"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "default"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "label"
+      ],
+      "properties": {
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string"
+        },
+        "timeoutSec": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400,
+          "default": 3600
+        },
+        "cancellable": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "cronEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "job",
+        "schedule"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z][a-zA-Z0-9_-]*$"
+        },
+        "job": {
+          "type": "string",
+          "pattern": "^[a-z][a-zA-Z0-9_-]*$",
+          "description": "A key of manifest.jobs."
+        },
+        "schedule": {
+          "type": "string",
+          "description": "A 5-field cron expression / @alias, or \"setting:<key>\" naming a cron-typed setting.",
+          "pattern": "^(setting:[a-z][a-zA-Z0-9_]*|@(yearly|annually|monthly|weekly|daily|midnight|hourly)|\\S+\\s+\\S+\\s+\\S+\\s+\\S+\\s+\\S+)$"
+        },
+        "params": {
+          "type": "object"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    }
+  }
+}
