@@ -47,7 +47,7 @@ export async function runOp(name, args, ctx) {
 export const arg = {
   username: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/),
   domain: z.string().regex(/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/),
-  hostname: z.string().regex(/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9-]{1,63}$/),
+  hostname: z.string().regex(/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/),
   unit: z.string().regex(/^[A-Za-z0-9@._-]{1,80}$/),
   ipv4: z.string().ip({ version: 'v4' }),
   ipv6: z.string().ip({ version: 'v6' }),

@@ -7,7 +7,7 @@ import { unprocessable } from './errors.js';
 export const fields = {
   username: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/, 'Lowercase letters, digits, "_" or "-"; must start with a letter; max 32 chars'),
   domain: z.string().toLowerCase().regex(/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/, 'Must be a valid fully-qualified domain name'),
-  hostname: z.string().toLowerCase().regex(/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{1,63}$/, 'Must be a valid hostname'),
+  hostname: z.string().toLowerCase().regex(/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/, 'Must be a valid hostname'),
   ipv4: z.string().ip({ version: 'v4' }),
   ipv6: z.string().ip({ version: 'v6' }),
   ip: z.string().ip(),

@@ -46,7 +46,7 @@ export async function bootstrap(overrides = {}) {
   ctx.system = createSystemService(ctx);
   ctx.serviceManager = createServiceManager(ctx);
   ctx.audit = createAuditService(ctx);
-  ctx.app = createApp(ctx);
+  ctx.app = await createApp(ctx);
 
   try {
     await agent.ping();

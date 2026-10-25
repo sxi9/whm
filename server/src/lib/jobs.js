@@ -50,6 +50,8 @@ export function createJobs({ db, logger, agent, concurrency = 2 }) {
       },
       progress(pct, message) {
         const p = Math.max(0, Math.min(100, Math.round(pct)));
+        job.progress = p;
+        job.message = message ?? null;
         stmts.progress.run(p, message ?? null, jobId);
         emit(jobId, { type: 'progress', progress: p, message: message ?? null });
       },
@@ -70,6 +72,7 @@ export function createJobs({ db, logger, agent, concurrency = 2 }) {
   }
 
   function tick() {
+    if (!timer) return;
     const free = concurrency - running.size;
     if (free <= 0) return;
     for (const { id } of stmts.nextQueued.all(free)) {
@@ -119,7 +122,7 @@ export function createJobs({ db, logger, agent, concurrency = 2 }) {
       timer.unref();
       tick();
     },
-    stop() { clearInterval(timer); },
+    stop() { clearInterval(timer); timer = null; },
     runningCount: () => running.size,
   };
 }

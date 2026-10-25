@@ -70,6 +70,31 @@ verified developers, and bundled plugins are part of the product (deferred to Ph
 - Commits: conventional prefixes (`feat:`, `fix:`, `docs:`, `wip:`, `test:`, `chore:`).
   Never put model names in commit messages, PR text, or code comments.
 
+## Category module contract (how every one of the 30 categories plugs in)
+
+Nothing is registered by hand in shared files. Adding a category = adding files:
+
+| Piece | Where | Discovered by |
+|---|---|---|
+| Agent ops (privileged) | `agent/src/ops/<family>.js` — `defineOp('family.op', { schema, run, destructive })`, import `defineOp, arg, OpError` from `./registry.js`, `exec`/`hasBinary` from `../exec.js` | `agent/src/ops/index.js` auto-imports every file in the dir |
+| DB tables | `server/src/db/migrations/0NN_<category-slug>.sql` (number assigned per category; `CREATE TABLE IF NOT EXISTS`, `INSERT OR IGNORE` for defaults) | migration runner at boot |
+| Service | `server/src/services/<category-slug>.js` → `createXService(ctx)`; attach in register as `ctx.<shortName>`; use other services via `ctx.<name>` **inside methods only** | — |
+| Routes | `server/src/routes/categories/<category-slug>.js` → `export async function register(ctx) { …; return { path: '/<prefix>', router } }` (see that dir's README) | `routes/index.js` auto-mounts after auth |
+| Jobs / schedules / capabilities | inside `register(ctx)`: `ctx.jobs.register(type, handler)`, `ctx.scheduler.ensure(name, cron, type)`, `ctx.capabilities.register(cap, { binaries, required })` | — |
+| Pages | `client/src/pages/fn/<category-slug>/<function-slug>.jsx` default-exporting a component `({ fn })`; shared UI in `client/src/pages/<domain>/` | `pages/registry.js` via `import.meta.glob` |
+| Tests | `server/test/<category-slug>.test.js` (vitest + supertest, boot via `bootstrap()` with a mock agent), `agent/test/<family>.test.js` (schemas reject injection; ops with side effects are never executed in tests) | `npm test` |
+
+Per-op agent rules: args schema must reject anything not strictly needed (use `arg.*`
+from `registry.js`); `exec(bin, argv[])` only; paths pass `ctx.assertAllowedPath()`; mark
+`destructive: true` on anything that deletes/stops; return structured results.
+Per-route rules: `requireRoot` for server-wide config and anything touching other
+accounts, `requireReseller` + ownership check in the service for account-scoped reads;
+long operations `202 { data: { job } }` via `ctx.jobs.enqueue`; `CapabilityError` when
+the daemon is missing. Function keys/labels come from `client/src/nav.js` — a category's
+list: `node --input-type=module -e "import {CATEGORIES} from './client/src/nav.js'; console.log(JSON.stringify(CATEGORIES.find(c=>c.slug==='dns-functions').functions.map(f=>[f.key,f.label,f.description]),null,1))"`.
+Never edit `CHECKLIST.md`, `nav.js`, `registry.js`, `routes/index.js`, `ops/index.js`,
+`app.js`, `index.js` or another category's files from a category task.
+
 ## Repository layout
 
 ```

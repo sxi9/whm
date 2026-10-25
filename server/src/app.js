@@ -14,7 +14,7 @@ import { createAudit } from './middleware/audit.js';
 import { errorHandler, notFoundHandler } from './middleware/error.js';
 import { apiRouter } from './routes/index.js';
 
-export function createApp(ctx) {
+export async function createApp(ctx) {
   const { config, db, logger, crypto: cryptoSvc } = ctx;
   const app = express();
   app.disable('x-powered-by');
@@ -65,7 +65,7 @@ export function createApp(ctx) {
   const audit = createAudit(ctx);
   ctx.auditRecord = audit.record;
   app.use('/api', audit.middleware);
-  app.use('/api', apiRouter(ctx));
+  app.use('/api', await apiRouter(ctx));
   app.use('/api', notFoundHandler);
 
   if (config.serveClient && fs.existsSync(path.join(config.clientDist, 'index.html'))) {

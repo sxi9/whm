@@ -72,6 +72,13 @@ export function createCapabilities({ agent, db, logger }) {
 
   return {
     refresh,
+    // Category modules declare the programs their feature needs; detection picks
+    // them up on the next refresh (boot refreshes after all modules register).
+    register(cap, { binaries, required }) {
+      CAPABILITY_BINARIES[cap] = binaries;
+      REQUIRED[cap] = required || binaries;
+      snapshot.at = 0;
+    },
     snapshot: () => snapshot,
     has: (cap) => Boolean(snapshot.capabilities[cap]?.installed),
     unitFor: (serviceName) => snapshot.units[serviceName] ?? null,

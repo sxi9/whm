@@ -38,11 +38,20 @@ export function createAudit({ db, logger }) {
   function middleware(req, res, next) {
     req.audit = (entry) => record(req, entry);
     if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && !req.path.startsWith('/auth/login')) {
+      // Express unwinds req.baseUrl and req.params before an error reaches the
+      // app-level error handler, so the matched route is captured when it is set.
+      let matched = null;
+      Object.defineProperty(req, 'route', {
+        configurable: true,
+        enumerable: true,
+        get: () => matched?.route,
+        set(route) { matched = { route, baseUrl: req.baseUrl, params: { ...req.params } }; },
+      });
       res.on('finish', () => {
-        const routePath = req.route?.path ?? req.path;
+        const routePath = matched?.route.path ?? req.path;
         record(req, {
-          action: `${req.method} ${req.baseUrl}${routePath === '/' ? '' : routePath}`,
-          target: Object.values(req.params || {}).join('/') || null,
+          action: `${req.method} ${matched?.baseUrl ?? req.baseUrl}${routePath === '/' ? '' : routePath}`,
+          target: Object.values(matched?.params ?? req.params ?? {}).join('/') || null,
           args: req.body && Object.keys(req.body).length ? req.body : null,
           result: res.statusCode < 400 ? 'ok' : `error:${res.statusCode}`,
         });
