@@ -15,6 +15,35 @@
 - **In progress:** Phase 2 wave 1 — ten categories being built in parallel by agents (Security Center, DNS Functions, Database Services, IP Functions, SSL/TLS, Email, Software, Service Configuration, Development, Locales), each with its agent op family, migration, service, routes, pages and tests, then adversarially verified. Waves 2 and 3 follow.
 - **Deferred to the end (user decision):** license server, plugin marketplace, plugin host, sample + automated-backup plugins (Phase 5).
 
+## Timeline (actual + estimated)
+
+Times are UTC on 2026-10-25/26. Estimates assume the build keeps running continuously
+with the current limit of **2 concurrent agents** (4-CPU container); every step is
+checkpointed to git, so an interrupted session resumes from `CLAUDE.md`/this file.
+Measured so far: a category builder takes ~35–45 min, each verification round ~10 min,
+a fix round ~15 min; most categories need one fix round.
+
+| Step | Status | Took / estimate | Done at / ETA |
+|---|---|---|---|
+| Blueprint (architecture + all 212 functions) | done | 15 min | 17:13 |
+| License-server design + plugin SDK reference code (paused run) | done | 40 min | 17:51 |
+| P0 Foundation (API, agent, DB, auth, jobs) + smoke test | done | ~1 h | 18:17 |
+| P1 Shell (UI, nav for 212 functions, 29 live pages, Playwright check) | done | 20 min | 18:36 |
+| Test suites (server 93, agent 42) + fixes | done | 25 min (background) | 18:48 |
+| Convention refactor, deploy (installer, systemd, CLI, README), e2e, screenshots | done | 25 min | 19:09 |
+| **P2 wave 1** — Security Center, DNS, Databases, IP, SSL/TLS, Email, Software, Service Configuration, Development, Locales (10 categories, op families) | running since 18:47 | ~6–7 h | ~01:30 (±1.5 h) |
+| Integrate wave 1 (suites, build, e2e, screenshots, checklist, push) | pending | 30 min | ~02:00 |
+| **P2 wave 2** — Account Functions completion (vhost/DNS/mail provisioning), Account Information, Multi Account, Resellers, Backup, Transfers, Server Status, System Health, Server Configuration, Networking, Contacts, Reboot (12) | pending | ~7–8 h | ~09:30 |
+| Integrate wave 2 | pending | 30 min | ~10:00 |
+| **P2 wave 3** — Clusters, Themes, Market, cPanel, Support, Plugins (6) | pending | ~3 h | ~13:00 |
+| Integrate wave 3 → **all 212 functions live** | pending | 30 min | ~13:30 |
+| **P5 deferred** — license server (`hub/license`), plugin host + marketplace (`hub/marketplace`, open dev registration with backend verification), `plugins/SDK.md`, sample plugin, automated-backup plugin | pending | ~5 h | ~18:30 |
+| **P6** — hardening pass, full e2e on a provisioned VM, Security Advisor rules, final docs, performance | pending | ~2.5 h | ~21:00 |
+| **Total remaining** | | **~25 h wall-clock** | |
+
+Faster option: verification can be cut to one reviewer and one fix round per category
+(~30% less time, less thorough). Not applied unless requested.
+
 ## Phases
 
 - [x] **Blueprint** — architecture, data model, security model, all 30 categories / 212 functions specified
