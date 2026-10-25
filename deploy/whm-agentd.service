@@ -1,0 +1,27 @@
+[Unit]
+Description=WHM privileged agent (allowlisted system operations over a Unix socket)
+Documentation=file:///opt/whm/BLUEPRINT.md
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=NODE_ENV=production
+Environment=WHM_AGENT_SOCKET=/run/whm-agent.sock
+Environment=WHM_AGENT_GROUP=whmpanel
+Environment=WHM_AGENT_CONFIG=/etc/whm/agent.conf
+WorkingDirectory=/opt/whm/agent
+ExecStart=/usr/bin/node /opt/whm/agent/src/index.js
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=20
+# The agent must manage users, home directories and daemon configs, so it keeps
+# full root privileges; its op catalog is the security boundary.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=whm-agentd
+
+[Install]
+WantedBy=multi-user.target

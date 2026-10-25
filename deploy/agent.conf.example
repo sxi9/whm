@@ -1,0 +1,4 @@
+{
+  "_comment": "whm-agentd configuration. Installed to /etc/whm/agent.conf. extraAllowedRoots widens the paths the agent may read/write beyond the built-in list in agent/src/lib.js (DEFAULT_ALLOWED_ROOTS). Keep it minimal.",
+  "extraAllowedRoots": []
+}

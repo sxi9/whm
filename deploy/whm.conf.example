@@ -1,0 +1,17 @@
+{
+  "_comment": "Panel configuration. Installed to /etc/whm/whm.conf by scripts/install.sh. Environment variables (see .env.example) override these keys.",
+  "host": "0.0.0.0",
+  "port": 2086,
+  "tlsPort": 2087,
+  "tlsCert": "/etc/whm/ssl/panel.crt",
+  "tlsKey": "/etc/whm/ssl/panel.key",
+  "dataDir": "/var/lib/whm",
+  "mode": "split",
+  "agentSocket": "/run/whm-agent.sock",
+  "serveClient": true,
+  "clientDist": "/opt/whm/client/dist",
+  "logLevel": "info",
+  "trustProxy": "loopback",
+  "sessionTtlMs": 28800000,
+  "loginRateLimit": { "windowMs": 900000, "max": 20 }
+}

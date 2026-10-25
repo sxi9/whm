@@ -1,0 +1,37 @@
+[Unit]
+Description=WHM control panel (API + web interface)
+Documentation=file:///opt/whm/BLUEPRINT.md
+After=network.target whm-agentd.service
+Requires=whm-agentd.service
+
+[Service]
+Type=simple
+User=whmpanel
+Group=whmpanel
+EnvironmentFile=/etc/whm/panel.env
+WorkingDirectory=/opt/whm/server
+ExecStart=/usr/bin/node /opt/whm/server/src/index.js
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=whm-panel
+
+# Hardening: the web tier never touches the system directly; it only talks to
+# whm-agentd over /run/whm-agent.sock, so it can be locked down tightly.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/whm /var/log/whm
+ReadOnlyPaths=/etc/whm /opt/whm
+
+[Install]
+WantedBy=multi-user.target
