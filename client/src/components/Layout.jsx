@@ -1,0 +1,39 @@
+import { Suspense, useEffect, useState } from 'react';
+import { Navigate, Outlet, useLocation } from 'react-router-dom';
+import { useAuth } from '../auth/AuthContext.jsx';
+import { TopBar } from './TopBar.jsx';
+import { Sidebar } from './Sidebar.jsx';
+import { Loading } from './Common.jsx';
+
+export function Layout() {
+  const { user, ready } = useAuth();
+  const location = useLocation();
+  const [collapsed, setCollapsed] = useState(() => localStorage.getItem('whm.sidebar.collapsed') === '1');
+  const [mobileOpen, setMobileOpen] = useState(false);
+
+  useEffect(() => { localStorage.setItem('whm.sidebar.collapsed', collapsed ? '1' : '0'); }, [collapsed]);
+  useEffect(() => { setMobileOpen(false); }, [location.pathname]);
+
+  if (!ready) return <div className="app-loading"><Loading text="Starting WHM…" /></div>;
+  if (!user) return <Navigate to="/login" state={{ from: location.pathname }} replace />;
+  if (user.mustChangePassword && location.pathname !== '/change-password') return <Navigate to="/change-password" replace />;
+
+  return (
+    <div className={`app ${collapsed ? 'sidebar-collapsed' : ''} ${mobileOpen ? 'mobile-open' : ''}`}>
+      <TopBar onMenu={() => setMobileOpen((o) => !o)} />
+      <div className="app-body">
+        <Sidebar collapsed={collapsed} onToggle={() => setCollapsed((c) => !c)} />
+        {mobileOpen && <div className="sidebar-scrim" onClick={() => setMobileOpen(false)} />}
+        <main className="content" id="main">
+          <Suspense fallback={<Loading />}>
+            <Outlet />
+          </Suspense>
+        </main>
+      </div>
+      <footer className="app-footer">
+        <span>WHM · WebHost Manager</span>
+        <span className="muted">Signed in as {user.username} ({user.role})</span>
+      </footer>
+    </div>
+  );
+}

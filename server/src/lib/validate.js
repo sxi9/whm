@@ -16,7 +16,7 @@ export const fields = {
   packageName: z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9_ .-]{0,63}$/, 'Letters, digits, spaces, "_", "." or "-"; max 64 chars'),
   dbName: z.string().regex(/^[a-z0-9_]{1,64}$/, 'Lowercase letters, digits or "_"; max 64 chars'),
   // An absolute path with no traversal segments. Services further restrict the root.
-  absPath: z.string().regex(/^\/(?!.*(^|\/)\.\.(\/|$))[^\0]*$/, 'Must be an absolute path without ".." segments'),
+  absPath: z.string().regex(/^\/(?!(?:.*\/)?\.\.(?:\/|$))[^\0]*$/s, 'Must be an absolute path without ".." segments'),
   cron: z.string().regex(/^(\S+\s+){4}\S+$/, 'Must be a 5-field cron expression'),
   shell: z.enum(['/bin/bash', '/bin/sh', '/usr/sbin/nologin', '/usr/local/bin/jailshell']),
   id: z.coerce.number().int().positive(),

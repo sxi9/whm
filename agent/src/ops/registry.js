@@ -53,7 +53,7 @@ export const arg = {
   ipv6: z.string().ip({ version: 'v6' }),
   ip: z.string().ip(),
   iface: z.string().regex(/^[a-zA-Z0-9._-]{1,15}$/),
-  absPath: z.string().regex(/^\/(?!.*(^|\/)\.\.(\/|$))[^\0]*$/),
+  absPath: z.string().regex(/^\/(?!(?:.*\/)?\.\.(?:\/|$))[^\0]*$/s),
   shell: z.enum(['/bin/bash', '/bin/sh', '/usr/sbin/nologin', '/usr/local/bin/jailshell']),
   pid: z.number().int().positive().max(4194304),
   signal: z.enum(['SIGTERM', 'SIGKILL', 'SIGHUP', 'SIGINT', 'SIGSTOP', 'SIGCONT', 'SIGUSR1', 'SIGUSR2']),

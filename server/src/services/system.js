@@ -52,6 +52,12 @@ export function createSystemService({ db, agent, capabilities, settings, config 
       req?.audit?.({ action: 'process.signal', target: String(pid), args: { signal } });
       return result;
     },
+    // "Change Root Password": the operating system root account, not the panel login.
+    async setRootPassword(password, req) {
+      await agent.op('user.set_password', { username: 'root', password }, { req });
+      req?.audit?.({ action: 'system.root_password.change', target: 'root' });
+      return { changed: true };
+    },
     async renice(pid, niceness, req) {
       const result = await agent.op('sys.process.renice', { pid, niceness }, { req });
       req?.audit?.({ action: 'process.renice', target: String(pid), args: { niceness } });

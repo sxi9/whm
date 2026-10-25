@@ -1,8 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 const isProd = process.env.NODE_ENV === 'production';
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 const defaults = {
   env: process.env.NODE_ENV || 'development',
@@ -18,7 +20,7 @@ const defaults = {
   sessionSecret: null,
   logLevel: 'info',
   serveClient: isProd,
-  clientDist: path.resolve(process.cwd(), '..', 'client', 'dist'),
+  clientDist: path.join(repoRoot, 'client', 'dist'),
   // Where plain-text brute-force protection bites: attempts per window per IP+user.
   loginRateLimit: { windowMs: 15 * 60 * 1000, max: 20 },
   sessionTtlMs: 8 * 60 * 60 * 1000,

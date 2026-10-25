@@ -104,8 +104,21 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   audit log with redaction; jobs + scheduler + SSE wired). Agent catalog: 40 ops across
   `sys`/`svc`/`user`/`fs`. `plugins/sdk/` reference code committed (56 tests pass).
   License-server design saved under `docs/design/`. Client workspace has only a manifest.
-- **Next:** vitest suites (server + agent), then P1 shell: `client/src/nav.js` covering all
-  212 functions, layout, dashboard, shared components; then fan out P2+ categories.
+- **2026-10-25 (later): Phase 1 shell is live.** `client/` React SPA: `nav.js` (30
+  categories / 212 functions, single source of truth for sidebar, Tools grid, router and
+  search), WHM-style layout, dashboard, login/2FA/forced password, audit log, shared
+  components, and 29 real pages (accounts, packages + feature manager, server status,
+  service manager, restart services ×8, process manager, disk usage, basic setup, tweak
+  settings, cron jobs, root password, 2FA). Unimplemented functions render
+  `pages/FunctionPage.jsx` with their phase. `npm run build --workspace client` then
+  `WHM_SERVE_CLIENT=true` serves it from the API. Playwright check script lives in the
+  session scratchpad (`ui-check.cjs`): login → create account via form → pages → search.
+- **Next:** finish vitest suites, then fan out P2 categories (Account Information/Functions
+  remainder, DNS, Database Services, Service Configuration, Server Status remainder) with
+  real `web`/`dns`/`db`/`mail` agent ops; add pages to `client/src/pages/registry.js`.
+- **Frontend rules learned:** import icons by name (never `import * as icons`), resolve
+  category icons through `client/src/icons.js`; wrap raw tables in `.table-wrap`; JSX
+  string attributes do not interpolate — use `{`template`}`.
 - **Dev tip:** never `pkill -f` a pattern that also appears in the same command line (it
   kills the shell). Use the PID file the start command writes, or match exact argv via /proc.
 

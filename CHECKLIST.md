@@ -10,7 +10,8 @@
 
 - **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-25
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
-- **In progress:** vitest unit + API suites for server and agent; then Phase 1 shell.
+- **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
+- **In progress:** vitest unit + API suites for server and agent (background agent).
 - **Deferred to the end (user decision):** license server, plugin marketplace, plugin host, sample + automated-backup plugins (Phase 5).
 
 ## Phases
@@ -26,7 +27,7 @@
   - [x] routes/services: auth (login, 2FA, password), system (status, processes, services, jobs, schedules, settings, audit), accounts, packages + feature lists
   - [x] `npm install`, boot, end-to-end API smoke test (all steps green)
   - [ ] vitest unit + API tests (server, agent)
-- [ ] **P1 Shell** — React layout (top bar, searchable collapsible sidebar with all 30 categories), home dashboard (Statistics + Tools grid + Favorites), login/2FA pages, shared components (DataTable, Form fields, ConfigPage, ActionPage, WizardPage, Toast, Modal, StatusPill, ProgressLog), `nav.js` as single source of truth, a route for every one of the 212 functions
+- [x] **P1 Shell** — React layout (top bar, searchable collapsible sidebar with all 30 categories), home dashboard (Statistics + Tools grid + Favorites), login/2FA pages, shared components (DataTable, Form fields, ConfigPage, ActionPage, Toast, Modal, StatusPill, ProgressLog), `nav.js` as single source of truth, a route for every one of the 212 functions *(WizardPage arrives with Transfer Tool / IP Migration in P4)*
 - [ ] **P2 Core hosting** — Account Information, Account Functions, Multi Account, Packages + Feature Manager, DNS Functions + Zone Manager, Database Services, Service Configuration + Service Manager, Restart Services, Server Status, System Health
 - [ ] **P3 Security & mail** — Security Center, Email, Exim/Dovecot config, SSL/TLS + AutoSSL (ACME)
 - [ ] **P4 Resellers, IP, backup, transfers** — Resellers, IP Functions, Backup + scheduler + destinations, Transfers + Transfer Tool, Networking Setup, Server Contacts, System Reboot
@@ -48,17 +49,17 @@
 ## Functions — all 30 categories (212)
 
 ### 1. Server Configuration
-- [ ] Basic WebHost Manager Setup
-- [ ] Change Root Password
+- [x] Basic WebHost Manager Setup
+- [x] Change Root Password
 - [ ] Configure cPanel Analytics
-- [ ] Configure cPanel Cron Jobs
+- [x] Configure cPanel Cron Jobs
 - [ ] Initial Quota Setup
 - [ ] Link Server Nodes
 - [ ] Server Profile
 - [ ] Server Time
 - [ ] Statistics Software Configuration
 - [ ] Terminal
-- [ ] Tweak Settings
+- [x] Tweak Settings
 - [ ] Update Preferences
 - [ ] WHM Marketplace
 
@@ -90,7 +91,7 @@
 - [ ] Shell Fork Bomb Protection
 - [ ] SSH Password Authorization Tweak
 - [ ] Traceroute Enable/Disable
-- [ ] Two-Factor Authentication
+- [x] Two-Factor Authentication
 
 ### 5. Server Contacts
 - [ ] Contact Manager
@@ -118,7 +119,7 @@
 - [ ] Mailserver Configuration
 - [ ] Manage Service SSL Certificates
 - [ ] Nameserver Selection
-- [ ] Service Manager
+- [x] Service Manager
 
 ### 8. Locales
 - [ ] Configure Application Locales
@@ -146,38 +147,38 @@
 ### 12. Server Status
 - [ ] Apache Status
 - [ ] Daily Process Log
-- [ ] Server Information
-- [ ] Service Status
-- [ ] Task Queue Monitor
+- [x] Server Information
+- [x] Service Status
+- [x] Task Queue Monitor
 
 ### 13. Account Information
-- [ ] List Accounts
+- [x] List Accounts
 - [ ] List Parked Domains
 - [ ] List Subdomains
-- [ ] List Suspended Accounts
+- [x] List Suspended Accounts
 - [ ] Manage Account Enhancements
 - [ ] Show Accounts Over Quota
 - [ ] View Bandwidth Usage
 
 ### 14. Account Functions
 - [ ] Change Site's IP Address
-- [ ] Create a New Account
+- [~] Create a New Account *(Linux user + home tree provisioned; vhost/DNS/mail steps land with P2 web/dns/mail ops)*
 - [ ] Email All Users
 - [ ] Force Password Change
 - [ ] Limit Bandwidth Usage
-- [ ] Manage Account Suspension
+- [x] Manage Account Suspension
 - [ ] Manage Demo Mode
 - [ ] Manage Shell Access
-- [ ] Modify an Account
-- [ ] Password Modification
+- [x] Modify an Account
+- [x] Password Modification
 - [ ] Quota Modification
 - [ ] Raw Apache Log Download
 - [ ] Raw NGINX Log Download
 - [ ] Rearrange an Account
 - [ ] Reset Account Bandwidth Limit
-- [ ] Terminate Accounts
+- [x] Terminate Accounts
 - [ ] Unsuspend Bandwidth Exceeders
-- [ ] Upgrade/Downgrade an Account
+- [x] Upgrade/Downgrade an Account
 - [ ] Web Log Retention
 - [ ] Web Template Editor
 
@@ -195,10 +196,10 @@
 - [ ] Theme Manager
 
 ### 18. Packages
-- [ ] Add a Package
-- [ ] Delete a Package
-- [ ] Edit a Package
-- [ ] Feature Manager
+- [x] Add a Package
+- [x] Delete a Package
+- [x] Edit a Package
+- [x] Feature Manager
 
 ### 19. DNS Functions
 - [ ] Add a DNS Zone
@@ -270,9 +271,9 @@
 
 ### 24. System Health
 - [ ] Background Process Killer
-- [ ] Process Manager
-- [ ] Show Current Disk Usage
-- [ ] Show Current Running Processes
+- [x] Process Manager
+- [x] Show Current Disk Usage
+- [x] Show Current Running Processes
 
 ### 25. cPanel
 - [ ] Change Log
@@ -295,14 +296,14 @@
 - [ ] Market Provider Manager
 
 ### 28. Restart Services
-- [ ] Database Server
-- [ ] DNS Server
-- [ ] HTTP Server (Apache)
-- [ ] IMAP Server
-- [ ] Mail Server (Exim)
-- [ ] Mailing List Manager (Mailman)
-- [ ] PHP-FPM service for Apache
-- [ ] SSH Server (OpenSSH)
+- [x] Database Server
+- [x] DNS Server
+- [x] HTTP Server (Apache)
+- [x] IMAP Server
+- [x] Mail Server (Exim)
+- [x] Mailing List Manager (Mailman)
+- [x] PHP-FPM service for Apache
+- [x] SSH Server (OpenSSH)
 
 ### 29. Development
 - [ ] OpenAPI Documentation for cPanel
@@ -321,11 +322,11 @@
 
 ## Cross-cutting
 
-- [ ] Home dashboard: Statistics panel, Tools grid, Favorites, global search
-- [ ] Login, 2FA enrollment/verification, forced password change
-- [ ] Audit log viewer
-- [ ] Job queue + progress streaming (SSE)
-- [ ] Capability detection + "service not installed" prompts
+- [x] Home dashboard: Statistics panel, Tools grid, Favorites, global search
+- [x] Login, 2FA enrollment/verification, forced password change
+- [x] Audit log viewer
+- [x] Job queue + progress streaming (SSE) — Task Queue Monitor
+- [x] Capability detection + "service not installed" prompts
 - [ ] Unit tests (vitest) · API tests (supertest) · agent op schema tests · e2e (playwright)
 - [ ] `scripts/install.sh`, `deploy/whm-panel.service`, `deploy/whm-agentd.service`
 - [ ] README (install / run / deploy / security)

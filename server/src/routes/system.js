@@ -16,6 +16,7 @@ export function systemRoutes({ system, serviceManager, jobs, scheduler, settings
     wrap((req) => system.signal(req.params.pid, req.body.signal, req)));
   r.post('/processes/:pid/renice', requireRoot, validate({ params: z.object({ pid: fields.id }), body: z.object({ niceness: z.number().int().min(-20).max(19) }).strict() }),
     wrap((req) => system.renice(req.params.pid, req.body.niceness, req)));
+  r.post('/root-password', requireRoot, validate({ body: z.object({ password: fields.password }).strict() }), wrap((req) => system.setRootPassword(req.body.password, req)));
   r.get('/capabilities', requireRoot, wrap(() => system.capabilities()));
   r.post('/capabilities/refresh', requireRoot, wrap(() => system.refreshCapabilities()));
 
