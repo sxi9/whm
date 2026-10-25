@@ -18,6 +18,8 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/etc/security/limits.conf', '/etc/security/limits.d', '/etc/logrotate.d', '/etc/cron.d', '/var/spool/cron',
   '/var/log/apache2', '/var/log/httpd', '/var/log/nginx', '/var/log/syslog', '/var/log/messages', '/var/log/auth.log', '/var/log/secure',
   '/backup', '/var/backups/whm', '/tmp/whm',
+  '/etc/named.conf', '/etc/named.whm.conf', '/etc/named',
+  '/etc/modsecurity', '/var/log/modsec_audit.log', '/usr/share/modsecurity-crs',
 ];
 
 export function createContext({ allowedRoots = DEFAULT_ALLOWED_ROOTS, principal = null, log = () => {} } = {}) {
