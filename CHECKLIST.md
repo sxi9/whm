@@ -9,8 +9,8 @@
 ## Current state
 
 - **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-25
-- **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing).
-- **In progress:** Phase 0 foundation (server core files being written; nothing runs end-to-end yet).
+- **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
+- **In progress:** vitest unit + API suites for server and agent; then Phase 1 shell.
 - **Deferred to the end (user decision):** license server, plugin marketplace, plugin host, sample + automated-backup plugins (Phase 5).
 
 ## Phases
@@ -19,12 +19,13 @@
 - [ ] **P0 Foundation** — workspace, config, SQLite schema + migrations + seed, session auth + bcrypt + TOTP 2FA, RBAC, CSRF, validation, audit log, agent protocol + `whm-agentd` skeleton, capability detection, jobs + scheduler
   - [x] root workspace (`package.json`, `.gitignore`, `.env.example`)
   - [x] `server/src/config.js`, `logger.js`, `lib/errors.js`, `lib/validate.js`, `lib/crypto.js`
-  - [ ] `server/src/db/` (migrations, seed, session store)
-  - [ ] middleware (auth, rbac, csrf, audit, error)
-  - [ ] `lib/agent-client.js`, `lib/capabilities.js`, `lib/jobs.js`, `lib/scheduler.js`
-  - [ ] `agent/` daemon + op catalog (`sys`, `svc`, `user`, `fs` real; others stubbed)
-  - [ ] routes/services: auth, system, accounts, packages, settings, audit, jobs
-  - [ ] `npm install`, boot, login → dashboard smoke test, unit + API tests
+  - [x] `server/src/db/` (migrations, seed, session store)
+  - [x] middleware (auth, rbac, csrf, audit, error)
+  - [x] `lib/agent-client.js` (monolithic + socket), `lib/capabilities.js`, `lib/cron.js`, `lib/jobs.js` (SSE), `lib/scheduler.js`
+  - [x] `agent/` daemon + op catalog (`sys`, `svc`, `user`, `fs` real — 40 ops; `web`/`dns`/`db`/`mail`/`net`/`ssl`/`sec` families arrive with their categories)
+  - [x] routes/services: auth (login, 2FA, password), system (status, processes, services, jobs, schedules, settings, audit), accounts, packages + feature lists
+  - [x] `npm install`, boot, end-to-end API smoke test (all steps green)
+  - [ ] vitest unit + API tests (server, agent)
 - [ ] **P1 Shell** — React layout (top bar, searchable collapsible sidebar with all 30 categories), home dashboard (Statistics + Tools grid + Favorites), login/2FA pages, shared components (DataTable, Form fields, ConfigPage, ActionPage, WizardPage, Toast, Modal, StatusPill, ProgressLog), `nav.js` as single source of truth, a route for every one of the 212 functions
 - [ ] **P2 Core hosting** — Account Information, Account Functions, Multi Account, Packages + Feature Manager, DNS Functions + Zone Manager, Database Services, Service Configuration + Service Manager, Restart Services, Server Status, System Health
 - [ ] **P3 Security & mail** — Security Center, Email, Exim/Dovecot config, SSL/TLS + AutoSSL (ACME)

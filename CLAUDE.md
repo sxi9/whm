@@ -97,13 +97,17 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Current state (update every push)
 
-- **2026-10-25:** Blueprint complete and pushed. Phase 0 foundation **in progress**: root
-  workspace + `server/src/{config,logger}.js` + `lib/{errors,validate,crypto}.js` written;
-  DB/migrations/seed, middleware, agent client/daemon, jobs/scheduler, first routes and the
-  client skeleton still to write; nothing runs end-to-end yet. `plugins/sdk/` reference
-  code committed (56 tests pass). License-server design saved under `docs/design/`.
-- **Next:** finish P0 (DB → middleware → agent → routes → smoke test), then P1 shell with
-  `nav.js` covering all 212 functions, then fan out P2+ category implementation.
+- **2026-10-25:** Blueprint complete and pushed. **Phase 0 foundation works end to end**
+  (`npm install` → `node server/src/index.js` boots, migrates, seeds root; login with forced
+  password change; CSRF; RBAC; status/services via real agent ops; packages CRUD; account
+  create provisions a real Linux user + home tree, suspend locks it, terminate removes it;
+  audit log with redaction; jobs + scheduler + SSE wired). Agent catalog: 40 ops across
+  `sys`/`svc`/`user`/`fs`. `plugins/sdk/` reference code committed (56 tests pass).
+  License-server design saved under `docs/design/`. Client workspace has only a manifest.
+- **Next:** vitest suites (server + agent), then P1 shell: `client/src/nav.js` covering all
+  212 functions, layout, dashboard, shared components; then fan out P2+ categories.
+- **Dev tip:** never `pkill -f` a pattern that also appears in the same command line (it
+  kills the shell). Use the PID file the start command writes, or match exact argv via /proc.
 
 ## Resume notes
 
