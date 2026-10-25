@@ -24,3 +24,10 @@ memory, restarts and Start/Stop/Restart actions.
 | [14-process-manager.png](14-process-manager.png) | Process Manager — live processes with kill / force kill / renice |
 
 Regenerate: `BASE=http://127.0.0.1:2086 PASSWORD='<root password>' OUT=docs/screenshots node e2e/ui-check.cjs`.
+
+## Every page
+
+[`pages/README.md`](pages/README.md) indexes a screenshot of **every one of the 212 function
+pages** (grouped by category) plus login, home, audit log and change-password, captured with
+`e2e/screenshot-all.cjs`. Regenerate at milestones (each full set is ~16 MB):
+`BASE=http://127.0.0.1:2086 PASSWORD='<root password>' OUT=docs/screenshots node e2e/screenshot-all.cjs`.
