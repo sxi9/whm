@@ -418,6 +418,7 @@ export function createDnsService(ctx) {
       const validation = await service.validateZone(domain, body, user);
       if (!validation.ok) throw unprocessable('Zone text is not valid', { body: validation.errors });
       const parsed = parseZone(body, domain);
+      const created = !zone;
       if (!zone) {
         zone = insertZoneRows({ domain, account_id: accountForDomain(domain)?.id ?? null, serial: parsed.serial || nextSerial(0), ttl: parsed.ttl || setting('dns.default_ttl', 14400) }, parsed.records);
       } else {
@@ -428,7 +429,7 @@ export function createDnsService(ctx) {
         })();
       }
       const result = await publish(zone, req);
-      audit(req, { action: 'dns.zone.raw_save', target: domain, args: { records: parsed.records.length, created: !validation.existing } });
+      audit(req, { action: 'dns.zone.raw_save', target: domain, args: { records: parsed.records.length, created } });
       return { ...(await service.getZone(domain, user)), ...result };
     },
 
