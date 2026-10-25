@@ -5,12 +5,14 @@ import { json, paginate } from '../db/index.js';
 import { notFound, conflict, forbidden, badRequest, unprocessable, CapabilityError } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
 import {
-  RECORD_TYPES, ZoneError, nextSerial, normalizeRecord, renderZone, renderTemplate, parseZone, parseSoaValue, soaValue, checkConflicts, absoluteName,
+  RECORD_TYPES, ZoneError, nextSerial, normalizeRecord, renderZone, renderTemplate, parseZone, parseSoaValue, soaValue, checkConflicts,
 } from './dns-zonefile.js';
 
 const SPF_RE = /^v=spf1(?: [+\-~?]?(?:all|a|mx|ptr|ip4:[0-9./]+|ip6:[0-9a-f:./]+|include:[a-z0-9._-]+|exists:[a-z0-9._%-]+|redirect=[a-z0-9._-]+|exp=[a-z0-9._-]+)(?:\/\d{1,3})?)*$/i;
-const DMARC_POLICIES = ['none', 'quarantine', 'reject'];
 const IMPORT_INTERVAL_MS = 5 * 60 * 1000;
+
+// API callers give hostnames as FQDNs (no trailing dot); '@' means the zone apex.
+const fqdn = (value, domain) => (value === '@' ? `${domain}.` : String(value).toLowerCase().endsWith('.') ? String(value).toLowerCase() : `${String(value).toLowerCase()}.`);
 
 // ctx.dns — zones, records, templates, DKIM/SPF/DMARC, routing, parking,
 // forwarding and cluster sync. Other categories call it lazily via ctx.dns.
@@ -493,8 +495,8 @@ export function createDnsService(ctx) {
       const soaRec = records.find((r) => r.type === 'SOA');
       const current = parseSoaValue(soaRec?.value, domain);
       const next = { ...current, ...Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined)) };
-      next.primary = absoluteName(next.primary, domain);
-      next.hostmaster = absoluteName(next.hostmaster, domain);
+      next.primary = fqdn(next.primary, domain);
+      next.hostmaster = fqdn(next.hostmaster, domain);
       db.transaction(() => {
         if (soaRec) stmts.updateRecord.run({ id: soaRec.id, name: '@', type: 'SOA', ttl: soaRec.ttl, priority: null, value: soaValue(next) });
         else stmts.insertRecord.run({ zone_id: zone.id, name: '@', type: 'SOA', ttl: null, priority: null, value: soaValue(next), line_index: 0 });
@@ -731,7 +733,7 @@ export function createDnsService(ctx) {
       assertPublishable();
       const zone = await load(domain, user);
       const { routing } = input;
-      const exchanges = (input.exchanges || []).map((e) => ({ priority: e.priority, value: absoluteName(e.exchange, domain) }));
+      const exchanges = (input.exchanges || []).map((e) => ({ priority: e.priority, value: fqdn(e.exchange, domain) }));
       if (['remote', 'backup'].includes(routing) && !exchanges.length) throw unprocessable('Remote and backup routing need at least one external mail exchanger', { exchanges: ['Add at least one MX host'] });
       const localMx = `mail.${domain}.`;
       db.transaction(() => {
