@@ -219,7 +219,7 @@ function Destinations() {
           <Field inline><Toggle checked={enabled} onChange={setEnabled} label="Enabled" /></Field>
         </div>
         <DestinationFields value={cfg} onChange={setCfg} errors={formError?.fields || {}} editing={editing !== 'new'} />
-        <KeyValue items={[['Upload method', cfg.kind === 's3' ? 'Signed PUT (AWS Signature V4) straight from the panel' : cfg.kind === 'local' ? 'File copy' : 'curl with a private config file (credentials never appear on the command line)']]} />
+        <KeyValue items={[['Upload method', cfg.kind === 's3' ? 'Single signed PUT (AWS Signature V4) straight from the panel; archives above 5 GB exceed the single-PUT object limit of AWS and most providers' : cfg.kind === 'local' ? 'File copy' : 'curl with a private config file (credentials never appear on the command line)']]} />
       </Modal>
     </Card>
   );

@@ -34,13 +34,14 @@ export default function FileAndDirectoryRestoration({ fn }) {
 
   const rel = (p) => p.slice(ROOT.length + 1);
   const crumbs = prefix.split('/');
+  const homeLabel = backup?.home_dir || '~';
   const entries = (listing.data?.entries || []).filter((e) => !filter || e.name.toLowerCase().includes(filter.toLowerCase()));
   const toggle = (p) => setSelected((s) => (s.includes(p) ? s.filter((x) => x !== p) : [...s, p]));
 
   const restore = async () => {
     if (!backup || !selected.length) return;
     const ok = await confirm({
-      title: `Restore ${selected.length} item(s) into /home/${backup.account}?`,
+      title: `Restore ${selected.length} item(s) into ${homeLabel}?`,
       message: `${overwrite ? 'Existing files with the same names are overwritten' : 'Only files that do not exist yet are written'}; ownership is set to ${backup.account}. ${selected.slice(0, 5).map(rel).join(', ')}${selected.length > 5 ? ', …' : ''}`,
       danger: overwrite, confirmLabel: 'Restore',
     });
@@ -70,7 +71,7 @@ export default function FileAndDirectoryRestoration({ fn }) {
           <nav className="breadcrumbs" aria-label="Archive path">
             {crumbs.map((c, i) => {
               const p = crumbs.slice(0, i + 1).join('/');
-              return <span key={p}>{i > 0 && <span>› </span>}{i === crumbs.length - 1 ? <span className="current">{i === 0 ? `/home/${backup.account}` : c}</span> : <a href="#" onClick={(e) => { e.preventDefault(); setPrefix(p); }}>{i === 0 ? `/home/${backup.account}` : c}</a>}</span>;
+              return <span key={p}>{i > 0 && <span>› </span>}{i === crumbs.length - 1 ? <span className="current">{i === 0 ? homeLabel : c}</span> : <a href="#" onClick={(e) => { e.preventDefault(); setPrefix(p); }}>{i === 0 ? homeLabel : c}</a>}</span>;
             })}
           </nav>
           <div className="form-grid">

@@ -15,14 +15,21 @@ const port = z.number().int().min(1).max(65535);
 
 // Mirrors the agent's destinationConfig so a bad configuration fails here with
 // field errors instead of at the first upload. On an update a blank secret
-// means "keep the stored one".
-const destinationSchema = (mode) => z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('local'), dir: fields.absPath }).strict(),
-  z.object({ kind: z.literal('ftp'), host: hostField, port: port.default(21), username: nonEmpty, password: secret.default(''), path: remotePath.default(''), tls: z.boolean().default(false), insecure: z.boolean().default(false), passive: z.boolean().default(true) }).strict(),
-  z.object({ kind: z.literal('sftp'), host: hostField, port: port.default(22), username: nonEmpty, password: secret.optional(), privateKey: z.string().max(16384).optional(), hostKeySha256: z.string().regex(/^[A-Za-z0-9+/=]{40,48}$/).optional(), path: remotePath.default(''), insecure: z.boolean().default(false) }).strict(),
-  z.object({ kind: z.literal('webdav'), url, username: nonEmpty.optional(), password: secret.optional(), insecure: z.boolean().default(false) }).strict(),
-  z.object({ kind: z.literal('s3'), endpoint: url.optional(), region: z.string().regex(/^[a-z0-9-]{1,32}$/).default('us-east-1'), bucket: z.string().regex(/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/), prefix: remotePath.default(''), accessKey: nonEmpty, secretKey: mode === 'update' ? secret : nonEmpty, pathStyle: z.boolean().default(false), insecure: z.boolean().default(false) }).strict(),
-]);
+// means "keep the stored one" and null removes it.
+const destinationSchema = (mode) => {
+  const optionalSecret = mode === 'update' ? secret.nullable().optional() : secret.optional();
+  const privateKey = mode === 'update' ? z.string().max(16384).nullable().optional() : z.string().max(16384).optional();
+  return z.discriminatedUnion('kind', [
+    z.object({ kind: z.literal('local'), dir: fields.absPath }).strict(),
+    z.object({ kind: z.literal('ftp'), host: hostField, port: port.default(21), username: nonEmpty, password: mode === 'update' ? secret.nullable().default('') : secret.default(''), path: remotePath.default(''), tls: z.boolean().default(false), insecure: z.boolean().default(false), passive: z.boolean().default(true) }).strict(),
+    z.object({ kind: z.literal('sftp'), host: hostField, port: port.default(22), username: nonEmpty, password: optionalSecret, privateKey, hostKeySha256: z.string().regex(/^[A-Za-z0-9+/=]{40,48}$/).optional(), path: remotePath.default(''), insecure: z.boolean().default(false) }).strict(),
+    z.object({ kind: z.literal('webdav'), url, username: nonEmpty.optional(), password: optionalSecret, insecure: z.boolean().default(false) }).strict(),
+    z.object({ kind: z.literal('s3'), endpoint: url.optional(), region: z.string().regex(/^[a-z0-9-]{1,32}$/).default('us-east-1'), bucket: z.string().regex(/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/), prefix: remotePath.default(''), accessKey: nonEmpty, secretKey: mode === 'update' ? secret : nonEmpty, pathStyle: z.boolean().default(false), insecure: z.boolean().default(false) }).strict(),
+  ]).superRefine((c, issues) => {
+    // Without a pinned host key an SFTP login verifies nothing on a host that has no known_hosts yet.
+    if (c.kind === 'sftp' && !c.hostKeySha256 && !c.insecure) issues.addIssue({ code: z.ZodIssueCode.custom, path: ['hostKeySha256'], message: 'Pin the server host key (SHA-256 fingerprint) or explicitly skip host key verification' });
+  });
+};
 const destinationConfig = destinationSchema('create');
 const destinationUpdate = destinationSchema('update');
 const destinationName = z.string().trim().min(1).max(64).regex(/^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/, 'Letters, digits, spaces, "._-"');

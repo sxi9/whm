@@ -76,7 +76,8 @@ export default function BackupRestoration({ fn }) {
               ['Home directory', info.data.components.home ? 'included' : 'not in archive'],
               ['Databases', info.data.components.mysql.length ? info.data.components.mysql.map((m) => m.database).join(', ') : 'none'],
               ['DNS zones', info.data.components.dnszones.length ? info.data.components.dnszones.join(', ') : 'none'],
-              ['Metadata', info.data.metadata ? `${info.data.metadata.account?.domain || ''} · package ${info.data.metadata.account?.package_name || '—'} · owner ${info.data.metadata.account?.owner || '—'}` : 'none (the account must already exist)'],
+              ['Metadata', info.data.metadata ? `${info.data.metadata.account?.domain || ''} · package ${info.data.metadata.account?.package_name || '—'} · owner ${info.data.metadata.account?.owner || '—'}${info.data.metadata.source === 'cpmove' ? ' · from cPanel cp/<user>' : ''}` : 'none (the account must already exist)'],
+              ['Other domains', info.data.metadata?.domains?.length ? info.data.metadata.domains.map((d) => `${d.domain} (${d.type})`).join(', ') : 'none'],
               ['sha256', <code style={{ fontSize: 11 }}>{backup.sha256}</code>],
             ]} />
           )}
@@ -86,7 +87,7 @@ export default function BackupRestoration({ fn }) {
             <Field inline><Toggle checked={options.databases} onChange={setOpt('databases')} label="Databases, users and grants" description="Each schema is created if missing, then its dump is imported inside it (works for cPanel per-database dumps too); users keep their original passwords." /></Field>
             <Field inline><Toggle checked={options.dns} onChange={setOpt('dns')} label="DNS zones" description="Zone files are loaded into BIND (saved for later when BIND is missing)." /></Field>
             <Field inline><Toggle checked={options.mail} onChange={setOpt('mail')} label="Mail routing (local / remote / backup MX)" /></Field>
-            <Field inline><Toggle checked={options.createAccount} onChange={setOpt('createAccount')} label="Recreate the account if it was terminated" description="Linux user, home, package and web vhost come from the archive metadata." /></Field>
+            <Field inline><Toggle checked={options.createAccount} onChange={setOpt('createAccount')} label="Recreate the account if it was terminated" description="Linux user, home, package, web vhost and the parked/addon/sub domains come from the archive metadata." /></Field>
           </div>
           <RequestError error={runError} />
           <FormActions>
@@ -100,8 +101,9 @@ export default function BackupRestoration({ fn }) {
       {isRoot && (
         <Card title="Import an archive" subtitle="Register a cPanel or WHM account archive copied onto this server by hand (e.g. /backup/cpmove-user.tar.gz), then restore it above.">
           <div className="form-grid">
-            <Field label="Archive path" help="Must be under /backup, /var/backups/whm or /home; the file name identifies the account."><TextInput value={importPath} onChange={setImportPath} placeholder="/backup/cpmove-alice.tar.gz" /></Field>
+            <Field label="Archive path" help="Must be under the backup directory or /var/backups/whm (move files out of account homes as root first); the file name identifies the account."><TextInput value={importPath} onChange={setImportPath} placeholder="/backup/cpmove-alice.tar.gz" /></Field>
           </div>
+          <p className="muted">cPanel cpmove archives restore the home directory, per-database dumps, DNS zones and the account (main, parked, addon and sub domains from cp/&lt;user&gt;, pds, addons and sds2). Database users kept in cPanel's mysql.sql are not recreated; add them again in Database Services after the restore.</p>
           <FormActions><Button disabled={!importPath.trim().startsWith('/')} onClick={importArchive}>Register archive</Button></FormActions>
         </Card>
       )}

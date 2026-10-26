@@ -124,9 +124,29 @@ async function remoteExec(conn, command, { timeoutMs = 600_000, maxBuffer } = {}
   });
 }
 
-function requireOk(result, what) {
-  if (result.code !== 0) throw new OpError('remote_command_failed', `${what} failed on the remote server: ${result.stderr.trim().split('\n').pop() || `exit status ${result.code}`}`, { code: result.code });
-  return result;
+// Fingerprints of the host keys recorded for a server, so the operator can
+// compare them with the source machine after the first (trust-on-first-use)
+// connection. Accepts the "-l -F" line form ("host TYPE SHA256:…") and the
+// plain "-lf" form ("256 SHA256:… comment (TYPE)").
+export function parseFingerprints(stdout) {
+  const out = [];
+  for (const line of String(stdout || '').split('\n')) {
+    if (!line.trim() || line.startsWith('#')) continue;
+    let m = line.match(/^\d+\s+(SHA256:[A-Za-z0-9+/=]+)\s.*\((\w+)\)\s*$/);
+    if (m) { out.push({ type: m[2].toUpperCase(), fingerprint: m[1] }); continue; }
+    m = line.match(/^\S+\s+(\S+)\s+(SHA256:[A-Za-z0-9+/=]+)/);
+    if (m) out.push({ type: m[1].toUpperCase().replace(/^SSH-/, ''), fingerprint: m[2] });
+  }
+  return out;
+}
+
+async function hostKeysOf(conn) {
+  if (!hasBinary('ssh-keygen') || !fs.existsSync(KNOWN_HOSTS)) return [];
+  const spec = conn.port === 22 ? conn.host : `[${conn.host}]:${conn.port}`;
+  try {
+    const { code, stdout } = await exec('ssh-keygen', ['-l', '-F', spec, '-f', KNOWN_HOSTS], { timeoutMs: 30_000, allowFailure: true });
+    return code === 0 ? parseFingerprints(stdout) : [];
+  } catch { return []; }
 }
 
 export function parsePasswd(text, { minUid = 1000 } = {}) {
@@ -163,10 +183,13 @@ export function parseRsyncStats(stdout) {
 
 // cpmove-<user>.tar.gz layout: <top>/cp/<user>, homedir/, mysql/<db>.sql,
 // mysql.sql (grants), dnszones/<zone>.db, userdata/<domain>, addons, pds, sds2.
+// The top directory becomes a tar argv element, so it must look like a name.
+const TOP_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
 export function summarizeArchive(entries) {
   const names = entries.map((e) => e.replace(/^\.\//, ''));
   const tops = new Set(names.map((n) => n.split('/')[0]).filter(Boolean));
-  const top = tops.size === 1 ? [...tops][0] : null;
+  const top = tops.size === 1 && TOP_NAME.test([...tops][0]) ? [...tops][0] : null;
   const rel = (n) => (top ? n.slice(top.length + 1) : n);
   const rels = names.map(rel).filter(Boolean);
   const cpUser = rels.find((r) => /^cp\/[a-z][a-z0-9_-]*$/.test(r))?.slice(3) || null;
@@ -251,6 +274,7 @@ defineOp('transfer.remote.probe', {
     const df = get(9).text.split('\n').pop()?.trim().split(/\s+/) || [];
     return {
       ok: true,
+      hostKeys: await hostKeysOf(conn),
       hostname: get(0).text || conn.host,
       kernel: get(1).text || null,
       uid: get(2).code === 0 ? Number(get(2).text) : null,
@@ -378,9 +402,11 @@ defineOp('transfer.remote.remove_file', {
 
 // Modes are preserved (-p) so 0600 credential files and 0700 directories stay
 // private and scripts keep their execute bit; ownership is reassigned afterwards.
+// Device and special files are never recreated (no -D): the copy runs as root
+// and the tree is handed to the account afterwards.
 // rsync splits "user@host:path" at the first ':', so an IPv6 host is bracketed.
 export function rsyncArgv({ transport, destination, src, dest, directory = true, excludes = [], deleteExtraneous = false, bwlimitKbps = 0, dryRun = false }) {
-  const argv = ['-rlptD', '-z', '--partial', '--stats', '--no-human-readable', '-e', transport];
+  const argv = ['-rlpt', '-z', '--partial', '--stats', '--no-human-readable', '-e', transport];
   if (deleteExtraneous) argv.push('--delete');
   if (bwlimitKbps) argv.push(`--bwlimit=${bwlimitKbps}`);
   if (dryRun) argv.push('--dry-run');
@@ -460,7 +486,7 @@ defineOp('transfer.cpmove.inspect', {
     const summary = summarizeArchive(entries);
     let cp = null;
     if (summary.hasCpConfig && summary.top) {
-      const r = await exec('tar', ['-xOf', resolved, `${summary.top}/cp/${summary.username}`], { timeoutMs: 3_600_000, allowFailure: true, maxBuffer: 4 * 1024 * 1024 });
+      const r = await exec('tar', ['-xOf', resolved, '--', `${summary.top}/cp/${summary.username}`], { timeoutMs: 3_600_000, allowFailure: true, maxBuffer: 4 * 1024 * 1024 });
       if (r.code === 0) cp = parseCpUserFile(r.stdout);
     }
     if (!summary.top || !summary.username) throw new OpError('invalid_archive', `${path.basename(resolved)} does not look like a cPanel account archive (expected a single cpmove-<user>/ or <user>/ top-level directory)`);
@@ -475,7 +501,7 @@ defineOp('transfer.cpmove.read_member', {
   run: async ({ path: file, member, maxBytes }, ctx) => {
     requireTar();
     const { resolved } = assertArchive(ctx, file);
-    const { code, stdout, stderr } = await exec('tar', ['-xOf', resolved, '--wildcards', '--no-anchored', member], { timeoutMs: 3_600_000, allowFailure: true, maxBuffer: maxBytes + 65536 });
+    const { code, stdout, stderr } = await exec('tar', ['-xOf', resolved, '--wildcards', '--no-anchored', '--', member], { timeoutMs: 3_600_000, allowFailure: true, maxBuffer: maxBytes + 65536 });
     if (code !== 0 && !stdout) {
       if (/Not found in archive/i.test(stderr)) return { member, exists: false, content: null };
       throw new OpError('invalid_archive', `tar could not read ${member}: ${stderr.trim().split('\n').pop() || `status ${code}`}`);
@@ -484,8 +510,39 @@ defineOp('transfer.cpmove.read_member', {
   },
 });
 
+// One line of "tar -tvf": mode, owner, size (or "major,minor" for devices),
+// date, time, name ("name -> target" for symlinks, "name link to target" for
+// hard links). The first character of the mode is the member type.
+const LISTING_LINE = /^([-bcdlhps?])[-rwxsStTX]{9}\s+\S+\s+\S+\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+(.*)$/;
+
+export function parseTarListing(stdout) {
+  const out = [];
+  for (const line of String(stdout || '').split('\n')) {
+    const m = line.match(LISTING_LINE);
+    if (!m) continue;
+    let name = m[2];
+    let link = null;
+    const type = m[1];
+    if (type === 'l') { const at = name.lastIndexOf(' -> '); if (at >= 0) { link = name.slice(at + 4); name = name.slice(0, at); } }
+    else if (type === 'h') { const at = name.lastIndexOf(' link to '); if (at >= 0) { link = name.slice(at + 9); name = name.slice(0, at); } }
+    out.push({ type, name, link });
+  }
+  return out;
+}
+
+// Why a listed member must not be extracted as root into an account's tree:
+// device nodes would be handed to the account by the chown that follows,
+// absolute or ".." names would land outside the destination.
+export function unsafeMember(entry) {
+  if (entry.type === 'b' || entry.type === 'c') return `"${entry.name}" is a ${entry.type === 'b' ? 'block' : 'character'} device node`;
+  const name = entry.name.replace(/^\.\//, '');
+  if (name.startsWith('/')) return `"${entry.name}" has an absolute path`;
+  if (name.split('/').includes('..')) return `"${entry.name}" contains ".."`;
+  return null;
+}
+
 defineOp('transfer.cpmove.extract', {
-  description: 'Extract members of an account archive into an allowed directory (homedir into the new home, dumps into staging)',
+  description: 'Extract members of an account archive into an allowed directory (homedir into the new home, dumps into staging) after refusing device nodes and absolute/".." members',
   timeoutMs: 86_400_000,
   schema: z.object({
     path: arg.absPath,
@@ -498,10 +555,26 @@ defineOp('transfer.cpmove.extract', {
     requireTar();
     const { resolved } = assertArchive(ctx, file);
     const dest = ctx.assertAllowedPath(destination, 'write');
+    // The same member selection is listed first; anything tar would recreate
+    // as a device node or outside the destination refuses the whole extraction.
+    let listing;
+    try {
+      listing = await exec('tar', ['-tvf', resolved, '--wildcards', '--no-anchored', '--', ...members], { timeoutMs: 86_400_000, allowFailure: true, maxBuffer: 256 * 1024 * 1024 });
+    } catch (err) {
+      if (err.code === 'spawn_failed' && /maxBuffer/i.test(err.message)) throw new OpError('refused', `${path.basename(resolved)} lists too many members to screen before extraction; extract it by hand`);
+      throw err;
+    }
+    if (listing.code !== 0 && !listing.stdout.trim()) {
+      if (/Not found in archive/i.test(listing.stderr)) return { destination: dest, extracted: false, members };
+      throw new OpError('invalid_archive', `tar could not read ${path.basename(resolved)}: ${listing.stderr.trim().split('\n').pop() || `status ${listing.code}`}`);
+    }
+    const entries = parseTarListing(listing.stdout);
+    const unsafe = entries.map(unsafeMember).filter(Boolean);
+    if (unsafe.length) throw new OpError('invalid_archive', `${path.basename(resolved)} contains members that must not be extracted as root: ${unsafe.slice(0, 3).join('; ')}${unsafe.length > 3 ? ` (+${unsafe.length - 3} more)` : ''}`);
     fs.mkdirSync(dest, { recursive: true });
     // GNU tar drops leading "/" and refuses ".." members by default; the
     // ownership from the archive is discarded and reapplied for the new user.
-    const argv = ['-xf', resolved, '-C', dest, '--no-same-owner', '--no-same-permissions', '--no-overwrite-dir', `--strip-components=${stripComponents}`, '--wildcards', '--no-anchored', ...members];
+    const argv = ['-xf', resolved, '-C', dest, '--no-same-owner', '--no-same-permissions', '--no-overwrite-dir', `--strip-components=${stripComponents}`, '--wildcards', '--no-anchored', '--', ...members];
     const { code, stderr } = await exec('tar', argv, { timeoutMs: 86_400_000, allowFailure: true });
     if (code !== 0) {
       if (/Not found in archive/i.test(stderr)) return { destination: dest, extracted: false, members };
@@ -844,6 +917,9 @@ defineOp('transfer.mysql.import', {
   run: async ({ path: file, database, definerPrefix, credentials: creds, timeoutMs }, ctx) => {
     const resolved = ctx.assertAllowedPath(file, 'read');
     if (SYSTEM_SCHEMAS.has(database)) throw new OpError('refused', `"${database}" is a system database`);
+    // The path is handed to the client's own "source" command, which splits
+    // its line on whitespace and ";" rather than taking argv.
+    if (!/^[A-Za-z0-9._/@+-]+$/.test(resolved)) throw new OpError('refused', `The dump path ${resolved} contains characters the mysql client's "source" command cannot take (use letters, digits and ". _ / @ + -")`);
     if (!fs.existsSync(resolved)) throw new OpError('not_found', `${file} does not exist`);
     const scan = await scanDumpFile(resolved, { database, definerPrefix });
     if (!scan.ok) throw new OpError('refused', `${path.basename(resolved)} line ${scan.line}: ${scan.reason}; review the dump and import it by hand if it is legitimate`);

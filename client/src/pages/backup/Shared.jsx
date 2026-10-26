@@ -154,8 +154,8 @@ export function DestinationFields({ value, onChange, errors = {}, editing = fals
       {value.kind === 'sftp' && (
         <>
           <Field label="Private key (PEM, optional)" error={err('privateKey')} help={secretHelp || 'Used instead of, or in addition to, the password'}><Textarea value={value.privateKey} onChange={(v) => set('privateKey', v)} rows={4} mono /></Field>
-          <Field label="Host key SHA-256 (optional)" error={err('hostKeySha256')} help="Base64 fingerprint as printed by ssh-keyscan | ssh-keygen -lf -. Pins the server identity."><TextInput value={value.hostKeySha256} onChange={(v) => set('hostKeySha256', v.trim())} /></Field>
-          <Field inline><Toggle checked={value.insecure} onChange={(v) => set('insecure', v)} label="Skip known_hosts verification" description="Ignored when a host key fingerprint is set" /></Field>
+          <Field label="Host key SHA-256" required={!value.insecure} error={err('hostKeySha256')} help="Base64 fingerprint as printed by ssh-keyscan host | ssh-keygen -lf -. Pins the server identity; required unless verification is skipped below."><TextInput value={value.hostKeySha256} onChange={(v) => set('hostKeySha256', v.trim())} /></Field>
+          <Field inline><Toggle checked={value.insecure} onChange={(v) => set('insecure', v)} label="Skip host key verification" description="Not recommended: the connection can be intercepted. Ignored when a fingerprint is set." /></Field>
         </>
       )}
       {value.kind === 'webdav' && (

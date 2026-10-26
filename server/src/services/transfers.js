@@ -36,15 +36,28 @@ const SHADOW_HASH = /^\$[A-Za-z0-9]{1,6}\$[A-Za-z0-9./$=+,-]{8,500}$/;
 const AUTH_PLUGINS = new Set(['mysql_native_password', 'caching_sha2_password', 'sha256_password', 'ed25519']);
 const AUTH_HASH = /^(?:\*[0-9A-F]{40}|0x[0-9A-Fa-f]{2,1024}|\$[A-Za-z0-9./$+=]{8,300}|[A-Za-z0-9+/=]{20,100})$/;
 const SYSTEM_DATABASES = new Set(['mysql', 'sys', 'information_schema', 'performance_schema']);
-// Socket-client timeouts for the long agent ops (split mode defaults to 1 h);
-// they match the maxima of the ops' own timeoutMs schemas.
-const COPY_TIMEOUT_MS = 86_400_000;
-const IMPORT_TIMEOUT_MS = 7_200_000;
+// Agent-side timeouts of the long ops: the split-mode socket client gives up
+// after 1 h unless told otherwise, so every call passes the op's own limit
+// plus a minute for the result to travel back.
+const LONG_OPS = {
+  'transfer.remote.rsync': 86_400_000,
+  'transfer.cpmove.extract': 86_400_000,
+  'transfer.cpmove.inspect': 3_600_000,
+  'transfer.cpmove.read_member': 3_600_000,
+  'transfer.remote.dump_database': 7_200_000,
+  'transfer.mysql.import': 7_200_000,
+};
+const LONG_OP_GRACE_MS = 60_000;
 const INSPECT_CACHE_MS = 3600_000;
+const ZONE_KEEP_BYTES = 64 * 1024;
 
 const isCapabilityMissing = (err) => err instanceof CapabilityError || err?.code === 'capability_missing' || err?.code === 'binary_not_found' || err?.status === 501;
 const isConflict = (err) => err?.status === 409 || err?.code === 'exists' || err?.code === 'conflict';
 const belongsTo = (name, prefix) => name === prefix || name.startsWith(`${prefix}_`);
+// ensureVhost reports these after the vhost files were written and Apache
+// reloaded: the site serves, only the PHP handler is missing.
+const PHP_WARNINGS = new Set(['php_missing', 'php_pool_failed']);
+const sameOrInside = (p, root) => p === root || p.startsWith(`${root}/`);
 
 // A database user of the source account renamed for the local one: "bob" ->
 // "robert", "bob_app" -> "robert_app".
@@ -149,6 +162,38 @@ export function parseUserdata(text) {
   return { documentroot: out.documentroot || null, servername: out.servername?.toLowerCase() || null, ip: out.ip || null, phpversion: out.phpversion || null };
 }
 
+// /var/cpanel/userdata/<user>/main: the YAML-ish map of a cPanel account's
+// domains (addon_domains: {addon: via-subdomain}, parked_domains and
+// sub_domains as lists). Only these three sections are read.
+export function parseUserdataMain(text) {
+  const out = { addons: {}, parked: [], subs: [] };
+  let section = null;
+  const domain = (s) => { const d = String(s || '').trim().replace(/^['"]|['"]$/g, '').toLowerCase(); return /^[a-z0-9.-]+\.[a-z0-9-]{2,}$/.test(d) ? d : null; };
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.replace(/\s+$/, '');
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const head = line.match(/^([a-z_]+):\s*(.*)$/);
+    if (head) { section = head[1]; if (head[2] && head[2] !== '{}' && head[2] !== '[]') section = null; continue; }
+    const m = line.match(/^\s+(?:-\s*)?([^:#]+?)(?::\s*(.*))?$/);
+    if (!m) continue;
+    if (section === 'addon_domains') { const a = domain(m[1]); const via = domain(m[2]); if (a) out.addons[a] = via; }
+    else if (section === 'parked_domains') { const d = domain(m[1]); if (d) out.parked.push(d); }
+    else if (section === 'sub_domains') { const d = domain(m[1]); if (d) out.subs.push(d); }
+  }
+  return out;
+}
+
+// Rewrites a source address inside zone text only where it stands as a whole
+// token, so 10.0.0.1 never touches 10.0.0.10 or 110.0.0.1.
+export function rewriteZoneAddresses(text, from, to) {
+  let body = text;
+  for (const ip of from) {
+    if (!ip || ip === to) continue;
+    body = body.replace(new RegExp(`(?<![0-9A-Fa-f.:])${ip.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![0-9A-Fa-f.:])`, 'g'), to);
+  }
+  return body;
+}
+
 export function createTransfersService(ctx) {
   const { db, agent, capabilities, settings, logger, jobs } = ctx;
   const stmts = {
@@ -181,6 +226,7 @@ export function createTransfersService(ctx) {
     addonRow: db.prepare("SELECT d.*, a.username, a.owner_id, a.home_dir, a.ip, a.domain AS main_domain, a.package_name, a.id AS account_id FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE d.domain = ? AND d.type = 'addon'"),
     addonRows: db.prepare("SELECT d.*, a.username, a.owner_id, a.home_dir, a.domain AS main_domain, a.package_name FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE d.type = 'addon' AND (@owner IS NULL OR a.owner_id = @owner) ORDER BY a.username, d.domain"),
     linkedSubs: db.prepare("SELECT * FROM account_domains WHERE account_id = ? AND type = 'sub' AND docroot = ?"),
+    domainsOfAccount: db.prepare('SELECT id, domain, type, docroot FROM account_domains WHERE account_id = ?'),
     insertDomain: db.prepare('INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, ?, ?, ?)'),
     insertDomainFull: db.prepare('INSERT INTO account_domains (id, account_id, domain, type, docroot, php_version, created_at) VALUES (@id, @account_id, @domain, @type, @docroot, @php_version, @created_at)'),
     deleteDomain: db.prepare('DELETE FROM account_domains WHERE id = ?'),
@@ -192,6 +238,7 @@ export function createTransfersService(ctx) {
   const inspectCache = new Map();
 
   const audit = (req, entry) => (req?.audit ? req.audit(entry) : ctx.auditRecord?.(req ?? null, entry));
+  const op = (name, args, req) => agent.op(name, args, LONG_OPS[name] ? { req, timeoutMs: LONG_OPS[name] + LONG_OP_GRACE_MS } : { req });
   const stagingDir = () => settings.get('transfers.staging_dir', '/var/lib/whm/transfers');
   const uploadDir = () => path.join(stagingDir(), 'uploads');
   const retentionDays = () => Math.max(1, Number(settings.get('transfers.run_retention_days', 90)) || 90);
@@ -203,12 +250,28 @@ export function createTransfersService(ctx) {
   }
 
   // A request-like principal for the job worker so ctx.accounts / ctx.dns audit
-  // and authorise as the user who started the run.
+  // and authorise as the user who started the run. A run whose requester was
+  // deleted in the meantime must not fall back to root authority; only jobs
+  // nobody requested (the cleanup schedule) act as the scheduler.
   function actorRequest(userId, requestId) {
-    const user = (userId && stmts.userById.get(userId)) || { id: null, username: 'scheduler', role: 'root' };
+    let user;
+    if (userId == null) user = { id: null, username: 'scheduler', role: 'root' };
+    else {
+      user = stmts.userById.get(userId);
+      if (!user) throw new HttpError(403, 'forbidden', `The user who requested this run (id ${userId}) no longer exists; nothing was done`);
+    }
     const req = { user, ip: null, id: requestId ?? null };
     req.audit = (entry) => ctx.auditRecord?.(req, entry);
     return req;
+  }
+
+  function actorForRun(run, userId, jobCtx) {
+    try {
+      return actorRequest(userId ?? run.created_by, `job:${jobCtx.job?.id ?? ''}`);
+    } catch (err) {
+      stmts.finishRun.run('failed', JSON.stringify({ ...totalsOf(run.id), error: err.message }), run.id);
+      throw err;
+    }
   }
 
   // Agent failures that are the remote server's or the caller's fault surface
@@ -431,7 +494,7 @@ export function createTransfersService(ctx) {
       if (!overwrite) return { name, status: 'skipped', detail: 'database already exists (overwrite is off)' };
     }
     try {
-      await agent.op('transfer.mysql.import', { path: dumpPath, database: name, definerPrefix: sourceUsername, credentials: localDbCredentials() }, { req, timeoutMs: IMPORT_TIMEOUT_MS });
+      await op('transfer.mysql.import', { path: dumpPath, database: name, definerPrefix: sourceUsername, credentials: localDbCredentials() }, req);
       return { name, status: 'applied', detail: 'imported' };
     } catch (err) {
       return { name, status: isCapabilityMissing(err) ? 'pending' : 'failed', detail: err.message };
@@ -510,16 +573,17 @@ export function createTransfersService(ctx) {
     }
   }
 
+  // Without BIND the zone cannot be stored, so the (rewritten) source text is
+  // kept in the step for a manual import once the daemon exists.
   async function importZone({ account, domain, text, remoteIps }, user, req) {
     if (!ctx.dns) return { domain, status: 'skipped', detail: 'DNS Functions is not loaded' };
     if (text) {
-      let body = text;
-      if (account.ip) for (const ip of (remoteIps || []).filter((x) => x && x !== account.ip)) body = body.split(ip).join(account.ip);
+      const body = account.ip ? rewriteZoneAddresses(text, remoteIps || [], account.ip) : text;
       try {
         const r = await ctx.dns.saveRawZone(domain, body, user, req, { create: true });
         return { domain, status: r.applied === false ? 'pending' : 'applied', detail: `zone imported from the source${r.applied === false ? '; published once BIND runs' : ''}${remoteIps?.length && account.ip ? ` (addresses rewritten to ${account.ip})` : ''}` };
       } catch (err) {
-        if (isCapabilityMissing(err)) return { domain, status: 'pending', detail: err.message };
+        if (isCapabilityMissing(err)) return { domain, status: 'pending', detail: `${err.message} The source zone was not stored: import the text kept with this step by hand (DNS Zone Manager → raw zone) once BIND is installed.`, zone: body.length > ZONE_KEEP_BYTES ? `${body.slice(0, ZONE_KEEP_BYTES)}\n; [truncated]\n` : body };
         logger.warn({ err, domain }, 'transfer: source zone rejected, creating a standard zone instead');
       }
     }
@@ -559,6 +623,7 @@ export function createTransfersService(ctx) {
       const r = await ctx.web.ensureVhost(account.username, req);
       if (r.applied) return { detail: `${r.vhosts?.length ?? 1} vhost(s) written${r.reload?.reloaded ? ', web server reloaded' : ''}` };
       if (r.reason === 'capability_missing') return { status: 'pending', detail: 'Apache is not installed; the vhosts are written when it is' };
+      if (PHP_WARNINGS.has(r.reason)) return { detail: `vhost(s) written; PHP handler not applied (${r.reason === 'php_missing' ? 'PHP-FPM is not installed' : 'the PHP-FPM pool could not be written'})`, warning: r.reason };
       return { status: 'failed', detail: r.vhosts?.find((v) => !v.applied)?.error || r.reason || 'vhost not applied' };
     });
     steps.mail = await step(async () => {
@@ -646,7 +711,7 @@ export function createTransfersService(ctx) {
     if (options.skipHome) steps.home = { status: 'skipped', detail: 'not requested' };
     else {
       steps.home = await step(async () => {
-        const r = await agent.op('transfer.remote.rsync', { connection: connectionOf(sessionRow), remotePath: remoteHome, localPath: account.home_dir, directory: true, excludes: HOME_EXCLUDES, bwlimitKbps: bwlimit() }, { req, timeoutMs: COPY_TIMEOUT_MS });
+        const r = await op('transfer.remote.rsync', { connection: connectionOf(sessionRow), remotePath: remoteHome, localPath: account.home_dir, directory: true, excludes: HOME_EXCLUDES, bwlimitKbps: bwlimit() }, req);
         if (account.uid != null) await agent.op('fs.chown', { path: account.home_dir, owner: account.username, recursive: true }, { req });
         return { detail: `${r.filesTransferred ?? r.files ?? '?'} file(s), ${r.transferredBytes ?? 0} bytes copied from ${remoteHome}${r.partial ? ' (some files vanished or were unreadable)' : ''}`, bytes: r.transferredBytes ?? null };
       });
@@ -664,8 +729,8 @@ export function createTransfersService(ctx) {
         const local = path.join(stagingDir(), `run-${runId}`, `${target}.sql`);
         let dump = null;
         try {
-          dump = await agent.op('transfer.remote.dump_database', { connection: connectionOf(sessionRow), database: name }, { req, timeoutMs: IMPORT_TIMEOUT_MS });
-          await agent.op('transfer.remote.rsync', { connection: connectionOf(sessionRow), remotePath: dump.remotePath, localPath: local, directory: false, bwlimitKbps: bwlimit() }, { req, timeoutMs: COPY_TIMEOUT_MS });
+          dump = await op('transfer.remote.dump_database', { connection: connectionOf(sessionRow), database: name }, req);
+          await op('transfer.remote.rsync', { connection: connectionOf(sessionRow), remotePath: dump.remotePath, localPath: local, directory: false, bwlimitKbps: bwlimit() }, req);
           const r = await importDatabase({ account, name: target, dumpPath: local, overwrite: options.overwrite, sourceUsername: item.source_username }, user, req);
           steps.databases.push({ ...r, name: target, source: name, sizeBytes: dump.sizeBytes });
           log(`${item.username}: database ${name} → ${target} ${r.status}${r.detail ? ` – ${r.detail}` : ''}`, r.status === 'failed' ? 'error' : 'info');
@@ -685,16 +750,28 @@ export function createTransfersService(ctx) {
       }
     }
 
-    // Addon/sub/parked domains of the source (cPanel userdomains); docroots come
-    // from the source's userdata when readable.
+    // Addon/sub/parked domains of the source (cPanel userdomains). The
+    // account's userdata/main tells parked (alias) domains, which share
+    // public_html, from addons, whose docroots come from userdata/<domain>;
+    // the subdomain an addon is served through is not added on its own.
     const extra = [];
+    let main = { addons: {}, parked: [], subs: [] };
+    if (plan.remote?.domains?.length) {
+      try {
+        const f = await agent.op('transfer.remote.read_file', { connection: connectionOf(sessionRow), path: `/var/cpanel/userdata/${item.source_username}/main` }, { req });
+        if (f.exists) main = parseUserdataMain(f.content);
+      } catch { /* not cPanel or unreadable: every extra domain is an addon or sub */ }
+    }
+    const addonVia = new Set(Object.values(main.addons).filter(Boolean));
     for (const d of plan.remote?.domains || []) {
+      if (main.parked.includes(d)) { extra.push({ domain: d, type: 'parked', docroot: null }); continue; }
+      if (addonVia.has(d) && !main.addons[d]) continue;
       let docroot = null;
       try {
         const ud = await agent.op('transfer.remote.read_file', { connection: connectionOf(sessionRow), path: `/var/cpanel/userdata/${item.source_username}/${d}` }, { req });
         if (ud.exists) docroot = rewriteHome(parseUserdata(ud.content).documentroot, remoteHome, account.home_dir);
       } catch { /* not cPanel or unreadable: default docroot */ }
-      extra.push({ domain: d, docroot });
+      extra.push({ domain: d, ...(main.addons[d] !== undefined ? { type: 'addon' } : {}), docroot });
     }
     const { added, skipped } = addDomains(account, extra);
     steps.domains = { status: 'applied', detail: `${added.length} additional domain(s) added${skipped.length ? `, ${skipped.length} already hosted (${skipped.join(', ')})` : ''}`, added };
@@ -722,7 +799,7 @@ export function createTransfersService(ctx) {
     const { runId, userId } = jobCtx.params;
     const run = stmts.run.get(runId);
     if (!run) throw new Error(`run ${runId} not found`);
-    const req = actorRequest(userId ?? run.created_by, `job:${jobCtx.job?.id ?? ''}`);
+    const req = actorForRun(run, userId, jobCtx);
     const user = req.user;
     const params = json.parse(run.params_json, {});
     const sessionRow = run.session_id ? stmts.session.get(run.session_id) : null;
@@ -787,7 +864,7 @@ export function createTransfersService(ctx) {
         const key = st?.exists && st.size != null && st.mtime ? `${st.size}:${st.mtime}` : null;
         const hit = key ? inspectCache.get(file) : null;
         if (hit && hit.key === key && Date.now() - hit.at < INSPECT_CACHE_MS) return annotate(hit.info);
-        const info = await agent.op('transfer.cpmove.inspect', { path: file }, { req });
+        const info = await op('transfer.cpmove.inspect', { path: file }, req);
         if (key) {
           inspectCache.set(file, { key, info, at: Date.now() });
           if (inspectCache.size > 50) inspectCache.delete(inspectCache.keys().next().value);
@@ -800,12 +877,20 @@ export function createTransfersService(ctx) {
   const shapeUpload = (u) => ({ id: u.id, filename: u.filename, path: u.path, size: u.size, received: u.received, chunks: u.chunks, chunkBytes: UPLOAD_CHUNK_BYTES });
 
   const uploadsApi = {
-    begin({ filename, size }, user, req) {
+    // The first chunk truncates the target, so a name already in the staging
+    // directory (or being uploaded by someone else) is refused rather than
+    // overwritten under an admin who may be restoring it.
+    async begin({ filename, size }, user, req) {
       assertRoot(user, 'Uploading archives');
       if (!ARCHIVE_NAME.test(filename)) throw unprocessable('Archive names must end in .tar.gz, .tgz or .tar', { filename: ['Not an archive file name'] });
       for (const [id, u] of uploads) if (Date.now() - u.touched > 6 * 3600_000) uploads.delete(id);
+      const target = path.join(uploadDir(), filename);
+      for (const u of uploads.values()) if (u.path === target) throw conflict(`${filename} is being uploaded already (upload ${u.id}); wait for it to finish, abort it, or choose another name`);
+      let st = null;
+      try { st = await agent.op('fs.stat', { path: target }, { req }); } catch (err) { throw translate(err); }
+      if (st?.exists) throw conflict(`${filename} already exists in ${uploadDir()}; remove it or upload under another name`);
       const id = crypto.randomBytes(12).toString('hex');
-      uploads.set(id, { id, path: path.join(uploadDir(), filename), filename, size, received: 0, chunks: 0, createdBy: user.id ?? null, touched: Date.now(), started: false });
+      uploads.set(id, { id, path: target, filename, size, received: 0, chunks: 0, createdBy: user.id ?? null, touched: Date.now(), started: false });
       audit(req, { action: 'transfer.upload.begin', target: filename, args: { size } });
       return shapeUpload(uploads.get(id));
     },
@@ -871,7 +956,7 @@ export function createTransfersService(ctx) {
     const file = params.path;
     const top = archive.top;
     const member = (rel) => `${top}/${rel}`;
-    const readMember = async (rel) => { const r = await agent.op('transfer.cpmove.read_member', { path: file, member: member(rel) }, { req }); return r.exists ? r.content : null; };
+    const readMember = async (rel) => { const r = await op('transfer.cpmove.read_member', { path: file, member: member(rel) }, req); return r.exists ? r.content : null; };
     const { account, created } = await ensureAccount({ username: item.username, domain: item.domain, pkg: params.package, contactEmail: archive.config?.contactEmail, overwrite: options.overwrite }, user, req, log);
     steps.account = { status: 'applied', detail: created ? `created from ${path.basename(file)}` : 'existing account reused' };
     const sourceHome = `/home/${archive.config?.raw?.USER || params.sourceUsername || item.username}`;
@@ -894,7 +979,7 @@ export function createTransfersService(ctx) {
     else if (!archive.hasHomedir) steps.home = { status: 'skipped', detail: 'the archive has no homedir/' };
     else {
       steps.home = await step(async () => {
-        const r = await agent.op('transfer.cpmove.extract', { path: file, destination: account.home_dir, members: [member('homedir/*')], stripComponents: 2, owner: account.uid != null ? account.username : undefined }, { req, timeoutMs: COPY_TIMEOUT_MS });
+        const r = await op('transfer.cpmove.extract', { path: file, destination: account.home_dir, members: [member('homedir/*')], stripComponents: 2, owner: account.uid != null ? account.username : undefined }, req);
         return { detail: r.extracted ? `homedir extracted into ${account.home_dir}` : 'homedir/ was empty' };
       });
       log(`${item.username}: home ${steps.home.status}${steps.home.detail ? ` – ${steps.home.detail}` : ''}`, steps.home.status === 'failed' ? 'error' : 'info');
@@ -909,7 +994,7 @@ export function createTransfersService(ctx) {
         const target = targetDatabaseName(name, src, item.username);
         const dumpPath = path.join(staging, `${name}.sql`);
         try {
-          const ex = await agent.op('transfer.cpmove.extract', { path: file, destination: staging, members: [member(`mysql/${name}.sql`)], stripComponents: 2 }, { req, timeoutMs: COPY_TIMEOUT_MS });
+          const ex = await op('transfer.cpmove.extract', { path: file, destination: staging, members: [member(`mysql/${name}.sql`)], stripComponents: 2 }, req);
           if (!ex.extracted) { steps.databases.push({ name: target, source: name, status: 'failed', detail: 'dump missing from the archive' }); continue; }
           const r = await importDatabase({ account, name: target, dumpPath, overwrite: options.overwrite, sourceUsername: src }, user, req);
           steps.databases.push({ ...r, name: target, source: name });
@@ -967,7 +1052,7 @@ export function createTransfersService(ctx) {
     const { runId, userId } = jobCtx.params;
     const run = stmts.run.get(runId);
     if (!run) throw new Error(`run ${runId} not found`);
-    const req = actorRequest(userId ?? run.created_by, `job:${jobCtx.job?.id ?? ''}`);
+    const req = actorForRun(run, userId, jobCtx);
     const params = json.parse(run.params_json, {});
     stmts.runStatus.run('running', runId);
     const items = stmts.queuedItems.all(runId);
@@ -1002,17 +1087,37 @@ export function createTransfersService(ctx) {
     return row;
   }
 
+  // Why the addon's document root must not be deleted from the old account:
+  // it is (or contains) the account's home or main site, or another domain
+  // that stays behind is served from it. Addon docroots are free-form, so
+  // cPanel allows every one of these layouts.
+  function removeSourceIssue(addon, docroot) {
+    if (sameOrInside(addon.home_dir, docroot) || sameOrInside(`${addon.home_dir}/public_html`, docroot)) return `the document root ${docroot} is the home directory or main site of ${addon.username}; the files cannot be deleted from the old account`;
+    const moving = new Set([addon.id, ...stmts.linkedSubs.all(addon.account_id, docroot).map((d) => d.id)]);
+    for (const d of stmts.domainsOfAccount.all(addon.account_id)) {
+      if (moving.has(d.id)) continue;
+      const other = d.docroot || `${addon.home_dir}/public_html/${d.domain}`;
+      if (sameOrInside(other, docroot) || sameOrInside(docroot, other)) return `${d.domain} (${d.type}) of ${addon.username} is served from ${other}, inside the files to delete; keep the source files`;
+    }
+    return null;
+  }
+
   function previewConvertAddon(input, user) {
     const addon = loadAddon(input.domain, user);
+    const options = { copyFiles: true, removeSource: false, moveMail: true, moveDatabases: [], ...(input.options || {}) };
     const issues = [];
     if (stmts.account.get(input.username)) issues.push(`${input.username} already exists on this server`);
     if (input.username === addon.username) issues.push('The new username must differ from the current account');
     if (input.package && !stmts.packageByName.get(input.package)) issues.push(`Package "${input.package}" does not exist`);
     const docroot = addon.docroot || `${addon.home_dir}/public_html/${addon.domain}`;
     const linked = stmts.linkedSubs.all(addon.account_id, docroot).map((d) => d.domain);
+    if (options.removeSource) { const why = removeSourceIssue(addon, docroot); if (why) issues.push(`Cannot delete the source files: ${why}`); }
     const zone = (() => { try { return db.prepare('SELECT id, domain FROM dns_zones WHERE domain = ?').get(addon.domain); } catch { return null; } })();
     let databases = [];
-    try { databases = db.prepare('SELECT name FROM databases WHERE account_id = ?').all(addon.account_id).map((d) => d.name); } catch { databases = []; }
+    // Reassigning a database is the root-only Database Map Tool, so resellers
+    // are not offered it (and a selection they send anyway blocks the plan).
+    if (isRoot(user)) { try { databases = db.prepare('SELECT name FROM databases WHERE account_id = ?').all(addon.account_id).map((d) => d.name); } catch { databases = []; } }
+    else if (options.moveDatabases?.length) issues.push('Moving databases to the new account requires the root user; leave the databases with the current account');
     const caps = capabilityStatus();
     const warnings = [];
     if (!caps.rsync.installed) warnings.push('rsync is not installed here: the document root cannot be copied (the account is created with an empty public_html)');
@@ -1022,7 +1127,7 @@ export function createTransfersService(ctx) {
     return {
       addon: { domain: addon.domain, account: addon.username, mainDomain: addon.main_domain, docroot, linkedSubdomains: linked, package: addon.package_name, zone: Boolean(zone), databases },
       target: { username: input.username, domain: addon.domain, home: `${homeRoot}/${input.username}`, package: input.package || addon.package_name, docroot: `${homeRoot}/${input.username}/public_html` },
-      options: { copyFiles: true, removeSource: false, moveMail: true, moveDatabases: [], ...(input.options || {}) },
+      options,
       issues, warnings, capabilities: caps, ok: issues.length === 0,
     };
   }
@@ -1049,6 +1154,8 @@ export function createTransfersService(ctx) {
     if (!isRoot(user) && row.owner_id !== user.id) throw forbidden('That addon domain belongs to another reseller\'s account');
     const oldAccount = stmts.accountById.get(row.account_id);
     const docroot = row.docroot || addon.docroot;
+    // Re-checked against the rows as they are now, not the preview's snapshot.
+    const keepSource = options.removeSource ? removeSourceIssue(row, docroot) : null;
     const removedRows = [row, ...stmts.linkedSubs.all(row.account_id, docroot)].map((d) => ({ id: d.id, account_id: row.account_id, domain: d.domain, type: d.type, docroot: d.docroot ?? null, php_version: d.php_version ?? null, created_at: d.created_at }));
 
     // The domain must leave account_domains before the new account can claim
@@ -1096,6 +1203,7 @@ export function createTransfersService(ctx) {
     steps.databases = [];
     for (const name of options.moveDatabases || []) {
       if (!ctx.databases?.assign) { steps.databases.push({ name, status: 'skipped', detail: 'Database Services is not loaded' }); continue; }
+      if (!isRoot(user)) { steps.databases.push({ name, status: 'skipped', detail: 'moving databases requires the root user; the database stays with the old account' }); continue; }
       try { await ctx.databases.assign({ kind: 'database', name, account: account.username }, user, req); steps.databases.push({ name, status: 'applied', detail: `moved to ${account.username}` }); }
       catch (err) { steps.databases.push({ name, status: err.status === 403 ? 'skipped' : 'failed', detail: err.message }); }
     }
@@ -1112,10 +1220,12 @@ export function createTransfersService(ctx) {
     steps.old_web = await step(async () => {
       if (!ctx.web?.ensureVhost) return { status: 'skipped', detail: 'Service Configuration is not loaded' };
       const r = await ctx.web.ensureVhost(oldAccount.username, req);
-      return r.applied ? { detail: `${oldAccount.username}'s vhosts rewritten without ${addon.domain}` } : r.reason === 'capability_missing' ? { status: 'pending', detail: 'Apache is not installed' } : { status: 'failed', detail: r.reason || 'vhost not applied' };
+      if (r.applied || PHP_WARNINGS.has(r.reason)) return { detail: `${oldAccount.username}'s vhosts rewritten without ${addon.domain}${r.applied ? '' : ' (PHP handler not applied)'}` };
+      return r.reason === 'capability_missing' ? { status: 'pending', detail: 'Apache is not installed' } : { status: 'failed', detail: r.reason || 'vhost not applied' };
     });
 
-    if (options.removeSource && steps.files.status === 'applied') {
+    if (options.removeSource && keepSource) steps.cleanup = { status: 'skipped', detail: `source files kept: ${keepSource}` };
+    else if (options.removeSource && steps.files.status === 'applied') {
       steps.cleanup = await step(async () => { await agent.op('fs.remove', { path: docroot, recursive: true }, { req }); return { detail: `${docroot} removed from ${oldAccount.username}` }; });
     } else steps.cleanup = { status: 'skipped', detail: options.removeSource ? 'files were not copied' : 'source files kept' };
 
@@ -1127,7 +1237,7 @@ export function createTransfersService(ctx) {
     const { runId, userId } = jobCtx.params;
     const run = stmts.run.get(runId);
     if (!run) throw new Error(`run ${runId} not found`);
-    const req = actorRequest(userId ?? run.created_by, `job:${jobCtx.job?.id ?? ''}`);
+    const req = actorForRun(run, userId, jobCtx);
     const params = json.parse(run.params_json, {});
     stmts.runStatus.run('running', runId);
     const items = stmts.queuedItems.all(runId);

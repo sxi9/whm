@@ -24,6 +24,13 @@ const DEFAULTS = {
 };
 const SECRET_FIELDS = ['password', 'secretKey', 'privateKey'];
 const SCHEDULE_NAME = 'backup-run';
+// Hand-copied archives are registered from the panel's own directories only;
+// a file in an account home is moved there by root first.
+const IMPORT_ROOTS = ['/backup', '/var/backups/whm'];
+// Ops declared with a longer agent-side timeout than the socket client's 1 h
+// default get a matching per-call timeout (contract §5).
+const LONG_OPS = { 'backup.account.archive': 7_200_000, 'backup.archive.extract': 7_200_000, 'backup.files.restore': 7_200_000, 'backup.db.import': 7_200_000, 'backup.destination.upload': 7_200_000, 'backup.destination.download': 7_200_000, 'backup.archive.verify': 3_600_000 };
+const RESTORABLE_DOMAIN_TYPES = ['addon', 'sub', 'parked', 'alias'];
 
 const isCapabilityMissing = (err) => err instanceof CapabilityError || err?.code === 'capability_missing' || err?.code === 'binary_not_found';
 
@@ -44,6 +51,24 @@ export function planPrune(backups, retention) {
     remove.push(...rows.slice(keep));
   }
   return remove;
+}
+
+// The database a GRANT line names (SHOW GRANTS form), with MySQL's "\_" /
+// "\%" escapes removed; null when the line is not a database grant.
+export function grantDatabase(line) {
+  const m = String(line).match(/^GRANT (.+?) ON (\*|`[^`]*(?:``[^`]*)*`|[^ ]+)\.(\*|`[^`]+`|[^ ]+) TO /i);
+  if (!m) return null;
+  const unq = (v) => (v.startsWith('`') ? v.slice(1, -1).replace(/``/g, '`') : v);
+  return unq(m[2]).replace(/\\([_%])/g, '$1');
+}
+
+// Archive docroots point into the home the archive was taken from; they are
+// moved under the current home (another home root, a renamed mount).
+export function rewriteDocroot(docroot, sourceHome, home) {
+  if (typeof docroot !== 'string' || !docroot.startsWith('/')) return null;
+  if (sourceHome && (docroot === sourceHome || docroot.startsWith(`${sourceHome}/`))) return `${home}${docroot.slice(sourceHome.length)}`;
+  const m = docroot.match(/^\/[^/]+\/[^/]+(\/.*)?$/);
+  return m ? `${home}${m[1] || ''}` : null;
 }
 
 export function publicDestinationConfig(config) {
@@ -76,7 +101,7 @@ export function createBackupService(ctx) {
     // Ownership comes from the row (owner_id, fixed when it was written), never
     // from whichever account currently carries the username; the join only
     // tells whether such an account exists today.
-    backupById: db.prepare('SELECT b.*, a.id AS live_account_id FROM backups b LEFT JOIN accounts a ON a.username = b.account_name WHERE b.id = ?'),
+    backupById: db.prepare('SELECT b.*, a.id AS live_account_id, a.home_dir AS live_home_dir FROM backups b LEFT JOIN accounts a ON a.username = b.account_name WHERE b.id = ?'),
     backupsForAccount: db.prepare("SELECT * FROM backups WHERE account_id = ? AND account_name = ? AND status = 'done'"),
     backupByPath: db.prepare('SELECT id FROM backups WHERE path = ?'),
     lastBackupFor: db.prepare("SELECT id, created_at, size, status FROM backups WHERE account_id = ? ORDER BY created_at DESC, id DESC LIMIT 1"),
@@ -100,10 +125,12 @@ export function createBackupService(ctx) {
     restoreById: db.prepare('SELECT * FROM backup_restores WHERE id = ?'),
     restoreStart: db.prepare("UPDATE backup_restores SET status = 'running' WHERE id = ?"),
     restoreFinish: db.prepare("UPDATE backup_restores SET status = ?, summary_json = ?, error = ?, finished_at = datetime('now') WHERE id = ?"),
-    restores: db.prepare('SELECT * FROM backup_restores ORDER BY id DESC LIMIT ?'),
+    restores: db.prepare('SELECT * FROM backup_restores WHERE (@owner IS NULL OR owner_id = @owner) AND (@account IS NULL OR account_name = @account) ORDER BY id DESC LIMIT @limit'),
     userById: db.prepare('SELECT id, username, role FROM users WHERE id = ?'),
     dbProfileSecret: db.prepare('SELECT * FROM db_instances WHERE id = ?'),
     dnsZonesFor: db.prepare('SELECT domain FROM dns_zones WHERE account_id = ? ORDER BY domain'),
+    databasesOf: db.prepare('SELECT name FROM databases WHERE account_id = ?'),
+    insertDomain: db.prepare('INSERT INTO account_domains (account_id, domain, type, docroot, php_version) VALUES (?, ?, ?, ?, ?)'),
     // Current owners of the objects an archive may carry, re-checked at restore time.
     dbOwner: db.prepare('SELECT d.account_id, a.username AS account FROM databases d LEFT JOIN accounts a ON a.id = d.account_id WHERE d.name = ?'),
     dbUserOwner: db.prepare('SELECT u.account_id, a.username AS account FROM db_users u LEFT JOIN accounts a ON a.id = u.account_id WHERE u.name = ?'),
@@ -154,7 +181,9 @@ export function createBackupService(ctx) {
   }
 
   async function op(name, args, req) {
-    try { return await agent.op(name, args, { req }); } catch (err) { throw translate(err); }
+    const opts = { req };
+    if (LONG_OPS[name]) opts.timeoutMs = LONG_OPS[name] + 60_000;
+    try { return await agent.op(name, args, opts); } catch (err) { throw translate(err); }
   }
 
   // ----------------------------------------------------------- settings ---
@@ -244,7 +273,8 @@ export function createBackupService(ctx) {
     return shapeDestination(stmts.destinationById.get(lastInsertRowid));
   }
 
-  // Secrets left empty in an update keep their stored value.
+  // Secrets left empty in an update keep their stored value; an explicit null
+  // removes one (switching an SFTP destination from a key to a password).
   function updateDestination(id, patch, req) {
     const row = loadDestination(id);
     const current = destinationConfig(row);
@@ -254,7 +284,10 @@ export function createBackupService(ctx) {
       const { kind: _k, ...incoming } = patch.config;
       merged = kind === row.kind ? { ...current, ...incoming } : { ...incoming };
       delete merged.kind;
-      for (const f of SECRET_FIELDS) if (kind === row.kind && (incoming[f] === '' || incoming[f] === undefined) && current[f] !== undefined) merged[f] = current[f];
+      for (const f of SECRET_FIELDS) {
+        if (incoming[f] === null) { delete merged[f]; continue; }
+        if (kind === row.kind && (incoming[f] === '' || incoming[f] === undefined) && current[f] !== undefined) merged[f] = current[f];
+      }
     } else { merged = { ...current }; delete merged.kind; }
     if (patch.name && patch.name !== row.name && stmts.destinationByName.get(patch.name)) throw conflict(`A destination named "${patch.name}" already exists`);
     stmts.updateDestination.run({ id, name: patch.name ?? row.name, kind, config_enc: crypto.encrypt(JSON.stringify(merged)), enabled: patch.enabled == null ? row.enabled : patch.enabled ? 1 : 0 });
@@ -333,7 +366,7 @@ export function createBackupService(ctx) {
   function shapeBackup(row, { withUploads = true } = {}) {
     if (!row) return null;
     return {
-      id: row.id, account: row.account_name, accountExists: row.live_account_id != null || row.account_id != null, type: row.type, path: row.path, name: row.path ? path.basename(row.path) : null,
+      id: row.id, account: row.account_name, accountExists: row.live_account_id != null || row.account_id != null, home_dir: row.live_home_dir ?? null, type: row.type, path: row.path, name: row.path ? path.basename(row.path) : null,
       size: row.size, sha256: row.sha256, status: row.status, error: row.error, created_at: row.created_at, run_id: row.run_id,
       retention_class: row.retention_class, pinned: Boolean(row.pinned), local_present: Boolean(row.local_present), components: json.parse(row.components_json, {}),
       uploads: withUploads ? stmts.uploadsFor.all(row.id).map((u) => ({ id: u.id, destination_id: u.destination_id, destination: u.destination_name, remote_path: u.remote_path, status: u.status, error: u.error, uploaded_at: u.uploaded_at })) : undefined,
@@ -359,7 +392,7 @@ export function createBackupService(ctx) {
     if (query.status) { where.push('b.status = @status'); params.status = query.status; }
     if (query.q) { where.push('(b.account_name LIKE @q OR b.path LIKE @q)'); params.q = `%${query.q}%`; }
     const result = paginate(db, {
-      select: 'b.*, a.id AS live_account_id', from: 'backups b LEFT JOIN accounts a ON a.username = b.account_name', where, params,
+      select: 'b.*, a.id AS live_account_id, a.home_dir AS live_home_dir', from: 'backups b LEFT JOIN accounts a ON a.username = b.account_name', where, params,
       sortable: { created_at: 'b.created_at', account: 'b.account_name', size: 'b.size', status: 'b.status', retention_class: 'b.retention_class' },
       defaultSort: 'created_at', query: { ...query, dir: query.sort ? query.dir : 'desc' },
     });
@@ -444,6 +477,8 @@ export function createBackupService(ctx) {
 
   async function registerArchive(archivePath, user, req) {
     if (!isRoot(user)) throw forbidden('Only root can import archives');
+    const roots = [...new Set([localDir(), ...IMPORT_ROOTS])];
+    if (!roots.some((r) => archivePath.startsWith(`${r}/`))) throw unprocessable(`Archives are imported from ${roots.join(', ')} only; move the file there as root first`, { path: [`Must be under ${roots.join(' or ')}`] });
     await requireTar();
     if (stmts.backupByPath.get(archivePath)) throw conflict('That archive is already registered');
     const info = await op('backup.archive.info', { archive: archivePath }, req);
@@ -735,10 +770,7 @@ export function createBackupService(ctx) {
   }
 
   function listRestores({ limit = 50, account } = {}, user) {
-    let rows = stmts.restores.all(limit);
-    if (!isRoot(user)) rows = rows.filter((r) => r.owner_id != null && r.owner_id === user.id);
-    if (account) rows = rows.filter((r) => r.account_name === account);
-    return rows.map(shapeRestore);
+    return stmts.restores.all({ owner: isRoot(user) ? null : user.id, account: account ?? null, limit }).map(shapeRestore);
   }
 
   // The objects inside an archive may have changed hands since it was written;
@@ -761,6 +793,62 @@ export function createBackupService(ctx) {
     const owned = ownedByAccount(stmts.domainOwner.get(domain), account);
     if (!owned.ok) return owned;
     return ownedByAccount(stmts.mailDomainOwner.get(domain), account);
+  }
+
+  // Grants come back only for databases the archive restored into this account
+  // or the account owns today; global, system-schema and wildcard grants never do.
+  function filterGrants(grants, allowed) {
+    const kept = [];
+    const dropped = [];
+    for (const line of grants || []) {
+      if (typeof line !== 'string') continue;
+      const database = grantDatabase(line);
+      const reason = database == null ? 'not a database grant' : database === '*' ? 'global grant' : SYSTEM_SCHEMAS.has(database.toLowerCase()) ? 'system schema' : !/^[a-z0-9_]{1,64}$/.test(database) ? 'wildcard database' : !allowed.has(database) ? 'database not restored for this account' : null;
+      if (reason) dropped.push(`${line.slice(0, 160)} (${reason})`);
+      else kept.push(line);
+    }
+    return { kept, dropped };
+  }
+
+  // Parked/addon/sub domains recorded in the archive metadata come back as
+  // account_domains rows (docroots moved under the current home) and one vhost
+  // sync; a domain that another account hosts today is left with it.
+  async function restoreDomains(account, meta, req, log) {
+    const home = homeOf(account);
+    const sourceHome = typeof meta.account?.home_dir === 'string' ? meta.account.home_dir : null;
+    const domains = [];
+    let added = 0;
+    for (const d of meta.domains) {
+      if (typeof d?.domain !== 'string' || !RESTORABLE_DOMAIN_TYPES.includes(d.type) || d.domain === account.domain) continue;
+      const owner = stmts.domainOwner.get(d.domain);
+      const claim = ownedByAccount(owner, account);
+      if (!claim.ok) { domains.push({ domain: d.domain, type: d.type, status: 'skipped', detail: claim.reason }); log(`domain ${d.domain} skipped: ${claim.reason}`, 'warn'); continue; }
+      if (owner) { domains.push({ domain: d.domain, type: d.type, status: 'kept', detail: 'already on the account' }); continue; }
+      const sub = d.type === 'sub' && d.domain.endsWith(`.${account.domain}`) ? d.domain.slice(0, -(account.domain.length + 1)) : d.domain;
+      const docroot = rewriteDocroot(d.docroot, sourceHome, home) ?? (d.type === 'parked' || d.type === 'alias' ? `${home}/public_html` : `${home}/public_html/${sub}`);
+      try {
+        stmts.insertDomain.run(account.id, d.domain, d.type, docroot, typeof d.php_version === 'string' ? d.php_version : null);
+        added += 1;
+        domains.push({ domain: d.domain, type: d.type, docroot, status: 'added' });
+      } catch (err) { domains.push({ domain: d.domain, type: d.type, status: 'failed', detail: err.message }); }
+    }
+    let web = null;
+    if (added) {
+      if (!ctx.web?.ensureVhost) web = { status: 'skipped', detail: 'Service Configuration is not loaded' };
+      else {
+        try {
+          const r = await ctx.web.ensureVhost(account.username, req);
+          const warning = ['php_missing', 'php_pool_failed'].includes(r?.reason);
+          if (r?.applied || warning) web = { status: 'done', detail: warning ? `vhosts written (${r.reason})` : 'vhosts written' };
+          else if (r?.reason === 'capability_missing') web = { status: 'pending', detail: 'Apache is not installed; the vhosts are written when it is' };
+          else web = { status: 'failed', detail: r?.vhosts?.find((v) => !v.applied)?.error || r?.reason || 'vhost not applied' };
+          for (const d of domains) { const v = r?.vhosts?.find((x) => x.domain === d.domain); if (v) d.vhost = v.applied ? 'applied' : v.reason || 'failed'; }
+        } catch (err) { web = { status: isCapabilityMissing(err) ? 'pending' : 'failed', detail: err.message }; }
+      }
+    }
+    const counts = { added, kept: domains.filter((d) => d.status === 'kept').length, skipped: domains.filter((d) => d.status === 'skipped').length, failed: domains.filter((d) => d.status === 'failed').length };
+    const status = counts.failed && !added ? 'failed' : web?.status === 'failed' ? 'failed' : web?.status === 'pending' ? 'pending' : !added && counts.skipped && !counts.kept ? 'skipped' : 'done';
+    return { status, detail: `${added} domain(s) re-added, ${counts.kept} kept, ${counts.skipped} skipped${counts.failed ? `, ${counts.failed} failed` : ''}${web ? `; vhosts: ${web.detail}` : ''}`, domains, web };
   }
 
   async function runRestoreJob(jobCtx) {
@@ -812,6 +900,10 @@ export function createBackupService(ctx) {
           account = stmts.accountByUsername.get(restore.account_name);
           step('account', { status: 'done', detail: `created ${created.username} (${domain}, package ${created.package_name})`, provisioning: created.provisioning });
         } else step('account', { status: 'done', detail: 'account exists; data is restored into it' });
+        if (Array.isArray(meta.domains) && meta.domains.length) {
+          jobCtx.progress(28, 'restoring domains');
+          step('domains', await restoreDomains(account, meta, req, jobCtx.log));
+        }
         if (options.files !== false) {
           jobCtx.progress(35, 'restoring home directory');
           const r = await op('backup.files.restore', { archive, username: account.username, homeDir: homeOf(account), paths: [], overwrite: options.overwrite !== false }, req);
@@ -825,9 +917,11 @@ export function createBackupService(ctx) {
             const imported = [];
             const errors = [];
             const skipped = [];
+            const allowedDatabases = new Set(stmts.databasesOf.all(account.id).map((r) => r.name));
             for (const d of ex.mysql) {
               const claim = databaseClaim(d.database, account);
               if (!claim.ok) { skipped.push(`${d.database} (${claim.reason})`); jobCtx.log(`database ${d.database} skipped: ${claim.reason}`, 'warn'); continue; }
+              allowedDatabases.add(d.database);
               try {
                 await op('backup.db.import', { file: d.file, database: d.database, ...(creds ? { credentials: creds } : {}) }, req);
                 imported.push(d.database);
@@ -843,13 +937,20 @@ export function createBackupService(ctx) {
               if (!claim.ok) { skipped.push(`user ${u.user} (${claim.reason})`); jobCtx.log(`database user ${u.user} skipped: ${claim.reason}`, 'warn'); }
               return claim.ok;
             });
+            const droppedGrants = [];
             if (userRows.length) {
               try {
-                users = await op('backup.db.restore_users', { users: userRows.map((u) => ({ user: u.user, host: u.host, plugin: u.plugin || '', hashHex: u.hashHex || '', grants: u.grants || [] })), ...(creds ? { credentials: creds } : {}) }, req);
+                const payload = userRows.map((u) => {
+                  const g = filterGrants(u.grants, allowedDatabases);
+                  for (const line of g.dropped) { droppedGrants.push(`${u.user}@${u.host}: ${line}`); jobCtx.log(`grant for ${u.user}@${u.host} dropped: ${line}`, 'warn'); }
+                  return { user: u.user, host: u.host, plugin: u.plugin || '', hashHex: u.hashHex || '', grants: g.kept };
+                });
+                users = await op('backup.db.restore_users', { users: payload, allowedDatabases: [...allowedDatabases], ...(creds ? { credentials: creds } : {}) }, req);
+                users.droppedGrants = droppedGrants;
                 for (const name of new Set(userRows.map((u) => u.user))) { try { await ctx.databases?.assign?.({ kind: 'user', name, account: account.username }, SYSTEM_ROOT, req); } catch (err) { jobCtx.log(`database map: user ${name}: ${err.message}`, 'warn'); } }
               } catch (err) { errors.push(`users: ${err.message}`); }
             }
-            step('databases', { status: errors.length ? (imported.length ? 'done' : 'failed') : imported.length || !skipped.length ? 'done' : 'skipped', detail: `${imported.length}/${ex.mysql.length} database(s) imported${users ? `, ${users.created.length} user(s) recreated, ${users.skipped.length} kept` : ''}${skipped.length ? `; skipped: ${skipped.join(', ')}` : ''}${errors.length ? `; errors: ${errors.join(' | ')}` : ''}`, imported, skipped, errors, users });
+            step('databases', { status: errors.length ? (imported.length ? 'done' : 'failed') : imported.length || !skipped.length ? 'done' : 'skipped', detail: `${imported.length}/${ex.mysql.length} database(s) imported${users ? `, ${users.created.length} user(s) recreated, ${users.skipped.length} kept${droppedGrants.length ? `, ${droppedGrants.length} grant(s) dropped` : ''}` : ''}${skipped.length ? `; skipped: ${skipped.join(', ')}` : ''}${errors.length ? `; errors: ${errors.join(' | ')}` : ''}`, imported, skipped, errors, users, droppedGrants });
           }
         }
         if (options.dns !== false && ex.dnszones.length) {
@@ -903,10 +1004,13 @@ export function createBackupService(ctx) {
       ? db.prepare("SELECT account_name, COUNT(*) AS n, MAX(created_at) AS last FROM backups WHERE status = 'done' GROUP BY account_name").all()
       : db.prepare("SELECT account_name, COUNT(*) AS n, MAX(created_at) AS last FROM backups WHERE status = 'done' AND owner_id = ? GROUP BY account_name").all(user.id)
     ).map((r) => [r.account_name, r]));
-    const accounts = stmts.accounts.all().filter((a) => isRoot(user) || a.owner_id === user.id).map((a) => ({ username: a.username, domain: a.domain, owner: a.owner, exists: true, backups: counts.get(a.username)?.n ?? 0, lastBackup: counts.get(a.username)?.last ?? null }));
-    if (isRoot(user)) {
-      const known = new Set(accounts.map((a) => a.username));
-      for (const [name, c] of counts) if (!known.has(name)) accounts.push({ username: name, domain: null, owner: null, exists: false, backups: c.n, lastBackup: c.last });
+    const accounts = stmts.accounts.all().filter((a) => isRoot(user) || a.owner_id === user.id).map((a) => ({ username: a.username, domain: a.domain, owner: a.owner, home_dir: homeOf(a), exists: true, backups: counts.get(a.username)?.n ?? 0, lastBackup: counts.get(a.username)?.last ?? null }));
+    // Archives of terminated accounts stay restorable by whoever owned them; a
+    // name that another reseller's live account carries today is not offered.
+    const known = new Set(accounts.map((a) => a.username));
+    for (const [name, c] of counts) {
+      if (known.has(name) || stmts.accountByUsername.get(name)) continue;
+      accounts.push({ username: name, domain: null, owner: null, home_dir: null, exists: false, backups: c.n, lastBackup: c.last });
     }
     return accounts.sort((a, b) => a.username.localeCompare(b.username));
   }
@@ -920,6 +1024,6 @@ export function createBackupService(ctx) {
     archiveAccount, enqueueRun, runBackupJob, listRuns, getRun: (id) => { const r = stmts.runById.get(id); if (!r) throw notFound('Backup run'); return shapeRun(r); },
     enqueueRestore, runRestoreJob, listRestores, getRestore: (id, user) => { const r = stmts.restoreById.get(id); if (!r) throw notFound('Restore'); if (!isRoot(user) && (r.owner_id == null || r.owner_id !== user.id)) throw forbidden('That restore belongs to another reseller\'s account'); return shapeRestore(r); },
     enqueueFetch, runFetchJob,
-    retentionClassFor, planPrune,
+    retentionClassFor, planPrune, grantDatabase, rewriteDocroot,
   };
 }

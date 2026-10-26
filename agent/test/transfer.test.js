@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { shellQuote, remoteCommand, parsePasswd, parseUserDomains, parseRsyncStats, summarizeArchive, parseCpUserFile, parseShadowHash, rsyncArgv, scanSql, createSqlCodeFilter, clientCommand } from '../src/ops/transfer.js';
+import { shellQuote, remoteCommand, parsePasswd, parseUserDomains, parseRsyncStats, summarizeArchive, parseCpUserFile, parseShadowHash, rsyncArgv, scanSql, createSqlCodeFilter, clientCommand, parseTarListing, unsafeMember, parseFingerprints } from '../src/ops/transfer.js';
 
 // exec is spied with the real implementation behind it so the tests prove an
 // op refused before any program ran. Remote ops are never executed against a
@@ -59,6 +59,37 @@ function buildArchive(dir) {
   return file;
 }
 
+// A hand-built ustar archive: tar cannot create device nodes without root, so
+// the headers are written directly (type '3' = char device, '4' = block device).
+function rawTar(dir, file, entries) {
+  const header = (name, { type = '0', mode = 0o644, size = 0, major = 0, minor = 0 } = {}) => {
+    const b = Buffer.alloc(512);
+    b.write(name, 0, 100);
+    b.write(`${mode.toString(8).padStart(7, '0')}\0`, 100, 8);
+    b.write('0000000\0', 108, 8); b.write('0000000\0', 116, 8);
+    b.write(`${size.toString(8).padStart(11, '0')}\0`, 124, 12);
+    b.write(`${Math.floor(Date.now() / 1000).toString(8).padStart(11, '0')}\0`, 136, 12);
+    b.write('        ', 148, 8);
+    b.write(type, 156, 1);
+    b.write('ustar\0', 257, 6); b.write('00', 263, 2);
+    b.write(`${major.toString(8).padStart(7, '0')}\0`, 329, 8);
+    b.write(`${minor.toString(8).padStart(7, '0')}\0`, 337, 8);
+    let sum = 0; for (const x of b) sum += x;
+    b.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 8);
+    return b;
+  };
+  const parts = [];
+  for (const e of entries) {
+    const data = Buffer.from(e.content || '');
+    parts.push(header(e.name, { ...e, size: data.length }));
+    if (data.length) parts.push(data, Buffer.alloc((512 - (data.length % 512)) % 512));
+  }
+  parts.push(Buffer.alloc(1024));
+  const out = path.join(dir, file);
+  fs.writeFileSync(out, Buffer.concat(parts));
+  return out;
+}
+
 beforeAll(() => {
   tmpRootExisted = fs.existsSync(TMP_ROOT);
   root = `${TMP_ROOT}/transfer-${crypto.randomBytes(6).toString('hex')}`;
@@ -102,9 +133,12 @@ describe('remote command construction', () => {
 
   it('builds rsync argv that preserves permissions while ownership is reassigned later', () => {
     const argv = rsyncArgv({ transport: 'ssh -p 22', destination: 'root@src.example.com', src: '/home/bob/', dest: '/home/robert', excludes: ['tmp/', '.cpanel/caches/'], bwlimitKbps: 500 });
-    expect(argv[0]).toBe('-rlptD');
+    expect(argv[0]).toBe('-rlpt');
     expect(argv).toEqual(expect.arrayContaining(['--partial', '--exclude=tmp/', '--bwlimit=500', '-e', 'ssh -p 22', 'root@src.example.com:/home/bob/', '/home/robert/']));
     expect(argv).not.toContain('--delete');
+    // The copy runs as root: device and special files from the source are never recreated.
+    for (const flag of ['-D', '--devices', '--specials', '-a', '--archive']) expect(argv, flag).not.toContain(flag);
+    expect(argv.filter((a) => /^-[a-zA-Z]+$/.test(a)).some((a) => a.includes('D'))).toBe(false);
     // rsync rejects "--human-readable=0" (the option takes no argument).
     expect(argv).toContain('--no-human-readable');
     expect(argv.some((a) => a.startsWith('--human-readable'))).toBe(false);
@@ -212,6 +246,29 @@ describe('parsers', () => {
     const s = summarizeArchive(['cpmove-bob', 'cpmove-bob/cp/bob', 'cpmove-bob/homedir', 'cpmove-bob/homedir/public_html', 'cpmove-bob/mysql/bob_x.sql', 'cpmove-bob/mysql.sql', 'cpmove-bob/dnszones/bob.com.db', 'cpmove-bob/userdata/main', 'cpmove-bob/userdata/x.bob.com', 'cpmove-bob/userdata/x.bob.com_SSL', 'cpmove-bob/addons']);
     expect(s).toMatchObject({ top: 'cpmove-bob', username: 'bob', databases: ['bob_x'], zones: ['bob.com'], userdata: ['x.bob.com'], hasHomedir: true, hasGrants: true, hasAddons: true, hasParked: false, hasCpConfig: true });
     expect(summarizeArchive(['a/x', 'b/y']).top).toBe(null);
+    // The top directory is passed to tar as an argument, so option-shaped names are not accepted.
+    for (const top of ['-f', '--files-from=/etc/passwd', 'a b', '.hidden']) expect(summarizeArchive([`${top}/cp/bob`, `${top}/homedir`]).top, top).toBe(null);
+    expect(summarizeArchive(['cpmove-bob.1/cp/bob']).top).toBe('cpmove-bob.1');
+  });
+
+  it('parses tar listings and host key fingerprints', () => {
+    const listing = parseTarListing([
+      '-rw-r--r-- 0/0              12 2026-10-26 19:08 cpmove-eve/cp/eve',
+      'drwxr-xr-x 0/0               0 2026-10-26 19:08 cpmove-eve/homedir/',
+      'brw-rw---- 0/0             8,0 2026-10-26 19:08 cpmove-eve/homedir/sda',
+      'crw-rw-rw- 0/0             5,0 2026-10-26 19:08 cpmove-eve/homedir/tty',
+      'lrwxrwxrwx 0/0               0 2026-10-26 19:08 cpmove-eve/homedir/link -> /etc/shadow',
+      'hrw-r--r-- 0/0               0 2026-10-26 19:08 cpmove-eve/homedir/hard link to cpmove-eve/homedir/index.html',
+      '-rw-r--r-- 0/0               1 2026-10-26 19:08 /etc/cron.d/evil',
+      '-rw-r--r-- 0/0               1 2026-10-26 19:08 cpmove-eve/homedir/../../../tmp/evil',
+      "tar: Removing leading `/' from member names",
+    ].join('\n'));
+    expect(listing.map((e) => [e.type, e.name])).toEqual([['-', 'cpmove-eve/cp/eve'], ['d', 'cpmove-eve/homedir/'], ['b', 'cpmove-eve/homedir/sda'], ['c', 'cpmove-eve/homedir/tty'], ['l', 'cpmove-eve/homedir/link'], ['h', 'cpmove-eve/homedir/hard'], ['-', '/etc/cron.d/evil'], ['-', 'cpmove-eve/homedir/../../../tmp/evil']]);
+    expect(listing[4].link).toBe('/etc/shadow');
+    expect(listing.map(unsafeMember)).toEqual([null, null, expect.stringMatching(/block device/), expect.stringMatching(/character device/), null, null, expect.stringMatching(/absolute path/), expect.stringMatching(/\.\./)]);
+    expect(parseFingerprints('# Host src.example.com found: line 1 \nsrc.example.com ED25519 SHA256:abcDEF123+/=\n')).toEqual([{ type: 'ED25519', fingerprint: 'SHA256:abcDEF123+/=' }]);
+    expect(parseFingerprints('256 SHA256:xyz987 [src.example.com]:2222 (ECDSA)\n')).toEqual([{ type: 'ECDSA', fingerprint: 'SHA256:xyz987' }]);
+    expect(parseFingerprints('')).toEqual([]);
   });
 });
 
@@ -270,6 +327,43 @@ describe('cpmove archive ops', () => {
     await runOp('transfer.cpmove.extract', { path: archive, destination: staging, members: ['cpmove-alice/mysql/alice_shop.sql'], stripComponents: 2 }, ctx);
     expect(fs.readFileSync(`${staging}/alice_shop.sql`, 'utf8')).toContain('CREATE TABLE');
     expect(await runOp('transfer.cpmove.extract', { path: archive, destination: staging, members: ['cpmove-alice/missing/*'], stripComponents: 2 }, ctx)).toMatchObject({ extracted: false });
+  });
+
+  it('refuses archives with device nodes or escaping members before anything is extracted', async () => {
+    const dest = `${root}/home-eve`;
+    const devices = rawTar(root, 'devices.tar', [
+      { name: 'cpmove-eve/cp/eve', content: 'DNS=eve.com\n' }, { name: 'cpmove-eve/homedir/', type: '5' }, { name: 'cpmove-eve/homedir/index.html', content: 'hi' },
+      { name: 'cpmove-eve/homedir/sda', type: '4', mode: 0o660, major: 8, minor: 0 }, { name: 'cpmove-eve/homedir/tty', type: '3', mode: 0o666, major: 5, minor: 0 },
+    ]);
+    exec.mockClear();
+    const err = await opError(runOp('transfer.cpmove.extract', { path: devices, destination: dest, members: ['cpmove-eve/homedir/*'], stripComponents: 2, owner: 'eve' }, ctx));
+    expect(err.code).toBe('invalid_archive');
+    expect(err.message).toMatch(/block device/);
+    expect(exec.mock.calls.some((c) => c[0] === 'tar' && c[1][0] === '-xf')).toBe(false);
+    expect(exec.mock.calls.some((c) => c[0] === 'chown')).toBe(false);
+    expect(fs.existsSync(dest)).toBe(false);
+    // Members outside the selected subtree do not matter; a device elsewhere in the archive leaves the dumps extractable.
+    const only = rawTar(root, 'devices-elsewhere.tar', [{ name: 'cpmove-eve/mysql/eve_db.sql', content: 'CREATE TABLE t (id INT);\n' }, { name: 'cpmove-eve/homedir/sda', type: '4', major: 8, minor: 0 }]);
+    expect(await runOp('transfer.cpmove.extract', { path: only, destination: `${root}/staging-eve`, members: ['cpmove-eve/mysql/eve_db.sql'], stripComponents: 2 }, ctx)).toMatchObject({ extracted: true });
+    for (const [file, entries, re] of [
+      ['absolute.tar', [{ name: 'cpmove-eve/homedir/index.html', content: 'x' }, { name: '/etc/cron.d/evil', content: 'x' }], /absolute path/],
+      ['dotdot.tar', [{ name: 'cpmove-eve/homedir/index.html', content: 'x' }, { name: 'cpmove-eve/homedir/../../../tmp/evil', content: 'x' }], /\.\./],
+    ]) {
+      const archivePath = rawTar(root, file, entries);
+      exec.mockClear();
+      const e = await opError(runOp('transfer.cpmove.extract', { path: archivePath, destination: dest, members: ['*/homedir/*', '*/evil'] }, ctx));
+      expect(e.code, file).toBe('invalid_archive');
+      expect(e.message, file).toMatch(re);
+      expect(exec.mock.calls.some((c) => c[0] === 'tar' && c[1][0] === '-xf'), file).toBe(false);
+    }
+    expect(fs.existsSync(dest)).toBe(false);
+    // Member names follow "--" in every tar argv so an archive can never supply an option.
+    exec.mockClear();
+    await runOp('transfer.cpmove.extract', { path: archive, destination: `${root}/home-alice-2`, members: ['cpmove-alice/homedir/*'], stripComponents: 2 }, ctx);
+    for (const call of exec.mock.calls.filter((c) => c[0] === 'tar')) expect(call[1].indexOf('--')).toBeGreaterThan(0);
+    await runOp('transfer.cpmove.read_member', { path: archive, member: 'cpmove-alice/cp/alice' }, ctx);
+    await runOp('transfer.cpmove.inspect', { path: archive }, ctx);
+    for (const call of exec.mock.calls.filter((c) => c[0] === 'tar' && c[1][0] === '-xOf')) expect(call[1].indexOf('--')).toBeGreaterThan(0);
   });
 });
 
@@ -491,6 +585,12 @@ describe('transfer.mysql.import', () => {
     expect((await opError(runOp('transfer.mysql.import', { path: `${root}/missing.sql`, database: 'alice_shop' }, ctx))).code).toBe('not_found');
     for (const database of ['mysql', 'sys', 'information_schema', 'performance_schema']) {
       expect((await opError(runOp('transfer.mysql.import', { path: `${root}/staging/alice_shop.sql`, database }, ctx))).code, database).toBe('refused');
+    }
+    // The path goes to the client's "source" line, which tokenises on whitespace and ";".
+    for (const name of ['a b.sql', 'x;drop.sql', "it's.sql", 'tab\there.sql']) {
+      const err = await opError(runOp('transfer.mysql.import', { path: `${root}/staging/${name}`, database: 'alice_shop' }, ctx));
+      expect(err.code, name).toBe('refused');
+      expect(err.message, name).toMatch(/source/);
     }
     expect(exec).not.toHaveBeenCalled();
   });

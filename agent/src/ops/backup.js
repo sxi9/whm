@@ -6,7 +6,7 @@ import https from 'node:https';
 import { z } from 'zod';
 import { exec, hasBinary, resolveBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
-import { renderClientCnf, classifyMysqlError, parseBatch, cloneUserStatements, q } from './db.js';
+import { renderClientCnf, classifyMysqlError, parseBatch, cloneUserStatements, parseGrant, q } from './db.js';
 
 // Backup op family. An account archive is a cPanel-compatible tarball:
 //
@@ -26,6 +26,7 @@ const TMP_DIR = '/tmp/whm';
 const ROOT_MY_CNF = '/root/.my.cnf';
 const CLIENT_BINS = ['mysql', 'mariadb'];
 const DUMP_BINS = ['mysqldump', 'mariadb-dump'];
+const SYSTEM_SCHEMAS = new Set(['mysql', 'information_schema', 'performance_schema', 'sys']);
 
 // Names the panel creates (backup-…_<user>.tar.gz) and names it may read
 // (also cPanel's cpmove-<user>.tar.gz and <user>.tar.gz).
@@ -104,6 +105,79 @@ export function archiveUser(name) {
 export function buildArchiveName(username, date = new Date()) {
   const p = (n) => String(n).padStart(2, '0');
   return `backup-${p(date.getMonth() + 1)}.${p(date.getDate())}.${date.getFullYear()}_${p(date.getHours())}-${p(date.getMinutes())}-${p(date.getSeconds())}_${username}.tar.gz`;
+}
+
+// Two archives of one account inside the same second (a manual run next to a
+// Transfers call) take the next free second instead of colliding.
+export function freeArchiveName(username, taken, date = new Date()) {
+  const d = new Date(date);
+  for (let i = 0; i < 120; i++) {
+    const name = buildArchiveName(username, d);
+    if (!taken(name)) return name;
+    d.setSeconds(d.getSeconds() + 1);
+  }
+  throw new OpError('exists', `No free archive name for ${username}`);
+}
+
+// Exclude patterns are anchored at the member root so "tmp" drops <home>/tmp
+// only, never a deeper public_html/<x>/tmp.
+export function tarExcludeArgs(base, excludes, includeMail) {
+  const out = ['--anchored', '--no-wildcards-match-slash'];
+  if (!includeMail) out.push(`--exclude=${base}/mail`);
+  for (const ex of excludes) out.push(`--exclude=${base}/${ex.replace(/\/+$/, '')}`);
+  return out;
+}
+
+// cPanel's cp/<user> is a KEY=value file; the keys a restore needs become the
+// same metadata shape the panel writes to cp/<user>.json.
+export function parseCpUserFile(text) {
+  const out = {};
+  for (const line of String(text || '').split('\n')) {
+    const m = line.match(/^([A-Z][A-Z0-9_-]*)=(.*)$/);
+    if (m) out[m[1]] = m[2].trim();
+  }
+  return out;
+}
+
+export function cpmoveMetadata(cpText, username, { pds = '', addons = '', sds2 = '' } = {}) {
+  const cp = parseCpUserFile(cpText);
+  const domain = (cp.DNS || '').toLowerCase();
+  if (!arg.domain.safeParse(domain).success) return null;
+  const lines = (t) => String(t || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const subDocroots = new Map();
+  for (const l of lines(sds2)) { const i = l.indexOf('='); if (i > 0) subDocroots.set(l.slice(0, i).toLowerCase(), l.slice(i + 1)); }
+  const domains = [];
+  const addonSubs = new Set();
+  for (const l of lines(addons)) {
+    const i = l.indexOf('=');
+    if (i <= 0) continue;
+    const addon = l.slice(0, i).toLowerCase();
+    const sub = l.slice(i + 1).toLowerCase().replace('_', '.');
+    addonSubs.add(sub);
+    if (arg.domain.safeParse(addon).success) domains.push({ domain: addon, type: 'addon', docroot: subDocroots.get(sub) ?? null });
+  }
+  for (const [sub, docroot] of subDocroots) if (!addonSubs.has(sub) && arg.domain.safeParse(sub).success) domains.push({ domain: sub, type: 'sub', docroot });
+  for (const parked of lines(pds)) if (arg.domain.safeParse(parked.toLowerCase()).success) domains.push({ domain: parked.toLowerCase(), type: 'parked', docroot: null });
+  return {
+    version: 0,
+    source: 'cpmove',
+    account: { username, domain, package_name: cp.PLAN || null, owner: cp.OWNER || null, contact_email: cp.CONTACTEMAIL || null, ip: cp.IP || null, plan: {} },
+    domains: domains.filter((d) => d.domain !== domain),
+    databases: [], dbUsers: [], mail: [], dnsZones: [],
+  };
+}
+
+// Members an archive may never carry into a home: device nodes, absolute
+// names and ".." segments. The panel's own archives have none; an imported
+// one is refused before tar extracts anything.
+export function unsafeMembers(entries) {
+  const out = [];
+  for (const e of entries) {
+    if (/^[bc]/.test(e.mode || '')) out.push({ name: e.name, reason: 'device node' });
+    else if (e.name.startsWith('/')) out.push({ name: e.name, reason: 'absolute path' });
+    else if (/(^|\/)\.\.(\/|$)/.test(e.name)) out.push({ name: e.name, reason: '".." segment' });
+  }
+  return out;
 }
 
 const sedEscape = (s) => s.replace(/[\\|.*^$[\]]/g, '\\$&');
@@ -207,7 +281,7 @@ defineOp('backup.account.archive', {
     const destDir = ctx.assertAllowedPath(dest, 'write');
     const home = ctx.assertAllowedPath(homeDir, 'read');
     const started = Date.now();
-    const archive = name || buildArchiveName(username);
+    const archive = name || freeArchiveName(username, (n) => exists(path.join(destDir, n)) || exists(path.join(destDir, `.staging-${archiveTop(n)}`)));
     if (archiveUser(archive) !== username) throw new OpError('invalid_args', `Archive name ${archive} does not belong to ${username}`);
     const top = archiveTop(archive);
     const base = path.basename(home);
@@ -273,8 +347,7 @@ defineOp('backup.account.archive', {
       const argv = ['--create', '--gzip', '--file', out, '--sparse', '--warning=no-file-changed', '--warning=no-file-removed', '--ignore-failed-read', '-C', staging, top];
       if (homeStat) {
         argv.push('--transform', `s|^${sedEscape(base)}\\(/\\|$\\)|${top}/homedir\\1|S`);
-        if (!include.mail) argv.push(`--exclude=${base}/mail`);
-        for (const ex of excludes) argv.push(`--exclude=${base}/${ex.replace(/\/+$/, '')}`);
+        argv.push(...tarExcludeArgs(base, excludes, include.mail));
         argv.push('-C', path.dirname(home), base);
       }
       // gzip honours GZIP for the level (with a deprecation note on stderr); the default level needs nothing.
@@ -359,13 +432,14 @@ defineOp('backup.archive.info', {
     if (!exists(file)) throw new OpError('not_found', `${archive} does not exist`);
     const top = archiveTop(file);
     const username = archiveUser(file);
-    const readJson = async (member) => {
+    const readText = async (member) => {
       const r = await exec('tar', ['--extract', '--to-stdout', '--file', file, '--', `${top}/${member}`], { allowFailure: true, timeoutMs: 1_800_000, maxBuffer: 16 * 1024 * 1024 });
-      if (r.code !== 0) return null;
-      try { return JSON.parse(r.stdout); } catch { return null; }
+      return r.code === 0 ? r.stdout : null;
     };
+    const readJson = async (member) => { const t = await readText(member); if (t == null) return null; try { return JSON.parse(t); } catch { return null; } };
     const info = await readJson('meta/info.json');
-    const metadata = username ? await readJson(`cp/${username}.json`) : null;
+    let metadata = username ? await readJson(`cp/${username}.json`) : null;
+    if (!metadata && username) metadata = cpmoveMetadata(await readText(`cp/${username}`), username);
     const list = await exec('tar', ['--list', '--file', file, '--no-recursion', '--wildcards', '--', `${top}/mysql/*`, `${top}/dnszones/*`, `${top}/homedir`], { allowFailure: true, timeoutMs: 1_800_000, maxBuffer: 16 * 1024 * 1024 });
     const members = list.stdout.split('\n').filter(Boolean).map((m) => m.slice(top.length + 1).replace(/\/$/, ''));
     return {
@@ -437,14 +511,20 @@ defineOp('backup.archive.extract', {
     if (!exists(file)) throw new OpError('not_found', `${archive} does not exist`);
     const top = archiveTop(file);
     fs.mkdirSync(destDir, { recursive: true, mode: 0o700 });
-    const { missing } = await extractMembers(file, destDir, ['mysql', 'dnszones', 'cp', 'meta'].map((m) => `${top}/${m}`), { strip: 1 });
+    const { missing } = await extractMembers(file, destDir, ['mysql', 'dnszones', 'cp', 'meta', 'pds', 'addons', 'sds2'].map((m) => `${top}/${m}`), { strip: 1 });
     const listDir = (sub, ext) => { try { return fs.readdirSync(path.join(destDir, sub)).filter((f) => f.endsWith(ext)).sort().map((f) => ({ name: f.slice(0, -ext.length), file: path.join(destDir, sub, f) })); } catch { return []; } };
-    const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
+    const readText = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } };
+    const readJson = (p) => { try { return JSON.parse(readText(p)); } catch { return null; } };
     const username = archiveUser(file);
+    let metadata = username ? readJson(path.join(destDir, 'cp', `${username}.json`)) : null;
+    if (!metadata && username) {
+      const cp = readText(path.join(destDir, 'cp', username));
+      if (cp != null) metadata = cpmoveMetadata(cp, username, { pds: readText(path.join(destDir, 'pds')), addons: readText(path.join(destDir, 'addons')), sds2: readText(path.join(destDir, 'sds2')) });
+    }
     return {
       path: file, top, stagingDir: destDir, username,
       info: readJson(path.join(destDir, 'meta', 'info.json')),
-      metadata: username ? readJson(path.join(destDir, 'cp', `${username}.json`)) : null,
+      metadata,
       mysql: listDir('mysql', '.sql').map((d) => ({ database: d.name, file: d.file, sizeBytes: fs.statSync(d.file).size })),
       users: readJson(path.join(destDir, 'mysql', 'users.json')),
       dnszones: listDir('dnszones', '.db').map((d) => ({ domain: d.name, file: d.file, body: fs.readFileSync(d.file, 'utf8') })),
@@ -470,6 +550,9 @@ defineOp('backup.files.restore', {
     if (!exists(home)) { fs.mkdirSync(home, { recursive: true, mode: 0o711 }); fs.chownSync(home, uid, gid); }
     const rel = paths.map((p) => p.replace(/\/+$/, ''));
     const members = rel.length ? rel.map((p) => `${top}/homedir/${p}`) : [`${top}/homedir`];
+    const listing = await exec('tar', ['--list', '--verbose', '--absolute-names', '--file', file, '--', ...members], { allowFailure: true, timeoutMs: 7_200_000, maxBuffer: 256 * 1024 * 1024 });
+    const unsafe = unsafeMembers(parseTarListing(listing.stdout));
+    if (unsafe.length) throw new OpError('invalid_archive', `${path.basename(file)} carries members that are never restored: ${unsafe.slice(0, 5).map((m) => `${m.name} (${m.reason})`).join(', ')}${unsafe.length > 5 ? ', …' : ''}`, { unsafe: unsafe.slice(0, 50) });
     const { missing, warnings } = await extractMembers(file, home, members, { strip: 2, overwrite, as: { uid, gid } });
     const restored = [];
     for (const p of rel.length ? rel : ['.']) {
@@ -524,23 +607,48 @@ defineOp('backup.db.import', {
   },
 });
 
+// The database a GRANT line names, with MySQL's "\_" / "\%" escapes removed so
+// it compares with the plain database names the panel keeps.
+export function grantDatabase(line) {
+  const g = parseGrant(line);
+  return g ? g.database.replace(/\\([_%])/g, '$1') : null;
+}
+
+// A restore never widens privileges: global (*.*) and system-schema grants are
+// refused outright, and with allowedDatabases every grant on another database
+// is dropped. GRANT USAGE lines fall away with the rest; the user is still created.
+const grantLine = z.string().max(4096).regex(/^GRANT /i).refine((line) => {
+  const database = grantDatabase(line);
+  return database == null || (database !== '*' && !SYSTEM_SCHEMAS.has(database.toLowerCase()));
+}, 'Global (*.*) and system-schema grants are never restored');
+
 defineOp('backup.db.restore_users', {
-  description: 'Recreate database users (password hash, plugin and grants) exported in mysql/users.json; existing user@host rows are kept',
+  description: 'Recreate database users (password hash, plugin and grants) exported in mysql/users.json; existing user@host rows are kept; grants outside allowedDatabases are dropped',
   schema: z.object({
-    users: z.array(z.object({ user: mysqlUser, host: mysqlHost, plugin: z.string().regex(/^[A-Za-z0-9_]{0,64}$/).default(''), hashHex: z.string().regex(/^([A-Fa-f0-9]{2}){0,512}$/).default(''), grants: z.array(z.string().max(4096).regex(/^GRANT /i)).max(200).default([]) }).strict()).min(1).max(500),
+    users: z.array(z.object({ user: mysqlUser, host: mysqlHost, plugin: z.string().regex(/^[A-Za-z0-9_]{0,64}$/).default(''), hashHex: z.string().regex(/^([A-Fa-f0-9]{2}){0,512}$/).default(''), grants: z.array(grantLine).max(200).default([]) }).strict()).min(1).max(500),
+    allowedDatabases: z.array(dbName).max(500).optional(),
     credentials,
   }).strict(),
-  run: async ({ users, credentials: creds }, ctx) => {
+  run: async ({ users, allowedDatabases, credentials: creds }, ctx) => {
     const [[version]] = await mysqlQuery('SELECT VERSION()', creds, ctx, { headers: false });
     const engine = /mariadb/i.test(version || '') ? 'mariadb' : 'mysql';
+    const allowed = allowedDatabases ? new Set(allowedDatabases) : null;
     const created = [];
     const skipped = [];
     const errors = [];
+    const dropped = [];
     for (const u of users) {
       try {
         const present = await mysqlQuery(`SELECT 1 FROM mysql.user WHERE User = ${q.str(u.user)} AND Host = ${q.str(u.host)}`, creds, ctx, { headers: false });
         if (present.length) { skipped.push(`${u.user}@${u.host}`); continue; }
-        const { statements } = cloneUserStatements({ user: u.user, toHost: u.host, engine, plugin: u.plugin, hashHex: u.hashHex, grantLines: u.grants });
+        const grantLines = u.grants.filter((line) => {
+          const database = grantDatabase(line);
+          if (database == null) return true;
+          const ok = database !== '*' && !SYSTEM_SCHEMAS.has(database.toLowerCase()) && (!allowed || allowed.has(database));
+          if (!ok) dropped.push(`${u.user}@${u.host}: ${line.slice(0, 160)}`);
+          return ok;
+        });
+        const { statements } = cloneUserStatements({ user: u.user, toHost: u.host, engine, plugin: u.plugin, hashHex: u.hashHex, grantLines });
         await mysqlQuery(`${statements.map((s) => `${s};`).join('\n')}\nFLUSH PRIVILEGES;`, creds, ctx);
         created.push(`${u.user}@${u.host}`);
       } catch (err) {
@@ -548,7 +656,7 @@ defineOp('backup.db.restore_users', {
         errors.push(`${u.user}@${u.host}: ${err.message}`);
       }
     }
-    return { engine, created, skipped, errors };
+    return { engine, created, skipped, errors, dropped };
   },
 });
 
@@ -585,13 +693,20 @@ const urlField = z.string().url().max(2048).refine((u) => /^https?:\/\//.test(u)
 const nonEmpty = z.string().min(1).max(256).regex(/^[^\n\r\0]+$/);
 const secretField = z.string().max(256).regex(/^[^\n\r\0]*$/);
 
+// SFTP without a pinned host key verifies nothing on a host that has no
+// known_hosts yet, so the fingerprint is required unless verification is
+// explicitly skipped.
+const requireSftpHostKey = (c, issues) => {
+  if (c.kind === 'sftp' && !c.hostKeySha256 && !c.insecure) issues.addIssue({ code: z.ZodIssueCode.custom, path: ['hostKeySha256'], message: 'Pin the server host key (SHA-256 fingerprint from ssh-keyscan | ssh-keygen -lf -) or explicitly skip host key verification' });
+};
+
 export const destinationConfig = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('local'), dir: arg.absPath }).strict(),
   z.object({ kind: z.literal('ftp'), host: hostField, port: z.number().int().min(1).max(65535).default(21), username: nonEmpty, password: secretField.default(''), path: remotePath.default(''), tls: z.boolean().default(false), insecure: z.boolean().default(false), passive: z.boolean().default(true) }).strict(),
   z.object({ kind: z.literal('sftp'), host: hostField, port: z.number().int().min(1).max(65535).default(22), username: nonEmpty, password: secretField.optional(), privateKey: z.string().max(16384).optional(), hostKeySha256: z.string().regex(/^[A-Za-z0-9+/=]{40,48}$/).optional(), path: remotePath.default(''), insecure: z.boolean().default(false) }).strict(),
   z.object({ kind: z.literal('webdav'), url: urlField, username: nonEmpty.optional(), password: secretField.optional(), insecure: z.boolean().default(false) }).strict(),
   z.object({ kind: z.literal('s3'), endpoint: urlField.optional(), region: z.string().regex(/^[a-z0-9-]{1,32}$/).default('us-east-1'), bucket: z.string().regex(/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/), prefix: remotePath.default(''), accessKey: nonEmpty, secretKey: nonEmpty, pathStyle: z.boolean().default(false), insecure: z.boolean().default(false) }).strict(),
-]);
+]).superRefine(requireSftpHostKey);
 
 const CURL_CODES = { 5: 'could not resolve proxy', 6: 'could not resolve host', 7: 'failed to connect', 9: 'access denied to the remote path', 19: 'file not found on the server', 22: 'the server returned an HTTP error', 25: 'upload failed (STOR/PUT refused)', 28: 'operation timed out', 35: 'TLS handshake failed', 51: 'TLS certificate verification failed', 60: 'TLS certificate could not be verified (enable "insecure" or install the CA)', 67: 'login denied', 78: 'the remote file does not exist', 79: 'SSH session error (host key or authentication)' };
 
