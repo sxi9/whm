@@ -59,6 +59,14 @@ describe('tar reader', () => {
     expect(() => listTar(bad)).toThrow(/corrupt tar header/);
   });
 
+  it('refuses duplicate entry names and file/directory conflicts', () => {
+    expect(() => listTar(createTar([{ name: 'a.js', data: '1' }, { name: './a.js', data: '2' }]))).toThrow(/duplicate entry "a.js"/);
+    const dest = path.join(dir, 'dup');
+    expect(() => extractTar(createTar([{ name: 'a', type: 'dir' }, { name: 'a', data: 'x' }]), dest)).toThrow(/duplicate entry/);
+    expect(() => extractTar(createTar([{ name: 'a/b', data: 'x' }, { name: 'a', data: 'x' }]), path.join(dir, 'dup2'))).toThrow(TarError);
+    expect(() => extractTar(createTar([{ name: 'f', data: 'x' }, { name: 'f/child', data: 'x' }]), path.join(dir, 'dup3'))).toThrow(/has a file as a parent/);
+  });
+
   it('never writes outside the destination even through a pre-existing symlink', () => {
     const dest = path.join(dir, 'link-dest');
     fs.mkdirSync(dest, { recursive: true });

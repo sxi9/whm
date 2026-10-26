@@ -147,7 +147,9 @@ const ISOLATION_MODES = Object.freeze(['in-process', 'process']);
 const SEVERITIES = Object.freeze(['info', 'warning', 'critical']);
 
 const BACKUP_COMPONENTS = Object.freeze(['home', 'mail', 'db', 'dns', 'ssl', 'cron']);
-const COMPRESSIONS = Object.freeze(['gzip', 'zstd', 'none']);
+// Only what the host's backup archiver produces today; 'zstd'/'none' return when
+// the backup op grows them, so a plugin cannot pass the mock and fail on the host.
+const COMPRESSIONS = Object.freeze(['gzip']);
 
 /** Plugin lifecycle states persisted in plugins.state. */
 const LIFECYCLE_STATES = Object.freeze([
@@ -221,11 +223,13 @@ function isPluginEvent(event) {
 /**
  * Does `host[:port]` (from a URL) match one of the granted net:outbound scopes?
  * "*.example.com" matches any sub-domain (but not example.com itself). A scope with a
- * port only matches that port; a scope without one matches any port.
+ * port only matches that port; a scope without one matches any port. An empty port
+ * (URL.port for the default port) means 443: ctx.net.fetch is https-only, so
+ * "host:443" matches https://host/.
  */
 function matchesNetScope(hostname, port, scopes) {
   const h = String(hostname).toLowerCase();
-  const p = port ? String(port) : '';
+  const p = port ? String(port) : '443';
   for (const scope of scopes || []) {
     const m = NET_OUTBOUND_SCOPE_PATTERN.exec(scope);
     if (!m) continue;

@@ -30,6 +30,7 @@ module.exports = {
   jobs: {
     async nightly(job, ctx) {
       calls.push('job:nightly:' + JSON.stringify(job.params));
+      if (job.params.fail) throw new sdk.PluginError('nightly failed on purpose', { code: job.params.fail, status: 500 });
       job.progress(50, 'halfway');
       job.log('working');
       await ctx.store.set('lastRun', ctx.now());
@@ -103,7 +104,7 @@ describe('install', () => {
     const dir = writePlugin(path.join(tmp, 'hello'), fixtures.fullManifest());
     const res = await post('/api/plugins/manage/install', { dir });
     expect(res.status).toBe(201);
-    expect(res.body.data.warnings).toEqual(['unsigned']);
+    expect(res.body.data.warnings).toEqual(['unsigned', 'in-process']);
     expect(res.body.data.plugin).toMatchObject({ id: ID, name: 'Hello Plugin', version: '1.2.3', state: 'installed', signed: false, signer: null, source: 'path' });
     expect(fs.existsSync(path.join(app.ctx.config.pluginsDir, ID, 'main.js'))).toBe(true);
     expect(fs.existsSync(path.join(app.ctx.config.pluginsDir, '.staging'))).toBe(true);
@@ -121,6 +122,21 @@ describe('install', () => {
     expect(again.status).toBe(201);
     expect(again.body.data).toMatchObject({ previousVersion: '2.0.0', plugin: { version: '2.1.0' } });
     expect(fs.existsSync(path.join(app.ctx.config.pluginsDir, 'net.example.packed.previous'))).toBe(false);
+    expect(fs.readdirSync(path.join(app.ctx.config.pluginsDir, '.staging'))).toEqual([]);
+  });
+
+  it('never touches a sibling plugin whose id ends in ".previous" while upgrading', async () => {
+    const sibling = writePlugin(path.join(tmp, 'sibling'), fixtures.minimalManifest({ id: `${ID}.previous` }));
+    expect((await post('/api/plugins/manage/install', { dir: sibling })).status).toBe(201);
+    const marker = path.join(app.ctx.config.pluginsDir, `${ID}.previous`, 'plugin.json');
+    expect(fs.existsSync(marker)).toBe(true);
+    const again = await post('/api/plugins/manage/install', { dir: writePlugin(path.join(tmp, 'hello'), fixtures.fullManifest()) });
+    expect(again.status).toBe(201);
+    expect(again.body.data.previousVersion).toBe('1.2.3');
+    expect(fs.existsSync(marker)).toBe(true);
+    expect((await get(`/api/plugins/manage/${ID}.previous`)).status).toBe(200);
+    expect((await del(`/api/plugins/manage/${ID}.previous?purge=true`)).status).toBe(200);
+    expect(fs.existsSync(path.join(app.ctx.config.pluginsDir, ID, 'main.js'))).toBe(true);
   });
 
   it('rejects an invalid manifest with the SDK error list and an incompatible engines range', async () => {
@@ -160,6 +176,9 @@ describe('install', () => {
     const outside = await post('/api/plugins/manage/install', { path: '/etc/hostname' });
     expect(outside.status).toBe(403);
     expect(outside.body.error.code).toBe('path_not_allowed');
+    const outsideDir = await post('/api/plugins/manage/install', { dir: '/etc' });
+    expect(outsideDir.status).toBe(403);
+    expect(outsideDir.body.error.code).toBe('path_not_allowed');
     const file = path.join(tmp, 'pkg.whmplugin');
     fs.writeFileSync(file, packageFromFiles(packageFiles(fixtures.minimalManifest({ id: 'net.example.frompath' }))));
     const ok = await post('/api/plugins/manage/install', { path: file });
@@ -309,6 +328,7 @@ describe('store', () => {
     expect(await c.store.delete('k2')).toBe(false);
     await expect(c.store.set('', 1)).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
     await expect(c.store.set('big', 'x'.repeat(1024 * 1024 + 1))).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    for (const op of [() => c.store.get('__seq'), () => c.store.set('__seq', 0), () => c.store.delete('__seq')]) await expect(op()).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
 
     const col = c.store.collection('items');
     const a = await col.insert({ n: 1, tag: 'x' });
@@ -353,9 +373,14 @@ describe('jobs, cron and schedule', () => {
     for (let i = 0; i < 100 && (await c.jobs.status(id)).status !== 'running'; i++) await new Promise((r) => setTimeout(r, 20));
     expect((await c.jobs.status(id)).status).toBe('running');
     expect(await c.jobs.cancel(id)).toBe(true);
+    expect(await c.jobs.status(id)).toMatchObject({ status: 'cancelled', finishedAt: expect.any(Number), error: null });
     const done = await waitForJob(app.ctx, Number(id));
     expect(done.status).toBe('cancelled');
+    expect((await c.jobs.status(id)).error).toBeNull();
     expect(await c.jobs.cancel(id)).toBe(false);
+    const failing = await c.jobs.run('nightly', { fail: 'UPSTREAM_DOWN' });
+    await waitForJob(app.ctx, Number(failing));
+    expect((await c.jobs.status(failing)).error).toEqual({ code: 'UPSTREAM_DOWN', message: 'nightly failed on purpose' });
     await expect(c.jobs.run('nope')).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
     await expect(c.jobs.status('999999')).rejects.toMatchObject({ code: 'NOT_FOUND' });
     const locked = await c.jobs.run('locked', { sleep: 300 });
@@ -460,7 +485,8 @@ describe('ctx.api bridge', () => {
     expect(await c.api.backups.destinations.list()).toEqual([]);
     await expect(c.api.backups.delete('999')).rejects.toMatchObject({ code: 'NOT_FOUND' });
     await expect(c.api.backups.create({ account: 'alice', include: ['nope'] })).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
-    await expect(c.api.backups.create({ account: 'alice', compression: 'zstd' })).rejects.toMatchObject({ code: 'UNSUPPORTED' });
+    await expect(c.api.backups.create({ account: 'alice', compression: 'zstd' })).rejects.toMatchObject({ code: 'VALIDATION_ERROR' });
+    await expect(c.api.backups.create({ account: 'alice', encrypt: true })).rejects.toMatchObject({ code: 'UNSUPPORTED', status: 422 });
     app.ctx.db.prepare("INSERT INTO backups (id, account_id, account_name, type, path, size, sha256, status) VALUES (77, (SELECT id FROM accounts WHERE username = 'alice'), 'alice', 'full', '/backup/alice.tar.gz', 10, 'abc', 'done')").run();
     expect((await c.api.backups.list({ account: 'alice' }))[0]).toMatchObject({ id: '77', account: 'alice', path: '/backup/alice.tar.gz', compression: 'gzip', encrypted: false });
     await expect(c.api.backups.restore({ artefactId: '77', account: 'alice', confirmToken: 'nope' })).rejects.toMatchObject({ code: 'PERMISSION_DENIED', details: { scope: 'confirm-token' } });
@@ -508,6 +534,9 @@ describe('fs, crypto, net, i18n', () => {
     expect(await c.fs.exists('nope')).toBe(false);
     await expect(c.fs.readFile('nope')).rejects.toMatchObject({ code: 'NOT_FOUND' });
     await expect(c.fs.remove('sub')).rejects.toMatchObject({ code: 'PATH_REJECTED' });
+    await expect(c.fs.writeFile('sub/dir/a.txt/child', 'x')).rejects.toMatchObject({ code: 'PATH_REJECTED' });
+    await expect(c.fs.mkdir('sub/dir/a.txt/child')).rejects.toMatchObject({ code: 'PATH_REJECTED' });
+    await expect(c.fs.mkdir('sub/dir/a.txt')).rejects.toMatchObject({ code: 'PATH_REJECTED' });
     fs.symlinkSync('/etc', path.join(c.plugin.dataDir, 'link'));
     await expect(c.fs.readFile('link/hostname')).rejects.toMatchObject({ code: 'PATH_REJECTED' });
     expect(await c.fs.remove('sub', { recursive: true })).toBe(true);
@@ -533,9 +562,11 @@ describe('fs, crypto, net, i18n', () => {
     const calls = [];
     const original = globalThis.fetch;
     globalThis.fetch = async (url, init) => {
-      calls.push([url, init.redirect]);
+      calls.push([url, init.redirect, init.method, init.body]);
       if (url.startsWith('https://api.example.net/redirect')) return { status: 302, headers: new Map([['location', 'https://evil.example.org/']]) };
       if (url.startsWith('https://api.example.net/hop')) return { status: 301, headers: new Map([['location', '/landed']]) };
+      if (url.startsWith('https://api.example.net/see-other')) return { status: 303, headers: new Map([['location', '/landed']]) };
+      if (url.startsWith('https://api.example.net/temp')) return { status: 307, headers: new Map([['location', '/landed']]) };
       return { ok: true, status: 200, headers: new Map(), json: async () => ({ url }) };
     };
     try {
@@ -548,6 +579,11 @@ describe('fs, crypto, net, i18n', () => {
       const hopped = await c.net.fetch('https://api.example.net/hop');
       expect(await hopped.json()).toEqual({ url: 'https://api.example.net/landed' });
       expect(calls.every(([, redirect]) => redirect === 'manual')).toBe(true);
+      await c.net.fetch('https://api.example.net/see-other', { method: 'POST', body: 'payload' });
+      expect(calls.at(-1)).toEqual(['https://api.example.net/landed', 'manual', 'GET', undefined]);
+      await c.net.fetch('https://api.example.net/temp', { method: 'POST', body: 'payload' });
+      expect(calls.at(-1)).toEqual(['https://api.example.net/landed', 'manual', 'POST', 'payload']);
+      expect(await (await c.net.fetch('https://api.example.net:443/')).json()).toEqual({ url: 'https://api.example.net/' });
     } finally {
       globalThis.fetch = original;
     }
@@ -572,6 +608,110 @@ describe('fs, crypto, net, i18n', () => {
   });
 });
 
+describe('review round 1', () => {
+  it('evaluates plugin code in a context without process, fetch or eval and hands out a frozen SDK', async () => {
+    const main = `'use strict';
+const sdk = require('whm/plugins/sdk');
+module.exports = {
+  routes(r) {
+    r.get('/probe', async (req, res) => {
+      const probe = {
+        process: typeof process, globalProcess: typeof globalThis.process, fetch: typeof fetch, global: typeof global,
+        eval: (() => { try { eval('1'); return 'allowed'; } catch (e) { return e.constructor.name; } })(),
+        fn: (() => { try { new Function('return 1')(); return 'allowed'; } catch (e) { return e.constructor.name; } })(),
+        requireProcess: (() => { try { require('process'); return 'allowed'; } catch (e) { return e.code; } })(),
+        requireFs: (() => { try { require('node:fs'); return 'allowed'; } catch (e) { return e.code; } })(),
+        patchProto: (() => { try { sdk.PluginError.prototype.toJSON = () => 'patched'; return 'allowed'; } catch (e) { return e.constructor.name; } })(),
+        patchExports: (() => { try { sdk.semver.satisfies = () => true; return 'allowed'; } catch (e) { return e.constructor.name; } })(),
+        builtins: [typeof Buffer, typeof URL, typeof setTimeout, typeof TextEncoder, typeof require('crypto').createHash],
+        frozen: Object.isFrozen(sdk) && Object.isFrozen(sdk.PluginError.prototype),
+      };
+      console.log('probe ran', probe.eval);
+      res.json(probe);
+    });
+  },
+};
+`;
+    const dir = writePlugin(path.join(tmp, 'probe'), fixtures.minimalManifest({ id: 'net.example.probe', permissions: ['api:routes'] }), { main });
+    expect((await post('/api/plugins/manage/install', { dir })).status).toBe(201);
+    const enabled = await post('/api/plugins/manage/net.example.probe/enable');
+    expect(enabled.body.data.state).toBe('enabled');
+    const res = await get('/api/plugins/net.example.probe/probe');
+    expect(res.status).toBe(200);
+    expect(res.body.data).toEqual({
+      process: 'undefined', globalProcess: 'undefined', fetch: 'undefined', global: 'undefined', eval: 'EvalError', fn: 'EvalError',
+      requireProcess: 'PERMISSION_DENIED', requireFs: 'PERMISSION_DENIED', patchProto: 'TypeError', patchExports: 'TypeError',
+      builtins: ['function', 'function', 'function', 'function', 'function'], frozen: true,
+    });
+    const logs = await get('/api/plugins/manage/net.example.probe/logs?limit=5');
+    expect(logs.body.data.some((l) => l.msg === 'probe ran EvalError' && l.level === 'info')).toBe(true);
+    const detail = await get('/api/plugins/manage/net.example.probe');
+    expect(detail.body.data).toMatchObject({ isolation: 'in-process', warnings: ['in-process', 'unsigned'] });
+    await del('/api/plugins/manage/net.example.probe?purge=true');
+  });
+
+  it('never writes a password-type setting or a nested secret to the audit log or plugin log', async () => {
+    const manifest = fixtures.minimalManifest({ id: 'net.example.secrets', permissions: ['settings:own'], settings: { fields: [{ key: 'smtpAuth', type: 'password', label: 'SMTP auth' }, { key: 'host', type: 'text', label: 'Host' }] } });
+    const dir = writePlugin(path.join(tmp, 'secrets'), manifest, { main: 'module.exports = {};' });
+    expect((await post('/api/plugins/manage/install', { dir })).status).toBe(201);
+    const res = await put('/api/plugins/manage/net.example.secrets/settings', { smtpAuth: 'hunter2-smtp', host: 'mail.example.net' });
+    expect(res.status).toBe(200);
+    expect(res.body.data).toEqual({ smtpAuth: PASSWORD_MASK, host: 'mail.example.net' });
+    const rows = app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE target = 'net.example.secrets' OR target = 'net.example.secrets/settings' OR action LIKE '%settings%' ORDER BY id DESC LIMIT 5").all();
+    expect(rows.length).toBeGreaterThan(0);
+    for (const r of rows) expect(r.args_redacted || '').not.toContain('hunter2-smtp');
+    expect(rows.some((r) => (r.args_redacted || '').includes(PASSWORD_MASK) && (r.args_redacted || '').includes('mail.example.net'))).toBe(true);
+    await del('/api/plugins/manage/net.example.secrets?purge=true');
+
+    const c = pluginCtx();
+    c.log.info('nested', { smtp: { password: 'p4ss', host: 'h' } });
+    const logRow = app.ctx.db.prepare('SELECT fields_json FROM plugin_logs WHERE plugin_id = ? ORDER BY id DESC LIMIT 1').get(ID);
+    expect(JSON.parse(logRow.fields_json)).toEqual({ smtp: { password: '[REDACTED]', host: 'h' } });
+    const r = await c.api.audit.record({ action: 'nested', details: { smtp: { password: 'p4ss' } } });
+    expect(JSON.parse(app.ctx.db.prepare('SELECT args_redacted FROM audit_log WHERE id = ?').get(Number(r.id)).args_redacted)).toEqual({ smtp: { password: '[REDACTED]' } });
+  });
+
+  it('caps plugin log rows: long messages and oversized fields are truncated', async () => {
+    const c = pluginCtx();
+    c.log.warn('m'.repeat(10_000), { big: 'y'.repeat(20_000) });
+    const row = app.ctx.db.prepare('SELECT msg, fields_json FROM plugin_logs WHERE plugin_id = ? ORDER BY id DESC LIMIT 1').get(ID);
+    expect(Buffer.byteLength(row.msg)).toBeLessThanOrEqual(2 * 1024 + 3);
+    expect(row.msg.endsWith('…')).toBe(true);
+    const fields = JSON.parse(row.fields_json);
+    expect(fields.truncated).toBe(true);
+    expect(Buffer.byteLength(row.fields_json)).toBeLessThan(9 * 1024);
+  });
+
+  it('times out hook handlers that never settle: a pre hook with the cancel scope vetoes, a post hook only logs', async () => {
+    const main = `module.exports = { hooks: {
+  async slowPre(evt) { if (evt.payload.username === 'stall') await new Promise(() => {}); },
+  async slowPost() { await new Promise(() => {}); },
+} };`;
+    const manifest = fixtures.minimalManifest({ id: 'net.example.slow', permissions: ['accounts:write'], hooks: [{ event: 'account.created', stage: 'pre', handler: 'slowPre' }, { event: 'account.created', handler: 'slowPost' }] });
+    const dir = writePlugin(path.join(tmp, 'slow'), manifest, { main });
+    expect((await post('/api/plugins/manage/install', { dir })).status).toBe(201);
+    expect((await post('/api/plugins/manage/net.example.slow/enable')).body.data.state).toBe('enabled');
+    app.ctx.config.pluginHookTimeoutMs = 150;
+    try {
+      const stalled = await post('/api/accounts', { username: 'stall', domain: 'stall.example.com' });
+      expect(stalled.status).toBe(409);
+      expect(stalled.body.error).toEqual({ code: 'hook_rejected', message: 'Minimal: hook hooks.slowPre timed out after 150 ms' });
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM accounts WHERE username = 'stall'").get().n).toBe(0);
+      const started = Date.now();
+      const quick = await post('/api/accounts', { username: 'quick', domain: 'quick.example.com' });
+      expect(quick.status).toBe(201);
+      expect(Date.now() - started).toBeLessThan(2000);
+      await new Promise((r) => setTimeout(r, 250));
+      const detail = await get('/api/plugins/manage/net.example.slow');
+      expect(detail.body.data.hookTimeouts.map((h) => h.handler)).toEqual(['hooks.slowPre', 'hooks.slowPost']);
+      expect(detail.body.data.logs.filter((l) => /timed out/.test(l.msg))).toHaveLength(2);
+    } finally {
+      delete app.ctx.config.pluginHookTimeoutMs;
+      await del('/api/plugins/manage/net.example.slow?purge=true');
+    }
+  });
+});
+
 describe('disable, uninstall, boot', () => {
   it('disables: routes 404, schedules gone, running jobs aborted, deactivate called', async () => {
     const c = pluginCtx();
@@ -589,8 +729,12 @@ describe('disable, uninstall, boot', () => {
   });
 
   it('re-enables with migrate() when the version changed and uninstall purges everything', async () => {
-    await post(`/api/plugins/manage/${ID}/enable`);
+    const [a, b] = await Promise.all([app.ctx.plugins.enable(ID), app.ctx.plugins.enable(ID)]);
+    expect(a.state).toBe('enabled');
+    expect(b.state).toBe('enabled');
     expect(pluginModule().calls).toEqual(['activate']);
+    expect(app.ctx.plugins.entry(ID).subscribers).toHaveLength(3);
+    expect(app.ctx.scheduler.listPrefix(`plugin:${ID}:`).filter((r) => r.name === `plugin:${ID}:nightly-run`)).toHaveLength(1);
     const dir = writePlugin(path.join(tmp, 'hello2'), fixtures.fullManifest({ version: '1.3.0' }));
     const up = await post('/api/plugins/manage/install', { dir });
     expect(up.status).toBe(201);
@@ -639,7 +783,7 @@ describe('signatures', () => {
     const files = signFiles(packageFiles(manifest), privateKey, 'vendor');
     const ok = await installRaw(packageFromFiles(files));
     expect(ok.status).toBe(201);
-    expect(ok.body.data).toMatchObject({ warnings: [], plugin: { signed: true, signer: 'vendor' } });
+    expect(ok.body.data).toMatchObject({ warnings: ['in-process'], plugin: { signed: true, signer: 'vendor' } });
 
     const tampered = await installRaw(packageFromFiles({ ...files, 'main.js': 'module.exports = { evil: true };' }));
     expect(tampered.status).toBe(422);

@@ -98,11 +98,14 @@ function classify(entry) {
 /** List entries → [{ name, type: 'file'|'dir', size, mode }]. Validates every name and type. */
 export function listTar(buf, { maxEntries = DEFAULT_MAX_ENTRIES, maxBytes = DEFAULT_MAX_BYTES } = {}) {
   const out = [];
+  const seen = new Set();
   let total = 0;
   for (const e of entries(buf)) {
     const type = classify(e);
     const name = safeEntryName(e.name);
     if (name === '') continue;
+    if (seen.has(name)) throw new TarError(`duplicate entry "${name}"`, name);
+    seen.add(name);
     total += e.size;
     if (total > maxBytes) throw new TarError(`archive exceeds ${maxBytes} bytes when extracted`);
     out.push({ name, type, size: e.size, mode: e.mode });
@@ -116,11 +119,14 @@ export function extractTar(buf, destDir, { maxBytes = DEFAULT_MAX_BYTES, maxEntr
   const root = path.resolve(destDir);
   fs.mkdirSync(root, { recursive: true, mode: 0o750 });
   const list = [];
+  const seen = new Set();
   let total = 0;
   for (const e of entries(buf)) {
     const type = classify(e);
     const name = safeEntryName(e.name);
     if (name === '') continue;
+    if (seen.has(name)) throw new TarError(`duplicate entry "${name}"`, name);
+    seen.add(name);
     total += e.size;
     if (total > maxBytes) throw new TarError(`archive exceeds ${maxBytes} bytes when extracted`);
     list.push({ name, type, size: e.size, mode: e.mode });
@@ -137,12 +143,17 @@ export function extractTar(buf, destDir, { maxBytes = DEFAULT_MAX_BYTES, maxEntr
       if (st.isSymbolicLink()) throw new TarError('refusing to write through a symbolic link', name);
       if (cur !== target && !st.isDirectory()) throw new TarError(`entry "${name}" has a file as a parent`, name);
     }
-    if (type === 'dir') {
-      fs.mkdirSync(target, { recursive: true, mode: 0o750 });
-      continue;
+    try {
+      if (type === 'dir') {
+        fs.mkdirSync(target, { recursive: true, mode: 0o750 });
+        continue;
+      }
+      fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o750 });
+      fs.writeFileSync(target, e.data, { mode: (e.mode & 0o100 ? 0o750 : 0o640), flag: 'w' });
+    } catch (err) {
+      if (['EEXIST', 'EISDIR', 'ENOTDIR'].includes(err.code)) throw new TarError(`entry "${name}" conflicts with an earlier entry (${err.code})`, name);
+      throw err;
     }
-    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o750 });
-    fs.writeFileSync(target, e.data, { mode: (e.mode & 0o100 ? 0o750 : 0o640), flag: 'w' });
   }
   return list;
 }

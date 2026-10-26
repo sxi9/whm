@@ -218,6 +218,8 @@ test('ctx.store: key/value and collections, isolated and inspectable', async () 
   assert.equal(await ctx.store.delete('a'), false);
   await assert.rejects(ctx.store.set('', 1), ValidationError);
   await assert.rejects(ctx.store.set('u', undefined), ValidationError);
+  await assert.rejects(ctx.store.set('__seq', 1), ValidationError);
+  await assert.rejects(ctx.store.get('__anything'), ValidationError);
   assert.deepEqual(host.state.store.kv, { b: [1, 2] });
 
   const runs = ctx.store.collection('runs');
@@ -273,10 +275,15 @@ test('ctx.api.accounts / packages / dns / services / system', async () => {
 test('ctx.api.backups: full artefact lifecycle, restore requires an admin confirm token', async () => {
   const host = mk();
   const { ctx } = host;
-  const art = await ctx.api.backups.create({ account: 'alice', include: ['home', 'db'], compression: 'zstd', encrypt: true });
+  const art = await ctx.api.backups.create({ account: 'alice', include: ['home', 'db'] });
   assert.match(art.id, /^bk_/);
   assert.equal(art.account, 'alice');
-  assert.match(art.path, /\.tar\.zst\.enc$/);
+  assert.match(art.path, /\.tar\.gz$/);
+  assert.equal(art.compression, 'gzip');
+  assert.equal(art.encrypted, false);
+  // The host only produces gzip, unencrypted archives; the mock mirrors that.
+  await assert.rejects(ctx.api.backups.create({ account: 'alice', compression: 'zstd' }), ValidationError);
+  await assert.rejects(ctx.api.backups.create({ account: 'alice', encrypt: true }), (e) => e.code === 'UNSUPPORTED');
   assert.match(art.sha256, /^[0-9a-f]{64}$/);
   assert.equal(art.createdAt, NOW);
   assert.ok(art.size > 0);
@@ -289,7 +296,7 @@ test('ctx.api.backups: full artefact lifecycle, restore requires an admin confir
   const up = await ctx.api.backups.upload({ artefactId: art.id, destinationId: 'dest1' });
   assert.equal(up.ok, true);
   assert.equal(up.sha256, art.sha256);
-  assert.equal(up.remotePath, `s3://offsite/alice/${art.id}.tar.zst.enc`);
+  assert.equal(up.remotePath, `s3://offsite/alice/${art.id}.tar.gz`);
   await assert.rejects(ctx.api.backups.upload({ artefactId: art.id, destinationId: 'nope' }), NotFoundError);
   const ver = await ctx.api.backups.verify(art.id);
   assert.deepEqual(ver, { ok: true, sha256: art.sha256, size: art.size, verifiedAt: NOW });

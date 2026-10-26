@@ -14,12 +14,41 @@ CommonJS packages validated by `plugins/sdk/validate-manifest.js`.
 | tar reader | `server/src/lib/tar.js` — pure JS ustar/gnu reader over a gunzipped buffer: `listTar(buf)` → entries `{ name, type, size, mode }`, `extractTar(buf, destDir, { maxBytes = 50 MiB, maxEntries = 2000 })`. Refuses absolute names, `..` segments, NUL, symlinks/hardlinks/devices/fifos (only `0`/`5` and GNU `L` long names), and size overflow. Never spawns a process. |
 | host service | `server/src/services/plugins.js` — `createPluginHost(ctx)` attached as `ctx.plugins` |
 | core routes | `server/src/routes/plugins.js` — mounted in `routes/index.js` as `api.use('/plugins', pluginRoutes(ctx))` right after `/packages` |
-| migration | `server/src/db/migrations/024_plugins.sql` |
+| migrations | `server/src/db/migrations/024_plugins.sql`, `024b_plugins-job-error-code.sql` (`jobs.error_code`, written by `lib/jobs.js` from `err.code`) |
 | scheduler | `server/src/lib/scheduler.js` gains `remove(name)` (DELETE by name) and `listPrefix(prefix)` |
 | bootstrap | `server/src/index.js`: `ctx.plugins = createPluginHost(ctx)` before `createApp`; after `createApp` → `await ctx.plugins.loadAll()` (never throws; a failing plugin becomes `errored`). `start()`/shutdown calls `ctx.plugins.stopAll()` |
-| client | `client/src/pages/plugins/PluginPage.jsx` (generic renderer), `client/src/hooks/usePluginNav.js`, one dynamic route `plugins/:pluginId/*` in `router.jsx`, sidebar/tools/search merge in the layout |
-| tests | `server/test/plugin-host.test.js`, `server/test/tar.test.js`, `client/test/plugin-page.test.jsx` (render each page kind) |
+| client | `client/src/pages/plugins/PluginPage.jsx` (generic renderer), `client/src/hooks/usePluginNav.js`, one dynamic route `plugins/:pluginId/*` in `router.jsx`, sidebar/tools/search merge in the layout; **Manage Plugins** page `client/src/pages/fn/cpanel/manage-plugins.jsx` (list / install / enable / disable / uninstall, detail with permissions, denials, hook timeouts, schedules, jobs, log; the `plugins.require_signature` switch with a warning while it is off; the trust notice below) |
+| tests | `server/test/plugin-host.test.js`, `server/test/tar.test.js`, `client/test/plugin-page.test.jsx` (render each page kind), `client/test/manage-plugins.test.jsx` |
 | docs | this file + `plugins/SDK.md` is written in Phase 5 (do not write it now) |
+
+## Trust model (read this before relying on permissions)
+
+Every plugin runs **inside the panel process** (`whm-panel`, or root in monolithic mode) until process
+isolation lands with the marketplace. The host evaluates `main.js` and its relative modules in a
+dedicated `vm` context (`lib/plugin-sdk.js` `createPluginContext`): the context global holds the
+ECMAScript intrinsics plus `Buffer`, `URL`/`URLSearchParams`, `TextEncoder`/`TextDecoder`,
+`AbortController`/`AbortSignal`, timers, `structuredClone`, `atob`/`btoa`, `performance` and a
+`console` that writes to the plugin log; `process`, `global` and `fetch` are shadowed to `undefined`;
+`eval`/`new Function` are disabled (`codeGeneration.strings = false`); dynamic `import()` is
+unavailable; `require` only resolves relative files inside the plugin dir, `whm/plugins/sdk` and the
+built-in allow-list. The SDK exports handed to plugins are a deep-frozen copy (`freezeExports`:
+classes, prototypes and nested objects), so a plugin cannot patch `PluginError.prototype` or
+`semver.satisfies` for the host and the other plugins.
+
+That context removes the convenient escape hatches (`process.binding`, `process.env`,
+`process.exit`, unscoped `fetch`), **but it is not a security boundary**: host objects reachable
+from `ctx` (and from the allow-listed built-ins) expose the panel realm, e.g. through
+`something.constructor.constructor`. The permission gates, `permissionsUsed` / `permissionDenials`
+and the `agent:op` / `net` / `fs` scopes are therefore an enforced contract for well-behaved code and
+a review aid, not protection against a hostile package. Consequences, all implemented:
+
+- `POST /api/plugins/manage/install` always returns `warnings: [..., 'in-process']`; the detail view
+  reports `isolation` and `warnings` (`in-process`, `unsigned`).
+- The Manage Plugins page shows a trust notice above the list and the same sentence next to each
+  plugin's permission list; the `plugins.require_signature` switch sits on that page with a warning
+  while it is off.
+- Signed packages from trusted keys are the real control today; turn `plugins.require_signature` on
+  before exposing the install endpoint to anyone but the operator.
 
 ## Storage (migration 024)
 
@@ -32,6 +61,12 @@ plugin_store       (plugin_id, key, value_json, updated_at, PK (plugin_id, key))
 plugin_docs        (plugin_id, collection, id, doc_json, created_at, updated_at, PK (plugin_id, collection, id))
 plugin_logs        (id INTEGER PK, plugin_id, ts, level, msg, fields_json)             -- ring buffer, keep newest 1000 per plugin
 ```
+Resource caps (`PluginError QUOTA_EXCEEDED` 507 beyond them): `MAX_STORE_VALUE_BYTES` 1 MiB per
+value/document, `MAX_STORE_ROWS` 50 000 keys and `MAX_DOCS_ROWS` 100 000 documents per plugin,
+`MAX_FS_BYTES` 100 MiB per data dir. Log rows truncate `msg` to 2 KiB and `fields` JSON to 8 KiB
+(`{ truncated: true, fields: '<prefix>…' }`); fields are redacted **recursively** (the SDK's
+`redact` is shallow; the host also masks `{ smtp: { password } }`). Store keys starting with `__`
+are reserved for the host (`ValidationError`); the collection id counter lives under `__seq`.
 Jobs use the core `jobs` table with type `plugin:<id>:<job>`; schedules use the core
 `schedules` table with name `plugin:<id>:<cronName>` (manifest cron) or
 `plugin:<id>:runtime:<job>` (ctx.schedule.cron) and job type `plugin:<id>:<job>`.
@@ -55,16 +90,20 @@ Max package 20 MiB compressed, 50 MiB extracted.
 Install sources: `POST /api/plugins/manage/install` with raw body (`application/gzip` or
 `application/octet-stream`, `express.raw({ limit: '20mb' })`) **or** JSON `{ "path": "/abs/file.whmplugin" }`
 (root only, path must pass `ctx.agent`-style allowed-root rules: under `$WHM_DATA_DIR`, `/root`, `/home`, `/tmp`, `/opt`)
-**or** `{ "dir": "/abs/dir" }` (an unpacked plugin directory, used by tests and bundled plugins).
+**or** `{ "dir": "/abs/dir" }` (an unpacked plugin directory, used by tests and bundled plugins; the realpath
+must sit under the same roots or the repository's `plugins/` directory → 403 `path_not_allowed` otherwise).
+The tar reader refuses duplicate entry names and file/directory conflicts (422 `invalid_package`).
 
 ## Lifecycle
 
 - `install(input, { user, req })`: unpack to a temp dir under `pluginsDir/.staging/` → read + `validateManifest`
   (errors → 422 `invalid_manifest` with the SDK's error list as `fields`) → `semver.satisfies(HOST_API_VERSION, manifest.engines.whm)`
   (422 `incompatible_host`) → signature policy → if the id exists: keep `previousVersion`, replace the directory atomically
-  (rename old to `.previous`, new into place; remove `.previous` after success) → upsert row (`state` stays `enabled`
+  (rename old to `.staging/<id>.previous-<random>` — never `<id>.previous`, which is itself a legal plugin id — new into
+  place; remove the backup after success) → upsert row (`state` stays `enabled`
   if it was enabled → re-activate with `migrate(from)`; new installs are `installed`) → audit `plugin.install` → `ctx.events.emit('plugin.installed')`.
-- `enable(id)`: load module (below) → `activate` sequence exactly like the mock's `load()`:
+- `enable(id)`: one activation per id at a time (a concurrent caller awaits the in-flight promise; an entry in state
+  `activating` counts as in progress) → load module (below) → `activate` sequence exactly like the mock's `load()`:
   engines check → handler presence checks → `routes(http, ctx)` → manifest pages → manifest cron → `migrate(ctx, from)`
   when upgrading → `activate(ctx)` → state `enabled`; failure ⇒ state `errored` + `last_error`, everything registered is rolled back.
 - `disable(id)`: `deactivate(ctx)` → remove routes, event subscriptions, schedules (`plugin:<id>:*`), abort running jobs → `disabled`.
@@ -73,7 +112,7 @@ Install sources: `POST /api/plugins/manage/install` with raw body (`application/
 - `HOST_API_VERSION = '1.0.0'` (the plugin API version, independent of the panel's package version; `ctx.plugin.hostVersion`).
 
 Module loading: `main.js` is CommonJS. Evaluate with `vm.compileFunction` wrapper (same technique as
-`loadCommonJs`) with a `require` that resolves: relative paths inside the plugin dir only (realpath must stay inside;
+`loadCommonJs`) inside the per-plugin vm context described under *Trust model*, with a `require` that resolves: relative paths inside the plugin dir only (realpath must stay inside;
 no symlink escape), `whm/plugins/sdk` → the loaded SDK exports, and Node built-ins from an allowlist
 (`crypto, path, url, util, buffer, events, stream, string_decoder, querystring, zlib, assert, timers`, with or without
 `node:`). Everything else throws `PermissionError('require:<spec>')`. `isolation: 'process'` is accepted but runs
@@ -87,15 +126,23 @@ logger child `{ plugin: id }`, fields redacted with the mock's SECRET_KEY_RE), `
 operators, `MAX_STORE_VALUE_BYTES`, ids `doc_0001`-style per plugin via a counter stored in `plugin_store` under
 `__seq`), `ctx.api.*` (below), `ctx.agent.op` (gate `agent:op:<name>` then `ctx.agent.op(name, args, { req })`),
 `ctx.jobs`, `ctx.schedule`, `ctx.events`, `ctx.http` (`baseUrl = /api/plugins/<id>`), `ctx.ui.registerPage`,
-`ctx.crypto` (HKDF-SHA256 from `config.masterKeyHex` with info `whm-plugin-crypto`, salt = plugin id, `whm1:` format),
-`ctx.fs` (real files under dataDir; `safeRel`; lstat → refuse symlinks; quota `MAX_FS_BYTES`), `ctx.net.fetch`
-(https only, `matchesNetScope`, 30 s timeout, `redirect: 'manual'` re-checked per hop, max 3 hops),
+`ctx.crypto` (HKDF-SHA256 from `config.masterKeyHex` with salt `whm-plugin-crypto`, info = plugin id — the mock's
+`hkdfSync` argument order — `whm1:` format),
+`ctx.fs` (real files under dataDir; `safeRel`; lstat → refuse symlinks; quota `MAX_FS_BYTES`; `writeFile`/`mkdir`
+through a parent that is a file → `PathError`; `remove()` of an empty real directory returns `true` where the mock's
+implicit directories return `false`), `ctx.net.fetch` (https only, `matchesNetScope` with an empty URL port read as
+`443` so a `host:443` scope matches `https://host/` while a port-less scope matches any port, 30 s timeout,
+`redirect: 'manual'` re-checked per hop, max 3 hops; 301/302/303 hops become body-less `GET`s, 307/308 replay the
+request, like fetch's `follow` mode),
 `ctx.i18n` (loads `<dir>/<manifest.i18n.dir>/<locale>.json`), `ctx.errors`, `ctx.now()` (= Date.now()).
 Gate semantics identical to the mock (`PermissionError` with the same arguments) and the host records
 `permissionsUsed`/`permissionDenials` per plugin for the Manage Plugins detail view.
 
 `ctx.api` maps onto panel services with a synthetic principal `{ id: null, username: 'plugin:<id>', role: 'root' }`
 and `req = { user, ip: null, audit: (e) => ctx.audit? ... }` (write audit rows with `principal = plugin:<id>`, `role = plugin`):
+Backups: the panel only produces gzip-compressed, unencrypted archives, so the SDK's `COMPRESSIONS` is `['gzip']`
+(`zstd`/`none` are a `ValidationError` in the mock and the host alike) and `encrypt: true` is `PluginError UNSUPPORTED`
+422 in both.
 accounts.list/get/suspend/unsuspend → `ctx.accounts.list(query, user)` / `get` / `suspend(username, reason, user, req)` /
 `unsuspend` (rows reshaped to the mock's account shape); packages.list → `ctx.packages.list({ pageSize: 500 }, user).data`;
 dns.zones.list/get → `ctx.dns.listZones` / `getZone`; backups.* → `ctx.backup` (find the real method names in
@@ -109,12 +156,21 @@ audit.record → insert into `audit_log`. Missing optional services (`ctx.dns`, 
 Jobs: on enable, register `plugin:<id>:<job>` with `ctx.jobs.register`; the handler builds the mock's `job` object
 (`id, name, params (frozen), signal, progress, log, cancelled`) over the core job ctx and calls the plugin's handler
 with `(job, pluginCtx)`; `ctx.jobs.run` → `enqueue` (returns the id as a string), `status` → the mock's record shape,
-`cancel` → core cancel for queued + AbortController for running (`cancellable: false` ⇒ `ConflictError`).
+`cancel` → core cancel for queued + AbortController for running (`cancellable: false` ⇒ `ConflictError`); the jobs row
+flips to `cancelled` with `finished_at` at cancel time (the mock's immediate transition) and is corrected again when the
+handler settles. `status().error.code` is the thrown error's code (`jobs.error_code`, migration 024b):
+`JOB_TIMEOUT`, `JOB_CANCELLED`, a plugin-defined code, else `JOB_FAILED`; a cancelled job reports `error: null`.
 
 Events: manifest hooks and `ctx.events.on` subscribe on `ctx.events` (PanelEvents, created by the development
 category; subscribe lazily on enable and tolerate absence). Envelope → the mock's `evt` (`name, stage, payload (frozen),
 ts, principal, cancellable, cancel()`); a `pre` cancel throws `HttpError(409, 'hook_rejected', '<plugin name>: <reason>')`
 so the panel's existing hook contract applies; errors in `post` handlers are logged (plugin log) and never propagate.
+Every delivery is raced against a timeout (`config.pluginHookTimeoutMs`, default `HOOK_TIMEOUT_MS` = 30 s): a
+handler that does not settle is logged (`hook handler … timed out`), recorded in the entry's `hookTimeouts` (detail
+view), and for a `post` stage returns `{ error }`. For a **`pre` stage the timeout vetoes the operation**
+(409 `hook_rejected`, "<plugin>: hook <handler> timed out after N ms") when the plugin holds the event's `cancelScope`:
+skipping its judgement would silently bypass the policy the hook exists to enforce, and the operator sees the error
+and can disable the plugin. Without that scope the plugin could not have cancelled anyway, so the timeout is only logged.
 `ctx.events.emit` (namespace-checked) → `ctx.events.emit(event, payload, { stage: 'post' })`.
 
 HTTP: per-plugin Express router created on enable; the core router dispatches `/api/plugins/:id/*` to it
@@ -127,13 +183,15 @@ never collide.
 
 ```
 GET    /api/plugins/manage                       list [{ id, name, version, state, lastError, permissions, sidebar, signed, signer, source, installedAt }]
-POST   /api/plugins/manage/install               raw .whmplugin body | { path } | { dir }  → 201 { plugin, warnings: ['unsigned'] }
+POST   /api/plugins/manage/install               raw .whmplugin body | { path } | { dir }  → 201 { plugin, warnings: ['unsigned'?, 'in-process'] }
 GET    /api/plugins/manage/:id                   detail: manifest, settings (schema + values, password fields masked as '••••••'),
-                                                 schedules, recent jobs, permissionsUsed/denials, logs (last 100)
+                                                 schedules, recent jobs, permissionsUsed/denials, hookTimeouts, isolation, warnings, logs (last 100)
 POST   /api/plugins/manage/:id/enable | /disable
 DELETE /api/plugins/manage/:id?purge=true
 GET    /api/plugins/manage/:id/settings          values (passwords masked)
-PUT    /api/plugins/manage/:id/settings          { key: value, ... } validated per field; a masked password value leaves the stored one untouched
+PUT    /api/plugins/manage/:id/settings          { key: value, ... } validated per field; a masked password value leaves the stored one untouched;
+                                                 every audit row (the route-level one and `plugin.settings.update`) carries PASSWORD_MASK for password-type fields,
+                                                 whatever the field is called
 GET    /api/plugins/manage/:id/logs?limit=
 POST   /api/plugins/manage/:id/jobs/:name        { params } → 202 { job } (root; resellers only when the page descriptor allows: pages carry `roles`? no — keep root)
 POST   /api/plugins/manage/:id/restore-token     { artefactId, account } → { token, expiresAt }

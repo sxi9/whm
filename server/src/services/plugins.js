@@ -2,11 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
+import util from 'node:util';
 import { createRequire } from 'node:module';
 import { json } from '../db/index.js';
 import { HttpError, CapabilityError, notFound, conflict } from '../lib/errors.js';
 import { agentErrorStatus } from '../middleware/error.js';
-import { loadPluginSdk, loadCommonJs } from '../lib/plugin-sdk.js';
+import { loadPluginSdk, loadCommonJs, createPluginContext, freezeExports, REPO_ROOT } from '../lib/plugin-sdk.js';
 import { extractTar, TarError } from '../lib/tar.js';
 import { PanelEvents } from './development.js';
 
@@ -25,6 +26,15 @@ export const LOG_RING_SIZE = 1000;
 export const RESTORE_TOKEN_TTL_MS = 10 * 60 * 1000;
 export const PASSWORD_MASK = '••••••';
 export const INSTALL_ROOTS = ['/root', '/home', '/tmp', '/opt'];
+export const MAX_LOG_MSG_BYTES = 2 * 1024;
+export const MAX_LOG_FIELDS_BYTES = 8 * 1024;
+export const MAX_STORE_ROWS = 50_000;
+export const MAX_DOCS_ROWS = 100_000;
+export const HOOK_TIMEOUT_MS = 30_000;
+// Every plugin runs inside the panel process until process isolation lands, so
+// an installed plugin is trusted code; the install response and the Manage
+// Plugins view carry this warning next to the permission list.
+export const IN_PROCESS_WARNING = 'in-process';
 
 const SECRET_KEY_RE = /pass(word)?|secret|token|key|credential|authorization/i;
 const BUILTIN_REQUIRES = new Set(['crypto', 'path', 'url', 'util', 'buffer', 'events', 'stream', 'string_decoder', 'querystring', 'zlib', 'assert', 'timers']);
@@ -52,11 +62,19 @@ function jsonSize(v) {
   return Buffer.byteLength(JSON.stringify(v) ?? 'null');
 }
 
-function redact(fields) {
-  if (!isObj(fields)) return fields;
+// Like the SDK's redact but recursive: `{ smtp: { password } }` is masked too.
+function redact(value, depth = 0) {
+  if (Array.isArray(value)) return depth > 6 ? '[…]' : value.map((v) => redact(v, depth + 1));
+  if (!isObj(value)) return value;
+  if (depth > 6) return '[…]';
   const out = {};
-  for (const [k, v] of Object.entries(fields)) out[k] = SECRET_KEY_RE.test(k) ? '[REDACTED]' : v;
+  for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY_RE.test(k) ? '[REDACTED]' : redact(v, depth + 1);
   return out;
+}
+
+function truncateUtf8(text, max) {
+  if (Buffer.byteLength(text) <= max) return text;
+  return `${Buffer.from(text).subarray(0, max - 1).toString('utf8').replace(/\uFFFD+$/, '')}…`;
 }
 
 function compilePath(p) {
@@ -113,7 +131,7 @@ export function createPluginHost(ctx) {
   const E = sdk?.errors;
   const semver = sdk?.semver;
   const cron = sdk?.cron;
-  const sdkExports = sdk ? (sdk.index || { ...sdk.validate, ...sdk.errors, semver: sdk.semver, cron: sdk.cron }) : null;
+  const sdkExports = sdk ? freezeExports({ ...(sdk.index || { ...sdk.validate, ...sdk.errors, semver: sdk.semver, cron: sdk.cron }) }) : null;
   const pluginsDir = config.pluginsDir;
   const pluginDataDir = config.pluginDataDir;
   const keysDir = path.join(config.dataDir, 'plugin-keys');
@@ -139,23 +157,27 @@ export function createPluginHost(ctx) {
     kvDel: db.prepare('DELETE FROM plugin_store WHERE plugin_id = ? AND key = ?'),
     kvKeys: db.prepare('SELECT key FROM plugin_store WHERE plugin_id = ? ORDER BY key'),
     kvPurge: db.prepare('DELETE FROM plugin_store WHERE plugin_id = ?'),
+    kvCount: db.prepare('SELECT COUNT(*) AS n FROM plugin_store WHERE plugin_id = ?'),
     docs: db.prepare('SELECT id, doc_json FROM plugin_docs WHERE plugin_id = ? AND collection = ? ORDER BY rowid'),
     docInsert: db.prepare('INSERT INTO plugin_docs (plugin_id, collection, id, doc_json) VALUES (?, ?, ?, ?)'),
     docUpdate: db.prepare(`UPDATE plugin_docs SET doc_json = ?, updated_at = datetime('now') WHERE plugin_id = ? AND collection = ? AND id = ?`),
     docDelete: db.prepare('DELETE FROM plugin_docs WHERE plugin_id = ? AND collection = ? AND id = ?'),
     docsPurge: db.prepare('DELETE FROM plugin_docs WHERE plugin_id = ?'),
+    docsCount: db.prepare('SELECT COUNT(*) AS n FROM plugin_docs WHERE plugin_id = ?'),
     logInsert: db.prepare('INSERT INTO plugin_logs (plugin_id, level, msg, fields_json) VALUES (?, ?, ?, ?)'),
     logPrune: db.prepare('DELETE FROM plugin_logs WHERE plugin_id = ? AND id NOT IN (SELECT id FROM plugin_logs WHERE plugin_id = ? ORDER BY id DESC LIMIT ?)'),
     logs: db.prepare('SELECT id, ts, level, msg, fields_json FROM plugin_logs WHERE plugin_id = ? ORDER BY id DESC LIMIT ?'),
     logsPurge: db.prepare('DELETE FROM plugin_logs WHERE plugin_id = ?'),
     jobsFor: db.prepare("SELECT * FROM jobs WHERE type LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT ?"),
     jobCancelled: db.prepare("UPDATE jobs SET status = 'cancelled' WHERE id = ?"),
+    jobCancelRunning: db.prepare("UPDATE jobs SET status = 'cancelled', finished_at = datetime('now') WHERE id = ? AND status = 'running'"),
     audit: db.prepare('INSERT INTO audit_log (principal, role, ip, action, target, args_redacted, result, request_id) VALUES (?, ?, NULL, ?, ?, ?, ?, NULL)'),
     accountByUsername: db.prepare('SELECT a.*, u.username AS owner FROM accounts a JOIN users u ON u.id = a.owner_id WHERE a.username = ?'),
     backupUpload: db.prepare('INSERT INTO backup_uploads (backup_id, destination_id, destination_name, remote_path, status, error) VALUES (?, ?, ?, ?, ?, ?)'),
   };
 
   const live = new Map();
+  const activations = new Map();
   const restoreTokens = new Map();
   let logCounter = 0;
   let processIsolationWarned = false;
@@ -179,9 +201,10 @@ export function createPluginHost(ctx) {
     const entry = {
       id: row.id, manifest, dir, dataDir, module: null, ctx: null, state: 'loaded', lastError: null,
       granted: new Set(manifest.permissions || []),
-      permissionsUsed: [], permissionDenials: [],
+      permissionsUsed: [], permissionDenials: [], hookTimeouts: [],
       routes: [], pages: [], subscribers: [], settingListeners: [], locales: {},
       running: new Map(), routesOpen: false, pagesOpen: false,
+      logger: logger.child ? logger.child({ plugin: row.id }) : logger,
     };
     entry.ctx = buildCtx(entry);
     return entry;
@@ -213,13 +236,21 @@ export function createPluginHost(ctx) {
   function writeLog(entry, level, msg, fields) {
     if (typeof msg !== 'string') throw new E.ValidationError('log message must be a string');
     if (fields !== undefined && !isObj(fields)) throw new E.ValidationError('log fields must be an object');
-    const safe = fields ? redact(fields) : null;
+    const text = truncateUtf8(msg, MAX_LOG_MSG_BYTES);
+    let safe = null;
+    if (fields) {
+      safe = redact(fields);
+      let encoded;
+      try { encoded = JSON.stringify(safe); } catch { encoded = undefined; }
+      if (encoded === undefined) safe = { fields: '[not serialisable]' };
+      else if (Buffer.byteLength(encoded) > MAX_LOG_FIELDS_BYTES) safe = { truncated: true, fields: truncateUtf8(encoded, MAX_LOG_FIELDS_BYTES) };
+    }
     try {
-      stmts.logInsert.run(entry.id, level, msg, safe ? JSON.stringify(safe) : null);
+      stmts.logInsert.run(entry.id, level, text, safe ? JSON.stringify(safe) : null);
       if (++logCounter % 50 === 0) stmts.logPrune.run(entry.id, entry.id, LOG_RING_SIZE);
     } catch (e) { log.warn({ err: e, plugin: entry.id }, 'plugin log write failed'); }
-    const child = logger.child ? logger.child({ plugin: entry.id }) : logger;
-    (child[level] || child.info).call(child, safe || {}, msg);
+    const child = entry.logger;
+    (child[level] || child.info).call(child, safe || {}, text);
   }
   function readLogs(id, limit) {
     return stmts.logs.all(id, limit).map((r) => ({ id: r.id, ts: r.ts, level: r.level, msg: r.msg, fields: json.parse(r.fields_json, null) }));
@@ -292,6 +323,10 @@ export function createPluginHost(ctx) {
   // ------------------------------------------------------------------ store
   function checkKey(key) {
     if (typeof key !== 'string' || key.length === 0 || key.length > 256) throw new E.ValidationError('store key must be a string of 1..256 characters');
+    if (key.startsWith('__')) throw new E.ValidationError('store keys starting with "__" are reserved for the host');
+  }
+  function checkRowCap(count, max, what) {
+    if (count >= max) throw new E.PluginError(`plugin ${what} quota exceeded (${max} rows)`, { code: 'QUOTA_EXCEEDED', status: 507 });
   }
   function checkValue(value, what) {
     if (value === undefined) throw new E.ValidationError(`${what} must be JSON-serialisable (got undefined)`);
@@ -341,7 +376,12 @@ export function createPluginHost(ctx) {
   function storeApi(entry) {
     return {
       async get(key) { gate(entry, 'store:own', 'ctx.store.get'); checkKey(key); const row = stmts.kv.get(entry.id, key); return row ? json.parse(row.value_json, undefined) : undefined; },
-      async set(key, value) { gate(entry, 'store:own', 'ctx.store.set'); checkKey(key); checkValue(value, 'store value'); stmts.kvPut.run(entry.id, key, JSON.stringify(value)); return clone(value); },
+      async set(key, value) {
+        gate(entry, 'store:own', 'ctx.store.set'); checkKey(key); checkValue(value, 'store value');
+        if (!stmts.kv.get(entry.id, key)) checkRowCap(stmts.kvCount.get(entry.id).n, MAX_STORE_ROWS, 'store');
+        stmts.kvPut.run(entry.id, key, JSON.stringify(value));
+        return clone(value);
+      },
       async delete(key) { gate(entry, 'store:own', 'ctx.store.delete'); checkKey(key); return stmts.kvDel.run(entry.id, key).changes > 0; },
       async keys(prefix) { gate(entry, 'store:own', 'ctx.store.keys'); return stmts.kvKeys.all(entry.id).map((r) => r.key).filter((k) => k !== '__seq' && (!prefix || k.startsWith(prefix))).sort(); },
       collection(name) {
@@ -352,6 +392,7 @@ export function createPluginHost(ctx) {
             gate(entry, 'store:own', `${label}.insert`);
             if (!isObj(doc)) throw new E.ValidationError('document must be an object');
             checkValue(doc, 'document');
+            checkRowCap(stmts.docsCount.get(entry.id).n, MAX_DOCS_ROWS, 'document');
             const now = Date.now();
             const rec = { ...clone(doc), id: doc.id !== undefined ? String(doc.id) : nextDocId(entry), createdAt: now, updatedAt: now };
             try { stmts.docInsert.run(entry.id, name, rec.id, JSON.stringify(rec)); } catch (e) {
@@ -661,7 +702,7 @@ export function createPluginHost(ctx) {
     const wrapped = isObj(j.params) && 'trigger' in j.params ? j.params : { trigger: 'manual', params: j.params };
     return {
       id: String(j.id), plugin: entry.id, name: j.type.slice(jobType(entry.id, '').length), status: j.status, progress: j.progress, message: j.message ?? null,
-      params: wrapped.params || {}, result: j.result ?? null, error: j.error ? { code: 'JOB_FAILED', message: j.error } : null, trigger: wrapped.trigger,
+      params: wrapped.params || {}, result: j.result ?? null, error: j.error && j.status !== 'cancelled' ? { code: j.error_code || 'JOB_FAILED', message: j.error } : null, trigger: wrapped.trigger,
       createdAt: toMs(j.created_at), startedAt: toMs(j.started_at), finishedAt: toMs(j.finished_at),
     };
   }
@@ -730,10 +771,13 @@ export function createPluginHost(ctx) {
     abortRun(entry, j.id);
     return true;
   }
-  // The core worker records done/failed when the handler settles; the row is corrected then.
+  // The row flips to cancelled right away (the mock's immediate transition); the
+  // core worker still records done/failed when the handler settles, so the row
+  // is corrected again then.
   function abortRun(entry, jobId) {
     const run = entry.running.get(jobId);
     if (run) { run.cancelled = true; run.ac.abort(); }
+    stmts.jobCancelRunning.run(jobId);
     const off = ctx.jobs.subscribe(jobId, (ev) => { if (ev.type === 'done' || ev.type === 'failed') { stmts.jobCancelled.run(jobId); off(); } });
   }
   function jobsApi(entry) {
@@ -819,13 +863,31 @@ export function createPluginHost(ctx) {
           throw new E.HookCancelled(String(reason || 'cancelled by plugin'), event);
         },
       };
+      // A handler that never settles would hang the panel request that emitted the
+      // event, so every delivery is raced against a timeout. A timed-out pre hook
+      // of a plugin that holds the cancel scope vetoes the operation: skipping its
+      // judgement would silently bypass the policy it exists to enforce, and the
+      // operator sees the error and can disable the plugin. Without that scope the
+      // plugin could not have cancelled anyway, so the timeout is only logged.
+      const timeoutMs = Number(config.pluginHookTimeoutMs) > 0 ? Number(config.pluginHookTimeoutMs) : HOOK_TIMEOUT_MS;
+      let timer = null;
+      const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new E.PluginError(`hook ${label} did not settle within ${timeoutMs} ms`, { code: 'HOOK_TIMEOUT', status: 504 })), timeoutMs); timer.unref(); });
       try {
-        await fn(evt, entry.ctx);
+        await Promise.race([fn(evt, entry.ctx), timeout]);
         return DELIVERED;
       } catch (err) {
         if (err instanceof E.HookCancelled) throw new HttpError(409, 'hook_rejected', `${entry.manifest.name}: ${err.reason}`);
+        if (err?.code === 'HOOK_TIMEOUT') {
+          entry.hookTimeouts.push({ event, stage, handler: label, timeoutMs, ts: Date.now() });
+          if (entry.hookTimeouts.length > 50) entry.hookTimeouts.shift();
+          writeLog(entry, 'error', `hook handler ${label} timed out for ${stage}:${event}`, { timeoutMs });
+          if (stage === 'pre' && cancellable && entry.granted.has(def.cancelScope)) throw new HttpError(409, 'hook_rejected', `${entry.manifest.name}: hook ${label} timed out after ${timeoutMs} ms`);
+          return { error: err.message };
+        }
         writeLog(entry, 'error', `hook handler ${label} threw for ${stage}:${event}`, { error: err.message, code: err.code });
         return { error: err.message };
+      } finally {
+        clearTimeout(timer);
       }
     };
     const off = bus().on(event, listener);
@@ -1009,6 +1071,14 @@ export function createPluginHost(ctx) {
       return { p, abs: path.join(root, p) };
     };
     const lstat = (abs) => { try { return fs.lstatSync(abs); } catch { return null; } };
+    const assertParentsAreDirs = (p, rel) => {
+      let cur = root;
+      for (const seg of p.split('/').slice(0, -1)) {
+        cur = path.join(cur, seg);
+        const st = lstat(cur);
+        if (st && !st.isDirectory()) throw new E.PathError('a parent of the path is a file', rel);
+      }
+    };
     return {
       async readFile(rel, { encoding = 'utf8' } = {}) {
         gate(entry, 'fs:own', 'ctx.fs.readFile');
@@ -1026,6 +1096,7 @@ export function createPluginHost(ctx) {
         if (typeof data !== 'string' && !Buffer.isBuffer(data)) throw new E.ValidationError('writeFile expects a string or Buffer');
         const st = lstat(abs);
         if (st?.isDirectory()) throw new E.PathError('path is a directory', rel);
+        assertParentsAreDirs(p, rel);
         const delta = Buffer.byteLength(data) - (st ? st.size : 0);
         if (dirUsage(root) + delta > MAX_FS_BYTES) throw new E.PluginError('plugin data directory quota exceeded', { code: 'QUOTA_EXCEEDED', status: 507 });
         fs.mkdirSync(path.dirname(abs), { recursive: true, mode: 0o750 });
@@ -1054,7 +1125,13 @@ export function createPluginHost(ctx) {
         return true;
       },
       async exists(rel) { gate(entry, 'fs:own', 'ctx.fs.exists'); const { p, abs } = resolve(rel); return p === '' ? true : lstat(abs) !== null; },
-      async mkdir(rel) { gate(entry, 'fs:own', 'ctx.fs.mkdir'); const { abs } = resolve(rel); fs.mkdirSync(abs, { recursive: true, mode: 0o750 }); },
+      async mkdir(rel) {
+        gate(entry, 'fs:own', 'ctx.fs.mkdir');
+        const { p, abs } = resolve(rel);
+        if (p !== '') assertParentsAreDirs(`${p}/`, rel);
+        if (lstat(abs)?.isDirectory() === false) throw new E.PathError('path is a file', rel);
+        fs.mkdirSync(abs, { recursive: true, mode: 0o750 });
+      },
     };
   }
 
@@ -1064,7 +1141,7 @@ export function createPluginHost(ctx) {
       async fetch(url, init = {}) {
         const check = (u) => {
           if (u.protocol !== 'https:') throw new E.ValidationError('ctx.net.fetch only allows https: URLs');
-          const scope = V.matchesNetScope(u.hostname, u.port, [...entry.granted]);
+          const scope = V.matchesNetScope(u.hostname, u.port || '443', [...entry.granted]);
           if (!scope) {
             const wanted = `net:outbound:${u.hostname}${u.port ? `:${u.port}` : ''}`;
             entry.permissionDenials.push({ scope: wanted, method: 'ctx.net.fetch', ts: Date.now() });
@@ -1078,13 +1155,19 @@ export function createPluginHost(ctx) {
         const doFetch = globalThis.fetch;
         if (typeof doFetch !== 'function') throw new E.PluginError('outbound HTTP is not available in this runtime', { code: 'SERVICE_UNAVAILABLE', status: 503 });
         let current = u;
+        let hopInit = { ...init };
         for (let hop = 0; hop <= 3; hop++) {
-          const response = await doFetch(current.toString(), { ...init, redirect: 'manual', signal: init.signal || AbortSignal.timeout(30_000) });
+          const response = await doFetch(current.toString(), { ...hopInit, redirect: 'manual', signal: init.signal || AbortSignal.timeout(30_000) });
           const location = response.status >= 300 && response.status < 400 ? response.headers?.get?.('location') : null;
           if (!location) return response;
           if (hop === 3) throw new E.PluginError('too many redirects', { code: 'TOO_MANY_REDIRECTS', status: 502 });
           current = new URL(location, current);
           check(current);
+          // Like fetch's "follow" mode: 301/302/303 turn the request into a body-less GET; 307/308 replay it.
+          if (response.status === 301 || response.status === 302 || response.status === 303) {
+            const { body, ...rest } = hopInit; // eslint-disable-line no-unused-vars
+            hopInit = { ...rest, method: 'GET' };
+          }
         }
         return undefined;
       },
@@ -1163,7 +1246,10 @@ export function createPluginHost(ctx) {
       if (BUILTIN_REQUIRES.has(bare)) return nodeRequire(`node:${bare}`);
       throw new E.PermissionError(`require:${spec}`, 'require', entry.id);
     };
-    return loadCommonJs(mainFile, new Map(), { resolve });
+    const consoleLog = (level) => (...args) => { try { writeLog(entry, level, util.format(...args)); } catch { /* never let console throw into plugin code */ } };
+    const pluginConsole = Object.freeze({ log: consoleLog('info'), info: consoleLog('info'), warn: consoleLog('warn'), error: consoleLog('error'), debug: consoleLog('debug'), trace: consoleLog('debug') });
+    const context = createPluginContext({ console: pluginConsole });
+    return loadCommonJs(mainFile, new Map(), { resolve, context });
   }
 
   // ------------------------------------------------------------------ lifecycle
@@ -1258,11 +1344,22 @@ export function createPluginHost(ctx) {
     return row;
   }
 
-  async function enable(id, { from, req } = {}) {
+  // One activation per id at a time: a second caller awaits the first instead of
+  // registering hooks and schedules twice.
+  async function enable(id, options = {}) {
     requireSdk();
+    requireRow(id);
+    const pending = activations.get(id);
+    if (pending) return pending;
+    const p = enableNow(id, options).finally(() => { if (activations.get(id) === p) activations.delete(id); });
+    activations.set(id, p);
+    return p;
+  }
+
+  async function enableNow(id, { from, req } = {}) {
     const row = requireRow(id);
     const existing = live.get(id);
-    if (existing && existing.state === 'enabled') return shapeRow(stmts.row.get(id));
+    if (existing && (existing.state === 'enabled' || existing.state === 'activating')) return shapeRow(stmts.row.get(id));
     if (existing) live.delete(id);
     if (!json.parse(row.manifest_json, null)) {
       persistState(id, 'errored', { code: 'INVALID_MANIFEST', message: 'stored manifest is unreadable' });
@@ -1344,12 +1441,24 @@ export function createPluginHost(ctx) {
   }
 
   // ------------------------------------------------------------------ install
+  const bundledDir = path.join(REPO_ROOT, 'plugins');
+  function assertInstallRoot(real) {
+    const allowed = [config.dataDir, bundledDir, ...INSTALL_ROOTS];
+    const roots = allowed.map((r) => { try { return fs.realpathSync(r); } catch { return r; } });
+    if (!roots.some((r) => real === r || real.startsWith(r + path.sep))) throw new HttpError(403, 'path_not_allowed', `Plugins may only be installed from ${allowed.join(', ')}`);
+  }
   function assertInstallPath(p) {
     let real;
     try { real = fs.realpathSync(p); } catch { throw notFound(`Package file ${p}`); }
-    const roots = [config.dataDir, ...INSTALL_ROOTS].map((r) => { try { return fs.realpathSync(r); } catch { return r; } });
-    if (!roots.some((r) => real === r || real.startsWith(r + path.sep))) throw new HttpError(403, 'path_not_allowed', `Packages may only be installed from ${[config.dataDir, ...INSTALL_ROOTS].join(', ')}`);
+    assertInstallRoot(real);
     if (!fs.statSync(real).isFile()) throw err422('invalid_package', `${p} is not a file`);
+    return real;
+  }
+  function assertInstallDir(p) {
+    let real;
+    try { real = fs.realpathSync(p); } catch { throw notFound(`Plugin directory ${p}`); }
+    assertInstallRoot(real);
+    if (!fs.statSync(real).isDirectory()) throw err422('invalid_package', `${p} is not a directory`);
     return real;
   }
 
@@ -1433,10 +1542,7 @@ export function createPluginHost(ctx) {
         unpackPackage(buffer, staging);
       } else if (typeof input.dir === 'string') {
         source = input.source === 'bundled' ? 'bundled' : 'path';
-        let real;
-        try { real = fs.realpathSync(input.dir); } catch { throw notFound(`Plugin directory ${input.dir}`); }
-        if (!fs.statSync(real).isDirectory()) throw err422('invalid_package', `${input.dir} is not a directory`);
-        copyTree(real, staging);
+        copyTree(assertInstallDir(input.dir), staging);
       } else {
         throw err422('invalid_package', 'Provide a .whmplugin body, { path } or { dir }');
       }
@@ -1457,8 +1563,9 @@ export function createPluginHost(ctx) {
       const previousVersion = previous?.version ?? null;
       if (previous && live.has(id)) await disable(id, { keepState: true });
       const { dir } = dirsOf(id);
-      const old = `${dir}.previous`;
-      removeDir(old);
+      // The backup lives in the staging area: "<id>.previous" would be a legal id
+      // of another installed plugin.
+      const old = path.join(stagingRoot, `${id}.previous-${crypto.randomBytes(4).toString('hex')}`);
       if (fs.existsSync(dir)) fs.renameSync(dir, old);
       try {
         fs.renameSync(root, dir);
@@ -1474,7 +1581,7 @@ export function createPluginHost(ctx) {
       req?.audit?.({ action: 'plugin.install', target: id, args: { version: manifest.version, previousVersion, source, signed: sig.signed, signer: sig.signer, sha256: packageSha, by: user?.username } });
       emitHost('plugin.installed', { pluginId: id, version: manifest.version });
       if (wasEnabled) await enable(id, { from: previousVersion !== manifest.version ? previousVersion : undefined });
-      return { plugin: shapeRow(stmts.row.get(id)), warnings: sig.warnings, previousVersion };
+      return { plugin: shapeRow(stmts.row.get(id)), warnings: [...sig.warnings, IN_PROCESS_WARNING], previousVersion };
     } finally {
       removeDir(staging);
     }
@@ -1511,7 +1618,8 @@ export function createPluginHost(ctx) {
       settings: { groups: entry.manifest.settings?.groups || [], fields: settingFields(entry), values: maskedValues(entry) },
       schedules: ctx.scheduler.listPrefix(schedPrefix(id)).map((r) => shapeSchedule(entry, r)),
       jobs: stmts.jobsFor.all(`${jobType(id, '').replace(/[\\%_]/g, '\\$&')}%`, 20).map((j) => shapeJob(entry, { ...j, params: json.parse(j.params_json, {}), result: json.parse(j.result_json, null) })),
-      permissionsUsed: entry.permissionsUsed.slice(), permissionDenials: entry.permissionDenials.slice(),
+      permissionsUsed: entry.permissionsUsed.slice(), permissionDenials: entry.permissionDenials.slice(), hookTimeouts: entry.hookTimeouts.slice(),
+      isolation: entry.manifest.isolation || 'in-process', warnings: [IN_PROCESS_WARNING, ...(row.signed ? [] : ['unsigned'])],
       pages: entry.pages.slice(), routes: entry.routes.map((r) => ({ method: r.method, path: r.path, roles: r.roles })),
       logs: readLogs(id, 100), dir: entry.dir, dataDir: entry.dataDir, requireSignature: ctx.settings.get('plugins.require_signature', false) === true,
     };
@@ -1535,7 +1643,15 @@ export function createPluginHost(ctx) {
       if (f.type === 'password' && value === PASSWORD_MASK) continue;
       setSetting(entry, key, value);
     }
-    req?.audit?.({ action: 'plugin.settings.update', target: id, args: values });
+    const audited = {};
+    for (const [key, value] of Object.entries(values)) audited[key] = fieldsOf.find((x) => x.key === key)?.type === 'password' ? PASSWORD_MASK : value;
+    // The request-level audit row reads req.body once the response has finished;
+    // the audit redactor matches key names, not manifest types, so password
+    // values are masked in place here.
+    for (const target of new Set([values, req?.body].filter(isObj))) {
+      for (const [key, value] of Object.entries(audited)) if (value === PASSWORD_MASK) target[key] = PASSWORD_MASK;
+    }
+    req?.audit?.({ action: 'plugin.settings.update', target: id, args: audited });
     return maskedValues(entry);
   }
 
