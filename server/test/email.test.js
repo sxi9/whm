@@ -434,7 +434,8 @@ describe('Filter Incoming Emails by Country / Domain', () => {
   it('surfaces an Exim validation failure from the agent as an error and records it', async () => {
     app.agent.fail('mail.config.include.write', 'config_invalid', 'Exim rejected the new configuration');
     const res = await post('/api/email/filters/apply');
-    expect(res.status).toBe(500);
+    expect(res.status).toBe(422);
+    expect(res.body.error.code).toBe('config_invalid');
     const saved = await post('/api/email/filters/domain', { domain: 'late.example', kind: 'block' });
     expect(saved.status).toBe(201);
     expect(saved.body.data.apply).toMatchObject({ applied: false, code: 'config_invalid' });

@@ -737,7 +737,7 @@ describe('NGINX Manager', () => {
       app.agent.fail('pkg.nginx.proxy.write', 'config_invalid', 'nginx -t rejected the generated configuration');
       app.agent.calls.length = 0;
       const invalid = await put('/api/software/nginx', { enabled: true });
-      expect(invalid.status).toBe(500);
+      expect(invalid.status).toBe(422);
       expect(invalid.body.error.message).toMatch(/nginx -t/);
       expect(ports).toEqual([]);
       expect(order()).toEqual(['pkg.nginx.proxy.write']);
