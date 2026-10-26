@@ -8,14 +8,14 @@
 
 ## Current state
 
-- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-26 17:40 UTC
+- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-26 17:41 UTC
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
 - **Tests:** server 93/93, agent 42/42 passing (`npm test`). Shared API test helper: `server/test/support/app.js`.
 - **Wave 1 landed** (`79097b1`, 2026-10-26 01:50): Security Center, DNS Functions, Database Services, IP Functions, SSL/TLS, Email, Software, Service Configuration, Development, Locales — 106/109 functions done (3 partial, noted inline), 222 new agent ops (267 total), migrations 002–012, 107 new pages; suites server 426 / agent 233 / client 5 green.
 - **Wave-1 fix round done** (03:12): all 19 reviewer findings and the 6 integration seams closed per `docs/design/integration-contracts.md`; suites server 479 / agent 260 / client 5 green; final integration check passed.
 - **In progress:** Phase 2 wave 2 — 12 categories (Account Functions completion, Account Information, Multi Account, Resellers, Backup, Transfers, Server Status, System Health, Server Configuration, Networking Setup, Server Contacts, System Reboot), launched 03:20. All 12 builders finished (67 pages, snapshot `2160fd4`); first-round reviews of 6 categories reported findings; the run died with a container restart at 05:38 and was resumed at 14:27 from its cached results (fix + re-verify rounds now running).
-- **Screenshots regenerated 17:40 UTC** at `1a83f76`: all 212 function pages captured with label bars, **196/212 live** (the 67 in-flight wave-2 pages included; 16 wave-3 placeholders remain) — galleries in `docs/screenshots/`.
+- **Screenshots regenerated 17:41 UTC** at `c555cca`: all 212 function pages captured with label bars, **196/212 live** (the 67 in-flight wave-2 pages included; 16 wave-3 placeholders remain) — galleries in `docs/screenshots/`.
 - **Deferred to the end (user decision):** license server, plugin marketplace, plugin host, sample + automated-backup plugins (Phase 5).
 
 ## Timeline (actual + estimated)
