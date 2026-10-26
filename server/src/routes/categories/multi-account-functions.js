@@ -11,7 +11,7 @@ const selection = { usernames: usernames.optional(), all: z.boolean().optional()
 const hasSelection = (b) => b.all === true || (b.usernames?.length ?? 0) > 0;
 const mb = z.number().int().min(0).max(1_000_000_000);
 const ipBody = z.object({
-  changes: z.array(z.object({ username: fields.username, ip: fields.ip }).strict()).min(1).max(1000),
+  changes: z.array(z.object({ username: fields.username, ip: z.string().ip({ version: 'v4' }) }).strict()).min(1).max(1000),
   updateDns: z.boolean().optional(), updateVhosts: z.boolean().optional(), requireDaemons: z.boolean().optional(),
 }).strict();
 const modifyChanges = z.object({

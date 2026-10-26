@@ -184,6 +184,59 @@ describe('Multi Account Functions API', () => {
       } finally { app.ctx.web = web; }
     });
 
+    it('rolls the account back when a step reports failure without throwing', async () => {
+      const web = app.ctx.web;
+      app.ctx.web = { ...web, ensureVhost: async (u) => ({ username: u, applied: false, reason: 'template_invalid', vhosts: [{ domain: `${u}.com`, applied: false, error: 'bad template' }] }) };
+      try {
+        const res = await post('/ip', { changes: [{ username: 'alice', ip: '203.0.113.31' }], updateDns: false }).expect(202);
+        const job = await finished(res.body.data.job.id);
+        expect(job.result).toMatchObject({ total: 1, failed: 1, done: 0 });
+        expect((await app.http.get('/api/accounts/alice')).body.data.ip).toBe('203.0.113.20');
+        const item = (await get(`/runs/${res.body.data.run.id}`)).body.data.items[0];
+        expect(item).toMatchObject({ status: 'failed', after: { ip: '203.0.113.20' } });
+        expect(item.detail).toMatch(/bad template.*stays on 203\.0\.113\.20/);
+        expect(item.steps.ip.status).toBe('rolled_back');
+      } finally { app.ctx.web = web; }
+    });
+
+    it('refuses IPv6 targets: the vhost renderer and A records need IPv4', async () => {
+      expect((await post('/ip/preview', { changes: [{ username: 'alice', ip: '2001:db8::10' }] })).status).toBe(422);
+      expect((await post('/ip', { changes: [{ username: 'alice', ip: '2001:db8::10' }] })).status).toBe(422);
+      const preview = app.ctx.multiAccount.previewChangeIp({ changes: [{ username: 'alice', ip: '2001:db8::10' }] }, { id: 1, username: 'root', role: 'root' });
+      expect(preview.items[0]).toMatchObject({ status: 'blocked' });
+      expect(preview.items[0].issues[0]).toMatch(/IPv6/);
+      expect(() => app.ctx.multiAccount.startChangeIp({ changes: [{ username: 'alice', ip: '2001:db8::10' }] }, { id: 1, username: 'root', role: 'root' })).toThrow(/problems/);
+      const fake = { sharedIp: () => '203.0.113.10', get: () => null, freeAddresses: () => [], all: () => [{ address: '2001:db8::10', family: 6, is_main: false, reserved: false, dedicated_to: null }, { address: '203.0.113.10', family: 4, is_main: true, reserved: false, dedicated_to: null }] };
+      app.ctx.ip = fake;
+      try {
+        const res = await get('/ip/addresses').expect(200);
+        expect(res.body.data.map((a) => a.address)).toEqual(['203.0.113.10']);
+      } finally { delete app.ctx.ip; }
+      expect((await app.http.get('/api/accounts/alice')).body.data.ip).toBe('203.0.113.20');
+    });
+
+    it('fails and rolls back the DNS step on a production host without BIND', async () => {
+      app.ctx.db.prepare("UPDATE dns_records SET value = ? WHERE type = 'A' AND zone_id = (SELECT id FROM dns_zones WHERE domain = 'alice.com')").run('203.0.113.20');
+      const env = app.ctx.config.env;
+      app.ctx.config.env = 'production';
+      try {
+        const preview = await post('/ip/preview', { changes: [{ username: 'alice', ip: '203.0.113.25' }] }).expect(200);
+        expect(preview.body.data.warnings.join(' ')).toMatch(/production server.*rolled back/);
+        const res = await post('/ip', { changes: [{ username: 'alice', ip: '203.0.113.25' }], updateVhosts: false }).expect(202);
+        const job = await finished(res.body.data.job.id);
+        expect(job.result).toMatchObject({ total: 1, failed: 1, pending: 0 });
+        expect((await app.http.get('/api/accounts/alice')).body.data.ip).toBe('203.0.113.20');
+        const zone = await app.http.get('/api/dns/zones/alice.com').expect(200);
+        expect(zone.body.data.records.filter((r) => r.type === 'A').every((r) => r.value === '203.0.113.20')).toBe(true);
+        const run = await get(`/runs/${res.body.data.run.id}`).expect(200);
+        expect(run.body.data.status).toBe('failed');
+        const item = run.body.data.items[0];
+        expect(item).toMatchObject({ status: 'failed', after: { ip: '203.0.113.20' } });
+        expect(item.steps.dns[0]).toMatchObject({ domain: 'alice.com', status: 'failed' });
+        expect(item.steps.dns[0].detail).toMatch(/BIND.*not saved/);
+      } finally { app.ctx.config.env = env; }
+    });
+
     it('validates addresses and dedication against IP Functions when it is loaded', async () => {
       const fake = {
         sharedIp: () => '203.0.113.10',
@@ -206,6 +259,29 @@ describe('Multi Account Functions API', () => {
         expect(b2).toMatchObject({ status: 'change', dedicated: false });
         expect(more.body.data.warnings.join(' ')).not.toMatch(/IP Functions is not loaded/);
       } finally { delete app.ctx.ip; }
+    });
+
+    it('puts the previous dedication back when allocating the new address throws', async () => {
+      const calls = [];
+      const fake = {
+        sharedIp: () => '203.0.113.10',
+        get: (a) => ({ '203.0.113.40': { address: a, reserved: false, dedicated_to: 'alice' }, '203.0.113.41': { address: a, reserved: false, dedicated_to: null } }[a] ?? null),
+        freeAddresses: (family) => (family === 4 ? [{ address: '203.0.113.41' }] : []),
+        all: () => [{ address: '203.0.113.40', family: 4, dedicated_to: 'alice' }],
+        releaseDedicated: (id) => { calls.push('release'); app.ctx.db.prepare('UPDATE accounts SET ip = ? WHERE id = ?').run('203.0.113.10', id); return {}; },
+        allocateDedicated: (id, req, { address }) => { calls.push(`allocate:${address}`); if (address === '203.0.113.41') throw Object.assign(new Error('203.0.113.41 is not a free address'), { status: 409 }); return {}; },
+      };
+      app.ctx.ip = fake;
+      app.ctx.db.prepare("UPDATE accounts SET ip = '203.0.113.40' WHERE username = 'alice'").run();
+      try {
+        const res = await post('/ip', { changes: [{ username: 'alice', ip: '203.0.113.41' }], updateDns: false, updateVhosts: false }).expect(202);
+        const job = await finished(res.body.data.job.id);
+        expect(job.result).toMatchObject({ total: 1, failed: 1 });
+        expect(calls).toEqual(['release', 'allocate:203.0.113.41', 'allocate:203.0.113.40']);
+        expect((await app.http.get('/api/accounts/alice')).body.data.ip).toBe('203.0.113.40');
+        const item = (await get(`/runs/${res.body.data.run.id}`)).body.data.items[0];
+        expect(item).toMatchObject({ status: 'failed', detail: '203.0.113.41 is not a free address', after: { ip: '203.0.113.40' } });
+      } finally { delete app.ctx.ip; app.ctx.db.prepare("UPDATE accounts SET ip = '203.0.113.20' WHERE username = 'alice'").run(); }
     });
   });
 
@@ -272,6 +348,27 @@ describe('Multi Account Functions API', () => {
         expect((await app.http.get('/api/accounts/alice')).body.data.ip).toBe('203.0.113.10');
         expect(app.ctx.ip.freeAddresses(4).map((r) => r.address)).toEqual(expect.arrayContaining(['203.0.113.11', '203.0.113.12']));
       } finally { app.ctx.web = web; }
+    });
+
+    it('re-checks the inventory when the job runs, so an address claimed after the preview is refused', async () => {
+      app.ctx.jobs.stop();
+      const aliceId = app.ctx.db.prepare('SELECT id FROM accounts WHERE username = ?').get('alice').id;
+      try {
+        const res = await post('/ip', { changes: [{ username: 'carol', ip: '203.0.113.12' }], updateDns: false, updateVhosts: false }).expect(202);
+        app.ctx.jobs.cancel(res.body.data.job.id);
+        app.ctx.ip.allocateDedicated(aliceId, null, { address: '203.0.113.12' });
+        await app.ctx.multiAccount.runChangeIp({ params: { runId: res.body.data.run.id, userId: 1 }, log() {}, progress() {} });
+        const run = await get(`/runs/${res.body.data.run.id}`).expect(200);
+        expect(run.body.data.status).toBe('failed');
+        expect(run.body.data.items[0].status).toBe('failed');
+        expect(run.body.data.items[0].detail).toMatch(/dedicated to alice/);
+        expect((await app.http.get('/api/accounts/carol')).body.data.ip).toBe('203.0.113.10');
+        expect((await app.http.get('/api/accounts/alice')).body.data.ip).toBe('203.0.113.12');
+        expect(app.ctx.ip.get('203.0.113.12').dedicated_to).toBe('alice');
+      } finally {
+        app.ctx.ip.releaseDedicated(aliceId, null);
+        app.ctx.jobs.start();
+      }
     });
   });
 
@@ -391,6 +488,52 @@ describe('Multi Account Functions API', () => {
         expect(run.body.data.status).toBe('failed');
         expect(run.body.data.items[0]).toMatchObject({ status: 'failed', detail: 'disk on fire' });
       } finally { app.ctx.accounts = accounts; }
+    });
+  });
+
+  describe('reseller ACLs', () => {
+    const root = { id: 1, username: 'root', role: 'root' };
+    const grant = (acls) => app.ctx.resellers.setPrivileges('resell1', { acls }, root, null);
+    afterAll(() => grant(['all']));
+
+    it('refuses demo mode, shell access and the account list without the matching privilege', async () => {
+      grant(['edit-account']);
+      const before = (await app.http.get('/api/accounts/bob')).body.data;
+      for (const [res, acl] of [
+        [await rpost('/modify/preview', { usernames: ['bob'], changes: { demoMode: false } }), 'Demo Mode'],
+        [await rpost('/modify', { usernames: ['bob'], changes: { demoMode: false } }), 'Demo Mode'],
+        [await rpost('/modify/preview', { usernames: ['bob'], changes: { shell: '/bin/bash' } }), 'Shell'],
+        [await rpost('/modify', { all: true, changes: { shell: '/bin/bash' } }), 'Shell'],
+        [await rget('/accounts'), 'List Accounts'],
+      ]) {
+        expect(res.status, res.body.error?.message).toBe(403);
+        expect(res.body.error.message).toMatch(new RegExp(acl, 'i'));
+      }
+      expect((await app.http.get('/api/accounts/bob')).body.data).toMatchObject({ demo_mode: before.demo_mode, shell: before.shell });
+      expect(app.agent.callsTo('user.set_shell')).toEqual([]);
+      grant(['edit-account', 'add-pkg-shell', 'disallow-shell', 'list-accts']);
+      const shell = await rpost('/modify', { usernames: ['bob'], changes: { shell: '/bin/bash' } });
+      expect(shell.status).toBe(403);
+      expect(shell.body.error.message).toMatch(/Disallow Shell/);
+      expect((await rpost('/modify/preview', { usernames: ['bob'], changes: { shell: '/usr/sbin/nologin' } })).status).toBe(200);
+      expect((await rget('/accounts')).status).toBe(200);
+    });
+
+    it('blocks rows the reseller limits refuse before the run starts', async () => {
+      grant(['edit-account', 'list-accts']);
+      const preview = await rpost('/modify/preview', { usernames: ['bob'], changes: { diskQuotaMb: 123 } }).expect(200);
+      expect(preview.body.data.items[0]).toMatchObject({ status: 'blocked' });
+      expect(preview.body.data.items[0].issues[0]).toMatch(/disk quotas/i);
+      expect(preview.body.data.totals.blocked).toBe(1);
+      const refused = await rpost('/modify', { usernames: ['bob'], changes: { diskQuotaMb: 123 } });
+      expect(refused.status).toBe(422);
+      expect(refused.body.error.fields.usernames[0]).toMatch(/bob: .*disk quotas/i);
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM multi_account_runs WHERE requested_by = 'resell1' AND params_json LIKE '%123%'").get().n).toBe(0);
+      grant(['edit-account', 'list-accts', 'quota']);
+      const ok = await rpost('/modify/preview', { usernames: ['bob'], changes: { diskQuotaMb: 123 } }).expect(200);
+      expect(ok.body.data.items[0].status).toBe('change');
+      const same = await rpost('/modify/preview', { usernames: ['bob'], changes: { contactEmail: null } }).expect(200);
+      expect(same.body.data.items[0].issues).toEqual([]);
     });
   });
 

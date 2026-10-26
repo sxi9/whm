@@ -54,7 +54,7 @@ export default function ChangeMultipleSitesIpAddresses({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Moves several accounts to other IP addresses in one run: pick the accounts, choose a new address per account (or one for all), review the plan, then the job updates each account record, rewrites its virtual hosts through the web server service and the A records of its zones that pointed at the old address. Every account gets its own result line and the run can be downloaded as a report." />
+      <PageHeader fn={fn} description="Moves several accounts to other IPv4 addresses in one run (IPv6 is assigned under IP Functions): pick the accounts, choose a new address per account (or one for all), review the plan, then the job updates each account record, rewrites its virtual hosts through the web server service and the A records of its zones that pointed at the old address. Every account gets its own result line and the run can be downloaded as a report." />
       <Steps step={step} labels={['Select accounts and addresses', 'Review plan', 'Run']} />
       {addrError?.status === 501 ? <CapabilityNotice error={addrError} /> : <ErrorBanner error={addrError} />}
       {error?.status === 501 ? <CapabilityNotice error={error} /> : <ErrorBanner error={error} />}

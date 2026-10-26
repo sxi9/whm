@@ -10,7 +10,8 @@ import { isRoot } from '../middleware/rbac.js';
 //   multiAccount.listRuns({ kind, limit }, user) / getRun(id, user) / report(id, format, user)
 // Per-account work goes through ctx.accounts.modify and, when loaded, ctx.ip
 // (dedication), ctx.web (vhosts, PHP) and ctx.dns (A records). A missing daemon
-// leaves an item 'pending' instead of failing the run.
+// leaves an item 'pending' instead of failing the run; a 'failed' IP item has
+// been rolled back to its previous address. IPv4 only, as in WHM.
 
 export const RUN_KINDS = ['change_ip', 'modify'];
 export const ITEM_STATUSES = ['queued', 'running', 'done', 'pending', 'failed', 'skipped', 'unchanged'];
@@ -168,11 +169,27 @@ export function createMultiAccountService(ctx) {
 
   // --------------------------------------------------------- change site IP ---
 
+  // Checked by the preview and again by the job right before an account moves,
+  // because another run or IP Functions may have reserved or dedicated the
+  // address in between.
+  function inventoryIssues(ip, username) {
+    const ipSvc = ctx.ip;
+    if (!ipSvc) return [];
+    const known = ipSvc.get(ip);
+    if (!known) return [`${ip} is not configured on this server; add it under IP Functions first`];
+    const issues = [];
+    if (known.reserved) issues.push(`${ip} is reserved (${known.reserved_reason || 'no reason given'})`);
+    if (known.dedicated_to && known.dedicated_to !== username) issues.push(`${ip} is dedicated to ${known.dedicated_to}`);
+    return issues;
+  }
+
+  const dnsStrict = () => ctx.config?.env === 'production';
+
   function previewChangeIp({ changes, updateDns = true, updateVhosts = true }, user) {
     if (changes.length > maxBatch()) throw unprocessable(`At most ${maxBatch()} accounts per run (multi_account.max_batch)`, { changes: ['Too many accounts'] });
     const ipSvc = ctx.ip;
     const shared = ipSvc ? ipSvc.sharedIp() : settings.get('basic.shared_ip') || settings.get('basic.main_ip') || null;
-    const free = ipSvc ? new Set([...ipSvc.freeAddresses(4), ...ipSvc.freeAddresses(6)].map((r) => r.address)) : new Set();
+    const free = ipSvc ? new Set(ipSvc.freeAddresses(4).map((r) => r.address)) : new Set();
     const claimed = new Map();
     const seen = new Set();
     const items = [];
@@ -185,17 +202,11 @@ export function createMultiAccountService(ctx) {
       try { account = load(username, user); } catch (err) { if (err.status === 404 || err.status === 403) { item.status = 'blocked'; item.issues.push('Account not found or not yours'); continue; } throw err; }
       Object.assign(item, { accountId: account.id, domain: account.domain, owner: account.owner, from: account.ip, vhosts: stmts.domains.all(account.id).length });
       if (account.ip === ip) { item.status = 'unchanged'; continue; }
-      if (ipSvc) {
-        const known = ipSvc.get(ip);
-        if (!known) item.issues.push(`${ip} is not configured on this server; add it under IP Functions first`);
-        else {
-          if (known.reserved) item.issues.push(`${ip} is reserved (${known.reserved_reason || 'no reason given'})`);
-          if (known.dedicated_to && known.dedicated_to !== username) item.issues.push(`${ip} is dedicated to ${known.dedicated_to}`);
-          if (ip !== shared && free.has(ip)) {
-            if (claimed.has(ip)) item.issues.push(`${ip} is a free address that becomes dedicated to ${claimed.get(ip)}; it cannot be given to a second account`);
-            else { claimed.set(ip, username); item.dedicated = true; }
-          }
-        }
+      if (familyOf(ip) !== 4) { item.status = 'blocked'; item.issues.push(`${ip} is an IPv6 address; virtual hosts and A records need an IPv4 address (use "Assign IPv6 Address" under IP Functions instead)`); continue; }
+      item.issues.push(...inventoryIssues(ip, username));
+      if (ipSvc && !item.issues.length && ip !== shared && free.has(ip)) {
+        if (claimed.has(ip)) item.issues.push(`${ip} is a free address that becomes dedicated to ${claimed.get(ip)}; it cannot be given to a second account`);
+        else { claimed.set(ip, username); item.dedicated = true; }
       }
       if (item.issues.length) { item.status = 'blocked'; continue; }
       try {
@@ -209,7 +220,10 @@ export function createMultiAccountService(ctx) {
     if (!ipSvc) warnings.push('IP Functions is not loaded: addresses are not validated against the server inventory');
     if (updateVhosts && caps.web.loaded && !caps.web.installed) warnings.push('Apache is not installed: vhost specs are stored and applied when it is (items finish as "pending")');
     if (updateVhosts && !caps.web.loaded) warnings.push('Service Configuration is not loaded: virtual hosts are not rewritten');
-    if (updateDns && caps.dns.loaded && !caps.dns.installed) warnings.push('BIND is not installed: zone changes are saved and published when it is');
+    if (updateDns && caps.dns.loaded && !caps.dns.installed) {
+      warnings.push(dnsStrict() ? 'BIND is not installed: A records cannot be published on a production server, so every account with records to rewrite fails and is rolled back (install bind9/bind first, or run with "require installed services" to refuse the run)'
+        : 'BIND is not installed: zone changes are saved and published when it is');
+    }
     if (updateDns && !caps.dns.loaded) warnings.push('DNS Functions is not loaded: A records are not rewritten');
     const totals = {
       accounts: items.length, change: items.filter((i) => i.status === 'change').length, unchanged: items.filter((i) => i.status === 'unchanged').length, blocked: items.filter((i) => i.status === 'blocked').length,
@@ -246,57 +260,82 @@ export function createMultiAccountService(ctx) {
     const previous = account.ip;
     const ipSvc = ctx.ip;
     const steps = { ip: { status: 'applied', from: previous, to: ip }, dedicated: null, web: null, dns: [] };
+    if (familyOf(ip) !== 4) throw unprocessable(`${ip} is an IPv6 address; this function moves accounts between IPv4 addresses only`, { ip: ['IPv4 required'] });
+    const issues = inventoryIssues(ip, account.username);
+    if (issues.length) throw unprocessable(issues.join('; '), { ip: issues });
     // ip-functions treats an address any account uses as taken, so the dedication
     // decision and allocateDedicated (which sets accounts.ip itself) come before
     // the row moves. Vhost and zone renderers then read the new accounts.ip; the
-    // dedication and the row are put back when a later step throws.
+    // dedication and the row are put back when a later step throws or fails.
+    // The checks above, the decision and the allocation share one synchronous
+    // stretch so a concurrent run cannot claim the address in between.
     const dedicatedBefore = ipSvc ? ipSvc.all().filter((r) => r.dedicated_to === account.username).map((r) => r.address) : [];
     const keepsDedication = dedicatedBefore.includes(ip);
-    const dedicate = Boolean(ipSvc) && !keepsDedication && ip !== ipSvc.sharedIp() && ipSvc.freeAddresses(familyOf(ip)).some((r) => r.address === ip);
+    const dedicate = Boolean(ipSvc) && !keepsDedication && ip !== ipSvc.sharedIp() && ipSvc.freeAddresses(4).some((r) => r.address === ip);
     const releases = Boolean(ipSvc) && dedicatedBefore.length > 0 && !keepsDedication;
-    const restore = () => {
-      if (dedicate) ipSvc.releaseDedicated(account.id, req);
-      if (releases) for (const address of dedicatedBefore) { try { ipSvc.allocateDedicated(account.id, req, { address }); } catch (err) { logger.warn({ err, address }, 'multi-account: could not re-dedicate the previous address'); } }
+    const applied = { released: false, dedicated: false, dns: [], web: false };
+    const restore = async () => {
+      if (applied.dedicated) ipSvc.releaseDedicated(account.id, req);
+      if (applied.released) for (const address of dedicatedBefore) { try { ipSvc.allocateDedicated(account.id, req, { address }); } catch (err) { logger.warn({ err, address }, 'multi-account: could not re-dedicate the previous address'); } }
       stmts.setIp.run(previous, account.id);
+      for (const { domain, name, values } of applied.dns) {
+        try { await ctx.dns.upsertRecords(domain, name, 'A', values, req); } catch (err) { logger.warn({ err, domain, name }, 'multi-account: could not put the A record back'); }
+      }
+      if (applied.web) { try { await ctx.web.ensureVhost(account.username, req); } catch (err) { logger.warn({ err, username: account.username }, 'multi-account: could not rewrite the vhosts with the previous address'); } }
+      steps.ip = { status: 'rolled_back', from: previous, to: ip };
+      steps.dedicated = null;
     };
-    if (releases) ipSvc.releaseDedicated(account.id, req);
-    if (dedicate) ipSvc.allocateDedicated(account.id, req, { address: ip });
-    else stmts.setIp.run(ip, account.id);
-    if (dedicate || keepsDedication) steps.dedicated = ip;
     try {
+      if (releases) { ipSvc.releaseDedicated(account.id, req); applied.released = true; }
+      if (dedicate) { ipSvc.allocateDedicated(account.id, req, { address: ip }); applied.dedicated = true; }
+      else stmts.setIp.run(ip, account.id);
+      if (dedicate || keepsDedication) steps.dedicated = ip;
       if (!updateVhosts) steps.web = { status: 'skipped', detail: 'not requested' };
       else if (!ctx.web) steps.web = { status: 'skipped', detail: 'Service Configuration is not loaded' };
       else {
         const web = await ctx.web.ensureVhost(account.username, req);
+        if (web.applied) applied.web = true;
         steps.web = web.applied ? { status: 'applied', detail: `${web.vhosts?.length ?? 0} vhost(s) rewritten${web.reload?.reloaded ? ', web server reloaded' : ''}` }
           : web.reason === 'capability_missing' ? { status: 'pending', detail: 'Apache is not installed; the vhosts are written when it is' }
             : { status: 'failed', detail: web.vhosts?.find((v) => !v.applied)?.error || web.reason || 'vhost not applied' };
       }
-      if (!updateDns) steps.dns.push({ domain: null, status: 'skipped', detail: 'not requested' });
-      else if (!ctx.dns) steps.dns.push({ domain: null, status: 'skipped', detail: 'DNS Functions is not loaded' });
-      else if (!previous) steps.dns.push({ domain: null, status: 'skipped', detail: 'the account had no address to replace' });
-      else {
-        for (const { domain } of stmts.zonesOf.all(account.id)) {
-          try {
-            const zone = await ctx.dns.getZone(domain, user);
+      if (steps.web.status !== 'failed') {
+        if (!updateDns) steps.dns.push({ domain: null, status: 'skipped', detail: 'not requested' });
+        else if (!ctx.dns) steps.dns.push({ domain: null, status: 'skipped', detail: 'DNS Functions is not loaded' });
+        else if (!previous) steps.dns.push({ domain: null, status: 'skipped', detail: 'the account had no address to replace' });
+        else {
+          for (const { domain } of stmts.zonesOf.all(account.id)) {
+            let zone;
+            try { zone = await ctx.dns.getZone(domain, user); } catch (err) { steps.dns.push({ domain, status: 'failed', detail: err.message }); break; }
             const stale = zone.records.filter((r) => r.type === 'A' && r.value === previous);
             if (!stale.length) { steps.dns.push({ domain, status: 'skipped', detail: 'no A record pointed at the old address' }); continue; }
             for (const name of new Set(stale.map((r) => r.name))) {
-              const values = zone.records.filter((r) => r.type === 'A' && r.name === name).map((r) => ({ value: r.value === previous ? ip : r.value, ttl: r.ttl }));
-              const pub = await ctx.dns.upsertRecords(domain, name, 'A', values, req);
-              steps.dns.push({ domain, name, status: pub?.applied ? 'applied' : 'pending', detail: pub?.applied ? 'A record updated and published' : pub?.reason || 'saved; published once BIND runs' });
+              const current = zone.records.filter((r) => r.type === 'A' && r.name === name);
+              const values = current.map((r) => ({ value: r.value === previous ? ip : r.value, ttl: r.ttl }));
+              try {
+                const pub = await ctx.dns.upsertRecords(domain, name, 'A', values, req);
+                applied.dns.push({ domain, name, values: current.map((r) => ({ value: r.value, ttl: r.ttl })) });
+                steps.dns.push({ domain, name, status: pub?.applied ? 'applied' : 'pending', detail: pub?.applied ? 'A record updated and published' : pub?.reason || 'saved; published once BIND runs' });
+              } catch (err) {
+                // dns-functions restores the zone when it cannot publish in strict
+                // (production) mode, so a daemon-missing error only means "pending"
+                // when the new value really was saved.
+                let saved = false;
+                if (isCapabilityMissing(err)) { try { saved = (await ctx.dns.getZone(domain, user)).records.some((r) => r.type === 'A' && r.name === name && r.value === ip); } catch { saved = false; } }
+                if (saved) { applied.dns.push({ domain, name, values: current.map((r) => ({ value: r.value, ttl: r.ttl })) }); steps.dns.push({ domain, name, status: 'pending', detail: err.message }); }
+                else steps.dns.push({ domain, name, status: 'failed', detail: isCapabilityMissing(err) ? `${err.message}; the A record was not saved` : err.message });
+              }
             }
-          } catch (err) {
-            if (isCapabilityMissing(err)) steps.dns.push({ domain, status: 'pending', detail: err.message });
-            else steps.dns.push({ domain, status: 'failed', detail: err.message });
+            if (steps.dns.some((d) => d.domain === domain && d.status === 'failed')) break;
           }
         }
       }
+      if (outcomeOf(steps).status === 'failed') await restore();
     } catch (err) {
-      try { restore(); } catch (undoErr) { logger.error({ err: undoErr, username: account.username }, 'multi-account: could not put the address back'); }
+      try { await restore(); } catch (undoErr) { logger.error({ err: undoErr, username: account.username }, 'multi-account: could not put the address back'); }
       throw err;
     }
-    audit(req, { action: 'account.ip.change', target: account.username, args: { from: previous, to: ip, dedicated: steps.dedicated, web: steps.web?.status, dns: steps.dns.length, bulk: true } });
+    audit(req, { action: 'account.ip.change', target: account.username, args: { from: previous, to: ip, dedicated: steps.dedicated, web: steps.web?.status, dns: steps.dns.length, rolledBack: steps.ip.status === 'rolled_back', bulk: true } });
     return steps;
   }
 
@@ -329,11 +368,12 @@ export function createMultiAccountService(ctx) {
       try {
         const result = await changeAccountIp(account, ip, params, user, req);
         const outcome = outcomeOf(result);
-        finishItem(item, { status: outcome.status, detail: outcome.detail, after: { ip }, steps: { ...steps, ...result } });
+        const rolledBack = result.ip?.status === 'rolled_back';
+        finishItem(item, { status: outcome.status, detail: rolledBack ? `${outcome.detail}; the account stays on ${account.ip || 'no address'}` : outcome.detail, after: { ip: rolledBack ? account.ip : ip }, steps: { ...steps, ...result } });
         jobCtx.log(`${item.username}: ${account.ip || 'unset'} → ${ip} (${outcome.status}${outcome.detail ? `: ${outcome.detail}` : ''})`, outcome.status === 'failed' ? 'error' : outcome.status === 'pending' ? 'warn' : 'info');
       } catch (err) {
         const status = isCapabilityMissing(err) ? 'pending' : 'failed';
-        finishItem(item, { status, detail: err.message, steps });
+        finishItem(item, { status, detail: err.message, after: status === 'failed' ? { ip: account.ip } : {}, steps });
         jobCtx.log(`${item.username}: ${err.message}`, status === 'failed' ? 'error' : 'warn');
       }
     }
@@ -369,8 +409,32 @@ export function createMultiAccountService(ctx) {
     return next;
   }
 
+  // Reseller privileges the bulk path must enforce itself (integration contract
+  // §10); package/quota/bandwidth limits go through ctx.resellers.modifyPolicy
+  // per account, as accounts.modify does again when the job runs.
+  function assertModifyAcls(changes, user) {
+    if (isRoot(user)) return;
+    if (changes.demoMode !== undefined) ctx.resellers?.assertAcl?.(user, 'demo-setup');
+    if (changes.shell && changes.shell !== '/usr/sbin/nologin') {
+      ctx.resellers?.assertAcl?.(user, 'add-pkg-shell');
+      if (ctx.resellers?.aclsFor?.(user.id)?.has('disallow-shell')) throw forbidden('Your reseller privileges forbid granting shell access (Disallow Shell Access); only /usr/sbin/nologin can be set');
+    }
+  }
+
+  function policyIssue(account, next, changes, user) {
+    if (isRoot(user) || !ctx.resellers?.modifyPolicy) return null;
+    try {
+      ctx.resellers.modifyPolicy(user, account, { pkgName: changes.package, diskQuotaMb: next.disk_quota_mb, bandwidthLimitMb: next.bandwidth_limit_mb });
+      return null;
+    } catch (err) {
+      if (err.status === 403 || err.status === 409) return err.message;
+      throw err;
+    }
+  }
+
   function previewModify({ usernames, all, filter, changes, applyPhp = true }, user) {
     if (changes.owner && !isRoot(user)) throw forbidden('Only root can move accounts to another owner');
+    assertModifyAcls(changes, user);
     if (changes.owner && !stmts.ownerByUsername.get(changes.owner)) throw unprocessable(`Owner "${changes.owner}" is not a reseller`, { 'changes.owner': ['Unknown owner'] });
     const plan = changes.package ? planFor(changes.package, user) : null;
     const { accounts, missing } = selectAccounts({ usernames, all, filter }, user);
@@ -382,7 +446,8 @@ export function createMultiAccountService(ctx) {
       const diff = Object.entries(fieldMap).filter(([col]) => before[col] !== after[col]).map(([col, field]) => ({ field, label: FIELD_LABELS[field], from: before[col], to: after[col] }));
       const php = applyPhp && changes.package && plan?.php_version ? { version: plan.php_version, available: Boolean(ctx.web?.setPhpVersion) } : null;
       if (php && php.available) diff.push({ field: 'phpVersion', label: FIELD_LABELS.phpVersion, from: null, to: plan.php_version });
-      return { accountId: a.id, username: a.username, domain: a.domain, owner: a.owner, status: diff.length ? 'change' : 'unchanged', issues: [], before, after, changes: diff, php, quota: after.disk_quota_mb !== before.disk_quota_mb };
+      const issue = diff.length ? policyIssue(a, after, changes, user) : null;
+      return { accountId: a.id, username: a.username, domain: a.domain, owner: a.owner, status: issue ? 'blocked' : diff.length ? 'change' : 'unchanged', issues: issue ? [issue] : [], before, after, changes: diff, php, quota: after.disk_quota_mb !== before.disk_quota_mb };
     });
     for (const u of missing) items.push({ username: u, domain: null, owner: null, status: 'blocked', issues: ['Account not found or not yours'], before: {}, after: {}, changes: [], php: null, quota: false });
     const caps = capabilityStatus();
@@ -482,6 +547,7 @@ export function createMultiAccountService(ctx) {
 
   return {
     listAccounts(query, user) {
+      if (!isRoot(user)) ctx.resellers?.assertAcl?.(user, 'list-accts');
       const rows = visibleAccounts(user);
       const data = rows.filter((a) => matches(a, query)).map(summary);
       const sortKey = query.sort || 'username';
@@ -496,11 +562,11 @@ export function createMultiAccountService(ctx) {
       for (const a of stmts.all.all()) if (a.ip) usage.set(a.ip, (usage.get(a.ip) || 0) + 1);
       if (ctx.ip) {
         const shared = ctx.ip.sharedIp();
-        return ctx.ip.all().map((r) => ({ address: r.address, family: r.family, is_main: r.is_main, reserved: r.reserved, reserved_reason: r.reserved_reason, dedicated_to: r.dedicated_to, shared: r.address === shared, accounts: usage.get(r.address) || 0, selectable: !r.reserved }));
+        return ctx.ip.all().filter((r) => r.family === 4).map((r) => ({ address: r.address, family: r.family, is_main: r.is_main, reserved: r.reserved, reserved_reason: r.reserved_reason, dedicated_to: r.dedicated_to, shared: r.address === shared, accounts: usage.get(r.address) || 0, selectable: !r.reserved }));
       }
       const main = settings.get('basic.main_ip') || null;
       const shared = settings.get('basic.shared_ip') || main;
-      return [...new Set([main, shared, ...usage.keys()].filter(Boolean))].map((address) => ({ address, family: familyOf(address), is_main: address === main, reserved: false, reserved_reason: null, dedicated_to: null, shared: address === shared, accounts: usage.get(address) || 0, selectable: true }));
+      return [...new Set([main, shared, ...usage.keys()].filter((a) => a && familyOf(a) === 4))].map((address) => ({ address, family: 4, is_main: address === main, reserved: false, reserved_reason: null, dedicated_to: null, shared: address === shared, accounts: usage.get(address) || 0, selectable: true }));
     },
     previewChangeIp, startChangeIp, runChangeIp,
     previewModify, startModify, runModify,
