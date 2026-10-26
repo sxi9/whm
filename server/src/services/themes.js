@@ -79,23 +79,55 @@ export function validateVariables(input) {
 const CSS_FORBIDDEN = [
   [/@import\b/i, '@import is not allowed'],
   [/@charset\b/i, '@charset is not allowed'],
+  [/@namespace\b/i, '@namespace is not allowed'],
   [/expression\s*\(/i, 'expression() is not allowed'],
   [/-moz-binding\b/i, '-moz-binding is not allowed'],
   [/behavior\s*:/i, 'behavior: is not allowed'],
   [/javascript\s*:/i, 'javascript: URLs are not allowed'],
   [/<\s*\/?\s*(script|style|iframe|object|embed)\b/i, 'HTML tags are not allowed'],
 ];
+// Fetchable targets: protocol-relative, any hierarchical scheme, or an opaque scheme a
+// browser resolves without "//". Relative paths and inline images are the only allowed forms.
+const REMOTE_TARGET_RE = /^(?:\/\/|[a-z][a-z0-9+.-]*:\/\/|(?:data|javascript|vbscript|blob|filesystem|about):)/i;
+const isRemoteTarget = (target) => REMOTE_TARGET_RE.test(target) && !/^data:image\//i.test(target);
+
+// CSS Syntax §4.3.7: "\" + 1-6 hex digits (+ one optional whitespace) is a code point,
+// "\" + newline inside a string is a continuation, "\" + anything else is that character.
+// Browsers decode these before matching keywords and schemes, so the checks below run on
+// the decoded text as well as the literal one.
+export function decodeCssEscapes(text) {
+  return text.replace(/\\(?:([0-9a-f]{1,6})(?:\r\n|[ \t\n\f\r])?|(\r\n|[\n\f\r])|([\s\S]))/gi, (_m, hex, newline, ch) => {
+    if (hex) {
+      const cp = parseInt(hex, 16);
+      return cp === 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff) ? '�' : String.fromCodePoint(cp);
+    }
+    return newline ? '' : ch;
+  });
+}
+
+function checkCssText(text, errors) {
+  const seen = new Set(errors);
+  const push = (message) => { if (!seen.has(message)) { seen.add(message); errors.push(message); } };
+  for (const [re, message] of CSS_FORBIDDEN) if (re.test(text)) push(message);
+  for (const m of text.matchAll(/url\(\s*['"]?\s*([^'")]*)/gi)) {
+    if (isRemoteTarget(m[1].trim())) { push('url() may only reference relative paths or data:image resources'); break; }
+  }
+  // image-set("…"), src("…"), @import "…" and custom-property fallbacks all fetch a bare
+  // string, so a quoted remote reference is refused wherever it appears.
+  for (const m of text.matchAll(/(["'])\s*([^"'\n]*)/g)) {
+    if (isRemoteTarget(m[2].trim())) { push('Quoted strings may not reference remote resources'); break; }
+  }
+}
+
 export function sanitizeCss(css) {
   const errors = [];
   const text = String(css ?? '');
   if (Buffer.byteLength(text, 'utf8') > MAX_CSS_BYTES) errors.push(`CSS exceeds ${MAX_CSS_BYTES / 1024} KB`);
   // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(text)) errors.push('CSS contains control characters');
-  for (const [re, message] of CSS_FORBIDDEN) if (re.test(text)) errors.push(message);
-  for (const m of text.matchAll(/url\(\s*['"]?\s*([^'")]*)/gi)) {
-    const target = m[1].trim();
-    if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(target) && !/^data:image\//i.test(target)) { errors.push('url() may only reference relative paths or data:image resources'); break; }
-  }
+  const decoded = decodeCssEscapes(text);
+  checkCssText(text, errors);
+  if (decoded !== text) checkCssText(decoded, errors);
   let depth = 0;
   for (const ch of text) { if (ch === '{') depth++; else if (ch === '}') depth--; if (depth < 0) break; }
   if (depth !== 0) errors.push('Unbalanced braces');

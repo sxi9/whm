@@ -13,7 +13,9 @@ import { REPO_ROOT } from '../lib/plugin-sdk.js';
 export const TICKET_CATEGORIES = ['general', 'accounts', 'email', 'dns', 'databases', 'web', 'ssl', 'security', 'backups', 'performance', 'licensing', 'other'];
 export const TICKET_SEVERITIES = ['low', 'normal', 'high', 'critical'];
 export const TICKET_STATUSES = ['open', 'closed'];
-export const GRANT_STATUSES = ['active', 'expired', 'revoked'];
+// 'cleanup_pending': the time box ended but the root key is still on the host;
+// the expiry job keeps retrying until sec.ssh_keys.remove succeeds.
+export const GRANT_STATUSES = ['active', 'cleanup_pending', 'expired', 'revoked'];
 export const JOB_EXPIRE = 'support.expire_access';
 export const SCHEDULE_EXPIRE = 'support-access-expiry';
 
@@ -104,7 +106,23 @@ export function parseOpenSshPrivateKey(pem) {
 }
 
 export const utcStamp = (value) => new Date(value).toISOString().replace(/\.\d{3}Z$/, 'Z');
+// sshd's expiry-time="YYYYMMDDHHMMSS": the daemon itself refuses the key after
+// the grant ends, whether or not the panel is alive to remove it. The stamp is
+// in the host's local time zone with no 'Z' suffix because that is the only form
+// every OpenSSH >= 7.7 parses; the UTC 'Z' form arrived in 9.1 and an older sshd
+// drops the whole line as "bad key options". The panel and sshd share the host
+// clock and /etc/localtime, so local time is unambiguous except for the hour a
+// DST fall-back repeats, which the panel's own removal job covers.
+export const SSHD_MIN_VERSION = '7.7';
+export const sshExpiryTime = (value) => {
+  const d = new Date(value);
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  return `${p(d.getFullYear(), 4)}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+};
+export const authorizedKeyLine = (publicKey, expiresAt) => `expiry-time="${sshExpiryTime(expiresAt)}" ${publicKey}`;
+export const hostTimeZone = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || null; } catch { return null; } };
 const SNAPSHOT_MAX = 200_000;
+const LIVE = "status IN ('active', 'cleanup_pending')";
 
 export function createSupportService(ctx) {
   const { db, settings, agent, capabilities, logger } = ctx;
@@ -118,12 +136,15 @@ export function createSupportService(ctx) {
     openTickets: db.prepare("SELECT id, reference, subject, severity, category, created_at FROM support_tickets WHERE status = 'open' ORDER BY created_at DESC LIMIT 20"),
     ticketCounts: db.prepare("SELECT SUM(status = 'open') AS open, SUM(status = 'closed') AS closed, COUNT(*) AS total FROM support_tickets"),
     grantById: db.prepare('SELECT * FROM support_access_grants WHERE id = ?'),
-    insertGrant: db.prepare(`INSERT INTO support_access_grants (label, ssh_fingerprint, ssh_key_type, ssh_comment, api_token_id, api_token_prefix, granted_by, granted_ip, note, expires_at)
-      VALUES (@label, @ssh_fingerprint, @ssh_key_type, @ssh_comment, @api_token_id, @api_token_prefix, @granted_by, @granted_ip, @note, @expires_at)`),
-    endGrant: db.prepare("UPDATE support_access_grants SET status = @status, ended_at = datetime('now'), ended_by = @ended_by, cleanup_json = @cleanup WHERE id = @id AND status = 'active'"),
+    insertGrant: db.prepare(`INSERT INTO support_access_grants (label, ssh_fingerprint, ssh_key_type, ssh_comment, ssh_expiry, api_token_id, api_token_prefix, granted_by, granted_ip, note, expires_at)
+      VALUES (@label, @ssh_fingerprint, @ssh_key_type, @ssh_comment, @ssh_expiry, @api_token_id, @api_token_prefix, @granted_by, @granted_ip, @note, @expires_at)`),
+    finishGrant: db.prepare(`UPDATE support_access_grants SET status = @status, ended_at = COALESCE(ended_at, datetime('now')), ended_by = COALESCE(ended_by, @ended_by), cleanup_json = @cleanup WHERE id = @id AND ${LIVE}`),
+    pendGrant: db.prepare(`UPDATE support_access_grants SET status = 'cleanup_pending', ended_at = COALESCE(ended_at, datetime('now')), ended_by = COALESCE(ended_by, @ended_by), cleanup_json = @cleanup WHERE id = @id AND ${LIVE}`),
     activeGrants: db.prepare("SELECT * FROM support_access_grants WHERE status = 'active' ORDER BY expires_at"),
-    dueGrants: db.prepare("SELECT * FROM support_access_grants WHERE status = 'active' AND expires_at <= ? ORDER BY expires_at"),
-    grantCounts: db.prepare("SELECT SUM(status = 'active') AS active, COUNT(*) AS total FROM support_access_grants"),
+    liveGrants: db.prepare(`SELECT * FROM support_access_grants WHERE ${LIVE} ORDER BY expires_at`),
+    pendingGrants: db.prepare("SELECT * FROM support_access_grants WHERE status = 'cleanup_pending' ORDER BY expires_at"),
+    dueGrants: db.prepare("SELECT * FROM support_access_grants WHERE (status = 'active' AND expires_at <= ?) OR status = 'cleanup_pending' ORDER BY expires_at"),
+    grantCounts: db.prepare("SELECT SUM(status = 'active') AS active, SUM(status = 'cleanup_pending') AS cleanupPending, COUNT(*) AS total FROM support_access_grants"),
     failedJobs: db.prepare("SELECT id, type, status, error, error_code, created_at, finished_at FROM jobs WHERE status = 'failed' ORDER BY id DESC LIMIT 50"),
     recentAudit: db.prepare('SELECT ts, principal, role, action, target, result FROM audit_log ORDER BY id DESC LIMIT 200'),
     settingKeys: db.prepare('SELECT key, value FROM settings ORDER BY key'),
@@ -142,16 +163,18 @@ export function createSupportService(ctx) {
     };
   }
 
+  // Validated as a whole before anything is written, then stored in one
+  // transaction, so a rejected request never leaves a half-applied pair behind.
   function updateSettings(input, req) {
-    if (input.email !== undefined) settings.set('support.email', input.email);
-    if (input.providerName !== undefined) settings.set('support.provider_name', input.providerName);
-    if (input.portalUrl !== undefined) settings.set('support.portal_url', input.portalUrl);
-    if (input.access?.defaultHours !== undefined) settings.set('support.access.default_hours', input.access.defaultHours);
-    if (input.access?.maxHours !== undefined) settings.set('support.access.max_hours', input.access.maxHours);
-    const next = supportSettings();
+    const current = supportSettings();
+    const next = { ...current, ...input, access: { ...current.access, ...(input.access || {}) } };
     if (next.access.defaultHours > next.access.maxHours) throw unprocessable('Request validation failed', { 'access.defaultHours': ['Must not exceed the maximum grant length'] });
+    settings.setMany({
+      'support.email': next.email, 'support.provider_name': next.providerName, 'support.portal_url': next.portalUrl,
+      'support.access.default_hours': next.access.defaultHours, 'support.access.max_hours': next.access.maxHours,
+    });
     audit(req, { action: 'support.settings.update', args: input });
-    return next;
+    return supportSettings();
   }
 
   // ---------------------------------------------------------------- snapshot ---
@@ -287,14 +310,17 @@ export function createSupportService(ctx) {
     if (!row) return null;
     const expiresAt = row.expires_at;
     const active = row.status === 'active';
+    const cleanup = json.parse(row.cleanup_json, null);
     return {
       id: row.id, label: row.label, status: row.status, note: row.note,
-      ssh: row.ssh_fingerprint ? { fingerprint: row.ssh_fingerprint, type: row.ssh_key_type, comment: row.ssh_comment } : null,
+      ssh: row.ssh_fingerprint ? { fingerprint: row.ssh_fingerprint, type: row.ssh_key_type, comment: row.ssh_comment, expiry: row.ssh_expiry } : null,
       apiToken: row.api_token_id ? { id: row.api_token_id, prefix: row.api_token_prefix } : null,
       grantedBy: row.granted_by, grantedIp: row.granted_ip, expiresAt, createdAt: row.created_at,
       remainingSeconds: active ? Math.max(0, Math.round((new Date(expiresAt).getTime() - Date.now()) / 1000)) : 0,
       overdue: active && new Date(expiresAt).getTime() <= Date.now(),
-      endedAt: row.ended_at, endedBy: row.ended_by, cleanup: json.parse(row.cleanup_json, null),
+      cleanupPending: row.status === 'cleanup_pending',
+      pendingStatus: row.status === 'cleanup_pending' ? cleanup?.pending ?? null : null,
+      endedAt: row.ended_at, endedBy: row.ended_by, cleanup,
     };
   }
 
@@ -305,9 +331,10 @@ export function createSupportService(ctx) {
   }
 
   // Removes what a grant created. Each step records its own outcome so a key
-  // the admin already deleted by hand, or a daemon that vanished, never stops
-  // the other half from being cleaned up or the grant from ending.
+  // the admin already deleted by hand never stops the token from being expired,
+  // and a step that already succeeded on an earlier attempt is not repeated.
   async function cleanupGrant(row, req) {
+    const previous = json.parse(row.cleanup_json, null) || {};
     const cleanup = {};
     if (row.ssh_fingerprint) {
       try {
@@ -318,25 +345,45 @@ export function createSupportService(ctx) {
       }
     }
     if (row.api_token_id) {
-      try {
-        if (!ctx.development?.tokens) throw new Error('Development service unavailable');
-        ctx.development.tokens.expireNow(row.api_token_id, SYSTEM_PRINCIPAL.user, req);
-        cleanup.api = { expired: true };
-      } catch (err) {
-        cleanup.api = { expired: err.status === 404, error: err.status === 404 ? null : err.message };
+      if (previous.api?.expired) cleanup.api = previous.api;
+      else {
+        try {
+          if (!ctx.development?.tokens) throw new Error('Development service unavailable');
+          ctx.development.tokens.expireNow(row.api_token_id, SYSTEM_PRINCIPAL.user, req);
+          cleanup.api = { expired: true };
+        } catch (err) {
+          cleanup.api = { expired: err.status === 404, error: err.status === 404 ? null : err.message };
+        }
       }
     }
     cleanup.ok = (!cleanup.ssh || !cleanup.ssh.error) && (!cleanup.api || cleanup.api.expired);
     return cleanup;
   }
 
+  // The grant only leaves the live states once the root key is off the host.
+  // While sec.ssh_keys.remove fails (agent down, socket timeout, sshd gone) the
+  // row becomes 'cleanup_pending' and every expiry run retries it; sshd's own
+  // expiry-time option on the key bounds the exposure meanwhile.
   async function endGrant(row, status, req, by) {
+    const previous = json.parse(row.cleanup_json, null) || {};
     const cleanup = await cleanupGrant(row, req);
-    stmts.endGrant.run({ id: row.id, status, ended_by: by, cleanup: JSON.stringify(cleanup) });
-    audit(req, { action: `support.access.${status === 'expired' ? 'expire' : 'revoke'}`, target: `${row.id}:${row.label}`, args: { fingerprint: row.ssh_fingerprint, apiCredentialId: row.api_token_id, cleanup }, result: cleanup.ok ? 'ok' : 'partial' });
-    if (!cleanup.ok) logger?.warn({ grant: row.id, cleanup }, 'support access cleanup incomplete');
+    const attempts = (previous.attempts || 0) + 1;
+    const hostClean = !cleanup.ssh || !cleanup.ssh.error;
+    const kind = status === 'expired' ? 'expire' : 'revoke';
+    if (hostClean) {
+      stmts.finishGrant.run({ id: row.id, status, ended_by: by, cleanup: JSON.stringify({ ...cleanup, attempts }) });
+      audit(req, { action: `support.access.${kind}`, target: `${row.id}:${row.label}`, args: { fingerprint: row.ssh_fingerprint, apiCredentialId: row.api_token_id, cleanup, attempts }, result: cleanup.ok ? 'ok' : 'partial' });
+      if (!cleanup.ok) logger?.warn({ grant: row.id, cleanup }, 'support access ended; API token cleanup incomplete');
+    } else {
+      stmts.pendGrant.run({ id: row.id, ended_by: by, cleanup: JSON.stringify({ ...cleanup, pending: status, attempts, lastAttemptAt: utcStamp(Date.now()) }) });
+      audit(req, { action: `support.access.${kind}`, target: `${row.id}:${row.label}`, args: { fingerprint: row.ssh_fingerprint, apiCredentialId: row.api_token_id, cleanup, attempts, pending: status }, result: 'partial' });
+      logger?.warn({ grant: row.id, cleanup, attempts }, 'support access cleanup pending: root SSH key still authorized, will retry');
+    }
     return shapeGrant(stmts.grantById.get(row.id));
   }
+
+  // What a live row should become once its host cleanup succeeds.
+  const finalStatus = (row, fallback) => (row.status === 'cleanup_pending' ? json.parse(row.cleanup_json, null)?.pending || fallback : fallback);
 
   const access = {
     list(query) {
@@ -350,7 +397,11 @@ export function createSupportService(ctx) {
     get(id) { return shapeGrant(loadGrant(id)); },
     status() {
       const sshd = capabilities.has('sshd');
-      return { sshd, tokens: Boolean(ctx.development?.tokens), active: stmts.activeGrants.all().map(shapeGrant), settings: supportSettings().access, sshdDetail: sshd ? null : 'OpenSSH server (sshd) is not installed on this server; SSH access cannot be granted but an API token can.' };
+      return {
+        sshd, tokens: Boolean(ctx.development?.tokens), active: stmts.activeGrants.all().map(shapeGrant), cleanupPending: stmts.pendingGrants.all().map(shapeGrant),
+        settings: supportSettings().access, sshdDetail: sshd ? null : 'OpenSSH server (sshd) is not installed on this server; SSH access cannot be granted but an API token can.',
+        sshdMinVersion: SSHD_MIN_VERSION, expiryTimeZone: hostTimeZone(),
+      };
     },
     // Host first, database second: the key is authorized and the token issued,
     // then the grant row is written. If that last step fails both are undone.
@@ -368,10 +419,11 @@ export function createSupportService(ctx) {
       const label = input.label;
       let key = null;
       let token = null;
+      const sshExpiry = sshExpiryTime(expiresAt);
       if (input.ssh) {
         key = generateSshKeyPair(`whm-support-${label}`);
         try {
-          await agent.op('sec.ssh_keys.add', { publicKey: key.publicKey }, { req });
+          await agent.op('sec.ssh_keys.add', { publicKey: authorizedKeyLine(key.publicKey, expiresAt) }, { req });
         } catch (err) {
           if (err.code === 'exists') throw conflict(`A key with fingerprint ${key.fingerprint} is already authorized for root`);
           throw err;
@@ -381,13 +433,13 @@ export function createSupportService(ctx) {
         if (input.apiToken) {
           token = await ctx.development.tokens.create({ name: `support-${label}`, description: `Support access grant for ${label}; expires ${expiresAt}`, scopes: input.tokenScopes || [], expiresAt }, user, req);
         }
-        const id = Number(stmts.insertGrant.run({ label, ssh_fingerprint: key?.fingerprint ?? null, ssh_key_type: key?.type ?? null, ssh_comment: key ? `whm-support-${label}` : null, api_token_id: token?.id ?? null, api_token_prefix: token?.prefix ?? null, granted_by: user?.username || null, granted_ip: req?.ip || null, note: input.note || null, expires_at: expiresAt }).lastInsertRowid);
-        audit(req, { action: 'support.access.grant', target: `${id}:${label}`, args: { hours, expiresAt, ssh: Boolean(key), fingerprint: key?.fingerprint, api: Boolean(token), apiCredentialId: token?.id, apiScopes: input.tokenScopes || [] } });
+        const id = Number(stmts.insertGrant.run({ label, ssh_fingerprint: key?.fingerprint ?? null, ssh_key_type: key?.type ?? null, ssh_comment: key ? `whm-support-${label}` : null, ssh_expiry: key ? sshExpiry : null, api_token_id: token?.id ?? null, api_token_prefix: token?.prefix ?? null, granted_by: user?.username || null, granted_ip: req?.ip || null, note: input.note || null, expires_at: expiresAt }).lastInsertRowid);
+        audit(req, { action: 'support.access.grant', target: `${id}:${label}`, args: { hours, expiresAt, ssh: Boolean(key), fingerprint: key?.fingerprint, sshExpiry: key ? sshExpiry : null, api: Boolean(token), apiCredentialId: token?.id, apiScopes: input.tokenScopes || [] } });
         const hostname = settings.get('basic.hostname') || null;
         return {
           grant: shapeGrant(stmts.grantById.get(id)),
           // Shown once: the private key is never stored and the token is kept only as a hash.
-          ssh: key ? { privateKey: key.privateKey, publicKey: key.publicKey, fingerprint: key.fingerprint, command: `ssh -i support-${label}.key root@${hostname || '<server>'}` } : null,
+          ssh: key ? { privateKey: key.privateKey, publicKey: key.publicKey, authorizedLine: authorizedKeyLine(key.publicKey, expiresAt), expiry: sshExpiry, expiryTimeZone: hostTimeZone(), sshdMinVersion: SSHD_MIN_VERSION, fingerprint: key.fingerprint, command: `ssh -i support-${label}.key root@${hostname || '<server>'}` } : null,
           apiToken: token ? { token: token.token, prefix: token.prefix, id: token.id, scopes: token.scopes, expiresAt: token.expiresAt, example: `curl -H "Authorization: Bearer <token>" https://${hostname || '<server>'}:2087/api/system/status` } : null,
         };
       } catch (err) {
@@ -396,22 +448,24 @@ export function createSupportService(ctx) {
         throw err;
       }
     },
+    // On a 'cleanup_pending' grant this retries the host cleanup by hand.
     async revoke(id, user, req) {
       const row = loadGrant(id);
-      if (row.status !== 'active') throw conflict(`This grant already ended (${row.status})`);
-      return endGrant(row, 'revoked', req, user?.username || null);
+      if (row.status !== 'active' && row.status !== 'cleanup_pending') throw conflict(`This grant already ended (${row.status})`);
+      return endGrant(row, finalStatus(row, 'revoked'), req, user?.username || null);
     },
-    // Runs from the scheduler every few minutes and from "Expire now".
+    // Runs from the scheduler every few minutes and from "Expire now": ends the
+    // grants that are overdue and retries every one whose cleanup is pending.
     async expireDue({ log = () => {}, req = null } = {}) {
       const due = stmts.dueGrants.all(utcStamp(Date.now()));
       const results = [];
       for (const row of due) {
-        const r = await endGrant(row, 'expired', req, req?.user?.username || 'scheduler');
-        log(`grant ${row.id} (${row.label}) expired; ssh ${r.cleanup?.ssh ? (r.cleanup.ssh.error ? `error: ${r.cleanup.ssh.error}` : `removed ${r.cleanup.ssh.removed}`) : 'n/a'}, token ${r.cleanup?.api ? (r.cleanup.api.expired ? 'expired' : `error: ${r.cleanup.api.error}`) : 'n/a'}`);
+        const r = await endGrant(row, finalStatus(row, 'expired'), req, req?.user?.username || 'scheduler');
+        log(`grant ${row.id} (${row.label}) ${r.cleanupPending ? `cleanup still pending (attempt ${r.cleanup?.attempts})` : r.status}; ssh ${r.cleanup?.ssh ? (r.cleanup.ssh.error ? `error: ${r.cleanup.ssh.error}` : `removed ${r.cleanup.ssh.removed}`) : 'n/a'}, token ${r.cleanup?.api ? (r.cleanup.api.expired ? 'expired' : `error: ${r.cleanup.api.error}`) : 'n/a'}`);
         results.push(r);
       }
       if (!due.length) log('no support access grants were due');
-      return { expired: results.length, grants: results };
+      return { expired: results.filter((r) => !r.cleanupPending).length, pending: results.filter((r) => r.cleanupPending).length, grants: results };
     },
   };
 
@@ -462,7 +516,7 @@ export function createSupportService(ctx) {
       settings: root ? cfg : { providerName: cfg.providerName, portalUrl: cfg.portalUrl },
       mail: root ? { transport, configured: Boolean(cfg.email), address: cfg.email } : undefined,
       tickets: root ? { ...stmts.ticketCounts.get(), open: stmts.openTickets.all().map((r) => ({ id: r.id, reference: r.reference, subject: r.subject, severity: r.severity, category: r.category, createdAt: r.created_at })) } : undefined,
-      access: root ? { ...stmts.grantCounts.get(), sshd: capabilities.has('sshd'), active: stmts.activeGrants.all().map(shapeGrant) } : undefined,
+      access: root ? { ...stmts.grantCounts.get(), sshd: capabilities.has('sshd'), active: stmts.activeGrants.all().map(shapeGrant), cleanupPending: stmts.pendingGrants.all().map(shapeGrant) } : undefined,
       panel: { version: ctx.version ?? null, mode: ctx.config?.mode ?? null, node: process.version },
     };
   }
@@ -490,7 +544,7 @@ export function createSupportService(ctx) {
       jobs: { failed: stmts.failedJobs.all(), types: ctx.jobs.types?.() ?? [] },
       schedules: ctx.scheduler.list(),
       tickets: { open: stmts.openTickets.all() },
-      accessGrants: stmts.activeGrants.all().map(shapeGrant),
+      accessGrants: stmts.liveGrants.all().map(shapeGrant),
       settings: redact(settingsOut),
       audit: { recent: stmts.recentAudit.all() },
       process: { pid: process.pid, uptimeSeconds: Math.floor(process.uptime()), memory: process.memoryUsage(), node: process.version, platform: process.platform },
@@ -501,7 +555,8 @@ export function createSupportService(ctx) {
     JOB_EXPIRE, SCHEDULE_EXPIRE,
     settings: supportSettings, updateSettings,
     snapshot, tickets, access, docs, center, diagnostics,
-    // Other categories may check for a live grant before, say, disabling SSH passwords.
-    activeGrants: () => stmts.activeGrants.all().map(shapeGrant),
+    // Other categories may check for a live grant before, say, disabling SSH
+    // passwords. Includes grants whose key is still on the host pending cleanup.
+    activeGrants: () => stmts.liveGrants.all().map(shapeGrant),
   };
 }

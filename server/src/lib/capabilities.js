@@ -50,7 +50,9 @@ export function createCapabilities({ agent, db, logger }) {
 
   async function refresh() {
     const names = [...new Set(Object.values(CAPABILITY_BINARIES).flat())];
-    const binaries = await agent.op('sys.binaries', { names });
+    const binaries = {};
+    // sys.binaries accepts at most 100 names per call and categories keep registering more.
+    for (let i = 0; i < names.length; i += 100) Object.assign(binaries, await agent.op('sys.binaries', { names: names.slice(i, i + 100) }));
     const capabilities = {};
     for (const [cap, bins] of Object.entries(CAPABILITY_BINARIES)) {
       const required = REQUIRED[cap] || bins;

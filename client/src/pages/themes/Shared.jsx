@@ -156,7 +156,7 @@ export function ThemeEditor({ theme, catalog, onSaved, onClose }) {
       <p className="muted">Leave a token empty to inherit the base scheme. Values are validated as colours (hex, rgb(), hsl() or a named colour) or pixel lengths.</p>
       <VariableEditor catalog={catalog} value={form.variables} onChange={(v) => update({ variables: v })} errors={error?.fields} />
       <h2 style={{ margin: '16px 0 4px' }}>CSS override</h2>
-      <p className="muted">Served to every panel user with this theme, so <code>@import</code>, external <code>url()</code> and script-like constructs are refused. Stored under the panel data directory.</p>
+      <p className="muted">Served to every panel user with this theme, so <code>@import</code>, remote <code>url()</code> targets, quoted remote addresses (as in <code>image-set()</code> or <code>src()</code>) and script-like constructs are refused, including when written with CSS escape sequences. Relative paths and <code>data:image/</code> resources are fine. Stored under the panel data directory.</p>
       <Field error={error?.fields?.css}>
         <Textarea value={css} onChange={updateCss} rows={10} mono spellCheck={false} placeholder={'.brand-mark { background: #ff6600; }'} />
       </Field>

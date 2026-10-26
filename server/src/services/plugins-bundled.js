@@ -69,6 +69,29 @@ export function createBundledPluginsService(ctx) {
     return req;
   }
 
+  // The host emits plugin.uninstalled for every uninstall (Manage Plugins, the
+  // API, another plugin); recording it here is what keeps the boot installer
+  // from putting the plugin back. The scan in ensureInstalled() covers an
+  // uninstall that happened while this process was not listening.
+  function noteUninstalled(id, version = null) {
+    if (!BUNDLED_PLUGINS.some((p) => p.id === id)) return false;
+    const manifest = readBundledManifest(id);
+    record(id, manifest?.version ?? stmts.row.get(id)?.bundled_version ?? '0.0.0', null, 'uninstalled', version ? `version ${version} was uninstalled by the operator` : null);
+    return true;
+  }
+
+  function watchHost() {
+    if (typeof ctx.events?.on !== 'function') return false;
+    ctx.events.on('plugin.uninstalled', (envelope) => {
+      try { noteUninstalled(envelope?.payload?.pluginId, envelope?.payload?.version); } catch (err) { log.warn({ err }, 'could not record a bundled plugin uninstall'); }
+    });
+    return true;
+  }
+
+  // A plugin this service once installed (or saw installed) that the host no
+  // longer has was removed by the operator: it is reported, never re-installed.
+  const wasRemovedByOperator = (previous) => Boolean(previous && previous.installed_version != null && !['missing', 'failed', 'uninstalled'].includes(previous.action));
+
   // Idempotent: a plugin that is missing from the host is installed and
   // enabled; one whose bundled version is newer is upgraded in place (the host
   // keeps its state and runs migrate()); anything else is left alone, so an
@@ -82,7 +105,13 @@ export function createBundledPluginsService(ctx) {
       const previous = stmts.row.get(def.id);
       try {
         if (!existing) {
-          if (previous && previous.action === 'uninstalled') { results.push({ id: def.id, action: 'uninstalled' }); continue; }
+          if (previous?.action === 'uninstalled') { results.push({ id: def.id, action: 'uninstalled' }); continue; }
+          if (wasRemovedByOperator(previous)) {
+            noteUninstalled(def.id, previous.installed_version);
+            log.info({ plugin: def.id, version: previous.installed_version }, 'bundled plugin was uninstalled by the operator; not re-installing it');
+            results.push({ id: def.id, action: 'uninstalled', version: previous.installed_version });
+            continue;
+          }
           await host().install({ dir: bundledDirOf(def.id), source: 'bundled' }, { user: req?.user, req });
           const enabled = await host().enable(def.id, { req });
           record(def.id, manifest.version, manifest.version, 'installed', enabled?.state === 'errored' ? enabled.lastError?.message : null);
@@ -243,7 +272,7 @@ export function createBundledPluginsService(ctx) {
 
   return {
     BUNDLED_PLUGINS, bundledDir: bundledDirOf, readBundledManifest,
-    ensureInstalled, list, status, enable, disable, reinstall,
+    ensureInstalled, watchHost, noteUninstalled, list, status, enable, disable, reinstall,
     accountsForInstall, siteDirOf, installWordPress, runWordPressInstall, wordPressInstalls,
     dataDir: () => config.pluginDataDir,
     record: (id) => json.parse(JSON.stringify(stmts.row.get(id) ?? null), null),

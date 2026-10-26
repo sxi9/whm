@@ -210,3 +210,64 @@ because themes registers after packages. Until this lands, `ctx.themes.accountDe
 `snapshot()` reaches `resolveForPackage`, and the Theme Manager tells root the setting is stored
 but not applied. Required core follow-up: make the change and add a server test asserting an
 account created from a package whose theme is disabled snapshots the account default.
+
+## 23. Clusters: DNS pushes, configuration pushes and cluster tokens (clusters is the owner)
+- **"Accept zones pushed by peers"** (`clusters.dns.accept_pushes`) must bite on the path peers
+  actually use. The DNS module's `dns.sync` job posts to `POST /api/dns/zones/import` with an API
+  token, so clusters mounts a guard router in front of that exact path (`register()` returns a
+  second mount `{ path: '/dns/zones/import' }`; category routers mount alphabetically, so it runs
+  before dns-functions) which refuses token-authenticated requests with 403 while the toggle is off
+  and logs a `dns.receive` / `skipped` exchange event. Sessions (root importing a zone by hand) pass.
+  Required dns-functions follow-ups so the guard is not the only line: (a) `POST /zones/import`
+  calls `ctx.clusters?.dns?.guardImport?.(req)` first (lazy, tolerate absence), and (b) `runSync`
+  targets `/api/clusters/dns/receive` when the peer's last test stored `remote_json.clusterAware`
+  (`cluster_peer_options`), falling back to `/zones/import` for older panels. `ctx.clusters.acceptsDnsPushes()`
+  exposes the toggle.
+- **Configuration cluster allowlist** lives in `server/src/services/clusters-config.js`: an explicit
+  key → `{ group, schema, apply }` map. Nothing outside it travels (host identity, addresses,
+  daemon selection, per-host paths, `*_updated_at` / `last_*` stamps, secrets). A receiving server
+  refuses keys it does not know locally, validates each value against the key's zod schema (strict
+  for objects: unknown fields reject the whole key) and then calls the owning service's validated
+  update path (`ctx.web.apache|exim|mailserver|logrotate|webdisk|webservices.update`,
+  `ctx.ssl.tls.update` / `ctx.ssl.autossl.updateSettings`, `ctx.mail.greylist.update` /
+  `ctx.mail.filters.setMessages`, `ctx.security.cphulk.updateSettings` / `ctx.security.smtp.set`,
+  `ctx.backup.updateConfig`, `ctx.software.panel.updateSettings` / `update.setAuto` /
+  `php.setSystemDefault`, `ctx.contacts.updateSettings` / `setMailPreferences`,
+  `ctx.systemHealth.setConfig`, `ctx.serverConfig.stats.update`). Owners keep their contract:
+  store, then write the host; throw `CapabilityError` when the daemon is missing. Clusters reports
+  per key `applied` (reached the host or live from the DB), `stored` (saved, daemon missing) or
+  `failed` (owner refused; `stored` flag says whether the value stuck). Owners adding a new
+  cluster-worthy setting add it to the allowlist with its schema and apply name.
+- **Cluster tokens** are root `api_tokens` rows with scopes `["clustering"]`, and `clustering` is a
+  *confined* scope: `middleware/auth.js` keeps a registry `ctx.confinedScopes` (scope →
+  `[{ method, path }]`, paths as mounted under `/api`), clusters' `register()` fills it with
+  `CLUSTER_TOKEN_ROUTES` (`GET /api/clusters/ping`, `POST /api/clusters/dns/receive`,
+  `GET /api/clusters/config/export`, `POST /api/clusters/config/receive`, `POST /api/dns/zones/import`),
+  and `requireAuth` answers 403 `scope_confined` to a token whose scopes are all confined on any
+  other route (core routers included). A token mixing in an unconfined scope is not confined and
+  keeps the per-route `requireScope()` rules. Any category that hands tokens to other machines
+  registers its scope the same way.
+- **URL settings with credentials stay local.** `software.update_url` and
+  `mail.country_filter.source_url` may carry basic-auth userinfo (Software sends it as a header);
+  the allowlist schema refuses such a value on receive and `exportValue()` leaves it out of exports
+  and pushes. A refused value is scrubbed from `req.body` before the request audit records it.
+
+## 24. Core: capability detection is chunked (landed from the support task; core owns it)
+`server/src/lib/capabilities.js` `refresh()` asks `sys.binaries` for at most 100 names per call
+and merges the answers. The op's schema caps `names` at 100 and the categories already register
+103 unique programs at boot, so without the chunking every boot would fail detection. This is a
+core change made from a category task because boot depended on it; core owns it from here. Its
+regression test lives in the core suite (`server/test/api.test.js`, "detects capabilities within
+the agent schema limit"), not in a category suite. Categories must not raise the per-call limit
+or bypass `ctx.capabilities.register` to get around it.
+
+## 25. Support: `expiry-time` on root's authorized_keys (support is the owner)
+`ctx.support.access.grant` writes the support engineer's key through `sec.ssh_keys.add` as
+`expiry-time="YYYYMMDDHHMMSS" <key>`: host-local time, no `Z`. OpenSSH accepts the option since
+7.7 but only parses the UTC `Z` form from 9.1; an older sshd drops the whole line ("bad key
+options"), so the local form is the one that works everywhere. The exact string written is kept
+in `support_access_grants.ssh_expiry` and surfaced as `ssh.expiry` next to `expiryTimeZone`
+(the panel's `Intl` zone, i.e. `/etc/localtime`). Security Center's key listing shows the
+options token as-is and must not rewrite it. `ctx.support.activeGrants()` lists grants whose key
+may still be on the host.
+

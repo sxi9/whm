@@ -112,7 +112,7 @@ export function ServerMonitoringOverview({ base, status }) {
   const mb = (v) => (v == null ? '—' : v >= 1024 ? `${(v / 1024).toFixed(1)} GB` : `${Math.round(v)} MB`);
   return (
     <>
-      <Card title="Current" subtitle={s?.lastSampleAt ? `Last sample ${formatDate(new Date(s.lastSampleAt).toISOString())} · ${s.sampleCount} samples kept for ${s.retentionDays} days` : 'No sample yet: the cron job runs every minute while the plugin is enabled.'}
+      <Card title="Current" subtitle={s?.lastSampleAt ? `Last sample ${formatDate(new Date(s.lastSampleAt).toISOString())} · ${s.sampleCount} samples kept for ${s.retentionDays} days · sampled every ${s.intervalMin ?? 1} min in-process` : `No sample yet: the plugin samples the host every ${s?.intervalMin ?? 1} minute${(s?.intervalMin ?? 1) === 1 ? '' : 's'} on an in-process timer while it is enabled.`}
         actions={<><Button size="sm" loading={sample.loading} onClick={() => sample.mutate().catch((e) => toast.error(e))}>Sample now</Button><Button size="sm" onClick={() => { metrics.refetch(); live.refetch(); }}>Refresh</Button></>}>
         <ErrorBanner error={live.error || metrics.error} onRetry={() => { metrics.refetch(); live.refetch(); }} />
         <div className="stat-grid">
@@ -129,12 +129,14 @@ export function ServerMonitoringOverview({ base, status }) {
             </div>
           </div>
         )}
-        {s && !s.enabled && <p className="banner banner-info" style={{ display: 'block', marginTop: 14 }}>Sampling is switched off in the plugin settings.</p>}
+        {s && !s.enabled && <p className="banner banner-info" style={{ display: 'block', marginTop: 14 }}>Sampling is switched off in the plugin settings; the timer is stopped and nothing is collected.</p>}
+        {s?.enabled && s.collector && !s.collector.running && <p className="banner banner-warning" style={{ display: 'block', marginTop: 14 }}>The sampling timer is not running; disable and re-enable the plugin to restart it.</p>}
+        {s?.collector?.lastError && <p className="banner banner-warning" style={{ display: 'block', marginTop: 14 }}>Last sample failed: {s.collector.lastError.message}</p>}
         {jobId && <ProgressLog jobId={jobId} onFinished={(ev) => { if (ev.type === 'done') { toast.success('Sample recorded'); metrics.refetch(); live.refetch(); } else toast.error(ev.error || 'Sampling failed'); }} />}
       </Card>
       <Card title="History" actions={<div style={{ display: 'flex', gap: 6 }}>{RANGES.map(([k, l]) => <Button key={k} size="sm" variant={range === k ? 'primary' : 'default'} onClick={() => setRange(k)}>{l}</Button>)}</div>}>
         {metrics.loading && !d && <Loading />}
-        {d && points.length === 0 && <EmptyState title="No samples in this range">The first sample appears within a minute of enabling the plugin.</EmptyState>}
+        {d && points.length === 0 && <EmptyState title="No samples in this range">The first sample appears within one sampling interval of enabling the plugin; use "Sample now" to take one immediately.</EmptyState>}
         {d && points.length > 0 && (
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 20 }}>
             <div><h3>Load (1 min)</h3><Sparkline label="1-minute load" series={[{ key: 'load1', label: 'load', points: seriesOf('load1') }]} threshold={th.load1} format={(v) => v.toFixed(1)} from={d.from} to={d.to} /></div>

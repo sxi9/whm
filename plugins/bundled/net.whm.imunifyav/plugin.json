@@ -11,7 +11,7 @@
   "permissions": [
     "accounts:read", "store:own", "settings:own", "jobs", "schedule", "api:routes", "ui:sidebar", "contacts:notify", "audit:write",
     "agent:op:sec.imunify.detect", "agent:op:sec.imunify.status", "agent:op:sec.imunify.scan", "agent:op:sec.imunify.results", "agent:op:sec.imunify.quarantine",
-    "agent:op:sec.clamav.detect", "agent:op:sec.clamav.scan"
+    "agent:op:sec.clamav.detect", "agent:op:sec.clamav.targets", "agent:op:sec.clamav.scan"
   ],
   "settings": {
     "groups": [{ "id": "schedule", "label": "Scheduled scans" }, { "id": "fallback", "label": "ClamAV fallback" }],
@@ -23,7 +23,7 @@
     ]
   },
   "jobs": {
-    "clamscan": { "label": "ClamAV scan", "description": "Scan account home directories with clamscan.", "timeoutSec": 21600, "cancellable": true }
+    "clamscan": { "label": "ClamAV scan", "description": "Scan account home directories with clamscan, one bounded agent call per directory chunk.", "timeoutSec": 21600, "cancellable": true }
   },
   "cron": [
     { "name": "scheduled-scan", "job": "clamscan", "schedule": "setting:scanCron" }

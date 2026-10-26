@@ -15,28 +15,80 @@ function host(opts = {}) {
   return h;
 }
 
-test('manifest is valid and declares the minute cron for the sample job', () => {
-  assert.equal(manifest.cron[0].schedule, '* * * * *');
+test('manifest declares no cron: the regular sampling runs on the in-process timer, the job backs "Sample now"', () => {
+  assert.equal(manifest.cron, undefined);
+  assert.ok(!manifest.permissions.includes('schedule'));
   assert.ok(manifest.permissions.includes('agent:op:sec.netdev.read'));
+  assert.equal(manifest.settings.fields.find((f) => f.key === 'intervalMin').default, 1);
 });
 
-test('the sample job stores load, memory, disk and network rates and the cron fires every minute', async () => {
+test('activate starts an unref\'d timer, ticks store samples, settings stop/restart it and deactivate clears it', async () => {
+  const { collectorOf, NET_COUNTERS_EVERY_MS } = mod.__test;
   const h = host();
   assert.deepEqual(await h.load(mod), { ok: true });
-  const first = await h.runJob('sample', {});
-  assert.equal(first.status, 'done');
-  assert.equal(first.result.load1, 0.1);
-  assert.equal(first.result.memPct, 25);
-  assert.equal(first.result.diskPct, 40);
-  const docs = await h.ctx.store.collection('samples').find({});
+  assert.equal(h.state.cron.length, 0, 'nothing is scheduled as a job');
+  const c = collectorOf(h.ctx);
+  assert.ok(c && c.running, 'the collector runs after activate()');
+  assert.equal(c.intervalMs, 60e3);
+  assert.ok(c.timer && typeof c.timer.unref === 'function');
+  const first = await c.tick();
+  assert.equal(first.sample.load1, 0.1);
+  assert.equal(first.sample.memPct, 25);
+  assert.equal(first.sample.diskPct, 40);
+  let docs = await h.ctx.store.collection('samples').find({});
   assert.equal(docs.length, 1);
   assert.equal(docs[0].net.rxRate, null, 'the first sample has no previous counters');
+  assert.equal(c.ticks, 1);
+  assert.equal(c.lastTickAt, NOW);
+  // a tick a minute later reuses the counters read less than 5 minutes ago (one agent call per window)
   await h.advance(60e3);
-  const after = await h.ctx.store.collection('samples').find({}, { sort: { ts: 1 } });
-  assert.equal(after.length, 2, 'the cron entry produced a second sample');
-  assert.equal(after[1].net.rxRate, 0, 'unchanged counters give a zero rate');
-  // schedule, ui:sidebar and jobs are exercised by the manifest (cron, pages) and the routes, not by the job itself.
-  assert.deepEqual(h.unusedPermissions().filter((p) => !['contacts:notify', 'audit:write', 'jobs', 'schedule', 'ui:sidebar'].includes(p)), []);
+  await c.tick();
+  docs = await h.ctx.store.collection('samples').find({}, { sort: { ts: 1 } });
+  assert.equal(docs.length, 2);
+  assert.equal(docs[1].net.carried, true);
+  assert.equal(h.state.agentOps.filter((a) => a.op === 'sec.netdev.read').length, 1);
+  await h.advance(NET_COUNTERS_EVERY_MS - 60e3);
+  await c.tick();
+  docs = await h.ctx.store.collection('samples').find({}, { sort: { ts: 1 } });
+  assert.equal(docs[2].net.carried, false);
+  assert.equal(docs[2].net.rxRate, 0, 'unchanged counters give a zero rate');
+  assert.equal(h.state.agentOps.filter((a) => a.op === 'sec.netdev.read').length, 2);
+  // a busy collector skips instead of overlapping
+  c.busy = true;
+  assert.deepEqual(await c.tick(), { skipped: true, reason: 'busy' });
+  c.busy = false;
+  // settings drive the timer: off stops it, a new interval restarts it
+  await h.ctx.settings.set('enabled', false);
+  assert.equal(collectorOf(h.ctx).running, false);
+  assert.equal(collectorOf(h.ctx).timer, null);
+  await h.ctx.settings.set('enabled', true);
+  assert.equal(collectorOf(h.ctx).running, true);
+  await h.ctx.settings.set('intervalMin', 5);
+  assert.equal(collectorOf(h.ctx).intervalMs, 5 * 60e3);
+  const status = await h.callRoute('GET', '/status');
+  assert.equal(status.body.data.intervalMin, 5);
+  assert.equal(status.body.data.collector.running, true);
+  await h.unload();
+  assert.equal(collectorOf(h.ctx).running, false, 'deactivate() clears the timer');
+  assert.deepEqual(h.unusedPermissions().filter((p) => !['contacts:notify', 'audit:write', 'jobs', 'ui:sidebar'].includes(p)), []);
+});
+
+test('the manual sample job always reads fresh counters and a failing tick is logged, not thrown', async () => {
+  let fail = false;
+  // ctx.api is frozen, so the failure comes from the system info the mock host spreads on every call.
+  const h = createMockHost({ manifest, now: NOW, agentOps: { 'sec.netdev.read': () => NETDEV(1000, 500) }, systemInfo: { get load() { if (fail) throw new Error('agent down'); return [0.1, 0.1, 0.1]; } } });
+  await h.load(mod);
+  await h.runJob('sample', {});
+  await h.runJob('sample', {});
+  assert.equal(h.state.agentOps.filter((a) => a.op === 'sec.netdev.read').length, 2, 'manual samples force a counter read');
+  const c = mod.__test.collectorOf(h.ctx);
+  fail = true;
+  const r = await c.tick();
+  assert.equal(r.error, 'agent down');
+  assert.equal(c.failures, 1);
+  assert.equal(c.lastError.message, 'agent down');
+  assert.ok(h.state.logs.some((l) => /could not be collected/.test(l.msg)));
+  await h.unload();
 });
 
 test('network rates come from counter deltas and a reset counter yields no rate', () => {

@@ -1448,6 +1448,15 @@ async function wp(username, home, site, argv, { input, timeoutMs = WP_TIMEOUT_MS
   return exec('runuser', [...base, ...argv], { input, timeoutMs, allowFailure: true, env: { HOME: home, WP_CLI_CACHE_DIR: `${home}/.wp-cli/cache`, WP_CLI_DISABLE_AUTO_CHECK_UPDATE: '1' } });
 }
 
+// Root never changes permissions inside an account's tree: the account user
+// may swap any file for a symbolic link between a check and the chmod, so the
+// chmod runs as that user and can only ever affect files the user owns.
+async function chmodAsUser(username, home, file, mode) {
+  const r = await exec('runuser', ['-u', username, '--', 'chmod', mode, '--', file], { allowFailure: true, timeoutMs: 30_000, env: { HOME: home } });
+  if (r.code !== 0) throw new OpError('command_failed', `chmod ${mode} ${file} as ${username} failed: ${lastLineOf(r)}`);
+  return true;
+}
+
 const lastLineOf = (r) => (r.stderr.trim().split('\n').pop() || r.stdout.trim().split('\n').pop() || 'no output').replace(/^(Error|Warning):\s*/, '');
 const jsonOf = (r) => { if (r.code !== 0) return null; const t = r.stdout.trim(); if (!t) return null; try { return JSON.parse(t.slice(t.search(/[[{]/))); } catch { return null; } };
 
@@ -1607,7 +1616,7 @@ defineOp('web.wp.hardenfix', {
   run: async ({ username, path: p, fixes }, ctx) => {
     const { home, site } = wpSite(username, p, ctx, 'write');
     const config = path.join(site, 'wp-config.php');
-    if (!exists(config) || fs.lstatSync(config).isSymbolicLink()) throw new OpError('not_found', `${site} does not contain a WordPress installation`);
+    if (!exists(config)) throw new OpError('not_found', `${site} does not contain a WordPress installation`);
     const applied = [];
     const failed = {};
     const set = async (id, name, value) => {
@@ -1615,7 +1624,7 @@ defineOp('web.wp.hardenfix', {
       if (r.code === 0) applied.push(id); else failed[id] = lastLineOf(r);
     };
     for (const fix of fixes) {
-      if (fix === 'config-perms') { fs.chmodSync(config, 0o600); applied.push(fix); }
+      if (fix === 'config-perms') { try { await chmodAsUser(username, home, config, '600'); applied.push(fix); } catch (err) { failed[fix] = err.message; } }
       else if (fix === 'disallow-file-edit') await set(fix, 'DISALLOW_FILE_EDIT', 'true');
       else if (fix === 'debug-off') await set(fix, 'WP_DEBUG', 'false');
       else if (fix === 'auto-update-core') await set(fix, 'WP_AUTO_UPDATE_CORE', 'true');
@@ -1624,8 +1633,18 @@ defineOp('web.wp.hardenfix', {
   },
 });
 
+// A fresh site needs an active theme to render; `wp core download` ships the
+// bundled default themes, and this one is fetched when none ends up active.
+export const WP_FALLBACK_THEME = 'twentytwentyfive';
+
+async function activeTheme(username, home, site) {
+  const r = await wp(username, home, site, ['theme', 'list', '--status=active', '--format=json', '--fields=name,version']);
+  const list = jsonOf(r);
+  return Array.isArray(list) && list.length ? { name: String(list[0].name), version: list[0].version ?? null } : null;
+}
+
 defineOp('web.wp.install', {
-  description: 'Download WordPress, write wp-config.php and run the installer as the account user (database credentials via stdin)',
+  description: 'Download WordPress with its default themes, write wp-config.php, run the installer as the account user (credentials via stdin) and verify a theme is active',
   timeoutMs: 1_800_000,
   schema: z.object({
     ...wpSiteArgs, url: wpUrl, title: wpTitle, adminUser: wpUser, adminEmail: z.string().email().max(254), adminPassword: wpSecret,
@@ -1638,7 +1657,7 @@ defineOp('web.wp.install', {
     const mk = await exec('runuser', ['-u', username, '--', 'mkdir', '-p', '--', site], { allowFailure: true, env: { HOME: home } });
     if (mk.code !== 0) throw new OpError('command_failed', `could not create ${site} as ${username}: ${lastLineOf(mk)}`);
     const steps = [];
-    const dl = await wp(username, home, site, ['core', 'download', `--locale=${locale}`, '--skip-content'], { timeoutMs: 900_000, skip: false });
+    const dl = await wp(username, home, site, ['core', 'download', `--locale=${locale}`], { timeoutMs: 900_000, skip: false });
     if (dl.code !== 0 && !/already present/i.test(dl.stderr)) throw new OpError('command_failed', `wp core download failed: ${lastLineOf(dl)}`, { step: 'download' });
     steps.push('download');
     const cfg = await wp(username, home, site, ['config', 'create', `--dbname=${dbName}`, `--dbuser=${dbUser}`, `--dbhost=${dbHost}`, `--dbprefix=${tablePrefix}`, `--locale=${locale}`, '--prompt=dbpass', '--skip-check'], { input: `${dbPassword}\n`, skip: false });
@@ -1647,8 +1666,17 @@ defineOp('web.wp.install', {
     const ins = await wp(username, home, site, ['core', 'install', `--url=${url}`, `--title=${title}`, `--admin_user=${adminUser}`, `--admin_email=${adminEmail}`, '--prompt=admin_password', '--skip-email'], { input: `${adminPassword}\n`, timeoutMs: 600_000, skip: false });
     if (ins.code !== 0) throw new OpError('command_failed', `wp core install failed: ${lastLineOf(ins)}`, { step: 'install' });
     steps.push('install');
-    try { fs.chmodSync(path.join(site, 'wp-config.php'), 0o600); } catch { /* best effort */ }
+    let theme = await activeTheme(username, home, site);
+    if (!theme) {
+      const t = await wp(username, home, site, ['theme', 'install', WP_FALLBACK_THEME, '--activate'], { timeoutMs: 600_000, skip: false });
+      if (t.code !== 0) throw new OpError('command_failed', `WordPress is installed but no theme is active and ${WP_FALLBACK_THEME} could not be installed: ${lastLineOf(t)}`, { step: 'theme' });
+      theme = await activeTheme(username, home, site);
+      if (!theme) throw new OpError('command_failed', 'WordPress is installed but no theme is active; the site would render an error page', { step: 'theme' });
+    }
+    steps.push('theme');
+    let warning = null;
+    try { await chmodAsUser(username, home, path.join(site, 'wp-config.php'), '600'); } catch (err) { warning = err.message; }
     const v = await wp(username, home, site, ['core', 'version']);
-    return { path: site, url, version: v.code === 0 ? v.stdout.trim() : null, steps };
+    return { path: site, url, version: v.code === 0 ? v.stdout.trim() : null, theme, steps, warning };
   },
 });

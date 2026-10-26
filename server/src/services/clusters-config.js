@@ -14,7 +14,11 @@ const int = (min, max) => z.number().int().min(min).max(max);
 const bool = z.boolean();
 const line = (max = 200) => z.string().max(max).regex(/^[^\r\n\0]*$/, 'Single line');
 const emailOrEmpty = z.union([z.literal(''), fields.email]);
-const httpsUrlOrEmpty = z.union([z.literal(''), z.string().max(500).regex(/^https?:\/\/[^\s\0'"<>]+$/, 'http(s) URL')]);
+// Credentials embedded in a URL (https://user:pass@host/...) are a secret of
+// the host that holds them: such a value is refused on receive and, since
+// exportValue() runs the same schema, left out of what this server serves.
+const withoutUserinfo = (v) => { if (v === '') return true; try { const u = new URL(v); return !u.username && !u.password; } catch { return false; } };
+const httpsUrlOrEmpty = z.union([z.literal(''), z.string().max(500).regex(/^https?:\/\/[^\s\0'"<>]+$/, 'http(s) URL').refine(withoutUserinfo, 'A URL carrying credentials stays local')]);
 const cron = fields.cron.refine((v) => isValidCron(v), 'Must be a valid 5-field cron expression');
 const cipherList = z.string().max(2048).regex(/^[A-Za-z0-9:+!@_=-]*$/);
 const cipherSuites = z.string().max(512).regex(/^[A-Za-z0-9_:]*$/);

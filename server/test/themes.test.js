@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import request from 'supertest';
 import { createTestApp } from './support/app.js';
-import { validateVariables, sanitizeCss, VARIABLE_CATALOG, MAX_CSS_BYTES } from '../src/services/themes.js';
+import { validateVariables, sanitizeCss, decodeCssEscapes, VARIABLE_CATALOG, MAX_CSS_BYTES } from '../src/services/themes.js';
 
 let app;
 let csrf;
@@ -47,9 +47,15 @@ describe('pure helpers', () => {
   it('refuses CSS that imports, scripts or fetches remote resources', () => {
     expect(sanitizeCss('.topbar { background: #000 } .brand-mark { background: url("data:image/png;base64,AAAA") }').ok).toBe(true);
     expect(sanitizeCss('.x { background: url(/logo.png) }').ok).toBe(true);
-    for (const css of ['@import url(https://evil.example/x.css);', '.x { background: url(https://evil.example/x.png) }', '.x { background: url(//evil.example/x.png) }', '.x { width: expression(alert(1)) }', '.x { behavior: url(x.htc) }', '</style><script>1</script>', '.x { color: red', '.x { color: red }}', '.x { a: "\u0007" }']) {
+    expect(sanitizeCss('.x { content: "\\201C"; font-family: "My Font" } .y { content: "Error: " } .z { content: "\\7b" }').ok).toBe(true);
+    expect(sanitizeCss('.x { background-image: image-set("data:image/png;base64,AAAA" 1x) }').ok).toBe(true);
+    for (const css of ['@import url(https://evil.example/x.css);', '.x { background: url(https://evil.example/x.png) }', '.x { background: url(//evil.example/x.png) }', '.x { width: expression(alert(1)) }', '.x { behavior: url(x.htc) }', '</style><script>1</script>', '.x { color: red', '.x { color: red }}', '.x { a: "\u0007" }',
+      // CSS escape sequences and string-URL functions decode to the same constructs in the browser.
+      '@\\69mport url(/x.css);', '@\\69 mport url(/x.css);', '.x{background:\\75rl(https://evil.example/t.png)}', '.x{background:\\75 rl(https://evil.example/t.png)}', '.x{background:url(\\68ttps://evil.example/t.png)}', '.x{background:url("\\68ttps://evil.example/t.png")}', '.x{background:url(\\2f\\2f evil.example/t.png)}',
+      '.x{background-image:image-set("https://evil.example/t.png" 1x)}', '.x{background-image:image-set(\'//evil.example/t.png\' 1x)}', '--x: "https://evil.example/t.png"; .y{background:image-set(var(--x))}', '@font-face{src:src("https://evil.example/f.woff")}', '@namespace url(https://evil.example);', '\\22 "https://evil.example/x"']) {
       expect(sanitizeCss(css).ok, css).toBe(false);
     }
+    expect(decodeCssEscapes('\\75 rl(\\2F x\\\nabc\\)')).toBe('url(/xabc)');
     expect(sanitizeCss('a'.repeat(MAX_CSS_BYTES + 1)).errors[0]).toMatch(/exceeds/);
   });
 });

@@ -31,9 +31,12 @@ export async function register(ctx) {
   ctx.bundledPlugins = createBundledPluginsService(ctx);
   const s = ctx.bundledPlugins;
   ctx.jobs.register(WP_INSTALL_JOB, (job) => s.runWordPressInstall(job));
+  // Only the programs the plugins actually probe: sys.binaries is capped per
+  // call and every extra name here costs every category.
   ctx.capabilities.register('imunifyav', { binaries: ['imunify-antivirus'], required: ['imunify-antivirus'] });
-  ctx.capabilities.register('clamav', { binaries: ['clamscan', 'freshclam', 'clamdscan'], required: ['clamscan'] });
-  ctx.capabilities.register('wpcli', { binaries: ['wp', 'runuser'], required: ['wp'] });
+  ctx.capabilities.register('clamav', { binaries: ['clamscan'], required: ['clamscan'] });
+  ctx.capabilities.register('wpcli', { binaries: ['wp'], required: ['wp'] });
+  s.watchHost();
 
   // The bundled plugins install into the host at boot. Test suites opt in
   // (overrides.bundledPlugins = true) so the core plugin-host suite keeps an

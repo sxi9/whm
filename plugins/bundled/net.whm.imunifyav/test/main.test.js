@@ -107,3 +107,45 @@ test('ImunifyAV results are listed with the account derived from the path', asyn
   assert.equal(mod.__test.ownerOf('/home2/carol/x'), 'carol');
   assert.equal(mod.__test.ownerOf('/var/www/x'), null);
 });
+
+test('the ClamAV job scans one bounded agent call per home-directory chunk, counts a timed-out chunk as an error and keeps going', async () => {
+  const calls = [];
+  const h = host({
+    'sec.imunify.detect': { installed: false }, 'sec.clamav.detect': { installed: true, version: '1.0.5' },
+    'sec.clamav.targets': ({ username }) => (username === 'alice'
+      ? { username, home: '/home/alice', chunks: [{ label: 'public_html/', paths: ['/home/alice/public_html'] }, { label: 'mail/', paths: ['/home/alice/mail'] }, { label: '(files)', paths: ['/home/alice/.bashrc'] }] }
+      : { username, home: '/home/bob', chunks: [{ label: 'public_html/', paths: ['/home/bob/public_html'] }] }),
+    'sec.clamav.scan': (a) => {
+      calls.push(a);
+      if (a.paths[0] === '/home/alice/mail') throw new PluginError('clamscan did not finish 1 target within 2700s; scan a smaller chunk', { code: 'TIMEOUT', status: 504 });
+      return a.paths[0] === '/home/bob/public_html' ? { infected: [{ file: '/home/bob/public_html/x.php', signature: 'Php.Malware.Agent-1' }], errors: [] } : { infected: [], errors: [] };
+    },
+  });
+  await h.load(mod);
+  const job = await h.runJob('clamscan', { force: true, trigger: 'manual' });
+  assert.equal(job.status, 'done');
+  assert.deepEqual(calls.map((c) => c.paths), [['/home/alice/public_html'], ['/home/alice/mail'], ['/home/alice/.bashrc'], ['/home/bob/public_html']]);
+  assert.ok(calls.every((c) => c.maxDurationSec === mod.__test.SCAN_CALL_SEC && c.maxDurationSec * 1000 < 3_600_000), 'every call is bounded under the socket timeout');
+  assert.ok(calls.every((c) => c.usernames === undefined), 'no whole-home call when the home could be split');
+  assert.equal(job.result.chunks, 3);
+  assert.equal(job.result.chunksFailed, 1);
+  assert.equal(job.result.errors, 1);
+  assert.equal(job.result.infected, 1);
+  assert.ok(job.log.some((l) => /WARN alice mail\/: clamscan did not finish/.test(l.msg)));
+  const findings = await h.callRoute('GET', '/findings');
+  assert.equal(findings.body.data[0].username, 'bob');
+});
+
+test('a home the agent cannot split falls back to a single bounded whole-home call', async () => {
+  const calls = [];
+  const h = host({
+    'sec.imunify.detect': { installed: false }, 'sec.clamav.detect': { installed: true },
+    'sec.clamav.targets': ({ username }) => { if (username === 'alice') throw new PluginError('Unknown user "alice"', { code: 'NOT_FOUND', status: 404 }); return { username, home: '/home/bob', chunks: [] }; },
+    'sec.clamav.scan': (a) => { calls.push(a); return { infected: [], errors: [] }; },
+  });
+  await h.load(mod);
+  const job = await h.runJob('clamscan', { force: true });
+  assert.equal(job.status, 'done');
+  assert.deepEqual(calls, [{ usernames: ['alice'], maxFileMb: 25, maxDurationSec: mod.__test.SCAN_CALL_SEC }], 'bob has an empty home: nothing to scan');
+  assert.equal(job.result.accounts, 2);
+});

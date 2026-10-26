@@ -1,14 +1,30 @@
 'use strict';
 
-// Server Monitoring: a cron job samples ctx.api.system.info plus the interface
-// counters from the agent every minute into the "samples" collection, prunes
-// it to the retention window and evaluates the alert thresholds. Routes serve
-// the page under Plugins › Server Monitoring.
+// Server Monitoring: an in-process timer started in activate() samples
+// ctx.api.system.info plus the interface counters from the agent into the
+// "samples" collection, prunes it to the retention window and evaluates the
+// alert thresholds. Routes serve the page under Plugins › Server Monitoring.
+//
+// Sampling deliberately does not run as a scheduled job: every job run costs
+// the panel a jobs + job_logs row and an SSE event that nothing prunes, which
+// at one sample a minute is about a million rows a year. The timer writes one
+// "samples" document per tick (pruned to retentionDays) and the "sample" job
+// only backs the manual "Sample now" action. The one remaining per-call cost
+// is the audit_log row the host writes for every plugin agent call, so the
+// network counters (the only agent call) are read at most every
+// NET_COUNTERS_EVERY_MS and the rates are carried forward in between.
+
+const timers = require('timers');
 
 const RANGES = { '1h': 3600e3, '6h': 6 * 3600e3, '24h': 24 * 3600e3, '7d': 7 * 86400e3 };
 const MAX_POINTS = 360;
 const MAX_ALERT_ROWS = 500;
 const PRUNE_EVERY_MS = 3600e3;
+const NET_COUNTERS_EVERY_MS = 5 * 60e3;
+const NET_SLACK_MS = 5e3;
+const MIN_INTERVAL_MIN = 1;
+const MAX_INTERVAL_MIN = 60;
+const collectors = new WeakMap();
 const METRICS = {
   load1: { label: '1-minute load', setting: 'loadThreshold', unit: '' },
   memPct: { label: 'Memory used', setting: 'memThresholdPct', unit: '%' },
@@ -93,10 +109,16 @@ async function evaluateAlerts(ctx, sample, settings, log) {
   return fired;
 }
 
-async function collectSample(ctx, log) {
-  const settings = await ctx.settings.getAll();
-  const ts = ctx.now();
-  const info = await ctx.api.system.info();
+// Interface counters are one agent call each (audited by the host), so they
+// are read every NET_COUNTERS_EVERY_MS at most unless the caller forces it
+// (manual "Sample now"); samples in between carry the last measured rates.
+async function readNetwork(ctx, settings, ts, log, force) {
+  const previous = await ctx.store.get('net:last');
+  const due = force || !previous || ts - previous.ts >= NET_COUNTERS_EVERY_MS - NET_SLACK_MS;
+  if (!due) {
+    const rates = (await ctx.store.get('net:rates')) || { rxRate: null, txRate: null };
+    return { ...previous, rxRate: rates.rxRate, txRate: rates.txRate, measuredAt: previous.ts, carried: true };
+  }
   let counters = null;
   try {
     const r = await ctx.agent.op('sec.netdev.read', {});
@@ -104,9 +126,18 @@ async function collectSample(ctx, log) {
   } catch (err) {
     if (!(await ctx.store.get('net:unavailable'))) { log('warn', 'network counters unavailable; sampling continues without them', { error: err.message }); await ctx.store.set('net:unavailable', true); }
   }
-  const previous = await ctx.store.get('net:last');
-  const net = counters ? { ...counters, ...netRates(counters, previous) } : null;
-  if (counters) await ctx.store.set('net:last', counters);
+  if (!counters) return null;
+  const rates = netRates(counters, previous);
+  await ctx.store.set('net:last', counters);
+  await ctx.store.set('net:rates', rates);
+  return { ...counters, ...rates, measuredAt: ts, carried: false };
+}
+
+async function collectSample(ctx, log, { force = false } = {}) {
+  const settings = await ctx.settings.getAll();
+  const ts = ctx.now();
+  const info = await ctx.api.system.info();
+  const net = await readNetwork(ctx, settings, ts, log, force);
   const sample = shapeSample(info, net, ts);
   const samples = ctx.store.collection('samples');
   await samples.insert(sample);
@@ -128,17 +159,92 @@ async function collectSample(ctx, log) {
   return { sample, alertsFired };
 }
 
+// ------------------------------------------------------------- collector ---
+// One timer per plugin context. Ticks never overlap (a slow sample is skipped,
+// not queued) and a failing tick is logged, never thrown into the timer. The
+// timer is unref'd so it can never keep the panel process alive on shutdown.
+
+const intervalMsOf = (settings) => Math.min(MAX_INTERVAL_MIN, Math.max(MIN_INTERVAL_MIN, Math.round(Number(settings.intervalMin) || MIN_INTERVAL_MIN))) * 60e3;
+
+function stopCollector(ctx) {
+  const c = collectors.get(ctx);
+  if (!c) return false;
+  if (c.timer) timers.clearInterval(c.timer);
+  c.timer = null;
+  c.running = false;
+  return true;
+}
+
+function startCollector(ctx, intervalMs) {
+  stopCollector(ctx);
+  const log = (level, msg, fields) => ctx.log[level](msg, fields);
+  const c = {
+    running: true, intervalMs, timer: null, busy: false, ticks: 0, failures: 0, lastTickAt: null, lastError: null, startedAt: ctx.now(),
+    async tick() {
+      if (c.busy) return { skipped: true, reason: 'busy' };
+      c.busy = true;
+      try {
+        const settings = await ctx.settings.getAll();
+        if (settings.enabled === false) return { skipped: true, reason: 'disabled' };
+        const r = await collectSample(ctx, log, { force: false });
+        c.ticks++;
+        c.lastTickAt = r.sample.ts;
+        c.lastError = null;
+        return r;
+      } catch (err) {
+        c.failures++;
+        c.lastError = { at: ctx.now(), message: err.message };
+        log('warn', 'sample could not be collected', { error: err.message });
+        return { error: err.message };
+      } finally { c.busy = false; }
+    },
+  };
+  c.timer = timers.setInterval(() => { c.tick().catch(() => {}); }, intervalMs);
+  if (c.timer && typeof c.timer.unref === 'function') c.timer.unref();
+  collectors.set(ctx, c);
+  return c;
+}
+
+async function syncCollector(ctx) {
+  const settings = await ctx.settings.getAll();
+  const current = collectors.get(ctx);
+  if (settings.enabled === false) {
+    if (stopCollector(ctx)) ctx.log.info('sampling stopped: disabled in the plugin settings');
+    return null;
+  }
+  const intervalMs = intervalMsOf(settings);
+  if (current && current.running && current.intervalMs === intervalMs) return current;
+  const c = startCollector(ctx, intervalMs);
+  ctx.log.info(`sampling every ${intervalMs / 60e3} minute${intervalMs === 60e3 ? '' : 's'} in-process`);
+  return c;
+}
+
+const collectorOf = (ctx) => collectors.get(ctx) || null;
+
 module.exports = {
   async activate(ctx) {
     ctx.log.info('server monitoring active', { version: ctx.plugin.version });
+    await syncCollector(ctx);
+    ctx.settings.onChange((key) => {
+      if (key !== 'enabled' && key !== 'intervalMin') return;
+      syncCollector(ctx).catch((err) => ctx.log.warn('collector could not be restarted after a settings change', { error: err.message }));
+    });
+  },
+
+  async deactivate(ctx) {
+    stopCollector(ctx);
   },
 
   jobs: {
+    // Backs the manual "Sample now" action only; the timer does the regular
+    // sampling without a job row per tick.
     async sample(job, ctx) {
       const settings = await ctx.settings.getAll();
       if (settings.enabled === false) { job.log('sampling is disabled in the plugin settings'); return { skipped: true }; }
       const log = (level, msg, fields) => ctx.log[level](msg, fields);
-      const { sample, alertsFired } = await collectSample(ctx, log);
+      const { sample, alertsFired } = await collectSample(ctx, log, { force: true });
+      const c = collectorOf(ctx);
+      if (c) c.lastTickAt = sample.ts;
       job.progress(100, 'sampled');
       return { ts: sample.ts, load1: sample.load1, memPct: sample.memPct, diskPct: sample.diskPct, alertsFired: alertsFired.length };
     },
@@ -154,7 +260,11 @@ module.exports = {
         const s = await ctx.store.get(`alert:${key}`);
         if (s?.active) active.push({ key, metric: def.label, since: s.since, threshold: settings[def.setting], unit: def.unit });
       }
-      res.json({ enabled: settings.enabled !== false, lastSampleAt: last?.ts ?? null, latest: last || null, sampleCount: total, thresholds: { load1: settings.loadThreshold, memPct: settings.memThresholdPct, diskPct: settings.diskThresholdPct }, alertsEnabled: settings.alertsEnabled !== false, activeAlerts: active, retentionDays: settings.retentionDays });
+      const c = collectorOf(ctx);
+      res.json({
+        enabled: settings.enabled !== false, intervalMin: intervalMsOf(settings) / 60e3, collector: c ? { running: c.running, intervalMs: c.intervalMs, ticks: c.ticks, failures: c.failures, lastTickAt: c.lastTickAt, lastError: c.lastError, startedAt: c.startedAt } : { running: false },
+        lastSampleAt: last?.ts ?? null, latest: last || null, sampleCount: total, thresholds: { load1: settings.loadThreshold, memPct: settings.memThresholdPct, diskPct: settings.diskThresholdPct }, alertsEnabled: settings.alertsEnabled !== false, activeAlerts: active, retentionDays: settings.retentionDays,
+      });
     });
 
     http.get('/metrics', async (req, res) => {
@@ -181,4 +291,4 @@ module.exports = {
   },
 };
 
-module.exports.__test = { sumInterfaces, netRates, shapeSample, downsample, evaluateAlerts, collectSample, METRICS, RANGES };
+module.exports.__test = { sumInterfaces, netRates, shapeSample, downsample, evaluateAlerts, collectSample, collectorOf, syncCollector, METRICS, RANGES, NET_COUNTERS_EVERY_MS };

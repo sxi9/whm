@@ -2,7 +2,9 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
 import request from 'supertest';
 import { createTestApp, waitForJob } from './support/app.js';
-import { parsePeerHost, groupOfKey, isPushableKey, PEER_HOST_RE, GROUP_NAMES, CONFIG_GROUPS } from '../src/services/clusters.js';
+import { parsePeerHost, groupOfKey, isPushableKey, PEER_HOST_RE, GROUP_NAMES, CONFIG_GROUPS, CONFIG_KEYS, keysOfGroup, TOKEN_ALLOWED, CLUSTER_TOKEN_ROUTES } from '../src/services/clusters.js';
+import { validateIncoming, exportValue } from '../src/services/clusters-config.js';
+import { DEFAULT_SETTINGS } from '../src/db/seed.js';
 
 const PEER_TOKEN = 'whm_peer-token-0123456789abcdefghij';
 const ZONE = (domain, serial = 7) => `$TTL 14400
@@ -58,6 +60,59 @@ describe('clusters helpers', () => {
     expect(isPushableKey('contacts.smtp.password')).toBe(false);
     expect(isPushableKey('security.cphulk.enabled')).toBe(true);
     expect(Object.keys(CONFIG_GROUPS)).toEqual(GROUP_NAMES);
+    for (const g of GROUP_NAMES) expect(keysOfGroup(g).length, g).toBeGreaterThan(0);
+  });
+
+  // Host identity, addresses, per-host daemon state, paths, timestamps and
+  // secrets must never travel, whatever prefix they sit under.
+  const HOST_STATE = /(^|\.)(ip|ipv4|ipv6|hostname|main_ip|main_ipv6|shared_ip|outbound|participant_id|local_dir|staging_dir|archive_dirs|resolvers|allow_transfer|apache_ports|nameserver|ftp_server|active_profile|nginx|ea4|smtp|external_auth|from_address|notification_from|cluster_verify_tls|accept_pushes|auto_push|groups|bind_address_ipv4|bind_address_ipv6)(\.|$)|(^|[._])(last(_[a-z_]+)?|updated_at|[a-z_]*fingerprint|password|password_enc|secret|token|private_key|credential|api_key)$|^service_config\.ftp$/;
+  it('never shares a host-identity or per-host key, whatever its prefix', () => {
+    const pushable = Object.keys(CONFIG_KEYS);
+    for (const key of pushable) expect(key, key).not.toMatch(HOST_STATE);
+    for (const key of ['basic.hostname', 'basic.main_ip', 'basic.main_ipv6', 'basic.shared_ip', 'mail.outbound.ipv4', 'mail.outbound.ipv6', 'mail.notification_from', 'service_config.apache_ports', 'service_config.nameserver', 'service_config.ftp_server', 'service_config.ftp', 'service_config.apache_updated_at', 'service_config.webdisk_updated_at', 'backup.local_dir', 'contacts.smtp.host', 'contacts.smtp.username', 'contacts.smtp.password_enc', 'contacts.from_address', 'contacts.exim.primary_hostname', 'contacts.check.last_result', 'contacts.check.last_run_at', 'analytics.participant_id', 'analytics.updated_at', 'analytics.enabled', 'software.nginx.last_fingerprint', 'software.nginx.last_sync', 'software.nginx.enabled', 'software.ea4.active_profile', 'software.updates.last_check', 'software.panel.last_check', 'stats.last_run', 'dns.resolvers', 'dns.allow_transfer', 'dns.cluster_verify_tls', 'security.external_auth.enabled', 'clusters.config.groups', 'clusters.dns.accept_pushes', 'db.client.bind_address_ipv4', 'ip.remote.mail_ipv4', 'transfers.staging_dir', 'dns.bogus_new_key', 'tweak.made_up']) {
+      expect(isPushableKey(key), key).toBe(false);
+    }
+    // Every seeded key is either shared on purpose or matches the host-state pattern / a known local-only prefix.
+    for (const key of Object.keys(DEFAULT_SETTINGS)) if (isPushableKey(key)) expect(key, key).not.toMatch(HOST_STATE);
+  });
+
+  it('validates incoming values against each key\'s schema and strips per-host fields on export', () => {
+    expect(validateIncoming('security.policy.session_timeout_minutes', 'abc')).toMatchObject({ ok: false, reason: expect.stringMatching(/number/i) });
+    expect(validateIncoming('tweak.max_emails_per_hour', {})).toMatchObject({ ok: false });
+    expect(validateIncoming('service_config.apache', [])).toMatchObject({ ok: false });
+    expect(validateIncoming('service_config.apache', { timeout: 10, mpm: { module: 'event' }, unknownField: 1 })).toMatchObject({ ok: false, reason: expect.stringMatching(/unknownField|Unrecognized/i) });
+    expect(validateIncoming('service_config.apache', { timeout: 10, mpm: { module: 'event' } })).toEqual({ ok: true, value: { timeout: 10, mpm: { module: 'event' } } });
+    expect(validateIncoming('basic.home_root', '/home/../etc')).toMatchObject({ ok: false });
+    expect(validateIncoming('basic.home_root', 'home')).toMatchObject({ ok: false });
+    expect(validateIncoming('basic.home_root', '/srv/www')).toEqual({ ok: true, value: '/srv/www' });
+    expect(validateIncoming('backup.schedule', '0 2 * * *')).toEqual({ ok: true, value: '0 2 * * *' });
+    expect(validateIncoming('backup.schedule', 'rm -rf /')).toMatchObject({ ok: false });
+    expect(validateIncoming('backup.excludes', ['../../etc'])).toMatchObject({ ok: false });
+    expect(validateIncoming('dns.dkim_bits', 1536)).toMatchObject({ ok: false });
+    expect(validateIncoming('dns.spf_default', 'v=spf1 +mx -all')).toMatchObject({ ok: true });
+    expect(validateIncoming('dns.spf_default', 'v=spf1\ninclude:x')).toMatchObject({ ok: false });
+    expect(validateIncoming('dns.bogus_new_key', 1)).toMatchObject({ ok: false, reason: 'not a shared setting' });
+    // Exim's TLS block and Dovecot's cipher/mailbox-layout fields are per host: dropped on export, refused on receive.
+    const exim = exportValue('service_config.exim', { rblEnabled: true, rbls: ['zen.spamhaus.org'], tls: { minProtocol: 'TLSv1.2' } });
+    expect(exim).toEqual({ ok: true, value: { rblEnabled: true, rbls: ['zen.spamhaus.org'] } });
+    expect(validateIncoming('service_config.exim', { rblEnabled: true, tls: null })).toMatchObject({ ok: false });
+    expect(exportValue('service_config.mailserver', { protocols: ['imap'], sslCipherList: 'X', mailLocation: 'maildir:~/mail', mailboxFormat: 'maildir' })).toEqual({ ok: true, value: { protocols: ['imap'] } });
+    expect(exportValue('service_config.apache', { timeout: 1, defaultPhpVersion: 'ea-php83' })).toEqual({ ok: true, value: { timeout: 1 } });
+    expect(exportValue('tweak.max_emails_per_hour', 'oops')).toEqual({ ok: false });
+  });
+
+  // A feed URL may carry basic-auth credentials (Software sends them as a
+  // header); they are a secret of the host that holds them.
+  it('never lets a URL with embedded credentials travel in either direction', () => {
+    for (const key of ['software.update_url', 'mail.country_filter.source_url']) {
+      expect(validateIncoming(key, 'https://example.com/feed.json')).toEqual({ ok: true, value: 'https://example.com/feed.json' });
+      expect(validateIncoming(key, '')).toEqual({ ok: true, value: '' });
+      expect(validateIncoming(key, 'https://u:p@example.com/feed.json')).toMatchObject({ ok: false, reason: expect.stringMatching(/credentials/i) });
+      expect(validateIncoming(key, 'https://token@example.com/feed.json')).toMatchObject({ ok: false });
+      expect(validateIncoming(key, 'ftp://example.com/x')).toMatchObject({ ok: false });
+      expect(exportValue(key, 'https://u:p@example.com/feed.json')).toEqual({ ok: false });
+      expect(exportValue(key, 'https://example.com/feed.json')).toEqual({ ok: true, value: 'https://example.com/feed.json' });
+    }
   });
 });
 
@@ -192,6 +247,51 @@ describe('Clusters API', () => {
       const row = app.ctx.db.prepare('SELECT scopes, token_hash FROM api_tokens WHERE id = ?').get(tokenId);
       expect(JSON.parse(row.scopes)).toEqual(['clustering']);
       expect(row.token_hash).toBe(app.ctx.crypto.hashToken(secret));
+      expect(res.body.data).toMatchObject({ access: 'confined', scopes: ['clustering'], allowed: TOKEN_ALLOWED });
+      expect(list.body.data[0]).not.toHaveProperty('accessNote');
+      expect(JSON.parse(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'clusters.token.create'").get().args_redacted)).toMatchObject({ access: 'confined' });
+    });
+
+    // The token belongs to root, yet core confines it to the peer endpoints
+    // everywhere: a compromised peer gets no further than pushing to them.
+    it('confines a cluster token to the peer endpoints on every API, not only this module', async () => {
+      expect(app.ctx.confinedScopes.get('clustering')).toBe(CLUSTER_TOKEN_ROUTES);
+      const as = (method, path, body) => request(app.ctx.app)[method](path).set('Authorization', `Bearer ${secret}`).send(body);
+      for (const p of ['/peers', '/tokens', '/events', '/dns', '/config']) {
+        const r = await asPeer('get', p).expect(403);
+        expect(r.body.error.code).toBe('scope_confined');
+        expect(r.body.error.message).toMatch(/confined to GET \/api\/clusters\/ping/);
+      }
+      await asPeer('post', '/config/push', {}).expect(403);
+      await asPeer('post', '/tokens', { name: 'escalate' }).expect(403);
+      for (const p of ['/api/system/status', '/api/accounts', '/api/auth/me', '/api/packages', '/api/dns/zones', '/api/security/hulk/settings', '/api/clusters/config/export/']) {
+        const r = await as('get', p).expect(403);
+        expect(r.body.error.code).toBe('scope_confined');
+      }
+      await as('post', '/api/accounts', { username: 'pwned', domain: 'pwned.example.com', password: 'Pwned-Passw0rd!1' }).expect(403);
+      await as('post', '/api/auth/password', { newPassword: 'Changed-Passw0rd!1' }).expect(403);
+      await as('delete', '/api/clusters/config/export').expect(403);
+      await as('post', '/api/clusters/ping').expect(403);
+      expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM users WHERE username = ?').get('pwned').n).toBe(0);
+      for (const { method, path } of CLUSTER_TOKEN_ROUTES) {
+        const r = await as(method.toLowerCase(), path, method === 'POST' ? {} : undefined);
+        expect(r.status, `${method} ${path}`).not.toBe(403);
+        expect(r.status, `${method} ${path}`).not.toBe(401);
+      }
+      // An unscoped root token is not confined, and a token mixing in a scope
+      // the registry does not know keeps the per-route requireScope() rules.
+      const plain = `whm_${app.ctx.crypto.randomToken(32)}`;
+      const insert = app.ctx.db.prepare("INSERT INTO api_tokens (user_id, name, token_hash, scopes, prefix) VALUES ((SELECT id FROM users WHERE username = 'root'), ?, ?, ?, ?)");
+      insert.run('plain', app.ctx.crypto.hashToken(plain), '[]', plain.slice(0, 12));
+      await request(app.ctx.app).get('/api/system/status').set('Authorization', `Bearer ${plain}`).expect(200);
+      await request(app.ctx.app).get('/api/clusters/ping').set('Authorization', `Bearer ${plain}`).expect(200);
+      await request(app.ctx.app).get('/api/clusters/peers').set('Authorization', `Bearer ${plain}`).expect(200);
+      const mixed = `whm_${app.ctx.crypto.randomToken(32)}`;
+      insert.run('mixed', app.ctx.crypto.hashToken(mixed), JSON.stringify(['clustering', 'development:read']), mixed.slice(0, 12));
+      await request(app.ctx.app).get('/api/clusters/ping').set('Authorization', `Bearer ${mixed}`).expect(200);
+      await request(app.ctx.app).get('/api/clusters/peers').set('Authorization', `Bearer ${mixed}`).expect(403);
+      app.ctx.db.prepare("DELETE FROM api_tokens WHERE name IN ('plain', 'mixed')").run();
+      expect((await get('/tokens').expect(200)).body.data).toHaveLength(1);
     });
 
     it('answers ping and export to a peer holding the token, without CSRF', async () => {
@@ -207,7 +307,9 @@ describe('Clusters API', () => {
 
     it('receives a configuration push, applying only pushable keys', async () => {
       const res = await asPeer('post', '/config/receive', { source: 'ns1.example.com', settings: { 'dns.default_ttl': 3600, 'tweak.max_emails_per_hour': 250, 'basic.hostname': 'evil.example.com', 'contacts.smtp.password': 'x', 'news.html': '<b>hi</b>', 'dns.soa_retry': 1800 } }).expect(200);
-      expect(res.body.data).toMatchObject({ applied: ['dns.default_ttl', 'tweak.max_emails_per_hour'], rejected: ['basic.hostname', 'contacts.smtp.password', 'news.html'], unchanged: 1 });
+      expect(res.body.data).toMatchObject({ applied: ['dns.default_ttl', 'tweak.max_emails_per_hour'], failed: [], rejected: ['basic.hostname', 'contacts.smtp.password', 'news.html'], unchanged: 1 });
+      expect(res.body.data.rejections).toEqual({ 'basic.hostname': 'not a shared setting', 'contacts.smtp.password': 'not a shared setting', 'news.html': 'not a shared setting' });
+      expect(res.body.data.results['dns.default_ttl']).toMatchObject({ status: 'applied', stored: true, via: null });
       expect(app.ctx.settings.get('dns.default_ttl')).toBe(3600);
       expect(app.ctx.settings.get('basic.hostname')).not.toBe('evil.example.com');
       expect(auditCount('clusters.config.receive')).toBe(1);
@@ -216,6 +318,101 @@ describe('Clusters API', () => {
       await put('/config/settings', { acceptPushes: false }).expect(200);
       await asPeer('post', '/config/receive', { settings: { 'dns.default_ttl': 1 } }).expect(403);
       await put('/config/settings', { acceptPushes: true }).expect(200);
+    });
+
+    it('refuses wrong-typed values, unknown keys under a shared prefix and host-state keys', async () => {
+      const before = { timeout: app.ctx.settings.get('security.policy.session_timeout_minutes'), ports: app.ctx.settings.get('service_config.apache_ports'), outbound: app.ctx.settings.get('mail.outbound.ipv4'), home: app.ctx.settings.get('basic.home_root') };
+      const res = await asPeer('post', '/config/receive', { settings: {
+        'security.policy.session_timeout_minutes': 'abc', 'service_config.apache_ports': { http: 80, https: 443, bind: '10.9.9.9' }, 'tweak.max_emails_per_hour': {}, 'dns.bogus_new_key': 1, 'dns.default_ttl': 3600,
+        'mail.outbound.ipv4': '10.9.9.9', 'basic.main_ipv6': '2001:db8::1', 'basic.home_root': '/home/../etc', 'backup.local_dir': '/tmp/x', 'service_config.nameserver': { server: 'powerdns', role: 'master' }, 'service_config.ftp_server': 'vsftpd', 'service_config.apache_updated_at': '2020-01-01', 'backup.schedule': 'rm -rf /',
+      } }).expect(200);
+      expect(res.body.data.applied).toEqual([]);
+      expect(res.body.data.unchanged).toBe(1);
+      expect(res.body.data.rejected.sort()).toEqual(['backup.local_dir', 'backup.schedule', 'basic.home_root', 'basic.main_ipv6', 'dns.bogus_new_key', 'mail.outbound.ipv4', 'security.policy.session_timeout_minutes', 'service_config.apache_ports', 'service_config.apache_updated_at', 'service_config.ftp_server', 'service_config.nameserver', 'tweak.max_emails_per_hour']);
+      expect(res.body.data.rejections['security.policy.session_timeout_minutes']).toMatch(/number/i);
+      expect(res.body.data.rejections['dns.bogus_new_key']).toBe('not a shared setting');
+      expect(res.body.data.rejections['basic.home_root']).toMatch(/absolute|\.\./i);
+      expect(app.ctx.settings.get('security.policy.session_timeout_minutes')).toBe(before.timeout);
+      expect(app.ctx.settings.get('service_config.apache_ports')).toEqual(before.ports);
+      expect(app.ctx.settings.get('mail.outbound.ipv4')).toBe(before.outbound);
+      expect(app.ctx.settings.get('basic.home_root')).toBe(before.home);
+      expect(app.ctx.settings.get('dns.bogus_new_key')).toBeUndefined();
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM settings WHERE key = 'dns.bogus_new_key'").get().n).toBe(0);
+      // Pushing an unknown field inside a shared object is refused as a whole, so the known fields are not half-applied.
+      const partial = await asPeer('post', '/config/receive', { settings: { 'service_config.apache': { timeout: 42, newDirective: 'x' } } }).expect(200);
+      expect(partial.body.data.rejected).toEqual(['service_config.apache']);
+      expect(app.ctx.settings.get('service_config.apache').timeout).toBe(300);
+    });
+
+    it('routes accepted keys through the owning services and reports what reached the host', async () => {
+      app.ctx.agent.reset();
+      app.ctx.agent.set('ssl.acme.detect', { certbot: false, acmeSh: null, providers: [], provider: null });
+      const res = await asPeer('post', '/config/receive', { source: 'ns1.example.com', settings: {
+        'service_config.apache': { timeout: 42, keepAlive: false, mpm: { module: 'event', minSpareThreads: 10, maxSpareThreads: 20 } },
+        'security.cphulk.lockout_minutes': 45, 'security.cphulk.max_failures_per_ip': 9,
+        'ssl.autossl.provider': 'certbot',
+        'php.default_version': 'ea-php74',
+        'backup.retention_daily': 9, 'backup.schedule': '15 3 * * *',
+        'system_health.bpk.signal': 'SIGTERM',
+        'contacts.check.ssl_days': 21,
+      } }).expect(200);
+      const { results } = res.body.data;
+      // Apache is not installed on the mock host: the owner saved the value and reported the missing daemon.
+      expect(results['service_config.apache']).toMatchObject({ status: 'stored', stored: true, via: 'apache', note: expect.stringMatching(/Apache is not installed/) });
+      expect(app.ctx.settings.get('service_config.apache')).toMatchObject({ timeout: 42, keepAlive: false, serverTokens: 'Prod', mpm: expect.objectContaining({ module: 'event', minSpareThreads: 10, maxSpareThreads: 20, startServers: 2 }) });
+      expect(auditCount('apache.config.update')).toBe(1);
+      // Brute-force settings are read live from the database.
+      expect(results['security.cphulk.lockout_minutes']).toMatchObject({ status: 'applied', stored: true, via: 'cphulk' });
+      expect(app.ctx.security.cphulk.settings()).toMatchObject({ lockoutMinutes: 45, maxFailuresPerIp: 9 });
+      // AutoSSL refuses a provider that is not installed here and stores nothing.
+      expect(results['ssl.autossl.provider']).toMatchObject({ status: 'failed', stored: false, via: 'autossl', note: expect.stringMatching(/certbot/) });
+      expect(app.ctx.settings.get('ssl.autossl.provider')).toBe('disabled');
+      // A PHP version this host does not have is refused by Software.
+      expect(results['php.default_version']).toMatchObject({ status: 'failed', stored: false, via: 'phpDefault' });
+      expect(app.ctx.settings.get('php.default_version')).toBe('ea-php83');
+      // Backup rewrote its schedule row; system health and contacts stored their policy.
+      expect(results['backup.schedule']).toMatchObject({ status: 'applied', via: 'backup' });
+      expect(app.ctx.scheduler.list().find((x) => x.name === 'backup-run').cron).toBe('15 3 * * *');
+      expect(results['system_health.bpk.signal']).toMatchObject({ status: 'applied', via: 'bpk' });
+      expect(app.ctx.settings.get('system_health.bpk.signal')).toBe('SIGTERM');
+      expect(results['contacts.check.ssl_days']).toMatchObject({ status: 'applied', via: 'contacts' });
+      expect(res.body.data.failed.sort()).toEqual(['php.default_version', 'ssl.autossl.provider']);
+      expect(res.body.data.applied).toEqual(expect.arrayContaining(['service_config.apache', 'security.cphulk.lockout_minutes', 'backup.schedule']));
+      expect(res.body.data.applied).not.toContain('ssl.autossl.provider');
+      const ev = app.ctx.db.prepare("SELECT * FROM cluster_events WHERE kind = 'config.receive' ORDER BY id DESC").get();
+      expect(ev.status).toBe('failed');
+      expect(JSON.parse(ev.details_json).results['service_config.apache'].status).toBe('stored');
+      // The same push again changes nothing more.
+      const again = await asPeer('post', '/config/receive', { settings: { 'service_config.apache': { timeout: 42, keepAlive: false, mpm: { module: 'event', minSpareThreads: 10, maxSpareThreads: 20 } }, 'security.cphulk.lockout_minutes': 45 } }).expect(200);
+      expect(again.body.data).toMatchObject({ applied: [], unchanged: 2 });
+    });
+
+    it('serves no URL credentials to a peer and refuses to receive them', async () => {
+      const SECRET_URL = 'https://feeduser:feedpass@updates.example.com/feed.json';
+      const before = app.ctx.settings.get('software.update_url');
+      app.ctx.settings.set('software.update_url', SECRET_URL);
+      app.ctx.settings.set('mail.country_filter.source_url', SECRET_URL);
+      try {
+        const exported = await asPeer('get', '/config/export?groups=software,mail').expect(200);
+        expect(exported.body.data.settings).not.toHaveProperty('software.update_url');
+        expect(exported.body.data.settings).not.toHaveProperty('mail.country_filter.source_url');
+        expect(exported.body.data.settings['updates.tier']).toBeDefined();
+        expect(JSON.stringify(exported.body)).not.toContain('feedpass');
+        const received = await asPeer('post', '/config/receive', { source: 'ns1.example.com', settings: { 'software.update_url': 'https://other:pw@mirror.example.com/feed.json', 'mail.country_filter.source_url': 'https://x:y@h.example.com/' } }).expect(200);
+        expect(received.body.data.rejected.sort()).toEqual(['mail.country_filter.source_url', 'software.update_url']);
+        expect(received.body.data.rejections['software.update_url']).toMatch(/credentials/i);
+        expect(app.ctx.settings.get('software.update_url')).toBe(SECRET_URL);
+        expect(JSON.stringify(received.body)).not.toContain('other:pw');
+        // A plain URL is shared like any other setting.
+        app.ctx.settings.set('software.update_url', 'https://updates.example.com/feed.json');
+        expect((await asPeer('get', '/config/export?groups=software').expect(200)).body.data.settings['software.update_url']).toBe('https://updates.example.com/feed.json');
+        const rows = app.ctx.db.prepare('SELECT details_json, message FROM cluster_events').all();
+        expect(JSON.stringify(rows)).not.toMatch(/feedpass|other:pw|x:y@/);
+        expect(JSON.stringify(app.ctx.db.prepare('SELECT args_redacted FROM audit_log').all())).not.toMatch(/feedpass|other:pw|x:y@/);
+      } finally {
+        app.ctx.settings.set('software.update_url', before);
+        app.ctx.settings.set('mail.country_filter.source_url', '');
+      }
     });
 
     it('receives a DNS zone pushed by a master and logs it', async () => {
@@ -228,6 +425,22 @@ describe('Clusters API', () => {
       await put('/dns/settings', { acceptPushes: false }).expect(200);
       await asPeer('post', '/dns/receive', { domain: 'peerzone.net', body: ZONE('peerzone.net', 8) }).expect(403);
       await put('/dns/settings', { acceptPushes: true }).expect(200);
+    });
+
+    it('enforces "accept pushes" on the DNS module\'s import endpoint that peers actually use', async () => {
+      const importZone = (body) => request(app.ctx.app).post('/api/dns/zones/import').set('Authorization', `Bearer ${secret}`).send(body);
+      await put('/dns/settings', { acceptPushes: false }).expect(200);
+      const refused = await importZone({ domain: 'peerzone.net', body: ZONE('peerzone.net', 9), serial: 9 }).expect(403);
+      expect(refused.body.error.message).toMatch(/does not accept DNS pushes/);
+      expect((await app.ctx.dns.getZone('peerzone.net', { role: 'root' })).serial).toBe(7);
+      const ev = app.ctx.db.prepare("SELECT * FROM cluster_events WHERE kind = 'dns.receive' ORDER BY id DESC").get();
+      expect(ev).toMatchObject({ status: 'skipped', message: expect.stringMatching(/peerzone\.net: refused/) });
+      // A root session importing by hand is not a peer push.
+      await app.http.post('/api/dns/zones/import').set('X-CSRF-Token', csrf).send({ domain: 'peerzone.net', body: ZONE('peerzone.net', 9), serial: 9 }).expect(200);
+      await put('/dns/settings', { acceptPushes: true }).expect(200);
+      await importZone({ domain: 'peerzone.net', body: ZONE('peerzone.net', 10), serial: 10 }).expect(200);
+      expect((await app.ctx.dns.getZone('peerzone.net', { role: 'root' })).serial).toBeGreaterThanOrEqual(10);
+      expect(app.ctx.clusters.acceptsDnsPushes()).toBe(true);
     });
 
     it('revokes the token so the peer is locked out', async () => {
@@ -248,7 +461,7 @@ describe('Clusters API', () => {
       expect(app.ctx.scheduler.list().find((s) => s.name === 'dns-cluster-sync').enabled).toBe(0);
       expect(app.ctx.settings.get('dns.cluster_verify_tls')).toBe(false);
       await put('/dns/settings', { autoSync: true }).expect(200);
-      expect(auditCount('clusters.dns.settings')).toBe(4);
+      expect(auditCount('clusters.dns.settings')).toBe(6);
     });
 
     it('synchronises through the DNS module job and refuses standalone or disabled peers', async () => {
@@ -287,7 +500,10 @@ describe('Clusters API', () => {
     it('lists groups with key counts and saves the selection', async () => {
       const res = await get('/config').expect(200);
       expect(res.body.data.groups.map((g) => g.name)).toEqual(GROUP_NAMES);
-      expect(res.body.data.groups.find((g) => g.name === 'dns').keys).toBeGreaterThan(3);
+      const dnsGroup = res.body.data.groups.find((g) => g.name === 'dns');
+      expect(dnsGroup.keyCount).toBeGreaterThan(3);
+      expect(dnsGroup.keys).toContain('dns.default_ttl');
+      expect(dnsGroup.keys).not.toContain('dns.resolvers');
       expect(res.body.data).toMatchObject({ settings: { autoPush: false, acceptPushes: true }, schedule: { name: 'config-cluster-push', enabled: false } });
       expect(res.body.data.keyCount).toBeGreaterThan(0);
       const saved = await put('/config/settings', { groups: ['dns', 'tweak'], autoPush: true }).expect(200);
@@ -334,6 +550,8 @@ describe('Clusters API', () => {
       expect(app.ctx.settings.get('tweak.max_emails_per_hour')).toBe(0);
       const applied = await post('/config/pull', { clusterId: peerId, apply: true }).expect(200);
       expect(applied.body.data.applied).toBe(true);
+      expect(applied.body.data.results['tweak.max_emails_per_hour']).toMatchObject({ status: 'applied', stored: true });
+      expect(applied.body.data.rejections).toEqual({ 'basic.hostname': 'not a shared setting', 'contacts.smtp.password': 'not a shared setting' });
       expect(app.ctx.settings.get('tweak.max_emails_per_hour')).toBe(250);
       expect(app.ctx.settings.get('basic.hostname')).not.toBe('peer.example.com');
       expect(auditCount('clusters.config.pull')).toBe(1);
@@ -342,6 +560,36 @@ describe('Clusters API', () => {
       expect(rejected.body.error.code).toBe('peer_rejected');
       peer.state.token = PEER_TOKEN;
       await post('/config/pull', { clusterId: 9999 }).expect(404);
+    });
+
+    it('never pushes or previews a URL with embedded credentials', async () => {
+      const SECRET_URL = 'https://feeduser:feedpass@updates.example.com/feed.json';
+      const before = app.ctx.settings.get('software.update_url');
+      app.ctx.settings.set('software.update_url', SECRET_URL);
+      app.ctx.jobs.start();
+      try {
+        const job = await waitForJob(app.ctx, (await post('/config/push', { clusterIds: [peerId], groups: ['software'] }).expect(202)).body.data.job.id, 20000);
+        expect(job.status).toBe('done');
+        const sent = peer.received.at(-1);
+        expect(sent.url).toBe('/api/clusters/config/receive');
+        expect(sent.body.settings).not.toHaveProperty('software.update_url');
+        expect(sent.body.settings['updates.tier']).toBeDefined();
+        expect(JSON.stringify(sent.body)).not.toContain('feedpass');
+      } finally { app.ctx.jobs.stop(); app.ctx.settings.set('software.update_url', before); }
+      peer.state.exportSettings = { ...peer.state.exportSettings, 'software.update_url': 'https://other:pw@mirror.example.com/feed.json' };
+      try {
+        const preview = await post('/config/pull', { clusterId: peerId, groups: ['software'] }).expect(200);
+        expect(preview.body.data.rejected).toContain('software.update_url');
+        expect(preview.body.data.rejections['software.update_url']).toMatch(/credentials/i);
+        expect(preview.body.data.changes.map((c) => c.key)).not.toContain('software.update_url');
+        expect(JSON.stringify(preview.body)).not.toContain('other:pw');
+        const applied = await post('/config/pull', { clusterId: peerId, groups: ['software'], apply: true }).expect(200);
+        expect(JSON.stringify(applied.body)).not.toContain('other:pw');
+        expect(app.ctx.settings.get('software.update_url')).toBe(before);
+      } finally { delete peer.state.exportSettings['software.update_url']; }
+      const rows = app.ctx.db.prepare('SELECT details_json, message FROM cluster_events').all();
+      expect(JSON.stringify(rows)).not.toMatch(/feedpass|other:pw/);
+      expect(JSON.stringify(app.ctx.db.prepare('SELECT args_redacted FROM audit_log').all())).not.toMatch(/feedpass|other:pw/);
     });
 
     it('reports an unreachable peer on pull', async () => {

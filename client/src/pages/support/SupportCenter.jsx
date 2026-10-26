@@ -143,7 +143,7 @@ export function SupportCenter() {
                 )}
               </Card>
               <Card title="Support access" actions={<Link className="btn btn-sm" to="/support/grant-cpanel-support-access"><KeyRound size={14} /> Manage</Link>}>
-                <KeyValue items={[['Active grants', data.access.active.length], ['sshd', data.access.sshd ? <StatusPill status="installed">installed</StatusPill> : <StatusPill status="not-installed">not installed</StatusPill>]]} />
+                <KeyValue items={[['Active grants', data.access.active.length], ['Cleanup pending', data.access.cleanupPending?.length ? <StatusPill status="warning">{data.access.cleanupPending.length} (root key still on the host)</StatusPill> : 0], ['sshd', data.access.sshd ? <StatusPill status="installed">installed</StatusPill> : <StatusPill status="not-installed">not installed</StatusPill>]]} />
                 {data.access.active.length > 0 && <ul style={{ margin: '10px 0 0', paddingLeft: 18 }}>{data.access.active.map((g) => <li key={g.id}>{g.label} · until {formatDate(g.expiresAt)}{g.ssh ? ' · SSH' : ''}{g.apiToken ? ' · API' : ''}</li>)}</ul>}
               </Card>
               <Card title="Diagnostics" subtitle="A JSON bundle to attach to a ticket by hand: the system snapshot, capabilities, services, failed jobs, schedules, non-secret settings and recent audit entries.">

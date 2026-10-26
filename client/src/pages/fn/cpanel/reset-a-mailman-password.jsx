@@ -4,7 +4,7 @@ import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, CapabilityNotice, EmptyState, KeyValue } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
-import { Field, Select, PasswordInput, Toggle, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
+import { Field, TextInput, PasswordInput, Toggle, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 
@@ -55,7 +55,7 @@ export default function ResetMailmanPassword({ fn }) {
       {error && !isCapabilityError(error) && <ErrorBanner error={error} onRetry={refetch} />}
       {data && (
         <>
-          <Card title="Mailing lists" subtitle={data.flavor === 'mailman3' ? 'Mailman 3: list administration is per user; per-list passwords do not exist' : 'Mailman 2 lists on this server (list_lists)'} padded={false}>
+          <Card title="Mailing lists" subtitle={data.flavor === 'mailman3' ? 'Mailman 3: list administration is per user; per-list passwords do not exist' : 'Every Mailman 2 list on this server, advertised or not (list_lists)'} padded={false}>
             <DataTable columns={columns} rows={lists} loading={loading} rowActions={rowActions} rowKey={(l) => l.name} emptyText="No mailing lists exist" />
             {lists.length === 0 && !loading && <div className="card-body"><EmptyState icon={Mails} title="No mailing lists"><p>Lists are created from a hosting account's cPanel (Mailing Lists) or with Mailman's <code>newlist</code> tool.</p></EmptyState></div>}
           </Card>
@@ -64,15 +64,16 @@ export default function ResetMailmanPassword({ fn }) {
               <p className="muted">Mailman 3 manages owners and moderators through Postorius or <code>mailman members</code>; there is no per-list administrator password to reset.</p>
             ) : (
               <form onSubmit={reset} className="form-narrow">
-                <Field label="Mailing list" required error={formError?.fields?.list}>
-                  <Select value={list} onChange={setList} options={lists.map((l) => ({ value: l.name, label: l.name }))} placeholder="Choose a list" />
+                <Field label="Mailing list" required help="Pick a list from the table or type its name" error={formError?.fields?.list}>
+                  <TextInput value={list} onChange={(v) => setList(v.trim().toLowerCase())} list="mailman-list-names" className="input mono" placeholder="announce" maxLength={64} autoComplete="off" />
+                  <datalist id="mailman-list-names">{lists.map((l) => <option key={l.name} value={l.name} />)}</datalist>
                 </Field>
                 <Field label="New administrator password" required help="At least 8 characters; must not start with a dash." error={formError?.fields?.password} htmlFor="mailman-password">
                   <PasswordInput id="mailman-password" value={password} onChange={setPassword} minStrength={50} />
                 </Field>
                 <ErrorBanner error={formError && !formError.fields ? formError : null} />
                 <CapabilityNotice error={formError} />
-                <FormActions><Button type="submit" variant="primary" loading={busy} disabled={!list || password.length < 8}>Reset password</Button></FormActions>
+                <FormActions><Button type="submit" variant="primary" loading={busy} disabled={!/^[a-z0-9][a-z0-9_.-]{0,63}$/.test(list) || password.length < 8}>Reset password</Button></FormActions>
               </form>
             )}
           </Card>

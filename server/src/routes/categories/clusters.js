@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { validate, z, fields } from '../../lib/validate.js';
 import { requireRoot, requireScope } from '../../middleware/rbac.js';
 import { forbidden } from '../../lib/errors.js';
-import { createClustersService, PEER_ROLES, GROUP_NAMES, EVENT_KINDS, PEER_HOST_RE, PUSH_JOB, PUSH_SCHEDULE, CLUSTER_SCOPE } from '../../services/clusters.js';
+import { createClustersService, PEER_ROLES, GROUP_NAMES, EVENT_KINDS, PEER_HOST_RE, PUSH_JOB, PUSH_SCHEDULE, CLUSTER_SCOPE, CLUSTER_TOKEN_ROUTES } from '../../services/clusters.js';
 
 const idParam = z.object({ id: fields.id });
 const nonEmpty = (schema) => schema.refine((b) => Object.keys(b).length > 0, { message: 'Nothing to change', path: ['_'] });
@@ -31,6 +31,8 @@ const configPull = z.object({ clusterId: fields.id, groups: groupList.min(1).opt
 export async function register(ctx) {
   ctx.clusters = createClustersService(ctx);
   const s = ctx.clusters;
+  // Core's requireAuth refuses a token carrying only this scope anywhere else.
+  (ctx.confinedScopes ??= new Map()).set(CLUSTER_SCOPE, CLUSTER_TOKEN_ROUTES);
   // Scheduled pushes honour the toggle; a manual push ({ manual }) always runs.
   ctx.jobs.register(PUSH_JOB, async (job) => {
     if (!job.params?.manual && !ctx.settings.get('clusters.config.auto_push', false)) { job.log('automatic configuration pushes are disabled; nothing pushed'); return { skipped: 'disabled' }; }
@@ -42,9 +44,8 @@ export async function register(ctx) {
   const r = Router();
   const wrap = (fn, status = 200) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(status).json(d?.meta ? d : { data: d })).catch(next);
   const peerScope = requireScope(CLUSTER_SCOPE);
-  // Within this router a cluster token reaches the peer endpoints only; the
-  // management routes are for sessions and unscoped root tokens. (Outside this
-  // router the token is not confined: see TOKEN_ACCESS_NOTE.)
+  // Core already confines the token before this router runs; this keeps the
+  // same boundary should a build ever mount the router without that registry.
   const isClusterToken = (req) => req.auth?.via === 'token' && Array.isArray(req.auth.scopes) && req.auth.scopes.length > 0 && !req.auth.scopes.includes('*') && req.auth.scopes.includes(CLUSTER_SCOPE);
   const peersOnly = (req, _res, next) => (isClusterToken(req) ? next(forbidden('A cluster token may only use the peer endpoints (ping, dns/receive, config/export, config/receive)')) : next());
   r.use((req, res, next) => (['/ping', '/dns/receive', '/config/export', '/config/receive'].includes(req.path) ? next() : peersOnly(req, res, next)));

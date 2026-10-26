@@ -1,8 +1,17 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import crypto from 'node:crypto';
 import request from 'supertest';
+import { catalog } from '@whm/agent';
 import { createTestApp, createMockAgent } from './support/app.js';
-import { generateSshKeyPair, parseOpenSshPrivateKey, sshFingerprint, indexSections, extractSection, utcStamp } from '../src/services/support.js';
+import { generateSshKeyPair, parseOpenSshPrivateKey, sshFingerprint, indexSections, extractSection, utcStamp, sshExpiryTime, authorizedKeyLine } from '../src/services/support.js';
+
+// Runs an op's real agent schema against the mock's arguments so a registration
+// overflow or a malformed key line fails here instead of only on a live host.
+const realSchema = (name, handler) => (args) => {
+  const parsed = catalog.get(name).schema.safeParse(args);
+  if (!parsed.success) throw Object.assign(new Error(`Invalid arguments for "${name}": ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`), { agentError: true, code: 'invalid_args', details: {} });
+  return handler(parsed.data);
+};
 
 describe('support helpers', () => {
   it('generates an ed25519 pair OpenSSH can read: the authorized_keys line matches the private key', () => {
@@ -32,6 +41,30 @@ describe('support helpers', () => {
     expect(extractSection(text, 'missing')).toBeNull();
     expect(utcStamp('2026-10-26T10:00:00.123Z')).toBe('2026-10-26T10:00:00Z');
   });
+
+  it('builds an authorized_keys line every sshd >= 7.7 expires by itself: host-local time, no UTC suffix', () => {
+    // Pre-9.1 daemons parse expiry-time as local time and drop a line carrying a 'Z'.
+    const tz = process.env.TZ;
+    try {
+      process.env.TZ = 'UTC';
+      expect(sshExpiryTime('2026-10-27T09:05:30.900Z')).toBe('20261027090530');
+      const line = authorizedKeyLine('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq5 whm-support-case-1', '2026-10-27T09:05:30Z');
+      expect(line).toBe('expiry-time="20261027090530" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq5 whm-support-case-1');
+      expect(catalog.get('sec.ssh_keys.add').schema.safeParse({ publicKey: line }).success).toBe(true);
+      expect(catalog.get('sec.ssh_keys.add').schema.safeParse({ publicKey: `${line}\ncommand="/bin/sh"` }).success).toBe(false);
+      process.env.TZ = 'Asia/Kolkata';
+      expect(sshExpiryTime('2026-10-27T09:05:30Z')).toBe('20261027143530');
+      process.env.TZ = 'America/Los_Angeles';
+      expect(sshExpiryTime('2026-01-01T03:00:00Z')).toBe('20251231190000');
+      expect(sshExpiryTime('2026-07-01T03:00:00Z')).toBe('20260630200000');
+    } finally {
+      if (tz === undefined) delete process.env.TZ; else process.env.TZ = tz;
+    }
+    const d = new Date('2026-10-27T09:05:30Z');
+    const p = (n) => String(n).padStart(2, '0');
+    expect(sshExpiryTime(d)).toBe(`${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`);
+    expect(sshExpiryTime(d)).not.toMatch(/Z$/);
+  });
 });
 
 describe('Support API', () => {
@@ -53,21 +86,24 @@ describe('Support API', () => {
   const auditRows = (action) => app.ctx.db.prepare('SELECT * FROM audit_log WHERE action = ? ORDER BY id').all(action);
   const refresh = () => app.ctx.capabilities.refresh();
   const host = () => app.ctx.settings.get('basic.hostname') || 'test.example.com';
+  // Mirrors the agent: an optional options token precedes the key type.
   const addKey = ({ publicKey }) => {
-    const blob = publicKey.split(' ')[1];
-    const fingerprint = sshFingerprint(Buffer.from(blob, 'base64'));
+    const tokens = publicKey.split(' ');
+    const i = tokens.findIndex((t) => t === 'ssh-ed25519');
+    expect(i).toBeGreaterThanOrEqual(0);
+    const fingerprint = sshFingerprint(Buffer.from(tokens[i + 1], 'base64'));
     if (authorized.includes(fingerprint)) throw Object.assign(new Error('exists'), { agentError: true, code: 'exists' });
     authorized.push(fingerprint);
-    return { fingerprint, type: 'ssh-ed25519', comment: publicKey.split(' ')[2] };
+    return { fingerprint, type: 'ssh-ed25519', comment: tokens[i + 2], options: i ? tokens.slice(0, i).join(' ') : null };
   };
   const removeKey = ({ fingerprint }) => { const n = authorized.length; authorized = authorized.filter((f) => f !== fingerprint); return { fingerprint, removed: n - authorized.length }; };
   const agentFail = (name, code, message) => app.agent.set(name, Object.assign(new Error(message), { agentError: true, code, details: {} }));
 
   beforeAll(async () => {
     const agent = createMockAgent({
-      'sys.binaries': ({ names }) => Object.fromEntries(names.map((n) => [n, (sshdInstalled && n === 'sshd') || (eximInstalled && n === 'exim4')])),
-      'sec.ssh_keys.add': addKey,
-      'sec.ssh_keys.remove': removeKey,
+      'sys.binaries': realSchema('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, (sshdInstalled && n === 'sshd') || (eximInstalled && n === 'exim4')]))),
+      'sec.ssh_keys.add': realSchema('sec.ssh_keys.add', addKey),
+      'sec.ssh_keys.remove': realSchema('sec.ssh_keys.remove', removeKey),
       'mail.sendmail': (args) => { if (sendmailFailure) throw sendmailFailure; sent.push(args); return { from: args.from, to: args.to, accepted: true, bytes: 10 }; },
     });
     app = await createTestApp({ agent });
@@ -89,7 +125,7 @@ describe('Support API', () => {
       expect(d.docs.map((x) => x.slug)).toEqual(['readme', 'blueprint']);
       expect(d.docs.every((x) => x.available && x.sections.length > 0)).toBe(true);
       expect(d.tickets).toMatchObject({ total: 0, open: [] });
-      expect(d.access).toMatchObject({ active: [], sshd: false });
+      expect(d.access).toMatchObject({ active: [], cleanupPending: [], sshd: false });
       expect(d.mail).toMatchObject({ transport: null, configured: false });
       expect(d.settings.email).toBe('');
     });
@@ -145,9 +181,18 @@ describe('Support API', () => {
       expect((await put('/api/support/settings', { email: '-r@example.com' })).status).toBe(422);
       expect((await put('/api/support/settings', { portalUrl: 'javascript:alert(1)' })).status).toBe(422);
       expect((await put('/api/support/settings', { bogus: 1 })).status).toBe(422);
-      const tooLong = await put('/api/support/settings', { access: { defaultHours: 500, maxHours: 100 } });
+      const before = (await get('/api/support/settings')).body.data;
+      const tooLong = await put('/api/support/settings', { email: 'changed@example.net', access: { defaultHours: 500, maxHours: 100 } });
       expect(tooLong.status).toBe(422);
       expect(tooLong.body.error.fields['access.defaultHours']).toBeDefined();
+      // A rejected update writes nothing, not even the keys that were valid on their own.
+      expect((await get('/api/support/settings')).body.data).toEqual(before);
+      expect(app.ctx.settings.get('support.email')).toBe('');
+      expect(Number(app.ctx.settings.get('support.access.default_hours'))).toBe(24);
+      expect(Number(app.ctx.settings.get('support.access.max_hours'))).toBe(168);
+      expect((await put('/api/support/settings', { access: { defaultHours: 200 } })).status).toBe(422);
+      expect((await put('/api/support/settings', { access: { maxHours: 12 } })).status).toBe(422);
+      expect(auditRows('support.settings.update')).toHaveLength(0);
       const res = await put('/api/support/settings', { email: 'support@example.net', providerName: 'Acme Support', portalUrl: 'https://help.example.net/', access: { defaultHours: 12, maxHours: 48 } });
       expect(res.status).toBe(200);
       expect(res.body.data).toMatchObject({ email: 'support@example.net', providerName: 'Acme Support', portalUrl: 'https://help.example.net/', access: { defaultHours: 12, maxHours: 48 } });
@@ -307,7 +352,18 @@ describe('Support API', () => {
       expect(grant.remainingSeconds).toBeGreaterThan(7000);
       expect(grant.remainingSeconds).toBeLessThanOrEqual(7200);
       expect(authorized).toEqual([d.ssh.fingerprint]);
-      expect(app.agent.callsTo('sec.ssh_keys.add').at(-1).args.publicKey).toBe(d.ssh.publicKey);
+      // The line on the host carries sshd's own deadline, so the key dies with the grant even if the panel does not.
+      expect(d.ssh.authorizedLine).toBe(`expiry-time="${sshExpiryTime(grant.expiresAt)}" ${d.ssh.publicKey}`);
+      // Host-local stamp without a UTC suffix: the form every OpenSSH >= 7.7 accepts; stored exactly as written.
+      expect(grant.ssh.expiry).toMatch(/^\d{14}$/);
+      expect(grant.ssh.expiry).toBe(sshExpiryTime(grant.expiresAt));
+      expect(d.ssh.expiry).toBe(grant.ssh.expiry);
+      expect(d.ssh.sshdMinVersion).toBe('7.7');
+      expect(d.ssh.expiryTimeZone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
+      expect(app.ctx.db.prepare('SELECT ssh_expiry FROM support_access_grants WHERE id = ?').get(grant.id).ssh_expiry).toBe(grant.ssh.expiry);
+      expect((await get('/api/support/access/status')).body.data).toMatchObject({ sshdMinVersion: '7.7', expiryTimeZone: d.ssh.expiryTimeZone });
+      expect(app.agent.callsTo('sec.ssh_keys.add').at(-1).args.publicKey).toBe(d.ssh.authorizedLine);
+      expect(catalog.get('sec.ssh_keys.add').schema.safeParse(app.agent.callsTo('sec.ssh_keys.add').at(-1).args).success).toBe(true);
 
       // The stored grant never carries the secrets, and the audit entry has the fingerprint but not the key.
       const stored = await get(`/api/support/access/${grant.id}`);
@@ -317,7 +373,7 @@ describe('Support API', () => {
       expect(audit).toHaveLength(2);
       expect(audit[1].target).toBe(`${grant.id}:case-1001`);
       expect(audit[1].args_redacted).not.toContain(tokenSecret);
-      expect(JSON.parse(audit[1].args_redacted)).toMatchObject({ hours: 2, ssh: true, api: true, apiCredentialId: grant.apiToken.id, fingerprint: d.ssh.fingerprint });
+      expect(JSON.parse(audit[1].args_redacted)).toMatchObject({ hours: 2, ssh: true, api: true, apiCredentialId: grant.apiToken.id, fingerprint: d.ssh.fingerprint, sshExpiry: grant.ssh.expiry });
 
       // The token works as root and expires with the grant.
       const tokenRow = app.ctx.db.prepare('SELECT * FROM api_tokens WHERE id = ?').get(grant.apiToken.id);
@@ -394,16 +450,55 @@ describe('Support API', () => {
       expect(app.ctx.scheduler.list().find((s) => s.name === 'support-access-expiry')).toMatchObject({ job_type: 'support.expire_access', cron: '*/5 * * * *' });
     });
 
-    it('surfaces a vanished sshd when ending a grant and still records the end', async () => {
+    it('keeps a grant live while the root key cannot be removed, retries it and ends it once the host is clean', async () => {
       const g = await post('/api/support/access', { label: 'lost-sshd', hours: 1 });
       expect(g.status).toBe(201);
-      agentFail('sec.ssh_keys.remove', 'capability_missing', 'sshd gone');
-      const res = await del(`/api/support/access/${g.body.data.grant.id}`);
-      app.agent.set('sec.ssh_keys.remove', removeKey);
+      const id = g.body.data.grant.id;
+      const fingerprint = g.body.data.ssh.fingerprint;
+      agentFail('sec.ssh_keys.remove', 'agent_unavailable', 'agent socket timed out');
+      const res = await del(`/api/support/access/${id}`);
       expect(res.status).toBe(200);
-      expect(res.body.data).toMatchObject({ status: 'revoked', cleanup: { ssh: { removed: 0, error: 'sshd gone', code: 'capability_missing' }, ok: false } });
+      expect(res.body.data).toMatchObject({ status: 'cleanup_pending', cleanupPending: true, pendingStatus: 'revoked', endedBy: 'root', cleanup: { ssh: { removed: 0, error: 'agent socket timed out', code: 'agent_unavailable' }, api: { expired: true }, ok: false, pending: 'revoked', attempts: 1 } });
+      expect(res.body.data.endedAt).toBeTruthy();
+      expect(authorized).toEqual([fingerprint]);
       expect(auditRows('support.access.revoke').at(-1).result).toBe('partial');
+      // Surfaced everywhere an admin looks, and still counted as live for other categories.
+      expect((await get('/api/support/access/status')).body.data.cleanupPending.map((x) => x.id)).toEqual([id]);
+      expect((await get('/api/support/center')).body.data.access).toMatchObject({ cleanupPending: [expect.objectContaining({ id })], active: [] });
+      expect((await get('/api/support/access?status=cleanup_pending')).body.meta.total).toBe(1);
+      expect(app.ctx.support.activeGrants().map((x) => x.id)).toEqual([id]);
+
+      // The scheduled run retries while the agent is still down and leaves the row pending; the token is not re-expired.
+      const tokenRow = () => app.ctx.db.prepare('SELECT expires_at FROM api_tokens WHERE id = ?').get(g.body.data.apiToken.id);
+      const tokenExpiry = tokenRow().expires_at;
+      agentFail('sec.ssh_keys.remove', 'capability_missing', 'sshd gone');
+      const retry = await app.ctx.support.access.expireDue({ log: () => {} });
+      expect(retry).toMatchObject({ expired: 0, pending: 1 });
+      expect(retry.grants[0]).toMatchObject({ id, status: 'cleanup_pending', cleanup: { ssh: { code: 'capability_missing' }, pending: 'revoked', attempts: 2 } });
+      expect(tokenRow().expires_at).toBe(tokenExpiry);
+      expect(authorized).toEqual([fingerprint]);
+      expect(auditRows('support.access.revoke').at(-1)).toMatchObject({ principal: 'scheduler', result: 'partial' });
+
+      // Once the agent answers again the key goes and the grant ends with the status that was asked for.
+      app.agent.set('sec.ssh_keys.remove', realSchema('sec.ssh_keys.remove', removeKey));
+      const run = await post('/api/support/access/expire-due');
+      expect(run.status).toBe(200);
+      expect(run.body.data).toMatchObject({ expired: 1, pending: 0 });
+      expect(run.body.data.grants[0]).toMatchObject({ id, status: 'revoked', cleanupPending: false, pendingStatus: null, endedBy: 'root', cleanup: { ssh: { removed: 1 }, api: { expired: true }, ok: true, attempts: 3 } });
+      expect(authorized).toEqual([]);
+      expect((await get('/api/support/access/status')).body.data.cleanupPending).toEqual([]);
+      expect(auditRows('support.access.revoke').at(-1).result).toBe('ok');
+      expect((await del(`/api/support/access/${id}`)).status).toBe(409);
+    });
+
+    it('ends a grant whose key was removed by hand even when the token service is the part that fails', async () => {
+      const g = await post('/api/support/access', { label: 'by-hand', hours: 1, apiToken: false });
+      expect(g.status).toBe(201);
       authorized = [];
+      const res = await del(`/api/support/access/${g.body.data.grant.id}`);
+      expect(res.status).toBe(200);
+      expect(res.body.data).toMatchObject({ status: 'revoked', cleanup: { ssh: { removed: 0 }, ok: true } });
+      expect(res.body.data.cleanup.api).toBeUndefined();
     });
   });
 });

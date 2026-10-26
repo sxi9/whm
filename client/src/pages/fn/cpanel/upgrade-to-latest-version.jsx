@@ -10,7 +10,7 @@ import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { renderMarkdown } from '../../plugins/PluginPage.jsx';
 
-function ReleaseKeys({ keys, onChanged }) {
+function ReleaseKeys({ keys, dir, readOnly, onChanged }) {
   const toast = useToast();
   const confirm = useConfirm();
   const [kid, setKid] = useState('');
@@ -28,21 +28,23 @@ function ReleaseKeys({ keys, onChanged }) {
     try { await api.delete(`/cpanel/upgrade/keys/${encodeURIComponent(k.kid)}`); toast.success('Key removed'); onChanged(); } catch (err) { toast.error(err); }
   };
   return (
-    <Card title="Trusted release-signing keys" subtitle="Ed25519 public keys (PEM) that may sign releases; the feed's signature covers the archive's SHA-256 digest">
-      {keys.length === 0 ? <p className="muted"><KeyRound size={16} /> No keys trusted: a release's signature cannot be checked, only its checksum.</p> : (
+    <Card title="Trusted release-signing keys" subtitle={`Ed25519 public keys (PEM) kept by the root agent${dir ? ` under ${dir}` : ''}; the feed's signature covers the archive's SHA-256 digest and is checked by the agent before anything is unpacked or run`}>
+      {keys.length === 0 ? <p className="muted"><KeyRound size={16} /> No keys trusted: a signed release can only be installed by confirming an unverified upgrade. Add the publisher's key first.</p> : (
         <div className="table-wrap">
           <table>
             <thead><tr><th>Key id</th><th>Fingerprint</th><th>Added</th><th /></tr></thead>
-            <tbody>{keys.map((k) => <tr key={k.kid}><td><code>{k.kid}</code> {!k.valid && <StatusPill status="failed">invalid</StatusPill>}</td><td className="mono small">{k.fingerprint || k.error}</td><td className="small">{formatDate(k.addedAt)}</td><td className="actions-col"><Button size="sm" variant="danger" onClick={() => remove(k)}>Remove</Button></td></tr>)}</tbody>
+            <tbody>{keys.map((k) => <tr key={k.kid}><td><code>{k.kid}</code> {!k.valid && <StatusPill status="failed">invalid</StatusPill>}</td><td className="mono small">{k.fingerprint || k.error}</td><td className="small">{formatDate(k.addedAt)}</td><td className="actions-col">{!readOnly && <Button size="sm" variant="danger" onClick={() => remove(k)}>Remove</Button>}</td></tr>)}</tbody>
           </table>
         </div>
       )}
+      {readOnly ? <p className="muted small">Keys are managed on the host (the agent runs with <code>WHM_RELEASE_KEYS_READONLY=1</code>): drop <code>&lt;kid&gt;.pub</code> files into {dir ? <code>{dir}</code> : 'the key directory'} as root.</p> : (
       <form onSubmit={add} className="form-narrow" style={{ marginTop: 12 }}>
         <Field label="Key id" help="Matches the feed's keyId, for example release-2026" error={error?.fields?.kid}><TextInput value={kid} onChange={setKid} className="input mono" maxLength={64} /></Field>
         <Field label="Public key (PEM)" error={error?.fields?.pem}><Textarea value={pem} onChange={setPem} rows={4} mono placeholder={'-----BEGIN PUBLIC KEY-----\n…\n-----END PUBLIC KEY-----'} /></Field>
         <ErrorBanner error={error && !error.fields ? error : null} />
         <FormActions><Button type="submit" variant="primary" loading={busy} disabled={!kid.trim() || !pem.includes('BEGIN PUBLIC KEY')}>Trust key</Button></FormActions>
       </form>
+      )}
     </Card>
   );
 }
@@ -88,7 +90,11 @@ export default function UpgradeToLatestVersion({ fn }) {
   if (error) return <><PageHeader fn={fn} /><ErrorBanner error={error} onRetry={refetch} /></>;
   if (!data) return null;
   const v = data.verification;
-  const verifiable = Boolean(v?.sha256 && (!v.signature || v.trustedKey));
+  // Mirrors the agent's rule: a published signature is always checked when any
+  // key is trusted and a mismatch is always refused; the toggle only covers a
+  // release with nothing to check against (no checksum, or a signature but no key).
+  const keyMissing = Boolean(v?.keyMissing);
+  const verifiable = Boolean(v && !v.unverifiable && !keyMissing);
   const last = data.last;
 
   return (
@@ -112,15 +118,18 @@ export default function UpgradeToLatestVersion({ fn }) {
           <KeyValue items={[
             ['Archive', data.latest.url ? <code key="a" className="small">{data.latest.url}</code> : <StatusPill key="a" status="failed">no download URL in the feed</StatusPill>],
             ['SHA-256', v?.sha256 ? <span key="s"><ShieldCheck size={14} /> published; verified before unpacking</span> : <StatusPill key="s" status="warning">not published</StatusPill>],
-            ['Signature', v?.signature ? (v.trustedKey ? <span key="g"><ShieldCheck size={14} /> published; verified with trusted key {v.keyId ? <code>{v.keyId}</code> : null}</span> : <StatusPill key="g" status="warning">published but no trusted key {v.keyId ? `"${v.keyId}"` : ''}</StatusPill>) : <span key="g" className="muted">not published</span>],
+            ['Signature', v?.signature ? (v.trustedKey ? <span key="g"><ShieldCheck size={14} /> published; the agent verifies it with trusted key {v.keyId ? <code>{v.keyId}</code> : null} before unpacking</span> : keyMissing ? <StatusPill key="g" status="failed">published with key {v.keyId ? `"${v.keyId}"` : ''} which is not trusted here; trust it below before upgrading</StatusPill> : <StatusPill key="g" status="warning">published but no trusted key is installed</StatusPill>) : v?.trustedKeys > 0 ? <StatusPill key="g" status="warning">not published although keys are trusted</StatusPill> : <span key="g" className="muted">not published</span>],
           ]} />
-          {!verifiable && (
+          {keyMissing && (
+            <div className="banner banner-error"><AlertTriangle size={18} /><div><strong>Signature cannot be accepted</strong><p>Trusted keys are installed but none is the one the feed names. A signature that does not verify is refused even with the override below; add the publisher's current key or remove the stale ones.</p></div></div>
+          )}
+          {!verifiable && !keyMissing && (
             <Field inline>
-              <Toggle checked={allowUnverified} onChange={setAllowUnverified} label="Install even though the release cannot be fully verified" description="Only do this for a feed you control. The download still has to come over HTTPS." />
+              <Toggle checked={allowUnverified} onChange={setAllowUnverified} label="Install even though the release cannot be verified" description={v?.sha256 ? 'There is nothing to check the signature against (no trusted key, or no signature although keys are trusted). Only do this for a feed you control.' : 'The feed publishes no checksum. Only do this for a feed you control; the download still has to come over HTTPS.'} />
             </Field>
           )}
           <div className="action-row">
-            <Button variant="danger" icon={ArrowUpCircle} loading={starting} disabled={!data.canRun || !data.latest.url || Boolean(activeJobId) || (!verifiable && !allowUnverified)} onClick={start}>Download and upgrade</Button>
+            <Button variant="danger" icon={ArrowUpCircle} loading={starting} disabled={!data.canRun || !data.latest.url || Boolean(activeJobId) || keyMissing || (!verifiable && !allowUnverified)} onClick={start}>Download and upgrade</Button>
           </div>
           <ErrorBanner error={startError} />
         </Card>
@@ -134,16 +143,18 @@ export default function UpgradeToLatestVersion({ fn }) {
 
       {last && (
         <Card title="Last upgrade" actions={<StatusPill status={last.status === 'succeeded' ? 'ok' : last.status === 'failed' ? 'failed' : last.status === 'running' ? 'running' : 'unknown'}>{last.status}</StatusPill>}>
-          <KeyValue items={[['Version', `${last.fromVersion} → ${last.version}`], ['Started', `${formatDate(last.startedAt)}${last.by ? ` by ${last.by}` : ''}`], last.finishedAt && ['Finished', formatDate(last.finishedAt)], ['Unit', <code key="u">{last.unit}</code>], ['Log file', <code key="f" className="small">{last.logFile}</code>]]} />
+          <KeyValue items={[['Version', `${last.fromVersion} → ${last.version}`], ['Started', `${formatDate(last.startedAt)}${last.by ? ` by ${last.by}` : ''}`], last.finishedAt && ['Finished', formatDate(last.finishedAt)], last.exitStatus != null && ['Installer exit status', String(last.exitStatus)], last.signer && ['Signed by', <code key="s">{last.signer}</code>], ['Unit', <code key="u">{last.unit}</code>], ['Log file', <code key="f" className="small">{last.logFile}</code>]]} />
+          {last.status === 'unknown' && <p className="muted small">The installer unit went away without reporting a result. Reload after the panel restarts: once the running version matches, the upgrade is recorded as succeeded.</p>}
           {last.log && <pre className="log">{last.log}</pre>}
         </Card>
       )}
 
-      <ReleaseKeys keys={data.releaseKeys} onChanged={refetch} />
+      {data.releaseKeysError && <ErrorBanner error={{ message: `Trusted keys could not be read from the agent: ${data.releaseKeysError}` }} />}
+      <ReleaseKeys keys={data.releaseKeys} dir={data.releaseKeyDir} readOnly={data.releaseKeysReadOnly} onChanged={refetch} />
 
       <Card title="Manual upgrade" subtitle="What the automatic path does, for servers where it is not available">
         <ol>{data.instructions.map((s) => <li key={s}><code>{s}</code></li>)}</ol>
-        <p className="muted small">The feed is a JSON document with <code>version</code>, <code>url</code> (https), <code>sha256</code>, optional <code>signature</code> (base64 Ed25519 over the raw SHA-256 digest), <code>keyId</code>, <code>notes</code> and <code>publishedAt</code>, either at the top level or under <code>tiers.&lt;tier&gt;</code>.</p>
+        <p className="muted small">The feed is a JSON document with <code>version</code>, <code>url</code> (https), <code>sha256</code>, optional <code>signature</code> (base64 Ed25519 over the raw SHA-256 digest), <code>keyId</code>, <code>notes</code> and <code>publishedAt</code>, either at the top level or under <code>tiers.&lt;tier&gt;</code>. The panel downloads the archive; the root agent copies it into its own staging area, re-checks the checksum and signature there, unpacks it and runs the installer from that copy only.</p>
       </Card>
     </>
   );

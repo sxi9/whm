@@ -16,7 +16,8 @@ function pluginsAgent(state) {
     'sec.netdev.read': () => ({ ts: Date.now(), interfaces: [{ iface: 'lo', rxBytes: 1, txBytes: 1 }, { iface: 'eth0', rxBytes: state.rx += 6000, txBytes: 500, rxPackets: 1, txPackets: 1 }] }),
     'sec.imunify.detect': () => ({ installed: false, version: null }),
     'sec.clamav.detect': () => (state.clamav ? { installed: true, version: '1.0.5', signatures: 27000, databaseAgeSec: 3600, freshclam: true } : { installed: false }),
-    'sec.clamav.scan': ({ usernames }) => ({ targets: usernames.map((u) => `/home/${u}`), infected: usernames[0] === 'bob' ? [{ file: '/home/bob/public_html/evil.php', signature: 'Php.Trojan.Agent-1' }] : [], errors: [], exitCode: 0 }),
+    'sec.clamav.targets': ({ username }) => ({ username, home: `/home/${username}`, chunks: [{ label: 'public_html/', paths: [`/home/${username}/public_html`] }, { label: '(files)', paths: [`/home/${username}/.bashrc`] }] }),
+    'sec.clamav.scan': ({ usernames = [], paths = [] }) => ({ targets: [...usernames.map((u) => `/home/${u}`), ...paths], infected: paths[0] === '/home/bob/public_html' ? [{ file: '/home/bob/public_html/evil.php', signature: 'Php.Trojan.Agent-1' }] : [], errors: [], exitCode: 0 }),
     'web.wp.detect': () => { if (state.wp) return { installed: true, version: '2.10.0' }; throw Object.assign(new Error('WP-CLI (wp) is not installed on this server'), { agentError: true, code: 'capability_missing', details: {} }); },
     'web.wp.discover': ({ usernames }) => ({ installs: usernames.filter((u) => u === 'alice').map((u) => ({ username: u, home: `/home/${u}`, path: `/home/${u}/public_html`, relative: 'public_html', version: '6.5.2', dbName: 'alice_wp', tablePrefix: 'wp_' })), missing: [] }),
     'web.wp.inspect': ({ username, path: p }) => ({ username, path: p, version: '6.5.2', siteUrl: 'https://alice.com', coreUpdates: [], plugins: [], themes: [], maintenance: false, admins: [], errors: {} }),
@@ -76,7 +77,9 @@ describe('Plugins category: bundled ImunifyAV, Server Monitoring and WP Toolkit'
       expect(rows.map((r) => r.action)).toEqual(['kept', 'kept', 'kept'].map(() => 'installed'));
       const again = await app.ctx.bundledPlugins.ensureInstalled();
       expect(again.map((r) => r.action)).toEqual(['kept', 'kept', 'kept']);
-      expect(app.ctx.scheduler.listPrefix('plugin:').map((r) => r.name).sort()).toEqual([`plugin:${AV}:scheduled-scan`, `plugin:${MON}:sample`, `plugin:${WP}:discover`]);
+      // Server Monitoring samples on an in-process timer: no per-minute job schedule exists.
+      expect(app.ctx.scheduler.listPrefix('plugin:').map((r) => r.name).sort()).toEqual([`plugin:${AV}:scheduled-scan`, `plugin:${WP}:discover`]);
+      expect(app.ctx.scheduler.listPrefix(`plugin:${MON}:`)).toEqual([]);
       expect(audit('plugin.install')).toHaveLength(3);
       expect(audit('plugin.install')[0]).toMatchObject({ principal: 'system', role: 'root' });
     });
@@ -120,12 +123,43 @@ describe('Plugins category: bundled ImunifyAV, Server Monitoring and WP Toolkit'
       expect(app.ctx.bundledPlugins.record(AV).action).toBe('reinstalled');
     });
 
-    it('enable re-installs a plugin the operator uninstalled from Manage Plugins', async () => {
+    it('an operator uninstall is recorded and the boot installer leaves the host empty; enable puts it back', async () => {
+      const s = app.ctx.bundledPlugins;
       await app.http.delete(`/api/plugins/manage/${WP}`).set('X-CSRF-Token', csrf).expect(200);
-      expect((await get(`/api/bundled-plugins/${WP}`)).body.data).toMatchObject({ installed: false, state: 'not-installed' });
+      expect((await get(`/api/bundled-plugins/${WP}`)).body.data).toMatchObject({ installed: false, state: 'not-installed', bootAction: 'uninstalled' });
+      // the host event marked it; a second boot pass reports it and does not re-install
+      expect(s.record(WP).action).toBe('uninstalled');
+      let boot = await s.ensureInstalled();
+      expect(boot.find((r) => r.id === WP)).toEqual({ id: WP, action: 'uninstalled' });
+      expect(app.ctx.plugins.list().some((p) => p.id === WP)).toBe(false);
+      // the same holds when the uninstall happened while the panel was not listening (row still says "kept")
+      app.ctx.db.prepare("UPDATE bundled_plugins SET action = 'kept', installed_version = '1.0.0' WHERE id = ?").run(WP);
+      boot = await s.ensureInstalled();
+      expect(boot.find((r) => r.id === WP)).toMatchObject({ id: WP, action: 'uninstalled', version: '1.0.0' });
+      expect(s.record(WP)).toMatchObject({ action: 'uninstalled', installed_version: null });
+      expect(app.ctx.plugins.list().some((p) => p.id === WP)).toBe(false);
+      expect(audit('plugin.install').filter((r) => r.target === WP)).toHaveLength(1);
+      // the explicit enable is the only way back
       const on = await post(`/api/bundled-plugins/${WP}/enable`).expect(200);
-      expect(on.body.data).toMatchObject({ installed: true, state: 'enabled' });
+      expect(on.body.data).toMatchObject({ installed: true, state: 'enabled', bootAction: 'reinstalled' });
+      expect((await s.ensureInstalled()).find((r) => r.id === WP)).toMatchObject({ action: 'kept' });
     });
+
+    it('capability detection survives the extra binaries this category registers (real agent catalog)', async () => {
+      // The three capabilities push the probed name list past the 100-name
+      // sys.binaries limit; detection must still complete with the real op.
+      const real = await createTestApp({ overrides: { agent: undefined, bundledPlugins: false } });
+      try {
+        const snap = real.ctx.capabilities.snapshot();
+        expect(snap.at).toBeGreaterThan(0);
+        expect(Object.keys(snap.binaries).length).toBeGreaterThan(100);
+        for (const cap of ['imunifyav', 'clamav', 'wpcli']) expect(snap.capabilities[cap]).toMatchObject({ installed: false });
+        expect(snap.capabilities.clamav.binaries).toEqual({ clamscan: false });
+        expect(snap.capabilities.wpcli.binaries).toEqual({ wp: false });
+        expect(real.ctx.capabilities.has('systemd')).toBe(fs.existsSync('/usr/bin/systemctl') || fs.existsSync('/bin/systemctl'));
+        await expect(real.ctx.capabilities.refresh()).resolves.toMatchObject({ at: expect.any(Number) });
+      } finally { await real.close(); }
+    }, 30_000);
   });
 
   describe('Server Monitoring plugin through the host', () => {
@@ -168,8 +202,12 @@ describe('Plugins category: bundled ImunifyAV, Server Monitoring and WP Toolkit'
       expect(scan.body.data.scanner).toBe('clamav');
       const job = await waitForJob(app.ctx, Number(scan.body.data.jobId));
       expect(job.status).toBe('done');
-      expect(job.result).toMatchObject({ accounts: 2, infected: 1 });
-      expect(app.agent.callsTo('sec.clamav.scan').map((c) => c.args.usernames[0])).toEqual(['alice', 'bob']);
+      expect(job.result).toMatchObject({ accounts: 2, infected: 1, chunks: 4, chunksFailed: 0 });
+      expect(app.agent.callsTo('sec.clamav.targets').map((c) => c.args.username)).toEqual(['alice', 'bob']);
+      const scans = app.agent.callsTo('sec.clamav.scan').map((c) => c.args);
+      expect(scans.map((a) => a.paths[0])).toEqual(['/home/alice/public_html', '/home/alice/.bashrc', '/home/bob/public_html', '/home/bob/.bashrc']);
+      // every call is bounded below the split-mode socket timeout (1 h)
+      expect(scans.every((a) => a.maxDurationSec * 1000 < 3_600_000 && a.usernames === undefined)).toBe(true);
       const findings = await get(`/api/plugins/${AV}/findings`).expect(200);
       expect(findings.body.data).toHaveLength(1);
       expect(findings.body.data[0]).toMatchObject({ username: 'bob', signature: 'Php.Trojan.Agent-1' });

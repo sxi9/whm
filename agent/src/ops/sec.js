@@ -1478,16 +1478,68 @@ function homeOfUser(username) {
   return home;
 }
 
+// Every agent call crosses the panel socket in one request and the client
+// gives up after an hour (lib/agent-client.js), so one clamscan run is capped
+// well below that; callers split a large home into chunks (sec.clamav.targets)
+// and scan them one call at a time.
+export const CLAMAV_CALL_MAX_SEC = 3300;
+export const CLAMAV_CALL_DEFAULT_SEC = 2700;
+const CLAMAV_SKIP_ENTRIES = new Set(['.cache', '.wp-cli', 'tmp', '.trash']);
+
+// Splits a home directory into scan chunks: every directory down to `depth`
+// levels becomes its own chunk and the loose files of each level are grouped
+// into one, so no single clamscan call covers more than a slice of the tree.
+// Symbolic links are left out (clamscan follows a link named on the command
+// line) and the chunks keep the walk order so progress reads top to bottom.
+export function listScanChunks(home, { depth = 2, maxChunks = 200 } = {}) {
+  const chunks = [];
+  const overflow = [];
+  const split = (dir, level, label) => {
+    let names;
+    try { names = fs.readdirSync(dir).sort(); } catch { return; }
+    const files = [];
+    for (const name of names) {
+      if (level === 1 && CLAMAV_SKIP_ENTRIES.has(name)) continue;
+      const full = path.join(dir, name);
+      let st;
+      try { st = fs.lstatSync(full); } catch { continue; }
+      if (st.isSymbolicLink()) continue;
+      if (st.isDirectory()) {
+        if (level < depth) split(full, level + 1, `${label}${name}/`);
+        else if (chunks.length < maxChunks) chunks.push({ label: `${label}${name}/`, paths: [full] });
+        else overflow.push(full);
+      } else if (st.isFile()) files.push(full);
+    }
+    if (files.length) { if (chunks.length < maxChunks) chunks.push({ label: `${label}(files)`, paths: files }); else overflow.push(...files); }
+  };
+  split(home, 1, '');
+  if (overflow.length) chunks.push({ label: '(remaining)', paths: overflow });
+  return chunks;
+}
+
+defineOp('sec.clamav.targets', {
+  description: 'Split an account home directory into clamscan chunks that each fit one bounded sec.clamav.scan call',
+  schema: z.object({ username: arg.username, depth: z.number().int().min(1).max(3).default(2), maxChunks: z.number().int().min(1).max(500).default(200) }).strict(),
+  run: async ({ username, depth, maxChunks }, ctx) => {
+    const home = homeOfUser(username);
+    ctx.assertAllowedPath(home, 'read');
+    if (!exists(home)) return { username, home, chunks: [] };
+    const chunks = listScanChunks(home, { depth, maxChunks });
+    return { username, home, chunks, files: chunks.reduce((n, c) => n + c.paths.length, 0) };
+  },
+});
+
 defineOp('sec.clamav.scan', {
-  description: 'Scan account home directories (or explicit paths) with clamscan; reports infected files only',
-  timeoutMs: 6 * 3_600_000,
+  description: 'Scan account home directories (or explicit paths) with clamscan; reports infected files only. One call is capped at maxDurationSec (< the agent-client timeout); split big trees with sec.clamav.targets',
+  timeoutMs: CLAMAV_CALL_MAX_SEC * 1000,
   schema: z.object({
     usernames: z.array(arg.username).max(500).default([]),
-    paths: z.array(arg.absPath).max(200).default([]),
+    paths: z.array(arg.absPath).max(2000).default([]),
     maxFileMb: z.number().int().min(1).max(4000).default(25),
     recursive: z.boolean().default(true),
+    maxDurationSec: z.number().int().min(60).max(CLAMAV_CALL_MAX_SEC).default(CLAMAV_CALL_DEFAULT_SEC),
   }).strict().refine((v) => v.usernames.length + v.paths.length > 0, 'usernames or paths is required'),
-  run: async ({ usernames, paths, maxFileMb, recursive }, ctx) => {
+  run: async ({ usernames, paths, maxFileMb, recursive, maxDurationSec }, ctx) => {
     const targets = [];
     for (const p of paths) { ctx.assertAllowedPath(p, 'read'); if (exists(p)) targets.push(p); }
     for (const u of usernames) {
@@ -1500,7 +1552,13 @@ defineOp('sec.clamav.scan', {
     const argv = ['-i', '--no-summary', '--stdout', `--max-filesize=${maxFileMb}M`, `--max-scansize=${Math.max(maxFileMb * 4, 100)}M`, '--exclude-dir=^/home/[^/]+/\\.cache', '--exclude-dir=^/proc', '--exclude-dir=^/sys'];
     if (recursive) argv.unshift('-r');
     const started = Date.now();
-    const r = await exec('clamscan', [...argv, '--', ...targets], { allowFailure: true, timeoutMs: 6 * 3_600_000, maxBuffer: 64 * 1024 * 1024 });
+    let r;
+    try {
+      r = await exec('clamscan', [...argv, '--', ...targets], { allowFailure: true, timeoutMs: maxDurationSec * 1000, maxBuffer: 64 * 1024 * 1024 });
+    } catch (err) {
+      if (err.code === 'timeout') throw new OpError('timeout', `clamscan did not finish ${targets.length} target${targets.length === 1 ? '' : 's'} within ${maxDurationSec}s; scan a smaller chunk`, { targets, maxDurationSec });
+      throw err;
+    }
     const parsed = parseClamscanOutput(r.stdout);
     if (r.code === 2 && parsed.infected.length === 0 && !parsed.errors.length) throw new OpError('command_failed', `clamscan failed: ${r.stderr.trim().split('\n').pop() || 'no error output'}`, { targets });
     return { targets, ...parsed, exitCode: r.code, durationMs: Date.now() - started };

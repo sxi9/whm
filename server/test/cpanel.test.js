@@ -215,6 +215,24 @@ describe('Modify cPanel & WHM News', () => {
     expect((await get('/api/cpanel/news')).body.meta.total).toBe(2);
     expect(auditRows('news.delete')[0].target).toBe(String(rootOnly.id));
   });
+
+  it('keeps the stored window untouched by a toggle whatever the process time zone is', async () => {
+    const savedTz = process.env.TZ;
+    process.env.TZ = 'America/New_York';
+    try {
+      const created = (await post('/api/cpanel/news', { title: 'Window', startsAt: '2026-10-26T12:00:00Z', endsAt: '2026-10-27T12:00:00Z' }).expect(201)).body.data;
+      expect(created.startsAt).toBe('2026-10-26 12:00:00');
+      expect(created.endsAt).toBe('2026-10-27 12:00:00');
+      for (let i = 0; i < 3; i++) await put(`/api/cpanel/news/${created.id}`, { enabled: i % 2 === 0 }).expect(200);
+      const after = (await get(`/api/cpanel/news/${created.id}`).expect(200)).body.data;
+      expect(after).toMatchObject({ startsAt: '2026-10-26 12:00:00', endsAt: '2026-10-27 12:00:00', enabled: true });
+      const moved = (await put(`/api/cpanel/news/${created.id}`, { endsAt: '2026-10-28T00:30:00+02:00' }).expect(200)).body.data;
+      expect(moved).toMatchObject({ startsAt: '2026-10-26 12:00:00', endsAt: '2026-10-27 22:30:00' });
+      await del(`/api/cpanel/news/${created.id}`).expect(200);
+    } finally {
+      if (savedTz === undefined) delete process.env.TZ; else process.env.TZ = savedTz;
+    }
+  });
 });
 
 describe('Reset a Mailman Password', () => {
@@ -242,6 +260,21 @@ describe('Reset a Mailman Password', () => {
     expect(audit.target).toBe('announce');
     expect(JSON.stringify(auditRows('POST /api/cpanel/mailman/lists/:list/password').concat(audit))).not.toContain('Str0ng-list-pass');
     expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE args_redacted LIKE '%Str0ng-list-pass%'").get().n).toBe(0);
+  });
+
+  it('never echoes the password when the Mailman tool fails', async () => {
+    const argvLeak = (code) => Object.assign(new Error(`"change_pw" exited with status 1: Bad password Str0ng-list-pass`), { agentError: true, code, details: { bin: '/usr/lib/mailman/bin/change_pw', argv: ['--quiet', '--listname', 'announce', '--password', 'Str0ng-list-pass'], stderr: 'Bad password Str0ng-list-pass' } });
+    app.agent.set('cpanel.mailman.change_pw', argvLeak('command_failed'));
+    const res = await post('/api/cpanel/mailman/lists/announce/password', { password: 'Str0ng-list-pass' }).expect(500);
+    expect(res.body.error.code).toBe('command_failed');
+    expect(res.body.error.details ?? {}).toEqual({});
+    app.agent.set('cpanel.mailman.change_pw', argvLeak('timeout'));
+    const t = await post('/api/cpanel/mailman/lists/announce/password', { password: 'Str0ng-list-pass' }).expect(503);
+    expect(t.body.error.details ?? {}).toEqual({});
+    app.agent.set('cpanel.mailman.site_password', Object.assign(new Error('mmsitepass exited with status 2'), { agentError: true, code: 'command_failed', details: { argv: ['-c', 'Str0ng-site-pass'] } }));
+    const sp = await post('/api/cpanel/mailman/site-password', { password: 'Str0ng-site-pass', creator: true }).expect(500);
+    expect(JSON.stringify(sp.body)).not.toContain('Str0ng-site-pass');
+    expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE args_redacted LIKE '%Str0ng-%' OR result LIKE '%Str0ng-%'").get().n).toBe(0);
   });
 
   it('validates list names and passwords before the agent sees them', async () => {
@@ -274,7 +307,14 @@ describe('Upgrade to Latest Version', () => {
   const digest = crypto.createHash('sha256').update(archive).digest();
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
   const signature = crypto.sign(null, digest, privateKey).toString('base64');
+  const pem = publicKey.export({ type: 'spki', format: 'pem' });
   let feed;
+  // The agent owns the key store; the mock keeps it in memory with the same op contract.
+  const keyStore = new Map();
+  const keyEntry = (kid, p) => ({ kid, type: 'ed25519', fingerprint: crypto.createHash('sha256').update(crypto.createPublicKey(p).export({ type: 'spki', format: 'der' })).digest('hex').slice(0, 32), addedAt: '2026-10-26T00:00:00.000Z', valid: true, pem: p });
+  const agentFail = (code, message) => Object.assign(new Error(message), { agentError: true, code, details: {} });
+  const stagingDir = () => path.join(app.dir, 'agent-staging');
+  let extractImpl;
 
   beforeAll(() => {
     feed = { version: '9.9.9', url: 'https://dl.example/whm-9.9.9.tar.gz', sha256: digest.toString('hex'), signature, keyId: 'release-2026', notes: 'Big release', publishedAt: '2026-10-26' };
@@ -284,13 +324,43 @@ describe('Upgrade to Latest Version', () => {
       if (href === feed.url) return new Response(archive, { status: 200, headers: { 'content-length': String(archive.length) } });
       return new Response('nope', { status: 404 });
     };
+    app.agent.set('cpanel.upgrade.keys', () => ({ dir: '/etc/whm/release-keys', readOnly: false, keys: [...keyStore.values()] }));
+    app.agent.set('cpanel.upgrade.key_add', ({ kid, pem: p }) => {
+      if (keyStore.has(kid)) throw agentFail('exists', `A key named "${kid}" already exists`);
+      keyStore.set(kid, keyEntry(kid, p));
+      return keyStore.get(kid);
+    });
+    app.agent.set('cpanel.upgrade.key_remove', ({ kid }) => {
+      if (!keyStore.has(kid)) throw agentFail('not_found', `No trusted key named "${kid}"`);
+      keyStore.delete(kid);
+      return { kid, removed: true };
+    });
+    // Stand-in for the agent's own verification: hash the archive it is handed
+    // and check the signature against the (mock) key store.
+    extractImpl = ({ archive: a, version, sha256, signature: sig, keyId, allowUnverified }) => {
+      const actual = crypto.createHash('sha256').update(fs.readFileSync(a)).digest();
+      if (sha256 && actual.toString('hex') !== sha256) throw agentFail('checksum_mismatch', 'SHA-256 mismatch');
+      let signer = null;
+      if (sig) {
+        const candidates = [...keyStore.values()].filter((k) => !keyId || k.kid === keyId);
+        if (keyStore.size === 0) { if (!allowUnverified) throw agentFail('unverified', 'no trusted key'); }
+        else {
+          signer = candidates.find((k) => crypto.verify(null, actual, crypto.createPublicKey(k.pem), Buffer.from(sig, 'base64')))?.kid ?? null;
+          if (!signer) throw agentFail('invalid_signature', 'The release signature does not verify against any trusted key');
+        }
+      }
+      const stageDir = path.join(stagingDir(), `src-${version}`);
+      fs.mkdirSync(stageDir, { recursive: true });
+      return { version, stageDir, sourceDir: path.join(stageDir, `whm-${version}`), sha256: actual.toString('hex'), signer, signatureState: signer ? 'verified' : 'unsigned', name: 'whm', packageVersion: version, warnings: signer ? [] : ['No signature verified'] };
+    };
+    app.agent.set('cpanel.upgrade.extract', extractImpl);
     app.ctx.jobs.start();
   });
   afterAll(() => { globalThis.fetch = realFetch; });
 
   it('reports status (root only) and explains why a git checkout cannot self-upgrade', async () => {
     const res = await get('/api/cpanel/upgrade').expect(200);
-    expect(res.body.data).toMatchObject({ currentVersion: app.ctx.version, updateUrlConfigured: false, canRun: false, latest: null, releaseKeys: [], activeJob: null, last: null });
+    expect(res.body.data).toMatchObject({ currentVersion: app.ctx.version, updateUrlConfigured: false, canRun: false, latest: null, releaseKeys: [], releaseKeyDir: '/etc/whm/release-keys', releaseKeysReadOnly: false, activeJob: null, last: null });
     expect(res.body.data.reason).toMatch(/git/);
     expect(res.body.data.instructions.length).toBeGreaterThan(1);
     await reseller.get('/api/cpanel/upgrade').expect(403);
@@ -306,7 +376,7 @@ describe('Upgrade to Latest Version', () => {
     expect(res.body.data.updateUrl).toBe('https://feed.example/releases.json');
     expect(res.body.data.latest).toMatchObject({ version: '9.9.9', sha256: feed.sha256, keyId: 'release-2026' });
     expect(res.body.data.updateAvailable).toBe(true);
-    expect(res.body.data.verification).toEqual({ sha256: true, signature: true, keyId: 'release-2026', trustedKey: false });
+    expect(res.body.data.verification).toEqual({ sha256: true, signature: true, keyId: 'release-2026', trustedKeys: 0, trustedKey: false, unverifiable: true, keyMissing: false });
     expect(JSON.stringify(auditRows('upgrade.check')[0])).not.toContain('user:pw');
     feed = { ...feed, version: 'garbage' };
     const bad = await post('/api/cpanel/upgrade/check').expect(200);
@@ -316,73 +386,143 @@ describe('Upgrade to Latest Version', () => {
     await post('/api/cpanel/upgrade/check').expect(200);
   });
 
-  it('manages trusted release keys', async () => {
-    const pem = publicKey.export({ type: 'spki', format: 'pem' });
+  it('manages trusted release keys through the agent and never stores them itself', async () => {
     const added = (await post('/api/cpanel/upgrade/keys', { kid: 'release-2026', pem }).expect(201)).body.data;
     expect(added).toMatchObject({ kid: 'release-2026', type: 'ed25519', valid: true });
-    expect(fs.existsSync(path.join(app.dir, 'release-keys', 'release-2026.pub'))).toBe(true);
+    expect(added.pem).toBeUndefined();
+    expect(app.agent.callsTo('cpanel.upgrade.key_add')[0].args).toEqual({ kid: 'release-2026', pem });
+    expect(fs.existsSync(path.join(app.dir, 'release-keys'))).toBe(false);
     await post('/api/cpanel/upgrade/keys', { kid: 'release-2026', pem }).expect(409);
     await post('/api/cpanel/upgrade/keys', { kid: 'bad', pem: '-----BEGIN PUBLIC KEY-----\nnotakey\n-----END PUBLIC KEY-----' }).expect(422);
     const rsa = crypto.generateKeyPairSync('rsa', { modulusLength: 1024 }).publicKey.export({ type: 'spki', format: 'pem' });
     await post('/api/cpanel/upgrade/keys', { kid: 'rsa', pem: rsa }).expect(422);
     await post('/api/cpanel/upgrade/keys', { kid: '../etc', pem }).expect(422);
+    expect(app.agent.callsTo('cpanel.upgrade.key_add')).toHaveLength(2);
     await mutate(reseller, 'post', '/api/cpanel/upgrade/keys', { kid: 'x', pem }, resellerCsrf).expect(403);
-    expect((await get('/api/cpanel/upgrade/keys').expect(200)).body.data).toHaveLength(1);
-    expect((await get('/api/cpanel/upgrade').expect(200)).body.data.verification.trustedKey).toBe(true);
+    const listed = (await get('/api/cpanel/upgrade/keys').expect(200)).body.data;
+    expect(listed.keys).toHaveLength(1);
+    expect(listed.keys[0].pem).toBeUndefined();
+    const v = (await get('/api/cpanel/upgrade').expect(200)).body.data.verification;
+    expect(v).toMatchObject({ trustedKeys: 1, trustedKey: true, unverifiable: false, keyMissing: false });
     await post('/api/cpanel/upgrade/keys', { kid: 'spare', pem }).expect(201);
     await del('/api/cpanel/upgrade/keys/spare').expect(200);
     await del('/api/cpanel/upgrade/keys/spare').expect(404);
+    expect(auditRows('upgrade.key.remove')[0].target).toBe('spare');
+    app.agent.set('cpanel.upgrade.key_add', agentFail('refused', 'Release keys are managed on the host'));
+    await post('/api/cpanel/upgrade/keys', { kid: 'later', pem }).expect(422);
+    app.agent.set('cpanel.upgrade.key_add', ({ kid, pem: p }) => { keyStore.set(kid, keyEntry(kid, p)); return keyStore.get(kid); });
   });
 
-  it('downloads, verifies, unpacks and runs the installer as a job, following its log', async () => {
+  it('downloads, lets the agent verify and unpack, runs the installer as a job and follows its log', async () => {
     app.ctx.software.panel.installMethod = () => 'install-script';
     const logFiles = [];
-    app.agent.set('cpanel.upgrade.extract', ({ archive: a, destDir }) => {
-      expect(fs.readFileSync(a).equals(archive)).toBe(true);
-      expect(destDir).toBe(path.join(app.dir, 'upgrades', 'src-9.9.9'));
-      return { sourceDir: path.join(destDir, 'whm-9.9.9'), version: '9.9.9', name: 'whm' };
-    });
-    app.agent.set('cpanel.upgrade.run', ({ sourceDir, logFile, unit, appDir }) => {
-      expect(sourceDir).toBe(path.join(app.dir, 'upgrades', 'src-9.9.9', 'whm-9.9.9'));
-      expect(unit).toMatch(/^whm-upgrade-\d{14}$/);
-      expect(appDir).toBe(app.ctx.cpanel.repoRoot);
+    app.agent.set('cpanel.upgrade.run', (args) => {
+      expect(args).toEqual({ version: '9.9.9', unit: expect.stringMatching(/^whm-upgrade-\d{14}$/), skipNode: false });
+      const logFile = path.join(stagingDir(), `${args.unit}.log`);
       fs.writeFileSync(logFile, '==> Deploying application to /opt/whm\n==> WHM is running\n');
       logFiles.push(logFile);
-      return { unit: `${unit}.service`, logFile, detached: true };
+      return { unit: `${args.unit}.service`, logFile, detached: true, sourceDir: path.join(stagingDir(), 'src-9.9.9', 'whm-9.9.9'), appDir: '/opt/whm' };
     });
-    app.agent.set('svc.status', ({ unit }) => ({ unit, installed: false, active: false, state: 'inactive', result: null }));
+    app.agent.set('cpanel.upgrade.unit_status', ({ unit }) => ({ unit, installed: false, state: 'gone', result: null, exitStatus: null }));
     const res = await post('/api/cpanel/upgrade/start', {}).expect(202);
     expect(res.body.data.job.type).toBe('cpanel.upgrade');
     await post('/api/cpanel/upgrade/start', {}).expect(409);
     const job = await waitForJob(app.ctx, res.body.data.job.id, 20_000);
     expect(job.status, JSON.stringify(job)).toBe('done');
     expect(job.result).toMatchObject({ version: '9.9.9', logFile: logFiles[0] });
+    const extract = app.agent.callsTo('cpanel.upgrade.extract').at(-1).args;
+    expect(extract).toEqual({ archive: path.join(app.dir, 'upgrades', 'whm-9.9.9.tar.gz'), version: '9.9.9', sha256: feed.sha256, signature, keyId: 'release-2026', allowUnverified: false });
+    expect(fs.readFileSync(extract.archive).equals(archive)).toBe(true);
     const lines = job.logs.map((l) => l.line);
-    expect(lines.some((l) => /SHA-256 checksum verified/.test(l))).toBe(true);
-    expect(lines.some((l) => /Signature verified with trusted key "release-2026"/.test(l))).toBe(true);
+    expect(lines.some((l) => /SHA-256 checksum matches/.test(l))).toBe(true);
+    expect(lines.some((l) => /Signature matches trusted key "release-2026"/.test(l))).toBe(true);
+    expect(lines.some((l) => /Agent verified sha256 .* and signature \(key "release-2026"\)/.test(l))).toBe(true);
     expect(lines.some((l) => /WHM is running/.test(l))).toBe(true);
     const status = (await get('/api/cpanel/upgrade').expect(200)).body.data;
-    expect(status.last).toMatchObject({ version: '9.9.9', fromVersion: app.ctx.version, status: 'succeeded', by: 'root' });
+    expect(status.last).toMatchObject({ version: '9.9.9', fromVersion: app.ctx.version, status: 'succeeded', by: 'root', signer: 'release-2026' });
     expect(status.last.log).toContain('WHM is running');
     expect((await get('/api/cpanel/upgrade/log').expect(200)).body.data.log).toContain('Deploying');
     expect(auditRows('upgrade.start')[0].target).toBe('9.9.9');
   }, 30_000);
 
-  it('fails the job on a checksum mismatch or an untrusted signature and refuses unverifiable feeds', async () => {
+  it('fails the job when the installer unit fails or vanishes without a result', async () => {
+    app.agent.set('cpanel.upgrade.run', ({ unit }) => {
+      const logFile = path.join(stagingDir(), `${unit}.log`);
+      fs.writeFileSync(logFile, '==> Deploying application to /opt/whm\nerror: npm ci failed\n');
+      return { unit: `${unit}.service`, logFile, detached: true, sourceDir: path.join(stagingDir(), 'src-9.9.9', 'whm-9.9.9'), appDir: '/opt/whm' };
+    });
+    // Collected straight away: the unit is gone, the log says the installer died.
+    app.agent.set('cpanel.upgrade.unit_status', ({ unit }) => ({ unit, installed: false, state: 'gone', result: null, exitStatus: null }));
+    let res = await post('/api/cpanel/upgrade/start', {}).expect(202);
+    let job = await waitForJob(app.ctx, res.body.data.job.id, 20_000);
+    expect(job.status).toBe('failed');
+    expect(job.error_code).toBe('UPGRADE_FAILED');
+    expect((await get('/api/cpanel/upgrade').expect(200)).body.data.last.status).toBe('failed');
+
+    // Still loaded in the failed state with an exit status: failed, then reset once read.
+    app.agent.set('cpanel.upgrade.unit_status', ({ unit, resetFailed }) => ({ unit, installed: true, state: 'failed', result: 'exit-code', exitStatus: 1, reset: Boolean(resetFailed) }));
+    res = await post('/api/cpanel/upgrade/start', {}).expect(202);
+    job = await waitForJob(app.ctx, res.body.data.job.id, 20_000);
+    expect(job.status).toBe('failed');
+    expect(job.error_code).toBe('UPGRADE_FAILED');
+    expect(job.error).toMatch(/exit status 1/);
+    expect(app.agent.callsTo('cpanel.upgrade.unit_status').some((c) => c.args.resetFailed === true)).toBe(true);
+    expect((await get('/api/cpanel/upgrade').expect(200)).body.data.last).toMatchObject({ status: 'failed', exitStatus: 1 });
+
+    // Gone before any terminal line was written: never reported as a success.
+    app.agent.set('cpanel.upgrade.run', ({ unit }) => {
+      const logFile = path.join(stagingDir(), `${unit}.log`);
+      fs.writeFileSync(logFile, '==> Deploying application to /opt/whm\n');
+      return { unit: `${unit}.service`, logFile, detached: true, sourceDir: path.join(stagingDir(), 'src-9.9.9', 'whm-9.9.9'), appDir: '/opt/whm' };
+    });
+    app.agent.set('cpanel.upgrade.unit_status', ({ unit }) => ({ unit, installed: false, state: 'gone', result: null, exitStatus: null }));
+    res = await post('/api/cpanel/upgrade/start', {}).expect(202);
+    job = await waitForJob(app.ctx, res.body.data.job.id, 20_000);
+    expect(job.status).toBe('failed');
+    expect(job.error_code).toBe('UPGRADE_UNKNOWN');
+    expect((await get('/api/cpanel/upgrade').expect(200)).body.data.last.status).toBe('unknown');
+  }, 60_000);
+
+  it('fails on a checksum mismatch or a bad signature even with the override, and refuses unverifiable feeds', async () => {
     feed = { ...feed, sha256: 'b'.repeat(64) };
     await post('/api/cpanel/upgrade/check').expect(200);
+    const extractCalls = app.agent.callsTo('cpanel.upgrade.extract').length;
     let res = await post('/api/cpanel/upgrade/start', {}).expect(202);
     let job = await waitForJob(app.ctx, res.body.data.job.id, 20_000);
     expect(job.status).toBe('failed');
     expect(job.error_code).toBe('CHECKSUM_MISMATCH');
-    expect(app.agent.callsTo('cpanel.upgrade.extract')).toHaveLength(1);
+    expect(app.agent.callsTo('cpanel.upgrade.extract')).toHaveLength(extractCalls);
 
-    feed = { ...feed, sha256: digest.toString('hex'), signature: crypto.sign(null, digest, crypto.generateKeyPairSync('ed25519').privateKey).toString('base64') };
+    const forged = crypto.sign(null, digest, crypto.generateKeyPairSync('ed25519').privateKey).toString('base64');
+    feed = { ...feed, sha256: digest.toString('hex'), signature: forged };
     await post('/api/cpanel/upgrade/check').expect(200);
-    res = await post('/api/cpanel/upgrade/start', {}).expect(202);
+    for (const allowUnverified of [false, true]) {
+      res = await post('/api/cpanel/upgrade/start', { allowUnverified }).expect(202);
+      job = await waitForJob(app.ctx, res.body.data.job.id, 20_000);
+      expect(job.status, String(allowUnverified)).toBe('failed');
+      expect(job.error_code, String(allowUnverified)).toBe('SIGNATURE_INVALID');
+    }
+    // A feed naming a key that is not trusted here is flagged for the UI.
+    feed = { ...feed, signature, keyId: 'release-2027' };
+    expect((await post('/api/cpanel/upgrade/check').expect(200)).body.data.verification).toMatchObject({ trustedKey: false, keyMissing: true, unverifiable: false });
+
+    // The agent is the authority: if it rejects the signature the job fails even when the panel's early check passed.
+    feed = { ...feed, signature, keyId: 'release-2026' };
+    await post('/api/cpanel/upgrade/check').expect(200);
+    app.agent.set('cpanel.upgrade.extract', agentFail('invalid_signature', 'The release signature does not verify against any trusted key'));
+    res = await post('/api/cpanel/upgrade/start', { allowUnverified: true }).expect(202);
     job = await waitForJob(app.ctx, res.body.data.job.id, 20_000);
     expect(job.status).toBe('failed');
     expect(job.error_code).toBe('SIGNATURE_INVALID');
+    app.agent.set('cpanel.upgrade.extract', extractImpl);
+
+    // Keys trusted but the feed is unsigned: refused unless confirmed.
+    feed = { version: '9.9.9', url: feed.url, sha256: digest.toString('hex') };
+    await post('/api/cpanel/upgrade/check').expect(200);
+    expect((await get('/api/cpanel/upgrade').expect(200)).body.data.verification).toMatchObject({ signature: false, unverifiable: true });
+    res = await post('/api/cpanel/upgrade/start', {}).expect(202);
+    job = await waitForJob(app.ctx, res.body.data.job.id, 20_000);
+    expect(job.error_code).toBe('UNSIGNED');
 
     feed = { version: '9.9.9', url: feed.url };
     await post('/api/cpanel/upgrade/check').expect(200);
@@ -392,5 +532,5 @@ describe('Upgrade to Latest Version', () => {
     await post('/api/cpanel/upgrade/check').expect(200);
     await post('/api/cpanel/upgrade/start', {}).expect(409);
     await post('/api/cpanel/upgrade/start', { allowUnverified: 'yes' }).expect(422);
-  }, 30_000);
+  }, 60_000);
 });

@@ -15,7 +15,9 @@ const SCOPE_OPTIONS = [
   { value: 'development:read', label: 'Development API read-only (other areas still act as root)' },
   { value: 'development:write', label: 'Development API read/write (other areas still act as root)' },
 ];
-const GRANT_TONE = { active: 'active', expired: 'done', revoked: 'cancelled' };
+const GRANT_TONE = { active: 'active', cleanup_pending: 'warning', expired: 'done', revoked: 'cancelled' };
+const GRANT_LABEL = { cleanup_pending: 'cleanup pending' };
+const grantLabel = (status) => GRANT_LABEL[status] || status;
 
 export function GrantResult({ result, onClose }) {
   const g = result?.grant;
@@ -29,7 +31,7 @@ export function GrantResult({ result, onClose }) {
             <>
               <SecretBlock label="SSH private key (give to support)" value={result.ssh.privateKey} filename={`support-${g.label}.key`} help="Save as a file with mode 0600, then connect with the command below." />
               <SecretBlock label="Login command" value={result.ssh.command} mono />
-              <SecretBlock label="Public key (now in /root/.ssh/authorized_keys)" value={result.ssh.publicKey} />
+              <SecretBlock label={`Line in /root/.ssh/authorized_keys (sshd itself refuses the key after ${result.ssh.expiry || 'the deadline'}${result.ssh.expiryTimeZone ? `, host time zone ${result.ssh.expiryTimeZone}` : ', host local time'})`} value={result.ssh.authorizedLine || result.ssh.publicKey} help={`The expiry-time option needs OpenSSH ${result.ssh.sshdMinVersion || '7.7'} or newer; an older sshd ignores the whole line. The panel removes the key itself when the grant ends regardless.`} />
             </>
           )}
           {result.apiToken && (
@@ -68,7 +70,7 @@ export function GrantForm({ status, onGranted }) {
   };
 
   return (
-    <Card title="Grant access" subtitle="Creates a fresh SSH key authorized for root and an API token, both removed automatically when the time box ends.">
+    <Card title="Grant access" subtitle={`Creates a fresh SSH key authorized for root and an API token. The key line carries sshd's expiry-time option (OpenSSH ${status?.sshdMinVersion || '7.7'} or newer, stamped in the host's local time${status?.expiryTimeZone ? `, ${status.expiryTimeZone}` : ''}) so the daemon refuses it after the deadline, and the panel removes both when the time box ends.`}>
       {sshdMissing && <div className="banner banner-info"><div><strong>sshd is not installed</strong><p>{status.sshdDetail} Only an API token can be issued until <Link to="/software/install-distro-packages">openssh-server</Link> is installed.</p></div></div>}
       <form onSubmit={submit}>
         <ErrorBanner error={error && isCapabilityError(error) ? null : error && !fieldErrors ? error : null} />
@@ -97,24 +99,32 @@ export function GrantList({ refreshKey = 0, onChanged }) {
   const loadedAt = useMemo(() => Date.now(), [data]);
 
   const revoke = async (g) => {
-    if (!await confirm({ title: 'Revoke support access', message: `End "${g.label}" now? The SSH key is removed from root's authorized_keys and the API token stops working immediately.`, danger: true, confirmLabel: 'Revoke' })) return;
+    const retry = g.status === 'cleanup_pending';
+    if (!retry && !await confirm({ title: 'Revoke support access', message: `End "${g.label}" now? The SSH key is removed from root's authorized_keys and the API token stops working immediately.`, danger: true, confirmLabel: 'Revoke' })) return;
     setBusy(true);
     try {
       const res = await api.delete(`/support/access/${g.id}`);
-      const c = res.data.cleanup || {};
-      if (c.ok === false) toast.warning(`Access revoked, but cleanup was incomplete: ${c.ssh?.error || c.api?.error || 'see the audit log'}`, { timeout: 10_000 });
-      else toast.success(`Access "${g.label}" revoked`);
+      const d = res.data;
+      const c = d.cleanup || {};
+      if (d.cleanupPending) toast.warning(`The grant is ended but the SSH key is still in root's authorized_keys (${c.ssh?.error || 'agent error'}). The panel retries every five minutes; sshd refuses the key after ${formatDate(g.expiresAt)} regardless.`, { timeout: 12_000 });
+      else if (c.ok === false) toast.warning(`Access ${d.status}, but the API token could not be expired: ${c.api?.error || 'see the audit log'}`, { timeout: 10_000 });
+      else toast.success(retry ? `Cleanup finished: access "${g.label}" ${d.status}` : `Access "${g.label}" revoked`);
       refetch(); onChanged?.();
     } catch (err) { toast.error(err); } finally { setBusy(false); }
   };
   const expireDue = async () => {
     setBusy(true);
-    try { const res = await api.post('/support/access/expire-due'); toast.success(res.data.expired ? `${res.data.expired} grant(s) expired` : 'Nothing was due'); refetch(); onChanged?.(); } catch (err) { toast.error(err); } finally { setBusy(false); }
+    try {
+      const res = await api.post('/support/access/expire-due');
+      if (res.data.pending) toast.warning(`${res.data.expired} grant(s) ended; ${res.data.pending} still waiting for the SSH key to be removed`, { timeout: 10_000 });
+      else toast.success(res.data.expired ? `${res.data.expired} grant(s) expired` : 'Nothing was due');
+      refetch(); onChanged?.();
+    } catch (err) { toast.error(err); } finally { setBusy(false); }
   };
 
   const columns = [
     { key: 'label', label: 'Label', sortable: true, render: (g) => <button className="link-button" onClick={() => setOpen(g)}>{g.label}</button> },
-    { key: 'status', label: 'Status', sortable: true, render: (g) => <StatusPill status={GRANT_TONE[g.status]}>{g.status}</StatusPill> },
+    { key: 'status', label: 'Status', sortable: true, render: (g) => <StatusPill status={GRANT_TONE[g.status]}>{grantLabel(g.status)}</StatusPill> },
     { key: 'what', label: 'Grants', render: (g) => [g.ssh && 'SSH', g.apiToken && 'API token'].filter(Boolean).join(' + ') || '—' },
     { key: 'expires_at', label: 'Expires', sortable: true, render: (g) => <span>{formatDate(g.expiresAt)}{g.status === 'active' && <> · <Remaining seconds={g.remainingSeconds} at={loadedAt} /></>}</span> },
     { key: 'grantedBy', label: 'Granted by' },
@@ -122,19 +132,19 @@ export function GrantList({ refreshKey = 0, onChanged }) {
   ];
   return (
     <>
-      <Card title="Grants" subtitle="Active grants are checked every five minutes and ended the moment they are overdue." actions={<><Button size="sm" icon={Clock} loading={busy} onClick={expireDue}>Expire overdue now</Button><Button size="sm" icon={RefreshCw} onClick={() => refetch()}>Refresh</Button></>}>
+      <Card title="Grants" subtitle="Active grants are checked every five minutes and ended the moment they are overdue. A grant whose key could not be removed stays in 'cleanup pending' and is retried on every run." actions={<><Button size="sm" icon={Clock} loading={busy} onClick={expireDue}>Expire overdue now</Button><Button size="sm" icon={RefreshCw} onClick={() => refetch()}>Refresh</Button></>}>
         <RequestError error={error} onRetry={refetch} />
         <DataTable columns={columns} rows={data || []} loading={loading} total={meta?.total} page={table.state.page} pageSize={table.state.pageSize} onPageChange={table.setPage}
           sort={table.state.sort} dir={table.state.dir} onSortChange={table.setSort} searchable q={table.state.q} onSearch={table.setSearch} searchPlaceholder="Search label or fingerprint…"
           emptyText="No support access has been granted"
-          toolbar={<Select value={status} onChange={(v) => { setStatus(v); table.setPage(1); }} options={[{ value: '', label: 'All' }, { value: 'active', label: 'Active' }, { value: 'expired', label: 'Expired' }, { value: 'revoked', label: 'Revoked' }]} />}
-          rowActions={(g) => [g.status === 'active' && { label: 'Revoke', primary: true, danger: true, disabled: busy, onClick: () => revoke(g) }, { label: 'Details', onClick: () => setOpen(g) }]} />
+          toolbar={<Select value={status} onChange={(v) => { setStatus(v); table.setPage(1); }} options={[{ value: '', label: 'All' }, { value: 'active', label: 'Active' }, { value: 'cleanup_pending', label: 'Cleanup pending' }, { value: 'expired', label: 'Expired' }, { value: 'revoked', label: 'Revoked' }]} />}
+          rowActions={(g) => [g.status === 'active' && { label: 'Revoke', primary: true, danger: true, disabled: busy, onClick: () => revoke(g) }, g.status === 'cleanup_pending' && { label: 'Retry cleanup', primary: true, disabled: busy, onClick: () => revoke(g) }, { label: 'Details', onClick: () => setOpen(g) }]} />
       </Card>
-      <Modal open={Boolean(open)} title={open ? `Grant: ${open.label}` : ''} onClose={() => setOpen(null)} footer={<>{open?.status === 'active' && <Button variant="danger" icon={ShieldOff} onClick={() => { revoke(open); setOpen(null); }}>Revoke</Button>}<Button onClick={() => setOpen(null)}>Close</Button></>}>
+      <Modal open={Boolean(open)} title={open ? `Grant: ${open.label}` : ''} onClose={() => setOpen(null)} footer={<>{open?.status === 'active' && <Button variant="danger" icon={ShieldOff} onClick={() => { revoke(open); setOpen(null); }}>Revoke</Button>}{open?.status === 'cleanup_pending' && <Button variant="primary" icon={RefreshCw} onClick={() => { revoke(open); setOpen(null); }}>Retry cleanup</Button>}<Button onClick={() => setOpen(null)}>Close</Button></>}>
         {open && (
           <KeyValue items={[
-            ['Status', <StatusPill status={GRANT_TONE[open.status]}>{open.status}</StatusPill>],
-            ['Expires', formatDate(open.expiresAt)],
+            ['Status', <span><StatusPill status={GRANT_TONE[open.status]}>{grantLabel(open.status)}</StatusPill>{open.cleanupPending && <span className="muted small"> → {open.pendingStatus} once the key is removed (attempt {open.cleanup?.attempts || 1}{open.cleanup?.lastAttemptAt ? `, last ${formatDate(open.cleanup.lastAttemptAt)}` : ''})</span>}</span>],
+            ['Expires', <span>{formatDate(open.expiresAt)}{open.ssh?.expiry && <span className="muted small"> · sshd expiry-time {open.ssh.expiry} (host local time, OpenSSH 7.7+)</span>}</span>],
             ['Granted', `${formatDate(open.createdAt)} by ${open.grantedBy || '—'}${open.grantedIp ? ` from ${open.grantedIp}` : ''}`],
             open.note && ['Note', open.note],
             ['SSH key', open.ssh ? <span><code className="small">{open.ssh.fingerprint}</code> <CopyButton text={open.ssh.fingerprint} /></span> : 'not granted'],
@@ -156,6 +166,9 @@ export function AccessGrants() {
     <>
       <RequestError error={status.error} onRetry={status.refetch} />
       {status.loading && !status.data && <Loading />}
+      {status.data?.cleanupPending?.length > 0 && (
+        <div className="banner banner-warning"><div><strong>{status.data.cleanupPending.length} grant{status.data.cleanupPending.length > 1 ? 's' : ''} waiting for cleanup</strong><p>{status.data.cleanupPending.map((g) => `${g.label} (${g.cleanup?.ssh?.error || 'key removal failed'})`).join(', ')}. The root SSH key is still in authorized_keys; the panel retries every five minutes and you can retry below. sshd refuses each key after its own deadline, or remove the line by hand under Security Center → Manage root's SSH Keys.</p></div></div>
+      )}
       {status.data?.active?.length > 0 && (
         <div className="banner banner-warning"><div><strong>{status.data.active.length} active support grant{status.data.active.length > 1 ? 's' : ''}</strong><p>{status.data.active.map((g) => `${g.label} (until ${formatDate(g.expiresAt)})`).join(', ')}. Revoke below as soon as the engineer is done.</p></div></div>
       )}

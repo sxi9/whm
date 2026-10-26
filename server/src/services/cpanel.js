@@ -13,8 +13,11 @@ import { isRoot } from '../middleware/rbac.js';
 //   cpanel.news.active(user)             -> news items the given principal should see right now
 //   cpanel.changelog.get()               -> parsed CHANGELOG.md
 //   cpanel.upgrade.status()              -> release check + last upgrade state (async)
-// Files: branding images under $WHM_DATA_DIR/branding/, trusted release-signing keys
-// under $WHM_DATA_DIR/release-keys/<kid>.pub, downloads and logs under $WHM_DATA_DIR/upgrades/.
+// Files: branding images under $WHM_DATA_DIR/branding/; release downloads under
+// $WHM_DATA_DIR/upgrades/. Trusted release-signing keys, the verified staging copy
+// and the installer log belong to the root agent (cpanel.upgrade.* ops), never to
+// this process: the panel only hands the agent the archive path and the feed's
+// checksum/signature, and the agent decides whether to unpack and run anything.
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 export const UPGRADE_JOB = 'cpanel.upgrade';
@@ -41,8 +44,12 @@ export const BRANDING_KEYS = {
 
 // ------------------------------------------------------------ helpers -------
 
+// Stored as 'YYYY-MM-DD HH:MM:SS' in UTC; that form must round-trip unchanged
+// whatever the process time zone is, so it is never handed to Date's local parser.
+const SQL_DATE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
 const sqlDate = (value) => {
   if (value == null || value === '') return null;
+  if (typeof value === 'string' && SQL_DATE.test(value)) return value;
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) throw unprocessable('Invalid date', { date: ['Must be an ISO 8601 date-time'] });
   return d.toISOString().slice(0, 19).replace('T', ' ');
@@ -156,6 +163,13 @@ export function createCpanelService(ctx) {
   const agentError = (err, capability) => {
     if (err?.agentError && (err.code === 'capability_missing' || err.code === 'binary_not_found')) return new CapabilityError(capability, err.message);
     return err;
+  };
+  // Mailman's tools take the password in argv; an exec failure's details would
+  // carry that argv into the HTTP error body, so they are dropped here as well.
+  const redacted = (err, capability) => {
+    const mapped = agentError(err, capability);
+    if (mapped?.agentError) mapped.details = {};
+    return mapped;
   };
 
   // ---------------------------------------------------------- changelog ----
@@ -279,7 +293,7 @@ export function createCpanelService(ctx) {
     },
     update(id, body, req) {
       const existing = news.get(id);
-      const values = news.normalise({ ...existing, startsAt: existing.startsAt, endsAt: existing.endsAt, ...body });
+      const values = news.normalise({ title: existing.title, body: existing.body, audience: existing.audience, severity: existing.severity, enabled: existing.enabled, startsAt: existing.startsAt, endsAt: existing.endsAt, ...body });
       newsStmts.update.run({ ...values, id });
       req?.audit?.({ action: 'news.update', target: String(id), args: { title: values.title, audience: values.audience, enabled: Boolean(values.enabled) } });
       return news.get(id);
@@ -320,7 +334,7 @@ export function createCpanelService(ctx) {
         return res;
       } catch (err) {
         req?.audit?.({ action: 'mailman.password.reset', target: list, result: `error:${err.code || 'failed'}` });
-        throw agentError(err, 'mailman');
+        throw redacted(err, 'mailman');
       }
     },
     async setSitePassword(password, creator, req) {
@@ -328,46 +342,47 @@ export function createCpanelService(ctx) {
         const res = await ctx.agent.op('cpanel.mailman.site_password', { password, creator });
         req?.audit?.({ action: 'mailman.site_password.set', args: { scope: res.scope } });
         return res;
-      } catch (err) { throw agentError(err, 'mailman'); }
+      } catch (err) {
+        req?.audit?.({ action: 'mailman.site_password.set', args: { scope: creator ? 'creator' : 'site' }, result: `error:${err.code || 'failed'}` });
+        throw redacted(err, 'mailman');
+      }
     },
   };
 
   // ------------------------------------------------------------ upgrade ----
-  const keyFile = (kid) => path.join(dirs.keys, `${kid}.pub`);
+  // Keys live on the host under the agent's control; the panel only relays them.
   const releaseKeys = {
-    list() {
-      if (!fs.existsSync(dirs.keys)) return [];
-      return fs.readdirSync(dirs.keys).filter((f) => f.endsWith('.pub')).sort().map((f) => {
-        const kid = f.slice(0, -4);
-        try {
-          const key = crypto.createPublicKey(fs.readFileSync(path.join(dirs.keys, f), 'utf8'));
-          const der = key.export({ type: 'spki', format: 'der' });
-          return { kid, type: key.asymmetricKeyType, fingerprint: crypto.createHash('sha256').update(der).digest('hex').slice(0, 32), addedAt: fs.statSync(path.join(dirs.keys, f)).mtime.toISOString(), valid: key.asymmetricKeyType === 'ed25519' };
-        } catch (err) { return { kid, type: null, fingerprint: null, addedAt: null, valid: false, error: err.message }; }
-      });
+    async list() {
+      const res = await ctx.agent.op('cpanel.upgrade.keys');
+      return { dir: res.dir, readOnly: Boolean(res.readOnly), keys: (res.keys || []).map(({ pem, ...k }) => k) };
     },
-    add(kid, pem, req) {
+    async pems() {
+      const res = await ctx.agent.op('cpanel.upgrade.keys');
+      return (res.keys || []).filter((k) => k.valid && k.pem);
+    },
+    async add(kid, pem, req) {
       let key;
       try { key = crypto.createPublicKey(pem); } catch (err) { throw unprocessable('Not a valid public key', { pem: [err.message] }); }
       if (key.asymmetricKeyType !== 'ed25519') throw unprocessable('Release keys must be Ed25519 public keys', { pem: [`got ${key.asymmetricKeyType}`] });
-      if (fs.existsSync(keyFile(kid))) throw conflict(`A key named "${kid}" already exists`);
-      fs.mkdirSync(dirs.keys, { recursive: true, mode: 0o750 });
-      fs.writeFileSync(keyFile(kid), key.export({ type: 'spki', format: 'pem' }), { mode: 0o640 });
-      req?.audit?.({ action: 'upgrade.key.add', target: kid });
-      return releaseKeys.list().find((k) => k.kid === kid);
+      const added = await ctx.agent.op('cpanel.upgrade.key_add', { kid, pem: key.export({ type: 'spki', format: 'pem' }) });
+      req?.audit?.({ action: 'upgrade.key.add', target: kid, args: { fingerprint: added?.fingerprint ?? null } });
+      const { pem: _pem, ...rest } = added || {};
+      return rest;
     },
-    remove(kid, req) {
-      if (!fs.existsSync(keyFile(kid))) throw notFound('Release key');
-      fs.unlinkSync(keyFile(kid));
+    async remove(kid, req) {
+      await ctx.agent.op('cpanel.upgrade.key_remove', { kid });
       req?.audit?.({ action: 'upgrade.key.remove', target: kid });
       return { removed: true };
     },
-    verify(digest, signature, keyId) {
+    // Early, non-authoritative check so a tampered download fails before the
+    // agent is asked to stage it. Same contract as the agent's verifySignature:
+    // kid | null (keys exist, none verifies) | undefined (no usable key at all).
+    async verify(digest, signature, keyId) {
+      const keys = await releaseKeys.pems();
+      if (keys.length === 0) return undefined;
       const sig = Buffer.from(signature, 'base64');
-      const candidates = releaseKeys.list().filter((k) => k.valid && (!keyId || k.kid === keyId));
-      for (const k of candidates) {
-        const key = crypto.createPublicKey(fs.readFileSync(keyFile(k.kid), 'utf8'));
-        if (crypto.verify(null, digest, key, sig)) return k.kid;
+      for (const k of keys.filter((k) => !keyId || k.kid === keyId)) {
+        if (crypto.verify(null, digest, crypto.createPublicKey(k.pem), sig)) return k.kid;
       }
       return null;
     },
@@ -393,6 +408,16 @@ export function createCpanelService(ctx) {
       } finally { fs.closeSync(fd); }
     } catch { return null; }
   };
+  // The installer prints "==> WHM is running" when done and "error: ..." when it
+  // dies; a transient unit that is gone without either is not a success.
+  const logOutcome = (log) => (/WHM is running/.test(log || '') ? 'succeeded' : /(^|\n)(\x1b\[[0-9;]*m)?error:/.test(log || '') ? 'failed' : null);
+  const unitOutcome = (st, log) => {
+    if (!st) return null;
+    if (st.installed && st.state === 'failed') return 'failed';
+    if (st.installed && st.state === 'inactive') return st.result && st.result !== 'success' ? 'failed' : 'succeeded';
+    if (!st.installed) return logOutcome(log) ?? 'unknown';
+    return null;
+  };
   const upgrade = {
     canRun() {
       const method = installMethod();
@@ -407,27 +432,43 @@ export function createCpanelService(ctx) {
       const last = S('cpanel.upgrade.last', null);
       const method = installMethod();
       const can = upgrade.canRun();
+      let keys = { dir: null, readOnly: false, keys: [], error: null };
+      try { keys = { ...(await releaseKeys.list()), error: null }; } catch (err) { keys.error = err.message; }
+      const trusted = keys.keys.filter((k) => k.valid);
       let lastDetail = null;
       if (last) {
         lastDetail = { ...last, log: last.logFile ? tailLog(last.logFile) : null };
-        if (last.status === 'started') {
+        if (last.status === 'started' || last.status === 'unknown') {
           if (last.version && compareVersions(ctx.version, last.version) === 0 && last.fromVersion !== ctx.version) lastDetail.status = 'succeeded';
-          else if (last.unit) {
+          else if (last.unit && last.status === 'started') {
             try {
-              const st = await ctx.agent.op('svc.status', { unit: last.unit.replace(/\.service$/, '') });
-              if (st.installed && st.state === 'active') lastDetail.status = 'running';
-              else if (st.installed && st.result && st.result !== 'success') lastDetail.status = 'failed';
-              else lastDetail.status = /WHM is running/.test(lastDetail.log || '') ? 'succeeded' : /error:/.test(lastDetail.log || '') ? 'failed' : 'unknown';
+              const st = await ctx.agent.op('cpanel.upgrade.unit_status', { unit: last.unit.replace(/\.service$/, '') });
+              lastDetail.status = st.installed && st.state === 'active' ? 'running' : unitOutcome(st, lastDetail.log) ?? 'unknown';
+              if (lastDetail.status === 'failed' && st.exitStatus != null) lastDetail.exitStatus = st.exitStatus;
             } catch { lastDetail.status = 'unknown'; }
           }
+          if (lastDetail.status !== last.status && lastDetail.status !== 'running') settings.set('cpanel.upgrade.last', { ...last, status: lastDetail.status, finishedAt: last.finishedAt ?? new Date().toISOString() });
         }
+      }
+      let verification = null;
+      if (latest) {
+        const keyKnown = latest.keyId ? trusted.some((k) => k.kid === latest.keyId) : trusted.length > 0;
+        verification = {
+          sha256: Boolean(latest.sha256), signature: Boolean(latest.signature), keyId: latest.keyId ?? null,
+          trustedKeys: trusted.length, trustedKey: Boolean(latest.signature) && keyKnown,
+          // A signature with trusted keys installed is always checked and a
+          // mismatch always refused; only "nothing to check against" may be
+          // waved through with allowUnverified.
+          unverifiable: !latest.sha256 || (!latest.signature && trusted.length > 0) || (Boolean(latest.signature) && trusted.length === 0),
+          keyMissing: Boolean(latest.signature) && trusted.length > 0 && !keyKnown,
+        };
       }
       return {
         currentVersion: ctx.version, updateUrl: splitCredentials(url).url, updateUrlConfigured: Boolean(url), tier: S('updates.tier', 'stable'),
         lastCheck, latest, updateAvailable: latest ? compareVersions(latest.version, ctx.version) > 0 : null,
         installMethod: method, repoRoot: REPO_ROOT, canRun: can.ok, reason: can.reason,
-        verification: latest ? { sha256: Boolean(latest.sha256), signature: Boolean(latest.signature), keyId: latest.keyId ?? null, trustedKey: latest.keyId ? releaseKeys.list().some((k) => k.kid === latest.keyId && k.valid) : releaseKeys.list().some((k) => k.valid) } : null,
-        releaseKeys: releaseKeys.list(), activeJob: activeJob(), last: lastDetail,
+        verification, releaseKeys: keys.keys, releaseKeyDir: keys.dir, releaseKeysReadOnly: keys.readOnly, releaseKeysError: keys.error,
+        activeJob: activeJob(), last: lastDetail,
         instructions: [
           method === 'git' ? `cd ${REPO_ROOT} && git fetch --tags && git checkout <release-tag>` : `Download the release archive${latest?.url ? ` from ${latest.url}` : ''} and unpack it (tar -xzf) somewhere root can read`,
           `bash <unpacked>/scripts/install.sh --upgrade   # redeploys to ${method === 'git' ? REPO_ROOT : '/opt/whm'}, keeps /etc/whm and ${dataDir}, restarts whm-agentd and whm-panel`,
@@ -470,7 +511,8 @@ export function createCpanelService(ctx) {
       if (!last?.logFile) throw notFound('Upgrade log');
       return { logFile: last.logFile, log: tailLog(last.logFile) ?? '', unit: last.unit, version: last.version, startedAt: last.startedAt };
     },
-    // Job handler: download → verify → unpack (agent) → run installer (agent, detached) → follow its log.
+    // Job handler: download → early checks → agent copies, verifies and unpacks
+    // in its own staging area → agent runs the installer detached → follow its log.
     async run(job) {
       const { version, url, sha256, signature, keyId, allowUnverified, skipNode } = job.params;
       fs.mkdirSync(dirs.upgrades, { recursive: true, mode: 0o750 });
@@ -483,7 +525,7 @@ export function createCpanelService(ctx) {
       const hash = crypto.createHash('sha256');
       let received = 0;
       let lastPct = 2;
-      const out = fs.createWriteStream(archive, { mode: 0o640 });
+      const out = fs.createWriteStream(archive, { mode: 0o644 });
       await pipeline(res.body, new Writable({
         write(chunk, _enc, cb) {
           received += chunk.length;
@@ -497,37 +539,45 @@ export function createCpanelService(ctx) {
       const digest = hash.digest();
       const digestHex = digest.toString('hex');
       job.log(`Downloaded ${received} bytes, sha256 ${digestHex}`);
+      // Early failures only; the agent repeats every check on its own copy.
       if (sha256) {
         if (digestHex !== sha256) throw Object.assign(new Error(`SHA-256 mismatch: feed says ${sha256}, archive is ${digestHex}`), { code: 'CHECKSUM_MISMATCH' });
-        job.log('SHA-256 checksum verified');
+        job.log('SHA-256 checksum matches the feed');
       } else if (allowUnverified) job.log('No checksum published; continuing because an unverified upgrade was confirmed', 'warn');
       else throw Object.assign(new Error('No SHA-256 checksum published for this release'), { code: 'UNVERIFIED' });
       if (signature) {
-        const signer = releaseKeys.verify(digest, signature, keyId);
-        if (!signer) {
-          if (!allowUnverified) throw Object.assign(new Error(`The release signature does not verify against any trusted key${keyId ? ` (feed names "${keyId}")` : ''}`), { code: 'SIGNATURE_INVALID' });
-          job.log('Signature could not be verified; continuing because an unverified upgrade was confirmed', 'warn');
-        } else job.log(`Signature verified with trusted key "${signer}"`);
-      } else if (releaseKeys.list().some((k) => k.valid) && !allowUnverified) {
+        const signer = await releaseKeys.verify(digest, signature, keyId);
+        if (signer === null) throw Object.assign(new Error(`The release signature does not verify against any trusted key${keyId ? ` (feed names "${keyId}")` : ''}`), { code: 'SIGNATURE_INVALID' });
+        if (signer === undefined) {
+          if (!allowUnverified) throw Object.assign(new Error('The release is signed but no trusted release key is installed'), { code: 'UNVERIFIED' });
+          job.log('Signature cannot be checked: no trusted release key is installed; continuing because an unverified upgrade was confirmed', 'warn');
+        } else job.log(`Signature matches trusted key "${signer}"`);
+      } else if ((await releaseKeys.pems()).length > 0 && !allowUnverified) {
         throw Object.assign(new Error('Trusted release keys are configured but the feed published no signature'), { code: 'UNSIGNED' });
-      } else if (!signature) job.log('No signature published for this release', 'warn');
-      job.progress(45, 'unpacking');
-      const destDir = path.join(dirs.upgrades, `src-${version}`);
-      const unpacked = await ctx.agent.op('cpanel.upgrade.extract', { archive, destDir }, { timeoutMs: 10 * 60 * 1000 });
-      job.log(`Unpacked ${unpacked.name ?? 'release'} ${unpacked.version ?? ''} into ${unpacked.sourceDir}`);
-      if (unpacked.version && compareVersions(unpacked.version, version) !== 0) job.log(`Archive package.json says ${unpacked.version}, feed said ${version}`, 'warn');
+      } else job.log('No signature published for this release', 'warn');
+      job.progress(45, 'verifying and unpacking');
+      let unpacked;
+      try {
+        unpacked = await ctx.agent.op('cpanel.upgrade.extract', { archive, version, sha256: sha256 ?? null, signature: signature ?? null, keyId: keyId ?? null, allowUnverified: Boolean(allowUnverified) }, { timeoutMs: 10 * 60 * 1000 });
+      } catch (err) {
+        const code = { checksum_mismatch: 'CHECKSUM_MISMATCH', invalid_signature: 'SIGNATURE_INVALID', unverified: 'UNVERIFIED', unsigned: 'UNSIGNED', invalid_package: 'INVALID_PACKAGE' }[err?.code] ?? 'STAGING_FAILED';
+        throw Object.assign(new Error(`The agent refused to stage the release: ${err.message}`), { code });
+      }
+      for (const w of unpacked.warnings || []) job.log(w, 'warn');
+      job.log(`Agent verified sha256 ${unpacked.sha256}${unpacked.signer ? ` and signature (key "${unpacked.signer}")` : ''}; unpacked ${unpacked.name ?? 'release'} ${unpacked.packageVersion ?? ''} into ${unpacked.sourceDir}`);
+      if (unpacked.packageVersion && compareVersions(unpacked.packageVersion, version) !== 0) job.log(`Archive package.json says ${unpacked.packageVersion}, feed said ${version}`, 'warn');
       const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
       const unit = `whm-upgrade-${stamp}`;
-      const logFile = path.join(dirs.upgrades, `upgrade-${version}-${stamp}.log`);
-      const record = { version, fromVersion: ctx.version, startedAt: new Date().toISOString(), unit: `${unit}.service`, logFile, jobId: job.job.id, status: 'started', by: job.params.by ?? null };
-      settings.set('cpanel.upgrade.last', record);
       job.progress(50, 'running installer');
-      const appDir = installMethod() === 'install-script' && REPO_ROOT !== '/opt/whm' ? REPO_ROOT : undefined;
-      const started = await ctx.agent.op('cpanel.upgrade.run', { sourceDir: unpacked.sourceDir, logFile, unit, ...(appDir ? { appDir } : {}), skipNode });
+      const started = await ctx.agent.op('cpanel.upgrade.run', { version, unit, skipNode: Boolean(skipNode) });
+      const logFile = started.logFile;
+      const record = { version, fromVersion: ctx.version, startedAt: new Date().toISOString(), unit: `${unit}.service`, logFile, sourceDir: started.sourceDir, sha256: unpacked.sha256, signer: unpacked.signer ?? null, jobId: job.job.id, status: 'started', by: job.params.by ?? null };
+      settings.set('cpanel.upgrade.last', record);
       job.log(`Installer started as ${started.unit}; output in ${logFile}. The panel restarts when it finishes, which ends this log stream.`);
       const deadline = Date.now() + UPGRADE_TIMEOUT_MS;
       let offset = 0;
       let outcome = null;
+      let exitStatus = null;
       while (Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, POLL_MS));
         try {
@@ -543,15 +593,17 @@ export function createCpanelService(ctx) {
           }
         } catch { /* log not readable yet */ }
         let st = null;
-        try { st = await ctx.agent.op('svc.status', { unit }); } catch { st = null; }
-        if (st && (!st.installed || st.state === 'inactive' || st.state === 'failed')) {
-          outcome = st.result && st.result !== 'success' ? 'failed' : st.state === 'failed' ? 'failed' : 'succeeded';
-          break;
-        }
+        try { st = await ctx.agent.op('cpanel.upgrade.unit_status', { unit }); } catch { st = null; }
+        outcome = unitOutcome(st, tailLog(logFile));
+        if (outcome) { exitStatus = st?.exitStatus ?? null; break; }
       }
       if (!outcome) throw Object.assign(new Error(`The installer did not finish within ${UPGRADE_TIMEOUT_MS / 60000} minutes; see ${logFile}`), { code: 'UPGRADE_TIMEOUT' });
-      settings.set('cpanel.upgrade.last', { ...record, status: outcome, finishedAt: new Date().toISOString() });
-      if (outcome === 'failed') throw Object.assign(new Error(`The installer failed; see ${logFile}`), { code: 'UPGRADE_FAILED' });
+      settings.set('cpanel.upgrade.last', { ...record, status: outcome, exitStatus, finishedAt: new Date().toISOString() });
+      if (outcome !== 'succeeded') {
+        try { await ctx.agent.op('cpanel.upgrade.unit_status', { unit, resetFailed: true }); } catch { /* unit already gone */ }
+      }
+      if (outcome === 'failed') throw Object.assign(new Error(`The installer failed${exitStatus != null ? ` (exit status ${exitStatus})` : ''}; see ${logFile}`), { code: 'UPGRADE_FAILED' });
+      if (outcome === 'unknown') throw Object.assign(new Error(`The installer unit disappeared before reporting a result; check ${logFile} and the running version`), { code: 'UPGRADE_UNKNOWN' });
       job.progress(100, 'done');
       return { version, unit: started.unit, logFile };
     },

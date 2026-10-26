@@ -2,6 +2,16 @@ import { unauthorized, forbidden, HttpError } from '../lib/errors.js';
 
 const USER_COLUMNS = 'id, username, email, role, totp_enabled, must_change_password, suspended';
 
+// A category that hands tokens to other machines registers the scope it puts
+// on them in ctx.confinedScopes (scope -> [{ method, path }], paths as mounted
+// under /api). A token whose scopes are all confined can call those routes
+// and nothing else, whatever the role of the user it belongs to.
+export function confinementOf(registry, scopes) {
+  if (!registry?.size || !Array.isArray(scopes) || !scopes.length || scopes.includes('*')) return null;
+  if (!scopes.every((s) => registry.has(s))) return null;
+  return scopes.flatMap((s) => registry.get(s));
+}
+
 // Resolves the principal for a request from either the session cookie or an
 // API token (Authorization: Bearer ...). Sets req.user and req.auth, and
 // applies the session parts of the login policy (timeout, token 2FA rule).
@@ -24,8 +34,9 @@ export function attachUser(ctx) {
       if (policy().apiTokensRequire2fa && !row.totp_enabled) return next(unauthorized('The security policy requires two-factor authentication before API tokens can be used'));
       touch.run(row.token_id);
       const { token_id, scopes, expires_at, ...user } = row;
+      const list = JSON.parse(scopes || '[]');
       req.user = user;
-      req.auth = { via: 'token', tokenId: token_id, scopes: JSON.parse(scopes || '[]') };
+      req.auth = { via: 'token', tokenId: token_id, scopes: list, confinedTo: confinementOf(ctx.confinedScopes, list) };
       return next();
     }
     if (req.session?.userId) {
@@ -50,6 +61,10 @@ export function attachUser(ctx) {
 export function requireAuth(req, _res, next) {
   if (!req.user) return next(unauthorized());
   const mounted = req.baseUrl + req.path;
+  const confined = req.auth?.confinedTo;
+  if (confined && !confined.some((r) => r.path === mounted && (!r.method || r.method === req.method))) {
+    return next(new HttpError(403, 'scope_confined', `This API token is confined to ${confined.map((r) => `${r.method || 'ANY'} ${r.path}`).join(', ')}`));
+  }
   // Users who must change their password or enrol in 2FA may only use the auth
   // endpoints until they have. req.path is relative to the current router, so
   // the mounted path is used.

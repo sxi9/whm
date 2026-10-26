@@ -35,6 +35,37 @@ export function ConfigurationCluster() {
   );
 }
 
+function KeyList({ keys }) {
+  const [open, setOpen] = useState(false);
+  if (!keys?.length) return <span className="muted">—</span>;
+  const shown = open ? keys : keys.slice(0, 3);
+  return (
+    <span style={{ fontSize: 12 }}>
+      <code style={{ fontSize: 12, wordBreak: 'break-all' }}>{shown.join(', ')}</code>
+      {keys.length > 3 && <> <button type="button" className="link-button" onClick={() => setOpen((v) => !v)}>{open ? 'fewer' : `+${keys.length - 3} more`}</button></>}
+    </span>
+  );
+}
+
+const RESULT_STATUS = { applied: 'ok', stored: 'warning', failed: 'failed' };
+const RESULT_LABEL = { applied: 'applied', stored: 'stored, daemon missing', failed: 'failed' };
+
+// Per-key outcome of an apply on this server or a peer.
+function ApplyResults({ results }) {
+  const rows = Object.entries(results || {}).map(([key, r]) => ({ key, ...r }));
+  if (!rows.length) return null;
+  return (
+    <DataTable dense rows={rows} rowKey={(r) => r.key} emptyText="Nothing applied."
+      columns={[
+        { key: 'key', label: 'Setting', render: (r) => <code style={{ fontSize: 12 }}>{r.key}</code> },
+        { key: 'status', label: 'Outcome', render: (r) => <StatusPill status={RESULT_STATUS[r.status] || r.status}>{RESULT_LABEL[r.status] || r.status}</StatusPill> },
+        { key: 'via', label: 'Through', render: (r) => (r.via ? <code style={{ fontSize: 12 }}>{r.via}</code> : <span className="muted">settings database</span>) },
+        { key: 'note', label: 'Details', render: (r) => <span style={{ wordBreak: 'break-word' }}>{r.note || (r.stored ? 'saved' : '—')}</span> },
+      ]}
+    />
+  );
+}
+
 function GroupSelection({ groups, settings, schedule, keyCount, onSaved }) {
   const toast = useToast();
   const initial = () => ({ groups: settings.groups, autoPush: settings.autoPush, acceptPushes: settings.acceptPushes });
@@ -54,14 +85,14 @@ function GroupSelection({ groups, settings, schedule, keyCount, onSaved }) {
   };
 
   return (
-    <Card title="Shared settings" subtitle="Which groups of settings travel between peers. Host identity (hostname, IP addresses) and anything secret never leave a server." padded={false}
+    <Card title="Shared settings" subtitle="Which groups of settings travel between peers. Only the keys listed per group are ever sent or accepted; host identity, addresses, daemon selection, per-host paths, timestamps and secrets never leave a server, and a receiving peer validates every value and applies it through the module that owns it." padded={false}
       actions={<Button variant="primary" size="sm" loading={saving} disabled={!dirty} onClick={save}>Save</Button>}>
       <DataTable dense rows={groups} rowKey={(g) => g.name}
         columns={[
           { key: 'share', label: 'Share', width: 60, render: (g) => <input type="checkbox" checked={draft.groups.includes(g.name)} onChange={() => toggleGroup(g.name)} aria-label={`Share ${g.label}`} /> },
           { key: 'label', label: 'Group', render: (g) => <><strong>{g.label}</strong><br /><small className="muted">{g.description}</small></> },
-          { key: 'keys', label: 'Settings', align: 'right', render: (g) => (g.keys ? g.keys : <span className="muted">none yet</span>) },
-          { key: 'prefixes', label: 'Keys', render: (g) => <code style={{ fontSize: 12 }}>{g.prefixes.map((p) => `${p}*`).join(', ')}</code> },
+          { key: 'keyCount', label: 'Settings', align: 'right', render: (g) => (g.keyCount ? g.keyCount : <span className="muted">none yet</span>) },
+          { key: 'keys', label: 'Keys', render: (g) => <KeyList keys={g.keys} /> },
         ]}
       />
       <div className="card-body">
@@ -87,7 +118,7 @@ function PushCard({ peers, groups, selected, onFinished }) {
   const run = async () => {
     const who = clusterId ? targets.find((p) => String(p.id) === clusterId)?.name : `${targets.length} peer${targets.length === 1 ? '' : 's'}`;
     const what = groupName ? groups.find((g) => g.name === groupName)?.label : `the ${selected.length} selected group${selected.length === 1 ? '' : 's'}`;
-    if (!(await confirm({ title: `Push ${what} to ${who}?`, message: 'Matching settings on the peers are overwritten with the values of this server. Settings the peer does not share are left alone.', confirmLabel: 'Push' }))) return;
+    if (!(await confirm({ title: `Push ${what} to ${who}?`, message: 'Each peer validates every value, refuses keys it does not know, and applies the rest through the module that owns them (Apache, Exim, Dovecot, backups, ...). The job log shows, per peer, what was applied, what was only stored because a daemon is missing, and what failed.', confirmLabel: 'Push' }))) return;
     setBusy(true);
     setError(null);
     try {
@@ -118,6 +149,7 @@ function PullCard({ peers, groups, selected, onApplied }) {
   const [clusterId, setClusterId] = useState('');
   const [groupName, setGroupName] = useState('');
   const [preview, setPreview] = useState(null);
+  const [outcome, setOutcome] = useState(null);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
   const sources = peers.filter((p) => p.enabled && p.hasToken);
@@ -129,13 +161,27 @@ function PullCard({ peers, groups, selected, onApplied }) {
       const body = { clusterId: Number(clusterId), apply };
       if (groupName) body.groups = [groupName];
       const { data } = await api.post('/clusters/config/pull', body);
-      if (apply) { toast.success(`${data.changes.length} setting${data.changes.length === 1 ? '' : 's'} applied from ${data.source || data.peer.name}`); setPreview(null); onApplied?.(); } else setPreview(data);
+      if (apply) {
+        const statuses = Object.values(data.results || {}).map((r) => r.status);
+        const n = (st) => statuses.filter((x) => x === st).length;
+        const summary = `${n('applied')} applied, ${n('stored')} stored (daemon missing), ${n('failed')} failed from ${data.source || data.peer.name}`;
+        if (n('failed')) toast.warning(summary); else toast.success(summary);
+        setPreview(null);
+        setOutcome(data);
+        onApplied?.();
+      } else setPreview(data);
     } catch (err) { setError(err); } finally { setBusy(false); }
   };
 
   return (
     <Card title="Pull from a peer" subtitle="Fetch a peer's shared settings, review the differences, then apply them here.">
       <ErrorBanner error={error} />
+      {outcome && (
+        <details open style={{ marginBottom: 12 }}>
+          <summary>Last pull from {outcome.source || outcome.peer?.name}: per-key outcome</summary>
+          <ApplyResults results={outcome.results} />
+        </details>
+      )}
       <Field label="Peer" required><Select value={clusterId} onChange={setClusterId} placeholder="Choose a peer" options={sources.map((p) => ({ value: String(p.id), label: `${p.name} (${p.host})` }))} /></Field>
       <Field label="Group" help="Blank pulls every selected group."><Select value={groupName} onChange={setGroupName} placeholder="All selected groups" options={groups.map((g) => ({ value: g.name, label: g.label }))} /></Field>
       <FormActions>
@@ -151,12 +197,13 @@ function PullCard({ peers, groups, selected, onApplied }) {
         )}>
         {preview && (
           <>
-            <p className="muted">{preview.received} settings received for {preview.groups.join(', ')}; {preview.changes.length} differ from this server{preview.rejected.length ? `; ${preview.rejected.length} ignored because they identify the peer or hold secrets (${preview.rejected.join(', ')})` : ''}.</p>
+            <p className="muted">{preview.received} settings received for {preview.groups.join(', ')}; {preview.changes.length} differ from this server{preview.rejected.length ? `; ${preview.rejected.length} refused: ${preview.rejected.map((k) => `${k} (${preview.rejections?.[k] || 'not shared'})`).join(', ')}` : ''}. Applying hands each change to the module that owns it; values a daemon cannot take yet are stored until it is installed.</p>
             <DataTable dense rows={preview.changes} rowKey={(c) => c.key} emptyText="Already identical."
               columns={[
                 { key: 'key', label: 'Setting', render: (c) => <code style={{ fontSize: 12 }}>{c.key}</code> },
                 { key: 'local', label: 'Here', render: (c) => <code style={{ fontSize: 12 }}>{JSON.stringify(c.local)}</code> },
                 { key: 'remote', label: 'Peer', render: (c) => <code style={{ fontSize: 12 }}>{JSON.stringify(c.remote)}</code> },
+                { key: 'apply', label: 'Applied through', render: (c) => (c.apply ? <code style={{ fontSize: 12 }}>{c.apply}</code> : <span className="muted">settings database</span>) },
               ]}
             />
           </>

@@ -4,6 +4,14 @@
 // otherwise clamscan runs over account home directories as a plugin job
 // (manual or on the cron setting). Findings of both scanners are kept in the
 // "findings" collection, scan runs in "scans".
+//
+// Every agent call crosses the panel's socket as one request with a one hour
+// ceiling, so a home directory is never scanned in one go: sec.clamav.targets
+// splits it into chunks and each chunk is one bounded sec.clamav.scan call
+// (SCAN_CALL_SEC, under that ceiling). The job checks its abort signal between
+// chunks, so cancelling stops after the running chunk at the latest.
+const SCAN_CALL_SEC = 2700;
+const SCAN_DEPTH = 2;
 
 const MAX_FINDINGS = 5000;
 const MAX_SCANS = 200;
@@ -55,6 +63,21 @@ async function notifyFindings(ctx, scanner, count, accounts) {
   }
 }
 
+// The chunks of one home directory, each as the args of one sec.clamav.scan
+// call. A home the agent cannot split (unknown user, no home yet) is scanned
+// as a single call, still bounded by maxDurationSec.
+async function chunksOf(ctx, username, job) {
+  try {
+    const t = await ctx.agent.op('sec.clamav.targets', { username, depth: SCAN_DEPTH });
+    const chunks = (t.chunks || []).filter((c) => Array.isArray(c.paths) && c.paths.length);
+    if (chunks.length) { job.log(`${username}: ${chunks.length} chunk${chunks.length === 1 ? '' : 's'} under ${t.home}`); return chunks.map((c) => ({ label: c.label, args: { paths: c.paths } })); }
+    if (t.home) return [];
+  } catch (err) {
+    job.log(`WARN ${username}: could not split the home directory (${err.message}); scanning it in one call`);
+  }
+  return [{ label: '(home)', args: { usernames: [username] } }];
+}
+
 function ownerOf(file) {
   const m = /^\/home\d*\/([a-z][a-z0-9_-]{0,31})\//.exec(String(file || ''));
   return m ? m[1] : null;
@@ -78,18 +101,37 @@ module.exports = {
       const scans = ctx.store.collection('scans');
       const started = ctx.now();
       const scan = await scans.insert({ scanner: 'clamav', startedAt: started, finishedAt: null, status: 'running', accounts: usernames.length, infected: 0, errors: 0, trigger: job.params.trigger || 'manual' });
-      job.log(`scanning ${usernames.length} account home director${usernames.length === 1 ? 'y' : 'ies'} with clamscan`);
+      job.log(`scanning ${usernames.length} account home director${usernames.length === 1 ? 'y' : 'ies'} with clamscan, one chunk per call (max ${SCAN_CALL_SEC}s each)`);
       const infected = [];
       let errors = 0;
       let scanned = 0;
+      let chunksDone = 0;
+      let chunksFailed = 0;
+      const cancelled = () => { if (job.cancelled || job.signal.aborted) throw new ctx.errors.PluginError('scan cancelled', { code: 'JOB_CANCELLED', status: 409 }); };
+      const scanArgs = { maxFileMb: settings.maxFileMb || 25, maxDurationSec: SCAN_CALL_SEC };
       try {
         for (const username of usernames) {
-          if (job.cancelled || job.signal.aborted) throw new ctx.errors.PluginError('scan cancelled', { code: 'JOB_CANCELLED', status: 409 });
+          cancelled();
           job.progress(Math.round((scanned / Math.max(1, usernames.length)) * 100), username);
-          const r = await ctx.agent.op('sec.clamav.scan', { usernames: [username], maxFileMb: settings.maxFileMb || 25 });
+          const chunks = await chunksOf(ctx, username, job);
+          for (const chunk of chunks) {
+            cancelled();
+            let r;
+            try {
+              r = await ctx.agent.op('sec.clamav.scan', { ...scanArgs, ...chunk.args });
+            } catch (err) {
+              // One chunk that times out or errors is a scan error, not the
+              // end of the run: the other chunks and accounts still get scanned.
+              chunksFailed++;
+              errors++;
+              job.log(`WARN ${username} ${chunk.label}: ${err.message}`);
+              continue;
+            }
+            chunksDone++;
+            errors += (r.errors || []).length;
+            for (const f of r.infected || []) { infected.push({ ...f, username }); job.log(`INFECTED ${f.file}: ${f.signature}`); }
+          }
           scanned++;
-          errors += (r.errors || []).length;
-          for (const f of r.infected || []) { infected.push({ ...f, username }); job.log(`INFECTED ${f.file}: ${f.signature}`); }
         }
       } catch (err) {
         await scans.update({ id: scan.id }, { finishedAt: ctx.now(), status: err.code === 'JOB_CANCELLED' ? 'cancelled' : 'failed', infected: infected.length, errors, error: err.message });
@@ -102,9 +144,9 @@ module.exports = {
       if (total > MAX_SCANS) for (const o of await scans.find({}, { sort: { startedAt: 1 }, limit: total - MAX_SCANS })) await scans.remove({ id: o.id });
       await ctx.store.set('lastScan', { scanner: 'clamav', at: started, infected: infected.length, accounts: usernames.length });
       const notified = await notifyFindings(ctx, 'ClamAV', infected.length, [...new Set(infected.map((f) => f.username))]);
-      await ctx.api.audit.record({ action: 'scan.clamav', target: wanted ? wanted.join(',') : 'all-accounts', details: { accounts: usernames.length, infected: infected.length, errors } });
+      await ctx.api.audit.record({ action: 'scan.clamav', target: wanted ? wanted.join(',') : 'all-accounts', details: { accounts: usernames.length, infected: infected.length, errors, chunks: chunksDone, chunksFailed } });
       job.progress(100, 'finished');
-      return { scanner: 'clamav', accounts: usernames.length, infected: infected.length, errors, notified, scanId: scan.id };
+      return { scanner: 'clamav', accounts: usernames.length, infected: infected.length, errors, chunks: chunksDone, chunksFailed, notified, scanId: scan.id };
     },
   },
 
@@ -171,4 +213,4 @@ module.exports = {
   },
 };
 
-module.exports.__test = { detect, ownerOf, VENDOR };
+module.exports.__test = { detect, ownerOf, chunksOf, VENDOR, SCAN_CALL_SEC };

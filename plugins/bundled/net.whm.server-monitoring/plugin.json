@@ -2,20 +2,21 @@
   "id": "net.whm.server-monitoring",
   "name": "Server Monitoring",
   "version": "1.0.0",
-  "description": "Samples load, memory, disk and network every minute, keeps a rolling history and raises alerts through Contact Manager when thresholds are crossed.",
+  "description": "Samples load, memory, disk and network on an in-process timer (every minute by default), keeps a rolling history and raises alerts through Contact Manager when thresholds are crossed.",
   "author": { "name": "WHM", "url": "https://trywhm.net" },
   "license": "MIT",
   "engines": { "whm": "^1.0.0" },
   "main": "main.js",
   "keywords": ["monitoring", "metrics", "alerts"],
   "permissions": [
-    "system:read", "store:own", "settings:own", "jobs", "schedule", "api:routes", "ui:sidebar", "contacts:notify", "audit:write",
+    "system:read", "store:own", "settings:own", "jobs", "api:routes", "ui:sidebar", "contacts:notify", "audit:write",
     "agent:op:sec.netdev.read"
   ],
   "settings": {
     "groups": [{ "id": "sampling", "label": "Sampling" }, { "id": "alerts", "label": "Alert thresholds" }],
     "fields": [
-      { "key": "enabled", "type": "toggle", "label": "Collect samples", "default": true, "group": "sampling", "help": "Sample the host every minute." },
+      { "key": "enabled", "type": "toggle", "label": "Collect samples", "default": true, "group": "sampling", "help": "Sample the host on an in-process timer; switching this off stops the timer." },
+      { "key": "intervalMin", "type": "number", "label": "Sampling interval (minutes)", "default": 1, "min": 1, "max": 60, "integer": true, "group": "sampling", "help": "Each sample stores one document (pruned by the retention window); network counters are read at most every 5 minutes." },
       { "key": "retentionDays", "type": "number", "label": "Retention (days)", "default": 7, "min": 1, "max": 30, "integer": true, "group": "sampling" },
       { "key": "netInterface", "type": "text", "label": "Network interface", "default": "", "group": "sampling", "maxLength": 15, "pattern": "^[a-zA-Z0-9._-]*$", "help": "Leave empty to sum every interface except loopback." },
       { "key": "alertsEnabled", "type": "toggle", "label": "Send alerts", "default": true, "group": "alerts", "help": "Notify the server contacts when a threshold is crossed." },
@@ -26,11 +27,8 @@
     ]
   },
   "jobs": {
-    "sample": { "label": "Sample metrics", "description": "Collect one sample and evaluate the alert thresholds.", "timeoutSec": 120, "cancellable": false }
+    "sample": { "label": "Sample metrics", "description": "Collect one sample now and evaluate the alert thresholds (the regular sampling runs on the in-process timer).", "timeoutSec": 120, "cancellable": false }
   },
-  "cron": [
-    { "name": "sample", "job": "sample", "schedule": "* * * * *" }
-  ],
   "ui": {
     "pages": [
       { "route": "/settings", "title": "Monitoring settings", "kind": "settings", "description": "Sampling, retention and alert thresholds." },

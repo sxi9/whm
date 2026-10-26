@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import request from 'supertest';
 import { authenticator } from 'otplib';
+import { catalog } from '@whm/agent';
 import { bootstrap } from '../src/index.js';
 import { AgentError } from '../src/lib/agent-client.js';
 
@@ -91,9 +92,30 @@ describe('bootstrap', () => {
     expect(ctx.db.prepare("SELECT username, role, must_change_password FROM users WHERE role = 'root'").get()).toEqual({ username: 'root', role: 'root', must_change_password: 0 });
     expect(fs.existsSync(path.join(tmp, 'master.key'))).toBe(true);
     expect(fs.existsSync(path.join(tmp, 'initial-admin-password.txt'))).toBe(false);
-    expect(agent.names()).toEqual(['sys.binaries', 'svc.list_units']);
+    // Detection asks for binaries in chunks of at most 100 names, then lists units once.
+    expect([...new Set(agent.names())]).toEqual(['sys.binaries', 'svc.list_units']);
+    expect(agent.names().at(-1)).toBe('svc.list_units');
+    expect(agent.calls.filter((c) => c.name === 'sys.binaries').every((c) => c.args.names.length >= 1 && c.args.names.length <= 100)).toBe(true);
     expect(ctx.capabilities.has('quota')).toBe(false);
     expect(ctx.capabilities.unitFor('httpd')).toBeNull();
+  });
+
+  it('detects capabilities within the agent schema limit however many categories register', async () => {
+    // Every category registers its programs; push the unique list well past sys.binaries' 100-name limit.
+    ctx.capabilities.register('test-overflow', { binaries: Array.from({ length: 120 }, (_, i) => `whm-test-bin-${i}`), required: ['whm-test-bin-0'] });
+    const callsTo = () => agent.calls.filter((c) => c.name === 'sys.binaries');
+    const before = callsTo().length;
+    await expect(ctx.capabilities.refresh()).resolves.toBeTruthy();
+    const calls = callsTo().slice(before);
+    expect(calls.length).toBeGreaterThan(1);
+    expect(calls.every((c) => catalog.get('sys.binaries').schema.safeParse(c.args).success)).toBe(true);
+    const names = calls.flatMap((c) => c.args.names);
+    expect(new Set(names).size).toBe(names.length);
+    expect(names).toContain('systemctl');
+    const snap = ctx.capabilities.snapshot();
+    expect(Object.keys(snap.binaries).length).toBe(names.length);
+    expect(snap.capabilities['test-overflow']).toMatchObject({ installed: false });
+    expect(snap.capabilities.systemd).toBeDefined();
   });
 });
 
