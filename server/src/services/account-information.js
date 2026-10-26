@@ -105,6 +105,9 @@ export function createAccountInformationService(ctx) {
   }
 
   const ownerWhere = (user, where, params) => { if (!isRoot(user)) { where.push('a.owner_id = @owner'); params.owner = user.id; } };
+  // Reseller ACL keys are owned by the Resellers category; the same keys gate the
+  // equivalent operations under Account Functions so neither route evades the other.
+  const requireAcl = (user, key) => { if (!isRoot(user)) ctx.resellers?.assertAcl?.(user, key); };
 
   function shapeEnhancement(row, extra = {}) {
     if (!row) return null;
@@ -398,6 +401,7 @@ export function createAccountInformationService(ctx) {
 
   function resetBandwidth(username, { all = false, period = currentPeriod() } = {}, user, req) {
     const account = loadAccount(username, user);
+    requireAcl(user, 'limit-bandwidth');
     db.transaction(() => {
       if (all) stmts.deleteBandwidthAll.run(account.id); else stmts.deleteBandwidth.run(account.id, period);
       stmts.setBandwidthUsed.run(all || period === currentPeriod() ? 0 : toMb(stmts.periodBytes.get(account.id, currentPeriod())?.bytes || 0), account.id);
@@ -477,6 +481,7 @@ export function createAccountInformationService(ctx) {
     },
     setForAccount(username, ids, user, req) {
       const account = loadAccount(username, user);
+      requireAcl(user, 'upgrade-account');
       const rows = ids.map((id) => { const r = stmts.enhancementBySlug.get(id); if (!r) throw notFound(`Enhancement "${id}"`); return r; });
       db.transaction(() => {
         stmts.clearAssignments.run(account.id);
@@ -487,6 +492,7 @@ export function createAccountInformationService(ctx) {
     },
     assign(username, id, user, req) {
       const account = loadAccount(username, user);
+      requireAcl(user, 'upgrade-account');
       const row = stmts.enhancementBySlug.get(id);
       if (!row) throw notFound('Enhancement');
       const { changes } = stmts.assign.run(account.id, row.id, user?.username ?? null);
@@ -496,6 +502,7 @@ export function createAccountInformationService(ctx) {
     },
     unassign(username, id, user, req) {
       const account = loadAccount(username, user);
+      requireAcl(user, 'upgrade-account');
       const row = stmts.enhancementBySlug.get(id);
       if (!row) throw notFound('Enhancement');
       if (!stmts.unassign.run(account.id, row.id).changes) throw notFound('Assignment');

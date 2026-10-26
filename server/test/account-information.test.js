@@ -401,6 +401,21 @@ describe('Account Information API', () => {
       await get('/bandwidth?period=2026-13').expect(422);
     });
 
+    it('requires the limit-bandwidth ACL for a reseller reset', async () => {
+      const root = { id: 1, username: 'root', role: 'root' };
+      app.ctx.resellers.setPrivileges('resell1', { acls: ['edit-account'] }, root, null);
+      try {
+        app.ctx.db.prepare('UPDATE accounts SET bandwidth_used_mb = 42 WHERE username = ?').run('alice');
+        const res = await rpost('/bandwidth/alice/reset').expect(403);
+        expect(res.body.error.message).toMatch(/Limit Bandwidth/i);
+        expect(app.ctx.db.prepare('SELECT bandwidth_used_mb FROM accounts WHERE username = ?').get('alice').bandwidth_used_mb).toBe(42);
+        app.ctx.resellers.setPrivileges('resell1', { acls: ['limit-bandwidth'] }, root, null);
+        await rpost('/bandwidth/alice/reset').expect(200);
+      } finally {
+        app.ctx.resellers.setPrivileges('resell1', { acls: ['all'] }, root, null);
+      }
+    });
+
     it('keeps the hourly collection and 6-hourly disk scan schedules registered', () => {
       const names = app.ctx.scheduler.list().map((s) => s.name);
       expect(names).toEqual(expect.arrayContaining(['account-bandwidth', 'account-disk-usage']));
@@ -455,6 +470,28 @@ describe('Account Information API', () => {
       expect(removed.body.data.map((e) => e.id)).toEqual(['cdn', 'extra-mailboxes-50']);
       await del('/accounts/alice/enhancements/bigger-db').expect(404);
       expect(app.ctx.accountInfo.enhancements.forAccount('alice', { role: 'root' }).map((e) => e.id)).toEqual(['cdn', 'extra-mailboxes-50']);
+    });
+
+    it('requires the upgrade-account ACL for reseller assignment changes', async () => {
+      const root = { id: 1, username: 'root', role: 'root' };
+      app.ctx.resellers.setPrivileges('resell1', { acls: ['edit-account', 'limit-bandwidth'] }, root, null);
+      try {
+        const before = (await rget('/accounts/alice/enhancements').expect(200)).body.data.map((e) => e.id);
+        for (const res of [
+          await rput('/accounts/alice/enhancements', { enhancements: ['cdn'] }),
+          await rpost('/accounts/alice/enhancements/bigger-db'),
+          await resellerHttp.delete('/api/account-info/accounts/alice/enhancements/cdn').set('X-CSRF-Token', resellerCsrf),
+        ]) {
+          expect(res.status, res.body.error?.message).toBe(403);
+          expect(res.body.error.message).toMatch(/Upgrade/i);
+        }
+        expect((await rget('/accounts/alice/enhancements').expect(200)).body.data.map((e) => e.id)).toEqual(before);
+        app.ctx.resellers.setPrivileges('resell1', { acls: ['upgrade-account'] }, root, null);
+        await rpost('/accounts/alice/enhancements/bigger-db').expect(201);
+        await resellerHttp.delete('/api/account-info/accounts/alice/enhancements/bigger-db').set('X-CSRF-Token', resellerCsrf).expect(200);
+      } finally {
+        app.ctx.resellers.setPrivileges('resell1', { acls: ['all'] }, root, null);
+      }
     });
 
     it('deleting an enhancement unassigns it everywhere', async () => {
