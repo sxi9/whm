@@ -1,6 +1,6 @@
 # Every page
 
-Captured 2026-10-26 at commit `68bfa1d` with `e2e/screenshot-all.cjs` (1280×800). **196 of 212 function pages are live**; the rest show the placeholder for their build phase. Each image carries its label bar. Click any thumbnail for full size.
+Captured 2026-10-26 at commit `de77602` with `e2e/screenshot-all.cjs` (1280×800). **196 of 212 function pages are live**; the rest show the placeholder for their build phase. Each image carries its label bar. Click any thumbnail for full size.
 
 ## Core pages
 
