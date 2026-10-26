@@ -37,6 +37,8 @@ export function AccountsTable({ suspendedOnly = false, toolbar }) {
       : { label: 'Suspend', onClick: async () => { if (await confirm({ title: `Suspend ${r.username}?`, message: 'The account\'s login is locked. Websites and mail are disabled until unsuspended.', confirmLabel: 'Suspend', danger: true })) act(`Suspended ${r.username}`, () => api.post(`/accounts/${r.username}/suspend`, { reason: 'Suspended from List Accounts' })); } },
     { label: 'Change password', onClick: () => navigate(`/account-functions/password-modification?username=${r.username}`) },
     { label: 'Upgrade/Downgrade', onClick: () => navigate(`/account-functions/upgrade-downgrade-an-account?username=${r.username}`) },
+    { label: 'Bandwidth usage', onClick: () => navigate(`/account-information/view-bandwidth-usage?username=${r.username}`) },
+    { label: 'Enhancements', onClick: () => navigate(`/account-information/manage-account-enhancements?username=${r.username}`) },
     { label: 'Terminate', danger: true, onClick: async () => { if (await confirm({ title: `Terminate ${r.username}?`, message: `This permanently deletes the Linux user, home directory, databases and DNS for ${r.domain}. This cannot be undone.`, confirmLabel: 'Terminate', danger: true, typeToConfirm: r.username })) act(`Terminated ${r.username}`, () => api.delete(`/accounts/${r.username}`)); } },
   ];
 
