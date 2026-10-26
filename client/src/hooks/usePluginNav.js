@@ -1,6 +1,7 @@
 import { createContext, createElement, useContext, useEffect, useMemo, useState } from 'react';
 import { api } from '../api/client.js';
 import { CATEGORIES, searchFunctions } from '../nav.js';
+import { useAuth } from '../auth/AuthContext.jsx';
 
 // Enabled plugins add sidebar entries at runtime. They are fetched once per
 // page load from GET /api/plugins/ui and merged into the categories nav.js
@@ -45,16 +46,27 @@ export function usePluginNav() {
   return useContext(PluginNavContext);
 }
 
-// nav.js categories with the plugin entries appended to their category.
+// The active Server Profile (Server Configuration) hides whole categories from the shell;
+// their routes stay reachable by URL, as in WHM.
+export function useHiddenCategories() {
+  const { user } = useAuth();
+  return user?.profile?.hiddenCategories || [];
+}
+
+export function mergeCategories(categories, entries, hidden = []) {
+  const visible = hidden.length ? categories.filter((cat) => !hidden.includes(cat.slug)) : categories;
+  if (!entries.length) return visible;
+  return visible.map((cat) => {
+    const extra = entries.filter((e) => e.categorySlug === cat.slug);
+    return extra.length ? { ...cat, functions: [...cat.functions, ...extra] } : cat;
+  });
+}
+
+// nav.js categories minus the profile-hidden ones, with the plugin entries appended to their category.
 export function useMergedCategories() {
   const { entries } = usePluginNav();
-  return useMemo(() => {
-    if (!entries.length) return CATEGORIES;
-    return CATEGORIES.map((cat) => {
-      const extra = entries.filter((e) => e.categorySlug === cat.slug);
-      return extra.length ? { ...cat, functions: [...cat.functions, ...extra] } : cat;
-    });
-  }, [entries]);
+  const hidden = useHiddenCategories();
+  return useMemo(() => mergeCategories(CATEGORIES, entries, hidden), [entries, hidden]);
 }
 
 export function searchEntries(entries, query) {
@@ -70,5 +82,6 @@ export function searchEntries(entries, query) {
 // searchFunctions() plus the plugin entries, for the top bar and the sidebar filter.
 export function useSearch() {
   const { entries } = usePluginNav();
-  return useMemo(() => (query) => [...searchFunctions(query), ...searchEntries(entries, query)], [entries]);
+  const hidden = useHiddenCategories();
+  return useMemo(() => (query) => [...searchFunctions(query), ...searchEntries(entries, query)].filter((f) => !hidden.includes(f.categorySlug)), [entries, hidden]);
 }

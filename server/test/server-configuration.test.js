@@ -131,6 +131,8 @@ describe('Server Configuration API', () => {
       expect(body.data.changes.length).toBeGreaterThan(0);
       const status = await app.http.get('/api/system/status').expect(200);
       expect(status.body.data.profile.hiddenCategories).toContain('email');
+      // The shell reads the profile from /auth/me to hide those categories.
+      expect((await app.http.get('/api/auth/me').expect(200)).body.data.profile.hiddenCategories).toContain('email');
       expect(app.ctx.serverConfig.profile.allows('email')).toBe(false);
       expect(auditCount('server_config.profile.set')).toBe(1);
       const back = await put('/profile', { name: 'standard' }).expect(200);

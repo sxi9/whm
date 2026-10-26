@@ -66,6 +66,8 @@ export function authRoutes(ctx) {
     res.json({ data: {
       user: auth.publicUser(req.user), csrfToken: issueCsrfToken(req, crypto), hostname: settings.get('basic.hostname'),
       mustEnroll2fa: Boolean(req.session?.mustEnroll2fa), policy: auth.policy(),
+      // The Server Profile decides which sidebar categories the shell shows.
+      profile: ctx.serverConfig?.profile?.summary?.() ?? { name: 'standard', hiddenCategories: [] },
     } });
   });
 

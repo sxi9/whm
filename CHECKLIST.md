@@ -16,7 +16,7 @@
 - **Wave-1 fix round done** (03:12): all 19 reviewer findings and the 6 integration seams closed per `docs/design/integration-contracts.md`; suites server 479 / agent 260 / client 5 green; final integration check passed.
 - **Wave 2 landed** (19:00 UTC, 100 agent runs, 0 errors): Account Functions (incl. real vhost/DNS/mail provisioning on Create Account), Account Information, Multi Account, Resellers, Backup, Transfers, Server Status, System Health, Server Configuration, Networking Setup, Server Contacts, System Reboot — 67 functions built, 49 new agent ops (316 total), migrations 012–023; suites server 807 / agent 381 / client 7 green, build + boot + e2e pass. 10 reviewer findings stayed open after two in-wave fix rounds and were closed by the **wave-2 fix round** (20:40: 27 agent runs, 0 open, final integration check pass) together with the critic's 6 integration gaps (`docs/design/integration-contracts.md` §11–21).
 - **Screenshots regenerated 20:44 UTC** at `de77602` (wave-2 fix round landed): all 212 function pages captured with label bars, **196/212 live** (the 67 in-flight wave-2 pages included; 16 wave-3 placeholders remain) — galleries in `docs/screenshots/`.
-- **Core plugin host merged** (20:55, `16286ee`): real implementation of the SDK host contract (signed packages, sandboxed plugins, per-plugin routes/jobs/cron/hooks, generic page renderer, sidebar injection); reviewed in 3 parity/security rounds with nothing open. Reseller nameservers now render into new zones (`521ae02`).
+- **Core plugin host merged** (20:55, `16286ee`): real implementation of the SDK host contract (signed packages, sandboxed plugins, per-plugin routes/jobs/cron/hooks, generic page renderer, sidebar injection); reviewed in 3 parity/security rounds with nothing open. Reseller nameservers now render into new zones (`521ae02`); the Server Profile's hidden categories are hidden by the shell (sidebar, Tools grid, search).
 - **Deferred to the end (user decision):** license server, plugin marketplace, plugin host, sample + automated-backup plugins (Phase 5).
 
 ## Timeline (actual + estimated)
@@ -43,7 +43,7 @@ a fix round ~15 min; most categories need one fix round.
 | Wave-2 fix round (10 open findings + 6 critic gaps; 1 fixer + 1 verifier per category, 12 categories) | done — 0 open, final integration check pass; suites server 861 / agent 410 / client 7, build + boot + e2e | 1 h 35 min | 20:40 |
 | Plugin host (core prerequisite for cPanel › Manage Plugins and the Plugins category) | done — built in an isolated worktree, 3 review rounds, 0 open, merged `16286ee` | 1 h 45 min | 20:55 |
 | **P2 wave 3** — Clusters, Themes, Market, cPanel, Support, Plugins (6; the three Plugins functions ship as real bundled SDK plugins) | launching ~21:05 | ~3 h | ~00:15 (27th) |
-| Integrate wave 3 → **all 212 functions live** (+ core follow-up: Server Profile hides categories in the shell) | pending | ~1.5 h | ~01:45 (27th) |
+| Integrate wave 3 → **all 212 functions live** | pending | ~1.5 h | ~01:45 (27th) |
 | **P5 deferred** — license server (`hub/license`), plugin host + marketplace (`hub/marketplace`, open dev registration with backend verification), `plugins/SDK.md`, sample plugin, automated-backup plugin | pending | ~5 h | ~06:45 (27th) |
 | **P6** — hardening pass, full e2e on a provisioned VM, Security Advisor rules (incl. the Oct-2026 PHP advisory check), final docs, performance | pending | ~2.5 h | ~09:15 (27th) |
 | **Total remaining** | | **~12.5 h wall-clock** (from 21:00 on the 26th) | |

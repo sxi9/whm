@@ -12,7 +12,7 @@ export function AuthProvider({ children }) {
     try {
       const { data } = await api.get('/auth/me');
       api.setCsrfToken(data.csrfToken);
-      setUser({ ...data.user, mustEnroll2fa: Boolean(data.mustEnroll2fa), policy: data.policy || {} });
+      setUser({ ...data.user, mustEnroll2fa: Boolean(data.mustEnroll2fa), policy: data.policy || {}, profile: data.profile || { name: 'standard', hiddenCategories: [] } });
       setHostname(data.hostname || '');
     } catch {
       setUser(null);

@@ -190,9 +190,9 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   in-wave fix rounds (Rearrange lock, domlog cap, replaceIp for multi-account IP changes, backup
   timeouts/domains/grants, transfers device nodes/removeSource/reseller DB move) and were closed by the
   **wave-2 fix round** (20:40, `whm-fix-wave` `args {wave: 2}`, 27 runs, 0 open, final check pass) together with
-  the critic's integration gaps. Core follow-ups still open: Server Profile `hiddenCategories` must hide
-  categories in the shell (Layout/sidebar/search); DNS Functions must honour `ensureZoneForDomain({ nameservers })`
-  for reseller nameservers; dead LEGACY registry rows for system-health removed. Core follow-ups done
+  the critic's integration gaps. Core follow-ups done afterwards: the shell hides the Server Profile's
+  `hiddenCategories` (`/api/auth/me` carries `profile`; `useMergedCategories`/`useSearch` filter by slug), DNS
+  Functions honours `ensureZoneForDomain({ nameservers })`, dead LEGACY registry rows removed. Core follow-ups done
   by hand: dead `sys.resolvers.set` op removed (networking-setup owns `resolver.*`), contracts doc
   §11–21, two load-sensitive tests made robust. Next: plugin host (core), then wave 3.
 - **2026-10-26 20:55: core plugin host merged** (`16286ee`, built in an isolated worktree from
