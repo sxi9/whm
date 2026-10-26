@@ -204,6 +204,14 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   the repo (`docs/design/license-server.md`, `plugins/sdk/`). When resuming Phase 5, write
   `plugins/SDK.md` against the committed `plugins/sdk/` code and design the marketplace
   to match its packaging/signing constants — do not regenerate the SDK code.
+- **Unattended operation:** the cloud container is reclaimed after idle periods and an in-process
+  workflow dies with it (happened 2026-10-26 05:38; resumed 14:27 from cache). A self-bound hourly
+  Routine `trig_015b4oBVtePikCYJAcFwKkTK` ("WHM build keep-alive check-in", minute :09) wakes this
+  session to resume the run, integrate finished waves, snapshot to git and move to the next step.
+  Current run: `wf_a559b157-423` (wave 2) — resume with
+  `Workflow({scriptPath: '<workflows>/scripts/whm-build-categories-wf_66434640-c00.js', resumeFromRunId: 'wf_a559b157-423', args: {wave: 2}})`;
+  wave 3 is a fresh run of the same script with `args: {wave: 3}`. Disable the Routine
+  (`update_trigger enabled=false`) once CHECKLIST.md is fully done.
 - This dev container has 4 CPUs → at most 2 concurrent subagents; plan fan-outs accordingly.
 - The container has `systemctl` and `useradd` but no Apache/BIND/Exim/MySQL daemons; the
   capability layer must make every page degrade gracefully here and work fully on a
