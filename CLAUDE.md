@@ -76,6 +76,7 @@ Nothing is registered by hand in shared files. Adding a category = adding files:
 
 | Piece | Where | Discovered by |
 |---|---|---|
+| Bundled plugin (Plugins category) | `plugins/bundled/<id>/{plugin.json,main.js,test/}` validated by `plugins/sdk/validate-manifest.js`, tested with `plugins/sdk/mock-host.js`, installed/enabled by the category's `register(ctx)` via `ctx.plugins.install({ dir })` (idempotent) | `ctx.plugins` (core host) |
 | Agent ops (privileged) | `agent/src/ops/<family>.js` — `defineOp('family.op', { schema, run, destructive })`, import `defineOp, arg, OpError` from `./registry.js`, `exec`/`hasBinary` from `../exec.js` | `agent/src/ops/index.js` auto-imports every file in the dir |
 | DB tables | `server/src/db/migrations/0NN_<category-slug>.sql` (number assigned per category; `CREATE TABLE IF NOT EXISTS`, `INSERT OR IGNORE` for defaults) | migration runner at boot |
 | Service | `server/src/services/<category-slug>.js` → `createXService(ctx)`; attach in register as `ctx.<shortName>`; use other services via `ctx.<name>` **inside methods only** | — |
@@ -194,6 +195,16 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   for reseller nameservers; dead LEGACY registry rows for system-health removed. Core follow-ups done
   by hand: dead `sys.resolvers.set` op removed (networking-setup owns `resolver.*`), contracts doc
   §11–21, two load-sensitive tests made robust. Next: plugin host (core), then wave 3.
+- **2026-10-26 20:55: core plugin host merged** (`16286ee`, built in an isolated worktree from
+  `docs/design/plugin-host.md`, 3 parity/security review rounds, 0 open): `ctx.plugins`
+  (`services/plugins.js`) is the real implementation of the SDK contract in `plugins/sdk/mock-host.js`
+  — signed `.whmplugin` packages (pure-JS tar reader `lib/tar.js`, Ed25519 keys in
+  `$WHM_DATA_DIR/plugin-keys/`, setting `plugins.require_signature`), sandboxed `ctx.fs`/require/net,
+  per-plugin routes under `/api/plugins/<id>/`, manage API under `/api/plugins/manage/*`, `GET /api/plugins/ui`
+  feeds the sidebar/tools/search (`client/src/hooks/usePluginNav.js`), generic renderer
+  `client/src/pages/plugins/PluginPage.jsx` for manifest page kinds. Migration 024. `HOST_API_VERSION = 1.0.0`.
+  Bundled plugins live under `plugins/bundled/<id>/` and are installed by their owning category with
+  `ctx.plugins.install({ dir })`. `plugins/SDK.md` is still Phase 5.
 - **Login/session policy is enforced in core** (`services/auth.js`, `middleware/auth.js`,
   `routes/auth.js`): session timeout, single session, password max age (users.password_changed_at
   via migration 001b), required 2FA for root/resellers (session flag `mustEnroll2fa` gates
