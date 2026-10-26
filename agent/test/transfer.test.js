@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { shellQuote, remoteCommand, parsePasswd, parseUserDomains, parseRsyncStats, summarizeArchive, parseCpUserFile, parseShadowHash, rsyncArgv, scanSql, createSqlCodeFilter, clientCommand, parseTarListing, unsafeMember, parseFingerprints } from '../src/ops/transfer.js';
+import { shellQuote, remoteCommand, parsePasswd, parseUserDomains, parseRsyncStats, summarizeArchive, parseCpUserFile, parseShadowHash, rsyncArgv, scanSql, createSqlCodeFilter, clientCommand, parseTarListing, unsafeMember, parseFingerprints, LISTING_ARGV } from '../src/ops/transfer.js';
 
 // exec is spied with the real implementation behind it so the tests prove an
 // op refused before any program ran. Remote ops are never executed against a
@@ -62,7 +62,7 @@ function buildArchive(dir) {
 // A hand-built ustar archive: tar cannot create device nodes without root, so
 // the headers are written directly (type '3' = char device, '4' = block device).
 function rawTar(dir, file, entries) {
-  const header = (name, { type = '0', mode = 0o644, size = 0, major = 0, minor = 0 } = {}) => {
+  const header = (name, { type = '0', mode = 0o644, size = 0, major = 0, minor = 0, uname = '', gname = '' } = {}) => {
     const b = Buffer.alloc(512);
     b.write(name, 0, 100);
     b.write(`${mode.toString(8).padStart(7, '0')}\0`, 100, 8);
@@ -72,6 +72,7 @@ function rawTar(dir, file, entries) {
     b.write('        ', 148, 8);
     b.write(type, 156, 1);
     b.write('ustar\0', 257, 6); b.write('00', 263, 2);
+    b.write(uname, 265, 32); b.write(gname, 297, 32);
     b.write(`${major.toString(8).padStart(7, '0')}\0`, 329, 8);
     b.write(`${minor.toString(8).padStart(7, '0')}\0`, 337, 8);
     let sum = 0; for (const x of b) sum += x;
@@ -261,11 +262,25 @@ describe('parsers', () => {
       'hrw-r--r-- 0/0               0 2026-10-26 19:08 cpmove-eve/homedir/hard link to cpmove-eve/homedir/index.html',
       '-rw-r--r-- 0/0               1 2026-10-26 19:08 /etc/cron.d/evil',
       '-rw-r--r-- 0/0               1 2026-10-26 19:08 cpmove-eve/homedir/../../../tmp/evil',
-      "tar: Removing leading `/' from member names",
+      '',
     ].join('\n'));
     expect(listing.map((e) => [e.type, e.name])).toEqual([['-', 'cpmove-eve/cp/eve'], ['d', 'cpmove-eve/homedir/'], ['b', 'cpmove-eve/homedir/sda'], ['c', 'cpmove-eve/homedir/tty'], ['l', 'cpmove-eve/homedir/link'], ['h', 'cpmove-eve/homedir/hard'], ['-', '/etc/cron.d/evil'], ['-', 'cpmove-eve/homedir/../../../tmp/evil']]);
     expect(listing[4].link).toBe('/etc/shadow');
     expect(listing.map(unsafeMember)).toEqual([null, null, expect.stringMatching(/block device/), expect.stringMatching(/character device/), null, null, expect.stringMatching(/absolute path/), expect.stringMatching(/\.\./)]);
+    // The screen is fail-closed: a line it cannot parse (an archive-supplied owner name shifting the
+    // columns, a tar diagnostic, a mode it does not know) refuses the archive instead of being skipped.
+    expect(LISTING_ARGV).toEqual(['--numeric-owner', '-tvf']);
+    for (const bad of [
+      'brw-rw---- a b/c d  8,0 1970-01-01 00:00 cpmove-bob/homedir/dev-sda',
+      'brw-rw---- root/root       8,0 2026-10-26 19:08 cpmove-eve/homedir/sda',
+      "tar: Removing leading `/' from member names",
+      'garbage',
+    ]) {
+      let thrown = null;
+      try { parseTarListing(`-rw-r--r-- 0/0 1 2026-10-26 19:08 cpmove-eve/cp/eve\n${bad}\n`); } catch (e) { thrown = e; }
+      expect(thrown?.code, bad).toBe('invalid_archive');
+      expect(thrown?.message, bad).toMatch(/could not be parsed/);
+    }
     expect(parseFingerprints('# Host src.example.com found: line 1 \nsrc.example.com ED25519 SHA256:abcDEF123+/=\n')).toEqual([{ type: 'ED25519', fingerprint: 'SHA256:abcDEF123+/=' }]);
     expect(parseFingerprints('256 SHA256:xyz987 [src.example.com]:2222 (ECDSA)\n')).toEqual([{ type: 'ECDSA', fingerprint: 'SHA256:xyz987' }]);
     expect(parseFingerprints('')).toEqual([]);
@@ -342,6 +357,29 @@ describe('cpmove archive ops', () => {
     expect(exec.mock.calls.some((c) => c[0] === 'tar' && c[1][0] === '-xf')).toBe(false);
     expect(exec.mock.calls.some((c) => c[0] === 'chown')).toBe(false);
     expect(fs.existsSync(dest)).toBe(false);
+    expect(exec.mock.calls.some((c) => c[0] === 'tar' && c[1][0] === '--numeric-owner' && c[1][1] === '-tvf')).toBe(true);
+    // The owner column comes from the archive's own uname/gname when tar prints names: spaces in
+    // them shift the columns, so the listing is requested numeric and anything else is refused.
+    for (const [file, entries] of [
+      ['devices-spaced-owner.tar', [
+        { name: 'cpmove-eve/homedir/', type: '5', uname: 'a b', gname: 'c d' }, { name: 'cpmove-eve/homedir/index.html', content: 'hi', uname: 'a b', gname: 'c d' },
+        { name: 'cpmove-eve/homedir/dev-sda', type: '4', mode: 0o660, major: 8, minor: 0, uname: 'a b', gname: 'c d' },
+        { name: 'cpmove-eve/homedir/dev-null', type: '3', mode: 0o666, major: 1, minor: 3, uname: 'x y z', gname: 'q r' },
+      ]],
+      ['devices-long-owner.tar', [
+        { name: 'cpmove-eve/homedir/index.html', content: 'hi', uname: 'a'.repeat(31), gname: 'g'.repeat(31) },
+        { name: 'cpmove-eve/homedir/dev-null', type: '3', mode: 0o666, major: 1, minor: 3, uname: 'a'.repeat(31), gname: 'g'.repeat(31) },
+      ]],
+    ]) {
+      const archivePath = rawTar(root, file, entries);
+      exec.mockClear();
+      const e = await opError(runOp('transfer.cpmove.extract', { path: archivePath, destination: dest, members: ['cpmove-eve/homedir/*'], stripComponents: 2, owner: 'eve' }, ctx));
+      expect(e.code, file).toBe('invalid_archive');
+      expect(e.message, file).toMatch(/device/);
+      expect(exec.mock.calls.some((c) => c[0] === 'tar' && c[1][0] === '-xf'), file).toBe(false);
+      expect(exec.mock.calls.some((c) => c[0] === 'chown'), file).toBe(false);
+      expect(fs.existsSync(dest), file).toBe(false);
+    }
     // Members outside the selected subtree do not matter; a device elsewhere in the archive leaves the dumps extractable.
     const only = rawTar(root, 'devices-elsewhere.tar', [{ name: 'cpmove-eve/mysql/eve_db.sql', content: 'CREATE TABLE t (id INT);\n' }, { name: 'cpmove-eve/homedir/sda', type: '4', major: 8, minor: 0 }]);
     expect(await runOp('transfer.cpmove.extract', { path: only, destination: `${root}/staging-eve`, members: ['cpmove-eve/mysql/eve_db.sql'], stripComponents: 2 }, ctx)).toMatchObject({ extracted: true });

@@ -187,9 +187,11 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   total), migrations 012–023, 12 services on ctx (names in the contract list above); suites server
   807 / agent 381 / client 7, build + boot + e2e green. Ten reviewer findings stayed open after the
   in-wave fix rounds (Rearrange lock, domlog cap, replaceIp for multi-account IP changes, backup
-  timeouts/domains/grants, transfers device nodes/removeSource/reseller DB move) and are tracked
-  `[~]` in CHECKLIST.md; the **wave-2 fix round** (`whm-fix-wave`, `args {wave: 2}`, issue files in the
-  session scratchpad `issues/`) closes them plus the critic's integration gaps. Core follow-ups done
+  timeouts/domains/grants, transfers device nodes/removeSource/reseller DB move) and were closed by the
+  **wave-2 fix round** (20:40, `whm-fix-wave` `args {wave: 2}`, 27 runs, 0 open, final check pass) together with
+  the critic's integration gaps. Core follow-ups still open: Server Profile `hiddenCategories` must hide
+  categories in the shell (Layout/sidebar/search); DNS Functions must honour `ensureZoneForDomain({ nameservers })`
+  for reseller nameservers; dead LEGACY registry rows for system-health removed. Core follow-ups done
   by hand: dead `sys.resolvers.set` op removed (networking-setup owns `resolver.*`), contracts doc
   §11–21, two load-sensitive tests made robust. Next: plugin host (core), then wave 3.
 - **Login/session policy is enforced in core** (`services/auth.js`, `middleware/auth.js`,

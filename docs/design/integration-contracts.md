@@ -136,8 +136,8 @@ tolerate absence (optional chaining).
 software's `os-update-check` schedule (job `software.update.check`) is the single scheduled check.
 server-configuration removes its `update-preferences-check` schedule (do not enqueue it; drop the
 `scheduler.ensure` call and delete the row in a new `020b_` migration), reads "last check" from
-software's settings through `ctx.software.update.status()`, and its "Check now" button calls
-`ctx.software.update.check()`. Update Preferences keeps owning the release channel / auto-update
+software's settings through `ctx.software.update.status()`, and its "Check now" button enqueues software's
+`software.update.check` job (`ctx.jobs.enqueue`), returning `202 { job }`. Update Preferences keeps owning the release channel / auto-update
 preference settings and passes them to software through `ctx.software.panel.setPreferences(...)` if
 that method exists, otherwise stores them under `updates.*` for software to read.
 

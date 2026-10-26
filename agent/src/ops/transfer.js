@@ -510,16 +510,22 @@ defineOp('transfer.cpmove.read_member', {
   },
 });
 
-// One line of "tar -tvf": mode, owner, size (or "major,minor" for devices),
-// date, time, name ("name -> target" for symlinks, "name link to target" for
-// hard links). The first character of the mode is the member type.
-const LISTING_LINE = /^([-bcdlhps?])[-rwxsStTX]{9}\s+\S+\s+\S+\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+(.*)$/;
+// One line of "tar --numeric-owner -tvf": mode, uid/gid, size (or
+// "major,minor" for devices), date, time, name ("name -> target" for
+// symlinks, "name link to target" for hard links). The first character of
+// the mode is the member type. The owner column is pinned to digits because
+// the archive's own uname/gname (which may contain spaces) would otherwise
+// shift the columns; a line that does not fit is a refusal, never a skip,
+// so the screen cannot be bypassed by a member it cannot read.
+const LISTING_LINE = /^([-bcdlhps?])[-rwxsStTX]{9}\s+\d+\/\d+\s+\S+\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?\s+(.*)$/;
+export const LISTING_ARGV = ['--numeric-owner', '-tvf'];
 
 export function parseTarListing(stdout) {
   const out = [];
   for (const line of String(stdout || '').split('\n')) {
+    if (!line.trim()) continue;
     const m = line.match(LISTING_LINE);
-    if (!m) continue;
+    if (!m) throw new OpError('invalid_archive', `listing line could not be parsed, so the archive cannot be screened before extraction: ${line.slice(0, 120)}`);
     let name = m[2];
     let link = null;
     const type = m[1];
@@ -559,7 +565,7 @@ defineOp('transfer.cpmove.extract', {
     // as a device node or outside the destination refuses the whole extraction.
     let listing;
     try {
-      listing = await exec('tar', ['-tvf', resolved, '--wildcards', '--no-anchored', '--', ...members], { timeoutMs: 86_400_000, allowFailure: true, maxBuffer: 256 * 1024 * 1024 });
+      listing = await exec('tar', [...LISTING_ARGV, resolved, '--wildcards', '--no-anchored', '--', ...members], { timeoutMs: 86_400_000, allowFailure: true, maxBuffer: 256 * 1024 * 1024 });
     } catch (err) {
       if (err.code === 'spawn_failed' && /maxBuffer/i.test(err.message)) throw new OpError('refused', `${path.basename(resolved)} lists too many members to screen before extraction; extract it by hand`);
       throw err;
