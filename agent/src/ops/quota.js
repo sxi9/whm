@@ -35,14 +35,17 @@ export function parseFstab(text) {
   return entries;
 }
 
+// Existing options (including "defaults") are kept verbatim so a line that
+// already carries the quota options is reported unchanged.
 export function withQuotaOptions(entry, { groupQuota = true } = {}) {
-  const options = entry.options.filter((o) => o !== 'defaults' || entry.options.length === 1);
-  const next = [...options];
+  const next = [...entry.options];
   if (!next.some((o) => USER_OPTS.test(o))) next.push(entry.fstype === 'xfs' ? 'uquota' : 'usrquota');
   if (groupQuota && !next.some((o) => GROUP_OPTS.test(o))) next.push(entry.fstype === 'xfs' ? 'gquota' : 'grpquota');
+  const changed = next.length !== entry.options.length;
+  if (!changed) return { options: next, line: entry.raw.trim(), changed };
   const fields = entry.raw.trim().split(/\s+/);
   fields[3] = next.join(',');
-  return { options: next, line: fields.join('\t') };
+  return { options: next, line: fields.join('\t'), changed };
 }
 
 function readFstab() {
@@ -89,6 +92,9 @@ async function describe(m, fstabEntries) {
   };
 }
 
+// Mountpoints are not run through ctx.assertAllowedPath: "/" and other roots
+// never live under an allowed root. Every op instead pins the argument to an
+// entry that actually exists in /proc/mounts or /etc/fstab before any exec.
 defineOp('quota.status', {
   description: 'Quota tools, mounted filesystems and whether user quotas are enabled on each',
   run: async () => {
@@ -108,8 +114,8 @@ defineOp('quota.fstab.enable', {
     const entry = parseFstab(text).find((e) => e.mountpoint === mountpoint);
     if (!entry) throw new OpError('not_found', `${FSTAB} has no entry for ${mountpoint}`);
     if (!SUPPORTED.has(entry.fstype)) throw new OpError('unsupported', `Disk quotas are not supported on ${entry.fstype} (${mountpoint})`);
-    const { line } = withQuotaOptions(entry, { groupQuota });
-    if (line.split(/\s+/)[3] === entry.options.join(',')) return { mountpoint, changed: false, line: entry.raw.trim() };
+    const { line, changed } = withQuotaOptions(entry, { groupQuota });
+    if (!changed) return { mountpoint, changed: false, line };
     const backup = `${FSTAB}.whm-bak`;
     fs.copyFileSync(FSTAB, backup);
     const lines = text.split('\n');

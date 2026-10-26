@@ -58,6 +58,7 @@ describe('System Health API', () => {
         return { pid, signal, user, elapsedSeconds };
       },
       'sys.process.renice': ({ pid, niceness }) => ({ pid, niceness }),
+      'fs.du': () => ({ bytes: 5 * 1024 * 1024 }),
     });
     app = await createTestApp({ agent });
     csrf = await app.login();
@@ -287,6 +288,14 @@ describe('System Health API', () => {
     expect(res.body.data.length).toBeGreaterThan(0);
     expect(res.body.data.every((k) => k.command === 'psybnc')).toBe(true);
     expect(res.body.meta).toMatchObject({ page: 1, pageSize: 2 });
+    // LIKE wildcards in the search are literal characters.
+    expect((await get('/api/system-health/bpk/kills?q=_').expect(200)).body.meta.total).toBe(0);
+    expect((await get('/api/system-health/bpk/kills?q=%25').expect(200)).body.meta.total).toBe(0);
+    expect((await get('/api/system-health/bpk/kills?q=%5C').expect(200)).body.meta.total).toBe(0);
+    app.ctx.db.prepare("INSERT INTO bpk_kills (pid, user, command, pattern, signal) VALUES (4242, 'alice', 'my_miner', 'my_miner', 'SIGKILL')").run();
+    expect((await get('/api/system-health/bpk/kills?q=_').expect(200)).body.data.map((k) => k.pid)).toEqual([4242]);
+    expect((await get('/api/system-health/bpk/kills?q=my_m').expect(200)).body.meta.total).toBe(1);
+    expect((await get('/api/system-health/bpk/kills?q=myXm').expect(200)).body.meta.total).toBe(0);
     const cleared = await del('/api/system-health/bpk/kills').expect(200);
     expect(cleared.body.data.removed).toBeGreaterThan(0);
     expect((await get('/api/system-health/bpk/kills').expect(200)).body.meta.total).toBe(0);
@@ -298,6 +307,18 @@ describe('System Health API', () => {
     expect(disk.body.data.filesystems[0]).toMatchObject({ mountpoint: '/', usedPercent: 20 });
     expect(disk.body.data.accounts.map((a) => a.username)).toEqual(['alice']);
     expect(disk.body.data.accounts[0]).toMatchObject({ domain: 'alice.com', owner: 'root', diskUsedMb: 0 });
+    expect(disk.body.data).toMatchObject({ sampledAt: null, canResample: true });
+    const accepted = await post('/api/system-health/disk/refresh').expect(202);
+    expect(accepted.body.data.job).toMatchObject({ type: 'account_info.disk_refresh' });
+    expect(auditRows('system_health.disk.resample')).toHaveLength(1);
+    app.ctx.jobs.start();
+    try {
+      const job = await waitForJob(app.ctx, accepted.body.data.job.id);
+      expect(job.status, job.error).toBe('done');
+    } finally { app.ctx.jobs.stop(); }
+    const resampled = (await get('/api/system-health/disk').expect(200)).body.data;
+    expect(resampled.sampledAt).toEqual(expect.any(String));
+    expect(resampled.accounts[0].diskUsedMb).toBe(5);
     const procs = await get('/api/system-health/processes?sort=mem&limit=3').expect(200);
     expect(procs.body.data).toHaveLength(3);
     expect(app.agent.callsTo('sys.processes').at(-1).args).toEqual({ sort: 'mem', limit: 3 });
@@ -319,7 +340,8 @@ describe('System Health API', () => {
     await put('/api/system-health/bpk/config', {}).expect(422);
     await put('/api/system-health/bpk/config', { signal: 'SIGFOO' }).expect(422);
     await put('/api/system-health/bpk/config', { scope: 'everyone' }).expect(422);
-    await put('/api/system-health/bpk/config', { exemptUsers: ['Root'] }).expect(422);
+    await put('/api/system-health/bpk/config', { exemptUsers: ['a;b'] }).expect(422);
+    await put('/api/system-health/bpk/config', { exemptUsers: ['-r'] }).expect(422);
     await put('/api/system-health/bpk/config', { retentionDays: 0 }).expect(422);
     await post('/api/system-health/bpk/scan', { dryRun: 'yes' }).expect(422);
     await post('/api/system-health/bpk/matches/0/kill').expect(422);
@@ -340,6 +362,7 @@ describe('System Health API', () => {
     expect((await rpost('/api/system-health/bpk/scan')).status).toBe(403);
     expect((await rpost('/api/system-health/bpk/patterns', { name: 'x' })).status).toBe(403);
     expect((await rpost('/api/system-health/bpk/matches/1001/kill')).status).toBe(403);
+    expect((await rpost('/api/system-health/disk/refresh')).status).toBe(403);
     expect((await reseller.put('/api/system-health/bpk/config').set('X-CSRF-Token', resellerCsrf).send({ enabled: false })).status).toBe(403);
     expect((await reseller.delete('/api/system-health/bpk/kills').set('X-CSRF-Token', resellerCsrf)).status).toBe(403);
     expect(signalled).toEqual([]);
@@ -363,18 +386,95 @@ describe('System Health API', () => {
     expect(run).toMatchObject({ trigger: 'manual', error: expect.stringMatching(/procps/) });
     expect(signalled).toEqual([]);
     const scheduleEnabled = () => app.ctx.scheduler.list().find((s) => s.name === 'system-health-bpk').enabled;
-    expect(overview.body.data.schedule).toMatchObject({ enabled: false, paused: 'procps_missing' });
-    expect(scheduleEnabled()).toBe(0);
+    // A missing binary is reported and makes the job skip, but the schedule row
+    // belongs to the enabled setting and the list, so it is left alone.
+    expect(overview.body.data.schedule).toMatchObject({ enabled: true, paused: 'procps_missing' });
+    expect(scheduleEnabled()).toBe(1);
     app.ctx.jobs.start();
     try {
       const job = await waitForJob(app.ctx, app.ctx.jobs.enqueue('system-health.bpk.scan').id);
       expect(job.status).toBe('done');
       expect(job.result).toEqual({ skipped: 'procps_missing' });
     } finally { app.ctx.jobs.stop(); }
+    expect(scheduleEnabled()).toBe(1);
     expect((await get('/api/system-health/disk').expect(200)).body.data.filesystems).toHaveLength(1);
     psInstalled = true;
     await app.ctx.capabilities.refresh();
     expect((await get('/api/system-health/bpk').expect(200)).body.data.schedule).toMatchObject({ enabled: true, paused: null });
     expect(scheduleEnabled()).toBe(1);
+  });
+
+  it('leaves a schedule paused in Configure cPanel Cron Jobs alone until the feature state itself flips', async () => {
+    const scheduleRow = () => app.ctx.scheduler.list().find((s) => s.name === 'system-health-bpk');
+    expect(scheduleRow().enabled).toBe(1);
+    app.ctx.scheduler.update('system-health-bpk', { enabled: false, cron: '*/15 * * * *' });
+    // Reads never write.
+    const overview = await get('/api/system-health/bpk').expect(200);
+    expect(overview.body.data.schedule).toMatchObject({ enabled: false, cron: '*/15 * * * *', paused: null });
+    expect(scheduleRow().enabled).toBe(0);
+    await get('/api/system-health/bpk/matches').expect(200);
+    await get('/api/system-health/bpk/patterns').expect(200);
+    expect(scheduleRow().enabled).toBe(0);
+    // Unrelated setting and list edits do not flip the feature state either.
+    await put('/api/system-health/bpk/config', { signal: 'SIGTERM', notify: false }).expect(200);
+    expect(scheduleRow().enabled).toBe(0);
+    const added = (await post('/api/system-health/bpk/patterns', { name: 'kinsing' }).expect(201)).body.data;
+    expect(scheduleRow().enabled).toBe(0);
+    await patch(`/api/system-health/bpk/patterns/${added.id}`, { note: 'miner' }).expect(200);
+    await del(`/api/system-health/bpk/patterns/${added.id}`).expect(200);
+    expect(scheduleRow().enabled).toBe(0);
+    // The scheduled job still honours the operator's pause: nothing is enqueued by the scheduler
+    // while enabled = 0, and a job enqueued by hand runs (the feature is armed).
+    expect(app.ctx.scheduler.list().filter((s) => s.enabled && s.name === 'system-health-bpk')).toHaveLength(0);
+    // Turning the feature off and on again hands the row back to the setting.
+    await put('/api/system-health/bpk/config', { enabled: false }).expect(200);
+    expect(scheduleRow().enabled).toBe(0);
+    await put('/api/system-health/bpk/config', { enabled: true, signal: 'SIGKILL', notify: true }).expect(200);
+    expect(scheduleRow()).toMatchObject({ enabled: 1, cron: '*/15 * * * *' });
+    app.ctx.scheduler.update('system-health-bpk', { cron: '*/10 * * * *' });
+  });
+
+  it('flags a scan whose process table hit the op limit as partial', async () => {
+    for (let pid = 10_000; pid < 15_100; pid++) processes.push(proc(pid, 'www-data', 'apache2', '/usr/sbin/apache2 -k start'));
+    const preview = await get('/api/system-health/bpk/matches').expect(200);
+    expect(preview.body.data).toMatchObject({ scanned: 5000, truncated: true, limit: 5000 });
+    const res = await post('/api/system-health/bpk/scan', { dryRun: true }).expect(200);
+    expect(res.body.data.truncated).toBe(true);
+    expect(res.body.data.run).toMatchObject({ scanned: 5000, matched: 4, error: null });
+    expect(JSON.parse(auditRows('system_health.bpk.scan').at(-1).args_redacted)).toMatchObject({ truncated: true, scanned: 5000 });
+    app.ctx.jobs.start();
+    try {
+      const job = await waitForJob(app.ctx, app.ctx.jobs.enqueue('system-health.bpk.scan').id);
+      expect(job.result).toMatchObject({ scanned: 5000, truncated: true });
+      const logs = app.ctx.jobs.get(job.id).logs;
+      expect(logs.some((l) => l.level === 'warn' && /cut at 5000 entries/.test(l.line))).toBe(true);
+    } finally { app.ctx.jobs.stop(); }
+    processes.length = 9;
+    expect((await post('/api/system-health/bpk/scan', { dryRun: true }).expect(200)).body.data).toMatchObject({ truncated: false });
+  });
+
+  it('kills processes owned by system users and bare UIDs instead of failing on every run', async () => {
+    processes.push(proc(3001, '_apt', 'bnc'), proc(3002, '1001', 'ircd'), proc(3003, 'Admin', 'ptlink'), proc(3004, `${'u'.repeat(31)}+`, 'eggdrop'));
+    const res = await post('/api/system-health/bpk/scan', {}).expect(200);
+    expect(res.body.data.run).toMatchObject({ matched: 8, killed: 8, failed: 0 });
+    expect(app.agent.callsTo('bpk.kill').map((c) => c.args.user)).toEqual(expect.arrayContaining(['_apt', '1001', 'Admin', `${'u'.repeat(31)}+`]));
+    expect((await get('/api/system-health/bpk/kills?user=_apt').expect(200)).body.data.map((k) => k.pid)).toEqual([3001]);
+    await put('/api/system-health/bpk/config', { exemptUsers: ['_apt', '1001'] }).expect(200);
+    expect((await get('/api/system-health/bpk/matches').expect(200)).body.data.matches.map((m) => m.pid)).not.toContain(3001);
+    await put('/api/system-health/bpk/config', { exemptUsers: [] }).expect(200);
+  });
+
+  it('enforces case-insensitive uniqueness of the list in the database and maps it to 409', async () => {
+    const indexes = app.ctx.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'bpk_patterns'").all().map((r) => r.name);
+    expect(indexes).toContain('idx_bpk_patterns_name_nocase');
+    expect(() => app.ctx.db.prepare('INSERT INTO bpk_patterns (name) VALUES (?)').run('EGGDROP')).toThrow(/UNIQUE constraint failed/);
+    expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM bpk_patterns WHERE name = 'EGGDROP'").get().n).toBe(0);
+    // The lost race (row appears between the pre-check and the insert) surfaces as the same 409.
+    const svc = app.ctx.systemHealth;
+    app.ctx.db.prepare('INSERT INTO bpk_patterns (name) VALUES (?)').run('RACEME');
+    expect(() => svc.updatePattern(app.ctx.db.prepare("SELECT id FROM bpk_patterns WHERE name = 'RACEME'").get().id, { name: 'raceme' }, null)).not.toThrow();
+    const res = await post('/api/system-health/bpk/patterns', { name: 'RaceMe' }).expect(409);
+    expect(res.body.error.code).toBe('conflict');
+    app.ctx.db.prepare("DELETE FROM bpk_patterns WHERE name = 'raceme'").run();
   });
 });

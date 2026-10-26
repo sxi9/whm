@@ -1,4 +1,6 @@
 import os from 'node:os';
+import net from 'node:net';
+import dns from 'node:dns/promises';
 import crypto from 'node:crypto';
 import { json, paginate } from '../db/index.js';
 import { notFound, unprocessable, CapabilityError, HttpError } from '../lib/errors.js';
@@ -13,25 +15,30 @@ export const SEVERITIES = ['info', 'warning', 'error', 'critical'];
 export const CHANNELS = ['email', 'sms', 'slack', 'pushover', 'webhook'];
 export const SMTP_SECURITY = ['none', 'starttls', 'tls'];
 
+// wired: false marks catalog entries no module raises yet (accounts and
+// backup.completed are core follow-ups, licensing is Phase 5); the UI says so
+// instead of letting admins subscribe to silence.
 export const EVENTS = [
-  { key: 'account.created', label: 'Account created', severity: 'info', group: 'Accounts' },
-  { key: 'account.suspended', label: 'Account suspended', severity: 'warning', group: 'Accounts' },
-  { key: 'account.terminated', label: 'Account terminated', severity: 'warning', group: 'Accounts' },
+  { key: 'account.created', label: 'Account created', severity: 'info', group: 'Accounts', wired: false },
+  { key: 'account.suspended', label: 'Account suspended', severity: 'warning', group: 'Accounts', wired: false },
+  { key: 'account.terminated', label: 'Account terminated', severity: 'warning', group: 'Accounts', wired: false },
+  { key: 'account.rearrange', label: 'Account move (Rearrange an Account) needs attention', severity: 'warning', group: 'Accounts' },
   { key: 'backup.failed', label: 'Backup failed', severity: 'error', group: 'Backups' },
-  { key: 'backup.completed', label: 'Backup completed', severity: 'info', group: 'Backups' },
+  { key: 'backup.completed', label: 'Backup completed', severity: 'info', group: 'Backups', wired: false },
   { key: 'service.down', label: 'Monitored service down', severity: 'error', group: 'Monitoring' },
   { key: 'service.restored', label: 'Monitored service back up', severity: 'info', group: 'Monitoring' },
   { key: 'disk.space.low', label: 'Disk space low', severity: 'warning', group: 'Monitoring' },
   { key: 'bpk.killed', label: 'Background Process Killer terminated processes', severity: 'warning', group: 'Security' },
-  { key: 'login.failed.blocked', label: 'Address blocked after failed logins', severity: 'warning', group: 'Security' },
+  { key: 'login.failed.blocked', label: 'Address blocked after failed logins', severity: 'warning', group: 'Security', wired: false },
   { key: 'login.new_ip', label: 'Login from a new address', severity: 'warning', group: 'Security' },
   { key: 'ssl.expiring', label: 'SSL certificate expiring', severity: 'warning', group: 'SSL' },
   { key: 'updates.available', label: 'Software updates available', severity: 'info', group: 'Software' },
-  { key: 'license.expiring', label: 'License expiring', severity: 'warning', group: 'Licensing' },
-  { key: 'license.invalid', label: 'License invalid or revoked', severity: 'error', group: 'Licensing' },
-  { key: 'license.activated', label: 'License activated or renewed', severity: 'info', group: 'Licensing' },
+  { key: 'license.expiring', label: 'License expiring', severity: 'warning', group: 'Licensing', wired: false },
+  { key: 'license.invalid', label: 'License invalid or revoked', severity: 'error', group: 'Licensing', wired: false },
+  { key: 'license.activated', label: 'License activated or renewed', severity: 'info', group: 'Licensing', wired: false },
   { key: 'test', label: 'Test notification', severity: 'info', group: 'Panel' },
-];
+].map((e) => ({ wired: true, ...e }));
+export const MANAGED_MAIL_USERS = ['root', 'nobody'];
 const EVENT_BY_KEY = new Map(EVENTS.map((e) => [e.key, e]));
 export const EVENT_KEY_RE = /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,3}$/;
 
@@ -81,6 +88,21 @@ export function maskAddress(channel, address) {
 
 const severityRank = (s) => Math.max(0, SEVERITIES.indexOf(s));
 
+// Addresses a webhook may not post to unless contacts.webhook.allow_private
+// is on: the panel runs as root next to metadata services and internal
+// admin ports, so a contact must not become an SSRF primitive.
+const PRIVATE_RANGES = new net.BlockList();
+for (const [addr, bits] of [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15], ['224.0.0.0', 4], ['240.0.0.0', 4]]) PRIVATE_RANGES.addSubnet(addr, bits, 'ipv4');
+for (const [addr, bits] of [['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8]]) PRIVATE_RANGES.addSubnet(addr, bits, 'ipv6');
+export function isPrivateAddress(address) {
+  const a = String(address || '').trim().replace(/^\[|\]$/g, '').replace(/%.*$/, '');
+  const mapped = a.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
+  if (mapped) return isPrivateAddress(mapped[1]);
+  const family = net.isIP(a);
+  if (!family) return false;
+  return PRIVATE_RANGES.check(a, family === 6 ? 'ipv6' : 'ipv4');
+}
+
 // Accepts notify({ event, subject, body, severity, data }) and the shorthand
 // notify('updates.available', payload) other categories use.
 export function normalizeNotification(eventOrMessage, payload) {
@@ -121,7 +143,11 @@ export function createServerContactsService(ctx) {
     upsertAlert: db.prepare(`INSERT INTO contact_alert_state (key, state, detail, last_notified_at) VALUES (@key, @state, @detail, @last_notified_at)
       ON CONFLICT (key) DO UPDATE SET state = excluded.state, detail = excluded.detail, last_notified_at = COALESCE(excluded.last_notified_at, last_notified_at)`),
     clearAlert: db.prepare('DELETE FROM contact_alert_state WHERE key = ?'),
-    expiringCerts: db.prepare("SELECT domain, not_after FROM ssl_certs WHERE installed = 1 AND not_after IS NOT NULL AND not_after <= datetime('now', ?) ORDER BY not_after"),
+    // not_after is stored as an ISO string by ssl-tls; datetime() normalises
+    // it so the text comparison does not depend on the "T" separator.
+    expiringCerts: db.prepare(`SELECT domain, not_after, 'vhost' AS kind FROM ssl_certs WHERE installed = 1 AND not_after IS NOT NULL AND datetime(not_after) <= datetime('now', @until)
+      UNION ALL SELECT service AS domain, not_after, 'service' AS kind FROM ssl_service_certs WHERE cert_pem IS NOT NULL AND not_after IS NOT NULL AND datetime(not_after) <= datetime('now', @until)
+      ORDER BY not_after`),
   };
 
   const SCHEDULE = 'server-contacts-check';
@@ -183,15 +209,30 @@ export function createServerContactsService(ctx) {
     if (Object.keys(fields).length) throw unprocessable('Contact validation failed', fields);
   }
 
+  // Loopback, link-local and RFC1918 targets are refused unless the admin
+  // allowed them; the name is resolved here and again before every post so a
+  // record that later points inside the network is caught too.
+  async function assertWebhookTarget(urlString) {
+    if (settings.get('contacts.webhook.allow_private', false)) return;
+    const host = new URL(urlString).hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    const refuse = (addr) => { const m = `Webhook target ${host}${addr && addr !== host ? ` (${addr})` : ''} is a loopback, link-local or private address; turn on "Allow webhooks to private addresses" in Contact Manager to use it`; throw new HttpError(422, 'private_target', m, { address: [m] }); };
+    if (host === 'localhost' || host.endsWith('.localhost')) refuse();
+    if (net.isIP(host)) { if (isPrivateAddress(host)) refuse(host); return; }
+    let records = [];
+    try { records = await dns.lookup(host, { all: true }); } catch { return; }
+    for (const r of records) if (isPrivateAddress(r.address)) refuse(r.address);
+  }
+
   // Validates the real address, then splits it into what is stored in the
   // address column (display form) and, for credential-bearing URLs, the
   // encrypted secret in config. Submitting the stored display form back
   // (the edit form does that) keeps the secret already on file.
-  function resolveAddress(channel, address, config, row = null) {
+  async function resolveAddress(channel, address, config, row = null) {
     const real = String(address).trim();
     const storedUrl = row && row.channel === channel && hasSecret(json.parse(row.config_json, {}).url_enc) && real === row.address ? decryptConfig(row).url : null;
     const effective = storedUrl || real;
     validateContact(channel, effective, config);
+    if (channel === 'webhook') await assertWebhookTarget(effective);
     const { display, secret } = maskAddress(channel, effective);
     const next = { ...config };
     if (secret) next.url_enc = ctx.crypto.encrypt(secret); else delete next.url_enc;
@@ -272,6 +313,7 @@ export function createServerContactsService(ctx) {
     return {
       host, port: Number(setting('contacts.smtp.port', 587)) || 587, security: setting('contacts.smtp.security', 'starttls'),
       username: setting('contacts.smtp.username', ''), password, allowSelfSigned: Boolean(settings.get('contacts.smtp.allow_self_signed')), prefer: Boolean(settings.get('contacts.smtp.prefer')),
+      allowPlaintextAuth: Boolean(settings.get('contacts.smtp.allow_plaintext_auth')),
     };
   }
 
@@ -307,9 +349,9 @@ export function createServerContactsService(ctx) {
     } else {
       const smtp = smtpConfig();
       try {
-        result = await sendSmtp({ ...smtp, rejectUnauthorized: !smtp.allowSelfSigned, from: sender, to: recipients, message: buildMessage({ from: sender, to: recipients, subject: cleanSubject, text: content, headers }), clientName: hostname() });
+        result = await sendSmtp({ ...smtp, rejectUnauthorized: !smtp.allowSelfSigned, allowPlaintextAuth: smtp.allowPlaintextAuth, from: sender, to: recipients, message: buildMessage({ from: sender, to: recipients, subject: cleanSubject, text: content, headers }), clientName: hostname() });
       } catch (err) {
-        if (err instanceof SmtpError) throw new HttpError(502, 'smtp_failed', `SMTP relay ${smtp.host}:${smtp.port}: ${err.message}`);
+        if (err instanceof SmtpError) throw new HttpError(err.code === 'plaintext_auth_refused' ? 422 : 502, err.code === 'plaintext_auth_refused' ? 'plaintext_auth_refused' : 'smtp_failed', `SMTP relay ${smtp.host}:${smtp.port}: ${err.message}`);
         throw err;
       }
     }
@@ -324,9 +366,11 @@ export function createServerContactsService(ctx) {
     } catch (err) {
       throw new HttpError(502, 'delivery_failed', `${new URL(url).host}: ${err.cause?.message || err.message}`);
     }
-    const text = (await res.text().catch(() => '')).slice(0, 500);
-    if (!res.ok) throw new HttpError(502, 'delivery_failed', `${new URL(url).host} answered ${res.status}${text ? `: ${text}` : ''}`);
-    return { status: res.status, body: text };
+    // The response body is not kept: it is foreign content and would land in
+    // the delivery log verbatim.
+    await res.text().catch(() => '');
+    if (!res.ok) throw new HttpError(502, 'delivery_failed', `${new URL(url).host} answered ${res.status}${res.statusText ? ` ${res.statusText}` : ''}`);
+    return { status: res.status };
   }
 
   async function deliver(row, msg, { req = null, test = false } = {}) {
@@ -346,7 +390,9 @@ export function createServerContactsService(ctx) {
         const payload = { event: msg.event, severity: msg.severity, subject: msg.subject, body: msg.body, data: msg.data, hostname: host, test, sentAt: new Date().toISOString() };
         const headers = { 'X-WHM-Event': msg.event };
         if (config.secret) headers['X-WHM-Signature'] = `sha256=${crypto.createHmac('sha256', config.secret).update(JSON.stringify(payload)).digest('hex')}`;
-        await postJson(targetUrl(row, config), payload, { headers });
+        const url = targetUrl(row, config);
+        await assertWebhookTarget(url);
+        await postJson(url, payload, { headers });
       } else if (row.channel === 'slack') {
         const icon = { info: ':information_source:', warning: ':warning:', error: ':x:', critical: ':rotating_light:' }[msg.severity];
         const text = `${icon} *${msg.subject}*${test ? ' _(test)_' : ''}\n${msg.body.slice(0, 2900)}\n_${host} · ${msg.event}_`;
@@ -368,14 +414,37 @@ export function createServerContactsService(ctx) {
     }
   }
 
+  // The domain Exim treats as its own ("@" in local_domains) so a message to
+  // root@<it> is expanded by /etc/aliases instead of being routed to DNS.
+  // Cached briefly; the panel hostname is the first candidate because the
+  // Basic Setup page tells admins to make it the FQDN.
+  let primaryHostCache = { at: 0, value: null };
+  async function eximPrimaryHostname() {
+    if (!capabilities.has('exim')) return null;
+    if (Date.now() - primaryHostCache.at < 10 * 60_000) return primaryHostCache.value;
+    let value = null;
+    try { const r = await agent.op('contacts.exim.primary_hostname'); value = r?.hostname && FQDN_RE.test(r.hostname) ? r.hostname : null; } catch { value = null; }
+    primaryHostCache = { at: Date.now(), value };
+    return value;
+  }
+
+  async function localRootAddress() {
+    const host = hostname();
+    if (FQDN_RE.test(host)) return `root@${host}`;
+    const exim = await eximPrimaryHostname();
+    if (exim) return `root@${exim}`;
+    const node = String(os.hostname() || '').toLowerCase();
+    if (FQDN_RE.test(node)) return `root@${node}`;
+    return `root@${host}.localdomain`;
+  }
+
   // With Exim on this host, root@<fqdn> is expanded by /etc/aliases. An SMTP
   // relay knows nothing about that file, so the forwarding targets saved from
   // Edit System Mail Preferences are addressed directly; a local account name
   // has no mailbox the relay could reach and is skipped.
-  function rootRecipients() {
-    const host = hostname();
+  async function rootRecipients() {
     const transport = mailTransport();
-    const rootAddress = `root@${FQDN_RE.test(host) ? host : 'localhost.localdomain'}`;
+    const rootAddress = await localRootAddress();
     if (transport !== 'smtp') {
       return { transport, rootAddress, to: transport ? [rootAddress] : [], skipped: [], error: transport ? null : 'Exim is not installed and no SMTP relay is configured, so mail for root cannot be sent.' };
     }
@@ -395,7 +464,7 @@ export function createServerContactsService(ctx) {
   // as a delivery with no contact.
   async function mailRoot(msg, req, { test = false } = {}) {
     const host = hostname();
-    const r = rootRecipients();
+    const r = await rootRecipients();
     const address = r.to.length ? r.to.join(', ') : r.rootAddress;
     const base = { contact_name: 'root (system mail)', channel: 'email', address, event: msg.event, severity: msg.severity, subject: msg.subject, test: test ? 1 : 0 };
     try {
@@ -417,11 +486,19 @@ export function createServerContactsService(ctx) {
     const rows = stmts.enabled.all().filter((row) => matches(row, msg));
     const deliveries = [];
     for (const row of rows) deliveries.push(await deliver(row, msg, { req }));
+    // Root mail with no transport, or over a relay with no forwarding address
+    // saved, is a configuration state the Mail Preferences page reports once;
+    // it is not logged as a failed delivery on every event.
+    let rootMail = null;
     const rootEvents = settings.get('contacts.root_mail_events', []) || [];
-    if (rootEvents.includes(msg.event) && mailTransport()) deliveries.push(await mailRoot(msg, req));
+    if (rootEvents.includes(msg.event)) {
+      const r = mailTransport() ? await rootRecipients() : { error: 'no mail transport' };
+      if (r.error) rootMail = { skipped: true, reason: r.error };
+      else deliveries.push(await mailRoot(msg, req));
+    }
     stmts.pruneDeliveries.run(`-${Number(setting('contacts.retention_days', 90)) || 90} days`);
     const sent = deliveries.filter((d) => d.status === 'sent').length;
-    return { event: msg.event, severity: msg.severity, subject: msg.subject, matched: rows.length, sent, failed: deliveries.length - sent, deliveries };
+    return { event: msg.event, severity: msg.severity, subject: msg.subject, matched: rows.length, sent, failed: deliveries.length - sent, deliveries, ...(rootMail ? { rootMail } : {}) };
   }
 
   // -------------------------------------------------------- scheduled check ---
@@ -455,7 +532,7 @@ export function createServerContactsService(ctx) {
             if (!state || cooldownOver(state, cfg.cooldownMinutes)) {
               await fire('service.down', `${s.displayName} is down on ${host}`, `${s.displayName} (unit ${s.unit}) is ${s.state}${s.subState ? `/${s.subState}` : ''}${s.restarts ? ` after ${s.restarts} restart(s)` : ''}.${s.error ? `\n${s.error}` : ''}\nOpen Service Manager to start it or enable automatic restart.`, 'error');
               stmts.upsertAlert.run({ key, state: 'down', detail: s.state, last_notified_at: new Date().toISOString().slice(0, 19).replace('T', ' ') });
-            } else if (!state) stmts.upsertAlert.run({ key, state: 'down', detail: s.state, last_notified_at: null });
+            }
           } else if (state) {
             result.services.restored.push(s.name);
             stmts.clearAlert.run(key);
@@ -488,18 +565,21 @@ export function createServerContactsService(ctx) {
     } catch (err) { log(`disk check skipped: ${err.message}`, 'warn'); result.disks.error = err.message; }
 
     try {
-      const certs = stmts.expiringCerts.all(`+${cfg.sslDays} days`);
+      const certs = stmts.expiringCerts.all({ until: `+${cfg.sslDays} days` });
+      const keyOf = (c) => (c.kind === 'service' ? `ssl:service:${c.domain}` : `ssl:${c.domain}`);
       for (const c of certs) {
-        const key = `ssl:${c.domain}`;
+        const key = keyOf(c);
         const days = Math.floor((new Date(`${c.not_after.replace(' ', 'T')}${/Z|[+-]\d\d:?\d\d$/.test(c.not_after) ? '' : 'Z'}`).getTime() - Date.now()) / 86_400_000);
-        result.ssl.expiring.push({ domain: c.domain, notAfter: c.not_after, daysRemaining: days });
+        const what = c.kind === 'service' ? `the ${c.domain} service certificate` : `the certificate for ${c.domain}`;
+        result.ssl.expiring.push({ domain: c.domain, kind: c.kind, notAfter: c.not_after, daysRemaining: days });
         const state = stmts.alertState.get(key);
         if (!state || cooldownOver(state, Math.max(cfg.cooldownMinutes, 1440))) {
-          await fire('ssl.expiring', `Certificate for ${c.domain} ${days < 0 ? 'has expired' : `expires in ${days} day(s)`}`, `The installed certificate for ${c.domain} is valid until ${c.not_after}. Renew it from SSL/TLS (AutoSSL or Install an SSL Certificate).`, days <= 3 ? 'error' : 'warning');
+          const where = c.kind === 'service' ? 'Manage Service SSL Certificates' : 'SSL/TLS (AutoSSL or Install an SSL Certificate)';
+          await fire('ssl.expiring', `${what[0].toUpperCase()}${what.slice(1)} ${days < 0 ? 'has expired' : `expires in ${days} day(s)`}`, `${what[0].toUpperCase()}${what.slice(1)} on ${host} is valid until ${c.not_after}. Renew it from ${where}.`, days <= 3 ? 'error' : 'warning');
           stmts.upsertAlert.run({ key, state: 'expiring', detail: c.not_after, last_notified_at: new Date().toISOString().slice(0, 19).replace('T', ' ') });
         }
       }
-      const current = new Set(certs.map((c) => `ssl:${c.domain}`));
+      const current = new Set(certs.map(keyOf));
       for (const row of stmts.alertStates.all()) if (row.key.startsWith('ssl:') && !current.has(row.key)) stmts.clearAlert.run(row.key);
     } catch (err) { log(`certificate check skipped: ${err.message}`, 'warn'); result.ssl.error = err.message; }
 
@@ -526,7 +606,8 @@ export function createServerContactsService(ctx) {
       fromAddress: setting('contacts.from_address', ''),
       effectiveFrom: (() => { try { return fromAddress(); } catch { return null; } })(),
       retentionDays: Number(setting('contacts.retention_days', 90)) || 90,
-      smtp: { host: smtp.host, port: smtp.port, security: smtp.security, username: smtp.username, password: { set: Boolean(smtp.password) }, allowSelfSigned: smtp.allowSelfSigned, prefer: smtp.prefer },
+      smtp: { host: smtp.host, port: smtp.port, security: smtp.security, username: smtp.username, password: { set: Boolean(smtp.password) }, allowSelfSigned: smtp.allowSelfSigned, prefer: smtp.prefer, allowPlaintextAuth: smtp.allowPlaintextAuth },
+      webhook: { allowPrivate: Boolean(settings.get('contacts.webhook.allow_private', false)) },
       check: checkConfig(),
     };
   }
@@ -541,14 +622,18 @@ export function createServerContactsService(ctx) {
     let aliasError = null;
     try { aliases = await agent.op('contacts.aliases.read'); } catch (err) { aliasError = { code: err.code, message: err.message }; }
     const host = hostname();
+    const savedFor = (user) => settings.get(`contacts.${user}_forward`, []) || [];
+    const fromAliases = (user) => (aliases ? (aliases.users?.[user] ?? (user === 'root' ? aliases.root : savedFor(user))) : savedFor(user));
     return {
       hostname: host,
-      rootAddress: `root@${FQDN_RE.test(host) ? host : 'localhost.localdomain'}`,
-      forwardTo: aliases ? aliases.root : settings.get('contacts.root_forward', []) || [],
+      rootAddress: await localRootAddress(),
+      forwardTo: fromAliases('root'),
+      users: Object.fromEntries(MANAGED_MAIL_USERS.map((u) => [u, fromAliases(u)])),
+      managedUsers: MANAGED_MAIL_USERS,
       aliases: aliases && { path: aliases.path, exists: aliases.exists, managed: aliases.managed, rebuildTool: aliases.rebuildTool, entries: aliases.entries },
       aliasError,
       rootMailEvents: settings.get('contacts.root_mail_events', []) || [],
-      rootDelivery: rootRecipients(),
+      rootDelivery: await rootRecipients(),
       events: EVENTS.filter((e) => e.key !== 'test'),
       capability: { exim: capabilities.has('exim'), mailTransport: mailTransport() },
     };
@@ -578,23 +663,23 @@ export function createServerContactsService(ctx) {
     list: () => stmts.all.all().map(shape),
     get: (id) => shape(load(id)),
 
-    create(input, req) {
+    async create(input, req) {
       const address = input.address;
       redactRequestAddress(req, input.channel, address);
       const events = normalizeEvents(input.events);
-      const { display, config } = resolveAddress(input.channel, address, mergeConfig(input.channel, input.config || {}));
+      const { display, config } = await resolveAddress(input.channel, address, mergeConfig(input.channel, input.config || {}));
       const { lastInsertRowid } = stmts.insert.run({ name: input.name?.trim() || '', channel: input.channel, address: display, events: JSON.stringify(events), enabled: input.enabled === false ? 0 : 1, config: JSON.stringify(config), min_severity: input.minSeverity || 'info' });
       audit(req, { action: 'contacts.create', target: display, args: { channel: input.channel, name: input.name, events, minSeverity: input.minSeverity || 'info' } });
       return shape(stmts.byId.get(lastInsertRowid));
     },
 
-    update(id, patch, req) {
+    async update(id, patch, req) {
       const row = load(id);
       const channel = patch.channel ?? row.channel;
       const address = patch.address ?? row.address;
       if (patch.address !== undefined) redactRequestAddress(req, channel, address);
       const events = patch.events !== undefined ? normalizeEvents(patch.events) : json.parse(row.events_json, ['*']);
-      const { display, config } = resolveAddress(channel, address, mergeConfig(channel, patch.config || {}, channel === row.channel ? json.parse(row.config_json, {}) : {}), row);
+      const { display, config } = await resolveAddress(channel, address, mergeConfig(channel, patch.config || {}, channel === row.channel ? json.parse(row.config_json, {}) : {}), row);
       stmts.update.run({ id: row.id, name: patch.name !== undefined ? patch.name.trim() : row.name, channel, address: display, events: JSON.stringify(events), enabled: (patch.enabled ?? Boolean(row.enabled)) ? 1 : 0, config: JSON.stringify(config), min_severity: patch.minSeverity ?? row.min_severity ?? 'info' });
       audit(req, { action: 'contacts.update', target: display, args: { ...patch, address: patch.address !== undefined ? display : undefined, config: patch.config ? Object.keys(patch.config) : undefined } });
       return shape(stmts.byId.get(id));
@@ -616,7 +701,7 @@ export function createServerContactsService(ctx) {
       audit(req, { action: 'contacts.test', target: row.address, args: { channel: row.channel, status: result.status, error: result.error } });
       if (result.status === 'failed') {
         if (result.code === 'capability_missing') throw new CapabilityError('exim', result.error);
-        throw new HttpError(result.httpStatus === 422 ? 422 : 502, result.code === 'smtp_failed' ? 'smtp_failed' : 'delivery_failed', result.error);
+        throw new HttpError(result.httpStatus === 422 ? 422 : 502, ['smtp_failed', 'private_target', 'plaintext_auth_refused'].includes(result.code) ? result.code : 'delivery_failed', result.error);
       }
       return result;
     },
@@ -659,7 +744,9 @@ export function createServerContactsService(ctx) {
         if (s.password !== undefined) values['contacts.smtp.password_enc'] = s.password ? ctx.crypto.encrypt(s.password) : '';
         if (s.allowSelfSigned !== undefined) values['contacts.smtp.allow_self_signed'] = Boolean(s.allowSelfSigned);
         if (s.prefer !== undefined) values['contacts.smtp.prefer'] = Boolean(s.prefer);
+        if (s.allowPlaintextAuth !== undefined) values['contacts.smtp.allow_plaintext_auth'] = Boolean(s.allowPlaintextAuth);
       }
+      if (patch.webhook?.allowPrivate !== undefined) values['contacts.webhook.allow_private'] = Boolean(patch.webhook.allowPrivate);
       if (patch.check) {
         const c = patch.check;
         if (c.enabled !== undefined) values['contacts.check.enabled'] = Boolean(c.enabled);
@@ -688,15 +775,20 @@ export function createServerContactsService(ctx) {
 
     mailPreferences,
 
-    async setMailPreferences({ forwardTo, rootMailEvents }, req) {
+    // forwardTo is root's list; users.<name> covers every managed system user
+    // (root again, or nobody). Host first, then the saved copy.
+    async setMailPreferences({ forwardTo, users, rootMailEvents }, req) {
       let aliases = null;
-      if (forwardTo !== undefined) {
-        const targets = [...new Set(forwardTo.map((t) => t.trim()).filter(Boolean))];
-        aliases = await agent.op('contacts.aliases.set_root', { targets }, { req });
-        settings.set('contacts.root_forward', targets);
+      const lists = { ...(users || {}) };
+      if (forwardTo !== undefined) lists.root = forwardTo;
+      for (const user of MANAGED_MAIL_USERS) {
+        if (lists[user] === undefined) continue;
+        const targets = [...new Set(lists[user].map((t) => t.trim()).filter(Boolean))];
+        aliases = user === 'root' ? await agent.op('contacts.aliases.set_root', { targets }, { req }) : await agent.op('contacts.aliases.set', { user, targets }, { req });
+        settings.set(`contacts.${user}_forward`, targets);
       }
       if (rootMailEvents !== undefined) settings.set('contacts.root_mail_events', [...new Set(rootMailEvents)]);
-      audit(req, { action: 'contacts.mail_preferences', target: 'root', args: { forwardTo, rootMailEvents, rebuild: aliases?.rebuild ?? null } });
+      audit(req, { action: 'contacts.mail_preferences', target: Object.keys(lists).join(',') || 'root', args: { forwardTo, users, rootMailEvents, rebuild: aliases?.rebuild ?? null } });
       return { ...(await mailPreferences()), rebuild: aliases?.rebuild ?? null };
     },
 
@@ -709,7 +801,7 @@ export function createServerContactsService(ctx) {
       audit(req, { action: 'contacts.mail.test', target: result.address, args: { transport: result.transport ?? mailTransport(), status: result.status, error: result.error } });
       if (result.status === 'failed') {
         if (result.code === 'capability_missing') throw new CapabilityError('exim', result.error);
-        throw new HttpError(result.httpStatus === 422 ? 422 : 502, result.code === 'smtp_failed' ? 'smtp_failed' : result.code === 'no_root_recipients' ? 'no_root_recipients' : 'delivery_failed', result.error);
+        throw new HttpError(result.httpStatus === 422 ? 422 : 502, ['smtp_failed', 'no_root_recipients', 'plaintext_auth_refused'].includes(result.code) ? result.code : 'delivery_failed', result.error);
       }
       return result;
     },

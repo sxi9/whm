@@ -59,7 +59,7 @@ export function TerminalView({ session, onExit, onClosed }) {
       if (event.type === 'open') setStatus('connected');
       else if (event.type === 'output') setState((s) => feedLines(s, event.data));
       else if (event.type === 'notice') setNotice(event.message);
-      else if (event.type === 'exit') { setStatus('exited'); setState((s) => feedLines(s, `\r\n[session ended${event.code != null ? ` with status ${event.code}` : event.reason ? ` (${event.reason})` : ''}]\r\n`)); onExit?.(event); }
+      else if (event.type === 'exit') { setStatus('exited'); setState((s) => feedLines(s, `\r\n[session ended${event.code != null ? ` with status ${event.code}` : event.message ? `: ${event.message}` : event.reason ? ` (${event.reason.replace(/_/g, ' ')})` : ''}]\r\n`)); onExit?.(event); }
       else if (event.type === 'error') { setStatus('error'); setNotice(event.message); }
     }, () => setStatus((s) => (s === 'exited' ? s : 'disconnected')));
     return close;

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import fs from 'node:fs';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
 import { ACL_GROUPS, ACL_KEYS } from '../src/services/resellers.js';
@@ -93,6 +94,15 @@ describe('Resellers API', () => {
       await post('/', { username: 'ghost', fromAccount: true }).expect(404);
       await post('/', { username: 'x', password: 'Stand-Alone-1!', acls: ['not-an-acl'] }).expect(422);
       await post('/', { username: 'x', password: 'Stand-Alone-1!', extra: 1 }).expect(422);
+      // Names of static routes and hosting accounts that were not asked for are refused.
+      for (const name of ['usage', 'catalog', 'email', 'reset', 'ownership', 'acl-lists']) await post('/', { username: name, password: 'Stand-Alone-1!' }).expect(422);
+      const collide = await post('/', { username: 'carol', password: 'Stand-Alone-1!' }).expect(409);
+      expect(collide.body.error.message).toMatch(/fromAccount/);
+      expect(app.ctx.db.prepare('SELECT owner_id FROM accounts WHERE username = ?').get('carol').owner_id).toBe(1);
+      // Two concurrent creates of the same name: one wins, the other is a 409, never a 500.
+      const race = await Promise.all([post('/', { username: 'racer', password: 'Stand-Alone-1!' }), post('/', { username: 'racer', password: 'Stand-Alone-1!' })]);
+      expect(race.map((r) => r.status).sort()).toEqual([201, 409]);
+      app.ctx.db.prepare('DELETE FROM users WHERE username = ?').run('racer');
       const login = await request.agent(app.ctx.app).post('/api/auth/login').send({ username: 'standalone', password: 'Stand-Alone-1!' });
       expect(login.status).toBe(200);
       expect(login.body.data.user.role).toBe('reseller');
@@ -114,6 +124,10 @@ describe('Resellers API', () => {
       const res = await put('/resell1', { maxAccounts: 2, maxDiskMb: 4096, oversellDisk: false, allowedPackages: ['default'], nameservers: ['ns1.resell1.com', 'ns2.resell1.com'], ownsNameservers: true, sharedIp: '203.0.113.11', notes: 'test' }).expect(200);
       expect(res.body.data.limits).toMatchObject({ max_accounts: 2, max_disk_mb: 4096, allowed_packages: ['default'], nameservers: ['ns1.resell1.com', 'ns2.resell1.com'], owns_nameservers: true, shared_ip: '203.0.113.11', notes: 'test' });
       expect(res.body.data.configured).toBe(true);
+      // Root's notes never reach the reseller itself.
+      expect((await rget('/resell1').expect(200)).body.data.limits).not.toHaveProperty('notes');
+      expect((await rget('/resell1/usage').expect(200)).body.data.limits).not.toHaveProperty('notes');
+      expect((await get('/resell1').expect(200)).body.data.limits.notes).toBe('test');
       await put('/resell1', { allowedPackages: ['no-such-package'] }).expect(422);
       await put('/resell1', { sharedIp: '198.51.100.1' }).expect(422);
       await put('/resell1', { maxAccounts: -1 }).expect(422);
@@ -235,10 +249,17 @@ describe('Resellers API', () => {
       // The Reseller Center edit modal sends the full (possibly empty) array too.
       await put('/resell1', { acls: [] }).expect(200);
       expect((await acct('post', '/', { username: 'erin', domain: 'erin.com' })).status).toBe(403);
-      // A reseller whose ACLs were never saved keeps ownership-only access.
+      // A reseller row written outside this API (no ACL rows) is unrestricted by ACLs
+      // (integration contract 10) until migration 015c seeds the default list at boot.
       const legacy = await app.createUser('legacy', 'reseller');
       expect(app.ctx.resellers.hasAcl({ id: legacy.id, role: 'reseller' }, 'kill-acct')).toBe(true);
       expect((await get('/legacy').expect(200)).body.data).toMatchObject({ acls_configured: false, acl_count: 0 });
+      app.ctx.db.exec(fs.readFileSync(new URL('../src/db/migrations/015c_resellers-legacy-acls.sql', import.meta.url), 'utf8'));
+      expect(app.ctx.resellers.hasAcl({ id: legacy.id, role: 'reseller' }, 'kill-acct')).toBe(false);
+      expect(app.ctx.resellers.hasAcl({ id: legacy.id, role: 'reseller' }, 'create-acct')).toBe(true);
+      expect((await get('/legacy').expect(200)).body.data).toMatchObject({ acls_configured: true, acls: expect.arrayContaining(['list-accts', 'create-acct']) });
+      // Already-configured resellers are left alone by the seed.
+      expect(app.ctx.resellers.hasAcl({ id: reseller.id, role: 'reseller' }, 'create-acct')).toBe(false);
       app.ctx.db.prepare('DELETE FROM users WHERE id = ?').run(legacy.id);
       await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages'] }).expect(200);
     });
@@ -371,8 +392,36 @@ describe('Resellers API', () => {
       const none = await put('/resell1/shared-ip', { sharedIp: null }).expect(200);
       expect(none.body.data).toMatchObject({ shared_ip: null, effective_shared_ip: '203.0.113.10' });
       await put('/resell1/shared-ip', { sharedIp: '198.51.100.1' }).expect(422);
+      await put('/resell1/shared-ip', { sharedIp: '203.0.113.13' }).expect(409);
+      app.ctx.db.prepare('INSERT INTO ip_addresses (address, family, netmask, interface, is_main, managed) VALUES (?, 4, ?, ?, 0, 0)').run('203.0.113.16', '255.255.255.0', 'eth0');
+      await put('/resell1/shared-ip', { sharedIp: '203.0.113.16' }).expect(400);
       await put('/resell1/shared-ip', {}).expect(422);
       await rput('/resell1/shared-ip', { sharedIp: null }).expect(403);
+    });
+
+    it('stops using a shared IP that was removed, delegated elsewhere or un-delegated', async () => {
+      const me = { id: reseller.id, role: 'reseller' };
+      await put('/resell1/ips', { addresses: ['203.0.113.12'] }).expect(200);
+      await put('/resell1/shared-ip', { sharedIp: '203.0.113.12' }).expect(200);
+      expect(app.ctx.resellers.sharedIpFor(me)).toBe('203.0.113.12');
+      expect(app.ctx.resellers.createPolicy(me, { pkgName: 'default', plan: {} }).sharedIp).toBe('203.0.113.12');
+      // Un-delegating the address clears the reseller shared IP with it.
+      const cleared = await put('/resell1/ips', { addresses: [] }).expect(200);
+      expect(cleared.body.data.shared_ip_cleared).toBe('203.0.113.12');
+      expect((await get('/resell1').expect(200)).body.data.limits.shared_ip).toBeNull();
+      expect(app.ctx.resellers.sharedIpFor(me)).toBeNull();
+      // A free address set by root stays usable until IP Functions removes it or another reseller gets it.
+      await put('/resell1/shared-ip', { sharedIp: '203.0.113.12' }).expect(200);
+      expect(app.ctx.resellers.sharedIpFor(me)).toBe('203.0.113.12');
+      expect(() => app.ctx.resellers.createPolicy(me, { pkgName: 'default', plan: {}, ip: '203.0.113.12' })).not.toThrow();
+      const aliceId = app.ctx.db.prepare('SELECT id FROM users WHERE username = ?').get('alice').id;
+      app.ctx.db.prepare('UPDATE ip_addresses SET delegated_to = ? WHERE address = ?').run(aliceId, '203.0.113.12');
+      expect(app.ctx.resellers.sharedIpFor(me)).toBeNull();
+      expect(() => app.ctx.resellers.createPolicy(me, { pkgName: 'default', plan: {}, ip: '203.0.113.12' })).toThrow(/not delegated/);
+      app.ctx.db.prepare('DELETE FROM ip_addresses WHERE address = ?').run('203.0.113.12');
+      expect(app.ctx.resellers.createPolicy(me, { pkgName: 'default', plan: {} }).sharedIp).toBeNull();
+      app.ctx.db.prepare('INSERT INTO ip_addresses (address, family, netmask, interface, is_main) VALUES (?, 4, ?, ?, 0)').run('203.0.113.12', '255.255.255.0', 'eth0');
+      await put('/resell1/shared-ip', { sharedIp: null }).expect(200);
     });
   });
 
@@ -394,6 +443,7 @@ describe('Resellers API', () => {
       const res = await post('/ownership', { usernames: ['carol', 'dave', 'ghost'], owner: 'root' }).expect(200);
       expect(res.body.data).toMatchObject({ owner: 'root', changed: 2, failed: 1 });
       expect(res.body.data.results.find((r) => r.username === 'ghost')).toMatchObject({ changed: false, code: 'not_found' });
+      expect(app.ctx.db.prepare("SELECT principal FROM audit_log WHERE action = 'account.owner.change' AND target = 'dave' ORDER BY id DESC").get().principal).toBe('root');
       await post('/ownership', { usernames: [], owner: 'root' }).expect(422);
       await post('/ownership', { usernames: ['carol'], owner: 'nobody' }).expect(404);
       const shown = await get('/resell1/accounts').expect(200);
@@ -482,16 +532,18 @@ describe('Resellers API', () => {
   });
 
   describe('Reset Resellers', () => {
-    it('strips privileges, moves accounts to root and keeps the login', async () => {
+    it('strips privileges, moves accounts to root and parks a standalone login', async () => {
       await put('/resell1/ips', { addresses: ['203.0.113.12'] }).expect(200);
       const res = await post('/reset', { usernames: ['resell1', 'carol', 'ghost'] }).expect(200);
       expect(res.body.data.moved_to).toBe('root');
       // carol is a hosting account, not a panel user, so it is "missing" like ghost.
       expect(res.body.data.missing).toEqual(['carol', 'ghost']);
-      expect(res.body.data.results.find((r) => r.username === 'resell1')).toMatchObject({ reset: true, accounts_moved: ['bob', 'dave'], ips_released: ['203.0.113.12'] });
+      expect(res.body.data.results.find((r) => r.username === 'resell1')).toMatchObject({ reset: true, accounts_moved: ['bob', 'dave'], ips_released: ['203.0.113.12'], login_suspended: true });
       expect(res.body.data.results).toHaveLength(1);
-      const user = app.ctx.db.prepare('SELECT role FROM users WHERE id = ?').get(reseller.id);
-      expect(user.role).toBe('user');
+      const user = app.ctx.db.prepare('SELECT role, suspended FROM users WHERE id = ?').get(reseller.id);
+      // resell1 has no hosting account, so the orphaned login cannot be used.
+      expect(user).toMatchObject({ role: 'user', suspended: 1 });
+      expect((await request.agent(app.ctx.app).post('/api/auth/login').send({ username: 'resell1', password: reseller.password })).status).not.toBe(200);
       expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM accounts WHERE owner_id = ?').get(reseller.id).n).toBe(0);
       expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM reseller_acls WHERE reseller_id = ?').get(reseller.id).n).toBe(0);
       expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM reseller_limits WHERE reseller_id = ?').get(reseller.id).n).toBe(0);
@@ -501,11 +553,23 @@ describe('Resellers API', () => {
       // The reset user's sessions are gone (a mutation trips CSRF first, a read is 401).
       expect([401, 403]).toContain((await rpost('/reset', { all: true })).status);
       await rget('/resell1').expect(401);
-      // A reset user can be promoted again, keeping its password.
+      // A reset user can be promoted again, keeping its password; root re-enables the login.
       const again = await post('/', { username: 'resell1', acls: ['list-accts'] }).expect(201);
       expect(again.body.data.initialPassword).toBeUndefined();
+      expect(app.ctx.db.prepare('SELECT suspended FROM users WHERE id = ?').get(reseller.id).suspended).toBe(0);
+      expect((await request.agent(app.ctx.app).post('/api/auth/login').send({ username: 'resell1', password: reseller.password })).status).toBe(200);
+      // alice was made from a hosting account: a login suspension applied for another
+      // reason survives the reset, and the login itself is kept.
+      const aliceId = app.ctx.db.prepare('SELECT id FROM users WHERE username = ?').get('alice').id;
+      app.ctx.db.prepare('UPDATE users SET suspended = 1 WHERE id = ?').run(aliceId);
       const all = await post('/reset', { all: true }).expect(200);
       expect(all.body.data.results.filter((r) => r.reset).map((r) => r.username).sort()).toEqual(['alice', 'resell1', 'standalone']);
+      expect(all.body.data.results.find((r) => r.username === 'alice')).toMatchObject({ login_suspended: true });
+      expect(app.ctx.db.prepare('SELECT suspended FROM users WHERE id = ?').get(aliceId).suspended).toBe(1);
+      app.ctx.db.prepare('UPDATE users SET suspended = 0 WHERE id = ?').run(aliceId);
+      const alice2 = await post('/', { username: 'alice', fromAccount: true }).expect(201);
+      expect((await post('/reset', { usernames: ['alice'] }).expect(200)).body.data.results[0]).toMatchObject({ login_suspended: false });
+      expect(app.ctx.db.prepare('SELECT suspended FROM users WHERE id = ?').get(alice2.body.data.id).suspended).toBe(0);
       expect((await get('/').expect(200)).body.data).toEqual([]);
     });
   });

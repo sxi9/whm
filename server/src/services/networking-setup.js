@@ -1,4 +1,5 @@
 import { badRequest, conflict, unprocessable } from '../lib/errors.js';
+import { fields } from '../lib/validate.js';
 
 export const HOSTS_PATH = '/etc/hosts';
 export const RESOLV_PATH = '/etc/resolv.conf';
@@ -7,6 +8,9 @@ export const RESOLVED_UNIT = 'systemd-resolved';
 // Debian's conventional loopback entry for the local hostname when no stable IP exists.
 export const LOOPBACK_HOSTNAME_IP = '127.0.1.1';
 export const MAX_RESOLVERS = 4;
+// Per-name budget of a live resolver test; the names run in parallel per server.
+export const RESOLVER_TEST_TIMEOUT_MS = 1500;
+export const DEFAULT_TEST_NAMES = ['example.com', 'example.net'];
 
 const RESERVED_HOSTNAMES = new Set(['localhost', 'localhost.localdomain', 'localhost6', 'localhost6.localdomain6', 'ip6-localhost', 'ip6-loopback', 'ip6-localnet', 'ip6-mcastprefix', 'ip6-allnodes', 'ip6-allrouters', 'ip6-allhosts']);
 const RESERVED_LABELS = new Set(['localhost', 'localhost6', 'ip6-localhost', 'ip6-loopback']);
@@ -60,31 +64,39 @@ function renderHostsLine(line) {
 }
 
 // Returns the hosts file with `hostname` (and its short name) mapped to `ip`
-// and the previous hostname dropped everywhere else, preserving every other
+// and the previous hostname(s) dropped everywhere else, preserving every other
 // entry, comment and blank line. Idempotent: `changed` is false when the file
-// already says exactly this. Loopback names (localhost, localhost.localdomain,
-// ip6-*) are never dropped, whatever the previous or new hostname was: on a
-// stock Debian ("localhost") or RHEL ("localhost.localdomain") image the first
-// hostname change would otherwise leave the box without a localhost mapping.
+// already says exactly this. `previous` takes the kernel hostname and the
+// panel's own setting: the kernel may report the short name while the file
+// lists the FQDN, so on a line that carried a previous name every alias that
+// shares its first label goes too. Loopback names (localhost,
+// localhost.localdomain, ip6-*) are never dropped, whatever the previous or
+// new hostname was: on a stock Debian ("localhost") or RHEL
+// ("localhost.localdomain") image the first hostname change would otherwise
+// leave the box without a localhost mapping.
 export function updateHostsFile(text, { ip, hostname, previous = null, ipv6 = null }) {
   const fqdn = normalizeHostname(hostname);
   const short = fqdn.split('.')[0];
-  const prev = previous ? normalizeHostname(previous) : null;
-  const prevShort = prev && prev !== fqdn ? prev.split('.')[0] : null;
-  const drop = new Set([fqdn, short, prev && prev !== fqdn ? prev : null].filter((n) => n && !RESERVED_HOSTNAMES.has(n)));
+  const prevs = [...new Set((Array.isArray(previous) ? previous : [previous]).map((p) => (p ? normalizeHostname(p) : null)).filter((p) => p && p !== fqdn && !RESERVED_HOSTNAMES.has(p)))];
+  const prevShorts = new Set(prevs.map((p) => p.split('.')[0]).filter((l) => l !== short && !RESERVED_HOSTNAMES.has(l)));
+  const drop = new Set([fqdn, short, ...prevs].filter((n) => n && !RESERVED_HOSTNAMES.has(n)));
   const original = String(text ?? '');
   const lines = parseHosts(original);
   const kept = [];
   for (const line of lines) {
     if (!line.ip) { kept.push(line); continue; }
-    const hadPrev = prev ? line.names.includes(prev) : false;
+    const lowerNames = line.names.map((n) => n.toLowerCase());
+    const hadPrev = lowerNames.some((n) => prevs.includes(n) || prevShorts.has(n));
     const names = line.names.filter((n) => {
       const lower = n.toLowerCase();
       if (drop.has(lower)) return false;
-      if (hadPrev && prevShort && lower === prevShort && !RESERVED_HOSTNAMES.has(lower)) return false;
+      if (hadPrev && !RESERVED_HOSTNAMES.has(lower) && prevShorts.has(lower.split('.')[0])) return false;
       return true;
     });
-    if (!names.length && !line.comment) continue;
+    if (!names.length) {
+      if (line.comment) kept.push({ raw: line.comment, ip: null, names: [], comment: line.comment });
+      continue;
+    }
     kept.push({ ...line, names });
   }
   const targets = [[ip, 'IPv4'], ipv6 ? [ipv6, 'IPv6'] : null].filter(Boolean);
@@ -161,10 +173,17 @@ export function createNetworkingSetupService(ctx) {
     return info?.interfaces?.flatMap((i) => i.addresses || []).find((a) => a.family === family && !skip.test(a.address))?.address ?? null;
   }
 
+  // Settings written by other modules are not trusted to be well formed: a bad
+  // address must never reach /etc/hosts.
+  const validAddress = (value, schema) => {
+    const v = String(value ?? '').trim();
+    return v && schema.safeParse(v).success ? v : null;
+  };
+
   async function mainAddresses(info) {
-    const ipv4 = settings.get('basic.main_ip', '') || firstGlobal(info, 'IPv4');
-    const ipv6 = settings.get('basic.main_ipv6', '') || null;
-    return { ipv4: ipv4 || null, ipv6, detectedIpv4: firstGlobal(info, 'IPv4'), configuredIpv4: settings.get('basic.main_ip', '') || null };
+    const ipv4 = validAddress(settings.get('basic.main_ip', ''), fields.ipv4) || firstGlobal(info, 'IPv4');
+    const ipv6 = validAddress(settings.get('basic.main_ipv6', ''), fields.ipv6);
+    return { ipv4: ipv4 || null, ipv6, detectedIpv4: firstGlobal(info, 'IPv4'), configuredIpv4: validAddress(settings.get('basic.main_ip', ''), fields.ipv4) };
   }
 
   async function readFile(path) {
@@ -185,7 +204,7 @@ export function createNetworkingSetupService(ctx) {
     return stmts.domainOwner.get(hostname, hostname) || null;
   }
 
-  async function resolveWith(name, server, timeoutMs = 3000) {
+  async function resolveWith(name, server, timeoutMs = RESOLVER_TEST_TIMEOUT_MS) {
     const started = Date.now();
     try {
       const r = await agent.op('dns.resolve', { name, type: 'A', servers: server ? [server] : undefined, timeoutMs });
@@ -217,6 +236,22 @@ export function createNetworkingSetupService(ctx) {
       return { installed: Boolean(st.installed), active: Boolean(st.active) };
     } catch { return { installed: false, active: false }; }
   }
+
+  // What systemd-resolved actually forwards to; the stub file only ever lists 127.0.0.53.
+  async function resolvedUpstream(resolved) {
+    if (!resolved.active || !capabilities.has('resolvectl')) return null;
+    try {
+      const r = await agent.op('resolver.upstream', {});
+      if (!Array.isArray(r?.servers)) return null;
+      return { source: r.source ?? 'resolvectl', global: r.global ?? [], links: r.links ?? [], servers: r.servers };
+    } catch (err) {
+      logger.warn({ err }, 'resolvectl dns failed');
+      return null;
+    }
+  }
+
+  const isLoopback = (ip) => /^127\./.test(ip || '') || ip === '::1';
+  const previousHostnames = (info) => [info?.hostname, settings.get('basic.hostname', '')].filter(Boolean);
 
   // lstat view of /etc/resolv.conf: a symlink into /run/systemd/resolve means
   // systemd-resolved owns the file even when its contents do not say so.
@@ -279,7 +314,9 @@ export function createNetworkingSetupService(ctx) {
         const file = await readFile(HOSTS_PATH);
         const lines = parseHosts(file.content).filter((l) => l.ip);
         const entry = current ? lines.find((l) => l.names.some((n) => n.toLowerCase() === current.toLowerCase())) || null : null;
-        hosts = { path: HOSTS_PATH, exists: file.exists, entry: entry && { ip: entry.ip, names: entry.names }, ok: Boolean(entry && (entry.ip === addresses.ipv4 || entry.ip === LOOPBACK_HOSTNAME_IP)), error: null };
+        // A loopback mapping is what most images ship and is valid without a stable IP.
+        const loopback = Boolean(entry && isLoopback(entry.ip));
+        hosts = { path: HOSTS_PATH, exists: file.exists, entry: entry && { ip: entry.ip, names: entry.names }, ok: Boolean(entry && (entry.ip === addresses.ipv4 || entry.ip === addresses.ipv6 || loopback)), loopback, error: null };
       } catch (err) {
         hosts.error = err.message;
       }
@@ -303,7 +340,7 @@ export function createNetworkingSetupService(ctx) {
         ip: addresses.ipv4, ipv6: addresses.ipv6, detectedIp: addresses.detectedIpv4, configuredIp: addresses.configuredIpv4,
         hosts, dns, resolves,
         capability: { hostnamectl: capabilities.has('hostnamectl'), dns: Boolean(ctx.dns?.ensureHostnameA) },
-        defaults: { updateHosts: settings.get('networking.hostname.update_hosts', true) !== false, addDnsRecord: settings.get('networking.hostname.add_dns_record', true) !== false },
+        defaults: service.hostnameDefaults(),
         lastChange: shapeChange(stmts.lastChange.get('hostname')),
       };
     },
@@ -315,7 +352,7 @@ export function createNetworkingSetupService(ctx) {
       const addresses = await mainAddresses(info);
       const targetIp = ip || addresses.ipv4 || LOOPBACK_HOSTNAME_IP;
       const file = await readFile(HOSTS_PATH);
-      const result = updateHostsFile(file.content, { ip: targetIp, ipv6: ipv6 || addresses.ipv6, hostname: check.hostname, previous: info?.hostname ?? settings.get('basic.hostname', '') });
+      const result = updateHostsFile(file.content, { ip: targetIp, ipv6: ipv6 || addresses.ipv6, hostname: check.hostname, previous: previousHostnames(info) });
       const conflictRow = hostedDomainConflict(check.hostname);
       return { hostname: check.hostname, ip: targetIp, ipv6: ipv6 || addresses.ipv6, path: HOSTS_PATH, before: file.content, after: result.content, changed: result.changed, entry: result.entry, previous: info?.hostname ?? null, conflict: conflictRow ? { account: conflictRow.username, type: conflictRow.type } : null };
     },
@@ -343,7 +380,7 @@ export function createNetworkingSetupService(ctx) {
       if (updateHosts) {
         try {
           const file = await readFile(HOSTS_PATH);
-          const result = updateHostsFile(file.content, { ip: targetIp, ipv6: ipv6 || addresses.ipv6, hostname: fqdn, previous });
+          const result = updateHostsFile(file.content, { ip: targetIp, ipv6: ipv6 || addresses.ipv6, hostname: fqdn, previous: previousHostnames(info) });
           if (result.changed) await writeRootFile(HOSTS_PATH, result.content, req);
           steps.push({ step: 'hosts', ok: true, changed: result.changed, detail: `${HOSTS_PATH}: ${result.entry.ip} ${result.entry.names.join(' ')}` });
         } catch (err) {
@@ -381,6 +418,19 @@ export function createNetworkingSetupService(ctx) {
       };
     },
 
+    hostnameDefaults() {
+      return { updateHosts: settings.get('networking.hostname.update_hosts', true) !== false, addDnsRecord: settings.get('networking.hostname.add_dns_record', true) !== false };
+    },
+
+    setHostnameDefaults({ updateHosts, addDnsRecord }, req) {
+      const before = service.hostnameDefaults();
+      if (updateHosts != null) settings.set('networking.hostname.update_hosts', Boolean(updateHosts));
+      if (addDnsRecord != null) settings.set('networking.hostname.add_dns_record', Boolean(addDnsRecord));
+      const after = service.hostnameDefaults();
+      audit(req, { action: 'networking.hostname.defaults', target: 'settings', args: { before, after } });
+      return after;
+    },
+
     // ------------------------------------------------------------- resolvers
     async resolverStatus() {
       await capabilities.ensureFresh();
@@ -392,11 +442,13 @@ export function createNetworkingSetupService(ctx) {
       if (current.managedBy === 'systemd-resolved' || resolved.active) {
         try { const f = await readFile(RESOLVED_DROPIN); dropIn = f.exists ? { path: RESOLVED_DROPIN, content: f.content } : null; } catch { dropIn = null; }
       }
-      const target = current.managedBy === 'systemd-resolved' ? 'resolved' : 'file';
+      // Mirrors what mode "auto" does: the drop-in only matters while the unit runs.
+      const target = current.managedBy === 'systemd-resolved' && resolved.active ? 'resolved' : 'file';
+      const upstream = await resolvedUpstream(resolved);
       return {
         path: RESOLV_PATH, raw: current.raw, nameservers: current.nameservers, search: current.search, options: current.options,
         managedBy: current.managedBy, target, writePath: target === 'resolved' ? RESOLVED_DROPIN : RESOLV_PATH,
-        resolved, dropIn, file,
+        resolved: { ...resolved, upstream }, dropIn, file,
         // Taking the file over only sticks once systemd-resolved no longer regenerates it.
         takeOverAllowed: !(resolvedOwnsFile(current, file) && resolved.active),
         panel: { resolvers: settings.get('dns.resolvers', []) || [], search: settings.get('networking.resolvers.search', []) || [] },
@@ -408,17 +460,23 @@ export function createNetworkingSetupService(ctx) {
     async setResolvers({ nameservers, search = [], applyToDns = true, mode = 'auto', test = true }, req) {
       const unique = [...new Set(nameservers)];
       if (unique.length !== nameservers.length) throw unprocessable('Duplicate nameserver', { nameservers: ['Each nameserver may only be listed once'] });
-      if (unique.some((ns) => /^(0\.0\.0\.0|::|255\.255\.255\.255|22[4-9]\.|23\d\.|ff)/i.test(ns))) throw unprocessable('Invalid nameserver', { nameservers: ['Unspecified, broadcast and multicast addresses cannot be resolvers'] });
+      // Exact matches for the unspecified addresses (so ::1 and ::ffff: stay
+      // usable), prefixes for broadcast and multicast.
+      if (unique.some((ns) => ns === '0.0.0.0' || ns === '::' || ns === '255.255.255.255' || /^(22[4-9]|23\d)\./.test(ns) || /^ff[0-9a-f]{2}:/i.test(ns))) throw unprocessable('Invalid nameserver', { nameservers: ['Unspecified, broadcast and multicast addresses cannot be resolvers'] });
       const before = await readResolvers();
       const fileBefore = await inspectResolvFile();
       if (before.managedBy !== 'systemd-resolved' && fileBefore.managedByResolved) before.managedBy = 'systemd-resolved';
-      const target = mode === 'auto' ? (before.managedBy === 'systemd-resolved' ? 'resolved' : 'file') : mode;
+      const resolved = await resolvedUnitStatus();
+      // A drop-in is only read by a running systemd-resolved: with the unit
+      // stopped (the state the take-over flow asks for) auto mode writes the
+      // static file instead of starting a unit the admin just stopped.
+      const target = mode === 'auto' ? (before.managedBy === 'systemd-resolved' && resolved.active ? 'resolved' : 'file') : mode;
+      if (target === 'resolved' && !resolved.installed) throw unprocessable('systemd-resolved is not installed on this server, so there is nothing to write a drop-in for; write /etc/resolv.conf directly instead', { mode: ['systemd-resolved is not installed; use mode "file" or "auto"'] });
       const notes = [];
       let restarted = null;
       let replacedSymlink = false;
       let path = RESOLV_PATH;
       if (target === 'file' && resolvedOwnsFile(before, fileBefore)) {
-        const resolved = await resolvedUnitStatus();
         if (resolved.active) throw unprocessable('systemd-resolved is running and regenerates /etc/resolv.conf; stop and disable it first (systemctl disable --now systemd-resolved) or keep writing through its drop-in', { mode: ['systemd-resolved must be stopped before /etc/resolv.conf can be replaced with a static file'] });
       }
       if (target === 'resolved') {
@@ -435,7 +493,7 @@ export function createNetworkingSetupService(ctx) {
         const written = await agent.op('resolver.write_static', { nameservers: unique, search }, { req });
         replacedSymlink = Boolean(written?.replacedSymlink);
         if (replacedSymlink) notes.push(`/etc/resolv.conf was a symlink to ${written.previousTarget || 'another file'}; it has been replaced with a regular file (the previous contents are in /etc/resolv.conf.whm-bak).`);
-        if (resolvedOwnsFile(before, fileBefore)) notes.push('systemd-resolved is stopped; keep it disabled (systemctl disable systemd-resolved) or it recreates the stub on its next start.');
+        if (resolvedOwnsFile(before, fileBefore)) notes.push(`systemd-resolved is ${resolved.installed ? 'stopped' : 'not installed'}; keep it disabled (systemctl disable systemd-resolved) or it recreates the stub on its next start.`);
         else if (['networkmanager', 'resolvconf', 'dhcp'].includes(before.managedBy)) notes.push(`/etc/resolv.conf was generated by ${before.managedBy}; that tool may overwrite the panel's file on the next network event.`);
       }
       settings.set('networking.resolvers.search', search);
@@ -461,10 +519,10 @@ export function createNetworkingSetupService(ctx) {
       if (!servers) servers = (await readResolvers()).nameservers;
       if (!servers.length) throw badRequest('No resolvers are configured to test');
       const hostname = settings.get('basic.hostname', '');
-      const targets = [...new Set((names?.length ? names : [validateHostname(hostname).ok ? hostname : null, 'example.com', 'cpanel.net'].filter(Boolean)).map(normalizeHostname))].slice(0, 5);
+      const targets = [...new Set((names?.length ? names : [validateHostname(hostname).ok ? hostname : null, ...DEFAULT_TEST_NAMES].filter(Boolean)).map(normalizeHostname))].slice(0, 5);
+      // All names of a server at once, so a dead resolver costs one timeout, not one per name.
       const results = await Promise.all(servers.slice(0, 8).map(async (server) => {
-        const lookups = [];
-        for (const name of targets) lookups.push(await resolveWith(name, server));
+        const lookups = await Promise.all(targets.map((name) => resolveWith(name, server)));
         const ok = lookups.filter((l) => l.ok);
         return { server, ok: ok.length === lookups.length, reachable: ok.length > 0 || lookups.some((l) => l.error === 'ENOTFOUND' || l.error === 'ENODATA'), lookups, avgMs: ok.length ? Math.round(ok.reduce((n, l) => n + l.ms, 0) / ok.length) : null };
       }));

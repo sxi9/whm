@@ -9,9 +9,9 @@ import { isRoot } from '../middleware/rbac.js';
 //   multiAccount.startModify(input, user, req)              -> { job, run }
 //   multiAccount.listRuns({ kind, limit }, user) / getRun(id, user) / report(id, format, user)
 // Per-account work goes through ctx.accounts.modify and, when loaded, ctx.ip
-// (dedication), ctx.web (vhosts, PHP) and ctx.dns (A records). A missing daemon
-// leaves an item 'pending' instead of failing the run; a 'failed' IP item has
-// been rolled back to its previous address. IPv4 only, as in WHM.
+// (dedication), ctx.web (vhosts via replaceIp, PHP) and ctx.dns (A records). A
+// missing daemon leaves an item 'pending' instead of failing the run; a 'failed'
+// IP item has been rolled back to its previous address. IPv4 only, as in WHM.
 
 export const RUN_KINDS = ['change_ip', 'modify'];
 export const ITEM_STATUSES = ['queued', 'running', 'done', 'pending', 'failed', 'skipped', 'unchanged'];
@@ -107,8 +107,12 @@ export function createMultiAccountService(ctx) {
 
   // Explicit usernames or "all" (optionally narrowed by a filter). Unknown or
   // foreign accounts come back in `missing` so the caller reports them.
+  // Enumerating "all" is the account list, so it needs the same privilege.
   function selectAccounts({ usernames, all, filter }, user) {
-    if (all) return { accounts: visibleAccounts(user).filter((a) => matches(a, filter)), missing: [] };
+    if (all) {
+      if (!isRoot(user)) ctx.resellers?.assertAcl?.(user, 'list-accts');
+      return { accounts: visibleAccounts(user).filter((a) => matches(a, filter)), missing: [] };
+    }
     const accounts = [];
     const missing = [];
     for (const u of [...new Set(usernames || [])]) {
@@ -184,6 +188,33 @@ export function createMultiAccountService(ctx) {
   }
 
   const dnsStrict = () => ctx.config?.env === 'production';
+  const sharedAddress = () => (ctx.ip ? ctx.ip.sharedIp() : settings.get('basic.shared_ip') || settings.get('basic.main_ip') || null);
+
+  // Service Configuration's replaceIp rewrites only the address of the stored
+  // vhosts (integration contract, wave 2 §4). The ensureVhost fallback re-renders
+  // everything and reports the PHP handler state, which pre-exists the move and
+  // is a warning here, never a reason to roll the account back. `touched` says
+  // whether a stored spec now carries the new address and must be put back.
+  async function rewriteVhosts(account, from, to, req) {
+    if (ctx.web.replaceIp) {
+      if (!from) return { status: 'skipped', detail: 'no previous address to replace in the stored virtual hosts', touched: false };
+      let r;
+      try { r = await ctx.web.replaceIp(from, to, { accounts: [account.username] }, req); } catch (err) {
+        if (isCapabilityMissing(err)) return { status: 'pending', detail: 'Apache is not installed; the vhosts are written with the new address when it is', touched: true };
+        throw err;
+      }
+      return r.updated > 0 ? { status: 'applied', detail: `${r.updated} vhost(s) rewritten (${r.domains.join(', ')})`, touched: true }
+        : { status: 'skipped', detail: `no stored virtual host used ${from}; the next sync renders them with ${to}`, touched: false };
+    }
+    const web = await ctx.web.ensureVhost(account.username, req);
+    const phpWarning = ['php_missing', 'php_pool_failed'].includes(web.reason);
+    if (web.applied || phpWarning) {
+      const warning = phpWarning ? web.vhosts?.find((v) => v.reason === web.reason)?.error || web.reason : null;
+      return { status: 'applied', detail: `${web.vhosts?.length ?? 0} vhost(s) rewritten${web.reload?.reloaded ? ', web server reloaded' : ''}${warning ? `; PHP handler warning: ${warning}` : ''}`, warning, touched: true };
+    }
+    if (web.reason === 'capability_missing') return { status: 'pending', detail: 'Apache is not installed; the vhosts are written when it is', touched: true };
+    return { status: 'failed', detail: web.vhosts?.find((v) => !v.applied)?.error || web.reason || 'vhost not applied', touched: false };
+  }
 
   function previewChangeIp({ changes, updateDns = true, updateVhosts = true }, user) {
     if (changes.length > maxBatch()) throw unprocessable(`At most ${maxBatch()} accounts per run (multi_account.max_batch)`, { changes: ['Too many accounts'] });
@@ -273,15 +304,24 @@ export function createMultiAccountService(ctx) {
     const keepsDedication = dedicatedBefore.includes(ip);
     const dedicate = Boolean(ipSvc) && !keepsDedication && ip !== ipSvc.sharedIp() && ipSvc.freeAddresses(4).some((r) => r.address === ip);
     const releases = Boolean(ipSvc) && dedicatedBefore.length > 0 && !keepsDedication;
+    // Zones and vhosts of an account that never had its own address were
+    // rendered with the shared address, so that is what gets replaced.
+    const replaced = previous || sharedAddress();
     const applied = { released: false, dedicated: false, dns: [], web: false };
+    let restored = false;
     const restore = async () => {
+      if (restored) return;
+      restored = true;
       if (applied.dedicated) ipSvc.releaseDedicated(account.id, req);
       if (applied.released) for (const address of dedicatedBefore) { try { ipSvc.allocateDedicated(account.id, req, { address }); } catch (err) { logger.warn({ err, address }, 'multi-account: could not re-dedicate the previous address'); } }
       stmts.setIp.run(previous, account.id);
       for (const { domain, name, values } of applied.dns) {
         try { await ctx.dns.upsertRecords(domain, name, 'A', values, req); } catch (err) { logger.warn({ err, domain, name }, 'multi-account: could not put the A record back'); }
       }
-      if (applied.web) { try { await ctx.web.ensureVhost(account.username, req); } catch (err) { logger.warn({ err, username: account.username }, 'multi-account: could not rewrite the vhosts with the previous address'); } }
+      if (applied.web) {
+        try { if (ctx.web.replaceIp) await ctx.web.replaceIp(ip, replaced, { accounts: [account.username] }, req); else await ctx.web.ensureVhost(account.username, req); }
+        catch (err) { if (!isCapabilityMissing(err)) logger.warn({ err, username: account.username }, 'multi-account: could not rewrite the vhosts with the previous address'); }
+      }
       steps.ip = { status: 'rolled_back', from: previous, to: ip };
       steps.dedicated = null;
     };
@@ -292,26 +332,28 @@ export function createMultiAccountService(ctx) {
       if (dedicate || keepsDedication) steps.dedicated = ip;
       if (!updateVhosts) steps.web = { status: 'skipped', detail: 'not requested' };
       else if (!ctx.web) steps.web = { status: 'skipped', detail: 'Service Configuration is not loaded' };
+      else if (replaced === ip) steps.web = { status: 'skipped', detail: `the stored virtual hosts already use ${ip}` };
       else {
-        const web = await ctx.web.ensureVhost(account.username, req);
-        if (web.applied) applied.web = true;
-        steps.web = web.applied ? { status: 'applied', detail: `${web.vhosts?.length ?? 0} vhost(s) rewritten${web.reload?.reloaded ? ', web server reloaded' : ''}` }
-          : web.reason === 'capability_missing' ? { status: 'pending', detail: 'Apache is not installed; the vhosts are written when it is' }
-            : { status: 'failed', detail: web.vhosts?.find((v) => !v.applied)?.error || web.reason || 'vhost not applied' };
+        const { touched, ...web } = await rewriteVhosts(account, replaced, ip, req);
+        applied.web = touched;
+        steps.web = web;
       }
       if (steps.web.status !== 'failed') {
         if (!updateDns) steps.dns.push({ domain: null, status: 'skipped', detail: 'not requested' });
         else if (!ctx.dns) steps.dns.push({ domain: null, status: 'skipped', detail: 'DNS Functions is not loaded' });
-        else if (!previous) steps.dns.push({ domain: null, status: 'skipped', detail: 'the account had no address to replace' });
+        else if (!replaced) steps.dns.push({ domain: null, status: 'skipped', detail: 'the account had no address to replace' });
+        else if (replaced === ip) steps.dns.push({ domain: null, status: 'skipped', detail: `the zones already point at ${ip}` });
         else {
-          for (const { domain } of stmts.zonesOf.all(account.id)) {
+          const zones = stmts.zonesOf.all(account.id);
+          if (!zones.length) steps.dns.push({ domain: null, status: 'skipped', detail: 'the account has no DNS zones' });
+          for (const { domain } of zones) {
             let zone;
             try { zone = await ctx.dns.getZone(domain, user); } catch (err) { steps.dns.push({ domain, status: 'failed', detail: err.message }); break; }
-            const stale = zone.records.filter((r) => r.type === 'A' && r.value === previous);
-            if (!stale.length) { steps.dns.push({ domain, status: 'skipped', detail: 'no A record pointed at the old address' }); continue; }
+            const stale = zone.records.filter((r) => r.type === 'A' && r.value === replaced);
+            if (!stale.length) { steps.dns.push({ domain, status: 'skipped', detail: `no A record pointed at ${replaced}` }); continue; }
             for (const name of new Set(stale.map((r) => r.name))) {
               const current = zone.records.filter((r) => r.type === 'A' && r.name === name);
-              const values = current.map((r) => ({ value: r.value === previous ? ip : r.value, ttl: r.ttl }));
+              const values = current.map((r) => ({ value: r.value === replaced ? ip : r.value, ttl: r.ttl }));
               try {
                 const pub = await ctx.dns.upsertRecords(domain, name, 'A', values, req);
                 applied.dns.push({ domain, name, values: current.map((r) => ({ value: r.value, ttl: r.ttl })) });
@@ -372,9 +414,10 @@ export function createMultiAccountService(ctx) {
         finishItem(item, { status: outcome.status, detail: rolledBack ? `${outcome.detail}; the account stays on ${account.ip || 'no address'}` : outcome.detail, after: { ip: rolledBack ? account.ip : ip }, steps: { ...steps, ...result } });
         jobCtx.log(`${item.username}: ${account.ip || 'unset'} → ${ip} (${outcome.status}${outcome.detail ? `: ${outcome.detail}` : ''})`, outcome.status === 'failed' ? 'error' : outcome.status === 'pending' ? 'warn' : 'info');
       } catch (err) {
-        const status = isCapabilityMissing(err) ? 'pending' : 'failed';
-        finishItem(item, { status, detail: err.message, after: status === 'failed' ? { ip: account.ip } : {}, steps });
-        jobCtx.log(`${item.username}: ${err.message}`, status === 'failed' ? 'error' : 'warn');
+        // changeAccountIp restores the row, dedication, records and vhosts before
+        // rethrowing, so a thrown error always means the account kept its address.
+        finishItem(item, { status: 'failed', detail: err.message, after: { ip: account.ip }, steps: { ...steps, ip: { status: 'rolled_back', from: account.ip, to: ip } } });
+        jobCtx.log(`${item.username}: ${err.message}; the account stays on ${account.ip || 'no address'}`, 'error');
       }
     }
     const totals = totalsOf(runId);
@@ -421,6 +464,15 @@ export function createMultiAccountService(ctx) {
     }
   }
 
+  // A package with shell access grants a shell to accounts that had none; a
+  // reseller needs the same privilege for that as for an explicit shell.
+  function shellIssue(before, after, changes, user) {
+    if (isRoot(user) || !changes.package || before.shell === after.shell || after.shell === '/usr/sbin/nologin') return null;
+    if (ctx.resellers?.aclsFor?.(user.id)?.has('disallow-shell')) return `package "${changes.package}" grants shell access, which your reseller privileges forbid (Disallow Shell Access)`;
+    if (ctx.resellers?.hasAcl && !ctx.resellers.hasAcl(user, 'add-pkg-shell')) return `package "${changes.package}" grants shell access, which needs the Shell Access (add-pkg-shell) privilege`;
+    return null;
+  }
+
   function policyIssue(account, next, changes, user) {
     if (isRoot(user) || !ctx.resellers?.modifyPolicy) return null;
     try {
@@ -444,9 +496,13 @@ export function createMultiAccountService(ctx) {
       const before = nextState(a, {}, null);
       const after = nextState(a, changes, plan);
       const diff = Object.entries(fieldMap).filter(([col]) => before[col] !== after[col]).map(([col, field]) => ({ field, label: FIELD_LABELS[field], from: before[col], to: after[col] }));
-      const php = applyPhp && changes.package && plan?.php_version ? { version: plan.php_version, available: Boolean(ctx.web?.setPhpVersion) } : null;
-      if (php && php.available) diff.push({ field: 'phpVersion', label: FIELD_LABELS.phpVersion, from: null, to: plan.php_version });
-      const issue = diff.length ? policyIssue(a, after, changes, user) : null;
+      // Re-applying the current package resyncs its snapshot, as WHM's upgrade flow does.
+      if (changes.package && before.package_name === after.package_name) diff.push({ field: 'package', label: `${FIELD_LABELS.package} (re-apply)`, from: before.package_name, to: after.package_name });
+      const currentPhp = json.parse(a.plan_snapshot_json, {})?.php_version ?? null;
+      const phpChanges = applyPhp && changes.package && plan?.php_version && (before.package_name !== after.package_name || currentPhp !== plan.php_version);
+      const php = phpChanges ? { version: plan.php_version, from: currentPhp, available: Boolean(ctx.web?.setPhpVersion) } : null;
+      if (php && php.available) diff.push({ field: 'phpVersion', label: FIELD_LABELS.phpVersion, from: currentPhp, to: plan.php_version });
+      const issue = diff.length ? shellIssue(before, after, changes, user) || policyIssue(a, after, changes, user) : null;
       return { accountId: a.id, username: a.username, domain: a.domain, owner: a.owner, status: issue ? 'blocked' : diff.length ? 'change' : 'unchanged', issues: issue ? [issue] : [], before, after, changes: diff, php, quota: after.disk_quota_mb !== before.disk_quota_mb };
     });
     for (const u of missing) items.push({ username: u, domain: null, owner: null, status: 'blocked', issues: ['Account not found or not yours'], before: {}, after: {}, changes: [], php: null, quota: false });
@@ -488,6 +544,10 @@ export function createMultiAccountService(ctx) {
     stmts.runStatus.run('running', runId);
     const items = stmts.queuedItems.all(runId);
     jobCtx.log(`Modifying ${items.length} account(s): ${Object.entries(patch).map(([k, v]) => `${FIELD_LABELS[k] || k} = ${v === null ? 'unlimited' : v}`).join(', ')}`);
+    // accounts.modify only surfaces a failed user.set_quota in production (strict)
+    // mode; elsewhere the limit is recorded and the op outcome is unknown.
+    const quotaStrict = ctx.config?.env === 'production';
+    let phpApplied = 0;
     for (const [i, item] of items.entries()) {
       const steps = json.parse(item.steps_json, {});
       stmts.itemStatus.run('running', item.id);
@@ -498,12 +558,14 @@ export function createMultiAccountService(ctx) {
         const updated = await ctx.accounts.modify(item.username, patch, user, req);
         const result = { account: { status: 'applied', detail: `${steps.plan?.changes?.length ?? 0} field(s) updated` } };
         if (steps.plan?.quota) {
+          const limit = updated.disk_quota_mb == null ? 'unlimited' : `${updated.disk_quota_mb} MB`;
           result.quota = account.uid == null ? { status: 'skipped', detail: 'no system user on this host' }
-            : capabilities.has('quota') ? { status: 'applied', detail: `quota set to ${updated.disk_quota_mb == null ? 'unlimited' : `${updated.disk_quota_mb} MB`}` }
-              : { status: 'pending', detail: 'quota tools are not installed; the limit is enforced once they are' };
+            : !capabilities.has('quota') ? { status: 'pending', detail: 'quota tools are not installed; the limit is enforced once they are' }
+              : quotaStrict ? { status: 'applied', detail: `quota set to ${limit}` }
+                : { status: 'recorded', detail: `limit ${limit} recorded; outside production mode a failed setquota is logged, not reported` };
         }
         if (applyPhp && steps.plan?.php && ctx.web?.setPhpVersion) {
-          try { await ctx.web.setPhpVersion(account.domain, steps.plan.php, req); result.php = { status: 'applied', detail: `PHP ${steps.plan.php} applied to ${account.domain}` }; }
+          try { await ctx.web.setPhpVersion(account.domain, steps.plan.php, req, { reload: false }); phpApplied++; result.php = { status: 'applied', detail: `PHP ${steps.plan.php} applied to ${account.domain}` }; }
           catch (err) {
             if (isCapabilityMissing(err)) result.php = { status: 'pending', detail: 'Apache is not installed; the PHP version is applied with the vhost' };
             else if (err.status === 404) result.php = { status: 'skipped', detail: 'no virtual host is stored for the domain yet' };
@@ -519,6 +581,11 @@ export function createMultiAccountService(ctx) {
         finishItem(item, { status, detail: err.message, steps });
         jobCtx.log(`${item.username}: ${err.message}`, status === 'failed' ? 'error' : 'warn');
       }
+    }
+    // The vhosts were written without a reload each; one reload makes them live.
+    if (phpApplied && ctx.web?.reload) {
+      try { await ctx.web.reload(req); jobCtx.log(`Web server reloaded once for ${phpApplied} PHP change(s)`); }
+      catch (err) { jobCtx.log(`Web server reload failed after ${phpApplied} PHP change(s): ${err.message}`, 'warn'); logger.warn({ err }, 'multi-account: web reload after PHP changes failed'); }
     }
     const totals = totalsOf(runId);
     stmts.finishRun.run(totals.failed && totals.failed === items.length ? 'failed' : 'done', JSON.stringify(totals), runId);
@@ -562,7 +629,7 @@ export function createMultiAccountService(ctx) {
       for (const a of stmts.all.all()) if (a.ip) usage.set(a.ip, (usage.get(a.ip) || 0) + 1);
       if (ctx.ip) {
         const shared = ctx.ip.sharedIp();
-        return ctx.ip.all().filter((r) => r.family === 4).map((r) => ({ address: r.address, family: r.family, is_main: r.is_main, reserved: r.reserved, reserved_reason: r.reserved_reason, dedicated_to: r.dedicated_to, shared: r.address === shared, accounts: usage.get(r.address) || 0, selectable: !r.reserved }));
+        return ctx.ip.all().filter((r) => r.family === 4).map((r) => ({ address: r.address, family: r.family, is_main: r.is_main, reserved: r.reserved, reserved_reason: r.reserved_reason, dedicated_to: r.dedicated_to, shared: r.address === shared, accounts: usage.get(r.address) || 0, selectable: !r.reserved && !r.dedicated_to }));
       }
       const main = settings.get('basic.main_ip') || null;
       const shared = settings.get('basic.shared_ip') || main;

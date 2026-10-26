@@ -40,7 +40,7 @@ export default function Terminal({ fn }) {
         </Card>
       )}
       {data && (
-        <Card title="Your sessions" subtitle={`Up to ${data.maxSessions} at once; idle sessions end after ${data.idleMinutes} minutes.`} padded={false}>
+        <Card title="Your sessions" subtitle={`Up to ${data.maxSessions} at once; a session ends after ${data.idleMinutes} minutes without input or output, even while a tab is attached. Full-screen programs get the window size requested when the session opened.`} padded={false}>
           <div className="table-wrap"><table>
             <thead><tr><th>Session</th><th>Shell</th><th>Started</th><th>Last activity</th><th>Viewers</th><th /></tr></thead>
             <tbody>

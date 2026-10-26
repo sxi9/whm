@@ -100,16 +100,31 @@ export function parseStatusPage(html) {
   return { statusPage: true, extended: table != null, table };
 }
 
-function fetchStatusHtml({ host, port }, timeoutMs = 3000) {
+// A full worker table for the largest MPM pools is well under 1 MB; anything
+// streaming past the cap, or past the hard deadline, is cut off and whatever
+// was read is parsed. `timeout` alone only covers socket idleness.
+export const MAX_BODY_BYTES = 1024 * 1024;
+
+export function fetchStatusHtml({ host, port }, { timeoutMs = 3000, deadlineMs = 10_000, maxBytes = MAX_BODY_BYTES } = {}) {
   return new Promise((resolve) => {
+    let settled = false;
+    let body = '';
+    let response = null;
+    const finish = (value) => { if (settled) return; settled = true; clearTimeout(deadline); resolve(value); };
+    const cut = () => { finish(response ? { statusCode: response.statusCode, body, truncated: true } : null); req.destroy(); };
+    const deadline = setTimeout(cut, deadlineMs);
     const req = http.get({ host, port, path: '/server-status', headers: { Host: 'localhost' }, timeout: timeoutMs }, (res) => {
-      let body = '';
+      response = res;
       res.setEncoding('utf8');
-      res.on('data', (c) => { if (body.length < 4 * 1024 * 1024) body += c; });
-      res.on('end', () => resolve({ statusCode: res.statusCode, body }));
+      res.on('data', (c) => {
+        body += c;
+        if (body.length >= maxBytes) { body = body.slice(0, maxBytes); cut(); }
+      });
+      res.on('end', () => finish({ statusCode: res.statusCode, body, truncated: false }));
+      res.on('error', () => finish(null));
     });
-    req.on('timeout', () => { req.destroy(); resolve(null); });
-    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); finish(null); });
+    req.on('error', () => finish(null));
   });
 }
 
@@ -121,6 +136,6 @@ defineOp('modstatus.workers', {
     const res = await fetchStatusHtml(probe);
     if (!res) return { probe, reachable: false, statusPage: false, extended: null, columns: [], workers: [] };
     const parsed = res.statusCode === 200 ? parseStatusPage(res.body) : { statusPage: false, extended: null, table: null };
-    return { probe, reachable: true, httpStatus: res.statusCode, statusPage: parsed.statusPage, extended: parsed.extended, columns: parsed.table?.columns || [], workers: parsed.table?.workers || [] };
+    return { probe, reachable: true, httpStatus: res.statusCode, truncated: Boolean(res.truncated), statusPage: parsed.statusPage, extended: parsed.extended, columns: parsed.table?.columns || [], workers: parsed.table?.workers || [] };
   },
 });

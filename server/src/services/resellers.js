@@ -20,9 +20,14 @@ import { isRoot } from '../middleware/rbac.js';
 //   resellers.isReseller(username)
 // ACLs are "configured" once any privilege editor saved them: every ACL key is
 // then stored with value 0/1, so an empty selection denies everything. A reseller
-// with no rows at all predates the editor and keeps ownership-only access.
+// with no rows at all is only reachable outside this API (every create path
+// writes the full set and migration 015c seeds legacy rows with the default
+// list at boot); per integration contract 10 such a row is unrestricted by
+// ACLs and bounded only by account ownership.
 // Privilege suspension sets users.suspended (the panel login is the reseller's
-// WHM access); the hosting account itself is left alone, as in WHM.
+// WHM access); the hosting account itself is left alone, as in WHM. The flag is
+// cleared again only when this feature set it (privileges_suspended), so a login
+// suspension applied for another reason survives unsuspend and reset.
 
 export const ACL_GROUPS = [
   { key: 'standard', label: 'Standard Privileges', acls: [
@@ -93,6 +98,14 @@ const EMPTY_LIMITS = { max_accounts: null, max_disk_mb: null, max_bandwidth_mb: 
 
 const resellerLimit = (message) => new HttpError(409, 'reseller_limit', message);
 
+// Static paths mounted before GET /:username; a reseller with one of these
+// names could never be read back.
+export const RESERVED_USERNAMES = ['usage', 'catalog', 'email', 'reset', 'ownership', 'acl-lists'];
+
+// A quota/limit of 0 is "unlimited" throughout the panel (setquota 0), like NULL.
+const OWNED_STATS = `SELECT owner_id, COUNT(*) AS accounts, SUM(suspended) AS suspended, COALESCE(SUM(disk_used_mb), 0) AS disk_used_mb, COALESCE(SUM(disk_quota_mb), 0) AS disk_allocated_mb, SUM(CASE WHEN disk_quota_mb IS NULL OR disk_quota_mb = 0 THEN 1 ELSE 0 END) AS unlimited_disk,
+  COALESCE(SUM(bandwidth_used_mb), 0) AS bandwidth_used_mb, COALESCE(SUM(bandwidth_limit_mb), 0) AS bandwidth_allocated_mb, SUM(CASE WHEN bandwidth_limit_mb IS NULL OR bandwidth_limit_mb = 0 THEN 1 ELSE 0 END) AS unlimited_bandwidth FROM accounts`;
+
 export function createResellersService(ctx) {
   const { db, agent, capabilities, settings, sessionStore } = ctx;
 
@@ -121,9 +134,7 @@ export function createResellersService(ctx) {
     accountByUsername: db.prepare('SELECT a.*, u.username AS owner FROM accounts a JOIN users u ON u.id = a.owner_id WHERE a.username = ?'),
     accountById: db.prepare('SELECT * FROM accounts WHERE id = ?'),
     accountsOwned: db.prepare('SELECT id, username, domain, ip, package_name, suspended, suspend_reason, disk_quota_mb, disk_used_mb, bandwidth_limit_mb, bandwidth_used_mb, contact_email, created_at FROM accounts WHERE owner_id = ? ORDER BY username'),
-    // A quota/limit of 0 is "unlimited" throughout the panel (setquota 0), like NULL.
-    ownedStats: db.prepare(`SELECT owner_id, COUNT(*) AS accounts, SUM(suspended) AS suspended, COALESCE(SUM(disk_used_mb), 0) AS disk_used_mb, COALESCE(SUM(disk_quota_mb), 0) AS disk_allocated_mb, SUM(CASE WHEN disk_quota_mb IS NULL OR disk_quota_mb = 0 THEN 1 ELSE 0 END) AS unlimited_disk,
-      COALESCE(SUM(bandwidth_used_mb), 0) AS bandwidth_used_mb, COALESCE(SUM(bandwidth_limit_mb), 0) AS bandwidth_allocated_mb, SUM(CASE WHEN bandwidth_limit_mb IS NULL OR bandwidth_limit_mb = 0 THEN 1 ELSE 0 END) AS unlimited_bandwidth FROM accounts GROUP BY owner_id`),
+    ownerStats: db.prepare(`${OWNED_STATS} WHERE owner_id = ? GROUP BY owner_id`),
     insertBroadcast: db.prepare('INSERT INTO reseller_broadcasts (subject, body, from_address, requested_by) VALUES (?, ?, ?, ?)'),
     broadcastById: db.prepare('SELECT * FROM reseller_broadcasts WHERE id = ?'),
     broadcastJob: db.prepare('UPDATE reseller_broadcasts SET job_id = ? WHERE id = ?'),
@@ -140,7 +151,6 @@ export function createResellersService(ctx) {
     delegatedTo: db.prepare('SELECT * FROM ip_addresses WHERE delegated_to = ? ORDER BY family, address'),
     setDelegated: db.prepare('UPDATE ip_addresses SET delegated_to = ? WHERE address = ?'),
     clearDelegated: db.prepare('UPDATE ip_addresses SET delegated_to = NULL WHERE delegated_to = ?'),
-    bandwidthPeriod: db.prepare('SELECT account_id, bytes FROM account_bandwidth WHERE period = ?'),
   };
 
   const audit = (req, entry) => (req?.audit ? req.audit(entry) : ctx.auditRecord?.(req ?? null, entry));
@@ -164,17 +174,18 @@ export function createResellersService(ctx) {
   }
   const aclsOf = (userId) => [...aclState(userId).granted];
 
-  function shapeLimits(row) {
+  // Notes are root's private remarks about a reseller and never reach the reseller itself.
+  function shapeLimits(row, { forRoot = true } = {}) {
     return {
       max_accounts: row.max_accounts, max_disk_mb: row.max_disk_mb, max_bandwidth_mb: row.max_bandwidth_mb,
       oversell_disk: Boolean(row.oversell_disk), oversell_bandwidth: Boolean(row.oversell_bandwidth),
       owns_nameservers: Boolean(row.owns_nameservers), nameservers: parseList(row.nameservers), shared_ip: row.shared_ip,
-      allowed_packages: parseList(row.allowed_packages), notes: row.notes ?? null,
+      allowed_packages: parseList(row.allowed_packages), ...(forRoot ? { notes: row.notes ?? null } : {}),
     };
   }
 
   function stats(userId) {
-    const row = stmts.ownedStats.all().find((r) => r.owner_id === userId);
+    const row = stmts.ownerStats.get(userId);
     return {
       accounts: row?.accounts ?? 0, suspended: row?.suspended ?? 0, disk_used_mb: Math.round(row?.disk_used_mb ?? 0), disk_allocated_mb: row?.disk_allocated_mb ?? 0, unlimited_disk: row?.unlimited_disk ?? 0,
       bandwidth_used_mb: Math.round(row?.bandwidth_used_mb ?? 0), bandwidth_allocated_mb: row?.bandwidth_allocated_mb ?? 0, unlimited_bandwidth: row?.unlimited_bandwidth ?? 0,
@@ -183,7 +194,7 @@ export function createResellersService(ctx) {
 
   const percent = (used, max) => (max > 0 ? Math.round((used / max) * 100) : null);
 
-  function shape(user, { withAcls = true } = {}) {
+  function shape(user, { withAcls = true, forRoot = true } = {}) {
     const limits = limitsOf(user.id);
     const s = stats(user.id);
     const account = limits.account_id ? stmts.accountById.get(limits.account_id) : stmts.accountByUsername.get(user.username);
@@ -193,7 +204,7 @@ export function createResellersService(ctx) {
       suspended: Boolean(limits.privileges_suspended) || Boolean(user.suspended), suspended_reason: limits.suspended_reason ?? null,
       configured: Boolean(stmts.limits.get(user.id)), created_at: user.created_at, last_login_at: user.last_login_at,
       account: account ? { id: account.id, username: account.username, domain: account.domain, suspended: Boolean(account.suspended) } : null,
-      limits: shapeLimits(limits), acls, acl_count: withAcls ? acls.length : stmts.aclCount.get(user.id).n, acls_configured: aclState(user.id).configured,
+      limits: shapeLimits(limits, { forRoot }), acls, acl_count: withAcls ? acls.length : stmts.aclCount.get(user.id).n, acls_configured: aclState(user.id).configured,
       delegated_ips: stmts.delegatedTo.all(user.id).map((r) => r.address),
       usage: { ...s, accounts_percent: percent(s.accounts, limits.max_accounts), disk_percent: percent(s.disk_allocated_mb, limits.max_disk_mb), bandwidth_percent: percent(s.bandwidth_allocated_mb, limits.max_bandwidth_mb),
         over_accounts: limits.max_accounts != null && s.accounts > limits.max_accounts, over_disk: limits.max_disk_mb != null && !limits.oversell_disk && s.disk_allocated_mb > limits.max_disk_mb, over_bandwidth: limits.max_bandwidth_mb != null && !limits.oversell_bandwidth && s.bandwidth_allocated_mb > limits.max_bandwidth_mb },
@@ -222,6 +233,8 @@ export function createResellersService(ctx) {
     const row = stmts.ipByAddress.get(address);
     if (!row) throw unprocessable(`${address} is not an IP address of this server`, { sharedIp: ['Add it under IP Functions first'] });
     if (row.dedicated_to) throw conflict(`${address} is dedicated to account ${stmts.accountById.get(row.dedicated_to)?.username ?? row.dedicated_to} and cannot be a shared IP`);
+    if (row.reserved) throw conflict(`${address} is reserved${row.reserved_reason ? ` (${row.reserved_reason})` : ''} and cannot be a shared IP`);
+    if (!row.managed) throw badRequest(`${address} is a dynamic address owned by the host and cannot be a shared IP`);
     if (row.delegated_to && row.delegated_to !== userId && !row.is_main && settings.get('basic.shared_ip') !== address) throw conflict(`${address} is delegated to ${row.delegated_user}; delegate it to this reseller first`);
     return row.address;
   }
@@ -263,13 +276,20 @@ export function createResellersService(ctx) {
 
   // --- Create / update ----------------------------------------------------------
 
-  async function create(input, user, req) {
-    const { username } = input;
-    const existingUser = stmts.userByUsername.get(username);
+  function assertPromotable(username, existingUser) {
     if (existingUser?.role === 'root') throw badRequest('The root user cannot be made a reseller');
     if (existingUser?.role === 'reseller') throw conflict(`"${username}" is already a reseller`);
+  }
+
+  async function create(input, user, req) {
+    const { username } = input;
+    if (RESERVED_USERNAMES.includes(username)) throw unprocessable(`"${username}" is a reserved name`, { username: [`Reserved names: ${RESERVED_USERNAMES.join(', ')}`] });
+    const existingUser = stmts.userByUsername.get(username);
+    assertPromotable(username, existingUser);
     const account = stmts.accountByUsername.get(username);
     if (input.fromAccount && !account) throw notFound(`Hosting account "${username}"`);
+    // A hosting account becomes a reseller only on request; a standalone reseller never silently takes one over.
+    if (!input.fromAccount && account) throw conflict(`"${username}" is a hosting account; set fromAccount to make it a reseller`);
     if (!input.fromAccount && !existingUser && !input.password) throw unprocessable('A password is required for a standalone reseller', { password: ['Required unless the reseller is created from an existing hosting account'] });
     const acls = input.aclList ? resolveAclList(input.aclList) : validateAcls(input.acls ?? resolveAclList(settings.get('resellers.default_acl_list', 'standard')));
     const generated = !input.password && !existingUser?.password_hash;
@@ -278,12 +298,18 @@ export function createResellersService(ctx) {
     const email = input.email ?? existingUser?.email ?? account?.contact_email ?? null;
 
     const created = db.transaction(() => {
+      // Re-read inside the transaction: the bcrypt hash above yields, so a concurrent create may have won.
+      const current = stmts.userByUsername.get(username);
+      assertPromotable(username, current);
+      if (Boolean(current) !== Boolean(existingUser)) throw conflict(`"${username}" was created concurrently; retry`);
       let id;
       if (existingUser) {
         id = existingUser.id;
         stmts.setRole.run('reseller', id);
         if (email !== existingUser.email) stmts.setEmail.run(email, id);
         if (hash) db.prepare("UPDATE users SET password_hash = ?, must_change_password = ?, password_changed_at = datetime('now') WHERE id = ?").run(hash, generated ? 1 : 0, id);
+        // Root is explicitly re-enabling this login (a reset standalone reseller is parked suspended).
+        if (existingUser.suspended) stmts.setUserSuspended.run(0, id);
       } else {
         id = Number(stmts.insertUser.run(username, email, hash, 'reseller', generated || input.forcePasswordChange ? 1 : 0).lastInsertRowid);
       }
@@ -293,7 +319,7 @@ export function createResellersService(ctx) {
       if (account) stmts.setOwner.run(id, account.id);
       return id;
     })();
-    audit(req, { action: 'reseller.create', target: username, args: { fromAccount: Boolean(account), acls: acls.length, maxAccounts: input.maxAccounts ?? null, maxDiskMb: input.maxDiskMb ?? null, email } });
+    audit(req, { action: 'reseller.create', target: username, args: { fromAccount: Boolean(account), acls: acls.length, maxAccounts: input.maxAccounts ?? null, maxDiskMb: input.maxDiskMb ?? null, email, loginRestored: Boolean(existingUser?.suspended) } });
     const out = shape(stmts.userById.get(created));
     if (generated) out.initialPassword = password;
     return out;
@@ -336,8 +362,10 @@ export function createResellersService(ctx) {
     return shape(stmts.userById.get(reseller.id));
   }
 
-  // Reset Resellers: the panel user keeps its login but loses the reseller
-  // role, ACLs, limits and delegated IPs; owned accounts move to root.
+  // Reset Resellers: the panel user loses the reseller role, ACLs, limits and
+  // delegated IPs; owned accounts move to root. A reseller created from a hosting
+  // account keeps its login for that account; a standalone one owns nothing any
+  // more, so its login is parked suspended until root promotes it again.
   function reset({ usernames, all }, user, req) {
     const root = stmts.rootUser.get();
     const targets = all ? stmts.owners.all().filter((u) => u.role === 'reseller') : usernames.map((u) => stmts.userByUsername.get(u)).filter(Boolean);
@@ -347,16 +375,19 @@ export function createResellersService(ctx) {
       if (target.role !== 'reseller') { results.push({ username: target.username, reset: false, reason: `${target.username} is not a reseller` }); continue; }
       const owned = stmts.accountsOwned.all(target.id).map((a) => a.username);
       const delegated = stmts.delegatedTo.all(target.id).map((a) => a.address);
+      const limits = limitsOf(target.id);
+      const hasAccount = Boolean((limits.account_id && stmts.accountById.get(limits.account_id)) || stmts.accountByUsername.get(target.username));
+      const loginSuspended = !hasAccount || (Boolean(stmts.userById.get(target.id)?.suspended) && !limits.privileges_suspended);
       db.transaction(() => {
         stmts.reassignOwner.run(root.id, target.id);
         stmts.clearDelegated.run(target.id);
         stmts.clearAcls.run(target.id);
         stmts.deleteLimits.run(target.id);
         stmts.setRole.run('user', target.id);
-        stmts.setUserSuspended.run(0, target.id);
+        stmts.setUserSuspended.run(loginSuspended ? 1 : 0, target.id);
       })();
       sessionStore?.destroyUserSessions?.(target.id);
-      results.push({ username: target.username, reset: true, accounts_moved: owned, ips_released: delegated });
+      results.push({ username: target.username, reset: true, accounts_moved: owned, ips_released: delegated, login_suspended: loginSuspended });
     }
     audit(req, { action: 'reseller.reset', target: all ? 'all' : usernames.join(','), args: { reset: results.filter((r) => r.reset).map((r) => r.username), missing } });
     return { results, missing, moved_to: root.username };
@@ -416,13 +447,18 @@ export function createResellersService(ctx) {
       return row;
     });
     const before = stmts.delegatedTo.all(reseller.id).map((r) => r.address);
+    const after = rows.map((r) => r.address);
+    const limits = limitsOf(reseller.id);
+    const sharedIpCleared = Boolean(limits.shared_ip) && before.includes(limits.shared_ip) && !after.includes(limits.shared_ip) && !isServerSharedAddress(limits.shared_ip);
     db.transaction(() => {
       stmts.clearDelegated.run(reseller.id);
       for (const r of rows) stmts.setDelegated.run(reseller.id, r.address);
+      if (sharedIpCleared) stmts.upsertLimits.run({ ...limits, reseller_id: reseller.id, shared_ip: null });
     })();
-    const after = rows.map((r) => r.address);
-    audit(req, { action: 'reseller.ip_delegation', target: username, args: { added: after.filter((a) => !before.includes(a)), removed: before.filter((a) => !after.includes(a)) } });
-    return { reseller: username, delegated: after, added: after.filter((a) => !before.includes(a)), removed: before.filter((a) => !after.includes(a)) };
+    const added = after.filter((a) => !before.includes(a));
+    const removed = before.filter((a) => !after.includes(a));
+    audit(req, { action: 'reseller.ip_delegation', target: username, args: { added, removed, sharedIpCleared: sharedIpCleared ? limits.shared_ip : null } });
+    return { reseller: username, delegated: after, added, removed, shared_ip_cleared: sharedIpCleared ? limits.shared_ip : null };
   }
 
   function setSharedIp(username, { sharedIp }, user, req) {
@@ -461,7 +497,7 @@ export function createResellersService(ctx) {
     ownerByName(owner);
     const results = [];
     for (const u of usernames) {
-      try { results.push({ ...changeOwner(u, { owner }, user, null), changed: true }); } catch (err) { results.push({ username: u, changed: false, error: err.message, code: err.code }); }
+      try { results.push({ ...changeOwner(u, { owner }, user, req), changed: true }); } catch (err) { results.push({ username: u, changed: false, error: err.message, code: err.code }); }
     }
     audit(req, { action: 'account.owner.change_bulk', target: owner, args: { requested: usernames.length, changed: results.filter((r) => r.changed).map((r) => r.username), failed: results.filter((r) => !r.changed).map((r) => r.username) } });
     return { owner, results, changed: results.filter((r) => r.changed).length, failed: results.filter((r) => !r.changed).length };
@@ -486,7 +522,7 @@ export function createResellersService(ctx) {
   function usage(username, user) {
     assertSelfOrRoot(username, user);
     const reseller = loadReseller(username);
-    const detail = shape(reseller, { withAcls: false });
+    const detail = shape(reseller, { withAcls: false, forRoot: isRoot(user) });
     const list = stmts.accountsOwned.all(reseller.id).map((a) => ({ ...a, suspended: Boolean(a.suspended), disk_percent: percent(a.disk_used_mb, a.disk_quota_mb), bandwidth_percent: percent(a.bandwidth_used_mb, a.bandwidth_limit_mb), over_disk: a.disk_quota_mb > 0 && a.disk_used_mb >= a.disk_quota_mb, over_bandwidth: a.bandwidth_limit_mb > 0 && a.bandwidth_used_mb >= a.bandwidth_limit_mb }));
     return { reseller: username, suspended: detail.suspended, limits: detail.limits, usage: detail.usage, accounts: list };
   }
@@ -578,9 +614,22 @@ export function createResellersService(ctx) {
   function assertAcl(user, key) {
     if (!hasAcl(user, key)) throw forbidden(`Your reseller privileges do not include "${ACL_LABELS[key] || key}"`);
   }
+  const isServerSharedAddress = (address) => address === (settings.get('basic.shared_ip') || null) || address === (settings.get('basic.main_ip') || null);
+  // reseller_limits.shared_ip is free text checked at write time; the address may
+  // since have been removed under IP Functions, dedicated, reserved or delegated to
+  // another reseller, so it only counts while the write-time rule still holds.
+  function effectiveSharedIp(userId, limits = stmts.limits.get(userId)) {
+    const address = limits?.shared_ip ?? null;
+    if (!address) return null;
+    const row = stmts.ipByAddress.get(address);
+    if (!row || row.dedicated_to) return null;
+    if (row.is_main || isServerSharedAddress(address)) return address;
+    if (row.reserved || !row.managed) return null;
+    return row.delegated_to == null || row.delegated_to === userId ? address : null;
+  }
   function sharedIpFor(user) {
     if (!user || isRoot(user)) return null;
-    return stmts.limits.get(user.id)?.shared_ip ?? null;
+    return effectiveSharedIp(user.id);
   }
   function nameserversFor(ownerId) {
     const row = ownerId ? stmts.limits.get(ownerId) : null;
@@ -623,7 +672,7 @@ export function createResellersService(ctx) {
   function assertIpUsable(user, pol, ip) {
     if (!ip) return;
     const row = stmts.ipByAddress.get(ip);
-    const usable = ip === pol.limits.shared_ip || ip === (settings.get('basic.shared_ip') || null) || (row && row.delegated_to === user.id);
+    const usable = ip === effectiveSharedIp(user.id, pol.limits) || ip === (settings.get('basic.shared_ip') || null) || (row && row.delegated_to === user.id);
     if (!usable) throw forbidden(`${ip} is not delegated to your reseller account`);
   }
 
@@ -639,7 +688,7 @@ export function createResellersService(ctx) {
     assertAllocation(pol, 'disk', { allocated: s.disk_allocated_mb, next: plan.disk_mb ?? null, unlimitedAcl: 'allow-unlimited-disk-pkgs', label: 'disk space' });
     assertAllocation(pol, 'bandwidth', { allocated: s.bandwidth_allocated_mb, next: plan.bandwidth_mb ?? null, unlimitedAcl: 'allow-unlimited-bw-pkgs', label: 'bandwidth' });
     assertIpUsable(user, pol, ip);
-    return { sharedIp: pol.limits.shared_ip || null };
+    return { sharedIp: effectiveSharedIp(user.id, pol.limits) };
   }
 
   // Called by accounts.modify for resellers with the values the account will
@@ -686,7 +735,7 @@ export function createResellersService(ctx) {
       const result = paginate(db, { select: 'u.*', from: 'users u', where, params, sortable: { username: 'u.username', created_at: 'u.created_at', last_login_at: 'u.last_login_at' }, defaultSort: 'username', query });
       return { ...result, data: result.data.map((u) => shape(u, { withAcls: false })) };
     },
-    get(username, user) { assertSelfOrRoot(username, user); return shape(loadReseller(username)); },
+    get(username, user) { assertSelfOrRoot(username, user); return shape(loadReseller(username), { forRoot: isRoot(user) }); },
     catalog, create, update, setPrivileges, setSuspended, reset, aclLists,
     delegation, setDelegation, setSharedIp, changeOwner, changeOwnerBulk, accounts, usage, usageAll,
     recipients, emailAll, runEmailAll, emailHistory,

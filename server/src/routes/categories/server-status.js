@@ -35,7 +35,7 @@ export async function register(ctx) {
   r.get('/process-log/days', requireRoot, wrap(() => svc().processLog.days()));
   r.get('/process-log/settings', requireRoot, wrap(() => svc().processLog.settings()));
   r.put('/process-log/settings', requireRoot, validate({ body: settingsBody }), wrap((req) => svc().processLog.updateSettings(req.body, req)));
-  r.post('/process-log/sample', requireRoot, wrap((req) => ({ job: svc().processLog.enqueueSample(req.user) }), 202));
+  r.post('/process-log/sample', requireRoot, wrap((req) => ({ job: svc().processLog.enqueueSample(req) }), 202));
   r.get('/process-log/latest', requireRoot, wrap(() => svc().processLog.latest()));
   r.get('/process-log/day/:date', requireRoot, validate({ params: z.object({ date: day }), query: z.object({ user: processUser.optional() }) }), wrap((req) => svc().processLog.day(req.params.date, req.query)));
   r.delete('/process-log/day/:date', requireRoot, validate({ params: z.object({ date: day }) }), wrap((req) => svc().processLog.purgeDay(req.params.date, req)));

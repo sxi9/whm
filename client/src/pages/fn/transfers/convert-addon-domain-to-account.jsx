@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
+import { useAuth } from '../../../auth/AuthContext.jsx';
 import { PageHeader, Card, StatusPill, CapabilityNotice, KeyValue, formatDate } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
 import { Field, TextInput, PasswordInput, Toggle, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
@@ -13,6 +14,9 @@ const EMPTY = { username: '', password: '', package: '', contactEmail: '' };
 export default function ConvertAddonDomainToAccount({ fn }) {
   const toast = useToast();
   const confirm = useConfirm();
+  const { user } = useAuth();
+  // Reassigning a database is the root-only Database Map Tool; the server also leaves the list empty for resellers.
+  const canMoveDatabases = user?.role === 'root';
   const { data: caps } = useApi('/transfers/capabilities');
   const { data: addons, loading, error: listError, refetch } = useApi('/transfers/addon-domains');
   const [domain, setDomain] = useState('');
@@ -80,10 +84,10 @@ export default function ConvertAddonDomainToAccount({ fn }) {
               </div>
               <div className="form-grid">
                 <Toggle checked={options.copyFiles} onChange={(v) => { setOptions((o) => ({ ...o, copyFiles: v, removeSource: v && o.removeSource })); setPreview(null); }} label="Copy the document root" description={`${addon.docroot} → new public_html (rsync)`} />
-                <Toggle checked={options.removeSource} disabled={!options.copyFiles} onChange={(v) => setOptions((o) => ({ ...o, removeSource: v }))} label="Delete the files from the old account afterwards" description="Only after a successful copy" />
+                <Toggle checked={options.removeSource} disabled={!options.copyFiles} onChange={(v) => { setOptions((o) => ({ ...o, removeSource: v })); setPreview(null); }} label="Delete the files from the old account afterwards" description="Only after a successful copy; refused when the document root is the account's main site or serves another of its domains" />
                 <Toggle checked={options.moveMail} onChange={(v) => setOptions((o) => ({ ...o, moveMail: v }))} label="Move mailboxes of the domain" description="mail/<domain> and etc/<domain> are copied to the new home" />
               </div>
-              {preview?.addon.databases?.length > 0 && (
+              {canMoveDatabases && preview?.addon.databases?.length > 0 && (
                 <Field label="Move databases to the new account" help={`Databases of ${addon.account}; moved ones are reassigned, not copied`}>
                   <div className="form-grid">
                     {preview.addon.databases.map((name) => <Toggle key={name} checked={options.moveDatabases.includes(name)} onChange={(v) => setOptions((o) => ({ ...o, moveDatabases: v ? [...o.moveDatabases, name] : o.moveDatabases.filter((n) => n !== name) }))} label={name} />)}
@@ -105,7 +109,7 @@ export default function ConvertAddonDomainToAccount({ fn }) {
                 ['To', <span key="t"><code>{preview.target.username}</code> · {preview.target.docroot} · package {preview.target.package || 'default'}</span>],
                 ['Linked subdomains', preview.addon.linkedSubdomains.length ? preview.addon.linkedSubdomains.join(', ') : 'none'],
                 ['DNS zone', preview.addon.zone ? <StatusPill key="z" status="ok">moves to the new account</StatusPill> : <StatusPill key="z" status="info">created for the new account</StatusPill>],
-                ['Databases', options.moveDatabases.length ? options.moveDatabases.join(', ') : 'none moved'],
+                ['Databases', canMoveDatabases ? (options.moveDatabases.length ? options.moveDatabases.join(', ') : 'none moved') : 'stay with the current account (moving them requires root)'],
               ]} />
             </Card>
           )}

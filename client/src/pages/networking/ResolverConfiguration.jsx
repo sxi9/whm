@@ -16,6 +16,7 @@ const SLOTS = ['Primary', 'Secondary', 'Third', 'Fourth'];
 
 const MANAGER_TEXT = {
   'systemd-resolved': { tone: 'info', text: 'systemd-resolved manages /etc/resolv.conf (the 127.0.0.53 stub). Saving writes a drop-in under /etc/systemd/resolved.conf.d and restarts the resolver, so the file keeps pointing at the stub while the upstream servers change.' },
+  'systemd-resolved-stopped': { tone: 'warning', text: 'systemd-resolved is stopped but /etc/resolv.conf still points at its stub, so nothing answers 127.0.0.53. Saving replaces the stub symlink with a static, panel-managed file (a copy of the previous contents is kept in /etc/resolv.conf.whm-bak); keep the unit disabled or it recreates the stub on its next start.' },
   networkmanager: { tone: 'warning', text: 'NetworkManager generated /etc/resolv.conf. The panel writes the file directly; NetworkManager may overwrite it on the next connection change unless its DNS handling is set to "none".' },
   resolvconf: { tone: 'warning', text: 'resolvconf generated /etc/resolv.conf and may overwrite the panel\'s file on the next interface event.' },
   dhcp: { tone: 'warning', text: 'A DHCP client wrote /etc/resolv.conf and may replace it on lease renewal.' },
@@ -65,7 +66,10 @@ export function ResolverConfiguration() {
 
   useEffect(() => {
     if (!data) return;
-    const current = data.managedBy === 'systemd-resolved' && data.panel.resolvers.length ? data.panel.resolvers : data.nameservers;
+    // On a systemd-resolved host the file only lists the stub; prefer what the
+    // resolver forwards to, then the panel's own setting.
+    const upstream = data.resolved?.upstream?.servers || [];
+    const current = data.managedBy === 'systemd-resolved' ? (upstream.length ? upstream : data.panel.resolvers.length ? data.panel.resolvers : data.nameservers) : data.nameservers;
     setServers([0, 1, 2, 3].map((i) => current[i] || ''));
     setSearch((data.search.length ? data.search : data.panel.search).join(' '));
   }, [data]);
@@ -76,7 +80,8 @@ export function ResolverConfiguration() {
   const searchList = search.split(/[\s,]+/).map((s) => s.trim().toLowerCase()).filter((s) => s && s !== '.');
   const searchError = searchList.some((s) => !DOMAIN.test(s)) ? 'Search domains must be valid domain names' : searchList.length > 6 ? 'At most 6 search domains' : null;
   const valid = list.length > 0 && errors.every((e) => !e) && !searchError;
-  const dirty = data && (list.join(',') !== data.nameservers.join(',') || searchList.join(' ') !== data.search.join(' '));
+  const inUse = data ? (data.resolved?.upstream?.servers?.length ? data.resolved.upstream.servers : data.nameservers) : [];
+  const dirty = data && (list.join(',') !== inUse.join(',') || searchList.join(' ') !== data.search.join(' '));
 
   const setSlot = (i, v) => setServers((s) => s.map((x, j) => (j === i ? v : x)));
   const applyPreset = (p) => { setServers([0, 1, 2, 3].map((i) => p.nameservers[i] || '')); setTest(null); };
@@ -94,7 +99,8 @@ export function ResolverConfiguration() {
   const save = async () => {
     if (!valid) return;
     let message = `Nameservers: ${list.join(', ')}${searchList.length ? `; search: ${searchList.join(' ')}` : ''}. Every program on this server resolves names through these from now on; a wrong address breaks mail delivery, updates and the panel's own lookups.`;
-    if (data.managedBy === 'systemd-resolved' && !takeOver) message += ' The upstream servers of systemd-resolved are changed and the service restarted.';
+    if (data.target === 'resolved' && !takeOver) message += ' The upstream servers of systemd-resolved are changed and the service restarted.';
+    else if (data.managedBy === 'systemd-resolved' && !takeOver) message += ' systemd-resolved is stopped, so /etc/resolv.conf is replaced with a regular, panel-managed file.';
     if (takeOver) message += ` /etc/resolv.conf${data.file?.isSymlink ? ` (currently a symlink to ${data.file.target})` : ''} is replaced with a regular, panel-managed file.`;
     if (!(await confirm({ title: 'Apply resolver configuration?', message, confirmLabel: 'Apply', danger: true }))) return;
     setSaving(true);
@@ -109,7 +115,7 @@ export function ResolverConfiguration() {
     } catch (err) { setSaveError(err); toast.error(err); } finally { setSaving(false); }
   };
 
-  const manager = data ? MANAGER_TEXT[data.managedBy] || MANAGER_TEXT.file : null;
+  const manager = data ? (data.managedBy === 'systemd-resolved' && !data.resolved?.active ? MANAGER_TEXT['systemd-resolved-stopped'] : MANAGER_TEXT[data.managedBy]) || MANAGER_TEXT.file : null;
 
   return (
     <>
@@ -125,6 +131,7 @@ export function ResolverConfiguration() {
             ['Managed by', <code key="m">{data.managedBy}</code>],
             ['Panel writes to', <code key="w">{data.writePath}</code>],
             data.resolved?.installed && ['systemd-resolved', <StatusPill key="r" status={data.resolved.active ? 'active' : 'inactive'}>{data.resolved.active ? 'running' : 'stopped'}</StatusPill>],
+            data.resolved?.upstream && ['Upstream servers (resolvectl)', data.resolved.upstream.servers.length ? <span key="u">{data.resolved.upstream.servers.map((n) => <code key={n} style={{ marginRight: 6 }}>{n}</code>)}{data.resolved.upstream.links?.some((l) => l.servers.length) && <span className="muted">(per-link: {data.resolved.upstream.links.filter((l) => l.servers.length).map((l) => `${l.name}: ${l.servers.join(' ')}`).join('; ')})</span>}</span> : <StatusPill key="u" status="warning">none configured</StatusPill>],
             data.file?.isSymlink && ['/etc/resolv.conf is', <span key="f">a symlink to <code>{data.file.target}</code></span>],
             ['DNS Functions lookups use', data.panel.resolvers.length ? data.panel.resolvers.join(', ') : <span key="p" className="muted">system resolvers</span>],
             data.lastChange && ['Last change', <span key="l">{(data.lastChange.before?.nameservers || []).join(', ') || '—'} → {(data.lastChange.after?.nameservers || []).join(', ')} by {data.lastChange.principal || 'system'} on {formatDate(data.lastChange.createdAt)}</span>],

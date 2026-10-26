@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
+import { assertRealPath } from '../src/ops/acct.js';
 
 // exec is spied with the real implementation behind it so tests prove an op
 // refused before any program ran. acct.set_home is never executed for real
@@ -68,6 +69,50 @@ describe('acct.set_home refuses bad input before running usermod', () => {
     const ghost = `nouser${crypto.randomBytes(3).toString('hex')}`;
     expect((await opError(runOp('acct.set_home', { username: ghost, homeDir: `/home2/${ghost}` }, ctx))).code).toBe('not_found');
     expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+// A hosting account the tests may name without changing anything: any
+// non-system user with a regular UID (the ops refuse before usermod runs).
+const MANAGED_USER = fs.readFileSync('/etc/passwd', 'utf8').split('\n').map((l) => l.split(':')).find(([name, , uid, , , home]) => Number(uid) >= 1000 && Number(uid) < 65534 && home?.startsWith('/') && !['nobody', 'whmpanel'].includes(name))?.[0] ?? null;
+
+describe('acct.set_home never follows a symlinked home', () => {
+  it.skipIf(!MANAGED_USER)('refuses a target that is a symbolic link before running usermod', async () => {
+    exec.mockClear();
+    fs.mkdirSync(`${root}/home-real`, { recursive: true });
+    fs.symlinkSync(`${root}/home-real`, `${root}/home-link`);
+    const err = await opError(runOp('acct.set_home', { username: MANAGED_USER, homeDir: `${root}/home-link` }, ctx));
+    expect(err.code).toBe('refused');
+    expect(err.message).toMatch(/symbolic link/);
+    expect((await opError(runOp('acct.set_home', { username: MANAGED_USER, homeDir: `${root}/missing-home` }, ctx))).code).toBe('not_found');
+    fs.writeFileSync(`${root}/home-file`, 'x');
+    expect((await opError(runOp('acct.set_home', { username: MANAGED_USER, homeDir: `${root}/home-file` }, ctx))).code).toBe('refused');
+    expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+describe('assertRealPath', () => {
+  it('accepts an allowed root that is itself a symbolic link but still refuses links below it', async () => {
+    const real = `${root}/linked-real`;
+    const link = `${root}/linked-root`;
+    fs.mkdirSync(`${real}/logs`, { recursive: true });
+    fs.writeFileSync(`${real}/logs/a.com-access.log`, 'hello');
+    fs.symlinkSync(real, link);
+    const linkedCtx = createContext({ allowedRoots: [link] });
+    expect(assertRealPath(`${link}/logs`, linkedCtx, 'read')).toBe(`${real}/logs`);
+    expect(assertRealPath(link, linkedCtx, 'read')).toBe(real);
+    const r = await runOp('acct.list_logs', { path: `${link}/logs` }, linkedCtx);
+    expect(r.entries.map((e) => e.name)).toEqual(['a.com-access.log']);
+    expect((await runOp('acct.read_range', { path: `${link}/logs/a.com-access.log` }, linkedCtx)).size).toBe(5);
+    // A link planted below the root is still a tenant's link and is refused.
+    fs.symlinkSync(`${real}/logs`, `${real}/tenant-logs`);
+    const err = await opError(runOp('acct.list_logs', { path: `${link}/tenant-logs` }, linkedCtx));
+    expect(err.code).toBe('refused');
+    expect(() => assertRealPath(`${link}/tenant-logs`, linkedCtx, 'read')).toThrow(/symbolic link/);
+    // The lexical root check still applies before anything is resolved.
+    expect(() => assertRealPath('/etc/passwd', linkedCtx, 'read')).toThrow(OpError);
+    // Under the real root (not an allowed root) the lexical check refuses outright.
+    expect((await opError(runOp('acct.list_logs', { path: `${real}/logs` }, linkedCtx))).code).toBe('path_not_allowed');
   });
 });
 

@@ -68,6 +68,10 @@ describe('template rendering', () => {
     expect(renderTemplateBody('<h1>{{domain}}</h1>{{ missing }}', { domain: '<x>&y' })).toBe('<h1>&lt;x&gt;&amp;y</h1>');
     for (const body of Object.values(DEFAULT_TEMPLATES)) expect(renderTemplateBody(body, { domain: 'a.com', hostname: 'h', contact_email: 'r@h', status: '404', status_text: 'Not Found' })).not.toMatch(/\{\{/);
   });
+  it('leaves values untouched for plain-text mail', () => {
+    expect(renderTemplateBody("Hi {{username}} <{{email}}> & co", { username: "o'neil", email: 'a@b' }, { escape: false })).toBe("Hi o'neil <a@b> & co");
+    expect(renderTemplateBody('{{x}}', { x: '<b>' })).toBe('&lt;b&gt;');
+  });
 });
 
 describe('Account Functions API', () => {
@@ -228,6 +232,33 @@ describe('Account Functions API', () => {
       } finally { app.ctx.settings.set('basic.shared_ip', shared ?? ''); if (ip) app.ctx.ip = ip; }
     });
 
+    it('rewrites only the address through web.replaceIp and puts the IP pool back when the rewrite fails', async () => {
+      const aliceId = app.ctx.db.prepare('SELECT id, ip FROM accounts WHERE username = ?').get('alice');
+      const insert = app.ctx.db.prepare("INSERT INTO ip_addresses (address, family, netmask, interface, is_main, reserved, managed) VALUES (?, 4, '255.255.255.0', 'eth0', 0, 0, 1)");
+      insert.run('203.0.113.40'); insert.run('203.0.113.41');
+      const dedicatedTo = (address) => app.ctx.db.prepare('SELECT dedicated_to FROM ip_addresses WHERE address = ?').get(address).dedicated_to;
+      const calls = [];
+      app.ctx.web = { replaceIp: async (from, to, { accounts }) => { calls.push([from, to, accounts]); return { updated: 1, domains: ['alice.com'] }; }, ensureVhost: async () => { throw new Error('ensureVhost must not be used for an address change'); } };
+      try {
+        const ok = await put('/ip/alice', { ip: '203.0.113.40' }).expect(200);
+        expect(ok.body.data).toMatchObject({ ip: '203.0.113.40', dedicated: '203.0.113.40', web: { applied: true, updated: 1, domains: ['alice.com'] } });
+        expect(calls).toEqual([[aliceId.ip, '203.0.113.40', ['alice']]]);
+        expect(dedicatedTo('203.0.113.40')).toBe(aliceId.id);
+        app.ctx.web.replaceIp = async () => { throw new Error('apache: configuration test failed'); };
+        const failed = await put('/ip/alice', { ip: '203.0.113.41' });
+        expect(failed.status).toBe(500);
+        // The account row and the pool agree again: .40 still dedicated, .41 free.
+        expect((await app.http.get('/api/accounts/alice')).body.data.ip).toBe('203.0.113.40');
+        expect(dedicatedTo('203.0.113.40')).toBe(aliceId.id);
+        expect(dedicatedTo('203.0.113.41')).toBeNull();
+        expect(app.ctx.ip.freeAddresses(4).map((r) => r.address)).toContain('203.0.113.41');
+      } finally {
+        delete app.ctx.web;
+        app.ctx.db.prepare("UPDATE accounts SET ip = ? WHERE id = ?").run(aliceId.ip, aliceId.id);
+        app.ctx.db.prepare("DELETE FROM ip_addresses WHERE address IN ('203.0.113.40', '203.0.113.41')").run();
+      }
+    });
+
     it('validates against IP Functions when it is loaded', async () => {
       const res = await put('/ip/alice', { ip: '198.51.100.9' });
       expect([200, 422]).toContain(res.status);
@@ -272,11 +303,26 @@ describe('Account Functions API', () => {
       await put('/bandwidth/carol', { limitMb: null }).expect(200);
 
       app.ctx.db.prepare('UPDATE accounts SET bandwidth_used_mb = 42 WHERE username = ?').run('carol');
-      const reset = await post('/bandwidth/reset', { usernames: ['carol'] }).expect(200);
-      expect(reset.body.data.reset).toEqual(['carol']);
+      // The current period's totals are Account Information's: cleared through its resetPeriod hook, never by touching its table.
+      const periods = [];
+      const info = app.ctx.accountInfo;
+      const hadHook = Object.prototype.hasOwnProperty.call(info, 'resetPeriod');
+      const savedHook = info.resetPeriod;
+      info.resetPeriod = (usernames) => periods.push(usernames);
+      try {
+        const reset = await post('/bandwidth/reset', { usernames: ['carol'] }).expect(200);
+        expect(reset.body.data.reset).toEqual(['carol']);
+        expect(periods).toEqual([['carol']]);
+      } finally { if (hadHook) info.resetPeriod = savedHook; else delete info.resetPeriod; }
       expect((await app.http.get('/api/accounts/carol')).body.data.bandwidth_used_mb).toBe(0);
-      await put('/bandwidth-enforcement', { enabled: false }).expect(200);
+      const off = await put('/bandwidth-enforcement', { enabled: false, reason: 'over quota' }).expect(200);
+      expect(off.body.data).toMatchObject({ enabled: false, reason: 'bandwidth: over quota' });
       expect(app.ctx.scheduler.list().find((s) => s.name === 'account-bandwidth-enforce').enabled).toBe(0);
+      // The setting is the source of truth: a schedule row edited elsewhere is realigned to it.
+      app.ctx.scheduler.update('account-bandwidth-enforce', { enabled: true });
+      expect(app.ctx.accountFunctions.syncEnforcementSchedule()).toBe(false);
+      expect(app.ctx.scheduler.list().find((s) => s.name === 'account-bandwidth-enforce').enabled).toBe(0);
+      expect(JSON.parse(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'account.bandwidth.enforcement' ORDER BY id DESC LIMIT 1").get().args_redacted)).toEqual({ enabled: false, reason: 'over quota' });
 
       expect((await put('/bandwidth/alice', { limitMb: -1 })).status).toBe(422);
       expect((await post('/bandwidth/reset', {})).status).toBe(422);
@@ -347,6 +393,32 @@ describe('Account Functions API', () => {
       expect((await get('/logs/iis/alice')).status).toBe(422);
     });
 
+    it('cuts the connection instead of hanging when a later range fails or the file shrinks', async () => {
+      // 1000-byte answers force several ranges for the 4000-byte log.
+      const ranged = (sizeAfterFirst) => ({ path, offset, length }) => {
+        if (offset > 0 && sizeAfterFirst === 'error') throw Object.assign(new Error('agent socket closed'), { agentError: true, code: 'agent_unavailable' });
+        const size = offset > 0 && sizeAfterFirst != null ? sizeAfterFirst : LOG_BYTES.length;
+        const slice = LOG_BYTES.subarray(offset, Math.min(offset + length, offset + 1000, size));
+        return { path, size, offset, length: slice.length, data: slice.toString('base64'), eof: offset + slice.length >= size };
+      };
+      const download = () => get(`/logs/apache/alice/download?file=${LOG_A}`).buffer(true).parse((res, cb) => { const chunks = []; res.on('data', (c) => chunks.push(c)); res.on('end', () => cb(null, Buffer.concat(chunks))); });
+      const aborted = async () => { try { const res = await download(); return res.status === 200 && res.body.length === LOG_BYTES.length ? null : new Error(`short body ${res.body.length}`); } catch (err) { return err; } };
+      try {
+        app.agent.set('acct.read_range', ranged(null));
+        expect(await aborted()).toBeNull();
+        expect(app.agent.callsTo('acct.read_range').length).toBe(4);
+        app.agent.set('acct.read_range', ranged('error'));
+        expect(await aborted()).toBeInstanceOf(Error);
+        app.agent.set('acct.read_range', ranged(1500));
+        expect(await aborted()).toBeInstanceOf(Error);
+        const audits = app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'account.log.download.aborted' AND target = 'alice' ORDER BY id DESC LIMIT 2").all().map((r) => JSON.parse(r.args_redacted));
+        expect(audits).toHaveLength(2);
+        expect(audits.map((a) => a.error).sort()).toEqual(expect.arrayContaining([expect.stringMatching(/agent socket closed/), expect.stringMatching(/changed size|shrank/)]));
+      } finally {
+        app.agent.set('acct.read_range', ({ path, offset, length }) => { const slice = LOG_BYTES.subarray(offset, offset + length); return { path, size: LOG_BYTES.length, offset, length: slice.length, data: slice.toString('base64'), eof: offset + slice.length >= LOG_BYTES.length }; });
+      }
+    });
+
     it('reports a home log directory the agent refused (symlink or foreign owner) instead of serving it', async () => {
       app.agent.set('acct.list_logs', ({ path, owner }) => {
         if (path === '/home/alice/logs') throw Object.assign(new Error(`${path} goes through a symbolic link (/var/log/whm/domlogs/bob); refusing to follow it`), { agentError: true, code: 'refused', details: { owner } });
@@ -403,9 +475,22 @@ describe('Account Functions API', () => {
       expect(app.agent.callsTo('user.set_quota').map((c) => c.args)).toEqual([{ username: 'alice', softMb: 0, hardMb: 0, filesystem: '/' }, { username: 'alice', softMb: 1024, hardMb: 1075, filesystem: '/home2' }]);
       expect(job.result.quota).toEqual({ applied: true, filesystem: '/home2', mb: 1024 });
       expect(app.agent.callsTo('fs.remove')).toEqual([{ name: 'fs.remove', args: { path: '/home/alice', recursive: true } }]);
+      // The Linux user is locked before the first copy and unlocked after the old tree is gone.
+      const order = app.agent.calls.map((c) => c.name);
+      expect(order.indexOf('user.lock')).toBeGreaterThanOrEqual(0);
+      expect(order.indexOf('user.lock')).toBeLessThan(order.indexOf('fs.copy_tree'));
+      expect(order.lastIndexOf('user.unlock')).toBeGreaterThan(order.indexOf('fs.remove'));
+      expect(job.result).toMatchObject({ oldTreeRemoved: true, oldHome: null, suspendedDuringMove: true });
+      expect(JSON.parse(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'account.suspend' AND target = 'alice' ORDER BY id DESC LIMIT 1").get().args_redacted).reason).toMatch(/^rearrange/);
       const account = (await app.http.get('/api/accounts/alice')).body.data;
-      expect(account.home_dir).toBe('/home2/alice');
+      expect(account).toMatchObject({ home_dir: '/home2/alice', suspended: false });
       expect(account.domains[0].docroot).toBe('/home2/alice/public_html');
+      // The quota report looks the moved account up on /home2, with one disk listing for the whole report.
+      app.agent.calls.length = 0;
+      const report = await get('/quota/report').expect(200);
+      expect(report.body.data.find((a) => a.username === 'alice')).toMatchObject({ filesystem: '/home2', live: { usedMb: 120 } });
+      expect(report.body.data.find((a) => a.username === 'carol').filesystem).toBe('/');
+      expect(app.agent.callsTo('sys.disk.usage')).toHaveLength(1);
       // Modify an Account and Quota Modification now agree on the filesystem of the moved home.
       await app.http.patch('/api/accounts/alice').set('X-CSRF-Token', csrf).send({ diskQuotaMb: 3000 }).expect(200);
       expect(app.agent.callsTo('user.set_quota').at(-1).args).toEqual({ username: 'alice', softMb: 3000, hardMb: 3150, filesystem: '/home2' });
@@ -413,6 +498,41 @@ describe('Account Functions API', () => {
       expect((await post('/rearrange/alice', { target: '/home2' })).status).toBe(409);
       expect((await post('/rearrange/alice', { target: '/opt' })).status).toBe(422);
       expect((await rpost('/rearrange/bob', { target: '/home2' })).status).toBe(403);
+    });
+
+    it('keeps the old home when the vhost rewrite fails and suspends the account only for the move', async () => {
+      app.ctx.web = { ensureVhost: async () => { throw new Error('apache: configuration test failed'); } };
+      try {
+        app.agent.calls.length = 0;
+        const start = await post('/rearrange/bob', { target: '/home2' }).expect(202);
+        const job = await waitForJob(app.ctx, start.body.data.job.id);
+        expect(job.status, job.error).toBe('done');
+        expect(job.result).toMatchObject({ oldTreeRemoved: false, oldHome: '/home/bob', web: { applied: false, reason: 'apache: configuration test failed' } });
+        expect(app.agent.callsTo('fs.remove')).toEqual([]);
+        expect(app.agent.callsTo('acct.set_home').map((c) => c.args)).toEqual([{ username: 'bob', homeDir: '/home2/bob' }]);
+        expect(app.agent.callsTo('user.lock').map((c) => c.args)).toEqual([{ username: 'bob' }]);
+        expect(app.agent.callsTo('user.unlock').map((c) => c.args)).toEqual([{ username: 'bob' }]);
+        expect(job.logs.some((l) => /NOT removed/.test(l.line) && l.level === 'error')).toBe(true);
+        expect((await app.http.get('/api/accounts/bob')).body.data).toMatchObject({ home_dir: '/home2/bob', suspended: false });
+      } finally { delete app.ctx.web; }
+    });
+
+    it('restores the previous home and removes the partial copy when usermod fails', async () => {
+      app.agent.fail('acct.set_home', 'command_failed', 'usermod: user carol is currently used by process 4242');
+      try {
+        app.agent.calls.length = 0;
+        const start = await post('/rearrange/carol', { target: '/home2' }).expect(202);
+        const job = await waitForJob(app.ctx, start.body.data.job.id);
+        expect(job.status).toBe('failed');
+        expect(job.error).toMatch(/usermod/);
+        expect(app.agent.callsTo('fs.remove').map((c) => c.args)).toEqual([{ path: '/home2/carol', recursive: true }]);
+        const order = app.agent.calls.map((c) => c.name);
+        expect(order.indexOf('user.lock')).toBeLessThan(order.indexOf('fs.copy_tree'));
+        expect(order.lastIndexOf('user.unlock')).toBeGreaterThan(order.indexOf('fs.remove'));
+        expect((await app.http.get('/api/accounts/carol')).body.data).toMatchObject({ home_dir: '/home/carol', suspended: false });
+        expect(app.ctx.db.prepare("SELECT docroot FROM account_domains WHERE domain = 'carol.com'").get().docroot).toBe('/home/carol/public_html');
+        expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'account.rearrange.failed' AND target = 'carol'").get().n).toBe(1);
+      } finally { app.agent.set('acct.set_home', ({ username, homeDir }) => ({ username, home: homeDir, uid: 30001, previousHome: '/home/carol' })); }
     });
 
     it('answers 501 without rsync', async () => {
@@ -511,6 +631,13 @@ describe('Account Functions API', () => {
       expect((await post('/email', { subject: 'x\ny', text: 'body' })).status).toBe(422);
       expect((await post('/email', { subject: 'x', text: 'body', scope: 'suspended' })).status).toBe(422);
       expect((await rpost('/email', { subject: 'Reseller note', text: 'hi', owner: 'root' })).status).toBe(202);
+      // A reseller cannot put another sender on the envelope; its own contact address is fine.
+      const spoof = await rpost('/email', { subject: 'Reseller note', text: 'hi', from: 'billing@hosting-provider.example' });
+      expect(spoof.status).toBe(403);
+      expect(spoof.body.error.message).toMatch(/own contact address/);
+      app.ctx.db.prepare('UPDATE users SET email = ? WHERE username = ?').run('Resell1@Example.com', 'resell1');
+      expect((await rpost('/email', { subject: 'Reseller note', text: 'hi', from: 'resell1@example.com' })).status).toBe(202);
+      expect((await post('/email', { subject: 'Root note', text: 'hi', from: 'billing@hosting-provider.example' })).status).toBe(202);
 
       app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, Boolean(BINS[n]) && n !== 'exim4'])));
       await app.ctx.capabilities.refresh();
@@ -530,6 +657,10 @@ describe('Account Functions API', () => {
     afterAll(() => grant(['all']));
 
     it('refuses account-scoped changes the reseller was not delegated', async () => {
+      grant(['limit-bandwidth']);
+      const noEdit = await rput('/ip/bob', { ip: '203.0.113.5' });
+      expect(noEdit.status).toBe(403);
+      expect(noEdit.body.error.message).toMatch(/Modify Accounts/);
       grant(['edit-account', 'suspend-acct']);
       const before = (await app.http.get('/api/accounts/bob')).body.data;
       for (const [res, acl] of [

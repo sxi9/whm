@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { parseGrantStatements, renameForAccount, targetDatabaseName, parseDomainLists, parseUserdata } from '../src/services/transfers.js';
+import { parseGrantStatements, renameForAccount, targetDatabaseName, parseDomainLists, parseUserdata, parseUserdataMain, rewriteZoneAddresses } from '../src/services/transfers.js';
 
 // A host with the user tooling, ssh, rsync and tar but no Apache/BIND/MySQL:
 // accounts and files move for real (mocked ops), daemon-bound steps end
@@ -13,7 +13,9 @@ const SHADOW = '$6$saltsalt$k2aJ8rXb0Jm9d1fQ3hT6vLw4nP5sR7uY8zA1bC2dE3fG4hI5jK6l
 const DB_USERS = new Set();
 const capabilityMissing = (what) => Object.assign(new Error(`${what} is not installed on this server`), { agentError: true, code: 'capability_missing', details: {} });
 const KEY = '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n-----END OPENSSH PRIVATE KEY-----\n';
-const ZONE = (domain, ip) => `$TTL 14400\n${domain}. IN SOA ns1.example.com. hostmaster.${domain}. 2024010101 3600 1800 1209600 86400\n${domain}. 86400 IN NS ns1.example.com.\n${domain}. 14400 IN A ${ip}\nwww 14400 IN A ${ip}\n`;
+// "mail" points at an address that merely starts with the source's: a token-wise rewrite must leave it alone.
+const ZONE = (domain, ip) => `$TTL 14400\n${domain}. IN SOA ns1.example.com. hostmaster.${domain}. 2024010101 3600 1800 1209600 86400\n${domain}. 86400 IN NS ns1.example.com.\n${domain}. 14400 IN A ${ip}\nwww 14400 IN A ${ip}\nmail 14400 IN A ${ip}0\n`;
+const USERDATA_MAIN = 'addon_domains:\n  bobshop.net: bobshop.bob.com\nmain_domain: bob.com\nparked_domains:\n  - bobalias.org\nsub_domains:\n  - shop.bob.com\n  - bobshop.bob.com\n';
 const REMOTE_IP = '198.51.100.7';
 
 const HANDLERS = {
@@ -22,11 +24,12 @@ const HANDLERS = {
     'fs.write_file': ({ path, content }) => ({ path, bytes: Buffer.byteLength(content) }),
     'fs.chown': ({ path, owner }) => ({ path, owner }),
     'fs.remove': ({ path }) => ({ path }),
-    'fs.stat': ({ path }) => (path.endsWith('.tar.gz') ? { path, exists: true, isDirectory: false, size: 2048, mtime: '2026-10-26T00:00:00.000Z' } : { path, exists: true, isDirectory: true }),
+    // Only cpmove-dave.tar.gz is present in the upload directory (as transfer.archive.list says); other archives exist elsewhere.
+    'fs.stat': ({ path }) => (path.startsWith('/var/lib/whm/transfers/uploads/') && !path.endsWith('/cpmove-dave.tar.gz') ? { path, exists: false } : path.endsWith('.tar.gz') ? { path, exists: true, isDirectory: false, size: 2048, mtime: '2026-10-26T00:00:00.000Z' } : { path, exists: true, isDirectory: true }),
     'fs.copy_tree': ({ from, to }) => ({ from, to }),
     'transfer.remote.probe': ({ connection }) => ({ ok: true, hostname: connection.host, kernel: '6.1.0', uid: 0, isRoot: true, addresses: [REMOTE_IP], tools: { rsync: true, mysqldump: true, mysql: true }, cpanel: true, os: { id: 'almalinux', name: 'AlmaLinux 9', version: '9' }, homeDisk: null }),
     'transfer.remote.list_accounts': () => ({ cpanel: true, accounts: [
-      { username: 'bob', uid: 1001, gid: 1001, home: '/home/bob', shell: '/bin/bash', domain: 'bob.com', domains: ['shop.bob.com', 'bobshop.net'], homeListed: true },
+      { username: 'bob', uid: 1001, gid: 1001, home: '/home/bob', shell: '/bin/bash', domain: 'bob.com', domains: ['shop.bob.com', 'bobshop.net', 'bobalias.org', 'bobshop.bob.com'], homeListed: true },
       { username: 'carol', uid: 1002, gid: 1002, home: '/home/carol', shell: '/bin/bash', domain: 'carol.org', domains: [], homeListed: true },
       { username: 'nodomain', uid: 1003, gid: 1003, home: '/home/nodomain', shell: '/bin/bash', domain: null, domains: [], homeListed: true },
     ] }),
@@ -44,6 +47,7 @@ const HANDLERS = {
       if (zone) return { path, exists: true, content: ZONE(zone[1], REMOTE_IP) };
       const ud = path.match(/^\/var\/cpanel\/userdata\/bob\/(bobshop\.net)$/);
       if (ud) return { path, exists: true, content: `documentroot: /home/bob/public_html/bobshop\nservername: ${ud[1]}\n` };
+      if (path === '/var/cpanel/userdata/bob/main') return { path, exists: true, content: USERDATA_MAIN };
       return { path, exists: false, content: null };
     },
     'transfer.mysql.import': ({ path, database }) => { if (!BINS.mysql) throw capabilityMissing('The MySQL client'); return { path, database, imported: true }; },
@@ -54,13 +58,13 @@ const HANDLERS = {
     'db.grants.list': ({ user, host }) => ({ user, host, raw: [], grants: [] }),
     'db.grant': ({ user, database, privileges, hosts }) => ({ user, database, privileges, hosts }),
     'transfer.archive.list': ({ path }) => ({ path, exists: path === '/var/lib/whm/transfers/uploads', archives: path === '/var/lib/whm/transfers/uploads' ? [{ name: 'cpmove-dave.tar.gz', path: '/var/lib/whm/transfers/uploads/cpmove-dave.tar.gz', sizeBytes: 2048, mtime: '2026-10-26T00:00:00.000Z' }] : [] }),
-    'transfer.cpmove.inspect': ({ path }) => ({ path, sizeBytes: 2048, mtime: '2026-10-26T00:00:00.000Z', top: 'cpmove-dave', username: 'dave', databases: path.includes('evil') ? ['dave_blog', 'mysql', 'sys'] : ['dave_blog'], zones: ['dave.net', 'davestore.com'], userdata: ['davestore.com'], hasHomedir: true, hasGrants: true, hasShadow: true, hasAddons: true, hasParked: true, hasSubdomains: true, hasCpConfig: true, version: true, config: { domain: 'dave.net', plan: 'gold', contactEmail: 'dave@dave.net', ip: REMOTE_IP, raw: { USER: 'dave' } }, entries: 10, sample: [] }),
+    'transfer.cpmove.inspect': ({ path }) => ({ path, sizeBytes: 2048, mtime: '2026-10-26T00:00:00.000Z', top: 'cpmove-dave', username: 'dave', databases: path.includes('evil') ? ['dave_blog', 'mysql', 'sys'] : ['dave_blog'], zones: ['dave.net', 'davestore.com', 'davezone.net'], userdata: ['davestore.com'], hasHomedir: true, hasGrants: true, hasShadow: true, hasAddons: true, hasParked: true, hasSubdomains: true, hasCpConfig: true, version: true, config: { domain: 'dave.net', plan: 'gold', contactEmail: 'dave@dave.net', ip: REMOTE_IP, raw: { USER: 'dave' } }, entries: 10, sample: [] }),
     'transfer.cpmove.extract': ({ destination, members }) => ({ destination, extracted: !members.some((m) => m.includes('missing')), members }),
     'transfer.cpmove.read_member': ({ member }) => {
       const map = {
         'cpmove-dave/addons': 'davestore.com=davestore.dave.net\n', 'cpmove-dave/pds': 'davealias.org\n', 'cpmove-dave/sds2': 'davestore_dave.net=/home/dave/public_html/davestore\n',
         'cpmove-dave/userdata/davestore.com': 'documentroot: /home/dave/public_html/davestore\nservername: davestore.com\n',
-        'cpmove-dave/dnszones/dave.net.db': ZONE('dave.net', REMOTE_IP), 'cpmove-dave/dnszones/davestore.com.db': ZONE('davestore.com', REMOTE_IP),
+        'cpmove-dave/dnszones/dave.net.db': ZONE('dave.net', REMOTE_IP), 'cpmove-dave/dnszones/davestore.com.db': ZONE('davestore.com', REMOTE_IP), 'cpmove-dave/dnszones/davezone.net.db': ZONE('davezone.net', REMOTE_IP),
         'cpmove-dave/shadow': `${SHADOW}\n`,
         'cpmove-dave/mysql.sql': [
           `GRANT USAGE ON *.* TO 'dave_app'@'localhost' IDENTIFIED BY PASSWORD '${NATIVE_HASH}';`,
@@ -124,6 +128,15 @@ describe('helpers', () => {
       { domain: 'shop.example.net', type: 'addon', via: 'shop.alice.com' }, { domain: 'alias.example.org', type: 'parked' }, { domain: 'shop.alice.com', type: 'sub', docroot: '/home/alice/public_html/shop' },
     ]);
     expect(parseUserdata('documentroot: /home/a/public_html/x\nservername: X.com\nphpversion: ea-php83\n')).toMatchObject({ documentroot: '/home/a/public_html/x', servername: 'x.com', phpversion: 'ea-php83' });
+    expect(parseUserdataMain(USERDATA_MAIN)).toEqual({ addons: { 'bobshop.net': 'bobshop.bob.com' }, parked: ['bobalias.org'], subs: ['shop.bob.com', 'bobshop.bob.com'] });
+    expect(parseUserdataMain('addon_domains: {}\nmain_domain: x.com\nparked_domains: []\nsub_domains: []\n')).toEqual({ addons: {}, parked: [], subs: [] });
+    expect(parseUserdataMain('parked_domains:\n  - "Alias.Example.org"\n  - not a domain\n')).toEqual({ addons: {}, parked: ['alias.example.org'], subs: [] });
+  });
+
+  it('rewrites source addresses in zone text only as whole tokens', () => {
+    const zone = 'a 14400 IN A 10.0.0.1\nb IN A 10.0.0.10\nc IN A 110.0.0.1\nt IN TXT "v=spf1 ip4:10.0.0.1 ip4:10.0.0.12 -all"\nd IN AAAA 2001:db8::1\ne IN AAAA 2001:db8::10\n';
+    expect(rewriteZoneAddresses(zone, ['10.0.0.1', '2001:db8::1'], '192.0.2.5')).toBe('a 14400 IN A 192.0.2.5\nb IN A 10.0.0.10\nc IN A 110.0.0.1\nt IN TXT "v=spf1 ip4:192.0.2.5 ip4:10.0.0.12 -all"\nd IN AAAA 192.0.2.5\ne IN AAAA 2001:db8::10\n');
+    expect(rewriteZoneAddresses(zone, ['192.0.2.5', null], '192.0.2.5')).toBe(zone);
   });
 });
 
@@ -229,7 +242,7 @@ describe('Transfers API', () => {
       const accounts = await get(`/sessions/${sessionId}/accounts`).expect(200);
       expect(accounts.body.data.cached).toBe(false);
       const bob = accounts.body.data.accounts.find((a) => a.username === 'bob');
-      expect(bob).toMatchObject({ domain: 'bob.com', localExists: false, domains: ['shop.bob.com', 'bobshop.net'] });
+      expect(bob).toMatchObject({ domain: 'bob.com', localExists: false, domains: ['shop.bob.com', 'bobshop.net', 'bobalias.org', 'bobshop.bob.com'] });
       expect((await get(`/sessions/${sessionId}/accounts`).expect(200)).body.data.cached).toBe(true);
       expect(app.agent.callsTo('transfer.remote.list_accounts')).toHaveLength(1);
       await get(`/sessions/${sessionId}/accounts?refresh=true`).expect(200);
@@ -293,6 +306,9 @@ describe('Transfers API', () => {
       const types = Object.fromEntries(account.domains.map((d) => [d.domain, d]));
       expect(types['shop.bob.com']).toMatchObject({ type: 'sub' });
       expect(types['bobshop.net']).toMatchObject({ type: 'addon', docroot: `${account.home_dir}/public_html/bobshop` });
+      // cPanel parked domains alias the main site; the subdomain an addon is served through is not a site of its own.
+      expect(types['bobalias.org']).toMatchObject({ type: 'parked', docroot: `${account.home_dir}/public_html` });
+      expect(types['bobshop.bob.com']).toBeUndefined();
 
       const rsync = app.agent.callsTo('transfer.remote.rsync');
       expect(rsync[0].args).toMatchObject({ remotePath: '/home/bob', localPath: account.home_dir, directory: true, excludes: expect.arrayContaining(['tmp/']) });
@@ -300,8 +316,8 @@ describe('Transfers API', () => {
       expect(rsync[1].args).toMatchObject({ remotePath: '/tmp/whm-transfer-bob_shop-abcd.sql', directory: false });
       expect(app.agent.callsTo('transfer.remote.remove_file')[0].args.path).toBe('/tmp/whm-transfer-bob_shop-abcd.sql');
       // Copies and dumps may run for hours: the split-mode socket client must not give up after its 1 h default.
-      expect(optionsOf('transfer.remote.rsync').map((o) => o.timeoutMs)).toEqual([86_400_000, 86_400_000]);
-      expect(optionsOf('transfer.remote.dump_database').map((o) => o.timeoutMs)).toEqual([7_200_000]);
+      expect(optionsOf('transfer.remote.rsync').map((o) => o.timeoutMs)).toEqual([86_460_000, 86_460_000]);
+      expect(optionsOf('transfer.remote.dump_database').map((o) => o.timeoutMs)).toEqual([7_260_000]);
       expect(app.agent.callsTo('fs.chown')[0].args).toMatchObject({ path: account.home_dir, owner: 'robert', recursive: true });
 
       const run = (await get(`/runs/${runId}`).expect(200)).body.data;
@@ -323,14 +339,18 @@ describe('Transfers API', () => {
       expect(app.agent.callsTo('transfer.user.set_password_hash')[0].args).toEqual({ username: 'robert', hash: SHADOW });
       expect(item.steps.password).toMatchObject({ status: 'applied', detail: expect.stringMatching(/hash copied/) });
       expect(JSON.stringify(run)).not.toContain(SHADOW);
-      expect(item.steps.domains.added.map((d) => d.domain).sort()).toEqual(['bobshop.net', 'shop.bob.com']);
+      expect(item.steps.domains.added.map((d) => d.domain).sort()).toEqual(['bobalias.org', 'bobshop.net', 'shop.bob.com']);
       const zones = Object.fromEntries(item.steps.dns.map((z) => [z.domain, z]));
-      expect(Object.keys(zones).sort()).toEqual(['bob.com', 'bobshop.net']);
+      expect(Object.keys(zones).sort()).toEqual(['bob.com', 'bobalias.org', 'bobshop.net']);
       // The source zone is stored for the new account; without BIND here it is published later.
       expect(['applied', 'pending']).toContain(zones['bob.com'].status);
       expect(zones['bob.com'].detail).toMatch(/imported/);
-      const zoneRow = app.ctx.db.prepare('SELECT z.account_id, a.username FROM dns_zones z JOIN accounts a ON a.id = z.account_id WHERE z.domain = ?').get('bob.com');
+      const zoneRow = app.ctx.db.prepare('SELECT z.id, z.account_id, a.username FROM dns_zones z JOIN accounts a ON a.id = z.account_id WHERE z.domain = ?').get('bob.com');
       expect(zoneRow.username).toBe('robert');
+      // The source address is rewritten to the account's; an address that only starts with it is left alone.
+      const records = Object.fromEntries(app.ctx.db.prepare("SELECT name, value FROM dns_records WHERE zone_id = ? AND type = 'A'").all(zoneRow.id).map((r) => [r.name.replace(/\.?bob\.com\.?$/, '') || '@', r.value]));
+      expect(records.www).toBe(account.ip || REMOTE_IP);
+      expect(records.mail).toBe(`${REMOTE_IP}0`);
       expect(item.steps.web.status).toBe('pending');
       expect(run.totals.total).toBe(1);
       const audit = app.ctx.db.prepare("SELECT action FROM audit_log WHERE action IN ('transfer.start', 'transfer.result')").all().map((r) => r.action);
@@ -448,9 +468,17 @@ describe('Transfers API', () => {
       expect((await post('/uploads', { filename: '../x.tar.gz', size: 10 })).status).toBe(422);
       expect((await rpost('/uploads', { filename: 'cpmove-dave.tar.gz', size: 10 })).status).toBe(403);
       const chunk = Buffer.alloc(5, 'a').toString('base64');
-      const begin = await post('/uploads', { filename: 'cpmove-dave.tar.gz', size: 10 }).expect(201);
+      // An archive already in the staging directory is never overwritten by an upload of the same name.
+      const taken = await post('/uploads', { filename: 'cpmove-dave.tar.gz', size: 10 });
+      expect(taken.status).toBe(409);
+      expect(taken.body.error.message).toMatch(/already exists/);
+      const begin = await post('/uploads', { filename: 'cpmove-new.tar.gz', size: 10 }).expect(201);
       const { id } = begin.body.data;
-      expect(begin.body.data.path).toBe('/var/lib/whm/transfers/uploads/cpmove-dave.tar.gz');
+      expect(begin.body.data.path).toBe('/var/lib/whm/transfers/uploads/cpmove-new.tar.gz');
+      // Nor by a second upload started while the first is in flight.
+      const twice = await post('/uploads', { filename: 'cpmove-new.tar.gz', size: 10 });
+      expect(twice.status).toBe(409);
+      expect(twice.body.error.message).toMatch(/being uploaded already/);
       expect((await put(`/uploads/${id}/chunks`, { data: 'not base64!' })).status).toBe(422);
       expect((await put('/uploads/zzz/chunks', { data: chunk })).status).toBe(422);
       expect((await put(`/uploads/${'0'.repeat(24)}/chunks`, { data: chunk })).status).toBe(404);
@@ -464,7 +492,7 @@ describe('Transfers API', () => {
       expect((await put(`/uploads/${id}/chunks`, { data: chunk }).expect(200)).body.data.received).toBe(10);
       expect((await put(`/uploads/${id}/chunks`, { data: chunk })).status).toBe(422);
       const appends = app.agent.callsTo('transfer.upload.append');
-      expect(appends[0].args).toMatchObject({ truncate: true, path: '/var/lib/whm/transfers/uploads/cpmove-dave.tar.gz' });
+      expect(appends[0].args).toMatchObject({ truncate: true, path: '/var/lib/whm/transfers/uploads/cpmove-new.tar.gz' });
       expect(appends[1].args.truncate).toBe(false);
       const fin = await post(`/uploads/${id}/finish`).expect(200);
       expect(fin.body.data.archive.username).toBe('dave');
@@ -499,7 +527,8 @@ describe('Transfers API', () => {
       const extracts = app.agent.callsTo('transfer.cpmove.extract');
       expect(extracts[0].args).toMatchObject({ path: file, destination: account.home_dir, members: ['cpmove-dave/homedir/*'], stripComponents: 2, owner: 'dave' });
       expect(extracts[1].args).toMatchObject({ members: ['cpmove-dave/mysql/dave_blog.sql'], destination: '/var/lib/whm/transfers/run-' + res.body.data.run.id });
-      expect(optionsOf('transfer.cpmove.extract').every((o) => o.timeoutMs === 86_400_000)).toBe(true);
+      expect(optionsOf('transfer.cpmove.extract').every((o) => o.timeoutMs === 86_460_000)).toBe(true);
+      expect(optionsOf('transfer.cpmove.read_member').every((o) => o.timeoutMs === 3_660_000)).toBe(true);
       // The UI's inspect result is reused: the archive is not listed again for the restore.
       expect(app.agent.callsTo('transfer.cpmove.inspect')).toHaveLength(0);
       const run = (await get(`/runs/${res.body.data.run.id}`).expect(200)).body.data;
@@ -540,7 +569,7 @@ describe('Transfers API', () => {
         const imported = app.agent.callsTo('transfer.mysql.import').map((c) => c.args.database);
         expect(imported.sort()).toEqual(['dave4_blog', 'dave4_mysql', 'dave4_sys']);
         expect(app.agent.callsTo('transfer.mysql.import').every((c) => c.args.definerPrefix === 'dave')).toBe(true);
-        expect(optionsOf('transfer.mysql.import').every((o) => o.timeoutMs === 7_200_000)).toBe(true);
+        expect(optionsOf('transfer.mysql.import').every((o) => o.timeoutMs === 7_260_000)).toBe(true);
         expect(app.agent.callsTo('db.database.create').map((c) => c.args.name).sort()).toEqual(['dave4_blog', 'dave4_mysql', 'dave4_sys']);
         // mysql.sql: dave_app keeps its hash, dave_ro (unix_socket) gets a random password, root/evil/mysql.*/FILE are refused.
         const created = app.agent.callsTo('transfer.mysql.create_user');
@@ -567,6 +596,20 @@ describe('Transfers API', () => {
       } finally {
         await refreshCaps({ mysql: false, mysqld: false });
       }
+    });
+
+    it('keeps the source zone text with a pending step when BIND is required but absent', async () => {
+      app.ctx.config.env = 'production';
+      try {
+        const res = await post('/restore', { path: '/var/lib/whm/transfers/uploads/cpmove-dave.tar.gz', username: 'davezone', domain: 'davezone.net', options: { skipHome: true, skipDatabases: true } }).expect(202);
+        await finished(res.body.data.job.id);
+        const run = (await get(`/runs/${res.body.data.run.id}`).expect(200)).body.data;
+        const zone = run.items[0].steps.dns.find((z) => z.domain === 'davezone.net');
+        expect(zone.status).toBe('pending');
+        expect(zone.detail).toMatch(/import the text kept with this step by hand/);
+        expect(zone.zone).toMatch(/IN SOA/);
+        expect(app.ctx.db.prepare('SELECT 1 FROM dns_zones WHERE domain = ?').get('davezone.net')).toBeUndefined();
+      } finally { app.ctx.config.env = 'development'; }
     });
 
     it('is exposed for other categories as restoreArchive', async () => {
@@ -641,6 +684,38 @@ describe('Transfers API', () => {
       expect(app.ctx.db.prepare("SELECT action FROM audit_log WHERE action = 'account.addon.convert'").all()).toHaveLength(1);
     });
 
+    it('refuses to delete source files that are the old account\'s main site or serve another of its domains', async () => {
+      const alice = app.ctx.db.prepare('SELECT id, home_dir FROM accounts WHERE username = ?').get('alice');
+      const insert = app.ctx.db.prepare('INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, ?, ?, ?)');
+      insert.run(alice.id, 'alicemain.com', 'addon', `${alice.home_dir}/public_html`);
+      insert.run(alice.id, 'alicehome.com', 'addon', alice.home_dir);
+      insert.run(alice.id, 'alicenest.com', 'addon', `${alice.home_dir}/public_html/nest`);
+      insert.run(alice.id, 'blog.alice.com', 'sub', `${alice.home_dir}/public_html/nest/blog`);
+      insert.run(alice.id, 'aliceparent.com', 'addon', `${alice.home_dir}/sites`);
+      insert.run(alice.id, 'alicechild.com', 'addon', `${alice.home_dir}/sites/child`);
+      // A docroot below another domain's (the usual public_html/<addon> layout) is fine to delete; one above another's is not.
+      expect((await post('/convert-addon/preview', { domain: 'alicechild.com', username: 'amain', options: { removeSource: true } }).expect(200)).body.data.ok).toBe(true);
+      for (const [domain, re] of [['alicemain.com', /home directory or main site/], ['alicehome.com', /home directory or main site/], ['alicenest.com', /blog\.alice\.com \(sub\)/], ['aliceparent.com', /alicechild\.com \(addon\)/]]) {
+        const unsafe = (await post('/convert-addon/preview', { domain, username: 'amain', options: { removeSource: true } }).expect(200)).body.data;
+        expect(unsafe.ok, domain).toBe(false);
+        expect(unsafe.issues.join(' '), domain).toMatch(re);
+        expect((await post('/convert-addon', { domain, username: 'amain', options: { removeSource: true } })).status, domain).toBe(422);
+        // Keeping the files is always possible.
+        expect((await post('/convert-addon/preview', { domain, username: 'amain', options: { removeSource: false } }).expect(200)).body.data.ok, domain).toBe(true);
+      }
+      // The check runs again inside the job: a domain added below the docroot after the preview keeps the files.
+      app.agent.set('user.create', (args) => { insert.run(alice.id, 'late.alice.com', 'sub', `${alice.home_dir}/public_html/nest/late`); return { username: args.username, uid: 30002, gid: 30002, home: args.homeDir, shell: args.shell }; });
+      app.ctx.db.prepare('DELETE FROM account_domains WHERE domain = ?').run('blog.alice.com');
+      try {
+        const res = await post('/convert-addon', { domain: 'alicenest.com', username: 'anest', options: { copyFiles: true, removeSource: true } }).expect(202);
+        await finished(res.body.data.job.id);
+        const run = (await get(`/runs/${res.body.data.run.id}`).expect(200)).body.data;
+        expect(run.items[0].steps.files.status).toBe('applied');
+        expect(run.items[0].steps.cleanup).toMatchObject({ status: 'skipped', detail: expect.stringMatching(/source files kept: late\.alice\.com/) });
+        expect(app.agent.callsTo('fs.remove').some((c) => c.args.path === `${alice.home_dir}/public_html/nest`)).toBe(false);
+      } finally { app.agent.reset('user.create'); }
+    });
+
     it('lets a reseller convert addon domains of their own accounts', async () => {
       const res = await rpost('/convert-addon', { domain: 'rbobshop.com', username: 'rbobshop', options: { copyFiles: false } }).expect(202);
       await finished(res.body.data.job.id);
@@ -648,6 +723,36 @@ describe('Transfers API', () => {
       expect(created.owner).toBe('resell1');
       const run = (await rget(`/runs/${res.body.data.run.id}`).expect(200)).body.data;
       expect(run.items[0].steps.files.status).toBe('skipped');
+    });
+
+    it('offers database moves to root only, since reassigning them is the Database Map Tool', async () => {
+      const rbob = app.ctx.db.prepare('SELECT id, home_dir FROM accounts WHERE username = ?').get('rbob');
+      app.ctx.db.prepare("INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, 'rbobdata.com', 'addon', ?)").run(rbob.id, `${rbob.home_dir}/public_html/rbobdata.com`);
+      app.ctx.db.prepare("INSERT INTO databases (account_id, name) VALUES (?, 'rbob_data')").run(rbob.id);
+      const asRoot = (await post('/convert-addon/preview', { domain: 'rbobdata.com', username: 'rbobdata' }).expect(200)).body.data;
+      expect(asRoot.addon.databases).toEqual(['rbob_data']);
+      const asReseller = (await rpost('/convert-addon/preview', { domain: 'rbobdata.com', username: 'rbobdata' }).expect(200)).body.data;
+      expect(asReseller.addon.databases).toEqual([]);
+      expect(asReseller.ok).toBe(true);
+      const selected = (await rpost('/convert-addon/preview', { domain: 'rbobdata.com', username: 'rbobdata', options: { moveDatabases: ['rbob_data'] } }).expect(200)).body.data;
+      expect(selected.ok).toBe(false);
+      expect(selected.issues.join(' ')).toMatch(/requires the root user/);
+      const start = await rpost('/convert-addon', { domain: 'rbobdata.com', username: 'rbobdata', options: { copyFiles: false, moveDatabases: ['rbob_data'] } });
+      expect(start.status).toBe(422);
+      expect(app.ctx.db.prepare('SELECT 1 FROM accounts WHERE username = ?').get('rbobdata')).toBeUndefined();
+      expect(app.ctx.db.prepare('SELECT account_id FROM databases WHERE name = ?').get('rbob_data').account_id).toBe(rbob.id);
+    });
+
+    it('fails a queued run whose requester no longer exists instead of running it as root', async () => {
+      const ghost = await app.createUser('ghost1', 'reseller');
+      const run = app.ctx.db.prepare("INSERT INTO transfer_runs (kind, created_by, requested_by, status, source, params_json) VALUES ('convert_addon', ?, 'ghost1', 'queued', 'alice:aliceshop.com', ?)").run(ghost.id, JSON.stringify({ addon: { domain: 'alicemain.com', account: 'alice' }, target: { username: 'ghostacct', package: null }, options: { copyFiles: false, removeSource: false, moveMail: false, moveDatabases: [] } }));
+      app.ctx.db.prepare("INSERT INTO transfer_run_items (run_id, source_username, username, domain, status, steps_json) VALUES (?, 'alice', 'ghostacct', 'alicemain.com', 'queued', '{}')").run(run.lastInsertRowid);
+      app.ctx.db.prepare('DELETE FROM users WHERE id = ?').run(ghost.id);
+      const jobCtx = { params: { runId: Number(run.lastInsertRowid), userId: ghost.id }, job: { id: 0 }, log: () => {}, progress: () => {} };
+      await expect(app.ctx.transfers.runConvertAddon(jobCtx)).rejects.toThrow(/no longer exists/);
+      expect(app.ctx.db.prepare('SELECT status FROM transfer_runs WHERE id = ?').get(run.lastInsertRowid).status).toBe('failed');
+      expect(app.ctx.db.prepare('SELECT 1 FROM accounts WHERE username = ?').get('ghostacct')).toBeUndefined();
+      expect(app.ctx.db.prepare('SELECT type FROM account_domains WHERE domain = ?').get('alicemain.com')).toMatchObject({ type: 'addon' });
     });
 
     it('puts the domain rows back when the account cannot be created', async () => {

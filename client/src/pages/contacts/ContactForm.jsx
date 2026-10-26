@@ -21,6 +21,8 @@ export function ContactForm({ initial, events, channels, severities, onSubmit, o
   // "*" marks an all-events contact in the API shape; the picker only ever holds specific keys.
   const [draft, setDraft] = useState(() => ({ ...emptyContact(), ...initial, events: (initial?.events || []).filter((k) => k !== '*'), config: {} }));
   const [secrets, setSecrets] = useState({ token: '', secret: '', channelName: initial?.config?.channelName || '' });
+  const [removeSecret, setRemoveSecret] = useState(false);
+  const secretStored = Boolean(initial?.config?.secret?.set);
   const set = (k, v) => setDraft((d) => ({ ...d, [k]: v }));
   const field = ADDRESS_FIELD[draft.channel] || ADDRESS_FIELD.email;
   const groups = useMemo(() => {
@@ -35,7 +37,10 @@ export function ContactForm({ initial, events, channels, severities, onSubmit, o
     e.preventDefault();
     const config = {};
     if (draft.channel === 'pushover' && secrets.token) config.token = secrets.token;
-    if (draft.channel === 'webhook' && secrets.secret !== '') config.secret = secrets.secret;
+    if (draft.channel === 'webhook') {
+      if (removeSecret && secretStored) config.secret = null;
+      else if (secrets.secret.trim() !== '') config.secret = secrets.secret.trim();
+    }
     if (draft.channel === 'slack') config.channelName = secrets.channelName || null;
     onSubmit({ name: draft.name.trim(), channel: draft.channel, address: draft.address.trim(), events: draft.allEvents ? [] : draft.events.filter((k) => k !== '*'), minSeverity: draft.minSeverity, enabled: draft.enabled, ...(Object.keys(config).length ? { config } : {}) });
   };
@@ -53,9 +58,12 @@ export function ContactForm({ initial, events, channels, severities, onSubmit, o
         </Field>
       )}
       {draft.channel === 'webhook' && (
-        <Field label="Signing secret" help={initial?.config?.secret?.set ? 'A secret is stored. Leave blank to keep it; type a space and clear it to remove it.' : 'Optional. The receiver verifies X-WHM-Signature with it.'}>
-          <TextInput value={secrets.secret} onChange={(v) => setSecrets((s) => ({ ...s, secret: v }))} type="password" autoComplete="off" placeholder={initial?.config?.secret?.set ? '•••••••••• (unchanged)' : ''} />
-        </Field>
+        <>
+          <Field label="Signing secret" help={secretStored ? 'A secret is stored. Leave blank to keep it, or type a new one to replace it.' : 'Optional. The receiver verifies X-WHM-Signature with it.'}>
+            <TextInput value={secrets.secret} onChange={(v) => { setSecrets((s) => ({ ...s, secret: v })); if (v) setRemoveSecret(false); }} type="password" autoComplete="off" placeholder={secretStored ? '•••••••••• (unchanged)' : ''} disabled={removeSecret} />
+          </Field>
+          {secretStored && <Field inline><Toggle checked={removeSecret} onChange={(v) => { setRemoveSecret(v); if (v) setSecrets((s) => ({ ...s, secret: '' })); }} label="Remove the stored secret" description="Posts are sent unsigned once saved." /></Field>}
+        </>
       )}
       {draft.channel === 'slack' && (
         <Field label="Channel override" help="Optional, e.g. #alerts. Most webhooks are bound to a channel already.">
@@ -66,7 +74,7 @@ export function ContactForm({ initial, events, channels, severities, onSubmit, o
         <Field label="Minimum severity" help="Events below this severity are not sent to this contact."><Select value={draft.minSeverity} onChange={(v) => set('minSeverity', v)} options={severities.map((s) => ({ value: s, label: SEVERITY_LABEL[s] || s }))} /></Field>
         <Field inline><Toggle checked={draft.enabled} onChange={(v) => set('enabled', v)} label="Enabled" description="Disabled contacts receive nothing but keep their configuration." /></Field>
       </div>
-      <Field inline><Toggle checked={draft.allEvents} onChange={(v) => set('allEvents', v)} label="Receive every event" description="Turn off to pick individual events." /></Field>
+      <Field inline><Toggle checked={draft.allEvents} onChange={(v) => set('allEvents', v)} label="Receive every event" description="Turn off to pick individual events. Events marked “not raised yet” are in the catalog for when their module is wired up." /></Field>
       {!draft.allEvents && (
         <div className="event-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12, marginBottom: 12 }}>
           {groups.map(([group, list]) => {
@@ -81,7 +89,7 @@ export function ContactForm({ initial, events, channels, severities, onSubmit, o
                 {list.map((e) => (
                   <label key={e.key} className="checkbox" style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, padding: '2px 0 2px 22px' }}>
                     <input type="checkbox" checked={draft.events.includes(e.key)} onChange={() => toggleEvent(e.key)} />
-                    <span>{e.label} <small className="muted">({e.severity})</small></span>
+                    <span>{e.label} <small className="muted">({e.severity}{e.wired === false ? ', not raised yet' : ''})</small></span>
                   </label>
                 ))}
               </div>

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { retentionClassFor, planPrune, publicDestinationConfig } from '../src/services/backup.js';
+import { retentionClassFor, planPrune, publicDestinationConfig, grantDatabase, rewriteDocroot } from '../src/services/backup.js';
 
 // A mock agent that behaves like a host with tar/gzip/curl: archives are kept
 // in an in-memory "disk" keyed by path, destinations in a per-kind store, so
@@ -26,10 +26,10 @@ function backupAgent({ binaries = ['tar', 'gzip', 'curl', 'systemctl', 'useradd'
     'backup.archive.verify': ({ archive, sha256 }) => { const a = disk.get(archive); if (!a) throw Object.assign(new Error(`${archive} does not exist`), { agentError: true, code: 'not_found', details: {} }); return { path: archive, sha256: a.sha256, expected: sha256 ?? null, ok: sha256 ? a.sha256 === sha256 : null, sizeBytes: a.sizeBytes }; },
     'backup.archive.info': ({ archive }) => { const a = disk.get(archive); if (!a) throw Object.assign(new Error('missing'), { agentError: true, code: 'not_found', details: {} }); return { path: archive, top: 'x', username: a.username, sizeBytes: a.sizeBytes, info: { version: 1, createdAt: '2026-10-25T02:00:00.000Z' }, metadata: a.metadata ?? null, components: { home: true, mysql: a.databases.map((d) => ({ database: d, file: `mysql/${d}.sql` })), users: false, dnszones: a.dnsZones.map((z) => z.domain) } }; },
     'backup.archive.inspect': ({ archive, prefix }) => ({ path: archive, top: 'x', prefix, total: 2, truncated: false, entries: [{ name: 'public_html', path: `${prefix}/public_html`, type: 'dir', size: 120, files: 3, mtime: '2026-10-25 02:00' }, { name: '.bashrc', path: `${prefix}/.bashrc`, type: 'file', size: 220, files: 1, mtime: '2026-10-25 02:00' }] }),
-    'backup.archive.extract': ({ archive, dest }) => { const a = disk.get(archive); return { path: archive, top: 'x', stagingDir: dest, username: a.username, info: {}, metadata: a.metadata ?? null, mysql: a.databases.map((d) => ({ database: d, file: `${dest}/mysql/${d}.sql`, sizeBytes: 10 })), users: a.databases.length ? { users: [{ user: `${a.username}_app`, host: 'localhost', plugin: 'mysql_native_password', hashHex: '2A41', grants: [`GRANT ALL PRIVILEGES ON \`${a.databases[0]}\`.* TO '${a.username}_app'@'localhost'`] }] } : null, dnszones: a.dnsZones.map((z) => ({ domain: z.domain, file: `${dest}/dnszones/${z.domain}.db`, body: z.body })), missing: [] }; },
+    'backup.archive.extract': ({ archive, dest }) => { const a = disk.get(archive); return { path: archive, top: 'x', stagingDir: dest, username: a.username, info: {}, metadata: a.metadata ?? null, mysql: a.databases.map((d) => ({ database: d, file: `${dest}/mysql/${d}.sql`, sizeBytes: 10 })), users: a.databases.length ? { users: [{ user: `${a.username}_app`, host: 'localhost', plugin: 'mysql_native_password', hashHex: '2A41', grants: [`GRANT USAGE ON *.* TO '${a.username}_app'@'localhost'`, `GRANT ALL PRIVILEGES ON \`${a.databases[0]}\`.* TO '${a.username}_app'@'localhost'`, `GRANT SELECT ON \`mysql\`.* TO '${a.username}_app'@'localhost'`, `GRANT ALL PRIVILEGES ON \`someone_else\`.* TO '${a.username}_app'@'localhost'`, `GRANT ALL PRIVILEGES ON \`${a.username}\\_%\`.* TO '${a.username}_app'@'localhost'`] }] } : null, dnszones: a.dnsZones.map((z) => ({ domain: z.domain, file: `${dest}/dnszones/${z.domain}.db`, body: z.body })), missing: [] }; },
     'backup.files.restore': ({ archive, username, homeDir, paths }) => ({ archive, homeDir, username, restored: paths.length ? paths.filter((p) => p !== 'missing.txt') : ['.'], missing: paths.filter((p) => p === 'missing.txt'), overwrite: true, warnings: [] }),
     'backup.db.import': ({ file, database }) => ({ file, database: database ?? null, sizeBytes: 10, warnings: [] }),
-    'backup.db.restore_users': ({ users }) => ({ engine: 'mariadb', created: users.map((u) => `${u.user}@${u.host}`), skipped: [], errors: [] }),
+    'backup.db.restore_users': ({ users }) => ({ engine: 'mariadb', created: users.map((u) => `${u.user}@${u.host}`), skipped: [], errors: [], dropped: [] }),
     'backup.archive.remove': ({ archive }) => ({ path: archive, removed: disk.delete(archive) }),
     'backup.staging.remove': ({ dir }) => ({ dir, removed: true }),
     'backup.destination.test': ({ config }) => (config.kind === 'ftp' && config.host === 'down.example.com' ? { ok: false, message: 'test upload: failed to connect', code: 'destination_failed', ms: 3 } : { ok: true, message: `probe ok on ${config.kind}`, ms: 3 }),
@@ -65,6 +65,20 @@ describe('backup helpers', () => {
 
   it('hides secrets in the public destination view', () => {
     expect(publicDestinationConfig({ host: 'h', password: 'p', secretKey: '', privateKey: 'k' })).toEqual({ host: 'h', has_password: true, has_secret_key: false, has_private_key: true });
+  });
+
+  it('reads the database a GRANT line names and moves archived docroots under the current home', () => {
+    expect(grantDatabase("GRANT ALL PRIVILEGES ON `alice_shop`.* TO 'alice_app'@'localhost'")).toBe('alice_shop');
+    expect(grantDatabase("GRANT SELECT, INSERT ON `alice\\_shop`.`orders` TO 'alice_app'@'%'")).toBe('alice_shop');
+    expect(grantDatabase("GRANT USAGE ON *.* TO 'alice_app'@'localhost' IDENTIFIED BY PASSWORD '*X'")).toBe('*');
+    expect(grantDatabase("GRANT SELECT ON mysql.* TO 'x'@'%'")).toBe('mysql');
+    expect(grantDatabase("GRANT PROXY ON ''@'' TO 'x'@'%'")).toBeNull();
+    expect(grantDatabase('DROP TABLE x')).toBeNull();
+    expect(rewriteDocroot('/home/alice/public_html/shop', '/home/alice', '/home2/alice')).toBe('/home2/alice/public_html/shop');
+    expect(rewriteDocroot('/home2/alice/public_html/blog', null, '/srv/home/alice')).toBe('/srv/home/alice/public_html/blog');
+    expect(rewriteDocroot('/home/alice', '/home/alice', '/home2/alice')).toBe('/home2/alice');
+    expect(rewriteDocroot('public_html', '/home/alice', '/home2/alice')).toBeNull();
+    expect(rewriteDocroot(null, '/home/alice', '/home2/alice')).toBeNull();
   });
 });
 
@@ -152,6 +166,13 @@ describe('Backup API', () => {
     });
   });
 
+  // dbCredentials() reads Database Services' profile row directly (no accessor
+  // is exported yet); the columns it depends on are pinned here.
+  it('the db_instances columns backups read for admin credentials exist', () => {
+    const columns = new Set(app.ctx.db.prepare('PRAGMA table_info(db_instances)').all().map((c) => c.name));
+    for (const c of ['id', 'engine', 'host', 'port', 'admin_user', 'admin_password_enc', 'is_local']) expect(columns.has(c), c).toBe(true);
+  });
+
   describe('destinations', () => {
     let s3Id;
     let ftpId;
@@ -173,7 +194,9 @@ describe('Backup API', () => {
       const res = await post('/destinations', { name: 'bad', config: { kind: 's3', accessKey: 'a', secretKey: 'b' } }).expect(422);
       expect(res.body.error.fields['config.bucket']).toBeDefined();
       await post('/destinations', { name: 'bad', config: { kind: 'ftp', host: 'h;rm', username: 'u' } }).expect(422);
-      await post('/destinations', { name: 'bad', config: { kind: 'sftp', host: 'h.example.com', username: 'u', path: '../x' } }).expect(422);
+      await post('/destinations', { name: 'bad', config: { kind: 'sftp', host: 'h.example.com', username: 'u', path: '../x', insecure: true } }).expect(422);
+      const unpinned = await post('/destinations', { name: 'bad', config: { kind: 'sftp', host: 'h.example.com', username: 'u', password: 'p' } }).expect(422);
+      expect(unpinned.body.error.fields['config.hostKeySha256']).toBeDefined();
       await post('/destinations', { name: 'bad', config: { kind: 'gdrive', folder: 'x' } }).expect(422);
       await post('/destinations', { name: 'bad', config: { kind: 'webdav', url: 'ftp://nope' } }).expect(422);
     });
@@ -185,6 +208,24 @@ describe('Backup API', () => {
       await put(`/destinations/${ftpId}`, { enabled: false }).expect(200);
       expect((await get('/destinations').expect(200)).body.data.find((d) => d.id === ftpId).enabled).toBe(false);
       await put(`/destinations/${ftpId}`, { enabled: true }).expect(200);
+    });
+
+    it('an explicit null removes a stored secret (key → password and back)', async () => {
+      const fp = 'A'.repeat(43);
+      const created = await post('/destinations', { name: 'sftp-box', enabled: false, config: { kind: 'sftp', host: 'sftp.example.com', username: 'u', password: 'pw', hostKeySha256: fp } }).expect(201);
+      const id = created.body.data.id;
+      expect(created.body.data.config).toMatchObject({ has_password: true, hostKeySha256: fp });
+      expect(created.body.data.config.has_private_key).toBeUndefined();
+      const keyed = await put(`/destinations/${id}`, { config: { kind: 'sftp', host: 'sftp.example.com', username: 'u', password: null, privateKey: '-----BEGIN KEY-----', hostKeySha256: fp } }).expect(200);
+      expect(keyed.body.data.config).toMatchObject({ has_private_key: true });
+      expect(keyed.body.data.config.has_password).toBeUndefined();
+      expect(app.ctx.backup.destinationConfig(id)).toEqual({ kind: 'sftp', host: 'sftp.example.com', port: 22, username: 'u', privateKey: '-----BEGIN KEY-----', hostKeySha256: fp, path: '', insecure: false });
+      const back = await put(`/destinations/${id}`, { config: { kind: 'sftp', host: 'sftp.example.com', username: 'u', password: 'pw2', privateKey: null, hostKeySha256: fp } }).expect(200);
+      expect(back.body.data.config).toMatchObject({ has_password: true });
+      expect(back.body.data.config.has_private_key).toBeUndefined();
+      expect(app.ctx.backup.destinationConfig(id).privateKey).toBeUndefined();
+      await put(`/destinations/${id}`, { config: { kind: 'sftp', host: 'sftp.example.com', username: 'u', privateKey: null } }).expect(422);
+      await del(`/destinations/${id}`).expect(200);
     });
 
     it('tests destinations through the agent and records the outcome', async () => {
@@ -258,6 +299,7 @@ describe('Backup API', () => {
       expect(run.body.data).toMatchObject({ status: 'done', accounts_ok: 1, accounts_failed: 0, kind: 'manual' });
       expect(run.body.data.summary.accounts[0]).toMatchObject({ username: 'alice', status: 'done', uploads: [{ destination: 'ftp-mirror', ok: false }, { destination: 'offsite-s3', ok: true }] });
       expect((await get('/runs').expect(200)).body.data[0].id).toBe(res.body.data.run.id);
+      expect(b.home_dir).toBe('/home/alice');
     });
 
     it('prunes beyond the retention per class and removes files locally and remotely', async () => {
@@ -316,6 +358,20 @@ describe('Backup API', () => {
       expect(row).toMatchObject({ account_name: 'bob', size: 999, status: 'done', local_present: 1 });
       await resellerHttp.post('/api/backup/rescan').set('X-CSRF-Token', resellerCsrf).send({}).expect(403);
     });
+    it('long-running ops cross the agent socket with a timeout matching their own (split mode never cuts an archive short)', async () => {
+      const seen = [];
+      const original = app.agent.op;
+      app.agent.op = (name, args, opts) => { seen.push({ name, timeoutMs: opts?.timeoutMs ?? null }); return original.call(app.agent, name, args, opts); };
+      try {
+        const res = await post('/runs', { accounts: ['alice'] }).expect(202);
+        expect((await waitForJob(app.ctx, res.body.data.job.id)).status).toBe('done');
+      } finally { app.agent.op = original; }
+      const by = (name) => seen.filter((c) => c.name === name).map((c) => c.timeoutMs);
+      expect(by('backup.account.archive')).toEqual([7_260_000]);
+      expect(by('backup.destination.upload')).toEqual([7_260_000, 7_260_000]);
+      expect(by('fs.mkdir')).toEqual([null]);
+      expect(by('backup.archive.remove').every((t) => t === null)).toBe(true);
+    });
   });
 
   describe('backups listing, browsing and lifecycle', () => {
@@ -336,6 +392,7 @@ describe('Backup API', () => {
       await resellerHttp.get(`/api/backup/backups/${bob.id}/browse`).expect(403);
       const overview = await resellerHttp.get('/api/backup/accounts').expect(200);
       expect(overview.body.data.map((a) => a.username)).toEqual(['alice']);
+      expect(overview.body.data[0]).toMatchObject({ backups: expect.any(Number), home_dir: '/home/alice', exists: true });
       expect(overview.body.data[0].backups).toBeGreaterThanOrEqual(1);
     });
 
@@ -405,6 +462,8 @@ describe('Backup API', () => {
       const assigned = [];
       const imported = [];
       app.ctx.dns.importZone = async ({ domain, body }) => { imported.push(domain); return { domain, body }; };
+      const bobId = app.ctx.db.prepare("SELECT id FROM accounts WHERE username = 'bob'").get().id;
+      app.ctx.db.prepare("INSERT INTO account_domains (account_id, domain, type, docroot, php_version) VALUES (?, 'shop.bob.com', 'sub', '/home/bob/public_html/shop', '8.2'), (?, 'bob-addon.com', 'addon', '/home/bob/public_html/bob-addon.com', NULL), (?, 'bob-parked.com', 'parked', NULL, NULL)").run(bobId, bobId, bobId);
       const run = await post('/runs', { accounts: ['bob'] }).expect(202);
       await waitForJob(app.ctx, run.body.data.job.id);
       const archiveCall = app.agent.callsTo('backup.account.archive').pop();
@@ -412,26 +471,81 @@ describe('Backup API', () => {
       expect(archiveCall.args.dbUsers).toEqual(['bob_app']);
       expect(archiveCall.args.dnsZones.map((z) => z.domain)).toEqual(['bob.com']);
       expect(archiveCall.args.credentials).toBeUndefined();
+      expect(archiveCall.args.metadata.domains.map((d) => [d.domain, d.type])).toEqual([['bob-addon.com', 'addon'], ['bob.com', 'main'], ['bob-parked.com', 'parked'], ['shop.bob.com', 'sub']]);
       const backup = (await get('/backups?account=bob').expect(200)).body.data[0];
       expect(backup.components.mysql).toEqual([{ database: 'bob_shop' }]);
+      // The archive was taken from another home root; docroots follow the new home.
+      const archived = app.agent.disk.get(backup.path).metadata;
+      archived.account.home_dir = '/home2/bob';
+      for (const d of archived.domains) if (d.docroot) d.docroot = d.docroot.replace('/home/bob', '/home2/bob');
 
       await app.http.delete('/api/accounts/bob').set('X-CSRF-Token', csrf).expect(200);
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM account_domains WHERE domain LIKE '%bob%'").get().n).toBe(0);
       expect((await get('/accounts').expect(200)).body.data.find((a) => a.username === 'bob')).toMatchObject({ exists: false });
-      await post(`/backups/${backup.id}/restore`, { kind: 'account', options: {} }).expect(409);
-      const res = await post(`/backups/${backup.id}/restore`, { kind: 'account', options: { createAccount: true } }).expect(202);
-      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      // bob-parked.com was taken by someone else in the meantime: it stays theirs.
+      const aliceId = app.ctx.db.prepare("SELECT id FROM accounts WHERE username = 'alice'").get().id;
+      app.ctx.db.prepare("INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, 'bob-parked.com', 'addon', '/home/alice/public_html/bob-parked.com')").run(aliceId);
+      const vhostCalls = [];
+      const web = app.ctx.web;
+      app.ctx.web = { ...web, ensureVhost: async (username) => { vhostCalls.push(username); return { username, applied: false, reason: 'php_missing', vhosts: [{ domain: 'bob.com', applied: false, reason: 'php_missing' }, { domain: 'shop.bob.com', applied: false, reason: 'php_missing' }, { domain: 'bob-addon.com', applied: false, reason: 'php_missing' }] }; } };
+      let res;
+      let job;
+      try {
+        await post(`/backups/${backup.id}/restore`, { kind: 'account', options: {} }).expect(409);
+        res = await post(`/backups/${backup.id}/restore`, { kind: 'account', options: { createAccount: true } }).expect(202);
+        job = await waitForJob(app.ctx, res.body.data.job.id);
+      } finally { app.ctx.web = web; }
       expect(job.status, JSON.stringify(job)).toBe('done');
       expect(app.ctx.db.prepare("SELECT username, domain FROM accounts WHERE username = 'bob'").get()).toEqual({ username: 'bob', domain: 'bob.com' });
       expect(app.agent.callsTo('backup.archive.extract')[0].args).toMatchObject({ archive: backup.path, dest: expect.stringMatching(/^\/backup\/\.restore-\d+$/) });
       expect(app.agent.callsTo('backup.files.restore')[0].args).toMatchObject({ username: 'bob', paths: [], overwrite: true });
       expect(app.agent.callsTo('backup.db.import')[0].args.file).toMatch(/mysql\/bob_shop\.sql$/);
-      expect(app.agent.callsTo('backup.db.restore_users')[0].args.users[0]).toMatchObject({ user: 'bob_app', host: 'localhost', hashHex: '2A41' });
+      const usersCall = app.agent.callsTo('backup.db.restore_users')[0].args;
+      expect(usersCall.users[0]).toMatchObject({ user: 'bob_app', host: 'localhost', hashHex: '2A41' });
+      expect(usersCall.users[0].grants).toEqual(["GRANT ALL PRIVILEGES ON `bob_shop`.* TO 'bob_app'@'localhost'"]);
+      expect(usersCall.allowedDatabases).toEqual(['bob_shop']);
       expect(assigned).toEqual([{ kind: 'database', name: 'bob_shop', account: 'bob' }, { kind: 'user', name: 'bob_app', account: 'bob' }]);
       expect(imported).toEqual(['bob.com']);
       expect(app.agent.callsTo('backup.staging.remove')).toHaveLength(1);
       const restore = await get(`/restores/${res.body.data.restore.id}`).expect(200);
-      expect(Object.fromEntries(Object.entries(restore.body.data.summary.steps).map(([k, v]) => [k, v.status]))).toMatchObject({ verify: 'done', account: 'done', files: 'done', databases: 'done', dns: 'done' });
+      expect(Object.fromEntries(Object.entries(restore.body.data.summary.steps).map(([k, v]) => [k, v.status]))).toMatchObject({ verify: 'done', account: 'done', domains: 'done', files: 'done', databases: 'done', dns: 'done' });
+      expect(restore.body.data.summary.steps.databases.droppedGrants).toHaveLength(4);
+      // Every other domain of the account is back, with its docroot under the new home and one vhost sync after the rows.
+      const newBobId = app.ctx.db.prepare("SELECT id FROM accounts WHERE username = 'bob'").get().id;
+      expect(app.ctx.db.prepare('SELECT domain, type, docroot, php_version FROM account_domains WHERE account_id = ? ORDER BY domain').all(newBobId)).toEqual([
+        { domain: 'bob-addon.com', type: 'addon', docroot: '/home/bob/public_html/bob-addon.com', php_version: null },
+        { domain: 'bob.com', type: 'main', docroot: '/home/bob/public_html', php_version: null },
+        { domain: 'shop.bob.com', type: 'sub', docroot: '/home/bob/public_html/shop', php_version: '8.2' },
+      ]);
+      expect(vhostCalls.filter((u) => u === 'bob').length).toBeGreaterThanOrEqual(1);
+      const domainsStep = restore.body.data.summary.steps.domains;
+      expect(domainsStep.domains).toEqual([
+        { domain: 'bob-addon.com', type: 'addon', docroot: '/home/bob/public_html/bob-addon.com', status: 'added', vhost: 'php_missing' },
+        { domain: 'bob-parked.com', type: 'parked', status: 'skipped', detail: 'now belongs to alice' },
+        { domain: 'shop.bob.com', type: 'sub', docroot: '/home/bob/public_html/shop', status: 'added', vhost: 'php_missing' },
+      ]);
+      expect(domainsStep.web).toEqual({ status: 'done', detail: 'vhosts written (php_missing)' });
+      expect(app.ctx.db.prepare("SELECT account_id FROM account_domains WHERE domain = 'bob-parked.com'").get().account_id).toBe(aliceId);
       expect(app.ctx.db.prepare("SELECT 1 FROM audit_log WHERE action = 'backup.restore.finish'").get()).toBeTruthy();
+      app.ctx.db.prepare("DELETE FROM account_domains WHERE domain = 'bob-parked.com'").run();
+    });
+
+    it('restoring into an existing account keeps its domains and only re-adds the missing ones', async () => {
+      const backup = (await get('/backups?account=bob').expect(200)).body.data[0];
+      const bobId = app.ctx.db.prepare("SELECT id FROM accounts WHERE username = 'bob'").get().id;
+      app.ctx.db.prepare("DELETE FROM account_domains WHERE domain = 'bob-addon.com'").run();
+      const web = app.ctx.web;
+      app.ctx.web = { ...web, ensureVhost: async (username) => ({ username, applied: true, reason: null, vhosts: [{ domain: 'bob.com', applied: true }, { domain: 'shop.bob.com', applied: true }, { domain: 'bob-addon.com', applied: true }] }) };
+      let steps;
+      try {
+        const res = await post(`/backups/${backup.id}/restore`, { kind: 'account', options: { files: false, databases: false, dns: false, mail: false } }).expect(202);
+        expect((await waitForJob(app.ctx, res.body.data.job.id)).status).toBe('done');
+        steps = (await get(`/restores/${res.body.data.restore.id}`).expect(200)).body.data.summary.steps;
+      } finally { app.ctx.web = web; }
+      expect(steps.domains).toMatchObject({ status: 'done', web: { status: 'done', detail: 'vhosts written' } });
+      expect(steps.domains.domains.map((d) => [d.domain, d.status])).toEqual([['bob-addon.com', 'added'], ['bob-parked.com', 'added'], ['shop.bob.com', 'kept']]);
+      expect(app.ctx.db.prepare('SELECT domain FROM account_domains WHERE account_id = ? ORDER BY domain').all(bobId).map((d) => d.domain)).toEqual(['bob-addon.com', 'bob-parked.com', 'bob.com', 'shop.bob.com']);
+      expect(app.ctx.db.prepare("SELECT docroot FROM account_domains WHERE domain = 'bob-parked.com'").get().docroot).toBe('/home/bob/public_html');
     });
 
     it('fails cleanly on a checksum mismatch and leaves the account untouched', async () => {
@@ -461,6 +575,10 @@ describe('Backup API', () => {
       expect(res.body.data).toMatchObject({ account: 'alice', type: 'import', pinned: true, size: 777, sha256: 'c'.repeat(64) });
       await post('/archives/import', { path: '/backup/cpmove-alice.tar.gz' }).expect(409);
       await post('/archives/import', { path: 'relative.tar.gz' }).expect(422);
+      app.agent.disk.set('/home/alice/cpmove-alice.tar.gz', { sizeBytes: 1, sha256: 'd'.repeat(64), username: 'alice', databases: [], dnsZones: [], metadata: null });
+      const home = await post('/archives/import', { path: '/home/alice/cpmove-alice.tar.gz' }).expect(422);
+      expect(home.body.error.fields.path).toBeDefined();
+      expect(app.agent.callsTo('backup.archive.info').map((c) => c.args.archive)).not.toContain('/home/alice/cpmove-alice.tar.gz');
       await resellerHttp.post('/api/backup/archives/import').set('X-CSRF-Token', resellerCsrf).send({ path: '/backup/cpmove-alice.tar.gz' }).expect(403);
     });
 
@@ -611,6 +729,69 @@ describe('Backup API', () => {
       const steps = (await get(`/restores/${res.body.data.restore.id}`).expect(200)).body.data.summary.steps;
       expect(steps.databases).toMatchObject({ status: 'done', imported: ['erin_shop'], skipped: ['mysql (system schema)'] });
       expect(app.agent.callsTo('backup.db.import').map((c) => c.args.file)).toEqual([expect.stringMatching(/erin_shop\.sql$/)]);
+      // The archived user's grant on the mysql schema never reaches the server; the user itself is recreated.
+      const users = app.agent.callsTo('backup.db.restore_users')[0].args;
+      expect(users.users[0].grants).toEqual([]);
+      expect(users.allowedDatabases).toEqual(['erin_shop']);
+      expect(steps.databases.droppedGrants.some((g) => /mysql.*system schema/.test(g))).toBe(true);
+      app.agent.disk.get(backup.path).databases = ['erin_shop'];
+    });
+
+    it('replays grants only for databases restored into the account: a database that changed hands keeps its new owner', async () => {
+      const backup = (await get('/backups?account=erin').expect(200)).body.data[0];
+      const bobId = app.ctx.db.prepare("SELECT id FROM accounts WHERE username = 'bob'").get().id;
+      app.ctx.db.prepare("DELETE FROM databases WHERE name = 'erin_shop'").run();
+      app.ctx.db.prepare("DELETE FROM db_users WHERE name = 'erin_app'").run();
+      app.ctx.db.prepare('INSERT INTO databases (account_id, name) VALUES (?, ?)').run(bobId, 'erin_shop');
+      app.agent.calls.length = 0;
+      const res = await post(`/backups/${backup.id}/restore`, { kind: 'account', options: { files: false, dns: false, mail: false } }).expect(202);
+      expect((await waitForJob(app.ctx, res.body.data.job.id)).status).toBe('done');
+      const steps = (await get(`/restores/${res.body.data.restore.id}`).expect(200)).body.data.summary.steps;
+      expect(steps.databases).toMatchObject({ imported: [], skipped: ['erin_shop (now belongs to bob)'] });
+      expect(app.agent.callsTo('backup.db.import')).toHaveLength(0);
+      const users = app.agent.callsTo('backup.db.restore_users');
+      expect(users).toHaveLength(1);
+      expect(users[0].args.users[0]).toMatchObject({ user: 'erin_app', grants: [] });
+      expect(users[0].args.allowedDatabases).toEqual([]);
+      expect(steps.databases.droppedGrants).toEqual([
+        expect.stringMatching(/GRANT USAGE ON \*\.\* .*\(global grant\)$/),
+        expect.stringMatching(/`erin_shop`.*\(database not restored for this account\)$/),
+        expect.stringMatching(/`mysql`.*\(system schema\)$/),
+        expect.stringMatching(/`someone_else`.*\(database not restored for this account\)$/),
+        expect.stringMatching(/`erin\\_%`.*\(wildcard database\)$/),
+      ]);
+      app.ctx.db.prepare("DELETE FROM databases WHERE name = 'erin_shop'").run();
+    });
+
+    it('a reseller sees and restores the archives of their own terminated accounts', async () => {
+      await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'frank', domain: 'frank.com', owner: 'resell1' }).expect(201);
+      const run = await resellerHttp.post('/api/backup/runs').set('X-CSRF-Token', resellerCsrf).send({ accounts: ['frank'] }).expect(202);
+      expect((await waitForJob(app.ctx, run.body.data.job.id)).status).toBe('done');
+      await app.http.delete('/api/accounts/frank').set('X-CSRF-Token', csrf).expect(200);
+      const overview = (await resellerHttp.get('/api/backup/accounts').expect(200)).body.data;
+      expect(overview.find((a) => a.username === 'frank')).toMatchObject({ exists: false, backups: 1, home_dir: null });
+      // dave now belongs to resell2: not offered to its former owner although the old archive is theirs.
+      expect(overview.find((a) => a.username === 'dave')).toBeUndefined();
+      const backup = (await resellerHttp.get('/api/backup/backups?account=frank').expect(200)).body.data[0];
+      expect(backup).toMatchObject({ account: 'frank', accountExists: false, home_dir: null });
+      const res = await resellerHttp.post(`/api/backup/backups/${backup.id}/restore`).set('X-CSRF-Token', resellerCsrf).send({ kind: 'account', options: { createAccount: true, databases: false, dns: false, mail: false } }).expect(202);
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.status, JSON.stringify(job)).toBe('done');
+      expect(app.ctx.db.prepare("SELECT owner_id FROM accounts WHERE username = 'frank'").get().owner_id).toBe(reseller.id);
+    });
+
+    it('restore history is filtered before it is limited, so a reseller\'s rows are never pushed out by other tenants', async () => {
+      const newest = app.ctx.db.prepare('SELECT owner_id FROM backup_restores ORDER BY id DESC LIMIT 1').get();
+      const mine = app.ctx.backup.listRestores({ limit: 1 }, { id: reseller.id, role: 'reseller' });
+      expect(mine).toHaveLength(1);
+      expect(mine[0].account_name).toBe('frank');
+      expect(app.ctx.backup.listRestores({ limit: 1 }, { id: 1, role: 'root' })[0].account_name).toBe('frank');
+      expect(newest.owner_id).toBe(reseller.id);
+      const older = app.ctx.backup.listRestores({ limit: 1, account: 'alice' }, { id: reseller.id, role: 'reseller' });
+      expect(older).toHaveLength(1);
+      expect(older[0]).toMatchObject({ account_name: 'alice' });
+      expect((await resellerHttp.get('/api/backup/restores?limit=1&account=alice').expect(200)).body.data[0].account_name).toBe('alice');
+      expect(app.ctx.backup.listRestores({ limit: 200 }, { id: reseller.id, role: 'reseller' }).every((r) => ['alice', 'frank'].includes(r.account_name))).toBe(true);
     });
   });
 });
@@ -648,6 +829,6 @@ describe('Backup API without tar on the host', () => {
 
   it('settings and destinations keep working without tar', async () => {
     await app.http.put('/api/backup/config').set('X-CSRF-Token', csrf).send({ 'backup.enabled': true }).expect(200);
-    await app.http.post('/api/backup/destinations').set('X-CSRF-Token', csrf).send({ name: 'later', config: { kind: 'sftp', host: 'sftp.example.com', username: 'u', password: 'p', path: '~/backups' } }).expect(201);
+    await app.http.post('/api/backup/destinations').set('X-CSRF-Token', csrf).send({ name: 'later', config: { kind: 'sftp', host: 'sftp.example.com', username: 'u', password: 'p', path: '~/backups', insecure: true } }).expect(201);
   });
 });

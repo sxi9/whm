@@ -133,14 +133,17 @@ describe('Multi Account Functions API', () => {
     it('runs the job: rows, A records and vhosts per account, with a downloadable report', async () => {
       const web = app.ctx.web;
       const synced = [];
-      app.ctx.web = { ...web, ensureVhost: async (u) => { synced.push(u); return { username: u, applied: false, reason: 'capability_missing', vhosts: [{ domain: `${u}.com`, applied: false }] }; } };
+      const rewrites = [];
+      app.ctx.web = { ...web, replaceIp: async (from, to, { accounts }) => { synced.push(accounts[0]); rewrites.push(`${accounts[0]}:${from}->${to}`); throw new CapabilityError('apache'); } };
       try {
-        const res = await post('/ip', { changes: [{ username: 'alice', ip: '203.0.113.20' }, { username: 'carol', ip: '203.0.113.20' }, { username: 'bob', ip: '203.0.113.10' }] }).expect(202);
+        const res = await post('/ip', { changes: [{ username: 'alice', ip: '203.0.113.20' }, { username: 'carol', ip: '203.0.113.20' }, { username: 'bob', ip: '203.0.113.20' }] }).expect(202);
         expect(res.body.data.run).toMatchObject({ kind: 'change_ip', status: 'queued' });
         const job = await finished(res.body.data.job.id);
         expect(job.result).toMatchObject({ runId: res.body.data.run.id, total: 3, pending: 3, failed: 0 });
         expect(synced.sort()).toEqual(['alice', 'bob', 'carol']);
-        for (const u of ['alice', 'carol']) expect((await app.http.get(`/api/accounts/${u}`)).body.data.ip).toBe('203.0.113.20');
+        // bob never had an address: the shared one is what its vhosts and zones carry.
+        expect(rewrites).toContain('bob:203.0.113.10->203.0.113.20');
+        for (const u of ['alice', 'carol', 'bob']) expect((await app.http.get(`/api/accounts/${u}`)).body.data.ip).toBe('203.0.113.20');
         const zone = await app.http.get('/api/dns/zones/alice.com').expect(200);
         expect(zone.body.data.records.filter((r) => r.type === 'A').every((r) => r.value === '203.0.113.20')).toBe(true);
 
@@ -152,7 +155,10 @@ describe('Multi Account Functions API', () => {
         expect(alice.steps.web.status).toBe('pending');
         expect(alice.steps.dns.some((d) => d.domain === 'alice.com' && d.name)).toBe(true);
         const bob = run.body.data.items.find((i) => i.username === 'bob');
-        expect(bob.steps.dns[0]).toMatchObject({ status: 'skipped' });
+        expect(bob).toMatchObject({ before: { ip: null }, after: { ip: '203.0.113.20' } });
+        expect(bob.steps.dns[0]).toMatchObject({ domain: 'bob.com', status: 'pending' });
+        const bobZone = await app.http.get('/api/dns/zones/bob.com').expect(200);
+        expect(bobZone.body.data.records.filter((r) => r.type === 'A').every((r) => r.value === '203.0.113.20')).toBe(true);
 
         const csv = await get(`/runs/${res.body.data.run.id}/report?format=csv`).expect(200);
         expect(csv.headers['content-type']).toMatch(/text\/csv/);
@@ -170,7 +176,7 @@ describe('Multi Account Functions API', () => {
 
     it('records a failure per account and continues with the rest', async () => {
       const web = app.ctx.web;
-      app.ctx.web = { ...web, ensureVhost: async (u) => { if (u === 'alice') throw Object.assign(new Error('apache exploded'), { agentError: true, code: 'command_failed' }); return { username: u, applied: true, vhosts: [{ domain: `${u}.com`, applied: true }], reload: { reloaded: true } }; } };
+      app.ctx.web = { ...web, replaceIp: async (from, to, { accounts }) => { if (accounts[0] === 'alice') throw Object.assign(new Error('apache exploded'), { agentError: true, code: 'command_failed' }); return { updated: 1, domains: [`${accounts[0]}.com`] }; } };
       try {
         const res = await post('/ip', { changes: [{ username: 'alice', ip: '203.0.113.30' }, { username: 'carol', ip: '203.0.113.30' }], updateDns: false }).expect(202);
         const job = await finished(res.body.data.job.id);
@@ -178,15 +184,17 @@ describe('Multi Account Functions API', () => {
         expect((await app.http.get('/api/accounts/alice')).body.data.ip).toBe('203.0.113.20');
         expect((await app.http.get('/api/accounts/carol')).body.data.ip).toBe('203.0.113.30');
         const run = await get(`/runs/${res.body.data.run.id}`).expect(200);
-        expect(run.body.data.items.find((i) => i.username === 'alice')).toMatchObject({ status: 'failed', detail: 'apache exploded' });
+        expect(run.body.data.items.find((i) => i.username === 'alice')).toMatchObject({ status: 'failed', detail: 'apache exploded', after: { ip: '203.0.113.20' } });
+        expect(run.body.data.items.find((i) => i.username === 'alice').steps.ip.status).toBe('rolled_back');
         expect(run.body.data.items.find((i) => i.username === 'carol')).toMatchObject({ status: 'done' });
+        expect(run.body.data.items.find((i) => i.username === 'carol').steps.web).toMatchObject({ status: 'applied', detail: expect.stringMatching(/1 vhost\(s\) rewritten \(carol\.com\)/) });
         expect(run.body.data.items.find((i) => i.username === 'carol').steps.dns[0].status).toBe('skipped');
       } finally { app.ctx.web = web; }
     });
 
     it('rolls the account back when a step reports failure without throwing', async () => {
       const web = app.ctx.web;
-      app.ctx.web = { ...web, ensureVhost: async (u) => ({ username: u, applied: false, reason: 'template_invalid', vhosts: [{ domain: `${u}.com`, applied: false, error: 'bad template' }] }) };
+      app.ctx.web = { ...web, replaceIp: undefined, ensureVhost: async (u) => ({ username: u, applied: false, reason: 'template_invalid', vhosts: [{ domain: `${u}.com`, applied: false, error: 'bad template' }] }) };
       try {
         const res = await post('/ip', { changes: [{ username: 'alice', ip: '203.0.113.31' }], updateDns: false }).expect(202);
         const job = await finished(res.body.data.job.id);
@@ -199,6 +207,59 @@ describe('Multi Account Functions API', () => {
       } finally { app.ctx.web = web; }
     });
 
+    it('keeps the new address when the vhost was written but the PHP handler is missing (ensureVhost fallback)', async () => {
+      const web = app.ctx.web;
+      const synced = [];
+      app.ctx.web = { ...web, replaceIp: undefined, ensureVhost: async (u) => { synced.push(u); return { username: u, applied: false, reason: 'php_missing', reload: { reloaded: true }, vhosts: [{ domain: `${u}.com`, applied: false, reason: 'php_missing', path: '/etc/apache2/sites-available/alice.com.conf', error: 'PHP-FPM is not installed; .php files are served as static content' }] }; } };
+      try {
+        const res = await post('/ip', { changes: [{ username: 'alice', ip: '203.0.113.32' }], updateDns: false }).expect(202);
+        const job = await finished(res.body.data.job.id);
+        expect(job.result).toMatchObject({ total: 1, done: 1, failed: 0 });
+        expect(synced).toEqual(['alice']);
+        expect((await app.http.get('/api/accounts/alice')).body.data.ip).toBe('203.0.113.32');
+        const item = (await get(`/runs/${res.body.data.run.id}`)).body.data.items[0];
+        expect(item).toMatchObject({ status: 'done', after: { ip: '203.0.113.32' } });
+        expect(item.steps.ip.status).toBe('applied');
+        expect(item.steps.web).toMatchObject({ status: 'applied', detail: expect.stringMatching(/web server reloaded; PHP handler warning: PHP-FPM is not installed/) });
+        const pool = await post('/ip', { changes: [{ username: 'alice', ip: '203.0.113.20' }], updateDns: false }).expect(202);
+        app.ctx.web.ensureVhost = async (u) => ({ username: u, applied: false, reason: 'php_pool_failed', vhosts: [{ domain: `${u}.com`, applied: false, reason: 'php_pool_failed', path: '/etc/apache2/sites-available/alice.com.conf', error: 'pool dir unwritable' }] });
+        expect((await finished(pool.body.data.job.id)).result).toMatchObject({ done: 1, failed: 0 });
+        expect((await app.http.get('/api/accounts/alice')).body.data.ip).toBe('203.0.113.20');
+      } finally { app.ctx.web = web; }
+    });
+
+    it('rewrites only the address through replaceIp and puts it back when a later step fails', async () => {
+      const web = app.ctx.web;
+      const dns = app.ctx.dns;
+      const calls = [];
+      app.ctx.web = { ...web, replaceIp: async (from, to, { accounts }) => { calls.push(`${accounts.join(',')}:${from}->${to}`); return { updated: 1, domains: ['alice.com'] }; } };
+      app.ctx.dns = { ...dns, getZone: async () => { throw new Error('zone store unreadable'); } };
+      try {
+        const res = await post('/ip', { changes: [{ username: 'alice', ip: '203.0.113.33' }] }).expect(202);
+        const job = await finished(res.body.data.job.id);
+        expect(job.result).toMatchObject({ total: 1, failed: 1 });
+        expect(calls).toEqual(['alice:203.0.113.20->203.0.113.33', 'alice:203.0.113.33->203.0.113.20']);
+        expect((await app.http.get('/api/accounts/alice')).body.data.ip).toBe('203.0.113.20');
+        const item = (await get(`/runs/${res.body.data.run.id}`)).body.data.items[0];
+        expect(item).toMatchObject({ status: 'failed', after: { ip: '203.0.113.20' } });
+        expect(item.detail).toMatch(/zone store unreadable/);
+        expect(item.steps.ip.status).toBe('rolled_back');
+        expect(item.steps.web.status).toBe('applied');
+      } finally { app.ctx.web = web; app.ctx.dns = dns; }
+    });
+
+    it('skips the vhost step when no stored vhost carries the previous address', async () => {
+      const web = app.ctx.web;
+      app.ctx.web = { ...web, replaceIp: async () => ({ updated: 0, domains: [] }) };
+      try {
+        const res = await post('/ip', { changes: [{ username: 'carol', ip: '203.0.113.34' }], updateDns: false }).expect(202);
+        expect((await finished(res.body.data.job.id)).result).toMatchObject({ done: 1 });
+        const item = (await get(`/runs/${res.body.data.run.id}`)).body.data.items[0];
+        expect(item.steps.web).toMatchObject({ status: 'skipped', detail: expect.stringMatching(/no stored virtual host used 203\.0\.113\.30/) });
+        expect((await app.http.get('/api/accounts/carol')).body.data.ip).toBe('203.0.113.34');
+      } finally { app.ctx.web = web; }
+    });
+
     it('refuses IPv6 targets: the vhost renderer and A records need IPv4', async () => {
       expect((await post('/ip/preview', { changes: [{ username: 'alice', ip: '2001:db8::10' }] })).status).toBe(422);
       expect((await post('/ip', { changes: [{ username: 'alice', ip: '2001:db8::10' }] })).status).toBe(422);
@@ -206,11 +267,13 @@ describe('Multi Account Functions API', () => {
       expect(preview.items[0]).toMatchObject({ status: 'blocked' });
       expect(preview.items[0].issues[0]).toMatch(/IPv6/);
       expect(() => app.ctx.multiAccount.startChangeIp({ changes: [{ username: 'alice', ip: '2001:db8::10' }] }, { id: 1, username: 'root', role: 'root' })).toThrow(/problems/);
-      const fake = { sharedIp: () => '203.0.113.10', get: () => null, freeAddresses: () => [], all: () => [{ address: '2001:db8::10', family: 6, is_main: false, reserved: false, dedicated_to: null }, { address: '203.0.113.10', family: 4, is_main: true, reserved: false, dedicated_to: null }] };
+      const fake = { sharedIp: () => '203.0.113.10', get: () => null, freeAddresses: () => [], all: () => [{ address: '2001:db8::10', family: 6, is_main: false, reserved: false, dedicated_to: null }, { address: '203.0.113.10', family: 4, is_main: true, reserved: false, dedicated_to: null }, { address: '203.0.113.50', family: 4, is_main: false, reserved: false, dedicated_to: 'bob' }, { address: '203.0.113.51', family: 4, is_main: false, reserved: true, dedicated_to: null }] };
       app.ctx.ip = fake;
       try {
         const res = await get('/ip/addresses').expect(200);
-        expect(res.body.data.map((a) => a.address)).toEqual(['203.0.113.10']);
+        expect(res.body.data.map((a) => a.address)).toEqual(['203.0.113.10', '203.0.113.50', '203.0.113.51']);
+        expect(res.body.data.map((a) => a.selectable)).toEqual([true, false, false]);
+        expect(res.body.data[1].dedicated_to).toBe('bob');
       } finally { delete app.ctx.ip; }
       expect((await app.http.get('/api/accounts/alice')).body.data.ip).toBe('203.0.113.20');
     });
@@ -281,6 +344,7 @@ describe('Multi Account Functions API', () => {
         expect((await app.http.get('/api/accounts/alice')).body.data.ip).toBe('203.0.113.40');
         const item = (await get(`/runs/${res.body.data.run.id}`)).body.data.items[0];
         expect(item).toMatchObject({ status: 'failed', detail: '203.0.113.41 is not a free address', after: { ip: '203.0.113.40' } });
+        expect(item.steps.ip).toMatchObject({ status: 'rolled_back', from: '203.0.113.40', to: '203.0.113.41' });
       } finally { delete app.ctx.ip; app.ctx.db.prepare("UPDATE accounts SET ip = '203.0.113.20' WHERE username = 'alice'").run(); }
     });
   });
@@ -339,7 +403,7 @@ describe('Multi Account Functions API', () => {
 
     it('puts the dedication and the row back when a later step throws', async () => {
       const web = app.ctx.web;
-      app.ctx.web = { ...web, ensureVhost: async () => { throw Object.assign(new Error('apache exploded'), { agentError: true, code: 'command_failed' }); } };
+      app.ctx.web = { ...web, replaceIp: async () => { throw Object.assign(new Error('apache exploded'), { agentError: true, code: 'command_failed' }); } };
       try {
         const res = await post('/ip', { changes: [{ username: 'alice', ip: '203.0.113.12' }], updateDns: false }).expect(202);
         const job = await finished(res.body.data.job.id);
@@ -438,7 +502,7 @@ describe('Multi Account Functions API', () => {
     it('applies the changes through ctx.accounts per account and records every step', async () => {
       const web = app.ctx.web;
       const php = [];
-      app.ctx.web = { ...web, setPhpVersion: async (domain, version) => { php.push(`${domain}:${version}`); throw new CapabilityError('apache'); } };
+      app.ctx.web = { ...web, setPhpVersion: async (domain, version, req, opts) => { php.push(`${domain}:${version}`); expect(opts).toEqual({ reload: false }); throw new CapabilityError('apache'); } };
       try {
         const res = await post('/modify', { usernames: ['alice', 'carol'], changes: { package: 'gold', bandwidthLimitMb: 1000 } }).expect(202);
         expect(res.body.data.run.items).toHaveLength(2);
@@ -453,9 +517,46 @@ describe('Multi Account Functions API', () => {
         const run = await get(`/runs/${res.body.data.run.id}`).expect(200);
         const item = run.body.data.items.find((i) => i.username === 'alice');
         expect(item).toMatchObject({ status: 'pending', after: { package_name: 'gold', shell: '/bin/bash' } });
-        expect(item.steps).toMatchObject({ account: { status: 'applied' }, quota: { status: 'applied' }, php: { status: 'pending' } });
+        // Outside production mode accounts.modify swallows a failed setquota, so the step is only "recorded".
+        expect(item.steps).toMatchObject({ account: { status: 'applied' }, quota: { status: 'recorded' }, php: { status: 'pending' } });
         const csv = await get(`/runs/${res.body.data.run.id}/report`).expect(200);
         expect(csv.text).toContain('modify,alice,alice.com,pending');
+      } finally { app.ctx.web = web; }
+    });
+
+    it('reloads the web server once after every PHP change in the run', async () => {
+      const web = app.ctx.web;
+      const php = [];
+      let reloads = 0;
+      app.ctx.web = { ...web, setPhpVersion: async (domain, version, req, opts) => { php.push(`${domain}:${version}:${opts.reload}`); return { domain }; }, reload: async () => { reloads++; return { reloaded: true }; } };
+      app.ctx.db.prepare("UPDATE accounts SET plan_snapshot_json = json_set(COALESCE(plan_snapshot_json, '{}'), '$.php_version', '7.4') WHERE username IN ('alice', 'carol')").run();
+      try {
+        const preview = await post('/modify/preview', { usernames: ['alice', 'carol'], changes: { package: 'gold' } }).expect(200);
+        expect(preview.body.data.items.map((i) => i.php?.from)).toEqual(['7.4', '7.4']);
+        const res = await post('/modify', { usernames: ['alice', 'carol'], changes: { package: 'gold' } }).expect(202);
+        const job = await finished(res.body.data.job.id);
+        expect(job.result).toMatchObject({ total: 2, done: 2 });
+        expect(php.sort()).toEqual(['alice.com:8.3:false', 'carol.com:8.3:false']);
+        expect(reloads).toBe(1);
+        const run = await get(`/runs/${res.body.data.run.id}`).expect(200);
+        expect(run.body.data.items.every((i) => i.steps.php.status === 'applied')).toBe(true);
+      } finally { app.ctx.web = web; }
+    });
+
+    it('re-applies the current package without a PHP change and reports it as a resync', async () => {
+      const php = [];
+      const web = app.ctx.web;
+      app.ctx.web = { ...web, setPhpVersion: async (domain, version) => { php.push(`${domain}:${version}`); return { domain }; } };
+      try {
+        const preview = await post('/modify/preview', { usernames: ['alice'], changes: { package: 'gold' } }).expect(200);
+        const item = preview.body.data.items[0];
+        expect(item.status).toBe('change');
+        expect(item.changes).toEqual([{ field: 'package', label: 'package (re-apply)', from: 'gold', to: 'gold' }]);
+        expect(item.php).toBeNull();
+        const res = await post('/modify', { usernames: ['alice'], changes: { package: 'gold' } }).expect(202);
+        expect((await finished(res.body.data.job.id)).result).toMatchObject({ total: 1, done: 1 });
+        expect(php).toEqual([]);
+        expect((await app.http.get('/api/accounts/alice')).body.data.package_name).toBe('gold');
       } finally { app.ctx.web = web; }
     });
 
@@ -511,12 +612,35 @@ describe('Multi Account Functions API', () => {
       }
       expect((await app.http.get('/api/accounts/bob')).body.data).toMatchObject({ demo_mode: before.demo_mode, shell: before.shell });
       expect(app.agent.callsTo('user.set_shell')).toEqual([]);
+      // Enumerating "all" is the account list; naming the account is not.
+      const enumerate = await rpost('/modify/preview', { all: true, changes: { contactEmail: 'bob@example.org' } });
+      expect(enumerate.status).toBe(403);
+      expect(enumerate.body.error.message).toMatch(/List Accounts/i);
+      expect((await rpost('/modify/preview', { usernames: ['bob'], changes: { contactEmail: 'bob@example.org' } })).status).toBe(200);
       grant(['edit-account', 'add-pkg-shell', 'disallow-shell', 'list-accts']);
       const shell = await rpost('/modify', { usernames: ['bob'], changes: { shell: '/bin/bash' } });
       expect(shell.status).toBe(403);
       expect(shell.body.error.message).toMatch(/Disallow Shell/);
       expect((await rpost('/modify/preview', { usernames: ['bob'], changes: { shell: '/usr/sbin/nologin' } })).status).toBe(200);
       expect((await rget('/accounts')).status).toBe(200);
+    });
+
+    it('blocks a package that grants a shell the reseller may not give', async () => {
+      expect((await app.http.get('/api/accounts/bob')).body.data.shell).toBe('/usr/sbin/nologin');
+      grant(['edit-account', 'list-accts', 'disallow-shell']);
+      const denied = await rpost('/modify/preview', { usernames: ['bob'], changes: { package: 'gold' } }).expect(200);
+      expect(denied.body.data.items[0]).toMatchObject({ status: 'blocked' });
+      expect(denied.body.data.items[0].issues[0]).toMatch(/Disallow Shell/);
+      expect((await rpost('/modify', { usernames: ['bob'], changes: { package: 'gold' } })).status).toBe(422);
+      grant(['edit-account', 'list-accts']);
+      const missing = await rpost('/modify/preview', { usernames: ['bob'], changes: { package: 'gold' } }).expect(200);
+      expect(missing.body.data.items[0].issues[0]).toMatch(/add-pkg-shell/);
+      expect(app.agent.callsTo('user.set_shell')).toEqual([]);
+      expect((await app.http.get('/api/accounts/bob')).body.data.shell).toBe('/usr/sbin/nologin');
+      grant(['edit-account', 'list-accts', 'add-pkg-shell', 'upgrade-account']);
+      const allowed = await rpost('/modify/preview', { usernames: ['bob'], changes: { package: 'gold' } }).expect(200);
+      // Only the reseller package list stands in the way now, not the shell privilege.
+      expect(allowed.body.data.items[0].issues.join(' ')).not.toMatch(/shell/i);
     });
 
     it('blocks rows the reseller limits refuse before the run starts', async () => {

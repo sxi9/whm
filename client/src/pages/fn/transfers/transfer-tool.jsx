@@ -70,6 +70,7 @@ function ConnectStep({ caps, onConnected }) {
             columns={[
               { key: 'host', label: 'Server', render: (s) => <code>{s.user}@{s.host}:{s.port}</code> },
               { key: 'probe', label: 'Detected', render: (s) => <span className="muted">{s.probe?.os?.name || '—'}{s.probe?.cpanel ? ' · cPanel' : ''}{s.probe?.isRoot === false ? ' · not root' : ''}</span> },
+              { key: 'hostKeys', label: 'Host key', render: (s) => <HostKeys keys={s.probe?.hostKeys} /> },
               { key: 'authType', label: 'Auth' },
               { key: 'expiresAt', label: 'Expires', render: (s) => formatDate(s.expiresAt) },
             ]}
@@ -116,6 +117,7 @@ function AccountsStep({ session, caps, onBack, onStarted }) {
           ['System', probe.os?.name || probe.hostname || '—'],
           ['Control panel', probe.cpanel ? 'cPanel/WHM detected' : 'none detected (plain Linux users)'],
           ['SSH user', <span key="u">{session.user} {probe.isRoot === false && <StatusPill status="warning">not root</StatusPill>}</span>],
+          ['Host key', <HostKeys key="k" keys={probe.hostKeys} verbose />],
           ['Source tools', <span key="t">rsync {probe.tools?.rsync ? <StatusPill status="ok">yes</StatusPill> : <StatusPill status="failed">missing</StatusPill>} · mysqldump {probe.tools?.mysqldump ? <StatusPill status="ok">yes</StatusPill> : <StatusPill status="failed">missing</StatusPill>}</span>],
           probe.homeDisk && ['Source /home', `${formatBytes(probe.homeDisk.usedBytes)} used of ${formatBytes(probe.homeDisk.sizeBytes)}`],
           data?.fetchedAt && ['Account list', `${accounts.length} account(s) · fetched ${formatDate(data.fetchedAt)}`],
@@ -169,6 +171,18 @@ function AccountsStep({ session, caps, onBack, onStarted }) {
         </Card>
       )}
     </>
+  );
+}
+
+// The key was accepted on first use; showing its fingerprint lets the operator
+// compare it with "ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub" on the source.
+function HostKeys({ keys, verbose = false }) {
+  if (!keys?.length) return <span className="muted">{verbose ? 'not recorded (ssh-keygen missing or first connection pending)' : '—'}</span>;
+  return (
+    <span className="muted">
+      {keys.map((k) => <span key={`${k.type}:${k.fingerprint}`} title={verbose ? 'Compare with the fingerprint shown by ssh-keygen -lf on the source server' : k.fingerprint} style={{ display: 'block' }}>{k.type} <code>{verbose ? k.fingerprint : `${k.fingerprint.slice(0, 19)}…`}</code></span>)}
+      {verbose && <span style={{ display: 'block' }}>Trusted on first use; compare with the source server before transferring.</span>}
+    </span>
   );
 }
 

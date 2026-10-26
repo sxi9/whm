@@ -1,14 +1,14 @@
 import { Router } from 'express';
 import { validate, z, fields } from '../../lib/validate.js';
 import { requireRoot } from '../../middleware/rbac.js';
-import { createServerContactsService, CHANNELS, SEVERITIES, SMTP_SECURITY, EVENT_KEY_RE } from '../../services/server-contacts.js';
+import { createServerContactsService, CHANNELS, SEVERITIES, SMTP_SECURITY, EVENT_KEY_RE, MANAGED_MAIL_USERS } from '../../services/server-contacts.js';
 
 const idParam = z.object({ id: fields.id });
 const eventKey = z.string().regex(EVENT_KEY_RE, 'Event keys look like "service.down"');
 const eventList = z.array(z.union([z.literal('*'), eventKey])).max(100);
 const contactConfig = z.object({
   token: z.string().max(200).regex(/^[A-Za-z0-9]*$/, 'Pushover tokens are alphanumeric').nullable().optional(),
-  secret: z.string().max(200).regex(/^[^\r\n\0]*$/).nullable().optional(),
+  secret: z.string().trim().max(200).regex(/^[^\r\n\0]*$/).nullable().optional(),
   channelName: z.string().max(80).regex(/^[#@]?[A-Za-z0-9._-]*$/, 'Slack channel names use letters, digits, ".", "_" or "-"').nullable().optional(),
 }).strict();
 const nonEmpty = (schema) => schema.refine((b) => Object.keys(b).length > 0, { message: 'Nothing to change', path: ['_'] });
@@ -21,14 +21,16 @@ const settingsBody = nonEmpty(z.object({
   fromAddress: z.union([z.literal(''), fields.email.regex(/^[A-Za-z0-9_]/, 'May not start with "-"')]).optional(),
   retentionDays: z.number().int().min(1).max(3650).optional(),
   smtp: z.object({
-    host: z.union([z.literal(''), fields.hostname, fields.ip]).optional(),
+    host: z.union([z.literal(''), z.literal('localhost'), fields.hostname, fields.ip]).optional(),
     port: z.number().int().min(1).max(65535).optional(),
     security: z.enum(SMTP_SECURITY).optional(),
     username: z.string().max(254).regex(/^[^\s\0]*$/, 'No whitespace').optional(),
     password: z.string().max(256).regex(/^[^\r\n\0]*$/).nullable().optional(),
     allowSelfSigned: z.boolean().optional(),
     prefer: z.boolean().optional(),
+    allowPlaintextAuth: z.boolean().optional(),
   }).strict().optional(),
+  webhook: z.object({ allowPrivate: z.boolean().optional() }).strict().optional(),
   check: z.object({
     enabled: z.boolean().optional(),
     diskThresholdPercent: z.number().int().min(50).max(99).optional(),
@@ -44,16 +46,22 @@ const deliveriesQuery = z.object({
 const notifyBody = z.object({ event: eventKey, subject: z.string().trim().min(1).max(200), body: z.string().max(20_000).optional(), severity: z.enum(SEVERITIES).optional() }).strict();
 const sendTestBody = z.object({ to: fields.email.regex(/^[A-Za-z0-9_]/, 'May not start with "-"') }).strict();
 const aliasTarget = z.union([fields.username, fields.email.regex(/^[A-Za-z0-9_]/, 'May not start with "-"')]);
-const mailPrefsBody = nonEmpty(z.object({ forwardTo: z.array(aliasTarget).max(20).optional(), rootMailEvents: z.array(eventKey).max(100).optional() }).strict());
+const aliasList = z.array(aliasTarget).max(20);
+const mailPrefsBody = nonEmpty(z.object({
+  forwardTo: aliasList.optional(),
+  users: z.object(Object.fromEntries(MANAGED_MAIL_USERS.map((u) => [u, aliasList.optional()]))).strict().optional(),
+  rootMailEvents: z.array(eventKey).max(100).optional(),
+}).strict());
 
 export async function register(ctx) {
   ctx.contacts = createServerContactsService(ctx);
   const s = ctx.contacts;
+  // A scheduled run honours the enable toggle; "Run checks now" ({ manual })
+  // always runs so the admin can see what a check would report.
   ctx.jobs.register(s.JOB, async (job) => {
-    if (!s.checkConfig().enabled) { job.log('scheduled contact checks are disabled; nothing checked'); return { skipped: 'disabled' }; }
+    if (!job.params?.manual && !s.checkConfig().enabled) { job.log('scheduled contact checks are disabled; nothing checked'); return { skipped: 'disabled' }; }
     await ctx.capabilities.ensureFresh();
-    const r = await s.runChecks({ log: job.log });
-    return { services: r.services, disks: r.disks, ssl: { expiring: r.ssl.expiring.length }, notifications: r.notifications.length };
+    return s.runChecks({ log: job.log });
   });
   ctx.scheduler.ensure(s.SCHEDULE, '*/10 * * * *', s.JOB);
   if (!s.checkConfig().enabled) ctx.scheduler.update(s.SCHEDULE, { enabled: false });
@@ -76,7 +84,12 @@ export async function register(ctx) {
   r.post('/settings/test-mail', requireRoot, validate({ body: sendTestBody }), wrap((req) => s.sendTest(req.body.to, req)));
   r.get('/deliveries', requireRoot, validate({ query: deliveriesQuery }), wrap((req) => s.deliveries(req.query)));
   r.post('/notify', requireRoot, validate({ body: notifyBody }), wrap((req) => s.notify(req.body, undefined, req)));
-  r.post('/check', requireRoot, wrap((req) => s.runChecks({ req })));
+  r.post('/check', requireRoot, (req, res, next) => {
+    try {
+      const job = ctx.jobs.enqueue(s.JOB, { manual: true, requestedBy: req.user?.username }, { userId: req.user?.id ?? null });
+      res.status(202).json({ data: { job } });
+    } catch (err) { next(err); }
+  });
 
   // Edit System Mail Preferences
   r.get('/mail-preferences', requireRoot, wrap(() => s.mailPreferences()));

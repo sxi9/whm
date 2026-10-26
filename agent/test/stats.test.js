@@ -25,10 +25,10 @@ async function opError(promise) {
 
 describe('stats helpers', () => {
   it('renders an AWStats config pointing at the domain log and data directory', () => {
-    const text = renderAwstatsConfig({ domain: 'example.com', logFile: '/var/log/whm/domlogs/alice/example.com-access.log', dataDir: '/home/alice/tmp/awstats', aliases: ['www.example.com'] });
+    const text = renderAwstatsConfig({ domain: 'example.com', logFile: '/var/log/whm/domlogs/alice/example.com-access.log', dataDir: '/var/lib/whm/stats/alice/example.com/awstats', aliases: ['www.example.com'] });
     expect(text).toContain('LogFile="/var/log/whm/domlogs/alice/example.com-access.log"');
     expect(text).toContain('SiteDomain="example.com"');
-    expect(text).toContain('DirData="/home/alice/tmp/awstats"');
+    expect(text).toContain('DirData="/var/lib/whm/stats/alice/example.com/awstats"');
     expect(text).toContain('www.example.com');
     expect(text).toContain('AllowToUpdateStatsFromBrowser=0');
   });

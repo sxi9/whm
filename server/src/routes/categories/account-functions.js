@@ -23,7 +23,7 @@ export async function register(ctx) {
   ctx.scheduler.ensure('account-bandwidth-monthly-reset', '5 0 1 * *', 'accounts.bandwidth_monthly_reset');
   ctx.scheduler.ensure('account-bandwidth-enforce', '40 * * * *', 'accounts.bandwidth_enforce');
   // The enforcement schedule follows its setting so it never enqueues work that is skipped.
-  ctx.scheduler.update('account-bandwidth-enforce', { enabled: Boolean(ctx.settings.get('account_functions.bandwidth_enforce', false)) });
+  ctx.accountFunctions.syncEnforcementSchedule();
   ctx.capabilities.register('jailshell', { binaries: ['jailshell'], required: ['jailshell'] });
 
   const r = Router();
@@ -52,14 +52,8 @@ export async function register(ctx) {
   r.get('/bandwidth/exceeders', requireReseller, wrap((req) => svc().exceeders(req.user)));
   r.post('/bandwidth/unsuspend-exceeders', requireReseller, validate({ body: z.object({ ...selection, resetCounters: z.boolean().optional() }).strict().refine(hasSelection, { message: 'Select at least one account or all', path: ['usernames'] }) }),
     wrap((req) => svc().unsuspendExceeders(req.body, req.user, req)));
-  r.put('/bandwidth-enforcement', requireRoot, validate({ body: z.object({ enabled: z.boolean(), reason: z.string().trim().min(1).max(200).optional() }).strict() }), wrap((req) => {
-    ctx.settings.set('account_functions.bandwidth_enforce', req.body.enabled);
-    if (req.body.reason) ctx.settings.set('account_functions.bandwidth_suspend_reason', req.body.reason.startsWith('bandwidth') ? req.body.reason : `bandwidth: ${req.body.reason}`);
-    ctx.scheduler.update('account-bandwidth-enforce', { enabled: req.body.enabled });
-    req.audit({ action: 'account.bandwidth.enforcement', args: req.body });
-    return { enabled: req.body.enabled, reason: ctx.settings.get('account_functions.bandwidth_suspend_reason') };
-  }));
-  r.get('/bandwidth-enforcement', requireReseller, wrap(() => ({ enabled: Boolean(ctx.settings.get('account_functions.bandwidth_enforce', false)), reason: ctx.settings.get('account_functions.bandwidth_suspend_reason') })));
+  r.put('/bandwidth-enforcement', requireRoot, validate({ body: z.object({ enabled: z.boolean(), reason: z.string().trim().min(1).max(200).optional() }).strict() }), wrap((req) => svc().setBandwidthEnforcement(req.body, req)));
+  r.get('/bandwidth-enforcement', requireReseller, wrap(() => svc().bandwidthEnforcement()));
 
   // Manage Shell Access ---------------------------------------------------------
   r.put('/shell/:username', requireReseller, validate({ params: nameParam, body: z.object({ shell: fields.shell }).strict() }), wrap((req) => svc().setShell(req.params.username, req.body, req.user, req)));

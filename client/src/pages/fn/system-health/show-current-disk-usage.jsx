@@ -1,12 +1,31 @@
+import { useState } from 'react';
+import { RefreshCw } from 'lucide-react';
+import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
-import { PageHeader, Card, formatBytes, formatMb } from '../../../components/Common.jsx';
+import { PageHeader, Card, formatBytes, formatMb, formatDate } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
 import { Button } from '../../../components/Form.jsx';
+import { useToast } from '../../../components/Toast.jsx';
 import { AccountDiskTable } from '../../server/AccountDiskTable.jsx';
+import { JobCard } from '../../account-info/Shared.jsx';
 
 export default function DiskUsage({ fn }) {
+  const toast = useToast();
   const { data, loading, error, refetch } = useApi('/system-health/disk');
+  const [jobId, setJobId] = useState(null);
+  const [busy, setBusy] = useState(false);
   const filesystems = data?.filesystems || [];
+
+  const resample = async () => {
+    setBusy(true);
+    try {
+      const res = await api.post('/system-health/disk/refresh');
+      setJobId(res.data.job.id);
+      toast.info('Measuring disk usage for every account…');
+    } catch (err) { toast.error(err); } finally { setBusy(false); }
+  };
+
+  const sampled = data ? (data.sampledAt ? `sampled ${formatDate(data.sampledAt)}` : 'not sampled yet') : null;
   return (
     <>
       <PageHeader fn={fn} actions={<Button onClick={() => refetch()}>Refresh</Button>} />
@@ -23,7 +42,13 @@ export default function DiskUsage({ fn }) {
           rows={filesystems} loading={loading} error={error} rowKey={(d) => `${d.filesystem}:${d.mountpoint}`}
         />
       </Card>
-      <Card title="Accounts" subtitle={data ? `${data.accounts.length} account(s) using ${formatMb(data.accountsTotalMb)} in total, as of the last disk-usage sample.` : undefined} padded={false}>
+      <JobCard jobId={jobId} title="Disk usage resample" onFinished={() => { setJobId(null); refetch(); }} />
+      <Card
+        title="Accounts"
+        subtitle={data ? `${data.accounts.length} account(s) using ${formatMb(data.accountsTotalMb)} in total, ${sampled}. Usage is measured every 6 hours; resample to refresh it now.` : undefined}
+        actions={data?.canResample ? <Button size="sm" icon={RefreshCw} loading={busy || Boolean(jobId)} onClick={resample}>Resample now</Button> : null}
+        padded={false}
+      >
         <AccountDiskTable accounts={data?.accounts} loading={loading} error={error} />
       </Card>
     </>

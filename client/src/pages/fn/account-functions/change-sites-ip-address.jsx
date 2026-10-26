@@ -8,6 +8,15 @@ import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { AccountPicker, useSelectedAccount } from '../../accounts/AccountPicker.jsx';
 
+const WEB_REASONS = {
+  capability_missing: 'Apache not installed; applied on the next sync',
+  web_category_missing: 'Service Configuration is not loaded; recorded only',
+  no_vhost_on_previous_ip: 'no virtual host used the old address; nothing to rewrite',
+  php_missing: 'vhosts rewritten; PHP-FPM is not installed, so .php files are static until it is',
+  php_pool_failed: 'vhosts rewritten; the PHP-FPM pool could not be written (see Service Configuration)',
+};
+const webStatus = (web) => (web?.applied ? `vhosts rewritten${web.updated != null ? ` (${web.updated} address${web.updated === 1 ? '' : 'es'} replaced)` : ''}${web.domains?.length ? `: ${web.domains.join(', ')}` : ''}` : WEB_REASONS[web?.reason] || web?.reason || 'not applied');
+
 export default function ChangeSitesIpAddress({ fn }) {
   const toast = useToast();
   const confirm = useConfirm();
@@ -61,7 +70,7 @@ export default function ChangeSitesIpAddress({ fn }) {
           <KeyValue items={[
             ['Previous address', <code key="p">{result.previousIp || '—'}</code>], ['New address', <code key="n">{result.ip}</code>],
             ['Dedicated', result.dedicated ? 'yes' : 'no (shared address)'],
-            ['Web server', <StatusPill key="w" status={result.web?.applied ? 'ok' : 'pending'}>{result.web?.applied ? `vhosts rewritten (${result.web.domains?.join(', ')})` : result.web?.reason === 'capability_missing' ? 'Apache not installed; applied on the next sync' : result.web?.reason || 'not applied'}</StatusPill>],
+            ['Web server', <StatusPill key="w" status={result.web?.applied ? 'ok' : 'pending'}>{webStatus(result.web)}</StatusPill>],
           ]} />
           {result.dns.length > 0 && (
             <ul style={{ marginTop: 12 }}>

@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { inspectResolvConf, renderResolvConf, RESOLV_CONF } from '../src/ops/resolver.js';
+import { inspectResolvConf, renderResolvConf, parseResolvectlDns, resolvTmpPath, RESOLV_CONF, RESOLV_BACKUP } from '../src/ops/resolver.js';
 
 // write_static replaces the live /etc/resolv.conf, so it is never executed here:
 // every call must stop at the schema or at the path guard.
@@ -90,5 +90,36 @@ describe('resolver helpers', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('resolver.upstream', () => {
+  it('is a read-only op that takes no arguments and reports a missing resolvectl', async () => {
+    expect(catalog.has('resolver.upstream')).toBe(true);
+    expect(catalog.get('resolver.upstream').destructive).toBe(false);
+    expect((await opError(runOp('resolver.upstream', { link: 'eth0' }, ctx))).code).toBe('invalid_args');
+    exec.mockClear();
+    const err = await opError(runOp('resolver.upstream', {}, ctx));
+    expect(['binary_not_found', 'command_failed', 'spawn_failed']).toContain(err.code);
+    for (const call of exec.mock.calls) expect(call[1]).toEqual(call[0] === 'resolvectl' ? ['dns'] : ['--status', '--no-pager']);
+  });
+
+  it('parses `resolvectl dns` and the legacy `systemd-resolve --status` output', () => {
+    expect(parseResolvectlDns('Global: 1.1.1.1 1.0.0.1\nLink 2 (eth0): 10.0.0.1 fe80::1%eth0\nLink 3 (docker0):\n')).toEqual({
+      global: ['1.1.1.1', '1.0.0.1'],
+      links: [{ index: 2, name: 'eth0', servers: ['10.0.0.1', 'fe80::1'] }, { index: 3, name: 'docker0', servers: [] }],
+      servers: ['1.1.1.1', '1.0.0.1', '10.0.0.1', 'fe80::1'],
+    });
+    expect(parseResolvectlDns('Global: 9.9.9.9#dns.quad9.net\n').servers).toEqual(['9.9.9.9']);
+    const legacy = 'Global\n       LLMNR setting: no\n         DNS Servers: 8.8.8.8\n                      8.8.4.4\n          DNSSEC NTA: 10.in-addr.arpa\n                      corp\n\nLink 2 (eth0)\n      Current Scopes: DNS\n         DNS Servers: 10.0.0.1\n';
+    expect(parseResolvectlDns(legacy)).toEqual({ global: ['8.8.8.8', '8.8.4.4'], links: [{ index: 2, name: 'eth0', servers: ['10.0.0.1'] }], servers: ['8.8.8.8', '8.8.4.4', '10.0.0.1'] });
+    expect(parseResolvectlDns('')).toEqual({ global: [], links: [], servers: [] });
+    expect(parseResolvectlDns('Global: ; rm -rf /\n').servers).toEqual([]);
+  });
+
+  it('keeps the takeover backup and rename source next to the guarded file', () => {
+    expect(path.dirname(RESOLV_BACKUP)).toBe(path.dirname(RESOLV_CONF));
+    expect(RESOLV_BACKUP.startsWith(`${RESOLV_CONF}.`)).toBe(true);
+    expect(resolvTmpPath().startsWith(`${RESOLV_CONF}.whm-tmp-`)).toBe(true);
   });
 });

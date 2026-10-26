@@ -13,12 +13,15 @@ import { isValidCron } from '../lib/cron.js';
 //   serverConfig.profile.summary()                 -> { name, label, hiddenCategories, services } (also in GET /api/system/status)
 //   serverConfig.profile.allows(categorySlug)      -> false when the active profile hides a category
 //   serverConfig.time.get()                        -> { now, timezone, ntp, ntpSynchronized, ntpService }
-//   serverConfig.quota.status()                    -> quota tools + per-filesystem state (never throws CapabilityError)
-//   serverConfig.quota.isEnabled(mountpoint?)      -> whether user quotas are active where account homes live
+//   serverConfig.quota.status()                    -> quota tools + per-filesystem state (never throws CapabilityError);
+//                                                     `enabled` = kernel state, `enforceable` = enabled AND setquota/repquota present
+//   serverConfig.quota.isEnabled(mountpoint?)      -> whether setquota can be enforced where account homes live (tools + kernel)
 //   serverConfig.nodes.list()                      -> linked server nodes (tokens never included)
 //   serverConfig.stats.settings()                  -> { generators, defaultGenerator, allowUserChoice }
-// Lazily used when present: ctx.software.pkg.ensureInstalled (quota tools), ctx.software.update.status / panel.status
-// (Update Preferences), ctx.serviceManager.configure (profile monitoring), ctx.contacts.notify (update summaries).
+//   serverConfig.stats.detect()                    -> { statsRoot, generators }; reports live under <statsRoot>/<user>/<domain>/<generator>
+// Lazily used when present: ctx.software.pkg.ensureInstalled (quota tools), ctx.software.update.status / update.setAuto /
+// panel.status / panel.check / panel.setPreferences and the `software.update.check` job (Update Preferences; software owns the
+// os-update-check schedule), ctx.serviceManager.configure (profile monitoring), ctx.contacts.notify (update summaries).
 
 export const PROFILES = {
   standard: {
@@ -55,9 +58,8 @@ const STATS_JOB = 'server_config.stats.generate';
 const STATS_SCHEDULE = 'stats-generation';
 const STATS_CRON = '17 2 * * *';
 const QUOTA_JOB = 'server_config.quota.enable';
-const UPDATE_JOB = 'server_config.update.check';
-const UPDATE_SCHEDULE = 'update-preferences-check';
-const UPDATE_CRON = '23 4 * * 1';
+const SOFTWARE_CHECK_JOB = 'software.update.check';
+const SOFTWARE_CHECK_SCHEDULE = 'os-update-check';
 const TERMINAL_SWEEP_MS = 60_000;
 
 const CATALOG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'server-configuration.marketplace.json');
@@ -197,23 +199,31 @@ export function createServerConfigService(ctx) {
       const holding = (p) => [...state.filesystems].filter((f) => p === f.mountpoint || p.startsWith(f.mountpoint.endsWith('/') ? f.mountpoint : `${f.mountpoint}/`)).sort((a, b) => b.mountpoint.length - a.mountpoint.length)[0] || null;
       const homeFs = holding(homeRoot);
       const filesystems = state.filesystems.map((f) => ({ ...f, holdsHomes: f.mountpoint === homeFs?.mountpoint }));
-      const toolsInstalled = capabilities.has('quota') && Boolean(state.tools.quotacheck && state.tools.quotaon);
+      const toolsInstalled = Boolean(state.tools.quotacheck && state.tools.quotaon && state.tools.setquota && state.tools.repquota);
       const lastJob = ctx.jobs.list({ type: QUOTA_JOB, limit: 1 })[0] ?? null;
+      const enabled = Boolean(homeFs && (homeFs.active.user === true || (homeFs.active.user == null && (homeFs.userQuotaMounted || homeFs.ext4QuotaFeature))));
       return {
         toolsInstalled, tools: state.tools, fstabPath: state.fstabPath, fstabPresent: state.fstabPresent, homeRoot, homeFilesystem: homeFs?.mountpoint ?? null,
-        enabled: Boolean(homeFs && (homeFs.active.user === true || (homeFs.active.user == null && (homeFs.userQuotaMounted || homeFs.ext4QuotaFeature)))),
+        enabled, enforceable: enabled && toolsInstalled,
         filesystems, lastJob, installPackages: ['quota'], pkgAvailable: Boolean(ctx.software?.pkg?.ensureInstalled),
       };
     },
     async isEnabled(mountpoint) {
       const st = await quota.status();
-      if (!mountpoint) return st.enabled;
+      if (!mountpoint) return st.enforceable;
       const fsEntry = st.filesystems.find((f) => f.mountpoint === mountpoint);
-      return Boolean(fsEntry && (fsEntry.active.user === true || fsEntry.userQuotaMounted));
+      return Boolean(st.toolsInstalled && fsEntry && (fsEntry.active.user === true || fsEntry.userQuotaMounted));
+    },
+    // The `quota` capability counts repquota/setquota (what Account Information
+    // needs); turning quotas on needs the two scanning tools as well.
+    async requireTools(names) {
+      const st = await quota.status();
+      const missing = names.filter((n) => !st.tools[n]);
+      if (missing.length) throw new CapabilityError('quota', `The quota tools (${missing.join(', ')}) are not installed. Install the "quota" package first.`);
+      return st;
     },
     async enable({ mountpoint, groupQuota = true, updateFstab = false }, user, req) {
-      await capabilities.ensureFresh();
-      capabilities.require('quota', 'The quota tools (quotacheck, quotaon, repquota) are not installed. Install the "quota" package first.');
+      await quota.requireTools(['quotacheck', 'quotaon']);
       const job = ctx.jobs.enqueue(QUOTA_JOB, { mountpoint, groupQuota, updateFstab }, { userId: user?.id ?? null });
       audit(req, { action: 'server_config.quota.enable', target: mountpoint, args: { groupQuota, updateFstab, jobId: job.id } });
       return { job };
@@ -235,8 +245,7 @@ export function createServerConfigService(ctx) {
       return { ...result, fstab };
     },
     async disable({ mountpoint }, req) {
-      await capabilities.ensureFresh();
-      capabilities.require('quota', 'The quota tools are not installed');
+      await quota.requireTools(['quotaoff']);
       const result = await agent.op('quota.disable', { mountpoint }, { req });
       audit(req, { action: 'server_config.quota.disable', target: mountpoint });
       return result;
@@ -327,21 +336,55 @@ export function createServerConfigService(ctx) {
       return row ? { name: row.name, cron: row.cron, enabled: Boolean(row.enabled), lastRunAt: row.last_run_at, nextRunAt: row.next_run_at } : null;
     },
     async detect() {
-      try { return await agent.op('stats.detect'); } catch (err) { logger.warn({ err }, 'stats.detect failed'); return { domlogsRoot: null, generators: {}, error: err.message }; }
+      try { return stats.remember(await agent.op('stats.detect')); } catch (err) { logger.warn({ err }, 'stats.detect failed'); return { domlogsRoot: null, generators: {}, error: err.message }; }
+    },
+    // The last detection is kept so boot (which must not call the agent) and
+    // the schedule sync can reason about installed generators without a probe.
+    remember(detect) {
+      const generators = Object.fromEntries(GENERATORS.map((g) => [g, { installed: Boolean(detect?.generators?.[g]?.installed) }]));
+      const previous = S('stats.last_detect', null);
+      if (JSON.stringify(previous?.generators ?? null) !== JSON.stringify(generators)) settings.set('stats.last_detect', { at: new Date().toISOString(), generators });
+      return detect;
     },
     async get() {
       const detect = await stats.detect();
       const domains = db.prepare('SELECT COUNT(*) AS n FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE a.suspended = 0').get().n;
-      return { ...stats.settings(), scheduleEnabled: stats.scheduleWanted(), detect, outputRoot: detect.statsRoot ?? null, schedule: stats.schedule(), domains, lastRun: S('stats.last_run', null), lastJob: ctx.jobs.list({ type: STATS_JOB, limit: 1 })[0] ?? null, pkgAvailable: Boolean(ctx.software?.pkg?.ensureInstalled) };
+      const schedule = stats.syncSchedule(detect);
+      return { ...stats.settings(), scheduleEnabled: stats.scheduleWanted(), detect, outputRoot: detect.statsRoot ?? null, schedule, domains, lastRun: S('stats.last_run', null), lastJob: ctx.jobs.list({ type: STATS_JOB, limit: 1 })[0] ?? null, pkgAvailable: Boolean(ctx.software?.pkg?.ensureInstalled) };
     },
     anyGeneratorOn(generators = stats.settings().generators) { return Object.values(generators).some(Boolean); },
+    anyGeneratorInstalled(detect, generators = stats.settings().generators) { return GENERATORS.some((g) => generators[g] && detect?.generators?.[g]?.installed); },
     scheduleWanted() { return Boolean(S('stats.schedule_enabled', true)); },
-    // Runs at boot. It only ever switches the schedule off (no generator on, or
-    // the administrator disabled it here); a schedule disabled from Configure
-    // cPanel Cron Jobs is never re-enabled behind the operator's back.
-    alignSchedule() {
+    // Why the schedule may not run: the page toggle, no generator enabled, or
+    // no enabled generator installed on this host. A schedule the panel paused
+    // for one of the last two reasons resumes by itself once the reason clears;
+    // one the operator switched off in Configure cPanel Cron Jobs stays off.
+    // `detect` null means "never probed": the installed gate is skipped then.
+    blocker(detect) {
+      if (!stats.scheduleWanted()) return 'disabled';
+      if (!stats.anyGeneratorOn()) return 'no_generator_enabled';
+      if (detect && !stats.anyGeneratorInstalled(detect)) return 'no_generator_installed';
+      return null;
+    },
+    syncSchedule(detect) {
       const row = stats.schedule();
-      if (row && row.enabled && !(stats.scheduleWanted() && stats.anyGeneratorOn())) ctx.scheduler.update(STATS_SCHEDULE, { enabled: false });
+      if (!row) return null;
+      const reason = stats.blocker(detect);
+      const paused = S('stats.schedule_paused', null);
+      if (reason && row.enabled) {
+        ctx.scheduler.update(STATS_SCHEDULE, { enabled: false });
+        settings.set('stats.schedule_paused', reason === 'disabled' ? null : reason);
+      } else if (!reason && paused) {
+        if (!row.enabled) ctx.scheduler.update(STATS_SCHEDULE, { enabled: true });
+        settings.set('stats.schedule_paused', null);
+      } else if (reason && reason !== 'disabled' && paused !== reason) {
+        settings.set('stats.schedule_paused', reason);
+      }
+      return { ...stats.schedule(), blockedReason: reason === 'disabled' ? null : reason };
+    },
+    // Boot calls this without `live` (no agent round trip at startup).
+    async alignSchedule({ live = false } = {}) {
+      return stats.syncSchedule(live ? await stats.detect() : S('stats.last_detect', null));
     },
     async update(body, req) {
       const current = stats.settings();
@@ -356,9 +399,19 @@ export function createServerConfigService(ctx) {
       if (body.cron !== undefined && !isValidCron(body.cron)) throw unprocessable('Request validation failed', { cron: ['Must be a valid 5-field cron expression'] });
       if (body.enabled === true && !anyOn) throw unprocessable('Enable a statistics generator before enabling the schedule', { enabled: ['No generator is enabled'] });
       if (body.enabled !== undefined) values['stats.schedule_enabled'] = body.enabled;
-      const wanted = body.enabled ?? stats.scheduleWanted();
       settings.setMany(values);
-      ctx.scheduler.update(STATS_SCHEDULE, { ...(body.cron !== undefined ? { cron: body.cron } : {}), enabled: wanted && anyOn });
+      if (body.cron !== undefined) ctx.scheduler.update(STATS_SCHEDULE, { cron: body.cron });
+      // Only an explicit toggle here writes the row's enabled flag; anything
+      // else leaves a schedule the operator paused in Cron Jobs alone.
+      if (body.enabled === true) {
+        const installed = stats.anyGeneratorInstalled(await stats.detect(), next.generators);
+        settings.set('stats.schedule_paused', null);
+        ctx.scheduler.update(STATS_SCHEDULE, { enabled: installed });
+        settings.set('stats.schedule_paused', installed ? null : 'no_generator_installed');
+      } else if (body.enabled === false) {
+        ctx.scheduler.update(STATS_SCHEDULE, { enabled: false });
+        settings.set('stats.schedule_paused', null);
+      }
       audit(req, { action: 'server_config.stats.update', args: body });
       return stats.get();
     },
@@ -374,9 +427,13 @@ export function createServerConfigService(ctx) {
     },
     async generateJob(job) {
       const cfg = stats.settings();
-      const detect = await job.agent.op('stats.detect');
+      const detect = stats.remember(await job.agent.op('stats.detect'));
       const generators = (job.params.generators?.length ? job.params.generators : GENERATORS.filter((g) => cfg.generators[g])).filter((g) => detect.generators?.[g]?.installed);
-      if (!generators.length) { job.log('no enabled statistics generator is installed; nothing to do', 'warn'); return { domains: 0, generated: 0, skipped: 0, failed: 0 }; }
+      if (!generators.length) {
+        const schedule = stats.syncSchedule(detect);
+        job.log(`no enabled statistics generator is installed; nothing to do${schedule?.blockedReason ? ' (schedule paused until one is installed)' : ''}`, 'warn');
+        return { domains: 0, generated: 0, skipped: 0, failed: 0, paused: Boolean(schedule?.blockedReason) };
+      }
       const rows = db.prepare(`SELECT a.username, d.domain FROM account_domains d JOIN accounts a ON a.id = d.account_id
         WHERE (@includeSuspended = 1 OR a.suspended = 0) AND (@domain IS NULL OR d.domain = @domain) AND d.type IN ('main', 'addon', 'sub') ORDER BY a.username, d.domain`).all({ includeSuspended: cfg.includeSuspended ? 1 : 0, domain: job.params.domain ?? null });
       const summary = { domains: rows.length, generators, generated: 0, skipped: 0, failed: 0, failures: [] };
@@ -403,6 +460,8 @@ export function createServerConfigService(ctx) {
   // --- Terminal ----------------------------------------------------------------
   const terminalSessions = new Map();
   let terminalSweeper = null;
+  let orphanReap = null;
+  const REASONS = { idle: 'idle_timeout', closed: 'closed' };
   const terminal = {
     idleMs: () => Math.max(1, Number(S('terminal.idle_minutes', 15)) || 15) * 60_000,
     maxSessions: () => Math.max(1, Number(S('terminal.max_sessions', 3)) || 3),
@@ -415,9 +474,33 @@ export function createServerConfigService(ctx) {
       if (s.user.id !== user.id) throw forbidden('This terminal session belongs to another administrator');
       return s;
     },
-    list(user) { terminal.assertRoot(user); return { sessions: [...terminalSessions.values()].filter((s) => s.user.id === user.id).map(terminal.shape), idleMinutes: terminal.idleMs() / 60_000, maxSessions: terminal.maxSessions(), installed: capabilities.has('terminal') }; },
+    // In split mode the agent outlives the API process: shells the API no
+    // longer knows about (restart, crash) are closed the first time the
+    // terminal is used again instead of lingering until their idle timer.
+    reapOrphans() {
+      if (!orphanReap) {
+        orphanReap = (async () => {
+          const held = await agent.op('terminal.list');
+          const closed = [];
+          for (const t of held) {
+            if (terminalSessions.has(t.id)) continue;
+            try { await agent.op('terminal.close', { id: t.id }); } catch (err) { logger.warn({ err, id: t.id }, 'orphaned terminal close failed'); continue; }
+            closed.push(t.id);
+            if (!t.exited && !t.closeReason) ctx.auditRecord?.(null, { action: 'server_config.terminal.close', target: t.id, args: { reason: 'orphaned', pid: t.pid ?? null } });
+          }
+          return closed;
+        })().catch((err) => { logger.warn({ err }, 'orphaned terminal sweep failed'); orphanReap = null; return []; });
+      }
+      return orphanReap;
+    },
+    async list(user) {
+      terminal.assertRoot(user);
+      await terminal.reapOrphans();
+      return { sessions: [...terminalSessions.values()].filter((s) => s.user.id === user.id).map(terminal.shape), idleMinutes: terminal.idleMs() / 60_000, maxSessions: terminal.maxSessions(), installed: capabilities.has('terminal') };
+    },
     async open({ shell = '/bin/bash', cols = 120, rows = 32 } = {}, req) {
       terminal.assertRoot(req.user);
+      await terminal.reapOrphans();
       await capabilities.ensureFresh();
       capabilities.require('terminal', 'The "script" utility (package util-linux / bsdutils) is required for the in-browser terminal');
       const mine = [...terminalSessions.values()].filter((s) => s.user.id === req.user.id);
@@ -434,7 +517,7 @@ export function createServerConfigService(ctx) {
       const s = terminal.owned(id, req.user);
       s.lastActivity = Date.now();
       try {
-        return await agent.op('terminal.write', { id, data });
+        return await agent.op('terminal.write', { id, data }, { req });
       } catch (err) {
         if (err.code === 'not_found' || err.code === 'exited') { await terminal.forget(s, err.code === 'exited' ? 'exited' : 'expired'); throw notFound('Terminal session'); }
         throw err;
@@ -451,10 +534,12 @@ export function createServerConfigService(ctx) {
       await terminal.forget(s, 'closed', req);
       return { id, closed: true };
     },
+    // Idle means no input and no output, whether or not a tab is attached; the
+    // agent applies the same rule, so both sides agree on when a shell ends.
     async sweep(now = Date.now()) {
       const expired = [];
       for (const s of [...terminalSessions.values()]) {
-        if (s.viewers > 0 || now - s.lastActivity <= terminal.idleMs()) continue;
+        if (now - s.lastActivity <= terminal.idleMs()) continue;
         expired.push(s.id);
         await terminal.forget(s, 'idle_timeout');
       }
@@ -496,7 +581,11 @@ export function createServerConfigService(ctx) {
         const buf = Buffer.from(r.data, 'base64');
         if (r.truncated && since > 0) send({ type: 'notice', message: 'some output was dropped from the scrollback' });
         if (buf.length) { since = r.offset; s.offset = r.offset; s.lastActivity = Date.now(); const text = decode(buf, r.exited); if (text) send({ type: 'output', data: text }); }
-        if (r.exited) { await terminal.forget(s, 'exited'); return finish({ type: 'exit', code: r.exitCode, signal: r.signal }); }
+        if (r.exited || r.closeReason) {
+          const reason = REASONS[r.closeReason] ?? 'exited';
+          await terminal.forget(s, reason);
+          return finish({ type: 'exit', code: r.exitCode, signal: r.signal, reason, message: reason === 'idle_timeout' ? `The session was idle for ${terminal.idleMs() / 60_000} minutes` : null });
+        }
         timer = setTimeout(poll, buf.length ? pollMs : idlePollMs);
         timer.unref?.();
       };
@@ -509,10 +598,13 @@ export function createServerConfigService(ctx) {
   };
 
   // --- Update Preferences --------------------------------------------------------
+  // Software owns the only scheduled check (os-update-check -> software.update.check)
+  // and the "last check" record; this page keeps the release tier and the
+  // auto-update policy and hands them to Software.
   const updates = {
     schedule() {
-      const row = ctx.scheduler.list().find((r) => r.name === UPDATE_SCHEDULE) || null;
-      return row ? { name: row.name, cron: row.cron, enabled: Boolean(row.enabled), lastRunAt: row.last_run_at, nextRunAt: row.next_run_at } : null;
+      const row = ctx.scheduler.list().find((r) => r.name === SOFTWARE_CHECK_SCHEDULE) || null;
+      return row ? { name: row.name, cron: row.cron, enabled: Boolean(row.enabled), lastRunAt: row.last_run_at, nextRunAt: row.next_run_at, owner: 'software' } : null;
     },
     settings() {
       return { tier: S('updates.tier', 'stable'), auto: Boolean(S('updates.auto', true)), autoOs: Boolean(S('software.updates.auto_os', false)), notifyContact: Boolean(S('updates.notify_contact', true)) };
@@ -520,43 +612,56 @@ export function createServerConfigService(ctx) {
     async get() {
       let panel = null; let os = null;
       try { panel = ctx.software?.panel?.status?.() ?? null; } catch (err) { logger.warn({ err }, 'panel update status failed'); }
-      try { os = ctx.software?.update?.status ? await ctx.software.update.status({ cached: true }) : null; } catch (err) { os = err instanceof CapabilityError ? { unavailable: true, reason: err.message } : { unavailable: true, reason: err.message }; }
-      const osSchedule = ctx.scheduler.list().find((r) => r.name === 'os-update-check') || null;
-      return { ...updates.settings(), tiers: UPDATE_TIERS.map((t) => ({ value: t, label: { stable: 'Stable', release: 'Release', current: 'Current', edge: 'Edge (development builds)' }[t], description: { stable: 'Well-tested releases only; recommended for production.', release: 'Latest release as soon as it ships.', current: 'Release candidates ahead of general availability.', edge: 'Nightly development builds; expect breakage.' }[t] })), schedule: updates.schedule(), osSchedule: osSchedule ? { cron: osSchedule.cron, enabled: Boolean(osSchedule.enabled), lastRunAt: osSchedule.last_run_at } : null, panel, os, lastCheck: S('updates.last_check', null), softwareAvailable: Boolean(ctx.software) };
+      try { os = ctx.software?.update?.status ? await ctx.software.update.status({ cached: true }) : null; } catch (err) { os = { unavailable: true, reason: err.message }; }
+      const osOk = os && !os.unavailable;
+      const lastCheck = osOk || panel?.lastCheck ? {
+        at: osOk ? os.checkedAt : panel?.lastCheck?.at ?? null, tier: S('updates.tier', 'stable'),
+        os: osOk ? { manager: os.manager, count: os.count, security: os.security, rebootRequired: os.rebootRequired, at: os.checkedAt } : null,
+        panel: panel?.lastCheck ? { at: panel.lastCheck.at, ok: panel.lastCheck.ok, current: panel.currentVersion, latest: panel.latest?.version ?? null, updateAvailable: panel.updateAvailable, error: panel.lastCheck.error ?? null } : null,
+      } : null;
+      return { ...updates.settings(), tiers: UPDATE_TIERS.map((t) => ({ value: t, label: { stable: 'Stable', release: 'Release', current: 'Current', edge: 'Edge (development builds)' }[t], description: { stable: 'Well-tested releases only; recommended for production.', release: 'Latest release as soon as it ships.', current: 'Release candidates ahead of general availability.', edge: 'Nightly development builds; expect breakage.' }[t] })), schedule: updates.schedule(), panel, os, lastCheck, lastJob: ctx.jobs.list({ type: SOFTWARE_CHECK_JOB, limit: 1 })[0] ?? null, softwareAvailable: Boolean(ctx.software), checkAvailable: updates.checkAvailable() };
     },
+    checkAvailable() { return Boolean(ctx.software?.update && (typeof ctx.software.update.check === 'function' || ctx.jobs.types().includes(SOFTWARE_CHECK_JOB))); },
     async update(body, req) {
+      const sw = ctx.software;
       const values = {};
-      if (body.tier !== undefined) values['updates.tier'] = body.tier;
-      if (body.auto !== undefined) values['updates.auto'] = body.auto;
       if (body.notifyContact !== undefined) values['updates.notify_contact'] = body.notifyContact;
-      if (body.autoOs !== undefined) values['software.updates.auto_os'] = body.autoOs;
-      if (body.cron !== undefined && !isValidCron(body.cron)) throw unprocessable('Request validation failed', { cron: ['Must be a valid 5-field cron expression'] });
+      if (body.tier !== undefined || body.auto !== undefined) {
+        if (sw?.panel?.setPreferences) await sw.panel.setPreferences({ tier: body.tier, autoUpdate: body.auto }, req);
+        else { if (body.tier !== undefined) values['updates.tier'] = body.tier; if (body.auto !== undefined) values['updates.auto'] = body.auto; }
+      }
+      if (body.autoOs !== undefined) {
+        if (sw?.update?.setAuto) await sw.update.setAuto(body.autoOs, req);
+        else values['software.updates.auto_os'] = body.autoOs;
+      }
       settings.setMany(values);
-      if (body.cron !== undefined || body.scheduleEnabled !== undefined) ctx.scheduler.update(UPDATE_SCHEDULE, { ...(body.cron !== undefined ? { cron: body.cron } : {}), ...(body.scheduleEnabled !== undefined ? { enabled: body.scheduleEnabled } : {}) });
       audit(req, { action: 'server_config.updates.set', args: body });
       return updates.get();
     },
-    check(user, req) {
-      const job = ctx.jobs.enqueue(UPDATE_JOB, {}, { userId: user?.id ?? null });
-      audit(req, { action: 'server_config.updates.check', args: { jobId: job.id } });
-      return { job };
-    },
-    async checkJob(job) {
-      const summary = { at: new Date().toISOString(), tier: S('updates.tier', 'stable'), panel: null, os: null };
-      job.progress(10, 'checking the panel release feed');
-      try {
-        if (ctx.software?.panel?.check && S('software.update_url', '')) { const p = await ctx.software.panel.check(); summary.panel = { current: p.currentVersion, latest: p.latest?.version ?? null, updateAvailable: p.updateAvailable }; job.log(`panel ${p.currentVersion}: ${p.updateAvailable ? `update ${p.latest.version} available` : 'up to date'}`); } else job.log('no panel update URL configured; skipping the release feed');
-      } catch (err) { job.log(`panel check failed: ${err.message}`, 'warn'); }
-      job.progress(50, 'checking operating system packages');
-      try {
-        if (ctx.software?.update?.status) { const os = await ctx.software.update.status(); summary.os = { manager: os.manager, count: os.count, security: os.security, rebootRequired: os.rebootRequired }; job.log(`${os.count} package update(s) pending (${os.security} security)${os.rebootRequired ? '; reboot required' : ''}`); } else job.log('software category not available; skipping OS packages');
-      } catch (err) { job.log(`OS update check skipped: ${err.message}`, 'warn'); }
-      settings.set('updates.last_check', summary);
-      if (S('updates.notify_contact', true) && (summary.panel?.updateAvailable || summary.os?.security > 0)) {
-        try { await ctx.contacts?.notify?.('updates.available', summary); } catch (err) { job.log(`contact notification failed: ${err.message}`, 'warn'); }
+    async check(user, req) {
+      const sw = ctx.software;
+      if (!updates.checkAvailable()) throw new CapabilityError('pkg', 'The Software category is not loaded; package update checks run from Software > System Update');
+      let job = null;
+      if (typeof sw.update.check === 'function') job = (await sw.update.check(user, req))?.job ?? null;
+      else job = ctx.jobs.enqueue(SOFTWARE_CHECK_JOB, {}, { userId: user?.id ?? null });
+      let panel = null;
+      if (sw.panel?.check && S('software.update_url', '')) {
+        try { const p = await sw.panel.check(req); panel = { current: p.currentVersion, latest: p.latest?.version ?? null, updateAvailable: p.updateAvailable, error: p.lastCheck?.error ?? null }; } catch (err) { panel = { error: err.message }; }
+        if (panel.updateAvailable) await updates.notify({ panel });
       }
-      job.progress(100, 'finished');
-      return summary;
+      audit(req, { action: 'server_config.updates.check', args: { jobId: job?.id ?? null, panel } });
+      return { job, panel };
+    },
+    // Runs after every software.update.check job (scheduled or started here).
+    async afterCheck(jobId, result) {
+      if (!result || result.skipped) return false;
+      const security = Number(result.security) || 0;
+      if (security <= 0) return false;
+      return updates.notify({ os: { count: Number(result.count) || 0, security }, jobId });
+    },
+    async notify(summary) {
+      if (!S('updates.notify_contact', true)) return false;
+      try { await ctx.contacts?.notify?.('updates.available', { at: new Date().toISOString(), tier: S('updates.tier', 'stable'), ...summary }); return true; } catch (err) { logger.warn({ err }, 'update notification failed'); return false; }
     },
   };
 
@@ -588,10 +693,8 @@ export function createServerConfigService(ctx) {
 
   return {
     profile, analytics, time, quota, nodes, stats, terminal, updates, marketplace,
-    jobs: { [QUOTA_JOB]: quota.enableJob, [STATS_JOB]: stats.generateJob, [UPDATE_JOB]: updates.checkJob },
-    schedules: [
-      { name: STATS_SCHEDULE, cron: STATS_CRON, jobType: STATS_JOB },
-      { name: UPDATE_SCHEDULE, cron: UPDATE_CRON, jobType: UPDATE_JOB },
-    ],
+    jobs: { [QUOTA_JOB]: quota.enableJob, [STATS_JOB]: stats.generateJob },
+    schedules: [{ name: STATS_SCHEDULE, cron: STATS_CRON, jobType: STATS_JOB }],
+    softwareCheckJob: SOFTWARE_CHECK_JOB,
   };
 }

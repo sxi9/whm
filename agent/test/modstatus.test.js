@@ -1,6 +1,7 @@
+import http from 'node:http';
 import { describe, it, expect } from 'vitest';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { parseWorkerTable, parseStatusPage, decodeEntities } from '../src/ops/modstatus.js';
+import { parseWorkerTable, parseStatusPage, decodeEntities, fetchStatusHtml } from '../src/ops/modstatus.js';
 
 const ctx = createContext();
 
@@ -119,5 +120,59 @@ describe('modstatus op schemas', () => {
   it('answers reachable: false when nothing listens on the probe address', async () => {
     const out = await runOp('modstatus.workers', { port: 1, bind: '127.0.0.1' }, ctx);
     expect(out).toMatchObject({ probe: { host: '127.0.0.1', port: 1 }, reachable: false, statusPage: false, workers: [] });
+  });
+});
+
+// A loopback listener controlled by the test; nothing on the host is touched.
+function listen(handler) {
+  return new Promise((resolve) => {
+    const server = http.createServer(handler);
+    server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(() => r()); }) }));
+  });
+}
+
+describe('modstatus status page fetch limits', () => {
+  it('cuts a body that streams past the cap and parses what was read', async () => {
+    let socketClosed = false;
+    const { port, close } = await listen((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.write('<html><head><title>Apache Status</title></head><body>');
+      const chunk = 'x'.repeat(64 * 1024);
+      const timer = setInterval(() => { if (!res.destroyed) res.write(chunk); }, 1);
+      res.on('close', () => { socketClosed = true; clearInterval(timer); });
+    });
+    try {
+      const started = Date.now();
+      const out = await fetchStatusHtml({ host: '127.0.0.1', port }, { maxBytes: 256 * 1024, deadlineMs: 5000 });
+      expect(out).toMatchObject({ statusCode: 200, truncated: true });
+      expect(out.body.length).toBe(256 * 1024);
+      expect(Date.now() - started).toBeLessThan(4000);
+      await new Promise((r) => setTimeout(r, 50));
+      expect(socketClosed).toBe(true);
+      expect(parseStatusPage(out.body)).toEqual({ statusPage: true, extended: false, table: null });
+    } finally { await close(); }
+  });
+
+  it('gives up at the hard deadline even while the socket stays busy', async () => {
+    const { port, close } = await listen((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      const timer = setInterval(() => { if (!res.destroyed) res.write('.'); }, 20);
+      res.on('close', () => clearInterval(timer));
+    });
+    try {
+      const started = Date.now();
+      const out = await fetchStatusHtml({ host: '127.0.0.1', port }, { timeoutMs: 2000, deadlineMs: 300 });
+      expect(Date.now() - started).toBeLessThan(1500);
+      expect(out).toMatchObject({ statusCode: 200, truncated: true });
+    } finally { await close(); }
+  });
+
+  it('returns the whole page and no truncation flag for a normal report', async () => {
+    const { port, close } = await listen((req, res) => { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(PAGE); });
+    try {
+      const out = await runOp('modstatus.workers', { port, bind: '127.0.0.1' }, ctx);
+      expect(out).toMatchObject({ reachable: true, httpStatus: 200, truncated: false, statusPage: true, extended: true });
+      expect(out.workers).toHaveLength(3);
+    } finally { await close(); }
   });
 });

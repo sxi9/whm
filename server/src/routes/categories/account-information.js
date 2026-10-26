@@ -23,11 +23,16 @@ export async function register(ctx) {
   ctx.jobs.register('account_info.disk_refresh', (job) => ctx.accountInfo.refreshDiskUsage(job));
   ctx.jobs.register('account_info.bandwidth_collect', (job) => ctx.accountInfo.collectBandwidth(job));
   ctx.scheduler.ensure('account-disk-usage', '25 */6 * * *', 'account_info.disk_refresh');
+  // Parked (enabled = 0) by the service wherever no web server writes domlogs; see syncCollectSchedule.
   ctx.scheduler.ensure('account-bandwidth', '35 * * * *', 'account_info.bandwidth_collect');
   ctx.capabilities.register('quota', { binaries: ['setquota', 'repquota', 'quotacheck', 'quotaon'], required: ['repquota', 'setquota'] });
 
   const r = Router();
-  const wrap = (fn, status = 200) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(status).json(d?.meta ? d : { data: d })).catch(next);
+  // A service result is passed through only when it is a list envelope; a plain
+  // map (effective limits may carry a key named "meta" or "data") is wrapped.
+  const isEnvelope = (d) => Boolean(d) && typeof d === 'object' && !Array.isArray(d) && 'data' in d && 'meta' in d && typeof d.meta === 'object' && d.meta !== null && 'total' in d.meta;
+  const wrap = (fn, status = 200) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(status).json(isEnvelope(d) ? d : { data: d })).catch(next);
+  const plain = (fn, status = 200) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(status).json({ data: d })).catch(next);
   const svc = () => ctx.accountInfo;
 
   r.get('/overview', requireReseller, wrap((req) => svc().overview(req.user)));
@@ -56,14 +61,14 @@ export async function register(ctx) {
     wrap((req) => svc().resetBandwidth(req.params.username, req.body, req.user, req)));
 
   // Manage Account Enhancements ----------------------------------------------------
-  r.get('/enhancements', requireReseller, validate({ query: pagination }), wrap((req) => svc().enhancements.list(req.query)));
+  r.get('/enhancements', requireReseller, validate({ query: pagination }), wrap((req) => svc().enhancements.list(req.query, req.user)));
   r.post('/enhancements', requireRoot, validate({ body: enhancementBody }), wrap((req) => svc().enhancements.create(req.body, req), 201));
-  r.get('/enhancements/:id', requireReseller, validate({ params: idParam }), wrap((req) => svc().enhancements.get(req.params.id)));
+  r.get('/enhancements/:id', requireReseller, validate({ params: idParam }), wrap((req) => svc().enhancements.get(req.params.id, req.user)));
   r.put('/enhancements/:id', requireRoot, validate({ params: idParam, body: enhancementBody.partial() }), wrap((req) => svc().enhancements.update(req.params.id, req.body, req)));
   r.delete('/enhancements/:id', requireRoot, validate({ params: idParam }), wrap((req) => svc().enhancements.remove(req.params.id, req)));
   r.get('/enhancements/:id/accounts', requireReseller, validate({ params: idParam }), wrap((req) => svc().enhancements.accounts(req.params.id, req.user)));
   r.get('/accounts/:username/enhancements', requireReseller, validate({ params: nameParam }), wrap((req) => svc().enhancements.forAccount(req.params.username, req.user)));
-  r.get('/accounts/:username/enhancements/effective', requireReseller, validate({ params: nameParam }), wrap((req) => svc().enhancements.effectiveLimits(req.params.username, req.user)));
+  r.get('/accounts/:username/enhancements/effective', requireReseller, validate({ params: nameParam }), plain((req) => svc().enhancements.effectiveLimits(req.params.username, req.user)));
   r.put('/accounts/:username/enhancements', requireReseller, validate({ params: nameParam, body: z.object({ enhancements: z.array(slug).max(100) }).strict() }),
     wrap((req) => svc().enhancements.setForAccount(req.params.username, req.body.enhancements, req.user, req)));
   r.post('/accounts/:username/enhancements/:id', requireReseller, validate({ params: nameParam.merge(idParam) }),

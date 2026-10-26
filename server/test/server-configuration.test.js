@@ -37,6 +37,9 @@ describe('Server Configuration API', () => {
   let statsInstalled = false;
   let terminalOutput = [];
   let terminalExited = false;
+  let terminalCloseReason = null;
+  let agentTerminals = [];
+  const ORPHAN_ID = 'd'.repeat(32);
   let quotaResult = { mountpoint: '/', enabled: true, steps: [{ step: 'quotacheck', ok: true, detail: 'created' }, { step: 'quotaon', ok: true, detail: 'on' }], active: { user: true, group: true } };
 
   beforeAll(async () => {
@@ -44,7 +47,7 @@ describe('Server Configuration API', () => {
       'sys.binaries': ({ names }) => Object.fromEntries(names.map((n) => [n, Boolean(installed[n])])),
       'sys.time.get': () => ({ now: '2026-10-26T10:00:00.000Z', timezone: 'Etc/UTC', ntp: true, ntpSynchronized: true, rtcLocal: false }),
       'sys.time.set': ({ timezone, ntp }) => ({ timezone, ntp }),
-      'quota.status': () => ({ tools: { quotacheck: installed.quotacheck, quotaon: installed.quotaon, repquota: installed.repquota, setquota: installed.setquota, mount: true, tune2fs: true }, fstabPath: '/etc/fstab', fstabPresent: true, filesystems: [QUOTA_FS, { ...QUOTA_FS, device: '/dev/vdb1', mountpoint: '/home', userQuotaMounted: true, active: { user: true, group: false } }] }),
+      'quota.status': () => ({ tools: { quotacheck: installed.quotacheck, quotaon: installed.quotaon, quotaoff: Boolean(installed.quotaoff), repquota: installed.repquota, setquota: installed.setquota, mount: true, tune2fs: true }, fstabPath: '/etc/fstab', fstabPresent: true, filesystems: [QUOTA_FS, { ...QUOTA_FS, device: '/dev/vdb1', mountpoint: '/home', userQuotaMounted: true, active: { user: true, group: false } }] }),
       'quota.enable': () => quotaResult,
       'quota.fstab.enable': ({ mountpoint }) => ({ mountpoint, changed: true, previousLine: '/dev/vda1 / ext4 defaults 0 1', line: '/dev/vda1\t/\text4\tdefaults,usrquota,grpquota\t0\t1', backup: '/etc/fstab.whm-bak' }),
       'quota.disable': ({ mountpoint }) => ({ mountpoint, disabled: true, active: { user: false, group: false } }),
@@ -53,10 +56,11 @@ describe('Server Configuration API', () => {
       'terminal.open': ({ shell }) => ({ id: TERM_ID, pid: 4321, shell, exited: false }),
       'terminal.read': ({ since }) => {
         const data = Buffer.concat(terminalOutput.map((t) => Buffer.from(t))).subarray(since);
-        return { id: TERM_ID, since, offset: since + data.length, data: data.toString('base64'), truncated: false, exited: terminalExited, exitCode: terminalExited ? 0 : null, signal: null };
+        return { id: TERM_ID, since, offset: since + data.length, data: data.toString('base64'), truncated: false, exited: terminalExited, exitCode: terminalExited ? 0 : null, signal: null, closeReason: terminalCloseReason };
       },
       'terminal.write': ({ id, data }) => ({ id, bytes: Buffer.byteLength(data) }),
       'terminal.close': ({ id }) => ({ id, existed: true }),
+      'terminal.list': () => agentTerminals,
     });
     app = await createTestApp({ agent });
     app.ctx.jobs.start();
@@ -79,10 +83,16 @@ describe('Server Configuration API', () => {
   describe('registration', () => {
     it('attaches ctx.serverConfig with its jobs, schedules and capabilities', () => {
       expect(app.ctx.serverConfig).toBeDefined();
-      expect(app.ctx.jobs.types()).toEqual(expect.arrayContaining(['server_config.stats.generate', 'server_config.quota.enable', 'server_config.update.check']));
+      expect(app.ctx.jobs.types()).toEqual(expect.arrayContaining(['server_config.stats.generate', 'server_config.quota.enable']));
       const names = app.ctx.scheduler.list().map((r) => r.name);
-      expect(names).toEqual(expect.arrayContaining(['stats-generation', 'update-preferences-check']));
-      expect(app.ctx.capabilities.snapshot().capabilities.terminal).toBeDefined();
+      expect(names).toContain('stats-generation');
+      // Software owns the only update-check schedule (contract §3).
+      expect(names).not.toContain('update-preferences-check');
+      expect(app.ctx.jobs.types()).not.toContain('server_config.update.check');
+      expect(app.ctx.settings.get('updates.last_check', 'absent')).toBe('absent');
+      const caps = app.ctx.capabilities.snapshot().capabilities;
+      expect(caps.terminal).toBeDefined();
+      expect(Object.keys(caps.quota.binaries)).toEqual(expect.arrayContaining(['quotacheck', 'quotaon', 'quotaoff', 'repquota', 'setquota']));
     });
 
     it('is root only on every route', async () => {
@@ -173,9 +183,12 @@ describe('Server Configuration API', () => {
   describe('Initial Quota Setup', () => {
     it('describes the filesystems and reports missing tools without failing', async () => {
       const { body } = await get('/quota').expect(200);
-      expect(body.data).toMatchObject({ toolsInstalled: false, homeRoot: '/home', homeFilesystem: '/home', enabled: true, installPackages: ['quota'] });
+      // `enabled` is the kernel state; `enforceable` also needs the tools.
+      expect(body.data).toMatchObject({ toolsInstalled: false, homeRoot: '/home', homeFilesystem: '/home', enabled: true, enforceable: false, installPackages: ['quota'] });
       expect(body.data.filesystems.find((f) => f.mountpoint === '/home').holdsHomes).toBe(true);
       expect(body.data.filesystems.find((f) => f.mountpoint === '/').proposedFstabLine).toContain('usrquota');
+      expect(await app.ctx.serverConfig.quota.isEnabled()).toBe(false);
+      expect(await app.ctx.serverConfig.quota.isEnabled('/home')).toBe(false);
     });
 
     it('returns 501 for enable/disable while the quota tools are missing and 422 without a package manager', async () => {
@@ -189,8 +202,22 @@ describe('Server Configuration API', () => {
       try { await post('/quota/install-tools').expect(422); } finally { app.ctx.software = original; }
     });
 
+    it('needs quotacheck and quotaon to enable even when repquota/setquota satisfy the capability', async () => {
+      await provision({ repquota: true, setquota: true });
+      expect(app.ctx.capabilities.has('quota')).toBe(true);
+      const res = await post('/quota/enable', { mountpoint: '/' }).expect(501);
+      expect(res.body.error).toMatchObject({ capability: 'quota' });
+      expect(res.body.error.message).toContain('quotacheck');
+      expect(app.ctx.jobs.list({ type: 'server_config.quota.enable' })).toHaveLength(0);
+      const off = await post('/quota/disable', { mountpoint: '/' }).expect(501);
+      expect(off.body.error.message).toContain('quotaoff');
+    });
+
     it('enables quotas as a job, optionally rewriting fstab first', async () => {
-      await provision({ quotacheck: true, quotaon: true, repquota: true, setquota: true });
+      await provision({ quotacheck: true, quotaon: true, quotaoff: true, repquota: true, setquota: true });
+      expect((await get('/quota').expect(200)).body.data).toMatchObject({ toolsInstalled: true, enforceable: true });
+      expect(await app.ctx.serverConfig.quota.isEnabled()).toBe(true);
+      expect(await app.ctx.serverConfig.quota.isEnabled('/')).toBe(false);
       const res = await post('/quota/enable', { mountpoint: '/', updateFstab: true, groupQuota: false }).expect(202);
       const job = await waitForJob(app.ctx, res.body.data.job.id);
       expect(job.status).toBe('done');
@@ -216,6 +243,9 @@ describe('Server Configuration API', () => {
         const res = await post('/quota/install-tools').expect(202);
         expect(res.body.data).toMatchObject({ missing: ['quota'], job: { id: 99 } });
         expect(calls).toEqual([['quota']]);
+        app.ctx.software = { pkg: { ensureInstalled: async () => ({ missing: [], job: null }) } };
+        const done = await post('/quota/install-tools').expect(200);
+        expect(done.body.data).toMatchObject({ missing: [], job: null });
       } finally { app.ctx.software = original; }
     });
   });
@@ -293,10 +323,61 @@ describe('Server Configuration API', () => {
   });
 
   describe('Statistics Software Configuration', () => {
-    it('shows generator presence, settings and the schedule', async () => {
+    const row = () => app.ctx.scheduler.list().find((r) => r.name === 'stats-generation');
+
+    it('keeps the schedule paused while no enabled generator is installed and resumes once one appears', async () => {
       const { body } = await get('/stats').expect(200);
-      expect(body.data).toMatchObject({ generators: { awstats: true, webalizer: false, analog: false }, defaultGenerator: 'awstats', schedule: { cron: '17 2 * * *', enabled: true } });
+      expect(body.data).toMatchObject({ generators: { awstats: true, webalizer: false, analog: false }, defaultGenerator: 'awstats', scheduleEnabled: true, schedule: { cron: '17 2 * * *', enabled: false, blockedReason: 'no_generator_installed' } });
       expect(body.data.detect.generators.awstats.installed).toBe(false);
+      expect(row().enabled).toBe(0);
+      // A paused schedule never enqueues a job that would only log "nothing to do".
+      statsInstalled = true;
+      const after = await get('/stats').expect(200);
+      expect(after.body.data.schedule).toMatchObject({ enabled: true, blockedReason: null });
+      expect(row().enabled).toBe(1);
+      statsInstalled = false;
+      // The boot alignment uses the last probe (no agent call at startup)...
+      app.agent.calls.length = 0;
+      await app.ctx.serverConfig.stats.alignSchedule();
+      expect(app.agent.callsTo('stats.detect')).toHaveLength(0);
+      expect(row().enabled).toBe(1);
+      // ...while a live sync (page load) probes again.
+      await app.ctx.serverConfig.stats.alignSchedule({ live: true });
+      expect(row().enabled).toBe(0);
+      expect(app.ctx.settings.get('stats.schedule_paused')).toBe('no_generator_installed');
+      statsInstalled = true;
+      await app.ctx.serverConfig.stats.alignSchedule();
+      expect(row().enabled).toBe(0);
+      await app.ctx.serverConfig.stats.alignSchedule({ live: true });
+      expect(row().enabled).toBe(1);
+      expect(app.ctx.settings.get('stats.schedule_paused')).toBeNull();
+    });
+
+    it('pauses itself when a scheduled run finds no installed generator', async () => {
+      statsInstalled = false;
+      app.ctx.scheduler.update('stats-generation', { enabled: true });
+      const job = app.ctx.jobs.enqueue('server_config.stats.generate', {});
+      const done = await waitForJob(app.ctx, job.id);
+      expect(done.status).toBe('done');
+      expect(done.result).toMatchObject({ generated: 0, paused: true });
+      expect(row().enabled).toBe(0);
+      statsInstalled = true;
+      await get('/stats').expect(200);
+      expect(row().enabled).toBe(1);
+    });
+
+    it('leaves a schedule the operator paused in Configure cPanel Cron Jobs alone', async () => {
+      await app.http.patch('/api/system/schedules/stats-generation').set('X-CSRF-Token', csrf).send({ enabled: false }).expect(200);
+      expect(row().enabled).toBe(0);
+      const res = await put('/stats', { allowUserChoice: false }).expect(200);
+      expect(res.body.data.schedule).toMatchObject({ enabled: false, blockedReason: null });
+      expect(row().enabled).toBe(0);
+      await get('/stats').expect(200);
+      await app.ctx.serverConfig.stats.alignSchedule();
+      expect(row().enabled).toBe(0);
+      await app.http.patch('/api/system/schedules/stats-generation').set('X-CSRF-Token', csrf).send({ enabled: true }).expect(200);
+      await put('/stats', { allowUserChoice: true }).expect(200);
+      expect(row().enabled).toBe(1);
     });
 
     it('validates settings and disables the schedule when every generator is off', async () => {
@@ -308,35 +389,36 @@ describe('Server Configuration API', () => {
       expect(Boolean(app.ctx.settings.get('stats.generators', {}).webalizer)).toBe(false);
       expect(app.ctx.scheduler.list().find((r) => r.name === 'stats-generation').cron).toBe('17 2 * * *');
       const off = await put('/stats', { generators: { awstats: false, webalizer: true }, defaultGenerator: 'webalizer', cron: '30 3 * * *' }).expect(200);
-      expect(off.body.data.schedule).toMatchObject({ cron: '30 3 * * *', enabled: true });
+      // webalizer is on but not installed on this host: paused, not disabled.
+      expect(off.body.data.schedule).toMatchObject({ cron: '30 3 * * *', enabled: false, blockedReason: 'no_generator_installed' });
       const none = await put('/stats', { generators: { webalizer: false } }).expect(200);
-      expect(none.body.data.schedule.enabled).toBe(false);
-      expect(app.ctx.scheduler.list().find((r) => r.name === 'stats-generation').enabled).toBe(0);
+      expect(none.body.data.schedule).toMatchObject({ enabled: false, blockedReason: 'no_generator_enabled' });
+      expect(row().enabled).toBe(0);
       await put('/stats', { enabled: true }).expect(422);
       const back = await put('/stats', { generators: { awstats: true }, defaultGenerator: 'awstats' }).expect(200);
-      expect(back.body.data.schedule.enabled).toBe(true);
-      expect(auditCount('server_config.stats.update')).toBe(3);
+      expect(back.body.data.schedule).toMatchObject({ enabled: true, blockedReason: null });
+      expect(auditCount('server_config.stats.update')).toBe(5);
     });
 
     it('keeps an explicitly disabled schedule off across boots while a generator is on', async () => {
-      const row = () => app.ctx.scheduler.list().find((r) => r.name === 'stats-generation');
       const off = await put('/stats', { enabled: false }).expect(200);
       expect(off.body.data).toMatchObject({ scheduleEnabled: false, schedule: { enabled: false } });
-      app.ctx.serverConfig.stats.alignSchedule();
+      await app.ctx.serverConfig.stats.alignSchedule();
       expect(row().enabled).toBe(0);
       await put('/stats', { generators: { webalizer: true } }).expect(200);
       expect(row().enabled).toBe(0);
       const on = await put('/stats', { enabled: true, generators: { webalizer: false } }).expect(200);
       expect(on.body.data).toMatchObject({ scheduleEnabled: true, schedule: { enabled: true } });
-      app.ctx.serverConfig.stats.alignSchedule();
+      await app.ctx.serverConfig.stats.alignSchedule();
       expect(row().enabled).toBe(1);
       app.ctx.scheduler.update('stats-generation', { enabled: false });
-      app.ctx.serverConfig.stats.alignSchedule();
+      await app.ctx.serverConfig.stats.alignSchedule();
       expect(row().enabled).toBe(0);
       app.ctx.scheduler.update('stats-generation', { enabled: true });
     });
 
     it('returns 501 when no enabled generator is installed', async () => {
+      statsInstalled = false;
       const res = await post('/stats/run').expect(501);
       expect(res.body.error).toMatchObject({ code: 'capability_missing', capability: 'stats' });
       await post('/stats/run', { generator: 'nope' }).expect(422);
@@ -372,6 +454,22 @@ describe('Server Configuration API', () => {
   });
 
   describe('Terminal', () => {
+    it('closes shells the agent still holds for a previous API process', async () => {
+      agentTerminals = [{ id: ORPHAN_ID, pid: 777, exited: false, closeReason: null }, { id: 'e'.repeat(32), pid: 778, exited: true, closeReason: null }];
+      const list = await get('/terminal').expect(200);
+      expect(list.body.data.sessions).toEqual([]);
+      expect(app.agent.callsTo('terminal.list')).toHaveLength(1);
+      expect(app.agent.callsTo('terminal.close').map((c) => c.args.id)).toEqual([ORPHAN_ID, 'e'.repeat(32)]);
+      const rows = app.ctx.db.prepare("SELECT target, args_redacted FROM audit_log WHERE action = 'server_config.terminal.close'").all();
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ target: ORPHAN_ID });
+      expect(rows[0].args_redacted).toContain('orphaned');
+      agentTerminals = [];
+      await get('/terminal').expect(200);
+      expect(app.agent.callsTo('terminal.list')).toHaveLength(1);
+      app.ctx.db.prepare("DELETE FROM audit_log WHERE action = 'server_config.terminal.close'").run();
+    });
+
     it('returns 501 while the script utility is missing', async () => {
       const res = await post('/terminal').expect(501);
       expect(res.body.error.capability).toBe('terminal');
@@ -413,9 +511,7 @@ describe('Server Configuration API', () => {
       terminalOutput.push('still running\r\n');
       await new Promise((r) => setTimeout(r, 80));
       expect(Date.now() - session.lastActivity).toBeLessThan(5_000);
-      session.viewers = 0;
       expect(await app.ctx.serverConfig.terminal.sweep()).toEqual([]);
-      session.viewers = 1;
       terminalExited = true;
       await new Promise((r) => setTimeout(r, 80));
       expect(events.at(-1)).toMatchObject({ type: 'exit', code: 0 });
@@ -439,9 +535,8 @@ describe('Server Configuration API', () => {
       app.ctx.settings.set('terminal.max_sessions', 3);
       const session = sessions.get(open.body.data.id);
       session.lastActivity = Date.now() - 60 * 60_000;
+      // An attached viewer does not keep an idle shell alive (the agent would end it anyway).
       session.viewers = 1;
-      expect(await app.ctx.serverConfig.terminal.sweep()).toEqual([]);
-      session.viewers = 0;
       const expired = await app.ctx.serverConfig.terminal.sweep();
       expect(expired).toEqual([open.body.data.id]);
       expect(app.agent.callsTo('terminal.close')).toHaveLength(1);
@@ -451,6 +546,24 @@ describe('Server Configuration API', () => {
       expect(done.body.data.closed).toBe(true);
       await del(`/terminal/${closed.body.data.id}`).expect(404);
     });
+
+    it('reports the agent\'s idle kill as idle_timeout to the viewer and the audit log', async () => {
+      await post('/terminal').expect(201);
+      const events = [];
+      const fakeRes = { set() {}, flushHeaders() {}, write(chunk) { const m = String(chunk).match(/^data: (.*)\n\n$/s); if (m) events.push(JSON.parse(m[1])); }, end() { this.ended = true; } };
+      const session = app.ctx.serverConfig.terminal.sessionsForTest().get(TERM_ID);
+      const fakeReq = { user: { ...session.user }, on() {} };
+      terminalCloseReason = 'idle';
+      try {
+        app.ctx.serverConfig.terminal.stream(TERM_ID, fakeReq, fakeRes, { pollMs: 10, idlePollMs: 10 });
+        await new Promise((r) => setTimeout(r, 80));
+        expect(events.at(-1)).toMatchObject({ type: 'exit', reason: 'idle_timeout' });
+        expect(events.at(-1).message).toContain('idle');
+        expect(fakeRes.ended).toBe(true);
+        expect(app.ctx.serverConfig.terminal.sessionsForTest().has(TERM_ID)).toBe(false);
+        expect(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'server_config.terminal.close' ORDER BY id DESC LIMIT 1").get().args_redacted).toContain('idle_timeout');
+      } finally { terminalCloseReason = null; }
+    });
   });
 
   describe('Update Preferences', () => {
@@ -459,37 +572,69 @@ describe('Server Configuration API', () => {
       app.ctx.software = undefined;
       try {
         const { body } = await get('/updates').expect(200);
-        expect(body.data).toMatchObject({ tier: 'stable', auto: true, autoOs: false, softwareAvailable: false, panel: null, os: null, schedule: { cron: '23 4 * * 1', enabled: true } });
+        expect(body.data).toMatchObject({ tier: 'stable', auto: true, autoOs: false, softwareAvailable: false, checkAvailable: false, panel: null, os: null, lastCheck: null });
         expect(body.data.tiers.map((t) => t.value)).toEqual(['stable', 'release', 'current', 'edge']);
+        // The schedule shown is Software's daily check, not one of our own.
+        expect(body.data.schedule).toMatchObject({ name: 'os-update-check', owner: 'software', cron: '41 5 * * *' });
+        const res = await post('/updates/check').expect(501);
+        expect(res.body.error).toMatchObject({ code: 'capability_missing', capability: 'pkg' });
       } finally { app.ctx.software = original; }
     });
 
-    it('validates and saves preferences, including the check schedule', async () => {
+    it('validates and saves preferences through the Software category', async () => {
       await put('/updates', {}).expect(422);
       await put('/updates', { tier: 'nightly' }).expect(422);
-      const bad = await put('/updates', { tier: 'edge', cron: 'a b c d e' }).expect(422);
-      expect(bad.body.error.fields.cron).toBeDefined();
+      await put('/updates', { tier: 'edge', cron: '0 6 * * *' }).expect(422);
+      await put('/updates', { scheduleEnabled: false }).expect(422);
       expect(app.ctx.settings.get('updates.tier', 'stable')).toBe('stable');
-      expect(app.ctx.scheduler.list().find((r) => r.name === 'update-preferences-check').cron).toBe('23 4 * * 1');
-      const { body } = await put('/updates', { tier: 'release', auto: false, autoOs: true, cron: '0 6 * * *', scheduleEnabled: false }).expect(200);
-      expect(body.data).toMatchObject({ tier: 'release', auto: false, autoOs: true, schedule: { cron: '0 6 * * *', enabled: false } });
+      const { body } = await put('/updates', { tier: 'release', auto: true, autoOs: true, notifyContact: false }).expect(200);
+      expect(body.data).toMatchObject({ tier: 'release', auto: true, autoOs: true, notifyContact: false });
       expect(app.ctx.settings.get('updates.tier')).toBe('release');
+      expect(app.ctx.settings.get('updates.auto')).toBe(true);
       expect(app.ctx.settings.get('software.updates.auto_os')).toBe(true);
+      expect(body.data.panel).toMatchObject({ tier: 'release', autoUpdate: true });
       expect(auditCount('server_config.updates.set')).toBe(1);
+      expect(auditCount('software.update.auto')).toBe(1);
+      const original = app.ctx.software;
+      const calls = [];
+      app.ctx.software = { ...original, panel: { ...original.panel, setPreferences: async (prefs) => { calls.push(prefs); } } };
+      try {
+        await put('/updates', { tier: 'stable', auto: false }).expect(200);
+        expect(calls).toEqual([{ tier: 'stable', autoUpdate: false }]);
+      } finally { app.ctx.software = original; }
+      await put('/updates', { tier: 'stable', auto: false, autoOs: false, notifyContact: true }).expect(200);
     });
 
-    it('runs the update check as a job using the software category when available', async () => {
+    it('"check now" runs Software\'s own update check job and the panel feed', async () => {
       const original = app.ctx.software;
-      app.ctx.software = { panel: { check: async () => ({ currentVersion: '0.1.0', latest: { version: '0.2.0' }, updateAvailable: true }) }, update: { status: async () => ({ manager: 'apt', count: 4, security: 1, rebootRequired: false }) } };
+      const originalContacts = app.ctx.contacts;
+      const notified = [];
+      app.ctx.contacts = { notify: async (event, payload) => { notified.push({ event, payload }); } };
+      const panelCheck = [];
+      app.ctx.software = { ...original, panel: { ...original.panel, check: async () => { panelCheck.push(1); return { currentVersion: '0.1.0', latest: { version: '0.2.0' }, updateAvailable: true, lastCheck: { at: '2026-10-26T00:00:00.000Z', ok: true, error: null } }; } } };
+      app.ctx.jobs.register('software.update.check', async (job) => { job.log('mock check'); return { count: 4, security: 1 }; });
       app.ctx.settings.set('software.update_url', 'https://updates.example.com/feed.json');
       try {
         const res = await post('/updates/check').expect(202);
+        expect(res.body.data.panel).toMatchObject({ current: '0.1.0', latest: '0.2.0', updateAvailable: true });
+        expect(panelCheck).toHaveLength(1);
         const job = await waitForJob(app.ctx, res.body.data.job.id);
+        expect(job.type).toBe('software.update.check');
         expect(job.status).toBe('done');
-        expect(job.result).toMatchObject({ panel: { current: '0.1.0', latest: '0.2.0', updateAvailable: true }, os: { manager: 'apt', count: 4, security: 1 } });
-        const after = await get('/updates').expect(200);
-        expect(after.body.data.lastCheck.os.count).toBe(4);
-      } finally { app.ctx.software = original; app.ctx.settings.set('software.update_url', ''); }
+        await new Promise((r) => setTimeout(r, 30));
+        expect(notified.map((n) => n.event)).toEqual(['updates.available', 'updates.available']);
+        expect(notified[0].payload.panel).toMatchObject({ updateAvailable: true });
+        expect(notified[1].payload.os).toEqual({ count: 4, security: 1 });
+        expect(auditCount('server_config.updates.check')).toBe(1);
+        expect(app.ctx.jobs.list({ type: 'server_config.update.check' })).toHaveLength(0);
+        // Notifications follow the preference and only fire for security updates.
+        await put('/updates', { notifyContact: false }).expect(200);
+        expect(await app.ctx.serverConfig.updates.afterCheck(1, { count: 2, security: 2 })).toBe(false);
+        await put('/updates', { notifyContact: true }).expect(200);
+        expect(await app.ctx.serverConfig.updates.afterCheck(1, { count: 2, security: 0 })).toBe(false);
+        expect(await app.ctx.serverConfig.updates.afterCheck(1, { skipped: true })).toBe(false);
+        expect(await app.ctx.serverConfig.updates.afterCheck(1, { count: 2, security: 2 })).toBe(true);
+      } finally { app.ctx.software = original; app.ctx.contacts = originalContacts; app.ctx.settings.set('software.update_url', ''); }
     });
   });
 

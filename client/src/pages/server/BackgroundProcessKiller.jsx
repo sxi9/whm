@@ -35,9 +35,10 @@ export function BackgroundProcessKiller() {
     setScanning(true);
     try {
       const res = await api.post('/system-health/bpk/scan', { dryRun });
-      const { run } = res.data;
+      const { run, truncated } = res.data;
       const summary = `${run.scanned} process(es) scanned, ${run.matched} match(es)${dryRun ? '' : `, ${run.killed} killed${run.failed ? `, ${run.failed} failed` : ''}`}`;
       if (dryRun) toast.info(summary); else if (run.matched) toast.success(summary); else toast.info(summary);
+      if (truncated) toast.warning(`The process table was cut at ${run.scanned} entries; processes with higher PIDs were not examined.`);
       refreshAll();
       if (matches) preview();
     } catch (err) { toast.error(err); } finally { setScanning(false); }
@@ -72,8 +73,8 @@ export function BackgroundProcessKiller() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: 18, alignItems: 'start' }}>
         <Card title="Status" actions={<StatusPill status={cfg.enabled ? 'enabled' : 'disabled'}>{cfg.enabled ? 'Enabled' : 'Disabled'}</StatusPill>}>
           <KeyValue items={[
-            ['Schedule', data.schedule ? <><code>{data.schedule.cron}</code> {data.schedule.enabled ? '' : <span className="muted">(paused: {PAUSED_LABEL[data.schedule.paused] || 'nothing to do'})</span>}</> : 'not registered'],
-            ['Next scheduled run', data.schedule?.enabled ? formatDate(data.schedule.nextRunAt) : '—'],
+            ['Schedule', data.schedule ? <><code>{data.schedule.cron}</code> {data.schedule.enabled && !data.schedule.paused ? '' : <span className="muted">(paused: {PAUSED_LABEL[data.schedule.paused] || 'turned off in Configure cPanel Cron Jobs'})</span>}</> : 'not registered'],
+            ['Next scheduled run', data.schedule?.enabled && !data.schedule.paused ? formatDate(data.schedule.nextRunAt) : '—'],
             ['Last run', run ? <>{formatDate(run.finished_at || run.started_at)} <span className="muted">({run.trigger}{run.dry_run ? ', dry run' : ''})</span></> : 'never'],
             ['Last result', run ? (run.error ? <StatusPill status="failed">{run.error}</StatusPill> : `${run.scanned} scanned, ${run.matched} matched, ${run.killed} killed${run.failed ? `, ${run.failed} failed` : ''}`) : '—'],
             ['Enabled names', armed ? `${armed} of ${data.patterns.length}` : <span className="muted">none (nothing is killed)</span>],
@@ -93,6 +94,7 @@ export function BackgroundProcessKiller() {
       {(matches || matchesError) && (
         <Card title="Processes that match right now" subtitle={matches ? `${matches.scanned} process(es) scanned against ${matches.patterns.length} enabled name(s); scope: ${matches.scope === 'accounts' ? 'panel accounts only' : 'every non-root user'}` : undefined} actions={<Button size="sm" onClick={preview}>Refresh</Button>} padded={false}>
           {matchesError && <div className="card-body"><CapabilityNotice error={matchesError} onRetry={preview} />{matchesError.status !== 501 && <ErrorBanner error={matchesError} onRetry={preview} />}</div>}
+          {matches?.truncated && <div className="banner banner-warning" style={{ margin: 12 }}><ShieldAlert size={18} /><div>The process table was cut at {matches.limit} entries, so processes with higher PIDs were not examined. Scans on this host are partial until the process count drops.</div></div>}
           {matches && (
             <DataTable dense rows={matches.matches} rowKey={(m) => m.pid} emptyText="No disallowed processes are running."
               columns={[
@@ -138,7 +140,7 @@ function Settings({ config, signals, scopes, onSaved }) {
   };
 
   return (
-    <Card title="Settings" subtitle="The scheduled scan runs every 10 minutes while enabled; tune the schedule in Configure cPanel Cron Jobs.">
+    <Card title="Settings" subtitle="Turning the scheduled scan on or off here pauses or resumes its schedule; the cron expression (every 10 minutes by default) can be tuned in Configure cPanel Cron Jobs, where it can also be paused independently.">
       <Field inline><Toggle checked={draft.enabled} onChange={(v) => set('enabled', v)} label="Enable the scheduled scan" description="When off, nothing is killed automatically; manual scans still work." /></Field>
       <Field label="Signal" help="SIGKILL cannot be caught or ignored; SIGTERM lets a process clean up.">
         <Select value={draft.signal} onChange={(v) => set('signal', v)} options={signals} />

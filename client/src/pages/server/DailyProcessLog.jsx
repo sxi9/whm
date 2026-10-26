@@ -9,16 +9,18 @@ import { useToast } from '../../components/Toast.jsx';
 import { RequestError, Tabs } from '../security/Shared.jsx';
 
 const SERIES = {
-  cpu: { label: 'CPU % (all processes)', key: 'cpuPercent', color: 'var(--primary)', unit: '%' },
+  cpu: { label: 'CPU % (sum of ps %CPU, lifetime average per process)', key: 'cpuPercent', color: 'var(--primary)', unit: '%' },
   mem: { label: 'Memory % (all processes)', key: 'memPercent', color: 'var(--warn)', unit: '%' },
   load: { label: 'Load average (1 min)', key: 'load1', color: 'var(--ok)', unit: '' },
-  userCpu: { label: 'CPU % (selected user)', key: 'userCpuPercent', color: 'var(--info)', unit: '%' },
+  userCpu: { label: 'CPU % (selected user, ps %CPU)', key: 'userCpuPercent', color: 'var(--info)', unit: '%' },
   userMem: { label: 'Memory % (selected user)', key: 'userMemPercent', color: 'var(--bad)', unit: '%' },
 };
 
+// Days are keyed by UTC date on the server, so times render in UTC too; a
+// local-time clock would spill a day's samples into its neighbours.
 function timeOf(at) {
   const d = new Date(at.replace(' ', 'T') + 'Z');
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
 }
 
 // A dependency-free line chart: time on the x-axis, one line per metric, with a
@@ -65,14 +67,20 @@ function DayChart({ series, metrics }) {
   );
 }
 
-function SettingsCard({ settings, onSaved }) {
+function SettingsCard({ settings, days, onSaved }) {
   const toast = useToast();
+  const confirm = useConfirm();
   const [form, setForm] = useState(settings);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   useEffect(() => setForm(settings), [settings]);
   const dirty = form && settings && ['enabled', 'topN', 'retentionDays'].some((k) => form[k] !== settings[k]);
   const save = async () => {
+    if (form.retentionDays < settings.retentionDays) {
+      const cutoff = new Date(Date.now() - form.retentionDays * 86_400_000).toISOString().slice(0, 10);
+      const doomed = (days || []).filter((d) => d.day < cutoff);
+      if (doomed.length && !(await confirm({ title: `Delete ${doomed.length} day${doomed.length === 1 ? '' : 's'} of process history?`, message: `Lowering retention to ${form.retentionDays} days removes every day before ${cutoff} (${doomed.reduce((n, d) => n + d.samples, 0)} samples) as soon as you save. This cannot be undone.`, confirmLabel: 'Save and delete', danger: true }))) return;
+    }
     setBusy(true); setError(null);
     try {
       const { data } = await api.put('/server-status/process-log/settings', { enabled: form.enabled, topN: form.topN, retentionDays: form.retentionDays });
@@ -84,10 +92,13 @@ function SettingsCard({ settings, onSaved }) {
   return (
     <Card title="Sampler" subtitle={settings.schedule ? `${settings.schedule.cron} · next run ${settings.schedule.nextRunAt ? formatDate(settings.schedule.nextRunAt) : '—'}` : 'Schedule not registered'}>
       <ErrorBanner error={error} />
-      <Toggle checked={form.enabled} onChange={(v) => setForm({ ...form, enabled: v })} label="Record processes every 5 minutes" description="Also tunable under Server Configuration > Configure cPanel Cron Jobs (process-log-sampler)." />
+      <Toggle checked={form.enabled} onChange={(v) => setForm({ ...form, enabled: v })} label="Record processes every 5 minutes" description="This switch is authoritative; the process-log-sampler schedule under Server Configuration > Configure cPanel Cron Jobs follows it, and scheduled runs record nothing while it is off." />
+      {settings.schedule && settings.schedule.enabled !== settings.enabled && (
+        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>The process-log-sampler schedule is currently {settings.schedule.enabled ? 'enabled' : 'paused'} in Configure cPanel Cron Jobs; it is realigned to this setting on the next save or panel restart.</div>
+      )}
       <div className="form-grid" style={{ marginTop: 12 }}>
         <Field label="Processes per sample" help="Top N by CPU plus top N by memory, de-duplicated."><NumberInput value={form.topN} onChange={(v) => setForm({ ...form, topN: v })} min={1} max={200} nullable={false} /></Field>
-        <Field label="Retention (days)" help="Older days are removed after each sample."><NumberInput value={form.retentionDays} onChange={(v) => setForm({ ...form, retentionDays: v })} min={1} max={90} nullable={false} /></Field>
+        <Field label="Retention (days)" help="Older days are removed after each sample and immediately when you lower this value."><NumberInput value={form.retentionDays} onChange={(v) => setForm({ ...form, retentionDays: v })} min={1} max={90} nullable={false} /></Field>
       </div>
       <FormActions><Button variant="primary" loading={busy} disabled={!dirty} onClick={save}>Save</Button></FormActions>
     </Card>
@@ -135,7 +146,7 @@ export default function DailyProcessLog({ fn }) {
   const users = day.data?.users || [];
   return (
     <>
-      <PageHeader fn={fn} description="Every 5 minutes the panel records the busiest processes by CPU and memory. Pick a day to see how the load developed, which programs and which users caused it." actions={<>
+      <PageHeader fn={fn} description="Every 5 minutes the panel records the busiest processes by CPU and memory. Pick a day (UTC) to see how the load developed, which programs and which users caused it. CPU figures are the %CPU column of ps: each process's lifetime average, summed, not an instantaneous reading." actions={<>
         <Button loading={sampling} onClick={sampleNow}>Sample now</Button>
         <button className="btn" onClick={() => { days.refetch(); day.refetch(); }}>Refresh</button>
       </>} />
@@ -158,9 +169,9 @@ export default function DailyProcessLog({ fn }) {
               </div>
               {selected && (
                 <div className="stat-grid">
-                  <div className="stat"><div className="label">Samples</div><div className="value">{selected.samples}</div><small className="muted">{selected.firstAt ? `${timeOf(selected.firstAt)} – ${timeOf(selected.lastAt)}` : ''}</small></div>
+                  <div className="stat"><div className="label">Samples</div><div className="value">{selected.samples}</div><small className="muted">{selected.firstAt ? `${timeOf(selected.firstAt)} – ${timeOf(selected.lastAt)} UTC` : ''}</small></div>
                   <div className="stat"><div className="label">Peak load (1 min)</div><div className="value">{selected.peakLoad1 == null ? '—' : selected.peakLoad1.toFixed(2)}</div><small className="muted">average {selected.avgLoad1 == null ? '—' : selected.avgLoad1.toFixed(2)}</small></div>
-                  <div className="stat"><div className="label">Peak CPU</div><div className="value">{selected.peakCpu == null ? '—' : `${selected.peakCpu.toFixed(1)}%`}</div><small className="muted">average {selected.avgCpu == null ? '—' : `${selected.avgCpu.toFixed(1)}%`}</small></div>
+                  <div className="stat"><div className="label">Peak CPU (ps %CPU)</div><div className="value">{selected.peakCpu == null ? '—' : `${selected.peakCpu.toFixed(1)}%`}</div><small className="muted">average {selected.avgCpu == null ? '—' : `${selected.avgCpu.toFixed(1)}%`}</small></div>
                   <div className="stat"><div className="label">Peak memory</div><div className="value">{selected.peakMem == null ? '—' : `${selected.peakMem.toFixed(1)}%`}</div><small className="muted">sum of process RSS shares</small></div>
                 </div>
               )}
@@ -211,7 +222,7 @@ export default function DailyProcessLog({ fn }) {
                 {tab === 'samples' && (
                   <DataTable
                     columns={[
-                      { key: 'at', label: 'Time', render: (s) => timeOf(s.at) },
+                      { key: 'at', label: 'Time (UTC)', render: (s) => timeOf(s.at) },
                       { key: 'load1', label: 'Load 1 / 5 / 15', render: (s) => [s.load1, s.load5, s.load15].map((n) => (n == null ? '—' : n.toFixed(2))).join(' / ') },
                       { key: 'cpuPercent', label: 'CPU %', align: 'right', render: (s) => s.cpuPercent.toFixed(1) },
                       { key: 'memPercent', label: 'Mem %', align: 'right', render: (s) => s.memPercent.toFixed(1) },
@@ -227,7 +238,7 @@ export default function DailyProcessLog({ fn }) {
               <div className="action-row"><Button variant="danger" onClick={purge}>Delete this day's log</Button></div>
             </>
           )}
-          <SettingsCard settings={days.data.settings} onSaved={() => days.refetch(true)} />
+          <SettingsCard settings={days.data.settings} days={available} onSaved={() => days.refetch(true)} />
         </>
       )}
       <Modal open={Boolean(open)} title={open ? `Sample at ${formatDate(open.at)}` : ''} onClose={() => setOpen(null)} size="lg">

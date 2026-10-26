@@ -44,13 +44,25 @@ export async function register(ctx) {
   const s = ctx.serverConfig;
   for (const [type, handler] of Object.entries(s.jobs)) ctx.jobs.register(type, handler);
   for (const sch of s.schedules) ctx.scheduler.ensure(sch.name, sch.cron, sch.jobType);
-  s.stats.alignSchedule();
+  await s.stats.alignSchedule().catch((err) => ctx.logger.warn({ err }, 'stats schedule alignment failed'));
+  // Update checks are Software's job; the contact notification for security
+  // updates is the only part owned here, so it follows every run of that job.
+  ctx.jobs.onAny((event) => {
+    if (event.type !== 'done') return;
+    let job = null;
+    try { job = ctx.jobs.get(event.jobId); } catch { return; }
+    if (job?.type === s.softwareCheckJob) ctx.serverConfig.updates.afterCheck(event.jobId, event.result).catch((err) => ctx.logger.warn({ err }, 'update notification failed'));
+  });
   ctx.capabilities.register('terminal', { binaries: ['script', 'bash'], required: ['script'] });
   ctx.capabilities.register('timedatectl', { binaries: ['timedatectl'], required: ['timedatectl'] });
+  // Shared with Account Information (same required set, so registration order
+  // does not matter); enabling quotas checks the scanning tools itself.
+  ctx.capabilities.register('quota', { binaries: ['setquota', 'repquota', 'quotacheck', 'quotaon', 'quotaoff'], required: ['repquota', 'setquota'] });
 
   const svc = () => ctx.serverConfig;
   const r = Router();
-  const wrap = (fn, status = 200) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(status).json(d?.meta ? d : { data: d })).catch(next);
+  const wrap = (fn, status = 200) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(typeof status === 'function' ? status(d) : status).json(d?.meta ? d : { data: d })).catch(next);
+  const jobOr200 = (d) => (d?.job ? 202 : 200);
 
   // Server Profile
   r.get('/profile', requireRoot, wrap(() => svc().profile.get()));
@@ -69,7 +81,7 @@ export async function register(ctx) {
   r.get('/quota', requireRoot, wrap(() => svc().quota.status()));
   r.post('/quota/enable', requireRoot, validate({ body: z.object({ mountpoint: fields.absPath, groupQuota: z.boolean().default(true), updateFstab: z.boolean().default(false) }).strict() }), wrap((req) => svc().quota.enable(req.body, req.user, req), 202));
   r.post('/quota/disable', requireRoot, validate({ body: z.object({ mountpoint: fields.absPath }).strict() }), wrap((req) => svc().quota.disable(req.body, req)));
-  r.post('/quota/install-tools', requireRoot, wrap((req) => svc().quota.installTools(req.user, req), 202));
+  r.post('/quota/install-tools', requireRoot, wrap((req) => svc().quota.installTools(req.user, req), jobOr200));
 
   // Link Server Nodes
   r.get('/nodes', requireRoot, wrap(() => svc().nodes.list()));
@@ -92,7 +104,7 @@ export async function register(ctx) {
 
   // Update Preferences
   r.get('/updates', requireRoot, wrap(() => svc().updates.get()));
-  r.put('/updates', requireRoot, validate({ body: nonEmpty(z.object({ tier: z.enum(UPDATE_TIERS).optional(), auto: z.boolean().optional(), autoOs: z.boolean().optional(), notifyContact: z.boolean().optional(), cron: cron.optional(), scheduleEnabled: z.boolean().optional() }).strict()) }), wrap((req) => svc().updates.update(req.body, req)));
+  r.put('/updates', requireRoot, validate({ body: nonEmpty(z.object({ tier: z.enum(UPDATE_TIERS).optional(), auto: z.boolean().optional(), autoOs: z.boolean().optional(), notifyContact: z.boolean().optional() }).strict()) }), wrap((req) => svc().updates.update(req.body, req)));
   r.post('/updates/check', requireRoot, wrap((req) => svc().updates.check(req.user, req), 202));
 
   // WHM Marketplace (static catalog until Phase 5)

@@ -38,6 +38,9 @@ export async function register(ctx) {
   const wrap = (fn, status = 200) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(status).json(d?.meta ? d : { data: d })).catch(next);
   const svc = () => ctx.multiAccount;
 
+  // The selection table and run history are deliberately unpaginated: the page
+  // selects across the whole visible set (bounded by multi_account.max_batch)
+  // and the history is capped by `limit`; meta carries total/all/filters instead.
   r.get('/accounts', requireReseller, validate({ query: listQuery }), wrap((req) => svc().listAccounts(req.query, req.user)));
   r.get('/capabilities', requireReseller, wrap(() => svc().capabilities()));
 

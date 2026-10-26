@@ -184,12 +184,13 @@ export function parseUserdataMain(text) {
 }
 
 // Rewrites a source address inside zone text only where it stands as a whole
-// token, so 10.0.0.1 never touches 10.0.0.10 or 110.0.0.1.
+// token, so 10.0.0.1 never touches 10.0.0.10, 110.0.0.1 or 2001:db8::1:2; a
+// preceding ":" is allowed so SPF "ip4:…" / "ip6:…" terms follow the move.
 export function rewriteZoneAddresses(text, from, to) {
   let body = text;
   for (const ip of from) {
     if (!ip || ip === to) continue;
-    body = body.replace(new RegExp(`(?<![0-9A-Fa-f.:])${ip.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![0-9A-Fa-f.:])`, 'g'), to);
+    body = body.replace(new RegExp(`(?<![0-9A-Fa-f.])${ip.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![0-9A-Fa-f.:])`, 'g'), to);
   }
   return body;
 }
@@ -1097,7 +1098,7 @@ export function createTransfersService(ctx) {
     for (const d of stmts.domainsOfAccount.all(addon.account_id)) {
       if (moving.has(d.id)) continue;
       const other = d.docroot || `${addon.home_dir}/public_html/${d.domain}`;
-      if (sameOrInside(other, docroot) || sameOrInside(docroot, other)) return `${d.domain} (${d.type}) of ${addon.username} is served from ${other}, inside the files to delete; keep the source files`;
+      if (sameOrInside(other, docroot)) return `${d.domain} (${d.type}) of ${addon.username} is served from ${other}, inside the files to delete; keep the source files`;
     }
     return null;
   }
@@ -1154,8 +1155,6 @@ export function createTransfersService(ctx) {
     if (!isRoot(user) && row.owner_id !== user.id) throw forbidden('That addon domain belongs to another reseller\'s account');
     const oldAccount = stmts.accountById.get(row.account_id);
     const docroot = row.docroot || addon.docroot;
-    // Re-checked against the rows as they are now, not the preview's snapshot.
-    const keepSource = options.removeSource ? removeSourceIssue(row, docroot) : null;
     const removedRows = [row, ...stmts.linkedSubs.all(row.account_id, docroot)].map((d) => ({ id: d.id, account_id: row.account_id, domain: d.domain, type: d.type, docroot: d.docroot ?? null, php_version: d.php_version ?? null, created_at: d.created_at }));
 
     // The domain must leave account_domains before the new account can claim
@@ -1224,6 +1223,9 @@ export function createTransfersService(ctx) {
       return r.reason === 'capability_missing' ? { status: 'pending', detail: 'Apache is not installed' } : { status: 'failed', detail: r.reason || 'vhost not applied' };
     });
 
+    // Re-checked against the rows as they are now (the moved domain and its
+    // linked subdomains are gone), not against the preview's snapshot.
+    const keepSource = options.removeSource ? removeSourceIssue(row, docroot) : null;
     if (options.removeSource && keepSource) steps.cleanup = { status: 'skipped', detail: `source files kept: ${keepSource}` };
     else if (options.removeSource && steps.files.status === 'applied') {
       steps.cleanup = await step(async () => { await agent.op('fs.remove', { path: docroot, recursive: true }, { req }); return { detail: `${docroot} removed from ${oldAccount.username}` }; });

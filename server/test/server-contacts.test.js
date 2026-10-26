@@ -4,8 +4,8 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { normalizeNotification, validateAddress, maskAddress, createServerContactsService, EVENTS } from '../src/services/server-contacts.js';
-import { buildMessage, dotStuff, sendSmtp } from '../src/services/server-contacts-smtp.js';
+import { normalizeNotification, validateAddress, maskAddress, isPrivateAddress, createServerContactsService, EVENTS } from '../src/services/server-contacts.js';
+import { buildMessage, dotStuff, sendSmtp, isLoopbackHost } from '../src/services/server-contacts-smtp.js';
 
 // A tiny SMTP server that records the session so the relay path is exercised
 // for real (greeting, EHLO, AUTH PLAIN, envelope, DATA).
@@ -109,6 +109,22 @@ describe('server contacts helpers', () => {
     await expect(sendSmtp({ host: '127.0.0.1', port: 1, from: '-r@example.com', to: ['a@example.com'], message: 'x' })).rejects.toMatchObject({ code: 'invalid_address' });
     await expect(sendSmtp({ host: '127.0.0.1', port: 1, from: 'a@example.com', to: ['b@example.com'], message: 'x', security: 'weird' })).rejects.toMatchObject({ code: 'invalid_args' });
   });
+
+  it('refuses to authenticate over a plain connection unless the relay is loopback or the admin allowed it', async () => {
+    const base = { port: 25, security: 'none', username: 'relay', password: 'pw', from: 'a@example.com', to: ['b@example.com'], message: 'x' };
+    await expect(sendSmtp({ ...base, host: 'relay.example.net' })).rejects.toMatchObject({ code: 'plaintext_auth_refused' });
+    await expect(sendSmtp({ ...base, host: '192.0.2.10' })).rejects.toMatchObject({ code: 'plaintext_auth_refused' });
+    expect(isLoopbackHost('127.0.0.1')).toBe(true);
+    expect(isLoopbackHost('localhost')).toBe(true);
+    expect(isLoopbackHost('::1')).toBe(true);
+    expect(isLoopbackHost('relay.example.net')).toBe(false);
+    expect(isLoopbackHost('10.0.0.1')).toBe(false);
+  });
+
+  it('classifies loopback, link-local, private and mapped addresses as private webhook targets', () => {
+    for (const a of ['127.0.0.1', '127.9.9.9', '10.1.2.3', '172.16.0.1', '172.31.255.255', '192.168.1.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '::1', '::', 'fe80::1', 'fd00::1', '::ffff:127.0.0.1', '::ffff:10.0.0.1', '[::1]']) expect(isPrivateAddress(a), a).toBe(true);
+    for (const a of ['8.8.8.8', '93.184.216.34', '172.32.0.1', '2606:4700::1111', 'example.com', '']) expect(isPrivateAddress(a), a).toBe(false);
+  });
 });
 
 describe('Server Contacts API', () => {
@@ -147,10 +163,13 @@ describe('Server Contacts API', () => {
       'svc.status': ({ unit }) => ({ unit, installed: true, active: unitState[unit] !== 'inactive', state: unitState[unit] || 'active', subState: unitState[unit] === 'inactive' ? 'dead' : 'running', enabled: true, pid: 100, memoryBytes: 1024, restarts: 0 }),
       'sys.disk.usage': () => disks,
       'mail.sendmail': (args) => { sentViaExim.push(args); return { from: args.from, to: args.to, accepted: true, bytes: 100 }; },
-      'contacts.aliases.read': () => ({ path: '/etc/aliases', exists: aliases.exists, root: aliases.root, managed: false, entries: aliases.entries, raw: '', rebuildTool: 'exim' }),
-      'contacts.aliases.set_root': ({ targets }) => { aliasWrites.push(targets); aliases.root = targets; return { path: '/etc/aliases', root: targets, rebuild: { tool: 'newaliases', ran: true, ok: true, output: '' } }; },
+      'contacts.aliases.read': () => ({ path: '/etc/aliases', exists: aliases.exists, root: aliases.root, users: { root: aliases.root, nobody: aliases.users?.nobody || [] }, managed: false, entries: aliases.entries, raw: '', rebuildTool: 'exim' }),
+      'contacts.aliases.set_root': ({ targets }) => { aliasWrites.push(targets); aliases.root = targets; return { path: '/etc/aliases', user: 'root', targets, root: targets, rebuild: { tool: 'newaliases', ran: true, ok: true, output: '' } }; },
+      'contacts.aliases.set': ({ user, targets }) => { aliasWrites.push([user, targets]); aliases.users = { ...(aliases.users || {}), [user]: targets }; if (user === 'root') aliases.root = targets; return { path: '/etc/aliases', user, targets, root: aliases.root, rebuild: { tool: 'newaliases', ran: true, ok: true, output: '' } }; },
+      'contacts.exim.primary_hostname': () => ({ installed: eximInstalled, hostname: eximInstalled ? 'mx.example.org' : null }),
     });
     app = await createTestApp({ agent });
+    app.ctx.jobs.start();
     csrf = await app.login();
     const r = await app.createUser('resell1', 'reseller');
     reseller = request.agent(app.ctx.app);
@@ -174,8 +193,17 @@ describe('Server Contacts API', () => {
     hook.setStatus(200);
     await app.ctx.capabilities.refresh();
     clearContacts();
-    app.ctx.settings.setMany({ 'contacts.enabled': true, 'contacts.smtp.host': '', 'contacts.smtp.prefer': false, 'contacts.smtp.username': '', 'contacts.smtp.password_enc': '', 'contacts.from_address': '', 'contacts.check.enabled': true, 'contacts.root_mail_events': ['service.down', 'disk.space.low', 'backup.failed'], 'contacts.root_forward': [] });
+    app.ctx.settings.setMany({ 'contacts.enabled': true, 'contacts.smtp.host': '', 'contacts.smtp.prefer': false, 'contacts.smtp.username': '', 'contacts.smtp.password_enc': '', 'contacts.smtp.allow_plaintext_auth': false, 'contacts.from_address': '', 'contacts.check.enabled': true, 'contacts.root_mail_events': ['service.down', 'disk.space.low', 'backup.failed'], 'contacts.root_forward': [], 'contacts.nobody_forward': [], 'contacts.webhook.allow_private': true });
   });
+
+  // "Run checks now" is a job: 202 { job }, then the result once it finishes.
+  const runCheck = async () => {
+    const res = await post('/api/server-contacts/check').expect(202);
+    expect(res.body.data.job).toMatchObject({ type: 'server-contacts.check', params: { manual: true } });
+    const job = await waitForJob(app.ctx, res.body.data.job.id);
+    if (job.status !== 'done') throw new Error(`check job ${job.status}: ${job.error}`);
+    return { body: { data: job.result } };
+  };
 
   it('registers the module: ctx.contacts, job type, schedule and the integration surface', () => {
     expect(typeof app.ctx.contacts.notify).toBe('function');
@@ -205,6 +233,19 @@ describe('Server Contacts API', () => {
     const all = await post('/api/server-contacts/contacts', { channel: 'webhook', address: `http://127.0.0.1:${hookPort}/hook`, config: { secret: 'shh' } }).expect(201);
     expect(all.body.data).toMatchObject({ name: `http://127.0.0.1:${hookPort}/hook`, events: ['*'], allEvents: true, minSeverity: 'info', config: { secret: { set: true } } });
     expect(app.ctx.db.prepare('SELECT config_json FROM contacts WHERE id = ?').get(all.body.data.id).config_json).toMatch(/"secret_enc":"v1:/);
+    // A stored signing secret is kept when the field is absent, replaced when set, and removed by null or a blank (whitespace-only) value.
+    expect((await patch(`/api/server-contacts/contacts/${all.body.data.id}`, { name: 'Hook' }).expect(200)).body.data.config).toEqual({ secret: { set: true } });
+    expect((await patch(`/api/server-contacts/contacts/${all.body.data.id}`, { config: { secret: '   ' } }).expect(200)).body.data.config).toEqual({});
+    expect(app.ctx.db.prepare('SELECT config_json FROM contacts WHERE id = ?').get(all.body.data.id).config_json).not.toContain('secret_enc');
+    expect((await patch(`/api/server-contacts/contacts/${all.body.data.id}`, { config: { secret: 'again' } }).expect(200)).body.data.config).toEqual({ secret: { set: true } });
+    expect((await patch(`/api/server-contacts/contacts/${all.body.data.id}`, { config: { secret: null } }).expect(200)).body.data.config).toEqual({});
+    const listed = (await get('/api/server-contacts/contacts').expect(200)).body.data;
+    expect(listed.map((c) => c.id).sort()).toEqual([id, all.body.data.id].sort());
+    const catalog = (await get('/api/server-contacts/events').expect(200)).body.data;
+    expect(catalog.map((e) => e.key)).toEqual(EVENTS.map((e) => e.key));
+    expect(catalog.find((e) => e.key === 'backup.failed').wired).toBe(true);
+    expect(catalog.find((e) => e.key === 'account.rearrange').wired).toBe(true);
+    expect(catalog.filter((e) => !e.wired).map((e) => e.key)).toEqual(expect.arrayContaining(['account.created', 'backup.completed', 'license.expiring']));
 
     await post('/api/server-contacts/contacts', { channel: 'slack', address: 'https://example.com/not-slack' }).expect(422);
     await post('/api/server-contacts/contacts', { channel: 'pushover', address: 'u'.repeat(30) }).expect(422);
@@ -344,6 +385,7 @@ describe('Server Contacts API', () => {
     const r3 = await app.ctx.contacts.notify('updates.available', { packages: 4 });
     expect(r3).toMatchObject({ event: 'updates.available', matched: 1, sent: 0, failed: 1 });
     expect(r3.deliveries[0].error).toMatch(/answered 500/);
+    expect(r3.deliveries[0].error).not.toContain('{"ok":true}');
 
     app.ctx.settings.set('contacts.enabled', false);
     expect(await app.ctx.contacts.notify({ event: 'account.created', subject: 'x' })).toMatchObject({ skipped: 'disabled', sent: 0 });
@@ -388,13 +430,15 @@ describe('Server Contacts API', () => {
     expect(rootTest.body.data).toMatchObject({ status: 'sent', transport: 'smtp', to: ['admin@example.net', 'second@example.org'] });
     expect(smtp.sessions.at(-1).data).toContain('Subject: [panel.example.com] Test message for root');
 
+    // A relay with nothing to forward to is a configuration state the Mail Preferences page reports; it is not a failed delivery per event.
     app.ctx.settings.set('contacts.root_forward', ['oncall']);
     const sessionsBefore = smtp.sessions.length;
+    const failedBefore = (await get('/api/server-contacts/deliveries?status=failed').expect(200)).body.meta.total;
     const r2 = await app.ctx.contacts.notify({ event: 'service.down', subject: 'still down', body: 'dead', severity: 'error' });
-    expect(r2).toMatchObject({ matched: 1, sent: 1, failed: 1 });
-    expect(r2.deliveries.find((d) => d.contactId === null)).toMatchObject({ address: 'root@panel.example.com', status: 'failed', code: 'no_root_recipients', error: expect.stringMatching(/local account oncall/) });
+    expect(r2).toMatchObject({ matched: 1, sent: 1, failed: 0, rootMail: { skipped: true, reason: expect.stringMatching(/local account oncall/) } });
+    expect(r2.deliveries.find((d) => d.contactId === null)).toBeUndefined();
     expect(smtp.sessions).toHaveLength(sessionsBefore + 1);
-    expect((await get('/api/server-contacts/deliveries?status=failed').expect(200)).body.data[0]).toMatchObject({ contact_name: 'root (system mail)', address: 'root@panel.example.com' });
+    expect((await get('/api/server-contacts/deliveries?status=failed').expect(200)).body.meta.total).toBe(failedBefore);
     app.ctx.settings.set('contacts.root_forward', []);
     prefs = (await get('/api/server-contacts/mail-preferences').expect(200)).body.data;
     expect(prefs.rootDelivery).toMatchObject({ transport: 'smtp', to: [], skipped: [], error: expect.stringMatching(/none are set/) });
@@ -429,6 +473,10 @@ describe('Server Contacts API', () => {
     // With Exim the host's /etc/aliases does the forwarding, so root mail stays addressed to root@<fqdn> whatever the saved list says.
     app.ctx.settings.set('contacts.root_forward', ['admin@example.net']);
     expect((await get('/api/server-contacts/mail-preferences').expect(200)).body.data.rootDelivery).toEqual({ transport: 'exim', rootAddress: 'root@panel.example.com', to: ['root@panel.example.com'], skipped: [], error: null });
+    // A bare panel hostname falls back to Exim's primary_hostname (a local domain) rather than a .localdomain name Exim would route to DNS.
+    app.ctx.settings.set('basic.hostname', 'bare-host');
+    expect((await get('/api/server-contacts/mail-preferences').expect(200)).body.data.rootAddress).toBe('root@mx.example.org');
+    app.ctx.settings.set('basic.hostname', 'panel.example.com');
     const rootViaExim = await app.ctx.contacts.notify({ event: 'backup.failed', subject: 'Nightly backup failed', body: 'disk full', severity: 'error' });
     expect(rootViaExim.deliveries.find((d) => d.contactId === null)).toMatchObject({ address: 'root@panel.example.com', status: 'sent', transport: 'exim' });
     expect(sentViaExim.at(-1)).toMatchObject({ to: ['root@panel.example.com'], subject: '[panel.example.com] Nightly backup failed' });
@@ -467,78 +515,131 @@ describe('Server Contacts API', () => {
     await app.ctx.capabilities.refresh();
     await post('/api/server-contacts/contacts', { name: 'Hook', channel: 'webhook', address: `http://127.0.0.1:${hookPort}/check` }).expect(201);
 
-    let res = await post('/api/server-contacts/check').expect(200);
+    let res = await runCheck();
     expect(res.body.data.services).toMatchObject({ down: ['exim'], restored: [] });
     expect(res.body.data.services.checked).toBeGreaterThanOrEqual(3);
     expect(res.body.data.disks).toMatchObject({ checked: 1, low: [] });
     expect(res.body.data.notifications).toEqual([{ event: 'service.down', subject: 'Mail Server (Exim) is down on panel.example.com', sent: 1, failed: 0 }]);
+    expect(res.body.data.ssl).toEqual({ expiring: [] });
     expect(hook.received[0].body).toMatchObject({ event: 'service.down', severity: 'error' });
     expect(hook.received[0].body.body).toMatch(/unit exim4.*inactive\/dead/);
     expect(app.ctx.db.prepare('SELECT * FROM contact_alert_state').all()).toEqual([expect.objectContaining({ key: 'service:exim', state: 'down' })]);
 
-    res = await post('/api/server-contacts/check').expect(200);
+    res = await runCheck();
     expect(res.body.data.services.down).toEqual(['exim']);
     expect(res.body.data.notifications).toEqual([]);
     expect(hook.received).toHaveLength(1);
 
     unitState = {};
     disks = [{ filesystem: '/dev/sda1', sizeBytes: 100e9, usedBytes: 95e9, availableBytes: 5e9, usedPercent: 95, mountpoint: '/' }, { filesystem: '/dev/sdb1', sizeBytes: 100e9, usedBytes: 10e9, availableBytes: 90e9, usedPercent: 10, mountpoint: '/home' }];
-    res = await post('/api/server-contacts/check').expect(200);
+    res = await runCheck();
     expect(res.body.data.services).toMatchObject({ down: [], restored: ['exim'] });
     expect(res.body.data.disks.low).toEqual([{ mountpoint: '/', usedPercent: 95 }]);
     expect(res.body.data.notifications.map((n) => n.event)).toEqual(['service.restored', 'disk.space.low']);
     expect(hook.received.at(-1).body).toMatchObject({ event: 'disk.space.low', severity: 'warning', subject: '/ is 95% full on panel.example.com' });
     expect(app.ctx.db.prepare('SELECT key FROM contact_alert_state').all()).toEqual([{ key: 'disk:/' }]);
 
-    res = await post('/api/server-contacts/check').expect(200);
+    res = await runCheck();
     expect(res.body.data.notifications).toEqual([]);
     app.ctx.db.prepare("UPDATE contact_alert_state SET last_notified_at = datetime('now', '-7 hours')").run();
-    res = await post('/api/server-contacts/check').expect(200);
+    res = await runCheck();
     expect(res.body.data.notifications.map((n) => n.event)).toEqual(['disk.space.low']);
     disks[0].usedPercent = 50;
-    await post('/api/server-contacts/check').expect(200);
+    await runCheck();
     expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM contact_alert_state').get().n).toBe(0);
     const cfg = (await get('/api/server-contacts/settings').expect(200)).body.data.check;
     expect(cfg.lastRunAt).toBeTruthy();
     expect(cfg.lastResult).toMatchObject({ disks: { low: [] } });
   });
 
-  it('notifies about installed certificates that are about to expire', async () => {
+  it('notifies about installed vhost and service certificates that are about to expire (ISO not_after, cutoff day included)', async () => {
     await post('/api/server-contacts/contacts', { name: 'Hook', channel: 'webhook', address: `http://127.0.0.1:${hookPort}/ssl` }).expect(201);
-    app.ctx.db.prepare("INSERT INTO ssl_certs (domain, installed, not_after) VALUES ('soon.example.com', 1, datetime('now', '+5 days')), ('later.example.com', 1, datetime('now', '+60 days')), ('old.example.com', 0, datetime('now', '+1 day'))").run();
+    const iso = (days) => new Date(Date.now() + days * 86_400_000).toISOString();
+    // not_after is stored the way ssl-tls writes it (ISO 8601 with "T"), including one on the cutoff day itself.
+    app.ctx.db.prepare('INSERT INTO ssl_certs (domain, installed, not_after) VALUES (?, 1, ?), (?, 1, ?), (?, 1, ?), (?, 0, ?)').run('soon.example.com', iso(5), 'edge.example.com', iso(13.9), 'later.example.com', iso(60), 'old.example.com', iso(1));
+    app.ctx.db.prepare("INSERT INTO ssl_service_certs (service, cert_pem, not_after) VALUES ('exim', '-----BEGIN CERTIFICATE-----', ?), ('dovecot', '-----BEGIN CERTIFICATE-----', ?), ('ftp', NULL, ?)").run(iso(2), iso(45), iso(1));
     try {
-      const res = await post('/api/server-contacts/check').expect(200);
-      expect(res.body.data.ssl.expiring.map((c) => c.domain)).toEqual(['soon.example.com']);
-      expect(res.body.data.ssl.expiring[0].daysRemaining).toBeGreaterThanOrEqual(4);
-      expect(res.body.data.notifications).toEqual([expect.objectContaining({ event: 'ssl.expiring', sent: 1 })]);
-      expect(hook.received[0].body.subject).toMatch(/soon\.example\.com expires in [45] day/);
-      expect((await post('/api/server-contacts/check').expect(200)).body.data.notifications).toEqual([]);
+      const res = await runCheck();
+      expect(res.body.data.ssl.expiring.map((c) => [c.domain, c.kind]).sort()).toEqual([['edge.example.com', 'vhost'], ['exim', 'service'], ['soon.example.com', 'vhost']]);
+      expect(res.body.data.ssl.expiring.find((c) => c.domain === 'soon.example.com').daysRemaining).toBeGreaterThanOrEqual(4);
+      expect(res.body.data.notifications.map((n) => n.event)).toEqual(['ssl.expiring', 'ssl.expiring', 'ssl.expiring']);
+      const subjects = hook.received.map((h) => h.body.subject);
+      expect(subjects).toEqual(expect.arrayContaining([expect.stringMatching(/soon\.example\.com expires in [45] day/), expect.stringMatching(/exim service certificate expires in [12] day/)]));
+      expect(hook.received.find((h) => /exim service/.test(h.body.subject)).body).toMatchObject({ severity: 'error' });
+      expect(hook.received.find((h) => /exim service/.test(h.body.subject)).body.body).toMatch(/Manage Service SSL Certificates/);
+      expect(app.ctx.db.prepare('SELECT key FROM contact_alert_state ORDER BY key').all().map((r) => r.key)).toEqual(['ssl:edge.example.com', 'ssl:service:exim', 'ssl:soon.example.com']);
+      expect((await runCheck()).body.data.notifications).toEqual([]);
+      app.ctx.db.prepare("DELETE FROM ssl_service_certs WHERE service = 'exim'").run();
+      await runCheck();
+      expect(app.ctx.db.prepare('SELECT key FROM contact_alert_state ORDER BY key').all().map((r) => r.key)).toEqual(['ssl:edge.example.com', 'ssl:soon.example.com']);
     } finally {
       app.ctx.db.prepare("DELETE FROM ssl_certs WHERE domain LIKE '%.example.com'").run();
+      app.ctx.db.prepare("DELETE FROM ssl_service_certs WHERE service IN ('exim', 'dovecot', 'ftp')").run();
     }
   });
 
-  it('runs the check through the job queue and skips it while disabled', async () => {
-    app.ctx.jobs.start();
-    try {
-      let job = await waitForJob(app.ctx, app.ctx.jobs.enqueue('server-contacts.check').id);
-      expect(job.status).toBe('done');
-      expect(job.result).toMatchObject({ disks: { checked: 1 }, notifications: 0 });
-      await put('/api/server-contacts/settings', { check: { enabled: false } }).expect(200);
-      expect(app.ctx.scheduler.list().find((s) => s.name === 'server-contacts-check').enabled).toBe(0);
-      job = await waitForJob(app.ctx, app.ctx.jobs.enqueue('server-contacts.check').id);
-      expect(job.result).toEqual({ skipped: 'disabled' });
-      await put('/api/server-contacts/settings', { check: { enabled: true, diskThresholdPercent: 80 } }).expect(200);
-      expect(app.ctx.scheduler.list().find((s) => s.name === 'server-contacts-check').enabled).toBe(1);
-      expect((await get('/api/server-contacts/settings').expect(200)).body.data.check.diskThresholdPercent).toBe(80);
-      await put('/api/server-contacts/settings', { check: { diskThresholdPercent: 90 } }).expect(200);
-    } finally { app.ctx.jobs.stop(); }
+  it('refuses webhooks to loopback, link-local and private addresses unless allowed, at creation and before every post', async () => {
+    const c = await post('/api/server-contacts/contacts', { name: 'Local', channel: 'webhook', address: `http://127.0.0.1:${hookPort}/private` }).expect(201);
+    await put('/api/server-contacts/settings', { webhook: { allowPrivate: false } }).expect(200);
+    expect((await get('/api/server-contacts/settings').expect(200)).body.data.webhook).toEqual({ allowPrivate: false });
+    for (const address of [`http://127.0.0.1:${hookPort}/x`, 'http://169.254.169.254/latest/meta-data/', 'http://10.0.0.5/hook', 'http://[::1]:8080/hook', 'http://localhost/hook', 'http://192.168.1.1/']) {
+      const res = await post('/api/server-contacts/contacts', { channel: 'webhook', address }).expect(422);
+      expect(res.body.error, address).toMatchObject({ code: 'private_target', fields: { address: [expect.stringMatching(/private address/)] } });
+    }
+    expect((await patch(`/api/server-contacts/contacts/${c.body.data.id}`, { address: 'http://172.16.0.1/hook' }).expect(422)).body.error.code).toBe('private_target');
+    const tested = await post(`/api/server-contacts/contacts/${c.body.data.id}/test`).expect(422);
+    expect(tested.body.error.code).toBe('private_target');
+    expect(hook.received).toHaveLength(0);
+    const r = await app.ctx.contacts.notify({ event: 'backup.failed', subject: 'x', body: 'y' });
+    expect(r).toMatchObject({ matched: 1, sent: 0, failed: 1 });
+    expect(r.deliveries[0].error).toMatch(/private address/);
+    expect(hook.received).toHaveLength(0);
+    await put('/api/server-contacts/settings', { webhook: { allowPrivate: true } }).expect(200);
+    expect((await post(`/api/server-contacts/contacts/${c.body.data.id}/test`).expect(200)).body.data.status).toBe('sent');
+    expect(hook.received).toHaveLength(1);
+  });
+
+  it('keeps relay credentials off plain connections unless the admin opts in, and accepts localhost as the relay host', async () => {
+    await put('/api/server-contacts/settings', { smtp: { host: 'relay.example.net', port: 25, security: 'none', username: 'relay', password: 'pw' } }).expect(200);
+    const refused = await post('/api/server-contacts/settings/test-mail', { to: 'a@example.org' }).expect(422);
+    expect(refused.body.error).toMatchObject({ code: 'plaintext_auth_refused', message: expect.stringMatching(/unencrypted/) });
+    expect(smtp.sessions).toEqual([]);
+    expect((await get('/api/server-contacts/settings').expect(200)).body.data.smtp).toMatchObject({ host: 'relay.example.net', security: 'none', allowPlaintextAuth: false });
+    await put('/api/server-contacts/settings', { smtp: { host: 'localhost' } }).expect(200);
+    expect((await get('/api/server-contacts/settings').expect(200)).body.data.smtp.host).toBe('localhost');
+    await put('/api/server-contacts/settings', { smtp: { host: '127.0.0.1', port: smtpPort, allowPlaintextAuth: true, password: 'secret-pass' } }).expect(200);
+    expect((await post('/api/server-contacts/settings/test-mail', { to: 'a@example.org' }).expect(200)).body.data.transport).toBe('smtp');
+    expect(smtp.sessions).toHaveLength(1);
+  });
+
+  it('runs the scheduled check through the job queue, skips it while disabled, and still runs a manual check', async () => {
+    let job = await waitForJob(app.ctx, app.ctx.jobs.enqueue('server-contacts.check').id);
+    expect(job.status).toBe('done');
+    expect(job.result).toMatchObject({ disks: { checked: 1 }, notifications: [] });
+    await put('/api/server-contacts/settings', { check: { enabled: false } }).expect(200);
+    expect(app.ctx.scheduler.list().find((s) => s.name === 'server-contacts-check').enabled).toBe(0);
+    job = await waitForJob(app.ctx, app.ctx.jobs.enqueue('server-contacts.check').id);
+    expect(job.result).toEqual({ skipped: 'disabled' });
+    expect((await runCheck()).body.data).toMatchObject({ disks: { checked: 1 }, notifications: [] });
+    await put('/api/server-contacts/settings', { check: { enabled: true, diskThresholdPercent: 80 } }).expect(200);
+    expect(app.ctx.scheduler.list().find((s) => s.name === 'server-contacts-check').enabled).toBe(1);
+    expect((await get('/api/server-contacts/settings').expect(200)).body.data.check.diskThresholdPercent).toBe(80);
+    await put('/api/server-contacts/settings', { check: { diskThresholdPercent: 90 } }).expect(200);
   });
 
   it('reads and writes the system mail preferences through /etc/aliases', async () => {
     let res = await get('/api/server-contacts/mail-preferences').expect(200);
-    expect(res.body.data).toMatchObject({ hostname: 'panel.example.com', rootAddress: 'root@panel.example.com', forwardTo: ['ops@example.com'], aliases: { path: '/etc/aliases', exists: true, rebuildTool: 'exim' }, aliasError: null, rootMailEvents: ['service.down', 'disk.space.low', 'backup.failed'] });
+    expect(res.body.data).toMatchObject({ hostname: 'panel.example.com', rootAddress: 'root@panel.example.com', forwardTo: ['ops@example.com'], users: { root: ['ops@example.com'], nobody: [] }, managedUsers: ['root', 'nobody'], aliases: { path: '/etc/aliases', exists: true, rebuildTool: 'exim' }, aliasError: null, rootMailEvents: ['service.down', 'disk.space.low', 'backup.failed'] });
     expect(res.body.data.events.map((e) => e.key)).not.toContain('test');
+
+    // Mail for nobody (web server cron and PHP mail) is managed next to root's.
+    res = await put('/api/server-contacts/mail-preferences', { users: { nobody: ['root', 'web@example.com'] } }).expect(200);
+    expect(aliasWrites).toEqual([['nobody', ['root', 'web@example.com']]]);
+    expect(res.body.data.users).toEqual({ root: ['ops@example.com'], nobody: ['root', 'web@example.com'] });
+    expect(res.body.data.forwardTo).toEqual(['ops@example.com']);
+    expect(app.ctx.settings.get('contacts.nobody_forward')).toEqual(['root', 'web@example.com']);
+    expect(auditRows('contacts.mail_preferences').at(-1).target).toBe('nobody');
+    aliasWrites = [];
 
     res = await put('/api/server-contacts/mail-preferences', { forwardTo: ['admin@example.net', 'oncall', 'admin@example.net'], rootMailEvents: ['backup.failed', 'login.failed.blocked'] }).expect(200);
     expect(aliasWrites).toEqual([['admin@example.net', 'oncall']]);
@@ -594,6 +695,11 @@ describe('Server Contacts API', () => {
     await put('/api/server-contacts/mail-preferences', { forwardTo: ['../x'] }).expect(422);
     await put('/api/server-contacts/mail-preferences', { forwardTo: ['"|/bin/sh"'] }).expect(422);
     await put('/api/server-contacts/mail-preferences', { rootMailEvents: ['BAD'] }).expect(422);
+    await put('/api/server-contacts/mail-preferences', { users: { 'www-data': ['root'] } }).expect(422);
+    await put('/api/server-contacts/mail-preferences', { users: { nobody: ['-r'] } }).expect(422);
+    await put('/api/server-contacts/settings', { smtp: { host: 'localhost;id' } }).expect(422);
+    await put('/api/server-contacts/settings', { webhook: { allowPrivate: 'yes' } }).expect(422);
+    await post('/api/server-contacts/contacts', { channel: 'webhook', address: `http://127.0.0.1:${hookPort}/x`, config: { secret: 'a\nb' } }).expect(422);
     await get('/api/server-contacts/deliveries?status=maybe').expect(422);
     await get('/api/server-contacts/deliveries?event=x;y').expect(422);
     expect(aliasWrites).toEqual([]);

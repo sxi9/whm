@@ -86,7 +86,7 @@ export function createBackupService(ctx) {
   const stmts = {
     accounts: db.prepare('SELECT a.*, u.username AS owner FROM accounts a JOIN users u ON u.id = a.owner_id ORDER BY a.username'),
     accountByUsername: db.prepare('SELECT a.*, u.username AS owner FROM accounts a JOIN users u ON u.id = a.owner_id WHERE a.username = ?'),
-    accountDomains: db.prepare('SELECT domain, type, docroot FROM account_domains WHERE account_id = ? ORDER BY type, domain'),
+    accountDomains: db.prepare('SELECT domain, type, docroot, php_version FROM account_domains WHERE account_id = ? ORDER BY type, domain'),
     mailDomains: db.prepare('SELECT m.domain, m.routing FROM mail_domains m WHERE m.account_id = ? OR m.domain IN (SELECT domain FROM account_domains WHERE account_id = ?)'),
     selection: db.prepare('SELECT * FROM backup_user_selection WHERE account_id = ?'),
     selectionAll: db.prepare('SELECT * FROM backup_user_selection'),

@@ -54,7 +54,11 @@ describe('bpk.kill schema rejects injection before anything runs', () => {
     { pid: 1234, user: '-r' },
     { pid: 1234, user: 'a;b' },
     { pid: 1234, user: '../etc' },
-    { pid: 1234, user: 'Alice' },
+    { pid: 1234, user: '.hidden' },
+    { pid: 1234, user: 'a b' },
+    { pid: 1234, user: 'a'.repeat(33) },
+    { pid: 1234, user: '$(id)' },
+    { pid: 1234, user: '' },
     { pid: 1234, user: 'alice', signal: 'SIGSTOP;id' },
     { pid: 1234, user: 'alice', signal: 9 },
     { pid: 1234, user: 'alice', elapsedSeconds: -1 },
@@ -66,6 +70,18 @@ describe('bpk.kill schema rejects injection before anything runs', () => {
       exec.mockClear();
       expect((await opError(runOp('bpk.kill', args, ctx))).code).toBe('invalid_args');
       expect(exec).not.toHaveBeenCalled();
+    });
+  }
+});
+
+describe('bpk.kill accepts every owner name ps can print', () => {
+  // The name is only compared, so an odd but legitimate owner must reach the
+  // ps lookup instead of failing as invalid_args on every scheduled run.
+  for (const user of ['_apt', 'Alice', '1001', 'svc$', 'a.b-c', `${'a'.repeat(31)}+`]) {
+    it(`looks up the PID for owner ${JSON.stringify(user)}`, async () => {
+      exec.mockClear();
+      expect((await opError(runOp('bpk.kill', { pid: 4194303, user }, ctx))).code).toBe('not_found');
+      expect(exec).toHaveBeenCalledWith('ps', ['-o', 'user:32=,etimes=', '-p', '4194303'], expect.anything());
     });
   }
 });

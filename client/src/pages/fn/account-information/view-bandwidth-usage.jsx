@@ -38,7 +38,11 @@ export default function ViewBandwidthUsage({ fn }) {
   const reset = async (username, all) => {
     const ok = await confirm({ title: all ? `Clear all bandwidth history for ${username}?` : `Reset this month's counter for ${username}?`, message: all ? 'Every recorded month is deleted. Access logs are not touched, but already-parsed bytes are not re-read.' : `The ${periodLabel(meta?.period)} total goes back to zero; the account can be unsuspended afterwards if it was suspended for exceeding its limit.`, confirmLabel: 'Reset', danger: true });
     if (!ok) return;
-    try { await api.post(`/account-info/bandwidth/${username}/reset`, all ? { all: true } : {}); toast.success(`Bandwidth counter reset for ${username}`); refetch(); history.refetch(); } catch (err) { toast.error(err); }
+    try {
+      const { data: r } = await api.post(`/account-info/bandwidth/${username}/reset`, all ? { all: true } : {});
+      toast.success(r?.unsuspended?.length ? `Bandwidth counter reset and ${username} unsuspended` : `Bandwidth counter reset for ${username}`);
+      refetch(); history.refetch();
+    } catch (err) { toast.error(err); }
   };
 
   const columns = [
@@ -65,9 +69,9 @@ export default function ViewBandwidthUsage({ fn }) {
       {meta && (
         <div className="stat-grid" style={{ marginBottom: 14 }}>
           <Stat label={`Total in ${periodLabel(meta.period)}`} value={formatBytes(meta.totalBytes)} hint={`${meta.total} account(s) listed`} />
-          <Stat label="Over limit (this page)" value={overCount} hint={meta.enforcement?.enabled ? 'Exceeders are suspended after each collection' : 'Exceeders are only flagged (enforcement off)'} />
+          <Stat label="Over limit (this page)" value={overCount} hint={meta.enforcement?.enabled ? 'Exceeders are suspended by the hourly enforcement schedule' : 'Exceeders are only flagged (enforcement off)'} />
           <Stat label="Warn threshold" value={`${meta.warnPercent}%`} />
-          <Stat label="Last collection" value={meta.lastCollect ? formatDate(meta.lastCollect) : 'never'} hint="Runs on the account-bandwidth schedule (hourly)" />
+          <Stat label="Last collection" value={meta.lastCollect ? formatDate(meta.lastCollect) : 'never'} hint="Runs hourly on the account-bandwidth schedule while a web server is installed" />
         </div>
       )}
       <JobCard jobId={jobId} title="Bandwidth collection" onFinished={() => { refetch(); history.refetch(); }} />
@@ -153,11 +157,12 @@ function BandwidthSettings({ onSaved }) {
         <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginBottom: 12 }}>
           <StatusPill status={data.enforcement?.enabled ? 'ok' : 'warning'}>{data.enforcement?.enabled ? 'Automatic suspension on' : 'Automatic suspension off'}</StatusPill>
           <span className="muted small">
-            {data.enforcement?.enabled ? `Accounts over their limit are suspended after each collection with the reason “${data.enforcement.reason || 'bandwidth: monthly transfer limit exceeded'}”; Unsuspend Bandwidth Exceeders lifts them in bulk.` : 'Accounts over their limit are only flagged.'} Configured under Account Functions.
+            {data.enforcement?.enabled ? `Accounts over their limit are suspended by the hourly account-bandwidth-enforce schedule with the reason “${data.enforcement.reason || 'bandwidth: monthly transfer limit exceeded'}”; Unsuspend Bandwidth Exceeders lifts them in bulk.` : 'Accounts over their limit are only flagged.'} Configured under Account Functions.
           </span>
           <Button size="sm" onClick={() => navigate('/account-functions/limit-bandwidth-usage')}>Limit Bandwidth Usage</Button>
         </div>
       )}
+      {data?.schedule && !data.schedule.enabled && <p className="muted small">The hourly collection schedule is parked because no web server (Apache or NGINX) is installed and no extra log directories are configured; it resumes by itself once one is. “Collect now” still works.</p>}
       {draft && (
         <>
           <div className="form-grid">

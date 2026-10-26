@@ -51,9 +51,14 @@ export const DEFAULT_TEMPLATES = {
 };
 
 const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-export function renderTemplateBody(body, vars = {}) {
-  return String(body).replace(/\{\{\s*([a-z_]+)\s*\}\}/g, (m, key) => (vars[key] == null ? '' : escapeHtml(vars[key])));
+// HTML pages escape substituted values; plain-text mail (escape: false) must not.
+export function renderTemplateBody(body, vars = {}, { escape = true } = {}) {
+  return String(body).replace(/\{\{\s*([a-z_]+)\s*\}\}/g, (m, key) => (vars[key] == null ? '' : escape ? escapeHtml(vars[key]) : String(vars[key])));
 }
+// ensureVhost answers these after the vhost files were written and Apache
+// reloaded: a PHP-handler warning, not a failed rewrite (integration contract 4).
+export const VHOST_WARNINGS = new Set(['php_missing', 'php_pool_failed']);
+const vhostWritten = (web) => Boolean(web?.applied || VHOST_WARNINGS.has(web?.reason));
 
 const monthKey = (d = new Date()) => d.toISOString().slice(0, 7);
 const previousMonthKey = (d = new Date()) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 1, 1)).toISOString().slice(0, 7);
@@ -68,7 +73,6 @@ export function createAccountFunctionsService(ctx) {
     setIp: db.prepare("UPDATE accounts SET ip = ?, updated_at = datetime('now') WHERE id = ?"),
     setBandwidthLimit: db.prepare("UPDATE accounts SET bandwidth_limit_mb = ?, updated_at = datetime('now') WHERE id = ?"),
     resetBandwidth: db.prepare("UPDATE accounts SET bandwidth_used_mb = 0, updated_at = datetime('now') WHERE id = ?"),
-    deleteBandwidthPeriod: db.prepare('DELETE FROM account_bandwidth WHERE account_id = ? AND period = ?'),
     setDemo: db.prepare("UPDATE accounts SET demo_mode = ?, updated_at = datetime('now') WHERE id = ?"),
     setForce: db.prepare("UPDATE accounts SET force_password_change = ?, updated_at = datetime('now') WHERE id = ?"),
     setShell: db.prepare("UPDATE accounts SET shell = ?, updated_at = datetime('now') WHERE id = ?"),
@@ -134,12 +138,11 @@ export function createAccountFunctionsService(ctx) {
     }
   }
 
-  async function mountpointFor(dir) {
-    try {
-      const disks = await op('sys.disk.usage', {});
-      const match = disks.filter((d) => dir === d.mountpoint || dir.startsWith(d.mountpoint.endsWith('/') ? d.mountpoint : `${d.mountpoint}/`)).sort((a, b) => b.mountpoint.length - a.mountpoint.length)[0];
-      return match?.mountpoint || '/';
-    } catch { return '/'; }
+  const resolveMountpoint = (dir, disks) => disks.filter((d) => dir === d.mountpoint || dir.startsWith(d.mountpoint.endsWith('/') ? d.mountpoint : `${d.mountpoint}/`)).sort((a, b) => b.mountpoint.length - a.mountpoint.length)[0]?.mountpoint || '/';
+  const diskList = () => op('sys.disk.usage', {}).catch(() => []);
+  // Callers resolving many homes pass one fetched disk list instead of paying an agent round-trip per account.
+  async function mountpointFor(dir, disks) {
+    try { return resolveMountpoint(dir, disks || await diskList()); } catch { return '/'; }
   }
 
   // ------------------------------------------------------------- templates ---
@@ -181,8 +184,22 @@ export function createAccountFunctionsService(ctx) {
 
   // ------------------------------------------------------- change site IP ---
 
+  // The vhost files are rewritten in place by Service Configuration's replaceIp
+  // (only the address changes); ensureVhost is the fallback for a web service
+  // without that hook or an account that had no address recorded yet.
+  async function rewriteVhostIp(username, previous, ip, req) {
+    if (!ctx.web) return { applied: false, reason: 'web_category_missing', domains: [] };
+    if (ctx.web.replaceIp && previous) {
+      const r = await ctx.web.replaceIp(previous, ip, { accounts: [username] }, req);
+      return { applied: r.updated > 0, updated: r.updated, reason: r.updated > 0 ? null : 'no_vhost_on_previous_ip', domains: r.domains || [] };
+    }
+    const web = await ctx.web.ensureVhost(username, req);
+    return { applied: vhostWritten(web), reason: web.reason ?? null, domains: (web.vhosts || []).map((v) => v.domain) };
+  }
+
   async function changeIp(username, { ip }, user, req) {
     const account = load(username, user);
+    requireAcl(user, 'edit-account');
     const previous = account.ip;
     if (previous === ip) throw conflict(`${username} already uses ${ip}`);
     const ipSvc = ctx.ip;
@@ -195,27 +212,29 @@ export function createAccountFunctionsService(ctx) {
     if (ipSvc) {
       const known = ipSvc.get(ip);
       if (!known) throw unprocessable(`${ip} is not configured on this server; add it under IP Functions first`, { ip: ['Unknown address'] });
-      if (known.dedicated_to && known.dedicated_to !== account.id) throw conflict(`${ip} is dedicated to another account`);
+      // IP Functions reports dedicated_to as the account's username.
+      if (known.dedicated_to && known.dedicated_to !== account.username) throw conflict(`${ip} is dedicated to another account`);
       if (known.reserved) throw conflict(`${ip} is reserved (${known.reserved_reason || 'no reason given'})`);
     }
     // The vhost and zone renderers read accounts.ip, so the row changes first and
     // is put back when the host refuses.
-    const snapshotDedicated = ipSvc ? ipSvc.all().filter((r) => r.dedicated_to === account.id).map((r) => r.address) : [];
+    const snapshotDedicated = ipSvc ? ipSvc.all().filter((r) => r.dedicated_to === account.username).map((r) => r.address) : [];
+    // "Free" is judged before the account row takes the address (an address in use is never free).
+    const free = ipSvc ? ipSvc.freeAddresses(ip.includes(':') ? 6 : 4).some((r) => r.address === ip) : false;
     stmts.setIp.run(ip, account.id);
     const result = { username, previousIp: previous, ip, web: null, dns: [], dedicated: null };
+    // Set once the IP pool changed, so a later failure puts the pool back too
+    // (the previous dedicated addresses re-dedicated, the new one released).
+    let poolChanged = false;
     try {
       if (ipSvc) {
         const shared = ipSvc.sharedIp();
-        const free = ipSvc.freeAddresses(ip.includes(':') ? 6 : 4).some((r) => r.address === ip);
         if (ip !== shared && (free || snapshotDedicated.includes(ip))) {
-          if (!snapshotDedicated.includes(ip)) { ipSvc.releaseDedicated(account.id, req); ipSvc.allocateDedicated(account.id, req, { address: ip }); }
+          if (!snapshotDedicated.includes(ip)) { poolChanged = true; ipSvc.releaseDedicated(account.id, req); ipSvc.allocateDedicated(account.id, req, { address: ip }); }
           result.dedicated = ip;
-        } else if (snapshotDedicated.length) { ipSvc.releaseDedicated(account.id, req); stmts.setIp.run(ip, account.id); }
+        } else if (snapshotDedicated.length) { poolChanged = true; ipSvc.releaseDedicated(account.id, req); stmts.setIp.run(ip, account.id); }
       }
-      if (ctx.web) {
-        const web = await ctx.web.ensureVhost(username, req);
-        result.web = { applied: web.applied, reason: web.reason ?? null, domains: (web.vhosts || []).map((v) => v.domain) };
-      } else result.web = { applied: false, reason: 'web_category_missing' };
+      result.web = await rewriteVhostIp(username, previous, ip, req);
       if (ctx.dns && previous) {
         for (const { domain } of stmts.zonesOf.all(account.id)) {
           try {
@@ -231,6 +250,12 @@ export function createAccountFunctionsService(ctx) {
         }
       }
     } catch (err) {
+      if (poolChanged) {
+        try {
+          ipSvc.releaseDedicated(account.id, req);
+          for (const address of snapshotDedicated) ipSvc.allocateDedicated(account.id, req, { address });
+        } catch (undoErr) { logger.error({ err: undoErr, username }, 'IP pool could not be restored after a failed IP change'); }
+      }
       stmts.setIp.run(previous, account.id);
       throw err;
     }
@@ -255,12 +280,20 @@ export function createAccountFunctionsService(ctx) {
     return { kind: 'agent', send: (msg, req) => op('mail.sendmail', { from: msg.from, to: [msg.to], subject: msg.subject, text: msg.text }, req) };
   }
 
+  const defaultSender = (user) => settings.get('account_functions.email_from', '') || settings.get('mail.notification_from', '') || `${user.username === 'root' ? 'root' : user.username}@${hostname()}`;
+
   function emailAll({ subject, text, scope, owner, from }, user, req) {
     const sender = senderFor();
     if (sender.kind !== 'contacts') capabilities.require('exim', 'Exim is not installed, so the panel cannot send email. Install exim4 (Debian/Ubuntu) or exim (RHEL) to email account owners.');
     const list = recipients({ scope, owner }, user);
     if (!list.recipients.length) throw unprocessable('No account in the selection has a contact email address', { scope: ['Nothing to send'] });
-    const sendFrom = from || settings.get('account_functions.email_from', '') || settings.get('mail.notification_from', '') || `${user.username === 'root' ? 'root' : user.username}@${hostname()}`;
+    // A reseller sends as itself (its own contact address or the server's
+    // configured sender); only root may put another sender on the envelope.
+    if (from && !isRoot(user)) {
+      const own = [user.email, defaultSender(user)].filter(Boolean).map((a) => a.toLowerCase());
+      if (!own.includes(from.toLowerCase())) throw forbidden(`Resellers can only send from their own contact address${user.email ? ` (${user.email})` : ''} or the server's notification sender`);
+    }
+    const sendFrom = from || defaultSender(user);
     const job = jobs.enqueue('accounts.email_all', { subject, text, from: sendFrom, recipients: list.recipients, requestedBy: user.username }, { userId: user.id });
     audit(req, { action: 'account.email_all', target: scope || 'all', args: { subject, recipients: list.recipients.length, from: sendFrom, job: job.id } });
     return { job, recipients: list.recipients.length, from: sendFrom };
@@ -273,9 +306,10 @@ export function createAccountFunctionsService(ctx) {
     const failed = [];
     jobCtx.log(`Sending "${subject}" to ${list.length} account owner(s) as ${from} via ${sender.kind}`);
     for (const [i, r] of list.entries()) {
-      const body = renderTemplateBody(text, { username: r.username, domain: r.domain, hostname: hostname(), email: r.email });
+      const vars = { username: r.username, domain: r.domain, hostname: hostname(), email: r.email };
+      const body = renderTemplateBody(text, vars, { escape: false });
       try {
-        await sender.send({ to: r.email, from, subject: renderTemplateBody(subject, { username: r.username, domain: r.domain, hostname: hostname() }), text: body }, null);
+        await sender.send({ to: r.email, from, subject: renderTemplateBody(subject, vars, { escape: false }), text: body }, null);
         sent.push(r.username);
         jobCtx.log(`${r.username} <${r.email}>: accepted`);
       } catch (err) {
@@ -315,13 +349,21 @@ export function createAccountFunctionsService(ctx) {
     return summary(stmts.byUsername.get(username));
   }
 
+  // The current period's log totals belong to Account Information
+  // (account_bandwidth); it clears them through resetPeriod, and without that
+  // hook only the counter on the account row is zeroed (integration contract 2).
+  function clearBandwidth(accounts) {
+    for (const a of accounts) stmts.resetBandwidth.run(a.id);
+    if (accounts.length && ctx.accountInfo?.resetPeriod) ctx.accountInfo.resetPeriod(accounts.map((a) => a.username));
+  }
+
   async function resetBandwidth({ usernames, all, unsuspend = true }, user, req) {
     requireAcl(user, 'limit-bandwidth');
     const { accounts, missing } = selectAccounts({ usernames, all }, user);
     const reset = [];
     const unsuspended = [];
+    clearBandwidth(accounts);
     for (const a of accounts) {
-      db.transaction(() => { stmts.resetBandwidth.run(a.id); stmts.deleteBandwidthPeriod.run(a.id, monthKey()); })();
       reset.push(a.username);
       if (unsuspend && a.suspended && BANDWIDTH_REASON.test(a.suspend_reason || '')) {
         await ctx.accounts.unsuspend(a.username, user, req);
@@ -345,13 +387,31 @@ export function createAccountFunctionsService(ctx) {
     const failed = [];
     for (const a of wanted) {
       try {
-        if (resetCounters) db.transaction(() => { const row = stmts.byUsername.get(a.username); stmts.resetBandwidth.run(row.id); stmts.deleteBandwidthPeriod.run(row.id, monthKey()); })();
+        if (resetCounters) clearBandwidth([stmts.byUsername.get(a.username)]);
         await ctx.accounts.unsuspend(a.username, user, req);
         unsuspended.push(a.username);
       } catch (err) { failed.push({ username: a.username, error: err.message }); }
     }
     audit(req, { action: 'account.bandwidth.unsuspend_exceeders', target: wanted.map((a) => a.username).join(',') || 'none', args: { unsuspended: unsuspended.length, failed: failed.length, resetCounters } });
     return { unsuspended, failed, skipped: candidates.length - wanted.length };
+  }
+
+  const ENFORCE_SCHEDULE = 'account-bandwidth-enforce';
+  const bandwidthEnforcement = () => ({ enabled: Boolean(settings.get('account_functions.bandwidth_enforce', false)), reason: settings.get('account_functions.bandwidth_suspend_reason', 'bandwidth: monthly transfer limit exceeded'), schedule: ENFORCE_SCHEDULE });
+  // The setting is the source of truth; the schedule row follows it and is only
+  // written when they disagree (Configure cPanel Cron Jobs may edit the row too).
+  function syncEnforcementSchedule() {
+    const row = ctx.scheduler.list().find((s) => s.name === ENFORCE_SCHEDULE);
+    const enabled = bandwidthEnforcement().enabled;
+    if (row && Boolean(row.enabled) !== enabled) ctx.scheduler.update(ENFORCE_SCHEDULE, { enabled });
+    return enabled;
+  }
+  function setBandwidthEnforcement({ enabled, reason }, req) {
+    settings.set('account_functions.bandwidth_enforce', enabled);
+    if (reason) settings.set('account_functions.bandwidth_suspend_reason', BANDWIDTH_REASON.test(reason) ? reason : `bandwidth: ${reason}`);
+    syncEnforcementSchedule();
+    audit(req, { action: 'account.bandwidth.enforcement', args: { enabled, reason: reason ?? null } });
+    return bandwidthEnforcement();
   }
 
   async function runBandwidthEnforce(jobCtx) {
@@ -424,13 +484,16 @@ export function createAccountFunctionsService(ctx) {
   async function quotaReport(user) {
     const accounts = visibleAccounts(user);
     if (!capabilities.has('quota')) throw new CapabilityError('quota', 'Disk quotas are not installed on this server (setquota/repquota missing). Run Initial Quota Setup after installing the quota package.');
+    const disks = await diskList();
     const byFs = new Map();
+    const fsOf = new Map();
     for (const a of accounts) {
-      const fs = await mountpointFor(homeOf(a));
+      const fs = resolveMountpoint(homeOf(a), disks);
+      fsOf.set(a.id, fs);
       if (!byFs.has(fs)) byFs.set(fs, await op('user.quota_report', { filesystem: fs }).catch((err) => ({ available: false, users: [], error: err.message })));
     }
     return accounts.map((a) => {
-      const fs = [...byFs.keys()].find((k) => homeOf(a).startsWith(k)) || '/';
+      const fs = fsOf.get(a.id);
       const report = byFs.get(fs) || { users: [] };
       const live = report.users.find((u) => u.username === a.username) || null;
       return { ...summary(a), filesystem: fs, live: live ? { usedMb: live.usedMb, softMb: live.softMb, hardMb: live.hardMb } : null, reportAvailable: report.available !== false };
@@ -483,12 +546,24 @@ export function createAccountFunctionsService(ctx) {
       res.status(200);
       res.set({ 'Content-Type': file.endsWith('.gz') ? 'application/gzip' : 'text/plain; charset=utf-8', 'Content-Disposition': `attachment; filename="${username}-${file.replace(/[^A-Za-z0-9._-]/g, '_')}"`, 'Content-Length': String(first.size), 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
       audit(req, { action: 'account.log.download', target: username, args: { kind, file, bytes: first.size } });
+      // Content-Length is fixed from the first range: once headers are out a
+      // later failure (agent error, file rotated or truncated meanwhile) can
+      // only be reported by cutting the connection, never by a JSON error.
       let sent = 0;
       let part = first;
-      for (;;) {
-        if (part.length) { sent += part.length; if (!res.write(Buffer.from(part.data, 'base64'))) await new Promise((r) => res.once('drain', r)); }
-        if (part.eof || sent >= first.size || res.destroyed) break;
-        part = await range(sent, Math.min(chunk, first.size - sent));
+      try {
+        for (;;) {
+          if (part.length) { sent += part.length; if (!res.write(Buffer.from(part.data, 'base64'))) await new Promise((r) => res.once('drain', r)); }
+          if (sent >= first.size || res.destroyed) break;
+          if (part.eof) throw new Error(`${entry.path} shrank to ${part.size} bytes while it was being sent (rotated or truncated)`);
+          part = await range(sent, Math.min(chunk, first.size - sent));
+          if (part.size !== first.size) throw new Error(`${entry.path} changed size while it was being sent (${first.size} -> ${part.size} bytes)`);
+        }
+      } catch (err) {
+        logger.warn({ err, username, file, sent, size: first.size }, 'raw log download aborted');
+        audit(req, { action: 'account.log.download.aborted', target: username, args: { kind, file, sent, bytes: first.size, error: err.message } });
+        res.destroy(err);
+        return { bytes: sent, aborted: true, error: err.message };
       }
       res.end();
       return { bytes: sent };
@@ -499,12 +574,14 @@ export function createAccountFunctionsService(ctx) {
 
   const rearrange = {
     async partitions() {
-      const disks = await op('sys.disk.usage', {}).catch(() => []);
+      const disks = await diskList();
+      const accounts = stmts.all.all();
       const roots = [];
       for (const root of HOME_ROOTS) {
-        const disk = disks.filter((d) => root === d.mountpoint || root.startsWith(d.mountpoint.endsWith('/') ? d.mountpoint : `${d.mountpoint}/`)).sort((a, b) => b.mountpoint.length - a.mountpoint.length)[0] || null;
+        const mountpoint = resolveMountpoint(root, disks);
+        const disk = disks.find((d) => d.mountpoint === mountpoint) || null;
         const stat = await op('fs.stat', { path: root }).catch(() => ({ exists: false }));
-        roots.push({ root, exists: Boolean(stat.exists && stat.isDirectory), mountpoint: disk?.mountpoint ?? null, filesystem: disk?.filesystem ?? null, availableBytes: disk?.availableBytes ?? null, usedPercent: disk?.usedPercent ?? null, accounts: stmts.all.all().filter((a) => homeOf(a).startsWith(`${root}/`)).length });
+        roots.push({ root, exists: Boolean(stat.exists && stat.isDirectory), mountpoint: disk?.mountpoint ?? null, filesystem: disk?.filesystem ?? null, availableBytes: disk?.availableBytes ?? null, usedPercent: disk?.usedPercent ?? null, accounts: accounts.filter((a) => homeOf(a).startsWith(`${root}/`)).length });
       }
       return { roots, disks };
     },
@@ -523,8 +600,13 @@ export function createAccountFunctionsService(ctx) {
       audit(req, { action: 'account.rearrange', target: username, args: { from, to, bytes: size.bytes, job: job.id } });
       return { job, username, from, to, bytes: size.bytes };
     },
+    // The account is suspended for the whole move (Linux user locked, sites on
+    // the suspended page) so nothing lands in the old tree after the final
+    // sync. The old tree goes only once usermod and the vhost rewrite both
+    // succeeded; otherwise both copies stay and the operator is told. A failure
+    // after the copy removes the partial target and restores the previous home.
     async run(jobCtx) {
-      const { username, from, to } = jobCtx.params;
+      const { username, from, to, target } = jobCtx.params;
       const account = stmts.byUsername.get(username);
       if (!account) throw new Error(`Account ${username} no longer exists`);
       if (homeOf(account) !== from) throw new Error(`${username}'s home is ${homeOf(account)}, not ${from}; refusing to move`);
@@ -533,46 +615,107 @@ export function createAccountFunctionsService(ctx) {
         const entries = existing.isDirectory ? (await op('fs.list', { path: to, limit: 2 })).entries : null;
         if (!entries || entries.length) throw new Error(`${to} already exists and is not empty`);
       }
-      jobCtx.log(`Copying ${from} to ${to} with rsync -a (ownership and permissions preserved)`);
-      jobCtx.progress(5, 'copying files');
-      await op('fs.copy_tree', { from, to });
-      jobCtx.progress(60, 'copy complete; syncing changes made during the copy');
-      await op('fs.copy_tree', { from, to, deleteExtraneous: true });
-      jobCtx.progress(75, 'updating the system user');
-      let quota = null;
-      if (account.uid != null) {
-        await op('acct.set_home', { username, homeDir: to });
-        jobCtx.log(`usermod -d ${to} ${username}`);
-        // Quotas are per filesystem: the limit stays on the old one and means
-        // nothing on the new partition until it is set there again.
-        if (account.disk_quota_mb && capabilities.has('quota')) {
-          const [fromFs, toFs] = [await mountpointFor(from), await mountpointFor(to)];
-          try {
-            if (fromFs !== toFs) { await op('user.set_quota', quotaArgs(username, 0, fromFs)); jobCtx.log(`Cleared the quota on ${fromFs}`); }
-            await op('user.set_quota', quotaArgs(username, account.disk_quota_mb, toFs));
-            quota = { applied: true, filesystem: toFs, mb: account.disk_quota_mb };
-            jobCtx.log(`Re-applied the ${account.disk_quota_mb} MB quota on ${toFs}`);
-          } catch (err) {
-            quota = { applied: false, filesystem: toFs, mb: account.disk_quota_mb, error: err.message };
-            jobCtx.log(`The ${account.disk_quota_mb} MB quota could not be applied on ${toFs}: ${err.message}; set it again in Quota Modification`, 'warn');
-          }
-        } else if (account.disk_quota_mb) { quota = { applied: false, mb: account.disk_quota_mb, error: 'quota tools are not installed' }; jobCtx.log('Disk quotas are not installed; the saved quota is applied once they are', 'warn'); }
-      } else jobCtx.log('No Linux user for this account; only the panel records are updated', 'warn');
-      db.transaction(() => {
-        stmts.setHome.run(to, account.id);
-        for (const d of stmts.docrootsOf.all(account.id)) if (d.docroot && d.docroot.startsWith(`${from}/`)) stmts.setDocroot.run(`${to}${d.docroot.slice(from.length)}`, d.id);
+      const principal = { id: null, username: 'rearrange', role: 'root' };
+      const wasSuspended = Boolean(account.suspended);
+      const state = { copied: false, homeSet: false, recorded: false, quotaFs: null };
+      const lock = async () => {
+        if (wasSuspended) { jobCtx.log(`${username} is already suspended (${account.suspend_reason || 'no reason'}); it stays suspended after the move`); return; }
+        let web = null;
+        if (ctx.accounts?.suspend) ({ web } = await ctx.accounts.suspend(username, `rearrange: moving the home directory to ${target || to}`, principal, null));
+        else if (account.uid != null) await op('user.lock', { username });
+        jobCtx.log(`${username} suspended for the duration of the move (logins locked${web?.applied ? ', sites on the suspended page' : ''})`);
+      };
+      const unlock = async () => {
+        if (wasSuspended) return;
+        try {
+          if (ctx.accounts?.unsuspend) await ctx.accounts.unsuspend(username, principal, null);
+          else if (account.uid != null) await op('user.unlock', { username });
+          jobCtx.log(`${username} unsuspended`);
+        } catch (err) { jobCtx.log(`${username} could not be unsuspended: ${err.message}; unsuspend it from Manage Account Suspension`, 'error'); }
+      };
+      const restoreRecords = () => db.transaction(() => {
+        stmts.setHome.run(from, account.id);
+        for (const d of stmts.docrootsOf.all(account.id)) if (d.docroot && d.docroot.startsWith(`${to}/`)) stmts.setDocroot.run(`${from}${d.docroot.slice(to.length)}`, d.id);
       })();
-      jobCtx.log('Panel records updated (home directory, document roots)');
-      if (ctx.web) {
-        jobCtx.progress(85, 'rewriting web server configuration');
-        const web = await ctx.web.ensureVhost(username, null).catch((err) => ({ applied: false, reason: err.message }));
-        jobCtx.log(web.applied ? 'Virtual hosts rewritten and the web server reloaded' : `Virtual hosts recorded (${web.reason || 'not applied'})`, web.applied ? 'info' : 'warn');
+      const rollback = async (err) => {
+        jobCtx.log(`Move failed: ${err.message}; restoring ${from}`, 'error');
+        if (state.recorded) { restoreRecords(); jobCtx.log('Panel records restored'); }
+        if (state.homeSet) {
+          try { await op('acct.set_home', { username, homeDir: from }); jobCtx.log(`usermod -d ${from} ${username} (restored)`); } catch (e) { jobCtx.log(`The home entry could not be restored to ${from}: ${e.message}`, 'error'); }
+        }
+        if (state.quotaFs) {
+          try { await op('user.set_quota', quotaArgs(username, account.disk_quota_mb, state.quotaFs)); } catch (e) { jobCtx.log(`The quota could not be restored on ${state.quotaFs}: ${e.message}; set it again in Quota Modification`, 'warn'); }
+        }
+        if (state.copied) {
+          try { await op('fs.remove', { path: to, recursive: true }); jobCtx.log(`Removed the partial copy ${to}`); } catch (e) { jobCtx.log(`The partial copy ${to} could not be removed: ${e.message}`, 'error'); }
+        }
+        ctx.auditRecord?.(null, { action: 'account.rearrange.failed', target: username, args: { from, to, error: err.message } });
+      };
+
+      await lock();
+      let quota = null;
+      let web = null;
+      try {
+        jobCtx.log(`Copying ${from} to ${to} with rsync -a (ownership and permissions preserved)`);
+        jobCtx.progress(5, 'copying files');
+        state.copied = true;
+        await op('fs.copy_tree', { from, to });
+        jobCtx.progress(60, 'copy complete; syncing changes made during the copy');
+        await op('fs.copy_tree', { from, to, deleteExtraneous: true });
+        jobCtx.progress(75, 'updating the system user');
+        if (account.uid != null) {
+          await op('acct.set_home', { username, homeDir: to });
+          state.homeSet = true;
+          jobCtx.log(`usermod -d ${to} ${username}`);
+          // Quotas are per filesystem: the limit stays on the old one and means
+          // nothing on the new partition until it is set there again.
+          if (account.disk_quota_mb && capabilities.has('quota')) {
+            const disks = await diskList();
+            const [fromFs, toFs] = [resolveMountpoint(from, disks), resolveMountpoint(to, disks)];
+            try {
+              if (fromFs !== toFs) { await op('user.set_quota', quotaArgs(username, 0, fromFs)); state.quotaFs = fromFs; jobCtx.log(`Cleared the quota on ${fromFs}`); }
+              await op('user.set_quota', quotaArgs(username, account.disk_quota_mb, toFs));
+              quota = { applied: true, filesystem: toFs, mb: account.disk_quota_mb };
+              jobCtx.log(`Re-applied the ${account.disk_quota_mb} MB quota on ${toFs}`);
+            } catch (err) {
+              quota = { applied: false, filesystem: toFs, mb: account.disk_quota_mb, error: err.message };
+              jobCtx.log(`The ${account.disk_quota_mb} MB quota could not be applied on ${toFs}: ${err.message}; set it again in Quota Modification`, 'warn');
+            }
+          } else if (account.disk_quota_mb) { quota = { applied: false, mb: account.disk_quota_mb, error: 'quota tools are not installed' }; jobCtx.log('Disk quotas are not installed; the saved quota is applied once they are', 'warn'); }
+        } else jobCtx.log('No Linux user for this account; only the panel records are updated', 'warn');
+        db.transaction(() => {
+          stmts.setHome.run(to, account.id);
+          for (const d of stmts.docrootsOf.all(account.id)) if (d.docroot && d.docroot.startsWith(`${from}/`)) stmts.setDocroot.run(`${to}${d.docroot.slice(from.length)}`, d.id);
+        })();
+        state.recorded = true;
+        jobCtx.log('Panel records updated (home directory, document roots)');
+        if (ctx.web) {
+          jobCtx.progress(85, 'rewriting web server configuration');
+          try {
+            const r = await ctx.web.ensureVhost(username, null);
+            // Apache absent: nothing serves either tree, so the rewrite is
+            // "done" (recorded as pending) and the old copy can go.
+            web = { applied: Boolean(r.applied), reason: r.reason ?? null, ok: vhostWritten(r) || r.reason === 'capability_missing' };
+          } catch (err) { web = { applied: false, reason: err.message, ok: false }; }
+          jobCtx.log(web.applied ? 'Virtual hosts rewritten and the web server reloaded' : `Virtual hosts ${web.ok ? 'recorded' : 'NOT rewritten'} (${web.reason || 'not applied'})`, web.ok ? (web.applied ? 'info' : 'warn') : 'error');
+        }
+      } catch (err) {
+        await rollback(err);
+        await unlock();
+        throw err;
       }
-      jobCtx.progress(92, 'removing the old home directory');
-      await op('fs.remove', { path: from, recursive: true });
-      jobCtx.log(`Removed ${from}`);
-      ctx.auditRecord?.(null, { action: 'account.rearrange.done', target: username, args: { from, to, quota } });
-      return { username, from, to, systemUser: account.uid != null, quota };
+      const oldTreeRemovable = (account.uid == null || state.homeSet) && (!web || web.ok);
+      let oldTreeRemoved = false;
+      if (oldTreeRemovable) {
+        jobCtx.progress(92, 'removing the old home directory');
+        try { await op('fs.remove', { path: from, recursive: true }); oldTreeRemoved = true; jobCtx.log(`Removed ${from}`); } catch (err) { jobCtx.log(`${from} could not be removed: ${err.message}; remove it by hand once the move is verified`, 'error'); }
+      } else {
+        jobCtx.log(`${from} was NOT removed: the web server still points at it (${web?.reason || 'vhost rewrite failed'}). ${username} now lives in ${to}; fix the web configuration (Service Configuration > sync the account) and remove ${from} by hand.`, 'error');
+        try { await ctx.contacts?.notify?.({ event: 'account.rearrange', severity: 'warning', subject: `Rearrange of ${username} needs attention`, body: `${username} was moved from ${from} to ${to}, but the virtual hosts could not be rewritten (${web?.reason || 'unknown'}). Both directories were kept.` }); } catch { /* notification is best effort */ }
+      }
+      await unlock();
+      ctx.auditRecord?.(null, { action: 'account.rearrange.done', target: username, args: { from, to, quota, web: web ? { applied: web.applied, reason: web.reason } : null, oldTreeRemoved } });
+      return { username, from, to, systemUser: account.uid != null, quota, web: web ? { applied: web.applied, reason: web.reason } : null, oldTreeRemoved, oldHome: oldTreeRemoved ? null : from, suspendedDuringMove: !wasSuspended };
     },
   };
 
@@ -636,7 +779,8 @@ export function createAccountFunctionsService(ctx) {
     renderTemplate, templatePath: (name) => { if (!TEMPLATE_NAMES.includes(name)) throw notFound(`Template "${name}"`); return `${TEMPLATE_DIR}/${name}.html`; }, templates, changeIp, recipients, emailAll, runEmailAll,
     forcePasswordChange, setDemoMode,
     setBandwidthLimit, resetBandwidth, exceeders, unsuspendExceeders, runBandwidthEnforce, runMonthlyBandwidthReset,
+    bandwidthEnforcement, setBandwidthEnforcement, syncEnforcementSchedule,
     setShell, setQuota, quotaReport, logs, rearrange, logRetention, mountpointFor,
-    HOME_ROOTS, TEMPLATE_NAMES, TEMPLATE_USAGE, SHELLS,
+    HOME_ROOTS, TEMPLATE_NAMES, TEMPLATE_USAGE, SHELLS, VHOST_WARNINGS,
   };
 }

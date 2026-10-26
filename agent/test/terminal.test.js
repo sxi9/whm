@@ -8,7 +8,7 @@ vi.mock('../src/exec.js', async (importOriginal) => {
   return { ...mod, exec: vi.fn(mod.exec) };
 });
 
-const ctx = createContext();
+const ctx = createContext({ principal: { username: 'root', role: 'root' } });
 const ID = 'c'.repeat(32);
 
 async function opError(promise) {
@@ -28,6 +28,16 @@ describe('terminal op schemas', () => {
     exec.mockClear();
     for (const args of [{ shell: '/bin/zsh' }, { shell: '/bin/bash; id' }, { shell: '../bin/sh' }, { cols: 1 }, { rows: 1000 }, { idleMinutes: 0 }, { idleMinutes: 10_000 }, { command: 'id' }, { cwd: '/' }]) {
       expect((await opError(runOp('terminal.open', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
+    }
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('terminal.open and terminal.write refuse any principal but root', async () => {
+    exec.mockClear();
+    for (const principal of [null, { username: 'resell1', role: 'reseller' }, { username: 'root', role: 'user' }]) {
+      const other = createContext({ principal });
+      expect((await opError(runOp('terminal.open', {}, other))).code, JSON.stringify(principal)).toBe('refused');
+      expect((await opError(runOp('terminal.write', { id: ID, data: 'id\r' }, other))).code, JSON.stringify(principal)).toBe('refused');
     }
     expect(exec).not.toHaveBeenCalled();
   });
@@ -55,7 +65,7 @@ describe('terminal op schemas', () => {
 
   it('read slices the scrollback by offset and the sweeper drops idle or finished sessions', async () => {
     const kills = [];
-    const fake = { id: ID, child: { pid: 1, kill: (sig) => kills.push(sig), stdin: { write() {} } }, shell: '/bin/bash', chunks: [{ offset: 0, data: Buffer.from('hello ') }, { offset: 6, data: Buffer.from('world') }], offset: 11, bytes: 11, startedAt: 0, lastActivity: Date.now(), exited: false, exitCode: null, signal: null, exitedAt: null, idleMs: 60_000, closeReason: null };
+    const fake = { id: ID, child: { pid: 1, kill: (sig) => kills.push(sig), stdin: { write() {} } }, shell: '/bin/bash', chunks: [{ offset: 0, data: Buffer.from('hello ') }, { offset: 6, data: Buffer.from('world') }], offset: 11, bytes: 11, startedAt: 0, lastActivity: Date.now(), exited: false, exitCode: null, signal: null, exitedAt: null, idleMs: 60_000, closeReason: null, closedAt: null };
     sessions.set(ID, fake);
     try {
       const all = await runOp('terminal.read', { id: ID }, ctx);
@@ -71,6 +81,12 @@ describe('terminal op schemas', () => {
       expect(sweep(Date.now())).toEqual([]);
       expect(sweep(Date.now() + 61_000)).toEqual([ID]);
       expect(kills).toEqual(['SIGHUP']);
+      // The idle kill is kept so the API's next read sees why the shell ended.
+      expect(sessions.get(ID)).toMatchObject({ closeReason: 'idle' });
+      expect((await runOp('terminal.read', { id: ID, since: 11 }, ctx))).toMatchObject({ closeReason: 'idle', exited: false });
+      expect((await opError(runOp('terminal.write', { id: ID, data: 'id\r' }, ctx))).code).toBe('exited');
+      expect(sweep(Date.now() + 61_000)).toEqual([]);
+      expect(sweep(Date.now() + 61_000 + LIMITS.exitedKeepMs + 1)).toEqual([ID]);
       expect(sessions.has(ID)).toBe(false);
       sessions.set(ID, { ...fake, exited: true, exitedAt: 0 });
       expect((await opError(runOp('terminal.write', { id: ID, data: 'id\r' }, ctx))).code).toBe('exited');

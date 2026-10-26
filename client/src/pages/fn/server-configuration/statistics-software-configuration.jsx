@@ -40,6 +40,8 @@ export default function StatisticsSoftwareConfiguration({ fn }) {
 
   const det = data?.detect?.generators || {};
   const anyOn = Boolean(data && Object.values(data.generators).some(Boolean));
+  const PAUSED = { no_generator_enabled: 'paused: no generator enabled', no_generator_installed: 'paused: no enabled generator is installed' };
+  const scheduleLabel = (sch) => (sch.enabled ? 'enabled' : PAUSED[sch.blockedReason] || 'disabled');
   return (
     <>
       <PageHeader fn={fn} description="Choose which web statistics generators process the per-domain access logs, which one accounts get by default and how often statistics are rebuilt." actions={data && <Button variant="primary" onClick={() => run()}>Generate now</Button>} />
@@ -76,13 +78,13 @@ export default function StatisticsSoftwareConfiguration({ fn }) {
             </FormActions>
           </Card>
           <div className="form-grid">
-            <Card title="Schedule" actions={data.schedule && <StatusPill status={data.schedule.enabled ? 'enabled' : 'disabled'}>{data.schedule.enabled ? 'enabled' : anyOn ? 'disabled' : 'disabled (no generator on)'}</StatusPill>}>
+            <Card title="Schedule" actions={data.schedule && <StatusPill status={data.schedule.enabled ? 'enabled' : data.schedule.blockedReason ? 'pending' : 'disabled'}>{scheduleLabel(data.schedule)}</StatusPill>}>
               {data.schedule ? (
                 <>
                   <Field inline><Toggle checked={data.scheduleEnabled} disabled={busy || !anyOn} onChange={(v) => save({ enabled: v })} label="Rebuild statistics on a schedule" description={anyOn ? 'Runs every enabled generator for all active domains.' : 'Enable a generator first.'} /></Field>
                   <Field label="Cron expression" help="Nightly after log rotation is typical"><CronField value={data.schedule.cron} onSave={(cron) => save({ cron })} saving={busy} /></Field>
                   <KeyValue items={[['Last run', formatDate(data.schedule.lastRunAt)], ['Next run', formatDate(data.schedule.nextRunAt)], ['Active domains', data.domains]]} />
-                  <p className="muted">The schedule is paused automatically while no generator is enabled and resumes when one is turned back on. It is also listed with the other panel schedules in <Link to="/server-configuration/configure-cpanel-cron-jobs">Configure cPanel Cron Jobs</Link>.</p>
+                  <p className="muted">The schedule pauses itself while no enabled generator is installed on this server (so no empty run is queued) and resumes when one appears. A schedule switched off in <Link to="/server-configuration/configure-cpanel-cron-jobs">Configure cPanel Cron Jobs</Link> stays off until it is switched on there or here.</p>
                 </>
               ) : <p className="muted">Schedule not registered.</p>}
             </Card>

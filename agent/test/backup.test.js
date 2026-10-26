@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { parseTarListing, foldChildren, archiveTop, archiveUser, buildArchiveName, signS3, s3Target, parseS3Listing, remoteUrl, destinationConfig, createDatabaseStatement } from '../src/ops/backup.js';
+import { parseTarListing, foldChildren, archiveTop, archiveUser, buildArchiveName, freeArchiveName, tarExcludeArgs, parseCpUserFile, cpmoveMetadata, unsafeMembers, grantDatabase, signS3, s3Target, parseS3Listing, remoteUrl, destinationConfig, createDatabaseStatement } from '../src/ops/backup.js';
 
 // exec is spied with the real implementation behind it so tests can prove an op
 // refused before any program ran. No test here archives, extracts, imports or
@@ -123,6 +123,35 @@ describe('backup schemas reject injection and traversal before anything runs', (
     expect(exec).not.toHaveBeenCalled();
   });
 
+  it('backup.db.restore_users refuses global and system-schema grants and validates allowedDatabases before anything runs', async () => {
+    exec.mockClear();
+    const user = (grants) => ({ users: [{ user: 'alice_app', host: 'localhost', hashHex: '2A41', grants }] });
+    for (const grant of [
+      "GRANT ALL PRIVILEGES ON *.* TO 'alice_app'@'localhost'",
+      "GRANT USAGE ON *.* TO 'alice_app'@'localhost'",
+      "GRANT SELECT ON mysql.* TO 'alice_app'@'localhost'",
+      "GRANT SELECT ON `mysql`.`user` TO 'alice_app'@'localhost'",
+      "GRANT ALL ON `information_schema`.* TO 'alice_app'@'localhost'",
+      "GRANT SELECT ON `performance_schema`.* TO 'alice_app'@'localhost'",
+      "GRANT SELECT ON sys.* TO 'alice_app'@'localhost'",
+    ]) {
+      const err = await opError(runOp('backup.db.restore_users', user([grant]), ctx));
+      expect(err.code, grant).toBe('invalid_args');
+      expect(err.details.fields['users.0.grants.0'], grant).toBeDefined();
+    }
+    for (const allowedDatabases of [['alice_shop; DROP'], ['Shop'], ['a'.repeat(65)], 'alice_shop']) expect((await opError(runOp('backup.db.restore_users', { ...user([]), allowedDatabases }, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+    // A database grant is accepted by the schema; the op then stops at the missing client.
+    hasBinary.mockImplementation((name) => !['mysql', 'mariadb'].includes(name));
+    try {
+      expect((await opError(runOp('backup.db.restore_users', { ...user(["GRANT ALL PRIVILEGES ON `alice_shop`.* TO 'alice_app'@'localhost'"]), allowedDatabases: ['alice_shop'] }, ctx))).code).toBe('capability_missing');
+    } finally { hasBinary.mockRestore(); }
+    expect(exec).not.toHaveBeenCalled();
+    expect(grantDatabase("GRANT ALL PRIVILEGES ON `alice\\_shop`.* TO 'a'@'localhost'")).toBe('alice_shop');
+    expect(grantDatabase("GRANT USAGE ON *.* TO 'a'@'localhost'")).toBe('*');
+    expect(grantDatabase("GRANT PROXY ON ''@'' TO 'a'@'localhost'")).toBeNull();
+  });
+
   it('creates the schema for a per-database (cPanel) dump from the validated name, taking only charset/collation from <db>.create', () => {
     expect(createDatabaseStatement('alice_shop')).toBe('CREATE DATABASE IF NOT EXISTS `alice_shop`');
     expect(createDatabaseStatement('alice_shop', 'CREATE DATABASE `alice_shop` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci */;\n')).toBe('CREATE DATABASE IF NOT EXISTS `alice_shop` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci');
@@ -150,7 +179,8 @@ describe('backup schemas reject injection and traversal before anything runs', (
       { kind: 'ftp', host: 'ftp.example.com', username: 'u', port: 70000 },
       { kind: 'ftp', host: 'ftp.example.com', username: '', password: 'p' },
       { kind: 'sftp', host: 'sftp.example.com', username: 'u', hostKeySha256: 'short' },
-      { kind: 'sftp', host: 'sftp.example.com', username: 'u', path: 'a b' },
+      { kind: 'sftp', host: 'sftp.example.com', username: 'u', path: 'a b', insecure: true },
+      { kind: 'sftp', host: 'sftp.example.com', username: 'u', password: 'p' },
       { kind: 'webdav', url: 'file:///etc/passwd' },
       { kind: 'webdav', url: 'not a url' },
       { kind: 's3', bucket: 'Bad_Bucket', accessKey: 'a', secretKey: 'b' },
@@ -173,11 +203,65 @@ describe('backup schemas reject injection and traversal before anything runs', (
     expect((await opError(runOp('backup.destination.upload', { config: good, file: '/root/backup-10.26.2026_02-00-00_alice.tar.gz' }, ctx))).code).toBe('path_not_allowed');
     expect((await opError(runOp('backup.destination.test', { config: { kind: 'local', dir: '/etc/backups' } }, ctx))).code).toBe('path_not_allowed');
     expect(exec).not.toHaveBeenCalled();
-    expect(destinationConfig.safeParse({ kind: 'sftp', host: '10.0.0.5', username: 'u', path: '~/backups' }).success).toBe(true);
+    // SFTP verifies the server only with a pinned fingerprint or an explicit opt-out.
+    const sftp = { kind: 'sftp', host: '10.0.0.5', username: 'u', path: '~/backups' };
+    const unpinned = destinationConfig.safeParse(sftp);
+    expect(unpinned.success).toBe(false);
+    expect(unpinned.error.issues[0].path).toEqual(['hostKeySha256']);
+    expect(destinationConfig.safeParse({ ...sftp, hostKeySha256: 'A'.repeat(43) }).success).toBe(true);
+    expect(destinationConfig.safeParse({ ...sftp, insecure: true }).success).toBe(true);
+    expect(destinationConfig.safeParse({ kind: 'ftp', host: '10.0.0.5', username: 'u' }).success).toBe(true);
   });
 });
 
 describe('pure helpers', () => {
+  it('takes the next free second when an archive name is taken, and anchors exclude patterns at the home root', () => {
+    const at = new Date(2026, 9, 26, 2, 5, 9);
+    expect(freeArchiveName('alice', () => false, at)).toBe('backup-10.26.2026_02-05-09_alice.tar.gz');
+    const taken = new Set(['backup-10.26.2026_02-05-09_alice.tar.gz', 'backup-10.26.2026_02-05-10_alice.tar.gz']);
+    expect(freeArchiveName('alice', (n) => taken.has(n), at)).toBe('backup-10.26.2026_02-05-11_alice.tar.gz');
+    expect(() => freeArchiveName('alice', () => true, at)).toThrow(OpError);
+    expect(tarExcludeArgs('alice', ['tmp', 'logs/', '.cache'], false)).toEqual(['--anchored', '--no-wildcards-match-slash', '--exclude=alice/mail', '--exclude=alice/tmp', '--exclude=alice/logs', '--exclude=alice/.cache']);
+    expect(tarExcludeArgs('alice', [], true)).toEqual(['--anchored', '--no-wildcards-match-slash']);
+  });
+
+  it('reads cPanel cp/<user>, pds, addons and sds2 into the panel metadata shape', () => {
+    expect(parseCpUserFile('DNS=Alice.com\nPLAN=gold\n# comment\nlower=x\nOWNER=resell1 \n')).toEqual({ DNS: 'Alice.com', PLAN: 'gold', OWNER: 'resell1' });
+    const meta = cpmoveMetadata('DNS=alice.com\nDNS1=blog.alice.com\nPLAN=gold\nOWNER=resell1\nCONTACTEMAIL=a@example.com\nIP=10.0.0.5\n', 'alice', {
+      pds: 'park.com\n',
+      addons: 'addon.com=addon_alice.com\n',
+      sds2: 'addon.alice.com=/home/alice/public_html/addon\nblog.alice.com=/home/alice/public_html/blog\n',
+    });
+    expect(meta.source).toBe('cpmove');
+    expect(meta.account).toEqual({ username: 'alice', domain: 'alice.com', package_name: 'gold', owner: 'resell1', contact_email: 'a@example.com', ip: '10.0.0.5', plan: {} });
+    expect(meta.domains).toEqual([
+      { domain: 'addon.com', type: 'addon', docroot: '/home/alice/public_html/addon' },
+      { domain: 'blog.alice.com', type: 'sub', docroot: '/home/alice/public_html/blog' },
+      { domain: 'park.com', type: 'parked', docroot: null },
+    ]);
+    expect(cpmoveMetadata('PLAN=gold\n', 'alice')).toBeNull();
+    expect(cpmoveMetadata('DNS=not a domain\n', 'alice')).toBeNull();
+    expect(cpmoveMetadata('DNS=alice.com\n', 'alice', { addons: 'bad domain=x\n', pds: '../etc\n' }).domains).toEqual([]);
+  });
+
+  it('names the archive members a restore refuses: device nodes, absolute names and ".." segments', () => {
+    const entries = parseTarListing([
+      '-rw-r--r-- alice/alice 10 2026-10-26 02:00 cpmove-alice/homedir/public_html/index.html',
+      'drwxr-xr-x alice/alice 0 2026-10-26 02:00 cpmove-alice/homedir/public_html/',
+      'crw-rw-rw- root/root 1,3 2026-10-26 02:00 cpmove-alice/homedir/dev/null',
+      'brw-rw---- root/root 0 2026-10-26 02:00 cpmove-alice/homedir/sda',
+      '-rw-r--r-- root/root 10 2026-10-26 02:00 /etc/cron.d/evil',
+      '-rw-r--r-- root/root 10 2026-10-26 02:00 cpmove-alice/homedir/../../root/.bashrc',
+      'lrwxrwxrwx alice/alice 0 2026-10-26 02:00 cpmove-alice/homedir/link -> /etc',
+    ].join('\n'));
+    expect(unsafeMembers(entries)).toEqual([
+      { name: 'cpmove-alice/homedir/dev/null', reason: 'device node' },
+      { name: 'cpmove-alice/homedir/sda', reason: 'device node' },
+      { name: '/etc/cron.d/evil', reason: 'absolute path' },
+      { name: 'cpmove-alice/homedir/../../root/.bashrc', reason: '".." segment' },
+    ]);
+  });
+
   it('derives names, top directories and users of archives', () => {
     expect(buildArchiveName('alice', new Date(2026, 9, 26, 2, 5, 9))).toBe('backup-10.26.2026_02-05-09_alice.tar.gz');
     expect(archiveTop('/backup/backup-10.26.2026_02-05-09_alice.tar.gz')).toBe('backup-10.26.2026_02-05-09_alice');

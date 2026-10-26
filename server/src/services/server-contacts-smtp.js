@@ -43,11 +43,22 @@ export function dotStuff(message) {
   return message.replace(/\r?\n/g, '\r\n').replace(/(^|\r\n)\./g, '$1..');
 }
 
-export function sendSmtp({ host, port = 587, security = 'starttls', username, password, from, to, message, timeoutMs = 20_000, rejectUnauthorized = true, clientName }) {
+// Loopback never leaves the host, so credentials over a plain connection to
+// it are harmless; anywhere else they need TLS or an explicit opt-in.
+export const isLoopbackHost = (host) => /^(localhost|127(?:\.\d{1,3}){3}|::1|::ffff:127(?:\.\d{1,3}){3})$/i.test(String(host || '').trim());
+
+// SNI needs a name: an IP literal as servername makes Node warn (DEP0123)
+// and later refuse it.
+const tlsOptions = (host, rejectUnauthorized) => ({ rejectUnauthorized, ...(net.isIP(host) ? {} : { servername: host }) });
+
+export function sendSmtp({ host, port = 587, security = 'starttls', username, password, from, to, message, timeoutMs = 20_000, rejectUnauthorized = true, clientName, allowPlaintextAuth = false }) {
   const recipients = Array.isArray(to) ? to : [to];
   if (!ADDRESS.test(from)) return Promise.reject(new SmtpError('invalid_address', `"${from}" is not a usable sender address`));
   for (const r of recipients) if (!ADDRESS.test(r)) return Promise.reject(new SmtpError('invalid_address', `"${r}" is not a usable recipient address`));
   if (!['none', 'starttls', 'tls'].includes(security)) return Promise.reject(new SmtpError('invalid_args', `Unknown SMTP security mode "${security}"`));
+  if (username && security === 'none' && !allowPlaintextAuth && !isLoopbackHost(host)) {
+    return Promise.reject(new SmtpError('plaintext_auth_refused', `Refusing to send the relay password to ${host} over an unencrypted connection: choose STARTTLS or implicit TLS, or allow plaintext authentication in Contact Manager`));
+  }
   const ehloName = clientName || os.hostname() || 'localhost';
 
   return new Promise((resolve, reject) => {
@@ -101,7 +112,7 @@ export function sendSmtp({ host, port = 587, security = 'starttls', username, pa
     const ehlo = async () => (await send(`EHLO ${ehloName}`, [250])).lines.slice(1).map((l) => l.toUpperCase());
 
     (async () => {
-      attach(security === 'tls' ? tls.connect({ host, port, servername: host, rejectUnauthorized }) : net.connect({ host, port }));
+      attach(security === 'tls' ? tls.connect({ host, port, ...tlsOptions(host, rejectUnauthorized) }) : net.connect({ host, port }));
       const greeting = await expectReply();
       if (greeting.code !== 220) throw new SmtpError('rejected', `SMTP greeting was ${greeting.code} ${greeting.lines.join(' ')}`.trim());
       let caps = await ehlo();
@@ -110,7 +121,7 @@ export function sendSmtp({ host, port = 587, security = 'starttls', username, pa
         await send('STARTTLS', [220]);
         const plain = socket;
         detach(plain);
-        const upgraded = tls.connect({ socket: plain, servername: host, rejectUnauthorized });
+        const upgraded = tls.connect({ socket: plain, ...tlsOptions(host, rejectUnauthorized) });
         attach(upgraded);
         await new Promise((res, rej) => { upgraded.once('secureConnect', res); upgraded.once('error', rej); });
         secure = true;

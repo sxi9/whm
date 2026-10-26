@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
@@ -62,13 +62,29 @@ export function ChangeHostname() {
   const [result, setResult] = useState(null);
   const [submitError, setSubmitError] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [savingDefaults, setSavingDefaults] = useState(false);
+  const seeded = useRef(false);
 
+  // The toggles are seeded from the saved defaults once; a refetch (after a
+  // change, or Refresh) must not discard what the admin picked.
   useEffect(() => {
     if (!status) return;
     setHostname((h) => h || status.current || '');
+    if (seeded.current) return;
+    seeded.current = true;
     setUpdateHosts(status.defaults?.updateHosts ?? true);
     setAddDnsRecord(Boolean(status.capability?.dns && (status.defaults?.addDnsRecord ?? true)));
   }, [status]);
+
+  const defaultsDirty = status && (updateHosts !== (status.defaults?.updateHosts ?? true) || addDnsRecord !== (status.defaults?.addDnsRecord ?? true));
+  const saveDefaults = async () => {
+    setSavingDefaults(true);
+    try {
+      await api.put('/networking/hostname/defaults', { updateHosts, addDnsRecord });
+      toast.success('Saved as the defaults for future hostname changes');
+      await refetch();
+    } catch (err) { toast.error(err); } finally { setSavingDefaults(false); }
+  };
 
   const problems = useMemo(() => hostnameProblems(hostname), [hostname]);
   const normalized = hostname.trim().toLowerCase().replace(/\.+$/, '');
@@ -121,7 +137,7 @@ export function ChangeHostname() {
             ['System hostname', <span key="h"><code>{status.current || '(unknown)'}</code> {status.validation?.ok ? <StatusPill status="ok">fully qualified</StatusPill> : <StatusPill status="warning">{status.validation?.problems?.[0] || 'not valid'}</StatusPill>}</span>],
             ['Panel setting (basic.hostname)', <span key="c"><code>{status.configured || '(not set)'}</code> {status.inSync ? <StatusPill status="ok">in sync</StatusPill> : <StatusPill status="warning">differs</StatusPill>}</span>],
             ['Main IP address', status.ip ? <span key="i"><code>{status.ip}</code>{!status.configuredIp && <span className="muted"> (detected; set it in <Link to="/server-configuration/basic-webhost-manager-setup">Basic Setup</Link>)</span>}</span> : <span key="i" className="muted">none detected</span>],
-            ['/etc/hosts entry', status.hosts?.error ? <StatusPill key="e" status="warning">{status.hosts.error}</StatusPill> : status.hosts?.entry ? <span key="e"><code>{status.hosts.entry.ip} {status.hosts.entry.names.join(' ')}</code> {status.hosts.ok ? <StatusPill status="ok">ok</StatusPill> : <StatusPill status="warning">points elsewhere</StatusPill>}</span> : <StatusPill key="e" status="warning">missing</StatusPill>],
+            ['/etc/hosts entry', status.hosts?.error ? <StatusPill key="e" status="warning">{status.hosts.error}</StatusPill> : status.hosts?.entry ? <span key="e"><code>{status.hosts.entry.ip} {status.hosts.entry.names.join(' ')}</code> {status.hosts.ok ? <StatusPill status="ok">{status.hosts.loopback && status.hosts.entry.ip !== status.ip ? 'loopback' : 'ok'}</StatusPill> : <StatusPill status="warning">points elsewhere</StatusPill>}</span> : <StatusPill key="e" status="warning">missing</StatusPill>],
             status.dns && ['DNS A record', status.dns.error ? <span key="d" className="muted">{status.dns.error}</span> : status.dns.record ? <span key="d"><code>{status.dns.recordName} IN A {status.dns.record.value}</code> in <Link to={`/dns-functions/dns-zone-manager?domain=${status.dns.zone}`}>{status.dns.zone}</Link></span> : <span key="d"><StatusPill status="warning">missing</StatusPill> <Link to="/dns-functions/add-an-a-entry-for-your-hostname">Add an A entry</Link></span>],
             ['Resolves publicly', status.resolves ? (status.resolves.matches ? <StatusPill key="r" status="ok">yes → {status.resolves.answers.join(', ')}</StatusPill> : <StatusPill key="r" status="warning">{status.resolves.answers?.length ? `resolves to ${status.resolves.answers.join(', ')}` : status.resolves.error || 'no answer'}</StatusPill>) : <span key="r" className="muted">not checked</span>],
             ['hostnamectl', status.capability?.hostnamectl ? <StatusPill key="k" status="installed">available</StatusPill> : <StatusPill key="k" status="not-installed">not installed</StatusPill>],
@@ -145,6 +161,7 @@ export function ChangeHostname() {
           <FormActions>
             <Button type="submit" variant="danger" loading={busy} disabled={!canSubmit}>Change hostname</Button>
             <Button onClick={doPreview} disabled={!normalized || problems.length > 0}>Preview /etc/hosts</Button>
+            <Button size="sm" onClick={saveDefaults} loading={savingDefaults} disabled={!defaultsDirty} title="Remember the /etc/hosts and DNS record choices for future hostname changes">Save toggles as defaults</Button>
           </FormActions>
         </form>
         <ErrorBanner error={previewError} />

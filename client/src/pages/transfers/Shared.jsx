@@ -61,11 +61,12 @@ function StepList({ steps }) {
   const rows = [];
   for (const [name, value] of Object.entries(steps || {})) {
     if (name === 'plan' || value == null) continue;
-    if (Array.isArray(value)) for (const v of value) rows.push({ name: `${name} ${v.name || v.domain || ''}`.trim(), status: v.status, detail: v.detail, extra: v.sizeBytes != null ? formatBytes(v.sizeBytes) : null });
+    if (Array.isArray(value)) for (const v of value) rows.push({ name: `${name} ${v.name || v.domain || ''}`.trim(), status: v.status, detail: v.detail, extra: v.sizeBytes != null ? formatBytes(v.sizeBytes) : null, zone: v.zone || null });
     else if (typeof value === 'object') rows.push({ name, status: value.status, detail: value.detail });
   }
   if (!rows.length) return <span className="muted">—</span>;
-  return <ul style={{ margin: 0, paddingLeft: 16 }}>{rows.map((r, i) => <li key={i}><code>{r.name}</code> {stepPill(r.status)} {r.detail && <span className="muted">{r.detail}</span>}{r.extra && <span className="muted"> · {r.extra}</span>}</li>)}</ul>;
+  // A zone that could not be stored (no BIND) travels with its step so it can be imported by hand.
+  return <ul style={{ margin: 0, paddingLeft: 16 }}>{rows.map((r, i) => <li key={i}><code>{r.name}</code> {stepPill(r.status)} {r.detail && <span className="muted">{r.detail}</span>}{r.extra && <span className="muted"> · {r.extra}</span>}{r.zone && <details><summary>Source zone text</summary><pre className="log" style={{ maxHeight: 240, overflow: 'auto' }}>{r.zone}</pre></details>}</li>)}</ul>;
 }
 
 export function RunDetail({ run }) {

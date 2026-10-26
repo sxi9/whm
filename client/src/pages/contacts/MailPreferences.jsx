@@ -7,43 +7,70 @@ import { DataTable } from '../../components/DataTable.jsx';
 import { Field, TextInput, Button, FormActions, ErrorBanner } from '../../components/Form.jsx';
 import { useToast } from '../../components/Toast.jsx';
 
+const TARGET_RE = /^([a-z][a-z0-9_-]{0,31}|[A-Za-z0-9_][A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,63})$/;
+
+function TargetList({ label, help, value, onChange }) {
+  const toast = useToast();
+  const [draft, setDraft] = useState('');
+  const add = (e) => {
+    e.preventDefault();
+    const t = draft.trim();
+    if (!t) return;
+    if (!TARGET_RE.test(t)) { toast.error('Enter a local account name or a full email address'); return; }
+    if (!value.includes(t)) onChange([...value, t]);
+    setDraft('');
+  };
+  return (
+    <Field label={label} help={help}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
+        {value.length === 0 && <span className="muted">Not forwarded (local mailbox)</span>}
+        {value.map((t) => (
+          <span key={t} className="pill pill-info" style={{ textTransform: 'none', height: 26, gap: 6 }}>
+            {t}
+            <button type="button" className="icon-button" aria-label={`Remove ${t}`} onClick={() => onChange(value.filter((x) => x !== t))} style={{ padding: 0 }}><X size={12} /></button>
+          </span>
+        ))}
+      </div>
+      <form onSubmit={add} style={{ display: 'flex', gap: 8 }}>
+        <div style={{ flex: 1 }}><TextInput value={draft} onChange={setDraft} placeholder="admin@example.com or a local user" /></div>
+        <Button type="submit" icon={Plus} disabled={!draft.trim() || value.length >= 20}>Add</Button>
+      </form>
+    </Field>
+  );
+}
+
 export function MailPreferences() {
   const toast = useToast();
   const { data, loading, error, refetch } = useApi('/server-contacts/mail-preferences');
   const [forwardTo, setForwardTo] = useState([]);
+  const [nobodyTo, setNobodyTo] = useState([]);
   const [events, setEvents] = useState([]);
-  const [newTarget, setNewTarget] = useState('');
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(null);
   const [testing, setTesting] = useState(false);
 
-  useEffect(() => { if (data) { setForwardTo(data.forwardTo); setEvents(data.rootMailEvents); } }, [data]);
-  const dirty = data && (JSON.stringify(forwardTo) !== JSON.stringify(data.forwardTo) || JSON.stringify([...events].sort()) !== JSON.stringify([...data.rootMailEvents].sort()));
+  const savedNobody = data?.users?.nobody || [];
+  useEffect(() => { if (data) { setForwardTo(data.forwardTo); setNobodyTo(data.users?.nobody || []); setEvents(data.rootMailEvents); } }, [data]);
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const dirty = data && (!same(forwardTo, data.forwardTo) || !same(nobodyTo, savedNobody) || !same([...events].sort(), [...data.rootMailEvents].sort()));
   const groups = useMemo(() => {
     const out = new Map();
     for (const e of data?.events || []) { if (!out.has(e.group)) out.set(e.group, []); out.get(e.group).push(e); }
     return [...out.entries()];
   }, [data]);
 
-  const addTarget = (e) => {
-    e.preventDefault();
-    const t = newTarget.trim();
-    if (!t) return;
-    if (!/^([a-z][a-z0-9_-]{0,31}|[A-Za-z0-9_][A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,63})$/.test(t)) { toast.error('Enter a local account name or a full email address'); return; }
-    if (!forwardTo.includes(t)) setForwardTo([...forwardTo, t]);
-    setNewTarget('');
-  };
-
   const save = async () => {
     setSaving(true);
     setSaveError(null);
     try {
       const body = {};
-      if (JSON.stringify(forwardTo) !== JSON.stringify(data.forwardTo)) body.forwardTo = forwardTo;
-      if (JSON.stringify([...events].sort()) !== JSON.stringify([...data.rootMailEvents].sort())) body.rootMailEvents = events;
+      if (!same(forwardTo, data.forwardTo)) body.forwardTo = forwardTo;
+      if (!same(nobodyTo, savedNobody)) body.users = { nobody: nobodyTo };
+      if (!same([...events].sort(), [...data.rootMailEvents].sort())) body.rootMailEvents = events;
       const res = await api.put('/server-contacts/mail-preferences', body);
       const rebuild = res.data.rebuild;
-      toast.success(body.forwardTo ? `Root mail now ${forwardTo.length ? `forwards to ${forwardTo.join(', ')}` : 'stays in the local mailbox'}${rebuild?.ran ? ' (alias database rebuilt)' : ''}` : 'System mail preferences saved');
+      const changed = [body.forwardTo && `root mail ${forwardTo.length ? `forwards to ${forwardTo.join(', ')}` : 'stays in the local mailbox'}`, body.users && `mail for nobody ${nobodyTo.length ? `forwards to ${nobodyTo.join(', ')}` : 'stays in the local mailbox'}`].filter(Boolean);
+      toast.success(changed.length ? `${changed.join('; ')}${rebuild?.ran ? ' (alias database rebuilt)' : ''}` : 'System mail preferences saved');
       refetch();
     } catch (err) { setSaveError(err); toast.error(err); } finally { setSaving(false); }
   };
@@ -85,21 +112,8 @@ export function MailPreferences() {
             ['Rebuild after saving', data.aliases?.rebuildTool === 'newaliases' ? 'newaliases (Postfix/Sendmail database)' : data.aliases?.rebuildTool === 'exim' ? 'not needed: Exim reads the file directly' : <span className="muted">no mail server detected</span>],
             ['Mail transport', data.capability.mailTransport === 'exim' ? 'Exim on this server' : data.capability.mailTransport === 'smtp' ? 'SMTP relay (Contact Manager)' : <span className="muted">none</span>],
           ]} />
-          <Field label="Forward root's mail to" help={data.capability.mailTransport === 'smtp' ? 'Full email addresses receive the events below through the SMTP relay; local account names only apply once a mail server runs on this host.' : 'Local account names or full email addresses. An empty list keeps root\'s mail in the local mailbox.'}>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
-              {forwardTo.length === 0 && <span className="muted">Not forwarded (local mailbox)</span>}
-              {forwardTo.map((t) => (
-                <span key={t} className="pill pill-info" style={{ textTransform: 'none', height: 26, gap: 6 }}>
-                  {t}
-                  <button type="button" className="icon-button" aria-label={`Remove ${t}`} onClick={() => setForwardTo(forwardTo.filter((x) => x !== t))} style={{ padding: 0 }}><X size={12} /></button>
-                </span>
-              ))}
-            </div>
-            <form onSubmit={addTarget} style={{ display: 'flex', gap: 8 }}>
-              <div style={{ flex: 1 }}><TextInput value={newTarget} onChange={setNewTarget} placeholder="admin@example.com or a local user" /></div>
-              <Button type="submit" icon={Plus} disabled={!newTarget.trim() || forwardTo.length >= 20}>Add</Button>
-            </form>
-          </Field>
+          <TargetList label="Forward root's mail to" value={forwardTo} onChange={setForwardTo} help={data.capability.mailTransport === 'smtp' ? 'Full email addresses receive the events below through the SMTP relay; local account names only apply once a mail server runs on this host.' : 'Local account names or full email addresses. An empty list keeps root\'s mail in the local mailbox.'} />
+          <TargetList label="Forward mail for nobody to" value={nobodyTo} onChange={setNobodyTo} help="The web server user: cron output and PHP mail() from sites without a sender land here. Forward it to root or an address so it is read; an empty list keeps it in the local mailbox." />
           <FormActions>
             <Button icon={Send} loading={testing} disabled={!data.capability.mailTransport || dirty || Boolean(data.rootDelivery?.error)} onClick={sendTest} title={dirty ? 'Save first' : data.rootDelivery?.error || undefined}>Send a test message to root</Button>
           </FormActions>
@@ -127,8 +141,8 @@ export function MailPreferences() {
       </div>
 
       {data.aliases?.entries?.length > 0 && (
-        <Card title="Other aliases on this server" subtitle="Read from /etc/aliases. Only the root entry is managed by the panel; edit the rest on the server." padded={false}>
-          <DataTable dense rows={data.aliases.entries.filter((e) => e.name !== 'root')} rowKey={(e) => e.name} emptyText="Only the root alias exists."
+        <Card title="Other aliases on this server" subtitle="Read from /etc/aliases. Only the root and nobody entries are managed by the panel; edit the rest on the server." padded={false}>
+          <DataTable dense rows={data.aliases.entries.filter((e) => !(data.managedUsers || ['root']).includes(e.name))} rowKey={(e) => e.name} emptyText="Only the managed aliases exist."
             columns={[{ key: 'name', label: 'Alias', render: (e) => <code>{e.name}</code> }, { key: 'targets', label: 'Delivers to', render: (e) => e.targets.join(', ') }]} />
         </Card>
       )}
@@ -137,7 +151,7 @@ export function MailPreferences() {
         <ErrorBanner error={saveError} />
         <FormActions>
           <Button variant="primary" loading={saving} disabled={!dirty} onClick={save}>Save</Button>
-          <Button disabled={!dirty || saving} onClick={() => { setForwardTo(data.forwardTo); setEvents(data.rootMailEvents); }}>Reset</Button>
+          <Button disabled={!dirty || saving} onClick={() => { setForwardTo(data.forwardTo); setNobodyTo(savedNobody); setEvents(data.rootMailEvents); }}>Reset</Button>
         </FormActions>
       </div>
     </>

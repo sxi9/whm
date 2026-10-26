@@ -246,6 +246,8 @@ describe('Server Status API', () => {
       const { body } = await get('/process-log/days').expect(200);
       expect(body.data.days).toEqual([]);
       expect(body.data.settings).toMatchObject({ enabled: true, topN: 25, retentionDays: 14, schedule: { cron: '*/5 * * * *', enabled: true } });
+      const settings = await get('/process-log/settings').expect(200);
+      expect(settings.body.data).toMatchObject({ enabled: true, topN: 25, retentionDays: 14, schedule: { name: 'process-log-sampler', cron: '*/5 * * * *', enabled: true } });
       const latest = await get('/process-log/latest').expect(200);
       expect(latest.body.data).toBeNull();
     });
@@ -261,6 +263,33 @@ describe('Server Status API', () => {
       const on = await put('/process-log/settings', { enabled: true }).expect(200);
       expect(on.body.data.schedule.enabled).toBe(true);
       expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'server_status.process_log.settings'").get().n).toBe(2);
+    });
+
+    it('keeps the setting authoritative over the schedule row without rewriting an aligned row', () => {
+      const s = app.ctx.serverStatus.processLog;
+      expect(s.alignSchedule()).toEqual({ changed: false, enabled: true });
+      app.ctx.scheduler.update('process-log-sampler', { enabled: false });
+      expect(s.settings()).toMatchObject({ enabled: true, schedule: { enabled: false } });
+      expect(s.alignSchedule()).toEqual({ changed: true, enabled: true });
+      expect(app.ctx.scheduler.list().find((r) => r.name === 'process-log-sampler').enabled).toBe(1);
+      expect(s.alignSchedule()).toEqual({ changed: false, enabled: true });
+    });
+
+    it('records nothing on a scheduled run while the sampler is paused, but still samples on demand', async () => {
+      await put('/process-log/settings', { enabled: false }).expect(200);
+      try {
+        const scheduled = await app.ctx.serverStatus.jobs['server_status.process_sample']({ params: {}, log: () => {} });
+        expect(scheduled).toEqual({ skipped: 'paused' });
+        expect(app.agent.callsTo('sys.processes')).toHaveLength(0);
+        const res = await post('/process-log/sample').expect(202);
+        const job = await waitForJob(app.ctx, res.body.data.job.id);
+        expect(job.status).toBe('done');
+        expect(job.result).toMatchObject({ processes: 5, recorded: 3 });
+        const audit = app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'server_status.process_log.sample' ORDER BY id DESC LIMIT 1").get();
+        expect(audit).toBeTruthy();
+        expect(JSON.parse(audit.args_redacted)).toMatchObject({ jobId: res.body.data.job.id });
+        await del(`/process-log/day/${dayKey()}`).expect(200);
+      } finally { await put('/process-log/settings', { enabled: true }).expect(200); }
     });
 
     it('samples the top processes on demand as a job and stores them per day', async () => {

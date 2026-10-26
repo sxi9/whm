@@ -1,7 +1,16 @@
 import { paginate } from '../db/index.js';
-import { notFound, conflict, badRequest } from '../lib/errors.js';
+import { notFound, conflict, badRequest, serviceUnavailable } from '../lib/errors.js';
 
 export const PATTERN_RE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
+// Owner names as `ps -o user:32` prints them: system users such as "_apt",
+// mixed case, bare UIDs for deleted users and names cut at 32 chars with a
+// trailing "+". They are only ever compared, never passed to a program.
+export const PS_USER_RE = /^[A-Za-z0-9_][A-Za-z0-9._$+-]{0,31}$/;
+// The op schema's maximum; a snapshot that reaches it may have been cut short.
+export const PROCESS_SCAN_LIMIT = 5000;
+
+const likeEscape = (s) => String(s).replace(/[\\%_]/g, (c) => `\\${c}`);
+const isUniqueViolation = (err) => err?.code === 'SQLITE_CONSTRAINT_UNIQUE' || /UNIQUE constraint failed/.test(err?.message || '');
 export const SIGNALS = ['SIGKILL', 'SIGTERM', 'SIGINT', 'SIGHUP', 'SIGSTOP'];
 export const SCOPES = ['non-root', 'accounts'];
 
@@ -102,15 +111,16 @@ export function createSystemHealthService(ctx) {
     const cfg = config();
     cfg.accountSet = new Set(stmts.accountUsernames.all().map((r) => r.username));
     const patterns = stmts.enabledPatterns.all().map((r) => r.name);
-    const processes = await agent.op('sys.processes', { sort: 'pid', limit: 5000 });
+    const processes = await agent.op('sys.processes', { sort: 'pid', limit: PROCESS_SCAN_LIMIT });
     const matches = [];
     for (const proc of processes) {
       if (!eligible(proc, cfg)) continue;
       const pattern = matchProcess(proc, patterns);
       if (pattern) matches.push({ pid: proc.pid, ppid: proc.ppid, user: proc.user, command: proc.command, args: proc.args, cpuPercent: proc.cpuPercent, memPercent: proc.memPercent, elapsedSeconds: proc.elapsedSeconds, pattern });
     }
-    return { scanned: processes.length, patterns, matches, config: cfg };
+    return { scanned: processes.length, truncated: processes.length >= PROCESS_SCAN_LIMIT, patterns, matches, config: cfg };
   }
+  const TRUNCATED_MSG = `the process table was cut at ${PROCESS_SCAN_LIMIT} entries; processes with higher PIDs were not examined`;
 
   async function notify(run, kills) {
     if (!ctx.contacts?.notify || !kills.length) return false;
@@ -143,13 +153,16 @@ export function createSystemHealthService(ctx) {
     const kills = [];
     let scanned = 0;
     let matched = 0;
+    let truncated = false;
     let notified = false;
     let error = null;
     try {
       const found = await findMatches();
       scanned = found.scanned;
       matched = found.matches.length;
+      truncated = found.truncated;
       log?.(`${scanned} process(es) scanned, ${matched} match(es) against ${found.patterns.length} pattern(s)`);
+      if (truncated) log?.(TRUNCATED_MSG, 'warn');
       for (const m of found.matches) {
         const entry = { run_id: runId, pid: m.pid, user: m.user, command: m.command, args: m.args || null, pattern: m.pattern, signal: cfg.signal, result: 'killed', error: null };
         if (dryRun) {
@@ -178,41 +191,57 @@ export function createSystemHealthService(ctx) {
     const killed = kills.filter((k) => k.result === 'killed').length;
     const failed = kills.filter((k) => k.result === 'failed').length;
     stmts.finishRun.run({ id: runId, scanned, matched, killed, failed, notified: notified ? 1 : 0, error });
-    if (killed || failed || trigger === 'manual') audit(req, { action: 'system_health.bpk.scan', target: String(runId), args: { trigger, dryRun, scanned, matched, killed, failed, pids: kills.map((k) => k.pid) } });
-    return { run: shapeRun(stmts.runById.get(runId)), kills };
+    if (killed || failed || trigger === 'manual') audit(req, { action: 'system_health.bpk.scan', target: String(runId), args: { trigger, dryRun, scanned, matched, killed, failed, truncated, pids: kills.map((k) => k.pid) } });
+    return { run: shapeRun(stmts.runById.get(runId)), kills, truncated };
+  }
+
+  // The feature's own state: off, or nothing ticked on the list. This is what
+  // the schedule row follows.
+  function featurePaused() {
+    if (!config().enabled) return 'disabled';
+    if (!stmts.enabledPatterns.all().length) return 'no_patterns';
+    return null;
   }
 
   // Why the scheduled scan would do nothing right now, or null when it is armed.
   // The procps check only counts once detection has run (boot registers modules
-  // before the first refresh).
+  // before the first refresh); it is reported for display and makes the job
+  // skip, but never drives the schedule row.
   function pausedReason() {
-    if (!config().enabled) return 'disabled';
-    if (!stmts.enabledPatterns.all().length) return 'no_patterns';
+    const paused = featurePaused();
+    if (paused) return paused;
     if (capabilities.snapshot().at && !capabilities.has('procps')) return 'procps_missing';
     return null;
   }
 
-  // The schedule mirrors the feature: paused while a run would be skipped, so
-  // the queue never fills with no-op jobs; resumed as soon as something is armed.
-  function syncSchedule() {
-    const paused = pausedReason();
+  // The enabled setting (and whether any name is ticked) is the single source
+  // of truth for the schedule row, but the row is written only when that state
+  // actually flips: `before` is featurePaused() from before the change. The
+  // generic schedules endpoint may pause or resume the row too, and a page load
+  // or an unrelated setting change must never revert that. Called without
+  // `before` it aligns unconditionally (first boot, when the row is created).
+  function alignSchedule(before) {
+    const after = featurePaused();
+    if (before !== undefined && Boolean(before) === Boolean(after)) return after;
     const schedule = ctx.scheduler.list().find((s) => s.name === SCHEDULE);
-    if (schedule && Boolean(schedule.enabled) !== !paused) {
-      try { ctx.scheduler.update(SCHEDULE, { enabled: !paused }); } catch (err) { logger.warn({ err }, 'could not toggle the background process killer schedule'); }
+    if (schedule && Boolean(schedule.enabled) !== !after) {
+      try { ctx.scheduler.update(SCHEDULE, { enabled: !after }); } catch (err) { logger.warn({ err }, 'could not toggle the background process killer schedule'); }
     }
-    return paused;
+    return after;
   }
 
   return {
     SCHEDULE,
     config,
     pausedReason,
-    syncSchedule,
+    featurePaused,
+    alignSchedule,
 
     // Page bootstrap: configuration, patterns, schedule and recent activity.
+    // A read: nothing is written here.
     async overview() {
       await capabilities.ensureFresh();
-      const paused = syncSchedule();
+      const paused = pausedReason();
       const schedule = ctx.scheduler.list().find((s) => s.name === SCHEDULE) || null;
       const stats = stmts.killStats.get();
       return {
@@ -228,6 +257,7 @@ export function createSystemHealthService(ctx) {
     },
 
     setConfig(patch, req) {
+      const before = featurePaused();
       const current = config();
       const next = { ...current, ...patch };
       const values = {
@@ -239,7 +269,7 @@ export function createSystemHealthService(ctx) {
         'system_health.bpk.retention_days': next.retentionDays,
       };
       settings.setMany(values);
-      syncSchedule();
+      alignSchedule(before);
       audit(req, { action: 'system_health.bpk.configure', args: patch });
       return config();
     },
@@ -249,8 +279,15 @@ export function createSystemHealthService(ctx) {
 
     addPattern({ name, note = null, enabled = true }, req) {
       if (stmts.patternByName.get(name)) throw conflict(`"${name}" is already on the list`);
-      const { lastInsertRowid } = stmts.insertPattern.run({ name, enabled: enabled ? 1 : 0, note });
-      syncSchedule();
+      const before = featurePaused();
+      let lastInsertRowid;
+      try {
+        ({ lastInsertRowid } = stmts.insertPattern.run({ name, enabled: enabled ? 1 : 0, note }));
+      } catch (err) {
+        if (isUniqueViolation(err)) throw conflict(`"${name}" is already on the list`);
+        throw err;
+      }
+      alignSchedule(before);
       audit(req, { action: 'system_health.bpk.pattern.add', target: name, args: { enabled } });
       return shapePattern(stmts.patternById.get(lastInsertRowid));
     },
@@ -262,8 +299,14 @@ export function createSystemHealthService(ctx) {
       const name = patch.name ?? row.name;
       const dup = stmts.patternByName.get(name);
       if (dup && dup.id !== row.id) throw conflict(`"${name}" is already on the list`);
-      stmts.updatePattern.run({ id: row.id, name, enabled: (patch.enabled ?? Boolean(row.enabled)) ? 1 : 0, note: patch.note === undefined ? row.note : patch.note });
-      syncSchedule();
+      const before = featurePaused();
+      try {
+        stmts.updatePattern.run({ id: row.id, name, enabled: (patch.enabled ?? Boolean(row.enabled)) ? 1 : 0, note: patch.note === undefined ? row.note : patch.note });
+      } catch (err) {
+        if (isUniqueViolation(err)) throw conflict(`"${name}" is already on the list`);
+        throw err;
+      }
+      alignSchedule(before);
       audit(req, { action: 'system_health.bpk.pattern.update', target: name, args: patch });
       return shapePattern(stmts.patternById.get(id));
     },
@@ -272,8 +315,9 @@ export function createSystemHealthService(ctx) {
       const row = stmts.patternById.get(id);
       if (!row) throw notFound('Pattern');
       if (row.builtin) throw badRequest('Built-in entries cannot be removed; disable it instead');
+      const before = featurePaused();
       stmts.deletePattern.run(id);
-      syncSchedule();
+      alignSchedule(before);
       audit(req, { action: 'system_health.bpk.pattern.remove', target: row.name });
       return { removed: true, name: row.name };
     },
@@ -281,7 +325,7 @@ export function createSystemHealthService(ctx) {
     // Live preview of what a run would kill right now (nothing is signalled).
     async matches() {
       const found = await findMatches();
-      return { scanned: found.scanned, patterns: found.patterns, matches: found.matches, scope: found.config.scope };
+      return { scanned: found.scanned, truncated: found.truncated, limit: PROCESS_SCAN_LIMIT, patterns: found.patterns, matches: found.matches, scope: found.config.scope };
     },
 
     scan,
@@ -311,7 +355,7 @@ export function createSystemHealthService(ctx) {
     kills(query) {
       const where = [];
       const params = {};
-      if (query.q) { where.push('(user LIKE @q OR command LIKE @q OR args LIKE @q OR pattern LIKE @q)'); params.q = `%${query.q}%`; }
+      if (query.q) { where.push("(user LIKE @q ESCAPE '\\' OR command LIKE @q ESCAPE '\\' OR args LIKE @q ESCAPE '\\' OR pattern LIKE @q ESCAPE '\\')"); params.q = `%${likeEscape(query.q)}%`; }
       if (query.user) { where.push('user = @user'); params.user = query.user; }
       if (query.result) { where.push('result = @result'); params.result = query.result; }
       return paginate(db, {
@@ -329,15 +373,29 @@ export function createSystemHealthService(ctx) {
       return { removed: changes };
     },
 
-    // Show Current Disk Usage: per-mount (df) plus what each account consumes.
+    // Show Current Disk Usage: per-mount (df) plus what each account consumes,
+    // as last sampled by Account Information's disk-usage job.
     async diskUsage() {
       const filesystems = await agent.op('sys.disk.usage');
+      const sampledAt = settings.get('account_info.disk_refreshed_at', null);
+      const canResample = Boolean(ctx.accountInfo?.enqueueDiskRefresh) || ctx.jobs.types().includes('account_info.disk_refresh');
       const accounts = stmts.accountDisk.all().map((a) => ({
         username: a.username, domain: a.domain, owner: a.owner, homeDir: a.home_dir, suspended: Boolean(a.suspended),
         diskUsedMb: a.disk_used_mb ?? 0, diskQuotaMb: a.disk_quota_mb || null,
         usedPercent: a.disk_quota_mb > 0 ? Math.min(100, Math.round(((a.disk_used_mb ?? 0) * 100) / a.disk_quota_mb)) : null,
       }));
-      return { filesystems, accounts, accountsTotalMb: accounts.reduce((n, a) => n + a.diskUsedMb, 0) };
+      return { filesystems, accounts, accountsTotalMb: accounts.reduce((n, a) => n + a.diskUsedMb, 0), sampledAt, canResample };
+    },
+
+    // Re-measure every account now (Account Information owns the sampler).
+    resampleDisk(req) {
+      const user = req?.user ?? null;
+      let job;
+      if (ctx.accountInfo?.enqueueDiskRefresh) job = ctx.accountInfo.enqueueDiskRefresh(user);
+      else if (ctx.jobs.types().includes('account_info.disk_refresh')) job = ctx.jobs.enqueue('account_info.disk_refresh', {}, { userId: user?.id ?? null });
+      else throw serviceUnavailable('The Account Information module is not loaded, so disk usage cannot be resampled');
+      audit(req, { action: 'system_health.disk.resample', target: String(job.id) });
+      return { job };
     },
 
     processes(opts) { requireProcps(); return agent.op('sys.processes', opts); },

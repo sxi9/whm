@@ -239,8 +239,15 @@ export function createServerStatusService(ctx) {
       audit(req, { action: 'server_status.process_log.settings', args: input });
       return processLog.settings();
     },
+    // The setting is the source of truth and the schedule row follows it; the
+    // row is written only when it disagrees, never on every boot or page load.
     alignSchedule() {
-      scheduler.update(SAMPLE_SCHEDULE, { enabled: settings.get(SETTING_KEYS.enabled, true) !== false });
+      const row = scheduler.list().find((r) => r.name === SAMPLE_SCHEDULE);
+      if (!row) return null;
+      const enabled = settings.get(SETTING_KEYS.enabled, true) !== false;
+      if (Boolean(row.enabled) === enabled) return { changed: false, enabled };
+      scheduler.update(SAMPLE_SCHEDULE, { enabled });
+      return { changed: true, enabled };
     },
     prune(retentionDays = processLog.settings().retentionDays) {
       const cutoff = dayKey(new Date(Date.now() - retentionDays * 86_400_000));
@@ -249,7 +256,11 @@ export function createServerStatusService(ctx) {
       return { cutoff, samples };
     },
     async sample(job) {
-      const { topN } = processLog.settings();
+      const { topN, enabled } = processLog.settings();
+      if (!enabled && !job?.params?.manual) {
+        job?.log?.('Sampler is paused in Daily Process Log settings; nothing recorded', 'warn');
+        return { skipped: 'paused' };
+      }
       const now = new Date();
       const processes = await agent.op('sys.processes', { sort: 'cpu', limit: 5000 });
       let info = null;
@@ -275,8 +286,10 @@ export function createServerStatusService(ctx) {
       job?.progress?.(100, `sample #${sampleId}`);
       return { sampleId, processes: processes.length, recorded: picked.length, pruned: pruned.samples };
     },
-    enqueueSample(user) {
-      return jobs.enqueue(SAMPLE_JOB, { manual: true }, { userId: user?.id ?? null });
+    enqueueSample(req) {
+      const job = jobs.enqueue(SAMPLE_JOB, { manual: true }, { userId: req?.user?.id ?? null });
+      audit(req, { action: 'server_status.process_log.sample', args: { jobId: job?.id ?? null } });
+      return job;
     },
     days() {
       const s = processLog.settings();

@@ -25,7 +25,7 @@ export default function ManageResellersIpDelegation({ fn }) {
     setBusy(true); setSaveError(null);
     try {
       const { data: res } = await api.put(`/resellers/${encodeURIComponent(username)}/ips`, { addresses: selected });
-      toast.success(`${username}: ${res.delegated.length} address(es) delegated${res.added.length ? `, +${res.added.length}` : ''}${res.removed.length ? `, -${res.removed.length}` : ''}`);
+      toast.success(`${username}: ${res.delegated.length} address(es) delegated${res.added.length ? `, +${res.added.length}` : ''}${res.removed.length ? `, -${res.removed.length}` : ''}${res.shared_ip_cleared ? `; reseller shared IP ${res.shared_ip_cleared} cleared` : ''}`);
       refetch();
     } catch (err) { setSaveError(err); } finally { setBusy(false); }
   };

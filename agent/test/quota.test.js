@@ -31,14 +31,19 @@ describe('quota helpers', () => {
 
   it('adds usrquota/grpquota (uquota/gquota on xfs) exactly once and keeps other options', () => {
     const [ext4] = parseFstab('/dev/vda1 / ext4 defaults 0 1');
-    expect(withQuotaOptions(ext4)).toEqual({ options: ['defaults', 'usrquota', 'grpquota'], line: '/dev/vda1\t/\text4\tdefaults,usrquota,grpquota\t0\t1' });
+    expect(withQuotaOptions(ext4)).toEqual({ options: ['defaults', 'usrquota', 'grpquota'], line: '/dev/vda1\t/\text4\tdefaults,usrquota,grpquota\t0\t1', changed: true });
     expect(withQuotaOptions(ext4, { groupQuota: false }).options).toEqual(['defaults', 'usrquota']);
     const [already] = parseFstab('/dev/vda1 / ext4 noatime,usrquota,grpquota 0 1');
-    expect(withQuotaOptions(already).options).toEqual(['noatime', 'usrquota', 'grpquota']);
+    expect(withQuotaOptions(already)).toMatchObject({ options: ['noatime', 'usrquota', 'grpquota'], changed: false, line: '/dev/vda1 / ext4 noatime,usrquota,grpquota 0 1' });
+    const [withDefaults] = parseFstab('/dev/vda1 / ext4 defaults,usrquota,grpquota 0 1');
+    expect(withQuotaOptions(withDefaults)).toMatchObject({ options: ['defaults', 'usrquota', 'grpquota'], changed: false });
+    expect(withQuotaOptions(withDefaults, { groupQuota: false }).changed).toBe(false);
+    const [userOnly] = parseFstab('/dev/vda1 / ext4 defaults,usrquota 0 1');
+    expect(withQuotaOptions(userOnly)).toMatchObject({ options: ['defaults', 'usrquota', 'grpquota'], changed: true });
     const [xfs] = parseFstab('/dev/sdb1 /home xfs defaults 0 2');
     expect(withQuotaOptions(xfs).options).toEqual(['defaults', 'uquota', 'gquota']);
     const [journaled] = parseFstab('/dev/vda1 / ext4 usrjquota=aquota.user,jqfmt=vfsv1 0 1');
-    expect(withQuotaOptions(journaled, { groupQuota: false }).options).toEqual(['usrjquota=aquota.user', 'jqfmt=vfsv1']);
+    expect(withQuotaOptions(journaled, { groupQuota: false })).toMatchObject({ options: ['usrjquota=aquota.user', 'jqfmt=vfsv1'], changed: false });
   });
 });
 

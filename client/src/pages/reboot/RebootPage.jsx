@@ -22,22 +22,25 @@ const MODES = {
 
 const HEALTH_POLL_MS = 3000;
 const HEALTH_TIMEOUT_MS = 20 * 60 * 1000;
+const HISTORY_PAGE_SIZE = 10;
 
 // After the reboot command is accepted the panel goes away with the host. This
 // polls the public /api/health endpoint until it fails (host going down) and
 // then succeeds again (panel back), so the operator sees when they can continue.
-export function RebootWatcher({ startedAt, mode }) {
+export function RebootWatcher({ startedAt, mode, onOnline }) {
   const [phase, setPhase] = useState('waiting');
   const [checks, setChecks] = useState(0);
   const [backAt, setBackAt] = useState(null);
   const seenOffline = useRef(false);
+  const onlineRef = useRef(onOnline);
+  onlineRef.current = onOnline;
 
   useEffect(() => {
     let cancelled = false;
     const began = Date.now();
     const tick = async () => {
       if (cancelled) return;
-      if (Date.now() - began > HEALTH_TIMEOUT_MS) { setPhase('timeout'); return; }
+      if (Date.now() - began > HEALTH_TIMEOUT_MS) { setPhase(seenOffline.current ? 'timeout' : 'never-offline'); return; }
       let up = false;
       try { const res = await api.get('/health'); up = Boolean(res?.data?.ok); } catch { up = false; }
       if (cancelled) return;
@@ -48,6 +51,7 @@ export function RebootWatcher({ startedAt, mode }) {
       } else if (seenOffline.current) {
         setPhase('online');
         setBackAt(new Date());
+        onlineRef.current?.();
         return;
       }
       setTimeout(tick, HEALTH_POLL_MS);
@@ -61,9 +65,10 @@ export function RebootWatcher({ startedAt, mode }) {
     offline: 'Server is rebooting — the panel is offline. This page keeps checking…',
     online: 'The server is back online. You can continue using the panel.',
     timeout: 'The panel has not answered for 20 minutes. Check the server console or your provider’s out-of-band access.',
+    'never-offline': 'The reboot command was accepted but the server never went offline in 20 minutes: the panel answered every health check. systemctl may have exited without rebooting (containers, hosts without a working init). Check journalctl -b and the console.',
   }[phase];
-  const tone = { waiting: 'banner-info', offline: 'banner-warning', online: 'banner-success', timeout: 'banner-error' }[phase];
-  const Icon = phase === 'online' ? CheckCircle2 : phase === 'timeout' ? AlertTriangle : Clock;
+  const tone = { waiting: 'banner-info', offline: 'banner-warning', online: 'banner-success', timeout: 'banner-error', 'never-offline': 'banner-error' }[phase];
+  const Icon = phase === 'online' ? CheckCircle2 : phase === 'timeout' || phase === 'never-offline' ? AlertTriangle : Clock;
   return (
     <div className={`banner ${tone}`} role="status" aria-live="polite">
       <Icon size={18} />
@@ -76,8 +81,17 @@ export function RebootWatcher({ startedAt, mode }) {
   );
 }
 
-export function PreflightSummary({ data }) {
+function requestOutcome(r) {
+  if (r.status === 'failed') return { status: 'failed', label: 'failed' };
+  if (r.completed) return { status: 'done', label: 'completed' };
+  if (r.bootIdChanged) return { status: 'pending', label: 'boot id changed by a later reboot' };
+  if (r.status === 'requested') return { status: 'pending', label: 'requested, outcome not recorded' };
+  return { status: 'pending', label: 'triggered, not yet rebooted' };
+}
+
+export function PreflightSummary({ data, onRecheck, rechecking = false }) {
   const active = data.activeWork;
+  const outcome = data.lastRequest ? requestOutcome(data.lastRequest) : null;
   return (
     <>
       <KeyValue items={[
@@ -85,12 +99,12 @@ export function PreflightSummary({ data }) {
         ['Uptime', data.uptimeSeconds != null ? formatDuration(data.uptimeSeconds) : null],
         ['Load average', data.loadAverage ? data.loadAverage.map((n) => n.toFixed(2)).join(' / ') : null],
         ['systemd', <StatusPill key="sd" status={data.capability.systemd ? 'installed' : 'not-installed'}>{data.capability.systemd ? 'systemctl available' : 'systemctl missing'}</StatusPill>],
-        ['Reboot required by updates', data.rebootRequired == null ? <span key="rr" className="muted">unknown</span> : <StatusPill key="rr" status={data.rebootRequired ? 'warning' : 'ok'}>{data.rebootRequired ? 'Yes — pending kernel/library updates' : 'No'}</StatusPill>],
+        ['Reboot required by updates', <span key="rr">{data.rebootRequired == null ? <span className="muted">unknown</span> : <StatusPill status={data.rebootRequired ? 'warning' : 'ok'}>{data.rebootRequired ? 'Yes — pending kernel/library updates' : 'No'}</StatusPill>}{data.rebootRequiredCheckedAt ? <span className="muted"> · checked {formatDate(data.rebootRequiredCheckedAt)}</span> : null}{onRecheck ? <> · <button type="button" className="btn btn-sm btn-ghost" disabled={rechecking} onClick={onRecheck}>{rechecking ? 'checking…' : 're-check'}</button></> : null}</span>],
         ['Running jobs', <StatusPill key="rj" status={data.jobs.running ? 'warning' : 'ok'}>{data.jobs.running}</StatusPill>],
         ['Queued jobs', <StatusPill key="qj" status={data.jobs.queued ? 'warning' : 'ok'}>{data.jobs.queued}</StatusPill>],
         ['Active transfers', data.transfers.available ? <StatusPill key="tr" status={data.transfers.count ? 'warning' : 'ok'}>{data.transfers.count}</StatusPill> : <span key="tr" className="muted">transfers module not loaded</span>],
         ['Active backups', data.backups.available ? <StatusPill key="bk" status={data.backups.count + data.restores.count ? 'warning' : 'ok'}>{data.backups.count + data.restores.count}</StatusPill> : <span key="bk" className="muted">backup module not loaded</span>],
-        data.lastRequest && ['Last panel reboot', <span key="lr">{data.lastRequest.mode} by {data.lastRequest.principal || 'unknown'} {formatDate(data.lastRequest.requested_at)} · <StatusPill status={data.lastRequest.status === 'failed' ? 'failed' : data.lastRequest.completed ? 'done' : 'pending'}>{data.lastRequest.status === 'failed' ? 'failed' : data.lastRequest.completed ? 'completed' : data.lastRequest.status === 'requested' ? 'requested, outcome not recorded' : 'not yet rebooted'}</StatusPill></span>],
+        data.lastRequest && ['Last panel reboot', <span key="lr">{data.lastRequest.mode} by {data.lastRequest.principal || 'unknown'} {formatDate(data.lastRequest.requested_at)} · <StatusPill status={outcome.status}>{outcome.label}</StatusPill></span>],
       ]} />
       {active ? (
         <div className="banner banner-warning">
@@ -125,11 +139,11 @@ export function PreflightSummary({ data }) {
   );
 }
 
-export function RebootHistory() {
-  const { data, loading, error } = useApi('/system-reboot/history?limit=10');
+export function RebootHistory({ history, page, onPageChange }) {
+  const { data, meta, loading, error } = history;
   if (!loading && !error && !(data || []).length) return null;
   return (
-    <Card title="Recent reboot requests" subtitle="Reboots requested through the panel. Completed means the kernel boot id changed after the request." padded={false}>
+    <Card title="Recent reboot requests" subtitle="Reboots requested through the panel. Completed means the kernel boot id changed and the current boot started after the request." padded={false}>
       <DataTable
         dense
         columns={[
@@ -137,10 +151,11 @@ export function RebootHistory() {
           { key: 'mode', label: 'Mode', render: (r) => <StatusPill status={r.mode === 'forceful' ? 'warning' : 'info'}>{r.mode}</StatusPill> },
           { key: 'principal', label: 'By', render: (r) => r.principal || <span className="muted">—</span> },
           { key: 'reason', label: 'Reason', render: (r) => r.reason || <span className="muted">—</span> },
-          { key: 'status', label: 'Result', render: (r) => <StatusPill status={r.status === 'failed' ? 'failed' : r.status === 'requested' ? 'pending' : 'ok'}>{r.status === 'failed' ? `failed: ${r.error}` : r.status === 'requested' ? 'requested (panel went down before the outcome was recorded)' : 'triggered'}</StatusPill> },
+          { key: 'status', label: 'Result', render: (r) => { const o = requestOutcome(r); return <StatusPill status={o.status}>{r.status === 'failed' ? `failed: ${r.error}` : o.label}</StatusPill>; } },
           { key: 'warnings', label: 'Interrupted work', render: (r) => (r.preflight?.warnings?.length ? r.preflight.warnings.join('; ') : <span className="muted">none</span>) },
         ]}
         rows={data || []} loading={loading} error={error} rowKey={(r) => r.id}
+        total={meta?.total ?? null} page={page} pageSize={HISTORY_PAGE_SIZE} onPageChange={onPageChange}
       />
     </Card>
   );
@@ -148,9 +163,19 @@ export function RebootHistory() {
 
 export default function RebootPage({ fn, mode }) {
   const spec = MODES[mode];
-  const preflight = useApi('/system-reboot/preflight', { refreshMs: 15_000 });
+  // Once the reboot command is accepted the host goes down, so the pre-flight
+  // poll stops instead of painting network errors over the result panel.
+  const [requested, setRequested] = useState(false);
+  const [rechecking, setRechecking] = useState(false);
+  const [historyPage, setHistoryPage] = useState(1);
+  const preflight = useApi('/system-reboot/preflight', { refreshMs: 15_000, enabled: !requested });
+  const history = useApi(`/system-reboot/history?page=${historyPage}&pageSize=${HISTORY_PAGE_SIZE}`);
   const [reason, setReason] = useState('');
   const data = preflight.data;
+  const recheck = async () => {
+    setRechecking(true);
+    try { const res = await api.get('/system-reboot/preflight?fresh=true'); preflight.setData(res.data); } catch { /* the regular poll reports errors */ } finally { setRechecking(false); }
+  };
   const warnings = data?.warnings || [];
   const confirmMessage = [
     `${spec.buttonLabel.toLowerCase()} of ${data?.hostname || 'this server'} (${spec.command}). Every connection to this server will drop and the panel will be unavailable until it is back.`,
@@ -171,12 +196,15 @@ export default function RebootPage({ fn, mode }) {
           const requestedAt = new Date().toISOString();
           try {
             const { data: result } = await api.post(`/system-reboot/${mode}`, body);
+            setRequested(true);
+            history.refetch();
             return result;
           } catch (err) {
             // No HTTP status means the connection died rather than the API
             // refusing: the panel is already going down with the host (the
             // request is recorded before the command runs), so watch for it.
             if (err?.status != null) throw err;
+            setRequested(true);
             return { mode, reason: body.reason ?? null, requested_at: requestedAt, unconfirmed: true, error: err };
           }
         }}
@@ -192,7 +220,7 @@ export default function RebootPage({ fn, mode }) {
               result.reason && ['Reason', result.reason],
               ['Requested', formatDate(result.requested_at)],
             ]} />
-            <RebootWatcher startedAt={result.requested_at} mode={result.mode} />
+            <RebootWatcher startedAt={result.requested_at} mode={result.mode} onOnline={() => { history.refetch(); setRequested(false); }} />
           </>
         )}
       >
@@ -200,12 +228,12 @@ export default function RebootPage({ fn, mode }) {
         {preflight.loading && !data && <Loading text="Running pre-flight checks…" />}
         <CapabilityNotice error={preflight.error} onRetry={() => preflight.refetch()} />
         {preflight.error && preflight.error.code !== 'capability_missing' && <ErrorBanner error={preflight.error} onRetry={() => preflight.refetch()} />}
-        {data && <PreflightSummary data={data} />}
+        {data && <PreflightSummary data={data} onRecheck={requested ? null : recheck} rechecking={rechecking} />}
         <Field label="Reason (optional)" help="Recorded in the audit log and the reboot history, for example “kernel update” or “stuck NFS mount”.">
           <TextInput value={reason} onChange={setReason} maxLength={200} placeholder="Why is the server being rebooted?" />
         </Field>
       </ActionPage>
-      <RebootHistory />
+      <RebootHistory history={history} page={historyPage} onPageChange={setHistoryPage} />
     </>
   );
 }

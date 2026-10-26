@@ -27,7 +27,9 @@ export default function ChangeMultipleSitesIpAddresses({ fn }) {
   const [historyKey, setHistoryKey] = useState(0);
   const step = run ? 3 : preview ? 2 : 1;
 
-  const addressOptions = (addresses || []).map((a) => ({ value: a.address, label: `${a.address}${a.is_main ? ' (main)' : ''}${a.shared ? ' (shared)' : ''}${a.dedicated_to ? ` (dedicated to ${a.dedicated_to})` : ''}${a.reserved ? ' (reserved)' : ''} · ${a.accounts} account(s)`, disabled: !a.selectable }));
+  // An address dedicated to another account is offered only to that account's own row.
+  const optionsFor = (username) => (addresses || []).map((a) => ({ value: a.address, label: `${a.address}${a.is_main ? ' (main)' : ''}${a.shared ? ' (shared)' : ''}${a.dedicated_to ? ` (dedicated to ${a.dedicated_to})` : ''}${a.reserved ? ' (reserved)' : ''} · ${a.accounts} account(s)`, disabled: !(a.selectable || (username && a.dedicated_to === username)) }));
+  const addressOptions = optionsFor(null);
   const changes = () => sel.selectedRows.map((r) => ({ username: r.username, ip: targets[r.username] || bulkIp })).filter((c) => c.ip);
   const ready = sel.selectedRows.length > 0 && changes().length === sel.selectedRows.length;
 
@@ -77,7 +79,7 @@ export default function ChangeMultipleSitesIpAddresses({ fn }) {
                 { key: 'username', label: 'User', render: (r) => <code>{r.username}</code> },
                 { key: 'domain', label: 'Domain' },
                 { key: 'ip', label: 'Current IP', render: (r) => (r.ip ? <code>{r.ip}</code> : <span className="muted">unset</span>) },
-                { key: 'target', label: 'New IP', render: (r) => <Select value={targets[r.username] || ''} onChange={(v) => { setTargets((t) => ({ ...t, [r.username]: v })); setPreview(null); }} options={addressOptions.filter((o) => o.value !== r.ip)} placeholder={bulkIp ? `Same as all (${bulkIp})` : 'Choose an address'} /> },
+                { key: 'target', label: 'New IP', render: (r) => <Select value={targets[r.username] || ''} onChange={(v) => { setTargets((t) => ({ ...t, [r.username]: v })); setPreview(null); }} options={optionsFor(r.username).filter((o) => o.value !== r.ip)} placeholder={bulkIp ? `Same as all (${bulkIp})` : 'Choose an address'} /> },
               ]}
               rows={sel.selectedRows} rowKey={(r) => r.username} dense emptyText="No accounts selected."
             />

@@ -53,7 +53,7 @@ export default function InitialQuotaSetup({ fn }) {
         <>
           <div className="form-grid">
             <Card title="Summary" actions={<LastJob job={data.lastJob} />}>
-              <KeyValue items={[['Account homes', <code key="h">{data.homeRoot}</code>], ['Filesystem holding homes', data.homeFilesystem ? <code key="f">{data.homeFilesystem}</code> : 'not found'], ['User quotas on that filesystem', <YesNo key="q" value={data.enabled} yes="enabled" no="not enabled" />], ['Quota tools (quotacheck, quotaon, repquota, setquota)', <YesNo key="t" value={data.toolsInstalled} yes="installed" no="missing" />]]} />
+              <KeyValue items={[['Account homes', <code key="h">{data.homeRoot}</code>], ['Filesystem holding homes', data.homeFilesystem ? <code key="f">{data.homeFilesystem}</code> : 'not found'], ['User quotas on that filesystem', <YesNo key="q" value={data.enabled} yes="enabled" no="not enabled" />], ['Quota tools (quotacheck, quotaon, quotaoff, repquota, setquota)', <YesNo key="t" value={data.toolsInstalled} yes="installed" no="missing" />], ['Package disk limits enforceable', <YesNo key="e" value={data.enforceable} yes="yes" no={data.enabled ? 'no: tools missing' : 'no: quotas not enabled'} />]]} />
               {!data.toolsInstalled && (
                 <div style={{ marginTop: 12 }}>
                   <CapabilityNotice error={{ code: 'capability_missing', message: `The quota tools are not installed. Install the "${data.installPackages.join('", "')}" package, then enable quotas below.` }} onRetry={refetch} />

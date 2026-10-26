@@ -75,6 +75,23 @@ describe('hostname helpers', () => {
     expect(again.changed).toBe(false);
   });
 
+  it('drops the stale FQDN when the kernel only reported the short name, and takes the panel setting as a previous name too', () => {
+    const r = updateHostsFile(DEBIAN_HOSTS, { ip: '10.0.0.5', hostname: 'new.example.com', previous: 'old' });
+    expect(r.content).not.toContain('old.example.com');
+    expect(parseHosts(r.content).filter((l) => l.ip).map((l) => [l.ip, l.names])).toEqual([['127.0.0.1', ['localhost']], ['::1', ['ip6-localhost', 'ip6-loopback']], ['fe00::0', ['ip6-localnet']], ['10.0.0.5', ['new.example.com', 'new']]]);
+    const both = updateHostsFile('127.0.1.1 panel.example.com panel\n10.0.0.9 db.example.com db old-alias\n', { ip: '10.0.0.5', hostname: 'new.example.com', previous: ['old', 'panel.example.com'] });
+    expect(parseHosts(both.content).filter((l) => l.ip).map((l) => [l.ip, l.names])).toEqual([['10.0.0.9', ['db.example.com', 'db', 'old-alias']], ['10.0.0.5', ['new.example.com', 'new']]]);
+    // Only lines that carried a previous name lose their same-label aliases.
+    const unrelated = updateHostsFile('192.0.2.1 old.other.net\n127.0.1.1 old.example.com old\n', { ip: '10.0.0.5', hostname: 'new.example.com', previous: 'old.example.com' });
+    expect(parseHosts(unrelated.content).filter((l) => l.ip).map((l) => [l.ip, l.names])).toEqual([['192.0.2.1', ['old.other.net']], ['10.0.0.5', ['new.example.com', 'new']]]);
+  });
+
+  it('keeps only the comment of a line whose names were all dropped', () => {
+    const r = updateHostsFile('127.0.0.1 localhost\n127.0.1.1 old.example.com old # added by the image\n', { ip: '10.0.0.5', hostname: 'new.example.com', previous: 'old.example.com' });
+    expect(r.content).toBe('127.0.0.1\tlocalhost\n10.0.0.5\tnew.example.com new\n# added by the image\n');
+    expect(r.content).not.toMatch(/^127\.0\.1\.1/m);
+  });
+
   it('prepends the hostname to an existing line for the IP and keeps other names', () => {
     const r = updateHostsFile('10.0.0.5 db.internal cache\n', { ip: '10.0.0.5', hostname: 'host.example.com' });
     expect(parseHosts(r.content).filter((l) => l.ip)[0].names).toEqual(['host.example.com', 'host', 'db.internal', 'cache']);
@@ -108,6 +125,13 @@ describe('Networking Setup API', () => {
   let resolvedActive = false;
   let resolvFile = { exists: true, isSymlink: false, isRegular: true, target: null, managedByResolved: false };
   const STUB = '/run/systemd/resolve/stub-resolv.conf';
+  const writeStatic = ({ nameservers, search }) => {
+    const replacedSymlink = resolvFile.isSymlink;
+    const previousTarget = resolvFile.target;
+    resolvConf = renderResolv(nameservers, search);
+    resolvFile = { exists: true, isSymlink: false, isRegular: true, target: null, managedByResolved: false };
+    return { path: '/etc/resolv.conf', nameservers, search, replacedSymlink, previousTarget, isRegular: true, isSymlink: false };
+  };
   const renderResolv = (nameservers, search) => ['# Managed by WHM panel (Resolver Configuration)', ...(search.length ? [`search ${search.join(' ')}`] : []), ...nameservers.map((n) => `nameserver ${n}`)].join('\n') + '\n';
 
   const post = (url, body = {}) => app.http.post(url).set('X-CSRF-Token', csrf).send(body);
@@ -125,13 +149,7 @@ describe('Networking Setup API', () => {
       'fs.write_file': ({ path, content }) => { files[path] = content; return { path, bytes: content.length }; },
       'sys.resolvers.get': () => ({ nameservers: parseResolvConf(resolvConf).nameservers, raw: resolvConf }),
       'resolver.inspect': () => ({ path: '/etc/resolv.conf', ...resolvFile }),
-      'resolver.write_static': ({ nameservers, search }) => {
-        const replacedSymlink = resolvFile.isSymlink;
-        const previousTarget = resolvFile.target;
-        resolvConf = renderResolv(nameservers, search);
-        resolvFile = { exists: true, isSymlink: false, isRegular: true, target: null, managedByResolved: false };
-        return { path: '/etc/resolv.conf', nameservers, search, replacedSymlink, previousTarget, isRegular: true, isSymlink: false };
-      },
+      'resolver.write_static': (args) => writeStatic(args),
       'svc.status': ({ unit }) => ({ unit, installed: unit === 'systemd-resolved', active: unit === 'systemd-resolved' && resolvedActive, state: 'active' }),
       'svc.restart': ({ unit }) => { restarted.push(unit); return { unit, verb: 'restart', output: '' }; },
       'dns.resolve': ({ name, servers }) => {
@@ -160,6 +178,7 @@ describe('Networking Setup API', () => {
     restarted = [];
     resolvedActive = false;
     resolvFile = { exists: true, isSymlink: false, isRegular: true, target: null, managedByResolved: false };
+    app.agent.set('resolver.write_static', (args) => writeStatic(args));
     app.ctx.settings.setMany({ 'basic.hostname': 'old.example.com', 'basic.main_ip': '10.0.0.5', 'dns.resolvers': [] });
     await app.ctx.capabilities.refresh();
     app.agent.calls.length = 0;
@@ -182,6 +201,44 @@ describe('Networking Setup API', () => {
     expect(data.dns).toMatchObject({ available: true });
     expect(data.defaults).toEqual({ updateHosts: true, addDnsRecord: true });
     expect(data.lastChange).toBeNull();
+  });
+
+  it('GET /hostname accepts a loopback /etc/hosts mapping and flags it', async () => {
+    files[HOSTS_PATH] = '127.0.0.1 old.example.com old localhost\n';
+    const { data } = (await get('/api/networking/hostname').expect(200)).body;
+    expect(data.hosts).toMatchObject({ entry: { ip: '127.0.0.1' }, ok: true, loopback: true });
+    files[HOSTS_PATH] = '192.0.2.77 old.example.com old\n';
+    const other = (await get('/api/networking/hostname').expect(200)).body.data;
+    expect(other.hosts).toMatchObject({ entry: { ip: '192.0.2.77' }, ok: false, loopback: false });
+    files[HOSTS_PATH] = '10.0.0.5 old.example.com old\n';
+    expect((await get('/api/networking/hostname').expect(200)).body.data.hosts).toMatchObject({ ok: true, loopback: false });
+  });
+
+  it('PUT /hostname/defaults stores the toggles the form is seeded with', async () => {
+    const { data } = (await put('/api/networking/hostname/defaults', { updateHosts: false, addDnsRecord: false }).expect(200)).body;
+    expect(data).toEqual({ updateHosts: false, addDnsRecord: false });
+    expect((await get('/api/networking/hostname').expect(200)).body.data.defaults).toEqual({ updateHosts: false, addDnsRecord: false });
+    expect((await put('/api/networking/hostname/defaults', { addDnsRecord: true }).expect(200)).body.data).toEqual({ updateHosts: false, addDnsRecord: true });
+    expect(auditRows('networking.hostname.defaults')).toHaveLength(2);
+    await put('/api/networking/hostname/defaults', {}).expect(422);
+    await put('/api/networking/hostname/defaults', { updateHosts: 'no' }).expect(422);
+    await put('/api/networking/hostname/defaults', { updateHosts: true, extra: 1 }).expect(422);
+    await put('/api/networking/hostname/defaults', { updateHosts: true, addDnsRecord: true }).expect(200);
+  });
+
+  it('ignores a malformed basic.main_ipv6 / basic.main_ip setting instead of writing it to /etc/hosts', async () => {
+    app.ctx.settings.setMany({ 'basic.main_ipv6': '2001:db8::zz; rm', 'basic.main_ip': 'not an ip' });
+    const { data } = (await post('/api/networking/hostname/preview', { hostname: 'new.example.com' }).expect(200)).body;
+    expect(data.ipv6).toBeNull();
+    expect(data.ip).toBe('10.0.0.5');
+    expect(data.after).not.toContain('2001:db8::zz');
+    app.ctx.settings.set('basic.main_ipv6', '2001:db8::5');
+    const good = (await post('/api/networking/hostname/preview', { hostname: 'new.example.com' }).expect(200)).body.data;
+    expect(good.ipv6).toBe('2001:db8::5');
+    expect(good.after).toContain('2001:db8::5\tnew.example.com new');
+    const status = (await get('/api/networking/hostname').expect(200)).body.data;
+    expect(status).toMatchObject({ ip: '10.0.0.5', configuredIp: null, ipv6: '2001:db8::5' });
+    app.ctx.settings.setMany({ 'basic.main_ipv6': '', 'basic.main_ip': '10.0.0.5' });
   });
 
   it('GET /hostname degrades when /etc/hosts is unreadable and sys.info fails', async () => {
@@ -351,7 +408,8 @@ describe('Networking Setup API', () => {
   // ------------------------------------------------------------- resolvers
   it('GET /resolvers parses resolv.conf and reports the write target', async () => {
     const { data } = (await get('/api/networking/resolvers').expect(200)).body;
-    expect(data).toMatchObject({ path: '/etc/resolv.conf', nameservers: ['8.8.8.8', '8.8.4.4'], search: [], options: ['timeout:2'], managedBy: 'file', target: 'file', writePath: '/etc/resolv.conf', resolved: { installed: true, active: false }, dropIn: null, file: { isSymlink: false, isRegular: true }, takeOverAllowed: true });
+    expect(data).toMatchObject({ path: '/etc/resolv.conf', nameservers: ['8.8.8.8', '8.8.4.4'], search: [], options: ['timeout:2'], managedBy: 'file', target: 'file', writePath: '/etc/resolv.conf', resolved: { installed: true, active: false, upstream: null }, dropIn: null, file: { isSymlink: false, isRegular: true }, takeOverAllowed: true });
+    expect(app.agent.callsTo('resolver.upstream')).toHaveLength(0);
     expect(data.panel).toEqual({ resolvers: [], search: [] });
     expect(data.presets.map((p) => p.nameservers[0])).toEqual(['1.1.1.1', '8.8.8.8', '9.9.9.9', '127.0.0.1']);
     expect(data.max).toBe(4);
@@ -396,6 +454,7 @@ describe('Networking Setup API', () => {
     expect(before).toMatchObject({ managedBy: 'systemd-resolved', target: 'resolved', writePath: RESOLVED_DROPIN, resolved: { active: true }, search: [], file: { isSymlink: true, target: STUB }, takeOverAllowed: false });
     const { data } = (await put('/api/networking/resolvers', { nameservers: ['1.1.1.1', '2606:4700:4700::1111'], test: false }).expect(200)).body;
     expect(data).toMatchObject({ target: 'resolved', path: RESOLVED_DROPIN, restarted: true, applied: null });
+    expect(app.agent.callsTo('resolver.write_static')).toHaveLength(0);
     expect(files[RESOLVED_DROPIN]).toBe('# Managed by WHM panel (Resolver Configuration); edit there, not here.\n[Resolve]\nDNS=1.1.1.1 2606:4700:4700::1111\n');
     expect(restarted).toEqual(['systemd-resolved']);
     expect(app.agent.callsTo('sys.resolvers.set')).toHaveLength(0);
@@ -444,6 +503,70 @@ describe('Networking Setup API', () => {
     expect(stale.notes.at(-1)).toMatch(/still a symlink/);
   });
 
+  it('PUT /resolvers mode=auto writes the static file (not the drop-in) once systemd-resolved is stopped', async () => {
+    resolvConf = 'nameserver 127.0.0.53\n';
+    resolvedActive = false;
+    resolvFile = { exists: true, isSymlink: true, isRegular: false, target: STUB, managedByResolved: true };
+    const status = (await get('/api/networking/resolvers').expect(200)).body.data;
+    expect(status).toMatchObject({ managedBy: 'systemd-resolved', target: 'file', writePath: '/etc/resolv.conf', resolved: { installed: true, active: false }, takeOverAllowed: true });
+    const { data } = (await put('/api/networking/resolvers', { nameservers: ['9.9.9.9'], test: false }).expect(200)).body;
+    expect(data).toMatchObject({ target: 'file', path: '/etc/resolv.conf', applied: true, replacedSymlink: true, restarted: null });
+    expect(data.notes.join(' ')).toMatch(/systemd-resolved is stopped; keep it disabled/);
+    expect(restarted).toEqual([]);
+    expect(files[RESOLVED_DROPIN]).toBeUndefined();
+    expect(app.agent.callsTo('resolver.write_static')).toHaveLength(1);
+  });
+
+  it('PUT /resolvers mode=resolved is refused when systemd-resolved is not installed', async () => {
+    app.agent.set('svc.status', ({ unit }) => ({ unit, installed: false, active: false, state: 'inactive' }));
+    try {
+      const res = await put('/api/networking/resolvers', { nameservers: ['9.9.9.9'], mode: 'resolved', test: false }).expect(422);
+      expect(res.body.error.message).toMatch(/not installed/);
+      expect(res.body.error.fields.mode[0]).toMatch(/mode "file" or "auto"/);
+      expect(files[RESOLVED_DROPIN]).toBeUndefined();
+      expect(app.agent.callsTo('fs.write_file')).toHaveLength(0);
+      expect(restarted).toEqual([]);
+      const auto = (await put('/api/networking/resolvers', { nameservers: ['9.9.9.9'], test: false }).expect(200)).body.data;
+      expect(auto.target).toBe('file');
+    } finally {
+      app.agent.set('svc.status', ({ unit }) => ({ unit, installed: unit === 'systemd-resolved', active: unit === 'systemd-resolved' && resolvedActive, state: 'active' }));
+    }
+  });
+
+  it('GET /resolvers reads the upstream servers through resolvectl on a running systemd-resolved host', async () => {
+    resolvConf = '# This is /run/systemd/resolve/stub-resolv.conf\nnameserver 127.0.0.53\n';
+    resolvedActive = true;
+    resolvFile = { exists: true, isSymlink: true, isRegular: false, target: STUB, managedByResolved: true };
+    app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, ['systemctl', 'hostnamectl', 'resolvectl'].includes(n)])));
+    app.agent.set('resolver.upstream', () => ({ source: 'resolvectl', global: ['1.1.1.1', '1.0.0.1'], links: [{ index: 2, name: 'eth0', servers: ['10.0.0.1'] }], servers: ['1.1.1.1', '1.0.0.1', '10.0.0.1'] }));
+    try {
+      await app.ctx.capabilities.refresh();
+      expect(app.ctx.capabilities.snapshot().capabilities.resolvectl).toMatchObject({ installed: true });
+      const { data } = (await get('/api/networking/resolvers').expect(200)).body;
+      expect(data.nameservers).toEqual(['127.0.0.53']);
+      expect(data.resolved).toEqual({ installed: true, active: true, upstream: { source: 'resolvectl', global: ['1.1.1.1', '1.0.0.1'], links: [{ index: 2, name: 'eth0', servers: ['10.0.0.1'] }], servers: ['1.1.1.1', '1.0.0.1', '10.0.0.1'] } });
+      app.agent.fail('resolver.upstream', 'command_failed', 'resolvectl exploded');
+      expect((await get('/api/networking/resolvers').expect(200)).body.data.resolved.upstream).toBeNull();
+      app.agent.set('resolver.upstream', () => ({ source: 'resolvectl', global: [], links: [], servers: [] }));
+      resolvedActive = false;
+      expect((await get('/api/networking/resolvers').expect(200)).body.data.resolved.upstream).toBeNull();
+    } finally {
+      app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, n === 'systemctl' || (hostnamectl && n === 'hostnamectl')])));
+      app.agent.reset('resolver.upstream');
+      await app.ctx.capabilities.refresh();
+    }
+  });
+
+  it('PUT /resolvers accepts the IPv6 loopback and mapped addresses but not unspecified, broadcast or multicast ones', async () => {
+    const ok = (await put('/api/networking/resolvers', { nameservers: ['::1', '::ffff:10.0.0.1', '127.0.0.1'], test: false }).expect(200)).body.data;
+    expect(ok.nameservers).toEqual(['::1', '::ffff:10.0.0.1', '127.0.0.1']);
+    for (const ns of ['0.0.0.0', '::', '255.255.255.255', '224.0.0.251', '239.255.255.250', 'ff02::1', 'FF05::1:3']) {
+      const res = await put('/api/networking/resolvers', { nameservers: [ns], test: false }).expect(422);
+      expect(res.body.error.fields.nameservers[0], ns).toMatch(/multicast/);
+    }
+    expect(app.agent.callsTo('resolver.write_static')).toHaveLength(1);
+  });
+
   it('PUT /resolvers validates: bad IPs, too many, duplicates, bad search domains, unknown fields', async () => {
     for (const body of [
       { nameservers: [] }, { nameservers: ['not-an-ip'] }, { nameservers: ['1.1.1.1', '2.2.2.2', '3.3.3.3', '4.4.4.4', '5.5.5.5'] },
@@ -459,23 +582,44 @@ describe('Networking Setup API', () => {
 
   it('POST /resolvers/test resolves each name against each server separately and times it', async () => {
     resolverAnswers['1.0.0.1|example.com'] = ['93.184.216.34'];
-    resolverAnswers['1.0.0.1|cpanel.net'] = Object.assign(new Error('timeout'), { agentError: true, code: 'timeout', details: {} });
-    const { data } = (await post('/api/networking/resolvers/test', { nameservers: ['1.1.1.1', '1.0.0.1'], names: ['example.com', 'cpanel.net'] }).expect(200)).body;
-    expect(data.names).toEqual(['example.com', 'cpanel.net']);
+    resolverAnswers['1.0.0.1|example.net'] = Object.assign(new Error('timeout'), { agentError: true, code: 'timeout', details: {} });
+    const { data } = (await post('/api/networking/resolvers/test', { nameservers: ['1.1.1.1', '1.0.0.1'], names: ['example.com', 'example.net'] }).expect(200)).body;
+    expect(data.names).toEqual(['example.com', 'example.net']);
     expect(data.servers).toHaveLength(2);
     expect(data.servers[0]).toMatchObject({ server: '1.1.1.1', ok: true, reachable: true });
-    expect(data.servers[0].lookups.map((l) => l.name)).toEqual(['example.com', 'cpanel.net']);
+    expect(data.servers[0].lookups.map((l) => l.name)).toEqual(['example.com', 'example.net']);
     expect(typeof data.servers[0].avgMs).toBe('number');
     expect(data.servers[1]).toMatchObject({ server: '1.0.0.1', ok: false, reachable: true });
     expect(data.servers[1].lookups[1]).toMatchObject({ ok: false, error: 'timeout' });
     expect(data.healthy).toBe(1);
-    for (const c of app.agent.callsTo('dns.resolve')) expect(c.args.servers).toHaveLength(1);
+    for (const c of app.agent.callsTo('dns.resolve')) { expect(c.args.servers).toHaveLength(1); expect(c.args.timeoutMs).toBe(1500); }
+  });
+
+  it('POST /resolvers/test runs the names of one server in parallel so a dead resolver costs one timeout', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    app.agent.set('dns.resolve', async ({ name, servers }) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 20));
+      inFlight -= 1;
+      return { name, type: 'A', servers, answers: [], error: 'ETIMEOUT' };
+    });
+    try {
+      const started = Date.now();
+      const { data } = (await post('/api/networking/resolvers/test', { nameservers: ['192.0.2.53'], names: ['a.example.com', 'b.example.com', 'c.example.com', 'd.example.com', 'e.example.com'] }).expect(200)).body;
+      expect(Date.now() - started).toBeLessThan(90);
+      expect(peak).toBe(5);
+      expect(data.servers[0]).toMatchObject({ server: '192.0.2.53', ok: false, reachable: false });
+      expect(data.servers[0].lookups.map((l) => l.name)).toEqual(['a.example.com', 'b.example.com', 'c.example.com', 'd.example.com', 'e.example.com']);
+    } finally { app.agent.reset('dns.resolve'); app.agent.set('dns.resolve', ({ name, servers }) => { const key = `${servers?.[0] ?? 'system'}|${name}`; const answer = resolverAnswers[key] ?? resolverAnswers[servers?.[0] ?? 'system']; if (answer instanceof Error) throw answer; return { name, type: 'A', servers: servers ?? ['8.8.8.8'], answers: answer ?? [], error: answer?.length ? null : 'ETIMEOUT' }; }); }
   });
 
   it('POST /resolvers/test defaults to the system resolvers and the hostname; 400 when none exist', async () => {
     const { data } = (await post('/api/networking/resolvers/test', {}).expect(200)).body;
     expect(data.servers.map((s) => s.server)).toEqual(['8.8.8.8', '8.8.4.4']);
-    expect(data.names).toEqual(['old.example.com', 'example.com', 'cpanel.net']);
+    expect(data.names).toEqual(['old.example.com', 'example.com', 'example.net']);
+    expect(data.names.join(' ')).not.toMatch(/cpanel/);
     await post('/api/networking/resolvers/test', { names: [] }).expect(422);
     resolvConf = '# empty\n';
     await post('/api/networking/resolvers/test', {}).expect(400);
@@ -493,6 +637,7 @@ describe('Networking Setup API', () => {
     await reseller.get('/api/networking/hostname').expect(403);
     await reseller.post('/api/networking/hostname/preview').set('X-CSRF-Token', resellerCsrf).send({ hostname: 'x.example.com' }).expect(403);
     await reseller.post('/api/networking/hostname').set('X-CSRF-Token', resellerCsrf).send({ hostname: 'x.example.com' }).expect(403);
+    await reseller.put('/api/networking/hostname/defaults').set('X-CSRF-Token', resellerCsrf).send({ updateHosts: false }).expect(403);
     await reseller.get('/api/networking/resolvers').expect(403);
     await reseller.put('/api/networking/resolvers').set('X-CSRF-Token', resellerCsrf).send({ nameservers: ['1.1.1.1'] }).expect(403);
     await reseller.post('/api/networking/resolvers/test').set('X-CSRF-Token', resellerCsrf).send({}).expect(403);

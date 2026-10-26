@@ -33,16 +33,30 @@ function assertManaged(username) {
 }
 
 // The path as given must be the real path: realpath resolves every component,
-// so any symlink on the way (not only the last one) makes them differ.
+// so any symlink on the way (not only the last one) makes them differ. One
+// exception: an allowed root that is itself a symlink (/home -> /mnt/home on
+// some images) is the administrator's layout, not a tenant's, provided the
+// link belongs to root; the components below it are still checked.
+const agentUid = () => (typeof process.getuid === 'function' ? process.getuid() : 0);
+function realRootFor(resolved, ctx) {
+  const root = ctx.allowedRoots.filter((r) => resolved === r || resolved.startsWith(r.endsWith('/') ? r : `${r}/`)).sort((a, b) => b.length - a.length)[0];
+  if (!root) return null;
+  let st;
+  try { st = fs.lstatSync(root); } catch { return null; }
+  if (!st.isSymbolicLink() || (st.uid !== 0 && st.uid !== agentUid())) return null;
+  try { return { root, real: fs.realpathSync(root) }; } catch { return null; }
+}
 export function assertRealPath(resolved, ctx, mode = 'read') {
+  ctx.assertAllowedPath(resolved, mode);
   let real;
   try { real = fs.realpathSync(resolved); } catch (err) {
     if (err.code === 'ENOENT' || err.code === 'ENOTDIR') throw new OpError('not_found', `${resolved} does not exist`);
     throw err;
   }
-  if (real !== resolved) throw new OpError('refused', `${resolved} goes through a symbolic link (${real}); refusing to follow it`);
-  ctx.assertAllowedPath(real, mode);
-  return real;
+  if (real === resolved) return real;
+  const linked = realRootFor(resolved, ctx);
+  if (linked && real === path.join(linked.real, path.relative(linked.root, resolved))) return real;
+  throw new OpError('refused', `${resolved} goes through a symbolic link (${real}); refusing to follow it`);
 }
 
 const ownedBy = (st, uid) => st.uid === 0 || st.uid === uid;
@@ -54,8 +68,11 @@ defineOp('acct.set_home', {
     const info = assertManaged(username);
     const target = ctx.assertAllowedPath(homeDir, 'write');
     let st;
-    try { st = fs.statSync(target); } catch { st = null; }
-    if (!st?.isDirectory()) throw new OpError('not_found', `${homeDir} does not exist or is not a directory; copy the account first`);
+    try { st = fs.lstatSync(target); } catch { st = null; }
+    if (!st) throw new OpError('not_found', `${homeDir} does not exist; copy the account first`);
+    if (st.isSymbolicLink()) throw new OpError('refused', `${homeDir} is a symbolic link; the home directory must be a real directory`);
+    if (!st.isDirectory()) throw new OpError('refused', `${homeDir} is not a directory`);
+    assertRealPath(target, ctx, 'write');
     if (st.uid !== info.uid) throw new OpError('refused', `${homeDir} is not owned by ${username} (uid ${info.uid})`);
     await exec('usermod', ['-d', target, username]);
     return { ...getent(username), previousHome: info.home };

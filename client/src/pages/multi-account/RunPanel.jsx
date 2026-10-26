@@ -18,7 +18,7 @@ function StepList({ steps }) {
     else rows.push({ name, status: 'done', detail: String(value) });
   }
   if (!rows.length) return <span className="muted">—</span>;
-  return <ul style={{ margin: 0, paddingLeft: 16 }}>{rows.map((r, i) => <li key={i}><code>{r.name}</code> <StatusPill status={r.status === 'applied' ? 'ok' : r.status === 'skipped' ? 'disabled' : r.status}>{r.status}</StatusPill> {r.detail && <span className="muted">{r.detail}</span>}</li>)}</ul>;
+  return <ul style={{ margin: 0, paddingLeft: 16 }}>{rows.map((r, i) => <li key={i}><code>{r.name}</code> <StatusPill status={r.status === 'applied' ? 'ok' : r.status === 'recorded' ? 'info' : r.status === 'skipped' ? 'disabled' : r.status}>{r.status}</StatusPill> {r.detail && <span className="muted">{r.detail}</span>}</li>)}</ul>;
 }
 
 // Live progress of a bulk job, then the per-account outcome with the report links.

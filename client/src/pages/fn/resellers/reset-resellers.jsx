@@ -60,7 +60,7 @@ export default function ResetResellers({ fn }) {
       {last && (
         <Card title="Last reset">
           <ul>
-            {last.results.map((r) => <li key={r.username}><code>{r.username}</code>: {r.reset ? `reset; ${r.accounts_moved.length} account(s) moved to ${last.moved_to}${r.ips_released.length ? `, released ${r.ips_released.join(', ')}` : ''}` : r.reason}</li>)}
+            {last.results.map((r) => <li key={r.username}><code>{r.username}</code>: {r.reset ? `reset; ${r.accounts_moved.length} account(s) moved to ${last.moved_to}${r.ips_released.length ? `, released ${r.ips_released.join(', ')}` : ''}${r.login_suspended ? '; login suspended (no hosting account)' : ''}` : r.reason}</li>)}
             {last.missing.map((u) => <li key={u}><code>{u}</code>: not a reseller</li>)}
           </ul>
         </Card>

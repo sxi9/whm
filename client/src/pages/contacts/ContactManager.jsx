@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Plus, Send, Play, RefreshCw } from 'lucide-react';
+import { Plus, Send, Play, RefreshCw, AlertTriangle } from 'lucide-react';
 import { api, queryString } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { Card, StatusPill, Loading, KeyValue, CapabilityNotice, formatDate } from '../../components/Common.jsx';
@@ -7,6 +7,7 @@ import { DataTable, useTableState } from '../../components/DataTable.jsx';
 import { Field, TextInput, NumberInput, Select, Toggle, Button, FormActions, ErrorBanner } from '../../components/Form.jsx';
 import { Modal, useConfirm } from '../../components/Modal.jsx';
 import { useToast } from '../../components/Toast.jsx';
+import { ProgressLog } from '../../components/ProgressLog.jsx';
 import { ContactForm, CHANNEL_LABEL } from './ContactForm.jsx';
 
 const SEVERITY_STATUS = { info: 'info', warning: 'warning', error: 'failed', critical: 'failed' };
@@ -98,7 +99,7 @@ export function ContactManager() {
 
 function NotificationSettings({ settings, capability, smtpSecurity, onSaved }) {
   const toast = useToast();
-  const initial = () => ({ enabled: settings.enabled, fromAddress: settings.fromAddress, retentionDays: settings.retentionDays, smtp: { host: settings.smtp.host, port: settings.smtp.port, security: settings.smtp.security, username: settings.smtp.username, password: '', allowSelfSigned: settings.smtp.allowSelfSigned, prefer: settings.smtp.prefer } });
+  const initial = () => ({ enabled: settings.enabled, fromAddress: settings.fromAddress, retentionDays: settings.retentionDays, webhook: { allowPrivate: Boolean(settings.webhook?.allowPrivate) }, smtp: { host: settings.smtp.host, port: settings.smtp.port, security: settings.smtp.security, username: settings.smtp.username, password: '', allowSelfSigned: settings.smtp.allowSelfSigned, prefer: settings.smtp.prefer, allowPlaintextAuth: Boolean(settings.smtp.allowPlaintextAuth) } });
   const [draft, setDraft] = useState(initial);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
@@ -108,6 +109,8 @@ function NotificationSettings({ settings, capability, smtpSecurity, onSaved }) {
   const set = (k, v) => setDraft((d) => ({ ...d, [k]: v }));
   const setSmtp = (k, v) => setDraft((d) => ({ ...d, smtp: { ...d.smtp, [k]: v } }));
   const dirty = JSON.stringify(draft) !== JSON.stringify(initial());
+  const loopback = /^(localhost|127(?:\.\d{1,3}){3}|::1)$/i.test(draft.smtp.host.trim());
+  const plaintextAuth = Boolean(draft.smtp.username) && draft.smtp.security === 'none' && Boolean(draft.smtp.host) && !loopback;
 
   const save = async () => {
     setSaving(true);
@@ -115,7 +118,7 @@ function NotificationSettings({ settings, capability, smtpSecurity, onSaved }) {
     try {
       const smtp = { ...draft.smtp };
       if (!smtp.password) delete smtp.password;
-      await api.put('/server-contacts/settings', { enabled: draft.enabled, fromAddress: draft.fromAddress, retentionDays: draft.retentionDays, smtp });
+      await api.put('/server-contacts/settings', { enabled: draft.enabled, fromAddress: draft.fromAddress, retentionDays: draft.retentionDays, smtp, webhook: draft.webhook });
       toast.success('Notification settings saved');
       onSaved?.();
     } catch (err) { setError(err); toast.error(err); } finally { setSaving(false); }
@@ -143,8 +146,20 @@ function NotificationSettings({ settings, capability, smtpSecurity, onSaved }) {
         <Field label="Username" help="Blank for an unauthenticated relay."><TextInput value={draft.smtp.username} onChange={(v) => setSmtp('username', v)} autoComplete="off" /></Field>
         <Field label="Password" help={settings.smtp.password.set ? 'A password is stored. Leave blank to keep it.' : undefined}><TextInput value={draft.smtp.password} onChange={(v) => setSmtp('password', v)} type="password" autoComplete="new-password" placeholder={settings.smtp.password.set ? '•••••••••• (unchanged)' : ''} /></Field>
       </div>
+      {plaintextAuth && (
+        <div className={`banner ${draft.smtp.allowPlaintextAuth ? 'banner-warning' : 'banner-error'}`}>
+          <AlertTriangle size={18} />
+          <div>
+            <strong>Credentials over an unencrypted connection</strong>
+            <p>With security set to “None”, the username and password are sent to {draft.smtp.host} in cleartext. Choose STARTTLS or implicit TLS; {draft.smtp.allowPlaintextAuth ? 'plaintext authentication is currently allowed.' : 'until then the panel refuses to authenticate.'}</p>
+          </div>
+        </div>
+      )}
       <Field inline><Toggle checked={draft.smtp.allowSelfSigned} onChange={(v) => setSmtp('allowSelfSigned', v)} label="Accept the relay's self-signed certificate" /></Field>
+      <Field inline><Toggle checked={draft.smtp.allowPlaintextAuth} onChange={(v) => setSmtp('allowPlaintextAuth', v)} label="Allow plaintext authentication" description="Send the relay password over a plain connection to a non-loopback host. Only for an isolated network." /></Field>
       <Field inline><Toggle checked={draft.smtp.prefer} onChange={(v) => setSmtp('prefer', v)} label="Prefer the relay even when Exim is installed" /></Field>
+      <h3 style={{ margin: '14px 0 6px', fontSize: 14 }}>Webhooks</h3>
+      <Field inline><Toggle checked={draft.webhook.allowPrivate} onChange={(v) => setDraft((d) => ({ ...d, webhook: { ...d.webhook, allowPrivate: v } }))} label="Allow webhooks to private addresses" description="Loopback, link-local and RFC 1918 targets are refused unless this is on, so a contact cannot be pointed at internal services." /></Field>
       <ErrorBanner error={error} />
       <FormActions>
         <Button variant="primary" loading={saving} disabled={!dirty} onClick={save}>Save</Button>
@@ -165,6 +180,7 @@ function ChecksCard({ settings, schedule, openAlerts, onChanged }) {
   const [draft, setDraft] = useState(check);
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
+  const [jobId, setJobId] = useState(null);
   const [result, setResult] = useState(null);
   useEffect(() => { setDraft(check); }, [check]);
   const set = (k, v) => setDraft((d) => ({ ...d, [k]: v }));
@@ -179,15 +195,31 @@ function ChecksCard({ settings, schedule, openAlerts, onChanged }) {
     } catch (err) { toast.error(err); } finally { setSaving(false); }
   };
 
+  // The check is a background job (service probes plus one delivery per
+  // contact can take a while). The stream shows its log; the result is
+  // polled so a job that finished before the stream opened is not missed.
   const runNow = async () => {
     setRunning(true);
+    setResult(null);
+    let id;
     try {
       const res = await api.post('/server-contacts/check');
-      setResult(res.data);
-      const n = res.data.notifications.length;
-      toast[n ? 'warning' : 'success'](n ? `${n} notification(s) raised` : 'All monitored services are up and disks are below the threshold');
-      onChanged?.();
-    } catch (err) { toast.error(err); } finally { setRunning(false); }
+      id = res.data.job.id;
+      setJobId(id);
+    } catch (err) { toast.error(err); setRunning(false); return; }
+    try {
+      let job;
+      for (;;) {
+        job = (await api.get(`/system/jobs/${id}`)).data;
+        if (!['queued', 'running'].includes(job.status)) break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      if (job.status === 'done' && job.result) {
+        setResult(job.result);
+        const n = job.result.notifications?.length || 0;
+        toast[n ? 'warning' : 'success'](n ? `${n} notification(s) raised` : 'All monitored services are up, disks are below the threshold and no certificate is about to expire');
+      } else toast.error(job.error || `The check ${job.status}`);
+    } catch (err) { toast.error(err); } finally { setRunning(false); onChanged?.(); }
   };
 
   const last = check.lastResult;
@@ -209,11 +241,12 @@ function ChecksCard({ settings, schedule, openAlerts, onChanged }) {
         <Button variant="primary" loading={saving} disabled={!dirty} onClick={save}>Save</Button>
         <Button icon={Play} loading={running} onClick={runNow}>Run checks now</Button>
       </FormActions>
+      {jobId && running && <ProgressLog jobId={jobId} />}
       {result && (
         <div className="banner banner-info" style={{ marginTop: 12 }}>
           <div>
             <strong>Checked {result.services.checked} service(s) and {result.disks.checked} filesystem(s)</strong>
-            <p style={{ margin: '4px 0' }}>{result.services.down.length ? `Down: ${result.services.down.join(', ')}. ` : 'All monitored services are active. '}{result.disks.low.length ? `Low disk: ${result.disks.low.map((d) => `${d.mountpoint} (${d.usedPercent}%)`).join(', ')}. ` : ''}{result.ssl.expiring.length ? `Expiring certificates: ${result.ssl.expiring.map((c) => c.domain).join(', ')}.` : ''}</p>
+            <p style={{ margin: '4px 0' }}>{result.services.down.length ? `Down: ${result.services.down.join(', ')}. ` : 'All monitored services are active. '}{result.disks.low.length ? `Low disk: ${result.disks.low.map((d) => `${d.mountpoint} (${d.usedPercent}%)`).join(', ')}. ` : ''}{result.ssl.expiring.length ? `Expiring certificates: ${result.ssl.expiring.map((c) => (c.kind === 'service' ? `${c.domain} (service)` : c.domain)).join(', ')}.` : ''}</p>
             {result.notifications.length > 0 && <ul>{result.notifications.map((n, i) => <li key={i}>{n.event}: {n.subject} — {n.sent} sent{n.failed ? `, ${n.failed} failed` : ''}</li>)}</ul>}
             {[result.services.error, result.disks.error, result.ssl.error].filter(Boolean).map((e) => <small key={e}>{e}</small>)}
           </div>
@@ -226,13 +259,14 @@ function ChecksCard({ settings, schedule, openAlerts, onChanged }) {
 function EventCatalog({ events }) {
   const [open, setOpen] = useState(false);
   return (
-    <Card title="Event catalog" subtitle="What the panel can notify about, with the default severity each event carries." actions={<Button size="sm" onClick={() => setOpen((o) => !o)}>{open ? 'Hide' : 'Show'}</Button>} padded={false}>
+    <Card title="Event catalog" subtitle="What the panel can notify about, with the default severity each event carries. Events marked “not raised yet” are reserved for modules still being wired up." actions={<Button size="sm" onClick={() => setOpen((o) => !o)}>{open ? 'Hide' : 'Show'}</Button>} padded={false}>
       {open && (
         <DataTable dense rows={events} rowKey={(e) => e.key} columns={[
           { key: 'group', label: 'Area' },
           { key: 'key', label: 'Event', render: (e) => <code>{e.key}</code> },
           { key: 'label', label: 'Description' },
           { key: 'severity', label: 'Severity', render: (e) => <StatusPill status={SEVERITY_STATUS[e.severity]}>{e.severity}</StatusPill> },
+          { key: 'wired', label: 'Raised by', render: (e) => (e.wired === false ? <StatusPill status="pending">not raised yet</StatusPill> : <StatusPill status="ok">active</StatusPill>) },
         ]} />
       )}
     </Card>

@@ -201,7 +201,7 @@ export function parseTarListing(stdout) {
   const out = [];
   for (const raw of stdout.split('\n')) {
     const line = raw.replace(/\r$/, '');
-    const m = line.match(/^([-dlcbps][-rwxsStT]{9})\s+(\S+)\s+(\d+)\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?)\s+(.*)$/);
+    const m = line.match(/^([-dlcbps][-rwxsStT]{9})\s+(\S+)\s+(\d+(?:,\d+)?)\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?)\s+(.*)$/);
     if (!m) continue;
     let name = m[5];
     let target = null;
@@ -209,7 +209,7 @@ export function parseTarListing(stdout) {
     if (type === 'link') { const i = name.indexOf(' -> '); if (i >= 0) { target = name.slice(i + 4); name = name.slice(0, i); } }
     if (type === 'dir') name = name.replace(/\/$/, '');
     const [owner, group] = m[2].split('/');
-    out.push({ name, type, mode: m[1], owner, group, size: Number(m[3]), mtime: m[4], target });
+    out.push({ name, type, mode: m[1], owner, group, size: m[3].includes(',') ? 0 : Number(m[3]), mtime: m[4], target });
   }
   return out;
 }

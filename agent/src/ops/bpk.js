@@ -14,13 +14,19 @@ export function parsePsOwner(stdout) {
   return { user, elapsedSeconds: Number(etimes) };
 }
 
+// The owner is whatever `ps -o user:32` printed for the snapshot: system users
+// such as "_apt", mixed case, a bare UID for a deleted user, or a name cut at
+// 32 characters with a trailing "+". It is only compared with the live owner,
+// never passed to a program.
+export const psUser = z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9._$+-]{0,31}$/, 'not a process owner name as ps prints it');
+
 defineOp('bpk.kill', {
   description: 'Signal a matched process after re-verifying its owner (never root) and age',
   destructive: true,
   schema: z.object({
     pid: arg.pid,
     signal: arg.signal.default('SIGKILL'),
-    user: arg.username,
+    user: psUser,
     elapsedSeconds: z.number().int().nonnegative().optional(),
   }).strict(),
   run: async ({ pid, signal, user, elapsedSeconds }) => {

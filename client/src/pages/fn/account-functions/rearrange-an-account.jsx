@@ -19,13 +19,14 @@ export default function RearrangeAnAccount({ fn }) {
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
   const [job, setJob] = useState(null);
+  const [outcome, setOutcome] = useState(null);
   const currentRoot = account ? (parts?.roots || []).map((r) => r.root).sort((a, b) => b.length - a.length).find((r) => account.home_dir?.startsWith(`${r}/`)) : null;
   const options = (parts?.roots || []).filter((r) => r.exists && r.root !== currentRoot).map((r) => ({ value: r.root, label: `${r.root} — ${r.mountpoint ? `${r.filesystem} on ${r.mountpoint}, ${formatBytes(r.availableBytes)} free` : 'mountpoint unknown'}` }));
 
   const submit = async (e) => {
     e.preventDefault();
-    if (!(await confirm({ title: `Move ${username} to ${target}?`, message: `The home directory is copied with rsync to ${target}/${username}, the Linux user and web server are pointed at it, and the old directory is deleted. Sites keep serving from the old copy until the switch.`, confirmLabel: 'Move account', danger: true, typeToConfirm: username }))) return;
-    setBusy(true); setError(null);
+    if (!(await confirm({ title: `Move ${username} to ${target}?`, message: `${username} is suspended for the duration of the move (logins locked, sites unavailable). The home directory is copied with rsync to ${target}/${username}, the Linux user and web server are pointed at it, and the old directory is deleted only once both switched; otherwise both copies are kept and the log says what to do.`, confirmLabel: 'Move account', danger: true, typeToConfirm: username }))) return;
+    setBusy(true); setError(null); setOutcome(null);
     try {
       const { data } = await api.post(`/account-functions/rearrange/${username}`, { target });
       setJob(data.job.id);
@@ -35,7 +36,7 @@ export default function RearrangeAnAccount({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Moves an account's home directory to another partition (for example /home2) when a disk fills up. Runs as a job: rsync copy, a second sync for files changed meanwhile, usermod -d, vhost rewrite, then removal of the old tree." />
+      <PageHeader fn={fn} description="Moves an account's home directory to another partition (for example /home2) when a disk fills up. Runs as a job with the account suspended: rsync copy, a second sync for files changed meanwhile, usermod -d, vhost rewrite, removal of the old tree once both succeeded, then the account is unsuspended." />
       <Card title="Home partitions" padded={false} actions={<Button size="sm" onClick={() => refetchParts()}>Refresh</Button>}>
         <ErrorBanner error={partsError} onRetry={refetchParts} />
         <DataTable
@@ -50,7 +51,7 @@ export default function RearrangeAnAccount({ fn }) {
           rows={parts?.roots || []} loading={loading} rowKey={(r) => r.root} dense
         />
       </Card>
-      <Card title="Select an account"><AccountPicker value={username} onChange={(u) => { setUsername(u); setJob(null); }} /></Card>
+      <Card title="Select an account"><AccountPicker value={username} onChange={(u) => { setUsername(u); setJob(null); setOutcome(null); }} /></Card>
       {account && (
         <form onSubmit={submit}>
           <Card title={`${account.domain} (${account.username})`}>
@@ -66,7 +67,19 @@ export default function RearrangeAnAccount({ fn }) {
           </Card>
         </form>
       )}
-      {job && <Card title="Move progress"><ProgressLog jobId={job} onFinished={() => { refetch(); refetchParts(); }} /></Card>}
+      {job && (
+        <Card title="Move progress">
+          {outcome?.type === 'done' && outcome.result && !outcome.result.oldTreeRemoved && (
+            <div className="banner banner-warning" role="alert">
+              <strong>{outcome.result.oldHome} was kept.</strong> The account now lives in <code>{outcome.result.to}</code>, but the web server could not be pointed at it ({outcome.result.web?.reason || 'vhost rewrite failed'}). Sync the account under Service Configuration, verify the sites, then remove <code>{outcome.result.oldHome}</code> by hand.
+            </div>
+          )}
+          {outcome?.type === 'failed' && (
+            <div className="banner banner-error" role="alert"><strong>The move failed and was rolled back:</strong> {outcome.error}. The account keeps its previous home directory and was unsuspended.</div>
+          )}
+          <ProgressLog jobId={job} onFinished={(event) => { setOutcome(event); refetch(); refetchParts(); }} />
+        </Card>
+      )}
     </>
   );
 }

@@ -7,6 +7,10 @@ import { isRoot } from '../middleware/rbac.js';
 export const DOMLOGS_ROOT = '/var/log/whm/domlogs';
 const ACCESS_LOG = /-access\.log$/;
 const READ_CAP = 32 * 1024 * 1024;
+// fs.list returns at most this many entries and no truncation flag.
+const LIST_MAX = 10000;
+// Schedule row declared by the route module; it follows the web-server capability.
+export const COLLECT_SCHEDULE = 'account-bandwidth';
 // acct.read_range serves at most 8 MiB per call.
 const RANGE_CHUNK = 8 * 1024 * 1024;
 // logrotate keeps the previous file as "<name>.1" or, with dateext,
@@ -17,7 +21,10 @@ const MONTHS = { Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06
 const LOG_LINE = /^\S+ \S+ \S+ \[(\d{1,2})\/([A-Za-z]{3})\/(\d{4}):[^\]]*\] "[^"]*" (\d{3}) (\d+|-)/;
 const DOMAIN_TYPES = { parked: ['parked', 'alias'], sub: ['sub'], addon: ['addon'], main: ['main'], all: ['main', 'addon', 'sub', 'parked', 'alias'] };
 
-export const currentPeriod = (d = new Date()) => d.toISOString().slice(0, 7);
+// Access-log timestamps are host-local, so the month a line belongs to and the
+// month the collector refreshes accounts.bandwidth_used_mb from must both be
+// taken in the host's zone or they disagree around month boundaries.
+export const currentPeriod = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
 
 export function slugify(name) {
   return String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
@@ -62,10 +69,13 @@ export function createAccountInformationService(ctx) {
     periods: db.prepare('SELECT DISTINCT period FROM account_bandwidth ORDER BY period DESC LIMIT 36'),
     deleteBandwidth: db.prepare('DELETE FROM account_bandwidth WHERE account_id = ? AND period = ?'),
     deleteBandwidthAll: db.prepare('DELETE FROM account_bandwidth WHERE account_id = ?'),
+    deletePeriodOf: db.prepare('DELETE FROM account_bandwidth WHERE period = ? AND account_id IN (SELECT id FROM accounts WHERE username IN (SELECT value FROM json_each(?)))'),
     source: db.prepare('SELECT * FROM account_bandwidth_sources WHERE account_id = ? AND path = ?'),
     sources: db.prepare('SELECT path, bytes_processed, size, lines, last_seen_at FROM account_bandwidth_sources WHERE account_id = ? ORDER BY path'),
+    // `lines` describes the file as it is now: it restarts with the file after a rotation.
     upsertSource: db.prepare(`INSERT INTO account_bandwidth_sources (account_id, path, bytes_processed, size, lines, last_seen_at) VALUES (@account_id, @path, @bytes_processed, @size, @lines, datetime('now'))
-      ON CONFLICT (account_id, path) DO UPDATE SET bytes_processed = excluded.bytes_processed, size = excluded.size, lines = account_bandwidth_sources.lines + excluded.lines, last_seen_at = excluded.last_seen_at`),
+      ON CONFLICT (account_id, path) DO UPDATE SET bytes_processed = excluded.bytes_processed, size = excluded.size,
+      lines = CASE WHEN @restart THEN excluded.lines ELSE account_bandwidth_sources.lines + excluded.lines END, last_seen_at = excluded.last_seen_at`),
     domainsOf: db.prepare("SELECT account_id, domain FROM account_domains WHERE account_id IN (SELECT value FROM json_each(?)) AND type IN ('main', 'addon')"),
     enhancementBySlug: db.prepare('SELECT * FROM account_enhancements WHERE enhancement_id = ?'),
     enhancementByName: db.prepare('SELECT id FROM account_enhancements WHERE name = ?'),
@@ -78,7 +88,6 @@ export function createAccountInformationService(ctx) {
     clearAssignments: db.prepare('DELETE FROM account_enhancement_assignments WHERE account_id = ?'),
     accountsOfEnhancement: db.prepare(`SELECT a.id, a.username, a.domain, a.suspended, u.username AS owner, a.owner_id, s.assigned_at, s.assigned_by FROM account_enhancement_assignments s
       JOIN accounts a ON a.id = s.account_id JOIN users u ON u.id = a.owner_id WHERE s.enhancement_id = ? ORDER BY a.username`),
-    systemAudit: db.prepare("INSERT INTO audit_log (principal, role, ip, action, target, args_redacted, result) VALUES ('system', 'root', NULL, ?, ?, ?, 'ok')"),
   };
 
   // Suspension on exceed is owned by Account Functions (Limit Bandwidth Usage
@@ -146,7 +155,7 @@ export function createAccountInformationService(ctx) {
     ownerWhere(user, where, params);
     const scope = query.scope || 'over';
     if (scope === 'over') where.push('a.disk_quota_mb > 0 AND a.disk_used_mb >= a.disk_quota_mb');
-    else if (scope === 'warn') where.push('a.disk_quota_mb > 0 AND a.disk_used_mb * 100.0 / a.disk_quota_mb >= @warn');
+    else if (scope === 'warn') where.push('a.disk_quota_mb > 0 AND a.disk_used_mb < a.disk_quota_mb AND a.disk_used_mb * 100.0 / a.disk_quota_mb >= @warn');
     if (query.q) { where.push('(a.username LIKE @q OR a.domain LIKE @q OR u.username LIKE @q)'); params.q = `%${query.q}%`; }
     const percentSql = 'CASE WHEN a.disk_quota_mb > 0 THEN a.disk_used_mb * 100.0 / a.disk_quota_mb END';
     const result = paginate(db, {
@@ -206,6 +215,7 @@ export function createAccountInformationService(ctx) {
   // Bandwidth -------------------------------------------------------------------
   function bandwidth(query, user) {
     const { warnPercent } = bwSettings();
+    syncCollectSchedule();
     const period = query.period || currentPeriod();
     const where = [];
     const params = { period, warn: warnPercent };
@@ -214,7 +224,7 @@ export function createAccountInformationService(ctx) {
     const percentSql = `CASE WHEN a.bandwidth_limit_mb > 0 THEN ${usedMbSql} * 100.0 / a.bandwidth_limit_mb END`;
     const scope = query.scope || 'all';
     if (scope === 'over') where.push(`a.bandwidth_limit_mb > 0 AND ${usedMbSql} >= a.bandwidth_limit_mb`);
-    else if (scope === 'warn') where.push(`a.bandwidth_limit_mb > 0 AND ${percentSql} >= @warn`);
+    else if (scope === 'warn') where.push(`a.bandwidth_limit_mb > 0 AND ${usedMbSql} < a.bandwidth_limit_mb AND ${percentSql} >= @warn`);
     if (query.q) { where.push('(a.username LIKE @q OR a.domain LIKE @q OR u.username LIKE @q)'); params.q = `%${query.q}%`; }
     const result = paginate(db, {
       select: `a.id, a.username, a.domain, a.package_name, a.bandwidth_limit_mb, a.suspended, a.suspend_reason, u.username AS owner, COALESCE(b.bytes, 0) AS bytes, ${percentSql} AS percent`,
@@ -236,15 +246,13 @@ export function createAccountInformationService(ctx) {
 
   function bandwidthHistory(username, user, months = 12) {
     const account = loadAccount(username, user);
-    const start = new Date();
-    start.setUTCDate(1);
-    start.setUTCMonth(start.getUTCMonth() - (months - 1));
+    const now = new Date();
+    const start = new Date(now.getFullYear(), now.getMonth() - (months - 1), 1);
     const from = currentPeriod(start);
     const rows = new Map(stmts.history.all(account.id, from).map((r) => [r.period, r.bytes]));
     const series = [];
     for (let i = 0; i < months; i++) {
-      const d = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + i, 1));
-      const period = currentPeriod(d);
+      const period = currentPeriod(new Date(start.getFullYear(), start.getMonth() + i, 1));
       series.push({ period, bytes: rows.get(period) || 0 });
     }
     const limitMb = account.bandwidth_limit_mb;
@@ -277,13 +285,29 @@ export function createAccountInformationService(ctx) {
     return { content: Buffer.concat(chunks), size, eof };
   }
 
-  // A rotated file no longer grows, so one tail read of its unread remainder
-  // returns exactly the bytes after `from`.
+  // A rotated file no longer grows, so range reads from `from` return exactly
+  // its unread remainder. acct.read_range (no symlink, realpath pinned) only
+  // accepts ".log" / ".log.N" names; a dateext copy ("-access.log-YYYYMMDD")
+  // is refused by name and falls back to the plain tail read, which cannot
+  // see a symlink swapped in after the listing.
   async function readRotatedTail(file, from, size) {
     const want = Math.min(READ_CAP, size - from);
     if (want <= 0) return Buffer.alloc(0);
-    const res = await agent.op('sys.read_file', { path: file, maxBytes: want, tail: true });
-    return Buffer.from(res.content, 'utf8');
+    const chunks = [];
+    let offset = from;
+    while (offset - from < want) {
+      let res;
+      try { res = await agent.op('acct.read_range', { path: file, offset, length: Math.min(RANGE_CHUNK, want - (offset - from)) }); } catch (err) {
+        if (err.code !== 'refused' || offset !== from) throw err;
+        const tail = await agent.op('sys.read_file', { path: file, maxBytes: want, tail: true });
+        return Buffer.from(tail.content, 'utf8');
+      }
+      if (!res.length) break;
+      chunks.push(Buffer.from(res.data, 'base64'));
+      offset += res.length;
+      if (res.eof) break;
+    }
+    return Buffer.concat(chunks);
   }
 
   // The rotated copy of `entry` when the rotation happened after the last run:
@@ -305,15 +329,16 @@ export function createAccountInformationService(ctx) {
 
   async function collectAccount(account, conf, job) {
     const dirs = [`${DOMLOGS_ROOT}/${account.username}`, ...(conf.extraLogDirs || []).map((d) => `${String(d).replace(/\/+$/, '')}/${account.username}`)];
-    const out = { files: 0, lines: 0, requests: 0, bytes: 0, recovered: 0, pending: 0 };
+    const out = { files: 0, lines: 0, requests: 0, bytes: 0, recovered: 0, pending: 0, truncated: 0 };
     const maxBytes = Math.min(READ_CAP, Math.max(65536, Number(conf.maxLogBytes) || READ_CAP));
     for (const dir of dirs) {
       let listing;
-      try { listing = await agent.op('fs.list', { path: dir, limit: 1000 }); } catch (err) {
+      try { listing = await agent.op('fs.list', { path: dir, limit: LIST_MAX }); } catch (err) {
         if (!['op_failed', 'not_found'].includes(err.code)) job.log(`${account.username}: cannot list ${dir}: ${err.message}`, 'warn');
         continue;
       }
       const entries = listing.entries || [];
+      if (entries.length >= LIST_MAX) { out.truncated++; job.log(`${account.username}: ${dir} holds ${LIST_MAX} or more entries and the listing stops there, so some access logs may be skipped and bandwidth under-counted; prune rotated logs in that directory`, 'warn'); }
       for (const entry of entries) {
         if (entry.type !== 'file' || !ACCESS_LOG.test(entry.name) || !entry.size) continue;
         const file = `${dir}/${entry.name}`;
@@ -325,7 +350,12 @@ export function createAccountInformationService(ctx) {
           try {
             const tail = parseAccessLog(await readRotatedTail(copyPath, from, copy.size));
             const bytes = Object.values(tail.periods).reduce((s, b) => s + b, 0);
-            db.transaction(() => addPeriods(account.id, tail.periods))();
+            // The offset restarts in the same transaction as the tail so a failed
+            // live read cannot make the next run detect the rotation and count it again.
+            db.transaction(() => {
+              addPeriods(account.id, tail.periods);
+              stmts.upsertSource.run({ account_id: account.id, path: file, bytes_processed: 0, size: entry.size, lines: 0, restart: 1 });
+            })();
             out.recovered += bytes; out.lines += tail.lines; out.requests += tail.requests; out.bytes += bytes;
             job.log(`${file} was rotated to ${copy.name}; counted its last ${copy.size - from} byte(s) (${tail.requests} request(s))${copy.size - from > READ_CAP ? ` — only the final ${READ_CAP} bytes could be read` : ''}`);
           } catch (err) { job.log(`${file} was rotated to ${copy.name}, whose last ${copy.size - from} byte(s) could not be read: ${err.message}`, 'warn'); }
@@ -337,7 +367,7 @@ export function createAccountInformationService(ctx) {
         const parsed = parseAccessLog(res.content);
         db.transaction(() => {
           addPeriods(account.id, parsed.periods);
-          stmts.upsertSource.run({ account_id: account.id, path: file, bytes_processed: from + parsed.consumedBytes, size: res.size, lines: parsed.lines });
+          stmts.upsertSource.run({ account_id: account.id, path: file, bytes_processed: from + parsed.consumedBytes, size: res.size, lines: parsed.lines, restart: from === 0 ? 1 : 0 });
         })();
         const unread = res.size - (from + parsed.consumedBytes);
         if (!res.eof && unread > 0) { out.pending += unread; job.log(`${file}: ${unread} byte(s) still unread after the ${maxBytes}-byte per-run limit; they are read on the next run`, 'warn'); }
@@ -348,32 +378,33 @@ export function createAccountInformationService(ctx) {
     return out;
   }
 
-  // Suspending exceeders is Account Functions' job (its toggle, its reason
-  // prefix, its Unsuspend Bandwidth Exceeders); this run only refreshes
-  // accounts.bandwidth_used_mb and hands over, auditing what got suspended.
-  async function enforceLimits(job, summary) {
-    if (!ctx.accountFunctions?.runBandwidthEnforce) { job.log('Account Functions is not loaded; accounts over their limit are reported but not suspended', 'warn'); return; }
-    let result;
-    try { result = await ctx.accountFunctions.runBandwidthEnforce(job); } catch (err) { job.log(`Bandwidth enforcement failed: ${err.message}`, 'error'); return; }
-    summary.enforcement = Boolean(result?.enabled);
-    summary.suspended = result?.suspended ?? [];
-    if (!summary.enforcement && summary.exceeded.length) job.log('Automatic suspension is off; enable it under Account Functions › Limit Bandwidth Usage');
-    const reason = enforcementStatus().reason;
-    for (const username of summary.suspended) stmts.systemAudit.run('account.suspend', username, JSON.stringify({ reason, by: 'accounts.bandwidth_enforce', trigger: 'account_info.bandwidth_collect' }));
+  // Collection runs where a web server can be writing domlogs (or extra log
+  // roots are configured); elsewhere the hourly schedule is parked instead of
+  // enqueuing runs over nothing. The row is written only when that changes.
+  function syncCollectSchedule() {
+    const row = ctx.scheduler?.list?.().find((s) => s.name === COLLECT_SCHEDULE);
+    if (!row) return null;
+    const enabled = capabilities.has('apache') || capabilities.has('nginx') || (bwSettings().extraLogDirs || []).length > 0;
+    if (Boolean(row.enabled) !== enabled) ctx.scheduler.update(COLLECT_SCHEDULE, { enabled });
+    return enabled;
   }
 
-  // Parses every account's Apache access logs incrementally into monthly totals,
-  // then lets Account Functions enforce the limits against the fresh numbers.
+  // Parses every account's Apache access logs incrementally into monthly totals
+  // and refreshes accounts.bandwidth_used_mb. Suspending exceeders is Account
+  // Functions' job (its toggle, its schedule, its reason prefix and its
+  // Unsuspend Bandwidth Exceeders); this run only reports who is over.
   async function collectBandwidth(job) {
     const conf = bwSettings();
     const accounts = stmts.accountsForJobs.all();
     const period = currentPeriod();
-    const summary = { accounts: accounts.length, files: 0, lines: 0, requests: 0, bytes: 0, recovered: 0, pending: 0, exceeded: [], suspended: [], enforcement: false, period };
+    const enforcement = enforcementStatus().enabled;
+    const summary = { accounts: accounts.length, files: 0, lines: 0, requests: 0, bytes: 0, recovered: 0, pending: 0, truncated: 0, exceeded: [], enforcement, period };
+    if (syncCollectSchedule() === false) job.log(`No web server is installed and no extra log directories are configured; the ${COLLECT_SCHEDULE} schedule stays parked until one is`);
     for (const [i, a] of accounts.entries()) {
-      job.progress((i / Math.max(1, accounts.length)) * 90, a.username);
+      job.progress((i / Math.max(1, accounts.length)) * 95, a.username);
       let r;
       try { r = await collectAccount(a, conf, job); } catch (err) { job.log(`${a.username}: ${err.message}`, 'warn'); continue; }
-      summary.files += r.files; summary.lines += r.lines; summary.requests += r.requests; summary.bytes += r.bytes; summary.recovered += r.recovered; summary.pending += r.pending;
+      summary.files += r.files; summary.lines += r.lines; summary.requests += r.requests; summary.bytes += r.bytes; summary.recovered += r.recovered; summary.pending += r.pending; summary.truncated += r.truncated;
       const usedMb = toMb(stmts.periodBytes.get(a.id, period)?.bytes || 0);
       stmts.setBandwidthUsed.run(usedMb, a.id);
       if (a.bandwidth_limit_mb > 0 && usedMb >= a.bandwidth_limit_mb) {
@@ -382,51 +413,74 @@ export function createAccountInformationService(ctx) {
       }
     }
     settings.set('account_info.bandwidth_collected_at', new Date().toISOString());
-    job.progress(92, 'enforcing bandwidth limits');
-    await enforceLimits(job, summary);
-    job.progress(100, `${summary.files} log file(s), ${summary.requests} request(s), ${summary.exceeded.length} account(s) over limit, ${summary.suspended.length} suspended`);
+    if (summary.exceeded.length) job.log(enforcement ? 'Accounts over their limit are suspended by the account-bandwidth-enforce schedule (Account Functions › Limit Bandwidth Usage)' : 'Automatic suspension is off; enable it under Account Functions › Limit Bandwidth Usage');
+    job.progress(100, `${summary.files} log file(s), ${summary.requests} request(s), ${summary.exceeded.length} account(s) over limit`);
     return summary;
   }
 
   function bandwidthSettings() {
-    return { settings: bwSettings(), enforcement: enforcementStatus(), logsRoot: DOMLOGS_ROOT, lastCollect: settings.get('account_info.bandwidth_collected_at', null), readCap: READ_CAP };
+    const scheduled = syncCollectSchedule();
+    return { settings: bwSettings(), enforcement: enforcementStatus(), logsRoot: DOMLOGS_ROOT, lastCollect: settings.get('account_info.bandwidth_collected_at', null), readCap: READ_CAP, schedule: { name: COLLECT_SCHEDULE, enabled: Boolean(scheduled) } };
   }
 
   function updateBandwidthSettings(input, req) {
     const next = { ...bwSettings(), ...input };
     settings.set('account_info.bandwidth', next);
+    syncCollectSchedule();
     req?.audit?.({ action: 'account_info.bandwidth.settings', args: input });
     return bandwidthSettings();
   }
 
-  function resetBandwidth(username, { all = false, period = currentPeriod() } = {}, user, req) {
+  // Account Functions' reset calls this to clear the current period of the
+  // table this category owns (integration contract 2); it zeroes the account
+  // counter itself.
+  function resetPeriod(usernames, period = currentPeriod()) {
+    if (!usernames?.length) return { period, cleared: 0 };
+    return { period, cleared: stmts.deletePeriodOf.run(period, JSON.stringify(usernames)).changes };
+  }
+
+  // The current period is reset through Account Functions (owner of the
+  // counter, the unsuspend step and the audit row); past months and the full
+  // history are this category's own rows.
+  async function resetBandwidth(username, { all = false, period = currentPeriod() } = {}, user, req) {
     const account = loadAccount(username, user);
     requireAcl(user, 'limit-bandwidth');
-    db.transaction(() => {
-      if (all) stmts.deleteBandwidthAll.run(account.id); else stmts.deleteBandwidth.run(account.id, period);
-      stmts.setBandwidthUsed.run(all || period === currentPeriod() ? 0 : toMb(stmts.periodBytes.get(account.id, currentPeriod())?.bytes || 0), account.id);
-    })();
-    req?.audit?.({ action: 'account_info.bandwidth.reset', target: username, args: { all, period } });
-    return { username, all, period };
+    const current = all || period === currentPeriod();
+    let delegated = null;
+    if (current && ctx.accountFunctions?.resetBandwidth) {
+      if (all) stmts.deleteBandwidthAll.run(account.id);
+      delegated = await ctx.accountFunctions.resetBandwidth({ usernames: [username], unsuspend: true }, user, req);
+    } else {
+      db.transaction(() => {
+        if (all) stmts.deleteBandwidthAll.run(account.id); else stmts.deleteBandwidth.run(account.id, period);
+        stmts.setBandwidthUsed.run(current ? 0 : toMb(stmts.periodBytes.get(account.id, currentPeriod())?.bytes || 0), account.id);
+      })();
+      req?.audit?.({ action: 'account_info.bandwidth.reset', target: username, args: { all, period } });
+    }
+    return { username, all, period, unsuspended: delegated?.unsuspended ?? [], via: delegated ? 'account-functions' : 'account-information' };
   }
 
   // Enhancements ------------------------------------------------------------------
   const enhancements = {
-    list(query) {
+    // A reseller sees how many of its own accounts carry an enhancement, never
+    // the server-wide count.
+    list(query, user) {
       const where = [];
       const params = {};
       if (query.q) { where.push('(e.name LIKE @q OR e.enhancement_id LIKE @q OR e.description LIKE @q)'); params.q = `%${query.q}%`; }
+      let assignedSql = '(SELECT COUNT(*) FROM account_enhancement_assignments s WHERE s.enhancement_id = e.id)';
+      if (!isRoot(user)) { assignedSql = '(SELECT COUNT(*) FROM account_enhancement_assignments s JOIN accounts a ON a.id = s.account_id WHERE s.enhancement_id = e.id AND a.owner_id = @owner)'; params.owner = user.id; }
       const result = paginate(db, {
-        select: 'e.*, (SELECT COUNT(*) FROM account_enhancement_assignments s WHERE s.enhancement_id = e.id) AS assigned',
+        select: `e.*, ${assignedSql} AS assigned`,
         from: 'account_enhancements e', where, params,
         sortable: { name: 'e.name', id: 'e.enhancement_id', assigned: 'assigned', created_at: 'e.created_at' }, defaultSort: 'name', query,
       });
       return { ...result, data: result.data.map((r) => shapeEnhancement(r, { assigned: r.assigned })) };
     },
-    get(id) {
+    get(id, user) {
       const row = stmts.enhancementBySlug.get(id);
       if (!row) throw notFound('Enhancement');
-      return shapeEnhancement(row, { assigned: stmts.accountsOfEnhancement.all(row.id).length });
+      return shapeEnhancement(row, { assigned: stmts.accountsOfEnhancement.all(row.id).filter((a) => !user || isRoot(user) || a.owner_id === user.id).length });
     },
     create(input, req) {
       const slug = input.id || slugify(input.name);
@@ -525,7 +579,7 @@ export function createAccountInformationService(ctx) {
   }
 
   return {
-    listDomains, quota, quotaReport, refreshDiskUsage, bandwidth, bandwidthHistory, collectBandwidth, bandwidthSettings, updateBandwidthSettings, resetBandwidth, enhancements, overview,
+    listDomains, quota, quotaReport, refreshDiskUsage, bandwidth, bandwidthHistory, collectBandwidth, bandwidthSettings, updateBandwidthSettings, resetBandwidth, resetPeriod, syncCollectSchedule, enhancements, overview,
     enqueueDiskRefresh: (user) => ctx.jobs.enqueue('account_info.disk_refresh', {}, { userId: user?.id ?? null }),
     enqueueBandwidthCollect: (user) => ctx.jobs.enqueue('account_info.bandwidth_collect', {}, { userId: user?.id ?? null }),
   };
