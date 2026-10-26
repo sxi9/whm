@@ -14,14 +14,17 @@ const file = (name, size = 10) => ({ name, type: 'file', size, mtime: '2026-10-0
 // /var/log/nginx holds the distribution logs shared by every site plus
 // per-domain files; the names are chosen so substring matching would leak.
 const NGINX_FILES = ['access.log', 'access.log.1', 'error.log', 'alice.com-access.log', 'alice.com.error.log.1', 'myalice.com-access.log', 'myalice.com-error.log'].map((n) => file(n));
-const FS_LIST = ({ path }) => {
-  if (path === '/var/log/whm/domlogs/alice') return { path, entries: [{ name: LOG_A, type: 'file', size: LOG_BYTES.length, mtime: '2026-10-01T00:00:00.000Z', mode: '640' }, { name: LOG_B, type: 'file', size: 10, mtime: '2026-09-01T00:00:00.000Z', mode: '640' }, { name: 'notes.txt', type: 'file', size: 1, mtime: null, mode: '644' }, { name: 'sub', type: 'dir', size: null, mtime: null, mode: '755' }] };
-  if (path === '/home/alice/logs') return { path, entries: [{ name: 'php-error.log', type: 'file', size: 5, mtime: '2026-10-02T00:00:00.000Z', mode: '600' }] };
-  if (path === '/var/log/nginx') return { path, entries: NGINX_FILES };
-  if (path === '/home2/alice') return { path, entries: [] };
-  const err = Object.assign(new Error(`ENOENT: ${path}`), { agentError: true, code: 'op_failed' });
-  throw err;
+const notFound = (path) => Object.assign(new Error(`ENOENT: ${path}`), { agentError: true, code: 'op_failed' });
+// What the agent's symlink-safe listing answers per directory (acct.list_logs
+// only ever returns regular files, so the "notes.txt"/"sub" entries of a real
+// domlogs tree never reach the panel).
+const LOG_DIRS = {
+  '/var/log/whm/domlogs/alice': [{ name: LOG_A, size: LOG_BYTES.length, mtime: '2026-10-01T00:00:00.000Z', uid: 0 }, { name: LOG_B, size: 10, mtime: '2026-09-01T00:00:00.000Z', uid: 0 }, { name: 'notes.txt', size: 1, mtime: null, uid: 0 }],
+  '/home/alice/logs': [{ name: 'php-error.log', size: 5, mtime: '2026-10-02T00:00:00.000Z', uid: 30001 }],
+  '/var/log/nginx': NGINX_FILES.map((f) => ({ name: f.name, size: f.size, mtime: f.mtime, uid: 0 })),
 };
+const LIST_LOGS = ({ path }) => { if (LOG_DIRS[path]) return { path, entries: LOG_DIRS[path], skipped: [] }; throw notFound(path); };
+const FS_LIST = ({ path }) => { if (path === '/home2/alice') return { path, entries: [] }; throw notFound(path); };
 
 function hostAgent() {
   return createMockAgent({
@@ -31,6 +34,8 @@ function hostAgent() {
     'user.set_quota': (args) => args,
     'user.quota_report': ({ filesystem }) => ({ available: true, users: [{ username: 'alice', usedMb: 120, softMb: 10240, hardMb: 10752 }], filesystem }),
     'fs.list': FS_LIST,
+    'acct.list_logs': LIST_LOGS,
+    'acct.archive_logs': ({ archiveDir, label }) => ({ dest: `${archiveDir}/${label}`, pruned: ['2020-01'] }),
     'acct.read_range': ({ path, offset, length }) => {
       const slice = LOG_BYTES.subarray(offset, offset + length);
       return { path, size: LOG_BYTES.length, offset, length: slice.length, data: slice.toString('base64'), eof: offset + slice.length >= LOG_BYTES.length };
@@ -248,6 +253,11 @@ describe('Account Functions API', () => {
       expect(done.status).toBe('done');
       expect(done.result.suspended).toEqual(['alice', 'carol']);
       expect((await app.http.get('/api/accounts/alice')).body.data).toMatchObject({ suspended: true, suspend_reason: expect.stringMatching(/^bandwidth/) });
+      // A scheduler-driven suspension carries no request but is still audited, per account and as a job summary.
+      const auto = app.ctx.db.prepare("SELECT principal, target, args_redacted FROM audit_log WHERE action = 'account.suspend' AND target IN ('alice', 'carol') ORDER BY id DESC LIMIT 2").all();
+      expect(auto.map((r) => r.target).sort()).toEqual(['alice', 'carol']);
+      for (const row of auto) { expect(row.principal).toBeNull(); expect(JSON.parse(row.args_redacted)).toMatchObject({ reason: expect.stringMatching(/^bandwidth/), by: 'scheduler', web: { applied: false, reason: 'web_category_missing' } }); }
+      expect(JSON.parse(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'account.bandwidth.enforce' ORDER BY id DESC LIMIT 1").get().args_redacted)).toMatchObject({ suspended: ['alice', 'carol'], job: job.id });
 
       // A named selection without an explicit "all" touches only those accounts.
       const un = await post('/bandwidth/unsuspend-exceeders', { usernames: ['alice'], resetCounters: true }).expect(200);
@@ -319,16 +329,35 @@ describe('Account Functions API', () => {
     it('lists log files from the domlogs and home trees and streams one in ranges', async () => {
       const list = await get('/logs/apache/alice').expect(200);
       expect(list.body.data.files.map((f) => f.name)).toEqual([LOG_A, LOG_B, 'php-error.log']);
+      expect(list.body.data.warnings).toEqual([]);
+      // The server-wide domlogs tree is root's; only the directory inside the home is pinned to the account.
+      expect(app.agent.callsTo('acct.list_logs').map((c) => c.args)).toEqual([{ path: '/var/log/whm/domlogs/alice', limit: 5000 }, { path: '/home/alice/logs', limit: 5000, owner: 'alice' }]);
       const dl = await get(`/logs/apache/alice/download?file=${LOG_A}`).buffer(true).parse((res, cb) => { const chunks = []; res.on('data', (c) => chunks.push(c)); res.on('end', () => cb(null, Buffer.concat(chunks))); });
       expect(dl.status).toBe(200);
       expect(dl.headers['content-disposition']).toBe(`attachment; filename="alice-${LOG_A}"`);
       expect(dl.headers['content-length']).toBe(String(LOG_BYTES.length));
       expect(Buffer.compare(dl.body, LOG_BYTES)).toBe(0);
       expect(app.agent.callsTo('acct.read_range').length).toBeGreaterThanOrEqual(1);
+      expect(app.agent.callsTo('acct.read_range')[0].args).toEqual({ path: `/var/log/whm/domlogs/alice/${LOG_A}`, offset: 0, length: 1024 * 1024 });
+      await get('/logs/apache/alice/download?file=php-error.log').expect(200);
+      expect(app.agent.callsTo('acct.read_range').at(-1).args).toMatchObject({ path: '/home/alice/logs/php-error.log', owner: 'alice' });
       expect((await get('/logs/apache/alice/download?file=notes.txt')).status).toBe(404);
       expect((await get('/logs/apache/alice/download?file=../passwd')).status).toBe(422);
       expect((await rget(`/logs/apache/alice/download?file=${LOG_A}`)).status).toBe(403);
       expect((await get('/logs/iis/alice')).status).toBe(422);
+    });
+
+    it('reports a home log directory the agent refused (symlink or foreign owner) instead of serving it', async () => {
+      app.agent.set('acct.list_logs', ({ path, owner }) => {
+        if (path === '/home/alice/logs') throw Object.assign(new Error(`${path} goes through a symbolic link (/var/log/whm/domlogs/bob); refusing to follow it`), { agentError: true, code: 'refused', details: { owner } });
+        return LIST_LOGS({ path });
+      });
+      try {
+        const list = await get('/logs/apache/alice').expect(200);
+        expect(list.body.data.files.map((f) => f.name)).toEqual([LOG_A, LOG_B]);
+        expect(list.body.data.warnings).toEqual([expect.stringMatching(/^\/home\/alice\/logs was skipped: .*symbolic link/)]);
+        expect((await get('/logs/apache/alice/download?file=php-error.log')).status).toBe(404);
+      } finally { app.agent.set('acct.list_logs', LIST_LOGS); }
     });
 
     it('shows each account only the NGINX files named after its own domains', async () => {
@@ -346,7 +375,6 @@ describe('Account Functions API', () => {
       } finally {
         app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, Boolean(BINS[n])])));
         await app.ctx.capabilities.refresh();
-        app.agent.set('fs.list', FS_LIST);
         await app.http.delete('/api/accounts/malice').set('X-CSRF-Token', csrf).expect(200);
       }
     });
@@ -363,16 +391,25 @@ describe('Account Functions API', () => {
       const parts = await get('/rearrange/partitions').expect(200);
       expect(parts.body.data.roots.map((r) => r.root)).toEqual(HOME_ROOTS);
       expect(parts.body.data.roots.find((r) => r.root === '/home2')).toMatchObject({ exists: true, mountpoint: '/home2', filesystem: '/dev/sdb1' });
+      await put('/quota/alice', { diskQuotaMb: 1024 }).expect(200);
+      app.agent.calls.length = 0;
       const start = await post('/rearrange/alice', { target: '/home2' }).expect(202);
       expect(start.body.data).toMatchObject({ from: '/home/alice', to: '/home2/alice', bytes: 4096 });
       const job = await waitForJob(app.ctx, start.body.data.job.id);
       expect(job.status, job.error).toBe('done');
       expect(app.agent.callsTo('fs.copy_tree').map((c) => c.args)).toEqual([{ from: '/home/alice', to: '/home2/alice' }, { from: '/home/alice', to: '/home2/alice', deleteExtraneous: true }]);
       expect(app.agent.callsTo('acct.set_home')).toEqual([{ name: 'acct.set_home', args: { username: 'alice', homeDir: '/home2/alice' } }]);
+      // /home2 is its own filesystem: the quota is cleared on the old one and set again on the new one.
+      expect(app.agent.callsTo('user.set_quota').map((c) => c.args)).toEqual([{ username: 'alice', softMb: 0, hardMb: 0, filesystem: '/' }, { username: 'alice', softMb: 1024, hardMb: 1075, filesystem: '/home2' }]);
+      expect(job.result.quota).toEqual({ applied: true, filesystem: '/home2', mb: 1024 });
       expect(app.agent.callsTo('fs.remove')).toEqual([{ name: 'fs.remove', args: { path: '/home/alice', recursive: true } }]);
       const account = (await app.http.get('/api/accounts/alice')).body.data;
       expect(account.home_dir).toBe('/home2/alice');
       expect(account.domains[0].docroot).toBe('/home2/alice/public_html');
+      // Modify an Account and Quota Modification now agree on the filesystem of the moved home.
+      await app.http.patch('/api/accounts/alice').set('X-CSRF-Token', csrf).send({ diskQuotaMb: 3000 }).expect(200);
+      expect(app.agent.callsTo('user.set_quota').at(-1).args).toEqual({ username: 'alice', softMb: 3000, hardMb: 3150, filesystem: '/home2' });
+      expect((await put('/quota/alice', { diskQuotaMb: 3000 }).expect(200)).body.data.filesystem).toBe('/home2');
       expect((await post('/rearrange/alice', { target: '/home2' })).status).toBe(409);
       expect((await post('/rearrange/alice', { target: '/opt' })).status).toBe(422);
       expect((await rpost('/rearrange/bob', { target: '/home2' })).status).toBe(403);
@@ -401,14 +438,16 @@ describe('Account Functions API', () => {
       expect(set.body.data).toMatchObject({ archive_logs: true, retain_months: 2, configured: true, archive_dir: '/home2/alice/logs/archive' });
       const list = await get('/log-retention').expect(200);
       expect(list.body.data.accounts.find((a) => a.username === 'alice').archive_logs).toBe(true);
-      app.agent.set('fs.list', ({ path }) => (path === '/home2/alice/logs/archive' ? { path, entries: [{ name: '2020-01', type: 'dir' }, { name: '2099-01', type: 'dir' }] } : { path, entries: [] }));
       const run = await post('/log-retention/archive', { username: 'alice' }).expect(202);
       const job = await waitForJob(app.ctx, run.body.data.job.id);
       expect(job.status, job.error).toBe('done');
       expect(job.result.archived).toEqual(['alice']);
       expect(job.result.pruned).toEqual(['alice/2020-01']);
-      expect(app.agent.callsTo('fs.copy_tree').at(-1).args).toMatchObject({ from: '/var/log/whm/domlogs/alice', to: expect.stringMatching(/^\/home2\/alice\/logs\/archive\/\d{4}-\d{2}$/) });
-      expect(app.agent.callsTo('fs.remove').at(-1).args).toEqual({ path: '/home2/alice/logs/archive/2020-01', recursive: true });
+      // The copy and the pruning are one agent op that runs as the account; root never writes into the home itself.
+      expect(app.agent.callsTo('acct.archive_logs').map((c) => c.args)).toEqual([{ username: 'alice', source: '/var/log/whm/domlogs/alice', archiveDir: '/home2/alice/logs/archive', label: expect.stringMatching(/^\d{4}-\d{2}$/), retainMonths: 2 }]);
+      expect(app.agent.callsTo('fs.mkdir')).toEqual([]);
+      expect(app.agent.callsTo('fs.copy_tree')).toEqual([]);
+      expect(app.agent.callsTo('fs.remove')).toEqual([]);
       expect((await get('/log-retention/alice')).body.data.last_archived_at).toBeTruthy();
       expect((await put('/log-retention/alice', { retainMonths: 0 })).status).toBe(422);
       expect((await rput('/log-retention/alice', { archiveLogs: true })).status).toBe(403);
@@ -482,6 +521,89 @@ describe('Account Functions API', () => {
       } finally {
         app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, Boolean(BINS[n])])));
         await app.ctx.capabilities.refresh();
+      }
+    });
+  });
+  describe('reseller ACLs and limits', () => {
+    const root = { id: 1, username: 'root', role: 'root' };
+    const grant = (acls) => app.ctx.resellers.setPrivileges('resell1', { acls }, root, null);
+    afterAll(() => grant(['all']));
+
+    it('refuses account-scoped changes the reseller was not delegated', async () => {
+      grant(['edit-account', 'suspend-acct']);
+      const before = (await app.http.get('/api/accounts/bob')).body.data;
+      for (const [res, acl] of [
+        [await rput('/bandwidth/bob', { limitMb: 5 }), 'Limit Bandwidth'],
+        [await rpost('/bandwidth/reset', { usernames: ['bob'] }), 'Limit Bandwidth'],
+        [await rpost('/bandwidth/unsuspend-exceeders', { all: true }), 'Limit Bandwidth'],
+        [await rput('/quota/bob', { diskQuotaMb: 100 }), 'Disk Quotas'],
+        [await rpost('/demo-mode', { usernames: ['bob'], enabled: true }), 'Demo Mode'],
+        [await rpost('/force-password-change', { usernames: ['bob'], enabled: true }), 'passwd|Password'],
+        [await rput('/shell/bob', { shell: '/bin/bash' }), 'Shell'],
+      ]) {
+        expect(res.status, res.body.error?.message).toBe(403);
+        expect(res.body.error.message).toMatch(new RegExp(acl, 'i'));
+      }
+      expect((await app.http.get('/api/accounts/bob')).body.data).toMatchObject({ demo_mode: before.demo_mode, force_password_change: before.force_password_change, shell: '/usr/sbin/nologin', bandwidth_limit_mb: before.bandwidth_limit_mb, disk_quota_mb: before.disk_quota_mb });
+      expect(app.agent.callsTo('user.set_shell')).toEqual([]);
+      expect(app.agent.callsTo('user.set_quota')).toEqual([]);
+    });
+
+    it('applies them once delegated, keeps "disallow shell" and binds unlimited values to the reseller limits', async () => {
+      grant(['edit-account', 'limit-bandwidth', 'quota', 'demo-setup', 'passwd', 'add-pkg-shell', 'disallow-shell']);
+      expect((await rput('/bandwidth/bob', { limitMb: 5 })).status).toBe(200);
+      expect((await rput('/quota/bob', { diskQuotaMb: 100 })).status).toBe(200);
+      expect((await rpost('/demo-mode', { usernames: ['bob'], enabled: false })).status).toBe(200);
+      expect((await rput('/shell/bob', { shell: '/usr/sbin/nologin' })).status).toBe(200);
+      const shell = await rput('/shell/bob', { shell: '/bin/bash' });
+      expect(shell.status).toBe(403);
+      expect(shell.body.error.message).toMatch(/Disallow Shell/);
+      // A reseller with a bandwidth/disk limit cannot lift an account to unlimited without the matching ACL.
+      app.ctx.resellers.update('resell1', { maxDiskMb: 1000, maxBandwidthMb: 1000 }, root, null);
+      for (const res of [await rput('/bandwidth/bob', { limitMb: null }), await rput('/quota/bob', { diskQuotaMb: null }), await rput('/bandwidth/bob', { limitMb: 5000 })]) {
+        expect(res.status, res.body.error?.message).toBe(409);
+        expect(res.body.error.code).toBe('reseller_limit');
+      }
+      expect((await rput('/quota/bob', { diskQuotaMb: 500 })).status).toBe(200);
+      app.ctx.resellers.update('resell1', { maxDiskMb: null, maxBandwidthMb: null }, root, null);
+      expect((await rput('/bandwidth/bob', { limitMb: null })).status).toBe(200);
+    });
+  });
+
+  describe('suspension', () => {
+    it('locks the user, hands the web side to the Service Configuration hook and reports what was applied', async () => {
+      const calls = [];
+      app.ctx.web = { setSuspended: async (username, suspended) => { calls.push([username, suspended]); return { applied: true }; } };
+      try {
+        const s = await app.http.post('/api/accounts/carol/suspend').set('X-CSRF-Token', csrf).send({ reason: 'abuse' }).expect(200);
+        expect(s.body.data).toMatchObject({ suspended: true, web: { applied: true, reason: null } });
+        expect(app.agent.callsTo('user.lock').map((c) => c.args)).toEqual([{ username: 'carol' }]);
+        const u = await app.http.post('/api/accounts/carol/unsuspend').set('X-CSRF-Token', csrf).send().expect(200);
+        expect(u.body.data).toMatchObject({ suspended: false, web: { applied: true } });
+        expect(calls).toEqual([['carol', true], ['carol', false]]);
+        expect(JSON.parse(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'account.suspend' AND target = 'carol' ORDER BY id DESC LIMIT 1").get().args_redacted)).toEqual({ reason: 'abuse', web: { applied: true, reason: null } });
+      } finally { delete app.ctx.web; }
+      // Without the hook the account is still suspended; the response says the sites were not switched.
+      const plain = await app.http.post('/api/accounts/carol/suspend').set('X-CSRF-Token', csrf).send({}).expect(200);
+      expect(plain.body.data.web).toEqual({ applied: false, reason: 'web_category_missing' });
+      app.ctx.web = { ensureVhost: async () => ({ applied: false }) };
+      try {
+        const u = await app.http.post('/api/accounts/carol/unsuspend').set('X-CSRF-Token', csrf).send().expect(200);
+        expect(u.body.data.web).toEqual({ applied: false, reason: 'web_hook_missing' });
+      } finally { delete app.ctx.web; }
+    });
+  });
+
+  describe('quota filesystem at creation', () => {
+    it('sets the package quota on the filesystem that holds the home, not on /', async () => {
+      const homeRoot = app.ctx.settings.get('basic.home_root');
+      app.ctx.settings.set('basic.home_root', '/home2');
+      try {
+        await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'frank', domain: 'frank.com', provision: { dns: false, mail: false } }).expect(201);
+        expect(app.agent.callsTo('user.set_quota').map((c) => c.args)).toEqual([{ username: 'frank', softMb: 10240, hardMb: 10752, filesystem: '/home2' }]);
+      } finally {
+        app.ctx.settings.set('basic.home_root', homeRoot);
+        await app.http.delete('/api/accounts/frank').set('X-CSRF-Token', csrf).expect(200);
       }
     });
   });

@@ -7,9 +7,9 @@ export const SEVERITY_LABEL = { info: 'Info and above (everything)', warning: 'W
 const ADDRESS_FIELD = {
   email: { label: 'Email address', placeholder: 'ops@example.com', help: 'Delivered through Exim, or the SMTP relay configured below when Exim is not installed.' },
   sms: { label: 'Gateway address', placeholder: '5551234567@txt.example.net', help: 'Your carrier\'s email-to-SMS address for the phone. Messages are kept under 300 characters.' },
-  slack: { label: 'Incoming webhook URL', placeholder: 'https://hooks.slack.com/services/T000/B000/XXXX', help: 'Create one under Slack → Apps → Incoming Webhooks.' },
+  slack: { label: 'Incoming webhook URL', placeholder: 'https://hooks.slack.com/services/T000/B000/XXXX', help: 'Create one under Slack → Apps → Incoming Webhooks. The URL is a credential: it is stored encrypted and only shown masked.' },
   pushover: { label: 'User or group key', placeholder: '30-character key from pushover.net', help: 'The application token goes in the field below and is stored encrypted.' },
-  webhook: { label: 'URL', placeholder: 'https://example.com/whm/notify', help: 'Receives a JSON POST { event, severity, subject, body, data, hostname }. With a secret, X-WHM-Signature carries an HMAC-SHA256 of the body.' },
+  webhook: { label: 'URL', placeholder: 'https://example.com/whm/notify', help: 'Receives a JSON POST { event, severity, subject, body, data, hostname }. With a secret, X-WHM-Signature carries an HMAC-SHA256 of the body. A URL with a query string is stored encrypted and shown masked.' },
 };
 
 export function emptyContact() {
@@ -45,7 +45,7 @@ export function ContactForm({ initial, events, channels, severities, onSubmit, o
         <Field label="Name" help="How this contact appears in the delivery log."><TextInput value={draft.name} onChange={(v) => set('name', v)} placeholder="e.g. On-call pager" maxLength={80} /></Field>
         <Field label="Channel" required><Select value={draft.channel} onChange={(v) => set('channel', v)} options={channels.map((c) => ({ value: c, label: CHANNEL_LABEL[c] || c }))} /></Field>
       </div>
-      <Field label={field.label} help={field.help} required error={error?.fields?.address}><TextInput value={draft.address} onChange={(v) => set('address', v)} placeholder={field.placeholder} maxLength={500} /></Field>
+      <Field label={field.label} help={initial?.config?.url?.set && draft.address === initial.address ? 'The stored URL is shown masked; leave it as is to keep it, or paste a new URL to replace it.' : field.help} required error={error?.fields?.address}><TextInput value={draft.address} onChange={(v) => set('address', v)} placeholder={field.placeholder} maxLength={500} /></Field>
       {draft.channel === 'pushover' && (
         <Field label="Application token" help={initial?.config?.token?.set ? 'A token is stored. Leave blank to keep it.' : 'Register an application at pushover.net to get a token.'} required={!initial?.config?.token?.set} error={error?.fields?.config}>
           <TextInput value={secrets.token} onChange={(v) => setSecrets((s) => ({ ...s, token: v }))} type="password" autoComplete="off" placeholder={initial?.config?.token?.set ? '•••••••••• (unchanged)' : ''} />

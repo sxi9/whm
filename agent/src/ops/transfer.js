@@ -3,9 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { z } from 'zod';
+import readline from 'node:readline';
 import { exec, hasBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
-import { renderClientCnf, classifyMysqlError } from './db.js';
+import { renderClientCnf, classifyMysqlError, PRIVILEGES, q } from './db.js';
 
 // Transfers op family: everything the Transfer Tool, cpmove restores and the
 // addon-domain conversion need from the host. Remote servers are reached over
@@ -14,22 +15,33 @@ import { renderClientCnf, classifyMysqlError } from './db.js';
 // 0600 file (key) or the SSHPASS environment of the child (password, via sshpass).
 // The command run on the remote side is a shell string by nature of ssh, so
 // every token is single-quoted and the program comes from a fixed allowlist.
+// Every remote command is assembled by a purpose-specific op from constants and
+// schema-validated arguments; no op runs caller-supplied argv remotely.
 
 const KNOWN_HOSTS = '/var/lib/whm/transfers/known_hosts';
 const TMP_PREFIX = path.join(os.tmpdir(), 'whm-transfer-');
 const MARK = '__WHM_TRANSFER_MARK__';
 
-const REMOTE_PROGRAMS = new Set(['cat', 'ls', 'getent', 'id', 'hostname', 'uname', 'command', 'test', 'stat', 'du', 'df', 'mysqldump', 'mysql', 'rm', 'mkdir', 'readlink', 'true', 'echo']);
+const REMOTE_PROGRAMS = new Set(['cat', 'ls', 'getent', 'id', 'hostname', 'uname', 'command', 'test', 'stat', 'df', 'mysqldump', 'mysql', 'rm', 'echo']);
 const CLIENT_BINS = ['mysql', 'mariadb'];
+export const AUTH_PLUGINS = ['mysql_native_password', 'caching_sha2_password', 'sha256_password', 'ed25519'];
+// crypt(3) hashes as found in /etc/shadow ($6$, $y$, $2b$, …): no ':' or whitespace can appear.
+export const SHADOW_HASH = /^\$[A-Za-z0-9]{1,6}\$[A-Za-z0-9./$=+,-]{8,500}$/;
 
 const remoteUser = z.string().regex(/^[a-z_][a-z0-9_-]{0,31}$/, 'SSH user: lowercase letters, digits, "_" or "-"');
 const remoteHost = z.union([arg.hostname, arg.ipv6]);
 const privateKey = z.string().max(16 * 1024).regex(/^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----\r?\n[\s\S]+-----END [A-Z0-9 ]*PRIVATE KEY-----\s*$/, 'Must be a PEM/OpenSSH private key');
 const password = z.string().min(1).max(256).regex(/^[^\n\r\0]+$/, 'Password must be a single line');
 const remotePath = z.string().regex(/^\/(?!(?:.*\/)?\.\.(?:\/|$))[A-Za-z0-9._/@+-]{0,1023}$/, 'Remote path: absolute, letters, digits, ". _ / @ + -" and no ".."');
-const remoteArg = z.string().max(4096).regex(/^[^\0\r\n]*$/, 'Arguments must be single-line');
+const linuxUser = z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/, 'Username: lowercase letters, digits, "_" or "-"');
 const dbName = z.string().regex(/^[a-z0-9_]{1,64}$/);
 const dbPrefix = z.string().regex(/^[a-z][a-z0-9_]{0,31}$/);
+const mysqlUser = z.string().regex(/^[a-z0-9_]{1,80}$/, 'Database user: lowercase letters, digits or "_"');
+const mysqlHost = z.string().regex(/^[A-Za-z0-9%:][A-Za-z0-9.%:_-]{0,254}$/, 'Host: IP, hostname or wildcard');
+// Native "*<SHA1>" hashes, hex literals (0x…) and the printable sha256/ed25519
+// forms; nothing that could close a string literal.
+const authHash = z.string().regex(/^(?:\*[0-9A-F]{40}|0x[0-9A-Fa-f]{2,1024}|\$[A-Za-z0-9./$+=]{8,300}|[A-Za-z0-9+/=]{20,100})$/, 'Unsupported password hash format');
+const privilege = z.enum(PRIVILEGES);
 const archiveName = /^[A-Za-z0-9][A-Za-z0-9._-]{0,200}\.(tar\.gz|tgz|tar)$/;
 const memberPattern = z.string().regex(/^(?!-)(?!(?:.*\/)?\.\.(?:\/|$))[A-Za-z0-9._*?/-]{1,512}$/, 'Archive member: letters, digits, ". _ - * ? /", no leading "-" and no ".."');
 
@@ -166,6 +178,7 @@ export function summarizeArchive(entries) {
     top, username, databases, zones, userdata,
     hasHomedir: rels.some((r) => r === 'homedir' || r.startsWith('homedir/')),
     hasGrants: rels.includes('mysql.sql'),
+    hasShadow: rels.includes('shadow'),
     hasAddons: rels.includes('addons'), hasParked: rels.includes('pds'), hasSubdomains: rels.includes('sds2') || rels.includes('sds'),
     hasCpConfig: Boolean(cpUser),
     version: rels.includes('version'),
@@ -184,13 +197,36 @@ export function parseCpUserFile(text) {
   };
 }
 
+// A shadow entry's hash field: "!" prefixes mean the account is locked, a bare
+// "*" / "!" / "!!" means no password was ever set.
+export function parseShadowHash(username, field) {
+  const raw = String(field || '').trim();
+  const locked = /^!/.test(raw);
+  const clean = raw.replace(/^!+/, '');
+  const available = SHADOW_HASH.test(clean);
+  return { username, hash: available ? clean : null, locked, available, reason: available ? null : locked ? 'the source account is locked' : 'no password hash on the source' };
+}
+
+function localPasswd(username) {
+  try {
+    const line = fs.readFileSync('/etc/passwd', 'utf8').split('\n').find((l) => l.startsWith(`${username}:`));
+    if (!line) return null;
+    const [, , uid, gid, , home] = line.split(':');
+    return { username, uid: Number(uid), gid: Number(gid), home };
+  } catch { return null; }
+}
+
 // ---------------------------------------------------------------- remote ---
 
-defineOp('transfer.remote.exec', {
-  description: 'Run an allowlisted program on a remote server over ssh (BatchMode, key or sshpass) and return its output',
-  timeoutMs: 600_000,
-  schema: z.object({ connection, argv: z.array(remoteArg).min(1).max(64), timeoutMs: z.number().int().min(1000).max(7_200_000).default(600_000) }).strict(),
-  run: async ({ connection: conn, argv, timeoutMs }) => remoteExec(conn, remoteCommand(argv), { timeoutMs }),
+defineOp('transfer.remote.password_hash', {
+  description: 'Read the password hash of a Linux user on a remote server (getent shadow) so a transferred account keeps its password',
+  timeoutMs: 60_000,
+  schema: z.object({ connection, username: linuxUser }).strict(),
+  run: async ({ connection: conn, username }) => {
+    const r = await remoteExec(conn, remoteCommand(['getent', 'shadow', '--', username]), { timeoutMs: 60_000 });
+    if (r.code !== 0) return { username, hash: null, locked: false, available: false, reason: r.code === 2 ? 'no such user on the source' : 'the shadow database is not readable on the source (not root?)' };
+    return parseShadowHash(username, r.stdout.split('\n')[0]?.split(':')[1]);
+  },
 });
 
 defineOp('transfer.remote.probe', {
@@ -335,6 +371,20 @@ defineOp('transfer.remote.remove_file', {
   },
 });
 
+// Modes are preserved (-p) so 0600 credential files and 0700 directories stay
+// private and scripts keep their execute bit; ownership is reassigned afterwards.
+export function rsyncArgv({ transport, destination, src, dest, directory = true, excludes = [], deleteExtraneous = false, bwlimitKbps = 0, dryRun = false }) {
+  const argv = ['-rlptD', '-z', '--partial', '--stats', '--human-readable=0', '-e', transport];
+  if (deleteExtraneous) argv.push('--delete');
+  if (bwlimitKbps) argv.push(`--bwlimit=${bwlimitKbps}`);
+  if (dryRun) argv.push('--dry-run');
+  for (const ex of excludes) argv.push(`--exclude=${ex}`);
+  const from = directory ? `${destination}:${src.replace(/\/+$/, '')}/` : `${destination}:${src}`;
+  const to = directory ? `${dest.replace(/\/+$/, '')}/` : dest;
+  argv.push(from, to);
+  return argv;
+}
+
 defineOp('transfer.remote.rsync', {
   description: 'Copy a directory or file from a remote server with rsync over ssh into an allowed local path',
   timeoutMs: 86_400_000,
@@ -355,14 +405,7 @@ defineOp('transfer.remote.rsync', {
     if (directory) fs.mkdirSync(dest, { recursive: true });
     else fs.mkdirSync(path.dirname(dest), { recursive: true });
     return withAuth(conn, async ({ env, transport, destination }) => {
-      const argv = ['-rltD', '-z', '--partial', '--stats', '--human-readable=0', '-e', transport];
-      if (deleteExtraneous) argv.push('--delete');
-      if (bwlimitKbps) argv.push(`--bwlimit=${bwlimitKbps}`);
-      if (dryRun) argv.push('--dry-run');
-      for (const ex of excludes) argv.push(`--exclude=${ex}`);
-      const from = directory ? `${destination}:${src.replace(/\/+$/, '')}/` : `${destination}:${src}`;
-      const to = directory ? `${dest.replace(/\/+$/, '')}/` : dest;
-      argv.push(from, to);
+      const argv = rsyncArgv({ transport, destination, src, dest, directory, excludes, deleteExtraneous, bwlimitKbps, dryRun });
       const { code, stdout, stderr } = await exec('rsync', argv, { env, timeoutMs, allowFailure: true });
       const sshErr = classifySsh(code === 255 ? 255 : 0, stderr);
       if (sshErr) throw sshErr;
@@ -395,10 +438,12 @@ defineOp('transfer.cpmove.inspect', {
   run: async ({ path: file, maxEntries }, ctx) => {
     requireTar();
     const { resolved, size, mtime } = assertArchive(ctx, file);
-    // Only the metadata members are listed so a multi-gigabyte homedir does not
-    // flood the output; the homedir itself is detected by its directory entry.
-    const patterns = ['*/cp/*', '*/mysql/*', '*/mysql.sql', '*/dnszones/*', '*/userdata/*', '*/homedir', '*/addons', '*/pds', '*/sds', '*/sds2', '*/version', '*/meta/*', '*/homedir/public_html'];
-    const argv = ['-tf', resolved, '--wildcards', '--no-anchored', ...patterns];
+    // Only the metadata members are listed; --no-recursion keeps tar from
+    // expanding the matched homedir/ directory into every file below it, so the
+    // output stays small for multi-gigabyte accounts (homedir is detected by its
+    // directory entry).
+    const patterns = ['*/cp/*', '*/mysql/*', '*/mysql.sql', '*/shadow', '*/dnszones/*', '*/userdata/*', '*/homedir', '*/addons', '*/pds', '*/sds', '*/sds2', '*/version', '*/meta/*'];
+    const argv = ['-tf', resolved, '--wildcards', '--no-anchored', '--no-recursion', ...patterns];
     const { code, stdout, stderr } = await exec('tar', argv, { timeoutMs: 3_600_000, allowFailure: true, maxBuffer: 64 * 1024 * 1024 });
     const entries = stdout.split('\n').map((s) => s.replace(/\/$/, '')).filter(Boolean).slice(0, maxEntries);
     if (code !== 0 && !entries.length) {
@@ -466,37 +511,238 @@ function findClient() {
   return CLIENT_BINS.find(hasBinary) || null;
 }
 
+// Runs fn(defaultsArgv) with the credentials in a short-lived 0600 option file
+// (or /root/.my.cnf when none were given).
+async function withClientDefaults(creds, fn) {
+  let dir = null;
+  const defaults = [];
+  if (creds && Object.keys(creds).length) {
+    dir = fs.mkdtempSync(TMP_PREFIX);
+    fs.chmodSync(dir, 0o700);
+    const cnf = path.join(dir, 'client.cnf');
+    fs.writeFileSync(cnf, renderClientCnf(creds), { mode: 0o600 });
+    defaults.push(`--defaults-extra-file=${cnf}`);
+  } else if (fs.existsSync('/root/.my.cnf')) defaults.push('--defaults-extra-file=/root/.my.cnf');
+  try { return await fn(defaults); } finally { if (dir) fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+async function runSql(bin, sql, creds, { timeoutMs = 120_000 } = {}) {
+  return withClientDefaults(creds, async (defaults) => {
+    const { code, stdout, stderr } = await exec(bin, [...defaults, '--batch', '--skip-column-names', '--no-auto-rehash', '--connect-timeout=10'], { input: `${sql}\n`, timeoutMs, allowFailure: true });
+    if (code !== 0) {
+      const err = classifyMysqlError(stderr);
+      throw new OpError(err.code, `mysql: ${err.message}`, { errno: err.errno });
+    }
+    return stdout;
+  });
+}
+
+const belongsTo = (name, prefix) => name === prefix || name.startsWith(`${prefix}_`);
+const SYSTEM_SCHEMAS = new Set(['mysql', 'sys', 'information_schema', 'performance_schema']);
+
+// Statements a dump of one account's database never needs; they would run with
+// the import user's (root) privileges. Conditional comments (/*!50106 …*/) are
+// stripped before matching, so hiding a statement in one does not help.
+const DENIED_SQL = [
+  [/\b(?:CREATE|DROP|ALTER|RENAME)\s+(?:OR\s+REPLACE\s+)?(?:USER|ROLE)\b/i, 'user or role management'],
+  [/\bGRANT\s+[A-Z_ ,()*]+?\s+ON\s+/i, 'GRANT'],
+  [/\bGRANT\s+(?:PROXY|`|')/i, 'GRANT'],
+  [/\bREVOKE\s+[A-Z_ ,()*]+?\s+(?:ON|FROM)\s+/i, 'REVOKE'],
+  [/\bSET\s+(?:GLOBAL|PERSIST|PERSIST_ONLY)\b/i, 'SET GLOBAL'],
+  [/\bSET\s+PASSWORD\b/i, 'SET PASSWORD'],
+  [/\bDROP\s+(?:DATABASE|SCHEMA)\b/i, 'DROP DATABASE'],
+  [/\b(?:INSTALL|UNINSTALL)\s+(?:PLUGIN|COMPONENT|SONAME)\b/i, 'plugin installation'],
+  [/\bSONAME\s+['"]/i, 'loadable function (SONAME)'],
+  [/\bLOAD\s+DATA\s+(?:LOW_PRIORITY\s+|CONCURRENT\s+)?(?:LOCAL\s+)?INFILE\b/i, 'LOAD DATA INFILE'],
+  [/\bINTO\s+(?:OUTFILE|DUMPFILE)\s+['"]/i, 'SELECT INTO OUTFILE'],
+  [/\bLOAD_FILE\s*\(/i, 'LOAD_FILE()'],
+  [/\bFLUSH\s+(?:PRIVILEGES|HOSTS|USER_RESOURCES|LOGS|BINARY|ENGINE|ERROR|GENERAL|SLOW)\b/i, 'FLUSH'],
+  [/\bCHANGE\s+(?:MASTER|REPLICATION\s+SOURCE)\s+TO\b/i, 'replication'],
+  [/\bSHUTDOWN\s*;/i, 'SHUTDOWN'],
+  [/\bKILL\s+(?:QUERY\s+|CONNECTION\s+)?\d/i, 'KILL'],
+];
+const CREATE_OBJECT = /\bCREATE\b([^;]{0,400}?)\b(PROCEDURE|FUNCTION|TRIGGER|EVENT|VIEW)\b/gi;
+const CREATE_MODIFIERS = /^\s*(?:OR\s+REPLACE\s+)?(?:AGGREGATE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*(\S+)\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?$/i;
+const USE_DB = /(?:^|;)\s*USE\s+[`'"]?([A-Za-z0-9_$]+)/gim;
+const DDL_DB = /\b(?:CREATE|ALTER)\s+(?:OR\s+REPLACE\s+)?(?:DATABASE|SCHEMA)\s+(?:IF\s+NOT\s+EXISTS\s+)?[`'"]?([A-Za-z0-9_$]+)/gi;
+// sql_mode changes that would make the server tokenise strings differently
+// from the filter below are refused on the raw text, literals included.
+const SQL_MODE_TRAP = /\bSQL_MODE\b[^\n]*\b(?:NO_BACKSLASH_ESCAPES|ANSI_QUOTES|ANSI)\b/i;
+const SHORT_LITERAL = /^[A-Za-z0-9_.$%*@-]{0,80}$/;
+const definerUser = (token) => { const m = String(token).match(/^[`'"]?([^`'"@]+)[`'"]?@/); return m ? m[1] : token.replace(/[`'"]/g, ''); };
+
+// Reduces SQL text to its code: string literals become '' (identifier-like
+// ones such as account names keep their value), comments disappear and the
+// markers of executable /*!NNNNN … */ comments are removed. Quote state carries
+// over between calls so multi-line literals are handled; prose inside INSERT
+// data therefore never looks like a statement.
+export function createSqlCodeFilter() {
+  let state = 'code';
+  let literal = '';
+  let quote = '';
+  return function codeOf(line) {
+    let out = '';
+    let i = 0;
+    const n = line.length;
+    while (i < n) {
+      const c = line[i];
+      if (state === 'code') {
+        if (c === "'" || c === '"') { state = 'str'; quote = c; literal = ''; i++; continue; }
+        if (c === '`') { state = 'ident'; out += c; i++; continue; }
+        if (c === '#' || (c === '-' && line[i + 1] === '-' && (i + 2 >= n || /\s/.test(line[i + 2])))) { i = n; continue; }
+        if (c === '/' && line[i + 1] === '*') {
+          const conditional = line[i + 2] === '!' || (line[i + 2] === 'M' && line[i + 3] === '!');
+          if (!conditional) { state = 'block'; i += 2; continue; }
+          i += line[i + 2] === '!' ? 3 : 4;
+          while (i < n && /\d/.test(line[i])) i++;
+          out += ' ';
+          continue;
+        }
+        if (c === '*' && line[i + 1] === '/') { out += ' '; i += 2; continue; }
+        out += c; i++; continue;
+      }
+      if (state === 'str') {
+        if (c === '\\') { literal += line.slice(i, i + 2); i += 2; continue; }
+        if (c === quote) {
+          if (line[i + 1] === quote) { literal += c; i += 2; continue; }
+          out += SHORT_LITERAL.test(literal) ? `${quote}${literal}${quote}` : `${quote}${quote}`;
+          state = 'code'; i++; continue;
+        }
+        literal += c; i++; continue;
+      }
+      if (state === 'ident') {
+        out += c; i++;
+        if (c === '`') { if (line[i] === '`') { out += '`'; i++; } else state = 'code'; }
+        continue;
+      }
+      if (state === 'block') {
+        const j = line.indexOf('*/', i);
+        if (j < 0) i = n; else { state = 'code'; i = j + 2; }
+      }
+    }
+    if (state === 'str') literal += '\n';
+    return out;
+  };
+}
+
+// Returns the reason a piece of dump code must not be imported as root, or
+// null. `database` is the only schema the dump may name; `definerPrefix` is the
+// account whose users may own routines, views, triggers and events. `code`
+// comes from createSqlCodeFilter; `raw` is the unfiltered text.
+export function scanSqlCode(code, raw, { database, definerPrefix } = {}) {
+  if (SQL_MODE_TRAP.test(raw)) return 'sql_mode changes that alter string quoting are not allowed in an account dump';
+  for (const [re, what] of DENIED_SQL) if (re.test(code)) return `${what} statements are not allowed in an account dump`;
+  for (const m of code.matchAll(USE_DB)) if (!database || m[1] !== database) return `the dump switches to database "${m[1]}" (only ${database || 'the target database'} may be used)`;
+  for (const m of code.matchAll(DDL_DB)) if (!database || m[1] !== database) return `the dump creates or alters database "${m[1]}" (only ${database || 'the target database'} may be used)`;
+  for (const m of code.matchAll(CREATE_OBJECT)) {
+    const mods = m[1].match(CREATE_MODIFIERS);
+    if (!mods) continue;
+    const kind = m[2].toLowerCase();
+    if (!mods[1]) return `a ${kind} without an explicit DEFINER would run as the import user`;
+    const owner = definerUser(mods[1]);
+    if (/^current_user/i.test(owner)) return `a ${kind} with DEFINER = CURRENT_USER would run as the import user`;
+    if (definerPrefix && !belongsTo(owner, definerPrefix)) return `a ${kind} is owned by DEFINER '${owner}', which is not a user of account "${definerPrefix}"`;
+  }
+  return null;
+}
+
+export function scanSql(text, options = {}) {
+  const codeOf = createSqlCodeFilter();
+  const lines = String(text).split('\n');
+  return scanSqlCode(lines.map(codeOf).join('\n'), text, options);
+}
+
+// Streams the dump line by line; a rolling window of filtered code keeps
+// statements split across lines ("CREATE\nUSER", mysqldump's multi-line view
+// definitions) visible as one text.
+async function scanDumpFile(file, options) {
+  const stream = fs.createReadStream(file, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  const codeOf = createSqlCodeFilter();
+  let window = '';
+  let lineNo = 0;
+  try {
+    for await (const line of rl) {
+      lineNo++;
+      window = `${window.slice(-600)}\n${codeOf(line)}`;
+      const reason = scanSqlCode(window, line, options);
+      if (reason) return { ok: false, line: lineNo, reason };
+    }
+  } finally { rl.close(); stream.destroy(); }
+  return { ok: true, lines: lineNo };
+}
+
 defineOp('transfer.mysql.import', {
-  description: 'Load a SQL dump into a local database with the mysql client ("source <file>", credentials via a 0600 defaults file or /root/.my.cnf)',
+  description: 'Load a SQL dump into a local database with the mysql client after refusing user/grant/global statements ("source <file>", credentials via a 0600 defaults file or /root/.my.cnf)',
   timeoutMs: 7_200_000,
-  schema: z.object({ path: arg.absPath, database: dbName.optional(), credentials, timeoutMs: z.number().int().min(10_000).max(7_200_000).default(3_600_000) }).strict(),
-  run: async ({ path: file, database, credentials: creds, timeoutMs }, ctx) => {
+  schema: z.object({ path: arg.absPath, database: dbName, definerPrefix: dbPrefix.optional(), credentials, timeoutMs: z.number().int().min(10_000).max(7_200_000).default(3_600_000) }).strict(),
+  run: async ({ path: file, database, definerPrefix, credentials: creds, timeoutMs }, ctx) => {
+    const resolved = ctx.assertAllowedPath(file, 'read');
+    if (SYSTEM_SCHEMAS.has(database)) throw new OpError('refused', `"${database}" is a system database`);
+    if (!fs.existsSync(resolved)) throw new OpError('not_found', `${file} does not exist`);
+    const scan = await scanDumpFile(resolved, { database, definerPrefix });
+    if (!scan.ok) throw new OpError('refused', `${path.basename(resolved)} line ${scan.line}: ${scan.reason}; review the dump and import it by hand if it is legitimate`);
     const bin = findClient();
     if (!bin) throw new OpError('capability_missing', 'The MySQL/MariaDB client (mysql or mariadb) is not installed on this server');
-    const resolved = ctx.assertAllowedPath(file, 'read');
-    if (!fs.existsSync(resolved)) throw new OpError('not_found', `${file} does not exist`);
-    let dir = null;
-    const defaults = [];
-    if (creds && Object.keys(creds).length) {
-      dir = fs.mkdtempSync(TMP_PREFIX);
-      fs.chmodSync(dir, 0o700);
-      const cnf = path.join(dir, 'client.cnf');
-      fs.writeFileSync(cnf, renderClientCnf(creds), { mode: 0o600 });
-      defaults.push(`--defaults-extra-file=${cnf}`);
-    } else if (fs.existsSync('/root/.my.cnf')) defaults.push('--defaults-extra-file=/root/.my.cnf');
-    try {
-      const argv = [...defaults, '--batch'];
-      if (database) argv.push(`--database=${database}`);
-      argv.push('-e', `source ${resolved}`);
+    return withClientDefaults(creds, async (defaults) => {
+      const argv = [...defaults, '--batch', `--database=${database}`, '-e', `source ${resolved}`];
       const { code, stderr } = await exec(bin, argv, { timeoutMs, allowFailure: true });
       if (code !== 0) {
         const err = classifyMysqlError(stderr);
         throw new OpError(err.code === 'db_error' ? 'import_failed' : err.code, `mysql: ${err.message}`, { errno: err.errno });
       }
-      return { path: resolved, database: database || null, imported: true };
-    } finally {
-      if (dir) fs.rmSync(dir, { recursive: true, force: true });
+      return { path: resolved, database, imported: true, scannedLines: scan.lines };
+    });
+  },
+});
+
+defineOp('transfer.mysql.create_user', {
+  description: 'Recreate a database user of a transferred account from its password hash, with grants limited to databases of that account',
+  timeoutMs: 300_000,
+  schema: z.object({
+    user: mysqlUser,
+    host: mysqlHost,
+    ownerPrefix: dbPrefix,
+    auth: z.object({ plugin: z.enum(AUTH_PLUGINS), hash: authHash }).strict().nullable().default(null),
+    grants: z.array(z.object({ database: dbName, privileges: z.array(privilege).min(1).max(PRIVILEGES.length) }).strict()).max(50).default([]),
+    credentials,
+  }).strict(),
+  run: async ({ user, host, ownerPrefix, auth, grants, credentials: creds }) => {
+    if (!belongsTo(user, ownerPrefix)) throw new OpError('refused', `Database user "${user}" does not belong to account "${ownerPrefix}"`);
+    for (const g of grants) {
+      if (SYSTEM_SCHEMAS.has(g.database) || !belongsTo(g.database, ownerPrefix)) throw new OpError('refused', `Database "${g.database}" does not belong to account "${ownerPrefix}"`);
     }
+    const bin = findClient();
+    if (!bin) throw new OpError('capability_missing', 'The MySQL/MariaDB client (mysql or mariadb) is not installed on this server');
+    const version = (await runSql(bin, 'SELECT VERSION()', creds)).trim();
+    const mariadb = /mariadb/i.test(version);
+    const acct = q.account(user, host);
+    let create = `CREATE USER IF NOT EXISTS ${acct}`;
+    if (auth) {
+      const literal = auth.hash.startsWith('0x') ? auth.hash : q.str(auth.hash);
+      if (mariadb) create += auth.plugin === 'mysql_native_password' ? ` IDENTIFIED BY PASSWORD ${literal}` : ` IDENTIFIED VIA ${auth.plugin} USING ${literal}`;
+      else create += ` IDENTIFIED WITH ${auth.plugin} AS ${literal}`;
+    }
+    const statements = [create];
+    for (const g of grants) {
+      const list = g.privileges.includes('ALL PRIVILEGES') ? 'ALL PRIVILEGES' : [...new Set(g.privileges)].join(', ');
+      statements.push(`GRANT ${list} ON ${q.id(g.database)}.* TO ${acct}`);
+    }
+    await runSql(bin, `${statements.map((s) => `${s};`).join('\n')}\nFLUSH PRIVILEGES;`, creds, { timeoutMs: 300_000 });
+    return { user, host, created: true, plugin: auth?.plugin ?? null, grants: grants.map((g) => g.database), engine: mariadb ? 'mariadb' : 'mysql' };
+  },
+});
+
+defineOp('transfer.user.set_password_hash', {
+  description: 'Set a Linux user password from an existing crypt(3) hash (chpasswd -e) so a transferred or restored account keeps its password',
+  schema: z.object({ username: arg.username, hash: z.string().regex(SHADOW_HASH, 'Must be a crypt(3) hash such as $6$…') }).strict(),
+  run: async ({ username, hash }) => {
+    const info = localPasswd(username);
+    if (!info) throw new OpError('not_found', `Linux user "${username}" does not exist`);
+    if (username === 'root' || info.uid < 1000) throw new OpError('refused', `"${username}" is a system account and is not managed by the panel`);
+    // chpasswd -e reads "user:hash" from stdin, so the hash never appears in argv.
+    await exec('chpasswd', ['-e'], { input: `${username}:${hash}\n` });
+    return { username, applied: true };
   },
 });
 

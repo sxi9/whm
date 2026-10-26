@@ -14,6 +14,7 @@ const hostnameBody = z.object({
   ipv6: fields.ipv6.optional(),
   updateHosts: z.boolean().default(true),
   addDnsRecord: z.boolean().default(false),
+  reissueServiceCerts: z.boolean().default(true),
 }).strict();
 const previewBody = z.object({ hostname: hostnameInput, ip: fields.ipv4.optional(), ipv6: fields.ipv6.optional() }).strict();
 const nameservers = z.array(fields.ip).min(1, 'At least one nameserver is required').max(MAX_RESOLVERS, `At most ${MAX_RESOLVERS} nameservers (the resolver library ignores the rest)`);

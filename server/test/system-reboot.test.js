@@ -152,19 +152,73 @@ describe('System Reboot API', () => {
     expect(JSON.parse(auditRows('system.reboot').at(-1).args_redacted)).toMatchObject({ ignoreActiveWork: true, warnings: ['1 job(s) are running and will be interrupted'] });
   });
 
+  it('writes the history row and the audit entry before the reboot command runs', async () => {
+    const before = requests().length;
+    let seen = null;
+    app.agent.set('sys.reboot', ({ mode }) => {
+      seen = { rows: requests(), audit: auditRows('system.reboot') };
+      reboots.push(mode);
+      return { scheduled: true, mode };
+    });
+    try {
+      const res = await post('/api/system-reboot/forceful', { reason: 'pre-record' }).expect(200);
+      expect(seen.rows).toHaveLength(before + 1);
+      expect(seen.rows.at(-1)).toMatchObject({ mode: 'forceful', reason: 'pre-record', status: 'requested', error: null, boot_id: readBootId() });
+      expect(seen.rows.at(-1).triggered_at).toBeNull();
+      expect(seen.audit.at(-1)).toMatchObject({ principal: 'root', target: 'forceful', result: 'ok' });
+      expect(JSON.parse(seen.audit.at(-1).args_redacted)).toMatchObject({ reason: 'pre-record', requestId: seen.rows.at(-1).id });
+      expect(res.body.data).toMatchObject({ id: seen.rows.at(-1).id, status: 'triggered' });
+      expect(requests().at(-1)).toMatchObject({ id: seen.rows.at(-1).id, status: 'triggered' });
+      expect(requests().at(-1).triggered_at).not.toBeNull();
+    } finally {
+      app.agent.set('sys.reboot', ({ mode }) => { reboots.push(mode); return { scheduled: true, mode }; });
+    }
+  });
+
+  it('a request whose outcome was never recorded counts as completed once the boot id changes', async () => {
+    app.ctx.db.prepare("INSERT INTO reboot_requests (mode, principal, status, boot_id) VALUES ('graceful', 'root', 'requested', 'previous-boot')").run();
+    const { data } = (await get('/api/system-reboot/preflight').expect(200)).body;
+    expect(data.lastRequest).toMatchObject({ mode: 'graceful', status: 'requested', completed: Boolean(readBootId()) });
+    expect(app.ctx.systemReboot.rebootedSinceLastRequest()).toBe(Boolean(readBootId()));
+    expect(() => app.ctx.db.prepare("INSERT INTO reboot_requests (mode, status) VALUES ('graceful', 'bogus')").run()).toThrow(/CHECK/);
+  });
+
   it('records a failed request and surfaces the agent error when the reboot command fails', async () => {
     app.agent.fail('sys.reboot', 'command_failed', 'systemctl exited with 1');
+    const before = requests().length;
     try {
       const res = await post('/api/system-reboot/graceful', { reason: 'test' }).expect(500);
       expect(res.body.error.message).toMatch(/systemctl exited with 1/);
+      expect(requests()).toHaveLength(before + 1);
       const last = requests().at(-1);
-      expect(last).toMatchObject({ mode: 'graceful', status: 'failed', error: 'systemctl exited with 1', reason: 'test' });
+      expect(last).toMatchObject({ mode: 'graceful', status: 'failed', error: 'systemctl exited with 1', reason: 'test', triggered_at: null });
+      expect(auditRows('system.reboot').at(-2)).toMatchObject({ target: 'graceful', result: 'ok' });
       expect(auditRows('system.reboot').at(-1)).toMatchObject({ target: 'graceful', result: 'error:command_failed' });
       const pre = (await get('/api/system-reboot/preflight').expect(200)).body.data;
       expect(pre.lastRequest).toMatchObject({ status: 'failed', completed: false });
     } finally {
       app.agent.set('sys.reboot', ({ mode }) => { reboots.push(mode); return { scheduled: true, mode }; });
     }
+  });
+
+  it('keeps each stored pre-flight snapshot bounded: the previous request is embedded without its own snapshot', async () => {
+    app.ctx.db.prepare("INSERT INTO jobs (type, status, params_json) VALUES ('dns.sync', 'queued', '{}')").run();
+    const sizes = [];
+    for (let i = 0; i < 6; i += 1) {
+      const { data } = (await post('/api/system-reboot/graceful', { ignoreActiveWork: true, reason: `round ${i}` }).expect(200)).body;
+      expect(data.preflight.lastRequest === null || !('preflight' in data.preflight.lastRequest)).toBe(true);
+      sizes.push(requests().at(-1).preflight_json.length);
+    }
+    const stored = JSON.parse(requests().at(-1).preflight_json);
+    expect(stored.lastRequest).toMatchObject({ reason: 'round 4', status: 'triggered' });
+    expect(stored.lastRequest).not.toHaveProperty('preflight');
+    expect(stored.lastRequest).not.toHaveProperty('preflight_json');
+    expect(Math.max(...sizes) - Math.min(...sizes)).toBeLessThan(200);
+    const pre = (await get('/api/system-reboot/preflight').expect(200)).body.data;
+    expect(pre.lastRequest).toMatchObject({ reason: 'round 5' });
+    expect(pre.lastRequest).not.toHaveProperty('preflight');
+    const history = (await get('/api/system-reboot/history?limit=200').expect(200)).body.data;
+    for (const row of history) expect(row.preflight.lastRequest?.preflight).toBeUndefined();
   });
 
   it('GET /history lists requests newest first with the stored pre-flight', async () => {

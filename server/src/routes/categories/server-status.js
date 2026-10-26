@@ -28,6 +28,7 @@ export async function register(ctx) {
 
   // Apache Status
   r.get('/apache', requireRoot, wrap(() => svc().apache()));
+  r.get('/apache/workers', requireRoot, wrap(() => svc().apacheWorkers()));
   r.post('/apache/enable-status', requireRoot, wrap((req) => svc().enableModStatus(req)));
 
   // Daily Process Log

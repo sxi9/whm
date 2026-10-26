@@ -44,8 +44,9 @@ export async function register(ctx) {
   // View Bandwidth Usage -----------------------------------------------------------
   r.get('/bandwidth', requireReseller, validate({ query: pagination.extend({ period: period.optional(), scope }) }), wrap((req) => svc().bandwidth(req.query, req.user)));
   r.get('/bandwidth/settings', requireRoot, wrap(() => svc().bandwidthSettings()));
+  // Suspension on exceed is configured under Account Functions (PUT /account-functions/bandwidth-enforcement).
   r.put('/bandwidth/settings', requireRoot, validate({ body: z.object({
-    suspendOnExceed: z.boolean().optional(), suspendReason: z.string().trim().min(1).max(200).optional(), warnPercent: z.number().int().min(1).max(100).optional(),
+    warnPercent: z.number().int().min(1).max(100).optional(),
     maxLogBytes: z.number().int().min(65536).max(32 * 1024 * 1024).optional(), extraLogDirs: z.array(fields.absPath).max(10).optional(),
   }).strict() }), wrap((req) => svc().updateBandwidthSettings(req.body, req)));
   r.post('/bandwidth/collect', requireRoot, wrap((req) => ({ job: svc().enqueueBandwidthCollect(req.user) }), 202));

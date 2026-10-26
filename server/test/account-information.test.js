@@ -31,6 +31,10 @@ describe('Account Information API', () => {
   let resellerHttp;
   let resellerCsrf;
   const files = {};
+  const mtimes = {};
+  // Appended to that file right after it is listed, before it is read (the
+  // listing/read race on a busy site).
+  let growAfterList = null;
   let quotaInstalled = false;
   let quotaUsers = [];
 
@@ -38,8 +42,9 @@ describe('Account Information API', () => {
     const agent = createMockAgent({
       'sys.binaries': ({ names }) => Object.fromEntries(names.map((n) => [n, quotaInstalled && ['repquota', 'setquota'].includes(n)])),
       'fs.list': ({ path }) => {
-        const entries = Object.entries(files).filter(([p]) => p.startsWith(`${path}/`)).map(([p, content]) => ({ name: p.slice(path.length + 1), type: 'file', size: Buffer.byteLength(content), mtime: null, mode: '644' }));
+        const entries = Object.entries(files).filter(([p]) => p.startsWith(`${path}/`)).map(([p, content]) => ({ name: p.slice(path.length + 1), type: 'file', size: Buffer.byteLength(content), mtime: mtimes[p] ?? null, mode: '644' }));
         if (!entries.length) throw Object.assign(new Error(`ENOENT: ${path}`), { agentError: true, code: 'op_failed' });
+        if (growAfterList && growAfterList.path.startsWith(`${path}/`)) { files[growAfterList.path] += growAfterList.content; growAfterList = null; }
         return { path, entries };
       },
       'sys.read_file': ({ path, maxBytes, tail }) => {
@@ -47,6 +52,11 @@ describe('Account Information API', () => {
         const length = Math.min(buf.length, maxBytes);
         const position = tail ? buf.length - length : 0;
         return { path, size: buf.length, truncated: buf.length > length, content: buf.subarray(position, position + length).toString('utf8') };
+      },
+      'acct.read_range': ({ path, offset, length }) => {
+        const buf = Buffer.from(files[path] ?? '');
+        const want = Math.max(0, Math.min(length, buf.length - offset));
+        return { path, size: buf.length, offset, length: want, data: buf.subarray(offset, offset + want).toString('base64'), eof: offset + want >= buf.length, mtime: mtimes[path] ?? null };
       },
       'fs.du': ({ path }) => ({ path, bytes: path.endsWith('/alice') ? 1500 * 1048576 : 10 * 1048576 }),
       'user.quota_report': () => ({ available: quotaInstalled, users: quotaUsers }),
@@ -181,6 +191,8 @@ describe('Account Information API', () => {
     const aliceLog = '/var/log/whm/domlogs/alice/alice.com-access.log';
     const aliceSsl = '/var/log/whm/domlogs/alice/alice.com-ssl-access.log';
     const bobLog = '/var/log/whm/domlogs/bob/bob.com-access.log';
+    let bobBytes = 0;
+    let aliceJan2020 = 999;
 
     it('parses access logs into monthly totals and only re-reads appended bytes', async () => {
       files[aliceLog] = line(1, monthName, year, 40 * 1048576) + line(2, monthName, year, 20 * 1048576) + line(3, 'Jan', 2020, 999);
@@ -189,11 +201,12 @@ describe('Account Information API', () => {
       let res = await post('/bandwidth/collect').expect(202);
       let job = await waitForJob(app.ctx, res.body.data.job.id);
       expect(job.status).toBe('done');
-      expect(job.result).toMatchObject({ files: 3, requests: 5, exceeded: [], suspended: [] });
-      expect(app.agent.callsTo('sys.read_file')).toHaveLength(3);
+      expect(job.result).toMatchObject({ files: 3, requests: 5, exceeded: [], suspended: [], enforcement: false, recovered: 0, pending: 0 });
+      expect(app.agent.callsTo('acct.read_range')).toHaveLength(3);
+      expect(app.agent.callsTo('sys.read_file')).toHaveLength(0);
 
       const list = await get('/bandwidth').expect(200);
-      expect(list.body.meta).toMatchObject({ period: currentPeriod(), total: 2, suspendOnExceed: false });
+      expect(list.body.meta).toMatchObject({ period: currentPeriod(), total: 2, enforcement: { enabled: false } });
       expect(list.body.meta.periods).toContain('2020-01');
       expect(list.body.meta.totalBytes).toBe(65 * 1048576 + 1024);
       const alice = list.body.data.find((a) => a.username === 'alice');
@@ -208,21 +221,108 @@ describe('Account Information API', () => {
       res = await post('/bandwidth/collect').expect(202);
       job = await waitForJob(app.ctx, res.body.data.job.id);
       expect(job.result).toMatchObject({ files: 2, requests: 3, exceeded: [] });
-      const reads = app.agent.callsTo('sys.read_file');
+      const reads = app.agent.callsTo('acct.read_range');
       expect(reads.map((c) => c.args.path).sort()).toEqual([bobLog, aliceLog].sort());
-      expect(reads.find((c) => c.args.path === aliceLog).args.maxBytes).toBe(Buffer.byteLength(line(5, monthName, year, 20 * 1048576)));
+      const aliceRead = reads.find((c) => c.args.path === aliceLog).args;
+      expect(aliceRead.length).toBe(Buffer.byteLength(line(5, monthName, year, 20 * 1048576)));
+      expect(aliceRead.offset).toBe(Buffer.byteLength(files[aliceLog]) - aliceRead.length);
       const after = await get('/bandwidth').expect(200);
       expect(after.body.data.find((a) => a.username === 'alice')).toMatchObject({ usedMb: 85, warn: true, over: false });
       expect(after.body.data.find((a) => a.username === 'bob').bytes).toBe(1024 + 2048 + 4096);
       expect(app.ctx.db.prepare('SELECT bandwidth_used_mb FROM accounts WHERE username = ?').get('alice').bandwidth_used_mb).toBe(85);
+      bobBytes = 1024 + 2048 + 4096;
     });
 
-    it('starts over after log rotation', async () => {
+    it('loses nothing when the file grows between the listing and the read', async () => {
+      files[bobLog] += line(4, monthName, year, 300);
+      growAfterList = { path: bobLog, content: line(4, monthName, year, 500) + '203.0.113.7 - - [05/' };
+      const res = await post('/bandwidth/collect').expect(202);
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.result).toMatchObject({ files: 1, requests: 2, pending: 0 });
+      const reads = app.agent.callsTo('acct.read_range').filter((c) => c.args.path === bobLog);
+      expect(reads).toHaveLength(2);
+      expect(reads[0].args.length).toBe(Buffer.byteLength(line(4, monthName, year, 300)));
+      expect(reads[1].args.offset).toBe(reads[0].args.offset + reads[0].args.length);
+      bobBytes += 300 + 500;
+      expect((await get('/bandwidth').expect(200)).body.data.find((a) => a.username === 'bob').bytes).toBe(bobBytes);
+      const source = app.ctx.db.prepare('SELECT bytes_processed, size FROM account_bandwidth_sources WHERE path = ?').get(bobLog);
+      expect(source.size).toBe(Buffer.byteLength(files[bobLog]));
+      expect(source.bytes_processed).toBe(source.size - Buffer.byteLength('203.0.113.7 - - [05/'));
+    });
+
+    it('reads the remainder on the next run when a file outgrows the per-run limit', async () => {
+      await put('/bandwidth/settings', { maxLogBytes: 65536 }).expect(200);
+      const big = line(6, monthName, year, 10).repeat(Math.ceil(70000 / Buffer.byteLength(line(6, monthName, year, 10))));
+      files[bobLog] = files[bobLog].replace('203.0.113.7 - - [05/', '') + big;
+      const total = big.split('\n').length - 1;
+      let res = await post('/bandwidth/collect').expect(202);
+      let job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.result.pending).toBeGreaterThan(0);
+      expect(job.result.requests).toBeLessThan(total);
+      expect(job.logs.some((l) => /still unread/.test(l.line))).toBe(true);
+      res = await post('/bandwidth/collect').expect(202);
+      job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.result.pending).toBe(0);
+      bobBytes += total * 10;
+      expect((await get('/bandwidth').expect(200)).body.data.find((a) => a.username === 'bob').bytes).toBe(bobBytes);
+      await put('/bandwidth/settings', { maxLogBytes: 32 * 1024 * 1024 }).expect(200);
+    });
+
+    it('counts the tail of a rotated log from its .1 copy before starting the new file', async () => {
+      const unread = line(8, monthName, year, 50);
+      // Last run an hour ago, rotation half an hour ago.
+      app.ctx.db.prepare("UPDATE account_bandwidth_sources SET last_seen_at = datetime('now', '-1 hour') WHERE path = ?").run(bobLog);
+      files[`${bobLog}.1`] = files[bobLog] + unread;
+      files[`${bobLog}.2.gz`] = 'not readable';
+      mtimes[`${bobLog}.1`] = new Date(Date.now() - 30 * 60 * 1000).toISOString();
       files[bobLog] = line(9, monthName, year, 100);
       const res = await post('/bandwidth/collect').expect(202);
       const job = await waitForJob(app.ctx, res.body.data.job.id);
-      expect(job.logs.some((l) => /rotated/.test(l.line))).toBe(true);
-      expect((await get('/bandwidth').expect(200)).body.data.find((a) => a.username === 'bob').bytes).toBe(1024 + 2048 + 4096 + 100);
+      expect(job.result).toMatchObject({ recovered: 50, files: 1 });
+      expect(job.logs.some((l) => /rotated to bob\.com-access\.log\.1; counted its last/.test(l.line))).toBe(true);
+      const tail = app.agent.callsTo('sys.read_file');
+      expect(tail).toHaveLength(1);
+      expect(tail[0].args).toMatchObject({ path: `${bobLog}.1`, maxBytes: Buffer.byteLength(unread), tail: true });
+      const live = app.agent.callsTo('acct.read_range').filter((c) => c.args.path === bobLog);
+      expect(live[0].args.offset).toBe(0);
+      bobBytes += 50 + 100;
+      expect((await get('/bandwidth').expect(200)).body.data.find((a) => a.username === 'bob').bytes).toBe(bobBytes);
+      // The copy is not re-read on the next run.
+      app.agent.calls.length = 0;
+      const again = await waitForJob(app.ctx, (await post('/bandwidth/collect').expect(202)).body.data.job.id);
+      expect(again.result.recovered).toBe(0);
+      expect(app.agent.callsTo('sys.read_file')).toHaveLength(0);
+    });
+
+    it('detects a dateext rotation even when the new file already outgrew the old offset', async () => {
+      const oldContent = files[aliceLog];
+      const unread = line(10, 'Jan', 2020, 111);
+      app.ctx.db.prepare("UPDATE account_bandwidth_sources SET last_seen_at = datetime('now', '-1 hour') WHERE path = ?").run(aliceLog);
+      files[`${aliceLog}-20260101`] = oldContent + unread;
+      files[`${aliceLog}-20260101.gz`] = 'zipped';
+      mtimes[`${aliceLog}-20260101`] = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+      const fresh = line(11, 'Jan', 2020, 222).repeat(Math.ceil(Buffer.byteLength(oldContent) / Buffer.byteLength(line(11, 'Jan', 2020, 222))) + 1);
+      files[aliceLog] = fresh;
+      expect(Buffer.byteLength(fresh)).toBeGreaterThan(Buffer.byteLength(oldContent));
+      const res = await post('/bandwidth/collect').expect(202);
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.result.recovered).toBe(111);
+      expect(app.agent.callsTo('sys.read_file')[0].args).toMatchObject({ path: `${aliceLog}-20260101`, maxBytes: Buffer.byteLength(unread) });
+      aliceJan2020 += 111 + 222 * (fresh.split('\n').length - 1);
+      expect((await get('/bandwidth?period=2020-01').expect(200)).body.data.find((a) => a.username === 'alice').bytes).toBe(aliceJan2020);
+      // Current-month totals are untouched: the new file only holds 2020 lines.
+      expect((await get('/bandwidth').expect(200)).body.data.find((a) => a.username === 'alice')).toMatchObject({ usedMb: 85 });
+    });
+
+    it('starts over with a warning when a log shrank and no readable copy is left', async () => {
+      delete files[`${bobLog}.1`];
+      files[bobLog] = line(12, monthName, year, 7);
+      const res = await post('/bandwidth/collect').expect(202);
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.logs.some((l) => /no readable copy/.test(l.line) && l.level === 'warn')).toBe(true);
+      expect(job.result.recovered).toBe(0);
+      bobBytes += 7;
+      expect((await get('/bandwidth').expect(200)).body.data.find((a) => a.username === 'bob').bytes).toBe(bobBytes);
     });
 
     it('returns a per-account monthly history with the limit', async () => {
@@ -237,37 +337,55 @@ describe('Account Information API', () => {
       await rget('/bandwidth/alice').expect(200);
     });
 
-    it('suspends exceeders only when the setting is on and audits it as system', async () => {
-      await put('/bandwidth/settings', { suspendOnExceed: 'yes' }).expect(422);
-      await rput('/bandwidth/settings', { suspendOnExceed: true }).expect(403);
+    it('hands enforcement to Account Functions so its exceeder tools find what the collector suspended', async () => {
+      await put('/bandwidth/settings', { warnPercent: 'yes' }).expect(422);
+      await put('/bandwidth/settings', { suspendOnExceed: true }).expect(422);
+      await put('/bandwidth/settings', { suspendReason: 'nope' }).expect(422);
+      await rput('/bandwidth/settings', { warnPercent: 50 }).expect(403);
       let settings = await get('/bandwidth/settings').expect(200);
-      expect(settings.body.data.settings).toMatchObject({ suspendOnExceed: false, warnPercent: 80 });
+      expect(settings.body.data.settings).toMatchObject({ warnPercent: 80 });
+      expect(settings.body.data.settings).not.toHaveProperty('suspendOnExceed');
+      expect(settings.body.data.enforcement).toMatchObject({ enabled: false, managedBy: 'account-functions/limit-bandwidth-usage' });
       expect(settings.body.data.logsRoot).toBe('/var/log/whm/domlogs');
+      // A stale enforcement toggle from an older version of this category is ignored.
+      app.ctx.settings.set('account_info.bandwidth', { ...app.ctx.settings.get('account_info.bandwidth'), suspendOnExceed: true, suspendReason: 'legacy' });
 
       files[aliceLog] += line(6, monthName, year, 30 * 1048576);
       let res = await post('/bandwidth/collect').expect(202);
       let job = await waitForJob(app.ctx, res.body.data.job.id);
-      expect(job.result).toMatchObject({ exceeded: ['alice'], suspended: [] });
+      expect(job.result).toMatchObject({ exceeded: ['alice'], suspended: [], enforcement: false });
+      expect(job.logs.some((l) => /Limit Bandwidth Usage/.test(l.line))).toBe(true);
       expect(app.ctx.db.prepare('SELECT suspended FROM accounts WHERE username = ?').get('alice').suspended).toBe(0);
       expect((await get('/bandwidth?scope=over').expect(200)).body.data.map((a) => a.username)).toEqual(['alice']);
 
-      settings = await put('/bandwidth/settings', { suspendOnExceed: true, suspendReason: 'Over the monthly transfer limit' }).expect(200);
-      expect(settings.body.data.settings.suspendOnExceed).toBe(true);
+      const af = (path) => app.http.put(`/api/account-functions${path}`).set('X-CSRF-Token', csrf);
+      await af('/bandwidth-enforcement').send({ enabled: true, reason: 'Over the monthly transfer limit' }).expect(200);
+      settings = await get('/bandwidth/settings').expect(200);
+      expect(settings.body.data.enforcement).toMatchObject({ enabled: true, reason: 'bandwidth: Over the monthly transfer limit' });
+      expect((await get('/bandwidth').expect(200)).body.meta.enforcement.enabled).toBe(true);
       res = await post('/bandwidth/collect').expect(202);
       job = await waitForJob(app.ctx, res.body.data.job.id);
-      expect(job.result).toMatchObject({ exceeded: ['alice'], suspended: ['alice'] });
+      expect(job.result).toMatchObject({ exceeded: ['alice'], suspended: ['alice'], enforcement: true });
       const row = app.ctx.db.prepare('SELECT suspended, suspend_reason FROM accounts WHERE username = ?').get('alice');
-      expect(row).toEqual({ suspended: 1, suspend_reason: 'Over the monthly transfer limit' });
+      expect(row).toEqual({ suspended: 1, suspend_reason: 'bandwidth: Over the monthly transfer limit' });
       expect(app.agent.callsTo('user.lock').map((c) => c.args.username)).toEqual(['alice']);
-      const audit = app.ctx.db.prepare("SELECT principal, action, target FROM audit_log WHERE action = 'account.suspend' AND principal = 'system'").all();
-      expect(audit).toEqual([{ principal: 'system', action: 'account.suspend', target: 'alice' }]);
+      const audit = app.ctx.db.prepare("SELECT principal, action, target, args_redacted FROM audit_log WHERE action = 'account.suspend' AND principal = 'system'").all();
+      expect(audit).toHaveLength(1);
+      expect(audit[0]).toMatchObject({ principal: 'system', action: 'account.suspend', target: 'alice' });
+      expect(JSON.parse(audit[0].args_redacted)).toMatchObject({ by: 'accounts.bandwidth_enforce', trigger: 'account_info.bandwidth_collect' });
+
+      // Unsuspend Bandwidth Exceeders recognises the suspension.
+      const exceeders = await app.http.get('/api/account-functions/bandwidth/exceeders').expect(200);
+      expect(exceeders.body.data.map((a) => [a.username, a.suspended_for_bandwidth])).toEqual([['alice', true]]);
 
       // Already suspended accounts are left alone on the next run.
       res = await post('/bandwidth/collect').expect(202);
       job = await waitForJob(app.ctx, res.body.data.job.id);
       expect(job.result.suspended).toEqual([]);
-      await put('/bandwidth/settings', { suspendOnExceed: false }).expect(200);
-      await app.http.post('/api/accounts/alice/unsuspend').set('X-CSRF-Token', csrf).expect(200);
+      const lifted = await app.http.post('/api/account-functions/bandwidth/unsuspend-exceeders').set('X-CSRF-Token', csrf).send({ usernames: ['alice'] }).expect(200);
+      expect(lifted.body.data.unsuspended).toEqual(['alice']);
+      expect(app.ctx.db.prepare('SELECT suspended FROM accounts WHERE username = ?').get('alice').suspended).toBe(0);
+      await af('/bandwidth-enforcement').send({ enabled: false }).expect(200);
     });
 
     it('resets counters for the current month or everything', async () => {
@@ -276,7 +394,7 @@ describe('Account Information API', () => {
       const res = await rpost('/bandwidth/alice/reset').expect(200);
       expect(res.body.data).toMatchObject({ username: 'alice', all: false, period: currentPeriod() });
       expect((await get('/bandwidth').expect(200)).body.data.find((a) => a.username === 'alice').bytes).toBe(0);
-      expect((await get('/bandwidth?period=2020-01').expect(200)).body.data.find((a) => a.username === 'alice').bytes).toBe(999);
+      expect((await get('/bandwidth?period=2020-01').expect(200)).body.data.find((a) => a.username === 'alice').bytes).toBe(aliceJan2020);
       await post('/bandwidth/alice/reset', { all: true }).expect(200);
       expect((await get('/bandwidth?period=2020-01').expect(200)).body.data.find((a) => a.username === 'alice').bytes).toBe(0);
       await rpost('/bandwidth/collect').expect(403);

@@ -1,13 +1,17 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { renameGrantStatements, parseDomainLists, parseUserdata } from '../src/services/transfers.js';
+import { parseGrantStatements, renameForAccount, targetDatabaseName, parseDomainLists, parseUserdata } from '../src/services/transfers.js';
 
 // A host with the user tooling, ssh, rsync and tar but no Apache/BIND/MySQL:
 // accounts and files move for real (mocked ops), daemon-bound steps end
 // "pending". BINS is mutable so capability-missing paths can be exercised by
 // flipping a binary and refreshing detection.
-const BINS = { useradd: true, usermod: true, userdel: true, chpasswd: true, systemctl: true, ssh: true, scp: true, rsync: true, tar: true, sshpass: false };
+const BINS = { useradd: true, usermod: true, userdel: true, chpasswd: true, systemctl: true, ssh: true, scp: true, rsync: true, tar: true, sshpass: false, mysql: false, mysqld: false };
+const NATIVE_HASH = '*2470C0C06DEE42FD1618BB99005ADCA2EC9D1E19';
+const SHADOW = '$6$saltsalt$k2aJ8rXb0Jm9d1fQ3hT6vLw4nP5sR7uY8zA1bC2dE3fG4hI5jK6lM7nO8pQ9rS0tU1vW2xY3zA4bC5dE6fG7hI8jK9l';
+const DB_USERS = new Set();
+const capabilityMissing = (what) => Object.assign(new Error(`${what} is not installed on this server`), { agentError: true, code: 'capability_missing', details: {} });
 const KEY = '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n-----END OPENSSH PRIVATE KEY-----\n';
 const ZONE = (domain, ip) => `$TTL 14400\n${domain}. IN SOA ns1.example.com. hostmaster.${domain}. 2024010101 3600 1800 1209600 86400\n${domain}. 86400 IN NS ns1.example.com.\n${domain}. 14400 IN A ${ip}\nwww 14400 IN A ${ip}\n`;
 const REMOTE_IP = '198.51.100.7';
@@ -18,7 +22,7 @@ const HANDLERS = {
     'fs.write_file': ({ path, content }) => ({ path, bytes: Buffer.byteLength(content) }),
     'fs.chown': ({ path, owner }) => ({ path, owner }),
     'fs.remove': ({ path }) => ({ path }),
-    'fs.stat': ({ path }) => ({ path, exists: true, isDirectory: true }),
+    'fs.stat': ({ path }) => (path.endsWith('.tar.gz') ? { path, exists: true, isDirectory: false, size: 2048, mtime: '2026-10-26T00:00:00.000Z' } : { path, exists: true, isDirectory: true }),
     'fs.copy_tree': ({ from, to }) => ({ from, to }),
     'transfer.remote.probe': ({ connection }) => ({ ok: true, hostname: connection.host, kernel: '6.1.0', uid: 0, isRoot: true, addresses: [REMOTE_IP], tools: { rsync: true, mysqldump: true, mysql: true }, cpanel: true, os: { id: 'almalinux', name: 'AlmaLinux 9', version: '9' }, homeDisk: null }),
     'transfer.remote.list_accounts': () => ({ cpanel: true, accounts: [
@@ -30,7 +34,11 @@ const HANDLERS = {
     'transfer.remote.databases': ({ prefix }) => ({ prefix, databases: prefix === 'bob' ? ['bob_shop'] : [] }),
     'transfer.remote.dump_database': ({ database }) => ({ database, remotePath: `/tmp/whm-transfer-${database}-abcd.sql`, sizeBytes: 1234 }),
     'transfer.remote.remove_file': ({ path }) => ({ path, removed: true }),
-    'transfer.remote.db_grants': ({ prefix }) => ({ prefix, users: [{ user: `${prefix}_app`, host: 'localhost', statements: [`CREATE USER '${prefix}_app'@'localhost' IDENTIFIED WITH mysql_native_password AS '*ABC'`, `GRANT ALL PRIVILEGES ON \`${prefix}\\_shop\`.* TO '${prefix}_app'@'localhost'`] }] }),
+    'transfer.remote.db_grants': ({ prefix }) => ({ prefix, users: [
+      { user: `${prefix}_app`, host: 'localhost', statements: [`CREATE USER '${prefix}_app'@'localhost' IDENTIFIED WITH 'mysql_native_password' AS '${NATIVE_HASH}' REQUIRE NONE PASSWORD EXPIRE DEFAULT ACCOUNT UNLOCK`, `GRANT USAGE ON *.* TO '${prefix}_app'@'localhost'`, `GRANT ALL PRIVILEGES ON \`${prefix}\\_shop\`.* TO '${prefix}_app'@'localhost'`, `GRANT SUPER ON *.* TO '${prefix}_app'@'localhost'`] },
+    ] }),
+    'transfer.remote.password_hash': ({ username }) => (username === 'bob' ? { username, hash: SHADOW, locked: false, available: true, reason: null } : { username, hash: null, locked: false, available: false, reason: 'no password hash on the source' }),
+    'transfer.user.set_password_hash': ({ username }) => ({ username, applied: true }),
     'transfer.remote.read_file': ({ path }) => {
       const zone = path.match(/^\/var\/named\/([a-z0-9.-]+)\.db$/);
       if (zone) return { path, exists: true, content: ZONE(zone[1], REMOTE_IP) };
@@ -38,16 +46,32 @@ const HANDLERS = {
       if (ud) return { path, exists: true, content: `documentroot: /home/bob/public_html/bobshop\nservername: ${ud[1]}\n` };
       return { path, exists: false, content: null };
     },
-    'transfer.mysql.import': ({ path, database }) => ({ path, database, imported: true }),
+    'transfer.mysql.import': ({ path, database }) => { if (!BINS.mysql) throw capabilityMissing('The MySQL client'); return { path, database, imported: true }; },
+    'transfer.mysql.create_user': ({ user, host, grants }) => { if (!BINS.mysql) throw capabilityMissing('The MySQL client'); return { user, host, created: true, grants: grants.map((g) => g.database) }; },
+    'db.database.create': ({ name }) => ({ name, created: true }),
+    'db.users.list': () => [{ user: 'root', host: 'localhost', plugin: 'mysql_native_password', system: true }, ...[...DB_USERS].map((k) => ({ user: k.split('@')[0], host: k.split('@')[1], plugin: 'mysql_native_password', system: false }))],
+    'db.user.create': ({ user, hosts }) => { for (const h of hosts) DB_USERS.add(`${user}@${h}`); return { user, hosts }; },
+    'db.grants.list': ({ user, host }) => ({ user, host, raw: [], grants: [] }),
+    'db.grant': ({ user, database, privileges, hosts }) => ({ user, database, privileges, hosts }),
     'transfer.archive.list': ({ path }) => ({ path, exists: path === '/var/lib/whm/transfers/uploads', archives: path === '/var/lib/whm/transfers/uploads' ? [{ name: 'cpmove-dave.tar.gz', path: '/var/lib/whm/transfers/uploads/cpmove-dave.tar.gz', sizeBytes: 2048, mtime: '2026-10-26T00:00:00.000Z' }] : [] }),
-    'transfer.cpmove.inspect': ({ path }) => ({ path, sizeBytes: 2048, mtime: '2026-10-26T00:00:00.000Z', top: 'cpmove-dave', username: 'dave', databases: ['dave_blog'], zones: ['dave.net', 'davestore.com'], userdata: ['davestore.com'], hasHomedir: true, hasGrants: true, hasAddons: true, hasParked: true, hasSubdomains: true, hasCpConfig: true, version: true, config: { domain: 'dave.net', plan: 'gold', contactEmail: 'dave@dave.net', ip: REMOTE_IP, raw: { USER: 'dave' } }, entries: 10, sample: [] }),
+    'transfer.cpmove.inspect': ({ path }) => ({ path, sizeBytes: 2048, mtime: '2026-10-26T00:00:00.000Z', top: 'cpmove-dave', username: 'dave', databases: path.includes('evil') ? ['dave_blog', 'mysql', 'sys'] : ['dave_blog'], zones: ['dave.net', 'davestore.com'], userdata: ['davestore.com'], hasHomedir: true, hasGrants: true, hasShadow: true, hasAddons: true, hasParked: true, hasSubdomains: true, hasCpConfig: true, version: true, config: { domain: 'dave.net', plan: 'gold', contactEmail: 'dave@dave.net', ip: REMOTE_IP, raw: { USER: 'dave' } }, entries: 10, sample: [] }),
     'transfer.cpmove.extract': ({ destination, members }) => ({ destination, extracted: !members.some((m) => m.includes('missing')), members }),
     'transfer.cpmove.read_member': ({ member }) => {
       const map = {
         'cpmove-dave/addons': 'davestore.com=davestore.dave.net\n', 'cpmove-dave/pds': 'davealias.org\n', 'cpmove-dave/sds2': 'davestore_dave.net=/home/dave/public_html/davestore\n',
         'cpmove-dave/userdata/davestore.com': 'documentroot: /home/dave/public_html/davestore\nservername: davestore.com\n',
         'cpmove-dave/dnszones/dave.net.db': ZONE('dave.net', REMOTE_IP), 'cpmove-dave/dnszones/davestore.com.db': ZONE('davestore.com', REMOTE_IP),
-        'cpmove-dave/mysql.sql': "CREATE USER 'dave_app'@'localhost' IDENTIFIED BY PASSWORD '*X';\nGRANT ALL PRIVILEGES ON `dave\\_blog`.* TO 'dave_app'@'localhost';\n",
+        'cpmove-dave/shadow': `${SHADOW}\n`,
+        'cpmove-dave/mysql.sql': [
+          `GRANT USAGE ON *.* TO 'dave_app'@'localhost' IDENTIFIED BY PASSWORD '${NATIVE_HASH}';`,
+          "GRANT ALL PRIVILEGES ON `dave\\_blog`.* TO 'dave_app'@'localhost';",
+          "CREATE USER 'dave_ro'@'localhost' IDENTIFIED VIA unix_socket;",
+          "GRANT SELECT, SHOW VIEW ON `dave\\_blog`.* TO 'dave_ro'@'localhost';",
+          "GRANT ALL PRIVILEGES ON *.* TO 'dave_evil'@'%' WITH GRANT OPTION;",
+          "GRANT ALL PRIVILEGES ON `mysql`.* TO 'dave_app'@'localhost';",
+          "CREATE USER 'root'@'%' IDENTIFIED BY 'owned';",
+          "GRANT FILE ON *.* TO 'dave_app'@'localhost';",
+        ].join('\n') + '\n',
       };
       return map[member] ? { member, exists: true, content: map[member] } : { member, exists: false, content: null };
     },
@@ -56,11 +80,43 @@ const HANDLERS = {
 const hostAgent = () => createMockAgent(HANDLERS);
 
 describe('helpers', () => {
-  it('renames grant statements for the new account prefix', () => {
-    const out = renameGrantStatements(["CREATE USER 'bob_app'@'localhost' IDENTIFIED BY 'x'", "GRANT ALL ON `bob\\_shop`.* TO 'bob_app'@'localhost'", "GRANT SELECT ON `bob_x`.* TO 'bob'@'%'"], 'bob', 'robert');
-    expect(out).toEqual(["CREATE USER IF NOT EXISTS 'robert_app'@'localhost' IDENTIFIED BY 'x'", "GRANT ALL ON `robert\\_shop`.* TO 'robert_app'@'localhost'", "GRANT SELECT ON `robert_x`.* TO 'robert'@'%'"]);
-    expect(renameGrantStatements(["CREATE USER 'bob_app'@'localhost'"], 'bob', 'bob')).toEqual(["CREATE USER IF NOT EXISTS 'bob_app'@'localhost'"]);
-    expect(renameGrantStatements(["GRANT ALL ON `bobby_x`.* TO 'bobby'@'%'"], 'bob', 'rob')).toEqual(["GRANT ALL ON `bobby_x`.* TO 'bobby'@'%'"]);
+  it('parses grant statements into account-scoped users and refuses the rest', () => {
+    const { users, refused } = parseGrantStatements([
+      `CREATE USER 'bob_app'@'localhost' IDENTIFIED WITH 'mysql_native_password' AS '${NATIVE_HASH}' REQUIRE NONE`,
+      "GRANT USAGE ON *.* TO 'bob_app'@'localhost'",
+      "GRANT ALL ON `bob\\_shop`.* TO 'bob_app'@'localhost';",
+      "GRANT SELECT, INSERT ON bob_x.* TO `bob`@`%`",
+      "GRANT ALL PRIVILEGES ON *.* TO 'bob_app'@'localhost' WITH GRANT OPTION",
+      "GRANT SUPER, FILE ON *.* TO 'bob_app'@'localhost'",
+      "GRANT ALL PRIVILEGES ON `mysql`.* TO 'bob_app'@'localhost'",
+      "GRANT SELECT ON `bob\\_shop`.`orders` TO 'bob_app'@'localhost'",
+      "GRANT ALL ON `bobby_x`.* TO 'bobby'@'%'",
+      "CREATE USER 'root'@'%' IDENTIFIED BY 'owned'",
+      "GRANT PROCESS ON `bob\\_shop`.* TO 'bob_app'@'localhost'",
+      "GRANT ALL ON `bob\\_shop`.* TO 'bob_app'@'localhost' WITH GRANT OPTION",
+      "GRANT `admin_role`@`%` TO 'bob_app'@'localhost'",
+      "DROP USER 'bob_app'@'localhost'",
+    ], 'bob');
+    expect(users).toEqual([
+      { user: 'bob_app', host: 'localhost', auth: { plugin: 'mysql_native_password', hash: NATIVE_HASH }, grants: [{ database: 'bob_shop', privileges: ['ALL PRIVILEGES'] }] },
+      { user: 'bob', host: '%', auth: null, grants: [{ database: 'bob_x', privileges: ['SELECT', 'INSERT'] }] },
+    ]);
+    expect(refused.map((r) => r.reason)).toEqual([
+      expect.stringMatching(/GRANT OPTION/), expect.stringMatching(/global privileges \(SUPER, FILE ON \*\.\*\)/), expect.stringMatching(/"mysql" does not belong/), expect.stringMatching(/table-level/),
+      expect.stringMatching(/'bobby' does not belong/), expect.stringMatching(/'root' does not belong/), expect.stringMatching(/PROCESS is not a database-level/), expect.stringMatching(/GRANT OPTION/),
+      expect.stringMatching(/only CREATE USER and GRANT/), expect.stringMatching(/only CREATE USER and GRANT/),
+    ]);
+    expect(parseGrantStatements(["GRANT USAGE ON *.* TO 'bob_app'@'localhost' IDENTIFIED BY PASSWORD '*ABC'"], 'bob').users[0].auth).toEqual({ plugin: 'mysql_native_password', hash: '*ABC' });
+    expect(parseGrantStatements(["CREATE USER `bob_ro`@`localhost` IDENTIFIED VIA unix_socket"], 'bob').users[0].auth).toEqual({ plugin: 'unix_socket', hash: null });
+  });
+
+  it('renames users and databases for the local account', () => {
+    expect(renameForAccount('bob', 'bob', 'robert')).toBe('robert');
+    expect(renameForAccount('bob_app', 'bob', 'robert')).toBe('robert_app');
+    expect(targetDatabaseName('bob_shop', 'bob', 'robert')).toBe('robert_shop');
+    expect(targetDatabaseName('bob_shop', 'bob', 'bob')).toBe('bob_shop');
+    expect(targetDatabaseName('mysql', 'bob', 'bob')).toBe('bob_mysql');
+    expect(targetDatabaseName('sys', 'dave', 'dave2')).toBe('dave2_sys');
   });
 
   it('parses cPanel domain lists and userdata', () => {
@@ -176,6 +232,22 @@ describe('Transfers API', () => {
       expect(audit).toHaveLength(1);
     });
 
+    it('re-probes a stored connection (root only) and refreshes the stored probe', async () => {
+      expect((await rpost(`/sessions/${sessionId}/probe`)).status).toBe(403);
+      app.ctx.db.prepare("UPDATE transfer_sessions SET probe_json = '{\"stale\":true}', last_used_at = datetime('now', '-3 hours') WHERE id = ?").run(sessionId);
+      const res = await post(`/sessions/${sessionId}/probe`).expect(200);
+      expect(res.body.data.probe).toMatchObject({ hostname: 'src.example.com', cpanel: true, tools: { rsync: true } });
+      const row = app.ctx.db.prepare('SELECT probe_json, last_used_at FROM transfer_sessions WHERE id = ?').get(sessionId);
+      expect(JSON.parse(row.probe_json)).toMatchObject({ hostname: 'src.example.com', isRoot: true });
+      expect(JSON.parse(row.probe_json).stale).toBeUndefined();
+      expect(Date.now() - new Date(`${row.last_used_at.replace(' ', 'T')}Z`).getTime()).toBeLessThan(60_000);
+      expect(app.agent.callsTo('transfer.remote.probe')[0].args.connection.privateKey).toBe(KEY);
+      expect((await post('/sessions/999/probe')).status).toBe(404);
+      app.agent.fail('transfer.remote.probe', 'ssh_unreachable', 'Could not connect to the remote server: Connection refused');
+      expect((await post(`/sessions/${sessionId}/probe`)).status).toBe(422);
+      app.agent.set('transfer.remote.probe', HANDLERS['transfer.remote.probe']);
+    });
+
     it('previews the plan with conflicts and blocks a bad plan', async () => {
       expect((await post('/transfer/preview', { sessionId, accounts: [] })).status).toBe(422);
       expect((await post('/transfer/preview', { sessionId, accounts: [{ source: '-r' }] })).status).toBe(422);
@@ -232,8 +304,15 @@ describe('Transfers API', () => {
       expect(item.steps.home).toMatchObject({ status: 'applied' });
       expect(item.steps.home.detail).toMatch(/12 file\(s\)/);
       expect(item.steps.databases[0]).toMatchObject({ name: 'robert_shop', source: 'bob_shop' });
-      // No database profile on this host: the dump is fetched, the import waits.
+      // No MySQL on this host: the dump is fetched, the import and the users wait.
       expect(item.steps.databases[0].status).toBe('pending');
+      expect(item.steps.grants.status).toBe('pending');
+      expect(app.agent.callsTo('transfer.mysql.import')).toHaveLength(0);
+      // The password hash read from the source's shadow is applied to the new user.
+      expect(app.agent.callsTo('transfer.remote.password_hash')[0].args).toMatchObject({ username: 'bob' });
+      expect(app.agent.callsTo('transfer.user.set_password_hash')[0].args).toEqual({ username: 'robert', hash: SHADOW });
+      expect(item.steps.password).toMatchObject({ status: 'applied', detail: expect.stringMatching(/hash copied/) });
+      expect(JSON.stringify(run)).not.toContain(SHADOW);
       expect(item.steps.domains.added.map((d) => d.domain).sort()).toEqual(['bobshop.net', 'shop.bob.com']);
       const zones = Object.fromEntries(item.steps.dns.map((z) => [z.domain, z]));
       expect(Object.keys(zones).sort()).toEqual(['bob.com', 'bobshop.net']);
@@ -247,6 +326,53 @@ describe('Transfers API', () => {
       const audit = app.ctx.db.prepare("SELECT action FROM audit_log WHERE action IN ('transfer.start', 'transfer.result')").all().map((r) => r.action);
       expect(audit).toContain('transfer.start');
       expect(audit).toContain('transfer.result');
+    });
+
+    it('sets the password from the form, or reports that none could be set', async () => {
+      expect((await post('/transfer', { sessionId, accounts: [{ source: 'carol', password: 'short' }] })).status).toBe(422);
+      const res = await post('/transfer', { sessionId, accounts: [{ source: 'carol', password: 'Carol-Passw0rd!1' }], options: { skipHome: true, skipDatabases: true, skipDns: true } }).expect(202);
+      expect(res.body.data.run.params.accounts[0].password).toBe('[set]');
+      await finished(res.body.data.job.id);
+      expect(app.agent.callsTo('user.set_password')[0].args).toEqual({ username: 'carol', password: 'Carol-Passw0rd!1' });
+      expect(app.agent.callsTo('transfer.remote.password_hash')).toHaveLength(0);
+      const run = (await get(`/runs/${res.body.data.run.id}`).expect(200)).body.data;
+      expect(run.items[0].steps.password).toMatchObject({ status: 'applied', detail: expect.stringMatching(/from the form/) });
+      expect(run.params.accounts[0].password).toBe('[set]');
+      expect(app.ctx.db.prepare('SELECT params_json FROM transfer_runs WHERE id = ?').get(run.id).params_json).not.toContain('Carol-Passw0rd');
+      expect(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'transfer.start'").all().map((r) => r.args_redacted).join('')).not.toContain('Carol-Passw0rd');
+
+      // "nodomain" has no hash on the source and no form password: pending, with the reason.
+      const none = await post('/transfer', { sessionId, accounts: [{ source: 'nodomain', domain: 'nodomain.example' }], options: { skipHome: true, skipDatabases: true, skipDns: true } }).expect(202);
+      await finished(none.body.data.job.id);
+      const item = (await get(`/runs/${none.body.data.run.id}`).expect(200)).body.data.items[0];
+      expect(item.status).toBe('pending');
+      expect(item.steps.password).toMatchObject({ status: 'pending', detail: expect.stringMatching(/no password set/) });
+      expect(app.agent.callsTo('transfer.user.set_password_hash')).toHaveLength(0);
+    });
+
+    it('imports databases into the account-prefixed name and rebuilds users from parsed grants when MySQL is installed', async () => {
+      await refreshCaps({ mysql: true, mysqld: true });
+      try {
+        const res = await post('/transfer', { sessionId, accounts: [{ source: 'bob', username: 'bobdb', domain: 'bobdb.example' }], options: { skipHome: true, skipDns: true } }).expect(202);
+        await finished(res.body.data.job.id);
+        const item = (await get(`/runs/${res.body.data.run.id}`).expect(200)).body.data.items[0];
+        expect(item.steps.databases[0]).toMatchObject({ name: 'bobdb_shop', source: 'bob_shop', status: 'applied' });
+        expect(app.agent.callsTo('db.database.create')[0].args.name).toBe('bobdb_shop');
+        const imp = app.agent.callsTo('transfer.mysql.import')[0].args;
+        expect(imp).toMatchObject({ database: 'bobdb_shop', definerPrefix: 'bob', path: expect.stringMatching(/run-\d+\/bobdb_shop\.sql$/) });
+        // Grants are never sourced as SQL: the user is recreated from its parsed hash and account-scoped grants.
+        const created = app.agent.callsTo('transfer.mysql.create_user');
+        expect(created).toHaveLength(1);
+        expect(created[0].args).toMatchObject({ user: 'bobdb_app', host: 'localhost', ownerPrefix: 'bobdb', auth: { plugin: 'mysql_native_password', hash: NATIVE_HASH }, grants: [{ database: 'bobdb_shop', privileges: ['ALL PRIVILEGES'] }] });
+        expect(app.agent.callsTo('fs.write_file').some((c) => /grants\.sql$/.test(c.args.path))).toBe(false);
+        expect(item.steps.grants.status).toBe('pending');
+        expect(item.steps.grants.detail).toMatch(/1 user\(s\) recreated with their password \(bobdb_app@localhost\)/);
+        expect(item.steps.grants.detail).toMatch(/refused: global privileges \(SUPER ON \*\.\*\)/);
+        expect(app.ctx.db.prepare('SELECT a.username FROM db_users u JOIN accounts a ON a.id = u.account_id WHERE u.name = ?').get('bobdb_app')?.username).toBe('bobdb');
+        expect(app.ctx.db.prepare('SELECT a.username FROM databases d JOIN accounts a ON a.id = d.account_id WHERE d.name = ?').get('bobdb_shop')?.username).toBe('bobdb');
+      } finally {
+        await refreshCaps({ mysql: false, mysqld: false });
+      }
     });
 
     it('merges into an existing account only with overwrite', async () => {
@@ -287,6 +413,26 @@ describe('Transfers API', () => {
       app.agent.set('transfer.cpmove.inspect', HANDLERS['transfer.cpmove.inspect']);
     });
 
+    it('reads an archive once while its size and mtime are unchanged', async () => {
+      const file = '/var/lib/whm/transfers/uploads/cpmove-dave.tar.gz';
+      app.agent.calls.length = 0;
+      await post('/archives/inspect', { path: file }).expect(200);
+      await post('/archives/inspect', { path: file }).expect(200);
+      expect(app.agent.callsTo('transfer.cpmove.inspect')).toHaveLength(0);
+      expect(app.agent.callsTo('fs.stat').length).toBeGreaterThanOrEqual(2);
+      app.agent.set('fs.stat', ({ path }) => ({ path, exists: true, isDirectory: false, size: 4096, mtime: '2026-10-26T01:00:00.000Z' }));
+      await post('/archives/inspect', { path: file }).expect(200);
+      expect(app.agent.callsTo('transfer.cpmove.inspect')).toHaveLength(1);
+      await post('/archives/inspect', { path: file }).expect(200);
+      expect(app.agent.callsTo('transfer.cpmove.inspect')).toHaveLength(1);
+      app.agent.set('fs.stat', HANDLERS['fs.stat']);
+      // A different size/mtime again means a fresh listing; one entry per path is kept.
+      await post('/archives/inspect', { path: file }).expect(200);
+      expect(app.agent.callsTo('transfer.cpmove.inspect')).toHaveLength(2);
+      await post('/archives/inspect', { path: file }).expect(200);
+      expect(app.agent.callsTo('transfer.cpmove.inspect')).toHaveLength(2);
+    });
+
     it('uploads an archive in chunks', async () => {
       expect((await post('/uploads', { filename: 'notes.txt', size: 10 })).status).toBe(422);
       expect((await post('/uploads', { filename: '../x.tar.gz', size: 10 })).status).toBe(422);
@@ -299,7 +445,12 @@ describe('Transfers API', () => {
       expect((await put('/uploads/zzz/chunks', { data: chunk })).status).toBe(422);
       expect((await put(`/uploads/${'0'.repeat(24)}/chunks`, { data: chunk })).status).toBe(404);
       expect((await post(`/uploads/${id}/finish`)).status).toBe(422);
+      expect((await rget(`/uploads/${id}`)).status).toBe(403);
+      expect((await get(`/uploads/${'0'.repeat(24)}`)).status).toBe(404);
+      expect((await get(`/uploads/${id}`).expect(200)).body.data).toMatchObject({ id, received: 0, size: 10, chunks: 0, chunkBytes: begin.body.data.chunkBytes });
       expect((await put(`/uploads/${id}/chunks`, { data: chunk }).expect(200)).body.data.received).toBe(5);
+      // The uploader resumes from the byte count the server reports after a lost response.
+      expect((await get(`/uploads/${id}`).expect(200)).body.data).toMatchObject({ received: 5, chunks: 1 });
       expect((await put(`/uploads/${id}/chunks`, { data: chunk }).expect(200)).body.data.received).toBe(10);
       expect((await put(`/uploads/${id}/chunks`, { data: chunk })).status).toBe(422);
       const appends = app.agent.callsTo('transfer.upload.append');
@@ -338,21 +489,72 @@ describe('Transfers API', () => {
       const extracts = app.agent.callsTo('transfer.cpmove.extract');
       expect(extracts[0].args).toMatchObject({ path: file, destination: account.home_dir, members: ['cpmove-dave/homedir/*'], stripComponents: 2, owner: 'dave' });
       expect(extracts[1].args).toMatchObject({ members: ['cpmove-dave/mysql/dave_blog.sql'], destination: '/var/lib/whm/transfers/run-' + res.body.data.run.id });
+      // The UI's inspect result is reused: the archive is not listed again for the restore.
+      expect(app.agent.callsTo('transfer.cpmove.inspect')).toHaveLength(0);
       const run = (await get(`/runs/${res.body.data.run.id}`).expect(200)).body.data;
       const item = run.items[0];
       expect(item.steps.home.status).toBe('applied');
       expect(item.steps.databases[0]).toMatchObject({ name: 'dave_blog', status: 'pending' });
+      expect(app.agent.callsTo('transfer.user.set_password_hash')[0].args).toEqual({ username: 'dave', hash: SHADOW });
+      expect(item.steps.password).toMatchObject({ status: 'applied', detail: expect.stringMatching(/hash copied/) });
       expect(item.steps.dns.map((z) => z.domain).sort()).toEqual(['dave.net', 'davealias.org', 'davestore.com']);
       expect(item.steps.dns.find((z) => z.domain === 'dave.net').detail).toMatch(/imported/);
       expect(item.steps.dns.find((z) => z.domain === 'davealias.org').detail).toMatch(/standard zone/);
       expect(app.ctx.db.prepare("SELECT action FROM audit_log WHERE action = 'transfer.restore.result'").all()).toHaveLength(1);
       const again = await post('/restore', { path: file, username: 'dave' });
       expect(again.status).toBe(409);
-      const overwrite = await post('/restore', { path: file, username: 'dave', options: { overwrite: true, skipHome: true, skipDatabases: true, skipDns: true } }).expect(202);
+      const overwrite = await post('/restore', { path: file, username: 'dave', password: 'Dave-Passw0rd!1', options: { overwrite: true, skipHome: true, skipDatabases: true, skipDns: true } }).expect(202);
+      expect(overwrite.body.data.run.params.password).toBe('[set]');
       await finished(overwrite.body.data.job.id);
       const run2 = (await get(`/runs/${overwrite.body.data.run.id}`).expect(200)).body.data;
       expect(run2.items[0].steps.home.status).toBe('skipped');
       expect(run2.items[0].steps.account.detail).toMatch(/existing/);
+      expect(run2.items[0].steps.password).toMatchObject({ status: 'applied', detail: expect.stringMatching(/from the form/) });
+      expect(app.agent.callsTo('user.set_password').pop().args).toEqual({ username: 'dave', password: 'Dave-Passw0rd!1' });
+      expect(app.ctx.db.prepare('SELECT params_json FROM transfer_runs WHERE id = ?').get(run2.id).params_json).not.toContain('Dave-Passw0rd');
+    });
+
+    it('never imports an archived dump into a system database and rebuilds only account-scoped users', async () => {
+      await refreshCaps({ mysql: true, mysqld: true });
+      try {
+        const file = '/backup/cpmove-dave-evil.tar.gz';
+        expect((await post('/archives/inspect', { path: file }).expect(200)).body.data.databases).toEqual(['dave_blog', 'mysql', 'sys']);
+        const res = await post('/restore', { path: file, username: 'dave4', domain: 'dave4.net', options: { skipHome: true, skipDns: true } }).expect(202);
+        await finished(res.body.data.job.id);
+        const item = (await get(`/runs/${res.body.data.run.id}`).expect(200)).body.data.items[0];
+        const byName = Object.fromEntries(item.steps.databases.map((d) => [d.source, d]));
+        expect(byName.dave_blog).toMatchObject({ name: 'dave4_blog', status: 'applied' });
+        expect(byName.mysql).toMatchObject({ name: 'dave4_mysql', status: 'applied' });
+        expect(byName.sys).toMatchObject({ name: 'dave4_sys', status: 'applied' });
+        const imported = app.agent.callsTo('transfer.mysql.import').map((c) => c.args.database);
+        expect(imported.sort()).toEqual(['dave4_blog', 'dave4_mysql', 'dave4_sys']);
+        expect(app.agent.callsTo('transfer.mysql.import').every((c) => c.args.definerPrefix === 'dave')).toBe(true);
+        expect(app.agent.callsTo('db.database.create').map((c) => c.args.name).sort()).toEqual(['dave4_blog', 'dave4_mysql', 'dave4_sys']);
+        // mysql.sql: dave_app keeps its hash, dave_ro (unix_socket) gets a random password, root/evil/mysql.*/FILE are refused.
+        const created = app.agent.callsTo('transfer.mysql.create_user');
+        expect(created.map((c) => c.args.user)).toEqual(['dave4_app']);
+        expect(created[0].args).toMatchObject({ ownerPrefix: 'dave4', auth: { plugin: 'mysql_native_password', hash: NATIVE_HASH }, grants: [{ database: 'dave4_blog', privileges: ['ALL PRIVILEGES'] }] });
+        expect(app.agent.callsTo('db.user.create').map((c) => c.args.user)).toEqual(['dave4_ro']);
+        expect(app.agent.callsTo('db.grant')[0].args).toMatchObject({ user: 'dave4_ro', database: 'dave4_blog' });
+        expect(app.agent.callsTo('transfer.mysql.create_user').some((c) => c.args.user === 'root' || c.args.user === 'dave4_evil')).toBe(false);
+        expect(app.agent.callsTo('db.user.create').some((c) => c.args.user === 'root' || c.args.user === 'dave4_evil')).toBe(false);
+        expect(item.steps.grants.status).toBe('pending');
+        expect(item.steps.grants.detail).toMatch(/dave4_ro/);
+        expect(item.steps.grants.detail).toMatch(/WITH GRANT OPTION is not replayed/);
+        expect(item.steps.grants.detail).toMatch(/"mysql" does not belong/);
+        expect(item.steps.grants.detail).toMatch(/'root' does not belong/);
+        expect(item.steps.grants.detail).toMatch(/FILE/);
+        // A dump the agent refuses (e.g. CREATE USER inside) fails only that database.
+        app.agent.set('transfer.mysql.import', ({ database }) => { if (database === 'dave5_blog') throw Object.assign(new Error('dave_blog.sql line 12: user or role management statements are not allowed in an account dump'), { agentError: true, code: 'refused', details: {} }); return { database, imported: true }; });
+        const res2 = await post('/restore', { path: '/backup/cpmove-dave.tar.gz', username: 'dave5', domain: 'dave5.net', options: { skipHome: true, skipDns: true } }).expect(202);
+        await finished(res2.body.data.job.id);
+        const item2 = (await get(`/runs/${res2.body.data.run.id}`).expect(200)).body.data.items[0];
+        expect(item2.steps.databases[0]).toMatchObject({ name: 'dave5_blog', status: 'failed', detail: expect.stringMatching(/user or role management/) });
+        expect(item2.status).toBe('failed');
+        app.agent.set('transfer.mysql.import', HANDLERS['transfer.mysql.import']);
+      } finally {
+        await refreshCaps({ mysql: false, mysqld: false });
+      }
     });
 
     it('is exposed for other categories as restoreArchive', async () => {

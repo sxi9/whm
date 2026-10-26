@@ -9,9 +9,9 @@ import { useConfirm } from '../../../components/Modal.jsx';
 import { RequestError, JobCard, LastJob, CronField } from '../../server-configuration/Shared.jsx';
 
 const GENERATORS = [
-  { key: 'awstats', label: 'AWStats', blurb: 'Detailed visitor, referrer, robot and bandwidth reports. Output in ~/tmp/awstats with a per-domain config in /etc/awstats.' },
-  { key: 'webalizer', label: 'Webalizer', blurb: 'Fast incremental HTML reports. Output in ~/tmp/webalizer.' },
-  { key: 'analog', label: 'Analog', blurb: 'Compact summary report (index.html) in ~/tmp/analog.' },
+  { key: 'awstats', label: 'AWStats', blurb: 'Detailed visitor, referrer, robot and bandwidth reports, with a per-domain config in /etc/awstats.' },
+  { key: 'webalizer', label: 'Webalizer', blurb: 'Fast incremental HTML reports.' },
+  { key: 'analog', label: 'Analog', blurb: 'Compact summary report (index.html).' },
 ];
 
 export default function StatisticsSoftwareConfiguration({ fn }) {
@@ -47,7 +47,7 @@ export default function StatisticsSoftwareConfiguration({ fn }) {
       {data && draft && (
         <>
           <RequestError error={runError} onRetry={() => { setRunError(null); refetch(); }} />
-          <Card title="Generators" subtitle={data.detect?.domlogsRoot ? `Logs are read from ${data.detect.domlogsRoot}/<user>/<domain>-access.log` : undefined}>
+          <Card title="Generators" subtitle={data.detect?.domlogsRoot ? `Plain and TLS logs (${data.detect.domlogsRoot}/<user>/<domain>-access.log and -ssl-access.log) are merged; reports are written to ${data.outputRoot || '/var/lib/whm/stats'}/<user>/<domain>/<generator>, readable by the account's group` : undefined}>
             <div className="table-wrap"><table>
               <thead><tr><th>Generator</th><th>Installed</th><th>Enabled</th><th /></tr></thead>
               <tbody>

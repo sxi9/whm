@@ -90,7 +90,7 @@ export function PreflightSummary({ data }) {
         ['Queued jobs', <StatusPill key="qj" status={data.jobs.queued ? 'warning' : 'ok'}>{data.jobs.queued}</StatusPill>],
         ['Active transfers', data.transfers.available ? <StatusPill key="tr" status={data.transfers.count ? 'warning' : 'ok'}>{data.transfers.count}</StatusPill> : <span key="tr" className="muted">transfers module not loaded</span>],
         ['Active backups', data.backups.available ? <StatusPill key="bk" status={data.backups.count + data.restores.count ? 'warning' : 'ok'}>{data.backups.count + data.restores.count}</StatusPill> : <span key="bk" className="muted">backup module not loaded</span>],
-        data.lastRequest && ['Last panel reboot', <span key="lr">{data.lastRequest.mode} by {data.lastRequest.principal || 'unknown'} {formatDate(data.lastRequest.requested_at)} · <StatusPill status={data.lastRequest.status === 'failed' ? 'failed' : data.lastRequest.completed ? 'done' : 'pending'}>{data.lastRequest.status === 'failed' ? 'failed' : data.lastRequest.completed ? 'completed' : 'not yet rebooted'}</StatusPill></span>],
+        data.lastRequest && ['Last panel reboot', <span key="lr">{data.lastRequest.mode} by {data.lastRequest.principal || 'unknown'} {formatDate(data.lastRequest.requested_at)} · <StatusPill status={data.lastRequest.status === 'failed' ? 'failed' : data.lastRequest.completed ? 'done' : 'pending'}>{data.lastRequest.status === 'failed' ? 'failed' : data.lastRequest.completed ? 'completed' : data.lastRequest.status === 'requested' ? 'requested, outcome not recorded' : 'not yet rebooted'}</StatusPill></span>],
       ]} />
       {active ? (
         <div className="banner banner-warning">
@@ -137,7 +137,7 @@ export function RebootHistory() {
           { key: 'mode', label: 'Mode', render: (r) => <StatusPill status={r.mode === 'forceful' ? 'warning' : 'info'}>{r.mode}</StatusPill> },
           { key: 'principal', label: 'By', render: (r) => r.principal || <span className="muted">—</span> },
           { key: 'reason', label: 'Reason', render: (r) => r.reason || <span className="muted">—</span> },
-          { key: 'status', label: 'Result', render: (r) => <StatusPill status={r.status === 'failed' ? 'failed' : 'ok'}>{r.status === 'failed' ? `failed: ${r.error}` : 'triggered'}</StatusPill> },
+          { key: 'status', label: 'Result', render: (r) => <StatusPill status={r.status === 'failed' ? 'failed' : r.status === 'requested' ? 'pending' : 'ok'}>{r.status === 'failed' ? `failed: ${r.error}` : r.status === 'requested' ? 'requested (panel went down before the outcome was recorded)' : 'triggered'}</StatusPill> },
           { key: 'warnings', label: 'Interrupted work', render: (r) => (r.preflight?.warnings?.length ? r.preflight.warnings.join('; ') : <span className="muted">none</span>) },
         ]}
         rows={data || []} loading={loading} error={error} rowKey={(r) => r.id}
@@ -167,13 +167,26 @@ export default function RebootPage({ fn, mode }) {
         confirmMessage={confirmMessage}
         typeToConfirm="REBOOT"
         run={async () => {
-          const { data: result } = await api.post(`/system-reboot/${mode}`, { reason: reason.trim() || undefined, ignoreActiveWork: warnings.length > 0 });
-          return result;
+          const body = { reason: reason.trim() || undefined, ignoreActiveWork: warnings.length > 0 };
+          const requestedAt = new Date().toISOString();
+          try {
+            const { data: result } = await api.post(`/system-reboot/${mode}`, body);
+            return result;
+          } catch (err) {
+            // No HTTP status means the connection died rather than the API
+            // refusing: the panel is already going down with the host (the
+            // request is recorded before the command runs), so watch for it.
+            if (err?.status != null) throw err;
+            return { mode, reason: body.reason ?? null, requested_at: requestedAt, unconfirmed: true, error: err };
+          }
         }}
         renderResult={(result) => (
           <>
+            {result.unconfirmed && (
+              <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>The panel stopped answering while the reboot command was being sent</strong><small>This usually means the reboot started before the response could be delivered ({result.error?.message || 'network error'}). The request was recorded before the command ran; the reboot history shows it as “requested” until the panel is back.</small></div></div>
+            )}
             <KeyValue items={[
-              ['Result', <StatusPill key="r" status="ok">reboot command accepted</StatusPill>],
+              ['Result', <StatusPill key="r" status={result.unconfirmed ? 'pending' : 'ok'}>{result.unconfirmed ? 'reboot most likely in progress' : 'reboot command accepted'}</StatusPill>],
               ['Mode', result.mode],
               ['Command', <code key="c">{spec.command}</code>],
               result.reason && ['Reason', result.reason],

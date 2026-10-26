@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { validate, z, fields, pagination } from '../../lib/validate.js';
 import { requireRoot, requireReseller } from '../../middleware/rbac.js';
+import { isValidCron } from '../../lib/cron.js';
 import { createBackupService, SETTING_KEYS } from '../../services/backup.js';
 
 const idParam = z.object({ id: fields.id });
@@ -28,7 +29,7 @@ const destinationName = z.string().trim().min(1).max(64).regex(/^[A-Za-z0-9][A-Z
 
 const settingsBody = z.object({
   'backup.enabled': z.boolean().optional(),
-  'backup.schedule': fields.cron.optional(),
+  'backup.schedule': fields.cron.refine(isValidCron, 'Must be a valid 5-field cron expression').optional(),
   'backup.retention_daily': z.number().int().min(0).max(3650).optional(),
   'backup.retention_weekly': z.number().int().min(0).max(520).optional(),
   'backup.retention_monthly': z.number().int().min(0).max(120).optional(),
@@ -70,7 +71,7 @@ export async function register(ctx) {
   // Backup Configuration ---------------------------------------------------------
   r.get('/config', requireRoot, wrap(async () => ({ settings: svc().config(), status: await svc().status() })));
   r.put('/config', requireRoot, validate({ body: settingsBody }), wrap((req) => svc().updateConfig(req.body, req)));
-  r.get('/status', requireReseller, wrap(() => svc().status()));
+  r.get('/status', requireReseller, wrap((req) => svc().status(req.user)));
 
   r.get('/destinations', requireRoot, wrap(() => svc().listDestinations()));
   r.post('/destinations', requireRoot, validate({ body: z.object({ name: destinationName, enabled: z.boolean().optional(), config: destinationConfig }).strict() }),

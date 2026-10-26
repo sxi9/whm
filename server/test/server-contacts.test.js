@@ -4,7 +4,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { normalizeNotification, validateAddress, EVENTS } from '../src/services/server-contacts.js';
+import { normalizeNotification, validateAddress, maskAddress, createServerContactsService, EVENTS } from '../src/services/server-contacts.js';
 import { buildMessage, dotStuff, sendSmtp } from '../src/services/server-contacts-smtp.js';
 
 // A tiny SMTP server that records the session so the relay path is exercised
@@ -72,6 +72,14 @@ describe('server contacts helpers', () => {
     expect(JSON.parse(short.body)).toEqual({ packages: 3, security: 1 });
     expect(normalizeNotification('custom.thing', 'plain text')).toMatchObject({ event: 'custom.thing', severity: 'info', subject: 'custom.thing', body: 'plain text' });
     expect(normalizeNotification({ event: 'login.new_ip', severity: 'nonsense' }).severity).toBe('warning');
+  });
+
+  it('masks credential-bearing addresses and leaves the rest alone', () => {
+    expect(maskAddress('slack', 'https://hooks.slack.com/services/T000/B000/XXXXXXXX')).toEqual({ display: 'hooks.slack.com/services/T000…/…XXXX', secret: 'https://hooks.slack.com/services/T000/B000/XXXXXXXX' });
+    expect(maskAddress('webhook', 'https://example.com/hook?key=abc')).toEqual({ display: 'https://example.com/hook?…', secret: 'https://example.com/hook?key=abc' });
+    expect(maskAddress('webhook', 'https://example.com/hook')).toEqual({ display: 'https://example.com/hook', secret: null });
+    expect(maskAddress('email', 'ops@example.com')).toEqual({ display: 'ops@example.com', secret: null });
+    expect(maskAddress('pushover', 'u'.repeat(30))).toEqual({ display: 'u'.repeat(30), secret: null });
   });
 
   it('validates addresses per channel', () => {
@@ -215,6 +223,67 @@ describe('Server Contacts API', () => {
     await get(`/api/server-contacts/contacts/${id}`).expect(404);
     expect(auditRows('contacts.create')).toHaveLength(3);
     expect(auditRows('contacts.remove')).toHaveLength(1);
+  });
+
+  it('treats Slack and token-bearing webhook URLs as secrets: encrypted at rest, masked in responses, deliveries and audit, still delivered to the real URL', async () => {
+    const slackUrl = 'https://hooks.slack.com/services/T0ABCDEF/B0GHIJKL/SeCrEtToKeN12345678';
+    const slack = await post('/api/server-contacts/contacts', { name: 'Slack', channel: 'slack', address: slackUrl, config: { channelName: '#alerts' } }).expect(201);
+    expect(slack.body.data).toMatchObject({ address: 'hooks.slack.com/services/T0AB…/…5678', config: { channelName: '#alerts', url: { set: true } } });
+    expect(JSON.stringify(slack.body.data)).not.toContain('SeCrEtToKeN');
+    const stored = app.ctx.db.prepare('SELECT address, config_json FROM contacts WHERE id = ?').get(slack.body.data.id);
+    expect(stored.address).toBe('hooks.slack.com/services/T0AB…/…5678');
+    expect(stored.config_json).toMatch(/"url_enc":"v1:/);
+    expect(stored.config_json).not.toContain('SeCrEtToKeN');
+    expect(app.ctx.crypto.decrypt(JSON.parse(stored.config_json).url_enc)).toBe(slackUrl);
+    expect(auditRows('contacts.create').at(-1).target).toBe('hooks.slack.com/services/T0AB…/…5678');
+    expect(JSON.stringify(auditRows('contacts.create').at(-1))).not.toContain('SeCrEtToKeN');
+
+    const hookUrl = `http://127.0.0.1:${hookPort}/notify?token=QueryToken987`;
+    const wh = await post('/api/server-contacts/contacts', { name: 'Tokened hook', channel: 'webhook', address: hookUrl }).expect(201);
+    expect(wh.body.data).toMatchObject({ address: `http://127.0.0.1:${hookPort}/notify?…`, config: { url: { set: true } } });
+    const plain = await post('/api/server-contacts/contacts', { name: 'Plain hook', channel: 'webhook', address: `http://127.0.0.1:${hookPort}/plain` }).expect(201);
+    expect(plain.body.data).toMatchObject({ address: `http://127.0.0.1:${hookPort}/plain`, config: {} });
+
+    const r = await app.ctx.contacts.notify({ event: 'backup.failed', subject: 'Run 3 failed', body: 'x' });
+    expect(r).toMatchObject({ matched: 3, sent: 2, failed: 1 });
+    expect(hook.received.map((h) => h.url).sort()).toEqual(['/notify?token=QueryToken987', '/plain']);
+    const slackDelivery = r.deliveries.find((d) => d.channel === 'slack');
+    expect(slackDelivery).toMatchObject({ address: 'hooks.slack.com/services/T0AB…/…5678', status: 'failed' });
+    expect(slackDelivery.error).not.toContain('SeCrEtToKeN');
+    const logged = app.ctx.db.prepare('SELECT address, error FROM contact_deliveries ORDER BY id').all();
+    expect(logged.map((d) => d.address).sort()).toEqual(['hooks.slack.com/services/T0AB…/…5678', `http://127.0.0.1:${hookPort}/notify?…`, `http://127.0.0.1:${hookPort}/plain`]);
+    expect(JSON.stringify(logged)).not.toMatch(/SeCrEtToKeN|QueryToken/);
+    const tested = await post(`/api/server-contacts/contacts/${wh.body.data.id}/test`).expect(200);
+    expect(tested.body.data.address).toBe(`http://127.0.0.1:${hookPort}/notify?…`);
+    expect(auditRows('contacts.test').at(-1).target).toBe(`http://127.0.0.1:${hookPort}/notify?…`);
+
+    // Editing: the masked form the edit form echoes back keeps the stored URL; a new URL replaces it; a non-URL is refused.
+    const kept = await patch(`/api/server-contacts/contacts/${slack.body.data.id}`, { address: 'hooks.slack.com/services/T0AB…/…5678', name: 'Slack ops' }).expect(200);
+    expect(kept.body.data).toMatchObject({ name: 'Slack ops', address: 'hooks.slack.com/services/T0AB…/…5678', config: { channelName: '#alerts', url: { set: true } } });
+    expect(app.ctx.crypto.decrypt(JSON.parse(app.ctx.db.prepare('SELECT config_json FROM contacts WHERE id = ?').get(slack.body.data.id).config_json).url_enc)).toBe(slackUrl);
+    const replaced = await patch(`/api/server-contacts/contacts/${slack.body.data.id}`, { address: 'https://hooks.slack.com/services/T0ABCDEF/B0GHIJKL/NewToken000099' }).expect(200);
+    expect(replaced.body.data.address).toBe('hooks.slack.com/services/T0AB…/…0099');
+    expect(app.ctx.crypto.decrypt(JSON.parse(app.ctx.db.prepare('SELECT config_json FROM contacts WHERE id = ?').get(slack.body.data.id).config_json).url_enc)).toBe('https://hooks.slack.com/services/T0ABCDEF/B0GHIJKL/NewToken000099');
+    expect(JSON.stringify(auditRows('contacts.update').at(-1))).not.toContain('NewToken');
+    await patch(`/api/server-contacts/contacts/${slack.body.data.id}`, { channel: 'email' }).expect(422);
+    await patch(`/api/server-contacts/contacts/${plain.body.data.id}`, { channel: 'slack' }).expect(422);
+    const dropped = await patch(`/api/server-contacts/contacts/${wh.body.data.id}`, { address: `http://127.0.0.1:${hookPort}/no-token` }).expect(200);
+    expect(dropped.body.data).toMatchObject({ address: `http://127.0.0.1:${hookPort}/no-token`, config: {} });
+    expect((await del(`/api/server-contacts/contacts/${slack.body.data.id}`).expect(200)).body.data.address).toBe('hooks.slack.com/services/T0AB…/…0099');
+    expect(auditRows('contacts.remove').at(-1).target).toBe('hooks.slack.com/services/T0AB…/…0099');
+  });
+
+  it('converts plaintext webhook URLs stored by earlier versions into the encrypted form at boot', async () => {
+    const legacy = 'https://hooks.slack.com/services/T0LEGACY/B0LEGACY/LegacyToken4321';
+    const { lastInsertRowid } = app.ctx.db.prepare("INSERT INTO contacts (channel, address, events_json, enabled, config_json) VALUES ('slack', ?, '[\"*\"]', 1, '{\"channelName\":\"#old\"}')").run(legacy);
+    app.ctx.db.prepare("INSERT INTO contact_deliveries (contact_id, contact_name, channel, address, event, severity, subject, status) VALUES (?, 'old', 'slack', ?, 'test', 'info', 's', 'sent')").run(lastInsertRowid, legacy);
+    createServerContactsService(app.ctx);
+    const row = app.ctx.db.prepare('SELECT address, config_json FROM contacts WHERE id = ?').get(lastInsertRowid);
+    expect(row.address).toBe('hooks.slack.com/services/T0LE…/…4321');
+    expect(JSON.parse(row.config_json).channelName).toBe('#old');
+    expect(app.ctx.crypto.decrypt(JSON.parse(row.config_json).url_enc)).toBe(legacy);
+    expect(app.ctx.db.prepare('SELECT address FROM contact_deliveries WHERE contact_id = ?').get(lastInsertRowid).address).toBe('hooks.slack.com/services/T0LE…/…4321');
+    expect((await get(`/api/server-contacts/contacts/${lastInsertRowid}`).expect(200)).body.data.address).toBe('hooks.slack.com/services/T0LE…/…4321');
   });
 
   it('delivers notifications to matching contacts (webhook signed, email failing without a transport) and logs every attempt', async () => {

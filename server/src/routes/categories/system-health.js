@@ -32,6 +32,7 @@ export async function register(ctx) {
   ctx.capabilities.register('procps', { binaries: ['ps', 'renice'], required: ['ps'] });
   ctx.jobs.register('system-health.bpk.scan', async (job) => {
     if (!s.config().enabled) { job.log('background process killer is disabled; nothing scanned'); return { skipped: 'disabled' }; }
+    if (!s.enabledPatterns().length) { job.log('no disallowed process names are enabled; nothing scanned'); return { skipped: 'no_patterns' }; }
     await ctx.capabilities.ensureFresh();
     if (!ctx.capabilities.has('procps')) { job.log('ps (procps) is not installed; nothing scanned', 'warn'); return { skipped: 'procps_missing' }; }
     const { run, kills } = await s.scan({ trigger: 'scheduled', log: job.log });

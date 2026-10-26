@@ -1,19 +1,28 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import readline from 'node:readline';
+import { finished } from 'node:stream/promises';
 import { z } from 'zod';
 import { exec, hasBinary, resolveBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
 import { DOMLOGS_ROOT } from './web.js';
 
 // Statistics Software Configuration: AWStats, Webalizer and Analog run against
-// the per-domain Apache logs the web family writes, with output placed in the
-// account's ~/tmp/<generator> directory as cPanel does.
+// the per-domain Apache logs the web family writes (plain and TLS vhosts log to
+// separate files, so both are merged first). Output lives in a root-owned tree
+// under STATS_ROOT, group-readable by the account: the generators run as root,
+// so they must never follow a path the account can rewrite (~/tmp is user-owned).
 export const GENERATORS = ['awstats', 'webalizer', 'analog'];
 export const AWSTATS_CONF_DIR = '/etc/awstats';
+export const STATS_ROOT = '/var/lib/whm/stats';
 const AWSTATS_CANDIDATES = ['awstats.pl', '/usr/lib/cgi-bin/awstats.pl', '/usr/share/awstats/wwwroot/cgi-bin/awstats.pl', '/usr/local/awstats/wwwroot/cgi-bin/awstats.pl', '/var/www/awstats/awstats.pl'];
 const AWSTATS_STATIC = ['awstats_buildstaticpages.pl', '/usr/share/awstats/tools/awstats_buildstaticpages.pl', '/usr/share/doc/awstats/examples/awstats_buildstaticpages.pl', '/usr/local/awstats/tools/awstats_buildstaticpages.pl'];
+const MERGED_LOG = 'access-merged.log';
+const MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
 
+const statsRoot = () => process.env.WHM_STATS_ROOT || STATS_ROOT;
 const firstBinary = (names) => names.map(resolveBinary).find(Boolean) || null;
+export const domainLogFiles = (username, domain) => [`${DOMLOGS_ROOT}/${username}/${domain}-access.log`, `${DOMLOGS_ROOT}/${username}/${domain}-ssl-access.log`];
 
 async function versionOf(bin, argv) {
   if (!bin) return null;
@@ -59,6 +68,42 @@ export function renderAwstatsConfig({ domain, logFile, dataDir, aliases = [] }) 
   ].join('\n');
 }
 
+// Epoch milliseconds of a combined-format log line, or null when it has no
+// "[dd/Mon/yyyy:HH:MM:SS +zzzz]" field.
+export function logTimestamp(line) {
+  const m = /\[(\d{2})\/([A-Za-z]{3})\/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2})\]/.exec(line);
+  if (!m || MONTHS[m[2]] === undefined) return null;
+  const utc = Date.UTC(Number(m[3]), MONTHS[m[2]], Number(m[1]), Number(m[4]), Number(m[5]), Number(m[6]));
+  const offset = (Number(m[8]) * 60 + Number(m[9])) * 60_000;
+  return m[7] === '-' ? utc + offset : utc - offset;
+}
+
+// Streams several time-ordered access logs into one time-ordered file so the
+// incremental generators (which drop records older than the last one seen) get
+// plain and TLS requests interleaved. Lines without a timestamp keep their
+// file's position.
+export async function mergeAccessLogs(files, dest) {
+  const heads = files.map((file) => ({ iterator: readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity })[Symbol.asyncIterator](), next: null, ts: 0 }));
+  const advance = async (h) => { h.next = await h.iterator.next(); if (h.next.done) h.ts = Infinity; else h.ts = logTimestamp(h.next.value) ?? h.ts; };
+  await Promise.all(heads.map(advance));
+  const out = fs.createWriteStream(dest, { flags: 'w', mode: 0o600 });
+  const write = (s) => (out.write(s) ? Promise.resolve() : new Promise((resolve) => out.once('drain', resolve)));
+  let lines = 0;
+  try {
+    for (;;) {
+      let best = null;
+      for (const h of heads) if (!h.next.done && (best === null || h.ts < best.ts)) best = h;
+      if (!best) break;
+      if (best.next.value !== '') { await write(`${best.next.value}\n`); lines++; }
+      await advance(best);
+    }
+  } finally {
+    out.end();
+    await finished(out);
+  }
+  return { dest, lines };
+}
+
 function passwdEntry(username) {
   try {
     const line = fs.readFileSync('/etc/passwd', 'utf8').split('\n').find((l) => l.startsWith(`${username}:`));
@@ -68,12 +113,30 @@ function passwdEntry(username) {
   } catch { return null; }
 }
 
-function chownTree(dir, { uid, gid }) {
-  fs.chownSync(dir, uid, gid);
+// Every directory the generators write into must be a real directory owned by
+// root, so an account can never redirect root's writes or chowns elsewhere.
+function ensureRootDir(p, { gid = 0, mode = 0o755 } = {}) {
+  let st;
+  try { st = fs.lstatSync(p); } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+    fs.mkdirSync(p, { mode });
+    st = fs.lstatSync(p);
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new OpError('refused', `${p} is not a plain directory; refusing to write statistics through it`);
+  if (st.uid !== 0) throw new OpError('refused', `${p} is not owned by root; refusing to write statistics there`);
+  if (st.gid !== gid || (st.mode & 0o7777) !== mode) { fs.chownSync(p, 0, gid); fs.chmodSync(p, mode); }
+  return p;
+}
+
+// Walks only a root-owned tree (nothing under STATS_ROOT is writable by an
+// account), never following symlinks.
+function finalizeTree(dir, gid) {
+  fs.chownSync(dir, 0, gid);
+  fs.chmodSync(dir, 0o750);
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const p = path.join(dir, entry.name);
-    if (entry.isDirectory()) chownTree(p, { uid, gid });
-    else fs.lchownSync(p, uid, gid);
+    if (entry.isDirectory()) finalizeTree(p, gid);
+    else if (entry.isFile()) { fs.chownSync(p, 0, gid); fs.chmodSync(p, 0o640); }
   }
 }
 
@@ -85,6 +148,7 @@ defineOp('stats.detect', {
     const found = detectGenerators();
     return {
       domlogsRoot: DOMLOGS_ROOT,
+      statsRoot: statsRoot(),
       generators: {
         awstats: { installed: Boolean(found.awstats.bin), bin: found.awstats.bin, staticTool: found.awstats.staticTool, configDir: AWSTATS_CONF_DIR, configDirExists: fs.existsSync(AWSTATS_CONF_DIR), version: await versionOf(found.awstats.bin, ['-h']), packages: { apt: ['awstats'], dnf: ['awstats'] } },
         webalizer: { installed: Boolean(found.webalizer.bin), bin: found.webalizer.bin, version: await versionOf(found.webalizer.bin, ['-v']), packages: { apt: ['webalizer'], dnf: ['webalizer'] } },
@@ -95,50 +159,57 @@ defineOp('stats.detect', {
 });
 
 defineOp('stats.generate', {
-  description: 'Run one statistics generator for one domain; output goes to <home>/tmp/<generator>',
+  description: 'Run one statistics generator for one domain over its plain and TLS access logs; output goes to <stats root>/<user>/<domain>/<generator>',
   timeoutMs: 1_800_000,
   schema: z.object({
     generator: z.enum(GENERATORS),
     domain: arg.domain,
     username: arg.username,
-    homeDir: arg.absPath,
-    logFile: arg.absPath.optional(),
+    logFiles: z.array(arg.absPath).min(1).max(4).optional(),
     aliases: z.array(arg.hostname).max(50).default([]),
   }).strict(),
-  run: async ({ generator, domain, username, homeDir, logFile, aliases }, ctx) => {
+  run: async ({ generator, domain, username, logFiles, aliases }, ctx) => {
     const found = detectGenerators()[generator];
     if (!found.bin) throw new OpError('capability_missing', `${generator} is not installed on this server`);
-    const log = ctx.assertAllowedPath(logFile || `${DOMLOGS_ROOT}/${username}/${domain}-access.log`, 'read');
-    const home = ctx.assertAllowedPath(homeDir, 'write');
+    const candidates = (logFiles || domainLogFiles(username, domain)).map((p) => ctx.assertAllowedPath(p, 'read'));
     const owner = passwdEntry(username);
     if (!owner) throw new OpError('not_found', `Linux user "${username}" does not exist`);
-    if (!fs.existsSync(log)) return { generator, domain, skipped: true, reason: 'no_log', logFile: log };
-    const outDir = path.join(home, 'tmp', generator);
-    fs.mkdirSync(outDir, { recursive: true, mode: 0o750 });
+    const logs = candidates.filter((p) => { try { return fs.statSync(p).isFile(); } catch { return false; } });
+    if (!logs.length) return { generator, domain, skipped: true, reason: 'no_log', logFiles: candidates };
+    const root = ensureRootDir(ctx.assertAllowedPath(statsRoot(), 'write'));
+    const userDir = ensureRootDir(path.join(root, username), { gid: owner.gid, mode: 0o750 });
+    const domainDir = ensureRootDir(path.join(userDir, domain), { gid: owner.gid, mode: 0o750 });
+    const outDir = ensureRootDir(path.join(domainDir, generator), { gid: owner.gid, mode: 0o750 });
+    const merged = path.join(domainDir, MERGED_LOG);
     let result;
-    if (generator === 'awstats') {
-      const confPath = ctx.assertAllowedPath(path.join(AWSTATS_CONF_DIR, `awstats.${domain}.conf`), 'write');
-      fs.mkdirSync(AWSTATS_CONF_DIR, { recursive: true });
-      fs.writeFileSync(confPath, renderAwstatsConfig({ domain, logFile: log, dataDir: outDir, aliases }), { mode: 0o644 });
-      const update = await exec(found.bin, [`-config=${domain}`, '-update'], { timeoutMs: 1_800_000, allowFailure: true, env: { AWSTATS_CONFIG_DIR: AWSTATS_CONF_DIR } });
-      result = { config: confPath, code: update.code, output: tail(update.stdout || update.stderr) };
-      if (update.code !== 0) throw new OpError('command_failed', `awstats update failed for ${domain}: ${tail(update.stderr || update.stdout).split('\n').pop()}`, result);
-      if (found.staticTool) {
-        const built = await exec(found.staticTool, [`-config=${domain}`, `-dir=${outDir}`, `-awstatsprog=${found.bin}`], { timeoutMs: 1_800_000, allowFailure: true, env: { AWSTATS_CONFIG_DIR: AWSTATS_CONF_DIR } });
-        result.staticPages = built.code === 0;
-        if (built.code === 0) { const idx = path.join(outDir, `awstats.${domain}.html`); if (fs.existsSync(idx)) fs.copyFileSync(idx, path.join(outDir, 'index.html')); }
+    try {
+      const log = logs.length === 1 ? logs[0] : (await mergeAccessLogs(logs, merged)).dest;
+      if (generator === 'awstats') {
+        const confPath = ctx.assertAllowedPath(path.join(AWSTATS_CONF_DIR, `awstats.${domain}.conf`), 'write');
+        fs.mkdirSync(AWSTATS_CONF_DIR, { recursive: true });
+        fs.writeFileSync(confPath, renderAwstatsConfig({ domain, logFile: log, dataDir: outDir, aliases }), { mode: 0o644 });
+        const update = await exec(found.bin, [`-config=${domain}`, '-update'], { timeoutMs: 1_800_000, allowFailure: true, env: { AWSTATS_CONFIG_DIR: AWSTATS_CONF_DIR } });
+        result = { config: confPath, code: update.code, output: tail(update.stdout || update.stderr) };
+        if (update.code !== 0) throw new OpError('command_failed', `awstats update failed for ${domain}: ${tail(update.stderr || update.stdout).split('\n').pop()}`, result);
+        if (found.staticTool) {
+          const built = await exec(found.staticTool, [`-config=${domain}`, `-dir=${outDir}`, `-awstatsprog=${found.bin}`], { timeoutMs: 1_800_000, allowFailure: true, env: { AWSTATS_CONFIG_DIR: AWSTATS_CONF_DIR } });
+          result.staticPages = built.code === 0;
+          if (built.code === 0) { const idx = path.join(outDir, `awstats.${domain}.html`); if (fs.existsSync(idx)) fs.copyFileSync(idx, path.join(outDir, 'index.html')); }
+        }
+      } else if (generator === 'webalizer') {
+        const run = await exec(found.bin, ['-q', '-p', '-n', domain, '-o', outDir, log], { timeoutMs: 1_800_000, allowFailure: true });
+        result = { code: run.code, output: tail(run.stdout || run.stderr) };
+        if (run.code !== 0) throw new OpError('command_failed', `webalizer failed for ${domain}: ${tail(run.stderr || run.stdout).split('\n').pop()}`, result);
+      } else {
+        const run = await exec(found.bin, ['-G', `+CHOSTNAME ${domain}`, '+CLOGFORMAT COMBINED', `+O${path.join(outDir, 'index.html')}`, log], { timeoutMs: 1_800_000, allowFailure: true });
+        result = { code: run.code, output: tail(run.stdout || run.stderr) };
+        if (run.code !== 0) throw new OpError('command_failed', `analog failed for ${domain}: ${tail(run.stderr || run.stdout).split('\n').pop()}`, result);
       }
-    } else if (generator === 'webalizer') {
-      const run = await exec(found.bin, ['-q', '-p', '-n', domain, '-o', outDir, log], { timeoutMs: 1_800_000, allowFailure: true });
-      result = { code: run.code, output: tail(run.stdout || run.stderr) };
-      if (run.code !== 0) throw new OpError('command_failed', `webalizer failed for ${domain}: ${tail(run.stderr || run.stdout).split('\n').pop()}`, result);
-    } else {
-      const run = await exec(found.bin, ['-G', `+CHOSTNAME ${domain}`, '+CLOGFORMAT COMBINED', `+O${path.join(outDir, 'index.html')}`, log], { timeoutMs: 1_800_000, allowFailure: true });
-      result = { code: run.code, output: tail(run.stdout || run.stderr) };
-      if (run.code !== 0) throw new OpError('command_failed', `analog failed for ${domain}: ${tail(run.stderr || run.stdout).split('\n').pop()}`, result);
+    } finally {
+      fs.rmSync(merged, { force: true });
+      finalizeTree(outDir, owner.gid);
     }
-    chownTree(outDir, owner);
-    return { generator, domain, username, logFile: log, outputDir: outDir, skipped: false, ...result };
+    return { generator, domain, username, logFiles: logs, outputDir: outDir, skipped: false, ...result };
   },
 });
 

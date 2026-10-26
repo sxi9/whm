@@ -41,7 +41,7 @@ export default function EditResellerNameserversAndPrivileges({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Choose which WHM functions a reseller may use, grouped as in WHM, and the nameservers its new accounts' DNS zones advertise. Save a selection as an ACL list to reuse it." />
+      <PageHeader fn={fn} description="Choose which privileges a reseller has, grouped as in WHM, and the nameservers recorded for its accounts. Account creation, suspension, termination, passwords, modification, quotas, bandwidth, packages and IP assignment are enforced by the panel; the other keys are stored for the categories that check them. An empty selection denies everything. Save a selection as an ACL list to reuse it." />
       <Card title="Reseller"><ResellerPicker value={username} onChange={setUsername} /></Card>
       <ErrorBanner error={loadError || catalog.error} onRetry={() => { refetch(); catalog.refetch(); }} />
       {reseller && (

@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import { exec } from '../src/exec.js';
 import { runOp, createContext, OpError } from '../src/lib.js';
-import { ALIASES_FILE, parseAliases, renderRootAlias } from '../src/ops/contacts.js';
+import { ALIASES_FILE, ALIASES_WORKDIR, parseAliases, renderRootAlias } from '../src/ops/contacts.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
@@ -39,11 +39,24 @@ describe('contacts op schemas reject injection before anything runs', () => {
     expect((await opError(runOp('contacts.aliases.read', { path: '/etc/passwd' }, ctx))).code).toBe('invalid_args');
   });
 
-  it('/etc/aliases is the only alias location the agent may touch', () => {
+  it('/etc/aliases is the only alias location the agent may touch; backups and temp files stay under the agent state root', () => {
     expect(ctx.allowedRoots).toContain(ALIASES_FILE);
     expect(() => ctx.assertAllowedPath('/etc/aliases.db')).toThrow(OpError);
+    expect(() => ctx.assertAllowedPath('/etc/aliases.whm-bak', 'write')).toThrow(OpError);
+    expect(() => ctx.assertAllowedPath(`/etc/aliases.whm-tmp-${process.pid}`, 'write')).toThrow(OpError);
     expect(() => ctx.assertAllowedPath('/etc/aliases/../passwd')).toThrow(OpError);
     expect(() => ctx.assertAllowedPath('/etc/passwd')).toThrow(OpError);
+    expect(ALIASES_WORKDIR.startsWith('/var/lib/whm/')).toBe(true);
+    expect(ctx.assertAllowedPath(ALIASES_WORKDIR, 'write')).toBe(ALIASES_WORKDIR);
+    expect(ctx.assertAllowedPath(`${ALIASES_WORKDIR}/aliases.20261026T000000Z.bak`, 'write')).toBe(`${ALIASES_WORKDIR}/aliases.20261026T000000Z.bak`);
+    expect(ctx.assertAllowedPath(`${ALIASES_WORKDIR}/aliases.tmp-1`, 'write')).toBe(`${ALIASES_WORKDIR}/aliases.tmp-1`);
+  });
+
+  it('contacts.aliases.set_root refuses to run under a policy that excludes the state root', async () => {
+    exec.mockClear();
+    const narrow = createContext({ allowedRoots: [ALIASES_FILE] });
+    expect((await opError(runOp('contacts.aliases.set_root', { targets: ['ops@example.com'] }, narrow))).code).toBe('path_not_allowed');
+    expect(exec).not.toHaveBeenCalled();
   });
 });
 

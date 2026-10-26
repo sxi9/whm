@@ -60,6 +60,25 @@ export function validateAddress(channel, address) {
   }
 }
 
+// A Slack incoming-webhook URL is a bearer credential, as is any webhook URL
+// that carries a token in its query string: only a masked display form is
+// stored in contacts.address, logged or audited; the real URL lives encrypted
+// in config.url_enc.
+export function maskAddress(channel, address) {
+  const a = String(address || '').trim();
+  if (channel === 'slack') {
+    const url = new URL(a);
+    const segs = url.pathname.split('/').filter(Boolean);
+    const last = segs[segs.length - 1] || '';
+    return { display: `${url.host}/${segs[0] || ''}/${(segs[1] || '').slice(0, 4)}…/…${last.slice(-4)}`, secret: a };
+  }
+  if (channel === 'webhook') {
+    const url = new URL(a);
+    if (url.search || url.hash) return { display: `${url.origin}${url.pathname}?…`, secret: a };
+  }
+  return { display: a, secret: null };
+}
+
 const severityRank = (s) => Math.max(0, SEVERITIES.indexOf(s));
 
 // Accepts notify({ event, subject, body, severity, data }) and the shorthand
@@ -143,9 +162,10 @@ export function createServerContactsService(ctx) {
   // a missing key on update keeps the stored value, null removes it.
   function mergeConfig(channel, input = {}, previous = {}) {
     const next = { ...previous };
-    const secrets = { pushover: ['token'], webhook: ['secret'] }[channel] || [];
+    const secrets = { pushover: ['token'], webhook: ['secret', 'url'], slack: ['url'] }[channel] || [];
     for (const key of Object.keys(input)) {
       const value = input[key];
+      if (key === 'url') continue;
       if (secrets.includes(key)) {
         if (value === null || value === '') delete next[`${key}_enc`];
         else if (value !== undefined) next[`${key}_enc`] = ctx.crypto.encrypt(String(value));
@@ -162,6 +182,45 @@ export function createServerContactsService(ctx) {
     if (channel === 'pushover' && !hasSecret(config.token_enc)) fields.config = ['A Pushover application token is required'];
     if (Object.keys(fields).length) throw unprocessable('Contact validation failed', fields);
   }
+
+  // Validates the real address, then splits it into what is stored in the
+  // address column (display form) and, for credential-bearing URLs, the
+  // encrypted secret in config. Submitting the stored display form back
+  // (the edit form does that) keeps the secret already on file.
+  function resolveAddress(channel, address, config, row = null) {
+    const real = String(address).trim();
+    const storedUrl = row && row.channel === channel && hasSecret(json.parse(row.config_json, {}).url_enc) && real === row.address ? decryptConfig(row).url : null;
+    const effective = storedUrl || real;
+    validateContact(channel, effective, config);
+    const { display, secret } = maskAddress(channel, effective);
+    const next = { ...config };
+    if (secret) next.url_enc = ctx.crypto.encrypt(secret); else delete next.url_enc;
+    return { display, config: next };
+  }
+
+  // The real URL a credential-bearing contact posts to.
+  function targetUrl(row, config) {
+    return config.url || row.address;
+  }
+
+  // Rows written before URLs were treated as secrets hold the full URL in
+  // the address column; they are converted the first time the service boots.
+  function migrateSecretAddresses() {
+    const rows = db.prepare("SELECT * FROM contacts WHERE channel IN ('slack', 'webhook')").all();
+    const tx = db.transaction(() => {
+      for (const row of rows) {
+        const raw = json.parse(row.config_json, {});
+        if (hasSecret(raw.url_enc)) continue;
+        let masked;
+        try { masked = maskAddress(row.channel, row.address); } catch { continue; }
+        if (!masked.secret) continue;
+        db.prepare('UPDATE contacts SET address = ?, config_json = ? WHERE id = ?').run(masked.display, JSON.stringify({ ...raw, url_enc: ctx.crypto.encrypt(masked.secret) }), row.id);
+        db.prepare('UPDATE contact_deliveries SET address = ? WHERE contact_id = ? AND address = ?').run(masked.display, row.id, row.address);
+      }
+    });
+    tx();
+  }
+  try { migrateSecretAddresses(); } catch (err) { logger.warn({ err }, 'could not convert stored webhook URLs to encrypted form'); }
 
   function matches(row, { event, severity }) {
     if (!row.enabled) return false;
@@ -259,11 +318,11 @@ export function createServerContactsService(ctx) {
         const payload = { event: msg.event, severity: msg.severity, subject: msg.subject, body: msg.body, data: msg.data, hostname: host, test, sentAt: new Date().toISOString() };
         const headers = { 'X-WHM-Event': msg.event };
         if (config.secret) headers['X-WHM-Signature'] = `sha256=${crypto.createHmac('sha256', config.secret).update(JSON.stringify(payload)).digest('hex')}`;
-        await postJson(row.address, payload, { headers });
+        await postJson(targetUrl(row, config), payload, { headers });
       } else if (row.channel === 'slack') {
         const icon = { info: ':information_source:', warning: ':warning:', error: ':x:', critical: ':rotating_light:' }[msg.severity];
         const text = `${icon} *${msg.subject}*${test ? ' _(test)_' : ''}\n${msg.body.slice(0, 2900)}\n_${host} · ${msg.event}_`;
-        await postJson(row.address, { text, ...(config.channelName ? { channel: config.channelName } : {}) });
+        await postJson(targetUrl(row, config), { text, ...(config.channelName ? { channel: config.channelName } : {}) });
       } else if (row.channel === 'pushover') {
         if (!config.token) throw new HttpError(422, 'validation_failed', 'The Pushover application token is missing');
         const priority = { info: -1, warning: 0, error: 1, critical: 1 }[msg.severity] ?? 0;
@@ -465,23 +524,20 @@ export function createServerContactsService(ctx) {
     get: (id) => shape(load(id)),
 
     create(input, req) {
-      const config = mergeConfig(input.channel, input.config || {});
-      validateContact(input.channel, input.address, config);
+      const { display, config } = resolveAddress(input.channel, input.address, mergeConfig(input.channel, input.config || {}));
       const events = input.events?.length ? [...new Set(input.events)] : ['*'];
-      const { lastInsertRowid } = stmts.insert.run({ name: input.name?.trim() || '', channel: input.channel, address: input.address.trim(), events: JSON.stringify(events), enabled: input.enabled === false ? 0 : 1, config: JSON.stringify(config), min_severity: input.minSeverity || 'info' });
-      audit(req, { action: 'contacts.create', target: input.address, args: { channel: input.channel, name: input.name, events, minSeverity: input.minSeverity || 'info' } });
+      const { lastInsertRowid } = stmts.insert.run({ name: input.name?.trim() || '', channel: input.channel, address: display, events: JSON.stringify(events), enabled: input.enabled === false ? 0 : 1, config: JSON.stringify(config), min_severity: input.minSeverity || 'info' });
+      audit(req, { action: 'contacts.create', target: display, args: { channel: input.channel, name: input.name, events, minSeverity: input.minSeverity || 'info' } });
       return shape(stmts.byId.get(lastInsertRowid));
     },
 
     update(id, patch, req) {
       const row = load(id);
       const channel = patch.channel ?? row.channel;
-      const address = (patch.address ?? row.address).trim();
-      const config = mergeConfig(channel, patch.config || {}, channel === row.channel ? json.parse(row.config_json, {}) : {});
-      validateContact(channel, address, config);
+      const { display, config } = resolveAddress(channel, patch.address ?? row.address, mergeConfig(channel, patch.config || {}, channel === row.channel ? json.parse(row.config_json, {}) : {}), row);
       const events = patch.events !== undefined ? (patch.events.length ? [...new Set(patch.events)] : ['*']) : json.parse(row.events_json, ['*']);
-      stmts.update.run({ id: row.id, name: patch.name !== undefined ? patch.name.trim() : row.name, channel, address, events: JSON.stringify(events), enabled: (patch.enabled ?? Boolean(row.enabled)) ? 1 : 0, config: JSON.stringify(config), min_severity: patch.minSeverity ?? row.min_severity ?? 'info' });
-      audit(req, { action: 'contacts.update', target: address, args: { ...patch, config: patch.config ? Object.keys(patch.config) : undefined } });
+      stmts.update.run({ id: row.id, name: patch.name !== undefined ? patch.name.trim() : row.name, channel, address: display, events: JSON.stringify(events), enabled: (patch.enabled ?? Boolean(row.enabled)) ? 1 : 0, config: JSON.stringify(config), min_severity: patch.minSeverity ?? row.min_severity ?? 'info' });
+      audit(req, { action: 'contacts.update', target: display, args: { ...patch, address: patch.address !== undefined ? display : undefined, config: patch.config ? Object.keys(patch.config) : undefined } });
       return shape(stmts.byId.get(id));
     },
 

@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { validate, z, fields } from '../../lib/validate.js';
 import { requireRoot } from '../../middleware/rbac.js';
+import { unprocessable } from '../../lib/errors.js';
 import { createServerConfigService, PROFILE_NAMES, GENERATORS, UPDATE_TIERS, NODE_ROLES } from '../../services/server-configuration.js';
 
 // Basic Setup, Tweak Settings, Cron Jobs and Change Root Password are served by
@@ -15,6 +16,26 @@ const nodeBase = { name: nodeName, hostname: nodeHost, port: z.number().int().mi
 const nodeCreate = z.object({ ...nodeBase, token: nodeToken, port: nodeBase.port.default(2087), scheme: nodeBase.scheme.default('https'), username: nodeBase.username.default('root'), verifyTls: nodeBase.verifyTls.default(true), roles: nodeBase.roles.default([]), enabled: nodeBase.enabled.default(true) }).strict();
 const nodeUpdate = nonEmpty(z.object({ ...Object.fromEntries(Object.entries(nodeBase).map(([k, v]) => [k, v.optional()])), token: nodeToken.optional() }).strict());
 const terminalId = z.object({ id: z.string().regex(/^[a-f0-9]{32}$/) });
+const terminalInput = z.object({ data: z.string().min(1).max(64 * 1024).regex(/^[^\0]*$/s) }).strict();
+
+// Keystrokes may contain passwords typed at shell prompts. The audit middleware
+// serialises req.body when the request finishes, whatever its outcome, so the
+// raw body is moved aside before any other handler runs and only its size stays.
+function stashTerminalInput(req, _res, next) {
+  const raw = req.body;
+  req.terminalInput = raw;
+  req.body = { bytes: typeof raw?.data === 'string' ? Buffer.byteLength(raw.data) : 0 };
+  next();
+}
+function parseTerminalInput(req) {
+  const result = terminalInput.safeParse(req.terminalInput ?? {});
+  if (!result.success) {
+    const fieldErrors = {};
+    for (const issue of result.error.issues) (fieldErrors[issue.path.join('.') || '_'] ||= []).push(issue.message);
+    throw unprocessable('Request validation failed', fieldErrors);
+  }
+  return result.data.data;
+}
 
 export async function register(ctx) {
   ctx.serverConfig = createServerConfigService(ctx);
@@ -64,7 +85,7 @@ export async function register(ctx) {
   r.get('/terminal', requireRoot, wrap((req) => svc().terminal.list(req.user)));
   r.post('/terminal', requireRoot, validate({ body: z.object({ shell: z.enum(['/bin/bash', '/bin/sh']).default('/bin/bash'), cols: z.number().int().min(20).max(500).default(120), rows: z.number().int().min(5).max(200).default(32) }).strict() }), wrap((req) => svc().terminal.open(req.body, req), 201));
   r.get('/terminal/:id/stream', requireRoot, validate({ params: terminalId }), (req, res, next) => { try { svc().terminal.stream(req.params.id, req, res); } catch (err) { next(err); } });
-  r.post('/terminal/:id/input', requireRoot, validate({ params: terminalId, body: z.object({ data: z.string().min(1).max(64 * 1024).regex(/^[^\0]*$/s) }).strict() }), wrap((req) => svc().terminal.write(req.params.id, req.body.data, req)));
+  r.post('/terminal/:id/input', stashTerminalInput, requireRoot, validate({ params: terminalId }), wrap((req) => svc().terminal.write(req.params.id, parseTerminalInput(req), req)));
   r.delete('/terminal/:id', requireRoot, validate({ params: terminalId }), wrap((req) => svc().terminal.close(req.params.id, req)));
 
   // Update Preferences

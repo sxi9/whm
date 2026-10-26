@@ -72,7 +72,8 @@ export function ResolverConfiguration() {
 
   const list = servers.map((s) => s.trim()).filter(Boolean);
   const errors = useMemo(() => servers.map((s) => (s.trim() && !isIp(s.trim()) ? 'Not a valid IPv4 or IPv6 address' : list.filter((x) => x === s.trim()).length > 1 ? 'Listed twice' : null)), [servers, list]);
-  const searchList = search.split(/[\s,]+/).map((s) => s.trim().toLowerCase()).filter(Boolean);
+  // systemd-resolved's stub lists "search ." (the root domain); it is not a search domain.
+  const searchList = search.split(/[\s,]+/).map((s) => s.trim().toLowerCase()).filter((s) => s && s !== '.');
   const searchError = searchList.some((s) => !DOMAIN.test(s)) ? 'Search domains must be valid domain names' : searchList.length > 6 ? 'At most 6 search domains' : null;
   const valid = list.length > 0 && errors.every((e) => !e) && !searchError;
   const dirty = data && (list.join(',') !== data.nameservers.join(',') || searchList.join(' ') !== data.search.join(' '));
@@ -94,7 +95,7 @@ export function ResolverConfiguration() {
     if (!valid) return;
     let message = `Nameservers: ${list.join(', ')}${searchList.length ? `; search: ${searchList.join(' ')}` : ''}. Every program on this server resolves names through these from now on; a wrong address breaks mail delivery, updates and the panel's own lookups.`;
     if (data.managedBy === 'systemd-resolved' && !takeOver) message += ' The upstream servers of systemd-resolved are changed and the service restarted.';
-    if (data.managedBy === 'systemd-resolved' && takeOver) message += ' systemd-resolved will stop managing /etc/resolv.conf; the file is replaced with a static one.';
+    if (takeOver) message += ` /etc/resolv.conf${data.file?.isSymlink ? ` (currently a symlink to ${data.file.target})` : ''} is replaced with a regular, panel-managed file.`;
     if (!(await confirm({ title: 'Apply resolver configuration?', message, confirmLabel: 'Apply', danger: true }))) return;
     setSaving(true);
     setSaveError(null);
@@ -103,7 +104,7 @@ export function ResolverConfiguration() {
       setSaved(r);
       if (r.test) setTest(r.test);
       if (r.applied === false) toast.warning('Resolvers written but /etc/resolv.conf does not show them yet; another tool may manage the file');
-      else toast.success(r.target === 'resolved' ? `Resolvers applied to systemd-resolved${r.restarted ? ' and the service restarted' : ''}` : 'Resolvers written to /etc/resolv.conf');
+      else toast.success(r.target === 'resolved' ? `Resolvers applied to systemd-resolved${r.restarted ? ' and the service restarted' : ''}` : r.replacedSymlink ? '/etc/resolv.conf symlink replaced with a static file' : 'Resolvers written to /etc/resolv.conf');
       await Promise.all([refetch(), refetchHistory()]);
     } catch (err) { setSaveError(err); toast.error(err); } finally { setSaving(false); }
   };
@@ -124,6 +125,7 @@ export function ResolverConfiguration() {
             ['Managed by', <code key="m">{data.managedBy}</code>],
             ['Panel writes to', <code key="w">{data.writePath}</code>],
             data.resolved?.installed && ['systemd-resolved', <StatusPill key="r" status={data.resolved.active ? 'active' : 'inactive'}>{data.resolved.active ? 'running' : 'stopped'}</StatusPill>],
+            data.file?.isSymlink && ['/etc/resolv.conf is', <span key="f">a symlink to <code>{data.file.target}</code></span>],
             ['DNS Functions lookups use', data.panel.resolvers.length ? data.panel.resolvers.join(', ') : <span key="p" className="muted">system resolvers</span>],
             data.lastChange && ['Last change', <span key="l">{(data.lastChange.before?.nameservers || []).join(', ') || '—'} → {(data.lastChange.after?.nameservers || []).join(', ')} by {data.lastChange.principal || 'system'} on {formatDate(data.lastChange.createdAt)}</span>],
           ]} />
@@ -150,8 +152,8 @@ export function ResolverConfiguration() {
             <TextInput value={search} onChange={setSearch} placeholder="example.com" autoComplete="off" spellCheck={false} />
           </Field>
           <Field inline><Toggle checked={applyToDns} onChange={setApplyToDns} label="Use these resolvers for the panel's DNS checks" description="DNS Functions (nameserver report, hostname check) query these servers instead of the system defaults." /></Field>
-          {data.managedBy === 'systemd-resolved' && (
-            <Field inline><Toggle checked={takeOver} onChange={setTakeOver} label="Replace /etc/resolv.conf with a static file" description="Bypasses the systemd-resolved stub. Only do this if you also disable systemd-resolved; otherwise it regenerates the file." /></Field>
+          {(data.managedBy === 'systemd-resolved' || data.file?.isSymlink) && (
+            <Field inline><Toggle checked={takeOver && data.takeOverAllowed !== false} onChange={setTakeOver} disabled={data.takeOverAllowed === false} label="Replace /etc/resolv.conf with a static file" description={data.takeOverAllowed === false ? 'Not possible while systemd-resolved is running: it regenerates the file. Stop and disable it first (systemctl disable --now systemd-resolved), refresh, then take the file over.' : 'Removes the stub symlink and writes a regular file the panel manages; a copy of the previous contents is kept in /etc/resolv.conf.whm-bak.'} /></Field>
           )}
           <FormActions>
             <Button variant="primary" loading={saving} disabled={!valid} onClick={save}>{dirty ? 'Apply resolvers' : 'Re-apply resolvers'}</Button>
@@ -166,6 +168,7 @@ export function ResolverConfiguration() {
               <div>
                 <strong>Written to <code>{saved.path}</code></strong>
                 {saved.target === 'resolved' && <div>systemd-resolved {saved.restarted ? 'restarted' : 'was not restarted'}.</div>}
+                {saved.replacedSymlink && <div>The symlink was removed; /etc/resolv.conf is now a regular file.</div>}
                 {saved.applied === false && <div>/etc/resolv.conf does not show the new servers yet.</div>}
                 {saved.notes?.map((n) => <div key={n} className="muted">{n}</div>)}
                 {saved.appliedToDns && <div className="muted">DNS Functions now query these resolvers; see the <Link to="/dns-functions/nameserver-record-report">Nameserver Record Report</Link>.</div>}

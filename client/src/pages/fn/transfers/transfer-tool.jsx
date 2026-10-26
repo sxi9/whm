@@ -95,7 +95,7 @@ function AccountsStep({ session, caps, onBack, onStarted }) {
   const accounts = data?.accounts || [];
   const probe = session.probe || {};
   const setOverride = (username, key) => (v) => { setOverrides((o) => ({ ...o, [username]: { ...(o[username] || {}), [key]: v } })); setPreview(null); };
-  const body = () => ({ sessionId: session.id, accounts: selected.map((u) => { const o = overrides[u] || {}; return { source: u, ...(o.username ? { username: o.username.trim() } : {}), ...(o.domain ? { domain: o.domain.trim().toLowerCase() } : {}), ...(o.package ? { package: o.package } : {}) }; }), options });
+  const body = () => ({ sessionId: session.id, accounts: selected.map((u) => { const o = overrides[u] || {}; return { source: u, ...(o.username ? { username: o.username.trim() } : {}), ...(o.domain ? { domain: o.domain.trim().toLowerCase() } : {}), ...(o.package ? { package: o.package } : {}), ...(o.password ? { password: o.password } : {}) }; }), options });
 
   const refresh = async () => { setRefreshing(true); try { await api.get(`/transfers/sessions/${session.id}/accounts?refresh=true`); await refetch(); } finally { setRefreshing(false); } };
   const runPreview = async () => {
@@ -122,7 +122,7 @@ function AccountsStep({ session, caps, onBack, onStarted }) {
         ]} />
       </Card>
       <ToolingNotice caps={caps} needs={options.skipHome ? [] : ['rsync']} />
-      <Card title="Select accounts" subtitle={`${selected.length} of ${accounts.length} selected. Override the local username, domain or package per account when needed.`} padded={false}>
+      <Card title="Select accounts" subtitle={`${selected.length} of ${accounts.length} selected. Override the local username, domain or package per account when needed; passwords are copied from the source's /etc/shadow unless you enter a new one.`} padded={false}>
         <ErrorBanner error={error} onRetry={refetch} />
         <DataTable
           columns={[
@@ -134,6 +134,7 @@ function AccountsStep({ session, caps, onBack, onStarted }) {
             { key: 'new_username', label: 'Local username', render: (a) => <input className="input" style={{ minWidth: 120 }} value={overrides[a.username]?.username ?? ''} placeholder={a.username} onChange={(e) => setOverride(a.username, 'username')(e.target.value)} disabled={!selected.includes(a.username)} /> },
             { key: 'new_domain', label: 'Domain', render: (a) => <input className="input" style={{ minWidth: 150 }} value={overrides[a.username]?.domain ?? ''} placeholder={a.domain || 'required'} onChange={(e) => setOverride(a.username, 'domain')(e.target.value)} disabled={!selected.includes(a.username)} /> },
             { key: 'package', label: 'Package', render: (a) => <PackageSelect value={overrides[a.username]?.package ?? ''} onChange={setOverride(a.username, 'package')} placeholder="default" /> },
+            { key: 'password', label: 'Password', render: (a) => <input className="input" type="password" autoComplete="new-password" style={{ minWidth: 130 }} value={overrides[a.username]?.password ?? ''} placeholder="keep source hash" title="Leave empty to copy the password hash from the source (needs root there)" onChange={(e) => setOverride(a.username, 'password')(e.target.value)} disabled={!selected.includes(a.username)} /> },
           ]}
           rows={accounts} loading={loading} rowKey={(a) => a.username} selectable selected={selected} onSelectedChange={(s) => { setSelected(s); setPreview(null); }} dense
           toolbar={<><Button size="sm" onClick={() => setSelected(accounts.filter((a) => !a.localExists).map((a) => a.username))}>Select all new</Button><Button size="sm" variant="ghost" onClick={() => setSelected([])}>Clear</Button></>}

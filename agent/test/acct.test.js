@@ -40,7 +40,7 @@ afterAll(() => {
 
 describe('acct op catalog', () => {
   it('registers the family and rejects unknown ops', async () => {
-    for (const name of ['acct.set_home', 'acct.read_range']) expect(catalog.has(name), name).toBe(true);
+    for (const name of ['acct.set_home', 'acct.read_range', 'acct.list_logs', 'acct.archive_logs']) expect(catalog.has(name), name).toBe(true);
     expect((await opError(runOp('acct.delete', { username: 'bob' }, ctx))).code).toBe('unknown_op');
     expect((await opError(runOp('acct.read', { path: '/home/bob/logs/a.log' }, ctx))).code).toBe('unknown_op');
   });
@@ -102,5 +102,63 @@ describe('acct.read_range', () => {
     expect((await opError(runOp('acct.read_range', { path: `${root}/dir.log` }, ctx))).code).toBe('refused');
     fs.symlinkSync('/etc/hostname', `${root}/link.log`);
     expect((await opError(runOp('acct.read_range', { path: `${root}/link.log` }, ctx))).code).toBe('refused');
+  });
+
+  // A tenant who replaces ~/logs with a link cannot have root read through it:
+  // the lexical path is inside the allowed root, the real one is wherever the
+  // link points, and only the real one counts.
+  it('refuses a path whose directory component is a symlink, even inside an allowed root', async () => {
+    fs.mkdirSync(`${root}/real`, { recursive: true });
+    fs.writeFileSync(`${root}/real/other.com-access.log`, 'secret');
+    fs.symlinkSync(`${root}/real`, `${root}/logs`);
+    const err = await opError(runOp('acct.read_range', { path: `${root}/logs/other.com-access.log` }, ctx));
+    expect(err.code).toBe('refused');
+    expect(err.message).toMatch(/symbolic link/);
+    expect((await runOp('acct.read_range', { path: `${root}/real/other.com-access.log` }, ctx)).size).toBe(6);
+    expect((await opError(runOp('acct.read_range', { path: `${root}/real/other.com-access.log`, owner: 'root' }, ctx))).code).toBe('refused');
+    expect((await opError(runOp('acct.read_range', { path: `${root}/real/other.com-access.log`, owner: '-r' }, ctx))).code).toBe('invalid_args');
+  });
+});
+
+describe('acct.list_logs', () => {
+  it('lists only regular log files and refuses symlinked directories or foreign owners', async () => {
+    const dir = `${root}/list`;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(`${dir}/a.com-access.log`, 'x');
+    fs.writeFileSync(`${dir}/a.com-error.log.1`, 'xx');
+    fs.writeFileSync(`${dir}/notes.txt`, 'x');
+    fs.mkdirSync(`${dir}/sub.log`);
+    fs.symlinkSync('/etc/hostname', `${dir}/link.log`);
+    const r = await runOp('acct.list_logs', { path: dir }, ctx);
+    expect(r.entries.map((e) => e.name).sort()).toEqual(['a.com-access.log', 'a.com-error.log.1']);
+    expect(r.entries.find((e) => e.name === 'a.com-error.log.1')).toMatchObject({ size: 2, uid: process.getuid() });
+    expect(r.skipped.map((e) => e.name).sort()).toEqual(['link.log', 'sub.log']);
+    fs.symlinkSync(dir, `${root}/list-link`);
+    expect((await opError(runOp('acct.list_logs', { path: `${root}/list-link` }, ctx))).code).toBe('refused');
+    expect((await opError(runOp('acct.list_logs', { path: `${root}/list/a.com-access.log` }, ctx))).code).toBe('refused');
+    expect((await opError(runOp('acct.list_logs', { path: `${root}/missing` }, ctx))).code).toBe('not_found');
+    expect((await opError(runOp('acct.list_logs', { path: '/etc' }, ctx))).code).toBe('path_not_allowed');
+    for (const owner of ['-r', 'a;b', '../x', 'root;x']) expect((await opError(runOp('acct.list_logs', { path: dir, owner }, ctx))).code, owner).toBe('invalid_args');
+    for (const path of ['relative', `${root}/../x`, '']) expect((await opError(runOp('acct.list_logs', { path }, ctx))).code, path).toBe('invalid_args');
+    expect((await opError(runOp('acct.list_logs', { path: dir, owner: 'root' }, ctx))).code).toBe('refused');
+    expect((await opError(runOp('acct.list_logs', { path: dir, owner: `nouser${crypto.randomBytes(3).toString('hex')}` }, ctx))).code).toBe('not_found');
+  });
+});
+
+describe('acct.archive_logs never runs for an unmanaged user or bad input', () => {
+  it('rejects injection-shaped arguments and refuses system or unknown users before runuser/rsync', async () => {
+    exec.mockClear();
+    const good = { username: 'bob', source: '/var/log/whm/domlogs/bob', archiveDir: '/home/bob/logs/archive', label: '2026-09', retainMonths: 3 };
+    for (const username of ['-r', 'a;b', '../x', 'Bob', '', '$(id)']) expect((await opError(runOp('acct.archive_logs', { ...good, username }, ctx))).code, username).toBe('invalid_args');
+    for (const label of ['2026-13', '2026-9', '../x', '2026-09;rm', 'latest', '']) expect((await opError(runOp('acct.archive_logs', { ...good, label }, ctx))).code, label).toBe('invalid_args');
+    for (const source of ['relative', '/var/log/whm/domlogs/../../etc', '']) expect((await opError(runOp('acct.archive_logs', { ...good, source }, ctx))).code, source).toBe('invalid_args');
+    for (const archiveDir of ['home/bob/logs', '/home/bob/../root', '-rf']) expect((await opError(runOp('acct.archive_logs', { ...good, archiveDir }, ctx))).code, archiveDir).toBe('invalid_args');
+    expect((await opError(runOp('acct.archive_logs', { ...good, retainMonths: 0 }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('acct.archive_logs', { ...good, extra: true }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('acct.archive_logs', { ...good, username: 'root' }, ctx))).code).toBe('refused');
+    expect((await opError(runOp('acct.archive_logs', { ...good, username: 'www-data' }, ctx))).code).toBe('refused');
+    const ghost = `nouser${crypto.randomBytes(3).toString('hex')}`;
+    expect((await opError(runOp('acct.archive_logs', { ...good, username: ghost }, ctx))).code).toBe('not_found');
+    expect(exec).not.toHaveBeenCalled();
   });
 });

@@ -21,15 +21,15 @@ export default function ServerProfile({ fn }) {
   const def = data?.profiles.find((p) => p.name === selected);
 
   const apply = async () => {
-    const ok = await confirm({ title: `Switch to ${def.label}?`, message: `Service monitoring follows the profile (${def.monitoredServices.join(', ')}) and ${def.hiddenCategories.length ? `${def.hiddenCategories.length} categories are hidden from the sidebar` : 'every category is shown'}. No daemon is stopped or uninstalled.`, confirmLabel: 'Apply profile' });
+    const ok = await confirm({ title: `Switch to ${def.label}?`, message: `Service monitoring follows the profile (${def.monitoredServices.join(', ')}). ${def.hiddenCategories.length ? `${def.hiddenCategories.length} categories are reported as hidden for linked nodes and integrations; the sidebar keeps showing every category until the shell consumes that list.` : 'Every category stays available.'} No daemon is stopped or uninstalled.`, confirmLabel: 'Apply profile' });
     if (!ok) return;
     setBusy(true);
-    try { const { data: d } = await api.put('/server-config/profile', { name: selected }); setResult(d); setChoice(null); toast.success(`Profile set to ${def.label}; reload the page for the sidebar to follow`); refetch(); } catch (err) { toast.error(err); } finally { setBusy(false); }
+    try { const { data: d } = await api.put('/server-config/profile', { name: selected }); setResult(d); setChoice(null); toast.success(`Profile set to ${def.label}; service monitoring updated`); refetch(); } catch (err) { toast.error(err); } finally { setBusy(false); }
   };
 
   return (
     <>
-      <PageHeader fn={fn} description="A profile declares which roles this server fulfils. It drives which services are monitored, which categories the interface shows and what linked nodes expect from it. It never installs or removes software." />
+      <PageHeader fn={fn} description="A profile declares which roles this server fulfils. It drives which services are monitored and what linked nodes and integrations expect from it, and it publishes the list of categories that do not apply to this role. It never installs or removes software." />
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
       {data && def && (
@@ -47,8 +47,8 @@ export default function ServerProfile({ fn }) {
                 {data.services.map((s) => { const will = def.monitoredServices.includes(s.name); return <tr key={s.name}><td>{s.displayName}<br /><small className="muted"><code>{s.name}</code></small></td><td><StatusPill status={will ? 'enabled' : 'disabled'}>{will ? 'monitored' : 'not monitored'}</StatusPill>{will !== s.monitored && <small className="muted"> (now: {s.monitored ? 'monitored' : 'off'})</small>}</td></tr>; })}
               </tbody></table></div>
             </Card>
-            <Card title="Hidden categories" subtitle="Reported in GET /api/system/status as profile.hiddenCategories">
-              {def.hiddenCategories.length === 0 ? <p className="muted">Every category is shown in this profile.</p> : <ul>{def.hiddenCategories.map((slug) => <li key={slug}>{labelFor(slug)} <small className="muted"><code>{slug}</code></small></li>)}</ul>}
+            <Card title="Categories not applicable to this role" subtitle="Published in GET /api/system/status as profile.hiddenCategories; the sidebar and these categories' APIs stay available until the panel shell applies the list">
+              {def.hiddenCategories.length === 0 ? <p className="muted">Every category applies to this profile.</p> : <ul>{def.hiddenCategories.map((slug) => <li key={slug}>{labelFor(slug)} <small className="muted"><code>{slug}</code></small></li>)}</ul>}
             </Card>
           </div>
           {result && (

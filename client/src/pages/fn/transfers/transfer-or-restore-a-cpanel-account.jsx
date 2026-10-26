@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api } from '../../../api/client.js';
+import { api, ApiError } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, CapabilityNotice, KeyValue, formatDate, formatBytes } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
@@ -15,15 +15,42 @@ const OPTION_FIELDS = [
   { key: 'skipDns', label: 'Skip DNS zones', description: 'Create standard zones instead of the archived zone files' },
   { key: 'overwrite', label: 'Restore into an existing account', description: 'Merge the archive into a local account with the same username' },
 ];
-const CHUNK = 1024 * 1024;
+const RETRY_STATUS = new Set([429, 500, 502, 503, 504]);
+const MAX_ATTEMPTS = 10;
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
-function readChunk(file, offset) {
+function readChunk(file, offset, size) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result).split(',')[1] || '');
     reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file.slice(offset, offset + CHUNK));
+    reader.readAsDataURL(file.slice(offset, offset + size));
   });
+}
+
+// One chunk, retried with backoff on rate limiting (429 + Retry-After), gateway
+// errors and lost connections. After a failure the server is asked how many
+// bytes really arrived so the upload resumes from there instead of aborting or
+// appending the same chunk twice.
+async function sendChunk(id, data, onWait) {
+  for (let attempt = 0; ; attempt++) {
+    let res;
+    try {
+      res = await api.request('PUT', `/transfers/uploads/${id}/chunks`, { data }, { raw: true });
+    } catch (err) {
+      if (attempt >= MAX_ATTEMPTS) throw err;
+      res = null;
+    }
+    if (res?.ok) return (await res.json()).data;
+    if (res && !RETRY_STATUS.has(res.status)) throw new ApiError(res.status, await res.json().catch(() => null));
+    if (res && attempt >= MAX_ATTEMPTS) throw new ApiError(res.status, await res.json().catch(() => null));
+    const retryAfter = Number(res?.headers.get('Retry-After')) || 0;
+    const wait = retryAfter ? retryAfter * 1000 : Math.min(30_000, 1000 * 2 ** attempt) + Math.random() * 500;
+    onWait?.(wait, res?.status ?? 'network');
+    await sleep(wait);
+    const { data: status } = await api.get(`/transfers/uploads/${id}`);
+    return { ...status, resumed: true };
+  }
 }
 
 function Uploader({ onInspected }) {
@@ -32,14 +59,18 @@ function Uploader({ onInspected }) {
   const [error, setError] = useState(null);
   const upload = async (file) => {
     if (!file) return;
-    setError(null); setProgress({ sent: 0, total: file.size, name: file.name });
+    setError(null); setProgress({ sent: 0, total: file.size, name: file.name, note: null });
     let id = null;
     try {
-      ({ data: { id } } = await api.post('/transfers/uploads', { filename: file.name, size: file.size }));
-      for (let offset = 0; offset < file.size; offset += CHUNK) {
-        const data = await readChunk(file, offset);
-        await api.put(`/transfers/uploads/${id}/chunks`, { data });
-        setProgress({ sent: Math.min(file.size, offset + CHUNK), total: file.size, name: file.name });
+      const { data: begun } = await api.post('/transfers/uploads', { filename: file.name, size: file.size });
+      id = begun.id;
+      const chunkBytes = begun.chunkBytes || 1_048_576;
+      let offset = 0;
+      while (offset < file.size) {
+        const data = await readChunk(file, offset, chunkBytes);
+        const status = await sendChunk(id, data, (wait, why) => setProgress((p) => ({ ...p, note: `${why === 429 ? 'rate limited' : `retrying (${why})`}, waiting ${Math.ceil(wait / 1000)} s` })));
+        offset = status.received;
+        setProgress({ sent: Math.min(file.size, offset), total: file.size, name: file.name, note: status.resumed ? 'resumed' : null });
       }
       const { data } = await api.post(`/transfers/uploads/${id}/finish`);
       onInspected(data.archive);
@@ -50,14 +81,14 @@ function Uploader({ onInspected }) {
   };
   const pct = progress ? Math.round((progress.sent / progress.total) * 100) : 0;
   return (
-    <Card title="Upload an archive" subtitle="cpmove-<user>.tar.gz or a full cPanel backup; sent in 1 MB chunks into the staging directory.">
+    <Card title="Upload an archive" subtitle="cpmove-<user>.tar.gz or a full cPanel backup; sent in chunks into the staging directory and resumed automatically after a hiccup.">
       <CapabilityNotice error={error} />
       {error && error.status !== 501 && <ErrorBanner error={error} />}
       <input ref={inputRef} type="file" accept=".tar.gz,.tgz,.tar,application/gzip,application/x-tar" className="input" onChange={(e) => upload(e.target.files?.[0])} disabled={Boolean(progress)} />
       {progress && (
         <div className="progress-head" style={{ marginTop: 10 }}>
           <div className="progress-bar"><span style={{ width: `${pct}%` }} /></div>
-          <span className="muted">{pct}% · {formatBytes(progress.sent)} of {formatBytes(progress.total)} · {progress.name}</span>
+          <span className="muted">{pct}% · {formatBytes(progress.sent)} of {formatBytes(progress.total)} · {progress.name}{progress.note ? ` · ${progress.note}` : ''}</span>
         </div>
       )}
     </Card>
@@ -105,7 +136,7 @@ function PickArchive({ caps, onInspected }) {
 function RestoreForm({ archive, onBack, onStarted }) {
   const confirm = useConfirm();
   const toast = useToast();
-  const [form, setForm] = useState({ username: '', domain: '', package: '' });
+  const [form, setForm] = useState({ username: '', domain: '', package: '', password: '' });
   const [options, setOptions] = useState({ skipHome: false, skipDatabases: false, skipDns: false, overwrite: false });
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -116,7 +147,7 @@ function RestoreForm({ archive, onBack, onStarted }) {
     if (!ok) return;
     setBusy(true); setError(null);
     try {
-      const body = { path: archive.path, options, ...(form.username.trim() ? { username: form.username.trim() } : {}), ...(form.domain.trim() ? { domain: form.domain.trim().toLowerCase() } : {}), ...(form.package ? { package: form.package } : {}) };
+      const body = { path: archive.path, options, ...(form.username.trim() ? { username: form.username.trim() } : {}), ...(form.domain.trim() ? { domain: form.domain.trim().toLowerCase() } : {}), ...(form.package ? { package: form.package } : {}), ...(form.password ? { password: form.password } : {}) };
       const { data } = await api.post('/transfers/restore', body);
       toast.success(`Restoring ${username}`);
       onStarted(data);
@@ -131,6 +162,7 @@ function RestoreForm({ archive, onBack, onStarted }) {
           ['Package on source', archive.config?.plan || '—'],
           ['Contact', archive.config?.contactEmail || '—'],
           ['Home directory', archive.hasHomedir ? 'present' : 'missing'],
+          ['Password', archive.hasShadow ? 'hash saved in the archive (kept unless you set a new one)' : 'not in the archive: set one below or afterwards under Password Modification'],
           ['Databases', archive.databases.length ? archive.databases.join(', ') : 'none'],
           ['Database users', archive.hasGrants ? 'grants saved' : 'none'],
           ['DNS zones', archive.zones.length ? archive.zones.join(', ') : 'none'],
@@ -144,6 +176,7 @@ function RestoreForm({ archive, onBack, onStarted }) {
           <Field label="Username" help={`Leave empty to keep ${archive.username || 'the archived name'}`} error={error?.fields?.username}><TextInput value={form.username} onChange={(v) => setForm((f) => ({ ...f, username: v }))} placeholder={archive.username || ''} /></Field>
           <Field label="Main domain" help={archive.config?.domain ? `Defaults to ${archive.config.domain}` : 'Required: the archive has no domain'} error={error?.fields?.domain}><TextInput value={form.domain} onChange={(v) => setForm((f) => ({ ...f, domain: v }))} placeholder={archive.config?.domain || 'example.com'} /></Field>
           <Field label="Package" help={archive.config?.plan ? `Source used "${archive.config.plan}"` : undefined}><PackageSelect value={form.package} onChange={(v) => setForm((f) => ({ ...f, package: v }))} /></Field>
+          <Field label="New password" help={archive.hasShadow ? 'Leave empty to keep the password saved in the archive' : 'At least 8 characters; without it the account cannot log in until one is set'} error={error?.fields?.password}><TextInput type="password" value={form.password} onChange={(v) => setForm((f) => ({ ...f, password: v }))} autoComplete="new-password" /></Field>
         </div>
         <Options value={options} onChange={setOptions} fields={OPTION_FIELDS} />
         <FormActions><Button variant="primary" onClick={start} loading={busy} disabled={!username || !domain}>Restore account</Button></FormActions>

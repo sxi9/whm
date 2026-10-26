@@ -9,6 +9,7 @@ import { isRoot } from '../middleware/rbac.js';
 //   accountFunctions.setBandwidthLimit / resetBandwidth / unsuspendExceeders
 //   accountFunctions.setShell / setQuota / setDemoMode / forcePasswordChange
 //   accountFunctions.logRetention.get(username) / logs.list(username, kind, user)
+//   accountFunctions.mountpointFor(dir)                -> the filesystem a quota for files under dir must be set on
 // Accounts themselves (create/suspend/modify/terminate) stay on ctx.accounts.
 
 export const DOMLOGS_ROOT = '/var/log/whm/domlogs';
@@ -23,7 +24,7 @@ export const TEMPLATE_VARS = ['domain', 'username', 'hostname', 'contact_email',
 // TEMPLATE_DIR for the web server configuration to reference once it does.
 export const TEMPLATE_USAGE = {
   index: { served: true, by: 'account creation: rendered into public_html/index.html of every new account' },
-  suspended: { served: false, by: 'not yet served: Service Configuration does not point suspended accounts at this page; it is only written to the template directory' },
+  suspended: { served: false, by: 'not yet served: account suspension calls ctx.web.setSuspended(username, true, req) when Service Configuration provides it; until then the page is only written to the template directory and the Linux account lock is what stops logins' },
   moved: { served: false, by: 'not yet served: no virtual host references this page yet; it is only written to the template directory' },
   'error-4xx': { served: false, by: 'not yet served: the virtual host renderer does not set ErrorDocument to this page yet; it is only written to the template directory' },
 };
@@ -107,6 +108,11 @@ export function createAccountFunctionsService(ctx) {
     return row;
   }
   const visibleAccounts = (user) => (isRoot(user) ? stmts.all.all() : stmts.byOwner.all(user.id));
+  // Resellers act within their delegated ACLs (Reseller Center); without the
+  // resellers category no ACLs exist and ownership alone applies, as in accounts.js.
+  const requireAcl = (user, key) => { if (!isRoot(user)) ctx.resellers?.assertAcl?.(user, key); };
+  const explicitAcl = (user, key) => !isRoot(user) && Boolean(ctx.resellers?.aclsFor?.(user.id)?.has(key));
+  const quotaArgs = (username, mb, filesystem) => ({ username, softMb: mb || 0, hardMb: mb ? Math.round(mb * 1.05) : 0, filesystem });
   // Bulk actions take explicit usernames or "all"; unknown or foreign accounts are reported, never silently skipped.
   function selectAccounts({ usernames, all }, user) {
     if (all) return { accounts: visibleAccounts(user), missing: [] };
@@ -285,27 +291,32 @@ export function createAccountFunctionsService(ctx) {
 
   // ---------------------------------------------------------- bulk flags ---
 
-  function bulkFlag({ usernames, all, enabled }, user, req, { stmt, action, column }) {
+  function bulkFlag({ usernames, all, enabled }, user, req, { stmt, action, column, acl }) {
+    requireAcl(user, acl);
     const { accounts, missing } = selectAccounts({ usernames, all }, user);
     const changed = [];
     db.transaction(() => { for (const a of accounts) { if (Boolean(a[column]) !== enabled) { stmt.run(enabled ? 1 : 0, a.id); changed.push(a.username); } } })();
     audit(req, { action, target: all ? 'all' : accounts.map((a) => a.username).join(','), args: { enabled, changed: changed.length } });
     return { enabled, changed, unchanged: accounts.map((a) => a.username).filter((u) => !changed.includes(u)), missing };
   }
-  const forcePasswordChange = (input, user, req) => bulkFlag(input, user, req, { stmt: stmts.setForce, action: 'account.force_password_change', column: 'force_password_change' });
-  const setDemoMode = (input, user, req) => bulkFlag(input, user, req, { stmt: stmts.setDemo, action: 'account.demo_mode', column: 'demo_mode' });
+  const forcePasswordChange = (input, user, req) => bulkFlag(input, user, req, { stmt: stmts.setForce, action: 'account.force_password_change', column: 'force_password_change', acl: 'passwd' });
+  const setDemoMode = (input, user, req) => bulkFlag(input, user, req, { stmt: stmts.setDemo, action: 'account.demo_mode', column: 'demo_mode', acl: 'demo-setup' });
 
   // ------------------------------------------------------------ bandwidth ---
 
   function setBandwidthLimit(username, { limitMb }, user, req) {
     const account = load(username, user);
+    requireAcl(user, 'limit-bandwidth');
     if (limitMb == null && settings.get('tweak.prevent_unlimited_bandwidth', false)) throw unprocessable('Unlimited bandwidth is disabled in Tweak Settings', { limitMb: ['Enter a limit in MB'] });
+    // The reseller's own bandwidth allocation (and the unlimited-bandwidth ACL) still bind.
+    if (!isRoot(user)) ctx.resellers?.modifyPolicy?.(user, account, { bandwidthLimitMb: limitMb });
     stmts.setBandwidthLimit.run(limitMb, account.id);
     audit(req, { action: 'account.bandwidth.limit', target: username, args: { from: account.bandwidth_limit_mb, to: limitMb } });
     return summary(stmts.byUsername.get(username));
   }
 
   async function resetBandwidth({ usernames, all, unsuspend = true }, user, req) {
+    requireAcl(user, 'limit-bandwidth');
     const { accounts, missing } = selectAccounts({ usernames, all }, user);
     const reset = [];
     const unsuspended = [];
@@ -327,6 +338,7 @@ export function createAccountFunctionsService(ctx) {
   }
 
   async function unsuspendExceeders({ usernames, all = false, resetCounters = false }, user, req) {
+    requireAcl(user, 'limit-bandwidth');
     const candidates = exceeders(user).filter((a) => a.suspended_for_bandwidth);
     const wanted = all ? candidates : candidates.filter((a) => (usernames || []).includes(a.username));
     const unsuspended = [];
@@ -347,11 +359,18 @@ export function createAccountFunctionsService(ctx) {
     const reason = settings.get('account_functions.bandwidth_suspend_reason', 'bandwidth: monthly transfer limit exceeded');
     const root = { id: null, username: 'scheduler', role: 'root' };
     const suspended = [];
+    const failed = [];
     for (const a of stmts.all.all()) {
       if (a.suspended || !a.bandwidth_limit_mb || a.bandwidth_used_mb < a.bandwidth_limit_mb) continue;
-      try { await ctx.accounts.suspend(a.username, reason, root, null); suspended.push(a.username); jobCtx.log(`${a.username}: suspended (${a.bandwidth_used_mb} MB of ${a.bandwidth_limit_mb} MB)`); } catch (err) { jobCtx.log(`${a.username}: ${err.message}`, 'warn'); }
+      try {
+        // accounts.suspend writes the per-account account.suspend audit row itself (principal-less, by: scheduler).
+        const r = await ctx.accounts.suspend(a.username, reason, root, null);
+        suspended.push(a.username);
+        jobCtx.log(`${a.username}: suspended (${a.bandwidth_used_mb} MB of ${a.bandwidth_limit_mb} MB)${r.web?.applied ? '; web sites switched to the suspended page' : r.web?.reason ? `; web: ${r.web.reason}` : ''}`);
+      } catch (err) { failed.push({ username: a.username, error: err.message }); jobCtx.log(`${a.username}: ${err.message}`, 'warn'); }
     }
-    return { suspended, enabled: true };
+    ctx.auditRecord?.(null, { action: 'account.bandwidth.enforce', target: suspended.join(',') || 'none', args: { job: jobCtx.job?.id ?? null, reason, suspended, failed: failed.length, by: 'scheduler' } });
+    return { suspended, failed, enabled: true };
   }
 
   async function runMonthlyBandwidthReset(jobCtx) {
@@ -365,6 +384,10 @@ export function createAccountFunctionsService(ctx) {
 
   async function setShell(username, { shell }, user, req) {
     const account = load(username, user);
+    if (shell !== '/usr/sbin/nologin') {
+      requireAcl(user, 'add-pkg-shell');
+      if (explicitAcl(user, 'disallow-shell')) throw forbidden('Your reseller privileges forbid granting shell access (Disallow Shell Access); only /usr/sbin/nologin can be set');
+    }
     if (shell === '/usr/local/bin/jailshell') {
       const bins = await op('sys.binaries', { names: ['jailshell'] });
       if (!bins.jailshell) throw new CapabilityError('jailshell', 'The jailed shell (/usr/local/bin/jailshell) is not installed on this server. Install a jailshell/CageFS-style wrapper or choose a normal shell.');
@@ -379,7 +402,9 @@ export function createAccountFunctionsService(ctx) {
 
   async function setQuota(username, { diskQuotaMb }, user, req) {
     const account = load(username, user);
-    const soft = diskQuotaMb ?? 0;
+    requireAcl(user, 'quota');
+    // The reseller's disk allocation (and the unlimited-disk ACL) still bind.
+    if (!isRoot(user)) ctx.resellers?.modifyPolicy?.(user, account, { diskQuotaMb });
     const filesystem = await mountpointFor(homeOf(account));
     let applied = false;
     if (account.uid != null) {
@@ -388,7 +413,7 @@ export function createAccountFunctionsService(ctx) {
         audit(req, { action: 'account.quota', target: username, args: { from: account.disk_quota_mb, to: diskQuotaMb, applied: false } });
         throw new CapabilityError('quota', `Disk quotas are not installed on this server; ${username}'s quota of ${diskQuotaMb == null ? 'unlimited' : `${diskQuotaMb} MB`} is saved and is applied once the quota tools exist (see Initial Quota Setup).`);
       }
-      await op('user.set_quota', { username, softMb: soft, hardMb: soft ? Math.round(soft * 1.05) : 0, filesystem }, req);
+      await op('user.set_quota', quotaArgs(username, diskQuotaMb, filesystem), req);
       applied = true;
     }
     stmts.setQuota.run(diskQuotaMb, account.id);
@@ -414,9 +439,17 @@ export function createAccountFunctionsService(ctx) {
 
   // ------------------------------------------------------------- raw logs ---
 
-  async function listDir(dir) {
-    try { return (await op('fs.list', { path: dir, limit: 5000 })).entries.filter((e) => e.type === 'file' && LOG_FILE.test(e.name)).map((e) => ({ dir, name: e.name, path: `${dir}/${e.name}`, size: e.size, mtime: e.mtime })); } catch (err) {
-      if (['op_failed', 'not_found', 'path_not_allowed'].includes(err.code)) return [];
+  // The agent lists only regular files reached without a symlink; a directory
+  // under the account home must also belong to the account (or root), so a
+  // tenant cannot point ~/logs at another tenant's logs or at /var/log. A
+  // refusal is reported with the listing rather than hidden.
+  async function listDir(dir, owner) {
+    try {
+      const r = await op('acct.list_logs', { path: dir, limit: 5000, ...(owner ? { owner } : {}) });
+      return { files: r.entries.filter((e) => LOG_FILE.test(e.name)).map((e) => ({ dir, name: e.name, path: `${dir}/${e.name}`, size: e.size, mtime: e.mtime, owner: owner || null })), warning: null };
+    } catch (err) {
+      if (err.code === 'refused') return { files: [], warning: `${dir} was skipped: ${err.message}` };
+      if (['op_failed', 'not_found', 'path_not_allowed'].includes(err.code)) return { files: [], warning: null };
       throw err;
     }
   }
@@ -426,14 +459,17 @@ export function createAccountFunctionsService(ctx) {
       const account = load(username, user);
       const domains = [account.domain, ...stmts.domains.all(account.id).map((d) => d.domain)];
       const home = homeOf(account);
-      let files;
+      const owner = account.uid != null ? username : undefined;
+      let server;
       if (kind === 'nginx') {
         if (!capabilities.has('nginx')) throw new CapabilityError('nginx', 'NGINX is not installed on this server, so there are no NGINX logs to download.');
-        files = [...(await listDir(NGINX_LOG_DIR)).filter((f) => domains.some((d) => domainLogFile(d).test(f.name))), ...(await listDir(`${home}/logs`)).filter((f) => /nginx/i.test(f.name))];
-      } else {
-        files = [...(await listDir(`${DOMLOGS_ROOT}/${username}`)), ...(await listDir(`${home}/logs`)).filter((f) => !/nginx/i.test(f.name))];
-      }
-      return { username, kind, domains, dirs: kind === 'nginx' ? [NGINX_LOG_DIR, `${home}/logs`] : [`${DOMLOGS_ROOT}/${username}`, `${home}/logs`], files: files.sort((a, b) => a.name.localeCompare(b.name)), apache: capabilities.has('apache'), nginx: capabilities.has('nginx') };
+        server = await listDir(NGINX_LOG_DIR);
+        server.files = server.files.filter((f) => domains.some((d) => domainLogFile(d).test(f.name)));
+      } else server = await listDir(`${DOMLOGS_ROOT}/${username}`);
+      const own = await listDir(`${home}/logs`, owner);
+      own.files = own.files.filter((f) => (kind === 'nginx') === /nginx/i.test(f.name));
+      const files = [...server.files, ...own.files];
+      return { username, kind, domains, dirs: kind === 'nginx' ? [NGINX_LOG_DIR, `${home}/logs`] : [`${DOMLOGS_ROOT}/${username}`, `${home}/logs`], files: files.sort((a, b) => a.name.localeCompare(b.name)), warnings: [server.warning, own.warning].filter(Boolean), apache: capabilities.has('apache'), nginx: capabilities.has('nginx') };
     },
     // Streams the file through the agent in 1 MB ranges so a multi-gigabyte log
     // never has to fit in memory on either side of the socket.
@@ -442,7 +478,8 @@ export function createAccountFunctionsService(ctx) {
       const entry = listing.files.find((f) => f.name === file);
       if (!entry) throw notFound(`Log file "${file}"`);
       const chunk = 1024 * 1024;
-      const first = await op('acct.read_range', { path: entry.path, offset: 0, length: chunk }, req);
+      const range = (offset, length) => op('acct.read_range', { path: entry.path, offset, length, ...(entry.owner ? { owner: entry.owner } : {}) }, req);
+      const first = await range(0, chunk);
       res.status(200);
       res.set({ 'Content-Type': file.endsWith('.gz') ? 'application/gzip' : 'text/plain; charset=utf-8', 'Content-Disposition': `attachment; filename="${username}-${file.replace(/[^A-Za-z0-9._-]/g, '_')}"`, 'Content-Length': String(first.size), 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
       audit(req, { action: 'account.log.download', target: username, args: { kind, file, bytes: first.size } });
@@ -451,7 +488,7 @@ export function createAccountFunctionsService(ctx) {
       for (;;) {
         if (part.length) { sent += part.length; if (!res.write(Buffer.from(part.data, 'base64'))) await new Promise((r) => res.once('drain', r)); }
         if (part.eof || sent >= first.size || res.destroyed) break;
-        part = await op('acct.read_range', { path: entry.path, offset: sent, length: Math.min(chunk, first.size - sent) }, req);
+        part = await range(sent, Math.min(chunk, first.size - sent));
       }
       res.end();
       return { bytes: sent };
@@ -502,7 +539,25 @@ export function createAccountFunctionsService(ctx) {
       jobCtx.progress(60, 'copy complete; syncing changes made during the copy');
       await op('fs.copy_tree', { from, to, deleteExtraneous: true });
       jobCtx.progress(75, 'updating the system user');
-      if (account.uid != null) { await op('acct.set_home', { username, homeDir: to }); jobCtx.log(`usermod -d ${to} ${username}`); } else jobCtx.log('No Linux user for this account; only the panel records are updated', 'warn');
+      let quota = null;
+      if (account.uid != null) {
+        await op('acct.set_home', { username, homeDir: to });
+        jobCtx.log(`usermod -d ${to} ${username}`);
+        // Quotas are per filesystem: the limit stays on the old one and means
+        // nothing on the new partition until it is set there again.
+        if (account.disk_quota_mb && capabilities.has('quota')) {
+          const [fromFs, toFs] = [await mountpointFor(from), await mountpointFor(to)];
+          try {
+            if (fromFs !== toFs) { await op('user.set_quota', quotaArgs(username, 0, fromFs)); jobCtx.log(`Cleared the quota on ${fromFs}`); }
+            await op('user.set_quota', quotaArgs(username, account.disk_quota_mb, toFs));
+            quota = { applied: true, filesystem: toFs, mb: account.disk_quota_mb };
+            jobCtx.log(`Re-applied the ${account.disk_quota_mb} MB quota on ${toFs}`);
+          } catch (err) {
+            quota = { applied: false, filesystem: toFs, mb: account.disk_quota_mb, error: err.message };
+            jobCtx.log(`The ${account.disk_quota_mb} MB quota could not be applied on ${toFs}: ${err.message}; set it again in Quota Modification`, 'warn');
+          }
+        } else if (account.disk_quota_mb) { quota = { applied: false, mb: account.disk_quota_mb, error: 'quota tools are not installed' }; jobCtx.log('Disk quotas are not installed; the saved quota is applied once they are', 'warn'); }
+      } else jobCtx.log('No Linux user for this account; only the panel records are updated', 'warn');
       db.transaction(() => {
         stmts.setHome.run(to, account.id);
         for (const d of stmts.docrootsOf.all(account.id)) if (d.docroot && d.docroot.startsWith(`${from}/`)) stmts.setDocroot.run(`${to}${d.docroot.slice(from.length)}`, d.id);
@@ -516,8 +571,8 @@ export function createAccountFunctionsService(ctx) {
       jobCtx.progress(92, 'removing the old home directory');
       await op('fs.remove', { path: from, recursive: true });
       jobCtx.log(`Removed ${from}`);
-      ctx.auditRecord?.(null, { action: 'account.rearrange.done', target: username, args: { from, to } });
-      return { username, from, to, systemUser: account.uid != null };
+      ctx.auditRecord?.(null, { action: 'account.rearrange.done', target: username, args: { from, to, quota } });
+      return { username, from, to, systemUser: account.uid != null, quota };
     },
   };
 
@@ -559,22 +614,17 @@ export function createAccountFunctionsService(ctx) {
         const conf = shapeRetention(a, rows[a.id]);
         jobCtx.progress((i / Math.max(1, accounts.length)) * 100, a.username);
         if (!conf.archive_logs && !only) { skipped.push(a.username); continue; }
+        if (a.uid == null) { jobCtx.log(`${a.username}: no Linux user, so there is no home to archive into`, 'warn'); skipped.push(a.username); continue; }
         const src = `${DOMLOGS_ROOT}/${a.username}`;
-        const dest = `${conf.archive_dir}/${label}`;
         try {
           const stat = await op('fs.stat', { path: src });
           if (!stat.exists) { jobCtx.log(`${a.username}: no web logs under ${src}`, 'warn'); skipped.push(a.username); continue; }
-          await op('fs.mkdir', { path: dest, owner: a.uid != null ? a.username : undefined, mode: '0750' });
-          await op('fs.copy_tree', { from: src, to: dest });
-          if (a.uid != null) await op('fs.chown', { path: conf.archive_dir, owner: a.username, recursive: true });
+          // The copy and the pruning run as the account inside its home (acct.archive_logs), never as root.
+          const r = await op('acct.archive_logs', { username: a.username, source: src, archiveDir: conf.archive_dir, label, retainMonths: conf.remove_old_archives ? conf.retain_months : null });
           stmts.archived.run(a.id);
           archived.push(a.username);
-          jobCtx.log(`${a.username}: archived ${src} to ${dest}`);
-          if (conf.remove_old_archives) {
-            const cutoff = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth() - conf.retain_months, 1)).toISOString().slice(0, 7);
-            const entries = (await op('fs.list', { path: conf.archive_dir })).entries.filter((e) => e.type === 'dir' && /^\d{4}-\d{2}$/.test(e.name) && e.name < cutoff);
-            for (const e of entries) { await op('fs.remove', { path: `${conf.archive_dir}/${e.name}`, recursive: true }); pruned.push(`${a.username}/${e.name}`); jobCtx.log(`${a.username}: removed archive ${e.name} (older than ${conf.retain_months} month(s))`); }
-          }
+          jobCtx.log(`${a.username}: archived ${src} to ${r.dest}`);
+          for (const name of r.pruned || []) { pruned.push(`${a.username}/${name}`); jobCtx.log(`${a.username}: removed archive ${name} (older than ${conf.retain_months} month(s))`); }
         } catch (err) { jobCtx.log(`${a.username}: ${err.message}`, 'error'); skipped.push(a.username); }
       }
       return { label, archived, pruned, skipped };
@@ -586,7 +636,7 @@ export function createAccountFunctionsService(ctx) {
     renderTemplate, templatePath: (name) => { if (!TEMPLATE_NAMES.includes(name)) throw notFound(`Template "${name}"`); return `${TEMPLATE_DIR}/${name}.html`; }, templates, changeIp, recipients, emailAll, runEmailAll,
     forcePasswordChange, setDemoMode,
     setBandwidthLimit, resetBandwidth, exceeders, unsuspendExceeders, runBandwidthEnforce, runMonthlyBandwidthReset,
-    setShell, setQuota, quotaReport, logs, rearrange, logRetention,
+    setShell, setQuota, quotaReport, logs, rearrange, logRetention, mountpointFor,
     HOME_ROOTS, TEMPLATE_NAMES, TEMPLATE_USAGE, SHELLS,
   };
 }

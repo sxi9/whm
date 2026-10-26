@@ -15,8 +15,10 @@ export function createSystemRebootService(ctx) {
   const { db, agent, capabilities, jobs, settings, logger } = ctx;
   const tableExists = (name) => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
   const stmts = {
-    insert: db.prepare(`INSERT INTO reboot_requests (mode, principal, ip, reason, preflight_json, status, error, boot_id)
-      VALUES (@mode, @principal, @ip, @reason, @preflight, @status, @error, @bootId)`),
+    insert: db.prepare(`INSERT INTO reboot_requests (mode, principal, ip, reason, preflight_json, status, boot_id)
+      VALUES (@mode, @principal, @ip, @reason, @preflight, 'requested', @bootId)`),
+    triggered: db.prepare("UPDATE reboot_requests SET status = 'triggered', triggered_at = datetime('now') WHERE id = ?"),
+    failed: db.prepare("UPDATE reboot_requests SET status = 'failed', error = ? WHERE id = ?"),
     get: db.prepare('SELECT * FROM reboot_requests WHERE id = ?'),
     last: db.prepare('SELECT * FROM reboot_requests ORDER BY id DESC LIMIT 1'),
     history: db.prepare('SELECT * FROM reboot_requests ORDER BY id DESC LIMIT ?'),
@@ -53,7 +55,9 @@ export function createSystemRebootService(ctx) {
     const backups = activeRuns('backup_runs', 'id, status, created_at');
     const restores = activeRuns('backup_restores', 'id, status, created_at');
     const bootId = readBootId();
-    const last = shape(stmts.last.get());
+    // The previous request is reported without its own stored snapshot, or
+    // every stored snapshot would nest the whole chain of earlier ones.
+    const { preflight: _omit, ...last } = shape(stmts.last.get()) || {};
     const warnings = [];
     if (counts.running) warnings.push(`${counts.running} job(s) are running and will be interrupted`);
     if (counts.queued) warnings.push(`${counts.queued} job(s) are queued and will restart after boot`);
@@ -71,7 +75,7 @@ export function createSystemRebootService(ctx) {
       transfers, backups, restores,
       warnings,
       activeWork: warnings.length > 0,
-      lastRequest: last && { ...last, completed: Boolean(last.boot_id && bootId && last.boot_id !== bootId && last.status === 'triggered') },
+      lastRequest: last.id ? { ...last, completed: Boolean(last.boot_id && bootId && last.boot_id !== bootId && last.status !== 'failed') } : null,
     };
   }
 
@@ -82,18 +86,24 @@ export function createSystemRebootService(ctx) {
     if (check.activeWork && !ignoreActiveWork) {
       throw new HttpError(409, 'active_work', `Reboot not started: ${check.warnings.join('; ')}. Confirm again to reboot anyway.`);
     }
-    const base = { mode, principal: req?.user?.username ?? null, ip: req?.ip ?? null, reason, preflight: JSON.stringify(check), bootId: check.bootId };
+    // Record first: the reboot command kills this process (immediately when
+    // forceful), so a row or audit entry written after it would be lost. The
+    // row starts as 'requested' and is flipped to 'triggered' or 'failed' only
+    // when the panel is still alive to see the outcome.
+    const principal = req?.user?.username ?? null;
+    const { lastInsertRowid: id } = stmts.insert.run({ mode, principal, ip: req?.ip ?? null, reason, preflight: JSON.stringify(check), bootId: check.bootId });
+    req?.audit?.({ action: 'system.reboot', target: mode, args: { mode, reason, ignoreActiveWork, requestId: id, warnings: check.warnings, hostname: check.hostname } });
+    logger.warn({ mode, principal, reason, requestId: id }, 'server reboot requested from the panel');
+    let result;
     try {
-      const result = await agent.op('sys.reboot', { mode }, { req });
-      const { lastInsertRowid } = stmts.insert.run({ ...base, status: 'triggered', error: null });
-      req?.audit?.({ action: 'system.reboot', target: mode, args: { mode, reason, ignoreActiveWork, warnings: check.warnings, hostname: check.hostname } });
-      logger.warn({ mode, principal: base.principal, reason }, 'server reboot triggered from the panel');
-      return { ...shape(stmts.get.get(lastInsertRowid)), scheduled: Boolean(result?.scheduled ?? true), preflight: check };
+      result = await agent.op('sys.reboot', { mode }, { req });
     } catch (err) {
-      stmts.insert.run({ ...base, status: 'failed', error: err.message });
-      req?.audit?.({ action: 'system.reboot', target: mode, args: { mode, reason, ignoreActiveWork }, result: `error:${err.code || 'failed'}` });
+      stmts.failed.run(err.message, id);
+      req?.audit?.({ action: 'system.reboot', target: mode, args: { mode, reason, ignoreActiveWork, requestId: id }, result: `error:${err.code || 'failed'}` });
       throw err;
     }
+    stmts.triggered.run(id);
+    return { ...shape(stmts.get.get(id)), scheduled: Boolean(result?.scheduled ?? true), preflight: check };
   }
 
   return {

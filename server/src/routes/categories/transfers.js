@@ -16,10 +16,10 @@ const sessionBody = z.object({
 const transferOptions = z.object({ skipHome: z.boolean().optional(), skipDatabases: z.boolean().optional(), skipDns: z.boolean().optional(), overwrite: z.boolean().optional() }).strict();
 const transferBody = z.object({
   sessionId: fields.id,
-  accounts: z.array(z.object({ source: fields.username, username: fields.username.optional(), domain: fields.domain.optional(), package: fields.packageName.optional() }).strict()).min(1).max(200),
+  accounts: z.array(z.object({ source: fields.username, username: fields.username.optional(), domain: fields.domain.optional(), package: fields.packageName.optional(), password: fields.password.optional() }).strict()).min(1).max(200),
   options: transferOptions.optional(),
 }).strict();
-const restoreBody = z.object({ path: fields.absPath, username: fields.username.optional(), domain: fields.domain.optional(), package: fields.packageName.optional(), options: transferOptions.optional() }).strict();
+const restoreBody = z.object({ path: fields.absPath, username: fields.username.optional(), domain: fields.domain.optional(), package: fields.packageName.optional(), password: fields.password.optional(), options: transferOptions.optional() }).strict();
 const convertBody = z.object({
   domain: fields.domain,
   username: fields.username,
@@ -30,7 +30,8 @@ const convertBody = z.object({
 }).strict();
 const archiveName = z.string().regex(ARCHIVE_NAME, 'Must end in .tar.gz, .tgz or .tar');
 const uploadBody = z.object({ filename: archiveName, size: z.number().int().min(1).max(500 * 1024 * 1024 * 1024) }).strict();
-const chunkBody = z.object({ data: z.string().min(1).max(1_500_000).regex(/^[A-Za-z0-9+/=]+$/, 'Chunk must be base64') }).strict();
+// Base64 of UPLOAD_CHUNK_BYTES fits under the 2 MB JSON body limit.
+const chunkBody = z.object({ data: z.string().min(1).max(1_800_000).regex(/^[A-Za-z0-9+/=]+$/, 'Chunk must be base64') }).strict();
 const idParam = z.object({ id: fields.id });
 const uploadParam = z.object({ id: z.string().regex(/^[a-f0-9]{24}$/) });
 
@@ -65,6 +66,7 @@ export async function register(ctx) {
   r.get('/archives', requireRoot, wrap((req) => svc().archives.list(req.user)));
   r.post('/archives/inspect', requireRoot, validate({ body: z.object({ path: fields.absPath }).strict() }), wrap((req) => svc().archives.inspect(req.body.path, req.user, req)));
   r.post('/uploads', requireRoot, validate({ body: uploadBody }), wrap((req) => svc().uploads.begin(req.body, req.user, req), 201));
+  r.get('/uploads/:id', requireRoot, validate({ params: uploadParam }), wrap((req) => svc().uploads.status(req.params.id, req.user)));
   r.put('/uploads/:id/chunks', requireRoot, validate({ params: uploadParam, body: chunkBody }), wrap((req) => svc().uploads.chunk(req.params.id, req.body.data, req.user, req)));
   r.post('/uploads/:id/finish', requireRoot, validate({ params: uploadParam }), wrap((req) => svc().uploads.finish(req.params.id, req.user, req)));
   r.delete('/uploads/:id', requireRoot, validate({ params: uploadParam }), wrap((req) => svc().uploads.abort(req.params.id, req.user, req)));

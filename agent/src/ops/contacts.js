@@ -8,6 +8,10 @@ import { defineOp, arg, OpError } from './registry.js';
 // other alias the admin wrote is kept byte for byte.
 
 export const ALIASES_FILE = '/etc/aliases';
+// Backups and the temp file for the atomic replace live under the agent's own
+// state root rather than beside /etc/aliases, which is the only /etc path the
+// policy allows the op to touch.
+export const ALIASES_WORKDIR = '/var/lib/whm/contacts';
 const MANAGED_MARK = '# root alias managed by WHM panel (Edit System Mail Preferences)';
 
 // A target is a local account or a full address; a local part may not start
@@ -60,6 +64,20 @@ export function renderRootAlias(text, targets) {
   return `${out.join('\n')}\n`;
 }
 
+// rename(2) only works within one filesystem; when /etc and /var/lib differ
+// the content is written in place and fsynced instead.
+function replaceFile(target, tmp, content) {
+  fs.writeFileSync(tmp, content, { mode: 0o644 });
+  try {
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    if (err.code !== 'EXDEV') throw err;
+    const fd = fs.openSync(target, 'w', 0o644);
+    try { fs.writeFileSync(fd, content); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  }
+}
+
 // Which tool turns the text file into what the MTA reads: Postfix/Sendmail
 // need newaliases; Exim's system_aliases router reads /etc/aliases directly.
 function rebuildTool() {
@@ -91,11 +109,17 @@ defineOp('contacts.aliases.set_root', {
   schema: z.object({ targets: z.array(aliasTarget).max(20) }).strict(),
   run: async ({ targets }, ctx) => {
     ctx.assertAllowedPath(ALIASES_FILE, 'write');
+    const workdir = ctx.assertAllowedPath(ALIASES_WORKDIR, 'write');
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+    const backup = ctx.assertAllowedPath(`${workdir}/aliases.${stamp}.bak`, 'write');
+    const tmp = ctx.assertAllowedPath(`${workdir}/aliases.tmp-${process.pid}`, 'write');
+    fs.mkdirSync(workdir, { recursive: true, mode: 0o700 });
     const previous = readText(ALIASES_FILE);
-    if (previous != null) fs.copyFileSync(ALIASES_FILE, `${ALIASES_FILE}.whm-bak`);
-    const tmp = `${ALIASES_FILE}.whm-tmp-${process.pid}`;
-    fs.writeFileSync(tmp, renderRootAlias(previous, targets), { mode: 0o644 });
-    fs.renameSync(tmp, ALIASES_FILE);
+    if (previous != null) {
+      fs.writeFileSync(backup, previous, { mode: 0o600 });
+      for (const stale of fs.readdirSync(workdir).filter((f) => /^aliases\.\d{8}T\d{6}Z\.bak$/.test(f)).sort().slice(0, -10)) fs.rmSync(`${workdir}/${stale}`, { force: true });
+    }
+    replaceFile(ALIASES_FILE, tmp, renderRootAlias(previous, targets));
     const tool = rebuildTool();
     let rebuild = { tool, ran: false, ok: tool === 'exim', output: '' };
     if (tool === 'newaliases') {
@@ -106,6 +130,6 @@ defineOp('contacts.aliases.set_root', {
         throw new OpError('command_failed', `newaliases rejected the alias file: ${rebuild.output.split('\n').pop() || `exit ${code}`}`, { output: rebuild.output });
       }
     }
-    return { path: ALIASES_FILE, root: targets, rebuild };
+    return { path: ALIASES_FILE, root: targets, backup: previous != null ? backup : null, rebuild };
   },
 });

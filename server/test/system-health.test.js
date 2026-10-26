@@ -96,11 +96,35 @@ describe('System Health API', () => {
     const { data } = res.body;
     expect(data.config).toEqual({ enabled: true, signal: 'SIGKILL', notify: true, scope: 'non-root', exemptUsers: [], retentionDays: 90 });
     expect(data.patterns.map((p) => p.name)).toEqual(['BitchX', 'bnc', 'eggdrop', 'generic-sniffers', 'guardservices', 'ircd', 'psyBNC', 'ptlink', 'services']);
-    expect(data.patterns.every((p) => p.builtin && p.enabled)).toBe(true);
+    expect(data.patterns.every((p) => p.builtin && !p.enabled)).toBe(true);
     expect(data.schedule).toMatchObject({ name: 'system-health-bpk', cron: '*/10 * * * *', enabled: true });
     expect(data.capability).toEqual({ procps: true, notifications: true });
     expect(data.stats).toEqual({ total: 0, last24h: 0, failed: 0 });
     expect(data.signals).toContain('SIGKILL');
+  });
+
+  it('a fresh install kills nothing until the operator ticks entries on the list', async () => {
+    expect((await get('/api/system-health/bpk/matches').expect(200)).body.data).toMatchObject({ scanned: 9, patterns: [], matches: [] });
+    const res = await post('/api/system-health/bpk/scan', {}).expect(200);
+    expect(res.body.data.run).toMatchObject({ matched: 0, killed: 0, failed: 0 });
+    expect(res.body.data.kills).toEqual([]);
+    expect(signalled).toEqual([]);
+    expect(notifications).toEqual([]);
+    app.ctx.jobs.start();
+    try {
+      const job = await waitForJob(app.ctx, app.ctx.jobs.enqueue('system-health.bpk.scan').id);
+      expect(job.status).toBe('done');
+      expect(job.result).toEqual({ skipped: 'no_patterns' });
+    } finally { app.ctx.jobs.stop(); }
+    expect(signalled).toEqual([]);
+    expect(app.agent.callsTo('sys.processes')).toHaveLength(2);
+    for (const p of (await get('/api/system-health/bpk/patterns').expect(200)).body.data) {
+      expect((await patch(`/api/system-health/bpk/patterns/${p.id}`, { enabled: true }).expect(200)).body.data.enabled).toBe(true);
+    }
+    const armed = await get('/api/system-health/bpk/matches').expect(200);
+    expect(armed.body.data.patterns).toHaveLength(9);
+    expect(armed.body.data.matches.map((m) => m.pid)).toEqual([1001, 1003, 1004, 1006]);
+    expect(signalled).toEqual([]);
   });
 
   it('GET /bpk/matches previews matches for non-root users only, without signalling', async () => {
@@ -300,6 +324,9 @@ describe('System Health API', () => {
       expect(res.body.error.code).toBe('capability_missing');
       expect(res.body.error.message).toMatch(/procps/);
     }
+    const renice = await post('/api/system-health/processes/1002/renice', { niceness: 5 }).expect(501);
+    expect(renice.body.error.code).toBe('capability_missing');
+    expect(app.agent.callsTo('sys.process.renice').filter((c) => c.args.pid === 1002)).toHaveLength(1);
     const run = (await get('/api/system-health/bpk/runs?limit=1').expect(200)).body.data[0];
     expect(run).toMatchObject({ trigger: 'manual', error: expect.stringMatching(/procps/) });
     expect(signalled).toEqual([]);

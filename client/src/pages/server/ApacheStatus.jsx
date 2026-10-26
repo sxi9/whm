@@ -1,8 +1,9 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { PageHeader, Card, KeyValue, StatusPill, Loading, formatBytes, formatDuration, formatDate } from '../../components/Common.jsx';
+import { DataTable, useTableState } from '../../components/DataTable.jsx';
 import { Button } from '../../components/Form.jsx';
 import { useToast } from '../../components/Toast.jsx';
 import { RequestError } from '../security/Shared.jsx';
@@ -39,6 +40,80 @@ function Scoreboard({ scoreboard }) {
         </table>
       </div>
     </>
+  );
+}
+
+// mod_status marks a slot busy in these modes; "_" (waiting) and "." (open)
+// are idle and hidden by default so the table shows what is being served.
+const BUSY_MODES = ['S', 'R', 'W', 'K', 'D', 'C', 'L', 'G', 'I'];
+const sortValue = (w, key) => (key === 'acc' ? w.acc?.child ?? -1 : key === 'mode' ? BUSY_MODES.indexOf(w.mode) : w[key]);
+
+function WorkerTable({ enabled, refreshMs, reason }) {
+  const { data, loading, error, refetch } = useApi('/server-status/apache/workers', { enabled, refreshMs });
+  const table = useTableState({ sort: 'slot', dir: 'asc', pageSize: 1000 });
+  const [busyOnly, setBusyOnly] = useState(true);
+  const [q, setQ] = useState('');
+  const rows = useMemo(() => {
+    const term = q.trim().toLowerCase();
+    const list = (data?.workers || []).filter((w) => (!busyOnly || BUSY_MODES.includes(w.mode)) && (!term || [w.vhost, w.client, w.request, w.protocol, String(w.pid ?? '')].some((v) => v && v.toLowerCase().includes(term))));
+    const { sort, dir } = table.state;
+    return [...list].sort((a, b) => {
+      const av = sortValue(a, sort); const bv = sortValue(b, sort);
+      const an = av == null; const bn = bv == null;
+      if (an || bn) return an && bn ? 0 : an ? 1 : -1;
+      const c = typeof av === 'number' && typeof bv === 'number' ? av - bv : String(av).localeCompare(String(bv));
+      return dir === 'desc' ? -c : c;
+    });
+  }, [data, busyOnly, q, table.state]);
+  const has = (key) => (data?.columns || []).some((c) => c.key === key);
+  const n = (v, digits = 2) => (v == null ? <span className="muted">—</span> : Number(v).toFixed(digits));
+  const columns = [
+    { key: 'slot', label: 'Srv', sortable: true, width: 70, render: (w) => <code title="Child server number - generation">{w.srv}</code> },
+    { key: 'pid', label: 'PID', sortable: true, width: 80, render: (w) => (w.pid == null ? <span className="muted">—</span> : <code>{w.pid}</code>) },
+    { key: 'acc', label: 'Acc', sortable: true, width: 110, render: (w) => <span title="Accesses this connection / this child / this slot">{w.acc ? `${w.acc.connection ?? '—'}/${w.acc.child ?? '—'}/${w.acc.slot ?? '—'}` : '—'}</span> },
+    { key: 'mode', label: 'M', sortable: true, width: 140, render: (w) => <span title={w.stateLabel || w.mode}><span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, background: STATE_COLORS[w.stateKey] || 'var(--bad)', marginRight: 6, verticalAlign: 'middle' }} /><code>{w.mode}</code> <small className="muted">{w.stateLabel}</small></span> },
+    has('cpuSeconds') && { key: 'cpuSeconds', label: 'CPU', sortable: true, align: 'right', render: (w) => n(w.cpuSeconds) },
+    { key: 'secondsSinceRequest', label: 'SS', sortable: true, align: 'right', render: (w) => n(w.secondsSinceRequest, 0) },
+    { key: 'requestMs', label: 'Req', sortable: true, align: 'right', render: (w) => n(w.requestMs, 0) },
+    has('durationMs') && { key: 'durationMs', label: 'Dur', sortable: true, align: 'right', render: (w) => n(w.durationMs, 0) },
+    { key: 'connKBytes', label: 'Conn', sortable: true, align: 'right', render: (w) => n(w.connKBytes, 1) },
+    { key: 'childMBytes', label: 'Child', sortable: true, align: 'right', render: (w) => n(w.childMBytes) },
+    { key: 'slotMBytes', label: 'Slot', sortable: true, align: 'right', render: (w) => n(w.slotMBytes) },
+    { key: 'client', label: 'Client', sortable: true, render: (w) => (w.client ? <code>{w.client}</code> : <span className="muted">—</span>) },
+    has('protocol') && { key: 'protocol', label: 'Protocol', sortable: true, width: 90 },
+    { key: 'vhost', label: 'VHost', sortable: true, render: (w) => (w.vhost ? <code>{w.vhost}</code> : <span className="muted">—</span>) },
+    { key: 'request', label: 'Request', sortable: true, render: (w) => (w.request ? <code style={{ wordBreak: 'break-all' }}>{w.request}</code> : <span className="muted">—</span>) },
+  ].filter(Boolean);
+  const summary = data?.summary;
+  const subtitle = !enabled ? 'Available while mod_status answers' : data?.available ? `${summary.active} of ${summary.slots} slots active · ${summary.vhosts} vhost${summary.vhosts === 1 ? '' : 's'} · ${summary.clients} client${summary.clients === 1 ? '' : 's'} being served` : 'Per-slot rows need ExtendedStatus On';
+  return (
+    <Card title="Workers" subtitle={subtitle} padded={false} actions={enabled && <button className="btn btn-sm" onClick={() => refetch()}>Refresh</button>}>
+      {!enabled && <div className="card-body muted">No worker table: {reason === 'module_missing' ? 'mod_status is not loaded.' : reason === 'apache_down' ? 'Apache is not running.' : 'the /server-status page did not answer.'}</div>}
+      {enabled && error && <div className="card-body"><RequestError error={error} onRetry={refetch} /></div>}
+      {enabled && !error && loading && !data && <div className="card-body"><Loading /></div>}
+      {enabled && data && !data.available && data.instructions && (
+        <div className="card-body">
+          <div className="banner banner-warning" style={{ margin: 0 }}>
+            <div>
+              <strong>{data.instructions.title}</strong>
+              <ol style={{ margin: '6px 0 0', paddingLeft: 18 }}>{data.instructions.steps.map((step, i) => <li key={i}>{step}</li>)}</ol>
+              {data.reason === 'extended_off' && <p className="muted" style={{ marginTop: 6 }}>Edit the global configuration in <Link to="/service-configuration/apache-configuration">Apache Configuration</Link>, then reload from <Link to="/restart-services/http-server-apache">Restart Services</Link>.</p>}
+            </div>
+          </div>
+        </div>
+      )}
+      {enabled && data?.available && (
+        <DataTable
+          dense columns={columns} rows={rows} rowKey={(w) => w.srv} sort={table.state.sort} dir={table.state.dir} onSortChange={table.setSort}
+          emptyText={busyOnly ? 'No busy workers right now; untick "Busy only" to list idle and open slots' : 'No worker slots reported'}
+          toolbar={<>
+            <label className="toggle"><input type="checkbox" checked={busyOnly} onChange={(e) => setBusyOnly(e.target.checked)} /><span className="toggle-track"><span className="toggle-thumb" /></span><span className="toggle-text"><span className="toggle-label">Busy only</span></span></label>
+            <input className="input" style={{ maxWidth: 260 }} placeholder="Filter by vhost, client, request…" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Filter workers" />
+            <span className="muted">{rows.length} of {data.workers.length} slots</span>
+          </>}
+        />
+      )}
+    </Card>
   );
 }
 
@@ -95,6 +170,8 @@ export default function ApacheStatus({ fn }) {
             </div>
           )}
 
+          <WorkerTable enabled={Boolean(data.scoreboard)} refreshMs={live ? 10_000 : 0} reason={data.reason} />
+
           <div className="home">
             <div>
               <Card title="Worker scoreboard" subtitle={data.scoreboard ? `${data.scoreboard.used} of ${data.scoreboard.total} slots in use` : 'Scoreboard is available while mod_status answers'} padded={Boolean(data.scoreboard)}>
@@ -123,7 +200,7 @@ export default function ApacheStatus({ fn }) {
                 ]} />
               </Card>
               <Card title="About this page">
-                <p className="muted" style={{ margin: 0 }}>Counters come from Apache's <code>mod_status</code> handler (<code>/server-status?auto</code>), fetched by the agent on the loopback address Apache listens on. "Requests / sec" over the last window is derived between two polls; the lifetime value is Apache's own average since its last restart.</p>
+                <p className="muted" style={{ margin: 0 }}>Counters come from Apache's <code>mod_status</code> handler (<code>/server-status?auto</code>), fetched by the agent on the loopback address Apache listens on; the worker table is read from the HTML report (<code>/server-status</code>), which Apache only renders with <code>ExtendedStatus On</code>. "Requests / sec" over the last window is derived between two polls; the lifetime value is Apache's own average since its last restart.</p>
               </Card>
             </div>
           </div>

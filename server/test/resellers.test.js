@@ -199,6 +199,82 @@ describe('Resellers API', () => {
     });
   });
 
+  describe('ACL enforcement', () => {
+    const acct = (method, path, body) => resellerHttp[method](`/api/accounts${path}`).set('X-CSRF-Token', resellerCsrf).send(body);
+
+    it('an empty privilege selection denies everything instead of granting it', async () => {
+      const res = await put('/resell1/privileges', { acls: [] }).expect(200);
+      expect(res.body.data).toMatchObject({ acls: [], acls_configured: true, acl_count: 0 });
+      expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM reseller_acls WHERE reseller_id = ?').get(reseller.id).n).toBe(ACL_KEYS.length);
+      expect(app.ctx.resellers.hasAcl({ id: reseller.id, role: 'reseller' }, 'create-acct')).toBe(false);
+      expect(() => app.ctx.resellers.createPolicy({ id: reseller.id, role: 'reseller' }, { pkgName: 'default', plan: {} })).toThrow(/creating accounts/);
+      expect((await acct('post', '/', { username: 'erin', domain: 'erin.com' })).status).toBe(403);
+      // The Reseller Center edit modal sends the full (possibly empty) array too.
+      await put('/resell1', { acls: [] }).expect(200);
+      expect((await acct('post', '/', { username: 'erin', domain: 'erin.com' })).status).toBe(403);
+      // A reseller whose ACLs were never saved keeps ownership-only access.
+      const legacy = await app.createUser('legacy', 'reseller');
+      expect(app.ctx.resellers.hasAcl({ id: legacy.id, role: 'reseller' }, 'kill-acct')).toBe(true);
+      expect((await get('/legacy').expect(200)).body.data).toMatchObject({ acls_configured: false, acl_count: 0 });
+      app.ctx.db.prepare('DELETE FROM users WHERE id = ?').run(legacy.id);
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages'] }).expect(200);
+    });
+
+    it('gates suspend, terminate, password and modify on the minimal list', async () => {
+      await put('/resell1/privileges', { aclList: 'minimal' }).expect(200);
+      const suspend = await acct('post', '/bob/suspend', { reason: 'x' });
+      expect(suspend.status).toBe(403);
+      expect(suspend.body.error.message).toMatch(/Suspend/);
+      expect((await acct('delete', '/bob')).status).toBe(403);
+      expect((await acct('patch', '/bob', { contactEmail: 'b@bob.com' })).status).toBe(403);
+      expect((await acct('post', '/bob/password', { password: 'New-Passw0rd!1' })).status).toBe(200);
+      expect(app.ctx.db.prepare('SELECT suspended, contact_email FROM accounts WHERE username = ?').get('bob')).toMatchObject({ suspended: 0, contact_email: 'bob@bob.com' });
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'suspend-acct', 'edit-account'] }).expect(200);
+      expect((await acct('post', '/bob/suspend', { reason: 'x' })).status).toBe(200);
+      expect((await acct('post', '/bob/unsuspend')).status).toBe(200);
+      expect((await acct('patch', '/bob', { contactEmail: 'b@bob.com' })).status).toBe(200);
+      expect((await acct('patch', '/bob', { diskQuotaMb: 512 })).status).toBe(403);
+      expect((await acct('patch', '/bob', { bandwidthLimitMb: 512 })).status).toBe(403);
+      expect((await acct('patch', '/bob', { package: 'big' })).status).toBe(403);
+      expect((await acct('patch', '/bob', { ip: '203.0.113.11' })).status).toBe(403);
+      // Root is never gated.
+      await app.http.patch('/api/accounts/bob').set('X-CSRF-Token', csrf).send({ contactEmail: 'bob@bob.com' }).expect(200);
+    });
+
+    it('re-checks limits, package ownership and IP delegation when an account is modified', async () => {
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'edit-account', 'upgrade-account', 'quota', 'limit-bandwidth', 'add-pkg-ip'] }).expect(200);
+      // bob and dave hold the default package (10240 MB disk, 102400 MB bandwidth each).
+      await put('/resell1', { maxDiskMb: 15000, maxBandwidthMb: 250000 }).expect(200);
+      const huge = await acct('patch', '/bob', { diskQuotaMb: 1000000 });
+      expect(huge.status).toBe(409);
+      expect(huge.body.error).toMatchObject({ code: 'reseller_limit' });
+      expect(huge.body.error.message).toMatch(/over your reseller limit of 15000 MB/);
+      expect((await acct('patch', '/bob', { diskQuotaMb: null })).status).toBe(409);
+      expect((await acct('patch', '/bob', { package: 'big' })).status).toBe(409);
+      expect((await acct('patch', '/bob', { bandwidthLimitMb: 1000000 })).status).toBe(409);
+      expect((await acct('patch', '/bob', { bandwidthLimitMb: null })).status).toBe(409);
+      const ok = await acct('patch', '/bob', { diskQuotaMb: 512, bandwidthLimitMb: 500 });
+      expect(ok.status).toBe(200);
+      expect(ok.body.data).toMatchObject({ disk_quota_mb: 512, bandwidth_limit_mb: 500 });
+      const aliceId = app.ctx.db.prepare('SELECT id FROM users WHERE username = ?').get('alice').id;
+      app.ctx.db.prepare('INSERT INTO packages (name, owner_id, disk_mb, bandwidth_mb) VALUES (?, ?, 100, 100)').run('alicepkg', aliceId);
+      const foreign = await acct('patch', '/bob', { package: 'alicepkg' });
+      expect(foreign.status).toBe(403);
+      expect(foreign.body.error.message).toMatch(/not available/);
+      const listed = await put('/resell1', { allowedPackages: ['alicepkg'] });
+      expect(listed.status).toBe(422);
+      expect(listed.body.error.message).toMatch(/another reseller/);
+      await put('/resell1', { allowedPackages: ['default'] }).expect(200);
+      expect((await acct('patch', '/bob', { package: 'big' })).status).toBe(403);
+      await put('/resell1', { allowedPackages: [] }).expect(200);
+      expect((await acct('patch', '/bob', { ip: '203.0.113.12' })).status).toBe(403);
+      const moved = await acct('patch', '/bob', { ip: '203.0.113.11' });
+      expect(moved.status).toBe(200);
+      expect(moved.body.data.ip).toBe('203.0.113.11');
+      await put('/resell1', { maxDiskMb: null, maxBandwidthMb: null }).expect(200);
+    });
+  });
+
   describe('IP delegation and shared IP', () => {
     it('delegates free addresses only, once, and reports them', async () => {
       const res = await put('/resell1/ips', { addresses: ['203.0.113.12'] }).expect(200);
@@ -210,10 +286,21 @@ describe('Resellers API', () => {
       const other = await put('/alice/ips', { addresses: ['203.0.113.12'] });
       expect(other.status).toBe(409);
       expect(other.body.error.message).toMatch(/resell1/);
+      // Other tenants' assignments are visible to root only.
+      const carolId = app.ctx.db.prepare('SELECT id FROM accounts WHERE username = ?').get('carol').id;
+      const aliceId = app.ctx.db.prepare('SELECT id FROM users WHERE username = ?').get('alice').id;
+      app.ctx.db.prepare('INSERT INTO ip_addresses (address, family, netmask, interface, is_main, dedicated_to) VALUES (?, 4, ?, ?, 0, ?)').run('203.0.113.14', '255.255.255.0', 'eth0', carolId);
+      app.ctx.db.prepare('INSERT INTO ip_addresses (address, family, netmask, interface, is_main, delegated_to) VALUES (?, 4, ?, ?, 0, ?)').run('203.0.113.15', '255.255.255.0', 'eth0', aliceId);
+      const rootView = await get('/resell1/ips').expect(200);
+      expect(rootView.body.data.addresses.find((a) => a.address === '203.0.113.14')).toMatchObject({ dedicated_to: 'carol', delegatable: false });
+      expect(rootView.body.data.addresses.find((a) => a.address === '203.0.113.15')).toMatchObject({ delegated_to: 'alice', delegatable: false });
       const view = await rget('/resell1/ips').expect(200);
       expect(view.body.data.delegated).toEqual(['203.0.113.12']);
-      expect(view.body.data.addresses.find((a) => a.address === '203.0.113.10')).toMatchObject({ is_main: true, delegatable: false, server_shared: true });
-      expect(view.body.data.addresses.find((a) => a.address === '203.0.113.12')).toMatchObject({ delegated: true, delegatable: true });
+      expect(view.body.data.addresses.map((a) => a.address)).toEqual(['203.0.113.10', '203.0.113.11', '203.0.113.12']);
+      expect(JSON.stringify(view.body)).not.toMatch(/carol|alice/);
+      expect(view.body.data.addresses.find((a) => a.address === '203.0.113.10')).toMatchObject({ is_main: true, delegatable: false, server_shared: true, dedicated_to: null, delegated_to: null });
+      expect(view.body.data.addresses.find((a) => a.address === '203.0.113.11')).toMatchObject({ reseller_shared: true });
+      expect(view.body.data.addresses.find((a) => a.address === '203.0.113.12')).toMatchObject({ delegated: true, delegatable: true, delegated_to: 'resell1' });
       await rget('/alice/ips').expect(403);
       await rput('/resell1/ips', { addresses: [] }).expect(403);
       expect(app.ctx.resellers.delegatedAddresses(reseller.id).map((a) => a.address)).toEqual(['203.0.113.12']);

@@ -5,7 +5,7 @@ import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { useAuth } from '../../../auth/AuthContext.jsx';
 import { PageHeader, Card, StatusPill, formatBytes, formatMb, formatDate, KeyValue, Loading } from '../../../components/Common.jsx';
-import { Button, Field, Select, Toggle, TextInput, NumberInput, FormActions, ErrorBanner } from '../../../components/Form.jsx';
+import { Button, Field, Select, TextInput, NumberInput, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { DataTable, useTableState } from '../../../components/DataTable.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
@@ -59,13 +59,13 @@ export default function ViewBandwidthUsage({ fn }) {
   const overCount = (data || []).filter((r) => r.over).length;
   return (
     <>
-      <PageHeader fn={fn} description="Monthly transfer per account, parsed hourly from each site's Apache access logs (/var/log/whm/domlogs/<user>/*-access.log). Accounts that pass their limit can be suspended automatically."
+      <PageHeader fn={fn} description="Monthly transfer per account, parsed hourly from each site's Apache access logs (/var/log/whm/domlogs/<user>/*-access.log). Whether accounts that pass their limit are suspended is decided under Account Functions › Limit Bandwidth Usage."
         actions={isRoot && <Button icon={Activity} loading={busy} onClick={collect}>Collect now</Button>} />
       <RequestError error={error} onRetry={refetch} />
       {meta && (
         <div className="stat-grid" style={{ marginBottom: 14 }}>
           <Stat label={`Total in ${periodLabel(meta.period)}`} value={formatBytes(meta.totalBytes)} hint={`${meta.total} account(s) listed`} />
-          <Stat label="Over limit (this page)" value={overCount} hint={meta.suspendOnExceed ? 'Exceeders are suspended automatically' : 'Exceeders are only flagged'} />
+          <Stat label="Over limit (this page)" value={overCount} hint={meta.enforcement?.enabled ? 'Exceeders are suspended after each collection' : 'Exceeders are only flagged (enforcement off)'} />
           <Stat label="Warn threshold" value={`${meta.warnPercent}%`} />
           <Stat label="Last collection" value={meta.lastCollect ? formatDate(meta.lastCollect) : 'never'} hint="Runs on the account-bandwidth schedule (hourly)" />
         </div>
@@ -129,6 +129,7 @@ function AccountHistory({ data }) {
 
 function BandwidthSettings({ onSaved }) {
   const toast = useToast();
+  const navigate = useNavigate();
   const { data, loading, error, refetch } = useApi('/account-info/bandwidth/settings');
   const [draft, setDraft] = useState(null);
   const [saving, setSaving] = useState(false);
@@ -145,16 +146,23 @@ function BandwidthSettings({ onSaved }) {
   };
 
   return (
-    <Card title="Bandwidth enforcement" subtitle={data ? `Logs are read from ${data.logsRoot}/<user>/; at most ${formatBytes(data.readCap)} of new log data is read per file and run` : undefined} className="config-fields">
+    <Card title="Bandwidth collection" subtitle={data ? `Logs are read from ${data.logsRoot}/<user>/; at most ${formatBytes(data.readCap)} of new log data is read per file and run, the rest on the next run. The last bytes of a rotated log are counted from its .1 / dated copy.` : undefined} className="config-fields">
       <ErrorBanner error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
+      {data && (
+        <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginBottom: 12 }}>
+          <StatusPill status={data.enforcement?.enabled ? 'ok' : 'warning'}>{data.enforcement?.enabled ? 'Automatic suspension on' : 'Automatic suspension off'}</StatusPill>
+          <span className="muted small">
+            {data.enforcement?.enabled ? `Accounts over their limit are suspended after each collection with the reason “${data.enforcement.reason || 'bandwidth: monthly transfer limit exceeded'}”; Unsuspend Bandwidth Exceeders lifts them in bulk.` : 'Accounts over their limit are only flagged.'} Configured under Account Functions.
+          </span>
+          <Button size="sm" onClick={() => navigate('/account-functions/limit-bandwidth-usage')}>Limit Bandwidth Usage</Button>
+        </div>
+      )}
       {draft && (
         <>
-          <Field inline><Toggle checked={draft.suspendOnExceed} onChange={set('suspendOnExceed')} label="Suspend accounts that exceed their monthly bandwidth limit" description="Applied at the end of every collection run; already-suspended accounts are left alone. Unsuspend Bandwidth Exceeders lifts them in bulk." /></Field>
           <div className="form-grid">
-            <Field label="Suspension reason"><TextInput value={draft.suspendReason} onChange={set('suspendReason')} maxLength={200} /></Field>
             <Field label="Warn at (% of limit)"><NumberInput value={draft.warnPercent} onChange={set('warnPercent')} min={1} max={100} nullable={false} /></Field>
-            <Field label="Max bytes read per log file per run" help="Lower this on busy servers to bound each hourly run"><NumberInput value={draft.maxLogBytes} onChange={set('maxLogBytes')} min={65536} max={33554432} nullable={false} /></Field>
+            <Field label="Max bytes read per log file per run" help="Lower this on busy servers to bound each hourly run; unread bytes are picked up next run"><NumberInput value={draft.maxLogBytes} onChange={set('maxLogBytes')} min={65536} max={33554432} nullable={false} /></Field>
             <Field label="Extra log directories" help="Comma-separated absolute paths holding <user>/<domain>-access.log trees (for example an NGINX log root); must be inside the agent's allowed paths">
               <TextInput value={(draft.extraLogDirs || []).join(', ')} onChange={(v) => set('extraLogDirs')(v.split(',').map((s) => s.trim()).filter(Boolean))} placeholder="/var/log/nginx/domlogs" />
             </Field>

@@ -19,6 +19,7 @@ export function RawLogDownload({ fn, kind, description }) {
         <Card title={`${kind === 'nginx' ? 'NGINX' : 'Apache'} logs for ${username}`} subtitle={data ? `Looked in ${data.dirs.join(' and ')}` : undefined} padded={false} actions={<button className="btn btn-sm" onClick={() => refetch()}>Refresh</button>}>
           <CapabilityNotice error={error} onRetry={refetch} />
           {error && error.status !== 501 && <ErrorBanner error={error} onRetry={refetch} />}
+          {data?.warnings?.length > 0 && <ErrorBanner error={{ message: `Some log directories were not read: ${data.warnings.join('; ')}` }} />}
           {data && !data.files.length && <EmptyState title="No log files yet">{kind === 'nginx' ? 'NGINX writes per-domain logs once a vhost for this account has served traffic.' : data.apache ? 'Apache creates the access and error logs once the site has served its first request.' : 'Apache is not installed on this server; logs appear once the web server serves this account.'}</EmptyState>}
           {data?.files.length > 0 && (
             <DataTable

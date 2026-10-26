@@ -7,7 +7,8 @@ import { Field, TextInput, Toggle, Button, FormActions, ErrorBanner } from '../.
 import { useToast } from '../../components/Toast.jsx';
 import { useConfirm } from '../../components/Modal.jsx';
 
-const RESERVED = new Set(['localhost', 'localhost.localdomain', 'localhost6', 'ip6-localhost', 'ip6-loopback']);
+const RESERVED = new Set(['localhost', 'localhost.localdomain', 'localhost6', 'localhost6.localdomain6', 'ip6-localhost', 'ip6-loopback']);
+const RESERVED_LABELS = new Set(['localhost', 'localhost6', 'ip6-localhost', 'ip6-loopback']);
 const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 // Mirrors the server's rules so the form can explain problems before submitting.
@@ -21,6 +22,7 @@ export function hostnameProblems(value) {
   if (/^\d+$/.test(labels.at(-1))) problems.push('The hostname cannot be an IP address');
   if (labels[0] === 'www') problems.push('The hostname cannot start with "www"');
   if (RESERVED.has(hostname)) problems.push('That name is reserved for the loopback interface');
+  else if (RESERVED_LABELS.has(labels[0])) problems.push(`The short name "${labels[0]}" is reserved for the loopback interface`);
   if (/\.(local|localdomain|localhost|arpa|internal|invalid|example|test)$/.test(hostname)) problems.push('That suffix is not resolvable on the public internet');
   return problems;
 }
@@ -28,7 +30,7 @@ export function hostnameProblems(value) {
 const isCapability = (e) => e && (e.status === 501 || e.code === 'capability_missing' || e.code === 'binary_not_found');
 
 function StepList({ steps }) {
-  const labels = { hostname: 'System hostname', hosts: '/etc/hosts', settings: 'Panel setting', dns: 'DNS A record' };
+  const labels = { hostname: 'System hostname', hosts: '/etc/hosts', settings: 'Panel setting', certs: 'Service SSL certificates', dns: 'DNS A record' };
   return (
     <ul className="step-list" style={{ listStyle: 'none', padding: 0, margin: 0 }}>
       {steps.map((s) => (
@@ -37,7 +39,8 @@ function StepList({ steps }) {
           <div>
             <strong>{labels[s.step] || s.step}</strong>
             {s.detail && <div className="muted"><code>{s.detail}</code></div>}
-            {s.error && <div className="muted">{s.error}{isCapability(s) ? ' (install the DNS server to publish records)' : ''}</div>}
+            {s.error && <div className="muted">{s.error}{isCapability(s) ? (s.step === 'dns' ? ' (install the DNS server to publish records)' : ' (install openssl to re-issue certificates)') : ''}</div>}
+            {s.step === 'certs' && s.manual?.length > 0 && <div className="muted">Re-issue or re-install the certificate for <strong>{s.manual.join(', ')}</strong> from <Link to="/service-configuration/manage-service-ssl-certificates">Manage Service SSL Certificates</Link>.</div>}
           </div>
         </li>
       ))}
@@ -53,6 +56,7 @@ export function ChangeHostname() {
   const [ip, setIp] = useState('');
   const [updateHosts, setUpdateHosts] = useState(true);
   const [addDnsRecord, setAddDnsRecord] = useState(false);
+  const [reissueServiceCerts, setReissueServiceCerts] = useState(true);
   const [preview, setPreview] = useState(null);
   const [previewError, setPreviewError] = useState(null);
   const [result, setResult] = useState(null);
@@ -87,7 +91,7 @@ export function ChangeHostname() {
     if (!canSubmit) return;
     const ok = await confirm({
       title: `Change the hostname to ${normalized}?`,
-      message: `hostnamectl sets the kernel hostname immediately${updateHosts ? ', /etc/hosts is rewritten to map it to ' + (ip.trim() || status?.ip || '127.0.1.1') : ''}${addDnsRecord ? ', and an A record is added to the DNS zone' : ''}. Mail and web daemons pick the new name up when they are restarted. Type the new hostname to confirm.`,
+      message: `hostnamectl sets the kernel hostname immediately${updateHosts ? ', /etc/hosts is rewritten to map it to ' + (ip.trim() || status?.ip || '127.0.1.1') : ''}${reissueServiceCerts ? ', self-signed service certificates that name the old host are re-issued' : ''}${addDnsRecord ? ', and an A record is added to the DNS zone' : ''}. Mail and web daemons pick the new name up when they are restarted. Type the new hostname to confirm.`,
       confirmLabel: 'Change hostname', danger: true, typeToConfirm: normalized,
     });
     if (!ok) return;
@@ -95,7 +99,7 @@ export function ChangeHostname() {
     setSubmitError(null);
     setResult(null);
     try {
-      const { data } = await api.post('/networking/hostname', { ...body(), updateHosts, addDnsRecord });
+      const { data } = await api.post('/networking/hostname', { ...body(), updateHosts, addDnsRecord, reissueServiceCerts });
       setResult(data);
       if (data.ok) toast.success(`Hostname changed to ${data.hostname}`);
       else toast.warning(`Hostname changed to ${data.hostname}, but some steps failed; see below`);
@@ -135,6 +139,7 @@ export function ChangeHostname() {
             <TextInput value={ip} onChange={setIp} placeholder={status?.ip || '203.0.113.10'} />
           </Field>
           <Field inline><Toggle checked={updateHosts} onChange={setUpdateHosts} label="Update /etc/hosts" description="Map the new name to the IP above and drop the old name. Required for sudo, Exim and local tools to resolve the hostname." /></Field>
+          <Field inline><Toggle checked={reissueServiceCerts} onChange={setReissueServiceCerts} label="Re-issue self-signed service certificates" description="Service certificates (Exim, Dovecot, Apache, FTP, panel) that are self-signed and name the old host are regenerated for the new name. CA-issued certificates are never replaced; they are listed for manual re-issue." /></Field>
           <Field inline><Toggle checked={addDnsRecord} onChange={setAddDnsRecord} disabled={!status?.capability?.dns} label="Add an A record for the hostname" description={status?.capability?.dns ? 'Creates the record in the matching zone (creating the parent zone when needed) through DNS Functions.' : 'DNS Functions are not available on this panel.'} /></Field>
           {unchanged && <p className="muted">This is already the hostname; applying again only repairs /etc/hosts and the DNS record.</p>}
           <FormActions>
@@ -160,8 +165,8 @@ export function ChangeHostname() {
         <Card title={result.ok ? `Hostname changed to ${result.hostname}` : `Hostname changed to ${result.hostname} with problems`}>
           <StepList steps={result.steps} />
           <p className="muted" style={{ marginTop: 12 }}>
-            Previous hostname: <code>{result.previous || '—'}</code>. Daemons that embed the hostname read it at start-up; restart them from{' '}
-            <Link to="/restart-services/mail-server-exim">Mail Server (Exim)</Link>, <Link to="/restart-services/imap-server">IMAP Server</Link> and <Link to="/restart-services/http-server-apache">HTTP Server</Link>, and re-issue the service SSL certificate from <Link to="/ssl-tls/manage-service-ssl-certificates">Manage Service SSL Certificates</Link> if it names the old host.
+            Previous hostname: <code>{result.previous || '—'}</code>. Apache, Exim and Dovecot read the hostname at start-up; restart them from{' '}
+            <Link to="/restart-services/mail-server-exim">Mail Server (Exim)</Link>, <Link to="/restart-services/imap-server">IMAP Server</Link> and <Link to="/restart-services/http-server-apache">HTTP Server</Link>. Service certificates are managed in <Link to="/service-configuration/manage-service-ssl-certificates">Manage Service SSL Certificates</Link>.
           </p>
         </Card>
       )}

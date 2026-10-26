@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 import { z } from 'zod';
-import { exec, hasBinary } from '../exec.js';
+import { exec, hasBinary, resolveBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
 import { renderClientCnf, classifyMysqlError, parseBatch, cloneUserStatements, q } from './db.js';
 
@@ -402,14 +402,27 @@ defineOp('backup.archive.inspect', {
 
 // ---------------------------------------------------------------- restore ---
 
-async function extractMembers(file, destDir, members, { strip, overwrite = true }) {
+// With `as`, tar runs under the account's uid/gid (setpriv) so every write into
+// the home tree is subject to the account's own permissions: a symlink the
+// account planted (public_html -> /etc) cannot turn a restore into a root file
+// write, whatever tar version the host has. The root-only archive stays
+// readable through an ambient CAP_DAC_READ_SEARCH, which grants no write access.
+async function extractMembers(file, destDir, members, { strip, overwrite = true, as = null }) {
   const argv = ['--extract', '--file', file, '-C', destDir, '--no-same-owner', `--strip-components=${strip}`, '--warning=no-unknown-keyword'];
+  if (as) argv.push('--preserve-permissions');
   if (!overwrite) argv.push('--skip-old-files');
   argv.push('--', ...members);
-  const r = await exec('tar', argv, { allowFailure: true, timeoutMs: 7_200_000, maxBuffer: 64 * 1024 * 1024 });
+  const tarBin = resolveBinary('tar');
+  const [bin, args] = as
+    ? ['setpriv', ['--reuid', String(as.uid), '--regid', String(as.gid), '--clear-groups', '--inh-caps', '+dac_read_search', '--ambient-caps', '+dac_read_search', '--no-new-privs', '--', tarBin, ...argv]]
+    : ['tar', argv];
+  const raw = await exec(bin, args, { allowFailure: true, timeoutMs: 7_200_000, maxBuffer: 64 * 1024 * 1024 });
+  if (as && raw.code !== 0 && /^setpriv:/m.test(raw.stderr)) throw new OpError('command_failed', `setpriv: ${raw.stderr.trim().split('\n').pop()}`, { stderr: raw.stderr.slice(-4000) });
+  // tar prefixes its messages with argv[0], which is the absolute path under setpriv.
+  const r = as ? { ...raw, stderr: raw.stderr.split(`${tarBin}:`).join('tar:') } : raw;
   const missing = [...r.stderr.matchAll(/^tar: (.+): Not found in archive$/gm)].map((m) => m[1]);
   const otherErrors = r.stderr.split('\n').filter((l) => l.startsWith('tar:') && !/Not found in archive|Exiting with failure status|Removing leading/.test(l));
-  if (r.code !== 0 && (r.code !== 2 || otherErrors.length)) throw new OpError('command_failed', `tar: ${otherErrors[0] || r.stderr.trim().split('\n').pop() || `exit ${r.code}`}`, { stderr: r.stderr.slice(-4000) });
+  if (r.code !== 0 && (r.code !== 2 || otherErrors.length)) throw new OpError('command_failed', `tar: ${(otherErrors[0] || r.stderr.trim().split('\n').pop() || `exit ${r.code}`).replace(/^tar: /, '')}`, { stderr: r.stderr.slice(-4000) });
   return { missing, warnings: otherErrors };
 }
 
@@ -441,32 +454,30 @@ defineOp('backup.archive.extract', {
 });
 
 defineOp('backup.files.restore', {
-  description: 'Restore paths from an archive homedir/ into an account home with the account ownership (whole home when paths is empty)',
+  description: 'Restore paths from an archive homedir/ into an account home, extracting as the account user (whole home when paths is empty)',
   destructive: true,
   timeoutMs: 7_200_000,
   schema: z.object({ archive: archivePath, username: arg.username, homeDir: arg.absPath, paths: z.array(relPath).max(500).default([]), overwrite: z.boolean().default(true) }).strict(),
   run: async ({ archive, username, homeDir, paths, overwrite }, ctx) => {
     requireTar();
+    if (!hasBinary('setpriv')) throw new OpError('capability_missing', 'setpriv (util-linux) is not installed on this server; it is required to restore files with the account\'s privileges');
     const file = ctx.assertAllowedPath(archive, 'read');
     const home = ctx.assertAllowedPath(homeDir, 'write');
-    if (!exists(file)) throw new OpError('not_found', `${archive} does not exist`);
     const { uid, gid } = ownership(username);
+    if (uid === 0) throw new OpError('refused', `Files are never restored for uid 0 (${username})`);
+    if (!exists(file)) throw new OpError('not_found', `${archive} does not exist`);
     const top = archiveTop(file);
     if (!exists(home)) { fs.mkdirSync(home, { recursive: true, mode: 0o711 }); fs.chownSync(home, uid, gid); }
     const rel = paths.map((p) => p.replace(/\/+$/, ''));
     const members = rel.length ? rel.map((p) => `${top}/homedir/${p}`) : [`${top}/homedir`];
-    const { missing, warnings } = await extractMembers(file, home, members, { strip: 2, overwrite });
+    const { missing, warnings } = await extractMembers(file, home, members, { strip: 2, overwrite, as: { uid, gid } });
     const restored = [];
     for (const p of rel.length ? rel : ['.']) {
-      const target = path.resolve(home, p);
-      if (!exists(target)) continue;
-      // Parent directories tar had to create belong to the account too.
-      const parts = p.split('/').slice(0, -1);
-      for (let i = 1; i <= parts.length; i++) { try { fs.lchownSync(path.join(home, ...parts.slice(0, i)), uid, gid); } catch { /* best effort */ } }
-      await exec('chown', ['-R', '-h', `${uid}:${gid}`, '--', target], { timeoutMs: 3_600_000 });
-      restored.push(p);
+      let st = null;
+      try { st = fs.lstatSync(path.resolve(home, p)); } catch { continue; }
+      if (st.uid === uid) restored.push(p);
     }
-    return { archive: file, homeDir: home, username, restored, missing: missing.map((m) => m.slice(`${top}/homedir/`.length)), overwrite, warnings };
+    return { archive: file, homeDir: home, username, uid, gid, restored, missing: missing.map((m) => m.slice(`${top}/homedir/`.length)), overwrite, warnings };
   },
 });
 

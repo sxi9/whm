@@ -8,7 +8,8 @@ export const RESOLVED_UNIT = 'systemd-resolved';
 export const LOOPBACK_HOSTNAME_IP = '127.0.1.1';
 export const MAX_RESOLVERS = 4;
 
-const RESERVED_HOSTNAMES = new Set(['localhost', 'localhost.localdomain', 'localhost6', 'localhost6.localdomain6', 'ip6-localhost', 'ip6-loopback']);
+const RESERVED_HOSTNAMES = new Set(['localhost', 'localhost.localdomain', 'localhost6', 'localhost6.localdomain6', 'ip6-localhost', 'ip6-loopback', 'ip6-localnet', 'ip6-mcastprefix', 'ip6-allnodes', 'ip6-allrouters', 'ip6-allhosts']);
+const RESERVED_LABELS = new Set(['localhost', 'localhost6', 'ip6-localhost', 'ip6-loopback']);
 const RESERVED_SUFFIXES = ['.localdomain', '.local', '.localhost', '.arpa', '.internal', '.invalid', '.example', '.test'];
 const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
@@ -36,6 +37,7 @@ export function validateHostname(value) {
   if (/^\d+$/.test(labels.at(-1))) problems.push('The hostname cannot be an IP address');
   if (labels[0] === 'www') problems.push('The hostname cannot start with "www"');
   if (RESERVED_HOSTNAMES.has(hostname)) problems.push(`"${hostname}" is reserved for the loopback interface`);
+  else if (RESERVED_LABELS.has(labels[0])) problems.push(`The short name "${labels[0]}" is reserved for the loopback interface`);
   for (const suffix of RESERVED_SUFFIXES) if (hostname.endsWith(suffix)) problems.push(`Names ending in "${suffix}" are not resolvable on the public internet`);
   return { hostname, ok: problems.length === 0, problems: [...new Set(problems)] };
 }
@@ -60,14 +62,16 @@ function renderHostsLine(line) {
 // Returns the hosts file with `hostname` (and its short name) mapped to `ip`
 // and the previous hostname dropped everywhere else, preserving every other
 // entry, comment and blank line. Idempotent: `changed` is false when the file
-// already says exactly this.
+// already says exactly this. Loopback names (localhost, localhost.localdomain,
+// ip6-*) are never dropped, whatever the previous or new hostname was: on a
+// stock Debian ("localhost") or RHEL ("localhost.localdomain") image the first
+// hostname change would otherwise leave the box without a localhost mapping.
 export function updateHostsFile(text, { ip, hostname, previous = null, ipv6 = null }) {
   const fqdn = normalizeHostname(hostname);
   const short = fqdn.split('.')[0];
   const prev = previous ? normalizeHostname(previous) : null;
   const prevShort = prev && prev !== fqdn ? prev.split('.')[0] : null;
-  const drop = new Set([fqdn, short]);
-  if (prev && prev !== fqdn) drop.add(prev);
+  const drop = new Set([fqdn, short, prev && prev !== fqdn ? prev : null].filter((n) => n && !RESERVED_HOSTNAMES.has(n)));
   const original = String(text ?? '');
   const lines = parseHosts(original);
   const kept = [];
@@ -119,7 +123,8 @@ export function parseResolvConf(text) {
     if (!line) continue;
     const [key, ...rest] = line.split(/\s+/);
     if (key === 'nameserver' && rest[0]) nameservers.push(rest[0]);
-    else if (key === 'search' || key === 'domain') search = rest.map((s) => s.toLowerCase());
+    // systemd-resolved writes "search ." (the root domain) into its stub file.
+    else if (key === 'search' || key === 'domain') search = rest.map((s) => s.toLowerCase()).filter((s) => s !== '.');
     else if (key === 'options') options.push(...rest);
   }
   return { nameservers, search, options, managedBy: detectResolverManager(text) };
@@ -213,6 +218,54 @@ export function createNetworkingSetupService(ctx) {
     } catch { return { installed: false, active: false }; }
   }
 
+  // lstat view of /etc/resolv.conf: a symlink into /run/systemd/resolve means
+  // systemd-resolved owns the file even when its contents do not say so.
+  async function inspectResolvFile() {
+    try {
+      const r = await agent.op('resolver.inspect', {});
+      return { exists: Boolean(r?.exists), isSymlink: Boolean(r?.isSymlink), isRegular: Boolean(r?.isRegular), target: r?.target ?? null, managedByResolved: Boolean(r?.managedByResolved) };
+    } catch (err) {
+      logger.warn({ err }, 'could not inspect /etc/resolv.conf');
+      return { exists: null, isSymlink: null, isRegular: null, target: null, managedByResolved: false, error: err.message };
+    }
+  }
+
+  const resolvedOwnsFile = (current, file) => current.managedBy === 'systemd-resolved' || file.managedByResolved;
+
+  // Service certificates are the only thing the panel renders from the hostname
+  // (Apache, Exim and Dovecot read it from the kernel at start-up, hence the
+  // restart hint). Self-signed ones are re-issued for the new name; a CA-issued
+  // certificate is never overwritten, only reported.
+  async function refreshServiceCerts(fqdn, reissue, req) {
+    const certs = ctx.web?.certs;
+    if (!certs?.list) return { step: 'certs', ok: true, skipped: true, error: 'Service Configuration is not available on this panel' };
+    try {
+      const listed = await certs.list();
+      const namesOf = (c) => [c?.commonName, ...(c?.sans || [])].filter(Boolean).map((n) => String(n).toLowerCase());
+      const stale = (listed.services || []).filter((svc) => svc.hasCertificate && svc.certificate && !namesOf(svc.certificate).includes(fqdn));
+      const reissued = [];
+      const manual = [];
+      const failed = [];
+      for (const svc of stale) {
+        if (!reissue || !svc.certificate.selfSigned) { manual.push(svc.service); continue; }
+        try {
+          await certs.reset(svc.service, {}, req);
+          reissued.push(svc.service);
+        } catch (err) {
+          failed.push({ service: svc.service, error: err.message, code: err.code ?? null, capability: err.capability ?? null });
+        }
+      }
+      const detail = [
+        reissued.length ? `re-issued self-signed certificate for ${reissued.join(', ')}` : null,
+        manual.length ? `${manual.join(', ')}: certificate names another host; re-issue it from Manage Service SSL Certificates` : null,
+        !stale.length ? 'no service certificate names the old host' : null,
+      ].filter(Boolean).join('; ');
+      return { step: 'certs', ok: failed.length === 0, detail, reissued, manual, failed, ...(failed.length ? { error: failed.map((f) => `${f.service}: ${f.error}`).join('; '), code: failed[0].code, capability: failed[0].capability } : {}) };
+    } catch (err) {
+      return { step: 'certs', ok: false, error: err.message, code: err.code ?? null, capability: err.capability ?? null };
+    }
+  }
+
   const service = {
     // -------------------------------------------------------------- hostname
     async hostnameStatus() {
@@ -269,7 +322,7 @@ export function createNetworkingSetupService(ctx) {
 
     // Order matters: hostnamectl first (the host is the source of truth), then
     // /etc/hosts, then the panel's own setting, then the optional DNS record.
-    async setHostname({ hostname, ip, ipv6, updateHosts = true, addDnsRecord = false }, req) {
+    async setHostname({ hostname, ip, ipv6, updateHosts = true, addDnsRecord = false, reissueServiceCerts = true }, req) {
       const check = validateHostname(hostname);
       if (!check.ok) throw unprocessable('That hostname cannot be used', { hostname: check.problems });
       const fqdn = check.hostname;
@@ -304,6 +357,8 @@ export function createNetworkingSetupService(ctx) {
       settings.set('basic.hostname', fqdn);
       steps.push({ step: 'settings', ok: true, detail: 'basic.hostname updated' });
 
+      steps.push(await refreshServiceCerts(fqdn, reissueServiceCerts, req));
+
       if (addDnsRecord) {
         if (!ctx.dns?.ensureHostnameA) {
           steps.push({ step: 'dns', ok: false, skipped: true, error: 'DNS Functions are not available on this panel' });
@@ -318,7 +373,7 @@ export function createNetworkingSetupService(ctx) {
       }
 
       recordChange('hostname', req, { hostname: previous }, { hostname: fqdn, ip: targetIp }, steps.map((s) => `${s.step}:${s.ok ? 'ok' : 'failed'}`).join(','));
-      audit(req, { action: 'networking.hostname.set', target: fqdn, args: { previous, ip: targetIp, updateHosts, addDnsRecord, steps: steps.map((s) => ({ step: s.step, ok: s.ok })) } });
+      audit(req, { action: 'networking.hostname.set', target: fqdn, args: { previous, ip: targetIp, updateHosts, addDnsRecord, reissueSelfSigned: reissueServiceCerts, steps: steps.map((s) => ({ step: s.step, ok: s.ok })) } });
       return {
         hostname: fqdn, previous, ip: targetIp, steps, ok: steps.every((s) => s.ok),
         // Daemons read the hostname at start-up; these are the ones that embed it.
@@ -331,6 +386,8 @@ export function createNetworkingSetupService(ctx) {
       await capabilities.ensureFresh();
       const current = await readResolvers();
       const resolved = await resolvedUnitStatus();
+      const file = await inspectResolvFile();
+      if (current.managedBy !== 'systemd-resolved' && file.managedByResolved) current.managedBy = 'systemd-resolved';
       let dropIn = null;
       if (current.managedBy === 'systemd-resolved' || resolved.active) {
         try { const f = await readFile(RESOLVED_DROPIN); dropIn = f.exists ? { path: RESOLVED_DROPIN, content: f.content } : null; } catch { dropIn = null; }
@@ -339,7 +396,9 @@ export function createNetworkingSetupService(ctx) {
       return {
         path: RESOLV_PATH, raw: current.raw, nameservers: current.nameservers, search: current.search, options: current.options,
         managedBy: current.managedBy, target, writePath: target === 'resolved' ? RESOLVED_DROPIN : RESOLV_PATH,
-        resolved, dropIn,
+        resolved, dropIn, file,
+        // Taking the file over only sticks once systemd-resolved no longer regenerates it.
+        takeOverAllowed: !(resolvedOwnsFile(current, file) && resolved.active),
         panel: { resolvers: settings.get('dns.resolvers', []) || [], search: settings.get('networking.resolvers.search', []) || [] },
         presets: RESOLVER_PRESETS, max: MAX_RESOLVERS,
         lastChange: shapeChange(stmts.lastChange.get('resolvers')),
@@ -351,10 +410,17 @@ export function createNetworkingSetupService(ctx) {
       if (unique.length !== nameservers.length) throw unprocessable('Duplicate nameserver', { nameservers: ['Each nameserver may only be listed once'] });
       if (unique.some((ns) => /^(0\.0\.0\.0|::|255\.255\.255\.255|22[4-9]\.|23\d\.|ff)/i.test(ns))) throw unprocessable('Invalid nameserver', { nameservers: ['Unspecified, broadcast and multicast addresses cannot be resolvers'] });
       const before = await readResolvers();
+      const fileBefore = await inspectResolvFile();
+      if (before.managedBy !== 'systemd-resolved' && fileBefore.managedByResolved) before.managedBy = 'systemd-resolved';
       const target = mode === 'auto' ? (before.managedBy === 'systemd-resolved' ? 'resolved' : 'file') : mode;
       const notes = [];
       let restarted = null;
+      let replacedSymlink = false;
       let path = RESOLV_PATH;
+      if (target === 'file' && resolvedOwnsFile(before, fileBefore)) {
+        const resolved = await resolvedUnitStatus();
+        if (resolved.active) throw unprocessable('systemd-resolved is running and regenerates /etc/resolv.conf; stop and disable it first (systemctl disable --now systemd-resolved) or keep writing through its drop-in', { mode: ['systemd-resolved must be stopped before /etc/resolv.conf can be replaced with a static file'] });
+      }
       if (target === 'resolved') {
         path = RESOLVED_DROPIN;
         await writeRootFile(RESOLVED_DROPIN, renderResolvedDropIn({ nameservers: unique, search }), req);
@@ -366,18 +432,24 @@ export function createNetworkingSetupService(ctx) {
           notes.push(`systemd-resolved could not be restarted (${err.message}); run "systemctl restart systemd-resolved" to apply`);
         }
       } else {
-        if (before.managedBy === 'systemd-resolved') notes.push('/etc/resolv.conf was managed by systemd-resolved; it has been replaced with a static file. Disable systemd-resolved or it may regenerate the file.');
+        const written = await agent.op('resolver.write_static', { nameservers: unique, search }, { req });
+        replacedSymlink = Boolean(written?.replacedSymlink);
+        if (replacedSymlink) notes.push(`/etc/resolv.conf was a symlink to ${written.previousTarget || 'another file'}; it has been replaced with a regular file (the previous contents are in /etc/resolv.conf.whm-bak).`);
+        if (resolvedOwnsFile(before, fileBefore)) notes.push('systemd-resolved is stopped; keep it disabled (systemctl disable systemd-resolved) or it recreates the stub on its next start.');
         else if (['networkmanager', 'resolvconf', 'dhcp'].includes(before.managedBy)) notes.push(`/etc/resolv.conf was generated by ${before.managedBy}; that tool may overwrite the panel's file on the next network event.`);
-        await agent.op('sys.resolvers.set', { nameservers: unique, search }, { req });
       }
       settings.set('networking.resolvers.search', search);
       if (applyToDns) settings.set('dns.resolvers', unique);
       const after = await readResolvers();
-      const applied = target === 'resolved' ? null : after.nameservers.join(',') === unique.join(',');
+      const fileAfter = target === 'resolved' ? fileBefore : await inspectResolvFile();
+      // A static write only counts when the file now holds the servers and is a
+      // regular file: writing through a surviving symlink lands in tmpfs.
+      const applied = target === 'resolved' ? null : after.nameservers.join(',') === unique.join(',') && fileAfter.isRegular === true && fileAfter.isSymlink !== true;
+      if (target === 'file' && applied === false && fileAfter.isSymlink) notes.push(`/etc/resolv.conf is still a symlink to ${fileAfter.target || 'another file'}; the servers were not applied to a static file.`);
       const summary = { nameservers: unique, search };
       recordChange('resolvers', req, { nameservers: before.nameservers, search: before.search }, summary, target);
-      audit(req, { action: 'networking.resolvers.set', target: path, args: { nameservers: unique, search, applyToDns, target, restarted, applied } });
-      const result = { target, path, nameservers: unique, search, restarted, applied, appliedToDns: Boolean(applyToDns), notes, managedBy: after.managedBy };
+      audit(req, { action: 'networking.resolvers.set', target: path, args: { nameservers: unique, search, applyToDns, target, restarted, applied, replacedSymlink } });
+      const result = { target, path, nameservers: unique, search, restarted, applied, replacedSymlink, appliedToDns: Boolean(applyToDns), notes, managedBy: after.managedBy, file: fileAfter };
       if (test) result.test = await service.testResolvers({ nameservers: unique });
       return result;
     },

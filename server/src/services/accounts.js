@@ -55,6 +55,29 @@ export function createAccountsService(ctx) {
   // without the tooling the account is still recorded so the UI can be exercised.
   function strict() { return config.env === 'production'; }
 
+  // Scheduler-driven calls carry no request; the row is still written (principal null).
+  const audit = (req, entry) => (req?.audit ? req.audit(entry) : ctx.auditRecord?.(null, entry));
+  const quotaArgs = (username, mb, filesystem) => ({ username, softMb: mb || 0, hardMb: mb ? Math.round(mb * 1.05) : 0, filesystem });
+  // Quotas are per filesystem: /home (or /home2 after a rearrange) is often its own.
+  async function homeFilesystem(dir) {
+    try { return (await ctx.accountFunctions?.mountpointFor?.(dir)) || '/'; } catch { return '/'; }
+  }
+  // The web side of a suspension (every vhost pointed at the suspended page) is
+  // Service Configuration's: ctx.web.setSuspended(username, suspended, req) ->
+  // { applied, reason }. Without the hook the Linux lock alone applies and the
+  // caller is told; a web failure never leaves the account half-suspended.
+  async function applyWebSuspension(username, suspended, req) {
+    if (!ctx.web) return { applied: false, reason: 'web_category_missing' };
+    if (!ctx.web.setSuspended) return { applied: false, reason: 'web_hook_missing' };
+    try {
+      const r = await ctx.web.setSuspended(username, suspended, req);
+      return { applied: Boolean(r?.applied), reason: r?.reason ?? null };
+    } catch (err) {
+      logger.warn({ err, username, suspended }, 'web suspension hook failed');
+      return { applied: false, reason: err.message };
+    }
+  }
+
   function indexHtml(domain, username) {
     try { if (ctx.accountFunctions) return ctx.accountFunctions.renderTemplate('index', { domain, username }); } catch (err) { logger.warn({ err }, 'index template unavailable; using the built-in page'); }
     return defaultIndexHtml(domain);
@@ -84,7 +107,8 @@ export function createAccountsService(ctx) {
     }, () => ctx.web.removeAccount(username, null));
     await run('dns', async () => {
       if (!ctx.dns) return { status: 'skipped', detail: 'DNS Functions is not loaded' };
-      const r = await ctx.dns.ensureZoneForDomain(domain, { ip: ip || undefined, accountId: id }, req);
+      const nameservers = ctx.resellers?.nameserversFor?.(account.owner_id) ?? [];
+      const r = await ctx.dns.ensureZoneForDomain(domain, { ip: ip || undefined, accountId: id, nameservers: nameservers.length ? nameservers : undefined }, req);
       return { status: r.applied ? 'applied' : r.reason === 'capability_missing' || r.applied === false ? 'pending' : 'applied', detail: r.applied ? `zone ${domain} loaded into BIND (serial ${r.serial})` : r.created === false && !r.reason ? 'zone already existed and is now owned by this account' : 'BIND is not installed; the zone is published when it is', serial: r.serial ?? null, created: r.created ?? null };
     }, () => ctx.dns.removeZonesForAccount(id, null));
     await run('mail', async () => {
@@ -203,7 +227,7 @@ export function createAccountsService(ctx) {
           await agent.op('fs.write_file', { path: `${homeDir}/public_html/index.html`, content: indexHtml(input.domain, username), owner: username, mode: '0644', backup: false }, { req });
           if (input.password) await agent.op('user.set_password', { username, password: input.password }, { req });
           if (plan.disk_mb && capabilities.has('quota')) {
-            await tryOp('user.set_quota', { username, softMb: plan.disk_mb, hardMb: Math.round(plan.disk_mb * 1.05), filesystem: '/' }, req, undo);
+            await tryOp('user.set_quota', quotaArgs(username, plan.disk_mb, await homeFilesystem(homeDir)), req, undo);
           }
         }
 
@@ -220,7 +244,7 @@ export function createAccountsService(ctx) {
 
         undo.push(() => Promise.resolve(stmts.remove.run(account.id)));
         const provisioning = await provision(account, { ip, user, req, undo, want: { web: true, dns: true, mail: true, ...(input.provision || {}) } });
-        req?.audit?.({ action: 'account.create', target: username, args: { domain: input.domain, package: pkgName, owner: ownerId, ip, provisioning: Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])) } });
+        audit(req, { action: 'account.create', target: username, args: { domain: input.domain, package: pkgName, owner: ownerId, ip, provisioning: Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])) } });
         return { ...shape(stmts.byUsername.get(username)), domains: stmts.domains.all(account.id), provisioning: { systemUser: Boolean(sysUser), ...Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])), steps: provisioning.steps } };
       } catch (err) {
         for (const step of undo.reverse()) await step().catch((e) => logger.error({ err: e }, 'rollback step failed'));
@@ -230,39 +254,47 @@ export function createAccountsService(ctx) {
 
     async suspend(username, reason, user, req) {
       const account = load(username, user);
+      ctx.resellers?.assertAcl?.(user, 'suspend-acct');
       if (account.suspended) throw conflict('Account is already suspended');
+      // usermod -L blocks every login that authenticates against the system
+      // user (SSH, FTP, IMAP/POP via PAM); the web sites go through the hook.
       if (account.uid != null) await tryOp('user.lock', { username }, req, []);
       stmts.suspend.run(reason || null, account.id);
-      req?.audit?.({ action: 'account.suspend', target: username, args: { reason } });
-      return shape(stmts.byUsername.get(username));
+      const web = await applyWebSuspension(username, true, req);
+      audit(req, { action: 'account.suspend', target: username, args: { reason, web, ...(req ? {} : { by: user?.username ?? 'scheduler' }) } });
+      return { ...shape(stmts.byUsername.get(username)), web };
     },
 
     async unsuspend(username, user, req) {
       const account = load(username, user);
+      ctx.resellers?.assertAcl?.(user, 'suspend-acct');
       if (!account.suspended) throw conflict('Account is not suspended');
       if (account.uid != null) await tryOp('user.unlock', { username }, req, []);
       stmts.unsuspend.run(account.id);
-      req?.audit?.({ action: 'account.unsuspend', target: username });
-      return shape(stmts.byUsername.get(username));
+      const web = await applyWebSuspension(username, false, req);
+      audit(req, { action: 'account.unsuspend', target: username, args: { web, ...(req ? {} : { by: user?.username ?? 'scheduler' }) } });
+      return { ...shape(stmts.byUsername.get(username)), web };
     },
 
     async terminate(username, { keepDns = false } = {}, user, req) {
       const account = load(username, user);
+      ctx.resellers?.assertAcl?.(user, 'kill-acct');
       const cleanup = await cleanupAccount(account, { keepDns }, req);
       if (account.uid != null) await tryOp('user.delete', { username, removeHome: true }, req, []);
       db.transaction(() => {
         stmts.remove.run(account.id);
         if (!keepDns) db.prepare('DELETE FROM dns_zones WHERE account_id = ?').run(account.id);
       })();
-      req?.audit?.({ action: 'account.terminate', target: username, args: { domain: account.domain, keepDns, cleanup } });
+      audit(req, { action: 'account.terminate', target: username, args: { domain: account.domain, keepDns, cleanup } });
       return { username, domain: account.domain, terminated: true };
     },
 
     async setPassword(username, password, user, req) {
       const account = load(username, user);
+      ctx.resellers?.assertAcl?.(user, 'passwd');
       if (account.uid != null) await tryOp('user.set_password', { username, password }, req, []);
       db.prepare("UPDATE accounts SET force_password_change = 0, updated_at = datetime('now') WHERE id = ?").run(account.id);
-      req?.audit?.({ action: 'account.password', target: username });
+      audit(req, { action: 'account.password', target: username });
       return { username };
     },
 
@@ -289,14 +321,16 @@ export function createAccountsService(ctx) {
         if (!owner) throw notFound(`Owner "${input.owner}"`);
         next.owner_id = owner.id;
       }
+      // Resellers stay within their ACLs, limits, package list and IP delegation after creation too.
+      if (!isRoot(user)) ctx.resellers?.modifyPolicy?.(user, account, { pkgName: input.package, diskQuotaMb: next.disk_quota_mb, bandwidthLimitMb: next.bandwidth_limit_mb, ip: next.ip });
       if (account.uid != null) {
         if (next.shell !== account.shell) await tryOp('user.set_shell', { username, shell: next.shell }, req, []);
         if (next.disk_quota_mb !== account.disk_quota_mb && capabilities.has('quota')) {
-          await tryOp('user.set_quota', { username, softMb: next.disk_quota_mb || 0, hardMb: next.disk_quota_mb ? Math.round(next.disk_quota_mb * 1.05) : 0, filesystem: '/' }, req, []);
+          await tryOp('user.set_quota', quotaArgs(username, next.disk_quota_mb, await homeFilesystem(account.home_dir || `${settings.get('basic.home_root')}/${username}`)), req, []);
         }
       }
       stmts.update.run({ ...next, id: account.id, plan: next.plan_snapshot_json });
-      req?.audit?.({ action: 'account.modify', target: username, args: input });
+      audit(req, { action: 'account.modify', target: username, args: input });
       return shape(stmts.byUsername.get(username));
     },
 

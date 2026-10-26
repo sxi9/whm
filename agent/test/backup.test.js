@@ -10,7 +10,7 @@ vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
   return { ...mod, exec: vi.fn(mod.exec), hasBinary: vi.fn(mod.hasBinary) };
 });
-const { exec } = await import('../src/exec.js');
+const { exec, hasBinary } = await import('../src/exec.js');
 
 const ctx = createContext();
 const ARCHIVE = '/backup/backup-10.26.2026_02-00-00_alice.tar.gz';
@@ -95,6 +95,19 @@ describe('backup schemas reject injection and traversal before anything runs', (
     expect((await opError(runOp('backup.archive.extract', { archive: ARCHIVE, dest: '/root/x' }, ctx))).code).toBe('path_not_allowed');
     expect((await opError(runOp('backup.staging.remove', { dir: '/backup' }, ctx))).code).toBe('refused');
     expect((await opError(runOp('backup.staging.remove', { dir: '/etc/.restore-1' }, ctx))).code).toBe('path_not_allowed');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('backup.files.restore extracts with the account\'s privileges, so it needs setpriv and never runs for uid 0', async () => {
+    exec.mockClear();
+    hasBinary.mockImplementation((name) => name !== 'setpriv');
+    try {
+      const err = await opError(runOp('backup.files.restore', { archive: ARCHIVE, username: 'alice', homeDir: '/home/alice' }, ctx));
+      expect(err.code).toBe('capability_missing');
+      expect(err.message).toMatch(/setpriv/);
+    } finally { hasBinary.mockRestore(); }
+    // root exists on every host; the op refuses before touching the archive or the home.
+    expect((await opError(runOp('backup.files.restore', { archive: '/tmp/whm/backup-10.26.2026_02-00-00_root.tar.gz', username: 'root', homeDir: '/home/root-restore' }, ctx))).code).toBe('refused');
     expect(exec).not.toHaveBeenCalled();
   });
 

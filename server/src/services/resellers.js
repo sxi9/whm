@@ -6,11 +6,18 @@ import { isRoot } from '../middleware/rbac.js';
 // Resellers. Attached as ctx.resellers; other categories may call:
 //   resellers.aclsFor(userId)                 -> Set of granted ACL keys ('all' = every privilege)
 //   resellers.hasAcl(user, key)               -> root always true; resellers per reseller_acls
+//   resellers.assertAcl(user, key)            -> throws 403 unless hasAcl
 //   resellers.createPolicy(user, { pkgName, plan, ip }) -> throws when a reseller's limits or
 //                                                package/IP delegation forbid the account; returns { sharedIp }
+//   resellers.modifyPolicy(user, account, { pkgName, diskQuotaMb, bandwidthLimitMb, ip })
+//                                             -> same checks for an existing account's new values
+//   resellers.nameserversFor(ownerId)         -> the owner's nameservers ([] when the server defaults apply)
 //   resellers.sharedIpFor(user)               -> the reseller's shared IP or null
 //   resellers.delegatedAddresses(userId)      -> ip_addresses rows delegated to a reseller
 //   resellers.isReseller(username)
+// ACLs are "configured" once any privilege editor saved them: every ACL key is
+// then stored with value 0/1, so an empty selection denies everything. A reseller
+// with no rows at all predates the editor and keeps ownership-only access.
 // Privilege suspension sets users.suspended (the panel login is the reseller's
 // WHM access); the hosting account itself is left alone, as in WHM.
 
@@ -100,10 +107,10 @@ export function createResellersService(ctx) {
         nameservers = excluded.nameservers, shared_ip = excluded.shared_ip, allowed_packages = excluded.allowed_packages, oversell_disk = excluded.oversell_disk, oversell_bandwidth = excluded.oversell_bandwidth,
         privileges_suspended = excluded.privileges_suspended, suspended_reason = excluded.suspended_reason, account_id = excluded.account_id, notes = excluded.notes, updated_at = datetime('now')`),
     deleteLimits: db.prepare('DELETE FROM reseller_limits WHERE reseller_id = ?'),
-    acls: db.prepare('SELECT acl_key FROM reseller_acls WHERE reseller_id = ? AND value = 1 ORDER BY acl_key'),
-    aclCount: db.prepare('SELECT COUNT(*) AS n FROM reseller_acls WHERE reseller_id = ?'),
+    acls: db.prepare('SELECT acl_key, value FROM reseller_acls WHERE reseller_id = ? ORDER BY acl_key'),
+    aclCount: db.prepare('SELECT COUNT(*) AS n FROM reseller_acls WHERE reseller_id = ? AND value = 1'),
     clearAcls: db.prepare('DELETE FROM reseller_acls WHERE reseller_id = ?'),
-    insertAcl: db.prepare('INSERT OR REPLACE INTO reseller_acls (reseller_id, acl_key, value) VALUES (?, ?, 1)'),
+    insertAcl: db.prepare('INSERT OR REPLACE INTO reseller_acls (reseller_id, acl_key, value) VALUES (?, ?, ?)'),
     aclLists: db.prepare('SELECT * FROM reseller_acl_lists ORDER BY builtin DESC, name'),
     aclList: db.prepare('SELECT * FROM reseller_acl_lists WHERE name = ?'),
     upsertAclList: db.prepare("INSERT INTO reseller_acl_lists (name, acls_json) VALUES (?, ?) ON CONFLICT (name) DO UPDATE SET acls_json = excluded.acls_json, updated_at = datetime('now')"),
@@ -142,7 +149,11 @@ export function createResellersService(ctx) {
     return user;
   }
   const limitsOf = (userId) => ({ ...EMPTY_LIMITS, ...(stmts.limits.get(userId) || {}) });
-  const aclsOf = (userId) => stmts.acls.all(userId).map((r) => r.acl_key);
+  function aclState(userId) {
+    const rows = stmts.acls.all(userId);
+    return { configured: rows.length > 0, granted: new Set(rows.filter((r) => r.value === 1).map((r) => r.acl_key)) };
+  }
+  const aclsOf = (userId) => [...aclState(userId).granted];
 
   function shapeLimits(row) {
     return {
@@ -173,7 +184,7 @@ export function createResellersService(ctx) {
       suspended: Boolean(limits.privileges_suspended) || Boolean(user.suspended), suspended_reason: limits.suspended_reason ?? null,
       configured: Boolean(stmts.limits.get(user.id)), created_at: user.created_at, last_login_at: user.last_login_at,
       account: account ? { id: account.id, username: account.username, domain: account.domain, suspended: Boolean(account.suspended) } : null,
-      limits: shapeLimits(limits), acls, acl_count: withAcls ? acls.length : stmts.aclCount.get(user.id).n,
+      limits: shapeLimits(limits), acls, acl_count: withAcls ? acls.length : stmts.aclCount.get(user.id).n, acls_configured: aclState(user.id).configured,
       delegated_ips: stmts.delegatedTo.all(user.id).map((r) => r.address),
       usage: { ...s, accounts_percent: percent(s.accounts, limits.max_accounts), disk_percent: percent(s.disk_allocated_mb, limits.max_disk_mb), bandwidth_percent: percent(s.bandwidth_allocated_mb, limits.max_bandwidth_mb),
         over_accounts: limits.max_accounts != null && s.accounts > limits.max_accounts, over_disk: limits.max_disk_mb != null && !limits.oversell_disk && s.disk_allocated_mb > limits.max_disk_mb, over_bandwidth: limits.max_bandwidth_mb != null && !limits.oversell_bandwidth && s.bandwidth_allocated_mb > limits.max_bandwidth_mb },
@@ -186,8 +197,14 @@ export function createResellersService(ctx) {
     return [...new Set(acls)];
   }
 
-  function validatePackages(names = []) {
-    for (const n of names) if (!stmts.packageByName.get(n)) throw unprocessable(`Package "${n}" does not exist`, { allowedPackages: [`Unknown package "${n}"`] });
+  // Another reseller's packages are never visible to this one (packages.js hides them),
+  // so they cannot be put on its allowed list either.
+  function validatePackages(names = [], userId) {
+    for (const n of names) {
+      const pkg = stmts.packageByName.get(n);
+      if (!pkg) throw unprocessable(`Package "${n}" does not exist`, { allowedPackages: [`Unknown package "${n}"`] });
+      if (pkg.owner_id != null && pkg.owner_id !== userId) throw unprocessable(`Package "${n}" belongs to another reseller`, { allowedPackages: [`"${n}" is owned by another reseller`] });
+    }
     return [...new Set(names)];
   }
 
@@ -210,7 +227,7 @@ export function createResellersService(ctx) {
     if (input.ownsNameservers !== undefined) next.owns_nameservers = input.ownsNameservers ? 1 : 0;
     if (input.nameservers !== undefined) next.nameservers = JSON.stringify([...new Set(input.nameservers.map((n) => n.toLowerCase().replace(/\.$/, '')))]);
     if (input.sharedIp !== undefined) next.shared_ip = validateSharedIp(input.sharedIp, userId);
-    if (input.allowedPackages !== undefined) next.allowed_packages = JSON.stringify(validatePackages(input.allowedPackages));
+    if (input.allowedPackages !== undefined) next.allowed_packages = JSON.stringify(validatePackages(input.allowedPackages, userId));
     if (input.notes !== undefined) next.notes = input.notes;
     if (input.accountId !== undefined) next.account_id = input.accountId;
     stmts.upsertLimits.run(next);
@@ -218,9 +235,10 @@ export function createResellersService(ctx) {
   }
 
   function writeAcls(userId, acls) {
+    const granted = new Set(acls);
     db.transaction(() => {
       stmts.clearAcls.run(userId);
-      for (const a of acls) stmts.insertAcl.run(userId, a);
+      for (const key of ACL_KEYS) stmts.insertAcl.run(userId, key, granted.has(key) ? 1 : 0);
     })();
   }
 
@@ -358,17 +376,20 @@ export function createResellersService(ctx) {
 
   // --- IP delegation / shared IP ---------------------------------------------------
 
+  // A reseller sees only the addresses it may use (its delegated ones and the
+  // shared IPs) and never which other tenants hold the rest.
   function delegation(username, user) {
     assertSelfOrRoot(username, user);
     const reseller = loadReseller(username);
     const limits = limitsOf(reseller.id);
     const sharedIp = settings.get('basic.shared_ip') || null;
+    const root = isRoot(user);
     const addresses = stmts.ips.all().map((r) => ({
       address: r.address, family: r.family, interface: r.interface, is_main: Boolean(r.is_main), reserved: Boolean(r.reserved), managed: Boolean(r.managed),
-      dedicated_to: r.dedicated_account ?? null, delegated_to: r.delegated_user ?? null, delegated: r.delegated_to === reseller.id,
-      server_shared: r.address === sharedIp, reseller_shared: r.address === limits.shared_ip,
+      dedicated_to: root ? r.dedicated_account ?? null : null, delegated_to: root ? r.delegated_user ?? null : r.delegated_to === reseller.id ? username : null,
+      delegated: r.delegated_to === reseller.id, server_shared: r.address === sharedIp, reseller_shared: r.address === limits.shared_ip,
       delegatable: Boolean(r.managed) && !r.is_main && !r.reserved && !r.dedicated_to && (r.delegated_to == null || r.delegated_to === reseller.id),
-    }));
+    })).filter((a) => root || a.delegated || a.server_shared || a.reseller_shared);
     return { reseller: username, shared_ip: limits.shared_ip, server_shared_ip: sharedIp, addresses, delegated: addresses.filter((a) => a.delegated).map((a) => a.address) };
   }
 
@@ -517,53 +538,101 @@ export function createResellersService(ctx) {
 
   // --- Hooks for other categories ---------------------------------------------------------
 
-  const aclsFor = (userId) => new Set(aclsOf(userId));
+  const aclsFor = (userId) => aclState(userId).granted;
   function hasAcl(user, key) {
     if (!user) return false;
     if (isRoot(user)) return true;
     if (user.role !== 'reseller') return false;
-    const granted = aclsFor(user.id);
-    return granted.has('all') || granted.has(key);
+    const { configured, granted } = aclState(user.id);
+    return !configured || granted.has('all') || granted.has(key);
+  }
+  const ACL_LABELS = Object.fromEntries(ACL_GROUPS.flatMap((g) => g.acls.map((a) => [a.key, a.label])));
+  function assertAcl(user, key) {
+    if (!hasAcl(user, key)) throw forbidden(`Your reseller privileges do not include "${ACL_LABELS[key] || key}"`);
   }
   function sharedIpFor(user) {
     if (!user || isRoot(user)) return null;
     return stmts.limits.get(user.id)?.shared_ip ?? null;
   }
+  function nameserversFor(ownerId) {
+    const row = ownerId ? stmts.limits.get(ownerId) : null;
+    return row ? parseList(row.nameservers) : [];
+  }
+
+  // Shared by the create and modify policies. `exclude` is the account being
+  // changed, so its current allocation does not count against the limit twice.
+  function policyContext(user) {
+    const limits = { ...EMPTY_LIMITS, ...(stmts.limits.get(user.id) || {}) };
+    if (limits.privileges_suspended) throw forbidden('Your reseller privileges are suspended');
+    const { configured, granted } = aclState(user.id);
+    return {
+      limits, configured,
+      allowed: (key) => !configured || granted.has('all') || granted.has(key),
+      explicitly: (key) => configured && (granted.has('all') || granted.has(key)),
+    };
+  }
+
+  // Global (root-owned) packages are subject to the allowed list and the
+  // viewglobalpackages privilege; another reseller's packages are never usable.
+  function assertPackageUsable(user, pol, pkgName) {
+    const pkg = pkgName ? stmts.packageByName.get(pkgName) : null;
+    if (!pkg || pkg.owner_id === user.id) return;
+    const allowedPackages = parseList(pol.limits.allowed_packages);
+    const usable = pkg.owner_id == null && (allowedPackages.length ? allowedPackages.includes(pkg.name) : pol.allowed('viewglobalpackages'));
+    if (!usable) throw forbidden(`Package "${pkg.name}" is not available to your reseller account`);
+  }
+
+  function assertAllocation(pol, kind, { allocated, next, unlimitedAcl, label }) {
+    const { limits } = pol;
+    const max = kind === 'disk' ? limits.max_disk_mb : limits.max_bandwidth_mb;
+    const oversell = kind === 'disk' ? limits.oversell_disk : limits.oversell_bandwidth;
+    if (max == null || oversell) return;
+    if (next == null) { if (!pol.explicitly(unlimitedAcl)) throw resellerLimit(`Unlimited ${label} is not allowed while your reseller ${label} limit is set`); return; }
+    if (allocated + next > max) throw resellerLimit(`This account would allocate ${allocated + next} MB of ${label}, over your reseller limit of ${max} MB`);
+  }
+
+  function assertIpUsable(user, pol, ip) {
+    if (!ip) return;
+    const row = stmts.ipByAddress.get(ip);
+    const usable = ip === pol.limits.shared_ip || ip === (settings.get('basic.shared_ip') || null) || (row && row.delegated_to === user.id);
+    if (!usable) throw forbidden(`${ip} is not delegated to your reseller account`);
+  }
 
   // Called by accounts.create for resellers. Limits apply only once Reseller
-  // Center wrote a limits row; ACLs apply once any were granted, so a reseller
-  // row inserted by hand (or before this category existed) keeps working.
+  // Center wrote a limits row; ACLs once a privilege editor saved them.
   function createPolicy(user, { pkgName, plan = {}, ip } = {}) {
     if (!user || isRoot(user)) return { sharedIp: null };
-    const limitsRow = stmts.limits.get(user.id);
-    const limits = { ...EMPTY_LIMITS, ...(limitsRow || {}) };
-    if (limits.privileges_suspended) throw forbidden('Your reseller privileges are suspended');
-    const granted = aclsFor(user.id);
-    const configured = granted.size > 0;
-    const allowed = (key) => !configured || granted.has('all') || granted.has(key);
-    const explicitly = (key) => configured && (granted.has('all') || granted.has(key));
-    if (!allowed('create-acct')) throw forbidden('Your reseller privileges do not include creating accounts');
+    const pol = policyContext(user);
+    if (!pol.allowed('create-acct')) throw forbidden('Your reseller privileges do not include creating accounts');
     const s = stats(user.id);
-    if (limits.max_accounts != null && s.accounts >= limits.max_accounts) throw resellerLimit(`You have reached your limit of ${limits.max_accounts} account(s)`);
-    const pkg = pkgName ? stmts.packageByName.get(pkgName) : null;
-    const allowedPackages = parseList(limits.allowed_packages);
-    if (pkg && pkg.owner_id !== user.id) {
-      if (allowedPackages.length ? !allowedPackages.includes(pkg.name) : (configured && !allowed('viewglobalpackages'))) throw forbidden(`Package "${pkg.name}" is not available to your reseller account`);
-    }
-    if (limits.max_disk_mb != null && !limits.oversell_disk) {
-      if (plan.disk_mb == null) { if (!explicitly('allow-unlimited-disk-pkgs')) throw resellerLimit('Packages with unlimited disk space are not allowed while your reseller disk limit is set'); }
-      else if (s.disk_allocated_mb + plan.disk_mb > limits.max_disk_mb) throw resellerLimit(`This account would allocate ${s.disk_allocated_mb + plan.disk_mb} MB of disk, over your reseller limit of ${limits.max_disk_mb} MB`);
-    }
-    if (limits.max_bandwidth_mb != null && !limits.oversell_bandwidth) {
-      if (plan.bandwidth_mb == null) { if (!explicitly('allow-unlimited-bw-pkgs')) throw resellerLimit('Packages with unlimited bandwidth are not allowed while your reseller bandwidth limit is set'); }
-      else if (s.bandwidth_allocated_mb + plan.bandwidth_mb > limits.max_bandwidth_mb) throw resellerLimit(`This account would allocate ${s.bandwidth_allocated_mb + plan.bandwidth_mb} MB of bandwidth, over your reseller limit of ${limits.max_bandwidth_mb} MB`);
-    }
-    if (ip) {
-      const row = stmts.ipByAddress.get(ip);
-      const usable = ip === limits.shared_ip || ip === (settings.get('basic.shared_ip') || null) || (row && row.delegated_to === user.id);
-      if (!usable) throw forbidden(`${ip} is not delegated to your reseller account`);
-    }
-    return { sharedIp: limits.shared_ip || null };
+    if (pol.limits.max_accounts != null && s.accounts >= pol.limits.max_accounts) throw resellerLimit(`You have reached your limit of ${pol.limits.max_accounts} account(s)`);
+    assertPackageUsable(user, pol, pkgName);
+    assertAllocation(pol, 'disk', { allocated: s.disk_allocated_mb, next: plan.disk_mb ?? null, unlimitedAcl: 'allow-unlimited-disk-pkgs', label: 'disk space' });
+    assertAllocation(pol, 'bandwidth', { allocated: s.bandwidth_allocated_mb, next: plan.bandwidth_mb ?? null, unlimitedAcl: 'allow-unlimited-bw-pkgs', label: 'bandwidth' });
+    assertIpUsable(user, pol, ip);
+    return { sharedIp: pol.limits.shared_ip || null };
+  }
+
+  // Called by accounts.modify for resellers with the values the account will
+  // have after the change; only what actually changes is checked, so an
+  // account that already exceeds a later-lowered limit can still be edited.
+  function modifyPolicy(user, account, { pkgName, diskQuotaMb, bandwidthLimitMb, ip } = {}) {
+    if (!user || isRoot(user)) return;
+    const pol = policyContext(user);
+    if (!pol.allowed('edit-account')) throw forbidden('Your reseller privileges do not include modifying accounts');
+    const packageChanged = pkgName && pkgName !== account.package_name;
+    const diskChanged = diskQuotaMb !== undefined && diskQuotaMb !== account.disk_quota_mb;
+    const bwChanged = bandwidthLimitMb !== undefined && bandwidthLimitMb !== account.bandwidth_limit_mb;
+    const ipChanged = ip && ip !== account.ip;
+    if (packageChanged && !pol.allowed('upgrade-account')) throw forbidden('Your reseller privileges do not include upgrading or downgrading accounts');
+    if (diskChanged && !packageChanged && !pol.allowed('quota')) throw forbidden('Your reseller privileges do not include modifying disk quotas');
+    if (bwChanged && !packageChanged && !pol.allowed('limit-bandwidth')) throw forbidden('Your reseller privileges do not include limiting bandwidth');
+    if (ipChanged && !pol.allowed('add-pkg-ip')) throw forbidden('Your reseller privileges do not include assigning IP addresses');
+    if (packageChanged) assertPackageUsable(user, pol, pkgName);
+    const s = stats(user.id);
+    if (diskChanged) assertAllocation(pol, 'disk', { allocated: s.disk_allocated_mb - (account.disk_quota_mb || 0), next: diskQuotaMb, unlimitedAcl: 'allow-unlimited-disk-pkgs', label: 'disk space' });
+    if (bwChanged) assertAllocation(pol, 'bandwidth', { allocated: s.bandwidth_allocated_mb - (account.bandwidth_limit_mb || 0), next: bandwidthLimitMb, unlimitedAcl: 'allow-unlimited-bw-pkgs', label: 'bandwidth' });
+    if (ipChanged) assertIpUsable(user, pol, ip);
   }
 
   function catalog() {
@@ -592,7 +661,7 @@ export function createResellersService(ctx) {
     catalog, create, update, setPrivileges, setSuspended, reset, aclLists,
     delegation, setDelegation, setSharedIp, changeOwner, changeOwnerBulk, accounts, usage, usageAll,
     recipients, emailAll, runEmailAll,
-    aclsFor, hasAcl, sharedIpFor, createPolicy, delegatedAddresses: (userId) => stmts.delegatedTo.all(userId),
+    aclsFor, hasAcl, assertAcl, sharedIpFor, nameserversFor, createPolicy, modifyPolicy, delegatedAddresses: (userId) => stmts.delegatedTo.all(userId),
     isReseller: (username) => stmts.userByUsername.get(username)?.role === 'reseller',
   };
 }

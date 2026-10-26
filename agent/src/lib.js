@@ -33,6 +33,7 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/etc/systemd/resolved.conf.d',
   '/etc/awstats',
   '/etc/aliases',
+  '/etc/resolv.conf',
 ];
 
 export function createContext({ allowedRoots = DEFAULT_ALLOWED_ROOTS, principal = null, log = () => {} } = {}) {

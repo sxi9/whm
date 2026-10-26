@@ -61,12 +61,22 @@ export function createMultiAccountService(ctx) {
   const maxBatch = () => Number(settings.get('multi_account.max_batch', 500)) || 500;
 
   // A request-like principal for the job worker so ctx.accounts / ctx.web / ctx.dns
-  // audit and authorise as the user who started the run.
+  // audit and authorise as the user who started the run. Host operations run as
+  // root, so a run whose user is gone is refused rather than given a root actor.
   function actorRequest(userId, requestId) {
-    const user = (userId && stmts.userById.get(userId)) || { id: null, username: 'scheduler', role: 'root' };
+    const user = userId ? stmts.userById.get(userId) : null;
+    if (!user) throw unprocessable('The user who started this run no longer exists; nothing was changed', { user: ['Unknown user'] });
     const req = { user, ip: null, id: requestId ?? null };
     req.audit = (entry) => ctx.auditRecord?.(req, entry);
     return req;
+  }
+
+  // Marks every queued item skipped and the run failed when it cannot start.
+  function abandonRun(runId, reason) {
+    db.transaction(() => {
+      for (const item of stmts.queuedItems.all(runId)) finishItem(item, { status: 'skipped', detail: reason, steps: json.parse(item.steps_json, {}) });
+      stmts.finishRun.run('failed', JSON.stringify(totalsOf(runId)), runId);
+    })();
   }
 
   const summary = (a) => ({
@@ -236,19 +246,24 @@ export function createMultiAccountService(ctx) {
     const previous = account.ip;
     const ipSvc = ctx.ip;
     const steps = { ip: { status: 'applied', from: previous, to: ip }, dedicated: null, web: null, dns: [] };
+    // ip-functions treats an address any account uses as taken, so the dedication
+    // decision and allocateDedicated (which sets accounts.ip itself) come before
+    // the row moves. Vhost and zone renderers then read the new accounts.ip; the
+    // dedication and the row are put back when a later step throws.
     const dedicatedBefore = ipSvc ? ipSvc.all().filter((r) => r.dedicated_to === account.username).map((r) => r.address) : [];
-    // Vhost and zone renderers read accounts.ip, so the row changes first and is
-    // put back when a step throws.
-    stmts.setIp.run(ip, account.id);
+    const keepsDedication = dedicatedBefore.includes(ip);
+    const dedicate = Boolean(ipSvc) && !keepsDedication && ip !== ipSvc.sharedIp() && ipSvc.freeAddresses(familyOf(ip)).some((r) => r.address === ip);
+    const releases = Boolean(ipSvc) && dedicatedBefore.length > 0 && !keepsDedication;
+    const restore = () => {
+      if (dedicate) ipSvc.releaseDedicated(account.id, req);
+      if (releases) for (const address of dedicatedBefore) { try { ipSvc.allocateDedicated(account.id, req, { address }); } catch (err) { logger.warn({ err, address }, 'multi-account: could not re-dedicate the previous address'); } }
+      stmts.setIp.run(previous, account.id);
+    };
+    if (releases) ipSvc.releaseDedicated(account.id, req);
+    if (dedicate) ipSvc.allocateDedicated(account.id, req, { address: ip });
+    else stmts.setIp.run(ip, account.id);
+    if (dedicate || keepsDedication) steps.dedicated = ip;
     try {
-      if (ipSvc) {
-        const shared = ipSvc.sharedIp();
-        const free = ipSvc.freeAddresses(familyOf(ip)).some((r) => r.address === ip);
-        if (ip !== shared && (free || dedicatedBefore.includes(ip))) {
-          if (!dedicatedBefore.includes(ip)) { ipSvc.releaseDedicated(account.id, req); ipSvc.allocateDedicated(account.id, req, { address: ip }); }
-          steps.dedicated = ip;
-        } else if (dedicatedBefore.length) { ipSvc.releaseDedicated(account.id, req); stmts.setIp.run(ip, account.id); }
-      }
       if (!updateVhosts) steps.web = { status: 'skipped', detail: 'not requested' };
       else if (!ctx.web) steps.web = { status: 'skipped', detail: 'Service Configuration is not loaded' };
       else {
@@ -278,7 +293,7 @@ export function createMultiAccountService(ctx) {
         }
       }
     } catch (err) {
-      stmts.setIp.run(previous, account.id);
+      try { restore(); } catch (undoErr) { logger.error({ err: undoErr, username: account.username }, 'multi-account: could not put the address back'); }
       throw err;
     }
     audit(req, { action: 'account.ip.change', target: account.username, args: { from: previous, to: ip, dedicated: steps.dedicated, web: steps.web?.status, dns: steps.dns.length, bulk: true } });
@@ -296,7 +311,8 @@ export function createMultiAccountService(ctx) {
     const { runId, userId } = jobCtx.params;
     const run = stmts.run.get(runId);
     if (!run) throw new Error(`run ${runId} not found`);
-    const req = actorRequest(userId ?? run.created_by, `job:${jobCtx.job?.id ?? ''}`);
+    let req;
+    try { req = actorRequest(userId ?? run.created_by, `job:${jobCtx.job?.id ?? ''}`); } catch (err) { abandonRun(runId, err.message); throw err; }
     const user = req.user;
     const params = json.parse(run.params_json, {});
     stmts.runStatus.run('running', runId);
@@ -399,7 +415,8 @@ export function createMultiAccountService(ctx) {
     const { runId, userId } = jobCtx.params;
     const run = stmts.run.get(runId);
     if (!run) throw new Error(`run ${runId} not found`);
-    const req = actorRequest(userId ?? run.created_by, `job:${jobCtx.job?.id ?? ''}`);
+    let req;
+    try { req = actorRequest(userId ?? run.created_by, `job:${jobCtx.job?.id ?? ''}`); } catch (err) { abandonRun(runId, err.message); throw err; }
     const user = req.user;
     const { changes = {}, applyPhp = true } = json.parse(run.params_json, {});
     const patch = Object.fromEntries(Object.entries(changes).filter(([k, v]) => MODIFY_FIELDS.includes(k) && v !== undefined));

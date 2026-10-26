@@ -127,9 +127,28 @@ describe('Backup API', () => {
       const res = await put('/config', { 'backup.schedule': 'every day', 'backup.excludes': ['../etc'] }).expect(422);
       expect(res.body.error.fields['backup.schedule']).toBeDefined();
       expect(res.body.error.fields['backup.excludes.0']).toBeDefined();
+      for (const cron of ['0 2 * * 8', '99 2 * * *', 'a b c d e', '*/0 * * * *']) {
+        const bad = await put('/config', { 'backup.schedule': cron }).expect(422);
+        expect(bad.body.error.fields['backup.schedule'], cron).toBeDefined();
+      }
+      expect(app.ctx.settings.get('backup.schedule')).toBe('30 3 * * *');
+      expect(app.ctx.db.prepare("SELECT cron FROM schedules WHERE name = 'backup-run'").get().cron).toBe('30 3 * * *');
+      await expect(app.ctx.backup.updateConfig({ 'backup.schedule': '0 2 * * 8' }, null)).rejects.toMatchObject({ status: 422 });
       await put('/config', { 'tweak.max_emails_per_hour': 5 }).expect(422);
       await resellerHttp.get('/api/backup/config').expect(403);
       await resellerHttp.put('/api/backup/config').set('X-CSRF-Token', resellerCsrf).send({ 'backup.enabled': true }).expect(403);
+    });
+
+    it('status shows resellers the capability only, never the server-wide configuration', async () => {
+      const root = await get('/status').expect(200);
+      expect(root.body.data).toMatchObject({ capability: { installed: true }, localDir: { path: '/backup' }, totalAccounts: 2 });
+      expect(root.body.data).toHaveProperty('destinations');
+      expect(root.body.data).toHaveProperty('schedule');
+      expect(root.body.data).toHaveProperty('lastRun');
+      const res = await resellerHttp.get('/api/backup/status').expect(200);
+      expect(res.body.data.capability).toMatchObject({ installed: true, binaries: { tar: true } });
+      expect(res.body.data).toMatchObject({ includedAccounts: 1, totalAccounts: 1 });
+      for (const key of ['destinations', 'localDir', 'schedule', 'lastRun']) expect(res.body.data, key).not.toHaveProperty(key);
     });
   });
 
@@ -443,6 +462,125 @@ describe('Backup API', () => {
       await post('/archives/import', { path: '/backup/cpmove-alice.tar.gz' }).expect(409);
       await post('/archives/import', { path: 'relative.tar.gz' }).expect(422);
       await resellerHttp.post('/api/backup/archives/import').set('X-CSRF-Token', resellerCsrf).send({ path: '/backup/cpmove-alice.tar.gz' }).expect(403);
+    });
+  });
+
+  describe('ownership is fixed on the rows, not derived from the current username', () => {
+    let resell2Http;
+    let resell2Csrf;
+    let oldId;
+
+    beforeAll(async () => {
+      const resell2 = await app.createUser('resell2', 'reseller');
+      const { default: request } = await import('supertest');
+      resell2Http = request.agent(app.ctx.app);
+      const res = await resell2Http.post('/api/auth/login').send({ username: 'resell2', password: resell2.password });
+      resell2Csrf = res.body.data.csrfToken;
+    });
+
+    it('a reseller who recreates a terminated account name cannot reach the previous tenant\'s archives', async () => {
+      await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'dave', domain: 'dave.com', owner: 'resell1' }).expect(201);
+      const run = await post('/runs', { accounts: ['dave'] }).expect(202);
+      expect((await waitForJob(app.ctx, run.body.data.job.id)).status).toBe('done');
+      const old = app.ctx.db.prepare("SELECT id, owner_id FROM backups WHERE account_name = 'dave'").get();
+      oldId = old.id;
+      expect(old.owner_id).toBe(reseller.id);
+      await app.http.delete('/api/accounts/dave').set('X-CSRF-Token', csrf).expect(200);
+      expect(app.ctx.db.prepare('SELECT account_id, owner_id FROM backups WHERE id = ?').get(oldId)).toEqual({ account_id: null, owner_id: reseller.id });
+      await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'dave', domain: 'dave.com', owner: 'resell2' }).expect(201);
+
+      const list = await resell2Http.get('/api/backup/backups').expect(200);
+      expect(list.body.data).toEqual([]);
+      expect((await resell2Http.get('/api/backup/backups?account=dave').expect(200)).body.data).toEqual([]);
+      await resell2Http.get(`/api/backup/backups/${oldId}`).expect(403);
+      await resell2Http.get(`/api/backup/backups/${oldId}/browse`).expect(403);
+      await resell2Http.get(`/api/backup/backups/${oldId}/info`).expect(403);
+      await resell2Http.post(`/api/backup/backups/${oldId}/fetch`).set('X-CSRF-Token', resell2Csrf).expect(403);
+      await resell2Http.post(`/api/backup/backups/${oldId}/restore`).set('X-CSRF-Token', resell2Csrf).send({ kind: 'files', options: { paths: ['public_html'] } }).expect(403);
+      await resell2Http.post(`/api/backup/backups/${oldId}/restore`).set('X-CSRF-Token', resell2Csrf).send({ kind: 'account', options: {} }).expect(403);
+      const overview = await resell2Http.get('/api/backup/accounts').expect(200);
+      expect(overview.body.data).toEqual([expect.objectContaining({ username: 'dave', backups: 0, lastBackup: null })]);
+      expect(app.agent.callsTo('backup.archive.inspect')).toHaveLength(0);
+      expect(app.agent.callsTo('backup.files.restore')).toHaveLength(0);
+
+      // The previous owner keeps their data; root sees everything.
+      expect((await resellerHttp.get(`/api/backup/backups/${oldId}`).expect(200)).body.data).toMatchObject({ account: 'dave', accountExists: true });
+      expect((await get(`/backups/${oldId}`).expect(200)).body.data.account).toBe('dave');
+      expect((await get('/accounts').expect(200)).body.data.find((a) => a.username === 'dave').backups).toBe(1);
+    });
+
+    it('orphaned archives with a reused name are never pruned by the new account\'s runs and restores stay with their owner', async () => {
+      await put('/config', { 'backup.retention_daily': 1, 'backup.retention_weekly': 0, 'backup.retention_monthly': 0 }).expect(200);
+      app.ctx.db.prepare("UPDATE backups SET retention_class = 'daily', created_at = '2026-09-01 02:00:00' WHERE id = ?").run(oldId);
+      for (let i = 0; i < 2; i++) {
+        const run = await resell2Http.post('/api/backup/runs').set('X-CSRF-Token', resell2Csrf).send({ accounts: ['dave'] }).expect(202);
+        expect((await waitForJob(app.ctx, run.body.data.job.id)).status).toBe('done');
+      }
+      const rows = app.ctx.db.prepare("SELECT id, owner_id, account_id FROM backups WHERE account_name = 'dave' ORDER BY id").all();
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toMatchObject({ id: oldId, owner_id: reseller.id, account_id: null });
+      expect(rows[1].owner_id).toBe(app.ctx.db.prepare("SELECT id FROM users WHERE username = 'resell2'").get().id);
+      expect((await resell2Http.get('/api/backup/backups').expect(200)).body.data.map((b) => b.id)).toEqual([rows[1].id]);
+      await put('/config', { 'backup.retention_daily': 7, 'backup.retention_weekly': 4, 'backup.retention_monthly': 3 }).expect(200);
+
+      const restore = await resell2Http.post(`/api/backup/backups/${rows[1].id}/restore`).set('X-CSRF-Token', resell2Csrf).send({ kind: 'files', options: { paths: ['public_html'] } }).expect(202);
+      expect((await waitForJob(app.ctx, restore.body.data.job.id)).status).toBe('done');
+      expect(app.ctx.db.prepare('SELECT owner_id FROM backup_restores WHERE id = ?').get(restore.body.data.restore.id).owner_id).toBe(rows[1].owner_id);
+      await resell2Http.get(`/api/backup/restores/${restore.body.data.restore.id}`).expect(200);
+      await resellerHttp.get(`/api/backup/restores/${restore.body.data.restore.id}`).expect(403);
+      expect((await resellerHttp.get('/api/backup/restores?account=dave').expect(200)).body.data).toEqual([]);
+    });
+
+    it('a restore skips databases, users and zones that now belong to another account', async () => {
+      await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'erin', domain: 'erin.com', provision: { dns: true } }).expect(201);
+      const run = await post('/runs', { accounts: ['erin'] }).expect(202);
+      expect((await waitForJob(app.ctx, run.body.data.job.id)).status).toBe('done');
+      const archived = app.agent.callsTo('backup.account.archive').pop().args;
+      expect(archived.databases).toEqual(['erin_shop']);
+      expect(archived.dnsZones.map((z) => z.domain)).toEqual(['erin.com']);
+      const backup = (await get('/backups?account=erin').expect(200)).body.data[0];
+
+      const bobId = app.ctx.db.prepare("SELECT id FROM accounts WHERE username = 'bob'").get().id;
+      app.ctx.db.prepare('INSERT INTO databases (account_id, name) VALUES (?, ?)').run(bobId, 'erin_shop');
+      app.ctx.db.prepare('INSERT INTO db_users (account_id, name) VALUES (?, ?)').run(bobId, 'erin_app');
+      app.ctx.db.prepare("UPDATE dns_zones SET account_id = ? WHERE domain = 'erin.com'").run(bobId);
+      const imported = [];
+      app.ctx.dns.importZone = async ({ domain }) => { imported.push(domain); return { domain }; };
+      app.agent.calls.length = 0;
+      const res = await post(`/backups/${backup.id}/restore`, { kind: 'account', options: { files: false, mail: false } }).expect(202);
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.status, JSON.stringify(job)).toBe('done');
+      const steps = (await get(`/restores/${res.body.data.restore.id}`).expect(200)).body.data.summary.steps;
+      expect(steps.databases).toMatchObject({ status: 'skipped', imported: [], skipped: ['erin_shop (now belongs to bob)', 'user erin_app (now belongs to bob)'] });
+      expect(steps.dns).toMatchObject({ status: 'skipped', zones: [], skipped: ['erin.com (now belongs to bob)'] });
+      expect(app.agent.callsTo('backup.db.import')).toHaveLength(0);
+      expect(app.agent.callsTo('backup.db.restore_users')).toHaveLength(0);
+      expect(imported).toEqual([]);
+
+      // Unowned objects and the account's own are restored as before.
+      app.ctx.db.prepare("DELETE FROM databases WHERE name = 'erin_shop'").run();
+      app.ctx.db.prepare("DELETE FROM db_users WHERE name = 'erin_app'").run();
+      app.ctx.db.prepare("UPDATE dns_zones SET account_id = (SELECT id FROM accounts WHERE username = 'erin') WHERE domain = 'erin.com'").run();
+      app.agent.calls.length = 0;
+      const again = await post(`/backups/${backup.id}/restore`, { kind: 'account', options: { files: false, mail: false } }).expect(202);
+      expect((await waitForJob(app.ctx, again.body.data.job.id)).status).toBe('done');
+      const steps2 = (await get(`/restores/${again.body.data.restore.id}`).expect(200)).body.data.summary.steps;
+      expect(steps2.databases).toMatchObject({ status: 'done', imported: ['erin_shop'], skipped: [] });
+      expect(steps2.dns).toMatchObject({ status: 'done', zones: ['erin.com'] });
+      expect(app.agent.callsTo('backup.db.import')).toHaveLength(1);
+      expect(app.agent.callsTo('backup.db.restore_users')).toHaveLength(1);
+      expect(imported).toEqual(['erin.com']);
+    });
+
+    it('never restores a system schema named by an archive', async () => {
+      const backup = (await get('/backups?account=erin').expect(200)).body.data[0];
+      app.agent.disk.get(backup.path).databases = ['mysql', 'erin_shop'];
+      app.agent.calls.length = 0;
+      const res = await post(`/backups/${backup.id}/restore`, { kind: 'account', options: { files: false, dns: false, mail: false } }).expect(202);
+      expect((await waitForJob(app.ctx, res.body.data.job.id)).status).toBe('done');
+      const steps = (await get(`/restores/${res.body.data.restore.id}`).expect(200)).body.data.summary.steps;
+      expect(steps.databases).toMatchObject({ status: 'done', imported: ['erin_shop'], skipped: ['mysql (system schema)'] });
+      expect(app.agent.callsTo('backup.db.import').map((c) => c.args.file)).toEqual([expect.stringMatching(/erin_shop\.sql$/)]);
     });
   });
 });

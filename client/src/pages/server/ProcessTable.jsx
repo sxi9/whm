@@ -3,27 +3,33 @@ import { api, queryString } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { DataTable } from '../../components/DataTable.jsx';
 import { Select, TextInput, Button } from '../../components/Form.jsx';
-import { formatBytes, formatDuration } from '../../components/Common.jsx';
+import { CapabilityNotice, formatBytes, formatDuration } from '../../components/Common.jsx';
 import { useToast } from '../../components/Toast.jsx';
 import { useConfirm } from '../../components/Modal.jsx';
 
-export function ProcessTable({ manage = false }) {
+// `base` is the API prefix that serves /processes, /processes/:pid/signal and
+// /processes/:pid/renice; the system-health prefix raises capability_missing
+// (501) when procps is absent instead of returning an empty list.
+export function ProcessTable({ manage = false, base = '/system-health' }) {
   const toast = useToast();
   const confirm = useConfirm();
   const [sort, setSort] = useState('cpu');
   const [user, setUser] = useState('');
   const [limit, setLimit] = useState(200);
-  const { data, loading, error, refetch } = useApi(`/system/processes${queryString({ sort, user: user || undefined, limit })}`, { refreshMs: manage ? 0 : 10_000 });
+  const { data, loading, error, refetch } = useApi(`${base}/processes${queryString({ sort, user: user || undefined, limit })}`, { refreshMs: manage ? 0 : 10_000 });
 
   const signal = async (p, sig) => {
     if (!(await confirm({ title: `Send ${sig} to PID ${p.pid}?`, message: `${p.command} (${p.user})`, confirmLabel: 'Send', danger: sig === 'SIGKILL' }))) return;
-    try { await api.post(`/system/processes/${p.pid}/signal`, { signal: sig }); toast.success(`${sig} sent to ${p.pid}`); setTimeout(refetch, 500); } catch (err) { toast.error(err); }
+    try { await api.post(`${base}/processes/${p.pid}/signal`, { signal: sig }); toast.success(`${sig} sent to ${p.pid}`); setTimeout(refetch, 500); } catch (err) { toast.error(err); }
   };
   const renice = async (p) => {
     const value = window.prompt(`New niceness for PID ${p.pid} (-20 highest priority … 19 lowest)`, '10');
     if (value == null) return;
-    try { await api.post(`/system/processes/${p.pid}/renice`, { niceness: Number(value) }); toast.success(`PID ${p.pid} reniced to ${value}`); refetch(); } catch (err) { toast.error(err); }
+    try { await api.post(`${base}/processes/${p.pid}/renice`, { niceness: Number(value) }); toast.success(`PID ${p.pid} reniced to ${value}`); refetch(); } catch (err) { toast.error(err); }
   };
+
+  const missing = error && (error.code === 'capability_missing' || error.status === 501);
+  if (missing) return <div className="card-body"><CapabilityNotice error={error} onRetry={() => api.post('/system/capabilities/refresh').then(() => refetch()).catch(toast.error)} /></div>;
 
   return (
     <DataTable

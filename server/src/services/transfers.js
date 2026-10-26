@@ -3,42 +3,131 @@ import path from 'node:path';
 import { json } from '../db/index.js';
 import { notFound, forbidden, conflict, unprocessable, HttpError, CapabilityError } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
+import { PRIVILEGES } from './database-services.js';
 
 // Transfers. Attached as ctx.transfers; other categories may call:
 //   transfers.capabilityStatus()                                  -> { ssh, sshpass, rsync, tar, mysql } install state
 //   transfers.sessions.create({ host, port, user, authType, password|privateKey }, user, req) -> probed remote connection (secret encrypted)
-//   transfers.sessions.list(user) / get(id, user) / remove(id, user, req) / accounts(id, user, { refresh })
+//   transfers.sessions.list(user) / get(id, user) / remove(id, user, req) / probe(id, user, req) / accounts(id, user, { refresh })
 //   transfers.previewTransfer({ sessionId, accounts, options }, user) / startTransfer(input, user, req) -> { job, run }
-//   transfers.archives.list(user) / inspect(path, user) / uploads.begin|chunk|finish|abort
-//   transfers.startRestore({ path, username?, domain?, package?, options }, user, req)     -> { job, run }  (restore.cpmove job)
+//   transfers.archives.list(user) / inspect(path, user) / uploads.begin|status|chunk|finish|abort
+//   transfers.startRestore({ path, username?, domain?, package?, password?, options }, user, req) -> { job, run }  (restore.cpmove job)
 //   transfers.restoreArchive(path, overrides, user, req)            -> same, for the Backup category's restore flow
 //   transfers.previewConvertAddon({ domain, username, ... }, user) / startConvertAddon(input, user, req)
 //   transfers.listRuns({ kind, limit }, user) / getRun(id, user) / listJobs({ limit }, user) / getJob(id, user)
-// Per-account work goes through ctx.accounts.create, ctx.databases (createDatabase,
-// assign), ctx.dns (saveRawZone, ensureZoneForDomain), ctx.web.ensureVhost and
-// ctx.mail.setRouting. A missing daemon leaves a step 'pending' instead of
-// failing the whole account; a missing ssh/rsync/tar raises CapabilityError
-// before a run starts.
+// Per-account work goes through ctx.accounts.create/setPassword, ctx.databases
+// (createDatabase, createUser, assign), ctx.dns (saveRawZone, ensureZoneForDomain),
+// ctx.web.ensureVhost and ctx.mail.setRouting. A missing daemon leaves a step
+// 'pending' instead of failing the whole account; a missing ssh/rsync/tar raises
+// CapabilityError before a run starts.
+// Untrusted input (archives, remote servers) never reaches MySQL as raw SQL:
+// dumps are imported into a database named after the local account after the
+// agent scans them, and database users are rebuilt from parsed statements with
+// the grants limited to that account's databases.
 
 export const RUN_KINDS = ['transfer', 'restore', 'convert_addon'];
 export const ITEM_STATUSES = ['queued', 'running', 'done', 'pending', 'failed', 'skipped'];
 export const JOB_TYPES = { transfer: 'transfer.remote', restore: 'restore.cpmove', convert_addon: 'transfer.convert_addon', cleanup: 'transfer.cleanup' };
 export const ARCHIVE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,200}\.(tar\.gz|tgz|tar)$/;
+export const UPLOAD_CHUNK_BYTES = 1_310_720;
 const ZONE_CANDIDATES = (domain) => [`/var/named/${domain}.db`, `/etc/bind/zones/${domain}.db`, `/var/lib/bind/${domain}.db`, `/etc/bind/db.${domain}`, `/var/named/zones/${domain}.db`];
 const HOME_EXCLUDES = ['.cpanel/caches/', '.cpanel/datastore/', 'tmp/', '.cphorde/', 'cpbackup-exclude.conf'];
+const SHADOW_HASH = /^\$[A-Za-z0-9]{1,6}\$[A-Za-z0-9./$=+,-]{8,500}$/;
+const AUTH_PLUGINS = new Set(['mysql_native_password', 'caching_sha2_password', 'sha256_password', 'ed25519']);
+const AUTH_HASH = /^(?:\*[0-9A-F]{40}|0x[0-9A-Fa-f]{2,1024}|\$[A-Za-z0-9./$+=]{8,300}|[A-Za-z0-9+/=]{20,100})$/;
+const SYSTEM_DATABASES = new Set(['mysql', 'sys', 'information_schema', 'performance_schema']);
+const INSPECT_CACHE_MS = 3600_000;
 
 const isCapabilityMissing = (err) => err instanceof CapabilityError || err?.code === 'capability_missing' || err?.code === 'binary_not_found' || err?.status === 501;
 const isConflict = (err) => err?.status === 409 || err?.code === 'exists' || err?.code === 'conflict';
+const belongsTo = (name, prefix) => name === prefix || name.startsWith(`${prefix}_`);
 
-// Rewrites the account prefix in CREATE USER / GRANT statements captured on the
-// source server so they can be replayed for the renamed local account.
-export function renameGrantStatements(statements, from, to) {
-  if (from === to) return statements.map((s) => s.replace(/^CREATE USER (?!IF NOT EXISTS)/i, 'CREATE USER IF NOT EXISTS '));
-  const esc = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return statements.map((s) => s
-    .replace(new RegExp(`'${esc}(_|'|\\\\_)`, 'g'), (m, tail) => `'${to}${tail}`)
-    .replace(new RegExp('`' + esc + '(\\\\_|_)', 'g'), (m, tail) => '`' + to + tail)
-    .replace(/^CREATE USER (?!IF NOT EXISTS)/i, 'CREATE USER IF NOT EXISTS '));
+// A database user of the source account renamed for the local one: "bob" ->
+// "robert", "bob_app" -> "robert_app".
+export function renameForAccount(name, from, to) {
+  if (name === from) return to;
+  if (name.startsWith(`${from}_`)) return `${to}${name.slice(from.length)}`;
+  return `${to}_${name}`;
+}
+
+// The local name of an imported database: always "<username>_…", so a dump
+// called mysql.sql or sys.sql can never land in a system schema.
+export function targetDatabaseName(name, from, to) {
+  return name.startsWith(`${from}_`) ? `${to}${name.slice(from.length)}` : `${to}_${name}`;
+}
+
+const ACCOUNT_RE = /(['`"])([A-Za-z0-9_.-]{1,80})\1@(['`"])([A-Za-z0-9.%:_-]{1,255})\3/;
+const PRIVILEGE_SET = new Set(PRIVILEGES);
+const unescapeLike = (s) => s.replace(/\\([_%])/g, '$1');
+
+function parseAuthClause(text) {
+  let m = text.match(/IDENTIFIED\s+WITH\s+['`"]?([A-Za-z0-9_]+)['`"]?(?:\s+(?:AS|BY)\s+(?:'([^']*)'|(0x[0-9A-Fa-f]+)))?/i);
+  if (m) return { plugin: m[1], hash: m[2] ?? m[3] ?? null };
+  m = text.match(/IDENTIFIED\s+VIA\s+['`"]?([A-Za-z0-9_]+)['`"]?(?:\s+USING\s+(?:'([^']*)'|(0x[0-9A-Fa-f]+)))?/i);
+  if (m) return { plugin: m[1], hash: m[2] ?? m[3] ?? null };
+  m = text.match(/IDENTIFIED\s+BY\s+PASSWORD\s+'([^']*)'/i);
+  if (m) return { plugin: 'mysql_native_password', hash: m[1] };
+  return null;
+}
+
+const usableAuth = (auth) => (auth && auth.hash && AUTH_PLUGINS.has(auth.plugin) && AUTH_HASH.test(auth.hash) ? { plugin: auth.plugin, hash: auth.hash } : null);
+
+// Turns the CREATE USER / GRANT text captured from a source server or an
+// archive's mysql.sql into per-user records, keeping only what an account may
+// own: users named <src> or <src>_…, grants on <src>_….* without GRANT OPTION,
+// database-level privileges from the panel's list. Everything else is refused
+// with a reason instead of being replayed.
+export function parseGrantStatements(statements, src) {
+  const users = new Map();
+  const refused = [];
+  const userOf = (acct) => {
+    const key = `${acct.user}@${acct.host}`;
+    if (!users.has(key)) users.set(key, { user: acct.user, host: acct.host, auth: null, grants: [] });
+    return users.get(key);
+  };
+  const owned = (acct, statement) => {
+    if (!belongsTo(acct.user, src)) { refused.push({ statement, reason: `user '${acct.user}' does not belong to account "${src}"` }); return false; }
+    return true;
+  };
+  for (const raw of statements) {
+    const statement = String(raw).trim().replace(/;$/, '');
+    if (!statement) continue;
+    const grantee = statement.match(ACCOUNT_RE);
+    if (!grantee) { refused.push({ statement, reason: 'no user@host grantee' }); continue; }
+    const acct = { user: grantee[2], host: grantee[4] };
+    if (/^CREATE\s+USER\b/i.test(statement)) {
+      if (!owned(acct, statement)) continue;
+      const u = userOf(acct);
+      u.auth = u.auth || parseAuthClause(statement.slice(grantee.index + grantee[0].length));
+      continue;
+    }
+    const grant = statement.match(/^GRANT\s+(.+?)\s+ON\s+(.+?)\s+TO\s+/i);
+    if (!grant) { refused.push({ statement, reason: 'only CREATE USER and GRANT … ON … TO statements are replayed' }); continue; }
+    if (!owned(acct, statement)) continue;
+    const tail = statement.slice(grant[0].length);
+    if (/\bWITH\s+GRANT\s+OPTION\b/i.test(tail)) { refused.push({ statement, reason: 'WITH GRANT OPTION is not replayed' }); continue; }
+    const privileges = grant[1].split(',').map((p) => p.trim().toUpperCase().replace(/\s+/g, ' ')).map((p) => (p === 'ALL' ? 'ALL PRIVILEGES' : p));
+    const object = grant[2].trim();
+    if (/^\*\.\*$/.test(object)) {
+      if (privileges.length === 1 && privileges[0] === 'USAGE') {
+        const u = userOf(acct);
+        u.auth = u.auth || parseAuthClause(tail);
+      } else refused.push({ statement, reason: `global privileges (${privileges.join(', ')} ON *.*) are not replayed` });
+      continue;
+    }
+    const obj = object.match(/^(?:`((?:[^`]|``)+)`|'([^']+)'|([A-Za-z0-9_\\%]+))\.(\*|`[^`]+`|[A-Za-z0-9_]+)$/);
+    if (!obj) { refused.push({ statement, reason: `unsupported grant object ${object}` }); continue; }
+    const database = unescapeLike((obj[1] ?? obj[2] ?? obj[3]).replace(/``/g, '`'));
+    if (obj[4] !== '*') { refused.push({ statement, reason: `table-level grant on ${database}.${obj[4]} is not replayed` }); continue; }
+    if (!/^[a-z0-9_]{1,64}$/.test(database) || SYSTEM_DATABASES.has(database) || !belongsTo(database, src)) { refused.push({ statement, reason: `database "${database}" does not belong to account "${src}"` }); continue; }
+    const bad = privileges.filter((p) => p !== 'USAGE' && !PRIVILEGE_SET.has(p));
+    if (bad.length) { refused.push({ statement, reason: `privilege ${bad.join(', ')} is not a database-level privilege` }); continue; }
+    const u = userOf(acct);
+    u.auth = u.auth || parseAuthClause(tail);
+    const privs = privileges.filter((p) => p !== 'USAGE');
+    if (privs.length) u.grants.push({ database, privileges: privs.includes('ALL PRIVILEGES') ? ['ALL PRIVILEGES'] : [...new Set(privs)] });
+  }
+  return { users: [...users.values()], refused };
 }
 
 // cPanel addon/parked/subdomain lists inside an account archive.
@@ -96,6 +185,7 @@ export function createTransfersService(ctx) {
     activeDbProfile: db.prepare('SELECT * FROM db_instances WHERE is_active = 1 ORDER BY id LIMIT 1'),
   };
   const uploads = new Map();
+  const inspectCache = new Map();
 
   const audit = (req, entry) => (req?.audit ? req.audit(entry) : ctx.auditRecord?.(req ?? null, entry));
   const stagingDir = () => settings.get('transfers.staging_dir', '/var/lib/whm/transfers');
@@ -241,6 +331,7 @@ export function createTransfersService(ctx) {
     if (!row) return null;
     const run = { ...row, params: json.parse(row.params_json, {}), totals: json.parse(row.totals_json, {}), params_json: undefined, totals_json: undefined };
     if (run.params.password) run.params.password = '[set]';
+    for (const a of run.params.accounts || []) if (a.password) a.password = '[set]';
     if (!Object.keys(run.totals).length) run.totals = totalsOf(row.id);
     if (withItems) run.items = stmts.items.all(row.id).map(shapeItem);
     return run;
@@ -321,42 +412,98 @@ export function createTransfersService(ctx) {
     return { account: stmts.account.get(username), created: true, provisioning: created.provisioning };
   }
 
-  async function importDatabase({ account, name, dumpPath, overwrite }, user, req) {
+  // The database is created and the dump imported under one and the same
+  // "<username>_…" name; the agent refuses dumps carrying user, grant, global or
+  // foreign-DEFINER statements before anything runs as the MySQL admin.
+  async function importDatabase({ account, name, dumpPath, overwrite, sourceUsername }, user, req) {
     if (!ctx.databases) return { name, status: 'skipped', detail: 'Database Services is not loaded' };
+    if (!name.startsWith(`${account.username}_`) || SYSTEM_DATABASES.has(name)) return { name, status: 'failed', detail: `"${name}" is not a database name of account ${account.username}` };
     try {
-      await ctx.databases.createDatabase({ name, account: account.username }, user, req);
+      const created = await ctx.databases.createDatabase({ name, account: account.username }, user, req);
+      if (created.name !== name) return { name, status: 'failed', detail: `the database was created as "${created.name}" instead of "${name}"; import the dump by hand` };
     } catch (err) {
       if (isCapabilityMissing(err)) return { name, status: 'pending', detail: err.message };
       if (!isConflict(err)) return { name, status: 'failed', detail: err.message };
       if (!overwrite) return { name, status: 'skipped', detail: 'database already exists (overwrite is off)' };
     }
     try {
-      await agent.op('transfer.mysql.import', { path: dumpPath, database: name, credentials: localDbCredentials() }, { req });
+      await agent.op('transfer.mysql.import', { path: dumpPath, database: name, definerPrefix: sourceUsername, credentials: localDbCredentials() }, { req });
       return { name, status: 'applied', detail: 'imported' };
     } catch (err) {
       return { name, status: isCapabilityMissing(err) ? 'pending' : 'failed', detail: err.message };
     }
   }
 
-  async function replayGrants({ account, statements, sourceUsername, stagingPath }, user, req) {
-    if (!statements.length) return { status: 'skipped', detail: 'no database users on the source' };
+  const randomPassword = () => `${crypto.randomBytes(18).toString('base64url')}!Aa1`;
+
+  // Rebuilds the source account's database users from parsed statements: a user
+  // with a supported password hash is recreated with it (so applications keep
+  // working), the rest get a fresh random password; grants are limited to the
+  // account's own databases and refused statements are reported, never run.
+  async function replayGrants({ account, statements, sourceUsername }, user, req) {
+    const parsed = parseGrantStatements(statements, sourceUsername);
+    if (!parsed.users.length && !parsed.refused.length) return { status: 'skipped', detail: 'no database users on the source' };
     if (!ctx.databases) return { status: 'skipped', detail: 'Database Services is not loaded' };
-    const renamed = renameGrantStatements(statements, sourceUsername, account.username);
-    const sql = `${renamed.map((s) => (s.endsWith(';') ? s : `${s};`)).join('\n')}\nFLUSH PRIVILEGES;\n`;
+    const results = { hashed: [], fresh: [], existing: [], failed: [] };
+    let pending = null;
+    for (const u of parsed.users) {
+      const name = renameForAccount(u.user, sourceUsername, account.username);
+      const grants = u.grants.map((g) => ({ database: targetDatabaseName(g.database, sourceUsername, account.username), privileges: g.privileges }));
+      const auth = usableAuth(u.auth);
+      try {
+        if (auth) {
+          await agent.op('transfer.mysql.create_user', { user: name, host: u.host, ownerPrefix: account.username, auth, grants, credentials: localDbCredentials() }, { req });
+          try { await ctx.databases.assign({ kind: 'user', name, account: account.username }, user, req); } catch (err) { logger.warn({ err, name }, 'transfer: could not map database user'); }
+          results.hashed.push(`${name}@${u.host}`);
+        } else {
+          await ctx.databases.createUser({ name, account: account.username, password: randomPassword(), databases: grants.map((g) => g.database) }, user, req);
+          results.fresh.push(name);
+        }
+      } catch (err) {
+        if (isCapabilityMissing(err)) { pending = err.message; break; }
+        if (isConflict(err)) results.existing.push(name);
+        else results.failed.push(`${name}: ${err.message}`);
+      }
+    }
+    const parts = [];
+    if (results.hashed.length) parts.push(`${results.hashed.length} user(s) recreated with their password (${results.hashed.join(', ')})`);
+    if (results.fresh.length) parts.push(`${results.fresh.length} user(s) recreated with a new random password, set one in Manage Database Users (${results.fresh.join(', ')})`);
+    if (results.existing.length) parts.push(`${results.existing.length} already existed (${results.existing.join(', ')})`);
+    if (results.failed.length) parts.push(`failed: ${results.failed.join('; ')}`);
+    if (parsed.refused.length) parts.push(`${parsed.refused.length} statement(s) refused: ${[...new Set(parsed.refused.map((r) => r.reason))].join('; ')}`);
+    if (pending) return { status: 'pending', detail: `${pending}${parts.length ? ` (${parts.join('; ')})` : ''}`, refused: parsed.refused };
+    const status = results.failed.length ? 'failed' : parsed.refused.length || results.fresh.length ? 'pending' : 'applied';
+    return { status, detail: parts.join('; ') || 'nothing to replay', refused: parsed.refused };
+  }
+
+  // Sets the Linux password of a created account: the one entered in the form,
+  // else the crypt hash read from the source (/etc/shadow or the archive's
+  // shadow member); without either the step stays pending so the admin knows
+  // nobody can log in yet.
+  async function applyPassword({ account, created, password, readHash }, user, req) {
+    if (password) {
+      try { await ctx.accounts.setPassword(account.username, password, user, req); return { status: 'applied', detail: 'password set from the form' }; }
+      catch (err) { return { status: isCapabilityMissing(err) ? 'pending' : 'failed', detail: err.message }; }
+    }
+    let hash = null;
+    let reason = null;
     try {
-      await agent.op('fs.write_file', { path: stagingPath, content: sql, mode: '0600', backup: false }, { req });
-      await agent.op('transfer.mysql.import', { path: stagingPath, credentials: localDbCredentials() }, { req });
+      const r = await readHash();
+      hash = r?.hash && SHADOW_HASH.test(r.hash) ? r.hash : null;
+      reason = r?.reason || (r?.locked ? 'the source account is locked' : 'no password hash on the source');
+    } catch (err) { reason = err.message; }
+    if (!hash) {
+      if (!created) return { status: 'skipped', detail: `existing password kept (${reason})` };
+      return { status: 'pending', detail: `no password set (${reason}); set one under Password Modification before the user can log in` };
+    }
+    if (account.uid == null) return { status: 'pending', detail: 'no Linux user on this host; the password hash is applied when one is provisioned' };
+    try {
+      await agent.op('transfer.user.set_password_hash', { username: account.username, hash }, { req });
+      audit(req, { action: 'account.password', target: account.username, args: { source: 'hash' } });
+      return { status: 'applied', detail: 'password hash copied from the source' };
     } catch (err) {
       return { status: isCapabilityMissing(err) ? 'pending' : 'failed', detail: err.message };
-    } finally {
-      await agent.op('fs.remove', { path: stagingPath }, { req }).catch(() => {});
     }
-    const users = [...new Set(renamed.map((s) => s.match(/^(?:CREATE USER(?: IF NOT EXISTS)?|GRANT .*? TO) '([^']+)'@/i)?.[1]).filter(Boolean))];
-    let mapped = 0;
-    for (const name of users) {
-      try { await ctx.databases.assign({ kind: 'user', name, account: account.username }, user, req); mapped++; } catch (err) { logger.warn({ err, name }, 'transfer: could not map database user'); }
-    }
-    return { status: 'applied', detail: `${users.length} user(s) recreated, ${mapped} mapped to ${account.username}` };
   }
 
   async function importZone({ account, domain, text, remoteIps }, user, req) {
@@ -469,7 +616,8 @@ export function createTransfersService(ctx) {
     if (preview.totals.blocked) throw unprocessable('Some accounts cannot be transferred', { accounts: preview.items.filter((i) => i.issues.length).flatMap((i) => i.issues.map((m) => `${i.sourceUsername}: ${m}`)) });
     if (!preview.totals.ready) throw unprocessable('Select at least one account', { accounts: ['Nothing to transfer'] });
     requireTools({ remote: true, password: preview.session.authType === 'password', rsync: !preview.options.skipHome });
-    const params = { options: preview.options, accounts: preview.items.map((i) => ({ sourceUsername: i.sourceUsername, username: i.username, domain: i.domain, package: i.package, remote: i.remote })), host: preview.session.host, remoteIps: preview.session.probe?.addresses || [] };
+    const passwords = new Map(input.accounts.filter((a) => a.password).map((a) => [`${a.source}:${a.username || a.source}`, a.password]));
+    const params = { options: preview.options, accounts: preview.items.map((i) => ({ sourceUsername: i.sourceUsername, username: i.username, domain: i.domain, package: i.package, remote: i.remote, password: passwords.has(`${i.sourceUsername}:${i.username}`) ? ctx.crypto.encrypt(passwords.get(`${i.sourceUsername}:${i.username}`)) : null })), host: preview.session.host, remoteIps: preview.session.probe?.addresses || [] };
     const runId = createRun('transfer', { user, sessionId: input.sessionId, source: `${preview.session.user}@${preview.session.host}`, params, items: preview.items.map((i) => ({ sourceUsername: i.sourceUsername, username: i.username, domain: i.domain, steps: { plan: { package: i.package, remote: i.remote } } })) });
     const job = jobs.enqueue(JOB_TYPES.transfer, { runId, userId: user.id ?? null }, { userId: user.id ?? null });
     stmts.setRunJob.run(job.id, runId);
@@ -483,6 +631,13 @@ export function createTransfersService(ctx) {
     steps.account = { status: 'applied', detail: created ? 'created' : 'existing account reused' };
     const remoteHome = plan.remote?.home || `/home/${item.source_username}`;
     const domains = [item.domain];
+
+    steps.password = await applyPassword({
+      account, created,
+      password: plan.password ? ctx.crypto.decrypt(plan.password) : null,
+      readHash: () => agent.op('transfer.remote.password_hash', { connection: connectionOf(sessionRow), username: item.source_username }, { req }),
+    }, user, req);
+    log(`${item.username}: password ${steps.password.status} – ${steps.password.detail}`, steps.password.status === 'failed' ? 'error' : 'info');
 
     if (options.skipHome) steps.home = { status: 'skipped', detail: 'not requested' };
     else {
@@ -501,13 +656,13 @@ export function createTransfersService(ctx) {
       try { names = (await agent.op('transfer.remote.databases', { connection: connectionOf(sessionRow), prefix: item.source_username }, { req })).databases; }
       catch (err) { steps.databases.push({ name: '*', status: err.code === 'remote_tool_missing' ? 'skipped' : 'failed', detail: err.message }); }
       for (const name of names) {
-        const target = item.username === item.source_username ? name : `${item.username}_${name.slice(item.source_username.length + 1)}`;
+        const target = targetDatabaseName(name, item.source_username, item.username);
         const local = path.join(stagingDir(), `run-${runId}`, `${target}.sql`);
         let dump = null;
         try {
           dump = await agent.op('transfer.remote.dump_database', { connection: connectionOf(sessionRow), database: name }, { req });
           await agent.op('transfer.remote.rsync', { connection: connectionOf(sessionRow), remotePath: dump.remotePath, localPath: local, directory: false, bwlimitKbps: bwlimit() }, { req });
-          const r = await importDatabase({ account, name: target, dumpPath: local, overwrite: options.overwrite }, user, req);
+          const r = await importDatabase({ account, name: target, dumpPath: local, overwrite: options.overwrite, sourceUsername: item.source_username }, user, req);
           steps.databases.push({ ...r, name: target, source: name, sizeBytes: dump.sizeBytes });
           log(`${item.username}: database ${name} → ${target} ${r.status}${r.detail ? ` – ${r.detail}` : ''}`, r.status === 'failed' ? 'error' : 'info');
         } catch (err) {
@@ -521,7 +676,7 @@ export function createTransfersService(ctx) {
       if (names.length) {
         try {
           const g = await agent.op('transfer.remote.db_grants', { connection: connectionOf(sessionRow), prefix: item.source_username }, { req });
-          steps.grants = await replayGrants({ account, statements: g.users.flatMap((u) => u.statements), sourceUsername: item.source_username, stagingPath: path.join(stagingDir(), `run-${runId}`, `${item.username}-grants.sql`) }, user, req);
+          steps.grants = await replayGrants({ account, statements: g.users.flatMap((u) => u.statements), sourceUsername: item.source_username }, user, req);
         } catch (err) { steps.grants = { status: isCapabilityMissing(err) ? 'pending' : 'failed', detail: err.message }; }
       }
     }
@@ -612,17 +767,33 @@ export function createTransfersService(ctx) {
       out.sort((a, b) => b.mtime.localeCompare(a.mtime));
       return { archives: out, dirs: archiveDirs(), uploadDir: uploadDir() };
     },
+    // Listing a large archive decompresses the whole stream, so the result is
+    // kept per path and reused while size and mtime are unchanged (the UI's
+    // inspect feeds the restore that follows).
     async inspect(file, user, req) {
       assertRoot(user, 'Restoring accounts');
       requireTools({ tar: true });
-      try {
-        const info = await agent.op('transfer.cpmove.inspect', { path: file }, { req });
+      const annotate = (info) => {
         const local = info.username ? stmts.account.get(info.username) : null;
         const hosted = info.config?.domain ? stmts.domainHosted.get(info.config.domain) : null;
         return { ...info, localExists: Boolean(local), localDomain: local?.domain ?? null, domainHostedBy: hosted?.username ?? null };
+      };
+      try {
+        const st = await agent.op('fs.stat', { path: file }, { req }).catch(() => null);
+        const key = st?.exists && st.size != null && st.mtime ? `${st.size}:${st.mtime}` : null;
+        const hit = key ? inspectCache.get(file) : null;
+        if (hit && hit.key === key && Date.now() - hit.at < INSPECT_CACHE_MS) return annotate(hit.info);
+        const info = await agent.op('transfer.cpmove.inspect', { path: file }, { req });
+        if (key) {
+          inspectCache.set(file, { key, info, at: Date.now() });
+          if (inspectCache.size > 50) inspectCache.delete(inspectCache.keys().next().value);
+        }
+        return annotate(info);
       } catch (err) { throw translate(err); }
     },
   };
+
+  const shapeUpload = (u) => ({ id: u.id, filename: u.filename, path: u.path, size: u.size, received: u.received, chunks: u.chunks, chunkBytes: UPLOAD_CHUNK_BYTES });
 
   const uploadsApi = {
     begin({ filename, size }, user, req) {
@@ -632,7 +803,7 @@ export function createTransfersService(ctx) {
       const id = crypto.randomBytes(12).toString('hex');
       uploads.set(id, { id, path: path.join(uploadDir(), filename), filename, size, received: 0, chunks: 0, createdBy: user.id ?? null, touched: Date.now(), started: false });
       audit(req, { action: 'transfer.upload.begin', target: filename, args: { size } });
-      return { id, filename, path: path.join(uploadDir(), filename), chunkBytes: 1024 * 1024 };
+      return shapeUpload(uploads.get(id));
     },
     get(id, user) {
       assertRoot(user, 'Uploading archives');
@@ -640,13 +811,16 @@ export function createTransfersService(ctx) {
       if (!u) throw notFound('Upload');
       return u;
     },
+    // Lets the uploader resume from the bytes that really arrived after a lost
+    // response or a rate-limited chunk.
+    status(id, user) { return shapeUpload(uploadsApi.get(id, user)); },
     async chunk(id, data, user, req) {
       const u = uploadsApi.get(id, user);
       const bytes = Buffer.byteLength(data, 'base64');
       if (u.size != null && u.received + bytes > u.size) throw unprocessable('More data than announced', { data: ['Upload exceeds the declared size'] });
       try { await agent.op('transfer.upload.append', { path: u.path, data, truncate: !u.started }, { req }); } catch (err) { throw translate(err); }
       u.started = true; u.received += bytes; u.chunks++; u.touched = Date.now();
-      return { id, received: u.received, size: u.size, chunks: u.chunks };
+      return shapeUpload(u);
     },
     async finish(id, user, req) {
       const u = uploadsApi.get(id, user);
@@ -679,7 +853,7 @@ export function createTransfersService(ctx) {
     if (local && !options.overwrite) throw conflict(`Account "${username}" already exists; enable overwrite to restore into it`);
     if (!local) { const hosted = stmts.domainHosted.get(domain); if (hosted) throw conflict(`${domain} is already hosted by account "${hosted.username}"`); }
     if (input.package && !stmts.packageByName.get(input.package)) throw notFound(`Package "${input.package}"`);
-    const params = { path: info.path, options, username, domain, package: input.package || null, sourceUsername: info.username, archive: { top: info.top, databases: info.databases, zones: info.zones, userdata: info.userdata, hasHomedir: info.hasHomedir, hasGrants: info.hasGrants, hasAddons: info.hasAddons, hasParked: info.hasParked, hasSubdomains: info.hasSubdomains, config: info.config } };
+    const params = { path: info.path, options, username, domain, package: input.package || null, password: input.password ? ctx.crypto.encrypt(input.password) : null, sourceUsername: info.username, archive: { top: info.top, databases: info.databases, zones: info.zones, userdata: info.userdata, hasHomedir: info.hasHomedir, hasGrants: info.hasGrants, hasShadow: Boolean(info.hasShadow), hasAddons: info.hasAddons, hasParked: info.hasParked, hasSubdomains: info.hasSubdomains, config: info.config } };
     const runId = createRun('restore', { user, source: info.path, params, items: [{ sourceUsername: info.username, username, domain, steps: { plan: { package: input.package || null, archive: path.basename(info.path) } } }] });
     const job = jobs.enqueue(JOB_TYPES.restore, { runId, userId: user.id ?? null }, { userId: user.id ?? null });
     stmts.setRunJob.run(job.id, runId);
@@ -699,6 +873,19 @@ export function createTransfersService(ctx) {
     const sourceHome = `/home/${archive.config?.raw?.USER || params.sourceUsername || item.username}`;
     const domains = [item.domain];
 
+    steps.password = await applyPassword({
+      account, created,
+      password: params.password ? ctx.crypto.decrypt(params.password) : null,
+      readHash: async () => {
+        if (!archive.hasShadow) return { hash: null, reason: 'the archive has no shadow member' };
+        const text = await readMember('shadow');
+        const field = String(text || '').trim().split('\n')[0] || '';
+        const clean = field.replace(/^!+/, '');
+        return { hash: SHADOW_HASH.test(clean) ? clean : null, locked: /^!/.test(field), reason: /^!/.test(field) ? 'the archived account was locked' : 'the archived shadow entry has no usable hash' };
+      },
+    }, user, req);
+    log(`${item.username}: password ${steps.password.status} – ${steps.password.detail}`, steps.password.status === 'failed' ? 'error' : 'info');
+
     if (options.skipHome) steps.home = { status: 'skipped', detail: 'not requested' };
     else if (!archive.hasHomedir) steps.home = { status: 'skipped', detail: 'the archive has no homedir/' };
     else {
@@ -715,12 +902,12 @@ export function createTransfersService(ctx) {
       const staging = path.join(stagingDir(), `run-${runId}`);
       const src = params.sourceUsername || item.username;
       for (const name of archive.databases || []) {
-        const target = item.username === src || !name.startsWith(`${src}_`) ? name : `${item.username}_${name.slice(src.length + 1)}`;
+        const target = targetDatabaseName(name, src, item.username);
         const dumpPath = path.join(staging, `${name}.sql`);
         try {
           const ex = await agent.op('transfer.cpmove.extract', { path: file, destination: staging, members: [member(`mysql/${name}.sql`)], stripComponents: 2 }, { req });
           if (!ex.extracted) { steps.databases.push({ name: target, source: name, status: 'failed', detail: 'dump missing from the archive' }); continue; }
-          const r = await importDatabase({ account, name: target, dumpPath, overwrite: options.overwrite }, user, req);
+          const r = await importDatabase({ account, name: target, dumpPath, overwrite: options.overwrite, sourceUsername: src }, user, req);
           steps.databases.push({ ...r, name: target, source: name });
           log(`${item.username}: database ${name} → ${target} ${r.status}${r.detail ? ` – ${r.detail}` : ''}`, r.status === 'failed' ? 'error' : 'info');
         } catch (err) {
@@ -732,8 +919,8 @@ export function createTransfersService(ctx) {
       if (archive.hasGrants && (archive.databases || []).length) {
         try {
           const text = await readMember('mysql.sql');
-          const statements = String(text || '').split(/;\s*\n/).map((s) => s.trim()).filter((s) => /^(CREATE USER|GRANT) /i.test(s));
-          steps.grants = await replayGrants({ account, statements, sourceUsername: src, stagingPath: path.join(staging, `${item.username}-grants.sql`) }, user, req);
+          const statements = String(text || '').split(/;\s*\n/).map((s) => s.trim()).filter((s) => /^(CREATE USER|GRANT)\s/i.test(s));
+          steps.grants = await replayGrants({ account, statements, sourceUsername: src }, user, req);
         } catch (err) { steps.grants = { status: isCapabilityMissing(err) ? 'pending' : 'failed', detail: err.message }; }
       }
     }

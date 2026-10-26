@@ -48,6 +48,22 @@ describe('Server Status API', () => {
   let apacheActive = true;
   let serverStatus = true;
   let procs = PROCS;
+  let workersMode = 'extended';
+  const WORKER_COLUMNS = ['Srv', 'PID', 'Acc', 'M', 'CPU', 'SS', 'Req', 'Dur', 'Conn', 'Child', 'Slot', 'Client', 'Protocol', 'VHost', 'Request'].map((h) => ({ header: h, key: h.toLowerCase(), label: h, title: h }));
+  const WORKERS = [
+    { srv: '0-2', slot: 0, generation: 2, pid: 31337, acc: { connection: 0, child: 12, slot: 345 }, mode: 'W', cpuSeconds: 0.53, secondsSinceRequest: 0, requestMs: 125, durationMs: 14450, connKBytes: 3.4, childMBytes: 1.25, slotMBytes: 40.11, client: '203.0.113.9', protocol: 'http/1.1', vhost: 'example.com:80', request: 'GET /wp-admin/index.php HTTP/1.1', extra: {} },
+    { srv: '1-2', slot: 1, generation: 2, pid: 31338, acc: { connection: 2, child: 7, slot: 90 }, mode: 'K', cpuSeconds: 0.1, secondsSinceRequest: 3, requestMs: 4, durationMs: 900, connKBytes: 0, childMBytes: 0.3, slotMBytes: 9, client: '198.51.100.4', protocol: 'h2', vhost: 'shop.example.net:443', request: 'GET /index.html HTTP/2.0', extra: {} },
+    { srv: '2-2', slot: 2, generation: 2, pid: 31339, acc: { connection: 0, child: 1, slot: 1 }, mode: '_', cpuSeconds: 0, secondsSinceRequest: 40, requestMs: 1, durationMs: 1, connKBytes: 0, childMBytes: 0, slotMBytes: 0, client: '203.0.113.9', protocol: 'http/1.1', vhost: 'example.com:80', request: 'GET /favicon.ico HTTP/1.1', extra: {} },
+    { srv: '3-0', slot: 3, generation: 0, pid: null, acc: { connection: 0, child: 0, slot: 0 }, mode: '.', cpuSeconds: 0, secondsSinceRequest: 0, requestMs: 0, durationMs: 0, connKBytes: 0, childMBytes: 0, slotMBytes: 0, client: null, protocol: null, vhost: null, request: null, extra: {} },
+  ];
+
+  const workersHandler = ({ port, bind }) => {
+    const probe = { host: bind || '127.0.0.1', port };
+    if (workersMode === 'down') return { probe, reachable: false, statusPage: false, extended: null, columns: [], workers: [] };
+    if (workersMode === 'not_status') return { probe, reachable: true, httpStatus: 404, statusPage: false, extended: null, columns: [], workers: [] };
+    if (workersMode === 'basic') return { probe, reachable: true, httpStatus: 200, statusPage: true, extended: false, columns: [], workers: [] };
+    return { probe, reachable: true, httpStatus: 200, statusPage: true, extended: true, columns: WORKER_COLUMNS, workers: WORKERS };
+  };
 
   beforeAll(async () => {
     const agent = createMockAgent({
@@ -62,6 +78,7 @@ describe('Server Status API', () => {
         } : null,
       }),
       'sys.processes': () => procs,
+      'modstatus.workers': workersHandler,
     });
     app = await createTestApp({ agent });
     app.ctx.jobs.start();
@@ -98,11 +115,14 @@ describe('Server Status API', () => {
       const res = await get('/apache').expect(501);
       expect(res.body.error).toMatchObject({ code: 'capability_missing', capability: 'apache' });
       expect(app.agent.callsTo('web.status')).toHaveLength(0);
+      await get('/apache/workers').expect(501);
+      expect(app.agent.callsTo('modstatus.workers')).toHaveLength(0);
       await post('/apache/enable-status').expect(501);
     });
 
     it('is root only', async () => {
       await resellerHttp.get('/api/server-status/apache').expect(403);
+      await resellerHttp.get('/api/server-status/apache/workers').expect(403);
       await resellerHttp.post('/api/server-status/apache/enable-status').set('X-CSRF-Token', resellerCsrf).send({}).expect(403);
       await resellerHttp.get('/api/server-status/process-log/days').expect(403);
       await resellerHttp.put('/api/server-status/process-log/settings').set('X-CSRF-Token', resellerCsrf).send({ enabled: false }).expect(403);
@@ -165,6 +185,53 @@ describe('Server Status API', () => {
         const audit = app.ctx.db.prepare("SELECT * FROM audit_log WHERE action = 'server_status.apache.enable_status'").all();
         expect(audit).toHaveLength(1);
       } finally { app.ctx.web = original; }
+    });
+
+    it('lists every mod_status worker slot with its state, vhost and request', async () => {
+      await provision(true);
+      const { body } = await get('/apache/workers').expect(200);
+      expect(app.agent.callsTo('modstatus.workers').pop().args).toEqual({ port: 80, bind: null });
+      expect(body.data).toMatchObject({ available: true, reason: null, instructions: null, probe: { host: '127.0.0.1', port: 80 }, summary: { slots: 4, active: 3, open: 1, vhosts: 2, clients: 2 } });
+      expect(body.data.columns.map((c) => c.header)).toEqual(['Srv', 'PID', 'Acc', 'M', 'CPU', 'SS', 'Req', 'Dur', 'Conn', 'Child', 'Slot', 'Client', 'Protocol', 'VHost', 'Request']);
+      expect(body.data.workers).toHaveLength(4);
+      expect(body.data.workers[0]).toMatchObject({ srv: '0-2', pid: 31337, mode: 'W', stateKey: 'sending', stateLabel: 'Sending reply', vhost: 'example.com:80', request: 'GET /wp-admin/index.php HTTP/1.1', acc: { connection: 0, child: 12, slot: 345 } });
+      expect(body.data.workers[1]).toMatchObject({ mode: 'K', stateKey: 'keepalive', protocol: 'h2' });
+      expect(body.data.workers[3]).toMatchObject({ srv: '3-0', pid: null, mode: '.', stateKey: 'open', vhost: null, request: null });
+      expect(body.data.checkedAt).toBeTruthy();
+    });
+
+    it('probes the worker table on the ports Apache Configuration set', async () => {
+      app.ctx.settings.set('service_config.apache_ports', { http: 8080, https: 8443, bind: '127.0.0.1' });
+      try {
+        const { body } = await get('/apache/workers').expect(200);
+        expect(app.agent.callsTo('modstatus.workers').pop().args).toEqual({ port: 8080, bind: '127.0.0.1' });
+        expect(body.data.probe).toEqual({ host: '127.0.0.1', port: 8080 });
+      } finally { app.ctx.settings.set('service_config.apache_ports', null); }
+    });
+
+    it('explains ExtendedStatus Off and an unreachable status page instead of an empty table', async () => {
+      workersMode = 'basic';
+      try {
+        const basic = await get('/apache/workers').expect(200);
+        expect(basic.body.data).toMatchObject({ available: false, reason: 'extended_off', workers: [], summary: { slots: 0, active: 0 } });
+        expect(basic.body.data.instructions.title).toBe('ExtendedStatus is Off');
+        expect(basic.body.data.instructions.steps.join(' ')).toContain('ExtendedStatus On');
+        workersMode = 'down';
+        const down = await get('/apache/workers').expect(200);
+        expect(down.body.data).toMatchObject({ available: false, reason: 'unreachable', workers: [] });
+        expect(down.body.data.instructions.title).toContain('127.0.0.1:80/server-status');
+        workersMode = 'not_status';
+        const other = await get('/apache/workers').expect(200);
+        expect(other.body.data).toMatchObject({ available: false, reason: 'unreachable' });
+      } finally { workersMode = 'extended'; }
+    });
+
+    it('maps an agent failure on the worker probe to the usual error envelope', async () => {
+      app.agent.fail('modstatus.workers', 'agent_unavailable', 'agent down');
+      try {
+        const res = await get('/apache/workers').expect(503);
+        expect(res.body.error.code).toBe('agent_unavailable');
+      } finally { app.agent.set('modstatus.workers', workersHandler); }
     });
 
     it('returns 422 when no Apache Configuration service can write the block', async () => {

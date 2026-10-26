@@ -331,7 +331,7 @@ export function createServerConfigService(ctx) {
     async get() {
       const detect = await stats.detect();
       const domains = db.prepare('SELECT COUNT(*) AS n FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE a.suspended = 0').get().n;
-      return { ...stats.settings(), detect, schedule: stats.schedule(), domains, lastRun: S('stats.last_run', null), lastJob: ctx.jobs.list({ type: STATS_JOB, limit: 1 })[0] ?? null, pkgAvailable: Boolean(ctx.software?.pkg?.ensureInstalled) };
+      return { ...stats.settings(), detect, outputRoot: detect.statsRoot ?? null, schedule: stats.schedule(), domains, lastRun: S('stats.last_run', null), lastJob: ctx.jobs.list({ type: STATS_JOB, limit: 1 })[0] ?? null, pkgAvailable: Boolean(ctx.software?.pkg?.ensureInstalled) };
     },
     alignSchedule() {
       const enabled = Object.values(stats.settings().generators).some(Boolean);
@@ -368,14 +368,14 @@ export function createServerConfigService(ctx) {
       const detect = await job.agent.op('stats.detect');
       const generators = (job.params.generators?.length ? job.params.generators : GENERATORS.filter((g) => cfg.generators[g])).filter((g) => detect.generators?.[g]?.installed);
       if (!generators.length) { job.log('no enabled statistics generator is installed; nothing to do', 'warn'); return { domains: 0, generated: 0, skipped: 0, failed: 0 }; }
-      const rows = db.prepare(`SELECT a.username, a.home_dir, d.domain FROM account_domains d JOIN accounts a ON a.id = d.account_id
+      const rows = db.prepare(`SELECT a.username, d.domain FROM account_domains d JOIN accounts a ON a.id = d.account_id
         WHERE (@includeSuspended = 1 OR a.suspended = 0) AND (@domain IS NULL OR d.domain = @domain) AND d.type IN ('main', 'addon', 'sub') ORDER BY a.username, d.domain`).all({ includeSuspended: cfg.includeSuspended ? 1 : 0, domain: job.params.domain ?? null });
       const summary = { domains: rows.length, generators, generated: 0, skipped: 0, failed: 0, failures: [] };
       let i = 0;
       for (const row of rows) {
         for (const generator of generators) {
           try {
-            const r = await job.agent.op('stats.generate', { generator, domain: row.domain, username: row.username, homeDir: row.home_dir || `${S('basic.home_root', '/home')}/${row.username}` });
+            const r = await job.agent.op('stats.generate', { generator, domain: row.domain, username: row.username });
             if (r.skipped) { summary.skipped++; job.log(`${generator} ${row.domain}: skipped (${r.reason === 'no_log' ? 'no access log yet' : r.reason})`); } else { summary.generated++; job.log(`${generator} ${row.domain}: ok -> ${r.outputDir}`); }
           } catch (err) {
             summary.failed++;

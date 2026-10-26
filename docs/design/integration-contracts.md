@@ -74,3 +74,30 @@ when the host was not changed.
 A schedule must not enqueue persistent `jobs` rows for work that will be skipped. Toggle the
 schedule's `enabled` flag (via `ctx.scheduler.update(name, { enabled })`) when the feature is
 enabled/disabled, or check the precondition inside the scheduler-facing wrapper before enqueueing.
+
+## 10. Reseller ACLs, limits and nameservers (resellers is the owner)
+`ctx.resellers` (tolerate absence: every call below is `ctx.resellers?.<fn>?.(…)`) exposes:
+- `hasAcl(user, key)` / `assertAcl(user, key)` — root is always allowed; a reseller whose ACLs were
+  never saved (no `reseller_acls` rows) keeps ownership-only access; once saved, every key is stored
+  with value 0/1 and an empty selection denies everything (`'all'` grants every key).
+- `createPolicy(user, { pkgName, plan, ip })` and `modifyPolicy(user, account, { pkgName, diskQuotaMb,
+  bandwidthLimitMb, ip })` — limits, allowed/global packages and IP delegation. Core `accounts.create`
+  and `accounts.modify` call them; any category that creates or re-plans accounts by another path must too.
+- `nameserversFor(ownerId)` → `string[]` (empty = server defaults). Core `accounts.create` passes it as
+  `ctx.dns.ensureZoneForDomain(domain, { ip, accountId, nameservers })`. **dns-functions must consume
+  `nameservers` (ns1/ns2 for the SOA/NS template) and fall back to `basic.nameservers` when absent**;
+  until it does, zones for reseller-owned accounts advertise the server defaults.
+- `sharedIpFor(user)`, `delegatedAddresses(userId)` — the only addresses a reseller may assign.
+
+ACL keys enforced by core (`services/accounts.js`): `create-acct`, `suspend-acct` (suspend/unsuspend),
+`kill-acct` (terminate), `passwd`, `edit-account` (any modify), `upgrade-account` (package change),
+`quota`, `limit-bandwidth`, `add-pkg-ip` (IP change), `viewglobalpackages`, `allow-unlimited-disk-pkgs`,
+`allow-unlimited-bw-pkgs`. Keys each category must check on its own reseller-reachable routes
+(`ctx.resellers?.assertAcl?.(req.user, key)` in the service): packages `add-pkg` (create/delete),
+`edit-pkg`; account-functions/multi-account `rearrange-accts`, `demo-setup`, `add-pkg-shell`,
+`show-bandwidth`, `acct-summary`, `list-accts`; dns-functions `add-dns`, `edit-dns`, `kill-dns`,
+`clustering`; email `edit-mx`, `mailcheck`, `mail-queue`; ssl-tls `ssl`, `ssl-info`, `ssl-gencrt`,
+`ssl-buy`; server-status/service-manager `status`, `stats`, `restart`; locales `locale-edit`;
+development/API tokens `cpanel-api`, `thirdparty`; security `digest-auth`, `mysql-superuser`,
+`disallow-shell`; server-contacts/news `news`. Until a category wires its key, that key is stored
+but not enforced.

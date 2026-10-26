@@ -219,6 +219,7 @@ export function createSystemHealthService(ctx) {
     },
 
     patterns: () => stmts.patterns.all().map(shapePattern),
+    enabledPatterns: () => stmts.enabledPatterns.all().map((r) => r.name),
 
     addPattern({ name, note = null, enabled = true }, req) {
       if (stmts.patternByName.get(name)) throw conflict(`"${name}" is already on the list`);
@@ -312,7 +313,7 @@ export function createSystemHealthService(ctx) {
 
     processes(opts) { requireProcps(); return agent.op('sys.processes', opts); },
     signal: (pid, signal, req) => ctx.system.signal(pid, signal, req),
-    renice: (pid, niceness, req) => ctx.system.renice(pid, niceness, req),
+    renice(pid, niceness, req) { requireProcps(); return ctx.system.renice(pid, niceness, req); },
     matchProcess,
   };
 }

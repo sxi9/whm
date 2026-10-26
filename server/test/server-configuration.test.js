@@ -49,7 +49,7 @@ describe('Server Configuration API', () => {
       'quota.fstab.enable': ({ mountpoint }) => ({ mountpoint, changed: true, previousLine: '/dev/vda1 / ext4 defaults 0 1', line: '/dev/vda1\t/\text4\tdefaults,usrquota,grpquota\t0\t1', backup: '/etc/fstab.whm-bak' }),
       'quota.disable': ({ mountpoint }) => ({ mountpoint, disabled: true, active: { user: false, group: false } }),
       'stats.detect': () => ({ domlogsRoot: '/var/log/whm/domlogs', generators: { awstats: { installed: statsInstalled, bin: statsInstalled ? '/usr/lib/cgi-bin/awstats.pl' : null }, webalizer: { installed: false, bin: null }, analog: { installed: false, bin: null } } }),
-      'stats.generate': ({ generator, domain, username, homeDir }) => (domain === 'nolog.test' ? { generator, domain, skipped: true, reason: 'no_log' } : { generator, domain, username, skipped: false, outputDir: `${homeDir}/tmp/${generator}` }),
+      'stats.generate': ({ generator, domain, username }) => (domain === 'nolog.test' ? { generator, domain, skipped: true, reason: 'no_log' } : { generator, domain, username, skipped: false, outputDir: `/var/lib/whm/stats/${username}/${domain}/${generator}` }),
       'terminal.open': ({ shell }) => ({ id: TERM_ID, pid: 4321, shell, exited: false }),
       'terminal.read': ({ since }) => {
         const data = Buffer.concat(terminalOutput.map((t) => Buffer.from(t))).subarray(since);
@@ -265,6 +265,13 @@ describe('Server Configuration API', () => {
       expect(bad.body.data.status).toBe('error');
       expect(bad.body.data.lastError).toContain('rejected the token');
       await put(`/nodes/${nodeId}`, { token: acceptToken, roles: ['dns', 'backup'], verifyTls: false }).expect(200);
+      // A node row echoed back by the UI must be trimmed to its editable keys first.
+      const listed = (await get('/nodes').expect(200)).body.data.find((n) => n.id === nodeId);
+      const echoed = await put(`/nodes/${nodeId}`, { ...listed, token: '' }).expect(422);
+      expect(Object.keys(echoed.body.error.fields)).toContain('_');
+      const editable = Object.fromEntries(['name', 'hostname', 'port', 'scheme', 'username', 'verifyTls', 'roles', 'enabled'].map((k) => [k, listed[k]]));
+      const saved = await put(`/nodes/${nodeId}`, editable).expect(200);
+      expect(saved.body.data).toMatchObject({ id: nodeId, hasToken: true, roles: ['dns', 'backup'] });
       const again = await post(`/nodes/${nodeId}/test`).expect(200);
       expect(again.body.data.test.ok).toBe(true);
       expect(again.body.data.roles).toEqual(['dns', 'backup']);
@@ -325,8 +332,8 @@ describe('Server Configuration API', () => {
       expect(job.status).toBe('done');
       expect(job.result).toMatchObject({ domains: 2, generated: 1, skipped: 1, failed: 0 });
       expect(app.agent.callsTo('stats.generate').map((c) => c.args)).toEqual([
-        { generator: 'awstats', domain: 'alice.test', username: 'alice', homeDir: '/home/alice' },
-        { generator: 'awstats', domain: 'nolog.test', username: 'alice', homeDir: '/home/alice' },
+        { generator: 'awstats', domain: 'alice.test', username: 'alice' },
+        { generator: 'awstats', domain: 'nolog.test', username: 'alice' },
       ]);
       const after = await get('/stats').expect(200);
       expect(after.body.data.lastRun).toMatchObject({ generated: 1 });
@@ -361,6 +368,13 @@ describe('Server Configuration API', () => {
       const typed = await post(`/terminal/${TERM_ID}/input`, { data: 'id\r' }).expect(200);
       expect(typed.body.data.bytes).toBe(3);
       expect(app.agent.callsTo('terminal.write').pop().args).toEqual({ id: TERM_ID, data: 'id\r' });
+      await post(`/terminal/${TERM_ID}/input`, { data: 'Hunter2-typed-at-a-prompt\r' }).expect(200);
+      const inputRows = app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action LIKE 'POST %/terminal/:id/input'").all();
+      expect(inputRows.length).toBeGreaterThanOrEqual(2);
+      expect(inputRows.at(-1).args_redacted).toBe(JSON.stringify({ bytes: 26 }));
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE args_redacted LIKE '%Hunter2%' OR args_redacted LIKE '%id\\r%'").get().n).toBe(0);
+      const rejected = app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action LIKE 'POST %/terminal/:id/input' AND result = 'error:403'").get();
+      expect(rejected.args_redacted).toBe(JSON.stringify({ bytes: 3 }));
 
       terminalOutput = ['root@host:~# id\r\n', 'uid=0(root)\r\n'];
       const events = [];

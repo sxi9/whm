@@ -2,6 +2,7 @@ import { notFound, unprocessable, CapabilityError } from '../lib/errors.js';
 
 // Server Status. Attached as ctx.serverStatus; other categories may call:
 //   serverStatus.apache()                      -> Apache worker status (throws CapabilityError without Apache)
+//   serverStatus.apacheWorkers()               -> mod_status per-slot worker table (needs ExtendedStatus On)
 //   serverStatus.processLog.latest()           -> the most recent process sample with its entries, or null
 //   serverStatus.processLog.settings()         -> { enabled, topN, retentionDays, schedule }
 // Lazily used when present: ctx.web.apache.settings().serverStatus (whether the panel's Apache include
@@ -174,6 +175,38 @@ export function createServerStatusService(ctx) {
     };
   }
 
+  // The per-slot table comes from the HTML report, which mod_status renders
+  // only with ExtendedStatus On; the ?auto counters stay available without it.
+  async function apacheWorkers() {
+    await capabilities.ensureFresh();
+    capabilities.require('apache', 'Apache is not installed on this server. Install apache2 (Debian/Ubuntu) or httpd (RHEL) to see worker status.');
+    const ports = listenPorts();
+    const out = await agent.op('modstatus.workers', { port: ports.http, bind: ports.bind });
+    const workers = (out?.workers || []).map((w) => {
+      const state = SCOREBOARD_STATES.find(([c]) => c === w.mode);
+      return { ...w, stateKey: state?.[1] || null, stateLabel: state?.[2] || null };
+    });
+    const reason = !out?.reachable ? 'unreachable' : !out.statusPage ? 'unreachable' : out.extended === false ? 'extended_off' : null;
+    const active = workers.filter((w) => w.pid != null && w.mode !== '.');
+    return {
+      probe: out?.probe || { host: ports.bind || '127.0.0.1', port: ports.http },
+      available: reason == null,
+      reason,
+      instructions: reason === 'extended_off' ? {
+        title: 'ExtendedStatus is Off',
+        steps: ['Apache only renders the per-worker table with "ExtendedStatus On" in its configuration (the panel\'s Apache include sets it when "Server status page" is enabled).', 'Reload Apache, then re-check this page.'],
+      } : reason === 'unreachable' ? { title: `${out?.probe?.host || ports.bind || '127.0.0.1'}:${out?.probe?.port || ports.http}/server-status did not answer`, steps: ['Check the Apache status panel above: it explains how to load mod_status and the Location block.'] } : null,
+      columns: out?.columns || [],
+      workers,
+      summary: {
+        slots: workers.length, active: active.length, open: workers.filter((w) => w.mode === '.').length,
+        vhosts: [...new Set(active.filter((w) => ['W', 'R', 'K', 'C', 'L', 'G'].includes(w.mode) && w.vhost).map((w) => w.vhost))].length,
+        clients: [...new Set(active.filter((w) => ['W', 'R', 'K', 'C'].includes(w.mode) && w.client).map((w) => w.client))].length,
+      },
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
   async function enableModStatus(req) {
     await capabilities.ensureFresh();
     capabilities.require('apache', 'Apache is not installed on this server.');
@@ -289,6 +322,7 @@ export function createServerStatusService(ctx) {
 
   return {
     apache,
+    apacheWorkers,
     enableModStatus,
     processLog,
     jobs: { [SAMPLE_JOB]: (job) => processLog.sample(job) },

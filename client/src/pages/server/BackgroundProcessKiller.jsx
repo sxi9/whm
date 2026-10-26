@@ -57,9 +57,16 @@ export function BackgroundProcessKiller() {
 
   const cfg = data.config;
   const run = data.lastRun;
+  const armed = data.patterns.filter((p) => p.enabled).length;
 
   return (
     <>
+      {procps && cfg.enabled && armed === 0 && (
+        <div className="banner banner-info">
+          <ShieldAlert size={18} />
+          <div><strong>Nothing is killed yet.</strong><p>The disallowed list ships with every entry unticked. Tick the names you want terminated below; the scheduled scan only acts on enabled entries.</p></div>
+        </div>
+      )}
       {!procps && <CapabilityNotice error={{ code: 'capability_missing', message: 'The "ps" program (procps) is not installed on this server, so processes cannot be scanned or killed.' }} onRetry={() => api.post('/system/capabilities/refresh').then(refreshAll).catch(toast.error)} />}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: 18, alignItems: 'start' }}>
         <Card title="Status" actions={<StatusPill status={cfg.enabled ? 'enabled' : 'disabled'}>{cfg.enabled ? 'Enabled' : 'Disabled'}</StatusPill>}>
@@ -68,6 +75,7 @@ export function BackgroundProcessKiller() {
             ['Next scheduled run', data.schedule?.enabled ? formatDate(data.schedule.nextRunAt) : '—'],
             ['Last run', run ? <>{formatDate(run.finished_at || run.started_at)} <span className="muted">({run.trigger}{run.dry_run ? ', dry run' : ''})</span></> : 'never'],
             ['Last result', run ? (run.error ? <StatusPill status="failed">{run.error}</StatusPill> : `${run.scanned} scanned, ${run.matched} matched, ${run.killed} killed${run.failed ? `, ${run.failed} failed` : ''}`) : '—'],
+            ['Enabled names', armed ? `${armed} of ${data.patterns.length}` : <span className="muted">none (nothing is killed)</span>],
             ['Kills in the last 24 h', String(data.stats.last24h)],
             ['Kills logged', `${data.stats.total}${data.stats.failed ? ` (${data.stats.failed} failed)` : ''}`],
             ['Notifications', data.capability.notifications ? (cfg.notify ? 'Sent to the server contact after every kill' : 'Off') : <span className="muted">Contact Manager is not loaded; kills are only logged</span>],
@@ -181,7 +189,7 @@ function Patterns({ patterns, onChanged }) {
   };
 
   return (
-    <Card title="Disallowed processes" subtitle="A process is matched by its name or the basename of its executable (case-insensitive). Built-in entries can be disabled but not removed." padded={false}>
+    <Card title="Disallowed processes" subtitle="Only ticked names are killed; the list ships unticked. A process is matched by its name or the basename of its executable (case-insensitive). Built-in entries can be unticked but not removed." padded={false}>
       <DataTable dense rows={patterns} rowKey={(p) => p.id}
         columns={[
           { key: 'enabled', label: 'Kill', width: 90, render: (p) => <Toggle checked={p.enabled} onChange={(v) => toggle(p, v)} /> },

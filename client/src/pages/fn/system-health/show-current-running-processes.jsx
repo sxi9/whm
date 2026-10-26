@@ -5,7 +5,7 @@ export default function RunningProcesses({ fn }) {
   return (
     <>
       <PageHeader fn={fn} description="Snapshot of running processes, refreshed every 10 seconds. Use Process Manager to kill or renice." />
-      <Card padded={false}><ProcessTable /></Card>
+      <Card padded={false}><ProcessTable base="/system-health" /></Card>
     </>
   );
 }

@@ -7,9 +7,9 @@ import { Field, TextInput, NumberInput, Select, Toggle, Button, FormActions, Err
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError } from '../../server-configuration/Shared.jsx';
+import { nodeFormValues, nodeRequestBody } from '../../server-configuration/nodes.js';
 
 const ROLES = [['dns', 'DNS'], ['mail', 'Mail'], ['database', 'Database'], ['web', 'Web'], ['backup', 'Backup']];
-const EMPTY = { name: '', hostname: '', port: 2087, scheme: 'https', username: 'root', token: '', verifyTls: true, roles: [], enabled: true };
 
 function NodeForm({ initial, onSubmit, onCancel, busy, error, editing }) {
   const [form, setForm] = useState(initial);
@@ -18,7 +18,7 @@ function NodeForm({ initial, onSubmit, onCancel, busy, error, editing }) {
   const fields = error?.fields || {};
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSubmit(form); }}>
-      <ErrorBanner error={error && !error.fields ? error : null} />
+      <ErrorBanner error={error && (!error.fields || error.fields._) ? error : null} />
       <div className="form-grid">
         <Field label="Name" required error={fields.name}><TextInput value={form.name} onChange={set('name')} placeholder="dns-node-2" /></Field>
         <Field label="Hostname or IP" required error={fields.hostname}><TextInput value={form.hostname} onChange={set('hostname')} placeholder="node2.example.com" /></Field>
@@ -54,8 +54,7 @@ export default function LinkServerNodes({ fn }) {
 
   const submit = async (form) => {
     setBusy(true); setFormError(null);
-    const body = { ...form };
-    if (modal.node && !body.token) delete body.token;
+    const body = nodeRequestBody(form, { editing: Boolean(modal.node) });
     try {
       if (modal.node) { await api.put(`/server-config/nodes/${modal.node.id}`, body); toast.success(`Node "${form.name}" updated`); } else { await api.post('/server-config/nodes', body); toast.success(`Node "${form.name}" linked`); }
       setModal(null); refetch();
@@ -98,7 +97,7 @@ export default function LinkServerNodes({ fn }) {
         </Card>
       )}
       <Modal open={Boolean(modal)} title={modal?.node ? `Edit ${modal.node.name}` : 'Link a server node'} onClose={() => setModal(null)} size="lg">
-        {modal && <NodeForm key={modal.node?.id ?? 'new'} editing={Boolean(modal.node)} initial={modal.node ? { ...EMPTY, ...modal.node, token: '' } : EMPTY} onSubmit={submit} onCancel={() => setModal(null)} busy={busy} error={formError} />}
+        {modal && <NodeForm key={modal.node?.id ?? 'new'} editing={Boolean(modal.node)} initial={nodeFormValues(modal.node)} onSubmit={submit} onCancel={() => setModal(null)} busy={busy} error={formError} />}
       </Modal>
     </>
   );

@@ -2,6 +2,7 @@ import path from 'node:path';
 import { json, paginate } from '../db/index.js';
 import { notFound, conflict, forbidden, badRequest, unprocessable, CapabilityError, HttpError } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
+import { isValidCron } from '../lib/cron.js';
 
 // Backup. Attached as ctx.backup; other categories (Transfers, Account Functions)
 // may call:
@@ -72,12 +73,15 @@ export function createBackupService(ctx) {
     updateDestination: db.prepare(`UPDATE backup_destinations SET name = @name, kind = @kind, config_enc = @config_enc, enabled = @enabled, updated_at = datetime('now') WHERE id = @id`),
     testDestination: db.prepare(`UPDATE backup_destinations SET last_test_at = datetime('now'), last_test_ok = ?, last_test_message = ? WHERE id = ?`),
     deleteDestination: db.prepare('DELETE FROM backup_destinations WHERE id = ?'),
-    backupById: db.prepare('SELECT b.*, a.owner_id, a.id AS live_account_id FROM backups b LEFT JOIN accounts a ON a.username = b.account_name WHERE b.id = ?'),
-    backupsForAccount: db.prepare("SELECT * FROM backups WHERE account_name = ? AND status = 'done'"),
+    // Ownership comes from the row (owner_id, fixed when it was written), never
+    // from whichever account currently carries the username; the join only
+    // tells whether such an account exists today.
+    backupById: db.prepare('SELECT b.*, a.id AS live_account_id FROM backups b LEFT JOIN accounts a ON a.username = b.account_name WHERE b.id = ?'),
+    backupsForAccount: db.prepare("SELECT * FROM backups WHERE account_id = ? AND account_name = ? AND status = 'done'"),
     backupByPath: db.prepare('SELECT id FROM backups WHERE path = ?'),
-    lastBackupFor: db.prepare("SELECT id, created_at, size, status FROM backups WHERE account_name = ? ORDER BY created_at DESC, id DESC LIMIT 1"),
-    insertBackup: db.prepare(`INSERT INTO backups (account_id, account_name, type, path, size, sha256, status, run_id, retention_class, components_json, error, local_present, created_at)
-      VALUES (@account_id, @account_name, @type, @path, @size, @sha256, @status, @run_id, @retention_class, @components_json, @error, @local_present, COALESCE(@created_at, datetime('now')))`),
+    lastBackupFor: db.prepare("SELECT id, created_at, size, status FROM backups WHERE account_id = ? ORDER BY created_at DESC, id DESC LIMIT 1"),
+    insertBackup: db.prepare(`INSERT INTO backups (account_id, account_name, owner_id, type, path, size, sha256, status, run_id, retention_class, components_json, error, local_present, created_at)
+      VALUES (@account_id, @account_name, @owner_id, @type, @path, @size, @sha256, @status, @run_id, @retention_class, @components_json, @error, @local_present, COALESCE(@created_at, datetime('now')))`),
     updateBackupLocal: db.prepare('UPDATE backups SET local_present = ?, path = COALESCE(?, path) WHERE id = ?'),
     pinBackup: db.prepare('UPDATE backups SET pinned = ? WHERE id = ?'),
     deleteBackup: db.prepare('DELETE FROM backups WHERE id = ?'),
@@ -91,16 +95,23 @@ export function createBackupService(ctx) {
     runFinish: db.prepare("UPDATE backup_runs SET status = ?, accounts_ok = ?, accounts_failed = ?, bytes = ?, summary_json = ?, error = ?, finished_at = datetime('now') WHERE id = ?"),
     runs: db.prepare('SELECT r.*, j.status AS job_status FROM backup_runs r LEFT JOIN jobs j ON j.id = r.job_id ORDER BY r.id DESC LIMIT ?'),
     lastRun: db.prepare("SELECT * FROM backup_runs WHERE status IN ('done', 'failed') ORDER BY id DESC LIMIT 1"),
-    insertRestore: db.prepare('INSERT INTO backup_restores (backup_id, account_name, kind, options_json, started_by) VALUES (?, ?, ?, ?, ?)'),
+    insertRestore: db.prepare('INSERT INTO backup_restores (backup_id, account_name, owner_id, kind, options_json, started_by) VALUES (?, ?, ?, ?, ?, ?)'),
     restoreJob: db.prepare('UPDATE backup_restores SET job_id = ? WHERE id = ?'),
     restoreById: db.prepare('SELECT * FROM backup_restores WHERE id = ?'),
     restoreStart: db.prepare("UPDATE backup_restores SET status = 'running' WHERE id = ?"),
     restoreFinish: db.prepare("UPDATE backup_restores SET status = ?, summary_json = ?, error = ?, finished_at = datetime('now') WHERE id = ?"),
-    restores: db.prepare('SELECT r.*, a.owner_id FROM backup_restores r LEFT JOIN accounts a ON a.username = r.account_name ORDER BY r.id DESC LIMIT ?'),
+    restores: db.prepare('SELECT * FROM backup_restores ORDER BY id DESC LIMIT ?'),
     userById: db.prepare('SELECT id, username, role FROM users WHERE id = ?'),
     dbProfileSecret: db.prepare('SELECT * FROM db_instances WHERE id = ?'),
     dnsZonesFor: db.prepare('SELECT domain FROM dns_zones WHERE account_id = ? ORDER BY domain'),
+    // Current owners of the objects an archive may carry, re-checked at restore time.
+    dbOwner: db.prepare('SELECT d.account_id, a.username AS account FROM databases d LEFT JOIN accounts a ON a.id = d.account_id WHERE d.name = ?'),
+    dbUserOwner: db.prepare('SELECT u.account_id, a.username AS account FROM db_users u LEFT JOIN accounts a ON a.id = u.account_id WHERE u.name = ?'),
+    zoneOwner: db.prepare('SELECT z.account_id, a.username AS account FROM dns_zones z LEFT JOIN accounts a ON a.id = z.account_id WHERE z.domain = ?'),
+    domainOwner: db.prepare('SELECT d.account_id, a.username AS account FROM account_domains d LEFT JOIN accounts a ON a.id = d.account_id WHERE d.domain = ?'),
+    mailDomainOwner: db.prepare('SELECT m.account_id, a.username AS account FROM mail_domains m LEFT JOIN accounts a ON a.id = m.account_id WHERE m.domain = ?'),
   };
+  const SYSTEM_SCHEMAS = new Set(['mysql', 'information_schema', 'performance_schema', 'sys']);
 
   const setting = (key) => settings.get(key, DEFAULTS[key]);
   const audit = (req, entry) => (req?.audit ? req.audit(entry) : ctx.auditRecord?.(req ?? null, entry));
@@ -159,14 +170,21 @@ export function createBackupService(ctx) {
     try { scheduler.update(SCHEDULE_NAME, { cron, enabled: Boolean(setting('backup.enabled')) }); } catch (err) { logger.warn({ err }, 'could not update the backup schedule'); }
   }
 
-  async function status() {
+  // Resellers get the capability banner and their own account count only; the
+  // destinations, directory, schedule and run history are server configuration.
+  async function status(user = SYSTEM_ROOT) {
     await capabilities.ensureFresh();
     const snap = capabilities.snapshot();
+    const bins = snap.binaries || {};
+    const capability = { installed: capabilities.has('backup'), binaries: { tar: Boolean(bins.tar), gzip: Boolean(bins.gzip), curl: Boolean(bins.curl), mysqldump: Boolean(bins.mysqldump || bins['mariadb-dump']) } };
+    if (!isRoot(user)) {
+      const own = (a) => a.owner_id === user.id;
+      return { capability, includedAccounts: includedAccounts().filter(own).length, totalAccounts: stmts.accounts.all().filter(own).length };
+    }
     let dir = { path: localDir(), exists: null };
     try { const st = await agent.op('fs.stat', { path: localDir() }); dir = { path: localDir(), exists: Boolean(st?.exists), isDirectory: st?.isDirectory ?? null, mode: st?.mode ?? null }; } catch (err) { dir = { path: localDir(), exists: null, error: err.message }; }
-    const bins = snap.binaries || {};
     return {
-      capability: { installed: capabilities.has('backup'), binaries: { tar: Boolean(bins.tar), gzip: Boolean(bins.gzip), curl: Boolean(bins.curl), mysqldump: Boolean(bins.mysqldump || bins['mariadb-dump']) } },
+      capability,
       localDir: dir,
       schedule: scheduler.list().find((s) => s.name === SCHEDULE_NAME) ?? null,
       destinations: stmts.destinations.all().map(shapeDestination),
@@ -180,6 +198,11 @@ export function createBackupService(ctx) {
     const next = {};
     for (const [k, v] of Object.entries(input)) if (SETTING_KEYS.includes(k)) next[k] = v;
     if (!Object.keys(next).length) throw badRequest('No backup settings supplied');
+    if (next['backup.schedule'] !== undefined) {
+      const cron = String(next['backup.schedule']).trim();
+      if (!isValidCron(cron)) throw unprocessable('Invalid cron expression', { 'backup.schedule': ['Must be a valid 5-field cron expression (minute hour day-of-month month day-of-week)'] });
+      next['backup.schedule'] = cron;
+    }
     if (next['backup.local_dir'] !== undefined) {
       const dir = String(next['backup.local_dir']).replace(/\/+$/, '');
       await op('fs.mkdir', { path: dir, mode: '0700', owner: 'root' }, req);
@@ -277,7 +300,7 @@ export function createBackupService(ctx) {
     if (query.owner) rows = rows.filter((a) => a.owner === query.owner);
     const data = rows.map((a) => {
       const sel = selection.get(a.id);
-      const last = stmts.lastBackupFor.get(a.username);
+      const last = stmts.lastBackupFor.get(a.id);
       return { username: a.username, domain: a.domain, owner: a.owner, suspended: Boolean(a.suspended), enabled: effectiveEnabled(a, sel), explicit: Boolean(sel), lastBackup: last ? { id: last.id, created_at: last.created_at, size: last.size, status: last.status } : null };
     });
     if (query.enabled != null) return { data: data.filter((r) => r.enabled === query.enabled), meta: { total: data.filter((r) => r.enabled === query.enabled).length, defaultInclude: Boolean(setting('backup.default_include')) } };
@@ -317,6 +340,8 @@ export function createBackupService(ctx) {
     };
   }
 
+  // Rows without an owner (archives of terminated accounts, adopted or imported
+  // archives of accounts that no longer exist) are root-only.
   function loadBackup(id, user) {
     const row = stmts.backupById.get(id);
     if (!row) throw notFound('Backup');
@@ -329,12 +354,12 @@ export function createBackupService(ctx) {
   function listBackups(query, user) {
     const where = [];
     const params = {};
-    if (!isRoot(user)) { where.push('a.owner_id = @owner'); params.owner = user.id; }
+    if (!isRoot(user)) { where.push('b.owner_id = @owner'); params.owner = user.id; }
     if (query.account) { where.push('b.account_name = @account'); params.account = query.account; }
     if (query.status) { where.push('b.status = @status'); params.status = query.status; }
     if (query.q) { where.push('(b.account_name LIKE @q OR b.path LIKE @q)'); params.q = `%${query.q}%`; }
     const result = paginate(db, {
-      select: 'b.*, a.owner_id, a.id AS live_account_id', from: 'backups b LEFT JOIN accounts a ON a.username = b.account_name', where, params,
+      select: 'b.*, a.id AS live_account_id', from: 'backups b LEFT JOIN accounts a ON a.username = b.account_name', where, params,
       sortable: { created_at: 'b.created_at', account: 'b.account_name', size: 'b.size', status: 'b.status', retention_class: 'b.retention_class' },
       defaultSort: 'created_at', query: { ...query, dir: query.sort ? query.dir : 'desc' },
     });
@@ -406,7 +431,7 @@ export function createBackupService(ctx) {
       const row = known.get(a.path);
       if (row) { if (!row.local_present) stmts.updateBackupLocal.run(1, null, row.id); continue; }
       const account = a.username ? stmts.accountByUsername.get(a.username) : null;
-      stmts.insertBackup.run({ account_id: account?.id ?? null, account_name: a.username, type: 'full', path: a.path, size: a.sizeBytes, sha256: a.sha256, status: 'done', run_id: null, retention_class: retentionClassFor(a.mtime, retention()), components_json: '{}', error: null, local_present: 1, created_at: a.mtime.replace('T', ' ').slice(0, 19) });
+      stmts.insertBackup.run({ account_id: account?.id ?? null, account_name: a.username, owner_id: account?.owner_id ?? null, type: 'full', path: a.path, size: a.sizeBytes, sha256: a.sha256, status: 'done', run_id: null, retention_class: retentionClassFor(a.mtime, retention()), components_json: '{}', error: null, local_present: 1, created_at: a.mtime.replace('T', ' ').slice(0, 19) });
       added.push(a.name);
     }
     let missing = 0;
@@ -426,7 +451,7 @@ export function createBackupService(ctx) {
     if (!username) throw unprocessable('The archive name does not identify an account');
     const account = stmts.accountByUsername.get(username);
     const verify = await op('backup.archive.verify', { archive: archivePath }, req);
-    const { lastInsertRowid } = stmts.insertBackup.run({ account_id: account?.id ?? null, account_name: username, type: 'import', path: archivePath, size: info.sizeBytes, sha256: verify.sha256, status: 'done', run_id: null, retention_class: 'daily', components_json: JSON.stringify(info.components), error: null, local_present: 1, created_at: info.info?.createdAt ? info.info.createdAt.replace('T', ' ').slice(0, 19) : null });
+    const { lastInsertRowid } = stmts.insertBackup.run({ account_id: account?.id ?? null, account_name: username, owner_id: account?.owner_id ?? null, type: 'import', path: archivePath, size: info.sizeBytes, sha256: verify.sha256, status: 'done', run_id: null, retention_class: 'daily', components_json: JSON.stringify(info.components), error: null, local_present: 1, created_at: info.info?.createdAt ? info.info.createdAt.replace('T', ' ').slice(0, 19) : null });
     stmts.pinBackup.run(1, lastInsertRowid);
     audit(req, { action: 'backup.import', target: archivePath, args: { account: username } });
     return shapeBackup(stmts.backupById.get(lastInsertRowid));
@@ -513,7 +538,7 @@ export function createBackupService(ctx) {
       error = err;
     }
     const { lastInsertRowid } = stmts.insertBackup.run({
-      account_id: account.id, account_name: username, type: 'full', path: result?.path ?? null, size: result?.sizeBytes ?? null, sha256: result?.sha256 ?? null,
+      account_id: account.id, account_name: username, owner_id: account.owner_id, type: 'full', path: result?.path ?? null, size: result?.sizeBytes ?? null, sha256: result?.sha256 ?? null,
       status: error ? 'failed' : 'done', run_id: runId, retention_class: retentionClassFor(new Date(), retention()),
       components_json: JSON.stringify(result ? { ...result.components, warnings: result.warnings, durationMs: result.durationMs, include: inc } : { include: inc }), error: error ? error.message : null, local_present: result ? 1 : 0, created_at: null,
     });
@@ -543,8 +568,11 @@ export function createBackupService(ctx) {
     return outcomes;
   }
 
-  async function pruneAccount(username, req, log = () => {}) {
-    const rows = stmts.backupsForAccount.all(username);
+  // Only this account's own archives are pruned: an orphaned archive with the
+  // same username (from a terminated predecessor) is root's to delete by hand.
+  async function pruneAccount(account, req, log = () => {}) {
+    const username = account.username;
+    const rows = stmts.backupsForAccount.all(account.id, username);
     const remove = planPrune(rows, retention());
     const pruned = [];
     for (const row of remove) {
@@ -611,7 +639,7 @@ export function createBackupService(ctx) {
           entry.uploads = await uploadBackup(row, req, jobCtx.log);
           summary.uploads += entry.uploads.filter((u) => u.ok).length;
           summary.uploadFailures += entry.uploads.filter((u) => !u.ok).length;
-          entry.pruned = (await pruneAccount(account.username, req, jobCtx.log)).length;
+          entry.pruned = (await pruneAccount(account, req, jobCtx.log)).length;
           summary.pruned += entry.pruned;
           ok += 1;
         } catch (err) {
@@ -693,7 +721,7 @@ export function createBackupService(ctx) {
       if (!options.paths?.length) throw badRequest('Choose at least one file or directory to restore');
     }
     if (kind === 'account' && !account && !options.createAccount) throw conflict(`Account "${row.account_name}" no longer exists; enable "create the account" to recreate it from the archive`);
-    const { lastInsertRowid } = stmts.insertRestore.run(row.id, row.account_name, kind, JSON.stringify(options), user?.username ?? null);
+    const { lastInsertRowid } = stmts.insertRestore.run(row.id, row.account_name, row.owner_id ?? null, kind, JSON.stringify(options), user?.username ?? null);
     const job = jobs.enqueue('backup.restore', { restoreId: Number(lastInsertRowid), userId: user?.id ?? null }, { userId: user?.id ?? null });
     stmts.restoreJob.run(job.id, lastInsertRowid);
     audit(req, { action: kind === 'files' ? 'backup.restore.files' : 'backup.restore.account', target: row.account_name, args: { backupId: row.id, options, jobId: job.id } });
@@ -708,9 +736,31 @@ export function createBackupService(ctx) {
 
   function listRestores({ limit = 50, account } = {}, user) {
     let rows = stmts.restores.all(limit);
-    if (!isRoot(user)) rows = rows.filter((r) => r.owner_id === user.id);
+    if (!isRoot(user)) rows = rows.filter((r) => r.owner_id != null && r.owner_id === user.id);
     if (account) rows = rows.filter((r) => r.account_name === account);
     return rows.map(shapeRestore);
+  }
+
+  // The objects inside an archive may have changed hands since it was written;
+  // each is restored only when it is still unowned or owned by this account.
+  function ownedByAccount(row, account) {
+    if (!row || row.account_id == null) return { ok: true };
+    if (row.account_id === account.id) return { ok: true };
+    return { ok: false, reason: `now belongs to ${row.account ?? 'another account'}` };
+  }
+  function databaseClaim(name, account) {
+    if (SYSTEM_SCHEMAS.has(name.toLowerCase())) return { ok: false, reason: 'system schema' };
+    return ownedByAccount(stmts.dbOwner.get(name), account);
+  }
+  function zoneClaim(domain, account) {
+    const zone = ownedByAccount(stmts.zoneOwner.get(domain), account);
+    if (!zone.ok) return zone;
+    return ownedByAccount(stmts.domainOwner.get(domain), account);
+  }
+  function mailDomainClaim(domain, account) {
+    const owned = ownedByAccount(stmts.domainOwner.get(domain), account);
+    if (!owned.ok) return owned;
+    return ownedByAccount(stmts.mailDomainOwner.get(domain), account);
   }
 
   async function runRestoreJob(jobCtx) {
@@ -735,6 +785,9 @@ export function createBackupService(ctx) {
         step('verify', { status: 'done', detail: 'sha256 matches' });
       }
       let account = stmts.accountByUsername.get(restore.account_name);
+      // Ownership was checked when the restore was queued; the account may have
+      // changed hands since, so it is checked again for the actor here.
+      if (account && !isRoot(req.user) && account.owner_id !== req.user.id) throw new Error(`account ${restore.account_name} no longer belongs to ${req.user.username}`);
       if (restore.kind === 'files') {
         if (!account) throw new Error(`account ${restore.account_name} does not exist`);
         jobCtx.progress(30, 'restoring files');
@@ -771,7 +824,10 @@ export function createBackupService(ctx) {
           else {
             const imported = [];
             const errors = [];
+            const skipped = [];
             for (const d of ex.mysql) {
+              const claim = databaseClaim(d.database, account);
+              if (!claim.ok) { skipped.push(`${d.database} (${claim.reason})`); jobCtx.log(`database ${d.database} skipped: ${claim.reason}`, 'warn'); continue; }
               try {
                 await op('backup.db.import', { file: d.file, ...(creds ? { credentials: creds } : {}) }, req);
                 imported.push(d.database);
@@ -782,13 +838,18 @@ export function createBackupService(ctx) {
               }
             }
             let users = null;
-            if (ex.users?.users?.length) {
+            const userRows = (ex.users?.users || []).filter((u) => {
+              const claim = ownedByAccount(stmts.dbUserOwner.get(u.user), account);
+              if (!claim.ok) { skipped.push(`user ${u.user} (${claim.reason})`); jobCtx.log(`database user ${u.user} skipped: ${claim.reason}`, 'warn'); }
+              return claim.ok;
+            });
+            if (userRows.length) {
               try {
-                users = await op('backup.db.restore_users', { users: ex.users.users.map((u) => ({ user: u.user, host: u.host, plugin: u.plugin || '', hashHex: u.hashHex || '', grants: u.grants || [] })), ...(creds ? { credentials: creds } : {}) }, req);
-                for (const name of new Set(ex.users.users.map((u) => u.user))) { try { await ctx.databases?.assign?.({ kind: 'user', name, account: account.username }, SYSTEM_ROOT, req); } catch (err) { jobCtx.log(`database map: user ${name}: ${err.message}`, 'warn'); } }
+                users = await op('backup.db.restore_users', { users: userRows.map((u) => ({ user: u.user, host: u.host, plugin: u.plugin || '', hashHex: u.hashHex || '', grants: u.grants || [] })), ...(creds ? { credentials: creds } : {}) }, req);
+                for (const name of new Set(userRows.map((u) => u.user))) { try { await ctx.databases?.assign?.({ kind: 'user', name, account: account.username }, SYSTEM_ROOT, req); } catch (err) { jobCtx.log(`database map: user ${name}: ${err.message}`, 'warn'); } }
               } catch (err) { errors.push(`users: ${err.message}`); }
             }
-            step('databases', { status: errors.length ? (imported.length ? 'done' : 'failed') : 'done', detail: `${imported.length}/${ex.mysql.length} database(s) imported${users ? `, ${users.created.length} user(s) recreated, ${users.skipped.length} kept` : ''}${errors.length ? `; errors: ${errors.join(' | ')}` : ''}`, imported, errors, users });
+            step('databases', { status: errors.length ? (imported.length ? 'done' : 'failed') : imported.length || !skipped.length ? 'done' : 'skipped', detail: `${imported.length}/${ex.mysql.length} database(s) imported${users ? `, ${users.created.length} user(s) recreated, ${users.skipped.length} kept` : ''}${skipped.length ? `; skipped: ${skipped.join(', ')}` : ''}${errors.length ? `; errors: ${errors.join(' | ')}` : ''}`, imported, skipped, errors, users });
           }
         }
         if (options.dns !== false && ex.dnszones.length) {
@@ -797,11 +858,14 @@ export function createBackupService(ctx) {
           else {
             const done = [];
             const errors = [];
+            const skipped = [];
             let pending = false;
             for (const zone of ex.dnszones) {
+              const claim = zoneClaim(zone.domain, account);
+              if (!claim.ok) { skipped.push(`${zone.domain} (${claim.reason})`); jobCtx.log(`zone ${zone.domain} skipped: ${claim.reason}`, 'warn'); continue; }
               try { await ctx.dns.importZone({ domain: zone.domain, body: zone.body }, SYSTEM_ROOT, req); done.push(zone.domain); } catch (err) { if (isCapabilityMissing(err)) pending = true; errors.push(`${zone.domain}: ${err.message}`); }
             }
-            step('dns', { status: pending && !done.length ? 'pending' : errors.length && !done.length ? 'failed' : 'done', detail: `${done.length}/${ex.dnszones.length} zone(s) loaded${errors.length ? `; ${errors.join(' | ')}` : ''}`, zones: done, errors });
+            step('dns', { status: pending && !done.length ? 'pending' : errors.length && !done.length ? 'failed' : !done.length && skipped.length ? 'skipped' : 'done', detail: `${done.length}/${ex.dnszones.length} zone(s) loaded${skipped.length ? `; skipped: ${skipped.join(', ')}` : ''}${errors.length ? `; ${errors.join(' | ')}` : ''}`, zones: done, skipped, errors });
           }
         }
         if (options.mail !== false && meta.mail?.length) {
@@ -809,10 +873,14 @@ export function createBackupService(ctx) {
           if (!ctx.mail?.setRouting) step('mail', { status: 'skipped', detail: 'Email is not loaded' });
           else {
             const results = [];
+            const skipped = [];
             for (const m of meta.mail) {
+              if (typeof m?.domain !== 'string') continue;
+              const claim = mailDomainClaim(m.domain, account);
+              if (!claim.ok) { skipped.push(`${m.domain} (${claim.reason})`); jobCtx.log(`mail routing for ${m.domain} skipped: ${claim.reason}`, 'warn'); continue; }
               try { const r = await ctx.mail.setRouting(m.domain, m.routing || 'local', req); results.push(`${m.domain}: ${m.routing}${r?.applied === false ? ' (pending)' : ''}`); } catch (err) { results.push(`${m.domain}: ${err.message}`); }
             }
-            step('mail', { status: 'done', detail: results.join(', ') });
+            step('mail', { status: results.length || !skipped.length ? 'done' : 'skipped', detail: [...results, ...skipped.map((s) => `skipped ${s}`)].join(', '), skipped });
           }
         }
       }
@@ -831,7 +899,10 @@ export function createBackupService(ctx) {
 
   // Accounts a user may restore into, with their backup counts (restore pages).
   function accountsOverview(user) {
-    const counts = new Map(db.prepare("SELECT account_name, COUNT(*) AS n, MAX(created_at) AS last FROM backups WHERE status = 'done' GROUP BY account_name").all().map((r) => [r.account_name, r]));
+    const counts = new Map((isRoot(user)
+      ? db.prepare("SELECT account_name, COUNT(*) AS n, MAX(created_at) AS last FROM backups WHERE status = 'done' GROUP BY account_name").all()
+      : db.prepare("SELECT account_name, COUNT(*) AS n, MAX(created_at) AS last FROM backups WHERE status = 'done' AND owner_id = ? GROUP BY account_name").all(user.id)
+    ).map((r) => [r.account_name, r]));
     const accounts = stmts.accounts.all().filter((a) => isRoot(user) || a.owner_id === user.id).map((a) => ({ username: a.username, domain: a.domain, owner: a.owner, exists: true, backups: counts.get(a.username)?.n ?? 0, lastBackup: counts.get(a.username)?.last ?? null }));
     if (isRoot(user)) {
       const known = new Set(accounts.map((a) => a.username));
@@ -847,7 +918,7 @@ export function createBackupService(ctx) {
     listSelection, setSelection, includedAccounts: () => includedAccounts().map((a) => a.username),
     listBackups, getBackup, inspect, archiveInfo, pinBackup, deleteBackup, rescan, registerArchive, accountsOverview,
     archiveAccount, enqueueRun, runBackupJob, listRuns, getRun: (id) => { const r = stmts.runById.get(id); if (!r) throw notFound('Backup run'); return shapeRun(r); },
-    enqueueRestore, runRestoreJob, listRestores, getRestore: (id, user) => { const r = stmts.restoreById.get(id); if (!r) throw notFound('Restore'); if (!isRoot(user)) loadAccount(r.account_name, user); return shapeRestore(r); },
+    enqueueRestore, runRestoreJob, listRestores, getRestore: (id, user) => { const r = stmts.restoreById.get(id); if (!r) throw notFound('Restore'); if (!isRoot(user) && (r.owner_id == null || r.owner_id !== user.id)) throw forbidden('That restore belongs to another reseller\'s account'); return shapeRestore(r); },
     enqueueFetch, runFetchJob,
     retentionClassFor, planPrune,
   };
