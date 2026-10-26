@@ -108,7 +108,7 @@ export function normalizeRecord(input, domain) {
       break;
     }
     case 'TXT':
-      if (value.length === 0 || value.length > 4096 || /[\0-\x08\x0b\x0c\x0e-\x1f]/.test(value)) fail('value', 'TXT must be 1–4096 printable characters');
+      if (value.length === 0 || value.length > 4096 || /[\0-\x1f\x7f]/.test(value)) fail('value', 'TXT must be 1–4096 printable characters (no tabs, line breaks or control characters)');
       break;
     case 'CAA': {
       const m = value.match(/^(\d{1,3})\s+(issue|issuewild|iodef)\s+"?([^"]*)"?$/i);

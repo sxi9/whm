@@ -10,9 +10,10 @@ import { defineOp, arg, OpError } from './registry.js';
 // RHEL/Fedora (/etc/named.conf, /var/named). The panel owns one include file in
 // each and keeps every zone it manages inside that file, between markers, so an
 // operator's hand-written zones are never touched.
+// optionsConf is the file holding the single `options { }` block named allows.
 const LAYOUTS = [
-  { flavor: 'debian', confDir: '/etc/bind', mainConf: '/etc/bind/named.conf.local', includeFile: '/etc/bind/named.conf.whm', zoneDir: '/etc/bind/zones', unit: 'bind9' },
-  { flavor: 'rhel', confDir: '/etc', mainConf: '/etc/named.conf', includeFile: '/etc/named.whm.conf', zoneDir: '/var/named', unit: 'named' },
+  { flavor: 'debian', confDir: '/etc/bind', mainConf: '/etc/bind/named.conf.local', optionsConf: '/etc/bind/named.conf.options', includeFile: '/etc/bind/named.conf.whm', zoneDir: '/etc/bind/zones', unit: 'bind9' },
+  { flavor: 'rhel', confDir: '/etc', mainConf: '/etc/named.conf', optionsConf: '/etc/named.conf', includeFile: '/etc/named.whm.conf', zoneDir: '/var/named', unit: 'named' },
 ];
 const BINARIES = ['named', 'rndc', 'named-checkzone', 'named-checkconf', 'dnssec-keygen', 'dnssec-signzone', 'dnssec-dsfromkey'];
 const TMP_DIR = '/tmp/whm';
@@ -44,11 +45,29 @@ function readText(file) {
   try { return fs.readFileSync(file, 'utf8'); } catch (err) { if (err.code === 'ENOENT') return ''; throw err; }
 }
 
+// The replacement keeps the owner, group and mode of the file it replaces
+// (named.conf is root:named 0640 on RHEL; zone files belong to bind/named).
 function writeAtomic(file, content, mode = 0o644) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.whm-tmp-${process.pid}-${crypto.randomBytes(3).toString('hex')}`;
-  fs.writeFileSync(tmp, content, { mode });
+  let existing = null;
+  try { existing = fs.statSync(file); } catch { /* new file */ }
+  fs.writeFileSync(tmp, content, { mode: existing ? existing.mode & 0o7777 : mode });
+  if (existing) { try { fs.chownSync(tmp, existing.uid, existing.gid); } catch { /* not root: keep the writer's ownership */ } }
   fs.renameSync(tmp, file);
+}
+
+// A temp file for text the API supplied: created exclusively (no symlink can
+// be followed) in a directory that must be ours and private.
+function privateTempFile(dir, prefix, content) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const st = fs.lstatSync(dir);
+  const uid = typeof process.getuid === 'function' ? process.getuid() : st.uid;
+  if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== uid || (st.mode & 0o022) !== 0) throw new OpError('refused', `${dir} must be a directory owned by the agent and not group/world writable`);
+  const file = path.join(dir, `${prefix}-${process.pid}-${crypto.randomBytes(4).toString('hex')}`);
+  const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+  try { fs.writeSync(fd, content); } finally { fs.closeSync(fd); }
+  return file;
 }
 
 export function stripStanza(text, domain) {
@@ -273,24 +292,82 @@ defineOp('dns.zone.write', {
   },
 });
 
+// A zone the operator declared by hand keeps being served by named whatever
+// the panel deletes, so removing it is refused until that stanza is gone.
+export async function removeZone(layout, domain, ctx) {
+  const located = await locateZone(layout, domain, ctx);
+  if (located.external) throw new OpError('zone_external', `${domain} is declared in named.conf outside the panel include (file "${located.file}"); named would keep serving it. Remove that stanza (or move it into ${layout.includeFile}) and reload named, then delete the zone again.`, { file: located.file, type: located.type });
+  const file = ctx.assertAllowedPath(zoneFile(layout, domain), 'write');
+  const removed = [];
+  for (const f of [file, `${file}.whm-bak`, `${file}.signed`, `${file}.jnl`, `${file}.signed.jnl`]) {
+    if (fs.existsSync(f)) { fs.rmSync(f, { force: true }); removed.push(f); }
+  }
+  const keys = ctx.assertAllowedPath(keyDir(layout, domain), 'write');
+  if (fs.existsSync(keys)) { fs.rmSync(keys, { recursive: true, force: true }); removed.push(keys); }
+  ctx.assertAllowedPath(layout.includeFile, 'write');
+  const current = readText(layout.includeFile);
+  const stanzaRemoved = current.includes(marker(domain));
+  if (stanzaRemoved) writeAtomic(layout.includeFile, stripStanza(current, domain).replace(/\n{3,}/g, '\n\n'));
+  return { domain, removed, stanzaRemoved, external: false };
+}
+
 defineOp('dns.zone.remove', {
-  description: 'Delete a zone file (plus signed output, journal and keys) and drop its stanza from the include',
+  description: 'Delete a zone file (plus signed output, journal and keys) and drop its stanza from the include; refuses zones declared outside the panel include',
   destructive: true,
   schema: z.object({ domain: arg.domain }).strict(),
-  run: async ({ domain }, ctx) => {
+  run: async ({ domain }, ctx) => removeZone(requireLayout(), domain, ctx),
+});
+
+// The panel's source-address directives live in a marked block inside the one
+// `options { }` statement named allows, so they never collide with a second
+// options block. Returns the new file text, or the same text when unchanged.
+const OPTIONS_BEGIN = '    // BEGIN whm options';
+const OPTIONS_END = '    // END whm options';
+export function optionsDirectives({ ipv4 = null, ipv6 = null } = {}) {
+  const lines = [];
+  if (ipv4) lines.push(`query-source address ${ipv4};`, `notify-source ${ipv4};`, `transfer-source ${ipv4};`);
+  if (ipv6) lines.push(`query-source-v6 address ${ipv6};`, `notify-source-v6 ${ipv6};`, `transfer-source-v6 ${ipv6};`);
+  return lines;
+}
+
+export function spliceOptionsBlock(text, directives) {
+  const block = directives.length ? `${OPTIONS_BEGIN}\n${directives.map((d) => `    ${d}`).join('\n')}\n${OPTIONS_END}\n` : '';
+  const managed = new RegExp(`[ \\t]*${escapeRe(OPTIONS_BEGIN.trim())}\\n[\\s\\S]*?[ \\t]*${escapeRe(OPTIONS_END.trim())}\\n?`);
+  if (managed.test(text)) return text.replace(managed, block);
+  if (!block) return text;
+  const stripped = text.replace(/\/\*[\s\S]*?\*\//g, (c) => ' '.repeat(c.length)).replace(/^[ \t]*(\/\/|#).*$/gm, (c) => ' '.repeat(c.length));
+  const open = stripped.match(/\boptions\s*\{/);
+  if (!open) throw new OpError('config_invalid', 'No options { } block was found in the named configuration; add one before setting source addresses');
+  let depth = 1;
+  let i = open.index + open[0].length;
+  for (; i < stripped.length && depth; i++) { if (stripped[i] === '{') depth++; else if (stripped[i] === '}') depth--; }
+  if (depth) throw new OpError('config_invalid', 'The options { } block in the named configuration is not closed');
+  const close = i - 1;
+  const before = text.slice(0, close).replace(/[ \t]*$/, '');
+  return `${before}${before.endsWith('\n') ? '' : '\n'}${block}${text.slice(close)}`;
+}
+
+defineOp('dns.options.write', {
+  description: 'Set the source addresses named uses for queries, notifies and transfers (query-source / notify-source / transfer-source) inside its options block, verified with named-checkconf and reverted on failure',
+  schema: z.object({ ipv4: arg.ipv4.nullable().optional(), ipv6: arg.ipv6.nullable().optional() }).strict(),
+  run: async ({ ipv4, ipv6 }, ctx) => {
     const layout = requireLayout();
-    const file = ctx.assertAllowedPath(zoneFile(layout, domain), 'write');
-    const removed = [];
-    for (const f of [file, `${file}.whm-bak`, `${file}.signed`, `${file}.jnl`, `${file}.signed.jnl`]) {
-      if (fs.existsSync(f)) { fs.rmSync(f, { force: true }); removed.push(f); }
+    const file = ctx.assertAllowedPath(layout.optionsConf, 'write');
+    if (!fs.existsSync(file)) throw new OpError('not_found', `${file} does not exist; the named options block could not be found`);
+    const previous = fs.readFileSync(file, 'utf8');
+    const directives = optionsDirectives({ ipv4, ipv6 });
+    const next = spliceOptionsBlock(previous, directives);
+    if (next === previous) return { file, changed: false, directives, checkconf: null };
+    writeAtomic(file, next);
+    let checkconf = null;
+    if (hasBinary('named-checkconf') && fs.existsSync(rootConf(layout))) {
+      checkconf = await runCheck('named-checkconf', [rootConf(layout)]);
+      if (!checkconf.ok) {
+        writeAtomic(file, previous);
+        throw new OpError('config_invalid', `named-checkconf rejected the configuration; the source addresses were not applied: ${checkconf.output}`, { output: checkconf.output });
+      }
     }
-    const keys = ctx.assertAllowedPath(keyDir(layout, domain), 'write');
-    if (fs.existsSync(keys)) { fs.rmSync(keys, { recursive: true, force: true }); removed.push(keys); }
-    ctx.assertAllowedPath(layout.includeFile, 'write');
-    const current = readText(layout.includeFile);
-    const stanzaRemoved = current.includes(marker(domain));
-    if (stanzaRemoved) writeAtomic(layout.includeFile, stripStanza(current, domain).replace(/\n{3,}/g, '\n\n'));
-    return { domain, removed, stanzaRemoved };
+    return { file, changed: true, directives, checkconf };
   },
 });
 
@@ -307,9 +384,8 @@ defineOp('dns.checkzone', {
     let file;
     let tmp = null;
     if (body != null) {
-      tmp = ctx.assertAllowedPath(path.join(TMP_DIR, `dns-check-${process.pid}-${crypto.randomBytes(4).toString('hex')}.db`), 'write');
-      fs.mkdirSync(TMP_DIR, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(tmp, body, { mode: 0o600 });
+      ctx.assertAllowedPath(TMP_DIR, 'write');
+      tmp = privateTempFile(TMP_DIR, 'dns-check', body);
       file = tmp;
     } else {
       const layout = requireLayout();
@@ -483,11 +559,28 @@ defineOp('dns.dnssec.remove', {
 
 const RR_TYPES = ['A', 'AAAA', 'NS', 'MX', 'TXT', 'CNAME', 'SOA', 'SRV', 'CAA', 'PTR'];
 
+const PUBLIC_RESOLVERS = ['1.1.1.1', '8.8.8.8'];
+const nameserverLines = (text) => [...String(text).matchAll(/^nameserver\s+(\S+)/gm)].map((m) => m[1]);
+const isLoopback = (ip) => /^127\./.test(ip) || ip === '::1';
+
+// The host's own resolvers come first: real upstreams from resolv.conf, else
+// the upstreams systemd-resolved learned (its stub 127.0.0.53 is all that
+// /etc/resolv.conf lists on Debian/Ubuntu), else the stub itself. Public
+// resolvers are only a last resort when nothing is configured.
+export function chooseResolvers(resolvText, systemdUpstreamText = '') {
+  const configured = nameserverLines(resolvText);
+  const direct = configured.filter((ip) => !isLoopback(ip));
+  if (direct.length) return direct;
+  const upstream = nameserverLines(systemdUpstreamText).filter((ip) => !isLoopback(ip));
+  if (upstream.length) return upstream;
+  if (configured.length) return configured;
+  return PUBLIC_RESOLVERS;
+}
+
 function readSystemResolvers() {
   try {
-    const out = [...fs.readFileSync('/etc/resolv.conf', 'utf8').matchAll(/^nameserver\s+(\S+)/gm)].map((m) => m[1]).filter((ip) => !/^127\./.test(ip) && ip !== '::1');
-    return out.length ? out : ['1.1.1.1', '8.8.8.8'];
-  } catch { return ['1.1.1.1', '8.8.8.8']; }
+    return chooseResolvers(readText('/etc/resolv.conf'), readText('/run/systemd/resolve/resolv.conf')).slice(0, 8);
+  } catch { return PUBLIC_RESOLVERS; }
 }
 
 async function withTimeout(promise, ms) {

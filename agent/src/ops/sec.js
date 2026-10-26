@@ -115,9 +115,21 @@ const groupName = z.string().regex(/^[a-z_][a-z0-9_-]{0,31}$/i);
 const HOSTS_ALLOW = '/etc/hosts.allow';
 const HOSTS_DENY = '/etc/hosts.deny';
 
+// libwrap splits fields on ":" and only understands IPv6 in brackets
+// ("[2001:db8::]/32"), so any source containing a colon must be an IPv6 address
+// or network; it is rendered bracketed whether or not the operator typed them.
+export function hostSourceForm(source) {
+  const s = String(source || '');
+  if (!s.includes(':')) return s;
+  const m = s.match(/^\[?([0-9a-fA-F:.]+)\]?(?:\/(\d{1,3}))?$/);
+  if (!m || net.isIP(m[1]) !== 6) return null;
+  if (m[2] !== undefined && Number(m[2]) > 128) return null;
+  return `[${m[1].toLowerCase()}]${m[2] !== undefined ? `/${m[2]}` : ''}`;
+}
+
 const hostRule = z.object({
   service: z.string().regex(/^(ALL|[A-Za-z0-9_.-]{1,32})$/, 'Daemon name such as sshd, vsftpd, ALL'),
-  source: z.string().regex(/^(ALL|LOCAL|KNOWN|UNKNOWN|PARANOID|[A-Za-z0-9.:/_-]{1,255})$/, 'Host, IP, network/mask or wildcard'),
+  source: z.string().regex(/^(ALL|LOCAL|KNOWN|UNKNOWN|PARANOID|\[?[A-Za-z0-9.:/_-]{1,255}\]?(\/\d{1,3})?)$/, 'Host, IP, network/mask or wildcard').refine((v) => hostSourceForm(v) !== null, 'An address containing ":" must be an IPv6 address or network, e.g. [2001:db8::]/32'),
   action: z.enum(['allow', 'deny']),
   comment: z.string().regex(/^[^\n\0]{0,120}$/).optional(),
 }).strict();
@@ -128,25 +140,37 @@ export function renderHostsAllow(rules) {
   const lines = [`${MANAGED} (Host Access Control). Edit through the panel; manual changes are overwritten.`, ''];
   for (const r of rules) {
     if (r.comment) lines.push(`# ${r.comment}`);
-    lines.push(`${r.service}: ${r.source}: ${r.action.toUpperCase()}`);
+    lines.push(`${r.service}: ${hostSourceForm(r.source) ?? r.source}: ${r.action.toUpperCase()}`);
   }
   return `${lines.join('\n')}\n`;
 }
 
+// hosts.deny is only taken over when the panel already owns it or it carries no
+// rules; a distro or hand-written deny file keeps applying and is reported as such.
+export function hostsDenyManaged(text) {
+  if (text == null) return true;
+  if (text.startsWith(MANAGED)) return true;
+  return !text.split('\n').some((l) => l.trim() && !l.trim().startsWith('#'));
+}
+
 defineOp('sec.hosts_allow.read', {
   description: 'Current /etc/hosts.allow and /etc/hosts.deny contents',
-  run: async () => ({ allow: readText(HOSTS_ALLOW), deny: readText(HOSTS_DENY), supported: exists('/etc/hosts.allow') || exists('/etc/hosts.deny') || exists('/lib/x86_64-linux-gnu/libwrap.so.0') || exists('/usr/lib64/libwrap.so.0') }),
+  run: async () => {
+    const deny = readText(HOSTS_DENY);
+    return { allow: readText(HOSTS_ALLOW), deny, denyManaged: hostsDenyManaged(deny), supported: exists('/etc/hosts.allow') || exists('/etc/hosts.deny') || exists('/lib/x86_64-linux-gnu/libwrap.so.0') || exists('/usr/lib64/libwrap.so.0') };
+  },
 });
 
 defineOp('sec.hosts_allow.write', {
-  description: 'Render host access rules into /etc/hosts.allow (ordered ALLOW/DENY) and a managed /etc/hosts.deny',
+  description: 'Render host access rules into /etc/hosts.allow (ordered ALLOW/DENY); /etc/hosts.deny is only rewritten when the panel already manages it',
   schema: z.object({ rules: z.array(hostRule).max(500) }).strict(),
   run: async ({ rules }, ctx) => {
     ctx.assertAllowedPath(HOSTS_ALLOW, 'write');
     ctx.assertAllowedPath(HOSTS_DENY, 'write');
     writeAtomic(HOSTS_ALLOW, renderHostsAllow(rules));
-    writeAtomic(HOSTS_DENY, `${MANAGED} (Host Access Control). Rules live in /etc/hosts.allow with explicit ALLOW/DENY actions.\n`);
-    return { rules: rules.length, files: [HOSTS_ALLOW, HOSTS_DENY] };
+    const denyUntouched = !hostsDenyManaged(readText(HOSTS_DENY));
+    if (!denyUntouched) writeAtomic(HOSTS_DENY, `${MANAGED} (Host Access Control). Rules live in /etc/hosts.allow with explicit ALLOW/DENY actions.\n`);
+    return { rules: rules.length, files: denyUntouched ? [HOSTS_ALLOW] : [HOSTS_ALLOW, HOSTS_DENY], denyUntouched };
   },
 });
 
@@ -529,7 +553,7 @@ function binaryAccess(candidates) {
     let st;
     try { st = fs.statSync(real); } catch { continue; }
     if (!st.isFile()) continue;
-    const entry = seen.get(real) || { realPath: real, paths: [], mode: (st.mode & 0o7777).toString(8).padStart(4, '0'), othersCanExecute: Boolean(st.mode & 0o001) };
+    const entry = seen.get(real) || { realPath: real, paths: [], mode: (st.mode & 0o7777).toString(8).padStart(4, '0'), specialBits: st.mode & 0o7000, othersCanExecute: Boolean(st.mode & 0o001) };
     entry.paths.push(p);
     seen.set(real, entry);
   }
@@ -537,9 +561,15 @@ function binaryAccess(candidates) {
   return { installed: binaries.length > 0, allowed: binaries.length > 0 && binaries.every((b) => b.othersCanExecute), binaries };
 }
 
+// Only the rwx bits change: setuid/setgid bits shipped by the distribution
+// (traceroute, mtr-packet) stay, or the tool breaks for everyone once re-enabled.
+export function accessMode(currentMode, allow) {
+  return (currentMode & 0o7000) | (allow ? 0o755 : 0o750);
+}
+
 function setBinaryAccess(candidates, allow) {
   const state = binaryAccess(candidates);
-  for (const b of state.binaries) fs.chmodSync(b.realPath, allow ? 0o755 : 0o750);
+  for (const b of state.binaries) fs.chmodSync(b.realPath, accessMode(b.specialBits, allow));
   return binaryAccess(candidates);
 }
 
@@ -852,6 +882,25 @@ const MODSEC_DIRECTIVES = {
 const modsecDirectives = z.object(Object.fromEntries(Object.entries(MODSEC_DIRECTIVES).map(([k, s]) => [k, s.nullable().optional()]))).strict();
 const vendorName = z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/, 'Lowercase letters, digits, "_" or "-"');
 
+// Debian's security2.conf loads /usr/share/modsecurity-crs/*.load (the packaged
+// OWASP CRS) by default; a CRS vendor installed on top would define the same rule
+// ids twice and fail `apachectl -t`.
+export function parseDistroCrsInclude(text) {
+  for (const raw of (text || '').split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const m = line.match(/^Include(?:Optional)?\s+"?([^"\s]*modsecurity-crs[^"\s]*)"?/i);
+    if (m) return { active: true, directive: line, path: m[1] };
+  }
+  return { active: false, directive: null, path: null };
+}
+
+export function distroCrsInclude(apache) {
+  if (!apache) return { active: false, directive: null, path: null, file: null };
+  const file = apache.flavor === 'debian' ? `${apache.modsEnabled}/security2.conf` : [`${apache.includeDir}/mod_security.conf`, `${apache.includeDir}/mod_security_crs.conf`].find(exists) || null;
+  return { ...parseDistroCrsInclude(file ? readText(file) : null), file };
+}
+
 export function modsecLayout() {
   const apache = apacheFlavor();
   let base = null;
@@ -861,6 +910,7 @@ export function modsecLayout() {
   return {
     installed: Boolean(base && apache),
     apache,
+    distroCrs: distroCrsInclude(apache),
     ...(base || { flavor: null, baseDir: null, mainConf: null, recommended: null, crsDirs: [] }),
     configConf: includeDir ? `${includeDir}/zz-whm-modsec-10-config.conf` : null,
     vendorsConf: includeDir ? `${includeDir}/zz-whm-modsec-20-vendors.conf` : null,
@@ -1040,9 +1090,22 @@ defineOp('sec.modsec.hits', {
   },
 });
 
+// Redirects are followed by hand so every hop stays on https: the archive is
+// unpacked into Apache's config tree as root and must never arrive in plaintext.
 async function download(url, dest, maxBytes) {
-  const res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(300_000) });
-  if (!res.ok) throw new OpError('download_failed', `Download failed: HTTP ${res.status} for ${url}`);
+  let current = url;
+  let res;
+  for (let hop = 0; ; hop++) {
+    res = await fetch(current, { redirect: 'manual', signal: AbortSignal.timeout(300_000) });
+    if (res.status < 300 || res.status >= 400) break;
+    const location = res.headers.get('location');
+    if (!location) throw new OpError('download_failed', `Download failed: HTTP ${res.status} without a Location header for ${current}`);
+    const next = new URL(location, current).toString();
+    if (!next.startsWith('https://')) throw new OpError('refused', `Refusing to follow a redirect to a non-https URL (${next})`);
+    if (hop >= 5) throw new OpError('download_failed', `Too many redirects while downloading ${url}`);
+    current = next;
+  }
+  if (!res.ok) throw new OpError('download_failed', `Download failed: HTTP ${res.status} for ${current}`);
   const chunks = [];
   let total = 0;
   for await (const chunk of res.body) {
@@ -1054,27 +1117,73 @@ async function download(url, dest, maxBytes) {
   return total;
 }
 
+// The archive kind comes from its leading bytes, not the URL (GitHub archive
+// links carry no extension that tar would recognise).
+export function archiveFormat(head) {
+  const b = Buffer.from(head);
+  if (b.length >= 2 && b[0] === 0x1f && b[1] === 0x8b) return 'tar.gz';
+  if (b.length >= 4 && b[0] === 0x50 && b[1] === 0x4b && b[2] === 0x03 && b[3] === 0x04) return 'zip';
+  if (b.length >= 3 && b[0] === 0x42 && b[1] === 0x5a && b[2] === 0x68) return 'tar.bz2';
+  if (b.length >= 6 && b[0] === 0xfd && b.subarray(1, 6).toString('latin1') === '7zXZ\0') return 'tar.xz';
+  if (b.length >= 262 && b.subarray(257, 262).toString('latin1') === 'ustar') return 'tar';
+  return null;
+}
+
+function readHead(file, bytes) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(bytes);
+    const n = fs.readSync(fd, buf, 0, bytes, 0);
+    return buf.subarray(0, n);
+  } finally { fs.closeSync(fd); }
+}
+
+// A zip has no --strip-components: when it unpacks to a single top-level
+// directory (GitHub archives do), that directory's contents become the root.
+function flattenSingleDir(staging) {
+  const entries = fs.readdirSync(staging);
+  if (entries.length !== 1) return;
+  const only = path.join(staging, entries[0]);
+  if (!fs.statSync(only).isDirectory()) return;
+  for (const e of fs.readdirSync(only)) fs.renameSync(path.join(only, e), path.join(staging, e));
+  fs.rmdirSync(only);
+}
+
+async function extractArchive(archive, staging) {
+  const format = archiveFormat(readHead(archive, 512));
+  if (!format) throw new OpError('unsupported', 'The download is not a recognised archive (expected .tar.gz, .tar.bz2, .tar.xz, .tar or .zip)');
+  if (format === 'zip') {
+    if (!hasBinary('unzip')) throw new OpError('capability_missing', 'unzip is not installed; install it or use a .tar.gz archive');
+    await exec('unzip', ['-q', '-o', archive, '-d', staging], { timeoutMs: 600_000 });
+    flattenSingleDir(staging);
+    return format;
+  }
+  if (!hasBinary('tar')) throw new OpError('capability_missing', 'tar is not installed');
+  const flag = { 'tar.gz': '-xzf', 'tar.bz2': '-xjf', 'tar.xz': '-xJf', tar: '-xf' }[format];
+  await exec('tar', [flag, archive, '-C', staging, '--strip-components=1', '--no-same-owner'], { timeoutMs: 600_000 });
+  return format;
+}
+
 defineOp('sec.modsec.vendor.install', {
-  description: 'Download a rule set archive (.tar.gz/.zip URL) into the vendors directory',
+  description: 'Download a rule set archive (.tar.gz, .tar.bz2, .tar.xz, .tar or .zip over https) into the vendors directory',
   timeoutMs: 600_000,
   schema: z.object({ name: vendorName, url: z.string().url().max(2048).refine((u) => u.startsWith('https://'), 'Only https:// URLs are accepted') }).strict(),
   run: async ({ name, url }, ctx) => {
     const layout = requireModsec();
-    if (!hasBinary('tar')) throw new OpError('capability_missing', 'tar is not installed');
     const dir = path.join(layout.vendorsDir, name);
     ctx.assertAllowedPath(dir, 'write');
     ctx.assertAllowedPath(layout.baseDir, 'write');
     // The archive is unpacked into Apache's config tree, so it is staged inside
     // the root-owned ModSecurity directory rather than a shared temp dir.
     const scratch = privateTempDir(layout.baseDir, '.whm-vendor-');
-    const archive = path.join(scratch, `${name}.tar.gz`);
+    const archive = path.join(scratch, `${name}.archive`);
     const staging = `${dir}.whm-new`;
     try {
       const bytes = await download(url, archive, 100 * 1024 * 1024);
       fs.rmSync(staging, { recursive: true, force: true });
       fs.mkdirSync(staging, { recursive: true, mode: 0o755 });
-      await exec('tar', ['-xzf', archive, '-C', staging, '--strip-components=1', '--no-same-owner'], { timeoutMs: 600_000 });
-      return finishVendorInstall(name, dir, staging, bytes);
+      const format = await extractArchive(archive, staging);
+      return { ...finishVendorInstall(name, dir, staging, bytes), format };
     } catch (err) {
       fs.rmSync(staging, { recursive: true, force: true });
       throw err;

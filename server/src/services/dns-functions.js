@@ -8,7 +8,13 @@ import {
   RECORD_TYPES, ZoneError, nextSerial, normalizeRecord, renderZone, renderTemplate, parseZone, parseSoaValue, soaValue, checkConflicts,
 } from './dns-zonefile.js';
 
-const SPF_RE = /^v=spf1(?: [+\-~?]?(?:all|a|mx|ptr|ip4:[0-9./]+|ip6:[0-9a-f:./]+|include:[a-z0-9._-]+|exists:[a-z0-9._%-]+|redirect=[a-z0-9._-]+|exp=[a-z0-9._-]+)(?:\/\d{1,3})?)*$/i;
+// RFC 7208 grammar, loosely: a/mx/ptr take an optional domain-spec and
+// CIDR, include/exists/redirect/exp take a domain-spec, and a domain-spec may
+// carry macros such as %{d}. Shell-ish characters never pass.
+const SPF_DOMAIN = '[a-z0-9._%{}+=-]+';
+const SPF_CIDR = '(?:\\/\\d{1,3})?(?:\\/\\/\\d{1,3})?';
+const SPF_RE = new RegExp(`^v=spf1(?: [+\\-~?]?(?:all|(?:a|mx|ptr)(?::${SPF_DOMAIN})?${SPF_CIDR}|ip4:[0-9.]+(?:\\/\\d{1,2})?|ip6:[0-9a-f:.]+(?:\\/\\d{1,3})?|(?:include|exists):${SPF_DOMAIN}|(?:redirect|exp)=${SPF_DOMAIN}))*$`, 'i');
+const DMARC_RE = /^v=DMARC1;\s*p=(none|quarantine|reject)(;\s*[a-z]+=[^;\r\n]+)*;?$/i;
 const IMPORT_INTERVAL_MS = 5 * 60 * 1000;
 
 // API callers give hostnames as FQDNs (no trailing dot); '@' means the zone apex.
@@ -63,6 +69,7 @@ export function createDnsService(ctx) {
     syncRow: db.prepare(`INSERT INTO dns_zone_sync (zone_id, cluster_id, serial, status, message, synced_at) VALUES (?, ?, ?, ?, ?, datetime('now'))
       ON CONFLICT (zone_id, cluster_id) DO UPDATE SET serial = excluded.serial, status = excluded.status, message = excluded.message, synced_at = excluded.synced_at`),
     syncStatus: db.prepare('SELECT s.*, z.domain, z.serial AS current_serial, c.name AS cluster FROM dns_zone_sync s JOIN dns_zones z ON z.id = s.zone_id JOIN dns_clusters c ON c.id = s.cluster_id ORDER BY z.domain, c.name'),
+    syncRowFor: db.prepare('SELECT * FROM dns_zone_sync WHERE zone_id = ? AND cluster_id = ?'),
   };
 
   let lastImportAt = 0;
@@ -273,9 +280,19 @@ export function createDnsService(ctx) {
     }
   }
 
+  // The DB row goes only after the host no longer serves the zone: a zone the
+  // operator declared outside the panel include would otherwise be re-imported
+  // from disk while named keeps answering for it.
   async function removeZoneInternal(zone, req) {
     if (bindAvailable()) {
-      await agent.op('dns.zone.remove', { domain: zone.domain }, { req });
+      let removed;
+      try {
+        removed = await agent.op('dns.zone.remove', { domain: zone.domain }, { req });
+      } catch (err) {
+        if (err.code === 'zone_external') throw conflict(err.message);
+        throw err;
+      }
+      if (removed?.external) throw conflict(`${zone.domain} is declared in named.conf outside the panel include; remove that stanza first, then delete the zone again`);
       try { await agent.op('dns.reload', {}, { req }); } catch (err) { logger.warn({ err }, 'named reload after zone removal failed'); }
     }
     stmts.deleteZone.run(zone.id);
@@ -343,6 +360,29 @@ export function createDnsService(ctx) {
     const ips = records.filter((r) => r.name === '@' && r.type === 'A').map((r) => `ip4:${r.value}`);
     const ip6 = records.filter((r) => r.name === '@' && r.type === 'AAAA').map((r) => `ip6:${r.value}`);
     return `v=spf1 +mx +a ${[...ips, ...ip6].join(' ')} ~all`.replace(/\s+/g, ' ');
+  }
+
+  // WHM's "automatically detect" rule: this server is the primary MX → local,
+  // a lower-priority MX → backup, not an MX at all → remote. An exchange is
+  // local when it is a well-known local name or resolves (within the zone) to
+  // one of this server's addresses. No MX at all means mail is delivered here.
+  function effectiveRouting(zone, records) {
+    const mx = records.filter((r) => r.type === 'MX').sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
+    if (!mx.length) return 'local';
+    const localIps = new Set([zone.account_ip, setting('basic.main_ip'), setting('basic.shared_ip'), setting('basic.main_ipv6')].filter(Boolean));
+    try { for (const row of db.prepare('SELECT address FROM ip_addresses').all()) localIps.add(row.address); } catch { /* ip table absent */ }
+    const hostname = setting('basic.hostname', '');
+    const localHosts = new Set([`mail.${zone.domain}.`, `${zone.domain}.`, hostname ? `${hostname.toLowerCase().replace(/\.$/, '')}.` : null].filter(Boolean));
+    const suffix = `.${zone.domain}.`;
+    const isLocal = (exchange) => {
+      const host = exchange.toLowerCase().endsWith('.') ? exchange.toLowerCase() : `${exchange.toLowerCase()}.`;
+      if (localHosts.has(host)) return true;
+      if (host !== `${zone.domain}.` && !host.endsWith(suffix)) return false;
+      const rel = host === `${zone.domain}.` ? '@' : host.slice(0, -suffix.length);
+      return records.some((r) => r.name === rel && ['A', 'AAAA'].includes(r.type) && localIps.has(r.value));
+    };
+    if (isLocal(mx[0].value)) return 'local';
+    return mx.some((m) => isLocal(m.value)) ? 'backup' : 'remote';
   }
 
   function emailStatusOf(zone) {
@@ -465,8 +505,14 @@ export function createDnsService(ctx) {
       return { domain, serial: zone.serial, body: rendered, onDisk, inSync: onDisk == null ? null : onDisk === rendered };
     },
 
+    // named-checkzone runs as root on the text; resellers may only submit it
+    // for zones they own or domains hosted on their accounts.
     async validateZone(domain, body, user) {
       if (stmts.zoneByDomain.get(domain)) await load(domain, user);
+      else if (!isRoot(user)) {
+        const account = accountForDomain(domain);
+        if (!account || account.owner_id !== user.id) throw forbidden('Resellers can only validate zones for domains on their own accounts');
+      }
       const parsed = parseZone(body, domain);
       const errors = [...parsed.errors];
       if (!parsed.records.some((r) => r.type === 'SOA')) errors.push('SOA record missing');
@@ -479,7 +525,7 @@ export function createDnsService(ctx) {
     },
 
     // Raw edit mode: parse → replace every record → re-render canonically.
-    async saveRawZone(domain, body, user, req, { create = false } = {}) {
+    async saveRawZone(domain, body, user, req, { create = false, minSerial = 0 } = {}) {
       assertPublishable();
       let zone = stmts.zoneByDomain.get(domain);
       if (!zone) {
@@ -492,13 +538,13 @@ export function createDnsService(ctx) {
       const created = !zone;
       let result;
       if (!zone) {
-        zone = insertZoneRows({ domain, account_id: accountForDomain(domain)?.id ?? null, serial: parsed.serial || nextSerial(0), ttl: parsed.ttl || setting('dns.default_ttl', 14400) }, parsed.records);
+        zone = insertZoneRows({ domain, account_id: accountForDomain(domain)?.id ?? null, serial: Math.max(parsed.serial || nextSerial(0), minSerial || 0), ttl: parsed.ttl || setting('dns.default_ttl', 14400) }, parsed.records);
         result = await publishNewZone(zone, req);
       } else {
         ({ result } = await commitAndPublish(zone, () => {
           stmts.deleteRecordsOfZone.run(zone.id);
           parsed.records.forEach((r, i) => stmts.insertRecord.run({ zone_id: zone.id, name: r.name, type: r.type, ttl: r.ttl ?? null, priority: r.priority ?? null, value: r.value, line_index: i + 1 }));
-          stmts.touchZone.run({ id: zone.id, serial: Math.max(nextSerial(zone.serial), parsed.serial || 0), ttl: parsed.ttl || zone.ttl, dnssec_enabled: zone.dnssec_enabled, account_id: zone.account_id });
+          stmts.touchZone.run({ id: zone.id, serial: Math.max(nextSerial(zone.serial), parsed.serial || 0, minSerial || 0), ttl: parsed.ttl || zone.ttl, dnssec_enabled: zone.dnssec_enabled, account_id: zone.account_id });
         }, req));
       }
       audit(req, { action: 'dns.zone.raw_save', target: domain, args: { records: parsed.records.length, created } });
@@ -595,13 +641,17 @@ export function createDnsService(ctx) {
       if (enabled && !bindAvailable()) throw new CapabilityError('bind', 'DNSSEC signing needs BIND\'s dnssec-keygen and dnssec-signzone');
       let keys = null;
       if (enabled && !zone.dnssec_enabled) keys = await agent.op('dns.dnssec.keygen', { domain, algorithm: 'ECDSAP256SHA256' }, { req });
-      if (!enabled && zone.dnssec_enabled && bindAvailable()) await agent.op('dns.dnssec.remove', { domain }, { req });
       let result;
       try {
         ({ result } = await commitAndPublish(zone, () => { bump(zone, { dnssec_enabled: enabled ? 1 : 0 }); }, req));
       } catch (err) {
         if (keys) { try { await agent.op('dns.dnssec.remove', { domain }, { req }); } catch (cleanupErr) { logger.warn({ err: cleanupErr, domain }, 'could not remove the DNSSEC keys of a zone that failed to publish'); } }
         throw err;
+      }
+      // Keys and the .signed output go only once named serves the unsigned
+      // file again; a failed publish above leaves the signed setup intact.
+      if (!enabled && zone.dnssec_enabled && bindAvailable()) {
+        try { await agent.op('dns.dnssec.remove', { domain }, { req }); } catch (err) { logger.warn({ err, domain }, 'DNSSEC disabled but the keys could not be removed from disk'); }
       }
       audit(req, { action: enabled ? 'dns.dnssec.enable' : 'dns.dnssec.disable', target: domain });
       return { domain, dnssec_enabled: enabled, keys: Boolean(keys), ds: keys?.ds ?? [], dnskey: keys ? { ksk: keys.ksk?.record ?? null, zsk: keys.zsk?.record ?? null } : null, ...result };
@@ -718,7 +768,7 @@ export function createDnsService(ctx) {
       assertPublishable();
       const zone = await load(domain, user);
       const value = (input.value || suggestedSpf(stmts.records.all(zone.id))).trim().replace(/\s+/g, ' ');
-      if (!SPF_RE.test(value)) throw unprocessable('Not a valid SPF record', { value: ['SPF must start with v=spf1 and use a, mx, ip4:, ip6:, include:, ~all / -all mechanisms'] });
+      if (!SPF_RE.test(value)) throw unprocessable('Not a valid SPF record', { value: ['SPF must start with v=spf1 and use a[:host], mx[:host], ptr, ip4:, ip6:, include:, exists:, redirect= and ~all / -all mechanisms'] });
       const { result } = await commitAndPublish(zone, () => {
         const others = txtAt(stmts.records.all(zone.id), '@', 'v=spf1');
         for (const r of others) stmts.deleteRecord.run(r.id);
@@ -759,7 +809,7 @@ export function createDnsService(ctx) {
       assertPublishable();
       const zone = await load(domain, user);
       const value = input.value ? input.value.trim() : buildDmarc(input);
-      if (!/^v=DMARC1;\s*p=(none|quarantine|reject)(;\s*[a-z]+=[^;]+)*;?$/i.test(value)) throw unprocessable('Not a valid DMARC record', { value: ['DMARC must start with v=DMARC1; p=none|quarantine|reject'] });
+      if (!DMARC_RE.test(value)) throw unprocessable('Not a valid DMARC record', { value: ['DMARC must start with v=DMARC1; p=none|quarantine|reject'] });
       const { result } = await commitAndPublish(zone, () => { replaceByNameType(zone, '_dmarc', 'TXT', [{ value }]); bump(zone); }, req);
       audit(req, { action: 'dns.email.dmarc', target: domain, args: { value } });
       return { ...emailStatusOf(stmts.zoneByDomain.get(domain)), ...result };
@@ -844,7 +894,9 @@ export function createDnsService(ctx) {
       const zones = allVisibleZones(user).filter((z) => !query.account || z.account === query.account);
       return zones.map((z) => {
         const md = stmts.mailDomain.get(z.domain);
-        return { domain: z.domain, account: z.account ?? null, routing: md?.routing ?? 'auto', mx: stmts.records.all(z.id).filter((r) => r.type === 'MX').map(shapeRecord).sort((a, b) => a.priority - b.priority) };
+        const records = stmts.records.all(z.id);
+        const routing = md?.routing ?? 'auto';
+        return { domain: z.domain, account: z.account ?? null, routing, effective: routing === 'auto' ? effectiveRouting(z, records) : routing, mx: records.filter((r) => r.type === 'MX').map(shapeRecord).sort((a, b) => a.priority - b.priority) };
       });
     },
 
@@ -875,8 +927,10 @@ export function createDnsService(ctx) {
       stmts.upsertMailDomain.run(zone.account_id ?? null, domain, routing);
       let mailApplied = null;
       try { if (typeof ctx.mail?.setRouting === 'function') { await ctx.mail.setRouting(domain, routing, req); mailApplied = true; } } catch (err) { mailApplied = false; logger.warn({ err, domain }, 'mail service could not apply routing'); }
-      audit(req, { action: 'dns.routing', target: domain, args: { routing, exchanges } });
-      return { domain, routing, mx: stmts.records.all(zone.id).filter((r) => r.type === 'MX').map(shapeRecord), mailApplied, ...result };
+      const after = stmts.records.all(zone.id);
+      const effective = routing === 'auto' ? effectiveRouting(stmts.zoneByDomain.get(domain), after) : routing;
+      audit(req, { action: 'dns.routing', target: domain, args: { routing, effective, exchanges } });
+      return { domain, routing, effective, mx: after.filter((r) => r.type === 'MX').map(shapeRecord).sort((a, b) => a.priority - b.priority), mailApplied, ...result };
     },
 
     // ----------------------------------------------------- nameserver report
@@ -884,8 +938,13 @@ export function createDnsService(ctx) {
       const zones = (domain ? [await load(domain, user)] : allVisibleZones(user)).slice(0, limit);
       const expected = setting('basic.nameservers', []).map((n) => `${n.toLowerCase().replace(/\.$/, '')}.`);
       const servers = setting('dns.resolvers', []);
+      let resolversUsed = null;
       const resolve = async (name, type) => {
-        try { return await agent.op('dns.resolve', { name: name.replace(/\.$/, ''), type, servers: servers.length ? servers : undefined, timeoutMs: 3000 }); } catch (err) { return { answers: [], error: err.code || 'EFAIL' }; }
+        try {
+          const r = await agent.op('dns.resolve', { name: name.replace(/\.$/, ''), type, servers: servers.length ? servers : undefined, timeoutMs: 3000 });
+          resolversUsed ??= r?.servers ?? null;
+          return r;
+        } catch (err) { return { answers: [], error: err.code || 'EFAIL' }; }
       };
       const results = [];
       let cursor = 0;
@@ -917,7 +976,7 @@ export function createDnsService(ctx) {
       };
       await Promise.all(Array.from({ length: Math.min(6, zones.length) }, worker));
       results.sort((a, b) => a.domain.localeCompare(b.domain));
-      return { resolvers: servers.length ? servers : 'system', expectedNameservers: expected, total: zones.length, zones: results };
+      return { resolvers: servers.length ? servers : 'system', resolversUsed, expectedNameservers: expected, total: zones.length, zones: results };
     },
 
     // ------------------------------------------------------------------ park
@@ -1090,19 +1149,24 @@ export function createDnsService(ctx) {
     syncStatus() {
       return { clusters: service.listClusters(), zones: stmts.syncStatus.all().map((r) => ({ ...r, stale: r.serial !== r.current_serial })) };
     },
-    enqueueSync({ domains, clusterId } = {}, user) {
-      const job = ctx.jobs.enqueue('dns.sync', { domains: domains ?? null, clusterId: clusterId ?? null, userId: user?.id ?? null }, { userId: user?.id ?? null });
+    // A manual push from the page re-sends every zone; the hourly schedule
+    // (no force) only sends zones whose serial a peer has not acknowledged.
+    enqueueSync({ domains, clusterId, force = true } = {}, user) {
+      const job = ctx.jobs.enqueue('dns.sync', { domains: domains ?? null, clusterId: clusterId ?? null, force: Boolean(force), userId: user?.id ?? null }, { userId: user?.id ?? null });
       return { job };
     },
 
     // Pushes rendered zones to every enabled peer's /api/dns/zones/import.
+    // Peers in role 'sync' are pushed to like 'write-only' ones: this version
+    // never pulls zones back from a peer.
     async runSync(jobCtx) {
-      const { domains, clusterId } = jobCtx.params;
+      const { domains, clusterId, force = false } = jobCtx.params;
       const peers = db.prepare("SELECT * FROM dns_clusters WHERE enabled = 1 AND role IN ('write-only', 'sync')").all().filter((c) => !clusterId || c.id === clusterId);
-      if (!peers.length) { jobCtx.log('No DNS cluster peers are configured; nothing to synchronise'); return { peers: 0, zones: 0, ok: 0, failed: 0 }; }
+      if (!peers.length) { jobCtx.log('No DNS cluster peers are configured; nothing to synchronise'); return { peers: 0, zones: 0, ok: 0, failed: 0, skipped: 0 }; }
       const zones = db.prepare('SELECT * FROM dns_zones ORDER BY domain').all().filter((z) => !domains || domains.includes(z.domain));
       const verifyTls = setting('dns.cluster_verify_tls', true);
-      const summary = { peers: peers.length, zones: zones.length, ok: 0, failed: 0 };
+      const full = Boolean(force || domains);
+      const summary = { peers: peers.length, zones: zones.length, ok: 0, failed: 0, skipped: 0 };
       let i = 0;
       for (const peer of peers) {
         if (!peer.api_token_enc) { jobCtx.log(`${peer.name}: no API token configured`, 'warn'); summary.failed += zones.length; continue; }
@@ -1112,6 +1176,10 @@ export function createDnsService(ctx) {
         for (const zone of zones) {
           i++;
           jobCtx.progress((i / Math.max(1, peers.length * zones.length)) * 100, `${zone.domain} → ${peer.name}`);
+          if (!full) {
+            const last = stmts.syncRowFor.get(zone.id, peer.id);
+            if (last?.status === 'ok' && last.serial === zone.serial) { summary.skipped++; continue; }
+          }
           const body = renderZone(zone, stmts.records.all(zone.id));
           try {
             const res = await postJson(url, { domain: zone.domain, body, serial: zone.serial }, { token, verifyTls });
@@ -1127,10 +1195,28 @@ export function createDnsService(ctx) {
       return summary;
     },
 
-    // Called by a peer (API token) to receive a zone pushed from its master.
-    async importZone({ domain, body }, user, req) {
-      return service.saveRawZone(domain, body, user, req, { create: true });
+    // Called by a peer (API token) to receive a zone pushed from its master;
+    // the master's serial is the floor so the copy never lags behind it.
+    async importZone({ domain, body, serial }, user, req) {
+      return service.saveRawZone(domain, body, user, req, { create: true, minSerial: serial || 0 });
     },
+
+    // "Configure Remote Service IPs" (ip-functions) hands over the address
+    // named should source queries, notifies and transfers from.
+    async setOutboundAddresses({ ipv4 = null, ipv6 = null } = {}, req) {
+      if (!bindAvailable()) throw new CapabilityError('bind', 'BIND (named) is not installed on this server; the DNS source address is saved and applied once it is');
+      const written = await agent.op('dns.options.write', { ipv4: ipv4 || null, ipv6: ipv6 || null }, { req });
+      let reloaded = false;
+      let reloadError = null;
+      if (written?.changed) {
+        try { await agent.op('dns.reload', { reconfig: true }, { req }); reloaded = true; } catch (err) { reloadError = err.message; logger.warn({ err }, 'named options written but reload failed'); }
+      }
+      audit(req, { action: 'dns.outbound_addresses', target: written?.file ?? 'named options', args: { ipv4: ipv4 || null, ipv6: ipv6 || null, changed: Boolean(written?.changed) } });
+      return { applied: true, changed: Boolean(written?.changed), file: written?.file ?? null, directives: written?.directives ?? [], reloaded, reloadError };
+    },
+
+    // The BIND layout on this host (flavor, paths, tools), for other categories.
+    layout: () => agent.op('dns.layout', {}),
 
     // ----------------------------------------------- helpers for other categories
     zoneExists: (domain) => Boolean(stmts.zoneByDomain.get(domain)),
