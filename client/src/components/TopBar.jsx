@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Search, Bell, ChevronDown, LogOut, KeyRound, ShieldCheck, ScrollText, Menu } from 'lucide-react';
 import { useAuth } from '../auth/AuthContext.jsx';
-import { searchFunctions } from '../nav.js';
+import { useSearch } from '../hooks/usePluginNav.js';
 
 export function TopBar({ onMenu }) {
   const { user, hostname, logout } = useAuth();
@@ -11,6 +11,7 @@ export function TopBar({ onMenu }) {
   const [openMenu, setOpenMenu] = useState(false);
   const [highlight, setHighlight] = useState(0);
   const inputRef = useRef(null);
+  const searchFunctions = useSearch();
   const results = q.trim() ? searchFunctions(q).slice(0, 8) : [];
 
   useEffect(() => {

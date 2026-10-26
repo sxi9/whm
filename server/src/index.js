@@ -19,6 +19,7 @@ import { createServiceManager } from './services/services.js';
 import { createPackagesService } from './services/packages.js';
 import { createAccountsService } from './services/accounts.js';
 import { createAuditService } from './services/audit.js';
+import { createPluginHost } from './services/plugins.js';
 import { createApp } from './app.js';
 
 const require = createRequire(import.meta.url);
@@ -46,7 +47,9 @@ export async function bootstrap(overrides = {}) {
   ctx.system = createSystemService(ctx);
   ctx.serviceManager = createServiceManager(ctx);
   ctx.audit = createAuditService(ctx);
+  ctx.plugins = createPluginHost(ctx);
   ctx.app = await createApp(ctx);
+  await ctx.plugins.loadAll();
 
   try {
     await agent.ping();
@@ -79,7 +82,7 @@ export async function start() {
     jobs.stop();
     scheduler.stop();
     ctx.sessionStore?.close();
-    Promise.all(servers.map((s) => new Promise((r) => s.close(r)))).then(() => { ctx.db.close(); process.exit(0); });
+    Promise.all([ctx.plugins.stopAll().catch(() => {}), ...servers.map((s) => new Promise((r) => s.close(r)))]).then(() => { ctx.db.close(); process.exit(0); });
     setTimeout(() => process.exit(1), 10_000).unref();
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));

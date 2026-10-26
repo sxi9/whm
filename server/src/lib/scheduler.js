@@ -13,6 +13,8 @@ export function createScheduler({ db, jobs, logger }) {
     ensure: db.prepare(`INSERT INTO schedules (name, cron, job_type, params_json, next_run_at) VALUES (@name, @cron, @job_type, @params, @next)
       ON CONFLICT (name) DO UPDATE SET job_type = excluded.job_type`),
     all: db.prepare('SELECT * FROM schedules ORDER BY name'),
+    byPrefix: db.prepare('SELECT * FROM schedules WHERE name LIKE ? ESCAPE \'\\\' ORDER BY name'),
+    remove: db.prepare('DELETE FROM schedules WHERE name = ?'),
     update: db.prepare('UPDATE schedules SET cron = @cron, enabled = @enabled, params_json = @params, next_run_at = @next WHERE name = @name'),
   };
 
@@ -39,6 +41,8 @@ export function createScheduler({ db, jobs, logger }) {
       stmts.ensure.run({ name, cron, job_type: jobType, params: JSON.stringify(params), next: nextCronRun(cron)?.toISOString() ?? null });
     },
     list: () => stmts.all.all().map((r) => ({ ...r, params: json.parse(r.params_json, {}), params_json: undefined })),
+    listPrefix: (prefix) => stmts.byPrefix.all(`${String(prefix).replace(/[\\%_]/g, '\\$&')}%`).map((r) => ({ ...r, params: json.parse(r.params_json, {}), params_json: undefined })),
+    remove: (name) => stmts.remove.run(name).changes > 0,
     update(name, { cron, enabled, params }) {
       const current = stmts.all.all().find((r) => r.name === name);
       if (!current) return null;

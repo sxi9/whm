@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
 import { ChevronDown, ChevronRight, Search, Star, Home, ChevronsDownUp, ChevronsUpDown, X, PanelLeftOpen, PanelLeftClose } from 'lucide-react';
-import { CATEGORIES, searchFunctions, FUNCTION_BY_KEY } from '../nav.js';
+import { FUNCTION_BY_KEY } from '../nav.js';
+import { useMergedCategories, useSearch } from '../hooks/usePluginNav.js';
 import { useFavorites } from '../hooks/useFavorites.js';
 import { iconFor } from '../icons.js';
 
@@ -12,6 +13,8 @@ export function Sidebar({ collapsed, onToggle }) {
     try { return JSON.parse(localStorage.getItem('whm.sidebar.open') || '{}'); } catch { return {}; }
   });
   const { favorites } = useFavorites();
+  const CATEGORIES = useMergedCategories();
+  const searchFunctions = useSearch();
 
   useEffect(() => { try { localStorage.setItem('whm.sidebar.open', JSON.stringify(open)); } catch { /* ignore */ } }, [open]);
 
@@ -21,7 +24,7 @@ export function Sidebar({ collapsed, onToggle }) {
     if (cat && !open[cat.slug]) setOpen((o) => ({ ...o, [cat.slug]: true }));
   }, [location.pathname]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const matches = useMemo(() => (filter.trim() ? new Set(searchFunctions(filter).map((f) => f.key)) : null), [filter]);
+  const matches = useMemo(() => (filter.trim() ? new Set(searchFunctions(filter).map((f) => f.key)) : null), [filter, searchFunctions]);
   const setAll = (value) => setOpen(Object.fromEntries(CATEGORIES.map((c) => [c.slug, value])));
   const favoriteFns = favorites.map((k) => FUNCTION_BY_KEY[k]).filter(Boolean);
 
