@@ -242,10 +242,11 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   workflow dies with it (happened 2026-10-26 05:38; resumed 14:27 from cache). A self-bound hourly
   Routine `trig_015b4oBVtePikCYJAcFwKkTK` ("WHM build keep-alive check-in", minute :09) wakes this
   session to resume the run, integrate finished waves, snapshot to git and move to the next step.
-  Current run: **wave-2 fix round `wf_86185de4-581`** (script `<workflows>/scripts/whm-fix-wave-wf_f1a004d0-b80.js`,
-  `args: {wave: 2}`; resume with `Workflow({scriptPath, resumeFromRunId: 'wf_86185de4-581', args: {wave: 2}})`).
-  Wave 2 build run `wf_a559b157-423` is complete and landed (`2d16a8d`). Wave 3 is a fresh run of
-  `whm-build-categories-wf_66434640-c00.js` with `args: {wave: 3}` after the plugin host exists. Disable the Routine
+  Current run: **wave 3 build `wf_cdfc582d-8cc`** (script `<workflows>/scripts/whm-build-categories-wf_66434640-c00.js`,
+  `args: {wave: 3}`; resume with `Workflow({scriptPath, resumeFromRunId: 'wf_cdfc582d-8cc', args: {wave: 3}})`).
+  Wave 2 (`wf_a559b157-423`) and its fix round (`wf_86185de4-581`) are complete and landed. After wave 3:
+  integrate (suites/build/boot/e2e/screenshots/checklist), run `whm-fix-wave-wf_f1a004d0-b80.js` with
+  `args {wave: 3}` once `SLUGS[3]` and the scratchpad `issues/` files exist, then Phase 5. Disable the Routine
   (`update_trigger enabled=false`) once CHECKLIST.md is fully done.
 - This dev container has 4 CPUs → at most 2 concurrent subagents; plan fan-outs accordingly.
 - The container has `systemctl` and `useradd` but no Apache/BIND/Exim/MySQL daemons; the
