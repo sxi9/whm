@@ -20,6 +20,8 @@ export function accountRoutes({ accounts }) {
       contactEmail: fields.email.optional(),
       ip: fields.ip.optional(),
       owner: fields.username.optional(),
+      // Which subsystems to provision besides the Linux user; the web vhost is on unless refused, DNS zone and mail routing are opt-in for API callers (the Create Account page requests all three).
+      provision: z.object({ web: z.boolean().optional(), dns: z.boolean().optional(), mail: z.boolean().optional() }).strict().optional(),
     }).strict(),
   }), (req, res, next) => accounts.create(req.body, req.user, req).then((data) => res.status(201).json({ data })).catch(next));
 

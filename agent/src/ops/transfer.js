@@ -1,0 +1,536 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { z } from 'zod';
+import { exec, hasBinary } from '../exec.js';
+import { defineOp, arg, OpError } from './registry.js';
+import { renderClientCnf, classifyMysqlError } from './db.js';
+
+// Transfers op family: everything the Transfer Tool, cpmove restores and the
+// addon-domain conversion need from the host. Remote servers are reached over
+// OpenSSH only (ssh/rsync argv, never a shell); the private key or password
+// arrives decrypted from the panel for the duration of one call and lives in a
+// 0600 file (key) or the SSHPASS environment of the child (password, via sshpass).
+// The command run on the remote side is a shell string by nature of ssh, so
+// every token is single-quoted and the program comes from a fixed allowlist.
+
+const KNOWN_HOSTS = '/var/lib/whm/transfers/known_hosts';
+const TMP_PREFIX = path.join(os.tmpdir(), 'whm-transfer-');
+const MARK = '__WHM_TRANSFER_MARK__';
+
+const REMOTE_PROGRAMS = new Set(['cat', 'ls', 'getent', 'id', 'hostname', 'uname', 'command', 'test', 'stat', 'du', 'df', 'mysqldump', 'mysql', 'rm', 'mkdir', 'readlink', 'true', 'echo']);
+const CLIENT_BINS = ['mysql', 'mariadb'];
+
+const remoteUser = z.string().regex(/^[a-z_][a-z0-9_-]{0,31}$/, 'SSH user: lowercase letters, digits, "_" or "-"');
+const remoteHost = z.union([arg.hostname, arg.ipv6]);
+const privateKey = z.string().max(16 * 1024).regex(/^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----\r?\n[\s\S]+-----END [A-Z0-9 ]*PRIVATE KEY-----\s*$/, 'Must be a PEM/OpenSSH private key');
+const password = z.string().min(1).max(256).regex(/^[^\n\r\0]+$/, 'Password must be a single line');
+const remotePath = z.string().regex(/^\/(?!(?:.*\/)?\.\.(?:\/|$))[A-Za-z0-9._/@+-]{0,1023}$/, 'Remote path: absolute, letters, digits, ". _ / @ + -" and no ".."');
+const remoteArg = z.string().max(4096).regex(/^[^\0\r\n]*$/, 'Arguments must be single-line');
+const dbName = z.string().regex(/^[a-z0-9_]{1,64}$/);
+const dbPrefix = z.string().regex(/^[a-z][a-z0-9_]{0,31}$/);
+const archiveName = /^[A-Za-z0-9][A-Za-z0-9._-]{0,200}\.(tar\.gz|tgz|tar)$/;
+const memberPattern = z.string().regex(/^(?!-)(?!(?:.*\/)?\.\.(?:\/|$))[A-Za-z0-9._*?/-]{1,512}$/, 'Archive member: letters, digits, ". _ - * ? /", no leading "-" and no ".."');
+
+export const connection = z.object({
+  host: remoteHost,
+  port: z.number().int().min(1).max(65535).default(22),
+  user: remoteUser.default('root'),
+  password: password.optional(),
+  privateKey: privateKey.optional(),
+}).strict().refine((c) => Boolean(c.password) !== Boolean(c.privateKey), { message: 'Provide either a password or a private key', path: ['password'] });
+
+const credentials = z.object({
+  host: z.string().regex(/^[A-Za-z0-9.%:_-]{1,255}$/).optional(),
+  port: z.number().int().min(1).max(65535).optional(),
+  user: z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}$/).optional(),
+  password: z.string().max(256).regex(/^[^\n\r\0]*$/).optional(),
+  socket: arg.absPath.optional(),
+}).strict().optional();
+
+// POSIX single-quoting: the only characters that survive are the ones inside
+// the quotes, so a username such as "a;rm -rf /" is one literal word remotely.
+export const shellQuote = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+
+export function remoteCommand(argv) {
+  if (!argv.length) throw new OpError('invalid_args', 'Remote command is empty');
+  if (!REMOTE_PROGRAMS.has(argv[0])) throw new OpError('refused', `"${argv[0]}" is not a program the transfer tool runs on remote servers`);
+  return argv.map(shellQuote).join(' ');
+}
+
+function sshOptions(conn, keyFile) {
+  const opts = ['-o', 'StrictHostKeyChecking=accept-new', '-o', `UserKnownHostsFile=${KNOWN_HOSTS}`, '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=30', '-o', 'LogLevel=ERROR', '-p', String(conn.port)];
+  if (keyFile) opts.push('-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes', '-o', 'PasswordAuthentication=no', '-i', keyFile);
+  else opts.push('-o', 'BatchMode=no', '-o', 'PubkeyAuthentication=no', '-o', 'PreferredAuthentications=password,keyboard-interactive', '-o', 'NumberOfPasswordPrompts=1');
+  return opts;
+}
+
+// Runs fn with everything needed to spawn ssh/rsync for this connection and
+// removes the key material afterwards. Password logins go through sshpass, which
+// reads the secret from the SSHPASS variable so it never appears in argv.
+async function withAuth(conn, fn) {
+  if (!hasBinary('ssh')) throw new OpError('capability_missing', 'The OpenSSH client (ssh) is not installed on this server; install openssh-client (Debian/Ubuntu) or openssh-clients (RHEL)');
+  if (conn.password && !hasBinary('sshpass')) throw new OpError('capability_missing', 'Password logins to remote servers need sshpass; install the sshpass package or authenticate with an SSH key');
+  fs.mkdirSync(path.dirname(KNOWN_HOSTS), { recursive: true, mode: 0o700 });
+  let dir = null;
+  let keyFile = null;
+  if (conn.privateKey) {
+    dir = fs.mkdtempSync(TMP_PREFIX);
+    fs.chmodSync(dir, 0o700);
+    keyFile = path.join(dir, 'id_key');
+    fs.writeFileSync(keyFile, conn.privateKey.endsWith('\n') ? conn.privateKey : `${conn.privateKey}\n`, { mode: 0o600 });
+  }
+  try {
+    const options = sshOptions(conn, keyFile);
+    const env = conn.password ? { SSHPASS: conn.password } : {};
+    const ssh = conn.password ? { bin: 'sshpass', argv: ['-e', 'ssh', ...options] } : { bin: 'ssh', argv: options };
+    const transport = [conn.password ? 'sshpass -e ssh' : 'ssh', ...options].join(' ');
+    return await fn({ ssh, env, transport, destination: `${conn.user}@${conn.host}` });
+  } finally {
+    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function classifySsh(code, stderr) {
+  const text = String(stderr || '').trim();
+  if (code === 255 || /Connection (refused|timed out|closed)|Could not resolve|No route to host|Permission denied|Host key verification failed|kex_exchange|Connection reset/i.test(text)) {
+    if (/Permission denied/i.test(text)) return new OpError('ssh_auth_failed', `The remote server rejected the login: ${text.split('\n').pop()}`);
+    if (/Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED/i.test(text)) return new OpError('ssh_hostkey_changed', `The host key of the remote server changed; remove its entry from ${KNOWN_HOSTS} if the server was reinstalled`);
+    return new OpError('ssh_unreachable', `Could not connect to the remote server: ${text.split('\n').pop() || `ssh exited with status ${code}`}`);
+  }
+  if (code === 5 && /sshpass/i.test(text)) return new OpError('ssh_auth_failed', 'The remote server rejected the password');
+  return null;
+}
+
+async function remoteExec(conn, command, { timeoutMs = 600_000, maxBuffer } = {}) {
+  return withAuth(conn, async ({ ssh, env, destination }) => {
+    const { code, stdout, stderr } = await exec(ssh.bin, [...ssh.argv, '--', destination, command], { env, timeoutMs, maxBuffer, allowFailure: true });
+    const sshErr = classifySsh(code, stderr);
+    if (sshErr) throw sshErr;
+    return { code, stdout, stderr };
+  });
+}
+
+function requireOk(result, what) {
+  if (result.code !== 0) throw new OpError('remote_command_failed', `${what} failed on the remote server: ${result.stderr.trim().split('\n').pop() || `exit status ${result.code}`}`, { code: result.code });
+  return result;
+}
+
+export function parsePasswd(text, { minUid = 1000 } = {}) {
+  const out = [];
+  for (const line of String(text || '').split('\n')) {
+    const [username, , uid, gid, , home, shell] = line.split(':');
+    if (!username || !/^[a-z][a-z0-9_-]{0,31}$/.test(username) || username === 'nobody') continue;
+    if (Number(uid) < minUid) continue;
+    out.push({ username, uid: Number(uid), gid: Number(gid), home: home || null, shell: shell || null });
+  }
+  return out;
+}
+
+// cPanel's /etc/userdomains lists "domain: user" (trueuserdomains has only the
+// main domain of each user).
+export function parseUserDomains(text) {
+  const out = [];
+  for (const line of String(text || '').split('\n')) {
+    const m = line.match(/^([a-z0-9.-]+):\s*([a-z0-9_-]+)\s*$/i);
+    if (m && m[1] !== '*') out.push({ domain: m[1].toLowerCase(), username: m[2] });
+  }
+  return out;
+}
+
+export function parseRsyncStats(stdout) {
+  const num = (re) => { const m = String(stdout).match(re); return m ? Number(m[1].replace(/,/g, '')) : null; };
+  return {
+    files: num(/Number of (?:regular )?files(?: transferred)?: ([\d,]+)/),
+    filesTransferred: num(/Number of (?:regular )?files transferred: ([\d,]+)/),
+    totalBytes: num(/Total file size: ([\d,]+)/),
+    transferredBytes: num(/Total transferred file size: ([\d,]+)/),
+  };
+}
+
+// cpmove-<user>.tar.gz layout: <top>/cp/<user>, homedir/, mysql/<db>.sql,
+// mysql.sql (grants), dnszones/<zone>.db, userdata/<domain>, addons, pds, sds2.
+export function summarizeArchive(entries) {
+  const names = entries.map((e) => e.replace(/^\.\//, ''));
+  const tops = new Set(names.map((n) => n.split('/')[0]).filter(Boolean));
+  const top = tops.size === 1 ? [...tops][0] : null;
+  const rel = (n) => (top ? n.slice(top.length + 1) : n);
+  const rels = names.map(rel).filter(Boolean);
+  const cpUser = rels.find((r) => /^cp\/[a-z][a-z0-9_-]*$/.test(r))?.slice(3) || null;
+  const username = cpUser || (top && top.match(/^cpmove-([a-z][a-z0-9_-]{0,31})$/)?.[1]) || (top && /^[a-z][a-z0-9_-]{0,31}$/.test(top) ? top : null);
+  const databases = [...new Set(rels.filter((r) => /^mysql\/[a-z0-9_]+\.sql$/.test(r)).map((r) => r.slice(6, -4)))];
+  const zones = [...new Set(rels.filter((r) => /^dnszones\/[a-z0-9.-]+\.db$/i.test(r)).map((r) => r.slice(9, -3).toLowerCase()))];
+  const userdata = [...new Set(rels.filter((r) => /^userdata\/[a-z0-9.-]+$/i.test(r) && !/^userdata\/(main|cache)$/.test(r) && !/_SSL$/.test(r)).map((r) => r.slice(9).toLowerCase()))];
+  return {
+    top, username, databases, zones, userdata,
+    hasHomedir: rels.some((r) => r === 'homedir' || r.startsWith('homedir/')),
+    hasGrants: rels.includes('mysql.sql'),
+    hasAddons: rels.includes('addons'), hasParked: rels.includes('pds'), hasSubdomains: rels.includes('sds2') || rels.includes('sds'),
+    hasCpConfig: Boolean(cpUser),
+    version: rels.includes('version'),
+  };
+}
+
+export function parseCpUserFile(text) {
+  const out = {};
+  for (const line of String(text || '').split('\n')) {
+    const m = line.match(/^([A-Z0-9_-]+)=(.*)$/);
+    if (m) out[m[1]] = m[2].trim();
+  }
+  return {
+    domain: out.DNS?.toLowerCase() || null, plan: out.PLAN || null, contactEmail: out.CONTACTEMAIL || null, ip: out.IP || null,
+    owner: out.OWNER || null, maxDbs: out.MAXSQL ?? null, hasShell: out.HASSHELL === '1', raw: out,
+  };
+}
+
+// ---------------------------------------------------------------- remote ---
+
+defineOp('transfer.remote.exec', {
+  description: 'Run an allowlisted program on a remote server over ssh (BatchMode, key or sshpass) and return its output',
+  timeoutMs: 600_000,
+  schema: z.object({ connection, argv: z.array(remoteArg).min(1).max(64), timeoutMs: z.number().int().min(1000).max(7_200_000).default(600_000) }).strict(),
+  run: async ({ connection: conn, argv, timeoutMs }) => remoteExec(conn, remoteCommand(argv), { timeoutMs }),
+});
+
+defineOp('transfer.remote.probe', {
+  description: 'Test an SSH connection and report the remote OS, tooling (rsync, mysqldump) and cPanel presence',
+  timeoutMs: 120_000,
+  schema: z.object({ connection }).strict(),
+  run: async ({ connection: conn }) => {
+    const parts = [
+      ['hostname', '-f'], ['uname', '-r'], ['id', '-u'], ['hostname', '-I'],
+      ['command', '-v', 'rsync'], ['command', '-v', 'mysqldump'], ['command', '-v', 'mysql'],
+      ['test', '-d', '/var/cpanel/users'], ['cat', '/etc/os-release'], ['df', '-Pk', '/home'],
+    ];
+    // Each probe is a constant argv; the separators are constants too, so the
+    // joined string carries no caller-supplied bytes.
+    const command = parts.map((p) => `${remoteCommand(p)} 2>/dev/null; echo ${shellQuote(MARK)}$?`).join('; ');
+    const { stdout } = await remoteExec(conn, command, { timeoutMs: 120_000 });
+    const sections = stdout.split(new RegExp(`${MARK}(\\d+)\\n?`)).slice(0, -1);
+    const out = [];
+    for (let i = 0; i + 1 < sections.length; i += 2) out.push({ text: sections[i].trim(), code: Number(sections[i + 1]) });
+    const get = (i) => out[i] || { text: '', code: 1 };
+    const osRelease = Object.fromEntries(get(8).text.split('\n').map((l) => l.split('=')).filter((kv) => kv.length === 2).map(([k, v]) => [k, v.replace(/^"|"$/g, '')]));
+    const df = get(9).text.split('\n').pop()?.trim().split(/\s+/) || [];
+    return {
+      ok: true,
+      hostname: get(0).text || conn.host,
+      kernel: get(1).text || null,
+      uid: get(2).code === 0 ? Number(get(2).text) : null,
+      isRoot: get(2).text === '0',
+      addresses: get(3).text.split(/\s+/).filter(Boolean),
+      tools: { rsync: get(4).code === 0, mysqldump: get(5).code === 0, mysql: get(6).code === 0 },
+      cpanel: get(7).code === 0,
+      os: { id: osRelease.ID || null, name: osRelease.PRETTY_NAME || osRelease.NAME || null, version: osRelease.VERSION_ID || null },
+      homeDisk: df.length >= 4 ? { sizeBytes: Number(df[1]) * 1024, usedBytes: Number(df[2]) * 1024, availableBytes: Number(df[3]) * 1024 } : null,
+    };
+  },
+});
+
+defineOp('transfer.remote.list_accounts', {
+  description: 'Enumerate hosting accounts on a remote server (/etc/passwd uid >= 1000 plus cPanel domain maps and /home listing)',
+  timeoutMs: 120_000,
+  schema: z.object({ connection, minUid: z.number().int().min(0).max(65535).default(1000) }).strict(),
+  run: async ({ connection: conn, minUid }) => {
+    const parts = [['cat', '/etc/passwd'], ['cat', '/etc/trueuserdomains'], ['cat', '/etc/userdomains'], ['ls', '-1', '/home']];
+    const command = parts.map((p) => `${remoteCommand(p)} 2>/dev/null; echo ${shellQuote(MARK)}`).join('; ');
+    const { stdout } = await remoteExec(conn, command, { timeoutMs: 120_000 });
+    const [passwd = '', trueDomains = '', userDomains = '', homes = ''] = stdout.split(`${MARK}\n`);
+    const users = parsePasswd(passwd, { minUid });
+    const mains = new Map(parseUserDomains(trueDomains).map((d) => [d.username, d.domain]));
+    const all = parseUserDomains(userDomains);
+    const homeDirs = new Set(homes.split('\n').map((s) => s.trim()).filter(Boolean));
+    return {
+      cpanel: mains.size > 0,
+      accounts: users.map((u) => ({
+        ...u,
+        domain: mains.get(u.username) || null,
+        domains: all.filter((d) => d.username === u.username && d.domain !== mains.get(u.username)).map((d) => d.domain),
+        homeListed: homeDirs.has(u.username),
+      })),
+    };
+  },
+});
+
+defineOp('transfer.remote.read_file', {
+  description: 'Read a file from a remote server over ssh (zone files, cPanel user configs)',
+  timeoutMs: 120_000,
+  schema: z.object({ connection, path: remotePath, maxBytes: z.number().int().min(1).max(8 * 1024 * 1024).default(1024 * 1024) }).strict(),
+  run: async ({ connection: conn, path: file, maxBytes }) => {
+    const result = await remoteExec(conn, remoteCommand(['cat', '--', file]), { timeoutMs: 120_000, maxBuffer: maxBytes + 65536 });
+    if (result.code !== 0) return { path: file, exists: false, content: null };
+    return { path: file, exists: true, content: result.stdout.length > maxBytes ? result.stdout.slice(0, maxBytes) : result.stdout, truncated: result.stdout.length > maxBytes };
+  },
+});
+
+defineOp('transfer.remote.databases', {
+  description: 'List MySQL databases on a remote server whose name starts with "<prefix>_" (remote root .my.cnf credentials)',
+  timeoutMs: 120_000,
+  schema: z.object({ connection, prefix: dbPrefix, defaultsFile: remotePath.optional() }).strict(),
+  run: async ({ connection: conn, prefix, defaultsFile }) => {
+    const argv = ['mysql'];
+    if (defaultsFile) argv.push(`--defaults-extra-file=${defaultsFile}`);
+    argv.push('-N', '-B', '-e', `SHOW DATABASES LIKE '${prefix}\\_%'`);
+    const result = await remoteExec(conn, remoteCommand(argv), { timeoutMs: 120_000 });
+    if (result.code !== 0) {
+      const err = classifyMysqlError(result.stderr);
+      if (/not found|No such file/i.test(result.stderr) && !/^ERROR/.test(result.stderr.trim())) throw new OpError('remote_tool_missing', 'The mysql client is not installed on the remote server');
+      throw new OpError(err.code === 'db_error' ? 'remote_command_failed' : `remote_${err.code}`, `Remote MySQL: ${err.message}`);
+    }
+    return { prefix, databases: result.stdout.split('\n').map((s) => s.trim()).filter((s) => /^[a-z0-9_]{1,64}$/.test(s)) };
+  },
+});
+
+defineOp('transfer.remote.db_grants', {
+  description: 'CREATE USER / GRANT statements for the remote MySQL users of an account prefix, for replay on this server',
+  timeoutMs: 300_000,
+  schema: z.object({ connection, prefix: dbPrefix, defaultsFile: remotePath.optional() }).strict(),
+  run: async ({ connection: conn, prefix, defaultsFile }) => {
+    const base = ['mysql'];
+    if (defaultsFile) base.push(`--defaults-extra-file=${defaultsFile}`);
+    const list = await remoteExec(conn, remoteCommand([...base, '-N', '-B', '-e', `SELECT user, host FROM mysql.user WHERE user LIKE '${prefix}\\_%' OR user = '${prefix}'`]), { timeoutMs: 120_000 });
+    if (list.code !== 0) throw new OpError('remote_command_failed', `Remote MySQL: ${classifyMysqlError(list.stderr).message}`);
+    const users = list.stdout.split('\n').map((l) => l.split('\t')).filter((c) => c.length === 2 && /^[A-Za-z0-9_.-]{1,80}$/.test(c[0]) && /^[A-Za-z0-9.%:_-]{1,255}$/.test(c[1]));
+    const out = [];
+    for (const [user, host] of users) {
+      const account = `'${user}'@'${host}'`;
+      const r = await remoteExec(conn, remoteCommand([...base, '-N', '-B', '-e', `SHOW CREATE USER ${account}; SHOW GRANTS FOR ${account}`]), { timeoutMs: 120_000 });
+      if (r.code !== 0) { out.push({ user, host, error: classifyMysqlError(r.stderr).message, statements: [] }); continue; }
+      const statements = r.stdout.split('\n').map((s) => s.trim()).filter(Boolean).filter((s) => /^(CREATE USER|GRANT) /i.test(s));
+      out.push({ user, host, statements });
+    }
+    return { prefix, users: out };
+  },
+});
+
+defineOp('transfer.remote.dump_database', {
+  description: 'mysqldump a remote database to a file under /tmp on the remote server (fetched with transfer.remote.rsync, removed with transfer.remote.remove_file)',
+  timeoutMs: 7_200_000,
+  schema: z.object({ connection, database: dbName, defaultsFile: remotePath.optional(), timeoutMs: z.number().int().min(10_000).max(7_200_000).default(3_600_000) }).strict(),
+  run: async ({ connection: conn, database, defaultsFile, timeoutMs }) => {
+    const remoteFile = `/tmp/whm-transfer-${database}-${crypto.randomBytes(4).toString('hex')}.sql`;
+    const argv = ['mysqldump'];
+    if (defaultsFile) argv.push(`--defaults-extra-file=${defaultsFile}`);
+    argv.push('--single-transaction', '--quick', '--routines', '--triggers', '--events', `--result-file=${remoteFile}`, '--', database);
+    const dump = await remoteExec(conn, remoteCommand(argv), { timeoutMs });
+    if (dump.code !== 0) {
+      await remoteExec(conn, remoteCommand(['rm', '-f', '--', remoteFile]), { timeoutMs: 60_000 }).catch(() => {});
+      if (/not found|No such file/i.test(dump.stderr) && !/^mysqldump:/.test(dump.stderr.trim())) throw new OpError('remote_tool_missing', 'mysqldump is not installed on the remote server');
+      throw new OpError('remote_command_failed', `Remote mysqldump: ${classifyMysqlError(dump.stderr).message}`);
+    }
+    const stat = await remoteExec(conn, remoteCommand(['stat', '-c', '%s', '--', remoteFile]), { timeoutMs: 60_000 });
+    return { database, remotePath: remoteFile, sizeBytes: stat.code === 0 ? Number(stat.stdout.trim()) || 0 : null };
+  },
+});
+
+defineOp('transfer.remote.remove_file', {
+  description: 'Remove a temporary dump the transfer tool created under /tmp on the remote server',
+  destructive: true,
+  timeoutMs: 60_000,
+  schema: z.object({ connection, path: remotePath.refine((p) => /^\/tmp\/whm-transfer-[A-Za-z0-9_.-]+$/.test(p), 'Only files the transfer tool created under /tmp can be removed') }).strict(),
+  run: async ({ connection: conn, path: file }) => {
+    const r = await remoteExec(conn, remoteCommand(['rm', '-f', '--', file]), { timeoutMs: 60_000 });
+    return { path: file, removed: r.code === 0 };
+  },
+});
+
+defineOp('transfer.remote.rsync', {
+  description: 'Copy a directory or file from a remote server with rsync over ssh into an allowed local path',
+  timeoutMs: 86_400_000,
+  schema: z.object({
+    connection,
+    remotePath,
+    localPath: arg.absPath,
+    directory: z.boolean().default(true),
+    excludes: z.array(z.string().regex(/^(?!-)[A-Za-z0-9._*?/-]{1,200}$/)).max(50).default([]),
+    deleteExtraneous: z.boolean().default(false),
+    bwlimitKbps: z.number().int().min(0).max(10_000_000).default(0),
+    dryRun: z.boolean().default(false),
+    timeoutMs: z.number().int().min(10_000).max(86_400_000).default(43_200_000),
+  }).strict(),
+  run: async ({ connection: conn, remotePath: src, localPath, directory, excludes, deleteExtraneous, bwlimitKbps, dryRun, timeoutMs }, ctx) => {
+    if (!hasBinary('rsync')) throw new OpError('capability_missing', 'rsync is not installed on this server; install the rsync package');
+    const dest = ctx.assertAllowedPath(localPath, 'write');
+    if (directory) fs.mkdirSync(dest, { recursive: true });
+    else fs.mkdirSync(path.dirname(dest), { recursive: true });
+    return withAuth(conn, async ({ env, transport, destination }) => {
+      const argv = ['-rltD', '-z', '--partial', '--stats', '--human-readable=0', '-e', transport];
+      if (deleteExtraneous) argv.push('--delete');
+      if (bwlimitKbps) argv.push(`--bwlimit=${bwlimitKbps}`);
+      if (dryRun) argv.push('--dry-run');
+      for (const ex of excludes) argv.push(`--exclude=${ex}`);
+      const from = directory ? `${destination}:${src.replace(/\/+$/, '')}/` : `${destination}:${src}`;
+      const to = directory ? `${dest.replace(/\/+$/, '')}/` : dest;
+      argv.push(from, to);
+      const { code, stdout, stderr } = await exec('rsync', argv, { env, timeoutMs, allowFailure: true });
+      const sshErr = classifySsh(code === 255 ? 255 : 0, stderr);
+      if (sshErr) throw sshErr;
+      // 23/24 = some files vanished or could not be read; the copy itself is usable.
+      if (code !== 0 && code !== 23 && code !== 24) throw new OpError('rsync_failed', `rsync exited with status ${code}: ${stderr.trim().split('\n').pop() || 'no error output'}`, { code });
+      return { from: src, to: dest, code, partial: code !== 0, dryRun, ...parseRsyncStats(stdout) };
+    });
+  },
+});
+
+// ---------------------------------------------------------------- cpmove ---
+
+function requireTar() {
+  if (!hasBinary('tar')) throw new OpError('capability_missing', 'tar is not installed on this server');
+}
+
+function assertArchive(ctx, file) {
+  const resolved = ctx.assertAllowedPath(file, 'read');
+  if (!archiveName.test(path.basename(resolved))) throw new OpError('refused', `${path.basename(resolved)} is not a .tar.gz / .tgz / .tar archive`);
+  let st;
+  try { st = fs.lstatSync(resolved); } catch { throw new OpError('not_found', `${file} does not exist`); }
+  if (st.isSymbolicLink() || !st.isFile()) throw new OpError('refused', `${file} is not a regular file`);
+  return { resolved, size: st.size, mtime: st.mtime.toISOString() };
+}
+
+defineOp('transfer.cpmove.inspect', {
+  description: 'Inspect a cpmove / pkgacct archive: account name, databases, zones, userdata and whether a homedir is present',
+  timeoutMs: 3_600_000,
+  schema: z.object({ path: arg.absPath, maxEntries: z.number().int().min(100).max(1_000_000).default(200_000) }).strict(),
+  run: async ({ path: file, maxEntries }, ctx) => {
+    requireTar();
+    const { resolved, size, mtime } = assertArchive(ctx, file);
+    // Only the metadata members are listed so a multi-gigabyte homedir does not
+    // flood the output; the homedir itself is detected by its directory entry.
+    const patterns = ['*/cp/*', '*/mysql/*', '*/mysql.sql', '*/dnszones/*', '*/userdata/*', '*/homedir', '*/addons', '*/pds', '*/sds', '*/sds2', '*/version', '*/meta/*', '*/homedir/public_html'];
+    const argv = ['-tf', resolved, '--wildcards', '--no-anchored', ...patterns];
+    const { code, stdout, stderr } = await exec('tar', argv, { timeoutMs: 3_600_000, allowFailure: true, maxBuffer: 64 * 1024 * 1024 });
+    const entries = stdout.split('\n').map((s) => s.replace(/\/$/, '')).filter(Boolean).slice(0, maxEntries);
+    if (code !== 0 && !entries.length) {
+      if (/not in gzip format|Unexpected EOF|does not look like a tar archive|not recoverable/i.test(stderr)) throw new OpError('invalid_archive', `${path.basename(resolved)} is not a readable tar archive: ${stderr.trim().split('\n')[0]}`);
+      if (!/Not found in archive/i.test(stderr)) throw new OpError('invalid_archive', `tar could not read ${path.basename(resolved)}: ${stderr.trim().split('\n').pop() || `status ${code}`}`);
+    }
+    const summary = summarizeArchive(entries);
+    let cp = null;
+    if (summary.hasCpConfig && summary.top) {
+      const r = await exec('tar', ['-xOf', resolved, `${summary.top}/cp/${summary.username}`], { timeoutMs: 3_600_000, allowFailure: true, maxBuffer: 4 * 1024 * 1024 });
+      if (r.code === 0) cp = parseCpUserFile(r.stdout);
+    }
+    if (!summary.top || !summary.username) throw new OpError('invalid_archive', `${path.basename(resolved)} does not look like a cPanel account archive (expected a single cpmove-<user>/ or <user>/ top-level directory)`);
+    return { path: resolved, sizeBytes: size, mtime, ...summary, config: cp, entries: entries.length, sample: entries.slice(0, 50) };
+  },
+});
+
+defineOp('transfer.cpmove.read_member', {
+  description: 'Read one text member of an account archive (cp config, zone file, userdata, addons list)',
+  timeoutMs: 3_600_000,
+  schema: z.object({ path: arg.absPath, member: memberPattern, maxBytes: z.number().int().min(1).max(32 * 1024 * 1024).default(4 * 1024 * 1024) }).strict(),
+  run: async ({ path: file, member, maxBytes }, ctx) => {
+    requireTar();
+    const { resolved } = assertArchive(ctx, file);
+    const { code, stdout, stderr } = await exec('tar', ['-xOf', resolved, '--wildcards', '--no-anchored', member], { timeoutMs: 3_600_000, allowFailure: true, maxBuffer: maxBytes + 65536 });
+    if (code !== 0 && !stdout) {
+      if (/Not found in archive/i.test(stderr)) return { member, exists: false, content: null };
+      throw new OpError('invalid_archive', `tar could not read ${member}: ${stderr.trim().split('\n').pop() || `status ${code}`}`);
+    }
+    return { member, exists: true, content: stdout.slice(0, maxBytes), truncated: stdout.length > maxBytes };
+  },
+});
+
+defineOp('transfer.cpmove.extract', {
+  description: 'Extract members of an account archive into an allowed directory (homedir into the new home, dumps into staging)',
+  timeoutMs: 86_400_000,
+  schema: z.object({
+    path: arg.absPath,
+    destination: arg.absPath,
+    members: z.array(memberPattern).min(1).max(100),
+    stripComponents: z.number().int().min(0).max(10).default(0),
+    owner: arg.username.optional(),
+  }).strict(),
+  run: async ({ path: file, destination, members, stripComponents, owner }, ctx) => {
+    requireTar();
+    const { resolved } = assertArchive(ctx, file);
+    const dest = ctx.assertAllowedPath(destination, 'write');
+    fs.mkdirSync(dest, { recursive: true });
+    // GNU tar drops leading "/" and refuses ".." members by default; the
+    // ownership from the archive is discarded and reapplied for the new user.
+    const argv = ['-xf', resolved, '-C', dest, '--no-same-owner', '--no-same-permissions', '--no-overwrite-dir', `--strip-components=${stripComponents}`, '--wildcards', '--no-anchored', ...members];
+    const { code, stderr } = await exec('tar', argv, { timeoutMs: 86_400_000, allowFailure: true });
+    if (code !== 0) {
+      if (/Not found in archive/i.test(stderr)) return { destination: dest, extracted: false, members };
+      throw new OpError('extract_failed', `tar exited with status ${code}: ${stderr.trim().split('\n').pop() || 'no error output'}`);
+    }
+    if (owner) await exec('chown', ['-R', `${owner}:${owner}`, '--', dest], { timeoutMs: 3_600_000 });
+    return { destination: dest, extracted: true, members, owner: owner || null };
+  },
+});
+
+// ------------------------------------------------------------- mysql/upload ---
+
+function findClient() {
+  return CLIENT_BINS.find(hasBinary) || null;
+}
+
+defineOp('transfer.mysql.import', {
+  description: 'Load a SQL dump into a local database with the mysql client ("source <file>", credentials via a 0600 defaults file or /root/.my.cnf)',
+  timeoutMs: 7_200_000,
+  schema: z.object({ path: arg.absPath, database: dbName.optional(), credentials, timeoutMs: z.number().int().min(10_000).max(7_200_000).default(3_600_000) }).strict(),
+  run: async ({ path: file, database, credentials: creds, timeoutMs }, ctx) => {
+    const bin = findClient();
+    if (!bin) throw new OpError('capability_missing', 'The MySQL/MariaDB client (mysql or mariadb) is not installed on this server');
+    const resolved = ctx.assertAllowedPath(file, 'read');
+    if (!fs.existsSync(resolved)) throw new OpError('not_found', `${file} does not exist`);
+    let dir = null;
+    const defaults = [];
+    if (creds && Object.keys(creds).length) {
+      dir = fs.mkdtempSync(TMP_PREFIX);
+      fs.chmodSync(dir, 0o700);
+      const cnf = path.join(dir, 'client.cnf');
+      fs.writeFileSync(cnf, renderClientCnf(creds), { mode: 0o600 });
+      defaults.push(`--defaults-extra-file=${cnf}`);
+    } else if (fs.existsSync('/root/.my.cnf')) defaults.push('--defaults-extra-file=/root/.my.cnf');
+    try {
+      const argv = [...defaults, '--batch'];
+      if (database) argv.push(`--database=${database}`);
+      argv.push('-e', `source ${resolved}`);
+      const { code, stderr } = await exec(bin, argv, { timeoutMs, allowFailure: true });
+      if (code !== 0) {
+        const err = classifyMysqlError(stderr);
+        throw new OpError(err.code === 'db_error' ? 'import_failed' : err.code, `mysql: ${err.message}`, { errno: err.errno });
+      }
+      return { path: resolved, database: database || null, imported: true };
+    } finally {
+      if (dir) fs.rmSync(dir, { recursive: true, force: true });
+    }
+  },
+});
+
+defineOp('transfer.upload.append', {
+  description: 'Append a base64 chunk to an archive being uploaded into an allowed staging directory (truncate starts a new file)',
+  schema: z.object({ path: arg.absPath, data: z.string().max(3 * 1024 * 1024).regex(/^[A-Za-z0-9+/=\s]*$/), truncate: z.boolean().default(false) }).strict(),
+  run: async ({ path: file, data, truncate }, ctx) => {
+    const resolved = ctx.assertAllowedPath(file, 'write');
+    if (!archiveName.test(path.basename(resolved))) throw new OpError('refused', `${path.basename(resolved)} is not an archive file name (.tar.gz, .tgz or .tar)`);
+    fs.mkdirSync(path.dirname(resolved), { recursive: true, mode: 0o700 });
+    const buf = Buffer.from(data.replace(/\s+/g, ''), 'base64');
+    if (truncate) fs.writeFileSync(resolved, buf, { mode: 0o600 });
+    else fs.appendFileSync(resolved, buf, { mode: 0o600 });
+    return { path: resolved, bytes: buf.length, size: fs.statSync(resolved).size };
+  },
+});
+
+defineOp('transfer.archive.list', {
+  description: 'List account archives (.tar.gz/.tgz/.tar) in a directory with size and mtime',
+  schema: z.object({ path: arg.absPath, limit: z.number().int().min(1).max(5000).default(500) }).strict(),
+  run: async ({ path: dir, limit }, ctx) => {
+    const resolved = ctx.assertAllowedPath(dir, 'read');
+    let names;
+    try { names = fs.readdirSync(resolved); } catch (err) { if (err.code === 'ENOENT') return { path: resolved, exists: false, archives: [] }; throw err; }
+    const archives = [];
+    for (const name of names) {
+      if (!archiveName.test(name)) continue;
+      let st;
+      try { st = fs.lstatSync(path.join(resolved, name)); } catch { continue; }
+      if (!st.isFile()) continue;
+      archives.push({ name, path: path.join(resolved, name), sizeBytes: st.size, mtime: st.mtime.toISOString() });
+      if (archives.length >= limit) break;
+    }
+    archives.sort((a, b) => b.mtime.localeCompare(a.mtime));
+    return { path: resolved, exists: true, archives };
+  },
+});

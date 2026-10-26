@@ -64,7 +64,7 @@ describe('Account Functions API', () => {
     delete app.ctx.web;
     csrf = await app.login();
     reseller = await app.createUser('resell1', 'reseller');
-    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'alice', domain: 'alice.com', contactEmail: 'alice@alice.com' }).expect(201);
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'alice', domain: 'alice.com', contactEmail: 'alice@alice.com', provision: { dns: true } }).expect(201);
     await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'bob', domain: 'bob.com', owner: 'resell1', contactEmail: 'bob@bob.com' }).expect(201);
     await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'carol', domain: 'carol.com' }).expect(201);
     resellerHttp = request.agent(app.ctx.app);
@@ -86,7 +86,7 @@ describe('Account Functions API', () => {
     it('records a provisioning status per step and renders the index template', async () => {
       const res = await post('/x', {}); // warm-up: unknown route is 404, keeps the CSRF cookie fresh
       expect(res.status).toBe(404);
-      const created = await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'dave', domain: 'dave.com' }).expect(201);
+      const created = await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'dave', domain: 'dave.com', provision: { dns: true, mail: true } }).expect(201);
       const p = created.body.data.provisioning;
       expect(p.systemUser).toBe(true);
       expect(p.web).toBe('skipped');
@@ -106,10 +106,13 @@ describe('Account Functions API', () => {
       const dns = app.ctx.dns;
       app.ctx.dns = { ...dns, ensureZoneForDomain: async () => { throw Object.assign(new Error('named exploded'), { agentError: true, code: 'command_failed' }); }, removeZonesForAccount: dns.removeZonesForAccount };
       try {
-        const res = await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'erin', domain: 'erin.com' });
+        const res = await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'erin', domain: 'erin.com', provision: { dns: true } });
         expect(res.status).toBe(500);
         expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM accounts WHERE username = ?').get('erin').n).toBe(0);
         expect(app.agent.callsTo('user.delete')).toHaveLength(1);
+        const plain = await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'erin', domain: 'erin.com' }).expect(201);
+        expect(plain.body.data.provisioning.steps.dns).toEqual({ status: 'skipped', detail: 'not requested' });
+        await app.http.delete('/api/accounts/erin').set('X-CSRF-Token', csrf).expect(200);
       } finally { app.ctx.dns = dns; }
     });
 

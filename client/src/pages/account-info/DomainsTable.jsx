@@ -24,7 +24,7 @@ export function DomainsTable({ type, emptyText, parentLabel = 'Parent domain', t
   ].filter(Boolean);
 
   const rowActions = (r) => [
-    { label: 'DNS zone', primary: true, onClick: () => navigate(`/dns-functions/dns-zone-manager?domain=${encodeURIComponent(r.parent === r.domain ? r.domain : r.domain)}`) },
+    { label: 'DNS zone', primary: true, onClick: () => navigate(`/dns-functions/dns-zone-manager?domain=${encodeURIComponent(r.type === 'sub' ? r.parent : r.domain)}`) },
     { label: 'Modify account', onClick: () => navigate(`/account-functions/modify-an-account?username=${r.username}`) },
     { label: 'Bandwidth', onClick: () => navigate(`/account-information/view-bandwidth-usage?username=${r.username}`) },
   ];

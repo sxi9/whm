@@ -4,7 +4,8 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const pkg = require('../../package.json');
 
-export function createSystemService({ db, agent, capabilities, settings, config }) {
+export function createSystemService(ctx) {
+  const { db, agent, capabilities, settings, config } = ctx;
   const counts = {
     accounts: db.prepare('SELECT COUNT(*) AS n FROM accounts'),
     suspended: db.prepare('SELECT COUNT(*) AS n FROM accounts WHERE suspended = 1'),
@@ -42,6 +43,8 @@ export function createSystemService({ db, agent, capabilities, settings, config 
         capabilities: Object.fromEntries(Object.entries(snapshot.capabilities).map(([k, v]) => [k, v.installed])),
         services: await serviceSummary(),
         license: { status: 'unlicensed', edition: null },
+        // Server Profile (Server Configuration) decides which categories the shell shows.
+        profile: ctx.serverConfig?.profile?.summary?.() ?? { name: 'standard', label: 'Standard Node', hiddenCategories: [], services: null },
       };
     },
     info: () => agent.op('sys.info'),

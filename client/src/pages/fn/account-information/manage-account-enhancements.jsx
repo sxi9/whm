@@ -143,7 +143,9 @@ function AssignCard({ enhancements, refreshKey }) {
   const assigned = useApi(username ? `/account-info/accounts/${encodeURIComponent(username)}/enhancements` : null, { enabled: Boolean(username) });
   const effective = useApi(username ? `/account-info/accounts/${encodeURIComponent(username)}/enhancements/effective` : null, { enabled: Boolean(username) });
   useEffect(() => { if (assigned.data) setDraft(assigned.data.map((e) => e.id)); }, [assigned.data]);
-  useEffect(() => { if (username) { assigned.refetch(); effective.refetch(); } }, [refreshKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const { refetch: refetchAssigned } = assigned;
+  const { refetch: refetchEffective } = effective;
+  useEffect(() => { if (username) { refetchAssigned(); refetchEffective(); } }, [refreshKey, username, refetchAssigned, refetchEffective]);
 
   const current = (assigned.data || []).map((e) => e.id).sort().join(',');
   const dirty = draft && draft.slice().sort().join(',') !== current;

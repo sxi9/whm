@@ -61,10 +61,11 @@ export function createAccountsService(ctx) {
   // Web, DNS, mail and database provisioning run through the owning categories
   // when they are loaded. Each step records applied | pending (daemon missing,
   // applied on the next sync) | failed | skipped (category not present).
-  async function provision(account, { ip, user, req, undo }) {
+  async function provision(account, { ip, req, undo, want }) {
     const { username, domain, id } = account;
     const steps = {};
     const run = async (name, fn, rollback) => {
+      if (want[name] === false) { steps[name] = { status: 'skipped', detail: 'not requested' }; return; }
       try {
         const out = await fn();
         steps[name] = out;
@@ -167,7 +168,9 @@ export function createAccountsService(ctx) {
       const homeRoot = settings.get('basic.home_root');
       const homeDir = `${homeRoot}/${username}`;
       const shell = plan.has_shell ? '/bin/bash' : '/usr/sbin/nologin';
-      const ip = input.ip || settings.get('basic.shared_ip') || settings.get('basic.main_ip') || null;
+      // Resellers are bound by their limits, ACLs, package list and IP delegation (Reseller Center).
+      const policy = !isRoot(user) && ctx.resellers?.createPolicy ? ctx.resellers.createPolicy(user, { pkgName, plan, ip: input.ip }) : null;
+      const ip = input.ip || policy?.sharedIp || settings.get('basic.shared_ip') || settings.get('basic.main_ip') || null;
 
       const undo = [];
       let sysUser = null;
@@ -197,7 +200,7 @@ export function createAccountsService(ctx) {
         })();
 
         undo.push(() => Promise.resolve(stmts.remove.run(account.id)));
-        const provisioning = await provision(account, { ip, user, req, undo });
+        const provisioning = await provision(account, { ip, user, req, undo, want: { web: true, dns: false, mail: false, ...(input.provision || {}) } });
         req?.audit?.({ action: 'account.create', target: username, args: { domain: input.domain, package: pkgName, owner: ownerId, ip, provisioning: Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])) } });
         return { ...shape(stmts.byUsername.get(username)), domains: stmts.domains.all(account.id), provisioning: { systemUser: Boolean(sysUser), ...Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])), steps: provisioning.steps } };
       } catch (err) {

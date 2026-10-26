@@ -4,7 +4,7 @@ import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
 import { PageHeader, Card, KeyValue, StatusPill } from '../../components/Common.jsx';
-import { Field, TextInput, PasswordInput, Select, Button, FormActions, ErrorBanner } from '../../components/Form.jsx';
+import { Field, TextInput, PasswordInput, Select, Toggle, Button, FormActions, ErrorBanner } from '../../components/Form.jsx';
 import { useToast } from '../../components/Toast.jsx';
 
 function suggestUsername(domain) {
@@ -16,6 +16,7 @@ export default function CreateAccount({ fn }) {
   const { user } = useAuth();
   const { data: packages } = useApi('/packages?pageSize=500');
   const [form, setForm] = useState({ domain: '', username: '', password: '', contactEmail: '', package: '', ip: '', owner: '' });
+  const [provision, setProvision] = useState({ web: true, dns: true, mail: true });
   const [auto, setAuto] = useState(true);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
@@ -29,7 +30,7 @@ export default function CreateAccount({ fn }) {
     setLoading(true);
     setError(null);
     try {
-      const body = Object.fromEntries(Object.entries(form).filter(([, v]) => v !== ''));
+      const body = { ...Object.fromEntries(Object.entries(form).filter(([, v]) => v !== '')), provision };
       const { data } = await api.post('/accounts', body);
       setResult(data);
       toast.success(`Account ${data.username} created`);
@@ -41,15 +42,19 @@ export default function CreateAccount({ fn }) {
   };
 
   if (result) {
+    const steps = result.provisioning?.steps || {};
+    const tone = { applied: 'ok', pending: 'pending', failed: 'failed', skipped: 'muted' };
+    const step = (key, label) => [label, <span key={key}><StatusPill status={tone[steps[key]?.status] || 'muted'}>{steps[key]?.status || result.provisioning?.[key] || 'unknown'}</StatusPill>{steps[key]?.detail && <span className="muted" style={{ marginLeft: 8 }}>{steps[key].detail}</span>}</span>];
     return (
       <>
         <PageHeader fn={fn} />
         <Card title="Account created" actions={<button className="btn" onClick={() => { setResult(null); setForm({ domain: '', username: '', password: '', contactEmail: '', package: '', ip: '', owner: '' }); }}>Create another</button>}>
           <KeyValue items={[
-            ['Domain', result.domain], ['Username', <code key="u">{result.username}</code>], ['Package', result.package_name], ['Home directory', <code key="h">{result.home_dir}</code>],
+            ['Domain', result.domain], ['Username', <code key="u">{result.username}</code>], ['Package', result.package_name], ['IP address', result.ip || 'shared'], ['Home directory', <code key="h">{result.home_dir}</code>],
             ['Linux user', <StatusPill key="s" status={result.provisioning?.systemUser ? 'ok' : 'warning'}>{result.provisioning?.systemUser ? 'created' : 'not created (development mode)'}</StatusPill>],
-            ['Web vhost', <StatusPill key="w" status="pending">{result.provisioning?.web}</StatusPill>], ['DNS zone', <StatusPill key="d" status="pending">{result.provisioning?.dns}</StatusPill>], ['Mail', <StatusPill key="m" status="pending">{result.provisioning?.mail}</StatusPill>],
+            step('web', 'Web vhost'), step('dns', 'DNS zone'), step('mail', 'Mail routing'), step('database', 'Databases'),
           ]} />
+          <p className="muted" style={{ marginTop: 10 }}>Pending steps are applied automatically once the missing service is installed and the account is synced; failed steps keep the account and are listed in the audit log.</p>
           <p style={{ marginTop: 14 }}><Link to="/account-information/list-accounts">Go to List Accounts</Link></p>
         </Card>
       </>
@@ -80,6 +85,11 @@ export default function CreateAccount({ fn }) {
             <Field label="Dedicated IP address" error={fieldErr('ip')} help="Leave blank to use the shared IP"><TextInput value={form.ip} onChange={set('ip')} placeholder="203.0.113.10" /></Field>
             {user.role === 'root' && <Field label="Owner" error={fieldErr('owner')} help="Reseller username that will own this account (default: root)"><TextInput value={form.owner} onChange={set('owner')} placeholder="root" /></Field>}
           </div>
+        </Card>
+        <Card title="Provisioning" subtitle="Each step runs through its own category when that service exists on this server; a missing daemon leaves the step pending until it is installed.">
+          <Field inline><Toggle checked={provision.web} onChange={(v) => setProvision((p) => ({ ...p, web: v }))} label="Web server virtual host" description="Apache vhost with the account's PHP-FPM pool and per-domain logs" /></Field>
+          <Field inline><Toggle checked={provision.dns} onChange={(v) => setProvision((p) => ({ ...p, dns: v }))} label="DNS zone" description="Zone from the standard template (A, MX, SPF) pointing at the account's IP" /></Field>
+          <Field inline><Toggle checked={provision.mail} onChange={(v) => setProvision((p) => ({ ...p, mail: v }))} label="Local mail routing" description="Adds the domain to Exim's local domains" /></Field>
         </Card>
         <FormActions><Button type="submit" variant="primary" loading={loading}>Create</Button></FormActions>
       </form>

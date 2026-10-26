@@ -1,0 +1,497 @@
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import net from 'node:net';
+import http from 'node:http';
+import crypto from 'node:crypto';
+import request from 'supertest';
+import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
+import { normalizeNotification, validateAddress, EVENTS } from '../src/services/server-contacts.js';
+import { buildMessage, dotStuff, sendSmtp } from '../src/services/server-contacts-smtp.js';
+
+// A tiny SMTP server that records the session so the relay path is exercised
+// for real (greeting, EHLO, AUTH PLAIN, envelope, DATA).
+function fakeSmtp() {
+  const sessions = [];
+  let reject = null;
+  const server = net.createServer((socket) => {
+    const session = { commands: [], data: '', auth: null };
+    sessions.push(session);
+    let inData = false;
+    let buf = '';
+    socket.write('220 relay.test ESMTP ready\r\n');
+    socket.on('data', (chunk) => {
+      buf += chunk.toString('utf8');
+      let idx;
+      while ((idx = buf.indexOf('\r\n')) !== -1) {
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        if (inData) {
+          if (line === '.') { inData = false; socket.write(reject === 'data' ? '554 5.7.1 content rejected\r\n' : '250 2.0.0 queued as ABC123\r\n'); } else session.data += `${line.startsWith('..') ? line.slice(1) : line}\n`;
+          continue;
+        }
+        session.commands.push(line.replace(/^(AUTH PLAIN) .*/, '$1 [redacted]'));
+        const verb = line.split(' ')[0].toUpperCase();
+        if (verb === 'EHLO') socket.write('250-relay.test\r\n250-AUTH PLAIN LOGIN\r\n250 8BITMIME\r\n');
+        else if (verb === 'AUTH') { session.auth = Buffer.from(line.split(' ')[2], 'base64').toString('utf8').split('\0'); socket.write(session.auth[2] === 'secret-pass' ? '235 2.7.0 ok\r\n' : '535 5.7.8 bad credentials\r\n'); }
+        else if (verb === 'MAIL') socket.write('250 2.1.0 ok\r\n');
+        else if (verb === 'RCPT') socket.write(reject === 'rcpt' ? '550 5.1.1 no such user\r\n' : '250 2.1.5 ok\r\n');
+        else if (verb === 'DATA') { inData = true; socket.write('354 go ahead\r\n'); }
+        else if (verb === 'QUIT') { socket.write('221 bye\r\n'); socket.end(); } else socket.write('500 what\r\n');
+      }
+    });
+  });
+  return {
+    sessions,
+    setReject: (r) => { reject = r; },
+    listen: () => new Promise((res) => server.listen(0, '127.0.0.1', () => res(server.address().port))),
+    close: () => new Promise((res) => server.close(res)),
+  };
+}
+
+function fakeWebhook() {
+  const received = [];
+  let status = 200;
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => { received.push({ url: req.url, headers: req.headers, body: body ? JSON.parse(body) : null, raw: body }); res.writeHead(status, { 'Content-Type': 'application/json' }); res.end('{"ok":true}'); });
+  });
+  return {
+    received,
+    setStatus: (s) => { status = s; },
+    listen: () => new Promise((res) => server.listen(0, '127.0.0.1', () => res(server.address().port))),
+    close: () => new Promise((res) => server.close(res)),
+  };
+}
+
+describe('server contacts helpers', () => {
+  it('normalizes the object and shorthand notify() forms', () => {
+    expect(normalizeNotification({ event: 'backup.failed', subject: 'Run 7 failed', body: 'x' })).toMatchObject({ event: 'backup.failed', severity: 'error', subject: 'Run 7 failed', body: 'x' });
+    expect(normalizeNotification({ event: 'service.down', severity: 'critical', subject: 'a\r\nb' })).toMatchObject({ severity: 'critical', subject: 'a b' });
+    const short = normalizeNotification('updates.available', { packages: 3, security: 1 });
+    expect(short).toMatchObject({ event: 'updates.available', severity: 'info', subject: 'Software updates available' });
+    expect(JSON.parse(short.body)).toEqual({ packages: 3, security: 1 });
+    expect(normalizeNotification('custom.thing', 'plain text')).toMatchObject({ event: 'custom.thing', severity: 'info', subject: 'custom.thing', body: 'plain text' });
+    expect(normalizeNotification({ event: 'login.new_ip', severity: 'nonsense' }).severity).toBe('warning');
+  });
+
+  it('validates addresses per channel', () => {
+    expect(validateAddress('email', 'ops@example.com')).toBeNull();
+    expect(validateAddress('email', '-r@example.com')).not.toBeNull();
+    expect(validateAddress('slack', 'https://hooks.slack.com/services/T000/B000/XXXXXXXX')).toBeNull();
+    expect(validateAddress('slack', 'https://evil.example.com/services/T000/B000/XXXXXXXX')).not.toBeNull();
+    expect(validateAddress('pushover', 'u'.repeat(30))).toBeNull();
+    expect(validateAddress('pushover', 'short')).not.toBeNull();
+    expect(validateAddress('webhook', 'https://example.com/hook?x=1')).toBeNull();
+    expect(validateAddress('webhook', 'ftp://example.com/hook')).not.toBeNull();
+    expect(validateAddress('webhook', 'https://user:pw@example.com/hook')).not.toBeNull();
+    expect(validateAddress('sms', '5551234567@txt.example.net')).toBeNull();
+  });
+
+  it('builds RFC 5322 messages with CRLF, dot-stuffing and encoded subjects', () => {
+    const msg = buildMessage({ from: 'whm@host.example.com', to: ['a@example.com'], subject: 'Disk 95% – full', text: 'line1\n.hidden\nline3', headers: { 'X-Priority': '1', Subject: 'ignored', 'Bad Header': 'x' } });
+    expect(msg).toMatch(/^From: whm@host\.example\.com\r\nTo: a@example\.com\r\nSubject: =\?UTF-8\?B\?/);
+    expect(msg).toContain('X-Priority: 1\r\n');
+    expect(msg).not.toContain('ignored');
+    expect(msg).not.toContain('Bad Header');
+    expect(msg.endsWith('\r\nline1\r\n.hidden\r\nline3\r\n')).toBe(true);
+    expect(dotStuff('a\n.b\n..c\n')).toBe('a\r\n..b\r\n...c\r\n');
+  });
+
+  it('rejects unusable addresses before opening a connection', async () => {
+    await expect(sendSmtp({ host: '127.0.0.1', port: 1, from: '-r@example.com', to: ['a@example.com'], message: 'x' })).rejects.toMatchObject({ code: 'invalid_address' });
+    await expect(sendSmtp({ host: '127.0.0.1', port: 1, from: 'a@example.com', to: ['b@example.com'], message: 'x', security: 'weird' })).rejects.toMatchObject({ code: 'invalid_args' });
+  });
+});
+
+describe('Server Contacts API', () => {
+  let app;
+  let csrf;
+  let reseller;
+  let resellerCsrf;
+  let smtp;
+  let smtpPort;
+  let hook;
+  let hookPort;
+  let eximInstalled = false;
+  let units = [];
+  let unitState = {};
+  let disks = [];
+  let sentViaExim = [];
+  let aliases = { root: [], entries: [], exists: true };
+  let aliasWrites = [];
+
+  const post = (url, body = {}) => app.http.post(url).set('X-CSRF-Token', csrf).send(body);
+  const put = (url, body) => app.http.put(url).set('X-CSRF-Token', csrf).send(body);
+  const patch = (url, body) => app.http.patch(url).set('X-CSRF-Token', csrf).send(body);
+  const del = (url) => app.http.delete(url).set('X-CSRF-Token', csrf);
+  const get = (url) => app.http.get(url);
+  const auditRows = (action) => app.ctx.db.prepare('SELECT * FROM audit_log WHERE action = ? ORDER BY id').all(action);
+  const clearContacts = () => { app.ctx.db.prepare('DELETE FROM contacts').run(); app.ctx.db.prepare('DELETE FROM contact_deliveries').run(); app.ctx.db.prepare('DELETE FROM contact_alert_state').run(); };
+
+  beforeAll(async () => {
+    smtp = fakeSmtp();
+    smtpPort = await smtp.listen();
+    hook = fakeWebhook();
+    hookPort = await hook.listen();
+    const agent = createMockAgent({
+      'sys.binaries': ({ names }) => Object.fromEntries(names.map((n) => [n, eximInstalled && ['exim4', 'exim'].includes(n)])),
+      'svc.list_units': () => units,
+      'svc.status': ({ unit }) => ({ unit, installed: true, active: unitState[unit] !== 'inactive', state: unitState[unit] || 'active', subState: unitState[unit] === 'inactive' ? 'dead' : 'running', enabled: true, pid: 100, memoryBytes: 1024, restarts: 0 }),
+      'sys.disk.usage': () => disks,
+      'mail.sendmail': (args) => { sentViaExim.push(args); return { from: args.from, to: args.to, accepted: true, bytes: 100 }; },
+      'contacts.aliases.read': () => ({ path: '/etc/aliases', exists: aliases.exists, root: aliases.root, managed: false, entries: aliases.entries, raw: '', rebuildTool: 'exim' }),
+      'contacts.aliases.set_root': ({ targets }) => { aliasWrites.push(targets); aliases.root = targets; return { path: '/etc/aliases', root: targets, rebuild: { tool: 'newaliases', ran: true, ok: true, output: '' } }; },
+    });
+    app = await createTestApp({ agent });
+    csrf = await app.login();
+    const r = await app.createUser('resell1', 'reseller');
+    reseller = request.agent(app.ctx.app);
+    resellerCsrf = (await reseller.post('/api/auth/login').send({ username: r.username, password: r.password })).body.data.csrfToken;
+    app.ctx.settings.set('basic.hostname', 'panel.example.com');
+  }, 30_000);
+
+  afterAll(async () => { await app?.close(); await smtp?.close(); await hook?.close(); });
+
+  beforeEach(async () => {
+    eximInstalled = false;
+    units = [];
+    unitState = {};
+    disks = [{ filesystem: '/dev/sda1', sizeBytes: 100e9, usedBytes: 20e9, availableBytes: 80e9, usedPercent: 20, mountpoint: '/' }];
+    sentViaExim = [];
+    aliasWrites = [];
+    aliases = { root: ['ops@example.com'], entries: [{ name: 'postmaster', targets: ['root'] }, { name: 'root', targets: ['ops@example.com'] }], exists: true };
+    smtp.setReject(null);
+    smtp.sessions.length = 0;
+    hook.received.length = 0;
+    hook.setStatus(200);
+    await app.ctx.capabilities.refresh();
+    clearContacts();
+    app.ctx.settings.setMany({ 'contacts.enabled': true, 'contacts.smtp.host': '', 'contacts.smtp.prefer': false, 'contacts.smtp.username': '', 'contacts.smtp.password_enc': '', 'contacts.from_address': '', 'contacts.check.enabled': true, 'contacts.root_mail_events': ['service.down', 'disk.space.low', 'backup.failed'] });
+  });
+
+  it('registers the module: ctx.contacts, job type, schedule and the integration surface', () => {
+    expect(typeof app.ctx.contacts.notify).toBe('function');
+    expect(typeof app.ctx.contacts.mail).toBe('function');
+    expect(app.ctx.contacts.sendMail).toBeUndefined();
+    expect(app.ctx.jobs.types()).toContain('server-contacts.check');
+    expect(app.ctx.scheduler.list().find((s) => s.name === 'server-contacts-check')).toMatchObject({ cron: '*/10 * * * *', job_type: 'server-contacts.check', enabled: 1 });
+  });
+
+  it('GET / returns the catalog, settings, capability and an empty contact list', async () => {
+    const { data } = (await get('/api/server-contacts').expect(200)).body;
+    expect(data.contacts).toEqual([]);
+    expect(data.events.map((e) => e.key)).toEqual(EVENTS.map((e) => e.key));
+    expect(data.events.map((e) => e.key)).toEqual(expect.arrayContaining(['account.created', 'account.suspended', 'backup.failed', 'service.down', 'disk.space.low', 'login.failed.blocked', 'ssl.expiring', 'license.expiring', 'license.invalid']));
+    expect(data.channels).toEqual(['email', 'sms', 'slack', 'pushover', 'webhook']);
+    expect(data.capability).toMatchObject({ exim: false, smtp: false, mailTransport: null, hostname: 'panel.example.com' });
+    expect(data.settings).toMatchObject({ enabled: true, effectiveFrom: 'whm@panel.example.com', smtp: { host: '', port: 587, security: 'starttls', password: { set: false } }, check: { enabled: true, diskThresholdPercent: 90, cooldownMinutes: 360 } });
+    expect(data.schedule).toMatchObject({ name: 'server-contacts-check', enabled: true });
+    expect(data.stats).toEqual({ total: 0, last24h: 0, failed: 0 });
+  });
+
+  it('creates, reads, updates and removes contacts with per-channel validation', async () => {
+    const created = await post('/api/server-contacts/contacts', { name: 'Ops', channel: 'email', address: 'ops@example.com', events: ['service.down', 'disk.space.low'], minSeverity: 'warning' }).expect(201);
+    expect(created.body.data).toMatchObject({ name: 'Ops', channel: 'email', address: 'ops@example.com', events: ['service.down', 'disk.space.low'], allEvents: false, minSeverity: 'warning', enabled: true, lastSentAt: null });
+    const id = created.body.data.id;
+    expect((await get(`/api/server-contacts/contacts/${id}`).expect(200)).body.data.id).toBe(id);
+    const all = await post('/api/server-contacts/contacts', { channel: 'webhook', address: `http://127.0.0.1:${hookPort}/hook`, config: { secret: 'shh' } }).expect(201);
+    expect(all.body.data).toMatchObject({ name: `http://127.0.0.1:${hookPort}/hook`, events: ['*'], allEvents: true, minSeverity: 'info', config: { secret: { set: true } } });
+    expect(app.ctx.db.prepare('SELECT config_json FROM contacts WHERE id = ?').get(all.body.data.id).config_json).toMatch(/"secret_enc":"v1:/);
+
+    await post('/api/server-contacts/contacts', { channel: 'slack', address: 'https://example.com/not-slack' }).expect(422);
+    await post('/api/server-contacts/contacts', { channel: 'pushover', address: 'u'.repeat(30) }).expect(422);
+    const po = await post('/api/server-contacts/contacts', { name: 'Phone', channel: 'pushover', address: 'u'.repeat(30), config: { token: 'a'.repeat(30) } }).expect(201);
+    expect(po.body.data.config).toEqual({ token: { set: true } });
+    await post('/api/server-contacts/contacts', { channel: 'webhook', address: 'https://user:pw@example.com/x' }).expect(422);
+    await post('/api/server-contacts/contacts', { channel: 'email', address: '-r@example.com' }).expect(422);
+
+    const updated = await patch(`/api/server-contacts/contacts/${id}`, { events: [], minSeverity: 'info', enabled: false, name: 'Ops team' }).expect(200);
+    expect(updated.body.data).toMatchObject({ name: 'Ops team', events: ['*'], minSeverity: 'info', enabled: false });
+    await patch(`/api/server-contacts/contacts/${id}`, { address: 'nope' }).expect(422);
+    await patch(`/api/server-contacts/contacts/${po.body.data.id}`, { config: { token: null } }).expect(422);
+    expect((await patch(`/api/server-contacts/contacts/${po.body.data.id}`, { config: { token: 'b'.repeat(30) } }).expect(200)).body.data.config.token.set).toBe(true);
+    expect((await del(`/api/server-contacts/contacts/${id}`).expect(200)).body.data).toMatchObject({ removed: true, id });
+    await del(`/api/server-contacts/contacts/${id}`).expect(404);
+    await get(`/api/server-contacts/contacts/${id}`).expect(404);
+    expect(auditRows('contacts.create')).toHaveLength(3);
+    expect(auditRows('contacts.remove')).toHaveLength(1);
+  });
+
+  it('delivers notifications to matching contacts (webhook signed, email failing without a transport) and logs every attempt', async () => {
+    await post('/api/server-contacts/contacts', { name: 'Hook', channel: 'webhook', address: `http://127.0.0.1:${hookPort}/whm`, config: { secret: 'topsecret' } }).expect(201);
+    await post('/api/server-contacts/contacts', { name: 'Ops', channel: 'email', address: 'ops@example.com', events: ['backup.failed'] }).expect(201);
+    await post('/api/server-contacts/contacts', { name: 'Only errors', channel: 'webhook', address: `http://127.0.0.1:${hookPort}/errors`, minSeverity: 'error' }).expect(201);
+    await post('/api/server-contacts/contacts', { name: 'Off', channel: 'webhook', address: `http://127.0.0.1:${hookPort}/off`, enabled: false }).expect(201);
+
+    const res = await post('/api/server-contacts/notify', { event: 'account.created', subject: 'Account alice created', body: 'alice.com' }).expect(200);
+    expect(res.body.data).toMatchObject({ event: 'account.created', severity: 'info', matched: 1, sent: 1, failed: 0 });
+    expect(hook.received).toHaveLength(1);
+    expect(hook.received[0].url).toBe('/whm');
+    expect(hook.received[0].body).toMatchObject({ event: 'account.created', severity: 'info', subject: 'Account alice created', body: 'alice.com', hostname: 'panel.example.com', test: false });
+    expect(hook.received[0].headers['x-whm-event']).toBe('account.created');
+    expect(hook.received[0].headers['x-whm-signature']).toBe(`sha256=${crypto.createHmac('sha256', 'topsecret').update(hook.received[0].raw).digest('hex')}`);
+
+    const r2 = await app.ctx.contacts.notify({ event: 'backup.failed', subject: 'Backup run 9 failed', body: 'disk full', severity: 'error' });
+    expect(r2).toMatchObject({ matched: 3, sent: 2, failed: 1 });
+    expect(hook.received.map((h) => h.url).sort()).toEqual(['/errors', '/whm', '/whm']);
+    const email = r2.deliveries.find((d) => d.channel === 'email' && d.contactId);
+    expect(email).toMatchObject({ status: 'failed', code: 'capability_missing' });
+    expect(email.error).toMatch(/Exim is not installed/);
+    const root = r2.deliveries.find((d) => d.contactId === null);
+    expect(root).toBeUndefined();
+
+    const log = await get('/api/server-contacts/deliveries').expect(200);
+    expect(log.body.meta.total).toBe(4);
+    expect(log.body.data[0]).toMatchObject({ event: 'backup.failed' });
+    expect((await get('/api/server-contacts/deliveries?status=failed').expect(200)).body.data.map((d) => d.channel)).toEqual(['email']);
+    expect((await get('/api/server-contacts/deliveries?event=account.created&q=alice').expect(200)).body.meta.total).toBe(1);
+    const overview = (await get('/api/server-contacts').expect(200)).body.data;
+    expect(overview.stats).toEqual({ total: 4, last24h: 4, failed: 1 });
+    expect(overview.contacts.find((c) => c.name === 'Ops').lastError).toMatch(/Exim/);
+    expect(overview.contacts.find((c) => c.name === 'Hook').lastSentAt).toBeTruthy();
+
+    hook.setStatus(500);
+    const r3 = await app.ctx.contacts.notify('updates.available', { packages: 4 });
+    expect(r3).toMatchObject({ event: 'updates.available', matched: 1, sent: 0, failed: 1 });
+    expect(r3.deliveries[0].error).toMatch(/answered 500/);
+
+    app.ctx.settings.set('contacts.enabled', false);
+    expect(await app.ctx.contacts.notify({ event: 'account.created', subject: 'x' })).toMatchObject({ skipped: 'disabled', sent: 0 });
+  });
+
+  it('sends mail through the SMTP relay when Exim is absent, and mails root for selected events', async () => {
+    await put('/api/server-contacts/settings', { smtp: { host: '127.0.0.1', port: smtpPort, security: 'none', username: 'relay-user', password: 'secret-pass' }, fromAddress: 'alerts@panel.example.com' }).expect(200);
+    const settings = (await get('/api/server-contacts/settings').expect(200)).body.data;
+    expect(settings.smtp).toMatchObject({ host: '127.0.0.1', port: smtpPort, security: 'none', username: 'relay-user', password: { set: true } });
+    expect(app.ctx.settings.get('contacts.smtp.password_enc')).toMatch(/^v1:/);
+    expect((await get('/api/server-contacts').expect(200)).body.data.capability).toMatchObject({ exim: false, smtp: true, mailTransport: 'smtp' });
+    expect(typeof app.ctx.contacts.sendMail).toBe('function');
+
+    const c = await post('/api/server-contacts/contacts', { name: 'Ops', channel: 'email', address: 'ops@example.com' }).expect(201);
+    const test = await post(`/api/server-contacts/contacts/${c.body.data.id}/test`).expect(200);
+    expect(test.body.data).toMatchObject({ status: 'sent', transport: 'smtp', channel: 'email' });
+    expect(smtp.sessions).toHaveLength(1);
+    const session = smtp.sessions[0];
+    expect(session.commands.slice(0, 2)).toEqual(['EHLO panel.example.com', 'AUTH PLAIN [redacted]']);
+    expect(session.auth).toEqual(['', 'relay-user', 'secret-pass']);
+    expect(session.commands).toContain('MAIL FROM:<alerts@panel.example.com>');
+    expect(session.commands).toContain('RCPT TO:<ops@example.com>');
+    expect(session.data).toMatch(/^From: alerts@panel\.example\.com\n/);
+    expect(session.data).toContain('Subject: [panel.example.com] Test notification from WHM on panel.example.com');
+    expect(session.data).toContain('This is a test message for the email contact "Ops"');
+    expect(auditRows('contacts.test').at(-1).target).toBe('ops@example.com');
+
+    const direct = await post('/api/server-contacts/settings/test-mail', { to: 'someone@example.org' }).expect(200);
+    expect(direct.body.data).toMatchObject({ transport: 'smtp', to: ['someone@example.org'], accepted: true });
+    expect(smtp.sessions[1].commands).toContain('RCPT TO:<someone@example.org>');
+
+    const r = await app.ctx.contacts.notify({ event: 'service.down', subject: 'Exim is down', body: 'dead', severity: 'error' });
+    expect(r).toMatchObject({ matched: 1, sent: 2, failed: 0 });
+    expect(r.deliveries.find((d) => d.contactId === null)).toMatchObject({ address: 'root@panel.example.com', status: 'sent', transport: 'smtp' });
+    expect(smtp.sessions.at(-1).commands).toContain('RCPT TO:<root@panel.example.com>');
+
+    smtp.setReject('rcpt');
+    const failed = await post('/api/server-contacts/settings/test-mail', { to: 'nobody@example.org' }).expect(502);
+    expect(failed.body.error.code).toBe('smtp_failed');
+    expect(failed.body.error.message).toMatch(/RCPT failed: 550/);
+    smtp.setReject(null);
+    await put('/api/server-contacts/settings', { smtp: { password: 'wrong' } }).expect(200);
+    expect((await post(`/api/server-contacts/contacts/${c.body.data.id}/test`).expect(502)).body.error.message).toMatch(/AUTH failed: 535/);
+    await put('/api/server-contacts/settings', { smtp: { host: '127.0.0.1', port: 1, security: 'none' } }).expect(200);
+    expect((await post('/api/server-contacts/settings/test-mail', { to: 'x@example.org' }).expect(502)).body.error.message).toMatch(/SMTP relay 127\.0\.0\.1:1/);
+  });
+
+  it('hands mail to Exim when it is installed, and prefers the relay only when asked', async () => {
+    eximInstalled = true;
+    await app.ctx.capabilities.refresh();
+    expect(typeof app.ctx.contacts.sendMail).toBe('function');
+    app.ctx.settings.set('basic.hostname', 'bare-host');
+    await expect(app.ctx.contacts.sendMail({ to: 'a@example.com', subject: 'Hi', body: 'x' })).resolves.toMatchObject({ from: 'whm@bare-host.localdomain' });
+    app.ctx.settings.set('basic.hostname', 'panel.example.com');
+    sentViaExim = [];
+    const r = await app.ctx.contacts.sendMail({ to: 'a@example.com', subject: 'Hello', body: 'line1\nline2' });
+    expect(r).toMatchObject({ transport: 'exim', from: 'whm@panel.example.com', to: ['a@example.com'], accepted: true });
+    expect(sentViaExim).toEqual([{ from: 'whm@panel.example.com', to: ['a@example.com'], subject: 'Hello', text: 'line1\nline2' }]);
+    expect(auditRows('contacts.mail.send').at(-1)).toMatchObject({ target: 'a@example.com' });
+    await expect(app.ctx.contacts.sendMail({ to: '-bounce@example.com', subject: 'x', body: 'y' })).rejects.toMatchObject({ status: 422 });
+    await expect(app.ctx.contacts.sendMail({ to: 'a@example.com', subject: 'x', body: 'y', from: '-f@example.com' })).resolves.toMatchObject({ from: 'whm@panel.example.com' });
+
+    await put('/api/server-contacts/settings', { smtp: { host: '127.0.0.1', port: smtpPort, security: 'none', prefer: true } }).expect(200);
+    expect((await get('/api/server-contacts').expect(200)).body.data.capability.mailTransport).toBe('smtp');
+    const r2 = await app.ctx.contacts.sendMail({ to: 'b@example.com', subject: 'Relay', body: 'z' });
+    expect(r2.transport).toBe('smtp');
+    expect(sentViaExim).toHaveLength(2);
+    await put('/api/server-contacts/settings', { smtp: { prefer: false } }).expect(200);
+    expect((await get('/api/server-contacts').expect(200)).body.data.capability.mailTransport).toBe('exim');
+  });
+
+  it('degrades to 501 capability_missing without Exim or a relay', async () => {
+    const c = await post('/api/server-contacts/contacts', { name: 'Ops', channel: 'email', address: 'ops@example.com' }).expect(201);
+    const res = await post(`/api/server-contacts/contacts/${c.body.data.id}/test`).expect(501);
+    expect(res.body.error.code).toBe('capability_missing');
+    expect(res.body.error.message).toMatch(/Exim is not installed and no SMTP relay/);
+    expect((await post('/api/server-contacts/settings/test-mail', { to: 'a@example.com' }).expect(501)).body.error.code).toBe('capability_missing');
+    expect(app.ctx.contacts.sendMail).toBeUndefined();
+    await expect(app.ctx.contacts.mail({ to: 'a@example.com', subject: 'x', body: 'y' })).rejects.toMatchObject({ status: 501, code: 'capability_missing' });
+    expect((await get('/api/server-contacts/deliveries?status=failed').expect(200)).body.data[0]).toMatchObject({ channel: 'email', test: 1 });
+    const sms = await post('/api/server-contacts/contacts', { name: 'Pager', channel: 'sms', address: '5551234567@txt.example.net' }).expect(201);
+    expect((await post(`/api/server-contacts/contacts/${sms.body.data.id}/test`)).status).toBe(501);
+  });
+
+  it('runs the scheduled checks: service down once, restored once, disk low with cooldown', async () => {
+    units = ['exim4', 'apache2', 'ssh'];
+    unitState = { exim4: 'inactive' };
+    await app.ctx.capabilities.refresh();
+    await post('/api/server-contacts/contacts', { name: 'Hook', channel: 'webhook', address: `http://127.0.0.1:${hookPort}/check` }).expect(201);
+
+    let res = await post('/api/server-contacts/check').expect(200);
+    expect(res.body.data.services).toMatchObject({ down: ['exim'], restored: [] });
+    expect(res.body.data.services.checked).toBeGreaterThanOrEqual(3);
+    expect(res.body.data.disks).toMatchObject({ checked: 1, low: [] });
+    expect(res.body.data.notifications).toEqual([{ event: 'service.down', subject: 'Mail Server (Exim) is down on panel.example.com', sent: 1, failed: 0 }]);
+    expect(hook.received[0].body).toMatchObject({ event: 'service.down', severity: 'error' });
+    expect(hook.received[0].body.body).toMatch(/unit exim4.*inactive\/dead/);
+    expect(app.ctx.db.prepare('SELECT * FROM contact_alert_state').all()).toEqual([expect.objectContaining({ key: 'service:exim', state: 'down' })]);
+
+    res = await post('/api/server-contacts/check').expect(200);
+    expect(res.body.data.services.down).toEqual(['exim']);
+    expect(res.body.data.notifications).toEqual([]);
+    expect(hook.received).toHaveLength(1);
+
+    unitState = {};
+    disks = [{ filesystem: '/dev/sda1', sizeBytes: 100e9, usedBytes: 95e9, availableBytes: 5e9, usedPercent: 95, mountpoint: '/' }, { filesystem: '/dev/sdb1', sizeBytes: 100e9, usedBytes: 10e9, availableBytes: 90e9, usedPercent: 10, mountpoint: '/home' }];
+    res = await post('/api/server-contacts/check').expect(200);
+    expect(res.body.data.services).toMatchObject({ down: [], restored: ['exim'] });
+    expect(res.body.data.disks.low).toEqual([{ mountpoint: '/', usedPercent: 95 }]);
+    expect(res.body.data.notifications.map((n) => n.event)).toEqual(['service.restored', 'disk.space.low']);
+    expect(hook.received.at(-1).body).toMatchObject({ event: 'disk.space.low', severity: 'warning', subject: '/ is 95% full on panel.example.com' });
+    expect(app.ctx.db.prepare('SELECT key FROM contact_alert_state').all()).toEqual([{ key: 'disk:/' }]);
+
+    res = await post('/api/server-contacts/check').expect(200);
+    expect(res.body.data.notifications).toEqual([]);
+    app.ctx.db.prepare("UPDATE contact_alert_state SET last_notified_at = datetime('now', '-7 hours')").run();
+    res = await post('/api/server-contacts/check').expect(200);
+    expect(res.body.data.notifications.map((n) => n.event)).toEqual(['disk.space.low']);
+    disks[0].usedPercent = 50;
+    await post('/api/server-contacts/check').expect(200);
+    expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM contact_alert_state').get().n).toBe(0);
+    const cfg = (await get('/api/server-contacts/settings').expect(200)).body.data.check;
+    expect(cfg.lastRunAt).toBeTruthy();
+    expect(cfg.lastResult).toMatchObject({ disks: { low: [] } });
+  });
+
+  it('notifies about installed certificates that are about to expire', async () => {
+    await post('/api/server-contacts/contacts', { name: 'Hook', channel: 'webhook', address: `http://127.0.0.1:${hookPort}/ssl` }).expect(201);
+    app.ctx.db.prepare("INSERT INTO ssl_certs (domain, installed, not_after) VALUES ('soon.example.com', 1, datetime('now', '+5 days')), ('later.example.com', 1, datetime('now', '+60 days')), ('old.example.com', 0, datetime('now', '+1 day'))").run();
+    try {
+      const res = await post('/api/server-contacts/check').expect(200);
+      expect(res.body.data.ssl.expiring.map((c) => c.domain)).toEqual(['soon.example.com']);
+      expect(res.body.data.ssl.expiring[0].daysRemaining).toBeGreaterThanOrEqual(4);
+      expect(res.body.data.notifications).toEqual([expect.objectContaining({ event: 'ssl.expiring', sent: 1 })]);
+      expect(hook.received[0].body.subject).toMatch(/soon\.example\.com expires in [45] day/);
+      expect((await post('/api/server-contacts/check').expect(200)).body.data.notifications).toEqual([]);
+    } finally {
+      app.ctx.db.prepare("DELETE FROM ssl_certs WHERE domain LIKE '%.example.com'").run();
+    }
+  });
+
+  it('runs the check through the job queue and skips it while disabled', async () => {
+    app.ctx.jobs.start();
+    try {
+      let job = await waitForJob(app.ctx, app.ctx.jobs.enqueue('server-contacts.check').id);
+      expect(job.status).toBe('done');
+      expect(job.result).toMatchObject({ disks: { checked: 1 }, notifications: 0 });
+      await put('/api/server-contacts/settings', { check: { enabled: false } }).expect(200);
+      expect(app.ctx.scheduler.list().find((s) => s.name === 'server-contacts-check').enabled).toBe(0);
+      job = await waitForJob(app.ctx, app.ctx.jobs.enqueue('server-contacts.check').id);
+      expect(job.result).toEqual({ skipped: 'disabled' });
+      await put('/api/server-contacts/settings', { check: { enabled: true, diskThresholdPercent: 80 } }).expect(200);
+      expect(app.ctx.scheduler.list().find((s) => s.name === 'server-contacts-check').enabled).toBe(1);
+      expect((await get('/api/server-contacts/settings').expect(200)).body.data.check.diskThresholdPercent).toBe(80);
+      await put('/api/server-contacts/settings', { check: { diskThresholdPercent: 90 } }).expect(200);
+    } finally { app.ctx.jobs.stop(); }
+  });
+
+  it('reads and writes the system mail preferences through /etc/aliases', async () => {
+    let res = await get('/api/server-contacts/mail-preferences').expect(200);
+    expect(res.body.data).toMatchObject({ hostname: 'panel.example.com', rootAddress: 'root@panel.example.com', forwardTo: ['ops@example.com'], aliases: { path: '/etc/aliases', exists: true, rebuildTool: 'exim' }, aliasError: null, rootMailEvents: ['service.down', 'disk.space.low', 'backup.failed'] });
+    expect(res.body.data.events.map((e) => e.key)).not.toContain('test');
+
+    res = await put('/api/server-contacts/mail-preferences', { forwardTo: ['admin@example.net', 'oncall', 'admin@example.net'], rootMailEvents: ['backup.failed', 'login.failed.blocked'] }).expect(200);
+    expect(aliasWrites).toEqual([['admin@example.net', 'oncall']]);
+    expect(res.body.data).toMatchObject({ forwardTo: ['admin@example.net', 'oncall'], rootMailEvents: ['backup.failed', 'login.failed.blocked'], rebuild: { tool: 'newaliases', ok: true } });
+    expect(app.ctx.settings.get('contacts.root_forward')).toEqual(['admin@example.net', 'oncall']);
+    expect(auditRows('contacts.mail_preferences').at(-1).target).toBe('root');
+
+    res = await put('/api/server-contacts/mail-preferences', { forwardTo: [] }).expect(200);
+    expect(aliasWrites.at(-1)).toEqual([]);
+    expect(res.body.data.forwardTo).toEqual([]);
+    expect(res.body.data.rootMailEvents).toEqual(['backup.failed', 'login.failed.blocked']);
+
+    app.ctx.settings.set('contacts.root_forward', ['mirror@example.com']);
+    app.agent.fail('contacts.aliases.read', 'path_not_allowed', 'Path "/etc/aliases" is outside the locations the agent may read');
+    res = await get('/api/server-contacts/mail-preferences').expect(200);
+    expect(res.body.data).toMatchObject({ forwardTo: ['mirror@example.com'], aliases: null, aliasError: { code: 'path_not_allowed' } });
+    app.agent.fail('contacts.aliases.set_root', 'command_failed', 'newaliases rejected the alias file');
+    expect((await put('/api/server-contacts/mail-preferences', { forwardTo: ['x@example.com'] })).status).toBe(500);
+    expect(app.ctx.settings.get('contacts.root_forward')).toEqual(['mirror@example.com']);
+    app.agent.reset('contacts.aliases.read');
+    app.agent.reset('contacts.aliases.set_root');
+  });
+
+  it('rejects invalid input with 422', async () => {
+    await post('/api/server-contacts/contacts', {}).expect(422);
+    await post('/api/server-contacts/contacts', { channel: 'pager', address: 'x' }).expect(422);
+    await post('/api/server-contacts/contacts', { channel: 'email', address: 'a b@example.com' }).expect(422);
+    await post('/api/server-contacts/contacts', { channel: 'email', address: 'a@example.com', events: ['Service.Down'] }).expect(422);
+    await post('/api/server-contacts/contacts', { channel: 'email', address: 'a@example.com', events: ['a;b'] }).expect(422);
+    await post('/api/server-contacts/contacts', { channel: 'email', address: 'a@example.com', minSeverity: 'loud' }).expect(422);
+    await post('/api/server-contacts/contacts', { channel: 'email', address: 'a@example.com', extra: 1 }).expect(422);
+    await post('/api/server-contacts/contacts', { channel: 'pushover', address: 'u'.repeat(30), config: { token: 'has spaces' } }).expect(422);
+    await post('/api/server-contacts/contacts', { channel: 'slack', address: 'https://hooks.slack.com/services/T0/B0/XXXXXXXX', config: { channelName: '#ops;rm' } }).expect(422);
+    await patch('/api/server-contacts/contacts/1', {}).expect(422);
+    await patch('/api/server-contacts/contacts/abc', { enabled: true }).expect(422);
+    await post('/api/server-contacts/contacts/0/test').expect(422);
+    await put('/api/server-contacts/settings', {}).expect(422);
+    await put('/api/server-contacts/settings', { fromAddress: '-bounce@example.com' }).expect(422);
+    await put('/api/server-contacts/settings', { smtp: { host: 'relay;rm -rf' } }).expect(422);
+    await put('/api/server-contacts/settings', { smtp: { host: '../relay' } }).expect(422);
+    await put('/api/server-contacts/settings', { smtp: { port: 70000 } }).expect(422);
+    await put('/api/server-contacts/settings', { smtp: { security: 'ssl3' } }).expect(422);
+    await put('/api/server-contacts/settings', { check: { diskThresholdPercent: 10 } }).expect(422);
+    await put('/api/server-contacts/settings', { check: { cooldownMinutes: 1 } }).expect(422);
+    await put('/api/server-contacts/settings', { retentionDays: 0 }).expect(422);
+    await post('/api/server-contacts/settings/test-mail', { to: 'not-an-address' }).expect(422);
+    await post('/api/server-contacts/settings/test-mail', { to: '-r@example.com' }).expect(422);
+    await post('/api/server-contacts/notify', { event: 'nope', subject: 'x' }).expect(422);
+    await post('/api/server-contacts/notify', { event: 'account.created' }).expect(422);
+    await put('/api/server-contacts/mail-preferences', {}).expect(422);
+    await put('/api/server-contacts/mail-preferences', { forwardTo: ['-r'] }).expect(422);
+    await put('/api/server-contacts/mail-preferences', { forwardTo: ['a;b@example.com'] }).expect(422);
+    await put('/api/server-contacts/mail-preferences', { forwardTo: ['../x'] }).expect(422);
+    await put('/api/server-contacts/mail-preferences', { forwardTo: ['"|/bin/sh"'] }).expect(422);
+    await put('/api/server-contacts/mail-preferences', { rootMailEvents: ['BAD'] }).expect(422);
+    await get('/api/server-contacts/deliveries?status=maybe').expect(422);
+    await get('/api/server-contacts/deliveries?event=x;y').expect(422);
+    expect(aliasWrites).toEqual([]);
+    expect(smtp.sessions).toEqual([]);
+  });
+
+  it('is root-only: resellers get 403 everywhere', async () => {
+    const rget = (url) => reseller.get(url);
+    const rpost = (url, body = {}) => reseller.post(url).set('X-CSRF-Token', resellerCsrf).send(body);
+    for (const url of ['/api/server-contacts', '/api/server-contacts/events', '/api/server-contacts/contacts', '/api/server-contacts/contacts/1', '/api/server-contacts/settings', '/api/server-contacts/deliveries', '/api/server-contacts/mail-preferences']) {
+      expect((await rget(url)).status, url).toBe(403);
+    }
+    expect((await rpost('/api/server-contacts/contacts', { channel: 'email', address: 'a@example.com' })).status).toBe(403);
+    expect((await rpost('/api/server-contacts/contacts/1/test')).status).toBe(403);
+    expect((await rpost('/api/server-contacts/notify', { event: 'account.created', subject: 'x' })).status).toBe(403);
+    expect((await rpost('/api/server-contacts/check')).status).toBe(403);
+    expect((await rpost('/api/server-contacts/settings/test-mail', { to: 'a@example.com' })).status).toBe(403);
+    expect((await reseller.put('/api/server-contacts/settings').set('X-CSRF-Token', resellerCsrf).send({ enabled: false })).status).toBe(403);
+    expect((await reseller.put('/api/server-contacts/mail-preferences').set('X-CSRF-Token', resellerCsrf).send({ forwardTo: [] })).status).toBe(403);
+    expect((await reseller.patch('/api/server-contacts/contacts/1').set('X-CSRF-Token', resellerCsrf).send({ enabled: false })).status).toBe(403);
+    expect((await reseller.delete('/api/server-contacts/contacts/1').set('X-CSRF-Token', resellerCsrf)).status).toBe(403);
+    expect(aliasWrites).toEqual([]);
+  });
+});

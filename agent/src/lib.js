@@ -30,6 +30,9 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/etc/default/locale', '/etc/locale.conf',
   '/var/cache/nginx',
   '/home2', '/home3', '/home4', '/mnt/home', '/srv/home',
+  '/etc/systemd/resolved.conf.d',
+  '/etc/awstats',
+  '/etc/aliases',
 ];
 
 export function createContext({ allowedRoots = DEFAULT_ALLOWED_ROOTS, principal = null, log = () => {} } = {}) {
