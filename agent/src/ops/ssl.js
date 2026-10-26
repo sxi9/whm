@@ -929,7 +929,7 @@ defineOp('ssl.tls_config.apply', {
     }
     const dovecot = dovecotLayout();
     if (removeLegacy.includes('dovecot') && dovecot) {
-      const files = removeManagedFiles([dovecot.legacyIncludes[0]], ctx);
+      const files = removeManagedFiles(dovecot.legacyIncludes, ctx);
       removed.dovecot = { files, removed: files.length > 0, reload: files.length ? await reloadUnit(dovecot.units) : { reloaded: false, unit: null } };
     }
     if (!Object.keys(results).length && !Object.keys(removed).length) throw new OpError('capability_missing', 'None of Apache or Exim is installed, so there is nothing to apply the TLS policy to');

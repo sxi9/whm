@@ -28,6 +28,7 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/etc/vsftpd',
   '/usr/local/whm/hooks',
   '/etc/default/locale', '/etc/locale.conf',
+  '/var/cache/nginx',
 ];
 
 export function createContext({ allowedRoots = DEFAULT_ALLOWED_ROOTS, principal = null, log = () => {} } = {}) {

@@ -166,9 +166,11 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 - **2026-10-26: Phase 2 wave 1 landed** (`79097b1`): Security Center, DNS Functions, Database
   Services, IP Functions, SSL/TLS, Email, Software, Service Configuration, Development, Locales —
   106/109 functions done, 222 new agent ops (267 total), migrations 002–012, 107 pages; suites
-  server 426 / agent 233 / client 5. A **fix round** for the reviewers' open findings and the
-  integration critic's seams is running (one fixer + verifier per category); the contracts it
-  follows are in `docs/design/integration-contracts.md`. Then wave 2.
+  server 426 / agent 233 / client 5. The **fix round** (03:12) closed every reviewer finding
+  and integration seam per `docs/design/integration-contracts.md`; suites now server 479 /
+  agent 260 / client 5. **Wave 2 launched 03:20** (12 categories; same build workflow, args
+  `{wave: 2}`). Core follow-ups done by hand: split-mode socket timeout now 1 h with a per-call
+  override, `/var/cache/nginx` allowed root.
 - **Deploy + tests:** `scripts/install.sh` (prod install, `--upgrade`), `deploy/*.service`
   + config templates, `scripts/whm-cli.js` (status / reset-password / create-admin /
   unlock-ip), `e2e/ui-check.cjs` (Playwright: login → create account → pages; run with

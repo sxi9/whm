@@ -48,7 +48,10 @@ function monolithicClient({ logger }) {
   };
 }
 
-function socketClient({ socketPath, logger, timeoutMs = 600_000 }) {
+// Long operations (database dumps, package upgrades, transfers) run as jobs
+// but still cross the socket in one request, so the default is generous; the
+// agent enforces per-op exec timeouts on its side.
+function socketClient({ socketPath, logger, timeoutMs = 3_600_000 }) {
   let socket = null;
   let buffer = '';
   const pending = new Map();
@@ -86,7 +89,7 @@ function socketClient({ socketPath, logger, timeoutMs = 600_000 }) {
     });
   }
 
-  async function send(op, args, principal) {
+  async function send(op, args, principal, callTimeoutMs = timeoutMs) {
     if (!socket) {
       try { await connect(); } catch (err) {
         throw new AgentError('agent_unavailable', `Cannot reach whm-agentd at ${socketPath}: ${err.message}`);
@@ -94,7 +97,7 @@ function socketClient({ socketPath, logger, timeoutMs = 600_000 }) {
     }
     const id = crypto.randomUUID();
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { pending.delete(id); reject(new AgentError('timeout', `Agent op "${op}" timed out`)); }, timeoutMs);
+      const timer = setTimeout(() => { pending.delete(id); reject(new AgentError('timeout', `Agent op "${op}" timed out`)); }, callTimeoutMs);
       pending.set(id, { resolve, reject, timer });
       socket.write(JSON.stringify({ id, op, args, principal }) + '\n');
     });
@@ -102,10 +105,10 @@ function socketClient({ socketPath, logger, timeoutMs = 600_000 }) {
 
   return {
     mode: 'split',
-    async op(name, args = {}, { req } = {}) {
+    async op(name, args = {}, { req, timeoutMs: callTimeoutMs } = {}) {
       const started = Date.now();
       try {
-        const result = await send(name, args, principalOf(req));
+        const result = await send(name, args, principalOf(req), callTimeoutMs);
         logger.debug({ op: name, ms: Date.now() - started }, 'agent op ok');
         return result;
       } catch (err) {

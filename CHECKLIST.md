@@ -13,7 +13,8 @@
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
 - **Tests:** server 93/93, agent 42/42 passing (`npm test`). Shared API test helper: `server/test/support/app.js`.
 - **Wave 1 landed** (`79097b1`, 2026-10-26 01:50): Security Center, DNS Functions, Database Services, IP Functions, SSL/TLS, Email, Software, Service Configuration, Development, Locales — 106/109 functions done (3 partial, noted inline), 222 new agent ops (267 total), migrations 002–012, 107 new pages; suites server 426 / agent 233 / client 5 green.
-- **In progress:** wave-1 fix round (reviewers' open findings + integration seams, per `docs/design/integration-contracts.md`). Then wave 2.
+- **Wave-1 fix round done** (03:12): all 19 reviewer findings and the 6 integration seams closed per `docs/design/integration-contracts.md`; suites server 479 / agent 260 / client 5 green; final integration check passed.
+- **In progress:** Phase 2 wave 2 — 12 categories (Account Functions completion, Account Information, Multi Account, Resellers, Backup, Transfers, Server Status, System Health, Server Configuration, Networking Setup, Server Contacts, System Reboot), launched 03:20.
 - **Deferred to the end (user decision):** license server, plugin marketplace, plugin host, sample + automated-backup plugins (Phase 5).
 
 ## Timeline (actual + estimated)
@@ -34,14 +35,14 @@ a fix round ~15 min; most categories need one fix round.
 | Convention refactor, deploy (installer, systemd, CLI, README), e2e, screenshots | done | 25 min | 19:09 |
 | **P2 wave 1** — Security Center, DNS, Databases, IP, SSL/TLS, Email, Software, Service Configuration, Development, Locales (10 categories, op families) | done — 106/109 functions, 88 agent runs | 6 h 54 min | 01:41 |
 | Integrate wave 1 (suites 426/233/5 green, build, e2e, screenshots, checklist, push `79097b1`) | done | 20 min | 01:50 |
-| Wave-1 fix round (reviewers' 19 open findings + 6 integration seams; 1 fixer + 1 verifier per category, 8 categories) | running since 01:45 | ~2.5–3 h | ~04:30 |
-| **P2 wave 2** — Account Functions completion (vhost/DNS/mail provisioning), Account Information, Multi Account, Resellers, Backup, Transfers, Server Status, System Health, Server Configuration, Networking, Contacts, Reboot (12) | pending | ~7–8 h | ~12:00 |
-| Integrate wave 2 (+ its fix round) | pending | ~2.5 h | ~14:30 |
-| **P2 wave 3** — Clusters, Themes, Market, cPanel, Support, Plugins (6) | pending | ~3 h | ~17:30 |
-| Integrate wave 3 → **all 212 functions live** | pending | ~1.5 h | ~19:00 |
-| **P5 deferred** — license server (`hub/license`), plugin host + marketplace (`hub/marketplace`, open dev registration with backend verification), `plugins/SDK.md`, sample plugin, automated-backup plugin | pending | ~5 h | ~00:00 (27th) |
-| **P6** — hardening pass, full e2e on a provisioned VM, Security Advisor rules, final docs, performance | pending | ~2.5 h | ~02:30 (27th) |
-| **Total remaining** | | **~24 h wall-clock** | |
+| Wave-1 fix round (reviewers' 19 open findings + 6 integration seams; 1 fixer + 1 verifier per category, 8 categories) | done — 0 open, final integration check pass; suites 479 / 260 / 5 | 1 h 27 min | 03:12 |
+| **P2 wave 2** — Account Functions completion (vhost/DNS/mail provisioning), Account Information, Multi Account, Resellers, Backup, Transfers, Server Status, System Health, Server Configuration, Networking, Contacts, Reboot (12) | running since 03:20 | ~7–8 h | ~11:00 |
+| Integrate wave 2 (+ its fix round) | pending | ~2.5 h | ~13:30 |
+| **P2 wave 3** — Clusters, Themes, Market, cPanel, Support, Plugins (6) | pending | ~3 h | ~16:30 |
+| Integrate wave 3 → **all 212 functions live** | pending | ~1.5 h | ~18:00 |
+| **P5 deferred** — license server (`hub/license`), plugin host + marketplace (`hub/marketplace`, open dev registration with backend verification), `plugins/SDK.md`, sample plugin, automated-backup plugin | pending | ~5 h | ~23:00 |
+| **P6** — hardening pass, full e2e on a provisioned VM, Security Advisor rules, final docs, performance | pending | ~2.5 h | ~01:30 (27th) |
+| **Total remaining** | | **~22 h wall-clock** | |
 
 Faster option: verification can be cut to one reviewer and one fix round per category
 (~30% less time, less thorough). Not applied unless requested.

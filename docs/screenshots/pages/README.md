@@ -1,6 +1,6 @@
 # All pages
 
-Captured 2026-10-25 with `e2e/screenshot-all.cjs` at 1280×800: 212 function pages across 30 categories, plus core pages. Functions without a dedicated screen yet show the phase placeholder.
+Captured 2026-10-26 with `e2e/screenshot-all.cjs` at 1280×800: 212 function pages across 30 categories, plus core pages. Functions without a dedicated screen yet show the phase placeholder.
 
 ## Core
 
