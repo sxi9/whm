@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { validate, z, fields, pagination } from '../../lib/validate.js';
 import { requireRoot, requireReseller } from '../../middleware/rbac.js';
-import { createEmailService } from '../../services/email.js';
+import { createEmailService, MAX_LIST_BYTES } from '../../services/email.js';
 
 const messageId = z.string().regex(/^[A-Za-z0-9]{6}-[A-Za-z0-9]{6,11}-[A-Za-z0-9]{2,4}$/, 'Exim message id');
 const idList = z.object({ ids: z.array(messageId).min(1).max(5000) }).strict();
@@ -10,7 +10,9 @@ const hours = z.coerce.number().min(0).max(24 * 366).optional();
 const countryCode = z.string().regex(/^[a-z]{2}$/i, 'Two-letter ISO country code').transform((v) => v.toLowerCase());
 const singleLine = (max) => z.string().max(max).regex(/^[^\n\r\0]*$/, 'Single line');
 const hostOrCidr = z.string().max(255).regex(/^[A-Za-z0-9.:*/_-]+$/, 'Host name, IP address or CIDR network');
-const relPath = z.string().min(1).max(512).regex(/^(?!.*(^|\/)\.\.(\/|$))[^\0\n\r]+$/, 'Path without ".." segments');
+// Becomes part of a Dovecot location ("maildir:<path>"), where ":" and "="
+// introduce extra location parameters: plain path characters only.
+const relPath = z.string().min(1).max(512).regex(/^(?!.*(^|\/)\.\.(\/|$))[A-Za-z0-9._\/-]+$/, 'Path made of letters, digits, ".", "_", "-" and "/" without ".." segments');
 const mailboxFormat = z.enum(['maildir', 'mbox', 'mdbox', 'sdbox']);
 const windowQuery = pagination.extend({ hours });
 // Addresses reach exim/doveadm argv: an option-shaped local part is refused here too.
@@ -43,7 +45,8 @@ export async function register(ctx) {
   const r = Router();
   const wrap = (fn, status = 200) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(status).json(d?.meta ? d : { data: d })).catch(next);
 
-  r.get('/status', requireReseller, wrap(() => m().status()));
+  // Server-wide detail (layout, queue, filters); every consumer page is root-only.
+  r.get('/status', requireRoot, validate({ query: z.object({ refresh: boolQuery }) }), wrap((req) => m().status({ refresh: req.query.refresh === true })));
 
   // Mail Queue Manager
   r.get('/queue', requireRoot, validate({ query: pagination.extend({ frozen: boolQuery, olderThanMinutes: z.coerce.number().int().min(0).optional() }) }), wrap((req) => m().queue.list(req.query)));
@@ -75,7 +78,7 @@ export async function register(ctx) {
   r.put('/filters/country/:code', requireRoot, validate({ params: z.object({ code: countryCode }), body: z.object({ name: singleLine(64).optional(), action: z.enum(['block', 'allow']).default('block'), enabled: z.boolean().default(true) }).strict() }),
     wrap((req) => m().filters.country.upsert(req.params.code, req.body, req)));
   r.get('/filters/country/:code/cidrs', requireRoot, validate({ params: z.object({ code: countryCode }), query: pagination }), wrap((req) => m().filters.country.cidrs(req.params.code, req.query)));
-  r.post('/filters/country/:code/cidrs', requireRoot, validate({ params: z.object({ code: countryCode }), body: z.object({ text: z.string().min(1).max(16 * 1024 * 1024), replace: z.boolean().default(true) }).strict() }),
+  r.post('/filters/country/:code/cidrs', requireRoot, validate({ params: z.object({ code: countryCode }), body: z.object({ text: z.string().min(1).max(MAX_LIST_BYTES, `Lists over ${Math.round(MAX_LIST_BYTES / 1024)} KB must be fetched with "Download"`), replace: z.boolean().default(true) }).strict() }),
     wrap((req) => m().filters.country.setCidrs(req.params.code, req.body.text, { source: 'upload', replace: req.body.replace }, req)));
   r.post('/filters/country/:code/fetch', requireRoot, validate({ params: z.object({ code: countryCode }) }), wrap((req) => m().filters.country.fetch(req.params.code, req)));
   r.delete('/filters/country/:code', requireRoot, validate({ params: z.object({ code: countryCode }) }), wrap((req) => m().filters.country.remove(req.params.code, req)));

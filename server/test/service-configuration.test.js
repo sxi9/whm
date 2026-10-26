@@ -1,14 +1,18 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { renderEximMain, renderEximRcptAcl, renderEximDataAcl, renderDovecot, phpVersionId, eximSupport, DEFAULTS } from '../src/services/service-configuration.js';
+import { renderEximMain, renderEximRcptAcl, renderEximDataAcl, renderEximTls, renderDovecot, dovecotSupportsCipherSuites, tlsPolicyFrom, eximTlsLibrary, phpVersionId, eximSupport, DEFAULTS } from '../src/services/service-configuration.js';
 
 const FULL_BINS = { apache2ctl: true, 'php-fpm': true, php: true, exim4: true, dovecot: true, doveadm: true, 'pure-ftpd': true, named: true, logrotate: true, openssl: true, systemctl: true };
 const unit = (name, active = true) => ({ unit: name, present: true, active, state: active ? 'active' : 'inactive', subState: active ? 'running' : 'dead', enabled: true, pid: 100, restarts: 0 });
 const APACHE = { flavor: 'debian', root: '/etc/apache2', bin: 'apache2ctl', sitesAvailable: '/etc/apache2/sites-available', globalInclude: '/etc/apache2/conf-available/whm.conf', units: ['apache2'], installed: true, version: 'Apache/2.4.58', mpm: 'event', modules: [{ name: 'status', type: 'shared' }, { name: 'proxy_fcgi', type: 'shared' }], unit: unit('apache2') };
 const PHP = { installed: true, versions: [{ version: '8.1', flavor: 'debian', poolDir: '/etc/php/8.1/fpm/pool.d', bin: 'php-fpm8.1', units: ['php8.1-fpm'] }, { version: '8.3', flavor: 'debian', poolDir: '/etc/php/8.3/fpm/pool.d', bin: 'php-fpm8.3', units: ['php8.3-fpm'] }] };
-// A Debian split-config host where the Email category already owns CHECK_RCPT_LOCAL_ACL_FILE.
-const EXIM_LAYOUT = { installed: true, bin: 'exim4', flavor: 'debian', confDir: '/etc/exim4', whmDir: '/etc/exim4/whm', splitConfig: true, mainConf: null, units: ['exim4'], version: '4.97', unit: unit('exim4'), slots: { main: { path: '/etc/exim4/conf.d/main/001_whm_service_config', hookable: true, exists: false, hooked: true, claimedBy: null, content: null }, acl_rcpt: { path: '/etc/exim4/whm/acl_rcpt_protect.conf', hookable: true, macro: 'CHECK_RCPT_LOCAL_ACL_FILE', exists: false, hooked: false, claimedBy: '/etc/exim4/whm/acl_rcpt.conf', content: null }, acl_data: { path: '/etc/exim4/whm/acl_data_whm.conf', hookable: true, macro: 'CHECK_DATA_LOCAL_ACL_FILE', exists: false, hooked: false, claimedBy: null, content: null } }, hints: ['CHECK_RCPT_LOCAL_ACL_FILE already points at /etc/exim4/whm/acl_rcpt.conf (the Email category\'s ACL), so the RCPT protections in /etc/exim4/whm/acl_rcpt_protect.conf are not loaded: add ".include /etc/exim4/whm/acl_rcpt_protect.conf" inside acl_check_rcpt (before the final accept) in /etc/exim4/conf.d/acl/30_exim4-config_check_rcpt.'] };
+// A Debian split-config host where a stale Email fallback macro still owns CHECK_RCPT_LOCAL_ACL_FILE.
+const EMAIL_ACL = '/etc/exim4/whm/acl-email-filters.conf';
+const CHAIN = '/etc/exim4/whm/acl-rcpt-local.conf';
+const EXIM_LAYOUT = { installed: true, bin: 'exim4', flavor: 'debian', confDir: '/etc/exim4', whmDir: '/etc/exim4/whm', splitConfig: true, mainConf: null, macroFile: '/etc/exim4/exim4.conf.localmacros', rcptAclSource: '/etc/exim4/conf.d/acl/30_exim4-config_check_rcpt', emailAclFile: EMAIL_ACL, sentinel: 'WHM_SERVICE_CONFIG', units: ['exim4'], version: '4.97', features: ['crypteq', 'GnuTLS', 'DKIM', 'SPF'], support: { spf: true, dkim: true, dmarc: false, tls: 'gnutls' }, unit: unit('exim4'), slots: { main: { path: '/etc/exim4/conf.d/main/001_whm_service_config', hookable: true, block: null, exists: false, hooked: true, claimedBy: null, content: null }, acl_rcpt: { path: CHAIN, hookable: true, macro: 'CHECK_RCPT_LOCAL_ACL_FILE', includes: EMAIL_ACL, exists: false, hooked: false, claimedBy: '/etc/exim4/whm/acl_rcpt.conf', includesEmailFilters: false, content: null }, acl_data: { path: '/etc/exim4/whm/acl_data_whm.conf', hookable: true, macro: 'CHECK_DATA_LOCAL_ACL_FILE', exists: false, hooked: false, claimedBy: null, content: null } }, hints: [`CHECK_RCPT_LOCAL_ACL_FILE already points at /etc/exim4/whm/acl_rcpt.conf, so the RCPT ACL chain in ${CHAIN} (the panel's protections plus the Email filters) is not loaded. Save "Filter Incoming Emails by Country" (Email) once so it hands the hook over to this chain, or remove that definition from /etc/exim4/exim4.conf.localmacros; alternatively add ".include ${CHAIN}" inside acl_check_rcpt (before the final accept) in /etc/exim4/conf.d/acl/30_exim4-config_check_rcpt.`] };
+// The Debian default: unsplit, main options as a managed block in localmacros.
+const EXIM_UNSPLIT = { ...EXIM_LAYOUT, splitConfig: false, mainConf: '/etc/exim4/exim4.conf.template', rcptAclSource: '/etc/exim4/exim4.conf.template', slots: { ...EXIM_LAYOUT.slots, main: { ...EXIM_LAYOUT.slots.main, path: '/etc/exim4/exim4.conf.localmacros', block: '# BEGIN WHM panel (Service Configuration: Exim main options) - managed block, edits inside are overwritten' } } };
 const ftpCandidates = (active = 'pure-ftpd') => [
   { name: 'pure-ftpd', label: 'Pure-FTPd', binaries: ['pure-ftpd'], units: ['pure-ftpd'], packages: { apt: 'pure-ftpd', dnf: 'pure-ftpd' }, installed: true, unitName: 'pure-ftpd', unit: unit('pure-ftpd', active === 'pure-ftpd') },
   { name: 'proftpd', label: 'ProFTPD', binaries: ['proftpd'], units: ['proftpd'], packages: { apt: 'proftpd-core', dnf: 'proftpd' }, installed: false, unitName: null, unit: { unit: null, present: false, active: false } },
@@ -67,13 +71,13 @@ beforeAll(async () => {
     'web.dovecot.detect': () => ({ installed: true, bin: 'dovecot', confDir: '/etc/dovecot', include: { path: '/etc/dovecot/conf.d/97-whm-mailserver.conf', exists: false, content: null }, version: '2.3.21', configOk: true, effective: { protocols: 'imap pop3 lmtp', ssl: 'yes', mail_location: 'maildir:~/Maildir' }, unit: unit('dovecot') }),
     'web.dovecot.include.write': ({ content }) => ({ path: '/etc/dovecot/conf.d/97-whm-mailserver.conf', validated: true, bytes: content.length, reloaded: true, unit: 'dovecot' }),
     'web.exim.detect': () => EXIM_LAYOUT,
-    'web.exim.include.write': ({ slot, content }) => ({ slot, path: EXIM_LAYOUT.slots[slot].path, validated: true, hooked: slot !== 'acl_rcpt', claimedBy: EXIM_LAYOUT.slots[slot].claimedBy, bytes: content.length, version: '4.97', reloaded: slot === 'main', unit: 'exim4' }),
+    'web.exim.include.write': ({ slot, content }) => ({ slot, path: EXIM_LAYOUT.slots[slot].path, block: EXIM_LAYOUT.slots[slot].block ?? null, validated: true, hooked: slot !== 'acl_rcpt', claimedBy: EXIM_LAYOUT.slots[slot].claimedBy, bytes: content.length, version: '4.97', reloaded: slot === 'main', unit: 'exim4' }),
     'web.service.detect': ({ role }) => (role === 'ftp' ? { role, candidates: ftpCandidates(), active: ['pure-ftpd'], enabled: ['pure-ftpd'], current: 'pure-ftpd', packageManager: 'apt-get' } : { role, candidates: dnsCandidates(), active: ['bind'], enabled: ['bind'], current: 'bind', packageManager: 'apt-get' }),
     'web.service.select': ({ role, server }) => ({ role, server, steps: [{ unit: role === 'ftp' ? 'pure-ftpd' : 'named', action: 'disable --now', ok: true, error: null }, ...(server !== 'disabled' ? [{ unit: server === 'vsftpd' ? 'vsftpd' : server === 'bind' ? 'named' : server, action: 'enable --now', ok: true, error: null }] : [])], candidates: role === 'ftp' ? ftpCandidates(server) : dnsCandidates() }),
     'web.ftp.config.read': ({ server }) => ({ server, path: '/etc/pure-ftpd/conf/', unit: unit('pure-ftpd'), settings: { passivePortMin: 30000, passivePortMax: 35000, tls: 'optional' }, raw: { PassivePortRange: '30000 35000', TLS: '1' } }),
     'web.ftp.config.write': ({ server, settings }) => ({ server, written: server === 'pure-ftpd' ? ['/etc/pure-ftpd/conf/PassivePortRange', '/etc/pure-ftpd/conf/TLS'] : ['/etc/vsftpd.conf'], validated: null, settings, reloaded: true, unit: server, verb: 'restart' }),
     'ssl.service_cert.status': () => ({ exim: { service: 'exim', daemonPresent: true, hasCertificate: true, paths: { dir: '/etc/ssl/whm/service/exim' }, certificate: { subjectText: 'CN=mail.example.com', issuerText: 'CN=mail.example.com', notAfter: '2027-01-01T00:00:00.000Z', daysRemaining: 400, selfSigned: true, expired: false } } }),
-    'ssl.service_cert.install': ({ service }) => ({ service, paths: { dir: `/etc/ssl/whm/service/${service}` }, applied: ['/etc/dovecot/conf.d/99-whm-ssl.conf'], reload: { reloaded: true, unit: 'dovecot' }, certificate: { subjectText: 'CN=mail.example.com', issuerText: 'CN=R3', notAfter: '2027-01-01T00:00:00.000Z', selfSigned: false } }),
+    'ssl.service_cert.install': ({ service }) => ({ service, paths: { dir: `/etc/ssl/whm/service/${service}` }, applied: ['/etc/dovecot/conf.d/90-whm-ssl-cert.conf'], reload: { reloaded: true, unit: 'dovecot' }, certificate: { subjectText: 'CN=mail.example.com', issuerText: 'CN=R3', notAfter: '2027-01-01T00:00:00.000Z', selfSigned: false } }),
     'ssl.key.matches': () => ({ matches: true }),
     'ssl.selfsigned.generate': ({ subject, days }) => ({ certPem: CERT, keyPem: KEY, certificate: { subjectText: `CN=${subject.CN}`, issuerText: `CN=${subject.CN}`, selfSigned: true, days } }),
     'ssl.cert.inspect': () => ({ subjectText: 'CN=mail.example.com', issuerText: 'CN=R3', notAfter: '2027-01-01T00:00:00.000Z', notBefore: '2026-01-01T00:00:00.000Z', sans: [], commonName: 'mail.example.com' }),
@@ -144,17 +148,39 @@ describe('Apache Configuration', () => {
     expect(spare.body.error.fields.mpm).toBeDefined();
   });
 
-  it('saves, writes the managed include, switches the MPM and audits', async () => {
+  it('saves, dry-runs the include, switches the MPM, writes the include and audits', async () => {
+    app.agent.reset('web.global.write'); app.agent.set('web.global.write', ({ directives, dryRun }) => (dryRun ? { dryRun: true, ok: !/Broken/.test(directives.customDirectives || ''), output: /Broken/.test(directives.customDirectives || '') ? 'AH00526: Syntax error on line 3: Invalid command Broken' : 'Syntax OK', path: APACHE.globalInclude } : { dryRun: false, path: APACHE.globalInclude, validated: true, linked: true, bytes: 100, reloaded: true, unit: 'apache2' }));
+    const before = app.agent.calls.length;
     const res = await put('/api/service-config/apache', { timeout: 120, serverTokens: 'Prod', customDirectives: 'ServerName panel.example.com', mpm: { module: 'prefork', minSpareServers: 2, maxSpareServers: 8 } }).expect(200);
     expect(res.body.data.settings).toMatchObject({ timeout: 120, mpm: { module: 'prefork', minSpareServers: 2 } });
     expect(res.body.data.applied.include.path).toBe(APACHE.globalInclude);
     expect(res.body.data.applied.mpm).toMatchObject({ module: 'prefork', changed: true });
     expect(res.body.data.lastApply.ok).toBe(true);
+    // Order: dry run of the new include, then the MPM restart, then the real write.
+    const order = app.agent.calls.slice(before).filter((c) => ['web.global.write', 'web.mpm.set'].includes(c.name)).map((c) => (c.name === 'web.global.write' ? (c.args.dryRun ? 'dry' : 'write') : 'mpm'));
+    expect(order).toEqual(['dry', 'mpm', 'write']);
     const write = app.agent.callsTo('web.global.write').pop();
     expect(write.args.directives).toMatchObject({ timeout: 120, customDirectives: 'ServerName panel.example.com', mpm: { module: 'prefork' } });
     expect(write.args.directives.serverAdmin).toBeUndefined();
     expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'apache.config.update'").get().n).toBeGreaterThan(0);
-    await put('/api/service-config/apache', { mpm: { module: 'event' } }).expect(200);
+    // A rejected directive stops before the MPM is touched and leaves the host as it was.
+    const mpmCalls = app.agent.callsTo('web.mpm.set').length;
+    const bad = await put('/api/service-config/apache', { customDirectives: 'Broken directive', mpm: { module: 'event' } });
+    expect(bad.status).toBe(422);
+    expect(bad.body.error.message).toMatch(/Syntax error/);
+    expect(app.agent.callsTo('web.mpm.set').length).toBe(mpmCalls);
+    expect((await get('/api/service-config/apache')).body.data.lastApply.ok).toBe(false);
+    await put('/api/service-config/apache', { customDirectives: 'ServerName panel.example.com', mpm: { module: 'event' } }).expect(200);
+  });
+
+  it('asks mod_status on the address Apache really listens on', async () => {
+    await app.ctx.web.setListenPorts({ http: 8080, https: null, bind: '127.0.0.1' }, null);
+    try {
+      await get('/api/service-config/apache').expect(200);
+      expect(app.agent.callsTo('web.status').pop().args).toEqual({ port: 8080, bind: '127.0.0.1' });
+    } finally { await app.ctx.web.setListenPorts({ http: 80, https: 443 }, null); }
+    await get('/api/service-config/apache').expect(200);
+    expect(app.agent.callsTo('web.status').pop().args).toEqual({ port: 80, bind: null });
   });
 
   it('configtest dry-runs the include and reports rejections without saving', async () => {
@@ -207,19 +233,31 @@ describe('cross-category helpers on ctx.web', () => {
   it('setRedirects, addAlias/removeAlias, setAccountIpv6, replaceIp, setPhpVersion and setListenPorts', async () => {
     await app.ctx.web.setRedirects('example.com', [{ from: '/', to: 'https://new.example.com', type: '301', matchWww: true, keepPath: true }], null);
     expect(app.agent.callsTo('web.vhost.write').pop().args.redirects).toEqual([{ from: '/', to: 'https://new.example.com', type: '301', matchWww: true, keepPath: true }]);
-    await app.ctx.web.addAlias({ username: 'alice', domain: 'example.com', alias: 'alias.example.org' }, null);
+    const audits = [];
+    const req = { audit: (e) => audits.push(e) };
+    await app.ctx.web.addAlias({ username: 'alice', domain: 'example.com', alias: 'alias.example.org' }, req);
     expect(app.ctx.web.vhostFor('example.com').aliases).toContain('alias.example.org');
-    await app.ctx.web.removeAlias({ username: 'alice', alias: 'alias.example.org' }, null);
+    await app.ctx.web.removeAlias({ username: 'alice', alias: 'alias.example.org' }, req);
     expect(app.ctx.web.vhostFor('example.com').aliases).not.toContain('alias.example.org');
+    expect(audits.map((a) => a.action)).toEqual(['web.alias.add', 'web.alias.remove']);
+    expect(audits[0]).toMatchObject({ target: 'example.com', args: { alias: 'alias.example.org', username: 'alice' } });
+    // Multi-vhost changes write every file without a reload and reload Apache once at the end.
+    const mark = app.agent.calls.length;
     const v6 = await app.ctx.web.setAccountIpv6('alice', '2001:db8::10', null);
     expect(v6.vhosts.length).toBe(2);
     expect(app.agent.callsTo('web.vhost.write').pop().args.ipv6).toBe('2001:db8::10');
+    const since = app.agent.calls.slice(mark);
+    expect(since.filter((c) => c.name === 'web.vhost.write').every((c) => c.args.reload === false)).toBe(true);
+    expect(since.filter((c) => c.name === 'web.reload')).toHaveLength(1);
     const moved = await app.ctx.web.replaceIp('203.0.113.5', '203.0.113.9', {}, null);
     expect(moved.updated).toBe(2);
     expect(app.ctx.web.vhostFor('shop.example.com').ip).toBe('203.0.113.9');
-    await app.ctx.web.setPhpVersion('example.com', 'ea-php81', null);
+    await app.ctx.web.setPhpVersion('example.com', 'ea-php81', null, { reload: false });
     expect(app.agent.callsTo('web.phpfpm.pool.write').pop().args.version).toBe('8.1');
+    expect(app.agent.callsTo('web.vhost.write').pop().args).toMatchObject({ domain: 'example.com', reload: false });
     expect(app.ctx.web.vhostFor('example.com').phpVersion).toBe('8.1');
+    await app.ctx.web.setPhpVersion('example.com', 'ea-php81', null);
+    expect(app.agent.callsTo('web.vhost.write').pop().args.reload).toBe(true);
     await expect(app.ctx.web.setPhpVersion('example.com', 'ea-php56', null)).rejects.toMatchObject({ status: 501, capability: 'php' });
     await expect(app.ctx.web.writePhpPool('nobody', '8.3', {}, null)).rejects.toMatchObject({ status: 404 });
     const ports = await app.ctx.web.setListenPorts({ http: 8080, https: 8443 }, null);
@@ -263,6 +301,40 @@ describe('cross-category helpers on ctx.web', () => {
     expect(removed.removed).toEqual(['bob.example.org']);
     expect(app.ctx.web.vhostFor('bob.example.org')).toBeNull();
     expect(app.agent.callsTo('web.vhost.remove').pop().args.domain).toBe('bob.example.org');
+  });
+
+  it('a rejected vhost in the middle of a batch still gets the validated ones reloaded', async () => {
+    const original = app.agent.callsTo('web.vhost.write').length >= 0;
+    expect(original).toBe(true);
+    app.agent.set('web.vhost.write', ({ domain, logDir, bind }) => { if (domain === 'shop.example.com') throw Object.assign(new Error('Apache rejected the new configuration'), { agentError: true, code: 'config_invalid', details: {} }); return { domain, path: `/etc/apache2/sites-available/${domain}.conf`, logDir, validated: true, bytes: 500, bind: bind ?? null, reloaded: false, unit: null }; });
+    try {
+      const mark = app.agent.calls.length;
+      const r = await app.ctx.web.ensureVhost('alice', null);
+      expect(r.vhosts.find((v) => v.domain === 'example.com').applied).toBe(true);
+      expect(r.vhosts.find((v) => v.domain === 'shop.example.com')).toMatchObject({ applied: false, reason: 'config_invalid' });
+      expect(app.agent.calls.slice(mark).filter((c) => c.name === 'web.reload')).toHaveLength(1);
+      expect(r.reload.reloaded).toBe(true);
+    } finally {
+      app.agent.set('web.vhost.write', ({ domain, ssl, sslPort, phpVersion, redirects, logDir, bind }) => ({ domain, path: `/etc/apache2/sites-available/${domain}.conf`, link: `/etc/apache2/sites-enabled/${domain}.conf`, logDir, validated: true, bytes: 500, ssl: Boolean(ssl && sslPort), bind: bind ?? null, phpVersion: phpVersion ?? null, redirects: redirects?.length ?? 0, reloaded: true, unit: 'apache2' }));
+      await app.ctx.web.ensureVhost('alice', null);
+    }
+  });
+
+  it('an Apache host without any PHP-FPM tree writes the vhost but marks it failed (php_missing) instead of applied', async () => {
+    app.agent.set('web.detect', () => ({ ...detectWith(true)(), php: { installed: false, versions: [] } }));
+    try {
+      await app.ctx.web.detect(true);
+      const r = await app.ctx.web.ensureVhost('bob', null);
+      expect(r).toMatchObject({ username: 'bob', applied: false, reason: 'php_missing', phpVersion: null });
+      expect(r.vhosts[0]).toMatchObject({ domain: 'bob.example.org', applied: false, reason: 'php_missing' });
+      expect(app.agent.callsTo('web.vhost.write').pop().args.phpVersion).toBeUndefined();
+      expect(app.ctx.web.vhostFor('bob.example.org')).toMatchObject({ status: 'failed' });
+      expect(app.ctx.web.vhostFor('bob.example.org').error).toMatch(/PHP-FPM is not installed/);
+    } finally {
+      app.agent.set('web.detect', detectWith(true));
+      await app.ctx.web.detect(true);
+      await app.ctx.web.removeAccount('bob', null);
+    }
   });
 
   it('a failing PHP-FPM pool never strips the PHP handler from a vhost: it keeps the handler, is marked failed and the sync reports applied:false', async () => {
@@ -341,6 +413,27 @@ describe('cPanel Log Rotation Configuration', () => {
     expect((await put('/api/service-config/logrotate', { frequency: 'always' })).status).toBe(422);
   });
 
+  it('leaves out web server logs the distribution already rotates, and writes nothing when none remain', async () => {
+    app.agent.set('web.logrotate.list', () => ({ dir: '/etc/logrotate.d', logrotate: true, policies: [], dirExists: true, distribution: { apache2: '/etc/logrotate.d/apache2' } }));
+    try {
+      const res = await get('/api/service-config/logrotate').expect(200);
+      const web = res.body.data.policies.find((p) => p.name === 'webserver');
+      expect(web.paths).toEqual(['/var/log/httpd/*log', '/var/log/nginx/*.log']);
+      expect(web.coveredBy).toEqual(['/etc/logrotate.d/apache2']);
+      await put('/api/service-config/logrotate', { webServerLogs: true }).expect(200);
+      expect(app.agent.callsTo('web.logrotate.write').filter((w) => w.args.name === 'webserver').pop().args.paths).toEqual(['/var/log/httpd/*log', '/var/log/nginx/*.log']);
+      app.agent.set('web.logrotate.list', () => ({ dir: '/etc/logrotate.d', logrotate: true, policies: [], dirExists: true, distribution: { apache2: '/etc/logrotate.d/apache2', httpd: '/etc/logrotate.d/httpd', nginx: '/etc/logrotate.d/nginx' } }));
+      const webWrites = app.agent.callsTo('web.logrotate.write').filter((w) => w.args.name === 'webserver').length;
+      const all = await put('/api/service-config/logrotate', { rotate: 9 }).expect(200);
+      expect(app.agent.callsTo('web.logrotate.write').filter((w) => w.args.name === 'webserver').length).toBe(webWrites);
+      expect(app.agent.callsTo('web.logrotate.remove').pop().args.name).toBe('webserver');
+      expect(all.body.data.applied.webserver.note).toMatch(/already rotated by/);
+    } finally {
+      app.agent.set('web.logrotate.list', () => ({ dir: '/etc/logrotate.d', logrotate: true, policies: [{ name: 'panel', path: '/etc/logrotate.d/whm-panel', size: 120 }], dirExists: true }));
+      await put('/api/service-config/logrotate', { webServerLogs: false }).expect(200);
+    }
+  });
+
   it('runs a policy now', async () => {
     const res = await post('/api/service-config/logrotate/panel/run', { force: true }).expect(200);
     expect(res.body.data).toMatchObject({ name: 'panel', force: true, ok: true });
@@ -380,21 +473,34 @@ describe('Exim Configuration Manager', () => {
     expect(renderEximMain({ ...s, spfVerify: false, spfReject: true }, EXIM_LAYOUT)).not.toContain('CHECK_RCPT_SPF');
     // CHECK_MAIL_HELO_ISSUED no longer exists in Debian's check_mail ACL; HELO is enforced in the RCPT fragment instead.
     expect(deb).not.toContain('CHECK_MAIL_HELO_ISSUED');
-    expect(deb).toContain(`.ifndef CHECK_RCPT_LOCAL_ACL_FILE\nCHECK_RCPT_LOCAL_ACL_FILE = ${EXIM_LAYOUT.slots.acl_rcpt.path}\n.endif`);
+    expect(deb).toContain(`.ifndef CHECK_RCPT_LOCAL_ACL_FILE\nCHECK_RCPT_LOCAL_ACL_FILE = ${CHAIN}\n.endif`);
     expect(deb).toContain(`CHECK_DATA_LOCAL_ACL_FILE = ${EXIM_LAYOUT.slots.acl_data.path}`);
     expect(deb).toContain('smtp_accept_max = 100');
     expect(deb).toContain('smtp_ratelimit_mail = 10,1s,1.5,30s');
     expect(deb).toContain('smtp_max_unknown_commands = 3');
     expect(deb).toContain('MAIN_LOG_SELECTOR = +smtp_connection +subject +tls_cipher');
     expect(deb).not.toContain('auth_advertise_hosts');
+    // The sentinel the agent checks with `exim -bP macro` leads every layout's main slot.
+    expect(deb.split('\n')[1]).toBe('WHM_SERVICE_CONFIG = 1');
+    // Unsplit Debian (the default) renders the same macros: they go into a localmacros block, read in both modes.
+    const unsplit = renderEximMain(s, EXIM_UNSPLIT);
+    expect(unsplit).toContain(`CHECK_RCPT_LOCAL_ACL_FILE = ${CHAIN}`);
+    expect(unsplit).toContain('MESSAGE_SIZE_LIMIT = 50M');
+    expect(unsplit).not.toContain('message_size_limit =');
+    expect(unsplit.replace(/^# .*\n/gm, '')).toBe(deb.replace(/^# .*\n/gm, ''));
     const rhel = renderEximMain(s, { flavor: 'rhel', splitConfig: false, slots: EXIM_LAYOUT.slots });
+    expect(rhel).toContain('WHM_SERVICE_CONFIG = 1');
     expect(rhel).toContain('message_size_limit = 50M');
     expect(rhel).toContain('auth_advertise_hosts = ${if eq{$tls_in_cipher}{}{}{*}}');
     expect(rhel).toContain('log_selector = +smtp_connection +subject +tls_cipher');
     expect(rhel).not.toContain('.ifndef');
     expect(rhel).not.toContain('helo_verify_hosts');
-    // The RCPT fragment carries the real deny rules on every layout (Debian's macros only warn).
-    const acl = renderEximRcptAcl(s);
+    expect(rhel).not.toContain('tls_require_ciphers');
+    // The RCPT chain carries the real deny rules on every layout (Debian's macros only warn) and ends with the Email filters include.
+    const acl = renderEximRcptAcl(s, undefined, EXIM_LAYOUT);
+    expect(acl.trimEnd().split('\n').pop()).toBe(`.include_if_exists ${EMAIL_ACL}`);
+    expect(renderEximRcptAcl(s).trimEnd().split('\n').pop()).toBe('.include_if_exists /etc/exim/whm/acl-email-filters.conf');
+    expect(renderEximRcptAcl({ ...s, requireHelo: false, rblEnabled: false, verifySender: false, spfVerify: false, dictionaryAttackProtection: false }, undefined, EXIM_LAYOUT)).toContain(`No RCPT protections are enabled.\n# Email filters`);
     expect(acl).toContain('drop    condition = ${if > {$rcpt_fail_count}{4}}');
     expect(acl).toContain('        delay = 10s');
     expect(acl).toContain('deny\n        !authenticated = *\n        !hosts = : 127.0.0.1 : ::1\n        dnslists = zen.spamhaus.org : bl.spamcop.net');
@@ -412,7 +518,30 @@ describe('Exim Configuration Manager', () => {
     const data = renderEximDataAcl({ ...s, dkimReject: true });
     expect(data).toContain('dkim_status = fail');
     expect(data).toContain('deny    !authenticated = *');
+    // $dkim_cur_signer only exists in acl_smtp_dkim; the DATA ACL has the signer list.
+    expect(data).toContain('$dkim_signers');
+    expect(data).not.toContain('$dkim_cur_signer');
     expect(renderEximDataAcl({ ...s, dkimVerify: false })).toContain('DKIM verification is disabled');
+  });
+
+  it('renders the TLS policy handed over by SSL/TLS Configuration per TLS library', () => {
+    const tls = tlsPolicyFrom({ minProtocol: 'TLSv1.2', protocols: ['TLSv1.2', 'TLSv1.3'], cipherList: 'ECDHE-RSA-AES256-GCM-SHA384', cipherSuites: 'TLS_AES_256_GCM_SHA384', preferServerCiphers: true });
+    expect(tls).toEqual({ minProtocol: 'TLSv1.2', protocols: ['TLSv1.2', 'TLSv1.3'], cipherList: 'ECDHE-RSA-AES256-GCM-SHA384', cipherSuites: 'TLS_AES_256_GCM_SHA384', preferServerCiphers: true });
+    expect(tlsPolicyFrom({ minProtocol: 'TLSv1.3' }).protocols).toEqual(['TLSv1.3']);
+    expect(tlsPolicyFrom(null)).toBeNull();
+    expect(() => tlsPolicyFrom({ minProtocol: 'SSLv3' })).toThrow(/minProtocol/);
+    expect(eximTlsLibrary(EXIM_LAYOUT)).toBe('gnutls');
+    expect(eximTlsLibrary({ flavor: 'rhel', features: ['OpenSSL', 'DKIM'] })).toBe('openssl');
+    expect(eximTlsLibrary({ flavor: 'rhel', features: null })).toBe('openssl');
+    expect(eximTlsLibrary({ flavor: 'debian', features: null })).toBe('gnutls');
+    expect(renderEximTls(tls, 'gnutls').join('\n')).toContain('tls_require_ciphers = NORMAL:-VERS-ALL:+VERS-TLS1.2:+VERS-TLS1.3:%SERVER_PRECEDENCE');
+    expect(renderEximTls(tls, 'gnutls').join('\n')).not.toContain('ECDHE');
+    const openssl = renderEximTls(tls, 'openssl').join('\n');
+    expect(openssl).toContain('tls_require_ciphers = ECDHE-RSA-AES256-GCM-SHA384');
+    expect(openssl).toContain('openssl_options = +no_sslv2 +no_sslv3 +no_tlsv1 +no_tlsv1_1 +single_dh_use +no_ticket +cipher_server_preference');
+    const main = renderEximMain({ ...DEFAULTS.exim, tls }, EXIM_LAYOUT);
+    expect(main).toContain('tls_require_ciphers = NORMAL:-VERS-ALL:+VERS-TLS1.2:+VERS-TLS1.3:%SERVER_PRECEDENCE');
+    expect(renderEximMain(DEFAULTS.exim, EXIM_LAYOUT)).not.toContain('tls_require_ciphers');
   });
 
   it('leaves the spf conditions out on an Exim built without SPF (exim4-daemon-light) so the config stays valid', () => {
@@ -440,7 +569,8 @@ describe('Exim Configuration Manager', () => {
     expect(res.body.data.installed).toBe(true);
     expect(res.body.data.layout.slots.main.path).toBe(EXIM_LAYOUT.slots.main.path);
     expect(Object.keys(res.body.data.preview)).toEqual(['main', 'acl_rcpt', 'acl_data']);
-    expect(res.body.data.support).toEqual({ spf: true, dkim: true });
+    expect(res.body.data.support).toEqual({ spf: true, dkim: true, tls: 'gnutls' });
+    expect(res.body.data.chain).toEqual({ path: CHAIN, emailAclFile: EMAIL_ACL, includesEmailFilters: false, hooked: false, claimedBy: '/etc/exim4/whm/acl_rcpt.conf' });
     expect(res.body.data.inactive).toEqual(['acl_rcpt']);
     const save = await put('/api/service-config/exim', { rbls: ['zen.spamhaus.org'], maxMessageSizeMb: 25, dictionaryAttackProtection: true, rcptFailLimit: 6, logSelector: ['+subject'] }).expect(200);
     expect(save.body.data.settings).toMatchObject({ rbls: ['zen.spamhaus.org'], maxMessageSizeMb: 25, rcptFailLimit: 6 });
@@ -452,14 +582,52 @@ describe('Exim Configuration Manager', () => {
     expect(writes[0].args.reload).toBe(false);
     expect(writes[1].args.content).toContain('{$rcpt_fail_count}{6}');
     expect(writes[1].args.content).toContain('dnslists = zen.spamhaus.org\n');
+    expect(writes[1].args.content.trimEnd()).toMatch(new RegExp(`\\.include_if_exists ${EMAIL_ACL}$`));
     expect(save.body.data.hints).toHaveLength(1);
     expect(save.body.data.hints[0]).toMatch(/CHECK_RCPT_LOCAL_ACL_FILE already points at \/etc\/exim4\/whm\/acl_rcpt\.conf/);
     expect(save.body.data.applied.acl_rcpt).toMatchObject({ hooked: false, claimedBy: '/etc/exim4/whm/acl_rcpt.conf', applied: false });
     expect(save.body.data.applied.main).toMatchObject({ hooked: true, applied: true });
     expect(save.body.data).toMatchObject({ live: false, inactive: ['acl_rcpt'] });
     expect(save.body.data.lastApply.ok).toBe(false);
-    expect(save.body.data.lastApply.error).toMatch(/does not include \/etc\/exim4\/whm\/acl_rcpt_protect\.conf \(CHECK_RCPT_LOCAL_ACL_FILE is used by \/etc\/exim4\/whm\/acl_rcpt\.conf\)/);
+    expect(save.body.data.lastApply.error).toMatch(/does not include \/etc\/exim4\/whm\/acl-rcpt-local\.conf \(CHECK_RCPT_LOCAL_ACL_FILE is used by \/etc\/exim4\/whm\/acl_rcpt\.conf\)/);
     expect((await get('/api/service-config/exim')).body.data.lastApply.ok).toBe(false);
+  });
+
+  it('ensureEximAclChain (Email hook) renders the chain + macro when missing, is a no-op once complete, and needs Exim', async () => {
+    // The layout above says the chain was never written: the hook applies the saved policy.
+    const before = app.agent.callsTo('web.exim.include.write').length;
+    const created = await app.ctx.web.ensureEximAclChain();
+    expect(created).toMatchObject({ created: true, path: CHAIN, emailAclFile: EMAIL_ACL, claimedBy: '/etc/exim4/whm/acl_rcpt.conf', live: false });
+    const writes = app.agent.callsTo('web.exim.include.write').slice(before);
+    expect(writes.map((w) => w.args.slot)).toEqual(['acl_data', 'acl_rcpt', 'main']);
+    expect(writes[1].args.content).toContain(`.include_if_exists ${EMAIL_ACL}`);
+    expect(writes[2].args.content).toContain(`CHECK_RCPT_LOCAL_ACL_FILE = ${CHAIN}`);
+    // Once the chain and the macro exist nothing is rewritten.
+    const complete = { ...EXIM_LAYOUT, slots: { ...EXIM_LAYOUT.slots, main: { ...EXIM_LAYOUT.slots.main, exists: true }, acl_rcpt: { ...EXIM_LAYOUT.slots.acl_rcpt, exists: true, hooked: true, claimedBy: null, includesEmailFilters: true, content: `# chain\n.include_if_exists ${EMAIL_ACL}\n` } } };
+    app.agent.set('web.exim.detect', () => complete);
+    try {
+      const again = await app.ctx.web.ensureEximAclChain();
+      expect(again).toEqual({ created: false, path: CHAIN, emailAclFile: EMAIL_ACL, hooked: true, claimedBy: null });
+      expect(app.agent.callsTo('web.exim.include.write').length).toBe(before + 3);
+    } finally { app.agent.set('web.exim.detect', () => EXIM_LAYOUT); }
+    app.agent.set('web.exim.detect', () => ({ installed: false }));
+    try { await expect(app.ctx.web.ensureEximAclChain()).rejects.toMatchObject({ status: 501, capability: 'exim' }); } finally { app.agent.set('web.exim.detect', () => EXIM_LAYOUT); }
+  });
+
+  it('applyEximTls (SSL/TLS Configuration hook) stores the preset and renders it into the main slot for the detected TLS library', async () => {
+    const r = await app.ctx.web.applyEximTls({ minProtocol: 'TLSv1.2', protocols: ['TLSv1.2', 'TLSv1.3'], cipherList: 'ECDHE-RSA-AES256-GCM-SHA384', cipherSuites: '', preferServerCiphers: true }, null);
+    expect(r).toMatchObject({ path: EXIM_LAYOUT.slots.main.path, validated: true, library: 'gnutls', reload: { reloaded: true, unit: 'exim4' } });
+    const main = app.agent.callsTo('web.exim.include.write').filter((w) => w.args.slot === 'main').pop().args.content;
+    expect(main).toContain('tls_require_ciphers = NORMAL:-VERS-ALL:+VERS-TLS1.2:+VERS-TLS1.3:%SERVER_PRECEDENCE');
+    expect(main).not.toContain('ECDHE-RSA');
+    expect((await get('/api/service-config/exim')).body.data.settings.tls).toEqual({ minProtocol: 'TLSv1.2', protocols: ['TLSv1.2', 'TLSv1.3'], cipherList: 'ECDHE-RSA-AES256-GCM-SHA384', cipherSuites: '', preferServerCiphers: true });
+    expect((await get('/api/service-config/exim')).body.data.preview.main).toContain('tls_require_ciphers');
+    // The policy survives an ordinary save and can be dropped through the API.
+    await put('/api/service-config/exim', { maxMessageSizeMb: 30 }).expect(200);
+    expect(app.agent.callsTo('web.exim.include.write').filter((w) => w.args.slot === 'main').pop().args.content).toContain('tls_require_ciphers');
+    expect((await put('/api/service-config/exim', { tls: { minProtocol: 'SSLv3' } })).status).toBe(422);
+    await put('/api/service-config/exim', { tls: null }).expect(200);
+    expect(app.agent.callsTo('web.exim.include.write').filter((w) => w.args.slot === 'main').pop().args.content).not.toContain('tls_require_ciphers');
   });
 
   it('reports ok once every required fragment is included, and warns when SPF is not compiled in', async () => {
@@ -468,7 +636,7 @@ describe('Exim Configuration Manager', () => {
     app.agent.set('web.exim.include.write', ({ slot, content }) => ({ slot, path: hookedLayout.slots[slot].path, validated: true, hooked: true, claimedBy: null, bytes: content.length, version: '4.97', features: hookedLayout.features, reloaded: slot === 'main', unit: 'exim4' }));
     try {
       const res = await get('/api/service-config/exim').expect(200);
-      expect(res.body.data.support).toEqual({ spf: false, dkim: true });
+      expect(res.body.data.support).toMatchObject({ spf: false, dkim: true });
       expect(res.body.data.warnings).toHaveLength(1);
       expect(res.body.data.warnings[0]).toMatch(/exim4-daemon-heavy/);
       expect(res.body.data.preview.acl_rcpt).not.toMatch(/^\s+spf = /m);
@@ -505,6 +673,32 @@ describe('Mailserver Configuration', () => {
     expect(text).toContain('protocol pop3 {\n  mail_max_userip_connections = 10');
     expect(text).toContain('mail_location = maildir:~/mail');
     expect(renderDovecot({ ...DEFAULTS.mailserver, protocols: ['imap'] })).not.toContain('protocol pop3');
+    // This file owns the cipher directives (ssl-tls only writes certificate paths, to 90-whm-ssl-cert.conf).
+    expect(text).toContain('ssl_prefer_server_ciphers = no');
+    expect(text).not.toContain('ssl_cipher_list');
+    expect(text).not.toContain('ssl_cert');
+    const ciphers = { ...DEFAULTS.mailserver, sslCipherList: 'ECDHE-RSA-AES256-GCM-SHA384', sslCipherSuites: 'TLS_AES_256_GCM_SHA384', sslPreferServerCiphers: true };
+    const modern = renderDovecot(ciphers, { version: '2.3.21' });
+    expect(modern).toContain('ssl_cipher_list = ECDHE-RSA-AES256-GCM-SHA384');
+    expect(modern).toContain('ssl_cipher_suites = TLS_AES_256_GCM_SHA384');
+    expect(modern).toContain('ssl_prefer_server_ciphers = yes');
+    // ssl_cipher_suites only exists from 2.3.15; an older Dovecot would reject the file.
+    expect(renderDovecot(ciphers, { version: '2.3.4' })).not.toContain('ssl_cipher_suites');
+    expect(renderDovecot(ciphers)).not.toContain('ssl_cipher_suites');
+    expect([dovecotSupportsCipherSuites('2.3.15'), dovecotSupportsCipherSuites('2.4.0'), dovecotSupportsCipherSuites('2.3.14'), dovecotSupportsCipherSuites(null)]).toEqual([true, true, false, false]);
+  });
+
+  it('applyMailserverTls (SSL/TLS Configuration hook) stores the preset here and re-renders the file', async () => {
+    const r = await app.ctx.web.applyMailserverTls({ minProtocol: 'TLSv1.3', protocols: ['TLSv1.3'], cipherList: 'ECDHE-ECDSA-AES128-GCM-SHA256', cipherSuites: 'TLS_AES_128_GCM_SHA256', preferServerCiphers: false }, null);
+    expect(r).toMatchObject({ path: '/etc/dovecot/conf.d/97-whm-mailserver.conf', validated: true, reload: { reloaded: true, unit: 'dovecot' } });
+    const content = app.agent.callsTo('web.dovecot.include.write').pop().args.content;
+    expect(content).toContain('ssl_min_protocol = TLSv1.3');
+    expect(content).toContain('ssl_cipher_list = ECDHE-ECDSA-AES128-GCM-SHA256');
+    expect(content).toContain('ssl_cipher_suites = TLS_AES_128_GCM_SHA256');
+    expect(content).toContain('ssl_prefer_server_ciphers = no');
+    expect((await get('/api/service-config/mailserver')).body.data.settings).toMatchObject({ sslMinProtocol: 'TLSv1.3', sslCipherList: 'ECDHE-ECDSA-AES128-GCM-SHA256', sslCipherSuites: 'TLS_AES_128_GCM_SHA256', sslPreferServerCiphers: false });
+    expect((await put('/api/service-config/mailserver', { sslCipherList: 'ECDHE RSA; rm' })).status).toBe(422);
+    await put('/api/service-config/mailserver', { sslMinProtocol: 'TLSv1.2', sslCipherList: '', sslCipherSuites: '' }).expect(200);
   });
 
   it('GET/PUT with validation and reload', async () => {
@@ -566,6 +760,21 @@ describe('FTP Server Selection', () => {
     expect((await put('/api/service-config/ftp/settings', { passiveAddress: '1.2.3.4\nx' })).status).toBe(422);
     await app.ctx.ftp.setPassiveAddress({ ipv4: '203.0.113.7' }, null);
     expect(app.agent.callsTo('web.ftp.config.write').pop().args.settings.passiveAddress).toBe('203.0.113.7');
+  });
+
+  it('saving daemon settings while FTP is disabled says so (422) instead of claiming nothing is installed', async () => {
+    app.agent.set('web.service.detect', ({ role }) => (role === 'ftp' ? { role, candidates: ftpCandidates(null), active: [], enabled: [], current: null, packageManager: 'apt-get' } : { role, candidates: dnsCandidates(), active: ['bind'], enabled: ['bind'], current: 'bind', packageManager: 'apt-get' }));
+    app.ctx.settings.set('service_config.ftp_server', 'disabled');
+    try {
+      const res = await put('/api/service-config/ftp/settings', { maxClients: 20 });
+      expect(res.status).toBe(422);
+      expect(res.body.error.message).toMatch(/FTP is disabled under FTP Server Selection/);
+      expect((await get('/api/service-config/ftp')).body.data.settings.maxClients).toBe(20);
+    } finally {
+      app.ctx.settings.set('service_config.ftp_server', 'pure-ftpd');
+      app.agent.set('web.service.detect', ({ role }) => (role === 'ftp' ? { role, candidates: ftpCandidates(), active: ['pure-ftpd'], enabled: ['pure-ftpd'], current: 'pure-ftpd', packageManager: 'apt-get' } : { role, candidates: dnsCandidates(), active: ['bind'], enabled: ['bind'], current: 'bind', packageManager: 'apt-get' }));
+      await put('/api/service-config/ftp/settings', { maxClients: 50 }).expect(200);
+    }
   });
 
   it('a daemon that did not come back after the write is not recorded as applied', async () => {
@@ -632,8 +841,19 @@ describe('Manage Service SSL Certificates', () => {
     const gen = app.agent.callsTo('ssl.selfsigned.generate').pop().args;
     expect(gen.subject.CN).toBe('panel.example.com');
     expect(gen.days).toBe(90);
-    expect(gen.sans).toContain('panel.example.com');
+    expect(gen.sans).toEqual(['panel.example.com', 'www.panel.example.com', 'mail.example.com']);
     expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'service_ssl.reset_self_signed'").get().n).toBe(1);
+    // Mixed-case hostnames are lowercased (the agent only accepts lowercase names) and the mail SAN is the parent domain, never the last two labels.
+    app.ctx.settings.set('basic.hostname', 'Panel.Example.CO.uk');
+    try {
+      await post('/api/service-config/service-certs/exim/self-signed', {}).expect(200);
+      const uk = app.agent.callsTo('ssl.selfsigned.generate').pop().args;
+      expect(uk.subject.CN).toBe('panel.example.co.uk');
+      expect(uk.sans).toEqual(['panel.example.co.uk', 'www.panel.example.co.uk', 'mail.example.co.uk']);
+      app.ctx.settings.set('basic.hostname', 'example.com');
+      await post('/api/service-config/service-certs/exim/self-signed', {}).expect(200);
+      expect(app.agent.callsTo('ssl.selfsigned.generate').pop().args.sans).toEqual(['example.com', 'www.example.com']);
+    } finally { app.ctx.settings.set('basic.hostname', 'panel.example.com'); }
   });
 });
 

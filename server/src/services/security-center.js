@@ -1,4 +1,5 @@
 import net from 'node:net';
+import dns from 'node:dns/promises';
 import nodeCrypto from 'node:crypto';
 import { json, paginate } from '../db/index.js';
 import { notFound, conflict, badRequest, unprocessable, CapabilityError } from '../lib/errors.js';
@@ -131,6 +132,97 @@ export function ipInCidr(ip, cidr) {
   return toBits(ip).slice(0, prefix) === toBits(network).slice(0, prefix);
 }
 
+function addressToBigInt(ip, family) {
+  if (family === 4) return ip.split('.').reduce((n, o) => (n << 8n) + BigInt(o), 0n);
+  const expand = (part) => (part ? part.split(':').flatMap((g) => {
+    if (!g.includes('.')) return [g];
+    const v = Number(addressToBigInt(g, 4));
+    return [(v >>> 16).toString(16), (v & 0xffff).toString(16)];
+  }) : []);
+  const [head, tail] = ip.split('::');
+  const h = expand(head);
+  const t = tail === undefined ? [] : expand(tail);
+  const groups = [...h, ...Array(8 - h.length - t.length).fill('0'), ...t];
+  return groups.reduce((n, g) => (n << 16n) + BigInt(parseInt(g || '0', 16)), 0n);
+}
+
+function bigIntToAddress(n, family) {
+  if (family === 4) return [24, 16, 8, 0].map((s) => Number((n >> BigInt(s)) & 255n)).join('.');
+  const groups = Array.from({ length: 8 }, (_, i) => Number((n >> BigInt((7 - i) * 16)) & 0xffffn));
+  let best = { start: -1, len: 0 };
+  let cur = { start: -1, len: 0 };
+  groups.forEach((g, i) => {
+    if (g !== 0) { cur = { start: -1, len: 0 }; return; }
+    if (cur.start < 0) cur = { start: i, len: 0 };
+    cur.len++;
+    if (cur.len > best.len) best = { ...cur };
+  });
+  const hex = groups.map((g) => g.toString(16));
+  if (best.len < 2) return hex.join(':');
+  return `${hex.slice(0, best.start).join(':')}::${hex.slice(best.start + best.len).join(':')}`;
+}
+
+// Canonical form shared by what the operator types, what is recorded and what
+// iptables/nft print back: host-length prefixes dropped, IPv6 compressed and
+// lower-cased, network host bits cleared. Returns null for anything that is not
+// an address or network.
+export function normalizeIpOrCidr(value) {
+  const parts = String(value ?? '').trim().split('/');
+  if (parts.length > 2) return null;
+  const [addr, prefixStr] = parts;
+  const family = net.isIP(addr);
+  if (!family) return null;
+  const max = family === 4 ? 32 : 128;
+  if (prefixStr !== undefined && (!/^\d{1,3}$/.test(prefixStr) || Number(prefixStr) > max)) return null;
+  const n = addressToBigInt(addr, family);
+  if (prefixStr === undefined || Number(prefixStr) === max) return bigIntToAddress(n, family);
+  const prefix = Number(prefixStr);
+  const mask = prefix === 0 ? 0n : ((1n << BigInt(max)) - 1n) ^ ((1n << BigInt(max - prefix)) - 1n);
+  return `${bigIntToAddress(n & mask, family)}/${prefix}`;
+}
+
+const NON_PUBLIC_V4 = ['0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.0.0.0/24', '192.168.0.0/16', '198.18.0.0/15', '224.0.0.0/4', '240.0.0.0/4'];
+
+export function isPublicAddress(addr) {
+  const family = net.isIP(addr);
+  if (family === 4) return !NON_PUBLIC_V4.some((cidr) => ipInCidr(addr, cidr));
+  if (family !== 6) return false;
+  const a = addr.toLowerCase();
+  if (a.startsWith('::ffff:') && net.isIP(a.slice(7)) === 4) return isPublicAddress(a.slice(7));
+  if (a === '::' || a === '::1') return false;
+  return !/^(fe[89ab]|f[cd])/.test(a);
+}
+
+// Server-side fetch of operator-supplied provider URLs: https only, redirects
+// are not followed (a redirect could steer the panel at internal services),
+// hosts that resolve to non-public addresses are refused and the body is capped.
+export async function fetchJson(url, { method = 'GET', body, headers = {}, maxBytes = 1024 * 1024, timeoutMs = 10_000, lookup = (host) => dns.lookup(host, { all: true }) } = {}) {
+  const u = new URL(url);
+  if (u.protocol !== 'https:') throw new Error('only https:// URLs are fetched');
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  let addresses = net.isIP(host) ? [host] : [];
+  if (!addresses.length) { try { addresses = (await lookup(host)).map((a) => a.address); } catch { addresses = []; } }
+  const internal = addresses.find((a) => !isPublicAddress(a));
+  if (internal) throw new Error(`${host} resolves to a non-public address (${internal}); the panel only contacts public identity providers`);
+  const res = await fetch(url, { method, body, redirect: 'manual', headers: { Accept: 'application/json', ...headers }, signal: AbortSignal.timeout(timeoutMs) });
+  if (res.status >= 300 && res.status < 400) throw new Error(`HTTP ${res.status} redirect to ${res.headers?.get?.('location') || 'another location'} was not followed`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  let text;
+  if (res.body && typeof res.body[Symbol.asyncIterator] === 'function') {
+    const chunks = [];
+    let total = 0;
+    for await (const chunk of res.body) {
+      total += chunk.length;
+      if (total > maxBytes) throw new Error(`the response exceeds ${maxBytes} bytes`);
+      chunks.push(chunk);
+    }
+    text = Buffer.concat(chunks).toString('utf8');
+  } else text = await res.text();
+  try { return JSON.parse(text); } catch { throw new Error('the response is not valid JSON'); }
+}
+
+const HOME_ROOT_SHAPE = /^\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+$/;
+
 export function createSecurityCenterService(ctx) {
   const { db, agent, capabilities, settings, crypto, config, logger } = ctx;
 
@@ -221,12 +313,14 @@ export function createSecurityCenterService(ctx) {
       return stmts.hostRules.all().map((r) => ({ id: r.id, service: r.service, source: r.source, action: r.action, comment: r.comment, position: r.position }));
     },
     async files() { return op('sec.hosts_allow.read'); },
+    // The host file is written first; the stored rule set only changes once the
+    // agent accepted the new file.
     async replace(rules, req) {
+      const result = await op('sec.hosts_allow.write', { rules: rules.map((r) => ({ service: r.service, source: r.source, action: r.action, ...(r.comment ? { comment: r.comment } : {}) })) }, req);
       db.transaction(() => {
         stmts.clearHostRules.run();
         rules.forEach((r, i) => stmts.insertHostRule.run(r.service, r.source, r.action, r.comment || null, i));
       })();
-      const result = await op('sec.hosts_allow.write', { rules: rules.map((r) => ({ service: r.service, source: r.source, action: r.action, ...(r.comment ? { comment: r.comment } : {}) })) }, req);
       req?.audit?.({ action: 'security.host_access.update', args: { rules: rules.length } });
       return { rules: hostAccess.list(), written: result };
     },
@@ -240,10 +334,16 @@ export function createSecurityCenterService(ctx) {
       const keys = await op('sec.ssh_keys.list').catch(() => ({ authorized: [] }));
       return { ...cfg, authorizedKeyCount: keys.authorized?.length ?? 0 };
     },
-    async setConfig(settingsIn, req) {
+    // Turning passwords off with no authorized root key locks root out of SSH,
+    // so that combination needs an explicit force flag from any API client.
+    async setConfig(settingsIn, req, { force = false } = {}) {
       capabilities.require('sshd', 'OpenSSH server (sshd) is not installed on this server');
+      if (settingsIn.PasswordAuthentication === 'no' && !force) {
+        const keys = await op('sec.ssh_keys.list').catch(() => ({ authorized: [] }));
+        if (!(keys.authorized?.length > 0)) throw unprocessable('Disabling SSH password authentication while no root key is authorized would lock root out of SSH. Authorize a key first (Manage root\'s SSH Keys) or resend with force: true to proceed anyway.', { force: ['Required to disable passwords without an authorized root key'] });
+      }
       const result = await op('sec.sshd.set', { settings: settingsIn }, req);
-      req?.audit?.({ action: 'security.sshd.update', args: settingsIn });
+      req?.audit?.({ action: 'security.sshd.update', args: { ...settingsIn, ...(force ? { force } : {}) } });
       return result;
     },
     async keys() {
@@ -408,9 +508,15 @@ export function createSecurityCenterService(ctx) {
     },
   };
 
+  // Addresses are stored and compared in canonical form (see normalizeIpOrCidr);
+  // the live listing is normalised the same way before any comparison.
+  const canon = (ip) => normalizeIpOrCidr(ip) ?? String(ip);
+  const liveEntries = (entries) => entries.map((e) => ({ ...e, ip: canon(e.ip) }));
+
   const firewallApi = {
     recorded: () => stmts.fwEntries.all(),
-    annotate(entries) {
+    annotate(entriesIn) {
+      const entries = liveEntries(entriesIn);
       const rows = stmts.fwEntries.all();
       const byIp = new Map();
       for (const r of rows) (byIp.get(r.ip) || byIp.set(r.ip, []).get(r.ip)).push(r);
@@ -428,22 +534,25 @@ export function createSecurityCenterService(ctx) {
       const list = await op('sec.firewall.list');
       return { ...detect, installed: true, entries: firewallApi.annotate(list.entries) };
     },
-    async block(ip, req, { source = 'manual', comment = null } = {}) {
+    async block(ipIn, req, { source = 'manual', comment = null } = {}) {
+      const ip = canon(ipIn);
       requireFirewallBackend(await op('sec.firewall.detect'));
       const result = await op('sec.firewall.block', { ip }, req);
       stmts.fwInsert.run(ip, source, comment);
       req?.audit?.({ action: 'security.firewall.block', target: ip, args: { source } });
-      return { ...result, source, persistent: true };
+      return { ...result, ip, source, persistent: true };
     },
     // An explicit unblock drops every record for the address, including cPHulk's.
-    async unblock(ip, req) {
+    async unblock(ipIn, req) {
+      const ip = canon(ipIn);
       requireFirewallBackend(await op('sec.firewall.detect'));
       const result = await op('sec.firewall.unblock', { ip }, req);
       stmts.fwDeleteIp.run(ip);
       req?.audit?.({ action: 'security.firewall.unblock', target: ip });
-      return result;
+      return { ...result, ip };
     },
-    async release(ip, source, req) {
+    async release(ipIn, source, req) {
+      const ip = canon(ipIn);
       stmts.fwDeleteSource.run(ip, source);
       if (stmts.fwByIp.all(ip).length) return { ip, removed: false, kept: true };
       const result = await op('sec.firewall.unblock', { ip }, req);
@@ -466,9 +575,9 @@ export function createSecurityCenterService(ctx) {
         const rows = stmts.fwEntries.all();
         const manual = new Set(rows.filter((r) => r.source === 'manual').map((r) => r.ip));
         const tracked = new Set(rows.filter((r) => r.source === 'cphulk').map((r) => r.ip));
-        const activeIps = new Set([...stmts.activeBlocks.all().map((b) => b.ip), ...stmts.listByKind.all('deny').map((e) => e.ip)]);
+        const activeIps = new Set([...stmts.activeBlocks.all().map((b) => b.ip), ...stmts.listByKind.all('deny').map((e) => e.ip)].map(canon));
         const wantCphulk = sync ? activeIps : new Set([...tracked].filter((ip) => activeIps.has(ip)));
-        const current = new Set((await op('sec.firewall.list')).entries.map((e) => e.ip));
+        const current = new Set(liveEntries((await op('sec.firewall.list')).entries).map((e) => e.ip));
         let added = 0; let removed = 0;
         const ensure = async (ip) => { if (current.has(ip)) return; await op('sec.firewall.block', { ip }); current.add(ip); added++; };
         for (const ip of manual) await ensure(ip);
@@ -583,9 +692,17 @@ export function createSecurityCenterService(ctx) {
       const state = await op('sec.userdir.get');
       return { ...state, installed: Boolean(state.installed) && capabilities.has('apache'), accounts: stmts.accountUsers.all().map((a) => a.username) };
     },
+    // The Basic Setup home root is accepted with a trailing slash there but lands
+    // inside an Apache <Directory "..."> block here, so it is normalised first.
+    homeRoot() {
+      const raw = String(settings.get('basic.home_root') || '/home').trim();
+      const normalized = raw.replace(/\/+$/, '').replace(/\/{2,}/g, '/') || '/';
+      if (!HOME_ROOT_SHAPE.test(normalized) || normalized.split('/').includes('..')) throw unprocessable(`The home directory root "${raw}" from Basic Setup cannot be used in the Apache mod_userdir include; set it to a plain absolute path such as /home on the Basic Setup page.`, { homeRoot: ['Must be a plain absolute path without ".." or special characters'] });
+      return normalized;
+    },
     async set({ enabled, excludeUsers }, req) {
       capabilities.require('apache', 'Apache is not installed on this server');
-      const result = await op('sec.userdir.set', { enabled, excludeUsers, homeRoot: settings.get('basic.home_root') || '/home' }, req);
+      const result = await op('sec.userdir.set', { enabled, excludeUsers, homeRoot: userdir.homeRoot() }, req);
       const reload = await reloadApache(req).catch((err) => ({ error: err.message }));
       req?.audit?.({ action: 'security.userdir.set', args: { enabled, excludeUsers } });
       return { ...result, reload };
@@ -620,11 +737,13 @@ export function createSecurityCenterService(ctx) {
       return { data: list.slice((page - 1) * pageSize, page * pageSize), meta: { page, pageSize, total: list.length, files: files.length, truncated } };
     },
     disabledRules: () => stmts.disabledRules.all(),
+    // The include is written (and validated by Apache) before the rule's state is
+    // recorded, so a rejected include never leaves a rule marked disabled.
     async setRuleDisabled(ruleId, disabled, reason, req) {
       await requireModsec();
-      if (disabled) stmts.disableRule.run(ruleId, reason || null); else stmts.enableRule.run(ruleId);
-      const ids = stmts.disabledRules.all().map((r) => r.rule_id);
+      const ids = [...new Set([...stmts.disabledRules.all().map((r) => r.rule_id).filter((id) => id !== ruleId), ...(disabled ? [ruleId] : [])])].sort((a, b) => a - b);
       const result = await op('sec.modsec.set_disabled', { ids }, req);
+      if (disabled) stmts.disableRule.run(ruleId, reason || null); else stmts.enableRule.run(ruleId);
       const reload = await reloadApache(req).catch((err) => ({ error: err.message }));
       req?.audit?.({ action: disabled ? 'security.modsec.rule.disable' : 'security.modsec.rule.enable', target: String(ruleId), args: { reason } });
       return { ruleId, disabled, ids, path: result.path, reload };
@@ -648,12 +767,15 @@ export function createSecurityCenterService(ctx) {
       req?.audit?.({ action: 'security.modsec.vendor.update', target: name });
       return { vendor, job: ctx.jobs.enqueue('security.modsec.vendor.install', { name }, { userId: user?.id ?? null }) };
     },
+    // Vendor state changes are applied to Apache first and recorded only once the
+    // include validated, so the stored flags never claim more than the host does.
     async setVendorEnabled(name, enabled, req) {
       await requireModsec();
       const vendor = stmts.vendorByName.get(name);
       if (!vendor) throw notFound('Vendor');
+      const desired = stmts.vendors.all().map((v) => ({ name: v.name, enabled: v.name === name ? enabled : Boolean(v.enabled) }));
+      const applied = await modsec.applyVendors(req, desired);
       stmts.setVendorEnabled.run(enabled ? 1 : 0, vendor.id);
-      const applied = await modsec.applyVendors(req);
       req?.audit?.({ action: 'security.modsec.vendor.toggle', target: name, args: { enabled } });
       return { ...stmts.vendorByName.get(name), enabled, applied };
     },
@@ -661,14 +783,14 @@ export function createSecurityCenterService(ctx) {
       await requireModsec();
       const vendor = stmts.vendorByName.get(name);
       if (!vendor) throw notFound('Vendor');
-      stmts.deleteVendor.run(vendor.id);
+      const remaining = stmts.vendors.all().filter((v) => v.name !== name).map((v) => ({ name: v.name, enabled: Boolean(v.enabled) }));
+      const applied = await modsec.applyVendors(req, remaining);
       await op('sec.modsec.vendor.remove', { name }, req);
-      const applied = await modsec.applyVendors(req);
+      stmts.deleteVendor.run(vendor.id);
       req?.audit?.({ action: 'security.modsec.vendor.remove', target: name });
       return { removed: true, applied };
     },
-    async applyVendors(req) {
-      const vendors = stmts.vendors.all().map((v) => ({ name: v.name, enabled: Boolean(v.enabled) }));
+    async applyVendors(req, vendors = stmts.vendors.all().map((v) => ({ name: v.name, enabled: Boolean(v.enabled) }))) {
       const result = await op('sec.modsec.vendors.apply', { vendors }, req);
       const reload = await reloadApache(req).catch((err) => ({ error: err.message }));
       return { ...result, reload };
@@ -752,9 +874,7 @@ export function createSecurityCenterService(ctx) {
       const url = `${row.issuer_url}/.well-known/openid-configuration`;
       let doc;
       try {
-        const res = await fetch(url, { signal: AbortSignal.timeout(10_000), headers: { Accept: 'application/json' } });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        doc = await res.json();
+        doc = await fetchJson(url, { timeoutMs: 10_000 });
       } catch (err) {
         throw badRequest(`OpenID discovery failed for ${url}: ${err.message}`);
       }
@@ -769,9 +889,8 @@ export function createSecurityCenterService(ctx) {
       const cached = jwksCache.get(row.id);
       if (cached && Date.now() - cached.at < 3_600_000) return cached.keys;
       if (!discovery.jwksUri.startsWith('https://')) throw badRequest('jwks_uri must use https://');
-      const res = await fetch(discovery.jwksUri, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
-      if (!res.ok) throw badRequest(`Fetching the provider keys failed: HTTP ${res.status}`);
-      const keys = (await res.json()).keys || [];
+      let keys;
+      try { keys = (await fetchJson(discovery.jwksUri, { timeoutMs: 15_000 })).keys || []; } catch (err) { throw badRequest(`Fetching the provider keys failed: ${err.message}`); }
       jwksCache.set(row.id, { at: Date.now(), keys });
       return keys;
     },
@@ -797,9 +916,8 @@ export function createSecurityCenterService(ctx) {
       const headers = { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' };
       const clientSecret = row.client_secret_enc ? crypto.decrypt(row.client_secret_enc) : null;
       if (clientSecret) headers.Authorization = `Basic ${Buffer.from(`${encodeURIComponent(row.client_id)}:${encodeURIComponent(clientSecret)}`).toString('base64')}`;
-      const res = await fetch(discovery.tokenEndpoint, { method: 'POST', headers, body, signal: AbortSignal.timeout(15_000) });
-      if (!res.ok) throw badRequest(`Token exchange failed: HTTP ${res.status}`);
-      const tokens = await res.json();
+      let tokens;
+      try { tokens = await fetchJson(discovery.tokenEndpoint, { method: 'POST', headers, body, timeoutMs: 15_000 }); } catch (err) { throw badRequest(`Token exchange failed: ${err.message}`); }
       if (!tokens.id_token) throw badRequest('The token response has no id_token: the provider is not OpenID Connect or "openid" is missing from the scopes');
       const header = decodeJwtPart(String(tokens.id_token).split('.')[0]) || {};
       const jwks = /^HS/.test(header.alg || '') ? [] : await externalAuth.jwks(row, discovery);
@@ -810,13 +928,10 @@ export function createSecurityCenterService(ctx) {
         throw badRequest(`The provider's id_token was rejected: ${err.message}`);
       }
       if (discovery.userinfoEndpoint && tokens.access_token) {
-        const info = await fetch(discovery.userinfoEndpoint, { headers: { Authorization: `Bearer ${tokens.access_token}`, Accept: 'application/json' }, signal: AbortSignal.timeout(15_000) }).catch(() => null);
-        if (info?.ok) {
-          const extra = await info.json().catch(() => null);
-          if (extra && typeof extra === 'object') {
-            if (extra.sub && extra.sub !== claims.sub) throw badRequest('The userinfo subject does not match the id_token');
-            claims = { ...extra, ...claims };
-          }
+        const extra = await fetchJson(discovery.userinfoEndpoint, { headers: { Authorization: `Bearer ${tokens.access_token}` }, timeoutMs: 15_000 }).catch(() => null);
+        if (extra && typeof extra === 'object') {
+          if (extra.sub && extra.sub !== claims.sub) throw badRequest('The userinfo subject does not match the id_token');
+          claims = { ...extra, ...claims };
         }
       }
       return { claims, subject: claims.sub, email: claims.email_verified === false ? null : claims.email || null, tokens: { tokenType: tokens.token_type, expiresIn: tokens.expires_in } };
@@ -895,14 +1010,30 @@ export function createSecurityCenterService(ctx) {
           : { id: 'cphulk.enabled', grade: 'warning', title: 'cPHulk brute force protection is disabled', detail: 'Repeated failed panel logins are not being blocked.', fix: { label: 'cPHulk Brute Force Protection', path: '/security-center/cphulk-brute-force-protection' } });
       });
 
+      // The pending-update check lives in the Software category
+      // (ctx.software.update.status(), backed by the pkg.upgradable op).
       await probe('packages', 'outdated packages', async () => {
-        const pkg = ctx.pkg;
-        const fn = pkg && (pkg.outdated || pkg.listUpdates || pkg.updates);
-        if (typeof fn !== 'function') { add({ id: 'pkg.updates', grade: 'info', title: 'Package update check unavailable', detail: 'The Software category is not loaded on this panel yet.' }); return; }
-        const result = await fn.call(pkg);
-        const count = Array.isArray(result) ? result.length : Number(result?.count ?? result?.total ?? 0);
+        const software = ctx.software;
+        const pkg = ctx.pkg || software?.pkg;
+        if (!software && !pkg) { add({ id: 'pkg.updates', grade: 'info', title: 'Package update check unavailable', detail: 'The Software category is not loaded on this panel.' }); return; }
+        if (!capabilities.has('pkg')) {
+          add({ id: 'pkg.updates', grade: 'info', title: 'Package update check unavailable', detail: 'No supported package manager (apt-get, dnf or yum) was found on this server.' });
+          return;
+        }
+        let count = 0; let security = 0;
+        if (typeof software?.update?.status === 'function') {
+          const status = await software.update.status();
+          count = Number(status?.count ?? (Array.isArray(status?.packages) ? status.packages.length : 0)) || 0;
+          security = Number(status?.security ?? 0) || 0;
+        } else {
+          const fn = pkg && (pkg.outdated || pkg.listUpdates || pkg.updates);
+          if (typeof fn !== 'function') { add({ id: 'pkg.updates', grade: 'info', title: 'Package update check unavailable', detail: 'The loaded Software category exposes no update check.' }); return; }
+          const result = await fn.call(pkg);
+          count = Array.isArray(result) ? result.length : Number(result?.count ?? result?.total ?? 0) || 0;
+          security = Number(result?.security ?? 0) || 0;
+        }
         add(count > 0
-          ? { id: 'pkg.updates', grade: 'warning', title: `${count} package update${count === 1 ? '' : 's'} available`, detail: 'Outdated packages may carry known vulnerabilities.', fix: { label: 'Update System Software', path: '/software/update-system-software' } }
+          ? { id: 'pkg.updates', grade: security > 0 ? 'critical' : 'warning', title: `${count} package update${count === 1 ? '' : 's'} available${security > 0 ? ` (${security} security)` : ''}`, detail: 'Outdated packages may carry known vulnerabilities.', fix: { label: 'System Update', path: '/software/system-update' } }
           : { id: 'pkg.updates', grade: 'ok', title: 'All distribution packages are up to date' });
       });
 

@@ -139,9 +139,22 @@ describe('Database Services API (MariaDB via mock agent)', () => {
     const res = await get('/status').expect(200);
     expect(res.body.data.profile).toMatchObject({ profile_name: 'localhost', engine: 'mysql', is_active: true, has_password: false });
     expect(res.body.data.detect.engine).toBe('mariadb');
+    expect(res.body.data.detect.layout.managedInclude).toBe('/etc/mysql/mariadb.conf.d/zz-whm.cnf');
     expect(res.body.data.version.version).toBe('10.11.6-MariaDB');
     expect(res.body.data.capabilities.mysql).toBe(true);
     expect(res.body.data.unit.unit).toBe('mariadb');
+  });
+
+  it('hides the server layout, profile connection details and unit PID from resellers', async () => {
+    const res = await rGet('/status').expect(200);
+    expect(res.body.data.profile).toEqual({ id: expect.any(Number), profile_name: 'localhost', engine: 'mysql', is_local: true, is_active: true });
+    expect(res.body.data.profile.host).toBeUndefined();
+    expect(res.body.data.profile.admin_user).toBeUndefined();
+    expect(res.body.data.detect).toEqual({ installed: true, serverInstalled: true, engine: 'mariadb', postgres: { installed: false } });
+    expect(res.body.data.version).toEqual({ version: '10.11.6-MariaDB', engine: 'mariadb', major: '10.11.6' });
+    expect(res.body.data.unit).toEqual({ unit: 'mariadb', state: 'active' });
+    expect(res.body.data.capabilities.mysql).toBe(true);
+    expect(JSON.stringify(res.body.data)).not.toMatch(/\/etc\/mysql|\/var\/lib|rootMyCnf|binaries|pid/);
   });
 
   describe('Manage Databases', () => {
@@ -220,17 +233,61 @@ describe('Database Services API (MariaDB via mock agent)', () => {
       await post('/users', { name: 'root', password: 'Str0ng-Passw0rd!' }).expect(400);
     });
 
+    it('checks the requested databases before creating the user, and drops it when the grant step fails', async () => {
+      // A reseller naming a database it does not own is refused before CREATE USER.
+      await rPost('/users', { name: 'rogue', password: 'Str0ng-Passw0rd!', account: 'alice', databases: ['shared_cache'] }).expect(403);
+      await post('/users', { name: 'sys', password: 'Str0ng-Passw0rd!', account: 'alice', databases: ['mysql'] }).expect(400);
+      expect(app.agent.callsTo('db.user.create')).toEqual([]);
+      expect(app.ctx.db.prepare("SELECT 1 FROM db_users WHERE name IN ('alice_rogue', 'alice_sys')").get()).toBeUndefined();
+      // The server refuses the GRANT: the freshly created user is removed again.
+      app.agent.fail('db.grant', 'db_error', 'MySQL: GRANT failed');
+      const res = await post('/users', { name: 'ghost', password: 'Str0ng-Passw0rd!', account: 'alice', databases: ['alice_shop'] });
+      app.agent.set('db.grant', app.agent.ops['db.grant']);
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(app.agent.callsTo('db.user.create')).toHaveLength(1);
+      expect(app.agent.callsTo('db.user.drop')[0].args).toMatchObject({ user: 'alice_ghost' });
+      expect(app.agent.state.users.has('alice_ghost@localhost')).toBe(false);
+      expect(app.ctx.db.prepare("SELECT 1 FROM db_users WHERE name = 'alice_ghost'").get()).toBeUndefined();
+    });
+
     it('edits grants as a diff of revoke/grant calls and refuses cross-account grants', async () => {
       await post('/databases', { name: 'blog', account: 'alice' }).expect(201);
       const res = await rPut('/users/alice_app/grants', { grants: [{ database: 'alice_blog', privileges: ['SELECT', 'INSERT', 'update'] }] }).expect(200);
       expect(res.body.data.grants).toEqual([{ database: 'alice_blog', privileges: ['INSERT', 'SELECT', 'UPDATE'] }]);
       expect(res.body.data.changes).toEqual(expect.arrayContaining([expect.objectContaining({ database: 'alice_shop', action: 'revoked' }), expect.objectContaining({ database: 'alice_blog', action: 'granted' })]));
       const live = await rGet('/users/alice_app/grants').expect(200);
-      expect(live.body.data.grants).toEqual([{ database: 'alice_blog', privileges: ['INSERT', 'SELECT', 'UPDATE'] }]);
+      expect(live.body.data.grants).toEqual([{ database: 'alice_blog', privileges: ['INSERT', 'SELECT', 'UPDATE'], hosts: ['localhost', '203.0.113.5'], mixed: false }]);
       await rPut('/users/alice_app/grants', { grants: [{ database: 'shared_cache', privileges: ['SELECT'] }] }).expect(403);
       await rPut('/users/alice_app/grants', { grants: [{ database: 'alice_blog', privileges: ['SUPER'] }] }).expect(422);
       await rPut('/users/legacy_app/grants', { grants: [] }).expect(403);
       await put('/users/alice_app/grants', { grants: [{ database: 'alice_shop', privileges: ['ALL PRIVILEGES'] }] }).expect(200);
+    });
+
+    it('reads grants at every host and revokes privileges that drifted onto one host only', async () => {
+      // A manual GRANT on the remote host only: localhost knows nothing about it.
+      app.agent.state.grants.get('alice_app@203.0.113.5').set('legacy_shop', ['SELECT']);
+      const live = await get('/users/alice_app/grants').expect(200);
+      expect(live.body.data.hosts).toEqual(['localhost', '203.0.113.5']);
+      expect(live.body.data.grants).toEqual([
+        { database: 'alice_shop', privileges: ['ALL PRIVILEGES'], hosts: ['localhost', '203.0.113.5'], mixed: false },
+        { database: 'legacy_shop', privileges: ['SELECT'], hosts: ['203.0.113.5'], mixed: true },
+      ]);
+      expect(live.body.data.perHost['203.0.113.5'].map((g) => g.database)).toEqual(['alice_shop', 'legacy_shop']);
+      expect(app.agent.callsTo('db.grants.list').map((c) => c.args.host).sort()).toEqual(['203.0.113.5', 'localhost']);
+      app.agent.calls.length = 0;
+      const res = await put('/users/alice_app/grants', { grants: [{ database: 'alice_shop', privileges: ['ALL PRIVILEGES'] }] }).expect(200);
+      expect(res.body.data.changes).toEqual([{ database: 'legacy_shop', action: 'revoked' }]);
+      expect(app.agent.callsTo('db.revoke')).toHaveLength(1);
+      expect(app.agent.callsTo('db.revoke')[0].args).toMatchObject({ user: 'alice_app', database: 'legacy_shop', hosts: ['localhost', '203.0.113.5'] });
+      expect(app.agent.callsTo('db.grant')).toEqual([]);
+      expect(app.agent.state.grants.get('alice_app@203.0.113.5').has('legacy_shop')).toBe(false);
+      // Privileges that differ per host are normalised to the requested set everywhere.
+      app.agent.state.grants.get('alice_app@203.0.113.5').set('alice_shop', ['SELECT']);
+      app.agent.calls.length = 0;
+      const fixed = await put('/users/alice_app/grants', { grants: [{ database: 'alice_shop', privileges: ['ALL PRIVILEGES'] }] }).expect(200);
+      expect(fixed.body.data.changes).toEqual([{ database: 'alice_shop', action: 'changed', privileges: ['ALL PRIVILEGES'] }]);
+      expect(app.agent.callsTo('db.grant')[0].args).toMatchObject({ database: 'alice_shop', hosts: ['localhost', '203.0.113.5'] });
+      expect(app.agent.state.grants.get('alice_app@203.0.113.5').get('alice_shop')).toEqual(['ALL PRIVILEGES']);
     });
 
     it('lists users with hosts and grants, scoped per role', async () => {
@@ -261,7 +318,7 @@ describe('Database Services API (MariaDB via mock agent)', () => {
       expect(app.agent.callsTo('db.grant')[0].args).toMatchObject({ user: 'remote_ro', database: 'shared_cache', hosts: ['203.0.113.77'] });
       expect(app.agent.state.users.has('remote_ro@localhost')).toBe(false);
       const live = await get('/users/remote_ro/grants').expect(200);
-      expect(live.body.data).toMatchObject({ hosts: ['203.0.113.77'], grants: [{ database: 'shared_cache', privileges: ['ALL PRIVILEGES'] }] });
+      expect(live.body.data).toMatchObject({ hosts: ['203.0.113.77'], grants: [{ database: 'shared_cache', privileges: ['ALL PRIVILEGES'], hosts: ['203.0.113.77'], mixed: false }] });
       expect(app.agent.callsTo('db.grants.list').every((c) => c.args.host === '203.0.113.77')).toBe(true);
       await del('/users/remote_ro').expect(200);
     });
@@ -358,6 +415,11 @@ describe('Database Services API (MariaDB via mock agent)', () => {
       expect(add.body.data.failed).toEqual([{ user: 'legacy_app', error: expect.stringMatching(/legacy_app/) }]);
       // The adopted user is cloned from the host it really exists at, not localhost.
       expect(app.agent.callsTo('db.user.add_host').find((c) => c.args.user === 'remote_app').args.fromHost).toBe('%');
+      // Resellers see the global host their users were provisioned at, read-only.
+      const mine = await rGet('/access-hosts').expect(200);
+      expect(mine.body.data.find((h) => h.host === 'office.example.com')).toMatchObject({ scope: 'global', account: null, editable: false });
+      expect(mine.body.data.find((h) => h.host === '203.0.113.5')).toMatchObject({ scope: 'account', account: 'alice', editable: true });
+      expect((await rGet('/access-hosts?account=alice').expect(200)).body.data.map((h) => h.host)).toEqual(expect.arrayContaining(['203.0.113.5', 'office.example.com']));
       await rDel(`/access-hosts/${add.body.data.id}`).expect(403);
       app.agent.calls.length = 0;
       const rm = await del(`/access-hosts/${add.body.data.id}`).expect(200);
@@ -416,6 +478,69 @@ describe('Database Services API (MariaDB via mock agent)', () => {
     });
   });
 
+  describe('Configure Remote Service IPs hook (ctx.databases.setClientAddresses)', () => {
+    it('records the source address and binds connections to remote profiles to it', async () => {
+      expect(app.ctx.databases.clientAddresses()).toEqual({ ipv4: null, ipv6: null });
+      // Local profile active: recorded, nothing to verify yet.
+      const saved = await app.ctx.databases.setClientAddresses({ ipv4: '203.0.113.10', ipv6: null });
+      expect(saved).toMatchObject({ applied: true, changed: true, verified: null, ipv4: '203.0.113.10', ipv6: null });
+      expect(app.ctx.settings.get('db.client.bind_address_ipv4')).toBe('203.0.113.10');
+      expect(app.agent.callsTo('db.ping')).toEqual([]);
+      // Local connections never carry a bind address.
+      await get('/databases').expect(200);
+      expect(app.agent.callsTo('db.databases.list')[0].args.credentials).toBeUndefined();
+
+      const remote = await post('/profiles', { profile_name: 'Remote', engine: 'mariadb', host: '198.51.100.20', admin_user: 'admin', admin_password: 'Adm1n-Secret!' }).expect(201);
+      await post(`/profiles/${remote.body.data.id}/activate`).expect(200);
+      app.agent.calls.length = 0;
+      await get('/databases').expect(200);
+      expect(app.agent.callsTo('db.databases.list')[0].args.credentials).toMatchObject({ host: '198.51.100.20', user: 'admin', bindAddress: '203.0.113.10' });
+
+      // With a remote profile active the new address is verified with a connection test.
+      app.agent.calls.length = 0;
+      const audits = [];
+      const verified = await app.ctx.databases.setClientAddresses({ ipv4: '203.0.113.11', ipv6: '2001:db8::11' }, { audit: (e) => audits.push(e) });
+      expect(verified).toMatchObject({ applied: true, changed: true, verified: true, warnings: [] });
+      expect(app.agent.callsTo('db.ping')[0].args.credentials).toMatchObject({ host: '198.51.100.20', bindAddress: '203.0.113.11' });
+      expect(audits).toEqual([{ action: 'db.client_addresses', target: 'Remote', args: { ipv4: '203.0.113.11', ipv6: '2001:db8::11', changed: true, verified: true } }]);
+
+      // An IPv6 server picks the IPv6 source; a hostname prefers IPv4.
+      await put(`/profiles/${remote.body.data.id}`, { host: '2001:db8::20' }).expect(200);
+      app.agent.calls.length = 0;
+      await get('/databases').expect(200);
+      expect(app.agent.callsTo('db.databases.list')[0].args.credentials.bindAddress).toBe('2001:db8::11');
+      await put(`/profiles/${remote.body.data.id}`, { host: 'db.example.net' }).expect(200);
+      app.agent.calls.length = 0;
+      await get('/databases').expect(200);
+      expect(app.agent.callsTo('db.databases.list')[0].args.credentials.bindAddress).toBe('203.0.113.11');
+
+      // A client that ignores bind-address is reported, not treated as a failure.
+      app.agent.set('db.ping', ({ credentials }) => ({ ok: true, version: '10.11.6-MariaDB', user: `${credentials?.user}@h`, ms: 4, warnings: [`mariadb: unknown variable 'loose-bind-address=${credentials?.bindAddress}'`] }));
+      const warned = await app.ctx.databases.setClientAddresses({ ipv4: '203.0.113.12', ipv6: null });
+      expect(warned.verified).toBe(true);
+      expect(warned.warnings[0]).toMatch(/ignores bind-address/);
+
+      // A failing connection keeps the previous address.
+      app.agent.set('db.ping', () => ({ ok: false, code: 'db_unreachable', error: "Can't assign requested address", ms: 2 }));
+      await expect(app.ctx.databases.setClientAddresses({ ipv4: '203.0.113.99', ipv6: null })).rejects.toMatchObject({ status: 502, code: 'db_bind_failed' });
+      expect(app.ctx.settings.get('db.client.bind_address_ipv4')).toBe('203.0.113.12');
+      app.agent.set('db.ping', app.agent.ops['db.ping']);
+
+      await expect(app.ctx.databases.setClientAddresses({ ipv4: 'not-an-ip' })).rejects.toMatchObject({ status: 422 });
+      await expect(app.ctx.databases.setClientAddresses({ ipv6: '203.0.113.1' })).rejects.toMatchObject({ status: 422 });
+
+      // Clearing is applied without a connection test.
+      app.agent.calls.length = 0;
+      expect(await app.ctx.databases.setClientAddresses({ ipv4: null, ipv6: null })).toMatchObject({ applied: true, changed: true, verified: null });
+      expect(app.agent.callsTo('db.ping')).toEqual([]);
+      expect(app.ctx.databases.clientAddresses()).toEqual({ ipv4: null, ipv6: null });
+
+      const local = (await get('/profiles').expect(200)).body.data.find((p) => p.profile_name === 'localhost');
+      await post(`/profiles/${local.id}/activate`).expect(200);
+      await del(`/profiles/${remote.body.data.id}`).expect(200);
+    });
+  });
+
   describe('Edit Database Configuration', () => {
     it('reads the managed include with runtime variables and writes validated changes', async () => {
       const before = await get('/config').expect(200);
@@ -429,6 +554,14 @@ describe('Database Services API (MariaDB via mock agent)', () => {
       const removed = await put('/config', { settings: { 'innodb-buffer-pool-size': null } }).expect(200);
       expect(removed.body.data.settings).toEqual({ 'max-connections': '300' });
       expect(removed.body.data.restart).toBeNull();
+      // Custom options in the managed include get a running value too.
+      await put('/config', { settings: { 'innodb-io-capacity': '2000' } }).expect(200);
+      app.agent.calls.length = 0;
+      await get('/config').expect(200);
+      const names = app.agent.callsTo('db.variables.get')[0].args.names;
+      expect(names).toEqual(expect.arrayContaining(['max_connections', 'innodb_io_capacity']));
+      expect(new Set(names).size).toBe(names.length);
+      await put('/config', { settings: { 'innodb-io-capacity': null } }).expect(200);
       await put('/config', { settings: { 'max connections': '1' } }).expect(422);
       await put('/config', { settings: { 'max-connections': '1; rm -rf /' } }).expect(422);
       const invalid = await put('/config', { settings: { 'bogus-option': '1' } }).expect(400);
@@ -510,6 +643,18 @@ describe('Database Services API (MariaDB via mock agent)', () => {
       await rPost('/upgrade', { target: 'mariadb-server' }).expect(403);
     });
 
+    it('leaves the server alone when the package was already at the newest version', async () => {
+      app.agent.set('pkg.install', ({ packages }) => ({ manager: 'apt', packages, output: [`${packages[0]} is already the newest version (1:10.11.8-0+deb12u1).`, '0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.'] }));
+      const res = await post('/upgrade', { target: 'mariadb-server', backup: false }).expect(202);
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      app.agent.set('pkg.install', app.agent.ops['pkg.install']);
+      expect(job.status).toBe('done');
+      expect(job.result).toMatchObject({ alreadyCurrent: true, installed: false, restarted: null, tablesUpgraded: null, versionBefore: '10.11.6-MariaDB', versionAfter: '10.11.6-MariaDB' });
+      expect(job.result.reason).toMatch(/already at the newest version/);
+      expect(app.agent.callsTo('db.restart')).toEqual([]);
+      expect(app.agent.callsTo('db.upgrade_tables')).toEqual([]);
+    });
+
     it('fails the job when the package manager cannot install the target', async () => {
       app.agent.fail('pkg.install', 'command_failed', 'E: Unable to locate package mariadb-server-99');
       const res = await post('/upgrade', { target: 'mariadb-server-99', backup: false }).expect(202);
@@ -526,10 +671,16 @@ describe('Database Services API (MariaDB via mock agent)', () => {
       const res = await get('/phpmyadmin').expect(200);
       expect(res.body.data).toMatchObject({ installed: true, version: '5.2.1', urlPath: '/phpmyadmin' });
       expect(res.body.data.url).toMatch(/^https:\/\/.+\/phpmyadmin$/);
+      expect(res.body.data.configFile).toBe('/etc/phpmyadmin/config.inc.php');
       await put('/phpmyadmin', { url: 'https://pma.example.com/' }).expect(200);
-      expect((await rGet('/phpmyadmin').expect(200)).body.data.url).toBe('https://pma.example.com/');
+      const mine = await rGet('/phpmyadmin').expect(200);
+      expect(mine.body.data).toEqual({ installed: true, version: '5.2.1', url: 'https://pma.example.com/', php: true, featureEnabled: true });
+      expect(JSON.stringify(mine.body.data)).not.toMatch(/\/usr\/share|\/etc\/|webConfigs|candidates|packageHint/);
       await rPut('/phpmyadmin', { url: '' }).expect(403);
       await put('/phpmyadmin', { url: 'javascript:alert(1)' }).expect(422);
+      await put('/phpmyadmin', { url: '//evil.example/pma' }).expect(422);
+      await put('/phpmyadmin', { url: 'https:///nohost' }).expect(422);
+      await put('/phpmyadmin', { url: '/pma' }).expect(200);
       await put('/phpmyadmin', { url: '' }).expect(200);
     });
   });
@@ -605,6 +756,13 @@ describe('Database Services API without a database server', () => {
     const res = await app.http.get('/api/databases/config');
     expect(res.status).toBe(501);
     expect(res.body.error.code).toBe('capability_missing');
+  });
+
+  it('setClientAddresses records the address, then reports the missing client tools as a capability error', async () => {
+    app.agent.calls.length = 0;
+    await expect(app.ctx.databases.setClientAddresses({ ipv4: '203.0.113.10', ipv6: null })).rejects.toMatchObject({ status: 501, code: 'capability_missing', capability: 'mysql' });
+    expect(app.ctx.databases.clientAddresses()).toEqual({ ipv4: '203.0.113.10', ipv6: null });
+    expect(app.agent.calls.filter((c) => c.name.startsWith('db.') && c.name !== 'db.detect')).toEqual([]);
   });
 
   it('names the postgres capability when the active profile is PostgreSQL', async () => {
@@ -732,9 +890,17 @@ describe('Database Services API (PostgreSQL via mock agent)', () => {
   });
 
   it('configuration editing and access hosts are MySQL-only features', async () => {
-    const cfg = await get('/config').expect(501);
-    expect(cfg.body.error).toMatchObject({ code: 'capability_missing', capability: 'mysql' });
-    await put('/config', { settings: { 'max-connections': '200' } }).expect(501);
+    // A PostgreSQL profile is not a missing MySQL: no install prompt, a plain notice.
+    const cfg = await get('/config').expect(409);
+    expect(cfg.body.error.code).toBe('unsupported_engine');
+    expect(cfg.body.error.message).toMatch(/postgresql\.conf/);
+    expect((await put('/config', { settings: { 'max-connections': '200' } }).expect(409)).body.error.code).toBe('unsupported_engine');
+    expect(app.agent.callsTo('db.config.read')).toEqual([]);
+    expect(app.agent.callsTo('db.config.write')).toEqual([]);
+    // No MySQL client on a PostgreSQL-only host: the address is kept for later.
+    await expect(app.ctx.databases.setClientAddresses({ ipv4: '203.0.113.10', ipv6: null })).rejects.toMatchObject({ status: 501, capability: 'mysql' });
+    expect(app.ctx.databases.clientAddresses()).toEqual({ ipv4: '203.0.113.10', ipv6: null });
+    expect(app.agent.callsTo('pg.ping')).toEqual([]);
     const hosts = await rPost('/access-hosts', { host: '203.0.113.5', account: 'dana' }).expect(201);
     expect(hosts.body.data).toMatchObject({ supported: false, applied: [], failed: [] });
     expect((await rGet('/access-hosts').expect(200)).body.meta).toMatchObject({ engine: 'postgres', supported: false });

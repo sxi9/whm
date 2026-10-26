@@ -8,6 +8,7 @@ import {
   parseEximQueue, ageToSeconds, sizeToBytes, parseMainlogLine, aggregateMainlog, summarizeMail, parseAddressTest,
   parseSpamdOptions, renderSpamdOptions, parseSpamdDefaults, renderSpamdDefaults, eximLayout, spamdLayout, greylistBackend,
   parseUpdateExim4Conf, versionAtLeast, renderManagedBlock, mergeManagedBlock, readManagedBlock, renderDkimTransportFragment, assertNoSymlinks,
+  queueResults, blockState, renderInterfaceList, renderTransportFragment,
 } from '../src/ops/mail.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
@@ -102,6 +103,15 @@ describe('mail op schemas reject injection and traversal before anything runs', 
     expect((await opError(runOp('mail.mailbox.convert', { user: 'alice', source: { format: 'mbox', path: '/home/alice/a' }, target: { format: 'maildir', path: '/home/alice/b' } }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('mail.mailbox.convert', { user: 'alice', homeDir: 'home/alice', source: { format: 'mbox', path: '/home/alice/a' }, target: { format: 'maildir', path: '/home/alice/b' } }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('mail.mailbox.inspect', { homeDir: 'relative' }, ctx))).code).toBe('invalid_args');
+    // ":" separates Dovecot location parameters (INDEX=/etc/x), so it never reaches doveadm.
+    for (const bad of ['/home/alice/mail/Maildir:INDEX=/etc/x', '/home/alice/mail:LAYOUT=fs', '/home/alice/mail dir', '/home/alice/$HOME']) {
+      expect((await opError(runOp('mail.mailbox.convert', { user: 'alice', homeDir: '/home/alice', source: { format: 'mbox', path: '/home/alice/a' }, target: { format: 'maildir', path: bad } }, ctx))).code, bad).toBe('invalid_args');
+      expect((await opError(runOp('mail.mailbox.convert', { user: 'alice', homeDir: '/home/alice', source: { format: 'mbox', path: bad }, target: { format: 'maildir', path: '/home/alice/b' } }, ctx))).code, bad).toBe('invalid_args');
+    }
+    for (const bad of [{ ipv4: '203.0.113.5; id' }, { ipv4: '2001:db8::1' }, { ipv6: '203.0.113.5' }, { ipv4: '203.0.113.5', extra: true }]) {
+      expect((await opError(runOp('mail.outbound.set', bad, ctx))).code, JSON.stringify(bad)).toBe('invalid_args');
+      expect((await opError(runOp('mail.config.include.write', { name: 'ok.conf', content: 'x', outbound: bad }, ctx))).code, JSON.stringify(bad)).toBe('invalid_args');
+    }
     expect(exec).not.toHaveBeenCalled();
   });
 
@@ -186,9 +196,24 @@ describe('mail ops refuse to act when the subsystem is missing (no side effects)
       ['mail.test_delivery', { address: 'a@example.com' }], ['mail.sendmail', { from: 'a@example.com', to: ['b@example.com'], subject: 's', text: 't' }],
       ['mail.config.include.write', { name: 'acl_rcpt.conf', content: '' }], ['mail.config.include.list', {}], ['mail.reload', {}],
       ['mail.dkim.install', { domain: 'example.com', selector: 'default', privateKeyPem: '-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----' }],
-      ['mail.greylist.init', {}], ['mail.greylist.triplets', {}],
+      ['mail.greylist.init', {}], ['mail.greylist.triplets', {}], ['mail.outbound.set', { ipv4: '203.0.113.5' }],
     ]) expect((await opError(runOp(op, args, ctx))).code, op).toBe('capability_missing');
     expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('an exim binary without /etc/exim4 or /etc/exim is an unsupported layout, not a crash', async () => {
+    if (fs.existsSync('/etc/exim4') || fs.existsSync('/etc/exim') || fs.existsSync('/etc/exim.conf')) return;
+    hasBinary.mockImplementation((bin) => bin === 'exim4');
+    exec.mockClear();
+    try {
+      expect(eximLayout()).toMatchObject({ installed: true, confDir: null, whmDir: null, aclFile: null });
+      for (const [op, args] of [['mail.config.include.write', { name: 'acl-email-filters.conf', content: '' }], ['mail.config.include.list', {}], ['mail.dkim.list', {}], ['mail.queue.list', {}]]) {
+        const err = await opError(runOp(op, args, ctx));
+        expect(err.code, op).toBe('capability_missing');
+        expect(err.message).toMatch(/Unsupported Exim layout/);
+      }
+      expect(exec).not.toHaveBeenCalled();
+    } finally { hasBinary.mockRestore(); }
   });
 
   it('spamd writer needs SpamAssassin; detection and reads work anywhere', async () => {
@@ -215,10 +240,22 @@ describe('pure parsers and renderers', () => {
     expect(q[0]).toMatchObject({ id: ID, ageSeconds: 1500, sizeBytes: 1229, sender: 'sender@example.com', frozen: true });
     expect(q[0].recipients).toEqual([{ address: 'recipient@example.com', delivered: false }, { address: 'other@example.org', delivered: true }]);
     expect(q[1]).toMatchObject({ sender: '<>', frozen: false, ageSeconds: 10800, sizeBytes: 15360 });
+    // Exim keeps local-part case: a recipient starting with "D" is not the delivered marker.
+    const caps = parseEximQueue(` 25m  1.2K ${ID} <sender@example.com>\n          Dave@example.com\n        D Dan@example.net\n`);
+    expect(caps[0].recipients).toEqual([{ address: 'Dave@example.com', delivered: false }, { address: 'Dan@example.net', delivered: true }]);
     expect(parseEximQueue('')).toEqual([]);
     expect(ageToSeconds('2d')).toBe(172800);
     expect(ageToSeconds('bogus')).toBeNull();
     expect(sizeToBytes('2.5M')).toBe(2621440);
+  });
+
+  it('reports every id exim stayed silent about as failed when the batch exits non-zero', () => {
+    const ids = [ID, '1RfGRb-0001Zy-3v', '1RfGRc-0001Zz-4w'];
+    expect(queueResults(ids, 0, '').every((r) => r.ok)).toBe(true);
+    const partial = queueResults(ids, 1, `Message ${ID} has been removed\nMessage 1RfGRb-0001Zy-3v not found\n`);
+    expect(partial.map((r) => r.ok)).toEqual([true, false, false]);
+    expect(partial[2].detail).toMatch(/no confirmation from exim \(exit 1\)/);
+    expect(queueResults([ID], 0, `Message ${ID} is already frozen`)).toEqual([{ id: ID, ok: true, detail: `Message ${ID} is already frozen` }]);
   });
 
   it('parses mainlog lines, groups per message and summarises', () => {
@@ -262,13 +299,25 @@ describe('pure parsers and renderers', () => {
     expect(versionAtLeast('4.92', [4, 94])).toBe(false);
     expect(versionAtLeast('5.0', [4, 94])).toBe(true);
     expect(versionAtLeast(null, [4, 94])).toBe(false);
-    const layout = { includeMode: 'debian-macro', aclFile: '/etc/exim4/whm/acl_rcpt.conf', localDomainsFile: '/etc/exim4/whm/local_domains.lst', relayDomainsFile: '/etc/exim4/whm/relay_domains.lst', otherHostnames: ['host.example.com'], debianRelayDomains: ['backup.example.net'], dkimDir: '/etc/exim4/whm/dkim', confDir: '/etc/exim4' };
+    const layout = { includeMode: 'debian-macro', aclFile: '/etc/exim4/whm/acl-email-filters.conf', localDomainsFile: '/etc/exim4/whm/local_domains.lst', relayDomainsFile: '/etc/exim4/whm/relay_domains.lst', otherHostnames: ['host.example.com'], debianRelayDomains: ['backup.example.net'], dkimDir: '/etc/exim4/whm/dkim', confDir: '/etc/exim4' };
     const block = renderManagedBlock(layout, { sqliteDbfile: '/var/lib/whm/greylist/greylist.db' });
-    expect(block).toContain('CHECK_RCPT_LOCAL_ACL_FILE = /etc/exim4/whm/acl_rcpt.conf\nsqlite_dbfile = /var/lib/whm/greylist/greylist.db');
-    expect(block).not.toMatch(/MAIN_LOCAL_DOMAINS|DKIM_/);
+    expect(block).toContain('CHECK_RCPT_LOCAL_ACL_FILE = /etc/exim4/whm/acl-email-filters.conf\nsqlite_dbfile = /var/lib/whm/greylist/greylist.db');
+    expect(block).not.toMatch(/MAIN_LOCAL_DOMAINS|DKIM_|REMOTE_SMTP_INTERFACE/);
     expect(renderManagedBlock(layout)).not.toContain('sqlite_dbfile');
-    expect(readManagedBlock(`X = 1\n${block}\nY = 2\n`)).toEqual({ present: true, sqliteDbfile: '/var/lib/whm/greylist/greylist.db' });
-    expect(readManagedBlock('X = 1\n')).toEqual({ present: false, sqliteDbfile: null });
+    expect(readManagedBlock(`X = 1\n${block}\nY = 2\n`)).toEqual({ present: true, sqliteDbfile: '/var/lib/whm/greylist/greylist.db', aclMacro: true, outbound: null });
+    expect(readManagedBlock('X = 1\n')).toEqual({ present: false, sqliteDbfile: null, aclMacro: null, outbound: null });
+    // With service-configuration's ACL chain in place the macro is theirs: the block leaves it out.
+    const chained = renderManagedBlock(layout, { aclMacro: false, sqliteDbfile: '/var/lib/whm/greylist/greylist.db' });
+    expect(chained).not.toContain('CHECK_RCPT_LOCAL_ACL_FILE');
+    expect(chained).toContain('sqlite_dbfile = /var/lib/whm/greylist/greylist.db');
+    expect(readManagedBlock(chained).aclMacro).toBe(false);
+    // Outbound source addresses (Configure Remote Service IPs) via Debian's REMOTE_SMTP_INTERFACE macro.
+    const outbound = renderManagedBlock(layout, { outbound: { ipv4: '203.0.113.5', ipv6: '2001:db8::1' } });
+    expect(outbound).toContain('.ifndef REMOTE_SMTP_INTERFACE\nREMOTE_SMTP_INTERFACE = <; 203.0.113.5 ; 2001:db8::1\n.endif');
+    expect(readManagedBlock(outbound).outbound).toEqual({ ipv4: '203.0.113.5', ipv6: '2001:db8::1' });
+    expect(readManagedBlock(renderManagedBlock(layout, { outbound: { ipv6: '2001:db8::1' } })).outbound).toEqual({ ipv4: null, ipv6: '2001:db8::1' });
+    expect(renderInterfaceList({ ipv4: null, ipv6: null })).toBeNull();
+    expect(renderManagedBlock(layout, { outbound: { ipv4: null } })).not.toContain('REMOTE_SMTP_INTERFACE');
     // Email Routing lists override Debian's dc_other_hostnames / dc_relay_domains, so those are merged in.
     const full = renderManagedBlock(layout, { domainLists: true, dkim: true });
     expect(full).toContain('.ifndef MAIN_LOCAL_DOMAINS\nMAIN_LOCAL_DOMAINS = @:localhost:host.example.com:/etc/exim4/whm/local_domains.lst\n.endif');
@@ -277,11 +326,14 @@ describe('pure parsers and renderers', () => {
     expect(full).toContain('.ifndef DKIM_PRIVATE_KEY\nDKIM_DOMAIN = ${lc:${domain:$h_from:}}');
     expect(full).toContain('DKIM_SELECTOR = ${lookup{${lc:${domain:$h_from:}}}lsearch{/etc/exim4/whm/dkim/selectors.lst}{$value}{default}}');
     expect(full).toContain('DKIM_PRIVATE_KEY = ${lookup{${lc:${domain:$h_from:}}.key}dsearch{/etc/exim4/whm/dkim}{/etc/exim4/whm/dkim/$value}{0}}\nDKIM_CANON = relaxed\n.endif');
-    const rhel = { includeMode: 'manual', aclFile: '/etc/exim/whm/acl_rcpt.conf', localDomainsFile: '/etc/exim/whm/local_domains.lst', relayDomainsFile: '/etc/exim/whm/relay_domains.lst', dkimDir: '/etc/exim/whm/dkim', confDir: '/etc/exim' };
-    const main = renderManagedBlock(rhel, { sqliteDbfile: '/var/lib/whm/greylist/greylist.db', domainLists: true, dkim: true });
-    expect(main).not.toMatch(/CHECK_RCPT_LOCAL_ACL_FILE|DKIM_/);
+    const rhel = { includeMode: 'manual', aclFile: '/etc/exim/whm/acl-email-filters.conf', localDomainsFile: '/etc/exim/whm/local_domains.lst', relayDomainsFile: '/etc/exim/whm/relay_domains.lst', dkimDir: '/etc/exim/whm/dkim', confDir: '/etc/exim' };
+    const main = renderManagedBlock(rhel, { sqliteDbfile: '/var/lib/whm/greylist/greylist.db', domainLists: true, dkim: true, outbound: { ipv4: '203.0.113.5' } });
+    expect(main).not.toMatch(/CHECK_RCPT_LOCAL_ACL_FILE|DKIM_|REMOTE_SMTP_INTERFACE/);
     expect(main).toContain('domainlist local_domains = @ : localhost : /etc/exim/whm/local_domains.lst\ndomainlist relay_to_domains = /etc/exim/whm/relay_domains.lst');
     expect(renderDkimTransportFragment(rhel)).toContain('dkim_private_key = ${lookup{${lc:${domain:$h_from:}}.key}dsearch{/etc/exim/whm/dkim}{/etc/exim/whm/dkim/$value}{0}}');
+    // Manual layouts carry the interface in a transport fragment instead.
+    expect(renderTransportFragment(rhel, { ipv4: '203.0.113.5', ipv6: '2001:db8::1' })).toContain('\ninterface = <; 203.0.113.5 ; 2001:db8::1\n');
+    expect(renderTransportFragment(rhel, null)).not.toContain('interface =');
     const merged = mergeManagedBlock('MAIN_TLS_ENABLE = yes\n', block);
     expect(merged.startsWith('MAIN_TLS_ENABLE = yes\n\n# BEGIN WHM panel')).toBe(true);
     expect(merged.endsWith('# END WHM panel (Email filters)\n')).toBe(true);
@@ -289,6 +341,18 @@ describe('pure parsers and renderers', () => {
     expect(replaced).toBe(`MAIN_TLS_ENABLE = yes\n\n${renderManagedBlock(layout)}\nLOCAL_AFTER = 1\n`);
     expect(replaced.match(/BEGIN WHM panel/g)).toHaveLength(1);
     expect(mergeManagedBlock(null, block)).toBe(`${block}\n`);
+  });
+
+  it('only carries the DKIM macros once a key (and so the selector index) is installed', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-dkim-'));
+    const layout = { localDomainsFile: path.join(root, 'local_domains.lst'), relayDomainsFile: path.join(root, 'relay_domains.lst'), dkimDir: path.join(root, 'dkim') };
+    expect(blockState(layout)).toEqual({ domainLists: false, dkim: false });
+    fs.mkdirSync(layout.dkimDir);
+    fs.writeFileSync(path.join(layout.dkimDir, 'selectors.lst'), '# empty\n');
+    expect(blockState(layout).dkim).toBe(false);
+    fs.writeFileSync(path.join(layout.dkimDir, 'example.com.key'), 'key');
+    fs.writeFileSync(layout.relayDomainsFile, '');
+    expect(blockState(layout)).toEqual({ domainLists: true, dkim: true });
   });
 
   it('parses exim -bt output', () => {
@@ -302,11 +366,13 @@ describe('pure parsers and renderers', () => {
     const rendered = renderSpamdOptions(parsed);
     expect(rendered).toBe('--max-children=5 --listen=127.0.0.1:783 --allowed-ips=127.0.0.1,::1 --username=debian-spamd --nice=10 --create-prefs --helper-home-dir=/var/lib/spamassassin --unknown-flag');
     expect(parseSpamdOptions(rendered)).toEqual(parsed);
+    // Distro comments survive a save; only the panel's own header is not duplicated.
     const defaults = parseSpamdDefaults('# comment\nENABLED=1\nOPTIONS="--create-prefs --max-children 5"\nCRON=0\nNICE="--nicelevel 15"\n');
-    expect(defaults).toEqual({ enabled: true, cron: false, options: '--create-prefs --max-children 5', other: ['NICE="--nicelevel 15"'] });
+    expect(defaults).toEqual({ enabled: true, cron: false, options: '--create-prefs --max-children 5', other: ['# comment', 'NICE="--nicelevel 15"'] });
     const text = renderSpamdDefaults({ flavor: 'debian', enabled: false, cron: true, options: '--max-children=3', other: defaults.other });
-    expect(text).toContain('ENABLED=0\nOPTIONS="--max-children=3"\nCRON=1\nNICE="--nicelevel 15"\n');
-    expect(parseSpamdDefaults(text)).toEqual({ enabled: false, cron: true, options: '--max-children=3', other: ['NICE="--nicelevel 15"'] });
+    expect(text).toContain('ENABLED=0\nOPTIONS="--max-children=3"\nCRON=1\n# comment\nNICE="--nicelevel 15"\n');
+    expect(parseSpamdDefaults(text)).toEqual({ enabled: false, cron: true, options: '--max-children=3', other: ['# comment', 'NICE="--nicelevel 15"'] });
+    expect(parseSpamdDefaults(renderSpamdDefaults({ flavor: 'debian', enabled: true, cron: false, options: '', other: parseSpamdDefaults(text).other })).other).toEqual(['# comment', 'NICE="--nicelevel 15"']);
     expect(renderSpamdDefaults({ flavor: 'rhel', options: '-d -c -m5', other: [] })).toContain('SPAMDOPTIONS="-d -c -m5"');
     expect(parseSpamdDefaults('SPAMDOPTIONS="-d -c -m5"').options).toBe('-d -c -m5');
   });

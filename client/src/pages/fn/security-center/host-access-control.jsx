@@ -23,8 +23,9 @@ export default function HostAccessControl({ fn }) {
     setBusy(true);
     try {
       const payload = rules.map((r) => ({ service: r.service.trim(), source: r.source.trim(), action: r.action, ...(r.comment.trim() ? { comment: r.comment.trim() } : {}) }));
-      await api.put('/security/host-access', { rules: payload });
+      const { data: result } = await api.put('/security/host-access', { rules: payload });
       toast.success('/etc/hosts.allow written');
+      if (result?.written?.denyUntouched) toast.info('/etc/hosts.deny already holds rules that were not written by the panel; it was left in place and those rules still apply.');
       refetch();
     } catch (err) { toast.error(err); } finally { setBusy(false); }
   };
@@ -38,6 +39,7 @@ export default function HostAccessControl({ fn }) {
       {data && (
         <>
           {data.files && !data.files.supported && <div className="banner banner-info"><div>libwrap was not detected on this host; the files are still written but only daemons linked against TCP wrappers honour them.</div></div>}
+          {data.files && data.files.denyManaged === false && <div className="banner banner-warning"><div><strong>/etc/hosts.deny contains rules the panel did not write.</strong> They keep applying after every save here (the panel only rewrites that file once it manages it). Review them below and move them into this list if they should be managed from the panel.</div></div>}
           <Card title="Rules" actions={<Button size="sm" icon={Plus} onClick={() => setRules((rs) => [...rs, { ...EMPTY }])}>Add rule</Button>} padded={false}>
             <div className="table-wrap">
               <table>
@@ -47,7 +49,7 @@ export default function HostAccessControl({ fn }) {
                   {rules.map((r, i) => (
                     <tr key={i}>
                       <td><TextInput value={r.service} onChange={(v) => update(i, { service: v })} list="whm-known-services" /></td>
-                      <td><TextInput value={r.source} onChange={(v) => update(i, { source: v })} placeholder="192.0.2.0/24" /></td>
+                      <td><TextInput value={r.source} onChange={(v) => update(i, { source: v })} placeholder="192.0.2.0/24 or [2001:db8::]/32" /></td>
                       <td><Select value={r.action} onChange={(v) => update(i, { action: v })} options={[{ value: 'allow', label: 'Allow' }, { value: 'deny', label: 'Deny' }]} /></td>
                       <td><TextInput value={r.comment} onChange={(v) => update(i, { comment: v })} placeholder="optional" /></td>
                       <td>
@@ -69,6 +71,7 @@ export default function HostAccessControl({ fn }) {
                 <Button disabled={!dirty} onClick={() => refetch()}>Reset</Button>
               </FormActions>
               <p className="muted">Tip: to lock SSH down, add <code>sshd</code> allow rules for your networks first, then an <code>sshd ALL deny</code> rule at the end.</p>
+              <p className="muted">IPv6 addresses and networks are written in libwrap's bracketed form (<code>[2001:db8::]/32</code>) automatically. For IPv4 networks the <code>n.n.n.n/m.m.m.m</code> mask form works on every distribution; <code>n.n.n.n/prefix</code> is honoured by Debian/Ubuntu's libwrap but not by RHEL-family builds.</p>
             </div>
           </Card>
           <Card title="Current files">

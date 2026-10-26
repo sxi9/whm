@@ -7,7 +7,13 @@ import { runOp, createContext, OpError } from '../src/lib.js';
 import {
   renderVhost, parseVhostMeta, renderRedirects, renderGlobalInclude, renderPhpPool, renderLogrotate, mergeKeyValueFile, renderProftpd, vsftpdSettings, pureFtpdSettings,
   ftpSettingsFrom, parseServerStatus, parseApacheVersion, parseModules, parseDoveconf, rewriteListen, apacheLayout, eximLayout, phpLayout, SERVICE_ROLES, hintsFor, ensureRootLogDir, confPath, parseEximVersion,
+  mergeEximBlock, readEximBlock, stripEximBlock, eximTlsLibrary, primaryGroupName, EXIM_SENTINEL_MACRO,
 } from '../src/ops/web.js';
+
+// Fake host for the layout detection: which paths exist, what they contain, which binaries resolve.
+function hostIo({ files = {}, dirs = [], binaries = [] }) {
+  return { exists: (p) => dirs.includes(p) || p in files, readText: (p) => (p in files ? files[p] : null), hasBinary: (b) => binaries.includes(b) };
+}
 
 vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
@@ -66,6 +72,15 @@ describe('web op schemas reject injection and traversal before anything runs', (
     expect(exec).not.toHaveBeenCalled();
     for (const p of ['/home/alice/public_html', '/home/alice/public_html/shop.example.com', '/etc/ssl/whm/example.com/fullchain.pem', '/var/log/whm/domlogs/alice']) expect(confPath.safeParse(p).success, p).toBe(true);
     for (const p of ['relative', '/a b', '/a"b', '/a\\b', '/a:b', '/a;b', '/a\nb', '/a/../b', '/a/..', '', '/a\0']) expect(confPath.safeParse(p).success, JSON.stringify(p)).toBe(false);
+  });
+
+  it('status probes only a valid port/bind address', async () => {
+    exec.mockClear();
+    expect((await opError(runOp('web.status', { port: 0 }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('web.status', { port: 8080, bind: 'localhost' }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('web.status', { port: 8080, bind: '127.0.0.1; id' }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('web.status', { host: '127.0.0.1' }, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
   });
 
   it('global directives, MPM and ports', async () => {
@@ -155,6 +170,10 @@ describe('renderers produce the expected daemon syntax', () => {
     expect(text).toContain('CustomLog "/home/alice/logs/example.com-access.log" combined');
     expect(text).toContain('UserDir disabled');
     expect(text).toContain('SetHandler "proxy:unix:/run/php/php8.3-fpm-alice.sock|fcgi://localhost"');
+    // Basic auth reaches PHP-FPM on the plain and the TLS vhost alike.
+    expect(text.match(/SetEnvIf Authorization "\(\.\*\)" HTTP_AUTHORIZATION=\$1/g)).toHaveLength(2);
+    expect(renderVhost({ ...VHOST, phpVersion: '8.3' }).match(/SetEnvIf Authorization/g)).toHaveLength(1);
+    expect(renderVhost(VHOST)).not.toContain('SetEnvIf Authorization');
     expect(text).toContain('RedirectMatch 301 "^/?(.*)$" "https://new.example.com/$1"');
     expect(text).toContain('<If "%{HTTP_HOST} !~ /^www\\./i">');
     expect(text).toContain('RedirectMatch 302 "^/old" "https://x.org/landing"');
@@ -332,21 +351,79 @@ describe('renderers produce the expected daemon syntax', () => {
     expect(rewriteListen(bound, { http: 80, https: 443 })).toMatch(/^Listen 80$/m);
   });
 
+  it('exim layout follows dc_use_split_config: fragments when split, a localmacros block when unsplit (the Debian default), a manual include on RHEL', () => {
+    const split = eximLayout(hostIo({ dirs: ['/etc/exim4', '/etc/exim4/conf.d'], files: { '/etc/exim4/update-exim4.conf.conf': "dc_use_split_config='true'\n" }, binaries: ['exim4', 'update-exim4.conf'] }));
+    expect(split).toMatchObject({ installed: true, flavor: 'debian', splitConfig: true, mainConf: null, updateConf: true, macroFile: '/etc/exim4/exim4.conf.localmacros', emailAclFile: '/etc/exim4/whm/acl-email-filters.conf', rcptAclSource: '/etc/exim4/conf.d/acl/30_exim4-config_check_rcpt', sentinel: EXIM_SENTINEL_MACRO });
+    expect(split.slots.main).toEqual({ path: '/etc/exim4/conf.d/main/001_whm_service_config', hookable: true, block: null });
+    expect(split.slots.acl_rcpt).toMatchObject({ path: '/etc/exim4/whm/acl-rcpt-local.conf', hookable: true, macro: 'CHECK_RCPT_LOCAL_ACL_FILE', includes: '/etc/exim4/whm/acl-email-filters.conf' });
+    // conf.d exists on every Debian host but is ignored unless split config is on: the main slot must not be a fragment there.
+    for (const conf of ["dc_use_split_config='false'\n", '']) {
+      const unsplit = eximLayout(hostIo({ dirs: ['/etc/exim4', '/etc/exim4/conf.d'], files: { '/etc/exim4/update-exim4.conf.conf': conf }, binaries: ['exim4'] }));
+      expect(unsplit).toMatchObject({ flavor: 'debian', splitConfig: false, mainConf: '/etc/exim4/exim4.conf.template', rcptAclSource: '/etc/exim4/exim4.conf.template' });
+      expect(unsplit.slots.main.path).toBe('/etc/exim4/exim4.conf.localmacros');
+      expect(unsplit.slots.main.hookable).toBe(true);
+      expect(unsplit.slots.main.block).toMatch(/^# BEGIN WHM panel \(Service Configuration/);
+      expect(unsplit.slots.acl_rcpt).toMatchObject({ path: '/etc/exim4/whm/acl-rcpt-local.conf', macro: 'CHECK_RCPT_LOCAL_ACL_FILE' });
+    }
+    const rhel = eximLayout(hostIo({ dirs: ['/etc/exim'], files: { '/etc/exim/exim.conf': '' }, binaries: ['exim'] }));
+    expect(rhel).toMatchObject({ flavor: 'rhel', splitConfig: false, mainConf: '/etc/exim/exim.conf', macroFile: null, emailAclFile: '/etc/exim/whm/acl-email-filters.conf' });
+    expect(rhel.slots.main).toEqual({ path: '/etc/exim/whm/service_config.conf', hookable: false, block: null });
+    expect(rhel.slots.acl_rcpt).toMatchObject({ path: '/etc/exim/whm/acl-rcpt-local.conf', hookable: false, macro: null });
+    expect(eximLayout(hostIo({}))).toBeNull();
+  });
+
+  it('the unsplit main slot is a managed block that leaves the admin\'s and the other categories\' localmacros lines alone', () => {
+    const admin = "MAIN_TLS_ENABLE = true\n# BEGIN WHM panel (Email filters) - managed block, edits inside are overwritten\nsqlite_dbfile = /var/lib/whm/greylist/greylist.db\n# END WHM panel (Email filters)\n";
+    const once = mergeEximBlock(admin, 'WHM_SERVICE_CONFIG = 1\nsmtp_accept_max = 100');
+    expect(once.startsWith(admin)).toBe(true);
+    expect(readEximBlock(once)).toBe('WHM_SERVICE_CONFIG = 1\nsmtp_accept_max = 100\n');
+    const twice = mergeEximBlock(once, 'WHM_SERVICE_CONFIG = 1\nsmtp_accept_max = 50');
+    expect(twice.match(/BEGIN WHM panel \(Service Configuration/g)).toHaveLength(1);
+    expect(twice).toContain('smtp_accept_max = 50');
+    expect(twice).not.toContain('smtp_accept_max = 100');
+    expect(twice).toContain('sqlite_dbfile = /var/lib/whm/greylist/greylist.db');
+    expect(stripEximBlock(twice)).toBe(admin);
+    expect(readEximBlock(admin)).toBeNull();
+    expect(stripEximBlock(null)).toBe('');
+    expect(mergeEximBlock(null, 'x')).toMatch(/^# BEGIN WHM panel \(Service Configuration: Exim main options\)[^\n]*\nx\n# END WHM panel \(Service Configuration: Exim main options\)\n$/);
+    expect(eximTlsLibrary(['crypteq', 'GnuTLS', 'DKIM'])).toBe('gnutls');
+    expect(eximTlsLibrary(['TLS=GnuTLS'])).toBe('gnutls');
+    expect(eximTlsLibrary(['OpenSSL'])).toBe('openssl');
+    expect(eximTlsLibrary(null)).toBeNull();
+  });
+
+  it('per-account logrotate stanzas take the real primary group from /etc/group', () => {
+    const passwd = 'root:x:0:0:root:/root:/bin/bash\nalice:x:30001:30050::/home/alice:/bin/bash\nbob:x:30002:30002::/home/bob:/bin/sh\neve:x:30003:30099::/home/eve:/bin/sh\n';
+    const group = 'root:x:0:\nhosting:x:30050:\nbob:x:30002:\nBad Group:x:30099:\n';
+    expect(primaryGroupName('alice', { passwd, group })).toBe('hosting');
+    expect(primaryGroupName('bob', { passwd, group })).toBe('bob');
+    // An unknown or unrenderable group name falls back to the caller's value.
+    expect(primaryGroupName('eve', { passwd, group })).toBeNull();
+    expect(primaryGroupName('nobody', { passwd, group })).toBeNull();
+    expect(primaryGroupName('alice', { passwd: null, group: null })).toBeNull();
+  });
+
   it('exim hints name only the manual steps a host still needs', () => {
-    const split = { splitConfig: true, mainConf: null, slots: { main: { path: '/etc/exim4/conf.d/main/001_whm_service_config', hookable: true }, acl_rcpt: { path: '/etc/exim4/whm/acl_rcpt_protect.conf', hookable: true }, acl_data: { path: '/etc/exim4/whm/acl_data_whm.conf', hookable: true } } };
-    const live = { main: { ...split.slots.main, hooked: true, claimedBy: null }, acl_rcpt: { ...split.slots.acl_rcpt, hooked: true, claimedBy: null }, acl_data: { ...split.slots.acl_data, hooked: true, claimedBy: null } };
+    const split = { splitConfig: true, mainConf: null, macroFile: '/etc/exim4/exim4.conf.localmacros', rcptAclSource: '/etc/exim4/conf.d/acl/30_exim4-config_check_rcpt', slots: { main: { path: '/etc/exim4/conf.d/main/001_whm_service_config', hookable: true }, acl_rcpt: { path: '/etc/exim4/whm/acl-rcpt-local.conf', hookable: true }, acl_data: { path: '/etc/exim4/whm/acl_data_whm.conf', hookable: true } } };
+    const live = { main: { ...split.slots.main, exists: true, hooked: true, claimedBy: null }, acl_rcpt: { ...split.slots.acl_rcpt, hooked: true, claimedBy: null }, acl_data: { ...split.slots.acl_data, hooked: true, claimedBy: null } };
     expect(hintsFor(split, live)).toEqual([]);
     // Hookable but not yet written: the next save defines the macro itself, so no manual step.
     expect(hintsFor(split, { ...live, acl_rcpt: { ...live.acl_rcpt, hooked: false } })).toEqual([]);
+    expect(hintsFor(split, { ...live, main: { ...live.main, exists: false, hooked: false } })).toEqual([]);
+    // Written but absent from the generated configuration: the layout/mode is off.
+    const stale = hintsFor(split, { ...live, main: { ...live.main, hooked: false } });
+    expect(stale).toHaveLength(1);
+    expect(stale[0]).toMatch(/dc_use_split_config/);
     const claimed = hintsFor(split, { ...live, acl_rcpt: { ...live.acl_rcpt, hooked: false, claimedBy: '/etc/exim4/whm/acl_rcpt.conf' } });
     expect(claimed).toHaveLength(1);
     expect(claimed[0]).toMatch(/CHECK_RCPT_LOCAL_ACL_FILE already points at \/etc\/exim4\/whm\/acl_rcpt\.conf/);
+    expect(claimed[0]).toMatch(/Save "Filter Incoming Emails by Country"/);
     expect(claimed[0]).toMatch(/30_exim4-config_check_rcpt/);
-    expect(claimed[0]).toContain('.include /etc/exim4/whm/acl_rcpt_protect.conf');
-    const rhel = { splitConfig: false, mainConf: '/etc/exim/exim.conf', slots: { main: { path: '/etc/exim/whm/service_config.conf', hookable: false }, acl_rcpt: { path: '/etc/exim/whm/acl_rcpt_protect.conf', hookable: false }, acl_data: { path: '/etc/exim/whm/acl_data_whm.conf', hookable: false } } };
+    expect(claimed[0]).toContain('.include /etc/exim4/whm/acl-rcpt-local.conf');
+    const rhel = { splitConfig: false, mainConf: '/etc/exim/exim.conf', rcptAclSource: '/etc/exim/exim.conf', slots: { main: { path: '/etc/exim/whm/service_config.conf', hookable: false }, acl_rcpt: { path: '/etc/exim/whm/acl-rcpt-local.conf', hookable: false }, acl_data: { path: '/etc/exim/whm/acl_data_whm.conf', hookable: false } } };
     const none = hintsFor(rhel, { main: { ...rhel.slots.main, hooked: false }, acl_rcpt: { ...rhel.slots.acl_rcpt, hooked: false }, acl_data: { ...rhel.slots.acl_data, hooked: false } });
     expect(none).toHaveLength(3);
-    expect(none[1]).toContain('.include /etc/exim/whm/acl_rcpt_protect.conf');
+    expect(none[1]).toContain('.include /etc/exim/whm/acl-rcpt-local.conf');
     expect(none[1]).toContain('/etc/exim/exim.conf');
   });
 

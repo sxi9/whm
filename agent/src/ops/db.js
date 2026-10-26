@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { z } from 'zod';
@@ -43,6 +44,8 @@ const configValue = z.string().regex(/^[A-Za-z0-9_./:%,+=-]{0,255}$/, 'Option va
 const variableName = z.string().regex(/^[A-Za-z0-9_%]{1,64}$/);
 const packageName = z.string().regex(/^[a-z0-9][a-z0-9+._-]{0,80}$/);
 
+const ipAddress = z.string().max(45).refine((v) => net.isIP(v) !== 0, 'Must be an IPv4 or IPv6 address');
+
 const credentials = z.object({
   host: host.optional(),
   port: z.number().int().min(1).max(65535).optional(),
@@ -50,6 +53,9 @@ const credentials = z.object({
   password: z.string().max(256).regex(/^[^\n\r\0]*$/).optional(),
   socket: arg.absPath.optional(),
   database: pgName.optional(),
+  // Local source address for TCP connections to remote servers (Configure
+  // Remote Service IPs).
+  bindAddress: ipAddress.optional(),
 }).strict().optional();
 
 const withCreds = (shape) => z.object({ ...shape, credentials }).strict();
@@ -71,6 +77,21 @@ function writeAtomic(file, content, mode = 0o644) {
   fs.writeFileSync(tmp, content, { mode });
   fs.chmodSync(tmp, mode);
   fs.renameSync(tmp, file);
+}
+
+// Credential files are written in place: no sibling .whm-bak / .whm-tmp files,
+// which would sit outside the single allowed path and keep the previous
+// password on disk. A backup left behind by earlier versions is removed.
+function writeSecret(file, content) {
+  const fd = fs.openSync(file, 'w', 0o600);
+  try {
+    fs.fchmodSync(fd, 0o600);
+    fs.writeSync(fd, content);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  try { fs.unlinkSync(`${file}.whm-bak`); } catch { /* no stale backup */ }
 }
 
 function restore(file, previous) {
@@ -108,13 +129,20 @@ export function renderClientCnf(creds) {
   if (creds.socket) lines.push(`socket=${optionValue(creds.socket)}`);
   if (creds.user) lines.push(`user=${optionValue(creds.user)}`);
   if (creds.password != null) lines.push(`password=${optionValue(creds.password)}`);
+  // "loose-": MySQL clients honour bind-address, MariaDB clients only warn.
+  if (creds.bindAddress) lines.push(`loose-bind-address=${optionValue(creds.bindAddress)}`);
   return `${lines.join('\n')}\n`;
+}
+
+// Non-fatal client diagnostics (e.g. "unknown variable 'loose-bind-address'").
+export function clientWarnings(stderr) {
+  return String(stderr || '').split('\n').map((l) => l.trim()).filter((l) => /^(warning|\S+: unknown (variable|option))/i.test(l));
 }
 
 // Runs fn(defaultsArgv) with a short-lived 0600 credentials file; falls back to
 // /root/.my.cnf and finally to the caller's own socket authentication.
 async function withDefaults(creds, ctx, fn) {
-  if (creds && (creds.user || creds.password != null || creds.host || creds.socket)) {
+  if (creds && (creds.user || creds.password != null || creds.host || creds.socket || creds.bindAddress)) {
     ctx.assertAllowedPath(TMP_DIR, 'write');
     fs.mkdirSync(TMP_DIR, { recursive: true, mode: 0o700 });
     const file = path.join(TMP_DIR, `my-${process.pid}-${crypto.randomBytes(6).toString('hex')}.cnf`);
@@ -153,7 +181,7 @@ export function parseBatch(stdout, { headers = true } = {}) {
 }
 
 // Executes SQL (over stdin) and returns the parsed batch output.
-async function mysql(sql, creds, ctx, { headers = true, timeoutMs = 120_000, database } = {}) {
+async function mysql(sql, creds, ctx, { headers = true, timeoutMs = 120_000, database, onStderr } = {}) {
   const bin = requireClient();
   return withDefaults(creds, ctx, async (defaults) => {
     const argv = [...defaults, '--batch', '--no-auto-rehash', '--connect-timeout=10'];
@@ -164,6 +192,7 @@ async function mysql(sql, creds, ctx, { headers = true, timeoutMs = 120_000, dat
       const err = classifyMysqlError(stderr);
       throw new OpError(err.code, `MySQL: ${err.message}`, { errno: err.errno });
     }
+    onStderr?.(stderr);
     return parseBatch(stdout, { headers });
   });
 }
@@ -269,16 +298,34 @@ export function renderCnf(settings) {
   return `${lines.join('\n')}\n`;
 }
 
-async function validateServerConfig() {
-  const server = findBin(SERVER_BINS);
+// mysqld refuses to start as root ("Please read 'Security' section of the
+// manual") even for --validate-config, so the probe always runs as the mysql
+// user. A probe that could not run at all (root guard, missing user, missing
+// data dir permissions) is reported as not validated rather than as a rejection
+// so a valid file is never rolled back by a mis-probe.
+const PROBE_FAILURES = /Please read ["']?Security["']? section|Can't change to run as user|Can't create test file|Can't lock aria control file|InnoDB: Unable to lock|Permission denied|Could not open the mysql\.plugin table/i;
+const CONFIG_REJECTIONS = /unknown (variable|option)|ambiguous option|error while loading|unknown suffix|option '[^']*' requires an argument|Wrong value for|value is invalid|Error while setting value/i;
+
+export function classifyProbeOutput(code, text) {
+  const lines = String(text || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  const rejection = lines.find((l) => CONFIG_REJECTIONS.test(l));
+  if (rejection) return { validated: true, ok: false, output: rejection };
+  if (code === 0) return { validated: true, ok: true, output: lines.pop() || '' };
+  const failure = lines.find((l) => PROBE_FAILURES.test(l));
+  if (failure) return { validated: false, ok: true, output: `configuration not validated (${failure})` };
+  return { validated: true, ok: false, output: lines.pop() || `server exited with status ${code}` };
+}
+
+export async function validateServerConfig(server = findBin(SERVER_BINS)) {
   if (!server) return { validated: false, ok: true, output: 'server binary not found; configuration not validated' };
-  const probe = await exec(server, ['--validate-config'], { allowFailure: true, timeoutMs: 60_000 });
-  if (!/unknown option '--validate-config'|unrecognized option/i.test(`${probe.stdout}\n${probe.stderr}`)) {
-    return { validated: true, ok: probe.code === 0, output: `${probe.stderr}${probe.stdout}`.trim().split('\n').pop() || '' };
+  const probe = await exec(server, ['--validate-config', '--user=mysql'], { allowFailure: true, timeoutMs: 60_000 });
+  const probeText = `${probe.stderr}\n${probe.stdout}`;
+  if (!/unknown option '--validate-config'|unrecognized option '--validate-config'|unknown variable 'validate-config/i.test(probeText)) {
+    return classifyProbeOutput(probe.code, probeText);
   }
   // MariaDB: --help --verbose parses every option file and complains about unknown variables.
   const help = await exec(server, ['--help', '--verbose', '--user=mysql'], { allowFailure: true, timeoutMs: 60_000 });
-  const bad = `${help.stderr}\n${help.stdout}`.split('\n').find((l) => /unknown (variable|option)|ambiguous option|error while loading/i.test(l));
+  const bad = `${help.stderr}\n${help.stdout}`.split('\n').map((l) => l.trim()).find((l) => CONFIG_REJECTIONS.test(l) && !/^Usage:|^--/.test(l));
   return { validated: true, ok: !bad, output: bad || '' };
 }
 
@@ -305,8 +352,9 @@ defineOp('db.ping', {
   run: async ({ credentials: creds }, ctx) => {
     const started = Date.now();
     try {
-      const [row] = await mysql('SELECT VERSION() AS version, CURRENT_USER() AS user', creds, ctx, { timeoutMs: 30_000 });
-      return { ok: true, version: row?.version || null, user: row?.user || null, ms: Date.now() - started };
+      let warnings = [];
+      const [row] = await mysql('SELECT VERSION() AS version, CURRENT_USER() AS user', creds, ctx, { timeoutMs: 30_000, onStderr: (stderr) => { warnings = clientWarnings(stderr); } });
+      return { ok: true, version: row?.version || null, user: row?.user || null, ms: Date.now() - started, warnings };
     } catch (err) {
       if (err.code === 'capability_missing') throw err;
       return { ok: false, code: err.code, error: err.message, ms: Date.now() - started };
@@ -611,7 +659,7 @@ defineOp('db.root_password.set', {
     let myCnf = false;
     if (updateMyCnf) {
       ctx.assertAllowedPath(ROOT_MY_CNF, 'write');
-      writeAtomic(ROOT_MY_CNF, renderRootMyCnf(pw), 0o600);
+      writeSecret(ROOT_MY_CNF, renderRootMyCnf(pw));
       myCnf = true;
     }
     return { hosts, myCnfUpdated: myCnf, path: myCnf ? ROOT_MY_CNF : null };

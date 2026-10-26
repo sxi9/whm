@@ -51,9 +51,16 @@ export default function ModsecurityVendors({ fn }) {
               rowActions={(v) => [{ label: 'Update', primary: true, onClick: () => update(v) }, { label: 'Remove', danger: true, onClick: () => remove(v) }]} />
           </Card>
           {jobId && <Card title="Installation progress"><ProgressLog jobId={jobId} onFinished={() => refetch()} /></Card>}
-          <Card title="Add a vendor" subtitle="A .tar.gz archive over https containing the rule files (a rules/ directory and optional crs-setup.conf). Downloaded, extracted and validated with apachectl -t before Apache is reloaded.">
+          <Card title="Add a vendor" subtitle="A .tar.gz, .tar.bz2, .tar.xz, .tar or .zip archive over https containing the rule files (a rules/ directory and optional crs-setup.conf). Downloaded, extracted and validated with apachectl -t before Apache is reloaded.">
+            {data.layout?.distroCrs?.active && (
+              <div className="banner banner-warning" style={{ marginBottom: 10 }}>
+                <div>
+                  <strong>The distribution's OWASP Core Rule Set is already loaded</strong> by <code>{data.layout.distroCrs.file}</code> (<code>{data.layout.distroCrs.directive}</code>). Installing the OWASP CRS preset as a vendor would define the same rule ids twice, so <code>apachectl -t</code> rejects it and the install is rolled back. Disable that include first (on Debian: comment it out in <code>security2.conf</code>), or add only vendors that do not duplicate the packaged CRS.
+                </div>
+              </div>
+            )}
             <div className="row-actions" style={{ marginBottom: 10 }}>
-              {PRESETS.map((p) => <Button key={p.name} size="sm" onClick={() => setForm({ name: p.name, url: p.url })}>{p.label}</Button>)}
+              {PRESETS.map((p) => <Button key={p.name} size="sm" disabled={p.name === 'owasp-crs' && Boolean(data.layout?.distroCrs?.active)} onClick={() => setForm({ name: p.name, url: p.url })}>{p.label}</Button>)}
             </div>
             <div className="form-grid">
               <Field label="Name" required help="Lowercase identifier"><TextInput value={form.name} onChange={(v) => setForm({ ...form, name: v })} placeholder="owasp-crs" /></Field>

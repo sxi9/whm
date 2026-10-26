@@ -18,6 +18,7 @@ let reseller;
 let resellerCsrf;
 let updateServer;
 let updateUrl;
+const feedRequests = [];
 const mutate = (client, method, url, body, token) => client[method](url).set('X-CSRF-Token', token).send(body);
 const put = (url, body) => mutate(app.http, 'put', url, body, csrf);
 const post = (url, body = {}) => mutate(app.http, 'post', url, body, csrf);
@@ -71,9 +72,10 @@ beforeAll(async () => {
     'pkg.nginx.proxy.remove': () => { const removed = nginxState.proxyConfigured; nginxState.proxyConfigured = false; nginxState.content = null; return { path: '/etc/nginx/conf.d/whm-proxy.conf', removed, configtest: { ok: true, output: 'ok' } }; },
     'svc.reload': ({ unit }) => ({ unit, verb: 'reload', output: '' }),
     'svc.restart': ({ unit }) => ({ unit, verb: 'restart', output: '' }),
-    'svc.start': ({ unit }) => ({ unit, verb: 'start', output: '' }),
-    'svc.stop': ({ unit }) => ({ unit, verb: 'stop', output: '' }),
+    'svc.start': ({ unit }) => { if (unit === 'nginx') nginxState.active = true; return { unit, verb: 'start', output: '' }; },
+    'svc.stop': ({ unit }) => { if (unit === 'nginx') nginxState.active = false; return { unit, verb: 'stop', output: '' }; },
     'svc.enable': ({ unit }) => ({ unit, verb: 'enable', output: '' }),
+    'svc.disable': ({ unit }) => ({ unit, verb: 'disable', output: '' }),
   });
   app = await createTestApp({ agent });
   app.ctx.jobs.start();
@@ -88,6 +90,7 @@ beforeAll(async () => {
   await provision(true);
 
   updateServer = http.createServer((req, res) => {
+    feedRequests.push({ url: req.url, authorization: req.headers.authorization ?? null });
     res.setHeader('Content-Type', 'application/json');
     if (req.url === '/latest.json') return res.end(JSON.stringify({ tiers: { stable: { version: '9.9.0', url: 'https://example.com/whm-9.9.0.tar.gz', notes: 'Big release' }, edge: { version: '10.0.0-beta.1' } } }));
     if (req.url === '/broken.json') return res.end('{"nope": true}');
@@ -116,15 +119,34 @@ describe('pure helpers', () => {
 });
 
 describe('module registration and RBAC', () => {
-  it('attaches ctx.software with its jobs, schedule and capabilities', () => {
+  it('attaches ctx.software (+ the ctx.pkg alias) with its jobs, schedules and capabilities', () => {
     expect(typeof app.ctx.software.pkg.ensureInstalled).toBe('function');
+    expect(app.ctx.pkg).toBe(app.ctx.software.pkg);
     expect(typeof app.ctx.software.php.versionForDomain).toBe('function');
     expect(typeof app.ctx.software.nginx.sync).toBe('function');
+    expect(typeof app.ctx.software.update.status).toBe('function');
     for (const t of ['software.pkg.install', 'software.pkg.remove', 'software.system.update', 'software.update.check', 'software.perl.install', 'software.module.install', 'software.nginx.install', 'software.nginx.sync', 'software.rpmdb.rebuild', 'software.php.resync', 'software.php.apply', 'software.ea4.build']) expect(app.ctx.jobs.types()).toContain(t);
     expect(app.ctx.scheduler.list().find((s) => s.name === 'os-update-check')?.cron).toBe('41 5 * * *');
-    expect(app.ctx.scheduler.list().find((s) => s.name === 'nginx-proxy-sync')).toMatchObject({ cron: '*/10 * * * *', job_type: 'software.nginx.sync' });
+    // Hourly, and paused at boot because the proxy is off: no skipped job rows pile up.
+    expect(app.ctx.scheduler.list().find((s) => s.name === 'nginx-proxy-sync')).toMatchObject({ cron: '23 * * * *', job_type: 'software.nginx.sync', enabled: 0 });
     expect(app.ctx.capabilities.has('pkg')).toBe(true);
     expect(app.ctx.capabilities.has('rpm')).toBe(false);
+  });
+
+  it('migrates the old 10-minute proxy-sync schedule to hourly at boot without touching operator tuning', async () => {
+    const { register } = await import('../src/routes/categories/software.js');
+    const fake = (cron, enabled = 1) => {
+      const rows = [{ name: 'nginx-proxy-sync', cron, enabled, job_type: 'software.nginx.sync', params_json: '{}' }];
+      const updates = [];
+      return { rows, updates, scheduler: { ensure: () => {}, list: () => rows, update: (name, patch) => { updates.push([name, patch]); Object.assign(rows[0], patch.cron ? { cron: patch.cron } : {}, patch.enabled != null ? { enabled: patch.enabled ? 1 : 0 } : {}); return rows[0]; } } };
+    };
+    const legacy = fake('*/10 * * * *');
+    await register({ ...app.ctx, scheduler: legacy.scheduler, jobs: { register: () => {} }, capabilities: { ...app.ctx.capabilities, register: () => {} } });
+    expect(legacy.rows[0]).toMatchObject({ cron: '23 * * * *', enabled: 0 });
+    const tuned = fake('5 */2 * * *');
+    await register({ ...app.ctx, scheduler: tuned.scheduler, jobs: { register: () => {} }, capabilities: { ...app.ctx.capabilities, register: () => {} } });
+    expect(tuned.rows[0].cron).toBe('5 */2 * * *');
+    expect(tuned.updates.every(([, patch]) => patch.cron === undefined)).toBe(true);
   });
 
   it('server-wide functions are root only', async () => {
@@ -137,6 +159,19 @@ describe('module registration and RBAC', () => {
     expect((await mutate(reseller, 'put', '/api/software/php/ini/8.3', { directives: { memory_limit: '1G' } }, resellerCsrf)).status).toBe(403);
     expect((await mutate(reseller, 'put', '/api/software/nginx', { enabled: true }, resellerCsrf)).status).toBe(403);
     expect((await mutate(reseller, 'post', '/api/software/ea4/profiles/1/build', {}, resellerCsrf)).status).toBe(403);
+  });
+
+  it('resellers get only the PHP version dropdown, never binaries, ini paths or the module scan', async () => {
+    app.agent.calls.length = 0;
+    const res = await reseller.get('/api/software/php/versions?modules=true');
+    expect(res.status).toBe(200);
+    expect(res.body.data.versions).toEqual([{ id: '8.3', label: 'PHP 8.3', version: '8.3.6', isDefault: true }, { id: '8.2', label: 'PHP 8.2', version: '8.2.20', isDefault: false }]);
+    expect(res.body.data.effectiveDefault).toBe('8.3');
+    expect(JSON.stringify(res.body.data)).not.toMatch(/iniPath|poolDir|fpmUnit|binary/);
+    expect(app.agent.callsTo('pkg.php.versions').pop().args).toEqual({ modules: false });
+    const root = await get('/api/software/php/versions?modules=true');
+    expect(root.body.data.versions[0]).toMatchObject({ binary: '/usr/bin/php8.3', iniPath: '/etc/php/8.3/fpm/php.ini', fpmUnit: 'php8.3-fpm' });
+    expect(app.agent.callsTo('pkg.php.versions').pop().args).toEqual({ modules: true });
   });
 
   it('resellers see and change only their own domains', async () => {
@@ -174,6 +209,14 @@ describe('validation (422)', () => {
     expect((await post('/api/software/perl/install', { modules: [] })).status).toBe(422);
     expect((await post('/api/software/modules/gem/install', { name: 'a b' })).status).toBe(422);
     expect((await post('/api/software/modules/gem/install', { name: 'rails', version: '-1' })).status).toBe(422);
+    // Names the agent's per-installer schemas would refuse are a 422 with a field message, not a failed job.
+    for (const [kind, name] of [['pecl', 'Redis'], ['pecl', 'redis.io'], ['pecl', 'redis--'], ['pear', 'Mail-1.0'], ['pear', 'pear/Mail'], ['pear', 'foo.bar'], ['gem', 'a b'], ['pip', '-r']]) {
+      const res = await post(`/api/software/modules/${kind}/install`, { name });
+      expect(res.status, `${kind} ${name}`).toBe(422);
+      expect(res.body.error.fields?.name?.[0] ?? res.body.error.message, `${kind} ${name}`).toMatch(/name|Letters/);
+    }
+    expect(app.agent.callsTo('pkg.pecl.install')).toHaveLength(0);
+    expect(app.agent.callsTo('pkg.pear.install')).toHaveLength(0);
     expect((await post('/api/software/modules/npm/install', { name: 'x' })).status).toBe(422);
     expect((await get('/api/software/modules/npm')).status).toBe(422);
     expect((await put('/api/software/panel/update/settings', { url: 'ftp://x' })).status).toBe(422);
@@ -365,8 +408,25 @@ describe('Install Distro Packages', () => {
 
 describe('System Update', () => {
   it('shows pending updates and runs the upgrade job', async () => {
+    app.ctx.settings.set('software.updates.last_check', null);
+    app.agent.calls.length = 0;
+    // No recorded check yet: the first page load runs the simulation once and records it.
     const status = await get('/api/software/update/status');
-    expect(status.body.data).toMatchObject({ count: 2, security: 1, autoApply: false });
+    expect(status.body.data).toMatchObject({ count: 2, security: 1, autoApply: false, source: 'live', manager: 'apt' });
+    expect(status.body.data.packages.map((p) => p.name)).toEqual(['libssl3', 'vim']);
+    expect(app.agent.callsTo('pkg.upgradable')).toHaveLength(1);
+    // Later page loads serve the recorded check instead of a minutes-long simulation; ?refresh=true runs it again.
+    const cached = await get('/api/software/update/status');
+    expect(cached.body.data).toMatchObject({ count: 2, security: 1, source: 'cached', checkedAt: status.body.data.checkedAt });
+    expect(cached.body.data.packages.map((p) => p.name)).toEqual(['libssl3', 'vim']);
+    expect(app.agent.callsTo('pkg.upgradable')).toHaveLength(1);
+    expect(app.agent.callsTo('pkg.reboot_required').length).toBeGreaterThanOrEqual(1);
+    expect((await get('/api/software/update/status?refresh=true')).body.data.source).toBe('live');
+    expect(app.agent.callsTo('pkg.upgradable')).toHaveLength(2);
+    expect((await get('/api/software/update/status?refresh=maybe')).status).toBe(422);
+    // Programmatic consumers (Security Advisor) get a live answer unless they ask for the cache.
+    expect((await app.ctx.software.update.status()).source).toBe('live');
+    expect((await app.ctx.software.update.status({ cached: true })).source).toBe('cached');
     const run = await post('/api/software/update/run', { autoremove: true });
     expect(run.status).toBe(202);
     const job = await waitForJob(app.ctx, run.body.data.job.id);
@@ -376,22 +436,37 @@ describe('System Update', () => {
     expect(job.logs.some((l) => l.level === 'warn' && /reboot/i.test(l.line))).toBe(true);
     expect(app.agent.callsTo('pkg.update_index').length).toBeGreaterThanOrEqual(1);
     expect(app.agent.callsTo('pkg.upgrade').pop().args).toMatchObject({ dist: true, autoremove: true });
+    // What is still pending comes from a fresh simulation after the upgrade (the mock still answers 2), never from an assumed zero.
+    expect(job.result.stillPending).toBe(2);
+    expect(app.ctx.settings.get('software.updates.last_check')).toMatchObject({ count: 2, security: 1, rebootRequired: true });
     const partial = await post('/api/software/update/run', { packages: ['vim'], refreshIndex: false });
-    expect((await waitForJob(app.ctx, partial.body.data.job.id)).status).toBe('done');
+    const partialJob = await waitForJob(app.ctx, partial.body.data.job.id);
+    expect(partialJob.status).toBe('done');
+    expect(partialJob.result).toMatchObject({ upgraded: 1, packages: ['vim'], stillPending: 2 });
     expect(app.agent.callsTo('pkg.upgrade').pop().args.packages).toEqual(['vim']);
     expect((await put('/api/software/update/auto', { autoApply: true })).body.data.autoApply).toBe(true);
     expect((await get('/api/software/update/status')).body.data.autoApply).toBe(true);
   });
 
-  it('the nightly check records pending counts and queues the upgrade when auto-apply is on', async () => {
+  it('the nightly check refreshes the index, records pending counts and queues the upgrade when auto-apply is on', async () => {
+    app.agent.calls.length = 0;
     const check = app.ctx.jobs.enqueue('software.update.check', {});
     const job = await waitForJob(app.ctx, check.id);
     expect(job.status).toBe('done');
     expect(job.result).toMatchObject({ count: 2, security: 1 });
+    // Without a refreshed index the simulation only knows what the last apt-get update saw.
+    expect(app.agent.calls.filter((c) => ['pkg.update_index', 'pkg.upgradable'].includes(c.name)).map((c) => c.name).slice(0, 2)).toEqual(['pkg.update_index', 'pkg.upgradable']);
     expect(job.result.autoJobId).toBeTruthy();
     expect((await waitForJob(app.ctx, job.result.autoJobId)).status).toBe('done');
-    // The queued upgrade ran and reset the pending count it had just recorded.
-    expect(app.ctx.settings.get('software.updates.last_check')).toMatchObject({ count: 0 });
+    // The queued upgrade ran and re-checked what is still pending afterwards.
+    expect(app.ctx.settings.get('software.updates.last_check')).toMatchObject({ count: 2, security: 1 });
+    expect(app.ctx.settings.get('software.updates.last_check').packages.map((p) => p.name)).toEqual(['libssl3', 'vim']);
+    // An index refresh failure is logged, not fatal.
+    app.agent.fail('pkg.update_index', 'command_failed', 'Could not get lock /var/lib/apt/lists/lock');
+    const degraded = await waitForJob(app.ctx, app.ctx.jobs.enqueue('software.update.check', {}).id);
+    expect(degraded.status).toBe('done');
+    expect(degraded.logs.some((l) => l.level === 'warn' && /index refresh failed/.test(l.line))).toBe(true);
+    app.agent.set('pkg.update_index', () => ({ manager: 'apt', output: ['Hit:1 http://archive.ubuntu.com noble InRelease'] }));
     await put('/api/software/update/auto', { autoApply: false });
   });
 });
@@ -451,6 +526,26 @@ describe('Update Server Software', () => {
     expect(broken.body.data.lastCheck.error).toMatch(/version/);
     await put('/api/software/panel/update/settings', { url: `${updateUrl}/missing.json` });
     expect((await post('/api/software/panel/update/check')).body.data.lastCheck.error).toMatch(/404/);
+  });
+
+  it('never echoes or audits the credentials of a basic-auth feed URL', async () => {
+    const secret = updateUrl.replace('http://', 'http://feeduser:s3cretpass@');
+    const saved = await put('/api/software/panel/update/settings', { url: `${secret}/latest.json` });
+    expect(saved.status).toBe(200);
+    expect(saved.body.data.updateUrl).toBe(`${updateUrl}/latest.json`);
+    expect(saved.body.data.updateUrlHasCredentials).toBe(true);
+    feedRequests.length = 0;
+    const checked = await post('/api/software/panel/update/check');
+    expect(checked.body.data.latest.version).toBe('9.9.0');
+    // fetch() refuses URLs with userinfo, so the credentials travel as a header.
+    expect(feedRequests).toEqual([{ url: '/latest.json', authorization: `Basic ${Buffer.from('feeduser:s3cretpass').toString('base64')}` }]);
+    expect(JSON.stringify(checked.body.data)).not.toMatch(/s3cretpass|feeduser/);
+    expect(JSON.stringify(await get('/api/software/panel/update').then((r) => r.body))).not.toMatch(/s3cretpass/);
+    const audit = app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action IN ('software.panel.check', 'software.panel.settings')").all().map((r) => r.args_redacted).join('\n');
+    expect(audit).toContain(`${updateUrl}/latest.json`);
+    expect(audit).not.toMatch(/s3cretpass|feeduser/);
+    expect(app.ctx.settings.get('software.update_url')).toBe(`${secret}/latest.json`);
+    await put('/api/software/panel/update/settings', { url: `${updateUrl}/latest.json` });
   });
 });
 
@@ -627,11 +722,100 @@ describe('NGINX Manager', () => {
     app.agent.fail('svc.reload', 'command_failed', 'boom');
     expect((await post('/api/software/nginx/reload')).status).toBe(400);
     app.agent.set('svc.reload', ({ unit }) => ({ unit, verb: 'reload', output: '' }));
+    // The schedule fires only while the proxy is on.
+    expect(app.ctx.scheduler.list().find((x) => x.name === 'nginx-proxy-sync').enabled).toBe(1);
     const disabled = await put('/api/software/nginx', { enabled: false });
     expect(disabled.body.data.settings.enabled).toBe(false);
     expect(disabled.body.data.proxy.removed).toBe(true);
+    // Even by hand, Apache cannot take :80 back while nginx runs the restored stock site, so nginx is stopped and disabled.
+    expect(disabled.body.data.proxy.unit).toMatchObject({ ok: true, verb: 'stop', disabledAtBoot: true, holdsPorts: false });
+    expect(disabled.body.data.apache.detail).toMatch(/nginx was stopped and disabled/);
+    expect(nginxState.active).toBe(false);
+    expect(app.ctx.scheduler.list().find((x) => x.name === 'nginx-proxy-sync').enabled).toBe(0);
     expect((await get('/api/software/nginx')).body.data.proxyConfigured).toBe(false);
     expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'software.nginx.configure'").get().n).toBe(2);
+    } finally { app.ctx.web = prevWeb; }
+  });
+
+  it('disabling releases 80/443 before Apache is moved back: proxy.remove -> svc.stop -> setListenPorts, no reload', async () => {
+    const ports = [];
+    const prevWeb = app.ctx.web;
+    app.ctx.web = fakeWeb(ports);
+    const order = () => app.agent.calls.map((c) => c.name).filter((n) => ['pkg.nginx.proxy.remove', 'svc.stop', 'svc.disable', 'svc.reload', 'svc.start', 'web.setListenPorts'].includes(n));
+    const fakePorts = async (args) => { app.agent.calls.push({ name: 'web.setListenPorts', args }); };
+    try {
+      await put('/api/software/nginx', { enabled: true });
+      expect(nginxState.active).toBe(true);
+      app.ctx.web = { setListenPorts: async (p) => { await fakePorts(p); ports.push(p); app.ctx.settings.set('service_config.apache_ports', p); } };
+      app.agent.calls.length = 0;
+      const res = await put('/api/software/nginx', { enabled: false });
+      expect(res.status).toBe(200);
+      expect(order()).toEqual(['pkg.nginx.proxy.remove', 'svc.stop', 'svc.disable', 'web.setListenPorts']);
+      expect(ports.pop()).toEqual({ http: 80, https: 443, bind: null });
+      expect(res.body.data.apache).toMatchObject({ state: 'applied' });
+      expect(res.body.data.apache.detail).toMatch(/nginx was stopped and disabled/);
+      expect(res.body.data.proxy.unit).toMatchObject({ ok: true, verb: 'stop', stillActive: false, holdsPorts: false });
+
+      // nginx refuses to stop and is still active: Apache is left on the backend ports rather than restarted into "address already in use".
+      await put('/api/software/nginx', { enabled: true });
+      app.agent.fail('svc.stop', 'command_failed', 'Job for nginx.service canceled');
+      app.agent.calls.length = 0;
+      const stuck = await put('/api/software/nginx', { enabled: false });
+      expect(stuck.status).toBe(200);
+      expect(order()).toEqual(['pkg.nginx.proxy.remove', 'svc.stop']);
+      expect(stuck.body.data.apache.state).toBe('skipped');
+      expect(stuck.body.data.apache.detail).toMatch(/still holds 80\/443/);
+      expect(stuck.body.data.proxy.unit).toMatchObject({ ok: false, verb: 'stop', holdsPorts: true });
+      expect(stuck.body.data.proxy.unit.hint).toMatch(/stop it before Apache/);
+      expect(stuck.body.data.settings.enabled).toBe(false);
+      expect((await get('/api/software/nginx')).body.data.backendBind).toBe('127.0.0.1');
+      app.agent.set('svc.stop', ({ unit }) => { if (unit === 'nginx') nginxState.active = false; return { unit, verb: 'stop', output: '' }; });
+      // Saving again while nginx still runs keeps Apache where it is; once nginx is down the re-save moves Apache back.
+      app.agent.calls.length = 0;
+      const stillUp = await put('/api/software/nginx', { enabled: false });
+      expect(stillUp.body.data.apache.state).toBe('skipped');
+      expect(order()).toEqual([]);
+      nginxState.active = false;
+      app.agent.calls.length = 0;
+      const again = await put('/api/software/nginx', { enabled: false });
+      expect(again.body.data.apache.state).toBe('applied');
+      expect(order()).toEqual(['web.setListenPorts']);
+      expect(ports.pop()).toEqual({ http: 80, https: 443, bind: null });
+      expect((await get('/api/software/nginx')).body.data.backendBind).toBe('all-interfaces');
+      // With Apache back on 80/443 a further save is a no-op.
+      app.agent.calls.length = 0;
+      expect((await put('/api/software/nginx', { enabled: false })).body.data.apache.state).toBe('unchanged');
+      expect(order()).toEqual([]);
+      // ...and the normal path when nginx stops cleanly.
+      await put('/api/software/nginx', { enabled: true });
+      app.agent.calls.length = 0;
+      await put('/api/software/nginx', { enabled: false });
+      expect(order()).toEqual(['pkg.nginx.proxy.remove', 'svc.stop', 'svc.disable', 'web.setListenPorts']);
+    } finally { app.ctx.web = prevWeb; app.agent.set('svc.stop', ({ unit }) => { if (unit === 'nginx') nginxState.active = false; return { unit, verb: 'stop', output: '' }; }); }
+  });
+
+  it('re-enabling after a disable starts and re-enables the unit and the sync time is only recorded once the switch succeeded', async () => {
+    const ports = [];
+    const prevWeb = app.ctx.web;
+    app.ctx.web = fakeWeb(ports);
+    try {
+      await put('/api/software/nginx', { enabled: false });
+      nginxState.active = false;
+      app.agent.calls.length = 0;
+      const before = app.ctx.settings.get('software.nginx.last_sync');
+      app.agent.fail('svc.start', 'command_failed', 'bind() to 0.0.0.0:80 failed');
+      expect((await put('/api/software/nginx', { enabled: true })).status).toBe(400);
+      // Rolled back: no "last synced" claim for a config that is not in force.
+      expect(app.ctx.settings.get('software.nginx.last_sync')).toBe(before);
+      app.agent.set('svc.start', ({ unit }) => { if (unit === 'nginx') nginxState.active = true; return { unit, verb: 'start', output: '' }; });
+      app.agent.calls.length = 0;
+      const ok = await put('/api/software/nginx', { enabled: true });
+      expect(ok.status).toBe(200);
+      expect(ok.body.data.proxy.unit).toMatchObject({ ok: true, verb: 'start', enabledAtBoot: true });
+      expect(app.agent.calls.map((c) => c.name).filter((n) => n.startsWith('svc.'))).toEqual(['svc.start', 'svc.enable']);
+      expect(app.ctx.settings.get('software.nginx.last_sync')).not.toBe(before);
+      expect(app.ctx.settings.get('software.nginx.last_fingerprint')).toBe(ok.body.data.status.fingerprint);
+      await put('/api/software/nginx', { enabled: false });
     } finally { app.ctx.web = prevWeb; }
   });
 

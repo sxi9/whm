@@ -1,11 +1,32 @@
 import { useState } from 'react';
 import { Copy, Download } from 'lucide-react';
 import { useApi } from '../../hooks/useApi.js';
-import { StatusPill, KeyValue, formatDate } from '../../components/Common.jsx';
-import { Field, Select, Textarea, TextInput, Button } from '../../components/Form.jsx';
+import { StatusPill, KeyValue, CapabilityNotice, formatDate } from '../../components/Common.jsx';
+import { Field, Select, Textarea, TextInput, Button, ErrorBanner } from '../../components/Form.jsx';
 import { useToast } from '../../components/Toast.jsx';
 
-export { RequestError, Tabs, isCapabilityError } from '../security/Shared.jsx';
+export function isCapabilityError(error) {
+  return Boolean(error) && (error.status === 501 || error.code === 'capability_missing' || error.code === 'binary_not_found');
+}
+
+// Error display that distinguishes "install the daemon" from real failures.
+export function RequestError({ error, onRetry }) {
+  if (!error) return null;
+  if (isCapabilityError(error)) return <CapabilityNotice error={error} onRetry={onRetry} />;
+  return <ErrorBanner error={error} onRetry={onRetry} />;
+}
+
+export function Tabs({ tabs, value, onChange }) {
+  return (
+    <div className="row-actions" role="tablist" style={{ marginBottom: 14, flexWrap: 'wrap' }}>
+      {tabs.map((t) => (
+        <button key={t.value} type="button" role="tab" aria-selected={value === t.value} className={`btn btn-sm ${value === t.value ? 'btn-primary' : ''}`} onClick={() => onChange(t.value)}>
+          {t.label}{t.count != null && <span className="pill pill-muted" style={{ marginLeft: 6 }}>{t.count}</span>}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 export const KEY_TYPES = [{ value: 'rsa', label: 'RSA' }, { value: 'ec', label: 'ECDSA (EC)' }];
 export const RSA_BITS = ['2048', '3072', '4096'];

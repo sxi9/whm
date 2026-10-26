@@ -23,12 +23,23 @@ const idParam = z.object({ id: fields.id });
 const domainParam = z.object({ domain: fields.hostname });
 const httpUrl = z.string().max(2048).url().refine((u) => /^https?:\/\//i.test(u), 'Must be an http(s) URL');
 
+// Inline ctx.software.nginx.sync() calls from SSL/TLS and Accounts give
+// immediacy; the schedule is a safety net and fires only while the proxy is on.
+const NGINX_SYNC_CRON = '23 * * * *';
+const LEGACY_NGINX_SYNC_CRON = '*/10 * * * *';
+
 export async function register(ctx) {
   ctx.software = createSoftwareService(ctx);
+  // Alias from the integration contracts: other categories read ctx.pkg. It
+  // follows ctx.software so a consumer that swaps the service sees the same pkg.
+  let pkgOverride;
+  Object.defineProperty(ctx, 'pkg', { configurable: true, enumerable: true, get: () => pkgOverride ?? ctx.software?.pkg, set: (value) => { pkgOverride = value; } });
   const s = ctx.software;
   for (const [type, handler] of Object.entries(s.jobs)) ctx.jobs.register(type, handler);
   ctx.scheduler.ensure('os-update-check', '41 5 * * *', 'software.update.check');
-  ctx.scheduler.ensure('nginx-proxy-sync', '*/10 * * * *', 'software.nginx.sync');
+  ctx.scheduler.ensure('nginx-proxy-sync', NGINX_SYNC_CRON, 'software.nginx.sync');
+  if (ctx.scheduler.list().find((row) => row.name === 'nginx-proxy-sync')?.cron === LEGACY_NGINX_SYNC_CRON) ctx.scheduler.update('nginx-proxy-sync', { cron: NGINX_SYNC_CRON });
+  s.nginx.alignSchedule();
   ctx.capabilities.register('pkg', { binaries: ['apt-get', 'dnf', 'yum', 'dpkg-query', 'rpm'], required: ['apt-get', 'dnf', 'yum'] });
   ctx.capabilities.register('rpm', { binaries: ['rpm'], required: ['rpm'] });
   ctx.capabilities.register('php', { binaries: ['php', 'php-fpm'], required: ['php'] });
@@ -58,7 +69,8 @@ export async function register(ctx) {
   r.post('/pkg/update-index', requireRoot, accepted((req) => s.pkg.updateIndex(req.user, req)));
 
   // System Update
-  r.get('/update/status', requireRoot, wrap(() => s.update.status()));
+  // Page loads get the recorded check; ?refresh=true runs the simulation again.
+  r.get('/update/status', requireRoot, validate({ query: z.object({ refresh: z.enum(['true', 'false']).default('false') }) }), wrap((req) => s.update.status({ cached: req.query.refresh !== 'true' })));
   r.post('/update/run', requireRoot, validate({ body: z.object({ dist: z.boolean().default(true), autoremove: z.boolean().default(false), refreshIndex: z.boolean().default(true), packages: z.array(pkgName).max(200).optional() }).strict() }), accepted((req) => s.update.run(req.body, req.user, req)));
   r.put('/update/auto', requireRoot, validate({ body: z.object({ autoApply: z.boolean() }).strict() }), wrap((req) => s.update.setAuto(req.body.autoApply, req)));
 
@@ -81,7 +93,7 @@ export async function register(ctx) {
   r.put('/panel/update/settings', requireRoot, validate({ body: z.object({ url: z.union([z.literal(''), httpUrl]).optional(), tier: z.enum(['stable', 'release', 'edge']).optional(), autoUpdate: z.boolean().optional() }).strict() }), wrap((req) => s.panel.updateSettings(req.body, req)));
 
   // MultiPHP Manager
-  r.get('/php/versions', requireReseller, validate({ query: z.object({ modules: z.enum(['true', 'false']).default('false') }) }), wrap((req) => s.php.versions({ modules: req.query.modules === 'true' })));
+  r.get('/php/versions', requireReseller, validate({ query: z.object({ modules: z.enum(['true', 'false']).default('false') }) }), wrap((req) => s.php.versions({ modules: req.query.modules === 'true', user: req.user })));
   r.put('/php/default', requireRoot, validate({ body: z.object({ version: phpVersionId }).strict() }), maybeAccepted((req) => s.php.setSystemDefault(req.body.version, req.user, req)));
   r.get('/php/domains', requireReseller, validate({ query: z.object({ account: fields.username.optional(), q: z.string().trim().max(200).optional() }) }), wrap((req) => s.php.domains(req.user, req.query)));
   r.put('/php/domains', requireReseller, validate({ body: z.object({ domains: z.array(fields.hostname).min(1).max(500), version: phpVersionId.nullable() }).strict() }), maybeAccepted((req) => s.php.setDomainVersion(req.body.domains, req.body.version, req.user, req)));

@@ -8,7 +8,7 @@ import {
   parseInstalledList, parseAptSearch, parseDnfSearch, parseAptSimulation, parseDnfCheckUpdate, parseAptPolicy, parsePeclList, parseGemList,
   parsePerlModules, parseIni, setIniDirectives, parseFpmPool, renderNginxProxy, parseProxyHeader, NGINX_PROXY_CONF,
   versionAtLeast, nginxHttp2Directive, nginxRejectHandshake, disableServerBlocks, restoreServerBlocks,
-  parseAptRemoveSimulation, parseDnfRemoveSimulation, peclIniHint, startRun, pollRun, PKG_RUN_DIR,
+  parseAptRemoveSimulation, parseDnfRemoveSimulation, peclIniHint, startRun, pollRun, PKG_RUN_DIR, NGINX_SSL_ROOTS, nginxSslPath,
 } from '../src/ops/pkg.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
@@ -364,12 +364,56 @@ describe('nginx proxy rendering is valid for every supported nginx', () => {
     expect(exec).not.toHaveBeenCalled();
   });
 
-  it('marks removals and the proxy removal as destructive', () => {
+  it('certificate paths cannot smuggle nginx directives and must live under the SSL stores', async () => {
+    exec.mockClear();
+    const ssl = (cert, key = '/etc/ssl/whm/example.com/key.pem') => runOp('pkg.nginx.proxy.write', { domains: [{ domain: 'example.com', ssl: { cert, key } }] }, ctx);
+    const bad = [
+      '/etc/ssl/whm/x.pem;\nlocation /x { alias /var/lib/whm/; autoindex on; }\n#',
+      '/etc/ssl/whm/x.pem; include /etc/passwd;',
+      '/etc/ssl/whm/x.pem }',
+      '/etc/ssl/whm/x.pem #c',
+      '/etc/ssl/whm/x pem',
+      '/etc/ssl/whm/x.pem\t',
+      '/etc/ssl/whm/$host.pem',
+      '/etc/ssl/whm//x.pem',
+      '/etc/ssl/whm/./x.pem',
+      '/etc/ssl/whm/x.pem/..',
+      '/etc/ssl/whm',
+      '/etc/ssl/whmx/x.pem',
+      '/etc/shadow',
+      '/var/lib/whm/whm.db',
+      '/home/alice/evil.pem',
+      `/etc/ssl/whm/${'a'.repeat(260)}.pem`,
+    ];
+    for (const cert of bad) {
+      expect((await opError(ssl(cert))).code, JSON.stringify(cert)).toBe('invalid_args');
+      expect((await opError(ssl('/etc/ssl/whm/example.com/fullchain.pem', cert))).code, JSON.stringify(cert)).toBe('invalid_args');
+    }
+    expect(exec).not.toHaveBeenCalled();
+    expect(NGINX_SSL_ROOTS).toEqual(['/etc/ssl/whm', '/etc/letsencrypt', '/etc/pki/tls/whm']);
+    // Paths under every SSL root pass the schema (checked on the schema alone so nothing is written to /etc/nginx on a host that has it).
+    for (const root of NGINX_SSL_ROOTS) {
+      expect(nginxSslPath.safeParse(`${root}/example.com/fullchain.pem`).success, root).toBe(true);
+      expect(nginxSslPath.safeParse(`${root}/live/example.com/privkey.pem`).success, root).toBe(true);
+    }
+    expect(nginxSslPath.safeParse('/etc/ssl/whm/example.com/fullchain.pem; include /etc/passwd;').success).toBe(false);
+  });
+
+  it('marks removals, file-displacing writes and the proxy removal as destructive', () => {
     expect(catalog.get('pkg.remove').destructive).toBe(true);
     expect(catalog.get('pkg.autoremove').destructive).toBe(true);
     expect(catalog.get('pkg.nginx.proxy.remove').destructive).toBe(true);
+    expect(catalog.get('pkg.nginx.proxy.write').destructive).toBe(true);
+    expect(catalog.get('pkg.php.userini.write').destructive).toBe(true);
+    expect(catalog.get('pkg.php.userini.read').destructive).toBe(false);
     expect(catalog.get('pkg.install').destructive).toBe(false);
     expect(NGINX_PROXY_CONF).toBe('/etc/nginx/conf.d/whm-proxy.conf');
+  });
+
+  it('the unit verbs the Software service drives are in the catalog', () => {
+    for (const verb of ['start', 'stop', 'reload', 'restart', 'enable', 'disable']) expect(catalog.has(`svc.${verb}`), verb).toBe(true);
+    expect(catalog.get('svc.stop').destructive).toBe(true);
+    expect(catalog.get('svc.disable').destructive).toBe(true);
   });
 });
 
@@ -399,6 +443,8 @@ describe('pure parsers', () => {
     expect(parsePeclList('Installed packages, channel pecl.php.net:\n=========================================\nPackage Version State\nredis   6.0.2   stable\nimagick 3.7.0   stable\n')).toEqual([{ name: 'redis', version: '6.0.2', state: 'stable' }, { name: 'imagick', version: '3.7.0', state: 'stable' }]);
     expect(parseGemList('\n*** LOCAL GEMS ***\n\nbundler (default: 2.5.3)\nrake (13.1.0, 13.0.6)\n')).toEqual([{ name: 'bundler', version: '2.5.3', versions: ['2.5.3'] }, { name: 'rake', version: '13.1.0', versions: ['13.1.0', '13.0.6'] }]);
     expect(parsePerlModules('DBD::mysql\t4.050\nJSON::XS\t\nPerl\n')).toEqual([{ name: 'DBD::mysql', version: '4.050' }, { name: 'JSON::XS', version: null }]);
+    // ExtUtils::Installed reports the interpreter as "Perl\t<version>"; it is not a CPAN module.
+    expect(parsePerlModules('Perl\t5.38.2\nDBI\t1.643\n')).toEqual([{ name: 'DBI', version: '1.643' }]);
   });
 
   it('reads and rewrites ini directives without touching sections or comments', () => {

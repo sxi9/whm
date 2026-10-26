@@ -166,6 +166,11 @@ describe('IP Functions API (iproute2 present via mock agent)', () => {
     await post('/addresses', { address: '10.0.0.0', endAddress: '10.0.2.0' }).expect(422);
     await post('/addresses', { address: '127.0.0.5' }).expect(422);
     await post('/addresses', { address: '203.0.113.30', prefix: 40 }).expect(422);
+    // A /0 bind would install a default on-link route; interface names never start with "-".
+    await post('/addresses', { address: '203.0.113.30', prefix: 0 }).expect(422);
+    expect((await post('/addresses', { address: '203.0.113.30', netmask: '0.0.0.0' }).expect(422)).body.error.fields.netmask[0]).toMatch(/\/0/);
+    await post('/addresses', { address: '203.0.113.30', interface: '-eth0' }).expect(422);
+    await post('/addresses', { address: '203.0.113.30', interface: '.eth0' }).expect(422);
     expect(app.agent.callsTo('net.ip.add')).toHaveLength(0);
   });
 
@@ -287,7 +292,7 @@ describe('IP Functions API (iproute2 present via mock agent)', () => {
     app.ctx.web = { setAccountIpv6: async (username, address) => { webCalls.push({ username, address }); } };
     const res = await post('/ipv6/assign', { account: 'alice' }).expect(201);
     expect(res.body.data).toMatchObject({ account: 'alice', address: '2001:db8:1::1', range: 'customers', interface: 'eth0', prefix: 64, bound: true, web: 'applied' });
-    expect(res.body.data.dns.results).toEqual([{ domain: 'alice.com', status: 'updated' }]);
+    expect(res.body.data.dns.results).toEqual([{ domain: 'alice.com', zone: 'alice.com', status: 'updated' }]);
     expect(app.agent.callsTo('net.ip.add')[0].args).toEqual({ address: '2001:db8:1::1', prefix: 64, iface: 'eth0' });
     expect(webCalls).toEqual([{ username: 'alice', address: '2001:db8:1::1' }]);
     const zone = (await app.http.get('/api/dns/zones/alice.com').expect(200)).body.data;
@@ -334,28 +339,44 @@ describe('IP Functions API (iproute2 present via mock agent)', () => {
     const before = await get('/remote-services').expect(200);
     expect(before.body.data.services.map((s) => s.key)).toEqual(['mail', 'dns', 'mysql', 'ftp', 'panel']);
     expect(before.body.data.candidates.ipv4).toContain('203.0.113.11');
+    expect(before.body.data.candidates.live).toBe(true);
     expect((await put('/remote-services', { mail: { ipv4: '198.51.100.9' } }).expect(422)).body.error.fields['mail.ipv4'][0]).toMatch(/not bound/);
+    // Recorded but not bound on the host: not a usable source address either.
+    app.ctx.db.prepare("INSERT INTO ip_addresses (address, family, netmask, interface) VALUES ('198.51.100.9', 4, '255.255.255.0', 'eth0')").run();
+    expect((await get('/remote-services').expect(200)).body.data.candidates.ipv4).not.toContain('198.51.100.9');
+    expect((await put('/remote-services', { mail: { ipv4: '198.51.100.9' } }).expect(422)).body.error.fields['mail.ipv4'][0]).toMatch(/not bound/);
+    app.ctx.db.prepare('DELETE FROM ip_addresses WHERE address = ?').run('198.51.100.9');
     await put('/remote-services', { mail: { ipv4: '2001:db8:ffff::11' } }).expect(422);
     await put('/remote-services', { mail: { ipv4: '203.0.113.11; x' } }).expect(422);
     await put('/remote-services', { bogus: { ipv4: '203.0.113.11' } }).expect(422);
     const mailCalls = [];
+    const mysqlCalls = [];
     const savedMail = app.ctx.mail;
     const savedFtp = app.ctx.ftp;
-    const savedDb = app.ctx.db_services;
-    app.ctx.mail = { setOutboundAddresses: async (addrs) => { mailCalls.push(addrs); } };
+    const savedDb = app.ctx.databases;
+    app.ctx.mail = { setOutboundAddresses: async (addrs) => { mailCalls.push(addrs); return { applied: true }; } };
     // The FTP service saves the value, then reports that no daemon is installed to apply it to.
     app.ctx.ftp = { setPassiveAddress: async () => { throw new CapabilityError('ftp', 'No FTP daemon is installed on this server'); } };
-    app.ctx.db_services = { setClientAddresses: async () => { throw new Error('mysqld refused the new bind address'); } };
-    const res = await put('/remote-services', { mail: { ipv4: '203.0.113.11', ipv6: '2001:db8:ffff::11' }, ftp: { ipv4: '203.0.113.20' }, mysql: { ipv4: '203.0.113.11' } }).expect(200);
-    expect(res.body.data.applied).toEqual({ mail: 'applied', ftp: 'saved', mysql: 'failed' });
-    expect(res.body.data.applyErrors).toEqual({ ftp: expect.stringMatching(/No FTP daemon/), mysql: expect.stringMatching(/mysqld refused/) });
+    // Database Services attaches itself as ctx.databases (never ctx.db, the SQLite handle).
+    app.ctx.databases = { setClientAddresses: async (addrs) => { mysqlCalls.push(addrs); return { applied: true }; } };
+    expect(typeof app.ctx.dns.setOutboundAddresses).toBe('function');
+    const res = await put('/remote-services', { mail: { ipv4: '203.0.113.11', ipv6: '2001:db8:ffff::11' }, ftp: { ipv4: '203.0.113.20' }, mysql: { ipv4: '203.0.113.11' }, dns: { ipv4: '203.0.113.11' } }).expect(200);
+    // The real DNS service has no BIND here: the value is saved, not failed.
+    expect(res.body.data.applied).toEqual({ mail: 'applied', ftp: 'saved', mysql: 'applied', dns: 'saved' });
+    expect(res.body.data.applyErrors).toEqual({ ftp: expect.stringMatching(/No FTP daemon/), dns: expect.stringMatching(/BIND/) });
     expect(mailCalls).toEqual([{ ipv4: '203.0.113.11', ipv6: '2001:db8:ffff::11' }]);
+    expect(mysqlCalls).toEqual([{ ipv4: '203.0.113.11', ipv6: null }]);
     expect(res.body.data.services.find((s) => s.key === 'mail')).toMatchObject({ ipv4: '203.0.113.11', ipv6: '2001:db8:ffff::11' });
     expect(app.ctx.settings.get('ip.remote.ftp_ipv4')).toBe('203.0.113.20');
     expect(app.ctx.settings.get('ip.remote.mysql_ipv4')).toBe('203.0.113.11');
+    app.ctx.databases = { setClientAddresses: async () => { throw new Error('mysqld refused the new bind address'); } };
+    const failed = await put('/remote-services', { mysql: { ipv4: '203.0.113.20' } }).expect(200);
+    expect(failed.body.data.applied).toEqual({ mysql: 'failed' });
+    expect(failed.body.data.applyErrors.mysql).toMatch(/mysqld refused/);
+    await put('/remote-services', { mysql: { ipv4: '203.0.113.11' }, dns: { ipv4: '' } }).expect(200);
     app.ctx.mail = savedMail;
     app.ctx.ftp = savedFtp;
-    app.ctx.db_services = savedDb;
+    app.ctx.databases = savedDb;
     expect((await del('/addresses/203.0.113.20').expect(409)).body.error.message).toMatch(/FTP/);
     app.ctx.ftp = undefined;
     const cleared = await put('/remote-services', { ftp: { ipv4: '' }, mysql: { ipv4: '' } }).expect(200);
@@ -561,6 +582,77 @@ describe('IP Functions API (iproute2 present via mock agent)', () => {
     app.ctx.settings.set('basic.main_ip', '');
     app.ctx.db.prepare("UPDATE ip_addresses SET is_main = CASE WHEN address = '203.0.113.60' THEN 1 ELSE 0 END").run();
     app.agent.set('net.route.default', () => ({ source: 'iproute2', ipv4: { gateway: '203.0.113.1', dev: 'eth0', prefsrc: '203.0.113.10', metric: 100 }, ipv6: { gateway: 'fe80::1', dev: 'eth0', prefsrc: null, metric: 1024 } }));
+  });
+
+  it('updates AAAA records of addon domains inside the parent zone', async () => {
+    const aliceId = app.ctx.db.prepare('SELECT id FROM accounts WHERE username = ?').get('alice').id;
+    app.ctx.db.prepare("INSERT INTO account_domains (account_id, domain, type) VALUES (?, 'shop.alice.com', 'addon'), (?, 'orphan.example', 'parked')").run(aliceId, aliceId);
+    const res = await post('/ipv6/assign', { account: 'alice' }).expect(201);
+    const address = res.body.data.address;
+    expect(res.body.data.dns.results).toEqual([
+      { domain: 'alice.com', zone: 'alice.com', status: 'updated' },
+      { domain: 'shop.alice.com', zone: 'alice.com', status: 'updated' },
+      { domain: 'orphan.example', status: 'no_zone' },
+    ]);
+    const zone = (await app.http.get('/api/dns/zones/alice.com').expect(200)).body.data;
+    expect(zone.records.filter((r) => r.type === 'AAAA').map((r) => `${r.name}=${r.value}`).sort()).toEqual([`@=${address}`, `shop=${address}`, `www.shop=${address}`, `www=${address}`].sort());
+    await del('/ipv6/assignments/alice').expect(200);
+    expect((await app.http.get('/api/dns/zones/alice.com').expect(200)).body.data.records.filter((r) => r.type === 'AAAA')).toEqual([]);
+    app.ctx.db.prepare('DELETE FROM account_domains WHERE account_id = ? AND type IN (?, ?)').run(aliceId, 'addon', 'parked');
+  });
+
+  it('unbinds the IPv6 address again when recording the assignment fails', async () => {
+    app.ctx.db.exec("CREATE TRIGGER whm_test_race BEFORE INSERT ON ipv6_assignments BEGIN SELECT RAISE(ABORT, 'simulated concurrent assignment'); END");
+    app.agent.calls.length = 0;
+    try {
+      await post('/ipv6/assign', { account: 'alice', address: '2001:db8:1::abc' }).expect(500);
+    } finally {
+      app.ctx.db.exec('DROP TRIGGER whm_test_race');
+    }
+    expect(app.agent.callsTo('net.ip.add')[0].args).toMatchObject({ address: '2001:db8:1::abc' });
+    expect(app.agent.callsTo('net.ip.del')[0].args).toMatchObject({ address: '2001:db8:1::abc', prefix: 64, iface: 'eth0' });
+    expect(app.agent.system.has('2001:db8:1::abc')).toBe(false);
+    expect(app.ctx.db.prepare('SELECT 1 FROM ip_addresses WHERE address = ?').get('2001:db8:1::abc')).toBeUndefined();
+    expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM ipv6_assignments').get().n).toBe(0);
+  });
+
+  it('runs chained mappings against the live host state, lifts the target reservation and names the actor', async () => {
+    const a = '203.0.113.80';
+    const b = '203.0.113.81';
+    const c = '203.0.113.22';
+    await post('/addresses', { address: a, prefix: 24 }).expect(201);
+    // b is recorded but not bound (a "missing" address); c is bound and reserved.
+    app.ctx.db.prepare("INSERT INTO ip_addresses (address, family, netmask, interface) VALUES (?, 4, '255.255.255.0', 'eth0')").run(b);
+    expect(app.ctx.db.prepare('SELECT reserved FROM ip_addresses WHERE address = ?').get(c).reserved).toBe(1);
+    expect(app.agent.system.has(c)).toBe(true);
+    app.ctx.db.prepare('UPDATE accounts SET ip = ? WHERE username = ?').run(a, 'bob');
+    const preview = await post('/migration/preview', { mappings: [{ from: a, to: b }, { from: b, to: c }] }).expect(200);
+    expect(preview.body.data.ok).toBe(true);
+    expect(preview.body.data.warnings).toEqual([expect.stringMatching(/203\.0\.113\.22 is reserved/)]);
+    // The target already carries an account: flagged even though the address was never recorded.
+    app.ctx.db.prepare('UPDATE accounts SET ip = ? WHERE username = ?').run('198.51.100.40', 'alice');
+    expect((await post('/migration/preview', { mappings: [{ from: a, to: '198.51.100.40' }] }).expect(200)).body.data.plan[0].issues).toEqual([expect.stringMatching(/already used by 1 account/)]);
+    app.ctx.db.prepare('UPDATE accounts SET ip = ? WHERE username = ?').run('203.0.113.10', 'alice');
+
+    app.ctx.jobs.start();
+    app.agent.calls.length = 0;
+    const res = await post('/migration', { mappings: [{ from: a, to: b }, { from: b, to: c }], removeOld: true, updateVhosts: false }).expect(202);
+    const job = await waitForJob(app.ctx, res.body.data.job.id, 10000);
+    app.ctx.jobs.stop();
+    expect(job.status).toBe('done');
+    expect(job.result).toMatchObject({ accounts: 2, bound: 1, removed: 2, failed: 0 });
+    expect(app.agent.callsTo('net.ip.add').map((x) => x.args.address)).toEqual([b]);
+    expect(app.agent.callsTo('net.ip.del').map((x) => x.args.address)).toEqual([a, b]);
+    expect(app.agent.system.has(a)).toBe(false);
+    expect(app.agent.system.has(b)).toBe(false);
+    expect(app.agent.system.has(c)).toBe(true);
+    expect(app.ctx.db.prepare('SELECT ip FROM accounts WHERE username = ?').get('bob').ip).toBe(c);
+    expect(app.ctx.db.prepare('SELECT 1 FROM ip_addresses WHERE address IN (?, ?)').get(a, b)).toBeUndefined();
+    expect(app.ctx.db.prepare('SELECT reserved, reserved_reason FROM ip_addresses WHERE address = ?').get(c)).toEqual({ reserved: 0, reserved_reason: null });
+    expect((await get('/usage').expect(200)).body.data.find((r) => r.address === c)).toMatchObject({ status: 'shared', account_count: 1 });
+    const auditRow = app.ctx.db.prepare("SELECT principal, role FROM audit_log WHERE action = 'ip.migrate' ORDER BY id DESC LIMIT 1").get();
+    expect(auditRow).toEqual({ principal: 'root', role: 'root' });
+    app.ctx.db.prepare('UPDATE accounts SET ip = ? WHERE username = ?').run('203.0.113.10', 'bob');
   });
 
   it('keeps every server-wide route root-only', async () => {

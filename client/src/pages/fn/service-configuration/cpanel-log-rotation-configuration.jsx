@@ -53,7 +53,10 @@ export default function LogRotationConfiguration({ fn }) {
                     return (
                       <tr key={p.name}>
                         <td><strong>{label}</strong><div className="small muted">{help}</div></td>
-                        <td><code className="small">{p.perAccount ? `${p.preview.stanzas[0].paths.join(' ')} + ${Math.max(0, p.preview.stanzas.length - 1)} account stanza(s)` : p.paths.join(' ')}</code></td>
+                        <td>
+                          <code className="small">{p.perAccount ? `${p.preview.stanzas[0].paths.join(' ')} + ${Math.max(0, p.preview.stanzas.length - 1)} account stanza(s)` : p.paths.length ? p.paths.join(' ') : '(nothing left to rotate)'}</code>
+                          {p.coveredBy?.length > 0 && <div className="small muted">Already rotated by the distribution: {p.coveredBy.join(', ')}{p.paths.length ? ' (those logs are left out)' : ' (no file is written)'}</div>}
+                        </td>
                         <td><Toggle checked={draft[key]} onChange={set(key)} /></td>
                         <td>{p.file?.exists ? <StatusPill status="ok">whm-{p.name}</StatusPill> : <StatusPill status="pending">not written</StatusPill>}</td>
                         <td className="actions-col"><div className="row-actions"><Button size="sm" disabled={!p.file?.exists || !data.installed} loading={running === p.name} onClick={() => run(p.name, false)}>Run</Button><Button size="sm" disabled={!p.file?.exists || !data.installed} onClick={() => run(p.name, true)}>Force</Button></div></td>

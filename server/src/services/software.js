@@ -20,7 +20,9 @@ import { isRoot } from '../middleware/rbac.js';
 //   software.nginx.sync(req)                                -> re-render the reverse-proxy config from current domains and certificates;
 //                                                              { skipped: true } when the proxy is disabled, so SSL/TLS and Accounts
 //                                                              should call ctx.software?.nginx.sync(req) after installing a certificate
-//                                                              or creating / removing a domain (a 10-minute schedule catches the rest)
+//                                                              or creating / removing a domain (an hourly schedule, enabled only while
+//                                                              the proxy is on, catches the rest)
+// software.update.status({ cached })                      -> pending OS updates; cached: true serves the last recorded check
 // Lazily used when present: ctx.web.setPhpVersion(domain, version, req, { reload }) (the 4th argument is advisory: the web category
 // may skip the Apache reload until the last domain of a batch), ctx.web.setListenPorts({ http, https, bind }, req),
 // ctx.web.apache.settings().defaultPhpVersion, ctx.ssl.certForDomain(domain) + ctx.ssl.bundlePaths(domain).
@@ -227,12 +229,26 @@ export function createSoftwareService(ctx) {
   }
 
   // --- system update -------------------------------------------------------
+  // The simulation (apt-get -s dist-upgrade / dnf check-update) can take minutes,
+  // so its result is kept in settings and served to page loads; the job runs
+  // and the explicit "check now" refresh it.
+  const MAX_CACHED_PACKAGES = 200;
+  const recordCheck = (pending) => {
+    const packages = Array.isArray(pending.packages) ? pending.packages : [];
+    const entry = { at: new Date().toISOString(), manager: pending.manager ?? null, count: Number(pending.count ?? packages.length) || 0, security: Number(pending.security ?? packages.filter((p) => p.security).length) || 0, rebootRequired: Boolean(pending.rebootRequired), packages: packages.slice(0, MAX_CACHED_PACKAGES), truncated: packages.length > MAX_CACHED_PACKAGES };
+    settings.set('software.updates.last_check', entry);
+    return entry;
+  };
   const update = {
-    async status() {
+    async status({ cached = false } = {}) {
       requirePkg();
-      const upgradable = await op('pkg.upgradable');
+      let check = cached ? S('software.updates.last_check', null) : null;
+      let source = 'cached';
+      if (!check || !Array.isArray(check.packages)) { check = recordCheck(await op('pkg.upgradable')); source = 'live'; }
+      let rebootRequired = check.rebootRequired;
+      if (source === 'cached') { try { rebootRequired = Boolean((await op('pkg.reboot_required')).rebootRequired); } catch (err) { logger.warn({ err }, 'reboot check failed'); } }
       const last = ctx.jobs.list({ type: 'software.system.update', limit: 1 })[0] ?? null;
-      return { ...upgradable, lastRun: last, lastCheck: S('software.updates.last_check', null), autoApply: Boolean(S('software.updates.auto_os', false)), tier: S('updates.tier', 'stable') };
+      return { manager: check.manager, count: check.count, security: check.security, packages: check.packages, truncated: Boolean(check.truncated), rebootRequired, checkedAt: check.at, source, lastRun: last, lastCheck: check, autoApply: Boolean(S('software.updates.auto_os', false)), tier: S('updates.tier', 'stable') };
     },
     run({ dist = true, autoremove = false, refreshIndex = true, packages } = {}, user, req) {
       requirePkg();
@@ -268,15 +284,25 @@ export function createSoftwareService(ctx) {
       } else {
         job.log('System is up to date');
       }
-      settings.set('software.updates.last_check', { at: new Date().toISOString(), count: 0, security: 0, rebootRequired });
+      // A partial upgrade (or packages the manager held back) leaves updates
+      // pending; the recorded count comes from a fresh simulation, not from zero.
+      job.progress(95, 'checking what is still pending');
+      let still = { count: 0, security: 0, packages: [], manager: pending.manager, rebootRequired };
+      try { still = { ...(await job.agent.op('pkg.upgradable')), rebootRequired }; } catch (err) { job.log(`post-upgrade check failed: ${err.message}`, 'warn'); }
+      const after = recordCheck(still);
+      if (after.count) job.log(`${after.count} update(s) still pending after this run${after.security ? ` (${after.security} security)` : ''}`);
       job.progress(100, rebootRequired ? 'done; reboot required' : 'done');
       if (rebootRequired) job.log('A reboot is required to finish applying these updates', 'warn');
-      return { upgraded: pending.count, packages: pending.packages.map((p) => p.name), rebootRequired };
+      const upgraded = packages?.length ? pending.packages.filter((p) => packages.includes(p.name)) : pending.packages;
+      return { upgraded: upgraded.length, packages: upgraded.map((p) => p.name), stillPending: after.count, rebootRequired };
     },
     async checkJob(job) {
       if (!capabilities.has('pkg')) { job.log('no package manager detected; skipping'); return { skipped: true }; }
-      const pending = await job.agent.op('pkg.upgradable');
-      settings.set('software.updates.last_check', { at: new Date().toISOString(), count: pending.count, security: pending.security, rebootRequired: pending.rebootRequired });
+      // Without a fresh index the simulation only sees what the last refresh knew.
+      job.progress(5, 'refreshing package index');
+      try { await runLongOp(job, 'pkg.update_index', {}, 'package index refresh'); } catch (err) { job.log(`package index refresh failed: ${err.message}; checking against the current index`, 'warn'); }
+      job.progress(40, 'checking for updates');
+      const pending = recordCheck(await job.agent.op('pkg.upgradable'));
       job.log(`${pending.count} pending update(s), ${pending.security} security`);
       if (pending.count > 0 && S('software.updates.auto_os', false)) {
         job.log('automatic OS updates are enabled; applying');
@@ -311,6 +337,14 @@ export function createSoftwareService(ctx) {
 
   // --- language modules ---------------------------------------------------
   const MODULE_OPS = { pecl: ['pkg.pecl.list', 'pkg.pecl.install', 'pecl', 'extension', 'extensions'], pear: ['pkg.pear.list', 'pkg.pear.install', 'pear', 'package', 'packages'], gem: ['pkg.gem.list', 'pkg.gem.install', 'gem', 'gem', 'gems'], pip: ['pkg.pip.list', 'pkg.pip.install', 'pip', 'package', 'packages'] };
+  // Mirrors the agent's per-installer name schemas (agent/src/ops/pkg.js) so a
+  // name the agent would refuse is a 422 with a field message, not a failed job.
+  const MODULE_NAMES = {
+    pecl: [/^[a-z][a-z0-9_]{0,63}(-(stable|beta|alpha|[0-9][0-9A-Za-z.]{0,31}))?$/, 'PECL extension names are lowercase letters, digits and "_" (redis, imagick), optionally followed by -stable, -beta or -<version>'],
+    pear: [/^[A-Za-z][A-Za-z0-9_]{0,63}$/, 'PEAR package names use letters, digits and "_" only (Mail, Net_SMTP); give the version separately'],
+    gem: [/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/, 'Gem names use letters, digits, ".", "_" and "-"'],
+    pip: [/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/, 'Package names use letters, digits, ".", "_" and "-"'],
+  };
   const modules = {
     async installers() {
       let detected = { present: {}, versions: {}, perl: null, pip: null };
@@ -325,6 +359,8 @@ export function createSoftwareService(ctx) {
     },
     install(kind, { name, version }, user, req) {
       const [, installOp, cap, argName] = MODULE_OPS[kind];
+      const [pattern, hint] = MODULE_NAMES[kind];
+      if (!pattern.test(name)) throw unprocessable(`"${name}" is not a valid ${kind} name`, { name: [hint] });
       capabilities.require(cap, `${kind} is not installed on this server`);
       const job = enqueue('software.module.install', { kind, op: installOp, args: { [argName]: name, ...(version && kind !== 'pecl' && kind !== 'pear' ? { version } : {}) } }, user);
       req?.audit?.({ action: `software.module.install.${kind}`, target: name, args: { version: version ?? null, jobId: job.id } });
@@ -362,6 +398,19 @@ export function createSoftwareService(ctx) {
   };
 
   // --- panel self-update ----------------------------------------------------
+  // A feed URL may carry basic-auth credentials; they never reach the audit
+  // log or a GET response, and since fetch() refuses URLs with userinfo they
+  // are sent as an Authorization header instead.
+  const splitCredentials = (url) => {
+    try {
+      const u = new URL(url);
+      if (!u.username && !u.password) return { url, headers: {} };
+      const auth = `Basic ${Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64')}`;
+      u.username = ''; u.password = '';
+      return { url: u.href, headers: { Authorization: auth } };
+    } catch { return { url, headers: {} }; }
+  };
+  const redactUrl = (url) => (url ? splitCredentials(url).url : url);
   const panel = {
     installMethod() {
       if (fs.existsSync(path.join(REPO_ROOT, '.git'))) return 'git';
@@ -373,7 +422,7 @@ export function createSoftwareService(ctx) {
       const latest = last?.latest ?? null;
       const method = panel.installMethod();
       return {
-        currentVersion: ctx.version, updateUrl: S('software.update_url', ''), tier: S('updates.tier', 'stable'), autoUpdate: Boolean(S('updates.auto', false)),
+        currentVersion: ctx.version, updateUrl: redactUrl(S('software.update_url', '')), updateUrlHasCredentials: redactUrl(S('software.update_url', '')) !== S('software.update_url', ''), tier: S('updates.tier', 'stable'), autoUpdate: Boolean(S('updates.auto', false)),
         lastCheck: last, latest, updateAvailable: latest ? compareVersions(latest.version, ctx.version) > 0 : null,
         installMethod: method, repoRoot: REPO_ROOT,
         selfUpdate: { supported: false, reason: 'In-place self-update is not performed by the panel. Apply updates with the install script so the service restarts under systemd with the right ownership.' },
@@ -388,9 +437,10 @@ export function createSoftwareService(ctx) {
     async check(req) {
       const url = S('software.update_url', '');
       if (!url) throw unprocessable('No update URL is configured', { url: ['Set the update URL below first'] });
-      const entry = { at: new Date().toISOString(), url, ok: false, latest: null, error: null };
+      const target = splitCredentials(url);
+      const entry = { at: new Date().toISOString(), url: target.url, ok: false, latest: null, error: null };
       try {
-        const res = await fetch(url, { headers: { Accept: 'application/json', 'User-Agent': `whm-panel/${ctx.version}` }, signal: AbortSignal.timeout(10_000), redirect: 'follow' });
+        const res = await fetch(target.url, { headers: { Accept: 'application/json', 'User-Agent': `whm-panel/${ctx.version}`, ...target.headers }, signal: AbortSignal.timeout(10_000), redirect: 'follow' });
         if (!res.ok) throw new Error(`update server answered ${res.status}`);
         const body = await res.json();
         const tier = S('updates.tier', 'stable');
@@ -399,10 +449,10 @@ export function createSoftwareService(ctx) {
         entry.ok = true;
         entry.latest = { version: release.version.replace(/^v/, ''), url: typeof release.url === 'string' && /^https?:\/\//.test(release.url) ? release.url : null, notes: typeof release.notes === 'string' ? release.notes.slice(0, 4000) : null, publishedAt: typeof release.publishedAt === 'string' ? release.publishedAt : null, tier };
       } catch (err) {
-        entry.error = err.name === 'TimeoutError' ? 'timed out after 10s' : err.message;
+        entry.error = (err.name === 'TimeoutError' ? 'timed out after 10s' : err.message).split(url).join(entry.url);
       }
       settings.set('software.panel.last_check', entry);
-      req?.audit?.({ action: 'software.panel.check', args: { url, ok: entry.ok, latest: entry.latest?.version ?? null, error: entry.error } });
+      req?.audit?.({ action: 'software.panel.check', args: { url: entry.url, ok: entry.ok, latest: entry.latest?.version ?? null, error: entry.error } });
       return panel.status();
     },
     updateSettings({ url, tier, autoUpdate }, req) {
@@ -411,7 +461,7 @@ export function createSoftwareService(ctx) {
       if (tier !== undefined) values['updates.tier'] = tier;
       if (autoUpdate !== undefined) values['updates.auto'] = autoUpdate;
       settings.setMany(values);
-      req?.audit?.({ action: 'software.panel.settings', args: values });
+      req?.audit?.({ action: 'software.panel.settings', args: { ...values, ...(url !== undefined ? { 'software.update_url': redactUrl(url) } : {}) } });
       return panel.status();
     },
   };
@@ -449,11 +499,16 @@ export function createSoftwareService(ctx) {
   }
 
   const php = {
-    async versions({ modules = false } = {}) {
+    // Resellers only need the dropdown: binaries, ini paths, pool dirs, units
+    // and the per-version module scan stay root-only.
+    async versions({ modules = false, user = null } = {}) {
       requirePhp();
-      const result = await op('pkg.php.versions', { modules });
+      const root = !user || isRoot(user);
+      const result = await op('pkg.php.versions', { modules: root && modules });
       const configured = S('php.default_version', null);
-      return { ...result, configuredDefault: configured, effectiveDefault: result.versions.some((v) => v.id === configured) ? configured : result.defaultId };
+      const effectiveDefault = result.versions.some((v) => v.id === configured) ? configured : result.defaultId;
+      if (root) return { ...result, configuredDefault: configured, effectiveDefault };
+      return { versions: result.versions.map((v) => ({ id: v.id, label: v.label, version: v.version, isDefault: v.id === effectiveDefault })), defaultId: effectiveDefault, configuredDefault: configured, effectiveDefault };
     },
     async systemDefault() {
       const configured = S('php.default_version', null);
@@ -649,18 +704,44 @@ export function createSoftwareService(ctx) {
   }
 
   // Renders + `nginx -t` through the agent; the op leaves the host untouched when
-  // the test fails, so callers may run this before changing anything else.
+  // the test fails, so callers may run this before changing anything else. The
+  // sync time / fingerprint are only recorded by markSynced(), once the caller
+  // knows the write is not going to be rolled back.
   async function writeProxy(s, req) {
     const domains = proxyDomains();
     const result = await op('pkg.nginx.proxy.write', { apachePort: s.apachePort, cache: s.cache, cacheMaxSizeMb: s.cacheMaxSizeMb, cacheTtl: s.cacheTtl, domains }, req);
-    settings.setMany({ 'software.nginx.last_sync': new Date().toISOString(), 'software.nginx.last_fingerprint': proxyFingerprint(s, domains) });
-    return result;
+    return { ...result, fingerprint: proxyFingerprint(s, domains), syncedAt: new Date().toISOString() };
   }
+  const markSynced = (written) => settings.setMany({ 'software.nginx.last_sync': written.syncedAt, 'software.nginx.last_fingerprint': written.fingerprint });
 
+  // A unit that was stopped + disabled by "disable proxy" is enabled again so
+  // the proxy comes back after a reboot.
   async function startOrReload(req) {
     const status = await op('pkg.nginx.status');
-    return status.active ? nginxUnit('reload', req) : nginxUnit('start', req);
+    if (status.active) return nginxUnit('reload', req);
+    const started = await nginxUnit('start', req);
+    if (started.ok) started.enabledAtBoot = (await nginxUnit('enable', req)).ok;
+    return started;
   }
+
+  // nginx must let go of :80/:443 before Apache can take them back: the stock
+  // default site proxy.remove restores listens on :80 again, so a reload would
+  // keep the ports and Apache's restart would fail to bind. The unit is also
+  // disabled so a reboot does not bring nginx up in front of Apache again.
+  async function releasePorts(req) {
+    const unit = await nginxUnit('stop', req);
+    if (unit.ok) unit.disabledAtBoot = (await nginxUnit('disable', req)).ok;
+    let active = null;
+    try { active = (await op('pkg.nginx.status')).active; } catch (err) { logger.warn({ err }, 'nginx status after stop failed'); }
+    unit.stillActive = active === true;
+    unit.holdsPorts = !unit.ok ? active !== false : active === true;
+    if (unit.holdsPorts) unit.hint = `nginx is still running and holds ports 80/443${unit.ok ? '' : ` (stop failed: ${unit.error})`}; stop it before Apache can listen there.`;
+    return unit;
+  }
+
+  const SYNC_SCHEDULE = 'nginx-proxy-sync';
+  // The schedule only fires while the proxy is on (contract: no job rows for work that is skipped).
+  const syncSchedule = (enabled) => { try { ctx.scheduler?.update?.(SYNC_SCHEDULE, { enabled: Boolean(enabled) }); } catch (err) { logger.warn({ err }, 'nginx: schedule toggle failed'); } };
 
   const nginx = {
     async status() {
@@ -697,11 +778,13 @@ export function createSoftwareService(ctx) {
       if (!s.enabled) return { skipped: true, reason: 'proxy disabled' };
       capabilities.require('nginx', 'nginx is not installed on this server');
       const result = await writeProxy(s, req);
+      markSynced(result);
       req?.audit?.({ action: 'software.nginx.sync', args: { domains: result.domains, sslDomains: result.sslDomains } });
       return { ...result, unit: await startOrReload(req) };
     },
-    // Scheduled every 10 minutes: re-renders only when the domains, certificates
-    // or settings the config was rendered from have changed since the last write.
+    // Scheduled hourly while the proxy is on: re-renders only when the domains,
+    // certificates or settings the config was rendered from have changed since
+    // the last write.
     async syncJob(job) {
       const s = nginxSettings();
       if (!s.enabled) { job.log('proxy disabled; nothing to do'); return { skipped: true, reason: 'proxy disabled' }; }
@@ -713,6 +796,7 @@ export function createSoftwareService(ctx) {
       if (configured && fingerprint === s.lastFingerprint) { job.log('proxy config is current'); return { skipped: true, reason: 'current', domains: domains.length }; }
       job.log(`proxy config is out of date (${domains.length} domains, ${domains.filter((d) => d.ssl).length} with HTTPS); re-rendering`);
       const result = await writeProxy(s, null);
+      markSynced(result);
       const unit = await startOrReload(null);
       job.log(`rendered ${result.domains} domains; nginx ${unit.ok ? `${unit.verb} ok` : `${unit.verb} failed: ${unit.error}`}`, unit.ok ? 'info' : 'error');
       if (!unit.ok) throw new Error(`nginx ${unit.verb} failed: ${unit.error}`);
@@ -752,23 +836,41 @@ export function createSoftwareService(ctx) {
           req?.audit?.({ action: 'software.nginx.configure', args: { before, after: next, rolledBack: true, error: proxy.unit.error } });
           throw badRequest(`nginx ${proxy.unit.verb} failed (${proxy.unit.error}); the proxy settings were rolled back and ${restored}`);
         }
+        markSynced(proxy);
+        syncSchedule(true);
         if (!proxy.unit.ok) proxy.unit.hint = manualNote(next);
       } else {
+        // Order: remove the managed config, stop nginx (it must release :80/:443),
+        // persist, then hand the ports back to Apache. Apache is left on the
+        // backend ports rather than restarted into a bind failure when nginx
+        // could not be stopped.
         const hadProxy = before.enabled || (await op('pkg.nginx.status')).proxyConfigured;
         if (hadProxy) {
           proxy = await op('pkg.nginx.proxy.remove', {}, req);
-          if (capabilities.has('nginx')) proxy.unit = await nginxUnit('reload', req);
+          if (capabilities.has('nginx')) proxy.unit = await releasePorts(req);
         } else {
           proxy = { skipped: true };
         }
         persistNginx(next);
-        if (webLinked() && (before.enabled || hadProxy)) {
-          try { await ctx.web.setListenPorts(backendPorts(next), req); apache = { state: 'applied', detail: 'Apache listens on 80/443 on all interfaces again.' }; } catch (err) { apache = { state: 'failed', detail: `${err.message}. ${manualNote(next)}` }; }
+        syncSchedule(false);
+        // Apache pinned to loopback is proxy state; a re-save after a stuck
+        // disable moves it back once nginx has let go of the ports.
+        const stillPinned = webLinked() && backendBind() === BACKEND_BIND;
+        if (webLinked() && (before.enabled || hadProxy || stillPinned)) {
+          let holdsPorts = proxy.unit?.holdsPorts ?? false;
+          if (!proxy.unit && stillPinned && capabilities.has('nginx')) { try { holdsPorts = (await op('pkg.nginx.status')).active === true; } catch (err) { logger.warn({ err }, 'nginx status before moving Apache back failed'); holdsPorts = true; } }
+          if (holdsPorts) {
+            apache = { state: 'skipped', detail: `Apache was left on the backend ports because nginx still holds 80/443 (${proxy.unit ? (proxy.unit.ok ? 'still active after stop' : proxy.unit.error) : 'nginx is running'}). Stop nginx, then save again or ${manualNote(next).charAt(0).toLowerCase()}${manualNote(next).slice(1)}` };
+          } else {
+            try { await ctx.web.setListenPorts(backendPorts(next), req); apache = { state: 'applied', detail: `Apache listens on 80/443 on all interfaces again${proxy.unit?.ok ? '; nginx was stopped and disabled' : ''}.` }; } catch (err) { apache = { state: 'failed', detail: `${err.message}. ${manualNote(next)}` }; }
+          }
         } else if (webLinked()) {
           apache = { state: 'unchanged', detail: null };
+        } else if (proxy.unit?.ok) {
+          apache.detail = `nginx was stopped and disabled. ${apache.detail}`;
         }
       }
-      req?.audit?.({ action: 'software.nginx.configure', args: { before, after: next, apache: apache.state, bind: next.enabled ? BACKEND_BIND : null } });
+      req?.audit?.({ action: 'software.nginx.configure', args: { before, after: next, apache: apache.state, bind: next.enabled ? BACKEND_BIND : null, nginxStopped: !next.enabled ? Boolean(proxy.unit?.ok) : undefined } });
       return { settings: next, apache, proxy, status: await nginx.status() };
     },
     async control(verb, req) {
@@ -780,6 +882,10 @@ export function createSoftwareService(ctx) {
     },
     async readConfig() { return (await op('pkg.nginx.status', { includeContent: true })).content ?? null; },
     proxyDomains,
+    // Called from register(): a fresh schedules row is enabled by default, which
+    // would enqueue skipped jobs on every host without a proxy. Operator tuning
+    // of an enabled schedule is left alone.
+    alignSchedule() { if (!nginxSettings().enabled) syncSchedule(false); },
   };
 
   // --- EasyApache 4 -----------------------------------------------------------

@@ -6,8 +6,10 @@ import { createIpService, REMOTE_SERVICES } from '../../services/ip-functions.js
 const addressParam = z.object({ address: fields.ip });
 const idParam = z.object({ id: fields.id });
 const netmask = z.string().regex(/^(\d{1,3}\.){3}\d{1,3}$|^\/?\d{1,3}$/, 'Dotted netmask (255.255.255.0) or prefix length');
-const prefix = z.number().int().min(0).max(128);
-const iface = z.string().regex(/^[a-zA-Z0-9._-]{1,15}$/, 'Interface name such as eth0');
+// Binds only: a /0 address would install a default on-link route.
+const prefix = z.number().int().min(1).max(128);
+// Mirrors the agent's schema: an interface name never starts with "-" (argv option) or ".".
+const iface = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,14}$/, 'Interface name such as eth0');
 const rangeName = z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,63}$/, 'Letters, digits, spaces, "_", "." or "-"; max 64 chars');
 const cidr6 = z.string().trim().regex(/^[0-9a-fA-F:.]{2,45}\/\d{1,3}$/, 'IPv6 network in CIDR notation, e.g. 2001:db8:1::/64');
 const reason = z.string().trim().max(200).nullable().optional();

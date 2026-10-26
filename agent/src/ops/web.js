@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import { z } from 'zod';
 import { exec, hasBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
+import { eximBaseLayout, includesFile, EXIM_WHM_FILES } from './exim-layout.js';
 
 // Web op family: Apache (Debian apache2 or RHEL httpd layout) virtual hosts,
 // the panel's global include, MPM switching, status; PHP-FPM per-account pools;
@@ -210,30 +211,77 @@ export function dovecotLayout() {
   return { installed, bin: installed ? 'dovecot' : null, confDir: '/etc/dovecot', dropinDir: '/etc/dovecot/conf.d', include: '/etc/dovecot/conf.d/97-whm-mailserver.conf', doveconf: hasBinary('doveconf'), units: ['dovecot'] };
 }
 
-export function eximLayout() {
-  const bin = ['exim4', 'exim'].find(hasBinary) || null;
-  let flavor = null;
-  if (exists('/etc/exim4')) flavor = 'debian';
-  else if (exists('/etc/exim') || exists('/etc/exim.conf')) flavor = 'rhel';
-  if (!flavor && !bin) return null;
-  const confDir = flavor === 'debian' ? '/etc/exim4' : '/etc/exim';
-  const whmDir = `${confDir}/whm`;
-  const split = flavor === 'debian' && exists('/etc/exim4/conf.d');
-  const mainConf = flavor === 'debian' ? (split ? null : '/etc/exim4/exim4.conf.template') : ['/etc/exim/exim.conf', '/etc/exim.conf'].find(exists) || '/etc/exim/exim.conf';
+// The main slot starts with this macro so `exim -bP macro` on the generated
+// configuration proves the slot is really read (a file Exim never loads passes
+// update-exim4.conf and exim -bV trivially).
+export const EXIM_SENTINEL_MACRO = 'WHM_SERVICE_CONFIG';
+const EXIM_BLOCK = { begin: '# BEGIN WHM panel (Service Configuration: Exim main options) - managed block, edits inside are overwritten', end: '# END WHM panel (Service Configuration: Exim main options)' };
+
+// Where the Exim main options live per layout (shared detection in
+// exim-layout.js decides the Debian config mode from dc_use_split_config):
+//   Debian split   → a conf.d/main fragment, concatenated into the main section;
+//   Debian unsplit → a managed block in exim4.conf.localmacros, which
+//                    update-exim4.conf prepends in both modes (conf.d/ is ignored);
+//   RHEL           → <confdir>/whm/service_config.conf, .include'd by hand once.
+// The RCPT ACL slot is the single local-ACL hook point both mail families agree
+// on (acl-rcpt-local.conf): Debian reaches it through CHECK_RCPT_LOCAL_ACL_FILE,
+// defined by the main slot, and it ends with an include of the Email category's
+// filters file so one macro serves both.
+export function eximLayout(io) {
+  const base = eximBaseLayout(io);
+  if (!base.flavor && !base.installed) return null;
+  const flavor = base.flavor;
+  const debian = flavor === 'debian';
+  const confDir = base.confDir || '/etc/exim';
+  const whmDir = base.whmDir || `${confDir}/whm`;
+  const mainConf = debian ? base.mainConf : base.mainConf || '/etc/exim/exim.conf';
+  const emailAclFile = base.emailAclFile || `${whmDir}/${EXIM_WHM_FILES.emailFilters}`;
+  const main = debian
+    ? (base.splitConfig ? { path: '/etc/exim4/conf.d/main/001_whm_service_config', hookable: true, block: null } : { path: base.macroFile, hookable: true, block: EXIM_BLOCK.begin })
+    : { path: `${whmDir}/service_config.conf`, hookable: false, block: null };
   return {
-    installed: Boolean(bin), bin, flavor, confDir, whmDir, splitConfig: split, mainConf, updateConf: hasBinary('update-exim4.conf'),
-    units: flavor === 'debian' ? ['exim4', 'exim'] : ['exim', 'exim4'],
+    installed: base.installed, bin: base.bin, flavor, confDir, whmDir, splitConfig: base.splitConfig, mainConf, updateConf: base.updateConf, macroFile: base.macroFile,
+    rcptAclSource: base.rcptAclSource || mainConf, emailAclFile, sentinel: EXIM_SENTINEL_MACRO,
+    units: debian ? ['exim4', 'exim'] : ['exim', 'exim4'],
     slots: {
-      // Debian's split config concatenates conf.d/main/* into the main section,
-      // so a file there is live without any include line; ACL fragments are
-      // pulled in through the CHECK_{RCPT,DATA}_LOCAL_ACL_FILE macros the
-      // distribution ACLs .include (defined by the main slot when nothing else,
-      // such as the Email category's localmacros, claimed them first).
-      main: split ? { path: '/etc/exim4/conf.d/main/001_whm_service_config', hookable: true } : { path: `${whmDir}/service_config.conf`, hookable: false },
-      acl_rcpt: { path: `${whmDir}/acl_rcpt_protect.conf`, hookable: split, macro: split ? 'CHECK_RCPT_LOCAL_ACL_FILE' : null },
-      acl_data: { path: `${whmDir}/acl_data_whm.conf`, hookable: split, macro: split ? 'CHECK_DATA_LOCAL_ACL_FILE' : null },
+      main,
+      acl_rcpt: { path: base.aclChainFile || `${whmDir}/${EXIM_WHM_FILES.aclChain}`, hookable: debian, macro: debian ? 'CHECK_RCPT_LOCAL_ACL_FILE' : null, block: null, includes: emailAclFile },
+      acl_data: { path: `${whmDir}/acl_data_whm.conf`, hookable: debian, macro: debian ? 'CHECK_DATA_LOCAL_ACL_FILE' : null, block: null },
     },
   };
+}
+
+// The managed block the unsplit-Debian main slot occupies inside localmacros,
+// next to the admin's lines and the other categories' blocks.
+export function mergeEximBlock(previous, content) {
+  const block = `${EXIM_BLOCK.begin}\n${String(content).trimEnd()}\n${EXIM_BLOCK.end}\n`;
+  const text = previous || '';
+  const start = text.indexOf(EXIM_BLOCK.begin);
+  const stop = text.indexOf(EXIM_BLOCK.end);
+  if (start !== -1 && stop !== -1 && stop >= start) return `${text.slice(0, start)}${block}${text.slice(stop + EXIM_BLOCK.end.length).replace(/^\n/, '')}`;
+  return `${text.length && !text.endsWith('\n') ? `${text}\n` : text}${block}`;
+}
+
+export function readEximBlock(text) {
+  const t = text || '';
+  const start = t.indexOf(EXIM_BLOCK.begin);
+  const stop = t.indexOf(EXIM_BLOCK.end);
+  if (start === -1 || stop === -1 || stop < start) return null;
+  return t.slice(start + EXIM_BLOCK.begin.length, stop).replace(/^\n/, '');
+}
+
+export function stripEximBlock(text) {
+  const t = text || '';
+  const start = t.indexOf(EXIM_BLOCK.begin);
+  const stop = t.indexOf(EXIM_BLOCK.end);
+  if (start === -1 || stop === -1 || stop < start) return t;
+  return `${t.slice(0, start)}${t.slice(stop + EXIM_BLOCK.end.length).replace(/^\n/, '')}`;
+}
+
+// What a slot holds right now: a block slot reads its block, a file slot the file.
+function eximSlotContent(s) {
+  const text = readText(s.path);
+  return s.block ? readEximBlock(text) : text;
 }
 
 // ---------------------------------------------------------------- schemas ---
@@ -364,14 +412,15 @@ function vhostBlock(v, { ssl, port }) {
   lines.push('  <IfModule mod_userdir.c>', '    UserDir disabled', '  </IfModule>');
   lines.push(`  <Directory ${q(v.docroot)}>`, `    Options ${v.options || '-Indexes +FollowSymLinks'}`, '    AllowOverride All', '    Require all granted', '  </Directory>');
   if (v.phpVersion) {
-    lines.push('  <IfModule proxy_fcgi_module>', '    <FilesMatch "\\.ph(ar|p|tml)$">', `      SetHandler "proxy:unix:${phpSocket(v.phpVersion, v.user)}|fcgi://localhost"`, '    </FilesMatch>', '  </IfModule>');
+    // proxy_fcgi drops the Authorization header unless it is re-exported, so
+    // PHP applications using HTTP Basic auth get it on both vhosts.
+    lines.push('  <IfModule proxy_fcgi_module>', '    SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1', '    <FilesMatch "\\.ph(ar|p|tml)$">', `      SetHandler "proxy:unix:${phpSocket(v.phpVersion, v.user)}|fcgi://localhost"`, '    </FilesMatch>', '  </IfModule>');
   }
   if (ssl) {
     lines.push('  SSLEngine on');
     if (v.ssl.fullchain) lines.push(`  SSLCertificateFile ${q(v.ssl.fullchain)}`);
     else { lines.push(`  SSLCertificateFile ${q(v.ssl.cert)}`); if (v.ssl.chain) lines.push(`  SSLCertificateChainFile ${q(v.ssl.chain)}`); }
     lines.push(`  SSLCertificateKeyFile ${q(v.ssl.key)}`);
-    if (v.phpVersion) lines.push('  <IfModule proxy_fcgi_module>', '    SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1', '  </IfModule>');
   }
   if (v.redirects.length) lines.push('  # Redirects (Setup/Edit Domain Forwarding)', ...renderRedirects(v.redirects));
   if (v.customDirectives.trim()) lines.push('  # Custom directives', ...v.customDirectives.trim().split('\n').map((l) => `  ${l}`));
@@ -544,9 +593,11 @@ export function parseModules(stdout) {
   return [...String(stdout || '').matchAll(/^\s*(\w+)_module\s+\((static|shared)\)/gm)].map((m) => ({ name: m[1], type: m[2] }));
 }
 
-function fetchServerStatus(timeoutMs = 3000) {
+// mod_status is asked on the address Apache really listens on: the panel passes
+// the ports/bind it set (e.g. 127.0.0.1:8080 behind the nginx proxy).
+function fetchServerStatus({ host = '127.0.0.1', port = 80 } = {}, timeoutMs = 3000) {
   return new Promise((resolve) => {
-    const req = http.get({ host: '127.0.0.1', port: 80, path: '/server-status?auto', headers: { Host: 'localhost' }, timeout: timeoutMs }, (res) => {
+    const req = http.get({ host, port, path: '/server-status?auto', headers: { Host: 'localhost' }, timeout: timeoutMs }, (res) => {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (c) => { if (body.length < 65_536) body += c; });
@@ -613,13 +664,14 @@ defineOp('web.detect', {
 });
 
 defineOp('web.status', {
-  description: 'Apache runtime status: unit state, version, MPM, loaded modules and mod_status counters when enabled',
-  run: async () => {
+  description: 'Apache runtime status: unit state, version, MPM, loaded modules and mod_status counters when enabled (probed on the given port/bind address)',
+  schema: z.object({ port: z.number().int().min(1).max(65535).default(80), bind: arg.ip.nullable().default(null) }).strict(),
+  run: async ({ port, bind }) => {
     const apache = apacheLayout();
     if (!apache || !apache.bin) return { installed: false };
     const info = await apacheInfo(apache);
     const unit = await unitState(await firstUnit(apache.units));
-    const serverStatus = unit.active && info.modules.some((m) => m.name === 'status') ? await fetchServerStatus() : null;
+    const serverStatus = unit.active && info.modules.some((m) => m.name === 'status') ? await fetchServerStatus({ host: bind || '127.0.0.1', port }) : null;
     const vhostDir = apache.flavor === 'debian' ? apache.sitesAvailable : apache.confD;
     let vhosts = 0;
     try { vhosts = fs.readdirSync(vhostDir).filter((f) => f.endsWith('.conf') && (readText(path.join(vhostDir, f)) || '').includes(VHOST_MARK)).length; } catch { vhosts = 0; }
@@ -764,6 +816,9 @@ defineOp('web.mpm.set', {
     if (module !== 'prefork' && info.modules.some((m) => /^php\d/.test(m.name))) throw new OpError('refused', `mod_${info.modules.find((m) => /^php\d/.test(m.name)).name} is loaded; it only works with the prefork MPM. Switch PHP to PHP-FPM first.`);
     if (apache.flavor === 'debian') {
       if (!apache.a2tools) throw new OpError('capability_missing', 'a2enmod/a2dismod are not available on this server');
+      // The running MPM comes from parsed `apache2ctl -V` output, so it is
+      // checked against the known set before it becomes an a2dismod argument.
+      if (info.mpm && !mpmSchema.shape.module.unwrap().safeParse(info.mpm).success) throw new OpError('unexpected_state', `Apache reports an unknown MPM "${info.mpm}"; refusing to switch modules`);
       const current = info.mpm ? `mpm_${info.mpm}` : null;
       if (current) await exec('a2dismod', ['-q', '-f', current], { allowFailure: true, timeoutMs: 60_000 });
       const en = await exec('a2enmod', ['-q', `mpm_${module}`], { allowFailure: true, timeoutMs: 60_000 });
@@ -1045,10 +1100,32 @@ async function logrotateTest(file) {
   return { ok: code === 0 && !/^error:/m.test(output), output: output.split('\n').slice(0, 60).join('\n') };
 }
 
+// The primary group of a system user from /etc/passwd + /etc/group, so a
+// per-account `su` stanza names the real group even when it is not called
+// after the user (logrotate rejects the whole file on an unknown group).
+export function primaryGroupName(user, { passwd = readText('/etc/passwd'), group = readText('/etc/group') } = {}) {
+  const pw = (passwd || '').split('\n').find((l) => l.startsWith(`${user}:`));
+  if (!pw) return null;
+  const gid = pw.split(':')[3];
+  const gr = (group || '').split('\n').find((l) => l.split(':')[2] === gid);
+  const name = gr ? gr.split(':')[0] : null;
+  return name && groupName.safeParse(name).success ? name : null;
+}
+
+function resolveSuGroups(l) {
+  const fix = (su) => (su && su.user !== 'root' ? { ...su, group: primaryGroupName(su.user) || su.group } : su);
+  return { ...l, su: fix(l.su), stanzas: l.stanzas?.map((s) => ({ ...s, su: fix(s.su) })) };
+}
+
+// Distribution-provided policies that already rotate the web server logs; a
+// panel policy naming the same files makes logrotate report duplicate entries.
+export const DISTRIBUTION_LOGROTATE = { apache2: `${LOGROTATE_DIR}/apache2`, httpd: `${LOGROTATE_DIR}/httpd`, nginx: `${LOGROTATE_DIR}/nginx` };
+
 defineOp('web.logrotate.write', {
   description: `Write a managed logrotate policy to ${LOGROTATE_DIR}/whm-<name>, validated with logrotate -d (rolled back on error)`,
   schema: logrotateSchema,
-  run: async (l, ctx) => {
+  run: async (input, ctx) => {
+    const l = resolveSuGroups(input);
     const file = ctx.assertAllowedPath(rotateFile(l.name), 'write');
     for (const p of [...l.paths, ...(l.stanzas || []).flatMap((s) => s.paths)]) ctx.assertAllowedPath(p.replace(/\*.*$/, ''), 'read');
     const content = renderLogrotate(l);
@@ -1072,7 +1149,8 @@ defineOp('web.logrotate.list', {
     ctx.assertAllowedPath(LOGROTATE_DIR, 'read');
     let files = [];
     try { files = fs.readdirSync(LOGROTATE_DIR).filter((f) => f.startsWith('whm-') && !f.endsWith('.whm-bak')).map((f) => ({ name: f.slice(4), path: path.join(LOGROTATE_DIR, f), size: fs.statSync(path.join(LOGROTATE_DIR, f)).size, mtime: fs.statSync(path.join(LOGROTATE_DIR, f)).mtime.toISOString() })); } catch { files = []; }
-    return { dir: LOGROTATE_DIR, logrotate: hasBinary('logrotate'), policies: files, dirExists: exists(LOGROTATE_DIR) };
+    const distribution = Object.fromEntries(Object.entries(DISTRIBUTION_LOGROTATE).filter(([, f]) => exists(f)));
+    return { dir: LOGROTATE_DIR, logrotate: hasBinary('logrotate'), policies: files, dirExists: exists(LOGROTATE_DIR), distribution };
   },
 });
 
@@ -1165,26 +1243,39 @@ function requireExim() {
   return layout;
 }
 
-// Whether a slot is reached by the configuration Exim would actually load.
-// Split-config ACL slots are hooked when their macro resolves to our file in
-// the generated config (`exim -bP macro`), which also reveals a macro another
-// component (the Email category's acl_rcpt.conf) claimed first; without the
-// binary the first textual definition wins, as it does for Exim.
+// The value of a macro in the configuration Exim would actually load (`exim -bP
+// macro`): null when it is not defined there, undefined without the binary.
+async function eximMacro(layout, name) {
+  if (!layout.installed) return undefined;
+  const { code, stdout } = await exec(layout.bin, ['-bP', 'macro', name], { allowFailure: true, timeoutMs: 30_000 });
+  if (code !== 0) return null;
+  return (stdout.trim().split('\n').pop() || '').replace(new RegExp(`^${name}\\s*==?\\s*`), '').trim() || null;
+}
+
+// Whether a slot is reached by the configuration Exim would actually load. The
+// main slot is proven by its sentinel macro (a conf.d fragment on an unsplit
+// host, or an un-included RHEL file, passes exim -bV without being read); the
+// ACL slots by their CHECK_*_LOCAL_ACL_FILE macro resolving to our file, which
+// also reveals a definition another component (the Email category's fallback
+// macro, or the admin) made first. Manual layouts are hooked when the main
+// configuration .include's the file, directly or through one level.
 async function eximHook(layout, slot) {
   const s = layout.slots[slot];
-  if (slot === 'main') return { hooked: s.hookable || (readText(layout.mainConf || '') || '').includes(s.path), claimedBy: null };
+  const includedByMain = () => includesFile(readText(layout.mainConf || '') || '', s.path, (f) => (/^\/etc\/exim/.test(f) ? readText(f) : null)).hooked;
+  if (slot === 'main') {
+    const value = await eximMacro(layout, layout.sentinel || EXIM_SENTINEL_MACRO);
+    if (value !== undefined) return { hooked: value != null, claimedBy: null };
+    return { hooked: s.hookable ? (eximSlotContent(s) || '').includes(`${EXIM_SENTINEL_MACRO} =`) : includedByMain(), claimedBy: null };
+  }
   if (s.macro) {
-    let value = null;
-    if (layout.installed) {
-      const { code, stdout } = await exec(layout.bin, ['-bP', 'macro', s.macro], { allowFailure: true, timeoutMs: 30_000 });
-      value = code === 0 ? (stdout.trim().split('\n').pop() || '').replace(new RegExp(`^${s.macro}\\s*=\\s*`), '').trim() || null : null;
-    } else {
-      const text = ['/etc/exim4/exim4.conf.localmacros', '/etc/exim4/conf.d/main/000_localmacros', '/etc/exim4/conf.d/main/000_whm_macros', s.path === layout.slots.main.path ? null : layout.slots.main.path].filter(Boolean).map((f) => readText(f) || '').join('\n');
+    let value = await eximMacro(layout, s.macro);
+    if (value === undefined) {
+      const text = [layout.macroFile, '/etc/exim4/conf.d/main/000_localmacros', s.path === layout.slots.main.path ? null : layout.slots.main.path].filter(Boolean).map((f) => readText(f) || '').join('\n');
       value = text.match(new RegExp(`^\\s*${s.macro}\\s*==?\\s*(\\S+)`, 'm'))?.[1] || null;
     }
     return { hooked: value === s.path, claimedBy: value && value !== s.path ? value : null };
   }
-  return { hooked: (readText(layout.mainConf || '') || '').includes(s.path), claimedBy: null };
+  return { hooked: includedByMain(), claimedBy: null };
 }
 
 // `exim -bV` names the compiled-in features ("Support for: ... DKIM ... SPF");
@@ -1194,9 +1285,11 @@ export function parseEximVersion(stdout) {
   return { version: String(stdout || '').match(/Exim version (\S+)/)?.[1] || null, features: support ? support.trim().split(/\s+/) : null };
 }
 
+// Debian regenerates config.autogenerated from the template or conf.d plus
+// localmacros in both modes, so update-exim4.conf runs whenever it exists.
 async function validateExim(layout) {
   let regenerated = null;
-  if (layout.splitConfig && layout.updateConf) { const r = await exec('update-exim4.conf', [], { allowFailure: true, timeoutMs: 120_000 }); regenerated = { ok: r.code === 0, output: `${r.stdout}${r.stderr}`.trim() }; }
+  if (layout.flavor === 'debian' && layout.updateConf) { const r = await exec('update-exim4.conf', [], { allowFailure: true, timeoutMs: 120_000 }); regenerated = { ok: r.code === 0, output: `${r.stdout}${r.stderr}`.trim() }; }
   const { code, stdout, stderr } = await exec(layout.bin, ['-bV'], { allowFailure: true, timeoutMs: 60_000 });
   const output = `${stdout}${stderr}`.trim();
   const ok = code === 0 && !/configuration error|main option .* unknown|Exim configuration error|option set for a second time|unknown ACL condition/i.test(output) && (regenerated?.ok ?? true);
@@ -1211,40 +1304,58 @@ defineOp('web.exim.detect', {
     const slots = {};
     for (const [k, s] of Object.entries(layout.slots)) {
       ctx.assertAllowedPath(s.path, 'read');
-      slots[k] = { ...s, exists: exists(s.path), ...(await eximHook(layout, k)), content: readText(s.path) };
+      const content = eximSlotContent(s);
+      slots[k] = { ...s, exists: content != null, ...(await eximHook(layout, k)), content, ...(s.includes ? { includesEmailFilters: content != null && content.includes(`.include_if_exists ${s.includes}`) } : {}) };
     }
     let info = { version: null, features: null };
     if (layout.installed) { const v = await exec(layout.bin, ['-bV'], { allowFailure: true, timeoutMs: 30_000 }); info = parseEximVersion(v.stdout); }
     const has = (f) => (info.features ? info.features.includes(f) : null);
-    return { ...layout, ...info, support: { spf: has('SPF'), dkim: has('DKIM'), dmarc: has('DMARC') }, slots, unit: await unitState(await firstUnit(layout.units)), hints: hintsFor(layout, slots) };
+    return { ...layout, ...info, support: { spf: has('SPF'), dkim: has('DKIM'), dmarc: has('DMARC'), tls: eximTlsLibrary(info.features) }, slots, unit: await unitState(await firstUnit(layout.units)), hints: hintsFor(layout, slots) };
   },
 });
+
+// `exim -bV` names the TLS library among the compiled-in features ("GnuTLS" or
+// "TLS=GnuTLS" / "OpenSSL"); a GnuTLS build takes a priority string instead of
+// an OpenSSL cipher list for tls_require_ciphers.
+export function eximTlsLibrary(features) {
+  if (!Array.isArray(features)) return null;
+  if (features.some((f) => /\bGnuTLS\b/.test(f))) return 'gnutls';
+  if (features.some((f) => /\bOpenSSL\b/.test(f))) return 'openssl';
+  return null;
+}
 
 // Only the manual steps this host really needs: nothing for a slot that is
 // live, and nothing for a hookable slot the next save hooks by itself.
 export function hintsFor(layout, slots) {
   const h = [];
-  const aclFile = layout.splitConfig ? '/etc/exim4/conf.d/acl/30_exim4-config_check_rcpt' : layout.mainConf;
-  if (!slots.main.hooked) h.push(`Add ".include ${slots.main.path}" to the main section of ${layout.mainConf} so the global options take effect.`);
+  const aclFile = layout.rcptAclSource || (layout.splitConfig ? '/etc/exim4/conf.d/acl/30_exim4-config_check_rcpt' : layout.mainConf);
+  if (!slots.main.hooked) {
+    if (!slots.main.hookable) h.push(`Add ".include ${slots.main.path}" to the main section of ${layout.mainConf} so the global options take effect.`);
+    else if (slots.main.exists) h.push(`Exim's generated configuration does not contain the panel's main options from ${slots.main.path}: run update-exim4.conf and reload Exim, and check that dc_use_split_config in /etc/exim4/update-exim4.conf.conf matches the layout detected here (${layout.splitConfig ? 'split' : 'unsplit'}).`);
+  }
   if (!slots.acl_rcpt.hooked) {
-    if (slots.acl_rcpt.claimedBy) h.push(`CHECK_RCPT_LOCAL_ACL_FILE already points at ${slots.acl_rcpt.claimedBy} (the Email category's ACL), so the RCPT protections in ${slots.acl_rcpt.path} are not loaded: add ".include ${slots.acl_rcpt.path}" inside acl_check_rcpt (before the final accept) in ${aclFile}. Until then the RBL, reverse-DNS, HELO and dictionary-attack toggles only tag messages.`);
-    else if (!slots.acl_rcpt.hookable) h.push(`Add ".include ${slots.acl_rcpt.path}" inside acl_check_rcpt (after the authenticated/relay accepts, before the final accept) in ${aclFile} for the RCPT protections.`);
+    if (slots.acl_rcpt.claimedBy) h.push(`CHECK_RCPT_LOCAL_ACL_FILE already points at ${slots.acl_rcpt.claimedBy}, so the RCPT ACL chain in ${slots.acl_rcpt.path} (the panel's protections plus the Email filters) is not loaded. Save "Filter Incoming Emails by Country" (Email) once so it hands the hook over to this chain, or remove that definition from ${layout.macroFile || 'the Exim configuration'}; alternatively add ".include ${slots.acl_rcpt.path}" inside acl_check_rcpt (before the final accept) in ${aclFile}. Until then the RBL, reverse-DNS, HELO and dictionary-attack toggles only tag messages.`);
+    else if (!slots.acl_rcpt.hookable) h.push(`Add ".include ${slots.acl_rcpt.path}" inside acl_check_rcpt (after the authenticated/relay accepts, before the final accept) in ${aclFile} for the RCPT protections and the Email filters.`);
   }
   if (!slots.acl_data.hooked) {
-    if (slots.acl_data.claimedBy) h.push(`CHECK_DATA_LOCAL_ACL_FILE already points at ${slots.acl_data.claimedBy}; add ".include ${slots.acl_data.path}" inside acl_check_data for DKIM verification handling.`);
+    if (slots.acl_data.claimedBy) h.push(`CHECK_DATA_LOCAL_ACL_FILE already points at ${slots.acl_data.claimedBy}; remove that definition from ${layout.macroFile || 'the Exim configuration'} or add ".include ${slots.acl_data.path}" inside acl_check_data for DKIM verification handling.`);
     else if (!slots.acl_data.hookable) h.push(`Add ".include ${slots.acl_data.path}" inside acl_check_data in ${layout.mainConf} for DKIM verification handling.`);
   }
   return h;
 }
 
+// A whole-file slot is written as is; a block slot replaces its managed block
+// inside the shared file (unsplit Debian's localmacros) and restores the whole
+// previous file on rejection.
 defineOp('web.exim.include.write', {
-  description: 'Write a managed Exim fragment into a slot (main options, RCPT ACL, DATA ACL), regenerate (Debian), validate with exim -bV (rolled back on error) and reload',
+  description: 'Write a managed Exim fragment into a slot (main options, RCPT ACL chain, DATA ACL), regenerate (Debian), validate with exim -bV (rolled back on error), verify it is live and reload',
   schema: z.object({ slot: eximSlot, content: freeText, reload: z.boolean().default(true) }).strict(),
   run: async ({ slot, content, reload }, ctx) => {
     const layout = requireExim();
-    const file = ctx.assertAllowedPath(layout.slots[slot].path, 'write');
+    const s = layout.slots[slot];
+    const file = ctx.assertAllowedPath(s.path, 'write');
     const previous = readText(file);
-    writeAtomic(file, ensureNl(content));
+    writeAtomic(file, s.block ? mergeEximBlock(previous, content) : ensureNl(content));
     const test = await validateExim(layout);
     if (!test.ok) {
       restore(file, previous);
@@ -1252,21 +1363,24 @@ defineOp('web.exim.include.write', {
       throw new OpError('config_invalid', `Exim rejected the new configuration; the previous file was restored: ${lastLine(test.output)}`, { output: test.output, slot });
     }
     const result = reload ? await reloadUnit(layout.units) : { reloaded: false, unit: null };
-    return { slot, path: file, validated: true, ...(await eximHook(layout, slot)), bytes: Buffer.byteLength(content), version: test.version, ...result };
+    return { slot, path: file, block: s.block || null, splitConfig: layout.splitConfig, validated: true, ...(await eximHook(layout, slot)), bytes: Buffer.byteLength(content), version: test.version, features: test.features, ...result };
   },
 });
 
 defineOp('web.exim.include.remove', {
-  description: 'Remove a managed Exim slot file, regenerate/validate and reload',
+  description: 'Remove a managed Exim slot (file, or managed block in localmacros), regenerate/validate and reload',
   destructive: true,
   schema: z.object({ slot: eximSlot }).strict(),
   run: async ({ slot }, ctx) => {
     const layout = requireExim();
-    const file = ctx.assertAllowedPath(layout.slots[slot].path, 'write');
-    const existed = exists(file);
-    if (existed) fs.unlinkSync(file);
-    await validateExim(layout);
-    return { slot, path: file, removed: existed, ...(existed ? await reloadUnit(layout.units) : { reloaded: false, unit: null }) };
+    const s = layout.slots[slot];
+    const file = ctx.assertAllowedPath(s.path, 'write');
+    const previous = readText(file);
+    const existed = s.block ? readEximBlock(previous) != null : previous != null;
+    if (existed) { if (s.block) writeAtomic(file, stripEximBlock(previous)); else fs.unlinkSync(file); }
+    const test = await validateExim(layout);
+    if (!test.ok) { restore(file, previous); await validateExim(layout); throw new OpError('config_invalid', `Exim rejected the configuration without the panel's ${slot} fragment; it was restored: ${lastLine(test.output)}`, { output: test.output, slot }); }
+    return { slot, path: file, block: s.block || null, removed: existed, ...(existed ? await reloadUnit(layout.units) : { reloaded: false, unit: null }) };
   },
 });
 

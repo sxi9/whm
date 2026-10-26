@@ -18,7 +18,7 @@ export default function DeleteDnsZone({ fn }) {
   const remove = async (domains) => {
     const ok = await confirm({
       title: domains.length === 1 ? `Delete zone ${domains[0]}?` : `Delete ${domains.length} zones?`,
-      message: 'The zone file is removed from BIND and named is reloaded. The domain stops resolving from this server immediately. This cannot be undone.',
+      message: 'The zone file and its stanza are removed from the panel-managed BIND include and named is reloaded, so the domain stops resolving from this server. A zone declared by hand elsewhere in named.conf is refused until that stanza is removed. This cannot be undone.',
       confirmLabel: 'Delete', danger: true, typeToConfirm: domains.length === 1 ? domains[0] : 'DELETE',
     });
     if (!ok) return;

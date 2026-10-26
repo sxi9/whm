@@ -32,11 +32,13 @@ export default function ManageAutossl({ fn }) {
       refetch();
     } catch (err) { toast.error(isCapabilityError(err) ? `${err.message}` : err); } finally { setBusy(false); }
   };
-  const runNow = async (force = false) => {
-    if (force && !(await confirm({ title: 'Force renewal?', message: 'Every eligible certificate is re-issued even if it is far from expiry. Let\'s Encrypt rate-limits duplicate certificates (5 per week per name set).', confirmLabel: 'Force run', danger: true }))) return;
+  // `domain` is passed explicitly: a row action sets runFor for the log tab's
+  // select, but state updates are not visible to the same call.
+  const runNow = async (force = false, domain = runFor) => {
+    if (force && !(await confirm({ title: 'Force renewal?', message: `${domain ? `The certificate for ${domain} is` : 'Every eligible certificate is'} re-issued even if it is far from expiry. Let's Encrypt rate-limits duplicate certificates (5 per week per name set).`, confirmLabel: 'Force run', danger: true }))) return;
     setBusy(true);
     try {
-      const { data: d } = await api.post('/ssl/autossl/run', { ...(runFor ? { domain: runFor } : {}), force });
+      const { data: d } = await api.post('/ssl/autossl/run', { ...(domain ? { domain } : {}), force });
       setJobId(d.job.id);
       setTab('log');
     } catch (err) { toast.error(err); } finally { setBusy(false); }
@@ -54,7 +56,7 @@ export default function ManageAutossl({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} actions={data && <Button variant="primary" loading={busy} disabled={data.settings.provider === 'disabled'} onClick={() => runNow(false)}>Run AutoSSL now</Button>} />
+      <PageHeader fn={fn} actions={data && <Button variant="primary" loading={busy} disabled={data.settings.provider === 'disabled'} onClick={() => runNow(false, '')}>Run AutoSSL now</Button>} />
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
       {data && draft && (
@@ -106,7 +108,7 @@ export default function ManageAutossl({ fn }) {
                   return <StatusPill status="pending">{d.certificate ? 'renew' : 'issue'}</StatusPill>;
                 } },
               ]} rows={data.coverage} rowKey={(d) => d.domain} emptyText="No accounts yet." rowActions={(d) => [
-                { label: 'Run for this domain', primary: true, disabled: data.settings.provider === 'disabled', onClick: () => { setRunFor(d.domain); runNow(false); } },
+                { label: 'Run for this domain', primary: true, disabled: data.settings.provider === 'disabled', onClick: () => { setRunFor(d.domain); runNow(false, d.domain); } },
                 !d.excluded && { label: 'Exclude', onClick: () => api.post('/ssl/autossl/exclusions', { kind: 'domain', value: d.domain }).then(refetch).catch(toast.error) },
               ]} />
             </Card>
@@ -136,8 +138,8 @@ export default function ManageAutossl({ fn }) {
               <Card title="Run now" subtitle="Runs in the background; the log streams here. Scheduled passes run daily at the time shown under Providers.">
                 <Field label="Limit to one domain (optional)"><Select value={runFor} onChange={setRunFor} placeholder="All domains" options={data.coverage.map((d) => d.domain)} /></Field>
                 <FormActions>
-                  <Button variant="primary" loading={busy} disabled={data.settings.provider === 'disabled'} onClick={() => runNow(false)}>Run</Button>
-                  <Button variant="danger" loading={busy} disabled={data.settings.provider === 'disabled'} onClick={() => runNow(true)}>Force renewal</Button>
+                  <Button variant="primary" loading={busy} disabled={data.settings.provider === 'disabled'} onClick={() => runNow(false, runFor)}>Run</Button>
+                  <Button variant="danger" loading={busy} disabled={data.settings.provider === 'disabled'} onClick={() => runNow(true, runFor)}>Force renewal</Button>
                 </FormActions>
                 {jobId && <ProgressLog jobId={jobId} onFinished={() => { refetch(); runs.refetch(); }} />}
               </Card>

@@ -50,7 +50,12 @@ export default function FilterIncomingEmailsByCountry({ fn }) {
     setBusy(true);
     try { const { data: res } = await api.post(`/email/filters/country/${c.code}/fetch`); done(res, `${res.imported} network(s) downloaded for ${c.code.toUpperCase()}`); } catch (err) { toast.error(err); } finally { setBusy(false); }
   };
+  // Pasted/uploaded lists travel in the JSON body (2 MB app limit); bigger
+  // country lists go through "Download list" instead.
+  const MAX_UPLOAD_BYTES = 1_900_000;
+  const uploadBytes = new TextEncoder().encode(upload.text).length;
   const uploadList = async () => {
+    if (uploadBytes > MAX_UPLOAD_BYTES) { toast.error(new Error(`This list is ${Math.round(uploadBytes / 1024)} KB; the upload limit is ${Math.round(MAX_UPLOAD_BYTES / 1024)} KB. Use "Download list" for large country lists.`)); return; }
     setBusy(true);
     try { const { data: res } = await api.post(`/email/filters/country/${upload.code}/cidrs`, { text: upload.text, replace: upload.replace }); done(res, `${res.imported} network(s) imported${res.invalidCount ? `, ${res.invalidCount} invalid line(s) skipped` : ''}`); setUpload((u) => ({ ...u, text: '' })); } catch (err) { toast.error(err); } finally { setBusy(false); }
   };
@@ -95,9 +100,9 @@ export default function FilterIncomingEmailsByCountry({ fn }) {
               </div>
               <FormActions><Button variant="primary" loading={busy} disabled={!/^[a-zA-Z]{2}$/.test(form.code.trim())} onClick={add}>Add country</Button></FormActions>
             </Card>
-            <Card title="Upload a CIDR list" subtitle="One network per line (ipdeny .zone format); # and ; start comments">
+            <Card title="Upload a CIDR list" subtitle={`One network per line (ipdeny .zone format); # and ; start comments. Up to ${Math.round(MAX_UPLOAD_BYTES / 1024)} KB here; use "Download list" for larger lists.`}>
               <Field label="Country"><Select value={upload.code} onChange={(v) => setUpload((u) => ({ ...u, code: v }))} options={countries.map((c) => ({ value: c.code, label: c.code.toUpperCase() }))} placeholder="Select a country" /></Field>
-              <Field label="File"><input type="file" accept=".zone,.txt,.lst,.csv,text/plain" onChange={onFile} /></Field>
+              <Field label="File" help={upload.text ? `${Math.round(uploadBytes / 1024)} KB loaded${uploadBytes > MAX_UPLOAD_BYTES ? ' — too large to upload' : ''}` : undefined}><input type="file" accept=".zone,.txt,.lst,.csv,text/plain" onChange={onFile} /></Field>
               <Field label="Or paste networks"><Textarea value={upload.text} onChange={(v) => setUpload((u) => ({ ...u, text: v }))} rows={6} mono placeholder={'203.0.113.0/24\n2001:db8::/32'} /></Field>
               <Field label="Mode"><Select value={upload.replace ? 'replace' : 'append'} onChange={(v) => setUpload((u) => ({ ...u, replace: v === 'replace' }))} options={[{ value: 'replace', label: 'Replace the existing list' }, { value: 'append', label: 'Append to the existing list' }]} /></Field>
               <FormActions><Button variant="primary" loading={busy} disabled={!upload.code || !upload.text.trim()} onClick={uploadList}>Import</Button></FormActions>

@@ -1,7 +1,8 @@
+import net from 'node:net';
 import { Router } from 'express';
 import { validate, z, fields, pagination } from '../../lib/validate.js';
 import { requireRoot } from '../../middleware/rbac.js';
-import { createSecurityCenterService } from '../../services/security-center.js';
+import { createSecurityCenterService, normalizeIpOrCidr } from '../../services/security-center.js';
 
 const yesNo = z.enum(['yes', 'no']);
 const sshdSettings = z.object({
@@ -21,7 +22,20 @@ const sshdSettings = z.object({
   ClientAliveCountMax: z.number().int().min(0).max(1000).nullable().optional(),
 }).strict();
 
-const ipOrCidr = z.string().max(64).regex(/^[0-9a-fA-F.:]+(\/\d{1,3})?$/, 'IP address or CIDR network');
+// Strict (net.isIP + prefix bound) and canonicalising, so cPHulk rows never hold
+// non-addresses and firewall records match what iptables/nft print back.
+const ipOrCidr = z.string().max(64).transform((v, c) => {
+  const n = normalizeIpOrCidr(v);
+  if (n === null) { c.addIssue({ code: z.ZodIssueCode.custom, message: 'IP address or CIDR network' }); return z.NEVER; }
+  return n;
+});
+// libwrap separates fields with ":" and needs IPv6 in brackets; the agent renders
+// them, so an address containing ":" must parse as IPv6 (brackets optional).
+const hostSource = z.string().regex(/^(ALL|LOCAL|KNOWN|UNKNOWN|PARANOID|\[?[A-Za-z0-9.:/_-]{1,255}\]?(\/\d{1,3})?)$/, 'Host, IP, network/mask or wildcard').refine((v) => {
+  if (!v.includes(':')) return true;
+  const m = v.match(/^\[?([0-9a-fA-F:.]+)\]?(?:\/(\d{1,3}))?$/);
+  return Boolean(m) && net.isIP(m[1]) === 6 && (m[2] === undefined || Number(m[2]) <= 128);
+}, 'An address containing ":" must be an IPv6 address or network, e.g. [2001:db8::]/32');
 const keyName = z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/);
 const vendorName = z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/);
 const providerName = z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/, 'Lowercase letters, digits, "_" or "-"');
@@ -69,14 +83,14 @@ export async function register(ctx) {
   r.get('/host-access', wrap(async () => ({ rules: s.hostAccess.list(), services: s.hostAccess.services(), files: await s.hostAccess.files() })));
   r.put('/host-access', validate({ body: z.object({ rules: z.array(z.object({
     service: z.string().regex(/^(ALL|[A-Za-z0-9_.-]{1,32})$/, 'Daemon name such as sshd, vsftpd or ALL'),
-    source: z.string().regex(/^(ALL|LOCAL|KNOWN|UNKNOWN|PARANOID|[A-Za-z0-9.:/_-]{1,255})$/, 'Host, IP, network/mask or wildcard'),
+    source: hostSource,
     action: z.enum(['allow', 'deny']),
     comment: z.string().regex(/^[^\n\0]{0,120}$/).optional(),
   }).strict()).max(500) }).strict() }), wrap((req) => s.hostAccess.replace(req.body.rules, req)));
 
   // SSH daemon + root keys
   r.get('/ssh/config', wrap(() => s.ssh.config()));
-  r.put('/ssh/config', validate({ body: z.object({ settings: sshdSettings }).strict() }), wrap((req) => s.ssh.setConfig(req.body.settings, req)));
+  r.put('/ssh/config', validate({ body: z.object({ settings: sshdSettings, force: z.boolean().optional() }).strict() }), wrap((req) => s.ssh.setConfig(req.body.settings, req, { force: req.body.force === true })));
   r.get('/ssh/keys', wrap(() => s.ssh.keys()));
   r.post('/ssh/keys', validate({ body: z.object({ publicKey: z.string().min(20).max(16 * 1024).regex(/^[^\n\r\0]+$/, 'One line') }).strict() }), wrap((req) => s.ssh.importKey(req.body.publicKey.trim(), req)));
   r.post('/ssh/keys/generate', validate({ body: z.object({

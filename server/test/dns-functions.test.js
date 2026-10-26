@@ -24,6 +24,7 @@ function bindAgent() {
       ds: [`${domain}. IN DS 1 13 2 00`], signed: { exists: true, path: `/etc/bind/zones/${domain}.db.signed`, ageSeconds: 120, stale: false, serial: null },
     }),
     'dns.dnssec.remove': ({ domain }) => ({ domain, removed: true }),
+    'dns.options.write': ({ ipv4, ipv6 }) => ({ file: '/etc/bind/named.conf.options', changed: true, directives: [ipv4 ? `query-source address ${ipv4};` : null, ipv6 ? `query-source-v6 address ${ipv6};` : null].filter(Boolean), checkconf: { ok: true, output: '' } }),
   });
   return agent;
 }
@@ -628,6 +629,111 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
     expect(app.agent.callsTo('dns.zone.remove')[0].args).toEqual({ domain: 'tpl.example' });
     await get('/zones/tpl.example').expect(404);
     await del('/zones/tpl.example').expect(404);
+  });
+
+  it('refuses to delete a zone named serves from a hand-written stanza and keeps the row', async () => {
+    await post('/zones', { domain: 'handwritten.example' }).expect(201);
+    app.agent.calls.length = 0;
+    app.agent.set('dns.zone.remove', Object.assign(new Error('handwritten.example is declared in named.conf outside the panel include (file "/etc/bind/db.handwritten"); named would keep serving it.'), { agentError: true, code: 'zone_external', details: { file: '/etc/bind/db.handwritten', type: 'master' } }));
+    const res = await del('/zones/handwritten.example').expect(409);
+    expect(res.body.error.code).toBe('conflict');
+    expect(res.body.error.message).toMatch(/db\.handwritten/);
+    expect(app.ctx.db.prepare('SELECT 1 FROM dns_zones WHERE domain = ?').get('handwritten.example')).toBeTruthy();
+    expect(app.agent.callsTo('dns.reload')).toHaveLength(0);
+    expect(app.ctx.db.prepare("SELECT 1 FROM audit_log WHERE action = 'dns.zone.delete' AND target = 'handwritten.example'").get()).toBeUndefined();
+    // An op answering external:true (instead of throwing) is treated the same way.
+    app.agent.set('dns.zone.remove', ({ domain }) => ({ domain, removed: [], stanzaRemoved: false, external: true }));
+    await del('/zones/handwritten.example').expect(409);
+    expect(app.ctx.db.prepare('SELECT 1 FROM dns_zones WHERE domain = ?').get('handwritten.example')).toBeTruthy();
+    app.agent.reset('dns.zone.remove');
+    await del('/zones/handwritten.example').expect(200);
+    await get('/zones/handwritten.example').expect(404);
+  });
+
+  it('disabling DNSSEC publishes the unsigned zone before removing the keys, and keeps them when the publish fails', async () => {
+    await put('/zones/bob.com/dnssec', { enabled: true }).expect(200);
+    app.agent.calls.length = 0;
+    app.agent.set('dns.checkzone', () => ({ ok: false, output: 'zone bob.com/IN: broken' }));
+    await put('/zones/bob.com/dnssec', { enabled: false }).expect(422);
+    expect(app.ctx.db.prepare('SELECT dnssec_enabled FROM dns_zones WHERE domain = ?').get('bob.com').dnssec_enabled).toBe(1);
+    expect(app.agent.callsTo('dns.dnssec.remove')).toHaveLength(0);
+    app.agent.reset('dns.checkzone');
+    app.agent.set('dns.checkzone', ({ domain }) => ({ domain, ok: true, output: '' }));
+    app.agent.calls.length = 0;
+    const off = await put('/zones/bob.com/dnssec', { enabled: false }).expect(200);
+    expect(off.body.data.dnssec_enabled).toBe(false);
+    const order = app.agent.calls.map((c) => c.name);
+    expect(order.indexOf('dns.zone.write')).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf('dns.dnssec.remove')).toBeGreaterThan(order.indexOf('dns.zone.write'));
+    expect(order.indexOf('dns.dnssec.remove')).toBeGreaterThan(order.indexOf('dns.reload'));
+    expect(app.agent.callsTo('dns.zone.write').pop().args.signed).toBe(false);
+    expect(app.agent.callsTo('dns.dnssec.sign')).toHaveLength(0);
+  });
+
+  it('applies the outbound source address to named for Configure Remote Service IPs and exposes the layout', async () => {
+    const applied = await app.ctx.dns.setOutboundAddresses({ ipv4: '203.0.113.9', ipv6: null });
+    expect(applied).toMatchObject({ applied: true, changed: true, reloaded: true, file: '/etc/bind/named.conf.options' });
+    expect(app.agent.callsTo('dns.options.write')[0].args).toEqual({ ipv4: '203.0.113.9', ipv6: null });
+    expect(app.agent.callsTo('dns.reload').pop().args).toEqual({ reconfig: true });
+    expect(app.ctx.db.prepare("SELECT 1 FROM audit_log WHERE action = 'dns.outbound_addresses'").get()).toBeTruthy();
+    app.agent.set('dns.options.write', () => ({ file: '/etc/bind/named.conf.options', changed: false, directives: [], checkconf: null }));
+    app.agent.calls.length = 0;
+    expect(await app.ctx.dns.setOutboundAddresses({ ipv4: null, ipv6: null })).toMatchObject({ applied: true, changed: false, reloaded: false });
+    expect(app.agent.callsTo('dns.reload')).toHaveLength(0);
+    app.agent.set('dns.options.write', Object.assign(new Error('named-checkconf rejected the configuration'), { agentError: true, code: 'config_invalid', details: {} }));
+    await expect(app.ctx.dns.setOutboundAddresses({ ipv4: '203.0.113.9' })).rejects.toMatchObject({ code: 'config_invalid' });
+    app.agent.reset('dns.options.write');
+    expect(await app.ctx.dns.layout()).toMatchObject({ installed: true, flavor: 'debian' });
+  });
+
+  it('accepts provider-style SPF mechanisms and rejects control characters in TXT and DMARC values', async () => {
+    for (const value of ['v=spf1 a:mail.example.net include:_spf.google.com ~all', 'v=spf1 mx:%{d}.spf.example.net ptr:example.net exists:%{i}.spf.example.net -all', 'v=spf1 a/24 mx:mx.example.net/24//64 ip4:198.51.100.0/24 ip6:2001:db8::/32 redirect=_spf.example.net']) {
+      const res = await put('/zones/bob.com/email/spf', { value }).expect(200);
+      expect(res.body.data.spf.value).toBe(value);
+    }
+    for (const value of ['v=spf1 include:$(evil) -all', 'v=spf1 a:mail;rm -all', 'v=spf1 "quoted" -all', 'v=spf2 mx -all']) await put('/zones/bob.com/email/spf', { value }).expect(422);
+    expect((await post('/zones/bob.com/records', { name: 'ctl', type: 'TXT', value: 'line1\nline2' }).expect(422)).body.error.fields.value).toBeDefined();
+    expect((await post('/zones/bob.com/records', { name: 'ctl', type: 'TXT', value: 'tab\there' }).expect(422)).body.error.fields.value).toBeDefined();
+    expect((await put('/zones/bob.com/email/dmarc', { value: 'v=DMARC1; p=none; rua=mailto:a@b.c\n@ IN A 1.2.3.4' }).expect(422)).body.error.fields.value).toBeDefined();
+    expect(app.agent.callsTo('dns.checkzone').length).toBe(3);
+  });
+
+  it('reports the effective routing for "auto" and lets resellers validate only their own domains', async () => {
+    await put('/routing/bob.com', { routing: 'remote', exchanges: [{ priority: 10, exchange: 'aspmx.l.google.com' }] }).expect(200);
+    const auto = await put('/routing/bob.com', { routing: 'auto' }).expect(200);
+    expect(auto.body.data).toMatchObject({ routing: 'auto', effective: 'remote' });
+    expect((await get('/routing').expect(200)).body.data.find((r) => r.domain === 'bob.com')).toMatchObject({ routing: 'auto', effective: 'remote' });
+    await put('/routing/bob.com', { routing: 'backup', exchanges: [{ priority: 10, exchange: 'mx.partner.net' }] }).expect(200);
+    expect((await put('/routing/bob.com', { routing: 'auto' }).expect(200)).body.data.effective).toBe('backup');
+    await put('/routing/bob.com', { routing: 'local' }).expect(200);
+    expect((await put('/routing/bob.com', { routing: 'auto' }).expect(200)).body.data.effective).toBe('local');
+    const body = '$TTL 60\n@ IN SOA a. b. 1 1 1 1 1\n@ IN A 10.0.0.1\n';
+    await resellerHttp.post('/api/dns/zones/unowned-validate.org/validate').set('X-CSRF-Token', resellerCsrf).send({ body }).expect(403);
+    await resellerHttp.post('/api/dns/zones/bob.com/validate').set('X-CSRF-Token', resellerCsrf).send({ body }).expect(403);
+    await resellerHttp.post('/api/dns/zones/alice.com/validate').set('X-CSRF-Token', resellerCsrf).send({ body }).expect(200);
+    await resellerHttp.post('/api/dns/zones/sub.alice.com/validate').set('X-CSRF-Token', resellerCsrf).send({ body }).expect(200);
+    await post('/zones/unowned-validate.org/validate', { body }).expect(200);
+  });
+
+  it('the scheduled sync skips zones a peer already acknowledged at the current serial; a manual push resends them', async () => {
+    const zone = app.ctx.db.prepare('SELECT * FROM dns_zones WHERE domain = ?').get('bob.com');
+    const peer = app.ctx.db.prepare("INSERT INTO dns_clusters (name, remote_host, api_token_enc, role) VALUES ('peer-skip', '127.0.0.1:1', ?, 'write-only')").run(app.ctx.crypto.encrypt('tok'));
+    app.ctx.db.prepare("INSERT INTO dns_zone_sync (zone_id, cluster_id, serial, status, message) VALUES (?, ?, ?, 'ok', NULL)").run(zone.id, peer.lastInsertRowid, zone.serial);
+    app.ctx.jobs.start();
+    const scheduled = await waitForJob(app.ctx, app.ctx.jobs.enqueue('dns.sync', { domains: null, clusterId: Number(peer.lastInsertRowid) }, {}).id, 20000);
+    expect(scheduled.result).toMatchObject({ peers: 1, skipped: 1, ok: 0, failed: scheduled.result.zones - 1 });
+    const manual = await post('/sync', { clusterId: Number(peer.lastInsertRowid), domains: ['bob.com'] }).expect(202);
+    const pushed = await waitForJob(app.ctx, manual.body.data.job.id, 20000);
+    expect(pushed.result).toMatchObject({ peers: 1, zones: 1, skipped: 0, failed: 1 });
+    app.ctx.jobs.stop();
+    app.ctx.db.prepare('DELETE FROM dns_clusters WHERE id = ?').run(peer.lastInsertRowid);
+  });
+
+  it('uses the serial a peer pushed as the floor when importing', async () => {
+    const text = app.ctx.dns.renderZoneText('bob.com').replace(/bob\.com/g, 'floor.example');
+    const imported = await post('/zones/import', { domain: 'floor.example', body: text, serial: 2099123199 }).expect(200);
+    expect(imported.body.data.serial).toBe(2099123199);
+    await del('/zones/floor.example').expect(200);
   });
 });
 

@@ -10,12 +10,22 @@ import { isRoot } from '../middleware/rbac.js';
 //   mail.setRouting(domain, 'local'|'remote'|'backup'|'auto', req) -> mail_domains + Exim domain lists. Resolves { applied: true } only
 //       when exim -bP confirms its local_domains/relay_to_domains read the lists; without Exim it resolves { applied: false, reason };
 //       with Exim present but not reading them it saves the routing and throws routing_not_applied (409) carrying { hint }.
+//   mail.setOutboundAddresses({ ipv4, ipv6 }, req)             -> Exim remote_smtp source interface (ip-functions "Configure Remote
+//       Service IPs" hook). Resolves { applied: true } once exim -bP shows the addresses, throws CapabilityError without Exim and
+//       outbound_not_applied (409, with { hint }) when the file is written but the running configuration does not use it.
 //   mail.detect() / mail.status()                               -> Exim/Dovecot/spamd layout on this host
 //   mail.deliverability.check(domain, user)                     -> SPF/DKIM/DMARC/MX/PTR status
 //   mail.filters.apply(req)                                     -> re-render every filter into Exim
 //   mail.queue.list(query) / mail.stats.summary({ hours })
 
-const ACL_FILE = 'acl_rcpt.conf';
+// Email writes only this ACL file. On hosts with Service Configuration loaded,
+// its RCPT ACL chain (acl-rcpt-local.conf) ends with an include of it and owns
+// Exim's CHECK_RCPT_LOCAL_ACL_FILE macro; without it the agent sets the macro.
+const ACL_FILE = 'acl-email-filters.conf';
+// A pasted/uploaded list travels in the JSON body (app-wide limit 2 MB).
+export const MAX_LIST_BYTES = 1_900_000;
+// Same shape the agent's sendmail op enforces for argv-bound addresses.
+const SENDER_SHAPE = /^[A-Za-z0-9_][A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$/;
 const LISTS = {
   countryBlock: 'country_blocklist.lst', countryAllow: 'country_allowlist.lst',
   domainBlock: 'domain_blocklist.lst', domainAllow: 'domain_allowlist.lst',
@@ -69,7 +79,7 @@ const windowHours = (q, fallback) => (q?.hours != null ? Number(q.hours) : fallb
 // Renders the panel's acl_check_rcpt include from the enabled filters. Pure so
 // tests can pin the Exim syntax.
 export function renderAcl({ dir, country, domain, greylist }) {
-  const lines = [`${MANAGED} (Email filters). Generated ${new Date().toISOString()}.`, '# Included in acl_check_rcpt before the final accept. Edit through the panel; manual changes are overwritten.', ''];
+  const lines = [`${MANAGED} (Email filters). Generated ${new Date().toISOString()}.`, '# Reached from acl_check_rcpt (before the final accept) through the Exim Configuration Manager ACL chain or CHECK_RCPT_LOCAL_ACL_FILE. Edit through the panel; manual changes are overwritten.', ''];
   // Host lists carry ::1, so the separator is switched to ";" (a colon-separated
   // list would split the IPv6 address). The leading empty item matches local
   // (non-TCP) submissions.
@@ -159,7 +169,7 @@ export function createEmailService(ctx) {
     dkimKey: db.prepare('SELECT domain, selector, public_key, created_at FROM dkim_keys WHERE domain = ?'),
     mailDomain: db.prepare('SELECT * FROM mail_domains WHERE domain = ?'),
     upsertMailDomain: db.prepare(`INSERT INTO mail_domains (domain, account_id, routing) VALUES (@domain, @account_id, @routing) ON CONFLICT (domain) DO UPDATE SET routing = excluded.routing, account_id = COALESCE(excluded.account_id, account_id)`),
-    mailDomainsByRouting: db.prepare('SELECT domain FROM mail_domains WHERE routing = ? ORDER BY domain'),
+    mailDomainsAll: db.prepare('SELECT domain, routing FROM mail_domains ORDER BY domain'),
   };
 
   const eximMissing = 'Exim is not installed on this server. Install exim4 (Debian/Ubuntu) or exim (RHEL) and refresh.';
@@ -173,9 +183,11 @@ export function createEmailService(ctx) {
     return value;
   }
 
-  async function status() {
+  // Pages poll this on every load, so the layout comes from the 60 s cache
+  // unless the caller asks for a refresh (the install-prompt retry button).
+  async function status({ refresh = false } = {}) {
     await capabilities.ensureFresh();
-    const layout = await detect(true).catch((err) => ({ installed: false, error: err.message }));
+    const layout = await detect(refresh).catch((err) => ({ installed: false, error: err.message }));
     const installed = capabilities.has('exim') && layout.installed !== false;
     let queue = null;
     if (installed) { try { const q = await op('mail.queue.list', { limit: 1 }); queue = { total: q.total, frozen: q.frozen }; } catch (err) { queue = { error: err.message }; } }
@@ -255,7 +267,7 @@ export function createEmailService(ctx) {
       if (query.status) rows = rows.filter((x) => x.status === query.status);
       if (query.q) { const q = query.q.toLowerCase(); rows = rows.filter((x) => JSON.stringify(x).toLowerCase().includes(q)); }
       const result = pageOf(rows, query, { arrived_at: 'arrivedAt', sender: 'sender', recipient: 'recipient', status: 'status', size: 'size' }, 'arrived_at');
-      return { ...result, meta: { ...result.meta, hours, file: r.file, logExists: r.logExists, logTruncated: r.logTruncated, rejects: r.rejects.length, messages: r.total } };
+      return { ...result, meta: { ...result.meta, hours, file: r.file, logExists: r.logExists, logTruncated: r.logTruncated, logFrom: r.logFrom ?? null, rejects: r.rejects.length, messages: r.total } };
     },
   };
 
@@ -264,7 +276,7 @@ export function createEmailService(ctx) {
       requireExim();
       const hours = windowHours(query, Number(setting('mail.log.default_window_hours', 24)));
       const s = await op('mail.log.stats', { sinceHours: hours });
-      return { hours, file: s.file, logExists: s.logExists, logTruncated: s.logTruncated, logBytes: s.logBytes, totals: s.totals, byHour: s.byHour, topDomains: s.topDomains, topHosts: s.topHosts, topSenders: s.senders.slice(0, 10), relayers: s.relayers.length };
+      return { hours, file: s.file, logExists: s.logExists, logTruncated: s.logTruncated, logFrom: s.logFrom ?? null, logBytes: s.logBytes, totals: s.totals, byHour: s.byHour, topDomains: s.topDomains, topHosts: s.topHosts, topSenders: s.senders.slice(0, 10), relayers: s.relayers.length };
     },
     async sent(query = {}) {
       requireExim();
@@ -274,7 +286,7 @@ export function createEmailService(ctx) {
       if (query.q) { const q = query.q.toLowerCase(); rows = rows.filter((x) => x.sender.toLowerCase().includes(q)); }
       if (query.authenticated != null) rows = rows.filter((x) => x.authenticated === query.authenticated);
       const result = pageOf(rows, query, { messages: 'messages', sender: 'sender', delivered: 'delivered', failed: 'failed', bytes: 'bytes', recipients: 'recipients', last_seen: 'lastSeen' }, 'messages');
-      return { ...result, meta: { ...result.meta, hours, totals: s.totals, logExists: s.logExists, logTruncated: s.logTruncated } };
+      return { ...result, meta: { ...result.meta, hours, totals: s.totals, logExists: s.logExists, logTruncated: s.logTruncated, logFrom: s.logFrom ?? null } };
     },
     async relayers(query = {}) {
       requireExim();
@@ -283,7 +295,7 @@ export function createEmailService(ctx) {
       let rows = s.relayers;
       if (query.q) { const q = query.q.toLowerCase(); rows = rows.filter((x) => x.user.toLowerCase().includes(q) || x.senders.some((y) => y.toLowerCase().includes(q))); }
       const result = pageOf(rows, query, { messages: 'messages', user: 'user', recipients: 'recipients', bytes: 'bytes', failed: 'failed', last_seen: 'lastSeen' }, 'messages');
-      return { ...result, meta: { ...result.meta, hours, totals: s.totals, logExists: s.logExists, logTruncated: s.logTruncated } };
+      return { ...result, meta: { ...result.meta, hours, totals: s.totals, logExists: s.logExists, logTruncated: s.logTruncated, logFrom: s.logFrom ?? null } };
     },
   };
 
@@ -297,7 +309,10 @@ export function createEmailService(ctx) {
   const lookupSafe = async (fn) => { try { return { ok: true, value: await fn() }; } catch (err) { return { ok: false, error: err.code || err.message, value: null }; } };
   const txtAt = async (name) => { const r = await lookupSafe(() => getResolver().resolveTxt(name)); return { ...r, value: r.ok ? r.value.map((chunks) => chunks.join('')) : [] }; };
 
-  // Probes an MX on port 25 and reads the banner; proves the path from this host.
+  // Probes an MX on port 25 and reads the banner; proves the path from this
+  // host. Replaceable (useBannerProber) so tests never open a socket.
+  let bannerProber = smtpBanner;
+  function useBannerProber(fn) { bannerProber = fn || smtpBanner; }
   function smtpBanner(host, port = 25, timeoutMs = 5000) {
     return new Promise((resolve) => {
       const socket = net.connect({ host, port });
@@ -338,7 +353,7 @@ export function createEmailService(ctx) {
     }
     const first = result.mx.records[0]?.exchange || result.mx.fallbackA?.[0];
     if (first) {
-      result.smtp = { host: first, ...(await smtpBanner(first)) };
+      result.smtp = { host: first, ...(await bannerProber(first)) };
       if (!result.smtp.ok) result.hints.push(`Could not reach ${first} on port 25 (${result.smtp.error}). Outbound SMTP may be firewalled (see Security Center → SMTP Restrictions) or the remote server is down.`);
     }
     if (capabilities.has('exim')) {
@@ -481,6 +496,12 @@ export function createEmailService(ctx) {
       summary.greylist.backend = backend;
       summary.greylist.dbfileOption = dbfileOption;
       const sqliteDbfile = backend === 'sqlite' && dbfileOption ? GREYLIST_DB : null;
+      // Who hooks the ACL into acl_check_rcpt: Service Configuration's chain
+      // when it is loaded (its chain file includes ours), else the agent's macro.
+      let aclMacro = true;
+      if (typeof ctx.web?.ensureEximAclChain === 'function') {
+        try { await ctx.web.ensureEximAclChain(); aclMacro = false; } catch (err) { logger.warn({ err }, 'mail filters: ACL chain unavailable, falling back to the CHECK_RCPT_LOCAL_ACL_FILE macro'); }
+      }
       const dir = layout.whmDir.replace(/^\//, '');
       const domainsOf = (kind) => stmts.domainFilters.all().filter((d) => d.enabled && d.kind === kind).flatMap((d) => [`*@${d.domain}`, `*@*.${d.domain}`]);
       const trustedOf = (kind) => stmts.trusted.all().filter((t) => t.kind === kind).map((t) => t.value);
@@ -499,22 +520,22 @@ export function createEmailService(ctx) {
           await op('mail.config.include.write', { name, content: `${MANAGED} (${name})\n${entries.join('\n')}\n`, reload: false, hook: false }, req);
           written.push({ name, entries: entries.length });
         }
-        const acl = await op('mail.config.include.write', { name: ACL_FILE, content: renderAcl({ dir, ...summary }), reload: true, hook: true, sqliteDbfile }, req);
+        const acl = await op('mail.config.include.write', { name: ACL_FILE, content: renderAcl({ dir, ...summary }), reload: true, hook: true, sqliteDbfile, aclMacro }, req);
         // The agent verifies the hook against the generated config; `hooked`
         // false means the files are written but Exim is not reading them yet.
         const hooked = acl.hooked ?? null;
         const includeMode = hooked === false ? 'manual' : (acl.includeMode || layout.includeMode);
         const warnings = [];
         let hint = acl.hint || null;
-        if (includeMode === 'manual' && !hint) hint = `Add ".include ${layout.aclFile}" inside acl_check_rcpt (before the final accept) in ${layout.configFile || '/etc/exim.conf'} once; the panel keeps that file current.`;
+        if (includeMode === 'manual' && !hint) hint = `Add ".include ${layout.aclChainFile || layout.aclFile}" inside acl_check_rcpt (before the final accept) in ${layout.configFile || '/etc/exim.conf'} once; the panel keeps that file current.`;
         if (hooked === false) warnings.push(`Filters were written to ${acl.path} but the running Exim configuration does not include them${acl.hookDetail ? ` (${acl.hookDetail})` : ''}.`);
         let selfTest = null;
         if (backend === 'sqlite') {
           selfTest = await op('mail.greylist.selftest').catch((err) => ({ backend: 'sqlite', ok: false, output: err.message }));
           if (selfTest.ok === false) warnings.push(`The greylist SQLite lookup failed its self-test (${(selfTest.output || '').split('\n').pop() || 'no output'}); until it works, greylisted mail is deferred for everyone who is not exempt.`);
         }
-        const result = { applied: true, enforced: hooked !== false && selfTest?.ok !== false, aclPath: acl.path, reloaded: acl.reloaded, unit: acl.unit, includeMode, hooked, hint, warnings, selfTest, files: written, summary };
-        stmts.insertApply.run(1, JSON.stringify({ countries: summary.country, domains: summary.domain, greylist: { enabled: summary.greylist.enabled, backend, dbfileOption }, hooked, includeMode, selfTest: selfTest ? { ok: selfTest.ok, form: selfTest.form || null } : null, warnings }), null); stmts.pruneApplies.run();
+        const result = { applied: true, enforced: hooked !== false && selfTest?.ok !== false, aclPath: acl.path, reloaded: acl.reloaded, unit: acl.unit, includeMode, aclMacro, hookVia: acl.hookVia ?? null, hooked, hint, warnings, selfTest, files: written, summary };
+        stmts.insertApply.run(1, JSON.stringify({ countries: summary.country, domains: summary.domain, greylist: { enabled: summary.greylist.enabled, backend, dbfileOption }, hooked, includeMode, aclMacro, selfTest: selfTest ? { ok: selfTest.ok, form: selfTest.form || null } : null, warnings }), null); stmts.pruneApplies.run();
         audit(req, { action: 'mail.filters.apply', args: { countries: summary.country, domains: summary.domain, greylist: summary.greylist.enabled, hooked, selfTest: selfTest?.ok ?? null } });
         return result;
       } catch (err) {
@@ -536,6 +557,7 @@ export function createEmailService(ctx) {
       },
       async setCidrs(code, text, { source = 'upload', replace = true } = {}, req) {
         if (!stmts.countryByCode.get(code)) throw notFound(`Country filter ${code}`);
+        if (source === 'upload' && Buffer.byteLength(text) > MAX_LIST_BYTES) throw unprocessable(`The list is larger than ${Math.round(MAX_LIST_BYTES / 1024)} KB; use "Download" to fetch large country lists from the configured source URL`, { text: ['Too large to paste or upload'] });
         const parsed = parseCidrList(text);
         if (!parsed.cidrs.length) throw unprocessable('No valid CIDR networks found in the list', { text: ['Provide one IPv4/IPv6 network per line, e.g. 203.0.113.0/24'] });
         db.transaction(() => {
@@ -755,7 +777,8 @@ export function createEmailService(ctx) {
 
   async function sendNotification({ to, subject, text, from, headers }, req) {
     requireExim('Exim is not installed, so the panel cannot send email notifications');
-    const sender = from || setting('mail.notification_from', '') || `whm@${setting('basic.hostname', 'localhost')}`;
+    const sender = from || setting('mail.notification_from', '') || `whm@${setting('basic.hostname', '') || 'localhost'}`;
+    if (!SENDER_SHAPE.test(sender)) throw unprocessable(`"${sender}" is not a usable sender address: set mail.notification_from or a fully-qualified basic.hostname before sending notifications`, { from: ['Must be a full email address with a dotted domain'] });
     const recipients = Array.isArray(to) ? to : [to];
     const result = await op('mail.sendmail', { from: sender, to: recipients, subject, text, ...(headers ? { headers } : {}) }, req);
     audit(req, { action: 'mail.send', target: recipients.join(','), args: { subject } });
@@ -778,6 +801,28 @@ export function createEmailService(ctx) {
     return result;
   }
 
+  // Every hosted domain is local unless it was explicitly routed elsewhere:
+  // mail_domains rows only exist for domains someone routed, so the rest
+  // (implicitly "auto") are added from the account/domain tables.
+  function routingLists() {
+    const explicit = new Map(stmts.mailDomainsAll.all().map((r) => [r.domain, r.routing]));
+    const local = new Set();
+    for (const d of stmts.visibleDomains.all()) if (['local', 'auto'].includes(explicit.get(d.domain) ?? 'auto')) local.add(d.domain);
+    for (const [d, r] of explicit) if (r === 'local' || r === 'auto') local.add(d);
+    const relay = [...explicit].filter(([, r]) => r === 'backup').map(([d]) => d);
+    return { local: [...local].sort(), relay: relay.sort() };
+  }
+
+  async function setOutboundAddresses({ ipv4 = null, ipv6 = null } = {}, req) {
+    await capabilities.ensureFresh();
+    requireExim('Exim is not installed, so no outbound source address can be applied; it is saved and used once Exim is installed');
+    const result = await op('mail.outbound.set', { ipv4: ipv4 || null, ipv6: ipv6 || null }, req);
+    settings.setMany({ 'mail.outbound.ipv4': ipv4 || '', 'mail.outbound.ipv6': ipv6 || '' });
+    audit(req, { action: 'mail.outbound.set', target: [ipv4, ipv6].filter(Boolean).join(',') || 'none', args: { ipv4, ipv6, applied: result.applied, hooked: result.hooked } });
+    if (result.hooked === false) throw Object.assign(new HttpError(409, 'outbound_not_applied', `Exim does not send from ${[ipv4, ipv6].filter(Boolean).join(' / ')} yet${result.detail ? ` (${result.detail})` : ''}${result.hint ? `. ${result.hint}` : ''}`), { ipv4, ipv6, applied: false, hooked: false, hint: result.hint });
+    return { applied: true, ipv4, ipv6, hooked: result.hooked, file: result.file, reloaded: result.reloaded };
+  }
+
   async function setRouting(domain, routing, req) {
     const account = stmts.visibleDomains.all().find((d) => d.domain === domain);
     stmts.upsertMailDomain.run({ domain, account_id: account ? stmts.accountByUsername.get(account.account)?.id ?? null : null, routing });
@@ -788,8 +833,7 @@ export function createEmailService(ctx) {
     let hint = null;
     let reason = null;
     if (capabilities.has('exim')) {
-      const local = [...stmts.mailDomainsByRouting.all('local'), ...stmts.mailDomainsByRouting.all('auto')].map((r) => r.domain);
-      const relay = stmts.mailDomainsByRouting.all('backup').map((r) => r.domain);
+      const { local, relay } = routingLists();
       try {
         await op('mail.config.include.write', { name: LISTS.localDomains, content: `${MANAGED} (local mail domains)\n${local.join('\n')}\n`, reload: false, hook: false }, req);
         const write = await op('mail.config.include.write', { name: LISTS.relayDomains, content: `${MANAGED} (backup MX relay domains)\n${relay.join('\n')}\n`, reload: true, hook: true }, req);
@@ -807,8 +851,8 @@ export function createEmailService(ctx) {
   }
 
   return {
-    detect, status, queue, reports, stats, troubleshoot, deliverability, filters, greylist, mailbox, spamd,
-    sendNotification, installDkimKey, removeDkimKey, setRouting,
+    detect, status, queue, reports, stats, troubleshoot, useBannerProber, deliverability, filters, greylist, mailbox, spamd,
+    sendNotification, installDkimKey, removeDkimKey, setRouting, setOutboundAddresses, routingLists,
     renderAcl: () => renderAcl({ dir: 'etc/exim4/whm', ...filterSummary() }),
   };
 }

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { stanza, stripStanza, currentStanza, declaredElsewhere, detectLayout, parseNamedConf, resolveZonePath, signzoneArgv } from '../src/ops/dns.js';
+import { stanza, stripStanza, currentStanza, declaredElsewhere, detectLayout, parseNamedConf, resolveZonePath, signzoneArgv, removeZone, spliceOptionsBlock, optionsDirectives, chooseResolvers } from '../src/ops/dns.js';
 
 // exec is spied with the real implementation behind it so tests can prove an op
 // refused before any program ran. Nothing here writes to a BIND directory: the
@@ -27,7 +27,7 @@ async function opError(promise) {
 
 describe('dns op catalog', () => {
   it('registers the whole family with destructive flags on removals', () => {
-    for (const name of ['dns.layout', 'dns.zone.list', 'dns.zone.read', 'dns.zone.write', 'dns.zone.remove', 'dns.checkzone', 'dns.checkconf', 'dns.reload', 'dns.dnssec.keygen', 'dns.dnssec.sign', 'dns.dnssec.status', 'dns.dnssec.remove', 'dns.resolve']) {
+    for (const name of ['dns.layout', 'dns.zone.list', 'dns.zone.read', 'dns.zone.write', 'dns.zone.remove', 'dns.checkzone', 'dns.checkconf', 'dns.reload', 'dns.dnssec.keygen', 'dns.dnssec.sign', 'dns.dnssec.status', 'dns.dnssec.remove', 'dns.resolve', 'dns.options.write']) {
       expect(catalog.has(name), name).toBe(true);
     }
     expect(catalog.get('dns.zone.remove').destructive).toBe(true);
@@ -105,6 +105,15 @@ describe('dns schemas reject injection and traversal', () => {
     expect((await opError(runOp('dns.dnssec.keygen', { domain: 'example.com', algorithm: 'RSASHA256 -f' }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('dns.dnssec.keygen', { domain: 'example.com', bits: 128 }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('dns.dnssec.keygen', { domain: 'example.com', bits: '2048' }, ctx))).code).toBe('invalid_args');
+  });
+
+  it('dns.options.write takes only well-formed IPv4/IPv6 source addresses', async () => {
+    exec.mockClear();
+    for (const args of [{ ipv4: '1.2.3.4; rm -rf /' }, { ipv4: '2001:db8::1' }, { ipv6: '10.0.0.1' }, { ipv6: '2001:db8::1 }' }, { ipv4: '10.0.0.1', extra: true }, { address: '10.0.0.1' }]) {
+      expect((await opError(runOp('dns.options.write', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
+    }
+    expect(exec).not.toHaveBeenCalled();
+    if (!detectLayout().flavor) expect((await opError(runOp('dns.options.write', { ipv4: '10.0.0.1' }, ctx))).code).toBe('capability_missing');
   });
 
   it('dns.resolve constrains name, type and servers', async () => {
@@ -217,6 +226,67 @@ describe('named include stanza helpers', () => {
     expect(resolveZonePath('x.db', null, { flavor: 'rhel', zoneDir: '/var/named' })).toBe('/var/named/x.db');
     expect(resolveZonePath('/var/named//a/../x.db', null, { flavor: 'rhel', zoneDir: '/var/named' })).toBe('/var/named/x.db');
     expect(resolveZonePath(null, '/var/named', { flavor: 'rhel', zoneDir: '/var/named' })).toBeNull();
+  });
+
+  it('removeZone refuses a zone declared outside the panel include and only deletes panel-managed zones', async () => {
+    if (detectLayout().binaries['named-checkconf']) return;
+    fs.mkdirSync('/tmp/whm', { recursive: true });
+    const dir = fs.mkdtempSync('/tmp/whm/dns-remove-');
+    const layout = { flavor: 'rhel', confDir: dir, mainConf: path.join(dir, 'named.conf'), optionsConf: path.join(dir, 'named.conf'), includeFile: path.join(dir, 'named.whm.conf'), zoneDir: path.join(dir, 'zones') };
+    try {
+      fs.mkdirSync(layout.zoneDir, { recursive: true });
+      fs.writeFileSync(layout.mainConf, `options { directory "${layout.zoneDir}"; };\nzone "hand.example" IN {\n  type master;\n  file "hand.db";\n};\ninclude "${layout.includeFile}";\n`);
+      fs.writeFileSync(path.join(layout.zoneDir, 'hand.db'), '$TTL 1\n');
+      fs.writeFileSync(path.join(layout.zoneDir, 'managed.example.db'), '$TTL 1\n');
+      fs.writeFileSync(path.join(layout.zoneDir, 'managed.example.db.signed'), '$TTL 1\n');
+      fs.writeFileSync(layout.includeFile, `${stanza('managed.example', path.join(layout.zoneDir, 'managed.example.db'))}${stanza('other.example', '/x')}`);
+      const err = await opError(removeZone(layout, 'hand.example', ctx));
+      expect(err.code).toBe('zone_external');
+      expect(err.details).toMatchObject({ file: path.join(layout.zoneDir, 'hand.db'), type: 'master' });
+      expect(fs.existsSync(path.join(layout.zoneDir, 'hand.db'))).toBe(true);
+      expect(fs.readFileSync(layout.mainConf, 'utf8')).toContain('zone "hand.example"');
+      const result = await removeZone(layout, 'managed.example', ctx);
+      expect(result).toMatchObject({ domain: 'managed.example', stanzaRemoved: true, external: false });
+      expect(result.removed).toEqual(expect.arrayContaining([path.join(layout.zoneDir, 'managed.example.db'), path.join(layout.zoneDir, 'managed.example.db.signed')]));
+      expect(fs.existsSync(path.join(layout.zoneDir, 'managed.example.db'))).toBe(false);
+      const include = fs.readFileSync(layout.includeFile, 'utf8');
+      expect(include).not.toContain('zone "managed.example"');
+      expect(include).toContain('zone "other.example"');
+      // A zone with neither a file nor a stanza is a no-op, not an error.
+      expect(await removeZone(layout, 'absent.example', ctx)).toMatchObject({ removed: [], stanzaRemoved: false });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('splices the source-address directives into the one options block and removes them again', () => {
+    const conf = 'options {\n\tdirectory "/var/cache/bind";\n\tallow-transfer { none; }; // comment with }\n\tlisten-on { any; };\n};\n\nzone "x.example" { type master; file "x"; };\n';
+    const directives = optionsDirectives({ ipv4: '203.0.113.9', ipv6: '2001:db8::9' });
+    expect(directives).toEqual(['query-source address 203.0.113.9;', 'notify-source 203.0.113.9;', 'transfer-source 203.0.113.9;', 'query-source-v6 address 2001:db8::9;', 'notify-source-v6 2001:db8::9;', 'transfer-source-v6 2001:db8::9;']);
+    const once = spliceOptionsBlock(conf, directives);
+    expect(once).toContain('    // BEGIN whm options\n    query-source address 203.0.113.9;');
+    expect(once).toMatch(/listen-on \{ any; \};\n    \/\/ BEGIN whm options\n[\s\S]*?    \/\/ END whm options\n\};\n\nzone "x\.example"/);
+    expect(once).toContain('zone "x.example"');
+    const again = spliceOptionsBlock(once, optionsDirectives({ ipv4: '198.51.100.1' }));
+    expect(again).not.toContain('203.0.113.9');
+    expect(again).toContain('query-source address 198.51.100.1;');
+    expect(again.match(/BEGIN whm options/g)).toHaveLength(1);
+    expect(spliceOptionsBlock(again, [])).toBe(conf);
+    expect(spliceOptionsBlock(conf, [])).toBe(conf);
+    expect(spliceOptionsBlock(once, directives)).toBe(once);
+    // Comments mentioning options do not count, and a missing block is an error.
+    expect(() => spliceOptionsBlock('// options { }\nzone "a.example" { type master; file "a"; };\n', directives)).toThrow(OpError);
+    expect(() => spliceOptionsBlock('options {\n directory "x";\n', directives)).toThrow(/not closed/);
+    const nested = spliceOptionsBlock('options { directory "/var/named"; rate-limit { responses-per-second 5; }; };\n', optionsDirectives({ ipv4: '10.0.0.1' }));
+    expect(nested).toMatch(/responses-per-second 5; };\n    \/\/ BEGIN whm options\n[\s\S]*\/\/ END whm options\n};/);
+  });
+
+  it('prefers the host resolvers, then systemd-resolved upstreams, then the stub, and only then public resolvers', () => {
+    expect(chooseResolvers('nameserver 10.0.0.2\nnameserver 127.0.0.53\n', 'nameserver 10.1.1.1\n')).toEqual(['10.0.0.2']);
+    expect(chooseResolvers('nameserver 127.0.0.53\noptions edns0\n', 'nameserver 10.1.1.1\nnameserver 10.1.1.2\n')).toEqual(['10.1.1.1', '10.1.1.2']);
+    expect(chooseResolvers('nameserver 127.0.0.53\n', '')).toEqual(['127.0.0.53']);
+    expect(chooseResolvers('nameserver ::1\n', 'nameserver 127.0.0.1\n')).toEqual(['::1']);
+    expect(chooseResolvers('# empty\n', '')).toEqual(['1.1.1.1', '8.8.8.8']);
   });
 
   it('detects a zone the operator declared outside the panel include and reports which file named loads', async () => {

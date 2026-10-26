@@ -58,7 +58,7 @@ export default function UpgradeDatabaseVersion({ fn }) {
             </div>
             <Field inline><Toggle checked={backup} onChange={setBackup} label="Dump all databases before upgrading" description="mysqldump --all-databases into the backup directory (recommended)" /></Field>
             <FormActions><Button variant="danger" loading={busy} onClick={run} disabled={!chosen || !data.local || !data.installerAvailable}>Upgrade database server</Button></FormActions>
-            {jobId && <ProgressLog jobId={jobId} onFinished={(e) => { if (e.type === 'done') toast[e.result?.available === false ? 'warning' : 'success'](e.result?.available === false ? e.result.reason : `Upgrade finished: ${e.result?.versionAfter || 'done'}`); else toast.error(e.error || 'Upgrade failed'); refetch(); }} />}
+            {jobId && <ProgressLog jobId={jobId} onFinished={(e) => { if (e.type === 'done') toast[e.result?.available === false || e.result?.alreadyCurrent ? 'warning' : 'success'](e.result?.available === false || e.result?.alreadyCurrent ? e.result.reason : `Upgrade finished: ${e.result?.versionAfter || 'done'}`); else toast.error(e.error || 'Upgrade failed'); refetch(); }} />}
           </Card>
           <Card title="Recent upgrade jobs" padded={false}>
             <DataTable
@@ -66,7 +66,7 @@ export default function UpgradeDatabaseVersion({ fn }) {
                 { key: 'created_at', label: 'Started', render: (j) => formatDate(j.created_at) },
                 { key: 'target', label: 'Target', render: (j) => <code>{j.params?.target}</code> },
                 { key: 'status', label: 'Job', render: (j) => <StatusPill status={j.status} /> },
-                { key: 'result', label: 'Result', render: (j) => (j.error ? <span className="muted">{j.error}</span> : j.result ? (j.result.available === false ? <span className="muted">not available: no package manager</span> :`${j.result.versionBefore || '?'} → ${j.result.versionAfter || '?'}${j.result.backup ? ` · backup ${j.result.backup.path}` : ''}`) : '—') },
+                { key: 'result', label: 'Result', render: (j) => (j.error ? <span className="muted">{j.error}</span> : j.result ? (j.result.available === false ? <span className="muted">not available: no package manager</span> : j.result.alreadyCurrent ? <span className="muted">already current ({j.result.versionBefore || '?'}); server not restarted</span> : `${j.result.versionBefore || '?'} → ${j.result.versionAfter || '?'}${j.result.backup ? ` · backup ${j.result.backup.path}` : ''}`) : '—') },
               ]}
               rows={data.recentJobs || []} rowKey={(j) => j.id} dense emptyText="No upgrade jobs yet."
             />

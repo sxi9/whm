@@ -25,13 +25,17 @@ export default function SshPasswordAuthorizationTweak({ fn }) {
   }, [data]);
 
   const save = async () => {
+    // The API refuses this combination unless force is sent; the confirm here
+    // is what grants it.
+    let force = false;
     if (draft.PasswordAuthentication === 'no' && data.authorizedKeyCount === 0) {
       const ok = await confirm({ title: 'No root SSH keys are authorized', message: 'Disabling password authentication without an authorized key will lock root out of SSH. Continue anyway?', confirmLabel: 'Disable passwords', danger: true, typeToConfirm: 'LOCKOUT' });
       if (!ok) return;
+      force = true;
     }
     setBusy(true);
     try {
-      const { data: result } = await api.put('/security/ssh/config', { settings: draft });
+      const { data: result } = await api.put('/security/ssh/config', { settings: draft, ...(force ? { force: true } : {}) });
       toast.success(result.reloaded ? `sshd configuration validated and ${result.unit} reloaded` : 'sshd configuration written (reload it from Service Manager)');
       if (result.shadowed?.length) toast.error(`${result.shadowed.length} setting${result.shadowed.length === 1 ? ' is' : 's are'} overridden by another sshd configuration file; see the warning above`);
       refetch();

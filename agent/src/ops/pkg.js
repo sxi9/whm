@@ -133,8 +133,9 @@ export function parseGemList(stdout) {
   return stdout.split('\n').map((l) => l.match(/^(\S+) \(([^)]+)\)/)).filter(Boolean).map((m) => ({ name: m[1], version: m[2].split(',')[0].replace(/^default: /, '').trim(), versions: m[2].split(',').map((v) => v.replace(/^default: /, '').trim()) }));
 }
 
+// ExtUtils::Installed lists the interpreter itself as "Perl\t<version>"; it is not a module.
 export function parsePerlModules(stdout) {
-  return stdout.split('\n').filter((l) => l.trim() && l !== 'Perl').map((l) => { const [name, version] = l.split('\t'); return { name, version: version || null }; });
+  return stdout.split('\n').filter((l) => l.trim()).map((l) => { const [name, version] = l.split('\t'); return { name: name.trim(), version: version?.trim() || null }; }).filter((m) => m.name && m.name !== 'Perl');
 }
 
 // ini files: directives before the first [section] belong to PHP; sections are
@@ -916,7 +917,8 @@ defineOp('pkg.php.userini.read', {
 });
 
 defineOp('pkg.php.userini.write', {
-  description: 'Write a document root\'s .user.ini (owned by the account); refuses links and files not owned by the account',
+  description: 'Write a document root\'s .user.ini (owned by the account); an empty result removes the file; refuses links and files not owned by the account',
+  destructive: true,
   schema: z.object({ docroot: arg.absPath, owner: arg.username.optional(), content: arg.text.optional(), directives: directives.optional() }).strict()
     .refine((a) => a.content != null || a.directives != null, 'content or directives is required'),
   run: async ({ docroot, owner, content, directives: changes }, ctx) => {
@@ -1030,10 +1032,19 @@ function restoreStockDefaults(changed) {
   if (changed.mainConf && fs.existsSync(NGINX_MAIN_CONF)) writeAtomic(NGINX_MAIN_CONF, restoreServerBlocks(fs.readFileSync(NGINX_MAIN_CONF, 'utf8')));
 }
 
+// Certificate paths are interpolated into a root-written nginx config, so they
+// get a strict alphabet (no whitespace, ";", "{", "}", "#" or newlines that
+// could smuggle directives) and must live under the panel's SSL stores. The
+// API is not trusted to have produced clean paths.
+export const NGINX_SSL_ROOTS = ['/etc/ssl/whm', '/etc/letsencrypt', '/etc/pki/tls/whm'];
+export const nginxSslPath = z.string().regex(/^\/[A-Za-z0-9._/-]{1,255}$/, 'certificate path')
+  .refine((p) => p.split('/').slice(1).every((seg) => seg && seg !== '.' && seg !== '..'), 'certificate path must be normalized')
+  .refine((p) => NGINX_SSL_ROOTS.some((root) => p.startsWith(`${root}/`)), `certificate path must be under ${NGINX_SSL_ROOTS.join(', ')}`);
+
 const domainEntry = z.object({
   domain: arg.hostname,
   aliases: z.array(arg.hostname).max(200).default([]),
-  ssl: z.object({ cert: arg.absPath, key: arg.absPath }).strict().optional(),
+  ssl: z.object({ cert: nginxSslPath, key: nginxSslPath }).strict().optional(),
 }).strict();
 
 const PROXY_HEADERS = [
@@ -1168,8 +1179,23 @@ defineOp('pkg.nginx.configtest', {
   },
 });
 
+// nginx -t creates only the last path component of proxy_cache_path, and
+// Debian/Ubuntu packages ship no /var/cache/nginx. The parent is created here
+// when the agent may write there (operators extend the allowed roots in the
+// agent config); otherwise the operator gets a clear message instead of a
+// configtest failure that is rolled back every time.
+function ensureCacheDir(ctx) {
+  if (fs.existsSync(CACHE_PATH)) return;
+  try { ctx.assertAllowedPath(CACHE_PATH, 'write'); } catch {
+    if (fs.existsSync(path.dirname(CACHE_PATH))) return;
+    throw new OpError('unsupported', `The cache directory ${path.dirname(CACHE_PATH)} does not exist and the agent may not create it; create it (owned by root, mode 0700) or add it to the agent's allowed roots, then enable the cache again`);
+  }
+  fs.mkdirSync(CACHE_PATH, { recursive: true, mode: 0o700 });
+}
+
 defineOp('pkg.nginx.proxy.write', {
-  description: 'Render and install the reverse-proxy config; validates with nginx -t and rolls back when invalid',
+  description: 'Render and install the reverse-proxy config (displacing the stock default site); validates with nginx -t and rolls back when invalid',
+  destructive: true,
   schema: z.object({
     apachePort: port.default(8080), cache: z.boolean().default(false), cacheMaxSizeMb: z.number().int().min(64).max(1_048_576).default(1024),
     cacheTtl: z.string().regex(/^\d{1,5}[smhd]?$/).default('10m'), httpPort: port.default(80), httpsPort: port.default(443), domains: z.array(domainEntry).max(5000).default([]),
@@ -1179,6 +1205,7 @@ defineOp('pkg.nginx.proxy.write', {
     ctx.assertAllowedPath(NGINX_PROXY_CONF, 'write');
     for (const d of args.domains) if (d.ssl) { ctx.assertAllowedPath(d.ssl.cert, 'read'); ctx.assertAllowedPath(d.ssl.key, 'read'); }
     const usable = args.domains.filter((d) => !d.ssl || (fs.existsSync(d.ssl.cert) && fs.existsSync(d.ssl.key)));
+    if (args.cache) ensureCacheDir(ctx);
     const version = await nginxVersion();
     const rejectHandshake = nginxRejectHandshake(version);
     const defaultCert = rejectHandshake ? null : await ensureDefaultCert(ctx);

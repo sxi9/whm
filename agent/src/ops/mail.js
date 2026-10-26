@@ -3,6 +3,9 @@ import path from 'node:path';
 import { z } from 'zod';
 import { exec, hasBinary } from '../exec.js';
 import { defineOp, arg, OpError, runOp } from './registry.js';
+import { eximBaseLayout, parseUpdateExim4Conf, eximIncludes, includesFile, EXIM_WHM_FILES } from './exim-layout.js';
+
+export { parseUpdateExim4Conf };
 
 // Mail op family: Exim queue control, mainlog analytics, routing tests, panel
 // notifications, managed ACL/config includes (validated with exim -bV and rolled
@@ -53,67 +56,47 @@ async function reloadUnit(candidates, verb = 'reload-or-restart') {
   return { reloaded: false, unit: null };
 }
 
-// Debian's update-exim4.conf.conf is a sourced shell fragment of KEY='value'
-// lines; dc_use_split_config decides whether conf.d/ is read at all.
-export function parseUpdateExim4Conf(text) {
-  const out = {};
-  for (const raw of (text || '').split('\n')) {
-    const m = raw.trim().match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
-    if (m) out[m[1]] = m[2].trim().replace(/^(['"])(.*)\1$/, '$2');
-  }
-  return out;
-}
-
 export function versionAtLeast(version, [major, minor]) {
   const m = String(version || '').match(/^(\d+)\.(\d+)/);
   if (!m) return false;
   return Number(m[1]) > major || (Number(m[1]) === major && Number(m[2]) >= minor);
 }
 
-// Where Exim lives on this host. Debian ships split config under /etc/exim4 and
-// the exim4 binary; RHEL/cPanel-style hosts use /etc/exim(.conf) and exim.
+// Where Exim lives on this host (shared detection in exim-layout.js) plus the
+// files this family manages under <confdir>/whm.
 export function eximLayout() {
-  const bin = ['exim4', 'exim'].find(hasBinary) || null;
-  let flavor = null;
-  if (exists('/etc/exim4')) flavor = 'debian';
-  else if (exists('/etc/exim') || exists('/etc/exim.conf')) flavor = 'rhel';
-  const confDir = flavor === 'debian' ? '/etc/exim4' : flavor === 'rhel' ? '/etc/exim' : null;
+  const base = eximBaseLayout();
+  const { flavor, whmDir } = base;
   const mainlog = ['/var/log/exim4/mainlog', '/var/log/exim_mainlog', '/var/log/exim/main.log', '/var/log/exim/mainlog'].find(exists) || (flavor === 'debian' ? '/var/log/exim4/mainlog' : '/var/log/exim/main.log');
   const rejectlog = ['/var/log/exim4/rejectlog', '/var/log/exim_rejectlog', '/var/log/exim/reject.log'].find(exists) || null;
   const spoolDir = ['/var/spool/exim4', '/var/spool/exim'].find(exists) || null;
   const runUser = ['Debian-exim', 'exim', 'mail', 'mailnull'].map(passwdEntry).find(Boolean) || null;
-  const whmDir = confDir ? `${confDir}/whm` : null;
-  const debianConf = flavor === 'debian' ? parseUpdateExim4Conf(readText('/etc/exim4/update-exim4.conf.conf')) : {};
-  // dc_other_hostnames / dc_relay_domains would be shadowed by our macros, so
-  // they are merged into them (items are ';' or ':' separated).
-  const debianList = (value) => String(value || '').split(/[;:]/).map((s) => s.trim()).filter((s) => /^[A-Za-z0-9.*@_+-]+$/.test(s));
   return {
-    installed: Boolean(bin), bin, flavor, confDir, mainlog, rejectlog, spoolDir, whmDir,
-    aclFile: whmDir ? `${whmDir}/acl_rcpt.conf` : null,
-    // Debian pulls a file into acl_check_rcpt through the CHECK_RCPT_LOCAL_ACL_FILE
-    // macro. update-exim4.conf prepends exim4.conf.localmacros to the generated
-    // config in both split and unsplit mode, so the macro lives there; conf.d/ is
-    // only read when dc_use_split_config='true'. Other layouts need a manual .include.
+    ...base, mainlog, rejectlog, spoolDir,
+    // The filters ACL. Debian reaches it through the CHECK_RCPT_LOCAL_ACL_FILE
+    // macro: either directly (this family sets the macro in localmacros) or via
+    // service-configuration's chain file, which ends with an include of ours.
+    // Other layouts need a manual .include of the chain or of this file.
+    aclFile: base.emailAclFile,
+    legacyAclFile: whmDir ? `${whmDir}/${EXIM_WHM_FILES.legacyEmailAcl}` : null,
     includeMode: flavor === 'debian' ? 'debian-macro' : flavor === 'rhel' ? 'manual' : null,
-    macroFile: flavor === 'debian' ? '/etc/exim4/exim4.conf.localmacros' : null,
     legacyMacroFile: flavor === 'debian' ? '/etc/exim4/conf.d/main/000_whm_macros' : null,
-    // Main-section options (sqlite_dbfile) for layouts without a macro hook.
+    // Main-section options (sqlite_dbfile, domain lists) for layouts without a macro hook.
     mainFile: flavor === 'rhel' && whmDir ? `${whmDir}/main.conf` : null,
-    splitConfig: flavor === 'debian' ? debianConf.dc_use_split_config === 'true' : false,
-    updateConf: hasBinary('update-exim4.conf'),
+    // remote_smtp transport options (outbound interface) for layouts without the
+    // Debian REMOTE_SMTP_INTERFACE macro.
+    transportFile: flavor === 'rhel' && whmDir ? `${whmDir}/remote_smtp.conf` : null,
     runUser: runUser?.name || null,
-    units: flavor === 'debian' ? ['exim4', 'exim'] : ['exim', 'exim4'],
     dkimDir: whmDir ? `${whmDir}/dkim` : null,
     localDomainsFile: whmDir ? `${whmDir}/local_domains.lst` : null,
     relayDomainsFile: whmDir ? `${whmDir}/relay_domains.lst` : null,
-    otherHostnames: debianList(debianConf.dc_other_hostnames),
-    debianRelayDomains: debianList(debianConf.dc_relay_domains),
   };
 }
 
 function requireExim() {
   const layout = eximLayout();
   if (!layout.installed) throw new OpError('capability_missing', 'Exim is not installed on this server (no exim/exim4 binary found)');
+  if (!layout.confDir) throw new OpError('capability_missing', 'Unsupported Exim layout: neither /etc/exim4 nor /etc/exim(.conf) exists on this server');
   return layout;
 }
 
@@ -188,7 +171,8 @@ export function parseEximQueue(stdout) {
       continue;
     }
     if (current) {
-      const rcpt = line.trim().match(/^(D)?\s*(\S+@\S+|\S+)$/);
+      // The delivered marker is a lone "D" column; a local part may start with D.
+      const rcpt = line.trim().match(/^(?:(D)\s+)?(\S+)$/);
       if (rcpt) current.recipients.push({ address: rcpt[2], delivered: rcpt[1] === 'D' });
     }
   }
@@ -237,15 +221,23 @@ defineOp('mail.queue.message', {
   },
 });
 
+// Per-id outcome of an exim -M*/-Mrm run. Exim names an id in its output when
+// something is worth saying about it; with a non-zero exit, an id it stayed
+// silent about cannot be reported as done.
+export function queueResults(ids, code, output) {
+  const lines = String(output || '').split('\n');
+  return ids.map((id) => {
+    const line = lines.find((l) => l.includes(id));
+    if (line) return { id, ok: !/not found|failed|error|has not been/i.test(line), detail: line };
+    return code === 0 ? { id, ok: true, detail: null } : { id, ok: false, detail: `no confirmation from exim (exit ${code})` };
+  });
+}
+
 async function queueAction(flag, ids, { destructive = false } = {}) {
   const layout = requireExim();
   const { code, stdout, stderr } = await exec(layout.bin, [flag, ...ids], { allowFailure: true, timeoutMs: 600_000 });
   const output = `${stdout}${stderr}`.trim();
-  const perId = ids.map((id) => {
-    const line = output.split('\n').find((l) => l.includes(id));
-    const failed = line ? /not found|failed|error|has not been/i.test(line) : code !== 0 && ids.length === 1;
-    return { id, ok: !failed, detail: line || null };
-  });
+  const perId = queueResults(ids, code, output);
   return { flag, ids, ok: perId.every((r) => r.ok), results: perId, output, destructive };
 }
 
@@ -382,9 +374,12 @@ export function summarizeMail(messages, rejects) {
   };
 }
 
+// The current mainlog only (rotated siblings are not read); `from` is the
+// timestamp of the first line scanned so callers can tell when a window
+// reaches further back than the log on disk.
 function readMainlogTail(layout, maxBytes) {
   const file = layout.mainlog;
-  if (!exists(file)) return { file, exists: false, lines: [], truncated: false, size: 0 };
+  if (!exists(file)) return { file, exists: false, lines: [], truncated: false, size: 0, from: null };
   const size = fs.statSync(file).size;
   const length = Math.min(size, maxBytes);
   const fd = fs.openSync(file, 'r');
@@ -394,7 +389,8 @@ function readMainlogTail(layout, maxBytes) {
     const text = buf.toString('utf8');
     const lines = text.split('\n');
     if (size > length) lines.shift();
-    return { file, exists: true, lines, truncated: size > length, size };
+    const from = lines.map((l) => l.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/)?.[1]).find(Boolean) || null;
+    return { file, exists: true, lines, truncated: size > length, size, from };
   } finally { fs.closeSync(fd); }
 }
 
@@ -414,7 +410,7 @@ defineOp('mail.log.report', {
     list.sort((a, b) => (b.arrivedAt || '').localeCompare(a.arrivedAt || ''));
     const total = list.length;
     list = list.slice(0, limit);
-    return { file: tail.file, logExists: tail.exists, logTruncated: tail.truncated, logBytes: tail.size, sinceHours, total, messages: list, rejects: rejects.slice(-200) };
+    return { file: tail.file, logExists: tail.exists, logTruncated: tail.truncated, logBytes: tail.size, logFrom: tail.from, sinceHours, total, messages: list, rejects: rejects.slice(-200) };
   },
 });
 
@@ -427,7 +423,7 @@ defineOp('mail.log.stats', {
     const tail = readMainlogTail(layout, maxBytes);
     const sinceMs = sinceHours ? Date.now() - sinceHours * 3600_000 : 0;
     const { messages, rejects } = aggregateMainlog(tail.lines, { sinceMs });
-    return { file: tail.file, logExists: tail.exists, logTruncated: tail.truncated, logBytes: tail.size, sinceHours, ...summarizeMail(messages, rejects) };
+    return { file: tail.file, logExists: tail.exists, logTruncated: tail.truncated, logBytes: tail.size, logFrom: tail.from, sinceHours, ...summarizeMail(messages, rejects) };
   },
 });
 
@@ -509,17 +505,28 @@ export function dkimExpansions(dkimDir) {
   };
 }
 
-// The lines the panel needs in Exim's main section: the Debian ACL hook macro,
-// the sqlite_dbfile option greylisting needs on a taint-checking Exim (>= 4.94),
-// the local/relay domain lists Email Routing maintains and the DKIM signing
-// macros. Debian's template defines MAIN_LOCAL_DOMAINS, MAIN_RELAY_TO_DOMAINS
-// and the DKIM_* macros under .ifndef, so our definitions win unless the admin
-// already set them in localmacros (then verifyHook reports it).
-export function renderManagedBlock(layout, { sqliteDbfile = null, domainLists = false, dkim = false } = {}) {
+// Exim list of the outbound source addresses; "<;" because IPv6 carries colons.
+export function renderInterfaceList(outbound) {
+  const ips = [outbound?.ipv4, outbound?.ipv6].filter(Boolean);
+  return ips.length ? `<; ${ips.join(' ; ')}` : null;
+}
+
+// The lines the panel needs in Exim's main section: the Debian ACL hook macro
+// (only when this family owns it — with service-configuration present its ACL
+// chain file includes ours instead, see aclMacro), the sqlite_dbfile option
+// greylisting needs on a taint-checking Exim (>= 4.94), the local/relay domain
+// lists Email Routing maintains, the DKIM signing macros and the remote_smtp
+// source interface. Debian's template defines MAIN_LOCAL_DOMAINS,
+// MAIN_RELAY_TO_DOMAINS, REMOTE_SMTP_INTERFACE and the DKIM_* macros under
+// .ifndef, so our definitions win unless the admin already set them in
+// localmacros (then verifyHook reports it).
+export function renderManagedBlock(layout, { sqliteDbfile = null, domainLists = false, dkim = false, aclMacro = true, outbound = null } = {}) {
   const lines = [BLOCK_BEGIN];
   const debian = layout.includeMode === 'debian-macro';
-  if (debian) lines.push(`CHECK_RCPT_LOCAL_ACL_FILE = ${layout.aclFile}`);
+  if (debian && aclMacro) lines.push(`CHECK_RCPT_LOCAL_ACL_FILE = ${layout.aclFile}`);
   if (sqliteDbfile) lines.push(`sqlite_dbfile = ${sqliteDbfile}`);
+  const iface = renderInterfaceList(outbound);
+  if (debian && iface) lines.push('.ifndef REMOTE_SMTP_INTERFACE', `REMOTE_SMTP_INTERFACE = ${iface}`, '.endif');
   if (domainLists) {
     const local = ['@', 'localhost', ...(layout.otherHostnames || []), layout.localDomainsFile];
     const relay = [...(layout.debianRelayDomains || []), layout.relayDomainsFile];
@@ -541,14 +548,29 @@ export function renderDkimTransportFragment(layout) {
   return `${MANAGED} (DKIM signing). .include this file inside the remote_smtp transport of ${layout.confDir}/exim.conf.\ndkim_domain = ${e.domain}\ndkim_selector = ${e.selector}\ndkim_private_key = ${e.privateKey}\ndkim_canon = ${e.canon}\n`;
 }
 
+// Transport options for layouts without the Debian REMOTE_SMTP_INTERFACE macro:
+// included once by the admin inside the remote_smtp transport.
+export function renderTransportFragment(layout, outbound) {
+  const iface = renderInterfaceList(outbound);
+  return `${MANAGED} (outbound source address). .include this file inside the remote_smtp transport of ${layout.confDir}/exim.conf.\n${iface ? `interface = ${iface}\n` : '# No outbound source address is configured (Configure Remote Service IPs).\n'}`;
+}
+
 // What the current managed block carries, so a writer that does not know the
-// greylist state (routing lists) keeps the sqlite_dbfile line as it is.
+// greylist state (routing lists), the ACL ownership or the outbound address
+// keeps those lines as they are.
 export function readManagedBlock(text) {
   const start = (text || '').indexOf(BLOCK_BEGIN);
   const end = (text || '').indexOf(BLOCK_END);
-  if (start === -1 || end === -1 || end < start) return { present: false, sqliteDbfile: null };
+  if (start === -1 || end === -1 || end < start) return { present: false, sqliteDbfile: null, aclMacro: null, outbound: null };
   const body = text.slice(start, end);
-  return { present: true, sqliteDbfile: body.match(/^sqlite_dbfile = (\S+)$/m)?.[1] || null };
+  const iface = body.match(/^REMOTE_SMTP_INTERFACE = <; (.+)$/m)?.[1];
+  const ips = iface ? iface.split(';').map((s) => s.trim()).filter(Boolean) : [];
+  return {
+    present: true,
+    sqliteDbfile: body.match(/^sqlite_dbfile = (\S+)$/m)?.[1] || null,
+    aclMacro: /^CHECK_RCPT_LOCAL_ACL_FILE = /m.test(body),
+    outbound: ips.length ? { ipv4: ips.find((ip) => !ip.includes(':')) || null, ipv6: ips.find((ip) => ip.includes(':')) || null } : null,
+  };
 }
 
 // Replaces (or appends) the managed block, keeping everything the admin wrote
@@ -594,21 +616,58 @@ async function verifyDomainLists(layout) {
   return { hooked, detail: hooked ? null : `Exim's ${Object.entries(out).filter(([, ok]) => !ok).map(([n]) => n).join(' and ')} list does not read the panel's domain list file` };
 }
 
-async function verifyHook(layout, { sqliteDbfile = null, domainLists = false, dkim = false } = {}) {
-  const result = { hooked: null, sqliteDbfile: null, detail: null, domainListsHooked: null, domainListsDetail: null, dkimHooked: null, dkimDetail: null };
-  if (domainLists) { const d = await verifyDomainLists(layout); result.domainListsHooked = d.hooked; result.domainListsDetail = d.detail; }
-  if (dkim) { const d = await verifyDkim(layout); result.dkimHooked = d.hooked; result.dkimDetail = d.detail; }
+// Does the running configuration use the outbound interface? Debian: the
+// REMOTE_SMTP_INTERFACE macro; elsewhere the remote_smtp transport's options.
+async function verifyOutbound(layout, outbound) {
+  const iface = renderInterfaceList(outbound);
+  if (!iface) return { hooked: true, detail: null };
+  const debian = layout.includeMode === 'debian-macro';
+  const { code, stdout, stderr } = await exec(layout.bin, debian ? ['-bP', 'macro', 'REMOTE_SMTP_INTERFACE'] : ['-bP', 'transport', 'remote_smtp'], { allowFailure: true, timeoutMs: 30_000 });
+  const line = stdout.split('\n').find((l) => /REMOTE_SMTP_INTERFACE|^\s*interface\b/i.test(l)) || '';
+  const wanted = [outbound.ipv4, outbound.ipv6].filter(Boolean);
+  const hooked = code === 0 && wanted.every((ip) => line.includes(ip));
+  let detail = null;
+  if (!hooked) {
+    if (code !== 0) detail = `${stdout}${stderr}`.trim().split('\n').pop() || (debian ? 'REMOTE_SMTP_INTERFACE is not defined in the generated configuration' : 'the remote_smtp transport could not be read');
+    else if (line) detail = `Exim sends from "${line.trim()}", not from ${wanted.join(' / ')}`;
+    else detail = debian ? 'REMOTE_SMTP_INTERFACE is not defined in the generated configuration' : 'the remote_smtp transport has no interface option';
+  }
+  return { hooked, detail };
+}
+
+// Is the filters ACL reached from the generated configuration? Debian: the
+// CHECK_RCPT_LOCAL_ACL_FILE macro points at it, or at a chain file that
+// includes it (service-configuration's acl-rcpt-local.conf). Manual layouts:
+// exim.conf includes it or includes a file that does.
+async function verifyAclHook(layout, ctx) {
+  const includesOurs = (file) => file && /^\/etc\/exim/.test(file) && readText(file) != null && eximIncludes(readText(file)).includes(layout.aclFile);
   if (layout.includeMode === 'debian-macro') {
     const { code, stdout, stderr } = await exec(layout.bin, ['-bP', 'macro', 'CHECK_RCPT_LOCAL_ACL_FILE'], { allowFailure: true, timeoutMs: 30_000 });
-    result.hooked = code === 0 && stdout.includes(layout.aclFile);
-    if (!result.hooked) result.detail = `${stdout}${stderr}`.trim().split('\n').pop() || 'CHECK_RCPT_LOCAL_ACL_FILE is not defined in the generated configuration';
-  } else if (layout.includeMode === 'manual') {
+    const value = code === 0 ? (stdout.trim().split('\n').pop() || '').replace(/^CHECK_RCPT_LOCAL_ACL_FILE\s*=\s*/, '').trim() || null : null;
+    if (value === layout.aclFile) return { hooked: true, via: null, macro: value, detail: null };
+    if (includesOurs(value)) return { hooked: true, via: value, macro: value, detail: null };
+    const detail = code !== 0 ? `${stdout}${stderr}`.trim().split('\n').pop() || 'CHECK_RCPT_LOCAL_ACL_FILE is not defined in the generated configuration' : value ? `CHECK_RCPT_LOCAL_ACL_FILE points at ${value}, which does not include ${layout.aclFile}` : 'CHECK_RCPT_LOCAL_ACL_FILE is not defined in the generated configuration';
+    return { hooked: false, via: null, macro: value, detail };
+  }
+  if (layout.includeMode === 'manual') {
     const info = await eximVersion(layout);
     const file = info.configFile && /^\/etc\/exim/.test(info.configFile) ? info.configFile : null;
+    if (file) ctx?.assertAllowedPath?.(file, 'read');
     const text = file ? readText(file) : null;
-    result.hooked = text == null ? null : new RegExp(`^\\s*\\.include\\s+${layout.aclFile.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'm').test(text);
-    if (result.hooked === false) result.detail = `${file} does not .include ${layout.aclFile}`;
+    if (text == null) return { hooked: null, via: null, macro: null, detail: null };
+    const r = includesFile(text, layout.aclFile, (f) => (/^\/etc\/exim/.test(f) ? readText(f) : null));
+    return { hooked: r.hooked, via: r.via, macro: null, detail: r.hooked ? null : `${file} does not .include ${layout.aclFile} (directly or through ${layout.aclChainFile})` };
   }
+  return { hooked: null, via: null, macro: null, detail: null };
+}
+
+async function verifyHook(layout, { sqliteDbfile = null, domainLists = false, dkim = false, outbound = null } = {}, ctx = null) {
+  const result = { hooked: null, hookVia: null, sqliteDbfile: null, detail: null, domainListsHooked: null, domainListsDetail: null, dkimHooked: null, dkimDetail: null, outboundHooked: null, outboundDetail: null };
+  if (domainLists) { const d = await verifyDomainLists(layout); result.domainListsHooked = d.hooked; result.domainListsDetail = d.detail; }
+  if (dkim) { const d = await verifyDkim(layout); result.dkimHooked = d.hooked; result.dkimDetail = d.detail; }
+  if (outbound) { const o = await verifyOutbound(layout, outbound); result.outboundHooked = o.hooked; result.outboundDetail = o.detail; }
+  const acl = await verifyAclHook(layout, ctx);
+  result.hooked = acl.hooked; result.hookVia = acl.via; result.detail = acl.detail;
   if (sqliteDbfile) {
     const { code, stdout } = await exec(layout.bin, ['-bP', 'sqlite_dbfile'], { allowFailure: true, timeoutMs: 30_000 });
     result.sqliteDbfile = code === 0 && stdout.includes(sqliteDbfile);
@@ -616,20 +675,26 @@ async function verifyHook(layout, { sqliteDbfile = null, domainLists = false, dk
   return result;
 }
 
-function hookHint(layout, verify, { sqliteDbfile = null } = {}) {
+function hookHint(layout, verify, { sqliteDbfile = null, aclMacro = true } = {}) {
   const hints = [];
-  if (layout.includeMode === 'debian-macro' && verify.hooked === false) hints.push(`Exim did not pick up CHECK_RCPT_LOCAL_ACL_FILE from ${layout.macroFile}. Run update-exim4.conf and reload Exim, or add ".include ${layout.aclFile}" inside acl_check_rcpt (before the final accept) in ${layout.confDir}/exim4.conf.template.`);
-  if (layout.includeMode === 'manual' && verify.hooked !== true) hints.push(`Add ".include ${layout.aclFile}" inside acl_check_rcpt (before the final accept) in ${layout.confDir}/exim.conf once; the panel keeps that file current.`);
+  if (layout.includeMode === 'debian-macro' && verify.hooked === false) {
+    hints.push(aclMacro
+      ? `Exim did not pick up CHECK_RCPT_LOCAL_ACL_FILE from ${layout.macroFile} (${verify.detail}). Run update-exim4.conf and reload Exim, or add ".include ${layout.aclFile}" inside acl_check_rcpt (before the final accept) in ${layout.confDir}/exim4.conf.template.`
+      : `The RCPT ACL chain does not reach ${layout.aclFile} (${verify.detail}). Save "Exim Configuration Manager" (Service Configuration) once so its chain file ${layout.aclChainFile} is created and includes the Email filters, then reload Exim.`);
+  }
+  if (layout.includeMode === 'manual' && verify.hooked !== true) hints.push(`Add ".include ${layout.aclChainFile}" (Exim Configuration Manager's RCPT chain, which includes ${layout.aclFile}) or ".include ${layout.aclFile}" inside acl_check_rcpt (before the final accept) in ${layout.confDir}/exim.conf once; the panel keeps those files current.`);
   if (sqliteDbfile && verify.sqliteDbfile === false) hints.push(layout.includeMode === 'manual' ? `Add ".include ${layout.mainFile}" to the main section of ${layout.confDir}/exim.conf so sqlite_dbfile points at the greylist database.` : `Exim did not pick up sqlite_dbfile from ${layout.macroFile}; greylisting lookups will fail until it does.`);
   if (verify.domainListsHooked === false) hints.push(layout.includeMode === 'manual' ? `Replace the "domainlist local_domains" and "domainlist relay_to_domains" lines in ${layout.confDir}/exim.conf with ".include ${layout.mainFile}" so Email Routing can switch domains between local, remote and backup.` : `Exim did not pick up MAIN_LOCAL_DOMAINS / MAIN_RELAY_TO_DOMAINS from ${layout.macroFile} (${verify.domainListsDetail}); remove any definition of those macros elsewhere, run update-exim4.conf and reload Exim.`);
   if (verify.dkimHooked === false) hints.push(layout.includeMode === 'manual' ? `Add ".include ${layout.dkimDir}/transport.conf" inside the remote_smtp transport of ${layout.confDir}/exim.conf so outbound mail is DKIM-signed.` : `Exim is not signing with the panel's DKIM keys (${verify.dkimDetail}); remove any DKIM_* macros defined elsewhere, run update-exim4.conf and reload Exim.`);
+  if (verify.outboundHooked === false) hints.push(layout.includeMode === 'manual' ? `Add ".include ${layout.transportFile}" inside the remote_smtp transport of ${layout.confDir}/exim.conf so outbound mail leaves from the configured address.` : `Exim does not send from the configured outbound address (${verify.outboundDetail}); remove any REMOTE_SMTP_INTERFACE macro defined elsewhere, run update-exim4.conf and reload Exim.`);
   return hints.length ? hints.join(' ') : null;
 }
 
 // Everything the managed block must carry right now: the domain lists once
-// Email Routing wrote them, DKIM always (an absent key expands to no signing).
-function blockState(layout) {
-  return { domainLists: exists(layout.localDomainsFile) || exists(layout.relayDomainsFile), dkim: true };
+// Email Routing wrote them, the DKIM macros once a key is installed (the
+// selector lsearch needs its index file, which only exists from then on).
+export function blockState(layout) {
+  return { domainLists: exists(layout.localDomainsFile) || exists(layout.relayDomainsFile), dkim: installedDkimKeys(layout).length > 0 };
 }
 
 defineOp('mail.config.include.read', {
@@ -651,16 +716,26 @@ defineOp('mail.config.include.list', {
     let files = [];
     try { files = fs.readdirSync(layout.whmDir).filter((f) => !f.endsWith('.whm-bak') && !f.includes('.whm-tmp-')).sort().map((f) => ({ name: f, size: fs.statSync(path.join(layout.whmDir, f)).size })); } catch { /* no dir yet */ }
     const state = blockState(layout);
-    const verify = await verifyHook(layout, state);
-    return { dir: layout.whmDir, aclFile: layout.aclFile, includeMode: verify.hooked === false ? 'manual' : layout.includeMode, splitConfig: layout.splitConfig, macroFile: layout.macroFile, hooked: verify.hooked, hookDetail: verify.detail, domainListsHooked: verify.domainListsHooked, dkimHooked: verify.dkimHooked, files, hint: hookHint(layout, verify) };
+    const target = layout.includeMode === 'debian-macro' ? layout.macroFile : layout.mainFile;
+    const block = target ? readManagedBlock(readText(target)) : readManagedBlock(null);
+    const verify = await verifyHook(layout, { ...state, sqliteDbfile: block.sqliteDbfile, outbound: block.outbound }, ctx);
+    return { dir: layout.whmDir, aclFile: layout.aclFile, aclChainFile: layout.aclChainFile, includeMode: verify.hooked === false ? 'manual' : layout.includeMode, splitConfig: layout.splitConfig, macroFile: layout.macroFile, aclMacro: block.aclMacro, hooked: verify.hooked, hookVia: verify.hookVia, hookDetail: verify.detail, domainListsHooked: verify.domainListsHooked, dkimHooked: verify.dkimHooked, outbound: block.outbound, outboundHooked: verify.outboundHooked, files, hint: hookHint(layout, verify, { sqliteDbfile: block.sqliteDbfile, aclMacro: block.aclMacro ?? true }) };
   },
 });
 
+const outboundAddresses = z.object({ ipv4: arg.ipv4.nullable().optional(), ipv6: arg.ipv6.nullable().optional() }).strict();
+
 defineOp('mail.config.include.write', {
-  description: 'Write a managed Exim include/list file under <confdir>/whm, wire the main-section hooks (ACL include, sqlite_dbfile, domain lists, DKIM macros), validate with exim -bV (rolling back on error), verify they are live and reload Exim',
-  // sqliteDbfile: a path sets the option, null removes it, absent keeps whatever the block has.
-  schema: z.object({ name: includeName, content: arg.text, reload: z.boolean().default(true), hook: z.boolean().default(true), sqliteDbfile: greylistDbPath.nullable().optional() }).strict(),
-  run: async ({ name, content, reload, hook, sqliteDbfile }, ctx) => {
+  description: 'Write a managed Exim include/list file under <confdir>/whm, wire the main-section hooks (ACL macro when this family owns it, sqlite_dbfile, domain lists, DKIM macros, outbound interface), validate with exim -bV (rolling back on error), verify they are live and reload Exim',
+  // sqliteDbfile / outbound: a value sets the option, null removes it, absent
+  // keeps whatever the block has. aclMacro: true = this family sets
+  // CHECK_RCPT_LOCAL_ACL_FILE itself, false = service-configuration's ACL chain
+  // includes the filters file; absent keeps the block's current choice.
+  schema: z.object({
+    name: includeName, content: arg.text, reload: z.boolean().default(true), hook: z.boolean().default(true),
+    sqliteDbfile: greylistDbPath.nullable().optional(), aclMacro: z.boolean().optional(), outbound: outboundAddresses.nullable().optional(),
+  }).strict(),
+  run: async ({ name, content, reload, hook, sqliteDbfile, aclMacro, outbound }, ctx) => {
     const layout = requireExim();
     const file = path.join(layout.whmDir, name);
     ctx.assertAllowedPath(file, 'write');
@@ -671,9 +746,16 @@ defineOp('mail.config.include.write', {
     let hookAdded = false;
     const state = blockState(layout);
     const target = layout.includeMode === 'debian-macro' ? layout.macroFile : layout.mainFile;
-    if (sqliteDbfile === undefined) sqliteDbfile = target ? readManagedBlock(readText(target)).sqliteDbfile : null;
+    const current = target ? readManagedBlock(readText(target)) : readManagedBlock(null);
+    if (sqliteDbfile === undefined) sqliteDbfile = current.sqliteDbfile;
+    if (aclMacro === undefined) aclMacro = current.aclMacro ?? true;
+    if (outbound === undefined) outbound = current.outbound;
+    if (outbound && !outbound.ipv4 && !outbound.ipv6) outbound = null;
     if (hook && layout.includeMode) {
-      const block = renderManagedBlock(layout, { sqliteDbfile, ...state });
+      // The DKIM_SELECTOR lsearch fails open on a missing index, so the index
+      // is in place before a block that references it is written.
+      if (state.dkim && !exists(path.join(layout.dkimDir, 'selectors.lst'))) { ctx.assertAllowedPath(layout.dkimDir, 'write'); writeDkimIndex(layout); }
+      const block = renderManagedBlock(layout, { sqliteDbfile, aclMacro, outbound, ...state });
       ctx.assertAllowedPath(target, 'write');
       const previousBlockFile = readText(target);
       const wanted = layout.includeMode === 'debian-macro' ? mergeManagedBlock(previousBlockFile, block) : `${MANAGED} (Email filters). Main-section options; .include this file from the main section of exim.conf.\n${block}\n`;
@@ -686,8 +768,22 @@ defineOp('mail.config.include.write', {
         fs.unlinkSync(layout.legacyMacroFile);
         rollback.push(() => restore(layout.legacyMacroFile, legacy));
       }
+      // ... and the filters ACL under its old name (acl_rcpt.conf), which the
+      // ACL chain never includes.
+      if (layout.legacyAclFile && layout.legacyAclFile !== layout.aclFile && exists(layout.legacyAclFile) && (readText(layout.legacyAclFile) || '').includes(MANAGED)) {
+        ctx.assertAllowedPath(layout.legacyAclFile, 'write');
+        const legacy = readText(layout.legacyAclFile);
+        fs.unlinkSync(layout.legacyAclFile);
+        rollback.push(() => restore(layout.legacyAclFile, legacy));
+      }
       // The hook needs the ACL file to exist even when only a list was written.
       if (!exists(layout.aclFile)) { writeAtomic(layout.aclFile, `${MANAGED} (Email filters). No filters are enabled.\n`); rollback.push(() => restore(layout.aclFile, null)); }
+      if (layout.transportFile) {
+        ctx.assertAllowedPath(layout.transportFile, 'write');
+        const previousTransport = readText(layout.transportFile);
+        const wantedTransport = renderTransportFragment(layout, outbound);
+        if (previousTransport !== wantedTransport) { writeAtomic(layout.transportFile, wantedTransport); rollback.push(() => restore(layout.transportFile, previousTransport)); }
+      }
     }
     const regenerated = await regenerateDebianConfig(layout);
     const test = await validateExim(layout);
@@ -697,15 +793,32 @@ defineOp('mail.config.include.write', {
       const detail = (regenerated && !regenerated.ok ? regenerated.output : test.output).split('\n').filter(Boolean).pop();
       throw new OpError('config_invalid', `Exim rejected the new configuration; the previous file was restored: ${detail}`, { output: test.output });
     }
-    const verify = hook ? await verifyHook(layout, { sqliteDbfile, ...state }) : { hooked: null, sqliteDbfile: null, detail: null, domainListsHooked: null, dkimHooked: null };
+    const verify = hook ? await verifyHook(layout, { sqliteDbfile, outbound, ...state }, ctx) : { hooked: null, hookVia: null, sqliteDbfile: null, detail: null, domainListsHooked: null, dkimHooked: null, outboundHooked: null };
     const reloaded = reload ? await reloadUnit(layout.units) : { reloaded: false, unit: null };
     return {
       path: file, bytes: Buffer.byteLength(content), validated: true, hookAdded, regenerated: regenerated?.ok ?? null, ...reloaded,
-      includeMode: verify.hooked === false ? 'manual' : layout.includeMode, splitConfig: layout.splitConfig, macroFile: target,
-      hooked: verify.hooked, hookDetail: verify.detail, sqliteDbfile: verify.sqliteDbfile,
+      includeMode: verify.hooked === false ? 'manual' : layout.includeMode, splitConfig: layout.splitConfig, macroFile: target, aclMacro, aclChainFile: layout.aclChainFile,
+      hooked: verify.hooked, hookVia: verify.hookVia, hookDetail: verify.detail, sqliteDbfile: verify.sqliteDbfile,
       domainListsHooked: verify.domainListsHooked, domainListsDetail: verify.domainListsDetail ?? null, dkimHooked: verify.dkimHooked, dkimDetail: verify.dkimDetail ?? null,
-      hint: hook ? hookHint(layout, verify, { sqliteDbfile }) : null,
+      outbound, outboundHooked: verify.outboundHooked, outboundDetail: verify.outboundDetail ?? null,
+      hint: hook ? hookHint(layout, verify, { sqliteDbfile, aclMacro }) : null,
     };
+  },
+});
+
+// "Configure Remote Service IPs" hook: the source address(es) remote_smtp
+// binds to. The managed block (Debian macro) or transport fragment (manual
+// layouts) is rewritten through the ACL include so validate/rollback apply.
+defineOp('mail.outbound.set', {
+  description: 'Set the source IPv4/IPv6 addresses Exim uses for outbound SMTP (remote_smtp interface), validate and reload',
+  schema: outboundAddresses,
+  run: async ({ ipv4 = null, ipv6 = null }, ctx) => {
+    const layout = requireExim();
+    if (!layout.includeMode) throw new OpError('unsupported', 'Unsupported Exim layout for outbound address configuration');
+    const outbound = ipv4 || ipv6 ? { ipv4, ipv6 } : null;
+    const aclContent = readText(layout.aclFile) ?? `${MANAGED} (Email filters). No filters are enabled.\n`;
+    const write = await runOp('mail.config.include.write', { name: path.basename(layout.aclFile), content: aclContent, reload: true, hook: true, outbound }, ctx);
+    return { ipv4, ipv6, applied: write.outboundHooked !== false, hooked: write.outboundHooked, detail: write.outboundDetail, hint: write.outboundHooked === false ? write.hint : null, file: layout.includeMode === 'debian-macro' ? layout.macroFile : layout.transportFile, reloaded: write.reloaded, unit: write.unit };
   },
 });
 
@@ -901,8 +1014,10 @@ defineOp('mail.dkim.list', {
   run: async (_args, ctx) => {
     const layout = requireExim();
     ctx.assertAllowedPath(layout.dkimDir, 'read');
+    const keys = installedDkimKeys(layout);
     const signing = await verifyDkim(layout);
-    return { dir: layout.dkimDir, keys: installedDkimKeys(layout), signing: signing.hooked, signingDetail: signing.detail, hint: signing.hooked === false ? hookHint(layout, { dkimHooked: false, dkimDetail: signing.detail }) : null };
+    // Without a key nothing is expected to sign, so no hint.
+    return { dir: layout.dkimDir, keys, signing: signing.hooked, signingDetail: signing.detail, hint: keys.length && signing.hooked === false ? hookHint(layout, { dkimHooked: false, dkimDetail: signing.detail }) : null };
   },
 });
 
@@ -989,11 +1104,15 @@ export function renderSpamdOptions(o) {
   return parts.join(' ');
 }
 
+// Everything except the assignments the panel owns is kept in `other` (in
+// order, distro comments included) and re-emitted; only the panel's own header
+// from an earlier save is dropped.
 export function parseSpamdDefaults(text) {
   const out = { enabled: null, cron: null, options: '', other: [] };
   for (const raw of (text || '').split('\n')) {
     const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
+    if (!line || line.startsWith(MANAGED)) continue;
+    if (line.startsWith('#')) { out.other.push(raw); continue; }
     const m = line.match(/^(?:export\s+)?([A-Z_]+)=(.*)$/);
     if (!m) { out.other.push(raw); continue; }
     if (m[1] === 'ENABLED') out.enabled = shellUnquote(m[2]) === '1';
@@ -1058,6 +1177,9 @@ defineOp('mail.spamd.config.write', {
 // --------------------------------------------------------------- mailboxes ---
 
 const mailboxFormat = z.enum(['maildir', 'mbox', 'mdbox', 'sdbox']);
+// Rendered into a Dovecot location (`maildir:<path>`), where ":" separates
+// extra location parameters (INDEX=, CONTROL=…) that could point elsewhere.
+const mailboxPath = arg.absPath.and(z.string().max(512).regex(/^[A-Za-z0-9._\/-]+$/, 'Path made of letters, digits, ".", "_", "-" and "/"'));
 
 function lstatOrNull(p) {
   try { return fs.lstatSync(p); } catch { return null; }
@@ -1117,8 +1239,8 @@ defineOp('mail.mailbox.convert', {
   schema: z.object({
     user: emailAddress.or(arg.username),
     homeDir: arg.absPath,
-    source: z.object({ format: mailboxFormat, path: arg.absPath }).strict(),
-    target: z.object({ format: mailboxFormat, path: arg.absPath }).strict(),
+    source: z.object({ format: mailboxFormat, path: mailboxPath }).strict(),
+    target: z.object({ format: mailboxFormat, path: mailboxPath }).strict(),
     dryRun: z.boolean().default(false),
   }).strict(),
   run: async ({ user, homeDir, source, target, dryRun }, ctx) => {

@@ -3,7 +3,7 @@ import { exec } from '../src/exec.js';
 import { runOp, createContext, OpError } from '../src/lib.js';
 import fs from 'node:fs';
 import {
-  renderHostsAllow, parseSshdConfig, sshdShadowed, parseAuthorizedKeys, parsePublicKeyLine, fingerprintOf, renderForkBombConf, parseForkBombConf,
+  renderHostsAllow, hostSourceForm, hostsDenyManaged, accessMode, archiveFormat, parseDistroCrsInclude, parseSshdConfig, sshdShadowed, parseAuthorizedKeys, parsePublicKeyLine, fingerprintOf, renderForkBombConf, parseForkBombConf,
   parseIptablesRules, parseNftChain, parseModsecDirectives, parseModsecRules, parseModsecErrorLog, renderUserdirConf, parseUserdirConf, firewallBackend, privateTempDir,
 } from '../src/ops/sec.js';
 
@@ -34,7 +34,12 @@ describe('sec op schemas reject injection and traversal before anything runs', (
       { service: 'sshd', source: 'ALL', action: 'DROP' },
       { service: 'sshd', source: 'ALL', action: 'allow', comment: 'multi\nline' },
       { service: '../etc', source: 'ALL', action: 'allow' },
-    ]) expect((await opError(runOp('sec.hosts_allow.write', { rules: [rule] }, ctx))).code).toBe('invalid_args');
+      // ":" is libwrap's field separator: only a real IPv6 address/network may contain it.
+      { service: 'sshd', source: 'host:name', action: 'allow' },
+      { service: 'sshd', source: '2001:db8::1: ALLOW', action: 'deny' },
+      { service: 'sshd', source: '2001:db8::/129', action: 'allow' },
+      { service: 'sshd', source: '[2001:db8::zz]', action: 'allow' },
+    ]) expect((await opError(runOp('sec.hosts_allow.write', { rules: [rule] }, ctx))).code, JSON.stringify(rule)).toBe('invalid_args');
     expect((await opError(runOp('sec.hosts_allow.write', { rules: [], extra: 1 }, ctx))).code).toBe('invalid_args');
     expect(exec).not.toHaveBeenCalled();
   });
@@ -158,6 +163,53 @@ describe('pure renderers and parsers', () => {
     const text = renderHostsAllow([{ service: 'sshd', source: '192.0.2.0/24', action: 'allow', comment: 'office' }, { service: 'ALL', source: 'ALL', action: 'deny' }]);
     expect(text).toContain('# office\nsshd: 192.0.2.0/24: ALLOW\nALL: ALL: DENY\n');
     expect(text.startsWith('# Managed by WHM panel')).toBe(true);
+  });
+
+  it('brackets IPv6 sources the way libwrap parses them', () => {
+    expect(hostSourceForm('2001:db8::/32')).toBe('[2001:db8::]/32');
+    expect(hostSourceForm('[2001:DB8::1]')).toBe('[2001:db8::1]');
+    expect(hostSourceForm('2001:db8::1')).toBe('[2001:db8::1]');
+    expect(hostSourceForm('192.0.2.0/24')).toBe('192.0.2.0/24');
+    expect(hostSourceForm('.example.com')).toBe('.example.com');
+    expect(hostSourceForm('host:name')).toBeNull();
+    expect(hostSourceForm('2001:db8::/129')).toBeNull();
+    const text = renderHostsAllow([{ service: 'sshd', source: '2001:db8::/32', action: 'allow' }, { service: 'sshd', source: '2001:db8:0:0:0:0:0:1', action: 'deny' }]);
+    expect(text).toContain('sshd: [2001:db8::]/32: ALLOW\nsshd: [2001:db8:0:0:0:0:0:1]: DENY\n');
+    expect(text).not.toMatch(/: 2001:/);
+  });
+
+  it('only treats hosts.deny as panel-managed when it is ours or has no rules', () => {
+    expect(hostsDenyManaged(null)).toBe(true);
+    expect(hostsDenyManaged('')).toBe(true);
+    expect(hostsDenyManaged('# comment only\n\n')).toBe(true);
+    expect(hostsDenyManaged('# Managed by WHM panel (Host Access Control).\n')).toBe(true);
+    expect(hostsDenyManaged('# distro default\nALL: PARANOID\n')).toBe(false);
+  });
+
+  it('keeps setuid/setgid bits when toggling binary access', () => {
+    expect(accessMode(0o4755, false)).toBe(0o4750);
+    expect(accessMode(0o4750, true)).toBe(0o4755);
+    expect(accessMode(0o2755, false)).toBe(0o2750);
+    expect(accessMode(0o755, false)).toBe(0o750);
+    expect(accessMode(0o700, true)).toBe(0o755);
+  });
+
+  it('detects the archive kind from its leading bytes', () => {
+    expect(archiveFormat(Buffer.from([0x1f, 0x8b, 0x08, 0x00]))).toBe('tar.gz');
+    expect(archiveFormat(Buffer.from('PK\u0003\u0004rest', 'latin1'))).toBe('zip');
+    expect(archiveFormat(Buffer.from('BZh91AY', 'latin1'))).toBe('tar.bz2');
+    expect(archiveFormat(Buffer.from([0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]))).toBe('tar.xz');
+    const tar = Buffer.alloc(512);
+    tar.write('ustar', 257, 'latin1');
+    expect(archiveFormat(tar)).toBe('tar');
+    expect(archiveFormat(Buffer.from('<!doctype html>'))).toBeNull();
+    expect(archiveFormat(Buffer.alloc(0))).toBeNull();
+  });
+
+  it('spots the distribution CRS include in security2.conf', () => {
+    expect(parseDistroCrsInclude('<IfModule security2_module>\n\tIncludeOptional /etc/modsecurity/*.conf\n\tIncludeOptional /usr/share/modsecurity-crs/*.load\n</IfModule>\n')).toEqual({ active: true, directive: 'IncludeOptional /usr/share/modsecurity-crs/*.load', path: '/usr/share/modsecurity-crs/*.load' });
+    expect(parseDistroCrsInclude('<IfModule security2_module>\n\tIncludeOptional /etc/modsecurity/*.conf\n\t# IncludeOptional /usr/share/modsecurity-crs/*.load\n</IfModule>\n')).toEqual({ active: false, directive: null, path: null });
+    expect(parseDistroCrsInclude(null).active).toBe(false);
   });
 
   it('parses sshd config and stops at Match blocks', () => {

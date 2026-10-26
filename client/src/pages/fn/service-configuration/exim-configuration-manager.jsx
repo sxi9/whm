@@ -29,10 +29,11 @@ export default function EximConfigurationManager({ fn }) {
               ['Unit', <UnitPill key="u" unit={data.layout?.unit} />],
               ['Version', data.layout?.version || '—'],
               ['Compiled-in checks', data.layout?.features ? <span key="f">SPF {data.support?.spf ? <StatusPill status="ok">yes</StatusPill> : <StatusPill status="warning">no (exim4-daemon-light; install exim4-daemon-heavy)</StatusPill>} · DKIM {data.support?.dkim ? <StatusPill status="ok">yes</StatusPill> : <StatusPill status="warning">no</StatusPill>}</span> : 'unknown until Exim is installed'],
-              ['Layout', data.layout?.flavor ? `${data.layout.flavor}${data.layout.splitConfig ? ' (split config, conf.d)' : ' (single file)'}` : '—'],
-              ['Main options', slot('main') ? <span key="m"><code>{slot('main').path}</code> {slot('main').exists ? <StatusPill status="ok">written</StatusPill> : <StatusPill status="pending">not written</StatusPill>} {slot('main').hooked ? <StatusPill status="ok">live</StatusPill> : <StatusPill status="warning">include line missing</StatusPill>}</span> : '—'],
-              ['RCPT ACL', slot('acl_rcpt') ? <span key="r"><code>{slot('acl_rcpt').path}</code> {hookPill(slot('acl_rcpt'))}</span> : '—'],
+              ['Layout', data.layout?.flavor ? `${data.layout.flavor}${data.layout.flavor === 'debian' ? (data.layout.splitConfig ? ' (split config: conf.d fragments)' : ' (unsplit: managed block in exim4.conf.localmacros)') : ' (single exim.conf, manual .include)'}` : '—'],
+              ['Main options', slot('main') ? <span key="m"><code>{slot('main').path}</code>{slot('main').block ? ' (managed block)' : ''} {slot('main').exists ? <StatusPill status="ok">written</StatusPill> : <StatusPill status="pending">not written</StatusPill>} {slot('main').hooked ? <StatusPill status="ok">live</StatusPill> : <StatusPill status="warning">{slot('main').hookable ? (slot('main').exists ? 'not in the generated config' : 'live after the next save') : 'include line missing'}</StatusPill>}</span> : '—'],
+              ['RCPT ACL chain', slot('acl_rcpt') ? <span key="r"><code>{slot('acl_rcpt').path}</code> {hookPill(slot('acl_rcpt'))} {data.chain?.emailAclFile && (data.chain.includesEmailFilters ? <StatusPill status="ok">includes Email filters</StatusPill> : <StatusPill status="pending">includes Email filters after the next save</StatusPill>)}</span> : '—'],
               ['DATA ACL', slot('acl_data') ? <span key="d"><code>{slot('acl_data').path}</code> {hookPill(slot('acl_data'))}</span> : '—'],
+              ['TLS policy', data.settings?.tls ? <span key="t">minimum {data.settings.tls.minProtocol}{data.support?.tls ? ` · ${data.support.tls === 'gnutls' ? 'GnuTLS priority string' : 'OpenSSL cipher list'}` : ''} <span className="muted">(from SSL/TLS Configuration)</span></span> : <span key="t" className="muted">not set; apply a preset under SSL/TLS Configuration</span>],
               data.mail && ['Queue', data.mail.queue ? `${data.mail.queue.total} message(s), ${data.mail.queue.frozen} frozen` : '—'],
               ['Email category', data.emailCategory ? <StatusPill key="e" status="ok">loaded (filters, greylisting, DKIM keys are managed there)</StatusPill> : <StatusPill key="e" status="muted">not loaded</StatusPill>],
             ]} />
@@ -41,7 +42,7 @@ export default function EximConfigurationManager({ fn }) {
           {(data.warnings || []).map((w) => <div key={w} className="banner banner-warning"><div>{w}</div></div>)}
           <Tabs value={tab} onChange={setTab} tabs={[{ value: 'filters', label: 'RBLs & verification' }, { value: 'limits', label: 'Limits & rate limiting' }, { value: 'attack', label: 'Dictionary attack protection' }, { value: 'auth', label: 'Auth, size & logging' }, { value: 'preview', label: 'Generated config' }]} />
           {(tab === 'filters' || tab === 'attack') && data.installed && !rcptLive && (
-            <div className="banner banner-warning"><div><strong>Rejection rules are not in force.</strong> They live in the RCPT ACL fragment, which Exim does not include on this host{slot('acl_rcpt')?.hookable && !slot('acl_rcpt')?.claimedBy ? ' until the next save hooks it in' : ' (see the manual step above)'}. Saving writes the fragment but reports the apply as not ok until Exim includes it; until then the RBL, reverse-DNS, HELO, sender-verification and dictionary-attack settings only tag messages.</div></div>
+            <div className="banner banner-warning"><div><strong>Rejection rules are not in force.</strong> They live in the RCPT ACL chain, which Exim does not include on this host{slot('acl_rcpt')?.hookable && !slot('acl_rcpt')?.claimedBy ? ' until the next save hooks it in' : slot('acl_rcpt')?.claimedBy ? ' because another definition of its hook macro came first (save the Email filters page once, or see the step above)' : ' (see the manual step above)'}. Saving writes the chain but reports the apply as not ok until Exim includes it; until then the RBL, reverse-DNS, HELO, sender-verification and dictionary-attack settings only tag messages.</div></div>
           )}
           {tab === 'filters' && (
             <Card className="config-fields" subtitle="Enforced by deny rules in the RCPT ACL fragment for unauthenticated remote senders; authenticated clients and localhost are exempt.">
@@ -98,7 +99,7 @@ export default function EximConfigurationManager({ fn }) {
           {tab === 'preview' && (
             <>
               <Card title="Main options" subtitle={slot('main')?.path}><pre className="log">{data.preview.main}</pre></Card>
-              <Card title="RCPT ACL fragment" subtitle={slot('acl_rcpt')?.path}><pre className="log">{data.preview.acl_rcpt}</pre></Card>
+              <Card title="RCPT ACL chain" subtitle={slot('acl_rcpt')?.path}><pre className="log">{data.preview.acl_rcpt}</pre></Card>
               <Card title="DATA ACL fragment" subtitle={slot('acl_data')?.path}><pre className="log">{data.preview.acl_data}</pre></Card>
               <p className="muted">The preview shows the last saved settings; save to regenerate.</p>
             </>

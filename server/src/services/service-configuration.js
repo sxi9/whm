@@ -18,6 +18,9 @@ import { notFound, badRequest, unprocessable, CapabilityError } from '../lib/err
 //   web.setListenPorts({ http, https|null, bind|null }, req)  -> bind pins Listen and every vhost to that address
 //   web.reload(req) / web.restart(req) / web.configtest()
 //   web.ftp.setPassiveAddress({ ipv4 }, req)
+//   web.ensureEximAclChain()                        -> email: makes sure the RCPT ACL chain (and its macro) exists before it writes its filters file
+//   web.applyEximTls({ minProtocol, protocols, cipherList, cipherSuites, preferServerCiphers }, req)   -> ssl-tls presets for Exim
+//   web.applyMailserverTls({ minProtocol, cipherList, cipherSuites, preferServerCiphers }, req)       -> ssl-tls presets for Dovecot
 // The ones that change a live vhost/daemon persist the change first and then throw
 // CapabilityError('apache' | 'ftp') when the daemon is missing; consumers map that
 // to 'pending' / 'saved' (dns-functions, ip-functions, ssl-tls all do) and the next
@@ -29,8 +32,9 @@ export const DEFAULTS = {
   logrotate: { frequency: 'daily', rotate: 14, compress: true, delaycompress: true, missingok: true, notifempty: true, dateext: false, maxSize: '', panelLogs: true, accountLogs: true, webServerLogs: false, postrotateWeb: true },
   webdisk: { enabled: true, port: 2077, sslPort: 2078, requireSsl: true, allowDigestAuth: true, allowAnonymousDiscovery: false, maxUploadMb: 2048, idleTimeoutMinutes: 30, allowedAccounts: 'all' },
   webservices: { apiEnabled: true, tokenLifetimeMinutes: 1440, sessionTimeoutMinutes: 60, maxConcurrentRequests: 200, rateLimitPerMinute: 600, allowedOrigins: [], enableCompression: true, requestLogRetentionDays: 30, exposeVersion: false, ipv6Listen: true },
-  exim: { rblEnabled: true, rbls: ['zen.spamhaus.org', 'bl.spamcop.net'], domainRblEnabled: false, domainRbls: ['dbl.spamhaus.org'], spfVerify: true, spfReject: false, dkimVerify: true, dkimReject: false, reverseDnsRequired: false, verifySender: true, requireHelo: true, maxMessageSizeMb: 50, smtpAcceptMax: 100, smtpAcceptMaxPerHost: 10, smtpAcceptQueuePerConnection: 10, ratelimitEnabled: true, ratelimitMailThreshold: 10, ratelimitMailDelay: 1, ratelimitRcptThreshold: 50, ratelimitRcptDelay: 1, dictionaryAttackProtection: true, maxUnknownCommands: 3, rcptFailLimit: 4, rcptFailDelay: 10, recipientsMax: 100, recipientsMaxReject: true, requireTlsForAuth: true, logSelector: ['+smtp_connection', '+subject', '+tls_cipher'] },
-  mailserver: { protocols: ['imap', 'pop3', 'lmtp'], maxUserIpConnections: 20, processLimit: 1000, clientLimit: 1000, ssl: 'required', sslMinProtocol: 'TLSv1.2', disablePlaintextAuth: true, loginGreeting: '', imapIdleNotifyIntervalMinutes: 2, pop3UidlFormat: '%08Xu%08Xv', mailLocation: 'maildir:~/mail', mailboxFormat: 'maildir' },
+  // `tls` is null until SSL/TLS Configuration hands a preset over (applyEximTls); nothing TLS-related is rendered before that.
+  exim: { rblEnabled: true, rbls: ['zen.spamhaus.org', 'bl.spamcop.net'], domainRblEnabled: false, domainRbls: ['dbl.spamhaus.org'], spfVerify: true, spfReject: false, dkimVerify: true, dkimReject: false, reverseDnsRequired: false, verifySender: true, requireHelo: true, maxMessageSizeMb: 50, smtpAcceptMax: 100, smtpAcceptMaxPerHost: 10, smtpAcceptQueuePerConnection: 10, ratelimitEnabled: true, ratelimitMailThreshold: 10, ratelimitMailDelay: 1, ratelimitRcptThreshold: 50, ratelimitRcptDelay: 1, dictionaryAttackProtection: true, maxUnknownCommands: 3, rcptFailLimit: 4, rcptFailDelay: 10, recipientsMax: 100, recipientsMaxReject: true, requireTlsForAuth: true, logSelector: ['+smtp_connection', '+subject', '+tls_cipher'], tls: null },
+  mailserver: { protocols: ['imap', 'pop3', 'lmtp'], maxUserIpConnections: 20, processLimit: 1000, clientLimit: 1000, ssl: 'required', sslMinProtocol: 'TLSv1.2', sslCipherList: '', sslCipherSuites: '', sslPreferServerCiphers: false, disablePlaintextAuth: true, loginGreeting: '', imapIdleNotifyIntervalMinutes: 2, pop3UidlFormat: '%08Xu%08Xv', mailLocation: 'maildir:~/mail', mailboxFormat: 'maildir' },
   ftp: { passivePortMin: 49152, passivePortMax: 65534, passiveAddress: '', tls: 'optional', maxClients: 50, maxPerIp: 8, anonymous: false, idleTimeoutMinutes: 15, chroot: true },
   nameserver: { server: 'bind', role: 'master' },
 };
@@ -69,17 +73,63 @@ export function eximSupport(layout) {
   return { spf: layout?.support?.spf ?? has('SPF'), dkim: layout?.support?.dkim ?? has('DKIM') };
 }
 
+// The TLS library Exim was built with decides the tls_require_ciphers syntax:
+// GnuTLS (Debian/Ubuntu) takes a priority string, OpenSSL (RHEL) a cipher list.
+export function eximTlsLibrary(layout) {
+  if (layout?.support?.tls) return layout.support.tls;
+  const features = Array.isArray(layout?.features) ? layout.features : null;
+  if (features?.some((f) => /\bGnuTLS\b/.test(f))) return 'gnutls';
+  if (features?.some((f) => /\bOpenSSL\b/.test(f))) return 'openssl';
+  return layout?.flavor === 'debian' ? 'gnutls' : 'openssl';
+}
+
+export const TLS_VERSIONS = ['TLSv1', 'TLSv1.1', 'TLSv1.2', 'TLSv1.3'];
+const GNUTLS_VERSIONS = { TLSv1: 'VERS-TLS1.0', 'TLSv1.1': 'VERS-TLS1.1', 'TLSv1.2': 'VERS-TLS1.2', 'TLSv1.3': 'VERS-TLS1.3' };
+
+// Normalises a preset from SSL/TLS Configuration ({ minProtocol, protocols?,
+// cipherList, cipherSuites, preferServerCiphers }) into what is stored.
+export function tlsPolicyFrom(p) {
+  if (!p) return null;
+  const hasMin = p.minProtocol != null;
+  if (hasMin && !TLS_VERSIONS.includes(p.minProtocol)) throw badRequest(`minProtocol must be one of ${TLS_VERSIONS.join(', ')}`);
+  const protocols = Array.isArray(p.protocols) && p.protocols.length ? TLS_VERSIONS.filter((v) => p.protocols.includes(v)) : hasMin ? TLS_VERSIONS.slice(TLS_VERSIONS.indexOf(p.minProtocol)) : [];
+  const minProtocol = hasMin ? p.minProtocol : protocols[0];
+  if (!minProtocol || !protocols.length) throw badRequest(`A TLS policy needs minProtocol or protocols out of ${TLS_VERSIONS.join(', ')}`);
+  return { minProtocol, protocols, cipherList: String(p.cipherList || ''), cipherSuites: String(p.cipherSuites || ''), preferServerCiphers: Boolean(p.preferServerCiphers) };
+}
+
+// Exim has no tls_prefer_server_ciphers: server preference is an openssl_options
+// flag or %SERVER_PRECEDENCE in a GnuTLS priority string, and a GnuTLS build
+// cannot take an OpenSSL cipher list, so only the floor and preference apply there.
+export function renderEximTls(tls, library) {
+  const lines = [`# TLS policy from SSL/TLS Configuration: minimum ${tls.minProtocol}${library === 'gnutls' ? ' (GnuTLS build: priority string, the cipher list cannot be translated)' : ''}.`];
+  if (library === 'gnutls') {
+    const priority = ['NORMAL', '-VERS-ALL', ...tls.protocols.map((v) => `+${GNUTLS_VERSIONS[v]}`), ...(tls.preferServerCiphers ? ['%SERVER_PRECEDENCE'] : [])];
+    lines.push(`tls_require_ciphers = ${priority.join(':')}`);
+  } else {
+    if (tls.cipherList) lines.push(`tls_require_ciphers = ${tls.cipherList}`);
+    const options = ['+no_sslv2', '+no_sslv3', ...TLS_VERSIONS.filter((v) => !tls.protocols.includes(v)).map((v) => `+no_${v.toLowerCase().replace('.', '_')}`), '+single_dh_use', '+no_ticket', ...(tls.preferServerCiphers ? ['+cipher_server_preference'] : [])];
+    lines.push(`openssl_options = ${options.join(' ')}`);
+  }
+  return lines;
+}
+
 // ------------------------------------------------------------ renderers ---
 
 const macro = (name, value) => [`.ifndef ${name}`, `${name} = ${value}`, '.endif'];
+const SENTINEL = 'WHM_SERVICE_CONFIG';
 
-// On Debian's split config the stock acl_check_rcpt only *warns* (adds a header)
-// for CHECK_RCPT_IP_DNSBLS / CHECK_RCPT_DOMAIN_DNSBLS / CHECK_RCPT_REVERSE_DNS and
+// On Debian the stock acl_check_rcpt only *warns* (adds a header) for
+// CHECK_RCPT_IP_DNSBLS / CHECK_RCPT_DOMAIN_DNSBLS / CHECK_RCPT_REVERSE_DNS and
 // hard-rejects for CHECK_RCPT_SPF, so the real deny rules live in the RCPT
-// fragment on every layout; the macros here only tag and hook the fragments in.
+// chain on every layout; the macros here only tag and hook the fragments in.
+// The same text goes into conf.d/main (split) or a localmacros block (unsplit):
+// both are the main section, read before the distribution's own options.
+// The sentinel macro lets the agent prove the slot is part of the generated
+// configuration (`exim -bP macro WHM_SERVICE_CONFIG`).
 export function renderEximMain(s, layout, support = eximSupport(layout)) {
-  const debian = layout?.flavor === 'debian' && layout?.splitConfig;
-  const lines = [`${MANAGED} (Exim Configuration Manager: main options). Edit through the panel; manual changes are overwritten.`];
+  const debian = layout?.flavor === 'debian';
+  const lines = [`${MANAGED} (Exim Configuration Manager: main options). Edit through the panel; manual changes are overwritten.`, `${layout?.sentinel || SENTINEL} = 1`];
   if (debian) {
     lines.push(...macro('MESSAGE_SIZE_LIMIT', `${s.maxMessageSizeMb}M`));
     lines.push('# The deny rules for RBLs, reverse DNS, HELO, sender verification and SPF are in the RCPT fragment below;', '# Debian\'s own CHECK_RCPT_* handling of these macros only adds X-Warning headers (SPF excepted).');
@@ -89,10 +139,11 @@ export function renderEximMain(s, layout, support = eximSupport(layout)) {
     else if (s.spfVerify && !support.spf) lines.push('# SPF is not compiled into this Exim build (exim4-daemon-light); install exim4-daemon-heavy for SPF checks.');
     if (s.reverseDnsRequired) lines.push(...macro('CHECK_RCPT_REVERSE_DNS', 'true'));
     if (s.verifySender) lines.push(...macro('CHECK_RCPT_VERIFY_SENDER', 'true'));
-    // exim4.conf.localmacros is read before conf.d/main, so a hook the Email
-    // category already claimed for its own ACL file is left alone (the detect op
-    // then reports the manual include that is needed).
-    lines.push('# Hooks the RCPT fragment into acl_check_rcpt unless another component claimed the macro first.', ...macro('CHECK_RCPT_LOCAL_ACL_FILE', layout.slots.acl_rcpt.path));
+    // This is the single local RCPT hook both mail features share: the chain
+    // file ends with an include of the Email category's filters. A definition
+    // another component made first (the Email fallback macro from before this
+    // module existed, or the admin's) is left alone and reported by detect.
+    lines.push('# Hooks the RCPT ACL chain (panel protections + Email filters) into acl_check_rcpt.', ...macro('CHECK_RCPT_LOCAL_ACL_FILE', layout.slots.acl_rcpt.path));
     if (s.dkimVerify && support.dkim) lines.push(...macro('CHECK_DATA_LOCAL_ACL_FILE', layout.slots.acl_data.path));
     if (!s.requireTlsForAuth) lines.push(...macro('AUTH_SERVER_ALLOW_NOTLS_PASSWORDS', 'true'));
     if (s.logSelector.length) lines.push(...macro('MAIN_LOG_SELECTOR', s.logSelector.join(' ')));
@@ -104,14 +155,17 @@ export function renderEximMain(s, layout, support = eximSupport(layout)) {
   lines.push(`smtp_accept_max = ${s.smtpAcceptMax}`, `smtp_accept_max_per_host = ${s.smtpAcceptMaxPerHost}`, `smtp_accept_queue_per_connection = ${s.smtpAcceptQueuePerConnection}`);
   if (s.ratelimitEnabled) lines.push('smtp_ratelimit_hosts = *', `smtp_ratelimit_mail = ${s.ratelimitMailThreshold},${s.ratelimitMailDelay}s,1.5,30s`, `smtp_ratelimit_rcpt = ${s.ratelimitRcptThreshold},${s.ratelimitRcptDelay}s,1.5,30s`);
   if (s.dictionaryAttackProtection) lines.push(`smtp_max_unknown_commands = ${s.maxUnknownCommands}`, `recipients_max = ${s.recipientsMax}`, `recipients_max_reject = ${s.recipientsMaxReject ? 'true' : 'false'}`);
+  if (s.tls) lines.push(...renderEximTls(s.tls, eximTlsLibrary(layout)));
   return `${lines.join('\n')}\n`;
 }
 
 // The same deny rules on every layout (see renderEximMain for why Debian's
 // macros are not enough). Exempting authenticated clients and loopback keeps
-// submissions from the server's own users and webmail working.
-export function renderEximRcptAcl(s, support = { spf: true, dkim: true }) {
-  const lines = [`${MANAGED} (Exim Configuration Manager: RCPT ACL). Include inside acl_check_rcpt after the local/authenticated accepts, before the final accept.`];
+// submissions from the server's own users and webmail working. The chain ends
+// with the Email category's filters file so one hook point serves both.
+export function renderEximRcptAcl(s, support = { spf: true, dkim: true }, layout = null) {
+  const emailAcl = layout?.emailAclFile || layout?.slots?.acl_rcpt?.includes || '/etc/exim/whm/acl-email-filters.conf';
+  const lines = [`${MANAGED} (Exim Configuration Manager: RCPT ACL chain). Include inside acl_check_rcpt after the local/authenticated accepts, before the final accept.`];
   const unauth = ['        !authenticated = *', '        !hosts = : 127.0.0.1 : ::1'];
   if (s.dictionaryAttackProtection) {
     lines.push('# Dictionary attack protection: slow down and then drop clients that keep guessing recipients',
@@ -130,23 +184,40 @@ export function renderEximRcptAcl(s, support = { spf: true, dkim: true }) {
     lines.push('warn', ...unauth, `        spf = ${s.spfReject ? 'softfail' : 'fail : softfail'}`, '        add_header = $spf_received', '        log_message = WHM SPF $spf_result', '');
   }
   if (lines.length === 1) lines.push('# No RCPT protections are enabled.');
+  lines.push('# Email filters (country / domain blocks, greylisting) are written by the Email category into this file:', `.include_if_exists ${emailAcl}`);
   return `${lines.join('\n')}\n`;
 }
 
+// $dkim_cur_signer is only set inside acl_smtp_dkim; in the DATA ACL the
+// signers are the colon-separated $dkim_signers list.
 export function renderEximDataAcl(s, support = { spf: true, dkim: true }) {
   const lines = [`${MANAGED} (Exim Configuration Manager: DATA ACL). Include inside acl_check_data.`];
   if (s.dkimVerify && !support.dkim) lines.push('# DKIM verification is enabled in the panel but this Exim build has no DKIM support; the dkim conditions are left out.');
   else if (s.dkimVerify) {
-    lines.push('# DKIM verification results', 'warn    dkim_status = pass', '        add_header = :at_start:X-WHM-DKIM: pass (signer $dkim_cur_signer)',
-      'warn    dkim_status = fail', '        add_header = :at_start:X-WHM-DKIM: fail (signer $dkim_cur_signer, $dkim_verify_reason)', '        log_message = WHM DKIM fail for $dkim_cur_signer');
-    if (s.dkimReject) lines.push('deny    !authenticated = *', '        dkim_status = fail', '        message = DKIM signature verification failed for $dkim_cur_signer', '        log_message = WHM DKIM reject');
+    lines.push('# DKIM verification results', 'warn    dkim_status = pass', '        add_header = :at_start:X-WHM-DKIM: pass (signers $dkim_signers)',
+      'warn    dkim_status = fail', '        add_header = :at_start:X-WHM-DKIM: fail (signers $dkim_signers)', '        log_message = WHM DKIM fail for $dkim_signers');
+    if (s.dkimReject) lines.push('deny    !authenticated = *', '        dkim_status = fail', '        message = DKIM signature verification failed for $dkim_signers', '        log_message = WHM DKIM reject');
   } else lines.push('# DKIM verification is disabled.');
   return `${lines.join('\n')}\n`;
 }
 
-export function renderDovecot(s) {
-  const lines = [`${MANAGED} (Mailserver Configuration). Loaded last from conf.d so these values win; edit through the panel.`, `protocols = ${s.protocols.join(' ')}`];
+// Dovecot reads conf.d alphabetically and later files win: this file owns
+// ssl=, protocols, limits and ciphers, and sorts after 90-whm-ssl-cert.conf
+// (certificate paths from Manage Service SSL Certificates / ssl-tls), which
+// writes nothing else. ssl_cipher_suites only exists from Dovecot 2.3.15.
+export function dovecotSupportsCipherSuites(version) {
+  const m = String(version || '').match(/^(\d+)\.(\d+)(?:\.(\d+))?/);
+  if (!m) return false;
+  const [maj, min, pat] = [Number(m[1]), Number(m[2]), Number(m[3] || 0)];
+  return maj > 2 || (maj === 2 && (min > 3 || (min === 3 && pat >= 15)));
+}
+
+export function renderDovecot(s, { version = null } = {}) {
+  const lines = [`${MANAGED} (Mailserver Configuration). Protocols, limits, ssl= and ciphers live here; certificate paths come from 90-whm-ssl-cert.conf. Edit through the panel.`, `protocols = ${s.protocols.join(' ')}`];
   lines.push(`ssl = ${s.ssl}`, `ssl_min_protocol = ${s.sslMinProtocol}`, `disable_plaintext_auth = ${s.disablePlaintextAuth ? 'yes' : 'no'}`);
+  if (s.sslCipherList) lines.push(`ssl_cipher_list = ${s.sslCipherList}`);
+  if (s.sslCipherSuites && dovecotSupportsCipherSuites(version)) lines.push(`ssl_cipher_suites = ${s.sslCipherSuites}`);
+  lines.push(`ssl_prefer_server_ciphers = ${s.sslPreferServerCiphers ? 'yes' : 'no'}`);
   lines.push(`mail_max_userip_connections = ${s.maxUserIpConnections}`, `default_process_limit = ${s.processLimit}`, `default_client_limit = ${s.clientLimit}`);
   if (s.mailLocation) lines.push(`mail_location = ${s.mailLocation}`);
   if (s.loginGreeting) lines.push(`login_greeting = ${s.loginGreeting}`);
@@ -272,6 +343,14 @@ export function createServiceConfigService(ctx) {
 
   const listenPorts = () => ({ http: 80, https: 443, bind: null, ...(settings.get('service_config.apache_ports', null) || {}) });
 
+  // Several vhosts changed by one action are written without a reload each and
+  // Apache is reloaded once afterwards when at least one file was validated, so
+  // a rejected last write cannot leave the earlier ones written but not live.
+  async function reloadAfter(written, req) {
+    if (!written) return { reloaded: false, unit: null };
+    return op('web.reload', {}, req).catch((err) => { logger.warn({ err }, 'web: reload after vhost writes failed'); return { reloaded: false, unit: null, error: err.message }; });
+  }
+
   function loadSpec(domain) {
     const row = stmts.vhostByDomain.get(domain);
     if (row) { const s = shapeVhost(row); s.logDir = domlogDir(s.username); return s; }
@@ -345,19 +424,28 @@ export function createServiceConfigService(ctx) {
       for (const pool of stmts.poolsByUser.all(account.username)) if (!specs.some((s) => s.phpVersion === pool.version)) await removePool(account.username, pool.version, req);
     }
     const results = [];
-    for (const [i, spec] of specs.entries()) {
+    let written = 0;
+    for (const spec of specs) {
       if (!installed) { storeSpec(spec); stmts.setVhostStatus.run('pending', 'Apache is not installed', null, spec.domain); results.push({ domain: spec.domain, applied: false, reason: 'capability_missing' }); continue; }
       try {
-        const written = await writeSpec(spec, req, { reload: i === specs.length - 1 });
+        const result = await writeSpec(spec, req, { reload: false });
+        written++;
         const poolError = spec.phpVersion ? poolErrors[spec.phpVersion] : null;
         if (poolError) {
-          stmts.setVhostStatus.run('failed', `PHP-FPM ${spec.phpVersion} pool: ${poolError}`, written.path ?? null, spec.domain);
-          results.push({ ...written, applied: false, reason: 'php_pool_failed', error: poolError });
-        } else results.push(written);
+          stmts.setVhostStatus.run('failed', `PHP-FPM ${spec.phpVersion} pool: ${poolError}`, result.path ?? null, spec.domain);
+          results.push({ ...result, applied: false, reason: 'php_pool_failed', error: poolError });
+        } else if (!spec.phpVersion) {
+          // No PHP-FPM tree on this host: the vhost is served, but without a
+          // handler .php files would be static content, so it is not "applied".
+          const error = 'PHP-FPM is not installed; .php files are served as static content until a PHP-FPM tree exists and the account is synced again';
+          stmts.setVhostStatus.run('failed', error, result.path ?? null, spec.domain);
+          results.push({ ...result, applied: false, reason: 'php_missing', error });
+        } else results.push(result);
       } catch (err) { results.push({ domain: spec.domain, applied: false, reason: err.code || 'error', error: err.message }); }
     }
+    const reload = await reloadAfter(written, req);
     audit(req, { action: 'web.vhost.sync', target: account.username, args: { domains: specs.map((s) => s.domain), applied: results.filter((r) => r.applied).length } });
-    return { username: account.username, applied: installed && results.every((r) => r.applied), reason: installed ? null : 'capability_missing', phpVersion, phpVersions: Object.fromEntries(specs.map((s) => [s.domain, s.phpVersion ?? null])), poolErrors, vhosts: results };
+    return { username: account.username, applied: installed && results.every((r) => r.applied), reason: !installed ? 'capability_missing' : results.find((r) => !r.applied)?.reason ?? null, phpVersion, phpVersions: Object.fromEntries(specs.map((s) => [s.domain, s.phpVersion ?? null])), poolErrors, reload, vhosts: results };
   }
 
   async function removeAccount(username, req) {
@@ -413,7 +501,9 @@ export function createServiceConfigService(ctx) {
     if (!spec.aliases.includes(alias)) spec.aliases = [...spec.aliases, alias];
     storeSpec(spec);
     requireApache();
-    return writeSpec(spec, req);
+    const result = await writeSpec(spec, req);
+    audit(req, { action: 'web.alias.add', target: spec.domain, args: { alias, username: spec.username } });
+    return result;
   }
 
   async function removeAlias({ username, alias, domain }, req) {
@@ -422,7 +512,9 @@ export function createServiceConfigService(ctx) {
     spec.aliases = spec.aliases.filter((a) => a !== alias);
     storeSpec(spec);
     requireApache();
-    return writeSpec(spec, req);
+    const result = await writeSpec(spec, req);
+    audit(req, { action: 'web.alias.remove', target: spec.domain, args: { alias, username: spec.username } });
+    return result;
   }
 
   async function setAccountIpv6(username, address, req) {
@@ -433,7 +525,10 @@ export function createServiceConfigService(ctx) {
     for (const s of list) { s.ipv6 = address || null; storeSpec(s); }
     requireApache();
     const results = [];
-    for (const [i, s] of list.entries()) results.push(await writeSpec(s, req, { reload: i === list.length - 1 }));
+    let written = 0;
+    try {
+      for (const s of list) { results.push(await writeSpec(s, req, { reload: false })); written++; }
+    } finally { await reloadAfter(written, req); }
     audit(req, { action: 'web.ipv6.set', target: username, args: { address } });
     return { username, address, vhosts: results };
   }
@@ -445,12 +540,15 @@ export function createServiceConfigService(ctx) {
     if (!rows.length) return { updated: 0, domains: [] };
     requireApache();
     let updated = 0;
-    for (const [i, r] of rows.entries()) { try { await writeSpec(r, req, { reload: i === rows.length - 1 }); updated++; } catch (err) { logger.warn({ err, domain: r.domain }, 'web: ip replacement failed'); } }
+    for (const r of rows) { try { await writeSpec(r, req, { reload: false }); updated++; } catch (err) { logger.warn({ err, domain: r.domain }, 'web: ip replacement failed'); } }
+    await reloadAfter(updated, req);
     audit(req, { action: 'web.ip.replace', target: `${from} -> ${to}`, args: { updated, domains: rows.map((r) => r.domain) } });
     return { updated, domains: rows.map((r) => r.domain) };
   }
 
-  async function setPhpVersion(domain, versionInput, req) {
+  // `reload: false` lets a caller batching many domains (MultiPHP Manager)
+  // reload Apache once itself.
+  async function setPhpVersion(domain, versionInput, req, { reload = true } = {}) {
     const spec = requireSpec(domain);
     const version = versionInput == null ? null : phpVersionId(versionInput);
     if (versionInput != null && !version) throw badRequest(`"${versionInput}" is not a PHP version`);
@@ -458,7 +556,7 @@ export function createServiceConfigService(ctx) {
     if (version) await ensurePool(stmts.accountByUsername.get(spec.username), version, req);
     spec.phpVersion = version;
     storeSpec(spec);
-    const result = await writeSpec(spec, req);
+    const result = await writeSpec(spec, req, { reload });
     audit(req, { action: 'web.php.set', target: domain, args: { version } });
     return result;
   }
@@ -470,7 +568,9 @@ export function createServiceConfigService(ctx) {
     const result = await op('web.ports.set', { http, https, bind }, req);
     settings.set('service_config.apache_ports', { http, https, bind });
     const rows = stmts.vhostsAll.all().map(shapeVhost);
-    for (const [i, r] of rows.entries()) { try { await writeSpec(r, req, { reload: i === rows.length - 1 }); } catch (err) { logger.warn({ err, domain: r.domain }, 'web: vhost port rewrite failed'); } }
+    let written = 0;
+    for (const r of rows) { try { await writeSpec(r, req, { reload: false }); written++; } catch (err) { logger.warn({ err, domain: r.domain }, 'web: vhost port rewrite failed'); } }
+    await reloadAfter(written, req);
     audit(req, { action: 'web.ports.set', args: { http, https, bind, vhosts: rows.length } });
     return { ...result, vhosts: rows.length };
   }
@@ -499,7 +599,8 @@ export function createServiceConfigService(ctx) {
     async get() {
       await capabilities.ensureFresh();
       const d = await detect(true).catch((err) => ({ apache: { installed: false, error: err.message }, php: { versions: [] } }));
-      const status = capabilities.has('apache') ? await op('web.status').catch((err) => ({ installed: true, error: err.message })) : { installed: false };
+      const ports = listenPorts();
+      const status = capabilities.has('apache') ? await op('web.status', { port: ports.http, bind: ports.bind }).catch((err) => ({ installed: true, error: err.message })) : { installed: false };
       const include = capabilities.has('apache') ? await op('web.global.read').catch(() => null) : null;
       const rows = stmts.vhostsAll.all().map(shapeVhost);
       return {
@@ -523,8 +624,13 @@ export function createServiceConfigService(ctx) {
       const applied = { include: null, mpm: null };
       try {
         const d = await detect(true);
+        // The include is dry-run before the MPM switch (a restart) so a rejected
+        // directive never leaves the host with the new MPM and the old include.
+        const directives = apache.directives(next);
+        const dry = await op('web.global.write', { directives, dryRun: true }, req);
+        if (dry.ok === false) throw unprocessable(`Apache rejected the directives: ${String(dry.output || '').trim().split('\n').pop() || 'configtest failed'}`, { customDirectives: ['Rejected by apache2ctl -t'] });
         if (next.mpm.module && d.apache?.mpm && d.apache.mpm !== next.mpm.module) applied.mpm = await op('web.mpm.set', { module: next.mpm.module }, req);
-        applied.include = await op('web.global.write', { directives: apache.directives(next), reload: true }, req);
+        applied.include = await op('web.global.write', { directives, reload: true }, req);
         recordApply('apache', true, { path: applied.include.path, mpm: applied.mpm?.module ?? d.apache?.mpm ?? null, reloaded: applied.include.reloaded });
         invalidate();
       } catch (err) {
@@ -564,12 +670,18 @@ export function createServiceConfigService(ctx) {
 
   // ---------------------------------------------------------- logrotate ---
 
+  // The web server policy only names logs no distribution file already rotates
+  // (logrotate reports duplicates as errors and the panel would roll back).
+  const DISTRIBUTION_LOGS = { apache2: '/var/log/apache2/*.log', httpd: '/var/log/httpd/*log', nginx: '/var/log/nginx/*.log' };
+
   const logrotate = {
     settings: () => getConf('logrotate'),
-    policy(name, s = getConf('logrotate')) {
+    policy(name, s = getConf('logrotate'), { distribution = {} } = {}) {
       const base = LOGROTATE_POLICIES[name];
       const postrotate = (p) => (p === 'apache-reload' && !s.postrotateWeb ? 'none' : p);
-      const policy = { name, paths: [...base.paths], frequency: s.frequency, rotate: s.rotate, compress: s.compress, delaycompress: s.compress && s.delaycompress, missingok: s.missingok, notifempty: s.notifempty, dateext: s.dateext, copytruncate: Boolean(base.copytruncate), ...(s.maxSize ? { maxSize: s.maxSize } : {}), ...(base.su ? { su: base.su } : {}), postrotate: postrotate(base.postrotate), sharedscripts: true };
+      const covered = Object.entries(DISTRIBUTION_LOGS).filter(([k]) => distribution[k]).map(([, glob]) => glob);
+      const paths = base.paths.filter((p) => !covered.includes(p));
+      const policy = { name, paths, frequency: s.frequency, rotate: s.rotate, compress: s.compress, delaycompress: s.compress && s.delaycompress, missingok: s.missingok, notifempty: s.notifempty, dateext: s.dateext, copytruncate: Boolean(base.copytruncate), ...(s.maxSize ? { maxSize: s.maxSize } : {}), ...(base.su ? { su: base.su } : {}), postrotate: postrotate(base.postrotate), sharedscripts: true, coveredBy: Object.entries(DISTRIBUTION_LOGS).filter(([k]) => distribution[k] && base.paths.includes(DISTRIBUTION_LOGS[k])).map(([k]) => distribution[k]) };
       if (base.perAccount) {
         const stanzas = [{ paths: [...base.paths], su: base.su, postrotate: policy.postrotate }];
         for (const a of stmts.accounts.all()) {
@@ -589,7 +701,7 @@ export function createServiceConfigService(ctx) {
       const list = await op('web.logrotate.list').catch((err) => ({ dir: '/etc/logrotate.d', logrotate: false, policies: [], error: err.message }));
       const files = {};
       for (const name of Object.keys(LOGROTATE_POLICIES)) files[name] = await op('web.logrotate.read', { name }).catch(() => ({ name, exists: false, content: null }));
-      return { installed: capabilities.has('logrotate'), settings: s, policies: Object.keys(LOGROTATE_POLICIES).map((name) => { const preview = logrotate.policy(name, s); return { name, enabled: logrotate.enabled(s).includes(name), paths: preview.paths, perAccount: Boolean(LOGROTATE_POLICIES[name].perAccount), file: files[name], preview }; }), managed: list, lastApply: lastApply('logrotate') };
+      return { installed: capabilities.has('logrotate'), settings: s, policies: Object.keys(LOGROTATE_POLICIES).map((name) => { const { coveredBy, ...preview } = logrotate.policy(name, s, { distribution: list.distribution || {} }); return { name, enabled: logrotate.enabled(s).includes(name), paths: preview.paths, coveredBy, perAccount: Boolean(LOGROTATE_POLICIES[name].perAccount), file: files[name], preview }; }), managed: list, lastApply: lastApply('logrotate') };
     },
     async update(input, req) {
       const next = { ...getConf('logrotate'), ...input };
@@ -598,9 +710,11 @@ export function createServiceConfigService(ctx) {
       if (!capabilities.has('logrotate')) { recordApply('logrotate', false, null, 'logrotate is not installed'); throw new CapabilityError('logrotate', 'logrotate is not installed on this server. Install the logrotate package; the policy you saved is written once it is.'); }
       const results = {};
       try {
+        const distribution = (await op('web.logrotate.list').catch(() => ({}))).distribution || {};
         for (const name of Object.keys(LOGROTATE_POLICIES)) {
-          if (logrotate.enabled(next).includes(name)) results[name] = await op('web.logrotate.write', logrotate.policy(name, next), req);
-          else results[name] = await op('web.logrotate.remove', { name }, req);
+          const { coveredBy, ...policy } = logrotate.policy(name, next, { distribution });
+          if (logrotate.enabled(next).includes(name) && policy.paths.length) results[name] = { ...(await op('web.logrotate.write', policy, req)), coveredBy };
+          else results[name] = { ...(await op('web.logrotate.remove', { name }, req)), coveredBy, note: coveredBy?.length && !policy.paths.length ? `Every log in this policy is already rotated by ${coveredBy.join(', ')}; nothing to write.` : null };
         }
         recordApply('logrotate', true, { policies: Object.keys(results) });
       } catch (err) { recordApply('logrotate', false, null, err.message); throw err; }
@@ -650,9 +764,9 @@ export function createServiceConfigService(ctx) {
     settings: () => getConf('exim'),
     async layout() { return op('web.exim.detect').catch((err) => ({ installed: false, error: err.message })); },
     preview(s = getConf('exim'), layout = null) {
-      const l = layout?.slots ? layout : { flavor: 'rhel', splitConfig: false, slots: { main: { path: '/etc/exim/whm/service_config.conf' }, acl_rcpt: { path: '/etc/exim/whm/acl_rcpt_protect.conf' }, acl_data: { path: '/etc/exim/whm/acl_data_whm.conf' } } };
+      const l = layout?.slots ? layout : { flavor: 'rhel', splitConfig: false, emailAclFile: '/etc/exim/whm/acl-email-filters.conf', slots: { main: { path: '/etc/exim/whm/service_config.conf' }, acl_rcpt: { path: '/etc/exim/whm/acl-rcpt-local.conf', includes: '/etc/exim/whm/acl-email-filters.conf' }, acl_data: { path: '/etc/exim/whm/acl_data_whm.conf' } } };
       const support = eximSupport(layout);
-      return { main: renderEximMain(s, l, support), acl_rcpt: renderEximRcptAcl(s, support), acl_data: renderEximDataAcl(s, support) };
+      return { main: renderEximMain(s, l, support), acl_rcpt: renderEximRcptAcl(s, support, l), acl_data: renderEximDataAcl(s, support) };
     },
     warnings(s, layout) {
       const support = eximSupport(layout);
@@ -678,16 +792,15 @@ export function createServiceConfigService(ctx) {
       let mailStatus = null;
       if (typeof ctx.mail?.status === 'function') { try { const st = await ctx.mail.status(); mailStatus = { installed: st.installed, queue: st.queue, filters: st.filters }; } catch { mailStatus = null; } }
       const installed = capabilities.has('exim') && layout.installed !== false;
-      return { installed, layout, settings: s, preview: exim.preview(s, layout.slots ? layout : null), support: eximSupport(layout), warnings: installed ? exim.warnings(s, layout) : [], inactive: installed ? exim.inactive(s, layout.slots, layout) : [], lastApply: lastApply('exim'), mail: mailStatus, emailCategory: Boolean(ctx.mail) };
+      const rcpt = layout.slots?.acl_rcpt;
+      return { installed, layout, settings: s, preview: exim.preview(s, layout.slots ? layout : null), support: { ...eximSupport(layout), tls: installed ? eximTlsLibrary(layout) : null }, warnings: installed ? exim.warnings(s, layout) : [], inactive: installed ? exim.inactive(s, layout.slots, layout) : [], lastApply: lastApply('exim'), mail: mailStatus, emailCategory: Boolean(ctx.mail), chain: rcpt ? { path: rcpt.path, emailAclFile: layout.emailAclFile ?? rcpt.includes ?? null, includesEmailFilters: rcpt.includesEmailFilters ?? null, hooked: rcpt.hooked ?? null, claimedBy: rcpt.claimedBy ?? null } : null };
     },
-    async update(input, req) {
-      const next = { ...getConf('exim'), ...input };
-      if (next.rblEnabled && !next.rbls.length) throw unprocessable('Add at least one RBL or disable RBL checks', { rbls: ['Required when RBL checks are enabled'] });
-      if (next.ratelimitEnabled && next.ratelimitRcptThreshold < next.ratelimitMailThreshold) throw unprocessable('The recipient threshold should be at least the message threshold', { ratelimitRcptThreshold: ['Lower than the message threshold'] });
-      setConf('exim', next);
-      audit(req, { action: 'exim.config.update', args: input });
-      const layout = await exim.layout();
+    requireInstalled(layout) {
       if (!capabilities.has('exim') || layout.installed === false) { recordApply('exim', false, null, 'Exim is not installed'); throw new CapabilityError('exim', 'Exim is not installed on this server. The settings were saved and are rendered into Exim once exim4/exim is installed.'); }
+    },
+    // Writes the three slots (macros last, so the files they point at exist
+    // when the generated configuration is validated) and records the apply.
+    async apply(next, layout, req) {
       const rendered = exim.preview(next, layout);
       const applied = {};
       let inactive = [];
@@ -700,7 +813,43 @@ export function createServiceConfigService(ctx) {
         const error = inactive.length ? `written, but Exim does not include ${inactive.map((k) => applied[k].path).join(', ')}${applied.acl_rcpt.claimedBy ? ` (CHECK_RCPT_LOCAL_ACL_FILE is used by ${applied.acl_rcpt.claimedBy})` : ''}; the rules in there are not in force` : null;
         recordApply('exim', inactive.length === 0, summary, error);
       } catch (err) { recordApply('exim', false, null, err.message); throw err; }
-      return { settings: next, applied, live: inactive.length === 0, inactive, warnings: exim.warnings(next, layout), hints: layout.hints || [], lastApply: lastApply('exim') };
+      return { applied, live: inactive.length === 0, inactive };
+    },
+    async update(input, req) {
+      const next = { ...getConf('exim'), ...input };
+      if (input.tls !== undefined) next.tls = tlsPolicyFrom(input.tls);
+      if (next.rblEnabled && !next.rbls.length) throw unprocessable('Add at least one RBL or disable RBL checks', { rbls: ['Required when RBL checks are enabled'] });
+      if (next.ratelimitEnabled && next.ratelimitRcptThreshold < next.ratelimitMailThreshold) throw unprocessable('The recipient threshold should be at least the message threshold', { ratelimitRcptThreshold: ['Lower than the message threshold'] });
+      setConf('exim', next);
+      audit(req, { action: 'exim.config.update', args: input });
+      const layout = await exim.layout();
+      exim.requireInstalled(layout);
+      const result = await exim.apply(next, layout, req);
+      return { settings: next, ...result, warnings: exim.warnings(next, layout), hints: layout.hints || [], lastApply: lastApply('exim') };
+    },
+    // Email's hook: before it writes acl-email-filters.conf it makes sure the
+    // chain file (which ends with an include of that file) and the macro that
+    // hooks the chain into acl_check_rcpt exist, rendering the saved or default
+    // policy when Exim Configuration Manager was never saved. Throws
+    // CapabilityError without Exim so the caller falls back to its own macro.
+    async ensureEximAclChain(req = null) {
+      await capabilities.ensureFresh();
+      const layout = await exim.layout();
+      if (!capabilities.has('exim') || layout.installed === false) throw new CapabilityError('exim', 'Exim is not installed on this server');
+      const rcpt = layout.slots?.acl_rcpt;
+      const main = layout.slots?.main;
+      const complete = Boolean(rcpt?.exists && rcpt.includesEmailFilters !== false && main?.exists && lastApply('exim'));
+      if (complete) return { created: false, path: rcpt.path, emailAclFile: layout.emailAclFile, hooked: rcpt.hooked ?? null, claimedBy: rcpt.claimedBy ?? null };
+      const { applied, live } = await exim.apply(getConf('exim'), layout, req);
+      audit(req, { action: 'exim.acl_chain.ensure', target: applied.acl_rcpt.path, args: { live } });
+      return { created: true, path: applied.acl_rcpt.path, emailAclFile: layout.emailAclFile, hooked: applied.acl_rcpt.hooked ?? null, claimedBy: applied.acl_rcpt.claimedBy ?? null, live };
+    },
+    // SSL/TLS Configuration hands its preset over; the TLS options are rendered
+    // into the main slot with everything else and validated the same way.
+    async applyEximTls(preset, req) {
+      const tls = tlsPolicyFrom(preset);
+      const r = await exim.update({ tls }, req);
+      return { path: r.applied.main.path, validated: Boolean(r.applied.main.validated), live: r.live, inactive: r.inactive, library: eximTlsLibrary(await exim.layout()), tls, reload: { reloaded: Boolean(r.applied.main.reloaded), unit: r.applied.main.unit ?? null }, hints: r.hints };
     },
   };
 
@@ -712,7 +861,7 @@ export function createServiceConfigService(ctx) {
       await capabilities.ensureFresh();
       const d = await op('web.dovecot.detect').catch((err) => ({ installed: false, error: err.message }));
       const s = getConf('mailserver');
-      return { installed: capabilities.has('dovecot') && d.installed !== false, detect: d, settings: s, preview: renderDovecot(s), lastApply: lastApply('dovecot') };
+      return { installed: capabilities.has('dovecot') && d.installed !== false, detect: d, settings: s, preview: renderDovecot(s, { version: d.version }), cipherSuitesSupported: dovecotSupportsCipherSuites(d.version), lastApply: lastApply('dovecot') };
     },
     async update(input, req) {
       const next = { ...getConf('mailserver'), ...input };
@@ -722,10 +871,19 @@ export function createServiceConfigService(ctx) {
       audit(req, { action: 'mailserver.config.update', args: input });
       if (!capabilities.has('dovecot')) { recordApply('dovecot', false, null, 'Dovecot is not installed'); throw new CapabilityError('dovecot', 'Dovecot is not installed on this server. The settings were saved and are written to Dovecot once it is installed.'); }
       try {
-        const r = await op('web.dovecot.include.write', { content: renderDovecot(next), reload: true }, req);
+        const d = await op('web.dovecot.detect').catch(() => ({ version: null }));
+        const r = await op('web.dovecot.include.write', { content: renderDovecot(next, { version: d.version }), reload: true }, req);
         recordApply('dovecot', true, { path: r.path, validated: r.validated, reloaded: r.reloaded });
         return { settings: next, applied: r, lastApply: lastApply('dovecot') };
       } catch (err) { recordApply('dovecot', false, null, err.message); throw err; }
+    },
+    // SSL/TLS Configuration's preset for Dovecot: this file owns ssl_min_protocol,
+    // ssl_cipher_list, ssl_cipher_suites and ssl_prefer_server_ciphers, so the
+    // preset is stored here and re-rendered with the rest of the settings.
+    async applyMailserverTls(preset, req) {
+      const tls = tlsPolicyFrom(preset);
+      const r = await mailserver.update({ sslMinProtocol: tls.minProtocol, sslCipherList: tls.cipherList, sslCipherSuites: tls.cipherSuites, sslPreferServerCiphers: tls.preferServerCiphers }, req);
+      return { path: r.applied.path, validated: Boolean(r.applied.validated), tls, reload: { reloaded: Boolean(r.applied.reloaded), unit: r.applied.unit ?? null } };
     },
   };
 
@@ -795,6 +953,7 @@ export function createServiceConfigService(ctx) {
       audit(req, { action: 'ftp.config.update', args: input });
       const d = capabilities.has('ftp') ? await op('web.service.detect', { role: 'ftp' }).catch(() => ({ candidates: [], current: null })) : { candidates: [], current: null };
       const target = d.candidates.find((c) => c.name === (d.current || ftp.selected()) && c.installed);
+      if (!target && !d.current && ftp.selected() === 'disabled' && d.candidates.some((c) => c.installed)) { recordApply('ftp', false, null, 'FTP is disabled'); throw unprocessable('FTP is disabled under FTP Server Selection; the settings were saved and are applied once a daemon is selected there.', { server: ['Select an FTP daemon first'] }); }
       if (!target) { recordApply('ftp', false, null, 'No FTP daemon is installed'); throw new CapabilityError('ftp', 'No FTP daemon is installed on this server. Choose one under FTP Server Selection; the settings were saved and are applied when it is installed.'); }
       try {
         const r = await op('web.ftp.config.write', { server: target.name, settings: ftp.args(next), restart: true }, req);
@@ -860,8 +1019,12 @@ export function createServiceConfigService(ctx) {
     async reset(service, { days = 365 } = {}, req) {
       if (!SSL_SERVICES.includes(service)) throw badRequest(`Unknown service "${service}"`);
       capabilities.require('ssl', 'openssl is not installed on this server; install the openssl package');
-      const host = hostname();
-      const sans = [...new Set([host, `mail.${host.split('.').slice(-2).join('.')}`, `www.${host}`].filter((n) => /^[a-z0-9.-]+$/i.test(n)))];
+      // The agent's certificate names are lowercase-only; the mail SAN is the
+      // hostname's parent domain (panel.example.com -> mail.example.com), never
+      // the last two labels (which would give mail.co.uk).
+      const host = hostname().toLowerCase();
+      const labels = host.split('.');
+      const sans = [...new Set([host, `www.${host}`, ...(labels.length >= 3 ? [`mail.${labels.slice(1).join('.')}`] : [])].filter((n) => /^[a-z0-9.-]+$/.test(n)))];
       const generated = await op('ssl.selfsigned.generate', { key: { type: 'rsa', bits: 2048 }, subject: { CN: host, O: 'WHM panel' }, sans, days }, req);
       const result = await certs.install(service, { certPem: generated.certPem, keyPem: generated.keyPem }, req);
       audit(req, { action: 'service_ssl.reset_self_signed', target: service, args: { days, host } });
@@ -891,5 +1054,6 @@ export function createServiceConfigService(ctx) {
     ensureVhost, syncAccount: ensureVhost, removeAccount, applySsl, removeSsl, setRedirects, addAlias, removeAlias, setAccountIpv6, replaceIp, setPhpVersion, writePhpPool, setListenPorts,
     reload: (req) => apache.reload(req), restart: (req) => apache.restart(req), configtest: () => op('web.configtest'),
     vhostFor: (domain) => shapeVhost(stmts.vhostByDomain.get(domain)) ?? null, syncAllJob,
+    ensureEximAclChain: (req) => exim.ensureEximAclChain(req), applyEximTls: (preset, req) => exim.applyEximTls(preset, req), applyMailserverTls: (preset, req) => mailserver.applyMailserverTls(preset, req),
   };
 }

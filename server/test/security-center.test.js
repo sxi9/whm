@@ -1,8 +1,9 @@
 import nodeCrypto from 'node:crypto';
+import Database from 'better-sqlite3';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { passwordStrength, ipInCidr, verifyIdToken, checkDiscoveryDocument } from '../src/services/security-center.js';
+import { passwordStrength, ipInCidr, verifyIdToken, checkDiscoveryDocument, normalizeIpOrCidr, isPublicAddress, fetchJson } from '../src/services/security-center.js';
 
 const BIN_FULL = { sshd: true, 'ssh-keygen': true, iptables: true, nft: true, apache2ctl: true, 'apt-get': true };
 const MODSEC_DETECT = () => ({ installed: true, flavor: 'debian', baseDir: '/etc/modsecurity', mainConf: '/etc/modsecurity/modsecurity.conf', configConf: '/etc/apache2/conf-enabled/zz-whm-modsec-10-config.conf', vendorsDir: '/etc/modsecurity/whm-vendors', errorLog: '/var/log/apache2/error.log', apache: { flavor: 'debian' }, moduleLoaded: true });
@@ -149,11 +150,67 @@ describe('host access control', () => {
   });
 
   it('rejects injection-shaped sources and services', async () => {
-    for (const bad of [{ service: 'sshd; rm', source: 'ALL', action: 'allow' }, { service: 'sshd', source: '1.2.3.4 ALL', action: 'deny' }, { service: 'sshd', source: 'ALL', action: 'drop' }]) {
+    for (const bad of [{ service: 'sshd; rm', source: 'ALL', action: 'allow' }, { service: 'sshd', source: '1.2.3.4 ALL', action: 'deny' }, { service: 'sshd', source: 'ALL', action: 'drop' }, { service: 'sshd', source: 'host:name', action: 'allow' }, { service: 'sshd', source: '2001:db8::/129', action: 'allow' }]) {
       const res = await put('/api/security/host-access', { rules: [bad] });
-      expect(res.status).toBe(422);
+      expect(res.status, JSON.stringify(bad)).toBe(422);
       expect(res.body.error.code).toBe('validation_failed');
     }
+  });
+
+  it('accepts IPv6 sources (bracketed or not) and hands them to the agent renderer', async () => {
+    const rules = [{ service: 'sshd', source: '2001:db8::/32', action: 'allow' }, { service: 'sshd', source: '[2001:db8:1::5]', action: 'deny' }];
+    const res = await put('/api/security/host-access', { rules });
+    expect(res.status).toBe(200);
+    expect(app.agent.callsTo('sec.hosts_allow.write').at(-1).args.rules.map((r) => r.source)).toEqual(['2001:db8::/32', '[2001:db8:1::5]']);
+  });
+
+  it('keeps the stored rule set when the agent refuses to write the file', async () => {
+    const before = (await get('/api/security/host-access')).body.data.rules;
+    expect(before.length).toBeGreaterThan(0);
+    app.agent.fail('sec.hosts_allow.write', 'config_invalid', 'write refused');
+    try {
+      const res = await put('/api/security/host-access', { rules: [{ service: 'ALL', source: 'ALL', action: 'deny' }] });
+      expect(res.status).toBe(422);
+      expect(res.body.error.message).toMatch(/write refused/);
+      expect((await get('/api/security/host-access')).body.data.rules).toEqual(before);
+    } finally {
+      app.agent.set('sec.hosts_allow.write', ({ rules: r }) => ({ rules: r.length, files: ['/etc/hosts.allow', '/etc/hosts.deny'] }));
+    }
+  });
+
+  it('reports a hosts.deny the panel left alone', async () => {
+    app.agent.set('sec.hosts_allow.write', ({ rules: r }) => ({ rules: r.length, files: ['/etc/hosts.allow'], denyUntouched: true }));
+    app.agent.set('sec.hosts_allow.read', () => ({ allow: '# none', deny: 'ALL: PARANOID\n', denyManaged: false, supported: true }));
+    try {
+      const res = await put('/api/security/host-access', { rules: [{ service: 'sshd', source: 'ALL', action: 'allow' }] });
+      expect(res.body.data.written.denyUntouched).toBe(true);
+      expect((await get('/api/security/host-access')).body.data.files.denyManaged).toBe(false);
+    } finally {
+      app.agent.set('sec.hosts_allow.write', ({ rules: r }) => ({ rules: r.length, files: ['/etc/hosts.allow', '/etc/hosts.deny'] }));
+      app.agent.set('sec.hosts_allow.read', () => ({ allow: '# none', deny: '', denyManaged: true, supported: true }));
+    }
+  });
+});
+
+describe('upgrade from a database that applied the original migration 002', () => {
+  it('adds firewall_entries and the SMTP setting through 002b so the service boots', async () => {
+    const first = await createTestApp({ agent: createMockAgent() });
+    const { dir } = first;
+    first.ctx.jobs.stop(); first.ctx.scheduler.stop(); first.ctx.sessionStore.close(); first.ctx.db.close();
+    // What an install migrated before firewall_entries existed looks like: the
+    // table and setting are missing, but 002 is recorded and will never re-run.
+    const raw = new Database(`${dir}/whm.db`);
+    raw.exec('DROP TABLE firewall_entries');
+    raw.prepare("DELETE FROM schema_migrations WHERE name LIKE '002b%'").run();
+    raw.prepare("DELETE FROM settings WHERE key = 'security.smtp_restrictions.enabled'").run();
+    expect(raw.prepare("SELECT name FROM schema_migrations WHERE name = '002_security-center.sql'").get()).toBeTruthy();
+    raw.close();
+    const again = await createTestApp({ agent: createMockAgent(), overrides: { dataDir: dir, dbPath: `${dir}/whm.db` } });
+    try {
+      expect(again.ctx.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'firewall_entries'").get()).toBeTruthy();
+      expect(again.ctx.settings.get('security.smtp_restrictions.enabled')).toBe(false);
+      expect(again.ctx.security.firewall.recorded()).toEqual([]);
+    } finally { await again.close(); }
   });
 });
 
@@ -171,6 +228,26 @@ describe('SSH password authorization + root keys', () => {
     expect(res.body.data).toMatchObject({ reloaded: true, shadowed: [], settings: { PasswordAuthentication: 'no', PermitRootLogin: 'prohibit-password', MaxAuthTries: 4 } });
     expect((await put('/api/security/ssh/config', { settings: { PasswordAuthentication: 'maybe' } })).status).toBe(422);
     expect((await put('/api/security/ssh/config', { settings: { Banner: '/etc/issue' } })).status).toBe(422);
+  });
+
+  it('refuses to disable passwords with no authorized root key unless forced', async () => {
+    app.agent.set('sec.ssh_keys.list', () => ({ dir: '/root/.ssh', keys: [], authorized: [], keygenAvailable: true }));
+    app.agent.calls.length = 0;
+    try {
+      const refused = await put('/api/security/ssh/config', { settings: { PasswordAuthentication: 'no' } });
+      expect(refused.status).toBe(422);
+      expect(refused.body.error.message).toMatch(/lock root out/);
+      expect(refused.body.error.fields).toHaveProperty('force');
+      expect(app.agent.callsTo('sec.sshd.set')).toHaveLength(0);
+      // Other settings and re-enabling passwords never need the flag.
+      expect((await put('/api/security/ssh/config', { settings: { PasswordAuthentication: 'yes', MaxAuthTries: 3 } })).status).toBe(200);
+      const forced = await put('/api/security/ssh/config', { settings: { PasswordAuthentication: 'no' }, force: true });
+      expect(forced.status).toBe(200);
+      expect(app.agent.callsTo('sec.sshd.set').at(-1).args).toEqual({ settings: { PasswordAuthentication: 'no' } });
+      expect((await put('/api/security/ssh/config', { settings: { PasswordAuthentication: 'no' }, force: 'yes' })).status).toBe(422);
+    } finally {
+      app.agent.set('sec.ssh_keys.list', () => ({ dir: '/root/.ssh', keys: [{ name: 'id_ed25519', type: 'ssh-ed25519', fingerprint: 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', authorized: true, hasPrivateKey: true }], authorized: [{ type: 'ssh-ed25519', fingerprint: 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', comment: 'root@host' }], keygenAvailable: true }));
+    }
   });
 
   it('lists, imports, generates, authorizes, exports and deletes keys', async () => {
@@ -244,7 +321,10 @@ describe('cPHulk', () => {
     expect(app.agent.callsTo('sec.firewall.block').at(-1).args).toEqual({ ip: '198.51.100.7' });
     expect(app.ctx.security.cphulk.isBlocked('198.51.100.7')).toBe(true);
     expect((await post('/api/security/cphulk/blocks', { ip: '198.51.100.7' })).status).toBe(409);
-    expect((await post('/api/security/cphulk/blocks', { ip: 'not-an-ip' })).status).toBe(422);
+    for (const ip of ['not-an-ip', 'deadbeef', 'abc', '1.2.3', '198.51.100.7/33', '2001:db8::/129']) {
+      expect((await post('/api/security/cphulk/blocks', { ip })).status, ip).toBe(422);
+      expect((await post('/api/security/cphulk/lists', { kind: 'deny', ip })).status, ip).toBe(422);
+    }
     const list = await get('/api/security/cphulk/blocks');
     expect(list.body.data.map((b) => b.ip)).toContain('198.51.100.7');
     const unblocked = await del(`/api/security/cphulk/blocks/${blocked.body.data.id}`);
@@ -375,6 +455,29 @@ describe('firewall chain', () => {
     expect((await mutate(reseller, 'post', '/api/security/firewall/block', { ip: '203.0.113.44' }, resellerCsrf)).status).toBe(403);
   });
 
+  it('stores addresses in the same canonical form the live chain reports', async () => {
+    // iptables -S prints 203.0.113.9 (the /32 is dropped by the parser) and
+    // compressed lower-case IPv6; the record must match or the entry is
+    // re-blocked every hour and shown as inactive.
+    const res = await post('/api/security/firewall/block', { ip: '203.0.113.9/32' });
+    expect(res.status).toBe(200);
+    expect(res.body.data.ip).toBe('203.0.113.9');
+    expect(app.agent.callsTo('sec.firewall.block').at(-1).args).toEqual({ ip: '203.0.113.9' });
+    expect((await get('/api/security/firewall')).body.data.entries.find((e) => e.ip === '203.0.113.9')).toMatchObject({ active: true, persistent: true, sources: ['manual'] });
+    app.agent.calls.length = 0;
+    const m = await post('/api/security/firewall/reconcile');
+    expect(m.status).toBe(200);
+    // Already present in the (mock) chain as 203.0.113.9: never re-blocked, never counted as untracked.
+    expect(app.agent.callsTo('sec.firewall.block').map((c) => c.args.ip)).not.toContain('203.0.113.9');
+    expect(m.body.data.firewall.untracked).toBe(0);
+    const v6 = await post('/api/security/firewall/block', { ip: '2001:DB8:0:0:0:0:0:7/128' });
+    expect(v6.body.data.ip).toBe('2001:db8::7');
+    expect(app.ctx.db.prepare("SELECT ip FROM firewall_entries WHERE ip IN ('203.0.113.9', '2001:db8::7') ORDER BY ip").all().map((r) => r.ip)).toEqual(['2001:db8::7', '203.0.113.9']);
+    expect((await post('/api/security/firewall/unblock', { ip: '203.0.113.9' })).status).toBe(200);
+    expect((await post('/api/security/firewall/unblock', { ip: '2001:db8:0::7' })).status).toBe(200);
+    expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM firewall_entries WHERE ip IN ('203.0.113.9', '2001:db8::7')").get().n).toBe(0);
+  });
+
   it('keeps manual blocks across the hourly sync and restores them when the chain lost them', async () => {
     await put('/api/security/cphulk/settings', { firewallSync: true });
     app.agent.calls.length = 0;
@@ -466,6 +569,19 @@ describe('SMTP restrictions, mod_userdir, wheel group', () => {
     expect((await put('/api/security/userdir', { enabled: true, excludeUsers: ['Bad User'] })).status).toBe(422);
   });
 
+  it('normalises the Basic Setup home root before handing it to the agent', async () => {
+    await put('/api/system/settings', { 'basic.home_root': '/home/' });
+    try {
+      const res = await put('/api/security/userdir', { enabled: true, excludeUsers: [] });
+      expect(res.status).toBe(200);
+      expect(app.agent.callsTo('sec.userdir.set').at(-1).args.homeRoot).toBe('/home');
+      app.ctx.settings.set('basic.home_root', '/home dir');
+      const bad = await put('/api/security/userdir', { enabled: true, excludeUsers: [] });
+      expect(bad.status).toBe(422);
+      expect(bad.body.error.message).toMatch(/Basic Setup/);
+    } finally { app.ctx.settings.set('basic.home_root', '/home'); }
+  });
+
   it('falls back to systemd when no web category is attached', async () => {
     const prev = app.ctx.web;
     app.ctx.web = undefined;
@@ -535,6 +651,19 @@ describe('ModSecurity', () => {
     expect(hits.body.data.hits[0]).toMatchObject({ id: 941100, client: '203.0.113.5' });
   });
 
+  it('does not record a disabled rule when Apache rejects the include', async () => {
+    app.agent.fail('sec.modsec.set_disabled', 'config_invalid', 'Apache rejected the new configuration');
+    try {
+      const res = await put('/api/security/modsec/rules/941100', { disabled: true, reason: 'test' });
+      expect(res.status).toBe(422);
+      expect(app.agent.callsTo('sec.modsec.set_disabled').at(-1).args).toEqual({ ids: [941100] });
+      expect((await get('/api/security/modsec/rules/disabled')).body.data).toEqual([]);
+      expect((await get('/api/security/modsec/rules?disabled=true')).body.data).toEqual([]);
+    } finally {
+      app.agent.set('sec.modsec.set_disabled', ({ ids }) => ({ path: '/etc/apache2/conf-enabled/zz-whm-modsec-90-disabled.conf', ids, unit: 'apache2' }));
+    }
+  });
+
   it('installs a vendor as a job, lists, toggles and removes it', async () => {
     app.ctx.jobs.start();
     expect((await get('/api/security/modsec/vendors')).body.data).toEqual([]);
@@ -556,6 +685,24 @@ describe('ModSecurity', () => {
     expect(toggled.body.data.applied.loaded).toEqual([]);
     expect((await get('/api/security/modsec/vendors')).body.data[0].enabled).toBe(false);
     expect((await post('/api/security/modsec/vendors/owasp/update')).status).toBe(202);
+
+    // A toggle or removal that Apache rejects leaves the stored vendor as it was.
+    app.agent.fail('sec.modsec.vendors.apply', 'config_invalid', 'duplicate rule id');
+    try {
+      const failedToggle = await mutate(app.http, 'patch', '/api/security/modsec/vendors/owasp', { enabled: true }, csrf);
+      expect(failedToggle.status).toBe(422);
+      expect(app.agent.callsTo('sec.modsec.vendors.apply').at(-1).args).toEqual({ vendors: [{ name: 'owasp', enabled: true }] });
+      expect((await get('/api/security/modsec/vendors')).body.data[0].enabled).toBe(false);
+      app.agent.calls.length = 0;
+      const failedRemove = await del('/api/security/modsec/vendors/owasp');
+      expect(failedRemove.status).toBe(422);
+      expect(app.agent.callsTo('sec.modsec.vendors.apply').at(-1).args).toEqual({ vendors: [] });
+      expect(app.agent.callsTo('sec.modsec.vendor.remove')).toHaveLength(0);
+      expect((await get('/api/security/modsec/vendors')).body.data).toHaveLength(1);
+    } finally {
+      app.agent.set('sec.modsec.vendors.apply', ({ vendors: v }) => ({ path: '/etc/apache2/conf-enabled/zz-whm-modsec-20-vendors.conf', loaded: v.filter((x) => x.enabled).map((x) => x.name), unit: 'apache2' }));
+    }
+
     expect((await del('/api/security/modsec/vendors/owasp')).body.data.removed).toBe(true);
     expect(app.agent.callsTo('sec.modsec.vendor.remove').at(-1).args).toEqual({ name: 'owasp' });
     expect((await del('/api/security/modsec/vendors/owasp')).status).toBe(404);
@@ -685,8 +832,8 @@ describe('external authentications', () => {
     globalThis.fetch = async (url, init = {}) => {
       seen.push({ url: String(url), init });
       const body = responses[String(url)];
-      if (!body) return { ok: false, status: 404, json: async () => ({}) };
-      return { ok: true, status: 200, json: async () => body };
+      if (!body) return new Response('{}', { status: 404 });
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
     };
     try {
       responses[`${ISSUER}/.well-known/openid-configuration`] = doc;
@@ -707,6 +854,8 @@ describe('external authentications', () => {
       const tokenCall = seen.find((c) => c.url === 'https://oauth2.example.net/token');
       expect(tokenCall.init.headers.Authorization).toBe(`Basic ${Buffer.from('whm:top-secret-value').toString('base64')}`);
       expect(String(tokenCall.init.body)).toContain('grant_type=authorization_code');
+      // Provider URLs are never followed through redirects.
+      expect(seen.every((c) => c.init.redirect === 'manual')).toBe(true);
       await expect(ex.exchangeCode('oidc', { code: 'c0de', redirectUri: 'https://panel/cb', nonce: 'other' })).rejects.toThrow(/nonce/);
       responses['https://oauth2.example.net/token'] = { id_token: sign({ ...baseClaims, aud: 'someone-else' }), access_token: 'at', token_type: 'Bearer' };
       await expect(ex.exchangeCode('oidc', { code: 'c0de', redirectUri: 'https://panel/cb', nonce: 'n1' })).rejects.toThrow(/audience/);
@@ -719,6 +868,37 @@ describe('external authentications', () => {
       globalThis.fetch = realFetch;
       await del('/api/security/external-auth/oidc');
     }
+  });
+
+  it('fetches provider documents without following redirects, off non-public hosts or past the size cap', async () => {
+    const realFetch = globalThis.fetch;
+    let next = () => new Response('{"ok":true}', { status: 200 });
+    globalThis.fetch = async () => next();
+    const publicLookup = async () => [{ address: '203.0.113.10', family: 4 }];
+    try {
+      expect(await fetchJson('https://idp.example.com/x', { lookup: publicLookup })).toEqual({ ok: true });
+      await expect(fetchJson('http://idp.example.com/x', { lookup: publicLookup })).rejects.toThrow(/https/);
+      await expect(fetchJson('https://idp.example.com/x', { lookup: async () => [{ address: '10.0.0.5', family: 4 }] })).rejects.toThrow(/non-public address \(10\.0\.0\.5\)/);
+      await expect(fetchJson('https://idp.example.com/x', { lookup: async () => [{ address: '203.0.113.10', family: 4 }, { address: 'fd00::1', family: 6 }] })).rejects.toThrow(/non-public/);
+      await expect(fetchJson('https://127.0.0.1/x')).rejects.toThrow(/non-public/);
+      await expect(fetchJson('https://[::1]/x')).rejects.toThrow(/non-public/);
+      await expect(fetchJson('https://169.254.169.254/latest/meta-data')).rejects.toThrow(/non-public/);
+      // An unresolvable host is left to fetch itself to report.
+      next = () => new Response('{}', { status: 404 });
+      await expect(fetchJson('https://idp.example.com/x', { lookup: async () => { throw Object.assign(new Error('nx'), { code: 'ENOTFOUND' }); } })).rejects.toThrow(/HTTP 404/);
+      next = () => new Response(null, { status: 302, headers: { Location: 'https://internal.example/.well-known/openid-configuration' } });
+      await expect(fetchJson('https://idp.example.com/x', { lookup: publicLookup })).rejects.toThrow(/redirect .*was not followed/);
+      next = () => new Response(`{"pad":"${'x'.repeat(2048)}"}`, { status: 200 });
+      await expect(fetchJson('https://idp.example.com/x', { lookup: publicLookup, maxBytes: 1024 })).rejects.toThrow(/exceeds 1024 bytes/);
+      next = () => new Response('not json', { status: 200 });
+      await expect(fetchJson('https://idp.example.com/x', { lookup: publicLookup })).rejects.toThrow(/not valid JSON/);
+    } finally { globalThis.fetch = realFetch; }
+  });
+
+  it('classifies public and non-public addresses', () => {
+    for (const a of ['203.0.113.10', '8.8.8.8', '2001:db8::1', '2606:4700::1111']) expect(isPublicAddress(a), a).toBe(true);
+    for (const a of ['10.1.2.3', '172.16.0.1', '172.31.255.254', '192.168.1.1', '127.0.0.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '::1', '::', 'fe80::1', 'fc00::1', 'fd12::1', '::ffff:10.0.0.1', 'not-an-ip']) expect(isPublicAddress(a), a).toBe(false);
+    expect(isPublicAddress('172.32.0.1')).toBe(true);
   });
 });
 
@@ -736,7 +916,8 @@ describe('security advisor', () => {
     expect(findings.find((f) => f.id === 'fs.world_writable')).toMatchObject({ grade: 'warning' });
     expect(findings.find((f) => f.id === 'firewall.present').grade).toBe('ok');
     expect(findings.find((f) => f.id === 'modsec.engine')).toMatchObject({ grade: 'warning', title: 'ModSecurity rule engine is DetectionOnly' });
-    expect(findings.find((f) => f.id === 'pkg.updates').grade).toBe('info');
+    // apt-get is "installed" and the mock pkg.upgradable answers {} → nothing pending.
+    expect(findings.find((f) => f.id === 'pkg.updates')).toMatchObject({ grade: 'ok', title: 'All distribution packages are up to date' });
     expect(findings.find((f) => f.id === 'smtp.restricted')).toMatchObject({ grade: 'warning' });
     expect(findings.find((f) => f.id === 'policy.unenforced')).toBeUndefined();
     await put('/api/system/settings', { 'security.policy.verified_ip_login': true, 'security.2fa.required_for_root': true });
@@ -750,16 +931,33 @@ describe('security advisor', () => {
     expect(last.body.data.trigger).toBe('manual');
   });
 
-  it('degrades on a bare host and uses ctx.pkg when a package service exists', async () => {
-    await provision(false);
-    app.ctx.pkg = { outdated: async () => [{ name: 'openssl' }, { name: 'bash' }] };
+  it('reads pending updates through the Software category and links to System Update', async () => {
+    await provision(true);
+    expect(typeof app.ctx.software?.update?.status).toBe('function');
+    app.agent.set('pkg.upgradable', () => ({ manager: 'apt', count: 2, security: 0, packages: [{ name: 'openssl' }, { name: 'bash' }], rebootRequired: false }));
     try {
-      const res = await post('/api/security/advisor/scan');
-      const byId = Object.fromEntries(res.body.data.findings.map((f) => [f.id, f]));
-      expect(byId['ssh.installed'].grade).toBe('info');
-      expect(byId['firewall.present'].grade).toBe('critical');
-      expect(byId['pkg.updates']).toMatchObject({ grade: 'warning', title: '2 package updates available' });
-    } finally { delete app.ctx.pkg; }
+      let byId = Object.fromEntries((await post('/api/security/advisor/scan')).body.data.findings.map((f) => [f.id, f]));
+      expect(byId['pkg.updates']).toMatchObject({ grade: 'warning', title: '2 package updates available', fix: { label: 'System Update', path: '/software/system-update' } });
+      app.agent.set('pkg.upgradable', () => ({ manager: 'apt', count: 3, security: 1, packages: [], rebootRequired: false }));
+      byId = Object.fromEntries((await post('/api/security/advisor/scan')).body.data.findings.map((f) => [f.id, f]));
+      expect(byId['pkg.updates']).toMatchObject({ grade: 'critical', title: '3 package updates available (1 security)' });
+    } finally { app.agent.reset('pkg.upgradable'); }
+  });
+
+  it('degrades on a bare host (no package manager) and when the Software category is absent', async () => {
+    await provision(false);
+    const res = await post('/api/security/advisor/scan');
+    const byId = Object.fromEntries(res.body.data.findings.map((f) => [f.id, f]));
+    expect(byId['ssh.installed'].grade).toBe('info');
+    expect(byId['firewall.present'].grade).toBe('critical');
+    expect(byId['pkg.updates']).toMatchObject({ grade: 'info', title: 'Package update check unavailable' });
+    expect(byId['pkg.updates'].detail).toMatch(/package manager/);
+    const software = app.ctx.software;
+    app.ctx.software = undefined;
+    try {
+      const without = Object.fromEntries((await post('/api/security/advisor/scan')).body.data.findings.map((f) => [f.id, f]));
+      expect(without['pkg.updates']).toMatchObject({ grade: 'info', detail: 'The Software category is not loaded on this panel.' });
+    } finally { app.ctx.software = software; }
   });
 });
 
@@ -771,5 +969,21 @@ describe('helpers', () => {
     expect(ipInCidr('2001:db8::1', '2001:db8::/32')).toBe(true);
     expect(ipInCidr('2001:db9::1', '2001:db8::/32')).toBe(false);
     expect(ipInCidr('10.1.2.3', '2001:db8::/32')).toBe(false);
+  });
+
+  it('normalizeIpOrCidr canonicalises addresses and networks', () => {
+    expect(normalizeIpOrCidr('203.0.113.44/32')).toBe('203.0.113.44');
+    expect(normalizeIpOrCidr('203.0.113.44')).toBe('203.0.113.44');
+    expect(normalizeIpOrCidr('10.1.2.3/8')).toBe('10.0.0.0/8');
+    expect(normalizeIpOrCidr('192.0.2.77/24')).toBe('192.0.2.0/24');
+    expect(normalizeIpOrCidr('0.0.0.0/0')).toBe('0.0.0.0/0');
+    expect(normalizeIpOrCidr('2001:DB8:0:0:0:0:0:1')).toBe('2001:db8::1');
+    expect(normalizeIpOrCidr('2001:db8::1/128')).toBe('2001:db8::1');
+    expect(normalizeIpOrCidr('2001:db8:abcd::ff/32')).toBe('2001:db8::/32');
+    expect(normalizeIpOrCidr('::1')).toBe('::1');
+    expect(normalizeIpOrCidr('::')).toBe('::');
+    expect(normalizeIpOrCidr('1:0:0:2:0:0:0:3')).toBe('1:0:0:2::3');
+    expect(normalizeIpOrCidr('::ffff:192.0.2.1')).toBe('::ffff:c000:201');
+    for (const bad of ['', 'abc', 'deadbeef', '1.2.3', '1.2.3.4/33', '::1/129', '1.2.3.4/8/8', '1.2.3.4/x', 'example.com', '1.2.3.4 -j ACCEPT', null]) expect(normalizeIpOrCidr(bad), String(bad)).toBeNull();
   });
 });

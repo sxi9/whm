@@ -25,12 +25,15 @@ const SERVICE_UNITS = { exim: ['exim4', 'exim'], dovecot: ['dovecot'], apache: [
 
 const PEM_BODY = '[A-Za-z0-9+/=\\r\\n ]+';
 const pemBlock = (label) => new RegExp(`^\\s*-----BEGIN ${label}-----\\r?\\n${PEM_BODY}-----END ${label}-----\\s*$`);
-const KEY_LABEL = '(?:RSA |EC |ENCRYPTED )?PRIVATE KEY';
+// Passphrase-protected keys are refused up front: openssl would prompt on the
+// terminal (or fail opaquely without one), so the caller is told to decrypt first.
+const KEY_LABEL = '(?:RSA |EC )?PRIVATE KEY';
 const CERT_LABEL = 'CERTIFICATE';
 const CSR_LABEL = '(?:NEW )?CERTIFICATE REQUEST';
+export const KEY_PEM_MESSAGE = 'Must be one unencrypted PEM private key (decrypt a passphrase-protected key first: openssl pkey -in key.pem -out plain.pem)';
 
 export const pem = {
-  key: z.string().max(64 * 1024).regex(pemBlock(KEY_LABEL), 'Must be one PEM private key'),
+  key: z.string().max(64 * 1024).regex(pemBlock(KEY_LABEL), KEY_PEM_MESSAGE),
   cert: z.string().max(64 * 1024).regex(pemBlock(CERT_LABEL), 'Must be one PEM certificate'),
   csr: z.string().max(64 * 1024).regex(pemBlock(CSR_LABEL), 'Must be a PEM certificate signing request'),
   // A CA chain: one or more concatenated certificates.
@@ -40,6 +43,11 @@ export const pem = {
 const HOST = '(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
 // Certificate names: a hostname, optionally with a leading wildcard label.
 export const certName = z.string().regex(new RegExp(`^(\\*\\.)?${HOST}$`), 'Must be a hostname such as example.com or *.example.com');
+// Bundle directory names: the same lower-case dotted hostname the API accepts
+// (fields.hostname), so a name that passes the route also passes here.
+export const bundleDomain = z.string().regex(/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/, 'Must be a lower-case hostname such as example.com');
+// Goes into argv after -m / --accountemail, so it may not start with "-".
+const acmeEmail = z.string().email().max(254).regex(/^[^-\s]/, 'May not start with "-"');
 // Subject attribute values go into -subj "/CN=…/O=…"; the separators / \ and
 // leading "-" are refused rather than escaped so no element can be misread.
 const subjectValue = z.string().regex(/^(?![-\s])[A-Za-z0-9 .,'&()@_:-]{1,64}$/, 'Letters, digits, spaces and . , \' & ( ) @ _ : - only');
@@ -308,6 +316,15 @@ export function readEximBlock(text, name) {
   return t.slice(start + begin.length, stop).replace(/^\n/, '');
 }
 
+export function stripEximBlock(text, name) {
+  const { begin, end } = eximBlockMarkers(name);
+  const t = text || '';
+  const start = t.indexOf(begin);
+  const stop = t.indexOf(end);
+  if (start === -1 || stop === -1 || stop < start) return t;
+  return `${t.slice(0, start)}${t.slice(stop + end.length).replace(/^\n/, '')}`;
+}
+
 // Resolves the first existing group of `names` from /etc/group.
 export function groupId(names, groupFile = '/etc/group') {
   const text = readText(groupFile) || '';
@@ -358,9 +375,40 @@ export async function writeEximFragment(exim, { path: file, block }, content, ct
   return { ...written, block: block || null };
 }
 
+// Dovecot reads conf.d alphabetically and later files win. Service Configuration
+// owns 97-whm-mailserver.conf (ssl=, protocols, ciphers); this category only
+// names the certificate files, from a drop-in that sorts BEFORE it so nothing
+// chosen in Mailserver Configuration is overridden. The 98/99 files are what
+// earlier builds wrote and are removed whenever the drop-in is rewritten.
 export function dovecotLayout() {
   if (!exists('/etc/dovecot')) return null;
-  return { confDir: '/etc/dovecot', dropinDir: '/etc/dovecot/conf.d', sslInclude: '/etc/dovecot/conf.d/99-whm-ssl.conf', tlsInclude: '/etc/dovecot/conf.d/98-whm-tls.conf', units: ['dovecot'] };
+  return { confDir: '/etc/dovecot', dropinDir: '/etc/dovecot/conf.d', sslInclude: '/etc/dovecot/conf.d/90-whm-ssl-cert.conf', legacyIncludes: ['/etc/dovecot/conf.d/98-whm-tls.conf', '/etc/dovecot/conf.d/99-whm-ssl.conf'], units: ['dovecot'] };
+}
+
+export function renderDovecotCertInclude(paths, { hasChain = false } = {}) {
+  const lines = [`${MANAGED} (Manage Service SSL Certificates). Certificate files only: ssl=, protocols and ciphers live in 97-whm-mailserver.conf (Mailserver Configuration).`, `ssl_cert = <${paths.fullchain}`, `ssl_key = <${paths.key}`];
+  if (hasChain) lines.push(`ssl_ca = <${paths.chain}`);
+  return `${lines.join('\n')}\n`;
+}
+
+// Deletes panel-written files only (header check), so an admin's own drop-in
+// that happens to share a name is left alone.
+function removeManagedFiles(files, ctx) {
+  const removed = [];
+  for (const f of files) {
+    const target = ctx.assertAllowedPath(f, 'write');
+    const text = readText(target);
+    if (text == null || !text.startsWith(MANAGED)) continue;
+    fs.unlinkSync(target);
+    removed.push(target);
+  }
+  return removed;
+}
+
+async function validateDovecot() {
+  if (!hasBinary('doveconf')) return null;
+  const { code, stderr, stdout } = await exec('doveconf', ['-n'], { allowFailure: true, timeoutMs: 60_000 });
+  return { ok: code === 0, output: `${stderr}\n${stdout}`.trim() };
 }
 
 export function ftpLayout() {
@@ -485,7 +533,7 @@ defineOp('ssl.cert.verify_chain', {
 
 defineOp('ssl.bundle.install_for_domain', {
   description: `Write cert/key/chain/fullchain for a domain under ${BUNDLE_ROOT}/<domain>/ (key 0600)`,
-  schema: z.object({ domain: arg.domain, certPem: pem.cert, keyPem: pem.key, chainPem: pem.chain.optional() }).strict(),
+  schema: z.object({ domain: bundleDomain, certPem: pem.cert, keyPem: pem.key, chainPem: pem.chain.optional() }).strict(),
   run: async ({ domain, certPem, keyPem, chainPem }, ctx) => {
     const dir = ctx.assertAllowedPath(bundleDir(domain), 'write');
     requireOpenssl();
@@ -497,7 +545,7 @@ defineOp('ssl.bundle.install_for_domain', {
 
 defineOp('ssl.bundle.read_for_domain', {
   description: `Read the bundle files of a domain from ${BUNDLE_ROOT}/<domain>/`,
-  schema: z.object({ domain: arg.domain, includeKey: z.boolean().default(false) }).strict(),
+  schema: z.object({ domain: bundleDomain, includeKey: z.boolean().default(false) }).strict(),
   run: async ({ domain, includeKey }, ctx) => {
     const dir = ctx.assertAllowedPath(bundleDir(domain), 'read');
     const paths = bundlePaths(dir);
@@ -510,7 +558,7 @@ defineOp('ssl.bundle.read_for_domain', {
 defineOp('ssl.bundle.remove_for_domain', {
   description: `Delete ${BUNDLE_ROOT}/<domain>/`,
   destructive: true,
-  schema: z.object({ domain: arg.domain }).strict(),
+  schema: z.object({ domain: bundleDomain }).strict(),
   run: async ({ domain }, ctx) => {
     const dir = ctx.assertAllowedPath(bundleDir(domain), 'write');
     const existed = exists(dir);
@@ -520,9 +568,11 @@ defineOp('ssl.bundle.remove_for_domain', {
 });
 
 defineOp('ssl.bundle.list', {
-  description: `Every domain bundle under ${BUNDLE_ROOT} with its certificate summary`,
-  run: async (_args, ctx) => {
+  description: `Every domain bundle under ${BUNDLE_ROOT}; directories in knownDomains (the panel already has their certificate) are listed without running openssl`,
+  schema: z.object({ knownDomains: z.array(bundleDomain).max(20_000).default([]) }).strict(),
+  run: async ({ knownDomains }, ctx) => {
     ctx.assertAllowedPath(BUNDLE_ROOT, 'read');
+    const known = new Set(knownDomains);
     const out = [];
     let entries = [];
     try { entries = fs.readdirSync(BUNDLE_ROOT, { withFileTypes: true }); } catch { return { root: BUNDLE_ROOT, bundles: [] }; }
@@ -532,8 +582,8 @@ defineOp('ssl.bundle.list', {
       const certPem = readText(paths.cert);
       if (!certPem) continue;
       let certificate = null;
-      try { certificate = hasBinary('openssl') ? await inspectCert(certPem) : null; } catch { certificate = null; }
-      out.push({ domain: e.name, paths, hasKey: exists(paths.key), hasChain: (readText(paths.chain) || '').trim().length > 0, certificate });
+      if (!known.has(e.name)) { try { certificate = hasBinary('openssl') ? await inspectCert(certPem) : null; } catch { certificate = null; } }
+      out.push({ domain: e.name, paths, hasKey: exists(paths.key), hasChain: (readText(paths.chain) || '').trim().length > 0, inspected: !known.has(e.name), certificate });
     }
     return { root: BUNDLE_ROOT, bundles: out.sort((a, b) => a.domain.localeCompare(b.domain)) };
   },
@@ -543,7 +593,7 @@ defineOp('ssl.bundle.list', {
 
 // The file set that wires a service bundle into its daemon. `layouts` lets tests
 // describe a host without touching /etc; production calls detect the real one.
-export function serviceCopies(svc, paths, layouts = {}) {
+export function serviceCopies(svc, paths, layouts = {}, { hasChain = false } = {}) {
   const layout = (key, detect) => (key in layouts ? layouts[key] : detect());
   const copies = [];
   if (svc === 'exim') {
@@ -552,7 +602,7 @@ export function serviceCopies(svc, paths, layouts = {}) {
     if (exim) copies.push({ from: paths.fullchain, to: exim.cert, mode: 0o644 }, { from: paths.key, to: exim.key, mode: 0o640, groups: exim.groups });
   } else if (svc === 'dovecot') {
     const dc = layout('dovecot', dovecotLayout);
-    if (dc) copies.push({ include: dc.sslInclude, content: `${MANAGED} (Manage Service SSL Certificates)\nssl = yes\nssl_cert = <${paths.fullchain}\nssl_key = <${paths.key}\n`, mode: 0o644 });
+    if (dc) copies.push({ remove: dc.legacyIncludes }, { include: dc.sslInclude, content: renderDovecotCertInclude(paths, { hasChain }), mode: 0o644, validate: 'dovecot' });
   } else if (svc === 'apache') {
     const apache = layout('apache', apacheLayout);
     if (apache) copies.push({ apacheInclude: `${apache.includeDir}/zz-whm-service-ssl.conf`, content: `${MANAGED} (Manage Service SSL Certificates). Default certificate for SSL vhosts that set none.\n<IfModule ssl_module>\n  SSLCertificateFile ${paths.fullchain}\n  SSLCertificateKeyFile ${paths.key}\n</IfModule>\n` });
@@ -585,11 +635,13 @@ async function installServiceCert(svc, { certPem, keyPem, chainPem }, ctx) {
   await assertKeyMatches(keyPem, certPem);
   const paths = writeBundle(dir, { certPem, keyPem, chainPem });
   const applied = [];
+  const removed = [];
   const notes = [];
   let validated = null;
-  const copies = serviceCopies(svc, paths);
+  const copies = serviceCopies(svc, paths, {}, { hasChain: Boolean(chainPem) });
   for (const c of copies) {
-    if (c.combine) { ctx.assertAllowedPath(c.combine, 'write'); writeAtomic(c.combine, `${readText(paths.fullchain)}${readText(paths.key)}`, c.mode); applied.push(c.combine); }
+    if (c.remove) { removed.push(...removeManagedFiles(c.remove, ctx)); }
+    else if (c.combine) { ctx.assertAllowedPath(c.combine, 'write'); writeAtomic(c.combine, `${readText(paths.fullchain)}${readText(paths.key)}`, c.mode); applied.push(c.combine); }
     else if (c.to) {
       ctx.assertAllowedPath(c.to, 'write'); fs.mkdirSync(path.dirname(c.to), { recursive: true }); fs.copyFileSync(c.from, c.to); fs.chmodSync(c.to, c.mode);
       if (c.groups) {
@@ -599,7 +651,17 @@ async function installServiceCert(svc, { certPem, keyPem, chainPem }, ctx) {
       }
       applied.push(c.to);
     }
-    else if (c.include) { ctx.assertAllowedPath(c.include, 'write'); writeAtomic(c.include, c.content, c.mode); applied.push(c.include); }
+    else if (c.include) {
+      const file = ctx.assertAllowedPath(c.include, 'write');
+      const previous = readText(file);
+      writeAtomic(file, c.content, c.mode);
+      if (c.validate === 'dovecot') {
+        const check = await validateDovecot();
+        if (check && !check.ok) { restore(file, previous); throw new OpError('config_invalid', `Dovecot rejected the certificate drop-in; the previous file was restored: ${check.output.split('\n').filter(Boolean).pop()}`, { output: check.output }); }
+        validated = check ? true : validated;
+      }
+      applied.push(file);
+    }
     else if (c.apacheInclude) { ctx.assertAllowedPath(c.apacheInclude, 'write'); validated = (await writeApacheInclude(apacheLayout(), c.apacheInclude, c.content)).validated; applied.push(c.apacheInclude); }
     else if (c.vsftpd) { ctx.assertAllowedPath(c.vsftpd, 'write'); applyVsftpd(c.vsftpd, paths); applied.push(c.vsftpd); }
   }
@@ -623,7 +685,7 @@ async function installServiceCert(svc, { certPem, keyPem, chainPem }, ctx) {
     notes.push('Point WHM_TLS_CERT/WHM_TLS_KEY at /etc/whm/tls/cert.pem and key.pem and restart whm-panel.');
   } else if (!copies.length) notes.push(`No ${svc} daemon configuration was found on this server; the bundle was stored under ${dir} only.`);
   const reload = copies.length ? await reloadUnit(SERVICE_UNITS[svc]) : { reloaded: false, unit: null };
-  return { service: svc, paths, applied, validated, reload, certificate: await inspectCert(certPem), note: notes.length ? notes.join(' ') : null };
+  return { service: svc, paths, applied, removed, validated, reload, certificate: await inspectCert(certPem), note: notes.length ? notes.join(' ') : null };
 }
 
 defineOp('ssl.service_cert.install', {
@@ -671,38 +733,16 @@ function requireProvider(provider) {
 const acmeEnv = { HOME: '/root', LE_WORKING_DIR: ACME_SH_HOME };
 const tail = (s, n = 60) => String(s || '').trim().split('\n').slice(-n).join('\n');
 
-export function parseCertbotCertificates(stdout) {
-  const out = [];
-  for (const block of stdout.split(/\n(?=\s*Certificate Name:)/)) {
-    const name = block.match(/Certificate Name:\s*(\S+)/)?.[1];
-    if (!name) continue;
-    out.push({
-      name,
-      domains: (block.match(/Domains:\s*([^\n]+)/)?.[1] || '').trim().split(/\s+/).filter(Boolean),
-      notAfter: parseOpensslDate(block.match(/Expiry Date:\s*([^\n(]+)/)?.[1] || ''),
-      certPath: block.match(/Certificate Path:\s*(\S+)/)?.[1] || null,
-      keyPath: block.match(/Private Key Path:\s*(\S+)/)?.[1] || null,
-      keyType: block.match(/Key Type:\s*(\S+)/)?.[1] || null,
-    });
-  }
-  return out;
-}
-
-export function parseAcmeShList(stdout) {
-  const lines = stdout.trim().split('\n');
-  const header = lines.shift() || '';
-  const cols = header.trim().split(/\s{2,}|\t/).map((c) => c.trim());
-  return lines.filter(Boolean).map((line) => {
-    const cells = line.trim().split(/\s{2,}|\t/);
-    const row = Object.fromEntries(cols.map((c, i) => [c, cells[i] ?? '']));
-    return { name: row.Main_Domain || cells[0], domains: [row.Main_Domain, ...(row.SAN_Domains && row.SAN_Domains !== 'no' ? row.SAN_Domains.split(',') : [])].filter(Boolean), keyLength: row.KeyLength || null, ca: row.CA || null, notAfter: parseOpensslDate(row.Renew || '') };
-  });
-}
+// The split-mode socket client gives up after 600 s, so every ACME run (issue +
+// acme.sh --install-cert) must finish, or fail, inside that: a run the panel has
+// already reported as timed out must never complete behind its back.
+export const ACME_OP_TIMEOUT_MS = 540_000;
+const ACME_EXEC_TIMEOUT_MS = 480_000;
 
 const acmeIssueSchema = z.object({
   provider: acmeProvider,
   domains: z.array(certName).min(1).max(100),
-  email: z.string().email().max(254).optional(),
+  email: acmeEmail.optional(),
   method: z.enum(['webroot', 'standalone']).default('webroot'),
   webroot: arg.absPath.optional(),
   staging: z.boolean().default(false),
@@ -720,7 +760,7 @@ defineOp('ssl.acme.detect', { description: 'Which ACME clients (certbot, acme.sh
 
 defineOp('ssl.acme.issue', {
   description: 'Issue or renew a certificate through certbot or acme.sh (webroot or standalone) and store it under /etc/ssl/whm/<domain>/',
-  timeoutMs: 900_000,
+  timeoutMs: ACME_OP_TIMEOUT_MS,
   schema: acmeIssueSchema,
   run: async ({ provider, domains, email, method, webroot, staging, keyType, force }, ctx) => {
     requireProvider(provider);
@@ -740,7 +780,7 @@ defineOp('ssl.acme.issue', {
       argv.push(...(method === 'webroot' ? ['--webroot', '-w', webroot] : ['--standalone']));
       if (staging) argv.push('--test-cert');
       argv.push(force ? '--force-renewal' : '--keep-until-expiring');
-      const res = await exec('certbot', argv, { allowFailure: true, timeoutMs: 900_000 });
+      const res = await exec('certbot', argv, { allowFailure: true, timeoutMs: ACME_EXEC_TIMEOUT_MS });
       output = tail(`${res.stdout}\n${res.stderr}`);
       if (res.code !== 0) throw new OpError('acme_failed', `certbot failed: ${tail(res.stderr || res.stdout, 3)}`, { output });
       renewed = /Successfully received certificate|Congratulations/i.test(res.stdout) || force;
@@ -753,14 +793,14 @@ defineOp('ssl.acme.issue', {
       argv.push(...(method === 'webroot' ? ['-w', webroot] : ['--standalone']));
       if (email) argv.push('--accountemail', email);
       if (force) argv.push('--force');
-      const res = await exec(bin, argv, { allowFailure: true, timeoutMs: 900_000, env: acmeEnv });
+      const res = await exec(bin, argv, { allowFailure: true, timeoutMs: ACME_EXEC_TIMEOUT_MS, env: acmeEnv });
       output = tail(`${res.stdout}\n${res.stderr}`);
       // Exit status 2 means "not due for renewal yet"; everything else non-zero is a failure.
       if (res.code !== 0 && res.code !== 2) throw new OpError('acme_failed', `acme.sh failed: ${tail(res.stdout || res.stderr, 3)}`, { output });
       renewed = res.code === 0;
       const paths = bundlePaths(target);
       fs.mkdirSync(target, { recursive: true, mode: 0o755 });
-      const install = await exec(bin, ['--install-cert', '-d', primary, ...(keyType === 'rsa' ? [] : ['--ecc']), '--key-file', paths.key, '--cert-file', paths.cert, '--ca-file', paths.chain, '--fullchain-file', paths.fullchain], { allowFailure: true, timeoutMs: 120_000, env: acmeEnv });
+      const install = await exec(bin, ['--install-cert', '-d', primary, ...(keyType === 'rsa' ? [] : ['--ecc']), '--key-file', paths.key, '--cert-file', paths.cert, '--ca-file', paths.chain, '--fullchain-file', paths.fullchain], { allowFailure: true, timeoutMs: ACME_OP_TIMEOUT_MS - ACME_EXEC_TIMEOUT_MS, env: acmeEnv });
       if (install.code !== 0) throw new OpError('acme_failed', `acme.sh --install-cert failed: ${tail(install.stdout || install.stderr, 3)}`, { output: tail(`${install.stdout}\n${install.stderr}`) });
       pems = { certPem: readText(paths.cert), keyPem: readText(paths.key), chainPem: readText(paths.chain) || undefined };
       if (!pems.certPem || !pems.keyPem) throw new OpError('acme_failed', 'acme.sh installed no certificate files', { output });
@@ -770,37 +810,8 @@ defineOp('ssl.acme.issue', {
   },
 });
 
-defineOp('ssl.acme.renew_all', {
-  description: 'Run the ACME client renewal pass (certbot renew / acme.sh --cron)',
-  timeoutMs: 1_800_000,
-  schema: z.object({ provider: acmeProvider, force: z.boolean().default(false) }).strict(),
-  run: async ({ provider, force }) => {
-    requireProvider(provider);
-    const res = provider === 'certbot'
-      ? await exec('certbot', ['renew', '--non-interactive', '--no-random-sleep-on-renew', ...(force ? ['--force-renewal'] : [])], { allowFailure: true, timeoutMs: 1_800_000 })
-      : await exec(acmeShPath(), ['--cron', '--home', ACME_SH_HOME, ...(force ? ['--force'] : [])], { allowFailure: true, timeoutMs: 1_800_000, env: acmeEnv });
-    const output = tail(`${res.stdout}\n${res.stderr}`, 200);
-    const renewedNames = provider === 'certbot'
-      ? [...res.stdout.matchAll(/\/live\/([^/\s]+)\/fullchain\.pem \(success\)/g)].map((m) => m[1])
-      : [...res.stdout.matchAll(/Cert success[\s\S]*?-d\s+(\S+)/g)].map((m) => m[1]);
-    return { provider, ok: res.code === 0, renewed: renewedNames, output };
-  },
-});
-
-defineOp('ssl.acme.list', {
-  description: 'Certificates the ACME client manages',
-  schema: z.object({ provider: acmeProvider }).strict(),
-  run: async ({ provider }) => {
-    requireProvider(provider);
-    if (provider === 'certbot') {
-      const { stdout } = await exec('certbot', ['certificates', '--non-interactive'], { allowFailure: true, timeoutMs: 120_000 });
-      return { provider, certificates: parseCertbotCertificates(stdout) };
-    }
-    const { stdout } = await exec(acmeShPath(), ['--list', '--home', ACME_SH_HOME], { allowFailure: true, timeoutMs: 120_000, env: acmeEnv });
-    return { provider, certificates: parseAcmeShList(stdout) };
-  },
-});
-
+// Called when an AutoSSL certificate is uninstalled or its account terminated, so
+// the client's own timer stops renewing a name whose docroot is gone.
 defineOp('ssl.acme.remove', {
   description: 'Stop managing a certificate in the ACME client (certbot delete / acme.sh --remove)',
   destructive: true,
@@ -851,9 +862,30 @@ export function renderEximTls(p, { library = 'openssl' } = {}) {
   return `${MANAGED} (SSL/TLS Configuration). Minimum protocol ${min}.\ntls_require_ciphers = ${p.ciphers}\nopenssl_options = ${options.join(' ')}\n`;
 }
 
-export function renderDovecotTls(p) {
-  const min = p.protocols.includes('TLSv1') ? 'TLSv1' : p.protocols.includes('TLSv1.1') ? 'TLSv1.1' : p.protocols.includes('TLSv1.2') ? 'TLSv1.2' : 'TLSv1.3';
-  return `${MANAGED} (SSL/TLS Configuration)\nssl_min_protocol = ${min}\nssl_cipher_list = ${p.ciphers}\n${p.ciphersuites ? `ssl_cipher_suites = ${p.ciphersuites}\n` : ''}ssl_prefer_server_ciphers = ${p.preferServerCiphers ? 'yes' : 'no'}\n`;
+// Dovecot's protocol floor and ciphers are Service Configuration's
+// (97-whm-mailserver.conf); the panel service hands the preset to it, so this
+// family never renders a Dovecot TLS include any more.
+
+// Removes the Exim TLS fragment earlier builds wrote once Service Configuration
+// renders those options itself (two definitions of tls_require_ciphers would
+// make Exim refuse its configuration). Validated and restored like any write.
+async function removeEximTlsFragment(exim, ctx) {
+  const file = ctx.assertAllowedPath(exim.tlsInclude, 'write');
+  const previous = readText(file);
+  if (previous == null) return { path: file, removed: false, validated: false };
+  if (exim.tlsBlock) {
+    if (readEximBlock(previous, exim.tlsBlock) == null) return { path: file, removed: false, validated: false };
+    const written = await writeEximInclude(exim, file, stripEximBlock(previous, exim.tlsBlock));
+    return { ...written, removed: true };
+  }
+  if (!previous.startsWith(MANAGED)) return { path: file, removed: false, validated: false };
+  fs.unlinkSync(file);
+  if (exim.validate) {
+    const [bin, argv] = exim.validate;
+    const { code, stdout, stderr } = await exec(bin, argv, { allowFailure: true, timeoutMs: 60_000 });
+    if (code !== 0) { restore(file, previous); throw new OpError('config_invalid', `Exim rejected the configuration without the panel's TLS fragment; it was restored: ${`${stderr}\n${stdout}`.trim().split('\n').filter(Boolean).pop() || `exit status ${code}`}`); }
+  }
+  return { path: file, removed: true, validated: Boolean(exim.validate) };
 }
 
 defineOp('ssl.tls_config.status', {
@@ -866,16 +898,17 @@ defineOp('ssl.tls_config.status', {
     return {
       apache: apache ? { present: true, path: `${apache.includeDir}/zz-whm-tls.conf`, content: read(`${apache.includeDir}/zz-whm-tls.conf`) } : { present: false },
       exim: exim ? { present: true, path: exim.tlsInclude, block: exim.tlsBlock, splitConfig: exim.splitConfig, includeMode: exim.includeMode, library: await detectEximTlsLibrary(exim).catch(() => null), content: exim.tlsBlock ? readEximBlock(read(exim.tlsInclude), exim.tlsBlock) : read(exim.tlsInclude) } : { present: false },
-      dovecot: dovecot ? { present: true, path: dovecot.tlsInclude, content: read(dovecot.tlsInclude) } : { present: false },
+      dovecot: dovecot ? { present: true, path: dovecot.sslInclude, content: read(dovecot.sslInclude), legacy: dovecot.legacyIncludes.filter(exists), managedBy: 'service-configuration' } : { present: false },
     };
   },
 });
 
 defineOp('ssl.tls_config.apply', {
-  description: 'Render the TLS policy into managed includes for Apache, Exim and Dovecot (validated, rolled back on error) and reload them',
-  schema: z.object({ policy: tlsPolicy, services: z.array(z.enum(['apache', 'exim', 'dovecot'])).default(['apache', 'exim', 'dovecot']) }).strict(),
-  run: async ({ policy, services }, ctx) => {
+  description: 'Render the TLS policy into managed includes for Apache (and Exim when Service Configuration does not own it), validated and rolled back on error, then reload; removeLegacy drops includes this category used to write for exim/dovecot',
+  schema: z.object({ policy: tlsPolicy, services: z.array(z.enum(['apache', 'exim'])).default(['apache']), removeLegacy: z.array(z.enum(['exim', 'dovecot'])).default([]) }).strict(),
+  run: async ({ policy, services, removeLegacy }, ctx) => {
     const results = {};
+    const removed = {};
     const apache = apacheLayout();
     if (services.includes('apache') && apache) {
       const file = ctx.assertAllowedPath(`${apache.includeDir}/zz-whm-tls.conf`, 'write');
@@ -890,20 +923,17 @@ defineOp('ssl.tls_config.apply', {
       // until then the file is not read, so it is reported as not applied rather than reloaded.
       const manual = exim.includeMode === 'manual';
       results.exim = { ...written, library, includeMode: exim.includeMode, note: manual ? `Add ".include ${written.path}" to the main section of the Exim configuration for this to take effect.` : null, reload: manual ? { reloaded: false, unit: null } : await reloadUnit(exim.units) };
+    } else if (removeLegacy.includes('exim') && exim) {
+      removed.exim = await removeEximTlsFragment(exim, ctx);
+      if (removed.exim.removed && exim.includeMode !== 'manual') removed.exim.reload = await reloadUnit(exim.units);
     }
     const dovecot = dovecotLayout();
-    if (services.includes('dovecot') && dovecot) {
-      const file = ctx.assertAllowedPath(dovecot.tlsInclude, 'write');
-      const previous = readText(file);
-      writeAtomic(file, renderDovecotTls(policy));
-      if (hasBinary('doveconf')) {
-        const { code, stderr } = await exec('doveconf', ['-n'], { allowFailure: true, timeoutMs: 60_000 });
-        if (code !== 0) { restore(file, previous); throw new OpError('config_invalid', `Dovecot rejected the TLS settings; the previous file was restored: ${stderr.trim().split('\n').pop()}`); }
-      }
-      results.dovecot = { path: file, validated: hasBinary('doveconf'), reload: await reloadUnit(dovecot.units) };
+    if (removeLegacy.includes('dovecot') && dovecot) {
+      const files = removeManagedFiles([dovecot.legacyIncludes[0]], ctx);
+      removed.dovecot = { files, removed: files.length > 0, reload: files.length ? await reloadUnit(dovecot.units) : { reloaded: false, unit: null } };
     }
-    if (!Object.keys(results).length) throw new OpError('capability_missing', 'None of Apache, Exim or Dovecot is installed, so there is nothing to apply the TLS policy to');
-    return { applied: Object.keys(results), results };
+    if (!Object.keys(results).length && !Object.keys(removed).length) throw new OpError('capability_missing', 'None of Apache or Exim is installed, so there is nothing to apply the TLS policy to');
+    return { applied: Object.keys(results), results, removed };
   },
 });
 

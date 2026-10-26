@@ -42,7 +42,7 @@ export function EngineBanner({ status, loading, error, onRetry }) {
   return (
     <Card>
       <div className="stat-grid">
-        <div className="stat"><div className="label">Active profile</div><div className="value">{status.profile ? status.profile.profile_name : '—'}</div><div className="muted">{status.profile ? `${engineLabel(status.profile.engine)} · ${status.profile.host}${status.profile.port ? `:${status.profile.port}` : ''}` : <Link to="/database-services/manage-database-profiles">Add a profile</Link>}</div></div>
+        <div className="stat"><div className="label">Active profile</div><div className="value">{status.profile ? status.profile.profile_name : '—'}</div><div className="muted">{status.profile ? `${engineLabel(status.profile.engine)}${status.profile.host ? ` · ${status.profile.host}${status.profile.port ? `:${status.profile.port}` : ''}` : status.profile.is_local ? ' · local server' : ' · remote server'}` : <Link to="/database-services/manage-database-profiles">Add a profile</Link>}</div></div>
         <div className="stat"><div className="label">Server</div><div className="value">{status.version ? status.version.version : <StatusPill status={engineOk ? 'warning' : 'not-installed'}>{engineOk ? (status.error?.message || 'unreachable') : 'not installed'}</StatusPill>}</div><div className="muted">{status.detect?.engine ? `${engineLabel(status.detect.engine)} tooling detected` : 'no MySQL/MariaDB binaries found'}{status.detect?.postgres?.installed ? ' · PostgreSQL present' : ''}</div></div>
         <div className="stat"><div className="label">Service</div><div className="value">{status.unit ? <StatusPill status={status.unit.state === 'active' ? 'active' : status.unit.state === 'not-installed' ? 'not-installed' : 'down'}>{status.unit.unit || 'no unit'} · {status.unit.state}</StatusPill> : <span className="muted">—</span>}</div><div className="muted">{status.unit?.pid ? `PID ${status.unit.pid}` : status.profile && !status.profile.is_local ? 'remote server' : ''}</div></div>
         <div className="stat"><div className="label">Managed</div><div className="value">{status.counts?.databases ?? 0} / {status.counts?.users ?? 0}</div><div className="muted">databases / users mapped to accounts{status.prefixing ? ' · prefixing on' : ''}</div></div>
@@ -102,7 +102,7 @@ export function GrantsModal({ user, engine, onClose, onSaved }) {
   const save = async () => {
     setBusy(true); setSaveError(null);
     try {
-      const payload = grants.filter((g) => g.privileges.length);
+      const payload = grants.filter((g) => g.privileges.length).map(({ database, privileges }) => ({ database, privileges }));
       const { data } = await api.put(`/databases/users/${encodeURIComponent(user.name)}/grants`, { grants: payload });
       onSaved?.(data);
       onClose();
@@ -117,9 +117,10 @@ export function GrantsModal({ user, engine, onClose, onSaved }) {
       {current && (
         <>
           {current.hosts?.length > 0 && <p className="muted">Applied at hosts: {current.hosts.map((h) => <code key={h} style={{ marginRight: 6 }}>{h}</code>)}</p>}
+          {current.grants?.some((g) => g.mixed) && <div className="banner banner-warning"><div>Some privileges differ between hosts (shown with <em>differs per host</em>). Saving applies the same set at every host.</div></div>}
           {grants.length === 0 && <p className="muted">This user has no database privileges yet.</p>}
           {grants.map((g) => (
-            <Card key={g.database} title={<code>{g.database}</code>} actions={<Button size="sm" variant="danger-ghost" onClick={() => setGrants((gs) => gs.filter((x) => x.database !== g.database))}>Remove</Button>}>
+            <Card key={g.database} title={<><code>{g.database}</code>{g.mixed && <StatusPill status="warning">differs per host{g.hosts?.length ? `: ${g.hosts.join(', ')}` : ''}</StatusPill>}</>} actions={<Button size="sm" variant="danger-ghost" onClick={() => setGrants((gs) => gs.filter((x) => x.database !== g.database))}>Remove</Button>}>
               <PrivilegesEditor value={g.privileges} onChange={(p) => setPrivs(g.database, p)} engine={engine} />
             </Card>
           ))}

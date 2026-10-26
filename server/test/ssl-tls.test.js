@@ -5,6 +5,8 @@ import { certCovers, daysUntil, TLS_PRESETS } from '../src/services/ssl-tls.js';
 
 const KEY = '-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n-----END PRIVATE KEY-----\n';
 const OTHER_KEY = '-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIOtherKeyBytesHere\n-----END EC PRIVATE KEY-----\n';
+const ENCRYPTED_KEY = '-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFHDBOBgkqhkiG9w0BBQ0wQTApBgkqhkiG9w0BBQwwHAQI\n-----END ENCRYPTED PRIVATE KEY-----\n';
+const agentError = (code, message) => Object.assign(new Error(message), { agentError: true, code, details: {} });
 const CERT = '-----BEGIN CERTIFICATE-----\nMIIDtestcertificatebody\n-----END CERTIFICATE-----\n';
 const CHAIN = '-----BEGIN CERTIFICATE-----\nMIIDintermediate\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIDroot\n-----END CERTIFICATE-----\n';
 const CSR = '-----BEGIN CERTIFICATE REQUEST-----\nMIICtestcsr\n-----END CERTIFICATE REQUEST-----\n';
@@ -44,7 +46,8 @@ beforeAll(async () => {
     'ssl.bundle.install_for_domain': ({ domain }) => ({ domain, paths: PATHS(domain), certificate: certInfo }),
     'ssl.bundle.remove_for_domain': ({ domain }) => ({ domain, removed: true }),
     'ssl.bundle.read_for_domain': ({ domain }) => ({ domain, exists: false, paths: PATHS(domain) }),
-    'ssl.bundle.list': () => ({ root: '/etc/ssl/whm', bundles: [{ domain: 'orphan.example.net', paths: PATHS('orphan.example.net'), hasKey: true, hasChain: false, certificate: { ...certInfo, commonName: 'orphan.example.net', subjectText: 'CN=orphan.example.net', sans: ['orphan.example.net'] } }] }),
+    'ssl.bundle.list': () => ({ root: '/etc/ssl/whm', bundles: [{ domain: 'orphan.example.net', paths: PATHS('orphan.example.net'), hasKey: true, hasChain: false, inspected: true, certificate: { ...certInfo, commonName: 'orphan.example.net', subjectText: 'CN=orphan.example.net', sans: ['orphan.example.net'] } }] }),
+    'ssl.acme.remove': ({ provider, name }) => ({ provider, name, removed: true, output: '' }),
     'ssl.acme.detect': () => ({ certbot: false, acmeSh: null, providers: [], provider: null }),
     'ssl.acme.issue': ({ provider, domains }) => ({ provider, domains, primary: domains[0], renewed: true, paths: PATHS(domains[0]), certPem: CERT, keyPem: KEY, chainPem: CHAIN, certificate: { ...certInfo, commonName: domains[0], subjectText: `CN=${domains[0]}`, sans: domains }, output: 'Successfully received certificate.' }),
     'ssl.tls_config.status': () => ({ apache: { present: true, path: '/etc/apache2/conf-enabled/zz-whm-tls.conf', content: null }, exim: { present: true, path: '/etc/exim4/conf.d/main/000_whm_tls', splitConfig: true, content: null }, dovecot: { present: false } }),
@@ -133,7 +136,62 @@ describe('validation (422)', () => {
     expect((await post('/api/ssl/autossl/exclusions', { kind: 'user', value: 'bob' })).status).toBe(422);
     expect((await post('/api/ssl/autossl/exclusions', { kind: 'account', value: 'Bob;' })).status).toBe(422);
     expect((await put('/api/ssl/autossl/settings', { renewDays: 120 })).status).toBe(422);
+    expect((await put('/api/ssl/autossl/settings', { email: '-x@example.com' })).status).toBe(422);
     expect((await post('/api/ssl/service-certs/nginx', { certPem: CERT, keyPem: KEY })).status).toBe(422);
+  });
+
+  it('refuses passphrase-protected keys with a hint instead of letting openssl prompt', async () => {
+    app.agent.calls.length = 0;
+    for (const [url, body] of [['/api/ssl/install', { domain: 'bob.com', certPem: CERT, keyPem: ENCRYPTED_KEY }], ['/api/ssl/certs/upload', { keyPem: ENCRYPTED_KEY, domain: 'bob.com' }], ['/api/ssl/service-certs/exim', { certPem: CERT, keyPem: ENCRYPTED_KEY }]]) {
+      const res = await post(url, body);
+      expect(res.status, url).toBe(422);
+      expect(res.body.error.fields.keyPem[0]).toMatch(/decrypt/i);
+    }
+    expect(app.agent.calls.filter((c) => c.name.startsWith('ssl.'))).toHaveLength(0);
+  });
+
+  it('turns openssl/daemon rejections raised by the agent into 422 with the field named', async () => {
+    const restore = {
+      'ssl.cert.inspect': () => certInfo,
+      'ssl.key.inspect': () => ({ type: 'rsa', bits: 2048, curve: null, publicKeyPem: 'pub', publicKeySha256: 'deadbeef' }),
+      'ssl.key.matches': ({ keyPem }) => ({ matches: keyPem === KEY, publicKeySha256: 'deadbeef' }),
+      'ssl.service_cert.install': ({ service }) => ({ service, paths: PATHS(`service/${service}`), applied: [`/etc/${service}/whm`], removed: [], reload: { reloaded: true, unit: service }, certificate: certInfo, note: null }),
+      'ssl.tls_config.apply': ({ services }) => ({ applied: services, results: Object.fromEntries(services.map((s) => [s, { path: `/etc/${s}/whm-tls`, validated: true, reload: { reloaded: true, unit: s } }])), removed: {} }),
+    };
+    try {
+      app.agent.fail('ssl.cert.inspect', 'invalid_certificate', 'openssl could not parse the certificate: asn1 encoding routines');
+      for (const [url, body] of [['/api/ssl/certs/inspect', { certPem: CERT }], ['/api/ssl/certs/upload', { certPem: CERT }], ['/api/ssl/install', { domain: 'bob.com', certPem: CERT, keyPem: KEY }]]) {
+        const res = await post(url, body);
+        expect(res.status, url).toBe(422);
+        expect(res.body.error.code).toBe('validation_failed');
+        expect(res.body.error.message).toMatch(/could not parse the certificate/);
+        expect(res.body.error.fields.certPem).toHaveLength(1);
+      }
+      app.agent.set('ssl.cert.inspect', restore['ssl.cert.inspect']);
+      app.agent.fail('ssl.key.inspect', 'invalid_key', 'openssl could not read the private key: bad decrypt');
+      const keyOnly = await post('/api/ssl/certs/upload', { keyPem: KEY, domain: 'bob.com' });
+      expect(keyOnly.status).toBe(422);
+      expect(keyOnly.body.error.fields.keyPem[0]).toMatch(/could not read the private key/);
+      app.agent.set('ssl.key.inspect', restore['ssl.key.inspect']);
+      // The matcher itself can reject a corrupt key: the key field is blamed, not a 500.
+      app.agent.fail('ssl.key.matches', 'invalid_key', 'openssl could not read the key: unsupported');
+      expect((await post('/api/ssl/service-certs/exim', { certPem: CERT, keyPem: KEY })).status).toBe(422);
+      expect((await post('/api/ssl/install', { domain: 'bob.com', certPem: CERT, keyPem: KEY })).body.error.fields.keyPem).toBeDefined();
+      app.agent.set('ssl.key.matches', restore['ssl.key.matches']);
+      // A daemon rejecting the written configuration (already rolled back by the agent) is the caller's 422 too.
+      app.agent.fail('ssl.service_cert.install', 'config_invalid', 'Dovecot rejected the certificate drop-in; the previous file was restored: ssl_cert: Cannot open file');
+      const svc = await post('/api/ssl/service-certs/dovecot', { certPem: CERT, keyPem: KEY });
+      expect(svc.status).toBe(422);
+      expect(svc.body.error.code).toBe('config_invalid');
+      expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM ssl_service_certs WHERE service = ?').get('dovecot').n).toBe(0);
+      app.agent.fail('ssl.tls_config.apply', 'config_invalid', 'Apache rejected the new configuration; the previous file was restored: SSLCipherSuite takes one argument');
+      const tls = await put('/api/ssl/tls-config', { preset: 'modern', services: ['apache'] });
+      expect(tls.status).toBe(422);
+      expect(tls.body.error).toMatchObject({ code: 'config_invalid', message: expect.stringMatching(/Apache rejected/) });
+    } finally {
+      for (const [name, handler] of Object.entries(restore)) app.agent.set(name, handler);
+    }
+    await put('/api/ssl/tls-config', { preset: 'intermediate', services: ['apache', 'exim', 'dovecot'], apply: false });
   });
 });
 
@@ -267,6 +325,23 @@ describe('install on a domain, hosts and storage', () => {
     expect(bad.body.error.fields.keyPem).toBeDefined();
   });
 
+  it('installing a stored certificate on another hostname moves the row instead of copying key and certificate', async () => {
+    const before = app.ctx.db.prepare('SELECT COUNT(*) AS n FROM ssl_certs WHERE key_enc IS NOT NULL').get().n;
+    const wildcard = (await post('/api/ssl/certs/upload', { certPem: CERT, keyPem: KEY, domain: 'bob.com' })).body.data.cert.id;
+    expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM ssl_certs WHERE key_enc IS NOT NULL').get().n).toBe(before + 1);
+    const res = await post('/api/ssl/install', { domain: 'shop.bob.com', certId: wildcard, force: true });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.data.cert.id).toBe(wildcard);
+    // shop.bob.com is no account's domain, so root installs it as a server hostname (no account).
+    expect(res.body.data.cert).toMatchObject({ domain: 'shop.bob.com', account: null, installed: 2 });
+    expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM ssl_certs WHERE key_enc IS NOT NULL').get().n).toBe(before + 1);
+    // Once it is installed somewhere, a second hostname needs its own row.
+    const second = await post('/api/ssl/install', { domain: 'mail.bob.com', certId: wildcard, force: true });
+    expect(second.body.data.cert.id).not.toBe(wildcard);
+    await del('/api/ssl/hosts/shop.bob.com');
+    await del('/api/ssl/hosts/mail.bob.com');
+  });
+
   it('refuses a certificate that does not cover the domain unless forced', async () => {
     const res = await post('/api/ssl/install', { domain: 'alice.com', certPem: CERT, keyPem: KEY });
     expect(res.status).toBe(422);
@@ -282,17 +357,60 @@ describe('install on a domain, hosts and storage', () => {
     expect(domains).toEqual(expect.arrayContaining(['bob.com', 'www.bob.com', 'alice.com', 'orphan.example.net']));
     expect(res.body.data.hosts.find((h) => h.domain === 'orphan.example.net').state).toBe('unmanaged');
     expect(res.body.data.hosts.find((h) => h.domain === 'bob.com').files.present).toBe(false);
+    expect(res.body.data.bundlesListed).toBe(true);
+    // Known rows are passed to the agent so it does not run openssl on every directory.
+    expect(app.agent.callsTo('ssl.bundle.list').pop().args.knownDomains).toEqual(expect.arrayContaining(['bob.com', 'alice.com']));
     const mine = await reseller.get('/api/ssl/hosts');
     expect(mine.body.data.hosts.map((h) => h.domain)).toEqual(['alice.com']);
+    expect(mine.body.data.hosts[0].files.present).toBeNull();
     const domainsList = await get('/api/ssl/domains');
     expect(domainsList.body.data.find((d) => d.domain === 'bob.com').certificate.installed).toBeGreaterThan(0);
+  });
+
+  it('a failed directory listing leaves file presence unknown rather than marking every host missing', async () => {
+    app.agent.fail('ssl.bundle.list', 'command_failed', 'EACCES');
+    const res = await get('/api/ssl/hosts');
+    expect(res.status).toBe(200);
+    expect(res.body.data.bundlesListed).toBe(false);
+    expect(res.body.data.hosts.every((h) => h.files.present === null)).toBe(true);
+    app.agent.set('ssl.bundle.list', () => ({ root: '/etc/ssl/whm', bundles: [{ domain: 'orphan.example.net', paths: PATHS('orphan.example.net'), hasKey: true, hasChain: false, inspected: true, certificate: { ...certInfo, commonName: 'orphan.example.net', subjectText: 'CN=orphan.example.net', sans: ['orphan.example.net'] } }] }));
+  });
+
+  it('shows one host from disk, including unmanaged directories without a row', async () => {
+    app.agent.set('ssl.bundle.read_for_domain', ({ domain }) => ({ domain, exists: true, paths: PATHS(domain), certPem: CERT, chainPem: CHAIN, certificate: { ...certInfo, commonName: domain, sans: [domain] } }));
+    const orphan = await get('/api/ssl/hosts/orphan.example.net');
+    expect(orphan.status, JSON.stringify(orphan.body)).toBe(200);
+    expect(orphan.body.data).toMatchObject({ state: 'unmanaged', cert: null, files: { exists: true, hasChain: true }, certificate: { commonName: 'orphan.example.net' }, chain: { ok: true } });
+    const bob = await get('/api/ssl/hosts/bob.com');
+    expect(bob.body.data.cert.domain).toBe('bob.com');
+    expect(bob.body.data.state).toBe('installed');
+    expect((await reseller.get('/api/ssl/hosts/bob.com')).status).toBe(403);
+    expect((await reseller.get('/api/ssl/hosts/alice.com')).status).toBe(200);
+    app.agent.set('ssl.bundle.read_for_domain', ({ domain }) => ({ domain, exists: false, paths: PATHS(domain) }));
+    expect((await get('/api/ssl/hosts/nothing.example.org')).status).toBe(404);
+  });
+
+  it('uninstall is authorised by the domain owner, not by whoever stored the certificate', async () => {
+    // Root installs a certificate that alice's reseller stored onto bob's domain: the row follows the domain.
+    const stored = (await mutate(reseller, 'post', '/api/ssl/certs/upload', { certPem: CERT, keyPem: KEY, domain: 'alice.com' }, resellerCsrf)).body.data.cert.id;
+    const res = await post('/api/ssl/install', { domain: 'bob.com', certId: stored, force: true });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.data.cert.account).toBe('bob');
+    expect((await mutate(reseller, 'delete', '/api/ssl/hosts/bob.com', undefined, resellerCsrf)).status).toBe(403);
+    expect(app.ctx.ssl.certForDomain('bob.com')).not.toBeNull();
+    // ...and a reseller may uninstall from their own domain whatever root installed there.
+    const applied = await post('/api/ssl/install', { domain: 'alice.com', certPem: CERT, keyPem: KEY, force: true });
+    expect(applied.status).toBe(200);
+    const un = await mutate(reseller, 'delete', '/api/ssl/hosts/alice.com', undefined, resellerCsrf);
+    expect(un.status, JSON.stringify(un.body)).toBe(200);
+    expect(app.ctx.ssl.certForDomain('alice.com')).toBeNull();
   });
 
   it('storage refuses to delete installed material until it is uninstalled', async () => {
     const storage = await get('/api/ssl/storage');
     expect(storage.status).toBe(200);
     expect(storage.body.data.counts.key).toBeGreaterThan(0);
-    const installed = storage.body.data.items.find((i) => i.domain === 'bob.com' && i.kind === 'cert' && i.state === 'installed');
+    const installed = storage.body.data.items.find((i) => i.domain === 'bob.com' && i.kind === 'cert' && i.installed > 0);
     expect(installed).toBeDefined();
     expect((await del(`/api/ssl/certs/${installed.id}/key`)).status).toBe(409);
     expect((await del(`/api/ssl/certs/${installed.id}`)).status).toBe(409);
@@ -315,14 +433,20 @@ describe('AutoSSL', () => {
   beforeAll(() => { savedWeb = app.ctx.web; app.ctx.web = undefined; });
   afterAll(() => { app.ctx.web = savedWeb; });
 
-  it('selects a provider once it is installed and reports coverage', async () => {
+  it('selects a provider once it is installed and reports coverage; the daily schedule follows the feature', async () => {
+    // Disabled at boot: the scheduler must not queue passes that would only be skipped.
+    expect(app.ctx.scheduler.list().find((x) => x.name === 'autossl-daily').enabled).toBe(0);
     const res = await put('/api/ssl/autossl/settings', { provider: 'certbot', email: 'admin@example.com', renewDays: 20 });
     expect(res.status).toBe(200);
     expect(res.body.data).toMatchObject({ provider: 'certbot', email: 'admin@example.com', renewDays: 20 });
     const status = await get('/api/ssl/autossl');
     expect(status.body.data.providerInstalled).toBe(true);
-    expect(status.body.data.schedule.cron).toBe('17 3 * * *');
+    expect(status.body.data.schedule).toMatchObject({ cron: '17 3 * * *', enabled: true });
     expect(status.body.data.coverage.map((d) => d.domain)).toEqual(expect.arrayContaining(['alice.com', 'bob.com']));
+    await put('/api/ssl/autossl/settings', { provider: 'disabled' });
+    expect((await get('/api/ssl/autossl')).body.data.schedule.enabled).toBe(false);
+    await put('/api/ssl/autossl/settings', { provider: 'certbot' });
+    expect((await get('/api/ssl/autossl')).body.data.schedule.enabled).toBe(true);
   });
 
   it('manages exclusions', async () => {
@@ -375,7 +499,39 @@ describe('AutoSSL', () => {
     expect(job.status).toBe('done');
     expect(job.result.failed).toBe(1);
     expect(job.result.entries[0]).toMatchObject({ action: 'failed', message: 'DNS problem: NXDOMAIN' });
+    // Both the www+apex attempt and the apex-only retry were made before giving up.
+    expect(app.agent.callsTo('ssl.acme.issue').slice(-2).map((c) => c.args.domains)).toEqual([['bob.com', 'www.bob.com'], ['bob.com']]);
     app.agent.reset('ssl.acme.issue');
+    app.agent.set('ssl.acme.issue', ({ provider, domains }) => ({ provider, domains, primary: domains[0], renewed: true, paths: PATHS(domains[0]), certPem: CERT, keyPem: KEY, chainPem: CHAIN, certificate: { ...certInfo, commonName: domains[0], sans: domains }, output: '' }));
+  });
+
+  it('drops a www name that fails validation and still secures the primary domain', async () => {
+    const issue = app.agent.callsTo('ssl.acme.issue').length;
+    app.agent.set('ssl.acme.issue', ({ provider, domains }) => {
+      if (domains.length > 1) throw agentError('acme_failed', 'certbot failed: Challenge failed for domain www.bob.com');
+      return { provider, domains, primary: domains[0], renewed: true, paths: PATHS(domains[0]), certPem: CERT, keyPem: KEY, chainPem: CHAIN, certificate: { ...certInfo, commonName: domains[0], sans: domains }, output: '' };
+    });
+    app.ctx.jobs.start();
+    const res = await post('/api/ssl/autossl/run', { domain: 'bob.com', force: true });
+    const job = await waitForJob(app.ctx, res.body.data.job.id, 10_000);
+    app.ctx.jobs.stop();
+    expect(job.result.entries[0].action).toBe('renewed');
+    expect(job.result.entries[0].message).toMatch(/www\.bob\.com failed validation/);
+    expect(app.agent.callsTo('ssl.acme.issue').slice(issue).map((c) => c.args.domains)).toEqual([['bob.com', 'www.bob.com'], ['bob.com']]);
+    // A non-ACME failure is not retried.
+    app.agent.fail('ssl.acme.issue', 'path_not_allowed', 'webroot outside allowed roots');
+    const result = await app.ctx.ssl.autossl.run({ params: { trigger: 'manual', domain: 'bob.com', force: true }, log() {}, progress() {} });
+    expect(result.entries[0].action).toBe('failed');
+    expect(app.agent.callsTo('ssl.acme.issue').length).toBe(issue + 3);
+    app.agent.set('ssl.acme.issue', ({ provider, domains }) => ({ provider, domains, primary: domains[0], renewed: true, paths: PATHS(domains[0]), certPem: CERT, keyPem: KEY, chainPem: CHAIN, certificate: { ...certInfo, commonName: domains[0], sans: domains }, output: '' }));
+  });
+
+  it('counts a pass the client kept the old certificate on as skipped, not renewed', async () => {
+    app.agent.set('ssl.acme.issue', ({ provider, domains }) => ({ provider, domains, primary: domains[0], renewed: false, paths: PATHS(domains[0]), certPem: CERT, keyPem: KEY, chainPem: CHAIN, certificate: { ...certInfo, commonName: domains[0], sans: domains }, output: 'Certificate not yet due for renewal' }));
+    const result = await app.ctx.ssl.autossl.run({ params: { trigger: 'manual', domain: 'bob.com', force: true }, log() {}, progress() {} });
+    expect(result.renewed).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(result.entries[0]).toMatchObject({ action: 'skip', message: expect.stringMatching(/not due according to certbot/) });
     app.agent.set('ssl.acme.issue', ({ provider, domains }) => ({ provider, domains, primary: domains[0], renewed: true, paths: PATHS(domains[0]), certPem: CERT, keyPem: KEY, chainPem: CHAIN, certificate: { ...certInfo, commonName: domains[0], sans: domains }, output: '' }));
   });
 
@@ -472,19 +628,40 @@ describe('TLS configuration and service certificates', () => {
     expect(res.body.data.daemons).toEqual({ apache: true, exim: true, dovecot: true });
   });
 
-  it('applies a preset to the installed daemons and persists custom policies', async () => {
-    const res = await put('/api/ssl/tls-config', { preset: 'modern', hsts: { enabled: true, maxAge: 63_072_000, preload: true } });
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body.data.settings).toMatchObject({ preset: 'modern', protocols: ['TLSv1.3'], hsts: { enabled: true, maxAge: 63_072_000, preload: true, includeSubdomains: true } });
-    expect(res.body.data.applied.applied).toEqual(['apache', 'exim', 'dovecot']);
-    const call = app.agent.callsTo('ssl.tls_config.apply').pop();
-    expect(call.args.policy.protocols).toEqual(['TLSv1.3']);
-    expect(call.args.policy.hsts.enabled).toBe(true);
-    const custom = await put('/api/ssl/tls-config', { protocols: ['TLSv1.2', 'TLSv1.3'], ciphers: 'ECDHE-RSA-AES256-GCM-SHA384', services: ['apache'], apply: false });
-    expect(custom.body.data.settings).toMatchObject({ preset: 'custom', ciphers: 'ECDHE-RSA-AES256-GCM-SHA384', services: ['apache'] });
-    expect(custom.body.data.applied).toBeNull();
-    const saved = await put('/api/ssl/tls-config', { preset: 'intermediate' });
-    expect(saved.body.data.applied.applied).toEqual(['apache']);
+  it('applies a preset: Apache through its own include, Exim and Dovecot through Service Configuration', async () => {
+    const savedWeb = app.ctx.web;
+    const hooks = [];
+    app.ctx.web = { applyEximTls: async (p) => { hooks.push(['exim', p]); return { path: '/etc/exim4/conf.d/main/000_whm_mail', validated: true, reload: { reloaded: true, unit: 'exim4' } }; }, applyMailserverTls: async (p) => { hooks.push(['dovecot', p]); return { path: '/etc/dovecot/conf.d/97-whm-mailserver.conf', validated: true, reload: { reloaded: true, unit: 'dovecot' } }; } };
+    try {
+      const res = await put('/api/ssl/tls-config', { preset: 'modern', hsts: { enabled: true, maxAge: 63_072_000, preload: true } });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.data.settings).toMatchObject({ preset: 'modern', protocols: ['TLSv1.3'], hsts: { enabled: true, maxAge: 63_072_000, preload: true, includeSubdomains: true } });
+      expect(res.body.data.applied.applied).toEqual(expect.arrayContaining(['apache', 'exim', 'dovecot']));
+      const call = app.agent.callsTo('ssl.tls_config.apply').pop();
+      // The agent only renders Apache; the Exim/Dovecot includes earlier builds wrote are removed.
+      expect(call.args).toMatchObject({ services: ['apache'], removeLegacy: ['exim', 'dovecot'] });
+      expect(call.args.policy.protocols).toEqual(['TLSv1.3']);
+      expect(call.args.policy.hsts.enabled).toBe(true);
+      expect(hooks.map(([svc]) => svc)).toEqual(['exim', 'dovecot']);
+      expect(hooks[1][1]).toMatchObject({ minProtocol: 'TLSv1.3', protocols: ['TLSv1.3'], cipherList: TLS_PRESETS.modern.ciphers, cipherSuites: TLS_PRESETS.modern.ciphersuites, preferServerCiphers: false });
+      expect(res.body.data.applied.results.dovecot).toMatchObject({ via: 'service-configuration', path: '/etc/dovecot/conf.d/97-whm-mailserver.conf' });
+      expect((await get('/api/ssl/tls-config')).body.data.delegated).toEqual({ exim: true, dovecot: true });
+    } finally { app.ctx.web = savedWeb; }
+    // Without Service Configuration the mail daemons are reported pending; Exim falls back to this category's fragment.
+    app.ctx.web = undefined;
+    try {
+      const res = await put('/api/ssl/tls-config', { preset: 'intermediate' });
+      expect(res.status).toBe(200);
+      expect(app.agent.callsTo('ssl.tls_config.apply').pop().args).toMatchObject({ services: ['apache', 'exim'], removeLegacy: ['dovecot'] });
+      expect(res.body.data.applied.applied).toEqual(['apache', 'exim']);
+      expect(res.body.data.applied.results.dovecot).toMatchObject({ pending: true, via: 'service-configuration' });
+      const custom = await put('/api/ssl/tls-config', { protocols: ['TLSv1.2', 'TLSv1.3'], ciphers: 'ECDHE-RSA-AES256-GCM-SHA384', services: ['apache'], apply: false });
+      expect(custom.body.data.settings).toMatchObject({ preset: 'custom', ciphers: 'ECDHE-RSA-AES256-GCM-SHA384', services: ['apache'] });
+      expect(custom.body.data.applied).toBeNull();
+      const saved = await put('/api/ssl/tls-config', { preset: 'intermediate' });
+      expect(saved.body.data.applied.applied).toEqual(['apache']);
+      expect(app.agent.callsTo('ssl.tls_config.apply').pop().args.removeLegacy).toEqual([]);
+    } finally { app.ctx.web = savedWeb; }
   });
 
   it('installs a certificate for a service and records it', async () => {
@@ -501,10 +678,33 @@ describe('TLS configuration and service certificates', () => {
     expect(status.body.data.map((s) => s.service)).toEqual(['exim', 'dovecot', 'apache', 'ftp', 'panel']);
   });
 
-  it('removeAccountCerts purges rows for a terminated account', () => {
+  it('removeAccountCerts uninstalls every installed bundle (files, vhost, ACME client) before purging rows', async () => {
     const bobId = app.ctx.db.prepare('SELECT id FROM accounts WHERE username = ?').get('bob').id;
+    await post('/api/accounts', { username: 'bob', domain: 'bob.com' }).catch(() => {});
+    app.ctx.db.prepare("INSERT OR IGNORE INTO account_domains (account_id, domain, type, docroot) VALUES (?, 'www2.bob.com', 'sub', '/home/bob/public_html/www2')").run(bobId);
+    expect((await post('/api/ssl/install', { domain: 'bob.com', certPem: CERT, keyPem: KEY })).status).toBe(200);
+    expect((await post('/api/ssl/install', { domain: 'www2.bob.com', certPem: CERT, keyPem: KEY, force: true })).status).toBe(200);
+    // One AutoSSL row too, so the ACME client is told to forget the name.
+    app.ctx.db.prepare('UPDATE ssl_certs SET autossl = 1 WHERE domain = ? AND installed > 0').run('www2.bob.com');
+    const installed = app.ctx.db.prepare('SELECT domain FROM ssl_certs WHERE account_id = ? AND installed > 0').all(bobId).map((r) => r.domain);
+    expect(installed).toEqual(expect.arrayContaining(['bob.com', 'www2.bob.com']));
+    const removedSsl = [];
+    const savedWeb = app.ctx.web;
+    app.ctx.web = { removeSsl: async (domain) => { removedSsl.push(domain); } };
     const before = app.ctx.db.prepare('SELECT COUNT(*) AS n FROM ssl_certs WHERE account_id = ?').get(bobId).n;
     expect(before).toBeGreaterThan(0);
-    expect(app.ctx.ssl.removeAccountCerts(bobId).removed).toBe(before);
+    app.agent.calls.length = 0;
+    // A bundle the agent cannot remove is reported, not fatal.
+    app.agent.set('ssl.bundle.remove_for_domain', ({ domain }) => { if (domain === 'bob.com') throw agentError('command_failed', 'EBUSY'); return { domain, removed: true }; });
+    let result;
+    try { result = await app.ctx.ssl.removeAccountCerts(bobId); } finally { app.ctx.web = savedWeb; }
+    expect(result.removed).toBe(before);
+    expect(result.uninstalled).toEqual(['www2.bob.com']);
+    expect(result.failed).toEqual([{ domain: 'bob.com', error: 'EBUSY' }]);
+    expect(app.agent.callsTo('ssl.bundle.remove_for_domain').map((c) => c.args.domain).sort()).toEqual(['bob.com', 'www2.bob.com']);
+    expect(removedSsl).toEqual(['www2.bob.com']);
+    expect(app.agent.callsTo('ssl.acme.remove').map((c) => c.args)).toEqual([{ provider: 'certbot', name: 'www2.bob.com' }]);
+    expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM ssl_certs WHERE account_id = ?').get(bobId).n).toBe(0);
+    app.agent.set('ssl.bundle.remove_for_domain', ({ domain }) => ({ domain, removed: true }));
   });
 });

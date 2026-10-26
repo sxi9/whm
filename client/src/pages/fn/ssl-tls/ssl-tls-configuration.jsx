@@ -70,15 +70,23 @@ export default function SslTlsConfiguration({ fn }) {
                 <Field inline><Toggle checked={draft.hsts.includeSubdomains} onChange={(v) => setDraft({ ...draft, hsts: { ...draft.hsts, includeSubdomains: v } })} label="includeSubDomains" disabled={!draft.hsts.enabled} /></Field>
                 <Field inline><Toggle checked={draft.hsts.preload} onChange={(v) => setDraft({ ...draft, hsts: { ...draft.hsts, preload: v } })} label="preload" description="Browsers hard-code the domain as HTTPS-only; removal takes months." disabled={!draft.hsts.enabled} /></Field>
               </Card>
-              <Card title="Apply to" subtitle="Each daemon gets a managed include; Apache, Exim and Dovecot configs are validated and rolled back if rejected.">
-                {SERVICES.map((s) => (
-                  <Field inline key={s.key}>
-                    <Toggle checked={draft.services.includes(s.key)} onChange={() => toggleService(s.key)} label={s.label} description={data.daemons[s.key] ? (data.status[s.key]?.path ? `Managed file: ${data.status[s.key].path}${data.status[s.key].content ? '' : ' (not written yet)'}` : 'installed') : 'not installed on this server'} />
-                  </Field>
-                ))}
-                {data.status?.exim?.includeMode === 'manual' && <p className="muted">Exim uses a single configuration file here; add <code>.include {data.status.exim.path}</code> to its main section once.</p>}
-                {data.status?.exim?.includeMode === 'localmacros' && <p className="muted">Exim runs Debian's unsplit configuration here; the policy is kept as a managed block in <code>{data.status.exim.path}</code>, which update-exim4.conf reads in both modes.</p>}
-                {data.status?.exim?.library === 'gnutls' && <p className="muted">Exim is built with GnuTLS here: the cipher list cannot be translated, so its include carries a priority string with the protocol floor and server preference only.</p>}
+              <Card title="Apply to" subtitle="Apache gets a managed include from this page. Exim and Dovecot are rendered by Service Configuration (Exim Configuration Manager, Mailserver Configuration), which receives the chosen protocol floor and ciphers; every daemon's config is validated and rolled back if rejected.">
+                {SERVICES.map((s) => {
+                  const delegated = data.delegated?.[s.key];
+                  const where = s.key === 'exim' ? 'Exim Configuration Manager' : 'Mailserver Configuration';
+                  const description = !data.daemons[s.key] ? 'not installed on this server'
+                    : s.key === 'apache' ? (data.status.apache?.path ? `Managed file: ${data.status.apache.path}${data.status.apache.content ? '' : ' (not written yet)'}` : 'installed')
+                      : delegated ? `Applied through Service Configuration → ${where}` : `Applied through Service Configuration → ${where} once that category is loaded; saved until then`;
+                  return (
+                    <Field inline key={s.key}>
+                      <Toggle checked={draft.services.includes(s.key)} onChange={() => toggleService(s.key)} label={s.label} description={description} />
+                    </Field>
+                  );
+                })}
+                {data.daemons.exim && !data.delegated?.exim && data.status?.exim?.includeMode === 'manual' && <p className="muted">Exim uses a single configuration file here; add <code>.include {data.status.exim.path}</code> to its main section once.</p>}
+                {data.daemons.exim && !data.delegated?.exim && data.status?.exim?.includeMode === 'localmacros' && <p className="muted">Exim runs Debian's unsplit configuration here; until Service Configuration takes over, the policy is kept as a managed block in <code>{data.status.exim.path}</code>, which update-exim4.conf reads in both modes.</p>}
+                {data.daemons.exim && data.status?.exim?.library === 'gnutls' && <p className="muted">Exim is built with GnuTLS here: the cipher list cannot be translated, so only the protocol floor and server preference apply to SMTP.</p>}
+                {data.status?.dovecot?.legacy?.length > 0 && <p className="muted">Older panel drop-ins (<code>{data.status.dovecot.legacy.join(', ')}</code>) still exist and override Mailserver Configuration; they are removed on the next apply or service-certificate install.</p>}
               </Card>
             </div>
           </div>
@@ -91,10 +99,12 @@ export default function SslTlsConfiguration({ fn }) {
             <RequestError error={applyError} />
             {applied && (
               <div className="action-result">
-                <KeyValue items={Object.entries(applied.results).map(([svc, r]) => [svc, <span key={svc}><code className="small">{r.path}</code> {r.validated ? <StatusPill status="ok">validated</StatusPill> : null} {r.library ? <StatusPill status="neutral">{r.library}</StatusPill> : null} <StatusPill status={r.reload?.reloaded ? 'ok' : 'warning'}>{r.reload?.reloaded ? `${r.reload.unit} reloaded` : r.reload?.error || r.note || 'not reloaded'}</StatusPill></span>])} />
+                <KeyValue items={Object.entries(applied.results).map(([svc, r]) => [svc, r.pending
+                  ? <StatusPill key={svc} status="pending">{r.note || 'pending'}</StatusPill>
+                  : <span key={svc}>{r.path && <code className="small">{r.path}</code>} {r.via && <StatusPill status="neutral">via Service Configuration</StatusPill>} {r.validated ? <StatusPill status="ok">validated</StatusPill> : null} {r.library ? <StatusPill status="neutral">{r.library}</StatusPill> : null} <StatusPill status={r.reload?.reloaded ? 'ok' : 'warning'}>{r.reload?.reloaded ? `${r.reload.unit} reloaded` : r.reload?.error || r.note || 'not reloaded'}</StatusPill>{r.legacyRemoved && <span className="muted small"> (old include removed)</span>}</span>])} />
               </div>
             )}
-            {Object.entries(data.status || {}).filter(([, s]) => s.content).map(([svc, s]) => (
+            {Object.entries(data.status || {}).filter(([svc, s]) => s.content && (svc === 'apache' || !data.delegated?.[svc])).map(([svc, s]) => (
               <details key={svc} style={{ marginTop: 10 }}><summary className="muted">Current managed include for {svc}: <code>{s.path}</code></summary><pre className="log">{s.content}</pre></details>
             ))}
           </Card>

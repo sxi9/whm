@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { api, queryString } from '../../../api/client.js';
+import { queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, formatBytes, formatDate } from '../../../components/Common.jsx';
 import { DataTable, useTableState } from '../../../components/DataTable.jsx';
@@ -26,7 +26,7 @@ export default function MailDeliveryReports({ fn }) {
             <Field label="Outcome"><Select value={form.status} onChange={set('status')} options={['delivered', 'failed', 'deferred', 'queued', 'completed']} placeholder="Any outcome" /></Field>
             <WindowSelect value={form.hours} onChange={set('hours')} />
           </div>
-          <FormActions><Button type="submit" variant="primary" loading={loading}>Search</Button>{filter && <Button onClick={() => api.get(path).then(() => refetch())}>Refresh</Button>}</FormActions>
+          <FormActions><Button type="submit" variant="primary" loading={loading}>Search</Button>{filter && <Button onClick={() => refetch()}>Refresh</Button>}</FormActions>
         </form>
       </Card>
       <RequestError error={error} onRetry={refetch} />

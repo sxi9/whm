@@ -32,7 +32,7 @@ export default function SynchronizeDnsRecords({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Pushes zones to the nameservers in your DNS cluster over their panel API, so every peer serves the same records. Runs hourly on its own; use this page to push now or after a bulk change." actions={<Button onClick={() => refetch()}>Refresh</Button>} />
+      <PageHeader fn={fn} description="Pushes zones to the nameservers in your DNS cluster over their panel API, so every peer serves the same records. Synchronisation is push-only in this version: peers in the 'sync' role receive zones like 'write-only' ones, and changes made on a peer are not pulled back. The hourly run only sends zones a peer has not acknowledged at their current serial; this page pushes everything you select." actions={<Button onClick={() => refetch()}>Refresh</Button>} />
       <ErrorBanner error={error} onRetry={refetch} />
       <Card title="Cluster peers" padded={false}>
         {data && !data.clusters.length ? (

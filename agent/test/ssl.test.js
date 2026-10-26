@@ -4,7 +4,8 @@ import path from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import { exec, hasBinary } from '../src/exec.js';
 import { runOp, createContext, OpError } from '../src/lib.js';
-import { parseDn, parseSans, parseX509Fields, parseOpensslDate, parseCertbotCertificates, parseAcmeShList, renderApacheTls, renderEximTls, renderDovecotTls, serviceCopies, bundlePaths, groupId, parseEximTlsLibrary, writeEximInclude, eximLayout, parseUpdateExim4Conf, mergeEximBlock, readEximBlock, writeEximFragment } from '../src/ops/ssl.js';
+import { parseDn, parseSans, parseX509Fields, parseOpensslDate, renderApacheTls, renderEximTls, renderDovecotCertInclude, serviceCopies, bundlePaths, groupId, parseEximTlsLibrary, writeEximInclude, eximLayout, parseUpdateExim4Conf, mergeEximBlock, readEximBlock, stripEximBlock, writeEximFragment, dovecotLayout, ACME_OP_TIMEOUT_MS } from '../src/ops/ssl.js';
+import { catalog } from '../src/ops/index.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
@@ -53,10 +54,13 @@ describe('ssl op schemas reject injection and traversal before anything runs', (
 
   it('PEM material must be PEM', async () => {
     exec.mockClear();
-    for (const bad of ['not a key', `${KEY}; rm -rf /`, 'ssh-rsa AAAA', KEY.replace('PRIVATE KEY', 'CERTIFICATE'), `${KEY}${KEY}`]) {
+    const ENCRYPTED = '-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFHDBOBgkqhkiG9w0BBQ0wQTApBgkqhkiG9w0BBQwwHAQI\n-----END ENCRYPTED PRIVATE KEY-----\n';
+    for (const bad of ['not a key', `${KEY}; rm -rf /`, 'ssh-rsa AAAA', KEY.replace('PRIVATE KEY', 'CERTIFICATE'), `${KEY}${KEY}`, ENCRYPTED]) {
       expect((await opError(runOp('ssl.key.inspect', { keyPem: bad }, ctx))).code).toBe('invalid_args');
       expect((await opError(runOp('ssl.csr.generate', { keyPem: bad, subject: { CN: 'example.com' } }, ctx))).code).toBe('invalid_args');
     }
+    // A passphrase-protected key would make openssl prompt on the terminal; the message says to decrypt it first.
+    expect((await opError(runOp('ssl.key.inspect', { keyPem: ENCRYPTED }, ctx))).details.fields.keyPem[0]).toMatch(/decrypt/i);
     for (const bad of ['-----BEGIN CERTIFICATE-----\n$(id)\n-----END CERTIFICATE-----', KEY, 'MIIDxyz', `${CERT}${CERT}`]) {
       expect((await opError(runOp('ssl.cert.inspect', { certPem: bad }, ctx))).code).toBe('invalid_args');
     }
@@ -75,6 +79,13 @@ describe('ssl op schemas reject injection and traversal before anything runs', (
       expect((await opError(runOp('ssl.bundle.read_for_domain', { domain }, ctx))).code, domain).toBe('invalid_args');
     }
     expect((await opError(runOp('ssl.bundle.install_for_domain', { domain: 'example.com', certPem: CERT, keyPem: KEY, chainPem: 'junk' }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('ssl.bundle.list', { knownDomains: ['-d'] }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('ssl.bundle.list', { inspect: false }, ctx))).code).toBe('invalid_args');
+    // The API validates hostnames with fields.hostname (numeric labels allowed); the bundle ops accept the same names.
+    const bare = createContext({ allowedRoots: ['/home'] });
+    for (const domain of ['host.example.123', '10.0.0.5', 'www.example.com']) {
+      expect((await opError(runOp('ssl.bundle.remove_for_domain', { domain }, bare))).code, domain).toBe('path_not_allowed');
+    }
     for (const service of ['nginx', 'exim; id', '../apache', 'EXIM']) {
       expect((await opError(runOp('ssl.service_cert.install', { service, certPem: CERT, keyPem: KEY }, ctx))).code, service).toBe('invalid_args');
     }
@@ -88,15 +99,21 @@ describe('ssl op schemas reject injection and traversal before anything runs', (
     for (const args of [
       { ...base, provider: 'letsencrypt' }, { ...base, domains: [] }, { ...base, domains: ['-d'] }, { ...base, domains: ['a;b.com'] }, { ...base, domains: ['*.example.com'] },
       { ...base, webroot: 'public_html' }, { ...base, webroot: '/home/../etc' }, { ...base, method: 'dns' }, { ...base, method: 'webroot', webroot: undefined },
-      { ...base, email: 'not-an-email' }, { ...base, keyType: 'dsa' }, { ...base, staging: 'yes' }, { ...base, extra: true },
+      { ...base, email: 'not-an-email' }, { ...base, email: '-x@example.com' }, { ...base, keyType: 'dsa' }, { ...base, staging: 'yes' }, { ...base, extra: true },
     ]) {
       expect((await opError(runOp('ssl.acme.issue', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
     }
-    expect((await opError(runOp('ssl.acme.renew_all', { provider: 'certbot', force: 'true' }, ctx))).code).toBe('invalid_args');
-    expect((await opError(runOp('ssl.acme.list', { provider: 'acme' }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('ssl.acme.remove', { provider: 'certbot', name: '--all' }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('ssl.acme.remove', { provider: 'certbot', name: 'a;b' }, ctx))).code).toBe('invalid_args');
     expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('keeps the ACME run inside the split-mode socket timeout and drops the ops nothing calls', () => {
+    expect(ACME_OP_TIMEOUT_MS).toBeLessThan(600_000);
+    expect(catalog.get('ssl.acme.issue').timeoutMs).toBe(ACME_OP_TIMEOUT_MS);
+    expect(catalog.has('ssl.acme.renew_all')).toBe(false);
+    expect(catalog.has('ssl.acme.list')).toBe(false);
+    expect(catalog.get('ssl.acme.remove').destructive).toBe(true);
   });
 
   it('TLS policy', async () => {
@@ -109,6 +126,9 @@ describe('ssl op schemas reject injection and traversal before anything runs', (
       expect((await opError(runOp('ssl.tls_config.apply', { policy: bad }, ctx))).code, JSON.stringify(bad)).toBe('invalid_args');
     }
     expect((await opError(runOp('ssl.tls_config.apply', { policy, services: ['nginx'] }, ctx))).code).toBe('invalid_args');
+    // Dovecot's protocol floor and ciphers belong to Service Configuration (97-whm-mailserver.conf); this op no longer takes it.
+    expect((await opError(runOp('ssl.tls_config.apply', { policy, services: ['dovecot'] }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('ssl.tls_config.apply', { policy, removeLegacy: ['apache'] }, ctx))).code).toBe('invalid_args');
     expect(exec).not.toHaveBeenCalled();
   });
 
@@ -131,16 +151,6 @@ describe('parsers and renderers', () => {
     expect(parseOpensslDate('garbage')).toBeNull();
   });
 
-  it('parses certbot and acme.sh listings', () => {
-    const certbot = parseCertbotCertificates(`Found the following certs:\n  Certificate Name: example.com\n    Serial Number: 3\n    Key Type: ECDSA\n    Domains: example.com www.example.com\n    Expiry Date: 2027-01-23 10:00:00+00:00 (VALID: 89 days)\n    Certificate Path: /etc/letsencrypt/live/example.com/fullchain.pem\n    Private Key Path: /etc/letsencrypt/live/example.com/privkey.pem\n  Certificate Name: shop.example.com\n    Domains: shop.example.com\n    Expiry Date: 2027-02-01 10:00:00+00:00 (VALID: 98 days)\n`);
-    expect(certbot).toHaveLength(2);
-    expect(certbot[0]).toMatchObject({ name: 'example.com', domains: ['example.com', 'www.example.com'], keyType: 'ECDSA', certPath: '/etc/letsencrypt/live/example.com/fullchain.pem' });
-    expect(certbot[0].notAfter).toBe('2027-01-23T10:00:00.000Z');
-    const acme = parseAcmeShList('Main_Domain  KeyLength  SAN_Domains          CA               Created                Renew\nexample.com  "ec-256"   www.example.com      LetsEncrypt.org  2026-10-25T10:00:00Z   2026-12-24T10:00:00Z\nsolo.example.com  "2048"  no  LetsEncrypt.org  2026-10-25T10:00:00Z  2026-12-24T10:00:00Z\n');
-    expect(acme[0]).toMatchObject({ name: 'example.com', domains: ['example.com', 'www.example.com'], ca: 'LetsEncrypt.org' });
-    expect(acme[1].domains).toEqual(['solo.example.com']);
-  });
-
   it('renders TLS policy includes', () => {
     const policy = { protocols: ['TLSv1.2', 'TLSv1.3'], ciphers: 'ECDHE-RSA-AES256-GCM-SHA384', ciphersuites: 'TLS_AES_256_GCM_SHA384', preferServerCiphers: true, hsts: { enabled: true, maxAge: 31536000, includeSubdomains: true, preload: false } };
     const apache = renderApacheTls(policy);
@@ -153,10 +163,28 @@ describe('parsers and renderers', () => {
     expect(exim).toContain('openssl_options = +no_sslv2 +no_sslv3 +no_tlsv1 +no_tlsv1_1 +single_dh_use +no_ticket +cipher_server_preference');
     expect(exim).toContain('tls_require_ciphers = ECDHE-RSA-AES256-GCM-SHA384');
     expect(renderEximTls({ ...policy, preferServerCiphers: false })).not.toContain('cipher_server_preference');
-    const dovecot = renderDovecotTls(policy);
-    expect(dovecot).toContain('ssl_min_protocol = TLSv1.2');
-    expect(dovecot).toContain('ssl_cipher_suites = TLS_AES_256_GCM_SHA384');
-    expect(renderDovecotTls({ ...policy, protocols: ['TLSv1.3'] })).toContain('ssl_min_protocol = TLSv1.3');
+  });
+
+  it('the Dovecot drop-in names certificate files only and sorts before Mailserver Configuration\'s 97 file', () => {
+    const paths = bundlePaths('/etc/ssl/whm/service/dovecot');
+    const include = renderDovecotCertInclude(paths, { hasChain: true });
+    const directives = include.trim().split('\n').filter((l) => !l.startsWith('#')).map((l) => l.split(' = ')[0]);
+    expect(directives).toEqual(['ssl_cert', 'ssl_key', 'ssl_ca']);
+    expect(include).toContain(`ssl_cert = <${paths.fullchain}`);
+    expect(include).toContain(`ssl_key = <${paths.key}`);
+    expect(include).toContain(`ssl_ca = <${paths.chain}`);
+    expect(include).not.toMatch(/^ssl = /m);
+    expect(include).not.toContain('ssl_min_protocol');
+    expect(include).not.toContain('ssl_cipher_list');
+    expect(renderDovecotCertInclude(paths).trim().split('\n').filter((l) => !l.startsWith('#')).map((l) => l.split(' = ')[0])).toEqual(['ssl_cert', 'ssl_key']);
+    const dc = { confDir: '/etc/dovecot', dropinDir: '/etc/dovecot/conf.d', sslInclude: '/etc/dovecot/conf.d/90-whm-ssl-cert.conf', legacyIncludes: ['/etc/dovecot/conf.d/98-whm-tls.conf', '/etc/dovecot/conf.d/99-whm-ssl.conf'], units: ['dovecot'] };
+    expect(path.basename(dc.sslInclude) < '97-whm-mailserver.conf').toBe(true);
+    const copies = serviceCopies('dovecot', paths, { dovecot: dc }, { hasChain: false });
+    expect(copies[0]).toEqual({ remove: dc.legacyIncludes });
+    expect(copies[1]).toMatchObject({ include: dc.sslInclude, validate: 'dovecot' });
+    expect(copies[1].content).not.toContain('ssl = ');
+    expect(serviceCopies('dovecot', paths, { dovecot: null })).toEqual([]);
+    if (fs.existsSync('/etc/dovecot')) expect(dovecotLayout().sslInclude).toBe(dc.sslInclude); else expect(dovecotLayout()).toBeNull();
   });
 
   it('renders only real Exim main options, for OpenSSL and GnuTLS builds', () => {
@@ -315,6 +343,12 @@ describe('Exim layout detection', () => {
     expect(twice.startsWith('MAIN_TLS_ENABLE = true\n')).toBe(true);
     expect(mergeEximBlock(null, 'STARTTLS', 'MAIN_TLS_ENABLE = true')).toBe('# BEGIN WHM panel (SSL/TLS: STARTTLS) - managed block, edits inside are overwritten\nMAIN_TLS_ENABLE = true\n# END WHM panel (SSL/TLS: STARTTLS)\n');
     expect(mergeEximBlock('no trailing newline', 'STARTTLS', 'x')).toMatch(/^no trailing newline\n# BEGIN/);
+    // Stripping one block leaves everything else byte for byte.
+    const stripped = stripEximBlock(twice, 'TLS policy');
+    expect(readEximBlock(stripped, 'TLS policy')).toBeNull();
+    expect(readEximBlock(stripped, 'STARTTLS')).toBe('.ifndef MAIN_TLS_ENABLE\nMAIN_TLS_ENABLE = true\n.endif\n');
+    expect(stripped.startsWith(admin)).toBe(true);
+    expect(stripEximBlock(admin, 'TLS policy')).toBe(admin);
   });
 
   it('writeEximFragment merges into localmacros, validates with update-exim4.conf and restores on rejection', async () => {

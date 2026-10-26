@@ -24,6 +24,7 @@ export default function EasyApache4({ fn }) {
   const [removeDependents, setRemoveDependents] = useState(false);
   const [editor, setEditor] = useState(null);
   const [family, setFamily] = useState('debian');
+  const [custom, setCustom] = useState('');
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(null);
   const runner = useJobRunner({ onFinished: () => { profiles.refetch(); installed.refetch(); builds.refetch(); if (selectedId) loadDiff(selectedId); } });
@@ -45,6 +46,7 @@ export default function EasyApache4({ fn }) {
     runner.start(() => api.post(`/software/ea4/profiles/${p.id}/build`, { removeExtras, removeDependents: removeExtras && removeDependents }), `EasyApache build: ${p.name}`);
   };
   const openEditor = (profile, asCopy = false) => {
+    setCustom('');
     if (!profile) return setEditor({ ...EMPTY, mode: 'create' });
     setEditor({ id: profile.id, name: asCopy ? `${profile.name} (custom)` : profile.name, description: profile.description || '', packages: { debian: [...profile.packages.debian], rhel: [...profile.packages.rhel] }, mode: asCopy ? 'copy' : 'edit' });
   };
@@ -64,7 +66,7 @@ export default function EasyApache4({ fn }) {
     try { await api.delete(`/software/ea4/profiles/${p.id}`); toast.success('Profile deleted'); if (selectedId === p.id) { setSelectedId(null); setDiff(null); } profiles.refetch(); } catch (err) { toast.error(err); }
   };
   const togglePkg = (name) => setEditor((e) => { const list = e.packages[family]; return { ...e, packages: { ...e.packages, [family]: list.includes(name) ? list.filter((p) => p !== name) : [...list, name] } }; });
-  const addCustom = (text) => { const names = text.split(/[\s,]+/).filter(Boolean); if (names.length) setEditor((e) => ({ ...e, packages: { ...e.packages, [family]: [...new Set([...e.packages[family], ...names])] } })); };
+  const addCustom = (text) => { const names = text.split(/[\s,]+/).filter(Boolean); if (names.length) setEditor((e) => ({ ...e, packages: { ...e.packages, [family]: [...new Set([...e.packages[family], ...names])] } })); setCustom(''); };
 
   return (
     <>
@@ -155,8 +157,9 @@ export default function EasyApache4({ fn }) {
                 </div>
               </div>
             ))}
-            <Field label="Additional packages" help="Any other distro package names, separated by spaces or commas (press Enter to add)">
-              <Textarea rows={2} mono value="" onChange={() => {}} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addCustom(e.target.value); e.target.value = ''; } }} placeholder="libapache2-mod-rpaf php8.3-xdebug" />
+            <Field label="Additional packages" help="Any other distro package names, separated by spaces or commas (press Enter or Add)">
+              <Textarea rows={2} mono value={custom} onChange={setCustom} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addCustom(custom); } }} placeholder="libapache2-mod-rpaf php8.3-xdebug" />
+              <div className="action-row"><Button size="sm" disabled={!custom.trim()} onClick={() => addCustom(custom)}>Add to {family === 'rhel' ? 'RHEL' : 'Debian'} list</Button></div>
             </Field>
             <p className="small">Selected for {family}: {editor.packages[family].length ? editor.packages[family].map((p) => <code key={p} style={{ marginRight: 6 }}>{p}</code>) : <span className="muted">nothing yet</span>}</p>
             <ErrorBanner error={saveError} />

@@ -5,7 +5,9 @@ import { createSslService, SSL_SERVICES } from '../../services/ssl-tls.js';
 
 const PEM_BODY = '[A-Za-z0-9+/=\\r\\n ]+';
 const pemBlock = (label) => new RegExp(`^\\s*-----BEGIN ${label}-----\\r?\\n${PEM_BODY}-----END ${label}-----\\s*$`);
-const keyPem = z.string().max(64 * 1024).regex(pemBlock('(?:RSA |EC |ENCRYPTED )?PRIVATE KEY'), 'Must be one PEM private key');
+// Same labels as the agent's pem.key: passphrase-protected keys are refused here
+// with a hint instead of making openssl prompt for a passphrase it cannot get.
+const keyPem = z.string().max(64 * 1024).regex(pemBlock('(?:RSA |EC )?PRIVATE KEY'), 'Must be one unencrypted PEM private key (decrypt a passphrase-protected key first: openssl pkey -in key.pem -out plain.pem)');
 const certPem = z.string().max(64 * 1024).regex(pemBlock('CERTIFICATE'), 'Must be one PEM certificate');
 const csrPem = z.string().max(64 * 1024).regex(pemBlock('(?:NEW )?CERTIFICATE REQUEST'), 'Must be a PEM certificate signing request');
 const chainPem = z.string().max(256 * 1024).regex(new RegExp(`^\\s*(?:-----BEGIN CERTIFICATE-----\\r?\\n${PEM_BODY}-----END CERTIFICATE-----\\s*)+$`), 'Must be one or more PEM certificates');
@@ -31,6 +33,7 @@ export async function register(ctx) {
   ctx.capabilities.register('acme', { binaries: ['certbot', 'acme.sh'], required: ['certbot', 'acme.sh'] });
   ctx.jobs.register('ssl.autossl.run', (job) => ctx.ssl.autossl.run(job));
   ctx.scheduler.ensure('autossl-daily', '17 3 * * *', 'ssl.autossl.run', { trigger: 'scheduled' });
+  ctx.ssl.autossl.syncSchedule();
 
   const s = ctx.ssl;
   const r = Router();
@@ -54,12 +57,13 @@ export async function register(ctx) {
   r.get('/domains', requireReseller, wrap((req) => s.domains(req.user)));
   r.post('/install', requireReseller, validate({ body: z.object({ domain: fields.hostname, certId: fields.id.optional(), certPem: certPem.optional(), keyPem: keyPem.optional(), chainPem: chainPem.optional(), force: z.boolean().default(false) }).strict() }), wrap((req) => s.install(req.body, req.user, req)));
   r.get('/hosts', requireReseller, wrap((req) => s.hosts.list(req.user)));
+  r.get('/hosts/:domain', requireReseller, validate({ params: z.object({ domain: fields.hostname }) }), wrap((req) => s.hosts.get(req.params.domain, req.user)));
   r.delete('/hosts/:domain', requireReseller, validate({ params: z.object({ domain: fields.hostname }) }), wrap((req) => s.uninstall(req.params.domain, req.user, req)));
 
   // AutoSSL (server-wide)
   r.get('/autossl', requireRoot, wrap(() => s.autossl.status()));
   r.put('/autossl/settings', requireRoot, validate({ body: z.object({
-    provider: z.enum(['disabled', 'certbot', 'acme.sh']).optional(), email: z.union([z.literal(''), z.string().email().max(254)]).optional(), method: z.enum(['webroot', 'standalone']).optional(),
+    provider: z.enum(['disabled', 'certbot', 'acme.sh']).optional(), email: z.union([z.literal(''), z.string().email().max(254).regex(/^[^-\s]/, 'May not start with "-"')]).optional(), method: z.enum(['webroot', 'standalone']).optional(),
     staging: z.boolean().optional(), keyType: z.enum(['rsa', 'ecdsa']).optional(), renewDays: z.number().int().min(1).max(89).optional(), includeWww: z.boolean().optional(), replaceCustom: z.boolean().optional(),
   }).strict() }), wrap((req) => s.autossl.updateSettings(req.body, req)));
   r.post('/autossl/exclusions', requireRoot, validate({ body: z.object({ kind: z.enum(['account', 'domain']), value: z.string().max(253), reason: z.string().max(200).optional() }).strict().refine((v) => (v.kind === 'account' ? fields.username.safeParse(v.value).success : fields.hostname.safeParse(v.value).success), { message: 'Must be a valid username or hostname', path: ['value'] }) }),

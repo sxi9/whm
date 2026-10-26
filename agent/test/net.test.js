@@ -53,7 +53,9 @@ describe('net schemas reject injection and traversal before anything runs', () =
       expect(err.code, JSON.stringify(iface)).toBe('invalid_args');
       expect(err.details.fields.iface).toBeDefined();
     }
-    for (const prefix of [-1, 129, '24', 24.5, null]) expect((await opError(runOp('net.ip.add', { address: '203.0.113.5', prefix, iface: 'eth0' }, ctx))).code, String(prefix)).toBe('invalid_args');
+    // 0 included: a /0 bind would install a default on-link route.
+    for (const prefix of [-1, 0, 129, '24', 24.5, null]) expect((await opError(runOp('net.ip.add', { address: '203.0.113.5', prefix, iface: 'eth0' }, ctx))).code, String(prefix)).toBe('invalid_args');
+    for (const iface of ['-eth0', '.eth0']) expect((await opError(runOp('net.ip.add', { address: '203.0.113.5', prefix: 24, iface }, ctx))).code, iface).toBe('invalid_args');
     for (const label of ['A B', 'x;y', '../', 'toolonglabel', '']) expect((await opError(runOp('net.ip.add', { address: '203.0.113.5', prefix: 24, iface: 'eth0', label }, ctx))).code, label).toBe('invalid_args');
     expect((await opError(runOp('net.ip.add', { address: '203.0.113.5', prefix: 24, iface: 'eth0', extra: true }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('net.ip.add', { address: '203.0.113.5', iface: 'eth0' }, ctx))).code).toBe('invalid_args');
@@ -71,7 +73,7 @@ describe('net schemas reject injection and traversal before anything runs', () =
   it('net.persist.write validates every address entry and never writes on bad input', async () => {
     exec.mockClear();
     for (const addresses of [
-      [{ address: '-r', prefix: 24, iface: 'eth0' }], [{ address: '203.0.113.5', prefix: 24, iface: 'eth0;reboot' }], [{ address: '203.0.113.5', prefix: 200, iface: 'eth0' }],
+      [{ address: '-r', prefix: 24, iface: 'eth0' }], [{ address: '203.0.113.5', prefix: 24, iface: 'eth0;reboot' }], [{ address: '203.0.113.5', prefix: 200, iface: 'eth0' }], [{ address: '203.0.113.5', prefix: 0, iface: 'eth0' }],
       [{ address: '203.0.113.5', prefix: 24, iface: 'eth0', label: 'a b' }], [{ address: '203.0.113.5', prefix: 24, iface: 'eth0', path: '/etc/passwd' }], 'eth0', null,
     ]) {
       expect((await opError(runOp('net.persist.write', { addresses }, ctx))).code, JSON.stringify(addresses)).toBe('invalid_args');
@@ -192,9 +194,13 @@ describe('net pure helpers', () => {
     expect(prefixToNetmask(24)).toBe('255.255.255.0');
     expect(prefixToNetmask(32)).toBe('255.255.255.255');
     expect(prefixToNetmask(17)).toBe('255.255.128.0');
+    expect(prefixToNetmask(0)).toBe('0.0.0.0');
+    expect(prefixToNetmask(1)).toBe('128.0.0.0');
     expect(netmaskToPrefix('255.255.255.0')).toBe(24);
     expect(netmaskToPrefix('255.255.255.255')).toBe(32);
     expect(netmaskToPrefix('255.0.255.0')).toBeNull();
     expect(netmaskToPrefix('16')).toBe(16);
+    expect(netmaskToPrefix('999')).toBeNull();
+    expect(netmaskToPrefix('33')).toBeNull();
   });
 });

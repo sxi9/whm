@@ -12,7 +12,7 @@ const ROUTING = [
   { value: 'local', label: 'Local Mail Exchanger', description: 'This server accepts mail for the domain. MX → mail.<domain> (priority 0).' },
   { value: 'backup', label: 'Backup Mail Exchanger', description: 'Remote servers deliver first; this server queues mail when they are down. Your MX hosts plus a lower-priority local MX.' },
   { value: 'remote', label: 'Remote Mail Exchanger', description: 'Mail is handled elsewhere (e.g. Google Workspace). This server does not accept mail for the domain.' },
-  { value: 'auto', label: 'Automatically Detect Configuration', description: 'Decide from the MX records at delivery time. MX records are left as they are.' },
+  { value: 'auto', label: 'Automatically Detect Configuration', description: 'Decide from the MX records: local when this server is the primary MX, backup when it is a lower-priority MX, remote otherwise. MX records are left as they are.' },
 ];
 
 function RoutingForm({ row, onSaved, onCancel }) {
@@ -69,6 +69,7 @@ export default function EmailRoutingConfiguration({ fn }) {
             { key: 'domain', label: 'Domain', render: (r) => <code>{r.domain}</code> },
             { key: 'account', label: 'Account', render: (r) => r.account || <span className="muted">—</span> },
             { key: 'routing', label: 'Routing', render: (r) => <StatusPill status={{ local: 'ok', remote: 'info', backup: 'warning', auto: 'unknown' }[r.routing]}>{ROUTING.find((o) => o.value === r.routing)?.label || r.routing}</StatusPill> },
+            { key: 'effective', label: 'Effective', render: (r) => <StatusPill status={{ local: 'ok', remote: 'info', backup: 'warning' }[r.effective] || 'unknown'}>{r.routing === 'auto' ? `auto → ${r.effective}` : r.effective}</StatusPill> },
             { key: 'mx', label: 'MX records', render: (r) => (r.mx.length ? <span style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>{r.mx.map((m) => `${m.priority} ${m.value}`).join(', ')}</span> : <span className="muted">none</span>) },
           ]}
           rows={rows} loading={loading} error={error} rowKey={(r) => r.domain} emptyText="No zones yet; add a DNS zone first."

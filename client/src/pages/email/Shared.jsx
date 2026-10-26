@@ -23,10 +23,16 @@ export function EximNotice({ status, onRetry }) {
   return <CapabilityNotice error={{ code: 'capability_missing', message: 'Exim is not installed on this server. Install exim4 (Debian/Ubuntu) or exim (RHEL) to manage mail; the settings you save here are kept and applied once it is.' }} onRetry={onRetry} />;
 }
 
+// Only the current mainlog is scanned; when the chosen window reaches further
+// back than its first line (daily rotation on Debian), say so.
 export function LogNote({ meta }) {
   if (!meta) return null;
   if (meta.logExists === false) return <div className="banner banner-info"><div>The Exim main log ({meta.file}) does not exist yet; nothing has been logged on this host.</div></div>;
-  if (meta.logTruncated) return <p className="muted">Only the most recent part of {meta.file} was scanned (window: {meta.hours ? `${meta.hours} h` : 'whole log'}).</p>;
+  const from = meta.logFrom ? Date.parse(`${meta.logFrom.replace(' ', 'T')}`) : null;
+  const windowStart = meta.hours ? Date.now() - Number(meta.hours) * 3600_000 : null;
+  const shortLog = from && (!windowStart || from > windowStart);
+  if (meta.logTruncated) return <p className="muted">Only the most recent part of {meta.file} was scanned (window: {meta.hours ? `${meta.hours} h` : 'whole log'}){meta.logFrom ? `, starting ${meta.logFrom}` : ''}.</p>;
+  if (shortLog) return <p className="muted">{meta.file} starts at {meta.logFrom}; earlier mail is in rotated log files, which are not scanned.</p>;
   return null;
 }
 

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { q, parseBatch, parseGrant, parseMysqlcheck, parseCnf, renderCnf, renderClientCnf, renderRootMyCnf, classifyMysqlError, detectEngine, detectLayout, phpMyAdminVersion, cloneUserStatements, pickPgUnit, PRIVILEGES } from '../src/ops/db.js';
+import { q, parseBatch, parseGrant, parseMysqlcheck, parseCnf, renderCnf, renderClientCnf, renderRootMyCnf, classifyMysqlError, detectEngine, detectLayout, phpMyAdminVersion, cloneUserStatements, pickPgUnit, PRIVILEGES, validateServerConfig, classifyProbeOutput, clientWarnings } from '../src/ops/db.js';
 
 // exec is spied with the real implementation behind it so tests can prove an op
 // refused before any program ran. This dev box has no mysql client: every op
@@ -96,7 +96,7 @@ describe('db schemas reject injection, traversal and unknown keys before anythin
 
   it('credentials object is strict and typed', async () => {
     exec.mockClear();
-    for (const credentials of [{ user: 'a b' }, { host: 'h;x' }, { port: 70000 }, { port: '3306' }, { socket: 'relative.sock' }, { password: 'x\ny' }, { user: 'root', extra: 1 }, 'root:pw']) {
+    for (const credentials of [{ user: 'a b' }, { host: 'h;x' }, { port: 70000 }, { port: '3306' }, { socket: 'relative.sock' }, { password: 'x\ny' }, { user: 'root', extra: 1 }, 'root:pw', { bindAddress: 'db.example.net' }, { bindAddress: '10.0.0.1;x' }, { bindAddress: '' }, { bindAddress: '999.1.1.1' }]) {
       expect((await opError(runOp('db.version', { credentials }, ctx))).code, JSON.stringify(credentials)).toBe('invalid_args');
     }
     expect((await opError(runOp('db.version', { bogus: 1 }, ctx))).code).toBe('invalid_args');
@@ -293,7 +293,76 @@ describe('SQL quoting and parsers', () => {
   it('renders option files with escaped passwords', () => {
     const cnf = renderClientCnf({ host: 'db.example.net', port: 3307, user: 'admin', password: 'p"a\\s#w' });
     expect(cnf).toContain('[client]\nhost="db.example.net"\nport=3307\nuser="admin"\npassword="p\\"a\\\\s#w"\n');
+    expect(cnf).not.toContain('bind-address');
     expect(renderRootMyCnf('x"y')).toContain('user=root\npassword="x\\"y"');
+  });
+
+  it('writes the remote source address as a loose client option so MariaDB clients only warn', () => {
+    const cnf = renderClientCnf({ host: 'db.example.net', user: 'admin', password: 'pw', bindAddress: '203.0.113.10' });
+    expect(cnf).toContain('\nloose-bind-address="203.0.113.10"\n');
+    expect(cnf.indexOf('[client]')).toBeLessThan(cnf.indexOf('loose-bind-address'));
+    expect(renderClientCnf({ host: '2001:db8::5', user: 'admin', bindAddress: '2001:db8::10' })).toContain('loose-bind-address="2001:db8::10"');
+    expect(clientWarnings("mysql: unknown variable 'loose-bind-address=203.0.113.10'\nWARNING: something\n")).toEqual(["mysql: unknown variable 'loose-bind-address=203.0.113.10'", 'WARNING: something']);
+    expect(clientWarnings("ERROR 1045 (28000): Access denied\n")).toEqual([]);
+    expect(clientWarnings('')).toEqual([]);
+  });
+
+  it('classifies --validate-config output: rejections, clean runs and probes that could not run', () => {
+    expect(classifyProbeOutput(1, "2026-10-26T10:00:00.000000Z 0 [ERROR] [MY-000067] [Server] unknown variable 'bogus_option=1'.\n2026-10-26T10:00:00.000000Z 0 [ERROR] [MY-010119] [Server] Aborting\n")).toEqual({ validated: true, ok: false, output: "2026-10-26T10:00:00.000000Z 0 [ERROR] [MY-000067] [Server] unknown variable 'bogus_option=1'." });
+    expect(classifyProbeOutput(1, "[ERROR] [MY-010140] [Server] Error while setting value '10x' to 'max_connections'.\n")).toMatchObject({ validated: true, ok: false });
+    expect(classifyProbeOutput(0, '')).toEqual({ validated: true, ok: true, output: '' });
+    expect(classifyProbeOutput(0, '2026-10-26T10:00:00.000000Z 0 [System] [MY-013169] [Server] /usr/sbin/mysqld (mysqld 8.0.39) initializing of server in progress\n')).toMatchObject({ validated: true, ok: true });
+    // The root guard is a probe failure, never a configuration rejection.
+    const rootGuard = classifyProbeOutput(1, "2026-10-26T10:00:00.000000Z 0 [ERROR] [MY-010123] [Server] Fatal error: Please read \"Security\" section of the manual to find out how to run mysqld as root!\n2026-10-26T10:00:00.000000Z 0 [ERROR] [MY-010119] [Server] Aborting\n");
+    expect(rootGuard).toMatchObject({ validated: false, ok: true });
+    expect(rootGuard.output).toMatch(/not validated/);
+    expect(classifyProbeOutput(1, "mysqld: Fatal error: Can't change to run as user 'mysql' ;  Please check that the user exists!\n")).toMatchObject({ validated: false, ok: true });
+    // Anything else that exits non-zero is still treated as a rejection.
+    expect(classifyProbeOutput(1, '[ERROR] [MY-010119] [Server] Aborting\n')).toMatchObject({ validated: true, ok: false, output: '[ERROR] [MY-010119] [Server] Aborting' });
+  });
+
+  it('validateServerConfig probes as the mysql user and falls back to MariaDB --help --verbose', async () => {
+    const original = exec.getMockImplementation();
+    const script = (answers) => exec.mockImplementation(async (bin, argv) => { const a = answers(bin, argv); return { code: 0, stdout: '', stderr: '', bin, argv, ...a }; });
+    try {
+      exec.mockClear();
+      // MySQL 8 as root, valid file: --user=mysql is passed and the run is clean.
+      script((bin, argv) => (argv.includes('--validate-config') ? { code: 0 } : { code: 1, stderr: 'unexpected' }));
+      expect(await validateServerConfig('mysqld')).toEqual({ validated: true, ok: true, output: '' });
+      expect(exec.mock.calls[0][0]).toBe('mysqld');
+      expect(exec.mock.calls[0][1]).toEqual(['--validate-config', '--user=mysql']);
+      expect(exec).toHaveBeenCalledTimes(1);
+
+      // MySQL 8 rejects an unknown variable.
+      exec.mockClear();
+      script(() => ({ code: 1, stderr: "[ERROR] [MY-000067] [Server] unknown variable 'bogus-option=1'.\n[ERROR] [MY-010119] [Server] Aborting\n" }));
+      const bad = await validateServerConfig('mysqld');
+      expect(bad).toMatchObject({ validated: true, ok: false });
+      expect(bad.output).toMatch(/unknown variable 'bogus-option=1'/);
+
+      // A probe stopped by the root guard does not count as a rejection.
+      exec.mockClear();
+      script(() => ({ code: 1, stderr: '[ERROR] [MY-010123] [Server] Fatal error: Please read "Security" section of the manual to find out how to run mysqld as root!\n' }));
+      expect(await validateServerConfig('mysqld')).toMatchObject({ validated: false, ok: true });
+
+      // MariaDB: no --validate-config; --help --verbose parses the files.
+      exec.mockClear();
+      script((bin, argv) => (argv.includes('--validate-config') ? { code: 2, stderr: "mariadbd: unknown option '--validate-config'\n" } : { code: 0, stdout: 'Usage: mariadbd [OPTIONS]\n\nVariables (--variable-name=value)\nmax-connections 151\n' }));
+      expect(await validateServerConfig('mariadbd')).toEqual({ validated: true, ok: true, output: '' });
+      expect(exec.mock.calls[1][1]).toEqual(['--help', '--verbose', '--user=mysql']);
+
+      exec.mockClear();
+      script((bin, argv) => (argv.includes('--validate-config') ? { code: 2, stderr: "mariadbd: unknown option '--validate-config'\n" } : { code: 1, stderr: "2026-10-26 10:00:00 0 [ERROR] /usr/sbin/mariadbd: unknown variable 'bogus-option=1'\n" }));
+      const mariaBad = await validateServerConfig('mariadbd');
+      expect(mariaBad).toMatchObject({ validated: true, ok: false });
+      expect(mariaBad.output).toMatch(/unknown variable 'bogus-option=1'/);
+
+      exec.mockClear();
+      expect(await validateServerConfig(null)).toMatchObject({ validated: false, ok: true });
+      expect(exec).not.toHaveBeenCalled();
+    } finally {
+      exec.mockImplementation(original);
+    }
   });
 
   it('classifies mysql client errors', () => {

@@ -13,8 +13,11 @@ import { isRoot } from '../middleware/rbac.js';
 //   ssl.installServiceCert(service, { certPem, keyPem, chainPem }, req)  service ∈ exim|dovecot|apache|ftp|panel
 //   ssl.serviceCertStatus()
 //   ssl.inspect(certPem, chainPem?)                   -> parsed certificate (+ chain verification)
-//   ssl.removeAccountCerts(accountId, req)            -> called when an account is terminated
-// The web category (ctx.web) is reached lazily: applySsl(domain, paths, req) / removeSsl(domain, req).
+//   ssl.removeAccountCerts(accountId, req)            -> async; call BEFORE the accounts row is deleted: uninstalls
+//                                                        every installed bundle (files, vhost SSL, ACME client) then purges rows
+// The web category (ctx.web) is reached lazily: applySsl(domain, paths, req) / removeSsl(domain, req), and the
+// Exim/Dovecot TLS presets go through applyEximTls / applyMailserverTls (service-configuration renders those files;
+// this category only writes certificate paths for Dovecot and owns the Apache protocol/cipher include).
 
 export const TLS_PRESETS = {
   modern: {
@@ -66,12 +69,13 @@ export function createSslService(ctx) {
     keyCandidates: db.prepare(`SELECT ${CERT_SELECT} FROM ${CERT_FROM} WHERE c.key_enc IS NOT NULL AND (@owner IS NULL OR a.owner_id = @owner) ORDER BY CASE WHEN c.domain = @domain THEN 0 ELSE 1 END, c.id DESC LIMIT 25`),
     insertCert: db.prepare(`INSERT INTO ssl_certs (account_id, domain, cert_pem, key_enc, chain_pem, csr_pem, issuer, subject, not_before, not_after, autossl, installed)
       VALUES (@account_id, @domain, @cert_pem, @key_enc, @chain_pem, @csr_pem, @issuer, @subject, @not_before, @not_after, @autossl, @installed)`),
-    updateCert: db.prepare(`UPDATE ssl_certs SET cert_pem = @cert_pem, key_enc = @key_enc, chain_pem = @chain_pem, csr_pem = @csr_pem, issuer = @issuer, subject = @subject, not_before = @not_before, not_after = @not_after, autossl = @autossl, installed = @installed, domain = @domain WHERE id = @id`),
+    updateCert: db.prepare(`UPDATE ssl_certs SET account_id = @account_id, cert_pem = @cert_pem, key_enc = @key_enc, chain_pem = @chain_pem, csr_pem = @csr_pem, issuer = @issuer, subject = @subject, not_before = @not_before, not_after = @not_after, autossl = @autossl, installed = @installed, domain = @domain WHERE id = @id`),
     setInstalled: db.prepare('UPDATE ssl_certs SET installed = ? WHERE id = ?'),
     supersede: db.prepare('UPDATE ssl_certs SET installed = 0 WHERE domain = ? AND installed > 0 AND id <> ?'),
     clearPart: { key: db.prepare('UPDATE ssl_certs SET key_enc = NULL WHERE id = ?'), csr: db.prepare('UPDATE ssl_certs SET csr_pem = NULL WHERE id = ?'), cert: db.prepare('UPDATE ssl_certs SET cert_pem = NULL, chain_pem = NULL, issuer = NULL, not_before = NULL, not_after = NULL WHERE id = ?') },
     deleteCert: db.prepare('DELETE FROM ssl_certs WHERE id = ?'),
     deleteAccountCerts: db.prepare('DELETE FROM ssl_certs WHERE account_id = ?'),
+    installedByAccount: db.prepare('SELECT * FROM ssl_certs WHERE account_id = ? AND installed > 0 ORDER BY domain'),
     accountByUsername: db.prepare('SELECT * FROM accounts WHERE username = ?'),
     accountByDomain: db.prepare('SELECT * FROM accounts WHERE domain = ?'),
     accountDomain: db.prepare('SELECT d.*, a.username, a.owner_id, a.home_dir, a.suspended FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE d.domain = ?'),
@@ -98,6 +102,17 @@ export function createSslService(ctx) {
 
   const op = (name, args, req) => agent.op(name, args, { req });
   const owner = (user) => (isRoot(user) ? null : user.id);
+
+  // openssl rejections name the offending input, so the form can highlight the
+  // field instead of showing a bare agent error.
+  const FIELD_OF = { invalid_certificate: 'certPem', invalid_cert: 'certPem', invalid_key: 'keyPem', invalid_csr: 'csrPem', key_mismatch: 'keyPem' };
+  async function pemOp(name, args, req) {
+    try { return await op(name, args, req); } catch (err) {
+      const field = err?.agentError ? FIELD_OF[err.code] : null;
+      if (field) throw unprocessable(err.message, { [field]: [err.message] });
+      throw err;
+    }
+  }
 
   function requireOpenssl() {
     capabilities.require('ssl', 'openssl is not installed on this server; install the openssl package');
@@ -174,7 +189,7 @@ export function createSslService(ctx) {
 
   async function inspect(certPem, chainPem, hostname) {
     requireOpenssl();
-    const certificate = await op('ssl.cert.inspect', { certPem });
+    const certificate = await pemOp('ssl.cert.inspect', { certPem });
     const chain = await op('ssl.cert.verify_chain', { certPem, ...(chainPem ? { chainPem } : {}), ...(hostname ? { hostname } : {}) }).catch((err) => ({ ok: false, error: err.message, output: '' }));
     return { certificate, chain };
   }
@@ -219,15 +234,15 @@ export function createSslService(ctx) {
       if (!certPem && !keyPem && !csrPem) throw unprocessable('Provide a certificate, a private key or a CSR', { certPem: ['At least one of certPem, keyPem or csrPem is required'] });
       let info = null;
       if (certPem) {
-        info = await op('ssl.cert.inspect', { certPem }, req);
+        info = await pemOp('ssl.cert.inspect', { certPem }, req);
         domain = domain || info.commonName || info.sans[0];
-        if (keyPem && !(await op('ssl.key.matches', { keyPem, certPem }, req)).matches) throw unprocessable('The private key does not match the certificate', { keyPem: ['Public key differs from the certificate'] });
+        if (keyPem && !(await pemOp('ssl.key.matches', { keyPem, certPem }, req)).matches) throw unprocessable('The private key does not match the certificate', { keyPem: ['Public key differs from the certificate'] });
       } else if (csrPem) {
-        const csr = await op('ssl.csr.inspect', { csrPem }, req);
+        const csr = await pemOp('ssl.csr.inspect', { csrPem }, req);
         domain = domain || csr.commonName || csr.sans[0];
-        if (keyPem && !(await op('ssl.key.matches', { keyPem, csrPem }, req)).matches) throw unprocessable('The private key does not match the CSR', { keyPem: ['Public key differs from the CSR'] });
+        if (keyPem && !(await pemOp('ssl.key.matches', { keyPem, csrPem }, req)).matches) throw unprocessable('The private key does not match the CSR', { keyPem: ['Public key differs from the CSR'] });
       } else {
-        await op('ssl.key.inspect', { keyPem }, req);
+        await pemOp('ssl.key.inspect', { keyPem }, req);
       }
       if (!domain) throw unprocessable('A domain is required when the upload has no certificate or CSR', { domain: ['Required'] });
       const acct = account ? resolveAccount(account, user) : resolveDomain(domain, user).account;
@@ -290,55 +305,100 @@ export function createSslService(ctx) {
       chainPem = chainPem || source.chain_pem || undefined;
     }
     if (!certPem) throw unprocessable('A certificate is required', { certPem: ['Paste a certificate or pick a stored one'] });
-    const certificate = await op('ssl.cert.inspect', { certPem }, req);
+    const certificate = await pemOp('ssl.cert.inspect', { certPem }, req);
     if (!keyPem) {
       for (const cand of stmts.keyCandidates.all({ owner: owner(user), domain })) {
         const pemKey = crypto.decrypt(cand.key_enc);
-        if ((await op('ssl.key.matches', { keyPem: pemKey, certPem }, req)).matches) { keyPem = pemKey; source = source || cand; break; }
+        if ((await op('ssl.key.matches', { keyPem: pemKey, certPem }, req).catch(() => ({ matches: false }))).matches) { keyPem = pemKey; source = source || cand; break; }
       }
       if (!keyPem) throw unprocessable('No private key was provided and no stored key matches this certificate', { keyPem: ['Required: paste the matching private key'] });
-    } else if (!(await op('ssl.key.matches', { keyPem, certPem }, req)).matches) {
+    } else if (!(await pemOp('ssl.key.matches', { keyPem, certPem }, req)).matches) {
       throw unprocessable('The private key does not match the certificate', { keyPem: ['Public key differs from the certificate'] });
     }
     if (!certCovers(certificate, domain) && !force) throw unprocessable(`The certificate is issued for ${[certificate.commonName, ...certificate.sans].filter(Boolean).join(', ')}, not ${domain}`, { domain: ['Not covered by the certificate; set force=true to install anyway'] });
     if (certificate.expired && !force) throw unprocessable(`The certificate expired on ${certificate.notAfter}`, { certPem: ['Expired; set force=true to install anyway'] });
-    const written = await op('ssl.bundle.install_for_domain', { domain, certPem, keyPem, ...(chainPem ? { chainPem } : {}) }, req);
+    const written = await pemOp('ssl.bundle.install_for_domain', { domain, certPem, keyPem, ...(chainPem ? { chainPem } : {}) }, req);
     const web = await applyWeb(domain, written.paths, req);
     const record = certRecord(certificate, { domain, accountId: target.accountId, certPem, keyPem, chainPem, csrPem: source?.csr_pem ?? null, autossl: source?.autossl ?? 0, installed: web.state });
+    // A stored row holding this very certificate follows the install (it moves
+    // to the target domain and account) unless it is installed elsewhere, so the
+    // Storage Manager does not end up with one copy of the key per hostname.
+    const reuse = source && source.cert_pem === certPem && (source.domain === domain || source.installed === 0);
     let id;
-    if (source && source.domain === domain && source.cert_pem === certPem) { stmts.updateCert.run({ ...record, id: source.id }); id = source.id; } else id = Number(stmts.insertCert.run(record).lastInsertRowid);
+    if (reuse) { stmts.updateCert.run({ ...record, id: source.id }); id = source.id; } else id = Number(stmts.insertCert.run(record).lastInsertRowid);
     stmts.supersede.run(domain, id);
     req?.audit?.({ action: 'ssl.install', target: domain, args: { account: target.account?.username ?? null, certId: source?.id ?? null, issuer: certificate.issuerText, notAfter: certificate.notAfter, web: web.web } });
     return { cert: shape(stmts.certById.get(id)), certificate, paths: written.paths, web: web.web, webDetail: web.detail };
   }
 
+  // Tells the ACME client to forget a name it issued, so its own timer stops
+  // renewing it. Best effort: the bundle is gone either way.
+  async function forgetAcme(domain, req) {
+    const provider = settings.get('ssl.autossl.provider', 'disabled');
+    if (provider === 'disabled') return { skipped: 'disabled' };
+    try { return await op('ssl.acme.remove', { provider, name: domain }, req); } catch (err) {
+      logger.warn({ err, domain }, 'ssl: acme client removal failed');
+      return { removed: false, error: err.message };
+    }
+  }
+
+  // Authorised by the DOMAIN's owner, not the stored row's: root may install a
+  // reseller's stored certificate on someone else's hostname and that reseller
+  // must not be able to strip it again.
   async function uninstall(domain, user, req) {
+    resolveDomain(domain, user);
     const row = stmts.installedByDomain.get(domain);
-    if (row) visible(row, user); else resolveDomain(domain, user);
     const removed = await op('ssl.bundle.remove_for_domain', { domain }, req);
     let web = 'skipped';
     if (typeof ctx.web?.removeSsl === 'function') {
       try { await ctx.web.removeSsl(domain, req); web = 'applied'; } catch (err) { logger.warn({ err, domain }, 'ssl: web removal failed'); web = `failed: ${err.message}`; }
     }
+    const acme = row?.autossl ? await forgetAcme(domain, req) : null;
     if (row) stmts.setInstalled.run(0, row.id);
-    req?.audit?.({ action: 'ssl.uninstall', target: domain, args: { certId: row?.id ?? null, web } });
-    return { domain, removed: removed.removed, web, cert: shape(row ? stmts.certById.get(row.id) : null) };
+    req?.audit?.({ action: 'ssl.uninstall', target: domain, args: { certId: row?.id ?? null, web, acme: acme?.removed ?? null } });
+    return { domain, removed: removed.removed, web, acme, cert: shape(row ? stmts.certById.get(row.id) : null) };
   }
 
   const hosts = {
     async list(user) {
       const rows = stmts.installedAll.all({ owner: owner(user) }).map(shape);
       let bundles = [];
+      let listed = false;
       if (isRoot(user)) {
-        try { bundles = (await op('ssl.bundle.list')).bundles; } catch (err) { logger.warn({ err }, 'ssl: could not list bundle directory'); }
+        // Rows the panel knows need no openssl pass on the agent; only strays are inspected.
+        try { bundles = (await op('ssl.bundle.list', { knownDomains: rows.map((r) => r.domain) })).bundles; listed = true; } catch (err) { logger.warn({ err }, 'ssl: could not list bundle directory'); }
       }
       const known = new Set(rows.map((r) => r.domain));
       const hostsOut = rows.map((r) => {
         const b = bundles.find((x) => x.domain === r.domain);
-        return { ...r, files: b ? { present: true, hasKey: b.hasKey, hasChain: b.hasChain, notAfter: b.certificate?.notAfter ?? null } : { present: isRoot(user) ? false : null } };
+        // present: null = unknown (reseller view, or the directory listing failed), never "missing" by default.
+        return { ...r, files: b ? { present: true, hasKey: b.hasKey, hasChain: b.hasChain, notAfter: b.certificate?.notAfter ?? r.notAfter ?? null } : { present: listed ? false : null } };
       });
       for (const b of bundles) if (!known.has(b.domain)) hostsOut.push({ id: null, domain: b.domain, account: null, state: 'unmanaged', installed: 0, subject: b.certificate?.subjectText ?? null, issuer: b.certificate?.issuerText ?? null, notAfter: b.certificate?.notAfter ?? null, daysRemaining: daysUntil(b.certificate?.notAfter), expired: b.certificate ? b.certificate.expired : null, autossl: false, selfSigned: b.certificate?.selfSigned ?? false, files: { present: true, hasKey: b.hasKey, hasChain: b.hasChain } });
-      return { hosts: hostsOut.sort((a, b) => a.domain.localeCompare(b.domain)), bundleRoot: BUNDLE_ROOT, webLinked: typeof ctx.web?.applySsl === 'function' };
+      return { hosts: hostsOut.sort((a, b) => a.domain.localeCompare(b.domain)), bundleRoot: BUNDLE_ROOT, bundlesListed: listed, webLinked: typeof ctx.web?.applySsl === 'function' };
+    },
+    // One host with what is on disk (also for "unmanaged" directories that have no row).
+    async get(domain, user) {
+      resolveDomain(domain, user);
+      const row = stmts.installedByDomain.get(domain);
+      let files = { exists: null, paths: bundlePaths(domain) };
+      let certificate = null;
+      let chain = null;
+      try {
+        const read = await op('ssl.bundle.read_for_domain', { domain });
+        files = { exists: read.exists, paths: read.paths, hasChain: Boolean(read.chainPem) };
+        if (read.exists) {
+          certificate = read.certificate;
+          chain = await op('ssl.cert.verify_chain', { certPem: read.certPem, ...(read.chainPem ? { chainPem: read.chainPem } : {}), hostname: domain }).catch((err) => ({ ok: false, error: err.message, output: '' }));
+        }
+      } catch (err) { logger.warn({ err, domain }, 'ssl: could not read bundle'); files.error = err.message; }
+      if (!certificate && row?.cert_pem && capabilities.has('ssl')) {
+        const inspected = await inspect(row.cert_pem, row.chain_pem || undefined, domain);
+        certificate = inspected.certificate;
+        chain = chain || inspected.chain;
+      }
+      if (!row && !files.exists) throw notFound(`No certificate is installed on ${domain}`);
+      return { domain, cert: shape(row), state: row ? INSTALL_STATE[row.installed] : 'unmanaged', files, certificate: certificate ?? null, chain };
     },
     uninstall,
   };
@@ -388,8 +448,16 @@ export function createSslService(ctx) {
       const values = {};
       for (const [k, v] of Object.entries(input)) if (v !== undefined && map[k]) values[`ssl.autossl.${map[k]}`] = v;
       settings.setMany(values);
+      if (input.provider !== undefined) autossl.syncSchedule();
       req?.audit?.({ action: 'ssl.autossl.settings', args: values });
       return autossl.settings();
+    },
+    // The daily pass only runs while a provider is selected; otherwise the
+    // schedule is paused so no job rows are queued just to be skipped.
+    syncSchedule() {
+      const enabled = settings.get('ssl.autossl.provider', 'disabled') !== 'disabled';
+      ctx.scheduler.update('autossl-daily', { enabled });
+      return enabled;
     },
     isExcluded(d) {
       const ex = stmts.exclusions.all();
@@ -461,9 +529,15 @@ export function createSslService(ctx) {
         if (current && current.autossl && current.daysRemaining != null && current.daysRemaining > Number(s.renewDays) && !params.force) { entry.message = `valid for ${current.daysRemaining} more days`; summary.skipped++; continue; }
         try {
           const result = await autossl.issue(d, s, { force: Boolean(params.force) });
-          entry.action = current ? 'renewed' : 'issued';
-          entry.message = `${result.certificate.issuerCommonName || s.provider} until ${result.certificate.notAfter} (${result.web})`;
-          summary[current ? 'renewed' : 'issued']++;
+          if (result.renewed === false && current) {
+            // The client kept the existing certificate (its own "not due yet" rule), so nothing was renewed.
+            entry.message = `not due according to ${s.provider}; valid until ${result.certificate.notAfter}`;
+            summary.skipped++;
+          } else {
+            entry.action = current ? 'renewed' : 'issued';
+            entry.message = `${result.certificate.issuerCommonName || s.provider} until ${result.certificate.notAfter} (${result.web})${result.droppedNames?.length ? `; ${result.droppedNames.join(', ')} failed validation and was left out` : ''}`;
+            summary[current ? 'renewed' : 'issued']++;
+          }
           job?.log?.(`${d.domain}: ${entry.action} — ${entry.message}`);
         } catch (err) {
           entry.action = 'failed';
@@ -479,17 +553,28 @@ export function createSslService(ctx) {
     async issue(d, s = autossl.settings(), { force = false, req } = {}) {
       const names = [d.domain];
       if (s.includeWww && d.type !== 'sub' && !d.domain.startsWith('www.')) names.push(`www.${d.domain}`);
-      const result = await op('ssl.acme.issue', {
-        provider: s.provider, domains: names, method: s.method, ...(s.method === 'webroot' ? { webroot: d.docroot } : {}),
+      const issueArgs = (domains) => ({
+        provider: s.provider, domains, method: s.method, ...(s.method === 'webroot' ? { webroot: d.docroot } : {}),
         ...(s.email ? { email: s.email } : {}), staging: Boolean(s.staging), keyType: s.keyType || 'ecdsa', force,
-      }, req);
+      });
+      let result;
+      let droppedNames = [];
+      try {
+        result = await op('ssl.acme.issue', issueArgs(names), req);
+      } catch (err) {
+        // Like WHM's AutoSSL: a www name that fails validation must not cost the primary domain its certificate.
+        if (names.length === 1 || !(err?.agentError && err.code === 'acme_failed')) throw err;
+        logger.warn({ domain: d.domain, err: err.message }, 'ssl: multi-name issuance failed, retrying with the primary name only');
+        result = await op('ssl.acme.issue', issueArgs([d.domain]), req);
+        droppedNames = names.slice(1);
+      }
       const web = await applyWeb(d.domain, result.paths, req);
       const record = certRecord(result.certificate, { domain: d.domain, accountId: d.accountId, certPem: result.certPem, keyPem: result.keyPem, chainPem: result.chainPem, autossl: 1, installed: web.state });
       const existing = stmts.installedByDomain.get(d.domain);
       let id;
       if (existing?.autossl) { stmts.updateCert.run({ ...record, id: existing.id }); id = existing.id; } else id = Number(stmts.insertCert.run(record).lastInsertRowid);
       stmts.supersede.run(d.domain, id);
-      return { cert: shape(stmts.certById.get(id)), certificate: result.certificate, renewed: result.renewed, paths: result.paths, web: web.web, output: result.output };
+      return { cert: shape(stmts.certById.get(id)), certificate: result.certificate, renewed: result.renewed, droppedNames, paths: result.paths, web: web.web, output: result.output };
     },
     runs(limit = 20) {
       return stmts.runs.all(limit).map((r) => ({ id: r.id, trigger: r.trigger, provider: r.provider, jobId: r.job_id, startedAt: r.started_at, finishedAt: r.finished_at, status: r.status, summary: json.parse(r.summary_json, {}), entries: json.parse(r.entries_json, []) }));
@@ -589,9 +674,41 @@ export function createSslService(ctx) {
     policy(s = tls.settings()) {
       return { protocols: s.protocols, ciphers: s.ciphers, ciphersuites: s.ciphersuites || '', preferServerCiphers: s.preferServerCiphers, hsts: s.hsts };
     },
+    // Who renders each daemon's TLS options: Apache is this category's include;
+    // Exim and Dovecot are service-configuration's files when it exposes the
+    // hooks (Dovecot always: this category never writes its protocol/ciphers).
+    delegation() {
+      return { exim: typeof ctx.web?.applyEximTls === 'function', dovecot: typeof ctx.web?.applyMailserverTls === 'function' };
+    },
     async get() {
       const status = await op('ssl.tls_config.status').catch((err) => ({ error: err.message }));
-      return { settings: tls.settings(), presets: Object.fromEntries(Object.entries(TLS_PRESETS).map(([k, v]) => [k, { label: v.label, description: v.description, protocols: v.protocols, ciphers: v.ciphers, ciphersuites: v.ciphersuites, preferServerCiphers: v.preferServerCiphers }])), status, daemons: { apache: capabilities.has('apache'), exim: capabilities.has('exim'), dovecot: capabilities.has('dovecot') } };
+      return { settings: tls.settings(), presets: Object.fromEntries(Object.entries(TLS_PRESETS).map(([k, v]) => [k, { label: v.label, description: v.description, protocols: v.protocols, ciphers: v.ciphers, ciphersuites: v.ciphersuites, preferServerCiphers: v.preferServerCiphers }])), status, delegated: tls.delegation(), daemons: { apache: capabilities.has('apache'), exim: capabilities.has('exim'), dovecot: capabilities.has('dovecot') } };
+    },
+    // The shape service-configuration's applyEximTls / applyMailserverTls take.
+    mailPreset(p) {
+      const order = ['TLSv1', 'TLSv1.1', 'TLSv1.2', 'TLSv1.3'];
+      return { minProtocol: order.find((v) => p.protocols.includes(v)) || 'TLSv1.3', protocols: p.protocols, cipherList: p.ciphers, cipherSuites: p.ciphersuites || '', preferServerCiphers: p.preferServerCiphers };
+    },
+    async apply(next, req) {
+      const policy = tls.policy(next);
+      const delegated = tls.delegation();
+      const present = (svc) => next.services.includes(svc) && capabilities.has(svc);
+      const results = {};
+      const own = ['apache', 'exim'].filter((svc) => present(svc) && !(svc === 'exim' && delegated.exim));
+      const removeLegacy = [...(present('exim') && delegated.exim ? ['exim'] : []), ...(present('dovecot') ? ['dovecot'] : [])];
+      if (own.length || removeLegacy.length) {
+        const agentResult = await op('ssl.tls_config.apply', { policy, services: own, removeLegacy }, req);
+        Object.assign(results, agentResult.results);
+        for (const [svc, r] of Object.entries(agentResult.removed || {})) if (r.removed) results[svc] = { ...(results[svc] || {}), legacyRemoved: r.path || r.files };
+      }
+      const preset = tls.mailPreset(policy);
+      for (const [svc, hook] of [['exim', 'applyEximTls'], ['dovecot', 'applyMailserverTls']]) {
+        if (!present(svc) || (svc === 'exim' && !delegated.exim)) continue;
+        if (!delegated[svc]) { results[svc] = { ...(results[svc] || {}), pending: true, via: 'service-configuration', note: `Applied through Service Configuration (${svc === 'exim' ? 'Exim Configuration Manager' : 'Mailserver Configuration'}), which is not loaded on this server yet; the preset is saved and applies once it is.` }; continue; }
+        const result = await ctx.web[hook](preset, req);
+        results[svc] = { ...(results[svc] || {}), via: 'service-configuration', ...(result && typeof result === 'object' ? result : {}) };
+      }
+      return { applied: Object.keys(results).filter((svc) => !results[svc].pending), results };
     },
     async update(input, req) {
       const current = tls.settings();
@@ -606,7 +723,7 @@ export function createSslService(ctx) {
       let applied = null;
       if (input.apply !== false) {
         if (!next.services.some((svc) => capabilities.has(svc))) throw new CapabilityError('apache', 'None of Apache, Exim or Dovecot is installed on this server; the TLS policy was saved and is applied once one of them is installed.');
-        applied = await op('ssl.tls_config.apply', { policy: tls.policy(next), services: next.services.filter((svc) => capabilities.has(svc)) }, req);
+        applied = await tls.apply(next, req);
       }
       req?.audit?.({ action: 'ssl.tls.update', args: { preset: next.preset, protocols: next.protocols, hsts: next.hsts, services: next.services, applied: applied?.applied ?? null } });
       return { settings: tls.settings(), applied };
@@ -618,10 +735,10 @@ export function createSslService(ctx) {
   async function installServiceCert(service, { certPem, keyPem, chainPem }, req) {
     if (!SSL_SERVICES.includes(service)) throw badRequest(`Unknown service "${service}"`);
     requireOpenssl();
-    if (!(await op('ssl.key.matches', { keyPem, certPem }, req)).matches) throw unprocessable('The private key does not match the certificate', { keyPem: ['Public key differs from the certificate'] });
-    const result = await op('ssl.service_cert.install', { service, certPem, keyPem, ...(chainPem ? { chainPem } : {}) }, req);
+    if (!(await pemOp('ssl.key.matches', { keyPem, certPem }, req)).matches) throw unprocessable('The private key does not match the certificate', { keyPem: ['Public key differs from the certificate'] });
+    const result = await pemOp('ssl.service_cert.install', { service, certPem, keyPem, ...(chainPem ? { chainPem } : {}) }, req);
     stmts.upsertServiceCert.run({ service, cert_pem: certPem, key_enc: crypto.encrypt(keyPem), chain_pem: chainPem ?? null, not_after: result.certificate?.notAfter ?? null });
-    req?.audit?.({ action: 'ssl.service_cert.install', target: service, args: { issuer: result.certificate?.issuerText, notAfter: result.certificate?.notAfter, applied: result.applied, reload: result.reload } });
+    req?.audit?.({ action: 'ssl.service_cert.install', target: service, args: { issuer: result.certificate?.issuerText, notAfter: result.certificate?.notAfter, applied: result.applied, removed: result.removed, reload: result.reload } });
     return result;
   }
 
@@ -631,10 +748,22 @@ export function createSslService(ctx) {
     return SSL_SERVICES.map((service) => ({ service, ...(files[service] || { daemonPresent: null, hasCertificate: false, certificate: null }), stored: rows[service] ? { notAfter: rows[service].not_after, updatedAt: rows[service].updated_at } : null, daysRemaining: daysUntil(files[service]?.certificate?.notAfter ?? rows[service]?.not_after) }));
   }
 
-  function removeAccountCerts(accountId, req) {
+  // Account termination: every installed bundle (private keys on disk), its vhost
+  // SSL and its ACME registration go first, then the rows. A host that cannot be
+  // cleaned is logged and reported, never a reason to block the termination.
+  async function removeAccountCerts(accountId, req) {
+    const installed = stmts.installedByAccount.all(accountId);
+    const uninstalled = [];
+    const failed = [];
+    for (const row of installed) {
+      try { uninstalled.push((await uninstall(row.domain, { role: 'root' }, req)).domain); } catch (err) {
+        logger.warn({ err, domain: row.domain, accountId }, 'ssl: could not remove bundle during account termination');
+        failed.push({ domain: row.domain, error: err.message });
+      }
+    }
     const { changes } = stmts.deleteAccountCerts.run(accountId);
-    req?.audit?.({ action: 'ssl.account.purge', target: String(accountId), args: { removed: changes } });
-    return { removed: changes };
+    req?.audit?.({ action: 'ssl.account.purge', target: String(accountId), args: { removed: changes, uninstalled, failed: failed.map((f) => f.domain) } });
+    return { removed: changes, uninstalled, failed };
   }
 
   return {

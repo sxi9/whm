@@ -1,7 +1,11 @@
 import { Router } from 'express';
 import { validate, z, fields } from '../../lib/validate.js';
 import { requireRoot } from '../../middleware/rbac.js';
-import { createServiceConfigService, FTP_SERVERS, DNS_SERVERS, SSL_SERVICES } from '../../services/service-configuration.js';
+import { createServiceConfigService, FTP_SERVERS, DNS_SERVERS, SSL_SERVICES, TLS_VERSIONS } from '../../services/service-configuration.js';
+
+// OpenSSL cipher-list / TLS 1.3 suite syntax: no whitespace or shell/config metacharacters.
+const cipherList = z.string().max(2048).regex(/^[A-Za-z0-9:+!@_=-]*$/, 'OpenSSL cipher list such as ECDHE-RSA-AES256-GCM-SHA384:!aNULL');
+const cipherSuites = z.string().max(512).regex(/^[A-Za-z0-9_:]*$/, 'Colon-separated TLS_* suite names');
 
 const PEM_BODY = '[A-Za-z0-9+/=\\r\\n ]+';
 const pemBlock = (label) => new RegExp(`^\\s*-----BEGIN ${label}-----\\r?\\n${PEM_BODY}-----END ${label}-----\\s*$`);
@@ -45,11 +49,13 @@ const eximBody = z.object({
   ratelimitEnabled: z.boolean().optional(), ratelimitMailThreshold: int(1, 100_000).optional(), ratelimitMailDelay: int(1, 300).optional(), ratelimitRcptThreshold: int(1, 100_000).optional(), ratelimitRcptDelay: int(1, 300).optional(),
   dictionaryAttackProtection: z.boolean().optional(), maxUnknownCommands: int(0, 100).optional(), rcptFailLimit: int(1, 1000).optional(), rcptFailDelay: int(1, 300).optional(), recipientsMax: int(1, 100_000).optional(), recipientsMaxReject: z.boolean().optional(),
   requireTlsForAuth: z.boolean().optional(), logSelector: z.array(z.string().regex(/^[+-][a-z_]{1,40}$/, 'log_selector item such as +subject')).max(40).optional(),
+  // Normally handed over by SSL/TLS Configuration (ctx.web.applyEximTls); null drops the TLS options from the rendered file.
+  tls: z.object({ minProtocol: z.enum(TLS_VERSIONS).optional(), protocols: z.array(z.enum(TLS_VERSIONS)).min(1).max(4).optional(), cipherList: cipherList.optional(), cipherSuites: cipherSuites.optional(), preferServerCiphers: z.boolean().optional() }).strict().nullable().optional(),
 }).strict();
 
 const mailserverBody = z.object({
   protocols: z.array(z.enum(['imap', 'pop3', 'lmtp', 'sieve'])).max(4).optional(), maxUserIpConnections: int(1, 10_000).optional(), processLimit: int(1, 1_000_000).optional(), clientLimit: int(1, 1_000_000).optional(),
-  ssl: z.enum(['yes', 'required', 'no']).optional(), sslMinProtocol: z.enum(['TLSv1', 'TLSv1.1', 'TLSv1.2', 'TLSv1.3']).optional(), disablePlaintextAuth: z.boolean().optional(),
+  ssl: z.enum(['yes', 'required', 'no']).optional(), sslMinProtocol: z.enum(TLS_VERSIONS).optional(), sslCipherList: cipherList.optional(), sslCipherSuites: cipherSuites.optional(), sslPreferServerCiphers: z.boolean().optional(), disablePlaintextAuth: z.boolean().optional(),
   loginGreeting: z.string().max(200).regex(/^[^\n\r\0]*$/, 'Single line').optional(), imapIdleNotifyIntervalMinutes: int(1, 60).optional(), pop3UidlFormat: z.string().max(64).regex(/^[A-Za-z0-9%._-]*$/).optional(),
   mailLocation: z.string().max(200).regex(/^(maildir|mbox|mdbox|sdbox):[A-Za-z0-9~%/._:-]+$/, 'Dovecot mail_location such as maildir:~/mail').optional(), mailboxFormat: z.enum(['maildir', 'mbox', 'mdbox', 'sdbox']).optional(),
 }).strict();

@@ -44,7 +44,7 @@ export default function ConfigureRemoteServiceIps({ fn }) {
       {loading && !data && <Loading />}
       {data && draft && (
         <>
-          {!data.candidates.ipv4.length && !data.candidates.ipv6.length && <div className="banner banner-info"><div>No addresses are recorded yet. Run <Link to="/ip-functions/rebuild-the-ip-address-pool">Rebuild the IP Address Pool</Link> or <Link to="/ip-functions/add-a-new-ip-address">add an address</Link> first.</div></div>}
+          {!data.candidates.ipv4.length && !data.candidates.ipv6.length && <div className="banner banner-info"><div>{data.candidates.live ? 'No managed addresses are bound to this server’s interfaces.' : 'No addresses are recorded yet.'} Run <Link to="/ip-functions/rebuild-the-ip-address-pool">Rebuild the IP Address Pool</Link> or <Link to="/ip-functions/add-a-new-ip-address">add an address</Link> first.</div></div>}
           {data.services.map((s) => (
             <Card key={s.key} title={s.label} subtitle={s.help} className="config-fields">
               <div className="form-grid">

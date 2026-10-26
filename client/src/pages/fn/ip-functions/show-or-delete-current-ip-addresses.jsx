@@ -30,7 +30,7 @@ export default function ShowOrDeleteCurrentIpAddresses({ fn }) {
       const { data: res } = await api.delete(`/ip/addresses/${encodeURIComponent(row.address)}`);
       toast.success(`${res.address} removed${res.removedFromSystem ? ' from the interface' : ''}`);
       refetch();
-    } catch (err) { setActionError(err); toast.error(err); }
+    } catch (err) { setActionError(err); }
   };
 
   const routes = meta?.routes;

@@ -335,7 +335,9 @@ export function spliceOptionsBlock(text, directives) {
   const managed = new RegExp(`[ \\t]*${escapeRe(OPTIONS_BEGIN.trim())}\\n[\\s\\S]*?[ \\t]*${escapeRe(OPTIONS_END.trim())}\\n?`);
   if (managed.test(text)) return text.replace(managed, block);
   if (!block) return text;
-  const stripped = text.replace(/\/\*[\s\S]*?\*\//g, (c) => ' '.repeat(c.length)).replace(/^[ \t]*(\/\/|#).*$/gm, (c) => ' '.repeat(c.length));
+  // Comments are blanked (same length, so indices still point into `text`).
+  const blank = (c) => ' '.repeat(c.length);
+  const stripped = text.replace(/\/\*[\s\S]*?\*\//g, blank).replace(/(\/\/|#).*$/gm, blank);
   const open = stripped.match(/\boptions\s*\{/);
   if (!open) throw new OpError('config_invalid', 'No options { } block was found in the named configuration; add one before setting source addresses');
   let depth = 1;

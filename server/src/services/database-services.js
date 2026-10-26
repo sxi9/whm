@@ -1,3 +1,4 @@
+import net from 'node:net';
 import path from 'node:path';
 import { json, paginate } from '../db/index.js';
 import { notFound, conflict, forbidden, badRequest, unprocessable, HttpError, CapabilityError } from '../lib/errors.js';
@@ -14,7 +15,9 @@ import { isRoot } from '../middleware/rbac.js';
 //   databases.dump({ databases, path }, req)        -> mysqldump to a file under an allowed root (backups)
 //   databases.quotaFor(account)                     -> { max, used, remaining }
 //   databases.hostsFor(accountId)                   -> hosts a per-account user is provisioned at
-//   databases.phpMyAdmin()                          -> install status and URL
+//   databases.phpMyAdmin(user)                      -> install status and URL (paths root-only)
+//   databases.setClientAddresses({ ipv4, ipv6 }, req) -> source address for connections to remote
+//                                                      profiles (Configure Remote Service IPs)
 
 export const PRIVILEGES = ['ALL PRIVILEGES', 'ALTER', 'ALTER ROUTINE', 'CREATE', 'CREATE ROUTINE', 'CREATE TEMPORARY TABLES', 'CREATE VIEW', 'DELETE', 'DROP', 'EVENT', 'EXECUTE', 'INDEX', 'INSERT', 'LOCK TABLES', 'REFERENCES', 'SELECT', 'SHOW VIEW', 'TRIGGER', 'UPDATE'];
 export const PG_PRIVILEGES = ['ALL PRIVILEGES', 'CONNECT', 'CREATE', 'TEMPORARY'];
@@ -129,6 +132,25 @@ export function createDatabaseServicesService(ctx) {
     return p;
   }
 
+  const isPg = (profile) => profile.engine === 'postgres';
+  const isRemote = (profile) => !profile.is_local && profile.host && !['localhost', '127.0.0.1', '::1'].includes(profile.host);
+
+  // Source addresses chosen in "Configure Remote Service IPs" (ip-functions).
+  function clientAddresses() {
+    return { ipv4: settings.get('db.client.bind_address_ipv4', null) || null, ipv6: settings.get('db.client.bind_address_ipv6', null) || null };
+  }
+
+  // The local address a remote profile's connections are bound to: the family
+  // of an IP-literal host decides; a hostname prefers IPv4.
+  function bindAddressFor(profile) {
+    if (!isRemote(profile) || isPg(profile)) return null;
+    const { ipv4, ipv6 } = clientAddresses();
+    const family = net.isIP(profile.host);
+    if (family === 6) return ipv6;
+    if (family === 4) return ipv4;
+    return ipv4 || ipv6;
+  }
+
   function credsFor(profile) {
     if (!profile.admin_user && !profile.admin_password_enc && (profile.is_local || profile.host === 'localhost')) return undefined;
     const creds = {};
@@ -137,10 +159,10 @@ export function createDatabaseServicesService(ctx) {
     if (profile.port) creds.port = profile.port;
     if (profile.admin_user) creds.user = profile.admin_user;
     if (profile.admin_password_enc) creds.password = crypto.decrypt(profile.admin_password_enc);
+    const bindAddress = bindAddressFor(profile);
+    if (bindAddress) creds.bindAddress = bindAddress;
     return creds;
   }
-
-  const isPg = (profile) => profile.engine === 'postgres';
   const capFor = (profile) => (isPg(profile) ? 'postgres' : 'mysql');
 
   function translateError(err, profile) {
@@ -249,7 +271,7 @@ export function createDatabaseServicesService(ctx) {
 
   // ------------------------------------------------------------ overview ---
 
-  async function status() {
+  async function status(user) {
     const profile = activeRow();
     const detect = await agent.op('db.detect');
     await capabilities.ensureFresh();
@@ -258,7 +280,18 @@ export function createDatabaseServicesService(ctx) {
       try { out.version = await run('version', {}, null, profile); } catch (err) { out.error = { code: err.code, message: err.message }; }
       if (profile.is_local) { try { out.unit = await agent.op(unitOp(profile)); } catch { out.unit = null; } }
     }
+    if (user && !isRoot(user)) return trimStatus(out);
     return out;
+  }
+
+  // Resellers see what engine runs and whether it answers, not where the server
+  // keeps its files, which profile/credentials the panel uses or the unit's PID.
+  function trimStatus(out) {
+    const profile = out.profile ? { id: out.profile.id, profile_name: out.profile.profile_name, engine: out.profile.engine, is_local: out.profile.is_local, is_active: out.profile.is_active } : null;
+    const detect = out.detect ? { installed: out.detect.installed, serverInstalled: out.detect.serverInstalled, engine: out.detect.engine, postgres: { installed: Boolean(out.detect.postgres?.installed) } } : null;
+    const version = out.version ? { version: out.version.version, engine: out.version.engine, major: out.version.major } : null;
+    const unit = out.unit ? { unit: out.unit.unit, state: out.unit.state } : null;
+    return { profile, detect, capabilities: out.capabilities, version, unit, counts: out.counts, prefixing: out.prefixing, error: out.error };
   }
 
   // ----------------------------------------------------------- databases ---
@@ -382,6 +415,10 @@ export function createDatabaseServicesService(ctx) {
     if (SYSTEM_USERS.has(name)) throw badRequest(`"${name}" is a reserved database user name`);
     if (stmts.userByName.get(name)) throw conflict(`Database user "${name}" already exists`);
     await checkPasswordPolicy(input.password);
+    // Grant targets are checked before the user exists so a refused database
+    // never leaves a half-provisioned user behind.
+    const wanted = (input.databases || []).map((d) => ({ database: d, privileges: settings.get('db.default_privileges', ['ALL PRIVILEGES']) }));
+    assertGrantTargets(wanted, { account_id: account?.id ?? null }, user, profile, name);
     const created = await run('user.create', isPg(profile) ? { user: name, password: input.password } : { user: name, password: input.password, hosts }, req, profile);
     const userId = db.transaction(() => {
       const { lastInsertRowid } = stmts.insertUser.run(account?.id ?? null, name, profile.id);
@@ -390,7 +427,17 @@ export function createDatabaseServicesService(ctx) {
     })();
     req?.audit?.({ action: 'db.user.create', target: name, args: { account: account?.username ?? null, hosts } });
     let grants = [];
-    if (input.databases?.length) grants = (await setGrants(name, input.databases.map((d) => ({ database: d, privileges: settings.get('db.default_privileges', ['ALL PRIVILEGES']) })), user, req)).grants;
+    if (wanted.length) {
+      try {
+        grants = (await setGrants(name, wanted, user, req)).grants;
+      } catch (err) {
+        // The grant step failed on the server: drop the user again rather than
+        // leave an account the caller does not know exists.
+        try { await run('user.drop', { user: name }, req, profile); stmts.deleteUser.run(name); } catch (dropErr) { logger.warn({ err: dropErr, user: name }, 'could not remove a user whose grants failed'); }
+        req?.audit?.({ action: 'db.user.create', target: name, result: 'error', args: { account: account?.username ?? null, reason: err.message } });
+        throw err;
+      }
+    }
     return { ...created, name, account: account?.username ?? null, hosts: isPg(profile) ? [] : hosts, grants, id: userId };
   }
 
@@ -440,23 +487,49 @@ export function createDatabaseServicesService(ctx) {
     return list.includes('ALL PRIVILEGES') ? ['ALL PRIVILEGES'] : list.sort();
   };
 
+  // Database-level grants of a user at every host it exists at. `grants` is the
+  // union across hosts; a database whose privileges differ between hosts is
+  // flagged `mixed` so the editor normalises all hosts on save.
+  async function liveGrants(name, hosts, profile, req) {
+    if (isPg(profile)) {
+      const live = await run('grants.list', { user: name }, req, profile);
+      const grants = live.grants.filter((g) => g.table === '*' && g.database !== '*').map((g) => ({ database: g.database, privileges: g.privileges.map((p) => p.toUpperCase()).sort() }));
+      return { grants, raw: live.raw, perHost: {} };
+    }
+    const perHost = {};
+    const raw = [];
+    for (const h of hosts) {
+      const live = await run('grants.list', { user: name, host: h }, req, profile);
+      perHost[h] = live.grants.filter((g) => g.table === '*' && g.database !== '*').map((g) => ({ database: g.database, privileges: g.privileges.map((p) => p.toUpperCase()).sort() }));
+      raw.push(...(live.raw || []));
+    }
+    const byDb = new Map();
+    for (const h of hosts) {
+      for (const g of perHost[h]) {
+        const entry = byDb.get(g.database) || { database: g.database, privileges: g.privileges, hosts: [], mixed: false };
+        if (entry.hosts.length && entry.privileges.join(',') !== g.privileges.join(',')) entry.mixed = true;
+        entry.hosts.push(h);
+        byDb.set(g.database, entry);
+      }
+    }
+    const grants = [...byDb.values()].map((g) => ({ ...g, mixed: g.mixed || g.hosts.length !== hosts.length })).sort((a, b) => a.database.localeCompare(b.database));
+    return { grants, raw, perHost };
+  }
+
   async function grantsFor(name, user) {
     const profile = requireProfile();
     const row = stmts.userByName.get(name);
     if (row) assertVisible(row, user, 'Database user');
     else assertRoot(user, 'Reading grants of an unmapped database user');
     const hosts = isPg(profile) ? [] : await resolveHosts(name, row, profile, null);
-    const live = await run('grants.list', { user: name, ...(isPg(profile) ? {} : { host: preferredHost(hosts) }) }, null, profile);
-    const grants = live.grants.filter((g) => g.table === '*').map((g) => ({ database: g.database, privileges: g.privileges }));
-    return { name, account: row?.account ?? null, hosts, grants, raw: live.raw, recorded: row ? stmts.grantsForUser.all(row.id).map((g) => ({ database: g.database, privileges: g.privileges.split(',').map((p) => p.trim()) })) : [] };
+    const live = await liveGrants(name, hosts, profile, null);
+    const grants = live.grants.map((g) => ({ database: g.database, privileges: g.privileges, ...(isPg(profile) ? {} : { hosts: g.hosts, mixed: g.mixed }) }));
+    return { name, account: row?.account ?? null, hosts, grants, perHost: live.perHost, raw: live.raw, recorded: row ? stmts.grantsForUser.all(row.id).map((g) => ({ database: g.database, privileges: g.privileges.split(',').map((p) => p.trim()) })) : [] };
   }
 
-  // Replaces the user's database-level grants with `wanted` (revoke + grant diff).
-  async function setGrants(name, wanted, user, req) {
-    const profile = requireProfile();
-    const row = stmts.userByName.get(name);
-    if (row) assertVisible(row, user, 'Database user');
-    else assertRoot(user, 'Granting privileges to an unmapped database user');
+  // Ownership and system-database checks for a grant list, shared by
+  // setGrants and createUser (which runs them before the user exists).
+  function assertGrantTargets(wanted, row, user, profile, name) {
     const target = new Map();
     for (const g of wanted) {
       const dbRow = stmts.dbByName.get(g.database);
@@ -467,19 +540,33 @@ export function createDatabaseServicesService(ctx) {
       if (SYSTEM_DATABASES.has(g.database)) throw badRequest(`Privileges on system database "${g.database}" cannot be granted from the panel`);
       target.set(g.database, normalizePrivs(g.privileges, profile));
     }
+    return target;
+  }
+
+  // Replaces the user's database-level grants with `wanted` (revoke + grant diff).
+  async function setGrants(name, wanted, user, req) {
+    const profile = requireProfile();
+    const row = stmts.userByName.get(name);
+    if (row) assertVisible(row, user, 'Database user');
+    else assertRoot(user, 'Granting privileges to an unmapped database user');
+    const target = assertGrantTargets(wanted, row, user, profile, name);
     const hosts = isPg(profile) ? [] : await resolveHosts(name, row, profile, req);
-    const live = await run('grants.list', { user: name, ...(isPg(profile) ? {} : { host: preferredHost(hosts) }) }, req, profile);
-    const current = new Map(live.grants.filter((g) => g.table === '*' && g.database !== '*').map((g) => [g.database, g.privileges.map((p) => p.toUpperCase()).sort()]));
+    // The diff is computed against the union of every host's grants, so a
+    // privilege that drifted onto one host only is still revoked, and a
+    // database present at some hosts only is re-granted everywhere.
+    const live = await liveGrants(name, hosts, profile, req);
+    const current = new Map(live.grants.map((g) => [g.database, g.mixed ? null : g.privileges]));
     const changes = [];
-    for (const [database, privs] of current) {
+    for (const [database] of current) {
       if (!target.has(database)) { await run('revoke', { user: name, database, ...(isPg(profile) ? {} : { hosts }) }, req, profile); changes.push({ database, action: 'revoked' }); }
     }
     for (const [database, privs] of target) {
+      const had = current.has(database);
       const have = current.get(database);
       if (have && have.join(',') === privs.join(',')) continue;
-      if (have) await run('revoke', { user: name, database, ...(isPg(profile) ? {} : { hosts }) }, req, profile);
+      if (had) await run('revoke', { user: name, database, ...(isPg(profile) ? {} : { hosts }) }, req, profile);
       await run('grant', { user: name, database, privileges: privs, ...(isPg(profile) ? {} : { hosts }) }, req, profile);
-      changes.push({ database, action: have ? 'changed' : 'granted', privileges: privs });
+      changes.push({ database, action: had ? 'changed' : 'granted', privileges: privs });
     }
     if (row) {
       db.transaction(() => {
@@ -562,12 +649,14 @@ export function createDatabaseServicesService(ctx) {
 
   // -------------------------------------------------------- access hosts ---
 
+  // Resellers see their own accounts' hosts plus the global ones (read-only for
+  // them), since their users are provisioned at both.
   function listAccessHosts(query, user) {
     let rows = stmts.accessHosts.all();
-    if (!isRoot(user)) rows = rows.filter((r) => r.account_id != null && r.owner_id === user.id);
-    if (query.account) rows = rows.filter((r) => r.account === query.account);
+    if (!isRoot(user)) rows = rows.filter((r) => r.account_id == null || r.owner_id === user.id);
+    if (query.account) rows = rows.filter((r) => r.account === query.account || (r.account_id == null && !isRoot(user)));
     const profile = activeRow();
-    return { data: rows.map(({ owner_id, ...r }) => ({ ...r, scope: r.account_id == null ? 'global' : 'account' })), meta: { total: rows.length, engine: profile?.engine ?? null, supported: profile ? !isPg(profile) : false } };
+    return { data: rows.map(({ owner_id, ...r }) => ({ ...r, scope: r.account_id == null ? 'global' : 'account', editable: isRoot(user) || r.account_id != null })), meta: { total: rows.length, engine: profile?.engine ?? null, supported: profile ? !isPg(profile) : false } };
   }
 
   async function addAccessHost(input, user, req) {
@@ -714,11 +803,30 @@ export function createDatabaseServicesService(ctx) {
 
   // ------------------------------------------------------- configuration ---
 
+  // A PostgreSQL profile is not a missing MySQL: the page gets a plain notice
+  // instead of an install prompt.
+  function requireMysqlConfigProfile() {
+    const profile = requireProfile();
+    if (isPg(profile)) throw new HttpError(409, 'unsupported_engine', 'Configuration editing is available for MySQL/MariaDB profiles; PostgreSQL is tuned through postgresql.conf. Activate a MySQL/MariaDB profile to use this page.');
+    if (!profile.is_local) throw badRequest('The active profile is a remote server; configuration files can only be edited for the local server');
+    return profile;
+  }
+
+  // Variables shown in the "Running value" column: every known tunable plus
+  // whatever the managed include currently sets (option names use dashes,
+  // variables underscores).
+  function runtimeVariableNames(settingsInFile = {}) {
+    const names = new Set(KNOWN_TUNABLES.map((t) => t.label));
+    for (const k of Object.keys(settingsInFile)) {
+      const v = k.replace(/-/g, '_');
+      if (/^[A-Za-z0-9_]{1,64}$/.test(v)) names.add(v);
+    }
+    return [...names].slice(0, 200);
+  }
+
   async function getConfig(user) {
     assertRoot(user, 'Editing the database configuration');
-    const profile = requireProfile();
-    if (isPg(profile)) throw new CapabilityError('mysql', 'Configuration editing is available for MySQL/MariaDB profiles; PostgreSQL is tuned through postgresql.conf');
-    if (!profile.is_local) throw badRequest('The active profile is a remote server; configuration files can only be edited for the local server');
+    const profile = requireMysqlConfigProfile();
     await capabilities.ensureFresh();
     let file;
     try { file = await agent.op('db.config.read'); } catch (err) { throw translateError(err, profile); }
@@ -726,16 +834,14 @@ export function createDatabaseServicesService(ctx) {
     try { unit = await agent.op('db.unit'); } catch { unit = null; }
     let runtime = null;
     if (capabilities.has('mysql')) {
-      try { runtime = await run('variables.get', { names: KNOWN_TUNABLES.map((t) => t.label), status: true }, null, profile); } catch (err) { runtime = { error: err.message }; }
+      try { runtime = await run('variables.get', { names: runtimeVariableNames(file.settings), status: true }, null, profile); } catch (err) { runtime = { error: err.message }; }
     }
     return { ...file, unit, runtime, tunables: KNOWN_TUNABLES };
   }
 
   async function setConfig(input, user, req) {
     assertRoot(user, 'Editing the database configuration');
-    const profile = requireProfile();
-    if (isPg(profile)) throw new CapabilityError('mysql', 'Configuration editing is available for MySQL/MariaDB profiles');
-    if (!profile.is_local) throw badRequest('The active profile is a remote server; configuration files can only be edited for the local server');
+    const profile = requireMysqlConfigProfile();
     let result;
     try { result = await agent.op('db.config.write', { settings: input.settings, replace: Boolean(input.replace) }, { req }); } catch (err) { throw translateError(err, profile); }
     let restart = null;
@@ -841,15 +947,29 @@ export function createDatabaseServicesService(ctx) {
     assertRoot(user, 'Upgrading the database server');
     const profile = requireProfile();
     if (!profile.is_local) throw badRequest('Only the local database server can be upgraded from this panel');
-    const job = ctx.jobs.enqueue('db.upgrade', { target: input.target, backup: input.backup !== false, profileId: profile.id }, { userId: user.id });
+    // The principal travels with the job so the agent log of pkg.install names
+    // who asked for it.
+    const principal = { username: user.username, role: user.role, ip: req?.ip ?? null, requestId: req?.id ?? null };
+    const job = ctx.jobs.enqueue('db.upgrade', { target: input.target, backup: input.backup !== false, profileId: profile.id, principal }, { userId: user.id });
     req?.audit?.({ action: 'db.upgrade.enqueue', target: input.target, args: { backup: input.backup !== false, job: job.id } });
     return { job: { id: job.id }, target: input.target };
   }
 
+  // "apt-get install" / "dnf install" of a package that is already at the
+  // candidate version changes nothing; the server is then left alone.
+  function installChangedNothing(output) {
+    const lines = Array.isArray(output) ? output : String(output || '').split('\n');
+    const text = lines.join('\n');
+    if (/is already the newest version/i.test(text) && !/^(Setting up|Unpacking|Preparing to unpack) /m.test(text)) return true;
+    if (/^Nothing to do\.?$/m.test(text) || /Package .* is already installed/i.test(text) && !/^(Upgrading|Installing|Installed:|Upgraded:)/m.test(text)) return true;
+    return false;
+  }
+
   async function runUpgrade(job) {
-    const { target, backup, profileId } = job.params;
+    const { target, backup, profileId, principal } = job.params;
+    const req = principal ? { user: { username: principal.username, role: principal.role }, ip: principal.ip, id: principal.requestId } : undefined;
     const profile = (profileId && stmts.profileById.get(profileId)) || requireProfile();
-    const result = { target, backup: null, installed: false, manager: null, restarted: null, tablesUpgraded: null, versionBefore: null, versionAfter: null, available: true, reason: null };
+    const result = { target, backup: null, installed: false, alreadyCurrent: false, manager: null, restarted: null, tablesUpgraded: null, versionBefore: null, versionAfter: null, available: true, reason: null };
     try { result.versionBefore = (await run('version', {}, null, profile)).version; } catch (err) { job.log(`could not read current version: ${err.message}`, 'warn'); }
     job.progress(5, 'preparing');
     const packages = await serverPackages([target]);
@@ -872,14 +992,22 @@ export function createDatabaseServicesService(ctx) {
     job.progress(30, `installing ${target}`);
     job.log(`${packages.manager} install ${target}`);
     let install;
-    try { install = await agent.op('pkg.install', { packages: [target] }); } catch (err) { throw new Error(`${packages.manager} could not install ${target}: ${err.message}`); }
+    try { install = await agent.op('pkg.install', { packages: [target] }, { req }); } catch (err) { throw new Error(`${packages.manager} could not install ${target}: ${err.message}`); }
     for (const line of Array.isArray(install.output) ? install.output : String(install.output || '').split('\n')) if (line.trim()) job.log(line);
+    if (installChangedNothing(install.output) || (candidate?.installed && candidate.candidate === candidate.installed)) {
+      result.alreadyCurrent = true;
+      result.reason = `${target} is already at the newest version the package manager offers${candidate?.installed ? ` (${candidate.installed})` : ''}; the server was not restarted and no table upgrade ran.`;
+      result.versionAfter = result.versionBefore;
+      job.log(result.reason);
+      job.progress(100, 'already current');
+      return result;
+    }
     result.installed = true;
     job.progress(70, 'restarting database server');
-    try { result.restarted = await agent.op(restartOp(profile)); job.log(`restarted ${result.restarted.unit}: ${result.restarted.state}`); } catch (err) { job.log(`restart failed: ${err.message}`, 'error'); throw err; }
+    try { result.restarted = await agent.op(restartOp(profile), {}, { req }); job.log(`restarted ${result.restarted.unit}: ${result.restarted.state}`); } catch (err) { job.log(`restart failed: ${err.message}`, 'error'); throw err; }
     if (!isPg(profile)) {
       job.progress(85, 'upgrading system tables');
-      try { result.tablesUpgraded = await run('upgrade_tables', {}, null, profile); job.log(result.tablesUpgraded.ran ? result.tablesUpgraded.output.split('\n').slice(-5).join('\n') : result.tablesUpgraded.reason); } catch (err) { job.log(`table upgrade failed: ${err.message}`, 'error'); }
+      try { result.tablesUpgraded = await run('upgrade_tables', {}, req, profile); job.log(result.tablesUpgraded.ran ? result.tablesUpgraded.output.split('\n').slice(-5).join('\n') : result.tablesUpgraded.reason); } catch (err) { job.log(`table upgrade failed: ${err.message}`, 'error'); }
     }
     try { result.versionAfter = (await run('version', {}, null, profile)).version; } catch (err) { job.log(`could not read new version: ${err.message}`, 'warn'); }
     job.progress(100, `upgraded to ${result.versionAfter || 'unknown'}`);
@@ -888,13 +1016,16 @@ export function createDatabaseServicesService(ctx) {
 
   // ----------------------------------------------------------- phpMyAdmin ---
 
-  async function phpMyAdmin() {
+  async function phpMyAdmin(user) {
     let detect;
     try { detect = await agent.op('db.phpmyadmin.detect'); } catch (err) { detect = { installed: false, error: err.message }; }
     const override = settings.get('db.phpmyadmin.url', '') || '';
     const hostname = settings.get('basic.hostname', '') || '';
     const url = override || (detect.urlPath ? `https://${hostname}${detect.urlPath}` : null);
-    return { ...detect, installed: Boolean(detect.installed), url, urlOverride: override, hostname, featureEnabled: Boolean(settings.get('db.phpmyadmin.enabled', true)) };
+    const common = { installed: Boolean(detect.installed), version: detect.version ?? null, url, php: Boolean(detect.php), featureEnabled: Boolean(settings.get('db.phpmyadmin.enabled', true)) };
+    // Install directories, config files and web-server files are root's business.
+    if (user && !isRoot(user)) return common;
+    return { ...detect, ...common, urlOverride: override, hostname };
   }
 
   function setPhpMyAdminUrl(url, user, req) {
@@ -941,12 +1072,48 @@ export function createDatabaseServicesService(ctx) {
     return run('dump', input, req, profile);
   }
 
+  // ------------------------------------------------- remote service IPs ---
+
+  // "Configure Remote Service IPs" (ip-functions) hands over the local address
+  // the panel's connections to remote database profiles are sourced from. It is
+  // recorded in settings and written as bind-address into the per-op client
+  // credentials file of every remote profile. When the active profile is remote
+  // the new address is verified with a connection test before it is kept.
+  async function setClientAddresses({ ipv4 = null, ipv6 = null } = {}, req) {
+    const fields = {};
+    if (ipv4 && net.isIP(ipv4) !== 4) fields.ipv4 = ['Must be an IPv4 address'];
+    if (ipv6 && net.isIP(ipv6) !== 6) fields.ipv6 = ['Must be an IPv6 address'];
+    if (Object.keys(fields).length) throw unprocessable('Database client addresses must be IP addresses bound to this server', fields);
+    const previous = clientAddresses();
+    const next = { ipv4: ipv4 || null, ipv6: ipv6 || null };
+    const changed = previous.ipv4 !== next.ipv4 || previous.ipv6 !== next.ipv6;
+    settings.setMany({ 'db.client.bind_address_ipv4': next.ipv4, 'db.client.bind_address_ipv6': next.ipv6 });
+    await capabilities.ensureFresh();
+    if (!capabilities.has('mysql')) throw new CapabilityError('mysql', 'MySQL/MariaDB client tools are not installed on this server; the database source address is saved and used once they are');
+    const profile = activeRow();
+    let verified = null;
+    const warnings = [];
+    if (profile && isRemote(profile) && !isPg(profile) && bindAddressFor(profile)) {
+      let ping;
+      try { ping = await run('ping', {}, req, profile); } catch (err) { settings.setMany({ 'db.client.bind_address_ipv4': previous.ipv4, 'db.client.bind_address_ipv6': previous.ipv6 }); throw err; }
+      if (!ping.ok) {
+        settings.setMany({ 'db.client.bind_address_ipv4': previous.ipv4, 'db.client.bind_address_ipv6': previous.ipv6 });
+        throw new HttpError(502, 'db_bind_failed', `Connections to ${profile.profile_name} (${profile.host}) fail when bound to ${next.ipv4 || next.ipv6}: ${ping.error}. The previous address was kept.`);
+      }
+      verified = true;
+      for (const w of ping.warnings || []) if (/bind-address/i.test(w)) warnings.push(`The ${profile.engine} client on this server ignores bind-address (${w}); connections use the routing table's source address.`);
+    }
+    req?.audit?.({ action: 'db.client_addresses', target: profile?.profile_name ?? 'settings', args: { ...next, changed, verified } });
+    return { applied: true, changed, verified, warnings, ...next, profile: profile ? { name: profile.profile_name, remote: isRemote(profile) } : null };
+  }
+
   return {
     activeProfile: () => shapeProfile(activeRow()),
     run,
     status,
     quotaFor,
     hostsFor,
+    clientAddresses, setClientAddresses,
     listDatabases, createDatabase, dropDatabase, serverDatabases,
     listUsers, createUser, dropUser, setUserPassword, setRootPassword,
     grantsFor, setGrants,

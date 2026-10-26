@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading, KeyValue, formatDuration } from '../../../components/Common.jsx';
@@ -45,7 +46,9 @@ export default function EditDatabaseConfiguration({ fn }) {
   return (
     <>
       <PageHeader fn={fn} description="Tune the local MySQL/MariaDB server through a panel-managed include file that overrides the distribution defaults. Changes are validated with the server binary and rolled back if rejected; a restart applies them." actions={<><Button onClick={() => refetch()}>Refresh</Button><Button variant="danger" onClick={restartNow} loading={busy}>Restart server</Button></>} />
-      <RequestError error={error} onRetry={refetch} />
+      {error?.code === 'unsupported_engine'
+        ? <div className="banner banner-info"><div><strong>Not available for the active profile</strong><p>{error.message} <Link to="/database-services/manage-database-profiles">Manage Database Profiles</Link></p></div></div>
+        : <RequestError error={error} onRetry={refetch} />}
       {loading && !data && <Loading />}
       {data && (
         <>

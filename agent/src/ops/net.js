@@ -15,6 +15,9 @@ export const IPS_FILE = '/etc/whm/ips.json';
 export const UNIT_FILE = '/etc/systemd/system/whm-ips.service';
 
 const prefix = z.number().int().min(0).max(128);
+// Binding a /0 would install a default on-link route; removal still accepts any
+// prefix so a mis-bound address can be taken off again.
+const bindPrefix = prefix.min(1);
 // Stricter than arg.iface: an interface name never starts with "-" (argv option) or ".".
 const iface = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,14}$/);
 // Linux alias labels must start with the interface name; the panel appends a
@@ -36,12 +39,13 @@ function fullLabel(iface, suffix) {
 }
 
 export function prefixToNetmask(pfx) {
-  const bits = 0xffffffff << (32 - pfx);
+  // A 32-bit shift is a no-op in JS, so /0 is special-cased.
+  const bits = pfx === 0 ? 0 : (0xffffffff << (32 - pfx)) >>> 0;
   return [24, 16, 8, 0].map((s) => ((bits >>> s) & 255)).join('.');
 }
 
 export function netmaskToPrefix(mask) {
-  if (/^\d{1,3}$/.test(mask)) return Number(mask);
+  if (/^\d{1,3}$/.test(mask)) { const n = Number(mask); return n <= 32 ? n : null; }
   const parts = mask.split('.').map(Number);
   if (parts.length !== 4 || parts.some((p) => Number.isNaN(p) || p < 0 || p > 255)) return null;
   const bits = parts.map((p) => p.toString(2).padStart(8, '0')).join('');
@@ -144,7 +148,7 @@ defineOp('net.route.default', {
 
 defineOp('net.ip.add', {
   description: 'Bind an address to an interface (ip addr add <addr>/<prefix> dev <iface> [label])',
-  schema: z.object({ address: arg.ip, prefix, iface, label: labelSuffix.optional() }).strict(),
+  schema: z.object({ address: arg.ip, prefix: bindPrefix, iface, label: labelSuffix.optional() }).strict(),
   run: async ({ address, prefix: pfx, iface, label }) => {
     requireIp();
     assertPrefixFitsFamily(address, pfx);
@@ -176,7 +180,7 @@ defineOp('net.ip.del', {
   },
 });
 
-const persistedAddress = z.object({ address: arg.ip, prefix, iface, label: labelSuffix.optional() }).strict();
+const persistedAddress = z.object({ address: arg.ip, prefix: bindPrefix, iface, label: labelSuffix.optional() }).strict();
 
 export function renderUnit(addresses, ipBin = '/sbin/ip') {
   const lines = [

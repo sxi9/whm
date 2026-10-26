@@ -10,11 +10,18 @@ import { RequestError, RebootBanner, useJobRunner, JobPanel, JobHistory } from '
 export default function SystemUpdate({ fn }) {
   const toast = useToast();
   const confirm = useConfirm();
-  const { data, loading, error, refetch } = useApi('/software/update/status');
+  // Page loads serve the last recorded check; "Check now" runs the simulation again.
+  const { data, loading, error, refetch, setData } = useApi('/software/update/status');
   const history = useApi('/system/jobs?type=software.system.update&limit=10');
   const [opts, setOpts] = useState({ dist: true, autoremove: false, refreshIndex: true });
   const [selected, setSelected] = useState([]);
+  const [checking, setChecking] = useState(false);
   const runner = useJobRunner({ onFinished: () => { refetch(); history.refetch(); } });
+
+  const checkNow = async () => {
+    setChecking(true);
+    try { const { data: fresh } = await api.get('/software/update/status?refresh=true'); setData(fresh); setSelected([]); toast.success(fresh.count ? `${fresh.count} update(s) pending` : 'System is up to date'); } catch (err) { toast.error(err); } finally { setChecking(false); }
+  };
 
   const run = async (packages) => {
     const what = packages?.length ? `${packages.length} selected package(s)` : `all ${data?.count ?? ''} pending updates`;
@@ -28,16 +35,16 @@ export default function SystemUpdate({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} actions={data && <Button onClick={() => refetch()} loading={loading}>Re-check</Button>} />
+      <PageHeader fn={fn} actions={data && <Button onClick={checkNow} loading={checking}>Check now</Button>} />
       <RequestError error={error} onRetry={refetch} />
-      {loading && !data && <Loading text="Checking for updates…" />}
+      {loading && !data && <Loading text="Loading the last update check…" />}
       {data && (
         <>
           <RebootBanner required={data.rebootRequired} />
-          <Card title="Pending updates" subtitle={`${data.manager === 'apt' ? 'apt-get dist-upgrade' : `${data.manager} upgrade`} simulation`} actions={<StatusPill status={data.count ? (data.security ? 'warning' : 'info') : 'ok'}>{data.count ? `${data.count} pending · ${data.security} security` : 'up to date'}</StatusPill>}>
+          <Card title="Pending updates" subtitle={`${data.manager === 'apt' ? 'apt-get dist-upgrade' : `${data.manager || 'package manager'} upgrade`} simulation${data.source === 'cached' ? ` recorded ${formatDate(data.checkedAt)}; the nightly check (05:41) and every update run refresh it, or use Check now` : ' run just now'}`} actions={<StatusPill status={data.count ? (data.security ? 'warning' : 'info') : 'ok'}>{data.count ? `${data.count} pending · ${data.security} security` : 'up to date'}</StatusPill>}>
             <KeyValue items={[
               ['Last update run', data.lastRun ? <span key="l"><StatusPill status={data.lastRun.status} /> {formatDate(data.lastRun.finished_at || data.lastRun.started_at)}</span> : 'never'],
-              ['Last nightly check', data.lastCheck?.at ? `${formatDate(data.lastCheck.at)} · ${data.lastCheck.count} pending` : 'not yet (runs daily at 05:41)'],
+              ['Last check', data.checkedAt ? `${formatDate(data.checkedAt)} · ${data.count} pending${data.truncated ? ' (list truncated to 200)' : ''}` : 'not yet (runs daily at 05:41)'],
               ['Release tier', data.tier],
             ]} />
             <div className="form-grid" style={{ marginTop: 12 }}>

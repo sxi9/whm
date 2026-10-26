@@ -28,10 +28,10 @@ export default function ManageSslHosts({ fn }) {
     if (!(await confirm({ title: `Remove the certificate from ${h.domain}?`, message: 'The certificate files under /etc/ssl/whm are deleted and the vhost falls back to the server default certificate. The certificate itself stays in the SSL Storage Manager.', confirmLabel: 'Uninstall', danger: true }))) return;
     try { await api.delete(`/ssl/hosts/${h.domain}`); toast.success(`Certificate removed from ${h.domain}`); refetch(); } catch (err) { toast.error(err); }
   };
+  // Reads what is actually on disk, so unmanaged directories (no panel row) have details too.
   const view = async (h) => {
     try {
-      const { data: d } = await api.get(`/ssl/certs/${h.id}/download?part=cert`);
-      const { data: info } = await api.post('/ssl/certs/inspect', { certPem: d.content, domain: h.domain });
+      const { data: info } = await api.get(`/ssl/hosts/${h.domain}`);
       setViewing({ host: h, ...info });
     } catch (err) { toast.error(err); }
   };
@@ -55,16 +55,21 @@ export default function ManageSslHosts({ fn }) {
             { key: 'notAfter', label: 'Expires', render: (h) => <ExpiryPill notAfter={h.notAfter} daysRemaining={h.daysRemaining} /> },
             { key: 'autossl', label: 'Source', render: (h) => <StatusPill status={h.autossl ? 'ok' : 'inactive'}>{h.autossl ? 'AutoSSL' : 'manual'}</StatusPill> },
             { key: 'state', label: 'State', render: (h) => <StatePill state={h.state} /> },
-            { key: 'files', label: 'Files', render: (h) => (h.files?.present == null ? <span className="muted">—</span> : <StatusPill status={h.files.present ? 'ok' : 'warning'}>{h.files.present ? `on disk${h.files.hasKey ? '' : ', key missing'}` : 'missing on disk'}</StatusPill>) },
+            { key: 'files', label: 'Files', render: (h) => (h.files?.present == null ? <span className="muted" title={data.bundlesListed === false ? 'The bundle directory could not be listed' : ''}>—</span> : <StatusPill status={h.files.present ? 'ok' : 'warning'}>{h.files.present ? `on disk${h.files.hasKey ? '' : ', key missing'}` : 'missing on disk'}</StatusPill>) },
           ]} rows={hosts} rowKey={(h) => h.domain} emptyText="No certificates are installed. Install one or enable AutoSSL."
             rowActions={(h) => [
-              h.id && { label: 'Details', primary: true, onClick: () => view(h) },
-              { label: 'Uninstall', danger: true, primary: !h.id, onClick: () => uninstall(h) },
+              { label: 'Details', primary: true, onClick: () => view(h) },
+              { label: 'Uninstall', danger: true, onClick: () => uninstall(h) },
             ]} />
         </Card>
       )}
       <Modal open={Boolean(viewing)} title={`Certificate on ${viewing?.host.domain}`} onClose={() => setViewing(null)} size="lg" footer={<Button variant="primary" onClick={() => setViewing(null)}>Close</Button>}>
-        {viewing && <CertificateSummary certificate={viewing.certificate} chain={viewing.chain} />}
+        {viewing && (
+          <>
+            <p className="muted small">{viewing.files?.exists ? <>Files: <code>{viewing.files.paths?.dir}/</code>{viewing.files.hasChain ? ' (with chain)' : ''}</> : viewing.files?.error ? `Bundle not readable: ${viewing.files.error}` : 'No bundle files on disk; showing the stored certificate.'}</p>
+            <CertificateSummary certificate={viewing.certificate} chain={viewing.chain} />
+          </>
+        )}
       </Modal>
     </>
   );

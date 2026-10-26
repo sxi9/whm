@@ -1,6 +1,6 @@
 import { notFound, conflict, forbidden, badRequest, unprocessable, serviceUnavailable, CapabilityError } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
-import { familyOf, canonical, parseCidr, enumerateRange, nextFreeInCidr, netmaskToPrefix, prefixToNetmask, cidrContains, toValue, isPrivateOrSpecial } from './ip-math.js';
+import { familyOf, canonical, parseCidr, enumerateRange, nextFreeInCidr, netmaskToPrefix, prefixToNetmask, cidrContains, toValue } from './ip-math.js';
 
 export const REMOTE_SERVICES = [
   { key: 'mail', label: 'Outgoing mail (SMTP)', help: 'Source address Exim uses when delivering mail to other servers.' },
@@ -15,6 +15,16 @@ const MAX_RANGE_PER_ADD = 256;
 // ctx.ip — bound addresses, reservations, the IP pool, IPv6 ranges and
 // assignments, remote-service source IPs and the IP migration job. Other
 // categories call it lazily via ctx.ip (see "helpers for other categories").
+// Hooks this service calls when the owning category provides them:
+//   ctx.mail.setOutboundAddresses({ ipv4, ipv6 }, req)   (email: Exim remote_smtp interface)
+//   ctx.dns.setOutboundAddresses({ ipv4, ipv6 }, req)    (dns-functions: BIND query/notify/transfer source)
+//   ctx.databases.setClientAddresses({ ipv4, ipv6 }, req) (database-services: MySQL client bind-address)
+//   ctx.ftp.setPassiveAddress({ ipv4 }, req)             (service-configuration)
+//   ctx.dns.zoneFor / zoneExists / upsertRecords, ctx.web.setAccountIpv6 / replaceIp
+// A missing hook or a missing daemon (CapabilityError) leaves the value 'saved'.
+// IPv6 assign/unassign is open to resellers for their own accounts (WHM keeps the
+// whole category root-only): the service enforces ownership and the range → account
+// mapping, so a reseller can only bind addresses root handed out to them.
 export function createIpService(ctx) {
   const { db, agent, capabilities, settings, logger } = ctx;
 
@@ -64,7 +74,16 @@ export function createIpService(ctx) {
     dnsRecordsByNameType: db.prepare("SELECT r.id, r.value, r.ttl FROM dns_records r JOIN dns_zones z ON z.id = r.zone_id WHERE z.domain = ? AND r.name = ? AND r.type = ? ORDER BY r.line_index, r.id"),
   };
 
-  const audit = (req, entry) => (req?.audit ? req.audit(entry) : ctx.auditRecord?.(null, entry));
+  const audit = (req, entry) => (req?.audit ? req.audit(entry) : ctx.auditRecord?.(req ?? null, entry));
+  // A request-like principal for work that runs outside an HTTP request (jobs),
+  // so agent ops and audit rows still name who started it.
+  function actorRequest(userId, requestId) {
+    const user = userId ? db.prepare('SELECT username, role FROM users WHERE id = ?').get(userId) : null;
+    if (!user) return null;
+    const req = { user, ip: null, id: requestId ?? null };
+    req.audit = (entry) => ctx.auditRecord?.(req, entry);
+    return req;
+  }
   const ipAvailable = () => capabilities.has('iproute2');
   const requireIproute2 = () => { if (!ipAvailable()) throw new CapabilityError('iproute2', 'iproute2 (the `ip` command) is not installed on this server. Install the iproute2 package to bind or remove addresses.'); };
   const setting = (key, fallback) => settings.get(key, fallback);
@@ -253,24 +272,46 @@ export function createIpService(ctx) {
     return touched;
   }
 
+  // The zone that holds `domain`: its own zone, or the closest enclosing one for
+  // addon/sub/parked domains that live inside a parent zone.
+  function enclosingZone(dns, domain) {
+    if (dns.zoneExists?.(domain)) return domain;
+    if (typeof dns.zoneFor !== 'function') return null;
+    return dns.zoneFor(domain)?.domain ?? null;
+  }
+
   async function updateAccountDns(account, address, type, jobCtx, req) {
     const dns = ctx.dns;
     const results = [];
-    if (!dns?.zoneExists || !dns?.upsertRecords) return { skipped: true, results };
+    if ((!dns?.zoneExists && !dns?.zoneFor) || !dns?.upsertRecords) return { skipped: true, results };
     const domains = [...new Set([account.domain, ...stmts.accountDomains.all(account.id).map((d) => d.domain)])];
     for (const domain of domains) {
-      if (!dns.zoneExists(domain)) { results.push({ domain, status: 'no_zone' }); continue; }
+      const zone = enclosingZone(dns, domain);
+      if (!zone) { results.push({ domain, status: 'no_zone' }); continue; }
       try {
         const values = address ? [{ value: address }] : [];
-        await dns.upsertRecords(domain, domain, type, values, req);
-        await dns.upsertRecords(domain, `www.${domain}`, type, values, req);
-        results.push({ domain, status: 'updated' });
-        jobCtx?.log(`DNS: ${domain} ${type} ${address ? `→ ${address}` : 'removed'}`);
+        await dns.upsertRecords(zone, domain, type, values, req);
+        await dns.upsertRecords(zone, `www.${domain}`, type, values, req);
+        results.push({ domain, zone, status: 'updated' });
+        jobCtx?.log(`DNS: ${domain}${zone !== domain ? ` (zone ${zone})` : ''} ${type} ${address ? `→ ${address}` : 'removed'}`);
       } catch (err) {
-        results.push({ domain, status: 'failed', error: err.message });
+        results.push({ domain, zone, status: 'failed', error: err.message });
       }
     }
     return { skipped: false, results };
+  }
+
+  // Addresses a service may use as its source: bound on the host right now and
+  // not a DHCP/SLAAC lease. Falls back to the managed inventory when the host
+  // view is unavailable.
+  async function sourceCandidates() {
+    const live = await liveInterfaces();
+    if (live?.interfaces?.length) {
+      const volatileAddresses = new Set(globalAddresses(live).filter(isVolatile).map((a) => a.address));
+      const unmanaged = new Set(stmts.all.all().filter((r) => !r.managed).map((r) => r.address));
+      return { live: true, addresses: globalAddresses(live).map((a) => a.address).filter((a) => !volatileAddresses.has(a) && !unmanaged.has(a)) };
+    }
+    return { live: false, addresses: stmts.all.all().filter((r) => r.managed).map((r) => r.address) };
   }
 
   const service = {
@@ -307,6 +348,8 @@ export function createIpService(ctx) {
       if (input.netmask && input.prefix == null && prefix == null) throw unprocessable('Invalid netmask', { netmask: ['Not a contiguous netmask or prefix length'] });
       if (prefix == null) prefix = family === 4 ? 24 : 64;
       if (family === 4 && prefix > 32) throw unprocessable('Invalid netmask', { netmask: ['IPv4 prefixes cannot exceed /32'] });
+      // A /0 address would install a default on-link route and break routing.
+      if (prefix < 1) throw unprocessable('Invalid netmask', { netmask: ['A /0 prefix cannot be bound to an interface'] });
       let addresses;
       try {
         addresses = input.endAddress ? enumerateRange(start, canonical(input.endAddress), { max: MAX_RANGE_PER_ADD }) : [start];
@@ -551,10 +594,17 @@ export function createIpService(ctx) {
       if (!iface) throw badRequest('No network interface could be detected for the IPv6 address; set one on the range');
       const prefix = parseCidr(range.range_cidr).prefix;
       const bound = await bind(address, { prefix, iface }, req);
-      db.transaction(() => {
-        insertAddress({ address, family: 6, prefix, interface: iface, dedicatedTo: account.id });
-        stmts.insertAssignment.run(account.id, range.id, address);
-      })();
+      try {
+        db.transaction(() => {
+          insertAddress({ address, family: 6, prefix, interface: iface, dedicatedTo: account.id });
+          stmts.insertAssignment.run(account.id, range.id, address);
+        })();
+      } catch (err) {
+        // Host first, DB second: a lost race leaves nothing bound that the inventory does not know.
+        if (bound.added) await agent.op('net.ip.del', { address, prefix, iface }, { req }).catch((e) => logger.warn({ err: e, address }, 'could not unbind after a failed IPv6 assignment'));
+        if (/UNIQUE|constraint/i.test(err.message)) throw conflict(`${address} was taken by another assignment; try again`);
+        throw err;
+      }
       const dns = await updateAccountDns(account, address, 'AAAA', null, req);
       const web = await applyWebIpv6(username, address, req);
       const persisted = await persist(req);
@@ -579,17 +629,18 @@ export function createIpService(ctx) {
     },
 
     // ---------------------------------------------------- remote service IPs
-    getRemoteServiceIps() {
-      const rows = stmts.all.all();
+    async getRemoteServiceIps(candidates) {
+      const { live, addresses } = candidates || await sourceCandidates();
       return {
         services: REMOTE_SERVICES.map((s) => ({ ...s, ipv4: setting(`ip.remote.${s.key}_ipv4`, '') || '', ipv6: setting(`ip.remote.${s.key}_ipv6`, '') || '' })),
-        candidates: { ipv4: rows.filter((r) => r.family === 4).map((r) => r.address), ipv6: rows.filter((r) => r.family === 6).map((r) => r.address) },
+        candidates: { ipv4: addresses.filter((a) => familyOf(a) === 4), ipv6: addresses.filter((a) => familyOf(a) === 6), live },
         mainIp: setting('basic.main_ip') || null,
       };
     },
 
     async setRemoteServiceIps(input, user, req) {
-      const known = new Set(stmts.all.all().map((r) => r.address));
+      const candidates = await sourceCandidates();
+      const known = new Set(candidates.addresses);
       const fields = {};
       const values = {};
       for (const s of REMOTE_SERVICES) {
@@ -611,10 +662,11 @@ export function createIpService(ctx) {
       const applyErrors = {};
       for (const s of REMOTE_SERVICES) {
         if (!input[s.key]) continue;
-        const hook = { mail: ctx.mail?.setOutboundAddresses, dns: ctx.dns?.setOutboundAddresses, mysql: ctx.db_services?.setClientAddresses, ftp: ctx.ftp?.setPassiveAddress, panel: null }[s.key];
+        const owner = { mail: ctx.mail, dns: ctx.dns, mysql: ctx.databases, ftp: ctx.ftp, panel: null }[s.key];
+        const hook = { mail: owner?.setOutboundAddresses, dns: owner?.setOutboundAddresses, mysql: owner?.setClientAddresses, ftp: owner?.setPassiveAddress, panel: null }[s.key];
         if (typeof hook !== 'function') { applied[s.key] = 'saved'; continue; }
         try {
-          await hook({ ipv4: setting(`ip.remote.${s.key}_ipv4`, '') || null, ipv6: setting(`ip.remote.${s.key}_ipv6`, '') || null }, req);
+          await hook.call(owner, { ipv4: setting(`ip.remote.${s.key}_ipv4`, '') || null, ipv6: setting(`ip.remote.${s.key}_ipv6`, '') || null }, req);
           applied[s.key] = 'applied';
         } catch (err) {
           const missing = isCapabilityMissing(err);
@@ -624,7 +676,7 @@ export function createIpService(ctx) {
         }
       }
       audit(req, { action: 'ip.remote_services', target: 'settings', args: values });
-      return { ...service.getRemoteServiceIps(), applied, applyErrors };
+      return { ...(await service.getRemoteServiceIps(candidates)), applied, applyErrors };
     },
 
     // ------------------------------------------------------------ migration
@@ -655,7 +707,8 @@ export function createIpService(ctx) {
         const isMain = f === mainIp || Boolean(fromRow?.is_main) || f === routes?.ipv4?.prefsrc || f === routes?.ipv6?.prefsrc;
         if (!fromRow && !accounts.length && !dns.length && !v6) issues.push(`${f} is not known to this server`);
         if (toRow?.dedicated_to && !accounts.includes(toRow.dedicated_account) && toRow.dedicated_to !== v6?.account_id) issues.push(`${t} is dedicated to ${toRow.dedicated_account}`);
-        if (toRow && stmts.accountsUsing.all(t).length) issues.push(`${t} is already used by ${stmts.accountsUsing.all(t).length} account(s)`);
+        const usingTarget = stmts.accountsUsing.all(t).length;
+        if (usingTarget) issues.push(`${t} is already used by ${usingTarget} account(s)`);
         if (v6Target) issues.push(`${t} is the IPv6 address of ${stmts.accountById.get(v6Target.account_id)?.username ?? `account #${v6Target.account_id}`}`);
         if (toRow?.reserved) warnings.push(`${t} is reserved (${toRow.reserved_reason || 'no reason given'}); the reservation is lifted by the migration`);
         if (isMain) warnings.push(`${f} is the server's main IP; it stays bound and is only marked reserved, even when old addresses are removed`);
@@ -679,11 +732,13 @@ export function createIpService(ctx) {
     },
 
     async runMigration(jobCtx) {
-      const { mappings, dryRun, updateDns, updateVhosts, removeOld, interface: wantedIface, prefix: wantedPrefix } = jobCtx.params;
+      const { mappings, dryRun, updateDns, updateVhosts, removeOld, interface: wantedIface, prefix: wantedPrefix, userId } = jobCtx.params;
       const summary = { mappings: mappings.length, dryRun, accounts: 0, dnsZones: 0, dnsRecords: 0, bound: 0, removed: 0, vhosts: null, failed: 0, settings: [] };
-      const live = await liveInterfaces();
+      // Re-read after every bind/unbind so a chain A→B, B→C sees B as bound in step 2.
+      let live = await liveInterfaces();
+      const refreshLive = async () => { live = (await liveInterfaces()) ?? live; };
       const routes = await defaultRoutes();
-      const req = null;
+      const req = actorRequest(userId, `job:${jobCtx.job?.id ?? ''}`);
       // Resolved once, before any setting is rewritten, so a chain A→B, B→C still
       // knows which address is the server's main IP at every step.
       let mainIp = await mainIpDetect(live, routes);
@@ -710,6 +765,7 @@ export function createIpService(ctx) {
                 if (r.failed.length) throw new Error(r.failed[0].error);
               } else await bind(to, { prefix, iface }, req);
               summary.bound++;
+              await refreshLive();
             }
           } else if (!stmts.byAddress.get(to) && !dryRun) {
             const b = globalAddresses(live).find((a) => a.address === to);
@@ -724,7 +780,9 @@ export function createIpService(ctx) {
             jobCtx.log(`IPv6 address of ${v6Owner.username}: ${from} → ${to}${range && !keepRange ? ` (leaves range "${range.name}")` : ''}`);
             if (!dryRun) { stmts.moveAssignment.run(to, keepRange ? range.id : null, from); summary.accounts++; }
           }
-          if (!dryRun && fromRow?.dedicated_to) { stmts.setDedicated.run(null, from); stmts.setDedicated.run(fromRow.dedicated_to, to); stmts.setReserved.run(0, null, to); }
+          if (!dryRun && fromRow?.dedicated_to) { stmts.setDedicated.run(null, from); stmts.setDedicated.run(fromRow.dedicated_to, to); }
+          // The preview promises the target's reservation is lifted; an address in use must not stay reserved.
+          if (!dryRun && stmts.byAddress.get(to)?.reserved) { stmts.setReserved.run(0, null, to); jobCtx.log(`${to} is no longer reserved`); }
           for (const key of ['basic.main_ip', 'basic.shared_ip', ...REMOTE_SERVICES.flatMap((s) => [`ip.remote.${s.key}_ipv4`, `ip.remote.${s.key}_ipv6`])]) {
             if (setting(key) === from) { jobCtx.log(`Setting ${key}: ${from} → ${to}`); if (!dryRun) settings.set(key, to); summary.settings.push(key); }
           }
@@ -753,6 +811,7 @@ export function createIpService(ctx) {
             const stillUsed = stmts.accountsUsing.all(from).length > 0 || Boolean(stmts.assignmentByAddress.get(from));
             if (removeOld && !isMain && !stillUsed) {
               const r = await unbind(fromRow, live, req).catch((err) => { jobCtx.log(`could not unbind ${from}: ${err.message}`, 'warn'); return { removed: false }; });
+              if (r.removed) await refreshLive();
               stmts.remove.run(from);
               summary.removed++;
               jobCtx.log(`${from} removed${r.removed ? ' from the interface' : ''}`);
@@ -772,7 +831,7 @@ export function createIpService(ctx) {
         try { await service.rebuildPool({ role: 'root' }, req); jobCtx.log('IP pool rebuilt'); } catch (err) { jobCtx.log(`pool rebuild: ${err.message}`, 'warn'); }
       }
       jobCtx.progress(100, 'finished');
-      audit(null, { action: dryRun ? 'ip.migrate.dry_run' : 'ip.migrate', target: mappings.map((m) => `${m.from}>${m.to}`).join(','), args: summary });
+      audit(req, { action: dryRun ? 'ip.migrate.dry_run' : 'ip.migrate', target: mappings.map((m) => `${m.from}>${m.to}`).join(','), args: { ...summary, userId: userId ?? null } });
       return summary;
     },
 

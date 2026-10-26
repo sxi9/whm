@@ -42,13 +42,16 @@ export default function MailserverConfiguration({ fn }) {
               <Field label="IMAP IDLE notify interval (minutes)"><NumberInput value={draft.imapIdleNotifyIntervalMinutes} onChange={set('imapIdleNotifyIntervalMinutes')} min={1} max={60} nullable={false} /></Field>
             </div>
           </Card>
-          <Card title="SSL" className="config-fields">
+          <Card title="SSL" className="config-fields" subtitle="This file owns ssl=, the protocol floor and the ciphers; SSL/TLS Configuration presets fill the cipher fields when applied to Dovecot.">
             <div className="form-grid">
               <Field label="ssl" help="required refuses plain-text connections on 143/110 before STARTTLS"><Select value={draft.ssl} onChange={set('ssl')} options={[{ value: 'required', label: 'required' }, { value: 'yes', label: 'yes (offered, not required)' }, { value: 'no', label: 'no' }]} /></Field>
               <Field label="Minimum TLS protocol"><Select value={draft.sslMinProtocol} onChange={set('sslMinProtocol')} options={['TLSv1', 'TLSv1.1', 'TLSv1.2', 'TLSv1.3']} /></Field>
             </div>
+            <Field label="Cipher list (ssl_cipher_list)" help="OpenSSL syntax for TLS 1.2 and below; empty keeps Dovecot's default"><TextInput value={draft.sslCipherList} onChange={set('sslCipherList')} placeholder="ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:..." /></Field>
+            <Field label="TLS 1.3 cipher suites (ssl_cipher_suites)" help={data.cipherSuitesSupported === false ? 'This Dovecot is older than 2.3.15 and has no ssl_cipher_suites; the value is kept but not written' : 'Colon-separated TLS_* names; empty keeps the library default'}><TextInput value={draft.sslCipherSuites} onChange={set('sslCipherSuites')} placeholder="TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384" /></Field>
+            <Field inline><Toggle checked={draft.sslPreferServerCiphers} onChange={set('sslPreferServerCiphers')} label="Prefer the server's cipher order (ssl_prefer_server_ciphers)" /></Field>
             <Field inline><Toggle checked={draft.disablePlaintextAuth} onChange={set('disablePlaintextAuth')} label="Disable plain-text authentication without TLS" disabled={draft.ssl === 'required'} /></Field>
-            <p className="muted">The certificate itself is installed under Manage Service SSL Certificates (conf.d/99-whm-ssl.conf); ciphers follow SSL/TLS Configuration.</p>
+            <p className="muted">The certificate itself is installed under Manage Service SSL Certificates (conf.d/90-whm-ssl-cert.conf, certificate paths only, loaded before this file so nothing here is overridden).</p>
           </Card>
           <Card title="Mailboxes" className="config-fields">
             <div className="form-grid">

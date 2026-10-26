@@ -29,7 +29,7 @@ export async function register(ctx) {
   const listQuery = pagination.extend({ account: fields.username.optional(), system: boolQuery });
 
   // Overview --------------------------------------------------------------
-  r.get('/status', requireReseller, wrap(() => dbs().status()));
+  r.get('/status', requireReseller, wrap((req) => dbs().status(req.user)));
   r.get('/accounts/:username', requireReseller, validate({ params: z.object({ username: fields.username }) }), wrap((req) => dbs().forAccount(req.params.username, req.user)));
 
   // Manage Databases -----------------------------------------------------
@@ -98,8 +98,10 @@ export async function register(ctx) {
     wrap((req) => dbs().enqueueUpgrade(req.body, req.user, req), 202));
 
   // phpMyAdmin -----------------------------------------------------------
-  r.get('/phpmyadmin', requireReseller, wrap(() => dbs().phpMyAdmin()));
-  r.put('/phpmyadmin', requireRoot, validate({ body: z.object({ url: z.string().trim().max(2048).regex(/^(https?:\/\/[^\s]+|\/[^\s]*|)$/, 'Absolute URL or a path on this server') }).strict() }),
+  r.get('/phpmyadmin', requireReseller, wrap((req) => dbs().phpMyAdmin(req.user)));
+  // A protocol-relative "//host/..." value would send every reseller to a foreign
+  // origin, so the path form must start with exactly one slash.
+  r.put('/phpmyadmin', requireRoot, validate({ body: z.object({ url: z.string().trim().max(2048).regex(/^(https?:\/\/[^\s/][^\s]*|\/(?!\/)[^\s]*|)$/, 'Absolute http(s) URL or a path on this server') }).strict() }),
     wrap((req) => dbs().setPhpMyAdminUrl(req.body.url, req.user, req)));
 
   return { path: '/databases', router: r };
