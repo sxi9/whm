@@ -129,6 +129,9 @@ function PluginDetail({ id, onClose }) {
           <div>
             <strong>Denied calls</strong>
             <ul>{data.permissionDenials.slice(-10).map((d, i) => <li key={i}><code>{d.method}</code> needed <code>{d.scope}</code> at {formatDate(d.ts)}</li>)}</ul>
+            {data.permissionDenialCounts && Object.keys(data.permissionDenialCounts).length > 0 && (
+              <p className="muted">Totals: {Object.entries(data.permissionDenialCounts).map(([scope, n]) => `${scope} ×${n}`).join(', ')}</p>
+            )}
           </div>
         </div>
       )}

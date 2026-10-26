@@ -7,7 +7,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createTestApp, waitForJob } from './support/app.js';
 import { createTarGz, packageFromFiles } from './support/tar.js';
 import { loadCommonJs, REPO_ROOT } from '../src/lib/plugin-sdk.js';
-import { HOST_API_VERSION, PASSWORD_MASK } from '../src/services/plugins.js';
+import { HOST_API_VERSION, PASSWORD_MASK, DENIAL_RING_SIZE, LOG_RING_SIZE } from '../src/services/plugins.js';
 
 const fixtures = loadCommonJs(path.join(REPO_ROOT, 'plugins', 'sdk', 'test', 'fixtures.js'));
 const ID = 'net.example.hello';
@@ -47,6 +47,10 @@ module.exports = {
     router.get('/boom', async () => { throw new Error('kaboom'); });
     router.get('/missing', async () => { throw new sdk.NotFoundError('item', 'x'); });
     router.get('/text', async (req, res) => res.set('X-Plugin', 'yes').send('plain'));
+    router.get('/cookie', async (req, res) => res.set('Set-Cookie', 'whm.sid=stolen').send('x'));
+    router.get('/cors', async (req, res) => res.set('Access-Control-Allow-Origin', '*').json({}));
+    router.get('/html', async (req, res) => res.set('Content-Type', 'text/html').send('<b>x</b>'));
+    router.post('/op', async (req, res) => res.json(await module.exports.ctx.agent.op(req.body.name, req.body.args)));
     router.post('/call', async (req, res) => {
       const ctx = module.exports.ctx;
       const fn = req.body.method.split('.').reduce((o, k) => o[k], ctx);
@@ -162,6 +166,8 @@ describe('install', () => {
       [{ name: '/etc/cron.d/evil', data: 'x' }, /absolute/],
       [{ name: 'link', type: 'symlink', linkname: '/etc/passwd' }, /symbolic link/],
       [{ name: 'dev', type: 'char', linkname: '' }, /character device/],
+      [{ name: 'lib/a b.js', data: 'x' }, /whitespace/],
+      [{ name: 'lib/a\nb.js', data: 'x' }, /whitespace/],
     ];
     for (const [entry, re] of cases) {
       const res = await installRaw(createTarGz([{ name: 'plugin.json', data: m }, { name: 'main.js', data: 'module.exports = {};' }, entry]));
@@ -184,6 +190,10 @@ describe('install', () => {
     const ok = await post('/api/plugins/manage/install', { path: file });
     expect(ok.status).toBe(201);
     expect(ok.body.data.plugin).toMatchObject({ id: 'net.example.frompath', source: 'path' });
+    const spaced = writePlugin(path.join(tmp, 'spaced'), fixtures.minimalManifest({ id: 'net.example.spaced' }), { extra: { 'read me.txt': 'x' } });
+    const refused = await post('/api/plugins/manage/install', { dir: spaced });
+    expect(refused.status).toBe(422);
+    expect(refused.body.error).toMatchObject({ code: 'invalid_package', message: expect.stringMatching(/whitespace/) });
   });
 
   it('is root only', async () => {
@@ -560,10 +570,14 @@ describe('fs, crypto, net, i18n', () => {
   it('allows only granted https hosts for ctx.net.fetch and follows redirects within scope', async () => {
     const c = pluginCtx();
     const calls = [];
+    const inits = [];
     const original = globalThis.fetch;
     globalThis.fetch = async (url, init) => {
       calls.push([url, init.redirect, init.method, init.body]);
+      inits.push(init);
       if (url.startsWith('https://api.example.net/redirect')) return { status: 302, headers: new Map([['location', 'https://evil.example.org/']]) };
+      if (url.startsWith('https://api.example.net/sibling')) return { status: 302, headers: new Map([['location', 'https://b.storage.example.net:8443/landed']]) };
+      if (url.startsWith('https://api.example.net/same')) return { status: 307, headers: new Map([['location', 'https://api.example.net/landed']]) };
       if (url.startsWith('https://api.example.net/hop')) return { status: 301, headers: new Map([['location', '/landed']]) };
       if (url.startsWith('https://api.example.net/see-other')) return { status: 303, headers: new Map([['location', '/landed']]) };
       if (url.startsWith('https://api.example.net/temp')) return { status: 307, headers: new Map([['location', '/landed']]) };
@@ -584,6 +598,16 @@ describe('fs, crypto, net, i18n', () => {
       await c.net.fetch('https://api.example.net/temp', { method: 'POST', body: 'payload' });
       expect(calls.at(-1)).toEqual(['https://api.example.net/landed', 'manual', 'POST', 'payload']);
       expect(await (await c.net.fetch('https://api.example.net:443/')).json()).toEqual({ url: 'https://api.example.net/' });
+      // Credentials never follow a redirect to another origin, even one inside the plugin's scopes.
+      const cross = await c.net.fetch('https://api.example.net/sibling', { headers: { Authorization: 'Bearer secret', Cookie: 'a=b', 'X-Trace': 't1' } });
+      expect(await cross.json()).toEqual({ url: 'https://b.storage.example.net:8443/landed' });
+      expect(inits.at(-2).headers).toEqual({ Authorization: 'Bearer secret', Cookie: 'a=b', 'X-Trace': 't1' });
+      expect(inits.at(-1).headers).toEqual({ 'X-Trace': 't1' });
+      const crossHeaders = await c.net.fetch('https://api.example.net/sibling', { headers: new Headers({ authorization: 'Bearer secret', 'proxy-authorization': 'x', 'x-trace': 't2' }) });
+      expect(crossHeaders.status).toBe(200);
+      expect([...inits.at(-1).headers.keys()]).toEqual(['x-trace']);
+      await c.net.fetch('https://api.example.net/same', { method: 'POST', body: 'p', headers: { Authorization: 'Bearer secret' } });
+      expect(inits.at(-1).headers).toEqual({ Authorization: 'Bearer secret' });
     } finally {
       globalThis.fetch = original;
     }
@@ -625,6 +649,11 @@ module.exports = {
         patchExports: (() => { try { sdk.semver.satisfies = () => true; return 'allowed'; } catch (e) { return e.constructor.name; } })(),
         builtins: [typeof Buffer, typeof URL, typeof setTimeout, typeof TextEncoder, typeof require('crypto').createHash],
         frozen: Object.isFrozen(sdk) && Object.isFrozen(sdk.PluginError.prototype),
+        builtinFrozen: Object.isFrozen(require('crypto')) && Object.isFrozen(require('node:zlib')) && require('crypto') === require('node:crypto'),
+        patchBuiltin: (() => { try { require('crypto').randomBytes = () => 'rigged'; return 'allowed'; } catch (e) { return e.constructor.name; } })(),
+        patchZlib: (() => { try { require('zlib').gunzipSync = () => 'rigged'; return 'allowed'; } catch (e) { return e.constructor.name; } })(),
+        hash: require('node:crypto').createHash('sha256').update('a').digest('hex').slice(0, 8),
+        emitter: (() => { const EE = require('events'); class Sub extends EE {} const e = new Sub(); let got = null; e.on('x', (v) => { got = v; }); e.emit('x', 7); return [got, e instanceof EE, Object.isFrozen(EE), typeof EE.once]; })(),
       };
       console.log('probe ran', probe.eval);
       res.json(probe);
@@ -642,7 +671,9 @@ module.exports = {
       process: 'undefined', globalProcess: 'undefined', fetch: 'undefined', global: 'undefined', eval: 'EvalError', fn: 'EvalError',
       requireProcess: 'PERMISSION_DENIED', requireFs: 'PERMISSION_DENIED', patchProto: 'TypeError', patchExports: 'TypeError',
       builtins: ['function', 'function', 'function', 'function', 'function'], frozen: true,
+      builtinFrozen: true, patchBuiltin: 'TypeError', patchZlib: 'TypeError', hash: 'ca978112', emitter: [7, true, true, 'function'],
     });
+    expect(typeof crypto.randomBytes(4)).toBe('object');
     const logs = await get('/api/plugins/manage/net.example.probe/logs?limit=5');
     expect(logs.body.data.some((l) => l.msg === 'probe ran EvalError' && l.level === 'info')).toBe(true);
     const detail = await get('/api/plugins/manage/net.example.probe');
@@ -708,6 +739,134 @@ module.exports = {
     } finally {
       delete app.ctx.config.pluginHookTimeoutMs;
       await del('/api/plugins/manage/net.example.slow?purge=true');
+    }
+  });
+});
+
+describe('review round 2', () => {
+  it('audits every ctx.agent.op call with the plugin principal, on success and on failure', async () => {
+    const before = app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'plugin.agent.op'").get().n;
+    const ok = await post(`${BASE}/op`, { name: 'svc.status', args: { unit: 'apache2', token: 'hunter2' } });
+    expect(ok.status).toBe(200);
+    expect(ok.body.data).toMatchObject({ unit: 'apache2', active: true });
+    app.agent.fail('svc.status', 'not_found', 'no such unit');
+    try {
+      const failed = await post(`${BASE}/op`, { name: 'svc.status', args: { unit: 'nope' } });
+      expect(failed.status).toBe(404);
+    } finally {
+      app.agent.reset('svc.status');
+    }
+    const denied = await post(`${BASE}/op`, { name: 'user.delete', args: { username: 'alice' } });
+    expect(denied.status).toBe(403);
+    expect(app.agent.callsTo('user.delete')).toEqual([]);
+    const rows = app.ctx.db.prepare("SELECT principal, role, target, args_redacted, result FROM audit_log WHERE action = 'plugin.agent.op' ORDER BY id").all();
+    expect(rows).toHaveLength(before + 2);
+    expect(rows.at(-2)).toEqual({ principal: `plugin:${ID}`, role: 'plugin', target: 'svc.status', args_redacted: JSON.stringify({ unit: 'apache2', token: '[redacted]' }), result: 'ok' });
+    expect(rows.at(-1)).toMatchObject({ principal: `plugin:${ID}`, role: 'plugin', target: 'svc.status', result: 'error:NOT_FOUND' });
+  });
+
+  it('audits ctx.api.backups.upload and echoes the requested include list from backups.create', async () => {
+    const c = pluginCtx();
+    const saved = app.ctx.backup;
+    const stub = {
+      ...saved,
+      archiveAccount: async (account, { include }) => ({ id: 78, account, path: '/backup/alice-78.tar.gz', size: 10, sha256: 'abc', created_at: '2026-01-01 00:00:00', status: 'done', components: { include } }),
+      listDestinations: () => [{ id: 5, name: 'offsite', kind: 's3' }],
+      destinationConfig: () => ({ kind: 's3', bucket: 'b', secretKey: 'shh' }),
+    };
+    app.ctx.backup = stub;
+    app.ctx.db.prepare('UPDATE backups SET local_present = 1 WHERE id = 77').run();
+    app.ctx.db.prepare("INSERT OR IGNORE INTO backup_destinations (id, name, kind) VALUES (5, 'offsite', 's3')").run();
+    app.agent.set('backup.destination.upload', () => ({ remotePath: 's3://b/alice-78.tar.gz' }));
+    try {
+      const created = await c.api.backups.create({ account: 'alice', include: ['home', 'ssl', 'cron'] });
+      expect(created).toMatchObject({ id: '78', account: 'alice', include: ['home', 'ssl', 'cron'], compression: 'gzip', encrypted: false });
+      const all = await c.api.backups.create({ account: 'alice' });
+      expect(all.include).toEqual(['home', 'mail', 'db', 'dns', 'ssl', 'cron']);
+      const up = await c.api.backups.upload({ artefactId: '77', destinationId: '5' });
+      expect(up).toEqual({ ok: true, remotePath: 's3://b/alice-78.tar.gz', sha256: 'abc' });
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM backup_uploads WHERE backup_id = 77 AND destination_id = 5 AND status = 'done'").get().n).toBe(1);
+      const row = app.ctx.db.prepare("SELECT principal, role, target, args_redacted, result FROM audit_log WHERE action = 'plugin.backup.upload' ORDER BY id DESC LIMIT 1").get();
+      expect(row).toEqual({ principal: `plugin:${ID}`, role: 'plugin', target: '77->offsite', args_redacted: JSON.stringify({ artefactId: '77', destinationId: '5', file: '/backup/alice.tar.gz', remotePath: 's3://b/alice-78.tar.gz' }), result: 'ok' });
+      app.agent.fail('backup.destination.upload', 'command_failed', 'upload broke');
+      await expect(c.api.backups.upload({ artefactId: '77', destinationId: '5' })).rejects.toMatchObject({ code: 'COMMAND_FAILED' });
+      expect(app.ctx.db.prepare("SELECT result FROM audit_log WHERE action = 'plugin.backup.upload' ORDER BY id DESC LIMIT 1").get().result).toBe('error:COMMAND_FAILED');
+    } finally {
+      app.ctx.backup = saved;
+      app.agent.reset('backup.destination.upload');
+    }
+  });
+
+  it('keeps manifest hooks out of ctx.events.off', async () => {
+    const c = pluginCtx();
+    const entry = app.ctx.plugins.entry(ID);
+    const n = entry.subscribers.length;
+    expect(c.events.off('account.created', pluginModule().hooks.afterAccountCreated)).toBe(false);
+    expect(entry.subscribers).toHaveLength(n);
+    const fn = async () => {};
+    const off = c.events.on('account.created', fn);
+    expect(entry.subscribers).toHaveLength(n + 1);
+    expect(off()).toBe(true);
+    expect(entry.subscribers).toHaveLength(n);
+  });
+
+  it('answers 400 for a malformed path parameter and refuses dangerous response headers', async () => {
+    const bad = await get(`${BASE}/items/%E0`);
+    expect(bad.status).toBe(400);
+    expect(bad.body.error.code).toBe('BAD_REQUEST');
+    for (const route of ['cookie', 'cors', 'html']) {
+      const res = await get(`${BASE}/${route}`);
+      expect(res.status, route).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+      expect(JSON.stringify(res.headers['set-cookie'] || [])).not.toContain('stolen');
+      expect(res.headers['access-control-allow-origin']).toBeUndefined();
+      expect(res.headers['content-type']).toMatch(/application\/json/);
+    }
+  });
+
+  it('caps the denial list, counts denials per scope and prunes the log ring per plugin', async () => {
+    const c = pluginCtx();
+    const scope = 'net:outbound:denied.example.org';
+    for (let i = 0; i < DENIAL_RING_SIZE + 10; i++) await expect(c.net.fetch('https://denied.example.org/')).rejects.toMatchObject({ code: 'PERMISSION_DENIED' });
+    const detail = (await get(`/api/plugins/manage/${ID}`)).body.data;
+    expect(detail.permissionDenials).toHaveLength(DENIAL_RING_SIZE);
+    expect(detail.permissionDenials.every((d) => d.scope === scope)).toBe(true);
+    expect(detail.permissionDenialCounts[scope]).toBe(DENIAL_RING_SIZE + 10);
+    for (let i = 0; i < LOG_RING_SIZE + 120; i++) c.log.debug(`line ${i}`);
+    // The ring prunes every 50 writes of this plugin, so at most 49 rows wait for the next prune.
+    expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM plugin_logs WHERE plugin_id = ?').get(ID).n).toBeLessThanOrEqual(LOG_RING_SIZE + 49);
+  });
+
+  it('times out an activation that never settles: the plugin is errored, rolled back and the panel keeps serving', async () => {
+    const main = `module.exports = {
+  routes(r) { r.get('/ping', async (req, res) => res.json('pong')); },
+  async activate(ctx) { module.exports.ctx = ctx; await new Promise(() => {}); },
+};`;
+    const manifest = fixtures.minimalManifest({ id: 'net.example.hang', permissions: ['api:routes', 'jobs', 'schedule'], cron: [{ name: 'tick', schedule: '*/5 * * * *', job: 'tick' }], jobs: { tick: { label: 'Tick' } } });
+    const dir = writePlugin(path.join(tmp, 'hang'), manifest, { main: `${main}
+module.exports.jobs = { async tick() { return null; } };` });
+    expect((await post('/api/plugins/manage/install', { dir })).status).toBe(201);
+    app.ctx.config.pluginActivateTimeoutMs = 200;
+    try {
+      const started = Date.now();
+      const res = await post('/api/plugins/manage/net.example.hang/enable');
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect(res.status).toBe(200);
+      expect(res.body.data).toMatchObject({ state: 'errored', lastError: { code: 'ACTIVATE_TIMEOUT' } });
+      expect(app.ctx.db.prepare('SELECT state FROM plugins WHERE id = ?').get('net.example.hang').state).toBe('errored');
+      expect(app.ctx.scheduler.listPrefix('plugin:net.example.hang:')).toEqual([]);
+      expect((await get('/api/plugins/net.example.hang/ping')).status).toBe(404);
+      expect((await get('/api/health')).status).toBe(200);
+      const entry = app.ctx.plugins.entry('net.example.hang');
+      expect(() => entry.ctx.events.on('account.created', async () => {})).toThrow(/active/);
+      expect(entry.subscribers).toEqual([]);
+      app.ctx.db.prepare("UPDATE plugins SET state = 'enabled' WHERE id = 'net.example.hang'").run();
+      await expect(app.ctx.plugins.loadAll()).resolves.toBeInstanceOf(Array);
+      expect(JSON.parse(app.ctx.db.prepare('SELECT last_error FROM plugins WHERE id = ?').get('net.example.hang').last_error).code).toBe('ACTIVATE_TIMEOUT');
+      expect((await get('/api/plugins/manage')).body.data.find((p) => p.id === 'net.example.hang').state).toBe('errored');
+    } finally {
+      delete app.ctx.config.pluginActivateTimeoutMs;
+      await del('/api/plugins/manage/net.example.hang?purge=true');
     }
   });
 });

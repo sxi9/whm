@@ -27,6 +27,8 @@ const defaults = {
   checkinIntervalMs: 60 * 1000,
   pluginsDir: null,
   pluginDataDir: null,
+  pluginHookTimeoutMs: 30_000,
+  pluginActivateTimeoutMs: 60_000,
 };
 
 function readConfigFile() {
@@ -63,6 +65,8 @@ function envOverrides() {
   if (e.WHM_CLIENT_DIST) out.clientDist = path.resolve(e.WHM_CLIENT_DIST);
   if (e.WHM_PLUGINS_DIR) out.pluginsDir = path.resolve(e.WHM_PLUGINS_DIR);
   if (e.WHM_PLUGIN_DATA_DIR) out.pluginDataDir = path.resolve(e.WHM_PLUGIN_DATA_DIR);
+  if (e.WHM_PLUGIN_HOOK_TIMEOUT_MS) out.pluginHookTimeoutMs = Number(e.WHM_PLUGIN_HOOK_TIMEOUT_MS);
+  if (e.WHM_PLUGIN_ACTIVATE_TIMEOUT_MS) out.pluginActivateTimeoutMs = Number(e.WHM_PLUGIN_ACTIVATE_TIMEOUT_MS);
   return out;
 }
 

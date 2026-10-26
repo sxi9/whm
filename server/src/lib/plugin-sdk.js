@@ -79,6 +79,37 @@ export function freezeExports(obj, seen = new Set()) {
   return Object.freeze(obj);
 }
 
+// A frozen shallow copy of an allow-listed built-in module for plugin require():
+// own properties are redefined by descriptor (getters stay lazy), so assigning
+// `crypto.randomBytes = ...` throws in strict mode instead of patching the host's
+// module object. Function modules (events, stream, assert) become a forwarding
+// function that shares the original prototype, so `new` and `instanceof` work.
+export function freezeBuiltin(mod) {
+  if (mod === null || (typeof mod !== 'object' && typeof mod !== 'function')) return mod;
+  let copy;
+  if (typeof mod === 'function') {
+    copy = function builtin(...args) { return new.target ? Reflect.construct(mod, args, new.target) : Reflect.apply(mod, this, args); };
+    if (mod.prototype && typeof mod.prototype === 'object') copy.prototype = mod.prototype;
+  } else {
+    copy = Object.create(Object.getPrototypeOf(mod));
+  }
+  const skip = new Set(['prototype', 'arguments', 'caller']);
+  for (const key of Reflect.ownKeys(mod)) {
+    if (skip.has(key)) continue;
+    const d = Object.getOwnPropertyDescriptor(mod, key);
+    if ('value' in d) {
+      if (d.value === mod) d.value = copy;
+    } else {
+      // Node's lazy getters (crypto.prng, …) cache onto `this`, which a frozen
+      // copy refuses, so getters run against the original module object.
+      const get = d.get;
+      Object.assign(d, { get: get ? () => get.call(mod) : undefined, set: undefined, configurable: true });
+    }
+    try { Object.defineProperty(copy, key, d); } catch { /* non-configurable on the copy: keep its own */ }
+  }
+  return Object.freeze(copy);
+}
+
 // Loads the bundled SDK once per call site. Returns null when the SDK is not
 // shipped with this install (the panel must keep working without it).
 export function loadPluginSdk(root = REPO_ROOT) {

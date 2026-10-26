@@ -18,7 +18,7 @@
     "build": "npm run build --workspace client",
     "start": "npm run start --workspace server",
     "agent": "npm run start --workspace agent",
-    "test": "npm run test --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present && npm test --prefix plugins/sdk",
     "lint": "npm run lint --workspaces --if-present"
   },
   "devDependencies": {

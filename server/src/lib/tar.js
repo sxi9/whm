@@ -46,10 +46,16 @@ function checksumOk(header) {
   return stored === unsigned || stored === signed;
 }
 
+// Entry names may not contain whitespace or control characters: the signed
+// package digest is built from `<name> <sha256>` lines, so a name holding a
+// space or a newline could forge a line of another file.
+export const UNSAFE_NAME_CHARS = /[\s\x00-\x1f\x7f]/;
+
 // Returns the normalised relative name or throws.
 export function safeEntryName(raw) {
   if (typeof raw !== 'string' || raw.length === 0) throw new TarError('entry has an empty name');
   if (raw.includes('\0')) throw new TarError('entry name contains a NUL byte', raw);
+  if (UNSAFE_NAME_CHARS.test(raw)) throw new TarError('entry name contains whitespace or a control character', raw);
   if (raw.includes('\\')) throw new TarError('entry name contains a backslash', raw);
   if (raw.startsWith('/')) throw new TarError('absolute entry names are not allowed', raw);
   const segments = raw.split('/').filter((s) => s !== '' && s !== '.');

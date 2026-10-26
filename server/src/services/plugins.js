@@ -7,8 +7,8 @@ import { createRequire } from 'node:module';
 import { json } from '../db/index.js';
 import { HttpError, CapabilityError, notFound, conflict } from '../lib/errors.js';
 import { agentErrorStatus } from '../middleware/error.js';
-import { loadPluginSdk, loadCommonJs, createPluginContext, freezeExports, REPO_ROOT } from '../lib/plugin-sdk.js';
-import { extractTar, TarError } from '../lib/tar.js';
+import { loadPluginSdk, loadCommonJs, createPluginContext, freezeExports, freezeBuiltin, REPO_ROOT } from '../lib/plugin-sdk.js';
+import { extractTar, TarError, UNSAFE_NAME_CHARS } from '../lib/tar.js';
 import { PanelEvents } from './development.js';
 
 // The in-process plugin host: the real implementation of the contract that
@@ -31,6 +31,12 @@ export const MAX_LOG_FIELDS_BYTES = 8 * 1024;
 export const MAX_STORE_ROWS = 50_000;
 export const MAX_DOCS_ROWS = 100_000;
 export const HOOK_TIMEOUT_MS = 30_000;
+export const ACTIVATE_TIMEOUT_MS = 60_000;
+export const DENIAL_RING_SIZE = 50;
+// Response headers a plugin route may not set on the panel origin: they would
+// touch the session cookie, the CORS policy or the browser hardening headers.
+export const BLOCKED_RESPONSE_HEADERS = /^(set-cookie|access-control-.*|content-security-policy(-report-only)?|strict-transport-security|x-frame-options)$/i;
+const STRING_BODY_TYPES = /^(text\/plain|application\/json)(\s*;|$)/i;
 // Every plugin runs inside the panel process until process isolation lands, so
 // an installed plugin is trusted code; the install response and the Manage
 // Plugins view carry this warning next to the permission list.
@@ -40,6 +46,11 @@ const SECRET_KEY_RE = /pass(word)?|secret|token|key|credential|authorization/i;
 const BUILTIN_REQUIRES = new Set(['crypto', 'path', 'url', 'util', 'buffer', 'events', 'stream', 'string_decoder', 'querystring', 'zlib', 'assert', 'timers']);
 const KID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const nodeRequire = createRequire(import.meta.url);
+const builtinCache = new Map();
+function requireBuiltin(bare) {
+  if (!builtinCache.has(bare)) builtinCache.set(bare, freezeBuiltin(nodeRequire(`node:${bare}`)));
+  return builtinCache.get(bare);
+}
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
@@ -179,7 +190,6 @@ export function createPluginHost(ctx) {
   const live = new Map();
   const activations = new Map();
   const restoreTokens = new Map();
-  let logCounter = 0;
   let processIsolationWarned = false;
 
   function requireSdk() {
@@ -201,7 +211,7 @@ export function createPluginHost(ctx) {
     const entry = {
       id: row.id, manifest, dir, dataDir, module: null, ctx: null, state: 'loaded', lastError: null,
       granted: new Set(manifest.permissions || []),
-      permissionsUsed: [], permissionDenials: [], hookTimeouts: [],
+      permissionsUsed: [], permissionDenials: [], deniedCounts: {}, hookTimeouts: [], logWrites: 0,
       routes: [], pages: [], subscribers: [], settingListeners: [], locales: {},
       running: new Map(), routesOpen: false, pagesOpen: false,
       logger: logger.child ? logger.child({ plugin: row.id }) : logger,
@@ -224,9 +234,16 @@ export function createPluginHost(ctx) {
   function useScope(entry, scope) {
     if (!entry.permissionsUsed.includes(scope)) entry.permissionsUsed.push(scope);
   }
+  // The detail view shows the newest denials; a plugin that retries a denied
+  // call on every tick must not grow memory, so the rest is kept as a counter.
+  function recordDenial(entry, scope, method) {
+    entry.permissionDenials.push({ scope, method, ts: Date.now() });
+    if (entry.permissionDenials.length > DENIAL_RING_SIZE) entry.permissionDenials.shift();
+    entry.deniedCounts[scope] = (entry.deniedCounts[scope] || 0) + 1;
+  }
   function gate(entry, scope, method) {
     if (!entry.granted.has(scope)) {
-      entry.permissionDenials.push({ scope, method, ts: Date.now() });
+      recordDenial(entry, scope, method);
       throw new E.PermissionError(scope, method, entry.id);
     }
     useScope(entry, scope);
@@ -247,7 +264,7 @@ export function createPluginHost(ctx) {
     }
     try {
       stmts.logInsert.run(entry.id, level, text, safe ? JSON.stringify(safe) : null);
-      if (++logCounter % 50 === 0) stmts.logPrune.run(entry.id, entry.id, LOG_RING_SIZE);
+      if (++entry.logWrites % 50 === 0) stmts.logPrune.run(entry.id, entry.id, LOG_RING_SIZE);
     } catch (e) { log.warn({ err: e, plugin: entry.id }, 'plugin log write failed'); }
     const child = entry.logger;
     (child[level] || child.info).call(child, safe || {}, text);
@@ -577,7 +594,7 @@ export function createPluginHost(ctx) {
           if (compression !== 'gzip' || encrypt) throw new E.PluginError('this host only produces gzip-compressed, unencrypted account archives', { code: 'UNSUPPORTED', status: 422 });
           const backup = requireService('backup', 'backup service');
           const r = await bridge(() => backup.archiveAccount(account, { include: { home: inc.includes('home'), mail: inc.includes('mail'), dbs: inc.includes('db'), dns: inc.includes('dns') } }, user, req), { resource: 'account', id: account });
-          return shapeArtefact(r);
+          return { ...shapeArtefact(r), include: inc.slice() };
         },
         async restore({ artefactId, account, confirmToken } = {}) {
           gate(entry, 'backups:restore', 'ctx.api.backups.restore');
@@ -623,8 +640,16 @@ export function createPluginHost(ctx) {
           const dest = backup.listDestinations().find((d) => String(d.id) === String(destinationId));
           if (!dest) throw new E.NotFoundError('backup destination', destinationId);
           if (!b.path || b.local_present === false) throw new E.ConflictError('the archive is not on local disk');
-          const r = await bridge(() => ctx.agent.op('backup.destination.upload', { config: backup.destinationConfig(dest.id), file: b.path }, { req }));
+          const target = `${artefactId}->${dest.name}`;
+          let r;
+          try {
+            r = await bridge(() => ctx.agent.op('backup.destination.upload', { config: backup.destinationConfig(dest.id), file: b.path }, { req }));
+          } catch (err) {
+            req.audit({ action: 'plugin.backup.upload', target, args: { artefactId, destinationId: String(dest.id), file: b.path }, result: `error:${err.code || 'failed'}` });
+            throw err;
+          }
           stmts.backupUpload.run(Number(b.id), dest.id, dest.name, r.remotePath ?? null, 'done', null);
+          req.audit({ action: 'plugin.backup.upload', target, args: { artefactId, destinationId: String(dest.id), file: b.path, remotePath: r.remotePath ?? null } });
           return { ok: true, remotePath: r.remotePath ?? null, sha256: b.sha256 ?? null };
         },
         async verify(artefactId) {
@@ -691,7 +716,15 @@ export function createPluginHost(ctx) {
         if (typeof name !== 'string' || !/^[a-z]+(\.[a-z][a-zA-Z0-9]*)+$/.test(name)) throw new E.ValidationError('agent op name must look like "family.op"');
         gate(entry, `agent:op:${name}`, 'ctx.agent.op');
         if (!isObj(args)) throw new E.ValidationError('agent op args must be an object');
-        return bridge(() => ctx.agent.op(name, clone(args), { req }));
+        const safeArgs = redact(clone(args));
+        try {
+          const result = await bridge(() => ctx.agent.op(name, clone(args), { req }));
+          req.audit({ action: 'plugin.agent.op', target: name, args: safeArgs });
+          return result;
+        } catch (err) {
+          req.audit({ action: 'plugin.agent.op', target: name, args: safeArgs, result: `error:${err.code || 'failed'}` });
+          throw err;
+        }
       },
     };
   }
@@ -851,6 +884,7 @@ export function createPluginHost(ctx) {
   // ------------------------------------------------------------------ events
   const DELIVERED = 'plugin:delivered';
   function subscribe(entry, event, stage, fn, label) {
+    if (entry.state !== 'activating' && entry.state !== 'enabled') throw new E.LifecycleError('event handlers can only be registered while the plugin is active');
     const def = V.EVENTS[event];
     const cancellable = Boolean(def && stage === 'pre' && def.cancellable);
     const listener = async (envelope) => {
@@ -891,7 +925,7 @@ export function createPluginHost(ctx) {
       }
     };
     const off = bus().on(event, listener);
-    const sub = { event, stage, fn, off };
+    const sub = { event, stage, fn, label, off };
     entry.subscribers.push(sub);
     return sub;
   }
@@ -910,8 +944,10 @@ export function createPluginHost(ctx) {
         subscribe(entry, event, stage, handler, 'events.on');
         return () => events.off(event, handler);
       },
+      // Manifest hooks are not reachable from off(): a plugin cannot detach a
+      // policy its manifest declares by passing the same function.
       off(event, handler) {
-        const i = entry.subscribers.findIndex((s) => s.event === event && s.fn === handler);
+        const i = entry.subscribers.findIndex((s) => s.label === 'events.on' && s.event === event && s.fn === handler);
         if (i === -1) return false;
         const [s] = entry.subscribers.splice(i, 1);
         s.off();
@@ -966,7 +1002,12 @@ export function createPluginHost(ctx) {
     if (!route.roles.includes(principal.role)) { res.status(403).json({ error: { code: 'FORBIDDEN', message: `role "${principal.role}" may not call ${m} ${routePath}` } }); return; }
     const match = route.re.exec(routePath);
     const pathParams = {};
-    route.keys.forEach((k, i) => { pathParams[k] = decodeURIComponent(match[i + 1]); });
+    try {
+      route.keys.forEach((k, i) => { pathParams[k] = decodeURIComponent(match[i + 1]); });
+    } catch {
+      res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'malformed path parameter' } });
+      return;
+    }
     const { cookie, authorization, ...headers } = req.headers; // eslint-disable-line no-unused-vars
     const facadeReq = {
       method: m, path: routePath, params: pathParams, query: clone(req.query) || {}, body: Buffer.isBuffer(req.body) ? req.body : clone(req.body),
@@ -981,7 +1022,13 @@ export function createPluginHost(ctx) {
     };
     const facadeRes = {
       status(code) { if (!Number.isInteger(code) || code < 100 || code > 599) throw new E.ValidationError('invalid status code'); state.statusCode = code; return facadeRes; },
-      set(name, value) { res.set(String(name), String(value)); return facadeRes; },
+      set(name, value) {
+        const header = String(name).trim();
+        if (!/^[A-Za-z0-9-]+$/.test(header) || BLOCKED_RESPONSE_HEADERS.test(header)) throw new E.ValidationError(`plugin routes may not set the "${header}" header`);
+        if (header.toLowerCase() === 'content-type' && !STRING_BODY_TYPES.test(String(value))) throw new E.ValidationError('plugin routes may only send text/plain or application/json bodies');
+        res.set(header, String(value));
+        return facadeRes;
+      },
       json(data) { if (state.sent) throw new E.ConflictError('response already sent'); send(state.statusCode, state.statusCode >= 400 ? data : { data }); },
       send(text) { if (state.sent) throw new E.ConflictError('response already sent'); send(state.statusCode, String(text)); },
       error(code, message, status = 400) { if (state.sent) throw new E.ConflictError('response already sent'); send(status, { error: { code, message } }); },
@@ -1136,6 +1183,17 @@ export function createPluginHost(ctx) {
   }
 
   // ------------------------------------------------------------------ net
+  const CREDENTIAL_HEADERS = ['authorization', 'proxy-authorization', 'cookie'];
+  function stripCredentialHeaders(headers) {
+    if (typeof Headers !== 'undefined' && headers instanceof Headers) {
+      const copy = new Headers(headers);
+      for (const h of CREDENTIAL_HEADERS) copy.delete(h);
+      return copy;
+    }
+    if (Array.isArray(headers)) return headers.filter(([k]) => !CREDENTIAL_HEADERS.includes(String(k).toLowerCase()));
+    if (isObj(headers)) return Object.fromEntries(Object.entries(headers).filter(([k]) => !CREDENTIAL_HEADERS.includes(k.toLowerCase())));
+    return headers;
+  }
   function netApi(entry) {
     return {
       async fetch(url, init = {}) {
@@ -1144,7 +1202,7 @@ export function createPluginHost(ctx) {
           const scope = V.matchesNetScope(u.hostname, u.port || '443', [...entry.granted]);
           if (!scope) {
             const wanted = `net:outbound:${u.hostname}${u.port ? `:${u.port}` : ''}`;
-            entry.permissionDenials.push({ scope: wanted, method: 'ctx.net.fetch', ts: Date.now() });
+            recordDenial(entry, wanted, 'ctx.net.fetch');
             throw new E.PermissionError(wanted, 'ctx.net.fetch', entry.id);
           }
           useScope(entry, scope);
@@ -1161,13 +1219,16 @@ export function createPluginHost(ctx) {
           const location = response.status >= 300 && response.status < 400 ? response.headers?.get?.('location') : null;
           if (!location) return response;
           if (hop === 3) throw new E.PluginError('too many redirects', { code: 'TOO_MANY_REDIRECTS', status: 502 });
+          const previous = current;
           current = new URL(location, current);
           check(current);
-          // Like fetch's "follow" mode: 301/302/303 turn the request into a body-less GET; 307/308 replay it.
+          // Like fetch's "follow" mode: 301/302/303 turn the request into a body-less GET; 307/308 replay it,
+          // and credentials never travel to another origin.
           if (response.status === 301 || response.status === 302 || response.status === 303) {
             const { body, ...rest } = hopInit; // eslint-disable-line no-unused-vars
             hopInit = { ...rest, method: 'GET' };
           }
+          if (current.origin !== previous.origin && hopInit.headers) hopInit = { ...hopInit, headers: stripCredentialHeaders(hopInit.headers) };
         }
         return undefined;
       },
@@ -1243,7 +1304,7 @@ export function createPluginHost(ctx) {
       }
       if (spec === 'whm/plugins/sdk') return sdkExports;
       const bare = spec.startsWith('node:') ? spec.slice(5) : spec;
-      if (BUILTIN_REQUIRES.has(bare)) return nodeRequire(`node:${bare}`);
+      if (BUILTIN_REQUIRES.has(bare)) return requireBuiltin(bare);
       throw new E.PermissionError(`require:${spec}`, 'require', entry.id);
     };
     const consoleLog = (level) => (...args) => { try { writeLog(entry, level, util.format(...args)); } catch { /* never let console throw into plugin code */ } };
@@ -1300,12 +1361,21 @@ export function createPluginHost(ctx) {
     entry.state = 'activating';
     entry.routesOpen = true;
     entry.pagesOpen = true;
-    try {
+    // The whole sequence races a timeout: a routes()/migrate()/activate() that
+    // never settles must not keep the panel from booting or the operator from
+    // reaching Manage Plugins. Once the timeout has won, a late step finds the
+    // entry errored and stops instead of registering into a rolled-back plugin.
+    const timeoutMs = Number(config.pluginActivateTimeoutMs) > 0 ? Number(config.pluginActivateTimeoutMs) : ACTIVATE_TIMEOUT_MS;
+    const stillActivating = () => { if (entry.state !== 'activating') throw new E.LifecycleError('activation was aborted'); };
+    let timer = null;
+    const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new E.PluginError(`activation did not settle within ${timeoutMs} ms`, { code: 'ACTIVATE_TIMEOUT', status: 504 })), timeoutMs); timer.unref(); });
+    const sequence = (async () => {
       fs.mkdirSync(entry.dataDir, { recursive: true, mode: 0o750 });
       entry.locales = loadLocales(entry);
       for (const name of Object.keys(m.jobs || {})) ctx.jobs.register(jobType(entry.id, name), (coreCtx) => runPluginJob(entry.id, name, coreCtx));
       for (const h of m.hooks || []) subscribe(entry, h.event, h.stage || 'post', mod.hooks[h.handler], `hooks.${h.handler}`);
       if (typeof mod.routes === 'function') await mod.routes(entry.ctx.http, entry.ctx);
+      stillActivating();
       for (const pg of (m.ui && m.ui.pages) || []) {
         if (!entry.pages.some((p) => p.route === pg.route)) entry.pages.push({ ...clone(pg), source: 'manifest' });
       }
@@ -1313,11 +1383,18 @@ export function createPluginHost(ctx) {
       if (from !== undefined) {
         if (!semver.valid(from)) throw new E.ValidationError(`fromVersion "${from}" is not semver`);
         if (typeof mod.migrate === 'function') await mod.migrate(entry.ctx, from);
+        stillActivating();
       }
       if (typeof mod.activate === 'function') await mod.activate(entry.ctx);
+      stillActivating();
+    })();
+    sequence.catch(() => {});
+    try {
+      await Promise.race([sequence, timeout]);
     } catch (err) {
       return fail(entry, err);
     } finally {
+      clearTimeout(timer);
       entry.routesOpen = false;
       entry.pagesOpen = false;
     }
@@ -1468,6 +1545,7 @@ export function createPluginHost(ctx) {
       const from = path.join(src, ent.name);
       const to = path.join(dst, ent.name);
       const st = fs.lstatSync(from);
+      if (UNSAFE_NAME_CHARS.test(ent.name) || ent.name.includes('\\')) throw err422('invalid_package', `file names may not contain whitespace, control characters or backslashes (${JSON.stringify(ent.name)})`);
       if (st.isSymbolicLink()) throw err422('invalid_package', `plugin directories may not contain symbolic links (${ent.name})`);
       if (++counters.entries > 2000) throw err422('invalid_package', 'plugin has more than 2000 files');
       if (st.isDirectory()) { copyTree(from, to, counters); continue; }
@@ -1618,7 +1696,7 @@ export function createPluginHost(ctx) {
       settings: { groups: entry.manifest.settings?.groups || [], fields: settingFields(entry), values: maskedValues(entry) },
       schedules: ctx.scheduler.listPrefix(schedPrefix(id)).map((r) => shapeSchedule(entry, r)),
       jobs: stmts.jobsFor.all(`${jobType(id, '').replace(/[\\%_]/g, '\\$&')}%`, 20).map((j) => shapeJob(entry, { ...j, params: json.parse(j.params_json, {}), result: json.parse(j.result_json, null) })),
-      permissionsUsed: entry.permissionsUsed.slice(), permissionDenials: entry.permissionDenials.slice(), hookTimeouts: entry.hookTimeouts.slice(),
+      permissionsUsed: entry.permissionsUsed.slice(), permissionDenials: entry.permissionDenials.slice(), permissionDenialCounts: { ...entry.deniedCounts }, hookTimeouts: entry.hookTimeouts.slice(),
       isolation: entry.manifest.isolation || 'in-process', warnings: [IN_PROCESS_WARNING, ...(row.signed ? [] : ['unsigned'])],
       pages: entry.pages.slice(), routes: entry.routes.map((r) => ({ method: r.method, path: r.path, roles: r.roles })),
       logs: readLogs(id, 100), dir: entry.dir, dataDir: entry.dataDir, requireSignature: ctx.settings.get('plugins.require_signature', false) === true,

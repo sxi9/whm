@@ -49,7 +49,7 @@ export async function bootstrap(overrides = {}) {
   ctx.audit = createAuditService(ctx);
   ctx.plugins = createPluginHost(ctx);
   ctx.app = await createApp(ctx);
-  await ctx.plugins.loadAll();
+  if (overrides.loadPlugins !== false) await ctx.plugins.loadAll();
 
   try {
     await agent.ping();
@@ -62,10 +62,8 @@ export async function bootstrap(overrides = {}) {
 }
 
 export async function start() {
-  const ctx = await bootstrap();
+  const ctx = await bootstrap({ loadPlugins: false });
   const { config, logger, app, jobs, scheduler } = ctx;
-  jobs.start();
-  scheduler.start();
 
   const servers = [];
   if (config.tls) {
@@ -76,6 +74,13 @@ export async function start() {
   const httpServer = http.createServer(app);
   httpServer.listen(config.port, config.host, () => logger.info({ port: config.port, mode: config.mode, env: config.env, dataDir: config.dataDir }, 'WHM panel listening (http)'));
   servers.push(httpServer);
+
+  // Plugins load once the panel listens, so a slow activation never keeps the
+  // operator from reaching Manage Plugins; the job workers start after that so
+  // a queued plugin job finds its handler registered.
+  ctx.plugins.loadAll()
+    .catch((err) => logger.error({ err }, 'plugin load failed'))
+    .finally(() => { jobs.start(); scheduler.start(); });
 
   const shutdown = (signal) => {
     logger.info({ signal }, 'shutting down');

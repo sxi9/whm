@@ -34,6 +34,15 @@ describe('tar reader', () => {
     expect(listTar(buf).map((e) => e.name)).toEqual([long, 'deep/prefix/short.js']);
   });
 
+  it('refuses whitespace and control characters in names so the signed digest stays unambiguous', () => {
+    expect(() => safeEntryName('a b.js')).toThrow(TarError);
+    expect(() => safeEntryName('a\nb.js')).toThrow(/whitespace/);
+    expect(() => safeEntryName('a\tb')).toThrow(/whitespace/);
+    expect(() => safeEntryName('a\x7fb')).toThrow(/control/);
+    expect(safeEntryName('lib/a-b_c.d.js')).toBe('lib/a-b_c.d.js');
+    expect(() => listTar(createTar([{ name: 'read me.txt', data: 'x' }]))).toThrow(/whitespace/);
+  });
+
   it('refuses absolute names, "..", NUL bytes and backslashes', () => {
     expect(() => listTar(createTar([{ name: '/etc/passwd', data: 'x' }]))).toThrow(/absolute/);
     expect(() => listTar(createTar([{ name: '../x', data: 'x' }]))).toThrow(/\.\./);
