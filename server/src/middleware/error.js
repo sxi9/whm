@@ -1,6 +1,21 @@
 import { ZodError } from 'zod';
 import { HttpError } from '../lib/errors.js';
 
+// Ops report problems with stable codes; validation-style failures (a bad
+// certificate, a key that does not match, an invalid config) are the caller's
+// fault and surface as 422 with the op's message rather than a 500.
+const CLIENT_FAULT_CODES = new Set(['config_invalid', 'refused', 'validation_failed', 'acme_failed', 'unsupported', 'in_use', 'conflict']);
+export function agentErrorStatus(code = '') {
+  if (code === 'capability_missing' || code === 'binary_not_found') return 501;
+  if (code === 'invalid_args') return 422;
+  if (code === 'not_found') return 404;
+  if (code === 'exists') return 409;
+  if (code === 'path_not_allowed' || code === 'unknown_op') return 403;
+  if (code === 'agent_unavailable' || code === 'timeout') return 503;
+  if (code.startsWith('invalid_') || code.endsWith('_mismatch') || CLIENT_FAULT_CODES.has(code)) return 422;
+  return 500;
+}
+
 export function notFoundHandler(_req, res) {
   res.status(404).json({ error: { code: 'not_found', message: 'No such API endpoint' } });
 }
@@ -34,8 +49,7 @@ export function errorHandler(logger) {
     }
     // Agent op failures carry a stable code; surface them without the stack.
     if (err?.agentError) {
-      const status = err.code === 'capability_missing' || err.code === 'binary_not_found' ? 501 : err.code === 'invalid_args' ? 422 : err.code === 'not_found' ? 404 : err.code === 'exists' ? 409 : 500;
-      return res.status(status).json({ error: { code: err.code, message: err.message, details: err.details } });
+      return res.status(agentErrorStatus(err.code)).json({ error: { code: err.code, message: err.message, details: err.details } });
     }
     logger.error({ err, requestId: req.id, path: req.originalUrl }, 'unhandled error');
     res.status(500).json({ error: { code: 'internal', message: 'Internal server error', requestId: req.id } });

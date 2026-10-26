@@ -37,6 +37,20 @@ function restore(file, previous) {
   if (previous == null) { try { fs.unlinkSync(file); } catch { /* already gone */ } } else fs.writeFileSync(file, previous);
 }
 
+// Scratch space for files root will execute or unpack. A world-writable parent
+// such as /tmp lets any local user plant the directory (or a symlink) ahead of
+// us and swap its contents between write and exec, so the parent must be a real
+// root-owned directory nobody else can write to; the fresh mkdtemp dir is 0700.
+export function privateTempDir(parent, prefix) {
+  let st;
+  try { st = fs.lstatSync(parent); } catch { throw new OpError('path_not_allowed', `${parent} does not exist`); }
+  if (!st.isDirectory() || st.isSymbolicLink()) throw new OpError('path_not_allowed', `${parent} is not a directory`);
+  if (st.uid !== 0 || (st.mode & 0o022) !== 0) throw new OpError('path_not_allowed', `${parent} must be owned by root and not group/world writable before the agent stages files in it`);
+  const dir = fs.mkdtempSync(path.join(parent, prefix));
+  fs.chmodSync(dir, 0o700);
+  return dir;
+}
+
 function groupEntry(name) {
   const line = (readText('/etc/group') || '').split('\n').find((l) => l.startsWith(`${name}:`));
   return line ? { name, gid: Number(line.split(':')[2]) } : null;
@@ -139,8 +153,14 @@ defineOp('sec.hosts_allow.write', {
 // -------------------------------------------------------------------- sshd ---
 
 const SSHD_CONFIG = '/etc/ssh/sshd_config';
-const SSHD_MANAGED = '/etc/ssh/sshd_config.d/whm.conf';
+const SSHD_DROPIN_DIR = '/etc/ssh/sshd_config.d';
+// sshd takes the first value it reads and Include globs are expanded in lexical
+// order, so the drop-in must sort before distro files such as 50-cloud-init.conf
+// (which sets PasswordAuthentication yes) or it is silently ignored.
+const SSHD_MANAGED = `${SSHD_DROPIN_DIR}/00-whm.conf`;
+const SSHD_LEGACY_MANAGED = `${SSHD_DROPIN_DIR}/whm.conf`;
 const SSHD_INCLUDE = 'Include /etc/ssh/sshd_config.d/*.conf';
+const SSHD_VALUE_ALIASES = { 'without-password': 'prohibit-password' };
 
 const yesNo = z.enum(['yes', 'no']);
 const sshdSettings = z.object({
@@ -172,21 +192,63 @@ export function parseSshdConfig(text) {
   return out;
 }
 
+// Everything sshd reads before the managed drop-in, in order: the main file up to
+// the Include line (the whole file when the Include is missing, since the drop-in
+// is then never read) and the drop-ins that sort before ours.
+function sshdSourcesBefore() {
+  const main = readText(SSHD_CONFIG) || '';
+  const includeIndex = main.indexOf(SSHD_INCLUDE);
+  const sources = [{ file: includeIndex >= 0 ? `${SSHD_CONFIG} (before the Include line)` : `${SSHD_CONFIG} (no Include line)`, settings: parseSshdConfig(includeIndex >= 0 ? main.slice(0, includeIndex) : main) }];
+  let dropins = [];
+  try { dropins = fs.readdirSync(SSHD_DROPIN_DIR).filter((f) => f.endsWith('.conf')).sort(); } catch { /* no drop-in dir */ }
+  for (const f of dropins) {
+    if (f >= path.basename(SSHD_MANAGED)) break;
+    sources.push({ file: path.join(SSHD_DROPIN_DIR, f), settings: parseSshdConfig(readText(path.join(SSHD_DROPIN_DIR, f))) });
+  }
+  return { sources, main, includeIndex, dropins };
+}
+
 function sshdEffectiveFromFiles() {
   const merged = {};
-  const main = readText(SSHD_CONFIG) || '';
-  // Include'd drop-ins win over later lines in the main file only when the Include
-  // precedes them; our managed file is read first in practice, so apply it last here
-  // only for keys the main file does not set before the Include line.
-  const includeIndex = main.indexOf(SSHD_INCLUDE);
+  const { main, includeIndex, dropins } = sshdSourcesBefore();
   const before = includeIndex >= 0 ? main.slice(0, includeIndex) : '';
   const after = includeIndex >= 0 ? main.slice(includeIndex) : main;
   Object.assign(merged, parseSshdConfig(before));
-  let dropins = [];
-  try { dropins = fs.readdirSync('/etc/ssh/sshd_config.d').filter((f) => f.endsWith('.conf')).sort(); } catch { /* no drop-in dir */ }
-  for (const f of dropins) for (const [k, v] of Object.entries(parseSshdConfig(readText(path.join('/etc/ssh/sshd_config.d', f))))) if (!(k in merged)) merged[k] = v;
+  if (includeIndex >= 0) for (const f of dropins) for (const [k, v] of Object.entries(parseSshdConfig(readText(path.join(SSHD_DROPIN_DIR, f))))) if (!(k in merged)) merged[k] = v;
   for (const [k, v] of Object.entries(parseSshdConfig(after))) if (!(k in merged)) merged[k] = v;
   return merged;
+}
+
+const sshdNorm = (v) => { const s = String(v).trim().toLowerCase(); return SSHD_VALUE_ALIASES[s] || s; };
+
+// Managed values that sshd does not actually apply, each with the earlier file
+// that supplies the winning value when it can be identified.
+export function sshdShadowed(managed, effective, sources = []) {
+  const out = [];
+  for (const [k, v] of Object.entries(managed)) {
+    const key = k.toLowerCase();
+    if (!(key in effective) || sshdNorm(effective[key]) === sshdNorm(v)) continue;
+    const by = sources.find((s) => key in s.settings && sshdNorm(s.settings[key]) === sshdNorm(effective[key]))?.file || null;
+    out.push({ key: k, managed: String(v), effective: String(effective[key]), by });
+  }
+  return out;
+}
+
+function readSshdManaged(file = SSHD_MANAGED) {
+  const managed = {};
+  for (const line of (readText(file) || '').split('\n')) {
+    const m = line.trim().match(/^(\w+)\s+(.+)$/);
+    if (m && !line.startsWith('#')) managed[m[1]] = m[2];
+  }
+  return managed;
+}
+
+async function sshdEffective() {
+  if (hasBinary('sshd')) {
+    const { code, stdout } = await exec('sshd', ['-T'], { allowFailure: true, timeoutMs: 30_000 });
+    if (code === 0) return { effective: parseSshdConfig(stdout), source: 'sshd -T' };
+  }
+  return { effective: sshdEffectiveFromFiles(), source: 'files' };
 }
 
 function renderSshdManaged(settings) {
@@ -199,41 +261,30 @@ defineOp('sec.sshd.get', {
   description: 'Effective sshd settings (sshd -T when available) plus the panel-managed drop-in',
   run: async () => {
     const installed = hasBinary('sshd');
-    let effective = {};
-    let source = 'files';
-    if (installed) {
-      const { code, stdout } = await exec('sshd', ['-T'], { allowFailure: true, timeoutMs: 30_000 });
-      if (code === 0) { effective = parseSshdConfig(stdout); source = 'sshd -T'; }
-    }
-    if (source === 'files') effective = sshdEffectiveFromFiles();
-    const managedText = readText(SSHD_MANAGED);
-    const managed = {};
-    for (const line of (managedText || '').split('\n')) {
-      const m = line.trim().match(/^(\w+)\s+(.+)$/);
-      if (m && !line.startsWith('#')) managed[m[1]] = m[2];
-    }
+    const { effective, source } = await sshdEffective();
+    const legacy = exists(SSHD_LEGACY_MANAGED) && !exists(SSHD_MANAGED);
+    const managed = readSshdManaged(legacy ? SSHD_LEGACY_MANAGED : SSHD_MANAGED);
     const mainText = readText(SSHD_CONFIG);
-    return { installed, source, effective, managed, managedPath: SSHD_MANAGED, includeActive: mainText == null ? false : mainText.includes(SSHD_INCLUDE), configPresent: mainText != null };
+    const includeActive = mainText == null ? false : mainText.includes(SSHD_INCLUDE);
+    return { installed, source, effective, managed, managedPath: SSHD_MANAGED, legacyPath: legacy ? SSHD_LEGACY_MANAGED : null, includeActive, configPresent: mainText != null, shadowed: sshdShadowed(managed, effective, sshdSourcesBefore().sources) };
   },
 });
 
 defineOp('sec.sshd.set', {
-  description: 'Write sshd settings to /etc/ssh/sshd_config.d/whm.conf, validate with sshd -t and reload',
+  description: `Write sshd settings to ${SSHD_MANAGED}, validate with sshd -t, reload and report values other files override`,
   schema: z.object({ settings: sshdSettings }).strict(),
   run: async ({ settings }, ctx) => {
     ctx.assertAllowedPath(SSHD_MANAGED, 'write');
+    ctx.assertAllowedPath(SSHD_LEGACY_MANAGED, 'write');
     ctx.assertAllowedPath(SSHD_CONFIG, 'write');
     if (!hasBinary('sshd')) throw new OpError('capability_missing', 'OpenSSH server (sshd) is not installed on this server');
-    const current = {};
-    for (const line of (readText(SSHD_MANAGED) || '').split('\n')) {
-      const m = line.trim().match(/^(\w+)\s+(.+)$/);
-      if (m && !line.startsWith('#')) current[m[1]] = m[2];
-    }
+    const previousManaged = readText(SSHD_MANAGED);
+    const previousLegacy = readText(SSHD_LEGACY_MANAGED);
+    const current = readSshdManaged(previousManaged == null && previousLegacy != null ? SSHD_LEGACY_MANAGED : SSHD_MANAGED);
     for (const [k, v] of Object.entries(settings)) {
       if (v === undefined) continue;
       if (v === null) delete current[k]; else current[k] = String(v);
     }
-    const previousManaged = readText(SSHD_MANAGED);
     const previousMain = readText(SSHD_CONFIG);
     let includeAdded = false;
     if (previousMain != null && !previousMain.includes(SSHD_INCLUDE)) {
@@ -242,14 +293,17 @@ defineOp('sec.sshd.set', {
       includeAdded = true;
     }
     writeAtomic(SSHD_MANAGED, renderSshdManaged(current), 0o600);
+    if (previousLegacy != null) { try { fs.unlinkSync(SSHD_LEGACY_MANAGED); } catch { /* already gone */ } }
     const { code, stderr } = await exec('sshd', ['-t'], { allowFailure: true, timeoutMs: 30_000 });
     if (code !== 0) {
       restore(SSHD_MANAGED, previousManaged);
+      if (previousLegacy != null) restore(SSHD_LEGACY_MANAGED, previousLegacy);
       if (includeAdded) restore(SSHD_CONFIG, previousMain);
       throw new OpError('config_invalid', `sshd rejected the configuration; the previous files were restored: ${stderr.trim().split('\n').pop()}`, { output: stderr.trim() });
     }
     const reload = await reloadUnit(['ssh', 'sshd']);
-    return { path: SSHD_MANAGED, settings: current, includeAdded, ...reload };
+    const { effective } = await sshdEffective();
+    return { path: SSHD_MANAGED, settings: current, includeAdded, migratedLegacy: previousLegacy != null, ...reload, shadowed: sshdShadowed(current, effective, sshdSourcesBefore().sources) };
   },
 });
 
@@ -300,6 +354,18 @@ function appendAuthorized(line) {
   const next = `${current.endsWith('\n') || current === '' ? current : `${current}\n`}${line.trim()}\n`;
   writeAtomic(AUTHORIZED_KEYS, next, 0o600);
   return key;
+}
+
+// Root-only helper that answers ssh-keygen's passphrase prompts from the
+// environment (both "Enter passphrase" and "Enter same passphrase again"). It
+// lives in a fresh 0700 directory under root's own ~/.ssh, never under /tmp.
+function writeAskpassHelper() {
+  ensureSshDir();
+  const dir = privateTempDir(SSH_DIR, '.whm-askpass-');
+  const helper = path.join(dir, 'askpass.sh');
+  fs.writeFileSync(helper, '#!/bin/sh\nprintf \'%s\\n\' "$WHM_SSH_PASSPHRASE"\n', { mode: 0o700 });
+  fs.chmodSync(helper, 0o700);
+  return { helper, dir };
 }
 
 function listKeyPairs() {
@@ -369,9 +435,22 @@ defineOp('sec.ssh_keys.generate', {
     ensureSshDir();
     const file = path.join(SSH_DIR, name);
     if (exists(file) || exists(`${file}.pub`)) throw new OpError('exists', `A key named "${name}" already exists`);
-    const argv = ['-q', '-t', type, '-f', file, '-N', passphrase, '-C', comment ?? `root@whm-${name}`];
+    const argv = ['-q', '-t', type, '-f', file, '-C', comment ?? `root@whm-${name}`];
     if (bits && type !== 'ed25519') argv.push('-b', String(bits));
-    await exec('ssh-keygen', argv, { timeoutMs: 120_000 });
+    // The passphrase must never appear in argv (/proc/<pid>/cmdline is world
+    // readable); an empty one is the documented "-N ''" and carries no secret.
+    // A non-empty passphrase reaches ssh-keygen through SSH_ASKPASS: the helper
+    // echoes an environment variable, and /proc/<pid>/environ is owner-only.
+    if (!passphrase) argv.push('-N', '');
+    const askpass = passphrase ? writeAskpassHelper() : null;
+    try {
+      await exec('ssh-keygen', argv, { timeoutMs: 120_000, env: askpass ? { SSH_ASKPASS: askpass.helper, SSH_ASKPASS_REQUIRE: 'force', DISPLAY: ':0', WHM_SSH_PASSPHRASE: passphrase } : undefined });
+    } catch (err) {
+      for (const f of [file, `${file}.pub`]) { try { fs.unlinkSync(f); } catch { /* not created */ } }
+      throw new OpError(err.code === 'binary_not_found' ? 'capability_missing' : 'command_failed', `ssh-keygen failed: ${String(err.details?.stderr || err.message).trim().split('\n').pop()}`, { bin: 'ssh-keygen' });
+    } finally {
+      if (askpass) fs.rmSync(askpass.dir, { recursive: true, force: true });
+    }
     const key = parsePublicKeyLine(readText(`${file}.pub`) || '');
     if (authorize) appendAuthorized(readText(`${file}.pub`));
     return { name, type: key?.type, fingerprint: key?.fingerprint, publicKey: (readText(`${file}.pub`) || '').trim(), privateKeyPath: file, authorized: authorize, encrypted: passphrase.length > 0 };
@@ -682,44 +761,65 @@ defineOp('sec.firewall.flush', {
 
 const MAIL_GROUPS = ['mail', 'exim', 'Debian-exim', 'mailnull', 'postfix', 'mailman'];
 
-async function smtpEnabled(backend) {
-  if (backend === 'iptables') return (await exec('iptables', ['-C', 'OUTPUT', '-p', 'tcp', '--dport', '25', '-j', SMTP_CHAIN], { allowFailure: true })).code === 0;
-  return (await exec('nft', ['list', 'chain', ...NFT_TABLE, 'smtp'], { allowFailure: true })).code === 0;
+// The iptables backend needs one chain per address family; ip6tables may be
+// absent, in which case IPv6 is reported as unprotected rather than assumed.
+const SMTP_FAMILIES = { ipv4: 'iptables', ipv6: 'ip6tables' };
+
+async function smtpFamilies(backend) {
+  if (backend === 'iptables') {
+    const families = {};
+    for (const [family, bin] of Object.entries(SMTP_FAMILIES)) families[family] = hasBinary(bin) ? (await exec(bin, ['-C', 'OUTPUT', '-p', 'tcp', '--dport', '25', '-j', SMTP_CHAIN], { allowFailure: true })).code === 0 : null;
+    return families;
+  }
+  const on = (await exec('nft', ['list', 'chain', ...NFT_TABLE, 'smtp'], { allowFailure: true })).code === 0;
+  return { ipv4: on, ipv6: on };
 }
 
+const smtpSummary = (families) => ({ families, enabled: Object.values(families).some((v) => v === true) && Object.values(families).every((v) => v !== false), unprotected: Object.entries(families).filter(([, v]) => v !== true).map(([f]) => f) });
+
 defineOp('sec.smtp_restrict.get', {
-  description: 'Whether outbound port 25 is restricted to root and the mail groups',
+  description: 'Whether outbound port 25 is restricted to root and the mail groups (per address family)',
   run: async () => {
     const backend = firewallBackend();
     const groups = MAIL_GROUPS.map(groupEntry).filter(Boolean);
-    return { backend, enabled: backend ? await smtpEnabled(backend) : false, groups: groups.map((g) => g.name) };
+    const families = backend ? await smtpFamilies(backend) : { ipv4: false, ipv6: false };
+    return { backend, ...smtpSummary(families), groups: groups.map((g) => g.name) };
   },
 });
 
+async function iptablesSmtpTeardown(bin) {
+  for (let i = 0; i < 5; i++) if ((await exec(bin, ['-D', 'OUTPUT', '-p', 'tcp', '--dport', '25', '-j', SMTP_CHAIN], { allowFailure: true })).code !== 0) break;
+  await exec(bin, ['-F', SMTP_CHAIN], { allowFailure: true });
+  await exec(bin, ['-X', SMTP_CHAIN], { allowFailure: true });
+}
+
+async function iptablesSmtpApply(bin, groups) {
+  await iptablesEnsureChain(bin, SMTP_CHAIN, 'OUTPUT', ['-p', 'tcp', '--dport', '25']);
+  await exec(bin, ['-F', SMTP_CHAIN]);
+  await exec(bin, ['-A', SMTP_CHAIN, '-o', 'lo', '-j', 'ACCEPT']);
+  await exec(bin, ['-A', SMTP_CHAIN, '-m', 'owner', '--uid-owner', '0', '-j', 'ACCEPT']);
+  for (const g of groups) await exec(bin, ['-A', SMTP_CHAIN, '-m', 'owner', '--gid-owner', String(g.gid), '-j', 'ACCEPT']);
+  await exec(bin, ['-A', SMTP_CHAIN, '-j', 'REJECT', '--reject-with', 'tcp-reset']);
+}
+
 defineOp('sec.smtp_restrict.set', {
-  description: 'Enable or disable the outbound SMTP restriction (owner-match firewall rules on port 25)',
+  description: 'Enable or disable the outbound SMTP restriction (owner-match firewall rules on port 25, IPv4 and IPv6)',
   schema: z.object({ enabled: z.boolean() }).strict(),
   run: async ({ enabled }) => {
     const backend = requireFirewall();
     const groups = MAIL_GROUPS.map(groupEntry).filter(Boolean);
     if (backend === 'iptables') {
+      const bins = Object.values(SMTP_FAMILIES).filter(hasBinary);
       if (!enabled) {
-        for (let i = 0; i < 5; i++) if ((await exec('iptables', ['-D', 'OUTPUT', '-p', 'tcp', '--dport', '25', '-j', SMTP_CHAIN], { allowFailure: true })).code !== 0) break;
-        await exec('iptables', ['-F', SMTP_CHAIN], { allowFailure: true });
-        await exec('iptables', ['-X', SMTP_CHAIN], { allowFailure: true });
-        return { backend, enabled: false };
+        for (const bin of bins) await iptablesSmtpTeardown(bin);
+        return { backend, ...smtpSummary(await smtpFamilies(backend)) };
       }
-      await iptablesEnsureChain('iptables', SMTP_CHAIN, 'OUTPUT', ['-p', 'tcp', '--dport', '25']);
-      await exec('iptables', ['-F', SMTP_CHAIN]);
-      await exec('iptables', ['-A', SMTP_CHAIN, '-o', 'lo', '-j', 'ACCEPT']);
-      await exec('iptables', ['-A', SMTP_CHAIN, '-m', 'owner', '--uid-owner', '0', '-j', 'ACCEPT']);
-      for (const g of groups) await exec('iptables', ['-A', SMTP_CHAIN, '-m', 'owner', '--gid-owner', String(g.gid), '-j', 'ACCEPT']);
-      await exec('iptables', ['-A', SMTP_CHAIN, '-j', 'REJECT', '--reject-with', 'tcp-reset']);
-      return { backend, enabled: true, groups: groups.map((g) => g.name) };
+      for (const bin of bins) await iptablesSmtpApply(bin, groups);
+      return { backend, ...smtpSummary(await smtpFamilies(backend)), groups: groups.map((g) => g.name) };
     }
     if (!enabled) {
       await exec('nft', ['delete', 'chain', ...NFT_TABLE, 'smtp'], { allowFailure: true });
-      return { backend, enabled: false };
+      return { backend, ...smtpSummary({ ipv4: false, ipv6: false }) };
     }
     await nftEnsureTable();
     await exec('nft', ['add', 'chain', ...NFT_TABLE, 'smtp', '{ type filter hook output priority 0 ; policy accept ; }']);
@@ -728,7 +828,7 @@ defineOp('sec.smtp_restrict.set', {
     await exec('nft', ['add', 'rule', ...NFT_TABLE, 'smtp', 'tcp', 'dport', '25', 'meta', 'skuid', '0', 'accept']);
     for (const g of groups) await exec('nft', ['add', 'rule', ...NFT_TABLE, 'smtp', 'tcp', 'dport', '25', 'meta', 'skgid', String(g.gid), 'accept']);
     await exec('nft', ['add', 'rule', ...NFT_TABLE, 'smtp', 'tcp', 'dport', '25', 'reject', 'with', 'tcp', 'reset']);
-    return { backend, enabled: true, groups: groups.map((g) => g.name) };
+    return { backend, ...smtpSummary({ ipv4: true, ipv6: true }), groups: groups.map((g) => g.name) };
   },
 });
 
@@ -963,24 +1063,34 @@ defineOp('sec.modsec.vendor.install', {
     if (!hasBinary('tar')) throw new OpError('capability_missing', 'tar is not installed');
     const dir = path.join(layout.vendorsDir, name);
     ctx.assertAllowedPath(dir, 'write');
-    fs.mkdirSync('/tmp/whm', { recursive: true, mode: 0o700 });
-    const archive = `/tmp/whm/modsec-vendor-${name}-${process.pid}.tar.gz`;
-    const bytes = await download(url, archive, 100 * 1024 * 1024);
+    ctx.assertAllowedPath(layout.baseDir, 'write');
+    // The archive is unpacked into Apache's config tree, so it is staged inside
+    // the root-owned ModSecurity directory rather than a shared temp dir.
+    const scratch = privateTempDir(layout.baseDir, '.whm-vendor-');
+    const archive = path.join(scratch, `${name}.tar.gz`);
     const staging = `${dir}.whm-new`;
-    fs.rmSync(staging, { recursive: true, force: true });
-    fs.mkdirSync(staging, { recursive: true, mode: 0o755 });
     try {
+      const bytes = await download(url, archive, 100 * 1024 * 1024);
+      fs.rmSync(staging, { recursive: true, force: true });
+      fs.mkdirSync(staging, { recursive: true, mode: 0o755 });
       await exec('tar', ['-xzf', archive, '-C', staging, '--strip-components=1', '--no-same-owner'], { timeoutMs: 600_000 });
-    } finally { fs.rmSync(archive, { force: true }); }
-    const rulesDir = exists(path.join(staging, 'rules')) ? path.join(dir, 'rules') : dir;
-    if (exists(path.join(staging, 'crs-setup.conf.example')) && !exists(path.join(staging, 'crs-setup.conf'))) fs.copyFileSync(path.join(staging, 'crs-setup.conf.example'), path.join(staging, 'crs-setup.conf'));
-    fs.rmSync(dir, { recursive: true, force: true });
-    fs.renameSync(staging, dir);
-    for (const f of fs.readdirSync(rulesDir)) if (f.endsWith('.conf.example') && !exists(path.join(rulesDir, f.replace(/\.example$/, '')))) fs.copyFileSync(path.join(rulesDir, f), path.join(rulesDir, f.replace(/\.example$/, '')));
-    const files = ruleFiles([rulesDir], 1);
-    return { name, dir, rulesDir, bytes, ruleFiles: files.length, rules: files.reduce((n, f) => n + parseModsecRules(readText(f), f).length, 0), setupConf: exists(path.join(dir, 'crs-setup.conf')) ? path.join(dir, 'crs-setup.conf') : null };
+      return finishVendorInstall(name, dir, staging, bytes);
+    } catch (err) {
+      fs.rmSync(staging, { recursive: true, force: true });
+      throw err;
+    } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
   },
 });
+
+function finishVendorInstall(name, dir, staging, bytes) {
+  const rulesDir = exists(path.join(staging, 'rules')) ? path.join(dir, 'rules') : dir;
+  if (exists(path.join(staging, 'crs-setup.conf.example')) && !exists(path.join(staging, 'crs-setup.conf'))) fs.copyFileSync(path.join(staging, 'crs-setup.conf.example'), path.join(staging, 'crs-setup.conf'));
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.renameSync(staging, dir);
+  for (const f of fs.readdirSync(rulesDir)) if (f.endsWith('.conf.example') && !exists(path.join(rulesDir, f.replace(/\.example$/, '')))) fs.copyFileSync(path.join(rulesDir, f), path.join(rulesDir, f.replace(/\.example$/, '')));
+  const files = ruleFiles([rulesDir], 1);
+  return { name, dir, rulesDir, bytes, ruleFiles: files.length, rules: files.reduce((n, f) => n + parseModsecRules(readText(f), f).length, 0), setupConf: exists(path.join(dir, 'crs-setup.conf')) ? path.join(dir, 'crs-setup.conf') : null };
+}
 
 defineOp('sec.modsec.vendor.remove', {
   description: 'Delete an installed vendor rule set directory',
@@ -1061,7 +1171,9 @@ defineOp('sec.userdir.get', {
 
 defineOp('sec.userdir.set', {
   description: 'Enable/disable ~user URLs via a managed Apache include (validates config, rolls back on error)',
-  schema: z.object({ enabled: z.boolean(), excludeUsers: z.array(arg.username).max(5000).default([]), homeRoot: arg.absPath.default('/home') }).strict(),
+  // homeRoot is interpolated into an Apache <Directory "..."> block, so only
+  // plain path characters are accepted (no quotes, spaces or newlines).
+  schema: z.object({ enabled: z.boolean(), excludeUsers: z.array(arg.username).max(5000).default([]), homeRoot: z.string().max(200).regex(/^\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+$/, 'Plain absolute path').refine((p) => !p.split('/').includes('..'), 'No ".." segments').default('/home') }).strict(),
   run: async ({ enabled, excludeUsers, homeRoot }, ctx) => {
     const apache = requireApache();
     const file = userdirConfPath(apache);

@@ -1,17 +1,106 @@
 import net from 'node:net';
+import nodeCrypto from 'node:crypto';
 import { json, paginate } from '../db/index.js';
-import { notFound, conflict, badRequest, CapabilityError } from '../lib/errors.js';
+import { notFound, conflict, badRequest, unprocessable, CapabilityError } from '../lib/errors.js';
 
 // Security Center. Attached as ctx.security; other categories may call:
 //   security.policy()                         -> current login/session policy settings
 //   security.passwordStrength(pw, context)    -> { score, minimum, ok }
-//   security.cphulk.isBlocked(ip) / isAllowlisted(ip) / block(ip, opts) / unblock(ip)
-//   security.firewall.block(ip) / unblock(ip) / list()
+//   security.cphulk.shouldBlock(ip)           -> CIDR-aware: active blocks + denylist, minus allowlist
+//   security.cphulk.isAllowlisted(ip)         -> exact or CIDR match on the allowlist
+//   security.cphulk.block(ip, opts) / unblock(id)
+//   security.firewall.block(ip, req, { comment }) / unblock(ip) / list()
+//        blocks are recorded in firewall_entries and restored at boot / hourly;
+//        the hourly sync never removes an address it did not add itself
+//   security.firewall.reconcile(job)          -> re-apply recorded blocks + SMTP restriction
 //   security.reloadApache(req)                -> uses ctx.web.reload when that category exists
 //   security.modsec.detect() / security.ssh.config() / security.externalAuth.*
+//   security.externalAuth.exchangeCode(name, { code, redirectUri, nonce })
+//        -> verified id_token claims (signature via jwks_uri or client secret,
+//           iss/aud/azp/exp/iat/nonce checked) merged with userinfo
+// Follow-up owned by the auth layer (services/auth.js + middleware/auth.js): consume
+// security.policy() (verified-IP login, session timeout, concurrent sessions, password
+// age, 2FA requirements), security.cphulk.shouldBlock()/isAllowlisted() on login, the
+// security.questions.* settings, and mount a public OIDC login/callback on top of
+// externalAuth.authorizationUrl()/exchangeCode()/findLinkedUser()/link(). Until then
+// those settings are stored, not enforced.
 
 const KNOWN_SERVICES = ['ALL', 'sshd', 'vsftpd', 'proftpd', 'pure-ftpd', 'exim', 'dovecot', 'imap', 'pop3', 'named', 'mysqld', 'whm-panel', 'ftpd', 'telnetd'];
 const PASSWORD_CONTEXTS = ['account', 'email', 'ftp', 'mysql', 'panel', 'ssh'];
+const stripSlash = (u) => String(u || '').replace(/\/+$/, '');
+
+// JWS algorithms accepted for id_tokens: [digest, key kind].
+const JWS_ALGS = {
+  RS256: ['sha256', 'rsa'], RS384: ['sha384', 'rsa'], RS512: ['sha512', 'rsa'],
+  PS256: ['sha256', 'pss'], PS384: ['sha384', 'pss'], PS512: ['sha512', 'pss'],
+  ES256: ['sha256', 'ec'], ES384: ['sha384', 'ec'], ES512: ['sha512', 'ec'],
+  HS256: ['sha256', 'hmac'], HS384: ['sha384', 'hmac'], HS512: ['sha512', 'hmac'],
+};
+
+function decodeJwtPart(part) {
+  try { return JSON.parse(Buffer.from(part, 'base64url').toString('utf8')); } catch { return null; }
+}
+
+// OpenID Connect Core 3.1.3.7: the id_token must be signature-checked and its
+// iss/aud/azp/exp/iat/nonce claims validated before anything trusts `sub`.
+export function verifyIdToken(idToken, { issuer, clientId, nonce = null, jwks = [], clientSecret = null, now = Date.now(), skewSeconds = 60 }) {
+  const parts = String(idToken || '').split('.');
+  if (parts.length !== 3) throw new Error('id_token is not a compact JWS');
+  const [h, p, s] = parts;
+  const header = decodeJwtPart(h);
+  const claims = decodeJwtPart(p);
+  if (!header || !claims || typeof claims !== 'object') throw new Error('id_token header or payload is not valid JSON');
+  const alg = JWS_ALGS[header.alg];
+  if (!alg) throw new Error(`id_token uses unsupported alg "${header.alg}"`);
+  const signed = Buffer.from(`${h}.${p}`);
+  const sig = Buffer.from(s, 'base64url');
+  let ok = false;
+  if (alg[1] === 'hmac') {
+    if (!clientSecret) throw new Error('id_token is HMAC-signed but the provider has no client secret');
+    const expected = nodeCrypto.createHmac(alg[0], clientSecret).update(signed).digest();
+    ok = expected.length === sig.length && nodeCrypto.timingSafeEqual(expected, sig);
+  } else {
+    const kty = alg[1] === 'ec' ? 'EC' : 'RSA';
+    const candidates = jwks.filter((k) => k && k.kty === kty && (!header.kid || !k.kid || k.kid === header.kid) && (!k.use || k.use === 'sig') && (!k.alg || k.alg === header.alg));
+    for (const jwk of candidates) {
+      let key;
+      try { key = nodeCrypto.createPublicKey({ key: jwk, format: 'jwk' }); } catch { continue; }
+      const keyObject = alg[1] === 'pss' ? { key, padding: nodeCrypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: nodeCrypto.constants.RSA_PSS_SALTLEN_DIGEST } : alg[1] === 'ec' ? { key, dsaEncoding: 'ieee-p1363' } : key;
+      try { if (nodeCrypto.verify(alg[0], signed, keyObject, sig)) { ok = true; break; } } catch { /* key/alg mismatch */ }
+    }
+  }
+  if (!ok) throw new Error('id_token signature could not be verified with the provider keys');
+  if (stripSlash(claims.iss) !== stripSlash(issuer)) throw new Error(`id_token issuer "${claims.iss}" does not match the provider issuer ${issuer}`);
+  const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+  if (!aud.includes(clientId)) throw new Error('id_token audience does not include this client');
+  if (aud.length > 1 && claims.azp !== clientId) throw new Error('id_token lists several audiences and azp is not this client');
+  const nowSec = Math.floor(now / 1000);
+  if (typeof claims.exp !== 'number' || claims.exp + skewSeconds < nowSec) throw new Error('id_token has expired');
+  if (typeof claims.iat !== 'number' || claims.iat - skewSeconds > nowSec) throw new Error('id_token was issued in the future');
+  if ((nonce != null || claims.nonce != null) && claims.nonce !== nonce) throw new Error('id_token nonce does not match this login attempt');
+  if (!claims.sub || typeof claims.sub !== 'string') throw new Error('id_token has no subject');
+  return claims;
+}
+
+// Discovery metadata must be served over TLS and, unless the operator opts in,
+// stay on the issuer's host: the token endpoint receives the client secret.
+export function checkDiscoveryDocument(doc, issuerUrl, { allowForeignEndpoints = false } = {}) {
+  if (!doc || typeof doc !== 'object') throw badRequest('The discovery document is not a JSON object');
+  if (doc.issuer && stripSlash(doc.issuer) !== stripSlash(issuerUrl)) throw badRequest(`The discovery document declares issuer "${doc.issuer}", which does not match the configured issuer ${issuerUrl}`);
+  const issuerHost = new URL(issuerUrl).host;
+  const endpoints = { authorizationEndpoint: doc.authorization_endpoint, tokenEndpoint: doc.token_endpoint, userinfoEndpoint: doc.userinfo_endpoint, jwksUri: doc.jwks_uri };
+  if (!endpoints.authorizationEndpoint || !endpoints.tokenEndpoint) throw badRequest('The discovery document lacks authorization_endpoint or token_endpoint');
+  const foreign = [];
+  for (const [name, value] of Object.entries(endpoints)) {
+    if (value == null) continue;
+    let u;
+    try { u = new URL(String(value)); } catch { throw badRequest(`${name} in the discovery document is not a valid URL`); }
+    if (u.protocol !== 'https:') throw badRequest(`${name} must use https:// (the provider published ${value})`);
+    if (u.host !== issuerHost) foreign.push(`${name} on ${u.host}`);
+  }
+  if (foreign.length && !allowForeignEndpoints) throw badRequest(`The discovery document points at hosts other than ${issuerHost}: ${foreign.join(', ')}. Re-run discovery allowing endpoints on other hosts if that is expected for this provider.`, { allowForeignEndpoints: ['Endpoints on other hosts need explicit approval'] });
+  return { ...endpoints, issuer: doc.issuer || issuerUrl, scopesSupported: doc.scopes_supported || [], foreignEndpoints: foreign, fetchedAt: new Date().toISOString() };
+}
 
 export function passwordStrength(pw) {
   if (!pw) return 0;
@@ -63,6 +152,11 @@ export function createSecurityCenterService(ctx) {
     listById: db.prepare('SELECT * FROM cphulk_lists WHERE id = ?'),
     insertList: db.prepare('INSERT INTO cphulk_lists (kind, ip, comment) VALUES (?, ?, ?)'),
     deleteList: db.prepare('DELETE FROM cphulk_lists WHERE id = ?'),
+    fwEntries: db.prepare('SELECT * FROM firewall_entries ORDER BY ip, source'),
+    fwByIp: db.prepare('SELECT * FROM firewall_entries WHERE ip = ?'),
+    fwInsert: db.prepare('INSERT OR IGNORE INTO firewall_entries (ip, source, comment) VALUES (?, ?, ?)'),
+    fwDeleteIp: db.prepare('DELETE FROM firewall_entries WHERE ip = ?'),
+    fwDeleteSource: db.prepare('DELETE FROM firewall_entries WHERE ip = ? AND source = ?'),
     attemptStats: db.prepare(`SELECT COUNT(*) AS attempts, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failures FROM login_attempts WHERE created_at > datetime('now', '-1 day')`),
     topOffenders: db.prepare(`SELECT ip, COUNT(*) AS failures, MAX(created_at) AS last_seen FROM login_attempts WHERE ok = 0 AND created_at > datetime('now', '-1 day') GROUP BY ip ORDER BY failures DESC LIMIT 10`),
     disabledRules: db.prepare('SELECT * FROM modsec_disabled_rules ORDER BY rule_id'),
@@ -218,8 +312,12 @@ export function createSecurityCenterService(ctx) {
       return { settings: cphulk.settings(), blocks: cphulk.blocks(), stats: { attempts24h: stats.attempts || 0, failures24h: stats.failures || 0, activeBlocks: stmts.activeBlocks.all().length, topOffenders: stmts.topOffenders.all() } };
     },
     blocks: () => stmts.activeBlocks.all().map((b) => ({ ...b, permanent: b.expires_at == null })),
-    isBlocked: (ip) => Boolean(stmts.activeBlockByIp.get(ip)),
     isAllowlisted: (ip) => stmts.listByKind.all('allow').some((e) => ipInCidr(ip, e.ip)),
+    shouldBlock(ip) {
+      if (cphulk.isAllowlisted(ip)) return false;
+      return stmts.activeBlocks.all().some((b) => ipInCidr(ip, b.ip)) || stmts.listByKind.all('deny').some((e) => ipInCidr(ip, e.ip));
+    },
+    isBlocked: (ip) => cphulk.shouldBlock(ip),
     history(query) {
       const where = [];
       const params = {};
@@ -228,114 +326,196 @@ export function createSecurityCenterService(ctx) {
       return paginate(db, { select: '*', from: 'login_attempts', where, params, sortable: { created_at: 'created_at', ip: 'ip', username: 'username' }, defaultSort: 'created_at', query: { ...query, dir: query.dir || 'desc' } });
     },
     async block(ip, { minutes = null, reason = 'manual block', firewall = false } = {}, req) {
+      const viaFirewall = firewall || Boolean(settings.get('security.cphulk.firewall_sync'));
+      // The panel login path matches exact addresses only; a network block is
+      // only meaningful when the firewall drops it.
+      if (ip.includes('/') && !viaFirewall) throw unprocessable('A CIDR network can only be blocked in the firewall: enable "Also drop blocked addresses in the firewall" or send firewall: true. Panel logins are matched per address.', { ip: ['Networks require a firewall block'] });
       if (cphulk.isAllowlisted(ip)) throw conflict(`${ip} is on the allowlist`);
       if (stmts.activeBlockByIp.get(ip)) throw conflict(`${ip} is already blocked`);
       const { lastInsertRowid } = stmts.insertBlock.run(ip, reason, minutes ? new Date(Date.now() + minutes * 60_000).toISOString().replace('T', ' ').slice(0, 19) : null);
       let firewalled = false;
-      if (firewall || settings.get('security.cphulk.firewall_sync')) {
-        try { await firewallApi.block(ip, req); firewalled = true; } catch (err) { logger.warn({ err, ip }, 'cPHulk: firewall block failed'); }
+      if (viaFirewall) {
+        try { await firewallApi.block(ip, req, { source: 'cphulk', comment: reason }); firewalled = true; } catch (err) { logger.warn({ err, ip }, 'cPHulk: firewall block failed'); }
       }
       req?.audit?.({ action: 'security.cphulk.block', target: ip, args: { minutes, reason, firewalled } });
       return { ...stmts.blockById.get(lastInsertRowid), firewalled };
+    },
+    // Drops the firewall rule cPHulk added for an address; a manual block of the
+    // same address (firewall_entries source 'manual') is left alone.
+    async releaseFirewall(ip, req) {
+      if (!stmts.fwByIp.all(ip).some((e) => e.source === 'cphulk')) return false;
+      if (!capabilities.has('firewall')) return false;
+      try { return (await firewallApi.release(ip, 'cphulk', req)).removed; } catch (err) { logger.warn({ err, ip }, 'cPHulk: firewall unblock failed'); return false; }
     },
     async unblock(id, req) {
       const row = stmts.blockById.get(id);
       if (!row) throw notFound('Block');
       stmts.expireBlocksByIp.run(row.ip);
-      let firewalled = false;
-      if (settings.get('security.cphulk.firewall_sync') && capabilities.has('firewall')) {
-        try { await firewallApi.unblock(row.ip, req); firewalled = true; } catch (err) { logger.warn({ err, ip: row.ip }, 'cPHulk: firewall unblock failed'); }
-      }
+      const firewalled = stmts.listByKind.all('deny').some((e) => e.ip === row.ip) ? false : await cphulk.releaseFirewall(row.ip, req);
       req?.audit?.({ action: 'security.cphulk.unblock', target: row.ip });
       return { ip: row.ip, unblocked: true, firewalled };
     },
     async flush(req) {
+      const ips = stmts.activeBlocks.all().map((b) => b.ip);
       const n = stmts.expireAllBlocks.run().changes;
-      if (settings.get('security.cphulk.firewall_sync') && capabilities.has('firewall')) {
-        try { await op('sec.firewall.flush', {}, req); } catch (err) { logger.warn({ err }, 'cPHulk: firewall flush failed'); }
-      }
-      req?.audit?.({ action: 'security.cphulk.flush', args: { blocks: n } });
-      return { cleared: n };
+      const deny = new Set(stmts.listByKind.all('deny').map((e) => e.ip));
+      let firewalled = 0;
+      for (const ip of new Set(ips)) if (!deny.has(ip) && await cphulk.releaseFirewall(ip, req)) firewalled++;
+      req?.audit?.({ action: 'security.cphulk.flush', args: { blocks: n, firewalled } });
+      return { cleared: n, firewalled };
     },
     lists: () => stmts.lists.all(),
-    addToList(kind, ip, comment, req) {
+    async addToList(kind, ip, comment, req) {
       if (stmts.lists.all().some((e) => e.kind === kind && e.ip === ip)) throw conflict(`${ip} is already on the ${kind} list`);
       const { lastInsertRowid } = stmts.insertList.run(kind, ip, comment || null);
-      if (kind === 'allow') stmts.expireBlocksByIp.run(ip);
-      if (kind === 'deny' && settings.get('security.cphulk.block_denylist_permanently') && !ip.includes('/') && !stmts.activeBlockByIp.get(ip)) stmts.insertBlock.run(ip, 'denylist', null);
-      req?.audit?.({ action: `security.cphulk.${kind}list.add`, target: ip, args: { comment } });
-      return stmts.listById.get(lastInsertRowid);
+      if (kind === 'allow') {
+        for (const b of stmts.activeBlocks.all()) if (b.ip === ip || ipInCidr(b.ip, ip)) { stmts.expireBlock.run(b.id); await cphulk.releaseFirewall(b.ip, req); }
+      }
+      let firewalled = false;
+      if (kind === 'deny') {
+        if (settings.get('security.cphulk.block_denylist_permanently') && !ip.includes('/') && !stmts.activeBlockByIp.get(ip)) stmts.insertBlock.run(ip, 'denylist', null);
+        if (settings.get('security.cphulk.firewall_sync') && capabilities.has('firewall')) {
+          try { await firewallApi.block(ip, req, { source: 'cphulk', comment: 'denylist' }); firewalled = true; } catch (err) { logger.warn({ err, ip }, 'cPHulk: firewall block failed'); }
+        }
+      }
+      req?.audit?.({ action: `security.cphulk.${kind}list.add`, target: ip, args: { comment, firewalled } });
+      return { ...stmts.listById.get(lastInsertRowid), firewalled };
     },
-    removeFromList(id, req) {
+    async removeFromList(id, req) {
       const row = stmts.listById.get(id);
       if (!row) throw notFound('List entry');
       stmts.deleteList.run(id);
-      if (row.kind === 'deny') db.prepare("UPDATE cphulk_blocks SET expires_at = datetime('now', '-1 second') WHERE ip = ? AND reason = 'denylist' AND expires_at IS NULL").run(row.ip);
+      let firewalled = false;
+      if (row.kind === 'deny') {
+        db.prepare("UPDATE cphulk_blocks SET expires_at = datetime('now', '-1 second') WHERE ip = ? AND reason = 'denylist' AND expires_at IS NULL").run(row.ip);
+        if (!stmts.activeBlockByIp.get(row.ip)) firewalled = await cphulk.releaseFirewall(row.ip, req);
+      }
       req?.audit?.({ action: `security.cphulk.${row.kind}list.remove`, target: row.ip });
-      return { removed: true };
+      return { removed: true, firewalled };
     },
-    // Hourly job: purge history, expire blocks that match the allowlist and keep
-    // the firewall chain equal to "active blocks + permanent denylist".
+    // Hourly job: purge history, expire blocks that match the allowlist, then
+    // reconcile the firewall (recorded blocks, cPHulk entries, SMTP restriction).
     async maintenance(job) {
       const days = Number(settings.get('security.cphulk.history_retention_days')) || 30;
       const purgedAttempts = stmts.purgeAttempts.run(`-${days} days`).changes;
       const purgedBlocks = stmts.purgeBlocks.run(`-${days} days`).changes;
       let lifted = 0;
       for (const b of stmts.activeBlocks.all()) if (cphulk.isAllowlisted(b.ip)) { stmts.expireBlock.run(b.id); lifted++; }
-      const result = { purgedAttempts, purgedBlocks, liftedAllowlisted: lifted, firewall: null };
-      if (settings.get('security.cphulk.firewall_sync') && capabilities.has('firewall')) {
-        try {
-          const detect = await op('sec.firewall.detect');
-          if (detect.backend) {
-            const desired = new Set([...stmts.activeBlocks.all().map((b) => b.ip), ...stmts.listByKind.all('deny').map((e) => e.ip)]);
-            const current = new Set((await op('sec.firewall.list')).entries.map((e) => e.ip));
-            let added = 0; let removed = 0;
-            for (const ip of desired) if (!current.has(ip)) { await op('sec.firewall.block', { ip }); added++; }
-            for (const ip of current) if (!desired.has(ip)) { await op('sec.firewall.unblock', { ip }); removed++; }
-            result.firewall = { backend: detect.backend, added, removed, total: desired.size };
-          }
-        } catch (err) {
-          job?.log?.(`firewall sync skipped: ${err.message}`, 'warn');
-          result.firewall = { error: err.message };
-        }
-      }
+      const sync = await firewallApi.reconcile(job);
+      const result = { purgedAttempts, purgedBlocks, liftedAllowlisted: lifted, firewall: sync.firewall, smtp: sync.smtp };
       job?.log?.(`cPHulk maintenance: ${JSON.stringify(result)}`);
       return result;
     },
   };
 
   const firewallApi = {
+    recorded: () => stmts.fwEntries.all(),
+    annotate(entries) {
+      const rows = stmts.fwEntries.all();
+      const byIp = new Map();
+      for (const r of rows) (byIp.get(r.ip) || byIp.set(r.ip, []).get(r.ip)).push(r);
+      const active = new Set(entries.map((e) => e.ip));
+      const shaped = entries.map((e) => {
+        const mine = byIp.get(e.ip) || [];
+        return { ...e, sources: mine.map((r) => r.source), comment: mine.find((r) => r.comment)?.comment || null, active: true, persistent: mine.length > 0 };
+      });
+      for (const [ip, mine] of byIp) if (!active.has(ip)) shaped.push({ ip, sources: mine.map((r) => r.source), comment: mine.find((r) => r.comment)?.comment || null, active: false, persistent: true });
+      return shaped;
+    },
     async status() {
       const detect = await op('sec.firewall.detect');
-      if (!capabilities.has('firewall') || !detect.backend) return { ...detect, installed: false, entries: [] };
+      if (!capabilities.has('firewall') || !detect.backend) return { ...detect, installed: false, entries: firewallApi.annotate([]) };
       const list = await op('sec.firewall.list');
-      return { ...detect, installed: true, entries: list.entries };
+      return { ...detect, installed: true, entries: firewallApi.annotate(list.entries) };
     },
-    async block(ip, req) {
+    async block(ip, req, { source = 'manual', comment = null } = {}) {
       requireFirewallBackend(await op('sec.firewall.detect'));
       const result = await op('sec.firewall.block', { ip }, req);
-      req?.audit?.({ action: 'security.firewall.block', target: ip });
-      return result;
+      stmts.fwInsert.run(ip, source, comment);
+      req?.audit?.({ action: 'security.firewall.block', target: ip, args: { source } });
+      return { ...result, source, persistent: true };
     },
+    // An explicit unblock drops every record for the address, including cPHulk's.
     async unblock(ip, req) {
       requireFirewallBackend(await op('sec.firewall.detect'));
       const result = await op('sec.firewall.unblock', { ip }, req);
+      stmts.fwDeleteIp.run(ip);
       req?.audit?.({ action: 'security.firewall.unblock', target: ip });
       return result;
     },
-    async list() { requireFirewallBackend(await op('sec.firewall.detect')); return (await op('sec.firewall.list')).entries; },
+    async release(ip, source, req) {
+      stmts.fwDeleteSource.run(ip, source);
+      if (stmts.fwByIp.all(ip).length) return { ip, removed: false, kept: true };
+      const result = await op('sec.firewall.unblock', { ip }, req);
+      return { ip, removed: Boolean(result.removed), kept: false };
+    },
+    async list() { requireFirewallBackend(await op('sec.firewall.detect')); return firewallApi.annotate((await op('sec.firewall.list')).entries); },
+    // Makes the live WHM_BLOCK chain contain every recorded manual block plus
+    // (when sync is on) every active cPHulk block and denylist entry, removing
+    // only cPHulk entries the panel added earlier. Addresses that reached the
+    // chain by other means are counted as "untracked" and never touched. Also
+    // re-applies the SMTP restriction when it is switched on. Runs at boot and
+    // from the hourly cPHulk maintenance job.
+    async reconcile(job) {
+      const out = { firewall: null, smtp: null };
+      if (!capabilities.has('firewall')) return out;
+      try {
+        const detect = await op('sec.firewall.detect');
+        if (!detect.backend) return out;
+        const sync = Boolean(settings.get('security.cphulk.firewall_sync'));
+        const rows = stmts.fwEntries.all();
+        const manual = new Set(rows.filter((r) => r.source === 'manual').map((r) => r.ip));
+        const tracked = new Set(rows.filter((r) => r.source === 'cphulk').map((r) => r.ip));
+        const activeIps = new Set([...stmts.activeBlocks.all().map((b) => b.ip), ...stmts.listByKind.all('deny').map((e) => e.ip)]);
+        const wantCphulk = sync ? activeIps : new Set([...tracked].filter((ip) => activeIps.has(ip)));
+        const current = new Set((await op('sec.firewall.list')).entries.map((e) => e.ip));
+        let added = 0; let removed = 0;
+        const ensure = async (ip) => { if (current.has(ip)) return; await op('sec.firewall.block', { ip }); current.add(ip); added++; };
+        for (const ip of manual) await ensure(ip);
+        for (const ip of wantCphulk) { await ensure(ip); stmts.fwInsert.run(ip, 'cphulk', null); }
+        for (const ip of tracked) {
+          if (wantCphulk.has(ip)) continue;
+          stmts.fwDeleteSource.run(ip, 'cphulk');
+          if (!manual.has(ip) && current.has(ip)) { await op('sec.firewall.unblock', { ip }); current.delete(ip); removed++; }
+        }
+        const untracked = [...current].filter((ip) => !manual.has(ip) && !wantCphulk.has(ip)).length;
+        out.firewall = { backend: detect.backend, added, removed, manual: manual.size, cphulk: wantCphulk.size, untracked };
+      } catch (err) {
+        job?.log?.(`firewall sync skipped: ${err.message}`, 'warn');
+        out.firewall = { error: err.message };
+      }
+      try { out.smtp = await smtp.reconcile(job); } catch (err) {
+        job?.log?.(`SMTP restriction re-apply failed: ${err.message}`, 'warn');
+        out.smtp = { desired: true, reapplied: false, error: err.message };
+      }
+      return out;
+    },
   };
 
   const smtp = {
+    desired: () => Boolean(settings.get('security.smtp_restrictions.enabled')),
     async status() {
       const state = await op('sec.smtp_restrict.get');
-      return { ...state, installed: capabilities.has('firewall') && Boolean(state.backend) };
+      return { ...state, installed: capabilities.has('firewall') && Boolean(state.backend), desired: smtp.desired() };
     },
+    // The live rules vanish on reboot or a firewall restart; the setting is the
+    // source of truth and reconcile() puts them back.
     async set(enabled, req) {
       requireFirewallBackend(await op('sec.firewall.detect'));
       const result = await op('sec.smtp_restrict.set', { enabled }, req);
+      settings.set('security.smtp_restrictions.enabled', enabled);
       req?.audit?.({ action: 'security.smtp_restrictions.set', args: { enabled } });
-      return result;
+      return { ...result, desired: enabled };
+    },
+    async reconcile(job) {
+      if (!smtp.desired()) return { desired: false, reapplied: false };
+      if (!capabilities.has('firewall')) return { desired: true, reapplied: false, error: 'no firewall tooling is installed' };
+      const state = await op('sec.smtp_restrict.get');
+      if (!state.backend) return { desired: true, reapplied: false, error: 'no supported firewall backend' };
+      if (state.enabled) return { desired: true, reapplied: false, families: state.families };
+      const result = await op('sec.smtp_restrict.set', { enabled: true });
+      job?.log?.(`SMTP restriction re-applied (${result.backend}: ${JSON.stringify(result.families)})`);
+      return { desired: true, reapplied: true, families: result.families };
     },
   };
 
@@ -529,6 +709,7 @@ export function createSecurityCenterService(ctx) {
     return { score, minimum, ok: score >= minimum, context };
   }
 
+  const jwksCache = new Map();
   const externalAuth = {
     shape(row) {
       if (!row) return null;
@@ -565,7 +746,7 @@ export function createSecurityCenterService(ctx) {
       req?.audit?.({ action: 'security.external_auth.delete', target: name });
       return { deleted: true };
     },
-    async discover(name, req) {
+    async discover(name, req, { allowForeignEndpoints = false } = {}) {
       const row = stmts.providerByName.get(name);
       if (!row) throw notFound('Provider');
       const url = `${row.issuer_url}/.well-known/openid-configuration`;
@@ -577,11 +758,22 @@ export function createSecurityCenterService(ctx) {
       } catch (err) {
         throw badRequest(`OpenID discovery failed for ${url}: ${err.message}`);
       }
-      const discovery = { issuer: doc.issuer, authorizationEndpoint: doc.authorization_endpoint, tokenEndpoint: doc.token_endpoint, userinfoEndpoint: doc.userinfo_endpoint, jwksUri: doc.jwks_uri, scopesSupported: doc.scopes_supported || [], fetchedAt: new Date().toISOString() };
-      if (!discovery.authorizationEndpoint || !discovery.tokenEndpoint) throw badRequest('The discovery document lacks authorization_endpoint or token_endpoint');
+      const discovery = checkDiscoveryDocument(doc, row.issuer_url, { allowForeignEndpoints });
       db.prepare("UPDATE external_auth_providers SET discovery_json = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(discovery), row.id);
-      req?.audit?.({ action: 'security.external_auth.discover', target: name });
+      jwksCache.delete(row.id);
+      req?.audit?.({ action: 'security.external_auth.discover', target: name, args: { allowForeignEndpoints, foreignEndpoints: discovery.foreignEndpoints } });
       return externalAuth.get(name);
+    },
+    async jwks(row, discovery) {
+      if (!discovery?.jwksUri) return [];
+      const cached = jwksCache.get(row.id);
+      if (cached && Date.now() - cached.at < 3_600_000) return cached.keys;
+      if (!discovery.jwksUri.startsWith('https://')) throw badRequest('jwks_uri must use https://');
+      const res = await fetch(discovery.jwksUri, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
+      if (!res.ok) throw badRequest(`Fetching the provider keys failed: HTTP ${res.status}`);
+      const keys = (await res.json()).keys || [];
+      jwksCache.set(row.id, { at: Date.now(), keys });
+      return keys;
     },
     // Helpers for the auth category to wire a login/link flow:
     authorizationUrl(name, { state, nonce, redirectUri }) {
@@ -592,24 +784,42 @@ export function createSecurityCenterService(ctx) {
       for (const [k, v] of Object.entries({ response_type: 'code', client_id: p.clientId, redirect_uri: redirectUri, scope: p.scopes, state, nonce })) if (v) u.searchParams.set(k, v);
       return u.toString();
     },
-    async exchangeCode(name, { code, redirectUri }) {
+    // `nonce` must be the value sent in authorizationUrl() for this login; the
+    // returned claims are trustworthy only because the id_token was verified.
+    async exchangeCode(name, { code, redirectUri, nonce = null }) {
       const row = stmts.providerByName.get(name);
       if (!row) throw notFound('Provider');
+      if (!row.enabled) throw badRequest(`Provider "${name}" is disabled`);
       const discovery = json.parse(row.discovery_json, null);
       if (!discovery?.tokenEndpoint) throw badRequest(`Run discovery for "${name}" first`);
+      if (!discovery.tokenEndpoint.startsWith('https://')) throw badRequest('The token endpoint must use https://; run discovery again');
       const body = new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: redirectUri, client_id: row.client_id });
       const headers = { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' };
-      if (row.client_secret_enc) headers.Authorization = `Basic ${Buffer.from(`${row.client_id}:${crypto.decrypt(row.client_secret_enc)}`).toString('base64')}`;
+      const clientSecret = row.client_secret_enc ? crypto.decrypt(row.client_secret_enc) : null;
+      if (clientSecret) headers.Authorization = `Basic ${Buffer.from(`${encodeURIComponent(row.client_id)}:${encodeURIComponent(clientSecret)}`).toString('base64')}`;
       const res = await fetch(discovery.tokenEndpoint, { method: 'POST', headers, body, signal: AbortSignal.timeout(15_000) });
       if (!res.ok) throw badRequest(`Token exchange failed: HTTP ${res.status}`);
       const tokens = await res.json();
-      let claims = null;
-      if (tokens.id_token) { try { claims = JSON.parse(Buffer.from(tokens.id_token.split('.')[1], 'base64url').toString('utf8')); } catch { claims = null; } }
+      if (!tokens.id_token) throw badRequest('The token response has no id_token: the provider is not OpenID Connect or "openid" is missing from the scopes');
+      const header = decodeJwtPart(String(tokens.id_token).split('.')[0]) || {};
+      const jwks = /^HS/.test(header.alg || '') ? [] : await externalAuth.jwks(row, discovery);
+      let claims;
+      try {
+        claims = verifyIdToken(tokens.id_token, { issuer: discovery.issuer || row.issuer_url, clientId: row.client_id, nonce, jwks, clientSecret });
+      } catch (err) {
+        throw badRequest(`The provider's id_token was rejected: ${err.message}`);
+      }
       if (discovery.userinfoEndpoint && tokens.access_token) {
         const info = await fetch(discovery.userinfoEndpoint, { headers: { Authorization: `Bearer ${tokens.access_token}`, Accept: 'application/json' }, signal: AbortSignal.timeout(15_000) }).catch(() => null);
-        if (info?.ok) claims = { ...(claims || {}), ...(await info.json()) };
+        if (info?.ok) {
+          const extra = await info.json().catch(() => null);
+          if (extra && typeof extra === 'object') {
+            if (extra.sub && extra.sub !== claims.sub) throw badRequest('The userinfo subject does not match the id_token');
+            claims = { ...extra, ...claims };
+          }
+        }
       }
-      return { claims, tokens: { tokenType: tokens.token_type, expiresIn: tokens.expires_in } };
+      return { claims, subject: claims.sub, email: claims.email_verified === false ? null : claims.email || null, tokens: { tokenType: tokens.token_type, expiresIn: tokens.expires_in } };
     },
     findLinkedUser(name, subject) {
       const row = stmts.providerByName.get(name);
@@ -651,6 +861,7 @@ export function createSecurityCenterService(ctx) {
           ? { id: 'ssh.root', grade: 'warning', title: 'Root may log in over SSH with a password', detail: `PermitRootLogin is "${root}". Set it to prohibit-password or no.`, fix: { label: 'SSH Password Authorization Tweak', path: '/security-center/ssh-password-authorization-tweak' } }
           : { id: 'ssh.root', grade: 'ok', title: `Root SSH login is restricted (PermitRootLogin ${root})` });
         if (e.port && e.port !== '22') add({ id: 'ssh.port', grade: 'ok', title: `SSH listens on a non-default port (${e.port})` });
+        for (const s of cfg.shadowed || []) add({ id: `ssh.shadowed.${s.key}`, grade: 'warning', title: `${s.key} ${s.managed} from the panel is overridden (sshd uses ${s.effective})`, detail: s.by ? `${s.by} sets it first and sshd keeps the first value it reads.` : 'Another sshd configuration file read before the panel drop-in sets it.', fix: { label: 'SSH Password Authorization Tweak', path: '/security-center/ssh-password-authorization-tweak' } });
       });
 
       await probe('2fa', 'two-factor authentication', async () => {
@@ -667,9 +878,14 @@ export function createSecurityCenterService(ctx) {
         else {
           add({ id: 'firewall.present', grade: 'ok', title: `Firewall available (${detect.backend})` });
           const smtpState = await op('sec.smtp_restrict.get');
-          add(smtpState.enabled
-            ? { id: 'smtp.restricted', grade: 'ok', title: 'Outbound SMTP is restricted to mail services' }
-            : { id: 'smtp.restricted', grade: 'warning', title: 'SMTP restrictions are disabled', detail: 'Compromised scripts can send spam directly on port 25. Restrict outbound SMTP to root and the mail groups.', fix: { label: 'SMTP Restrictions', path: '/security-center/smtp-restrictions' } });
+          const open = smtpState.unprotected || [];
+          add(!smtpState.enabled
+            ? smtp.desired()
+              ? { id: 'smtp.restricted', grade: 'warning', title: 'SMTP restrictions are enabled but not active in the firewall', detail: 'The rules were lost (reboot or firewall restart). They are re-applied by the hourly maintenance job; re-enable the restriction to apply them now.', fix: { label: 'SMTP Restrictions', path: '/security-center/smtp-restrictions' } }
+              : { id: 'smtp.restricted', grade: 'warning', title: 'SMTP restrictions are disabled', detail: 'Compromised scripts can send spam directly on port 25. Restrict outbound SMTP to root and the mail groups.', fix: { label: 'SMTP Restrictions', path: '/security-center/smtp-restrictions' } }
+            : open.length
+              ? { id: 'smtp.restricted', grade: 'warning', title: `Outbound SMTP is restricted for IPv4 only (${open.join(', ')} open)`, detail: 'ip6tables is not installed, so unprivileged processes can still reach port 25 over IPv6. Install ip6tables or switch to nftables.', fix: { label: 'SMTP Restrictions', path: '/security-center/smtp-restrictions' } }
+              : { id: 'smtp.restricted', grade: 'ok', title: 'Outbound SMTP is restricted to mail services (IPv4 and IPv6)' });
         }
       });
 
@@ -710,6 +926,9 @@ export function createSecurityCenterService(ctx) {
         if (cc.installed) add(cc.allowed ? { id: 'compilers', grade: 'info', title: 'Compilers are available to all users', detail: 'Exploit kits often need a compiler. Deny access unless accounts need it.', fix: { label: 'Compiler Access', path: '/security-center/compiler-access' } } : { id: 'compilers', grade: 'ok', title: 'Compilers are restricted to privileged users' });
         const shells = stmts.shellAccounts.get().n;
         if (shells > 0) add({ id: 'accounts.shell', grade: 'info', title: `${shells} hosting account${shells === 1 ? ' has' : 's have'} shell access` });
+        const p = policy();
+        const stored = [p.verifiedIpLogin && 'verified-IP login', p.require2faForRoot && '2FA for root', p.require2faForResellers && '2FA for resellers', p.apiTokensRequire2fa && '2FA for API tokens', p.sessionTimeoutMinutes > 0 && 'session timeout', p.disallowConcurrentSessions && 'single session', p.passwordMaxAgeDays > 0 && 'password age', settings.get('security.questions.enabled') && 'security questions'].filter(Boolean);
+        if (stored.length) add({ id: 'policy.unenforced', grade: 'warning', title: `${stored.length} login polic${stored.length === 1 ? 'y is' : 'ies are'} stored but not enforced yet`, detail: `${stored.join(', ')}: the authentication layer does not read these settings yet, so they provide no protection today.`, fix: { label: 'Configure Security Policies', path: '/security-center/configure-security-policies' } });
       });
 
       await probe('apache', 'web server hardening', async () => {

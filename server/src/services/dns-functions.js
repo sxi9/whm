@@ -28,6 +28,8 @@ export function createDnsService(ctx) {
     records: db.prepare('SELECT * FROM dns_records WHERE zone_id = ? ORDER BY line_index, id'),
     recordById: db.prepare('SELECT * FROM dns_records WHERE id = ? AND zone_id = ?'),
     insertRecord: db.prepare('INSERT INTO dns_records (zone_id, name, type, ttl, priority, value, line_index) VALUES (@zone_id, @name, @type, @ttl, @priority, @value, @line_index)'),
+    restoreRecord: db.prepare('INSERT INTO dns_records (id, zone_id, name, type, ttl, priority, value, line_index) VALUES (@id, @zone_id, @name, @type, @ttl, @priority, @value, @line_index)'),
+    restoreZone: db.prepare('UPDATE dns_zones SET serial = @serial, ttl = @ttl, dnssec_enabled = @dnssec_enabled, account_id = @account_id, updated_at = @updated_at WHERE id = @id'),
     updateRecord: db.prepare('UPDATE dns_records SET name = @name, type = @type, ttl = @ttl, priority = @priority, value = @value WHERE id = @id'),
     deleteRecord: db.prepare('DELETE FROM dns_records WHERE id = ?'),
     deleteRecordsOfZone: db.prepare('DELETE FROM dns_records WHERE zone_id = ?'),
@@ -47,7 +49,7 @@ export function createDnsService(ctx) {
     mailDomain: db.prepare('SELECT * FROM mail_domains WHERE domain = ?'),
     upsertMailDomain: db.prepare('INSERT INTO mail_domains (account_id, domain, routing) VALUES (?, ?, ?) ON CONFLICT (domain) DO UPDATE SET routing = excluded.routing'),
     insertParked: db.prepare('INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, ?, ?, ?)'),
-    parkedByDomain: db.prepare("SELECT d.*, a.username AS account, a.owner_id, a.home_dir FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE d.domain = ? AND d.type IN ('parked', 'alias')"),
+    parkedByDomain: db.prepare("SELECT d.*, a.username AS account, a.domain AS target, a.owner_id, a.home_dir FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE d.domain = ? AND d.type IN ('parked', 'alias')"),
     deleteParked: db.prepare('DELETE FROM account_domains WHERE id = ?'),
     forwarding: db.prepare('SELECT f.*, a.username AS account, a.owner_id FROM domain_forwarding f LEFT JOIN accounts a ON a.id = f.account_id WHERE f.domain = ?'),
     upsertForwarding: db.prepare(`INSERT INTO domain_forwarding (domain, account_id, target_url, type, match_www, keep_path, status, last_error)
@@ -167,8 +169,10 @@ export function createDnsService(ctx) {
   }
 
   // Re-renders the zone from the DB, validates it with named-checkzone, writes it
-  // to disk and reloads named. On a dev box without BIND the DB is still updated
-  // and the caller learns the zone is unpublished.
+  // to disk (the agent verifies named-checkconf and reverts on failure) and
+  // reloads named, reconfiguring first when the zone's stanza changed. On a
+  // dev box without BIND the DB is still updated and the caller learns the
+  // zone is unpublished.
   async function publish(zone, req, { reload = true } = {}) {
     const fresh = stmts.zoneByDomain.get(zone.domain);
     const records = stmts.records.all(fresh.id);
@@ -179,14 +183,54 @@ export function createDnsService(ctx) {
     }
     const check = await agent.op('dns.checkzone', { domain: fresh.domain, body }, { req });
     if (check?.ok === false) throw unprocessable(`Zone ${fresh.domain} failed named-checkzone`, { zone: [check.output || 'named-checkzone reported an error'] });
-    await agent.op('dns.zone.write', { domain: fresh.domain, body, allowTransfer: setting('dns.allow_transfer', []), signed: Boolean(fresh.dnssec_enabled) }, { req });
-    if (fresh.dnssec_enabled) await agent.op('dns.dnssec.sign', { domain: fresh.domain }, { req });
+    let written;
+    try {
+      written = await agent.op('dns.zone.write', { domain: fresh.domain, body, allowTransfer: setting('dns.allow_transfer', []), signed: Boolean(fresh.dnssec_enabled) }, { req });
+    } catch (err) {
+      if (err.code === 'config_invalid') throw unprocessable(`named-checkconf rejected the configuration for ${fresh.domain}; nothing was changed on disk`, { zone: [err.details?.output || err.message] });
+      // The operator's own stanza points named at a file the panel cannot
+      // write (or a secondary zone): reporting "published" would be a lie.
+      if (err.code === 'zone_external') throw conflict(err.message);
+      throw err;
+    }
+    const external = Boolean(written?.external);
+    if (fresh.dnssec_enabled) {
+      if (external) throw unprocessable(`${fresh.domain} is declared in named.conf outside the panel include, so the panel cannot point named at the signed zone file`, { dnssec: ['Move the zone declaration into the panel-managed include (or remove it) before enabling DNSSEC'] });
+      await agent.op('dns.dnssec.sign', { domain: fresh.domain }, { req });
+    }
+    const reconfig = Boolean(written?.stanzaAdded || written?.stanzaChanged || written?.includeAdded);
     let reloaded = false;
     let reloadError = null;
     if (reload) {
-      try { await agent.op('dns.reload', { domain: fresh.domain }, { req }); reloaded = true; } catch (err) { reloadError = err.message; logger.warn({ err, domain: fresh.domain }, 'zone written but named reload failed'); }
+      try { await agent.op('dns.reload', { domain: fresh.domain, reconfig }, { req }); reloaded = true; } catch (err) { reloadError = err.message; logger.warn({ err, domain: fresh.domain }, 'zone written but named reload failed'); }
     }
-    return { applied: true, reloaded, reloadError, serial: fresh.serial };
+    return { applied: true, reloaded, reloadError, reconfigured: reconfig, external, file: written?.path ?? null, serial: fresh.serial };
+  }
+
+  // Mutations commit to SQLite (the source of truth) and then publish; when
+  // named-checkzone, named-checkconf or the agent rejects the result the rows
+  // and serial are put back so the DB never keeps what BIND refused.
+  function snapshotZone(zoneId) {
+    return { zone: stmts.zoneById.get(zoneId), records: stmts.records.all(zoneId) };
+  }
+
+  function restoreZone(snap) {
+    db.transaction(() => {
+      stmts.deleteRecordsOfZone.run(snap.zone.id);
+      for (const r of snap.records) stmts.restoreRecord.run({ id: r.id, zone_id: r.zone_id, name: r.name, type: r.type, ttl: r.ttl, priority: r.priority, value: r.value, line_index: r.line_index });
+      stmts.restoreZone.run({ id: snap.zone.id, serial: snap.zone.serial, ttl: snap.zone.ttl, dnssec_enabled: snap.zone.dnssec_enabled, account_id: snap.zone.account_id, updated_at: snap.zone.updated_at });
+    })();
+  }
+
+  async function commitAndPublish(zone, mutate, req, opts) {
+    const snap = snapshotZone(zone.id);
+    const out = db.transaction(mutate)();
+    try {
+      return { out, result: await publish(zone, req, opts) };
+    } catch (err) {
+      restoreZone(snap);
+      throw err;
+    }
   }
 
   function bump(zone, patch = {}) {
@@ -214,9 +258,19 @@ export function createDnsService(ctx) {
     if (parsed.errors.length) throw unprocessable(`Template "${template}" renders an invalid zone`, { template: parsed.errors });
     if (!parsed.records.some((r) => r.type === 'SOA')) throw unprocessable(`Template "${template}" has no SOA record`, { template: ['SOA record missing'] });
     const zone = insertZoneRows({ domain, account_id: accountId, serial: parsed.serial || serial, ttl: parsed.ttl || zoneTtl }, parsed.records);
-    const result = await publish(zone, req);
+    const result = await publishNewZone(zone, req);
     audit(req, { action: 'dns.zone.create', target: domain, args: { template, ip: address, accountId } });
     return { ...shapeZone(stmts.zoneByDomain.get(domain)), records: stmts.records.all(zone.id).map(shapeRecord), ...result };
+  }
+
+  // A freshly inserted zone that BIND rejects is dropped again entirely.
+  async function publishNewZone(zone, req) {
+    try {
+      return await publish(zone, req);
+    } catch (err) {
+      db.transaction(() => { stmts.deleteRecordsOfZone.run(zone.id); stmts.deleteZone.run(zone.id); })();
+      throw err;
+    }
   }
 
   async function removeZoneInternal(zone, req) {
@@ -307,6 +361,21 @@ export function createDnsService(ctx) {
       mx: records.filter((r) => r.type === 'MX').map(shapeRecord).sort((a, b) => a.priority - b.priority),
       suggestions: { spf: suggestedSpf(records), dmarc: buildDmarc({ p: 'none', rua: `postmaster@${zone.domain}` }) },
     };
+  }
+
+  const isCapabilityMissing = (err) => err?.code === 'capability_missing' || err instanceof CapabilityError;
+
+  // Runs a web-server side effect (alias, redirect). A missing web category or
+  // a CapabilityError from it (no Apache yet) leaves the change 'pending' —
+  // the vhost sync picks it up once the daemon exists; only real errors fail.
+  async function applyWeb(domain, fn) {
+    try {
+      return { web: (await fn()) ? 'applied' : 'pending', webDetail: null };
+    } catch (err) {
+      if (isCapabilityMissing(err)) return { web: 'pending', webDetail: err.message };
+      logger.warn({ err, domain }, 'web service could not apply the change');
+      return { web: `failed: ${err.message}`, webDetail: err.message };
+    }
   }
 
   function parseRemote(host) {
@@ -421,16 +490,17 @@ export function createDnsService(ctx) {
       if (!validation.ok) throw unprocessable('Zone text is not valid', { body: validation.errors });
       const parsed = parseZone(body, domain);
       const created = !zone;
+      let result;
       if (!zone) {
         zone = insertZoneRows({ domain, account_id: accountForDomain(domain)?.id ?? null, serial: parsed.serial || nextSerial(0), ttl: parsed.ttl || setting('dns.default_ttl', 14400) }, parsed.records);
+        result = await publishNewZone(zone, req);
       } else {
-        db.transaction(() => {
+        ({ result } = await commitAndPublish(zone, () => {
           stmts.deleteRecordsOfZone.run(zone.id);
           parsed.records.forEach((r, i) => stmts.insertRecord.run({ zone_id: zone.id, name: r.name, type: r.type, ttl: r.ttl ?? null, priority: r.priority ?? null, value: r.value, line_index: i + 1 }));
           stmts.touchZone.run({ id: zone.id, serial: Math.max(nextSerial(zone.serial), parsed.serial || 0), ttl: parsed.ttl || zone.ttl, dnssec_enabled: zone.dnssec_enabled, account_id: zone.account_id });
-        })();
+        }, req));
       }
-      const result = await publish(zone, req);
       audit(req, { action: 'dns.zone.raw_save', target: domain, args: { records: parsed.records.length, created } });
       return { ...(await service.getZone(domain, user)), ...result };
     },
@@ -452,12 +522,11 @@ export function createDnsService(ctx) {
       const conflictMsg = checkConflicts(records, rec);
       if (conflictMsg) throw conflict(conflictMsg);
       if (records.some((r) => r.name === rec.name && r.type === rec.type && r.value === rec.value && (r.priority ?? null) === (rec.priority ?? null))) throw conflict('An identical record already exists');
-      const id = db.transaction(() => {
+      const { out: id, result } = await commitAndPublish(zone, () => {
         const { lastInsertRowid } = stmts.insertRecord.run({ zone_id: zone.id, ...rec, line_index: stmts.maxLine.get(zone.id).n + 1 });
         bump(zone);
         return Number(lastInsertRowid);
-      })();
-      const result = await publish(zone, req);
+      }, req);
       audit(req, { action: 'dns.record.add', target: domain, args: rec });
       return { record: shapeRecord(stmts.recordById.get(id, zone.id)), ...result };
     },
@@ -471,8 +540,7 @@ export function createDnsService(ctx) {
       try { rec = normalizeRecord({ ...existing, ...input, ttl: input.ttl === undefined ? existing.ttl : input.ttl, priority: input.priority === undefined ? existing.priority : input.priority }, domain); } catch (err) { if (err instanceof ZoneError) throw unprocessable(err.message, err.fields); throw err; }
       const conflictMsg = checkConflicts(stmts.records.all(zone.id), rec, existing.id);
       if (conflictMsg) throw conflict(conflictMsg);
-      db.transaction(() => { stmts.updateRecord.run({ id: existing.id, ...rec }); bump(zone); })();
-      const result = await publish(zone, req);
+      const { result } = await commitAndPublish(zone, () => { stmts.updateRecord.run({ id: existing.id, ...rec }); bump(zone); }, req);
       audit(req, { action: 'dns.record.update', target: `${domain}#${id}`, args: rec });
       return { record: shapeRecord(stmts.recordById.get(id, zone.id)), ...result };
     },
@@ -482,8 +550,7 @@ export function createDnsService(ctx) {
       const zone = await load(domain, user);
       const existing = stmts.recordById.get(id, zone.id);
       if (!existing || existing.type === 'SOA') throw notFound('Record');
-      db.transaction(() => { stmts.deleteRecord.run(existing.id); bump(zone); })();
-      const result = await publish(zone, req);
+      const { result } = await commitAndPublish(zone, () => { stmts.deleteRecord.run(existing.id); bump(zone); }, req);
       audit(req, { action: 'dns.record.delete', target: `${domain}#${id}`, args: shapeRecord(existing) });
       return { deleted: true, ...result };
     },
@@ -497,12 +564,11 @@ export function createDnsService(ctx) {
       const next = { ...current, ...Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined)) };
       next.primary = fqdn(next.primary, domain);
       next.hostmaster = fqdn(next.hostmaster, domain);
-      db.transaction(() => {
+      const { result } = await commitAndPublish(zone, () => {
         if (soaRec) stmts.updateRecord.run({ id: soaRec.id, name: '@', type: 'SOA', ttl: soaRec.ttl, priority: null, value: soaValue(next) });
         else stmts.insertRecord.run({ zone_id: zone.id, name: '@', type: 'SOA', ttl: null, priority: null, value: soaValue(next), line_index: 0 });
         bump(zone);
-      })();
-      const result = await publish(zone, req);
+      }, req);
       audit(req, { action: 'dns.zone.soa', target: domain, args: next });
       return { soa: { ...next, serial: stmts.zoneById.get(zone.id).serial }, ...result };
     },
@@ -510,8 +576,7 @@ export function createDnsService(ctx) {
     async setTtl(domain, ttl, user, req) {
       assertPublishable();
       const zone = await load(domain, user);
-      db.transaction(() => { bump(zone, { ttl }); })();
-      const result = await publish(zone, req);
+      const { result } = await commitAndPublish(zone, () => { bump(zone, { ttl }); }, req);
       audit(req, { action: 'dns.zone.ttl', target: domain, args: { ttl } });
       return { domain, ttl, ...result };
     },
@@ -531,10 +596,32 @@ export function createDnsService(ctx) {
       let keys = null;
       if (enabled && !zone.dnssec_enabled) keys = await agent.op('dns.dnssec.keygen', { domain, algorithm: 'ECDSAP256SHA256' }, { req });
       if (!enabled && zone.dnssec_enabled && bindAvailable()) await agent.op('dns.dnssec.remove', { domain }, { req });
-      db.transaction(() => { bump(zone, { dnssec_enabled: enabled ? 1 : 0 }); })();
-      const result = await publish(zone, req);
+      let result;
+      try {
+        ({ result } = await commitAndPublish(zone, () => { bump(zone, { dnssec_enabled: enabled ? 1 : 0 }); }, req));
+      } catch (err) {
+        if (keys) { try { await agent.op('dns.dnssec.remove', { domain }, { req }); } catch (cleanupErr) { logger.warn({ err: cleanupErr, domain }, 'could not remove the DNSSEC keys of a zone that failed to publish'); } }
+        throw err;
+      }
       audit(req, { action: enabled ? 'dns.dnssec.enable' : 'dns.dnssec.disable', target: domain });
-      return { domain, dnssec_enabled: enabled, ds: keys?.ds ?? [], dnskey: keys ? { ksk: keys.ksk?.record, zsk: keys.zsk?.record } : null, ...result };
+      return { domain, dnssec_enabled: enabled, keys: Boolean(keys), ds: keys?.ds ?? [], dnskey: keys ? { ksk: keys.ksk?.record ?? null, zsk: keys.zsk?.record ?? null } : null, ...result };
+    },
+
+    // The DS/DNSKEY records are read back from the key files on the BIND host,
+    // so the operator can fetch them for the registrar at any time without
+    // regenerating keys.
+    async dnssecStatus(domain, user) {
+      const zone = await load(domain, user);
+      if (!isRoot(user)) throw forbidden('Only root can read DNSSEC keys');
+      const base = { domain, dnssec_enabled: Boolean(zone.dnssec_enabled), keys: false, ds: [], dnskey: null, signed: null, keyDir: null };
+      if (!zone.dnssec_enabled) return base;
+      if (!bindAvailable()) throw new CapabilityError('bind', 'The DNSSEC keys live on the BIND host; install bind9 / bind to read them');
+      const status = await agent.op('dns.dnssec.status', { domain });
+      return {
+        ...base, keys: Boolean(status?.hasKeys), keyDir: status?.keyDir ?? null, ds: status?.ds ?? [],
+        dnskey: status?.ksk || status?.zsk ? { ksk: status.ksk?.record ?? null, zsk: status.zsk?.record ?? null } : null,
+        signed: status?.signed ?? null,
+      };
     },
 
     // ------------------------------------------------------------- templates
@@ -609,8 +696,7 @@ export function createDnsService(ctx) {
         zone = stmts.zoneByDomain.get(parent);
       }
       const relative = hostname === zone.domain ? '@' : hostname.slice(0, -(zone.domain.length + 1));
-      db.transaction(() => { replaceByNameType(zone, relative, 'A', [{ value: ip }]); bump(zone); })();
-      const result = await publish(zone, req);
+      const { result } = await commitAndPublish(zone, () => { replaceByNameType(zone, relative, 'A', [{ value: ip }]); bump(zone); }, req);
       audit(req, { action: 'dns.hostname.a', target: hostname, args: { ip, zone: zone.domain } });
       return { hostname, ip, zone: zone.domain, recordName: relative, createdZone: createdZone?.domain ?? null, ...result };
     },
@@ -633,13 +719,12 @@ export function createDnsService(ctx) {
       const zone = await load(domain, user);
       const value = (input.value || suggestedSpf(stmts.records.all(zone.id))).trim().replace(/\s+/g, ' ');
       if (!SPF_RE.test(value)) throw unprocessable('Not a valid SPF record', { value: ['SPF must start with v=spf1 and use a, mx, ip4:, ip6:, include:, ~all / -all mechanisms'] });
-      db.transaction(() => {
+      const { result } = await commitAndPublish(zone, () => {
         const others = txtAt(stmts.records.all(zone.id), '@', 'v=spf1');
         for (const r of others) stmts.deleteRecord.run(r.id);
         stmts.insertRecord.run({ zone_id: zone.id, name: '@', type: 'TXT', ttl: null, priority: null, value, line_index: stmts.maxLine.get(zone.id).n + 1 });
         bump(zone);
-      })();
-      const result = await publish(zone, req);
+      }, req);
       audit(req, { action: 'dns.email.spf', target: domain, args: { value } });
       return { ...emailStatusOf(stmts.zoneByDomain.get(domain)), ...result };
     },
@@ -647,8 +732,12 @@ export function createDnsService(ctx) {
     async ensureDkim(domain, input, user, req) {
       assertPublishable();
       const zone = await load(domain, user);
+      const snap = snapshotZone(zone.id);
       const dkim = await ensureDkimInternal(zone, input, req);
-      const result = dkim.changed ? await publish(zone, req) : { applied: null };
+      let result = { applied: null };
+      if (dkim.changed) {
+        try { result = await publish(zone, req); } catch (err) { restoreZone(snap); throw err; }
+      }
       audit(req, { action: 'dns.email.dkim', target: domain, args: { selector: dkim.selector, generated: dkim.generated } });
       return { ...emailStatusOf(stmts.zoneByDomain.get(domain)), dkimResult: dkim, ...result };
     },
@@ -656,12 +745,11 @@ export function createDnsService(ctx) {
     async removeDkim(domain, user, req) {
       assertPublishable();
       const zone = await load(domain, user);
-      db.transaction(() => {
+      const { result } = await commitAndPublish(zone, () => {
         for (const r of stmts.records.all(zone.id)) if (r.type === 'TXT' && r.name.endsWith('._domainkey')) stmts.deleteRecord.run(r.id);
-        stmts.deleteDkim.run(domain);
         bump(zone);
-      })();
-      const result = await publish(zone, req);
+      }, req);
+      stmts.deleteDkim.run(domain);
       try { await ctx.mail?.removeDkimKey?.(domain, req); } catch (err) { logger.warn({ err, domain }, 'mail service could not remove DKIM key'); }
       audit(req, { action: 'dns.email.dkim_remove', target: domain });
       return { ...emailStatusOf(stmts.zoneByDomain.get(domain)), ...result };
@@ -672,8 +760,7 @@ export function createDnsService(ctx) {
       const zone = await load(domain, user);
       const value = input.value ? input.value.trim() : buildDmarc(input);
       if (!/^v=DMARC1;\s*p=(none|quarantine|reject)(;\s*[a-z]+=[^;]+)*;?$/i.test(value)) throw unprocessable('Not a valid DMARC record', { value: ['DMARC must start with v=DMARC1; p=none|quarantine|reject'] });
-      db.transaction(() => { replaceByNameType(zone, '_dmarc', 'TXT', [{ value }]); bump(zone); })();
-      const result = await publish(zone, req);
+      const { result } = await commitAndPublish(zone, () => { replaceByNameType(zone, '_dmarc', 'TXT', [{ value }]); bump(zone); }, req);
       audit(req, { action: 'dns.email.dmarc', target: domain, args: { value } });
       return { ...emailStatusOf(stmts.zoneByDomain.get(domain)), ...result };
     },
@@ -720,6 +807,38 @@ export function createDnsService(ctx) {
       return summary;
     },
 
+    // ---------------------------------------------------------------- dnssec
+    // dnssec-signzone signatures expire after 30 days; the nightly schedule
+    // re-signs every signed zone whose signed output is older than the window.
+    // A re-sign goes through a normal publish (serial bump, write, sign with
+    // the new serial, reload) so secondaries notice the fresh signatures.
+    async runResign(jobCtx) {
+      const zones = db.prepare('SELECT * FROM dns_zones WHERE dnssec_enabled = 1 ORDER BY domain').all();
+      const summary = { total: zones.length, signed: 0, skipped: 0, failed: 0 };
+      if (!zones.length) { jobCtx.log('No DNSSEC-signed zones'); return summary; }
+      if (!bindAvailable()) { jobCtx.log('BIND is not installed; zones cannot be re-signed', 'warn'); summary.failed = zones.length; return summary; }
+      const maxAgeSeconds = Math.max(1, Number(setting('dns.dnssec_resign_days', 7))) * 86400;
+      let i = 0;
+      for (const zone of zones) {
+        i++;
+        jobCtx.progress((i / zones.length) * 100, zone.domain);
+        try {
+          const status = await agent.op('dns.dnssec.status', { domain: zone.domain });
+          if (!status?.hasKeys) throw new Error('no DNSSEC keys on disk; disable and re-enable DNSSEC to generate new ones');
+          const fresh = status.signed?.exists && !status.signed.stale && status.signed.ageSeconds != null && status.signed.ageSeconds < maxAgeSeconds;
+          if (fresh) { summary.skipped++; continue; }
+          const { result } = await commitAndPublish(zone, () => { bump(zone); }, null);
+          summary.signed++;
+          jobCtx.log(`${zone.domain}: re-signed with serial ${result.serial}${result.reloaded ? ' and reloaded' : ` (reload failed: ${result.reloadError})`}`);
+        } catch (err) {
+          summary.failed++;
+          jobCtx.log(`${zone.domain}: ${err.message}`, 'error');
+        }
+      }
+      if (summary.signed) audit(null, { action: 'dns.dnssec.resign', target: 'all', args: summary });
+      return summary;
+    },
+
     // --------------------------------------------------------------- routing
     listRouting(query, user) {
       const zones = allVisibleZones(user).filter((z) => !query.account || z.account === query.account);
@@ -736,7 +855,7 @@ export function createDnsService(ctx) {
       const exchanges = (input.exchanges || []).map((e) => ({ priority: e.priority, value: fqdn(e.exchange, domain) }));
       if (['remote', 'backup'].includes(routing) && !exchanges.length) throw unprocessable('Remote and backup routing need at least one external mail exchanger', { exchanges: ['Add at least one MX host'] });
       const localMx = `mail.${domain}.`;
-      db.transaction(() => {
+      const { result } = await commitAndPublish(zone, () => {
         const records = stmts.records.all(zone.id);
         if (routing === 'local') {
           replaceByNameType(zone, '@', 'MX', [{ priority: 0, value: localMx }]);
@@ -751,10 +870,9 @@ export function createDnsService(ctx) {
           const highest = Math.max(...exchanges.map((e) => e.priority)) + 10;
           replaceByNameType(zone, '@', 'MX', [...exchanges, { priority: highest, value: localMx }]);
         }
-        stmts.upsertMailDomain.run(zone.account_id ?? null, domain, routing);
         bump(zone);
-      })();
-      const result = await publish(zone, req);
+      }, req);
+      stmts.upsertMailDomain.run(zone.account_id ?? null, domain, routing);
       let mailApplied = null;
       try { if (typeof ctx.mail?.setRouting === 'function') { await ctx.mail.setRouting(domain, routing, req); mailApplied = true; } } catch (err) { mailApplied = false; logger.warn({ err, domain }, 'mail service could not apply routing'); }
       audit(req, { action: 'dns.routing', target: domain, args: { routing, exchanges } });
@@ -827,16 +945,23 @@ export function createDnsService(ctx) {
       const parkedCount = db.prepare("SELECT COUNT(*) AS n FROM account_domains WHERE account_id = ? AND type IN ('parked', 'alias')").get(account.id).n;
       if (limit != null && limit >= 0 && parkedCount >= limit && !isRoot(user)) throw forbidden(`The account's package allows ${limit} parked domain(s)`);
       const docroot = stmts.accountByAnyDomain.get(account.domain)?.docroot || `${account.home_dir}/public_html`;
-      stmts.insertParked.run(account.id, domain, 'parked', docroot);
+      // The zone goes first: a parked row without a zone would consume the
+      // package quota for a domain that was never provisioned.
       let zone = null;
       if (createZone && !stmts.zoneByDomain.get(domain)) zone = await createZoneInternal({ domain, ip: input.ip || account.ip, template: 'standard', accountId: account.id }, req);
-      let web = 'pending';
       try {
-        if (typeof ctx.web?.addAlias === 'function') { await ctx.web.addAlias({ username: account.username, domain: account.domain, alias: domain, docroot }, req); web = 'applied'; }
-        else if (typeof ctx.web?.syncAccount === 'function') { await ctx.web.syncAccount(account.username, req); web = 'applied'; }
-      } catch (err) { web = `failed: ${err.message}`; logger.warn({ err, domain }, 'web service could not add the alias'); }
-      audit(req, { action: 'dns.park', target: domain, args: { account: account.username, createZone } });
-      return { domain, account: account.username, target: account.domain, docroot, zone: zone ? { domain: zone.domain, applied: zone.applied } : null, web };
+        stmts.insertParked.run(account.id, domain, 'parked', docroot);
+      } catch (err) {
+        if (zone) { try { await removeZoneInternal(stmts.zoneByDomain.get(domain), req); } catch (cleanupErr) { logger.warn({ err: cleanupErr, domain }, 'could not remove the zone of a failed park'); } }
+        throw err;
+      }
+      const { web, webDetail } = await applyWeb(domain, async () => {
+        if (typeof ctx.web?.addAlias === 'function') { await ctx.web.addAlias({ username: account.username, domain: account.domain, alias: domain, docroot }, req); return true; }
+        if (typeof ctx.web?.syncAccount === 'function') { await ctx.web.syncAccount(account.username, req); return true; }
+        return false;
+      });
+      audit(req, { action: 'dns.park', target: domain, args: { account: account.username, createZone, web } });
+      return { domain, account: account.username, target: account.domain, docroot, zone: zone ? { domain: zone.domain, applied: zone.applied } : null, web, webDetail };
     },
 
     async unparkDomain(domain, { removeZone = true } = {}, user, req) {
@@ -846,13 +971,13 @@ export function createDnsService(ctx) {
       stmts.deleteParked.run(parked.id);
       const zone = stmts.zoneByDomain.get(domain);
       if (removeZone && zone) await removeZoneInternal(zone, req);
-      let web = 'pending';
-      try {
-        if (typeof ctx.web?.removeAlias === 'function') { await ctx.web.removeAlias({ username: parked.account, alias: domain }, req); web = 'applied'; }
-        else if (typeof ctx.web?.syncAccount === 'function') { await ctx.web.syncAccount(parked.account, req); web = 'applied'; }
-      } catch (err) { web = `failed: ${err.message}`; }
-      audit(req, { action: 'dns.unpark', target: domain, args: { removeZone } });
-      return { domain, unparked: true, zoneRemoved: Boolean(removeZone && zone), web };
+      const { web, webDetail } = await applyWeb(domain, async () => {
+        if (typeof ctx.web?.removeAlias === 'function') { await ctx.web.removeAlias({ username: parked.account, alias: domain, domain: parked.target }, req); return true; }
+        if (typeof ctx.web?.syncAccount === 'function') { await ctx.web.syncAccount(parked.account, req); return true; }
+        return false;
+      });
+      audit(req, { action: 'dns.unpark', target: domain, args: { removeZone, web } });
+      return { domain, unparked: true, zoneRemoved: Boolean(removeZone && zone), web, webDetail };
     },
 
     // --------------------------------------------------------------- cleanup
@@ -869,7 +994,7 @@ export function createDnsService(ctx) {
         try {
           const listing = await agent.op('dns.zone.list', {});
           const onDisk = new Set((listing?.zones || []).filter((z) => z.exists).map((z) => z.domain));
-          unmanaged = (listing?.zones || []).filter((z) => z.exists && !stmts.zoneByDomain.get(z.domain)).map((z) => ({ domain: z.domain, path: z.path }));
+          unmanaged = (listing?.zones || []).filter((z) => z.exists && !stmts.zoneByDomain.get(z.domain)).map((z) => ({ domain: z.domain, path: z.path, external: Boolean(z.external) }));
           missingOnDisk = zones.filter((z) => !onDisk.has(z.domain)).map((z) => ({ domain: z.domain, account: z.account }));
         } catch (err) { logger.warn({ err }, 'cleanup: could not list zone files'); }
       }
@@ -908,6 +1033,9 @@ export function createDnsService(ctx) {
       return { ...result, data: result.data.map((r) => ({ ...r, match_www: Boolean(r.match_www), keep_path: Boolean(r.keep_path), webSupported: typeof ctx.web?.setRedirects === 'function' })) };
     },
 
+    // 'pending' means the web server category (or Apache itself) is not there
+    // yet; POST /forwarding/apply re-applies those rows once it is. Only a real
+    // error marks a row 'failed'.
     async applyForwardingRow(row, req) {
       if (typeof ctx.web?.setRedirects !== 'function') { stmts.forwardingStatus.run('pending', 'web service not available yet', row.domain); return 'pending'; }
       try {
@@ -915,8 +1043,9 @@ export function createDnsService(ctx) {
         stmts.forwardingStatus.run('applied', null, row.domain);
         return 'applied';
       } catch (err) {
-        stmts.forwardingStatus.run('failed', err.message, row.domain);
-        return 'failed';
+        const status = isCapabilityMissing(err) ? 'pending' : 'failed';
+        stmts.forwardingStatus.run(status, err.message, row.domain);
+        return status;
       }
     },
 
@@ -939,10 +1068,13 @@ export function createDnsService(ctx) {
       if (!row) throw notFound(`Forwarding for ${domain}`);
       if (!isRoot(user) && row.owner_id !== user.id) throw forbidden('That domain belongs to another reseller\'s account');
       stmts.deleteForwarding.run(domain);
-      let web = 'pending';
-      try { if (typeof ctx.web?.setRedirects === 'function') { await ctx.web.setRedirects(domain, [], req); web = 'applied'; } } catch (err) { web = `failed: ${err.message}`; }
-      audit(req, { action: 'dns.forwarding.remove', target: domain });
-      return { domain, removed: true, web };
+      const { web, webDetail } = await applyWeb(domain, async () => {
+        if (typeof ctx.web?.setRedirects !== 'function') return false;
+        await ctx.web.setRedirects(domain, [], req);
+        return true;
+      });
+      audit(req, { action: 'dns.forwarding.remove', target: domain, args: { web } });
+      return { domain, removed: true, web, webDetail };
     },
 
     async applyForwarding(user, req) {
@@ -1024,8 +1156,7 @@ export function createDnsService(ctx) {
       if (!zone) throw notFound(`Zone ${domain}`);
       const rel = name === domain || name === `${domain}.` ? '@' : name.replace(new RegExp(`\\.${domain.replace(/\./g, '\\.')}\\.?$`), '');
       const recs = values.map((v) => normalizeRecord({ name: rel, type, ttl: v.ttl, priority: v.priority, value: v.value }, domain));
-      db.transaction(() => { replaceByNameType(zone, rel, type.toUpperCase(), recs); bump(zone); })();
-      return publish(zone, req);
+      return (await commitAndPublish(zone, () => { replaceByNameType(zone, rel, type.toUpperCase(), recs); bump(zone); }, req)).result;
     },
     async removeZonesForAccount(accountId, req) {
       const zones = db.prepare('SELECT * FROM dns_zones WHERE account_id = ?').all(accountId);

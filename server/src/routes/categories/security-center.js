@@ -50,8 +50,14 @@ export async function register(ctx) {
   ctx.jobs.register('security.cphulk.maintenance', (job) => ctx.security.cphulk.maintenance(job));
   ctx.jobs.register('security.advisor.scan', () => ctx.security.advisor.scan('scheduled'));
   ctx.jobs.register('security.modsec.vendor.install', (job) => ctx.security.modsec.installVendorJob(job));
+  ctx.jobs.register('security.firewall.reconcile', (job) => ctx.security.firewall.reconcile(job));
   ctx.scheduler.ensure('security-cphulk-maintenance', '7 * * * *', 'security.cphulk.maintenance');
   ctx.scheduler.ensure('security-advisor-scan', '15 4 * * *', 'security.advisor.scan');
+  // Firewall rules do not survive a reboot: put recorded blocks and the SMTP
+  // restriction back as soon as the job worker starts, when there is anything to restore.
+  if (ctx.security.smtp.desired() || ctx.settings.get('security.cphulk.firewall_sync') || ctx.security.firewall.recorded().length) {
+    ctx.jobs.enqueue('security.firewall.reconcile', { trigger: 'boot' });
+  }
 
   const s = ctx.security;
   const r = Router();
@@ -110,8 +116,9 @@ export async function register(ctx) {
   r.delete('/cphulk/lists/:id', validate({ params: z.object({ id: fields.id }) }), wrap((req) => s.cphulk.removeFromList(req.params.id, req)));
   r.post('/cphulk/maintenance', wrap(() => s.cphulk.maintenance()));
   r.get('/firewall', wrap(() => s.firewall.status()));
-  r.post('/firewall/block', validate({ body: z.object({ ip: ipOrCidr }).strict() }), wrap((req) => s.firewall.block(req.body.ip, req)));
+  r.post('/firewall/block', validate({ body: z.object({ ip: ipOrCidr, comment: z.string().max(200).optional() }).strict() }), wrap((req) => s.firewall.block(req.body.ip, req, { comment: req.body.comment })));
   r.post('/firewall/unblock', validate({ body: z.object({ ip: ipOrCidr }).strict() }), wrap((req) => s.firewall.unblock(req.body.ip, req)));
+  r.post('/firewall/reconcile', wrap(() => s.firewall.reconcile()));
 
   // SMTP restrictions, mod_userdir, wheel
   r.get('/smtp-restrictions', wrap(() => s.smtp.status()));
@@ -149,7 +156,7 @@ export async function register(ctx) {
     clientSecret: z.string().max(1024).optional(), scopes: z.string().regex(/^[A-Za-z0-9_.:\/ -]{1,200}$/).optional(), enabled: z.boolean().optional(),
   }).strict() }), wrap((req) => s.externalAuth.update(req.params.name, req.body, req)));
   r.delete('/external-auth/:name', validate({ params: z.object({ name: providerName }) }), wrap((req) => s.externalAuth.remove(req.params.name, req)));
-  r.post('/external-auth/:name/discover', validate({ params: z.object({ name: providerName }) }), wrap((req) => s.externalAuth.discover(req.params.name, req)));
+  r.post('/external-auth/:name/discover', validate({ params: z.object({ name: providerName }), body: z.object({ allowForeignEndpoints: z.boolean().optional() }).strict() }), wrap((req) => s.externalAuth.discover(req.params.name, req, { allowForeignEndpoints: req.body.allowForeignEndpoints === true })));
   r.get('/advisor', wrap(() => s.advisor.last()));
   r.post('/advisor/scan', wrap((req) => s.advisor.scan('manual', req)));
 

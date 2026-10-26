@@ -1,9 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import { exec } from '../src/exec.js';
 import { runOp, createContext, OpError } from '../src/lib.js';
+import fs from 'node:fs';
 import {
-  renderHostsAllow, parseSshdConfig, parseAuthorizedKeys, parsePublicKeyLine, fingerprintOf, renderForkBombConf, parseForkBombConf,
-  parseIptablesRules, parseNftChain, parseModsecDirectives, parseModsecRules, parseModsecErrorLog, renderUserdirConf, parseUserdirConf, firewallBackend,
+  renderHostsAllow, parseSshdConfig, sshdShadowed, parseAuthorizedKeys, parsePublicKeyLine, fingerprintOf, renderForkBombConf, parseForkBombConf,
+  parseIptablesRules, parseNftChain, parseModsecDirectives, parseModsecRules, parseModsecErrorLog, renderUserdirConf, parseUserdirConf, firewallBackend, privateTempDir,
 } from '../src/ops/sec.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
@@ -48,6 +49,7 @@ describe('sec op schemas reject injection and traversal before anything runs', (
 
   it('ssh keys', async () => {
     exec.mockClear();
+    expect((await opError(runOp('sec.ssh_keys.generate', { name: 'ok', passphrase: 'a\nb' }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('sec.ssh_keys.generate', { name: '-rf' }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('sec.ssh_keys.generate', { name: '../id_rsa' }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('sec.ssh_keys.generate', { name: 'a/b' }, ctx))).code).toBe('invalid_args');
@@ -99,6 +101,12 @@ describe('sec op schemas reject injection and traversal before anything runs', (
     exec.mockClear();
     expect((await opError(runOp('sec.userdir.set', { enabled: true, excludeUsers: ['-r'] }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('sec.userdir.set', { enabled: true, homeRoot: '/home/../etc' }, ctx))).code).toBe('invalid_args');
+    // homeRoot lands inside <Directory "..."> so anything that could close the
+    // quote or add a directive is refused before Apache config is touched.
+    for (const homeRoot of ['/home">\nInclude /etc/passwd', '/home"', '/home dir', '/home\n', 'home', '/home/', '/', `/${'a'.repeat(200)}`]) {
+      expect((await opError(runOp('sec.userdir.set', { enabled: true, homeRoot }, ctx))).code, JSON.stringify(homeRoot)).toBe('invalid_args');
+    }
+    expect(exec).not.toHaveBeenCalled();
     expect((await opError(runOp('sec.scan.filesystem', { root: '/etc' }, ctx))).code).toBe('path_not_allowed');
     expect((await opError(runOp('sec.scan.filesystem', { root: 'relative' }, ctx))).code).toBe('invalid_args');
     expect(exec).not.toHaveBeenCalled();
@@ -137,6 +145,8 @@ describe('sec ops refuse to act when the subsystem is missing (no side effects)'
     const sshd = await runOp('sec.sshd.get', {}, ctx);
     expect(typeof sshd.installed).toBe('boolean');
     expect(typeof sshd.effective).toBe('object');
+    expect(sshd.managedPath).toBe('/etc/ssh/sshd_config.d/00-whm.conf');
+    expect(Array.isArray(sshd.shadowed)).toBe(true);
     const scan = await runOp('sec.scan.filesystem', { root: '/home', limit: 5 }, ctx);
     expect(Array.isArray(scan.worldWritable)).toBe(true);
     expect(scan.sensitive.find((f) => f.path === '/etc/shadow')).toBeTruthy();
@@ -153,6 +163,42 @@ describe('pure renderers and parsers', () => {
   it('parses sshd config and stops at Match blocks', () => {
     const cfg = parseSshdConfig('# comment\nPort 2222\nPasswordAuthentication no\nPermitRootLogin=prohibit-password\nMatch User foo\nPasswordAuthentication yes\n');
     expect(cfg).toEqual({ port: '2222', passwordauthentication: 'no', permitrootlogin: 'prohibit-password' });
+  });
+
+  it('reports managed sshd values that an earlier file overrides', () => {
+    const managed = { PasswordAuthentication: 'no', PermitRootLogin: 'without-password', MaxAuthTries: '4', Port: '22' };
+    const effective = { passwordauthentication: 'yes', permitrootlogin: 'prohibit-password', maxauthtries: '6', port: '22' };
+    const sources = [
+      { file: '/etc/ssh/sshd_config (before the Include line)', settings: { maxauthtries: '6' } },
+      { file: '/etc/ssh/sshd_config.d/00-cloud-init.conf', settings: { passwordauthentication: 'yes' } },
+    ];
+    expect(sshdShadowed(managed, effective, sources)).toEqual([
+      { key: 'PasswordAuthentication', managed: 'no', effective: 'yes', by: '/etc/ssh/sshd_config.d/00-cloud-init.conf' },
+      { key: 'MaxAuthTries', managed: '4', effective: '6', by: '/etc/ssh/sshd_config (before the Include line)' },
+    ]);
+    expect(sshdShadowed({ PasswordAuthentication: 'no' }, { passwordauthentication: 'yes' }, [])).toEqual([{ key: 'PasswordAuthentication', managed: 'no', effective: 'yes', by: null }]);
+    expect(sshdShadowed({ PasswordAuthentication: 'no' }, {}, [])).toEqual([]);
+  });
+
+  it('never stages root-executed files under a directory another user could own', () => {
+    // /tmp is sticky and world-writable: any local user can pre-create a subdir there.
+    expect(() => privateTempDir('/tmp', 'whm-test-')).toThrow(OpError);
+    expect(() => privateTempDir('/nonexistent-whm-dir', 'x-')).toThrow(OpError);
+    const base = fs.mkdtempSync('/tmp/whm/sec-tmpdir-');
+    try {
+      fs.chmodSync(base, 0o700);
+      const link = `${base}/link`;
+      fs.symlinkSync(base, link);
+      expect(() => privateTempDir(link, 'x-')).toThrow(/not a directory/);
+      fs.chmodSync(base, 0o775);
+      expect(() => privateTempDir(base, 'x-')).toThrow(/group\/world writable/);
+      fs.chmodSync(base, 0o755);
+      if (process.getuid?.() === 0) {
+        const dir = privateTempDir(base, 'x-');
+        expect(dir.startsWith(`${base}/x-`)).toBe(true);
+        expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
+      } else expect(() => privateTempDir(base, 'x-')).toThrow(/owned by root/);
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
 
   it('parses authorized_keys lines with options and computes SHA256 fingerprints', () => {

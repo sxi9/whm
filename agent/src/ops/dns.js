@@ -56,22 +56,126 @@ export function stripStanza(text, domain) {
   return text.replace(re, '');
 }
 
+// The file named actually loads: Debian's named.conf includes named.conf.local.
+const rootConf = (layout) => (layout.flavor === 'debian' ? '/etc/bind/named.conf' : layout.mainConf);
+
+export function currentStanza(text, domain) {
+  const m = text.match(new RegExp(`${escapeRe(marker(domain))}\\n[\\s\\S]*?${escapeRe(marker(domain, true))}\\n?`));
+  return m ? m[0] : null;
+}
+
+// Pulls `options { directory }` and every zone stanza (name, type, file) out of
+// named.conf text. Blocks are matched by brace depth so stanzas inside views
+// and nested lists (allow-transfer { ... }) do not confuse the scan.
+export function parseNamedConf(text) {
+  const src = String(text).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*(\/\/|#).*$/gm, '');
+  const zones = [];
+  let directory = null;
+  const re = /\b(zone|options)\b\s*(?:"([^"]*)"|'([^']*)')?\s*(?:IN|CH|HS)?\s*\{/gi;
+  let m;
+  while ((m = re.exec(src))) {
+    let depth = 1;
+    let i = re.lastIndex;
+    for (; i < src.length && depth; i++) { if (src[i] === '{') depth++; else if (src[i] === '}') depth--; }
+    const body = src.slice(re.lastIndex, depth ? src.length : i - 1);
+    re.lastIndex = i;
+    if (m[1].toLowerCase() === 'options') { directory = body.match(/\bdirectory\s+"([^"]*)"/)?.[1] ?? directory; continue; }
+    if (m[2] == null && m[3] == null) continue;
+    zones.push({
+      domain: (m[2] ?? m[3]).toLowerCase().replace(/(.)\.$/, '$1'),
+      type: body.match(/\btype\s+([a-z-]+)\s*;/i)?.[1].toLowerCase() ?? null,
+      file: body.match(/\bfile\s+"([^"]*)"/)?.[1] ?? null,
+    });
+  }
+  return { directory, zones };
+}
+
+// A relative `file` in a zone stanza is relative to options { directory }.
+const DEFAULT_DIRECTORY = { debian: '/var/cache/bind', rhel: '/var/named' };
+export function resolveZonePath(file, directory, layout) {
+  if (!file) return null;
+  if (path.isAbsolute(file)) return path.normalize(file);
+  return path.join(directory || DEFAULT_DIRECTORY[layout.flavor] || layout.zoneDir, file);
+}
+
+// Every zone named loads. named-checkconf -p expands every include; when it is
+// unavailable (or the config is already broken) the configuration files next
+// to the main one are scanned textually, skipping the panel's own include.
+export async function namedZones(layout, ctx) {
+  const root = rootConf(layout);
+  if (hasBinary('named-checkconf') && fs.existsSync(root)) {
+    const { code, stdout } = await exec('named-checkconf', ['-p', root], { allowFailure: true, timeoutMs: 30_000 });
+    if (code === 0) return { ...parseNamedConf(stdout), source: 'checkconf' };
+  }
+  const candidates = new Set([layout.mainConf, root]);
+  for (const dir of [layout.confDir, path.join(layout.confDir, 'named'), path.join(layout.confDir, 'named.conf.d')]) {
+    if (!fs.existsSync(dir)) continue;
+    for (const f of fs.readdirSync(dir)) if (/^named(\..+)?\.(conf|zones|local|options)$/.test(f)) candidates.add(path.join(dir, f));
+  }
+  const zones = [];
+  let directory = null;
+  for (const f of candidates) {
+    if (f === layout.includeFile || !fs.existsSync(f)) continue;
+    try { ctx.assertAllowedPath(f, 'read'); } catch { continue; }
+    const parsed = parseNamedConf(readText(f));
+    directory ??= parsed.directory;
+    zones.push(...parsed.zones);
+  }
+  return { directory, zones, source: 'scan' };
+}
+
+// A zone the operator declared by hand (outside the panel include) must not be
+// declared again: named refuses a configuration with a duplicate zone. The
+// panel then maintains the file that stanza names, which need not be the
+// panel's own <zoneDir>/<domain>.db. Returns { external, type, file }.
+export async function declaredElsewhere(layout, domain, ctx) {
+  const conf = await namedZones(layout, ctx);
+  const own = new Set([zoneFile(layout, domain), `${zoneFile(layout, domain)}.signed`]);
+  let matches = conf.zones.filter((z) => z.domain === domain).map((z) => ({ ...z, file: resolveZonePath(z.file, conf.directory, layout) }));
+  if (conf.source === 'checkconf' && readText(layout.includeFile).includes(marker(domain))) {
+    // The expanded config contains the panel's own stanza: drop that one copy.
+    const idx = matches.findIndex((z) => own.has(z.file));
+    matches = matches.filter((_, i) => i !== (idx >= 0 ? idx : 0));
+  }
+  if (!matches.length) return { external: false, type: null, file: null };
+  return { external: true, type: matches[0].type, file: matches[0].file };
+}
+
+// Where the panel reads and writes a zone's master file: its own path, unless
+// an external stanza points named at another file.
+async function locateZone(layout, domain, ctx) {
+  const own = zoneFile(layout, domain);
+  const ext = await declaredElsewhere(layout, domain, ctx);
+  if (!ext.external) return { file: own, external: false, type: null };
+  if (ext.type && !['master', 'primary'].includes(ext.type)) throw new OpError('zone_external', `${domain} is declared in named.conf outside the panel include as a "${ext.type}" zone; the panel can only maintain primary zones. Remove that stanza to let the panel manage the zone.`, { file: ext.file, type: ext.type });
+  if (!ext.file) throw new OpError('zone_external', `${domain} is declared in named.conf outside the panel include without a file statement; remove that stanza to let the panel manage the zone.`, { file: null, type: ext.type });
+  return { file: ext.file, external: true, type: ext.type };
+}
+
 // Puts (or replaces) the zone's stanza in the managed include file and makes
-// sure the main configuration includes that file exactly once.
+// sure the main configuration includes that file exactly once. Reports whether
+// the stanza text changed: named only re-reads a zone's options on reconfig.
 function ensureStanza(layout, domain, file, allowTransfer, ctx) {
   ctx.assertAllowedPath(layout.includeFile, 'write');
   ctx.assertAllowedPath(layout.mainConf, 'write');
   const current = readText(layout.includeFile);
-  const stanzaAdded = !current.includes(marker(domain));
+  const previous = currentStanza(current, domain);
+  const fresh = stanza(domain, file, allowTransfer);
+  const stanzaAdded = previous == null;
+  const stanzaChanged = previous != null && previous !== fresh;
   const body = stripStanza(current.replace(HEADER, ''), domain).trim();
-  const next = `${HEADER}${body ? `${body}\n` : ''}${stanza(domain, file, allowTransfer)}`;
+  const next = `${HEADER}${body ? `${body}\n` : ''}${fresh}`;
   if (next !== current) writeAtomic(layout.includeFile, next);
   const mainConf = readText(layout.mainConf);
   const includeLine = `include "${layout.includeFile}";`;
   const includeAdded = !mainConf.includes(includeLine);
   if (includeAdded) writeAtomic(layout.mainConf, `${mainConf.trimEnd()}\n${includeLine}\n`.replace(/^\n+/, ''));
-  return { stanzaAdded, includeAdded };
+  return { stanzaAdded, stanzaChanged, includeAdded };
 }
+
+// Zone text comes from the API, which the agent does not trust: $INCLUDE would
+// make root named-checkzone open any file and $GENERATE expands unbounded.
+export const zoneBody = arg.text.refine((t) => !/^\s*\$(INCLUDE|GENERATE)\b/im.test(t), 'Zone text may not use $INCLUDE or $GENERATE');
 
 function chownToNamed(file) {
   try {
@@ -97,11 +201,18 @@ defineOp('dns.zone.list', {
     ctx.assertAllowedPath(layout.includeFile, 'read');
     const managed = new Set([...readText(layout.includeFile).matchAll(/^\/\/ BEGIN whm zone (\S+)$/gm)].map((m) => m[1]));
     const zones = new Map();
-    for (const d of managed) zones.set(d, { domain: d, path: zoneFile(layout, d), managed: true, exists: fs.existsSync(zoneFile(layout, d)) });
+    for (const d of managed) zones.set(d, { domain: d, path: zoneFile(layout, d), managed: true, external: false, exists: fs.existsSync(zoneFile(layout, d)) });
+    // Primary zones the operator declared by hand, wherever their file lives.
+    const conf = await namedZones(layout, ctx);
+    for (const z of conf.zones) {
+      if (zones.has(z.domain) || !['master', 'primary'].includes(z.type) || !/^[a-z0-9.-]+$/.test(z.domain)) continue;
+      const file = resolveZonePath(z.file, conf.directory, layout);
+      if (file) zones.set(z.domain, { domain: z.domain, path: file, managed: false, external: true, exists: fs.existsSync(file) });
+    }
     if (fs.existsSync(layout.zoneDir)) {
       for (const f of fs.readdirSync(layout.zoneDir)) {
         const m = f.match(/^([a-z0-9.-]+)\.db$/);
-        if (m && !zones.has(m[1])) zones.set(m[1], { domain: m[1], path: path.join(layout.zoneDir, f), managed: false, exists: true });
+        if (m && !zones.has(m[1])) zones.set(m[1], { domain: m[1], path: path.join(layout.zoneDir, f), managed: false, external: false, exists: true });
       }
     }
     return { installed: layout.installed, zones: [...zones.values()].sort((a, b) => a.domain.localeCompare(b.domain)) };
@@ -109,34 +220,56 @@ defineOp('dns.zone.list', {
 });
 
 defineOp('dns.zone.read', {
-  description: 'Read a zone file from the zone directory',
+  description: 'Read the master file of a zone (the panel path, or the file an external named.conf stanza names)',
   schema: z.object({ domain: arg.domain }).strict(),
   run: async ({ domain }, ctx) => {
     const layout = requireLayout();
-    const file = ctx.assertAllowedPath(zoneFile(layout, domain), 'read');
-    if (!fs.existsSync(file)) return { domain, path: file, exists: false, body: null };
-    return { domain, path: file, exists: true, body: fs.readFileSync(file, 'utf8') };
+    const located = await locateZone(layout, domain, ctx);
+    const file = ctx.assertAllowedPath(located.file, 'read');
+    if (!fs.existsSync(file)) return { domain, path: file, external: located.external, exists: false, body: null };
+    return { domain, path: file, external: located.external, exists: true, body: fs.readFileSync(file, 'utf8') };
   },
 });
 
 defineOp('dns.zone.write', {
-  description: 'Write a zone file atomically and register the zone in the panel-managed named include',
+  description: 'Write a zone file atomically, register the zone in the panel-managed named include (or write the file an external stanza names) and verify the configuration with named-checkconf, reverting on failure',
   schema: z.object({
     domain: arg.domain,
-    body: arg.text,
+    body: zoneBody,
     allowTransfer: allowTransferSchema,
     // When the zone is DNSSEC-signed, named must load the .signed output instead.
     signed: z.boolean().default(false),
   }).strict(),
   run: async ({ domain, body, allowTransfer, signed }, ctx) => {
     const layout = requireLayout();
-    const file = ctx.assertAllowedPath(zoneFile(layout, domain), 'write');
+    ctx.assertAllowedPath(layout.includeFile, 'write');
+    ctx.assertAllowedPath(layout.mainConf, 'write');
+    const located = await locateZone(layout, domain, ctx);
+    const { external } = located;
+    let file;
+    try {
+      file = ctx.assertAllowedPath(located.file, 'write');
+    } catch (err) {
+      if (!external || err.code !== 'path_not_allowed') throw err;
+      throw new OpError('zone_external', `${domain} is declared in named.conf outside the panel include with file "${located.file}", which the agent may not write. Move the zone into the panel-managed include (or point the stanza at ${zoneFile(layout, domain)}) so panel edits reach named.`, { file: located.file, type: located.type });
+    }
+    const previous = { include: readText(layout.includeFile), main: readText(layout.mainConf), includeExisted: fs.existsSync(layout.includeFile) };
     const existed = fs.existsSync(file);
     if (existed) fs.copyFileSync(file, `${file}.whm-bak`);
     writeAtomic(file, body.endsWith('\n') ? body : `${body}\n`);
     chownToNamed(file);
-    const { stanzaAdded, includeAdded } = ensureStanza(layout, domain, signed ? `${file}.signed` : file, allowTransfer, ctx);
-    return { domain, path: file, bytes: Buffer.byteLength(body), existed, stanzaAdded, includeAdded };
+    const stanzaState = external ? { stanzaAdded: false, stanzaChanged: false, includeAdded: false } : ensureStanza(layout, domain, signed ? `${file}.signed` : file, allowTransfer, ctx);
+    let checkconf = null;
+    if (hasBinary('named-checkconf') && fs.existsSync(rootConf(layout))) {
+      checkconf = await runCheck('named-checkconf', [rootConf(layout)]);
+      if (!checkconf.ok) {
+        if (previous.includeExisted) writeAtomic(layout.includeFile, previous.include); else fs.rmSync(layout.includeFile, { force: true });
+        if (stanzaState.includeAdded) writeAtomic(layout.mainConf, previous.main);
+        if (existed) fs.copyFileSync(`${file}.whm-bak`, file); else fs.rmSync(file, { force: true });
+        throw new OpError('config_invalid', `named-checkconf rejected the configuration; the zone was not written: ${checkconf.output}`, { output: checkconf.output });
+      }
+    }
+    return { domain, path: file, bytes: Buffer.byteLength(body), existed, external, ...stanzaState, checkconf };
   },
 });
 
@@ -168,7 +301,7 @@ async function runCheck(bin, argv) {
 
 defineOp('dns.checkzone', {
   description: 'Validate zone syntax with named-checkzone (given text, or the file on disk)',
-  schema: z.object({ domain: arg.domain, body: arg.text.optional() }).strict(),
+  schema: z.object({ domain: arg.domain, body: zoneBody.optional() }).strict(),
   run: async ({ domain, body }, ctx) => {
     if (!hasBinary('named-checkzone')) throw new OpError('capability_missing', 'named-checkzone is not installed (bind9-utils / bind-utils)');
     let file;
@@ -179,7 +312,8 @@ defineOp('dns.checkzone', {
       fs.writeFileSync(tmp, body, { mode: 0o600 });
       file = tmp;
     } else {
-      file = ctx.assertAllowedPath(zoneFile(requireLayout(), domain), 'read');
+      const layout = requireLayout();
+      file = ctx.assertAllowedPath((await locateZone(layout, domain, ctx)).file, 'read');
       if (!fs.existsSync(file)) throw new OpError('not_found', `Zone file for ${domain} does not exist`);
     }
     try {
@@ -204,14 +338,25 @@ defineOp('dns.checkconf', {
 });
 
 defineOp('dns.reload', {
-  description: 'Reload named (one zone or everything) via rndc, falling back to systemctl reload',
-  schema: z.object({ domain: arg.domain.optional() }).strict(),
-  run: async ({ domain }) => {
+  description: 'Reload named (one zone or everything) via rndc, falling back to systemctl reload; reconfig first when a zone stanza changed',
+  schema: z.object({
+    domain: arg.domain.optional(),
+    // `rndc reload <zone>` only re-reads zone data; a changed stanza (file,
+    // allow-transfer) is picked up by `rndc reconfig` alone.
+    reconfig: z.boolean().default(false),
+  }).strict(),
+  run: async ({ domain, reconfig }) => {
     const layout = requireLayout();
     if (hasBinary('rndc')) {
+      let reconfigured = false;
+      if (reconfig) {
+        const r = await exec('rndc', ['reconfig'], { allowFailure: true, timeoutMs: 60_000 });
+        if (r.code !== 0 && !hasBinary('systemctl')) throw new OpError('command_failed', `rndc reconfig failed: ${r.stderr.trim() || r.stdout.trim()}`);
+        reconfigured = r.code === 0;
+      }
       const argv = domain ? ['reload', domain] : ['reload'];
       const { code, stdout, stderr } = await exec('rndc', argv, { allowFailure: true, timeoutMs: 60_000 });
-      if (code === 0) return { method: 'rndc', domain: domain ?? null, output: `${stdout}${stderr}`.trim() };
+      if (code === 0) return { method: reconfigured ? 'rndc reconfig+reload' : 'rndc', domain: domain ?? null, reconfigured, output: `${stdout}${stderr}`.trim() };
       // A zone named has not loaded yet needs a full reconfig to pick up the new stanza.
       if (domain && /not found|no matching zone/i.test(stderr)) {
         const r = await exec('rndc', ['reconfig'], { allowFailure: true, timeoutMs: 60_000 });
@@ -261,8 +406,13 @@ defineOp('dns.dnssec.keygen', {
   },
 });
 
+// `-N keep`: the signed zone carries the YYYYMMDDnn serial the panel rendered
+// (and tracks in its database). unixtime/increment would publish a different
+// serial, so secondaries that transferred the unsigned zone could fall behind.
+export const signzoneArgv = (dir, domain, file, signedPath) => ['-S', '-K', dir, '-o', domain, '-N', 'keep', '-t', '-f', signedPath, file];
+
 defineOp('dns.dnssec.sign', {
-  description: 'Sign a zone file with its keys (dnssec-signzone) producing <zone>.db.signed',
+  description: 'Sign a zone file with its keys (dnssec-signzone, keeping the serial of the unsigned file) producing <zone>.db.signed',
   schema: z.object({ domain: arg.domain }).strict(),
   timeoutMs: 300_000,
   run: async ({ domain }, ctx) => {
@@ -272,9 +422,47 @@ defineOp('dns.dnssec.sign', {
     const dir = ctx.assertAllowedPath(keyDir(layout, domain), 'read');
     if (!fs.existsSync(file)) throw new OpError('not_found', `Zone file for ${domain} does not exist`);
     if (!fs.existsSync(dir) || !fs.readdirSync(dir).some((f) => f.endsWith('.private'))) throw new OpError('not_found', `No DNSSEC keys for ${domain}; generate them first`);
-    const { stdout, stderr } = await exec('dnssec-signzone', ['-S', '-K', dir, '-o', domain, '-N', 'unixtime', '-t', '-f', `${file}.signed`, file], { timeoutMs: 300_000 });
-    chownToNamed(`${file}.signed`);
-    return { domain, signedPath: `${file}.signed`, output: `${stdout}${stderr}`.trim().split('\n').slice(-12).join('\n') };
+    const signedPath = `${file}.signed`;
+    const { stdout, stderr } = await exec('dnssec-signzone', signzoneArgv(dir, domain, file, signedPath), { timeoutMs: 300_000 });
+    chownToNamed(signedPath);
+    return { domain, signedPath, serial: signedSerial(signedPath), output: `${stdout}${stderr}`.trim().split('\n').slice(-12).join('\n') };
+  },
+});
+
+function signedSerial(signedPath) {
+  const m = readText(signedPath).match(/\bIN\s+SOA\s+\S+\s+\S+\s*\(?\s*(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
+const keyRecord = (file) => readText(file).split('\n').filter((l) => l && !l.startsWith(';')).join('\n');
+
+defineOp('dns.dnssec.status', {
+  description: 'Report the DNSSEC keys of a zone (DNSKEY records, DS from the KSK via dnssec-dsfromkey) and the age of its signed output',
+  schema: z.object({ domain: arg.domain }).strict(),
+  run: async ({ domain }, ctx) => {
+    const layout = requireLayout();
+    const file = ctx.assertAllowedPath(zoneFile(layout, domain), 'read');
+    const dir = ctx.assertAllowedPath(keyDir(layout, domain), 'read');
+    const keys = { ksk: null, zsk: null };
+    if (fs.existsSync(dir)) {
+      for (const f of fs.readdirSync(dir).filter((n) => /^K.+\.key$/.test(n)).sort()) {
+        const record = keyRecord(path.join(dir, f));
+        // Flags 257 = KSK (SEP bit), 256 = ZSK.
+        keys[/\bDNSKEY\s+257\b/.test(record) ? 'ksk' : 'zsk'] = { name: f.replace(/\.key$/, ''), file: path.join(dir, f), record };
+      }
+    }
+    let ds = [];
+    if (keys.ksk && hasBinary('dnssec-dsfromkey')) {
+      const { code, stdout } = await exec('dnssec-dsfromkey', ['-a', 'SHA-256', keys.ksk.file], { allowFailure: true });
+      if (code === 0) ds = stdout.trim().split('\n').filter(Boolean);
+    }
+    const signedPath = `${file}.signed`;
+    const signedStat = fs.existsSync(signedPath) ? fs.statSync(signedPath) : null;
+    const zoneStat = fs.existsSync(file) ? fs.statSync(file) : null;
+    const signed = signedStat
+      ? { exists: true, path: signedPath, ageSeconds: Math.round((Date.now() - signedStat.mtimeMs) / 1000), stale: Boolean(zoneStat && signedStat.mtimeMs < zoneStat.mtimeMs), serial: signedSerial(signedPath) }
+      : { exists: false, path: signedPath, ageSeconds: null, stale: true, serial: null };
+    return { domain, keyDir: dir, hasKeys: Boolean(keys.ksk && keys.zsk), ksk: keys.ksk, zsk: keys.zsk, ds, signed };
   },
 });
 

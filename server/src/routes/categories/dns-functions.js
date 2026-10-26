@@ -7,10 +7,13 @@ const domainParam = z.object({ domain: fields.domain });
 const recordParam = z.object({ domain: fields.domain, id: fields.id });
 const templateName = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,39}$/, 'Lowercase letters, digits, "_" or "-"; max 40 chars');
 const ttl = z.coerce.number().int().min(0).max(2147483647);
+// null / '' means "inherit $TTL"; z.null() goes first because the coerce
+// branch would turn null into 0.
+const recordTtl = z.preprocess((v) => (v === '' ? null : v), z.union([z.null(), ttl, z.string().regex(/^\d+[smhdw]?$/)]));
 const recordBody = z.object({
   name: z.string().trim().max(253).default('@'),
   type: z.enum(['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'SRV', 'NS', 'CAA', 'PTR']),
-  ttl: z.union([ttl, z.string().regex(/^\d+[smhdw]?$/), z.null()]).optional(),
+  ttl: recordTtl.optional(),
   priority: z.number().int().min(0).max(65535).nullable().optional(),
   value: z.string().trim().min(1).max(4096),
 });
@@ -21,7 +24,9 @@ export async function register(ctx) {
   ctx.dns = createDnsService(ctx);
   ctx.jobs.register('dns.sync', (job) => ctx.dns.runSync(job));
   ctx.jobs.register('dns.email_auth_all', (job) => ctx.dns.runEmailAuthAll(job));
+  ctx.jobs.register('dns.resign', (job) => ctx.dns.runResign(job));
   ctx.scheduler.ensure('dns-cluster-sync', '20 * * * *', 'dns.sync');
+  ctx.scheduler.ensure('dns-resign', '15 3 * * *', 'dns.resign');
   ctx.capabilities.register('bind', { binaries: ['named', 'rndc', 'named-checkzone', 'named-checkconf', 'dnssec-keygen', 'dnssec-signzone'], required: ['named'] });
 
   const r = Router();
@@ -51,6 +56,7 @@ export async function register(ctx) {
     primary: fields.hostname.optional(), hostmaster: fields.hostname.optional(),
     refresh: ttl.optional(), retry: ttl.optional(), expire: ttl.optional(), minimum: ttl.optional(),
   }).strict() }), wrap((req) => dns().setSoa(req.params.domain, req.body, req.user, req)));
+  r.get('/zones/:domain/dnssec', requireRoot, validate({ params: domainParam }), wrap((req) => dns().dnssecStatus(req.params.domain, req.user)));
   r.put('/zones/:domain/dnssec', requireRoot, validate({ params: domainParam, body: z.object({ enabled: z.boolean() }).strict() }),
     wrap((req) => dns().setDnssec(req.params.domain, req.body.enabled, req.user, req)));
 

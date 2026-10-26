@@ -78,7 +78,7 @@ export default function ManageRootsSshKeys({ fn }) {
               <Field label="Type"><Select value={gen.type} onChange={(v) => setGen({ ...gen, type: v, bits: '' })} options={[{ value: 'ed25519', label: 'Ed25519 (recommended)' }, { value: 'rsa', label: 'RSA' }, { value: 'ecdsa', label: 'ECDSA' }]} /></Field>
               {bitsOptions.length > 0 && <Field label="Bits"><Select value={gen.bits} onChange={(v) => setGen({ ...gen, bits: v })} options={bitsOptions} placeholder="default" /></Field>}
               <Field label="Comment"><TextInput value={gen.comment} onChange={(v) => setGen({ ...gen, comment: v })} placeholder="root@server" /></Field>
-              <Field label="Passphrase" help="Optional; protects the private key file at rest."><PasswordInput value={gen.passphrase} onChange={(v) => setGen({ ...gen, passphrase: v })} showStrength={false} allowGenerate={false} /></Field>
+              <Field label="Passphrase" help="Optional; protects the private key file at rest. It is handed to ssh-keygen through its environment, never on the command line."><PasswordInput value={gen.passphrase} onChange={(v) => setGen({ ...gen, passphrase: v })} showStrength={false} allowGenerate={false} /></Field>
               <Field inline><Toggle checked={gen.authorize} onChange={(v) => setGen({ ...gen, authorize: v })} label="Authorize immediately" /></Field>
               <FormActions><Button variant="primary" loading={busy} disabled={!gen.name || !data.keygenAvailable} onClick={generate}>Generate key</Button></FormActions>
             </Card>

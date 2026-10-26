@@ -36,12 +36,14 @@ export function useZone(domain) {
   return { zone: domain ? data : null, error, loading, refetch, setData };
 }
 
-// Every DNS mutation answers with { applied, reloaded, serial } so pages can
-// tell "saved and live" from "saved but BIND is missing on this host".
+// Every DNS mutation answers with { applied, reloaded, serial, external, file }
+// so pages can tell "saved and live" from "saved but BIND is missing on this
+// host", and flag a zone whose named.conf stanza the operator wrote by hand.
 export function PublishBadge({ result }) {
   if (!result || result.applied == null) return null;
   if (result.applied === false) return <StatusPill status="warning">Saved, not published: BIND is not installed</StatusPill>;
   if (result.reloadError) return <StatusPill status="warning">Written (serial {result.serial}) but reload failed: {result.reloadError}</StatusPill>;
+  if (result.external) return <StatusPill status="warning">Published · serial {result.serial} · zone declared outside the panel include{result.file ? ` (${result.file})` : ''}</StatusPill>;
   return <StatusPill status="ok">Published · serial {result.serial}</StatusPill>;
 }
 
@@ -49,5 +51,6 @@ export function publishMessage(result, verb = 'saved') {
   if (!result) return verb;
   if (result.applied === false) return `${verb} (not published: BIND is not installed on this server)`;
   if (result.reloadError) return `${verb}; named reload failed: ${result.reloadError}`;
+  if (result.external) return `${verb} and published (serial ${result.serial}) to ${result.file || 'the file named by the hand-written named.conf stanza'}`;
   return `${verb} and published (serial ${result.serial})`;
 }

@@ -1,27 +1,30 @@
 import { Link } from 'react-router-dom';
 import { Star, AlertTriangle, Download, Info } from 'lucide-react';
 import { useFavorites } from '../hooks/useFavorites.js';
+import { useT } from '../i18n/useT.js';
 
 export function PageHeader({ fn, title, description, actions, children }) {
   const { isFavorite, toggle } = useFavorites();
-  const heading = title || fn?.label;
+  const { t } = useT();
+  const heading = title || (fn && t(`fn.${fn.key}.label`, fn.label));
+  const text = description || (fn && t(`fn.${fn.key}.description`, fn.description));
   return (
     <header className="page-header">
       <div className="page-header-main">
         <nav className="breadcrumbs" aria-label="Breadcrumb">
-          <Link to="/">Home</Link>
-          {fn && <><span>›</span><span>{fn.category}</span></>}
+          <Link to="/">{t('common.home', 'Home')}</Link>
+          {fn && <><span>›</span><span>{t(`category.${fn.categorySlug}`, fn.category)}</span></>}
           {heading && <><span>›</span><span className="current">{heading}</span></>}
         </nav>
         <div className="page-title-row">
           <h1>{heading}</h1>
           {fn && (
-            <button className={`icon-button favorite ${isFavorite(fn.key) ? 'active' : ''}`} onClick={() => toggle(fn.key)} aria-label={isFavorite(fn.key) ? 'Remove from favorites' : 'Add to favorites'} title="Favorite">
+            <button className={`icon-button favorite ${isFavorite(fn.key) ? 'active' : ''}`} onClick={() => toggle(fn.key)} aria-label={isFavorite(fn.key) ? t('common.remove_from_favorites', 'Remove from favorites') : t('common.add_to_favorites', 'Add to favorites')} title={t('common.favorite', 'Favorite')}>
               <Star size={18} fill={isFavorite(fn.key) ? 'currentColor' : 'none'} />
             </button>
           )}
         </div>
-        {(description || fn?.description) && <p className="page-description">{description || fn.description}</p>}
+        {text && <p className="page-description">{text}</p>}
         {children}
       </div>
       {actions && <div className="page-header-actions">{actions}</div>}

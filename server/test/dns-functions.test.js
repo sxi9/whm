@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
 import { parseZone, renderZone, normalizeRecord, nextSerial, quoteTxt, checkConflicts } from '../src/services/dns-zonefile.js';
+import { CapabilityError } from '../src/lib/errors.js';
 
 // A mock agent that behaves like a host with BIND installed: named-checkzone
 // passes, writes succeed and every call is recorded for assertions.
@@ -16,7 +17,12 @@ function bindAgent() {
     'dns.reload': ({ domain }) => ({ method: 'rndc', domain: domain ?? null, output: '' }),
     'dns.resolve': ({ name, type }) => ({ name, type, servers: ['1.1.1.1'], answers: [], error: 'ENOTFOUND' }),
     'dns.dnssec.keygen': ({ domain }) => ({ domain, ksk: { name: 'K1', record: `${domain}. IN DNSKEY 257 3 13 abc` }, zsk: { name: 'K2', record: `${domain}. IN DNSKEY 256 3 13 def` }, ds: [`${domain}. IN DS 1 13 2 00`] }),
-    'dns.dnssec.sign': ({ domain }) => ({ domain, signedPath: `/etc/bind/zones/${domain}.db.signed` }),
+    'dns.dnssec.sign': ({ domain }) => ({ domain, signedPath: `/etc/bind/zones/${domain}.db.signed`, serial: null }),
+    'dns.dnssec.status': ({ domain }) => ({
+      domain, keyDir: `/etc/bind/zones/keys/${domain}`, hasKeys: true,
+      ksk: { name: 'K1', file: `/etc/bind/zones/keys/${domain}/K1.key`, record: `${domain}. IN DNSKEY 257 3 13 abc` }, zsk: { name: 'K2', file: `/etc/bind/zones/keys/${domain}/K2.key`, record: `${domain}. IN DNSKEY 256 3 13 def` },
+      ds: [`${domain}. IN DS 1 13 2 00`], signed: { exists: true, path: `/etc/bind/zones/${domain}.db.signed`, ageSeconds: 120, stale: false, serial: null },
+    }),
     'dns.dnssec.remove': ({ domain }) => ({ domain, removed: true }),
   });
   return agent;
@@ -80,9 +86,15 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
   let reseller;
   let resellerHttp;
   let resellerCsrf;
+  // The web category registers ctx.web at boot; these tests own it so the
+  // 'pending' / 'applied' / 'failed' paths do not depend on which other
+  // categories are loaded or whether Apache exists on the test host.
+  let realWeb;
 
   beforeAll(async () => {
     app = await createTestApp({ agent: bindAgent() });
+    realWeb = app.ctx.web;
+    delete app.ctx.web;
     csrf = await app.login();
     reseller = await app.createUser('resell1', 'reseller');
     await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'alice', domain: 'alice.com', owner: 'resell1' }).expect(201);
@@ -92,8 +104,8 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
     const res = await resellerHttp.post('/api/auth/login').send({ username: 'resell1', password: reseller.password });
     resellerCsrf = res.body.data.csrfToken;
   });
-  afterAll(() => app.close());
-  beforeEach(() => { app.agent.calls.length = 0; });
+  afterAll(() => { if (realWeb) app.ctx.web = realWeb; return app.close(); });
+  beforeEach(() => { app.agent.calls.length = 0; delete app.ctx.web; });
 
   const post = (path, body) => app.http.post(`/api/dns${path}`).set('X-CSRF-Token', csrf).send(body);
   const put = (path, body) => app.http.put(`/api/dns${path}`).set('X-CSRF-Token', csrf).send(body);
@@ -108,8 +120,17 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
     expect(app.agent.callsTo('dns.checkzone')).toHaveLength(1);
     expect(app.agent.callsTo('dns.zone.write')[0].args).toMatchObject({ domain: 'bob.com', signed: false });
     expect(app.agent.callsTo('dns.zone.write')[0].args.body).toContain('$ORIGIN bob.com.');
-    expect(app.agent.callsTo('dns.reload')[0].args).toEqual({ domain: 'bob.com' });
+    expect(app.agent.callsTo('dns.reload')[0].args).toEqual({ domain: 'bob.com', reconfig: true });
+    expect(res.body.data.reconfigured).toBe(true);
     expect(app.ctx.db.prepare("SELECT 1 FROM audit_log WHERE action = 'dns.zone.create' AND target = 'bob.com'").get()).toBeTruthy();
+  });
+
+  it('reloads without reconfig when the stanza is unchanged', async () => {
+    app.agent.set('dns.zone.write', ({ domain }) => ({ domain, path: `/etc/bind/zones/${domain}.db`, existed: true, stanzaAdded: false, stanzaChanged: false, includeAdded: false }));
+    const res = await post('/zones/bob.com/apply').expect(200);
+    expect(res.body.data).toMatchObject({ applied: true, reconfigured: false, external: false });
+    expect(app.agent.callsTo('dns.reload')[0].args).toEqual({ domain: 'bob.com', reconfig: false });
+    app.agent.reset('dns.zone.write');
   });
 
   it('refuses duplicates, unknown templates and bad input', async () => {
@@ -120,12 +141,58 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
     await post('/zones', { domain: 'x.com', bogus: 1 }).expect(422);
   });
 
-  it('fails cleanly when named-checkzone rejects the rendered zone', async () => {
+  it('fails cleanly when named-checkzone rejects the rendered zone and leaves the database untouched', async () => {
+    const zoneCount = () => app.ctx.db.prepare('SELECT COUNT(*) AS n FROM dns_zones').get().n;
+    const before = zoneCount();
     app.agent.set('dns.checkzone', () => ({ ok: false, output: 'zone x/IN: NS has no address records' }));
     const res = await post('/zones', { domain: 'broken.test' }).expect(422);
     expect(res.body.error.fields.zone[0]).toMatch(/NS has no address/);
+    expect(zoneCount()).toBe(before);
+    expect(app.ctx.db.prepare('SELECT 1 FROM dns_zones WHERE domain = ?').get('broken.test')).toBeUndefined();
+    expect(app.agent.callsTo('dns.zone.write')).toHaveLength(0);
+
+    const zone = app.ctx.db.prepare('SELECT * FROM dns_zones WHERE domain = ?').get('bob.com');
+    const records = app.ctx.db.prepare('SELECT * FROM dns_records WHERE zone_id = ? ORDER BY id').all(zone.id);
+    await post('/zones/bob.com/records', { name: 'rejected', type: 'A', value: '203.0.113.99' }).expect(422);
+    expect(app.ctx.db.prepare('SELECT * FROM dns_zones WHERE domain = ?').get('bob.com')).toEqual(zone);
+    expect(app.ctx.db.prepare('SELECT * FROM dns_records WHERE zone_id = ? ORDER BY id').all(zone.id)).toEqual(records);
+    await put('/zones/bob.com/ttl', { ttl: 1234 }).expect(422);
+    expect(app.ctx.db.prepare('SELECT ttl, serial FROM dns_zones WHERE domain = ?').get('bob.com')).toEqual({ ttl: zone.ttl, serial: zone.serial });
     app.agent.reset('dns.checkzone');
     app.agent.set('dns.checkzone', ({ domain }) => ({ domain, ok: true, output: '' }));
+    // The retry is not blocked by a half-created zone.
+    await post('/zones', { domain: 'broken.test' }).expect(201);
+    await del('/zones/broken.test').expect(200);
+  });
+
+  it('rolls back and answers 422 when the agent reports named-checkconf rejected the configuration', async () => {
+    const zone = app.ctx.db.prepare('SELECT * FROM dns_zones WHERE domain = ?').get('bob.com');
+    const count = app.ctx.db.prepare('SELECT COUNT(*) AS n FROM dns_records WHERE zone_id = ?').get(zone.id).n;
+    app.agent.set('dns.zone.write', Object.assign(new Error('named-checkconf rejected the configuration'), { agentError: true, code: 'config_invalid', details: { output: '/etc/bind/named.conf.whm:3: zone \'bob.com\': already exists' } }));
+    const res = await post('/zones/bob.com/records', { name: 'dup', type: 'A', value: '203.0.113.98' }).expect(422);
+    expect(res.body.error.fields.zone[0]).toMatch(/already exists/);
+    expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM dns_records WHERE zone_id = ?').get(zone.id).n).toBe(count);
+    expect(app.ctx.db.prepare('SELECT serial FROM dns_zones WHERE id = ?').get(zone.id).serial).toBe(zone.serial);
+    app.agent.fail('dns.zone.write', 'internal', 'agent connection lost');
+    await post('/zones/bob.com/records', { name: 'dup', type: 'A', value: '203.0.113.98' }).expect(500);
+    expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM dns_records WHERE zone_id = ?').get(zone.id).n).toBe(count);
+    app.agent.reset('dns.zone.write');
+  });
+
+  it('stores a blank TTL as "inherit" rather than 0', async () => {
+    for (const ttl of [null, '']) {
+      const res = await post('/zones/bob.com/records', { name: `inherit${ttl === null ? 'n' : 'e'}`, type: 'A', value: '203.0.113.42', ttl }).expect(201);
+      expect(res.body.data.record.ttl).toBeNull();
+      const line = app.agent.callsTo('dns.zone.write').pop().args.body.split('\n').find((l) => l.startsWith(`inherit${ttl === null ? 'n' : 'e'}`));
+      expect(line).toMatch(/^inherit[ne]\s+IN\s+A\s+203\.0\.113\.42$/);
+      await del(`/zones/bob.com/records/${res.body.data.record.id}`).expect(200);
+    }
+    const explicit = await post('/zones/bob.com/records', { name: 'explicit0', type: 'A', value: '203.0.113.43', ttl: 0 }).expect(201);
+    expect(explicit.body.data.record.ttl).toBe(0);
+    expect(app.agent.callsTo('dns.zone.write').pop().args.body).toMatch(/^explicit0\s+0\s+IN\s+A/m);
+    const upd = await put(`/zones/bob.com/records/${explicit.body.data.record.id}`, { ttl: null }).expect(200);
+    expect(upd.body.data.record.ttl).toBeNull();
+    await del(`/zones/bob.com/records/${explicit.body.data.record.id}`).expect(200);
   });
 
   it('lists zones with pagination and search; resellers only see their own', async () => {
@@ -206,6 +273,7 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
     expect(own.body.data.account).toBe('alice');
     await resellerHttp.get('/api/dns/zones/alice.com').expect(200);
     await resellerHttp.put('/api/dns/zones/alice.com/dnssec').set('X-CSRF-Token', resellerCsrf).send({ enabled: true }).expect(403);
+    await resellerHttp.get('/api/dns/zones/alice.com/dnssec').expect(403);
     for (const path of ['/templates', '/hostname', '/cleanup', '/sync']) await resellerHttp.get(`/api/dns${path}`).expect(403);
     await resellerHttp.post('/api/dns/email/enable-all').set('X-CSRF-Token', resellerCsrf).send({}).expect(403);
   });
@@ -341,9 +409,37 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
     const list = await get('/parked?account=bob').expect(200);
     expect(list.body.data).toEqual([expect.objectContaining({ domain: 'bob-alias.com', has_zone: true })]);
     const un = await del('/parked/bob-alias.com?removeZone=true').expect(200);
-    expect(un.body.data).toMatchObject({ unparked: true, zoneRemoved: true });
+    expect(un.body.data).toMatchObject({ unparked: true, zoneRemoved: true, web: 'pending' });
     await get('/zones/bob-alias.com').expect(404);
     await del('/parked/bob-alias.com').expect(404);
+  });
+
+  it('parking leaves no row behind when the zone cannot be created, and treats a missing web server as pending', async () => {
+    app.agent.set('dns.checkzone', () => ({ ok: false, output: 'bad zone' }));
+    await post('/parked', { domain: 'bob-broken.com', account: 'bob' }).expect(422);
+    expect(app.ctx.db.prepare('SELECT 1 FROM account_domains WHERE domain = ?').get('bob-broken.com')).toBeUndefined();
+    expect(app.ctx.db.prepare('SELECT 1 FROM dns_zones WHERE domain = ?').get('bob-broken.com')).toBeUndefined();
+    app.agent.reset('dns.checkzone');
+    app.agent.set('dns.checkzone', ({ domain }) => ({ domain, ok: true, output: '' }));
+
+    app.ctx.web = { addAlias: async () => { throw new CapabilityError('apache', 'Apache is not installed on this server'); }, removeAlias: async () => { throw new CapabilityError('apache', 'Apache is not installed on this server'); } };
+    const pending = await post('/parked', { domain: 'bob-noapache.com', account: 'bob' }).expect(201);
+    expect(pending.body.data).toMatchObject({ web: 'pending', webDetail: 'Apache is not installed on this server' });
+    expect((await del('/parked/bob-noapache.com?removeZone=true').expect(200)).body.data.web).toBe('pending');
+
+    const aliases = [];
+    app.ctx.web = { addAlias: async (args) => { aliases.push(args); }, removeAlias: async (args) => { aliases.push({ removed: args }); } };
+    const applied = await post('/parked', { domain: 'bob-apache.com', account: 'bob' }).expect(201);
+    expect(applied.body.data.web).toBe('applied');
+    expect(aliases[0]).toMatchObject({ username: 'bob', domain: 'bob.com', alias: 'bob-apache.com' });
+    await del('/parked/bob-apache.com?removeZone=true').expect(200);
+    expect(aliases[1].removed).toMatchObject({ username: 'bob', alias: 'bob-apache.com', domain: 'bob.com' });
+
+    app.ctx.web = { addAlias: async () => { throw new Error('vhost write failed'); } };
+    const failed = await post('/parked', { domain: 'bob-failed.com', account: 'bob' }).expect(201);
+    expect(failed.body.data.web).toBe('failed: vhost write failed');
+    delete app.ctx.web;
+    await del('/parked/bob-failed.com?removeZone=true').expect(200);
   });
 
   it('finds and removes orphaned zones in a cleanup', async () => {
@@ -374,6 +470,9 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
     expect(direct.body.data).toMatchObject({ status: 'applied', type: 'temporary', match_www: false });
     app.ctx.web = { setRedirects: async () => { throw new Error('vhost reload failed'); } };
     expect((await put('/forwarding/bob.com', { targetUrl: 'http://bob.example/' }).expect(200)).body.data).toMatchObject({ status: 'failed', last_error: 'vhost reload failed' });
+    app.ctx.web = { setRedirects: async () => { throw new CapabilityError('apache', 'Apache is not installed on this server'); } };
+    expect((await put('/forwarding/bob.com', { targetUrl: 'http://bob.example/' }).expect(200)).body.data).toMatchObject({ status: 'pending', last_error: 'Apache is not installed on this server' });
+    expect((await post('/forwarding/apply').expect(200)).body.data.results).toEqual([{ domain: 'bob.com', status: 'pending' }]);
     delete app.ctx.web;
     expect((await get('/forwarding').expect(200)).body.data.map((f) => f.domain)).toEqual(['bob.com']);
     await resellerHttp.put('/api/dns/forwarding/bob.com').set('X-CSRF-Token', resellerCsrf).send({ targetUrl: 'https://x.y/' }).expect(403);
@@ -381,18 +480,113 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
     await del('/forwarding/bob.com').expect(404);
   });
 
-  it('toggles DNSSEC through the agent and signs on publish', async () => {
+  it('toggles DNSSEC through the agent, signs on publish and reconfigures named when the stanza flips to the signed file', async () => {
+    // Behaves like the real op: the stanza changes exactly when `signed` flips.
+    const stanzaSigned = {};
+    app.agent.set('dns.zone.write', ({ domain, signed }) => {
+      const changed = domain in stanzaSigned && stanzaSigned[domain] !== signed;
+      stanzaSigned[domain] = signed;
+      return { domain, path: `/etc/bind/zones/${domain}.db`, existed: true, external: false, stanzaAdded: false, stanzaChanged: changed, includeAdded: false };
+    });
+    await post('/zones/bob.com/apply').expect(200);
+    const before = await get('/zones/bob.com/dnssec').expect(200);
+    expect(before.body.data).toMatchObject({ domain: 'bob.com', dnssec_enabled: false, keys: false, ds: [], dnskey: null });
+    expect(app.agent.callsTo('dns.dnssec.status')).toHaveLength(0);
     const on = await put('/zones/bob.com/dnssec', { enabled: true }).expect(200);
-    expect(on.body.data).toMatchObject({ dnssec_enabled: true, applied: true });
+    expect(on.body.data).toMatchObject({ dnssec_enabled: true, keys: true, applied: true, reconfigured: true });
     expect(on.body.data.ds).toHaveLength(1);
     expect(app.agent.callsTo('dns.dnssec.keygen')).toHaveLength(1);
     expect(app.agent.callsTo('dns.zone.write').pop().args.signed).toBe(true);
     expect(app.agent.callsTo('dns.dnssec.sign')).toHaveLength(1);
-    await post('/zones/bob.com/records', { name: 'signed', type: 'A', value: '198.51.100.9' }).expect(201);
-    expect(app.agent.callsTo('dns.dnssec.sign')).toHaveLength(2);
+    expect(app.agent.callsTo('dns.dnssec.sign')[0].args).toEqual({ domain: 'bob.com' });
+    expect(app.agent.callsTo('dns.reload').pop().args).toEqual({ domain: 'bob.com', reconfig: true });
+    // The DS/DNSKEY can be read back any time without touching the keys.
+    const status = await get('/zones/bob.com/dnssec').expect(200);
+    expect(status.body.data).toMatchObject({ dnssec_enabled: true, keys: true, ds: ['bob.com. IN DS 1 13 2 00'], dnskey: { ksk: 'bob.com. IN DNSKEY 257 3 13 abc', zsk: 'bob.com. IN DNSKEY 256 3 13 def' }, signed: { exists: true, ageSeconds: 120 }, keyDir: '/etc/bind/zones/keys/bob.com' });
+    expect(app.agent.callsTo('dns.dnssec.status')).toEqual([{ name: 'dns.dnssec.status', args: { domain: 'bob.com' } }]);
+    expect(app.agent.callsTo('dns.dnssec.keygen')).toHaveLength(1);
+    app.agent.set('dns.dnssec.status', ({ domain }) => ({ domain, keyDir: `/etc/bind/zones/keys/${domain}`, hasKeys: false, ksk: null, zsk: null, ds: [], signed: { exists: false, path: `/etc/bind/zones/${domain}.db.signed`, ageSeconds: null, stale: true, serial: null } }));
+    expect((await get('/zones/bob.com/dnssec').expect(200)).body.data).toMatchObject({ dnssec_enabled: true, keys: false, ds: [], dnskey: null });
+    app.agent.reset('dns.dnssec.status'); // reset() also clears the recorded calls
+    await get('/zones/nope.example/dnssec').expect(404);
+    const rec = await post('/zones/bob.com/records', { name: 'signed', type: 'A', value: '198.51.100.9' }).expect(201);
+    expect(rec.body.data.reconfigured).toBe(false);
+    expect(app.agent.callsTo('dns.dnssec.sign')).toHaveLength(1);
+    expect(app.agent.callsTo('dns.dnssec.keygen')).toHaveLength(0);
+    expect(app.agent.callsTo('dns.reload').pop().args).toEqual({ domain: 'bob.com', reconfig: false });
     const off = await put('/zones/bob.com/dnssec', { enabled: false }).expect(200);
-    expect(off.body.data.dnssec_enabled).toBe(false);
+    expect(off.body.data).toMatchObject({ dnssec_enabled: false, reconfigured: true });
     expect(app.agent.callsTo('dns.dnssec.remove')).toHaveLength(1);
+    app.agent.reset('dns.zone.write');
+  });
+
+  it('refuses DNSSEC on a zone declared outside the panel include and rolls the flag back', async () => {
+    app.agent.set('dns.zone.write', ({ domain }) => ({ domain, path: `/etc/bind/db.${domain}`, existed: true, external: true, stanzaAdded: false, stanzaChanged: false, includeAdded: false }));
+    const applied = await post('/zones/bob.com/apply').expect(200);
+    expect(applied.body.data).toMatchObject({ applied: true, external: true, file: '/etc/bind/db.bob.com' });
+    const res = await put('/zones/bob.com/dnssec', { enabled: true }).expect(422);
+    expect(res.body.error.fields.dnssec[0]).toMatch(/panel-managed include/);
+    expect(app.ctx.db.prepare('SELECT dnssec_enabled FROM dns_zones WHERE domain = ?').get('bob.com').dnssec_enabled).toBe(0);
+    expect(app.agent.callsTo('dns.dnssec.sign')).toHaveLength(0);
+    expect(app.agent.callsTo('dns.dnssec.remove')).toHaveLength(1);
+    app.agent.reset('dns.zone.write');
+  });
+
+  it('answers 409 and rolls back when the hand-written stanza points named at a file the agent may not write', async () => {
+    const zone = app.ctx.db.prepare('SELECT * FROM dns_zones WHERE domain = ?').get('bob.com');
+    const count = app.ctx.db.prepare('SELECT COUNT(*) AS n FROM dns_records WHERE zone_id = ?').get(zone.id).n;
+    app.agent.set('dns.zone.write', Object.assign(new Error('bob.com is declared in named.conf outside the panel include with file "/srv/dns/bob.com.zone", which the agent may not write. Move the zone into the panel-managed include (or point the stanza at /etc/bind/zones/bob.com.db) so panel edits reach named.'), { agentError: true, code: 'zone_external', details: { file: '/srv/dns/bob.com.zone', type: 'master' } }));
+    const res = await post('/zones/bob.com/records', { name: 'ext', type: 'A', value: '203.0.113.77' }).expect(409);
+    expect(res.body.error.code).toBe('conflict');
+    expect(res.body.error.message).toMatch(/\/srv\/dns\/bob\.com\.zone/);
+    expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM dns_records WHERE zone_id = ?').get(zone.id).n).toBe(count);
+    expect(app.ctx.db.prepare('SELECT serial FROM dns_zones WHERE id = ?').get(zone.id).serial).toBe(zone.serial);
+    expect(app.agent.callsTo('dns.reload')).toHaveLength(0);
+    expect((await post('/zones', { domain: 'secondary.example' }).expect(409)).body.error.code).toBe('conflict');
+    expect(app.ctx.db.prepare('SELECT 1 FROM dns_zones WHERE domain = ?').get('secondary.example')).toBeUndefined();
+    app.agent.reset('dns.zone.write');
+  });
+
+  it('re-signs DNSSEC zones on a schedule through a serial bump and publish, skipping fresh signatures', async () => {
+    expect(app.ctx.scheduler.list().find((s) => s.name === 'dns-resign')).toMatchObject({ job_type: 'dns.resign' });
+    await put('/zones/bob.com/dnssec', { enabled: true }).expect(200);
+    const serialBefore = app.ctx.db.prepare('SELECT serial FROM dns_zones WHERE domain = ?').get('bob.com').serial;
+    app.agent.calls.length = 0;
+    const status = (ageSeconds, stale = false) => ({ domain }) => ({ domain, keyDir: `/etc/bind/zones/keys/${domain}`, hasKeys: true, ksk: { record: 'k' }, zsk: { record: 'z' }, ds: [], signed: { exists: true, path: `/etc/bind/zones/${domain}.db.signed`, ageSeconds, stale, serial: serialBefore } });
+    app.agent.set('dns.dnssec.status', status(8 * 86400));
+    app.ctx.jobs.start();
+    const job = await waitForJob(app.ctx, app.ctx.jobs.enqueue('dns.resign', {}, {}).id);
+    app.ctx.jobs.stop();
+    expect(job.status).toBe('done');
+    expect(job.result).toMatchObject({ total: 1, signed: 1, skipped: 0, failed: 0 });
+    // The signed zone carries a serial secondaries have not seen: bump, write, sign, reload.
+    const serialAfter = app.ctx.db.prepare('SELECT serial FROM dns_zones WHERE domain = ?').get('bob.com').serial;
+    expect(serialAfter).toBeGreaterThan(serialBefore);
+    expect(app.agent.callsTo('dns.dnssec.status')).toEqual([{ name: 'dns.dnssec.status', args: { domain: 'bob.com' } }]);
+    expect(app.agent.callsTo('dns.zone.write')).toHaveLength(1);
+    expect(app.agent.callsTo('dns.zone.write')[0].args.body).toContain(`${serialAfter}  ; serial`);
+    expect(app.agent.callsTo('dns.dnssec.sign')).toEqual([{ name: 'dns.dnssec.sign', args: { domain: 'bob.com' } }]);
+    expect(app.agent.callsTo('dns.reload')).toEqual([{ name: 'dns.reload', args: { domain: 'bob.com', reconfig: false } }]);
+    app.agent.calls.length = 0;
+    app.agent.set('dns.dnssec.status', status(60));
+    app.ctx.jobs.start();
+    const again = await waitForJob(app.ctx, app.ctx.jobs.enqueue('dns.resign', {}, {}).id);
+    app.ctx.jobs.stop();
+    expect(again.result).toMatchObject({ total: 1, signed: 0, skipped: 1 });
+    expect(app.agent.callsTo('dns.dnssec.sign')).toHaveLength(0);
+    expect(app.ctx.db.prepare('SELECT serial FROM dns_zones WHERE domain = ?').get('bob.com').serial).toBe(serialAfter);
+    // Signed output older than the zone file is re-signed regardless of age; a failed publish restores the serial.
+    app.agent.set('dns.dnssec.status', status(60, true));
+    app.agent.set('dns.checkzone', () => ({ ok: false, output: 'zone bob.com/IN: broken' }));
+    app.ctx.jobs.start();
+    const failed = await waitForJob(app.ctx, app.ctx.jobs.enqueue('dns.resign', {}, {}).id);
+    app.ctx.jobs.stop();
+    expect(failed.result).toMatchObject({ total: 1, signed: 0, skipped: 0, failed: 1 });
+    expect(app.ctx.db.prepare('SELECT serial FROM dns_zones WHERE domain = ?').get('bob.com').serial).toBe(serialAfter);
+    app.agent.reset('dns.checkzone');
+    app.agent.set('dns.checkzone', ({ domain }) => ({ domain, ok: true, output: '' }));
+    app.agent.reset('dns.dnssec.status');
+    await put('/zones/bob.com/dnssec', { enabled: false }).expect(200);
   });
 
   it('synchronises zones to cluster peers (job) and accepts imports from a master', async () => {
@@ -463,6 +657,11 @@ describe('DNS Functions API without BIND', () => {
     expect(validate.body.data).toMatchObject({ ok: true, checkzone: null });
     const dnssec = await app.http.put('/api/dns/zones/dev.test/dnssec').set('X-CSRF-Token', csrf).send({ enabled: true }).expect(501);
     expect(dnssec.body.error.code).toBe('capability_missing');
+    expect((await app.http.get('/api/dns/zones/dev.test/dnssec').expect(200)).body.data).toMatchObject({ dnssec_enabled: false, keys: false, ds: [] });
+    // A zone flagged as signed (e.g. the DB came from another host) cannot report its keys without BIND.
+    app.ctx.db.prepare('UPDATE dns_zones SET dnssec_enabled = 1 WHERE domain = ?').run('dev.test');
+    expect((await app.http.get('/api/dns/zones/dev.test/dnssec').expect(501)).body.error).toMatchObject({ code: 'capability_missing', capability: 'bind' });
+    app.ctx.db.prepare('UPDATE dns_zones SET dnssec_enabled = 0 WHERE domain = ?').run('dev.test');
     const cleanup = await app.http.get('/api/dns/cleanup').expect(200);
     expect(cleanup.body.data).toMatchObject({ bindInstalled: false, unmanaged: [] });
     await app.http.delete('/api/dns/zones/dev.test').set('X-CSRF-Token', csrf).expect(200);

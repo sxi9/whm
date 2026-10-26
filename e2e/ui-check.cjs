@@ -64,7 +64,8 @@ const errors = [];
   await page.waitForSelector('.toggle');
   await shot('09-tweak-settings');
 
-  await page.goto(`${BASE}/dns-functions/dns-zone-manager`);
+  // A function whose screen is still scheduled for a later phase renders the placeholder.
+  await page.goto(`${BASE}/plugins/wp-toolkit`);
   await page.waitForSelector('.empty-state');
   await shot('10-generic-function-page');
 

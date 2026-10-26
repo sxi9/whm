@@ -11,7 +11,9 @@ export function CphulkStatus({ overview, refetch }) {
   const toast = useToast();
   const [draft, setDraft] = useState(overview.settings);
   const [busy, setBusy] = useState(false);
-  useEffect(() => setDraft(overview.settings), [overview.settings]);
+  // The overview polls; only reset the form when the stored values actually change.
+  const stored = JSON.stringify(overview.settings);
+  useEffect(() => setDraft(JSON.parse(stored)), [stored]);
   const dirty = JSON.stringify(draft) !== JSON.stringify(overview.settings);
   const save = async () => {
     setBusy(true);
@@ -67,7 +69,7 @@ export function CphulkBlocks({ blocks, refetch }) {
     <>
       <Card title="Block an address">
         <div className="form-grid">
-          <Field label="IP address or CIDR" required><TextInput value={form.ip} onChange={(v) => setForm({ ...form, ip: v })} placeholder="203.0.113.5" /></Field>
+          <Field label="IP address or CIDR" required help="Panel logins are matched per address; a network (CIDR) is only blocked in the firewall and needs firewall sync."><TextInput value={form.ip} onChange={(v) => setForm({ ...form, ip: v })} placeholder="203.0.113.5" /></Field>
           <Field label="Duration (minutes)"><NumberInput value={form.minutes} onChange={(v) => setForm({ ...form, minutes: v })} min={1} nullable={false} disabled={form.permanent} /></Field>
           <Field label="Reason"><TextInput value={form.reason} onChange={(v) => setForm({ ...form, reason: v })} placeholder="optional" /></Field>
         </div>
@@ -118,7 +120,7 @@ export function CphulkLists() {
     try { await api.delete(`/security/cphulk/lists/${e.id}`); refetch(); } catch (err) { toast.error(err); }
   };
   const table = (kind, empty) => (
-    <Card title={kind === 'allow' ? 'Allowlist (never blocked)' : 'Denylist (always blocked)'} padded={false}>
+    <Card title={kind === 'allow' ? 'Allowlist' : 'Denylist'} subtitle={kind === 'allow' ? 'Exact addresses are never blocked by the login path. Addresses inside an allowlisted network can still be auto-blocked after failed logins; those blocks are released by the hourly maintenance job.' : 'Exact addresses are blocked permanently in the panel. Networks are blocked in the firewall when sync is on.'} padded={false}>
       <DataTable dense columns={[{ key: 'ip', label: 'Address / network', render: (e) => <code>{e.ip}</code> }, { key: 'comment', label: 'Comment' }, { key: 'created_at', label: 'Added', render: (e) => formatDate(e.created_at) }]}
         rows={(data || []).filter((e) => e.kind === kind)} loading={loading} error={error} rowKey={(e) => e.id} emptyText={empty} rowActions={(e) => [{ label: 'Remove', danger: true, primary: true, onClick: () => remove(e) }]} />
     </Card>
@@ -133,8 +135,8 @@ export function CphulkLists() {
         </div>
         <FormActions><Button variant="primary" disabled={!form.ip.trim()} onClick={add}>Add</Button></FormActions>
       </Card>
-      {table('allow', 'Add your office or VPN networks so a typo never locks you out.')}
-      {table('deny', 'Addresses here are blocked permanently (and in the firewall when sync is on).')}
+      {table('allow', 'Add your office or VPN addresses so a typo never locks you out.')}
+      {table('deny', 'No denylisted addresses or networks.')}
     </>
   );
 }

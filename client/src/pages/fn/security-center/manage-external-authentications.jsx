@@ -53,7 +53,20 @@ export default function ManageExternalAuthentications({ fn }) {
   const [modal, setModal] = useState(null);
 
   const setSetting = async (key, value) => { try { await api.put('/system/settings', { [key]: value }); toast.success('Saved'); refetchSettings(); } catch (err) { toast.error(err); } };
-  const discover = async (p) => { try { const { data: d } = await api.post(`/security/external-auth/${p.name}/discover`); toast.success(`Discovered ${d.discovery.issuer || p.issuerUrl}`); refetch(); } catch (err) { toast.error(err); } };
+  const discover = async (p, allowForeignEndpoints = false) => {
+    try {
+      const { data: d } = await api.post(`/security/external-auth/${p.name}/discover`, allowForeignEndpoints ? { allowForeignEndpoints: true } : {});
+      toast.success(`Discovered ${d.discovery.issuer || p.issuerUrl}${d.discovery.foreignEndpoints?.length ? ` (endpoints on other hosts allowed: ${d.discovery.foreignEndpoints.join(', ')})` : ''}`);
+      refetch();
+    } catch (err) {
+      if (!allowForeignEndpoints && err?.fields?.allowForeignEndpoints) {
+        const ok = await confirm({ title: 'Endpoints on other hosts', message: `${err.message} The client secret is sent to the token endpoint, so only allow this when the provider documents those hosts.`, confirmLabel: 'Allow and discover', danger: true });
+        if (ok) return discover(p, true);
+        return;
+      }
+      toast.error(err);
+    }
+  };
   const toggle = async (p) => { try { await api.put(`/security/external-auth/${p.name}`, { enabled: !p.enabled }); refetch(); } catch (err) { toast.error(err); } };
   const remove = async (p) => {
     if (!(await confirm({ title: `Delete provider "${p.displayName}"?`, message: `${p.links} linked user${p.links === 1 ? '' : 's'} will lose the ability to sign in through it.`, confirmLabel: 'Delete', danger: true }))) return;

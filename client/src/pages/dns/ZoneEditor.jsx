@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api } from '../../api/client.js';
+import { useApi } from '../../hooks/useApi.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
 import { Card, StatusPill, KeyValue, CapabilityNotice, Loading, formatDate } from '../../components/Common.jsx';
 import { DataTable } from '../../components/DataTable.jsx';
@@ -135,6 +136,32 @@ function RawEditor({ domain, onSaved }) {
   );
 }
 
+const age = (s) => (s == null ? 'unknown age' : s < 3600 ? `${Math.round(s / 60)} min ago` : s < 86400 ? `${Math.round(s / 3600)} h ago` : `${Math.round(s / 86400)} day(s) ago`);
+
+function DnssecKeys({ status }) {
+  const { data, error, loading, refetch } = status;
+  if (loading && !data) return <Loading text="Reading keys from the BIND host…" />;
+  if (error) return <><CapabilityNotice error={error} onRetry={refetch} />{error.code !== 'capability_missing' && <ErrorBanner error={error} onRetry={refetch} />}</>;
+  if (!data) return null;
+  return (
+    <>
+      {!data.keys && <div className="banner banner-error"><div><strong>No DNSSEC keys found on disk</strong><p>The zone is flagged as signed but {data.keyDir || 'the key directory'} holds no KSK/ZSK. Disable and re-enable DNSSEC to generate new keys (then publish the new DS).</p></div></div>}
+      {data.signed && (
+        <KeyValue items={[
+          ['Signed zone', data.signed.exists ? <code key="p">{data.signed.path}</code> : 'not written yet'],
+          ['Signed', data.signed.exists ? `${age(data.signed.ageSeconds)}${data.signed.stale ? ' (older than the zone file; re-publish)' : ''}` : '—'],
+          ['Signed serial', data.signed.serial ?? '—'],
+          ['Key directory', data.keyDir ? <code key="k">{data.keyDir}</code> : null],
+        ]} />
+      )}
+      {data.ds.length > 0 && <><h3>DS record(s) for your registrar</h3><pre className="log">{data.ds.join('\n')}</pre></>}
+      {data.keys && data.ds.length === 0 && <p className="muted">dnssec-dsfromkey is not installed on the BIND host; derive the DS from the KSK below.</p>}
+      {data.dnskey && <><h3>DNSKEY</h3><pre className="log">{[data.dnskey.ksk, data.dnskey.zsk].filter(Boolean).join('\n')}</pre></>}
+      <FormActions><Button size="sm" onClick={refetch} loading={loading}>Refresh</Button></FormActions>
+    </>
+  );
+}
+
 export function ZoneEditor({ domain, zone, loading, error, refetch, setData }) {
   const toast = useToast();
   const confirm = useConfirm();
@@ -143,9 +170,12 @@ export function ZoneEditor({ domain, zone, loading, error, refetch, setData }) {
   const [editing, setEditing] = useState(null);
   const [filter, setFilter] = useState('');
   const [lastResult, setLastResult] = useState(null);
-  const [dnssec, setDnssec] = useState(null);
+  // Keys live on the BIND host; GET /dnssec reads DS/DNSKEY back whenever the
+  // zone is signed, so a reload never loses the DS the registrar needs.
+  const isRoot = user.role === 'root';
+  const dnssec = useApi(domain && isRoot && zone?.dnssec_enabled ? `/dns/zones/${encodeURIComponent(domain)}/dnssec` : null, { enabled: Boolean(domain && isRoot && zone?.dnssec_enabled) });
 
-  useEffect(() => { setEditing(null); setLastResult(null); setDnssec(null); setTab('records'); }, [domain]);
+  useEffect(() => { setEditing(null); setLastResult(null); setTab('records'); }, [domain]);
 
   const onSaved = (result) => { setLastResult(result); setEditing(null); refetch(); };
   const remove = async (r) => {
@@ -157,7 +187,8 @@ export function ZoneEditor({ domain, zone, loading, error, refetch, setData }) {
   };
   const toggleDnssec = async (enabled) => {
     if (enabled && !(await confirm({ title: 'Enable DNSSEC?', message: 'Keys are generated with dnssec-keygen and the zone is signed on every change. You must publish the DS record at your registrar for validation to work.', confirmLabel: 'Enable' }))) return;
-    try { const { data } = await api.put(`/dns/zones/${domain}/dnssec`, { enabled }); setDnssec(data); toast.success(enabled ? 'DNSSEC enabled; publish the DS record at your registrar' : 'DNSSEC disabled'); refetch(); } catch (err) { toast.error(err); }
+    if (!enabled && !(await confirm({ title: 'Disable DNSSEC?', message: 'The keys and the signed zone are deleted. Remove the DS record at your registrar first, or resolvers will treat the zone as bogus.', confirmLabel: 'Disable', danger: true }))) return;
+    try { const { data } = await api.put(`/dns/zones/${domain}/dnssec`, { enabled }); setLastResult(data); toast.success(enabled ? 'DNSSEC enabled; publish the DS record at your registrar' : 'DNSSEC disabled'); refetch(); } catch (err) { toast.error(err); }
   };
 
   if (loading && !zone) return <Loading />;
@@ -201,11 +232,10 @@ export function ZoneEditor({ domain, zone, loading, error, refetch, setData }) {
       {tab === 'raw' && <Card title="Raw zone file"><RawEditor domain={zone.domain} onSaved={onSaved} /></Card>}
       {tab === 'dnssec' && (
         <Card title="DNSSEC">
-          {user.role !== 'root' ? <p className="muted">Only the root administrator can change DNSSEC settings.</p> : (
+          {!isRoot ? <p className="muted">Only the root administrator can change DNSSEC settings.</p> : (
             <>
-              <Field inline><Toggle checked={zone.dnssec_enabled} onChange={toggleDnssec} label="Sign this zone with DNSSEC" description="Generates ECDSA P-256 KSK/ZSK keys and signs the zone file with dnssec-signzone on every change." /></Field>
-              {dnssec?.ds?.length > 0 && <><h3>DS record(s) for your registrar</h3><pre className="log">{dnssec.ds.join('\n')}</pre></>}
-              {dnssec?.dnskey?.ksk && <><h3>DNSKEY</h3><pre className="log">{dnssec.dnskey.ksk}{'\n'}{dnssec.dnskey.zsk}</pre></>}
+              <Field inline><Toggle checked={zone.dnssec_enabled} onChange={toggleDnssec} label="Sign this zone with DNSSEC" description="Generates ECDSA P-256 KSK/ZSK keys and signs the zone file with dnssec-signzone on every change; the signed zone keeps the panel's serial." /></Field>
+              {zone.dnssec_enabled && <DnssecKeys status={dnssec} />}
             </>
           )}
         </Card>

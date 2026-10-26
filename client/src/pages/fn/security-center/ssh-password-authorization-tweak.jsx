@@ -33,6 +33,7 @@ export default function SshPasswordAuthorizationTweak({ fn }) {
     try {
       const { data: result } = await api.put('/security/ssh/config', { settings: draft });
       toast.success(result.reloaded ? `sshd configuration validated and ${result.unit} reloaded` : 'sshd configuration written (reload it from Service Manager)');
+      if (result.shadowed?.length) toast.error(`${result.shadowed.length} setting${result.shadowed.length === 1 ? ' is' : 's are'} overridden by another sshd configuration file; see the warning above`);
       refetch();
     } catch (err) { toast.error(err); } finally { setBusy(false); }
   };
@@ -52,6 +53,18 @@ export default function SshPasswordAuthorizationTweak({ fn }) {
               ['Drop-in include active', data.includeActive ? 'yes' : 'no — it is added automatically on save'],
             ]} />
             <ManagedFileNote path={data.managedPath} />
+            {data.legacyPath && <p className="muted">The older drop-in <code>{data.legacyPath}</code> is still in place; it is moved to <code>{data.managedPath}</code> on the next save so it sorts before distribution files.</p>}
+            {data.shadowed?.length > 0 && (
+              <div className="banner banner-warning" style={{ marginTop: 10 }}>
+                <div>
+                  <strong>Some panel settings are not in effect.</strong> sshd keeps the first value it reads, and another file sets these before the panel drop-in:
+                  <ul style={{ margin: '6px 0 0 18px' }}>
+                    {data.shadowed.map((s) => <li key={s.key}><code>{s.key} {s.managed}</code> is overridden by <code>{s.effective}</code>{s.by ? <> from <code>{s.by}</code></> : null}</li>)}
+                  </ul>
+                  Remove or change the directive in that file (and keep the Include line at the top of <code>/etc/ssh/sshd_config</code>), then save again.
+                </div>
+              </div>
+            )}
           </Card>
           <Card title="Settings" subtitle="Written to the panel's drop-in, validated with sshd -t and rolled back if sshd rejects them.">
             <div className="form-grid">

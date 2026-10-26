@@ -20,6 +20,14 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/backup', '/var/backups/whm', '/tmp/whm',
   '/etc/named.conf', '/etc/named.whm.conf', '/etc/named',
   '/etc/modsecurity', '/var/log/modsec_audit.log', '/usr/share/modsecurity-crs',
+  '/etc/systemd/system/whm-ips.service',
+  '/root/.my.cnf',
+  '/root/.acme.sh', '/var/log/letsencrypt',
+  '/etc/default/spamassassin', '/etc/default/spamd', '/etc/sysconfig/spamassassin', '/etc/exim.conf', '/var/log/exim_mainlog', '/var/log/exim_rejectlog',
+  '/opt/cpanel', '/etc/php.ini', '/etc/php.d', '/etc/opt/rh', '/var/run/reboot-required', '/var/run/reboot-required.pkgs',
+  '/etc/vsftpd',
+  '/usr/local/whm/hooks',
+  '/etc/default/locale', '/etc/locale.conf',
 ];
 
 export function createContext({ allowedRoots = DEFAULT_ALLOWED_ROOTS, principal = null, log = () => {} } = {}) {

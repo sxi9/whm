@@ -51,6 +51,19 @@ CREATE TABLE IF NOT EXISTS external_auth_links (
   UNIQUE (provider_id, subject)
 );
 
+-- Addresses the panel itself put into the WHM_BLOCK firewall chain, so they can
+-- be restored after a reboot and told apart from rules added by other tools.
+-- 'manual' rows come from the Firewall block action (an operator or another
+-- category); 'cphulk' rows mirror active cPHulk blocks / denylist entries.
+CREATE TABLE IF NOT EXISTS firewall_entries (
+  id         INTEGER PRIMARY KEY,
+  ip         TEXT NOT NULL,
+  source     TEXT NOT NULL CHECK (source IN ('manual', 'cphulk')),
+  comment    TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (ip, source)
+);
+
 -- Security Advisor scan history (latest run is what the page shows).
 CREATE TABLE IF NOT EXISTS security_advisor_runs (
   id            INTEGER PRIMARY KEY,
@@ -66,6 +79,7 @@ INSERT OR IGNORE INTO settings (key, value) VALUES
   ('security.cphulk.firewall_sync', 'false'),
   ('security.cphulk.history_retention_days', '30'),
   ('security.cphulk.block_denylist_permanently', 'true'),
+  ('security.smtp_restrictions.enabled', 'false'),
   ('security.policy.verified_ip_login', 'false'),
   ('security.policy.password_max_age_days', '0'),
   ('security.policy.require_2fa_for_resellers', 'false'),
