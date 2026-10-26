@@ -45,7 +45,8 @@ describe('createContext().assertAllowedPath', () => {
 
   it('is not fooled by a root used as a string prefix', () => {
     expect(rejects(ctx, '/homeX').code).toBe('path_not_allowed');
-    expect(rejects(ctx, '/home2/u').code).toBe('path_not_allowed');
+    // /home2…/home4 are real roots (extra home partitions); use a prefix that is not one.
+    expect(rejects(ctx, '/homes/u').code).toBe('path_not_allowed');
     expect(rejects(ctx, '/etc/hosts.evil').code).toBe('path_not_allowed');
     expect(rejects(ctx, '/etc/hostsX/y').code).toBe('path_not_allowed');
     expect(rejects(ctx, '/var/lib/whmX').code).toBe('path_not_allowed');

@@ -10,13 +10,34 @@ const PASSWORD = process.env.PASSWORD || 'Sm0ke-Test-Passw0rd!';
 fs.mkdirSync(OUT, { recursive: true });
 
 const errors = [];
+const DATE = new Date().toISOString().slice(0, 10);
+let SHA = process.env.GIT_SHA || '';
+if (!SHA) { try { SHA = require('child_process').execSync('git rev-parse --short HEAD', { cwd: path.join(__dirname, '..') }).toString().trim(); } catch { SHA = 'working-tree'; } }
+const LABELS = {
+  '01-login': 'Login', '02-dashboard': 'Home dashboard', '03-create-account-form': 'Create a New Account — form', '04-create-account-result': 'Create a New Account — result',
+  '05-list-accounts': 'List Accounts', '06-service-status': 'Service Status', '07-server-information': 'Server Information', '08-feature-manager': 'Feature Manager',
+  '09-tweak-settings': 'Tweak Settings', '10-generic-function-page': 'Placeholder for a not-yet-built function', '11-sidebar-search': 'Sidebar search',
+  '12-top-search': 'Global search', '13-restart-service': 'Restart HTTP Server (Apache)', '14-process-manager': 'Process Manager',
+};
+// Stamps a label bar at the top of the page so the screenshot explains itself.
+async function stamp(page, text) {
+  await page.evaluate((t) => {
+    document.getElementById('whm-shot-label')?.remove();
+    const el = document.createElement('div');
+    el.id = 'whm-shot-label';
+    el.textContent = t;
+    el.style.cssText = 'position:relative;z-index:1000;background:#0b1117;color:#e6edf3;font:600 13px/1.4 -apple-system,"Segoe UI",Roboto,sans-serif;padding:7px 14px;border-bottom:3px solid #1b8fc9;letter-spacing:.01em';
+    const host = document.querySelector('.app') || document.body;
+    host.insertBefore(el, host.firstChild);
+  }, text);
+}
 (async () => {
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
   page.on('console', (m) => { if (m.type() === 'error') errors.push(`console: ${m.text()}`); });
   page.on('response', (r) => { if (r.status() >= 500) errors.push(`http ${r.status()} ${r.url()}`); });
-  const shot = (name) => page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: false });
+  const shot = async (name) => { await stamp(page, `WHM › ${LABELS[name] || name} · ${DATE} · ${SHA}`); await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: false }); };
 
   await page.goto(`${BASE}/login`);
   await page.waitForSelector('#username');
@@ -28,6 +49,7 @@ const errors = [];
   await page.waitForSelector('.home', { timeout: 15000 });
   await page.waitForSelector('.kv', { timeout: 15000 });
   await shot('02-dashboard');
+  await stamp(page, `WHM › Home dashboard (full page) · ${DATE} · ${SHA}`);
   await page.screenshot({ path: path.join(OUT, '02-dashboard-full.png'), fullPage: true });
 
   // Create an account through the real form (unique domain per run; removed at the end).

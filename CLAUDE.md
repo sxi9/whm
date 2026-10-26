@@ -171,6 +171,17 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   agent 260 / client 5. **Wave 2 launched 03:20** (12 categories; same build workflow, args
   `{wave: 2}`). Core follow-ups done by hand: split-mode socket timeout now 1 h with a per-call
   override, `/var/cache/nginx` allowed root.
+- **Login/session policy is enforced in core** (`services/auth.js`, `middleware/auth.js`,
+  `routes/auth.js`): session timeout, single session, password max age (users.password_changed_at
+  via migration 001b), required 2FA for root/resellers (session flag `mustEnroll2fa` gates
+  everything but `/auth/*`; the SPA redirects to the 2FA page), API tokens require 2FA,
+  verified-IP login (new address → audit + `ctx.contacts.notify('login.new_ip')`). Public
+  OIDC routes `GET /api/auth/external[/:name/start|/callback]` use `ctx.security.externalAuth`
+  (state+nonce in session; `?link=1` links the current user). Tests: `server/test/auth-policy.test.js`.
+- **Screenshots are a deliverable the user wants kept current:** after every wave/milestone run
+  `BASE=… PASSWORD=… bash e2e/screenshots.sh` (needs the built client served by the API); it
+  stamps a label bar on every image and rewrites the gallery READMEs under `docs/screenshots/`.
+  Commit the result.
 - **Deploy + tests:** `scripts/install.sh` (prod install, `--upgrade`), `deploy/*.service`
   + config templates, `scripts/whm-cli.js` (status / reset-password / create-admin /
   unlock-ip), `e2e/ui-check.cjs` (Playwright: login → create account → pages; run with

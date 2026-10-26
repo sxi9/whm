@@ -399,10 +399,18 @@ export function startRun({ kind, bin, argv, env, input, timeoutMs }, ctx) {
   return state;
 }
 
-export function pollRun(id, { offset = 0, maxBytes = 256 * 1024 } = {}, ctx) {
+export async function pollRun(id, { offset = 0, maxBytes = 256 * 1024 } = {}, ctx) {
   ctx.assertAllowedPath(runDir(), 'read');
   let state = readRunState(id);
   if (!state) throw new OpError('not_found', `Unknown package run "${id}"`);
+  if (state.status === 'running' && !runAlive(state)) {
+    // The child's exit handler records the code a tick after the process is
+    // gone; give it a moment before concluding the record was lost (agent restart).
+    for (let i = 0; i < 20 && state.status === 'running'; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      state = readRunState(id) || state;
+    }
+  }
   if (state.status === 'running' && !runAlive(state)) {
     state = { ...state, status: 'lost', finishedAt: new Date().toISOString(), error: 'the installer is no longer running but its exit status was not recorded (agent restarted?)' };
     writeRunState(state);

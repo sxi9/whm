@@ -262,3 +262,6 @@ tbody tr.is-selected { background: var(--primary-soft); }
 .login-card { width: 100%; max-width: 400px; background: var(--surface); border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); padding: 28px; display: flex; flex-direction: column; gap: 6px; }
 .login-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; color: var(--text-muted); }
 .login-card h1 { margin-bottom: 12px; }
+.login-external { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+.login-divider { display: flex; align-items: center; gap: 10px; color: var(--text-faint); font-size: 12px; margin: 6px 0; }
+.login-divider::before, .login-divider::after { content: ''; flex: 1; height: 1px; background: var(--border); }

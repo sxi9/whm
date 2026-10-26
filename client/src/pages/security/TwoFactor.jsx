@@ -32,6 +32,12 @@ export default function TwoFactor({ fn }) {
   return (
     <>
       <PageHeader fn={fn} />
+      {user.mustEnroll2fa && (
+        <div className="banner banner-warning" role="alert">
+          <strong>Two-factor authentication is required for your role.</strong>
+          <p>The server security policy requires it before you can use the rest of the panel. Set it up below to continue.</p>
+        </div>
+      )}
       <Card title="Your account" subtitle={`Signed in as ${user.username}`}>
         <KeyValue items={[['Status', <StatusPill key="s" status={user.totpEnabled ? 'ok' : 'warning'}>{user.totpEnabled ? 'Enabled' : 'Not enabled'}</StatusPill>]]} />
         {!user.totpEnabled && !enrollment && <FormActions><Button variant="primary" loading={busy} onClick={enroll}>Set up two-factor authentication</Button></FormActions>}

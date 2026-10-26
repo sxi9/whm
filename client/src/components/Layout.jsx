@@ -17,6 +17,9 @@ export function Layout() {
   if (!ready) return <div className="app-loading"><Loading text="Starting WHM…" /></div>;
   if (!user) return <Navigate to="/login" state={{ from: location.pathname }} replace />;
   if (user.mustChangePassword && location.pathname !== '/change-password') return <Navigate to="/change-password" replace />;
+  if (user.mustEnroll2fa && !['/security-center/two-factor-authentication', '/change-password'].includes(location.pathname)) {
+    return <Navigate to="/security-center/two-factor-authentication" replace />;
+  }
 
   return (
     <div className={`app ${collapsed ? 'sidebar-collapsed' : ''} ${mobileOpen ? 'mobile-open' : ''}`}>

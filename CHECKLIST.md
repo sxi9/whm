@@ -109,10 +109,10 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [x] Apache mod_userdir Tweak
 - [x] SMTP Restrictions
 - [x] Compiler Access
-- [~] Configure Security Policies *(Settings-backed ConfigPage (security.policy.* + 2FA keys) and ctx.security.policy()/GET /security/policy; enforcement of verified-IP login, )*
+- [x] Configure Security Policies
 - [x] cPHulk Brute Force Protection
 - [x] Host Access Control
-- [~] Manage External Authentications *(OIDC provider CRUD (client secrets AES-encrypted, redacted in audit), discovery fetch of .well-known/openid-configuration, enable/disable, l)*
+- [x] Manage External Authentications
 - [x] Manage root's SSH Keys
 - [x] Manage Wheel Group Users
 - [x] ModSecurity Configuration

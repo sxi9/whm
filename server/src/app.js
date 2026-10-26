@@ -60,6 +60,8 @@ export async function createApp(ctx) {
   app.use('/api/auth/2fa', rateLimit({ windowMs: config.loginRateLimit.windowMs, limit: config.loginRateLimit.max, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: { code: 'rate_limited', message: 'Too many attempts, please wait' } } }));
   app.use('/api', rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: 'draft-7', legacyHeaders: false, skip: (req) => req.url.includes('/stream') }));
 
+  // OIDC callbacks arrive as top-level navigations with the session cookie; the
+  // redirect target lives on the same origin, so the SPA fallback below serves it.
   app.use('/api', attachUser(ctx));
   app.use('/api', csrfProtection);
   const audit = createAudit(ctx);
