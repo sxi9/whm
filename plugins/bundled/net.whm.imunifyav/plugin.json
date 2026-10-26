@@ -1,0 +1,39 @@
+{
+  "id": "net.whm.imunifyav",
+  "name": "ImunifyAV",
+  "version": "1.0.0",
+  "description": "Malware scanner: drives the ImunifyAV CLI when it is installed and falls back to scheduled ClamAV scans of account home directories.",
+  "author": { "name": "WHM", "url": "https://trywhm.net" },
+  "license": "MIT",
+  "engines": { "whm": "^1.0.0" },
+  "main": "main.js",
+  "keywords": ["malware", "antivirus", "security"],
+  "permissions": [
+    "accounts:read", "store:own", "settings:own", "jobs", "schedule", "api:routes", "ui:sidebar", "contacts:notify", "audit:write",
+    "agent:op:sec.imunify.detect", "agent:op:sec.imunify.status", "agent:op:sec.imunify.scan", "agent:op:sec.imunify.results", "agent:op:sec.imunify.quarantine",
+    "agent:op:sec.clamav.detect", "agent:op:sec.clamav.scan"
+  ],
+  "settings": {
+    "groups": [{ "id": "schedule", "label": "Scheduled scans" }, { "id": "fallback", "label": "ClamAV fallback" }],
+    "fields": [
+      { "key": "scanCron", "type": "cron", "label": "Scan schedule", "default": "0 3 * * 0", "group": "schedule", "help": "When the fallback scan of every account home directory runs (ImunifyAV keeps its own schedule)." },
+      { "key": "notifyOnFindings", "type": "toggle", "label": "Notify contacts about findings", "default": true, "group": "schedule" },
+      { "key": "fallbackEnabled", "type": "toggle", "label": "Use ClamAV when ImunifyAV is absent", "default": true, "group": "fallback" },
+      { "key": "maxFileMb", "type": "number", "label": "Largest file to scan (MB)", "default": 25, "min": 1, "max": 4000, "integer": true, "group": "fallback" }
+    ]
+  },
+  "jobs": {
+    "clamscan": { "label": "ClamAV scan", "description": "Scan account home directories with clamscan.", "timeoutSec": 21600, "cancellable": true }
+  },
+  "cron": [
+    { "name": "scheduled-scan", "job": "clamscan", "schedule": "setting:scanCron" }
+  ],
+  "ui": {
+    "pages": [
+      { "route": "/settings", "title": "ImunifyAV settings", "kind": "settings", "description": "Scan schedule and ClamAV fallback." },
+      { "route": "/findings", "title": "Malware findings", "kind": "table", "source": "/findings", "description": "Infected files recorded by scans on this server.", "columns": [
+        { "key": "at", "label": "Found" }, { "key": "scanner", "label": "Scanner" }, { "key": "username", "label": "Account" }, { "key": "file", "label": "File" }, { "key": "signature", "label": "Signature" }
+      ] }
+    ]
+  }
+}

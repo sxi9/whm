@@ -6,7 +6,9 @@ import { useApi } from '../../../hooks/useApi.js';
 import { usePluginNav } from '../../../hooks/usePluginNav.js';
 import { PageHeader, Card, StatusPill, Loading, KeyValue, EmptyState, formatDate } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
-import { Button, Toggle, TextInput, Field, ErrorBanner } from '../../../components/Form.jsx';
+import { Button, Toggle, TextInput, Field, ErrorBanner, FormActions } from '../../../components/Form.jsx';
+import { PluginFields, fieldDefault } from '../../plugins/PluginPage.jsx';
+import { describePermission } from '../../cpanel/pluginPermissions.js';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 
@@ -95,6 +97,36 @@ function InstallCard({ onInstalled }) {
   );
 }
 
+// The plugin's own settings (manifest `settings`), edited through the manage
+// endpoints: GET/PUT /plugins/manage/:id/settings. Password values come back
+// masked and stay untouched unless retyped.
+function PluginSettingsForm({ id, settings }) {
+  const toast = useToast();
+  const [values, setValues] = useState(() => Object.fromEntries(settings.fields.map((f) => [f.key, settings.values?.[f.key] ?? fieldDefault(f)])));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState(null);
+  const save = async (e) => {
+    e.preventDefault();
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await api.put(`/plugins/manage/${id}/settings`, values);
+      setValues((v) => ({ ...v, ...res.data }));
+      toast.success('Plugin settings saved');
+    } catch (err) { setError(err); } finally { setSaving(false); }
+  };
+  return (
+    <>
+      <h3>Settings</h3>
+      <form onSubmit={save}>
+        <PluginFields fields={settings.fields} groups={settings.groups || []} values={values} onChange={(k, v) => setValues((s) => ({ ...s, [k]: v }))} errors={error?.fields} />
+        <ErrorBanner error={error && !error.fields ? error : null} />
+        <FormActions><Button type="submit" variant="primary" loading={saving}>Save settings</Button></FormActions>
+      </form>
+    </>
+  );
+}
+
 function PluginDetail({ id, onClose }) {
   const { data, loading, error, refetch } = useApi(`/plugins/manage/${id}`);
   if (loading && !data) return <Card title={id}><Loading /></Card>;
@@ -117,12 +149,22 @@ function PluginDetail({ id, onClose }) {
       <h3>Permissions</h3>
       <p className="muted small">Declared in plugin.json. Checked on every ctx call and recorded below, but an in-process plugin could bypass them: treat the list as a statement of intent from code you trust.</p>
       {data.permissions.length === 0 ? <p className="muted">None declared.</p> : (
-        <ul>
-          {data.permissions.map((p) => (
-            <li key={p}><code>{p}</code>{data.permissionsUsed.includes(p) ? <span className="pill pill-ok" style={{ marginLeft: 8 }}>used</span> : null}</li>
-          ))}
+        <ul className="permission-list">
+          {data.permissions.map((p) => {
+            const d = describePermission(p);
+            return (
+              <li key={p}>
+                <code>{p}</code>
+                {data.permissionsUsed.includes(p) ? <span className="pill pill-ok" style={{ marginLeft: 8 }}>used</span> : null}
+                {d.sensitive ? <span className="pill pill-warn" style={{ marginLeft: 8 }}>reaches outside the plugin</span> : null}
+                <div className="muted small">{d.text}</div>
+              </li>
+            );
+          })}
         </ul>
       )}
+
+      {data.settings?.fields?.length > 0 && <PluginSettingsForm id={data.id} settings={data.settings} />}
       {data.permissionDenials.length > 0 && (
         <div className="banner banner-warning">
           <AlertTriangle size={18} />

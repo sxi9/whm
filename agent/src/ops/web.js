@@ -1385,3 +1385,270 @@ defineOp('web.exim.include.remove', {
 });
 
 export { ROLES as SERVICE_ROLES, LOGROTATE_DIR, ensureRootLogDir };
+
+// ------------------------------------------------------------- WordPress ---
+// Used by the bundled WP Toolkit plugin. Every WP-CLI command runs as the
+// account user through runuser (never as root), inside a directory that sits
+// under that user's home from /etc/passwd. Passwords travel over WP-CLI's
+// --prompt stdin mechanism, never as argv.
+
+const WP_TIMEOUT_MS = 300_000;
+const WP_SKIP_DIRS = new Set(['node_modules', '.git', '.cache', 'cache', 'wp-includes', 'wp-admin', 'wp-content', 'vendor', '.trash', 'tmp']);
+const wpName = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,99}$/, 'Plugin/theme slug');
+const wpUser = z.string().regex(/^[a-z0-9][a-z0-9._@-]{0,59}$/i, 'WordPress user name');
+const wpUrl = z.string().max(300).regex(/^https?:\/\/[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*(:\d{2,5})?(\/[A-Za-z0-9._~\-/]*)?$/i, 'http(s) site URL');
+const wpTitle = z.string().min(1).max(120).regex(/^[^\0\r\n]+$/, 'Single-line title');
+const wpSecret = z.string().min(8).max(128).regex(/^[^\0\r\n]+$/);
+const wpLocale = z.string().regex(/^[a-z]{2,3}(_[A-Z]{2})?(_[a-z]+)?$/).default('en_US');
+const wpSiteArgs = { username: arg.username, path: arg.absPath };
+
+export function passwdHome(username) {
+  const line = (readText('/etc/passwd') || '').split('\n').find((l) => l.startsWith(`${username}:`));
+  if (!line) throw new OpError('not_found', `Unknown user "${username}"`);
+  const home = line.split(':')[5];
+  if (!home || !path.isAbsolute(home)) throw new OpError('not_found', `User "${username}" has no home directory`);
+  return home;
+}
+
+// A site directory must resolve (symlinks included) under the account's home,
+// so a crafted path or a planted link never makes root touch another tree.
+export function assertUnderHome(home, p) {
+  const resolved = path.resolve(p);
+  const homeResolved = path.resolve(home);
+  if (resolved !== homeResolved && !resolved.startsWith(`${homeResolved}/`)) throw new OpError('path_not_allowed', `${p} is not inside the home directory ${home}`);
+  let real = resolved;
+  try { real = fs.realpathSync(resolved); } catch { /* not created yet: check the nearest existing parent */
+    let cur = path.dirname(resolved);
+    while (!exists(cur) && cur !== '/') cur = path.dirname(cur);
+    real = path.join(fs.realpathSync(cur), path.relative(cur, resolved));
+  }
+  let realHome = homeResolved;
+  try { realHome = fs.realpathSync(homeResolved); } catch { /* keep */ }
+  if (real !== realHome && !real.startsWith(`${realHome}/`)) throw new OpError('path_not_allowed', `${p} escapes the home directory through a symbolic link`);
+  return resolved;
+}
+
+function wpSite(username, p, ctx, mode = 'read') {
+  const home = passwdHome(username);
+  ctx.assertAllowedPath(home, mode);
+  const site = assertUnderHome(home, p);
+  ctx.assertAllowedPath(site, mode);
+  return { home, site };
+}
+
+function requireWpCli() {
+  if (!hasBinary('wp')) throw new OpError('capability_missing', 'WP-CLI (wp) is not installed on this server');
+  if (!hasBinary('runuser')) throw new OpError('capability_missing', 'runuser is required to run WP-CLI as the account user');
+}
+
+async function wp(username, home, site, argv, { input, timeoutMs = WP_TIMEOUT_MS, skip = true } = {}) {
+  requireWpCli();
+  const base = ['-u', username, '--', 'wp', `--path=${site}`, '--no-color'];
+  if (skip) base.push('--skip-plugins', '--skip-themes');
+  return exec('runuser', [...base, ...argv], { input, timeoutMs, allowFailure: true, env: { HOME: home, WP_CLI_CACHE_DIR: `${home}/.wp-cli/cache`, WP_CLI_DISABLE_AUTO_CHECK_UPDATE: '1' } });
+}
+
+const lastLineOf = (r) => (r.stderr.trim().split('\n').pop() || r.stdout.trim().split('\n').pop() || 'no output').replace(/^(Error|Warning):\s*/, '');
+const jsonOf = (r) => { if (r.code !== 0) return null; const t = r.stdout.trim(); if (!t) return null; try { return JSON.parse(t.slice(t.search(/[[{]/))); } catch { return null; } };
+
+export function parseWpVersion(text) {
+  const m = /\$wp_version\s*=\s*'([^']+)'/.exec(String(text || ''));
+  return m ? m[1] : null;
+}
+
+export function parseWpConfig(text) {
+  const grab = (name) => { const m = new RegExp(`define\\(\\s*['"]${name}['"]\\s*,\\s*['"]([^'"]*)['"]`).exec(String(text || '')); return m ? m[1] : null; };
+  const prefix = /\$table_prefix\s*=\s*['"]([^'"]*)['"]/.exec(String(text || ''));
+  return { dbName: grab('DB_NAME'), dbUser: grab('DB_USER'), dbHost: grab('DB_HOST'), tablePrefix: prefix ? prefix[1] : null };
+}
+
+function findWordPress(root, maxDepth, budget, out) {
+  const walk = (dir, depth) => {
+    if (budget.dirs-- <= 0 || depth > maxDepth) return;
+    let st;
+    try { st = fs.lstatSync(dir); } catch { return; }
+    if (!st.isDirectory()) return;
+    const config = path.join(dir, 'wp-config.php');
+    if (exists(config) && exists(path.join(dir, 'wp-includes', 'version.php'))) {
+      out.push({ path: dir, version: parseWpVersion(readText(path.join(dir, 'wp-includes', 'version.php'))), ...parseWpConfig(readText(config)) });
+      return;
+    }
+    let ents = [];
+    try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      if (!e.isDirectory() || e.name.startsWith('.') || WP_SKIP_DIRS.has(e.name)) continue;
+      walk(path.join(dir, e.name), depth + 1);
+    }
+  };
+  walk(root, 0);
+}
+
+defineOp('web.wp.detect', {
+  description: 'Whether WP-CLI is installed and its version',
+  run: async () => {
+    if (!hasBinary('wp')) return { installed: false, version: null, php: hasBinary('php'), runuser: hasBinary('runuser') };
+    const r = await exec('wp', ['cli', 'version', '--no-color'], { allowFailure: true, timeoutMs: 60_000 });
+    const m = /WP-CLI\s+([0-9][0-9.]*)/.exec(r.stdout);
+    return { installed: true, version: m ? m[1] : null, php: hasBinary('php'), runuser: hasBinary('runuser') };
+  },
+});
+
+defineOp('web.wp.discover', {
+  description: 'Find WordPress installations (wp-config.php + wp-includes/version.php) under account web roots',
+  schema: z.object({ usernames: z.array(arg.username).min(1).max(500), maxDepth: z.number().int().min(0).max(4).default(3), maxDirs: z.number().int().min(100).max(50_000).default(5000) }).strict(),
+  run: async ({ usernames, maxDepth, maxDirs }, ctx) => {
+    const installs = [];
+    const missing = [];
+    for (const username of usernames) {
+      let home;
+      try { home = passwdHome(username); } catch { missing.push(username); continue; }
+      ctx.assertAllowedPath(home, 'read');
+      const found = [];
+      for (const sub of ['public_html', 'www', 'domains']) {
+        const root = path.join(home, sub);
+        if (!exists(root)) continue;
+        findWordPress(root, sub === 'domains' ? maxDepth + 2 : maxDepth, { dirs: maxDirs }, found);
+      }
+      for (const f of found) installs.push({ username, home, ...f, relative: path.relative(home, f.path) });
+    }
+    return { installs, missing };
+  },
+});
+
+defineOp('web.wp.inspect', {
+  description: 'Core version, site URL, available updates, plugins, themes, maintenance mode and administrators of one WordPress site (WP-CLI as the account user)',
+  schema: z.object(wpSiteArgs).strict(),
+  run: async ({ username, path: p }, ctx) => {
+    const { home, site } = wpSite(username, p, ctx);
+    if (!exists(path.join(site, 'wp-config.php'))) throw new OpError('not_found', `${site} does not contain a WordPress installation`);
+    const errors = {};
+    const run = async (key, argv, parse = jsonOf) => {
+      const r = await wp(username, home, site, argv);
+      if (r.code !== 0) { errors[key] = lastLineOf(r); return null; }
+      return parse(r);
+    };
+    const text = (r) => r.stdout.trim();
+    const version = await run('version', ['core', 'version'], text) || parseWpVersion(readText(path.join(site, 'wp-includes', 'version.php')));
+    const siteUrl = await run('siteUrl', ['option', 'get', 'siteurl'], text);
+    const coreUpdates = (await run('coreUpdates', ['core', 'check-update', '--format=json'])) || [];
+    const plugins = (await run('plugins', ['plugin', 'list', '--format=json', '--fields=name,status,version,update,update_version'])) || [];
+    const themes = (await run('themes', ['theme', 'list', '--format=json', '--fields=name,status,version,update,update_version'])) || [];
+    const maintenance = await run('maintenance', ['maintenance-mode', 'status'], (r) => /is active/i.test(r.stdout));
+    const admins = (await run('admins', ['user', 'list', '--role=administrator', '--format=json', '--fields=ID,user_login,user_email'])) || [];
+    return {
+      username, path: site, version, siteUrl, coreUpdates: Array.isArray(coreUpdates) ? coreUpdates : [], plugins: Array.isArray(plugins) ? plugins : [], themes: Array.isArray(themes) ? themes : [],
+      maintenance: maintenance === null ? null : Boolean(maintenance), admins: Array.isArray(admins) ? admins : [], errors, inspectedAt: Date.now(),
+    };
+  },
+});
+
+defineOp('web.wp.update', {
+  description: 'Update WordPress core, one plugin/theme or all of them (WP-CLI as the account user)',
+  timeoutMs: 1_800_000,
+  schema: z.object({ ...wpSiteArgs, kind: z.enum(['core', 'plugin', 'theme']), name: wpName.optional(), all: z.boolean().default(false) }).strict()
+    .refine((v) => v.kind === 'core' || v.name || v.all, 'name or all is required for plugin/theme updates'),
+  run: async ({ username, path: p, kind, name, all }, ctx) => {
+    const { home, site } = wpSite(username, p, ctx, 'write');
+    const argv = kind === 'core' ? ['core', 'update'] : [kind, 'update', ...(all ? ['--all'] : [name])];
+    const r = await wp(username, home, site, argv, { timeoutMs: 1_500_000, skip: kind === 'core' });
+    if (r.code !== 0) throw new OpError('command_failed', `wp ${argv.join(' ')} failed: ${lastLineOf(r)}`, { output: r.stdout.slice(-4000), stderr: r.stderr.slice(-2000) });
+    const db = kind === 'core' ? await wp(username, home, site, ['core', 'update-db']) : null;
+    return { kind, name: name ?? null, all, output: r.stdout.trim().slice(-4000), databaseUpdated: db ? db.code === 0 : null };
+  },
+});
+
+defineOp('web.wp.maintenance', {
+  description: 'Activate or deactivate WordPress maintenance mode',
+  schema: z.object({ ...wpSiteArgs, enabled: z.boolean() }).strict(),
+  run: async ({ username, path: p, enabled }, ctx) => {
+    const { home, site } = wpSite(username, p, ctx, 'write');
+    const r = await wp(username, home, site, ['maintenance-mode', enabled ? 'activate' : 'deactivate']);
+    if (r.code !== 0 && !/already/i.test(r.stderr + r.stdout)) throw new OpError('command_failed', `maintenance mode could not be ${enabled ? 'activated' : 'deactivated'}: ${lastLineOf(r)}`);
+    return { enabled };
+  },
+});
+
+export const WP_HARDENING_FIXES = ['config-perms', 'disallow-file-edit', 'debug-off', 'auto-update-core'];
+
+defineOp('web.wp.harden', {
+  description: 'Hardening checks for one WordPress site (config permissions, file editor, debug mode, admin user name, table prefix, core updates)',
+  schema: z.object(wpSiteArgs).strict(),
+  run: async ({ username, path: p }, ctx) => {
+    const { home, site } = wpSite(username, p, ctx);
+    const config = path.join(site, 'wp-config.php');
+    if (!exists(config)) throw new OpError('not_found', `${site} does not contain a WordPress installation`);
+    const checks = [];
+    const mode = fs.statSync(config).mode & 0o777;
+    checks.push({ id: 'config-perms', label: 'wp-config.php is private', ok: (mode & 0o077) === 0, detail: `mode ${mode.toString(8).padStart(4, '0')}`, fix: 'config-perms' });
+    const get = async (name) => { const r = await wp(username, home, site, ['config', 'get', name]); return r.code === 0 ? r.stdout.trim() : null; };
+    const truthy = (v) => v != null && /^(1|true|on)$/i.test(v);
+    const fileEdit = await get('DISALLOW_FILE_EDIT');
+    checks.push({ id: 'disallow-file-edit', label: 'Theme and plugin editor disabled (DISALLOW_FILE_EDIT)', ok: truthy(fileEdit), detail: fileEdit ?? 'not set', fix: 'disallow-file-edit' });
+    const debug = await get('WP_DEBUG');
+    checks.push({ id: 'debug-off', label: 'Debug mode off (WP_DEBUG)', ok: !truthy(debug), detail: debug ?? 'not set', fix: 'debug-off' });
+    const auto = await get('WP_AUTO_UPDATE_CORE');
+    checks.push({ id: 'auto-update-core', label: 'Automatic core updates enabled', ok: auto == null || truthy(auto) || /minor/i.test(auto), detail: auto ?? 'default (minor)', fix: 'auto-update-core' });
+    const prefix = parseWpConfig(readText(config)).tablePrefix;
+    checks.push({ id: 'table-prefix', label: 'Non-default table prefix', ok: prefix != null && prefix !== 'wp_', detail: prefix ?? 'unknown', fix: null });
+    const admins = await wp(username, home, site, ['user', 'list', '--role=administrator', '--format=json', '--fields=user_login']);
+    const logins = (jsonOf(admins) || []).map((u) => String(u.user_login).toLowerCase());
+    checks.push({ id: 'admin-name', label: 'No administrator named "admin"', ok: admins.code !== 0 ? null : !logins.includes('admin'), detail: admins.code !== 0 ? lastLineOf(admins) : logins.join(', ') || 'none', fix: null });
+    const updates = await wp(username, home, site, ['core', 'check-update', '--format=json']);
+    const pending = jsonOf(updates);
+    checks.push({ id: 'core-current', label: 'WordPress core is up to date', ok: updates.code !== 0 ? null : !(Array.isArray(pending) && pending.length), detail: updates.code !== 0 ? lastLineOf(updates) : Array.isArray(pending) && pending.length ? `${pending[0].version} available` : 'current', fix: null });
+    const score = checks.filter((c) => c.ok === true).length;
+    return { username, path: site, checks, score, total: checks.length };
+  },
+});
+
+defineOp('web.wp.hardenfix', {
+  description: 'Apply hardening fixes: private wp-config.php, DISALLOW_FILE_EDIT, WP_DEBUG off, automatic core updates',
+  schema: z.object({ ...wpSiteArgs, fixes: z.array(z.enum(WP_HARDENING_FIXES)).min(1).max(WP_HARDENING_FIXES.length) }).strict(),
+  run: async ({ username, path: p, fixes }, ctx) => {
+    const { home, site } = wpSite(username, p, ctx, 'write');
+    const config = path.join(site, 'wp-config.php');
+    if (!exists(config) || fs.lstatSync(config).isSymbolicLink()) throw new OpError('not_found', `${site} does not contain a WordPress installation`);
+    const applied = [];
+    const failed = {};
+    const set = async (id, name, value) => {
+      const r = await wp(username, home, site, ['config', 'set', name, value, '--raw', '--type=constant']);
+      if (r.code === 0) applied.push(id); else failed[id] = lastLineOf(r);
+    };
+    for (const fix of fixes) {
+      if (fix === 'config-perms') { fs.chmodSync(config, 0o600); applied.push(fix); }
+      else if (fix === 'disallow-file-edit') await set(fix, 'DISALLOW_FILE_EDIT', 'true');
+      else if (fix === 'debug-off') await set(fix, 'WP_DEBUG', 'false');
+      else if (fix === 'auto-update-core') await set(fix, 'WP_AUTO_UPDATE_CORE', 'true');
+    }
+    return { applied, failed };
+  },
+});
+
+defineOp('web.wp.install', {
+  description: 'Download WordPress, write wp-config.php and run the installer as the account user (database credentials via stdin)',
+  timeoutMs: 1_800_000,
+  schema: z.object({
+    ...wpSiteArgs, url: wpUrl, title: wpTitle, adminUser: wpUser, adminEmail: z.string().email().max(254), adminPassword: wpSecret,
+    dbName: z.string().regex(/^[A-Za-z0-9_]{1,64}$/), dbUser: z.string().regex(/^[A-Za-z0-9_]{1,80}$/), dbPassword: wpSecret, dbHost: arg.mysqlHost.default('localhost'), tablePrefix: z.string().regex(/^[a-z0-9_]{1,20}_$/).default('wp_'), locale: wpLocale,
+  }).strict(),
+  run: async ({ username, path: p, url, title, adminUser, adminEmail, adminPassword, dbName, dbUser, dbPassword, dbHost, tablePrefix, locale }, ctx) => {
+    const { home, site } = wpSite(username, p, ctx, 'write');
+    requireWpCli();
+    if (exists(path.join(site, 'wp-config.php'))) throw new OpError('exists', `${site} already contains a WordPress installation`);
+    const mk = await exec('runuser', ['-u', username, '--', 'mkdir', '-p', '--', site], { allowFailure: true, env: { HOME: home } });
+    if (mk.code !== 0) throw new OpError('command_failed', `could not create ${site} as ${username}: ${lastLineOf(mk)}`);
+    const steps = [];
+    const dl = await wp(username, home, site, ['core', 'download', `--locale=${locale}`, '--skip-content'], { timeoutMs: 900_000, skip: false });
+    if (dl.code !== 0 && !/already present/i.test(dl.stderr)) throw new OpError('command_failed', `wp core download failed: ${lastLineOf(dl)}`, { step: 'download' });
+    steps.push('download');
+    const cfg = await wp(username, home, site, ['config', 'create', `--dbname=${dbName}`, `--dbuser=${dbUser}`, `--dbhost=${dbHost}`, `--dbprefix=${tablePrefix}`, `--locale=${locale}`, '--prompt=dbpass', '--skip-check'], { input: `${dbPassword}\n`, skip: false });
+    if (cfg.code !== 0) throw new OpError('command_failed', `wp config create failed: ${lastLineOf(cfg)}`, { step: 'config' });
+    steps.push('config');
+    const ins = await wp(username, home, site, ['core', 'install', `--url=${url}`, `--title=${title}`, `--admin_user=${adminUser}`, `--admin_email=${adminEmail}`, '--prompt=admin_password', '--skip-email'], { input: `${adminPassword}\n`, timeoutMs: 600_000, skip: false });
+    if (ins.code !== 0) throw new OpError('command_failed', `wp core install failed: ${lastLineOf(ins)}`, { step: 'install' });
+    steps.push('install');
+    try { fs.chmodSync(path.join(site, 'wp-config.php'), 0o600); } catch { /* best effort */ }
+    const v = await wp(username, home, site, ['core', 'version']);
+    return { path: site, url, version: v.code === 0 ? v.stdout.trim() : null, steps };
+  },
+});

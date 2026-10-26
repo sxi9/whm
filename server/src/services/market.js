@@ -4,7 +4,7 @@ import { isRoot } from '../middleware/rbac.js';
 import { ADAPTERS, CREATABLE_ADAPTERS, adapterCatalog, normalizeProducts, safeRequest } from './market-adapters.js';
 
 // Market providers. Attached as ctx.market; other categories may call:
-//   market.enabledProviders(type)   -> enabled rows of a type ('ssl' | 'plugin'), no secrets
+//   market.enabledProviders(type)   -> enabled rows of a type ('ssl' | 'plugin') with base prices, no secrets
 //   market.credentials(name)        -> decrypted adapter config for a provider (services only)
 //   market.hub()                    -> { enabled, url, licenseKey } of the plugin marketplace hub
 //   market.sslProviders()           -> the list SSL/TLS reads from the market.providers setting
@@ -60,7 +60,10 @@ export function createMarketService(ctx) {
     return fields;
   }
 
-  function shape(row, { forRoot = false, orders = null } = {}) {
+  // Resellers only ever see the resale price: vendor prices, the commission,
+  // config field names and test results are the operator's business.
+  // `wholesale` keeps the economics for other services without exposing config.
+  function shape(row, { forRoot = false, wholesale = forRoot, orders = null } = {}) {
     const a = adapterOf(row);
     const config = readConfig(row);
     const visible = {};
@@ -69,22 +72,25 @@ export function createMarketService(ctx) {
       if (f.secret) { visible[f.key] = null; if (config[f.key]) secretsSet.push(f.key); } else visible[f.key] = config[f.key] ?? null;
     }
     const missing = missingForEnable(row, config);
+    const resale = (p) => ({ id: p.id, name: p.name, price: resalePrice(p.price, row.commission_percent), currency: p.currency, termMonths: p.termMonths, wildcard: p.wildcard });
     return {
       name: row.name, displayName: row.display_name, type: row.type, adapter: row.adapter, adapterLabel: a.label,
       builtin: Boolean(row.builtin), readOnly: false, enabled: Boolean(row.enabled), url: row.url || null,
-      commissionPercent: Number(row.commission_percent) || 0,
-      products: products(row).map((p) => ({ ...p, basePrice: p.price, price: resalePrice(p.price, row.commission_percent) })),
+      ...(wholesale ? { commissionPercent: Number(row.commission_percent) || 0 } : {}),
+      products: products(row).map((p) => (wholesale ? { ...resale(p), basePrice: p.price } : resale(p))),
       hasProducts: typeof a.listProducts === 'function',
-      configured: Object.keys(missing).length === 0, missing: Object.keys(missing),
-      ...(forRoot ? { config: visible, secretsSet } : {}),
-      lastTest: row.last_test_at ? { at: row.last_test_at, ok: row.last_test_ok == null ? null : Boolean(row.last_test_ok), message: row.last_test_message } : null,
+      configured: Object.keys(missing).length === 0,
+      ...(forRoot ? {
+        missing: Object.keys(missing), config: visible, secretsSet,
+        lastTest: row.last_test_at ? { at: row.last_test_at, ok: row.last_test_ok == null ? null : Boolean(row.last_test_ok), message: row.last_test_message } : null,
+      } : {}),
       orders: orders == null ? null : orders[row.name] || 0,
       createdAt: row.created_at, updatedAt: row.updated_at,
     };
   }
 
   // The ACME clients AutoSSL can drive, reflected read-only from SSL/TLS.
-  async function acmeRows() {
+  async function acmeRows({ forRoot = false } = {}) {
     const ssl = ctx.ssl?.autossl;
     if (!ssl?.settings || !ssl.detect) return [];
     let current = 'disabled';
@@ -94,8 +100,9 @@ export function createMarketService(ctx) {
     return ACME_CLIENTS.map((c) => ({
       name: c.name, displayName: c.displayName, type: 'ssl', adapter: 'acme', adapterLabel: ADAPTERS.acme.label,
       builtin: true, readOnly: true, enabled: current === c.name, installed: installed.includes(c.name), url: null,
-      commissionPercent: 0, products: ACME_PRODUCTS, hasProducts: false, configured: installed.includes(c.name), missing: installed.includes(c.name) ? [] : ['installed'],
-      manageAt: MANAGE_AUTOSSL, lastTest: null, orders: null, createdAt: null, updatedAt: null,
+      ...(forRoot ? { commissionPercent: 0, missing: installed.includes(c.name) ? [] : ['installed'], lastTest: null } : {}),
+      products: ACME_PRODUCTS, hasProducts: false, configured: installed.includes(c.name),
+      manageAt: MANAGE_AUTOSSL, orders: null, createdAt: null, updatedAt: null,
     }));
   }
 
@@ -145,13 +152,13 @@ export function createMarketService(ctx) {
       const forRoot = isRoot(user);
       const orders = forRoot ? orderCounts() : null;
       const stored = stmts.all.all().map((r) => shape(r, { forRoot, orders }));
-      const all = [...stored, ...(await acmeRows())];
+      const all = [...stored, ...(await acmeRows({ forRoot }))];
       return all.filter((p) => !type || p.type === type);
     },
 
     async get(name, user) {
       if (isAcmeName(name)) {
-        const found = (await acmeRows()).find((p) => p.name === name);
+        const found = (await acmeRows({ forRoot: isRoot(user) })).find((p) => p.name === name);
         if (!found) throw notFound(`Provider "${name}"`);
         return found;
       }
@@ -233,7 +240,7 @@ export function createMarketService(ctx) {
 
     async test(name, req) {
       if (isAcmeName(name)) {
-        const found = (await acmeRows()).find((p) => p.name === name);
+        const found = (await acmeRows({ forRoot: true })).find((p) => p.name === name);
         if (!found) throw new CapabilityError('acme', `${name} is not available: the SSL/TLS category is not loaded`);
         if (!found.installed) throw new CapabilityError('acme', `${name} is not installed on this server. Install certbot (python3-certbot) or acme.sh, then select it under Manage AutoSSL.`);
         const result = { ok: true, message: `${name} is installed${found.enabled ? ' and selected as the AutoSSL provider' : '; select it under Manage AutoSSL to use it'}` };
@@ -284,7 +291,7 @@ export function createMarketService(ctx) {
     // ---- integration surface for other categories ------------------------------
     sslProviders,
     syncSettings,
-    enabledProviders(type) { return stmts.all.all().filter((r) => r.enabled && (!type || r.type === type)).map((r) => shape(r)); },
+    enabledProviders(type) { return stmts.all.all().filter((r) => r.enabled && (!type || r.type === type)).map((r) => shape(r, { wholesale: true })); },
     credentials(name) { const r = stmts.byName.get(name); return r ? readConfig(r) : null; },
     hub() {
       const r = stmts.byName.get(HUB_NAME);

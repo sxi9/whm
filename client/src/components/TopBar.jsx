@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Search, Bell, ChevronDown, LogOut, KeyRound, ShieldCheck, ScrollText, Menu } from 'lucide-react';
+import { Search, Bell, ChevronDown, LogOut, KeyRound, ShieldCheck, ScrollText, Menu, LifeBuoy } from 'lucide-react';
 import { useAuth } from '../auth/AuthContext.jsx';
 import { useSearch } from '../hooks/usePluginNav.js';
+import { useBranding, logoSrc } from '../pages/cpanel/branding.js';
 
 export function TopBar({ onMenu }) {
   const { user, hostname, logout } = useAuth();
+  const branding = useBranding();
+  const logo = logoSrc(branding);
   const navigate = useNavigate();
   const [q, setQ] = useState('');
   const [openMenu, setOpenMenu] = useState(false);
@@ -27,9 +30,9 @@ export function TopBar({ onMenu }) {
   return (
     <header className="topbar">
       <button className="icon-button topbar-menu" onClick={onMenu} aria-label="Toggle navigation"><Menu size={20} /></button>
-      <Link to="/" className="brand" aria-label="WHM home">
-        <span className="brand-mark">WHM</span>
-        <span className="brand-sub">WebHost Manager</span>
+      <Link to="/" className="brand" aria-label={`${branding.companyName} home`}>
+        {logo ? <img src={logo} alt={branding.companyName} style={{ height: 28, maxWidth: 160, objectFit: 'contain', alignSelf: 'center' }} /> : <span className="brand-mark">{branding.companyName === 'WHM' ? 'WHM' : branding.companyName}</span>}
+        <span className="brand-sub">{branding.tagline}</span>
       </Link>
       <div className="topbar-search" role="search">
         <Search size={16} />
@@ -65,6 +68,9 @@ export function TopBar({ onMenu }) {
               <div className="menu-meta"><strong>{user?.username}</strong><small>{user?.role}</small></div>
               <Link className="menu-item" to="/change-password" onClick={() => setOpenMenu(false)}><KeyRound size={14} /> Change password</Link>
               <Link className="menu-item" to="/security-center/two-factor-authentication" onClick={() => setOpenMenu(false)}><ShieldCheck size={14} /> Two-factor authentication</Link>
+              {[['Help', branding.helpUrl], ['Documentation', branding.docsUrl], ['Support', branding.supportUrl]].filter(([, url]) => url).map(([label, url]) => (
+                <a key={label} className="menu-item" href={url} target="_blank" rel="noopener noreferrer"><LifeBuoy size={14} /> {label}</a>
+              ))}
               <button className="menu-item" onClick={() => logout().then(() => navigate('/login'))}><LogOut size={14} /> Log out</button>
             </div>
           )}

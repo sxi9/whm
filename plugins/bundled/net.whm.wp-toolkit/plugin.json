@@ -1,0 +1,34 @@
+{
+  "id": "net.whm.wp-toolkit",
+  "name": "WP Toolkit",
+  "version": "1.0.0",
+  "description": "Discovers WordPress sites under account web roots and manages them with WP-CLI: versions, plugin and theme updates, maintenance mode and hardening checks.",
+  "author": { "name": "WHM", "url": "https://trywhm.net" },
+  "license": "MIT",
+  "engines": { "whm": "^1.0.0" },
+  "main": "main.js",
+  "keywords": ["wordpress", "wp-cli", "updates"],
+  "permissions": [
+    "accounts:read", "store:own", "settings:own", "jobs", "schedule", "api:routes", "ui:sidebar", "audit:write",
+    "agent:op:web.wp.detect", "agent:op:web.wp.discover", "agent:op:web.wp.inspect", "agent:op:web.wp.update", "agent:op:web.wp.maintenance", "agent:op:web.wp.harden", "agent:op:web.wp.hardenfix"
+  ],
+  "settings": {
+    "fields": [
+      { "key": "discoverCron", "type": "cron", "label": "Discovery schedule", "default": "0 */6 * * *", "help": "How often account web roots are searched for new WordPress sites." },
+      { "key": "maxDepth", "type": "number", "label": "Search depth below public_html", "default": 3, "min": 0, "max": 4, "integer": true }
+    ]
+  },
+  "jobs": {
+    "discover": { "label": "Discover WordPress sites", "description": "Search every account web root for wp-config.php.", "timeoutSec": 1800, "cancellable": true },
+    "update": { "label": "Update a WordPress site", "description": "Core, plugin or theme update through WP-CLI.", "timeoutSec": 1800, "cancellable": false }
+  },
+  "cron": [
+    { "name": "discover", "job": "discover", "schedule": "setting:discoverCron" }
+  ],
+  "ui": {
+    "pages": [
+      { "route": "/settings", "title": "WP Toolkit settings", "kind": "settings", "description": "Discovery schedule and search depth." },
+      { "route": "/discover", "title": "Discover sites now", "kind": "action", "job": "discover", "description": "Search every account web root for WordPress installations." }
+    ]
+  }
+}

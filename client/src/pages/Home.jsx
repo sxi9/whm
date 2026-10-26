@@ -9,6 +9,7 @@ import { useMergedCategories, useSearch } from '../hooks/usePluginNav.js';
 import { useFavorites } from '../hooks/useFavorites.js';
 import { Card, KeyValue, StatusPill, Loading, formatBytes, formatDuration } from '../components/Common.jsx';
 import { ErrorBanner } from '../components/Form.jsx';
+import { NewsBanner } from './cpanel/NewsBanner.jsx';
 
 export function HomePage() {
   const { user } = useAuth();
@@ -26,6 +27,7 @@ export function HomePage() {
   return (
     <div className="home">
       <div className="home-main">
+        <NewsBanner />
         <Card title="Favorites" subtitle={favoriteFns.length ? 'Your pinned tools' : 'Click the star on any tool to pin it here.'}>
           {favoriteFns.length > 0 && (
             <div className="tool-grid">

@@ -5,10 +5,13 @@ import { TopBar } from './TopBar.jsx';
 import { Sidebar } from './Sidebar.jsx';
 import { Loading } from './Common.jsx';
 import { PluginNavProvider } from '../hooks/usePluginNav.js';
+import { useBranding, useBrandingLoader } from '../pages/cpanel/branding.js';
 
 export function Layout() {
   const { user, ready } = useAuth();
   const location = useLocation();
+  const branding = useBranding();
+  useBrandingLoader(user?.id ?? null);
   const [collapsed, setCollapsed] = useState(() => localStorage.getItem('whm.sidebar.collapsed') === '1');
   const [mobileOpen, setMobileOpen] = useState(false);
 
@@ -36,7 +39,7 @@ export function Layout() {
         </main>
       </div>
       <footer className="app-footer">
-        <span>WHM · WebHost Manager</span>
+        <span>{branding.footerText || `${branding.companyName} · ${branding.tagline}`}</span>
         <span className="muted">Signed in as {user.username} ({user.role})</span>
       </footer>
     </div>

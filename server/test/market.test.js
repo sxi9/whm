@@ -78,6 +78,18 @@ describe('GET /api/market/providers', () => {
     expect(cpstore.config).toBeUndefined();
     expect(cpstore.secretsSet).toBeUndefined();
     expect(cpstore.orders).toBeNull();
+    // Wholesale economics stay with root: resellers get resale prices only.
+    for (const p of res.body.data) {
+      expect(p.commissionPercent, p.name).toBeUndefined();
+      expect(p.lastTest, p.name).toBeUndefined();
+      expect(p.missing, p.name).toBeUndefined();
+      for (const x of p.products) expect(Object.keys(x).sort()).toEqual(['currency', 'id', 'name', 'price', 'termMonths', 'wildcard']);
+    }
+    const single = await reseller.get('/api/market/providers/cpstore').expect(200);
+    expect(single.body.data.commissionPercent).toBeUndefined();
+    expect(single.body.data.products[0].basePrice).toBeUndefined();
+    expect((await reseller.get('/api/market/providers/certbot').expect(200)).body.data).toMatchObject({ readOnly: true, manageAt: '/ssl-tls/manage-autossl' });
+    expect((await reseller.get('/api/market/providers/certbot')).body.data.commissionPercent).toBeUndefined();
     expect((await plainUser.get('/api/market/providers')).status).toBe(403);
     expect((await reseller.get('/api/market/adapters')).status).toBe(403);
     const adapters = await get('/api/market/adapters').expect(200);
@@ -116,6 +128,9 @@ describe('custom providers (REST adapter)', () => {
     expect(res.body.data).toMatchObject({ name: 'vendor', enabled: false, configured: false, missing: ['apiBase', 'apiKey'], commissionPercent: 10, hasProducts: true });
     expect(res.body.data.products[0]).toMatchObject({ id: 'dv', basePrice: 9.99, price: 10.99 });
     expect(sslSetting().find((p) => p.name === 'vendor').products[0].price).toBe(10.99);
+    const asReseller = (await reseller.get('/api/market/providers/vendor').expect(200)).body.data;
+    expect(asReseller.products[0]).toEqual({ id: 'dv', name: 'DV 1 year', price: 10.99, currency: 'USD', termMonths: 12, wildcard: false });
+    expect(asReseller.commissionPercent).toBeUndefined();
     expect(auditCount('market.provider.create')).toBe(1);
   });
   it('refuses to enable before it is configured', async () => {

@@ -126,7 +126,7 @@ defineOp('cpanel.upgrade.extract', {
     if (!fs.existsSync(src)) throw new OpError('not_found', `${src} does not exist`);
     fs.rmSync(dest, { recursive: true, force: true });
     fs.mkdirSync(dest, { recursive: true, mode: 0o755 });
-    await exec('tar', ['--no-absolute-names', '--no-same-owner', '-xzf', src, '-C', dest], { timeoutMs: 10 * 60 * 1000 });
+    await exec('tar', ['--no-same-owner', '-xzf', src, '-C', dest], { timeoutMs: 10 * 60 * 1000 });
     const sourceDir = findReleaseRoot(dest);
     if (!sourceDir) {
       fs.rmSync(dest, { recursive: true, force: true });

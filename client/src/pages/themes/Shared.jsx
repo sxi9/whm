@@ -20,6 +20,7 @@ export function useThemes() {
     defaultSlug: themes.find((t) => t.isDefault)?.slug || res.meta?.default || 'jupiter',
     accountDefault: themes.find((t) => t.isAccountDefault)?.slug || res.meta?.accountDefault || 'jupiter',
     allowUserOverride: res.meta?.allowUserOverride !== false,
+    accountDefaultApplied: res.meta?.accountDefaultApplied ?? false,
     catalog: res.meta?.variables || {},
   };
 }

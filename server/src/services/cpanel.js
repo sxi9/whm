@@ -82,7 +82,7 @@ export function parseChangelog(markdown) {
     if (h2) {
       const title = h2[1].trim();
       const m = /^\[?(unreleased|v?\d+(?:\.\d+){0,3}(?:[.-][0-9A-Za-z.]+)?)\]?(?:\s*[-–(]\s*([0-9]{4}-[0-9]{2}-[0-9]{2})\)?)?/i.exec(title);
-      current = { version: m ? m[1].replace(/^v/, '') : title, date: m?.[2] ?? null, unreleased: !m || /^unreleased$/i.test(m[1]), title, sections: [], body: [] };
+      current = { version: m ? (/^unreleased$/i.test(m[1]) ? 'unreleased' : m[1].replace(/^v/, '')) : title, date: m?.[2] ?? null, unreleased: !m || /^unreleased$/i.test(m[1]), title, sections: [], body: [] };
       releases.push(current);
       section = null;
       continue;

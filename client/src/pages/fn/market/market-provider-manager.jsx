@@ -17,7 +17,7 @@ export default function MarketProviderManager({ fn }) {
   const navigate = useNavigate();
   const toast = useToast();
   const confirm = useConfirm();
-  const { providers, adapters, refetch } = useProviders();
+  const { providers, adapters, refetch } = useProviders({ isRoot });
   const [form, setForm] = useState({ open: false, provider: null });
   const [configuring, setConfiguring] = useState(null);
   const [testing, setTesting] = useState(null);
@@ -77,10 +77,12 @@ export default function MarketProviderManager({ fn }) {
               { key: 'adapter', label: 'Adapter', render: (p) => p.adapterLabel },
               { key: 'enabled', label: 'Status', render: (p) => <ProviderStatus p={p} /> },
               { key: 'url', label: 'URL', render: (p) => (p.url ? <a href={p.url} target="_blank" rel="noreferrer">{p.url.replace(/^https:\/\//, '')}</a> : <span className="muted">—</span>) },
-              { key: 'products', label: 'Products', render: (p) => (p.type === 'ssl' ? (p.products.length ? p.products.map((x) => `${x.name} (${money(x.price, x.currency)})`).join(' · ') : <span className="muted">none</span>) : <span className="muted">catalog from hub</span>) },
-              { key: 'commissionPercent', label: 'Commission', align: 'right', render: (p) => (p.readOnly ? '—' : `${p.commissionPercent}%`) },
-              { key: 'orders', label: 'Orders', align: 'right', render: (p) => (p.orders == null ? '—' : p.orders) },
-              { key: 'lastTest', label: 'Last test', render: (p) => <LastTest p={p} /> },
+              { key: 'products', label: isRoot ? 'Products (resale)' : 'Products', render: (p) => (p.type === 'ssl' ? (p.products.length ? p.products.map((x) => `${x.name} (${money(x.price, x.currency)})`).join(' · ') : <span className="muted">none</span>) : <span className="muted">catalog from hub</span>) },
+              ...(isRoot ? [
+                { key: 'commissionPercent', label: 'Commission', align: 'right', render: (p) => (p.readOnly ? '—' : `${p.commissionPercent}%`) },
+                { key: 'orders', label: 'Orders', align: 'right', render: (p) => (p.orders == null ? '—' : p.orders) },
+                { key: 'lastTest', label: 'Last test', render: (p) => <LastTest p={p} /> },
+              ] : []),
             ]} rowActions={(p) => (p.readOnly ? [
               { label: 'Manage AutoSSL', primary: true, onClick: () => navigate(p.manageAt) },
               isRoot && { label: testing === p.name ? 'Testing…' : 'Test', onClick: () => test(p), disabled: testing === p.name },

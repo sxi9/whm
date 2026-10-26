@@ -150,7 +150,7 @@ describe('defaults, preferences and the active theme', () => {
   });
   it('configures the panel and account defaults', async () => {
     const res = await put('/api/themes/config', { default: 'acme', accountDefault: 'high-contrast', allowUserOverride: false }).expect(200);
-    expect(res.body.data).toEqual({ default: 'acme', accountDefault: 'high-contrast', allowUserOverride: false });
+    expect(res.body.data).toEqual({ default: 'acme', accountDefault: 'high-contrast', accountDefaultApplied: false, allowUserOverride: false });
     expect(app.ctx.themes.defaultSlug()).toBe('acme');
     expect(app.ctx.themes.accountDefault()).toBe('high-contrast');
     const active = await reseller.get('/api/themes/active').expect(200);
@@ -194,7 +194,26 @@ describe('package assignment', () => {
   it('lists packages with their effective theme', async () => {
     const res = await get('/api/themes/packages').expect(200);
     expect(res.body.data.map((p) => p.name)).toEqual(['default', 'starter']);
-    expect(res.body.data[1]).toEqual({ id: expect.any(Number), name: 'starter', theme: 'jupiter', accounts: 0, themeKnown: true, effective: 'jupiter' });
+    expect(res.body.data[1]).toEqual({ id: expect.any(Number), name: 'starter', theme: 'jupiter', accounts: 0, themeKnown: true, effective: 'jupiter', owned: true });
+  });
+  it('reports whether core applies the account default to new accounts', async () => {
+    // Until packages.snapshot() routes the theme through resolveForPackage (integration-contracts §22)
+    // the account default is stored but not applied, and the API must say so.
+    expect(app.ctx.themes.accountDefaultApplied()).toBe(false);
+    expect((await get('/api/themes').expect(200)).body.meta.accountDefaultApplied).toBe(false);
+    expect(app.ctx.packages.snapshot('starter').theme).toBe('jupiter');
+    const original = app.ctx.packages.snapshot;
+    app.ctx.packages.snapshot = (name) => { const plan = original(name); return { ...plan, theme: app.ctx.themes.resolveForPackage({ theme: plan.theme }) }; };
+    try {
+      expect(app.ctx.themes.accountDefaultApplied()).toBe(true);
+      expect((await get('/api/themes').expect(200)).body.meta.accountDefaultApplied).toBe(true);
+      await app.ctx.db.prepare('UPDATE packages SET theme = ? WHERE name = ?').run('acme2', 'starter');
+      expect(app.ctx.packages.snapshot('starter').theme).toBe('jupiter');
+    } finally {
+      app.ctx.packages.snapshot = original;
+      await app.ctx.db.prepare('UPDATE packages SET theme = ? WHERE name = ?').run('jupiter', 'starter');
+    }
+    expect(app.ctx.themes.accountDefaultApplied()).toBe(false);
   });
   it('assigns a theme to a package through the packages service', async () => {
     const res = await put('/api/themes/packages/starter', { theme: 'acme' }).expect(200);
@@ -208,11 +227,17 @@ describe('package assignment', () => {
     await put('/api/themes/packages/missing', { theme: 'jupiter' }).expect(404);
     await put('/api/themes/packages/starter', { theme: '../x' }).expect(422);
   });
-  it('resellers only touch their own packages', async () => {
-    await mutate(reseller, 'put', '/api/themes/packages/starter', { theme: 'jupiter' }, resellerCsrf).expect(200);
-    await app.ctx.db.prepare('UPDATE packages SET owner_id = (SELECT id FROM users WHERE username = ?) WHERE name = ?').run('root', 'starter');
-    await mutate(reseller, 'put', '/api/themes/packages/starter', { theme: 'jupiter' }, resellerCsrf).expect(403);
-    expect((await reseller.get('/api/themes/packages').expect(200)).body.data.map((p) => p.name)).toEqual(['default']);
+  it('resellers may read shared packages but only retheme the ones they own', async () => {
+    const before = app.ctx.packages.get('starter', { role: 'root' }).theme;
+    const denied = await mutate(reseller, 'put', '/api/themes/packages/starter', { theme: 'jupiter-dark' }, resellerCsrf).expect(403);
+    expect(denied.body.error.message).toMatch(/owner/);
+    expect(app.ctx.packages.get('starter', { role: 'root' }).theme).toBe(before);
+    await mutate(reseller, 'post', '/api/packages', { name: 'resellerplan', disk_mb: 512 }, resellerCsrf).expect(201);
+    const own = await mutate(reseller, 'put', '/api/themes/packages/resellerplan', { theme: 'jupiter-dark' }, resellerCsrf).expect(200);
+    expect(own.body.data).toEqual({ name: 'resellerplan', theme: 'jupiter-dark', accounts: 0 });
+    const list = (await reseller.get('/api/themes/packages').expect(200)).body.data;
+    expect(list.map((p) => [p.name, p.owned])).toEqual([['default', false], ['resellerplan', true], ['starter', false]]);
+    await mutate(app.http, 'delete', '/api/packages/resellerplan', undefined, csrf).expect(200);
     await mutate(plainUser, 'get', '/api/themes/packages', undefined, plainCsrf).expect(403);
   });
   it('refuses to delete a theme a package still uses, then deletes once freed', async () => {

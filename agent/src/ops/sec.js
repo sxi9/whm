@@ -1325,3 +1325,209 @@ defineOp('sec.scan.filesystem', {
     return { root, scanned, worldWritable, sensitive };
   },
 });
+
+// ------------------------------------------------------- malware scanners ---
+// Used by the bundled ImunifyAV plugin: the vendor CLI when it is installed,
+// clamscan as the fallback, and nothing else. Plugin permissions can only name
+// ops whose segments are plain lowercase words, so these have no underscores.
+
+const IMUNIFY_BIN = 'imunify-antivirus';
+const IMUNIFY_TIMEOUT_MS = 120_000;
+const CLAMAV_DB_DIRS = ['/var/lib/clamav'];
+
+function parseJsonOutput(stdout) {
+  const text = String(stdout || '').trim();
+  if (!text) return null;
+  try { return JSON.parse(text); } catch { /* fall through */ }
+  const start = text.search(/[[{]/);
+  if (start === -1) return null;
+  try { return JSON.parse(text.slice(start)); } catch { return null; }
+}
+
+async function imunify(argv, { allowFailure = true } = {}) {
+  if (!hasBinary(IMUNIFY_BIN)) throw new OpError('capability_missing', 'ImunifyAV is not installed on this server (imunify-antivirus not found)');
+  const r = await exec(IMUNIFY_BIN, [...argv, '--json'], { allowFailure, timeoutMs: IMUNIFY_TIMEOUT_MS });
+  return { ...r, json: parseJsonOutput(r.stdout) };
+}
+
+export function parseImunifyVersion(stdout) {
+  const j = parseJsonOutput(stdout);
+  if (j && typeof j === 'object' && j.version) return String(j.version);
+  const m = /(\d+\.\d+(?:\.\d+)?(?:-\d+)?)/.exec(String(stdout || ''));
+  return m ? m[1] : null;
+}
+
+// Both list shapes the CLI has used: a bare array, or { items, max_count }.
+export function imunifyItems(json) {
+  if (Array.isArray(json)) return json;
+  if (json && Array.isArray(json.items)) return json.items;
+  if (json && Array.isArray(json.result)) return json.result;
+  return [];
+}
+
+export function shapeImunifyFinding(item) {
+  return {
+    id: item.id != null ? String(item.id) : null, file: item.file ?? item.filename ?? null, user: item.username ?? item.user ?? null,
+    signature: item.type ?? item.malicious_type ?? item.hash ?? null, status: item.status ?? null, detected: item.created ?? item.timestamp ?? item.detected ?? null,
+    cleaned: Boolean(item.cleaned), quarantined: /quarantin/i.test(String(item.status || '')) || Boolean(item.quarantined),
+  };
+}
+
+defineOp('sec.imunify.detect', {
+  description: 'Whether the ImunifyAV CLI is installed and which version',
+  run: async () => {
+    if (!hasBinary(IMUNIFY_BIN)) return { installed: false, version: null };
+    const r = await exec(IMUNIFY_BIN, ['version', '--json'], { allowFailure: true, timeoutMs: IMUNIFY_TIMEOUT_MS });
+    return { installed: true, version: parseImunifyVersion(r.stdout), ok: r.code === 0 };
+  },
+});
+
+defineOp('sec.imunify.status', {
+  description: 'ImunifyAV on-demand scanner status',
+  run: async () => {
+    const r = await imunify(['malware', 'on-demand', 'status']);
+    const j = r.json && typeof r.json === 'object' ? r.json : {};
+    return { ok: r.code === 0, status: j.status ?? (r.code === 0 ? 'unknown' : 'error'), path: j.path ?? null, scanned: j.scanned ?? j.total_files ?? null, infected: j.infected ?? null, started: j.started ?? j.start_time ?? null, raw: r.code === 0 ? j : r.stderr.slice(-1000) };
+  },
+});
+
+defineOp('sec.imunify.scan', {
+  description: 'Start an ImunifyAV on-demand scan of a directory',
+  schema: z.object({ path: arg.absPath.default('/home'), intensity: z.enum(['low', 'moderate', 'high']).default('moderate') }).strict(),
+  run: async ({ path: target, intensity }, ctx) => {
+    ctx.assertAllowedPath(target, 'read');
+    const r = await imunify(['malware', 'on-demand', 'start', `--path=${target}`, `--intensity-cpu=${intensity === 'low' ? '2' : intensity === 'high' ? '7' : '4'}`]);
+    if (r.code !== 0) throw new OpError('command_failed', `ImunifyAV refused to start the scan: ${r.stderr.trim().split('\n').pop() || r.stdout.trim().split('\n').pop() || 'no output'}`, { path: target });
+    return { started: true, path: target, result: r.json ?? null };
+  },
+});
+
+defineOp('sec.imunify.results', {
+  description: 'Malicious files ImunifyAV has found (newest first)',
+  schema: z.object({ limit: z.number().int().min(1).max(1000).default(100), username: arg.username.optional() }).strict(),
+  run: async ({ limit, username }) => {
+    const argv = ['malware', 'malicious', 'list', `--limit=${limit}`, '--order-by=created', '--order-direction=desc'];
+    if (username) argv.push(`--user=${username}`);
+    const r = await imunify(argv);
+    if (r.code !== 0) throw new OpError('command_failed', `ImunifyAV could not list findings: ${r.stderr.trim().split('\n').pop() || 'no output'}`);
+    const items = imunifyItems(r.json).map(shapeImunifyFinding);
+    return { total: r.json?.max_count ?? items.length, items };
+  },
+});
+
+defineOp('sec.imunify.quarantine', {
+  description: 'Files ImunifyAV has quarantined',
+  schema: z.object({ limit: z.number().int().min(1).max(1000).default(100) }).strict(),
+  run: async ({ limit }) => {
+    const r = await imunify(['malware', 'malicious', 'list', `--limit=${limit}`, '--order-by=created', '--order-direction=desc']);
+    if (r.code !== 0) throw new OpError('command_failed', `ImunifyAV could not list quarantined files: ${r.stderr.trim().split('\n').pop() || 'no output'}`);
+    return { items: imunifyItems(r.json).map(shapeImunifyFinding).filter((f) => f.quarantined) };
+  },
+});
+
+export function parseClamavVersion(stdout) {
+  const m = /ClamAV\s+([0-9][0-9.]*)(?:\/(\d+))?/.exec(String(stdout || ''));
+  return m ? { version: m[1], signatures: m[2] ? Number(m[2]) : null } : { version: null, signatures: null };
+}
+
+// "path: Signature FOUND" lines of `clamscan -i`; errors and summaries are kept
+// apart so a permission problem is never reported as an infection.
+export function parseClamscanOutput(stdout) {
+  const infected = [];
+  const errors = [];
+  for (const raw of String(stdout || '').split('\n')) {
+    const line = raw.trimEnd();
+    if (!line) continue;
+    let m = /^(.*): (.+) FOUND$/.exec(line);
+    if (m) { infected.push({ file: m[1], signature: m[2] }); continue; }
+    m = /^(.*): (.+) ERROR$/.exec(line);
+    if (m) errors.push({ file: m[1], error: m[2] });
+  }
+  return { infected, errors };
+}
+
+function clamavDatabaseAge() {
+  let newest = null;
+  for (const dir of CLAMAV_DB_DIRS) {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const n of names) {
+      if (!/\.(cvd|cld)$/.test(n)) continue;
+      try { const t = fs.statSync(path.join(dir, n)).mtimeMs; if (newest == null || t > newest) newest = t; } catch { /* vanished */ }
+    }
+  }
+  return newest == null ? null : Math.max(0, Math.floor((Date.now() - newest) / 1000));
+}
+
+defineOp('sec.clamav.detect', {
+  description: 'Whether clamscan/freshclam are installed, the engine version and the signature database age',
+  run: async () => {
+    if (!hasBinary('clamscan')) return { installed: false, version: null, signatures: null, freshclam: hasBinary('freshclam'), databaseAgeSec: null };
+    const r = await exec('clamscan', ['--version'], { allowFailure: true, timeoutMs: 30_000 });
+    return { installed: true, ...parseClamavVersion(r.stdout), freshclam: hasBinary('freshclam'), databaseAgeSec: clamavDatabaseAge() };
+  },
+});
+
+// Account home directories come from /etc/passwd so a caller never names an
+// arbitrary path for a Unix user; explicit paths must sit under an allowed root.
+function homeOfUser(username) {
+  const line = (readText('/etc/passwd') || '').split('\n').find((l) => l.startsWith(`${username}:`));
+  if (!line) throw new OpError('not_found', `Unknown user "${username}"`);
+  const home = line.split(':')[5];
+  if (!home || !path.isAbsolute(home)) throw new OpError('not_found', `User "${username}" has no home directory`);
+  return home;
+}
+
+defineOp('sec.clamav.scan', {
+  description: 'Scan account home directories (or explicit paths) with clamscan; reports infected files only',
+  timeoutMs: 6 * 3_600_000,
+  schema: z.object({
+    usernames: z.array(arg.username).max(500).default([]),
+    paths: z.array(arg.absPath).max(200).default([]),
+    maxFileMb: z.number().int().min(1).max(4000).default(25),
+    recursive: z.boolean().default(true),
+  }).strict().refine((v) => v.usernames.length + v.paths.length > 0, 'usernames or paths is required'),
+  run: async ({ usernames, paths, maxFileMb, recursive }, ctx) => {
+    const targets = [];
+    for (const p of paths) { ctx.assertAllowedPath(p, 'read'); if (exists(p)) targets.push(p); }
+    for (const u of usernames) {
+      const home = homeOfUser(u);
+      ctx.assertAllowedPath(home, 'read');
+      if (exists(home)) targets.push(home);
+    }
+    if (!hasBinary('clamscan')) throw new OpError('capability_missing', 'ClamAV is not installed on this server (clamscan not found)');
+    if (!targets.length) return { targets: [], infected: [], errors: [], scanned: 0, exitCode: 0 };
+    const argv = ['-i', '--no-summary', '--stdout', `--max-filesize=${maxFileMb}M`, `--max-scansize=${Math.max(maxFileMb * 4, 100)}M`, '--exclude-dir=^/home/[^/]+/\\.cache', '--exclude-dir=^/proc', '--exclude-dir=^/sys'];
+    if (recursive) argv.unshift('-r');
+    const started = Date.now();
+    const r = await exec('clamscan', [...argv, '--', ...targets], { allowFailure: true, timeoutMs: 6 * 3_600_000, maxBuffer: 64 * 1024 * 1024 });
+    const parsed = parseClamscanOutput(r.stdout);
+    if (r.code === 2 && parsed.infected.length === 0 && !parsed.errors.length) throw new OpError('command_failed', `clamscan failed: ${r.stderr.trim().split('\n').pop() || 'no error output'}`, { targets });
+    return { targets, ...parsed, exitCode: r.code, durationMs: Date.now() - started };
+  },
+});
+
+// ------------------------------------------------------ network counters ---
+
+export function parseNetDev(text) {
+  const out = [];
+  for (const raw of String(text || '').split('\n')) {
+    const m = /^\s*([^\s:]+):\s*(.*)$/.exec(raw);
+    if (!m) continue;
+    const f = m[2].trim().split(/\s+/).map(Number);
+    if (f.length < 16 || f.some((n) => !Number.isFinite(n))) continue;
+    out.push({ iface: m[1], rxBytes: f[0], rxPackets: f[1], rxErrors: f[2], rxDropped: f[3], txBytes: f[8], txPackets: f[9], txErrors: f[10], txDropped: f[11] });
+  }
+  return out;
+}
+
+defineOp('sec.netdev.read', {
+  description: 'Per-interface byte and packet counters from /proc/net/dev (for the Server Monitoring plugin)',
+  schema: z.object({ includeLoopback: z.boolean().default(false) }).strict(),
+  run: async ({ includeLoopback }) => {
+    const text = readText('/proc/net/dev');
+    if (text == null) throw new OpError('capability_missing', '/proc/net/dev is not readable on this host');
+    const interfaces = parseNetDev(text).filter((i) => includeLoopback || i.iface !== 'lo');
+    return { ts: Date.now(), interfaces };
+  },
+});

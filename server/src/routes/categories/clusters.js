@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { validate, z, fields } from '../../lib/validate.js';
 import { requireRoot, requireScope } from '../../middleware/rbac.js';
+import { forbidden } from '../../lib/errors.js';
 import { createClustersService, PEER_ROLES, GROUP_NAMES, EVENT_KINDS, PEER_HOST_RE, PUSH_JOB, PUSH_SCHEDULE, CLUSTER_SCOPE } from '../../services/clusters.js';
 
 const idParam = z.object({ id: fields.id });
@@ -41,6 +42,12 @@ export async function register(ctx) {
   const r = Router();
   const wrap = (fn, status = 200) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(status).json(d?.meta ? d : { data: d })).catch(next);
   const peerScope = requireScope(CLUSTER_SCOPE);
+  // Within this router a cluster token reaches the peer endpoints only; the
+  // management routes are for sessions and unscoped root tokens. (Outside this
+  // router the token is not confined: see TOKEN_ACCESS_NOTE.)
+  const isClusterToken = (req) => req.auth?.via === 'token' && Array.isArray(req.auth.scopes) && req.auth.scopes.length > 0 && !req.auth.scopes.includes('*') && req.auth.scopes.includes(CLUSTER_SCOPE);
+  const peersOnly = (req, _res, next) => (isClusterToken(req) ? next(forbidden('A cluster token may only use the peer endpoints (ping, dns/receive, config/export, config/receive)')) : next());
+  r.use((req, res, next) => (['/ping', '/dns/receive', '/config/export', '/config/receive'].includes(req.path) ? next() : peersOnly(req, res, next)));
 
   // Shared: peers, tokens issued for remote panels, exchange log
   r.get('/ping', requireRoot, peerScope, wrap(() => s.identity()));
@@ -69,5 +76,11 @@ export async function register(ctx) {
   r.post('/config/push', requireRoot, validate({ body: configPush }), wrap((req) => s.config.enqueuePush(req.body, req.user), 202));
   r.post('/config/pull', requireRoot, validate({ body: configPull }), wrap((req) => s.config.pull(req.body, req)));
 
-  return { path: '/clusters', router: r };
+  // The DNS module's sync job pushes zones to /api/dns/zones/import, so the
+  // "Accept zones pushed by peers" toggle is enforced in front of that route
+  // as well (the DNS module can also call ctx.clusters.dns.guardImport itself).
+  const importGuard = Router();
+  importGuard.post('/', (req, _res, next) => { try { s.dns.guardImport(req); next(); } catch (err) { next(err); } });
+
+  return [{ path: '/clusters', router: r }, { path: '/dns/zones/import', router: importGuard }];
 }

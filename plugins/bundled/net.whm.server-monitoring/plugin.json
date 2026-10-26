@@ -1,0 +1,42 @@
+{
+  "id": "net.whm.server-monitoring",
+  "name": "Server Monitoring",
+  "version": "1.0.0",
+  "description": "Samples load, memory, disk and network every minute, keeps a rolling history and raises alerts through Contact Manager when thresholds are crossed.",
+  "author": { "name": "WHM", "url": "https://trywhm.net" },
+  "license": "MIT",
+  "engines": { "whm": "^1.0.0" },
+  "main": "main.js",
+  "keywords": ["monitoring", "metrics", "alerts"],
+  "permissions": [
+    "system:read", "store:own", "settings:own", "jobs", "schedule", "api:routes", "ui:sidebar", "contacts:notify", "audit:write",
+    "agent:op:sec.netdev.read"
+  ],
+  "settings": {
+    "groups": [{ "id": "sampling", "label": "Sampling" }, { "id": "alerts", "label": "Alert thresholds" }],
+    "fields": [
+      { "key": "enabled", "type": "toggle", "label": "Collect samples", "default": true, "group": "sampling", "help": "Sample the host every minute." },
+      { "key": "retentionDays", "type": "number", "label": "Retention (days)", "default": 7, "min": 1, "max": 30, "integer": true, "group": "sampling" },
+      { "key": "netInterface", "type": "text", "label": "Network interface", "default": "", "group": "sampling", "maxLength": 15, "pattern": "^[a-zA-Z0-9._-]*$", "help": "Leave empty to sum every interface except loopback." },
+      { "key": "alertsEnabled", "type": "toggle", "label": "Send alerts", "default": true, "group": "alerts", "help": "Notify the server contacts when a threshold is crossed." },
+      { "key": "loadThreshold", "type": "number", "label": "1-minute load", "default": 4, "min": 0, "max": 1000, "group": "alerts", "help": "0 disables the check." },
+      { "key": "memThresholdPct", "type": "number", "label": "Memory used (%)", "default": 90, "min": 0, "max": 100, "integer": true, "group": "alerts" },
+      { "key": "diskThresholdPct", "type": "number", "label": "Disk used (%)", "default": 90, "min": 0, "max": 100, "integer": true, "group": "alerts" },
+      { "key": "alertCooldownMin", "type": "number", "label": "Alert cooldown (minutes)", "default": 60, "min": 1, "max": 1440, "integer": true, "group": "alerts" }
+    ]
+  },
+  "jobs": {
+    "sample": { "label": "Sample metrics", "description": "Collect one sample and evaluate the alert thresholds.", "timeoutSec": 120, "cancellable": false }
+  },
+  "cron": [
+    { "name": "sample", "job": "sample", "schedule": "* * * * *" }
+  ],
+  "ui": {
+    "pages": [
+      { "route": "/settings", "title": "Monitoring settings", "kind": "settings", "description": "Sampling, retention and alert thresholds." },
+      { "route": "/alerts", "title": "Alert history", "kind": "table", "source": "/alerts", "description": "Threshold alerts raised by Server Monitoring.", "columns": [
+        { "key": "at", "label": "Raised" }, { "key": "metric", "label": "Metric" }, { "key": "value", "label": "Value" }, { "key": "threshold", "label": "Threshold" }, { "key": "state", "label": "State" }, { "key": "resolvedAt", "label": "Resolved" }
+      ] }
+    ]
+  }
+}

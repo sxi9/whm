@@ -197,3 +197,16 @@ enforcement), the setting is the single source of truth and the schedule row fol
 generic schedules endpoint (Configure cPanel Cron Jobs) may change cron/enabled too, so
 `alignSchedule`/`syncSchedule` helpers must only write the row when the setting changed (compare
 before writing), never on every page load.
+
+## 22. Themes: account-default resolution (core-owned hook, pending)
+`ctx.themes.resolveForPackage(pkg)` returns `pkg.theme` when that theme exists and is enabled,
+otherwise the root-configured account default (`themes.account_default`). The one integration
+point is core's `packages.snapshot(name)` (`server/src/services/packages.js`), which must return
+`theme: ctx.themes?.resolveForPackage(pkg) ?? pkg.theme` so that every account created or
+re-planned from a package (`accounts.create` / `accounts.update`) snapshots a live theme.
+`createPackagesService(ctx)` already receives the full ctx; resolve lazily inside `snapshot()`
+because themes registers after packages. Until this lands, `ctx.themes.accountDefaultApplied()`
+(and `meta.accountDefaultApplied` on `GET /api/themes`) reports `false` by probing whether
+`snapshot()` reaches `resolveForPackage`, and the Theme Manager tells root the setting is stored
+but not applied. Required core follow-up: make the change and add a server test asserting an
+account created from a package whose theme is disabled snapshots the account default.

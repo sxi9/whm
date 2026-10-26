@@ -3,6 +3,8 @@ import { useLocation, useNavigate, Navigate, useSearchParams } from 'react-route
 import { useAuth } from '../auth/AuthContext.jsx';
 import { api } from '../api/client.js';
 import { Field, TextInput, Button, ErrorBanner } from '../components/Form.jsx';
+import { useBranding, logoSrc } from '../pages/cpanel/branding.js';
+import { renderMarkdown } from '../pages/plugins/PluginPage.jsx';
 
 const EXTERNAL_ERRORS = {
   external_state: 'The sign-in with your identity provider could not be verified (expired or invalid state). Please try again.',
@@ -26,6 +28,8 @@ export function LoginPage() {
     return key ? { message: [EXTERNAL_ERRORS[key] || 'Sign-in failed.', params.get('message')].filter(Boolean).join(' ') } : null;
   });
   const [loading, setLoading] = useState(false);
+  const branding = useBranding();
+  const logo = logoSrc(branding);
 
   useEffect(() => {
     api.get('/auth/external').then(({ data }) => setProviders(data.providers || [])).catch(() => setProviders([]));
@@ -55,8 +59,12 @@ export function LoginPage() {
   return (
     <div className="login-page">
       <form className="login-card" onSubmit={submit}>
-        <div className="login-brand"><span className="brand-mark">WHM</span><span>WebHost Manager</span></div>
+        <div className="login-brand">
+          {logo ? <img src={logo} alt={branding.companyName} style={{ height: 36, maxWidth: 200, objectFit: 'contain' }} /> : <span className="brand-mark">{branding.companyName === 'WHM' ? 'WHM' : branding.companyName}</span>}
+          <span>{branding.tagline}</span>
+        </div>
         <h1>{stage === 'credentials' ? 'Log in' : 'Two-factor authentication'}</h1>
+        {branding.loginNotice && <div className="banner banner-info login-notice"><div className="markdown">{renderMarkdown(branding.loginNotice)}</div></div>}
         <ErrorBanner error={error} />
         {stage === 'credentials' ? (
           <>

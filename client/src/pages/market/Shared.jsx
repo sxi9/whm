@@ -10,10 +10,11 @@ import { useToast } from '../../components/Toast.jsx';
 export const money = (p, c) => (p == null ? '—' : `${Number(p).toFixed(2)} ${c || 'USD'}`);
 export const TYPE_LABELS = { ssl: 'SSL certificates', plugin: 'Plugins' };
 
-export function useProviders() {
+// The adapter catalog is root-only; resellers get the provider list alone.
+export function useProviders({ isRoot = false } = {}) {
   const providers = useApi('/market/providers');
-  const adapters = useApi('/market/adapters');
-  return { providers, adapters, refetch: () => { providers.refetch(); adapters.refetch(); } };
+  const adapters = useApi('/market/adapters', { enabled: isRoot });
+  return { providers, adapters, refetch: () => { providers.refetch(); if (isRoot) adapters.refetch(); } };
 }
 
 export function ProviderStatus({ p }) {

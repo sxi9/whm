@@ -6,9 +6,11 @@ import { isRoot } from '../middleware/rbac.js';
 
 // Themes. Attached as ctx.themes; other categories may call:
 //   themes.defaultSlug()                 -> theme the panel shows when a user has no override
-//   themes.accountDefault()              -> theme new hosting accounts get unless their package sets one
+//   themes.accountDefault()              -> theme recorded for new hosting accounts when their package's theme is disabled/missing
 //   themes.resolve(slug)                 -> { slug, name, base, variables, css } or null
 //   themes.resolveForPackage(pkg)        -> slug for a package row ({ theme }) falling back to the account default
+//   themes.accountDefaultApplied()       -> true once core's packages.snapshot() resolves theme through resolveForPackage
+//                                           (integration-contracts §22); false while new accounts still record the package theme verbatim
 //   themes.slugs()                       -> every enabled theme slug
 //   themes.activeFor(user)               -> what the browser applies for that user
 // Uploaded CSS overrides live under $WHM_DATA_DIR/themes/<slug>.css.
@@ -151,11 +153,25 @@ export function createThemesService(ctx) {
 
   const load = (slug) => { const row = stmts.bySlug.get(slug); if (!row) throw notFound(`Theme "${slug}"`); return row; };
   const assertEditable = (row) => { if (row.builtin) throw conflict(`"${row.slug}" is a built-in theme and cannot be changed; copy it to customise`); };
-  const meta = () => ({ default: defaultSlug(), accountDefault: accountDefault(), allowUserOverride: allowUserOverride() });
+
+  // packages.snapshot() is core-owned; whether it routes the theme through resolveForPackage
+  // is observed rather than assumed, so the UI never claims the account default is applied
+  // before the hook exists. snapshot() is read-only, so probing an existing package is safe.
+  let probeHits = 0;
+  function accountDefaultApplied() {
+    if (typeof ctx.packages?.snapshot !== 'function') return false;
+    const sample = stmts.packageList.all()[0];
+    if (!sample) return null;
+    probeHits = 0;
+    try { ctx.packages.snapshot(sample.name); } catch { return false; }
+    return probeHits > 0;
+  }
+  const meta = () => ({ default: defaultSlug(), accountDefault: accountDefault(), accountDefaultApplied: accountDefaultApplied(), allowUserOverride: allowUserOverride() });
 
   const service = {
     defaultSlug,
     accountDefault,
+    accountDefaultApplied,
     allowUserOverride,
     slugs: () => stmts.all.all().filter((r) => r.enabled).map((r) => r.slug),
     catalog: () => VARIABLE_CATALOG,
@@ -165,6 +181,7 @@ export function createThemesService(ctx) {
       return { slug: row.slug, name: row.name, base: row.base, variables: json.parse(row.variables_json, {}), css: readCss(row) };
     },
     resolveForPackage(pkg) {
+      probeHits++;
       const slug = pkg?.theme;
       const row = slug ? stmts.bySlug.get(slug) : null;
       return row?.enabled ? row.slug : accountDefault();
@@ -288,13 +305,17 @@ export function createThemesService(ctx) {
     packages(user) {
       const rows = stmts.packageList.all().filter((p) => isRoot(user) || p.owner_id == null || p.owner_id === user.id);
       const known = new Set(stmts.all.all().map((r) => r.slug));
-      return rows.map((p) => ({ id: p.id, name: p.name, theme: p.theme, accounts: p.accounts, themeKnown: known.has(p.theme), effective: service.resolveForPackage(p) }));
+      return rows.map((p) => ({ id: p.id, name: p.name, theme: p.theme, accounts: p.accounts, themeKnown: known.has(p.theme), effective: service.resolveForPackage(p), owned: isRoot(user) || p.owner_id === user.id }));
     },
 
+    // Resellers see root's shared packages but may only retheme the ones they own: a shared
+    // package's theme lands in every account any reseller creates from it.
     assignPackage(name, slug, user, req) {
       const row = load(slug);
       if (!row.enabled) throw unprocessable(`Theme "${slug}" is disabled`, { theme: ['Pick an enabled theme'] });
       if (!ctx.packages) throw notFound('Package');
+      const current = ctx.packages.get(name, user);
+      if (!isRoot(user) && current.owner_id !== user.id) throw forbidden('Only the owner of a package can change its theme');
       const pkg = ctx.packages.update(name, { theme: slug }, user);
       req?.audit?.({ action: 'themes.package', target: name, args: { theme: slug } });
       return { name: pkg.name, theme: pkg.theme, accounts: pkg.accounts };
