@@ -95,6 +95,28 @@ list: `node --input-type=module -e "import {CATEGORIES} from './client/src/nav.j
 Never edit `CHECKLIST.md`, `nav.js`, `registry.js`, `routes/index.js`, `ops/index.js`,
 `app.js`, `index.js` or another category's files from a category task.
 
+### Integration contracts (binding; full text in `docs/design/integration-contracts.md`)
+- **Services on ctx:** `ctx.security`, `ctx.dns`, `ctx.databases` (never `ctx.db`, that is the
+  SQLite handle), `ctx.ip`, `ctx.ssl`, `ctx.mail`, `ctx.software` (+ alias `ctx.pkg`),
+  `ctx.web` (service-configuration: vhosts, PHP-FPM, Apache/Exim/Dovecot/FTP config),
+  `ctx.development`, `ctx.locales`, `ctx.accounts`, `ctx.packages`, `ctx.system`,
+  `ctx.serviceManager`, `ctx.auth`, `ctx.settings`, `ctx.jobs`, `ctx.scheduler`,
+  `ctx.capabilities`, `ctx.contacts` (wave 2). Reference lazily inside methods; tolerate absence.
+- **Remote service IP hooks:** `ctx.mail.setOutboundAddresses`, `ctx.dns.setOutboundAddresses`,
+  `ctx.databases.setClientAddresses` ({ ipv4, ipv6 }); ip-functions is the caller.
+- **Dovecot:** service-configuration owns `97-whm-mailserver.conf` (protocols, limits, `ssl=`,
+  min protocol, ciphers); ssl-tls writes only cert/key/ca paths in `90-whm-ssl-cert.conf`; TLS
+  presets go through `ctx.web.applyMailserverTls` / `ctx.web.applyEximTls`.
+- **Exim local RCPT ACL:** service-configuration owns the macro/include and its ACL file ends
+  with `.include_if_exists …/acl-email-filters.conf`; email writes only that file
+  (`ctx.web.ensureEximAclChain()` first). Shared layout detection: `agent/src/ops/exim-layout.js`.
+- **Migrations are immutable once committed** — add `0NNb_<slug>-<topic>.sql`, idempotent.
+- **Host first, DB second:** run the agent op, then commit the SQLite change (or compensate).
+- **Agent error → HTTP** (`middleware/error.js`): capability/binary missing 501, invalid_args 422,
+  not_found 404, exists 409, path_not_allowed/unknown_op 403, agent_unavailable/timeout 503,
+  `invalid_*`/`*_mismatch`/config_invalid/refused/acme_failed/unsupported/in_use → 422.
+- **Schedules** must not enqueue jobs that will be skipped; toggle `enabled` with the feature.
+
 ## Repository layout
 
 ```
@@ -141,6 +163,12 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 - **Next:** finish vitest suites, then fan out P2 categories (Account Information/Functions
   remainder, DNS, Database Services, Service Configuration, Server Status remainder) with
   real `web`/`dns`/`db`/`mail` agent ops; add pages to `client/src/pages/registry.js`.
+- **2026-10-26: Phase 2 wave 1 landed** (`79097b1`): Security Center, DNS Functions, Database
+  Services, IP Functions, SSL/TLS, Email, Software, Service Configuration, Development, Locales —
+  106/109 functions done, 222 new agent ops (267 total), migrations 002–012, 107 pages; suites
+  server 426 / agent 233 / client 5. A **fix round** for the reviewers' open findings and the
+  integration critic's seams is running (one fixer + verifier per category); the contracts it
+  follows are in `docs/design/integration-contracts.md`. Then wave 2.
 - **Deploy + tests:** `scripts/install.sh` (prod install, `--upgrade`), `deploy/*.service`
   + config templates, `scripts/whm-cli.js` (status / reset-password / create-admin /
   unlock-ip), `e2e/ui-check.cjs` (Playwright: login → create account → pages; run with

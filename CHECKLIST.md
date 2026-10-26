@@ -12,7 +12,8 @@
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
 - **Tests:** server 93/93, agent 42/42 passing (`npm test`). Shared API test helper: `server/test/support/app.js`.
-- **In progress:** Phase 2 wave 1 — ten categories being built in parallel by agents (Security Center, DNS Functions, Database Services, IP Functions, SSL/TLS, Email, Software, Service Configuration, Development, Locales), each with its agent op family, migration, service, routes, pages and tests, then adversarially verified. Waves 2 and 3 follow.
+- **Wave 1 landed** (`79097b1`, 2026-10-26 01:50): Security Center, DNS Functions, Database Services, IP Functions, SSL/TLS, Email, Software, Service Configuration, Development, Locales — 106/109 functions done (3 partial, noted inline), 222 new agent ops (267 total), migrations 002–012, 107 new pages; suites server 426 / agent 233 / client 5 green.
+- **In progress:** wave-1 fix round (reviewers' open findings + integration seams, per `docs/design/integration-contracts.md`). Then wave 2.
 - **Deferred to the end (user decision):** license server, plugin marketplace, plugin host, sample + automated-backup plugins (Phase 5).
 
 ## Timeline (actual + estimated)
@@ -31,15 +32,16 @@ a fix round ~15 min; most categories need one fix round.
 | P1 Shell (UI, nav for 212 functions, 29 live pages, Playwright check) | done | 20 min | 18:36 |
 | Test suites (server 93, agent 42) + fixes | done | 25 min (background) | 18:48 |
 | Convention refactor, deploy (installer, systemd, CLI, README), e2e, screenshots | done | 25 min | 19:09 |
-| **P2 wave 1** — Security Center, DNS, Databases, IP, SSL/TLS, Email, Software, Service Configuration, Development, Locales (10 categories, op families) | running since 18:47 | ~6–7 h | ~01:30 (±1.5 h) |
-| Integrate wave 1 (suites, build, e2e, screenshots, checklist, push) | pending | 30 min | ~02:00 |
-| **P2 wave 2** — Account Functions completion (vhost/DNS/mail provisioning), Account Information, Multi Account, Resellers, Backup, Transfers, Server Status, System Health, Server Configuration, Networking, Contacts, Reboot (12) | pending | ~7–8 h | ~09:30 |
-| Integrate wave 2 | pending | 30 min | ~10:00 |
-| **P2 wave 3** — Clusters, Themes, Market, cPanel, Support, Plugins (6) | pending | ~3 h | ~13:00 |
-| Integrate wave 3 → **all 212 functions live** | pending | 30 min | ~13:30 |
-| **P5 deferred** — license server (`hub/license`), plugin host + marketplace (`hub/marketplace`, open dev registration with backend verification), `plugins/SDK.md`, sample plugin, automated-backup plugin | pending | ~5 h | ~18:30 |
-| **P6** — hardening pass, full e2e on a provisioned VM, Security Advisor rules, final docs, performance | pending | ~2.5 h | ~21:00 |
-| **Total remaining** | | **~25 h wall-clock** | |
+| **P2 wave 1** — Security Center, DNS, Databases, IP, SSL/TLS, Email, Software, Service Configuration, Development, Locales (10 categories, op families) | done — 106/109 functions, 88 agent runs | 6 h 54 min | 01:41 |
+| Integrate wave 1 (suites 426/233/5 green, build, e2e, screenshots, checklist, push `79097b1`) | done | 20 min | 01:50 |
+| Wave-1 fix round (reviewers' 19 open findings + 6 integration seams; 1 fixer + 1 verifier per category, 8 categories) | running since 01:45 | ~2.5–3 h | ~04:30 |
+| **P2 wave 2** — Account Functions completion (vhost/DNS/mail provisioning), Account Information, Multi Account, Resellers, Backup, Transfers, Server Status, System Health, Server Configuration, Networking, Contacts, Reboot (12) | pending | ~7–8 h | ~12:00 |
+| Integrate wave 2 (+ its fix round) | pending | ~2.5 h | ~14:30 |
+| **P2 wave 3** — Clusters, Themes, Market, cPanel, Support, Plugins (6) | pending | ~3 h | ~17:30 |
+| Integrate wave 3 → **all 212 functions live** | pending | ~1.5 h | ~19:00 |
+| **P5 deferred** — license server (`hub/license`), plugin host + marketplace (`hub/marketplace`, open dev registration with backend verification), `plugins/SDK.md`, sample plugin, automated-backup plugin | pending | ~5 h | ~00:00 (27th) |
+| **P6** — hardening pass, full e2e on a provisioned VM, Security Advisor rules, final docs, performance | pending | ~2.5 h | ~02:30 (27th) |
+| **Total remaining** | | **~24 h wall-clock** | |
 
 Faster option: verification can be cut to one reviewer and one fix round per category
 (~30% less time, less thorough). Not applied unless requested.
@@ -103,24 +105,24 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [ ] Resolver Configuration
 
 ### 4. Security Center
-- [ ] Apache mod_userdir Tweak
-- [ ] SMTP Restrictions
-- [ ] Compiler Access
-- [ ] Configure Security Policies
-- [ ] cPHulk Brute Force Protection
-- [ ] Host Access Control
-- [ ] Manage External Authentications
-- [ ] Manage root's SSH Keys
-- [ ] Manage Wheel Group Users
-- [ ] ModSecurity Configuration
-- [ ] ModSecurity Tools
-- [ ] ModSecurity Vendors
-- [ ] Password Strength Configuration
-- [ ] Security Advisor
-- [ ] Security Questions
-- [ ] Shell Fork Bomb Protection
-- [ ] SSH Password Authorization Tweak
-- [ ] Traceroute Enable/Disable
+- [x] Apache mod_userdir Tweak
+- [x] SMTP Restrictions
+- [x] Compiler Access
+- [~] Configure Security Policies *(Settings-backed ConfigPage (security.policy.* + 2FA keys) and ctx.security.policy()/GET /security/policy; enforcement of verified-IP login, )*
+- [x] cPHulk Brute Force Protection
+- [x] Host Access Control
+- [~] Manage External Authentications *(OIDC provider CRUD (client secrets AES-encrypted, redacted in audit), discovery fetch of .well-known/openid-configuration, enable/disable, l)*
+- [x] Manage root's SSH Keys
+- [x] Manage Wheel Group Users
+- [x] ModSecurity Configuration
+- [x] ModSecurity Tools
+- [x] ModSecurity Vendors
+- [x] Password Strength Configuration
+- [x] Security Advisor
+- [x] Security Questions
+- [x] Shell Fork Bomb Protection
+- [x] SSH Password Authorization Tweak
+- [x] Traceroute Enable/Disable
 - [x] Two-Factor Authentication
 
 ### 5. Server Contacts
@@ -140,25 +142,25 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [ ] View Reseller Usage and Manage Account Status
 
 ### 7. Service Configuration
-- [ ] Apache Configuration
-- [ ] cPanel Log Rotation Configuration
-- [ ] cPanel Web Disk Configuration
-- [ ] cPanel Web Services Configuration
-- [ ] Exim Configuration Manager
-- [ ] FTP Server Selection
-- [ ] Mailserver Configuration
-- [ ] Manage Service SSL Certificates
-- [ ] Nameserver Selection
+- [x] Apache Configuration
+- [x] cPanel Log Rotation Configuration
+- [x] cPanel Web Disk Configuration
+- [x] cPanel Web Services Configuration
+- [x] Exim Configuration Manager
+- [x] FTP Server Selection
+- [x] Mailserver Configuration
+- [x] Manage Service SSL Certificates
+- [x] Nameserver Selection
 - [x] Service Manager
 
 ### 8. Locales
-- [ ] Configure Application Locales
-- [ ] Copy a Locale
-- [ ] Delete a Locale
-- [ ] Edit a Locale
-- [ ] Locale XML Download
-- [ ] Locale XML Upload
-- [ ] View Available Locales
+- [x] Configure Application Locales
+- [x] Copy a Locale
+- [x] Delete a Locale
+- [x] Edit a Locale
+- [x] Locale XML Download
+- [x] Locale XML Upload
+- [x] View Available Locales
 
 ### 9. Backup
 - [ ] Backup Configuration
@@ -232,72 +234,72 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [x] Feature Manager
 
 ### 19. DNS Functions
-- [ ] Add a DNS Zone
-- [ ] Add an A Entry for Your Hostname
-- [ ] Delete a DNS Zone
-- [ ] DNS Zone Manager
-- [ ] Edit Zone Templates
-- [ ] Email DNS Record Manager
-- [ ] Email Routing Configuration
-- [ ] Enable DKIM/SPF Globally
-- [ ] Nameserver Record Report
-- [ ] Park a Domain
-- [ ] Perform a DNS Cleanup
-- [ ] Set Zone TTL
-- [ ] Setup/Edit Domain Forwarding
-- [ ] Synchronize DNS Records
+- [x] Add a DNS Zone
+- [x] Add an A Entry for Your Hostname
+- [x] Delete a DNS Zone
+- [x] DNS Zone Manager
+- [x] Edit Zone Templates
+- [x] Email DNS Record Manager
+- [x] Email Routing Configuration
+- [x] Enable DKIM/SPF Globally
+- [x] Nameserver Record Report
+- [x] Park a Domain
+- [x] Perform a DNS Cleanup
+- [x] Set Zone TTL
+- [x] Setup/Edit Domain Forwarding
+- [x] Synchronize DNS Records
 
 ### 20. Database Services
-- [ ] Change Database Root Password
-- [ ] Change Database User Password
-- [ ] Database Map Tool
-- [ ] Edit Database Configuration
-- [ ] Manage Database Access Hosts
-- [ ] Manage Database Profiles
-- [ ] Manage Database Users
-- [ ] Manage Databases
-- [ ] phpMyAdmin
-- [ ] Repair Databases
-- [ ] Show Database Processes
-- [ ] Upgrade Database Version
+- [x] Change Database Root Password
+- [x] Change Database User Password
+- [x] Database Map Tool
+- [x] Edit Database Configuration
+- [x] Manage Database Access Hosts
+- [x] Manage Database Profiles
+- [x] Manage Database Users
+- [x] Manage Databases
+- [x] phpMyAdmin
+- [x] Repair Databases
+- [x] Show Database Processes
+- [x] Upgrade Database Version
 
 ### 21. IP Functions
-- [ ] IPv6 Ranges
-- [ ] Add a New IP Address
-- [ ] Assign IPv6 Address
-- [ ] Configure Remote Service IPs
-- [ ] IP Migration Wizard
-- [ ] Rebuild the IP Address Pool
-- [ ] Show IP Address Usage
-- [ ] Show or Delete Current IP Addresses
-- [ ] Show/Edit Reserved IPs
+- [x] IPv6 Ranges
+- [x] Add a New IP Address
+- [x] Assign IPv6 Address
+- [x] Configure Remote Service IPs
+- [x] IP Migration Wizard
+- [x] Rebuild the IP Address Pool
+- [x] Show IP Address Usage
+- [x] Show or Delete Current IP Addresses
+- [x] Show/Edit Reserved IPs
 
 ### 22. Software
-- [ ] Install a Perl Module
-- [ ] Install Distro Packages
-- [ ] Module Installers
-- [ ] MultiPHP INI Editor
-- [ ] MultiPHP Manager
-- [ ] NGINX Manager
-- [ ] Rebuild RPM Database
-- [ ] System Update
-- [ ] Update Server Software
-- [ ] EasyApache 4
+- [x] Install a Perl Module
+- [x] Install Distro Packages
+- [x] Module Installers
+- [x] MultiPHP INI Editor
+- [x] MultiPHP Manager
+- [x] NGINX Manager
+- [x] Rebuild RPM Database
+- [x] System Update
+- [x] Update Server Software
+- [x] EasyApache 4
 
 ### 23. Email
-- [ ] Email Deliverability
-- [ ] Filter Incoming Emails by Country
-- [ ] Filter Incoming Emails by Domain
-- [ ] Greylisting
-- [ ] Mail Delivery Reports
-- [ ] Mail Queue Manager
-- [ ] Mail Troubleshooter
-- [ ] Mailbox Conversion
-- [ ] Repair Mailbox Permissions
-- [ ] Spamd Startup Configuration
-- [ ] View Mail Statistics Summary
-- [ ] View Relayers
-- [ ] View Sent Summary
+- [x] Email Deliverability
+- [x] Filter Incoming Emails by Country
+- [x] Filter Incoming Emails by Domain
+- [x] Greylisting
+- [x] Mail Delivery Reports
+- [x] Mail Queue Manager
+- [x] Mail Troubleshooter
+- [x] Mailbox Conversion
+- [x] Repair Mailbox Permissions
+- [x] Spamd Startup Configuration
+- [x] View Mail Statistics Summary
+- [x] View Relayers
+- [x] View Sent Summary
 
 ### 24. System Health
 - [ ] Background Process Killer
@@ -314,13 +316,13 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [ ] Upgrade to Latest Version
 
 ### 26. SSL/TLS
-- [ ] Generate an SSL Certificate and Signing Request
-- [ ] Install an SSL Certificate on a Domain
-- [ ] Manage AutoSSL
-- [ ] Manage SSL Hosts
-- [ ] Purchase and Install an SSL Certificate
-- [ ] SSL Storage Manager
-- [ ] SSL/TLS Configuration
+- [x] Generate an SSL Certificate and Signing Request
+- [x] Install an SSL Certificate on a Domain
+- [x] Manage AutoSSL
+- [x] Manage SSL Hosts
+- [~] Purchase and Install an SSL Certificate *(Provider list from settings market.providers (default cpstore, disabled), order flow records an ssl_orders row + generates/stores a CSR (wil)*
+- [x] SSL Storage Manager
+- [x] SSL/TLS Configuration
 
 ### 27. Market
 - [ ] Market Provider Manager
@@ -336,14 +338,14 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [x] SSH Server (OpenSSH)
 
 ### 29. Development
-- [ ] OpenAPI Documentation for cPanel
-- [ ] OpenAPI Documentation for WHM
-- [ ] Apps Managed by AppConfig
-- [ ] cPanel Development Forum
-- [ ] cPanel Plugin File Generator
-- [ ] Developer Documentation
-- [ ] Manage API Tokens
-- [ ] Manage Hooks
+- [x] OpenAPI Documentation for cPanel
+- [x] OpenAPI Documentation for WHM
+- [x] Apps Managed by AppConfig
+- [x] cPanel Development Forum
+- [x] cPanel Plugin File Generator
+- [x] Developer Documentation
+- [x] Manage API Tokens
+- [x] Manage Hooks
 
 ### 30. Plugins
 - [ ] ImunifyAV
