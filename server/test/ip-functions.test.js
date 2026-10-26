@@ -93,8 +93,8 @@ describe('IP Functions API (iproute2 present via mock agent)', () => {
     app = await createTestApp({ agent: netAgent() });
     csrf = await app.login();
     reseller = await app.createUser('resell1', 'reseller');
-    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'alice', domain: 'alice.com', owner: 'resell1', ip: '203.0.113.10' }).expect(201);
-    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'bob', domain: 'bob.com', ip: '203.0.113.10' }).expect(201);
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'alice', domain: 'alice.com', owner: 'resell1', ip: '203.0.113.10', provision: { dns: false, mail: false } }).expect(201);
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'bob', domain: 'bob.com', ip: '203.0.113.10', provision: { dns: false, mail: false } }).expect(201);
     const { default: request } = await import('supertest');
     resellerHttp = request.agent(app.ctx.app);
     const res = await resellerHttp.post('/api/auth/login').send({ username: 'resell1', password: reseller.password });
@@ -674,7 +674,7 @@ describe('IP Functions API without iproute2', () => {
   beforeAll(async () => {
     app = await createTestApp();
     csrf = await app.login();
-    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'carol', domain: 'carol.com' }).expect(201);
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'carol', domain: 'carol.com', provision: { dns: false, mail: false } }).expect(201);
   });
   afterAll(() => app.close());
 
@@ -720,7 +720,7 @@ describe('IP Functions with the real web service and no Apache', () => {
   beforeAll(async () => {
     app = await createTestApp({ agent: netAgent() });
     csrf = await app.login();
-    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'dave', domain: 'dave.com', ip: '203.0.113.10' }).expect(201);
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'dave', domain: 'dave.com', ip: '203.0.113.10', provision: { dns: false, mail: false } }).expect(201);
     await post('/ipv6/ranges', { name: 'customers', range: '2001:db8:1::/64' }).expect(201);
   });
   afterAll(() => app.close());

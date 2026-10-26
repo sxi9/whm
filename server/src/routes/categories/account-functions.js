@@ -50,7 +50,7 @@ export async function register(ctx) {
   r.post('/bandwidth/reset', requireReseller, validate({ body: z.object({ ...selection, unsuspend: z.boolean().optional() }).strict().refine(hasSelection, { message: 'Select at least one account or all', path: ['usernames'] }) }),
     wrap((req) => svc().resetBandwidth(req.body, req.user, req)));
   r.get('/bandwidth/exceeders', requireReseller, wrap((req) => svc().exceeders(req.user)));
-  r.post('/bandwidth/unsuspend-exceeders', requireReseller, validate({ body: z.object({ usernames: usernames.optional(), all: z.boolean().optional(), resetCounters: z.boolean().optional() }).strict() }),
+  r.post('/bandwidth/unsuspend-exceeders', requireReseller, validate({ body: z.object({ ...selection, resetCounters: z.boolean().optional() }).strict().refine(hasSelection, { message: 'Select at least one account or all', path: ['usernames'] }) }),
     wrap((req) => svc().unsuspendExceeders(req.body, req.user, req)));
   r.put('/bandwidth-enforcement', requireRoot, validate({ body: z.object({ enabled: z.boolean(), reason: z.string().trim().min(1).max(200).optional() }).strict() }), wrap((req) => {
     ctx.settings.set('account_functions.bandwidth_enforce', req.body.enabled);

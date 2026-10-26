@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { renderTemplateBody, DEFAULT_TEMPLATES, HOME_ROOTS } from '../src/services/account-functions.js';
+import { renderTemplateBody, DEFAULT_TEMPLATES, HOME_ROOTS, domainLogFile } from '../src/services/account-functions.js';
 
 // A host with the account tooling installed: users, quota, rsync and Exim exist,
 // Apache/BIND/NGINX do not, so the web/dns steps stay "pending" while the ops
@@ -10,6 +10,18 @@ const BINS = { useradd: true, usermod: true, userdel: true, chpasswd: true, setq
 const LOG_A = 'alice.com-access.log';
 const LOG_B = 'alice.com-error.log.1';
 const LOG_BYTES = Buffer.from('GET / 200\n'.repeat(400));
+const file = (name, size = 10) => ({ name, type: 'file', size, mtime: '2026-10-01T00:00:00.000Z', mode: '640' });
+// /var/log/nginx holds the distribution logs shared by every site plus
+// per-domain files; the names are chosen so substring matching would leak.
+const NGINX_FILES = ['access.log', 'access.log.1', 'error.log', 'alice.com-access.log', 'alice.com.error.log.1', 'myalice.com-access.log', 'myalice.com-error.log'].map((n) => file(n));
+const FS_LIST = ({ path }) => {
+  if (path === '/var/log/whm/domlogs/alice') return { path, entries: [{ name: LOG_A, type: 'file', size: LOG_BYTES.length, mtime: '2026-10-01T00:00:00.000Z', mode: '640' }, { name: LOG_B, type: 'file', size: 10, mtime: '2026-09-01T00:00:00.000Z', mode: '640' }, { name: 'notes.txt', type: 'file', size: 1, mtime: null, mode: '644' }, { name: 'sub', type: 'dir', size: null, mtime: null, mode: '755' }] };
+  if (path === '/home/alice/logs') return { path, entries: [{ name: 'php-error.log', type: 'file', size: 5, mtime: '2026-10-02T00:00:00.000Z', mode: '600' }] };
+  if (path === '/var/log/nginx') return { path, entries: NGINX_FILES };
+  if (path === '/home2/alice') return { path, entries: [] };
+  const err = Object.assign(new Error(`ENOENT: ${path}`), { agentError: true, code: 'op_failed' });
+  throw err;
+};
 
 function hostAgent() {
   return createMockAgent({
@@ -18,13 +30,7 @@ function hostAgent() {
     'user.set_shell': ({ username, shell }) => ({ username, shell }),
     'user.set_quota': (args) => args,
     'user.quota_report': ({ filesystem }) => ({ available: true, users: [{ username: 'alice', usedMb: 120, softMb: 10240, hardMb: 10752 }], filesystem }),
-    'fs.list': ({ path }) => {
-      if (path === '/var/log/whm/domlogs/alice') return { path, entries: [{ name: LOG_A, type: 'file', size: LOG_BYTES.length, mtime: '2026-10-01T00:00:00.000Z', mode: '640' }, { name: LOG_B, type: 'file', size: 10, mtime: '2026-09-01T00:00:00.000Z', mode: '640' }, { name: 'notes.txt', type: 'file', size: 1, mtime: null, mode: '644' }, { name: 'sub', type: 'dir', size: null, mtime: null, mode: '755' }] };
-      if (path === '/home/alice/logs') return { path, entries: [{ name: 'php-error.log', type: 'file', size: 5, mtime: '2026-10-02T00:00:00.000Z', mode: '600' }] };
-      if (path === '/home2/alice') return { path, entries: [] };
-      const err = Object.assign(new Error(`ENOENT: ${path}`), { agentError: true, code: 'op_failed' });
-      throw err;
-    },
+    'fs.list': FS_LIST,
     'acct.read_range': ({ path, offset, length }) => {
       const slice = LOG_BYTES.subarray(offset, offset + length);
       return { path, size: LOG_BYTES.length, offset, length: slice.length, data: slice.toString('base64'), eof: offset + slice.length >= LOG_BYTES.length };
@@ -40,6 +46,17 @@ function hostAgent() {
     'mail.sendmail': ({ from, to }) => ({ from, to, accepted: true, bytes: 100 }),
   });
 }
+
+describe('log file matching', () => {
+  it('claims only files named after the whole domain, never substrings or the shared logs', () => {
+    const alice = domainLogFile('alice.com');
+    expect(NGINX_FILES.map((f) => f.name).filter((n) => alice.test(n))).toEqual(['alice.com-access.log', 'alice.com.error.log.1']);
+    expect(NGINX_FILES.map((f) => f.name).filter((n) => domainLogFile('le.com').test(n))).toEqual([]);
+    expect(NGINX_FILES.map((f) => f.name).filter((n) => domainLogFile('access.log').test(n))).toEqual([]);
+    expect(domainLogFile('a.b').test('a.b-access_log')).toBe(true);
+    expect(domainLogFile('a.b').test('axb-access_log')).toBe(false);
+  });
+});
 
 describe('template rendering', () => {
   it('substitutes and escapes variables and leaves unknown ones empty', () => {
@@ -86,8 +103,9 @@ describe('Account Functions API', () => {
     it('records a provisioning status per step and renders the index template', async () => {
       const res = await post('/x', {}); // warm-up: unknown route is 404, keeps the CSRF cookie fresh
       expect(res.status).toBe(404);
-      const created = await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'dave', domain: 'dave.com', provision: { dns: true, mail: true } }).expect(201);
+      const created = await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'dave', domain: 'dave.com' }).expect(201);
       const p = created.body.data.provisioning;
+      // WHM parity: the zone and the local mail routing are created unless the caller opts out.
       expect(p.systemUser).toBe(true);
       expect(p.web).toBe('skipped');
       expect(['pending', 'applied']).toContain(p.dns);
@@ -97,6 +115,7 @@ describe('Account Functions API', () => {
       expect(p.database).toBe('pending');
       expect(p.steps.dns.detail).toMatch(/BIND|zone/);
       expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM dns_zones WHERE domain = ?').get('dave.com').n).toBe(1);
+      expect(app.ctx.mail.routingLists().local).toContain('dave.com');
       const index = app.agent.callsTo('fs.write_file').find((c) => c.args.path === '/home/dave/public_html/index.html');
       expect(index.args.content).toContain('<h1>dave.com</h1>');
       expect(index.args.content).not.toContain('{{');
@@ -110,8 +129,9 @@ describe('Account Functions API', () => {
         expect(res.status).toBe(500);
         expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM accounts WHERE username = ?').get('erin').n).toBe(0);
         expect(app.agent.callsTo('user.delete')).toHaveLength(1);
-        const plain = await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'erin', domain: 'erin.com' }).expect(201);
+        const plain = await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'erin', domain: 'erin.com', provision: { dns: false, mail: false } }).expect(201);
         expect(plain.body.data.provisioning.steps.dns).toEqual({ status: 'skipped', detail: 'not requested' });
+        expect(plain.body.data.provisioning.steps.mail).toEqual({ status: 'skipped', detail: 'not requested' });
         await app.http.delete('/api/accounts/erin').set('X-CSRF-Token', csrf).expect(200);
       } finally { app.ctx.dns = dns; }
     });
@@ -126,8 +146,16 @@ describe('Account Functions API', () => {
         expect(removed).toEqual(['web:dave']);
         expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM dns_zones WHERE domain = ?').get('dave.com').n).toBe(0);
         expect(app.agent.callsTo('user.delete')).toHaveLength(1);
+        // The domain leaves Exim's local list and the routing row goes with the account.
+        expect(app.ctx.mail.routingLists().local).not.toContain('dave.com');
+        expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM mail_domains WHERE domain = ?').get('dave.com').n).toBe(0);
+        const listWrites = app.agent.callsTo('mail.config.include.write').map((c) => c.args.content);
+        expect(listWrites.length).toBeGreaterThan(0);
+        expect(listWrites.at(-2)).not.toMatch(/dave\.com/);
         const audit = app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'account.terminate' ORDER BY id DESC LIMIT 1").get();
-        expect(JSON.parse(audit.args_redacted).cleanup.web.removed).toEqual(['dave.com']);
+        const cleanup = JSON.parse(audit.args_redacted).cleanup;
+        expect(cleanup.web.removed).toEqual(['dave.com']);
+        expect(cleanup.mail.routing).toEqual([{ domain: 'dave.com', applied: false, detail: expect.stringMatching(/domain lists|Exim/) }]);
       } finally { delete app.ctx.web; }
     });
   });
@@ -179,6 +207,22 @@ describe('Account Functions API', () => {
       } finally { if (ip) app.ctx.ip = ip; }
     });
 
+    it('lets a reseller move an owned account only to the shared or a delegated address', async () => {
+      const ip = app.ctx.ip;
+      delete app.ctx.ip;
+      const shared = app.ctx.settings.get('basic.shared_ip');
+      app.ctx.settings.set('basic.shared_ip', '203.0.113.5');
+      try {
+        const refused = await rput('/ip/bob', { ip: '203.0.113.78' });
+        expect(refused.status).toBe(403);
+        expect(refused.body.error.message).toMatch(/not delegated/);
+        expect((await app.http.get('/api/accounts/bob')).body.data.ip).not.toBe('203.0.113.78');
+        const ok = await rput('/ip/bob', { ip: '203.0.113.5' }).expect(200);
+        expect(ok.body.data).toMatchObject({ username: 'bob', ip: '203.0.113.5' });
+        expect((await put('/ip/bob', { ip: '203.0.113.78' })).status).toBe(200);
+      } finally { app.ctx.settings.set('basic.shared_ip', shared ?? ''); if (ip) app.ctx.ip = ip; }
+    });
+
     it('validates against IP Functions when it is loaded', async () => {
       const res = await put('/ip/alice', { ip: '198.51.100.9' });
       expect([200, 422]).toContain(res.status);
@@ -191,8 +235,10 @@ describe('Account Functions API', () => {
       const set = await put('/bandwidth/alice', { limitMb: 100 }).expect(200);
       expect(set.body.data).toMatchObject({ username: 'alice', bandwidth_limit_mb: 100 });
       app.ctx.db.prepare('UPDATE accounts SET bandwidth_used_mb = 150 WHERE username = ?').run('alice');
+      await put('/bandwidth/carol', { limitMb: 10 }).expect(200);
+      app.ctx.db.prepare('UPDATE accounts SET bandwidth_used_mb = 50 WHERE username = ?').run('carol');
       const ex = await get('/bandwidth/exceeders').expect(200);
-      expect(ex.body.data.map((a) => a.username)).toEqual(['alice']);
+      expect(ex.body.data.map((a) => a.username)).toEqual(['alice', 'carol']);
       expect(ex.body.data[0]).toMatchObject({ over_bandwidth: true, bandwidth_percent: 150, suspended_for_bandwidth: false });
 
       await put('/bandwidth-enforcement', { enabled: true }).expect(200);
@@ -200,12 +246,20 @@ describe('Account Functions API', () => {
       const job = app.ctx.jobs.enqueue('accounts.bandwidth_enforce', {});
       const done = await waitForJob(app.ctx, job.id);
       expect(done.status).toBe('done');
-      expect(done.result.suspended).toEqual(['alice']);
+      expect(done.result.suspended).toEqual(['alice', 'carol']);
       expect((await app.http.get('/api/accounts/alice')).body.data).toMatchObject({ suspended: true, suspend_reason: expect.stringMatching(/^bandwidth/) });
 
-      const un = await post('/bandwidth/unsuspend-exceeders', { all: true, resetCounters: true }).expect(200);
-      expect(un.body.data.unsuspended).toEqual(['alice']);
+      // A named selection without an explicit "all" touches only those accounts.
+      const un = await post('/bandwidth/unsuspend-exceeders', { usernames: ['alice'], resetCounters: true }).expect(200);
+      expect(un.body.data).toMatchObject({ unsuspended: ['alice'], failed: [], skipped: 1 });
       expect((await app.http.get('/api/accounts/alice')).body.data).toMatchObject({ suspended: false, bandwidth_used_mb: 0 });
+      expect((await app.http.get('/api/accounts/carol')).body.data).toMatchObject({ suspended: true, bandwidth_used_mb: 50 });
+      expect((await post('/bandwidth/unsuspend-exceeders', {})).status).toBe(422);
+      expect((await post('/bandwidth/unsuspend-exceeders', { usernames: [] })).status).toBe(422);
+      expect((await app.http.get('/api/accounts/carol')).body.data.suspended).toBe(true);
+      const rest = await post('/bandwidth/unsuspend-exceeders', { all: true }).expect(200);
+      expect(rest.body.data.unsuspended).toEqual(['carol']);
+      await put('/bandwidth/carol', { limitMb: null }).expect(200);
 
       app.ctx.db.prepare('UPDATE accounts SET bandwidth_used_mb = 42 WHERE username = ?').run('carol');
       const reset = await post('/bandwidth/reset', { usernames: ['carol'] }).expect(200);
@@ -277,6 +331,26 @@ describe('Account Functions API', () => {
       expect((await get('/logs/iis/alice')).status).toBe(422);
     });
 
+    it('shows each account only the NGINX files named after its own domains', async () => {
+      await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'malice', domain: 'myalice.com', owner: 'resell1', provision: { dns: false, mail: false } }).expect(201);
+      app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, Boolean(BINS[n]) || n === 'nginx'])));
+      await app.ctx.capabilities.refresh();
+      try {
+        const alice = await get('/logs/nginx/alice').expect(200);
+        expect(alice.body.data.files.map((f) => f.name)).toEqual(['alice.com-access.log', 'alice.com.error.log.1']);
+        const malice = await rget('/logs/nginx/malice').expect(200);
+        expect(malice.body.data.files.map((f) => f.name)).toEqual(['myalice.com-access.log', 'myalice.com-error.log']);
+        expect((await rget('/logs/nginx/malice/download?file=alice.com-access.log')).status).toBe(404);
+        expect((await rget('/logs/nginx/malice/download?file=access.log')).status).toBe(404);
+        expect((await rget('/logs/nginx/alice')).status).toBe(403);
+      } finally {
+        app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, Boolean(BINS[n])])));
+        await app.ctx.capabilities.refresh();
+        app.agent.set('fs.list', FS_LIST);
+        await app.http.delete('/api/accounts/malice').set('X-CSRF-Token', csrf).expect(200);
+      }
+    });
+
     it('answers 501 for NGINX logs while NGINX is not installed', async () => {
       const res = await get('/logs/nginx/alice');
       expect(res.status).toBe(501);
@@ -339,6 +413,13 @@ describe('Account Functions API', () => {
       expect((await put('/log-retention/alice', { retainMonths: 0 })).status).toBe(422);
       expect((await rput('/log-retention/alice', { archiveLogs: true })).status).toBe(403);
       expect((await rput('/log-retention/bob', { archiveLogs: true })).status).toBe(200);
+      // Archiving every account is server-wide work: resellers must name one of their own.
+      expect((await rpost('/log-retention/archive', {})).status).toBe(403);
+      expect((await rpost('/log-retention/archive', { username: 'alice' })).status).toBe(403);
+      const own = await rpost('/log-retention/archive', { username: 'bob' }).expect(202);
+      const ownJob = await waitForJob(app.ctx, own.body.data.job.id);
+      expect(ownJob.status, ownJob.error).toBe('done');
+      expect(ownJob.result.archived).toEqual([]);
     });
   });
 
@@ -346,6 +427,9 @@ describe('Account Functions API', () => {
     it('lists, previews, saves to /etc/whm/templates and resets templates (root only)', async () => {
       const list = await get('/templates').expect(200);
       expect(list.body.data.templates.map((t) => t.name)).toEqual(['index', 'suspended', 'moved', 'error-4xx']);
+      expect(list.body.data.templates.map((t) => t.served)).toEqual([true, false, false, false]);
+      expect(list.body.data.templates[1].served_by).toMatch(/not yet served/);
+      expect(app.ctx.accountFunctions.templatePath('error-4xx')).toBe('/etc/whm/templates/error-4xx.html');
       const preview = await post('/templates/error-4xx/preview', { status: '403', status_text: 'Forbidden', domain: 'alice.com' }).expect(200);
       expect(preview.body.data.html).toContain('403 Forbidden');
       expect(preview.body.data.html).toContain('alice.com');

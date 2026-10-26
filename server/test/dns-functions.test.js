@@ -98,8 +98,8 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
     delete app.ctx.web;
     csrf = await app.login();
     reseller = await app.createUser('resell1', 'reseller');
-    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'alice', domain: 'alice.com', owner: 'resell1' }).expect(201);
-    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'bob', domain: 'bob.com' }).expect(201);
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'alice', domain: 'alice.com', owner: 'resell1', provision: { dns: false, mail: false } }).expect(201);
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'bob', domain: 'bob.com', provision: { dns: false, mail: false } }).expect(201);
     const { default: request } = await import('supertest');
     resellerHttp = request.agent(app.ctx.app);
     const res = await resellerHttp.post('/api/auth/login').send({ username: 'resell1', password: reseller.password });

@@ -26,6 +26,8 @@ export function createAccountsService(ctx) {
       owner_id = @owner_id, updated_at = datetime('now') WHERE id = @id`),
     packageByName: db.prepare('SELECT id FROM packages WHERE name = ?'),
     ownerByUsername: db.prepare("SELECT id FROM users WHERE username = ? AND role IN ('root', 'reseller')"),
+    deleteMailDomains: db.prepare('DELETE FROM mail_domains WHERE account_id = ?'),
+    deleteMailDomain: db.prepare('DELETE FROM mail_domains WHERE domain = ?'),
   };
 
   function shape(row) {
@@ -111,7 +113,24 @@ export function createAccountsService(ctx) {
     await attempt('ssl', async () => (ctx.ssl?.removeAccountCerts ? ctx.ssl.removeAccountCerts(id, req) : null));
     await attempt('web', async () => (ctx.web?.removeAccount ? ctx.web.removeAccount(username, req) : null));
     await attempt('databases', async () => (ctx.databases?.removeAccountData ? ctx.databases.removeAccountData(username, req) : null));
-    await attempt('mail', async () => (ctx.mail?.removeDkimKey && capabilities.has('exim') ? ctx.mail.removeDkimKey(domain, req) : null));
+    // Every hosted domain leaves Exim's local-domain list on termination (WHM
+    // drops it from /etc/localdomains); the rows go afterwards so the list is
+    // rewritten while the routing row still says "remote".
+    await attempt('mail', async () => {
+      if (!ctx.mail) return null;
+      const domains = [...new Set([domain, ...stmts.domains.all(id).map((d) => d.domain)])];
+      const result = { routing: [], dkim: null };
+      for (const d of domains) {
+        if (!ctx.mail.setRouting) break;
+        try { const r = await ctx.mail.setRouting(d, 'remote', req); result.routing.push({ domain: d, applied: r.applied }); } catch (err) {
+          if (!softFailure(err)) throw err;
+          result.routing.push({ domain: d, applied: false, detail: err.message });
+        }
+      }
+      db.transaction(() => { stmts.deleteMailDomains.run(id); for (const d of domains) stmts.deleteMailDomain.run(d); })();
+      if (ctx.mail.removeDkimKey && capabilities.has('exim')) result.dkim = await ctx.mail.removeDkimKey(domain, req);
+      return result;
+    });
     if (!keepDns) await attempt('dns', async () => (ctx.dns?.removeZonesForAccount ? ctx.dns.removeZonesForAccount(id, req) : null));
     return cleanup;
   }
@@ -200,7 +219,7 @@ export function createAccountsService(ctx) {
         })();
 
         undo.push(() => Promise.resolve(stmts.remove.run(account.id)));
-        const provisioning = await provision(account, { ip, user, req, undo, want: { web: true, dns: false, mail: false, ...(input.provision || {}) } });
+        const provisioning = await provision(account, { ip, user, req, undo, want: { web: true, dns: true, mail: true, ...(input.provision || {}) } });
         req?.audit?.({ action: 'account.create', target: username, args: { domain: input.domain, package: pkgName, owner: ownerId, ip, provisioning: Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])) } });
         return { ...shape(stmts.byUsername.get(username)), domains: stmts.domains.all(account.id), provisioning: { systemUser: Boolean(sysUser), ...Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])), steps: provisioning.steps } };
       } catch (err) {

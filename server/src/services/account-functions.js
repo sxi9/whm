@@ -3,6 +3,8 @@ import { isRoot } from '../middleware/rbac.js';
 
 // Account Functions. Attached as ctx.accountFunctions; other categories may call:
 //   accountFunctions.renderTemplate(name, vars)        -> HTML of a site/error page template ('index' | 'suspended' | 'moved' | 'error-4xx')
+//   accountFunctions.templatePath(name)                -> /etc/whm/templates/<name>.html, the file a vhost may reference (ErrorDocument, suspended docroot)
+//   accountFunctions.TEMPLATE_USAGE                     -> which templates are served today; a category that starts serving one updates its entry
 //   accountFunctions.changeIp(username, { ip }, user, req)
 //   accountFunctions.setBandwidthLimit / resetBandwidth / unsuspendExceeders
 //   accountFunctions.setShell / setQuota / setDemoMode / forcePasswordChange
@@ -16,9 +18,24 @@ export const HOME_ROOTS = ['/home', '/home2', '/home3', '/home4', '/mnt/home', '
 export const TEMPLATE_NAMES = ['index', 'suspended', 'moved', 'error-4xx'];
 export const TEMPLATE_DIR = '/etc/whm/templates';
 export const TEMPLATE_VARS = ['domain', 'username', 'hostname', 'contact_email', 'ip', 'status', 'status_text', 'reason'];
+// Which part of the panel serves each template today. Only "index" is consumed
+// (accounts.create writes it into public_html); the other three are kept under
+// TEMPLATE_DIR for the web server configuration to reference once it does.
+export const TEMPLATE_USAGE = {
+  index: { served: true, by: 'account creation: rendered into public_html/index.html of every new account' },
+  suspended: { served: false, by: 'not yet served: Service Configuration does not point suspended accounts at this page; it is only written to the template directory' },
+  moved: { served: false, by: 'not yet served: no virtual host references this page yet; it is only written to the template directory' },
+  'error-4xx': { served: false, by: 'not yet served: the virtual host renderer does not set ErrorDocument to this page yet; it is only written to the template directory' },
+};
 export const SHELLS = ['/bin/bash', '/bin/sh', '/usr/sbin/nologin', '/usr/local/bin/jailshell'];
 const LOG_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,200}(\.log|\.log\.\d+|\.gz|\.\d+|-access_log|-error_log|_log)$/;
 const BANDWIDTH_REASON = /^bandwidth\b/i;
+// Server-wide log directories hold every tenant's files, so a domain only
+// claims "<domain>-access.log", "<domain>.error.log.1" and the like: the whole
+// domain, then a separator, then the stream name. Substring matches would let
+// "le.com" see "example.com" and "access.log" see the shared access.log.
+const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+export const domainLogFile = (domain) => new RegExp(`^${escapeRegExp(domain)}[._-](access|error|ssl_access|ssl_error|bytes)(?![A-Za-z0-9])`, 'i');
 
 const page = (title, body, bg = '#f4f6f8') => `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>${title}</title>
@@ -131,12 +148,12 @@ export function createAccountFunctionsService(ctx) {
   const templates = {
     list() {
       const rows = Object.fromEntries(stmts.templates.all().map((t) => [t.name, t]));
-      return { dir: TEMPLATE_DIR, variables: TEMPLATE_VARS, templates: TEMPLATE_NAMES.map((name) => ({ name, path: `${TEMPLATE_DIR}/${name}.html`, updated_at: rows[name]?.updated_at ?? null, customised: rows[name] ? rows[name].body !== DEFAULT_TEMPLATES[name] : false, bytes: Buffer.byteLength(rows[name]?.body ?? DEFAULT_TEMPLATES[name]) })) };
+      return { dir: TEMPLATE_DIR, variables: TEMPLATE_VARS, templates: TEMPLATE_NAMES.map((name) => ({ name, path: `${TEMPLATE_DIR}/${name}.html`, updated_at: rows[name]?.updated_at ?? null, customised: rows[name] ? rows[name].body !== DEFAULT_TEMPLATES[name] : false, bytes: Buffer.byteLength(rows[name]?.body ?? DEFAULT_TEMPLATES[name]), served: TEMPLATE_USAGE[name].served, served_by: TEMPLATE_USAGE[name].by })) };
     },
     get(name) {
       if (!TEMPLATE_NAMES.includes(name)) throw notFound(`Template "${name}"`);
       const row = stmts.template.get(name);
-      return { name, path: `${TEMPLATE_DIR}/${name}.html`, body: row?.body ?? DEFAULT_TEMPLATES[name], default: DEFAULT_TEMPLATES[name], updated_at: row?.updated_at ?? null, variables: TEMPLATE_VARS };
+      return { name, path: `${TEMPLATE_DIR}/${name}.html`, body: row?.body ?? DEFAULT_TEMPLATES[name], default: DEFAULT_TEMPLATES[name], updated_at: row?.updated_at ?? null, variables: TEMPLATE_VARS, served: TEMPLATE_USAGE[name].served, served_by: TEMPLATE_USAGE[name].by };
     },
     async save(name, body, req) {
       if (!TEMPLATE_NAMES.includes(name)) throw notFound(`Template "${name}"`);
@@ -163,6 +180,12 @@ export function createAccountFunctionsService(ctx) {
     const previous = account.ip;
     if (previous === ip) throw conflict(`${username} already uses ${ip}`);
     const ipSvc = ctx.ip;
+    // Resellers may only use the shared address or one delegated to them in
+    // Reseller Center, the same rule account creation applies.
+    if (!isRoot(user)) {
+      const allowed = new Set([ipSvc?.sharedIp?.() ?? settings.get('basic.shared_ip') ?? settings.get('basic.main_ip'), ctx.resellers?.sharedIpFor?.(user), ...(ctx.resellers?.delegatedAddresses?.(user.id) ?? []).map((r) => r.address)].filter(Boolean));
+      if (!allowed.has(ip)) throw forbidden(`${ip} is not delegated to you; ask the server administrator to delegate it in Reseller Center`);
+    }
     if (ipSvc) {
       const known = ipSvc.get(ip);
       if (!known) throw unprocessable(`${ip} is not configured on this server; add it under IP Functions first`, { ip: ['Unknown address'] });
@@ -303,9 +326,9 @@ export function createAccountFunctionsService(ctx) {
       .map((a) => ({ ...a, suspended_for_bandwidth: a.suspended && BANDWIDTH_REASON.test(a.suspend_reason || '') }));
   }
 
-  async function unsuspendExceeders({ usernames, all = true, resetCounters = false }, user, req) {
+  async function unsuspendExceeders({ usernames, all = false, resetCounters = false }, user, req) {
     const candidates = exceeders(user).filter((a) => a.suspended_for_bandwidth);
-    const wanted = all || !usernames?.length ? candidates : candidates.filter((a) => usernames.includes(a.username));
+    const wanted = all ? candidates : candidates.filter((a) => (usernames || []).includes(a.username));
     const unsuspended = [];
     const failed = [];
     for (const a of wanted) {
@@ -406,7 +429,7 @@ export function createAccountFunctionsService(ctx) {
       let files;
       if (kind === 'nginx') {
         if (!capabilities.has('nginx')) throw new CapabilityError('nginx', 'NGINX is not installed on this server, so there are no NGINX logs to download.');
-        files = [...(await listDir(NGINX_LOG_DIR)).filter((f) => domains.some((d) => f.name.includes(d))), ...(await listDir(`${home}/logs`)).filter((f) => /nginx/i.test(f.name))];
+        files = [...(await listDir(NGINX_LOG_DIR)).filter((f) => domains.some((d) => domainLogFile(d).test(f.name))), ...(await listDir(`${home}/logs`)).filter((f) => /nginx/i.test(f.name))];
       } else {
         files = [...(await listDir(`${DOMLOGS_ROOT}/${username}`)), ...(await listDir(`${home}/logs`)).filter((f) => !/nginx/i.test(f.name))];
       }
@@ -518,6 +541,7 @@ export function createAccountFunctionsService(ctx) {
     },
     archiveNow({ username } = {}, user, req) {
       if (username) load(username, user);
+      else if (!isRoot(user)) throw forbidden('Archiving every account at once is reserved for the server administrator; name one of your accounts');
       capabilities.require('rsync', 'rsync is not installed on this server; it is needed to archive web logs into the account home');
       const job = jobs.enqueue('accounts.log_archive', username ? { username } : {}, { userId: user.id });
       audit(req, { action: 'account.log_archive', target: username || 'all', args: { job: job.id } });
@@ -559,10 +583,10 @@ export function createAccountFunctionsService(ctx) {
 
   return {
     summary: (user) => visibleAccounts(user).map(summary),
-    renderTemplate, templates, changeIp, recipients, emailAll, runEmailAll,
+    renderTemplate, templatePath: (name) => { if (!TEMPLATE_NAMES.includes(name)) throw notFound(`Template "${name}"`); return `${TEMPLATE_DIR}/${name}.html`; }, templates, changeIp, recipients, emailAll, runEmailAll,
     forcePasswordChange, setDemoMode,
     setBandwidthLimit, resetBandwidth, exceeders, unsuspendExceeders, runBandwidthEnforce, runMonthlyBandwidthReset,
     setShell, setQuota, quotaReport, logs, rearrange, logRetention,
-    HOME_ROOTS, TEMPLATE_NAMES, SHELLS,
+    HOME_ROOTS, TEMPLATE_NAMES, TEMPLATE_USAGE, SHELLS,
   };
 }
