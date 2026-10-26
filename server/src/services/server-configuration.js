@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { json } from '../db/index.js';
 import { SERVICE_REGISTRY } from '../db/seed.js';
 import { notFound, forbidden, unprocessable, conflict, CapabilityError } from '../lib/errors.js';
+import { isValidCron } from '../lib/cron.js';
 
 // Server Configuration. Attached as ctx.serverConfig; other categories may call:
 //   serverConfig.profile.summary()                 -> { name, label, hiddenCategories, services } (also in GET /api/system/status)
@@ -331,12 +332,16 @@ export function createServerConfigService(ctx) {
     async get() {
       const detect = await stats.detect();
       const domains = db.prepare('SELECT COUNT(*) AS n FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE a.suspended = 0').get().n;
-      return { ...stats.settings(), detect, outputRoot: detect.statsRoot ?? null, schedule: stats.schedule(), domains, lastRun: S('stats.last_run', null), lastJob: ctx.jobs.list({ type: STATS_JOB, limit: 1 })[0] ?? null, pkgAvailable: Boolean(ctx.software?.pkg?.ensureInstalled) };
+      return { ...stats.settings(), scheduleEnabled: stats.scheduleWanted(), detect, outputRoot: detect.statsRoot ?? null, schedule: stats.schedule(), domains, lastRun: S('stats.last_run', null), lastJob: ctx.jobs.list({ type: STATS_JOB, limit: 1 })[0] ?? null, pkgAvailable: Boolean(ctx.software?.pkg?.ensureInstalled) };
     },
+    anyGeneratorOn(generators = stats.settings().generators) { return Object.values(generators).some(Boolean); },
+    scheduleWanted() { return Boolean(S('stats.schedule_enabled', true)); },
+    // Runs at boot. It only ever switches the schedule off (no generator on, or
+    // the administrator disabled it here); a schedule disabled from Configure
+    // cPanel Cron Jobs is never re-enabled behind the operator's back.
     alignSchedule() {
-      const enabled = Object.values(stats.settings().generators).some(Boolean);
       const row = stats.schedule();
-      if (row && row.enabled !== enabled) ctx.scheduler.update(STATS_SCHEDULE, { enabled });
+      if (row && row.enabled && !(stats.scheduleWanted() && stats.anyGeneratorOn())) ctx.scheduler.update(STATS_SCHEDULE, { enabled: false });
     },
     async update(body, req) {
       const current = stats.settings();
@@ -346,10 +351,14 @@ export function createServerConfigService(ctx) {
       if (body.allowUserChoice !== undefined) values['stats.allow_user_choice'] = body.allowUserChoice;
       if (body.includeSuspended !== undefined) values['stats.include_suspended'] = body.includeSuspended;
       const next = { ...current, ...(values['stats.generators'] ? { generators: values['stats.generators'] } : {}), ...(body.defaultGenerator !== undefined ? { defaultGenerator: body.defaultGenerator } : {}) };
-      if (Object.values(next.generators).some(Boolean) && !next.generators[next.defaultGenerator]) throw unprocessable('The default generator must be one of the enabled generators', { defaultGenerator: [`${next.defaultGenerator} is disabled`] });
+      const anyOn = stats.anyGeneratorOn(next.generators);
+      if (anyOn && !next.generators[next.defaultGenerator]) throw unprocessable('The default generator must be one of the enabled generators', { defaultGenerator: [`${next.defaultGenerator} is disabled`] });
+      if (body.cron !== undefined && !isValidCron(body.cron)) throw unprocessable('Request validation failed', { cron: ['Must be a valid 5-field cron expression'] });
+      if (body.enabled === true && !anyOn) throw unprocessable('Enable a statistics generator before enabling the schedule', { enabled: ['No generator is enabled'] });
+      if (body.enabled !== undefined) values['stats.schedule_enabled'] = body.enabled;
+      const wanted = body.enabled ?? stats.scheduleWanted();
       settings.setMany(values);
-      if (body.cron !== undefined) ctx.scheduler.update(STATS_SCHEDULE, { cron: body.cron });
-      ctx.scheduler.update(STATS_SCHEDULE, { enabled: body.enabled ?? Object.values(next.generators).some(Boolean) });
+      ctx.scheduler.update(STATS_SCHEDULE, { ...(body.cron !== undefined ? { cron: body.cron } : {}), enabled: wanted && anyOn });
       audit(req, { action: 'server_config.stats.update', args: body });
       return stats.get();
     },
@@ -445,7 +454,9 @@ export function createServerConfigService(ctx) {
     async sweep(now = Date.now()) {
       const expired = [];
       for (const s of [...terminalSessions.values()]) {
-        if (now - s.lastActivity > terminal.idleMs()) { expired.push(s.id); await terminal.forget(s, 'idle_timeout'); }
+        if (s.viewers > 0 || now - s.lastActivity <= terminal.idleMs()) continue;
+        expired.push(s.id);
+        await terminal.forget(s, 'idle_timeout');
       }
       return expired;
     },
@@ -484,7 +495,7 @@ export function createServerConfigService(ctx) {
         if (closed) return;
         const buf = Buffer.from(r.data, 'base64');
         if (r.truncated && since > 0) send({ type: 'notice', message: 'some output was dropped from the scrollback' });
-        if (buf.length) { since = r.offset; s.offset = r.offset; const text = decode(buf, r.exited); if (text) send({ type: 'output', data: text }); }
+        if (buf.length) { since = r.offset; s.offset = r.offset; s.lastActivity = Date.now(); const text = decode(buf, r.exited); if (text) send({ type: 'output', data: text }); }
         if (r.exited) { await terminal.forget(s, 'exited'); return finish({ type: 'exit', code: r.exitCode, signal: r.signal }); }
         timer = setTimeout(poll, buf.length ? pollMs : idlePollMs);
         timer.unref?.();
@@ -519,6 +530,7 @@ export function createServerConfigService(ctx) {
       if (body.auto !== undefined) values['updates.auto'] = body.auto;
       if (body.notifyContact !== undefined) values['updates.notify_contact'] = body.notifyContact;
       if (body.autoOs !== undefined) values['software.updates.auto_os'] = body.autoOs;
+      if (body.cron !== undefined && !isValidCron(body.cron)) throw unprocessable('Request validation failed', { cron: ['Must be a valid 5-field cron expression'] });
       settings.setMany(values);
       if (body.cron !== undefined || body.scheduleEnabled !== undefined) ctx.scheduler.update(UPDATE_SCHEDULE, { ...(body.cron !== undefined ? { cron: body.cron } : {}), ...(body.scheduleEnabled !== undefined ? { enabled: body.scheduleEnabled } : {}) });
       audit(req, { action: 'server_config.updates.set', args: body });

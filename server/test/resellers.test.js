@@ -119,6 +119,29 @@ describe('Resellers API', () => {
       await put('/resell1', { maxAccounts: -1 }).expect(422);
       await rput('/resell1', { maxAccounts: 100 }).expect(403);
     });
+
+    // The host half of "Edit Reseller Nameservers" is DNS Functions' (integration
+    // contract 10): this pins the option accounts.create hands over.
+    it('passes the reseller\'s nameservers to DNS Functions when an account zone is created', async () => {
+      expect(app.ctx.dns?.ensureZoneForDomain).toBeTypeOf('function');
+      expect(app.ctx.resellers.nameserversFor(reseller.id)).toEqual(['ns1.resell1.com', 'ns2.resell1.com']);
+      expect(app.ctx.resellers.nameserversFor(1)).toEqual([]);
+      const original = app.ctx.dns.ensureZoneForDomain;
+      const seen = [];
+      app.ctx.dns.ensureZoneForDomain = async (domain, opts, req) => { seen.push({ domain, opts }); return original.call(app.ctx.dns, domain, opts, req); };
+      try {
+        await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'nsacct', domain: 'nsacct.com', owner: 'resell1' }).expect(201);
+        expect(seen).toHaveLength(1);
+        expect(seen[0]).toMatchObject({ domain: 'nsacct.com', opts: { nameservers: ['ns1.resell1.com', 'ns2.resell1.com'] } });
+        seen.length = 0;
+        await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'rootacct', domain: 'rootacct.com' }).expect(201);
+        expect(seen[0].opts.nameservers).toBeUndefined();
+      } finally {
+        app.ctx.dns.ensureZoneForDomain = original;
+        await app.http.delete('/api/accounts/nsacct').set('X-CSRF-Token', csrf).expect(200);
+        await app.http.delete('/api/accounts/rootacct').set('X-CSRF-Token', csrf).expect(200);
+      }
+    });
   });
 
   describe('Edit Reseller Nameservers and Privileges', () => {
@@ -273,6 +296,40 @@ describe('Resellers API', () => {
       expect(moved.body.data.ip).toBe('203.0.113.11');
       await put('/resell1', { maxDiskMb: null, maxBandwidthMb: null }).expect(200);
     });
+
+    it('treats a quota or limit of 0 as unlimited and gates it on the unlimited ACLs', async () => {
+      await put('/resell1', { maxDiskMb: 15000, maxBandwidthMb: 250000 }).expect(200);
+      const zeroDisk = await acct('patch', '/bob', { diskQuotaMb: 0 });
+      expect(zeroDisk.status).toBe(409);
+      expect(zeroDisk.body.error).toMatchObject({ code: 'reseller_limit' });
+      expect(zeroDisk.body.error.message).toMatch(/Unlimited disk space is not allowed/);
+      const zeroBw = await acct('patch', '/bob', { bandwidthLimitMb: 0 });
+      expect(zeroBw.status).toBe(409);
+      expect(zeroBw.body.error.message).toMatch(/Unlimited bandwidth is not allowed/);
+      const quota = await resellerHttp.put('/api/account-functions/quota/bob').set('X-CSRF-Token', resellerCsrf).send({ diskQuotaMb: 0 });
+      expect(quota.status).toBe(409);
+      expect(quota.body.error).toMatchObject({ code: 'reseller_limit' });
+      // A reseller-owned package with no quota is "unlimited" too.
+      await resellerHttp.post('/api/packages').set('X-CSRF-Token', resellerCsrf).send({ name: 'freepkg', disk_mb: 0, bandwidth_mb: 0 }).expect(201);
+      const viaPackage = await resellerHttp.post('/api/accounts').set('X-CSRF-Token', resellerCsrf).send({ username: 'frank', domain: 'frank.com', package: 'freepkg' });
+      expect(viaPackage.status).toBe(409);
+      expect(viaPackage.body.error.message).toMatch(/Unlimited disk space/);
+      expect(() => app.ctx.resellers.createPolicy({ id: reseller.id, role: 'reseller' }, { pkgName: 'freepkg', plan: { disk_mb: 0, bandwidth_mb: 0 } })).toThrow(/Unlimited disk space/);
+      expect(app.ctx.db.prepare('SELECT 1 FROM accounts WHERE username = ?').get('frank')).toBeUndefined();
+      // Usage counts 0 as unlimited, like NULL.
+      await app.http.patch('/api/accounts/bob').set('X-CSRF-Token', csrf).send({ diskQuotaMb: 0, bandwidthLimitMb: null }).expect(200);
+      expect((await get('/resell1/usage').expect(200)).body.data.usage).toMatchObject({ unlimited_disk: 1, unlimited_bandwidth: 1 });
+      await app.http.patch('/api/accounts/bob').set('X-CSRF-Token', csrf).send({ diskQuotaMb: 512, bandwidthLimitMb: 500 }).expect(200);
+      expect((await get('/resell1/usage').expect(200)).body.data.usage).toMatchObject({ unlimited_disk: 0, unlimited_bandwidth: 0 });
+      // With the explicit ACLs the zero values pass.
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'edit-account', 'upgrade-account', 'quota', 'limit-bandwidth', 'add-pkg-ip', 'allow-unlimited-disk-pkgs', 'allow-unlimited-bw-pkgs'] }).expect(200);
+      expect((await acct('patch', '/bob', { diskQuotaMb: 0, bandwidthLimitMb: 0 })).status).toBe(200);
+      expect(() => app.ctx.resellers.createPolicy({ id: reseller.id, role: 'reseller' }, { pkgName: 'freepkg', plan: { disk_mb: 0, bandwidth_mb: 0 } })).not.toThrow();
+      await app.http.patch('/api/accounts/bob').set('X-CSRF-Token', csrf).send({ diskQuotaMb: 512, bandwidthLimitMb: 500 }).expect(200);
+      app.ctx.db.prepare('DELETE FROM packages WHERE name = ?').run('freepkg');
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'edit-account', 'upgrade-account', 'quota', 'limit-bandwidth', 'add-pkg-ip'] }).expect(200);
+      await put('/resell1', { maxDiskMb: null, maxBandwidthMb: null }).expect(200);
+    });
   });
 
   describe('IP delegation and shared IP', () => {
@@ -402,6 +459,20 @@ describe('Resellers API', () => {
         const calls = app.agent.callsTo('mail.sendmail');
         expect(calls).toHaveLength(2);
         expect(calls.find((c) => c.args.to[0] === 'alice@alice.com').args.text).toContain('Hello alice, you own 1 account(s).');
+        // Job records are readable by every reseller: no addresses, no message in them.
+        const asReseller = await resellerHttp.get(`/api/system/jobs/${res.body.data.job.id}`).expect(200);
+        const exposed = JSON.stringify(asReseller.body);
+        expect(exposed).not.toContain('alice@alice.com');
+        expect(exposed).not.toContain('sa@example.com');
+        expect(exposed).not.toContain('Maintenance on');
+        expect(exposed).not.toContain('you own');
+        expect(asReseller.body.data.params).toEqual({ broadcastId: res.body.data.broadcast, requestedBy: 'root' });
+        expect(JSON.stringify(app.ctx.jobs.list({ type: 'resellers.email_all' }))).not.toContain('@');
+        const history = await get('/email/history').expect(200);
+        expect(history.body.data[0]).toMatchObject({ id: res.body.data.broadcast, subject: 'Maintenance on {{hostname}}', from: 'whm@test.example.com', requested_by: 'root', status: 'done', failed: [] });
+        expect(history.body.data[0].sent.sort()).toEqual(['alice', 'standalone']);
+        await rget('/email/history').expect(403);
+        await get('/email/history?limit=0').expect(422);
       } finally {
         app.agent.reset('sys.binaries');
         app.agent.set('sys.binaries', hostAgent().op ? ({ names }) => Object.fromEntries(names.map((n) => [n, ['useradd', 'usermod', 'userdel', 'chpasswd', 'systemctl'].includes(n)])) : undefined);

@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { shellQuote, remoteCommand, parsePasswd, parseUserDomains, parseRsyncStats, summarizeArchive, parseCpUserFile, parseShadowHash, rsyncArgv, scanSql, createSqlCodeFilter } from '../src/ops/transfer.js';
+import { shellQuote, remoteCommand, parsePasswd, parseUserDomains, parseRsyncStats, summarizeArchive, parseCpUserFile, parseShadowHash, rsyncArgv, scanSql, createSqlCodeFilter, clientCommand } from '../src/ops/transfer.js';
 
 // exec is spied with the real implementation behind it so the tests prove an
 // op refused before any program ran. Remote ops are never executed against a
@@ -105,7 +105,16 @@ describe('remote command construction', () => {
     expect(argv[0]).toBe('-rlptD');
     expect(argv).toEqual(expect.arrayContaining(['--partial', '--exclude=tmp/', '--bwlimit=500', '-e', 'ssh -p 22', 'root@src.example.com:/home/bob/', '/home/robert/']));
     expect(argv).not.toContain('--delete');
+    // rsync rejects "--human-readable=0" (the option takes no argument).
+    expect(argv).toContain('--no-human-readable');
+    expect(argv.some((a) => a.startsWith('--human-readable'))).toBe(false);
     expect(rsyncArgv({ transport: 'ssh', destination: 'root@h', src: '/tmp/whm-transfer-x.sql', dest: '/var/lib/whm/transfers/x.sql', directory: false, deleteExtraneous: true }).slice(-3)).toEqual(['--delete', 'root@h:/tmp/whm-transfer-x.sql', '/var/lib/whm/transfers/x.sql']);
+  });
+
+  it('brackets IPv6 hosts so rsync does not split the address at its first colon', () => {
+    expect(rsyncArgv({ transport: 'ssh', destination: 'root@2001:db8::1', src: '/home/bob', dest: '/home/bob' }).slice(-2)).toEqual(['root@[2001:db8::1]:/home/bob/', '/home/bob/']);
+    expect(rsyncArgv({ transport: 'ssh', destination: 'root@2001:db8::1', src: '/tmp/whm-transfer-x.sql', dest: '/var/lib/whm/transfers/x.sql', directory: false }).slice(-2)).toEqual(['root@[2001:db8::1]:/tmp/whm-transfer-x.sql', '/var/lib/whm/transfers/x.sql']);
+    expect(rsyncArgv({ transport: 'ssh', destination: 'root@198.51.100.7', src: '/home/bob', dest: '/home/bob' }).at(-2)).toBe('root@198.51.100.7:/home/bob/');
   });
 });
 
@@ -356,6 +365,117 @@ describe('dump scanning', () => {
     bad('CREATE DEFINER=CURRENT_USER PROCEDURE p() BEGIN END;', /CURRENT_USER/);
     bad('CREATE DEFINER = CURRENT_USER() FUNCTION f() RETURNS INT RETURN 1;', /CURRENT_USER/);
   });
+
+  it('refuses @@global / @@persist assignments in every spelling', () => {
+    bad('SET @@global.event_scheduler=ON;', /SET GLOBAL/);
+    bad('SET @@GLOBAL.event_scheduler = ON;', /SET GLOBAL/);
+    bad('SET @@ global . max_connections = 1;', /SET GLOBAL/);
+    bad('SET @@persist.max_connections = 1;', /SET GLOBAL/);
+    bad('SET @@PERSIST_ONLY.max_connections = 1;', /SET GLOBAL/);
+    bad("/*!80000 SET @@GLOBAL.GTID_PURGED=/*!80000 '+'*/ 'aaaa:1-5' */;", /GTID.*--set-gtid-purged=OFF/);
+    bad('SET @@SESSION.SQL_LOG_BIN= 0;', /GTID and binary-log/);
+    ok('/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;\nSET @@session.foreign_key_checks = 0;\nSET @@SESSION.unique_checks=0;');
+  });
+
+  it('refuses statements that target the privilege tables or another schema', () => {
+    bad("UPDATE mysql.user SET authentication_string='' WHERE User='root';", /system schema "mysql"/);
+    bad("UPDATE `mysql`.`user` SET authentication_string='' WHERE User='root';", /system schema "mysql"/);
+    bad("INSERT INTO mysql.global_grants VALUES ('x','%','SYSTEM_USER','N');", /system schema "mysql"/);
+    bad('CREATE TABLE mysql.x (id INT);', /system schema "mysql"/);
+    bad('REPLACE INTO mysql . db VALUES (1);', /system schema "mysql"/);
+    bad('DELETE FROM performance_schema.setup_actors;', /system schema "performance_schema"/);
+    bad('SELECT * FROM sys.session;', /system schema "sys"/);
+    bad('DROP TABLE bob_db.orders;', /targets "bob_db.orders" outside database "alice_shop"/);
+    bad('DROP TABLE IF EXISTS `t`, `bob_db`.`orders`;', /targets "bob_db.orders"/);
+    bad('INSERT INTO bob_db.orders VALUES (1);', /targets "bob_db.orders"/);
+    bad('UPDATE bob_db.orders SET paid = 1;', /targets "bob_db.orders"/);
+    bad('DELETE FROM bob_db.orders;', /targets "bob_db.orders"/);
+    bad('TRUNCATE TABLE bob_db.orders;', /targets "bob_db.orders"/);
+    bad('ALTER TABLE bob_db.orders ADD COLUMN x INT;', /targets "bob_db.orders"/);
+    bad('RENAME TABLE t TO bob_db.t;', /targets "bob_db.t"/);
+    bad('LOCK TABLES bob_db.orders WRITE;', /targets "bob_db.orders"/);
+    bad('CREATE DEFINER=`alice`@`localhost` VIEW bob_db.v AS SELECT 1;', /targets "bob_db.v"/);
+    bad('CREATE DEFINER=`alice`@`localhost` TRIGGER t BEFORE INSERT ON bob_db.orders FOR EACH ROW BEGIN END;', /targets "bob_db.orders"/);
+    bad('CREATE INDEX i ON bob_db.orders (id);', /targets "bob_db.orders"/);
+    bad('CREATE DEFINER=`alice`@`localhost` PROCEDURE bob_db.p() BEGIN END;', /targets "bob_db.p"/);
+    bad('CALL bob_db.p();', /targets "bob_db.p"/);
+    bad('CREATE TABLE ALICE_BLOG.t (id INT);', /targets "ALICE_BLOG.t"/);
+    // Qualified names of the target database, column references and literals are fine.
+    ok('INSERT INTO alice_shop.t VALUES (1);\nDROP TABLE IF EXISTS `alice_shop`.`t`;\nCREATE TABLE `alice_shop`.`t` (id INT);');
+    ok('/*!50001 CREATE ALGORITHM=UNDEFINED */\n/*!50013 DEFINER=`alice_app`@`localhost` SQL SECURITY DEFINER */\n/*!50001 VIEW `v` AS select `alice_shop`.`t`.`id` AS `id` from `alice_shop`.`t` join `u` on `t`.`uid` = `u`.`id` */;');
+    ok("INSERT INTO t VALUES ('mysql.user', 'UPDATE mysql.user SET x=1'), ('bob_db.orders');");
+    ok('CREATE TABLE `t` (`id` int NOT NULL, `ts` timestamp ON UPDATE CURRENT_TIMESTAMP, FOREIGN KEY (`id`) REFERENCES `u` (`id`) ON DELETE CASCADE);');
+  });
+
+  it('refuses the remaining file, instance and engine statements', () => {
+    bad("LOAD XML INFILE '/etc/passwd' INTO TABLE t;", /LOAD DATA \/ LOAD XML INFILE/);
+    bad("LOAD XML LOCAL INFILE '/etc/passwd' INTO TABLE t;", /LOAD XML/);
+    bad('ALTER INSTANCE ROTATE INNODB MASTER KEY;', /server instance/);
+    bad("CREATE TABLESPACE ts ADD DATAFILE '/var/www/x.ibd';", /TABLESPACE/);
+    bad("CREATE TABLE t (id INT) DATA DIRECTORY='/var/www';", /DATA DIRECTORY/);
+    bad("CREATE TABLE t (id INT) INDEX DIRECTORY = '/var/www';", /DATA DIRECTORY/);
+    bad("CREATE TABLE t (id INT) ENGINE=FEDERATED CONNECTION='mysql://root@10.0.0.1/db/t';", /storage engine/);
+    bad("CREATE TABLE t (id INT) ENGINE=CONNECT TABLE_TYPE=DOS FILE_NAME='/etc/passwd';", /storage engine/);
+    bad("CREATE SERVER s FOREIGN DATA WRAPPER mysql OPTIONS (HOST '10.0.0.1');", /CREATE SERVER/);
+    bad("IMPORT TABLE FROM '/tmp/x.sdi';", /IMPORT TABLE/);
+    bad('SET ROLE ALL;', /SET ROLE/);
+    bad('RESET MASTER;', /replication/);
+    bad("BINLOG 'AAAA';", /replication/);
+    bad('FLUSH TABLES WITH READ LOCK;', /FLUSH/);
+    ok('CREATE TABLE t (id INT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;\nFLUSH TABLES t;');
+  });
+
+  it('refuses mysql client commands, which the client runs as the user importing', () => {
+    bad('system id', /client command "system"/);
+    bad('system id;', /client command "system"/);
+    bad('SELECT 1; system id;', /client command "system"/);
+    bad('  SYSTEM id', /client command "system"/);
+    bad('system\tid', /client command "system"/);
+    bad('tee /etc/cron.d/x', /client command "tee"/);
+    bad('tee /etc/cron.d/x;\nSELECT 1;', /client command "tee"/);
+    bad('pager sh', /client command "pager"/);
+    bad('source /etc/whm/other.sql', /client command "source"/);
+    bad('connect mysql', /client command "connect"/);
+    bad('charset gbk', /client command "charset"/);
+    bad('status', /client command "status"/);
+    bad('\\! id', /backslash command/);
+    bad('\\!id', /backslash command/);
+    bad('SELECT 1 \\! id', /backslash command/);
+    bad('SELECT 1;\\! id', /backslash command/);
+    bad('\\T /etc/cron.d/x', /backslash command/);
+    bad('\\. /etc/whm/other.sql', /backslash command/);
+    bad('\\P sh', /backslash command/);
+    bad('SELECT 1\\G', /backslash command/);
+    bad('/*! \\! id */ SELECT 1;', /backslash command/);
+    bad('/*+ \\! id */ SELECT 1;', /backslash command/);
+    bad('DELIMITER $$x', /statement delimiter/);
+    bad('DELIMITER system', /statement delimiter/);
+    bad('use mysql', /switches to database "mysql"/);
+    bad('use `bob_db`', /switches to database "bob_db"/);
+    // What the client itself treats as SQL or a plain comment is accepted.
+    ok('status int,\nedit varchar(10),\nsource_id INT;');
+    ok('/* \\! id */ SELECT 1;\n-- \\! id\n# \\T /etc/x\nSELECT 1;');
+    ok("INSERT INTO t VALUES ('\\\\! id', 'system id', 'tee /etc/x', 'a\\'b');");
+    ok("INSERT INTO t VALUES ('line one\nsystem id\n\\! id\nline four');");
+    ok('INSERT INTO t VALUES (\\N, 1);');
+    ok('INSERT INTO `sys\\tem` VALUES (1);');
+    ok('DELIMITER ;;\nCREATE DEFINER=`alice`@`localhost` TRIGGER t BEFORE INSERT ON x FOR EACH ROW BEGIN SELECT 1; END ;;\nDELIMITER ;\nSELECT 1;');
+    ok('DELIMITER //\nCREATE DEFINER=`alice_app`@`localhost` PROCEDURE p() BEGIN SELECT 1; SELECT 2; END //\nDELIMITER ;');
+    // A "system" statement after a ";;" delimiter switch is still a statement start.
+    bad('DELIMITER ;;\nSELECT 1 ;;\nsystem id ;;', /client command "system"/);
+    bad('DELIMITER ;;\nsystem id\n', /client command "system"/);
+  });
+
+  it('mirrors find_command(): long forms need the first word, bare-word commands take no arguments', () => {
+    expect(clientCommand('system id')).toEqual({ name: 'system', args: 'id' });
+    expect(clientCommand('   TEE   /tmp/x  ')).toEqual({ name: 'tee', args: '/tmp/x  ' });
+    expect(clientCommand('status')).toEqual({ name: 'status', args: '' });
+    expect(clientCommand('status int')).toBe(null);
+    expect(clientCommand('system\nid')).toBe(null);
+    expect(clientCommand('systemd restart')).toBe(null);
+    expect(clientCommand('')).toBe(null);
+    expect(clientCommand('SELECT system')).toBe(null);
+  });
 });
 
 describe('transfer.mysql.import', () => {
@@ -387,6 +507,14 @@ describe('transfer.mysql.import', () => {
     expect((await opError(runOp('transfer.mysql.import', { path: evil, database: 'alice_shop' }, ctx))).message).toMatch(/line 3: user or role management/);
     fs.writeFileSync(evil, "CREATE TABLE t (id INT);\nCREATE DEFINER=`root`@`localhost` PROCEDURE p() BEGIN END;\n");
     expect((await opError(runOp('transfer.mysql.import', { path: evil, database: 'alice_shop', definerPrefix: 'alice' }, ctx))).message).toMatch(/DEFINER 'root'/);
+    fs.writeFileSync(evil, "CREATE TABLE t (id INT);\nINSERT INTO t VALUES (1);\nsystem touch /etc/cron.d/x\n");
+    expect((await opError(runOp('transfer.mysql.import', { path: evil, database: 'alice_shop', definerPrefix: 'alice' }, ctx))).message).toMatch(/line 3: the dump contains the mysql client command "system"/);
+    fs.writeFileSync(evil, "CREATE TABLE t (id INT);\nINSERT INTO t VALUES (1); \\! id\n");
+    expect((await opError(runOp('transfer.mysql.import', { path: evil, database: 'alice_shop', definerPrefix: 'alice' }, ctx))).message).toMatch(/line 2: the dump contains a backslash command/);
+    fs.writeFileSync(evil, "CREATE TABLE t (id INT);\nUPDATE mysql.user SET authentication_string='' WHERE User='root';\n");
+    expect((await opError(runOp('transfer.mysql.import', { path: evil, database: 'alice_shop', definerPrefix: 'alice' }, ctx))).message).toMatch(/line 2: the dump references the system schema "mysql"/);
+    fs.writeFileSync(evil, "CREATE TABLE t (id INT);\nSET @@global.event_scheduler=ON;\n");
+    expect((await opError(runOp('transfer.mysql.import', { path: evil, database: 'alice_shop', definerPrefix: 'alice' }, ctx))).message).toMatch(/line 2: SET GLOBAL/);
     expect(exec).not.toHaveBeenCalled();
     // A clean dump passes the scan; without a client it stops at the capability check.
     if (!hasBinary('mysql') && !hasBinary('mariadb')) {

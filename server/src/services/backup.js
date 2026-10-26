@@ -829,7 +829,7 @@ export function createBackupService(ctx) {
               const claim = databaseClaim(d.database, account);
               if (!claim.ok) { skipped.push(`${d.database} (${claim.reason})`); jobCtx.log(`database ${d.database} skipped: ${claim.reason}`, 'warn'); continue; }
               try {
-                await op('backup.db.import', { file: d.file, ...(creds ? { credentials: creds } : {}) }, req);
+                await op('backup.db.import', { file: d.file, database: d.database, ...(creds ? { credentials: creds } : {}) }, req);
                 imported.push(d.database);
                 try { await ctx.databases?.assign?.({ kind: 'database', name: d.database, account: account.username }, SYSTEM_ROOT, req); } catch (err) { jobCtx.log(`database map: ${d.database}: ${err.message}`, 'warn'); }
               } catch (err) {

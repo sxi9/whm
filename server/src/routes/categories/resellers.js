@@ -42,6 +42,7 @@ export async function register(ctx) {
   // Usage overview / email / ownership / reset / ACL lists (static paths before /:username)
   r.get('/usage', requireRoot, wrap(() => svc().usageAll()));
   r.get('/email/recipients', requireRoot, wrap(() => svc().recipients()));
+  r.get('/email/history', requireRoot, validate({ query: z.object({ limit: z.coerce.number().int().min(1).max(200).default(50) }) }), wrap((req) => svc().emailHistory(req.query.limit)));
   r.post('/email', requireRoot, validate({ body: z.object({ subject: z.string().trim().min(1).max(200).regex(/^[^\r\n]+$/, 'Single line'), text: z.string().min(1).max(200_000), from: fields.email.optional() }).strict() }),
     wrap((req) => svc().emailAll(req.body, req.user, req), 202));
   r.post('/reset', requireRoot, validate({ body: z.object({ usernames: usernames.optional(), all: z.boolean().optional() }).strict().refine((b) => b.all === true || (b.usernames?.length ?? 0) > 0, { message: 'Select at least one reseller or all', path: ['usernames'] }) }),

@@ -51,8 +51,8 @@ export function MailPreferences() {
   const sendTest = async () => {
     setTesting(true);
     try {
-      const res = await api.post('/server-contacts/settings/test-mail', { to: data.rootAddress });
-      toast.success(`Test message for ${data.rootAddress} handed to ${res.data.transport === 'smtp' ? 'the SMTP relay' : 'Exim'}`);
+      const res = await api.post('/server-contacts/mail-preferences/test');
+      toast.success(`Test message for root handed to ${res.data.transport === 'smtp' ? `the SMTP relay for ${res.data.to.join(', ')}` : `Exim as ${res.data.address}`}`);
     } catch (err) { toast.error(err, { timeout: 10_000 }); } finally { setTesting(false); }
   };
 
@@ -66,6 +66,17 @@ export function MailPreferences() {
       {aliasesUnavailable && <CapabilityNotice error={{ code: 'capability_missing', message: `The agent could not read ${data.aliases?.path || '/etc/aliases'} (${data.aliasError.message}). The forwarding list below is the last one saved from this panel.` }} onRetry={refetch} />}
       {data.aliasError && !aliasesUnavailable && <ErrorBanner error={{ message: `Could not read /etc/aliases: ${data.aliasError.message}` }} onRetry={refetch} />}
       {!data.capability.mailTransport && <div className="banner banner-warning"><div><strong>No mail transport</strong><p>Exim is not installed and no SMTP relay is configured in Contact Manager, so copies of events cannot be mailed to root yet. Forwarding in /etc/aliases is still saved for when the mail server is installed.</p></div></div>}
+      {data.capability.mailTransport === 'smtp' && (
+        <div className={`banner ${data.rootDelivery?.error ? 'banner-warning' : 'banner-info'}`}><div>
+          <strong>Root mail goes through the SMTP relay</strong>
+          <p>
+            The relay configured in Contact Manager does not read /etc/aliases, so the events below are sent straight to the forwarding addresses above
+            {data.rootDelivery?.to?.length ? <> (currently {data.rootDelivery.to.join(', ')})</> : null}.
+            {data.rootDelivery?.skipped?.length ? <> Local account name{data.rootDelivery.skipped.length > 1 ? 's' : ''} {data.rootDelivery.skipped.join(', ')} cannot be reached that way and {data.rootDelivery.skipped.length > 1 ? 'are' : 'is'} skipped.</> : null}
+            {data.rootDelivery?.error ? <> <strong>Nothing can be delivered right now:</strong> {data.rootDelivery.error}</> : null}
+          </p>
+        </div></div>
+      )}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: 18, alignItems: 'start' }}>
         <Card title="Where root's mail goes" subtitle={`System mail for root (cron output, daemon reports, the events below) is addressed to ${data.rootAddress} and delivered according to /etc/aliases.`}>
@@ -74,7 +85,7 @@ export function MailPreferences() {
             ['Rebuild after saving', data.aliases?.rebuildTool === 'newaliases' ? 'newaliases (Postfix/Sendmail database)' : data.aliases?.rebuildTool === 'exim' ? 'not needed: Exim reads the file directly' : <span className="muted">no mail server detected</span>],
             ['Mail transport', data.capability.mailTransport === 'exim' ? 'Exim on this server' : data.capability.mailTransport === 'smtp' ? 'SMTP relay (Contact Manager)' : <span className="muted">none</span>],
           ]} />
-          <Field label="Forward root's mail to" help="Local account names or full email addresses. An empty list keeps root's mail in the local mailbox.">
+          <Field label="Forward root's mail to" help={data.capability.mailTransport === 'smtp' ? 'Full email addresses receive the events below through the SMTP relay; local account names only apply once a mail server runs on this host.' : 'Local account names or full email addresses. An empty list keeps root\'s mail in the local mailbox.'}>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
               {forwardTo.length === 0 && <span className="muted">Not forwarded (local mailbox)</span>}
               {forwardTo.map((t) => (
@@ -90,7 +101,7 @@ export function MailPreferences() {
             </form>
           </Field>
           <FormActions>
-            <Button icon={Send} loading={testing} disabled={!data.capability.mailTransport || dirty} onClick={sendTest} title={dirty ? 'Save first' : undefined}>Send a test message to root</Button>
+            <Button icon={Send} loading={testing} disabled={!data.capability.mailTransport || dirty || Boolean(data.rootDelivery?.error)} onClick={sendTest} title={dirty ? 'Save first' : data.rootDelivery?.error || undefined}>Send a test message to root</Button>
           </FormActions>
         </Card>
 

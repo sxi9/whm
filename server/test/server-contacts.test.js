@@ -174,7 +174,7 @@ describe('Server Contacts API', () => {
     hook.setStatus(200);
     await app.ctx.capabilities.refresh();
     clearContacts();
-    app.ctx.settings.setMany({ 'contacts.enabled': true, 'contacts.smtp.host': '', 'contacts.smtp.prefer': false, 'contacts.smtp.username': '', 'contacts.smtp.password_enc': '', 'contacts.from_address': '', 'contacts.check.enabled': true, 'contacts.root_mail_events': ['service.down', 'disk.space.low', 'backup.failed'] });
+    app.ctx.settings.setMany({ 'contacts.enabled': true, 'contacts.smtp.host': '', 'contacts.smtp.prefer': false, 'contacts.smtp.username': '', 'contacts.smtp.password_enc': '', 'contacts.from_address': '', 'contacts.check.enabled': true, 'contacts.root_mail_events': ['service.down', 'disk.space.low', 'backup.failed'], 'contacts.root_forward': [] });
   });
 
   it('registers the module: ctx.contacts, job type, schedule and the integration surface', () => {
@@ -214,7 +214,16 @@ describe('Server Contacts API', () => {
     await post('/api/server-contacts/contacts', { channel: 'email', address: '-r@example.com' }).expect(422);
 
     const updated = await patch(`/api/server-contacts/contacts/${id}`, { events: [], minSeverity: 'info', enabled: false, name: 'Ops team' }).expect(200);
-    expect(updated.body.data).toMatchObject({ name: 'Ops team', events: ['*'], minSeverity: 'info', enabled: false });
+    expect(updated.body.data).toMatchObject({ name: 'Ops team', events: ['*'], allEvents: true, minSeverity: 'info', enabled: false });
+    // Narrowing an all-events contact must drop the "*" marker; a mixed list is refused rather than silently matching everything.
+    const narrowed = await patch(`/api/server-contacts/contacts/${id}`, { events: ['service.down'] }).expect(200);
+    expect(narrowed.body.data).toMatchObject({ events: ['service.down'], allEvents: false });
+    expect(JSON.parse(app.ctx.db.prepare('SELECT events_json FROM contacts WHERE id = ?').get(id).events_json)).toEqual(['service.down']);
+    const mixed = await patch(`/api/server-contacts/contacts/${id}`, { events: ['*', 'service.down'] }).expect(422);
+    expect(mixed.body.error.fields.events[0]).toMatch(/not both/);
+    expect(JSON.parse(app.ctx.db.prepare('SELECT events_json FROM contacts WHERE id = ?').get(id).events_json)).toEqual(['service.down']);
+    expect((await post('/api/server-contacts/contacts', { channel: 'email', address: 'mixed@example.com', events: ['*', 'backup.failed'] }).expect(422)).body.error.fields.events).toBeDefined();
+    expect((await patch(`/api/server-contacts/contacts/${id}`, { events: ['*', '*'] }).expect(200)).body.data).toMatchObject({ events: ['*'], allEvents: true });
     await patch(`/api/server-contacts/contacts/${id}`, { address: 'nope' }).expect(422);
     await patch(`/api/server-contacts/contacts/${po.body.data.id}`, { config: { token: null } }).expect(422);
     expect((await patch(`/api/server-contacts/contacts/${po.body.data.id}`, { config: { token: 'b'.repeat(30) } }).expect(200)).body.data.config.token.set).toBe(true);
@@ -237,6 +246,9 @@ describe('Server Contacts API', () => {
     expect(app.ctx.crypto.decrypt(JSON.parse(stored.config_json).url_enc)).toBe(slackUrl);
     expect(auditRows('contacts.create').at(-1).target).toBe('hooks.slack.com/services/T0AB…/…5678');
     expect(JSON.stringify(auditRows('contacts.create').at(-1))).not.toContain('SeCrEtToKeN');
+    const genericCreate = auditRows('POST /api/server-contacts/contacts').at(-1);
+    expect(JSON.parse(genericCreate.args_redacted).address).toBe('hooks.slack.com/services/T0AB…/…5678');
+    expect(JSON.stringify(genericCreate)).not.toContain('SeCrEtToKeN');
 
     const hookUrl = `http://127.0.0.1:${hookPort}/notify?token=QueryToken987`;
     const wh = await post('/api/server-contacts/contacts', { name: 'Tokened hook', channel: 'webhook', address: hookUrl }).expect(201);
@@ -265,6 +277,15 @@ describe('Server Contacts API', () => {
     expect(replaced.body.data.address).toBe('hooks.slack.com/services/T0AB…/…0099');
     expect(app.ctx.crypto.decrypt(JSON.parse(app.ctx.db.prepare('SELECT config_json FROM contacts WHERE id = ?').get(slack.body.data.id).config_json).url_enc)).toBe('https://hooks.slack.com/services/T0ABCDEF/B0GHIJKL/NewToken000099');
     expect(JSON.stringify(auditRows('contacts.update').at(-1))).not.toContain('NewToken');
+    const genericPatch = auditRows('PATCH /api/server-contacts/contacts/:id').at(-1);
+    expect(JSON.parse(genericPatch.args_redacted).address).toBe('hooks.slack.com/services/T0AB…/…0099');
+    expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE args_redacted LIKE '%NewToken%' OR args_redacted LIKE '%SeCrEtToKeN%' OR target LIKE '%NewToken%' OR target LIKE '%SeCrEtToKeN%'").get().n).toBe(0);
+    // A query-string token is masked the same way, and a rejected URL with embedded credentials never reaches the log either.
+    await post('/api/server-contacts/contacts', { channel: 'webhook', address: `http://127.0.0.1:${hookPort}/q?token=AuditQueryToken` }).expect(201);
+    expect(JSON.parse(auditRows('POST /api/server-contacts/contacts').at(-1).args_redacted).address).toBe(`http://127.0.0.1:${hookPort}/q?…`);
+    await post('/api/server-contacts/contacts', { channel: 'webhook', address: 'https://user:BasicPw123@example.com/x' }).expect(422);
+    expect(JSON.parse(auditRows('POST /api/server-contacts/contacts').at(-1).args_redacted).address).toBe('[redacted]');
+    expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE args_redacted LIKE '%AuditQueryToken%' OR args_redacted LIKE '%BasicPw123%'").get().n).toBe(0);
     await patch(`/api/server-contacts/contacts/${slack.body.data.id}`, { channel: 'email' }).expect(422);
     await patch(`/api/server-contacts/contacts/${plain.body.data.id}`, { channel: 'slack' }).expect(422);
     const dropped = await patch(`/api/server-contacts/contacts/${wh.body.data.id}`, { address: `http://127.0.0.1:${hookPort}/no-token` }).expect(200);
@@ -354,10 +375,33 @@ describe('Server Contacts API', () => {
     expect(direct.body.data).toMatchObject({ transport: 'smtp', to: ['someone@example.org'], accepted: true });
     expect(smtp.sessions[1].commands).toContain('RCPT TO:<someone@example.org>');
 
+    // Root mail over the relay goes to the saved forwarding addresses: /etc/aliases means nothing to an external relay.
+    app.ctx.settings.set('contacts.root_forward', ['admin@example.net', 'oncall', 'second@example.org']);
+    let prefs = (await get('/api/server-contacts/mail-preferences').expect(200)).body.data;
+    expect(prefs.rootDelivery).toEqual({ transport: 'smtp', rootAddress: 'root@panel.example.com', to: ['admin@example.net', 'second@example.org'], skipped: ['oncall'], error: null });
     const r = await app.ctx.contacts.notify({ event: 'service.down', subject: 'Exim is down', body: 'dead', severity: 'error' });
     expect(r).toMatchObject({ matched: 1, sent: 2, failed: 0 });
-    expect(r.deliveries.find((d) => d.contactId === null)).toMatchObject({ address: 'root@panel.example.com', status: 'sent', transport: 'smtp' });
-    expect(smtp.sessions.at(-1).commands).toContain('RCPT TO:<root@panel.example.com>');
+    expect(r.deliveries.find((d) => d.contactId === null)).toMatchObject({ address: 'admin@example.net, second@example.org', to: ['admin@example.net', 'second@example.org'], status: 'sent', transport: 'smtp' });
+    expect(smtp.sessions.at(-1).commands).toEqual(expect.arrayContaining(['RCPT TO:<admin@example.net>', 'RCPT TO:<second@example.org>']));
+    expect(smtp.sessions.at(-1).commands.join('\n')).not.toMatch(/root@|oncall/);
+    const rootTest = await post('/api/server-contacts/mail-preferences/test').expect(200);
+    expect(rootTest.body.data).toMatchObject({ status: 'sent', transport: 'smtp', to: ['admin@example.net', 'second@example.org'] });
+    expect(smtp.sessions.at(-1).data).toContain('Subject: [panel.example.com] Test message for root');
+
+    app.ctx.settings.set('contacts.root_forward', ['oncall']);
+    const sessionsBefore = smtp.sessions.length;
+    const r2 = await app.ctx.contacts.notify({ event: 'service.down', subject: 'still down', body: 'dead', severity: 'error' });
+    expect(r2).toMatchObject({ matched: 1, sent: 1, failed: 1 });
+    expect(r2.deliveries.find((d) => d.contactId === null)).toMatchObject({ address: 'root@panel.example.com', status: 'failed', code: 'no_root_recipients', error: expect.stringMatching(/local account oncall/) });
+    expect(smtp.sessions).toHaveLength(sessionsBefore + 1);
+    expect((await get('/api/server-contacts/deliveries?status=failed').expect(200)).body.data[0]).toMatchObject({ contact_name: 'root (system mail)', address: 'root@panel.example.com' });
+    app.ctx.settings.set('contacts.root_forward', []);
+    prefs = (await get('/api/server-contacts/mail-preferences').expect(200)).body.data;
+    expect(prefs.rootDelivery).toMatchObject({ transport: 'smtp', to: [], skipped: [], error: expect.stringMatching(/none are set/) });
+    const noRecipients = await post('/api/server-contacts/mail-preferences/test').expect(422);
+    expect(noRecipients.body.error).toMatchObject({ code: 'no_root_recipients', message: expect.stringMatching(/forwarding addresses/) });
+    expect(smtp.sessions).toHaveLength(sessionsBefore + 1);
+    app.ctx.settings.set('contacts.root_forward', ['admin@example.net']);
 
     smtp.setReject('rcpt');
     const failed = await post('/api/server-contacts/settings/test-mail', { to: 'nobody@example.org' }).expect(502);
@@ -382,6 +426,14 @@ describe('Server Contacts API', () => {
     expect(r).toMatchObject({ transport: 'exim', from: 'whm@panel.example.com', to: ['a@example.com'], accepted: true });
     expect(sentViaExim).toEqual([{ from: 'whm@panel.example.com', to: ['a@example.com'], subject: 'Hello', text: 'line1\nline2' }]);
     expect(auditRows('contacts.mail.send').at(-1)).toMatchObject({ target: 'a@example.com' });
+    // With Exim the host's /etc/aliases does the forwarding, so root mail stays addressed to root@<fqdn> whatever the saved list says.
+    app.ctx.settings.set('contacts.root_forward', ['admin@example.net']);
+    expect((await get('/api/server-contacts/mail-preferences').expect(200)).body.data.rootDelivery).toEqual({ transport: 'exim', rootAddress: 'root@panel.example.com', to: ['root@panel.example.com'], skipped: [], error: null });
+    const rootViaExim = await app.ctx.contacts.notify({ event: 'backup.failed', subject: 'Nightly backup failed', body: 'disk full', severity: 'error' });
+    expect(rootViaExim.deliveries.find((d) => d.contactId === null)).toMatchObject({ address: 'root@panel.example.com', status: 'sent', transport: 'exim' });
+    expect(sentViaExim.at(-1)).toMatchObject({ to: ['root@panel.example.com'], subject: '[panel.example.com] Nightly backup failed' });
+    expect((await post('/api/server-contacts/mail-preferences/test').expect(200)).body.data).toMatchObject({ status: 'sent', transport: 'exim', address: 'root@panel.example.com' });
+    expect(auditRows('contacts.mail.send').at(-1)).toMatchObject({ target: 'root@panel.example.com' });
     await expect(app.ctx.contacts.sendMail({ to: '-bounce@example.com', subject: 'x', body: 'y' })).rejects.toMatchObject({ status: 422 });
     await expect(app.ctx.contacts.sendMail({ to: 'a@example.com', subject: 'x', body: 'y', from: '-f@example.com' })).resolves.toMatchObject({ from: 'whm@panel.example.com' });
 
@@ -389,7 +441,7 @@ describe('Server Contacts API', () => {
     expect((await get('/api/server-contacts').expect(200)).body.data.capability.mailTransport).toBe('smtp');
     const r2 = await app.ctx.contacts.sendMail({ to: 'b@example.com', subject: 'Relay', body: 'z' });
     expect(r2.transport).toBe('smtp');
-    expect(sentViaExim).toHaveLength(2);
+    expect(sentViaExim).toHaveLength(4);
     await put('/api/server-contacts/settings', { smtp: { prefer: false } }).expect(200);
     expect((await get('/api/server-contacts').expect(200)).body.data.capability.mailTransport).toBe('exim');
   });
@@ -400,6 +452,8 @@ describe('Server Contacts API', () => {
     expect(res.body.error.code).toBe('capability_missing');
     expect(res.body.error.message).toMatch(/Exim is not installed and no SMTP relay/);
     expect((await post('/api/server-contacts/settings/test-mail', { to: 'a@example.com' }).expect(501)).body.error.code).toBe('capability_missing');
+    expect((await post('/api/server-contacts/mail-preferences/test').expect(501)).body.error.code).toBe('capability_missing');
+    expect((await get('/api/server-contacts/mail-preferences').expect(200)).body.data.rootDelivery).toMatchObject({ transport: null, to: [], error: expect.stringMatching(/no SMTP relay/) });
     expect(app.ctx.contacts.sendMail).toBeUndefined();
     await expect(app.ctx.contacts.mail({ to: 'a@example.com', subject: 'x', body: 'y' })).rejects.toMatchObject({ status: 501, code: 'capability_missing' });
     expect((await get('/api/server-contacts/deliveries?status=failed').expect(200)).body.data[0]).toMatchObject({ channel: 'email', test: 1 });
@@ -557,6 +611,7 @@ describe('Server Contacts API', () => {
     expect((await rpost('/api/server-contacts/notify', { event: 'account.created', subject: 'x' })).status).toBe(403);
     expect((await rpost('/api/server-contacts/check')).status).toBe(403);
     expect((await rpost('/api/server-contacts/settings/test-mail', { to: 'a@example.com' })).status).toBe(403);
+    expect((await rpost('/api/server-contacts/mail-preferences/test')).status).toBe(403);
     expect((await reseller.put('/api/server-contacts/settings').set('X-CSRF-Token', resellerCsrf).send({ enabled: false })).status).toBe(403);
     expect((await reseller.put('/api/server-contacts/mail-preferences').set('X-CSRF-Token', resellerCsrf).send({ forwardTo: [] })).status).toBe(403);
     expect((await reseller.patch('/api/server-contacts/contacts/1').set('X-CSRF-Token', resellerCsrf).send({ enabled: false })).status).toBe(403);

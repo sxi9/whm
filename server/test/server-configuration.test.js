@@ -303,14 +303,37 @@ describe('Server Configuration API', () => {
       await put('/stats', {}).expect(422);
       await put('/stats', { generators: { awstats: false, analog: true } }).expect(422);
       await put('/stats', { cron: 'not cron' }).expect(422);
+      const bad = await put('/stats', { generators: { webalizer: true }, cron: '99 99 * * *' }).expect(422);
+      expect(bad.body.error.fields.cron).toBeDefined();
+      expect(Boolean(app.ctx.settings.get('stats.generators', {}).webalizer)).toBe(false);
+      expect(app.ctx.scheduler.list().find((r) => r.name === 'stats-generation').cron).toBe('17 2 * * *');
       const off = await put('/stats', { generators: { awstats: false, webalizer: true }, defaultGenerator: 'webalizer', cron: '30 3 * * *' }).expect(200);
       expect(off.body.data.schedule).toMatchObject({ cron: '30 3 * * *', enabled: true });
       const none = await put('/stats', { generators: { webalizer: false } }).expect(200);
       expect(none.body.data.schedule.enabled).toBe(false);
       expect(app.ctx.scheduler.list().find((r) => r.name === 'stats-generation').enabled).toBe(0);
+      await put('/stats', { enabled: true }).expect(422);
       const back = await put('/stats', { generators: { awstats: true }, defaultGenerator: 'awstats' }).expect(200);
       expect(back.body.data.schedule.enabled).toBe(true);
       expect(auditCount('server_config.stats.update')).toBe(3);
+    });
+
+    it('keeps an explicitly disabled schedule off across boots while a generator is on', async () => {
+      const row = () => app.ctx.scheduler.list().find((r) => r.name === 'stats-generation');
+      const off = await put('/stats', { enabled: false }).expect(200);
+      expect(off.body.data).toMatchObject({ scheduleEnabled: false, schedule: { enabled: false } });
+      app.ctx.serverConfig.stats.alignSchedule();
+      expect(row().enabled).toBe(0);
+      await put('/stats', { generators: { webalizer: true } }).expect(200);
+      expect(row().enabled).toBe(0);
+      const on = await put('/stats', { enabled: true, generators: { webalizer: false } }).expect(200);
+      expect(on.body.data).toMatchObject({ scheduleEnabled: true, schedule: { enabled: true } });
+      app.ctx.serverConfig.stats.alignSchedule();
+      expect(row().enabled).toBe(1);
+      app.ctx.scheduler.update('stats-generation', { enabled: false });
+      app.ctx.serverConfig.stats.alignSchedule();
+      expect(row().enabled).toBe(0);
+      app.ctx.scheduler.update('stats-generation', { enabled: true });
     });
 
     it('returns 501 when no enabled generator is installed', async () => {
@@ -386,6 +409,13 @@ describe('Server Configuration API', () => {
       await new Promise((r) => setTimeout(r, 80));
       expect(events[0]).toMatchObject({ type: 'open', session: { id: TERM_ID } });
       expect(events.filter((e) => e.type === 'output').map((e) => e.data).join('')).toBe('root@host:~# id\r\nuid=0(root)\r\n');
+      session.lastActivity = Date.now() - 60 * 60_000;
+      terminalOutput.push('still running\r\n');
+      await new Promise((r) => setTimeout(r, 80));
+      expect(Date.now() - session.lastActivity).toBeLessThan(5_000);
+      session.viewers = 0;
+      expect(await app.ctx.serverConfig.terminal.sweep()).toEqual([]);
+      session.viewers = 1;
       terminalExited = true;
       await new Promise((r) => setTimeout(r, 80));
       expect(events.at(-1)).toMatchObject({ type: 'exit', code: 0 });
@@ -407,7 +437,11 @@ describe('Server Configuration API', () => {
       app.ctx.settings.set('terminal.max_sessions', 1);
       await post('/terminal').expect(422);
       app.ctx.settings.set('terminal.max_sessions', 3);
-      sessions.get(open.body.data.id).lastActivity = Date.now() - 60 * 60_000;
+      const session = sessions.get(open.body.data.id);
+      session.lastActivity = Date.now() - 60 * 60_000;
+      session.viewers = 1;
+      expect(await app.ctx.serverConfig.terminal.sweep()).toEqual([]);
+      session.viewers = 0;
       const expired = await app.ctx.serverConfig.terminal.sweep();
       expect(expired).toEqual([open.body.data.id]);
       expect(app.agent.callsTo('terminal.close')).toHaveLength(1);
@@ -433,6 +467,10 @@ describe('Server Configuration API', () => {
     it('validates and saves preferences, including the check schedule', async () => {
       await put('/updates', {}).expect(422);
       await put('/updates', { tier: 'nightly' }).expect(422);
+      const bad = await put('/updates', { tier: 'edge', cron: 'a b c d e' }).expect(422);
+      expect(bad.body.error.fields.cron).toBeDefined();
+      expect(app.ctx.settings.get('updates.tier', 'stable')).toBe('stable');
+      expect(app.ctx.scheduler.list().find((r) => r.name === 'update-preferences-check').cron).toBe('23 4 * * 1');
       const { body } = await put('/updates', { tier: 'release', auto: false, autoOs: true, cron: '0 6 * * *', scheduleEnabled: false }).expect(200);
       expect(body.data).toMatchObject({ tier: 'release', auto: false, autoOs: true, schedule: { cron: '0 6 * * *', enabled: false } });
       expect(app.ctx.settings.get('updates.tier')).toBe('release');

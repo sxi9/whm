@@ -81,6 +81,7 @@ export async function register(ctx) {
   // Edit System Mail Preferences
   r.get('/mail-preferences', requireRoot, wrap(() => s.mailPreferences()));
   r.put('/mail-preferences', requireRoot, validate({ body: mailPrefsBody }), wrap((req) => s.setMailPreferences(req.body, req)));
+  r.post('/mail-preferences/test', requireRoot, wrap((req) => s.testRootMail(req)));
 
   return { path: '/server-contacts', router: r };
 }

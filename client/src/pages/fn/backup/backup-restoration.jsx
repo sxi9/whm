@@ -83,7 +83,7 @@ export default function BackupRestoration({ fn }) {
           <div className="form-grid" style={{ marginTop: 12 }}>
             <Field inline><Toggle checked={options.files} onChange={setOpt('files')} label="Home directory and mail" description="Archived files are written over the current ones with the account's ownership." /></Field>
             <Field inline><Toggle checked={options.overwrite} onChange={setOpt('overwrite')} label="Overwrite files that exist" description="Off: only files missing from the home directory are restored." disabled={!options.files} /></Field>
-            <Field inline><Toggle checked={options.databases} onChange={setOpt('databases')} label="Databases, users and grants" description="Each dump is imported with DROP DATABASE IF EXISTS; users keep their original passwords." /></Field>
+            <Field inline><Toggle checked={options.databases} onChange={setOpt('databases')} label="Databases, users and grants" description="Each schema is created if missing, then its dump is imported inside it (works for cPanel per-database dumps too); users keep their original passwords." /></Field>
             <Field inline><Toggle checked={options.dns} onChange={setOpt('dns')} label="DNS zones" description="Zone files are loaded into BIND (saved for later when BIND is missing)." /></Field>
             <Field inline><Toggle checked={options.mail} onChange={setOpt('mail')} label="Mail routing (local / remote / backup MX)" /></Field>
             <Field inline><Toggle checked={options.createAccount} onChange={setOpt('createAccount')} label="Recreate the account if it was terminated" description="Linux user, home, package and web vhost come from the archive metadata." /></Field>

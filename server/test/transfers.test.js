@@ -134,8 +134,15 @@ describe('Transfers API', () => {
   let resellerHttp;
   let resellerCsrf;
 
+  // The mock records args only; the options of each call (socket-client
+  // timeouts for the long ops) are captured here.
+  const callOptions = [];
+  const optionsOf = (name) => callOptions.filter((c) => c.name === name).map((c) => c.opts);
+
   beforeAll(async () => {
     app = await createTestApp({ agent: hostAgent() });
+    const originalOp = app.agent.op;
+    app.agent.op = (name, args, opts) => { callOptions.push({ name, opts }); return originalOp.call(app.agent, name, args, opts); };
     csrf = await app.login();
     reseller = await app.createUser('resell1', 'reseller');
     await app.http.post('/api/packages').set('X-CSRF-Token', csrf).send({ name: 'gold', disk_mb: 20480, bandwidth_mb: 204800, has_shell: true, max_db: 10 }).expect(201);
@@ -292,6 +299,9 @@ describe('Transfers API', () => {
       expect(rsync[0].args.connection.privateKey).toBe(KEY);
       expect(rsync[1].args).toMatchObject({ remotePath: '/tmp/whm-transfer-bob_shop-abcd.sql', directory: false });
       expect(app.agent.callsTo('transfer.remote.remove_file')[0].args.path).toBe('/tmp/whm-transfer-bob_shop-abcd.sql');
+      // Copies and dumps may run for hours: the split-mode socket client must not give up after its 1 h default.
+      expect(optionsOf('transfer.remote.rsync').map((o) => o.timeoutMs)).toEqual([86_400_000, 86_400_000]);
+      expect(optionsOf('transfer.remote.dump_database').map((o) => o.timeoutMs)).toEqual([7_200_000]);
       expect(app.agent.callsTo('fs.chown')[0].args).toMatchObject({ path: account.home_dir, owner: 'robert', recursive: true });
 
       const run = (await get(`/runs/${runId}`).expect(200)).body.data;
@@ -489,6 +499,7 @@ describe('Transfers API', () => {
       const extracts = app.agent.callsTo('transfer.cpmove.extract');
       expect(extracts[0].args).toMatchObject({ path: file, destination: account.home_dir, members: ['cpmove-dave/homedir/*'], stripComponents: 2, owner: 'dave' });
       expect(extracts[1].args).toMatchObject({ members: ['cpmove-dave/mysql/dave_blog.sql'], destination: '/var/lib/whm/transfers/run-' + res.body.data.run.id });
+      expect(optionsOf('transfer.cpmove.extract').every((o) => o.timeoutMs === 86_400_000)).toBe(true);
       // The UI's inspect result is reused: the archive is not listed again for the restore.
       expect(app.agent.callsTo('transfer.cpmove.inspect')).toHaveLength(0);
       const run = (await get(`/runs/${res.body.data.run.id}`).expect(200)).body.data;
@@ -529,6 +540,7 @@ describe('Transfers API', () => {
         const imported = app.agent.callsTo('transfer.mysql.import').map((c) => c.args.database);
         expect(imported.sort()).toEqual(['dave4_blog', 'dave4_mysql', 'dave4_sys']);
         expect(app.agent.callsTo('transfer.mysql.import').every((c) => c.args.definerPrefix === 'dave')).toBe(true);
+        expect(optionsOf('transfer.mysql.import').every((o) => o.timeoutMs === 7_200_000)).toBe(true);
         expect(app.agent.callsTo('db.database.create').map((c) => c.args.name).sort()).toEqual(['dave4_blog', 'dave4_mysql', 'dave4_sys']);
         // mysql.sql: dave_app keeps its hash, dave_ro (unix_socket) gets a random password, root/evil/mysql.*/FILE are refused.
         const created = app.agent.callsTo('transfer.mysql.create_user');

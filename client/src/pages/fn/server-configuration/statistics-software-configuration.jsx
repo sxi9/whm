@@ -39,6 +39,7 @@ export default function StatisticsSoftwareConfiguration({ fn }) {
   };
 
   const det = data?.detect?.generators || {};
+  const anyOn = Boolean(data && Object.values(data.generators).some(Boolean));
   return (
     <>
       <PageHeader fn={fn} description="Choose which web statistics generators process the per-domain access logs, which one accounts get by default and how often statistics are rebuilt." actions={data && <Button variant="primary" onClick={() => run()}>Generate now</Button>} />
@@ -75,12 +76,13 @@ export default function StatisticsSoftwareConfiguration({ fn }) {
             </FormActions>
           </Card>
           <div className="form-grid">
-            <Card title="Schedule" actions={data.schedule && <StatusPill status={data.schedule.enabled ? 'enabled' : 'disabled'}>{data.schedule.enabled ? 'enabled' : 'disabled (no generator on)'}</StatusPill>}>
+            <Card title="Schedule" actions={data.schedule && <StatusPill status={data.schedule.enabled ? 'enabled' : 'disabled'}>{data.schedule.enabled ? 'enabled' : anyOn ? 'disabled' : 'disabled (no generator on)'}</StatusPill>}>
               {data.schedule ? (
                 <>
+                  <Field inline><Toggle checked={data.scheduleEnabled} disabled={busy || !anyOn} onChange={(v) => save({ enabled: v })} label="Rebuild statistics on a schedule" description={anyOn ? 'Runs every enabled generator for all active domains.' : 'Enable a generator first.'} /></Field>
                   <Field label="Cron expression" help="Nightly after log rotation is typical"><CronField value={data.schedule.cron} onSave={(cron) => save({ cron })} saving={busy} /></Field>
                   <KeyValue items={[['Last run', formatDate(data.schedule.lastRunAt)], ['Next run', formatDate(data.schedule.nextRunAt)], ['Active domains', data.domains]]} />
-                  <p className="muted">The schedule follows the generators: it is disabled automatically while none is enabled. Edit it with the other panel schedules in <Link to="/server-configuration/configure-cpanel-cron-jobs">Configure cPanel Cron Jobs</Link>.</p>
+                  <p className="muted">The schedule is paused automatically while no generator is enabled and resumes when one is turned back on. It is also listed with the other panel schedules in <Link to="/server-configuration/configure-cpanel-cron-jobs">Configure cPanel Cron Jobs</Link>.</p>
                 </>
               ) : <p className="muted">Schedule not registered.</p>}
             </Card>

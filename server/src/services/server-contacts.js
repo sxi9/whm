@@ -198,6 +198,34 @@ export function createServerContactsService(ctx) {
     return { display, config: next };
   }
 
+  // The generic mutation audit stores req.body when the response finishes,
+  // so a credential-bearing URL submitted as "address" is swapped for its
+  // display form before that happens (also when validation then fails).
+  function redactRequestAddress(req, channel, address) {
+    if (!req?.body || req.body.address === undefined) return;
+    let safe = address;
+    try {
+      const { display, secret } = maskAddress(channel, address);
+      if (secret) safe = display;
+      else if (channel === 'webhook') { const url = new URL(address); if (url.username || url.password) safe = '[redacted]'; }
+    } catch {
+      if (['slack', 'webhook'].includes(channel)) safe = '[redacted]';
+    }
+    req.body.address = safe;
+  }
+
+  // An empty list means every event; "*" may not be mixed with specific keys
+  // because matches() would then deliver everything regardless of the keys.
+  function normalizeEvents(list) {
+    const events = [...new Set(list || [])];
+    if (!events.length) return ['*'];
+    if (events.includes('*')) {
+      if (events.length > 1) throw unprocessable('Contact validation failed', { events: ['Choose either every event ("*") or a list of specific events, not both'] });
+      return ['*'];
+    }
+    return events;
+  }
+
   // The real URL a credential-bearing contact posts to.
   function targetUrl(row, config) {
     return config.url || row.address;
@@ -340,20 +368,46 @@ export function createServerContactsService(ctx) {
     }
   }
 
-  // Root's mailbox (forwarded by /etc/aliases) for the events the system mail
-  // preferences select. Logged as a delivery with no contact.
-  async function mailRoot(msg, req) {
+  // With Exim on this host, root@<fqdn> is expanded by /etc/aliases. An SMTP
+  // relay knows nothing about that file, so the forwarding targets saved from
+  // Edit System Mail Preferences are addressed directly; a local account name
+  // has no mailbox the relay could reach and is skipped.
+  function rootRecipients() {
     const host = hostname();
-    const to = `root@${FQDN_RE.test(host) ? host : 'localhost.localdomain'}`;
-    const base = { contact_name: 'root (system mail)', channel: 'email', address: to, event: msg.event, severity: msg.severity, subject: msg.subject };
+    const transport = mailTransport();
+    const rootAddress = `root@${FQDN_RE.test(host) ? host : 'localhost.localdomain'}`;
+    if (transport !== 'smtp') {
+      return { transport, rootAddress, to: transport ? [rootAddress] : [], skipped: [], error: transport ? null : 'Exim is not installed and no SMTP relay is configured, so mail for root cannot be sent.' };
+    }
+    const targets = (settings.get('contacts.root_forward', []) || []).map((t) => String(t).trim()).filter(Boolean);
+    const to = targets.filter((t) => EMAIL_RE.test(t));
+    const skipped = targets.filter((t) => !EMAIL_RE.test(t));
+    let error = null;
+    if (!to.length) {
+      error = skipped.length
+        ? `Mail for root leaves through the SMTP relay, which cannot deliver to the local account${skipped.length > 1 ? 's' : ''} ${skipped.join(', ')}. Add a full email address under Edit System Mail Preferences.`
+        : 'Mail for root leaves through the SMTP relay and is sent to the forwarding addresses saved under Edit System Mail Preferences, but none are set.';
+    }
+    return { transport, rootAddress, to, skipped, error };
+  }
+
+  // Root's mailbox for the events the system mail preferences select. Logged
+  // as a delivery with no contact.
+  async function mailRoot(msg, req, { test = false } = {}) {
+    const host = hostname();
+    const r = rootRecipients();
+    const address = r.to.length ? r.to.join(', ') : r.rootAddress;
+    const base = { contact_name: 'root (system mail)', channel: 'email', address, event: msg.event, severity: msg.severity, subject: msg.subject, test: test ? 1 : 0 };
     try {
-      const r = await sendMail({ to, subject: `[${host}] ${msg.subject}`, body: `${msg.body}\n\n-- \nWHM on ${host} · event ${msg.event} · severity ${msg.severity}` }, req);
-      recordDelivery({ ...base, status: 'sent', transport: r.transport });
-      return { contactId: null, name: base.contact_name, channel: 'email', address: to, status: 'sent', transport: r.transport };
+      if (r.error) throw new HttpError(422, 'no_root_recipients', r.error);
+      const sent = await sendMail({ to: r.to, subject: `[${host}] ${msg.subject}`, body: `${msg.body}\n\n-- \nWHM on ${host} · event ${msg.event} · severity ${msg.severity}` }, req);
+      recordDelivery({ ...base, status: 'sent', transport: sent.transport });
+      return { contactId: null, name: base.contact_name, channel: 'email', address, status: 'sent', transport: sent.transport, to: r.to };
     } catch (err) {
       const error = String(err.message || err).slice(0, 500);
       recordDelivery({ ...base, status: 'failed', error });
-      return { contactId: null, name: base.contact_name, channel: 'email', address: to, status: 'failed', error, code: err.code || 'delivery_failed' };
+      logger.warn({ event: msg.event, transport: r.transport, err: error }, 'root mail notification failed');
+      return { contactId: null, name: base.contact_name, channel: 'email', address, status: 'failed', error, code: err.code || 'delivery_failed', httpStatus: err.status || 502, to: r.to };
     }
   }
 
@@ -494,6 +548,7 @@ export function createServerContactsService(ctx) {
       aliases: aliases && { path: aliases.path, exists: aliases.exists, managed: aliases.managed, rebuildTool: aliases.rebuildTool, entries: aliases.entries },
       aliasError,
       rootMailEvents: settings.get('contacts.root_mail_events', []) || [],
+      rootDelivery: rootRecipients(),
       events: EVENTS.filter((e) => e.key !== 'test'),
       capability: { exim: capabilities.has('exim'), mailTransport: mailTransport() },
     };
@@ -524,8 +579,10 @@ export function createServerContactsService(ctx) {
     get: (id) => shape(load(id)),
 
     create(input, req) {
-      const { display, config } = resolveAddress(input.channel, input.address, mergeConfig(input.channel, input.config || {}));
-      const events = input.events?.length ? [...new Set(input.events)] : ['*'];
+      const address = input.address;
+      redactRequestAddress(req, input.channel, address);
+      const events = normalizeEvents(input.events);
+      const { display, config } = resolveAddress(input.channel, address, mergeConfig(input.channel, input.config || {}));
       const { lastInsertRowid } = stmts.insert.run({ name: input.name?.trim() || '', channel: input.channel, address: display, events: JSON.stringify(events), enabled: input.enabled === false ? 0 : 1, config: JSON.stringify(config), min_severity: input.minSeverity || 'info' });
       audit(req, { action: 'contacts.create', target: display, args: { channel: input.channel, name: input.name, events, minSeverity: input.minSeverity || 'info' } });
       return shape(stmts.byId.get(lastInsertRowid));
@@ -534,8 +591,10 @@ export function createServerContactsService(ctx) {
     update(id, patch, req) {
       const row = load(id);
       const channel = patch.channel ?? row.channel;
-      const { display, config } = resolveAddress(channel, patch.address ?? row.address, mergeConfig(channel, patch.config || {}, channel === row.channel ? json.parse(row.config_json, {}) : {}), row);
-      const events = patch.events !== undefined ? (patch.events.length ? [...new Set(patch.events)] : ['*']) : json.parse(row.events_json, ['*']);
+      const address = patch.address ?? row.address;
+      if (patch.address !== undefined) redactRequestAddress(req, channel, address);
+      const events = patch.events !== undefined ? normalizeEvents(patch.events) : json.parse(row.events_json, ['*']);
+      const { display, config } = resolveAddress(channel, address, mergeConfig(channel, patch.config || {}, channel === row.channel ? json.parse(row.config_json, {}) : {}), row);
       stmts.update.run({ id: row.id, name: patch.name !== undefined ? patch.name.trim() : row.name, channel, address: display, events: JSON.stringify(events), enabled: (patch.enabled ?? Boolean(row.enabled)) ? 1 : 0, config: JSON.stringify(config), min_severity: patch.minSeverity ?? row.min_severity ?? 'info' });
       audit(req, { action: 'contacts.update', target: display, args: { ...patch, address: patch.address !== undefined ? display : undefined, config: patch.config ? Object.keys(patch.config) : undefined } });
       return shape(stmts.byId.get(id));
@@ -639,6 +698,20 @@ export function createServerContactsService(ctx) {
       if (rootMailEvents !== undefined) settings.set('contacts.root_mail_events', [...new Set(rootMailEvents)]);
       audit(req, { action: 'contacts.mail_preferences', target: 'root', args: { forwardTo, rootMailEvents, rebuild: aliases?.rebuild ?? null } });
       return { ...(await mailPreferences()), rebuild: aliases?.rebuild ?? null };
+    },
+
+    // The exact path the "events that also mail root" use, so the page shows
+    // where root mail really ends up with the current transport.
+    async testRootMail(req) {
+      if (!mailTransport()) throw new CapabilityError('exim', 'Exim is not installed and no SMTP relay is configured, so the panel cannot send email. Install exim4 (Debian/Ubuntu) or exim (RHEL), or configure an SMTP relay in Contact Manager.');
+      const msg = normalizeNotification({ event: 'test', subject: `Test message for root from WHM on ${hostname()}`, body: `This test message was sent by ${req?.user?.username || 'the panel'} at ${new Date().toISOString()} the way events selected under Edit System Mail Preferences are mailed to root.`, severity: 'info' });
+      const result = await mailRoot(msg, req, { test: true });
+      audit(req, { action: 'contacts.mail.test', target: result.address, args: { transport: result.transport ?? mailTransport(), status: result.status, error: result.error } });
+      if (result.status === 'failed') {
+        if (result.code === 'capability_missing') throw new CapabilityError('exim', result.error);
+        throw new HttpError(result.httpStatus === 422 ? 422 : 502, result.code === 'smtp_failed' ? 'smtp_failed' : result.code === 'no_root_recipients' ? 'no_root_recipients' : 'delivery_failed', result.error);
+      }
+      return result;
     },
   };
 }

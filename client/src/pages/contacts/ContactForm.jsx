@@ -18,7 +18,8 @@ export function emptyContact() {
 
 // Create/edit form; onSubmit receives the API body (secrets only when typed).
 export function ContactForm({ initial, events, channels, severities, onSubmit, onCancel, saving, error }) {
-  const [draft, setDraft] = useState(() => ({ ...emptyContact(), ...initial, config: {} }));
+  // "*" marks an all-events contact in the API shape; the picker only ever holds specific keys.
+  const [draft, setDraft] = useState(() => ({ ...emptyContact(), ...initial, events: (initial?.events || []).filter((k) => k !== '*'), config: {} }));
   const [secrets, setSecrets] = useState({ token: '', secret: '', channelName: initial?.config?.channelName || '' });
   const set = (k, v) => setDraft((d) => ({ ...d, [k]: v }));
   const field = ADDRESS_FIELD[draft.channel] || ADDRESS_FIELD.email;
@@ -36,7 +37,7 @@ export function ContactForm({ initial, events, channels, severities, onSubmit, o
     if (draft.channel === 'pushover' && secrets.token) config.token = secrets.token;
     if (draft.channel === 'webhook' && secrets.secret !== '') config.secret = secrets.secret;
     if (draft.channel === 'slack') config.channelName = secrets.channelName || null;
-    onSubmit({ name: draft.name.trim(), channel: draft.channel, address: draft.address.trim(), events: draft.allEvents ? [] : draft.events, minSeverity: draft.minSeverity, enabled: draft.enabled, ...(Object.keys(config).length ? { config } : {}) });
+    onSubmit({ name: draft.name.trim(), channel: draft.channel, address: draft.address.trim(), events: draft.allEvents ? [] : draft.events.filter((k) => k !== '*'), minSeverity: draft.minSeverity, enabled: draft.enabled, ...(Object.keys(config).length ? { config } : {}) });
   };
 
   return (
@@ -88,6 +89,7 @@ export function ContactForm({ initial, events, channels, severities, onSubmit, o
           })}
         </div>
       )}
+      {error?.fields?.events && <ErrorBanner error={{ message: error.fields.events.join(', ') }} />}
       {error?.fields?._ && <ErrorBanner error={{ message: error.fields._.join(', ') }} />}
       {error && !error.fields && <ErrorBanner error={error} />}
       <FormActions>

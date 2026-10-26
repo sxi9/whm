@@ -481,8 +481,18 @@ defineOp('backup.files.restore', {
   },
 });
 
+// cPanel ships per-database dumps (mysql/<db>.sql, no CREATE DATABASE/USE) with
+// the schema's CREATE statement in mysql/<db>.create. Only its charset and
+// collation are taken from that file; the name is the validated argument.
+export function createDatabaseStatement(database, createFileText = '') {
+  const text = String(createFileText || '');
+  const charset = /(?:DEFAULT\s+)?CHARACTER\s+SET\s*=?\s*`?([A-Za-z0-9_]{1,32})`?/i.exec(text)?.[1];
+  const collate = /COLLATE\s*=?\s*`?([A-Za-z0-9_]{1,64})`?/i.exec(text)?.[1];
+  return `CREATE DATABASE IF NOT EXISTS ${q.id(database)}${charset ? ` DEFAULT CHARACTER SET ${charset}` : ''}${collate ? ` COLLATE ${collate}` : ''}`;
+}
+
 defineOp('backup.db.import', {
-  description: 'Import a mysqldump file through the client (source <file>), optionally into a named database',
+  description: 'Import a mysqldump file through the client (source <file>); with `database`, the schema is created first (mysql/<db>.create charset honoured) and the dump is sourced inside it',
   destructive: true,
   timeoutMs: 7_200_000,
   // The file name is placed on the client's `source` line, so it is kept to a plain character set.
@@ -492,6 +502,14 @@ defineOp('backup.db.import', {
     if (!bin) throw new OpError('capability_missing', 'The MySQL/MariaDB client (mysql or mariadb) is not installed on this server');
     const sql = ctx.assertAllowedPath(file, 'read');
     if (!/\.sql$/.test(sql) || !exists(sql)) throw new OpError('not_found', `${file} is not an existing .sql dump`);
+    let created = false;
+    if (database) {
+      let createText = '';
+      try { createText = fs.readFileSync(`${sql.slice(0, -4)}.create`, 'utf8').slice(0, 4096); } catch { /* panel archives carry no .create file */ }
+      const before = await mysqlQuery(`SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ${q.str(database)}`, creds, ctx, { headers: false });
+      await mysqlQuery(createDatabaseStatement(database, createText), creds, ctx);
+      created = before.length === 0;
+    }
     const defaults = defaultsFor(creds, ctx);
     try {
       const argv = [...defaults.argv, '--batch', '--no-auto-rehash', '--connect-timeout=10'];
@@ -501,7 +519,7 @@ defineOp('backup.db.import', {
       argv.push('--execute', `source ${sql}`);
       const { code, stderr } = await exec(bin, argv, { allowFailure: true, timeoutMs: 7_200_000 });
       if (code !== 0) { const err = classifyMysqlError(stderr); throw new OpError(err.code, `MySQL: ${err.message}`, { errno: err.errno }); }
-      return { file: sql, database: database ?? null, sizeBytes: fs.statSync(sql).size, warnings: stderr.trim() ? stderr.trim().split('\n').slice(-5) : [] };
+      return { file: sql, database: database ?? null, created, sizeBytes: fs.statSync(sql).size, warnings: stderr.trim() ? stderr.trim().split('\n').slice(-5) : [] };
     } finally { defaults.cleanup(); }
   },
 });

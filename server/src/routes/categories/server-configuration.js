@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { validate, z, fields } from '../../lib/validate.js';
 import { requireRoot } from '../../middleware/rbac.js';
 import { unprocessable } from '../../lib/errors.js';
+import { isValidCron } from '../../lib/cron.js';
 import { createServerConfigService, PROFILE_NAMES, GENERATORS, UPDATE_TIERS, NODE_ROLES } from '../../services/server-configuration.js';
 
 // Basic Setup, Tweak Settings, Cron Jobs and Change Root Password are served by
@@ -16,6 +17,7 @@ const nodeBase = { name: nodeName, hostname: nodeHost, port: z.number().int().mi
 const nodeCreate = z.object({ ...nodeBase, token: nodeToken, port: nodeBase.port.default(2087), scheme: nodeBase.scheme.default('https'), username: nodeBase.username.default('root'), verifyTls: nodeBase.verifyTls.default(true), roles: nodeBase.roles.default([]), enabled: nodeBase.enabled.default(true) }).strict();
 const nodeUpdate = nonEmpty(z.object({ ...Object.fromEntries(Object.entries(nodeBase).map(([k, v]) => [k, v.optional()])), token: nodeToken.optional() }).strict());
 const terminalId = z.object({ id: z.string().regex(/^[a-f0-9]{32}$/) });
+const cron = fields.cron.refine(isValidCron, 'Must be a valid 5-field cron expression');
 const terminalInput = z.object({ data: z.string().min(1).max(64 * 1024).regex(/^[^\0]*$/s) }).strict();
 
 // Keystrokes may contain passwords typed at shell prompts. The audit middleware
@@ -78,7 +80,7 @@ export async function register(ctx) {
 
   // Statistics Software Configuration
   r.get('/stats', requireRoot, wrap(() => svc().stats.get()));
-  r.put('/stats', requireRoot, validate({ body: nonEmpty(z.object({ generators: z.object(Object.fromEntries(GENERATORS.map((g) => [g, z.boolean().optional()]))).strict().optional(), defaultGenerator: z.enum(GENERATORS).optional(), allowUserChoice: z.boolean().optional(), includeSuspended: z.boolean().optional(), cron: fields.cron.optional(), enabled: z.boolean().optional() }).strict()) }), wrap((req) => svc().stats.update(req.body, req)));
+  r.put('/stats', requireRoot, validate({ body: nonEmpty(z.object({ generators: z.object(Object.fromEntries(GENERATORS.map((g) => [g, z.boolean().optional()]))).strict().optional(), defaultGenerator: z.enum(GENERATORS).optional(), allowUserChoice: z.boolean().optional(), includeSuspended: z.boolean().optional(), cron: cron.optional(), enabled: z.boolean().optional() }).strict()) }), wrap((req) => svc().stats.update(req.body, req)));
   r.post('/stats/run', requireRoot, validate({ body: z.object({ generator: z.enum(GENERATORS).optional(), domain: fields.hostname.optional() }).strict() }), wrap((req) => svc().stats.run(req.body, req.user, req), 202));
 
   // Terminal (root only; sessions are owned by the administrator who opened them)
@@ -90,7 +92,7 @@ export async function register(ctx) {
 
   // Update Preferences
   r.get('/updates', requireRoot, wrap(() => svc().updates.get()));
-  r.put('/updates', requireRoot, validate({ body: nonEmpty(z.object({ tier: z.enum(UPDATE_TIERS).optional(), auto: z.boolean().optional(), autoOs: z.boolean().optional(), notifyContact: z.boolean().optional(), cron: fields.cron.optional(), scheduleEnabled: z.boolean().optional() }).strict()) }), wrap((req) => svc().updates.update(req.body, req)));
+  r.put('/updates', requireRoot, validate({ body: nonEmpty(z.object({ tier: z.enum(UPDATE_TIERS).optional(), auto: z.boolean().optional(), autoOs: z.boolean().optional(), notifyContact: z.boolean().optional(), cron: cron.optional(), scheduleEnabled: z.boolean().optional() }).strict()) }), wrap((req) => svc().updates.update(req.body, req)));
   r.post('/updates/check', requireRoot, wrap((req) => svc().updates.check(req.user, req), 202));
 
   // WHM Marketplace (static catalog until Phase 5)

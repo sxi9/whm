@@ -129,6 +129,12 @@ export function createSystemHealthService(ctx) {
     }
   }
 
+  // The agent re-reads the owner and age of the PID right before signalling and
+  // refuses when they differ from the snapshot the match came from, so a PID
+  // recycled onto another user's (or root's) process is never hit.
+  const kill = (m, signal, req) => agent.op('bpk.kill', { pid: m.pid, signal, user: m.user, elapsedSeconds: m.elapsedSeconds }, { req });
+  const killResult = (err) => (err.code === 'not_found' || err.code === 'owner_mismatch' ? 'gone' : 'failed');
+
   // One pass: list processes, kill every match (unless dryRun), log, notify.
   async function scan({ dryRun = false, trigger = 'manual', req = null, log = null } = {}) {
     const cfg = config();
@@ -150,10 +156,10 @@ export function createSystemHealthService(ctx) {
           entry.result = 'would-kill';
         } else {
           try {
-            await agent.op('sys.process.signal', { pid: m.pid, signal: cfg.signal }, { req });
+            await kill(m, cfg.signal, req);
             log?.(`killed pid ${m.pid} (${m.user}) ${m.command} [${m.pattern}]`);
           } catch (err) {
-            entry.result = err.code === 'not_found' ? 'gone' : 'failed';
+            entry.result = killResult(err);
             entry.error = err.message;
             log?.(`pid ${m.pid} (${m.user}) ${m.command}: ${err.message}`, 'warn');
           }
@@ -176,24 +182,44 @@ export function createSystemHealthService(ctx) {
     return { run: shapeRun(stmts.runById.get(runId)), kills };
   }
 
-  function syncSchedule(enabled) {
-    try { ctx.scheduler.update(SCHEDULE, { enabled }); } catch (err) { logger.warn({ err }, 'could not toggle the background process killer schedule'); }
+  // Why the scheduled scan would do nothing right now, or null when it is armed.
+  // The procps check only counts once detection has run (boot registers modules
+  // before the first refresh).
+  function pausedReason() {
+    if (!config().enabled) return 'disabled';
+    if (!stmts.enabledPatterns.all().length) return 'no_patterns';
+    if (capabilities.snapshot().at && !capabilities.has('procps')) return 'procps_missing';
+    return null;
+  }
+
+  // The schedule mirrors the feature: paused while a run would be skipped, so
+  // the queue never fills with no-op jobs; resumed as soon as something is armed.
+  function syncSchedule() {
+    const paused = pausedReason();
+    const schedule = ctx.scheduler.list().find((s) => s.name === SCHEDULE);
+    if (schedule && Boolean(schedule.enabled) !== !paused) {
+      try { ctx.scheduler.update(SCHEDULE, { enabled: !paused }); } catch (err) { logger.warn({ err }, 'could not toggle the background process killer schedule'); }
+    }
+    return paused;
   }
 
   return {
     SCHEDULE,
     config,
+    pausedReason,
+    syncSchedule,
 
     // Page bootstrap: configuration, patterns, schedule and recent activity.
     async overview() {
       await capabilities.ensureFresh();
+      const paused = syncSchedule();
       const schedule = ctx.scheduler.list().find((s) => s.name === SCHEDULE) || null;
       const stats = stmts.killStats.get();
       return {
         config: config(),
         capability: { procps: capabilities.has('procps'), notifications: Boolean(ctx.contacts?.notify) },
         patterns: stmts.patterns.all().map(shapePattern),
-        schedule: schedule && { name: schedule.name, cron: schedule.cron, enabled: Boolean(schedule.enabled), lastRunAt: schedule.last_run_at, nextRunAt: schedule.next_run_at },
+        schedule: schedule && { name: schedule.name, cron: schedule.cron, enabled: Boolean(schedule.enabled), paused, lastRunAt: schedule.last_run_at, nextRunAt: schedule.next_run_at },
         lastRun: shapeRun(stmts.lastRun.get()),
         stats: { total: stats.total || 0, last24h: stats.last24h || 0, failed: stats.failed || 0 },
         signals: SIGNALS,
@@ -213,7 +239,7 @@ export function createSystemHealthService(ctx) {
         'system_health.bpk.retention_days': next.retentionDays,
       };
       settings.setMany(values);
-      if (current.enabled !== Boolean(next.enabled)) syncSchedule(Boolean(next.enabled));
+      syncSchedule();
       audit(req, { action: 'system_health.bpk.configure', args: patch });
       return config();
     },
@@ -224,6 +250,7 @@ export function createSystemHealthService(ctx) {
     addPattern({ name, note = null, enabled = true }, req) {
       if (stmts.patternByName.get(name)) throw conflict(`"${name}" is already on the list`);
       const { lastInsertRowid } = stmts.insertPattern.run({ name, enabled: enabled ? 1 : 0, note });
+      syncSchedule();
       audit(req, { action: 'system_health.bpk.pattern.add', target: name, args: { enabled } });
       return shapePattern(stmts.patternById.get(lastInsertRowid));
     },
@@ -236,6 +263,7 @@ export function createSystemHealthService(ctx) {
       const dup = stmts.patternByName.get(name);
       if (dup && dup.id !== row.id) throw conflict(`"${name}" is already on the list`);
       stmts.updatePattern.run({ id: row.id, name, enabled: (patch.enabled ?? Boolean(row.enabled)) ? 1 : 0, note: patch.note === undefined ? row.note : patch.note });
+      syncSchedule();
       audit(req, { action: 'system_health.bpk.pattern.update', target: name, args: patch });
       return shapePattern(stmts.patternById.get(id));
     },
@@ -245,6 +273,7 @@ export function createSystemHealthService(ctx) {
       if (!row) throw notFound('Pattern');
       if (row.builtin) throw badRequest('Built-in entries cannot be removed; disable it instead');
       stmts.deletePattern.run(id);
+      syncSchedule();
       audit(req, { action: 'system_health.bpk.pattern.remove', target: row.name });
       return { removed: true, name: row.name };
     },
@@ -268,9 +297,9 @@ export function createSystemHealthService(ctx) {
       const runId = Number(lastInsertRowid);
       const entry = { run_id: runId, pid: m.pid, user: m.user, command: m.command, args: m.args || null, pattern: m.pattern, signal: cfg.signal, result: 'killed', error: null };
       try {
-        await agent.op('sys.process.signal', { pid: m.pid, signal: cfg.signal }, { req });
+        await kill(m, cfg.signal, req);
       } catch (err) {
-        entry.result = err.code === 'not_found' ? 'gone' : 'failed';
+        entry.result = killResult(err);
         entry.error = err.message;
       }
       stmts.insertKill.run(entry);

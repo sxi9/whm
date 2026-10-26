@@ -348,6 +348,11 @@ defineOp('transfer.remote.dump_database', {
     const remoteFile = `/tmp/whm-transfer-${database}-${crypto.randomBytes(4).toString('hex')}.sql`;
     const argv = ['mysqldump'];
     if (defaultsFile) argv.push(`--defaults-extra-file=${defaultsFile}`);
+    // MySQL's mysqldump adds SET @@GLOBAL.GTID_PURGED / SQL_LOG_BIN statements
+    // on GTID-enabled servers; the import runs without the privileges for them
+    // (and must not alter GTID state). MariaDB's mysqldump has no such option.
+    const help = await remoteExec(conn, remoteCommand(['mysqldump', '--help']), { timeoutMs: 60_000, maxBuffer: 4 * 1024 * 1024 });
+    if (/--set-gtid-purged/.test(help.stdout)) argv.push('--set-gtid-purged=OFF');
     argv.push('--single-transaction', '--quick', '--routines', '--triggers', '--events', `--result-file=${remoteFile}`, '--', database);
     const dump = await remoteExec(conn, remoteCommand(argv), { timeoutMs });
     if (dump.code !== 0) {
@@ -373,13 +378,15 @@ defineOp('transfer.remote.remove_file', {
 
 // Modes are preserved (-p) so 0600 credential files and 0700 directories stay
 // private and scripts keep their execute bit; ownership is reassigned afterwards.
+// rsync splits "user@host:path" at the first ':', so an IPv6 host is bracketed.
 export function rsyncArgv({ transport, destination, src, dest, directory = true, excludes = [], deleteExtraneous = false, bwlimitKbps = 0, dryRun = false }) {
-  const argv = ['-rlptD', '-z', '--partial', '--stats', '--human-readable=0', '-e', transport];
+  const argv = ['-rlptD', '-z', '--partial', '--stats', '--no-human-readable', '-e', transport];
   if (deleteExtraneous) argv.push('--delete');
   if (bwlimitKbps) argv.push(`--bwlimit=${bwlimitKbps}`);
   if (dryRun) argv.push('--dry-run');
   for (const ex of excludes) argv.push(`--exclude=${ex}`);
-  const from = directory ? `${destination}:${src.replace(/\/+$/, '')}/` : `${destination}:${src}`;
+  const remote = destination.includes(':') ? destination.replace(/^([^@]*@)?(.*)$/, '$1[$2]') : destination;
+  const from = directory ? `${remote}:${src.replace(/\/+$/, '')}/` : `${remote}:${src}`;
   const to = directory ? `${dest.replace(/\/+$/, '')}/` : dest;
   argv.push(from, to);
   return argv;
@@ -512,8 +519,9 @@ function findClient() {
 }
 
 // Runs fn(defaultsArgv) with the credentials in a short-lived 0600 option file
-// (or /root/.my.cnf when none were given).
-async function withClientDefaults(creds, fn) {
+// (or /root/.my.cnf when none were given). `exclusive` makes that file the
+// only option file the client reads.
+async function withClientDefaults(creds, fn, { exclusive = false } = {}) {
   let dir = null;
   const defaults = [];
   if (creds && Object.keys(creds).length) {
@@ -521,7 +529,7 @@ async function withClientDefaults(creds, fn) {
     fs.chmodSync(dir, 0o700);
     const cnf = path.join(dir, 'client.cnf');
     fs.writeFileSync(cnf, renderClientCnf(creds), { mode: 0o600 });
-    defaults.push(`--defaults-extra-file=${cnf}`);
+    defaults.push(`${exclusive ? '--defaults-file' : '--defaults-extra-file'}=${cnf}`);
   } else if (fs.existsSync('/root/.my.cnf')) defaults.push('--defaults-extra-file=/root/.my.cnf');
   try { return await fn(defaults); } finally { if (dir) fs.rmSync(dir, { recursive: true, force: true }); }
 }
@@ -540,27 +548,134 @@ async function runSql(bin, sql, creds, { timeoutMs = 120_000 } = {}) {
 const belongsTo = (name, prefix) => name === prefix || name.startsWith(`${prefix}_`);
 const SYSTEM_SCHEMAS = new Set(['mysql', 'sys', 'information_schema', 'performance_schema']);
 
-// Statements a dump of one account's database never needs; they would run with
-// the import user's (root) privileges. Conditional comments (/*!50106 …*/) are
-// stripped before matching, so hiding a statement in one does not help.
+// Statements a dump of one account's database never needs. The import runs as
+// a temporary user limited to the target database, so the server refuses them
+// too; this pre-check gives a readable reason before anything is loaded.
+// Conditional comments (/*!50106 …*/) are stripped before matching, so hiding
+// a statement in one does not help.
 const DENIED_SQL = [
   [/\b(?:CREATE|DROP|ALTER|RENAME)\s+(?:OR\s+REPLACE\s+)?(?:USER|ROLE)\b/i, 'user or role management'],
   [/\bGRANT\s+[A-Z_ ,()*]+?\s+ON\s+/i, 'GRANT'],
   [/\bGRANT\s+(?:PROXY|`|')/i, 'GRANT'],
   [/\bREVOKE\s+[A-Z_ ,()*]+?\s+(?:ON|FROM)\s+/i, 'REVOKE'],
-  [/\bSET\s+(?:GLOBAL|PERSIST|PERSIST_ONLY)\b/i, 'SET GLOBAL'],
+  [/\bSET\s+(?:DEFAULT\s+)?ROLE\b/i, 'SET ROLE'],
+  [/\bGTID_PURGED\b|\bGTID_NEXT\b|\bSQL_LOG_BIN\b/i, 'GTID and binary-log', ' (export the source with --set-gtid-purged=OFF)'],
+  [/\bSET\s+(?:GLOBAL|PERSIST|PERSIST_ONLY)\b|@@\s*(?:GLOBAL|PERSIST|PERSIST_ONLY)\s*\./i, 'SET GLOBAL'],
   [/\bSET\s+PASSWORD\b/i, 'SET PASSWORD'],
   [/\bDROP\s+(?:DATABASE|SCHEMA)\b/i, 'DROP DATABASE'],
   [/\b(?:INSTALL|UNINSTALL)\s+(?:PLUGIN|COMPONENT|SONAME)\b/i, 'plugin installation'],
   [/\bSONAME\s+['"]/i, 'loadable function (SONAME)'],
-  [/\bLOAD\s+DATA\s+(?:LOW_PRIORITY\s+|CONCURRENT\s+)?(?:LOCAL\s+)?INFILE\b/i, 'LOAD DATA INFILE'],
+  [/\bLOAD\s+(?:DATA|XML)\s+(?:LOW_PRIORITY\s+|CONCURRENT\s+)?(?:LOCAL\s+)?INFILE\b/i, 'LOAD DATA / LOAD XML INFILE'],
   [/\bINTO\s+(?:OUTFILE|DUMPFILE)\s+['"]/i, 'SELECT INTO OUTFILE'],
   [/\bLOAD_FILE\s*\(/i, 'LOAD_FILE()'],
-  [/\bFLUSH\s+(?:PRIVILEGES|HOSTS|USER_RESOURCES|LOGS|BINARY|ENGINE|ERROR|GENERAL|SLOW)\b/i, 'FLUSH'],
-  [/\bCHANGE\s+(?:MASTER|REPLICATION\s+SOURCE)\s+TO\b/i, 'replication'],
-  [/\bSHUTDOWN\s*;/i, 'SHUTDOWN'],
+  [/\bIMPORT\s+TABLE\s+FROM\b/i, 'IMPORT TABLE'],
+  [/\b(?:DATA|INDEX)\s+DIRECTORY\s*=/i, 'DATA DIRECTORY / INDEX DIRECTORY'],
+  [/\b(?:CREATE|ALTER|DROP)\s+(?:UNDO\s+)?TABLESPACE\b|\b(?:CREATE|ALTER|DROP)\s+LOGFILE\s+GROUP\b/i, 'TABLESPACE'],
+  [/\bALTER\s+INSTANCE\b|\bCLONE\s+(?:LOCAL|INSTANCE)\b|\bRESTART\s*;|\bSHUTDOWN\s*;/i, 'server instance'],
+  [/\b(?:CREATE|ALTER|DROP)\s+(?:SERVER|RESOURCE\s+GROUP)\b|\bSET\s+RESOURCE\s+GROUP\b/i, 'CREATE SERVER / RESOURCE GROUP'],
+  [/\bENGINE\s*=\s*(?:FEDERATED|FEDERATEDX|CONNECT|SPIDER)\b|\bCONNECTION\s*=\s*['"]/i, 'remote or file-backed storage engine'],
+  [/\bFLUSH\s+(?:PRIVILEGES|HOSTS|USER_RESOURCES|LOGS|BINARY|ENGINE|ERROR|GENERAL|SLOW|TABLES\s+WITH\s+READ\s+LOCK)\b/i, 'FLUSH'],
+  [/\bCHANGE\s+(?:MASTER|REPLICATION\s+SOURCE|REPLICATION\s+FILTER)\s+TO\b|\b(?:START|STOP|RESET)\s+(?:REPLICA|SLAVE|GROUP_REPLICATION|MASTER|PERSIST)\b|\bPURGE\s+(?:BINARY|MASTER)\s+LOGS\b|\bBINLOG\s+['"]/i, 'replication'],
   [/\bKILL\s+(?:QUERY\s+|CONNECTION\s+)?\d/i, 'KILL'],
 ];
+// References to the privilege tables and other schemas. Only the direct
+// target of a DML/DDL statement is checked here (aliases make "x.y" ambiguous
+// elsewhere); the server enforces the rest through the import user's grants.
+const SYSTEM_SCHEMA_REF = /(?:^|[^A-Za-z0-9_$.`'"@])`?(mysql|sys|performance_schema)`?\s*\.\s*`?[A-Za-z0-9_$*]/i;
+const QUALIFIED = '`?[A-Za-z0-9_$]+`?\\s*\\.\\s*`?[A-Za-z0-9_$]+`?';
+const QUALIFIED_PAIR = /(?:^|[^A-Za-z0-9_$.`'"@])`?([A-Za-z0-9_$]+)`?\s*\.\s*`?([A-Za-z0-9_$]+)`?/g;
+const TARGET_CLAUSES = [
+  new RegExp(`\\bINSERT(?:\\s+(?:LOW_PRIORITY|DELAYED|HIGH_PRIORITY|IGNORE))*\\s+(?:INTO\\s+)?(${QUALIFIED})`, 'gi'),
+  new RegExp(`\\bREPLACE(?:\\s+(?:LOW_PRIORITY|DELAYED))?\\s+(?:INTO\\s+)?(${QUALIFIED})`, 'gi'),
+  new RegExp(`\\bUPDATE\\s+(?:LOW_PRIORITY\\s+)?(?:IGNORE\\s+)?(${QUALIFIED})`, 'gi'),
+  new RegExp(`\\bDELETE\\s+(?:LOW_PRIORITY\\s+|QUICK\\s+|IGNORE\\s+)*FROM\\s+(${QUALIFIED})`, 'gi'),
+  new RegExp(`\\bTRUNCATE\\s+(?:TABLE\\s+)?(${QUALIFIED})`, 'gi'),
+  new RegExp(`\\b(?:CREATE|ALTER)\\s+(?:TEMPORARY\\s+)?TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(${QUALIFIED})`, 'gi'),
+  /\bDROP\s+(?:TEMPORARY\s+)?TABLE\s+(?:IF\s+EXISTS\s+)?([^;]{0,2000})/gi,
+  /\bRENAME\s+TABLE\s+([^;]{0,2000})/gi,
+  /\bLOCK\s+TABLES?\s+([^;]{0,2000})/gi,
+  new RegExp(`\\b(?:CREATE|ALTER|DROP)\\b[^;]{0,200}?\\bVIEW\\s+(?:IF\\s+(?:NOT\\s+)?EXISTS\\s+)?(${QUALIFIED})`, 'gi'),
+  new RegExp(`\\bTRIGGER\\s+\`?[A-Za-z0-9_$]+\`?\\s+(?:BEFORE|AFTER)\\s+(?:INSERT|UPDATE|DELETE)\\s+ON\\s+(${QUALIFIED})`, 'gi'),
+  new RegExp(`\\bINDEX\\s+\`?[A-Za-z0-9_$]+\`?\\s+(?:USING\\s+\\w+\\s+)?ON\\s+(${QUALIFIED})`, 'gi'),
+  new RegExp(`\\b(?:PROCEDURE|FUNCTION|EVENT)\\s+(?:IF\\s+(?:NOT\\s+)?EXISTS\\s+)?(${QUALIFIED})`, 'gi'),
+  new RegExp(`\\bCALL\\s+(${QUALIFIED})`, 'gi'),
+];
+
+function foreignSchema(code, database) {
+  const sys = code.match(SYSTEM_SCHEMA_REF);
+  if (sys) return `the dump references the system schema "${sys[1].toLowerCase()}"`;
+  for (const re of TARGET_CLAUSES) {
+    for (const m of code.matchAll(re)) {
+      for (const p of m[1].matchAll(QUALIFIED_PAIR)) {
+        if (!database || p[1].toLowerCase() !== database) return `the dump targets "${p[1]}.${p[2]}" outside database "${database || 'the target database'}"`;
+      }
+    }
+  }
+  return null;
+}
+
+// The mysql client runs its own commands from a dump: "system <cmd>" / "\! <cmd>"
+// start a shell as the user running the client, "tee" / "\T" write to any file,
+// "source", "pager", "connect" … likewise. Long forms are recognised when they
+// are the first word of a statement (find_command() on the line, or on the
+// buffer at every delimiter); short forms "\x" anywhere outside strings and
+// comments. This mirrors that tokenisation and refuses every command except a
+// plain DELIMITER switch and USE of the target database.
+const CLIENT_COMMANDS = new Map([
+  ['?', true], ['clear', false], ['connect', true], ['delimiter', true], ['edit', false], ['ego', false], ['exit', false], ['go', false], ['help', true],
+  ['nopager', false], ['notee', false], ['pager', true], ['print', false], ['prompt', true], ['quit', false], ['rehash', false], ['source', true],
+  ['status', false], ['system', true], ['tee', true], ['use', true], ['charset', true], ['warnings', false], ['nowarning', false],
+  ['resetconnection', false], ['query_attributes', true], ['ssl_session_data_print', true],
+]);
+const DELIMITER_TOKEN = /^[;$|/]{1,4}$/;
+
+export function clientCommand(text) {
+  const name = text.replace(/^\s+/, '');
+  const m = name.match(/^([^ \t]+)(?:[ \t]+([\s\S]*))?$/);
+  if (!m) return null;
+  const word = m[1].toLowerCase();
+  const takesParams = CLIENT_COMMANDS.get(word);
+  if (takesParams === undefined) return null;
+  const args = (m[2] || '').replace(/^\s+/, '');
+  if (args && !takesParams) return null;
+  return { name: word, args };
+}
+
+export function createClientCommandGuard({ database } = {}) {
+  let delimiter = ';';
+  let stmt = '';
+  const handle = (com) => {
+    if (com.name === 'delimiter') {
+      const next = com.args.split(/\s+/)[0] || '';
+      if (!DELIMITER_TOKEN.test(next)) return `the dump sets the statement delimiter to "${next}"; only ";", "$$", "//" and the like are allowed`;
+      delimiter = next;
+      return null;
+    }
+    if (com.name === 'use') {
+      const db = com.args.replace(/[`'"]/g, '').split(/\s/)[0] || '';
+      return !database || db !== database ? `the dump switches to database "${db}" (only ${database || 'the target database'} may be used)` : null;
+    }
+    return `the dump contains the mysql client command "${com.name}", which the client would run outside SQL`;
+  };
+  return function feed(code) {
+    if (/\\(?![N\n]|$)/.test(code)) return 'the dump contains a backslash command ("\\!", "\\T", "\\." …) that the mysql client would run outside SQL';
+    if (!stmt.trim() && (!code.includes(delimiter) || /^\s*delimiter\b/i.test(code))) {
+      const com = clientCommand(code);
+      if (com) return handle(com);
+    }
+    let rest = code;
+    let at;
+    while ((at = rest.indexOf(delimiter)) >= 0) {
+      stmt += rest.slice(0, at);
+      const com = clientCommand(stmt);
+      if (com) { const reason = handle(com); if (reason) return reason; }
+      stmt = '';
+      rest = rest.slice(at + delimiter.length);
+    }
+    stmt = `${stmt}${rest}\n`.slice(0, 4000);
+    return null;
+  };
+}
 const CREATE_OBJECT = /\bCREATE\b([^;]{0,400}?)\b(PROCEDURE|FUNCTION|TRIGGER|EVENT|VIEW)\b/gi;
 const CREATE_MODIFIERS = /^\s*(?:OR\s+REPLACE\s+)?(?:AGGREGATE\s+)?(?:ALGORITHM\s*=\s*\w+\s+)?(?:DEFINER\s*=\s*(\S+)\s+)?(?:SQL\s+SECURITY\s+\w+\s+)?$/i;
 const USE_DB = /(?:^|;)\s*USE\s+[`'"]?([A-Za-z0-9_$]+)/gim;
@@ -591,9 +706,11 @@ export function createSqlCodeFilter() {
         if (c === '`') { state = 'ident'; out += c; i++; continue; }
         if (c === '#' || (c === '-' && line[i + 1] === '-' && (i + 2 >= n || /\s/.test(line[i + 2])))) { i = n; continue; }
         if (c === '/' && line[i + 1] === '*') {
-          const conditional = line[i + 2] === '!' || (line[i + 2] === 'M' && line[i + 3] === '!');
-          if (!conditional) { state = 'block'; i += 2; continue; }
-          i += line[i + 2] === '!' ? 3 : 4;
+          // /*! … */, /*M! … */ and /*+ … */ (optimizer hints) are code to the
+          // mysql client and the server; only plain block comments are dropped.
+          const executable = line[i + 2] === '!' || line[i + 2] === '+' || (line[i + 2] === 'M' && line[i + 3] === '!');
+          if (!executable) { state = 'block'; i += 2; continue; }
+          i += line[i + 2] === 'M' ? 4 : 3;
           while (i < n && /\d/.test(line[i])) i++;
           out += ' ';
           continue;
@@ -611,7 +728,8 @@ export function createSqlCodeFilter() {
         literal += c; i++; continue;
       }
       if (state === 'ident') {
-        out += c; i++;
+        // The client treats backticks like strings, so "\" inside one is never a command.
+        out += c === '\\' ? '_' : c; i++;
         if (c === '`') { if (line[i] === '`') { out += '`'; i++; } else state = 'code'; }
         continue;
       }
@@ -631,9 +749,11 @@ export function createSqlCodeFilter() {
 // comes from createSqlCodeFilter; `raw` is the unfiltered text.
 export function scanSqlCode(code, raw, { database, definerPrefix } = {}) {
   if (SQL_MODE_TRAP.test(raw)) return 'sql_mode changes that alter string quoting are not allowed in an account dump';
-  for (const [re, what] of DENIED_SQL) if (re.test(code)) return `${what} statements are not allowed in an account dump`;
+  for (const [re, what, hint] of DENIED_SQL) if (re.test(code)) return `${what} statements are not allowed in an account dump${hint || ''}`;
   for (const m of code.matchAll(USE_DB)) if (!database || m[1] !== database) return `the dump switches to database "${m[1]}" (only ${database || 'the target database'} may be used)`;
   for (const m of code.matchAll(DDL_DB)) if (!database || m[1] !== database) return `the dump creates or alters database "${m[1]}" (only ${database || 'the target database'} may be used)`;
+  const foreign = foreignSchema(code, database);
+  if (foreign) return foreign;
   for (const m of code.matchAll(CREATE_OBJECT)) {
     const mods = m[1].match(CREATE_MODIFIERS);
     if (!mods) continue;
@@ -648,8 +768,12 @@ export function scanSqlCode(code, raw, { database, definerPrefix } = {}) {
 
 export function scanSql(text, options = {}) {
   const codeOf = createSqlCodeFilter();
-  const lines = String(text).split('\n');
-  return scanSqlCode(lines.map(codeOf).join('\n'), text, options);
+  const guard = createClientCommandGuard(options);
+  const codes = String(text).split('\n').map(codeOf);
+  const reason = scanSqlCode(codes.join('\n'), text, options);
+  if (reason) return reason;
+  for (const code of codes) { const r = guard(code); if (r) return r; }
+  return null;
 }
 
 // Streams the dump line by line; a rolling window of filtered code keeps
@@ -659,21 +783,62 @@ async function scanDumpFile(file, options) {
   const stream = fs.createReadStream(file, { encoding: 'utf8' });
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
   const codeOf = createSqlCodeFilter();
+  const guard = createClientCommandGuard(options);
   let window = '';
   let lineNo = 0;
+  let definers = false;
   try {
     for await (const line of rl) {
       lineNo++;
-      window = `${window.slice(-600)}\n${codeOf(line)}`;
-      const reason = scanSqlCode(window, line, options);
+      const code = codeOf(line);
+      window = `${window.slice(-600)}\n${code}`;
+      const reason = scanSqlCode(window, line, options) || guard(code);
       if (reason) return { ok: false, line: lineNo, reason };
+      if (!definers && /\bDEFINER\s*=/i.test(code)) definers = true;
     }
   } finally { rl.close(); stream.destroy(); }
-  return { ok: true, lines: lineNo };
+  return { ok: true, lines: lineNo, definers };
+}
+
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+// Privileges that let a non-SUPER user keep the DEFINER of views, routines,
+// triggers and events found in the dump: MySQL 8.2+, MySQL 8.0/8.1, MariaDB
+// 10.5.2+. Older servers offer only SUPER, which the import never gets.
+const DEFINER_PRIVILEGES = ['SET_ANY_DEFINER, ALLOW_NONEXISTENT_DEFINER', 'SET_USER_ID', 'SET USER'];
+
+async function grantDefinerPrivilege(bin, accounts, creds) {
+  for (const priv of DEFINER_PRIVILEGES) {
+    try {
+      await runSql(bin, accounts.map((a) => `GRANT ${priv} ON *.* TO ${a};`).join('\n'), creds);
+      return priv;
+    } catch (err) {
+      if (err.code !== 'db_error') throw err;
+    }
+  }
+  return null;
+}
+
+// Runs fn with a temporary MySQL user that holds ALL PRIVILEGES on the target
+// database and nothing else, so cross-schema statements, SET GLOBAL, FILE
+// operations and the like are refused by the server itself, whatever the
+// scanner missed. The user is dropped when fn settles.
+async function withImportUser(bin, creds, database, { definers }, fn) {
+  const user = `whm_import_${crypto.randomBytes(6).toString('hex')}`;
+  const password = crypto.randomBytes(24).toString('base64url');
+  const hosts = !creds?.host ? ['localhost'] : LOCAL_HOSTS.has(creds.host) ? [...LOCAL_HOSTS] : ['%'];
+  const accounts = hosts.map((h) => q.account(user, h));
+  const setup = accounts.flatMap((a) => [`CREATE USER ${a} IDENTIFIED BY ${q.str(password)};`, `GRANT ALL PRIVILEGES ON ${q.id(database)}.* TO ${a};`]);
+  await runSql(bin, setup.join('\n'), creds);
+  try {
+    const definerPrivilege = definers ? await grantDefinerPrivilege(bin, accounts, creds) : null;
+    return await fn({ user, password, definerPrivilege });
+  } finally {
+    await runSql(bin, accounts.map((a) => `DROP USER IF EXISTS ${a};`).join('\n'), creds).catch(() => {});
+  }
 }
 
 defineOp('transfer.mysql.import', {
-  description: 'Load a SQL dump into a local database with the mysql client after refusing user/grant/global statements ("source <file>", credentials via a 0600 defaults file or /root/.my.cnf)',
+  description: 'Load a SQL dump into a local database as a temporary user limited to that database, after refusing user/grant/global/client-command statements ("source <file>", admin credentials via a 0600 defaults file or /root/.my.cnf)',
   timeoutMs: 7_200_000,
   schema: z.object({ path: arg.absPath, database: dbName, definerPrefix: dbPrefix.optional(), credentials, timeoutMs: z.number().int().min(10_000).max(7_200_000).default(3_600_000) }).strict(),
   run: async ({ path: file, database, definerPrefix, credentials: creds, timeoutMs }, ctx) => {
@@ -684,14 +849,27 @@ defineOp('transfer.mysql.import', {
     if (!scan.ok) throw new OpError('refused', `${path.basename(resolved)} line ${scan.line}: ${scan.reason}; review the dump and import it by hand if it is legitimate`);
     const bin = findClient();
     if (!bin) throw new OpError('capability_missing', 'The MySQL/MariaDB client (mysql or mariadb) is not installed on this server');
-    return withClientDefaults(creds, async (defaults) => {
-      const argv = [...defaults, '--batch', `--database=${database}`, '-e', `source ${resolved}`];
-      const { code, stderr } = await exec(bin, argv, { timeoutMs, allowFailure: true });
-      if (code !== 0) {
-        const err = classifyMysqlError(stderr);
-        throw new OpError(err.code === 'db_error' ? 'import_failed' : err.code, `mysql: ${err.message}`, { errno: err.errno });
-      }
-      return { path: resolved, database, imported: true, scannedLines: scan.lines };
+    const [sqlMode = '', socket = '', port = ''] = (await runSql(bin, 'SELECT @@GLOBAL.sql_mode, @@socket, @@port', creds)).trim().split('\t');
+    // Under NO_BACKSLASH_ESCAPES the client tokenises strings differently from
+    // the scanner, which would let "\!" hide inside a literal.
+    if (/\bNO_BACKSLASH_ESCAPES\b/i.test(sqlMode)) throw new OpError('refused', 'The MySQL server runs with sql_mode NO_BACKSLASH_ESCAPES, under which dumps cannot be screened for mysql client commands; import the dump by hand');
+    return withImportUser(bin, creds, database, { definers: scan.definers }, async (login) => {
+      const client = { user: login.user, password: login.password };
+      if (creds?.host) { client.host = creds.host; if (creds.port) client.port = creds.port; } else if (creds?.socket) client.socket = creds.socket;
+      else if (socket && socket !== 'NULL') client.socket = socket;
+      else if (port && port !== 'NULL') { client.host = '127.0.0.1'; client.port = Number(port); }
+      // --defaults-file (not -extra-file): /root/.my.cnf is read after an extra
+      // file and would put the admin user back.
+      return withClientDefaults(client, async (defaults) => {
+        const argv = [...defaults, '--batch', '--no-auto-rehash', `--database=${database}`, '-e', `source ${resolved}`];
+        const { code, stderr } = await exec(bin, argv, { timeoutMs, allowFailure: true });
+        if (code !== 0) {
+          const err = classifyMysqlError(stderr);
+          const hint = !login.definerPrivilege && /SUPER|SET_USER_ID|SET_ANY_DEFINER|SET USER/i.test(stderr) ? ' (this server offers no privilege short of SUPER for keeping a DEFINER; recreate those objects by hand)' : '';
+          throw new OpError(err.code === 'db_error' || err.code === 'db_auth_failed' ? 'import_failed' : err.code, `mysql: ${err.message}${hint}`, { errno: err.errno });
+        }
+        return { path: resolved, database, imported: true, scannedLines: scan.lines, importUser: login.user, definerPrivilege: login.definerPrivilege };
+      }, { exclusive: true });
     });
   },
 });

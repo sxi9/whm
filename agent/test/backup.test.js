@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { parseTarListing, foldChildren, archiveTop, archiveUser, buildArchiveName, signS3, s3Target, parseS3Listing, remoteUrl, destinationConfig } from '../src/ops/backup.js';
+import { parseTarListing, foldChildren, archiveTop, archiveUser, buildArchiveName, signS3, s3Target, parseS3Listing, remoteUrl, destinationConfig, createDatabaseStatement } from '../src/ops/backup.js';
 
 // exec is spied with the real implementation behind it so tests can prove an op
 // refused before any program ran. No test here archives, extracts, imports or
@@ -120,6 +120,25 @@ describe('backup schemas reject injection and traversal before anything runs', (
     expect((await opError(runOp('backup.db.restore_users', { users: [{ user: 'app', host: 'localhost', hashHex: 'zz' }] }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('backup.db.restore_users', { users: [{ user: 'app', host: 'localhost', grants: ['DROP TABLE x'] }] }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('backup.db.import', { file: '/etc/x.sql' }, ctx))).code).toMatch(/capability_missing|path_not_allowed/);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('creates the schema for a per-database (cPanel) dump from the validated name, taking only charset/collation from <db>.create', () => {
+    expect(createDatabaseStatement('alice_shop')).toBe('CREATE DATABASE IF NOT EXISTS `alice_shop`');
+    expect(createDatabaseStatement('alice_shop', 'CREATE DATABASE `alice_shop` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci */;\n')).toBe('CREATE DATABASE IF NOT EXISTS `alice_shop` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci');
+    expect(createDatabaseStatement('alice_shop', 'CREATE DATABASE IF NOT EXISTS `other` CHARACTER SET = latin1;')).toBe('CREATE DATABASE IF NOT EXISTS `alice_shop` DEFAULT CHARACTER SET latin1');
+    // Nothing but identifier characters ever reaches the statement from the file.
+    expect(createDatabaseStatement('alice_shop', "CREATE DATABASE `x` CHARACTER SET utf8; DROP DATABASE mysql; -- COLLATE 'a b'")).toBe('CREATE DATABASE IF NOT EXISTS `alice_shop` DEFAULT CHARACTER SET utf8');
+    expect(createDatabaseStatement('alice_shop', 'garbage')).toBe('CREATE DATABASE IF NOT EXISTS `alice_shop`');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('import with a database name still stops before any program runs when the client is missing', async () => {
+    exec.mockClear();
+    hasBinary.mockImplementation((name) => !['mysql', 'mariadb'].includes(name));
+    try {
+      expect((await opError(runOp('backup.db.import', { file: '/backup/alice_shop.sql', database: 'alice_shop' }, ctx))).code).toBe('capability_missing');
+    } finally { hasBinary.mockRestore(); }
     expect(exec).not.toHaveBeenCalled();
   });
 

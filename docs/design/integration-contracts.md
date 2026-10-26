@@ -86,7 +86,9 @@ enabled/disabled, or check the precondition inside the scheduler-facing wrapper 
 - `nameserversFor(ownerId)` → `string[]` (empty = server defaults). Core `accounts.create` passes it as
   `ctx.dns.ensureZoneForDomain(domain, { ip, accountId, nameservers })`. **dns-functions must consume
   `nameservers` (ns1/ns2 for the SOA/NS template) and fall back to `basic.nameservers` when absent**;
-  until it does, zones for reseller-owned accounts advertise the server defaults.
+  until it does, zones for reseller-owned accounts advertise the server defaults and "Edit Reseller
+  Nameservers and Privileges" counts as partial (resellers' test `passes the reseller's nameservers to
+  DNS Functions` pins the call shape; `owns_nameservers` stays informational either way).
 - `sharedIpFor(user)`, `delegatedAddresses(userId)` — the only addresses a reseller may assign.
 
 ACL keys enforced by core (`services/accounts.js`): `create-acct`, `suspend-acct` (suspend/unsuspend),

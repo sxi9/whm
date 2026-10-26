@@ -30,16 +30,18 @@ export async function register(ctx) {
   ctx.systemHealth = createSystemHealthService(ctx);
   const s = ctx.systemHealth;
   ctx.capabilities.register('procps', { binaries: ['ps', 'renice'], required: ['ps'] });
+  // The schedule is paused whenever a run would be skipped (see syncSchedule);
+  // these guards are the last line of defence for jobs enqueued by hand.
+  const SKIP_LOG = { disabled: 'background process killer is disabled; nothing scanned', no_patterns: 'no disallowed process names are enabled; nothing scanned', procps_missing: 'ps (procps) is not installed; nothing scanned' };
   ctx.jobs.register('system-health.bpk.scan', async (job) => {
-    if (!s.config().enabled) { job.log('background process killer is disabled; nothing scanned'); return { skipped: 'disabled' }; }
-    if (!s.enabledPatterns().length) { job.log('no disallowed process names are enabled; nothing scanned'); return { skipped: 'no_patterns' }; }
     await ctx.capabilities.ensureFresh();
-    if (!ctx.capabilities.has('procps')) { job.log('ps (procps) is not installed; nothing scanned', 'warn'); return { skipped: 'procps_missing' }; }
+    const paused = s.syncSchedule();
+    if (paused) { job.log(SKIP_LOG[paused], paused === 'procps_missing' ? 'warn' : 'info'); return { skipped: paused }; }
     const { run, kills } = await s.scan({ trigger: 'scheduled', log: job.log });
     return { runId: run.id, scanned: run.scanned, matched: run.matched, killed: run.killed, failed: run.failed, pids: kills.map((k) => k.pid) };
   });
   ctx.scheduler.ensure(s.SCHEDULE, '*/10 * * * *', 'system-health.bpk.scan');
-  if (!s.config().enabled) ctx.scheduler.update(s.SCHEDULE, { enabled: false });
+  s.syncSchedule();
 
   const r = Router();
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.json(d?.meta ? d : { data: d })).catch(next);

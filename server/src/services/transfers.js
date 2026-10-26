@@ -36,6 +36,10 @@ const SHADOW_HASH = /^\$[A-Za-z0-9]{1,6}\$[A-Za-z0-9./$=+,-]{8,500}$/;
 const AUTH_PLUGINS = new Set(['mysql_native_password', 'caching_sha2_password', 'sha256_password', 'ed25519']);
 const AUTH_HASH = /^(?:\*[0-9A-F]{40}|0x[0-9A-Fa-f]{2,1024}|\$[A-Za-z0-9./$+=]{8,300}|[A-Za-z0-9+/=]{20,100})$/;
 const SYSTEM_DATABASES = new Set(['mysql', 'sys', 'information_schema', 'performance_schema']);
+// Socket-client timeouts for the long agent ops (split mode defaults to 1 h);
+// they match the maxima of the ops' own timeoutMs schemas.
+const COPY_TIMEOUT_MS = 86_400_000;
+const IMPORT_TIMEOUT_MS = 7_200_000;
 const INSPECT_CACHE_MS = 3600_000;
 
 const isCapabilityMissing = (err) => err instanceof CapabilityError || err?.code === 'capability_missing' || err?.code === 'binary_not_found' || err?.status === 501;
@@ -427,7 +431,7 @@ export function createTransfersService(ctx) {
       if (!overwrite) return { name, status: 'skipped', detail: 'database already exists (overwrite is off)' };
     }
     try {
-      await agent.op('transfer.mysql.import', { path: dumpPath, database: name, definerPrefix: sourceUsername, credentials: localDbCredentials() }, { req });
+      await agent.op('transfer.mysql.import', { path: dumpPath, database: name, definerPrefix: sourceUsername, credentials: localDbCredentials() }, { req, timeoutMs: IMPORT_TIMEOUT_MS });
       return { name, status: 'applied', detail: 'imported' };
     } catch (err) {
       return { name, status: isCapabilityMissing(err) ? 'pending' : 'failed', detail: err.message };
@@ -642,7 +646,7 @@ export function createTransfersService(ctx) {
     if (options.skipHome) steps.home = { status: 'skipped', detail: 'not requested' };
     else {
       steps.home = await step(async () => {
-        const r = await agent.op('transfer.remote.rsync', { connection: connectionOf(sessionRow), remotePath: remoteHome, localPath: account.home_dir, directory: true, excludes: HOME_EXCLUDES, bwlimitKbps: bwlimit() }, { req });
+        const r = await agent.op('transfer.remote.rsync', { connection: connectionOf(sessionRow), remotePath: remoteHome, localPath: account.home_dir, directory: true, excludes: HOME_EXCLUDES, bwlimitKbps: bwlimit() }, { req, timeoutMs: COPY_TIMEOUT_MS });
         if (account.uid != null) await agent.op('fs.chown', { path: account.home_dir, owner: account.username, recursive: true }, { req });
         return { detail: `${r.filesTransferred ?? r.files ?? '?'} file(s), ${r.transferredBytes ?? 0} bytes copied from ${remoteHome}${r.partial ? ' (some files vanished or were unreadable)' : ''}`, bytes: r.transferredBytes ?? null };
       });
@@ -660,8 +664,8 @@ export function createTransfersService(ctx) {
         const local = path.join(stagingDir(), `run-${runId}`, `${target}.sql`);
         let dump = null;
         try {
-          dump = await agent.op('transfer.remote.dump_database', { connection: connectionOf(sessionRow), database: name }, { req });
-          await agent.op('transfer.remote.rsync', { connection: connectionOf(sessionRow), remotePath: dump.remotePath, localPath: local, directory: false, bwlimitKbps: bwlimit() }, { req });
+          dump = await agent.op('transfer.remote.dump_database', { connection: connectionOf(sessionRow), database: name }, { req, timeoutMs: IMPORT_TIMEOUT_MS });
+          await agent.op('transfer.remote.rsync', { connection: connectionOf(sessionRow), remotePath: dump.remotePath, localPath: local, directory: false, bwlimitKbps: bwlimit() }, { req, timeoutMs: COPY_TIMEOUT_MS });
           const r = await importDatabase({ account, name: target, dumpPath: local, overwrite: options.overwrite, sourceUsername: item.source_username }, user, req);
           steps.databases.push({ ...r, name: target, source: name, sizeBytes: dump.sizeBytes });
           log(`${item.username}: database ${name} → ${target} ${r.status}${r.detail ? ` – ${r.detail}` : ''}`, r.status === 'failed' ? 'error' : 'info');
@@ -890,7 +894,7 @@ export function createTransfersService(ctx) {
     else if (!archive.hasHomedir) steps.home = { status: 'skipped', detail: 'the archive has no homedir/' };
     else {
       steps.home = await step(async () => {
-        const r = await agent.op('transfer.cpmove.extract', { path: file, destination: account.home_dir, members: [member('homedir/*')], stripComponents: 2, owner: account.uid != null ? account.username : undefined }, { req });
+        const r = await agent.op('transfer.cpmove.extract', { path: file, destination: account.home_dir, members: [member('homedir/*')], stripComponents: 2, owner: account.uid != null ? account.username : undefined }, { req, timeoutMs: COPY_TIMEOUT_MS });
         return { detail: r.extracted ? `homedir extracted into ${account.home_dir}` : 'homedir/ was empty' };
       });
       log(`${item.username}: home ${steps.home.status}${steps.home.detail ? ` – ${steps.home.detail}` : ''}`, steps.home.status === 'failed' ? 'error' : 'info');
@@ -905,7 +909,7 @@ export function createTransfersService(ctx) {
         const target = targetDatabaseName(name, src, item.username);
         const dumpPath = path.join(staging, `${name}.sql`);
         try {
-          const ex = await agent.op('transfer.cpmove.extract', { path: file, destination: staging, members: [member(`mysql/${name}.sql`)], stripComponents: 2 }, { req });
+          const ex = await agent.op('transfer.cpmove.extract', { path: file, destination: staging, members: [member(`mysql/${name}.sql`)], stripComponents: 2 }, { req, timeoutMs: COPY_TIMEOUT_MS });
           if (!ex.extracted) { steps.databases.push({ name: target, source: name, status: 'failed', detail: 'dump missing from the archive' }); continue; }
           const r = await importDatabase({ account, name: target, dumpPath, overwrite: options.overwrite, sourceUsername: src }, user, req);
           steps.databases.push({ ...r, name: target, source: name });

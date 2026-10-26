@@ -48,9 +48,14 @@ describe('System Health API', () => {
       'sys.processes': ({ limit }) => processes.slice(0, limit),
       'sys.process.signal': ({ pid, signal }) => {
         signalled.push({ pid, signal });
+        return { pid, signal };
+      },
+      'bpk.kill': ({ pid, signal, user, elapsedSeconds }) => {
+        signalled.push({ pid, signal });
         if (pid === 666) throw Object.assign(new Error(`No process with PID ${pid}`), { agentError: true, code: 'not_found', details: {} });
         if (pid === 777) throw Object.assign(new Error('Operation not permitted'), { agentError: true, code: 'signal_failed', details: {} });
-        return { pid, signal };
+        if (pid === 888) throw Object.assign(new Error(`PID ${pid} now belongs to "root", not "${user}"`), { agentError: true, code: 'owner_mismatch', details: {} });
+        return { pid, signal, user, elapsedSeconds };
       },
       'sys.process.renice': ({ pid, niceness }) => ({ pid, niceness }),
     });
@@ -83,11 +88,12 @@ describe('System Health API', () => {
     ];
   });
 
-  it('registers the module: service on ctx, capability, job type and schedule', () => {
+  it('registers the module: service on ctx, capability, job type and a schedule paused until something is armed', () => {
     expect(typeof app.ctx.systemHealth.scan).toBe('function');
     expect(app.ctx.jobs.types()).toContain('system-health.bpk.scan');
     const schedule = app.ctx.scheduler.list().find((s) => s.name === 'system-health-bpk');
-    expect(schedule).toMatchObject({ cron: '*/10 * * * *', job_type: 'system-health.bpk.scan', enabled: 1 });
+    expect(schedule).toMatchObject({ cron: '*/10 * * * *', job_type: 'system-health.bpk.scan', enabled: 0 });
+    expect(app.ctx.systemHealth.pausedReason()).toBe('no_patterns');
     expect(app.ctx.capabilities.snapshot().capabilities.procps).toMatchObject({ installed: true });
   });
 
@@ -97,19 +103,22 @@ describe('System Health API', () => {
     expect(data.config).toEqual({ enabled: true, signal: 'SIGKILL', notify: true, scope: 'non-root', exemptUsers: [], retentionDays: 90 });
     expect(data.patterns.map((p) => p.name)).toEqual(['BitchX', 'bnc', 'eggdrop', 'generic-sniffers', 'guardservices', 'ircd', 'psyBNC', 'ptlink', 'services']);
     expect(data.patterns.every((p) => p.builtin && !p.enabled)).toBe(true);
-    expect(data.schedule).toMatchObject({ name: 'system-health-bpk', cron: '*/10 * * * *', enabled: true });
+    expect(data.schedule).toMatchObject({ name: 'system-health-bpk', cron: '*/10 * * * *', enabled: false, paused: 'no_patterns' });
     expect(data.capability).toEqual({ procps: true, notifications: true });
     expect(data.stats).toEqual({ total: 0, last24h: 0, failed: 0 });
     expect(data.signals).toContain('SIGKILL');
   });
 
-  it('a fresh install kills nothing until the operator ticks entries on the list', async () => {
+  it('a fresh install kills nothing and keeps the schedule paused until the operator ticks entries on the list', async () => {
+    const scheduleEnabled = () => app.ctx.scheduler.list().find((s) => s.name === 'system-health-bpk').enabled;
+    expect(scheduleEnabled()).toBe(0);
     expect((await get('/api/system-health/bpk/matches').expect(200)).body.data).toMatchObject({ scanned: 9, patterns: [], matches: [] });
     const res = await post('/api/system-health/bpk/scan', {}).expect(200);
     expect(res.body.data.run).toMatchObject({ matched: 0, killed: 0, failed: 0 });
     expect(res.body.data.kills).toEqual([]);
     expect(signalled).toEqual([]);
     expect(notifications).toEqual([]);
+    // A job enqueued by hand while nothing is armed is still a no-op (safety net).
     app.ctx.jobs.start();
     try {
       const job = await waitForJob(app.ctx, app.ctx.jobs.enqueue('system-health.bpk.scan').id);
@@ -118,9 +127,20 @@ describe('System Health API', () => {
     } finally { app.ctx.jobs.stop(); }
     expect(signalled).toEqual([]);
     expect(app.agent.callsTo('sys.processes')).toHaveLength(2);
-    for (const p of (await get('/api/system-health/bpk/patterns').expect(200)).body.data) {
+    const patterns = (await get('/api/system-health/bpk/patterns').expect(200)).body.data;
+    expect((await patch(`/api/system-health/bpk/patterns/${patterns[0].id}`, { enabled: true }).expect(200)).body.data.enabled).toBe(true);
+    expect(scheduleEnabled()).toBe(1);
+    expect((await get('/api/system-health/bpk').expect(200)).body.data.schedule).toMatchObject({ enabled: true, paused: null });
+    expect((await patch(`/api/system-health/bpk/patterns/${patterns[0].id}`, { enabled: false }).expect(200)).body.data.enabled).toBe(false);
+    expect(scheduleEnabled()).toBe(0);
+    const custom = (await post('/api/system-health/bpk/patterns', { name: 'kinsing' }).expect(201)).body.data;
+    expect(scheduleEnabled()).toBe(1);
+    await del(`/api/system-health/bpk/patterns/${custom.id}`).expect(200);
+    expect(scheduleEnabled()).toBe(0);
+    for (const p of patterns) {
       expect((await patch(`/api/system-health/bpk/patterns/${p.id}`, { enabled: true }).expect(200)).body.data.enabled).toBe(true);
     }
+    expect(scheduleEnabled()).toBe(1);
     const armed = await get('/api/system-health/bpk/matches').expect(200);
     expect(armed.body.data.patterns).toHaveLength(9);
     expect(armed.body.data.matches.map((m) => m.pid)).toEqual([1001, 1003, 1004, 1006]);
@@ -141,6 +161,13 @@ describe('System Health API', () => {
     expect(run).toMatchObject({ trigger: 'manual', principal: 'root', dry_run: false, scanned: 9, matched: 4, killed: 4, failed: 0, notified: true, error: null });
     expect(kills.map((k) => k.pid)).toEqual([1001, 1003, 1004, 1006]);
     expect(signalled).toEqual([1001, 1003, 1004, 1006].map((pid) => ({ pid, signal: 'SIGKILL' })));
+    expect(app.agent.callsTo('sys.process.signal')).toHaveLength(0);
+    expect(app.agent.callsTo('bpk.kill').map((c) => c.args)).toEqual([
+      { pid: 1001, signal: 'SIGKILL', user: 'alice', elapsedSeconds: 60 },
+      { pid: 1003, signal: 'SIGKILL', user: 'bob', elapsedSeconds: 60 },
+      { pid: 1004, signal: 'SIGKILL', user: 'bob', elapsedSeconds: 60 },
+      { pid: 1006, signal: 'SIGKILL', user: 'carol', elapsedSeconds: 60 },
+    ]);
     expect(notifications).toHaveLength(1);
     expect(notifications[0]).toMatchObject({ event: 'bpk.killed', severity: 'warning' });
     expect(notifications[0].subject).toContain('4 process(es)');
@@ -156,15 +183,17 @@ describe('System Health API', () => {
     expect(overview.body.data.lastRun.id).toBe(run.id);
   });
 
-  it('records processes that vanished or refused the signal without aborting the run', async () => {
-    processes.push(proc(666, 'dave', 'bnc'), proc(777, 'erin', 'ircd'));
+  it('records processes that vanished, were recycled or refused the signal without aborting the run', async () => {
+    processes.push(proc(666, 'dave', 'bnc'), proc(777, 'erin', 'ircd'), proc(888, 'frank', 'ptlink'));
     const res = await post('/api/system-health/bpk/scan', {}).expect(200);
-    expect(res.body.data.run).toMatchObject({ matched: 6, killed: 4, failed: 1 });
+    expect(res.body.data.run).toMatchObject({ matched: 7, killed: 4, failed: 1 });
     const byPid = Object.fromEntries(res.body.data.kills.map((k) => [k.pid, k]));
     expect(byPid[666]).toMatchObject({ result: 'gone' });
+    expect(byPid[888]).toMatchObject({ result: 'gone', error: expect.stringMatching(/now belongs to "root"/) });
     expect(byPid[777]).toMatchObject({ result: 'failed', error: 'Operation not permitted' });
     expect(notifications[0].body).toContain('FAILED pid 777');
     expect(notifications[0].body).not.toContain('pid 666');
+    expect(notifications[0].body).not.toContain('pid 888');
     const failed = await get('/api/system-health/bpk/kills?result=failed&user=erin').expect(200);
     expect(failed.body.data.map((k) => k.pid)).toEqual([777]);
   });
@@ -218,18 +247,21 @@ describe('System Health API', () => {
     await patch(`/api/system-health/bpk/patterns/${eggdrop.id}`, { enabled: true }).expect(200);
     expect((await del(`/api/system-health/bpk/patterns/${id}`).expect(200)).body.data).toEqual({ removed: true, name: 'xmrig' });
     await del(`/api/system-health/bpk/patterns/${id}`).expect(404);
-    expect(auditRows('system_health.bpk.pattern.add')).toHaveLength(1);
-    expect(auditRows('system_health.bpk.pattern.remove')).toHaveLength(1);
+    expect(auditRows('system_health.bpk.pattern.add').filter((r) => r.target === 'minerd')).toHaveLength(1);
+    expect(auditRows('system_health.bpk.pattern.remove').filter((r) => r.target === 'xmrig')).toHaveLength(1);
   });
 
   it('kills a single previewed match and refuses PIDs that are not matches', async () => {
     const res = await post('/api/system-health/bpk/matches/1003/kill').expect(200);
     expect(res.body.data).toMatchObject({ pid: 1003, user: 'bob', pattern: 'psyBNC', result: 'killed' });
     expect(signalled).toEqual([{ pid: 1003, signal: 'SIGKILL' }]);
+    expect(app.agent.callsTo('bpk.kill').at(-1).args).toEqual({ pid: 1003, signal: 'SIGKILL', user: 'bob', elapsedSeconds: 60 });
+    processes.push(proc(888, 'frank', 'ptlink'));
+    expect((await post('/api/system-health/bpk/matches/888/kill').expect(200)).body.data).toMatchObject({ pid: 888, result: 'gone' });
     await post('/api/system-health/bpk/matches/1002/kill').expect(404);
     await post('/api/system-health/bpk/matches/900/kill').expect(404);
-    expect(signalled).toHaveLength(1);
-    expect(auditRows('system_health.bpk.kill')).toHaveLength(1);
+    expect(signalled).toHaveLength(2);
+    expect(auditRows('system_health.bpk.kill')).toHaveLength(2);
   });
 
   it('runs the scheduled job through the job queue and skips it while disabled', async () => {
@@ -330,6 +362,9 @@ describe('System Health API', () => {
     const run = (await get('/api/system-health/bpk/runs?limit=1').expect(200)).body.data[0];
     expect(run).toMatchObject({ trigger: 'manual', error: expect.stringMatching(/procps/) });
     expect(signalled).toEqual([]);
+    const scheduleEnabled = () => app.ctx.scheduler.list().find((s) => s.name === 'system-health-bpk').enabled;
+    expect(overview.body.data.schedule).toMatchObject({ enabled: false, paused: 'procps_missing' });
+    expect(scheduleEnabled()).toBe(0);
     app.ctx.jobs.start();
     try {
       const job = await waitForJob(app.ctx, app.ctx.jobs.enqueue('system-health.bpk.scan').id);
@@ -337,5 +372,9 @@ describe('System Health API', () => {
       expect(job.result).toEqual({ skipped: 'procps_missing' });
     } finally { app.ctx.jobs.stop(); }
     expect((await get('/api/system-health/disk').expect(200)).body.data.filesystems).toHaveLength(1);
+    psInstalled = true;
+    await app.ctx.capabilities.refresh();
+    expect((await get('/api/system-health/bpk').expect(200)).body.data.schedule).toMatchObject({ enabled: true, paused: null });
+    expect(scheduleEnabled()).toBe(1);
   });
 });

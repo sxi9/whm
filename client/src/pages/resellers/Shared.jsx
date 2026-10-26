@@ -101,7 +101,7 @@ export function NameserversEditor({ value = [], onChange, owns, onOwnsChange, de
       <div className="form-grid">
         {rows.map((n, i) => <Field key={i} label={`Nameserver ${i + 1}`} help={i < defaults.length && !n ? `Server default: ${defaults[i]}` : undefined}><TextInput value={n} onChange={(v) => set(i, v)} placeholder={defaults[i] || `ns${i + 1}.example.com`} /></Field>)}
       </div>
-      <p className="muted" style={{ margin: '4px 0 8px' }}>Stored with the reseller and handed to DNS Functions when zones for its accounts are created (<code>ctx.resellers.nameserversFor</code>); until DNS Functions reads them, new zones advertise the server defaults.</p>
+      <p className="muted" style={{ margin: '4px 0 8px' }}>Stored with the reseller and passed to DNS Functions whenever a zone is created for one of its accounts. Partial: DNS Functions does not yet read that option, so new zones still advertise the server's nameservers until it does; existing zones are never rewritten.</p>
       {onOwnsChange && <Field inline><Toggle checked={owns} onChange={onOwnsChange} label="Reseller operates these nameservers" description="Informational: the hosts are run by the reseller rather than by this server" /></Field>}
     </div>
   );

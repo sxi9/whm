@@ -11,7 +11,10 @@ import { isRoot } from '../middleware/rbac.js';
 //                                                package/IP delegation forbid the account; returns { sharedIp }
 //   resellers.modifyPolicy(user, account, { pkgName, diskQuotaMb, bandwidthLimitMb, ip })
 //                                             -> same checks for an existing account's new values
-//   resellers.nameserversFor(ownerId)         -> the owner's nameservers ([] when the server defaults apply)
+//   resellers.nameserversFor(ownerId)         -> the owner's nameservers ([] when the server defaults apply).
+//                                                accounts.create hands them to ctx.dns.ensureZoneForDomain as
+//                                                { nameservers }; until DNS Functions consumes that option
+//                                                (integration contract 10) new zones advertise the server defaults.
 //   resellers.sharedIpFor(user)               -> the reseller's shared IP or null
 //   resellers.delegatedAddresses(userId)      -> ip_addresses rows delegated to a reseller
 //   resellers.isReseller(username)
@@ -118,8 +121,14 @@ export function createResellersService(ctx) {
     accountByUsername: db.prepare('SELECT a.*, u.username AS owner FROM accounts a JOIN users u ON u.id = a.owner_id WHERE a.username = ?'),
     accountById: db.prepare('SELECT * FROM accounts WHERE id = ?'),
     accountsOwned: db.prepare('SELECT id, username, domain, ip, package_name, suspended, suspend_reason, disk_quota_mb, disk_used_mb, bandwidth_limit_mb, bandwidth_used_mb, contact_email, created_at FROM accounts WHERE owner_id = ? ORDER BY username'),
-    ownedStats: db.prepare(`SELECT owner_id, COUNT(*) AS accounts, SUM(suspended) AS suspended, COALESCE(SUM(disk_used_mb), 0) AS disk_used_mb, COALESCE(SUM(disk_quota_mb), 0) AS disk_allocated_mb, SUM(CASE WHEN disk_quota_mb IS NULL THEN 1 ELSE 0 END) AS unlimited_disk,
-      COALESCE(SUM(bandwidth_used_mb), 0) AS bandwidth_used_mb, COALESCE(SUM(bandwidth_limit_mb), 0) AS bandwidth_allocated_mb, SUM(CASE WHEN bandwidth_limit_mb IS NULL THEN 1 ELSE 0 END) AS unlimited_bandwidth FROM accounts GROUP BY owner_id`),
+    // A quota/limit of 0 is "unlimited" throughout the panel (setquota 0), like NULL.
+    ownedStats: db.prepare(`SELECT owner_id, COUNT(*) AS accounts, SUM(suspended) AS suspended, COALESCE(SUM(disk_used_mb), 0) AS disk_used_mb, COALESCE(SUM(disk_quota_mb), 0) AS disk_allocated_mb, SUM(CASE WHEN disk_quota_mb IS NULL OR disk_quota_mb = 0 THEN 1 ELSE 0 END) AS unlimited_disk,
+      COALESCE(SUM(bandwidth_used_mb), 0) AS bandwidth_used_mb, COALESCE(SUM(bandwidth_limit_mb), 0) AS bandwidth_allocated_mb, SUM(CASE WHEN bandwidth_limit_mb IS NULL OR bandwidth_limit_mb = 0 THEN 1 ELSE 0 END) AS unlimited_bandwidth FROM accounts GROUP BY owner_id`),
+    insertBroadcast: db.prepare('INSERT INTO reseller_broadcasts (subject, body, from_address, requested_by) VALUES (?, ?, ?, ?)'),
+    broadcastById: db.prepare('SELECT * FROM reseller_broadcasts WHERE id = ?'),
+    broadcastJob: db.prepare('UPDATE reseller_broadcasts SET job_id = ? WHERE id = ?'),
+    broadcastStatus: db.prepare("UPDATE reseller_broadcasts SET status = ?, sent_json = ?, failed_json = ?, finished_at = datetime('now') WHERE id = ?"),
+    broadcasts: db.prepare('SELECT * FROM reseller_broadcasts ORDER BY id DESC LIMIT ?'),
     setOwner: db.prepare("UPDATE accounts SET owner_id = ?, updated_at = datetime('now') WHERE id = ?"),
     reassignOwner: db.prepare("UPDATE accounts SET owner_id = ?, updated_at = datetime('now') WHERE owner_id = ?"),
     rootUser: db.prepare("SELECT id, username, role FROM users WHERE role = 'root' ORDER BY id LIMIT 1"),
@@ -500,40 +509,59 @@ export function createResellersService(ctx) {
     return { kind: 'agent', send: (msg, req) => agent.op('mail.sendmail', { from: msg.from, to: [msg.to], subject: msg.subject, text: msg.text }, { req }) };
   }
 
+  // Job records (params, result, logs) are readable by every reseller through
+  // /api/jobs, so the message and the addresses never go into them: the job
+  // carries only the broadcast id and the handler resolves recipients when it runs.
   function emailAll({ subject, text, from }, user, req) {
     const sender = senderFor();
     if (sender.kind !== 'contacts' && !capabilities.has('exim')) throw new CapabilityError('exim', 'Exim is not installed, so the panel cannot send email. Install exim4 (Debian/Ubuntu) or exim (RHEL) to email resellers.');
     const list = recipients();
     if (!list.recipients.length) throw unprocessable('No reseller has an email address', { subject: ['Nothing to send'] });
     const sendFrom = from || settings.get('resellers.email_from', '') || settings.get('mail.notification_from', '') || `root@${hostname()}`;
-    const job = ctx.jobs.enqueue('resellers.email_all', { subject, text, from: sendFrom, recipients: list.recipients, requestedBy: user.username }, { userId: user.id });
-    audit(req, { action: 'reseller.email_all', target: 'resellers', args: { subject, recipients: list.recipients.length, from: sendFrom, job: job.id } });
-    return { job, recipients: list.recipients.length, from: sendFrom };
+    const broadcastId = Number(stmts.insertBroadcast.run(subject, text, sendFrom, user.username).lastInsertRowid);
+    const job = ctx.jobs.enqueue('resellers.email_all', { broadcastId, requestedBy: user.username }, { userId: user.id });
+    stmts.broadcastJob.run(job.id, broadcastId);
+    audit(req, { action: 'reseller.email_all', target: 'resellers', args: { subject, recipients: list.recipients.length, from: sendFrom, job: job.id, broadcast: broadcastId } });
+    return { job, broadcast: broadcastId, recipients: list.recipients.length, from: sendFrom };
   }
 
   const fill = (template, vars) => String(template).replace(/\{\{\s*([a-z_]+)\s*\}\}/gi, (_, k) => (vars[k] ?? ''));
 
+  function shapeBroadcast(row) {
+    return { id: row.id, subject: row.subject, from: row.from_address, requested_by: row.requested_by, job_id: row.job_id, status: row.status, sent: parseList(row.sent_json), failed: parseList(row.failed_json), created_at: row.created_at, finished_at: row.finished_at };
+  }
+
   async function runEmailAll(jobCtx) {
-    const { subject, text, from, recipients: list = [], requestedBy } = jobCtx.params;
+    const { broadcastId, requestedBy } = jobCtx.params;
+    const row = stmts.broadcastById.get(broadcastId);
+    if (!row) throw new Error(`Broadcast ${broadcastId} no longer exists`);
+    const { subject, body: text, from_address: from } = row;
+    const list = recipients().recipients;
     const sender = senderFor();
     const sent = [];
     const failed = [];
-    jobCtx.log(`Sending "${subject}" to ${list.length} reseller(s) as ${from} via ${sender.kind}`);
+    jobCtx.log(`Sending broadcast #${broadcastId} to ${list.length} reseller(s) via ${sender.kind}`);
     for (const [i, r] of list.entries()) {
       const vars = { username: r.username, email: r.email, hostname: hostname(), accounts: r.accounts };
       try {
         await sender.send({ to: r.email, from, subject: fill(subject, vars), text: fill(text, vars) }, null);
         sent.push(r.username);
-        jobCtx.log(`${r.username} <${r.email}>: accepted`);
+        jobCtx.log(`${r.username}: accepted`);
       } catch (err) {
         failed.push({ username: r.username, email: r.email, error: err.message });
-        jobCtx.log(`${r.username} <${r.email}>: ${err.message}`, 'warn');
+        jobCtx.log(`${r.username}: ${err.message}`, 'warn');
         if (err.code === 'capability_missing' || err.code === 'binary_not_found' || err.status === 501) { jobCtx.log('Mail server is not available; stopping', 'error'); break; }
       }
       jobCtx.progress(((i + 1) / list.length) * 100, `${sent.length} sent, ${failed.length} failed`);
     }
-    ctx.auditRecord?.(null, { action: 'reseller.email_all.result', target: requestedBy, args: { subject, sent: sent.length, failed: failed.length } });
-    return { subject, from, sent, failed, total: list.length };
+    stmts.broadcastStatus.run(failed.length ? (sent.length ? 'partial' : 'failed') : 'done', JSON.stringify(sent), JSON.stringify(failed), broadcastId);
+    ctx.auditRecord?.(null, { action: 'reseller.email_all.result', target: requestedBy, args: { subject, broadcast: broadcastId, sent: sent.length, failed: failed.length } });
+    return { broadcast: broadcastId, sent, failed: failed.map((f) => ({ username: f.username, error: f.error })), total: list.length };
+  }
+
+  // Root-only: what was sent and to whom (addresses included), per broadcast.
+  function emailHistory(limit = 50) {
+    return stmts.broadcasts.all(limit).map(shapeBroadcast);
   }
 
   // --- Hooks for other categories ---------------------------------------------------------
@@ -587,7 +615,8 @@ export function createResellersService(ctx) {
     const max = kind === 'disk' ? limits.max_disk_mb : limits.max_bandwidth_mb;
     const oversell = kind === 'disk' ? limits.oversell_disk : limits.oversell_bandwidth;
     if (max == null || oversell) return;
-    if (next == null) { if (!pol.explicitly(unlimitedAcl)) throw resellerLimit(`Unlimited ${label} is not allowed while your reseller ${label} limit is set`); return; }
+    // 0 is "no quota" for setquota and for packages, so it needs the unlimited ACL like NULL.
+    if (next == null || next === 0) { if (!pol.explicitly(unlimitedAcl)) throw resellerLimit(`Unlimited ${label} is not allowed while your reseller ${label} limit is set`); return; }
     if (allocated + next > max) throw resellerLimit(`This account would allocate ${allocated + next} MB of ${label}, over your reseller limit of ${max} MB`);
   }
 
@@ -660,7 +689,7 @@ export function createResellersService(ctx) {
     get(username, user) { assertSelfOrRoot(username, user); return shape(loadReseller(username)); },
     catalog, create, update, setPrivileges, setSuspended, reset, aclLists,
     delegation, setDelegation, setSharedIp, changeOwner, changeOwnerBulk, accounts, usage, usageAll,
-    recipients, emailAll, runEmailAll,
+    recipients, emailAll, runEmailAll, emailHistory,
     aclsFor, hasAcl, assertAcl, sharedIpFor, nameserversFor, createPolicy, modifyPolicy, delegatedAddresses: (userId) => stmts.delegatedTo.all(userId),
     isReseller: (username) => stmts.userByUsername.get(username)?.role === 'reseller',
   };

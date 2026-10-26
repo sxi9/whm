@@ -10,6 +10,7 @@ import { useConfirm } from '../../components/Modal.jsx';
 
 const RESULT_LABEL = { killed: 'Killed', failed: 'Failed', gone: 'Already exited', 'would-kill': 'Dry run' };
 const RESULT_STATUS = { killed: 'ok', failed: 'failed', gone: 'unknown', 'would-kill': 'pending' };
+const PAUSED_LABEL = { disabled: 'the scan is disabled', no_patterns: 'no names enabled', procps_missing: 'procps is not installed' };
 
 export function BackgroundProcessKiller() {
   const toast = useToast();
@@ -64,14 +65,14 @@ export function BackgroundProcessKiller() {
       {procps && cfg.enabled && armed === 0 && (
         <div className="banner banner-info">
           <ShieldAlert size={18} />
-          <div><strong>Nothing is killed yet.</strong><p>The disallowed list ships with every entry unticked. Tick the names you want terminated below; the scheduled scan only acts on enabled entries.</p></div>
+          <div><strong>Nothing is killed yet.</strong><p>The disallowed list ships with every entry unticked and the scheduled scan stays paused until you tick the names you want terminated below.</p></div>
         </div>
       )}
       {!procps && <CapabilityNotice error={{ code: 'capability_missing', message: 'The "ps" program (procps) is not installed on this server, so processes cannot be scanned or killed.' }} onRetry={() => api.post('/system/capabilities/refresh').then(refreshAll).catch(toast.error)} />}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: 18, alignItems: 'start' }}>
         <Card title="Status" actions={<StatusPill status={cfg.enabled ? 'enabled' : 'disabled'}>{cfg.enabled ? 'Enabled' : 'Disabled'}</StatusPill>}>
           <KeyValue items={[
-            ['Schedule', data.schedule ? <><code>{data.schedule.cron}</code> {data.schedule.enabled ? '' : <span className="muted">(paused)</span>}</> : 'not registered'],
+            ['Schedule', data.schedule ? <><code>{data.schedule.cron}</code> {data.schedule.enabled ? '' : <span className="muted">(paused: {PAUSED_LABEL[data.schedule.paused] || 'nothing to do'})</span>}</> : 'not registered'],
             ['Next scheduled run', data.schedule?.enabled ? formatDate(data.schedule.nextRunAt) : '—'],
             ['Last run', run ? <>{formatDate(run.finished_at || run.started_at)} <span className="muted">({run.trigger}{run.dry_run ? ', dry run' : ''})</span></> : 'never'],
             ['Last result', run ? (run.error ? <StatusPill status="failed">{run.error}</StatusPill> : `${run.scanned} scanned, ${run.matched} matched, ${run.killed} killed${run.failed ? `, ${run.failed} failed` : ''}`) : '—'],

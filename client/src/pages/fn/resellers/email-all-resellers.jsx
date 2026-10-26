@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
-import { PageHeader, Card, CapabilityNotice, KeyValue } from '../../../components/Common.jsx';
+import { PageHeader, Card, CapabilityNotice, KeyValue, StatusPill, formatDate } from '../../../components/Common.jsx';
 import { Field, TextInput, Textarea, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { ProgressLog } from '../../../components/ProgressLog.jsx';
 import { useToast } from '../../../components/Toast.jsx';
@@ -17,6 +17,7 @@ export default function EmailAllResellers({ fn }) {
   const [outcome, setOutcome] = useState(null);
   const set = (k) => (v) => setForm((f) => ({ ...f, [k]: v }));
   const { data: who, error: whoError, refetch } = useApi('/resellers/email/recipients');
+  const history = useApi('/resellers/email/history');
 
   const submit = async (e) => {
     e.preventDefault();
@@ -57,10 +58,27 @@ export default function EmailAllResellers({ fn }) {
       </form>
       {job && (
         <Card title="Delivery">
-          <ProgressLog jobId={job} onFinished={(ev) => setOutcome(ev)} />
+          <ProgressLog jobId={job} onFinished={(ev) => { setOutcome(ev); history.refetch(); }} />
           {outcome?.result && <KeyValue items={[['Sent', outcome.result.sent.length], ['Failed', outcome.result.failed.length], outcome.result.failed.length > 0 && ['Failures', outcome.result.failed.map((f) => `${f.username}: ${f.error}`).join('; ')]]} />}
         </Card>
       )}
+      <Card title="Recent broadcasts" subtitle="Messages and addresses are kept here, visible to root only; the job queue shows counts">
+        <ErrorBanner error={history.error} onRetry={history.refetch} />
+        {history.data?.length === 0 && <p className="muted" style={{ margin: 0 }}>Nothing has been sent yet.</p>}
+        {history.data?.length > 0 && (
+          <div className="table-wrap"><table>
+            <thead><tr><th>Sent</th><th>Subject</th><th>From</th><th>By</th><th>Status</th><th>Delivered</th><th>Failed</th></tr></thead>
+            <tbody>{history.data.map((b) => (
+              <tr key={b.id}>
+                <td>{formatDate(b.created_at)}</td><td>{b.subject}</td><td>{b.from}</td><td><code>{b.requested_by}</code></td>
+                <td><StatusPill status={b.status === 'partial' ? 'warning' : b.status}>{b.status}</StatusPill></td>
+                <td>{b.sent.length}</td>
+                <td>{b.failed.length ? b.failed.map((f) => `${f.username} <${f.email}>: ${f.error}`).join('; ') : '0'}</td>
+              </tr>
+            ))}</tbody>
+          </table></div>
+        )}
+      </Card>
     </>
   );
 }

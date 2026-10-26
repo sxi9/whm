@@ -463,6 +463,36 @@ describe('Backup API', () => {
       await post('/archives/import', { path: 'relative.tar.gz' }).expect(422);
       await resellerHttp.post('/api/backup/archives/import').set('X-CSRF-Token', resellerCsrf).send({ path: '/backup/cpmove-alice.tar.gz' }).expect(403);
     });
+
+    it('restores a cPanel cpmove archive: per-database dumps without USE land in a schema created first', async () => {
+      // cpmove archives carry mysql/<db>.sql dumps with no CREATE DATABASE/USE and
+      // no cp/<user>.json the panel can read; the account exists already.
+      const entry = app.agent.disk.get('/backup/cpmove-alice.tar.gz');
+      entry.metadata = null;
+      entry.databases = ['alice_shop'];
+      entry.dnsZones = [];
+      const previousDatabases = app.ctx.databases;
+      app.ctx.databases = {
+        activeProfile: () => ({ id: 1, engine: 'mysql', profile_name: 'localhost', is_local: true }),
+        forAccount: () => ({ databases: [], users: [], accessHosts: [], quota: {} }),
+        clientAddresses: () => ({ ipv4: null, ipv6: null }),
+        assign: async (args) => args,
+      };
+      try {
+        const backup = (await get('/backups?account=alice').expect(200)).body.data.find((b) => b.type === 'import');
+        expect(backup.path).toBe('/backup/cpmove-alice.tar.gz');
+        app.agent.calls.length = 0;
+        const res = await post(`/backups/${backup.id}/restore`, { kind: 'account', options: { files: false, dns: false, mail: false } }).expect(202);
+        const job = await waitForJob(app.ctx, res.body.data.job.id);
+        expect(job.status, JSON.stringify(job)).toBe('done');
+        const steps = (await get(`/restores/${res.body.data.restore.id}`).expect(200)).body.data.summary.steps;
+        expect(steps.databases).toMatchObject({ status: 'done', imported: ['alice_shop'], errors: [] });
+        const imports = app.agent.callsTo('backup.db.import');
+        expect(imports).toHaveLength(1);
+        expect(imports[0].args).toMatchObject({ database: 'alice_shop', file: expect.stringMatching(/\/mysql\/alice_shop\.sql$/) });
+        expect(imports[0].args.credentials).toBeUndefined();
+      } finally { app.ctx.databases = previousDatabases; }
+    });
   });
 
   describe('ownership is fixed on the rows, not derived from the current username', () => {
