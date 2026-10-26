@@ -1,0 +1,568 @@
+import { notFound, conflict, forbidden, unprocessable, CapabilityError } from '../lib/errors.js';
+import { isRoot } from '../middleware/rbac.js';
+
+// Account Functions. Attached as ctx.accountFunctions; other categories may call:
+//   accountFunctions.renderTemplate(name, vars)        -> HTML of a site/error page template ('index' | 'suspended' | 'moved' | 'error-4xx')
+//   accountFunctions.changeIp(username, { ip }, user, req)
+//   accountFunctions.setBandwidthLimit / resetBandwidth / unsuspendExceeders
+//   accountFunctions.setShell / setQuota / setDemoMode / forcePasswordChange
+//   accountFunctions.logRetention.get(username) / logs.list(username, kind, user)
+// Accounts themselves (create/suspend/modify/terminate) stay on ctx.accounts.
+
+export const DOMLOGS_ROOT = '/var/log/whm/domlogs';
+export const NGINX_LOG_DIR = '/var/log/nginx';
+// Partitions an account home may live on; each is an allowed root of the agent.
+export const HOME_ROOTS = ['/home', '/home2', '/home3', '/home4', '/mnt/home', '/srv/home'];
+export const TEMPLATE_NAMES = ['index', 'suspended', 'moved', 'error-4xx'];
+export const TEMPLATE_DIR = '/etc/whm/templates';
+export const TEMPLATE_VARS = ['domain', 'username', 'hostname', 'contact_email', 'ip', 'status', 'status_text', 'reason'];
+export const SHELLS = ['/bin/bash', '/bin/sh', '/usr/sbin/nologin', '/usr/local/bin/jailshell'];
+const LOG_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,200}(\.log|\.log\.\d+|\.gz|\.\d+|-access_log|-error_log|_log)$/;
+const BANDWIDTH_REASON = /^bandwidth\b/i;
+
+const page = (title, body, bg = '#f4f6f8') => `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>${title}</title>
+<style>body{font-family:system-ui,sans-serif;display:grid;place-items:center;height:100vh;margin:0;background:${bg};color:#1f2a37}main{text-align:center;max-width:520px}h1{font-weight:600}</style></head>
+<body><main>${body}</main></body></html>
+`;
+export const DEFAULT_TEMPLATES = {
+  index: page('{{domain}}', '<h1>{{domain}}</h1><p>This site is hosted but has no content yet. Upload your files to <code>public_html</code>.</p>'),
+  suspended: page('Account suspended', '<h1>This account has been suspended</h1><p>The website for <strong>{{domain}}</strong> is temporarily unavailable.</p><p>Contact the hosting provider at <a href="mailto:{{contact_email}}">{{contact_email}}</a> for assistance.</p>', '#fff7ed'),
+  moved: page('Site moved', '<h1>{{domain}} has moved</h1><p>This website is now served from a different address. If you keep seeing this page, the DNS change has not reached you yet.</p><p>Hosted on {{hostname}}.</p>'),
+  'error-4xx': page('{{status}} {{status_text}}', '<h1>{{status}} {{status_text}}</h1><p>The page you requested on <strong>{{domain}}</strong> could not be served.</p><p>Hosted on {{hostname}}.</p>'),
+};
+
+const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+export function renderTemplateBody(body, vars = {}) {
+  return String(body).replace(/\{\{\s*([a-z_]+)\s*\}\}/g, (m, key) => (vars[key] == null ? '' : escapeHtml(vars[key])));
+}
+
+const monthKey = (d = new Date()) => d.toISOString().slice(0, 7);
+const previousMonthKey = (d = new Date()) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 1, 1)).toISOString().slice(0, 7);
+
+export function createAccountFunctionsService(ctx) {
+  const { db, agent, capabilities, settings, config, logger, jobs } = ctx;
+  const stmts = {
+    byUsername: db.prepare('SELECT a.*, u.username AS owner FROM accounts a JOIN users u ON u.id = a.owner_id WHERE a.username = ?'),
+    all: db.prepare('SELECT a.*, u.username AS owner FROM accounts a JOIN users u ON u.id = a.owner_id ORDER BY a.username'),
+    byOwner: db.prepare('SELECT a.*, u.username AS owner FROM accounts a JOIN users u ON u.id = a.owner_id WHERE a.owner_id = ? ORDER BY a.username'),
+    domains: db.prepare('SELECT * FROM account_domains WHERE account_id = ? ORDER BY type, domain'),
+    setIp: db.prepare("UPDATE accounts SET ip = ?, updated_at = datetime('now') WHERE id = ?"),
+    setBandwidthLimit: db.prepare("UPDATE accounts SET bandwidth_limit_mb = ?, updated_at = datetime('now') WHERE id = ?"),
+    resetBandwidth: db.prepare("UPDATE accounts SET bandwidth_used_mb = 0, updated_at = datetime('now') WHERE id = ?"),
+    deleteBandwidthPeriod: db.prepare('DELETE FROM account_bandwidth WHERE account_id = ? AND period = ?'),
+    setDemo: db.prepare("UPDATE accounts SET demo_mode = ?, updated_at = datetime('now') WHERE id = ?"),
+    setForce: db.prepare("UPDATE accounts SET force_password_change = ?, updated_at = datetime('now') WHERE id = ?"),
+    setShell: db.prepare("UPDATE accounts SET shell = ?, updated_at = datetime('now') WHERE id = ?"),
+    setQuota: db.prepare("UPDATE accounts SET disk_quota_mb = ?, updated_at = datetime('now') WHERE id = ?"),
+    setHome: db.prepare("UPDATE accounts SET home_dir = ?, updated_at = datetime('now') WHERE id = ?"),
+    docrootsOf: db.prepare('SELECT id, docroot FROM account_domains WHERE account_id = ?'),
+    setDocroot: db.prepare('UPDATE account_domains SET docroot = ? WHERE id = ?'),
+    zonesOf: db.prepare('SELECT domain FROM dns_zones WHERE account_id = ? ORDER BY domain'),
+    retention: db.prepare('SELECT * FROM account_log_retention WHERE account_id = ?'),
+    retentionAll: db.prepare('SELECT * FROM account_log_retention'),
+    upsertRetention: db.prepare(`INSERT INTO account_log_retention (account_id, archive_logs, remove_old_archives, retain_months) VALUES (@account_id, @archive_logs, @remove_old_archives, @retain_months)
+      ON CONFLICT (account_id) DO UPDATE SET archive_logs = excluded.archive_logs, remove_old_archives = excluded.remove_old_archives, retain_months = excluded.retain_months, updated_at = datetime('now')`),
+    archived: db.prepare("UPDATE account_log_retention SET last_archived_at = datetime('now') WHERE account_id = ?"),
+    templates: db.prepare('SELECT * FROM web_templates ORDER BY name'),
+    template: db.prepare('SELECT * FROM web_templates WHERE name = ?'),
+    saveTemplate: db.prepare(`INSERT INTO web_templates (name, body) VALUES (?, ?) ON CONFLICT (name) DO UPDATE SET body = excluded.body, updated_at = datetime('now')`),
+  };
+
+  const audit = (req, entry) => (req?.audit ? req.audit(entry) : ctx.auditRecord?.(null, entry));
+  const op = (name, args, req) => agent.op(name, args, { req });
+  const strict = () => config.env === 'production';
+  const hostname = () => settings.get('basic.hostname', '') || 'localhost';
+  const homeOf = (a) => a.home_dir || `${settings.get('basic.home_root') || '/home'}/${a.username}`;
+  const summary = (a) => ({
+    username: a.username, domain: a.domain, owner: a.owner, ip: a.ip, package_name: a.package_name, contact_email: a.contact_email,
+    suspended: Boolean(a.suspended), suspend_reason: a.suspend_reason, demo_mode: Boolean(a.demo_mode), force_password_change: Boolean(a.force_password_change),
+    shell: a.shell, disk_quota_mb: a.disk_quota_mb, disk_used_mb: a.disk_used_mb, bandwidth_limit_mb: a.bandwidth_limit_mb, bandwidth_used_mb: a.bandwidth_used_mb,
+    bandwidth_percent: a.bandwidth_limit_mb ? Math.round((a.bandwidth_used_mb / a.bandwidth_limit_mb) * 100) : null,
+    over_bandwidth: Boolean(a.bandwidth_limit_mb && a.bandwidth_used_mb >= a.bandwidth_limit_mb),
+    home_dir: homeOf(a), uid: a.uid, systemUser: a.uid != null, created_at: a.created_at, updated_at: a.updated_at,
+  });
+
+  function load(username, user) {
+    const row = stmts.byUsername.get(username);
+    if (!row) throw notFound('Account');
+    if (!isRoot(user) && row.owner_id !== user.id) throw forbidden('That account belongs to another reseller');
+    return row;
+  }
+  const visibleAccounts = (user) => (isRoot(user) ? stmts.all.all() : stmts.byOwner.all(user.id));
+  // Bulk actions take explicit usernames or "all"; unknown or foreign accounts are reported, never silently skipped.
+  function selectAccounts({ usernames, all }, user) {
+    if (all) return { accounts: visibleAccounts(user), missing: [] };
+    const missing = [];
+    const accounts = [];
+    for (const u of usernames || []) {
+      try { accounts.push(load(u, user)); } catch (err) { if (err.status === 404 || err.status === 403) missing.push(u); else throw err; }
+    }
+    return { accounts, missing };
+  }
+
+  // Agent failures that only mean "this dev box has no such tool" are tolerated
+  // outside production so the panel stays usable; production always surfaces them.
+  async function tolerant(name, args, req) {
+    try { return { ok: true, result: await op(name, args, req) }; } catch (err) {
+      if (strict() || !['capability_missing', 'binary_not_found', 'path_not_allowed', 'command_failed', 'spawn_failed', 'op_failed'].includes(err.code)) throw err;
+      logger.warn({ op: name, code: err.code }, `${err.message} — continuing without applying it to the host (development mode)`);
+      return { ok: false, error: err.message, code: err.code };
+    }
+  }
+
+  async function mountpointFor(dir) {
+    try {
+      const disks = await op('sys.disk.usage', {});
+      const match = disks.filter((d) => dir === d.mountpoint || dir.startsWith(d.mountpoint.endsWith('/') ? d.mountpoint : `${d.mountpoint}/`)).sort((a, b) => b.mountpoint.length - a.mountpoint.length)[0];
+      return match?.mountpoint || '/';
+    } catch { return '/'; }
+  }
+
+  // ------------------------------------------------------------- templates ---
+
+  function renderTemplate(name, vars = {}) {
+    const row = stmts.template.get(name);
+    const body = row?.body ?? DEFAULT_TEMPLATES[name];
+    if (body == null) throw notFound(`Template "${name}"`);
+    return renderTemplateBody(body, { hostname: hostname(), contact_email: settings.get('basic.contact_email', '') || `root@${hostname()}`, ...vars });
+  }
+
+  const templates = {
+    list() {
+      const rows = Object.fromEntries(stmts.templates.all().map((t) => [t.name, t]));
+      return { dir: TEMPLATE_DIR, variables: TEMPLATE_VARS, templates: TEMPLATE_NAMES.map((name) => ({ name, path: `${TEMPLATE_DIR}/${name}.html`, updated_at: rows[name]?.updated_at ?? null, customised: rows[name] ? rows[name].body !== DEFAULT_TEMPLATES[name] : false, bytes: Buffer.byteLength(rows[name]?.body ?? DEFAULT_TEMPLATES[name]) })) };
+    },
+    get(name) {
+      if (!TEMPLATE_NAMES.includes(name)) throw notFound(`Template "${name}"`);
+      const row = stmts.template.get(name);
+      return { name, path: `${TEMPLATE_DIR}/${name}.html`, body: row?.body ?? DEFAULT_TEMPLATES[name], default: DEFAULT_TEMPLATES[name], updated_at: row?.updated_at ?? null, variables: TEMPLATE_VARS };
+    },
+    async save(name, body, req) {
+      if (!TEMPLATE_NAMES.includes(name)) throw notFound(`Template "${name}"`);
+      if (!/<html[\s>]/i.test(body)) throw unprocessable('The template must be a complete HTML document', { body: ['Missing <html> element'] });
+      const written = await tolerant('fs.write_file', { path: `${TEMPLATE_DIR}/${name}.html`, content: body, owner: 'root', mode: '0644', backup: true }, req);
+      stmts.saveTemplate.run(name, body);
+      audit(req, { action: 'account.template.save', target: name, args: { bytes: Buffer.byteLength(body), written: written.ok } });
+      return { ...templates.get(name), written: written.ok, writeError: written.error ?? null };
+    },
+    async reset(name, req) { return templates.save(name, DEFAULT_TEMPLATES[name], req); },
+    preview(name, vars = {}) {
+      if (!TEMPLATE_NAMES.includes(name)) throw notFound(`Template "${name}"`);
+      const body = vars.body ?? stmts.template.get(name)?.body ?? DEFAULT_TEMPLATES[name];
+      const sample = { domain: 'example.com', username: 'example', ip: settings.get('basic.main_ip', '') || '203.0.113.10', status: '404', status_text: 'Not Found', reason: 'Non-payment', hostname: hostname(), contact_email: settings.get('basic.contact_email', '') || `root@${hostname()}` };
+      const { body: _b, ...rest } = vars;
+      return { name, html: renderTemplateBody(body, { ...sample, ...Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== '' && v != null)) }) };
+    },
+  };
+
+  // ------------------------------------------------------- change site IP ---
+
+  async function changeIp(username, { ip }, user, req) {
+    const account = load(username, user);
+    const previous = account.ip;
+    if (previous === ip) throw conflict(`${username} already uses ${ip}`);
+    const ipSvc = ctx.ip;
+    if (ipSvc) {
+      const known = ipSvc.get(ip);
+      if (!known) throw unprocessable(`${ip} is not configured on this server; add it under IP Functions first`, { ip: ['Unknown address'] });
+      if (known.dedicated_to && known.dedicated_to !== account.id) throw conflict(`${ip} is dedicated to another account`);
+      if (known.reserved) throw conflict(`${ip} is reserved (${known.reserved_reason || 'no reason given'})`);
+    }
+    // The vhost and zone renderers read accounts.ip, so the row changes first and
+    // is put back when the host refuses.
+    const snapshotDedicated = ipSvc ? ipSvc.all().filter((r) => r.dedicated_to === account.id).map((r) => r.address) : [];
+    stmts.setIp.run(ip, account.id);
+    const result = { username, previousIp: previous, ip, web: null, dns: [], dedicated: null };
+    try {
+      if (ipSvc) {
+        const shared = ipSvc.sharedIp();
+        const free = ipSvc.freeAddresses(ip.includes(':') ? 6 : 4).some((r) => r.address === ip);
+        if (ip !== shared && (free || snapshotDedicated.includes(ip))) {
+          if (!snapshotDedicated.includes(ip)) { ipSvc.releaseDedicated(account.id, req); ipSvc.allocateDedicated(account.id, req, { address: ip }); }
+          result.dedicated = ip;
+        } else if (snapshotDedicated.length) { ipSvc.releaseDedicated(account.id, req); stmts.setIp.run(ip, account.id); }
+      }
+      if (ctx.web) {
+        const web = await ctx.web.ensureVhost(username, req);
+        result.web = { applied: web.applied, reason: web.reason ?? null, domains: (web.vhosts || []).map((v) => v.domain) };
+      } else result.web = { applied: false, reason: 'web_category_missing' };
+      if (ctx.dns && previous) {
+        for (const { domain } of stmts.zonesOf.all(account.id)) {
+          try {
+            const zone = await ctx.dns.getZone(domain, user);
+            const stale = zone.records.filter((r) => r.type === 'A' && r.value === previous);
+            for (const name of new Set(stale.map((r) => r.name))) {
+              const values = zone.records.filter((r) => r.type === 'A' && r.name === name).map((r) => ({ value: r.value === previous ? ip : r.value, ttl: r.ttl }));
+              const pub = await ctx.dns.upsertRecords(domain, name, 'A', values, req);
+              result.dns.push({ domain, name, applied: pub?.applied ?? false, reason: pub?.reason ?? null });
+            }
+            if (!stale.length) result.dns.push({ domain, name: null, applied: true, reason: 'no A record pointed at the old address' });
+          } catch (err) { result.dns.push({ domain, name: null, applied: false, reason: err.message }); }
+        }
+      }
+    } catch (err) {
+      stmts.setIp.run(previous, account.id);
+      throw err;
+    }
+    audit(req, { action: 'account.ip.change', target: username, args: { from: previous, to: ip, dedicated: result.dedicated, web: result.web?.applied, dns: result.dns.length } });
+    return { ...result, account: summary(stmts.byUsername.get(username)) };
+  }
+
+  // ------------------------------------------------------ email all users ---
+
+  function recipients({ scope = 'all', owner } = {}, user) {
+    let rows = visibleAccounts(user);
+    if (scope === 'active') rows = rows.filter((a) => !a.suspended);
+    if (scope === 'suspended') rows = rows.filter((a) => a.suspended);
+    if (owner && isRoot(user)) rows = rows.filter((a) => a.owner === owner);
+    const withEmail = rows.filter((a) => a.contact_email);
+    return { total: rows.length, withoutEmail: rows.length - withEmail.length, recipients: withEmail.map((a) => ({ username: a.username, domain: a.domain, email: a.contact_email, owner: a.owner, suspended: Boolean(a.suspended) })) };
+  }
+
+  function senderFor() {
+    if (ctx.contacts?.sendMail) return { kind: 'contacts', send: (msg, req) => ctx.contacts.sendMail(msg, req) };
+    if (ctx.mail?.sendNotification) return { kind: 'mail', send: (msg, req) => ctx.mail.sendNotification(msg, req) };
+    return { kind: 'agent', send: (msg, req) => op('mail.sendmail', { from: msg.from, to: [msg.to], subject: msg.subject, text: msg.text }, req) };
+  }
+
+  function emailAll({ subject, text, scope, owner, from }, user, req) {
+    const sender = senderFor();
+    if (sender.kind !== 'contacts') capabilities.require('exim', 'Exim is not installed, so the panel cannot send email. Install exim4 (Debian/Ubuntu) or exim (RHEL) to email account owners.');
+    const list = recipients({ scope, owner }, user);
+    if (!list.recipients.length) throw unprocessable('No account in the selection has a contact email address', { scope: ['Nothing to send'] });
+    const sendFrom = from || settings.get('account_functions.email_from', '') || settings.get('mail.notification_from', '') || `${user.username === 'root' ? 'root' : user.username}@${hostname()}`;
+    const job = jobs.enqueue('accounts.email_all', { subject, text, from: sendFrom, recipients: list.recipients, requestedBy: user.username }, { userId: user.id });
+    audit(req, { action: 'account.email_all', target: scope || 'all', args: { subject, recipients: list.recipients.length, from: sendFrom, job: job.id } });
+    return { job, recipients: list.recipients.length, from: sendFrom };
+  }
+
+  async function runEmailAll(jobCtx) {
+    const { subject, text, from, recipients: list = [], requestedBy } = jobCtx.params;
+    const sender = senderFor();
+    const sent = [];
+    const failed = [];
+    jobCtx.log(`Sending "${subject}" to ${list.length} account owner(s) as ${from} via ${sender.kind}`);
+    for (const [i, r] of list.entries()) {
+      const body = renderTemplateBody(text, { username: r.username, domain: r.domain, hostname: hostname(), email: r.email });
+      try {
+        await sender.send({ to: r.email, from, subject: renderTemplateBody(subject, { username: r.username, domain: r.domain, hostname: hostname() }), text: body }, null);
+        sent.push(r.username);
+        jobCtx.log(`${r.username} <${r.email}>: accepted`);
+      } catch (err) {
+        failed.push({ username: r.username, email: r.email, error: err.message });
+        jobCtx.log(`${r.username} <${r.email}>: ${err.message}`, 'warn');
+        if (err.code === 'capability_missing' || err.code === 'binary_not_found' || err.status === 501) { jobCtx.log('Mail server is not available; stopping', 'error'); break; }
+      }
+      jobCtx.progress(((i + 1) / list.length) * 100, `${sent.length} sent, ${failed.length} failed`);
+    }
+    ctx.auditRecord?.(null, { action: 'account.email_all.result', target: requestedBy, args: { subject, sent: sent.length, failed: failed.length } });
+    return { subject, from, sent, failed, total: list.length };
+  }
+
+  // ---------------------------------------------------------- bulk flags ---
+
+  function bulkFlag({ usernames, all, enabled }, user, req, { stmt, action, column }) {
+    const { accounts, missing } = selectAccounts({ usernames, all }, user);
+    const changed = [];
+    db.transaction(() => { for (const a of accounts) { if (Boolean(a[column]) !== enabled) { stmt.run(enabled ? 1 : 0, a.id); changed.push(a.username); } } })();
+    audit(req, { action, target: all ? 'all' : accounts.map((a) => a.username).join(','), args: { enabled, changed: changed.length } });
+    return { enabled, changed, unchanged: accounts.map((a) => a.username).filter((u) => !changed.includes(u)), missing };
+  }
+  const forcePasswordChange = (input, user, req) => bulkFlag(input, user, req, { stmt: stmts.setForce, action: 'account.force_password_change', column: 'force_password_change' });
+  const setDemoMode = (input, user, req) => bulkFlag(input, user, req, { stmt: stmts.setDemo, action: 'account.demo_mode', column: 'demo_mode' });
+
+  // ------------------------------------------------------------ bandwidth ---
+
+  function setBandwidthLimit(username, { limitMb }, user, req) {
+    const account = load(username, user);
+    if (limitMb == null && settings.get('tweak.prevent_unlimited_bandwidth', false)) throw unprocessable('Unlimited bandwidth is disabled in Tweak Settings', { limitMb: ['Enter a limit in MB'] });
+    stmts.setBandwidthLimit.run(limitMb, account.id);
+    audit(req, { action: 'account.bandwidth.limit', target: username, args: { from: account.bandwidth_limit_mb, to: limitMb } });
+    return summary(stmts.byUsername.get(username));
+  }
+
+  async function resetBandwidth({ usernames, all, unsuspend = true }, user, req) {
+    const { accounts, missing } = selectAccounts({ usernames, all }, user);
+    const reset = [];
+    const unsuspended = [];
+    for (const a of accounts) {
+      db.transaction(() => { stmts.resetBandwidth.run(a.id); stmts.deleteBandwidthPeriod.run(a.id, monthKey()); })();
+      reset.push(a.username);
+      if (unsuspend && a.suspended && BANDWIDTH_REASON.test(a.suspend_reason || '')) {
+        await ctx.accounts.unsuspend(a.username, user, req);
+        unsuspended.push(a.username);
+      }
+    }
+    audit(req, { action: 'account.bandwidth.reset', target: all ? 'all' : reset.join(','), args: { reset: reset.length, unsuspended } });
+    return { reset, unsuspended, missing, period: monthKey() };
+  }
+
+  function exceeders(user) {
+    return visibleAccounts(user).map(summary).filter((a) => a.over_bandwidth || (a.suspended && BANDWIDTH_REASON.test(a.suspend_reason || '')))
+      .map((a) => ({ ...a, suspended_for_bandwidth: a.suspended && BANDWIDTH_REASON.test(a.suspend_reason || '') }));
+  }
+
+  async function unsuspendExceeders({ usernames, all = true, resetCounters = false }, user, req) {
+    const candidates = exceeders(user).filter((a) => a.suspended_for_bandwidth);
+    const wanted = all || !usernames?.length ? candidates : candidates.filter((a) => usernames.includes(a.username));
+    const unsuspended = [];
+    const failed = [];
+    for (const a of wanted) {
+      try {
+        if (resetCounters) db.transaction(() => { const row = stmts.byUsername.get(a.username); stmts.resetBandwidth.run(row.id); stmts.deleteBandwidthPeriod.run(row.id, monthKey()); })();
+        await ctx.accounts.unsuspend(a.username, user, req);
+        unsuspended.push(a.username);
+      } catch (err) { failed.push({ username: a.username, error: err.message }); }
+    }
+    audit(req, { action: 'account.bandwidth.unsuspend_exceeders', target: wanted.map((a) => a.username).join(',') || 'none', args: { unsuspended: unsuspended.length, failed: failed.length, resetCounters } });
+    return { unsuspended, failed, skipped: candidates.length - wanted.length };
+  }
+
+  async function runBandwidthEnforce(jobCtx) {
+    if (!settings.get('account_functions.bandwidth_enforce', false)) { jobCtx.log('Bandwidth enforcement is disabled (account_functions.bandwidth_enforce)'); return { suspended: [], enabled: false }; }
+    const reason = settings.get('account_functions.bandwidth_suspend_reason', 'bandwidth: monthly transfer limit exceeded');
+    const root = { id: null, username: 'scheduler', role: 'root' };
+    const suspended = [];
+    for (const a of stmts.all.all()) {
+      if (a.suspended || !a.bandwidth_limit_mb || a.bandwidth_used_mb < a.bandwidth_limit_mb) continue;
+      try { await ctx.accounts.suspend(a.username, reason, root, null); suspended.push(a.username); jobCtx.log(`${a.username}: suspended (${a.bandwidth_used_mb} MB of ${a.bandwidth_limit_mb} MB)`); } catch (err) { jobCtx.log(`${a.username}: ${err.message}`, 'warn'); }
+    }
+    return { suspended, enabled: true };
+  }
+
+  async function runMonthlyBandwidthReset(jobCtx) {
+    const root = { id: null, username: 'scheduler', role: 'root' };
+    const result = await resetBandwidth({ all: true, unsuspend: true }, root, null);
+    jobCtx.log(`Reset bandwidth counters of ${result.reset.length} account(s); unsuspended ${result.unsuspended.length}`);
+    return result;
+  }
+
+  // ---------------------------------------------------------------- shell ---
+
+  async function setShell(username, { shell }, user, req) {
+    const account = load(username, user);
+    if (shell === '/usr/local/bin/jailshell') {
+      const bins = await op('sys.binaries', { names: ['jailshell'] });
+      if (!bins.jailshell) throw new CapabilityError('jailshell', 'The jailed shell (/usr/local/bin/jailshell) is not installed on this server. Install a jailshell/CageFS-style wrapper or choose a normal shell.');
+    }
+    if (account.uid != null) await op('user.set_shell', { username, shell }, req);
+    stmts.setShell.run(shell, account.id);
+    audit(req, { action: 'account.shell', target: username, args: { from: account.shell, to: shell, applied: account.uid != null } });
+    return { ...summary(stmts.byUsername.get(username)), applied: account.uid != null };
+  }
+
+  // ---------------------------------------------------------------- quota ---
+
+  async function setQuota(username, { diskQuotaMb }, user, req) {
+    const account = load(username, user);
+    const soft = diskQuotaMb ?? 0;
+    const filesystem = await mountpointFor(homeOf(account));
+    let applied = false;
+    if (account.uid != null) {
+      if (!capabilities.has('quota')) {
+        stmts.setQuota.run(diskQuotaMb, account.id);
+        audit(req, { action: 'account.quota', target: username, args: { from: account.disk_quota_mb, to: diskQuotaMb, applied: false } });
+        throw new CapabilityError('quota', `Disk quotas are not installed on this server; ${username}'s quota of ${diskQuotaMb == null ? 'unlimited' : `${diskQuotaMb} MB`} is saved and is applied once the quota tools exist (see Initial Quota Setup).`);
+      }
+      await op('user.set_quota', { username, softMb: soft, hardMb: soft ? Math.round(soft * 1.05) : 0, filesystem }, req);
+      applied = true;
+    }
+    stmts.setQuota.run(diskQuotaMb, account.id);
+    audit(req, { action: 'account.quota', target: username, args: { from: account.disk_quota_mb, to: diskQuotaMb, filesystem, applied } });
+    return { ...summary(stmts.byUsername.get(username)), applied, filesystem };
+  }
+
+  async function quotaReport(user) {
+    const accounts = visibleAccounts(user);
+    if (!capabilities.has('quota')) throw new CapabilityError('quota', 'Disk quotas are not installed on this server (setquota/repquota missing). Run Initial Quota Setup after installing the quota package.');
+    const byFs = new Map();
+    for (const a of accounts) {
+      const fs = await mountpointFor(homeOf(a));
+      if (!byFs.has(fs)) byFs.set(fs, await op('user.quota_report', { filesystem: fs }).catch((err) => ({ available: false, users: [], error: err.message })));
+    }
+    return accounts.map((a) => {
+      const fs = [...byFs.keys()].find((k) => homeOf(a).startsWith(k)) || '/';
+      const report = byFs.get(fs) || { users: [] };
+      const live = report.users.find((u) => u.username === a.username) || null;
+      return { ...summary(a), filesystem: fs, live: live ? { usedMb: live.usedMb, softMb: live.softMb, hardMb: live.hardMb } : null, reportAvailable: report.available !== false };
+    });
+  }
+
+  // ------------------------------------------------------------- raw logs ---
+
+  async function listDir(dir) {
+    try { return (await op('fs.list', { path: dir, limit: 5000 })).entries.filter((e) => e.type === 'file' && LOG_FILE.test(e.name)).map((e) => ({ dir, name: e.name, path: `${dir}/${e.name}`, size: e.size, mtime: e.mtime })); } catch (err) {
+      if (['op_failed', 'not_found', 'path_not_allowed'].includes(err.code)) return [];
+      throw err;
+    }
+  }
+
+  const logs = {
+    async list(username, kind, user) {
+      const account = load(username, user);
+      const domains = [account.domain, ...stmts.domains.all(account.id).map((d) => d.domain)];
+      const home = homeOf(account);
+      let files;
+      if (kind === 'nginx') {
+        if (!capabilities.has('nginx')) throw new CapabilityError('nginx', 'NGINX is not installed on this server, so there are no NGINX logs to download.');
+        files = [...(await listDir(NGINX_LOG_DIR)).filter((f) => domains.some((d) => f.name.includes(d))), ...(await listDir(`${home}/logs`)).filter((f) => /nginx/i.test(f.name))];
+      } else {
+        files = [...(await listDir(`${DOMLOGS_ROOT}/${username}`)), ...(await listDir(`${home}/logs`)).filter((f) => !/nginx/i.test(f.name))];
+      }
+      return { username, kind, domains, dirs: kind === 'nginx' ? [NGINX_LOG_DIR, `${home}/logs`] : [`${DOMLOGS_ROOT}/${username}`, `${home}/logs`], files: files.sort((a, b) => a.name.localeCompare(b.name)), apache: capabilities.has('apache'), nginx: capabilities.has('nginx') };
+    },
+    // Streams the file through the agent in 1 MB ranges so a multi-gigabyte log
+    // never has to fit in memory on either side of the socket.
+    async download(username, kind, file, user, req, res) {
+      const listing = await logs.list(username, kind, user);
+      const entry = listing.files.find((f) => f.name === file);
+      if (!entry) throw notFound(`Log file "${file}"`);
+      const chunk = 1024 * 1024;
+      const first = await op('acct.read_range', { path: entry.path, offset: 0, length: chunk }, req);
+      res.status(200);
+      res.set({ 'Content-Type': file.endsWith('.gz') ? 'application/gzip' : 'text/plain; charset=utf-8', 'Content-Disposition': `attachment; filename="${username}-${file.replace(/[^A-Za-z0-9._-]/g, '_')}"`, 'Content-Length': String(first.size), 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no' });
+      audit(req, { action: 'account.log.download', target: username, args: { kind, file, bytes: first.size } });
+      let sent = 0;
+      let part = first;
+      for (;;) {
+        if (part.length) { sent += part.length; if (!res.write(Buffer.from(part.data, 'base64'))) await new Promise((r) => res.once('drain', r)); }
+        if (part.eof || sent >= first.size || res.destroyed) break;
+        part = await op('acct.read_range', { path: entry.path, offset: sent, length: Math.min(chunk, first.size - sent) }, req);
+      }
+      res.end();
+      return { bytes: sent };
+    },
+  };
+
+  // ------------------------------------------------------------ rearrange ---
+
+  const rearrange = {
+    async partitions() {
+      const disks = await op('sys.disk.usage', {}).catch(() => []);
+      const roots = [];
+      for (const root of HOME_ROOTS) {
+        const disk = disks.filter((d) => root === d.mountpoint || root.startsWith(d.mountpoint.endsWith('/') ? d.mountpoint : `${d.mountpoint}/`)).sort((a, b) => b.mountpoint.length - a.mountpoint.length)[0] || null;
+        const stat = await op('fs.stat', { path: root }).catch(() => ({ exists: false }));
+        roots.push({ root, exists: Boolean(stat.exists && stat.isDirectory), mountpoint: disk?.mountpoint ?? null, filesystem: disk?.filesystem ?? null, availableBytes: disk?.availableBytes ?? null, usedPercent: disk?.usedPercent ?? null, accounts: stmts.all.all().filter((a) => homeOf(a).startsWith(`${root}/`)).length });
+      }
+      return { roots, disks };
+    },
+    async start(username, { target }, user, req) {
+      const account = load(username, user);
+      if (!HOME_ROOTS.includes(target)) throw unprocessable(`"${target}" is not a home partition the panel manages`, { target: [`One of ${HOME_ROOTS.join(', ')}`] });
+      const from = homeOf(account);
+      const to = `${target}/${username}`;
+      if (from === to) throw conflict(`${username} already lives on ${target}`);
+      if ([...jobs.list({ status: 'running', type: 'accounts.rearrange' }), ...jobs.list({ status: 'queued', type: 'accounts.rearrange' })].some((j) => j.params.username === username)) throw conflict(`A move of ${username} is already queued`);
+      capabilities.require('rsync', 'rsync is not installed on this server; it is needed to copy the account between partitions');
+      const stat = await op('fs.stat', { path: target }, req);
+      if (!stat.exists || !stat.isDirectory) throw unprocessable(`${target} does not exist on this server`, { target: ['Mount the partition and create the directory first'] });
+      const size = await op('fs.du', { path: from }, req).catch(() => ({ bytes: null }));
+      const job = jobs.enqueue('accounts.rearrange', { username, from, to, target, bytes: size.bytes, requestedBy: user.username }, { userId: user.id });
+      audit(req, { action: 'account.rearrange', target: username, args: { from, to, bytes: size.bytes, job: job.id } });
+      return { job, username, from, to, bytes: size.bytes };
+    },
+    async run(jobCtx) {
+      const { username, from, to } = jobCtx.params;
+      const account = stmts.byUsername.get(username);
+      if (!account) throw new Error(`Account ${username} no longer exists`);
+      if (homeOf(account) !== from) throw new Error(`${username}'s home is ${homeOf(account)}, not ${from}; refusing to move`);
+      const existing = await op('fs.stat', { path: to });
+      if (existing.exists) {
+        const entries = existing.isDirectory ? (await op('fs.list', { path: to, limit: 2 })).entries : null;
+        if (!entries || entries.length) throw new Error(`${to} already exists and is not empty`);
+      }
+      jobCtx.log(`Copying ${from} to ${to} with rsync -a (ownership and permissions preserved)`);
+      jobCtx.progress(5, 'copying files');
+      await op('fs.copy_tree', { from, to });
+      jobCtx.progress(60, 'copy complete; syncing changes made during the copy');
+      await op('fs.copy_tree', { from, to, deleteExtraneous: true });
+      jobCtx.progress(75, 'updating the system user');
+      if (account.uid != null) { await op('acct.set_home', { username, homeDir: to }); jobCtx.log(`usermod -d ${to} ${username}`); } else jobCtx.log('No Linux user for this account; only the panel records are updated', 'warn');
+      db.transaction(() => {
+        stmts.setHome.run(to, account.id);
+        for (const d of stmts.docrootsOf.all(account.id)) if (d.docroot && d.docroot.startsWith(`${from}/`)) stmts.setDocroot.run(`${to}${d.docroot.slice(from.length)}`, d.id);
+      })();
+      jobCtx.log('Panel records updated (home directory, document roots)');
+      if (ctx.web) {
+        jobCtx.progress(85, 'rewriting web server configuration');
+        const web = await ctx.web.ensureVhost(username, null).catch((err) => ({ applied: false, reason: err.message }));
+        jobCtx.log(web.applied ? 'Virtual hosts rewritten and the web server reloaded' : `Virtual hosts recorded (${web.reason || 'not applied'})`, web.applied ? 'info' : 'warn');
+      }
+      jobCtx.progress(92, 'removing the old home directory');
+      await op('fs.remove', { path: from, recursive: true });
+      jobCtx.log(`Removed ${from}`);
+      ctx.auditRecord?.(null, { action: 'account.rearrange.done', target: username, args: { from, to } });
+      return { username, from, to, systemUser: account.uid != null };
+    },
+  };
+
+  // -------------------------------------------------------- log retention ---
+
+  const shapeRetention = (a, row) => ({ username: a.username, domain: a.domain, owner: a.owner, archive_logs: row ? Boolean(row.archive_logs) : Boolean(settings.get('account_functions.log_archive_default', false)), remove_old_archives: row ? Boolean(row.remove_old_archives) : true, retain_months: row?.retain_months ?? 3, last_archived_at: row?.last_archived_at ?? null, configured: Boolean(row), archive_dir: `${homeOf(a)}/logs/archive`, log_dir: `${DOMLOGS_ROOT}/${a.username}` });
+
+  const logRetention = {
+    list(user) {
+      const rows = Object.fromEntries(stmts.retentionAll.all().map((r) => [r.account_id, r]));
+      return { accounts: visibleAccounts(user).map((a) => shapeRetention(a, rows[a.id])), defaults: { archive_logs: Boolean(settings.get('account_functions.log_archive_default', false)) }, logrotate: capabilities.has('rsync') };
+    },
+    get(username, user) { const a = load(username, user); return shapeRetention(a, stmts.retention.get(a.id)); },
+    set(username, input, user, req) {
+      const a = load(username, user);
+      const current = shapeRetention(a, stmts.retention.get(a.id));
+      const next = { account_id: a.id, archive_logs: (input.archiveLogs ?? current.archive_logs) ? 1 : 0, remove_old_archives: (input.removeOldArchives ?? current.remove_old_archives) ? 1 : 0, retain_months: input.retainMonths ?? current.retain_months };
+      stmts.upsertRetention.run(next);
+      audit(req, { action: 'account.log_retention', target: username, args: input });
+      return shapeRetention(a, stmts.retention.get(a.id));
+    },
+    archiveNow({ username } = {}, user, req) {
+      if (username) load(username, user);
+      capabilities.require('rsync', 'rsync is not installed on this server; it is needed to archive web logs into the account home');
+      const job = jobs.enqueue('accounts.log_archive', username ? { username } : {}, { userId: user.id });
+      audit(req, { action: 'account.log_archive', target: username || 'all', args: { job: job.id } });
+      return { job };
+    },
+    async run(jobCtx) {
+      const only = jobCtx.params.username || null;
+      const rows = Object.fromEntries(stmts.retentionAll.all().map((r) => [r.account_id, r]));
+      const label = previousMonthKey();
+      const archived = [];
+      const pruned = [];
+      const skipped = [];
+      const accounts = stmts.all.all().filter((a) => !only || a.username === only);
+      for (const [i, a] of accounts.entries()) {
+        const conf = shapeRetention(a, rows[a.id]);
+        jobCtx.progress((i / Math.max(1, accounts.length)) * 100, a.username);
+        if (!conf.archive_logs && !only) { skipped.push(a.username); continue; }
+        const src = `${DOMLOGS_ROOT}/${a.username}`;
+        const dest = `${conf.archive_dir}/${label}`;
+        try {
+          const stat = await op('fs.stat', { path: src });
+          if (!stat.exists) { jobCtx.log(`${a.username}: no web logs under ${src}`, 'warn'); skipped.push(a.username); continue; }
+          await op('fs.mkdir', { path: dest, owner: a.uid != null ? a.username : undefined, mode: '0750' });
+          await op('fs.copy_tree', { from: src, to: dest });
+          if (a.uid != null) await op('fs.chown', { path: conf.archive_dir, owner: a.username, recursive: true });
+          stmts.archived.run(a.id);
+          archived.push(a.username);
+          jobCtx.log(`${a.username}: archived ${src} to ${dest}`);
+          if (conf.remove_old_archives) {
+            const cutoff = new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth() - conf.retain_months, 1)).toISOString().slice(0, 7);
+            const entries = (await op('fs.list', { path: conf.archive_dir })).entries.filter((e) => e.type === 'dir' && /^\d{4}-\d{2}$/.test(e.name) && e.name < cutoff);
+            for (const e of entries) { await op('fs.remove', { path: `${conf.archive_dir}/${e.name}`, recursive: true }); pruned.push(`${a.username}/${e.name}`); jobCtx.log(`${a.username}: removed archive ${e.name} (older than ${conf.retain_months} month(s))`); }
+          }
+        } catch (err) { jobCtx.log(`${a.username}: ${err.message}`, 'error'); skipped.push(a.username); }
+      }
+      return { label, archived, pruned, skipped };
+    },
+  };
+
+  return {
+    summary: (user) => visibleAccounts(user).map(summary),
+    renderTemplate, templates, changeIp, recipients, emailAll, runEmailAll,
+    forcePasswordChange, setDemoMode,
+    setBandwidthLimit, resetBandwidth, exceeders, unsuspendExceeders, runBandwidthEnforce, runMonthlyBandwidthReset,
+    setShell, setQuota, quotaReport, logs, rearrange, logRetention,
+    HOME_ROOTS, TEMPLATE_NAMES, SHELLS,
+  };
+}

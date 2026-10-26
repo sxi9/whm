@@ -29,6 +29,7 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/usr/local/whm/hooks',
   '/etc/default/locale', '/etc/locale.conf',
   '/var/cache/nginx',
+  '/home2', '/home3', '/home4', '/mnt/home', '/srv/home',
 ];
 
 export function createContext({ allowedRoots = DEFAULT_ALLOWED_ROOTS, principal = null, log = () => {} } = {}) {

@@ -1,10 +1,16 @@
 import { json, paginate } from '../db/index.js';
-import { notFound, conflict, forbidden, badRequest } from '../lib/errors.js';
+import { notFound, conflict, forbidden, badRequest, HttpError } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
 
 const RESERVED = new Set(['root', 'admin', 'administrator', 'nobody', 'www', 'mail', 'ftp', 'mysql', 'whm', 'cpanel', 'whmpanel']);
 
-export function createAccountsService({ db, agent, capabilities, packages, settings, config, logger }) {
+// A provisioning step that fails because the daemon is absent, or with a
+// client-fault status the owning category chose (409 routing_not_applied…),
+// is recorded on the account; anything else aborts and rolls the account back.
+const softFailure = (err) => err?.code === 'capability_missing' || err?.code === 'binary_not_found' || (err instanceof HttpError && err.status < 500 && err.status !== 404);
+
+export function createAccountsService(ctx) {
+  const { db, agent, capabilities, packages, settings, config, logger } = ctx;
   const stmts = {
     byUsername: db.prepare('SELECT a.*, u.username AS owner FROM accounts a JOIN users u ON u.id = a.owner_id WHERE a.username = ?'),
     byDomain: db.prepare('SELECT 1 FROM account_domains WHERE domain = ?'),
@@ -46,6 +52,68 @@ export function createAccountsService({ db, agent, capabilities, packages, setti
   // Real system provisioning is mandatory in production; in development on a host
   // without the tooling the account is still recorded so the UI can be exercised.
   function strict() { return config.env === 'production'; }
+
+  function indexHtml(domain, username) {
+    try { if (ctx.accountFunctions) return ctx.accountFunctions.renderTemplate('index', { domain, username }); } catch (err) { logger.warn({ err }, 'index template unavailable; using the built-in page'); }
+    return defaultIndexHtml(domain);
+  }
+
+  // Web, DNS, mail and database provisioning run through the owning categories
+  // when they are loaded. Each step records applied | pending (daemon missing,
+  // applied on the next sync) | failed | skipped (category not present).
+  async function provision(account, { ip, user, req, undo }) {
+    const { username, domain, id } = account;
+    const steps = {};
+    const run = async (name, fn, rollback) => {
+      try {
+        const out = await fn();
+        steps[name] = out;
+        if (rollback && out.status !== 'skipped') undo.push(rollback);
+      } catch (err) {
+        if (!softFailure(err)) throw err;
+        steps[name] = { status: err.code === 'capability_missing' || err.code === 'binary_not_found' ? 'pending' : 'failed', detail: err.message };
+      }
+    };
+    await run('web', async () => {
+      if (!ctx.web) return { status: 'skipped', detail: 'Service Configuration is not loaded' };
+      const r = await ctx.web.ensureVhost(username, req);
+      return { status: r.applied ? 'applied' : r.reason === 'capability_missing' ? 'pending' : 'failed', detail: r.applied ? `${r.vhosts?.length ?? 1} vhost(s) written${r.reload?.reloaded ? ', web server reloaded' : ''}` : r.reason === 'capability_missing' ? 'Apache is not installed; the vhost is written when it is' : (r.vhosts?.find((v) => !v.applied)?.error || r.reason), phpVersion: r.phpVersion ?? null };
+    }, () => ctx.web.removeAccount(username, null));
+    await run('dns', async () => {
+      if (!ctx.dns) return { status: 'skipped', detail: 'DNS Functions is not loaded' };
+      const r = await ctx.dns.ensureZoneForDomain(domain, { ip: ip || undefined, accountId: id }, req);
+      return { status: r.applied ? 'applied' : r.reason === 'capability_missing' || r.applied === false ? 'pending' : 'applied', detail: r.applied ? `zone ${domain} loaded into BIND (serial ${r.serial})` : r.created === false && !r.reason ? 'zone already existed and is now owned by this account' : 'BIND is not installed; the zone is published when it is', serial: r.serial ?? null, created: r.created ?? null };
+    }, () => ctx.dns.removeZonesForAccount(id, null));
+    await run('mail', async () => {
+      if (!ctx.mail?.setRouting) return { status: 'skipped', detail: 'Email is not loaded' };
+      const r = await ctx.mail.setRouting(domain, 'local', req);
+      return { status: r.applied ? 'applied' : 'pending', detail: r.applied ? `${domain} added to Exim's local domains` : r.reason || 'Exim is not installed; the domain is routed when it is', routing: r.routing };
+    });
+    await run('database', async () => {
+      if (!ctx.databases) return { status: 'skipped', detail: 'Database Services is not loaded' };
+      const profile = ctx.databases.activeProfile?.() ?? null;
+      const plan = json.parse(account.plan_snapshot_json, {});
+      if (!profile) return { status: 'pending', detail: 'No active database profile; databases can be created once one is configured' };
+      if (!capabilities.has('mysql') && !capabilities.has('postgres')) return { status: 'pending', detail: `${profile.engine || 'MySQL'} client tools are not installed; the account may create databases once they are` };
+      return { status: 'applied', detail: `ready on profile ${profile.profile_name || profile.name || 'default'} (${plan.max_db == null ? 'unlimited' : plan.max_db} database(s) allowed)`, prefix: `${username}_` };
+    });
+    return { steps };
+  }
+
+  // Everything the categories created for an account goes before the Linux
+  // user and the rows; a subsystem that cannot be cleaned is reported, logged
+  // and never blocks the termination.
+  async function cleanupAccount(account, { keepDns }, req) {
+    const { username, domain, id } = account;
+    const cleanup = {};
+    const attempt = async (name, fn) => { try { const r = await fn(); if (r) cleanup[name] = r; } catch (err) { logger.warn({ err, username, step: name }, 'termination cleanup step failed'); cleanup[name] = { error: err.message }; } };
+    await attempt('ssl', async () => (ctx.ssl?.removeAccountCerts ? ctx.ssl.removeAccountCerts(id, req) : null));
+    await attempt('web', async () => (ctx.web?.removeAccount ? ctx.web.removeAccount(username, req) : null));
+    await attempt('databases', async () => (ctx.databases?.removeAccountData ? ctx.databases.removeAccountData(username, req) : null));
+    await attempt('mail', async () => (ctx.mail?.removeDkimKey && capabilities.has('exim') ? ctx.mail.removeDkimKey(domain, req) : null));
+    if (!keepDns) await attempt('dns', async () => (ctx.dns?.removeZonesForAccount ? ctx.dns.removeZonesForAccount(id, req) : null));
+    return cleanup;
+  }
 
   async function tryOp(name, args, req, steps, undo) {
     try {
@@ -110,7 +178,7 @@ export function createAccountsService({ db, agent, capabilities, packages, setti
           for (const sub of ['public_html', 'mail', 'etc', 'tmp', 'logs', 'ssl']) {
             await agent.op('fs.mkdir', { path: `${homeDir}/${sub}`, owner: username, mode: sub === 'public_html' ? '0750' : '0700' }, { req });
           }
-          await agent.op('fs.write_file', { path: `${homeDir}/public_html/index.html`, content: defaultIndexHtml(input.domain), owner: username, mode: '0644', backup: false }, { req });
+          await agent.op('fs.write_file', { path: `${homeDir}/public_html/index.html`, content: indexHtml(input.domain, username), owner: username, mode: '0644', backup: false }, { req });
           if (input.password) await agent.op('user.set_password', { username, password: input.password }, { req });
           if (plan.disk_mb && capabilities.has('quota')) {
             await tryOp('user.set_quota', { username, softMb: plan.disk_mb, hardMb: Math.round(plan.disk_mb * 1.05), filesystem: '/' }, req, undo);
@@ -128,8 +196,10 @@ export function createAccountsService({ db, agent, capabilities, packages, setti
           return stmts.byUsername.get(username);
         })();
 
-        req?.audit?.({ action: 'account.create', target: username, args: { domain: input.domain, package: pkgName, owner: ownerId, ip } });
-        return { ...shape(account), domains: stmts.domains.all(account.id), provisioning: { systemUser: Boolean(sysUser), web: 'pending', dns: 'pending', mail: 'pending' } };
+        undo.push(() => Promise.resolve(stmts.remove.run(account.id)));
+        const provisioning = await provision(account, { ip, user, req, undo });
+        req?.audit?.({ action: 'account.create', target: username, args: { domain: input.domain, package: pkgName, owner: ownerId, ip, provisioning: Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])) } });
+        return { ...shape(stmts.byUsername.get(username)), domains: stmts.domains.all(account.id), provisioning: { systemUser: Boolean(sysUser), ...Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])), steps: provisioning.steps } };
       } catch (err) {
         for (const step of undo.reverse()) await step().catch((e) => logger.error({ err: e }, 'rollback step failed'));
         throw err;
@@ -156,12 +226,13 @@ export function createAccountsService({ db, agent, capabilities, packages, setti
 
     async terminate(username, { keepDns = false } = {}, user, req) {
       const account = load(username, user);
+      const cleanup = await cleanupAccount(account, { keepDns }, req);
       if (account.uid != null) await tryOp('user.delete', { username, removeHome: true }, req, []);
       db.transaction(() => {
         stmts.remove.run(account.id);
         if (!keepDns) db.prepare('DELETE FROM dns_zones WHERE account_id = ?').run(account.id);
       })();
-      req?.audit?.({ action: 'account.terminate', target: username, args: { domain: account.domain, keepDns } });
+      req?.audit?.({ action: 'account.terminate', target: username, args: { domain: account.domain, keepDns, cleanup } });
       return { username, domain: account.domain, terminated: true };
     },
 
