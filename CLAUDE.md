@@ -101,7 +101,19 @@ Never edit `CHECKLIST.md`, `nav.js`, `registry.js`, `routes/index.js`, `ops/inde
   `ctx.web` (service-configuration: vhosts, PHP-FPM, Apache/Exim/Dovecot/FTP config),
   `ctx.development`, `ctx.locales`, `ctx.accounts`, `ctx.packages`, `ctx.system`,
   `ctx.serviceManager`, `ctx.auth`, `ctx.settings`, `ctx.jobs`, `ctx.scheduler`,
-  `ctx.capabilities`, `ctx.contacts` (wave 2). Reference lazily inside methods; tolerate absence.
+  `ctx.capabilities`; wave 2: `ctx.accountFunctions`, `ctx.accountInfo`, `ctx.multiAccount`,
+  `ctx.resellers`, `ctx.backup`, `ctx.transfers`, `ctx.serverStatus`, `ctx.systemHealth`,
+  `ctx.serverConfig`, `ctx.networking`, `ctx.contacts`, `ctx.systemReboot`. Reference lazily inside
+  methods; tolerate absence. Hooks core relies on: `resellers.assertAcl/createPolicy/modifyPolicy/
+  nameserversFor`, `accountFunctions.mountpointFor/renderTemplate/runBandwidthEnforce/resetBandwidth`,
+  `serverConfig.profile.summary()`, `contacts.notify(event, payload)` / `contacts.sendMail(...)`.
+- **Wave-2 seams (binding, `docs/design/integration-contracts.md` §11–21):** account-information owns
+  bandwidth collection + `account_bandwidth`, account-functions owns enforcement/reset; software's
+  `os-update-check` is the only update schedule; IP changes use `ctx.web.replaceIp` (ensureVhost's
+  `php_missing`/`php_pool_failed` is a warning, not a vhost failure); long ops pass `timeoutMs`;
+  untrusted archives/rsync never recreate device nodes as root; restores replay only grants for
+  databases the account owns; migration `012` is shared by account-functions and development (documented
+  exception — never reuse a number).
 - **Remote service IP hooks:** `ctx.mail.setOutboundAddresses`, `ctx.dns.setOutboundAddresses`,
   `ctx.databases.setClientAddresses` ({ ipv4, ipv6 }); ip-functions is the caller.
 - **Dovecot:** service-configuration owns `97-whm-mailserver.conf` (protocols, limits, `ssl=`,
@@ -171,6 +183,15 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   agent 260 / client 5. **Wave 2 launched 03:20** (12 categories; same build workflow, args
   `{wave: 2}`). Core follow-ups done by hand: split-mode socket timeout now 1 h with a per-call
   override, `/var/cache/nginx` allowed root.
+- **2026-10-26 19:00: Phase 2 wave 2 landed** — 12 categories, 67 functions, 49 new agent ops (316
+  total), migrations 012–023, 12 services on ctx (names in the contract list above); suites server
+  807 / agent 381 / client 7, build + boot + e2e green. Ten reviewer findings stayed open after the
+  in-wave fix rounds (Rearrange lock, domlog cap, replaceIp for multi-account IP changes, backup
+  timeouts/domains/grants, transfers device nodes/removeSource/reseller DB move) and are tracked
+  `[~]` in CHECKLIST.md; the **wave-2 fix round** (`whm-fix-wave`, `args {wave: 2}`, issue files in the
+  session scratchpad `issues/`) closes them plus the critic's integration gaps. Core follow-ups done
+  by hand: dead `sys.resolvers.set` op removed (networking-setup owns `resolver.*`), contracts doc
+  §11–21, two load-sensitive tests made robust. Next: plugin host (core), then wave 3.
 - **Login/session policy is enforced in core** (`services/auth.js`, `middleware/auth.js`,
   `routes/auth.js`): session timeout, single session, password max age (users.password_changed_at
   via migration 001b), required 2FA for root/resellers (session flag `mustEnroll2fa` gates

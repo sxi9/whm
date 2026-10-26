@@ -195,18 +195,6 @@ defineOp('sys.resolvers.get', {
   },
 });
 
-defineOp('sys.resolvers.set', {
-  description: 'Write /etc/resolv.conf nameservers',
-  schema: z.object({ nameservers: z.array(arg.ip).min(1).max(4), search: z.array(arg.hostname).max(6).default([]) }).strict(),
-  run: async ({ nameservers, search }) => {
-    const lines = ['# Managed by WHM panel (Resolver Configuration)'];
-    if (search.length) lines.push(`search ${search.join(' ')}`);
-    for (const ns of nameservers) lines.push(`nameserver ${ns}`);
-    fs.writeFileSync('/etc/resolv.conf', lines.join('\n') + '\n');
-    return { nameservers, search };
-  },
-});
-
 defineOp('sys.binaries', {
   description: 'Which of the given programs are installed (capability detection)',
   schema: z.object({ names: z.array(z.string().regex(/^[A-Za-z0-9._-]{1,64}$/)).min(1).max(100) }).strict(),

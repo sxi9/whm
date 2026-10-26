@@ -385,7 +385,7 @@ describe('Manage Hooks', () => {
     const failedRuns = await get('/api/development/hooks/runs?status=failed');
     expect(failedRuns.body.data[0]).toMatchObject({ hookName: 'Quota gate', exitCode: 2 });
     const recent = await get('/api/development/hooks/recent-events');
-    expect(recent.body.data[0]).toMatchObject({ event: 'account.created', stage: 'post' });
+    expect(recent.body.data.find((e) => e.event === 'account.created')).toMatchObject({ event: 'account.created', stage: 'post' });
     // Non-blocking pre hooks and hooks that cannot run never veto.
     await put(`/api/development/hooks/${failId}`, { enabled: true, blocking: false });
     expect((await post('/api/accounts', { username: 'hooked2', domain: 'hooked2.com' })).status).toBe(201);

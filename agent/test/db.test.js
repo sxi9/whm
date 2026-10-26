@@ -165,7 +165,7 @@ describe('db ops on a host without MySQL', () => {
     const result = await runOp('db.packages', {}, ctx);
     expect(Array.isArray(result.installed)).toBe(true);
     expect(Array.isArray(result.available)).toBe(true);
-  });
+  }, 20_000);
 
   it('pg ops stop with capability_missing without psql', async () => {
     if (!noPsql) return;

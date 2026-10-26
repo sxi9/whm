@@ -8,13 +8,13 @@
 
 ## Current state
 
-- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-26 18:12 UTC
+- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-26 19:10 UTC
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
 - **Tests:** server 93/93, agent 42/42 passing (`npm test`). Shared API test helper: `server/test/support/app.js`.
 - **Wave 1 landed** (`79097b1`, 2026-10-26 01:50): Security Center, DNS Functions, Database Services, IP Functions, SSL/TLS, Email, Software, Service Configuration, Development, Locales — 106/109 functions done (3 partial, noted inline), 222 new agent ops (267 total), migrations 002–012, 107 new pages; suites server 426 / agent 233 / client 5 green.
 - **Wave-1 fix round done** (03:12): all 19 reviewer findings and the 6 integration seams closed per `docs/design/integration-contracts.md`; suites server 479 / agent 260 / client 5 green; final integration check passed.
-- **In progress:** Phase 2 wave 2 — 12 categories (Account Functions completion, Account Information, Multi Account, Resellers, Backup, Transfers, Server Status, System Health, Server Configuration, Networking Setup, Server Contacts, System Reboot), launched 03:20. All 12 builders finished (67 pages, snapshot `2160fd4`); first-round reviews of 6 categories reported findings; the run died with a container restart at 05:38 and was resumed at 14:27 from its cached results (fix + re-verify rounds now running).
+- **Wave 2 landed** (19:00 UTC, 100 agent runs, 0 errors): Account Functions (incl. real vhost/DNS/mail provisioning on Create Account), Account Information, Multi Account, Resellers, Backup, Transfers, Server Status, System Health, Server Configuration, Networking Setup, Server Contacts, System Reboot — 67 functions built, 49 new agent ops (316 total), migrations 012–023; suites server 807 / agent 381 / client 7 green, build + boot + e2e pass. 10 reviewer findings stayed open after two in-wave fix rounds (marked `[~]` inline) and go to the **wave-2 fix round** with the critic's 6 integration gaps (`docs/design/integration-contracts.md` §11–21).
 - **Screenshots regenerated 18:12 UTC** at `83e0595`: all 212 function pages captured with label bars, **196/212 live** (the 67 in-flight wave-2 pages included; 16 wave-3 placeholders remain) — galleries in `docs/screenshots/`.
 - **Deferred to the end (user decision):** license server, plugin marketplace, plugin host, sample + automated-backup plugins (Phase 5).
 
@@ -37,13 +37,15 @@ a fix round ~15 min; most categories need one fix round.
 | **P2 wave 1** — Security Center, DNS, Databases, IP, SSL/TLS, Email, Software, Service Configuration, Development, Locales (10 categories, op families) | done — 106/109 functions, 88 agent runs | 6 h 54 min | 01:41 |
 | Integrate wave 1 (suites 426/233/5 green, build, e2e, screenshots, checklist, push `79097b1`) | done | 20 min | 01:50 |
 | Wave-1 fix round (reviewers' 19 open findings + 6 integration seams; 1 fixer + 1 verifier per category, 8 categories) | done — 0 open, final integration check pass; suites 479 / 260 / 5 | 1 h 27 min | 03:12 |
-| **P2 wave 2** — Account Functions completion (vhost/DNS/mail provisioning), Account Information, Multi Account, Resellers, Backup, Transfers, Server Status, System Health, Server Configuration, Networking, Contacts, Reboot (12) | running — 12/12 built, review + fix rounds in progress (started 03:20; the container was recycled 05:38–14:26 and the run resumed from its cached results at 14:27) | ~7–8 h of agent time (+ 9 h stall) | ~22:00 |
-| Integrate wave 2 (+ its fix round) | pending | ~2.5 h | ~00:30 (27th) |
-| **P2 wave 3** — Clusters, Themes, Market, cPanel, Support, Plugins (6) | pending | ~3 h | ~03:30 (27th) |
-| Integrate wave 3 → **all 212 functions live** | pending | ~1.5 h | ~05:00 (27th) |
-| **P5 deferred** — license server (`hub/license`), plugin host + marketplace (`hub/marketplace`, open dev registration with backend verification), `plugins/SDK.md`, sample plugin, automated-backup plugin | pending | ~5 h | ~10:00 (27th) |
-| **P6** — hardening pass, full e2e on a provisioned VM, Security Advisor rules (incl. the Oct-2026 PHP advisory check), final docs, performance | pending | ~2.5 h | ~12:30 (27th) |
-| **Total remaining** | | **~22 h wall-clock** (from 14:30 on the 26th) | |
+| **P2 wave 2** — Account Functions completion (vhost/DNS/mail provisioning), Account Information, Multi Account, Resellers, Backup, Transfers, Server Status, System Health, Server Configuration, Networking, Contacts, Reboot (12) | done — 67 functions, 100 agent runs, 10 findings carried to the fix round (container recycled 05:38–14:26; resumed from cache) | 6 h 50 min of run time (+ 9 h stall) | 19:00 |
+| Integrate wave 2 (suites/build/boot/e2e, contracts §11–21, checklist, screenshots) | done | 25 min | 19:25 |
+| Wave-2 fix round (10 open findings + 6 critic gaps; 1 fixer + 1 verifier per category, 12 categories) | running | ~2 h | ~21:30 |
+| Plugin host (core prerequisite for cPanel › Manage Plugins and the Plugins category) | pending | ~45 min | ~22:15 |
+| **P2 wave 3** — Clusters, Themes, Market, cPanel, Support, Plugins (6) | pending | ~3 h | ~01:15 (27th) |
+| Integrate wave 3 → **all 212 functions live** | pending | ~1.5 h | ~02:45 (27th) |
+| **P5 deferred** — license server (`hub/license`), plugin host + marketplace (`hub/marketplace`, open dev registration with backend verification), `plugins/SDK.md`, sample plugin, automated-backup plugin | pending | ~5 h | ~07:45 (27th) |
+| **P6** — hardening pass, full e2e on a provisioned VM, Security Advisor rules (incl. the Oct-2026 PHP advisory check), final docs, performance | pending | ~2.5 h | ~10:15 (27th) |
+| **Total remaining** | | **~15 h wall-clock** (from 19:10 on the 26th) | |
 
 Faster option: verification can be cut to one reviewer and one fix round per category
 (~30% less time, less thorough). Not applied unless requested.
@@ -85,17 +87,17 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 ### 1. Server Configuration
 - [x] Basic WebHost Manager Setup
 - [x] Change Root Password
-- [ ] Configure cPanel Analytics
+- [x] Configure cPanel Analytics
 - [x] Configure cPanel Cron Jobs
-- [ ] Initial Quota Setup
-- [ ] Link Server Nodes
-- [ ] Server Profile
-- [ ] Server Time
-- [ ] Statistics Software Configuration
-- [ ] Terminal
+- [x] Initial Quota Setup
+- [x] Link Server Nodes
+- [x] Server Profile
+- [x] Server Time
+- [x] Statistics Software Configuration
+- [x] Terminal
 - [x] Tweak Settings
-- [ ] Update Preferences
-- [ ] WHM Marketplace
+- [x] Update Preferences
+- [~] WHM Marketplace *(static catalog with installed detection; marketplace install arrives with Phase 5)*
 
 ### 2. Support
 - [ ] Create Support Ticket
@@ -103,8 +105,8 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [ ] Support Center
 
 ### 3. Networking Setup
-- [ ] Change Hostname
-- [ ] Resolver Configuration
+- [x] Change Hostname
+- [x] Resolver Configuration
 
 ### 4. Security Center
 - [x] Apache mod_userdir Tweak
@@ -128,20 +130,20 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [x] Two-Factor Authentication
 
 ### 5. Server Contacts
-- [ ] Contact Manager
-- [ ] Edit System Mail Preferences
+- [x] Contact Manager
+- [x] Edit System Mail Preferences
 
 ### 6. Resellers
-- [ ] Change Ownership of an Account
-- [ ] Change Ownership of Multiple Accounts
-- [ ] Edit Reseller Nameservers and Privileges
-- [ ] Email All Resellers
-- [ ] Manage Reseller's IP Delegation
-- [ ] Manage Reseller's Shared IP
-- [ ] Reseller Center
-- [ ] Reset Resellers
-- [ ] Show Reseller Accounts
-- [ ] View Reseller Usage and Manage Account Status
+- [x] Change Ownership of an Account
+- [x] Change Ownership of Multiple Accounts
+- [x] Edit Reseller Nameservers and Privileges
+- [x] Email All Resellers
+- [x] Manage Reseller's IP Delegation
+- [x] Manage Reseller's Shared IP
+- [x] Reseller Center
+- [x] Reset Resellers
+- [x] Show Reseller Accounts
+- [x] View Reseller Usage and Manage Account Status
 
 ### 7. Service Configuration
 - [x] Apache Configuration
@@ -165,66 +167,66 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [x] View Available Locales
 
 ### 9. Backup
-- [ ] Backup Configuration
-- [ ] Backup Restoration
-- [ ] Backup User Selection
-- [ ] File and Directory Restoration
+- [~] Backup Configuration *(split-mode client timeout for archives over 1 h; fix round in progress)*
+- [~] Backup Restoration *(restores only the main domain and replays grants unfiltered; fix round in progress)*
+- [x] Backup User Selection
+- [x] File and Directory Restoration
 
 ### 10. Clusters
 - [ ] Configuration Cluster
 - [ ] DNS Cluster
 
 ### 11. System Reboot
-- [ ] Forceful Server Reboot
-- [ ] Graceful Server Reboot
+- [x] Forceful Server Reboot
+- [x] Graceful Server Reboot
 
 ### 12. Server Status
-- [ ] Apache Status
-- [ ] Daily Process Log
+- [x] Apache Status
+- [x] Daily Process Log
 - [x] Server Information
 - [x] Service Status
 - [x] Task Queue Monitor
 
 ### 13. Account Information
 - [x] List Accounts
-- [ ] List Parked Domains
-- [ ] List Subdomains
+- [x] List Parked Domains
+- [x] List Subdomains
 - [x] List Suspended Accounts
-- [ ] Manage Account Enhancements
-- [ ] Show Accounts Over Quota
-- [ ] View Bandwidth Usage
+- [x] Manage Account Enhancements
+- [x] Show Accounts Over Quota
+- [~] View Bandwidth Usage *(domlog listing capped at 1000 entries; fix round in progress)*
 
 ### 14. Account Functions
-- [ ] Change Site's IP Address
-- [~] Create a New Account *(Linux user + home tree provisioned; vhost/DNS/mail steps land with P2 web/dns/mail ops)*
-- [ ] Email All Users
-- [ ] Force Password Change
-- [ ] Limit Bandwidth Usage
+- [x] Change Site's IP Address
+- [x] Create a New Account
+- [x] Email All Users
+- [x] Force Password Change
+- [x] Limit Bandwidth Usage
 - [x] Manage Account Suspension
-- [ ] Manage Demo Mode
-- [ ] Manage Shell Access
+- [x] Manage Demo Mode
+- [x] Manage Shell Access
 - [x] Modify an Account
 - [x] Password Modification
-- [ ] Quota Modification
-- [ ] Raw Apache Log Download
-- [ ] Raw NGINX Log Download
-- [ ] Rearrange an Account
-- [ ] Reset Account Bandwidth Limit
+- [x] Quota Modification
+- [x] Raw Apache Log Download
+- [x] Raw NGINX Log Download
+- [~] Rearrange an Account *(move runs without locking the account; fix round in progress)*
+- [x] Reset Account Bandwidth Limit
 - [x] Terminate Accounts
-- [ ] Unsuspend Bandwidth Exceeders
+- [x] Unsuspend Bandwidth Exceeders
 - [x] Upgrade/Downgrade an Account
-- [ ] Web Log Retention
-- [ ] Web Template Editor
+- [x] Web Log Retention
+- [x] Web Template Editor
 
 ### 15. Multi Account Functions
-- [ ] Change Multiple Sites' IP Addresses
-- [ ] Modify/Upgrade Multiple Accounts
+- [~] Change Multiple Sites' IP Addresses *(treats PHP-handler warnings as vhost failure; switching to ctx.web.replaceIp in the fix round)*
+- [x] Modify/Upgrade Multiple Accounts
 
 ### 16. Transfers
-- [ ] Convert Addon Domain to Account
-- [ ] Review Transfers and Restores
-- [ ] Transfer or Restore a cPanel Account
-- [ ] Transfer Tool
+- [~] Convert Addon Domain to Account *(removeSource docroot guard + reseller database move; fix round in progress)*
+- [x] Review Transfers and Restores
+- [~] Transfer or Restore a cPanel Account *(same archive/device-node filter pending)*
+- [~] Transfer Tool *(rsync -D / tar may recreate device nodes as root; fix round in progress)*
 
 ### 17. Themes
 - [ ] Theme Manager
@@ -304,7 +306,7 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [x] View Sent Summary
 
 ### 24. System Health
-- [ ] Background Process Killer
+- [x] Background Process Killer
 - [x] Process Manager
 - [x] Show Current Disk Usage
 - [x] Show Current Running Processes

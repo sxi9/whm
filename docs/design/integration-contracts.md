@@ -103,3 +103,97 @@ ACL keys enforced by core (`services/accounts.js`): `create-acct`, `suspend-acct
 development/API tokens `cpanel-api`, `thirdparty`; security `digest-auth`, `mysql-superuser`,
 `disallow-shell`; server-contacts/news `news`. Until a category wires its key, that key is stored
 but not enforced.
+
+---
+
+# Wave-2 contracts (binding; added after the wave-2 build)
+
+## 11. Service names on ctx (authoritative, wave 2)
+`ctx.accountFunctions` (account-functions), `ctx.accountInfo` (account-information),
+`ctx.multiAccount` (multi-account-functions), `ctx.resellers`, `ctx.backup`, `ctx.transfers`,
+`ctx.serverStatus` (server-status), `ctx.systemHealth` (system-health), `ctx.serverConfig`
+(server-configuration), `ctx.networking` (networking-setup), `ctx.contacts` (server-contacts),
+`ctx.systemReboot` (system-reboot). Hooks core relies on and that MUST keep their names/signatures:
+`ctx.resellers.assertAcl/createPolicy/modifyPolicy/nameserversFor`,
+`ctx.accountFunctions.mountpointFor/renderTemplate/runBandwidthEnforce/resetBandwidth`,
+`ctx.serverConfig.profile.summary()`, `ctx.contacts.notify(event, payload)` and
+`ctx.contacts.sendMail({ to, subject, text })`. Reference other services lazily inside methods and
+tolerate absence (optional chaining).
+
+## 12. Bandwidth: one owner per concern
+- **account-information owns collection and the `account_bandwidth` table** (job
+  `account_info.bandwidth_collect`). Its collect job MUST NOT call enforcement.
+- **account-functions owns enforcement and reset**: the toggle, the schedule
+  `account-bandwidth-enforce` (the only enforcement schedule) and `resetBandwidth`. To clear the
+  current period it calls `ctx.accountInfo.resetPeriod(usernames)` (account-information adds this
+  method; it deletes/zeroes the current period rows of its own table) and falls back to zeroing
+  `accounts.bandwidth_used_mb` when the method is absent.
+- `ctx.accountInfo.resetBandwidth` delegates to `ctx.accountFunctions.resetBandwidth` when present.
+- account-information's domlog listing uses the op maximum (`limit: 10000`) and logs a warning
+  through the job when a directory hits the cap; never silently under-count.
+
+## 13. Update checks: software owns the schedule
+software's `os-update-check` schedule (job `software.update.check`) is the single scheduled check.
+server-configuration removes its `update-preferences-check` schedule (do not enqueue it; drop the
+`scheduler.ensure` call and delete the row in a new `020b_` migration), reads "last check" from
+software's settings through `ctx.software.update.status()`, and its "Check now" button calls
+`ctx.software.update.check()`. Update Preferences keeps owning the release channel / auto-update
+preference settings and passes them to software through `ctx.software.panel.setPreferences(...)` if
+that method exists, otherwise stores them under `updates.*` for software to read.
+
+## 14. Vhost results and IP changes (service-configuration is the owner of the semantics)
+`ctx.web.ensureVhost` may return `{ applied: false, reason: 'php_missing' | 'php_pool_failed', … }`
+AFTER the vhost files were written and Apache reloaded; that is a PHP-handler warning, not a vhost
+failure. Consumers changing an address MUST call `ctx.web.replaceIp(previousIp, newIp, { accounts:
+[username] }, req)` (rewrites only the address; reports `updated`) instead of `ensureVhost`, and
+treat `reason in { php_missing, php_pool_failed }` as applied-with-warning anywhere `ensureVhost` is
+still used. Applies to multi-account-functions (Change Multiple Sites' IP Addresses) and
+account-functions (Change Site's IP Address).
+
+## 15. Long agent calls in split mode
+`lib/agent-client.js` times out socket calls after 1 h unless `{ timeoutMs }` is passed. Every
+service that calls an op declared with a longer agent-side `timeoutMs` (backup archive/restore/
+import/upload/download; transfers rsync/extract/stream) passes `{ req, timeoutMs: <op timeout> +
+60_000 }` from its `op()` helper (a LONG_OPS map keyed by op name).
+
+## 16. Untrusted content is never recreated as root with special files
+transfers: rsync uses `-rlpt` (never `-D`, `--devices`, `--specials`); archives are listed with
+`tar -tvf` first and any member of type `b`/`c` (device) or with an absolute/`..` path is refused
+with `invalid_archive` before extraction; agent tests cover both. backup's own archives are
+produced by the panel, but `backup.files.restore` applies the same member filter.
+
+## 17. Restores never widen privileges
+backup: database-user grants from an archive are replayed only for databases that
+`databaseClaim()` accepted for this account (reuse `parseGrant`/ownership); global (`*.*`) and
+system-schema grants (mysql, information_schema, performance_schema, sys) are dropped. The agent
+op `backup.db.restore_users` rejects `ON *.*` and system-schema grants itself (defence in depth)
+and takes an `allowedDatabases` list. Restoring a terminated account re-adds every parked/addon/
+sub domain from `metadata.domains` (insert `account_domains` rows and provision the vhost via
+`ctx.web.ensureVhost`; record per-domain outcomes in `summary.steps.domains`).
+
+## 18. Reseller-safe operations
+transfers: "Move databases to the new account" is root-only because `ctx.databases.assign` is
+root-only — the preview reports an `issue` for non-root callers and the page hides the toggle for
+resellers; the reseller test covers it. `removeSource` on Convert Addon Domain is refused (issue,
+re-checked before `fs.remove`) when the docroot equals the account's `home_dir` or
+`<home_dir>/public_html`, or contains/equals another domain's docroot of that account.
+
+## 19. Moving a live account (Rearrange an Account)
+account-functions: lock the Linux user (`user.lock`) and record a `rearrange` suspension before the
+first copy; unlock at the end. Remove the old tree ONLY when `acct.set_home` and the vhost rewrite
+both succeeded; otherwise keep both trees, record the state in the job and tell the operator. On an
+exception after the copy, remove the partial target tree and restore the previous home. Test: old
+home kept when `ctx.web.ensureVhost` throws.
+
+## 20. Migrations
+`012` is used by both `012_account-functions.sql` and `012_development-token-expiry.sql` (a
+documented exception; both apply in filename order). Never reuse a number: wave-2 categories own
+013–023 as assigned; follow-ups are `0NNb_<slug>-<topic>.sql`, idempotent, never editing a
+committed file.
+
+## 21. Schedules and settings toggles
+Where a feature has an enable/disable setting (process-log sampler, system-health BPK, bandwidth
+enforcement), the setting is the single source of truth and the schedule row follows it; the
+generic schedules endpoint (Configure cPanel Cron Jobs) may change cron/enabled too, so
+`alignSchedule`/`syncSchedule` helpers must only write the row when the setting changed (compare
+before writing), never on every page load.
