@@ -281,6 +281,7 @@ function createMockHost(opts = {}) {
   // ------------------------------------------------------------------ store
   function checkKey(key) {
     if (typeof key !== 'string' || key.length === 0 || key.length > 256) throw new ValidationError('store key must be a string of 1..256 characters');
+    if (key.startsWith('__')) throw new ValidationError('store keys starting with "__" are reserved for the host');
   }
   function checkValue(value, what) {
     if (value === undefined) throw new ValidationError(`${what} must be JSON-serialisable (got undefined)`);
@@ -431,6 +432,7 @@ function createMockHost(opts = {}) {
         if (!Array.isArray(inc) || inc.some((c) => !V.BACKUP_COMPONENTS.includes(c))) throw new ValidationError(`include must be a subset of ${V.BACKUP_COMPONENTS.join(', ')}`);
         if (!V.COMPRESSIONS.includes(compression)) throw new ValidationError(`compression must be one of ${V.COMPRESSIONS.join(', ')}`);
         if (typeof encrypt !== 'boolean') throw new ValidationError('encrypt must be a boolean');
+        if (encrypt) throw new PluginError('this host only produces gzip-compressed, unencrypted account archives', { code: 'UNSUPPORTED', status: 422 });
         const id = nextId('bk');
         const ext = compression === 'none' ? 'tar' : compression === 'zstd' ? 'tar.zst' : 'tar.gz';
         const artefact = {

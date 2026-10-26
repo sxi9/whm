@@ -1,10 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import vm from 'node:vm';
 import zlib from 'node:zlib';
 import { EventEmitter } from 'node:events';
-import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
+import { loadPluginSdk as loadSdk, REPO_ROOT } from '../lib/plugin-sdk.js';
 import { json, paginate } from '../db/index.js';
 import { HttpError, notFound, forbidden, conflict, badRequest, unprocessable, CapabilityError } from '../lib/errors.js';
 import { requireRoot, requireReseller } from '../middleware/rbac.js';
@@ -20,10 +18,8 @@ import { requireAuth } from '../middleware/auth.js';
 //   ctx.development.appconfig.listFor(user, service)  -> AppConfig apps visible to a principal
 //   ctx.development.openapi.collect()                 -> every mounted endpoint with its role
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-export const REPO_ROOT = path.resolve(here, '..', '..', '..');
+export { REPO_ROOT };
 export const HOOKS_DIR = '/usr/local/whm/hooks';
-const require = createRequire(import.meta.url);
 
 // Fallback vocabulary used only when plugins/sdk is not shipped with this install.
 const FALLBACK_EVENTS = {
@@ -38,38 +34,11 @@ const FALLBACK_EVENTS = {
   'panel.started': { stages: ['post'], cancellable: false, payload: '{ hostVersion, bootedAt }' },
 };
 
-// plugins/sdk is CommonJS inside an ESM workspace, so it cannot be require()d
-// directly; this evaluates its files with the CommonJS wrapper, resolving the
-// SDK's own relative imports to each other and everything else to Node.
-function loadCommonJs(file, cache = new Map()) {
-  const resolved = path.resolve(file);
-  if (cache.has(resolved)) return cache.get(resolved).exports;
-  const module = { exports: {} };
-  cache.set(resolved, module);
-  const localRequire = (spec) => {
-    if (spec.startsWith('./') || spec.startsWith('../')) {
-      let target = path.resolve(path.dirname(resolved), spec);
-      if (!fs.existsSync(target) && fs.existsSync(`${target}.js`)) target = `${target}.js`;
-      return loadCommonJs(target, cache);
-    }
-    return require(spec);
-  };
-  const wrapper = vm.compileFunction(fs.readFileSync(resolved, 'utf8'), ['exports', 'require', 'module', '__filename', '__dirname'], { filename: resolved });
-  wrapper(module.exports, localRequire, module, resolved, path.dirname(resolved));
-  return module.exports;
-}
-
+// The SDK loader lives in lib/plugin-sdk.js (shared with the plugin host); this
+// keeps the flat { ...validate, path, version } shape the generator uses.
 export function loadPluginSdk(root = REPO_ROOT) {
-  const dir = path.join(root, 'plugins', 'sdk');
-  const file = path.join(dir, 'validate-manifest.js');
-  if (!fs.existsSync(file)) return null;
-  try {
-    const cache = new Map();
-    const validate = loadCommonJs(file, cache);
-    let version = null;
-    try { version = loadCommonJs(path.join(dir, 'index.js'), cache).SDK_VERSION || null; } catch { /* index optional */ }
-    return { ...validate, path: dir, version };
-  } catch { return null; }
+  const sdk = loadSdk(root);
+  return sdk ? { ...sdk.validate, path: sdk.path, version: sdk.version } : null;
 }
 
 export const EVENT_NAME_RE = /^[a-z][a-z0-9_-]*(\.[a-z][a-z0-9_-]*){1,5}$/;

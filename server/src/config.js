@@ -25,6 +25,10 @@ const defaults = {
   loginRateLimit: { windowMs: 15 * 60 * 1000, max: 20 },
   sessionTtlMs: 8 * 60 * 60 * 1000,
   checkinIntervalMs: 60 * 1000,
+  pluginsDir: null,
+  pluginDataDir: null,
+  pluginHookTimeoutMs: 30_000,
+  pluginActivateTimeoutMs: 60_000,
 };
 
 function readConfigFile() {
@@ -59,6 +63,10 @@ function envOverrides() {
   if (e.WHM_LOG_LEVEL) out.logLevel = e.WHM_LOG_LEVEL;
   if (e.WHM_SERVE_CLIENT) out.serveClient = e.WHM_SERVE_CLIENT === 'true';
   if (e.WHM_CLIENT_DIST) out.clientDist = path.resolve(e.WHM_CLIENT_DIST);
+  if (e.WHM_PLUGINS_DIR) out.pluginsDir = path.resolve(e.WHM_PLUGINS_DIR);
+  if (e.WHM_PLUGIN_DATA_DIR) out.pluginDataDir = path.resolve(e.WHM_PLUGIN_DATA_DIR);
+  if (e.WHM_PLUGIN_HOOK_TIMEOUT_MS) out.pluginHookTimeoutMs = Number(e.WHM_PLUGIN_HOOK_TIMEOUT_MS);
+  if (e.WHM_PLUGIN_ACTIVATE_TIMEOUT_MS) out.pluginActivateTimeoutMs = Number(e.WHM_PLUGIN_ACTIVATE_TIMEOUT_MS);
   return out;
 }
 
@@ -82,5 +90,7 @@ export function loadConfig(overrides = {}) {
   cfg.sessionSecret ||= persistedSecret(cfg.dataDir, 'session.secret');
   cfg.masterKeyHex = persistedSecret(cfg.dataDir, 'master.key');
   cfg.tls = Boolean(cfg.tlsCert && cfg.tlsKey);
+  cfg.pluginsDir = path.resolve(cfg.pluginsDir || path.join(cfg.dataDir, 'plugins'));
+  cfg.pluginDataDir = path.resolve(cfg.pluginDataDir || path.join(cfg.dataDir, 'plugin-data'));
   return cfg;
 }

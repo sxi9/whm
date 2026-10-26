@@ -6,6 +6,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { authRoutes } from './auth.js';
 import { systemRoutes } from './system.js';
 import { accountRoutes, packageRoutes } from './accounts.js';
+import { pluginRoutes } from './plugins.js';
 
 const categoriesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'categories');
 
@@ -22,6 +23,7 @@ export async function apiRouter(ctx) {
   api.use('/system', systemRoutes(ctx));
   api.use('/accounts', accountRoutes(ctx));
   api.use('/packages', packageRoutes(ctx));
+  api.use('/plugins', pluginRoutes(ctx));
 
   const files = fs.existsSync(categoriesDir) ? fs.readdirSync(categoriesDir).filter((f) => f.endsWith('.js')).sort() : [];
   for (const file of files) {

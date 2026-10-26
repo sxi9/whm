@@ -19,6 +19,7 @@ import { createServiceManager } from './services/services.js';
 import { createPackagesService } from './services/packages.js';
 import { createAccountsService } from './services/accounts.js';
 import { createAuditService } from './services/audit.js';
+import { createPluginHost } from './services/plugins.js';
 import { createApp } from './app.js';
 
 const require = createRequire(import.meta.url);
@@ -46,7 +47,9 @@ export async function bootstrap(overrides = {}) {
   ctx.system = createSystemService(ctx);
   ctx.serviceManager = createServiceManager(ctx);
   ctx.audit = createAuditService(ctx);
+  ctx.plugins = createPluginHost(ctx);
   ctx.app = await createApp(ctx);
+  if (overrides.loadPlugins !== false) await ctx.plugins.loadAll();
 
   try {
     await agent.ping();
@@ -59,10 +62,8 @@ export async function bootstrap(overrides = {}) {
 }
 
 export async function start() {
-  const ctx = await bootstrap();
+  const ctx = await bootstrap({ loadPlugins: false });
   const { config, logger, app, jobs, scheduler } = ctx;
-  jobs.start();
-  scheduler.start();
 
   const servers = [];
   if (config.tls) {
@@ -74,12 +75,19 @@ export async function start() {
   httpServer.listen(config.port, config.host, () => logger.info({ port: config.port, mode: config.mode, env: config.env, dataDir: config.dataDir }, 'WHM panel listening (http)'));
   servers.push(httpServer);
 
+  // Plugins load once the panel listens, so a slow activation never keeps the
+  // operator from reaching Manage Plugins; the job workers start after that so
+  // a queued plugin job finds its handler registered.
+  ctx.plugins.loadAll()
+    .catch((err) => logger.error({ err }, 'plugin load failed'))
+    .finally(() => { jobs.start(); scheduler.start(); });
+
   const shutdown = (signal) => {
     logger.info({ signal }, 'shutting down');
     jobs.stop();
     scheduler.stop();
     ctx.sessionStore?.close();
-    Promise.all(servers.map((s) => new Promise((r) => s.close(r)))).then(() => { ctx.db.close(); process.exit(0); });
+    Promise.all([ctx.plugins.stopAll().catch(() => {}), ...servers.map((s) => new Promise((r) => s.close(r)))]).then(() => { ctx.db.close(); process.exit(0); });
     setTimeout(() => process.exit(1), 10_000).unref();
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));

@@ -4,6 +4,7 @@ import { useAuth } from '../auth/AuthContext.jsx';
 import { TopBar } from './TopBar.jsx';
 import { Sidebar } from './Sidebar.jsx';
 import { Loading } from './Common.jsx';
+import { PluginNavProvider } from '../hooks/usePluginNav.js';
 
 export function Layout() {
   const { user, ready } = useAuth();
@@ -22,6 +23,7 @@ export function Layout() {
   }
 
   return (
+    <PluginNavProvider enabled={!user.mustChangePassword && !user.mustEnroll2fa}>
     <div className={`app ${collapsed ? 'sidebar-collapsed' : ''} ${mobileOpen ? 'mobile-open' : ''}`}>
       <TopBar onMenu={() => setMobileOpen((o) => !o)} />
       <div className="app-body">
@@ -38,5 +40,6 @@ export function Layout() {
         <span className="muted">Signed in as {user.username} ({user.role})</span>
       </footer>
     </div>
+    </PluginNavProvider>
   );
 }

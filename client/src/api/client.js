@@ -24,6 +24,18 @@ export const api = {
     if (csrfToken && !['GET', 'HEAD'].includes(method)) headers['X-CSRF-Token'] = csrfToken;
     const res = await fetch(`/api${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), credentials: 'same-origin' });
     if (raw) return res;
+    return api.parse(res, path);
+  },
+
+  // Binary upload (plugin packages): the body is sent as-is under `contentType`.
+  async postRaw(path, body, contentType) {
+    const headers = { Accept: 'application/json', 'Content-Type': contentType };
+    if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
+    const res = await fetch(`/api${path}`, { method: 'POST', headers, body, credentials: 'same-origin' });
+    return api.parse(res, path);
+  },
+
+  async parse(res, path) {
     let json = null;
     const text = await res.text();
     if (text) { try { json = JSON.parse(text); } catch { json = null; } }

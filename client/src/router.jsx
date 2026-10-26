@@ -7,6 +7,7 @@ import { LoginPage } from './pages/Login.jsx';
 import { ChangePasswordPage } from './pages/ChangePassword.jsx';
 import { FunctionPage, NotFoundPage } from './pages/FunctionPage.jsx';
 import { AuditLogPage } from './pages/AuditLog.jsx';
+import PluginPage from './pages/plugins/PluginPage.jsx';
 
 // One route per function, generated from nav.js. A registered page gets its
 // component; everything else renders the generic FunctionPage.
@@ -25,6 +26,8 @@ export const router = createBrowserRouter([
       { path: 'change-password', element: <ChangePasswordPage /> },
       { path: 'audit-log', element: <AuditLogPage /> },
       ...functionRoutes,
+      // Enabled plugins register pages at runtime; one dynamic route serves them all.
+      { path: 'plugins/:pluginId/*', element: <PluginPage /> },
       { path: '*', element: <NotFoundPage /> },
     ],
   },

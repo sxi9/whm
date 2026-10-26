@@ -70,6 +70,9 @@ test('matchesNetScope: exact, wildcard sub-domain and port rules', () => {
   assert.equal(V.matchesNetScope('eu.storage.example.net', '', scopes), null);
   assert.equal(V.matchesNetScope('storage.example.net', '8443', scopes), null);
   assert.equal(V.matchesNetScope('evil.net', '', scopes), null);
+  // An empty port is the https default, so a "host:443" scope matches https://host/.
+  assert.equal(V.matchesNetScope('api.example.net', '', ['net:outbound:api.example.net:443']), 'net:outbound:api.example.net:443');
+  assert.equal(V.matchesNetScope('api.example.net', '8443', ['net:outbound:api.example.net:443']), null);
 });
 
 test('full manifest is valid; minimal manifest is valid', () => {

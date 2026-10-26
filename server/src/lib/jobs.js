@@ -18,11 +18,11 @@ export function createJobs({ db, logger, agent, concurrency = 2 }) {
     claim: db.prepare(`UPDATE jobs SET status = 'running', started_at = datetime('now') WHERE id = ? AND status = 'queued'`),
     nextQueued: db.prepare(`SELECT id FROM jobs WHERE status = 'queued' ORDER BY id LIMIT ?`),
     progress: db.prepare('UPDATE jobs SET progress = ?, message = ? WHERE id = ?'),
-    finish: db.prepare(`UPDATE jobs SET status = ?, progress = ?, result_json = ?, error = ?, finished_at = datetime('now') WHERE id = ?`),
+    finish: db.prepare(`UPDATE jobs SET status = ?, progress = ?, result_json = ?, error = ?, error_code = ?, finished_at = datetime('now') WHERE id = ?`),
     cancel: db.prepare(`UPDATE jobs SET status = 'cancelled', finished_at = datetime('now') WHERE id = ? AND status = 'queued'`),
     log: db.prepare('INSERT INTO job_logs (job_id, level, line) VALUES (?, ?, ?)'),
     logs: db.prepare('SELECT ts, level, line FROM job_logs WHERE job_id = ? ORDER BY id'),
-    recoverStale: db.prepare(`UPDATE jobs SET status = 'failed', error = 'panel restarted while job was running', finished_at = datetime('now') WHERE status = 'running'`),
+    recoverStale: db.prepare(`UPDATE jobs SET status = 'failed', error = 'panel restarted while job was running', error_code = 'PANEL_RESTARTED', finished_at = datetime('now') WHERE status = 'running'`),
   };
 
   function shape(row) {
@@ -59,13 +59,14 @@ export function createJobs({ db, logger, agent, concurrency = 2 }) {
     try {
       if (!handler) throw new Error(`no handler registered for job type "${row.type}"`);
       const result = await handler(ctx);
-      stmts.finish.run('done', 100, JSON.stringify(result ?? null), null, jobId);
+      stmts.finish.run('done', 100, JSON.stringify(result ?? null), null, null, jobId);
       emit(jobId, { type: 'done', result: result ?? null });
     } catch (err) {
       logger.error({ err, jobId, type: row.type }, 'job failed');
-      stmts.finish.run('failed', job.progress, null, err.message, jobId);
+      const code = typeof err.code === 'string' && err.code ? err.code : null;
+      stmts.finish.run('failed', job.progress, null, err.message, code, jobId);
       ctx.log(err.message, 'error');
-      emit(jobId, { type: 'failed', error: err.message });
+      emit(jobId, { type: 'failed', error: err.message, ...(code ? { code } : {}) });
     } finally {
       running.delete(jobId);
     }

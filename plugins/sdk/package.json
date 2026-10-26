@@ -1,0 +1,11 @@
+{
+  "name": "@whm/plugin-sdk",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WHM plugin SDK: manifest validation, mock host and error classes (CommonJS)",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  }
+}
