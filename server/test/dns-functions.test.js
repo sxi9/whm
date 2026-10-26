@@ -377,6 +377,18 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
     await resellerHttp.put('/api/dns/routing/bob.com').set('X-CSRF-Token', resellerCsrf).send({ routing: 'local' }).expect(403);
   });
 
+  it('renders a reseller\'s nameservers into zones created through ensureZoneForDomain', async () => {
+    const zone = await app.ctx.dns.ensureZoneForDomain('resold.example', { ip: '203.0.113.21', nameservers: ['ns1.resell1.com', 'ns2.resell1.com'] });
+    expect(zone.created).toBe(true);
+    const ns = zone.records.filter((r) => r.type === 'NS' && r.name === '@').map((r) => r.value);
+    expect(ns).toEqual(['ns1.resell1.com.', 'ns2.resell1.com.']);
+    expect(zone.records.find((r) => r.type === 'SOA').value).toMatch(/^ns1\.resell1\.com\. /);
+    const defaults = await app.ctx.dns.ensureZoneForDomain('plain.example', { ip: '203.0.113.22', nameservers: [] });
+    expect(defaults.records.filter((r) => r.type === 'NS').map((r) => r.value)).not.toContain('ns1.resell1.com.');
+    await del('/zones/resold.example').expect(200);
+    await del('/zones/plain.example').expect(200);
+  });
+
   it('reports nameserver health using the resolver op', async () => {
     app.agent.set('dns.resolve', ({ name, type }) => {
       if (type === 'NS' && name === 'bob.com') return { name, type, servers: ['1.1.1.1'], answers: ['ns1.bob.com', 'ns9.elsewhere.net'], error: null };

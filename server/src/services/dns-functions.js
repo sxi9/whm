@@ -76,8 +76,9 @@ export function createDnsService(ctx) {
   const strict = () => config.env === 'production';
   const bindAvailable = () => capabilities.has('bind');
   const setting = (key, fallback) => settings.get(key, fallback);
-  const nameservers = () => {
-    const ns = setting('basic.nameservers', []);
+  // A reseller's own nameservers (Edit Reseller Nameservers) take precedence over the server defaults.
+  const nameservers = (override) => {
+    const ns = Array.isArray(override) && override.length ? override : setting('basic.nameservers', []);
     return { ns1: ns[0] || `ns1.${setting('basic.hostname', 'localhost')}`, ns2: ns[1] || ns[0] || `ns2.${setting('basic.hostname', 'localhost')}` };
   };
   const audit = (req, entry) => (req?.audit ? req.audit(entry) : ctx.auditRecord?.(null, entry));
@@ -252,11 +253,11 @@ export function createDnsService(ctx) {
     for (const v of values) stmts.insertRecord.run({ zone_id: zone.id, name, type, ttl: v.ttl ?? null, priority: v.priority ?? null, value: v.value, line_index: ++line });
   }
 
-  async function createZoneInternal({ domain, ip, template = 'standard', accountId = null, ttl }, req) {
+  async function createZoneInternal({ domain, ip, template = 'standard', accountId = null, ttl, nameservers: ownerNs }, req) {
     if (stmts.zoneByDomain.get(domain)) throw conflict(`A zone for ${domain} already exists`);
     const tpl = stmts.template.get(template);
     if (!tpl) throw notFound(`Zone template "${template}"`);
-    const { ns1, ns2 } = nameservers();
+    const { ns1, ns2 } = nameservers(ownerNs);
     const zoneTtl = ttl || setting('dns.default_ttl', 14400);
     const serial = nextSerial(0);
     const address = ip || setting('basic.main_ip') || setting('basic.shared_ip') || '127.0.0.1';
@@ -1227,14 +1228,14 @@ export function createDnsService(ctx) {
       return renderZone(zone, stmts.records.all(zone.id));
     },
     // Idempotent zone provisioning for account creation / addon domains.
-    async ensureZoneForDomain(domain, { ip, accountId, template } = {}, req) {
+    async ensureZoneForDomain(domain, { ip, accountId, template, nameservers } = {}, req) {
       const existing = stmts.zoneByDomain.get(domain);
       if (existing) {
         if (accountId && existing.account_id !== accountId) db.transaction(() => { bump(existing, { account_id: accountId }); })();
         return { ...shapeZone(stmts.zoneByDomain.get(domain)), created: false };
       }
       if (!bindAvailable() && strict()) return { domain, created: false, applied: false, reason: 'capability_missing' };
-      return { ...(await createZoneInternal({ domain, ip, template: template || 'standard', accountId: accountId ?? accountForDomain(domain)?.id ?? null }, req)), created: true };
+      return { ...(await createZoneInternal({ domain, ip, template: template || 'standard', accountId: accountId ?? accountForDomain(domain)?.id ?? null, nameservers }, req)), created: true };
     },
     // Replaces every record of (name, type) in a zone; e.g. ctx.dns.upsertRecords('example.com', 'www', 'A', [{ value: '10.0.0.2' }]).
     async upsertRecords(domain, name, type, values, req) {

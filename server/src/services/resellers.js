@@ -13,8 +13,7 @@ import { isRoot } from '../middleware/rbac.js';
 //                                             -> same checks for an existing account's new values
 //   resellers.nameserversFor(ownerId)         -> the owner's nameservers ([] when the server defaults apply).
 //                                                accounts.create hands them to ctx.dns.ensureZoneForDomain as
-//                                                { nameservers }; until DNS Functions consumes that option
-//                                                (integration contract 10) new zones advertise the server defaults.
+//                                                { nameservers }, which renders them into the zone's NS/SOA.
 //   resellers.sharedIpFor(user)               -> the reseller's shared IP or null
 //   resellers.delegatedAddresses(userId)      -> ip_addresses rows delegated to a reseller
 //   resellers.isReseller(username)

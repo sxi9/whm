@@ -136,7 +136,7 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 ### 6. Resellers
 - [x] Change Ownership of an Account
 - [x] Change Ownership of Multiple Accounts
-- [~] Edit Reseller Nameservers and Privileges *(nameserver hand-off to DNS Functions' ensureZoneForDomain pending; core follow-up)*
+- [x] Edit Reseller Nameservers and Privileges
 - [x] Email All Resellers
 - [x] Manage Reseller's IP Delegation
 - [x] Manage Reseller's Shared IP
