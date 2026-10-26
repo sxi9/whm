@@ -1,309 +1,182 @@
-# All pages
+# Every page
 
-Captured 2026-10-26 with `e2e/screenshot-all.cjs` at 1280×800: 212 function pages across 30 categories, plus core pages. Functions without a dedicated screen yet show the phase placeholder.
+Captured 2026-10-26 at commit `e1c8c0f` with `e2e/screenshot-all.cjs` (1280×800). **139 of 212 function pages are live**; the rest show the placeholder for their build phase. Each image carries its label bar. Click any thumbnail for full size.
 
-## Core
+## Core pages
 
-- [Login](_core/login.jpg) · [Home](_core/home.jpg) · [Audit log](_core/audit-log.jpg) · [Change password](_core/change-password.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="_core/login.jpg"><img src="_core/login.jpg" width="400" alt="Login"></a><br><sub><b>Login</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="_core/home.jpg"><img src="_core/home.jpg" width="400" alt="Home"></a><br><sub><b>Home</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="_core/audit-log.jpg"><img src="_core/audit-log.jpg" width="400" alt="Audit log"></a><br><sub><b>Audit log</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="_core/change-password.jpg"><img src="_core/change-password.jpg" width="400" alt="Change password"></a><br><sub><b>Change password</b></sub> <sub>✅ live</sub></td></tr></table>
 
-## 1. Server Configuration
+## 1. Server Configuration — 4/13 live
 
-- [Basic WebHost Manager Setup](server-configuration/basic-webhost-manager-setup.jpg)
-- [Change Root Password](server-configuration/change-root-password.jpg)
-- [Configure cPanel Analytics](server-configuration/configure-cpanel-analytics.jpg)
-- [Configure cPanel Cron Jobs](server-configuration/configure-cpanel-cron-jobs.jpg)
-- [Initial Quota Setup](server-configuration/initial-quota-setup.jpg)
-- [Link Server Nodes](server-configuration/link-server-nodes.jpg)
-- [Server Profile](server-configuration/server-profile.jpg)
-- [Server Time](server-configuration/server-time.jpg)
-- [Statistics Software Configuration](server-configuration/statistics-software-configuration.jpg)
-- [Terminal](server-configuration/terminal.jpg)
-- [Tweak Settings](server-configuration/tweak-settings.jpg)
-- [Update Preferences](server-configuration/update-preferences.jpg)
-- [WHM Marketplace](server-configuration/whm-marketplace.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="server-configuration/basic-webhost-manager-setup.jpg"><img src="server-configuration/basic-webhost-manager-setup.jpg" width="400" alt="Basic WebHost Manager Setup"></a><br><sub><b>Basic WebHost Manager Setup</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="server-configuration/change-root-password.jpg"><img src="server-configuration/change-root-password.jpg" width="400" alt="Change Root Password"></a><br><sub><b>Change Root Password</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="server-configuration/configure-cpanel-analytics.jpg"><img src="server-configuration/configure-cpanel-analytics.jpg" width="400" alt="Configure cPanel Analytics"></a><br><sub><b>Configure cPanel Analytics</b></sub> <sub>⏳ phase 5</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="server-configuration/configure-cpanel-cron-jobs.jpg"><img src="server-configuration/configure-cpanel-cron-jobs.jpg" width="400" alt="Configure cPanel Cron Jobs"></a><br><sub><b>Configure cPanel Cron Jobs</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="server-configuration/initial-quota-setup.jpg"><img src="server-configuration/initial-quota-setup.jpg" width="400" alt="Initial Quota Setup"></a><br><sub><b>Initial Quota Setup</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="server-configuration/link-server-nodes.jpg"><img src="server-configuration/link-server-nodes.jpg" width="400" alt="Link Server Nodes"></a><br><sub><b>Link Server Nodes</b></sub> <sub>⏳ phase 5</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="server-configuration/server-profile.jpg"><img src="server-configuration/server-profile.jpg" width="400" alt="Server Profile"></a><br><sub><b>Server Profile</b></sub> <sub>⏳ phase 5</sub></td><td align="center" valign="top" width="33%"><a href="server-configuration/server-time.jpg"><img src="server-configuration/server-time.jpg" width="400" alt="Server Time"></a><br><sub><b>Server Time</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="server-configuration/statistics-software-configuration.jpg"><img src="server-configuration/statistics-software-configuration.jpg" width="400" alt="Statistics Software Configuration"></a><br><sub><b>Statistics Software Configuration</b></sub> <sub>⏳ phase 5</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="server-configuration/terminal.jpg"><img src="server-configuration/terminal.jpg" width="400" alt="Terminal"></a><br><sub><b>Terminal</b></sub> <sub>⏳ phase 5</sub></td><td align="center" valign="top" width="33%"><a href="server-configuration/tweak-settings.jpg"><img src="server-configuration/tweak-settings.jpg" width="400" alt="Tweak Settings"></a><br><sub><b>Tweak Settings</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="server-configuration/update-preferences.jpg"><img src="server-configuration/update-preferences.jpg" width="400" alt="Update Preferences"></a><br><sub><b>Update Preferences</b></sub> <sub>⏳ phase 5</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="server-configuration/whm-marketplace.jpg"><img src="server-configuration/whm-marketplace.jpg" width="400" alt="WHM Marketplace"></a><br><sub><b>WHM Marketplace</b></sub> <sub>⏳ phase 5</sub></td></tr></table>
 
-## 2. Support
+## 2. Support — 0/3 live
 
-- [Create Support Ticket](support/create-support-ticket.jpg)
-- [Grant cPanel Support Access](support/grant-cpanel-support-access.jpg)
-- [Support Center](support/support-center.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="support/create-support-ticket.jpg"><img src="support/create-support-ticket.jpg" width="400" alt="Create Support Ticket"></a><br><sub><b>Create Support Ticket</b></sub> <sub>⏳ phase 5</sub></td><td align="center" valign="top" width="33%"><a href="support/grant-cpanel-support-access.jpg"><img src="support/grant-cpanel-support-access.jpg" width="400" alt="Grant cPanel Support Access"></a><br><sub><b>Grant cPanel Support Access</b></sub> <sub>⏳ phase 5</sub></td><td align="center" valign="top" width="33%"><a href="support/support-center.jpg"><img src="support/support-center.jpg" width="400" alt="Support Center"></a><br><sub><b>Support Center</b></sub> <sub>⏳ phase 5</sub></td></tr></table>
 
-## 3. Networking Setup
+## 3. Networking Setup — 0/2 live
 
-- [Change Hostname](networking-setup/change-hostname.jpg)
-- [Resolver Configuration](networking-setup/resolver-configuration.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="networking-setup/change-hostname.jpg"><img src="networking-setup/change-hostname.jpg" width="400" alt="Change Hostname"></a><br><sub><b>Change Hostname</b></sub> <sub>⏳ phase 4</sub></td><td align="center" valign="top" width="33%"><a href="networking-setup/resolver-configuration.jpg"><img src="networking-setup/resolver-configuration.jpg" width="400" alt="Resolver Configuration"></a><br><sub><b>Resolver Configuration</b></sub> <sub>⏳ phase 4</sub></td></tr></table>
 
-## 4. Security Center
+## 4. Security Center — 19/19 live
 
-- [Apache mod_userdir Tweak](security-center/apache-mod-userdir-tweak.jpg)
-- [SMTP Restrictions](security-center/smtp-restrictions.jpg)
-- [Compiler Access](security-center/compiler-access.jpg)
-- [Configure Security Policies](security-center/configure-security-policies.jpg)
-- [cPHulk Brute Force Protection](security-center/cphulk-brute-force-protection.jpg)
-- [Host Access Control](security-center/host-access-control.jpg)
-- [Manage External Authentications](security-center/manage-external-authentications.jpg)
-- [Manage root's SSH Keys](security-center/manage-roots-ssh-keys.jpg)
-- [Manage Wheel Group Users](security-center/manage-wheel-group-users.jpg)
-- [ModSecurity Configuration](security-center/modsecurity-configuration.jpg)
-- [ModSecurity Tools](security-center/modsecurity-tools.jpg)
-- [ModSecurity Vendors](security-center/modsecurity-vendors.jpg)
-- [Password Strength Configuration](security-center/password-strength-configuration.jpg)
-- [Security Advisor](security-center/security-advisor.jpg)
-- [Security Questions](security-center/security-questions.jpg)
-- [Shell Fork Bomb Protection](security-center/shell-fork-bomb-protection.jpg)
-- [SSH Password Authorization Tweak](security-center/ssh-password-authorization-tweak.jpg)
-- [Traceroute Enable/Disable](security-center/traceroute-enable-disable.jpg)
-- [Two-Factor Authentication](security-center/two-factor-authentication.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="security-center/apache-mod-userdir-tweak.jpg"><img src="security-center/apache-mod-userdir-tweak.jpg" width="400" alt="Apache mod_userdir Tweak"></a><br><sub><b>Apache mod_userdir Tweak</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="security-center/smtp-restrictions.jpg"><img src="security-center/smtp-restrictions.jpg" width="400" alt="SMTP Restrictions"></a><br><sub><b>SMTP Restrictions</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="security-center/compiler-access.jpg"><img src="security-center/compiler-access.jpg" width="400" alt="Compiler Access"></a><br><sub><b>Compiler Access</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="security-center/configure-security-policies.jpg"><img src="security-center/configure-security-policies.jpg" width="400" alt="Configure Security Policies"></a><br><sub><b>Configure Security Policies</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="security-center/cphulk-brute-force-protection.jpg"><img src="security-center/cphulk-brute-force-protection.jpg" width="400" alt="cPHulk Brute Force Protection"></a><br><sub><b>cPHulk Brute Force Protection</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="security-center/host-access-control.jpg"><img src="security-center/host-access-control.jpg" width="400" alt="Host Access Control"></a><br><sub><b>Host Access Control</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="security-center/manage-external-authentications.jpg"><img src="security-center/manage-external-authentications.jpg" width="400" alt="Manage External Authentications"></a><br><sub><b>Manage External Authentications</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="security-center/manage-roots-ssh-keys.jpg"><img src="security-center/manage-roots-ssh-keys.jpg" width="400" alt="Manage root's SSH Keys"></a><br><sub><b>Manage root's SSH Keys</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="security-center/manage-wheel-group-users.jpg"><img src="security-center/manage-wheel-group-users.jpg" width="400" alt="Manage Wheel Group Users"></a><br><sub><b>Manage Wheel Group Users</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="security-center/modsecurity-configuration.jpg"><img src="security-center/modsecurity-configuration.jpg" width="400" alt="ModSecurity Configuration"></a><br><sub><b>ModSecurity Configuration</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="security-center/modsecurity-tools.jpg"><img src="security-center/modsecurity-tools.jpg" width="400" alt="ModSecurity Tools"></a><br><sub><b>ModSecurity Tools</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="security-center/modsecurity-vendors.jpg"><img src="security-center/modsecurity-vendors.jpg" width="400" alt="ModSecurity Vendors"></a><br><sub><b>ModSecurity Vendors</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="security-center/password-strength-configuration.jpg"><img src="security-center/password-strength-configuration.jpg" width="400" alt="Password Strength Configuration"></a><br><sub><b>Password Strength Configuration</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="security-center/security-advisor.jpg"><img src="security-center/security-advisor.jpg" width="400" alt="Security Advisor"></a><br><sub><b>Security Advisor</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="security-center/security-questions.jpg"><img src="security-center/security-questions.jpg" width="400" alt="Security Questions"></a><br><sub><b>Security Questions</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="security-center/shell-fork-bomb-protection.jpg"><img src="security-center/shell-fork-bomb-protection.jpg" width="400" alt="Shell Fork Bomb Protection"></a><br><sub><b>Shell Fork Bomb Protection</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="security-center/ssh-password-authorization-tweak.jpg"><img src="security-center/ssh-password-authorization-tweak.jpg" width="400" alt="SSH Password Authorization Tweak"></a><br><sub><b>SSH Password Authorization Tweak</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="security-center/traceroute-enable-disable.jpg"><img src="security-center/traceroute-enable-disable.jpg" width="400" alt="Traceroute Enable/Disable"></a><br><sub><b>Traceroute Enable/Disable</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="security-center/two-factor-authentication.jpg"><img src="security-center/two-factor-authentication.jpg" width="400" alt="Two-Factor Authentication"></a><br><sub><b>Two-Factor Authentication</b></sub> <sub>✅ live</sub></td></tr></table>
 
-## 5. Server Contacts
+## 5. Server Contacts — 0/2 live
 
-- [Contact Manager](server-contacts/contact-manager.jpg)
-- [Edit System Mail Preferences](server-contacts/edit-system-mail-preferences.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="server-contacts/contact-manager.jpg"><img src="server-contacts/contact-manager.jpg" width="400" alt="Contact Manager"></a><br><sub><b>Contact Manager</b></sub> <sub>⏳ phase 4</sub></td><td align="center" valign="top" width="33%"><a href="server-contacts/edit-system-mail-preferences.jpg"><img src="server-contacts/edit-system-mail-preferences.jpg" width="400" alt="Edit System Mail Preferences"></a><br><sub><b>Edit System Mail Preferences</b></sub> <sub>⏳ phase 4</sub></td></tr></table>
 
-## 6. Resellers
+## 6. Resellers — 0/10 live
 
-- [Change Ownership of an Account](resellers/change-ownership-of-an-account.jpg)
-- [Change Ownership of Multiple Accounts](resellers/change-ownership-of-multiple-accounts.jpg)
-- [Edit Reseller Nameservers and Privileges](resellers/edit-reseller-nameservers-and-privileges.jpg)
-- [Email All Resellers](resellers/email-all-resellers.jpg)
-- [Manage Reseller's IP Delegation](resellers/manage-resellers-ip-delegation.jpg)
-- [Manage Reseller's Shared IP](resellers/manage-resellers-shared-ip.jpg)
-- [Reseller Center](resellers/reseller-center.jpg)
-- [Reset Resellers](resellers/reset-resellers.jpg)
-- [Show Reseller Accounts](resellers/show-reseller-accounts.jpg)
-- [View Reseller Usage and Manage Account Status](resellers/view-reseller-usage-and-manage-account-status.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="resellers/change-ownership-of-an-account.jpg"><img src="resellers/change-ownership-of-an-account.jpg" width="400" alt="Change Ownership of an Account"></a><br><sub><b>Change Ownership of an Account</b></sub> <sub>⏳ phase 4</sub></td><td align="center" valign="top" width="33%"><a href="resellers/change-ownership-of-multiple-accounts.jpg"><img src="resellers/change-ownership-of-multiple-accounts.jpg" width="400" alt="Change Ownership of Multiple Accounts"></a><br><sub><b>Change Ownership of Multiple Accounts</b></sub> <sub>⏳ phase 4</sub></td><td align="center" valign="top" width="33%"><a href="resellers/edit-reseller-nameservers-and-privileges.jpg"><img src="resellers/edit-reseller-nameservers-and-privileges.jpg" width="400" alt="Edit Reseller Nameservers and Privileges"></a><br><sub><b>Edit Reseller Nameservers and Privileges</b></sub> <sub>⏳ phase 4</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="resellers/email-all-resellers.jpg"><img src="resellers/email-all-resellers.jpg" width="400" alt="Email All Resellers"></a><br><sub><b>Email All Resellers</b></sub> <sub>⏳ phase 4</sub></td><td align="center" valign="top" width="33%"><a href="resellers/manage-resellers-ip-delegation.jpg"><img src="resellers/manage-resellers-ip-delegation.jpg" width="400" alt="Manage Reseller's IP Delegation"></a><br><sub><b>Manage Reseller's IP Delegation</b></sub> <sub>⏳ phase 4</sub></td><td align="center" valign="top" width="33%"><a href="resellers/manage-resellers-shared-ip.jpg"><img src="resellers/manage-resellers-shared-ip.jpg" width="400" alt="Manage Reseller's Shared IP"></a><br><sub><b>Manage Reseller's Shared IP</b></sub> <sub>⏳ phase 4</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="resellers/reseller-center.jpg"><img src="resellers/reseller-center.jpg" width="400" alt="Reseller Center"></a><br><sub><b>Reseller Center</b></sub> <sub>⏳ phase 4</sub></td><td align="center" valign="top" width="33%"><a href="resellers/reset-resellers.jpg"><img src="resellers/reset-resellers.jpg" width="400" alt="Reset Resellers"></a><br><sub><b>Reset Resellers</b></sub> <sub>⏳ phase 4</sub></td><td align="center" valign="top" width="33%"><a href="resellers/show-reseller-accounts.jpg"><img src="resellers/show-reseller-accounts.jpg" width="400" alt="Show Reseller Accounts"></a><br><sub><b>Show Reseller Accounts</b></sub> <sub>⏳ phase 4</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="resellers/view-reseller-usage-and-manage-account-status.jpg"><img src="resellers/view-reseller-usage-and-manage-account-status.jpg" width="400" alt="View Reseller Usage and Manage Account Status"></a><br><sub><b>View Reseller Usage and Manage Account Status</b></sub> <sub>⏳ phase 4</sub></td></tr></table>
 
-## 7. Service Configuration
+## 7. Service Configuration — 10/10 live
 
-- [Apache Configuration](service-configuration/apache-configuration.jpg)
-- [cPanel Log Rotation Configuration](service-configuration/cpanel-log-rotation-configuration.jpg)
-- [cPanel Web Disk Configuration](service-configuration/cpanel-web-disk-configuration.jpg)
-- [cPanel Web Services Configuration](service-configuration/cpanel-web-services-configuration.jpg)
-- [Exim Configuration Manager](service-configuration/exim-configuration-manager.jpg)
-- [FTP Server Selection](service-configuration/ftp-server-selection.jpg)
-- [Mailserver Configuration](service-configuration/mailserver-configuration.jpg)
-- [Manage Service SSL Certificates](service-configuration/manage-service-ssl-certificates.jpg)
-- [Nameserver Selection](service-configuration/nameserver-selection.jpg)
-- [Service Manager](service-configuration/service-manager.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="service-configuration/apache-configuration.jpg"><img src="service-configuration/apache-configuration.jpg" width="400" alt="Apache Configuration"></a><br><sub><b>Apache Configuration</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="service-configuration/cpanel-log-rotation-configuration.jpg"><img src="service-configuration/cpanel-log-rotation-configuration.jpg" width="400" alt="cPanel Log Rotation Configuration"></a><br><sub><b>cPanel Log Rotation Configuration</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="service-configuration/cpanel-web-disk-configuration.jpg"><img src="service-configuration/cpanel-web-disk-configuration.jpg" width="400" alt="cPanel Web Disk Configuration"></a><br><sub><b>cPanel Web Disk Configuration</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="service-configuration/cpanel-web-services-configuration.jpg"><img src="service-configuration/cpanel-web-services-configuration.jpg" width="400" alt="cPanel Web Services Configuration"></a><br><sub><b>cPanel Web Services Configuration</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="service-configuration/exim-configuration-manager.jpg"><img src="service-configuration/exim-configuration-manager.jpg" width="400" alt="Exim Configuration Manager"></a><br><sub><b>Exim Configuration Manager</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="service-configuration/ftp-server-selection.jpg"><img src="service-configuration/ftp-server-selection.jpg" width="400" alt="FTP Server Selection"></a><br><sub><b>FTP Server Selection</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="service-configuration/mailserver-configuration.jpg"><img src="service-configuration/mailserver-configuration.jpg" width="400" alt="Mailserver Configuration"></a><br><sub><b>Mailserver Configuration</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="service-configuration/manage-service-ssl-certificates.jpg"><img src="service-configuration/manage-service-ssl-certificates.jpg" width="400" alt="Manage Service SSL Certificates"></a><br><sub><b>Manage Service SSL Certificates</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="service-configuration/nameserver-selection.jpg"><img src="service-configuration/nameserver-selection.jpg" width="400" alt="Nameserver Selection"></a><br><sub><b>Nameserver Selection</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="service-configuration/service-manager.jpg"><img src="service-configuration/service-manager.jpg" width="400" alt="Service Manager"></a><br><sub><b>Service Manager</b></sub> <sub>✅ live</sub></td></tr></table>
 
-## 8. Locales
+## 8. Locales — 7/7 live
 
-- [Configure Application Locales](locales/configure-application-locales.jpg)
-- [Copy a Locale](locales/copy-a-locale.jpg)
-- [Delete a Locale](locales/delete-a-locale.jpg)
-- [Edit a Locale](locales/edit-a-locale.jpg)
-- [Locale XML Download](locales/locale-xml-download.jpg)
-- [Locale XML Upload](locales/locale-xml-upload.jpg)
-- [View Available Locales](locales/view-available-locales.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="locales/configure-application-locales.jpg"><img src="locales/configure-application-locales.jpg" width="400" alt="Configure Application Locales"></a><br><sub><b>Configure Application Locales</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="locales/copy-a-locale.jpg"><img src="locales/copy-a-locale.jpg" width="400" alt="Copy a Locale"></a><br><sub><b>Copy a Locale</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="locales/delete-a-locale.jpg"><img src="locales/delete-a-locale.jpg" width="400" alt="Delete a Locale"></a><br><sub><b>Delete a Locale</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="locales/edit-a-locale.jpg"><img src="locales/edit-a-locale.jpg" width="400" alt="Edit a Locale"></a><br><sub><b>Edit a Locale</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="locales/locale-xml-download.jpg"><img src="locales/locale-xml-download.jpg" width="400" alt="Locale XML Download"></a><br><sub><b>Locale XML Download</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="locales/locale-xml-upload.jpg"><img src="locales/locale-xml-upload.jpg" width="400" alt="Locale XML Upload"></a><br><sub><b>Locale XML Upload</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="locales/view-available-locales.jpg"><img src="locales/view-available-locales.jpg" width="400" alt="View Available Locales"></a><br><sub><b>View Available Locales</b></sub> <sub>✅ live</sub></td></tr></table>
 
-## 9. Backup
+## 9. Backup — 0/4 live
 
-- [Backup Configuration](backup/backup-configuration.jpg)
-- [Backup Restoration](backup/backup-restoration.jpg)
-- [Backup User Selection](backup/backup-user-selection.jpg)
-- [File and Directory Restoration](backup/file-and-directory-restoration.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="backup/backup-configuration.jpg"><img src="backup/backup-configuration.jpg" width="400" alt="Backup Configuration"></a><br><sub><b>Backup Configuration</b></sub> <sub>⏳ phase 4</sub></td><td align="center" valign="top" width="33%"><a href="backup/backup-restoration.jpg"><img src="backup/backup-restoration.jpg" width="400" alt="Backup Restoration"></a><br><sub><b>Backup Restoration</b></sub> <sub>⏳ phase 4</sub></td><td align="center" valign="top" width="33%"><a href="backup/backup-user-selection.jpg"><img src="backup/backup-user-selection.jpg" width="400" alt="Backup User Selection"></a><br><sub><b>Backup User Selection</b></sub> <sub>⏳ phase 4</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="backup/file-and-directory-restoration.jpg"><img src="backup/file-and-directory-restoration.jpg" width="400" alt="File and Directory Restoration"></a><br><sub><b>File and Directory Restoration</b></sub> <sub>⏳ phase 4</sub></td></tr></table>
 
-## 10. Clusters
+## 10. Clusters — 0/2 live
 
-- [Configuration Cluster](clusters/configuration-cluster.jpg)
-- [DNS Cluster](clusters/dns-cluster.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="clusters/configuration-cluster.jpg"><img src="clusters/configuration-cluster.jpg" width="400" alt="Configuration Cluster"></a><br><sub><b>Configuration Cluster</b></sub> <sub>⏳ phase 5</sub></td><td align="center" valign="top" width="33%"><a href="clusters/dns-cluster.jpg"><img src="clusters/dns-cluster.jpg" width="400" alt="DNS Cluster"></a><br><sub><b>DNS Cluster</b></sub> <sub>⏳ phase 5</sub></td></tr></table>
 
-## 11. System Reboot
+## 11. System Reboot — 0/2 live
 
-- [Forceful Server Reboot](system-reboot/forceful-server-reboot.jpg)
-- [Graceful Server Reboot](system-reboot/graceful-server-reboot.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="system-reboot/forceful-server-reboot.jpg"><img src="system-reboot/forceful-server-reboot.jpg" width="400" alt="Forceful Server Reboot"></a><br><sub><b>Forceful Server Reboot</b></sub> <sub>⏳ phase 4</sub></td><td align="center" valign="top" width="33%"><a href="system-reboot/graceful-server-reboot.jpg"><img src="system-reboot/graceful-server-reboot.jpg" width="400" alt="Graceful Server Reboot"></a><br><sub><b>Graceful Server Reboot</b></sub> <sub>⏳ phase 4</sub></td></tr></table>
 
-## 12. Server Status
+## 12. Server Status — 3/5 live
 
-- [Apache Status](server-status/apache-status.jpg)
-- [Daily Process Log](server-status/daily-process-log.jpg)
-- [Server Information](server-status/server-information.jpg)
-- [Service Status](server-status/service-status.jpg)
-- [Task Queue Monitor](server-status/task-queue-monitor.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="server-status/apache-status.jpg"><img src="server-status/apache-status.jpg" width="400" alt="Apache Status"></a><br><sub><b>Apache Status</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="server-status/daily-process-log.jpg"><img src="server-status/daily-process-log.jpg" width="400" alt="Daily Process Log"></a><br><sub><b>Daily Process Log</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="server-status/server-information.jpg"><img src="server-status/server-information.jpg" width="400" alt="Server Information"></a><br><sub><b>Server Information</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="server-status/service-status.jpg"><img src="server-status/service-status.jpg" width="400" alt="Service Status"></a><br><sub><b>Service Status</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="server-status/task-queue-monitor.jpg"><img src="server-status/task-queue-monitor.jpg" width="400" alt="Task Queue Monitor"></a><br><sub><b>Task Queue Monitor</b></sub> <sub>✅ live</sub></td></tr></table>
 
-## 13. Account Information
+## 13. Account Information — 2/7 live
 
-- [List Accounts](account-information/list-accounts.jpg)
-- [List Parked Domains](account-information/list-parked-domains.jpg)
-- [List Subdomains](account-information/list-subdomains.jpg)
-- [List Suspended Accounts](account-information/list-suspended-accounts.jpg)
-- [Manage Account Enhancements](account-information/manage-account-enhancements.jpg)
-- [Show Accounts Over Quota](account-information/show-accounts-over-quota.jpg)
-- [View Bandwidth Usage](account-information/view-bandwidth-usage.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="account-information/list-accounts.jpg"><img src="account-information/list-accounts.jpg" width="400" alt="List Accounts"></a><br><sub><b>List Accounts</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="account-information/list-parked-domains.jpg"><img src="account-information/list-parked-domains.jpg" width="400" alt="List Parked Domains"></a><br><sub><b>List Parked Domains</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="account-information/list-subdomains.jpg"><img src="account-information/list-subdomains.jpg" width="400" alt="List Subdomains"></a><br><sub><b>List Subdomains</b></sub> <sub>⏳ phase 2</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="account-information/list-suspended-accounts.jpg"><img src="account-information/list-suspended-accounts.jpg" width="400" alt="List Suspended Accounts"></a><br><sub><b>List Suspended Accounts</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="account-information/manage-account-enhancements.jpg"><img src="account-information/manage-account-enhancements.jpg" width="400" alt="Manage Account Enhancements"></a><br><sub><b>Manage Account Enhancements</b></sub> <sub>⏳ phase 5</sub></td><td align="center" valign="top" width="33%"><a href="account-information/show-accounts-over-quota.jpg"><img src="account-information/show-accounts-over-quota.jpg" width="400" alt="Show Accounts Over Quota"></a><br><sub><b>Show Accounts Over Quota</b></sub> <sub>⏳ phase 2</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="account-information/view-bandwidth-usage.jpg"><img src="account-information/view-bandwidth-usage.jpg" width="400" alt="View Bandwidth Usage"></a><br><sub><b>View Bandwidth Usage</b></sub> <sub>⏳ phase 2</sub></td></tr></table>
 
-## 14. Account Functions
+## 14. Account Functions — 6/20 live
 
-- [Change Site's IP Address](account-functions/change-sites-ip-address.jpg)
-- [Create a New Account](account-functions/create-a-new-account.jpg)
-- [Email All Users](account-functions/email-all-users.jpg)
-- [Force Password Change](account-functions/force-password-change.jpg)
-- [Limit Bandwidth Usage](account-functions/limit-bandwidth-usage.jpg)
-- [Manage Account Suspension](account-functions/manage-account-suspension.jpg)
-- [Manage Demo Mode](account-functions/manage-demo-mode.jpg)
-- [Manage Shell Access](account-functions/manage-shell-access.jpg)
-- [Modify an Account](account-functions/modify-an-account.jpg)
-- [Password Modification](account-functions/password-modification.jpg)
-- [Quota Modification](account-functions/quota-modification.jpg)
-- [Raw Apache Log Download](account-functions/raw-apache-log-download.jpg)
-- [Raw NGINX Log Download](account-functions/raw-nginx-log-download.jpg)
-- [Rearrange an Account](account-functions/rearrange-an-account.jpg)
-- [Reset Account Bandwidth Limit](account-functions/reset-account-bandwidth-limit.jpg)
-- [Terminate Accounts](account-functions/terminate-accounts.jpg)
-- [Unsuspend Bandwidth Exceeders](account-functions/unsuspend-bandwidth-exceeders.jpg)
-- [Upgrade/Downgrade an Account](account-functions/upgrade-downgrade-an-account.jpg)
-- [Web Log Retention](account-functions/web-log-retention.jpg)
-- [Web Template Editor](account-functions/web-template-editor.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="account-functions/change-sites-ip-address.jpg"><img src="account-functions/change-sites-ip-address.jpg" width="400" alt="Change Site's IP Address"></a><br><sub><b>Change Site's IP Address</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="account-functions/create-a-new-account.jpg"><img src="account-functions/create-a-new-account.jpg" width="400" alt="Create a New Account"></a><br><sub><b>Create a New Account</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="account-functions/email-all-users.jpg"><img src="account-functions/email-all-users.jpg" width="400" alt="Email All Users"></a><br><sub><b>Email All Users</b></sub> <sub>⏳ phase 2</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="account-functions/force-password-change.jpg"><img src="account-functions/force-password-change.jpg" width="400" alt="Force Password Change"></a><br><sub><b>Force Password Change</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="account-functions/limit-bandwidth-usage.jpg"><img src="account-functions/limit-bandwidth-usage.jpg" width="400" alt="Limit Bandwidth Usage"></a><br><sub><b>Limit Bandwidth Usage</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="account-functions/manage-account-suspension.jpg"><img src="account-functions/manage-account-suspension.jpg" width="400" alt="Manage Account Suspension"></a><br><sub><b>Manage Account Suspension</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="account-functions/manage-demo-mode.jpg"><img src="account-functions/manage-demo-mode.jpg" width="400" alt="Manage Demo Mode"></a><br><sub><b>Manage Demo Mode</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="account-functions/manage-shell-access.jpg"><img src="account-functions/manage-shell-access.jpg" width="400" alt="Manage Shell Access"></a><br><sub><b>Manage Shell Access</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="account-functions/modify-an-account.jpg"><img src="account-functions/modify-an-account.jpg" width="400" alt="Modify an Account"></a><br><sub><b>Modify an Account</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="account-functions/password-modification.jpg"><img src="account-functions/password-modification.jpg" width="400" alt="Password Modification"></a><br><sub><b>Password Modification</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="account-functions/quota-modification.jpg"><img src="account-functions/quota-modification.jpg" width="400" alt="Quota Modification"></a><br><sub><b>Quota Modification</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="account-functions/raw-apache-log-download.jpg"><img src="account-functions/raw-apache-log-download.jpg" width="400" alt="Raw Apache Log Download"></a><br><sub><b>Raw Apache Log Download</b></sub> <sub>⏳ phase 2</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="account-functions/raw-nginx-log-download.jpg"><img src="account-functions/raw-nginx-log-download.jpg" width="400" alt="Raw NGINX Log Download"></a><br><sub><b>Raw NGINX Log Download</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="account-functions/rearrange-an-account.jpg"><img src="account-functions/rearrange-an-account.jpg" width="400" alt="Rearrange an Account"></a><br><sub><b>Rearrange an Account</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="account-functions/reset-account-bandwidth-limit.jpg"><img src="account-functions/reset-account-bandwidth-limit.jpg" width="400" alt="Reset Account Bandwidth Limit"></a><br><sub><b>Reset Account Bandwidth Limit</b></sub> <sub>⏳ phase 2</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="account-functions/terminate-accounts.jpg"><img src="account-functions/terminate-accounts.jpg" width="400" alt="Terminate Accounts"></a><br><sub><b>Terminate Accounts</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="account-functions/unsuspend-bandwidth-exceeders.jpg"><img src="account-functions/unsuspend-bandwidth-exceeders.jpg" width="400" alt="Unsuspend Bandwidth Exceeders"></a><br><sub><b>Unsuspend Bandwidth Exceeders</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="account-functions/upgrade-downgrade-an-account.jpg"><img src="account-functions/upgrade-downgrade-an-account.jpg" width="400" alt="Upgrade/Downgrade an Account"></a><br><sub><b>Upgrade/Downgrade an Account</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="account-functions/web-log-retention.jpg"><img src="account-functions/web-log-retention.jpg" width="400" alt="Web Log Retention"></a><br><sub><b>Web Log Retention</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="account-functions/web-template-editor.jpg"><img src="account-functions/web-template-editor.jpg" width="400" alt="Web Template Editor"></a><br><sub><b>Web Template Editor</b></sub> <sub>⏳ phase 2</sub></td></tr></table>
 
-## 15. Multi Account Functions
+## 15. Multi Account Functions — 0/2 live
 
-- [Change Multiple Sites' IP Addresses](multi-account-functions/change-multiple-sites-ip-addresses.jpg)
-- [Modify/Upgrade Multiple Accounts](multi-account-functions/modify-upgrade-multiple-accounts.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="multi-account-functions/change-multiple-sites-ip-addresses.jpg"><img src="multi-account-functions/change-multiple-sites-ip-addresses.jpg" width="400" alt="Change Multiple Sites' IP Addresses"></a><br><sub><b>Change Multiple Sites' IP Addresses</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="multi-account-functions/modify-upgrade-multiple-accounts.jpg"><img src="multi-account-functions/modify-upgrade-multiple-accounts.jpg" width="400" alt="Modify/Upgrade Multiple Accounts"></a><br><sub><b>Modify/Upgrade Multiple Accounts</b></sub> <sub>⏳ phase 2</sub></td></tr></table>
 
-## 16. Transfers
+## 16. Transfers — 0/4 live
 
-- [Convert Addon Domain to Account](transfers/convert-addon-domain-to-account.jpg)
-- [Review Transfers and Restores](transfers/review-transfers-and-restores.jpg)
-- [Transfer or Restore a cPanel Account](transfers/transfer-or-restore-a-cpanel-account.jpg)
-- [Transfer Tool](transfers/transfer-tool.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="transfers/convert-addon-domain-to-account.jpg"><img src="transfers/convert-addon-domain-to-account.jpg" width="400" alt="Convert Addon Domain to Account"></a><br><sub><b>Convert Addon Domain to Account</b></sub> <sub>⏳ phase 4</sub></td><td align="center" valign="top" width="33%"><a href="transfers/review-transfers-and-restores.jpg"><img src="transfers/review-transfers-and-restores.jpg" width="400" alt="Review Transfers and Restores"></a><br><sub><b>Review Transfers and Restores</b></sub> <sub>⏳ phase 4</sub></td><td align="center" valign="top" width="33%"><a href="transfers/transfer-or-restore-a-cpanel-account.jpg"><img src="transfers/transfer-or-restore-a-cpanel-account.jpg" width="400" alt="Transfer or Restore a cPanel Account"></a><br><sub><b>Transfer or Restore a cPanel Account</b></sub> <sub>⏳ phase 4</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="transfers/transfer-tool.jpg"><img src="transfers/transfer-tool.jpg" width="400" alt="Transfer Tool"></a><br><sub><b>Transfer Tool</b></sub> <sub>⏳ phase 4</sub></td></tr></table>
 
-## 17. Themes
+## 17. Themes — 0/1 live
 
-- [Theme Manager](themes/theme-manager.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="themes/theme-manager.jpg"><img src="themes/theme-manager.jpg" width="400" alt="Theme Manager"></a><br><sub><b>Theme Manager</b></sub> <sub>⏳ phase 5</sub></td></tr></table>
 
-## 18. Packages
+## 18. Packages — 4/4 live
 
-- [Add a Package](packages/add-a-package.jpg)
-- [Delete a Package](packages/delete-a-package.jpg)
-- [Edit a Package](packages/edit-a-package.jpg)
-- [Feature Manager](packages/feature-manager.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="packages/add-a-package.jpg"><img src="packages/add-a-package.jpg" width="400" alt="Add a Package"></a><br><sub><b>Add a Package</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="packages/delete-a-package.jpg"><img src="packages/delete-a-package.jpg" width="400" alt="Delete a Package"></a><br><sub><b>Delete a Package</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="packages/edit-a-package.jpg"><img src="packages/edit-a-package.jpg" width="400" alt="Edit a Package"></a><br><sub><b>Edit a Package</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="packages/feature-manager.jpg"><img src="packages/feature-manager.jpg" width="400" alt="Feature Manager"></a><br><sub><b>Feature Manager</b></sub> <sub>✅ live</sub></td></tr></table>
 
-## 19. DNS Functions
+## 19. DNS Functions — 14/14 live
 
-- [Add a DNS Zone](dns-functions/add-a-dns-zone.jpg)
-- [Add an A Entry for Your Hostname](dns-functions/add-an-a-entry-for-your-hostname.jpg)
-- [Delete a DNS Zone](dns-functions/delete-a-dns-zone.jpg)
-- [DNS Zone Manager](dns-functions/dns-zone-manager.jpg)
-- [Edit Zone Templates](dns-functions/edit-zone-templates.jpg)
-- [Email DNS Record Manager](dns-functions/email-dns-record-manager.jpg)
-- [Email Routing Configuration](dns-functions/email-routing-configuration.jpg)
-- [Enable DKIM/SPF Globally](dns-functions/enable-dkim-spf-globally.jpg)
-- [Nameserver Record Report](dns-functions/nameserver-record-report.jpg)
-- [Park a Domain](dns-functions/park-a-domain.jpg)
-- [Perform a DNS Cleanup](dns-functions/perform-a-dns-cleanup.jpg)
-- [Set Zone TTL](dns-functions/set-zone-ttl.jpg)
-- [Setup/Edit Domain Forwarding](dns-functions/setup-edit-domain-forwarding.jpg)
-- [Synchronize DNS Records](dns-functions/synchronize-dns-records.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="dns-functions/add-a-dns-zone.jpg"><img src="dns-functions/add-a-dns-zone.jpg" width="400" alt="Add a DNS Zone"></a><br><sub><b>Add a DNS Zone</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="dns-functions/add-an-a-entry-for-your-hostname.jpg"><img src="dns-functions/add-an-a-entry-for-your-hostname.jpg" width="400" alt="Add an A Entry for Your Hostname"></a><br><sub><b>Add an A Entry for Your Hostname</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="dns-functions/delete-a-dns-zone.jpg"><img src="dns-functions/delete-a-dns-zone.jpg" width="400" alt="Delete a DNS Zone"></a><br><sub><b>Delete a DNS Zone</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="dns-functions/dns-zone-manager.jpg"><img src="dns-functions/dns-zone-manager.jpg" width="400" alt="DNS Zone Manager"></a><br><sub><b>DNS Zone Manager</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="dns-functions/edit-zone-templates.jpg"><img src="dns-functions/edit-zone-templates.jpg" width="400" alt="Edit Zone Templates"></a><br><sub><b>Edit Zone Templates</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="dns-functions/email-dns-record-manager.jpg"><img src="dns-functions/email-dns-record-manager.jpg" width="400" alt="Email DNS Record Manager"></a><br><sub><b>Email DNS Record Manager</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="dns-functions/email-routing-configuration.jpg"><img src="dns-functions/email-routing-configuration.jpg" width="400" alt="Email Routing Configuration"></a><br><sub><b>Email Routing Configuration</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="dns-functions/enable-dkim-spf-globally.jpg"><img src="dns-functions/enable-dkim-spf-globally.jpg" width="400" alt="Enable DKIM/SPF Globally"></a><br><sub><b>Enable DKIM/SPF Globally</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="dns-functions/nameserver-record-report.jpg"><img src="dns-functions/nameserver-record-report.jpg" width="400" alt="Nameserver Record Report"></a><br><sub><b>Nameserver Record Report</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="dns-functions/park-a-domain.jpg"><img src="dns-functions/park-a-domain.jpg" width="400" alt="Park a Domain"></a><br><sub><b>Park a Domain</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="dns-functions/perform-a-dns-cleanup.jpg"><img src="dns-functions/perform-a-dns-cleanup.jpg" width="400" alt="Perform a DNS Cleanup"></a><br><sub><b>Perform a DNS Cleanup</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="dns-functions/set-zone-ttl.jpg"><img src="dns-functions/set-zone-ttl.jpg" width="400" alt="Set Zone TTL"></a><br><sub><b>Set Zone TTL</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="dns-functions/setup-edit-domain-forwarding.jpg"><img src="dns-functions/setup-edit-domain-forwarding.jpg" width="400" alt="Setup/Edit Domain Forwarding"></a><br><sub><b>Setup/Edit Domain Forwarding</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="dns-functions/synchronize-dns-records.jpg"><img src="dns-functions/synchronize-dns-records.jpg" width="400" alt="Synchronize DNS Records"></a><br><sub><b>Synchronize DNS Records</b></sub> <sub>✅ live</sub></td></tr></table>
 
-## 20. Database Services
+## 20. Database Services — 12/12 live
 
-- [Change Database Root Password](database-services/change-database-root-password.jpg)
-- [Change Database User Password](database-services/change-database-user-password.jpg)
-- [Database Map Tool](database-services/database-map-tool.jpg)
-- [Edit Database Configuration](database-services/edit-database-configuration.jpg)
-- [Manage Database Access Hosts](database-services/manage-database-access-hosts.jpg)
-- [Manage Database Profiles](database-services/manage-database-profiles.jpg)
-- [Manage Database Users](database-services/manage-database-users.jpg)
-- [Manage Databases](database-services/manage-databases.jpg)
-- [phpMyAdmin](database-services/phpmyadmin.jpg)
-- [Repair Databases](database-services/repair-databases.jpg)
-- [Show Database Processes](database-services/show-database-processes.jpg)
-- [Upgrade Database Version](database-services/upgrade-database-version.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="database-services/change-database-root-password.jpg"><img src="database-services/change-database-root-password.jpg" width="400" alt="Change Database Root Password"></a><br><sub><b>Change Database Root Password</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="database-services/change-database-user-password.jpg"><img src="database-services/change-database-user-password.jpg" width="400" alt="Change Database User Password"></a><br><sub><b>Change Database User Password</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="database-services/database-map-tool.jpg"><img src="database-services/database-map-tool.jpg" width="400" alt="Database Map Tool"></a><br><sub><b>Database Map Tool</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="database-services/edit-database-configuration.jpg"><img src="database-services/edit-database-configuration.jpg" width="400" alt="Edit Database Configuration"></a><br><sub><b>Edit Database Configuration</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="database-services/manage-database-access-hosts.jpg"><img src="database-services/manage-database-access-hosts.jpg" width="400" alt="Manage Database Access Hosts"></a><br><sub><b>Manage Database Access Hosts</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="database-services/manage-database-profiles.jpg"><img src="database-services/manage-database-profiles.jpg" width="400" alt="Manage Database Profiles"></a><br><sub><b>Manage Database Profiles</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="database-services/manage-database-users.jpg"><img src="database-services/manage-database-users.jpg" width="400" alt="Manage Database Users"></a><br><sub><b>Manage Database Users</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="database-services/manage-databases.jpg"><img src="database-services/manage-databases.jpg" width="400" alt="Manage Databases"></a><br><sub><b>Manage Databases</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="database-services/phpmyadmin.jpg"><img src="database-services/phpmyadmin.jpg" width="400" alt="phpMyAdmin"></a><br><sub><b>phpMyAdmin</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="database-services/repair-databases.jpg"><img src="database-services/repair-databases.jpg" width="400" alt="Repair Databases"></a><br><sub><b>Repair Databases</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="database-services/show-database-processes.jpg"><img src="database-services/show-database-processes.jpg" width="400" alt="Show Database Processes"></a><br><sub><b>Show Database Processes</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="database-services/upgrade-database-version.jpg"><img src="database-services/upgrade-database-version.jpg" width="400" alt="Upgrade Database Version"></a><br><sub><b>Upgrade Database Version</b></sub> <sub>✅ live</sub></td></tr></table>
 
-## 21. IP Functions
+## 21. IP Functions — 9/9 live
 
-- [IPv6 Ranges](ip-functions/ipv6-ranges.jpg)
-- [Add a New IP Address](ip-functions/add-a-new-ip-address.jpg)
-- [Assign IPv6 Address](ip-functions/assign-ipv6-address.jpg)
-- [Configure Remote Service IPs](ip-functions/configure-remote-service-ips.jpg)
-- [IP Migration Wizard](ip-functions/ip-migration-wizard.jpg)
-- [Rebuild the IP Address Pool](ip-functions/rebuild-the-ip-address-pool.jpg)
-- [Show IP Address Usage](ip-functions/show-ip-address-usage.jpg)
-- [Show or Delete Current IP Addresses](ip-functions/show-or-delete-current-ip-addresses.jpg)
-- [Show/Edit Reserved IPs](ip-functions/show-edit-reserved-ips.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="ip-functions/ipv6-ranges.jpg"><img src="ip-functions/ipv6-ranges.jpg" width="400" alt="IPv6 Ranges"></a><br><sub><b>IPv6 Ranges</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="ip-functions/add-a-new-ip-address.jpg"><img src="ip-functions/add-a-new-ip-address.jpg" width="400" alt="Add a New IP Address"></a><br><sub><b>Add a New IP Address</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="ip-functions/assign-ipv6-address.jpg"><img src="ip-functions/assign-ipv6-address.jpg" width="400" alt="Assign IPv6 Address"></a><br><sub><b>Assign IPv6 Address</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="ip-functions/configure-remote-service-ips.jpg"><img src="ip-functions/configure-remote-service-ips.jpg" width="400" alt="Configure Remote Service IPs"></a><br><sub><b>Configure Remote Service IPs</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="ip-functions/ip-migration-wizard.jpg"><img src="ip-functions/ip-migration-wizard.jpg" width="400" alt="IP Migration Wizard"></a><br><sub><b>IP Migration Wizard</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="ip-functions/rebuild-the-ip-address-pool.jpg"><img src="ip-functions/rebuild-the-ip-address-pool.jpg" width="400" alt="Rebuild the IP Address Pool"></a><br><sub><b>Rebuild the IP Address Pool</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="ip-functions/show-ip-address-usage.jpg"><img src="ip-functions/show-ip-address-usage.jpg" width="400" alt="Show IP Address Usage"></a><br><sub><b>Show IP Address Usage</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="ip-functions/show-or-delete-current-ip-addresses.jpg"><img src="ip-functions/show-or-delete-current-ip-addresses.jpg" width="400" alt="Show or Delete Current IP Addresses"></a><br><sub><b>Show or Delete Current IP Addresses</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="ip-functions/show-edit-reserved-ips.jpg"><img src="ip-functions/show-edit-reserved-ips.jpg" width="400" alt="Show/Edit Reserved IPs"></a><br><sub><b>Show/Edit Reserved IPs</b></sub> <sub>✅ live</sub></td></tr></table>
 
-## 22. Software
+## 22. Software — 10/10 live
 
-- [Install a Perl Module](software/install-a-perl-module.jpg)
-- [Install Distro Packages](software/install-distro-packages.jpg)
-- [Module Installers](software/module-installers.jpg)
-- [MultiPHP INI Editor](software/multiphp-ini-editor.jpg)
-- [MultiPHP Manager](software/multiphp-manager.jpg)
-- [NGINX Manager](software/nginx-manager.jpg)
-- [Rebuild RPM Database](software/rebuild-rpm-database.jpg)
-- [System Update](software/system-update.jpg)
-- [Update Server Software](software/update-server-software.jpg)
-- [EasyApache 4](software/easyapache-4.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="software/install-a-perl-module.jpg"><img src="software/install-a-perl-module.jpg" width="400" alt="Install a Perl Module"></a><br><sub><b>Install a Perl Module</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="software/install-distro-packages.jpg"><img src="software/install-distro-packages.jpg" width="400" alt="Install Distro Packages"></a><br><sub><b>Install Distro Packages</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="software/module-installers.jpg"><img src="software/module-installers.jpg" width="400" alt="Module Installers"></a><br><sub><b>Module Installers</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="software/multiphp-ini-editor.jpg"><img src="software/multiphp-ini-editor.jpg" width="400" alt="MultiPHP INI Editor"></a><br><sub><b>MultiPHP INI Editor</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="software/multiphp-manager.jpg"><img src="software/multiphp-manager.jpg" width="400" alt="MultiPHP Manager"></a><br><sub><b>MultiPHP Manager</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="software/nginx-manager.jpg"><img src="software/nginx-manager.jpg" width="400" alt="NGINX Manager"></a><br><sub><b>NGINX Manager</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="software/rebuild-rpm-database.jpg"><img src="software/rebuild-rpm-database.jpg" width="400" alt="Rebuild RPM Database"></a><br><sub><b>Rebuild RPM Database</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="software/system-update.jpg"><img src="software/system-update.jpg" width="400" alt="System Update"></a><br><sub><b>System Update</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="software/update-server-software.jpg"><img src="software/update-server-software.jpg" width="400" alt="Update Server Software"></a><br><sub><b>Update Server Software</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="software/easyapache-4.jpg"><img src="software/easyapache-4.jpg" width="400" alt="EasyApache 4"></a><br><sub><b>EasyApache 4</b></sub> <sub>✅ live</sub></td></tr></table>
 
-## 23. Email
+## 23. Email — 13/13 live
 
-- [Email Deliverability](email/email-deliverability.jpg)
-- [Filter Incoming Emails by Country](email/filter-incoming-emails-by-country.jpg)
-- [Filter Incoming Emails by Domain](email/filter-incoming-emails-by-domain.jpg)
-- [Greylisting](email/greylisting.jpg)
-- [Mail Delivery Reports](email/mail-delivery-reports.jpg)
-- [Mail Queue Manager](email/mail-queue-manager.jpg)
-- [Mail Troubleshooter](email/mail-troubleshooter.jpg)
-- [Mailbox Conversion](email/mailbox-conversion.jpg)
-- [Repair Mailbox Permissions](email/repair-mailbox-permissions.jpg)
-- [Spamd Startup Configuration](email/spamd-startup-configuration.jpg)
-- [View Mail Statistics Summary](email/view-mail-statistics-summary.jpg)
-- [View Relayers](email/view-relayers.jpg)
-- [View Sent Summary](email/view-sent-summary.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="email/email-deliverability.jpg"><img src="email/email-deliverability.jpg" width="400" alt="Email Deliverability"></a><br><sub><b>Email Deliverability</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="email/filter-incoming-emails-by-country.jpg"><img src="email/filter-incoming-emails-by-country.jpg" width="400" alt="Filter Incoming Emails by Country"></a><br><sub><b>Filter Incoming Emails by Country</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="email/filter-incoming-emails-by-domain.jpg"><img src="email/filter-incoming-emails-by-domain.jpg" width="400" alt="Filter Incoming Emails by Domain"></a><br><sub><b>Filter Incoming Emails by Domain</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="email/greylisting.jpg"><img src="email/greylisting.jpg" width="400" alt="Greylisting"></a><br><sub><b>Greylisting</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="email/mail-delivery-reports.jpg"><img src="email/mail-delivery-reports.jpg" width="400" alt="Mail Delivery Reports"></a><br><sub><b>Mail Delivery Reports</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="email/mail-queue-manager.jpg"><img src="email/mail-queue-manager.jpg" width="400" alt="Mail Queue Manager"></a><br><sub><b>Mail Queue Manager</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="email/mail-troubleshooter.jpg"><img src="email/mail-troubleshooter.jpg" width="400" alt="Mail Troubleshooter"></a><br><sub><b>Mail Troubleshooter</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="email/mailbox-conversion.jpg"><img src="email/mailbox-conversion.jpg" width="400" alt="Mailbox Conversion"></a><br><sub><b>Mailbox Conversion</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="email/repair-mailbox-permissions.jpg"><img src="email/repair-mailbox-permissions.jpg" width="400" alt="Repair Mailbox Permissions"></a><br><sub><b>Repair Mailbox Permissions</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="email/spamd-startup-configuration.jpg"><img src="email/spamd-startup-configuration.jpg" width="400" alt="Spamd Startup Configuration"></a><br><sub><b>Spamd Startup Configuration</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="email/view-mail-statistics-summary.jpg"><img src="email/view-mail-statistics-summary.jpg" width="400" alt="View Mail Statistics Summary"></a><br><sub><b>View Mail Statistics Summary</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="email/view-relayers.jpg"><img src="email/view-relayers.jpg" width="400" alt="View Relayers"></a><br><sub><b>View Relayers</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="email/view-sent-summary.jpg"><img src="email/view-sent-summary.jpg" width="400" alt="View Sent Summary"></a><br><sub><b>View Sent Summary</b></sub> <sub>✅ live</sub></td></tr></table>
 
-## 24. System Health
+## 24. System Health — 3/4 live
 
-- [Background Process Killer](system-health/background-process-killer.jpg)
-- [Process Manager](system-health/process-manager.jpg)
-- [Show Current Disk Usage](system-health/show-current-disk-usage.jpg)
-- [Show Current Running Processes](system-health/show-current-running-processes.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="system-health/background-process-killer.jpg"><img src="system-health/background-process-killer.jpg" width="400" alt="Background Process Killer"></a><br><sub><b>Background Process Killer</b></sub> <sub>⏳ phase 2</sub></td><td align="center" valign="top" width="33%"><a href="system-health/process-manager.jpg"><img src="system-health/process-manager.jpg" width="400" alt="Process Manager"></a><br><sub><b>Process Manager</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="system-health/show-current-disk-usage.jpg"><img src="system-health/show-current-disk-usage.jpg" width="400" alt="Show Current Disk Usage"></a><br><sub><b>Show Current Disk Usage</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="system-health/show-current-running-processes.jpg"><img src="system-health/show-current-running-processes.jpg" width="400" alt="Show Current Running Processes"></a><br><sub><b>Show Current Running Processes</b></sub> <sub>✅ live</sub></td></tr></table>
 
-## 25. cPanel
+## 25. cPanel — 0/6 live
 
-- [Change Log](cpanel/change-log.jpg)
-- [Customization](cpanel/customization.jpg)
-- [Manage Plugins](cpanel/manage-plugins.jpg)
-- [Modify cPanel & WHM News](cpanel/modify-cpanel-and-whm-news.jpg)
-- [Reset a Mailman Password](cpanel/reset-a-mailman-password.jpg)
-- [Upgrade to Latest Version](cpanel/upgrade-to-latest-version.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="cpanel/change-log.jpg"><img src="cpanel/change-log.jpg" width="400" alt="Change Log"></a><br><sub><b>Change Log</b></sub> <sub>⏳ phase 5</sub></td><td align="center" valign="top" width="33%"><a href="cpanel/customization.jpg"><img src="cpanel/customization.jpg" width="400" alt="Customization"></a><br><sub><b>Customization</b></sub> <sub>⏳ phase 5</sub></td><td align="center" valign="top" width="33%"><a href="cpanel/manage-plugins.jpg"><img src="cpanel/manage-plugins.jpg" width="400" alt="Manage Plugins"></a><br><sub><b>Manage Plugins</b></sub> <sub>⏳ phase 5</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="cpanel/modify-cpanel-and-whm-news.jpg"><img src="cpanel/modify-cpanel-and-whm-news.jpg" width="400" alt="Modify cPanel & WHM News"></a><br><sub><b>Modify cPanel & WHM News</b></sub> <sub>⏳ phase 5</sub></td><td align="center" valign="top" width="33%"><a href="cpanel/reset-a-mailman-password.jpg"><img src="cpanel/reset-a-mailman-password.jpg" width="400" alt="Reset a Mailman Password"></a><br><sub><b>Reset a Mailman Password</b></sub> <sub>⏳ phase 5</sub></td><td align="center" valign="top" width="33%"><a href="cpanel/upgrade-to-latest-version.jpg"><img src="cpanel/upgrade-to-latest-version.jpg" width="400" alt="Upgrade to Latest Version"></a><br><sub><b>Upgrade to Latest Version</b></sub> <sub>⏳ phase 5</sub></td></tr></table>
 
-## 26. SSL/TLS
+## 26. SSL/TLS — 7/7 live
 
-- [Generate an SSL Certificate and Signing Request](ssl-tls/generate-an-ssl-certificate-and-signing-request.jpg)
-- [Install an SSL Certificate on a Domain](ssl-tls/install-an-ssl-certificate-on-a-domain.jpg)
-- [Manage AutoSSL](ssl-tls/manage-autossl.jpg)
-- [Manage SSL Hosts](ssl-tls/manage-ssl-hosts.jpg)
-- [Purchase and Install an SSL Certificate](ssl-tls/purchase-and-install-an-ssl-certificate.jpg)
-- [SSL Storage Manager](ssl-tls/ssl-storage-manager.jpg)
-- [SSL/TLS Configuration](ssl-tls/ssl-tls-configuration.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="ssl-tls/generate-an-ssl-certificate-and-signing-request.jpg"><img src="ssl-tls/generate-an-ssl-certificate-and-signing-request.jpg" width="400" alt="Generate an SSL Certificate and Signing Request"></a><br><sub><b>Generate an SSL Certificate and Signing Request</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="ssl-tls/install-an-ssl-certificate-on-a-domain.jpg"><img src="ssl-tls/install-an-ssl-certificate-on-a-domain.jpg" width="400" alt="Install an SSL Certificate on a Domain"></a><br><sub><b>Install an SSL Certificate on a Domain</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="ssl-tls/manage-autossl.jpg"><img src="ssl-tls/manage-autossl.jpg" width="400" alt="Manage AutoSSL"></a><br><sub><b>Manage AutoSSL</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="ssl-tls/manage-ssl-hosts.jpg"><img src="ssl-tls/manage-ssl-hosts.jpg" width="400" alt="Manage SSL Hosts"></a><br><sub><b>Manage SSL Hosts</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="ssl-tls/purchase-and-install-an-ssl-certificate.jpg"><img src="ssl-tls/purchase-and-install-an-ssl-certificate.jpg" width="400" alt="Purchase and Install an SSL Certificate"></a><br><sub><b>Purchase and Install an SSL Certificate</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="ssl-tls/ssl-storage-manager.jpg"><img src="ssl-tls/ssl-storage-manager.jpg" width="400" alt="SSL Storage Manager"></a><br><sub><b>SSL Storage Manager</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="ssl-tls/ssl-tls-configuration.jpg"><img src="ssl-tls/ssl-tls-configuration.jpg" width="400" alt="SSL/TLS Configuration"></a><br><sub><b>SSL/TLS Configuration</b></sub> <sub>✅ live</sub></td></tr></table>
 
-## 27. Market
+## 27. Market — 0/1 live
 
-- [Market Provider Manager](market/market-provider-manager.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="market/market-provider-manager.jpg"><img src="market/market-provider-manager.jpg" width="400" alt="Market Provider Manager"></a><br><sub><b>Market Provider Manager</b></sub> <sub>⏳ phase 5</sub></td></tr></table>
 
-## 28. Restart Services
+## 28. Restart Services — 8/8 live
 
-- [Database Server](restart-services/database-server.jpg)
-- [DNS Server](restart-services/dns-server.jpg)
-- [HTTP Server (Apache)](restart-services/http-server-apache.jpg)
-- [IMAP Server](restart-services/imap-server.jpg)
-- [Mail Server (Exim)](restart-services/mail-server-exim.jpg)
-- [Mailing List Manager (Mailman)](restart-services/mailing-list-manager-mailman.jpg)
-- [PHP-FPM service for Apache](restart-services/php-fpm-service-for-apache.jpg)
-- [SSH Server (OpenSSH)](restart-services/ssh-server-openssh.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="restart-services/database-server.jpg"><img src="restart-services/database-server.jpg" width="400" alt="Database Server"></a><br><sub><b>Database Server</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="restart-services/dns-server.jpg"><img src="restart-services/dns-server.jpg" width="400" alt="DNS Server"></a><br><sub><b>DNS Server</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="restart-services/http-server-apache.jpg"><img src="restart-services/http-server-apache.jpg" width="400" alt="HTTP Server (Apache)"></a><br><sub><b>HTTP Server (Apache)</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="restart-services/imap-server.jpg"><img src="restart-services/imap-server.jpg" width="400" alt="IMAP Server"></a><br><sub><b>IMAP Server</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="restart-services/mail-server-exim.jpg"><img src="restart-services/mail-server-exim.jpg" width="400" alt="Mail Server (Exim)"></a><br><sub><b>Mail Server (Exim)</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="restart-services/mailing-list-manager-mailman.jpg"><img src="restart-services/mailing-list-manager-mailman.jpg" width="400" alt="Mailing List Manager (Mailman)"></a><br><sub><b>Mailing List Manager (Mailman)</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="restart-services/php-fpm-service-for-apache.jpg"><img src="restart-services/php-fpm-service-for-apache.jpg" width="400" alt="PHP-FPM service for Apache"></a><br><sub><b>PHP-FPM service for Apache</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="restart-services/ssh-server-openssh.jpg"><img src="restart-services/ssh-server-openssh.jpg" width="400" alt="SSH Server (OpenSSH)"></a><br><sub><b>SSH Server (OpenSSH)</b></sub> <sub>✅ live</sub></td></tr></table>
 
-## 29. Development
+## 29. Development — 8/8 live
 
-- [OpenAPI Documentation for cPanel](development/openapi-documentation-for-cpanel.jpg)
-- [OpenAPI Documentation for WHM](development/openapi-documentation-for-whm.jpg)
-- [Apps Managed by AppConfig](development/apps-managed-by-appconfig.jpg)
-- [cPanel Development Forum](development/cpanel-development-forum.jpg)
-- [cPanel Plugin File Generator](development/cpanel-plugin-file-generator.jpg)
-- [Developer Documentation](development/developer-documentation.jpg)
-- [Manage API Tokens](development/manage-api-tokens.jpg)
-- [Manage Hooks](development/manage-hooks.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="development/openapi-documentation-for-cpanel.jpg"><img src="development/openapi-documentation-for-cpanel.jpg" width="400" alt="OpenAPI Documentation for cPanel"></a><br><sub><b>OpenAPI Documentation for cPanel</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="development/openapi-documentation-for-whm.jpg"><img src="development/openapi-documentation-for-whm.jpg" width="400" alt="OpenAPI Documentation for WHM"></a><br><sub><b>OpenAPI Documentation for WHM</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="development/apps-managed-by-appconfig.jpg"><img src="development/apps-managed-by-appconfig.jpg" width="400" alt="Apps Managed by AppConfig"></a><br><sub><b>Apps Managed by AppConfig</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="development/cpanel-development-forum.jpg"><img src="development/cpanel-development-forum.jpg" width="400" alt="cPanel Development Forum"></a><br><sub><b>cPanel Development Forum</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="development/cpanel-plugin-file-generator.jpg"><img src="development/cpanel-plugin-file-generator.jpg" width="400" alt="cPanel Plugin File Generator"></a><br><sub><b>cPanel Plugin File Generator</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="development/developer-documentation.jpg"><img src="development/developer-documentation.jpg" width="400" alt="Developer Documentation"></a><br><sub><b>Developer Documentation</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="development/manage-api-tokens.jpg"><img src="development/manage-api-tokens.jpg" width="400" alt="Manage API Tokens"></a><br><sub><b>Manage API Tokens</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="development/manage-hooks.jpg"><img src="development/manage-hooks.jpg" width="400" alt="Manage Hooks"></a><br><sub><b>Manage Hooks</b></sub> <sub>✅ live</sub></td></tr></table>
 
-## 30. Plugins
+## 30. Plugins — 0/3 live
 
-- [ImunifyAV](plugins/imunifyav.jpg)
-- [Server Monitoring](plugins/server-monitoring.jpg)
-- [WP Toolkit](plugins/wp-toolkit.jpg)
+<table><tr><td align="center" valign="top" width="33%"><a href="plugins/imunifyav.jpg"><img src="plugins/imunifyav.jpg" width="400" alt="ImunifyAV"></a><br><sub><b>ImunifyAV</b></sub> <sub>⏳ phase 5</sub></td><td align="center" valign="top" width="33%"><a href="plugins/server-monitoring.jpg"><img src="plugins/server-monitoring.jpg" width="400" alt="Server Monitoring"></a><br><sub><b>Server Monitoring</b></sub> <sub>⏳ phase 5</sub></td><td align="center" valign="top" width="33%"><a href="plugins/wp-toolkit.jpg"><img src="plugins/wp-toolkit.jpg" width="400" alt="WP Toolkit"></a><br><sub><b>WP Toolkit</b></sub> <sub>⏳ phase 5</sub></td></tr></table>

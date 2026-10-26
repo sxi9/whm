@@ -1,33 +1,24 @@
 # Screenshots
 
-Captured by `e2e/ui-check.cjs` (Playwright, 1440×900) against the built interface served by
-the API in development mode on 2026-10-25. The host had none of the managed daemons
-installed, so service rows read "Not installed" — on a provisioned server they show PID,
-memory, restarts and Start/Stop/Restart actions.
+Updated 2026-10-26 at commit `e1c8c0f`. All images are captured automatically (Playwright) against the built interface served by the API, and each carries a label bar naming the screen, whether it is live or a placeholder, the date and the commit. They are regenerated at every milestone (`e2e/screenshots.sh`).
 
-| File | What it shows |
-|---|---|
-| [01-login.png](01-login.png) | Login page |
-| [02-dashboard.png](02-dashboard.png) | Home: Favorites, Tools grid, Statistics panel (live load/memory/disk/OS), service status dots |
-| [02-dashboard-full.png](02-dashboard-full.png) | Home, full page: all 30 categories in the Tools grid |
-| [03-create-account-form.png](03-create-account-form.png) | Create a New Account — auto-suggested username, password strength meter and generator, package selector |
-| [04-create-account-result.png](04-create-account-result.png) | Account created — real Linux user provisioned; per-step provisioning status |
-| [05-list-accounts.png](05-list-accounts.png) | List Accounts — sortable, searchable, row actions (Modify, Suspend, Password, Upgrade, Terminate) |
-| [06-service-status.png](06-service-status.png) | Service Status — monitored services and their state |
-| [07-server-information.png](07-server-information.png) | Server Information — load, uptime, memory/swap meters, disks, network interfaces |
-| [08-feature-manager.png](08-feature-manager.png) | Feature Manager — per-plan feature toggles |
-| [09-tweak-settings.png](09-tweak-settings.png) | Tweak Settings — grouped switches with sticky Save/Reset |
-| [10-generic-function-page.png](10-generic-function-page.png) | Placeholder shown by functions whose screen is scheduled for a later build phase |
-| [11-sidebar-search.png](11-sidebar-search.png) | Sidebar filter narrowing the categories to matching functions |
-| [12-top-search.png](12-top-search.png) | Global search (Alt + /) with keyboard navigation |
-| [13-restart-service.png](13-restart-service.png) | Restart Services › HTTP Server (Apache) — action page with current state |
-| [14-process-manager.png](14-process-manager.png) | Process Manager — live processes with kill / force kill / renice |
+- **[Every page →](pages/README.md)** — all 212 function pages grouped by category (139/212 live) plus core pages.
 
-Regenerate: `BASE=http://127.0.0.1:2086 PASSWORD='<root password>' OUT=docs/screenshots node e2e/ui-check.cjs`.
+## Flow
 
-## Every page
+Login → dashboard → creating an account through the form → lists, status pages, configuration and search.
 
-[`pages/README.md`](pages/README.md) indexes a screenshot of **every one of the 212 function
-pages** (grouped by category) plus login, home, audit log and change-password, captured with
-`e2e/screenshot-all.cjs`. Regenerate at milestones (each full set is ~16 MB):
-`BASE=http://127.0.0.1:2086 PASSWORD='<root password>' OUT=docs/screenshots node e2e/screenshot-all.cjs`.
+<table><tr><td align="center" valign="top" width="33%"><a href="01-login.png"><img src="01-login.png" width="400" alt="Login"></a><br><sub><b>Login</b></sub></td><td align="center" valign="top" width="33%"><a href="02-dashboard.png"><img src="02-dashboard.png" width="400" alt="Home dashboard"></a><br><sub><b>Home dashboard</b></sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="02-dashboard-full.png"><img src="02-dashboard-full.png" width="400" alt="Home dashboard (full page)"></a><br><sub><b>Home dashboard (full page)</b></sub></td><td align="center" valign="top" width="33%"><a href="03-create-account-form.png"><img src="03-create-account-form.png" width="400" alt="Create a New Account — form"></a><br><sub><b>Create a New Account — form</b></sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="04-create-account-result.png"><img src="04-create-account-result.png" width="400" alt="Create a New Account — result"></a><br><sub><b>Create a New Account — result</b></sub></td><td align="center" valign="top" width="33%"><a href="05-list-accounts.png"><img src="05-list-accounts.png" width="400" alt="List Accounts"></a><br><sub><b>List Accounts</b></sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="06-service-status.png"><img src="06-service-status.png" width="400" alt="Service Status"></a><br><sub><b>Service Status</b></sub></td><td align="center" valign="top" width="33%"><a href="07-server-information.png"><img src="07-server-information.png" width="400" alt="Server Information"></a><br><sub><b>Server Information</b></sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="08-feature-manager.png"><img src="08-feature-manager.png" width="400" alt="Feature Manager"></a><br><sub><b>Feature Manager</b></sub></td><td align="center" valign="top" width="33%"><a href="09-tweak-settings.png"><img src="09-tweak-settings.png" width="400" alt="Tweak Settings"></a><br><sub><b>Tweak Settings</b></sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="10-generic-function-page.png"><img src="10-generic-function-page.png" width="400" alt="Placeholder for a not-yet-built function"></a><br><sub><b>Placeholder for a not-yet-built function</b></sub></td><td align="center" valign="top" width="33%"><a href="11-sidebar-search.png"><img src="11-sidebar-search.png" width="400" alt="Sidebar search"></a><br><sub><b>Sidebar search</b></sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="12-top-search.png"><img src="12-top-search.png" width="400" alt="Global search"></a><br><sub><b>Global search</b></sub></td><td align="center" valign="top" width="33%"><a href="13-restart-service.png"><img src="13-restart-service.png" width="400" alt="Restart HTTP Server (Apache)"></a><br><sub><b>Restart HTTP Server (Apache)</b></sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="14-process-manager.png"><img src="14-process-manager.png" width="400" alt="Process Manager"></a><br><sub><b>Process Manager</b></sub></td></tr></table>
+
+## Regenerate
+
+```bash
+BASE=http://127.0.0.1:2086 PASSWORD='<root password>' bash e2e/screenshots.sh   # flow shots + every page + galleries
+```

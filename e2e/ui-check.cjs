@@ -35,7 +35,8 @@ async function stamp(page, text) {
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
-  page.on('console', (m) => { if (m.type() === 'error') errors.push(`console: ${m.text()}`); });
+  // The SPA probes /api/auth/me before login; that 401 is expected, not an error.
+  page.on('console', (m) => { if (m.type() === 'error' && !/status of 401/.test(m.text())) errors.push(`console: ${m.text()}`); });
   page.on('response', (r) => { if (r.status() >= 500) errors.push(`http ${r.status()} ${r.url()}`); });
   const shot = async (name) => { await stamp(page, `WHM › ${LABELS[name] || name} · ${DATE} · ${SHA}`); await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: false }); };
 
