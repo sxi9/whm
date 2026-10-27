@@ -423,15 +423,26 @@ describe('state machine and events', () => {
       expect(auditRows(ctx, 'license.fingerprint_changed')).toHaveLength(1);
       hub.messages = [];
 
-      hub.handlers['/v1/checkin'] = (body, h2) => h2.answer(body, { status: 409, error: { code: 'fingerprint_mismatch', message: 'cloned', activations: [{ id: 'act_test0001', hostname: 'srv', last_checkin: null }] } });
+      // drift travels as an integer percent (the hub cannot sign a float); a partial clone is 80 %
+      hub.handlers['/v1/checkin'] = (body, h2) => h2.answer(body, { status: 409, error: { code: 'fingerprint_mismatch', message: 'cloned', drift_pct: 80, activations: [{ id: 'act_test0001', hostname: 'srv', last_checkin: null }] } });
       ci = await app.post('/api/license/checkin');
       expect(ci.body.data).toMatchObject({ ok: false, code: 'fingerprint_mismatch', status: 'degraded' });
       expect(ctx.license.get().reason).toBe('fingerprint_mismatch');
+      expect(ctx.license.get().hubDriftPct).toBe(80);
+      expect(ctx.license.get().knownActivations).toEqual([{ id: 'act_test0001', hostname: 'srv', last_checkin: null }]);
       expect((await app.post('/api/accounts', { username: 'blocked', domain: 'blocked.example', password: 'Str0ng-Passw0rd!' })).status).toBe(423);
 
       delete hub.handlers['/v1/checkin'];
       ci = await app.post('/api/license/checkin');
       expect(ci.body.data).toMatchObject({ ok: true, status: 'active' });
+      expect(ctx.license.get().hubDriftPct).toBe(null);
+      // an out-of-range drift field is ignored rather than persisted
+      hub.handlers['/v1/checkin'] = (body, h2) => h2.answer(body, { status: 409, error: { code: 'fingerprint_mismatch', message: 'cloned', drift_pct: 180 } });
+      await app.post('/api/license/checkin');
+      expect(ctx.license.get().reason).toBe('fingerprint_mismatch');
+      expect(ctx.license.get().hubDriftPct).toBe(null);
+      delete hub.handlers['/v1/checkin'];
+      await app.post('/api/license/checkin');
 
       hub.handlers['/v1/checkin'] = (body, h2) => h2.answer(body, { status: 403, error: { code: 'deactivated', message: 'transferred' } });
       ci = await app.post('/api/license/checkin');

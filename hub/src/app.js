@@ -52,10 +52,21 @@ export function signedMiddleware(ctx) {
     if (req.method !== 'POST') return next();
     const nonce = req.get('x-whm-nonce') || null;
     const originalJson = res.json.bind(res);
+    // Fail closed: a body the hub cannot sign (no active key, a non-canonical
+    // value such as a float) never leaves as an unsigned 2xx/4xx. The 500 that
+    // replaces it is signed when the key is usable, and logged with the route.
     res.json = (payload) => {
       const out = { ...payload, meta: { ...(payload?.meta || {}), nonce } };
-      try { ctx.keys.signResponse(res, out); } catch (err) { ctx.logger.error({ err }, 'cannot sign response'); }
-      return originalJson(out);
+      try {
+        ctx.keys.signResponse(res, out);
+        return originalJson(out);
+      } catch (err) {
+        ctx.logger.error({ err, requestId: req.id, route: `${req.method} ${req.originalUrl.split('?')[0]}`, status: res.statusCode }, 'cannot sign response');
+        const failure = { error: { code: 'signing_failed', message: 'The hub could not sign its response', requestId: req.id }, meta: { nonce } };
+        res.status(500);
+        try { ctx.keys.signResponse(res, failure); } catch { res.removeHeader('X-WHM-Signature'); }
+        return originalJson(failure);
+      }
     };
     try {
       if (req.bodyError) throw req.bodyError;

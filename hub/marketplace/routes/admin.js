@@ -83,6 +83,7 @@ export function adminRoutes(m) {
 
   // Money out.
   r.get('/payouts', read, validate({ query: pagination.extend({ status: z.enum(['pending', 'approved', 'paid', 'failed', 'held']).optional(), developer_id: idField.optional() }) }), (req, res) => res.json(m.payouts.list(req.query)));
+  r.get('/payouts/:id', read, validate({ params: z.object({ id: idField }) }), (req, res) => res.json({ data: m.payouts.statement(req.params.id) }));
   r.post('/payouts/close', market('billing'), stepUp, validate({ body: z.object({ period_start: z.string().datetime().optional(), period_end: z.string().datetime().optional() }).strict() }), (req, res) => res.json({ data: m.payouts.close(req.body, actor(req)) }));
   r.post('/payouts/:id/approve', market('billing'), stepUp, validate({ params: z.object({ id: idField }), body: z.object({}).strict() }), (req, res) => res.json({ data: m.payouts.approve(req.params.id, actor(req)) }));
   r.post('/payouts/:id/mark-paid', market('billing'), stepUp, validate({ params: z.object({ id: idField }), body: z.object({ provider_ref: z.string().trim().min(1).max(120) }).strict() }), (req, res) => res.json({ data: m.payouts.markPaid(req.params.id, { ...req.body, ...actor(req) }) }));

@@ -1,8 +1,8 @@
 import { test, after, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { bootHub, DAY } from './support.js';
+import { bootHub, tamperSignature, DAY } from './support.js';
 import { KIDS } from './fixtures/index.js';
-import { drift } from '../shared/fingerprint.js';
+import { drift, driftPct } from '../shared/fingerprint.js';
 import { canonicalize } from '../shared/canonical.js';
 
 let h;
@@ -56,7 +56,8 @@ test('a tampered payload, wrong kid, bad signature and malformed token are refus
   assert.equal(verify(`${p}.${canonicalize({ ...obj, ed: 'enterprise' }).toString('base64url')}.${sig}`).reason, 'bad_signature');
   assert.equal(verify(`${p}.${canonicalize({ ...obj, kid: 'deadbeef' }).toString('base64url')}.${sig}`).reason, 'unknown_kid');
   assert.equal(verify(`${p}.${canonicalize({ ...obj, kid: KIDS.pluginA }).toString('base64url')}.${sig}`).reason, 'unknown_kid', 'a plugin kid never verifies a token');
-  assert.equal(verify(`${p}.${payload}.${sig.slice(0, -2)}AA`).reason, 'bad_signature');
+  assert.equal(verify(tamperSignature(token)).reason, 'bad_signature');
+  assert.notEqual(tamperSignature(token), token);
   assert.equal(verify(`${p}.${payload}.${sig}x`).reason, 'malformed');
   assert.equal(verify(`WHMT0.${payload}.${sig}`).reason, 'malformed');
   assert.equal(verify('garbage').reason, 'malformed');
@@ -99,9 +100,12 @@ test('fingerprint drift: ≤ 0.5 is the same activation, > 0.5 is a different se
   const { license } = h.issue();
   h.db.prepare('INSERT INTO activations (id, license_id, fingerprint, fp_components_json, first_seen) VALUES (?, ?, ?, ?, ?)')
     .run('act_TEST000000000006', license.id, a.fingerprint, JSON.stringify(a.fp_components), new Date().toISOString());
-  assert.deepEqual(h.ctx.activations.matchFingerprint('act_TEST000000000006', a.fingerprint, a.fp_components), { ok: true, drift: 0 });
-  assert.deepEqual(h.ctx.activations.matchFingerprint('act_TEST000000000006', 'sha256:' + '9'.repeat(64), nicAndDisk), { ok: true, drift: 0.5 });
-  assert.deepEqual(h.ctx.activations.matchFingerprint('act_TEST000000000006', 'sha256:' + '9'.repeat(64), { ...machine, mac: 'f'.repeat(64) }), { ok: false, drift: 0.8 });
+  assert.deepEqual(h.ctx.activations.matchFingerprint('act_TEST000000000006', a.fingerprint, a.fp_components), { ok: true, drift_pct: 0 });
+  assert.deepEqual(h.ctx.activations.matchFingerprint('act_TEST000000000006', 'sha256:' + '9'.repeat(64), nicAndDisk), { ok: true, drift_pct: 50 });
+  assert.deepEqual(h.ctx.activations.matchFingerprint('act_TEST000000000006', 'sha256:' + '9'.repeat(64), { ...machine, mac: 'f'.repeat(64) }), { ok: false, drift_pct: 80 });
+  assert.equal(driftPct(a.fp_components, nic), 30);
+  assert.equal(driftPct(a.fp_components, { ...machine, mac: 'f'.repeat(64) }), 80);
+  assert.equal(driftPct(a.fp_components, {}), 100);
 });
 
 test('the panel-side verification of a signed response uses the license key only', async () => {

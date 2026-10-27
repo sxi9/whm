@@ -571,8 +571,11 @@ test('ctx.ui.registerPage validates descriptors; manifest pages registered on lo
   await assert.rejects(host.ctx.ui.registerPage({ route: '/about', title: 'Dup', kind: 'markdown', content: 'x' }), ConflictError);
   await assert.rejects(host.ctx.ui.registerPage({ route: '/bad', title: 'Bad', kind: 'table' }), ValidationError);
   await assert.rejects(host.ctx.ui.registerPage({ route: '/act', title: 'Act', kind: 'action', job: 'nope' }), ValidationError);
+  await host.ctx.ui.registerPage({ route: '/more', title: 'More', kind: 'table', source: '/items' });
   await host.load(fullModule());
-  assert.deepEqual(host.state.pages.map((p) => `${p.source}:${p.route}`), ['runtime:/about', 'manifest:/', 'manifest:/settings', 'manifest:/run']);
+  assert.deepEqual(host.state.pages.map((p) => `${p.origin}:${p.route}`), ['runtime:/about', 'runtime:/more', 'manifest:/', 'manifest:/settings', 'manifest:/run']);
+  assert.deepEqual(host.state.pages.filter((p) => p.kind === 'table').map((p) => [p.route, p.source]), [['/more', '/items'], ['/', '/items']], 'origin never overwrites a data page source');
+  assert.ok(host.state.pages.every((p) => p.source !== 'manifest' && p.source !== 'runtime'));
   await assert.rejects(host.ctx.ui.registerPage({ route: '/late', title: 'L', kind: 'markdown', content: 'x' }), LifecycleError);
 });
 

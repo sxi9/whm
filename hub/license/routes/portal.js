@@ -9,7 +9,17 @@ import { issueCsrfToken, requireRole, requireStepUp, PORTAL_ROLES } from '../../
 export function portalRoutes(ctx) {
   const r = express.Router();
   const requireSession = (req, _res, next) => (req.principal?.type === 'portal' ? next() : next(unauthorized('Sign in first')));
-  const me = (req) => ({ user: ctx.portalUsers.publicView(ctx.portalUsers.get(req.principal.userId)), totp_verified_at: req.session.totpVerifiedAt || null, csrfToken: issueCsrfToken(req, ctx.crypto) });
+  // While impersonating, `user` is the effective reseller_admin identity the SPA
+  // routes on, `impersonating` names the tenant/window and `reseller` carries
+  // the tenant's white-label brand (the same shape a real reseller user gets).
+  const me = (req) => {
+    const user = ctx.portalUsers.publicView(ctx.portalUsers.get(req.principal.userId));
+    const imp = req.principal.impersonation || null;
+    const resellerId = imp?.reseller_id || user.reseller_id || null;
+    const out = { user: imp ? { ...user, role: 'reseller_admin', reseller_id: imp.reseller_id } : user, totp_verified_at: req.session.totpVerifiedAt || null, csrfToken: issueCsrfToken(req, ctx.crypto), impersonating: imp ? { reseller_id: imp.reseller_id, by: imp.by, expires_at: new Date(imp.expires_at).toISOString() } : null };
+    if (resellerId) { try { const rs = ctx.resellers.get(resellerId); out.reseller = { id: rs.id, name: rs.name, brand: rs.brand || {} }; } catch { out.reseller = null; } }
+    return out;
+  };
 
   r.post('/login', ctx.app.limiters.portalLogin, validate({ body: z.object({ email: fields.email, password: z.string().min(1).max(128), totp: z.string().regex(/^\d{6}$/).optional() }).strict() }), wrap(async (req, res) => {
     let user;
@@ -31,6 +41,12 @@ export function portalRoutes(ctx) {
   });
   r.get('/csrf', requireSession, (req, res) => res.json({ data: { csrfToken: issueCsrfToken(req, ctx.crypto) } }));
   r.get('/me', requireSession, (req, res) => res.json({ data: me(req) }));
+  r.post('/impersonate/end', requireSession, validate({ body: z.object({}).strict() }), (req, res) => {
+    const imp = req.principal.impersonation || null;
+    delete req.session.impersonation;
+    if (imp) req.audit({ action: 'reseller.impersonate_end', target: imp.reseller_id, args: { reason: 'ended' } });
+    res.json({ data: { ended: Boolean(imp), reseller_id: imp?.reseller_id || null } });
+  });
   r.post('/stepup', requireSession, validate({ body: z.object({ totp: z.string().regex(/^\d{6}$/) }).strict() }), (req, res) => {
     if (!ctx.portalUsers.verifyTotp(req.principal.userId, req.body.totp)) throw new HttpError(422, 'totp_invalid', 'Wrong code');
     req.session.totpVerifiedAt = ctx.clock.now();

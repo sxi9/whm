@@ -20,7 +20,7 @@ const helper = require('./lib/helper');
 const calls = [];
 module.exports = {
   calls,
-  async activate(ctx) { calls.push('activate'); module.exports.ctx = ctx; ctx.log.info('activated', { version: ctx.plugin.version, apiKey: 'hunter2' }); },
+  async activate(ctx) { calls.push('activate'); module.exports.ctx = ctx; await ctx.ui.registerPage({ route: '/runtime-items', title: 'Runtime items', kind: 'table', source: '/items' }); ctx.log.info('activated', { version: ctx.plugin.version, apiKey: 'hunter2' }); },
   async deactivate() { calls.push('deactivate'); },
   async migrate(ctx, from) { calls.push('migrate:' + from); },
   hooks: {
@@ -257,7 +257,11 @@ describe('enable + routes', () => {
 
   it('lists the plugin for the UI with its sidebar and pages, and the detail view', async () => {
     const ui = await get('/api/plugins/ui');
-    expect(ui.body.data).toEqual([{ id: ID, name: 'Hello Plugin', version: '1.2.3', sidebar: [{ category: 'Plugins', label: 'Hello', route: '/', icon: 'hand' }], pages: expect.arrayContaining([expect.objectContaining({ route: '/settings', kind: 'settings', source: 'manifest' })]) }]);
+    expect(ui.body.data).toEqual([{ id: ID, name: 'Hello Plugin', version: '1.2.3', sidebar: [{ category: 'Plugins', label: 'Hello', route: '/', icon: 'hand' }], pages: expect.arrayContaining([expect.objectContaining({ route: '/settings', kind: 'settings', origin: 'manifest' })]) }]);
+    // `origin` says where a page was registered; a table/form page's `source` stays its data route.
+    expect(ui.body.data[0].pages.find((p) => p.route === '/')).toEqual({ route: '/', title: 'Hello', kind: 'table', source: '/items', columns: [{ key: 'id', label: 'ID' }], origin: 'manifest' });
+    expect(ui.body.data[0].pages.find((p) => p.route === '/runtime-items')).toEqual({ route: '/runtime-items', title: 'Runtime items', kind: 'table', source: '/items', origin: 'runtime' });
+    expect(ui.body.data[0].pages.some((p) => p.source === 'manifest' || p.source === 'runtime')).toBe(false);
     const detail = await get(`/api/plugins/manage/${ID}`);
     expect(detail.status).toBe(200);
     expect(detail.body.data).toMatchObject({ id: ID, state: 'enabled', requireSignature: false, manifest: { id: ID } });

@@ -15,10 +15,10 @@ const plugin = {
   id: 'net.example.hello', name: 'Hello Plugin', version: '1.2.3',
   sidebar: [{ category: 'Plugins', label: 'Hello', route: '/', icon: 'hand' }, { category: 'Nope', label: 'Lost', route: '/settings', icon: 'cog' }],
   pages: [
-    { route: '/', title: 'Hello', kind: 'table', source: '/items', columns: [{ key: 'id', label: 'ID' }] },
+    { route: '/', title: 'Hello', kind: 'table', source: '/items', columns: [{ key: 'id', label: 'ID' }], origin: 'manifest' },
     { route: '/settings', title: 'Settings', kind: 'settings' },
     { route: '/run', title: 'Run now', kind: 'action', job: 'nightly', confirm: true, description: 'Runs the nightly job.' },
-    { route: '/form', title: 'Add item', kind: 'form', source: '/items', fields: [{ key: 'name', type: 'text', label: 'Name', required: true }, { key: 'size', type: 'number', label: 'Size', default: 3 }, { key: 'mode', type: 'select', label: 'Mode', options: [{ value: 'a', label: 'A' }] }, { key: 'on', type: 'toggle', label: 'On' }, { key: 'tags', type: 'multiselect', label: 'Tags', options: [{ value: 'x', label: 'X' }] }, { key: 'pw', type: 'password', label: 'Secret' }, { key: 'when', type: 'cron', label: 'When' }, { key: 'notes', type: 'textarea', label: 'Notes' }] },
+    { route: '/form', title: 'Add item', kind: 'form', source: '/items', origin: 'runtime', fields: [{ key: 'name', type: 'text', label: 'Name', required: true }, { key: 'size', type: 'number', label: 'Size', default: 3 }, { key: 'mode', type: 'select', label: 'Mode', options: [{ value: 'a', label: 'A' }] }, { key: 'on', type: 'toggle', label: 'On' }, { key: 'tags', type: 'multiselect', label: 'Tags', options: [{ value: 'x', label: 'X' }] }, { key: 'pw', type: 'password', label: 'Secret' }, { key: 'when', type: 'cron', label: 'When' }, { key: 'notes', type: 'textarea', label: 'Notes' }] },
     { route: '/docs', title: 'Docs', kind: 'markdown', content: '# Title\n\nSome **bold** and `code` with a [link](https://example.net) and <b>raw</b>.\n\n- one\n- two\n\n```\nconst x = 1;\n```\n' },
     { route: '/embed', title: 'Embed', kind: 'html', file: 'ui/index.html' },
   ],

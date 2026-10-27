@@ -305,9 +305,6 @@ module.exports = {
   async activate(ctx) {
     if ((await ctx.store.get('installedAt')) === undefined) await ctx.store.set('installedAt', ctx.now());
     const settings = await ctx.settings.getAll();
-    // Pages registered through ctx.ui.registerPage get their `source` field
-    // replaced by the host's "runtime" label, so the data pages live in the
-    // manifest and only this markdown help page is registered at runtime.
     await ctx.ui.registerPage({ route: '/help', title: 'How retention works', kind: 'markdown', content: [
       '# Automated Backup: retention and remote copies', '',
       `Retention keeps, per account, the newest archive of the last **${settings.retention_daily}** days, **${settings.retention_weekly}** ISO weeks and **${settings.retention_monthly}** months and deletes every other local archive this plugin created.`, '',

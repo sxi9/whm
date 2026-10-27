@@ -55,7 +55,8 @@ test('load activates: runtime page, exports dir, installedAt, both schedules; de
   await h.ctx.fs.writeFile('exports/.keep', '');
   assert.equal(await h.ctx.fs.exists('exports'), true);
   const runtimePage = h.state.pages.find((p) => p.route === '/schedules');
-  assert.deepEqual([runtimePage.kind, runtimePage.source], ['markdown', 'runtime']);
+  assert.deepEqual([runtimePage.kind, runtimePage.origin], ['markdown', 'runtime']);
+  assert.deepEqual(h.state.pages.filter((p) => p.kind === 'table' || p.kind === 'form').map((p) => [p.route, p.source, p.origin]), [['/', '/notes', 'manifest'], ['/new', '/notes', 'manifest']]);
   assert.match(runtimePage.content, /daily-digest.*0 8 \* \* \*/);
   assert.equal(h.state.pages.length, 7);
   const sched = await h.ctx.schedule.list();

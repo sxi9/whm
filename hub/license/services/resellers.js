@@ -100,6 +100,19 @@ export function createResellersService(ctx) {
       }
       return { reseller_id: id, currency: 'USD', total_cents: rows.reduce((s, x) => s + x.wholesale_cents, 0), months: Object.values(months), lines: rows };
     },
+    // Reseller catalog (GET /v1/reseller/products): the active products of
+    // every edition this tenant may issue (quota -1 = unlimited, > 0 = capped,
+    // missing or 0 = never), priced from its own wholesale pricing_json
+    // (null when the vendor has not set a price for that edition/term).
+    products(id) {
+      const r = svc.get(id);
+      const issuable = (edition) => { const q = r.quota?.[edition]; return q === -1 || (Number.isInteger(q) && q > 0); };
+      return ctx.products.list().filter((p) => p.active && issuable(p.edition)).map((p) => {
+        const termKey = p.term === 'days' ? 'trial' : p.term;
+        const wholesale = r.pricing?.[p.edition]?.[termKey];
+        return { sku: p.sku, name: p.name, edition: p.edition, rank: p.rank, term: p.term, term_days: p.term_days, limits: p.limits, features: p.features, active: true, price_cents: Number.isInteger(wholesale) ? wholesale : null, currency: p.currency };
+      });
+    },
     // { resellerId } for reseller principals, null for the vendor.
     scopeOf(principal) {
       return principal?.ownerType === 'reseller' ? { resellerId: principal.ownerId } : null;

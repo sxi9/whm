@@ -79,8 +79,9 @@ test('without a schedule nothing is scheduled; setting one binds the cron and ad
   assert.deepEqual(await h.ctx.schedule.list(), []);
   await h.advance(DAY);
   assert.equal(h.state.jobs.length, 1, 'cleared schedule: no further runs');
-  const help = h.state.pages.find((p) => p.source === 'runtime');
+  const help = h.state.pages.find((p) => p.origin === 'runtime');
   assert.deepEqual([help.route, help.kind], ['/help', 'markdown']);
+  assert.deepEqual(h.state.pages.find((p) => p.route === '/history'), { ...manifest.ui.pages.find((p) => p.route === '/history'), origin: 'manifest' });
   assert.match(help.content, /last \*\*7\*\* days/);
 });
 

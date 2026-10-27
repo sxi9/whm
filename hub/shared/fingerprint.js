@@ -9,11 +9,22 @@ export const DRIFT_THRESHOLD = 0.5;
 // drift(stored, next) -> sum of the weights of the components that changed. A
 // component missing on either side counts as changed.
 export function drift(stored = {}, next = {}) {
+  return driftTenths(stored, next) / 10;
+}
+
+// The same score as an integer percent (0, 20, 30, 50, 80, 100): the form the
+// hub emits in signed responses and audit rows, because canonical JSON
+// (shared/canonical.js) refuses fractional numbers.
+export function driftPct(stored = {}, next = {}) {
+  return driftTenths(stored, next) * 10;
+}
+
+function driftTenths(stored, next) {
   let tenths = 0;
   for (const c of COMPONENTS) {
     if (!stored?.[c] || !next?.[c] || stored[c] !== next[c]) tenths += TENTHS[c];
   }
-  return tenths / 10;
+  return tenths;
 }
 
 // Composite fingerprint over the already-hashed components (the panel hashes

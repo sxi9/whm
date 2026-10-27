@@ -40,7 +40,7 @@ export default function Reports() {
           {data && report === 'activations' && (
             <>
               <h3>Active activations by edition</h3><Table rows={data.by_edition} />
-              <h3 style={{ marginTop: 16 }}>Activations over time (90 d)</h3><MiniBars points={data.over_time} />
+              <h3 style={{ marginTop: 16 }}>Activations over time (90 d)</h3><MiniBars points={data.over_time} valueKey="created" labelKey="day" />
               <h3 style={{ marginTop: 16 }}>Panel versions</h3><Table rows={data.panel_versions} />
             </>
           )}

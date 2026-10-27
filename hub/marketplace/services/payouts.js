@@ -80,9 +80,19 @@ export function createPayoutsService(m) {
       if (!p || (developerId && p.developer_id !== developerId)) throw notFound('Payout');
       return view(p);
     },
+    // The purchases a payout's statement lists (paid ones and the clawed-back refunds).
+    statementRows(p) {
+      return db.prepare('SELECT id, plugin_id, license_id, kind, amount_cents, tax_cents, currency, status, revenue_share_pct, developer_cents, paid_at, refunded_at FROM purchases WHERE id IN (SELECT value FROM json_each(?)) OR id IN (SELECT value FROM json_each(?)) ORDER BY paid_at').all(JSON.stringify(p.statement.purchases || []), JSON.stringify(p.statement.refunds || []));
+    },
+    // GET /v1/admin/market/payouts/:id: the row with its developer and purchases.
+    statement(id) {
+      const p = svc.get(id);
+      const dev = m.developers.get(p.developer_id);
+      return { ...p, developer_name: dev?.display_name ?? null, developer_email: dev?.email ?? null, purchases: svc.statementRows(p) };
+    },
     statementCsv(id, developerId = null) {
       const p = svc.get(id, developerId);
-      const rows = db.prepare('SELECT id, plugin_id, kind, amount_cents, tax_cents, currency, status, revenue_share_pct, developer_cents, paid_at, refunded_at FROM purchases WHERE id IN (SELECT value FROM json_each(?)) OR id IN (SELECT value FROM json_each(?)) ORDER BY paid_at').all(JSON.stringify(p.statement.purchases || []), JSON.stringify(p.statement.refunds || []));
+      const rows = svc.statementRows(p);
       const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
       const header = ['purchase_id', 'plugin_id', 'kind', 'amount_cents', 'tax_cents', 'currency', 'status', 'share_pct', 'developer_cents', 'paid_at', 'refunded_at'];
       return [header.join(','), ...rows.map((r) => [r.id, r.plugin_id, r.kind, r.amount_cents, r.tax_cents, r.currency, r.status, r.revenue_share_pct, r.developer_cents, r.paid_at, r.refunded_at].map(esc).join(','))].join('\n') + '\n';

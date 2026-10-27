@@ -18,6 +18,7 @@ const LABELS = {
   '05-list-accounts': 'List Accounts', '06-service-status': 'Service Status', '07-server-information': 'Server Information', '08-feature-manager': 'Feature Manager',
   '09-tweak-settings': 'Tweak Settings', '10-wp-toolkit-plugin': 'WP Toolkit (bundled plugin page)', '11-sidebar-search': 'Sidebar search',
   '12-top-search': 'Global search', '13-restart-service': 'Restart HTTP Server (Apache)', '14-process-manager': 'Process Manager',
+  '15-license-tab': 'Basic WebHost Manager Setup — License tab', '16-manage-plugins-marketplace': 'Manage Plugins — Marketplace tab', '17-whm-marketplace': 'WHM Marketplace',
 };
 // Stamps a label bar at the top of the page so the screenshot explains itself.
 async function stamp(page, text) {
@@ -108,6 +109,20 @@ async function stamp(page, text) {
   await page.goto(`${BASE}/system-health/process-manager`);
   await page.waitForSelector('tbody tr');
   await shot('14-process-manager');
+
+  // Phase 5: license tab, marketplace tab and the WHM Marketplace catalog page.
+  await page.goto(`${BASE}/server-configuration/basic-webhost-manager-setup#license`);
+  await page.waitForSelector('.page-header h1');
+  await page.waitForTimeout(600);
+  await shot('15-license-tab');
+  await page.goto(`${BASE}/cpanel/manage-plugins#marketplace`);
+  await page.waitForSelector('.page-header h1');
+  await page.waitForTimeout(600);
+  await shot('16-manage-plugins-marketplace');
+  await page.goto(`${BASE}/server-configuration/whm-marketplace`);
+  await page.waitForSelector('.page-header h1');
+  await page.waitForTimeout(600);
+  await shot('17-whm-marketplace');
 
   // Count sidebar entries after expanding all.
   await page.goto(`${BASE}/`);

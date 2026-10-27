@@ -75,6 +75,21 @@ verified developers, and bundled plugins are part of the product (deferred to Ph
 - Commits: conventional prefixes (`feat:`, `fix:`, `docs:`, `wip:`, `test:`, `chore:`).
   Never put model names in commit messages, PR text, or code comments.
 
+## Token economy (user ask, 2026-10-27 — keep the process lean)
+
+What costs the most, measured over this build: category builders ~40 %, adversarial reviewers +
+fix rounds ~45 % (they found real security defects in every wave — keep them, but one fix round
+and one re-review is the default from here; a second round only for blocking findings),
+integration critics ~5 %, everything else (snapshots, check-ins, status replies) < 10 %.
+Defaults from now on:
+- **Screenshots:** regenerate only at a phase milestone or when the user asks — not after every fix
+  round (the capture itself is cheap in tokens, the commits are 24 MB each).
+- **Keep-alive check-ins:** hourly, one short line, no narration unless something needs a decision.
+- **Reviews:** two lenses for code that runs as root or signs/verifies anything; one lens for UI,
+  docs and deploy work. Skip the integration critic for single-unit changes.
+- **Reports to the user:** lead with the outcome, numbers once, no restating history.
+- **Snapshots:** keep (a few hundred tokens each; they saved the work twice on container restarts).
+
 ## Category module contract (how every one of the 30 categories plugs in)
 
 Nothing is registered by hand in shared files. Adding a category = adding files:
@@ -220,7 +235,10 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   `ui_dist` config. Carried into the **Phase-5 fix round**: hub check-in `fingerprint_mismatch` answers with a
   fractional drift are sent unsigned (canonical form rejects non-integers), a flaky token test, hub/ui dashboard
   field names (`active`/`created`), reseller entitlement-grant route not mounted, host page-descriptor `source`
-  label clash, hub/ui interaction tests. Then the live hub+panel end-to-end flow and screenshots.
+  label clash, hub/ui interaction tests — **fix round `wf_8f6db955-2a6` running since 06:55**. Then the live
+  hub+panel end-to-end flow, the Phase-5 flow screenshots (License tab, Manage Plugins › Marketplace, WHM
+  Marketplace — steps to add to `e2e/ui-check.cjs`; the user stopped a refresh at 07:05, do it with the
+  end-to-end flow), tracker, then Phase 6. Phase 5 is committed as `76483ef`.
 - **2026-10-27 03:25: Phase 5 round 1 done** — `plugins/SDK.md` (developer reference against the real host),
   `plugins/sdk/pack.js` (deterministic tar + sign/verify, parity-tested against `services/plugins.js`),
   `scripts/build-plugin.js`, the sample plugin `plugins/sample-plugin` (`net.whm.sample-notes`, node:test, signed

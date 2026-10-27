@@ -41,11 +41,9 @@ describe('bundled plugin: Automated Backup installs at boot', () => {
     expect(one.pages.map((p) => p.route).sort()).toEqual(['/artefacts', '/destinations', '/help', '/history', '/locks', '/restore', '/run-now', '/settings']);
     const ui = (await get('/api/plugins/ui').expect(200)).body.data.find((p) => p.id === AB);
     expect(ui.sidebar).toEqual([{ category: 'Backup', label: 'Automated Backup', route: '/history', icon: 'archive' }]);
-    // The catalog labels every page with where it was registered; that label
-    // currently replaces a table/form page's `source` route (host quirk, see
-    // services/plugins.js uiCatalog) — asserted as-is so a fix shows up here.
-    expect(ui.pages.find((p) => p.route === '/artefacts')).toMatchObject({ kind: 'table', source: 'manifest' });
-    expect(ui.pages.find((p) => p.route === '/help')).toMatchObject({ kind: 'markdown', source: 'runtime' });
+    expect(ui.pages.find((p) => p.route === '/artefacts')).toMatchObject({ kind: 'table', source: '/artefacts', origin: 'manifest' });
+    expect(ui.pages.find((p) => p.route === '/restore')).toMatchObject({ kind: 'form', source: '/restore', origin: 'manifest' });
+    expect(ui.pages.find((p) => p.route === '/help')).toMatchObject({ kind: 'markdown', origin: 'runtime' });
   });
 
   it('serves its routes to root only and is unscheduled until the cron setting is set', async () => {

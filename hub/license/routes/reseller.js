@@ -36,6 +36,9 @@ export function resellerRoutes(ctx) {
   licenseLifecycleRoutes(ctx, r, { scope, scopes: { renew: 'license:renew', change: 'license:renew', suspend: 'license:revoke', revoke: 'license:revoke', rekey: 'license:issue', activations: 'license:read', deactivate: 'license:revoke' } });
   customerRoutes(ctx, r, { scope, scopes: { read: 'license:read', write: 'customer:write' } });
 
+  r.get('/products', requireScope('license:read'), (req, res) => {
+    res.json({ data: ctx.resellers.products(req.principal.ownerId) });
+  });
   r.get('/quota', requireScope('license:read'), (req, res) => {
     const rs = ctx.resellers.get(req.principal.ownerId);
     res.json({ data: { quota: rs.quota, issued: rs.issued, quota_left: ctx.resellers.quotaLeft(rs.id), pricing: rs.pricing } });

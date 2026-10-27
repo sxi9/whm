@@ -833,7 +833,7 @@ function createMockHost(opts = {}) {
       V.validatePageDescriptor(descriptor, 'page', c, { jobs: Object.keys(manifest.jobs || {}), hasSettings: settingFields.length > 0 });
       if (c.errors.length) throw new ValidationError('invalid page descriptor', c.errors);
       if (state.pages.some((p) => p.route === descriptor.route)) throw new ConflictError(`page route "${descriptor.route}" already registered`);
-      state.pages.push({ ...clone(descriptor), source: 'runtime' });
+      state.pages.push({ ...clone(descriptor), origin: 'runtime' });
     },
   };
 
@@ -1056,7 +1056,7 @@ function createMockHost(opts = {}) {
     try {
       if (typeof mod.routes === 'function') await mod.routes(http, ctx);
       for (const pg of (manifest.ui && manifest.ui.pages) || []) {
-        if (!state.pages.some((p) => p.route === pg.route)) state.pages.push({ ...clone(pg), source: 'manifest' });
+        if (!state.pages.some((p) => p.route === pg.route)) state.pages.push({ ...clone(pg), origin: 'manifest' });
       }
       for (const entry of manifest.cron || []) {
         if (entry.enabled === false) continue;

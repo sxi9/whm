@@ -36,6 +36,9 @@ const FLOW_SHOTS = [
   ['12-top-search.png', 'Global search'],
   ['13-restart-service.png', 'Restart HTTP Server (Apache)'],
   ['14-process-manager.png', 'Process Manager'],
+  ['15-license-tab.png', 'Basic WebHost Manager Setup — License tab'],
+  ['16-manage-plugins-marketplace.png', 'Manage Plugins — Marketplace tab'],
+  ['17-whm-marketplace.png', 'WHM Marketplace'],
 ];
 
 // Stamps a label bar at the top of the rendered page so the screenshot explains itself.

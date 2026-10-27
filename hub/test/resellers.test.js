@@ -1,5 +1,7 @@
 import { test, after, before } from 'node:test';
 import assert from 'node:assert/strict';
+import request from 'supertest';
+import { authenticator } from 'otplib';
 import { bootHub } from './support.js';
 
 let h; let r1; let r2; let k1; let k2;
@@ -218,4 +220,105 @@ test('a suspended or closed reseller loses its API keys, portal sessions and iss
   assert.equal((await as(staffKey)('get', '/v1/reseller/licenses')).status, 200);
   assert.equal((await agent.post('/v1/portal/login').send({ email: 'admin2@reseller.test', password: 'Reseller-Pass-2' })).status, 200);
   assert.equal((await h.admin('post', '/v1/admin/licenses').send({ sku: 'whm-trial', customer: { email: 'behalf@r2.test' }, reseller_id: r2.id })).status, 201);
+});
+
+test('GET /v1/reseller/products lists only the editions the reseller may issue, priced from its pricing_json', async () => {
+  const mine = await as(k1)('get', '/v1/reseller/products');
+  assert.equal(mine.status, 200, JSON.stringify(mine.body));
+  const bySku = Object.fromEntries(mine.body.data.map((p) => [p.sku, p]));
+  assert.deepEqual(Object.keys(bySku).sort(), ['whm-pro-annual', 'whm-pro-monthly', 'whm-solo-annual', 'whm-solo-monthly', 'whm-trial'], 'quota { solo, pro, trial } → those editions only');
+  assert.equal(bySku['whm-solo-annual'].price_cents, 6000, 'wholesale annual price');
+  assert.equal(bySku['whm-solo-monthly'].price_cents, 600);
+  assert.equal(bySku['whm-pro-annual'].price_cents, 18000);
+  assert.equal(bySku['whm-pro-monthly'].price_cents, null, 'no wholesale price set for pro/monthly');
+  assert.equal(bySku['whm-trial'].price_cents, null);
+  assert.equal(bySku['whm-solo-annual'].currency, 'USD');
+  assert.equal(bySku['whm-solo-annual'].active, true);
+  assert.deepEqual(Object.keys(bySku['whm-solo-annual']).sort(), ['active', 'currency', 'edition', 'features', 'limits', 'name', 'price_cents', 'rank', 'sku', 'term', 'term_days']);
+  assert.ok(!mine.body.data.some((p) => p.price_cents != null && !Number.isInteger(p.price_cents)));
+  const theirs = await as(k2)('get', '/v1/reseller/products');
+  assert.deepEqual(theirs.body.data.map((p) => p.sku).sort(), ['whm-solo-annual', 'whm-solo-monthly']);
+  assert.ok(theirs.body.data.every((p) => p.price_cents === null), 'no pricing_json → null prices, never the retail price');
+  // an inactive product disappears from the catalog
+  await h.admin('put', '/v1/admin/products/whm-solo-monthly').send({ active: false });
+  assert.deepEqual((await as(k2)('get', '/v1/reseller/products')).body.data.map((p) => p.sku), ['whm-solo-annual']);
+  await h.admin('put', '/v1/admin/products/whm-solo-monthly').send({ active: true });
+  assert.equal((await h.admin('get', '/v1/reseller/products')).body.error.code, 'wrong_owner_type', 'vendor keys use /v1/admin/products');
+  assert.equal((await h.http.get('/v1/reseller/products')).status, 401);
+});
+
+// otplib verifies against the real clock with window 0; start TOTP sequences
+// with time to spare in the current 30 s step (see security.test.js).
+function freshTotpStep() {
+  const left = 30_000 - (Date.now() % 30_000);
+  return left < 15_000 ? new Promise((resolve) => setTimeout(resolve, left + 50)) : Promise.resolve();
+}
+
+test('POST /v1/admin/resellers/:id/impersonate rebinds a vendor_admin session to the reseller for 15 minutes, audited both ways', async () => {
+  await freshTotpStep();
+  const admin = await h.ctx.portalUsers.create({ email: 'imp-admin@vendor.test', password: 'Vendor-Pass-123', role: 'vendor_admin' });
+  const support = await h.ctx.portalUsers.create({ email: 'imp-support@vendor.test', password: 'Support-Pass-123', role: 'vendor_support' });
+  const agent = request.agent(h.ctx.app);
+  const login = await agent.post('/v1/portal/login').send({ email: 'imp-admin@vendor.test', password: 'Vendor-Pass-123' });
+  assert.equal(login.status, 200, JSON.stringify(login.body));
+  const csrf = login.body.data.csrfToken;
+  const post = (url, body = {}) => agent.post(url).set('X-CSRF-Token', csrf).send(body);
+  // step-up gate: TOTP must be enabled and fresh
+  assert.equal((await post(`/v1/admin/resellers/${r1.id}/impersonate`)).body.error.code, 'totp_required');
+  const enroll = await post('/v1/portal/2fa/enroll');
+  assert.equal((await post('/v1/portal/2fa/confirm', { code: authenticator.generate(enroll.body.data.secret) })).status, 200);
+  // API keys cannot impersonate (no session to rebind) and the reseller must exist and be active
+  assert.equal((await h.admin('post', `/v1/admin/resellers/${r1.id}/impersonate`).send({})).body.error.code, 'portal_session_required');
+  assert.equal((await post('/v1/admin/resellers/rs_000000000000/impersonate')).status, 404);
+  await h.admin('patch', `/v1/admin/resellers/${r2.id}`).send({ status: 'suspended' });
+  assert.equal((await post(`/v1/admin/resellers/${r2.id}/impersonate`)).body.error.code, 'reseller_suspended');
+  await h.admin('patch', `/v1/admin/resellers/${r2.id}`).send({ status: 'active' });
+  assert.equal((await post(`/v1/admin/resellers/${r1.id}/impersonate`, { extra: 1 })).status, 422);
+
+  const started = await post(`/v1/admin/resellers/${r1.id}/impersonate`);
+  assert.equal(started.status, 200, JSON.stringify(started.body));
+  assert.equal(started.body.data.reseller_id, r1.id);
+  assert.equal(new Date(started.body.data.expires_at).getTime(), h.clock.t + 15 * 60_000);
+  assert.ok(h.db.prepare("SELECT 1 FROM audit_log WHERE action = 'reseller.impersonate' AND principal = ? AND target = ?").get(`portal:${admin.id}`, r1.id));
+  // the session now is reseller_admin of r1: /me says so, the reseller API scopes to r1, the vendor API refuses
+  const me = await agent.get('/v1/portal/me');
+  assert.equal(me.body.data.user.role, 'reseller_admin');
+  assert.equal(me.body.data.user.reseller_id, r1.id);
+  assert.equal(me.body.data.user.id, admin.id, 'the vendor identity is kept');
+  assert.equal(me.body.data.impersonating.reseller_id, r1.id);
+  assert.equal(me.body.data.impersonating.by, admin.id);
+  assert.equal(me.body.data.reseller.name, 'Reseller One');
+  const licenses = await agent.get('/v1/reseller/licenses');
+  assert.equal(licenses.status, 200);
+  assert.ok(licenses.body.data.length >= 3 && licenses.body.data.every((l) => l.reseller_id === r1.id));
+  assert.equal((await agent.get('/v1/reseller/products')).status, 200);
+  assert.equal((await agent.get('/v1/admin/licenses')).body.error.code, 'wrong_owner_type', 'no vendor powers while impersonating');
+  assert.equal((await post(`/v1/admin/resellers/${r2.id}/impersonate`)).body.error.code, 'wrong_owner_type');
+  // actions taken while impersonating are audited under the admin's identity with the reseller role
+  const cust = await post('/v1/reseller/customers', { name: 'Imp Customer', email: 'imp-customer@r1.test' });
+  assert.equal(cust.status, 201, JSON.stringify(cust.body));
+  assert.equal(h.ctx.customers.get(cust.body.data.id).reseller_id, r1.id, 'row scoped to the impersonated tenant');
+  const row = h.db.prepare("SELECT principal, role FROM audit_log WHERE action = 'customer.create' AND target = ?").get(cust.body.data.id);
+  assert.deepEqual(row, { principal: `portal:${admin.id}`, role: 'reseller_admin' });
+  // ending restores the vendor session
+  const ended = await post('/v1/portal/impersonate/end');
+  assert.deepEqual(ended.body.data, { ended: true, reseller_id: r1.id });
+  assert.equal((await agent.get('/v1/portal/me')).body.data.impersonating, null);
+  assert.equal((await agent.get('/v1/portal/me')).body.data.user.role, 'vendor_admin');
+  assert.equal((await agent.get('/v1/admin/licenses')).status, 200);
+  assert.ok(h.db.prepare("SELECT 1 FROM audit_log WHERE action = 'reseller.impersonate_end' AND target = ? AND args_redacted LIKE '%ended%'").get(r1.id));
+  assert.deepEqual((await post('/v1/portal/impersonate/end')).body.data, { ended: false, reseller_id: null }, 'idempotent');
+  // expiry: the rebinding lapses by itself after 15 minutes and is audited as expired
+  assert.equal((await post(`/v1/admin/resellers/${r1.id}/impersonate`)).status, 200);
+  h.advance(15 * 60_000 + 1);
+  assert.equal((await agent.get('/v1/portal/me')).body.data.impersonating, null);
+  assert.equal((await agent.get('/v1/admin/licenses')).status, 200);
+  assert.ok(h.db.prepare("SELECT 1 FROM audit_log WHERE action = 'reseller.impersonate_end' AND target = ? AND args_redacted LIKE '%expired%'").get(r1.id));
+  // vendor_support cannot impersonate
+  const agent2 = request.agent(h.ctx.app);
+  const sl = await agent2.post('/v1/portal/login').send({ email: 'imp-support@vendor.test', password: 'Support-Pass-123' });
+  assert.equal(sl.status, 200);
+  const denied = await agent2.post(`/v1/admin/resellers/${r1.id}/impersonate`).set('X-CSRF-Token', sl.body.data.csrfToken).send({});
+  assert.equal(denied.body.error.code, 'insufficient_role');
+  void support;
 });

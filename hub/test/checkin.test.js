@@ -1,6 +1,6 @@
 import { test, after, before } from 'node:test';
 import assert from 'node:assert/strict';
-import { bootHub, DAY, HOUR } from './support.js';
+import { bootHub, tamperSignature, DAY, HOUR } from './support.js';
 import { KIDS } from './fixtures/index.js';
 
 let h;
@@ -98,7 +98,7 @@ test('an expired-but-valid-signature token can still check in; a forged one cann
   h.advance(10 * DAY);
   const res = await checkin(a.body.data.token, server);
   assert.equal(res.status, 200, 'the hub re-evaluates from the database');
-  const forged = await checkin(a.body.data.token.slice(0, -3) + 'AAA', server);
+  const forged = await checkin(tamperSignature(a.body.data.token), server);
   assert.equal(forged.status, 401);
   assert.equal(forged.body.error.code, 'invalid_token');
   h.advance(-10 * DAY);
@@ -120,8 +120,48 @@ test('fingerprint drift ≤ 0.5 updates the stored components; > 0.5 is a 409 wi
   res = await checkin(res.body.data.token, cloned);
   assert.equal(res.status, 409);
   assert.equal(res.body.error.code, 'fingerprint_mismatch');
+  assert.equal(res.body.error.drift_pct, 100);
   assert.equal(res.body.error.activations[0].id, a.body.data.activation_id);
   assert.equal(h.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'activation.fingerprint_mismatch'").get().n, 1);
+});
+
+test('a partial clone (fractional drift 0.8 / 0.7) is a signed 409 that carries drift_pct as an integer', async () => {
+  const { key } = h.issue('whm-pro-annual');
+  const server = h.fp('partial');
+  const a = await h.activate(key, server);
+  // machine-id + NIC changed, disk kept: drift 0.8 → 80 %
+  const partial = { fingerprint: 'sha256:' + 'd'.repeat(64), fp_components: { ...server.fp_components, machine_id: 'a'.repeat(64), mac: 'b'.repeat(64) } };
+  // h.panel() throws unless X-WHM-Signature is present and verifies over the body
+  const res = await checkin(a.body.data.token, partial);
+  assert.equal(res.status, 409, JSON.stringify(res.body));
+  assert.equal(res.body.error.code, 'fingerprint_mismatch');
+  assert.equal(res.body.error.drift_pct, 80);
+  assert.equal(res.signatureKid, KIDS.licenseA);
+  assert.equal('drift' in res.body.error, false, 'the fractional score is never emitted');
+  // machine-id + disk changed: drift 0.7 → 70 %
+  const other = { fingerprint: 'sha256:' + 'e'.repeat(64), fp_components: { ...server.fp_components, machine_id: 'a'.repeat(64), disk: 'c'.repeat(64) } };
+  const res2 = await checkin(a.body.data.token, other);
+  assert.equal(res2.status, 409);
+  assert.equal(res2.body.error.drift_pct, 70);
+  const audit = h.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'activation.fingerprint_mismatch' ORDER BY id DESC LIMIT 1").get();
+  assert.equal(JSON.parse(audit.args_redacted).drift_pct, 70);
+  assert.equal(h.ctx.activations.get(a.body.data.activation_id).fingerprint, server.fingerprint, 'nothing was updated');
+});
+
+test('the signed wrapper fails closed: an unsignable body becomes a signed 500, never an unsigned 4xx', async () => {
+  const { key } = h.issue('whm-pro-annual');
+  const server = h.fp('unsignable');
+  const a = await h.activate(key, server);
+  const original = h.ctx.activations.checkin;
+  h.ctx.activations.checkin = () => { throw Object.assign(new Error('partial clone'), { status: 409, code: 'fingerprint_mismatch', extra: { drift: 0.8 } }); };
+  try {
+    const res = await checkin(a.body.data.token, server);
+    assert.equal(res.status, 500, JSON.stringify(res.body));
+    assert.equal(res.body.error.code, 'signing_failed');
+    assert.equal(res.body.meta.nonce, res.whmNonce);
+    assert.equal(res.signatureKid, KIDS.licenseA, 'the 500 itself is signed');
+  } finally { h.ctx.activations.checkin = original; }
+  assert.equal((await checkin(a.body.data.token, server)).status, 200, 'the real service answers again');
 });
 
 test('usage above the edition limits is recorded as over_limit with a warning', async () => {
@@ -206,7 +246,7 @@ test('check-ins are rate limited per activation, only for valid tokens, with a s
     const a = await limited.activate(key, server);
     const c = (t) => limited.panel('/v1/checkin', { token: t, ...server, panel_version: '1.0.0' });
     // a stranger who knows the activation id cannot spend the bucket with forged tokens
-    const forged = a.body.data.token.slice(0, -3) + 'AAA';
+    const forged = tamperSignature(a.body.data.token);
     for (let i = 0; i < 5; i++) assert.equal((await c(forged)).status, 401);
     assert.equal((await c(a.body.data.token)).status, 200);
     assert.equal((await c(a.body.data.token)).status, 200);

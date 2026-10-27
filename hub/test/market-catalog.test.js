@@ -2,6 +2,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { bootMarket, buildPackage, manifestFor, pack, KIDS, DEV_PEM, SAMPLE_ID, SAMPLE_MANIFEST } from './market-support.js';
+import { tamperSignature } from './support.js';
 
 let h; let dev; let lic;
 const PAID = 'net.whm.paid-thing';
@@ -134,7 +135,7 @@ test('live rows win over a valid token: revoked license, transferred activation,
   const revoked = await h.download({ plugin_id: SAMPLE_ID, token: b.token, fingerprint: b.server.fingerprint });
   assert.equal(revoked.status, 403);
   assert.equal(revoked.body.error.code, 'license_inactive');
-  const bad = await h.download({ plugin_id: SAMPLE_ID, token: `${b.token.slice(0, -2)}AA`, fingerprint: b.server.fingerprint });
+  const bad = await h.download({ plugin_id: SAMPLE_ID, token: tamperSignature(b.token), fingerprint: b.server.fingerprint });
   assert.equal(bad.status, 401);
 });
 

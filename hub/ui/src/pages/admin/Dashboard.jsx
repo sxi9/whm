@@ -6,11 +6,19 @@ import { Stat, StatGrid, MiniBars, money } from '../../widgets/index.jsx';
 
 // Vendor dashboard: license health from /admin/reports/dashboard and the
 // marketplace queues from /admin/market/stats (§16.9 + §18.7).
+// hub/license/services/reports.js shapes: activations_by_edition
+// [{ edition, active }], checkins_last_24h [{ hour, n, failed }].
+export function activationTotals(byEdition) {
+  const rows = Array.isArray(byEdition) ? byEdition : [];
+  return { total: rows.reduce((a, r) => a + (Number(r.active) || 0), 0), hint: rows.map((r) => `${r.edition}: ${Number(r.active) || 0}`).join(' · ') || 'none yet' };
+}
+
 export default function Dashboard() {
   const lic = useApi('/admin/reports/dashboard');
   const mkt = useApi('/admin/market/stats');
   const d = lic.data || {};
   const m = mkt.data || {};
+  const activations = activationTotals(d.activations_by_edition);
   const reviewQueue = Object.values(m.review_queue || {}).reduce((a, b) => a + b, 0);
   return (
     <>
@@ -19,7 +27,7 @@ export default function Dashboard() {
       <ErrorBanner error={mkt.error} onRetry={mkt.refetch} />
       {lic.loading && !lic.data && <Loading />}
       <StatGrid>
-        <Stat label="Active activations" value={(d.activations_by_edition || []).reduce((a, r) => a + (r.n || 0), 0)} hint={(d.activations_by_edition || []).map((r) => `${r.edition}: ${r.n}`).join(' · ') || 'none yet'} />
+        <Stat label="Active activations" value={activations.total} hint={activations.hint} />
         <Stat label="Expiring in 30 days" value={d.expiring_30d} hint={<Link to="/admin/licenses?expiring_within=30">open list</Link>} />
         <Stat label="Failed check-ins (24 h)" value={d.failed_checkins_24h} tone={d.failed_checkins_24h ? 'warn' : undefined} />
         <Stat label="Webhook failures" value={d.webhook_failures} hint={<Link to="/admin/integrations">integrations</Link>} />

@@ -1,6 +1,6 @@
 import { HttpError, notFound } from '../../shared/errors.js';
 import { json, newId, paginate, nowIso } from '../../shared/db.js';
-import { drift as driftScore, DRIFT_THRESHOLD } from '../../shared/fingerprint.js';
+import { drift as driftScore, driftPct, DRIFT_THRESHOLD } from '../../shared/fingerprint.js';
 
 const DAY_MS = 86_400_000;
 
@@ -115,12 +115,13 @@ export function createActivationsService(ctx) {
     checkins: (licenseId, limit = 100) => stmts.checkins.all(licenseId, limit).map((c) => ({ ...c, usage: json.parse(c.usage_json, null), usage_json: undefined })),
 
     // §16.5 rule: drift 0 = same server; ≤ 0.5 = same activation with
-    // replaced parts; > 0.5 = a different server.
+    // replaced parts; > 0.5 = a different server. The score travels as an
+    // integer percent (drift_pct) so it can be signed and audited as-is.
     matchFingerprint(aid, fingerprint, components) {
       const a = svc.get(aid);
-      if (a.fingerprint === fingerprint) return { ok: true, drift: 0 };
+      if (a.fingerprint === fingerprint) return { ok: true, drift_pct: 0 };
       const d = driftScore(a.fp_components, components);
-      return { ok: d <= DRIFT_THRESHOLD, drift: d };
+      return { ok: d <= DRIFT_THRESHOLD, drift_pct: driftPct(a.fp_components, components) };
     },
 
     activate(input) {
@@ -136,16 +137,16 @@ export function createActivationsService(ctx) {
       const run = db.transaction(() => {
         const active = stmts.activeOfLicense.all(license.id).map(shape);
         let activation = active.find((a) => a.fingerprint === input.fingerprint);
-        let drifted = null;
+        let driftedPct = null;
         if (!activation) {
           const scored = active.map((a) => ({ a, d: driftScore(a.fp_components, input.fp_components) })).filter((x) => x.d <= DRIFT_THRESHOLD).sort((x, y) => x.d - y.d)[0];
-          if (scored) { activation = scored.a; drifted = scored.d; }
+          if (scored) { activation = scored.a; driftedPct = driftPct(scored.a.fp_components, input.fp_components); }
         }
         if (activation) {
-          if (drifted != null && drifted > 0) {
+          if (driftedPct != null && driftedPct > 0) {
             stmts.updateFp.run({ id: activation.id, fingerprint: input.fingerprint, fp_components_json: JSON.stringify(input.fp_components) });
-            messages.push({ level: 'info', code: 'fingerprint_updated', text: `Server fingerprint updated (drift ${drifted})` });
-            ctx.audit.record({ principal: `activation:${activation.id}`, ip: input.ip, action: 'activation.fingerprint_updated', target: activation.id, args: { drift: drifted }, result: 'ok' });
+            messages.push({ level: 'info', code: 'fingerprint_updated', text: `Server fingerprint updated (drift ${driftedPct}%)` });
+            ctx.audit.record({ principal: `activation:${activation.id}`, ip: input.ip, action: 'activation.fingerprint_updated', target: activation.id, args: { drift_pct: driftedPct }, result: 'ok' });
           }
           stmts.touch.run({ id: activation.id, hostname: input.hostname || activation.hostname, public_ip: input.ip || null, panel_version: input.panel_version || null, os: input.os || null, now: nowIso(now()), token_kid: kid });
           return { activation: shape(stmts.byId.get(activation.id)), reused: true };
@@ -207,16 +208,17 @@ export function createActivationsService(ctx) {
       const messages = [];
       if (activation.fingerprint !== input.fingerprint) {
         const d = driftScore(activation.fp_components, input.fp_components);
+        const pct = driftPct(activation.fp_components, input.fp_components);
         if (d > DRIFT_THRESHOLD) {
           record('fingerprint_mismatch');
-          ctx.audit.record({ principal: `activation:${activation.id}`, ip: input.ip, action: 'activation.fingerprint_mismatch', target: activation.id, args: { drift: d }, result: 'error' });
-          throw Object.assign(new HttpError(409, 'fingerprint_mismatch', 'This server does not match the activation; transfer the license or activate again'), { extra: { activations: publicList(license.id), drift: d } });
+          ctx.audit.record({ principal: `activation:${activation.id}`, ip: input.ip, action: 'activation.fingerprint_mismatch', target: activation.id, args: { drift_pct: pct }, result: 'error' });
+          throw Object.assign(new HttpError(409, 'fingerprint_mismatch', 'This server does not match the activation; transfer the license or activate again'), { extra: { activations: publicList(license.id), drift_pct: pct } });
         }
         stmts.updateFp.run({ id: activation.id, fingerprint: input.fingerprint, fp_components_json: JSON.stringify(input.fp_components) });
         activation.fingerprint = input.fingerprint;
         activation.fp_components = input.fp_components;
-        messages.push({ level: 'info', code: 'fingerprint_updated', text: `Server fingerprint updated (drift ${d})` });
-        ctx.audit.record({ principal: `activation:${activation.id}`, ip: input.ip, action: 'activation.fingerprint_updated', target: activation.id, args: { drift: d }, result: 'ok' });
+        messages.push({ level: 'info', code: 'fingerprint_updated', text: `Server fingerprint updated (drift ${pct}%)` });
+        ctx.audit.record({ principal: `activation:${activation.id}`, ip: input.ip, action: 'activation.fingerprint_updated', target: activation.id, args: { drift_pct: pct }, result: 'ok' });
       }
       const status = ctx.licenses.statusAt(license);
       const kid = ctx.keys.active('license')?.kid;

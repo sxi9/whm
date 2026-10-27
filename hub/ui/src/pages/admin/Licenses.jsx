@@ -12,13 +12,14 @@ import { FormModal, SecretOnce, limitLabel } from '../../widgets/index.jsx';
 export const EDITIONS = ['trial', 'solo', 'pro', 'reseller', 'enterprise'];
 export const LICENSE_STATUSES = ['pending', 'active', 'suspended', 'expired', 'revoked'];
 
-// The product field: a select over the catalog when one is available, else
-// a free SKU input (with suggestions) so the hub, not the form, decides
-// whether a SKU exists. Resellers have no catalog route until U1 adds
-// GET /v1/reseller/products, and vendor-defined SKUs are arbitrary.
-export function skuField({ products, suggestions = [], label = 'Product', withTerm = false }) {
+// The product field: a select over the catalog when one is available
+// (GET /v1/admin/products, or GET /v1/reseller/products whose price_cents is
+// the reseller's wholesale price), else a free SKU input (with suggestions)
+// so the hub, not the form, decides whether a SKU exists.
+export function skuField({ products, suggestions = [], label = 'Product', withTerm = false, withPrice = false }) {
   const list = Array.isArray(products) ? products.filter((p) => p.active !== false) : [];
-  if (list.length) return { key: 'sku', label, type: 'select', options: list.map((p) => ({ value: p.sku, label: `${p.name} (${p.edition}${withTerm && p.term ? `, ${p.term}` : ''})` })), required: true };
+  const price = (p) => (withPrice && Number.isInteger(p.price_cents) ? ` · ${money(p.price_cents, p.currency)}` : '');
+  if (list.length) return { key: 'sku', label, type: 'select', options: list.map((p) => ({ value: p.sku, label: `${p.name} (${p.edition}${withTerm && p.term ? `, ${p.term}` : ''})${price(p)}` })), required: true };
   return { key: 'sku', label: `${label} SKU`, required: true, placeholder: suggestions[0] || 'whm-pro-annual', suggestions, help: 'The SKU as defined by the vendor; an unknown SKU is refused by the hub.' };
 }
 
@@ -26,7 +27,7 @@ export function skuField({ products, suggestions = [], label = 'Product', withTe
 // /admin or /reseller; the reseller variant has no reseller_id field.
 export function IssueLicenseModal({ open, onClose, base, products, skuSuggestions, onIssued, reseller = false }) {
   const fields = [
-    skuField({ products, suggestions: skuSuggestions, withTerm: true }),
+    skuField({ products, suggestions: skuSuggestions, withTerm: true, withPrice: reseller }),
     { key: 'email', label: 'Customer e-mail', type: 'email', required: true, help: 'An existing customer is matched by e-mail; otherwise one is created.' },
     { key: 'name', label: 'Customer name' },
     { key: 'term_months', label: 'Term (months)', type: 'number', min: 1, max: 120 },

@@ -87,10 +87,7 @@ module.exports = {
     });
     if ((await ctx.store.get('installedAt')) === undefined) await ctx.store.set('installedAt', ctx.now());
     await ctx.fs.mkdir('exports');
-    // A page registered at runtime (the manifest declares the other six). Pages
-    // registered through ctx.ui.registerPage get their `source` field replaced
-    // by the host's "runtime" label, so only kinds without `source` (markdown,
-    // html, settings, action) are registered here; data pages stay in the manifest.
+    // A page registered at runtime (the manifest declares the other six).
     const schedules = (await ctx.schedule.list()).map((s) => `- **${s.name}**: \`${s.expr}\` (next ${new Date(s.nextRunAt).toISOString()})`).join('\n');
     await ctx.ui.registerPage({ route: '/schedules', title: 'Schedules', kind: 'markdown', content: `# Schedules at activation\n\n${schedules || '_none_'}\n\nLive values: \`GET ${ctx.http.baseUrl}/schedules\`.` });
     ctx.log.info('activated', { version: ctx.plugin.version, host: ctx.plugin.hostVersion, locale: ctx.i18n.locale() });

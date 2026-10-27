@@ -339,14 +339,12 @@ plugin log line. The panel's auth and CSRF apply (routes sit behind `requireAuth
 ### 5.11 `ctx.ui.registerPage(descriptor)` (gate `ui:sidebar`)
 
 Registers a page at runtime (only during `activate()`); same descriptor rules as manifest pages
-(§7), `ConflictError` on a duplicate route. **Known host limitation (HOST_API_VERSION 1.0.0):** the
-page catalog (`GET /api/plugins/ui`) overwrites every page's `source` key with the label of where
-the page came from (`'manifest'` or `'runtime'`), and the panel's generic renderer builds the data
-URL of a `table`/`form` page from that same key. Until the host stores the label under a separate
-key, `table` and `form` pages — whether declared in the manifest or registered here — fetch
-`/api/plugins/<id>manifest` and render no rows. Register only kinds without a `source` here
-(markdown, html, settings, action), keep data pages in the manifest, and read their data through
-the plugin's routes (`GET <baseUrl><route>`) or a `markdown`/`html` page until the fix lands.
+(§7), `ConflictError` on a duplicate route. Every page kind, `table` and `form` included, can be
+registered here. The served catalog (`GET /api/plugins/ui`, `host.state.pages` in the mock) adds an
+`origin` key to each page, `'manifest'` for pages declared in `ui.pages` and `'runtime'` for pages
+registered through this call; the descriptor's own keys, including a data page's `source` route,
+are kept as declared. `origin` is informational (the panel does not render it), and a descriptor
+may not declare it itself.
 
 ### 5.12 `ctx.crypto` (gate `crypto:own`)
 
@@ -426,9 +424,8 @@ matching `ui.pages[]` entry. Routes are relative to `/plugins/<id>` and match
 Resellers see the pages of enabled plugins (`GET /api/plugins/ui`); whether their calls succeed
 depends on the route `roles` (§5.10).
 
-The `source` of `table` and `form` pages is validated and stored as you declare it, but the
-current host replaces it with the origin label in the served catalog (see §5.11), so those two
-kinds do not load data in the panel today; their routes work and are the stable contract.
+The served catalog carries each page as declared plus `origin: 'manifest' | 'runtime'` (§5.11);
+the `source` of `table` and `form` pages is the plugin route path the panel fetches or posts to.
 
 ## 8. Jobs and cron
 

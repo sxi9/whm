@@ -150,6 +150,19 @@ test('billing: whm_kind routing, idempotency, no renewal from a plugin invoice, 
     assert.equal((await fresh.admin('post', `/v1/admin/market/payouts/${payout.id}/hold`).send({ reason: 'kyc' })).body.data.status, 'held');
     assert.equal((await fresh.admin('post', `/v1/admin/market/payouts/${payout.id}/approve`).send({})).body.data.status, 'approved');
     assert.equal((await fresh.admin('post', `/v1/admin/market/payouts/${payout.id}/mark-paid`).send({ provider_ref: 'tr_1' })).body.data.status, 'paid');
+    // the vendor statement: the payout row with its developer and every purchase it settles
+    const statement = await fresh.admin('get', `/v1/admin/market/payouts/${payout.id}`);
+    assert.equal(statement.status, 200, JSON.stringify(statement.body));
+    assert.equal(statement.body.data.id, payout.id);
+    assert.equal(statement.body.data.status, 'paid');
+    assert.equal(statement.body.data.provider_ref, 'tr_1');
+    assert.equal(statement.body.data.developer_name, d.display_name ?? statement.body.data.developer_name);
+    assert.equal(statement.body.data.purchases.length, 12 + 1, 'paid purchases plus the clawed-back refund');
+    assert.equal(statement.body.data.purchases.filter((p) => p.status === 'refunded').length, 1);
+    assert.ok(statement.body.data.purchases.every((p) => typeof p.license_id === 'string' && Number.isInteger(p.developer_cents)));
+    assert.equal((await fresh.admin('get', '/v1/admin/market/payouts/pay_missing000')).status, 404);
+    assert.equal((await fresh.admin('get', '/v1/admin/market/payouts/not-an-id')).status, 422);
+    assert.equal((await fresh.asKey(fresh.marketKey(['market:review']))('get', `/v1/admin/market/payouts/${payout.id}`)).body.error.code, 'insufficient_scope');
     assert.ok(fresh.sent.some((s) => s.to === d.email && s.template === 'dev.payout_paid'));
     await d.login();
     const mine = await d.get('/v1/dev/payouts');

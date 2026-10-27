@@ -105,5 +105,19 @@ function deepMerge(base, extra) {
   return out;
 }
 
+// Deterministic signature tampering for WHMT1 tokens and bare base64url
+// signatures: flips one bit in the middle of the decoded bytes, so the result
+// is always a different, well-formed signature (replacing the trailing
+// characters is a no-op whenever they already are the replacement).
+export function tamperSignature(tokenOrSig) {
+  const parts = String(tokenOrSig).split('.');
+  const sig = parts[parts.length - 1];
+  const bytes = Buffer.from(sig, 'base64url');
+  if (!bytes.length) throw new Error('nothing to tamper');
+  bytes[Math.floor(bytes.length / 2)] ^= 0x10;
+  parts[parts.length - 1] = bytes.toString('base64url');
+  return parts.join('.');
+}
+
 export const DAY = 86_400_000;
 export const HOUR = 3_600_000;

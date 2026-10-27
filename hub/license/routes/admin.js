@@ -1,7 +1,7 @@
 import express from 'express';
 import { z, validate, fields, pagination, wrap } from '../../shared/validate.js';
 import { HttpError, notFound } from '../../shared/errors.js';
-import { requireScope, requireStepUp, actorOf, scopeAllows, VENDOR_SCOPES, RESELLER_SCOPES } from '../../shared/auth.js';
+import { requireScope, requireStepUp, requireRole, actorOf, scopeAllows, VENDOR_SCOPES, RESELLER_SCOPES, IMPERSONATION_TTL_MS } from '../../shared/auth.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -192,6 +192,18 @@ export function adminRoutes(ctx) {
     res.json({ data: ctx.resellers.setQuota(req.params.id, req.body) });
   });
   r.get('/resellers/:id/statement', read, validate({ params: idParam }), (req, res) => res.json({ data: ctx.resellers.statement(req.params.id) }));
+  // §16.9 impersonate-reseller: rebinds this vendor_admin portal session to the
+  // reseller's tenant as reseller_admin for 15 minutes (shared/auth.js
+  // impersonationOf); ends early via POST /v1/portal/impersonate/end. API keys
+  // cannot impersonate — the rebinding lives in the session.
+  r.post('/resellers/:id/impersonate', requireRole('vendor_admin'), stepUp, validate({ params: idParam, body: z.object({}).strict() }), (req, res) => {
+    const reseller = ctx.resellers.get(req.params.id);
+    if (reseller.status !== 'active') throw new HttpError(409, 'reseller_suspended', `This reseller account is ${reseller.status}`);
+    const now = ctx.clock.now();
+    req.session.impersonation = { reseller_id: reseller.id, by: req.principal.userId, started_at: now, expires_at: now + IMPERSONATION_TTL_MS };
+    req.audit({ action: 'reseller.impersonate', target: reseller.id, args: { expires_at: new Date(req.session.impersonation.expires_at).toISOString() } });
+    res.json({ data: { reseller_id: reseller.id, reseller_name: reseller.name, expires_at: new Date(req.session.impersonation.expires_at).toISOString() } });
+  });
 
   const issueBody = z.object({
     sku: fields.sku,

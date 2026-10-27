@@ -1054,7 +1054,7 @@ export function createPluginHost(ctx) {
         V.validatePageDescriptor(descriptor, 'page', c, { jobs: Object.keys(entry.manifest.jobs || {}), hasSettings: settingFields(entry).length > 0 });
         if (c.errors.length) throw new E.ValidationError('invalid page descriptor', c.errors);
         if (entry.pages.some((p) => p.route === descriptor.route)) throw new E.ConflictError(`page route "${descriptor.route}" already registered`);
-        entry.pages.push({ ...clone(descriptor), source: 'runtime' });
+        entry.pages.push({ ...clone(descriptor), origin: 'runtime' });
       },
     };
   }
@@ -1377,7 +1377,7 @@ export function createPluginHost(ctx) {
       if (typeof mod.routes === 'function') await mod.routes(entry.ctx.http, entry.ctx);
       stillActivating();
       for (const pg of (m.ui && m.ui.pages) || []) {
-        if (!entry.pages.some((p) => p.route === pg.route)) entry.pages.push({ ...clone(pg), source: 'manifest' });
+        if (!entry.pages.some((p) => p.route === pg.route)) entry.pages.push({ ...clone(pg), origin: 'manifest' });
       }
       syncManifestCron(entry);
       if (from !== undefined) {

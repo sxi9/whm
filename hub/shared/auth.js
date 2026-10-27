@@ -98,6 +98,12 @@ export function attachPrincipal(ctx) {
         ownerType: user.reseller_id ? 'reseller' : 'vendor', ownerId: user.reseller_id || 'vnd_default',
         scopes: ROLE_SCOPES[user.role] || [], totpVerifiedAt: req.session.totpVerifiedAt || null,
       };
+      // §16.9 impersonation: a vendor_admin session rebound to one reseller
+      // tenant for a short window acts as that tenant's reseller_admin
+      // (scopes, row scoping, rate limits) and nothing else; the vendor
+      // identity stays on the principal so every audit row names the admin.
+      const imp = impersonationOf(req, user, ctx);
+      if (imp) Object.assign(principal, { role: 'reseller_admin', ownerType: 'reseller', ownerId: imp.reseller_id, scopes: ROLE_SCOPES.reseller_admin, impersonation: imp });
       const refused = assertResellerActive(principal);
       if (refused) {
         req.session.destroy(() => next(refused));
@@ -107,6 +113,20 @@ export function attachPrincipal(ctx) {
     }
     next();
   };
+}
+
+export const IMPERSONATION_TTL_MS = 15 * 60 * 1000;
+
+// The active impersonation of a session, or null. An expired one is removed
+// here (and audited as ended) so a stale rebinding never outlives its window.
+export function impersonationOf(req, user, ctx) {
+  const imp = req.session?.impersonation;
+  if (!imp) return null;
+  const valid = user?.role === 'vendor_admin' && typeof imp.reseller_id === 'string' && Number.isFinite(imp.expires_at) && imp.by === user.id;
+  if (valid && imp.expires_at > ctx.clock.now()) return { reseller_id: imp.reseller_id, by: imp.by, started_at: imp.started_at, expires_at: imp.expires_at };
+  delete req.session.impersonation;
+  if (valid) ctx.audit?.record({ principal: `portal:${user.id}`, role: 'vendor_admin', ip: req.ip, action: 'reseller.impersonate_end', target: imp.reseller_id, args: { reason: 'expired' }, result: 'ok' });
+  return null;
 }
 
 export function apiKeyAuth({ ownerType }) {

@@ -330,7 +330,7 @@ export function createLicenseService(ctx) {
       messages: json.parse(row.messages_json, []) || [],
       fingerprint: cache.fingerprint?.fingerprint ?? null, hostname: hostname(),
       pluginSigningKids: pluginSigningKids(), conflictKids: cache.meta.conflictKids ?? [], revocationsHeadTs: cache.meta.revocationsHeadTs ?? null,
-      knownActivations: cache.meta.knownActivations ?? [], checkinIntervalHours: checkinHours(),
+      knownActivations: cache.meta.knownActivations ?? [], hubDriftPct: cache.meta.hubDriftPct ?? null, checkinIntervalHours: checkinHours(),
     };
   }
 
@@ -568,7 +568,7 @@ export function createLicenseService(ctx) {
       throw new HttpError(502, 'hub_token_invalid', 'The hub issued a token for a different server fingerprint');
     }
     const now = clock.now();
-    const meta = { ...cache.meta, fingerprintMismatch: false, statusReason: null, fpComponents: fp?.components ?? cache.meta.fpComponents ?? null, lastAnswerAt: nowIso(now), lastAnswerSource: source };
+    const meta = { ...cache.meta, fingerprintMismatch: false, statusReason: null, hubDriftPct: null, fpComponents: fp?.components ?? cache.meta.fpComponents ?? null, lastAnswerAt: nowIso(now), lastAnswerSource: source };
     if (key) meta.keyPrefix = key.slice(0, 8);
     meta.checkinIntervalHours = Number.isInteger(data.checkin_interval_hours) && data.checkin_interval_hours >= 1 && data.checkin_interval_hours <= 168 ? data.checkin_interval_hours : null;
     const hours = meta.checkinIntervalHours ?? configCheckinHours;
@@ -589,9 +589,14 @@ export function createLicenseService(ctx) {
     return settle({ req, previous });
   }
 
+  // activation_limit / fingerprint_mismatch answers carry the hub's view of the
+  // license's servers and, for a mismatch, how far this server drifted from the
+  // stored fingerprint as an integer percent (`drift_pct`, §16.5).
   function rememberActivations(err) {
     const list = Array.isArray(err?.fields?.activations) ? err.fields.activations.slice(0, 50).map((a) => ({ id: String(a.id ?? ''), hostname: a.hostname ?? null, last_checkin: a.last_checkin ?? null })) : null;
-    if (list) saveMeta({ knownActivations: list });
+    const pct = err?.fields?.drift_pct;
+    const hubDriftPct = Number.isInteger(pct) && pct >= 0 && pct <= 100 ? pct : null;
+    if (list || hubDriftPct != null) saveMeta({ ...(list ? { knownActivations: list } : {}), hubDriftPct });
   }
 
   // ---- public operations --------------------------------------------------
@@ -614,7 +619,7 @@ export function createLicenseService(ctx) {
       throw err;
     }
     const status = await applyAnswer(answer.data, { key, source: transferFrom ? 'transfer' : 'activate', req });
-    saveMeta({ knownActivations: [] });
+    saveMeta({ knownActivations: [], hubDriftPct: null });
     recordEvent('license.activate', { edition: cache.payload?.ed ?? null, activationId: cache.row.activation_id, keyPrefix: key.slice(0, 8), transferFrom, status }, { req, notify: false });
     return get();
   }
