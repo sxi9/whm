@@ -288,8 +288,10 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   workflow dies with it (happened 2026-10-26 05:38; resumed 14:27 from cache). A self-bound hourly
   Routine `trig_015b4oBVtePikCYJAcFwKkTK` ("WHM build keep-alive check-in", minute :09) wakes this
   session to resume the run, integrate finished waves, snapshot to git and move to the next step.
-  Current step: **Phase-5 integration** (green gate across every workspace, commit `feat(phase5)`), then the
-  **Phase-5 fix round** (a `whm-phase5-fix` workflow over the carried findings; its run id goes here when launched),
+  Phase 5 is committed (`76483ef`, green gate: server 1135 / agent 462 / client 48 / hub 177 / hub-ui 97 + SDK +
+  plugins, both builds, boot, e2e). Current run: the
+  **Phase-5 fix round `wf_8f6db955-2a6`** (`<workflows>/scripts/whm-phase5-fix-wf_8f6db955-2a6.js`, no args; resume with
+  `Workflow({scriptPath, resumeFromRunId: 'wf_8f6db955-2a6'})`),
   then the live hub+panel end-to-end flow (`scripts/install.sh --with-hub` is the production path; in dev: start
   the hub with test keys on :7443, point `WHM_LICENSE_HUB_URL` at it, activate a trial from Basic Setup → License,
   enable the `whm-hub` provider, install `net.whm.sample-notes` through the consent screen, revoke it from the admin
