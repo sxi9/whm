@@ -876,7 +876,7 @@ hub/
 │   │   ├── services/ licenses.js activations.js customers.js resellers.js trials.js billing.js reports.js
 │   │   └── routes/ public.js reseller.js admin.js portal.js
 │   └── portal/                  React (Vite) admin + reseller portal
-└── marketplace/                 see §17
+└── marketplace/                 see §18
 ```
 
 | Item | Value |
@@ -1206,7 +1206,7 @@ license_events(id, ts, event, detail_json)            -- feeds audit_log + Conta
   Feature flags gate routers: `requireFeature('transfers')` on Transfers, `clusters` on
   Clusters/DNS Cluster, `terminal` on Terminal, `api` on API-token creation, `white_label`
   on Customization/Theme Manager branding fields, `marketplace_paid` on paid plugin install
-  (§17). Downgrades never delete anything over the new limit.
+  (§18). Downgrades never delete anything over the new limit.
 - **UI**: the Home **Statistics panel** gets a *License* row (edition, status pill, days
   left, activations `1/1`, last check-in); **Basic WebHost Manager Setup → License** tab:
   enter/replace key, "Check in now", view edition/limits/features, activations list with
@@ -1290,7 +1290,7 @@ license_events(id, ts, event, detail_json)            -- feeds audit_log + Conta
 
 | Phase | Deliverable |
 |---|---|
-| **P7 Commercial** | `hub/license/` (API, portal, signing/rotation, webhooks, billing connectors, reports) + panel `license.js` (offline verify, check-in, degraded mode, edition gates, Basic Setup License tab, notifications); then `hub/marketplace/` (§17). |
+| **P7 Commercial** | `hub/license/` (API, portal, signing/rotation, webhooks, billing connectors, reports) + panel `license.js` (offline verify, check-in, degraded mode, edition gates, Basic Setup License tab, notifications); then `hub/marketplace/` (§18). |
 
 The suite (node:test, temp SQLite, fixed test key pair) must cover:
 

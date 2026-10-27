@@ -63,14 +63,10 @@ test('approve → repack → sign → install on the real panel host: signed: tr
   await panel.http.delete(`/api/plugins/manage/${SAMPLE_ID}?purge=true`).set('X-CSRF-Token', csrf);
 });
 
-test('bundled { dir } install stays exempt from require_signature (skipped until the U5 host edit lands)', async (t) => {
+test('bundled { dir } install stays exempt from require_signature', async () => {
   panel.ctx.settings.set('plugins.require_signature', true);
   try {
     const res = await panel.http.post('/api/plugins/manage/install').set('X-CSRF-Token', csrf).send({ dir: path.join(REPO, 'plugins/bundled/net.whm.server-monitoring'), source: 'bundled' });
-    if (res.status === 422 && res.body.error.code === 'unsigned_package') {
-      t.skip('bundled exemption of §18.6 is a U5 host edit; the host still applies require_signature to { dir } installs');
-      return;
-    }
     assert.equal(res.status, 201, JSON.stringify(res.body));
     assert.equal(res.body.data.plugin.source, 'bundled');
   } finally {

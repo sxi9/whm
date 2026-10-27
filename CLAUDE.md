@@ -31,6 +31,11 @@ verified developers, and bundled plugins are part of the product (deferred to Ph
 | 2026-10-25 | Build order: Phase 0 foundation → P1 shell → P2 core hosting → P3 security/mail/SSL → P4 resellers/IP/backup/transfers → P5 software/platform **+ license server + marketplace + plugins (deferred here by the user)** → P6 hardening/deploy. |
 | 2026-10-25 | License server, plugin marketplace (open developer registration, **backend verification before publishing**), sample plugin and automated-backup plugin: **do at the end**, build on what's already saved rather than regenerating. |
 | 2026-10-25 | Panel ports mirror WHM: HTTP 2086, HTTPS 2087. |
+| 2026-10-27 | **Phase 5 layout:** one hub process `whm-hub` (`hub/` workspace `@whm/hub`: `hub/src`, `hub/shared`, `hub/license`, `hub/marketplace`, `hub/ui`), JSON config `/etc/whm-hub/hub.conf`, unit `deploy/whm-hub.service`, ports 7443 (public) / 7440 (loopback). `docs/design/license-server.md` §16.1 paths are superseded by the errata table in `docs/design/phase5-build-plan.md`. |
+| 2026-10-27 | **Signing:** `kid` = first 8 hex of sha256(raw Ed25519 public key) for license, plugin-signing and developer keys; tokens and `X-WHM-Signature` use base64url, package signatures (`SIGNATURE.json`, `DEV-SIGNATURE.json`) use standard base64 with padding — what the host decodes. `signing_keys` (with `purpose`) lives only in license.db, used through `ctx.keys`. |
+| 2026-10-27 | **Panel identity:** `ctx.license` owns the hub URL (token `iss`, bootstrap `WHM_LICENSE_HUB_URL`) and the license key (License tab only); the Market Provider `whm-hub` row is just an enable switch (`hub_mismatch` if its origin differs). Enforcement gates (degraded 423, feature gates, capacity) run only when `config.licenseEnforce` is true (default true under `NODE_ENV=production`, false in dev/tests). |
+| 2026-10-27 | **Plugins distribution:** the three monitoring/security/WordPress plugins **and the automated-backup plugin** are bundled (`plugins/bundled/*`, installed at boot, exempt from `plugins.require_signature`); the sample plugin `net.whm.sample-notes` is marketplace-distributed under the vendor developer `net.whm`. Marketplace installs go through the host's additive `install(input, { policy: { requireSigned, signers, activate: false, expectedId } })`; consent is compared against the installed, signature-verified manifest. |
+| 2026-10-27 | `hub/ui` **copies** the panel's component kit (`hub/ui/src/components/SYNC.md` records the source commit) instead of importing across packages. Hub tests are `node --test`; hub/ui and the panel use vitest. |
 
 ## Non-negotiable conventions
 
@@ -200,6 +205,22 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   Functions honours `ensureZoneForDomain({ nameservers })`, dead LEGACY registry rows removed. Core follow-ups done
   by hand: dead `sys.resolvers.set` op removed (networking-setup owns `resolver.*`), contracts doc
   §11–21, two load-sensitive tests made robust. Next: plugin host (core), then wave 3.
+- **2026-10-27 06:45: Phase 5 built** (`wf_c7084ffb-2df`, 49 runs, 0 errors, critic: nothing blocking):
+  `hub/license` (§16: products/editions, customers, resellers, licenses, activations with fingerprint drift,
+  trials, transfers, billing connectors, signed responses, check-in messages, portal users, signing keys with
+  rotation; 177 node:test cases incl. marketplace), `hub/marketplace` (§18: developer registration + TOTP, verification
+  queue with DNS/well-known/GitHub evidence, namespaces + PSL, uploads with static scan and review, hub signing,
+  catalog/download/update/revocation feeds, entitlements, payouts), `hub/ui` (vendor admin, developer and reseller
+  portals), panel `services/license.js` + `routes/license.js` + migration 031 (offline token verify with pinned
+  `license-keys.json`, check-in schedule, grace/degraded mode, feature gates, License tab, banners), panel
+  `services/marketplace-client.js` + migration 032 (Marketplace tab in Manage Plugins with consent screen,
+  WHM Marketplace from the hub catalog, revocation polling + banner, developer mode). Integrator items done:
+  BLUEPRINT §16–18, deploy unit + config template, `install.sh --with-hub`, README hub section, root workspaces
+  (`hub`, `hub/ui`) + test/build scripts, Security Advisor "panel integrity" finding (`MANIFEST.sha256`), hub
+  `ui_dist` config. Carried into the **Phase-5 fix round**: hub check-in `fingerprint_mismatch` answers with a
+  fractional drift are sent unsigned (canonical form rejects non-integers), a flaky token test, hub/ui dashboard
+  field names (`active`/`created`), reseller entitlement-grant route not mounted, host page-descriptor `source`
+  label clash, hub/ui interaction tests. Then the live hub+panel end-to-end flow and screenshots.
 - **2026-10-27 03:25: Phase 5 round 1 done** — `plugins/SDK.md` (developer reference against the real host),
   `plugins/sdk/pack.js` (deterministic tar + sign/verify, parity-tested against `services/plugins.js`),
   `scripts/build-plugin.js`, the sample plugin `plugins/sample-plugin` (`net.whm.sample-notes`, node:test, signed
@@ -267,12 +288,13 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   workflow dies with it (happened 2026-10-26 05:38; resumed 14:27 from cache). A self-bound hourly
   Routine `trig_015b4oBVtePikCYJAcFwKkTK` ("WHM build keep-alive check-in", minute :09) wakes this
   session to resume the run, integrate finished waves, snapshot to git and move to the next step.
-  Current run: **Phase-5 build `wf_c7084ffb-2df`** (script `<workflows>/scripts/whm-phase5-build-wf_c7084ffb-2df.js`, no
-  args; resume with `Workflow({scriptPath, resumeFromRunId: 'wf_c7084ffb-2df'})`): three rounds of two units per
-  `docs/design/phase5-build-plan.md` (U1+U6, U2+U4, U3+U5), each with two verifiers and bounded fix rounds, then an
-  integration critic. Phase 2 (all waves + fix rounds) is complete and landed (`6c693e4`); the marketplace design
-  (`docs/design/marketplace.md`) and build plan are committed (`63d2f27`). After the build: the integrator checklist
-  at the end of the build plan (BLUEPRINT §16–18, workspaces, deploy unit, README, CHECKLIST), suites, screenshots.
+  Current step: **Phase-5 integration** (green gate across every workspace, commit `feat(phase5)`), then the
+  **Phase-5 fix round** (a `whm-phase5-fix` workflow over the carried findings; its run id goes here when launched),
+  then the live hub+panel end-to-end flow (`scripts/install.sh --with-hub` is the production path; in dev: start
+  the hub with test keys on :7443, point `WHM_LICENSE_HUB_URL` at it, activate a trial from Basic Setup → License,
+  enable the `whm-hub` provider, install `net.whm.sample-notes` through the consent screen, revoke it from the admin
+  portal), `e2e/ui-check.cjs` steps for License/Marketplace, `e2e/screenshots.sh`, CHECKLIST/README, then Phase 6.
+  Phase-5 build `wf_c7084ffb-2df` and docs/deploy run `wf_f64003d8-af1` are complete and landed.
   After the fix round: Phase 5 (license server, marketplace, SDK docs, sample + automated-backup plugins). Disable the Routine
   (`update_trigger enabled=false`) once CHECKLIST.md is fully done.
 - This dev container has 4 CPUs → at most 2 concurrent subagents; plan fan-outs accordingly.

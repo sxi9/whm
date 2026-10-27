@@ -1,7 +1,7 @@
 import { json } from '../db/index.js';
 import { notFound, conflict, unprocessable, CapabilityError } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
-import { ADAPTERS, CREATABLE_ADAPTERS, LICENSE_KEY_RE, adapterCatalog, normalizeProducts, safeRequest } from './market-adapters.js';
+import { ADAPTERS, CREATABLE_ADAPTERS, adapterCatalog, normalizeProducts, safeRequest } from './market-adapters.js';
 
 // Market providers. Attached as ctx.market; other categories may call:
 //   market.enabledProviders(type)   -> enabled rows of a type ('ssl' | 'plugin') with base prices, no secrets
@@ -170,7 +170,6 @@ export function createMarketService(ctx) {
       if (value == null || value === '') continue;
       if (f.kind === 'url' && !HTTPS_URL_RE.test(value)) errors[key] = ['Must be an https:// URL'];
       if (f.kind === 'path' && !PATH_RE.test(value)) errors[key] = ['Must be a path like /v1/products (letters, digits, "/", ".", "_", "-")'];
-      if (f.kind === 'licenseKey' && !LICENSE_KEY_RE.test(String(value).trim())) errors[key] = ['License keys look like WHM-XXXX-XXXX-XXXX-XXXX'];
     }
     if (Object.keys(errors).length) throw unprocessable('Provider configuration is invalid', errors);
   }

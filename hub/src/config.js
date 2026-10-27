@@ -8,6 +8,7 @@ const rateLimit = (max, windowMs) => z.object({ max: z.number().int().min(1).def
 const schema = z.object({
   public_url: z.string().url().default('https://localhost:7443'),
   serve_ui: z.boolean().default(false),
+  ui_dist: z.string().optional(),
   host: z.string().default('0.0.0.0'),
   port: z.number().int().min(1).max(65535).default(7443),
   loopback_port: z.number().int().min(0).max(65535).default(7440),
@@ -63,6 +64,7 @@ const schema = z.object({
 const ENV_MAP = {
   WHM_HUB_PUBLIC_URL: ['public_url'],
   WHM_HUB_SERVE_UI: ['serve_ui', 'bool'],
+  WHM_HUB_UI_DIST: ['ui_dist'],
   WHM_HUB_HOST: ['host'],
   WHM_HUB_PORT: ['port', 'int'],
   WHM_HUB_LOOPBACK_PORT: ['loopback_port', 'int'],

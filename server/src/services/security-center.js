@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { REPO_ROOT } from '../lib/plugin-sdk.js';
 import net from 'node:net';
 import dns from 'node:dns/promises';
 import nodeCrypto from 'node:crypto';
@@ -985,6 +988,25 @@ export function createSecurityCenterService(ctx) {
         if (root && !root.totp_enabled) add({ id: '2fa.root', grade: 'critical', title: 'The root panel user has no two-factor authentication', detail: 'A leaked root password gives full control of the server. Enroll an authenticator app.', fix: { label: 'Two-Factor Authentication', path: '/security-center/two-factor-authentication' } });
         else add({ id: '2fa.root', grade: 'ok', title: 'Root has two-factor authentication enabled' });
         if (!required) add({ id: '2fa.policy', grade: 'warning', title: 'Two-factor authentication is not required for root', detail: 'Enable the policy so it cannot be silently disabled.', fix: { label: 'Two-Factor Authentication', path: '/security-center/two-factor-authentication' } });
+      });
+
+      await probe('integrity', 'panel integrity', async () => {
+        // Release builds ship /opt/whm/MANIFEST.sha256 (sha256 + path per line) beside the panel;
+        // a development checkout has none, which is reported but not graded.
+        const manifest = [path.join(REPO_ROOT, 'MANIFEST.sha256'), '/opt/whm/MANIFEST.sha256'].find((f) => fs.existsSync(f));
+        if (!manifest) { add({ id: 'integrity.manifest', grade: 'info', title: 'No release manifest found', detail: 'MANIFEST.sha256 is written by release packaging; development checkouts and manual installs have none, so panel files cannot be verified against a known-good list.' }); return; }
+        const root = path.dirname(manifest);
+        const entries = fs.readFileSync(manifest, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean).map((l) => l.match(/^([0-9a-f]{64})\s+\*?(.+)$/)).filter(Boolean);
+        const changed = []; const missing = [];
+        for (const [, digest, rel] of entries) {
+          const file = path.resolve(root, rel);
+          if (!file.startsWith(root + path.sep)) continue;
+          if (!fs.existsSync(file)) { missing.push(rel); continue; }
+          if (nodeCrypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex') !== digest) changed.push(rel);
+        }
+        if (!entries.length) add({ id: 'integrity.manifest', grade: 'warning', title: 'The release manifest is empty or unreadable', detail: `${manifest} holds no "<sha256>  <path>" lines.` });
+        else if (changed.length || missing.length) add({ id: 'integrity.files', grade: 'critical', title: `${changed.length + missing.length} panel file(s) differ from the release manifest`, detail: [...changed.map((f) => `${f}: modified`), ...missing.map((f) => `${f}: missing`)].slice(0, 20).join('\n'), fix: { label: 'Upgrade to Latest Version', path: '/cpanel/upgrade-to-latest-version' } });
+        else add({ id: 'integrity.files', grade: 'ok', title: `All ${entries.length} manifest files match the release manifest` });
       });
 
       await probe('firewall', 'firewall', async () => {
