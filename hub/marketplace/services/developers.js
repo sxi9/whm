@@ -70,8 +70,9 @@ export function createDevelopersService(m) {
 
     async register({ email, password, display_name }, { ip } = {}) {
       if (cfg.disposable_domains.includes(email.split('@')[1])) throw new HttpError(422, 'disposable_email', 'Disposable e-mail addresses are not accepted');
-      if (stmts.byEmail.get(email)) throw new HttpError(409, 'email_taken', 'An account with that e-mail already exists');
+      // The per-IP budget counts every attempt, so e-mail enumeration through 409s is bounded too.
       m.limits.assert(`register:${m.hashIp(ip)}`, cfg.rate_limits.register.max, cfg.rate_limits.register.windowMs, 'Too many registrations from this address');
+      if (stmts.byEmail.get(email)) throw new HttpError(409, 'email_taken', 'An account with that e-mail already exists');
       let slug = slugify(display_name);
       for (let i = 2; stmts.bySlug.get(slug); i++) slug = `${slugify(display_name)}-${i}`;
       const id = newId('dev', m.now());
@@ -99,7 +100,7 @@ export function createDevelopersService(m) {
       if (!d.email_verified_at) throw new HttpError(403, 'email_unverified', 'Verify your e-mail address first');
       if (d.totp_enabled) {
         if (!totp) throw new HttpError(401, 'totp_required', 'A TOTP code is required');
-        if (!ctx.crypto.totp.verify(totp, ctx.crypto.decrypt(d.totp_secret_enc))) { m.devSecurity.recordFailedLogin(d, ip); throw new HttpError(401, 'invalid_totp', 'The code is not valid'); }
+        m.devSecurity.verifyTotp(d, totp, { ip });
       }
       m.devSecurity.recordSuccessfulLogin(d, ip);
       return { developer: get(d.id), totpVerified: !!d.totp_enabled };
@@ -123,7 +124,7 @@ export function createDevelopersService(m) {
         reverify = true;
       }
       if (reverify) svc.triggerReverification(developer.id, patch.email !== undefined ? 'email_changed' : 'payout_changed');
-      m.audit({ principal: `developer:${developer.id}`, role: 'developer', ip, action: 'developer.profile.update', target: developer.id, args: patch, result: 'ok' });
+      m.audit({ principal: `developer:${developer.id}`, role: 'developer', ip, action: 'developer.profile.update', target: developer.id, args: { ...patch, payout: patch.payout === undefined ? undefined : '[redacted]' }, result: 'ok' });
       return publicView(get(developer.id));
     },
     // TOTP enrolment: start → confirm; disabling revokes every API key.
@@ -135,14 +136,16 @@ export function createDevelopersService(m) {
     totpConfirm(developer, code, { ip } = {}) {
       const d = get(developer.id);
       if (d.totp_enabled) throw new HttpError(409, 'totp_enabled', 'TOTP is already enabled');
-      if (!d.totp_secret_enc || !ctx.crypto.totp.verify(code, ctx.crypto.decrypt(d.totp_secret_enc))) throw new HttpError(401, 'invalid_totp', 'The code is not valid');
+      if (!d.totp_secret_enc) throw new HttpError(409, 'totp_not_started', 'Start TOTP enrolment first');
+      m.devSecurity.verifyTotp(d, code, { ip });
       db.prepare('UPDATE developers SET totp_enabled = 1, updated_at = ? WHERE id = ?').run(m.nowIso(), d.id);
       m.devSecurity.securityEvent(d, 'totp_enabled', { ip });
       return { enabled: true };
     },
     totpDisable(developer, code, { ip } = {}) {
       const d = get(developer.id);
-      if (!d.totp_enabled || !ctx.crypto.totp.verify(code, ctx.crypto.decrypt(d.totp_secret_enc))) throw new HttpError(401, 'invalid_totp', 'The code is not valid');
+      if (!d.totp_enabled) throw new HttpError(409, 'totp_not_enabled', 'TOTP is not enabled');
+      m.devSecurity.verifyTotp(d, code, { ip });
       db.prepare('UPDATE developers SET totp_enabled = 0, totp_secret_enc = NULL, updated_at = ? WHERE id = ?').run(m.nowIso(), d.id);
       const revoked = m.devSecurity.revokeAllApiKeys(d.id);
       m.devSecurity.securityEvent(d, 'totp_disabled', { ip, detail: `${revoked} API key(s) revoked` });
@@ -220,9 +223,11 @@ export function createDevelopersService(m) {
       if (d.status !== 'rejected') return publicView(d);
       return publicView(transition(d, 'pending', { reason: 'resubmitted', by: `developer:${d.id}` }));
     },
+    // Suspension freezes publishing (canPublish/canUpload) and hides the
+    // developer's unpublished versions from the scan and review queues; the
+    // versions keep their status so reinstating needs no re-upload (§18.2 step 7).
     suspend(id, { reason, by, ip } = {}) {
       const d = get(id);
-      db.prepare("UPDATE plugin_versions SET status = 'rejected' WHERE plugin_id IN (SELECT id FROM plugins WHERE developer_id = ?) AND status IN ('uploaded', 'scanning', 'in_review', 'approved')").run(id);
       return publicView(transition(d, 'suspended', { reason, by, ip, mail: 'dev.suspended' }));
     },
     reinstate(id, { by, ip } = {}) {

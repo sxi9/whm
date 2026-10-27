@@ -3,6 +3,7 @@ import { newId, json, paginate } from '../../shared/db.js';
 
 const PAID = { stripe: ['invoice.paid', 'invoice.payment_succeeded', 'checkout.session.completed'], whmcs: ['InvoicePaid'], paddle: ['transaction.completed', 'subscription.payment_succeeded'] };
 const REFUND = { stripe: { 'charge.refunded': 'refunded', 'charge.dispute.created': 'chargeback' }, whmcs: { InvoiceRefunded: 'refunded', Chargeback: 'chargeback' }, paddle: { 'transaction.refunded': 'refunded', 'adjustment.created': 'chargeback' } };
+const MAGIC_MAX_PER_HOUR = 5;
 const MAGIC_TTL_MS = 15 * 60_000;
 
 function amountOf(source, payload) {
@@ -95,6 +96,7 @@ export function createMarketBillingService(m) {
     // Magic link for the checkout portal: hashed token, single use, 15 min, e-mail bound.
     issueMagicLink({ customer_id, plugin_id = null, license_id = null }, { ip } = {}) {
       const customer = ctx.customers.get(customer_id);
+      m.limits.assert(`magic:${customer.id}`, MAGIC_MAX_PER_HOUR, 3600_000, 'Too many sign-in links were requested for this customer; try again later');
       const token = ctx.crypto.randomToken(32);
       stmts.insertMagic.run(ctx.crypto.hashToken(token), customer.id, customer.email, plugin_id, license_id, m.nowIso(m.now() + MAGIC_TTL_MS), m.nowIso());
       m.mail(customer.email, 'customer.magic_link', { name: customer.name, link: `${ctx.config.public_url}/buy/magic/${token}`, plugin_id });
@@ -118,7 +120,9 @@ export function createMarketBillingService(m) {
       const wholesale = reseller.pricing?.plugins?.[plugin_id];
       if (wholesale == null) throw new HttpError(403, 'no_wholesale_price', 'No wholesale price is set for this plugin');
       const pricing = json.parse(plugin.pricing_json, {});
-      return m.entitlements.grant({ license_id, plugin_id, kind: pricing.model === 'subscription' ? 'subscription' : 'one_time', source: 'reseller', expires_at }, { by, ip });
+      const row = m.entitlements.grant({ license_id, plugin_id, kind: pricing.model === 'subscription' ? 'subscription' : 'one_time', source: 'reseller', expires_at }, { by, ip });
+      m.audit({ principal: by, role: 'reseller', ip, action: 'entitlement.reseller_grant', target: row.id, args: { reseller_id: resellerId, license_id, plugin_id, wholesale_cents: wholesale, expires_at }, result: 'ok' });
+      return row;
     },
   };
   return svc;

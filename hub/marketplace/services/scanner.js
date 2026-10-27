@@ -106,7 +106,7 @@ export function createScannerService(m) {
       }
     },
     async scanQueue(limit = 20) {
-      const rows = db.prepare("SELECT id FROM plugin_versions WHERE status IN ('uploaded', 'scanning') ORDER BY created_at LIMIT ?").all(limit);
+      const rows = db.prepare("SELECT v.id FROM plugin_versions v JOIN plugins p ON p.id = v.plugin_id JOIN developers d ON d.id = p.developer_id WHERE v.status IN ('uploaded', 'scanning') AND d.status != 'suspended' ORDER BY v.created_at LIMIT ?").all(limit);
       for (const r of rows) { try { await svc.scan(r.id); } catch (err) { ctx.logger.error({ err, version: r.id }, 'scan failed'); } }
       return { scanned: rows.length };
     },

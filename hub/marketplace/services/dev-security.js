@@ -1,6 +1,7 @@
-import { HttpError, unauthorized, forbidden } from '../../shared/errors.js';
+import { HttpError, unauthorized, forbidden, notFound } from '../../shared/errors.js';
 import { constantTimeEqual } from '../../shared/crypto.js';
-import { newId, nowIso, json } from '../../shared/db.js';
+import { newId, nowIso, json, paginate } from '../../shared/db.js';
+import { replay as replayDelivery } from '../../shared/webhooks.js';
 
 export const DEV_SCOPES = ['plugin:read', 'plugin:write', 'version:upload', 'version:publish', 'stats:read', 'webhook:write'];
 export const SESSION_COOKIE = 'whmdev.sid';
@@ -8,15 +9,21 @@ export const API_KEY_HEADER = 'x-dev-api-key';
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 const LOGIN_WINDOW_MS = 15 * 60_000;
 const LOGIN_MAX = 10;
+// Rejected TOTP codes (login, step-up, enrolment, disable, reset) share one
+// per-account budget so a stolen session cookie cannot be stepped up by guessing.
+const TOTP_WINDOW_MS = 15 * 60_000;
+const TOTP_MAX = 5;
 
-function parseCookies(header) {
-  const out = {};
+// Only the session cookie is read; a malformed percent-escape in any cookie
+// must not turn into a 500 on every developer route.
+function sessionCookie(header) {
   for (const part of String(header || '').split(';')) {
     const i = part.indexOf('=');
-    if (i === -1) continue;
-    out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    if (i === -1 || part.slice(0, i).trim() !== SESSION_COOKIE) continue;
+    const raw = part.slice(i + 1).trim();
+    try { return decodeURIComponent(raw); } catch { return raw; }
   }
-  return out;
+  return null;
 }
 
 // Developer identity: a cookie session over developer_sessions (marketplace.db)
@@ -47,7 +54,14 @@ export function createDevSecurityService(m) {
     reset: db.prepare('SELECT * FROM developer_password_resets WHERE token_hash = ?'),
     useReset: db.prepare('UPDATE developer_password_resets SET used_at = ? WHERE token_hash = ? AND used_at IS NULL'),
     setPassword: db.prepare('UPDATE developers SET password_hash = @hash, password_changed_at = @now, credentials_changed_at = @now, failed_logins = 0, locked_until = NULL, updated_at = @now WHERE id = @id'),
+    webhook: db.prepare('SELECT * FROM developer_webhooks WHERE id = ? AND developer_id = ?'),
+    webhooks: db.prepare('SELECT * FROM developer_webhooks WHERE developer_id = ? ORDER BY created_at'),
+    insertWebhook: db.prepare('INSERT INTO developer_webhooks (id, developer_id, url, secret_enc, events_json, enabled, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)'),
+    deleteWebhook: db.prepare('DELETE FROM developer_webhooks WHERE id = ? AND developer_id = ?'),
+    delivery: db.prepare('SELECT d.id FROM developer_webhook_deliveries d JOIN developer_webhooks w ON w.id = d.webhook_id WHERE d.id = ? AND w.id = ? AND w.developer_id = ?'),
   };
+
+  const webhookView = (row) => ({ id: row.id, url: row.url, events: json.parse(row.events_json, []), enabled: !!row.enabled, created_at: row.created_at });
 
   function securityEvent(developer, event, { ip = null, detail = null, mail = true } = {}) {
     stmts.insertEvent.run(developer.id, event, m.hashIp(ip), detail, m.nowIso());
@@ -66,7 +80,7 @@ export function createDevSecurityService(m) {
   }
 
   function loadSession(req) {
-    const token = parseCookies(req.get('cookie'))[SESSION_COOKIE];
+    const token = sessionCookie(req.get('cookie'));
     if (!token) return null;
     const row = stmts.session.get(ctx.crypto.hashToken(token));
     if (!row || row.expires_at < m.now()) return null;
@@ -115,9 +129,13 @@ export function createDevSecurityService(m) {
     };
   }
 
-  function requireDeveloper({ scope = null } = {}) {
+  // `session: true` closes a route to API keys: §18.8 scopes cover plugins,
+  // versions, stats and webhooks only, so account, verification, key and
+  // session management stay with the portal session.
+  function requireDeveloper({ scope = null, session = false } = {}) {
     return (req, _res, next) => {
       if (!req.devPrincipal) return next(unauthorized('A developer session or API key is required'));
+      if (session && req.devPrincipal.type !== 'session') return next(forbidden('This action needs a developer portal session', 'portal_session_required'));
       if (scope && req.devPrincipal.type === 'api_key' && !req.devPrincipal.scopes.includes(scope)) return next(forbidden(`Scope "${scope}" is required`, 'insufficient_scope'));
       next();
     };
@@ -143,9 +161,23 @@ export function createDevSecurityService(m) {
     const s = req.devSession;
     if (!s) throw unauthorized('A developer session is required');
     if (!s.developer.totp_enabled) throw new HttpError(403, 'totp_required', 'Two-factor authentication is not enabled');
-    if (!ctx.crypto.totp.verify(totp, ctx.crypto.decrypt(s.developer.totp_secret_enc))) throw new HttpError(401, 'invalid_totp', 'The code is not valid');
+    verifyTotp(s.developer, totp, { ip: req.ip });
     stmts.updateSession.run({ sid: s.row.sid, data: s.row.data, totp_verified_at: m.now(), expires_at: s.row.expires_at });
     return { totp_verified_at: m.now() };
+  }
+
+  // Every TOTP check: refused while the account is locked, 429 after TOTP_MAX
+  // wrong codes in TOTP_WINDOW_MS, and each wrong code also counts as a failed
+  // login so the §18.9 doubling lockout applies.
+  function verifyTotp(developer, code, { ip = null, secretEnc = developer.totp_secret_enc } = {}) {
+    assertNotLocked(developer);
+    const key = `totp:${developer.id}`;
+    if (m.limits.count(key, TOTP_WINDOW_MS) >= TOTP_MAX) throw Object.assign(new HttpError(429, 'totp_rate_limited', 'Too many invalid codes; try again later'), { retryAfterS: Math.ceil(TOTP_WINDOW_MS / 1000) });
+    if (secretEnc && ctx.crypto.totp.verify(code || '', ctx.crypto.decrypt(secretEnc))) return true;
+    m.limits.hit(key);
+    const r = recordFailedLogin(developer, ip);
+    if (r.locked) throw Object.assign(new HttpError(423, 'account_locked', 'Too many failed attempts; the account is locked for a while'), { retryAfterS: 900 });
+    throw new HttpError(401, 'invalid_totp', 'The code is not valid');
   }
 
   // After TOTP enrolment the current session counts as stepped up.
@@ -200,7 +232,7 @@ export function createDevSecurityService(m) {
 
   return {
     SESSION_COOKIE, API_KEY_HEADER, DEV_SCOPES,
-    attachDeveloper, csrf, requireDeveloper, requireStepUp, stepUp, markStepUp, createSession, destroySession, securityEvent, assertNotLocked, recordFailedLogin, recordSuccessfulLogin, invalidateCredentials,
+    attachDeveloper, csrf, requireDeveloper, requireStepUp, stepUp, verifyTotp, markStepUp, createSession, destroySession, securityEvent, assertNotLocked, recordFailedLogin, recordSuccessfulLogin, invalidateCredentials,
     sessions: (developerId) => stmts.listSessions.all(developerId, m.now()).map((s) => ({ id: s.sid.slice(0, 12), created_at: s.created_at, expires_at: new Date(s.expires_at).toISOString(), stepped_up: !!s.totp_verified_at })),
     revokeSessions: (developerId) => stmts.deleteDevSessions.run(developerId).changes,
     pruneSessions: () => stmts.pruneSessions.run(m.now()).changes,
@@ -236,7 +268,7 @@ export function createDevSecurityService(m) {
       const row = stmts.reset.get(ctx.crypto.hashToken(String(token)));
       if (!row || row.used_at || new Date(row.expires_at).getTime() < m.now()) throw new HttpError(410, 'reset_invalid', 'The reset link is invalid, used or expired');
       const developer = stmts.developer.get(row.developer_id);
-      if (developer.totp_enabled && !ctx.crypto.totp.verify(totp || '', ctx.crypto.decrypt(developer.totp_secret_enc))) throw new HttpError(401, 'invalid_totp', 'A valid TOTP code is required');
+      if (developer.totp_enabled) verifyTotp(developer, totp, { ip });
       if (!stmts.useReset.run(m.nowIso(), row.token_hash).changes) throw new HttpError(410, 'reset_invalid', 'The reset link was already used');
       stmts.setPassword.run({ id: developer.id, hash: await ctx.crypto.hashPassword(password), now: m.nowIso() });
       invalidateCredentials(developer, { reason: 'password_reset', ip });
@@ -247,6 +279,34 @@ export function createDevSecurityService(m) {
       stmts.setPassword.run({ id: developer.id, hash: await ctx.crypto.hashPassword(password), now: m.nowIso() });
       invalidateCredentials(developer, { reason: 'password_changed', ip });
       return { changed: true };
+    },
+    // Developer webhooks (§18.8): rows in marketplace.db delivered by shared/webhooks.js.
+    webhooks: {
+      view: webhookView,
+      list: (developerId) => stmts.webhooks.all(developerId).map(webhookView),
+      create(developer, { url, events, secret: given }, { ip } = {}) {
+        const secret = given || ctx.crypto.randomToken(32);
+        const id = newId('dwh', m.now());
+        stmts.insertWebhook.run(id, developer.id, url, ctx.crypto.encrypt(secret), JSON.stringify(events), nowIso(m.now()));
+        m.audit({ principal: `developer:${developer.id}`, role: 'developer', ip, action: 'developer.webhook.create', target: id, args: { url, events }, result: 'ok' });
+        return { ...webhookView(stmts.webhook.get(id, developer.id)), secret };
+      },
+      remove(developer, id, { ip } = {}) {
+        if (!stmts.deleteWebhook.run(id, developer.id).changes) throw notFound('Webhook');
+        m.audit({ principal: `developer:${developer.id}`, role: 'developer', ip, action: 'developer.webhook.delete', target: id, args: null, result: 'ok' });
+        return { deleted: true };
+      },
+      deliveries(developer, id, query = {}) {
+        if (!stmts.webhook.get(id, developer.id)) throw notFound('Webhook');
+        return paginate(db, { select: 'id, event, attempt, status, next_at, last_code, last_error, created_at, delivered_at', from: 'developer_webhook_deliveries', where: ['webhook_id = @wh'], params: { wh: id }, sortable: { created_at: 'created_at' }, defaultSort: 'created_at', query: { dir: 'desc', ...query } });
+      },
+      replay(developer, id, deliveryId, { ip } = {}) {
+        const row = stmts.delivery.get(deliveryId, id, developer.id);
+        if (!row) throw notFound('Delivery');
+        replayDelivery(db, { ownerType: 'developer', id: row.id, now: m.now() });
+        m.audit({ principal: `developer:${developer.id}`, role: 'developer', ip, action: 'developer.webhook.replay', target: id, args: { delivery: row.id }, result: 'ok' });
+        return { replayed: true };
+      },
     },
   };
 }

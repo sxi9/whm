@@ -86,7 +86,7 @@ export function createReviewService(m) {
       return stmts.byId.get(id);
     },
     queue(query = {}) {
-      const where = ["r.state = 'open'", "v.status = 'in_review'"];
+      const where = ["r.state = 'open'", "v.status = 'in_review'", "d.status != 'suspended'"];
       const params = {};
       if (query.risk) { where.push('v.risk = @risk'); params.risk = query.risk; }
       const page = paginate(db, {

@@ -96,7 +96,7 @@ test('billing: whm_kind routing, idempotency, no renewal from a plugin invoice, 
     assert.equal((await fresh.publish(d, PAID, '1.0.0')).status, 200);
     const l = await fresh.panelLicense('whm-pro-annual', { external_ref: 'sub_lic_1' });
     const expiresBefore = l.license.expires_at;
-    assert.equal((await fresh.download({ plugin_id: PAID, token: l.token })).status, 402);
+    assert.equal((await fresh.download({ plugin_id: PAID, token: l.token, fingerprint: l.server.fingerprint })).status, 402);
     const stripeFresh = (body, t = Math.floor(fresh.clock.t / 1000)) => { const raw = JSON.stringify(body); return fresh.http.post('/v1/admin/billing/webhooks/stripe').set('Content-Type', 'application/json').set('Stripe-Signature', `t=${t},v1=${crypto.createHmac('sha256', 'whsec_test').update(`${t}.${raw}`).digest('hex')}`).send(raw); };
     const paid = await stripeFresh({ id: 'evt_p1', type: 'invoice.paid', data: { object: { amount_paid: 500, currency: 'usd', subscription: 'sub_lic_1', metadata: { whm_kind: 'plugin_purchase', whm_plugin_id: PAID, whm_license_id: l.license.id, whm_external_ref: 'sub_lic_1' } } } });
     assert.equal(paid.status, 200, JSON.stringify(paid.body));
@@ -108,7 +108,7 @@ test('billing: whm_kind routing, idempotency, no renewal from a plugin invoice, 
     assert.equal(purchase.revenue_share_pct, 70);
     assert.equal(purchase.developer_cents, 350);
     assert.equal(purchase.vendor_cents, 150);
-    const ok = await fresh.download({ plugin_id: PAID, token: l.token });
+    const ok = await fresh.download({ plugin_id: PAID, token: l.token, fingerprint: l.server.fingerprint });
     assert.equal(ok.status, 200, JSON.stringify(ok.body));
     assert.equal(ok.body.data.entitlement.kind, 'subscription');
     // duplicate external_id is idempotent
@@ -122,18 +122,18 @@ test('billing: whm_kind routing, idempotency, no renewal from a plugin invoice, 
     const refund = await stripeFresh({ id: 'evt_r1', type: 'charge.refunded', data: { object: { metadata: { whm_kind: 'plugin_purchase', whm_plugin_id: PAID, whm_license_id: l.license.id, whm_purchase_external_id: 'evt_p1' } } } });
     assert.equal(refund.status, 200);
     assert.equal(fresh.mdb.prepare('SELECT status FROM purchases WHERE external_id = ?').get('evt_p1').status, 'refunded');
-    assert.equal((await fresh.download({ plugin_id: PAID, token: l.token })).status, 402);
+    assert.equal((await fresh.download({ plugin_id: PAID, token: l.token, fingerprint: l.server.fingerprint })).status, 402);
     assert.ok(fresh.mdb.prepare("SELECT 1 FROM audit_log WHERE action = 'purchase.refunded'").get());
     // one trial entitlement per license per plugin
     const plugin = fresh.m.submissions.get(PAID);
     const license = fresh.ctx.licenses.get(l.license.id);
     fresh.m.entitlements.startTrial(license, plugin);
-    assert.equal((await fresh.download({ plugin_id: PAID, token: l.token })).body.data.entitlement.kind, 'trial');
+    assert.equal((await fresh.download({ plugin_id: PAID, token: l.token, fingerprint: l.server.fingerprint })).body.data.entitlement.kind, 'trial');
     assert.throws(() => fresh.m.entitlements.startTrial(license, plugin), (e) => e.code === 'trial_exists');
     fresh.advance(15 * 86_400_000);
     await l.checkin();
     assert.equal(fresh.m.entitlements.expireDue().expired, 1);
-    assert.equal((await fresh.download({ plugin_id: PAID, token: l.token })).status, 402);
+    assert.equal((await fresh.download({ plugin_id: PAID, token: l.token, fingerprint: l.server.fingerprint })).status, 402);
     // payouts: close → held below minimum / pending, approve, hold, mark paid, statement
     const l2 = await fresh.panelLicense('whm-pro-annual');
     for (let i = 0; i < 12; i++) assert.equal((await stripeFresh({ id: `evt_big_${i}`, type: 'invoice.paid', data: { object: { amount_paid: 1000, currency: 'usd', metadata: { whm_kind: 'plugin_purchase', whm_plugin_id: PAID, whm_license_id: l2.license.id } } } })).status, 200);

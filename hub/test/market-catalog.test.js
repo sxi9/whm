@@ -85,36 +85,36 @@ test('free download: signed descriptor, URL bound to the activation, single use,
   assert.equal(JSON.parse(expired.body.toString()).error.code, 'download_expired');
   assert.ok(h.m.distribution.purge().purged >= 0);
   // explicit version and unknown version
-  assert.equal((await h.download({ plugin_id: SAMPLE_ID, version: SAMPLE_MANIFEST.version, token: lic.token })).status, 200);
-  assert.equal((await h.download({ plugin_id: SAMPLE_ID, version: '9.9.9', token: lic.token })).status, 404);
-  assert.equal((await h.download({ plugin_id: SAMPLE_ID, token: lic.token, host_api: '0.5.0' })).body.error.code, 'incompatible_host');
+  assert.equal((await h.download({ plugin_id: SAMPLE_ID, version: SAMPLE_MANIFEST.version, token: lic.token, fingerprint: lic.server.fingerprint })).status, 200);
+  assert.equal((await h.download({ plugin_id: SAMPLE_ID, version: '9.9.9', token: lic.token, fingerprint: lic.server.fingerprint })).status, 404);
+  assert.equal((await h.download({ plugin_id: SAMPLE_ID, token: lic.token, fingerprint: lic.server.fingerprint, host_api: '0.5.0' })).body.error.code, 'incompatible_host');
 });
 
 test('paid plugin: 402 with pricing + buy_url, marketplace_paid 403, trial free-only, entitlement grant → 200, refund → 402', async () => {
-  const paid = await h.download({ plugin_id: PAID, token: lic.token });
+  const paid = await h.download({ plugin_id: PAID, token: lic.token, fingerprint: lic.server.fingerprint });
   assert.equal(paid.status, 402);
   assert.equal(paid.body.error.code, 'entitlement_required');
   assert.deepEqual(paid.body.error.pricing, { model: 'one_time', cents: 2900, currency: 'USD' });
   assert.match(paid.body.error.buy_url, /^https:\/\/hub\.test\/buy\//);
   const solo = await h.panelLicense('whm-solo-annual');
-  const feat = await h.download({ plugin_id: PAID, token: solo.token });
+  const feat = await h.download({ plugin_id: PAID, token: solo.token, fingerprint: solo.server.fingerprint });
   assert.equal(feat.status, 403);
   assert.equal(feat.body.error.code, 'feature_required');
   assert.equal(feat.body.error.feature, 'marketplace_paid');
-  assert.equal((await h.download({ plugin_id: SAMPLE_ID, token: solo.token })).status, 200, 'free plugins are fine on solo');
+  assert.equal((await h.download({ plugin_id: SAMPLE_ID, token: solo.token, fingerprint: solo.server.fingerprint })).status, 200, 'free plugins are fine on solo');
   const trial = await h.panelLicense('whm-trial');
-  assert.equal((await h.download({ plugin_id: SAMPLE_ID, token: trial.token })).status, 200);
-  assert.equal((await h.download({ plugin_id: PAID, token: trial.token })).body.error.code, 'feature_required', 'trials download free plugins only');
+  assert.equal((await h.download({ plugin_id: SAMPLE_ID, token: trial.token, fingerprint: trial.server.fingerprint })).status, 200);
+  assert.equal((await h.download({ plugin_id: PAID, token: trial.token, fingerprint: trial.server.fingerprint })).body.error.code, 'feature_required', 'trials download free plugins only');
   const grant = await h.admin('post', '/v1/admin/market/entitlements').send({ license_id: lic.license.id, plugin_id: PAID, kind: 'one_time' });
   assert.equal(grant.status, 201, JSON.stringify(grant.body));
-  const ok = await h.download({ plugin_id: PAID, token: lic.token });
+  const ok = await h.download({ plugin_id: PAID, token: lic.token, fingerprint: lic.server.fingerprint });
   assert.equal(ok.status, 200);
   assert.deepEqual(ok.body.data.entitlement, { kind: 'one_time', status: 'active' });
   assert.equal((await h.admin('post', `/v1/admin/market/entitlements/${grant.body.data.id}/cancel`).send({})).status, 200);
-  assert.equal((await h.download({ plugin_id: PAID, token: lic.token })).status, 402);
+  assert.equal((await h.download({ plugin_id: PAID, token: lic.token, fingerprint: lic.server.fingerprint })).status, 402);
   // bundled with an edition
   assert.equal((await h.admin('patch', `/v1/admin/market/plugins/${PAID}`).send({ bundled_editions: ['pro'] })).status, 200);
-  assert.deepEqual((await h.download({ plugin_id: PAID, token: lic.token })).body.data.entitlement, { kind: 'one_time', status: 'active' });
+  assert.deepEqual((await h.download({ plugin_id: PAID, token: lic.token, fingerprint: lic.server.fingerprint })).body.data.entitlement, { kind: 'one_time', status: 'active' });
   assert.equal((await h.admin('patch', `/v1/admin/market/plugins/${PAID}`).send({ bundled_editions: [] })).status, 200);
 });
 
@@ -125,16 +125,16 @@ test('live rows win over a valid token: revoked license, transferred activation,
   assert.equal(wrongFp.status, 403);
   assert.equal(wrongFp.body.error.code, 'fingerprint_mismatch');
   h.ctx.activations.deactivate(a.activationId, { reason: 'moved', status: 'transferred' });
-  const transferred = await h.download({ plugin_id: SAMPLE_ID, token: a.token });
+  const transferred = await h.download({ plugin_id: SAMPLE_ID, token: a.token, fingerprint: a.server.fingerprint });
   assert.equal(transferred.status, 403);
   assert.equal(transferred.body.error.code, 'activation_inactive');
   const b = await h.panelLicense('whm-pro-annual');
   h.ctx.licenses.revoke(b.license.id, { reason: 'chargeback' });
   assert.ok(h.ctx.licenses.verifyToken(b.token).ok, 'the token itself is still valid');
-  const revoked = await h.download({ plugin_id: SAMPLE_ID, token: b.token });
+  const revoked = await h.download({ plugin_id: SAMPLE_ID, token: b.token, fingerprint: b.server.fingerprint });
   assert.equal(revoked.status, 403);
   assert.equal(revoked.body.error.code, 'license_inactive');
-  const bad = await h.download({ plugin_id: SAMPLE_ID, token: `${b.token.slice(0, -2)}AA` });
+  const bad = await h.download({ plugin_id: SAMPLE_ID, token: `${b.token.slice(0, -2)}AA`, fingerprint: b.server.fingerprint });
   assert.equal(bad.status, 401);
 });
 
@@ -143,7 +143,7 @@ test('yanked → 410 for a new license but 200 for a license with an installs ro
   assert.equal(yank.status, 200, JSON.stringify(yank.body));
   assert.equal((await h.http.get('/v1/market/catalog')).body.data.some((p) => p.id === SAMPLE_ID), false, 'hidden from the catalog');
   const fresh = await h.panelLicense('whm-pro-annual');
-  const y = await h.download({ plugin_id: SAMPLE_ID, version: SAMPLE_MANIFEST.version, token: fresh.token });
+  const y = await h.download({ plugin_id: SAMPLE_ID, version: SAMPLE_MANIFEST.version, token: fresh.token, fingerprint: fresh.server.fingerprint });
   assert.equal(y.status, 410);
   assert.equal(y.body.error.code, 'version_yanked');
   assert.equal(y.body.error.reason, 'bug');
@@ -151,10 +151,10 @@ test('yanked → 410 for a new license but 200 for a license with an installs ro
   const ci = await lic.checkin({ usage: { accounts: 1, resellers: 0, domains: 1, plugins: [{ id: SAMPLE_ID, version: SAMPLE_MANIFEST.version, state: 'enabled' }] } });
   assert.equal(ci.status, 200, JSON.stringify(ci.body));
   assert.equal(h.mdb.prepare('SELECT COUNT(*) AS n FROM installs WHERE license_id = ? AND plugin_id = ?').get(lic.license.id, SAMPLE_ID).n, 1);
-  assert.equal((await h.download({ plugin_id: SAMPLE_ID, version: SAMPLE_MANIFEST.version, token: lic.token })).status, 200);
+  assert.equal((await h.download({ plugin_id: SAMPLE_ID, version: SAMPLE_MANIFEST.version, token: lic.token, fingerprint: lic.server.fingerprint })).status, 200);
   const rv = await h.admin('post', '/v1/admin/market/revocations').send({ plugin_id: SAMPLE_ID, version: SAMPLE_MANIFEST.version, severity: 'warning', action: 'disable', reason: 'vuln' });
   assert.equal(rv.status, 201, JSON.stringify(rv.body));
-  const r = await h.download({ plugin_id: SAMPLE_ID, version: SAMPLE_MANIFEST.version, token: lic.token });
+  const r = await h.download({ plugin_id: SAMPLE_ID, version: SAMPLE_MANIFEST.version, token: lic.token, fingerprint: lic.server.fingerprint });
   assert.equal(r.status, 410);
   assert.equal(r.body.error.code, 'version_revoked');
   assert.equal(r.body.error.reason, 'vuln');
@@ -162,8 +162,8 @@ test('yanked → 410 for a new license but 200 for a license with an installs ro
   try {
     await limited.submitSample();
     const l = await limited.panelLicense();
-    for (let i = 0; i < 2; i++) assert.equal((await limited.download({ plugin_id: SAMPLE_ID, token: l.token })).status, 200);
-    const third = await limited.download({ plugin_id: SAMPLE_ID, token: l.token });
+    for (let i = 0; i < 2; i++) assert.equal((await limited.download({ plugin_id: SAMPLE_ID, token: l.token, fingerprint: l.server.fingerprint })).status, 200);
+    const third = await limited.download({ plugin_id: SAMPLE_ID, token: l.token, fingerprint: l.server.fingerprint });
     assert.equal(third.status, 429);
     assert.equal(third.body.meta.nonce, third.whmNonce, 'the 429 is signed and echoes the nonce');
   } finally { await limited.close(); }

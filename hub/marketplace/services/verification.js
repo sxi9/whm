@@ -85,10 +85,12 @@ export function createVerificationService(m) {
     METHODS, view, get, check,
     listFor: (developerId) => stmts.forDev.all(developerId).map(view),
     submit(developer, input, { ip } = {}) {
+      m.limits.assert(`verification:${developer.id}`, cfg.rate_limits.verification.max, cfg.rate_limits.verification.windowMs, 'Evidence submission limit reached (10 per day)');
       const id = newId('dvf', m.now());
       let ns = null; let evidence = {}; let documentEnc = null;
       if (input.method === 'id_document') {
         if (!input.document) throw new HttpError(422, 'validation_failed', 'document (base64) is required');
+        if (db.prepare("SELECT 1 FROM developer_verifications WHERE developer_id = ? AND method = 'id_document' AND result = 'pending' AND document_enc IS NOT NULL").get(developer.id)) throw new HttpError(409, 'document_pending', 'A document is already awaiting review');
         documentEnc = ctx.crypto.encrypt(JSON.stringify({ content_type: input.content_type || 'application/octet-stream', data: input.document }));
         evidence = { content_type: input.content_type || 'application/octet-stream' };
       } else {
@@ -183,9 +185,10 @@ export function createVerificationService(m) {
       m.audit({ principal: by, role: 'vendor', ip, action: 'developer.request_evidence', target: devId, args: { text }, result: 'ok' });
       return { requested: true };
     },
-    document(id) {
+    document(id, { by = 'system', ip = null } = {}) {
       const row = get(id);
       if (!row.document_enc) throw notFound('Document');
+      m.audit({ principal: by, role: 'vendor', ip, action: 'developer.verification.document_view', target: id, args: { developer_id: row.developer_id }, result: 'ok' });
       return JSON.parse(ctx.crypto.decrypt(row.document_enc));
     },
     purgeDocuments: (days = cfg.evidence_purge_days) => ({ purged: stmts.purge.run(m.nowIso(m.now() - days * 86_400_000)).changes }),

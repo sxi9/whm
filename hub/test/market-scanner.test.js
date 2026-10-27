@@ -20,6 +20,13 @@ async function scan({ files = {}, permissions = [], justifications, name, manife
 const rejects = (v) => v.scan_report.rejects.map((r) => r.rule);
 const flags = (v) => v.scan_report.flags.map((r) => r.rule);
 
+test('computed_constructor fires on property keys only', async () => {
+  const flagged = ["const F = x['constructor'];", 'const F = x?.[`constructor`];', "const o = { 'constructor': 1 };"];
+  for (const src of flagged) assert.deepEqual(scanSource(src, {}).filter((f) => f.rule === 'computed_constructor').length, 1, src);
+  const fine = ["log('constructor');", "throw new Error('constructor');", "const name = `constructor`;", "if (k === 'constructor') return;"];
+  for (const src of fine) assert.deepEqual(scanSource(src, {}).filter((f) => f.rule === 'computed_constructor'), [], src);
+});
+
 test('a fixture per reject rule', async () => {
   const cases = [
     ['child_process', "const cp = require('child_process');", 'require_outside_allowlist'],

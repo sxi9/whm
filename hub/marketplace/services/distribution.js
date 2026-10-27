@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { HttpError, notFound } from '../../shared/errors.js';
+import { HttpError, notFound, unprocessable } from '../../shared/errors.js';
 import { newId, json } from '../../shared/db.js';
 import * as pkg from '../lib/package.js';
 
@@ -60,6 +60,8 @@ export function createDistributionService(m) {
   const svc = {
     resolvePanel, sigOf,
     descriptor(input, { ip } = {}) {
+      // §18.4: the descriptor is bound to the machine, so a copied license_state cannot download elsewhere.
+      if (!input.fingerprint) throw unprocessable('fingerprint is required', { fingerprint: ['Required'] });
       const { license, activation } = resolvePanel(input);
       m.limits.assert(`download:${activation.id}`, cfg.rate_limits.download.max, cfg.rate_limits.download.windowMs, 'Download limit reached for this activation');
       const plugin = db.prepare('SELECT * FROM plugins WHERE id = ?').get(input.plugin_id);

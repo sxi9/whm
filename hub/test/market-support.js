@@ -74,7 +74,18 @@ export function manifestFor(id, extra = {}) {
   return { id, name: extra.name || id.split('.').pop(), version: '1.0.0', description: 'A test plugin for the marketplace suite.', author: { name: 'Test' }, license: 'MIT', engines: { whm: '^1.0.0' }, main: 'main.js', permissions: [], ...extra };
 }
 
+// otplib verifies with window 0 and a bcrypt round (300 ms idle, seconds under
+// a parallel run) sits between a test minting a code and the server checking
+// it; a code minted in the last seconds of a 30-second step would straddle it,
+// so generation waits for the next step instead.
+// The hub verifies through the same otplib singleton, so accepting the
+// previous step here (window [1, 0]) removes the straddle entirely for the
+// marketplace suites; the production hub keeps otplib's default window.
+authenticator.options = { ...authenticator.options, window: [1, 0] };
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 export function totpCode(secret) {
+  const remaining = authenticator.timeRemaining();
+  if (remaining < 6) sleepSync(remaining * 1000 + 100);
   return authenticator.generate(secret);
 }
 
@@ -103,11 +114,19 @@ export async function bootMarket({ config = {}, ...rest } = {}) {
     }
     const agent = request.agent(ctx.app);
     let csrf = null;
-    if (loggedIn) {
-      const res = await agent.post('/v1/dev/login').send({ email: mail, password, ...(totp ? { totp: totpCode(secret) } : {}) });
+    // bcrypt under a parallel test run can straddle a 30-second TOTP step, so a
+    // rejected code is retried once with a freshly generated one.
+    const login = async () => {
+      let res;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        res = await agent.post('/v1/dev/login').send({ email: mail, password, ...(secret ? { totp: totpCode(secret) } : {}) });
+        if (res.status === 200 || res.body?.error?.code !== 'invalid_totp') break;
+      }
       if (res.status !== 200) throw new Error(`developer login failed: ${res.status} ${JSON.stringify(res.body)}`);
       csrf = res.body.data.csrfToken;
-    }
+      return res;
+    };
+    if (loggedIn) await login();
     const d = {
       id: reg.id, email: mail, password, secret, agent, csrf, pem: key && key !== 'fresh' ? key : pack.generateKeyPair().privateKeyPem,
       get: (url) => agent.get(url),
@@ -123,7 +142,7 @@ export async function bootMarket({ config = {}, ...rest } = {}) {
       stepUp: () => d.post('/v1/dev/2fa/stepup', { totp: totpCode(secret) }),
       row: () => m.developers.get(reg.id),
       // Re-authenticates after the clock moved past the session TTL.
-      login: async () => { const res = await agent.post('/v1/dev/login').send({ email: mail, password, ...(secret ? { totp: totpCode(secret) } : {}) }); if (res.status !== 200) throw new Error(`re-login failed ${res.status} ${JSON.stringify(res.body)}`); csrf = res.body.data.csrfToken; d.csrf = csrf; return res; },
+      login: async () => { const res = await login(); d.csrf = csrf; return res; },
     };
     for (const ns of namespaces) m.developers.reassignNamespace(ns, reg.id, { by: 'test', ip: null });
     if (verified) m.developers.approve(reg.id, { by: 'test', ip: null });

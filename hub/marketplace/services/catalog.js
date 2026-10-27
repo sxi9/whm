@@ -94,6 +94,13 @@ export function createCatalogService(m) {
       const r = db.prepare("SELECT AVG(rating) AS avg, COUNT(*) AS n FROM plugin_reviews WHERE plugin_id = ? AND status = 'published'").get(pluginId);
       db.prepare('UPDATE plugins SET rating_avg = ?, rating_count = ? WHERE id = ?').run(r.n ? Math.round(r.avg * 100) / 100 : null, r.n, pluginId);
     },
+    adminList(query = {}) {
+      const where = []; const params = {};
+      if (query.status) { where.push('status = @status'); params.status = query.status; }
+      if (query.q) { where.push('(id LIKE @q OR name LIKE @q)'); params.q = `%${query.q}%`; }
+      const page = paginate(db, { from: 'plugins', where, params, sortable: { created_at: 'created_at', name: 'name', install_count: 'install_count' }, defaultSort: 'created_at', query: { dir: 'desc', ...query } });
+      return { ...page, data: page.data.map((p) => m.submissions.shapePlugin(p)) };
+    },
     adminGet(id) {
       const p = m.submissions.get(id);
       return { ...m.submissions.shapePlugin(p), versions: m.submissions.versionsOf(id).map((v) => m.submissions.shapeVersion(v)), developer: m.developers.publicView(m.developers.get(p.developer_id)), assets: m.submissions.assetsOf(id) };

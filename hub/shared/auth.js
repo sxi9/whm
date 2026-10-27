@@ -5,7 +5,9 @@ import { constantTimeEqual } from './crypto.js';
 export const PORTAL_ROLES = ['vendor_admin', 'vendor_support', 'reseller_admin', 'reseller_staff'];
 // §16.7 verbatim: webhook:write is the integration scope and also governs /v1/reseller/api-keys.
 export const RESELLER_SCOPES = ['license:read', 'license:issue', 'license:renew', 'license:revoke', 'customer:write', 'webhook:write'];
-export const VENDOR_SCOPES = ['admin:*', 'admin:read', 'admin:write', 'billing:webhook', 'report:read'];
+// §18.8: marketplace admin scopes for vendor api_keys; the marketplace guard honours them.
+export const MARKET_SCOPES = ['market:*', 'market:read', 'market:review', 'market:verify', 'market:revoke', 'market:billing'];
+export const VENDOR_SCOPES = ['admin:*', 'admin:read', 'admin:write', 'billing:webhook', 'report:read', ...MARKET_SCOPES];
 const ROLE_SCOPES = {
   vendor_admin: ['*'],
   vendor_support: ['admin:read', 'report:read'],

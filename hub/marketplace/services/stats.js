@@ -1,4 +1,5 @@
 import { HttpError } from '../../shared/errors.js';
+import { paginate } from '../../shared/db.js';
 
 const DAY_MS = 86_400_000;
 
@@ -36,6 +37,13 @@ export function createStatsService(m) {
         resign: m.signing.resignStatus(),
         payouts_pending: db.prepare("SELECT COUNT(*) AS n FROM payouts WHERE status IN ('pending', 'approved')").get().n,
       };
+    },
+    auditList(query = {}) {
+      const where = []; const params = {};
+      if (query.action) { where.push('action LIKE @action'); params.action = `${query.action}%`; }
+      if (query.target) { where.push('target = @target'); params.target = query.target; }
+      if (query.q) { where.push('(principal LIKE @q OR target LIKE @q OR action LIKE @q)'); params.q = `%${query.q}%`; }
+      return paginate(db, { from: 'audit_log', where, params, sortable: { ts: 'ts', id: 'id' }, defaultSort: 'id', query: { dir: 'desc', ...query } });
     },
     gauges() {
       return [

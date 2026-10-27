@@ -25,6 +25,7 @@ import { createPluginReviewsService } from './services/plugin-reviews.js';
 import { publicRoutes } from './routes/public.js';
 import { developerRoutes } from './routes/developer.js';
 import { adminRoutes } from './routes/admin.js';
+import { resellerRoutes } from './routes/reseller.js';
 import { createMarketJobs, MARKET_SCHEDULES } from './jobs.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -59,6 +60,7 @@ export const marketplaceConfigSchema = z.object({
     register: rateLimit(5, 24 * 3600_000),
     upload: rateLimit(10, 24 * 3600_000),
     recheck: rateLimit(5, 3600_000),
+    verification: rateLimit(10, 24 * 3600_000),
     download: rateLimit(60, 3600_000),
     feed: rateLimit(30, 3600_000),
     catalog: rateLimit(600, 3600_000),
@@ -190,6 +192,7 @@ export async function register(ctx) {
   ctx.app.use('/v1/market', publicRoutes(m));
   ctx.app.use('/v1/dev', developerRoutes(m));
   ctx.app.use('/v1/admin/market', adminRoutes(m));
+  ctx.app.use('/v1/reseller/market', resellerRoutes(m));
 
   const baseHealth = ctx.health;
   ctx.health = () => {

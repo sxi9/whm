@@ -282,7 +282,8 @@ test('admin exports and reports are scope-gated and audited; the loopback app se
 
 test('the scheduler runs every §16.11 job without error and runDue honours cron minutes', async () => {
   const names = h.ctx.scheduler.list().map((s) => s.name).sort();
-  assert.deepEqual(names, ['checkin-prune', 'db-backup', 'expire-licenses', 'expiring-reminders', 'nonce-prune', 'stale-activations', 'trial-expiry', 'webhook-retry']);
+  // Modules (the marketplace) register their own schedules next to these; every registered job must run.
+  for (const name of ['checkin-prune', 'db-backup', 'expire-licenses', 'expiring-reminders', 'nonce-prune', 'stale-activations', 'trial-expiry', 'webhook-retry']) assert.ok(names.includes(name), `${name} scheduled`);
   for (const name of names) {
     const out = await h.ctx.scheduler.run(name);
     assert.equal(out.ok, true, `${name}: ${out.error}`);

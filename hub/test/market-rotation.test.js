@@ -25,7 +25,7 @@ test('activating a new plugin kid re-signs every published version; descriptor s
   assert.equal(after.package_digest, before.package_digest, 'the signed content is unchanged');
   const history = h.mdb.prepare('SELECT mkt_kid, package_sha256 FROM plugin_version_signatures WHERE version_id = ? ORDER BY signed_at').all(after.id);
   assert.deepEqual(history.map((s) => s.mkt_kid).sort(), [KIDS.pluginA, KIDS.pluginB].sort());
-  const d = await h.download({ plugin_id: SAMPLE_ID, token: lic.token });
+  const d = await h.download({ plugin_id: SAMPLE_ID, token: lic.token, fingerprint: lic.server.fingerprint });
   assert.equal(d.body.data.kid, KIDS.pluginB);
   assert.equal(d.body.data.sha256, after.package_sha256);
   const bytes = await h.fetchPackage(d.body.data.url);

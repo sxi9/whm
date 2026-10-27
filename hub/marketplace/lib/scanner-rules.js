@@ -240,7 +240,8 @@ export function scanSource(src, { scopes = [], matchesNetScope = () => false } =
         if (arg?.type === 'string' && !agentScopes.has(arg.value)) add('undeclared_agent_op', t.line, arg.value);
       }
     }
-    if ((t.type === 'string' || t.type === 'template') && t.value === 'constructor') add('computed_constructor', t.line, t.raw);
+    // A "constructor" literal only matters as a property key: x['constructor'], x?.['constructor'] or { 'constructor': … }.
+    if ((t.type === 'string' || t.type === 'template') && t.value === 'constructor' && (prev?.value === '[' || next?.value === ':')) add('computed_constructor', t.line, t.raw);
     if (t.type === 'string' || t.type === 'template') {
       const m = /^https?:\/\/([^/\s:]+)(?::(\d+))?(\/|$)/i.exec(t.value);
       if (m) {
