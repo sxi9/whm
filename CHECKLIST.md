@@ -8,7 +8,7 @@
 
 ## Current state
 
-- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-27 08:15 UTC
+- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-27 08:20 UTC
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
 - **Tests (06:50 on the 27th):** server 1135 / agent 462 / client 48 / hub 177 / hub-ui 97 / SDK 73 / sample plugin 13 / bundled plugins ×4 — all green (`npm test` runs every workspace, the SDK, the sample plugin and the bundled plugins); both builds (client, hub/ui), boot and Playwright pass.
@@ -52,8 +52,9 @@ a fix round ~15 min; most categories need one fix round.
 | Phase-5 fix round (`wf_8f6db955-2a6`: signed fail-closed hub errors, deterministic token test, hub/ui dashboard fields, reseller entitlement + products routes, payouts statement, admin impersonation, hub/ui interaction tests, page-descriptor `origin`) | done — 0 open; landed `e49e500`; gate server 1135 / agent 462 / client 48 / hub 181 / hub-ui 105 + SDK + 5 plugin suites, builds, boot | 45 min (+ 20 min container restart) | 07:40 (27th) |
 | Live hub + panel end-to-end flow (`e2e/live-hub-flow.sh`: hub with generated keys + TLS → trial activation + key pinning + check-in → developer registration, e-mail verify, TOTP, namespace, signed upload, admin review, hub signing, publish → provider enable → install → pending_consent → consent → revoke → disable + banner + audit → update 1.1.1 held for consent) | done — 11/11 steps PASS on the first live run, **no code fix needed**; reviewer re-ran it green; Playwright steps 15–17 + full screenshot refresh (`974cb94`) | 45 min | 08:10 (27th) |
 | Install guide + user manual (`docs/INSTALL.md`, `docs/MANUAL.md`: every flag/env var, all 212 functions, hub portals, plugins, licensing, troubleshooting; accuracy-reviewed) — user ask 07:40 | running since 07:40 | ~1 h | ~08:45 (27th) |
-| **P6** — hardening pass (dependency audit, agent op sweep, rate-limit/CSRF/headers review), Security Advisor rules (incl. the Oct-2026 PHP advisory check), e2e against a provisioned host where available, final docs, performance pass | pending | ~2.5 h | ~11:30 (27th) |
-| **Total remaining** | | **~4.5 h wall-clock** (from 06:55 on the 27th) | |
+| **P6** — hardening (`wf_4ec3a48f-132`: agent-op + route sweep, dependency audit + web security review, Security Advisor PHP-advisory rule, performance/indexes; verifier + full gate) | running since 08:20 | ~2.5 h | ~10:50 (27th) |
+| Final docs (merge manual parts, link INSTALL/MANUAL from README + HANDOFF, README/BLUEPRINT consistency), tick P6, disable keep-alive | pending | ~30 min | ~11:20 (27th) |
+| **Total remaining** | | **~3 h wall-clock** (from 08:20 on the 27th) | |
 
 Faster option: verification can be cut to one reviewer and one fix round per category
 (~30% less time, less thorough). Not applied unless requested.
