@@ -15,37 +15,37 @@ Companion documents: [`README.md`](../README.md) (install, hub, configuration re
 ## Table of contents
 
 - [Part A — Getting around](#part-a--getting-around)
-  - [1. Signing in](#1-signing-in)
-  - [2. The layout](#2-the-layout)
-  - [3. Roles: root, reseller, user](#3-roles-root-reseller-user)
-  - [4. How a change reaches the server](#4-how-a-change-reaches-the-server)
-  - [5. Reading the function blocks](#5-reading-the-function-blocks)
+  - [Signing in](#signing-in)
+  - [The layout](#the-layout)
+  - [Roles: root, reseller, user](#roles-root-reseller-user)
+  - [How a change reaches the server](#how-a-change-reaches-the-server)
+  - [Reading the function blocks](#reading-the-function-blocks)
 - [Part A — Categories 1–15](#part-a--categories-115)
-  - [Server Configuration](#server-configuration)
-  - [Support](#support)
-  - [Networking Setup](#networking-setup)
-  - [Security Center](#security-center)
-  - [Server Contacts](#server-contacts)
-  - [Resellers](#resellers)
-  - [Service Configuration](#service-configuration)
-  - [Locales](#locales)
-  - [Backup](#backup)
-  - [Clusters](#clusters)
-  - [System Reboot](#system-reboot)
-  - [Server Status](#server-status)
-  - [Account Information](#account-information)
-  - [Account Functions](#account-functions)
-  - [Multi Account Functions](#multi-account-functions)
+  - [1. Server Configuration](#1-server-configuration)
+  - [2. Support](#2-support)
+  - [3. Networking Setup](#3-networking-setup)
+  - [4. Security Center](#4-security-center)
+  - [5. Server Contacts](#5-server-contacts)
+  - [6. Resellers](#6-resellers)
+  - [7. Service Configuration](#7-service-configuration)
+  - [8. Locales](#8-locales)
+  - [9. Backup](#9-backup)
+  - [10. Clusters](#10-clusters)
+  - [11. System Reboot](#11-system-reboot)
+  - [12. Server Status](#12-server-status)
+  - [13. Account Information](#13-account-information)
+  - [14. Account Functions](#14-account-functions)
+  - [15. Multi Account Functions](#15-multi-account-functions)
 - Part B — Categories 16–30 and appendices (Transfers, Themes, Packages, DNS Functions,
   Database Services, IP Functions, Software, Email, System Health, cPanel, SSL/TLS, Market,
-  Restart Services, Development, Plugins) follow after the `PART B` marker at the end of
-  this file.
+  Restart Services, Development, Plugins; licensing, marketplace, developer, hub-portal and
+  troubleshooting appendices): [MANUAL-partB.md](MANUAL-partB.md).
 
 ---
 
 # Part A — Getting around
 
-## 1. Signing in
+## Signing in
 
 The panel listens on **http://server:2086** and, when a certificate is configured,
 **https://server:2087** (the installer generates a self-signed one and enables both). Open
@@ -110,7 +110,7 @@ panel looks up the identity link. Errors come back as query parameters on the lo
 
 Providers can also auto-link by e-mail when `security.external_auth.auto_link_by_email` is on.
 
-## 2. The layout
+## The layout
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -166,7 +166,7 @@ server-sent events). Queued jobs can be cancelled; running ones cannot.
 (*Basic WebHost Manager Setup › License* fixes it); a revoked marketplace plugin shows a
 revocation banner.
 
-## 3. Roles: root, reseller, user
+## Roles: root, reseller, user
 
 | Role | What it sees | What it may do |
 |---|---|---|
@@ -179,7 +179,7 @@ needs where the service checks one. "Root, reseller (own accounts)" means the re
 and acts on owned accounts only; ownership is re-checked inside the service, not just by the
 route.
 
-## 4. How a change reaches the server
+## How a change reaches the server
 
 1. The page calls the JSON API (`/api/...`). Every request is validated with zod; a bad field
    comes back as `422` with per-field messages, which the form shows inline. Mutations carry
@@ -213,7 +213,7 @@ invalid arguments or a refused configuration, `404` not found, `409` already exi
 agent unavailable or timed out, `423 license_degraded` when the license has lapsed and the
 panel is read-only.
 
-## 5. Reading the function blocks
+## Reading the function blocks
 
 Each function below is documented as: purpose · **Who** · the fields and actions on the
 screen · **Server** (what the route/service does) · **Needs** (daemon, setting) · **Gotchas**.
@@ -225,11 +225,11 @@ lists).
 
 # Part A — Categories 1–15
 
-## Server Configuration
+## 1. Server Configuration
 
 Routes under `/api/server-config/*` and `/api/system/*`; everything here is **root only**.
 
-#### Basic WebHost Manager Setup
+#### 1.1 Basic WebHost Manager Setup
 
 Contact details, main and shared IPs, nameservers and account defaults, plus the **License** tab.
 **Who:** root.
@@ -260,14 +260,14 @@ activation; nothing for the Settings tab. **Gotchas:** with `licenseEnforce` on 
 mutations; GETs, backups, restarts and unsuspend still work); sites keep running. The
 *Market Provider Manager* `whm-hub` row is only the marketplace switch — the key lives here.
 
-#### Change Root Password
+#### 1.2 Change Root Password
 
 Rotate the Linux root password used for SSH and the console. **Who:** root.
 Fields: *New root password* (with strength meter and generator), *Confirm*; a danger
 confirmation precedes the change. **Server:** `POST /api/system/root-password` → agent op `user.set_password`, which feeds
 `user:password` to `chpasswd` on stdin (never on a command line); audited without the secret. **Gotchas:** this is the OS account, not your WHM login — change that from the user menu.
 
-#### Configure cPanel Analytics
+#### 1.3 Configure cPanel Analytics
 
 Opt in or out of anonymous interface analytics. **Who:** root.
 Toggles: *Send anonymous interface analytics* (off by default; generates a random participant
@@ -276,7 +276,7 @@ discards the link to previously submitted data. **Server:** `PUT /api/server-con
 `POST …/analytics/rotate-id`; settings only. **Gotchas:** the *What is collected* card is the
 authoritative list; nothing is sent while the first toggle is off.
 
-#### Configure cPanel Cron Jobs
+#### 1.4 Configure cPanel Cron Jobs
 
 Schedules for the panel's own maintenance tasks. **Who:** root.
 A table of every registered schedule (name, job type, editable **cron expression**, **Enabled**
@@ -288,7 +288,7 @@ own schedule when nothing would run (statistics with no generator installed, ban
 web server) — the feature page shows *paused* with the reason. A schedule you disable here stays
 off even if the feature is on.
 
-#### Initial Quota Setup
+#### 1.5 Initial Quota Setup
 
 Enable and verify filesystem disk quotas. **Who:** root.
 **Summary** card (tools installed? *Install quota tools* button or link to *Install Distro
@@ -302,7 +302,7 @@ job. **Needs:** `quota` tools; a filesystem that supports user quotas (XFS needs
 the fstab change). **Gotchas:** without kernel quotas, packages' disk limits are recorded and
 measured by `du` but not enforced.
 
-#### Link Server Nodes
+#### 1.6 Link Server Nodes
 
 Register other panel servers this one can hand work to. **Who:** root.
 Table of nodes (name, `scheme://host:port` as user, roles, connection state, remote panel
@@ -314,7 +314,7 @@ certificate*, *Enabled*. **Server:** `/api/server-config/nodes*`; *Test* calls t
 API and records the answer. **Gotchas:** unlinking only deletes the stored token; nothing changes
 on the remote server. DNS/configuration replication itself is set up under *Clusters*.
 
-#### Server Profile
+#### 1.7 Server Profile
 
 Choose which roles this server fulfils. **Who:** root.
 Radio choice between **Standard Node** (everything shown), **DNS Node**, **Mail Node** and
@@ -324,7 +324,7 @@ Radio choice between **Standard Node** (everything shown), **DNS Node**, **Mail 
 `profile.hiddenCategories` through `/api/auth/me`. **Gotchas:** hidden categories vanish from the
 sidebar, Tools grid and search for everyone but stay reachable by URL and API, as in WHM.
 
-#### Server Time
+#### 1.8 Server Time
 
 Timezone and NTP synchronisation. **Who:** root.
 Shows the current server time; *Find a timezone* filter, *Timezone* select, *Synchronise the
@@ -332,7 +332,7 @@ clock with NTP* toggle, **Apply**. **Server:** `PUT /api/server-config/time` →
 set-timezone` / `set-ntp`. **Needs:** systemd's `timedatectl` (a capability notice replaces the
 form otherwise). **Gotchas:** mail headers, logs and cron use this clock.
 
-#### Statistics Software Configuration
+#### 1.9 Statistics Software Configuration
 
 Web statistics generators and their schedule. **Who:** root.
 **Generators** table (AWStats, Webalizer, Analog: installed?, enabled toggle, *Run* button),
@@ -344,7 +344,7 @@ merges plain and TLS domlogs (`/var/log/whm/domlogs/<user>/<domain>-access.log` 
 package installed. **Gotchas:** the schedule pauses itself while no enabled generator is installed
 and resumes when one appears.
 
-#### Terminal
+#### 1.10 Terminal
 
 In-browser root shell. **Who:** root.
 **Open terminal** starts a `/bin/bash` session; **Your sessions** lists your open sessions with
@@ -355,7 +355,7 @@ open/close are audited. Limits: `terminal.max_sessions` (3) and `terminal.idle_m
 max 240). **Needs:** the `terminal` capability on the host. **Gotchas:** sessions belong to the
 administrator who opened them; closing sends SIGHUP to the shell and whatever runs in it.
 
-#### Tweak Settings
+#### 1.11 Tweak Settings
 
 Server-wide behaviour switches, grouped. **Who:** root.
 
@@ -372,7 +372,7 @@ view of the same keys the dedicated pages edit (cPHulk, Update Preferences, Back
 Configuration…); the dedicated page also applies side effects (re-creating schedules,
 re-applying firewall rules), the raw save does not always.
 
-#### Update Preferences
+#### 1.12 Update Preferences
 
 Release tier and automatic update policy. **Who:** root.
 *Release tier* radio (`stable`, `release`, `current`, `edge`), *Panel updates: apply
@@ -384,7 +384,7 @@ the last check. **Server:** `PUT /api/server-config/updates`, `POST …/updates/
 toggle is honoured by *Software*'s daily `os-update-check`, and packages are applied from
 *Software › System Update*.
 
-#### WHM Marketplace
+#### 1.13 WHM Marketplace
 
 Browse and install add-ons and plugins. **Who:** root.
 With the `whm-hub` provider enabled (*Market › Market Provider Manager*) the page lists the
@@ -394,11 +394,11 @@ the package manager can install, filter by category). Without the hub it is a re
 **Server:** `GET /api/server-config/marketplace`, `GET /api/marketplace/status`. **Needs:** a
 license with the `marketplace_free`/`marketplace_paid` feature for hub installs.
 
-## Support
+## 2. Support
 
 Routes under `/api/support/*`.
 
-#### Create Support Ticket
+#### 2.1 Create Support Ticket
 
 Open a support request with a redacted system snapshot. **Who:** root (the ticket API is root
 only).
@@ -413,7 +413,7 @@ the ticket id. **Needs:** a mail transport (Exim or the SMTP relay from *Contact
 delivery; without an address the ticket is stored only. **Gotchas:** deleting removes the local
 copy; anything already e-mailed stays with the provider.
 
-#### Grant cPanel Support Access
+#### 2.2 Grant cPanel Support Access
 
 Time-boxed access for support engineers. **Who:** root.
 **Grant access** form: *Label* (ticket number; becomes the key comment and token name),
@@ -430,7 +430,7 @@ only the token. **Gotchas:** the private key is not stored; a grant whose key co
 removed stays in *cleanup pending* and is retried every five minutes (sshd refuses the key after
 the deadline regardless).
 
-#### Support Center
+#### 2.3 Support Center
 
 Documentation, forums and support resources. **Who:** root, reseller (overview and docs).
 Cards: **Tickets** (counts, *New ticket*), **Support access** (active grants, *Manage*),
@@ -441,11 +441,11 @@ section by section, with copy/download), and **Settings** (root): *Support email
 *Provider name*, *Support portal URL*, *Default grant length*, *Maximum grant length*.
 **Server:** `/api/support/center`, `/docs`, `/diagnostics`, `/settings`.
 
-## Networking Setup
+## 3. Networking Setup
 
 Routes under `/api/networking/*`; **root only**.
 
-#### Change Hostname
+#### 3.1 Change Hostname
 
 Set the server's fully qualified hostname. **Who:** root.
 Shows the current hostname; form: *Hostname* (at least three labels, no `www`, not an IP, not a
@@ -460,7 +460,7 @@ re-issue and zone record. **Needs:** `hostnamectl` (systemd). **Gotchas:** the p
 conflict when the name is a domain of an account; partial failures are reported step by step,
 not rolled back.
 
-#### Resolver Configuration
+#### 3.2 Resolver Configuration
 
 DNS resolvers the server uses. **Who:** root.
 Current configuration (read from `/etc/resolv.conf` or systemd-resolved, with a note on which
@@ -473,12 +473,12 @@ history under `/api/networking/history?kind=resolvers`. **Gotchas:** when anothe
 (NetworkManager, cloud-init) owns the file the save reports `applied: false` until you take
 the file over.
 
-## Security Center
+## 4. Security Center
 
 Routes under `/api/security/*`; **root only** except Two-Factor Authentication, where every
 user manages their own enrolment.
 
-#### Apache mod_userdir Tweak
+#### 4.1 Apache mod_userdir Tweak
 
 Control `http://host/~user/` URLs. **Who:** root.
 *Enable mod_userdir* toggle and a per-account **Exclude these accounts** list; **Save and reload
@@ -486,7 +486,7 @@ Apache**. **Server:** `PUT /api/security/userdir` writes the managed include, va
 `apachectl -t`, reloads; a rejected file is rolled back. **Needs:** Apache. **Gotchas:** `~user`
 URLs bypass per-domain bandwidth accounting and SSL, hence the exclusions.
 
-#### SMTP Restrictions
+#### 4.2 SMTP Restrictions
 
 Block outgoing SMTP (port 25) from everyone but mail-system users. **Who:** root.
 One-button page: **Enable/Disable SMTP restrictions**, with per-family (IPv4/IPv6) state pills,
@@ -494,14 +494,14 @@ the firewall backend in use and warnings when the panel setting and the live rul
 **Server:** `PUT /api/security/smtp-restrictions` installs owner-match rules through the agent;
 the setting is re-applied at panel start and checked hourly. **Needs:** `iptables` or `nftables`.
 
-#### Compiler Access
+#### 4.3 Compiler Access
 
 Allow or deny compilers to unprivileged users. **Who:** root.
 **Allow compilers / Deny compilers** with the list of binaries found (`gcc`, `cc`, `g++`,
 `clang`). **Server:** `PUT /api/security/compilers` changes the binaries' modes through the agent.
 **Gotchas:** the page is empty when no compiler is installed.
 
-#### Configure Security Policies
+#### 4.4 Configure Security Policies
 
 Login and session policies. **Who:** root.
 
@@ -510,7 +510,7 @@ Login and session policies. **Who:** root.
 | Require 2FA for root / for resellers | `security.2fa.required_for_root`, `security.policy.require_2fa_for_resellers` | login (`mustEnroll2fa` gate) |
 | Only users with 2FA may create API tokens | `security.policy.api_tokens_require_2fa` | token auth middleware |
 | Limit logins to verified IP addresses | `security.policy.verified_ip_login` | login (audit + `login.new_ip` notification) |
-| Idle session timeout (minutes) | `security.policy.session_timeout_minutes` | session middleware (0 = server default `WHM_SESSION_TTL`) |
+| Idle session timeout (minutes) | `security.policy.session_timeout_minutes` | session middleware (0 = server default `sessionTtlMs` from whm.conf, 8 h) |
 | One active session per user | `security.policy.disallow_concurrent_sessions` | login destroys other sessions |
 | Maximum password age (days) | `security.policy.password_max_age_days` | login forces a change |
 | Minimum password strength | `security.min_password_strength` | every password set |
@@ -520,7 +520,7 @@ Login and session policies. **Who:** root.
 most switches — that wording predates the core enforcement described above (see
 `server/test/auth-policy.test.js`); treat the switches as live.
 
-#### cPHulk Brute Force Protection
+#### 4.5 cPHulk Brute Force Protection
 
 Block repeated failed logins. **Who:** root.
 Tabs: **Status & settings** (protection on/off, active blocks, failures and attempts in 24 h;
@@ -534,7 +534,7 @@ maintenance job expires blocks and prunes history. **Gotchas:** panel logins are
 address — a CIDR is only blocked in the firewall and needs firewall sync; allowlisted exact
 addresses are never blocked.
 
-#### Host Access Control
+#### 4.6 Host Access Control
 
 Per-service allow and deny rules (TCP wrappers). **Who:** root.
 Ordered rule rows (*Source* address/CIDR, *Action* allow/deny, *Comment*, move up/down,
@@ -544,7 +544,7 @@ remove), **Save and write /etc/hosts.allow**, and the current `/etc/hosts.allow`
 `libwrap` (sshd, vsftpd, dovecot…); the page notes when libwrap is absent. **Gotchas:** a
 `hosts.deny` with foreign rules is left untouched and keeps applying.
 
-#### Manage External Authentications
+#### 4.7 Manage External Authentications
 
 OpenID Connect providers for panel login. **Who:** root.
 **Policy** card: *Allow external authentication on the login page*, *Automatically link by
@@ -556,7 +556,7 @@ enabled) with **Discover**, **Edit**, **Enable/Disable**, **Delete**. Provider f
 `/api/auth/external/:name/start|callback`. **Gotchas:** discovery refuses endpoints on other
 hosts unless you explicitly allow them (the client secret is sent to the token endpoint).
 
-#### Manage root's SSH Keys
+#### 4.8 Manage root's SSH Keys
 
 Generate, import and authorise root SSH keys. **Who:** root.
 **Key pairs in /root/.ssh** (name, type, fingerprint, comment, authorized, created) with
@@ -567,7 +567,7 @@ passed to `ssh-keygen` via its environment —, *Authorize immediately*); **Impo
 **Server:** `/api/security/ssh/keys*` through agent ops on `/root/.ssh`. **Needs:** `ssh-keygen`
 for generation.
 
-#### Manage Wheel Group Users
+#### 4.9 Manage Wheel Group Users
 
 Who may become root with `su`. **Who:** root.
 Pick a user and **Add to wheel** (or `sudo`, whichever group exists); members table with
@@ -575,7 +575,7 @@ Pick a user and **Add to wheel** (or `sudo`, whichever group exists); members ta
 through the agent. **Gotchas:** if neither group exists the page tells you to create one and
 configure `pam_wheel` first.
 
-#### ModSecurity Configuration
+#### 4.10 ModSecurity Configuration
 
 Web application firewall engine settings. **Who:** root.
 Status card and **Engine directives**: `SecRuleEngine` (On / DetectionOnly / Off),
@@ -585,7 +585,7 @@ limits and action, PCRE limits, `SecConnEngine`; empty = keep the distribution v
 file, `apachectl -t`, reload, rollback on error. **Needs:** `mod_security2` (Debian:
 `libapache2-mod-security2`; RHEL: `mod_security`).
 
-#### ModSecurity Tools
+#### 4.11 ModSecurity Tools
 
 Review hits and manage rules. **Who:** root.
 **Hits list** (parsed from the audit/error log; time, client, host, URI, rule id, message,
@@ -595,7 +595,7 @@ files: id, message, severity, phase, vendor/file, enable toggle; search; *Disabl
 `SecRuleRemoveById` for the whole server and reloads Apache. **Gotchas:** prefer disabling one
 rule over switching the engine to DetectionOnly.
 
-#### ModSecurity Vendors
+#### 4.12 ModSecurity Vendors
 
 Install and update rule vendors. **Who:** root.
 **Installed vendors** (name, source URL, installed/updated, enabled toggle; **Update**,
@@ -606,7 +606,7 @@ Comodo). Installs and updates run as jobs with a progress log. **Server:**
 reloaded. **Gotchas:** the OWASP preset is disabled when the distribution's CRS package is
 already active.
 
-#### Password Strength Configuration
+#### 4.13 Password Strength Configuration
 
 Minimum password strength requirements. **Who:** root.
 *Default minimum strength* (0–100; 65 rejects dictionary words and short passwords, 80 needs
@@ -614,7 +614,7 @@ mixed case and symbols) and **per-context overrides** (`security.password.streng
 **Test a password** scores a candidate with the server's algorithm for a chosen context.
 **Server:** settings; `POST /api/security/password-strength` scores without storing.
 
-#### Security Advisor
+#### 4.14 Security Advisor
 
 Scan the server for security weaknesses. **Who:** root.
 **Scan now / Scan again** runs read-only probes (SSH, firewall, cPHulk, ModSecurity,
@@ -623,7 +623,7 @@ remediation links; the summary shows counts and the last scan time and trigger.
 **Server:** `POST /api/security/advisor/scan`, last result from `GET /api/security/advisor`.
 **Gotchas:** scans never change anything.
 
-#### Security Questions
+#### 4.15 Security Questions
 
 Recovery question policy. **Who:** root.
 *Require security questions*, *Questions each user must answer*, *Minimum answer length*,
@@ -631,7 +631,7 @@ Recovery question policy. **Who:** root.
 (`security.questions.*`). **Gotchas:** stored but **not enforced** — no login or password-reset
 flow consumes these settings yet (the page says so).
 
-#### Shell Fork Bomb Protection
+#### 4.16 Shell Fork Bomb Protection
 
 Per-user process and memory limits. **Who:** root.
 Status, then *Maximum processes (nproc)* (WHM's classic default 35), *Maximum open files*,
@@ -640,7 +640,7 @@ Save limits**, **Disable**. **Server:** `PUT /api/security/fork-bomb` writes
 `/etc/security/limits.d/whm-forkbomb.conf` through the agent; root is always exempt.
 **Needs:** `/etc/security/limits.d` (pam_limits).
 
-#### SSH Password Authorization Tweak
+#### 4.17 SSH Password Authorization Tweak
 
 Toggle SSH password authentication and related sshd options. **Who:** root.
 Effective configuration (with warnings when another file shadows a setting), then *Password
@@ -651,13 +651,13 @@ reload, rollback on error. **Gotchas:** turning password auth off with no author
 asks for an explicit override — it would lock root out; update the firewall before changing
 the port.
 
-#### Traceroute Enable/Disable
+#### 4.18 Traceroute Enable/Disable
 
 Control traceroute availability. **Who:** root.
 **Enable/Disable traceroute** for `traceroute`, `tracepath` and `mtr` (mode changes through
 the agent). Empty when none is installed.
 
-#### Two-Factor Authentication
+#### 4.19 Two-Factor Authentication
 
 Time-based one-time passwords for panel logins. **Who:** every user for their own account;
 the server policy card is root only.
@@ -668,11 +668,11 @@ the root user*. **Server:** `POST /api/auth/2fa/enroll|confirm|disable`; the sec
 encrypted. **Gotchas:** when the policy requires 2FA for your role, this page is the only one
 you can open until you enrol.
 
-## Server Contacts
+## 5. Server Contacts
 
 Routes under `/api/server-contacts/*`; **root only**.
 
-#### Contact Manager
+#### 5.1 Contact Manager
 
 Notification channels and the events they receive. **Who:** root.
 **Contacts** table (name, channel, address, events, minimum severity, last sent/error) with
@@ -697,7 +697,7 @@ addresses*), *Send a test message*. **Monitoring checks**: run every 10 minutes
 **Needs:** Exim or an SMTP relay for e-mail/SMS; Slack/Pushover/webhooks only need outbound
 HTTPS. **Gotchas:** webhooks to private addresses are refused unless allowed.
 
-#### Edit System Mail Preferences
+#### 5.2 Edit System Mail Preferences
 
 Where system mail for root and `nobody` is delivered. **Who:** root.
 *Forward root's mail to* and *Forward mail for nobody to* (local users or full addresses, up
@@ -708,26 +708,26 @@ and the read-only list of other `/etc/aliases` entries; **Save** rewrites only t
 full addresses receive the events through it). **Gotchas:** the alias file is read through the
 agent; when it cannot be read the forwarding list is unavailable but the event list still saves.
 
-## Resellers
+## 6. Resellers
 
 Routes under `/api/resellers/*`. Reading one's own reseller record, delegated IPs, owned
 accounts and usage is allowed to the reseller; everything else is **root only**.
 
-#### Change Ownership of an Account
+#### 6.1 Change Ownership of an Account
 
 Move one hosting account to root or another reseller. **Who:** root.
 Pick the account, choose *New owner*, confirm. **Server:** `PUT /api/resellers/ownership/:username`
 updates the owner; packages, IPs and DNS are unchanged; the new owner's limits are reported
 (an over-limit reseller is flagged), not enforced.
 
-#### Change Ownership of Multiple Accounts
+#### 6.2 Change Ownership of Multiple Accounts
 
 Bulk ownership changes. **Who:** root.
 Table of all accounts with a filter by current owner and a search, multi-select, *New owner*,
 **Move N to owner**; a result table shows each account's outcome and warnings. **Server:**
 `POST /api/resellers/ownership { usernames, owner }`, reassigning one by one.
 
-#### Edit Reseller Nameservers and Privileges
+#### 6.3 Edit Reseller Nameservers and Privileges
 
 ACLs and nameservers per reseller. **Who:** root.
 Pick the reseller; **Nameservers** (blank entries fall back to the server's, from *Basic
@@ -743,7 +743,7 @@ reuse in Reseller Center. **Server:** `PUT /api/resellers/:username/privileges`,
 inside the service (`suspend-acct`, `kill-acct`, `passwd`, `quota`, `limit-bandwidth`,
 `add-pkg-shell`, `demo-setup`, `edit-account`, `upgrade-account`, `list-accts`, `news`).
 
-#### Email All Resellers
+#### 6.4 Email All Resellers
 
 Broadcast a message to every reseller. **Who:** root.
 Recipient list, *From address* (blank: `resellers.email_from`, then the notification sender),
@@ -752,7 +752,7 @@ runs as a job with a delivery log; **Recent broadcasts** keeps messages and addr
 only). **Server:** `POST /api/resellers/email` (202). **Needs:** a mail transport (501
 otherwise).
 
-#### Manage Reseller's IP Delegation
+#### 6.5 Manage Reseller's IP Delegation
 
 IP addresses a reseller may assign. **Who:** root (a reseller can view its own).
 Pick the reseller; table of delegatable addresses (address, family, interface, role,
@@ -762,14 +762,14 @@ cannot be delegated (main, reserved, dedicated, dynamic, delegated elsewhere). *
 reseller's shared IP are the only ones it may assign when creating accounts; an address can be
 delegated to one reseller only.
 
-#### Manage Reseller's Shared IP
+#### 6.6 Manage Reseller's Shared IP
 
 Default shared IP for a reseller. **Who:** root.
 Radio list: *Server shared IP* or one of the main/delegated/free addresses; **Save shared IP**.
 **Server:** `PUT /api/resellers/:username/shared-ip`. **Gotchas:** existing accounts are not
 moved — use *Change Site's IP Address*.
 
-#### Reseller Center
+#### 6.7 Reseller Center
 
 Create and manage resellers and their limits. **Who:** root.
 Table (username, e-mail, accounts/limit, disk allocated bar, privilege count, shared IP, last
@@ -783,7 +783,7 @@ packages**. **Edit** adds *Notes* and the full privilege grid. **Server:**
 `POST/PUT /api/resellers[/:username]`, `…/suspend`, `…/unsuspend`. **Gotchas:** suspending a
 reseller's privileges locks the reseller login only; its hosting accounts keep running.
 
-#### Reset Resellers
+#### 6.8 Reset Resellers
 
 Strip reseller privileges. **Who:** root.
 Table with multi-select, **Reset selected**, **Reset all resellers**; confirmation states how
@@ -791,14 +791,14 @@ many accounts move to root. **Server:** `POST /api/resellers/reset`: ACLs, limit
 and delegated IPs are removed and the owned accounts are reassigned to root; the hosting
 accounts themselves are untouched.
 
-#### Show Reseller Accounts
+#### 6.9 Show Reseller Accounts
 
 Accounts owned by a reseller. **Who:** root (any reseller), reseller (own).
 Reseller picker (root), *Active only / Suspended / All* filter, searchable table (domain,
 user, package, IP, disk, bandwidth, contact, created, status) with **Modify** and **Change
 owner** links. **Server:** `GET /api/resellers/:username/accounts`.
 
-#### View Reseller Usage and Manage Account Status
+#### 6.10 View Reseller Usage and Manage Account Status
 
 Usage overview with suspend controls. **Who:** root (all resellers), reseller (own).
 **All resellers** table (accounts, disk allocated/used, bandwidth allocated/used against limits,
@@ -806,12 +806,12 @@ status), a per-reseller usage card, and the reseller's **Accounts** table with p
 **Suspend** (reason recorded) / **Unsuspend**. **Server:** `GET /api/resellers/usage`,
 `GET /api/resellers/:username/usage`, suspension through `POST /api/accounts/:username/suspend|unsuspend`.
 
-## Service Configuration
+## 7. Service Configuration
 
 Routes under `/api/service-config/*` and `/api/system/services*`; **root only** except
 reading the service list.
 
-#### Apache Configuration
+#### 7.1 Apache Configuration
 
 Global web server directives and includes. **Who:** root.
 **Server** card (version, MPM, modules, vhost counts with *Sync vhosts* job; *Reload* /
@@ -826,7 +826,7 @@ renders `conf-enabled/whm.conf` or `conf.d/whm.conf`, validates with `apachectl 
 rejected saves are rolled back. **Needs:** Apache. **Gotchas:** a threaded MPM cannot be
 enabled while `mod_php` is loaded — the page warns.
 
-#### cPanel Log Rotation Configuration
+#### 7.2 cPanel Log Rotation Configuration
 
 Log rotation policy. **Who:** root.
 **Policy**: frequency, rotations to keep, *Rotate when larger than*, compress, delaycompress,
@@ -835,7 +835,7 @@ policies** (panel, accounts, web server: files under `/etc/logrotate.d/whm-*`, *
 *Force-rotate*); a **Preview** of the rendered files. **Server:** `PUT /api/service-config/logrotate`
 writes the three files; `POST …/logrotate/:name/run`. **Needs:** `logrotate`.
 
-#### cPanel Web Disk Configuration
+#### 7.3 cPanel Web Disk Configuration
 
 WebDAV service settings. **Who:** root.
 *Enable Web Disk*, *Plain port* (2077), *SSL port* (2078), idle timeout, maximum upload, *Who
@@ -844,7 +844,7 @@ unauthenticated OPTIONS/PROPFIND*). **Server:** settings only (`PUT /api/service
 **Gotchas:** the panel does not ship a WebDAV daemon yet; the values are stored for a service
 that does not run — the page says so.
 
-#### cPanel Web Services Configuration
+#### 7.4 cPanel Web Services Configuration
 
 Tuning for the panel's own HTTP services. **Who:** root.
 **API** (JSON API on/off, token lifetime, browser session timeout, rate limit, max concurrent
@@ -853,7 +853,7 @@ IPv6 listen, expose version). **Server:** settings only. **Gotchas:** **not wire
 panel** — the listeners are configured by `/etc/whm/panel.env` and the session policy lives in
 *Security Center › Configure Security Policies*; this page records intent.
 
-#### Exim Configuration Manager
+#### 7.5 Exim Configuration Manager
 
 Server-wide mail-server policy. **Who:** root.
 Tabs: **RBLs & verification** (reject hosts in IP RBLs, domain RBLs, SPF verify/reject, DKIM
@@ -867,7 +867,7 @@ renders the managed files, validates (`exim -bV`), reloads. **Needs:** Exim. **G
 page warns when Exim does not include the panel's RCPT ACL chain — rejection rules are then not
 in force until the include exists (the Email category's filters rely on the same chain).
 
-#### FTP Server Selection
+#### 7.6 FTP Server Selection
 
 Choose the FTP daemon. **Who:** root.
 **FTP server** selector (Pure-FTPd, ProFTPD, vsftpd, or *disabled*; install as a job when not
@@ -878,7 +878,7 @@ enables and starts the chosen unit and stops/disables the alternatives; `…/ftp
 renders the daemon's config and reloads it. **Gotchas:** active FTP sessions drop on a switch;
 anonymous logins are ignored by the ProFTPD renderer.
 
-#### Mailserver Configuration
+#### 7.7 Mailserver Configuration
 
 Dovecot IMAP/POP3 settings. **Who:** root.
 **Protocols** (IMAP, POP3, LMTP, …), **Connections** (per-user-per-IP, process and client
@@ -889,7 +889,7 @@ list, TLS 1.3 suites, prefer server order, disable plaintext auth), **Mailboxes*
 file through the agent, which validates it before reloading Dovecot. **Needs:** Dovecot. **Gotchas:** disabling IMAP asks
 for confirmation; certificate paths are owned by *SSL/TLS* (`90-whm-ssl-cert.conf`), not here.
 
-#### Manage Service SSL Certificates
+#### 7.8 Manage Service SSL Certificates
 
 Certificates for Exim, Dovecot, FTP, Apache's default host and the panel. **Who:** root.
 Table per service (paths under `/etc/ssl/whm/service/<service>/`, subject, expiry) with
@@ -898,7 +898,7 @@ panel DB) and **Reset to self-signed** (new certificate for the hostname, N days
 **Server:** `POST /api/service-config/service-certs/:service[/self-signed]`, wiring the paths
 into each daemon and reloading it. **Needs:** `openssl`.
 
-#### Nameserver Selection
+#### 7.9 Nameserver Selection
 
 Choose the DNS server software and role. **Who:** root.
 *Role* (master / slave / standalone) and the daemon selector (BIND or PowerDNS, install as a
@@ -906,7 +906,7 @@ job, or *disabled*). **Server:** `PUT /api/service-config/nameserver` enables/st
 unit and disables the other; zones stay in the panel database and are written for the active
 daemon. **Gotchas:** after an install job finishes, select the daemon again to enable it.
 
-#### Service Manager
+#### 7.10 Service Manager
 
 Enable, monitor and auto-restart services. **Who:** root (resellers can view the list).
 Table (service, unit or the candidate units looked for, status, *Start at boot*, *Monitor*,
@@ -915,33 +915,33 @@ Table (service, unit or the candidate units looked for, status, *Start at boot*,
 loop restarts failed monitored services and raises `service.down`/`service.restored`.
 **Gotchas:** the monitored set follows the *Server Profile*.
 
-## Locales
+## 8. Locales
 
 Routes under `/api/locales/*`. Viewing, keys and XML download are open to resellers; configuring,
 editing, copying, deleting and uploading are **root only**.
 
-#### Configure Application Locales
+#### 8.1 Configure Application Locales
 
 Default and available interface languages. **Who:** root.
 *Default locale* (always enabled), an enable toggle per installed locale, **Save**; a
 browser-only *Interface language for this browser* preference (stored locally, enabled locales
 only). **Server:** `PUT /api/locales/config`.
 
-#### Copy a Locale
+#### 8.2 Copy a Locale
 
 Duplicate a locale to customise it. **Who:** root.
 *Source locale*, *New locale code* (`es`, `de_at`, `pt_br`…), *Display name*; **Copy locale**.
 **Server:** `POST /api/locales/:code/copy`. **Gotchas:** the copy is disabled until enabled under
 Configure Application Locales; copy the built-in English locale to start a new translation.
 
-#### Delete a Locale
+#### 8.3 Delete a Locale
 
 Remove a custom locale. **Who:** root.
 Table of custom locales (code, name, state, translated progress, updated) with **Download XML
 first** and **Delete**. **Server:** `DELETE /api/locales/:code`. **Gotchas:** the built-in
 English locale and the current default cannot be deleted.
 
-#### Edit a Locale
+#### 8.4 Edit a Locale
 
 Edit translated strings. **Who:** root.
 Pick the locale and *Display name*; the **Strings** editor shows every key next to its English
@@ -949,13 +949,13 @@ source with tabs *All / Untranslated / Translated / Unsaved / Not in catalog*, s
 paging; clearing a field falls back to English. **Server:** `PUT /api/locales/:code` (reports
 changed/cleared counts). **Gotchas:** the English catalog is read-only.
 
-#### Locale XML Download
+#### 8.5 Locale XML Download
 
 Export a locale. **Who:** root, reseller.
 Pick a locale, **Preview**, **Download `<code>.xml`** (every translated string as
 `<string key=…>`). **Server:** `GET /api/locales/:code/xml`.
 
-#### Locale XML Upload
+#### 8.6 Locale XML Upload
 
 Import a locale. **Who:** root.
 File (≤ 2 MB) or pasted XML, optional *Locale code* and *Display name* overrides, mode
@@ -963,20 +963,20 @@ File (≤ 2 MB) or pasted XML, optional *Locale code* and *Display name* overrid
 **Import**. **Server:** `POST /api/locales/xml` (`dryRun` first). **Gotchas:** the built-in
 English locale cannot be overwritten.
 
-#### View Available Locales
+#### 8.7 View Available Locales
 
 All installed locales. **Who:** root, reseller.
 Table (code, name, state pills, translated progress, source, updated) with per-row links
 (edit/copy/download for root, download for resellers) and, for root, the **Operating system
 locale** card (`LANG`/`LC_*` from the host). **Server:** `GET /api/locales`, `GET /api/locales/system`.
 
-## Backup
+## 9. Backup
 
 Routes under `/api/backup/*`. Configuration, destinations, user selection, run history,
 rescans and imports are **root only**; listing backups of owned accounts, fetching, browsing
 and restoring them is allowed to resellers.
 
-#### Backup Configuration
+#### 9.1 Backup Configuration
 
 Schedule, retention, scope and destinations. **Who:** root.
 **Status** (enabled, next run, accounts included, local directory, last run; **Run backup
@@ -998,7 +998,7 @@ use the cPanel layout (`homedir/`, `mysql/`, `dnszones/`, `cp/`). **Needs:** `ta
 written locally first, then copied to every enabled destination; deleting a destination does
 not delete what is already uploaded there.
 
-#### Backup Restoration
+#### 9.2 Backup Restoration
 
 Restore a full account backup. **Who:** root; reseller for owned accounts.
 **1. Choose the account and the backup date** (fetch a remote-only archive first, as a job).
@@ -1012,7 +1012,7 @@ history** shows each restore with its step outcomes. **Server:**
 **Gotchas:** database grants are replayed only for databases the account owns; untrusted
 archives never recreate device nodes.
 
-#### Backup User Selection
+#### 9.3 Backup User Selection
 
 Include or exclude accounts. **Who:** root.
 *Include accounts that have no explicit setting* (the default), filter *All / Included /
@@ -1020,7 +1020,7 @@ Excluded*, searchable table (account, owner, backups state with a *default* pill
 with per-row **Include/Exclude** and bulk **Include selected / Exclude selected**. **Server:**
 `PUT /api/backup/selection`, `PUT /api/backup/config { 'backup.default_include' }`.
 
-#### File and Directory Restoration
+#### 9.4 File and Directory Restoration
 
 Restore individual files. **Who:** root; reseller for owned accounts.
 Choose account and date, browse the archive (breadcrumbs, filter, checkboxes; directories
@@ -1029,13 +1029,13 @@ N selected** (job), **Recent file restores**. **Server:** `GET /api/backup/backu
 `POST …/restore { kind: 'files', options: { paths, overwrite } }`; files are written into the
 home with the account's ownership.
 
-## Clusters
+## 10. Clusters
 
 Routes under `/api/clusters/*`; **root only**. Peers authenticate to each other with cluster
 tokens that carry a purpose (`clustering:dns` or `clustering:config`) and are confined to
 those endpoints.
 
-#### Configuration Cluster
+#### 10.1 Configuration Cluster
 
 Share configuration with peer servers. **Who:** root.
 **Peers** (shared with DNS Cluster: name, address — port 2087 assumed, token, DNS role,
@@ -1050,7 +1050,7 @@ differences, then apply), and the **Exchange log**. **Server:** `/api/clusters/c
 group selection; values applied where the daemon is missing are reported as *stored, daemon
 missing*.
 
-#### DNS Cluster
+#### 10.2 DNS Cluster
 
 Replicate DNS zones to other nameservers. **Who:** root.
 Peers with a DNS role — **Write-only** (receives zones), **Sync** (receives, may push back),
@@ -1062,11 +1062,11 @@ hourly run re-sends stale zones. **Needs:** the DNS Functions module; BIND is op
 pushing server (zones live in the panel database and are pushed regardless). **Gotchas:**
 revoking a token cuts the peer off immediately.
 
-## System Reboot
+## 11. System Reboot
 
 Routes under `/api/system-reboot/*`; **root only**.
 
-#### Forceful Server Reboot
+#### 11.1 Forceful Server Reboot
 
 Reboot immediately. **Who:** root.
 Preflight card (reboot required by updates, running and queued jobs, systemctl present, last
@@ -1076,19 +1076,19 @@ request the page polls `/api/health` and offers *Reload the panel* when the serv
 the request is recorded with the boot id so *completed* can be verified later. **Gotchas:**
 unsaved data in running services may be lost; use only when a graceful reboot hangs.
 
-#### Graceful Server Reboot
+#### 11.2 Graceful Server Reboot
 
 Stop services cleanly, then reboot. **Who:** root.
 Same page as above with **Graceful Reboot** → `systemctl reboot` (systemd stops services in
 dependency order). **Needs:** `systemctl`. **Gotchas:** running jobs are marked failed when the
 panel restarts, queued jobs resume after boot; transfers and backups must be started again.
 
-## Server Status
+## 12. Server Status
 
 Routes under `/api/server-status/*` and `/api/system/*`. Apache status, the process log and
 server information are **root only**; service status and the job list are visible to resellers.
 
-#### Apache Status
+#### 12.1 Apache Status
 
 Live web server worker status. **Who:** root.
 Stats (running, requests/s, throughput, busy/idle workers, uptime), **Worker scoreboard**,
@@ -1098,7 +1098,7 @@ Configuration** when `mod_status` is not reachable. **Server:** `GET /api/server
 reads `http://localhost/server-status?auto`; `POST …/apache/enable-status` writes the include.
 **Needs:** Apache with `mod_status` on localhost; `ExtendedStatus On` for per-request counters.
 
-#### Daily Process Log
+#### 12.2 Daily Process Log
 
 Resource usage by process over time. **Who:** root.
 A sampler records the top N processes by CPU and memory every 5 minutes
@@ -1109,34 +1109,34 @@ processes every 5 minutes*, *Processes per sample*, *Retention (days)*). **Serve
 `/api/server-status/process-log/*`. **Gotchas:** lowering retention deletes older days
 immediately (confirmed first); CPU % is `ps`'s lifetime average per process.
 
-#### Server Information
+#### 12.3 Server Information
 
 Hardware, OS, memory and disk details. **Who:** root.
 Load averages, uptime, memory and swap meters, **System** (hostname, OS, kernel, CPU, panel),
 **Memory**, **Disks**, **Network interfaces**; refreshes every 20 s. **Server:** `GET /api/system/info`
 (reads `/proc`, `df`, interfaces through the agent).
 
-#### Service Status
+#### 12.4 Service Status
 
 Up/down state of monitored services. **Who:** root, reseller (view); actions root.
 Table (service, unit, status Up/Down/Not installed, PID, memory, restarts, started) with
 **Restart**, **Stop** (confirmed) / **Start**; refreshes every 15 s. **Server:**
 `GET /api/system/services`, `POST /api/system/services/:name/:verb` → `systemctl`.
 
-#### Task Queue Monitor
+#### 12.5 Task Queue Monitor
 
 Background jobs and their progress. **Who:** root, reseller (view; cancel is root).
 Table of the last 200 jobs (id, type, status, progress bar, message/error, queued, finished)
 refreshing every 5 s; **View log** opens the live progress log; **Cancel** for queued jobs.
 **Server:** `GET /api/system/jobs`, `GET /api/system/jobs/:id/stream` (SSE), `POST …/cancel`.
 
-## Account Information
+## 13. Account Information
 
 Routes under `/api/account-info/*` and `/api/accounts`. Lists are scoped to owned accounts
 for resellers; the quota refresh, bandwidth collection and settings, and enhancement
 definitions are **root only**.
 
-#### List Accounts
+#### 13.1 List Accounts
 
 Search, inspect and act on hosting accounts. **Who:** root, reseller (own accounts).
 Searchable, sortable table (domain, user, owner, package, IP, disk used/quota, contact,
@@ -1145,24 +1145,24 @@ created, status) with row actions **Modify**, **Suspend/Unsuspend**, **Change pa
 **Server:** `GET /api/accounts?page&pageSize&q&sort&dir`; actions call the account routes with
 the ACL checks listed under Account Functions.
 
-#### List Parked Domains
+#### 13.2 List Parked Domains
 
 Parked (alias) domains. **Who:** root, reseller (own).
 Table of alias domains with the account, the domain they point at and the shared document
 root; link to *Park a Domain*. **Server:** `GET /api/account-info/domains?type=parked`.
 
-#### List Subdomains
+#### 13.3 List Subdomains
 
 All subdomains. **Who:** root, reseller (own).
 Same table for `type=sub` (root domain and document root).
 
-#### List Suspended Accounts
+#### 13.4 List Suspended Accounts
 
 Accounts currently suspended. **Who:** root, reseller (own).
 The List Accounts table filtered with `suspended=true`; the same row actions apply
 (**Unsuspend** restores logins and web sites).
 
-#### Manage Account Enhancements
+#### 13.5 Manage Account Enhancements
 
 Add-on entitlements per account. **Who:** root defines enhancements; root and resellers
 (ACL `upgrade-account`) assign them to owned accounts.
@@ -1175,7 +1175,7 @@ account**: pick the account (`?username=` deep link), tick enhancements, **Save 
 `PUT /api/account-info/accounts/:username/enhancements`. **Gotchas:** package limits are not
 affected by deleting an enhancement.
 
-#### Show Accounts Over Quota
+#### 13.6 Show Accounts Over Quota
 
 Accounts exceeding disk quota. **Who:** root; reseller (own).
 Tabs *Over quota / Near quota / All*, stats (usage source `repquota` or `du` scan, warn
@@ -1186,7 +1186,7 @@ package, used, quota, usage meter, status, measured) with **Change quota**, **Mo
 without the quota tools usage is measured by the `account-disk-usage` schedule and limits are
 advisory.
 
-#### View Bandwidth Usage
+#### 13.7 View Bandwidth Usage
 
 Bandwidth consumption per account. **Who:** root; reseller (own; reset needs ACL
 `limit-bandwidth`).
@@ -1201,13 +1201,13 @@ directories* (e.g. an NGINX log root inside the agent's allowed paths). **Server
 hourly (`account-bandwidth` schedule) while a web server is installed. **Gotchas:** resetting
 the month also unsuspends an account suspended for bandwidth.
 
-## Account Functions
+## 14. Account Functions
 
 Routes under `/api/accounts/*` and `/api/account-functions/*`. Resellers act on owned
 accounts and need the ACL named in each block; *Rearrange an Account*, *Web Template Editor*
 and the bandwidth-enforcement switch are **root only**.
 
-#### Change Site's IP Address
+#### 14.1 Change Site's IP Address
 
 Move a site to a different IP. **Who:** root; reseller (own; the address must be its shared or
 a delegated IP).
@@ -1218,7 +1218,7 @@ through `ctx.web.replaceIp` and changes every A record that pointed at the old a
 account's zones; the result card lists each step. **Needs:** Apache/BIND for the respective
 steps (a missing daemon leaves that step pending, not failed).
 
-#### Create a New Account
+#### 14.2 Create a New Account
 
 Provision a hosting account. **Who:** root, reseller (ACL `create-acct`, within its limits and
 package list).
@@ -1234,14 +1234,14 @@ are checked first. **Gotchas:** a step whose daemon is missing stays *pending* u
 service is installed (then *Sync vhosts* / zone creation catches up); the default PHP version
 comes from the package or `php.default_version`.
 
-#### Email All Users
+#### 14.3 Email All Users
 
 Broadcast a message to all account owners. **Who:** root, reseller (own accounts).
 *Which accounts* (all / active / suspended), *Owned by* (root), *From address*, *Subject*,
 *Body* with `{{username}}`, `{{domain}}`, `{{hostname}}`; **Send** runs as a job with a
 delivery log. **Server:** `POST /api/account-functions/email` (202). **Needs:** a mail transport.
 
-#### Force Password Change
+#### 14.4 Force Password Change
 
 Require accounts to change their password. **Who:** root, reseller (ACL `edit-account`).
 Bulk flag page: account table with the *Change required* column, **Require change / Clear
@@ -1250,7 +1250,7 @@ requirement** per row, for the selection, or *for all*. **Server:**
 password is changed (Password Modification); since account owners have no panel login in this
 version, the flag matters for future user logins and for the record.
 
-#### Limit Bandwidth Usage
+#### 14.5 Limit Bandwidth Usage
 
 Set a bandwidth cap. **Who:** root, reseller (ACL `limit-bandwidth`); the enforcement switch
 is root only.
@@ -1261,7 +1261,7 @@ used/limit/usage. **Server:** `PUT /api/account-functions/bandwidth/:username`,
 with enforcement on, an account over its cap is suspended with a bandwidth reason and freed by
 *Unsuspend Bandwidth Exceeders* or the monthly reset.
 
-#### Manage Account Suspension
+#### 14.6 Manage Account Suspension
 
 Suspend or unsuspend with a reason. **Who:** root, reseller (ACL `suspend-acct`).
 Pick the account; *Reason (shown to the account owner)*; **Suspend account** (confirmed) /
@@ -1271,14 +1271,14 @@ unlocks the Linux account (blocks SSH, FTP and mailbox logins) and asks Service 
 toast tells you when the web step could not be applied (no web hook or daemon) — logins are
 still locked.
 
-#### Manage Demo Mode
+#### 14.7 Manage Demo Mode
 
 Restrict accounts to read-only demo mode. **Who:** root, reseller (ACL `demo-setup`).
 Bulk flag page (**Enable demo mode / Disable demo mode**). **Server:**
 `POST /api/account-functions/demo-mode`. **Gotchas:** demo mode is a recorded account attribute
 for the (future) account login; it changes nothing on the host.
 
-#### Manage Shell Access
+#### 14.8 Manage Shell Access
 
 Normal, jailed or no shell. **Who:** root, reseller (ACL `add-pkg-shell`).
 Choose the shell to apply — *Disabled* (`/usr/sbin/nologin`), *Jailed shell*
@@ -1287,7 +1287,7 @@ Choose the shell to apply — *Disabled* (`/usr/sbin/nologin`), *Jailed shell*
 whether the Linux user exists. **Server:** `PUT /api/account-functions/shell/:username` →
 `usermod -s` through the agent. **Gotchas:** FTP and the panel keep working with no shell.
 
-#### Modify an Account
+#### 14.9 Modify an Account
 
 Change domain, owner, package and limits. **Who:** root, reseller (ACL `edit-account`;
 owner change root only).
@@ -1297,7 +1297,7 @@ Pick the account; **Basic information** (*Contact email*, *Package* — re-appli
 `PATCH /api/accounts/:username`; quota and shell changes are applied to the Linux user.
 **Gotchas:** the primary domain is not renamed here; blank limits mean unlimited.
 
-#### Password Modification
+#### 14.10 Password Modification
 
 Set an account's password. **Who:** root, reseller (ACL `passwd`).
 Pick the account; *New password* (strength meter and generator). **Server:**
@@ -1305,7 +1305,7 @@ Pick the account; *New password* (strength meter and generator). **Server:**
 account's panel login); clears a pending force-change flag. **Gotchas:** must meet
 `security.min_password_strength` / the `account` context override.
 
-#### Quota Modification
+#### 14.11 Quota Modification
 
 Change disk quota. **Who:** root, reseller (ACL `quota`).
 Pick the account; *Unlimited disk space* or *Disk quota (MB)*; a **Quota report** table shows
@@ -1314,21 +1314,21 @@ live `repquota` figures next to the panel's record. **Server:**
 filesystem holding the home. **Needs:** quota tools and an enabled filesystem (otherwise the
 value is recorded and a 501 warning explains that it is not enforced).
 
-#### Raw Apache Log Download
+#### 14.12 Raw Apache Log Download
 
 Download raw web access logs. **Who:** root, reseller (own).
 Pick the account; table of files (name, directory, size, last written) from
 `/var/log/whm/domlogs/<user>` plus PHP-FPM logs, each with **Download**. **Server:**
 `GET /api/account-functions/logs/apache/:username[/download?file=]`.
 
-#### Raw NGINX Log Download
+#### 14.13 Raw NGINX Log Download
 
 Download raw NGINX logs. **Who:** root, reseller (own).
 Same page for NGINX logs mentioning the account's domains under `/var/log/nginx` and any nginx
 log in the account's home. **Gotchas:** empty until an NGINX vhost for the account has served
 traffic.
 
-#### Rearrange an Account
+#### 14.14 Rearrange an Account
 
 Move an account's home to another partition. **Who:** root.
 **Home partitions** table (`/home`, `/home2`, …: present, filesystem, free, used, accounts);
@@ -1339,24 +1339,24 @@ path and the vhosts are rewritten, then the old tree is removed and the account 
 failure rolls back (home pointer restored) and unsuspends. **Needs:** `rsync`. **Gotchas:**
 a per-account lock prevents two moves at once; create the target directory on the server first.
 
-#### Reset Account Bandwidth Limit
+#### 14.15 Reset Account Bandwidth Limit
 
 Clear bandwidth counters. **Who:** root, reseller (ACL `limit-bandwidth`).
 Table with used/limit/status, *Unsuspend bandwidth-suspended accounts* toggle, **Reset
 selected** / **Reset all**. **Server:** `POST /api/account-functions/bandwidth/reset`. The
 scheduler resets every account on the 1st of each month.
 
-#### Terminate Accounts
+#### 14.16 Terminate Accounts
 
 Permanently remove accounts. **Who:** root, reseller (ACL `kill-acct`).
 Searchable table with multi-select, *Keep DNS zones* toggle, **Terminate selected** (type the
 username, or `TERMINATE` for several). **Server:** `DELETE /api/accounts/:username?keepDns=`
-removes the vhosts, the account's databases and users, switches mail routing to remote and
-removes DKIM keys, deletes the zones (unless kept), deletes the Linux user and home tree, then
-the panel records. **Gotchas:** irreversible unless a backup exists — *Backup Restoration* can
+removes the account's SSL certificates, the vhosts, the account's databases and users, switches
+mail routing to remote and removes DKIM keys, deletes the zones (unless kept), deletes the Linux
+user and home tree, then the panel records. **Gotchas:** irreversible unless a backup exists — *Backup Restoration* can
 recreate a terminated account from its archive.
 
-#### Unsuspend Bandwidth Exceeders
+#### 14.17 Unsuspend Bandwidth Exceeders
 
 Bulk unsuspend accounts over bandwidth. **Who:** root, reseller (ACL `limit-bandwidth`).
 Table of accounts over their monthly limit or suspended for it; *Also reset counters*;
@@ -1364,7 +1364,7 @@ Table of accounts over their monthly limit or suspended for it; *Also reset coun
 `POST /api/account-functions/bandwidth/unsuspend-exceeders`. **Gotchas:** without resetting the
 counter, hourly enforcement suspends the account again.
 
-#### Upgrade/Downgrade an Account
+#### 14.18 Upgrade/Downgrade an Account
 
 Change an account's package. **Who:** root, reseller (ACL `upgrade-account`; its allowed
 packages).
@@ -1372,7 +1372,7 @@ Pick the account; *New package*; **Upgrade/Downgrade**. **Server:**
 `PATCH /api/accounts/:username { package }` re-applies the package limits (disk, bandwidth,
 shell, PHP version).
 
-#### Web Log Retention
+#### 14.19 Web Log Retention
 
 How long to keep web logs. **Who:** root, reseller (own).
 Table (account, archive on/off, keep months, last archived, source account/server default)
@@ -1381,7 +1381,7 @@ with **Edit** (*Archive logs in the home directory* — monthly into `~/logs/arc
 all). **Server:** `/api/account-functions/log-retention*`. **Gotchas:** rotation of the live
 logs is *cPanel Log Rotation Configuration*; this page only governs the per-account archives.
 
-#### Web Template Editor
+#### 14.20 Web Template Editor
 
 Default and error page templates. **Who:** root.
 Pick a page — *Default site page (new accounts)*, *Suspended account page*, *Site moved page*,
@@ -1392,12 +1392,12 @@ default site page is served today (written into `public_html` of new accounts); 
 saved for the web server configuration that will reference them, and the page says when a
 template is "saved in the panel only".
 
-## Multi Account Functions
+## 15. Multi Account Functions
 
 Routes under `/api/multi-account/*`. Runs are capped at `multi_account.max_batch` accounts
 (500) and leave a per-account report (CSV/JSON).
 
-#### Change Multiple Sites' IP Addresses
+#### 15.1 Change Multiple Sites' IP Addresses
 
 Bulk IP changes. **Who:** root.
 Three steps: **Select accounts and addresses** (filter by search, owner, package, IP, status;
@@ -1410,7 +1410,7 @@ problems), **Run** (job with progress log, then the per-account outcome with ste
 **Gotchas:** IPv4 only (IPv6 is assigned under IP Functions); with *Require installed
 services* off, a missing daemon leaves the step pending instead of refusing the run.
 
-#### Modify/Upgrade Multiple Accounts
+#### 15.2 Modify/Upgrade Multiple Accounts
 
 Bulk package and limit changes. **Who:** root, reseller (ACL `list-accts`; `demo-setup` for
 demo mode, `add-pkg-shell` for shells or packages that grant one; owner change root only).
@@ -1422,4 +1422,6 @@ is blocked); **Run** (job, outcome table, reports). **Server:**
 `POST /api/multi-account/modify/preview`, `POST /api/multi-account/modify` (202); limits are
 applied to the Linux user (quota, shell) and PHP-FPM pools where a package names a version.
 
-<!-- PART B -->
+---
+
+The manual continues with categories 16–30 and the appendices in [MANUAL-partB.md](MANUAL-partB.md).

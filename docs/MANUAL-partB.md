@@ -1,5 +1,8 @@
 # Part B — Categories 16–30 and appendices
 
+This is the second half of the WHM User Manual. Part A (getting around, conventions and categories 1–15)
+is [MANUAL.md](MANUAL.md); installation is covered in [INSTALL.md](INSTALL.md).
+
 ## Contents of Part B
 
 - [16. Transfers](#16-transfers)
@@ -832,7 +835,7 @@ Sidebar category 25. API prefix `/api/cpanel`; the branding read endpoints are a
 - **Screen:** *Company* (name, tagline, footer text); *Colours* (primary, chrome; applied on top of the active
   theme, a theme that sets the same token wins); *Help and documentation links* (help, documentation, support
   URLs); *Login page notice* (plain text or simple Markdown, served to anyone who opens the login page); image
-  uploads (logo, favicon and the other `IMAGE_KINDS`) with *Remove*.
+  uploads: logo (up to 512 KB) and favicon (up to 128 KB) with *Remove*.
 - **Server:** `PUT /branding` stores the fields; `POST /branding/:kind` takes raw image bytes
   (`image/*`), stored under `$WHM_DATA_DIR/branding/` and served with an ETag.
 - **Gotchas:** `white_label`/`custom_branding_builder` are license flags in the edition catalog, but the only
@@ -1295,8 +1298,9 @@ Root only.
 
 ### B.3 The Marketplace tab (and WHM Marketplace)
 
-The tab appears on *Manage Plugins* (`#marketplace`); *Server Configuration › WHM Marketplace* shows the same
-catalog read-only for resellers (plus the static *Distribution packages* catalog of host software).
+The tab appears on *Manage Plugins* (`#marketplace`); *Server Configuration › WHM Marketplace* (root only)
+shows the same catalog plus the static *Distribution packages* catalog of host software; without the hub
+provider it is a read-only preview.
 
 - **Prerequisites:** the `whm-hub` provider enabled in *Market Provider Manager*; a license token on this
   panel (`422 license_required` otherwise); the provider URL must share its origin with the hub that issued the
@@ -1490,8 +1494,13 @@ node scripts/whm-cli.js unlock-ip <ip>                        # deletes the cPHu
 - **Lost panel root password:** `node scripts/whm-cli.js reset-password root`. The next login forces a password change when
   the policy requires it. This changes the **panel** login only; the Linux root password is changed from
   *Server Configuration › Change Root Password*.
-- **Locked out by 2FA:** `reset-password` does not clear TOTP; create a second admin with `create-admin`, log in
-  with it and disable 2FA for the locked user from *Security Center › Two-Factor Authentication*.
+- **Locked out by 2FA:** `reset-password` leaves TOTP enabled, and there is no administrative control to clear
+  another user's TOTP: `POST /api/auth/2fa/disable` acts on the caller only, and *Security Center › Two-Factor
+  Authentication* offers *Disable* only in the *Your account* card. The panel issues no backup codes. Recovery
+  means signing in with the authenticator (or the secret shown at enrolment), or clearing the user's TOTP columns
+  in `$WHM_DATA_DIR/whm.db` by hand with the panel stopped:
+  `sqlite3 /var/lib/whm/whm.db "UPDATE users SET totp_enabled = 0, totp_secret_enc = NULL WHERE username = 'root';"`
+  then `systemctl start whm-panel`. If the policy requires 2FA for that role, the next login enrols again.
 - **Blocked IP:** `node scripts/whm-cli.js unlock-ip <ip>`.
 - **Panel degraded after a hub outage:** nothing on the host stopped; activate or check in from the License
   tab once the hub is back. If the hub's license key rotated, update `license-keys.json` first

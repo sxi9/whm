@@ -215,8 +215,8 @@ WHM_SERVE_CLIENT=true npm start                 # http://127.0.0.1:2086/
 Tests and checks:
 
 ```bash
-npm test                                        # vitest (server, agent, client, hub/ui) + node:test (SDK, sample + bundled plugins)
-cd hub && npm test                              # hub (node --test)
+npm test                                        # all workspaces (server, agent, client, hub, hub/ui) + SDK, sample and bundled plugins
+cd hub && npm test                              # hub suite alone (node --test)
 BASE=http://127.0.0.1:2086 PASSWORD='<root password>' node e2e/ui-check.cjs   # Playwright end-to-end against a served build
 ```
 
@@ -450,9 +450,10 @@ characters) and printed once. `hub-cli.js` boots the hub services in-process, so
 `--keys-dir`, `--json`. After a CLI run as root, restore ownership:
 `chown -R whmhub:whmhub /var/lib/whm-hub` (the installer does this itself).
 
-Log in at `https://<hub>:7443/login` (`POST /v1/portal/login { email, password, totp? }`); the
-portal asks you to enrol TOTP on first login, and sensitive actions require a fresh TOTP step-up
-(`license.stepup_max_age_s`).
+Log in at `https://<hub>:7443/login` (`POST /v1/portal/login { email, password, totp? }`). After the
+first login enrol TOTP under *Security*: the portal warns until you do, and the hub refuses signing-key,
+API-key, portal-user and marketplace actions (TOTP step-up, `license.stepup_max_age_s`) until 2FA is
+enabled.
 
 ### 5.4 Issuing the first license
 
@@ -754,7 +755,7 @@ Precedence (`loadConfig()` in `server/src/config.js`): environment variables →
 | `WHM_LICENSE_CHECKIN_HOURS` | `licenseCheckinHours` | `12` | Check-in interval. |
 | — | `sessionTtlMs` | `28800000` (8 h) | Session lifetime and cookie `maxAge`. |
 | — | `loginRateLimit` | `{ "windowMs": 900000, "max": 20 }` | Login and 2FA attempts per window per IP+user. |
-| — | `checkinIntervalMs` | `60000` | Internal check-in tick. |
+| — | `checkinIntervalMs` | `60000` | Defined in `config.js` but not consumed by any code in this release; setting it has no effect. |
 | — | `trustProxy` | `"loopback"` | Express `trust proxy` (`server/src/app.js`). |
 | — | `cookieSecure` | *(unset)* | `true` forces the `secure` cookie flag without TLS (behind a TLS proxy). |
 
@@ -765,7 +766,7 @@ Keys without a variable are set in `whm.conf` only (the file is merged verbatim)
 | Variable | Default | Meaning |
 |---|---|---|
 | `WHM_AGENT_SOCKET` | `/run/whm-agent.sock` | Socket to listen on; the parent directory is created, a stale socket file removed. |
-| `WHM_AGENT_GROUP` | `whmpanel` | Group that owns the socket (`chown root:<gid>`, `chmod 0660`). Must exist in `/etc/group`; otherwise a warning is logged and the socket stays root-only. |
+| `WHM_AGENT_GROUP` | `whmpanel` | Group that owns the socket (`chown root:<gid>`, `chmod 0660`). If the group does not exist in `/etc/group` the chown is skipped silently and the socket stays `root:root 0660` (only root can reach it); the `whm-agentd listening` log line shows the group name it looked for. `could not set socket ownership` is logged only when chown/chmod itself fails. |
 | `WHM_AGENT_CONFIG` | `/etc/whm/agent.conf` | JSON config: `{ "extraAllowedRoots": [ … ] }` appended to `DEFAULT_ALLOWED_ROOTS`. An unparsable file logs `invalid agent config, using defaults`. |
 
 Programs are resolved in `/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin` with
@@ -811,9 +812,12 @@ default from [§5.6](#56-hubconf-reference). Booleans accept `1`, `true`, `yes`.
 `503 agent_unavailable` / `Cannot reach whm-agentd at /run/whm-agent.sock` on pages.
 - `systemctl status whm-agentd`; `journalctl -u whm-agentd -n 50`. The agent logs
   `whm-agentd listening` with the socket, group and op count when it is up.
-- `ls -l /run/whm-agent.sock` must show `srw-rw---- root whmpanel`. If the group is wrong, the
-  `whmpanel` group is missing or `WHM_AGENT_GROUP` names another group: the agent logs
-  `could not set socket ownership`. Create the group/user or fix the variable in the unit.
+- `ls -l /run/whm-agent.sock` must show `srw-rw---- root whmpanel`. If it shows `root root`, the
+  `whmpanel` group is missing or `WHM_AGENT_GROUP` names a group that does not exist: the agent then
+  skips the chown silently (the socket stays `root:root 0660`, so the non-root panel cannot connect) and
+  only the `group` field of its `whm-agentd listening` log line tells you which name it looked for.
+  `could not set socket ownership` is logged only when chown/chmod itself fails. Create the
+  group/user or fix the variable in the unit, then restart `whm-agentd`.
 - `WHM_AGENT_SOCKET` must be identical in `panel.env` and `whm-agentd.service`.
 - In **monolithic** mode there is no socket at all; `agent self-check failed` means an op failed
   in-process, usually because the API is not running as root.
