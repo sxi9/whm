@@ -1,0 +1,94 @@
+{
+  "_comment": "whm-hub configuration. JSON has no comments: every key below is explained in README.md under 'License server & marketplace (hub)' > 'hub.conf reference'. Installed to /etc/whm-hub/hub.conf by scripts/install.sh --with-hub (written once; --upgrade never rewrites it); WHM_HUB_* environment variables (hub/src/config.js ENV_MAP) override these keys. Billing webhook secrets belong in /etc/whm-hub/hub.env (WHM_HUB_STRIPE_SECRET, WHM_HUB_WHMCS_SECRET, WHM_HUB_PADDLE_SECRET). The GitHub OAuth client secret has no environment variable: add marketplace.github_oauth = { client_id, client_secret or client_secret_enc, redirect_url } here (the file is 0640 root:whmhub); absent, the GitHub verification method answers 501 github_not_configured. Note that `node hub/src/index.js --check-config` creates marketplace.packages_dir from the file it checks.",
+  "public_url": "https://hub.example.com:7443",
+  "serve_ui": true,
+  "host": "0.0.0.0",
+  "port": 7443,
+  "loopback_port": 7440,
+  "trust_proxy": "loopback",
+  "log_level": "info",
+  "db_dir": "/var/lib/whm-hub",
+  "master_key_file": "/etc/whm-hub/master.key",
+  "insecure_http": false,
+  "tls": {
+    "cert": "/etc/whm-hub/ssl/hub.crt",
+    "key": "/etc/whm-hub/ssl/hub.key"
+  },
+  "keys": {
+    "dir": "/etc/whm-hub/keys",
+    "active_kid": {
+      "license": null,
+      "plugin": null
+    }
+  },
+  "license": {
+    "token_ttl_hours": 168,
+    "checkin_interval_hours": 12,
+    "default_grace_days": 7,
+    "trial_days": 14,
+    "reclaim_days": 30,
+    "reactivation_limit": { "count": 3, "days": 30 },
+    "nonce_ttl_s": 600,
+    "max_skew_s": 300,
+    "session_ttl_hours": 12,
+    "stepup_max_age_s": 300,
+    "checkin_retention_days": 90,
+    "lookup_block": { "failures": 20, "windowMs": 3600000, "blockMs": 86400000 },
+    "backup_dir": "/var/backups/whm-hub",
+    "backup_keep": 48,
+    "mail": {
+      "from": "whm-hub@hub.example.com",
+      "enabled": true,
+      "transport": "sendmail"
+    },
+    "billing": {
+      "stripe": {},
+      "whmcs": {},
+      "paddle": {}
+    },
+    "rate_limits": {
+      "activate": { "max": 10, "windowMs": 3600000 },
+      "checkin": { "max": 12, "windowMs": 3600000 },
+      "trial": { "max": 3, "windowMs": 86400000 },
+      "recover": { "max": 3, "windowMs": 3600000 },
+      "reseller": { "max": 600, "windowMs": 3600000 },
+      "admin": { "max": 1200, "windowMs": 3600000 },
+      "portal_login": { "max": 10, "windowMs": 900000 },
+      "public": { "max": 600, "windowMs": 3600000 }
+    },
+    "vendor": {
+      "name": "WHM Vendor",
+      "support_email": "support@hub.example.com",
+      "portal_url": "https://hub.example.com:7443/"
+    }
+  },
+  "marketplace": {
+    "packages_dir": "/var/lib/whm-hub/packages",
+    "max_package_bytes": 20971520,
+    "download_url_ttl_s": 900,
+    "download_hmac_file": "/etc/whm-hub/keys/download.hmac",
+    "scan": { "av_command": null },
+    "review": { "require_two_reviewers_for_high_risk": true },
+    "revenue_share_pct": 70,
+    "payout_min_cents": 5000,
+    "currencies": ["USD", "EUR"],
+    "github_oauth": null,
+    "public_suffix_list": "/var/lib/whm-hub/public_suffix_list.dat",
+    "reserved_namespaces": [],
+    "reserved_brands": [],
+    "host_api_versions": ["1.0.0"],
+    "evidence_purge_days": 30,
+    "session_ttl_hours": 12,
+    "stepup_max_age_s": 300,
+    "rate_limits": {
+      "register": { "max": 5, "windowMs": 86400000 },
+      "upload": { "max": 10, "windowMs": 86400000 },
+      "recheck": { "max": 5, "windowMs": 3600000 },
+      "verification": { "max": 10, "windowMs": 86400000 },
+      "download": { "max": 60, "windowMs": 3600000 },
+      "feed": { "max": 30, "windowMs": 3600000 },
+      "catalog": { "max": 600, "windowMs": 3600000 },
+      "dev_login": { "max": 30, "windowMs": 900000 }
+    }
+  }
+}

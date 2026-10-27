@@ -1,0 +1,44 @@
+[Unit]
+Description=WHM hub (license server + plugin marketplace)
+Documentation=file:///opt/whm/BLUEPRINT.md
+After=network.target
+
+[Service]
+Type=simple
+User=whmhub
+Group=whmhub
+EnvironmentFile=/etc/whm-hub/hub.env
+WorkingDirectory=/opt/whm/hub
+ExecStart=/usr/bin/node /opt/whm/hub/src/index.js
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=whm-hub
+
+# Listens on :7443 (HTTPS, public API + portals) and 127.0.0.1:7440 (/healthz, /metrics).
+# The hub never touches the host: it only needs its databases, package store,
+# backups and log directory writable, and its config read-only. The keys
+# directory is the one writable spot under /etc/whm-hub because key rotation
+# (POST /v1/admin/signing-keys) writes new <kid>.ed25519 files there.
+# scripts/install.sh substitutes the node binary, the app directory and the data and
+# backup directories recorded in hub.env/hub.conf (HUB_DATA_DIR, license.backup_dir)
+# when it writes /etc/systemd/system/whm-hub.service; a packages_dir outside them
+# needs a drop-in with an extra ReadWritePaths= line.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/whm-hub /var/log/whm-hub /var/backups/whm-hub
+ReadOnlyPaths=/etc/whm-hub /opt/whm
+ReadWritePaths=/etc/whm-hub/keys
+
+[Install]
+WantedBy=multi-user.target
