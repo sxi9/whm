@@ -54,3 +54,5 @@ be started once per server fingerprint and e-mail on a given hub). Needs `node`,
 `HUB_ADMIN_PASSWORD`, `DEV_EMAIL`, `DEV_PASSWORD`, `TRIAL_EMAIL`. The hub config written by the
 script sets `review.require_two_reviewers_for_high_risk: false` so one admin approval signs the
 sample plugin; the production default needs a second reviewer for high-risk versions.
+
+> The run log under `$SCRATCH` records response bodies of the throwaway hub (admin API key, TOTP secrets, CSRF tokens). It is test-only material; delete the scratch directory after use and never point the script at a production hub.

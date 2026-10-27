@@ -316,7 +316,8 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   marker) — link both from README and HANDOFF when landed), and the **live end-to-end run `wf_a77b6326-d1e`**
   (`whm-live-e2e-wf_a77b6326-d1e.js`: operator runs hub + panel on :7443/:2088 under the scratch dir, publishes the
   sample plugin, installs it with consent, revokes it; writes `e2e/live-hub-flow.sh`, adds Playwright steps 15–17,
-  refreshes `docs/screenshots/`; one reviewer re-runs the script),
+  refreshes `docs/screenshots/`; one reviewer re-runs the script) — **done 08:10: 11/11 PASS, no code fix needed**;
+  the hub and panel worked together on the first live run. Phase 6 hardening run id goes here when launched,
   then the live hub+panel end-to-end flow (`scripts/install.sh --with-hub` is the production path; in dev: start
   the hub with test keys on :7443, point `WHM_LICENSE_HUB_URL` at it, activate a trial from Basic Setup → License,
   enable the `whm-hub` provider, install `net.whm.sample-notes` through the consent screen, revoke it from the admin

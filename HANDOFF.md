@@ -4,7 +4,7 @@ For any AI or engineer taking over. Everything stated here is on the branch
 `claude/trusting-cori-ifp7wy` of `github.com/sxi9/whm`; this file is updated at every milestone
 together with `CHECKLIST.md` (tracker) and `CLAUDE.md` (conventions + memory). Read those two next.
 
-**Last updated:** 2026-10-27 07:45 UTC · head `e49e500`+ · checklist 232 done / 2 partial / 2 open
+**Last updated:** 2026-10-27 08:15 UTC · head `974cb94`+ · checklist 234 done / 1 partial / 1 open
 
 ## 1. What this is
 
@@ -28,13 +28,13 @@ license + marketplace service with its own React portals (`hub/ui`).
 | Phase 5 build (hub/license, hub/marketplace, hub/ui, panel license + marketplace clients, SDK.md, sample + automated-backup plugins) | done, landed `76483ef` | green gate: server 1135 / agent 462 / client 48 / hub 177 / hub-ui 97 + SDK + 5 plugin suites; both builds; boot; Playwright |
 | Phase 5 docs/deploy (BLUEPRINT §16–18, `deploy/whm-hub.service`, `deploy/hub.conf.example`, `scripts/install.sh --with-hub`, README hub section) | done, `0be6f9c` | `bash -n`, hub `--check-config` |
 | Phase 5 fix round (8 carried findings) | done, landed `e49e500` | gate: server 1135 / agent 462 / client 48 / hub 181 / hub-ui 105 + SDK + plugins |
-| Live hub + panel end-to-end flow, Phase-5 flow screenshots | **running** (07:45) | — |
+| Live hub + panel end-to-end flow (`e2e/live-hub-flow.sh`), Phase-5 flow screenshots | done 08:10 — 11/11 PASS, no code fix needed | reviewer re-run green; screenshots `974cb94` |
 | Install guide + user manual (`docs/INSTALL.md`, `docs/MANUAL.md`) | **running** (07:40) | — |
 | Phase 6 hardening | pending | — |
 
-Screenshots of every page (labelled, all 212 live) are under `docs/screenshots/` (last refresh
-`6c693e4`; the Phase-5 pages — License tab, Manage Plugins › Marketplace, WHM Marketplace — are
-not in the flow set yet).
+Screenshots of every page (labelled, all 212 live) plus 17 flow shots incl. the Phase-5 pages are under
+`docs/screenshots/` (last refresh `974cb94`, taken from a panel with a live trial license and an
+installed marketplace plugin).
 
 ## 3. How to run and verify (from a fresh clone)
 
@@ -63,14 +63,10 @@ page degrades to an install prompt — that is by design), Playwright + Chromium
 1. ~~Phase-5 fix round~~ — done (`e49e500`): signed fail-closed hub errors, deterministic token test,
    hub/ui dashboard fields, reseller entitlement/products routes, payouts statement, admin impersonation,
    hub/ui interaction tests, page-descriptor `origin` key.
-2. **Live hub + panel flow** (never run yet — the first time both talk): start the hub with test
-   keys on :7443, point the panel at it with the hub's license public key in `WHM_LICENSE_KEYS_FILE`,
-   activate a trial from *Basic WebHost Manager Setup → License*, enable the `whm-hub` provider in
-   *Market Provider Manager*, install `net.whm.sample-notes` from *Manage Plugins → Marketplace*
-   through the consent screen, revoke it from the admin portal, confirm the banner and the
-   `plugin_revoked` notification. Fix whatever breaks; add these as steps 15–17 of `e2e/ui-check.cjs`
-   (labels in its `LABELS` map and the flow list in `e2e/screenshot-all.cjs`), then
-   `bash e2e/screenshots.sh`, commit the images and galleries.
+2. ~~Live hub + panel flow~~ — done: `e2e/live-hub-flow.sh` (parameterised by `SCRATCH`, `HUB_PORT`,
+   `PANEL_PORT`, …; see `e2e/README.md`) brings up a hub with generated keys and TLS and a panel on :2088 and
+   drives trial → publish → install with consent → revoke → update; 11/11 steps PASS, Playwright steps 15–17 added.
+   Note: its run log records response bodies (throwaway hub secrets) under the scratch dir — delete it after use.
 3. **Phase 6 hardening**: `npm audit` + pin fixes; sweep every agent op for argv/schema/path rules
    (`agent/src/ops/*`); review rate limits, CSRF, helmet headers, session policy end to end;
    Security Advisor rules incl. a check for the Oct-2026 PHP advisory (flag affected PHP versions
@@ -114,6 +110,6 @@ plugins/       sdk/ (contract + mock host + pack.js), SDK.md, sample-plugin/, bu
 hub/           license + marketplace service (src/, shared/, license/, marketplace/, scripts/, test/) and ui/ portals
 deploy/        whm-panel.service, whm-agentd.service, whm-hub.service, config templates
 scripts/       install.sh (--with-hub, --upgrade), whm-cli.js, build-plugin.js
-e2e/           ui-check.cjs (flow), screenshot-all.cjs (every page), screenshots.sh
+e2e/           ui-check.cjs (flow), screenshot-all.cjs (every page), screenshots.sh, live-hub-flow.sh (hub+panel end-to-end), README.md
 docs/screenshots/  labelled captures + galleries
 ```
