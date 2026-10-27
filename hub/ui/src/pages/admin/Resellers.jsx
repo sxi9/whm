@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { PageHeader, Card, StatusPill, formatDate } from '../../components/Common.jsx';
 import { DataTable } from '../../components/DataTable.jsx';
 import { Button, Field, NumberInput, ErrorBanner } from '../../components/Form.jsx';
@@ -96,7 +97,8 @@ function BrandEditor({ reseller, onSaved }) {
 }
 
 export default function Resellers() {
-  const list = useListQuery('/admin/resellers');
+  const [params] = useSearchParams();
+  const list = useListQuery('/admin/resellers', { initialQ: params.get('q') || '' });
   const [creating, setCreating] = useState(false);
   const [open, setOpen] = useState(null);
   const columns = [

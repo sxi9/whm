@@ -79,7 +79,7 @@ export default function ResellerLicenses() {
           <Select value={filters.edition} onChange={(v) => setFilter('edition', v)} options={EDITIONS} placeholder="Any edition" />
           <Select value={filters.expiring_within} onChange={(v) => setFilter('expiring_within', v)} options={[{ value: '30', label: 'Expiring in 30 days' }, { value: '90', label: 'Expiring in 90 days' }]} placeholder="Any expiry" />
         </div>
-        <LicenseTable base="/reseller" filters={filters} linkTo={(r) => `/reseller/licenses/${r.id}`} />
+        <LicenseTable base="/reseller" filters={filters} initialQ={params.get('q') || ''} linkTo={(r) => `/reseller/licenses/${r.id}`} />
       </Card>
       <IssueLicenseModal reseller open={issueOpen} onClose={() => setIssueOpen(false)} base="/reseller" products={products} skuSuggestions={suggestions} onIssued={(d) => { setIssued(d); setTick((t) => t + 1); }} />
       <BulkIssueModal open={bulkOpen} onClose={() => setBulkOpen(false)} base="/reseller" products={products} skuSuggestions={suggestions} onQueued={setJob} />

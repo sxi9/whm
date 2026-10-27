@@ -23,7 +23,8 @@ vi.mock('../src/hooks/useApi.js', () => ({
   useMutation: (fn) => ({ mutate: fn, loading: false, error: null, fieldErrors: null, reset() {} }),
 }));
 
-const { MarketplaceTab, MarketplaceDisabledNotice, HubMismatchNotice, PluginDetailDrawer, priceLabel, safeHref } = await import('../src/pages/cpanel/MarketplaceTab.jsx');
+const { MarketplaceTab, MarketplaceDisabledNotice, HubMismatchNotice, MarketplaceUpdatesNotice, PluginDetailDrawer, priceLabel, safeHref } = await import('../src/pages/cpanel/MarketplaceTab.jsx');
+const { HomePage } = await import('../src/pages/Home.jsx');
 const { ConsentModal, PermissionList, TrustNotice } = await import('../src/pages/cpanel/ConsentModal.jsx');
 const { RevocationBanner, describeRevocation } = await import('../src/components/RevocationBanner.jsx');
 const ManagePlugins = (await import('../src/pages/fn/cpanel/manage-plugins.jsx')).default;
@@ -176,6 +177,36 @@ describe('Consent screen', () => {
     expect(render(<ConsentModal open={false} pluginId="x" onClose={() => {}} />)).not.toContain('role="dialog"');
     expect(render(<PermissionList scopes={[]} />)).toContain('declares no permissions');
     expect(render(<TrustNotice />)).toContain('Plugins run inside the panel process');
+  });
+});
+
+describe('Dashboard update notice', () => {
+  const pending = [{ id: 'net.example.scoped', current: '1.0.0', latest: '1.0.1', channel: 'stable', security: true, changelogUrl: null }, { id: 'net.example.minimal', current: '1.0.0', latest: '1.1.0', channel: 'stable', security: false, changelogUrl: null }];
+
+  it('tells root about pending marketplace updates on the home dashboard and links to the Marketplace tab', () => {
+    responses.clear();
+    responses.set('/marketplace/updates', { data: { pending, lastCheckAt: '2026-10-27T04:10:00Z' } });
+    const html = render(<MarketplaceUpdatesNotice />);
+    expect(html).toContain('data-testid="marketplace-updates-notice"');
+    expect(html).toContain('2 marketplace plugin updates available (1 security)');
+    expect(html).toContain('net.example.scoped 1.0.0 → 1.0.1');
+    expect(html).toContain('href="/cpanel/manage-plugins#marketplace"');
+    expect(html).toContain('banner-warning');
+    const home = render(<HomePage />);
+    expect(home).toContain('data-testid="marketplace-updates-notice"');
+    expect(home).toContain('href="/cpanel/manage-plugins#marketplace"');
+  });
+
+  it('renders nothing without pending updates or for a reseller', () => {
+    responses.clear();
+    responses.set('/marketplace/updates', { data: { pending: [], lastCheckAt: null } });
+    expect(render(<MarketplaceUpdatesNotice />)).not.toContain('marketplace-updates-notice');
+    expect(render(<HomePage />)).not.toContain('marketplace-updates-notice');
+    responses.set('/marketplace/updates', { data: { pending, lastCheckAt: null } });
+    authState.user = { id: 2, username: 'res', role: 'reseller' };
+    expect(render(<MarketplaceUpdatesNotice />)).not.toContain('marketplace-updates-notice');
+    expect(render(<HomePage />)).not.toContain('marketplace-updates-notice');
+    authState.user = { id: 1, username: 'root', role: 'root' };
   });
 });
 

@@ -28,7 +28,7 @@ const SIG_HEADER_RE = /^kid=([0-9a-f]{8}),sig=([A-Za-z0-9_-]+)$/;
 const NONCE_RE = /^[A-Za-z0-9_-]{16,128}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
 const DAY_S = 86400;
-const MAX_RESPONSE_BYTES = 1024 * 1024;
+export const MAX_RESPONSE_BYTES = 1024 * 1024;
 const EXPIRING_DAYS = [30, 14, 7, 1];
 const EDITION_LABELS = { trial: 'Trial', solo: 'Solo', pro: 'Pro', reseller: 'Reseller', enterprise: 'Enterprise' };
 const UPGRADE_HINT = { trial: 'Solo', solo: 'Pro', pro: 'Reseller' };
@@ -378,7 +378,8 @@ export function createLicenseService(ctx) {
   // ---- hub transport & signed requests ------------------------------------
 
   const transport = {
-    request(url, { method = 'POST', body, headers = {}, timeoutMs = 30_000 } = {}) {
+    // `maxBytes` is for package downloads (ctx.marketplace); signed JSON answers keep the 1 MiB default.
+    request(url, { method = 'POST', body, headers = {}, timeoutMs = 30_000, maxBytes = MAX_RESPONSE_BYTES } = {}) {
       return new Promise((resolve, reject) => {
         let u;
         try { u = new URL(url); } catch (err) { return reject(err); }
@@ -390,7 +391,7 @@ export function createLicenseService(ctx) {
         const req = https.request(u, options, (res) => {
           const chunks = [];
           let size = 0;
-          res.on('data', (c) => { size += c.length; if (size > MAX_RESPONSE_BYTES) { req.destroy(new Error('hub response too large')); return; } chunks.push(c); });
+          res.on('data', (c) => { size += c.length; if (size > maxBytes) { req.destroy(new Error(`hub response too large (over ${maxBytes} bytes)`)); return; } chunks.push(c); });
           res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
           res.on('error', reject);
         });

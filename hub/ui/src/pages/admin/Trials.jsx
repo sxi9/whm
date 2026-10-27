@@ -8,6 +8,16 @@ import { useApi } from '../../hooks/useApi.js';
 import { useListQuery } from '../../hooks/useListQuery.js';
 import { Stat, StatGrid, FormModal, SecretOnce } from '../../widgets/index.jsx';
 
+// ctx.trials.funnel() → { started, converted, expired, abuse: [{ ip, n }] };
+// "active" is what is neither converted nor expired. `abuse` is computed by
+// the hub over every trial (same IP more than once), not only the page shown.
+export function funnelStats(f) {
+  if (!f || typeof f !== 'object') return { started: null, converted: null, expired: null, active: null, abuse: [] };
+  const n = (v) => (v == null ? 0 : Number(v) || 0);
+  const started = f.started == null ? null : n(f.started);
+  return { started, converted: n(f.converted), expired: n(f.expired), active: started == null ? null : Math.max(0, started - n(f.converted) - n(f.expired)), abuse: Array.isArray(f.abuse) ? f.abuse : [] };
+}
+
 // Trial funnel + abuse view: the list joins trials with their license; the
 // same ip / email_hash appearing more than once is the key-sharing signal.
 export default function Trials() {
@@ -15,7 +25,7 @@ export default function Trials() {
   const list = useListQuery('/admin/trials', { filters: { converted } });
   // The trials route also returns a top-level `funnel`; the dashboard report carries the same numbers through { data }.
   const summary = useApi('/admin/reports/dashboard');
-  const f = summary.data?.trial_funnel || {};
+  const f = funnelStats(summary.data?.trial_funnel);
   const products = useApi('/admin/products');
   const [convert, setConvert] = useState(null);
   const [converted1, setConverted1] = useState(null);
@@ -35,8 +45,13 @@ export default function Trials() {
     <>
       <PageHeader title="Trials" description="Funnel and abuse view. One trial per fingerprint and per e-mail." home="/admin" />
       <StatGrid>
-        <Stat label="Started" value={f.started} /><Stat label="Converted" value={f.converted} /><Stat label="Expired" value={f.expired} /><Stat label="Active" value={f.active} />
+        <Stat label="Started" value={f.started} /><Stat label="Converted" value={f.converted} /><Stat label="Expired" value={f.expired} /><Stat label="Active" value={f.active} hint="started − converted − expired" />
       </StatGrid>
+      {f.abuse.length > 0 && (
+        <Card title="Abuse: same IP more than once" subtitle="Computed by the hub over every trial, not only the rows shown below.">
+          <div className="inline-list">{f.abuse.map((a) => <span key={a.ip} className="pill pill-warn">{a.ip} ×{a.n}</span>)}</div>
+        </Card>
+      )}
       <Card padded={false}>
         <div className="filter-row" style={{ padding: '12px 16px 0' }}><Select value={converted} onChange={setConverted} options={[{ value: 'true', label: 'Converted' }, { value: 'false', label: 'Not converted' }]} placeholder="All trials" /></div>
         <DataTable columns={columns} {...list.tableProps} emptyText="No trials" rowActions={(r) => [!r.converted_at && { label: 'Convert', primary: true, onClick: () => setConvert(r) }]} />

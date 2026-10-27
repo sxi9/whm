@@ -98,7 +98,7 @@ export function PasswordResetPage() {
           <>
             <Field label="New password"><PasswordInput value={password} onChange={setPassword} /></Field>
             <Field label="Two-factor code (if enabled)"><TextInput value={totp} onChange={setTotp} inputMode="numeric" maxLength={6} /></Field>
-            <Button variant="primary" loading={busy} disabled={password.length < 10} onClick={() => run(() => api.post(`/dev/password/reset/${token}`, { password, ...(totp ? { totp } : {}) }), { then: () => setDone(true), silent: true })}>Reset password</Button>
+            <Button variant="primary" loading={busy} disabled={password.length < 10} onClick={() => run(() => api.post(`/dev/password/reset/${encodeURIComponent(token)}`, { password, ...(totp ? { totp } : {}) }), { then: () => setDone(true), silent: true })}>Reset password</Button>
           </>
         )}
         <p className="muted" style={{ marginTop: 10 }}><Link to="/dev/login">Back to sign-in</Link></p>

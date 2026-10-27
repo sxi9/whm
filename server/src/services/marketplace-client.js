@@ -99,9 +99,9 @@ export function createMarketplaceClient(ctx) {
     };
   }
 
-  // Every marketplace action needs the hub row on and pointing at the license hub.
+  // Every marketplace action needs the hub row on and pointing at the license
+  // hub. A pure read: catalog GETs go through it, so nothing is written here.
   function requireHub() {
-    syncSchedules();
     const s = status();
     if (!s.enabled) throw new HttpError(422, 'marketplace_disabled', 'The WHM marketplace hub is disabled: enable the whm-hub provider in Market Provider Manager');
     if (s.hubMismatch) throw new HttpError(409, 'hub_mismatch', `The whm-hub provider points at ${s.url || 'no URL'} but this panel's license was issued by ${s.hubUrl || 'no hub'}; the two must share an origin`);
@@ -250,17 +250,10 @@ export function createMarketplaceClient(ctx) {
     fs.writeFileSync(cacheFile, buffer, { mode: 0o640 });
     try {
       jobCtx.progress(55, 'verifying and installing the package');
-      const installed = await ctx.plugins.install({ buffer, source: 'marketplace' }, { user: req.user, req, policy: { requireSigned: true, signers: hubKids, activate: false } });
+      // expectedId: the host refuses a package whose manifest names another id
+      // before verifying or unpacking it over an installed plugin (422 plugin_id_mismatch).
+      const installed = await ctx.plugins.install({ buffer, source: 'marketplace' }, { user: req.user, req, policy: { requireSigned: true, signers: hubKids, activate: false, expectedId: pluginId } });
       const id = installed.plugin.id;
-      if (id !== pluginId) {
-        // The host has already written the package under its own id. A plugin
-        // this job created is removed; one that existed before is only left
-        // disabled (activate: false), never removed on the hub's say-so.
-        const created = installed.previousVersion === null;
-        if (created) await ctx.plugins.uninstall(id, { purge: false, req });
-        audit(req, { action: 'plugin.marketplace.id_mismatch', target: pluginId, args: { declared: id, version: installed.plugin.version, previousVersion: installed.previousVersion, kid: installed.plugin.signer, removed: created }, result: 'error:plugin_id_mismatch' });
-        throw new HttpError(422, 'plugin_id_mismatch', `The package declares plugin id ${id}, not ${pluginId}${created ? '' : `; ${id} was left disabled`}`);
-      }
       const required = requiredScopes(id);
       // An update is a host upgrade of a plugin this client installed; a stale
       // row without a plugin behind it (removed through the host) is a first install.
@@ -309,6 +302,7 @@ export function createMarketplaceClient(ctx) {
   }
 
   async function install({ pluginId, version, channel, consent, allowDowngrade } = {}, user, req) {
+    syncSchedules();
     requireHub();
     requireLicensed();
     if (!ID_RE.test(pluginId || '')) throw new HttpError(422, 'validation_failed', 'Malformed plugin id', { pluginId: ['Reverse-DNS plugin id with at least three segments'] });
@@ -322,6 +316,7 @@ export function createMarketplaceClient(ctx) {
   }
 
   async function update(id, user, req) {
+    syncSchedules();
     requireHub();
     requireLicensed();
     const row = stmts.install.get(id);
@@ -502,15 +497,18 @@ export function createMarketplaceClient(ctx) {
   ctx.jobs.register(UPDATE_CHECK_JOB, async () => {
     syncSchedules();
     const s = status();
-    if (!s.enabled || s.hubMismatch || !s.hasToken) return { skipped: true };
+    if (!s.enabled || s.hubMismatch) return { skipped: s.enabled ? 'hub_mismatch' : 'disabled' };
+    if (s.licenseDegraded) return { skipped: 'license_degraded' };
+    if (!s.hasToken) return { skipped: 'no_token' };
     return { updates: await checkUpdates() };
   });
 
   // Schedules exist once and are switched with the hub row, so the scheduler
   // never enqueues a job the handler would skip. The state last applied is
   // persisted: between two hub-row changes an operator's own toggle of a
-  // schedule is left alone. Runs at boot, from onHubChanged() (Market service)
-  // and before every hub action as a fallback.
+  // schedule is left alone. Runs at boot, from onHubChanged() (the Market
+  // service calls it after every change to the whm-hub row), inside the job
+  // handlers and before install/update as a fallback; reads never call it.
   function syncSchedules() {
     try {
       const names = new Set([REVOCATIONS_SCHEDULE, UPDATE_CHECK_SCHEDULE]);
@@ -526,7 +524,7 @@ export function createMarketplaceClient(ctx) {
       ctx.settings.set(SCHEDULES_SETTING, desired);
     } catch (err) { log.warn({ err }, 'marketplace schedules could not be synchronised'); }
   }
-  // For the Market service: call after the whm-hub row is enabled, disabled or re-pointed.
+  // Called by the Market service after the whm-hub row is enabled, disabled or re-pointed.
   const onHubChanged = () => syncSchedules();
 
   function enqueueRevocationPoll(reason) {

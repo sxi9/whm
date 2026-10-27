@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { Link } from 'react-router-dom';
 import { Modal } from '../components/Modal.jsx';
 import { Field, TextInput, Button, ErrorBanner } from '../components/Form.jsx';
 
@@ -35,7 +36,7 @@ export function StepUpModal({ open, request, session, stepUp, onDone, onCancel }
           {request?.err?.message || 'This action needs a fresh two-factor confirmation.'}
           {request?.info?.path && <> <code>{request.info.method} {request.info.path}</code></>}
         </p>
-        {!session?.totpEnabled && <div className="banner banner-warning"><div>Two-factor authentication is not enabled on this account; enable it under <a href={securityPath} onClick={onCancel}>Security</a> first.</div></div>}
+        {!session?.totpEnabled && <div className="banner banner-warning"><div>Two-factor authentication is not enabled on this account; enable it under <Link to={securityPath} onClick={onCancel}>Security</Link> first.</div></div>}
         <ErrorBanner error={error} />
         <Field label="Authenticator code" htmlFor="stepup-code">
           <TextInput id="stepup-code" value={code} onChange={setCode} inputMode="numeric" autoComplete="one-time-code" placeholder="123456" maxLength={6} autoFocus />

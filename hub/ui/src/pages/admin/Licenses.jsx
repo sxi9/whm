@@ -61,8 +61,8 @@ export function BulkIssueModal({ open, onClose, base, products, skuSuggestions, 
   );
 }
 
-export function LicenseTable({ base, filters, linkTo }) {
-  const list = useListQuery(`${base}/licenses`, { filters });
+export function LicenseTable({ base, filters, linkTo, initialQ = '' }) {
+  const list = useListQuery(`${base}/licenses`, { filters, initialQ });
   const columns = [
     { key: 'key_prefix', label: 'Key', sortable: true, render: (r) => <Link to={linkTo(r)}><code>{r.key_prefix}-…</code></Link> },
     { key: 'edition', label: 'Edition', sortable: true },
@@ -96,7 +96,7 @@ export default function Licenses() {
           <Select value={filters.edition} onChange={(v) => setFilter('edition', v)} options={EDITIONS} placeholder="Any edition" />
           <Select value={filters.expiring_within} onChange={(v) => setFilter('expiring_within', v)} options={[{ value: '7', label: 'Expiring in 7 days' }, { value: '30', label: 'Expiring in 30 days' }, { value: '90', label: 'Expiring in 90 days' }]} placeholder="Any expiry" />
         </div>
-        <LicenseTable base="/admin" filters={filters} linkTo={(r) => `/admin/licenses/${r.id}`} />
+        <LicenseTable base="/admin" filters={filters} initialQ={params.get('q') || ''} linkTo={(r) => `/admin/licenses/${r.id}`} />
       </Card>
       <IssueLicenseModal open={issueOpen} onClose={() => setIssueOpen(false)} base="/admin" products={products.data} onIssued={setIssued} />
       <BulkIssueModal open={bulkOpen} onClose={() => setBulkOpen(false)} base="/admin" products={products.data} onQueued={setJob} />

@@ -3,12 +3,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import https from 'node:https';
+import { EventEmitter } from 'node:events';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
 import { packageFromFiles } from './support/tar.js';
 import { canonicalize } from '../src/lib/canonical.js';
 import { loadCommonJs, REPO_ROOT } from '../src/lib/plugin-sdk.js';
-import { INSTALL_JOB, UPDATE_JOB, REVOCATIONS_JOB, REVOCATIONS_SCHEDULE, UPDATE_CHECK_SCHEDULE, SCHEDULES_SETTING } from '../src/services/marketplace-client.js';
+import { INSTALL_JOB, UPDATE_JOB, REVOCATIONS_JOB, UPDATE_CHECK_JOB, REVOCATIONS_SCHEDULE, UPDATE_CHECK_SCHEDULE, SCHEDULES_SETTING } from '../src/services/marketplace-client.js';
+import { MAX_RESPONSE_BYTES } from '../src/services/license.js';
+import { MAX_PACKAGE_BYTES } from '../src/services/plugins.js';
 
 // §18.10 "Panel client": the hub is a recorded-fixture mock behind
 // ctx.license.transport; nothing here opens a socket.
@@ -159,6 +163,7 @@ let app;
 let hub;
 let tmp;
 let csrf;
+let realTransport;
 const post = (url, body = {}) => app.http.post(url).set('X-CSRF-Token', csrf).send(body);
 const put = (url, body = {}) => app.http.put(url).set('X-CSRF-Token', csrf).send(body);
 const del = (url) => app.http.delete(url).set('X-CSRF-Token', csrf);
@@ -182,6 +187,7 @@ beforeAll(async () => {
   hub = createMockHub();
   const agent = createMockAgent({ 'sys.fingerprint': () => ({ version: 'whmfp1', fingerprint: fpOf(FP), components: FP, available: { machine_id: true, mac: true, disk: true } }) });
   app = await createTestApp({ agent, overrides: { licenseEnforce: true, licenseHubUrl: HUB, licenseKeysFile: KEYS_FILE } });
+  realTransport = app.ctx.license.transport;
   app.ctx.license.transport = hub.transport;
   app.ctx.license.clock.now = () => hub.now();
   app.ctx.jobs.start();
@@ -233,14 +239,12 @@ describe('hub identity', () => {
   });
 
   it('serves the hub catalog through the license transport once the origins match, annotated with local state', async () => {
-    await enableHubRow(`${HUB}/`);
-    const status = (await get('/api/marketplace/status').expect(200)).body.data;
-    expect(status).toMatchObject({ enabled: true, hubMismatch: false });
-    // status() is a pure read: the schedules switch from the Market service's hook (or the next hub action).
-    expect(schedulesEnabled()).toEqual([0, 0]);
-    app.ctx.marketplace.onHubChanged();
+    // Re-pointing the row at the license hub is enough: the Market service calls onHubChanged().
+    await put('/api/market/providers/whm-hub/config', { url: `${HUB}/`, config: {} }).expect(200);
     expect(schedulesEnabled()).toEqual([1, 1]);
     expect(app.ctx.settings.get(SCHEDULES_SETTING)).toBe(true);
+    const status = (await get('/api/marketplace/status').expect(200)).body.data;
+    expect(status).toMatchObject({ enabled: true, hubMismatch: false });
     const cat = await get('/api/marketplace/catalog?q=scoped').expect(200);
     expect(cat.body.data.map((e) => e.id)).toEqual(['net.example.scoped']);
     expect(cat.body.data[0].installed).toBeNull();
@@ -260,21 +264,30 @@ describe('hub identity', () => {
     expect((await get('/api/marketplace/catalog?category=BAD!')).status).toBe(422);
   });
 
-  it('leaves a schedule the operator switched off alone until the hub row changes again', async () => {
+  it('switches the schedules from the Market service hook on every whm-hub row change and never from a read', async () => {
+    // An operator's own toggle survives reads: status and catalog are pure.
     app.ctx.scheduler.update(REVOCATIONS_SCHEDULE, { enabled: false });
+    const settingsBefore = app.ctx.settings.get(SCHEDULES_SETTING);
     await get('/api/marketplace/status').expect(200);
     await get('/api/marketplace/catalog').expect(200);
+    await get('/api/marketplace/categories').expect(200);
+    await get('/api/marketplace/plugins/net.example.scoped').expect(200);
     expect(schedulesEnabled()).toEqual([0, 1]);
+    expect(app.ctx.settings.get(SCHEDULES_SETTING)).toBe(settingsBefore);
+    // Disabling the row switches both off immediately, with no marketplace call in between.
     await post('/api/market/providers/whm-hub/disable').expect(200);
-    await get('/api/marketplace/status').expect(200);
-    expect(schedulesEnabled()).toEqual([0, 1]);
-    expect((await get('/api/marketplace/catalog')).status).toBe(422);
     expect(schedulesEnabled()).toEqual([0, 0]);
     expect(app.ctx.settings.get(SCHEDULES_SETTING)).toBe(false);
-    await post('/api/market/providers/whm-hub/enable').expect(200);
-    await get('/api/marketplace/status').expect(200);
+    expect((await get('/api/marketplace/catalog')).status).toBe(422);
     expect(schedulesEnabled()).toEqual([0, 0]);
-    await get('/api/marketplace/catalog').expect(200);
+    // Enabling flips both on without a subsequent catalog read.
+    await post('/api/market/providers/whm-hub/enable').expect(200);
+    expect(schedulesEnabled()).toEqual([1, 1]);
+    expect(app.ctx.settings.get(SCHEDULES_SETTING)).toBe(true);
+    // Re-pointing the row off the license origin (hub_mismatch) switches them off; back on restores them.
+    await put('/api/market/providers/whm-hub/config', { url: 'https://other.test/', config: {} }).expect(200);
+    expect(schedulesEnabled()).toEqual([0, 0]);
+    await put('/api/market/providers/whm-hub', { url: `${HUB}/` }).expect(200);
     expect(schedulesEnabled()).toEqual([1, 1]);
     const cron = app.ctx.scheduler.list().find((s) => s.name === REVOCATIONS_SCHEDULE).cron;
     app.ctx.marketplace.boot();
@@ -475,24 +488,28 @@ describe('install flow', () => {
     expect(JSON.parse(audits('plugin.marketplace.install').at(-1).args_redacted)).toMatchObject({ previousVersion: null, enabled: true });
   });
 
-  it('fails a package that declares another plugin id without removing a plugin it did not create, and re-checks the install source inside the job', async () => {
+  it('refuses a package that declares another plugin id before it touches the plugin installed under that id, and re-checks the install source inside the job', async () => {
     app.ctx.settings.set('plugins.developer_mode', true);
     expect((await installRaw(unsignedPackage(fixtures.minimalManifest({ id: 'net.example.victim', version: '1.0.0' })))).status).toBe(201);
     app.ctx.settings.set('plugins.developer_mode', false);
     await post('/api/plugins/manage/net.example.victim/enable').expect(200);
     expect(pluginRow('net.example.victim')).toMatchObject({ version: '1.0.0', state: 'enabled', source: 'upload' });
+    const installAudits = audits('plugin.install').length;
     hub.publish('net.example.alias', { version: '1.0.1', buffer: signedPackage(fixtures.minimalManifest({ id: 'net.example.victim', version: '1.0.1' })) });
     const kept = await runJob(await post('/api/marketplace/install', { pluginId: 'net.example.alias' }));
     expect(kept.status).toBe('failed');
     expect(kept.error_code).toBe('plugin_id_mismatch');
-    expect(pluginRow('net.example.victim')).toMatchObject({ version: '1.0.1', state: 'disabled' });
+    // The host refused before the directory swap: the sideloaded plugin is untouched and still live.
+    expect(pluginRow('net.example.victim')).toMatchObject({ version: '1.0.0', state: 'enabled', source: 'upload', signed: 0 });
+    expect(app.ctx.plugins.isLive('net.example.victim')).toBe(true);
     expect(installRow('net.example.alias')).toBeUndefined();
-    expect(JSON.parse(audits('plugin.marketplace.id_mismatch').at(-1).args_redacted)).toMatchObject({ declared: 'net.example.victim', previousVersion: '1.0.0', removed: false });
+    expect(installRow('net.example.victim')).toBeUndefined();
+    expect(audits('plugin.install').length).toBe(installAudits);
     hub.publish('net.example.alias2', { version: '1.0.0', buffer: signedPackage(fixtures.minimalManifest({ id: 'net.example.ghost', version: '1.0.0' })) });
     const removed = await runJob(await post('/api/marketplace/install', { pluginId: 'net.example.alias2' }));
     expect(removed.error_code).toBe('plugin_id_mismatch');
     expect(pluginRow('net.example.ghost')).toBeUndefined();
-    expect(JSON.parse(audits('plugin.marketplace.id_mismatch').at(-1).args_redacted)).toMatchObject({ declared: 'net.example.ghost', previousVersion: null, removed: true });
+    expect(fs.existsSync(path.join(app.ctx.config.pluginsDir, 'net.example.ghost'))).toBe(false);
     await del('/api/plugins/manage/net.example.victim?purge=true').expect(200);
     // A job queued for a sideloaded id (the plugin appeared between enqueue and run) is refused by the job itself.
     const sideloaded = app.ctx.jobs.enqueue(INSTALL_JOB, { pluginId: 'net.example.sideload', username: 'root' });
@@ -698,6 +715,10 @@ describe('degraded license and install sources', () => {
     expect((await get('/api/marketplace/catalog').expect(200)).body.data.length).toBeGreaterThan(0);
     expect((await post('/api/marketplace/revocations/poll')).status).toBe(423);
     expect(await app.ctx.marketplace.pollRevocations()).toMatchObject({ skipped: 'no_token' });
+    // The scheduled update check is skipped on a degraded license, never recorded as a failure.
+    const check = await waitForJob(app.ctx, app.ctx.jobs.enqueue(UPDATE_CHECK_JOB, {}).id, 15_000);
+    expect(check.status, check.error).toBe('done');
+    expect(check.result).toEqual({ skipped: 'license_degraded' });
     await post('/api/license/key', { key: 'WHM-7K3Q-M2DF-9XA1-P0R6' }).expect(200);
     expect((await post('/api/marketplace/install', { pluginId: 'net.example.minimal' })).body.error.code).toBe('not_marketplace');
     await del('/api/plugins/manage/net.example.minimal?purge=true').expect(200);
@@ -717,5 +738,62 @@ describe('degraded license and install sources', () => {
   it('registers both job types and the two schedules', () => {
     expect(app.ctx.jobs.types()).toEqual(expect.arrayContaining([INSTALL_JOB, UPDATE_JOB, REVOCATIONS_JOB, 'marketplace.update-check']));
     expect(app.ctx.scheduler.list().map((s) => s.name)).toEqual(expect.arrayContaining([REVOCATIONS_SCHEDULE, UPDATE_CHECK_SCHEDULE]));
+  });
+});
+
+// The real license transport (only https.request is stubbed): a package download
+// may be 20 MiB while signed JSON answers keep the 1 MiB default (§18.6).
+describe('license transport size limit', () => {
+  function stubHttps(bytes, { chunk = 256 * 1024 } = {}) {
+    const seen = [];
+    const spy = vi.spyOn(https, 'request').mockImplementation((u, options, cb) => {
+      seen.push({ url: u.href, options });
+      const req = new EventEmitter();
+      req.write = () => true;
+      req.destroy = (err) => { if (req.destroyed) return; req.destroyed = true; if (err) req.emit('error', err); };
+      req.end = () => setImmediate(() => {
+        const res = new EventEmitter();
+        res.statusCode = 200;
+        res.headers = { 'content-type': 'application/gzip' };
+        cb(res);
+        let sent = 0;
+        const tick = () => {
+          if (req.destroyed) return;
+          if (sent >= bytes) { res.emit('end'); return; }
+          const n = Math.min(chunk, bytes - sent);
+          res.emit('data', Buffer.alloc(n, 1));
+          sent += n;
+          setImmediate(tick);
+        };
+        tick();
+      });
+      return req;
+    });
+    return { spy, seen };
+  }
+  afterAll(() => vi.restoreAllMocks());
+
+  it('caps signed JSON answers at 1 MiB by default and honours maxBytes for package downloads', async () => {
+    const url = `${HUB}/v1/market/packages/dl_TEST?exp=1&sig=x`;
+    const over = MAX_RESPONSE_BYTES + 1;
+    let stub = stubHttps(over);
+    await expect(realTransport.request(url, { method: 'GET' })).rejects.toThrow(/too large/);
+    expect(stub.seen[0].options).toMatchObject({ method: 'GET', timeout: 30_000, rejectUnauthorized: true });
+    stub.spy.mockRestore();
+    stub = stubHttps(over);
+    const ok = await realTransport.request(url, { method: 'GET', timeoutMs: 60_000, maxBytes: MAX_PACKAGE_BYTES });
+    expect(ok.status).toBe(200);
+    expect(ok.body.length).toBe(over);
+    expect(stub.seen[0].options.timeout).toBe(60_000);
+    stub.spy.mockRestore();
+    stub = stubHttps(MAX_PACKAGE_BYTES + 1);
+    await expect(realTransport.request(url, { method: 'GET', maxBytes: MAX_PACKAGE_BYTES })).rejects.toThrow(/too large/);
+    stub.spy.mockRestore();
+    stub = stubHttps(MAX_PACKAGE_BYTES);
+    expect((await realTransport.request(url, { method: 'GET', maxBytes: MAX_PACKAGE_BYTES })).body.length).toBe(MAX_PACKAGE_BYTES);
+    stub.spy.mockRestore();
+    const plain = stubHttps(10);
+    await expect(realTransport.request('http://hub.test/v1/market/packages/x', { method: 'GET', maxBytes: MAX_PACKAGE_BYTES })).rejects.toThrow(/https/);
+    expect(plain.seen).toEqual([]);
   });
 });

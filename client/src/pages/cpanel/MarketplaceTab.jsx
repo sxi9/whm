@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { AlertTriangle, Download, RefreshCw, ShieldCheck, Store } from 'lucide-react';
 import { api, queryString } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
+import { useAuth } from '../../auth/AuthContext.jsx';
 import { Card, StatusPill, Loading, EmptyState, KeyValue, formatDate, formatBytes } from '../../components/Common.jsx';
 import { Button, TextInput, Select, Textarea, Field, ErrorBanner, FormActions } from '../../components/Form.jsx';
 import { Modal, useConfirm } from '../../components/Modal.jsx';
@@ -33,6 +34,26 @@ export function MarketplaceDisabledNotice() {
       <div>
         <strong>The WHM marketplace hub is not enabled</strong>
         <p>Enable the <code>whm-hub</code> provider in <Link to={PROVIDER_PATH}>Market Provider Manager</Link> to browse and install plugins from the hub. The license key itself is entered under <Link to={LICENSE_PATH}>Basic Setup → License</Link>.</p>
+      </div>
+    </div>
+  );
+}
+
+// Dashboard notice (§18.6): pending marketplace updates for root, read from the
+// panel's own state (no hub call), linking to the Marketplace tab.
+export function MarketplaceUpdatesNotice() {
+  const { user } = useAuth();
+  const isRoot = user?.role === 'root';
+  const { data } = useApi('/marketplace/updates', { enabled: isRoot, refreshMs: 5 * 60 * 1000 });
+  const pending = Array.isArray(data?.pending) ? data.pending : [];
+  if (!isRoot || pending.length === 0) return null;
+  const security = pending.filter((u) => u.security).length;
+  return (
+    <div className={`banner ${security ? 'banner-warning' : 'banner-info'}`} role="status" data-testid="marketplace-updates-notice">
+      <RefreshCw size={18} />
+      <div>
+        <strong>{pending.length} marketplace plugin update{pending.length === 1 ? '' : 's'} available{security ? ` (${security} security)` : ''}</strong>
+        <p>{pending.map((u) => `${u.id} ${u.current} → ${u.latest}`).join(', ')}. <Link to={`${MANAGE_PLUGINS_PATH}#marketplace`}>Open the Marketplace tab</Link></p>
       </div>
     </div>
   );

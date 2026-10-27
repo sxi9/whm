@@ -115,7 +115,7 @@ export function createApp(ctx) {
     }));
   }
   app.use(helmet({
-    contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'"], styleSrc: ["'self'", "'unsafe-inline'"], imgSrc: ["'self'", 'data:'], connectSrc: ["'self'"], objectSrc: ["'none'"], frameAncestors: ["'none'"], baseUri: ["'self'"], formAction: ["'self'"] } },
+    contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'"], styleSrc: ["'self'", "'unsafe-inline'"], imgSrc: ["'self'", 'data:', 'https:'], connectSrc: ["'self'"], objectSrc: ["'none'"], frameAncestors: ["'none'"], baseUri: ["'self'"], formAction: ["'self'"] } },
     crossOriginEmbedderPolicy: false,
     hsts: config.tls ? undefined : false,
   }));
@@ -159,7 +159,7 @@ export function createApp(ctx) {
 // hub/ui/dist at "/" when serve_ui is set: hashed assets with a long cache,
 // index.html (never cached) for every other extension-less GET so the
 // client-side router owns /login, /admin/*, /reseller/* and /dev/*.
-// WHM_HUB_UI_DIST (or config.ui_dist) points at another build directory.
+// WHM_HUB_UI_DIST points at another build directory.
 const STATIC_EXTENSIONS = new Set(['.js', '.mjs', '.css', '.map', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.json', '.txt', '.woff', '.woff2', '.ttf', '.webmanifest', '.html']);
 // Client-side route prefixes: a reverse-DNS segment inside them (plugin id
 // net.acme.js, catalog id com.foo.json) is a route param, never a file.
@@ -172,7 +172,7 @@ export function isSpaPath(reqPath) {
 }
 
 export function uiDistDir(config = {}) {
-  return config.ui_dist || process.env.WHM_HUB_UI_DIST || path.resolve(path.dirname(new URL(import.meta.url).pathname), '../ui/dist');
+  return process.env.WHM_HUB_UI_DIST || path.resolve(path.dirname(new URL(import.meta.url).pathname), '../ui/dist');
 }
 
 export function finalizeApp(ctx) {

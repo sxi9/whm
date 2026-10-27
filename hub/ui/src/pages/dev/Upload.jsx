@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { PageHeader, Card, StatusPill } from '../../components/Common.jsx';
 import { Field, TextInput, Textarea, Select, Button, ErrorBanner } from '../../components/Form.jsx';
-import { api } from '../../api/client.js';
+import { api, queryString } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { useAction } from '../../hooks/useAction.js';
 
@@ -24,6 +24,12 @@ export function parseJustifications(text) {
   return out;
 }
 
+// Both segments come from the URL or a select; a '/', '?' or '#' in them
+// must stay inside this route, never pick another one.
+export function uploadPath(pluginId, channel) {
+  return `/dev/plugins/${encodeURIComponent(pluginId)}/versions${queryString({ channel })}`;
+}
+
 export default function Upload() {
   const { id: routeId } = useParams();
   const navigate = useNavigate();
@@ -42,7 +48,7 @@ export default function Upload() {
     if (changelog.trim()) headers['X-WHM-Changelog'] = encodeHeader(changelog);
     const just = parseJustifications(justifications);
     if (Object.keys(just).length) headers['X-WHM-Justifications'] = encodeHeader(just);
-    const { data } = await api.postRaw(`/dev/plugins/${pluginId}/versions?channel=${channel}`, bytes, 'application/gzip', headers);
+    const { data } = await api.postRaw(uploadPath(pluginId, channel), bytes, 'application/gzip', headers);
     return data;
   }, { success: (v) => `Version ${v.version} uploaded; scanning`, then: (v) => setResult(v) });
   return (

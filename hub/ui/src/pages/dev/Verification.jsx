@@ -2,13 +2,19 @@ import { useState } from 'react';
 import { PageHeader, Card, StatusPill, CapabilityNotice, formatDate } from '../../components/Common.jsx';
 import { Field, TextInput, Select, Button, ErrorBanner } from '../../components/Form.jsx';
 import { useConfirm } from '../../components/Modal.jsx';
-import { api } from '../../api/client.js';
+import { api, queryString } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { useAction } from '../../hooks/useAction.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
 
 // Namespace ↔ domain rule: net.acme ↔ acme.net; evidence on that domain or
 // its registrable parent (§18.2).
+// The GitHub OAuth start URL is hub-generated (routes/developer.js), but the
+// browser is only ever sent to github.com: any other origin is refused.
+export function githubAuthorizeUrl(url) {
+  return typeof url === 'string' && /^https:\/\/github\.com\//.test(url) ? url : null;
+}
+
 export function domainOfNamespace(ns) {
   return String(ns || '').trim().toLowerCase().split('.').filter(Boolean).reverse().join('.');
 }
@@ -67,7 +73,7 @@ export default function Verification() {
                   <td>{v.evidence?.token && <code className="small">whm-dev-verify={v.evidence.token}</code>}{v.result_detail && <span className="muted"> {typeof v.result_detail === 'string' ? v.result_detail : JSON.stringify(v.result_detail)}</span>}{v.reviewer_note && <span className="muted"> · reviewer: {v.reviewer_note}</span>}</td>
                   <td className="inline-list">
                     {['dns_txt', 'well_known'].includes(v.method) && <Button size="sm" loading={busy} onClick={() => run(() => api.post(`/dev/verification/${v.id}/recheck`), { success: (r) => `Check result: ${r.data?.result}`, then: refresh })}>Re-check</Button>}
-                    {v.method === 'github_org' && <Button size="sm" onClick={() => run(() => api.get(`/dev/verification/github/start?id=${v.id}`), { then: (r) => { if (r.data?.url) window.location.assign(r.data.url); } })}>Connect GitHub</Button>}
+                    {v.method === 'github_org' && <Button size="sm" onClick={() => run(() => api.get(`/dev/verification/github/start${queryString({ id: v.id })}`), { then: (r) => { const url = githubAuthorizeUrl(r.data?.url); if (url) window.location.assign(url); else throw Object.assign(new Error('The hub returned an unexpected GitHub authorisation URL'), { code: 'invalid_redirect' }); } })}>Connect GitHub</Button>}
                   </td></tr>
               ))}
               {!(verifications.data || []).length && <tr><td colSpan={6} className="muted">No evidence submitted yet.</td></tr>}

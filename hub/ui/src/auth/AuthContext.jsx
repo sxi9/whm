@@ -37,10 +37,15 @@ export function stepUpPathFor(session) {
 // Reseller users carry their tenant's white-label brand (resellers.brand_json:
 // name, logo_url, support_url) in /portal/me and /portal/login as
 // `reseller: { id, name, brand }` (build-plan contract row); absent → defaults.
+// Only an absolute https URL may become an href/src in the portals; anything
+// else (javascript:, data:, relative) renders as plain text.
+export function safeUrl(u) {
+  return typeof u === 'string' && /^https:\/\/[^\s/?#]+/i.test(u) ? u : null;
+}
+
 export function brandOf(data) {
   const brand = data?.reseller?.brand || data?.brand || null;
   if (!brand || typeof brand !== 'object') return null;
-  const safeUrl = (u) => (typeof u === 'string' && /^https:\/\//i.test(u) ? u : null);
   return { name: typeof brand.name === 'string' && brand.name.trim() ? brand.name.trim() : data?.reseller?.name || null, logo_url: safeUrl(brand.logo_url), support_url: safeUrl(brand.support_url) };
 }
 

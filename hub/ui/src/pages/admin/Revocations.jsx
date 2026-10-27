@@ -6,6 +6,23 @@ import { api } from '../../api/client.js';
 import { useListQuery } from '../../hooks/useListQuery.js';
 import { FormModal } from '../../widgets/index.jsx';
 
+// The hub's revocations.list() reports, per row, how many installs of the
+// plugin exist, how many checked in (installs.last_seen) since the revocation
+// and how many of those still have it present (enabled/installed/disabled).
+export function propagationText(p) {
+  if (!p || typeof p !== 'object') return null;
+  const installs = Number(p.installs) || 0;
+  const reported = Number(p.reported_after) || 0;
+  const active = Number(p.still_active) || 0;
+  return { installs, reported, active, text: `${reported} / ${installs} installs reported since the revocation · ${active} still active` };
+}
+
+function Propagation({ p }) {
+  const t = propagationText(p);
+  if (!t) return '—';
+  return <>{t.reported} / {t.installs} installs <span className="muted">reported since the revocation</span> · <span className={t.active ? 'pill pill-warn' : 'pill pill-ok'}>{t.active} still active</span></>;
+}
+
 // §18.3 revoke vs kill-switch: a revocation reaches panels through the signed
 // feed (every 6 h); the kill-switch additionally queues a check-in message so
 // every activation pulls the feed within one check-in.
@@ -20,7 +37,7 @@ export default function Revocations() {
     { key: 'action', label: 'Action' },
     { key: 'reason', label: 'Reason' },
     { key: 'revoked_by', label: 'By', render: (r) => <code className="small">{r.revoked_by}</code> },
-    { key: 'propagation', label: 'Propagation', render: (r) => (r.propagation ? <>{r.propagation.applied ?? r.propagation.seen ?? 0} / {r.propagation.total ?? r.propagation.installs ?? 0} installs <span className="muted">(last_seen within 30 d)</span></> : '—') },
+    { key: 'propagation', label: 'Propagation', render: (r) => <Propagation p={r.propagation} /> },
   ];
   const fields = (kill) => [
     { key: 'plugin_id', label: 'Plugin id', required: true },

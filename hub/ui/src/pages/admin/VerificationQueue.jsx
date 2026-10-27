@@ -6,6 +6,7 @@ import { Modal } from '../../components/Modal.jsx';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { useAction } from '../../hooks/useAction.js';
+import { safeUrl } from '../../auth/AuthContext.jsx';
 import { ReasonModal, KV } from '../../widgets/index.jsx';
 import { decideVerification, VERIFICATION_REJECT_CODES } from './queues.js';
 
@@ -62,8 +63,7 @@ export function DocumentViewer({ verification, open, onClose }) {
       <p className="muted">Uploaded {formatDate(verification?.created_at)} · every view is audited (<code>developer.verification.document_view</code>) · purged 30 days after the decision.</p>
       {!doc && <Button variant="primary" loading={busy} onClick={load}>Load document</Button>}
       {doc && type.startsWith('image/') && <img src={url} alt="Uploaded ID document" style={{ maxWidth: '100%' }} />}
-      {doc && type === 'application/pdf' && <object data={url} type="application/pdf" style={{ width: '100%', height: '70vh' }} aria-label="Uploaded ID document">PDF preview unavailable; open it in a new tab.</object>}
-      {doc && !type.startsWith('image/') && type !== 'application/pdf' && <p>{type || 'unknown type'}: no inline preview; open it in a new tab.</p>}
+      {doc && !type.startsWith('image/') && <p>{type === 'application/pdf' ? 'PDF' : type || 'unknown type'}: no inline preview (the hub forbids embedded objects); open it in a new tab.</p>}
     </Modal>
   );
 }
@@ -80,7 +80,7 @@ function QueueEntry({ entry, onDecided }) {
       actions={<><StatusPill status={d.status} />{rejections_90d > 0 && <span className="pill pill-warn">{rejections_90d} rejection(s) in 90 d</span>}{!d.email_verified && <span className="pill pill-bad">e-mail unverified</span>}</>}>
       <div className="two-col">
         <div>
-          <KV items={[['Company', d.company], ['Website', d.website ? <a href={d.website} target="_blank" rel="noreferrer noopener">{d.website}</a> : null], ['Country', d.country], ['Support', d.support_email || d.support_url], ['2FA', d.totp_enabled ? 'enabled' : 'not enrolled'], ['Status reason', d.status_reason]]} />
+          <KV items={[['Company', d.company], ['Website', d.website ? (safeUrl(d.website) ? <a href={safeUrl(d.website)} target="_blank" rel="noreferrer noopener">{d.website}</a> : <span title="Not an https URL; shown as text">{d.website}</span>) : null], ['Country', d.country], ['Support', d.support_email || d.support_url], ['2FA', d.totp_enabled ? 'enabled' : 'not enrolled'], ['Status reason', d.status_reason]]} />
           <p style={{ marginTop: 10 }}><strong>Namespaces</strong></p>
           <div className="inline-list">{(namespaces || []).map((n) => <span key={n.ns} className={`pill ${n.status === 'verified' ? 'pill-ok' : 'pill-muted'}`}>{n.ns} · {n.status}</span>)}{!(namespaces || []).length && <span className="muted">none claimed</span>}</div>
           <p style={{ marginTop: 10 }}><strong>Signing keys</strong></p>

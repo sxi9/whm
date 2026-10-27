@@ -157,6 +157,8 @@ hub/ui/test/            vitest + @testing-library: render each page against a mo
                         Integrator: add @testing-library/react + jsdom to hub/ui devDependencies and one interaction test per queue.
 hub/ui/src/pages/admin/Security.jsx   portal account security (TOTP enrol/confirm/disable via /v1/portal/2fa/*, password via /v1/portal/password),
                         mounted at /admin/security and /reseller/security (fix round 1)
+                        DEFERRED (fix round 2): the §16.9 "impersonate-reseller (audited)" screen waits for the U1 route recorded in the
+                        cross-unit table; the Shell's 2FA indicator is advisory (the hub alone enforces license.stepup_max_age_s).
 ```
 **Edit**: `hub/src/app.js` — serve `hub/ui/dist` at `/` (SPA fallback) when `config.serve_ui`.
 
@@ -233,7 +235,7 @@ hub.request(path, body, { timeoutMs = 30000 } = {})   // POST hubUrl()+path with
                  //   HttpError 502 hub_signature_invalid | hub_nonce_mismatch | hub_unreachable (503); never follows redirects; https only
 verifySigned(bodyBuffer, signatureHeader) → boolean   // same verification for callers that hold a raw response
 on('status_changed'|'keys_changed'|'message', fn)      // 'message' delivers check-in messages such as plugin_revocations_pending and the signed revocations_head_ts
-transport        → { request(url, { method, body, headers, timeoutMs }) }  // replaced by tests with a mock hub; U5 mocks THIS, never its own transport
+transport        → { request(url, { method, body, headers, timeoutMs, maxBytes = 1 MiB }) }  // replaced by tests with a mock hub; U5 mocks THIS, never its own transport; U5 passes maxBytes = 20 MiB for package downloads
 ```
 Key pinning lives here (U5 only reads `pluginSigningKids()`): every `plugin_signing_keys` entry
 (`active`, `retiring`, `pending`) in a verified response is written to `plugin-keys/<kid>.pub`; a kid missing
@@ -358,8 +360,12 @@ fixtures under the vendor developer `net.whm` (verified) and used by the integra
 | Billing discriminator `metadata.whm_kind ∈ license|plugin_purchase`; magic links single-use/15 min/e-mail-bound | §18.5 + errata | U1, U2 | marketplace.md, this plan |
 | `shared/webhooks.js enqueue(db, …)` with `ownerType = 'developer'` → marketplace.db `developer_webhook_*`; `shared/safe-fetch.js` for every developer-supplied host | U1 | U2 | this plan |
 | Feature-gate map and degraded allow-list (concrete paths) | U4 | core tests, U5 | this plan |
+| **`transport.request(url, { method, body, headers, timeoutMs, maxBytes })`** honours a per-call `maxBytes` (default `MAX_RESPONSE_BYTES` = 1 MiB for signed JSON answers; U5 passes `MAX_PACKAGE_BYTES` = 20 MiB with a 60 s timeout for package downloads, §18.6) and rejects with "hub response too large" above it | U4 (`services/license.js`) | U5 (`fetchPackage`) | this plan (U5 fix round 2) |
+| Host `policy.expectedId`: `install()` answers `422 plugin_id_mismatch` right after manifest validation, before `verifySignature()` and the directory swap, when `manifest.id !== policy.expectedId`; U5 passes the requested `pluginId` | U5 (`services/plugins.js`) | U5 | this plan (U5 fix round 2) |
+| `market.update/configure/setEnabled` of the `whm-hub` row call `ctx.marketplace?.onHubChanged?.()` (lazy, tolerates absence) so the marketplace schedules flip with the row; `requireHub()`/catalog reads never write | Market category (`services/market.js`) + U5 | U5 | this plan (U5 fix round 2) |
 | **Reseller catalog**: `GET /v1/reseller/products` (scope `license:read`) → `{ data: [ { sku, name, edition, term, term_days, price_cents, currency, active, limits, features } ] }`, active products only, every edition (the UI narrows to `quota_left`); until it exists the reseller forms take a free SKU input and the hub's 404 `Product not found` is the error | U1 (`license/routes/reseller.js`) | U3 (`pages/reseller/Licenses.jsx` `useResellerProducts`) | this plan (fix round 1) |
 | **Reseller brand in the portal session**: `GET /v1/portal/me` and `POST /v1/portal/login` carry `reseller: { id, name, brand: { name?, logo_url?, support_url? } }` (from `resellers.brand_json`) for users with `reseller_id`; absent for vendor users | U1 (`license/routes/portal.js`) | U3 (`auth/AuthContext.jsx brandOf()`, `shell/Shell.jsx`; https URLs only) | this plan (fix round 1) |
+| **Impersonate reseller (§16.9, DEFERRED)**: `POST /v1/admin/resellers/:id/impersonate` † (vendor_admin, step-up) → `{ data: { expires_at } }` after rebinding the portal session to a short-lived (≤ 1 h) `reseller_admin` scope for that reseller, `audit_log` rows `reseller.impersonate` on start and `reseller.impersonate_end` on `POST /v1/portal/impersonate/end` or expiry; `/v1/portal/me` carries `impersonating: { reseller_id, by, expires_at }`. No hub route exists yet, so the vendor Resellers drawer has no Impersonate action; U3 adds it (banner + "End impersonation" in the Shell) when U1 lands the route | U1 (`license/routes/admin.js`, `portal.js`) | U3 (`pages/admin/Resellers.jsx`, `shell/Shell.jsx`) | this plan (fix round 2) |
 
 Anything not listed is internal to its unit. A unit that needs more from another unit adds a
 row here first (the integrator merges the doc), then builds.

@@ -1586,7 +1586,8 @@ export function createPluginHost(ctx) {
   }
 
   // `policy` (marketplace installs): requireSigned demands a valid signature
-  // from one of `signers` whatever plugins.require_signature says.
+  // from one of `signers` whatever plugins.require_signature says; install()
+  // also honours policy.expectedId (manifest id must match) and policy.activate.
   function verifySignature(root, { source = 'upload', policy = null } = {}) {
     const sigFile = path.join(root, 'SIGNATURE.json');
     const bundled = source === 'bundled';
@@ -1656,6 +1657,9 @@ export function createPluginHost(ctx) {
       const vr = V.validateManifest(manifest);
       if (!vr.ok) throw err422('invalid_manifest', `plugin.json is invalid: ${vr.errors.map((e) => `${e.path}: ${e.message}`).join('; ')}`, vr.errors);
       if (!semver.satisfies(HOST_API_VERSION, manifest.engines.whm)) throw err422('incompatible_host', `Plugin "${manifest.id}" requires WHM ${manifest.engines.whm} but this host provides ${HOST_API_VERSION}`);
+      // Refused before any signature check or rename: a package the caller
+      // requested under one id never touches a plugin installed under another.
+      if (typeof policy?.expectedId === 'string' && manifest.id !== policy.expectedId) throw err422('plugin_id_mismatch', `The package declares plugin id ${manifest.id}, not ${policy.expectedId}`);
       const mainFile = path.resolve(root, manifest.main);
       if (!mainFile.startsWith(root + path.sep) || !fs.existsSync(mainFile) || !fs.statSync(mainFile).isFile()) throw err422('invalid_manifest', `main "${manifest.main}" does not exist in the package`);
       const sig = verifySignature(root, { source, policy });

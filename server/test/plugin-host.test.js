@@ -994,6 +994,21 @@ describe('marketplace policy, developer-mode gate, bundled source and enable gua
     expect(ok).toMatchObject({ wasEnabled: false, previousVersion: null, warnings: ['in-process'], plugin: { id: 'net.example.policy', state: 'installed', signed: true, signer: hubKey.kid, source: 'marketplace' } });
   });
 
+  it('policy.expectedId refuses a package that declares another id before signature checks and the directory swap', async () => {
+    const before = app.ctx.plugins.get('net.example.policy');
+    expect(before).toMatchObject({ version: '1.0.0', state: 'installed' });
+    const policy = { requireSigned: true, signers: [hubKey.kid], activate: false, expectedId: 'net.example.requested' };
+    // Unsigned and foreign-signed copies fail on the id first: the check precedes verifySignature().
+    await expect(install(packed(manifest('1.1.0')), { policy })).rejects.toMatchObject({ status: 422, code: 'plugin_id_mismatch' });
+    await expect(install(packed(manifest('1.1.0'), otherKey.privateKey, otherKey.kid), { policy })).rejects.toMatchObject({ status: 422, code: 'plugin_id_mismatch' });
+    await expect(install(packed(manifest('1.1.0'), hubKey.privateKey, hubKey.kid), { policy })).rejects.toMatchObject({ status: 422, code: 'plugin_id_mismatch', message: 'The package declares plugin id net.example.policy, not net.example.requested' });
+    expect(app.ctx.plugins.get('net.example.policy')).toMatchObject({ version: '1.0.0', state: 'installed', signer: hubKey.kid });
+    expect(() => app.ctx.plugins.get('net.example.requested')).toThrow(expect.objectContaining({ status: 404 }));
+    expect(fs.readdirSync(path.join(app.ctx.config.pluginsDir, '.staging')).filter((n) => !n.endsWith('.previous'))).toEqual([]);
+    const ok = await install(packed(manifest('1.0.0'), hubKey.privateKey, hubKey.kid), { policy: { ...policy, expectedId: 'net.example.policy' } });
+    expect(ok.plugin).toMatchObject({ id: 'net.example.policy', version: '1.0.0' });
+  });
+
   it('policy.activate false leaves an upgraded plugin disabled and reports wasEnabled', async () => {
     await app.ctx.plugins.enable('net.example.policy');
     expect(app.ctx.plugins.get('net.example.policy').state).toBe('enabled');

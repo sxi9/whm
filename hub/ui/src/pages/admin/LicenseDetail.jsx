@@ -97,7 +97,7 @@ export default function LicenseDetail() {
             ['Status', <StatusPill status={lic.status_now || lic.status} />], ['Edition', `${lic.edition} (rank ${lic.rank ?? '—'})`], ['Issued', formatDate(lic.issued_at)], ['Starts', formatDate(lic.starts_at)],
             ['Expires', lic.expires_at ? `${formatDate(lic.expires_at)} (+${lic.grace_days} d grace)` : 'never'], ['Activations', `${(lic.activations || []).filter((a) => a.status === 'active').length} / ${limitLabel(lic.max_activations)}`],
             ['Customer', lic.customer ? <Link to={`/admin/customers?q=${encodeURIComponent(lic.customer.email)}`}>{lic.customer.name || lic.customer.email}</Link> : lic.customer_id],
-            ['Reseller', lic.reseller_id ? <Link to={`/admin/resellers?q=${lic.reseller_id}`}>{lic.reseller_id}</Link> : 'vendor direct'], ['External ref', lic.external_ref], ['Issued by', lic.issued_by], ['Notes', lic.notes],
+            ['Reseller', lic.reseller_id ? <Link to={`/admin/resellers?q=${encodeURIComponent(lic.reseller_id)}`}>{lic.reseller_id}</Link> : 'vendor direct'], ['External ref', lic.external_ref], ['Issued by', lic.issued_by], ['Notes', lic.notes],
             lic.trial && ['Trial', `started ${formatDate(lic.trial.started_at)}${lic.trial.converted_at ? `, converted ${formatDate(lic.trial.converted_at)}` : ''}`],
           ]} />
         </Card>

@@ -135,6 +135,12 @@ export function createMarketService(ctx) {
     }));
   }
   function syncSettings() { settings.set('market.providers', sslProviders()); }
+  // The marketplace client switches its schedules with the whm-hub row (enable,
+  // disable, URL change). Referenced lazily: it is created after this service.
+  function hubChanged(name) {
+    if (name !== HUB_NAME) return;
+    try { ctx.marketplace?.onHubChanged?.(); } catch (err) { logger.warn({ err }, 'market: marketplace could not follow the hub row change'); }
+  }
 
   // Entries the legacy market.providers setting has and the table does not were
   // placed there before the table existed; they become manual SSL providers.
@@ -226,6 +232,7 @@ export function createMarketService(ctx) {
       if (r.enabled && a.requiresUrl && !next.url) throw unprocessable('An enabled provider needs a URL', { url: ['Disable the provider before clearing its URL'] });
       stmts.update.run(next);
       if (r.type === 'ssl') syncSettings();
+      hubChanged(name);
       req?.audit?.({ action: 'market.provider.update', target: name, args: { displayName: next.display_name, url: next.url, commissionPercent: next.commission_percent, products: input.products === undefined ? undefined : normalizeProducts(input.products).length } });
       return shape(stmts.byName.get(name), { forRoot: true });
     },
@@ -253,6 +260,7 @@ export function createMarketService(ctx) {
       }
       stmts.setConfig.run(Object.keys(merged).length ? crypto.encrypt(JSON.stringify(merged)) : null, nextUrl || null, name);
       if (r.type === 'ssl') syncSettings();
+      hubChanged(name);
       req?.audit?.({ action: 'market.provider.configure', target: name, args: { url: nextUrl || null, fields: Object.keys(config), cleared: Object.keys(config).filter((k) => config[k] === null) } });
       return shape(stmts.byName.get(name), { forRoot: true });
     },
@@ -266,6 +274,7 @@ export function createMarketService(ctx) {
       }
       stmts.setEnabled.run(enabled ? 1 : 0, name);
       if (r.type === 'ssl') syncSettings();
+      hubChanged(name);
       req?.audit?.({ action: enabled ? 'market.provider.enable' : 'market.provider.disable', target: name });
       return shape(stmts.byName.get(name), { forRoot: true });
     },

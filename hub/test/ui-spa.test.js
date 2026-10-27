@@ -67,6 +67,36 @@ test('serve_ui: index.html for portal routes, static assets, API and health unto
   }
 });
 
+test('uiDistDir: only WHM_HUB_UI_DIST overrides the bundled dist (hub.conf has no ui_dist key)', () => {
+  const saved = process.env.WHM_HUB_UI_DIST;
+  delete process.env.WHM_HUB_UI_DIST;
+  try {
+    assert.equal(uiDistDir({ ui_dist: '/elsewhere' }), path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../ui/dist'));
+    process.env.WHM_HUB_UI_DIST = '/from-env';
+    assert.equal(uiDistDir({ ui_dist: '/elsewhere' }), '/from-env');
+  } finally {
+    if (saved === undefined) delete process.env.WHM_HUB_UI_DIST; else process.env.WHM_HUB_UI_DIST = saved;
+  }
+});
+
+test('CSP: external https images (reseller logo_url) are allowed, objects stay forbidden', async () => {
+  const dist = fakeDist();
+  process.env.WHM_HUB_UI_DIST = dist;
+  const hub = await bootHub({ config: { serve_ui: true } });
+  try {
+    const res = await hub.http.get('/login');
+    const csp = res.headers['content-security-policy'];
+    assert.match(csp, /img-src 'self' data: https:/);
+    assert.match(csp, /object-src 'none'/);
+    assert.match(csp, /script-src 'self'(;|$)/);
+    assert.match(csp, /connect-src 'self'(;|$)/);
+  } finally {
+    delete process.env.WHM_HUB_UI_DIST;
+    await hub.close();
+    fs.rmSync(dist, { recursive: true, force: true });
+  }
+});
+
 test('isSpaPath: SPA prefixes win over a file-like last segment; elsewhere extensions mean files', () => {
   for (const p of ['/', '/login', '/admin', '/admin/', '/reseller/licenses/lic_1', '/dev/plugins/net.acme.js', '/dev/plugins/com.foo.txt/versions/1.0.0', '/admin/market/catalog/org.bar.json', '/dev/verify-email', '/pricing']) assert.equal(isSpaPath(p), true, p);
   for (const p of ['/assets/index-abc.js', '/assets/nope.css', '/favicon.ico', '/robots.txt', '/admin.js', '/adminx/net.acme.js', '/loginx.html', '/devs/a.json']) assert.equal(isSpaPath(p), false, p);
