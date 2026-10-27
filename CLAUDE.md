@@ -253,8 +253,10 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   workflow dies with it (happened 2026-10-26 05:38; resumed 14:27 from cache). A self-bound hourly
   Routine `trig_015b4oBVtePikCYJAcFwKkTK` ("WHM build keep-alive check-in", minute :09) wakes this
   session to resume the run, integrate finished waves, snapshot to git and move to the next step.
-  Current run: **wave-3 fix round** (script `<workflows>/scripts/whm-fix-wave-wf_f1a004d0-b80.js`, `args: {wave: 3}`; the run id
-  is recorded in CHECKLIST.md's timeline row once launched). Wave 3 build `wf_cdfc582d-8cc` is complete and landed.
+  Current runs: **wave-3 fix round `wf_914776c1-9db`** (script `<workflows>/scripts/whm-fix-wave-wf_f1a004d0-b80.js`,
+  `args: {wave: 3}`; resumed from cache at 01:07 after a container restart) and the **Phase-5 marketplace design
+  `wf_eed21b3a-bfc`** (`whm-marketplace-design-wf_eed21b3a-bfc.js`, writes `docs/design/marketplace.md` +
+  `docs/design/phase5-build-plan.md`). Wave 3 build `wf_cdfc582d-8cc` is complete and landed.
   After the fix round: Phase 5 (license server, marketplace, SDK docs, sample + automated-backup plugins). Disable the Routine
   (`update_trigger enabled=false`) once CHECKLIST.md is fully done.
 - This dev container has 4 CPUs → at most 2 concurrent subagents; plan fan-outs accordingly.
