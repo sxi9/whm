@@ -16,7 +16,7 @@ if (!SHA) { try { SHA = require('child_process').execSync('git rev-parse --short
 const LABELS = {
   '01-login': 'Login', '02-dashboard': 'Home dashboard', '03-create-account-form': 'Create a New Account — form', '04-create-account-result': 'Create a New Account — result',
   '05-list-accounts': 'List Accounts', '06-service-status': 'Service Status', '07-server-information': 'Server Information', '08-feature-manager': 'Feature Manager',
-  '09-tweak-settings': 'Tweak Settings', '10-generic-function-page': 'Placeholder for a not-yet-built function', '11-sidebar-search': 'Sidebar search',
+  '09-tweak-settings': 'Tweak Settings', '10-wp-toolkit-plugin': 'WP Toolkit (bundled plugin page)', '11-sidebar-search': 'Sidebar search',
   '12-top-search': 'Global search', '13-restart-service': 'Restart HTTP Server (Apache)', '14-process-manager': 'Process Manager',
 };
 // Stamps a label bar at the top of the page so the screenshot explains itself.
@@ -87,10 +87,11 @@ async function stamp(page, text) {
   await page.waitForSelector('.toggle');
   await shot('09-tweak-settings');
 
-  // A function whose screen is still scheduled for a later phase renders the placeholder.
+  // Every function is live; the Plugins category pages render bundled SDK plugins through the host.
   await page.goto(`${BASE}/plugins/wp-toolkit`);
-  await page.waitForSelector('.empty-state');
-  await shot('10-generic-function-page');
+  await page.waitForSelector('.page-header h1');
+  await page.waitForTimeout(500);
+  await shot('10-wp-toolkit-plugin');
 
   // Sidebar search + top search.
   await page.fill('#sidebar-search', 'ssl');

@@ -31,7 +31,7 @@ const FLOW_SHOTS = [
   ['07-server-information.png', 'Server Information'],
   ['08-feature-manager.png', 'Feature Manager'],
   ['09-tweak-settings.png', 'Tweak Settings'],
-  ['10-generic-function-page.png', 'Placeholder for a not-yet-built function'],
+  ['10-wp-toolkit-plugin.png', 'WP Toolkit (bundled plugin page)'],
   ['11-sidebar-search.png', 'Sidebar search'],
   ['12-top-search.png', 'Global search'],
   ['13-restart-service.png', 'Restart HTTP Server (Apache)'],
