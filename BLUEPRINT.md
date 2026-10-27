@@ -6,9 +6,16 @@
 >
 > This document is the single source of truth for *what we are building* and *how it
 > is put together*. It mirrors the WHM interface at `trywhm.net` — **all 30 sidebar
-> categories and 180+ functions** — and specifies, for each function, the backend
+> categories and 212 functions** — and specifies, for each function, the backend
 > operation, the real system integration (commands/files touched), what is persisted,
 > and the UI.
+>
+> **As built (2026-10-27):** every section of this document is implemented — the 212 functions
+> (`CHECKLIST.md`), the privilege-separated agent (316 ops), the plugin host and SDK (§17), the
+> license server and marketplace hub (§16, §18; `hub/`), the installer and systemd units, the
+> installation guide (`docs/INSTALL.md`) and the user manual (`docs/MANUAL.md`, `docs/MANUAL-partB.md`).
+> Deviations from the saved designs are recorded in `docs/design/phase5-build-plan.md` (§16 errata)
+> and `docs/design/integration-contracts.md`. Current state and what remains: `HANDOFF.md`.
 
 - **Status:** Design / blueprint
 - **Target OS:** Ubuntu 22.04/24.04 LTS & RHEL/AlmaLinux 8/9 (systemd-based)

@@ -221,6 +221,13 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   Functions honours `ensureZoneForDomain({ nameservers })`, dead LEGACY registry rows removed. Core follow-ups done
   by hand: dead `sys.resolvers.set` op removed (networking-setup owns `resolver.*`), contracts doc
   §11–21, two load-sensitive tests made robust. Next: plugin host (core), then wave 3.
+- **2026-10-27 09:00: session ended during Phase 6 — continue from `HANDOFF.md` §4.** Phase 5 fix round
+  landed (`e49e500`); the live hub + panel flow passed 11/11 with no code fix (`e2e/live-hub-flow.sh`);
+  `docs/INSTALL.md` + `docs/MANUAL.md`/`MANUAL-partB.md` written and accuracy-reviewed (`029510f`); the
+  three Phase-6 audits (privileged surface, web platform, advisor + performance) applied 21 fixes with
+  tests (`b01bd30`) — the verifier did not run; their deferred items (zod 4 bump, react-router 7, root
+  `npm install` for the hub workspaces, `backup.db.import` temp user, 2FA-disable re-verification,
+  hub `ui_dist` config, one load-sensitive test) are listed in `HANDOFF.md` §4. Keep-alive Routine disabled.
 - **2026-10-27 06:45: Phase 5 built** (`wf_c7084ffb-2df`, 49 runs, 0 errors, critic: nothing blocking):
   `hub/license` (§16: products/editions, customers, resellers, licenses, activations with fingerprint drift,
   trials, transfers, billing connectors, signed responses, check-in messages, portal users, signing keys with
@@ -303,32 +310,12 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   the repo (`docs/design/license-server.md`, `plugins/sdk/`). When resuming Phase 5, write
   `plugins/SDK.md` against the committed `plugins/sdk/` code and design the marketplace
   to match its packaging/signing constants — do not regenerate the SDK code.
-- **Unattended operation:** the cloud container is reclaimed after idle periods and an in-process
-  workflow dies with it (happened 2026-10-26 05:38; resumed 14:27 from cache). A self-bound hourly
-  Routine `trig_015b4oBVtePikCYJAcFwKkTK` ("WHM build keep-alive check-in", minute :09) wakes this
-  session to resume the run, integrate finished waves, snapshot to git and move to the next step.
-  Phase 5 is committed (`76483ef`, green gate: server 1135 / agent 462 / client 48 / hub 177 / hub-ui 97 + SDK +
-  plugins, both builds, boot, e2e). Current run: the
-  Phase-5 fix round `wf_8f6db955-2a6` is **done** (07:34: hub 0 open, host 0 open; minors closed by the integrator:
-  expiring-threshold dedup persisted before notify, `origin` in the client fixture, app.js comment); green gate
-  running, then commit `fix(phase5)`. Docs run **`wf_6fb27dfc-b56`** (`whm-install-manual-wf_6fb27dfc-b56.js`, user
-  ask 07:40: `docs/INSTALL.md` + `docs/MANUAL.md` (parts A/B merged by the integrator at the `<!-- PART B -->`
-  marker) — link both from README and HANDOFF when landed), and the **live end-to-end run `wf_a77b6326-d1e`**
-  (`whm-live-e2e-wf_a77b6326-d1e.js`: operator runs hub + panel on :7443/:2088 under the scratch dir, publishes the
-  sample plugin, installs it with consent, revokes it; writes `e2e/live-hub-flow.sh`, adds Playwright steps 15–17,
-  refreshes `docs/screenshots/`; one reviewer re-runs the script) — **done 08:10: 11/11 PASS, no code fix needed**;
-  the hub and panel worked together on the first live run. **Phase 6 hardening run `wf_4ec3a48f-132`**
-  (`whm-phase6-hardening-wf_4ec3a48f-132.js`: three auditors — privileged surface (agent ops + routes), web
-  platform (deps, headers, CSRF, sessions, rate limits, hub nonce/SSRF), Security Advisor PHP-advisory rule +
-  performance/indexes — then one verifier running the full gate; resume with
-  `Workflow({scriptPath, resumeFromRunId: 'wf_4ec3a48f-132'})`),
-  then the live hub+panel end-to-end flow (`scripts/install.sh --with-hub` is the production path; in dev: start
-  the hub with test keys on :7443, point `WHM_LICENSE_HUB_URL` at it, activate a trial from Basic Setup → License,
-  enable the `whm-hub` provider, install `net.whm.sample-notes` through the consent screen, revoke it from the admin
-  portal), `e2e/ui-check.cjs` steps for License/Marketplace, `e2e/screenshots.sh`, CHECKLIST/README, then Phase 6.
-  Phase-5 build `wf_c7084ffb-2df` and docs/deploy run `wf_f64003d8-af1` are complete and landed.
-  After the fix round: Phase 5 (license server, marketplace, SDK docs, sample + automated-backup plugins). Disable the Routine
-  (`update_trigger enabled=false`) once CHECKLIST.md is fully done.
+- **No run is in progress.** The ended session's keep-alive Routine `trig_015b4oBVtePikCYJAcFwKkTK` is
+  disabled; its workflow scripts are not needed — the remaining work is ordinary engineering listed in
+  `HANDOFF.md` §4 (verify the Phase-6 fixes with the full gate, close the deferred items, tick P6).
+  If a future session wants multi-agent runs again: builders per category/unit, two adversarial
+  reviewers for root-level or signing code (one otherwise), one fix round, then a full gate — the
+  pattern that produced every phase here.
 - This dev container has 4 CPUs → at most 2 concurrent subagents; plan fan-outs accordingly.
 - The container has `systemctl` and `useradd` but no Apache/BIND/Exim/MySQL daemons; the
   capability layer must make every page degrade gracefully here and work fully on a
