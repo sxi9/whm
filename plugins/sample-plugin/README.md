@@ -10,7 +10,7 @@ deliberately boring: every feature exists to show one extension point of `plugin
 | Jobs, cancellable and not | `jobs.digest` (`cancellable: true`), `jobs.housekeeping` (`cancellable: false`) |
 | Cron, setting-bound and fixed | `cron[0].schedule = "setting:digestSchedule"`, `cron[1].schedule = "30 3 * * *"` |
 | Pages of every kind | `ui.pages`: table (`/`), form (`/new`), settings, action (`/digest`), markdown (`/about`), html (`/widget`); `/schedules` (markdown) is registered at runtime with `ctx.ui.registerPage` |
-| Routes with roles | `routes()`: `GET/POST /notes` for root and resellers (resellers scoped to their accounts), `DELETE /notes/:id`, `/status`, `/export`, `POST /digest` root only |
+| Routes with roles | `routes()`: `GET/POST /notes` and `GET /notes/:id` for root and resellers (resellers are scoped to accounts they own on every route: the list filters, the single-note read answers 404 for anything else), `DELETE /notes/:id`, `/status`, `/export`, `POST /digest` root only |
 | Store | kv entries (`installedAt`, `digest:last`, `webhook:token`) and the `notes` collection |
 | fs | `exports/latest-digest.json` in the plugin data directory |
 | crypto | the webhook token mirrored into the store with `ctx.crypto.encrypt` |
@@ -23,14 +23,16 @@ deliberately boring: every feature exists to show one extension point of `plugin
 
 ```
 cd plugins/sample-plugin
-npm test                                  # node --test against the SDK mock host
+npm test                                  # node --test "test/*.test.js" against the SDK mock host
+                                          # (node --test needs the glob; a bare directory argument fails)
 node ../../scripts/build-plugin.js . --out dist/sample-notes.whmplugin
 node ../../scripts/build-plugin.js . --sign test/fixtures/dev.pem --dev   # DEV-SIGNATURE.json for a marketplace upload
 npm run fixtures                          # regenerate test/fixtures/sample-notes-signed.whmplugin
 ```
 
 `test/fixtures/` holds a fixture developer key (`dev.pem`/`dev.pub`, test-only) and the plugin packed
-with a `DEV-SIGNATURE.json` from that key. The hub's upload tests and the panel's marketplace install
+with a `DEV-SIGNATURE.json` from that key (`build-plugin.js --include-tests` refuses to package that
+key unless `--allow-secrets` is passed). The hub's upload tests and the panel's marketplace install
 tests consume it; `test/fixture.test.js` fails when the plugin changed and the fixture was not
 regenerated. The plugin is distributed through the marketplace under the vendor developer `net.whm`;
 it is not a bundled plugin.

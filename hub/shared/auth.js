@@ -3,7 +3,8 @@ import { HttpError, unauthorized, forbidden } from './errors.js';
 import { constantTimeEqual } from './crypto.js';
 
 export const PORTAL_ROLES = ['vendor_admin', 'vendor_support', 'reseller_admin', 'reseller_staff'];
-export const RESELLER_SCOPES = ['license:read', 'license:issue', 'license:renew', 'license:revoke', 'customer:write', 'webhook:write', 'apikey:write'];
+// §16.7 verbatim: webhook:write is the integration scope and also governs /v1/reseller/api-keys.
+export const RESELLER_SCOPES = ['license:read', 'license:issue', 'license:renew', 'license:revoke', 'customer:write', 'webhook:write'];
 export const VENDOR_SCOPES = ['admin:*', 'admin:read', 'admin:write', 'billing:webhook', 'report:read'];
 const ROLE_SCOPES = {
   vendor_admin: ['*'],
@@ -62,6 +63,14 @@ export function attachPrincipal(ctx) {
   const byHash = db.prepare('SELECT * FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL');
   const touch = db.prepare("UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?");
   const userById = db.prepare('SELECT id, email, role, reseller_id, totp_enabled, status FROM portal_users WHERE id = ?');
+  const resellerStatus = db.prepare('SELECT status FROM resellers WHERE id = ?');
+  // A suspended or closed reseller tenant loses every key and session at once.
+  const assertResellerActive = (principal) => {
+    if (principal.ownerType !== 'reseller') return null;
+    const row = resellerStatus.get(principal.ownerId);
+    if (!row || row.status !== 'active') return forbidden(`This reseller account is ${row?.status || 'closed'}`, 'reseller_suspended');
+    return null;
+  };
   return (req, _res, next) => {
     req.principal = null;
     const header = req.get('authorization');
@@ -69,8 +78,11 @@ export function attachPrincipal(ctx) {
       const row = byHash.get(crypto.hashToken(header.slice(7).trim()));
       if (!row) return next(unauthorized('Invalid API key'));
       if (row.expires_at && new Date(row.expires_at).getTime() < ctx.clock.now()) return next(unauthorized('API key has expired'));
+      const principal = { type: 'api_key', keyId: row.id, name: row.name, ownerType: row.owner_type, ownerId: row.owner_id, scopes: JSON.parse(row.scopes_json || '[]'), role: null };
+      const refused = assertResellerActive(principal);
+      if (refused) return next(refused);
       touch.run(row.id);
-      req.principal = { type: 'api_key', keyId: row.id, name: row.name, ownerType: row.owner_type, ownerId: row.owner_id, scopes: JSON.parse(row.scopes_json || '[]'), role: null };
+      req.principal = principal;
       return next();
     }
     if (req.session?.userId) {
@@ -79,11 +91,17 @@ export function attachPrincipal(ctx) {
         req.session.destroy(() => next(unauthorized('Session is no longer valid')));
         return;
       }
-      req.principal = {
+      const principal = {
         type: 'portal', userId: user.id, email: user.email, role: user.role, totpEnabled: !!user.totp_enabled,
         ownerType: user.reseller_id ? 'reseller' : 'vendor', ownerId: user.reseller_id || 'vnd_default',
         scopes: ROLE_SCOPES[user.role] || [], totpVerifiedAt: req.session.totpVerifiedAt || null,
       };
+      const refused = assertResellerActive(principal);
+      if (refused) {
+        req.session.destroy(() => next(refused));
+        return;
+      }
+      req.principal = principal;
     }
     next();
   };
@@ -155,7 +173,8 @@ export function portalSession(ctx) {
     resave: false,
     saveUninitialized: false,
     rolling: true,
-    cookie: { httpOnly: true, sameSite: 'strict', secure: !!ctx.config.tls || ctx.config.cookie_secure === true, maxAge: ctx.config.license.session_ttl_hours * 3600 * 1000, path: '/' },
+    // Secure unless the operator opts out (cookie_secure: false) for a plain-HTTP dev setup.
+    cookie: { httpOnly: true, sameSite: 'strict', secure: !!ctx.config.tls || ctx.config.cookie_secure !== false, maxAge: ctx.config.license.session_ttl_hours * 3600 * 1000, path: '/' },
   });
 }
 

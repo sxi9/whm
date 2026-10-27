@@ -29,7 +29,8 @@ export function createReportsService(ctx) {
   function csv(rows) {
     if (!rows.length) return '';
     const cols = Object.keys(rows[0]);
-    const esc = (v) => { const s = v == null ? '' : String(v); return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+    // Values that a spreadsheet would evaluate as a formula get a leading quote.
+    const esc = (v) => { const s = v == null ? '' : String(v); const safe = /^[=+\-@\t\r]/.test(s) ? `'${s}` : s; return /[",\n\r]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe; };
     return [cols.join(','), ...rows.map((r) => cols.map((c) => esc(r[c])).join(','))].join('\r\n') + '\r\n';
   }
 

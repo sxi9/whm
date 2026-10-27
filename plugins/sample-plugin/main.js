@@ -58,6 +58,15 @@ async function webhookToken(ctx) {
   return enc ? ctx.crypto.decrypt(enc) : null;
 }
 
+// Tenancy: a reseller may only see notes attached to accounts it owns. Every
+// route that returns a note applies this, not only the list.
+async function ownedAccounts(ctx, user) {
+  return new Set((await ctx.api.accounts.list({ owner: user.username, pageSize: 500 })).data.map((a) => a.username));
+}
+async function ownsNote(ctx, user, note) {
+  return Boolean(note.account) && (await ownedAccounts(ctx, user)).has(note.account);
+}
+
 async function postDigest(ctx, digest, token) {
   const res = await ctx.net.fetch(WEBHOOK_URL, {
     method: 'POST',
@@ -185,7 +194,7 @@ module.exports = {
       // Resellers only see notes attached to accounts they own.
       let rows = await notesOf(ctx).find(query, { sort, limit: 200 });
       if (req.user.role === 'reseller') {
-        const owned = new Set((await ctx.api.accounts.list({ owner: req.user.username, pageSize: 500 })).data.map((a) => a.username));
+        const owned = await ownedAccounts(ctx, req.user);
         rows = rows.filter((n) => n.account && owned.has(n.account));
       }
       res.json(rows.map((n) => ({ id: n.id, title: n.title, category: n.category, account: n.account, tags: n.tags, createdAt: n.createdAtIso || new Date(n.createdAt).toISOString() })));
@@ -203,7 +212,9 @@ module.exports = {
 
     router.get('/notes/:id', { roles: ['root', 'reseller'] }, async (req, res) => {
       const doc = await notesOf(ctx).findOne({ id: req.params.id });
-      if (!doc) throw new ctx.errors.NotFoundError('note', req.params.id);
+      // Same scope as the list: a reseller gets 404, not 403, for a note it may
+      // not see, so ids of other tenants' notes are not confirmed to exist.
+      if (!doc || (req.user.role === 'reseller' && !(await ownsNote(ctx, req.user, doc)))) throw new ctx.errors.NotFoundError('note', req.params.id);
       res.json(doc);
     });
 

@@ -1,7 +1,7 @@
 import express from 'express';
 import { z, validate, fields, pagination, wrap } from '../../shared/validate.js';
 import { apiKeyAuth, requireScope, actorOf, RESELLER_SCOPES } from '../../shared/auth.js';
-import { licenseLifecycleRoutes, customerRoutes, webhookRoutes, apiKeyRoutes, jobRoutes } from './admin.js';
+import { licenseLifecycleRoutes, customerRoutes, webhookRoutes, apiKeyRoutes, jobRoutes, JOB_SCOPES } from './admin.js';
 
 const issueBody = z.object({
   sku: fields.sku,
@@ -44,7 +44,7 @@ export function resellerRoutes(ctx) {
     res.json({ data: ctx.resellers.statement(req.principal.ownerId) });
   });
   webhookRoutes(ctx, r, { ownerType: 'reseller', ownerId: (req) => req.principal.ownerId, scope: 'webhook:write' });
-  apiKeyRoutes(ctx, r, { ownerType: 'reseller', ownerId: (req) => req.principal.ownerId, scope: 'apikey:write', allowedScopes: RESELLER_SCOPES });
-  jobRoutes(ctx, r);
+  apiKeyRoutes(ctx, r, { ownerType: 'reseller', ownerId: (req) => req.principal.ownerId, scope: 'webhook:write', allowedScopes: RESELLER_SCOPES });
+  jobRoutes(ctx, r, { scope: JOB_SCOPES.reseller });
   return r;
 }

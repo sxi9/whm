@@ -17,6 +17,8 @@
 // is refused with UNSUPPORTED, which a run records as a warning before writing
 // the archive unencrypted.
 
+const crypto = require('node:crypto');
+
 const ID = 'net.whm.automated-backup';
 const DAY_MS = 86400e3;
 const MAX_RUNS_KEPT = 500;
@@ -24,6 +26,8 @@ const LOCK_PREFIX = 'lock:';
 const SEEN_PREFIX = 'seen:artefact:';
 const ACCOUNT_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 const ID_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
+const CONFIRM_REF_RE = /^[a-f0-9]{32}$/;
+const CONFIRM_HOLD_MS = 10 * 60e3;
 
 const lines = (text) => String(text || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
 const uniq = (arr) => [...new Set(arr)];
@@ -114,12 +118,28 @@ async function readLock(ctx, account) {
   return { account, ...lock, expired: lock.expiresAt <= ctx.now() };
 }
 
-async function acquireLock(ctx, account, jobId, ttlMinutes) {
-  const existing = await readLock(ctx, account);
-  if (existing && !existing.expired) return { ok: false, lock: existing };
-  const lock = { jobId, acquiredAt: ctx.now(), expiresAt: ctx.now() + ttlMinutes * 60e3 };
-  await ctx.store.set(`${LOCK_PREFIX}${account}`, lock);
-  return { ok: true, lock: { account, ...lock, expired: false, takenOver: Boolean(existing) } };
+// The store has no compare-and-set, so the read-then-write of a lock is made
+// atomic per account with an in-process queue: every run of this plugin shares
+// this module instance, which is where concurrent runs (cron plus a manual
+// POST /run) would otherwise both observe "no lock". The stored lock still
+// carries the TTL so an interrupted run never blocks an account forever.
+const lockQueues = new Map();
+function serialised(key, fn) {
+  const prev = lockQueues.get(key) || Promise.resolve();
+  const next = prev.catch(() => {}).then(fn);
+  const tail = next.catch(() => {}).then(() => { if (lockQueues.get(key) === tail) lockQueues.delete(key); });
+  lockQueues.set(key, tail);
+  return next;
+}
+
+function acquireLock(ctx, account, jobId, ttlMinutes) {
+  return serialised(account, async () => {
+    const existing = await readLock(ctx, account);
+    if (existing && !existing.expired) return { ok: false, lock: existing };
+    const lock = { jobId, acquiredAt: ctx.now(), expiresAt: ctx.now() + ttlMinutes * 60e3 };
+    await ctx.store.set(`${LOCK_PREFIX}${account}`, lock);
+    return { ok: true, lock: { account, ...lock, expired: false, takenOver: Boolean(existing) } };
+  });
 }
 
 const releaseLock = (ctx, account) => ctx.store.delete(`${LOCK_PREFIX}${account}`);
@@ -252,6 +272,25 @@ function summarise(results) {
   };
 }
 
+// Confirm tokens never reach the job queue: the host persists job params
+// (jobs.params_json, visible on the Manage Plugins job list), so POST /restore
+// parks the token in memory under a random reference and the job redeems the
+// reference exactly once. A reference that is unknown, already redeemed, older
+// than the token's own lifetime or orphaned by a panel restart fails the job
+// with PERMISSION_DENIED, the same as a bad token.
+const heldTokens = new Map();
+function holdToken(token, now) {
+  for (const [ref, held] of heldTokens) if (held.expiresAt <= now) heldTokens.delete(ref);
+  const ref = crypto.randomBytes(16).toString('hex');
+  heldTokens.set(ref, { token, expiresAt: now + CONFIRM_HOLD_MS });
+  return ref;
+}
+function redeemToken(ref, now) {
+  const held = typeof ref === 'string' && CONFIRM_REF_RE.test(ref) ? heldTokens.get(ref) : undefined;
+  if (held) heldTokens.delete(ref);
+  return held && held.expiresAt > now ? held.token : null;
+}
+
 function validateRestoreBody(body, errors) {
   const fields = [];
   if (!body || typeof body !== 'object') throw new errors.ValidationError('a JSON object is required');
@@ -291,12 +330,12 @@ module.exports = {
       if (await ctx.store.get(`${SEEN_PREFIX}${artefact.id}`)) return;
       if (await artefactsOf(ctx).findOne({ artefactId: artefact.id })) return;
       await artefactsOf(ctx).insert({ artefactId: artefact.id, account, runId: null, hostJobId: jobId || null, createdBy: 'host', createdAt: artefact.createdAt || evt.ts, path: artefact.path || null, size: artefact.size ?? null, sha256: artefact.sha256 || null, local: 'present', remote: [] });
-      await runsOf(ctx).insert({ kind: 'host', source: evt.principal || 'host', status: 'ok', startedAt: evt.ts, finishedAt: evt.ts, accounts: 1, ok: 1, failed: 0, skipped: 0, warnings: 0, results: [{ account, status: 'ok', artefactId: artefact.id, size: artefact.size ?? null }], hostJobId: jobId || null });
+      await runsOf(ctx).insert({ kind: 'host', source: evt.principal || 'host', status: 'ok', startedAt: evt.ts, finishedAt: evt.ts, account, artefactId: artefact.id, accounts: 1, ok: 1, failed: 0, skipped: 0, warnings: 0, results: [{ account, status: 'ok', artefactId: artefact.id, size: artefact.size ?? null }], hostJobId: jobId || null });
       await trimRuns(ctx);
     },
     async onBackupFailed(evt, ctx) {
       const { jobId, account, error } = evt.payload;
-      await runsOf(ctx).insert({ kind: 'host', source: evt.principal || 'host', status: 'failed', startedAt: evt.ts, finishedAt: evt.ts, accounts: 1, ok: 0, failed: 1, skipped: 0, warnings: 0, results: [{ account, status: 'failed', error: error || null }], hostJobId: jobId || null });
+      await runsOf(ctx).insert({ kind: 'host', source: evt.principal || 'host', status: 'failed', startedAt: evt.ts, finishedAt: evt.ts, account, accounts: 1, ok: 0, failed: 1, skipped: 0, warnings: 0, results: [{ account, status: 'failed', error: error || null }], hostJobId: jobId || null });
       await trimRuns(ctx);
     },
     async onAccountTerminated(evt, ctx) {
@@ -357,10 +396,12 @@ module.exports = {
     },
 
     async restore(job, ctx) {
-      const { artefactId, account, confirmToken } = job.params;
+      const { artefactId, account, confirmRef } = job.params;
       const settings = await ctx.settings.getAll();
       const run = await runsOf(ctx).insert({ kind: 'restore', source: job.params.source || 'manual', jobId: job.id, status: 'running', startedAt: ctx.now(), finishedAt: null, account, artefactId, accounts: 1, ok: 0, failed: 0, skipped: 0, warnings: 0, results: [] });
       try {
+        const confirmToken = redeemToken(confirmRef, ctx.now());
+        if (!confirmToken) throw Object.assign(new ctx.errors.PermissionError('confirm-token', 'jobs.restore', ID), { message: 'confirm token reference is unknown, already redeemed or expired; request a new token' });
         const r = await ctx.api.backups.restore({ artefactId, account, confirmToken });
         await runsOf(ctx).update({ id: run.id }, { status: 'ok', finishedAt: ctx.now(), ok: 1, results: [{ account, status: 'ok', artefactId, hostJobId: r.jobId || null }] });
         await notify(ctx, settings, { ok: true, subject: `Automated Backup: restore of ${artefactId} over ${account} started`, body: `Host job ${r.jobId || '?'} restores archive ${artefactId} over account ${account}.` });
@@ -434,11 +475,12 @@ module.exports = {
     });
 
     router.post('/restore', async (req, res) => {
-      const params = validateRestoreBody(req.body, ctx.errors);
-      const jobId = await ctx.jobs.run('restore', { ...params, source: 'api', by: req.user.username });
+      const { artefactId, account, confirmToken } = validateRestoreBody(req.body, ctx.errors);
+      const confirmRef = holdToken(confirmToken, ctx.now());
+      const jobId = await ctx.jobs.run('restore', { artefactId, account, confirmRef, source: 'api', by: req.user.username });
       res.status(202).json({ job: { id: jobId } });
     });
   },
 
-  __test: { retentionPlan, isoWeekKey, dayKey, monthKey, selectAccounts, selectDestinations, lines, LOCK_PREFIX, SEEN_PREFIX, MAX_RUNS_KEPT },
+  __test: { retentionPlan, isoWeekKey, dayKey, monthKey, selectAccounts, selectDestinations, lines, holdToken, redeemToken, heldTokens, LOCK_PREFIX, SEEN_PREFIX, MAX_RUNS_KEPT, CONFIRM_HOLD_MS },
 };

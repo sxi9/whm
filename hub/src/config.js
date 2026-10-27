@@ -56,7 +56,7 @@ const schema = z.object({
       public: rateLimit(600, 3600_000),
     }).default({}),
     vendor: z.object({ name: z.string().default('WHM Vendor'), support_email: z.string().email().optional(), portal_url: z.string().url().optional() }).default({}),
-  }).default({}),
+  }).default({}).refine((l) => l.nonce_ttl_s >= 2 * l.max_skew_s, { message: 'nonce_ttl_s must be at least 2 × max_skew_s or a pruned nonce could be replayed', path: ['nonce_ttl_s'] }),
   marketplace: z.record(z.unknown()).default({}),
 });
 

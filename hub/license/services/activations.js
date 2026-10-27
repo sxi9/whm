@@ -15,7 +15,7 @@ export function createActivationsService(ctx) {
     recentOfLicense: db.prepare('SELECT COUNT(*) AS n FROM activations WHERE license_id = ? AND first_seen >= ?'),
     insert: db.prepare(`INSERT INTO activations (id, license_id, fingerprint, fp_components_json, hostname, public_ip, panel_version, os, first_seen, last_checkin, token_kid, status)
       VALUES (@id, @license_id, @fingerprint, @fp_components_json, @hostname, @public_ip, @panel_version, @os, @first_seen, @first_seen, @token_kid, 'active')`),
-    touch: db.prepare('UPDATE activations SET hostname = @hostname, public_ip = @public_ip, panel_version = COALESCE(@panel_version, panel_version), os = COALESCE(@os, os), last_checkin = @now, token_kid = @token_kid WHERE id = @id'),
+    touch: db.prepare('UPDATE activations SET hostname = @hostname, public_ip = @public_ip, panel_version = COALESCE(@panel_version, panel_version), os = COALESCE(@os, os), last_checkin = @now, token_kid = @token_kid, checkin_failed_at = NULL WHERE id = @id'),
     updateFp: db.prepare('UPDATE activations SET fingerprint = @fingerprint, fp_components_json = @fp_components_json, drift_events = drift_events + 1 WHERE id = @id'),
     setStatus: db.prepare('UPDATE activations SET status = @status, deactivated_at = @now, deactivated_by = @by WHERE id = @id'),
     insertCheckin: db.prepare(`INSERT INTO checkins (activation_id, license_id, ts, panel_version, accounts_used, resellers_used, domains_used, usage_json, ip, result, latency_ms)
@@ -23,12 +23,15 @@ export function createActivationsService(ctx) {
     checkins: db.prepare('SELECT * FROM checkins WHERE license_id = ? ORDER BY id DESC LIMIT ?'),
     pruneCheckins: db.prepare('DELETE FROM checkins WHERE ts < ?'),
     stale: db.prepare("SELECT a.*, l.key_prefix, l.edition FROM activations a JOIN licenses l ON l.id = a.license_id WHERE a.status = 'active' AND a.last_checkin < ? ORDER BY a.last_checkin"),
+    missed: db.prepare("SELECT a.*, l.key_prefix, l.edition FROM activations a JOIN licenses l ON l.id = a.license_id WHERE a.status = 'active' AND a.last_checkin < ? AND a.checkin_failed_at IS NULL ORDER BY a.last_checkin"),
+    markMissed: db.prepare('UPDATE activations SET checkin_failed_at = ? WHERE id = ? AND checkin_failed_at IS NULL'),
     insertMessage: db.prepare('INSERT INTO messages (license_id, level, code, text, data_json, created_at, expires_at) VALUES (@license_id, @level, @code, @text, @data_json, @created_at, @expires_at)'),
     pendingMessages: db.prepare(`SELECT m.* FROM messages m WHERE (m.license_id IS NULL OR m.license_id = @license_id) AND (m.expires_at IS NULL OR m.expires_at > @now)
       AND NOT EXISTS (SELECT 1 FROM message_deliveries d WHERE d.message_id = m.id AND d.activation_id = @activation_id) ORDER BY m.id`),
     markDelivered: db.prepare('INSERT OR IGNORE INTO message_deliveries (message_id, activation_id, delivered_at) VALUES (?, ?, ?)'),
     insertTransfer: db.prepare('INSERT INTO transfers (id, license_id, from_activation_id, to_activation_id, requested_at, completed_at, requested_by) VALUES (@id, @license_id, @from, @to, @at, @at, @by)'),
     countRecentCheckins: db.prepare('SELECT COUNT(*) AS n FROM checkins WHERE activation_id = ? AND ts >= ?'),
+    convertedFrom: db.prepare('SELECT 1 FROM trials WHERE license_id = ? AND converted_license_id = ?'),
   };
 
   function shape(row) {
@@ -174,8 +177,16 @@ export function createActivationsService(ctx) {
       if (!verified.ok && verified.reason !== 'expired') throw new HttpError(401, 'invalid_token', `Token rejected: ${verified.reason}`);
       const payload = verified.payload;
       const activation = svc.find(payload.aid);
-      if (!activation || activation.license_id !== payload.lid) throw new HttpError(401, 'invalid_token', 'Token does not match an activation');
-      const license = ctx.licenses.get(license_idOf(activation));
+      if (!activation) throw new HttpError(401, 'invalid_token', 'Token does not match an activation');
+      // A converted trial re-parents its activation; the panel still holds the trial token.
+      if (activation.license_id !== payload.lid && !stmts.convertedFrom.get(payload.lid, activation.license_id)) throw new HttpError(401, 'invalid_token', 'Token does not match an activation');
+      const license = ctx.licenses.get(activation.license_id);
+      // The per-activation limit counts only check-ins that carried a valid
+      // token, so a stranger who knows the activation id cannot exhaust it.
+      const rl = cfg.rate_limits.checkin;
+      if (stmts.countRecentCheckins.get(activation.id, nowIso(now() - rl.windowMs)).n >= rl.max) {
+        throw Object.assign(new HttpError(429, 'rate_limited', 'Check-in limit reached for this activation'), { retryAfterS: Math.ceil(rl.windowMs / 1000) });
+      }
       const record = (result, extra = {}) => stmts.insertCheckin.run({
         activation_id: activation.id, license_id: license.id, ts: nowIso(now()), panel_version: input.panel_version || null,
         accounts_used: input.usage?.accounts ?? null, resellers_used: input.usage?.resellers ?? null, domains_used: input.usage?.domains ?? null,
@@ -283,22 +294,24 @@ export function createActivationsService(ctx) {
     },
     stale: (days = cfg.reclaim_days) => stmts.stale.all(nowIso(now() - days * DAY_MS)).map((a) => ({ id: a.id, license_id: a.license_id, key_prefix: a.key_prefix, edition: a.edition, hostname: a.hostname, last_checkin: a.last_checkin })),
     pruneCheckins: (days = cfg.checkin_retention_days) => ({ pruned: stmts.pruneCheckins.run(nowIso(now() - days * DAY_MS)).changes }),
-    // Three consecutive missed check-ins alert the vendor (§16.7 license.checkin_failed).
+    // Three consecutive missed check-ins alert the vendor once per episode
+    // (§16.7 license.checkin_failed): checkin_failed_at marks the alert and a
+    // successful check-in clears it, re-arming the activation.
     flagMissedCheckins() {
       const threshold = nowIso(now() - 3 * cfg.checkin_interval_hours * 3600_000);
       let n = 0;
-      for (const a of stmts.stale.all(threshold)) {
+      for (const a of stmts.missed.all(threshold)) {
         const lic = ctx.licenses.getRaw(a.license_id);
         if (!lic) continue;
+        if (stmts.markMissed.run(nowIso(now()), a.id).changes === 0) continue;
         ctx.licenses.emit('license.checkin_failed', ctx.licenses.shape(lic), { activation_id: a.id, hostname: a.hostname, last_checkin: a.last_checkin });
+        ctx.audit.record({ principal: 'system', ip: null, action: 'activation.checkin_failed', target: a.id, args: { license_id: a.license_id, last_checkin: a.last_checkin }, result: 'ok' });
         n++;
       }
       return { flagged: n };
     },
     recentCheckinCount: (aid, windowMs) => stmts.countRecentCheckins.get(aid, nowIso(now() - windowMs)).n,
   };
-
-  function license_idOf(activation) { return activation.license_id; }
 
   return svc;
 }

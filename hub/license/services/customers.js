@@ -6,8 +6,8 @@ export function createCustomersService(ctx) {
   const stmts = {
     byId: db.prepare('SELECT * FROM customers WHERE id = ?'),
     byEmail: db.prepare('SELECT * FROM customers WHERE email = ?'),
-    insert: db.prepare(`INSERT INTO customers (id, reseller_id, name, email, company, country, external_ref, status, created_at, updated_at)
-      VALUES (@id, @reseller_id, @name, @email, @company, @country, @external_ref, 'active', @now, @now)`),
+    insert: db.prepare(`INSERT INTO customers (id, reseller_id, name, email, company, country, external_ref, source, status, created_at, updated_at)
+      VALUES (@id, @reseller_id, @name, @email, @company, @country, @external_ref, @source, 'active', @now, @now)`),
     update: db.prepare(`UPDATE customers SET name = @name, company = @company, country = @country, external_ref = @external_ref, status = @status, updated_at = @now WHERE id = @id`),
   };
 
@@ -33,7 +33,8 @@ export function createCustomersService(ctx) {
       const email = String(input.email).toLowerCase();
       if (stmts.byEmail.get(email)) throw conflict('A customer with that e-mail already exists', 'customer_exists');
       const id = newId('cus', ctx.clock.now());
-      stmts.insert.run({ id, reseller_id: scope?.resellerId || input.reseller_id || null, name: input.name, email, company: input.company || null, country: input.country || null, external_ref: input.external_ref || null, now: nowIso(ctx.clock.now()) });
+      // source: 'manual' (admin/reseller/API), 'trial' (self-service, unverified e-mail), 'billing' (checkout webhook).
+      stmts.insert.run({ id, reseller_id: scope?.resellerId || input.reseller_id || null, name: input.name, email, company: input.company || null, country: input.country || null, external_ref: input.external_ref || null, source: input.source || 'manual', now: nowIso(ctx.clock.now()) });
       return stmts.byId.get(id);
     },
     // Issue flows pass { email, name }: an existing customer is reused when it

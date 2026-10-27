@@ -38,17 +38,24 @@ export function createTrialsService(ctx) {
       if (query.converted === false) where.push('t.converted_at IS NULL');
       return paginate(db, { select: 't.*, l.status AS license_status, l.expires_at, l.key_prefix', from: 'trials t JOIN licenses l ON l.id = t.license_id', where, params, sortable: { started_at: 't.started_at' }, defaultSort: 'started_at', query: { dir: 'desc', ...query } });
     },
-    // One trial per fingerprint and per e-mail hash.
+    // One trial per fingerprint and per e-mail hash. Trials are vendor-owned:
+    // a reseller's customer gets licenses from that reseller, never a trial
+    // that would land in the reseller's statement and webhooks.
     start(input) {
       ctx.licenses.lookupGuard.assertNotBlocked(input.ip);
       const hash = emailHash(input.email);
       if (stmts.byFingerprint.get(input.fingerprint) || stmts.byEmail.get(hash)) {
         throw new HttpError(409, 'trial_exists', 'A trial was already used on this server or e-mail');
       }
-      const { license, key } = ctx.licenses.issue({ sku: TRIAL_SKU, customer: { email: input.email, name: input.email }, notify: false }, { actor: { principal: 'system', ip: input.ip } });
-      const id = newId('trl', now());
-      stmts.insert.run({ id, customer_id: license.customer_id, license_id: license.id, fingerprint: input.fingerprint, email_hash: hash, ip: input.ip || null, started_at: nowIso(now()) });
-      const activation = ctx.activations.activate({ ...input, key });
+      if (ctx.customers.findByEmail(input.email)?.reseller_id) throw new HttpError(409, 'trial_unavailable', 'Trials for this e-mail are handled by its reseller');
+      // Issue, trial row and activation commit together: a failed activation
+      // (no signing key, limit) leaves the fingerprint and e-mail free to retry.
+      const { license, key, id, activation } = db.transaction(() => {
+        const issued = ctx.licenses.issue({ sku: TRIAL_SKU, customer: { email: input.email, name: input.email, source: 'trial' }, notify: false }, { actor: { principal: 'system', ip: input.ip } });
+        const trialId = newId('trl', now());
+        stmts.insert.run({ id: trialId, customer_id: issued.license.customer_id, license_id: issued.license.id, fingerprint: input.fingerprint, email_hash: hash, ip: input.ip || null, started_at: nowIso(now()) });
+        return { ...issued, id: trialId, activation: ctx.activations.activate({ ...input, key: issued.key }) };
+      })();
       ctx.licenses.emit('trial.started', license, { trial_id: id, activation_id: activation.activation_id });
       ctx.mailer.send({ to: input.email, template: 'trial.started', data: { key_prefix: license.key_prefix, expires_at: license.expires_at, portal_url: ctx.config.license.vendor.portal_url || ctx.config.public_url } });
       ctx.audit.record({ principal: `activation:${activation.activation_id}`, ip: input.ip, action: 'trial.start', target: id, args: { hostname: input.hostname }, result: 'ok' });

@@ -4,7 +4,8 @@ import { newId, nowIso, paginate } from '../../shared/db.js';
 
 export const SOURCES = ['stripe', 'whmcs', 'paddle'];
 
-// Maps every provider's events onto the three license actions.
+// Maps every provider's events onto the three license actions; `suspend`
+// takes effect after the paid term's grace period (§16.7).
 const ACTIONS = {
   stripe: { 'invoice.paid': 'renew', 'invoice.payment_succeeded': 'renew', 'customer.subscription.deleted': 'suspend', 'charge.refunded': 'revoke', 'charge.dispute.created': 'revoke' },
   whmcs: { InvoicePaid: 'renew', InvoiceCancelled: 'suspend', InvoiceRefunded: 'revoke', Chargeback: 'revoke' },
@@ -79,7 +80,7 @@ export function createBillingService(ctx) {
         if (lic.status === 'revoked') continue;
         ctx.licenses.renew(lic.id, { term_months: months }, { actor });
       } else if (action === 'suspend') {
-        if (lic.status === 'active' || lic.status === 'expired') ctx.licenses.suspend(lic.id, { reason: `${source}:${ev.event_type}` }, { actor });
+        if (lic.status === 'active' || lic.status === 'expired') ctx.licenses.scheduleSuspension(lic.id, { reason: `${source}:${ev.event_type}` }, { actor });
       } else if (action === 'revoke') {
         if (lic.status !== 'revoked') ctx.licenses.revoke(lic.id, { reason: `${source}:${ev.event_type}` }, { actor });
       }

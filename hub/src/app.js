@@ -11,7 +11,7 @@ import { HttpError } from '../shared/errors.js';
 import { ZodError } from 'zod';
 import { publicRoutes } from '../license/routes/public.js';
 import { resellerRoutes } from '../license/routes/reseller.js';
-import { adminRoutes, billingWebhookRoutes } from '../license/routes/admin.js';
+import { adminRoutes, billingWebhookRoutes, jobAliasRoutes } from '../license/routes/admin.js';
 import { portalRoutes } from '../license/routes/portal.js';
 
 function limiter({ max, windowMs }, { keyGenerator, message = 'Too many requests, slow down', skip } = {}) {
@@ -21,23 +21,19 @@ function limiter({ max, windowMs }, { keyGenerator, message = 'Too many requests
   });
 }
 
+const NONCE_RE = /^[A-Za-z0-9_-]{16,128}$/;
+
 function keyPrefixOf(body) {
   const k = String(body?.key || '').toUpperCase().replace(/[^0-9A-Z]/g, '');
   return k ? k.slice(0, 7) : '-';
 }
 
-function activationIdOf(body) {
-  try {
-    const payload = JSON.parse(Buffer.from(String(body?.token || '').split('.')[1] || '', 'base64url').toString('utf8'));
-    return typeof payload?.aid === 'string' ? payload.aid : null;
-  } catch { return null; }
-}
-
+// The per-activation check-in limit (rate_limits.checkin) is enforced inside
+// activations.checkin() after the token verifies; only per-IP buckets live here.
 export function buildLimiters(ctx) {
   const rl = ctx.config.license.rate_limits;
   return {
     activate: limiter(rl.activate, { keyGenerator: (req) => `${req.ip}|${keyPrefixOf(req.body)}` }),
-    checkin: limiter(rl.checkin, { keyGenerator: (req) => activationIdOf(req.body) || req.ip, message: 'Check-in limit reached for this activation' }),
     trial: limiter(rl.trial, { keyGenerator: (req) => req.ip }),
     recover: limiter(rl.recover, { keyGenerator: (req) => req.ip }),
     public: limiter(rl.public, { keyGenerator: (req) => req.ip }),
@@ -62,9 +58,11 @@ export function signedMiddleware(ctx) {
       return originalJson(out);
     };
     try {
+      if (req.bodyError) throw req.bodyError;
       const body = req.body && typeof req.body === 'object' ? req.body : {};
       const tsHeader = Number(req.get('x-whm-timestamp'));
       if (!nonce || body.nonce !== nonce) throw new HttpError(400, 'nonce_mismatch', 'X-WHM-Nonce must equal body.nonce');
+      if (!NONCE_RE.test(nonce)) throw new HttpError(400, 'invalid_nonce', 'A nonce is 16 to 128 URL-safe characters');
       if (!Number.isInteger(tsHeader) || body.ts !== tsHeader) throw new HttpError(400, 'timestamp_mismatch', 'X-WHM-Timestamp must equal body.ts');
       ctx.nonce.check(nonce, tsHeader);
       req.whm = { nonce, ts: tsHeader };
@@ -84,6 +82,10 @@ export function errorHandler(logger) {
       if (err.fields) body.error.fields = err.fields;
       if (err.retryAfterS) res.set('Retry-After', String(err.retryAfterS));
       return res.status(err.status).json(body);
+    }
+    // Hook-raised errors (e.g. a beforeKeyRetire guard) may be plain Errors carrying status + code.
+    if (Number.isInteger(err?.status) && err.status >= 400 && err.status <= 599 && typeof err.code === 'string' && /^[a-z_]+$/.test(err.code)) {
+      return res.status(err.status).json({ error: { code: err.code, message: err.message || err.code, ...(err.extra || {}) } });
     }
     if (err instanceof ZodError) {
       const fields = {};
@@ -124,7 +126,16 @@ export function createApp(ctx) {
   });
 
   app.use('/v1/admin/billing/webhooks', billingWebhookRoutes(ctx));
-  app.use(express.json({ limit: '1mb' }));
+  // §16.6: errors on signed routes are signed too, including a body that does
+  // not parse. The parser's error for a POST that carries X-WHM-Nonce is held
+  // on req.bodyError until signedMiddleware has installed the signing wrapper
+  // and rethrows it; every other request fails here, unsigned, as before.
+  const jsonParser = express.json({ limit: '1mb' });
+  app.use((req, res, next) => jsonParser(req, res, (err) => {
+    if (err && req.method === 'POST' && req.get('x-whm-nonce')) { req.bodyError = err; return next(); }
+    next(err);
+  }));
+  if (!config.tls && config.cookie_secure === false) logger.warn('cookie_secure is false: the portal session cookie is sent over plain HTTP');
   app.use(portalSession(ctx));
   app.use(attachPrincipal(ctx));
   app.use(csrf({ exempt: ['/v1/portal/login', '/v1/portal/csrf'] }));
@@ -139,6 +150,7 @@ export function createApp(ctx) {
   app.use('/v1/reseller', resellerRoutes(ctx));
   app.use('/v1/admin', adminRoutes(ctx));
   app.use('/v1/portal', portalRoutes(ctx));
+  app.use('/v1/jobs', jobAliasRoutes(ctx));
   return app;
 }
 

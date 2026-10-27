@@ -1,7 +1,7 @@
 import express from 'express';
 import { z, validate, fields, pagination, wrap } from '../../shared/validate.js';
 import { HttpError, unauthorized } from '../../shared/errors.js';
-import { issueCsrfToken, requireRole, PORTAL_ROLES } from '../../shared/auth.js';
+import { issueCsrfToken, requireRole, requireStepUp, PORTAL_ROLES } from '../../shared/auth.js';
 
 // Portal sessions for hub/ui: password + TOTP login, step-up, 2FA enrolment,
 // password change and (vendor_admin) portal user management. Vendor users then
@@ -36,7 +36,11 @@ export function portalRoutes(ctx) {
     req.session.totpVerifiedAt = ctx.clock.now();
     res.json({ data: { totp_verified_at: req.session.totpVerifiedAt } });
   });
-  r.post('/2fa/enroll', requireSession, validate({ body: z.object({}).strict() }), (req, res) => res.json({ data: ctx.portalUsers.totpEnroll(req.principal.userId) }));
+  r.post('/2fa/enroll', requireSession, validate({ body: z.object({ code: z.string().regex(/^\d{6}$/).optional() }).strict() }), (req, res) => {
+    const out = ctx.portalUsers.totpEnroll(req.principal.userId, { code: req.body.code });
+    if (out.reenrol) req.audit({ action: 'portal.2fa_reenroll', target: req.principal.userId });
+    res.json({ data: out });
+  });
   r.post('/2fa/confirm', requireSession, validate({ body: z.object({ code: z.string().regex(/^\d{6}$/) }).strict() }), (req, res) => {
     const user = ctx.portalUsers.totpConfirm(req.principal.userId, req.body.code);
     req.session.totpVerifiedAt = ctx.clock.now();
@@ -56,14 +60,16 @@ export function portalRoutes(ctx) {
   }));
 
   const admin = [requireSession, requireRole('vendor_admin')];
+  // Minting or altering portal users is as sensitive as minting keys: fresh TOTP required.
+  const mutate = [...admin, requireStepUp(ctx.config.license.stepup_max_age_s, () => ctx.clock.now())];
   r.get('/users', ...admin, validate({ query: pagination }), (req, res) => res.json(ctx.portalUsers.list(req.query)));
-  r.post('/users', ...admin, validate({ body: z.object({ email: fields.email, password: fields.password, role: z.enum(PORTAL_ROLES), reseller_id: fields.id.optional() }).strict() }), wrap(async (req, res) => {
+  r.post('/users', ...mutate, validate({ body: z.object({ email: fields.email, password: fields.password, role: z.enum(PORTAL_ROLES), reseller_id: fields.id.optional() }).strict() }), wrap(async (req, res) => {
     const user = await ctx.portalUsers.create(req.body);
     req.audit({ action: 'portal.user_create', target: user.id, args: { email: user.email, role: user.role } });
     res.status(201).json({ data: user });
   }));
-  r.patch('/users/:id', ...admin, validate({ params: z.object({ id: fields.id }), body: z.object({ status: z.enum(['active', 'disabled']).optional(), role: z.enum(PORTAL_ROLES).optional() }).strict() }), (req, res) => res.json({ data: ctx.portalUsers.update(req.params.id, req.body) }));
-  r.post('/users/:id/reset-password', ...admin, validate({ params: z.object({ id: fields.id }), body: z.object({ password: fields.password }).strict() }), wrap(async (req, res) => {
+  r.patch('/users/:id', ...mutate, validate({ params: z.object({ id: fields.id }), body: z.object({ status: z.enum(['active', 'disabled']).optional(), role: z.enum(PORTAL_ROLES).optional() }).strict() }), (req, res) => res.json({ data: ctx.portalUsers.update(req.params.id, req.body) }));
+  r.post('/users/:id/reset-password', ...mutate, validate({ params: z.object({ id: fields.id }), body: z.object({ password: fields.password }).strict() }), wrap(async (req, res) => {
     await ctx.portalUsers.resetPassword(req.params.id, req.body.password);
     req.audit({ action: 'portal.password_reset', target: req.params.id });
     res.json({ data: { reset: true } });

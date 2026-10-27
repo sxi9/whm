@@ -10,7 +10,7 @@ export const fields = {
   kid: z.string().regex(/^[0-9a-f]{8}$/, 'A key id is 8 hex characters'),
   purpose: z.enum(['license', 'plugin']),
   sku: z.string().regex(/^[a-z0-9][a-z0-9-]{1,63}$/, 'Malformed SKU'),
-  licenseKey: z.string().trim().min(16).max(40).regex(/^[A-Za-z0-9 -]+$/, 'Malformed license key'),
+  licenseKey: z.string().trim().min(16).max(40).regex(/^[A-Za-z0-9 *~$=-]+$/, 'Malformed license key'),
   licensePrefix: z.string().trim().toUpperCase().regex(/^WHM-[0-9A-HJKMNP-TV-Z]{4}$/, 'A key prefix looks like WHM-XXXX'),
   fingerprint: z.string().regex(/^sha256:[0-9a-f]{64}$/, 'Malformed fingerprint'),
   fpComponents: z.object({

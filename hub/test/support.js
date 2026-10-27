@@ -28,6 +28,7 @@ export async function bootHub({ config = {}, now, fetch, webhookFetch, keys = tr
     config: deepMerge({
       log_level: 'silent',
       public_url: 'https://hub.test',
+      cookie_secure: false,
       keys: { dir: keysDir, active_kid: { license: KIDS.licenseA, plugin: KIDS.pluginA } },
       license: {
         mail: { transport: 'none' }, backup_dir: null,
@@ -86,8 +87,8 @@ export async function bootHub({ config = {}, now, fetch, webhookFetch, keys = tr
     return ctx.licenses.issue({ sku, customer: { email: `c${++counter}@example.test`, name: 'Customer' }, ...extra }, { actor: { principal: 'test', ip: '127.0.0.1' } });
   }
 
-  async function activate(key, server = fp(), extra = {}) {
-    return panel('/v1/activate', { key, ...server, hostname: 'srv.example.test', panel_version: '1.0.0', os: 'ubuntu-24.04', ...extra });
+  async function activate(key, server = fp(), extra = {}, opts = {}) {
+    return panel('/v1/activate', { key, ...server, hostname: 'srv.example.test', panel_version: '1.0.0', os: 'ubuntu-24.04', ...extra }, opts);
   }
 
   return {

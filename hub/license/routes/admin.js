@@ -1,7 +1,10 @@
 import express from 'express';
 import { z, validate, fields, pagination, wrap } from '../../shared/validate.js';
 import { HttpError, notFound } from '../../shared/errors.js';
-import { requireScope, requireStepUp, actorOf, VENDOR_SCOPES, RESELLER_SCOPES } from '../../shared/auth.js';
+import { requireScope, requireStepUp, actorOf, scopeAllows, VENDOR_SCOPES, RESELLER_SCOPES } from '../../shared/auth.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { newId, nowIso, paginate, json } from '../../shared/db.js';
 import { replay as replayDelivery } from '../../shared/webhooks.js';
 import { EDITIONS } from '../services/products.js';
@@ -101,6 +104,11 @@ export function apiKeyRoutes(ctx, r, { ownerType, ownerId, scope, allowedScopes 
     res.json({ data: db.prepare('SELECT * FROM api_keys WHERE owner_type = ? AND owner_id = ? ORDER BY created_at').all(ownerType, ownerId(req)).map(view) });
   });
   r.post('/api-keys', requireScope(scope), requireStepUp(ctx.config.license.stepup_max_age_s, () => ctx.clock.now()), validate({ body: z.object({ name: z.string().trim().min(1).max(100), scopes: z.array(z.enum(allowedScopes)).min(1).max(20), expires_in_days: z.number().int().min(1).max(3650).optional() }).strict() }), (req, res) => {
+    // A key never grants more than its creator holds; portal roles carry the full list.
+    if (req.principal.type === 'api_key') {
+      const beyond = req.body.scopes.filter((sc) => !scopeAllows(req.principal.scopes, sc));
+      if (beyond.length) throw new HttpError(403, 'insufficient_scope', `Your key cannot grant: ${beyond.join(', ')}`);
+    }
     const secret = `whk_${ctx.crypto.randomToken(30)}`;
     const id = newId('key', ctx.clock.now());
     db.prepare('INSERT INTO api_keys (id, owner_type, owner_id, name, key_hash, key_prefix, scopes_json, expires_at, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
@@ -116,15 +124,32 @@ export function apiKeyRoutes(ctx, r, { ownerType, ownerId, scope, allowedScopes 
   });
 }
 
-export function jobRoutes(ctx, r) {
-  r.get('/jobs/:id', validate({ params: idParam, query: z.object({ format: z.enum(['json', 'csv']).default('json') }) }), (req, res) => {
-    const job = ctx.jobs.get(req.params.id, req.principal);
-    if (req.query.format === 'csv' && job.status === 'done' && Array.isArray(job.result?.licenses)) {
-      res.type('text/csv').send(ctx.reports.csv(job.result.licenses));
-      return;
-    }
-    res.json({ data: job });
-  });
+// Bulk-issue results carry clear-text keys: the issuing scope and the creating
+// principal are both required (ctx.jobs.get checks the creator).
+const jobQuery = z.object({ format: z.enum(['json', 'csv']).default('json') });
+function sendJob(ctx, req, res) {
+  const job = ctx.jobs.get(req.params.id, req.principal);
+  if (req.query.format === 'csv' && job.status === 'done' && Array.isArray(job.result?.licenses)) {
+    res.type('text/csv').send(ctx.reports.csv(job.result.licenses));
+    return;
+  }
+  res.json({ data: job });
+}
+export const JOB_SCOPES = { vendor: 'admin:write', reseller: 'license:issue' };
+export function jobRoutes(ctx, r, { scope }) {
+  r.get('/jobs/:id', requireScope(scope), validate({ params: idParam, query: jobQuery }), (req, res) => sendJob(ctx, req, res));
+}
+// GET /v1/jobs/:id (§16.6) resolves the scope from the principal's owner type.
+export function jobAliasRoutes(ctx) {
+  const r = express.Router();
+  r.get('/:id', (req, _res, next) => {
+    if (!req.principal) return next(new HttpError(401, 'unauthorized', 'Authentication required'));
+    const scope = JOB_SCOPES[req.principal.ownerType];
+    if (!scope) return next(new HttpError(403, 'wrong_owner_type', 'Unknown principal type'));
+    const limiter = ctx.app.limiters[req.principal.ownerType === 'vendor' ? 'admin' : 'reseller'];
+    limiter(req, _res, (err) => (err ? next(err) : requireScope(scope)(req, _res, next)));
+  }, validate({ params: idParam, query: jobQuery }), (req, res) => sendJob(ctx, req, res));
+  return r;
 }
 
 export function actorLabel(req) {
@@ -226,6 +251,19 @@ export function adminRoutes(ctx) {
     ctx.audit.record({ principal: req.principal, ip: req.ip, action: 'export.csv', target: req.query.table, args: null, result: 'ok' });
     res.type('text/csv').send(ctx.reports.exportCsv(req.query.table));
   });
+  // Full database copy for vendor admins (§16.11): admin:* plus a fresh step-up, audited.
+  r.get('/export.db', requireScope('admin:*'), stepUp, wrap(async (req, res) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-hub-export-'));
+    const file = path.join(dir, 'license.db');
+    try {
+      await db.backup(file);
+      ctx.audit.record({ principal: req.principal, ip: req.ip, action: 'export.db', target: 'license.db', args: { bytes: fs.statSync(file).size }, result: 'ok' });
+      res.set('Content-Disposition', `attachment; filename="license-${nowIso(ctx.clock.now()).replace(/[:.]/g, '-')}.db"`);
+      res.type('application/vnd.sqlite3').send(fs.readFileSync(file));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }));
   r.get('/audit', read, validate({ query: pagination.extend({ action: z.string().max(80).optional(), principal: z.string().max(120).optional() }) }), (req, res) => {
     const where = []; const params = {};
     if (req.query.action) { where.push('action LIKE @action'); params.action = `${req.query.action}%`; }
@@ -241,7 +279,7 @@ export function adminRoutes(ctx) {
   r.get('/schedules', read, (_req, res) => res.json({ data: ctx.scheduler.list() }));
   r.post('/schedules/:name/run', write, validate({ params: z.object({ name: z.string().regex(/^[a-z-]{2,40}$/) }) }), wrap(async (req, res) => res.json({ data: await ctx.scheduler.run(req.params.name) })));
   r.post('/ip-blocks/:ip/unblock', write, validate({ params: z.object({ ip: z.string().ip() }) }), (req, res) => res.json({ data: { unblocked: ctx.licenses.lookupGuard.unblock(req.params.ip) } }));
-  jobRoutes(ctx, r);
+  jobRoutes(ctx, r, { scope: JOB_SCOPES.vendor });
   return r;
 }
 

@@ -10,8 +10,9 @@ import { loadConfig } from './config.js';
 import { createApp, finalizeApp, createLoopbackApp } from './app.js';
 import { openDb, newId, nowIso, json } from '../shared/db.js';
 import { createCrypto } from '../shared/crypto.js';
+import { notFound } from '../shared/errors.js';
 import { loadSigningKeys } from '../shared/keys.js';
-import { createAudit } from '../shared/audit.js';
+import { createAudit, principalLabel } from '../shared/audit.js';
 import * as webhooks from '../shared/webhooks.js';
 import { createMailer, sendmailTransport, recordingTransport } from '../shared/mailer.js';
 import { createScheduler, LICENSE_SCHEDULES } from '../shared/scheduler.js';
@@ -65,7 +66,7 @@ function createMetrics() {
 function createJobs(ctx) {
   const db = ctx.dbs.license;
   const stmts = {
-    insert: db.prepare('INSERT INTO jobs (id, type, owner_type, owner_id, status, params_json, created_at) VALUES (@id, @type, @owner_type, @owner_id, \'queued\', @params_json, @created_at)'),
+    insert: db.prepare('INSERT INTO jobs (id, type, owner_type, owner_id, status, params_json, created_at, created_by) VALUES (@id, @type, @owner_type, @owner_id, \'queued\', @params_json, @created_at, @created_by)'),
     get: db.prepare('SELECT * FROM jobs WHERE id = ?'),
     finish: db.prepare('UPDATE jobs SET status = @status, result_json = @result_json, error = @error, finished_at = @finished_at WHERE id = @id'),
   };
@@ -81,7 +82,7 @@ function createJobs(ctx) {
   return {
     enqueueBulkIssue(input, { actor, scope, owner }) {
       const id = newId('job', ctx.clock.now());
-      stmts.insert.run({ id, type: 'bulk_issue', owner_type: owner?.ownerType || null, owner_id: owner?.ownerId || null, params_json: JSON.stringify({ sku: input.sku, count: input.count, customer_id: input.customer_id }), created_at: nowIso(ctx.clock.now()) });
+      stmts.insert.run({ id, type: 'bulk_issue', owner_type: owner?.ownerType || null, owner_id: owner?.ownerId || null, params_json: JSON.stringify({ sku: input.sku, count: input.count, customer_id: input.customer_id }), created_at: nowIso(ctx.clock.now()), created_by: principalLabel(owner) });
       run(id, () => {
         const licenses = [];
         db.transaction(() => {
@@ -94,11 +95,10 @@ function createJobs(ctx) {
       });
       return { id };
     },
+    // Results hold clear-text keys: only the principal that queued the job may read them (§16.6).
     get(id, principal) {
       const row = stmts.get.get(id);
-      if (!row || (row.owner_type && principal && (row.owner_type !== principal.ownerType || row.owner_id !== principal.ownerId))) {
-        const err = new Error('Job not found'); err.status = 404; err.code = 'not_found'; throw Object.assign(err, { fields: undefined });
-      }
+      if (!row || !principal || row.owner_type !== principal.ownerType || row.owner_id !== principal.ownerId || row.created_by !== principalLabel(principal)) throw notFound('Job');
       return { id: row.id, type: row.type, status: row.status, params: json.parse(row.params_json, {}), result: row.result_json ? JSON.parse(ctx.crypto.decrypt(row.result_json)) : null, error: row.error, created_at: row.created_at, finished_at: row.finished_at };
     },
     settle: () => Promise.allSettled(pending.splice(0)),
@@ -147,9 +147,12 @@ export async function bootstrap(overrides = {}) {
     nonce: createNonceStore(dbs.license, { ttlS: config.license.nonce_ttl_s, maxSkewS: config.license.max_skew_s, now: clock.now }),
     scheduler: createScheduler({ logger, now: clock.now }),
     hooks: { checkin: [], billing: [], activationExtras: [], keyActivated: [], beforeKeyRetire: [] },
+    // deliver(db, { ownerType }) is the module function with the hub's fetch,
+    // crypto, clock and logger bound; modules pass only their db and owner type.
     webhooks: {
       ...webhooks,
-      deliverDue: (opts = {}) => webhooks.deliver(dbs.license, { ownerType: 'vendor', fetch: overrides.webhookFetch || ((url, init) => safeFetch(url, { ...init, maxBytes: 65536, timeoutMs: init?.timeoutMs || 10_000 })), crypto: cryptoSvc, now: clock.now, logger, ...opts }),
+      deliver: (db, opts = {}) => webhooks.deliver(db, { fetch: overrides.webhookFetch || ((url, init) => safeFetch(url, { ...init, maxBytes: 65536, timeoutMs: init?.timeoutMs || 10_000 })), crypto: cryptoSvc, now: clock.now, logger, ...opts }),
+      deliverDue: (opts = {}) => ctx.webhooks.deliver(dbs.license, { ownerType: 'vendor', ...opts }),
     },
     modules: [],
     finalized: false,
@@ -183,6 +186,8 @@ export async function bootstrap(overrides = {}) {
     ...dbs.license.prepare("SELECT l.edition, COUNT(*) AS n FROM activations a JOIN licenses l ON l.id = a.license_id WHERE a.status = 'active' GROUP BY l.edition").all().map((r) => ['activations_active', r.n, `edition="${r.edition}"`]),
     ['webhook_failures', dbs.license.prepare("SELECT COUNT(*) AS n FROM webhook_deliveries WHERE status IN ('failed', 'retrying')").get().n],
     ['nonces_cached', dbs.license.prepare('SELECT COUNT(*) AS n FROM nonces').get().n],
+    // §16.11 names replica lag; a single-node hub has no replica, so the gauge is a constant 0 until one exists.
+    ['replica_lag_seconds', 0],
   ]);
 
   const jobs = {

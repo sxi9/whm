@@ -1,5 +1,9 @@
 import crypto from 'node:crypto';
 import { newId } from './db.js';
+import { safeFetch } from './safe-fetch.js';
+
+// Developer- and reseller-supplied URLs go through the §18.2 SSRF policy.
+export const defaultFetch = (url, init = {}) => safeFetch(url, { ...init, maxBytes: 65536, timeoutMs: init.timeoutMs || 10_000 });
 
 // Outbound webhooks for every owner type. Vendor and reseller endpoints live
 // in license.db (webhook_endpoints/webhook_deliveries); developer endpoints in
@@ -62,9 +66,10 @@ export function enqueue(db, { ownerType, ownerId, event, data, now = Date.now() 
 
 // Delivers due rows: 2xx → delivered; otherwise the attempt counter grows and
 // next_at follows the backoff table until MAX_ATTEMPTS, then `failed`.
-export async function deliver(db, { ownerType = 'vendor', fetch, crypto: cryptoSvc, now = () => Date.now(), limit = 100, logger } = {}) {
+// `crypto` (the hub crypto service) decrypts endpoint secrets; ctx.webhooks.deliver
+// is this function with fetch/crypto/now/logger already bound.
+export async function deliver(db, { ownerType = 'vendor', fetch = defaultFetch, crypto: cryptoSvc = null, now = () => Date.now(), limit = 100, logger } = {}) {
   const t = tables(ownerType);
-  if (!fetch) throw new Error('deliver() needs a fetch implementation');
   const due = db.prepare(`SELECT d.*, e.url, e.secret_enc FROM ${t.deliveries} d JOIN ${t.endpoints} e ON e.id = d.${t.fk}
     WHERE d.status IN ('pending', 'retrying') AND d.next_at <= ? AND e.enabled = 1 ORDER BY d.next_at LIMIT ?`).all(new Date(now()).toISOString(), limit);
   const update = db.prepare(`UPDATE ${t.deliveries} SET attempt = @attempt, status = @status, next_at = @next_at, last_code = @last_code, last_error = @last_error, delivered_at = @delivered_at WHERE id = @id`);
@@ -72,8 +77,8 @@ export async function deliver(db, { ownerType = 'vendor', fetch, crypto: cryptoS
   for (const row of due) {
     const body = row.payload_json;
     const nowS = Math.floor(now() / 1000);
-    let secret = '';
-    try { secret = row.secret_enc ? cryptoSvc.decrypt(row.secret_enc) : ''; } catch { secret = ''; }
+    if (row.secret_enc && !cryptoSvc) throw new Error('deliver() needs the hub crypto service to decrypt endpoint secrets; call ctx.webhooks.deliver(db, opts)');
+    const secret = row.secret_enc ? cryptoSvc.decrypt(row.secret_enc) : '';
     const attempt = row.attempt + 1;
     let code = null; let error = null;
     try {

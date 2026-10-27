@@ -17,6 +17,21 @@ export function openDb(dbPath, { migrationsDir, logger } = {}) {
   return db;
 }
 
+// SQLite has no ADD COLUMN IF NOT EXISTS: a follow-up migration (0NNb_*) that
+// adds columns stays idempotent because every single-line
+// `ALTER TABLE t ADD COLUMN c ...;` statement is dropped when t already has c,
+// so a database whose schema_migrations ledger lags its schema still boots.
+const ALTER_ADD_COLUMN = /^[ \t]*ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(\w+)[^;]*;[ \t]*$/gim;
+
+export function hasColumn(db, table, column) {
+  if (!/^\w+$/.test(table)) throw new Error('invalid table name');
+  return db.prepare(`PRAGMA table_info("${table}")`).all().some((c) => c.name.toLowerCase() === String(column).toLowerCase());
+}
+
+export function skipExistingColumns(db, sql) {
+  return sql.replace(ALTER_ADD_COLUMN, (stmt, table, column) => (hasColumn(db, table, column) ? '' : stmt));
+}
+
 export function migrate(db, migrationsDir, logger) {
   db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
     name TEXT PRIMARY KEY,
@@ -28,7 +43,7 @@ export function migrate(db, migrationsDir, logger) {
   const names = [];
   for (const file of files) {
     if (applied.has(file)) continue;
-    const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+    const sql = skipExistingColumns(db, fs.readFileSync(path.join(migrationsDir, file), 'utf8'));
     db.transaction(() => { db.exec(sql); record.run(file); })();
     names.push(file);
     logger?.info({ migration: file }, 'applied database migration');

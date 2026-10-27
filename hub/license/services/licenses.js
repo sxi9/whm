@@ -38,11 +38,14 @@ export function createLicensesService(ctx) {
       max_activations = @max_activations, grace_days = @grace_days, updated_at = @now WHERE id = @id`),
     setKey: db.prepare('UPDATE licenses SET key_hash = @key_hash, key_prefix = @key_prefix, updated_at = @now WHERE id = @id'),
     setOverride: db.prepare('UPDATE licenses SET reactivation_override_until = @until, updated_at = @now WHERE id = @id'),
+    setSuspendAfter: db.prepare('UPDATE licenses SET suspend_after = @at, suspend_reason = @reason, updated_at = @now WHERE id = @id'),
+    suspensionsDue: db.prepare("SELECT id, suspend_reason FROM licenses WHERE suspend_after IS NOT NULL AND suspend_after <= ? AND status IN ('active', 'expired')"),
     activeActivations: db.prepare("SELECT id, hostname, last_checkin, fingerprint FROM activations WHERE license_id = ? AND status = 'active' ORDER BY first_seen"),
     blockActivations: db.prepare("UPDATE activations SET status = 'blocked', deactivated_at = @now, deactivated_by = @by WHERE license_id = @id AND status = 'active'"),
     insertRevocation: db.prepare('INSERT INTO revocations (id, license_id, activation_id, reason, revoked_by, ts) VALUES (@id, @license_id, @activation_id, @reason, @revoked_by, @ts)'),
-    lastCheckin: db.prepare('SELECT accounts_used, resellers_used, domains_used, ts FROM checkins WHERE license_id = ? ORDER BY id DESC LIMIT 1'),
+    lastCheckin: db.prepare('SELECT accounts_used, resellers_used, domains_used, ts FROM checkins WHERE license_id = ? AND accounts_used IS NOT NULL ORDER BY id DESC LIMIT 1'),
     expireDue: db.prepare("SELECT id, expires_at, grace_days FROM licenses WHERE status = 'active' AND expires_at IS NOT NULL"),
+    startsDue: db.prepare("SELECT id FROM licenses WHERE status = 'pending' AND starts_at <= ?"),
     expiring: db.prepare("SELECT * FROM licenses WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > @from AND expires_at <= @to"),
     customerEmail: db.prepare('SELECT email, name FROM customers WHERE id = ?'),
     insertFailure: db.prepare('INSERT INTO lookup_failures (ip, ts) VALUES (?, ?)'),
@@ -66,10 +69,14 @@ export function createLicensesService(ctx) {
     return row;
   }
 
-  // active|grace|expired|suspended|revoked|pending as of `at` (ms).
+  // active|grace|expired|suspended|revoked|pending as of `at` (ms). `pending`
+  // is a function of time, not of the stored row: a license whose starts_at
+  // lies ahead is pending until then and usable afterwards, whether or not the
+  // hourly job has already promoted the row.
   function statusAt(lic, at = now()) {
-    if (lic.status === 'revoked' || lic.status === 'suspended' || lic.status === 'pending') return lic.status;
+    if (lic.status === 'revoked' || lic.status === 'suspended') return lic.status;
     if (lic.status === 'expired') return 'expired';
+    if (lic.starts_at && at < new Date(lic.starts_at).getTime()) return 'pending';
     if (!lic.expires_at) return 'active';
     const exp = new Date(lic.expires_at).getTime();
     if (at < exp) return 'active';
@@ -134,6 +141,8 @@ export function createLicensesService(ctx) {
     // Issue: the clear-text key is returned once and never stored.
     issue(input, { actor = null, scope = null } = {}) {
       const snapshot = ctx.products.snapshot(input.sku);
+      const resellerId = scope?.resellerId || input.reseller_id || null;
+      if (resellerId) ctx.resellers.assertActive(resellerId);
       if (scope?.resellerId) ctx.resellers.assertQuota(scope.resellerId, snapshot.edition, 1);
       const customer = input.customer_id ? ctx.customers.get(input.customer_id, scope) : ctx.customers.findOrCreate(input.customer, scope);
       const key = keyfmt.generate();
@@ -165,6 +174,7 @@ export function createLicensesService(ctx) {
       const expiresAt = addMonths(new Date(base).toISOString(), term_months);
       const status = lic.status === 'expired' ? 'active' : lic.status;
       stmts.setExpiry.run({ id, expires_at: expiresAt, status, now: nowIso(now()) });
+      if (lic.suspend_after) stmts.setSuspendAfter.run({ id, at: null, reason: null, now: nowIso(now()) });
       const next = svc.get(id);
       audit(actor, 'license.renew', id, { term_months, expires_at: expiresAt });
       emit('license.renewed', next, { previous_expires_at: lic.expires_at });
@@ -180,6 +190,7 @@ export function createLicensesService(ctx) {
       const lic = svc.get(id, scope);
       if (lic.status === 'revoked') throw new HttpError(409, 'revoked', 'A revoked license cannot change edition');
       const snapshot = ctx.products.snapshot(sku);
+      if (scope?.resellerId) ctx.resellers.assertActive(scope.resellerId);
       if (scope?.resellerId && snapshot.rank > lic.rank) ctx.resellers.assertQuota(scope.resellerId, snapshot.edition, 1);
       const usage = svc.lastUsage(id);
       const activeCount = stmts.activeActivations.all(id).length;
@@ -202,9 +213,25 @@ export function createLicensesService(ctx) {
     suspend(id, { reason }, { actor = null, scope = null } = {}) {
       const lic = svc.get(id, scope);
       if (lic.status === 'revoked') throw new HttpError(409, 'revoked', 'License is revoked');
-      stmts.setStatus.run({ id, status: 'suspended', notes: null, now: nowIso(now()) });
+      db.transaction(() => {
+        stmts.setStatus.run({ id, status: 'suspended', notes: null, now: nowIso(now()) });
+        stmts.setSuspendAfter.run({ id, at: null, reason: null, now: nowIso(now()) });
+      })();
       audit(actor, 'license.suspend', id, { reason });
       emit('license.suspended', svc.get(id), { reason });
+      return svc.get(id);
+    },
+    // §16.7 billing cancellation: the license keeps running until the paid
+    // term plus its grace period ends, then the hourly job suspends it. A
+    // renewal in between cancels the pending suspension.
+    scheduleSuspension(id, { reason }, { actor = null, scope = null } = {}) {
+      const lic = svc.get(id, scope);
+      if (lic.status === 'revoked') throw new HttpError(409, 'revoked', 'License is revoked');
+      if (lic.status === 'suspended') return lic;
+      const graceEnd = lic.expires_at ? new Date(lic.expires_at).getTime() + lic.grace_days * DAY_MS : now();
+      if (graceEnd <= now()) return svc.suspend(id, { reason }, { actor, scope });
+      stmts.setSuspendAfter.run({ id, at: nowIso(graceEnd), reason: reason || null, now: nowIso(now()) });
+      audit(actor, 'license.suspend_scheduled', id, { reason, suspend_after: nowIso(graceEnd) });
       return svc.get(id);
     },
     unsuspend(id, _input = {}, { actor = null, scope = null } = {}) {
@@ -276,7 +303,7 @@ export function createLicensesService(ctx) {
     verifyToken(token, { now: at = now(), skewS = SKEW_S } = {}) {
       if (typeof token !== 'string') return { ok: false, reason: 'malformed' };
       const parts = token.split('.');
-      if (parts.length !== 3 || parts[0] !== TOKEN_PREFIX) return { ok: false, reason: 'malformed' };
+      if (parts.length !== 3 || parts[0] !== TOKEN_PREFIX || !/^[A-Za-z0-9_-]{86}$/.test(parts[2])) return { ok: false, reason: 'malformed' };
       let payload; let bytes;
       try {
         bytes = Buffer.from(parts[1], 'base64url');
@@ -329,6 +356,19 @@ export function createLicensesService(ctx) {
     expireDue() {
       const t = now();
       let n = 0;
+      let suspended = 0;
+      let started = 0;
+      for (const row of stmts.startsDue.all(nowIso(t))) {
+        stmts.setStatus.run({ id: row.id, status: 'active', notes: null, now: nowIso(t) });
+        const lic = svc.get(row.id);
+        audit(null, 'license.start', row.id, { starts_at: lic.starts_at });
+        emit('license.started', lic);
+        started++;
+      }
+      for (const row of stmts.suspensionsDue.all(nowIso(t))) {
+        svc.suspend(row.id, { reason: row.suspend_reason || 'billing:cancelled' }, { actor: { principal: 'system', ip: null } });
+        suspended++;
+      }
       for (const row of stmts.expireDue.all()) {
         if (new Date(row.expires_at).getTime() + row.grace_days * DAY_MS > t) continue;
         stmts.setStatus.run({ id: row.id, status: 'expired', notes: null, now: nowIso(t) });
@@ -338,7 +378,7 @@ export function createLicensesService(ctx) {
         if (c) ctx.mailer.send({ to: c.email, template: 'license.expired', data: { edition: lic.edition, key_prefix: lic.key_prefix, expires_at: lic.expires_at } });
         n++;
       }
-      return { expired: n };
+      return { expired: n, suspended, started };
     },
     expiringReminders(days = [30, 14, 7, 1]) {
       const t = now();

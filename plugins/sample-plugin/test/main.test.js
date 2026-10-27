@@ -94,6 +94,17 @@ test('settings: defaults of every type, validation, password re-encryption and s
   await assert.rejects(h.ctx.settings.set('sortOrder', 'sideways'), ValidationError);
   await assert.rejects(h.ctx.settings.set('categories', ['ops', 'ops']), ValidationError);
   await assert.rejects(h.ctx.settings.set('blockedUsernames', 'Not Valid!'), ValidationError);
+  await h.ctx.settings.set('blockedUsernames', 'alice\nbob\r\ncarol\n');
+  assert.deepEqual(mod.__test.blockedList(await h.ctx.settings.get('blockedUsernames')), ['alice', 'bob', 'carol']);
+  // the textarea pattern is linear: a long run of valid characters followed by
+  // one invalid character must be rejected instantly, not backtracked for hours
+  const field = manifest.settings.fields.find((f) => f.key === 'blockedUsernames');
+  const t0 = process.hrtime.bigint();
+  await assert.rejects(h.ctx.settings.set('blockedUsernames', 'a'.repeat(5000) + '!'), ValidationError);
+  await assert.rejects(h.ctx.settings.set('blockedUsernames', ('abcdefgh\n'.repeat(1500)) + 'Bad!'), ValidationError);
+  await assert.rejects(h.ctx.settings.set('blockedUsernames', 'a'.repeat(field.maxLength + 1)), ValidationError);
+  assert.ok(Number(process.hrtime.bigint() - t0) / 1e6 < 500, 'pattern validation must be linear');
+  assert.equal(field.maxLength, 16384);
   await assert.rejects(h.ctx.settings.set('digestSchedule', '99 * * * *'), ValidationError);
   // the password setting is mirrored into the store encrypted with ctx.crypto
   assert.equal(await h.ctx.store.get('webhook:token'), undefined);
@@ -240,9 +251,10 @@ test('routes: roles per route, validation, reseller scoping, 404s, export and th
   // a reseller may only attach notes to its own accounts and only sees those
   assert.equal((await post(h, '/notes', { title: 'not mine', account: 'alice' }, reseller)).status, 409);
   await h.advance(1000);
-  assert.equal((await post(h, '/notes', { title: 'bob note', account: 'bob' }, reseller)).status, 201);
+  const bobNote = await post(h, '/notes', { title: 'bob note', account: 'bob' }, reseller);
+  assert.equal(bobNote.status, 201);
   await h.advance(1000);
-  await post(h, '/notes', { title: 'unattached' });
+  const unattached = await post(h, '/notes', { title: 'unattached' });
   const rootList = await h.callRoute('GET', '/notes');
   assert.deepEqual(rootList.body.data.map((n) => n.title), ['unattached', 'bob note', 'root note']);
   await h.ctx.settings.set('sortOrder', 'oldest');
@@ -250,8 +262,14 @@ test('routes: roles per route, validation, reseller scoping, 404s, export and th
   assert.deepEqual((await h.callRoute('GET', '/notes', { query: { category: 'security' } })).body.data.map((n) => n.title), ['root note']);
   const resellerList = await h.callRoute('GET', '/notes', { user: reseller });
   assert.deepEqual(resellerList.body.data.map((n) => n.title), ['bob note']);
-  const one = await h.callRoute('GET', `/notes/${created.body.data.id}`, { user: reseller });
+  // GET /notes/:id applies the same tenancy scope as the list: a reseller gets
+  // 404 for root's note on an account it does not own and for unattached notes
+  assert.equal((await h.callRoute('GET', `/notes/${created.body.data.id}`, { user: reseller })).status, 404);
+  assert.equal((await h.callRoute('GET', `/notes/${unattached.body.data.id}`, { user: reseller })).status, 404);
+  const one = await h.callRoute('GET', `/notes/${bobNote.body.data.id}`, { user: reseller });
   assert.equal(one.status, 200);
+  assert.equal(one.body.data.title, 'bob note');
+  assert.equal((await h.callRoute('GET', `/notes/${created.body.data.id}`)).status, 200, 'root sees every note');
   assert.equal((await h.callRoute('GET', '/notes/doc_9999')).status, 404);
   assert.equal((await h.callRoute('DELETE', `/notes/${created.body.data.id}`, { user: reseller })).status, 403);
   assert.equal((await h.callRoute('DELETE', `/notes/${created.body.data.id}`)).status, 204);

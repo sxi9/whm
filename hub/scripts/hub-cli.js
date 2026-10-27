@@ -25,7 +25,8 @@ function parseArgs(argv) {
 export async function main(argv = process.argv.slice(2), { stdout = process.stdout, env = process.env } = {}) {
   const args = parseArgs(argv);
   const [cmd, ...rest] = args._;
-  const ctx = await bootstrap({ config: { log_level: 'silent', ...(args['db-dir'] ? { db_dir: args['db-dir'] } : {}), ...(args.config ? {} : {}), license: { mail: { transport: 'none' } } }, logger: pino({ level: 'silent' }) });
+  if (args.config) env.WHM_HUB_CONFIG = args.config;
+  const ctx = await bootstrap({ config: { log_level: 'silent', ...(args['db-dir'] ? { db_dir: args['db-dir'] } : {}), ...(args['keys-dir'] ? { keys: { dir: args['keys-dir'] } } : {}) }, logger: pino({ level: 'silent' }) });
   const out = (obj) => stdout.write((args.json ? JSON.stringify(obj) : JSON.stringify(obj, null, 2)) + '\n');
   const actor = { principal: 'cli', ip: null };
   try {

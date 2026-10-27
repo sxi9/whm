@@ -49,7 +49,7 @@
       { "key": "digestEnabled", "type": "toggle", "label": "Send the daily digest", "default": true, "group": "digest" },
       { "key": "digestSchedule", "type": "cron", "label": "Digest schedule", "default": "0 8 * * *", "group": "digest", "help": "UTC cron expression; clear it to stop the digest job." },
       { "key": "webhookToken", "type": "password", "label": "Webhook bearer token", "group": "digest", "help": "When set, the digest is also POSTed to https://hooks.example.net/whm-notes with this token.", "secret": true },
-      { "key": "blockedUsernames", "type": "textarea", "label": "Blocked usernames", "default": "", "group": "policy", "placeholder": "one username per line", "pattern": "^([a-z][a-z0-9_-]{0,31}(\\r?\\n)?)*$", "help": "Account creation is refused for these usernames (pre-stage hook)." }
+      { "key": "blockedUsernames", "type": "textarea", "label": "Blocked usernames", "default": "", "group": "policy", "placeholder": "one username per line", "maxLength": 16384, "pattern": "^(?:(?:[a-z][a-z0-9_-]{0,31})?\\r?\\n)*(?:[a-z][a-z0-9_-]{0,31})?$", "help": "Account creation is refused for these usernames (pre-stage hook)." }
     ]
   },
   "jobs": {

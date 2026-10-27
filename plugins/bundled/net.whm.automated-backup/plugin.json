@@ -31,8 +31,8 @@
       { "key": "scope", "type": "select", "label": "Back up", "default": "all", "group": "selection", "options": [
         { "value": "all", "label": "All accounts" }, { "value": "packages", "label": "Accounts on the listed packages" }, { "value": "accounts", "label": "The listed accounts" }
       ] },
-      { "key": "packages", "type": "textarea", "label": "Packages", "default": "", "group": "selection", "placeholder": "one package name per line", "pattern": "^([A-Za-z0-9_.-]{1,64}(\\r?\\n)?)*$", "help": "Used when \"Back up\" is set to packages; unknown names are reported as run warnings." },
-      { "key": "accounts", "type": "textarea", "label": "Accounts", "default": "", "group": "selection", "placeholder": "one username per line", "pattern": "^([a-z][a-z0-9_-]{0,31}(\\r?\\n)?)*$", "help": "Used when \"Back up\" is set to accounts; unknown usernames are reported as run warnings." },
+      { "key": "packages", "type": "textarea", "label": "Packages", "default": "", "group": "selection", "placeholder": "one package name per line", "maxLength": 16384, "pattern": "^(?:(?:[A-Za-z0-9_.-]{1,64})?\\r?\\n)*(?:[A-Za-z0-9_.-]{1,64})?$", "help": "Used when \"Back up\" is set to packages; unknown names are reported as run warnings." },
+      { "key": "accounts", "type": "textarea", "label": "Accounts", "default": "", "group": "selection", "placeholder": "one username per line", "maxLength": 16384, "pattern": "^(?:(?:[a-z][a-z0-9_-]{0,31})?\\r?\\n)*(?:[a-z][a-z0-9_-]{0,31})?$", "help": "Used when \"Back up\" is set to accounts; unknown usernames are reported as run warnings." },
       { "key": "include", "type": "multiselect", "label": "Components", "default": ["home", "mail", "db", "dns", "ssl", "cron"], "group": "archive", "options": [
         { "value": "home", "label": "Home directory" }, { "value": "mail", "label": "Mail" }, { "value": "db", "label": "Databases" }, { "value": "dns", "label": "DNS zones" }, { "value": "ssl", "label": "SSL certificates" }, { "value": "cron", "label": "Cron jobs" }
       ] },
@@ -42,7 +42,7 @@
       { "key": "retention_daily", "type": "number", "label": "Daily archives to keep", "default": 7, "min": 0, "max": 365, "integer": true, "group": "retention" },
       { "key": "retention_weekly", "type": "number", "label": "Weekly archives to keep", "default": 4, "min": 0, "max": 104, "integer": true, "group": "retention" },
       { "key": "retention_monthly", "type": "number", "label": "Monthly archives to keep", "default": 3, "min": 0, "max": 120, "integer": true, "group": "retention", "help": "Retention removes local archives only; copies on a destination follow that destination's own retention." },
-      { "key": "destinations", "type": "textarea", "label": "Destination ids", "default": "", "group": "destinations", "placeholder": "one destination id per line", "pattern": "^([A-Za-z0-9_-]{1,64}(\\r?\\n)?)*$", "help": "Ids from the Destinations page (Backup › Backup Configuration). Unknown ids are skipped with a run warning." },
+      { "key": "destinations", "type": "textarea", "label": "Destination ids", "default": "", "group": "destinations", "placeholder": "one destination id per line", "maxLength": 16384, "pattern": "^(?:(?:[A-Za-z0-9_-]{1,64})?\\r?\\n)*(?:[A-Za-z0-9_-]{1,64})?$", "help": "Ids from the Destinations page (Backup › Backup Configuration). Unknown ids are skipped with a run warning." },
       { "key": "notify_on", "type": "select", "label": "Notify the server contacts on", "default": "failure", "group": "notifications", "options": [
         { "value": "failure", "label": "Failure" }, { "value": "success", "label": "Success" }, { "value": "both", "label": "Failure and success" }, { "value": "never", "label": "Never" }
       ] },

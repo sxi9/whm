@@ -1,6 +1,5 @@
 import express from 'express';
 import { z, validate, fields, wrap } from '../../shared/validate.js';
-import { HttpError } from '../../shared/errors.js';
 
 const panelFields = {
   fingerprint: fields.fingerprint,
@@ -29,27 +28,28 @@ export function publicRoutes(ctx) {
   const { signed, limiters } = ctx.app;
   const guard = (req, _res, next) => { try { ctx.licenses.lookupGuard.assertNotBlocked(req.ip); next(); } catch (err) { next(err); } };
 
-  r.post('/activate', limiters.activate, guard, ...signed(validate({ body: activateBody }), wrap(async (req, res) => {
+  // Limiters run inside signed() so a 429 is signed and echoes the nonce like every other answer (§16.6).
+  r.post('/activate', ...signed(limiters.activate, guard, validate({ body: activateBody }), wrap(async (req, res) => {
     const out = ctx.activations.activate({ ...req.body, ip: req.ip });
     res.json({ data: await withExtras(ctx, out) });
   })));
 
-  r.post('/checkin', limiters.checkin, ...signed(validate({ body: checkinBody }), wrap(async (req, res) => {
+  r.post('/checkin', ...signed(limiters.public, validate({ body: checkinBody }), wrap(async (req, res) => {
     const out = ctx.activations.checkin({ ...req.body, ip: req.ip });
     res.json({ data: await withExtras(ctx, out) });
   })));
 
-  r.post('/deactivate', limiters.public, ...signed(validate({ body: deactivateBody }), wrap(async (req, res) => {
+  r.post('/deactivate', ...signed(limiters.public, validate({ body: deactivateBody }), wrap(async (req, res) => {
     const out = ctx.activations.deactivateByToken({ token: req.body.token, reason: req.body.reason, ip: req.ip });
     res.json({ data: out });
   })));
 
-  r.post('/transfers', limiters.activate, guard, ...signed(validate({ body: transferBody }), wrap(async (req, res) => {
+  r.post('/transfers', ...signed(limiters.activate, guard, validate({ body: transferBody }), wrap(async (req, res) => {
     const out = ctx.transfers.request({ ...req.body, ip: req.ip });
     res.json({ data: await withExtras(ctx, out) });
   })));
 
-  r.post('/trial', limiters.trial, guard, ...signed(validate({ body: trialBody }), wrap(async (req, res) => {
+  r.post('/trial', ...signed(limiters.trial, guard, validate({ body: trialBody }), wrap(async (req, res) => {
     const out = ctx.trials.start({ ...req.body, ip: req.ip });
     res.status(201).json({ data: await withExtras(ctx, out) });
   })));
@@ -78,17 +78,17 @@ export function publicRoutes(ctx) {
 
 // Hooks (the marketplace) add plugin_signing_keys and revocations_head_ts
 // inside the signed body of activation, check-in, transfer and trial answers.
+// The core answer is merged last: a hook can add keys, never replace token,
+// activation_id, status or messages.
 async function withExtras(ctx, out) {
-  let data = out;
+  let extras = {};
   for (const fn of ctx.hooks.activationExtras) {
     try {
       const extra = await fn(ctx.activations.find(out.activation_id) || { id: out.activation_id });
-      if (extra && typeof extra === 'object') data = { ...data, ...extra };
+      if (extra && typeof extra === 'object') extras = { ...extras, ...extra };
     } catch (err) {
       ctx.logger.error({ err }, 'activationExtras hook failed');
     }
   }
-  return data;
+  return { ...extras, ...out };
 }
-
-export { HttpError };

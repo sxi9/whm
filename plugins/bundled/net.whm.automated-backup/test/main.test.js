@@ -102,6 +102,24 @@ test('scope selects by packages or usernames and reports unknown names as warnin
   assert.deepEqual(r.result.warnings.map((w) => [w.code, w.account]), [['unknown_account', 'nobody']]);
   await assert.rejects(h.ctx.settings.set('accounts', 'Not A User'), ValidationError);
   await assert.rejects(h.ctx.settings.set('packages', 'bad name'), ValidationError);
+  await h.ctx.settings.set('accounts', 'alice\r\nbob\n\ncarol\n');
+  await h.ctx.settings.set('packages', 'gold\nsilver');
+  await h.ctx.settings.set('destinations', 'offsite\nnas\n');
+  assert.deepEqual(mod.__test.lines(await h.ctx.settings.get('accounts')), ['alice', 'bob', 'carol']);
+});
+
+test('the textarea patterns are linear and bounded: a long run of valid characters followed by a typo is rejected instantly', async () => {
+  const h = await loaded();
+  const t0 = process.hrtime.bigint();
+  for (const [key, valid] of [['packages', 'pkg-name'], ['accounts', 'abcdefgh'], ['destinations', 'dest_01']]) {
+    const field = manifest.settings.fields.find((f) => f.key === key);
+    assert.equal(field.maxLength, 16384, key);
+    await assert.rejects(h.ctx.settings.set(key, 'a'.repeat(5000) + ' '), ValidationError, key);
+    await assert.rejects(h.ctx.settings.set(key, `${valid}\n`.repeat(1500) + '!'), ValidationError, key);
+    await assert.rejects(h.ctx.settings.set(key, `${valid}\n`.repeat(3000)), ValidationError, `${key} beyond maxLength`);
+    await h.ctx.settings.set(key, `${valid}\n`.repeat(100));
+  }
+  assert.ok(Number(process.hrtime.bigint() - t0) / 1e6 < 1000, 'pattern validation must be linear');
 });
 
 // ---------------------------------------------------------------- locks
@@ -133,6 +151,18 @@ test('locks: a live lock skips the account with a warning, an expired lock is ta
   await spyHost.runJob('run', { source: 'manual' });
   assert.ok(seen && seen.expiresAt === NOW + 45 * 60e3 && typeof seen.jobId === 'string');
   assert.equal(await spyHost.ctx.store.get('lock:alice'), undefined);
+});
+
+test('two runs started at the same time (cron plus a manual POST /run) back up an account once: the second sees the lock', async () => {
+  const h = spy({ scope: 'accounts', accounts: 'alice', max_parallel: 2 }, (c) => ({ async create(args) { await new Promise((r) => setTimeout(r, 5)); return c.api.backups.create(args); } }));
+  const [a, b] = await Promise.all([h.ctx.jobs.run('run', { source: 'cron' }), h.ctx.jobs.run('run', { source: 'api' })]);
+  await h.flush();
+  assert.deepEqual([(await h.ctx.jobs.status(a)).status, (await h.ctx.jobs.status(b)).status], ['done', 'done']);
+  assert.equal(h.state.backupsCreated.length, 1, 'the account was backed up exactly once');
+  const all = await runs(h, 'run');
+  assert.deepEqual(all.map((r) => r.ok + r.skipped), [1, 1]);
+  assert.equal(all.filter((r) => r.warningList.some((w) => w.code === 'locked')).length, 1, 'one run reports the lock');
+  assert.deepEqual(await h.ctx.store.keys('lock:'), []);
 });
 
 // ---------------------------------------------------------------- destinations
@@ -282,45 +312,69 @@ test('cancelling a run stops before the next account and max_parallel bounds con
   inFlight = 0; peak = 0;
   await p.runJob('run', { source: 'manual' });
   assert.equal(peak, 3);
-  await assert.rejects(h.ctx.jobs.cancel(await h.ctx.jobs.run('restore', { artefactId: 'x', account: 'alice', confirmToken: 'aaaaaaaaaa' })), ConflictError);
+  await assert.rejects(h.ctx.jobs.cancel(await h.ctx.jobs.run('restore', { artefactId: 'x', account: 'alice', confirmRef: 'nope' })), ConflictError);
   await h.flush();
 });
 
 // ---------------------------------------------------------------- restore
 
-test('restore: a valid token restores once, a bad or used token is refused (PERMISSION_DENIED) and recorded; the route validates and enqueues', async () => {
+test('restore: the route parks the token in memory and the job redeems the reference once; bad, used, wrong-account and expired tokens are refused (PERMISSION_DENIED) and recorded; nothing persists the token', async () => {
+  const { holdToken, redeemToken, heldTokens, CONFIRM_HOLD_MS } = mod.__test;
   const h = await loaded({ settings: { scope: 'accounts', accounts: 'alice' } });
   await h.runJob('run', { source: 'manual' });
   const artefactId = h.state.backupsCreated[0].id;
-  const bad = await h.runJob('restore', { artefactId, account: 'alice', confirmToken: 'ffffffffffffffff' });
-  assert.equal(bad.status, 'failed');
-  assert.equal(bad.error.code, 'PERMISSION_DENIED');
+  const restore = (body, user) => h.callRoute('POST', '/restore', { body, user });
+  const bad = await restore({ artefactId, account: 'alice', confirmToken: 'ffffffffffffffff' });
+  assert.equal(bad.status, 202);
+  await h.flush();
+  const badJob = await h.ctx.jobs.status(bad.body.data.job.id);
+  assert.deepEqual([badJob.status, badJob.error.code], ['failed', 'PERMISSION_DENIED']);
   assert.equal(h.state.restores.length, 0);
   assert.equal(h.state.notifications.length, 1);
   assert.match(h.state.notifications[0].subject, /refused/);
   const token = h.issueRestoreToken(artefactId, 'alice', { issuedBy: 'root' });
-  const route = await h.callRoute('POST', '/restore', { body: { artefactId, account: 'alice', confirmToken: token } });
+  const route = await restore({ artefactId, account: 'alice', confirmToken: token });
   assert.equal(route.status, 202);
   await h.flush();
   const ok = await h.ctx.jobs.status(route.body.data.job.id);
   assert.equal(ok.status, 'done', JSON.stringify(ok.error));
   assert.deepEqual(h.state.restores.map((r) => [r.artefactId, r.account, r.confirmedBy]), [[artefactId, 'alice', 'root']]);
   assert.equal(ok.result.hostJobId, h.state.restores[0].jobId);
-  const used = await h.runJob('restore', { artefactId, account: 'alice', confirmToken: token });
-  assert.equal(used.status, 'failed');
-  assert.equal(used.error.code, 'PERMISSION_DENIED');
+  // the token itself is never in a job record, the run history or the store
+  for (const j of h.state.jobs) assert.ok(!JSON.stringify(j).includes(token), 'job record leaks the token');
+  assert.match(ok.params.confirmRef, /^[a-f0-9]{32}$/);
+  assert.equal(ok.params.confirmToken, undefined);
+  assert.ok(!JSON.stringify(h.state.store).includes(token), 'store leaks the token');
+  assert.equal(heldTokens.size, 0, 'redeemed references are dropped');
+  // a used token (same token, new reference) and a reused reference are both refused
+  const used = await restore({ artefactId, account: 'alice', confirmToken: token });
+  await h.flush();
+  assert.equal((await h.ctx.jobs.status(used.body.data.job.id)).error.code, 'PERMISSION_DENIED');
+  const replay = await h.runJob('restore', { artefactId, account: 'alice', confirmRef: ok.params.confirmRef });
+  assert.deepEqual([replay.status, replay.error.code], ['failed', 'PERMISSION_DENIED']);
+  assert.match(replay.error.message, /unknown, already redeemed or expired/);
+  assert.equal((await h.runJob('restore', { artefactId, account: 'alice' })).error.code, 'PERMISSION_DENIED', 'no reference at all');
   const wrongAccount = h.issueRestoreToken(artefactId, 'bob');
-  assert.equal((await h.runJob('restore', { artefactId, account: 'alice', confirmToken: wrongAccount })).status, 'failed');
+  assert.equal((await h.runJob('restore', { artefactId, account: 'alice', confirmRef: holdToken(wrongAccount, h.ctx.now()) })).status, 'failed');
   const expired = h.issueRestoreToken(artefactId, 'alice', { ttlMs: 1000 });
+  const expiredRef = holdToken(expired, h.ctx.now());
   await h.advance(2000);
-  assert.equal((await h.runJob('restore', { artefactId, account: 'alice', confirmToken: expired })).status, 'failed');
+  assert.equal((await h.runJob('restore', { artefactId, account: 'alice', confirmRef: expiredRef })).status, 'failed');
+  // a held reference outlives nothing: it expires with the token's own lifetime and is swept
+  const stale = holdToken('stale-token', 0);
+  assert.equal(redeemToken(stale, CONFIRM_HOLD_MS), null);
+  assert.equal(redeemToken(holdToken('fresh', 0), CONFIRM_HOLD_MS - 1), 'fresh');
+  holdToken('sweep', CONFIRM_HOLD_MS * 2);
+  assert.ok(![...heldTokens.values()].some((v) => v.token === 'stale-token'), 'expired holds are swept on the next hold');
+  heldTokens.clear();
   const history = await runs(h, 'restore');
-  assert.deepEqual(history.map((r) => r.status), ['failed', 'ok', 'failed', 'failed', 'failed']);
+  assert.deepEqual(history.map((r) => r.status), ['failed', 'ok', 'failed', 'failed', 'failed', 'failed', 'failed']);
   assert.equal(history[0].results[0].error.code, 'PERMISSION_DENIED');
-  const invalid = await h.callRoute('POST', '/restore', { body: { artefactId: 'x y', account: 'Bad', confirmToken: 'short' } });
+  assert.ok(!JSON.stringify(history).includes(token));
+  const invalid = await restore({ artefactId: 'x y', account: 'Bad', confirmToken: 'short' });
   assert.equal(invalid.status, 400);
   assert.deepEqual(invalid.body.error.details.fields.map((f) => f.path), ['artefactId', 'account', 'confirmToken']);
-  assert.equal((await h.callRoute('POST', '/restore', { body: { artefactId, account: 'alice', confirmToken: token }, user: { id: 2, username: 'r', role: 'reseller' } })).status, 403);
+  assert.equal((await restore({ artefactId, account: 'alice', confirmToken: token }, { id: 2, username: 'r', role: 'reseller' })).status, 403);
 });
 
 test('every declared permission is exercised across a package-scoped run, a notification, the API routes and a restore', async () => {
@@ -363,9 +417,12 @@ test('host-initiated backups appear in the history once, failures too, and a ter
   assert.equal(page.body.data[0].startedAt, new Date(NOW).toISOString());
   // termination
   await h.ctx.store.set('lock:bob', { jobId: 'j', acquiredAt: NOW, expiresAt: NOW + H });
+  assert.deepEqual(all.filter((r) => r.kind === 'host').map((r) => r.account), ['bob', 'carol'], 'host runs carry the account at the top level');
   await h.fire('account.terminated', { username: 'bob', domain: 'bob.test', keepDns: false });
   assert.deepEqual(await h.ctx.store.keys('lock:'), []);
   assert.deepEqual((await artefacts(h)).map((a) => a.account), ['alice']);
+  assert.deepEqual((await runs(h)).map((r) => [r.kind, r.account || r.results[0].account]), [['run', 'alice'], ['host', 'carol']], 'the host-initiated run rows of the terminated account are dropped');
+  assert.ok(h.state.logs.some((l) => l.msg === 'history of a terminated account dropped' && l.fields.runs === 1));
   assert.deepEqual((await h.callRoute('GET', '/artefacts', { query: { account: 'alice' } })).body.data.map((a) => a.artefactId), [own.id]);
   assert.throws(() => { throw new PermissionError('x', 'y'); }, PermissionError);
 });

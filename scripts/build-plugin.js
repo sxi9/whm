@@ -3,7 +3,7 @@
 // packer, optionally signing it.
 //
 //   node scripts/build-plugin.js <dir> [--out file.whmplugin] [--sign <private.pem> [--dev]] [--kid <kid>]
-//                                      [--exclude <pattern>]... [--include-tests] [--json]
+//                                      [--exclude <pattern>]... [--include-tests] [--allow-secrets] [--json]
 //
 //   --sign <pem> --dev   developer signature: writes DEV-SIGNATURE.json over the digest with
 //                        both signature files excluded (marketplace.md §18.3); what an upload
@@ -14,11 +14,15 @@
 //   --kid <kid>          key id to record; default = first 8 hex of sha256(raw public key)
 //   --exclude <pat>      extra exclude (exact path, "dir/" prefix or "*.ext" glob); repeatable
 //   --include-tests      keep test/ and tests/ in the package (excluded by default)
+//   --allow-secrets      package files that look like PEM private keys instead of refusing
 //   --json               print the result as JSON
 //
 // Without --sign the package is unsigned; a DEV-SIGNATURE.json already present in the source
 // is kept. A source directory that already contains SIGNATURE.json is refused unless --sign is
 // given without --dev (the hub is the only writer of that file in distributed packages).
+// A file whose first bytes hold a PEM private key (a developer or operator signing key left
+// in the tree, e.g. test/fixtures/dev.pem with --include-tests) is refused unless
+// --allow-secrets is given: locally signed packages never pass the marketplace scanner.
 // Prints sha256 of the package, the digest, the kid and the entry count.
 import fs from 'node:fs';
 import os from 'node:os';
@@ -33,8 +37,23 @@ const { pack, validateManifest } = sdk;
 
 function usage(code = 0) {
   const out = code ? console.error : console.log;
-  out(`Usage: build-plugin <dir> [--out file.whmplugin] [--sign <private.pem> [--dev]] [--kid <kid>] [--exclude <pattern>]... [--include-tests] [--json]`);
+  out(`Usage: build-plugin <dir> [--out file.whmplugin] [--sign <private.pem> [--dev]] [--kid <kid>] [--exclude <pattern>]... [--include-tests] [--allow-secrets] [--json]`);
   process.exit(code);
+}
+
+const PRIVATE_KEY_RE = /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/;
+const SECRET_SCAN_BYTES = 4096;
+
+/** True when the first bytes of `file` carry a PEM private key block. */
+export function looksLikePrivateKey(file) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const buf = Buffer.alloc(SECRET_SCAN_BYTES);
+    const n = fs.readSync(fd, buf, 0, SECRET_SCAN_BYTES, 0);
+    return PRIVATE_KEY_RE.test(buf.toString('latin1', 0, n));
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function fail(message, details) {
@@ -44,7 +63,7 @@ function fail(message, details) {
 }
 
 export function parseArgs(argv) {
-  const opts = { dir: null, out: null, sign: null, dev: false, kid: null, exclude: [], includeTests: false, json: false };
+  const opts = { dir: null, out: null, sign: null, dev: false, kid: null, exclude: [], includeTests: false, allowSecrets: false, json: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => { if (i + 1 >= argv.length) throw new Error(`${a} needs a value`); return argv[++i]; };
@@ -54,6 +73,7 @@ export function parseArgs(argv) {
     else if (a === '--kid') opts.kid = next();
     else if (a === '--exclude') opts.exclude.push(next());
     else if (a === '--include-tests') opts.includeTests = true;
+    else if (a === '--allow-secrets') opts.allowSecrets = true;
     else if (a === '--json') opts.json = true;
     else if (a === '--help' || a === '-h') opts.help = true;
     else if (a.startsWith('-')) throw new Error(`unknown option ${a}`);
@@ -88,12 +108,15 @@ export function buildPlugin(opts) {
   try {
     const root = path.join(staging, 'pkg');
     fs.mkdirSync(root);
+    const secrets = [];
     for (const f of pack.walkFiles(dir, { exclude })) {
+      if (!opts.allowSecrets && looksLikePrivateKey(f.full)) { secrets.push(f.rel); continue; }
       const to = path.join(root, f.rel);
       fs.mkdirSync(path.dirname(to), { recursive: true });
       fs.copyFileSync(f.full, to);
       fs.chmodSync(to, f.mode & 0o100 ? 0o755 : 0o644);
     }
+    if (secrets.length) throw Object.assign(new Error('the package would contain a private key; remove it, --exclude it, or pass --allow-secrets'), { details: secrets });
     let signature = null;
     let kid = null;
     if (opts.sign) {

@@ -99,7 +99,6 @@ export function createSafeFetch({ lookup = (host) => dns.promises.lookup(host, {
     return new Promise((resolve, reject) => {
       const controller = new AbortController();
       const timer = setTimeout(() => { controller.abort(); reject(refused('timeout', `${timeoutMs} ms`)); }, timeoutMs);
-      timer.unref?.();
       let req;
       try {
         req = request({
@@ -134,15 +133,18 @@ export function createSafeFetch({ lookup = (host) => dns.promises.lookup(host, {
     if (!/^[a-z0-9._-]{1,253}$/i.test(String(name))) throw refused('invalid-name');
     const r = resolver || new dns.promises.Resolver({ timeout: timeoutMs, tries: 1 });
     let records;
+    let timer;
     try {
       records = await Promise.race([
         r.resolveTxt(name),
-        new Promise((_, rej) => setTimeout(() => rej(refused('dns-timeout')), timeoutMs).unref?.()),
+        new Promise((_, rej) => { timer = setTimeout(() => rej(refused('dns-timeout')), timeoutMs); }),
       ]);
     } catch (err) {
       if (err instanceof HttpError) throw err;
       if (['ENOTFOUND', 'ENODATA'].includes(err?.code)) return [];
       throw refused('dns-failure', err?.code || err?.message);
+    } finally {
+      clearTimeout(timer);
     }
     return records.slice(0, maxRecords).map((parts) => parts.join(''));
   }

@@ -12,6 +12,7 @@ export function createResellersService(ctx) {
     update: db.prepare('UPDATE resellers SET name = @name, status = @status, brand_json = @brand_json, updated_at = @now WHERE id = @id'),
     setQuota: db.prepare('UPDATE resellers SET quota_json = @quota_json, pricing_json = @pricing_json, updated_at = @now WHERE id = @id'),
     setIssued: db.prepare('UPDATE resellers SET issued_json = @issued_json, updated_at = @now WHERE id = @id'),
+    portalUsers: db.prepare('SELECT id FROM portal_users WHERE reseller_id = ?'),
     statement: db.prepare(`SELECT l.id, l.key_prefix, l.edition, l.term, l.issued_at, l.status, l.customer_id, substr(l.issued_at, 1, 7) AS month
       FROM licenses l WHERE l.reseller_id = ? ORDER BY l.issued_at`),
   };
@@ -44,7 +45,17 @@ export function createResellersService(ctx) {
     update(id, patch) {
       const row = svc.get(id);
       stmts.update.run({ id, name: patch.name ?? row.name, status: patch.status ?? row.status, brand_json: JSON.stringify(patch.brand ?? row.brand), now: nowIso(ctx.clock.now()) });
+      if (patch.status && patch.status !== 'active' && patch.status !== row.status) {
+        for (const u of stmts.portalUsers.all(id)) ctx.portalSessionStore?.destroyUserSessions(u.id);
+        ctx.audit.record({ principal: 'system', ip: null, action: `reseller.${patch.status}`, target: id, args: null, result: 'ok' });
+      }
       return svc.get(id);
+    },
+    // Suspended or closed resellers lose the API, the portal and issuance.
+    assertActive(id) {
+      const row = svc.get(id);
+      if (row.status !== 'active') throw new HttpError(403, 'reseller_suspended', `This reseller account is ${row.status}`);
+      return row;
     },
     setQuota(id, { quota, pricing }) {
       const row = svc.get(id);
