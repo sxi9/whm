@@ -19,9 +19,9 @@ export const PAYOUT = payout;
 export const ID_DOCUMENT = idDocument;
 
 export const FIXTURES = [
-  [/^\/admin\/reports\/dashboard$/, { data: { activations_by_edition: [{ edition: 'pro', n: 12 }, { edition: 'solo', n: 30 }], checkins_last_24h: [{ hour: '2026-10-26T11', n: 40 }, { hour: '2026-10-26T12', n: 55 }], expiring_30d: 3, failed_checkins_24h: 1, webhook_failures: 0, trial_funnel: { started: 10, converted: 4, expired: 3, abuse: [{ ip: '198.51.100.9', n: 2 }] } } }],
+  [/^\/admin\/reports\/dashboard$/, { data: { activations_by_edition: [{ edition: 'pro', active: 12 }, { edition: 'solo', active: 30 }], checkins_last_24h: [{ hour: '2026-10-26T11', n: 40 }, { hour: '2026-10-26T12', n: 55 }], expiring_30d: 3, failed_checkins_24h: 1, webhook_failures: 0, trial_funnel: { started: 10, converted: 4, expired: 3, abuse: [{ ip: '198.51.100.9', n: 2 }] } } }],
   [/^\/admin\/market\/stats$/, { data: { verification_queue: 2, review_queue: { normal: 1, high: 1 }, downloads_per_day: [{ day: '2026-10-25', n: 8 }], revenue_30d: [{ currency: 'USD', amount_cents: 58000, vendor_cents: 17400, developer_cents: 40600, purchases: 20 }], revocations: 1, revocations_pending: 0, developers: { pending: 2, verified: 5 }, plugins: { listed: 4, draft: 1 }, scan_queue_age_s: 0, review_queue_age_s: 7200, resign: { active_kid: '7b2d4e10', backlog: 0, last_run: null, keys_in_use: [{ kid: '7b2d4e10', versions: 4 }] }, payouts_pending: 1 } }],
-  [/^\/admin\/reports\/activations$/, { data: { by_edition: [{ edition: 'pro', n: 12 }], over_time: [{ day: '2026-10-25', n: 2 }], panel_versions: [{ panel_version: '1.4.2', n: 12 }] } }],
+  [/^\/admin\/reports\/activations$/, { data: { by_edition: [{ edition: 'pro', active: 12 }], over_time: [{ day: '2026-10-25', created: 2 }, { day: '2026-10-26', created: 5 }], panel_versions: [{ panel_version: '1.4.2', n: 12 }] } }],
   [/^\/admin\/licenses\/lic_/, { data: license }],
   [/^\/admin\/licenses/, page([license])],
   [/^\/admin\/products$/, { data: [{ sku: 'whm-pro-annual', name: 'Pro annual', edition: 'pro', rank: 30, term: 'annual', price_cents: 29900, currency: 'USD', active: true, limits: { max_accounts: -1, max_resellers: 5, max_activations: 1 }, features: { api: true, marketplace_paid: true } }] }],

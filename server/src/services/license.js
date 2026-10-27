@@ -553,8 +553,9 @@ export function createLicenseService(ctx) {
     const notified = cache.meta.expiringNotified?.lexp === p.lexp ? cache.meta.expiringNotified.days : [];
     const due = EXPIRING_DAYS.filter((t) => days <= t && !notified.includes(t));
     if (!due.length) return;
-    recordEvent('license.expiring', { daysLeft: days, expiresAt: nowIso(p.lexp * 1000), edition: p.ed }, { req, severity: days <= 7 ? 'error' : 'warning', subject: `License expires in ${days} day${days === 1 ? '' : 's'}` });
+    // The threshold is recorded before notifying so two concurrent check-ins cannot both pass the once-per-threshold guard.
     saveMeta({ expiringNotified: { lexp: p.lexp, days: [...notified, ...due] } });
+    recordEvent('license.expiring', { daysLeft: days, expiresAt: nowIso(p.lexp * 1000), edition: p.ed }, { req, severity: days <= 7 ? 'error' : 'warning', subject: `License expires in ${days} day${days === 1 ? '' : 's'}` });
   }
 
   // Stores a verified answer: the token must verify against the pinned keys and

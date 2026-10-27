@@ -103,6 +103,9 @@ test('a trial that fails to activate leaves nothing behind, so the customer can 
     const failed = await begin({ skipVerify: true });
     assert.equal(failed.status, 503, JSON.stringify(failed.body));
     assert.equal(failed.body.error.code, 'no_active_key');
+    // nothing can be signed without a key: the 5xx is unsigned (never a signed-looking 2xx/4xx) and echoes the nonce
+    assert.equal(failed.headers['x-whm-signature'], undefined);
+    assert.equal(failed.body.meta.nonce, failed.whmNonce);
     assert.deepEqual(bare.db.prepare('SELECT (SELECT COUNT(*) FROM trials) AS trials, (SELECT COUNT(*) FROM licenses) AS licenses, (SELECT COUNT(*) FROM customers) AS customers, (SELECT COUNT(*) FROM activations) AS activations').get(), { trials: 0, licenses: 0, customers: 0, activations: 0 });
     bare.ctx.keys.register({ purpose: 'license', publicPem: pubOf(KIDS.licenseA), status: 'active', activatedAt: new Date(bare.clock.t).toISOString() });
     bare.ctx.keys.register({ purpose: 'plugin', publicPem: pubOf(KIDS.pluginA), status: 'active', activatedAt: new Date(bare.clock.t).toISOString() });

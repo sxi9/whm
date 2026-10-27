@@ -52,16 +52,25 @@ export function signedMiddleware(ctx) {
     if (req.method !== 'POST') return next();
     const nonce = req.get('x-whm-nonce') || null;
     const originalJson = res.json.bind(res);
-    // Fail closed: a body the hub cannot sign (no active key, a non-canonical
-    // value such as a float) never leaves as an unsigned 2xx/4xx. The 500 that
-    // replaces it is signed when the key is usable, and logged with the route.
+    // Fail closed: a body the hub cannot sign never leaves as an unsigned
+    // 2xx/4xx. A non-canonical value (a float) becomes a signed 500 and is
+    // logged with the route; a hub with no usable key (no_active_key) answers
+    // that 5xx itself, unsigned, because nothing can be signed at all — the
+    // panel rejects the unsigned answer as hub_signature_invalid (502) and,
+    // like any transient hub error, backs off and keeps its last state.
     res.json = (payload) => {
       const out = { ...payload, meta: { ...(payload?.meta || {}), nonce } };
       try {
         ctx.keys.signResponse(res, out);
         return originalJson(out);
       } catch (err) {
-        ctx.logger.error({ err, requestId: req.id, route: `${req.method} ${req.originalUrl.split('?')[0]}`, status: res.statusCode }, 'cannot sign response');
+        const route = `${req.method} ${req.originalUrl.split('?')[0]}`;
+        ctx.logger.error({ err, requestId: req.id, route, status: res.statusCode }, 'cannot sign response');
+        res.removeHeader('X-WHM-Signature');
+        if (err instanceof HttpError && err.status >= 500) {
+          res.status(err.status);
+          return originalJson({ error: { code: err.code, message: err.message, requestId: req.id }, meta: { nonce } });
+        }
         const failure = { error: { code: 'signing_failed', message: 'The hub could not sign its response', requestId: req.id }, meta: { nonce } };
         res.status(500);
         try { ctx.keys.signResponse(res, failure); } catch { res.removeHeader('X-WHM-Signature'); }

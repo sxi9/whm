@@ -309,8 +309,11 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   session to resume the run, integrate finished waves, snapshot to git and move to the next step.
   Phase 5 is committed (`76483ef`, green gate: server 1135 / agent 462 / client 48 / hub 177 / hub-ui 97 + SDK +
   plugins, both builds, boot, e2e). Current run: the
-  **Phase-5 fix round `wf_8f6db955-2a6`** (`<workflows>/scripts/whm-phase5-fix-wf_8f6db955-2a6.js`, no args; resume with
-  `Workflow({scriptPath, resumeFromRunId: 'wf_8f6db955-2a6'})`),
+  Phase-5 fix round `wf_8f6db955-2a6` is **done** (07:34: hub 0 open, host 0 open; minors closed by the integrator:
+  expiring-threshold dedup persisted before notify, `origin` in the client fixture, app.js comment); green gate
+  running, then commit `fix(phase5)`. Docs run **`wf_6fb27dfc-b56`** (`whm-install-manual-wf_6fb27dfc-b56.js`, user
+  ask 07:40: `docs/INSTALL.md` + `docs/MANUAL.md` (parts A/B merged by the integrator at the `<!-- PART B -->`
+  marker) — link both from README and HANDOFF when landed),
   then the live hub+panel end-to-end flow (`scripts/install.sh --with-hub` is the production path; in dev: start
   the hub with test keys on :7443, point `WHM_LICENSE_HUB_URL` at it, activate a trial from Basic Setup → License,
   enable the `whm-hub` provider, install `net.whm.sample-notes` through the consent screen, revoke it from the admin

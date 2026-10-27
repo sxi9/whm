@@ -265,3 +265,5 @@ tbody tr.is-selected { background: var(--primary-soft); }
 .login-external { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
 .login-divider { display: flex; align-items: center; gap: 10px; color: var(--text-faint); font-size: 12px; margin: 6px 0; }
 .login-divider::before, .login-divider::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+.impersonation-banner { display: flex; align-items: center; gap: 10px; padding: 8px 16px; background: var(--warn-soft); border-bottom: 1px solid var(--warn); font-size: 13px; position: sticky; top: 0; z-index: 31; }
+.impersonation-banner span { flex: 1; }

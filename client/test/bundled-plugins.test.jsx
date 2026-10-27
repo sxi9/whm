@@ -22,7 +22,7 @@ vi.mock('../src/hooks/useApi.js', async (importOriginal) => {
 React.useLayoutEffect = React.useEffect;
 
 const fns = Object.fromEntries(CATEGORIES.find((c) => c.slug === 'plugins').functions.map((f) => [f.slug, f]));
-const plugin = (id, name) => ({ id, name, version: '1.0.0', sidebar: [], pages: [{ route: '/settings', title: 'Settings', kind: 'settings', source: 'manifest' }] });
+const plugin = (id, name) => ({ id, name, version: '1.0.0', sidebar: [], pages: [{ route: '/settings', title: 'Settings', kind: 'settings', origin: 'manifest' }] });
 
 function render(Page, fn, plugins) {
   const value = { plugins, entries: pluginEntries(plugins), loading: false, error: null, reload() {} };

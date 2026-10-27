@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
-import { Menu, LogOut, ShieldCheck, KeyRound } from 'lucide-react';
+import { Menu, LogOut, ShieldCheck, KeyRound, UserCog } from 'lucide-react';
 import { useAuth } from '../auth/AuthContext.jsx';
 import { NAV_BY_AREA, AREA_LABELS } from './nav.js';
 
@@ -16,10 +16,22 @@ export function stepUpIndicator(session, now = Date.now()) {
   return `2FA confirmed ${ago}`;
 }
 
+// §16.9: the banner shown while a vendor_admin acts as a reseller. The hub
+// drops the rebinding after 15 minutes on its own; the text says when.
+export function impersonationText(session, now = Date.now()) {
+  const imp = session?.impersonating;
+  if (!imp) return null;
+  const who = imp.reseller_name || imp.reseller_id;
+  const until = imp.expires_at ? new Date(imp.expires_at).getTime() : NaN;
+  if (!Number.isFinite(until)) return `Impersonating ${who}`;
+  const left = Math.max(0, Math.round((until - now) / 60000));
+  return `Impersonating ${who} · ${left ? `${left} min left` : 'window expired'}`;
+}
+
 // Portal chrome: top bar, area sidebar, content outlet. The step-up modal is
 // mounted by AuthProvider, so pages only see the retried request succeed.
 export function Shell({ area }) {
-  const { session, logout } = useAuth();
+  const { session, logout, endImpersonation } = useAuth();
   const navigate = useNavigate();
   const [mobileOpen, setMobileOpen] = useState(false);
   const identity = session?.kind === 'developer' ? session.developer?.email : session?.user?.email;
@@ -27,9 +39,16 @@ export function Shell({ area }) {
   const reseller = session?.kind === 'portal' && session.user?.reseller_id ? session.brand || {} : null;
   const brand = reseller ? reseller.name || 'Reseller portal' : 'WHM Hub';
   const stepUp = stepUpIndicator(session);
+  const impersonating = impersonationText(session);
 
   return (
     <div className={`app ${mobileOpen ? 'mobile-open' : ''}`}>
+      {impersonating && (
+        <div className="impersonation-banner" role="status">
+          <UserCog size={14} /> <span>{impersonating} — every action is audited under your vendor identity.</span>
+          <button type="button" className="btn btn-sm" onClick={async () => { await endImpersonation?.(); navigate('/admin/resellers'); }}>End impersonation</button>
+        </div>
+      )}
       <header className="topbar">
         <button className="icon-button topbar-menu" onClick={() => setMobileOpen((o) => !o)} aria-label="Menu"><Menu size={20} /></button>
         <div className="brand">{reseller?.logo_url ? <img src={reseller.logo_url} alt="" className="brand-logo" style={{ height: 20, width: 'auto' }} /> : <ShieldCheck size={18} />} <strong>{brand}</strong> <span className="brand-sub muted">{AREA_LABELS[area]}</span></div>

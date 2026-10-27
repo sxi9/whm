@@ -565,6 +565,14 @@ market:read`):
 | `GET /v1/admin/market/resign-status` | progress of the re-sign job after a plugin-key activation (§18.9) |
 | `GET /v1/admin/signing-keys?purpose=` · `POST /v1/admin/signing-keys { purpose }` · `POST …/:kid/activate` · `POST …/:kid/retire` | **owned by §16.7 / `hub/license`**; the marketplace registers the `activate`/`retire` hooks (`ctx.hooks.keyActivated`, `ctx.hooks.beforeKeyRetire`) |
 
+**Reseller API** (`/v1/reseller/market/*`; reseller portal session or reseller `api_keys` — the §16.7
+scopes apply; rows scoped to the reseller's own licenses):
+
+| Method & path | Function |
+|---|---|
+| `POST /v1/reseller/market/entitlements { license_id, plugin_id, expires_at? }` (scope `license:issue`) | grants a plugin entitlement to one of the reseller's own licenses at the wholesale price in `resellers.pricing_json.plugins[plugin_id]` (`no_wholesale_price` 403 when none, `not_owned` 403 for a foreign license); audited `entitlement.reseller_grant` |
+| `GET /v1/reseller/products` (scope `license:read`, **owned by §16 / `hub/license`**) | the editions this reseller may issue with its wholesale prices — what the reseller portal's issue forms offer |
+
 **Developer webhooks** (`developer_webhooks` / `developer_webhook_deliveries` in marketplace.db, delivered by
 `shared/webhooks.js` with `ownerType = 'developer'` and the marketplace `db` handle — same HMAC header and
 retry schedule as §16.7): `version.scan_completed`, `version.review_decided`, `version.published`,

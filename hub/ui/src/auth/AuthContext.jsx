@@ -49,8 +49,18 @@ export function brandOf(data) {
   return { name: typeof brand.name === 'string' && brand.name.trim() ? brand.name.trim() : data?.reseller?.name || null, logo_url: safeUrl(brand.logo_url), support_url: safeUrl(brand.support_url) };
 }
 
+// §16.9: while a vendor_admin impersonates a reseller, /portal/me reports the
+// effective reseller_admin identity in `user` and the window in
+// `impersonating: { reseller_id, by, expires_at }`; the SPA routes on the
+// effective role and the Shell shows the banner with the End action.
+export function impersonationOf(data) {
+  const imp = data?.impersonating;
+  if (!imp || typeof imp !== 'object' || typeof imp.reseller_id !== 'string') return null;
+  return { reseller_id: imp.reseller_id, by: imp.by || null, expires_at: imp.expires_at || null, reseller_name: data?.reseller?.name || null };
+}
+
 function portalSession(data) {
-  return { kind: 'portal', user: data.user, totpVerifiedAt: data.totp_verified_at || null, totpEnabled: !!data.user?.totp_enabled, brand: data.user?.reseller_id ? brandOf(data) : null };
+  return { kind: 'portal', user: data.user, totpVerifiedAt: data.totp_verified_at || null, totpEnabled: !!data.user?.totp_enabled, brand: data.user?.reseller_id ? brandOf(data) : null, impersonating: impersonationOf(data) };
 }
 function developerSession(data) {
   return { kind: 'developer', developer: data.developer, scopes: data.scopes || ['*'], totpVerifiedAt: data.totp_verified_at || null, totpEnabled: !!data.developer?.totp_enabled };
@@ -112,6 +122,17 @@ export function AuthProvider({ children, initialPath = typeof window !== 'undefi
       const { data } = await api.post(stepUpPathFor(session), { totp });
       setSession((s) => (s ? { ...s, totpVerifiedAt: data.totp_verified_at || Date.now() } : s));
       return data;
+    },
+    // §16.9 impersonate-reseller: the hub rebinds this vendor_admin session to
+    // the reseller tenant for 15 minutes; the session is re-read so the SPA
+    // routes on the effective reseller_admin role. end() restores the admin.
+    async impersonate(resellerId) {
+      const { data } = await api.post(`/admin/resellers/${encodeURIComponent(resellerId)}/impersonate`, {});
+      await refresh();
+      return data;
+    },
+    async endImpersonation() {
+      try { await api.post('/portal/impersonate/end', {}); } finally { await refresh(); }
     },
     markTotpEnabled(enabled) {
       setSession((s) => (s ? { ...s, totpEnabled: enabled, totpVerifiedAt: enabled ? Date.now() : null } : s));

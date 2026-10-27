@@ -1,5 +1,6 @@
 import { useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useAuth } from '../../auth/AuthContext.jsx';
 import { PageHeader, Card, StatusPill, formatDate } from '../../components/Common.jsx';
 import { DataTable } from '../../components/DataTable.jsx';
 import { Button, Field, NumberInput, ErrorBanner } from '../../components/Form.jsx';
@@ -56,10 +57,18 @@ export function StatementView({ statement }) {
   );
 }
 
-function ResellerDrawer({ id, onClose }) {
+// Only a vendor_admin portal session may impersonate (API keys and
+// vendor_support cannot); the hub asks for a TOTP step-up first.
+export function canImpersonate(session, reseller) {
+  return session?.kind === 'portal' && session.user?.role === 'vendor_admin' && !session.impersonating && reseller?.status === 'active';
+}
+
+export function ResellerDrawer({ id, onClose }) {
   const { data, loading, error, refetch } = useApi(id ? `/admin/resellers/${id}` : null);
   const statement = useApi(id ? `/admin/resellers/${id}/statement` : null);
-  const { run } = useAction();
+  const { run, busy } = useAction();
+  const { session, impersonate } = useAuth();
+  const navigate = useNavigate();
   const [tab, setTab] = useState('quota');
   return (
     <Modal open={Boolean(id)} title={data ? `${data.name} · ${data.email}` : 'Reseller'} onClose={onClose} size="lg">
@@ -73,6 +82,7 @@ function ResellerDrawer({ id, onClose }) {
             <Button size="sm" onClick={() => setTab('quota')}>Quota & pricing</Button>
             <Button size="sm" onClick={() => setTab('statement')}>Statement</Button>
             <Button size="sm" onClick={() => setTab('brand')}>White-label</Button>
+            {canImpersonate(session, data) && <Button size="sm" loading={busy} title="Act as this reseller's admin for 15 minutes (audited)" onClick={() => run(() => impersonate(data.id), { success: (r) => `Impersonating ${r?.reseller_name || data.name} until ${formatDate(r?.expires_at)}`, then: () => navigate('/reseller') })}>Impersonate</Button>}
           </div>
           {tab === 'quota' && <QuotaEditor key={data.updated_at || data.id} reseller={data} onSaved={refetch} />}
           {tab === 'statement' && <StatementView statement={statement.data} />}
