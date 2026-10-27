@@ -12,12 +12,21 @@ import { FormModal, SecretOnce, limitLabel } from '../../widgets/index.jsx';
 export const EDITIONS = ['trial', 'solo', 'pro', 'reseller', 'enterprise'];
 export const LICENSE_STATUSES = ['pending', 'active', 'suspended', 'expired', 'revoked'];
 
+// The product field: a select over the catalog when one is available, else
+// a free SKU input (with suggestions) so the hub, not the form, decides
+// whether a SKU exists. Resellers have no catalog route until U1 adds
+// GET /v1/reseller/products, and vendor-defined SKUs are arbitrary.
+export function skuField({ products, suggestions = [], label = 'Product', withTerm = false }) {
+  const list = Array.isArray(products) ? products.filter((p) => p.active !== false) : [];
+  if (list.length) return { key: 'sku', label, type: 'select', options: list.map((p) => ({ value: p.sku, label: `${p.name} (${p.edition}${withTerm && p.term ? `, ${p.term}` : ''})` })), required: true };
+  return { key: 'sku', label: `${label} SKU`, required: true, placeholder: suggestions[0] || 'whm-pro-annual', suggestions, help: 'The SKU as defined by the vendor; an unknown SKU is refused by the hub.' };
+}
+
 // Issue / bulk-issue forms shared with the reseller portal: `base` is
 // /admin or /reseller; the reseller variant has no reseller_id field.
-export function IssueLicenseModal({ open, onClose, base, products, onIssued, reseller = false }) {
-  const skus = (products || []).filter((p) => p.active !== false).map((p) => ({ value: p.sku, label: `${p.name} (${p.edition}, ${p.term})` }));
+export function IssueLicenseModal({ open, onClose, base, products, skuSuggestions, onIssued, reseller = false }) {
   const fields = [
-    { key: 'sku', label: 'Product', type: 'select', options: skus, required: true },
+    skuField({ products, suggestions: skuSuggestions, withTerm: true }),
     { key: 'email', label: 'Customer e-mail', type: 'email', required: true, help: 'An existing customer is matched by e-mail; otherwise one is created.' },
     { key: 'name', label: 'Customer name' },
     { key: 'term_months', label: 'Term (months)', type: 'number', min: 1, max: 120 },
@@ -27,27 +36,26 @@ export function IssueLicenseModal({ open, onClose, base, products, onIssued, res
   if (!reseller) fields.push({ key: 'reseller_id', label: 'Reseller id (optional)', help: 'Issue on behalf of a reseller (rs_…)' });
   return (
     <FormModal open={open} title="Issue a license" fields={fields} onClose={onClose} submitLabel="Issue" onSubmit={async (d) => {
-      const body = { sku: d.sku, customer: { email: d.email, ...(d.name ? { name: d.name } : {}) } };
+      const body = { sku: String(d.sku || '').trim(), customer: { email: d.email, ...(d.name ? { name: d.name } : {}) } };
       if (d.term_months) body.term_months = Number(d.term_months);
       if (d.notes) body.notes = d.notes;
       if (d.external_ref) body.external_ref = d.external_ref;
       if (d.reseller_id) body.reseller_id = d.reseller_id;
-      const { data } = await api.post(`${base}/licenses`, body);
-      onIssued(data);
+      const { data, meta } = await api.post(`${base}/licenses`, body);
+      onIssued({ ...data, meta: meta || null });
     }} />
   );
 }
 
-export function BulkIssueModal({ open, onClose, base, products, onQueued }) {
-  const skus = (products || []).map((p) => ({ value: p.sku, label: `${p.name} (${p.edition})` }));
+export function BulkIssueModal({ open, onClose, base, products, skuSuggestions, onQueued }) {
   return (
     <FormModal open={open} title="Bulk issue" fields={[
-      { key: 'sku', label: 'Product', type: 'select', options: skus, required: true },
+      skuField({ products, suggestions: skuSuggestions }),
       { key: 'customer_id', label: 'Customer id', required: true, help: 'cus_… — every key is issued to this customer' },
       { key: 'count', label: 'Count', type: 'number', min: 1, max: 1000, required: true },
       { key: 'notes', label: 'Notes' },
     ]} onClose={onClose} submitLabel="Queue job" onSubmit={async (d) => {
-      const { data } = await api.post(`${base}/licenses/bulk`, { sku: d.sku, customer_id: d.customer_id, count: Number(d.count), ...(d.notes ? { notes: d.notes } : {}) });
+      const { data } = await api.post(`${base}/licenses/bulk`, { sku: String(d.sku || '').trim(), customer_id: d.customer_id, count: Number(d.count), ...(d.notes ? { notes: d.notes } : {}) });
       onQueued(data.job);
     }} />
   );

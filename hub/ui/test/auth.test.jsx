@@ -63,20 +63,22 @@ describe('session areas', () => {
 describe('step-up prompt and login forms', () => {
   it('renders the step-up modal with the refused request and a 6-digit code field', () => {
     const request = { err: { message: 'Confirm your TOTP code to continue' }, info: { method: 'POST', path: '/admin/signing-keys' } };
-    const html = render(<StepUpModal open request={request} onDone={() => {}} onCancel={() => {}} />);
+    const html = render(<StepUpModal open request={request} session={SESSIONS.vendor} stepUp={auth.stepUp} onDone={() => {}} onCancel={() => {}} />);
     expect(html).toContain('Confirm your two-factor code');
     expect(html).toContain('POST /admin/signing-keys');
     expect(html).toContain('id="stepup-code"');
-    expect(html).toContain('inputMode="numeric"'.replace('inputMode', 'inputmode'));
+    expect(html).toMatch(/input[Mm]ode="numeric"/);
     expect(html).toContain('disabled=""');
-    expect(render(<StepUpModal open={false} request={null} onDone={() => {}} onCancel={() => {}} />)).toBe('');
+    expect(render(<StepUpModal open={false} request={null} session={SESSIONS.vendor} stepUp={auth.stepUp} onDone={() => {}} onCancel={() => {}} />)).not.toContain('modal');
   });
 
-  it('warns inside the step-up modal when the session has no 2FA', () => {
-    auth.value = SESSIONS.support;
-    const html = render(<StepUpModal open request={{ err: {}, info: {} }} onDone={() => {}} onCancel={() => {}} />);
+  it('warns inside the step-up modal when the session has no 2FA and links the area Security page', () => {
+    const html = render(<StepUpModal open request={{ err: {}, info: {} }} session={SESSIONS.support} stepUp={auth.stepUp} onDone={() => {}} onCancel={() => {}} />);
     expect(html).toContain('Two-factor authentication is not enabled');
-    auth.value = SESSIONS.vendor;
+    expect(html).toContain('href="/admin/security"');
+    expect(render(<StepUpModal open request={{ err: {}, info: {} }} session={{ ...SESSIONS.reseller, totpEnabled: false }} stepUp={auth.stepUp} onDone={() => {}} onCancel={() => {}} />)).toContain('href="/reseller/security"');
+    expect(render(<StepUpModal open request={{ err: {}, info: {} }} session={{ ...SESSIONS.developer, totpEnabled: false }} stepUp={auth.stepUp} onDone={() => {}} onCancel={() => {}} />)).toContain('href="/dev/security"');
+    expect(render(<StepUpModal open request={{ err: {}, info: {} }} session={SESSIONS.vendor} stepUp={auth.stepUp} onDone={() => {}} onCancel={() => {}} />)).not.toContain('/admin/security');
   });
 
   it('login form shows e-mail + password first and links the other portal', () => {
@@ -99,6 +101,10 @@ describe('shell and routes', () => {
       for (const g of groups) for (const item of g.items) expect(paths.has(item.to), `${area} ${item.to}`).toBe(true);
     }
     expect(paths.has('/admin/licenses/:id')).toBe(true);
+    expect(paths.has('/admin/security')).toBe(true);
+    expect(paths.has('/reseller/security')).toBe(true);
+    expect(NAV_BY_AREA.admin.flatMap((g) => g.items).some((i) => i.to === '/admin/security')).toBe(true);
+    expect(NAV_BY_AREA.reseller.flatMap((g) => g.items).some((i) => i.to === '/reseller/security')).toBe(true);
     expect(paths.has('/dev/plugins/:id/versions/:v')).toBe(true);
     expect(paths.has('/login')).toBe(true);
     expect(paths.has('/dev/login')).toBe(true);
@@ -111,6 +117,17 @@ describe('shell and routes', () => {
     expect(html).toContain('root@vendor.test');
     expect(html).toContain('href="/admin/market/verifications"');
     expect(html).toContain('2FA confirmed');
+    auth.value = SESSIONS.reseller;
+    const plain = render(<Shell area="reseller" />);
+    expect(plain).toContain('Reseller portal');
+    expect(plain).toContain('href="/reseller/security"');
+    expect(plain).not.toContain('brand-logo');
+    auth.value = { ...SESSIONS.reseller, brand: { name: 'Acme Hosting Licenses', logo_url: 'https://acme.test/logo.png', support_url: 'https://acme.test/support' } };
+    const branded = render(<Shell area="reseller" />);
+    expect(branded).toContain('Acme Hosting Licenses');
+    expect(branded).toContain('src="https://acme.test/logo.png"');
+    expect(branded).toContain('href="https://acme.test/support"');
+    expect(branded).not.toContain('WHM Hub');
     auth.value = SESSIONS.developer;
     const dev = render(<Shell area="dev" />);
     expect(dev).toContain('Developer portal');

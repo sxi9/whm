@@ -9,16 +9,33 @@ import { SecretOnce, KV, limitLabel } from '../../widgets/index.jsx';
 import { IssueLicenseModal, BulkIssueModal, LicenseTable, EDITIONS, LICENSE_STATUSES } from '../admin/Licenses.jsx';
 import { LifecycleActions, ActivationsTable } from '../admin/LicenseDetail.jsx';
 
-// Reseller products come from the public catalog of editions the quota names;
-// /v1/admin/products is vendor-only, so the SKU list is derived from quota + pricing.
-function useResellerProducts() {
-  const quota = useApi('/reseller/quota');
-  const editions = Object.entries(quota.data?.quota || {}).filter(([, n]) => n === -1 || n > 0).map(([e]) => e);
-  const products = editions.flatMap((e) => (e === 'trial' ? [] : [{ sku: `whm-${e}-annual`, name: `${e} annual`, edition: e, term: 'annual' }, { sku: `whm-${e}-monthly`, name: `${e} monthly`, edition: e, term: 'monthly' }]));
-  return { products, quota };
+// Seeded SKUs per edition (hub/license/migrations/001_license.sql); only
+// suggestions for the free SKU input, never a catalog of their own.
+export const KNOWN_SKUS = { solo: ['whm-solo-annual', 'whm-solo-monthly'], pro: ['whm-pro-annual', 'whm-pro-monthly'], reseller: ['whm-reseller-annual-5'], enterprise: ['whm-enterprise'] };
+
+// Editions the reseller may still issue (quota -1 = unlimited, missing = 0).
+export function issuableEditions(quota) {
+  return Object.entries(quota || {}).filter(([e, n]) => e !== 'trial' && (n === -1 || n > 0)).map(([e]) => e);
 }
 
-function LicenseDrawer({ id, products, onClose, onChanged }) {
+// Products the issue forms offer: the hub catalog (GET /v1/reseller/products,
+// contract row in the build plan) narrowed to issuable editions, or null when
+// the hub has no such route yet so the forms fall back to a SKU input with
+// `suggestions`.
+export function issuableProducts(quota, catalog) {
+  const editions = issuableEditions(quota);
+  const products = Array.isArray(catalog) ? catalog.filter((p) => p.active !== false && editions.includes(p.edition)) : null;
+  return { editions, products: products?.length ? products : null, suggestions: products?.length ? [] : editions.flatMap((e) => KNOWN_SKUS[e] || []) };
+}
+
+function useResellerProducts() {
+  const quota = useApi('/reseller/quota');
+  const catalog = useApi('/reseller/products');
+  const { products, suggestions } = issuableProducts(quota.data?.quota_left || quota.data?.quota, catalog.error ? null : catalog.data);
+  return { products, suggestions, quota };
+}
+
+function LicenseDrawer({ id, products, suggestions, onClose, onChanged }) {
   const { data: lic, loading, error, refetch } = useApi(id ? `/reseller/licenses/${id}` : null);
   const changed = async () => { await refetch(); onChanged?.(); };
   return (
@@ -29,7 +46,7 @@ function LicenseDrawer({ id, products, onClose, onChanged }) {
         <>
           <KV items={[['Status', <StatusPill status={lic.status_now || lic.status} />], ['Customer', lic.customer_id], ['Expires', lic.expires_at ? formatDate(lic.expires_at) : 'never'], ['Servers', `${(lic.activations || []).filter((a) => a.status === 'active').length} / ${limitLabel(lic.max_activations)}`], ['Accounts limit', limitLabel(lic.limits?.max_accounts)], ['Usage', lic.usage ? `${lic.usage.accounts} accounts · ${lic.usage.domains} domains` : '—'], ['Notes', lic.notes], ['External ref', lic.external_ref]]} />
           <h3 style={{ margin: '12px 0 8px' }}>Actions</h3>
-          <LifecycleActions base="/reseller" license={lic} products={products} onChanged={changed} />
+          <LifecycleActions base="/reseller" license={lic} products={products} skuSuggestions={suggestions} onChanged={changed} />
           <h3 style={{ margin: '12px 0 8px' }}>Activations</h3>
           <ActivationsTable activations={lic.activations} base="/reseller" licenseId={lic.id} onChanged={changed} />
         </>
@@ -42,7 +59,7 @@ export default function ResellerLicenses() {
   const { id } = useParams();
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
-  const { products } = useResellerProducts();
+  const { products, suggestions } = useResellerProducts();
   const [issueOpen, setIssueOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [issued, setIssued] = useState(null);
@@ -64,9 +81,9 @@ export default function ResellerLicenses() {
         </div>
         <LicenseTable base="/reseller" filters={filters} linkTo={(r) => `/reseller/licenses/${r.id}`} />
       </Card>
-      <IssueLicenseModal reseller open={issueOpen} onClose={() => setIssueOpen(false)} base="/reseller" products={products} onIssued={(d) => { setIssued(d); setTick((t) => t + 1); }} />
-      <BulkIssueModal open={bulkOpen} onClose={() => setBulkOpen(false)} base="/reseller" products={products} onQueued={setJob} />
-      <LicenseDrawer id={id || null} products={products} onClose={() => navigate('/reseller/licenses')} onChanged={() => setTick((t) => t + 1)} />
+      <IssueLicenseModal reseller open={issueOpen} onClose={() => setIssueOpen(false)} base="/reseller" products={products} skuSuggestions={suggestions} onIssued={(d) => { setIssued(d); setTick((t) => t + 1); }} />
+      <BulkIssueModal open={bulkOpen} onClose={() => setBulkOpen(false)} base="/reseller" products={products} skuSuggestions={suggestions} onQueued={setJob} />
+      <LicenseDrawer id={id || null} products={products} suggestions={suggestions} onClose={() => navigate('/reseller/licenses')} onChanged={() => setTick((t) => t + 1)} />
     </>
   );
 }

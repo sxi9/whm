@@ -65,7 +65,7 @@ function SessionsPanel() {
     <>
       <ErrorBanner error={error} onRetry={refetch} />
       <h3>Sessions</h3>
-      <ul className="timeline">{(data?.sessions || []).map((s) => <li key={s.sid || s.id}><time>{formatDate(s.created_at)}</time><span>{s.ip_hash ? `ip ${String(s.ip_hash).slice(0, 10)}…` : ''} · expires {formatDate(s.expires_at)}{s.current && <span className="pill pill-ok" style={{ marginLeft: 6 }}>this session</span>}</span></li>)}{!(data?.sessions || []).length && <li><span className="muted">No sessions.</span></li>}</ul>
+      <ul className="timeline">{(data?.sessions || []).map((s) => <li key={s.id}><time>{formatDate(s.created_at)}</time><span><code className="small">{s.id}</code> · expires {formatDate(s.expires_at)}<span className={`pill ${s.stepped_up ? 'pill-ok' : 'pill-muted'}`} style={{ marginLeft: 6 }}>{s.stepped_up ? 'stepped up' : 'not stepped up'}</span></span></li>)}{!(data?.sessions || []).length && <li><span className="muted">No sessions.</span></li>}</ul>
       <Button size="sm" variant="danger" onClick={async () => { if (await confirm({ title: 'Sign out everywhere', message: 'Every developer session is revoked, including this one.', danger: true })) run(() => api.delete('/dev/sessions'), { success: 'All sessions revoked', then: refresh }); }}>Sign out everywhere</Button>
       <h3 style={{ marginTop: 16 }}>Security events</h3>
       <ul className="timeline">{(data?.events || []).slice(0, 30).map((e, i) => <li key={i}><time>{formatDate(e.ts || e.created_at)}</time><span>{e.event || e.kind} {e.detail && <span className="muted">{typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail)}</span>}</span></li>)}{!(data?.events || []).length && <li><span className="muted">No events yet.</span></li>}</ul>

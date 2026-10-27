@@ -8,7 +8,7 @@ import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
 import { packageFromFiles } from './support/tar.js';
 import { canonicalize } from '../src/lib/canonical.js';
 import { loadCommonJs, REPO_ROOT } from '../src/lib/plugin-sdk.js';
-import { INSTALL_JOB, UPDATE_JOB, REVOCATIONS_JOB, REVOCATIONS_SCHEDULE, UPDATE_CHECK_SCHEDULE } from '../src/services/marketplace-client.js';
+import { INSTALL_JOB, UPDATE_JOB, REVOCATIONS_JOB, REVOCATIONS_SCHEDULE, UPDATE_CHECK_SCHEDULE, SCHEDULES_SETTING } from '../src/services/marketplace-client.js';
 
 // §18.10 "Panel client": the hub is a recorded-fixture mock behind
 // ctx.license.transport; nothing here opens a socket.
@@ -166,6 +166,8 @@ const get = (url) => app.http.get(url);
 const installRaw = (buf) => app.http.post('/api/plugins/manage/install').set('X-CSRF-Token', csrf).set('Content-Type', 'application/gzip').send(buf);
 const audits = (action) => app.ctx.db.prepare('SELECT * FROM audit_log WHERE action = ? ORDER BY id').all(action);
 const installRow = (id) => app.ctx.db.prepare('SELECT * FROM marketplace_installs WHERE plugin_id = ?').get(id);
+const stateRow = () => app.ctx.db.prepare('SELECT * FROM marketplace_state').get();
+const schedulesEnabled = () => [REVOCATIONS_SCHEDULE, UPDATE_CHECK_SCHEDULE].map((name) => app.ctx.scheduler.list().find((s) => s.name === name)?.enabled);
 const pluginRow = (id) => app.ctx.db.prepare('SELECT * FROM plugins WHERE id = ?').get(id);
 const runJob = async (res) => { expect(res.status, JSON.stringify(res.body)).toBe(202); return waitForJob(app.ctx, res.body.data.job.id, 15_000); };
 const notified = [];
@@ -234,7 +236,11 @@ describe('hub identity', () => {
     await enableHubRow(`${HUB}/`);
     const status = (await get('/api/marketplace/status').expect(200)).body.data;
     expect(status).toMatchObject({ enabled: true, hubMismatch: false });
-    expect(app.ctx.scheduler.list().filter((s) => [REVOCATIONS_SCHEDULE, UPDATE_CHECK_SCHEDULE].includes(s.name)).map((s) => s.enabled)).toEqual([1, 1]);
+    // status() is a pure read: the schedules switch from the Market service's hook (or the next hub action).
+    expect(schedulesEnabled()).toEqual([0, 0]);
+    app.ctx.marketplace.onHubChanged();
+    expect(schedulesEnabled()).toEqual([1, 1]);
+    expect(app.ctx.settings.get(SCHEDULES_SETTING)).toBe(true);
     const cat = await get('/api/marketplace/catalog?q=scoped').expect(200);
     expect(cat.body.data.map((e) => e.id)).toEqual(['net.example.scoped']);
     expect(cat.body.data[0].installed).toBeNull();
@@ -252,6 +258,28 @@ describe('hub identity', () => {
     for (const c of gets) { expect(c.url.startsWith(`${HUB}/v1/market/`)).toBe(true); expect(c.headers.Authorization).toBeUndefined(); }
     expect(hub.calls.filter((c) => c.url.startsWith('http://'))).toEqual([]);
     expect((await get('/api/marketplace/catalog?category=BAD!')).status).toBe(422);
+  });
+
+  it('leaves a schedule the operator switched off alone until the hub row changes again', async () => {
+    app.ctx.scheduler.update(REVOCATIONS_SCHEDULE, { enabled: false });
+    await get('/api/marketplace/status').expect(200);
+    await get('/api/marketplace/catalog').expect(200);
+    expect(schedulesEnabled()).toEqual([0, 1]);
+    await post('/api/market/providers/whm-hub/disable').expect(200);
+    await get('/api/marketplace/status').expect(200);
+    expect(schedulesEnabled()).toEqual([0, 1]);
+    expect((await get('/api/marketplace/catalog')).status).toBe(422);
+    expect(schedulesEnabled()).toEqual([0, 0]);
+    expect(app.ctx.settings.get(SCHEDULES_SETTING)).toBe(false);
+    await post('/api/market/providers/whm-hub/enable').expect(200);
+    await get('/api/marketplace/status').expect(200);
+    expect(schedulesEnabled()).toEqual([0, 0]);
+    await get('/api/marketplace/catalog').expect(200);
+    expect(schedulesEnabled()).toEqual([1, 1]);
+    const cron = app.ctx.scheduler.list().find((s) => s.name === REVOCATIONS_SCHEDULE).cron;
+    app.ctx.marketplace.boot();
+    expect(app.ctx.scheduler.list().find((s) => s.name === REVOCATIONS_SCHEDULE).cron).toBe(cron);
+    expect(schedulesEnabled()).toEqual([1, 1]);
   });
 });
 
@@ -430,6 +458,50 @@ describe('install flow', () => {
     expect((await del('/api/marketplace/net.whm.sample-notes')).status).toBe(404);
   });
 
+  it('forgets a marketplace install removed through the host route and treats the next install as a first install', async () => {
+    expect(installRow('net.example.minimal')).toBeTruthy();
+    await del('/api/plugins/manage/net.example.minimal?purge=true').expect(200);
+    expect(pluginRow('net.example.minimal')).toBeUndefined();
+    expect(installRow('net.example.minimal')).toBeUndefined();
+    expect((await get('/api/marketplace/installs').expect(200)).body.data.map((r) => r.pluginId)).not.toContain('net.example.minimal');
+    expect((await get('/api/marketplace/catalog?q=minimal').expect(200)).body.data[0].installed).toBeNull();
+    // A stale row with no plugin behind it never turns a fresh install into a held, disabled update.
+    app.ctx.db.prepare("INSERT INTO marketplace_installs (plugin_id, version, channel, consented_permissions_json, consent_state, was_enabled) VALUES ('net.example.minimal', '0.0.1', 'stable', '[]', 'consented', 0)").run();
+    const job = await runJob(await post('/api/marketplace/install', { pluginId: 'net.example.minimal', version: '1.0.0' }));
+    expect(job.status, job.error).toBe('done');
+    expect(job.result).toMatchObject({ status: 'installed', version: '1.0.0', enabled: true });
+    expect(pluginRow('net.example.minimal')).toMatchObject({ state: 'enabled', source: 'marketplace' });
+    expect(installRow('net.example.minimal')).toMatchObject({ version: '1.0.0', consent_state: 'consented', consented_by: 'root' });
+    expect(JSON.parse(audits('plugin.marketplace.install').at(-1).args_redacted)).toMatchObject({ previousVersion: null, enabled: true });
+  });
+
+  it('fails a package that declares another plugin id without removing a plugin it did not create, and re-checks the install source inside the job', async () => {
+    app.ctx.settings.set('plugins.developer_mode', true);
+    expect((await installRaw(unsignedPackage(fixtures.minimalManifest({ id: 'net.example.victim', version: '1.0.0' })))).status).toBe(201);
+    app.ctx.settings.set('plugins.developer_mode', false);
+    await post('/api/plugins/manage/net.example.victim/enable').expect(200);
+    expect(pluginRow('net.example.victim')).toMatchObject({ version: '1.0.0', state: 'enabled', source: 'upload' });
+    hub.publish('net.example.alias', { version: '1.0.1', buffer: signedPackage(fixtures.minimalManifest({ id: 'net.example.victim', version: '1.0.1' })) });
+    const kept = await runJob(await post('/api/marketplace/install', { pluginId: 'net.example.alias' }));
+    expect(kept.status).toBe('failed');
+    expect(kept.error_code).toBe('plugin_id_mismatch');
+    expect(pluginRow('net.example.victim')).toMatchObject({ version: '1.0.1', state: 'disabled' });
+    expect(installRow('net.example.alias')).toBeUndefined();
+    expect(JSON.parse(audits('plugin.marketplace.id_mismatch').at(-1).args_redacted)).toMatchObject({ declared: 'net.example.victim', previousVersion: '1.0.0', removed: false });
+    hub.publish('net.example.alias2', { version: '1.0.0', buffer: signedPackage(fixtures.minimalManifest({ id: 'net.example.ghost', version: '1.0.0' })) });
+    const removed = await runJob(await post('/api/marketplace/install', { pluginId: 'net.example.alias2' }));
+    expect(removed.error_code).toBe('plugin_id_mismatch');
+    expect(pluginRow('net.example.ghost')).toBeUndefined();
+    expect(JSON.parse(audits('plugin.marketplace.id_mismatch').at(-1).args_redacted)).toMatchObject({ declared: 'net.example.ghost', previousVersion: null, removed: true });
+    await del('/api/plugins/manage/net.example.victim?purge=true').expect(200);
+    // A job queued for a sideloaded id (the plugin appeared between enqueue and run) is refused by the job itself.
+    const sideloaded = app.ctx.jobs.enqueue(INSTALL_JOB, { pluginId: 'net.example.sideload', username: 'root' });
+    const refused = await waitForJob(app.ctx, sideloaded.id, 15_000);
+    expect(refused.status).toBe('failed');
+    expect(refused.error_code).toBe('not_marketplace');
+    expect(hub.calls.filter((c) => c.url === `${HUB}/v1/market/download` && c.body.plugin_id === 'net.example.sideload')).toEqual([]);
+  });
+
   it('posts reviews through the signed route and lets resellers browse but not manage', async () => {
     const review = await post('/api/marketplace/plugins/net.example.minimal/reviews', { rating: 5, title: 'Great', body: 'Small and sharp.' });
     expect(review.status).toBe(201);
@@ -441,9 +513,18 @@ describe('install flow', () => {
     const login = await other.post('/api/auth/login').send({ username: reseller.username, password: reseller.password });
     expect(login.status).toBe(200);
     const rcsrf = login.body.data.csrfToken;
-    expect((await other.get('/api/marketplace/status')).status).toBe(200);
-    expect((await other.get('/api/marketplace/catalog')).status).toBe(200);
-    expect((await other.get('/api/marketplace/plugins/net.example.minimal')).status).toBe(200);
+    const rstatus = await other.get('/api/marketplace/status');
+    expect(rstatus.status).toBe(200);
+    expect(Object.keys(rstatus.body.data).sort()).toEqual(['enabled', 'hostVersion', 'hubMismatch', 'hubUrl', 'licenseDegraded', 'licenseStatus', 'url']);
+    expect(rstatus.body.data).toMatchObject({ enabled: true, hubMismatch: false, hubUrl: HUB, licenseStatus: 'active' });
+    const rcat = await other.get('/api/marketplace/catalog?q=minimal');
+    expect(rcat.status).toBe(200);
+    expect(rcat.body.data[0].installed).toEqual({ state: 'enabled' });
+    const rdetail = await other.get('/api/marketplace/plugins/net.example.minimal');
+    expect(rdetail.status).toBe(200);
+    expect(rdetail.body.data.installed).toEqual({ state: 'enabled' });
+    expect((await get('/api/marketplace/plugins/net.example.minimal').expect(200)).body.data.installed).toMatchObject({ version: '1.0.0', marketplace: true, consentState: 'consented' });
+    expect((await other.get('/api/marketplace/plugins/net.example.nothere')).status).toBe(404);
     expect((await other.get('/api/marketplace/installs')).status).toBe(403);
     expect((await other.post('/api/marketplace/install').set('X-CSRF-Token', rcsrf).send({ pluginId: 'net.example.minimal' })).status).toBe(403);
     expect((await other.post('/api/marketplace/consent/net.example.minimal').set('X-CSRF-Token', rcsrf).send({ permissions: [] })).status).toBe(403);
@@ -453,6 +534,7 @@ describe('install flow', () => {
 
 describe('revocations', () => {
   const feed = readFixture('revocations.json').data;
+  const HEAD = Math.max(...feed.map((r) => r.ts));
 
   it('refuses a stale, replayed or stripped feed and audits it', async () => {
     hub.revocations = feed;
@@ -473,7 +555,7 @@ describe('revocations', () => {
     hub.tamper = null;
   });
 
-  it('applies the feed: disables the marketplace install, a same-id path install signed by a hub kid and, for critical rows, an unsigned sideload', async () => {
+  it('applies the feed: disables a same-id path install signed by a hub kid, only disables an unsigned sideload on a critical uninstall row, and uninstalls the hub-signed marketplace install', async () => {
     await del('/api/marketplace/net.example.minimal?purge=true').expect(200);
     const sideload = await installRaw(unsignedPackage(fixtures.minimalManifest({ id: 'net.example.minimal', version: '1.0.0' })));
     expect(sideload.status, JSON.stringify(sideload.body)).toBe(422);
@@ -496,28 +578,35 @@ describe('revocations', () => {
 
     const t0 = hub.now();
     const before = notified.length;
+    expect(pluginRow('net.example.paid')).toMatchObject({ source: 'marketplace', signer: PLUGIN_KID_A, version: '2.1.0', state: 'enabled' });
     const res = await post('/api/marketplace/revocations/poll');
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body.data.received).toBe(2);
-    expect(res.body.data.applied.map((a) => [a.id, a.action, a.appliedTo.map((t) => `${t.id}:${t.source}`)])).toEqual([
-      ['rvk_01SCOPED', 'disable', ['net.example.scoped:path']],
-      ['rvk_02MINIMAL', 'uninstall', ['net.example.minimal:upload']],
+    expect(res.body.data.received).toBe(3);
+    expect(res.body.data.applied.map((a) => [a.id, a.action, a.appliedTo.map((t) => `${t.id}:${t.source}:${t.action}`)])).toEqual([
+      ['rvk_01SCOPED', 'disable', ['net.example.scoped:path:disable']],
+      ['rvk_02MINIMAL', 'uninstall', ['net.example.minimal:upload:disable']],
+      ['rvk_03PAID', 'uninstall', ['net.example.paid:marketplace:uninstall']],
     ]);
     expect(pluginRow('net.example.scoped').state).toBe('disabled');
-    expect(pluginRow('net.example.minimal')).toBeUndefined();
+    // The operator's unsigned sideload is disabled, never removed on the hub's say-so.
+    expect(pluginRow('net.example.minimal')).toMatchObject({ source: 'upload', state: 'disabled', version: '1.0.0' });
+    expect(app.ctx.plugins.isLive('net.example.minimal')).toBe(false);
+    expect(pluginRow('net.example.paid')).toBeUndefined();
+    expect(installRow('net.example.paid')).toBeUndefined();
     expect(app.ctx.plugins.isLive('net.example.scoped')).toBe(false);
-    const state = app.ctx.db.prepare('SELECT * FROM marketplace_state').get();
-    expect(state).toMatchObject({ last_revocation_ts: feed[1].ts, revocations_head_ts: feed[1].ts, fail_count: 0 });
+    const state = stateRow();
+    expect(state).toMatchObject({ last_revocation_ts: HEAD, revocations_head_ts: HEAD, fail_count: 0 });
     expect(state.last_revocation_now).toBeGreaterThanOrEqual(Math.floor(t0 / 1000) - 1);
-    expect(audits('plugin.revoked').map((a) => a.target)).toEqual(['net.example.scoped', 'net.example.minimal']);
-    expect(notified.slice(before).filter((n) => n.event === 'plugin.revoked')).toHaveLength(2);
+    expect(audits('plugin.revoked').map((a) => a.target)).toEqual(['net.example.scoped', 'net.example.minimal', 'net.example.paid']);
+    expect(JSON.parse(audits('plugin.revoked')[1].args_redacted).appliedTo[0]).toMatchObject({ id: 'net.example.minimal', action: 'disable', hubSigned: false });
+    expect(notified.slice(before).filter((n) => n.event === 'plugin.revoked')).toHaveLength(3);
     const banner = (await get('/api/marketplace/revocations?unacknowledged=true').expect(200)).body.data;
-    expect(banner.map((r) => r.id)).toEqual(['rvk_02MINIMAL', 'rvk_01SCOPED']);
-    expect(banner[1]).toMatchObject({ pluginId: 'net.example.scoped', severity: 'warning', action: 'disable', reason: 'leaks the account list to a third party', acknowledgedAt: null });
-    expect((await get('/api/marketplace/status').expect(200)).body.data).toMatchObject({ unacknowledgedRevocations: 2, lastRevocationTs: feed[1].ts });
+    expect(banner.map((r) => r.id)).toEqual(['rvk_03PAID', 'rvk_02MINIMAL', 'rvk_01SCOPED']);
+    expect(banner[2]).toMatchObject({ pluginId: 'net.example.scoped', severity: 'warning', action: 'disable', reason: 'leaks the account list to a third party', acknowledgedAt: null });
+    expect((await get('/api/marketplace/status').expect(200)).body.data).toMatchObject({ unacknowledgedRevocations: 3, lastRevocationTs: HEAD });
     // The same feed again is a no-op (rows are keyed by id; since = last ts).
     expect((await post('/api/marketplace/revocations/poll').expect(200)).body.data).toMatchObject({ received: 0, applied: [] });
-    expect(hub.calls.at(-1).body.since).toBe(feed[1].ts);
+    expect(hub.calls.at(-1).body.since).toBe(HEAD);
     // A replay of an older `now` is refused once a newer feed was accepted.
     hub.feedNow = state.last_revocation_now - 10;
     expect((await post('/api/marketplace/revocations/poll')).body.error.code).toBe('hub_feed_stale');
@@ -540,27 +629,59 @@ describe('revocations', () => {
     expect(ack.body.data).toMatchObject({ id: 'rvk_01SCOPED', acknowledgedBy: 'root' });
     expect(audits('marketplace.revocation.ack')).toHaveLength(1);
     expect((await post('/api/plugins/manage/net.example.scoped/enable')).status).toBe(200);
-    expect((await get('/api/marketplace/revocations?unacknowledged=true').expect(200)).body.data.map((r) => r.id)).toEqual(['rvk_02MINIMAL']);
+    expect((await get('/api/marketplace/revocations?unacknowledged=true').expect(200)).body.data.map((r) => r.id)).toEqual(['rvk_03PAID', 'rvk_02MINIMAL']);
     expect((await post('/api/marketplace/revocations/nope/ack')).status).toBe(404);
-    expect((await get('/api/marketplace/revocations').expect(200)).body.data).toHaveLength(2);
+    expect((await get('/api/marketplace/revocations').expect(200)).body.data).toHaveLength(3);
   });
 
   it('queues a poll on the check-in message plugin_revocations_pending and when the signed head advances', async () => {
     const countJobs = () => app.ctx.jobs.list({ type: REVOCATIONS_JOB, limit: 100 }).length;
     const n0 = countJobs();
-    hub.messages = [{ level: 'critical', code: 'plugin_revocations_pending', text: 'pull the feed', data: { plugin_id: 'net.example.scoped', head_ts: feed[1].ts } }];
+    hub.messages = [{ level: 'critical', code: 'plugin_revocations_pending', text: 'pull the feed', data: { plugin_id: 'net.example.scoped', head_ts: HEAD } }];
     await post('/api/license/checkin').expect(200);
     expect(countJobs()).toBe(n0 + 1);
     hub.messages = [];
-    hub.revocationsHeadTs = feed[1].ts + 5;
+    hub.revocationsHeadTs = HEAD + 5;
+    hub.feedHeadTs = HEAD + 5;
     await post('/api/license/checkin').expect(200);
     expect(countJobs()).toBe(n0 + 2);
-    hub.revocationsHeadTs = feed[1].ts;
+    // The signed head is pinned as the feed floor as soon as the check-in lands.
+    expect(stateRow().revocations_head_ts).toBe(HEAD + 5);
+    hub.revocationsHeadTs = HEAD;
     await post('/api/license/checkin').expect(200);
     expect(countJobs()).toBe(n0 + 2);
+    expect(stateRow().revocations_head_ts).toBe(HEAD + 5);
     const last = app.ctx.jobs.list({ type: REVOCATIONS_JOB, limit: 1 })[0];
     const done = await waitForJob(app.ctx, last.id, 15_000);
     expect(done.status, done.error).toBe('done');
+    expect(done.result).toMatchObject({ headTs: HEAD + 5 });
+  });
+
+  it('refuses a feed whose head is behind the head the hub signed at check-in (stripped feed)', async () => {
+    const before = audits('marketplace.feed_stale').length;
+    hub.revocationsHeadTs = HEAD + 10;
+    hub.feedHeadTs = HEAD;
+    await post('/api/license/checkin').expect(200);
+    expect(app.ctx.license.get().revocationsHeadTs).toBe(HEAD + 10);
+    expect(stateRow().revocations_head_ts).toBe(HEAD + 10);
+    const queued = app.ctx.jobs.list({ type: REVOCATIONS_JOB, limit: 1 })[0];
+    const job = await waitForJob(app.ctx, queued.id, 15_000);
+    expect(job.status).toBe('failed');
+    expect(job.error_code).toBe('hub_feed_stale');
+    const manual = await post('/api/marketplace/revocations/poll');
+    expect(manual.status).toBe(502);
+    expect(manual.body.error.code).toBe('hub_feed_stale');
+    expect(manual.body.error.message).toMatch(/stripped feed/);
+    expect(audits('marketplace.feed_stale')).toHaveLength(before + 2);
+    expect(JSON.parse(audits('marketplace.feed_stale').at(-1).args_redacted)).toMatchObject({ headTs: HEAD, storedHeadTs: HEAD + 10 });
+    expect(stateRow().fail_count).toBe(2);
+    // The floor is also taken straight from the license cache (the boot path), not only from the stored row.
+    app.ctx.db.prepare('UPDATE marketplace_state SET revocations_head_ts = 0').run();
+    expect((await post('/api/marketplace/revocations/poll')).body.error.code).toBe('hub_feed_stale');
+    expect(stateRow()).toMatchObject({ revocations_head_ts: HEAD + 10, fail_count: 3 });
+    hub.feedHeadTs = HEAD + 10;
+    expect((await post('/api/marketplace/revocations/poll').expect(200)).body.data).toMatchObject({ received: 0, applied: [], headTs: HEAD + 10 });
+    expect(stateRow()).toMatchObject({ revocations_head_ts: HEAD + 10, fail_count: 0 });
   });
 });
 
@@ -578,6 +699,8 @@ describe('degraded license and install sources', () => {
     expect((await post('/api/marketplace/revocations/poll')).status).toBe(423);
     expect(await app.ctx.marketplace.pollRevocations()).toMatchObject({ skipped: 'no_token' });
     await post('/api/license/key', { key: 'WHM-7K3Q-M2DF-9XA1-P0R6' }).expect(200);
+    expect((await post('/api/marketplace/install', { pluginId: 'net.example.minimal' })).body.error.code).toBe('not_marketplace');
+    await del('/api/plugins/manage/net.example.minimal?purge=true').expect(200);
     expect((await post('/api/marketplace/install', { pluginId: 'net.example.minimal' })).status).toBe(202);
   });
 

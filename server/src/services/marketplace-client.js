@@ -19,6 +19,7 @@ export const UPDATE_CHECK_JOB = 'marketplace.update-check';
 export const REVOCATIONS_SCHEDULE = 'marketplace-revocations';
 export const UPDATE_CHECK_SCHEDULE = 'marketplace-update-check';
 export const FEED_SKEW_S = 300;
+export const SCHEDULES_SETTING = 'marketplace.schedules_follow_hub';
 export const DOWNLOAD_TIMEOUT_MS = 60_000;
 const ID_RE = /^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*){2,}$/;
 const VERSION_RE = /^[0-9A-Za-z.+-]{1,64}$/;
@@ -80,23 +81,27 @@ export function createMarketplaceClient(ctx) {
   const hubUrl = () => { try { return license().hubUrl(); } catch { return null; } };
   const developerMode = () => ctx.settings.get('plugins.developer_mode', false) === true;
 
-  function status() {
+  // A pure read. `full: false` (resellers) is the browse view only: no pinned
+  // keys, feed health or plugin inventory.
+  function status({ full = true } = {}) {
     const row = hubRow();
     const url = hubUrl();
     const lic = ctx.license ? ctx.license.get() : null;
     const hubMismatch = Boolean(row.enabled) && (!url || !row.url || originOf(row.url) !== originOf(url));
+    const base = { enabled: Boolean(row.enabled), url: row.url || null, hubUrl: url, hubMismatch, licenseStatus: lic?.status ?? null, licenseDegraded: lic ? lic.enforce && lic.degraded : false, hostVersion: HOST_API_VERSION };
+    if (!full) return base;
     const st = state();
-    syncSchedules(Boolean(row.enabled) && !hubMismatch);
     return {
-      enabled: Boolean(row.enabled), url: row.url || null, hubUrl: url, hubMismatch, licenseStatus: lic?.status ?? null, licenseDegraded: lic ? lic.enforce && lic.degraded : false,
+      ...base,
       hasToken: Boolean(lic && ctx.license.token()), hubKids: lic?.pluginSigningKids ?? [], conflictKids: lic?.conflictKids ?? [],
       lastRevocationTs: st.last_revocation_ts, revocationsHeadTs: st.revocations_head_ts, lastRevocationNow: st.last_revocation_now, lastUpdateCheckAt: st.last_update_check_at,
-      pendingUpdates: pendingUpdates(), unacknowledgedRevocations: stmts.unacked.all().length, developerMode: developerMode(), hostVersion: HOST_API_VERSION, feedFailCount: st.fail_count,
+      pendingUpdates: pendingUpdates(), unacknowledgedRevocations: stmts.unacked.all().length, developerMode: developerMode(), feedFailCount: st.fail_count,
     };
   }
 
   // Every marketplace action needs the hub row on and pointing at the license hub.
   function requireHub() {
+    syncSchedules();
     const s = status();
     if (!s.enabled) throw new HttpError(422, 'marketplace_disabled', 'The WHM marketplace hub is disabled: enable the whm-hub provider in Market Provider Manager');
     if (s.hubMismatch) throw new HttpError(409, 'hub_mismatch', `The whm-hub provider points at ${s.url || 'no URL'} but this panel's license was issued by ${s.hubUrl || 'no hub'}; the two must share an origin`);
@@ -144,17 +149,22 @@ export function createMarketplaceClient(ctx) {
     if (!row && !install) return null;
     return { version: row?.version ?? install?.version ?? null, state: row?.state ?? 'missing', source: row?.source ?? 'marketplace', consentState: install?.consent_state ?? null, marketplace: Boolean(install), update: pendingUpdates().find((u) => u.id === id) ?? null };
   }
-  const annotate = (entry) => (entry && typeof entry === 'object' ? { ...entry, installed: localState(entry.id) } : entry);
+  // Resellers see whether a plugin is on this panel, not root's inventory.
+  function annotate(entry, { full = true } = {}) {
+    if (!entry || typeof entry !== 'object') return entry;
+    const local = localState(entry.id);
+    return { ...entry, installed: full || !local ? local : { state: local.state } };
+  }
 
-  async function catalog(query = {}) {
+  async function catalog(query = {}, { full = true } = {}) {
     const res = await publicGet('/v1/market/catalog', { q: query.q, category: query.category, channel: query.channel, page: query.page, pageSize: query.pageSize, sort: query.sort, dir: query.dir, featured: query.featured });
     saveState({ last_catalog_sync_at: nowIso() });
-    return { data: Array.isArray(res.data) ? res.data.map(annotate) : [], meta: res.meta ?? { page: 1, pageSize: 24, total: 0 } };
+    return { data: Array.isArray(res.data) ? res.data.map((e) => annotate(e, { full })) : [], meta: res.meta ?? { page: 1, pageSize: 24, total: 0 } };
   }
   const categories = async () => (await publicGet('/v1/market/categories')).data;
-  async function plugin(id) {
+  async function plugin(id, { full = true } = {}) {
     const res = await publicGet(`/v1/market/plugins/${encodeURIComponent(id)}`, { host: HOST_API_VERSION });
-    return annotate(res.data);
+    return annotate(res.data, { full });
   }
   const versions = async (id) => (await publicGet(`/v1/market/plugins/${encodeURIComponent(id)}/versions`)).data;
 
@@ -219,6 +229,7 @@ export function createMarketplaceClient(ctx) {
     const req = jobRequest(p);
     requireHub();
     requireLicensed();
+    assertMarketplaceSource(pluginId);
     const previous = stmts.install.get(pluginId);
     const channel = CHANNELS.has(p.channel) ? p.channel : previous?.channel || 'stable';
     jobCtx.progress(5, 'requesting the download descriptor');
@@ -242,13 +253,21 @@ export function createMarketplaceClient(ctx) {
       const installed = await ctx.plugins.install({ buffer, source: 'marketplace' }, { user: req.user, req, policy: { requireSigned: true, signers: hubKids, activate: false } });
       const id = installed.plugin.id;
       if (id !== pluginId) {
-        await ctx.plugins.uninstall(id, { purge: false, req });
-        throw new HttpError(422, 'plugin_id_mismatch', `The package declares plugin id ${id}, not ${pluginId}`);
+        // The host has already written the package under its own id. A plugin
+        // this job created is removed; one that existed before is only left
+        // disabled (activate: false), never removed on the hub's say-so.
+        const created = installed.previousVersion === null;
+        if (created) await ctx.plugins.uninstall(id, { purge: false, req });
+        audit(req, { action: 'plugin.marketplace.id_mismatch', target: pluginId, args: { declared: id, version: installed.plugin.version, previousVersion: installed.previousVersion, kid: installed.plugin.signer, removed: created }, result: 'error:plugin_id_mismatch' });
+        throw new HttpError(422, 'plugin_id_mismatch', `The package declares plugin id ${id}, not ${pluginId}${created ? '' : `; ${id} was left disabled`}`);
       }
       const required = requiredScopes(id);
-      const consented = scopes(previous ? json.parse(previous.consented_permissions_json, []) : []);
+      // An update is a host upgrade of a plugin this client installed; a stale
+      // row without a plugin behind it (removed through the host) is a first install.
+      const isUpdate = Boolean(previous) && installed.previousVersion !== null;
+      const consented = scopes(isUpdate ? json.parse(previous.consented_permissions_json, []) : []);
       const granted = Array.isArray(p.consent?.permissions) ? scopes(p.consent.permissions) : consented;
-      const firstInstall = !previous;
+      const firstInstall = !isUpdate;
       const shouldEnable = firstInstall || installed.wasEnabled === true || previous.was_enabled === 1;
       const base = { plugin_id: id, version: installed.plugin.version, channel, package_sha256: descriptor.sha256, hub_kid: installed.plugin.signer };
       if (covers(granted, required)) {
@@ -262,7 +281,7 @@ export function createMarketplaceClient(ctx) {
         jobCtx.progress(100, 'installed');
         return { status: 'installed', pluginId: id, version: installed.plugin.version, enabled: shouldEnable };
       }
-      stmts.upsertInstall.run({ ...base, consented_permissions_json: JSON.stringify(consented), consented_by: previous?.consented_by ?? null, consented_at: previous?.consented_at ?? null, consent_state: 'pending', was_enabled: shouldEnable ? 1 : 0 });
+      stmts.upsertInstall.run({ ...base, consented_permissions_json: JSON.stringify(consented), consented_by: isUpdate ? previous.consented_by : null, consented_at: isUpdate ? previous.consented_at : null, consent_state: 'pending', was_enabled: shouldEnable ? 1 : 0 });
       const added = required.filter((s) => !consented.includes(s));
       audit(req, { action: 'plugin.marketplace.install', target: id, args: { version: installed.plugin.version, previousVersion: installed.previousVersion, kid: installed.plugin.signer, sha256: descriptor.sha256, consent: 'pending', added } });
       dropPendingUpdate(id);
@@ -271,6 +290,13 @@ export function createMarketplaceClient(ctx) {
     } finally {
       try { fs.rmSync(cacheFile, { force: true }); } catch { /* already gone */ }
     }
+  }
+
+  // Checked when the request is queued and again inside the job: a bundled or
+  // sideloaded plugin is never replaced by a hub package.
+  function assertMarketplaceSource(pluginId) {
+    const local = stmts.plugin.get(pluginId);
+    if (local && local.source !== 'marketplace') throw new HttpError(409, 'not_marketplace', `${pluginId} is installed from ${local.source === 'bundled' ? 'the bundled plugins' : 'a sideloaded package'}; uninstall it before installing the marketplace version`);
   }
 
   function dropPendingUpdate(id) {
@@ -286,8 +312,7 @@ export function createMarketplaceClient(ctx) {
     requireHub();
     requireLicensed();
     if (!ID_RE.test(pluginId || '')) throw new HttpError(422, 'validation_failed', 'Malformed plugin id', { pluginId: ['Reverse-DNS plugin id with at least three segments'] });
-    const local = stmts.plugin.get(pluginId);
-    if (local && local.source !== 'marketplace') throw new HttpError(409, 'not_marketplace', `${pluginId} is installed from ${local.source === 'bundled' ? 'the bundled plugins' : 'a sideloaded package'}; uninstall it before installing the marketplace version`);
+    assertMarketplaceSource(pluginId);
     let detail = null;
     try { detail = await plugin(pluginId); } catch (err) { if (err.status === 404) throw err; log.warn({ err: err.message, pluginId }, 'catalog lookup failed before install; the hub decides at download time'); }
     if (detail) requirePaidFeature(detail.pricing);
@@ -365,15 +390,30 @@ export function createMarketplaceClient(ctx) {
     const row = stmts.plugin.get(rev.plugin_id);
     if (!row) return [];
     if (rev.version && row.version !== rev.version) return [];
-    const trusted = row.signer && hubKids.includes(row.signer);
-    if (trusted || rev.severity === 'critical') return [{ id: row.id, version: row.version, source: row.source, signer: row.signer, state: row.state, signed: Boolean(row.signed) }];
+    const hubSigned = Boolean(row.signer && hubKids.includes(row.signer));
+    if (hubSigned || rev.severity === 'critical') return [{ id: row.id, version: row.version, source: row.source, signer: row.signer, state: row.state, signed: Boolean(row.signed), hubSigned }];
     return [];
+  }
+
+  // The floor for a feed's head: the highest head the hub ever signed at
+  // activation/check-in or answered in an accepted feed, so a feed stripped of
+  // rows is refused once the next check-in names a newer head.
+  function signedHeadTs() {
+    const v = ctx.license?.get?.().revocationsHeadTs;
+    return Number.isInteger(v) ? v : 0;
+  }
+  function raiseHeadFloor(value) {
+    if (!Number.isInteger(value)) return state().revocations_head_ts;
+    const stored = state().revocations_head_ts;
+    if (value > stored) saveState({ revocations_head_ts: value });
+    return Math.max(stored, value);
   }
 
   async function pollRevocations({ req = null, reason = 'scheduled' } = {}) {
     const s = status();
     if (!s.enabled || s.hubMismatch) return { skipped: s.enabled ? 'hub_mismatch' : 'disabled', applied: [] };
     if (!license().token()) return { skipped: 'no_token', applied: [] };
+    raiseHeadFloor(signedHeadTs());
     const st = state();
     const res = await license().hub.request('/v1/market/revocations', { token: license().token(), since: st.last_revocation_ts });
     const now = Math.floor((license().clock?.now?.() ?? Date.now()) / 1000);
@@ -397,13 +437,16 @@ export function createMarketplaceClient(ctx) {
       const matches = matchesLocally(rev, hubKids);
       const appliedTo = [];
       for (const m of matches) {
+        // Only a hub-signed match follows `uninstall`; a same-id plugin the
+        // operator sideloaded is disabled on a critical row, never removed.
+        const action = rev.action === 'uninstall' && m.hubSigned ? 'uninstall' : 'disable';
         try {
-          if (rev.action === 'uninstall') await ctx.plugins.uninstall(m.id, { purge: false, req });
+          if (action === 'uninstall') await ctx.plugins.uninstall(m.id, { purge: false, req });
           else await ctx.plugins.disable(m.id, { req });
-          appliedTo.push({ ...m, action: rev.action });
+          appliedTo.push({ ...m, action });
         } catch (err) {
           log.error({ err, plugin: m.id }, 'revocation could not be applied');
-          appliedTo.push({ ...m, action: rev.action, error: err.message });
+          appliedTo.push({ ...m, action, error: err.message });
         }
       }
       const version = typeof rev.version === 'string' && VERSION_RE.test(rev.version) ? rev.version : null;
@@ -455,26 +498,36 @@ export function createMarketplaceClient(ctx) {
 
   ctx.jobs.register(INSTALL_JOB, runInstall);
   ctx.jobs.register(UPDATE_JOB, runInstall);
-  ctx.jobs.register(REVOCATIONS_JOB, async (jobCtx) => pollRevocations({ reason: jobCtx.params?.reason || 'scheduled' }));
+  ctx.jobs.register(REVOCATIONS_JOB, async (jobCtx) => { syncSchedules(); return pollRevocations({ reason: jobCtx.params?.reason || 'scheduled' }); });
   ctx.jobs.register(UPDATE_CHECK_JOB, async () => {
+    syncSchedules();
     const s = status();
     if (!s.enabled || s.hubMismatch || !s.hasToken) return { skipped: true };
     return { updates: await checkUpdates() };
   });
 
-  let scheduled = null;
   // Schedules exist once and are switched with the hub row, so the scheduler
-  // never enqueues a job the handler would skip.
-  function syncSchedules(enabled) {
-    if (scheduled === enabled) return;
+  // never enqueues a job the handler would skip. The state last applied is
+  // persisted: between two hub-row changes an operator's own toggle of a
+  // schedule is left alone. Runs at boot, from onHubChanged() (Market service)
+  // and before every hub action as a fallback.
+  function syncSchedules() {
     try {
-      ctx.scheduler.ensure(REVOCATIONS_SCHEDULE, `${crypto.randomInt(0, 60)} */6 * * *`, REVOCATIONS_JOB, { reason: 'scheduled' });
-      ctx.scheduler.ensure(UPDATE_CHECK_SCHEDULE, `${crypto.randomInt(0, 60)} 4 * * *`, UPDATE_CHECK_JOB);
-      ctx.scheduler.update(REVOCATIONS_SCHEDULE, { enabled });
-      ctx.scheduler.update(UPDATE_CHECK_SCHEDULE, { enabled });
-      scheduled = enabled;
+      const names = new Set([REVOCATIONS_SCHEDULE, UPDATE_CHECK_SCHEDULE]);
+      const existing = ctx.scheduler.list().filter((row) => names.has(row.name)).map((row) => row.name);
+      if (!existing.includes(REVOCATIONS_SCHEDULE)) ctx.scheduler.ensure(REVOCATIONS_SCHEDULE, `${crypto.randomInt(0, 60)} */6 * * *`, REVOCATIONS_JOB, { reason: 'scheduled' });
+      if (!existing.includes(UPDATE_CHECK_SCHEDULE)) ctx.scheduler.ensure(UPDATE_CHECK_SCHEDULE, `${crypto.randomInt(0, 60)} 4 * * *`, UPDATE_CHECK_JOB);
+      const s = status({ full: false });
+      const desired = s.enabled && !s.hubMismatch;
+      const applied = ctx.settings.get(SCHEDULES_SETTING, null);
+      if (applied === desired && existing.length === 2) return;
+      ctx.scheduler.update(REVOCATIONS_SCHEDULE, { enabled: desired });
+      ctx.scheduler.update(UPDATE_CHECK_SCHEDULE, { enabled: desired });
+      ctx.settings.set(SCHEDULES_SETTING, desired);
     } catch (err) { log.warn({ err }, 'marketplace schedules could not be synchronised'); }
   }
+  // For the Market service: call after the whm-hub row is enabled, disabled or re-pointed.
+  const onHubChanged = () => syncSchedules();
 
   function enqueueRevocationPoll(reason) {
     try {
@@ -488,14 +541,36 @@ export function createMarketplaceClient(ctx) {
     ctx.license.on('message', (msg) => {
       if (!msg || typeof msg !== 'object') return;
       if (msg.code === 'plugin_revocations_pending') enqueueRevocationPoll('checkin_message');
-      else if (msg.code === 'revocations_head_ts' && Number.isInteger(msg.value) && msg.value > state().revocations_head_ts) enqueueRevocationPoll('head_advanced');
+      else if (msg.code === 'revocations_head_ts' && Number.isInteger(msg.value)) {
+        const advanced = msg.value > state().revocations_head_ts;
+        raiseHeadFloor(msg.value);
+        if (advanced) enqueueRevocationPoll('head_advanced');
+      }
     });
   }
   if (ctx.plugins?.guards?.enable) ctx.plugins.guards.enable.push(enableGuard);
+  // A marketplace plugin removed through the host (Manage Plugins, a revocation)
+  // leaves no install row behind: the hub stops hearing about it and the next
+  // install is a first install again.
+  if (typeof ctx.events?.on === 'function') {
+    ctx.events.on('plugin.uninstalled', (envelope) => {
+      const id = envelope?.payload?.pluginId;
+      if (typeof id !== 'string' || !stmts.install.get(id)) return;
+      stmts.removeInstall.run(id);
+      dropPendingUpdate(id);
+      log.info({ plugin: id }, 'marketplace install row dropped after a host uninstall');
+    });
+  }
+  // Called by core once the license cache is loaded and the Market category
+  // (the hub row) exists: pins the signed feed head and switches the schedules.
+  function boot() {
+    raiseHeadFloor(signedHeadTs());
+    syncSchedules();
+  }
 
   return {
-    INSTALL_JOB, UPDATE_JOB, REVOCATIONS_JOB, UPDATE_CHECK_JOB, cacheDir,
-    status, requireHub, catalog, categories, plugin, versions, updates, checkUpdates,
+    INSTALL_JOB, UPDATE_JOB, REVOCATIONS_JOB, UPDATE_CHECK_JOB, cacheDir, boot,
+    status, requireHub, onHubChanged, catalog, categories, plugin, versions, updates, checkUpdates,
     install, update, consent, uninstall, installs,
     pollRevocations, revocations, acknowledgeRevocation, enableGuard, review,
   };

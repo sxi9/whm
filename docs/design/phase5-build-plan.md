@@ -151,6 +151,12 @@ hub/ui/src/pages/admin/ {Dashboard,Licenses,LicenseDetail,Customers,Resellers,Pr
 hub/ui/src/pages/reseller/ {Dashboard,Licenses,Customers,Activations,ApiKeys,Statement}.jsx
 hub/ui/src/pages/dev/   {Register,VerifyEmail,Profile,Security,Verification,Keys,Plugins,PluginEdit,Versions,VersionDetail,Upload,Stats,Payouts,ApiKeys,Webhooks}.jsx
 hub/ui/test/            vitest + @testing-library: render each page against a mocked api client; the two queues' approve/reject flows; step-up prompt
+                        DEVIATION (fix round 1, 2026-10-27): neither @testing-library/react nor jsdom is installable in this checkout
+                        (no npm install), so pages render through react-dom/server against mocked hooks and the approve/reject and
+                        step-up flows are covered as the pure functions the pages call (queues.js, createApiClient step-up retry).
+                        Integrator: add @testing-library/react + jsdom to hub/ui devDependencies and one interaction test per queue.
+hub/ui/src/pages/admin/Security.jsx   portal account security (TOTP enrol/confirm/disable via /v1/portal/2fa/*, password via /v1/portal/password),
+                        mounted at /admin/security and /reseller/security (fix round 1)
 ```
 **Edit**: `hub/src/app.js` — serve `hub/ui/dist` at `/` (SPA fallback) when `config.serve_ui`.
 
@@ -352,6 +358,8 @@ fixtures under the vendor developer `net.whm` (verified) and used by the integra
 | Billing discriminator `metadata.whm_kind ∈ license|plugin_purchase`; magic links single-use/15 min/e-mail-bound | §18.5 + errata | U1, U2 | marketplace.md, this plan |
 | `shared/webhooks.js enqueue(db, …)` with `ownerType = 'developer'` → marketplace.db `developer_webhook_*`; `shared/safe-fetch.js` for every developer-supplied host | U1 | U2 | this plan |
 | Feature-gate map and degraded allow-list (concrete paths) | U4 | core tests, U5 | this plan |
+| **Reseller catalog**: `GET /v1/reseller/products` (scope `license:read`) → `{ data: [ { sku, name, edition, term, term_days, price_cents, currency, active, limits, features } ] }`, active products only, every edition (the UI narrows to `quota_left`); until it exists the reseller forms take a free SKU input and the hub's 404 `Product not found` is the error | U1 (`license/routes/reseller.js`) | U3 (`pages/reseller/Licenses.jsx` `useResellerProducts`) | this plan (fix round 1) |
+| **Reseller brand in the portal session**: `GET /v1/portal/me` and `POST /v1/portal/login` carry `reseller: { id, name, brand: { name?, logo_url?, support_url? } }` (from `resellers.brand_json`) for users with `reseller_id`; absent for vendor users | U1 (`license/routes/portal.js`) | U3 (`auth/AuthContext.jsx brandOf()`, `shell/Shell.jsx`; https URLs only) | this plan (fix round 1) |
 
 Anything not listed is internal to its unit. A unit that needs more from another unit adds a
 row here first (the integrator merges the doc), then builds.

@@ -160,6 +160,17 @@ export function createApp(ctx) {
 // index.html (never cached) for every other extension-less GET so the
 // client-side router owns /login, /admin/*, /reseller/* and /dev/*.
 // WHM_HUB_UI_DIST (or config.ui_dist) points at another build directory.
+const STATIC_EXTENSIONS = new Set(['.js', '.mjs', '.css', '.map', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.json', '.txt', '.woff', '.woff2', '.ttf', '.webmanifest', '.html']);
+// Client-side route prefixes: a reverse-DNS segment inside them (plugin id
+// net.acme.js, catalog id com.foo.json) is a route param, never a file.
+const SPA_PREFIX_RE = /^\/(admin|reseller|dev|login)(\/|$)/;
+
+export function isSpaPath(reqPath) {
+  if (reqPath.startsWith('/assets/')) return false;
+  if (SPA_PREFIX_RE.test(reqPath)) return true;
+  return !STATIC_EXTENSIONS.has(path.extname(reqPath).toLowerCase());
+}
+
 export function uiDistDir(config = {}) {
   return config.ui_dist || process.env.WHM_HUB_UI_DIST || path.resolve(path.dirname(new URL(import.meta.url).pathname), '../ui/dist');
 }
@@ -171,7 +182,9 @@ export function finalizeApp(ctx) {
   if (config.serve_ui && fs.existsSync(path.join(uiDist, 'index.html'))) {
     app.use(express.static(uiDist, { index: false, maxAge: '1h', fallthrough: true }));
     app.get('*', (req, res, next) => {
-      if (path.extname(req.path)) return next();
+      // Missing build files answer 404, not index.html; route params such as
+      // a semver segment ("/versions/1.0.0") or a plugin id are not files.
+      if (!isSpaPath(req.path)) return next();
       res.set('Cache-Control', 'no-store');
       res.sendFile(path.join(uiDist, 'index.html'));
     });

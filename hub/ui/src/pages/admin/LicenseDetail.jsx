@@ -7,10 +7,11 @@ import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { useAction } from '../../hooks/useAction.js';
 import { KV, ReasonModal, FormModal, SecretOnce, limitLabel } from '../../widgets/index.jsx';
+import { skuField } from './Licenses.jsx';
 
 // Lifecycle actions shared with the reseller license drawer. `base` selects
 // the scoped (/reseller) or unscoped (/admin) route family of §16.7.
-export function LifecycleActions({ base, license, products, onChanged, admin = false }) {
+export function LifecycleActions({ base, license, products, skuSuggestions, onChanged, admin = false }) {
   const { run, busy } = useAction();
   const confirm = useConfirm();
   const [modal, setModal] = useState(null);
@@ -18,7 +19,7 @@ export function LifecycleActions({ base, license, products, onChanged, admin = f
   const id = license.id;
   const post = (path, body, success) => run(() => api.post(`${base}/licenses/${id}/${path}`, body), { success, then: onChanged });
   const status = license.status_now || license.status;
-  const skus = (products || []).map((p) => ({ value: p.sku, label: `${p.name} (${p.edition})` }));
+  const newProduct = skuField({ products, suggestions: skuSuggestions, label: 'New product' });
   return (
     <>
       <div className="inline-list">
@@ -35,8 +36,8 @@ export function LifecycleActions({ base, license, products, onChanged, admin = f
       <SecretOnce label="New key" value={rekeyed?.key}>The previous key no longer resolves; existing activations keep working.</SecretOnce>
       <FormModal open={modal === 'renew'} title="Renew license" fields={[{ key: 'term_months', label: 'Months to add', type: 'number', min: 1, max: 120, required: true }]} initial={{ term_months: 12 }} onClose={() => setModal(null)} submitLabel="Renew"
         onSubmit={(d) => post('renew', { term_months: Number(d.term_months) }, 'Renewed')} />
-      <FormModal open={modal === 'edition'} title="Change edition" fields={[{ key: 'sku', label: 'New product', type: 'select', options: skus, required: true }, { key: 'force', label: 'Force (allow a downgrade below current usage)', type: 'select', options: [{ value: 'no', label: 'No' }, { value: 'yes', label: 'Yes — the panel blocks new creation but keeps existing accounts' }] }]} initial={{ force: 'no' }} onClose={() => setModal(null)} submitLabel="Change"
-        onSubmit={(d) => post('change-edition', { sku: d.sku, ...(d.force === 'yes' ? { force: true } : {}) }, 'Edition changed; applies at the next check-in')} />
+      <FormModal open={modal === 'edition'} title="Change edition" fields={[newProduct, { key: 'force', label: 'Force (allow a downgrade below current usage)', type: 'select', options: [{ value: 'no', label: 'No' }, { value: 'yes', label: 'Yes — the panel blocks new creation but keeps existing accounts' }] }]} initial={{ force: 'no' }} onClose={() => setModal(null)} submitLabel="Change"
+        onSubmit={(d) => post('change-edition', { sku: String(d.sku || '').trim(), ...(d.force === 'yes' ? { force: true } : {}) }, 'Edition changed; applies at the next check-in')} />
       <ReasonModal open={modal === 'suspend'} title="Suspend license" confirmLabel="Suspend" onClose={() => setModal(null)} onConfirm={({ reason }) => post('suspend', { reason }, 'Suspended')} />
       <ReasonModal open={modal === 'revoke'} title="Revoke license" help="Every activation is blocked at its next check-in; this cannot be undone." confirmLabel="Revoke" onClose={() => setModal(null)} onConfirm={({ reason }) => post('revoke', { reason }, 'Revoked')} />
       <ReasonModal open={modal === 'rekey'} title="Issue a replacement key" danger={false} confirmLabel="Re-key" onClose={() => setModal(null)} onConfirm={async ({ reason }) => { const out = await run(() => api.post(`${base}/licenses/${id}/rekey`, { reason }), { success: 'New key issued', then: onChanged }); if (out) setRekeyed(out.data); }} />

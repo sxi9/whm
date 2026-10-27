@@ -37,7 +37,7 @@ export function MiniBars({ points, valueKey = 'n', labelKey = 'day' }) {
   const rows = Array.isArray(points) ? points : [];
   const max = Math.max(1, ...rows.map((p) => Number(p[valueKey]) || 0));
   if (!rows.length) return <p className="muted">No data yet.</p>;
-  return <div className="mini-bars" aria-label="bar chart">{rows.map((p) => <span key={p[labelKey]} title={`${p[labelKey]}: ${p[valueKey]}`} style={{ height: `${Math.max(4, (Number(p[valueKey]) || 0) / max * 100)}%` }} />)}</div>;
+  return <div className="mini-bars" aria-label="bar chart">{rows.map((p, i) => <span key={`${p[labelKey] ?? i}`} title={`${p[labelKey] ?? i}: ${p[valueKey]}`} style={{ height: `${Math.max(4, (Number(p[valueKey]) || 0) / max * 100)}%` }} />)}</div>;
 }
 
 export function Tabs({ tabs, value, onChange }) {
@@ -83,7 +83,8 @@ export function FormModal({ open, title, fields, initial = {}, onClose, onSubmit
           {f.type === 'select' ? <Select value={draft[f.key]} onChange={(v) => set(f.key, v)} options={f.options} placeholder={f.placeholder} />
             : f.type === 'textarea' ? <Textarea value={draft[f.key]} onChange={(v) => set(f.key, v)} rows={f.rows || 4} mono={f.mono} />
               : f.type === 'number' ? <TextInput type="number" value={draft[f.key] ?? ''} onChange={(v) => set(f.key, v === '' ? null : Number(v))} min={f.min} max={f.max} />
-                : <TextInput type={f.type || 'text'} value={draft[f.key] ?? ''} onChange={(v) => set(f.key, v)} placeholder={f.placeholder} />}
+                : <TextInput type={f.type || 'text'} value={draft[f.key] ?? ''} onChange={(v) => set(f.key, v)} placeholder={f.placeholder} list={f.suggestions ? `${f.key}-suggestions` : undefined} />}
+          {f.suggestions && <datalist id={`${f.key}-suggestions`}>{f.suggestions.map((s) => <option key={s} value={s} />)}</datalist>}
         </Field>
       ))}
     </Modal>

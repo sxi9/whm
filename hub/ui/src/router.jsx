@@ -24,6 +24,7 @@ import AdminEntitlements from './pages/admin/Entitlements.jsx';
 import AdminPayouts from './pages/admin/Payouts.jsx';
 import AdminReviewModeration from './pages/admin/ReviewModeration.jsx';
 import AdminSigningKeys from './pages/admin/SigningKeys.jsx';
+import PortalSecurity from './pages/admin/Security.jsx';
 
 import ResellerDashboard from './pages/reseller/Dashboard.jsx';
 import ResellerLicenses from './pages/reseller/Licenses.jsx';
@@ -72,6 +73,7 @@ export const routes = [
       { path: 'reports', element: <AdminReports /> },
       { path: 'audit', element: <AdminAudit /> },
       { path: 'signing-keys', element: <AdminSigningKeys /> },
+      { path: 'security', element: <PortalSecurity home="/admin" /> },
       { path: 'market/verifications', element: <AdminVerificationQueue /> },
       { path: 'market/developers', element: <AdminDevelopers /> },
       { path: 'market/developers/:id', element: <AdminDevelopers /> },
@@ -97,6 +99,7 @@ export const routes = [
       { path: 'activations', element: <ResellerActivations /> },
       { path: 'api-keys', element: <ResellerApiKeys /> },
       { path: 'statement', element: <ResellerStatement /> },
+      { path: 'security', element: <PortalSecurity home="/reseller" /> },
       { path: '*', element: <Navigate to="/reseller" replace /> },
     ],
   },

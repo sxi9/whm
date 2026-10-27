@@ -57,6 +57,7 @@ export async function bootstrap(overrides = {}) {
   ctx.app = await createApp(ctx);
   // Categories (Contact Manager among them) exist now: deliver what boot() found.
   ctx.license.flushNotifications();
+  ctx.marketplace.boot();
   if (overrides.loadPlugins !== false) await ctx.plugins.loadAll();
 
   try {

@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { PageHeader, Card, StatusPill, formatDate, EmptyState } from '../../components/Common.jsx';
 import { Button, ErrorBanner, Select } from '../../components/Form.jsx';
+import { Modal } from '../../components/Modal.jsx';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { useAction } from '../../hooks/useAction.js';
@@ -29,12 +30,51 @@ export function EvidenceList({ verifications }) {
   );
 }
 
+// The id_document evidence row (dvf_…) whose encrypted upload the admin route
+// GET /admin/market/verifications/:id/document decrypts; the developer id is
+// not a valid argument there.
+export function idDocumentOf(verifications) {
+  return (verifications || []).find((v) => v.method === 'id_document' && v.has_document !== false) || null;
+}
+
+// The route answers { content_type, data (base64) }, not a file.
+export function documentDataUrl(doc) {
+  if (!doc?.data) return null;
+  return `data:${doc.content_type || 'application/octet-stream'};base64,${doc.data}`;
+}
+
+export function DocumentViewer({ verification, open, onClose }) {
+  const { run, busy, error } = useAction();
+  const [doc, setDoc] = useState(null);
+  const load = () => run(() => api.get(`/admin/market/verifications/${verification.id}/document`), { silent: true, then: (r) => setDoc(r.data) });
+  const url = documentDataUrl(doc);
+  const type = doc?.content_type || '';
+  const openTab = () => {
+    const bytes = Uint8Array.from(atob(doc.data), (c) => c.charCodeAt(0));
+    const blobUrl = URL.createObjectURL(new Blob([bytes], { type: type || 'application/octet-stream' }));
+    window.open(blobUrl, '_blank', 'noopener');
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+  };
+  return (
+    <Modal open={open} title="ID document" onClose={() => { setDoc(null); onClose(); }} size="lg"
+      footer={<><Button onClick={() => { setDoc(null); onClose(); }}>Close</Button>{doc && <Button variant="primary" onClick={openTab}>Open in new tab</Button>}</>}>
+      <ErrorBanner error={error} onRetry={load} />
+      <p className="muted">Uploaded {formatDate(verification?.created_at)} · every view is audited (<code>developer.verification.document_view</code>) · purged 30 days after the decision.</p>
+      {!doc && <Button variant="primary" loading={busy} onClick={load}>Load document</Button>}
+      {doc && type.startsWith('image/') && <img src={url} alt="Uploaded ID document" style={{ maxWidth: '100%' }} />}
+      {doc && type === 'application/pdf' && <object data={url} type="application/pdf" style={{ width: '100%', height: '70vh' }} aria-label="Uploaded ID document">PDF preview unavailable; open it in a new tab.</object>}
+      {doc && !type.startsWith('image/') && type !== 'application/pdf' && <p>{type || 'unknown type'}: no inline preview; open it in a new tab.</p>}
+    </Modal>
+  );
+}
+
 function QueueEntry({ entry, onDecided }) {
   const { developer: d, namespaces, verifications, keys, rejections_90d } = entry;
   const { run, busy } = useAction();
   const [modal, setModal] = useState(null);
   const decide = (decision, payload) => run(() => decideVerification(api, d.id, decision, payload), { success: `Developer ${decision === 'approve' ? 'verified' : decision === 'reject' ? 'rejected' : 'asked for more evidence'}`, then: onDecided });
   const passed = (verifications || []).filter((v) => v.result === 'passed').length;
+  const idDoc = idDocumentOf(verifications);
   return (
     <Card title={<>{d.display_name} <span className="muted">· {d.email}</span></>} subtitle={`${d.slug || 'no slug'} · registered ${formatDate(d.created_at)}${d.verified_at ? ` · previously verified ${formatDate(d.verified_at)}` : ''}`}
       actions={<><StatusPill status={d.status} />{rejections_90d > 0 && <span className="pill pill-warn">{rejections_90d} rejection(s) in 90 d</span>}{!d.email_verified && <span className="pill pill-bad">e-mail unverified</span>}</>}>
@@ -49,7 +89,7 @@ function QueueEntry({ entry, onDecided }) {
         <div>
           <p><strong>Evidence</strong> <span className="muted">({passed} passed of {(verifications || []).length}) — automated results are inputs, the decision is yours</span></p>
           <EvidenceList verifications={verifications} />
-          {(verifications || []).some((v) => v.method === 'id_document') && <p className="muted">An ID document was uploaded; it is purged 30 days after the decision. <a href={`/v1/admin/market/verifications/${d.id}/document`} target="_blank" rel="noreferrer noopener">Open document</a></p>}
+          {idDoc && <p className="muted">An ID document was uploaded; it is purged 30 days after the decision. <Button size="sm" onClick={() => setModal('document')}>View document</Button></p>}
         </div>
       </div>
       <div className="inline-list" style={{ marginTop: 12 }}>
@@ -62,6 +102,7 @@ function QueueEntry({ entry, onDecided }) {
         onConfirm={({ reason }) => decide('approve', { note: reason || undefined })} />
       <ReasonModal open={modal === 'reject'} title={`Reject ${d.display_name}`} options={VERIFICATION_REJECT_CODES} optionsLabel="Reason code" label="Details for the developer" required={false} confirmLabel="Reject" onClose={() => setModal(null)}
         onConfirm={({ reason, code }) => decide('reject', { code, text: reason || undefined })} />
+      {idDoc && <DocumentViewer verification={idDoc} open={modal === 'document'} onClose={() => setModal(null)} />}
       <ReasonModal open={modal === 'request-evidence'} title="Request more evidence" label="What is missing?" danger={false} confirmLabel="Send" onClose={() => setModal(null)}
         onConfirm={({ reason }) => decide('request-evidence', { text: reason })} />
     </Card>

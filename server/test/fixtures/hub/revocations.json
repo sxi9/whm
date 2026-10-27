@@ -1,4 +1,5 @@
 { "data": [
   { "id": "rvk_01SCOPED", "plugin_id": "net.example.scoped", "version": null, "severity": "warning", "action": "disable", "reason": "leaks the account list to a third party", "ts": 1761600000000, "revoked_by": "admin@vendor" },
-  { "id": "rvk_02MINIMAL", "plugin_id": "net.example.minimal", "version": "1.0.0", "severity": "critical", "action": "uninstall", "reason": "malicious update", "ts": 1761600001000, "revoked_by": "admin@vendor" }
+  { "id": "rvk_02MINIMAL", "plugin_id": "net.example.minimal", "version": "1.0.0", "severity": "critical", "action": "uninstall", "reason": "malicious update", "ts": 1761600001000, "revoked_by": "admin@vendor" },
+  { "id": "rvk_03PAID", "plugin_id": "net.example.paid", "version": "2.1.0", "severity": "critical", "action": "uninstall", "reason": "credential theft in 2.1.0", "ts": 1761600002000, "revoked_by": "admin@vendor" }
 ] }

@@ -34,8 +34,18 @@ export function stepUpPathFor(session) {
   return session?.kind === 'developer' ? '/dev/2fa/stepup' : '/portal/stepup';
 }
 
+// Reseller users carry their tenant's white-label brand (resellers.brand_json:
+// name, logo_url, support_url) in /portal/me and /portal/login as
+// `reseller: { id, name, brand }` (build-plan contract row); absent → defaults.
+export function brandOf(data) {
+  const brand = data?.reseller?.brand || data?.brand || null;
+  if (!brand || typeof brand !== 'object') return null;
+  const safeUrl = (u) => (typeof u === 'string' && /^https:\/\//i.test(u) ? u : null);
+  return { name: typeof brand.name === 'string' && brand.name.trim() ? brand.name.trim() : data?.reseller?.name || null, logo_url: safeUrl(brand.logo_url), support_url: safeUrl(brand.support_url) };
+}
+
 function portalSession(data) {
-  return { kind: 'portal', user: data.user, totpVerifiedAt: data.totp_verified_at || null, totpEnabled: !!data.user?.totp_enabled };
+  return { kind: 'portal', user: data.user, totpVerifiedAt: data.totp_verified_at || null, totpEnabled: !!data.user?.totp_enabled, brand: data.user?.reseller_id ? brandOf(data) : null };
 }
 function developerSession(data) {
   return { kind: 'developer', developer: data.developer, scopes: data.scopes || ['*'], totpVerifiedAt: data.totp_verified_at || null, totpEnabled: !!data.developer?.totp_enabled };
@@ -107,7 +117,7 @@ export function AuthProvider({ children, initialPath = typeof window !== 'undefi
   return (
     <AuthContext.Provider value={value}>
       {children}
-      <StepUpModal open={Boolean(stepUpRequest)} request={stepUpRequest} onDone={() => finishStepUp(true)} onCancel={() => finishStepUp(false)} />
+      <StepUpModal open={Boolean(stepUpRequest)} request={stepUpRequest} session={session} stepUp={value.stepUp} onDone={() => finishStepUp(true)} onCancel={() => finishStepUp(false)} />
     </AuthContext.Provider>
   );
 }

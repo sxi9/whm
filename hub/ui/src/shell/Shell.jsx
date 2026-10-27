@@ -12,14 +12,15 @@ export function Shell({ area }) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const identity = session?.kind === 'developer' ? session.developer?.email : session?.user?.email;
   const role = session?.kind === 'developer' ? session.developer?.status : session?.user?.role;
-  const brand = session?.kind === 'portal' && session.user?.reseller_id ? 'Reseller portal' : 'WHM Hub';
+  const reseller = session?.kind === 'portal' && session.user?.reseller_id ? session.brand || {} : null;
+  const brand = reseller ? reseller.name || 'Reseller portal' : 'WHM Hub';
   const stepUpFresh = session?.totpVerifiedAt && Date.now() - new Date(session.totpVerifiedAt).getTime() < 5 * 60_000;
 
   return (
     <div className={`app ${mobileOpen ? 'mobile-open' : ''}`}>
       <header className="topbar">
         <button className="icon-button topbar-menu" onClick={() => setMobileOpen((o) => !o)} aria-label="Menu"><Menu size={20} /></button>
-        <div className="brand"><ShieldCheck size={18} /> <strong>{brand}</strong> <span className="brand-sub muted">{AREA_LABELS[area]}</span></div>
+        <div className="brand">{reseller?.logo_url ? <img src={reseller.logo_url} alt="" className="brand-logo" style={{ height: 20, width: 'auto' }} /> : <ShieldCheck size={18} />} <strong>{brand}</strong> <span className="brand-sub muted">{AREA_LABELS[area]}</span></div>
         <div className="topbar-right">
           {session?.kind !== 'developer' && <span className="topbar-host" title="Two-factor step-up status"><KeyRound size={12} /> {session?.totpEnabled ? (stepUpFresh ? '2FA confirmed' : '2FA armed') : 'no 2FA'}</span>}
           <span className="topbar-host">{identity} · {role}</span>
@@ -44,7 +45,7 @@ export function Shell({ area }) {
         </aside>
         <main className="content"><Outlet /></main>
       </div>
-      <footer className="app-footer"><span>whm-hub · {AREA_LABELS[area]}</span><span className="muted">Every mutation is audited</span></footer>
+      <footer className="app-footer"><span>{reseller ? brand : 'whm-hub'} · {AREA_LABELS[area]}</span><span className="muted">{reseller?.support_url ? <a href={reseller.support_url} target="_blank" rel="noreferrer noopener">Support</a> : 'Every mutation is audited'}</span></footer>
     </div>
   );
 }

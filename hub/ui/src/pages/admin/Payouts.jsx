@@ -2,14 +2,50 @@ import { useState } from 'react';
 import { PageHeader, Card, StatusPill, formatDate } from '../../components/Common.jsx';
 import { DataTable } from '../../components/DataTable.jsx';
 import { Button, Select } from '../../components/Form.jsx';
-import { useConfirm } from '../../components/Modal.jsx';
+import { Modal, useConfirm } from '../../components/Modal.jsx';
 import { api } from '../../api/client.js';
 import { useListQuery } from '../../hooks/useListQuery.js';
 import { useAction } from '../../hooks/useAction.js';
-import { FormModal, ReasonModal, money } from '../../widgets/index.jsx';
+import { FormModal, ReasonModal, KV, money } from '../../widgets/index.jsx';
 
 // §18.5 money out: close a period → pending rows → approve → mark paid with
 // the provider reference; held when under the minimum or developer not verified.
+// A payout row carries its statement inline (statement_json → statement:
+// { purchases: [ids], refunds: [ids] }); there is no per-payout admin route,
+// the developer downloads the CSV from /v1/dev/payouts/:id/statement.csv.
+export function statementSummary(p) {
+  const purchases = p?.statement?.purchases || [];
+  const refunds = p?.statement?.refunds || [];
+  return {
+    items: [
+      ['Developer', p?.developer_name || p?.developer_id],
+      ['Period', p ? `${formatDate(p.period_start).slice(0, 10)} → ${formatDate(p.period_end).slice(0, 10)}` : null],
+      ['Gross', p ? money(p.gross_cents, p.currency) : null],
+      ['Refunds', p ? money(p.refunds_cents, p.currency) : null],
+      ['Share', p ? `${p.share_pct}%` : null],
+      ['Net', p ? money(p.net_cents, p.currency) : null],
+      ['Status', p?.status],
+      ['Hold reason', p?.hold_reason],
+      ['Provider ref', p?.provider_ref],
+      ['Paid', p?.paid_at ? formatDate(p.paid_at) : null],
+    ],
+    purchases, refunds,
+  };
+}
+
+export function StatementModal({ payout, onClose }) {
+  const { items, purchases, refunds } = statementSummary(payout);
+  return (
+    <Modal open={Boolean(payout)} title={payout ? `Statement ${payout.id}` : 'Statement'} onClose={onClose} size="md" footer={<Button onClick={onClose}>Close</Button>}>
+      <KV items={items} />
+      <h3 style={{ margin: '12px 0 6px' }}>Paid purchases ({purchases.length})</h3>
+      <div className="inline-list">{purchases.map((id) => <code key={id} className="small">{id}</code>)}{!purchases.length && <span className="muted">none</span>}</div>
+      <h3 style={{ margin: '12px 0 6px' }}>Refunded purchases ({refunds.length})</h3>
+      <div className="inline-list">{refunds.map((id) => <code key={id} className="small">{id}</code>)}{!refunds.length && <span className="muted">none</span>}</div>
+    </Modal>
+  );
+}
+
 export default function Payouts() {
   const [status, setStatus] = useState('');
   const list = useListQuery('/admin/market/payouts', { filters: { status } });
@@ -18,6 +54,7 @@ export default function Payouts() {
   const [paying, setPaying] = useState(null);
   const [holding, setHolding] = useState(null);
   const [closing, setClosing] = useState(false);
+  const [viewing, setViewing] = useState(null);
   const columns = [
     { key: 'developer_id', label: 'Developer', render: (p) => <code className="small">{p.developer_name || p.developer_id}</code> },
     { key: 'period_start', label: 'Period', render: (p) => `${formatDate(p.period_start).slice(0, 10)} → ${formatDate(p.period_end).slice(0, 10)}` },
@@ -39,9 +76,10 @@ export default function Payouts() {
           p.status === 'pending' && { label: 'Approve', primary: true, onClick: async () => { if (await confirm({ title: 'Approve payout', message: `${money(p.net_cents, p.currency)} to ${p.developer_id}` })) run(() => api.post(`/admin/market/payouts/${p.id}/approve`), { success: 'Approved', then: list.refetch }); } },
           p.status === 'approved' && { label: 'Mark paid', primary: true, onClick: () => setPaying(p) },
           ['pending', 'approved'].includes(p.status) && { label: 'Hold', danger: true, onClick: () => setHolding(p) },
-          { label: 'Statement', onClick: () => window.open(`/v1/admin/market/payouts/${p.id}`, '_blank') },
+          { label: 'Statement', onClick: () => setViewing(p) },
         ]} />
       </Card>
+      <StatementModal payout={viewing} onClose={() => setViewing(null)} />
       <FormModal open={closing} title="Close a payout period" fields={[{ key: 'period_start', label: 'Period start (ISO, optional)' }, { key: 'period_end', label: 'Period end (ISO, optional)', help: 'Defaults to the previous calendar month' }]} onClose={() => setClosing(false)} submitLabel="Close period"
         onSubmit={async (d) => { await api.post('/admin/market/payouts/close', { ...(d.period_start ? { period_start: new Date(d.period_start).toISOString() } : {}), ...(d.period_end ? { period_end: new Date(d.period_end).toISOString() } : {}) }); list.refetch(); }} />
       <FormModal open={Boolean(paying)} title={`Mark paid: ${paying ? money(paying.net_cents, paying.currency) : ''}`} fields={[{ key: 'provider_ref', label: 'Provider reference (transfer id)', required: true }]} onClose={() => setPaying(null)} submitLabel="Mark paid"

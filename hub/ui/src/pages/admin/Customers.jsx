@@ -19,7 +19,7 @@ const CUSTOMER_FIELDS = [
 // Shared by the vendor (/admin, every customer) and reseller (/reseller, own
 // customers) portals; `licensesLink` builds the per-customer license filter.
 export function CustomerTable({ base, licensesLink, initialQ = '' }) {
-  const list = useListQuery(`${base}/customers`, {});
+  const list = useListQuery(`${base}/customers`, { initialQ });
   const { run } = useAction();
   const [editing, setEditing] = useState(null);
   const [creating, setCreating] = useState(false);
@@ -34,7 +34,7 @@ export function CustomerTable({ base, licensesLink, initialQ = '' }) {
   ];
   return (
     <>
-      <DataTable columns={columns} {...list.tableProps} q={list.tableProps.q || initialQ} searchable searchPlaceholder="Name, e-mail, company, external ref" emptyText="No customers"
+      <DataTable columns={columns} {...list.tableProps} searchable searchPlaceholder="Name, e-mail, company, external ref" emptyText="No customers"
         toolbar={<Button variant="primary" size="sm" onClick={() => setCreating(true)}>New customer</Button>}
         rowActions={(r) => [
           { label: 'Edit', primary: true, onClick: () => setEditing(r) },

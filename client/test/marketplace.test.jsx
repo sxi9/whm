@@ -23,7 +23,7 @@ vi.mock('../src/hooks/useApi.js', () => ({
   useMutation: (fn) => ({ mutate: fn, loading: false, error: null, fieldErrors: null, reset() {} }),
 }));
 
-const { MarketplaceTab, MarketplaceDisabledNotice, HubMismatchNotice, PluginDetailDrawer, priceLabel } = await import('../src/pages/cpanel/MarketplaceTab.jsx');
+const { MarketplaceTab, MarketplaceDisabledNotice, HubMismatchNotice, PluginDetailDrawer, priceLabel, safeHref } = await import('../src/pages/cpanel/MarketplaceTab.jsx');
 const { ConsentModal, PermissionList, TrustNotice } = await import('../src/pages/cpanel/ConsentModal.jsx');
 const { RevocationBanner, describeRevocation } = await import('../src/components/RevocationBanner.jsx');
 const ManagePlugins = (await import('../src/pages/fn/cpanel/manage-plugins.jsx')).default;
@@ -97,8 +97,15 @@ describe('Marketplace tab', () => {
     expect(root).toContain('security');
     expect(root).toContain('Check for updates');
     expect(root).toContain('2 signing keys pinned');
+    // Resellers get the trimmed status (no hubKids / pendingUpdates) and `installed: { state }` only.
+    const { hasToken, hubKids, pendingUpdates, unacknowledgedRevocations, developerMode, ...trimmed } = enabledStatus;
+    responses.set('/marketplace/status', { data: trimmed });
+    responses.set('/marketplace/catalog', { data: catalog.map((e) => ({ ...e, installed: e.installed ? { state: e.installed.state } : null })), meta: { page: 1, pageSize: 24, total: 3 } });
     const reseller = render(<MarketplaceTab manage={false} />);
     expect(reseller).toContain('catalog-net.example.minimal');
+    expect(reseller).not.toContain('signing key');
+    expect(reseller).not.toContain('undefined');
+    expect(reseller).toContain('>enabled<');
     expect(reseller).toContain('Details');
     expect(reseller).not.toContain('>Install<');
     expect(reseller).not.toContain('Update to 1.0.1');
@@ -137,6 +144,16 @@ describe('Marketplace tab', () => {
     expect(readOnly).not.toContain('Uninstall and purge');
     expect(priceLabel({ model: 'subscription', amount_cents: 500, currency: 'EUR', interval: 'month' })).toBe('5.00 EUR / month');
     expect(priceLabel(null)).toBe('Free');
+    responses.set('/marketplace/plugins/net.example.scoped', { data: { ...detail, homepage: 'javascript:alert(1)', support_url: 'https://example.net/help', installed: { state: 'enabled' } } });
+    const unsafe = render(<PluginDetailDrawer id="net.example.scoped" manage={false} onClose={() => {}} />);
+    expect(unsafe).not.toContain('href="javascript:');
+    expect(unsafe).toContain('javascript:alert(1)');
+    expect(unsafe).toContain('href="https://example.net/help"');
+    expect(unsafe).toContain('(enabled)');
+    expect(unsafe).not.toContain('undefined');
+    expect(safeHref('http://example.net')).toBeNull();
+    expect(safeHref('https://example.net/x')).toBe('https://example.net/x');
+    expect(safeHref('nonsense')).toBeNull();
   });
 });
 

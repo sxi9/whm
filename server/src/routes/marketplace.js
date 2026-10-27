@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z, validate } from '../lib/validate.js';
-import { requireRoot, requireReseller } from '../middleware/rbac.js';
+import { requireRoot, requireReseller, isRoot } from '../middleware/rbac.js';
 
 // Reverse-DNS plugin id (>= 3 segments), the SDK's ID_PATTERN.
 const ID_RE = /^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*){2,}$/;
@@ -18,16 +18,18 @@ const consentBody = z.object({ permissions: z.array(scope).max(200) }).strict();
 const reviewBody = z.object({ rating: z.number().int().min(1).max(5), title: z.string().trim().max(120).optional(), body: z.string().trim().max(4000).optional() }).strict();
 const revocationId = z.object({ id: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/) });
 
-// Root manages; resellers browse (WHM Marketplace is read-only for them).
+// Root manages; resellers browse (WHM Marketplace is read-only for them) and
+// see the browse view only: no pinned keys, feed health or plugin inventory.
 export function marketplaceRoutes(ctx) {
   const r = Router();
   const m = () => ctx.marketplace;
   const wrap = (fn, status = 200) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(status).json(d?.meta ? d : { data: d })).catch(next);
+  const view = (req) => ({ full: isRoot(req.user) });
 
-  r.get('/status', requireReseller, wrap(() => m().status()));
-  r.get('/catalog', requireReseller, validate({ query: catalogQuery }), wrap((req) => m().catalog({ ...req.query, featured: req.query.featured === 'true' ? true : undefined })));
+  r.get('/status', requireReseller, wrap((req) => m().status(view(req))));
+  r.get('/catalog', requireReseller, validate({ query: catalogQuery }), wrap((req) => m().catalog({ ...req.query, featured: req.query.featured === 'true' ? true : undefined }, view(req))));
   r.get('/categories', requireReseller, wrap(() => m().categories()));
-  r.get('/plugins/:id', requireReseller, validate({ params: idParam }), wrap((req) => m().plugin(req.params.id)));
+  r.get('/plugins/:id', requireReseller, validate({ params: idParam }), wrap((req) => m().plugin(req.params.id, view(req))));
   r.get('/plugins/:id/versions', requireReseller, validate({ params: idParam }), wrap((req) => m().versions(req.params.id)));
   r.get('/installs', requireRoot, wrap(() => m().installs()));
   r.get('/updates', requireRoot, wrap(() => m().updates()));

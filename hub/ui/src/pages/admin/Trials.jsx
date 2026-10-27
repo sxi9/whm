@@ -13,9 +13,9 @@ import { Stat, StatGrid, FormModal, SecretOnce } from '../../widgets/index.jsx';
 export default function Trials() {
   const [converted, setConverted] = useState('');
   const list = useListQuery('/admin/trials', { filters: { converted } });
-  const funnel = list.data === null && !list.loading ? null : (list.meta && list.meta.funnel) || null;
+  // The trials route also returns a top-level `funnel`; the dashboard report carries the same numbers through { data }.
   const summary = useApi('/admin/reports/dashboard');
-  const f = summary.data?.trial_funnel || funnel || {};
+  const f = summary.data?.trial_funnel || {};
   const products = useApi('/admin/products');
   const [convert, setConvert] = useState(null);
   const [converted1, setConverted1] = useState(null);

@@ -15,6 +15,11 @@ import { ConsentModal, PermissionList, TrustNotice } from './ConsentModal.jsx';
 export const PROVIDER_PATH = '/market/market-provider-manager';
 export const MANAGE_PLUGINS_PATH = '/cpanel/manage-plugins';
 
+// Catalog links come from the public, unsigned catalog: only https:// reaches an anchor.
+export function safeHref(url) {
+  try { return new URL(url).protocol === 'https:' ? url : null; } catch { return null; }
+}
+
 export function priceLabel(pricing) {
   if (!pricing || pricing.model === 'free' || !pricing.model) return 'Free';
   const amount = Number.isFinite(pricing.amount_cents) ? `${(pricing.amount_cents / 100).toFixed(2)} ${pricing.currency || 'USD'}` : 'Paid';
@@ -45,11 +50,25 @@ export function HubMismatchNotice({ status }) {
   );
 }
 
+// A link whose URL is not https:// is shown as text, never as an anchor.
+function ExternalLinks({ links }) {
+  const items = links.filter(([, url]) => typeof url === 'string' && url);
+  if (!items.length) return <span>—</span>;
+  return (
+    <span>
+      {items.map(([label, url], i) => {
+        const href = safeHref(url);
+        return <span key={label}>{i > 0 ? ' · ' : ''}{href ? <a href={href} target="_blank" rel="noreferrer">{label}</a> : <span title={`${label}: not an https:// link`}>{label}: <code>{url}</code></span>}</span>;
+      })}
+    </span>
+  );
+}
+
 function InstalledPill({ installed }) {
   if (!installed) return null;
   if (installed.update) return <StatusPill status="warning">update {installed.update.latest}</StatusPill>;
   if (installed.consentState === 'pending') return <StatusPill status="pending">awaiting consent</StatusPill>;
-  return <StatusPill status={installed.state}>{installed.marketplace ? installed.state : `${installed.source} · ${installed.state}`}</StatusPill>;
+  return <StatusPill status={installed.state}>{installed.marketplace || !installed.source ? installed.state : `${installed.source} · ${installed.state}`}</StatusPill>;
 }
 
 function PluginCard({ entry, manage, onDetails, onInstall, onUpdate, onUninstall }) {
@@ -150,9 +169,9 @@ export function PluginDetailDrawer({ id, manage, onClose, onInstall, onUpdate, o
         ['Category', data.category?.name || '—'],
         ['Price', priceLabel(data.pricing)],
         ['Compatibility', data.compatibility ? `requires WHM ${data.compatibility.engines_whm}${data.compatibility.compatible === false ? ' — not compatible with this host' : data.compatibility.compatible ? ' — compatible' : ''}` : '—'],
-        ['Installed', inst ? `${inst.version} (${inst.state}${inst.consentState === 'pending' ? ', awaiting consent' : ''})` : 'no'],
+        ['Installed', inst ? `${inst.version ? `${inst.version} ` : ''}(${inst.state}${inst.consentState === 'pending' ? ', awaiting consent' : ''})` : 'no'],
         ['Rating', data.rating_count ? `${Number(data.rating_avg).toFixed(1)} ★ from ${data.rating_count} review${data.rating_count === 1 ? '' : 's'}` : 'no reviews yet'],
-        ['Links', <span key="l">{data.homepage ? <a href={data.homepage} target="_blank" rel="noreferrer">Homepage</a> : null}{data.homepage && data.support_url ? ' · ' : ''}{data.support_url ? <a href={data.support_url} target="_blank" rel="noreferrer">Support</a> : null}{!data.homepage && !data.support_url ? '—' : ''}</span>],
+        ['Links', <ExternalLinks key="l" links={[['Homepage', data.homepage], ['Support', data.support_url]]} />],
       ]} />
       {manage && (
         <div className="row-actions" style={{ marginTop: 10, flexWrap: 'wrap' }}>
@@ -290,7 +309,7 @@ export function MarketplaceTab({ manage = true, status: statusProp = null }) {
         <div className="datatable-toolbar" style={{ padding: 12, flexWrap: 'wrap', gap: 8 }}>
           <TextInput value={q} onChange={setQ} placeholder="Search plugins…" style={{ maxWidth: 280 }} />
           <Select value={category} onChange={setCategory} options={(categories.data || []).map((c) => ({ value: c.slug, label: `${c.name}${c.count != null ? ` (${c.count})` : ''}` }))} placeholder="All categories" style={{ maxWidth: 240 }} />
-          <span className="muted">{catalog.meta?.total ?? rows.length} plugin{(catalog.meta?.total ?? rows.length) === 1 ? '' : 's'} · hub {status.hubUrl?.replace(/^https:\/\//, '')} · {status.hubKids?.length || 0} signing key{status.hubKids?.length === 1 ? '' : 's'} pinned</span>
+          <span className="muted">{catalog.meta?.total ?? rows.length} plugin{(catalog.meta?.total ?? rows.length) === 1 ? '' : 's'} · hub {status.hubUrl?.replace(/^https:\/\//, '')}{Array.isArray(status.hubKids) ? ` · ${status.hubKids.length} signing key${status.hubKids.length === 1 ? '' : 's'} pinned` : ''}</span>
           {manage && <Button size="sm" icon={RefreshCw} onClick={checkUpdates}>Check for updates</Button>}
           <Button size="sm" onClick={refreshAll}>Refresh</Button>
         </div>

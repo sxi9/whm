@@ -124,16 +124,17 @@ function BillingPanel() {
   );
 }
 
-function SchedulesPanel() {
+// shared/scheduler.js list(): { name, cron, lastRunAt, lastResult, lastError, runs }.
+export function SchedulesPanel() {
   const { data, refetch } = useApi('/admin/schedules');
   const { run } = useAction();
   return (
     <div className="table-wrap">
       <table>
-        <thead><tr><th>Job</th><th>Cron</th><th>Last run</th><th>Result</th><th /></tr></thead>
+        <thead><tr><th>Job</th><th>Cron</th><th>Last run</th><th>Runs</th><th>Result</th><th /></tr></thead>
         <tbody>
-          {(data || []).map((s) => <tr key={s.name}><td><code>{s.name}</code></td><td>{s.cron}</td><td>{formatDate(s.last_run_at || s.lastRunAt)}</td><td>{s.last_error ? <span className="pill pill-bad">{s.last_error}</span> : s.last_result ? <code className="small">{JSON.stringify(s.last_result).slice(0, 80)}</code> : '—'}</td><td><Button size="sm" onClick={() => run(() => api.post(`/admin/schedules/${s.name}/run`), { success: `${s.name} ran`, then: refetch })}>Run now</Button></td></tr>)}
-          {!(data || []).length && <tr><td colSpan={5} className="muted">No schedules reported.</td></tr>}
+          {(data || []).map((s) => <tr key={s.name}><td><code>{s.name}</code></td><td>{s.cron}</td><td>{s.lastRunAt ? formatDate(s.lastRunAt) : <span className="muted">never</span>}</td><td>{s.runs ?? 0}</td><td>{s.lastError ? <span className="pill pill-bad">{s.lastError}</span> : s.lastResult != null ? <code className="small">{JSON.stringify(s.lastResult).slice(0, 80)}</code> : '—'}</td><td><Button size="sm" onClick={() => run(() => api.post(`/admin/schedules/${s.name}/run`), { success: `${s.name} ran`, then: refetch })}>Run now</Button></td></tr>)}
+          {!(data || []).length && <tr><td colSpan={6} className="muted">No schedules reported.</td></tr>}
         </tbody>
       </table>
     </div>

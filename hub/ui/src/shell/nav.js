@@ -11,6 +11,7 @@ export const ADMIN_NAV = [
     { to: '/admin/integrations', label: 'Integrations' },
     { to: '/admin/reports', label: 'Reports' },
     { to: '/admin/audit', label: 'Audit log' },
+    { to: '/admin/security', label: 'Security & 2FA' },
   ] },
   { title: 'Marketplace', items: [
     { to: '/admin/market/verifications', label: 'Verification queue' },
@@ -33,6 +34,7 @@ export const RESELLER_NAV = [
     { to: '/reseller/activations', label: 'Activations' },
     { to: '/reseller/api-keys', label: 'API keys & webhooks' },
     { to: '/reseller/statement', label: 'Statement' },
+    { to: '/reseller/security', label: 'Security & 2FA' },
   ] },
 ];
 
