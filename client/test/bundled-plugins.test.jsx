@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
@@ -11,6 +11,13 @@ import ImunifyAv from '../src/pages/fn/plugins/imunifyav.jsx';
 import WpToolkit from '../src/pages/fn/plugins/wp-toolkit.jsx';
 import { Sparkline } from '../src/pages/plugins/ServerMonitoring.jsx';
 import { formatRate } from '../src/pages/plugins/BundledPlugin.jsx';
+
+// The bundled-plugin status call decides whether the root-only Settings tab shows.
+let statusData = null;
+vi.mock('../src/hooks/useApi.js', async (importOriginal) => {
+  const mod = await importOriginal();
+  return { ...mod, useApi: (path, opts) => (typeof path === 'string' && path.startsWith('/bundled-plugins/')) ? { data: statusData, meta: null, error: null, loading: false, refetch() {} } : mod.useApi(path, opts) };
+});
 
 React.useLayoutEffect = React.useEffect;
 
@@ -26,11 +33,15 @@ function render(Page, fn, plugins) {
 
 describe('Plugins category pages', () => {
   it('render the overview shell with tabs when the plugin is enabled', () => {
+    statusData = null;
     const mon = render(ServerMonitoring, fns['server-monitoring'], [plugin('net.whm.server-monitoring', 'Server Monitoring')]);
     expect(mon).toContain('Server Monitoring');
     expect(mon).toContain('Overview');
-    expect(mon).toContain('Settings');
+    expect(mon).not.toContain('>Settings<');
     expect(mon).toContain('Sample now');
+    statusData = { state: 'enabled', canManage: true };
+    expect(render(ServerMonitoring, fns['server-monitoring'], [plugin('net.whm.server-monitoring', 'Server Monitoring')])).toContain('Settings');
+    statusData = null;
     const av = render(ImunifyAv, fns.imunifyav, [plugin('net.whm.imunifyav', 'ImunifyAV')]);
     expect(av).toContain('Malicious files');
     expect(av).toContain('Quarantine');

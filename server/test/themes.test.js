@@ -240,6 +240,11 @@ describe('package assignment', () => {
       }
     }
   });
+  it('refuses a package theme that is not an enabled theme (core validation)', async () => {
+    const res = await app.http.put('/api/packages/starter').set('X-CSRF-Token', csrf).send({ theme: 'nope' }).expect(422);
+    expect(res.body.error.fields).toMatchObject({ theme: ['not an enabled theme'] });
+    await app.http.put('/api/packages/starter').set('X-CSRF-Token', csrf).send({ theme: 'jupiter' }).expect(200);
+  });
   it('assigns a theme to a package through the packages service', async () => {
     const res = await put('/api/themes/packages/starter', { theme: 'acme' }).expect(200);
     expect(res.body.data).toEqual({ name: 'starter', theme: 'acme', accounts: 0 });

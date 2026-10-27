@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { validate, z, fields, pagination } from '../../lib/validate.js';
 import { requireRoot, requireReseller, requireScope } from '../../middleware/rbac.js';
-import { createDevelopmentService, wireCoreEvents, PanelEvents, EVENT_NAME_RE, HOOK_SCRIPT_RE, ENFORCED_SCOPES, APP_NAME_RE, ACL_RE } from '../../services/development.js';
+import { createDevelopmentService, wireCoreEvents, EVENT_NAME_RE, HOOK_SCRIPT_RE, ENFORCED_SCOPES, APP_NAME_RE, ACL_RE } from '../../services/development.js';
 
 const idParam = z.object({ id: fields.id });
 const label = z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9 ._()\/-]{0,63}$/, 'Letters, digits, spaces, "." "_" "-" "(" ")" or "/"; max 64 chars');
@@ -45,7 +45,6 @@ const pluginBody = z.object({
 }).strict();
 
 export async function register(ctx) {
-  ctx.events ||= new PanelEvents(ctx.logger);
   ctx.development = createDevelopmentService(ctx);
   const s = ctx.development;
   ctx.events.onAny((envelope) => s.hooks.dispatch(envelope));

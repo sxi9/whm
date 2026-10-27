@@ -108,6 +108,11 @@ Never edit `CHECKLIST.md`, `nav.js`, `registry.js`, `routes/index.js`, `ops/inde
   methods; tolerate absence. Hooks core relies on: `resellers.assertAcl/createPolicy/modifyPolicy/
   nameserversFor`, `accountFunctions.mountpointFor/renderTemplate/runBandwidthEnforce/resetBandwidth`,
   `serverConfig.profile.summary()`, `contacts.notify(event, payload)` / `contacts.sendMail(...)`.
+- **Wave-3 seams (binding, `docs/design/integration-contracts.md` §22–32):** cluster tokens carry `clustering:dns`
+  or `clustering:config` and are confined to their endpoints via `ctx.confinedScopes`; inbound config pushes are
+  opt-in and honour the receiver's group selection; cPanel's upgrade check goes through `ctx.software.panel.*`
+  (feed `sha256`/`signature`/`keyId` kept); support grants never come from API tokens; `packages.theme` must be
+  an enabled theme (`ctx.themes.isEnabledSlug`); `ctx.events` is created by core only.
 - **Wave-2 seams (binding, `docs/design/integration-contracts.md` §11–21):** account-information owns
   bandwidth collection + `account_bandwidth`, account-functions owns enforcement/reset; software's
   `os-update-check` is the only update schedule; IP changes use `ctx.web.replaceIp` (ensureVhost's
@@ -203,9 +208,10 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   follow-ups done by the integrator: `packages.snapshot()` resolves `theme` via `ctx.themes.resolveForPackage`
   (contract §22); `routes/index.js` serves `{ public: true }` mounts before `requireAuth` (login-page
   branding); `middleware/audit.js` summarises Buffers as `{ bytes }`; `ctx.events` (PanelEvents, now
-  `lib/events.js`) is created by core at bootstrap. The wave-3 fix round closes the 10 open findings
-  (cluster token scopes + opt-in config pushes, cPanel upgrade check via Software, support grant guards)
-  per the scratchpad `issues/_contracts.md` (wave 3).
+  `lib/events.js`) is created by core at bootstrap. The **wave-3 fix round** (01:35 on the 27th, 19 runs, 0 open per category) closed
+  the 10 findings (cluster token scopes + opt-in config pushes, cPanel upgrade check via Software, support
+  grant guards, DNS import guard, single quota capability); the integrator then closed the core items the
+  fixers could not touch (see the wave-3 seams above). **Phase 2 is complete.** Next: Phase 5.
 - **2026-10-26 20:55: core plugin host merged** (`16286ee`, built in an isolated worktree from
   `docs/design/plugin-host.md`, 3 parity/security review rounds, 0 open): `ctx.plugins`
   (`services/plugins.js`) is the real implementation of the SDK contract in `plugins/sdk/mock-host.js`

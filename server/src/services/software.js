@@ -447,7 +447,14 @@ export function createSoftwareService(ctx) {
         const release = body?.tiers?.[tier] ?? body?.[tier] ?? body;
         if (!release || typeof release.version !== 'string' || !/^v?\d+(\.\d+){0,3}([.-][0-9A-Za-z.]+)?$/.test(release.version)) throw new Error('update feed has no usable "version" field');
         entry.ok = true;
-        entry.latest = { version: release.version.replace(/^v/, ''), url: typeof release.url === 'string' && /^https?:\/\//.test(release.url) ? release.url : null, notes: typeof release.notes === 'string' ? release.notes.slice(0, 4000) : null, publishedAt: typeof release.publishedAt === 'string' ? release.publishedAt : null, tier };
+        entry.latest = {
+          version: release.version.replace(/^v/, ''), url: typeof release.url === 'string' && /^https?:\/\//.test(release.url) ? release.url : null,
+          notes: typeof release.notes === 'string' ? release.notes.slice(0, 4000) : null, publishedAt: typeof release.publishedAt === 'string' ? release.publishedAt : null, tier,
+          // Integrity fields are passed through for cPanel › Upgrade to Latest Version, which verifies the archive before installing it.
+          sha256: typeof release.sha256 === 'string' && /^[0-9a-f]{64}$/i.test(release.sha256) ? release.sha256.toLowerCase() : null,
+          signature: typeof release.signature === 'string' && /^[A-Za-z0-9+/=_-]{1,1024}$/.test(release.signature) ? release.signature : null,
+          keyId: typeof release.keyId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(release.keyId) ? release.keyId : null,
+        };
       } catch (err) {
         entry.error = (err.name === 'TimeoutError' ? 'timed out after 10s' : err.message).split(url).join(entry.url);
       }

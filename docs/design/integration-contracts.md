@@ -271,3 +271,96 @@ in `support_access_grants.ssh_expiry` and surfaced as `ssh.expiry` next to `expi
 options token as-is and must not rewrite it. `ctx.support.activeGrants()` lists grants whose key
 may still be on the host.
 
+---
+
+# Wave-3 fix-round contracts (binding)
+
+## 24. Service names on ctx (authoritative, wave 3)
+`ctx.clusters`, `ctx.themes`, `ctx.market`, `ctx.cpanel`, `ctx.support`, `ctx.bundledPlugins`
+(Plugins category); the core plugin host stays `ctx.plugins`. `ctx.events` (PanelEvents) is now
+**created by core** in `server/src/index.js` before any category registers (class in
+`server/src/lib/events.js`, re-exported by `services/development.js`); categories must never create
+it, only use it.
+
+## 25. Core items already done by the integrator (do not redo; build on them)
+- `packages.snapshot()` resolves `theme` through `ctx.themes?.resolveForPackage?.(pkg) ?? pkg.theme`
+  (contract §22 fulfilled); the themes fixer removes the "Not applied yet" probe/banners and asserts
+  the behaviour in a test that creates an account from a package whose theme is disabled.
+- `routes/index.js` accepts `{ path, router, public: true }` mounts from `register(ctx)`; public mounts
+  are served **before** `requireAuth`. cpanel returns its `/branding` router as public and that router
+  may only contain read-only `GET /` (no inline logo bytes; no PII) and `GET /:kind` image handlers —
+  every mutation stays on the authenticated `/cpanel/branding*` routes. The login page then reads
+  `/api/branding` unauthenticated (company name, logo, favicon, login notice).
+- `middleware/audit.js` `redact()` summarises Buffers/typed arrays as `{ bytes: n }`, so raw uploads
+  no longer bloat the audit log (cpanel may additionally replace `req.body` with a summary).
+
+## 26. Clusters: token purpose and inbound trust
+- Cluster tokens carry **one** of two scopes: `clustering:dns` (ping, `/api/clusters/dns/receive`,
+  `/api/dns/zones/import`) or `clustering:config` (ping, `/api/clusters/config/export`,
+  `/api/clusters/config/receive`). The DNS Cluster page issues `clustering:dns`, the Configuration
+  Cluster page issues `clustering:config`; `requireScope` on each endpoint checks the matching scope
+  (a legacy bare `clustering` token keeps working for DNS only and is flagged in the token list).
+- `clusters.config.accept_pushes` defaults to **false** (new migration `025b_`), and the receiver
+  enforces its own group selection: `config.diff()/receive()` reject keys whose group is not in this
+  server's `clusters.config.groups` (`422 group_not_shared`). The 'security' and 'software' groups are
+  excluded from the default selection.
+- Successful inbound zone pushes are recorded in the exchange log: the import guard mounted in
+  front of `POST /api/dns/zones/import` records `dns.receive` with status ok/failed from the response
+  status (domain + serial from the body) for token-authenticated calls; `/api/clusters/dns/receive`
+  stays as the logged equivalent.
+- dns-functions (in this round): `POST /dns/zones/import` calls `ctx.clusters?.dns?.guardImport?.(req)`
+  before importing (a thrown HttpError is returned as-is), and `runSync` prefers
+  `/api/clusters/dns/receive` when the peer's `/api/clusters/ping` answers (cache the capability per
+  peer for the run), falling back to `/api/dns/zones/import`.
+- The configuration-cluster group list gains a `branding` group (branding.*, themes.*, support.*,
+  market.providers) so Customization/Theme/Support settings replicate; `clusters.config.groups`
+  defaults and `GROUP_NAMES` must agree (one source of truth).
+
+## 27. cPanel
+- Upgrade to Latest Version delegates the release check to Software: call
+  `ctx.software.panel.check()` / read `ctx.software.panel.status()` (whatever software exposes for the
+  panel release feed — read `services/software.js`), never fetch the feed itself; record nothing under
+  `cpanel.upgrade.last_check` (remove the key, new `028b_` migration deletes it). The upgrade job
+  itself stays in cpanel.
+- The reseller ACL `news` is enforced: resellers with the ACL may create/edit/delete news items whose
+  audience is `resellers`-owned accounts only (`audience: 'own'`), through `ctx.resellers.assertAcl`;
+  root keeps everything. Remove the dead core `news.html` setting reader expectation (document that
+  the key is unused; delete it in `028b_`).
+- Logo upload route replaces `req.body` with `{ size }` before returning (belt and braces).
+
+## 28. Support
+- The `support-access-expiry` schedule is enabled only while live grants exist (`scheduler.update`
+  on grant/end/expire; disabled at register when none).
+- `access.grant` with `ssh: true` reads `sec.sshd.get` and refuses (`422`) when PermitRootLogin is
+  `no`/`forced-commands-only` or PubkeyAuthentication is `no`, pointing at Security Center.
+- Grants cannot be created from an API-token-authenticated request (`403` when
+  `req.auth?.via === 'token'`); the SSH half of a grant never outlives the issuing session's policy.
+
+## 29. Plugins / Market / Themes
+- The Plugins category's agent ops stay where they are (`sec.imunify.*`, `sec.clamav.*`,
+  `sec.netdev.read` in `agent/src/ops/sec.js`; `web.wp.*` in `agent/src/ops/web.js`) as a documented
+  exception (CLAUDE.md records the ownership). Do not move them.
+- `ctx.market.hub()` stays declared (Phase 5 consumer); market removes the dead `market.providers`
+  seed dependency by tolerating the row from `006_ssl-tls.sql` (no migration edits).
+- Themes: `tweak.login_theme` is reconciled with the themes table — the Tweak Settings option list is
+  not themes' file, so themes exposes `themes.slugs()` and documents that `tweak.login_theme` is
+  legacy; `packages.theme` is validated against enabled theme slugs on package create/update **by the
+  core packages route** (integrator) — themes provides `themes.isEnabledSlug(slug)`.
+- Migration numbers: `024_plugins.sql` (core host) and `030_plugins.sql` (category) coexist; never
+  reuse a number; follow-ups are `0NNb_<slug>-<topic>.sql`.
+
+## 30. Capabilities
+`quota` is registered by both account-information and server-configuration: server-configuration
+is the owner (Initial Quota Setup); account-information must not register it (remove the call).
+
+## 31. Scope-confined API tokens (core, `ctx.confinedScopes`)
+A category may add scope names to `ctx.confinedScopes` (a Set) in `register(ctx)`; a token whose
+scopes are all confined is accepted only by routes guarded with `requireScope(<one of them>)` and is
+refused everywhere else, so a `clustering:dns` token can push zones but never act as root. Clusters
+registers `clustering:dns`, `clustering:config` and the legacy `clustering`.
+
+## 32. cPanel seams
+`ctx.cpanel.branding.get()` (public via `GET /api/branding`), `ctx.cpanel.news.active(user)` (audience
+`own` keyed on `accounts.owner_id`), `ctx.cpanel.upgrade.status()` reads the release only through
+`ctx.software.panel.status()` (which keeps the feed's `sha256`/`signature`/`keyId`); release keys live
+under `/etc/whm/release-keys`. Bundled plugins' node:test suites run from the root `npm test`.

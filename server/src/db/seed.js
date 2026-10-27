@@ -49,8 +49,6 @@ export const DEFAULT_SETTINGS = {
   'updates.tier': 'stable',
   'updates.auto': true,
   'analytics.enabled': false,
-  'news.html': '',
-  'themes.default': 'jupiter',
 };
 
 export const DEFAULT_ZONE_TEMPLATE = `; Zone template: %domain%

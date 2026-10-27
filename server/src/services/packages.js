@@ -1,5 +1,5 @@
 import { json, paginate } from '../db/index.js';
-import { notFound, conflict, forbidden } from '../lib/errors.js';
+import { notFound, conflict, forbidden, unprocessable } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
 
 const LIMIT_COLUMNS = ['disk_mb', 'bandwidth_mb', 'max_domains', 'max_subdomains', 'max_addons', 'max_parked', 'max_db', 'max_email', 'max_ftp', 'max_email_per_hour', 'quota_inodes'];
@@ -37,6 +37,7 @@ export function createPackagesService(ctx) {
       if (col in input) row[col] = ['has_shell', 'has_dedicated_ip', 'cgi', 'digest_auth'].includes(col) ? (input[col] ? 1 : 0) : input[col];
       else if (!(col in row)) row[col] = col === 'cgi' ? 1 : ['has_shell', 'has_dedicated_ip', 'digest_auth'].includes(col) ? 0 : col === 'theme' ? 'jupiter' : null;
     }
+    if (input.theme && ctx.themes?.isEnabledSlug && !ctx.themes.isEnabledSlug(input.theme)) throw unprocessable('Theme is not enabled on this server', { theme: ['not an enabled theme'] });
     if (input.feature_list) {
       const fl = stmts.featureList.get(input.feature_list);
       if (!fl) throw notFound('Feature list');
