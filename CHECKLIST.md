@@ -8,7 +8,7 @@
 
 ## Current state
 
-- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-27 03:35 UTC
+- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-27 06:45 UTC
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
 - **Tests:** server 93/93, agent 42/42 passing (`npm test`). Shared API test helper: `server/test/support/app.js`.
@@ -47,8 +47,8 @@ a fix round ~15 min; most categories need one fix round.
 | Integrate wave 3 (suites 1046/451/30 green, build, boot, e2e; core: theme hook, public branding mounts, buffer-safe audit, core-owned event bus) → **all 212 functions built** | done | 25 min | 00:30 (27th) |
 | Wave-3 fix round (10 open findings + critic gaps; 8 categories incl. dns-functions and account-information follow-ups) | done — 0 open per category; integrator closed the core items (release-feed integrity fields, package theme validation, seed cleanup, core-only event bus, bundled-plugin tests in `npm test`) | 1 h 20 min (+ 1 h container restart) | 01:35 (27th) |
 | **P5** — marketplace design (`docs/design/marketplace.md`, 683 lines, + six-unit build plan; two critique passes, 26 findings resolved) | done | 55 min | 01:40 (27th) |
-| **P5 build** — license server (`hub/license`), marketplace (`hub/marketplace`, open dev registration with backend verification), hub UI, panel license + marketplace clients, `plugins/SDK.md`, sample plugin, automated-backup plugin — 3 rounds × 2 units, each verified (`wf_c7084ffb-2df`) | running since 01:42 — round 1 done 03:25 (SDK/plugins unit passed both reviewers; license server built, 3 findings carried); round 2 (marketplace + panel license client) building | ~5.5 h | ~07:15 (27th) |
-| Integrate Phase 5 (integrator checklist: BLUEPRINT §16–18, workspaces, deploy unit + install.sh --with-hub, contacts events, README, CHECKLIST) + fix round | pending | ~2 h | ~09:15 (27th) |
+| **P5 build** — license server (`hub/license`), marketplace (`hub/marketplace`, open dev registration with backend verification), hub UI, panel license + marketplace clients, `plugins/SDK.md`, sample plugin, automated-backup plugin — 3 rounds × 2 units, each verified (`wf_c7084ffb-2df`) | running since 01:42 — rounds 1–3 built and reviewed (SDK/plugins, license server, marketplace service, panel license client, panel marketplace client, hub UI); integration critic running | ~5.5 h | ~07:00 (27th) |
+| Integrate Phase 5 — docs/deploy half done 05:40 (`0be6f9c`: BLUEPRINT §16–18, hub unit + config template, install.sh --with-hub, README); code half (workspaces + test script, contacts events, Security Advisor finding, suites, screenshots) + fix round for carried findings | pending | ~2 h | ~09:00 (27th) |
 | **P6** — hardening pass, full e2e on a provisioned VM, Security Advisor rules (incl. the Oct-2026 PHP advisory check), final docs, performance | pending | ~2.5 h | ~11:45 (27th) |
 | **Total remaining** | | **~10 h wall-clock** (from 01:45 on the 27th) | |
 
@@ -58,7 +58,7 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 ## Phases
 
 - [x] **Blueprint** — architecture, data model, security model, all 30 categories / 212 functions specified
-- [ ] **P0 Foundation** — workspace, config, SQLite schema + migrations + seed, session auth + bcrypt + TOTP 2FA, RBAC, CSRF, validation, audit log, agent protocol + `whm-agentd` skeleton, capability detection, jobs + scheduler
+- [x] **P0 Foundation** — workspace, config, SQLite schema + migrations + seed, session auth + bcrypt + TOTP 2FA, RBAC, CSRF, validation, audit log, agent protocol + `whm-agentd` skeleton, capability detection, jobs + scheduler
   - [x] root workspace (`package.json`, `.gitignore`, `.env.example`)
   - [x] `server/src/config.js`, `logger.js`, `lib/errors.js`, `lib/validate.js`, `lib/crypto.js`
   - [x] `server/src/db/` (migrations, seed, session store)
@@ -69,9 +69,9 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
   - [x] `npm install`, boot, end-to-end API smoke test (all steps green)
   - [x] vitest unit + API tests — server 93 tests (cron, validate, crypto, jobs/scheduler, full API incl. RBAC/CSRF/rollback/audit/2FA), agent 42 tests (registry injection rejection, path sandbox, exec, side-effect-free ops)
 - [x] **P1 Shell** — React layout (top bar, searchable collapsible sidebar with all 30 categories), home dashboard (Statistics + Tools grid + Favorites), login/2FA pages, shared components (DataTable, Form fields, ConfigPage, ActionPage, Toast, Modal, StatusPill, ProgressLog), `nav.js` as single source of truth, a route for every one of the 212 functions *(WizardPage arrives with Transfer Tool / IP Migration in P4)*
-- [ ] **P2 Core hosting** — Account Information, Account Functions, Multi Account, Packages + Feature Manager, DNS Functions + Zone Manager, Database Services, Service Configuration + Service Manager, Restart Services, Server Status, System Health
-- [ ] **P3 Security & mail** — Security Center, Email, Exim/Dovecot config, SSL/TLS + AutoSSL (ACME)
-- [ ] **P4 Resellers, IP, backup, transfers** — Resellers, IP Functions, Backup + scheduler + destinations, Transfers + Transfer Tool, Networking Setup, Server Contacts, System Reboot
+- [x] **P2 Core hosting** — Account Information, Account Functions, Multi Account, Packages + Feature Manager, DNS Functions + Zone Manager, Database Services, Service Configuration + Service Manager, Restart Services, Server Status, System Health
+- [x] **P3 Security & mail** — Security Center, Email, Exim/Dovecot config, SSL/TLS + AutoSSL (ACME)
+- [x] **P4 Resellers, IP, backup, transfers** — Resellers, IP Functions, Backup + scheduler + destinations, Transfers + Transfer Tool, Networking Setup, Server Contacts, System Reboot
 - [ ] **P5 Software & platform** — Software (MultiPHP, EasyApache, updates), Locales, Clusters, Themes, Market, cPanel section, Development (API tokens, hooks, OpenAPI), Support, **license client + hub/license server, plugin host + plugin marketplace, sample + automated-backup plugins** *(deferred items land here)*
 - [ ] **P6 Hardening & deploy** — `scripts/install.sh`, systemd units, panel TLS, Security Advisor rules, docs, e2e tests, performance pass
 
