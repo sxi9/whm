@@ -181,12 +181,13 @@ export function createCpanelService(ctx) {
   // ---------------------------------------------------------- changelog ----
   const changelog = {
     path: path.join(REPO_ROOT, 'CHANGELOG.md'),
-    get() {
+    // The install path is root's business; resellers get the notes only.
+    get(user) {
       const exists = fs.existsSync(changelog.path);
       const markdown = exists ? fs.readFileSync(changelog.path, 'utf8') : '';
       const parsed = parseChangelog(markdown);
       const current = parsed.releases.find((r) => !r.unreleased && compareVersions(r.version, ctx.version) === 0) ?? null;
-      return { version: ctx.version, path: changelog.path, exists, markdown, intro: parsed.intro, releases: parsed.releases, currentRelease: current?.version ?? null };
+      return { version: ctx.version, path: isRoot(user) ? changelog.path : null, exists, markdown, intro: parsed.intro, releases: parsed.releases, currentRelease: current?.version ?? null };
     },
   };
 
@@ -194,23 +195,19 @@ export function createCpanelService(ctx) {
   const imageMeta = (kind) => { const m = S(`branding.${kind}`, null); return m && typeof m === 'object' && m.file ? m : null; };
   const imageFile = (kind, meta) => path.join(dirs.branding, path.basename(meta.file));
   const branding = {
-    get({ inlineLogo = true } = {}) {
+    // Served to anyone (the login page reads it before a session exists), so
+    // this is text an operator chose to show the public plus image descriptors;
+    // the bytes themselves come from the public image routes.
+    get() {
       const out = {};
       for (const [k, key] of Object.entries(BRANDING_KEYS)) out[k] = S(key, '') ?? '';
       out.companyName ||= 'WHM';
       for (const kind of Object.keys(IMAGE_KINDS)) {
         const meta = imageMeta(kind);
         if (!meta || !fs.existsSync(imageFile(kind, meta))) { out[kind] = null; continue; }
-        const descriptor = { url: `/api/branding/${kind}?v=${meta.sha256.slice(0, 12)}`, mime: meta.mime, size: meta.size, updatedAt: meta.updatedAt };
-        // The login page is public but /api is not: a small logo travels inline so
-        // the cached copy can paint the login screen without a request.
-        if (inlineLogo && kind === 'logo' && meta.size <= INLINE_LOGO_MAX_BYTES) {
-          try { descriptor.dataUrl = `data:${meta.mime};base64,${fs.readFileSync(imageFile(kind, meta)).toString('base64')}`; } catch { /* file vanished; the url still works */ }
-        }
-        out[kind] = descriptor;
+        out[kind] = { url: `/api/branding/${kind}?v=${meta.sha256.slice(0, 12)}`, mime: meta.mime, size: meta.size, updatedAt: meta.updatedAt };
       }
       out.links = { help: out.helpUrl, docs: out.docsUrl, support: out.supportUrl };
-      out.version = ctx.version;
       return out;
     },
     update(values, req) {
@@ -219,7 +216,7 @@ export function createCpanelService(ctx) {
       if (Object.keys(changes).length === 0) throw unprocessable('Nothing to change', { companyName: ['Provide at least one field'] });
       settings.setMany(changes);
       req?.audit?.({ action: 'branding.update', args: changes });
-      return branding.get({ inlineLogo: false });
+      return branding.get();
     },
     image(kind) {
       const meta = imageMeta(kind);
@@ -248,7 +245,7 @@ export function createCpanelService(ctx) {
       const meta = { file, mime: type.mime, size: buffer.length, sha256, updatedAt: new Date().toISOString() };
       settings.set(`branding.${kind}`, meta);
       req?.audit?.({ action: `branding.${kind}.upload`, args: { mime: meta.mime, size: meta.size, sha256 } });
-      return branding.get({ inlineLogo: false })[kind];
+      return branding.get()[kind];
     },
     removeImage(kind, req) {
       if (!IMAGE_KINDS[kind]) throw notFound('Image kind');

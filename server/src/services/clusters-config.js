@@ -29,12 +29,14 @@ const mpm = z.object({
   module: z.enum(['prefork', 'worker', 'event']), startServers: int(1, 10_000), minSpareServers: int(1, 10_000), maxSpareServers: int(1, 10_000),
   minSpareThreads: int(1, 100_000), maxSpareThreads: int(1, 100_000), threadsPerChild: int(1, 10_000), maxRequestWorkers: int(1, 100_000), maxConnectionsPerChild: int(0, 10_000_000), serverLimit: int(1, 20_000),
 }).partial().strict();
-// Apache's include; the per-host PHP default (defaultPhpVersion) is not part of it.
+// Apache's include. The per-host PHP default (defaultPhpVersion) is not part
+// of it, and neither is customDirectives: free-form directives are code that
+// a peer must never be able to write into this host's Apache configuration.
 const apache = z.object({
   timeout: int(1, 86_400), keepAlive: bool, maxKeepAliveRequests: int(0, 100_000), keepAliveTimeout: int(1, 3600),
   serverTokens: z.enum(['Prod', 'Major', 'Minor', 'Min', 'OS', 'Full']), serverSignature: z.enum(['On', 'Off', 'EMail']), traceEnable: z.enum(['on', 'off', 'extended']), hostnameLookups: z.enum(['On', 'Off', 'Double']),
   serverAdmin: emailOrEmpty, directoryIndex: z.array(z.string().regex(/^[A-Za-z0-9._-]{1,64}$/)).min(1).max(20), fileETag: z.enum(['None', 'MTime Size', 'INode MTime Size', 'All']),
-  limitRequestBody: int(0, 2_147_483_647), serverStatus: bool, mpm, customDirectives: z.string().max(256 * 1024).regex(/^[^\0]*$/s),
+  limitRequestBody: int(0, 2_147_483_647), serverStatus: bool, mpm,
 }).partial();
 const logrotate = z.object({
   frequency: z.enum(['hourly', 'daily', 'weekly', 'monthly', 'yearly']), rotate: int(0, 3650), compress: bool, delaycompress: bool, missingok: bool, notifempty: bool,
@@ -65,6 +67,21 @@ const mailserver = z.object({
   ssl: z.enum(['yes', 'required', 'no']), disablePlaintextAuth: bool, loginGreeting: line(200), imapIdleNotifyIntervalMinutes: int(1, 60), pop3UidlFormat: z.string().max(64).regex(/^[A-Za-z0-9%._-]*$/),
 }).partial();
 
+const singleLine = (max) => z.string().max(max).regex(/^[^\r\n\0<>]*$/, 'A single line without angle brackets');
+const hexColorOrEmpty = z.union([z.literal(''), z.string().regex(/^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/, 'A #rgb or #rrggbb colour')]);
+const httpUrlOrEmpty = z.union([z.literal(''), z.string().max(500).url().refine((u) => /^https?:\/\//i.test(u), 'Only http(s) links').refine(withoutUserinfo, 'A URL carrying credentials stays local')]);
+const themeSlug = z.string().regex(/^[a-z0-9][a-z0-9_-]{0,39}$/);
+// What Market mirrors into market.providers: the resale catalogue of each SSL
+// provider. Credentials and the enabled flag (which needs them) stay local.
+const marketProduct = z.object({
+  id: z.string().regex(/^[A-Za-z0-9_.-]{1,64}$/), name: z.string().max(80).regex(/^[A-Za-z0-9 ._()&/-]*$/), price: z.number().min(0).max(1e6).nullable(), basePrice: z.number().min(0).max(1e6).nullable(),
+  currency: z.string().regex(/^[A-Z]{3}$/), termMonths: int(1, 120), wildcard: bool,
+}).partial({ price: true, basePrice: true, currency: true, termMonths: true, wildcard: true });
+const marketProvider = z.object({
+  name: z.string().regex(/^[a-z][a-z0-9_.-]{0,31}$/), displayName: singleLine(80).min(1), enabled: bool, url: z.union([z.null(), z.string().max(512).regex(/^https:\/\/[^\s/$.?#][^\s]*$/i).refine(withoutUserinfo, 'A URL carrying credentials stays local')]),
+  adapter: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/), commissionPercent: z.number().min(0).max(100), products: z.array(marketProduct).max(50),
+}).partial({ enabled: true, url: true, adapter: true, commissionPercent: true, products: true });
+
 const bpkScope = z.enum(['non-root', 'accounts']);
 const bpkSignal = z.enum(['SIGKILL', 'SIGTERM', 'SIGINT', 'SIGHUP', 'SIGSTOP']);
 const generator = z.enum(['awstats', 'webalizer', 'analog']);
@@ -78,11 +95,15 @@ export const CONFIG_GROUPS = {
   ssl: { label: 'SSL/TLS', description: 'AutoSSL settings and the TLS policy applied to Apache, Exim and Dovecot.' },
   backup: { label: 'Backups', description: 'Schedule, scope and retention; the local directory, destinations and their credentials stay local.' },
   software: { label: 'Software and updates', description: 'Update tier, automatic updates and the default PHP version. NGINX and EA4 profiles stay local.' },
-  service_config: { label: 'Service configuration', description: 'Apache, Exim, Dovecot, logrotate, Web Disk and web services policy. Ports, bind addresses, FTP and the nameserver choice stay local.' },
+  service_config: { label: 'Service configuration', description: 'Apache, Exim, Dovecot, logrotate, Web Disk and web services policy. Ports, bind addresses, FTP, the nameserver choice and custom Apache directives stay local.' },
   contacts: { label: 'Server contacts', description: 'Notification policy, checks and where system mail goes. The SMTP relay and its credentials stay local.' },
   system_health: { label: 'System health', description: 'Background process killer policy.' },
   stats: { label: 'Statistics', description: 'Log analysers and who may choose them.' },
+  branding: { label: 'Branding and support', description: 'Customization (company name, colours, links, login notice), the default themes, Support Center settings and the Market catalogue. Logo and favicon files, provider credentials and whether a provider is enabled stay local.' },
 };
+// Groups shared when the operator has not chosen: the login policy and the
+// update feed of a server are deliberately not replicated by default.
+export const DEFAULT_GROUPS = Object.freeze(Object.keys(CONFIG_GROUPS).filter((g) => !['security', 'software'].includes(g)));
 
 const K = {};
 const def = (group, key, schema, apply = null) => { K[key] = { group, schema, apply }; };
@@ -210,6 +231,25 @@ def('stats', 'stats.default_generator', generator, 'stats');
 def('stats', 'stats.generators', z.object({ awstats: bool, webalizer: bool, analog: bool }).partial(), 'stats');
 def('stats', 'stats.include_suspended', bool, 'stats');
 
+def('branding', 'branding.chrome_color', hexColorOrEmpty, 'branding');
+def('branding', 'branding.company_name', singleLine(80).min(1), 'branding');
+def('branding', 'branding.docs_url', httpUrlOrEmpty, 'branding');
+def('branding', 'branding.footer_text', singleLine(200), 'branding');
+def('branding', 'branding.help_url', httpUrlOrEmpty, 'branding');
+def('branding', 'branding.login_notice', z.string().max(2000).regex(/^[^\0]*$/), 'branding');
+def('branding', 'branding.primary_color', hexColorOrEmpty, 'branding');
+def('branding', 'branding.support_url', httpUrlOrEmpty, 'branding');
+def('branding', 'branding.tagline', singleLine(120), 'branding');
+def('branding', 'themes.account_default', themeSlug, 'themes');
+def('branding', 'themes.allow_user_override', bool, 'themes');
+def('branding', 'themes.default', themeSlug, 'themes');
+def('branding', 'support.access.default_hours', int(1, 8760), 'support');
+def('branding', 'support.access.max_hours', int(1, 8760), 'support');
+def('branding', 'support.email', emailOrEmpty, 'support');
+def('branding', 'support.portal_url', httpUrlOrEmpty, 'support');
+def('branding', 'support.provider_name', singleLine(80), 'support');
+def('branding', 'market.providers', z.array(marketProvider).max(50), 'market');
+
 export const CONFIG_KEYS = Object.freeze(K);
 export const GROUP_NAMES = Object.keys(CONFIG_GROUPS);
 export const groupOfKey = (key) => CONFIG_KEYS[key]?.group ?? null;
@@ -281,4 +321,42 @@ export const APPLIERS = {
   },
   bpk: (ctx, v, req) => need(ctx.systemHealth, 'System Health').setConfig(pick(v, 'system_health.bpk.'), req),
   stats: (ctx, v, req) => need(ctx.serverConfig?.stats, 'Server Configuration').update(pick(v, 'stats.'), req),
+  branding: (ctx, v, req) => need(ctx.cpanel?.branding, 'cPanel (Customization)').update(pick(v, 'branding.'), req),
+  themes(ctx, v, req) {
+    const t = need(ctx.themes, 'Themes');
+    const patch = {};
+    if (v['themes.default'] !== undefined) patch.default = v['themes.default'];
+    if (v['themes.account_default'] !== undefined) patch.accountDefault = v['themes.account_default'];
+    if (v['themes.allow_user_override'] !== undefined) patch.allowUserOverride = v['themes.allow_user_override'];
+    return t.configure(patch, req);
+  },
+  support(ctx, v, req) {
+    const s = need(ctx.support, 'Support');
+    const patch = {};
+    if (v['support.email'] !== undefined) patch.email = v['support.email'];
+    if (v['support.provider_name'] !== undefined) patch.providerName = v['support.provider_name'];
+    if (v['support.portal_url'] !== undefined) patch.portalUrl = v['support.portal_url'];
+    const access = pick(v, 'support.access.');
+    if (Object.keys(access).length) patch.access = access;
+    return s.updateSettings(patch, req);
+  },
+  // The provider table is Market's source of truth and the setting only mirrors
+  // it, so the catalogue is applied provider by provider to the ones that exist
+  // here. A provider this host does not have needs an adapter and credentials
+  // that never travel, so it is reported rather than created.
+  market(ctx, v, req) {
+    const m = need(ctx.market, 'Market');
+    const local = new Map((m.sslProviders?.() ?? []).map((p) => [p.name, p]));
+    const skipped = [];
+    for (const p of v['market.providers'] ?? []) {
+      if (!local.has(p.name)) { skipped.push(p.name); continue; }
+      const patch = { displayName: p.displayName };
+      if (p.url !== undefined) patch.url = p.url;
+      if (p.commissionPercent !== undefined) patch.commissionPercent = p.commissionPercent;
+      if (p.products !== undefined) patch.products = p.products.map(({ basePrice, price, ...rest }) => ({ ...rest, price: basePrice ?? price ?? null }));
+      m.update(p.name, patch, req);
+    }
+    if (skipped.length) { const err = new Error(`not created here (add the provider with its credentials first): ${skipped.join(', ')}`); err.code = 'unsupported'; err.status = 422; throw err; }
+    return { live: true };
+  },
 };
