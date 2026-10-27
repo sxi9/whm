@@ -328,28 +328,32 @@ describe('built-in providers', () => {
     await put('/api/market/providers/cpstore/config', { url: 'https://store.cpanel.net', config: { accountEmail: 'ops@example.com' } }).expect(200);
     expect((await get('/api/market/providers/cpstore').expect(200)).body.data.config.accountEmail).toBe('ops@example.com');
   });
-  it('configures the plugin hub and exposes it to the Plugins category', async () => {
-    expect(app.ctx.market.hub()).toEqual({ enabled: false, url: null, licenseKey: null });
+  it('configures the plugin hub and exposes it to the marketplace client', async () => {
+    expect(app.ctx.market.hub()).toEqual({ enabled: false, url: null });
     expect((await post('/api/market/providers/whm-hub/enable')).status).toBe(422);
     expect((await put('/api/market/providers/whm-hub/config', { url: 'https://hub.example.com', config: { apiKey: 'x' } })).status).toBe(422);
-    const badKey = await put('/api/market/providers/whm-hub/config', { url: 'https://hub.example.com', config: { licenseKey: 'LIC-123' } });
+    // The license key is entered under Basic Setup → License only (§18.6): the adapter no longer has the field.
+    const badKey = await put('/api/market/providers/whm-hub/config', { url: 'https://hub.example.com', config: { licenseKey: 'whm-7k3q-m2df-9xa1-p0r6' } });
     expect(badKey.status).toBe(422);
-    expect(badKey.body.error.fields.licenseKey[0]).toMatch(/WHM-XXXX/);
-    // Without a key the probe reads the public signing-key list (docs/design/license-server.md §16.5).
+    expect(badKey.body.error.fields.licenseKey[0]).toMatch(/Unknown field/);
+    expect(app.ctx.market.adapters().find((a) => a.id === 'hub').configFields).toEqual([]);
+    // Without a license the probe reads the public signing-key list (docs/design/license-server.md §16.5).
     await put('/api/market/providers/whm-hub/config', { url: 'https://hub.example.com/', config: {} }).expect(200);
     const seen = [];
     app.ctx.market.transport.request = async (url, opts) => { seen.push({ url, opts }); return { status: 200, ok: true, json: { keys: [{ kid: 'a91f3c2e', status: 'active' }] }, text: '' }; };
-    expect((await post('/api/market/providers/whm-hub/test').expect(200)).body.data.result).toMatchObject({ ok: true, message: 'Hub hub.example.com is reachable (1 signing key published); add a license key to check its status' });
+    expect((await post('/api/market/providers/whm-hub/test').expect(200)).body.data.result).toMatchObject({ ok: true, message: 'Hub hub.example.com is reachable (1 signing key published); activate a license under Basic Setup → License to check its status' });
     expect(seen[0].url).toBe('https://hub.example.com/v1/keys');
     expect(seen[0].opts?.headers?.Authorization).toBeUndefined();
     app.ctx.market.transport.request = async () => ({ status: 200, ok: true, json: { name: 'something else' }, text: '' });
     expect((await post('/api/market/providers/whm-hub/test').expect(200)).body.data.result).toMatchObject({ ok: false, message: expect.stringMatching(/not like a license hub/) });
-    const res = await put('/api/market/providers/whm-hub/config', { url: 'https://hub.example.com/', config: { licenseKey: 'whm-7k3q-m2df-9xa1-p0r6' } }).expect(200);
-    expect(res.body.data).toMatchObject({ url: 'https://hub.example.com/', configured: true, secretsSet: ['licenseKey'], config: { licenseKey: null } });
+    const res = await put('/api/market/providers/whm-hub/config', { url: 'https://hub.example.com/', config: {} }).expect(200);
+    expect(res.body.data).toMatchObject({ url: 'https://hub.example.com/', configured: true, secretsSet: [] });
     await post('/api/market/providers/whm-hub/enable').expect(200);
-    expect(app.ctx.market.hub()).toEqual({ enabled: true, url: 'https://hub.example.com/', licenseKey: 'whm-7k3q-m2df-9xa1-p0r6' });
+    expect(app.ctx.market.hub()).toEqual({ enabled: true, url: 'https://hub.example.com/' });
     expect(app.ctx.market.enabledProviders('plugin').map((p) => p.name)).toEqual(['whm-hub']);
-    // With a key the probe is the public status lookup by key prefix: the key itself never leaves the panel.
+    // With a license the probe is the public status lookup by the key prefix ctx.license holds: the key itself never leaves the panel.
+    const realLicense = app.ctx.license;
+    app.ctx.license = { ...realLicense, get: () => ({ ...realLicense.get(), keyPrefix: 'WHM-7K3Q' }) };
     seen.length = 0;
     app.ctx.market.transport.request = async (url, opts) => { seen.push({ url, opts }); return { status: 200, ok: true, json: { data: { valid: true, status: 'active', edition: 'pro', expires_at: '2027-10-27' } }, text: '' }; };
     const test = await post('/api/market/providers/whm-hub/test').expect(200);
@@ -360,6 +364,7 @@ describe('built-in providers', () => {
     expect((await post('/api/market/providers/whm-hub/test').expect(200)).body.data.result).toMatchObject({ ok: false, message: 'hub.example.com: license WHM-7K3Q is revoked (pro)' });
     app.ctx.market.transport.request = async () => ({ status: 404, ok: false, json: { error: { code: 'not_found' } }, text: '' });
     expect((await post('/api/market/providers/whm-hub/test').expect(200)).body.data.result).toMatchObject({ ok: false, message: 'hub.example.com does not know license WHM-7K3Q' });
+    app.ctx.license = realLicense;
     // Plugin rows have no product list of their own: the catalog comes from the hub.
     const products = await put('/api/market/providers/whm-hub', { products: [{ id: 'x', name: 'x' }] });
     expect(products.status).toBe(422);

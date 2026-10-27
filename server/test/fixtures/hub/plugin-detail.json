@@ -1,0 +1,18 @@
+{
+  "net.example.scoped": {
+    "description_md": "Reads the account list to build a report.", "keywords": ["accounts"], "homepage": "https://example.net/scoped", "support_url": null, "license_spdx": "MIT", "screenshots": [],
+    "permissions": [
+      { "scope": "accounts:read", "description": "Read hosting accounts (ctx.api.accounts.list / get)", "justification": "The report lists every account and its package." },
+      { "scope": "store:own", "description": "Read and write the plugin's own key/value store and collections (ctx.store)", "justification": "Caches the last report." }
+    ],
+    "compatibility": { "engines_whm": ">=1.0.0", "host": "1.0.0", "compatible": true },
+    "changelog": [{ "version": "1.0.0", "channel": "stable", "published_at": "2026-10-21T10:00:00Z", "changelog_md": "First release." }],
+    "reviews": [{ "id": "rev_1", "rating": 5, "title": "Works", "body": "Does what it says.", "created_at": "2026-10-22T00:00:00Z", "developer_reply": null }],
+    "bundled_editions": []
+  },
+  "net.example.paid": {
+    "description_md": "Speeds things up. Paid.", "keywords": ["cache"], "homepage": null, "support_url": null, "license_spdx": "Proprietary", "screenshots": [],
+    "permissions": [{ "scope": "settings:own", "description": "Read and write the plugin's own settings (ctx.settings)", "justification": null }],
+    "compatibility": { "engines_whm": "^1.0.0", "host": "1.0.0", "compatible": true }, "changelog": [], "reviews": [], "bundled_editions": ["enterprise"]
+  }
+}

@@ -36,6 +36,9 @@ export const EVENTS = [
   { key: 'license.expiring', label: 'License expiring', severity: 'warning', group: 'Licensing', wired: false },
   { key: 'license.invalid', label: 'License invalid or revoked', severity: 'error', group: 'Licensing', wired: false },
   { key: 'license.activated', label: 'License activated or renewed', severity: 'info', group: 'Licensing', wired: false },
+  { key: 'license.plugin_key_conflict', label: 'Plugin signing key conflicts with an operator-installed key', severity: 'error', group: 'Licensing' },
+  { key: 'plugin.revoked', label: 'Marketplace plugin revoked and disabled', severity: 'error', group: 'Plugins' },
+  { key: 'plugin.update_available', label: 'Marketplace plugin updates available', severity: 'info', group: 'Plugins' },
   { key: 'test', label: 'Test notification', severity: 'info', group: 'Panel' },
 ].map((e) => ({ wired: true, ...e }));
 export const MANAGED_MAIL_USERS = ['root', 'nobody'];

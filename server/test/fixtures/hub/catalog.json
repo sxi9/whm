@@ -1,0 +1,29 @@
+{
+  "data": [
+    {
+      "id": "net.example.minimal", "name": "Minimal", "slug": "minimal", "summary": "Smallest valid plugin, free.",
+      "developer": { "slug": "example", "display_name": "Example Dev", "verified": true }, "category": { "slug": "developer-tools", "name": "Developer tools" },
+      "pricing": { "model": "free" }, "latest": { "version": "1.0.0", "channel": "stable", "published_at": "2026-10-20T10:00:00Z", "engines_whm": ">=1.0.0" },
+      "install_count": 12, "rating_avg": 4.5, "rating_count": 2, "featured": false, "icon_url": null, "updated_at": "2026-10-20T10:00:00Z"
+    },
+    {
+      "id": "net.example.scoped", "name": "Scoped", "slug": "scoped", "summary": "Reads accounts; asks for consent.",
+      "developer": { "slug": "example", "display_name": "Example Dev", "verified": true }, "category": { "slug": "security", "name": "Security" },
+      "pricing": { "model": "free" }, "latest": { "version": "1.0.0", "channel": "stable", "published_at": "2026-10-21T10:00:00Z", "engines_whm": ">=1.0.0" },
+      "install_count": 3, "rating_avg": null, "rating_count": 0, "featured": true, "icon_url": null, "updated_at": "2026-10-21T10:00:00Z"
+    },
+    {
+      "id": "net.example.paid", "name": "Paid Cache Boost", "slug": "paid-cache-boost", "summary": "A paid plugin.",
+      "developer": { "slug": "acme", "display_name": "ACME", "verified": true }, "category": { "slug": "other", "name": "Other" },
+      "pricing": { "model": "one_time", "amount_cents": 4900, "currency": "USD" }, "latest": { "version": "2.1.0", "channel": "stable", "published_at": "2026-10-22T10:00:00Z", "engines_whm": "^1.0.0" },
+      "install_count": 40, "rating_avg": 4.9, "rating_count": 10, "featured": false, "icon_url": null, "updated_at": "2026-10-22T10:00:00Z"
+    },
+    {
+      "id": "net.whm.sample-notes", "name": "Sample Notes", "slug": "sample-notes", "summary": "Reference plugin for the WHM plugin SDK.",
+      "developer": { "slug": "whm", "display_name": "WHM", "verified": true }, "category": { "slug": "developer-tools", "name": "Developer tools" },
+      "pricing": { "model": "free" }, "latest": { "version": "1.1.0", "channel": "stable", "published_at": "2026-10-23T10:00:00Z", "engines_whm": "^1.0.0" },
+      "install_count": 7, "rating_avg": 5, "rating_count": 1, "featured": true, "icon_url": null, "updated_at": "2026-10-23T10:00:00Z"
+    }
+  ],
+  "meta": { "page": 1, "pageSize": 24, "total": 4 }
+}

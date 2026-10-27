@@ -9,6 +9,7 @@ import { Button } from '../../../components/Form.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError } from '../../ssl/Shared.jsx';
+import { LICENSE_PATH } from '../../server-configuration/LicenseTab.jsx';
 import { useProviders, ProviderStatus, LastTest, ProviderFormModal, ConfigureModal, TestResultCard, money, TYPE_LABELS } from '../../market/Shared.jsx';
 
 export default function MarketProviderManager({ fn }) {
@@ -77,7 +78,7 @@ export default function MarketProviderManager({ fn }) {
               { key: 'adapter', label: 'Adapter', render: (p) => p.adapterLabel },
               { key: 'enabled', label: 'Status', render: (p) => <ProviderStatus p={p} /> },
               { key: 'url', label: 'URL', render: (p) => (p.url ? <a href={p.url} target="_blank" rel="noreferrer">{p.url.replace(/^https:\/\//, '')}</a> : <span className="muted">—</span>) },
-              { key: 'products', label: isRoot ? 'Products (resale)' : 'Products', render: (p) => (p.type === 'ssl' ? (p.products.length ? p.products.map((x) => `${x.name} (${money(x.price, x.currency)})`).join(' · ') : <span className="muted">none</span>) : <span className="muted">catalog from hub</span>) },
+              { key: 'products', label: isRoot ? 'Products (resale)' : 'Products', render: (p) => (p.type === 'ssl' ? (p.products.length ? p.products.map((x) => `${x.name} (${money(x.price, x.currency)})`).join(' · ') : <span className="muted">none</span>) : <span className="muted">catalog from hub{p.adapter === 'hub' && <> · <Link to={LICENSE_PATH}>License key is entered under Basic Setup → License</Link></>}</span>) },
               ...(isRoot ? [
                 { key: 'commissionPercent', label: 'Commission', align: 'right', render: (p) => (p.readOnly ? '—' : `${p.commissionPercent}%`) },
                 { key: 'orders', label: 'Orders', align: 'right', render: (p) => (p.orders == null ? '—' : p.orders) },

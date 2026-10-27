@@ -213,22 +213,22 @@ export const ADAPTERS = {
     readOnly: true,
     requiresUrl: false,
   },
-  // The plugin marketplace hub (Phase 5): a single built-in row (whm-hub) that
-  // the Plugins category will read through ctx.market.hub(). The probe follows
-  // docs/design/license-server.md §16.5: both routes are public, so the license
-  // key itself is never sent, only its display prefix.
+  // The plugin marketplace hub: a single built-in row (whm-hub) that the
+  // marketplace client reads through ctx.market.hub() as its enable switch. The
+  // license key and the hub URL the panel trusts belong to ctx.license (entered
+  // under Basic Setup → License), so this adapter stores no credential; the probe
+  // follows docs/design/license-server.md §16.5 (both routes are public and only
+  // the key's display prefix, from io.licensePrefix(), is sent).
   hub: {
     id: 'hub',
     label: 'WHM plugin marketplace hub',
     types: ['plugin'],
     singleton: true,
-    configFields: [
-      { key: 'licenseKey', label: 'License key', required: false, secret: true, kind: 'licenseKey', help: 'WHM-XXXX-XXXX-XXXX-XXXX, issued by the license server. Only its first group is sent when testing.' },
-    ],
+    configFields: [],
     requiresUrl: true,
     async test(provider, config, io) {
       if (!provider.url) return { ok: false, message: 'Set the hub URL first' };
-      const prefix = config.licenseKey ? licenseKeyPrefix(config.licenseKey) : null;
+      const prefix = typeof io.licensePrefix === 'function' ? io.licensePrefix() : null;
       const url = joinUrl(provider.url, prefix ? `/v1/status/${prefix}` : '/v1/keys');
       const host = hostOf(url);
       try {
@@ -246,7 +246,7 @@ export const ADAPTERS = {
         }
         const keys = Array.isArray(data.keys) ? data.keys.length : null;
         if (keys === null) return { ok: false, message: `${host} answered HTTP ${res.status} but not like a license hub (no signing keys published)`, details: { status: res.status } };
-        return { ok: true, message: `Hub ${host} is reachable (${keys} signing key${keys === 1 ? '' : 's'} published); add a license key to check its status`, details: { status: res.status, keys } };
+        return { ok: true, message: `Hub ${host} is reachable (${keys} signing key${keys === 1 ? '' : 's'} published); activate a license under Basic Setup → License to check its status`, details: { status: res.status, keys } };
       } catch (err) { return { ok: false, message: `${host}: ${describeError(err)}` }; }
     },
   },

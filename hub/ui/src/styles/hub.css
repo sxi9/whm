@@ -1,0 +1,44 @@
+/* Hub-only additions on top of the copied panel kit (base.css). */
+.brand { display: flex; align-items: center; gap: 8px; color: var(--chrome-text); }
+.brand-sub { font-size: 12px; margin-left: 4px; color: var(--chrome-muted); }
+.topbar-host { display: inline-flex; align-items: center; gap: 4px; }
+.nav-category-head { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--chrome-muted); padding: 10px 12px 4px; cursor: default; }
+.nav-category-head:hover { background: transparent; }
+.sidebar { position: relative; min-height: calc(100vh - var(--topbar-h) - var(--footer-h)); }
+.two-col { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+.three-col { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; align-items: start; }
+@media (max-width: 1000px) { .two-col, .three-col { grid-template-columns: 1fr; } }
+.stat-grid { margin-bottom: 18px; }
+.stat .hint { color: var(--text-faint); font-size: 11px; margin-top: 2px; }
+.code-block { font-family: var(--mono); font-size: 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; white-space: pre-wrap; word-break: break-all; margin: 0 0 10px; }
+.secret-once { border: 1px dashed var(--warn); background: var(--warn-soft); border-radius: var(--radius); padding: 12px; margin: 10px 0; }
+.secret-once code { font-size: 14px; display: block; margin: 6px 0; background: var(--surface); }
+.inline-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.scope-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.scope-list li { display: grid; grid-template-columns: 220px 1fr; gap: 10px; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius); font-size: 13px; }
+.scope-list li.added { border-color: var(--warn); background: var(--warn-soft); }
+.scope-list code { align-self: start; }
+.diff { font-family: var(--mono); font-size: 12px; max-height: 480px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); }
+.diff .line { padding: 0 10px; white-space: pre-wrap; }
+.diff .add { background: var(--ok-soft); } .diff .del { background: var(--bad-soft); } .diff .hunk { color: var(--text-muted); background: var(--surface-2); }
+.filter-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+.filter-row .input { width: auto; min-width: 160px; }
+.mini-bars { display: flex; align-items: flex-end; gap: 3px; height: 60px; }
+.mini-bars span { flex: 1; background: var(--primary); border-radius: 2px 2px 0 0; min-width: 4px; }
+.timeline { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+.timeline li { display: grid; grid-template-columns: 170px 1fr; gap: 10px; padding: 6px 0; border-bottom: 1px dashed var(--border); }
+.timeline li:last-child { border-bottom: 0; }
+.timeline time { color: var(--text-muted); font-family: var(--mono); font-size: 12px; }
+.progress-log { margin-top: 12px; }
+.progress-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.progress-bar { flex: 1; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+.progress-bar span { display: block; height: 100%; background: var(--primary); }
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+.tabs button { background: transparent; border: 0; border-bottom: 2px solid transparent; padding: 8px 12px; color: var(--text-muted); cursor: pointer; font: inherit; }
+.tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--primary); font-weight: 500; }
+.stepup-form .banner { margin-bottom: 10px; }
+.page-description { color: var(--text-muted); margin-top: 4px; }
+.table-wrap table { width: 100%; border-collapse: collapse; }
+.table-wrap th, .table-wrap td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: top; }
+.table-wrap th { font-weight: 600; color: var(--text-muted); font-size: 12px; }
+.align-right { text-align: right; }

@@ -8,6 +8,7 @@ import { createTestApp, waitForJob } from './support/app.js';
 import { createTarGz, packageFromFiles } from './support/tar.js';
 import { loadCommonJs, REPO_ROOT } from '../src/lib/plugin-sdk.js';
 import { HOST_API_VERSION, PASSWORD_MASK, DENIAL_RING_SIZE, LOG_RING_SIZE } from '../src/services/plugins.js';
+import { HttpError } from '../src/lib/errors.js';
 
 const fixtures = loadCommonJs(path.join(REPO_ROOT, 'plugins', 'sdk', 'test', 'fixtures.js'));
 const ID = 'net.example.hello';
@@ -959,5 +960,118 @@ describe('signatures', () => {
     expect((await installRaw(packageFromFiles(files))).status).toBe(201);
     app.ctx.settings.set('plugins.require_signature', false);
     await del('/api/plugins/manage/net.example.signed?purge=true');
+  });
+});
+
+// Additive host edits for the marketplace client (build plan U5, §18.6).
+describe('marketplace policy, developer-mode gate, bundled source and enable guards', () => {
+  const kidOf = (publicKey) => crypto.createHash('sha256').update(publicKey.export({ type: 'spki', format: 'der' }).subarray(-32)).digest('hex').slice(0, 8);
+  let hubKey;
+  let otherKey;
+  const SIMPLE_MAIN = "module.exports = { async activate(ctx) { ctx.log.info('up'); }, async deactivate() {} };\n";
+  const manifest = (version = '1.0.0') => fixtures.minimalManifest({ id: 'net.example.policy', version });
+  const packed = (m, key, kid) => packageFromFiles(key ? signFiles(packageFiles(m, SIMPLE_MAIN), key, kid) : packageFiles(m, SIMPLE_MAIN));
+  const install = (buffer, options) => app.ctx.plugins.install({ buffer, source: 'marketplace' }, { user: { id: 1, username: 'root', role: 'root' }, ...options });
+
+  beforeAll(() => {
+    hubKey = crypto.generateKeyPairSync('ed25519');
+    otherKey = crypto.generateKeyPairSync('ed25519');
+    const keysDir = path.join(app.ctx.config.dataDir, 'plugin-keys');
+    fs.mkdirSync(keysDir, { recursive: true });
+    hubKey.kid = kidOf(hubKey.publicKey);
+    otherKey.kid = kidOf(otherKey.publicKey);
+    fs.writeFileSync(path.join(keysDir, `${hubKey.kid}.pub`), hubKey.publicKey.export({ type: 'spki', format: 'pem' }));
+    fs.writeFileSync(path.join(keysDir, `${otherKey.kid}.pub`), otherKey.publicKey.export({ type: 'spki', format: 'pem' }));
+  });
+
+  it('policy.requireSigned refuses unsigned and foreign-signed packages whatever plugins.require_signature says', async () => {
+    expect(app.ctx.settings.get('plugins.require_signature')).toBe(false);
+    const policy = { requireSigned: true, signers: [hubKey.kid], activate: false };
+    await expect(install(packed(manifest()), { policy })).rejects.toMatchObject({ status: 422, code: 'unsigned_package' });
+    await expect(install(packed(manifest(), otherKey.privateKey, otherKey.kid), { policy })).rejects.toMatchObject({ status: 422, code: 'untrusted_signer' });
+    await expect(install(packed(manifest(), hubKey.privateKey, 'nokey'), { policy })).rejects.toMatchObject({ status: 422, code: 'untrusted_signer' });
+    const ok = await install(packed(manifest(), hubKey.privateKey, hubKey.kid), { policy });
+    expect(ok).toMatchObject({ wasEnabled: false, previousVersion: null, warnings: ['in-process'], plugin: { id: 'net.example.policy', state: 'installed', signed: true, signer: hubKey.kid, source: 'marketplace' } });
+  });
+
+  it('policy.activate false leaves an upgraded plugin disabled and reports wasEnabled', async () => {
+    await app.ctx.plugins.enable('net.example.policy');
+    expect(app.ctx.plugins.get('net.example.policy').state).toBe('enabled');
+    const policy = { requireSigned: true, signers: [hubKey.kid], activate: false };
+    const up = await install(packed(manifest('1.1.0'), hubKey.privateKey, hubKey.kid), { policy });
+    expect(up).toMatchObject({ wasEnabled: true, previousVersion: '1.0.0', plugin: { version: '1.1.0', state: 'disabled' } });
+    expect(app.ctx.plugins.isLive('net.example.policy')).toBe(false);
+    expect(app.ctx.db.prepare('SELECT state FROM plugins WHERE id = ?').get('net.example.policy').state).toBe('disabled');
+    await app.ctx.plugins.enable('net.example.policy');
+    const again = await install(packed(manifest('1.2.0'), hubKey.privateKey, hubKey.kid), { policy: { ...policy, activate: true } });
+    expect(again).toMatchObject({ wasEnabled: true, plugin: { version: '1.2.0', state: 'enabled' } });
+    expect(app.ctx.plugins.isLive('net.example.policy')).toBe(true);
+    await del('/api/plugins/manage/net.example.policy?purge=true');
+  });
+
+  it('gates sideloads behind plugins.developer_mode while the hub row is enabled; bundled dirs are exempt', async () => {
+    await put('/api/market/providers/whm-hub/config', { url: 'https://hub.example.test/', config: {} }).expect(200);
+    await post('/api/market/providers/whm-hub/enable').expect(200);
+    expect(app.ctx.marketplace.status().enabled).toBe(true);
+    expect(app.ctx.settings.get('plugins.developer_mode')).toBe(false);
+    const m = fixtures.minimalManifest({ id: 'net.example.sideloaded' });
+    const gated = await installRaw(packageFromFiles(packageFiles(m)));
+    expect(gated.status).toBe(422);
+    expect(gated.body.error).toMatchObject({ code: 'unsigned_package', message: 'enable plugins.developer_mode to sideload while the marketplace is enabled' });
+    const unknownKid = await installRaw(packageFromFiles(signFiles(packageFiles(m), otherKey.privateKey, 'unknown')));
+    expect(unknownKid.body.error.code).toBe('unsigned_package');
+    // A package signed by a trusted key sideloads without developer mode and is recorded as upload.
+    const signed = await installRaw(packageFromFiles(signFiles(packageFiles(m), hubKey.privateKey, hubKey.kid)));
+    expect(signed.status).toBe(201);
+    expect(signed.body.data.plugin).toMatchObject({ source: 'upload', signed: true, signer: hubKey.kid });
+    app.ctx.settings.set('plugins.developer_mode', true);
+    const allowed = await installRaw(packageFromFiles(packageFiles(m)));
+    expect(allowed.status).toBe(201);
+    expect(allowed.body.data).toMatchObject({ warnings: ['unsigned', 'in-process'], plugin: { source: 'upload', signed: false } });
+    app.ctx.settings.set('plugins.developer_mode', false);
+    // Bundled directories ship with the release: exempt from both gates even with require_signature on.
+    app.ctx.settings.set('plugins.require_signature', true);
+    const bundledDir = path.join(REPO_ROOT, 'plugins', 'bundled', 'net.whm.server-monitoring');
+    const bundled = await post('/api/plugins/manage/install', { dir: bundledDir, source: 'bundled' });
+    expect(bundled.status, JSON.stringify(bundled.body)).toBe(201);
+    expect(bundled.body.data.plugin).toMatchObject({ id: 'net.whm.server-monitoring', source: 'bundled', signed: false });
+    // The same claim from a directory outside plugins/bundled is recorded as `path` and gated like any sideload.
+    const dir = writePlugin(path.join(tmp, 'fake-bundled'), fixtures.minimalManifest({ id: 'net.example.fakebundled' }));
+    const fake = await post('/api/plugins/manage/install', { dir, source: 'bundled' });
+    expect(fake.status).toBe(422);
+    expect(fake.body.error.code).toBe('unsigned_package');
+    app.ctx.settings.set('plugins.require_signature', false);
+    app.ctx.settings.set('plugins.developer_mode', true);
+    const fakeAllowed = await post('/api/plugins/manage/install', { dir, source: 'bundled' });
+    expect(fakeAllowed.status).toBe(201);
+    expect(fakeAllowed.body.data.plugin.source).toBe('path');
+    app.ctx.settings.set('plugins.developer_mode', false);
+    await post('/api/market/providers/whm-hub/disable').expect(200);
+    expect((await installRaw(packageFromFiles(packageFiles(fixtures.minimalManifest({ id: 'net.example.sideloaded' }))))).status).toBe(201);
+    await del('/api/plugins/manage/net.example.sideloaded?purge=true');
+    await del('/api/plugins/manage/net.example.fakebundled?purge=true');
+    await del('/api/plugins/manage/net.whm.server-monitoring?purge=true');
+  });
+
+  it('runs enable guards before activation and lets a thrown HttpError reach the manage route and programmatic callers', async () => {
+    const m = fixtures.minimalManifest({ id: 'net.example.guarded' });
+    expect((await installRaw(packageFromFiles(packageFiles(m, SIMPLE_MAIN)))).status).toBe(201);
+    expect(Array.isArray(app.ctx.plugins.guards.enable)).toBe(true);
+    const seen = [];
+    const guard = (id, row) => { seen.push([id, row.state]); if (id === 'net.example.guarded') throw new HttpError(409, 'plugin_revoked', 'revoked by the marketplace'); };
+    app.ctx.plugins.guards.enable.push(guard);
+    try {
+      const res = await post('/api/plugins/manage/net.example.guarded/enable');
+      expect(res.status).toBe(409);
+      expect(res.body.error.code).toBe('plugin_revoked');
+      await expect(app.ctx.plugins.enable('net.example.guarded')).rejects.toMatchObject({ code: 'plugin_revoked' });
+      expect(app.ctx.plugins.isLive('net.example.guarded')).toBe(false);
+      expect(app.ctx.plugins.get('net.example.guarded').state).toBe('installed');
+      expect(seen).toEqual([['net.example.guarded', 'installed'], ['net.example.guarded', 'installed']]);
+    } finally {
+      app.ctx.plugins.guards.enable.splice(app.ctx.plugins.guards.enable.indexOf(guard), 1);
+    }
+    expect((await post('/api/plugins/manage/net.example.guarded/enable')).status).toBe(200);
+    await del('/api/plugins/manage/net.example.guarded?purge=true');
   });
 });

@@ -1,6 +1,6 @@
-import { useState } from 'react';
-import { Link } from 'react-router-dom';
-import { AlertTriangle, ShieldAlert, Puzzle } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Link, useLocation } from 'react-router-dom';
+import { AlertTriangle, Puzzle, KeyRound } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { usePluginNav } from '../../../hooks/usePluginNav.js';
@@ -11,22 +11,40 @@ import { PluginFields, fieldDefault } from '../../plugins/PluginPage.jsx';
 import { describePermission } from '../../cpanel/pluginPermissions.js';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
+import { Tabs } from '../../security/Shared.jsx';
+import { TrustNotice } from '../../cpanel/ConsentModal.jsx';
+import { MarketplaceTab } from '../../cpanel/MarketplaceTab.jsx';
+
+export { TrustNotice };
 
 const REQUIRE_SIGNATURE = 'plugins.require_signature';
+const DEVELOPER_MODE = 'plugins.developer_mode';
+const SETTINGS_PREFIX = 'plugins.';
+export const TABS = [{ value: 'installed', label: 'Installed' }, { value: 'marketplace', label: 'Marketplace' }];
 
-// In-process plugins share the panel process, so the permission list is a
-// record of what a plugin declares and uses, not a boundary the host can
-// enforce against hostile code. The same wording ships in the install response
-// (warnings: ['in-process']) and the design of record.
-export function TrustNotice() {
+export function sourceLabel(source) {
+  if (source === 'marketplace') return 'Marketplace';
+  if (source === 'bundled') return 'Bundled';
+  return 'Sideloaded';
+}
+
+// Sideloading (upload / path installs) while the hub is enabled needs the
+// developer-mode switch: without it the host answers 422 unsigned_package for
+// anything a marketplace signing key did not sign (§18.6).
+export function DeveloperMode({ enabled, marketplaceEnabled, onChange, busy }) {
   return (
-    <div className="banner banner-info">
-      <ShieldAlert size={18} />
-      <div>
-        <strong>Plugins run inside the panel process</strong>
-        <p>An enabled plugin executes with the panel's own privileges (root in monolithic mode). Declared permissions are checked and recorded for review, but they are not a security boundary against malicious code: install only plugins you trust, and prefer signed packages. Process isolation arrives with the marketplace.</p>
-      </div>
-    </div>
+    <>
+      {enabled && (
+        <div className="banner banner-warning">
+          <AlertTriangle size={18} />
+          <div>
+            <strong>Developer mode is on</strong>
+            <p>Unsigned packages can be sideloaded while the marketplace hub is enabled, and a revoked plugin can be re-enabled without acknowledging the revocation. Turn it off on production servers.</p>
+          </div>
+        </div>
+      )}
+      <Toggle checked={Boolean(enabled)} disabled={busy} onChange={onChange} label="Developer mode (sideloading)" description={marketplaceEnabled ? 'Allow unsigned uploads and path installs while the marketplace hub is enabled.' : 'Only matters once the marketplace hub is enabled: sideloads then need this switch.'} />
+    </>
   );
 }
 
@@ -127,6 +145,43 @@ function PluginSettingsForm({ id, settings }) {
   );
 }
 
+// Restore tokens let a plugin with backups:restore run a restore the operator
+// confirmed: POST /plugins/manage/:id/restore-token → a short-lived token the
+// plugin's restore page or route needs.
+export function RestoreTokenForm({ id }) {
+  const toast = useToast();
+  const [artefactId, setArtefactId] = useState('');
+  const [account, setAccount] = useState('');
+  const [issued, setIssued] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const issue = async (e) => {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api.post(`/plugins/manage/${id}/restore-token`, { artefactId: artefactId.trim(), account: account.trim() });
+      setIssued(res.data);
+      toast.success('Restore token issued');
+    } catch (err) { setError(err); } finally { setBusy(false); }
+  };
+  return (
+    <>
+      <h3>Issue restore token</h3>
+      <p className="muted small">A plugin that restores backups needs a token you issue here for one artefact and one account; it expires after a few minutes.</p>
+      <form onSubmit={issue}>
+        <div className="form-grid">
+          <Field label="Backup artefact id" htmlFor={`rt-art-${id}`}><TextInput id={`rt-art-${id}`} value={artefactId} onChange={setArtefactId} placeholder="42" className="input mono" /></Field>
+          <Field label="Account" htmlFor={`rt-acct-${id}`}><TextInput id={`rt-acct-${id}`} value={account} onChange={setAccount} placeholder="username" className="input mono" /></Field>
+        </div>
+        <ErrorBanner error={error} />
+        {issued && <div className="banner banner-success"><KeyRound size={18} /><div><strong>Token</strong><p><code>{issued.token}</code></p><small>Expires {formatDate(issued.expiresAt)}</small></div></div>}
+        <FormActions><Button type="submit" icon={KeyRound} loading={busy} disabled={!artefactId.trim() || !account.trim()}>Issue restore token</Button></FormActions>
+      </form>
+    </>
+  );
+}
+
 function PluginDetail({ id, onClose }) {
   const { data, loading, error, refetch } = useApi(`/plugins/manage/${id}`);
   if (loading && !data) return <Card title={id}><Loading /></Card>;
@@ -139,7 +194,7 @@ function PluginDetail({ id, onClose }) {
         ['Plugin id', <code key="id">{data.id}</code>],
         ['State', <span key="s"><StatusPill status={data.state} />{data.lastError ? <span className="muted"> {data.lastError.code}: {data.lastError.message}</span> : null}</span>],
         ['Author', data.author ? `${data.author.name || ''}${data.author.email ? ` <${data.author.email}>` : ''}` : '—'],
-        ['Package', data.signed ? `signed by ${data.signer}` : 'unsigned'],
+        ['Package', `${data.signed ? `signed by ${data.signer}` : 'unsigned'} · ${sourceLabel(data.source)}`],
         ['Isolation', `${data.isolation} (runs inside the panel process)`],
         ['Host API', `${data.hostVersion}${data.compatible === false ? ' — incompatible' : ''}`],
         ['Installed', `${formatDate(data.installedAt)} from ${data.source}`],
@@ -165,6 +220,7 @@ function PluginDetail({ id, onClose }) {
       )}
 
       {data.settings?.fields?.length > 0 && <PluginSettingsForm id={data.id} settings={data.settings} />}
+      <RestoreTokenForm id={data.id} />
       {data.permissionDenials.length > 0 && (
         <div className="banner banner-warning">
           <AlertTriangle size={18} />
@@ -230,11 +286,16 @@ export default function ManagePlugins({ fn }) {
   const toast = useToast();
   const confirm = useConfirm();
   const nav = usePluginNav();
+  const location = useLocation();
   const list = useApi('/plugins/manage');
-  const settings = useApi(`/system/settings?prefix=${REQUIRE_SIGNATURE}`);
+  const settings = useApi(`/system/settings?prefix=${SETTINGS_PREFIX}`);
+  const marketplace = useApi('/marketplace/status');
+  const [tab, setTab] = useState(() => (location.hash === '#marketplace' ? 'marketplace' : 'installed'));
   const [selected, setSelected] = useState(null);
   const [busy, setBusy] = useState(null);
   const required = settings.data?.[REQUIRE_SIGNATURE] === true;
+  const developerMode = settings.data?.[DEVELOPER_MODE] === true;
+  useEffect(() => { if (location.hash === '#marketplace') setTab('marketplace'); }, [location.hash]);
 
   const refreshAll = () => { list.refetch(); nav.reload(); };
   const act = async (id, label, run) => {
@@ -244,6 +305,10 @@ export default function ManagePlugins({ fn }) {
   const setRequired = async (value) => {
     if (!value && !(await confirm({ title: 'Accept unsigned plugin packages?', message: 'Anyone with root access to the panel will be able to install packages that no trusted key has verified.', confirmLabel: 'Accept unsigned', danger: true }))) return;
     try { await api.put('/system/settings', { [REQUIRE_SIGNATURE]: value }); toast.success(value ? 'Only signed packages are accepted now' : 'Unsigned packages are accepted'); settings.refetch(); } catch (err) { toast.error(err); }
+  };
+  const setDeveloperMode = async (value) => {
+    if (value && !(await confirm({ title: 'Turn developer mode on?', message: 'Unsigned packages can then be sideloaded while the marketplace hub is enabled, and revoked plugins can be re-enabled without acknowledging the revocation.', confirmLabel: 'Turn on', danger: true }))) return;
+    try { await api.put('/system/settings', { [DEVELOPER_MODE]: value }); toast.success(value ? 'Developer mode is on' : 'Developer mode is off'); settings.refetch(); marketplace.refetch(); } catch (err) { toast.error(err); }
   };
   const uninstall = async (p, purge) => {
     const ok = await confirm({
@@ -259,7 +324,7 @@ export default function ManagePlugins({ fn }) {
   const columns = [
     { key: 'name', label: 'Plugin', render: (p) => <><strong>{p.name}</strong> <span className="muted small">{p.version}</span><br /><code className="small">{p.id}</code></> },
     { key: 'state', label: 'State', render: (p) => <><StatusPill status={p.state} />{p.lastError ? <span className="muted small"> {p.lastError.message}</span> : null}</> },
-    { key: 'signed', label: 'Package', render: (p) => (p.signed ? <span className="pill pill-ok">signed · {p.signer}</span> : <span className="pill pill-warn">unsigned</span>) },
+    { key: 'signed', label: 'Package', render: (p) => <>{p.signed ? <span className="pill pill-ok">signed · {p.signer}</span> : <span className="pill pill-warn">unsigned</span>} <span className={`pill ${p.source === 'marketplace' ? 'pill-info' : p.source === 'bundled' ? 'pill-muted' : 'pill-warn'}`}>{sourceLabel(p.source)}</span></> },
     { key: 'permissions', label: 'Permissions', render: (p) => <span title={p.permissions.join('\n')}>{p.permissions.length}</span> },
     { key: 'installedAt', label: 'Installed', render: (p) => formatDate(p.installedAt) },
   ];
@@ -272,22 +337,29 @@ export default function ManagePlugins({ fn }) {
     { label: 'Uninstall and purge', danger: true, disabled: busy === p.id, onClick: () => uninstall(p, true) },
   ];
 
+  const marketplaceEnabled = marketplace.data?.enabled === true;
   return (
     <>
       <PageHeader fn={fn} actions={<Button onClick={refreshAll}>Refresh</Button>} />
       <TrustNotice />
-      <Card title="Signature policy" subtitle="Who may ship code into this panel">
-        <ErrorBanner error={settings.error} onRetry={settings.refetch} />
-        <SignaturePolicy required={required} busy={!settings.data} onChange={setRequired} />
-      </Card>
-      <InstallCard onInstalled={refreshAll} />
-      <Card title="Installed plugins" padded={false}>
-        <DataTable columns={columns} rows={list.data || []} loading={list.loading} error={list.error} rowActions={rowActions} emptyText="No plugins are installed" />
-        {!list.loading && !list.error && (list.data || []).length === 0 && (
-          <div className="card-body"><EmptyState icon={Puzzle} title="No plugins yet"><p>Install a package above, or scaffold one with the <Link to="/development/cpanel-plugin-file-generator">plugin file generator</Link>.</p></EmptyState></div>
-        )}
-      </Card>
-      {selected && <PluginDetail id={selected} onClose={() => setSelected(null)} />}
+      <Tabs tabs={TABS.map((t) => (t.value === 'installed' ? { ...t, count: list.data?.length } : t))} value={tab} onChange={setTab} />
+      {tab === 'marketplace' ? <MarketplaceTab manage status={marketplace.data} /> : (
+        <>
+          <Card title="Signature policy" subtitle="Who may ship code into this panel">
+            <ErrorBanner error={settings.error} onRetry={settings.refetch} />
+            <SignaturePolicy required={required} busy={!settings.data} onChange={setRequired} />
+            <DeveloperMode enabled={developerMode} marketplaceEnabled={marketplaceEnabled} busy={!settings.data} onChange={setDeveloperMode} />
+          </Card>
+          <InstallCard onInstalled={refreshAll} />
+          <Card title="Installed plugins" padded={false}>
+            <DataTable columns={columns} rows={list.data || []} loading={list.loading} error={list.error} rowActions={rowActions} emptyText="No plugins are installed" />
+            {!list.loading && !list.error && (list.data || []).length === 0 && (
+              <div className="card-body"><EmptyState icon={Puzzle} title="No plugins yet"><p>Install a package above, browse the <button className="btn btn-sm btn-ghost" onClick={() => setTab('marketplace')}>Marketplace</button>, or scaffold one with the <Link to="/development/cpanel-plugin-file-generator">plugin file generator</Link>.</p></EmptyState></div>
+            )}
+          </Card>
+          {selected && <PluginDetail id={selected} onClose={() => setSelected(null)} />}
+        </>
+      )}
     </>
   );
 }

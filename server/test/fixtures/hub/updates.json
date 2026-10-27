@@ -1,0 +1,5 @@
+{ "data": [
+  { "id": "net.example.scoped", "current": "1.0.0", "latest": "1.0.1", "channel": "stable", "security": false, "changelog_url": "https://hub.test/v1/market/plugins/net.example.scoped/versions", "known": true },
+  { "id": "net.example.minimal", "current": "1.0.0", "latest": "1.0.0", "channel": "stable", "security": false, "changelog_url": "https://hub.test/v1/market/plugins/net.example.minimal/versions", "known": true },
+  { "id": "net.example.unknown-thing", "current": "0.0.1", "latest": "0.0.1", "channel": "stable", "security": false, "changelog_url": null, "known": false }
+] }

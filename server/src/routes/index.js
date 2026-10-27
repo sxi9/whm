@@ -7,6 +7,7 @@ import { authRoutes } from './auth.js';
 import { systemRoutes } from './system.js';
 import { accountRoutes, packageRoutes } from './accounts.js';
 import { pluginRoutes } from './plugins.js';
+import { marketplaceRoutes } from './marketplace.js';
 import { licenseRoutes } from './license.js';
 import { licenseGate } from '../middleware/license.js';
 
@@ -45,6 +46,7 @@ export async function apiRouter(ctx) {
   api.use('/accounts', accountRoutes(ctx));
   api.use('/packages', packageRoutes(ctx));
   api.use('/plugins', pluginRoutes(ctx));
+  api.use('/marketplace', marketplaceRoutes(ctx));
   for (const mount of mounts.filter((m) => !m.public)) {
     api.use(mount.path, mount.router);
     ctx.logger.debug({ category: mount.file, path: mount.path }, 'mounted category router');

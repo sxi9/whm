@@ -7,6 +7,7 @@ import { Loading } from './Common.jsx';
 import { PluginNavProvider } from '../hooks/usePluginNav.js';
 import { useBranding, useBrandingLoader } from '../pages/cpanel/branding.js';
 import { LicenseBanner } from '../pages/server-configuration/LicenseTab.jsx';
+import { RevocationBanner } from './RevocationBanner.jsx';
 
 export function Layout() {
   const { user, ready } = useAuth();
@@ -35,6 +36,7 @@ export function Layout() {
         {mobileOpen && <div className="sidebar-scrim" onClick={() => setMobileOpen(false)} />}
         <main className="content" id="main">
           <LicenseBanner license={user.license} />
+          <RevocationBanner />
           <Suspense fallback={<Loading />}>
             <Outlet />
           </Suspense>

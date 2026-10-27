@@ -6,9 +6,9 @@ import { ADAPTERS, CREATABLE_ADAPTERS, LICENSE_KEY_RE, adapterCatalog, normalize
 // Market providers. Attached as ctx.market; other categories may call:
 //   market.enabledProviders(type)   -> enabled rows of a type ('ssl' | 'plugin') with base prices, no secrets
 //   market.credentials(name)        -> decrypted adapter config for a provider (services only)
-//   market.hub()                    -> { enabled, url, licenseKey } of the plugin marketplace hub; the hub is
-//                                      the single built-in 'whm-hub' row. Declared for the Phase 5 Plugins
-//                                      marketplace client; nothing reads it until then.
+//   market.hub()                    -> { enabled, url } of the plugin marketplace hub, the single built-in
+//                                      'whm-hub' row. Read by ctx.marketplace as its enable switch only: the
+//                                      license key and the hub URL the panel trusts are owned by ctx.license.
 //   market.sslProviders()           -> the list SSL/TLS reads from the market.providers setting
 // The market_providers table is the source of truth; every change to an SSL
 // provider is mirrored into the market.providers setting so Purchase and Install
@@ -48,7 +48,8 @@ export function createMarketService(ctx) {
 
   // Outbound HTTPS goes through here so tests can answer for the vendor.
   const transport = { request: (url, opts) => safeRequest(url, opts) };
-  const io = { request: (url, opts) => transport.request(url, opts) };
+  // The hub probe asks for the license key prefix; the key itself lives in ctx.license and never leaves it.
+  const io = { request: (url, opts) => transport.request(url, opts), licensePrefix: () => { try { return ctx.license?.get?.().keyPrefix ?? null; } catch { return null; } } };
 
   const adapterOf = (row) => ADAPTERS[row.adapter] || ADAPTERS.manual;
   const readConfig = (row) => {
@@ -325,11 +326,11 @@ export function createMarketService(ctx) {
     adoptLegacySetting,
     enabledProviders(type) { return stmts.all.all().filter((r) => r.enabled && (!type || r.type === type)).map((r) => shape(r, { wholesale: true })); },
     credentials(name) { const r = stmts.byName.get(name); return r ? readConfig(r) : null; },
+    // Enable switch and display URL only; a stored licenseKey from older releases is never read again.
     hub() {
       const r = stmts.byName.get(HUB_NAME);
-      if (!r) return { enabled: false, url: null, licenseKey: null };
-      const config = readConfig(r);
-      return { enabled: Boolean(r.enabled), url: r.url || null, licenseKey: config.licenseKey || null };
+      if (!r) return { enabled: false, url: null };
+      return { enabled: Boolean(r.enabled), url: r.url || null };
     },
   };
   return service;

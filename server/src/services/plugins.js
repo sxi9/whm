@@ -1421,11 +1421,16 @@ export function createPluginHost(ctx) {
     return row;
   }
 
+  // Callers (the marketplace client) may veto an activation: every guard runs
+  // with (id, row) and a thrown HttpError reaches the manage route unchanged.
+  const guards = { enable: [] };
+
   // One activation per id at a time: a second caller awaits the first instead of
   // registering hooks and schedules twice.
   async function enable(id, options = {}) {
     requireSdk();
-    requireRow(id);
+    const row = requireRow(id);
+    if (live.get(id)?.state !== 'enabled') for (const guard of guards.enable) await guard(id, row);
     const pending = activations.get(id);
     if (pending) return pending;
     const p = enableNow(id, options).finally(() => { if (activations.get(id) === p) activations.delete(id); });
@@ -1574,21 +1579,33 @@ export function createPluginHost(ctx) {
     throw err422('invalid_manifest', 'package has no plugin.json at its root');
   }
 
-  function verifySignature(root) {
+  // The marketplace client reports whether the hub row is on; a sideload then
+  // needs developer mode (§18.6). Bundled and marketplace packages are exempt.
+  function marketplaceEnabled() {
+    try { return ctx.marketplace?.status?.().enabled === true; } catch { return false; }
+  }
+
+  // `policy` (marketplace installs): requireSigned demands a valid signature
+  // from one of `signers` whatever plugins.require_signature says.
+  function verifySignature(root, { source = 'upload', policy = null } = {}) {
     const sigFile = path.join(root, 'SIGNATURE.json');
-    const required = ctx.settings.get('plugins.require_signature', false) === true;
-    if (!fs.existsSync(sigFile)) {
-      if (required) throw err422('unsigned_package', 'This server only accepts signed plugin packages (plugins.require_signature is on)');
-      return { signed: false, signer: null, warnings: ['unsigned'] };
-    }
+    const bundled = source === 'bundled';
+    const strict = policy?.requireSigned === true;
+    const required = strict || (!bundled && ctx.settings.get('plugins.require_signature', false) === true);
+    const sideloadGated = !bundled && source !== 'marketplace' && marketplaceEnabled() && ctx.settings.get('plugins.developer_mode', false) !== true;
+    const unverifiable = ({ code, message, warnings }) => {
+      if (strict) throw err422(code, message);
+      if (required) throw err422('unsigned_package', message);
+      if (sideloadGated) throw err422('unsigned_package', 'enable plugins.developer_mode to sideload while the marketplace is enabled');
+      return { signed: false, signer: null, warnings: ['unsigned', ...warnings] };
+    };
+    if (!fs.existsSync(sigFile)) return unverifiable({ code: 'unsigned_package', message: strict ? 'Marketplace packages must carry a SIGNATURE.json from a hub signing key' : 'This server only accepts signed plugin packages (plugins.require_signature is on)', warnings: [] });
     let sig;
     try { sig = JSON.parse(fs.readFileSync(sigFile, 'utf8')); } catch { throw err422('invalid_signature', 'SIGNATURE.json is not valid JSON'); }
     if (!isObj(sig) || typeof sig.kid !== 'string' || !KID_RE.test(sig.kid) || sig.alg !== 'ed25519' || typeof sig.sig !== 'string') throw err422('invalid_signature', 'SIGNATURE.json must be { kid, alg: "ed25519", sig }');
+    if (strict && Array.isArray(policy.signers) && !policy.signers.includes(sig.kid)) throw err422('untrusted_signer', `The package is signed with key "${sig.kid}", which is not a marketplace signing key this panel trusts`);
     const keyFile = path.join(keysDir, `${sig.kid}.pub`);
-    if (!fs.existsSync(keyFile)) {
-      if (required) throw err422('unsigned_package', `No trusted key "${sig.kid}" in ${keysDir}; the package cannot be verified`);
-      return { signed: false, signer: null, warnings: ['unsigned', `unknown signing key "${sig.kid}"`] };
-    }
+    if (!fs.existsSync(keyFile)) return unverifiable({ code: 'untrusted_signer', message: `No trusted key "${sig.kid}" in ${keysDir}; the package cannot be verified`, warnings: [`unknown signing key "${sig.kid}"`] });
     let key;
     try { key = crypto.createPublicKey(fs.readFileSync(keyFile, 'utf8')); } catch { throw err422('invalid_signature', `trusted key "${sig.kid}" is not a valid PEM public key`); }
     if (key.asymmetricKeyType !== 'ed25519') throw err422('invalid_signature', `trusted key "${sig.kid}" is not an Ed25519 key`);
@@ -1598,7 +1615,14 @@ export function createPluginHost(ctx) {
     return { signed: true, signer: sig.kid, warnings: [] };
   }
 
-  async function install(input, { user, req } = {}) {
+  // `source: 'bundled'` is honoured only for directories that ship in the release.
+  function isBundledDir(real) {
+    let root = path.join(REPO_ROOT, 'plugins', 'bundled');
+    try { root = fs.realpathSync(root); } catch { /* keep the nominal path */ }
+    return real === root || real.startsWith(root + path.sep);
+  }
+
+  async function install(input, { user, req, policy = null } = {}) {
     requireSdk();
     fs.mkdirSync(pluginsDir, { recursive: true, mode: 0o750 });
     fs.mkdirSync(pluginDataDir, { recursive: true, mode: 0o750 });
@@ -1609,6 +1633,7 @@ export function createPluginHost(ctx) {
     let packageSha = null;
     try {
       if (Buffer.isBuffer(input.buffer)) {
+        if (input.source === 'marketplace') source = 'marketplace';
         packageSha = sha256Hex(input.buffer);
         unpackPackage(input.buffer, staging);
       } else if (typeof input.path === 'string') {
@@ -1619,8 +1644,9 @@ export function createPluginHost(ctx) {
         packageSha = sha256Hex(buffer);
         unpackPackage(buffer, staging);
       } else if (typeof input.dir === 'string') {
-        source = input.source === 'bundled' ? 'bundled' : 'path';
-        copyTree(assertInstallDir(input.dir), staging);
+        const real = assertInstallDir(input.dir);
+        source = input.source === 'bundled' && isBundledDir(real) ? 'bundled' : 'path';
+        copyTree(real, staging);
       } else {
         throw err422('invalid_package', 'Provide a .whmplugin body, { path } or { dir }');
       }
@@ -1632,12 +1658,15 @@ export function createPluginHost(ctx) {
       if (!semver.satisfies(HOST_API_VERSION, manifest.engines.whm)) throw err422('incompatible_host', `Plugin "${manifest.id}" requires WHM ${manifest.engines.whm} but this host provides ${HOST_API_VERSION}`);
       const mainFile = path.resolve(root, manifest.main);
       if (!mainFile.startsWith(root + path.sep) || !fs.existsSync(mainFile) || !fs.statSync(mainFile).isFile()) throw err422('invalid_manifest', `main "${manifest.main}" does not exist in the package`);
-      const sig = verifySignature(root);
+      const sig = verifySignature(root, { source, policy });
       if (!packageSha) packageSha = packageDigest(root).toString('hex');
 
       const id = manifest.id;
       const previous = stmts.row.get(id);
       const wasEnabled = previous?.state === 'enabled';
+      // policy.activate === false leaves an upgraded plugin disabled: the caller
+      // decides (after a consent check) whether the new code may run.
+      const reactivate = wasEnabled && policy?.activate !== false;
       const previousVersion = previous?.version ?? null;
       if (previous && live.has(id)) await disable(id, { keepState: true });
       const { dir } = dirsOf(id);
@@ -1653,13 +1682,13 @@ export function createPluginHost(ctx) {
       }
       removeDir(old);
       stmts.upsert.run({
-        id, name: manifest.name, version: manifest.version, manifest_json: JSON.stringify(manifest), state: wasEnabled ? 'enabled' : (previous ? previous.state === 'errored' ? 'disabled' : previous.state : 'installed'),
+        id, name: manifest.name, version: manifest.version, manifest_json: JSON.stringify(manifest), state: wasEnabled ? (reactivate ? 'enabled' : 'disabled') : (previous ? previous.state === 'errored' ? 'disabled' : previous.state : 'installed'),
         source, signer: sig.signer, package_sha256: packageSha, signed: sig.signed ? 1 : 0,
       });
       req?.audit?.({ action: 'plugin.install', target: id, args: { version: manifest.version, previousVersion, source, signed: sig.signed, signer: sig.signer, sha256: packageSha, by: user?.username } });
       emitHost('plugin.installed', { pluginId: id, version: manifest.version });
-      if (wasEnabled) await enable(id, { from: previousVersion !== manifest.version ? previousVersion : undefined });
-      return { plugin: shapeRow(stmts.row.get(id)), warnings: [...sig.warnings, IN_PROCESS_WARNING], previousVersion };
+      if (reactivate) await enable(id, { from: previousVersion !== manifest.version ? previousVersion : undefined });
+      return { plugin: shapeRow(stmts.row.get(id)), warnings: [...sig.warnings, IN_PROCESS_WARNING], previousVersion, wasEnabled };
     } finally {
       removeDir(staging);
     }
@@ -1774,7 +1803,7 @@ export function createPluginHost(ctx) {
     list: () => stmts.rows.all().map(shapeRow),
     get: (id) => shapeRow(requireRow(id)),
     detail,
-    install, enable, disable, uninstall, loadAll, stopAll,
+    install, enable, disable, uninstall, loadAll, stopAll, guards,
     settings: (id) => { const entry = entryFor(id); return { fields: settingFields(entry), values: maskedValues(entry) }; },
     updateSettings,
     logs: (id, limit = 100) => { requireRow(id); return readLogs(id, limit); },

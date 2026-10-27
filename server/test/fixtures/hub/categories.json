@@ -1,0 +1,6 @@
+{ "data": [
+  { "id": 1, "slug": "security", "name": "Security", "position": 1, "count": 1 },
+  { "id": 2, "slug": "backups", "name": "Backups", "position": 2, "count": 0 },
+  { "id": 7, "slug": "developer-tools", "name": "Developer tools", "position": 7, "count": 2 },
+  { "id": 9, "slug": "other", "name": "Other", "position": 9, "count": 1 }
+] }

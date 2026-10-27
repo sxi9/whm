@@ -22,6 +22,7 @@ import { createAccountsService } from './services/accounts.js';
 import { createAuditService } from './services/audit.js';
 import { createPluginHost } from './services/plugins.js';
 import { createLicenseService } from './services/license.js';
+import { createMarketplaceClient } from './services/marketplace-client.js';
 import { createApp } from './app.js';
 
 const require = createRequire(import.meta.url);
@@ -51,6 +52,7 @@ export async function bootstrap(overrides = {}) {
   ctx.audit = createAuditService(ctx);
   ctx.plugins = createPluginHost(ctx);
   ctx.license = createLicenseService(ctx);
+  ctx.marketplace = createMarketplaceClient(ctx);
   await ctx.license.boot();
   ctx.app = await createApp(ctx);
   // Categories (Contact Manager among them) exist now: deliver what boot() found.

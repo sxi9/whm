@@ -155,15 +155,28 @@ export function createApp(ctx) {
 }
 
 // 404 + error handler + optional SPA go last, after every module mounted its routes.
+// The SPA (hub/ui, built by `npm run build --prefix hub/ui`) is served from
+// hub/ui/dist at "/" when serve_ui is set: hashed assets with a long cache,
+// index.html (never cached) for every other extension-less GET so the
+// client-side router owns /login, /admin/*, /reseller/* and /dev/*.
+// WHM_HUB_UI_DIST (or config.ui_dist) points at another build directory.
+export function uiDistDir(config = {}) {
+  return config.ui_dist || process.env.WHM_HUB_UI_DIST || path.resolve(path.dirname(new URL(import.meta.url).pathname), '../ui/dist');
+}
+
 export function finalizeApp(ctx) {
   const { app, config, logger } = ctx;
   app.use('/v1', (_req, res) => res.status(404).json({ error: { code: 'not_found', message: 'No such API endpoint' } }));
-  const uiDist = path.resolve(path.dirname(new URL(import.meta.url).pathname), '../ui/dist');
+  const uiDist = uiDistDir(config);
   if (config.serve_ui && fs.existsSync(path.join(uiDist, 'index.html'))) {
-    app.use(express.static(uiDist, { index: false, maxAge: '1h' }));
-    app.get('*', (_req, res) => res.sendFile(path.join(uiDist, 'index.html')));
+    app.use(express.static(uiDist, { index: false, maxAge: '1h', fallthrough: true }));
+    app.get('*', (req, res, next) => {
+      if (path.extname(req.path)) return next();
+      res.set('Cache-Control', 'no-store');
+      res.sendFile(path.join(uiDist, 'index.html'));
+    });
   } else if (config.serve_ui) {
-    logger.warn({ dist: uiDist }, 'serve_ui is set but hub/ui/dist is missing');
+    logger.warn({ dist: uiDist }, 'serve_ui is set but hub/ui/dist is missing; run `npm run build --prefix hub/ui`');
   }
   app.use(errorHandler(logger));
   return app;

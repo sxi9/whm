@@ -3,21 +3,38 @@ import { Link } from 'react-router-dom';
 import { ExternalLink } from 'lucide-react';
 import { useApi } from '../../../hooks/useApi.js';
 import { queryString } from '../../../api/client.js';
+import { useAuth } from '../../../auth/AuthContext.jsx';
 import { PageHeader, Card, Loading, StatusPill, EmptyState } from '../../../components/Common.jsx';
 import { TextInput, Select } from '../../../components/Form.jsx';
 import { RequestError } from '../../server-configuration/Shared.jsx';
+import { MarketplaceTab, MarketplaceDisabledNotice } from '../../cpanel/MarketplaceTab.jsx';
 
+// Hub enabled → the hub catalog (resellers read-only, root manages) with the
+// static distribution packages underneath; hub off → the static catalog alone.
 export default function WhmMarketplace({ fn }) {
+  const { user } = useAuth();
+  const status = useApi('/marketplace/status');
+  const hubOn = status.data?.enabled === true;
+  return (
+    <>
+      <PageHeader fn={fn} description={hubOn ? 'Plugins published on the WHM marketplace hub, verified and signed by the vendor, plus the distribution packages that extend the host.' : 'Add-ons that extend the panel. This is a read-only catalog for now: each entry links to the distribution packages behind it and the page that configures it once installed.'} />
+      {status.data && !hubOn && user?.role === 'root' && <MarketplaceDisabledNotice />}
+      {hubOn && <MarketplaceTab manage={user?.role === 'root'} status={status.data} />}
+      <StaticCatalog title={hubOn ? 'Distribution packages' : null} />
+    </>
+  );
+}
+
+export function StaticCatalog({ title = null }) {
   const [q, setQ] = useState('');
   const [category, setCategory] = useState('');
   const { data, loading, error, refetch } = useApi(`/server-config/marketplace${queryString({ q, category })}`);
 
   return (
     <>
-      <PageHeader fn={fn} description="Add-ons that extend the panel. This is a read-only catalog for now: each entry links to the distribution packages behind it and the page that configures it once installed." />
       <RequestError error={error} onRetry={refetch} />
-      {data?.note && <div className="banner banner-info"><div><strong>Marketplace preview</strong><p>{data.note}</p></div></div>}
-      <Card padded={false}>
+      {data?.note && !title && <div className="banner banner-info"><div><strong>Marketplace preview</strong><p>{data.note}</p></div></div>}
+      <Card padded={false} title={title || undefined} subtitle={title ? 'Host software the panel can install through the package manager; not plugins.' : undefined}>
         <div className="datatable-toolbar" style={{ padding: 12 }}>
           <TextInput value={q} onChange={setQ} placeholder="Search add-ons…" style={{ maxWidth: 280 }} />
           <Select value={category} onChange={setCategory} options={data?.categories || []} placeholder="All categories" style={{ maxWidth: 220 }} />
