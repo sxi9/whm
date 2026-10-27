@@ -56,12 +56,28 @@ export function evidenceHostAllowed(ns, host, psl) {
   return !!reg && h === reg;
 }
 
-// PSL rule: the registrable domain must exist (≥ 2 labels) and the domain
-// itself must not be a public suffix (ICANN and private sections).
+// The PSL section of the suffix that governs `domain` (icann|private|null).
+export function suffixSection(domain, psl) {
+  const suffix = psl.publicSuffix(domain);
+  if (!suffix) return null;
+  const exact = psl.rules?.get(suffix);
+  if (exact) return exact.section;
+  const labels = suffix.split('.');
+  const wildcard = psl.rules?.get(`*.${labels.slice(1).join('.')}`);
+  return wildcard ? wildcard.section : null;
+}
+
+// PSL rule: the registrable domain must exist (≥ 2 labels), the domain itself
+// must not be a public suffix, and a domain under a private-section suffix
+// (acme.github.io) cannot be proven by DNS/well-known: GitHub organisations
+// claim com.github.<org> through the OAuth method instead.
 export function assertClaimable(ns, psl) {
   const domain = domainOf(ns);
   if (psl.isPublicSuffix(domain) || !psl.registrableDomain(domain)) {
     throw new HttpError(422, 'namespace_reserved', `"${ns}" maps to the public suffix "${domain}", which cannot be claimed`);
+  }
+  if (suffixSection(domain, psl) === 'private') {
+    throw new HttpError(422, 'namespace_reserved', `"${ns}" maps to "${domain}", which sits on the hosting-platform suffix "${psl.publicSuffix(domain)}"; claim it through the GitHub-organisation method or use your own domain`);
   }
   return domain;
 }

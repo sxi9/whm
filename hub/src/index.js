@@ -212,6 +212,7 @@ export async function bootstrap(overrides = {}) {
 
   createApp(ctx);
   // ctx.registerModule(...) lines belong here, before the modules run:
+  ctx.registerModule((await import('../marketplace/index.js')).register);
   for (const fn of ctx.modules) await fn(ctx);
   ctx.finalized = true;
   ctx.registerModule = () => { throw new Error('registerModule() must be called before the app is finalised'); };

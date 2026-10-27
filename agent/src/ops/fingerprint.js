@@ -32,11 +32,14 @@ function machineId() {
   return readFirst(['/etc/machine-id', '/var/lib/dbus/machine-id']);
 }
 
+// Interface names are at most 15 bytes; a name made only of dots would be a path segment, not a device.
+const IFNAME_RE = /^(?!\.{1,2}$)[a-zA-Z0-9._-]{1,15}$/;
+
 export function parseDefaultRouteDev(stdout) {
   try {
     const routes = JSON.parse(stdout);
     const dev = routes.find((r) => r && typeof r.dev === 'string')?.dev;
-    return dev && /^[a-zA-Z0-9._-]{1,15}$/.test(dev) ? dev : null;
+    return dev && IFNAME_RE.test(dev) ? dev : null;
   } catch { return null; }
 }
 
@@ -64,21 +67,47 @@ async function defaultRouteMac() {
   return readFirst([`/sys/class/net/${dev}/address`]);
 }
 
+const UUID_RE = /^[A-Za-z0-9-]{4,64}$/;
+// A block device node under /dev (findmnt appends "[/subvol]" for btrfs subvolumes).
+const DEV_SOURCE_RE = /^\/dev\/(?!\.)[A-Za-z0-9._-]+(?:\/(?!\.)[A-Za-z0-9._-]+)*$/;
+
 export function parseFindmntUuid(stdout) {
   try {
     const parsed = JSON.parse(stdout);
     const fsys = parsed?.filesystems?.[0];
     const uuid = fsys?.uuid || null;
-    return uuid && /^[A-Za-z0-9-]{4,64}$/.test(uuid) ? uuid : null;
+    return uuid && UUID_RE.test(uuid) ? uuid : null;
   } catch { return null; }
 }
 
+export function parseFindmntSource(stdout) {
+  try {
+    const parsed = JSON.parse(stdout);
+    const source = parsed?.filesystems?.[0]?.source;
+    if (typeof source !== 'string') return null;
+    const dev = source.replace(/\[.*$/, '');
+    return DEV_SOURCE_RE.test(dev) && !dev.includes('..') ? dev : null;
+  } catch { return null; }
+}
+
+export function parseBlkidUuid(stdout) {
+  const uuid = String(stdout || '').trim().split('\n')[0];
+  return uuid && UUID_RE.test(uuid) ? uuid : null;
+}
+
+// §16.5: findmnt's UUID, then blkid on the root source, then the by-id listing.
 async function rootDiskId() {
   if (hasBinary('findmnt')) {
-    const { code, stdout } = await exec('findmnt', ['-J', '-o', 'UUID', '/'], { allowFailure: true });
+    const { code, stdout } = await exec('findmnt', ['-J', '-o', 'UUID,SOURCE', '/'], { allowFailure: true });
     if (code === 0) {
       const uuid = parseFindmntUuid(stdout);
       if (uuid) return uuid;
+      const source = parseFindmntSource(stdout);
+      if (source && hasBinary('blkid')) {
+        const blk = await exec('blkid', ['-o', 'value', '-s', 'UUID', source], { allowFailure: true });
+        const fromBlkid = blk.code === 0 ? parseBlkidUuid(blk.stdout) : null;
+        if (fromBlkid) return fromBlkid;
+      }
     }
   }
   try {

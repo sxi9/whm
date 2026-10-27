@@ -97,6 +97,14 @@ export function fingerprintDrift(stored, current) {
   return Math.round(drift * 100) / 100;
 }
 
+// Offline binding is stricter than the hub's drift arithmetic: a changed
+// machine-id means a cloned or reinstalled host (§16.5) even when the NIC and
+// disk still match, so it never passes without the hub re-checking it.
+export function fingerprintMismatch(stored, current) {
+  const drift = fingerprintDrift(stored, current);
+  return drift == null || drift > DRIFT_THRESHOLD || stored.machine_id !== current.machine_id;
+}
+
 export function decodeToken(token) {
   const m = TOKEN_RE.exec(String(token || ''));
   if (!m) return null;
@@ -112,10 +120,12 @@ export function createLicenseService(ctx) {
   const log = logger.child ? logger.child({ module: 'license' }) : logger;
   const emitter = new EventEmitter();
   emitter.setMaxListeners(0);
-  const clock = { now: () => Date.now() };
+  const clock = { now: typeof config.licenseNow === 'function' ? config.licenseNow : () => Date.now() };
   const keys = loadLicenseKeys(config.licenseKeysFile || DEFAULT_KEYS_FILE, log);
   const keysDir = path.join(config.dataDir, 'plugin-keys');
-  const checkinHours = Number(config.licenseCheckinHours) > 0 ? Number(config.licenseCheckinHours) : 12;
+  const configCheckinHours = Number(config.licenseCheckinHours) > 0 ? Number(config.licenseCheckinHours) : 12;
+  // The hub's checkin_interval_hours (stored from the last verified answer) wins over the config default.
+  const checkinHours = () => (Number.isInteger(cache.meta.checkinIntervalHours) && cache.meta.checkinIntervalHours >= 1 && cache.meta.checkinIntervalHours <= 168 ? cache.meta.checkinIntervalHours : configCheckinHours);
 
   const stmts = {
     state: db.prepare('SELECT * FROM license_state WHERE id = 1'),
@@ -161,6 +171,27 @@ export function createLicenseService(ctx) {
 
   // ---- events, audit, notifications ---------------------------------------
 
+  // Contact Manager registers after boot(); a transition found at boot waits
+  // here until it exists (flushed by index.js after createApp and by get()).
+  const pendingNotifications = [];
+  const MAX_PENDING = 50;
+
+  function sendNotification({ event, subject, severity, data }) {
+    try {
+      Promise.resolve(ctx.contacts.notify(event, { subject, severity, data }))
+        .catch((err) => log.warn({ err, event }, 'license notification failed'));
+    } catch (err) {
+      log.warn({ err, event }, 'license notification failed');
+    }
+  }
+
+  function flushNotifications() {
+    if (!pendingNotifications.length || typeof ctx.contacts?.notify !== 'function') return 0;
+    const batch = pendingNotifications.splice(0, pendingNotifications.length);
+    for (const n of batch) sendNotification(n);
+    return batch.length;
+  }
+
   function recordEvent(event, detail = {}, { notify = true, severity, subject, req = null } = {}) {
     try {
       stmts.event.run(nowIso(clock.now()), event, JSON.stringify(redact(detail)));
@@ -170,9 +201,10 @@ export function createLicenseService(ctx) {
       log.error({ err, event }, 'failed to record license event');
     }
     if (notify) {
-      Promise.resolve()
-        .then(() => ctx.contacts?.notify?.(event, { subject: subject || `License: ${event.replace(/^license\./, '').replace(/_/g, ' ')}`, severity, data: redact(detail) }))
-        .catch((err) => log.warn({ err, event }, 'license notification failed'));
+      const n = { event, subject: subject || `License: ${event.replace(/^license\./, '').replace(/_/g, ' ')}`, severity, data: redact(detail) };
+      if (typeof ctx.contacts?.notify === 'function') sendNotification(n);
+      else if (pendingNotifications.length < MAX_PENDING) pendingNotifications.push(n);
+      else log.warn({ event }, 'license notification dropped: contact manager unavailable');
     }
   }
 
@@ -274,14 +306,21 @@ export function createLicenseService(ctx) {
   }
 
   const enforce = () => config.licenseEnforce === true;
-  const daysLeft = () => (Number.isInteger(cache.payload?.lexp) ? Math.max(0, Math.ceil((cache.payload.lexp * 1000 - clock.now()) / (DAY_S * 1000))) : null);
+  const daysLeft = () => (cache.verification?.ok && Number.isInteger(cache.payload?.lexp) ? Math.max(0, Math.ceil((cache.payload.lexp * 1000 - clock.now()) / (DAY_S * 1000))) : null);
+
+  // Entitlements are only reported from a token whose signature verified (an
+  // expired one still counts: the hub signed it); anything else is shown as
+  // unverified so the UI never displays what a tampered row claims.
+  const tokenVerified = () => Boolean(cache.verification?.ok);
 
   function get() {
+    flushNotifications();
     const status = settle();
-    const p = cache.payload;
+    const p = tokenVerified() ? cache.payload : null;
     const row = cache.row;
     return {
       status, enforce: enforce(), degraded: !isLicensedState(status), reason: cache.meta.statusReason ?? null,
+      tokenVerified: tokenVerified(), hasToken: Boolean(row.token),
       edition: p?.ed ?? null, editionLabel: p ? EDITION_LABELS[p.ed] || p.ed : null, rank: p?.rank ?? null,
       limits: p?.lim ?? {}, features: p?.feat ?? {},
       activationId: row.activation_id ?? null, licenseId: p?.lid ?? null, keyPrefix: cache.meta.keyPrefix ?? null, hasKey: Boolean(row.key_enc),
@@ -291,7 +330,7 @@ export function createLicenseService(ctx) {
       messages: json.parse(row.messages_json, []) || [],
       fingerprint: cache.fingerprint?.fingerprint ?? null, hostname: hostname(),
       pluginSigningKids: pluginSigningKids(), conflictKids: cache.meta.conflictKids ?? [], revocationsHeadTs: cache.meta.revocationsHeadTs ?? null,
-      knownActivations: cache.meta.knownActivations ?? [], checkinIntervalHours: checkinHours,
+      knownActivations: cache.meta.knownActivations ?? [], checkinIntervalHours: checkinHours(),
     };
   }
 
@@ -307,7 +346,8 @@ export function createLicenseService(ctx) {
   }
 
   const token = () => cache.row?.token ?? null;
-  const hubUrl = () => (typeof cache.payload?.iss === 'string' && /^https:\/\//.test(cache.payload.iss) ? cache.payload.iss : config.licenseHubUrl || null);
+  // Only a signed `iss` may steer hub calls; an unverifiable token falls back to the bootstrap hub.
+  const hubUrl = () => (tokenVerified() && typeof cache.payload?.iss === 'string' && /^https:\/\//.test(cache.payload.iss) ? cache.payload.iss : config.licenseHubUrl || null);
   const isDegraded = () => !isLicensedState(settle());
   const hasFeature = (flag) => cache.payload?.feat?.[flag] === true && isLicensedState(settle());
   const editionLabel = () => (cache.payload ? EDITION_LABELS[cache.payload.ed] || cache.payload.ed : 'current');
@@ -423,8 +463,8 @@ export function createLicenseService(ctx) {
     };
   }
 
-  function nextCheckinAt(now = clock.now(), { failCount = 0 } = {}) {
-    const base = failCount > 0 ? Math.min(checkinHours, Math.pow(2, failCount - 1) * 0.25) * 3600 * 1000 : checkinHours * 3600 * 1000;
+  function nextCheckinAt(now = clock.now(), { failCount = 0, hours = checkinHours() } = {}) {
+    const base = failCount > 0 ? Math.min(hours, Math.pow(2, failCount - 1) * 0.25) * 3600 * 1000 : hours * 3600 * 1000;
     const jitter = (crypto.randomInt(0, 2 * 20 * 60) - 20 * 60) * 1000;
     return nowIso(now + Math.max(60_000, base + jitter));
   }
@@ -458,21 +498,21 @@ export function createLicenseService(ctx) {
       const file = path.join(keysDir, `${kid}.pub`);
       let existing = null;
       try { existing = fs.readFileSync(file, 'utf8'); } catch { existing = null; }
-      if (existing !== null && existing !== pem) {
-        const ours = pinned[kid] && sha256(existing) === pinned[kid].sha256;
-        if (!ours) {
-          conflicts.add(kid);
-          if (!previousConflicts.has(kid)) recordEvent('license.plugin_key_conflict', { kid, file, reason: 'an operator-installed key with this id has different content; it was kept and the hub key is not trusted' }, { req, severity: 'error' });
-          continue;
-        }
+      const ours = Boolean(pinned[kid]) && existing !== null && sha256(existing) === pinned[kid].sha256;
+      if (existing !== null && existing !== pem && !ours) {
+        conflicts.add(kid);
+        if (!previousConflicts.has(kid)) recordEvent('license.plugin_key_conflict', { kid, file, reason: 'an operator-installed key with this id has different content; it was kept and the hub key is not trusted' }, { req, severity: 'error' });
+        continue;
       }
+      // A pre-existing identical file belongs to the operator: trusted, but never ours to remove.
+      const operator = existing !== null && !ours ? true : Boolean(pinned[kid]?.operator);
       if (existing !== pem) {
         try { fs.writeFileSync(file, pem, { mode: 0o640 }); fs.chmodSync(file, 0o640); } catch (err) { log.error({ err, kid }, 'cannot write plugin signing key'); continue; }
       }
-      next[kid] = { status, sha256: hash };
+      next[kid] = operator ? { status, sha256: hash, operator: true } : { status, sha256: hash };
     }
     for (const [kid, info] of Object.entries(pinned)) {
-      if (next[kid] || conflicts.has(kid)) continue;
+      if (next[kid] || conflicts.has(kid) || info.operator) continue;
       const file = path.join(keysDir, `${kid}.pub`);
       try {
         if (fs.existsSync(file) && sha256(fs.readFileSync(file, 'utf8')) === info.sha256) fs.unlinkSync(file);
@@ -523,19 +563,20 @@ export function createLicenseService(ctx) {
     const v = verifyToken(data.token);
     if (!v.ok) throw new HttpError(502, 'hub_token_invalid', `The hub issued a token this panel cannot verify (${v.reason})`);
     const fp = await currentFingerprint();
-    if (fp && v.payload.fp !== fp.fingerprint) {
-      const drift = fingerprintDrift(cache.meta.fpComponents, fp.components);
-      if (drift == null || drift > DRIFT_THRESHOLD) throw new HttpError(502, 'hub_token_invalid', 'The hub issued a token for a different server fingerprint');
+    if (fp && v.payload.fp !== fp.fingerprint && fingerprintMismatch(cache.meta.fpComponents, fp.components)) {
+      throw new HttpError(502, 'hub_token_invalid', 'The hub issued a token for a different server fingerprint');
     }
     const now = clock.now();
     const meta = { ...cache.meta, fingerprintMismatch: false, statusReason: null, fpComponents: fp?.components ?? cache.meta.fpComponents ?? null, lastAnswerAt: nowIso(now), lastAnswerSource: source };
     if (key) meta.keyPrefix = key.slice(0, 8);
+    meta.checkinIntervalHours = Number.isInteger(data.checkin_interval_hours) && data.checkin_interval_hours >= 1 && data.checkin_interval_hours <= 168 ? data.checkin_interval_hours : null;
+    const hours = meta.checkinIntervalHours ?? configCheckinHours;
     if (data.license && typeof data.license === 'object') meta.license = { edition: data.license.edition ?? null, expiresAt: data.license.expires_at ?? null, daysLeft: data.license.days_left ?? null };
     const status = ['active', 'grace', 'expired', 'suspended', 'revoked'].includes(v.payload.status) ? v.payload.status : 'active';
     const previous = cache.row.status;
     persist({
       key_enc: key ? cryptoSvc.encrypt(key) : cache.row.key_enc, token: data.token, payload_json: JSON.stringify(meta), activation_id: typeof data.activation_id === 'string' ? data.activation_id : v.payload.aid,
-      status, last_checkin_at: nowIso(now), last_ok_at: nowIso(now), next_checkin_at: nextCheckinAt(now), fail_count: 0, messages_json: JSON.stringify(handleMessages(data.messages, { req })),
+      status, last_checkin_at: nowIso(now), last_ok_at: nowIso(now), next_checkin_at: nextCheckinAt(now, { hours }), fail_count: 0, messages_json: JSON.stringify(handleMessages(data.messages, { req })),
     });
     if (Number.isInteger(data.revocations_head_ts)) {
       saveMeta({ revocationsHeadTs: data.revocations_head_ts });
@@ -666,12 +707,25 @@ export function createLicenseService(ctx) {
 
   // ---- scheduling ---------------------------------------------------------
 
+  // The cron follows next_checkin_at (interval + jitter, or the failure
+  // backoff): it fires at that minute and at every interval after it, and each
+  // answer re-derives it, so the designed jitter spreads the scheduled runs.
+  function checkinCron(nextAt, hours) {
+    const at = new Date(nextAt);
+    if (Number.isNaN(at.getTime())) return null;
+    const step = Math.min(24, Math.max(1, Math.round(hours)));
+    const hoursList = [];
+    // The scheduler matches local time.
+    for (let h = at.getHours(); hoursList.length < 24 / step && !hoursList.includes(h); h = (h + step) % 24) hoursList.push(h);
+    return `${at.getMinutes()} ${hoursList.sort((a, b) => a - b).join(',')} * * *`;
+  }
+
   function syncSchedule() {
     try {
-      const minute = Number.isInteger(cache.meta.scheduleMinute) ? cache.meta.scheduleMinute : crypto.randomInt(0, 60);
-      if (cache.meta.scheduleMinute !== minute) saveMeta({ scheduleMinute: minute });
-      ctx.scheduler.ensure(CHECKIN_SCHEDULE, `${minute} */${Math.min(23, Math.max(1, Math.round(checkinHours)))} * * *`, CHECKIN_JOB);
-      ctx.scheduler.update(CHECKIN_SCHEDULE, { enabled: Boolean(cache.row.token) });
+      const hours = checkinHours();
+      const cron = checkinCron(cache.row.next_checkin_at, hours) || `${crypto.randomInt(0, 60)} */${Math.min(23, hours)} * * *`;
+      ctx.scheduler.ensure(CHECKIN_SCHEDULE, cron, CHECKIN_JOB);
+      ctx.scheduler.update(CHECKIN_SCHEDULE, { cron, enabled: Boolean(cache.row.token) });
     } catch (err) {
       log.warn({ err }, 'cannot sync the license check-in schedule');
     }
@@ -686,22 +740,29 @@ export function createLicenseService(ctx) {
 
   async function boot() {
     reload();
+    let newMismatch = false;
     if (cache.row.token && cache.payload) {
       const fp = await currentFingerprint({ refresh: true });
       let mismatch = false;
       if (fp && cache.payload.fp !== fp.fingerprint) {
-        const drift = fingerprintDrift(cache.meta.fpComponents, fp.components);
-        mismatch = drift == null || drift > DRIFT_THRESHOLD;
-        if (!mismatch) log.info({ drift }, 'server fingerprint drifted within tolerance; the hub updates it at the next check-in');
+        mismatch = fingerprintMismatch(cache.meta.fpComponents, fp.components);
+        if (!mismatch) log.info({ drift: fingerprintDrift(cache.meta.fpComponents, fp.components) }, 'server fingerprint drifted within tolerance; the hub updates it at the next check-in');
       }
-      if (mismatch !== Boolean(cache.meta.fingerprintMismatch)) saveMeta({ fingerprintMismatch: mismatch, statusReason: mismatch ? 'fingerprint_mismatch' : cache.meta.statusReason ?? null });
+      newMismatch = mismatch && !cache.meta.fingerprintMismatch;
+      if (mismatch !== Boolean(cache.meta.fingerprintMismatch)) {
+        // Back on the original hardware: the hub-independent degradation lifts and the token decides again.
+        const restored = !mismatch && cache.meta.statusReason === 'fingerprint_mismatch';
+        saveMeta({ fingerprintMismatch: mismatch, statusReason: mismatch ? 'fingerprint_mismatch' : restored ? null : cache.meta.statusReason ?? null });
+        if (restored) persist({ status: ['active', 'grace', 'expired', 'suspended', 'revoked'].includes(cache.payload.status) ? cache.payload.status : 'active' });
+      }
       if (mismatch && cache.row.status !== 'degraded') persist({ status: 'degraded' });
       if (!cache.verification?.ok) log.error({ reason: cache.verification?.reason }, 'stored license token does not verify against the pinned keys');
     }
     settle();
     syncSchedule();
-    if (cache.row.token && (!cache.row.next_checkin_at || new Date(cache.row.next_checkin_at).getTime() <= clock.now())) {
-      try { ctx.jobs.enqueue(CHECKIN_JOB, { reason: 'boot' }); } catch (err) { log.warn({ err }, 'cannot enqueue the boot check-in'); }
+    // A check-in is due, or the hub must arbitrate a fingerprint the panel refused offline.
+    if (cache.row.token && (newMismatch || !cache.row.next_checkin_at || new Date(cache.row.next_checkin_at).getTime() <= clock.now())) {
+      try { ctx.jobs.enqueue(CHECKIN_JOB, { reason: newMismatch ? 'fingerprint_mismatch' : 'boot' }); } catch (err) { log.warn({ err }, 'cannot enqueue the boot check-in'); }
     }
     const l = get();
     log.info({ status: l.status, edition: l.edition, enforce: l.enforce, keys: keys.map((k) => k.kid) }, 'license state loaded');
@@ -715,7 +776,7 @@ export function createLicenseService(ctx) {
     activate, checkin, deactivate, startTrial, activations, events, pluginSigningKids, verifySigned, verifyToken,
     hub, transport, clock, keys: () => keys.map((k) => ({ kid: k.kid, notAfter: k.notAfter ? k.notAfter.toISOString() : null })),
     on(name, fn) { emitter.on(name, fn); return () => emitter.off(name, fn); },
-    enforce,
+    enforce, flushNotifications,
     // Test seams: reload the cached row after a direct DB edit; apply a signed answer by hand.
     _reload: reload, _settle: settle, _pinPluginKeys: pinPluginKeys,
   };

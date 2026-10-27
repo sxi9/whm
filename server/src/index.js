@@ -53,6 +53,8 @@ export async function bootstrap(overrides = {}) {
   ctx.license = createLicenseService(ctx);
   await ctx.license.boot();
   ctx.app = await createApp(ctx);
+  // Categories (Contact Manager among them) exist now: deliver what boot() found.
+  ctx.license.flushNotifications();
   if (overrides.loadPlugins !== false) await ctx.plugins.loadAll();
 
   try {

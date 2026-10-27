@@ -30,16 +30,20 @@ export const degradedAllow = [
 export const DEGRADED_ACTION = '/server-configuration/basic-webhost-manager-setup#license';
 const READ_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
+// Express routers match paths case-insensitively, so the rules must too or a
+// mixed-case path would reach a gated router unmatched.
 function compile(pattern) {
   const [method, spec] = pattern.split(' ');
   const base = spec.replace(/\/\*$/, '');
   const prefix = method === 'ALL' || spec.endsWith('/*');
-  const re = new RegExp(`^${base.split('/').map((seg) => (seg.startsWith(':') ? '[^/]+' : seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))).join('/')}${prefix ? '(?:/.*)?' : ''}/?$`);
+  const re = new RegExp(`^${base.split('/').map((seg) => (seg.startsWith(':') ? '[^/]+' : seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))).join('/')}${prefix ? '(?:/.*)?' : ''}/?$`, 'i');
   return { method, re };
 }
 
 export function matchRule(rules, method, path) {
-  return rules.find((r) => (r.method === 'ALL' || r.method === method) && r.re.test(path)) || null;
+  const m = String(method || '').toUpperCase();
+  const p = String(path || '').toLowerCase();
+  return rules.find((r) => (r.method === 'ALL' || r.method === m) && r.re.test(p)) || null;
 }
 
 const allowRules = degradedAllow.map(compile);
@@ -48,20 +52,24 @@ const gateRules = Object.entries(featureGates).filter(([k]) => !manualGates.has(
 export const isAllowedWhileDegraded = (method, path) => Boolean(matchRule(allowRules, method, path));
 export const gatedFeatureFor = (method, path) => matchRule(gateRules, method, path)?.feature ?? null;
 
-// Mounted on the /api router right after requireAuth: GETs are never gated; a
-// gated feature answers 403; every other mutation answers 423 while degraded.
+// Mounted on the /api router right after requireAuth. A licensed panel whose
+// edition lacks a gated feature answers 403 on the whole prefix (reads
+// included: `ALL` rows gate a router, as §16.8 words it). A panel that is not
+// licensed has no entitlements to judge by, so the degraded rules decide
+// instead: GETs are never gated and every other mutation answers 423.
 export function licenseGate(ctx) {
   return (req, res, next) => {
     const license = ctx.license;
     if (!license || !license.enforce()) return next();
     const path = req.path;
-    const feature = gatedFeatureFor(req.method, path);
+    const degraded = license.isDegraded();
+    const feature = degraded ? null : gatedFeatureFor(req.method, path);
     if (feature && !license.hasFeature(feature)) {
       const l = license.get();
       return next(new HttpError(403, 'feature_required', `Your ${l.editionLabel || 'current'} license does not include "${feature}". Upgrade your license to use this function.`, { feature: [feature] }));
     }
     if (READ_METHODS.has(req.method)) return next();
-    if (!license.isDegraded()) return next();
+    if (!degraded) return next();
     if (isAllowedWhileDegraded(req.method, path)) return next();
     const l = license.get();
     const why = l.status === 'unlicensed' ? 'This server has no active license' : `The license is ${l.status}${l.reason ? ` (${l.reason})` : ''}`;

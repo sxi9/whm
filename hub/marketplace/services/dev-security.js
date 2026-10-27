@@ -148,6 +148,14 @@ export function createDevSecurityService(m) {
     return { totp_verified_at: m.now() };
   }
 
+  // After TOTP enrolment the current session counts as stepped up.
+  function markStepUp(req) {
+    const s = req.devSession;
+    if (!s) return null;
+    stmts.updateSession.run({ sid: s.row.sid, data: s.row.data, totp_verified_at: m.now(), expires_at: s.row.expires_at });
+    return { totp_verified_at: m.now() };
+  }
+
   function destroySession(req, res) {
     if (req.devSession) stmts.deleteSession.run(req.devSession.row.sid);
     res?.clearCookie(SESSION_COOKIE, { path: '/' });
@@ -192,7 +200,7 @@ export function createDevSecurityService(m) {
 
   return {
     SESSION_COOKIE, API_KEY_HEADER, DEV_SCOPES,
-    attachDeveloper, csrf, requireDeveloper, requireStepUp, stepUp, createSession, destroySession, securityEvent, assertNotLocked, recordFailedLogin, recordSuccessfulLogin, invalidateCredentials,
+    attachDeveloper, csrf, requireDeveloper, requireStepUp, stepUp, markStepUp, createSession, destroySession, securityEvent, assertNotLocked, recordFailedLogin, recordSuccessfulLogin, invalidateCredentials,
     sessions: (developerId) => stmts.listSessions.all(developerId, m.now()).map((s) => ({ id: s.sid.slice(0, 12), created_at: s.created_at, expires_at: new Date(s.expires_at).toISOString(), stepped_up: !!s.totp_verified_at })),
     revokeSessions: (developerId) => stmts.deleteDevSessions.run(developerId).changes,
     pruneSessions: () => stmts.pruneSessions.run(m.now()).changes,
