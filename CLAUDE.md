@@ -195,6 +195,17 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   Functions honours `ensureZoneForDomain({ nameservers })`, dead LEGACY registry rows removed. Core follow-ups done
   by hand: dead `sys.resolvers.set` op removed (networking-setup owns `resolver.*`), contracts doc
   §11–21, two load-sensitive tests made robust. Next: plugin host (core), then wave 3.
+- **2026-10-27 00:03: Phase 2 wave 3 landed** — Clusters, Themes, Market, cPanel, Support, Plugins (16
+  functions; migrations 025–030; `ctx.clusters/themes/market/cpanel/support/bundledPlugins`). The Plugins
+  category's three functions are bundled SDK plugins under `plugins/bundled/<id>/` installed through
+  `ctx.plugins.install({ dir })`; its agent ops live in the sec/web families as a documented exception
+  (`sec.imunify.*`, `sec.clamav.*`, `sec.netdev.read`, `web.wp.*`). **All 212 functions are built.** Core
+  follow-ups done by the integrator: `packages.snapshot()` resolves `theme` via `ctx.themes.resolveForPackage`
+  (contract §22); `routes/index.js` serves `{ public: true }` mounts before `requireAuth` (login-page
+  branding); `middleware/audit.js` summarises Buffers as `{ bytes }`; `ctx.events` (PanelEvents, now
+  `lib/events.js`) is created by core at bootstrap. The wave-3 fix round closes the 10 open findings
+  (cluster token scopes + opt-in config pushes, cPanel upgrade check via Software, support grant guards)
+  per the scratchpad `issues/_contracts.md` (wave 3).
 - **2026-10-26 20:55: core plugin host merged** (`16286ee`, built in an isolated worktree from
   `docs/design/plugin-host.md`, 3 parity/security review rounds, 0 open): `ctx.plugins`
   (`services/plugins.js`) is the real implementation of the SDK contract in `plugins/sdk/mock-host.js`
@@ -242,11 +253,9 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   workflow dies with it (happened 2026-10-26 05:38; resumed 14:27 from cache). A self-bound hourly
   Routine `trig_015b4oBVtePikCYJAcFwKkTK` ("WHM build keep-alive check-in", minute :09) wakes this
   session to resume the run, integrate finished waves, snapshot to git and move to the next step.
-  Current run: **wave 3 build `wf_cdfc582d-8cc`** (script `<workflows>/scripts/whm-build-categories-wf_66434640-c00.js`,
-  `args: {wave: 3}`; resume with `Workflow({scriptPath, resumeFromRunId: 'wf_cdfc582d-8cc', args: {wave: 3}})`).
-  Wave 2 (`wf_a559b157-423`) and its fix round (`wf_86185de4-581`) are complete and landed. After wave 3:
-  integrate (suites/build/boot/e2e/screenshots/checklist), run `whm-fix-wave-wf_f1a004d0-b80.js` with
-  `args {wave: 3}` once `SLUGS[3]` and the scratchpad `issues/` files exist, then Phase 5. Disable the Routine
+  Current run: **wave-3 fix round** (script `<workflows>/scripts/whm-fix-wave-wf_f1a004d0-b80.js`, `args: {wave: 3}`; the run id
+  is recorded in CHECKLIST.md's timeline row once launched). Wave 3 build `wf_cdfc582d-8cc` is complete and landed.
+  After the fix round: Phase 5 (license server, marketplace, SDK docs, sample + automated-backup plugins). Disable the Routine
   (`update_trigger enabled=false`) once CHECKLIST.md is fully done.
 - This dev container has 4 CPUs → at most 2 concurrent subagents; plan fan-outs accordingly.
 - The container has `systemctl` and `useradd` but no Apache/BIND/Exim/MySQL daemons; the

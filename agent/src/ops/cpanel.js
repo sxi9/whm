@@ -11,7 +11,10 @@ import { defineOp, arg, OpError } from './registry.js';
 // downloaded archive into a root-owned staging area, hashes and signature-checks
 // that copy itself against keys only root can install, unpacks it there, and
 // only runs scripts/install.sh --upgrade from a staging directory it created.
-// The unprivileged panel never gets to choose a directory, a log file or a key.
+// The unprivileged panel never gets to choose a directory, a log file, a key,
+// or whether verification happens: an archive must match its checksum and carry
+// a signature from a trusted key unless the host's own policy (the agent's
+// environment or /etc/whm/agent.conf, both root-only) says otherwise.
 
 // ------------------------------------------------------------ mailman ------
 
@@ -125,9 +128,42 @@ defineOp('cpanel.mailman.site_password', {
 // systemd unit, not by the panel.
 export const UPGRADE_STAGING_ROOT = '/var/cache/whm/upgrades';
 export const RELEASE_KEY_DIR = '/etc/whm/release-keys';
+export const AGENT_CONFIG_FILE = '/etc/whm/agent.conf';
 const stagingRoot = () => path.resolve(process.env.WHM_UPGRADE_STAGING_ROOT || UPGRADE_STAGING_ROOT);
 const keyDir = () => path.resolve(process.env.WHM_RELEASE_KEY_DIR || RELEASE_KEY_DIR);
-const keysReadOnly = () => process.env.WHM_RELEASE_KEYS_READONLY === '1';
+const agentConfigFile = () => path.resolve(process.env.WHM_AGENT_CONFIG || AGENT_CONFIG_FILE);
+
+const ownUid = () => (typeof process.getuid === 'function' ? process.getuid() : 0);
+
+// The `upgrade` object of the agent's config file, read only when the file is
+// the agent's own and nobody else can write it; a config the panel could edit
+// would be an op argument in disguise.
+function readHostUpgradeConfig() {
+  const file = agentConfigFile();
+  try {
+    const st = fs.lstatSync(file);
+    if (st.isSymbolicLink() || !st.isFile() || st.uid !== ownUid() || (st.mode & 0o022)) return {};
+    const conf = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return conf && typeof conf.upgrade === 'object' && conf.upgrade ? conf.upgrade : {};
+  } catch { return {}; }
+}
+
+// Host policy for the panel's self-upgrade. Both switches default to off, so
+// out of the box only a release whose checksum matches and whose signature
+// verifies against a key root placed under RELEASE_KEY_DIR can be unpacked and
+// run, and the panel cannot install keys of its own. Root opts in through the
+// whm-agentd unit (WHM_UPGRADE_ALLOW_UNVERIFIED=1, WHM_RELEASE_KEYS_PANEL_MANAGED=1)
+// or `"upgrade": { "allowUnverified": true, "panelManagedKeys": true }` in agent.conf.
+export function upgradePolicy() {
+  const conf = readHostUpgradeConfig();
+  return {
+    allowUnverified: process.env.WHM_UPGRADE_ALLOW_UNVERIFIED === '1' || conf.allowUnverified === true,
+    panelManagedKeys: process.env.WHM_RELEASE_KEYS_PANEL_MANAGED === '1' || conf.panelManagedKeys === true,
+    configFile: agentConfigFile(),
+  };
+}
+const keysReadOnly = () => !upgradePolicy().panelManagedKeys;
+const POLICY_HINT = () => `set upgrade.allowUnverified in ${agentConfigFile()} or WHM_UPGRADE_ALLOW_UNVERIFIED=1 in the whm-agentd unit to permit it`;
 // The app directory the installer redeploys into is where this agent runs from
 // (/opt/whm in a packaged install); it is never taken from the caller.
 export const AGENT_APP_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -153,8 +189,6 @@ export function findReleaseRoot(destDir) {
   if (entries.length === 1 && isReleaseDir(path.join(destDir, entries[0].name))) return path.join(destDir, entries[0].name);
   return null;
 }
-
-const ownUid = () => (typeof process.getuid === 'function' ? process.getuid() : 0);
 
 // Something root is about to trust or run must belong to the agent itself and
 // be unwritable by anyone else; a symlink is never accepted.
@@ -202,18 +236,44 @@ function removeStageDir(stageDir, marker) {
   fs.rmSync(marker, { force: true });
 }
 
-function sha256File(file) {
-  const hash = crypto.createHash('sha256');
-  const fd = fs.openSync(file, 'r');
+// The archive lives in a panel-owned directory, so the source path must not be
+// used as a read primitive: no symlink anywhere in it (the resolved path has to
+// pass the allowed-roots check again), the final component is opened O_NOFOLLOW
+// and the opened inode must be the regular file that was inspected, which
+// closes the rename race on the parent directory. The copy is created O_EXCL
+// with mode 0600: only root hashes, unpacks and later removes it.
+function stageArchive(src, staged, assertAllowed) {
+  let st;
+  try { st = fs.lstatSync(src); } catch { throw new OpError('not_found', `${src} does not exist`); }
+  if (st.isSymbolicLink()) throw new OpError('refused', `${src} is a symbolic link`);
+  if (!st.isFile()) throw new OpError('refused', `${src} is not a regular file`);
+  const real = fs.realpathSync(src);
+  if (real !== src) {
+    assertAllowed(real);
+    st = fs.lstatSync(real);
+    if (!st.isFile()) throw new OpError('refused', `${real} is not a regular file`);
+  }
+  const inFd = fs.openSync(real, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  let outFd = null;
   try {
+    const opened = fs.fstatSync(inFd);
+    if (!opened.isFile() || opened.ino !== st.ino || opened.dev !== st.dev) throw new OpError('refused', `${src} changed while it was being checked`);
+    outFd = fs.openSync(staged, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+    const hash = crypto.createHash('sha256');
     const buf = Buffer.alloc(1024 * 1024);
+    let size = 0;
     for (;;) {
-      const n = fs.readSync(fd, buf, 0, buf.length, null);
+      const n = fs.readSync(inFd, buf, 0, buf.length, null);
       if (n === 0) break;
       hash.update(buf.subarray(0, n));
+      fs.writeSync(outFd, buf, 0, n);
+      size += n;
     }
-  } finally { fs.closeSync(fd); }
-  return hash.digest();
+    return { digest: hash.digest(), size };
+  } finally {
+    fs.closeSync(inFd);
+    if (outFd !== null) fs.closeSync(outFd);
+  }
 }
 
 const keyFile = (kid) => path.join(keyDir(), `${kid}.pub`);
@@ -249,14 +309,14 @@ export function verifySignature(digest, signature, kid) {
 
 defineOp('cpanel.upgrade.keys', {
   description: 'Trusted release-signing keys installed on the host',
-  run: async () => ({ dir: keyDir(), readOnly: keysReadOnly(), keys: listKeys() }),
+  run: async () => ({ dir: keyDir(), readOnly: keysReadOnly(), policy: upgradePolicy(), keys: listKeys() }),
 });
 
 defineOp('cpanel.upgrade.key_add', {
   description: 'Install a trusted Ed25519 release-signing public key',
   schema: z.object({ kid: keyId, pem: pemText }).strict(),
   run: async ({ kid, pem }) => {
-    if (keysReadOnly()) throw new OpError('refused', 'Release keys are managed on the host (WHM_RELEASE_KEYS_READONLY); add the key under ' + keyDir() + ' as root');
+    if (keysReadOnly()) throw new OpError('refused', `Release keys are managed on the host: add ${kid}.pub under ${keyDir()} as root, or set upgrade.panelManagedKeys in ${agentConfigFile()} to let the panel manage them`);
     let key;
     try { key = crypto.createPublicKey(pem); } catch (err) { throw new OpError('invalid_key', `Not a valid public key: ${err.message}`); }
     if (key.asymmetricKeyType !== 'ed25519') throw new OpError('invalid_key', `Release keys must be Ed25519 public keys (got ${key.asymmetricKeyType})`);
@@ -277,7 +337,7 @@ defineOp('cpanel.upgrade.key_remove', {
   schema: z.object({ kid: keyId }).strict(),
   destructive: true,
   run: async ({ kid }) => {
-    if (keysReadOnly()) throw new OpError('refused', 'Release keys are managed on the host (WHM_RELEASE_KEYS_READONLY)');
+    if (keysReadOnly()) throw new OpError('refused', `Release keys are managed on the host: remove ${kid}.pub from ${keyDir()} as root`);
     const file = keyFile(kid);
     if (!fs.existsSync(file)) throw new OpError('not_found', `No trusted key named "${kid}"`);
     fs.unlinkSync(file);
@@ -293,47 +353,44 @@ defineOp('cpanel.upgrade.extract', {
     sha256: sha256Hex.nullable().default(null),
     signature: signatureB64.nullable().default(null),
     keyId: keyId.nullable().default(null),
-    allowUnverified: z.boolean().default(false),
   }).strict(),
   destructive: true,
   timeoutMs: 10 * 60 * 1000,
-  run: async ({ archive, version, sha256, signature, keyId: kid, allowUnverified }, ctx) => {
+  run: async ({ archive, version, sha256, signature, keyId: kid }, ctx) => {
     const src = ctx.assertAllowedPath(archive, 'read');
-    if (!fs.existsSync(src)) throw new OpError('not_found', `${src} does not exist`);
     ensureStagingRoot();
     const { stageDir, marker, archive: staged } = stagePaths(version);
     removeStageDir(stageDir, marker);
     // The panel owns the download; a private copy is what gets hashed and
     // unpacked so the bytes cannot change between the two.
     fs.rmSync(staged, { force: true });
-    fs.copyFileSync(src, staged, fs.constants.COPYFILE_EXCL);
-    fs.chmodSync(staged, 0o644);
-    const digest = sha256File(staged);
-    const digestHex = digest.toString('hex');
+    const policy = upgradePolicy();
+    const digestHex = (() => {
+      try { return stageArchive(src, staged, (p) => ctx.assertAllowedPath(p, 'read')).digest.toString('hex'); } catch (err) { fs.rmSync(staged, { force: true }); throw err; }
+    })();
+    const digest = Buffer.from(digestHex, 'hex');
     const warnings = [];
     const fail = (code, message) => { fs.rmSync(staged, { force: true }); throw new OpError(code, message, { sha256: digestHex }); };
     if (sha256) {
       if (digestHex !== sha256) fail('checksum_mismatch', `SHA-256 mismatch: feed says ${sha256}, archive is ${digestHex}`);
-    } else if (!allowUnverified) fail('unverified', 'No SHA-256 checksum was published for this release and an unverified upgrade was not confirmed');
-    else warnings.push('No checksum published; the archive was accepted because an unverified upgrade was confirmed');
+    } else if (!policy.allowUnverified) fail('unverified', `No SHA-256 checksum was published for this release and the host policy refuses unverified upgrades; ${POLICY_HINT()}`);
+    else warnings.push('No checksum published; the archive was accepted because the host policy allows unverified upgrades');
     let signer = null;
     let signatureState;
     if (signature) {
       const result = verifySignature(digest, signature, kid);
       if (result === undefined) {
-        if (!allowUnverified) fail('unverified', 'The release is signed but no trusted release key is installed; add the key or confirm an unverified upgrade');
+        if (!policy.allowUnverified) fail('unverified', `The release is signed but no trusted release key is installed under ${keyDir()}; add the publisher's key as root, or ${POLICY_HINT()}`);
         signatureState = 'no_trusted_key';
-        warnings.push('Signature not checked: no trusted release key is installed');
+        warnings.push('Signature not checked: no trusted release key is installed; accepted because the host policy allows unverified upgrades');
       } else if (result === null) {
         // A signature that does not verify is evidence of tampering, never
-        // something the operator may wave through.
+        // something any policy may wave through.
         fail('invalid_signature', `The release signature does not verify against any trusted key${kid ? ` (feed names "${kid}")` : ''}`);
       } else { signer = result; signatureState = 'verified'; }
-    } else if (listKeys().some((k) => k.valid)) {
-      if (!allowUnverified) fail('unsigned', 'Trusted release keys are installed but the feed published no signature');
-      signatureState = 'unsigned';
-      warnings.push('No signature published although trusted keys are installed; accepted because an unverified upgrade was confirmed');
-    } else { signatureState = 'unsigned'; warnings.push('No signature published for this release'); }
+    } else if (!policy.allowUnverified) {
+      fail('unsigned', `The feed published no signature and the host policy only runs releases signed by a key under ${keyDir()}; ${POLICY_HINT()}`);
+    } else { signatureState = 'unsigned'; warnings.push('No signature published; accepted because the host policy allows unverified upgrades'); }
 
     fs.mkdirSync(stageDir, { mode: 0o755 });
     try {
@@ -380,6 +437,9 @@ defineOp('cpanel.upgrade.run', {
   destructive: true,
   run: async ({ version, unit, skipNode }) => {
     const staged = verifyStagedRelease(version);
+    // The policy is re-read here: a release staged while unverified upgrades
+    // were permitted must not run once root has withdrawn that permission.
+    if (staged.signatureState !== 'verified' && !upgradePolicy().allowUnverified) throw new OpError('unverified', `Release ${version} was staged without a verified signature (${staged.signatureState ?? 'unknown'}) and the host policy refuses to run it; ${POLICY_HINT()}`);
     // The installer restarts whm-agentd and whm-panel; as a child of either it
     // would be killed half way. systemd-run detaches it into its own unit. The
     // unit is deliberately not --collect'ed: a failed unit must stay visible

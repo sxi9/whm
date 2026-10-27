@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { EventEmitter } from 'node:events';
+import { PanelEvents, EVENT_NAME_RE } from '../lib/events.js';
+export { PanelEvents, EVENT_NAME_RE };
 import { loadPluginSdk as loadSdk, REPO_ROOT } from '../lib/plugin-sdk.js';
 import { json, paginate } from '../db/index.js';
 import { HttpError, notFound, forbidden, conflict, badRequest, unprocessable, CapabilityError } from '../lib/errors.js';
@@ -41,7 +42,6 @@ export function loadPluginSdk(root = REPO_ROOT) {
   return sdk ? { ...sdk.validate, path: sdk.path, version: sdk.version } : null;
 }
 
-export const EVENT_NAME_RE = /^[a-z][a-z0-9_-]*(\.[a-z][a-z0-9_-]*){1,5}$/;
 export const HOOK_SCRIPT_RE = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
 export const TOKEN_SCOPE_RE = /^(\*|[a-z][a-z0-9-]{1,30}:(read|write))$/;
 export const APP_NAME_RE = /^[a-z][a-z0-9_-]{1,63}$/;
@@ -287,45 +287,6 @@ export function extractSection(text, slug) {
   const next = sections.slice(idx + 1).find((s) => s.level <= sections[idx].level);
   const lines = text.split('\n');
   return lines.slice(start, next ? next.line - 1 : lines.length).join('\n').trim() + '\n';
-}
-
-export class PanelEvents extends EventEmitter {
-  constructor(logger) {
-    super();
-    this.setMaxListeners(0);
-    this.logger = logger;
-    this.anyListeners = new Set();
-    this.recent = [];
-  }
-
-  // on() returns an unsubscribe function instead of the emitter so services can
-  // drop their listeners without keeping a reference to the handler.
-  on(event, fn) { super.on(event, fn); return () => this.off(event, fn); }
-
-  onAny(fn) { this.anyListeners.add(fn); return () => this.anyListeners.delete(fn); }
-
-  // Unlike EventEmitter.emit this awaits every listener. For a 'pre' stage a
-  // listener may throw to veto the operation; 'post' listener errors are logged.
-  async emit(event, payload = {}, { stage = 'post', req = null } = {}) {
-    if (typeof event !== 'string' || !EVENT_NAME_RE.test(event)) throw badRequest(`Invalid event name "${event}"`);
-    const envelope = { event, stage, payload, at: new Date().toISOString(), principal: req?.user?.username ?? null, role: req?.user?.role ?? null, ip: req?.ip ?? null };
-    const listeners = [...this.listeners(event), ...this.anyListeners];
-    const results = [];
-    for (const fn of listeners) {
-      try {
-        results.push(await fn(envelope));
-      } catch (err) {
-        if (stage === 'pre') throw err;
-        this.logger?.warn({ err, event }, 'event listener failed');
-        results.push({ error: err.message });
-      }
-    }
-    this.recent.unshift({ event, stage, at: envelope.at, principal: envelope.principal, listeners: listeners.length });
-    if (this.recent.length > 50) this.recent.length = 50;
-    return { event, stage, listeners: listeners.length, results };
-  }
-
-  emitPre(event, payload, opts = {}) { return this.emit(event, payload, { ...opts, stage: 'pre' }); }
 }
 
 export function createDevelopmentService(ctx) {

@@ -156,7 +156,7 @@ describe('defaults, preferences and the active theme', () => {
   });
   it('configures the panel and account defaults', async () => {
     const res = await put('/api/themes/config', { default: 'acme', accountDefault: 'high-contrast', allowUserOverride: false }).expect(200);
-    expect(res.body.data).toEqual({ default: 'acme', accountDefault: 'high-contrast', accountDefaultApplied: false, allowUserOverride: false });
+    expect(res.body.data).toEqual({ default: 'acme', accountDefault: 'high-contrast', accountDefaultApplied: true, allowUserOverride: false });
     expect(app.ctx.themes.defaultSlug()).toBe('acme');
     expect(app.ctx.themes.accountDefault()).toBe('high-contrast');
     const active = await reseller.get('/api/themes/active').expect(200);
@@ -202,24 +202,18 @@ describe('package assignment', () => {
     expect(res.body.data.map((p) => p.name)).toEqual(['default', 'starter']);
     expect(res.body.data[1]).toEqual({ id: expect.any(Number), name: 'starter', theme: 'jupiter', accounts: 0, themeKnown: true, effective: 'jupiter', owned: true });
   });
-  it('reports whether core applies the account default to new accounts', async () => {
-    // Until packages.snapshot() routes the theme through resolveForPackage (integration-contracts §22)
-    // the account default is stored but not applied, and the API must say so.
-    expect(app.ctx.themes.accountDefaultApplied()).toBe(false);
-    expect((await get('/api/themes').expect(200)).body.meta.accountDefaultApplied).toBe(false);
+  it('applies the account default when a package names a disabled or unknown theme', async () => {
+    // packages.snapshot() resolves the theme through resolveForPackage (integration-contracts §22).
+    expect(app.ctx.themes.accountDefaultApplied()).toBe(true);
+    expect((await get('/api/themes').expect(200)).body.meta.accountDefaultApplied).toBe(true);
     expect(app.ctx.packages.snapshot('starter').theme).toBe('jupiter');
-    const original = app.ctx.packages.snapshot;
-    app.ctx.packages.snapshot = (name) => { const plan = original(name); return { ...plan, theme: app.ctx.themes.resolveForPackage({ theme: plan.theme }) }; };
+    await app.ctx.db.prepare('UPDATE packages SET theme = ? WHERE name = ?').run('acme2', 'starter');
     try {
-      expect(app.ctx.themes.accountDefaultApplied()).toBe(true);
-      expect((await get('/api/themes').expect(200)).body.meta.accountDefaultApplied).toBe(true);
-      await app.ctx.db.prepare('UPDATE packages SET theme = ? WHERE name = ?').run('acme2', 'starter');
-      expect(app.ctx.packages.snapshot('starter').theme).toBe('jupiter');
+      expect(app.ctx.packages.snapshot('starter').theme).toBe(app.ctx.themes.resolveForPackage({ theme: 'acme2' }));
+      expect(app.ctx.packages.snapshot('starter').theme).not.toBe('acme2');
     } finally {
-      app.ctx.packages.snapshot = original;
       await app.ctx.db.prepare('UPDATE packages SET theme = ? WHERE name = ?').run('jupiter', 'starter');
     }
-    expect(app.ctx.themes.accountDefaultApplied()).toBe(false);
   });
   it('assigns a theme to a package through the packages service', async () => {
     const res = await put('/api/themes/packages/starter', { theme: 'acme' }).expect(200);

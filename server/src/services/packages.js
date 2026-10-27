@@ -5,7 +5,8 @@ import { isRoot } from '../middleware/rbac.js';
 const LIMIT_COLUMNS = ['disk_mb', 'bandwidth_mb', 'max_domains', 'max_subdomains', 'max_addons', 'max_parked', 'max_db', 'max_email', 'max_ftp', 'max_email_per_hour', 'quota_inodes'];
 const COLUMNS = [...LIMIT_COLUMNS, 'php_version', 'feature_list_id', 'has_shell', 'has_dedicated_ip', 'cgi', 'digest_auth', 'theme'];
 
-export function createPackagesService({ db }) {
+export function createPackagesService(ctx) {
+  const { db } = ctx;
   const stmts = {
     byName: db.prepare('SELECT p.*, f.name AS feature_list FROM packages p LEFT JOIN feature_lists f ON f.id = p.feature_list_id WHERE p.name = ?'),
     usage: db.prepare('SELECT COUNT(*) AS n FROM accounts WHERE package_id = ?'),
@@ -100,7 +101,7 @@ export function createPackagesService({ db }) {
       if (!pkg) throw notFound('Package');
       const fl = pkg.feature_list_id ? db.prepare('SELECT features_json FROM feature_lists WHERE id = ?').get(pkg.feature_list_id) : null;
       const limits = Object.fromEntries(LIMIT_COLUMNS.map((c) => [c, pkg[c]]));
-      return { ...limits, php_version: pkg.php_version, has_shell: Boolean(pkg.has_shell), has_dedicated_ip: Boolean(pkg.has_dedicated_ip), cgi: Boolean(pkg.cgi), theme: pkg.theme, features: json.parse(fl?.features_json, {}) };
+      return { ...limits, php_version: pkg.php_version, has_shell: Boolean(pkg.has_shell), has_dedicated_ip: Boolean(pkg.has_dedicated_ip), cgi: Boolean(pkg.cgi), theme: ctx.themes?.resolveForPackage?.(pkg) ?? pkg.theme, features: json.parse(fl?.features_json, {}) };
     },
 
     featureLists: {

@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { exec, hasBinary } from '../src/exec.js';
 import { runOp, createContext, OpError } from '../src/lib.js';
-import { parseWpVersion, parseWpConfig, assertUnderHome, passwdHome, WP_HARDENING_FIXES, WP_FALLBACK_THEME } from '../src/ops/web.js';
+import { execFileSync } from 'node:child_process';
+import { parseWpVersion, parseWpConfig, assertUnderHome, passwdHome, findWordPress, readSiteFile, regularFileStat, WP_READ_MAX_BYTES, WP_HARDENING_FIXES, WP_FALLBACK_THEME } from '../src/ops/web.js';
 
 // WP-CLI ops added for the bundled WP Toolkit plugin. WP-CLI is absent on the
 // test host, so every op either fails the schema or reports capability_missing
@@ -85,6 +86,77 @@ describe('WordPress helpers', () => {
       expect(() => assertUnderHome(home, path.join(home, 'public_html', 'link'))).toThrow(/symbolic link/);
       expect(() => assertUnderHome(home, path.join(home, 'public_html', 'link', 'deeper'))).toThrow(/symbolic link/);
     } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+});
+
+// Files under an account's web root are account-controlled: a FIFO would park
+// the root agent forever, a symlink would read another tree, a sparse file
+// would fill root's memory. Each is planted and must be skipped, never opened.
+describe('site files are read only when they are small regular files', () => {
+  const me = os.userInfo().username;
+  const home = passwdHome(me);
+  const userCtx = createContext({ allowedRoots: [home] });
+  const config = "<?php\ndefine('DB_NAME', 'alice_wp');\n$table_prefix = 'wp_';\n";
+  const version = "<?php\n$wp_version = '6.5.2';\n";
+
+  function plant(root, name, kind, target) {
+    const dir = path.join(root, name);
+    fs.mkdirSync(path.join(dir, 'wp-includes'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'wp-includes', 'version.php'), version);
+    const cfg = path.join(dir, 'wp-config.php');
+    if (kind === 'file') fs.writeFileSync(cfg, config);
+    else if (kind === 'fifo') execFileSync('mkfifo', [cfg]);
+    else if (kind === 'symlink') fs.symlinkSync(target, cfg);
+    else if (kind === 'sparse') { fs.writeFileSync(cfg, config); fs.truncateSync(cfg, WP_READ_MAX_BYTES + 1); }
+    return dir;
+  }
+
+  it('readSiteFile and findWordPress skip FIFOs, symlinks and oversized files', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wp-files-'));
+    try {
+      const good = plant(tmp, 'good', 'file');
+      const fifo = plant(tmp, 'fifo', 'fifo');
+      const link = plant(tmp, 'link', 'symlink', path.join(good, 'wp-config.php'));
+      const sparse = plant(tmp, 'sparse', 'sparse');
+      fs.symlinkSync(path.join(good, 'wp-includes', 'version.php'), path.join(fifo, 'wp-includes', 'version-link.php'));
+      expect(readSiteFile(path.join(good, 'wp-config.php'))).toBe(config);
+      expect(readSiteFile(path.join(fifo, 'wp-config.php'))).toBe(null);
+      expect(readSiteFile(path.join(link, 'wp-config.php'))).toBe(null);
+      expect(readSiteFile(path.join(sparse, 'wp-config.php'))).toBe(null);
+      expect(readSiteFile(path.join(fifo, 'wp-includes', 'version-link.php'))).toBe(null);
+      expect(readSiteFile(path.join(tmp, 'missing'))).toBe(null);
+      expect(regularFileStat(path.join(fifo, 'wp-config.php'))).toBe(null);
+      expect(regularFileStat(good)).toBe(null);
+      const found = [];
+      const started = Date.now();
+      findWordPress(tmp, 3, { dirs: 500 }, found);
+      expect(Date.now() - started).toBeLessThan(5000);
+      expect(found).toEqual([{ path: good, version: '6.5.2', dbName: 'alice_wp', dbUser: null, dbHost: null, tablePrefix: 'wp_' }]);
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  it('web.wp.discover skips a planted FIFO and web.wp.harden / inspect refuse it without spawning anything', async () => {
+    // discover walks <home>/{public_html,www,domains}; one that does not exist
+    // yet is created for the test and removed afterwards.
+    const sub = ['public_html', 'www', 'domains'].find((d) => !fs.existsSync(path.join(home, d)));
+    if (!sub) return;
+    const root = path.join(home, sub);
+    fs.mkdirSync(root);
+    exec.mockClear();
+    try {
+      const good = plant(root, 'good-site', 'file');
+      const fifo = plant(root, 'fifo-site', 'fifo');
+      plant(root, 'link-site', 'symlink', path.join(good, 'wp-config.php'));
+      plant(root, 'link-away', 'symlink', '/etc/passwd');
+      const r = await runOp('web.wp.discover', { usernames: [me] }, userCtx);
+      expect(r.missing).toEqual([]);
+      expect(r.installs.map((i) => i.relative)).toEqual([`${sub}/good-site`]);
+      expect(r.installs[0]).toMatchObject({ username: me, version: '6.5.2', dbName: 'alice_wp' });
+      expect((await opError(runOp('web.wp.harden', { username: me, path: fifo }, userCtx))).code).toBe('not_found');
+      expect((await opError(runOp('web.wp.inspect', { username: me, path: path.join(root, 'link-site') }, userCtx))).code).toBe('not_found');
+      expect((await opError(runOp('web.wp.hardenfix', { username: me, path: path.join(root, 'link-away'), fixes: ['config-perms'] }, userCtx))).code).toBe('not_found');
+      expect(exec).not.toHaveBeenCalled();
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 });
 

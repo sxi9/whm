@@ -8,6 +8,7 @@ import { openDatabase } from './db/index.js';
 import { seed } from './db/seed.js';
 import { SqliteSessionStore } from './db/session-store.js';
 import { createCrypto } from './lib/crypto.js';
+import { PanelEvents } from './lib/events.js';
 import { createAgentClient } from './lib/agent-client.js';
 import { createCapabilities } from './lib/capabilities.js';
 import { createJobs } from './lib/jobs.js';
@@ -39,7 +40,7 @@ export async function bootstrap(overrides = {}) {
   const scheduler = createScheduler({ db, jobs, logger });
   const settings = createSettingsService({ db });
 
-  const ctx = { config, logger, db, crypto, agent, capabilities, jobs, scheduler, settings, version };
+  const ctx = { config, logger, db, crypto, agent, capabilities, jobs, scheduler, settings, version, events: new PanelEvents(logger) };
   ctx.sessionStore = new SqliteSessionStore(db, { ttlMs: config.sessionTtlMs });
   ctx.auth = createAuthService(ctx);
   ctx.packages = createPackagesService(ctx);

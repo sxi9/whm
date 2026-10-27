@@ -175,7 +175,7 @@ export function WpToolkitOverview({ base }) {
       </Card>
       {installs.data?.length > 0 && (
         <Card title="Recent installs" padded={false}>
-          <DataTable dense columns={[{ key: 'created_at', label: 'Requested', render: (r) => formatDate(r.created_at) }, { key: 'username', label: 'Account' }, { key: 'url', label: 'URL' }, { key: 'db_name', label: 'Database' }, { key: 'status', label: 'Status', render: (r) => <StatusPill status={r.status === 'done' ? 'ok' : r.status} /> }, { key: 'error', label: 'Error', render: (r) => r.error || '' }]} rows={installs.data} rowKey={(r) => r.id} />
+          <DataTable dense columns={[{ key: 'created_at', label: 'Requested', render: (r) => formatDate(r.created_at) }, { key: 'username', label: 'Account' }, { key: 'url', label: 'URL' }, { key: 'db_name', label: 'Database' }, { key: 'status', label: 'Status', render: (r) => <StatusPill status={r.status === 'done' ? 'ok' : r.status} /> }, { key: 'error', label: 'Error', render: (r) => (r.error ? `${r.error}${r.cleanup ? ` (${r.cleanup})` : ''}` : '') }]} rows={installs.data} rowKey={(r) => r.id} />
         </Card>
       )}
     </>

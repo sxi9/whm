@@ -350,11 +350,16 @@ export function createCpanelService(ctx) {
   };
 
   // ------------------------------------------------------------ upgrade ----
-  // Keys live on the host under the agent's control; the panel only relays them.
+  // Keys live on the host under the agent's control; the panel only relays
+  // them. The same op reports the host policy: whether root lets the panel
+  // manage keys and whether unverified releases may run at all. Both are root's
+  // decisions (agent environment or agent.conf); nothing here can override them.
+  const DEFAULT_POLICY = { allowUnverified: false, panelManagedKeys: false, configFile: null };
+  const shapePolicy = (p) => ({ allowUnverified: p?.allowUnverified === true, panelManagedKeys: p?.panelManagedKeys === true, configFile: typeof p?.configFile === 'string' ? p.configFile : null });
   const releaseKeys = {
     async list() {
       const res = await ctx.agent.op('cpanel.upgrade.keys');
-      return { dir: res.dir, readOnly: Boolean(res.readOnly), keys: (res.keys || []).map(({ pem, ...k }) => k) };
+      return { dir: res.dir, readOnly: Boolean(res.readOnly), policy: shapePolicy(res.policy), keys: (res.keys || []).map(({ pem, ...k }) => k) };
     },
     async pems() {
       const res = await ctx.agent.op('cpanel.upgrade.keys');
@@ -432,7 +437,7 @@ export function createCpanelService(ctx) {
       const last = S('cpanel.upgrade.last', null);
       const method = installMethod();
       const can = upgrade.canRun();
-      let keys = { dir: null, readOnly: false, keys: [], error: null };
+      let keys = { dir: null, readOnly: true, policy: DEFAULT_POLICY, keys: [], error: null };
       try { keys = { ...(await releaseKeys.list()), error: null }; } catch (err) { keys.error = err.message; }
       const trusted = keys.keys.filter((k) => k.valid);
       let lastDetail = null;
@@ -456,10 +461,11 @@ export function createCpanelService(ctx) {
         verification = {
           sha256: Boolean(latest.sha256), signature: Boolean(latest.signature), keyId: latest.keyId ?? null,
           trustedKeys: trusted.length, trustedKey: Boolean(latest.signature) && keyKnown,
-          // A signature with trusted keys installed is always checked and a
-          // mismatch always refused; only "nothing to check against" may be
-          // waved through with allowUnverified.
-          unverifiable: !latest.sha256 || (!latest.signature && trusted.length > 0) || (Boolean(latest.signature) && trusted.length === 0),
+          // Mirrors the agent's rule: a release is verifiable only with a
+          // checksum and a signature from a trusted key. A signature that does
+          // not verify is always refused; anything short of verified runs only
+          // when the host policy allows unverified upgrades.
+          unverifiable: !latest.sha256 || !latest.signature || trusted.length === 0,
           keyMissing: Boolean(latest.signature) && trusted.length > 0 && !keyKnown,
         };
       }
@@ -467,7 +473,7 @@ export function createCpanelService(ctx) {
         currentVersion: ctx.version, updateUrl: splitCredentials(url).url, updateUrlConfigured: Boolean(url), tier: S('updates.tier', 'stable'),
         lastCheck, latest, updateAvailable: latest ? compareVersions(latest.version, ctx.version) > 0 : null,
         installMethod: method, repoRoot: REPO_ROOT, canRun: can.ok, reason: can.reason,
-        verification, releaseKeys: keys.keys, releaseKeyDir: keys.dir, releaseKeysReadOnly: keys.readOnly, releaseKeysError: keys.error,
+        verification, policy: keys.policy, releaseKeys: keys.keys, releaseKeyDir: keys.dir, releaseKeysReadOnly: keys.readOnly, releaseKeysError: keys.error,
         activeJob: activeJob(), last: lastDetail,
         instructions: [
           method === 'git' ? `cd ${REPO_ROOT} && git fetch --tags && git checkout <release-tag>` : `Download the release archive${latest?.url ? ` from ${latest.url}` : ''} and unpack it (tar -xzf) somewhere root can read`,
@@ -500,7 +506,15 @@ export function createCpanelService(ctx) {
       if (!latest) throw unprocessable('Check for updates first', { latest: ['no release known'] });
       if (!latest.url) throw unprocessable('The release feed did not publish a download URL', { url: ['missing'] });
       if (compareVersions(latest.version, ctx.version) <= 0) throw conflict(`Version ${latest.version} is not newer than the running ${ctx.version}`);
-      if (!latest.sha256 && !allowUnverified) throw unprocessable('The release feed does not publish a SHA-256 checksum; confirm an unverified upgrade explicitly', { allowUnverified: ['required'] });
+      // Early, non-authoritative: the agent re-derives all of this from its
+      // own policy and keys. allowUnverified is only the operator's
+      // acknowledgement; it is never sent to the agent.
+      const { verification, policy } = await upgrade.status();
+      if (verification?.keyMissing) throw unprocessable(`The feed's signature names key "${latest.keyId}", which is not trusted on this host; a signature that does not verify is always refused`, { keyId: ['not trusted'] });
+      if (verification?.unverifiable) {
+        if (!policy.allowUnverified) throw unprocessable('This release cannot be verified (it needs a SHA-256 checksum and a signature from a key trusted on the host) and the host policy refuses unverified upgrades', { policy: ['set upgrade.allowUnverified in the agent configuration or WHM_UPGRADE_ALLOW_UNVERIFIED=1 in the whm-agentd unit'] });
+        if (!allowUnverified) throw unprocessable('This release cannot be verified; the host policy permits it but you must acknowledge an unverified upgrade explicitly', { allowUnverified: ['required'] });
+      }
       if (activeJob()) throw conflict('An upgrade is already queued or running');
       const job = ctx.jobs.enqueue(UPGRADE_JOB, { version: latest.version, url: latest.url, sha256: latest.sha256, signature: latest.signature, keyId: latest.keyId, allowUnverified: Boolean(allowUnverified), skipNode: Boolean(skipNode), by: user?.username ?? null }, { userId: user?.id ?? null });
       req?.audit?.({ action: 'upgrade.start', target: latest.version, args: { jobId: job.id, url: latest.url, sha256: latest.sha256, allowUnverified: Boolean(allowUnverified) } });
@@ -539,28 +553,24 @@ export function createCpanelService(ctx) {
       const digest = hash.digest();
       const digestHex = digest.toString('hex');
       job.log(`Downloaded ${received} bytes, sha256 ${digestHex}`);
-      // Early failures only; the agent repeats every check on its own copy.
+      // Early failures only; the agent repeats every check on its own copy
+      // and applies the host policy to whatever cannot be verified.
       if (sha256) {
         if (digestHex !== sha256) throw Object.assign(new Error(`SHA-256 mismatch: feed says ${sha256}, archive is ${digestHex}`), { code: 'CHECKSUM_MISMATCH' });
         job.log('SHA-256 checksum matches the feed');
-      } else if (allowUnverified) job.log('No checksum published; continuing because an unverified upgrade was confirmed', 'warn');
-      else throw Object.assign(new Error('No SHA-256 checksum published for this release'), { code: 'UNVERIFIED' });
+      } else job.log(`No checksum published for this release${allowUnverified ? '; unverified upgrade acknowledged by the operator' : ''}`, 'warn');
       if (signature) {
         const signer = await releaseKeys.verify(digest, signature, keyId);
         if (signer === null) throw Object.assign(new Error(`The release signature does not verify against any trusted key${keyId ? ` (feed names "${keyId}")` : ''}`), { code: 'SIGNATURE_INVALID' });
-        if (signer === undefined) {
-          if (!allowUnverified) throw Object.assign(new Error('The release is signed but no trusted release key is installed'), { code: 'UNVERIFIED' });
-          job.log('Signature cannot be checked: no trusted release key is installed; continuing because an unverified upgrade was confirmed', 'warn');
-        } else job.log(`Signature matches trusted key "${signer}"`);
-      } else if ((await releaseKeys.pems()).length > 0 && !allowUnverified) {
-        throw Object.assign(new Error('Trusted release keys are configured but the feed published no signature'), { code: 'UNSIGNED' });
+        if (signer === undefined) job.log('Signature cannot be checked here: no trusted release key is installed on the host', 'warn');
+        else job.log(`Signature matches trusted key "${signer}"`);
       } else job.log('No signature published for this release', 'warn');
       job.progress(45, 'verifying and unpacking');
       let unpacked;
       try {
-        unpacked = await ctx.agent.op('cpanel.upgrade.extract', { archive, version, sha256: sha256 ?? null, signature: signature ?? null, keyId: keyId ?? null, allowUnverified: Boolean(allowUnverified) }, { timeoutMs: 10 * 60 * 1000 });
+        unpacked = await ctx.agent.op('cpanel.upgrade.extract', { archive, version, sha256: sha256 ?? null, signature: signature ?? null, keyId: keyId ?? null }, { timeoutMs: 10 * 60 * 1000 });
       } catch (err) {
-        const code = { checksum_mismatch: 'CHECKSUM_MISMATCH', invalid_signature: 'SIGNATURE_INVALID', unverified: 'UNVERIFIED', unsigned: 'UNSIGNED', invalid_package: 'INVALID_PACKAGE' }[err?.code] ?? 'STAGING_FAILED';
+        const code = { checksum_mismatch: 'CHECKSUM_MISMATCH', invalid_signature: 'SIGNATURE_INVALID', unverified: 'UNVERIFIED', unsigned: 'UNSIGNED', invalid_package: 'INVALID_PACKAGE', refused: 'STAGING_REFUSED', path_not_allowed: 'STAGING_REFUSED' }[err?.code] ?? 'STAGING_FAILED';
         throw Object.assign(new Error(`The agent refused to stage the release: ${err.message}`), { code });
       }
       for (const w of unpacked.warnings || []) job.log(w, 'warn');

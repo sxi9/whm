@@ -3,6 +3,7 @@ const SECRET_KEYS = /pass(word)?|secret|token|key|cert|private|totp|csrf/i;
 export function redact(value, depth = 0) {
   if (depth > 6 || value == null) return value;
   if (Array.isArray(value)) return value.slice(0, 50).map((v) => redact(v, depth + 1));
+  if (Buffer.isBuffer(value) || ArrayBuffer.isView(value)) return { bytes: value.byteLength };
   if (typeof value === 'object') {
     const out = {};
     for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEYS.test(k) ? '[redacted]' : redact(v, depth + 1);

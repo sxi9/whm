@@ -9,7 +9,7 @@ import { HttpError, CapabilityError, notFound, conflict } from '../lib/errors.js
 import { agentErrorStatus } from '../middleware/error.js';
 import { loadPluginSdk, loadCommonJs, createPluginContext, freezeExports, freezeBuiltin, REPO_ROOT } from '../lib/plugin-sdk.js';
 import { extractTar, TarError, UNSAFE_NAME_CHARS } from '../lib/tar.js';
-import { PanelEvents } from './development.js';
+import { PanelEvents } from '../lib/events.js';
 
 // The in-process plugin host: the real implementation of the contract that
 // plugins/sdk/mock-host.js documents. Attached as ctx.plugins. Every ctx.* method a

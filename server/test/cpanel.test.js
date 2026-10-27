@@ -314,6 +314,9 @@ describe('Upgrade to Latest Version', () => {
   const keyEntry = (kid, p) => ({ kid, type: 'ed25519', fingerprint: crypto.createHash('sha256').update(crypto.createPublicKey(p).export({ type: 'spki', format: 'der' })).digest('hex').slice(0, 32), addedAt: '2026-10-26T00:00:00.000Z', valid: true, pem: p });
   const agentFail = (code, message) => Object.assign(new Error(message), { agentError: true, code, details: {} });
   const stagingDir = () => path.join(app.dir, 'agent-staging');
+  // The host policy is the agent's (root's) decision; the mock reports it and
+  // enforces it exactly like the real op, and never accepts it as an argument.
+  const hostPolicy = { allowUnverified: false, panelManagedKeys: true, configFile: '/etc/whm/agent.conf' };
   let extractImpl;
 
   beforeAll(() => {
@@ -324,7 +327,7 @@ describe('Upgrade to Latest Version', () => {
       if (href === feed.url) return new Response(archive, { status: 200, headers: { 'content-length': String(archive.length) } });
       return new Response('nope', { status: 404 });
     };
-    app.agent.set('cpanel.upgrade.keys', () => ({ dir: '/etc/whm/release-keys', readOnly: false, keys: [...keyStore.values()] }));
+    app.agent.set('cpanel.upgrade.keys', () => ({ dir: '/etc/whm/release-keys', readOnly: !hostPolicy.panelManagedKeys, policy: { ...hostPolicy }, keys: [...keyStore.values()] }));
     app.agent.set('cpanel.upgrade.key_add', ({ kid, pem: p }) => {
       if (keyStore.has(kid)) throw agentFail('exists', `A key named "${kid}" already exists`);
       keyStore.set(kid, keyEntry(kid, p));
@@ -337,18 +340,21 @@ describe('Upgrade to Latest Version', () => {
     });
     // Stand-in for the agent's own verification: hash the archive it is handed
     // and check the signature against the (mock) key store.
-    extractImpl = ({ archive: a, version, sha256, signature: sig, keyId, allowUnverified }) => {
+    extractImpl = (args) => {
+      const { archive: a, version, sha256, signature: sig, keyId } = args;
+      if ('allowUnverified' in args) throw agentFail('invalid_args', 'Unrecognized key: allowUnverified');
       const actual = crypto.createHash('sha256').update(fs.readFileSync(a)).digest();
       if (sha256 && actual.toString('hex') !== sha256) throw agentFail('checksum_mismatch', 'SHA-256 mismatch');
+      else if (!sha256 && !hostPolicy.allowUnverified) throw agentFail('unverified', 'no checksum and the host policy refuses unverified upgrades');
       let signer = null;
       if (sig) {
         const candidates = [...keyStore.values()].filter((k) => !keyId || k.kid === keyId);
-        if (keyStore.size === 0) { if (!allowUnverified) throw agentFail('unverified', 'no trusted key'); }
+        if (keyStore.size === 0) { if (!hostPolicy.allowUnverified) throw agentFail('unverified', 'no trusted key'); }
         else {
           signer = candidates.find((k) => crypto.verify(null, actual, crypto.createPublicKey(k.pem), Buffer.from(sig, 'base64')))?.kid ?? null;
           if (!signer) throw agentFail('invalid_signature', 'The release signature does not verify against any trusted key');
         }
-      }
+      } else if (!hostPolicy.allowUnverified) throw agentFail('unsigned', 'no signature and the host policy refuses unverified upgrades');
       const stageDir = path.join(stagingDir(), `src-${version}`);
       fs.mkdirSync(stageDir, { recursive: true });
       return { version, stageDir, sourceDir: path.join(stageDir, `whm-${version}`), sha256: actual.toString('hex'), signer, signatureState: signer ? 'verified' : 'unsigned', name: 'whm', packageVersion: version, warnings: signer ? [] : ['No signature verified'] };
@@ -360,7 +366,7 @@ describe('Upgrade to Latest Version', () => {
 
   it('reports status (root only) and explains why a git checkout cannot self-upgrade', async () => {
     const res = await get('/api/cpanel/upgrade').expect(200);
-    expect(res.body.data).toMatchObject({ currentVersion: app.ctx.version, updateUrlConfigured: false, canRun: false, latest: null, releaseKeys: [], releaseKeyDir: '/etc/whm/release-keys', releaseKeysReadOnly: false, activeJob: null, last: null });
+    expect(res.body.data).toMatchObject({ currentVersion: app.ctx.version, updateUrlConfigured: false, canRun: false, latest: null, releaseKeys: [], releaseKeyDir: '/etc/whm/release-keys', releaseKeysReadOnly: false, policy: { allowUnverified: false, panelManagedKeys: true, configFile: '/etc/whm/agent.conf' }, activeJob: null, last: null });
     expect(res.body.data.reason).toMatch(/git/);
     expect(res.body.data.instructions.length).toBeGreaterThan(1);
     await reseller.get('/api/cpanel/upgrade').expect(403);
@@ -402,14 +408,19 @@ describe('Upgrade to Latest Version', () => {
     const listed = (await get('/api/cpanel/upgrade/keys').expect(200)).body.data;
     expect(listed.keys).toHaveLength(1);
     expect(listed.keys[0].pem).toBeUndefined();
+    expect(listed.policy).toEqual({ allowUnverified: false, panelManagedKeys: true, configFile: '/etc/whm/agent.conf' });
     const v = (await get('/api/cpanel/upgrade').expect(200)).body.data.verification;
     expect(v).toMatchObject({ trustedKeys: 1, trustedKey: true, unverifiable: false, keyMissing: false });
     await post('/api/cpanel/upgrade/keys', { kid: 'spare', pem }).expect(201);
     await del('/api/cpanel/upgrade/keys/spare').expect(200);
     await del('/api/cpanel/upgrade/keys/spare').expect(404);
     expect(auditRows('upgrade.key.remove')[0].target).toBe('spare');
+    // Host-managed keys (the shipped default): the agent refuses, the panel reports it as read-only.
+    hostPolicy.panelManagedKeys = false;
     app.agent.set('cpanel.upgrade.key_add', agentFail('refused', 'Release keys are managed on the host'));
     await post('/api/cpanel/upgrade/keys', { kid: 'later', pem }).expect(422);
+    expect((await get('/api/cpanel/upgrade').expect(200)).body.data).toMatchObject({ releaseKeysReadOnly: true, policy: { panelManagedKeys: false } });
+    hostPolicy.panelManagedKeys = true;
     app.agent.set('cpanel.upgrade.key_add', ({ kid, pem: p }) => { keyStore.set(kid, keyEntry(kid, p)); return keyStore.get(kid); });
   });
 
@@ -431,7 +442,7 @@ describe('Upgrade to Latest Version', () => {
     expect(job.status, JSON.stringify(job)).toBe('done');
     expect(job.result).toMatchObject({ version: '9.9.9', logFile: logFiles[0] });
     const extract = app.agent.callsTo('cpanel.upgrade.extract').at(-1).args;
-    expect(extract).toEqual({ archive: path.join(app.dir, 'upgrades', 'whm-9.9.9.tar.gz'), version: '9.9.9', sha256: feed.sha256, signature, keyId: 'release-2026', allowUnverified: false });
+    expect(extract).toEqual({ archive: path.join(app.dir, 'upgrades', 'whm-9.9.9.tar.gz'), version: '9.9.9', sha256: feed.sha256, signature, keyId: 'release-2026' });
     expect(fs.readFileSync(extract.archive).equals(archive)).toBe(true);
     const lines = job.logs.map((l) => l.line);
     expect(lines.some((l) => /SHA-256 checksum matches/.test(l))).toBe(true);
@@ -483,7 +494,7 @@ describe('Upgrade to Latest Version', () => {
     expect((await get('/api/cpanel/upgrade').expect(200)).body.data.last.status).toBe('unknown');
   }, 60_000);
 
-  it('fails on a checksum mismatch or a bad signature even with the override, and refuses unverifiable feeds', async () => {
+  it('fails on a checksum mismatch or a bad signature whatever the operator acknowledges, and leaves unverifiable feeds to the host policy', async () => {
     feed = { ...feed, sha256: 'b'.repeat(64) };
     await post('/api/cpanel/upgrade/check').expect(200);
     const extractCalls = app.agent.callsTo('cpanel.upgrade.extract').length;
@@ -502,9 +513,10 @@ describe('Upgrade to Latest Version', () => {
       expect(job.status, String(allowUnverified)).toBe('failed');
       expect(job.error_code, String(allowUnverified)).toBe('SIGNATURE_INVALID');
     }
-    // A feed naming a key that is not trusted here is flagged for the UI.
+    // A feed naming a key that is not trusted here is flagged for the UI and refused up front.
     feed = { ...feed, signature, keyId: 'release-2027' };
     expect((await post('/api/cpanel/upgrade/check').expect(200)).body.data.verification).toMatchObject({ trustedKey: false, keyMissing: true, unverifiable: false });
+    expect((await post('/api/cpanel/upgrade/start', { allowUnverified: true }).expect(422)).body.error.fields.keyId).toBeTruthy();
 
     // The agent is the authority: if it rejects the signature the job fails even when the panel's early check passed.
     feed = { ...feed, signature, keyId: 'release-2026' };
@@ -516,18 +528,43 @@ describe('Upgrade to Latest Version', () => {
     expect(job.error_code).toBe('SIGNATURE_INVALID');
     app.agent.set('cpanel.upgrade.extract', extractImpl);
 
-    // Keys trusted but the feed is unsigned: refused unless confirmed.
+    // Keys trusted but the feed is unsigned: the host policy decides, not the request body.
     feed = { version: '9.9.9', url: feed.url, sha256: digest.toString('hex') };
     await post('/api/cpanel/upgrade/check').expect(200);
     expect((await get('/api/cpanel/upgrade').expect(200)).body.data.verification).toMatchObject({ signature: false, unverifiable: true });
-    res = await post('/api/cpanel/upgrade/start', {}).expect(202);
+    for (const allowUnverified of [false, true]) {
+      const refused = await post('/api/cpanel/upgrade/start', { allowUnverified }).expect(422);
+      expect(refused.body.error.fields.policy, String(allowUnverified)).toBeTruthy();
+    }
+    expect(app.agent.callsTo('cpanel.upgrade.extract').every((c) => !('allowUnverified' in c.args))).toBe(true);
+    // Root opted in on the host: the operator still has to acknowledge it, and the agent gets no flag.
+    hostPolicy.allowUnverified = true;
+    expect((await post('/api/cpanel/upgrade/start', {}).expect(422)).body.error.fields.allowUnverified).toBeTruthy();
+    const before = app.agent.callsTo('cpanel.upgrade.extract').length;
+    res = await post('/api/cpanel/upgrade/start', { allowUnverified: true }).expect(202);
     job = await waitForJob(app.ctx, res.body.data.job.id, 20_000);
+    expect(app.agent.callsTo('cpanel.upgrade.extract')).toHaveLength(before + 1);
+    expect(app.agent.callsTo('cpanel.upgrade.extract').at(-1).args).toEqual({ archive: path.join(app.dir, 'upgrades', 'whm-9.9.9.tar.gz'), version: '9.9.9', sha256: digest.toString('hex'), signature: null, keyId: null });
+    expect(['UNSIGNED', 'UNVERIFIED']).not.toContain(job.error_code);
+    expect(job.logs.map((l) => l.line).some((l) => /unverified upgrade acknowledged|No signature published/.test(l))).toBe(true);
+    expect(JSON.parse(auditRows('upgrade.start')[0].args_redacted)).toMatchObject({ allowUnverified: true });
+    // The agent is the authority on the policy: if it refuses, the job fails even though the panel saw it permitted.
+    app.agent.set('cpanel.upgrade.extract', agentFail('unsigned', 'the host policy refuses unverified upgrades'));
+    res = await post('/api/cpanel/upgrade/start', { allowUnverified: true }).expect(202);
+    job = await waitForJob(app.ctx, res.body.data.job.id, 20_000);
+    expect(job.status).toBe('failed');
     expect(job.error_code).toBe('UNSIGNED');
+    app.agent.set('cpanel.upgrade.extract', agentFail('refused', 'archive is a symbolic link'));
+    res = await post('/api/cpanel/upgrade/start', { allowUnverified: true }).expect(202);
+    job = await waitForJob(app.ctx, res.body.data.job.id, 20_000);
+    expect(job.error_code).toBe('STAGING_REFUSED');
+    app.agent.set('cpanel.upgrade.extract', extractImpl);
+    hostPolicy.allowUnverified = false;
 
     feed = { version: '9.9.9', url: feed.url };
     await post('/api/cpanel/upgrade/check').expect(200);
-    const refused = await post('/api/cpanel/upgrade/start', {}).expect(422);
-    expect(refused.body.error.fields.allowUnverified).toBeTruthy();
+    const refused = await post('/api/cpanel/upgrade/start', { allowUnverified: true }).expect(422);
+    expect(refused.body.error.fields.policy).toBeTruthy();
     feed = { version: '0.0.1', url: feed.url, sha256: digest.toString('hex') };
     await post('/api/cpanel/upgrade/check').expect(200);
     await post('/api/cpanel/upgrade/start', {}).expect(409);

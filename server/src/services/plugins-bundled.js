@@ -42,7 +42,7 @@ export function createBundledPluginsService(ctx) {
     row: db.prepare('SELECT * FROM bundled_plugins WHERE id = ?'),
     wpInsert: db.prepare('INSERT INTO wp_installs (username, path, url, db_name, db_user, job_id, status, requested_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
     wpJob: db.prepare('UPDATE wp_installs SET job_id = ? WHERE id = ?'),
-    wpFinish: db.prepare(`UPDATE wp_installs SET status = ?, error = ?, finished_at = datetime('now') WHERE id = ?`),
+    wpFinish: db.prepare(`UPDATE wp_installs SET status = ?, error = ?, cleanup = ?, finished_at = datetime('now') WHERE id = ?`),
     wpList: db.prepare('SELECT * FROM wp_installs WHERE (@username IS NULL OR username = @username) ORDER BY id DESC LIMIT 50'),
   };
 
@@ -196,6 +196,20 @@ export function createBundledPluginsService(ctx) {
     return ctx.databases;
   }
 
+  // Asked of the agent, not the capability snapshot: the operator installs
+  // WP-CLI and retries straight away, and nothing may be provisioned for an
+  // install that cannot run.
+  async function requireWpCli() {
+    let d;
+    try { d = await ctx.agent.op('web.wp.detect', {}); } catch (err) {
+      if (err?.agentError && ['capability_missing', 'binary_not_found'].includes(err.code)) throw new CapabilityError('wpcli', err.message);
+      throw err;
+    }
+    if (!d?.installed) throw new CapabilityError('wpcli', 'WP-CLI (wp) is not installed on this server, so WordPress cannot be installed');
+    if (d.runuser === false) throw new CapabilityError('wpcli', 'runuser is required to run WP-CLI as the account user');
+    return d;
+  }
+
   function accountsForInstall(user) {
     const r = ctx.accounts.list({ page: 1, pageSize: 500 }, user);
     return r.data.filter((a) => !a.suspended).map((a) => ({ username: a.username, domain: a.domain, home: a.home_dir || `${ctx.settings.get('basic.home_root') || '/home'}/${a.username}`, owner: a.owner }));
@@ -216,6 +230,7 @@ export function createBundledPluginsService(ctx) {
     const { site, rel } = siteDirOf(account, input.directory);
     const url = input.url || `https://${account.domain}${rel ? `/${rel}` : ''}`;
     const databases = requireDatabases();
+    await requireWpCli();
     const dbPassword = input.dbPassword || ctx.crypto.randomPassword?.(20) || `Wp${Math.random().toString(36).slice(2, 12)}!${Date.now().toString(36)}`;
     const created = await databases.createDatabase({ account: account.username, name: input.dbName }, user, req);
     let dbUserName;
@@ -252,16 +267,40 @@ export function createBundledPluginsService(ctx) {
         dbName: p.dbName, dbUser: p.dbUser, dbPassword: ctx.crypto.decrypt(p.dbPassword), dbHost: p.dbHost, tablePrefix: p.tablePrefix, locale: p.locale,
       });
       jobCtx.progress(90, 'registering the site with WP Toolkit');
-      stmts.wpFinish.run('done', null, p.installId);
+      stmts.wpFinish.run('done', null, null, p.installId);
       if (ctx.jobs.types().includes(WP_DISCOVER_JOB)) {
         try { ctx.jobs.enqueue(WP_DISCOVER_JOB, { trigger: 'manual', params: { usernames: [p.username] } }); } catch (err) { jobCtx.log(`discovery could not be queued: ${err.message}`, 'warn'); }
       }
       jobCtx.progress(100, 'done');
       return { path: r.path, url: p.url, version: r.version ?? null, steps: r.steps ?? [] };
     } catch (err) {
-      stmts.wpFinish.run('failed', err.message, p.installId);
+      const cleanup = await compensateWordPressInstall(p, jobCtx);
+      stmts.wpFinish.run('failed', err.message, cleanup, p.installId);
       throw err;
     }
+  }
+
+  // A failed install leaves nothing behind: the database user and database
+  // created for it are dropped (user first, it holds the grants) so the same
+  // names work on the retry. What happened is kept on the wp_installs row.
+  async function compensateWordPressInstall(p, jobCtx) {
+    if (!ctx.databases) return 'database cleanup skipped: Database Services is not loaded';
+    const req = bootRequest();
+    const notes = [];
+    const steps = [['user', p.dbUser, (name) => ctx.databases.dropUser(name, req.user, req)], ['database', p.dbName, (name) => ctx.databases.dropDatabase(name, req.user, req)]];
+    for (const [kind, name, drop] of steps) {
+      if (!name) continue;
+      try {
+        await drop(name);
+        notes.push(`dropped ${kind} ${name}`);
+        jobCtx.log(`dropped the ${kind} ${name} created for this install`);
+      } catch (err) {
+        notes.push(`could not drop ${kind} ${name}: ${err.message}`);
+        jobCtx.log(`could not drop the ${kind} ${name}: ${err.message}`, 'warn');
+        log.warn({ err, installId: p.installId, [kind]: name }, 'WordPress install cleanup failed');
+      }
+    }
+    return notes.join('; ') || null;
   }
 
   function wordPressInstalls(user) {

@@ -10,7 +10,7 @@ import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { renderMarkdown } from '../../plugins/PluginPage.jsx';
 
-function ReleaseKeys({ keys, dir, readOnly, onChanged }) {
+function ReleaseKeys({ keys, dir, readOnly, policy, onChanged }) {
   const toast = useToast();
   const confirm = useConfirm();
   const [kid, setKid] = useState('');
@@ -29,7 +29,7 @@ function ReleaseKeys({ keys, dir, readOnly, onChanged }) {
   };
   return (
     <Card title="Trusted release-signing keys" subtitle={`Ed25519 public keys (PEM) kept by the root agent${dir ? ` under ${dir}` : ''}; the feed's signature covers the archive's SHA-256 digest and is checked by the agent before anything is unpacked or run`}>
-      {keys.length === 0 ? <p className="muted"><KeyRound size={16} /> No keys trusted: a signed release can only be installed by confirming an unverified upgrade. Add the publisher's key first.</p> : (
+      {keys.length === 0 ? <p className="muted"><KeyRound size={16} /> No keys trusted: the agent refuses to unpack or run any release until the publisher's key is installed{policy?.allowUnverified ? ' (except that this host permits unverified upgrades)' : ''}.</p> : (
         <div className="table-wrap">
           <table>
             <thead><tr><th>Key id</th><th>Fingerprint</th><th>Added</th><th /></tr></thead>
@@ -37,7 +37,7 @@ function ReleaseKeys({ keys, dir, readOnly, onChanged }) {
           </table>
         </div>
       )}
-      {readOnly ? <p className="muted small">Keys are managed on the host (the agent runs with <code>WHM_RELEASE_KEYS_READONLY=1</code>): drop <code>&lt;kid&gt;.pub</code> files into {dir ? <code>{dir}</code> : 'the key directory'} as root.</p> : (
+      {readOnly ? <p className="muted small">Keys are managed on the host, which is the default: as root, drop <code>&lt;kid&gt;.pub</code> files (Ed25519, PEM) into {dir ? <code>{dir}</code> : 'the key directory'}. To let this panel manage them instead, set <code>{'"upgrade": { "panelManagedKeys": true }'}</code> in <code>{policy?.configFile || '/etc/whm/agent.conf'}</code> or <code>WHM_RELEASE_KEYS_PANEL_MANAGED=1</code> in the whm-agentd unit, then restart whm-agentd.</p> : (
       <form onSubmit={add} className="form-narrow" style={{ marginTop: 12 }}>
         <Field label="Key id" help="Matches the feed's keyId, for example release-2026" error={error?.fields?.kid}><TextInput value={kid} onChange={setKid} className="input mono" maxLength={64} /></Field>
         <Field label="Public key (PEM)" error={error?.fields?.pem}><Textarea value={pem} onChange={setPem} rows={4} mono placeholder={'-----BEGIN PUBLIC KEY-----\n…\n-----END PUBLIC KEY-----'} /></Field>
@@ -90,11 +90,16 @@ export default function UpgradeToLatestVersion({ fn }) {
   if (error) return <><PageHeader fn={fn} /><ErrorBanner error={error} onRetry={refetch} /></>;
   if (!data) return null;
   const v = data.verification;
-  // Mirrors the agent's rule: a published signature is always checked when any
-  // key is trusted and a mismatch is always refused; the toggle only covers a
-  // release with nothing to check against (no checksum, or a signature but no key).
+  // Mirrors the agent's rule: a release is verifiable only with a checksum and
+  // a signature from a trusted key; a signature that does not verify is always
+  // refused. Anything unverifiable runs only if the host policy (set by root
+  // in the agent's own configuration, never from here) allows it, and then the
+  // toggle is the operator's acknowledgement.
   const keyMissing = Boolean(v?.keyMissing);
   const verifiable = Boolean(v && !v.unverifiable && !keyMissing);
+  const policy = data.policy || { allowUnverified: false, panelManagedKeys: false, configFile: null };
+  const policyAllows = Boolean(policy.allowUnverified);
+  const configFile = policy.configFile || '/etc/whm/agent.conf';
   const last = data.last;
 
   return (
@@ -118,18 +123,22 @@ export default function UpgradeToLatestVersion({ fn }) {
           <KeyValue items={[
             ['Archive', data.latest.url ? <code key="a" className="small">{data.latest.url}</code> : <StatusPill key="a" status="failed">no download URL in the feed</StatusPill>],
             ['SHA-256', v?.sha256 ? <span key="s"><ShieldCheck size={14} /> published; verified before unpacking</span> : <StatusPill key="s" status="warning">not published</StatusPill>],
-            ['Signature', v?.signature ? (v.trustedKey ? <span key="g"><ShieldCheck size={14} /> published; the agent verifies it with trusted key {v.keyId ? <code>{v.keyId}</code> : null} before unpacking</span> : keyMissing ? <StatusPill key="g" status="failed">published with key {v.keyId ? `"${v.keyId}"` : ''} which is not trusted here; trust it below before upgrading</StatusPill> : <StatusPill key="g" status="warning">published but no trusted key is installed</StatusPill>) : v?.trustedKeys > 0 ? <StatusPill key="g" status="warning">not published although keys are trusted</StatusPill> : <span key="g" className="muted">not published</span>],
+            ['Signature', v?.signature ? (v.trustedKey ? <span key="g"><ShieldCheck size={14} /> published; the agent verifies it with trusted key {v.keyId ? <code>{v.keyId}</code> : null} before unpacking</span> : keyMissing ? <StatusPill key="g" status="failed">published with key {v.keyId ? `"${v.keyId}"` : ''} which is not trusted here; trust it below before upgrading</StatusPill> : <StatusPill key="g" status="warning">published but no trusted key is installed</StatusPill>) : <StatusPill key="g" status="warning">not published</StatusPill>],
+            ['Host policy', policyAllows ? <StatusPill key="p" status="warning">unverified upgrades permitted by root ({configFile} / whm-agentd environment)</StatusPill> : <span key="p"><ShieldCheck size={14} /> verified releases only (checksum and a signature from a trusted key)</span>],
           ]} />
           {keyMissing && (
-            <div className="banner banner-error"><AlertTriangle size={18} /><div><strong>Signature cannot be accepted</strong><p>Trusted keys are installed but none is the one the feed names. A signature that does not verify is refused even with the override below; add the publisher's current key or remove the stale ones.</p></div></div>
+            <div className="banner banner-error"><AlertTriangle size={18} /><div><strong>Signature cannot be accepted</strong><p>Trusted keys are installed but none is the one the feed names. A signature that does not verify is refused whatever the host policy says; add the publisher's current key or remove the stale ones.</p></div></div>
           )}
-          {!verifiable && !keyMissing && (
+          {!verifiable && !keyMissing && !policyAllows && (
+            <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>This release cannot be verified, and the host only runs verified releases</strong><p>{v?.sha256 ? (v?.signature ? 'No trusted key is installed to check the signature with: install the publisher\'s key as root.' : 'The feed publishes no signature.') : 'The feed publishes no SHA-256 checksum.'} The root agent decides this, not the panel: to permit unverified upgrades on a feed you control, set <code>{'"upgrade": { "allowUnverified": true }'}</code> in <code>{configFile}</code> or <code>WHM_UPGRADE_ALLOW_UNVERIFIED=1</code> in the whm-agentd unit, restart whm-agentd and reload this page.</p></div></div>
+          )}
+          {!verifiable && !keyMissing && policyAllows && (
             <Field inline>
-              <Toggle checked={allowUnverified} onChange={setAllowUnverified} label="Install even though the release cannot be verified" description={v?.sha256 ? 'There is nothing to check the signature against (no trusted key, or no signature although keys are trusted). Only do this for a feed you control.' : 'The feed publishes no checksum. Only do this for a feed you control; the download still has to come over HTTPS.'} />
+              <Toggle checked={allowUnverified} onChange={setAllowUnverified} label="I understand this release cannot be verified" description={v?.sha256 ? 'There is nothing to check the signature against (no trusted key, or no signature published). The host policy permits it; only do this for a feed you control.' : 'The feed publishes no checksum. The host policy permits it; only do this for a feed you control, and the download still has to come over HTTPS.'} />
             </Field>
           )}
           <div className="action-row">
-            <Button variant="danger" icon={ArrowUpCircle} loading={starting} disabled={!data.canRun || !data.latest.url || Boolean(activeJobId) || keyMissing || (!verifiable && !allowUnverified)} onClick={start}>Download and upgrade</Button>
+            <Button variant="danger" icon={ArrowUpCircle} loading={starting} disabled={!data.canRun || !data.latest.url || Boolean(activeJobId) || keyMissing || (!verifiable && !(policyAllows && allowUnverified))} onClick={start}>Download and upgrade</Button>
           </div>
           <ErrorBanner error={startError} />
         </Card>
@@ -150,11 +159,11 @@ export default function UpgradeToLatestVersion({ fn }) {
       )}
 
       {data.releaseKeysError && <ErrorBanner error={{ message: `Trusted keys could not be read from the agent: ${data.releaseKeysError}` }} />}
-      <ReleaseKeys keys={data.releaseKeys} dir={data.releaseKeyDir} readOnly={data.releaseKeysReadOnly} onChanged={refetch} />
+      <ReleaseKeys keys={data.releaseKeys} dir={data.releaseKeyDir} readOnly={data.releaseKeysReadOnly} policy={policy} onChanged={refetch} />
 
       <Card title="Manual upgrade" subtitle="What the automatic path does, for servers where it is not available">
         <ol>{data.instructions.map((s) => <li key={s}><code>{s}</code></li>)}</ol>
-        <p className="muted small">The feed is a JSON document with <code>version</code>, <code>url</code> (https), <code>sha256</code>, optional <code>signature</code> (base64 Ed25519 over the raw SHA-256 digest), <code>keyId</code>, <code>notes</code> and <code>publishedAt</code>, either at the top level or under <code>tiers.&lt;tier&gt;</code>. The panel downloads the archive; the root agent copies it into its own staging area, re-checks the checksum and signature there, unpacks it and runs the installer from that copy only.</p>
+        <p className="muted small">The feed is a JSON document with <code>version</code>, <code>url</code> (https), <code>sha256</code>, optional <code>signature</code> (base64 Ed25519 over the raw SHA-256 digest), <code>keyId</code>, <code>notes</code> and <code>publishedAt</code>, either at the top level or under <code>tiers.&lt;tier&gt;</code>. The panel downloads the archive; the root agent copies it (never following symlinks) into its own root-only staging area, re-checks the checksum and signature there against keys under its key directory, unpacks it and runs the installer from that copy only. Whether an unverified release may run is the host's decision, made in the agent's configuration, not in this panel.</p>
       </Card>
     </>
   );

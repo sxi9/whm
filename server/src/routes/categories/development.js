@@ -45,7 +45,7 @@ const pluginBody = z.object({
 }).strict();
 
 export async function register(ctx) {
-  ctx.events = new PanelEvents(ctx.logger);
+  ctx.events ||= new PanelEvents(ctx.logger);
   ctx.development = createDevelopmentService(ctx);
   const s = ctx.development;
   ctx.events.onAny((envelope) => s.hooks.dispatch(envelope));

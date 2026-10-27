@@ -1402,6 +1402,39 @@ const wpSecret = z.string().min(8).max(128).regex(/^[^\0\r\n]+$/);
 const wpLocale = z.string().regex(/^[a-z]{2,3}(_[A-Z]{2})?(_[a-z]+)?$/).default('en_US');
 const wpSiteArgs = { username: arg.username, path: arg.absPath };
 
+// Root only ever reads a file inside an account's tree when lstat says it is a
+// small regular file: a FIFO would block the agent (the whole panel in
+// monolithic mode), a symlink would leak another tree and a huge sparse file
+// would be read into root's memory. The open uses O_NOFOLLOW | O_NONBLOCK and
+// fstat re-checks the descriptor, so a file the account swaps between the two
+// calls is still never followed or waited on.
+export const WP_READ_MAX_BYTES = 512 * 1024;
+
+export function regularFileStat(file, max = WP_READ_MAX_BYTES) {
+  let st;
+  try { st = fs.lstatSync(file); } catch { return null; }
+  return st.isFile() && !st.isSymbolicLink() && st.size <= max ? st : null;
+}
+
+export function readSiteFile(file, max = WP_READ_MAX_BYTES) {
+  if (!regularFileStat(file, max)) return null;
+  let fd = null;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size > max) return null;
+    const buf = Buffer.alloc(Math.min(st.size, max));
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    return buf.subarray(0, n).toString('utf8');
+  } catch { return null; } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* closed */ } }
+  }
+}
+
+function lexists(file) {
+  try { fs.lstatSync(file); return true; } catch { return false; }
+}
+
 export function passwdHome(username) {
   const line = (readText('/etc/passwd') || '').split('\n').find((l) => l.startsWith(`${username}:`));
   if (!line) throw new OpError('not_found', `Unknown user "${username}"`);
@@ -1471,15 +1504,16 @@ export function parseWpConfig(text) {
   return { dbName: grab('DB_NAME'), dbUser: grab('DB_USER'), dbHost: grab('DB_HOST'), tablePrefix: prefix ? prefix[1] : null };
 }
 
-function findWordPress(root, maxDepth, budget, out) {
+export function findWordPress(root, maxDepth, budget, out) {
   const walk = (dir, depth) => {
     if (budget.dirs-- <= 0 || depth > maxDepth) return;
     let st;
     try { st = fs.lstatSync(dir); } catch { return; }
     if (!st.isDirectory()) return;
     const config = path.join(dir, 'wp-config.php');
-    if (exists(config) && exists(path.join(dir, 'wp-includes', 'version.php'))) {
-      out.push({ path: dir, version: parseWpVersion(readText(path.join(dir, 'wp-includes', 'version.php'))), ...parseWpConfig(readText(config)) });
+    const versionFile = path.join(dir, 'wp-includes', 'version.php');
+    if (regularFileStat(config) && regularFileStat(versionFile)) {
+      out.push({ path: dir, version: parseWpVersion(readSiteFile(versionFile)), ...parseWpConfig(readSiteFile(config)) });
       return;
     }
     let ents = [];
@@ -1529,7 +1563,7 @@ defineOp('web.wp.inspect', {
   schema: z.object(wpSiteArgs).strict(),
   run: async ({ username, path: p }, ctx) => {
     const { home, site } = wpSite(username, p, ctx);
-    if (!exists(path.join(site, 'wp-config.php'))) throw new OpError('not_found', `${site} does not contain a WordPress installation`);
+    if (!regularFileStat(path.join(site, 'wp-config.php'))) throw new OpError('not_found', `${site} does not contain a WordPress installation (wp-config.php is missing or not a regular file)`);
     const errors = {};
     const run = async (key, argv, parse = jsonOf) => {
       const r = await wp(username, home, site, argv);
@@ -1537,7 +1571,7 @@ defineOp('web.wp.inspect', {
       return parse(r);
     };
     const text = (r) => r.stdout.trim();
-    const version = await run('version', ['core', 'version'], text) || parseWpVersion(readText(path.join(site, 'wp-includes', 'version.php')));
+    const version = await run('version', ['core', 'version'], text) || parseWpVersion(readSiteFile(path.join(site, 'wp-includes', 'version.php')));
     const siteUrl = await run('siteUrl', ['option', 'get', 'siteurl'], text);
     const coreUpdates = (await run('coreUpdates', ['core', 'check-update', '--format=json'])) || [];
     const plugins = (await run('plugins', ['plugin', 'list', '--format=json', '--fields=name,status,version,update,update_version'])) || [];
@@ -1585,9 +1619,10 @@ defineOp('web.wp.harden', {
   run: async ({ username, path: p }, ctx) => {
     const { home, site } = wpSite(username, p, ctx);
     const config = path.join(site, 'wp-config.php');
-    if (!exists(config)) throw new OpError('not_found', `${site} does not contain a WordPress installation`);
+    const configStat = regularFileStat(config);
+    if (!configStat) throw new OpError('not_found', `${site} does not contain a WordPress installation (wp-config.php is missing or not a regular file)`);
     const checks = [];
-    const mode = fs.statSync(config).mode & 0o777;
+    const mode = configStat.mode & 0o777;
     checks.push({ id: 'config-perms', label: 'wp-config.php is private', ok: (mode & 0o077) === 0, detail: `mode ${mode.toString(8).padStart(4, '0')}`, fix: 'config-perms' });
     const get = async (name) => { const r = await wp(username, home, site, ['config', 'get', name]); return r.code === 0 ? r.stdout.trim() : null; };
     const truthy = (v) => v != null && /^(1|true|on)$/i.test(v);
@@ -1597,7 +1632,7 @@ defineOp('web.wp.harden', {
     checks.push({ id: 'debug-off', label: 'Debug mode off (WP_DEBUG)', ok: !truthy(debug), detail: debug ?? 'not set', fix: 'debug-off' });
     const auto = await get('WP_AUTO_UPDATE_CORE');
     checks.push({ id: 'auto-update-core', label: 'Automatic core updates enabled', ok: auto == null || truthy(auto) || /minor/i.test(auto), detail: auto ?? 'default (minor)', fix: 'auto-update-core' });
-    const prefix = parseWpConfig(readText(config)).tablePrefix;
+    const prefix = parseWpConfig(readSiteFile(config)).tablePrefix;
     checks.push({ id: 'table-prefix', label: 'Non-default table prefix', ok: prefix != null && prefix !== 'wp_', detail: prefix ?? 'unknown', fix: null });
     const admins = await wp(username, home, site, ['user', 'list', '--role=administrator', '--format=json', '--fields=user_login']);
     const logins = (jsonOf(admins) || []).map((u) => String(u.user_login).toLowerCase());
@@ -1616,7 +1651,7 @@ defineOp('web.wp.hardenfix', {
   run: async ({ username, path: p, fixes }, ctx) => {
     const { home, site } = wpSite(username, p, ctx, 'write');
     const config = path.join(site, 'wp-config.php');
-    if (!exists(config)) throw new OpError('not_found', `${site} does not contain a WordPress installation`);
+    if (!regularFileStat(config)) throw new OpError('not_found', `${site} does not contain a WordPress installation (wp-config.php is missing or not a regular file)`);
     const applied = [];
     const failed = {};
     const set = async (id, name, value) => {
@@ -1653,7 +1688,7 @@ defineOp('web.wp.install', {
   run: async ({ username, path: p, url, title, adminUser, adminEmail, adminPassword, dbName, dbUser, dbPassword, dbHost, tablePrefix, locale }, ctx) => {
     const { home, site } = wpSite(username, p, ctx, 'write');
     requireWpCli();
-    if (exists(path.join(site, 'wp-config.php'))) throw new OpError('exists', `${site} already contains a WordPress installation`);
+    if (lexists(path.join(site, 'wp-config.php'))) throw new OpError('exists', `${site} already contains a WordPress installation`);
     const mk = await exec('runuser', ['-u', username, '--', 'mkdir', '-p', '--', site], { allowFailure: true, env: { HOME: home } });
     if (mk.code !== 0) throw new OpError('command_failed', `could not create ${site} as ${username}: ${lastLineOf(mk)}`);
     const steps = [];

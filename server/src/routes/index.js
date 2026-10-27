@@ -19,22 +19,30 @@ export async function apiRouter(ctx) {
   const api = Router();
   api.get('/health', (_req, res) => res.json({ data: { ok: true, mode: ctx.config.mode, version: ctx.version } }));
   api.use('/auth', authRoutes(ctx));
+
+  // Categories register first so a module may mark a read-only mount `public: true`
+  // (served before the session check, e.g. login-page branding); everything else
+  // is mounted after requireAuth in discovery order.
+  const files = fs.existsSync(categoriesDir) ? fs.readdirSync(categoriesDir).filter((f) => f.endsWith('.js')).sort() : [];
+  const mounts = [];
+  for (const file of files) {
+    const mod = await import(pathToFileURL(path.join(categoriesDir, file)).href);
+    if (typeof mod.register !== 'function') throw new Error(`routes/categories/${file} must export register(ctx)`);
+    for (const mount of [].concat(await mod.register(ctx)).filter(Boolean)) {
+      if (!mount.path || !mount.router) throw new Error(`routes/categories/${file}: register() must return { path, router }`);
+      mounts.push({ ...mount, file });
+    }
+  }
+  for (const mount of mounts.filter((m) => m.public)) api.use(mount.path, mount.router);
+
   api.use(requireAuth);
   api.use('/system', systemRoutes(ctx));
   api.use('/accounts', accountRoutes(ctx));
   api.use('/packages', packageRoutes(ctx));
   api.use('/plugins', pluginRoutes(ctx));
-
-  const files = fs.existsSync(categoriesDir) ? fs.readdirSync(categoriesDir).filter((f) => f.endsWith('.js')).sort() : [];
-  for (const file of files) {
-    const mod = await import(pathToFileURL(path.join(categoriesDir, file)).href);
-    if (typeof mod.register !== 'function') throw new Error(`routes/categories/${file} must export register(ctx)`);
-    const mounts = [].concat(await mod.register(ctx)).filter(Boolean);
-    for (const mount of mounts) {
-      if (!mount.path || !mount.router) throw new Error(`routes/categories/${file}: register() must return { path, router }`);
-      api.use(mount.path, mount.router);
-      ctx.logger.debug({ category: file, path: mount.path }, 'mounted category router');
-    }
+  for (const mount of mounts.filter((m) => !m.public)) {
+    api.use(mount.path, mount.router);
+    ctx.logger.debug({ category: mount.file, path: mount.path }, 'mounted category router');
   }
   return api;
 }

@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { exec } from '../src/exec.js';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { parseListLists, detectMailman, findReleaseRoot, isReleaseDir, listName, listPassword, execRedacted, verifyStagedRelease, AGENT_APP_DIR } from '../src/ops/cpanel.js';
+import { parseListLists, detectMailman, findReleaseRoot, isReleaseDir, listName, listPassword, execRedacted, verifyStagedRelease, upgradePolicy, AGENT_APP_DIR } from '../src/ops/cpanel.js';
 
 // exec() is spied with the real implementation behind it so tests can prove an
 // op refused *before* running anything, and stub the one call (systemd-run)
@@ -20,6 +20,8 @@ const TMP_ROOT = '/tmp/whm';
 let root;
 let staging;
 let keys;
+let agentConf;
+let outside;
 let tmpRootExisted;
 const PASSWORD = 'Str0ng-list-pass';
 
@@ -43,16 +45,25 @@ beforeAll(() => {
   staging = path.join(root, 'staging');
   keys = path.join(root, 'keys');
   fs.mkdirSync(root, { recursive: true });
+  agentConf = path.join(root, 'agent.conf');
+  outside = fs.mkdtempSync('/tmp/whm-cpanel-outside-');
   process.env.WHM_UPGRADE_STAGING_ROOT = staging;
   process.env.WHM_RELEASE_KEY_DIR = keys;
-  delete process.env.WHM_RELEASE_KEYS_READONLY;
+  // The host policy is read from the agent's own environment/config only; the
+  // suite starts from the shipped defaults (nothing permitted) and opts in per test.
+  process.env.WHM_AGENT_CONFIG = agentConf;
+  delete process.env.WHM_UPGRADE_ALLOW_UNVERIFIED;
+  delete process.env.WHM_RELEASE_KEYS_PANEL_MANAGED;
 });
 
 afterAll(() => {
   delete process.env.WHM_UPGRADE_STAGING_ROOT;
   delete process.env.WHM_RELEASE_KEY_DIR;
-  delete process.env.WHM_RELEASE_KEYS_READONLY;
+  delete process.env.WHM_AGENT_CONFIG;
+  delete process.env.WHM_UPGRADE_ALLOW_UNVERIFIED;
+  delete process.env.WHM_RELEASE_KEYS_PANEL_MANAGED;
   fs.rmSync(root, { recursive: true, force: true });
+  fs.rmSync(outside, { recursive: true, force: true });
   if (!tmpRootExisted) fs.rmSync(TMP_ROOT, { recursive: true, force: true });
 });
 
@@ -119,12 +130,51 @@ describe('mailman helpers', () => {
   });
 });
 
+describe('host policy', () => {
+  it('defaults to verified-only upgrades and host-managed keys, and is never an op argument', () => {
+    expect(upgradePolicy()).toEqual({ allowUnverified: false, panelManagedKeys: false, configFile: agentConf });
+    expect(catalog.get('cpanel.upgrade.extract').schema.safeParse({ archive: `${root}/x.tar.gz`, version: '1.0.0', allowUnverified: true }).success).toBe(false);
+    expect(catalog.get('cpanel.upgrade.run').schema.safeParse({ version: '1.0.0', unit: 'whm-upgrade-1', allowUnverified: true }).success).toBe(false);
+  });
+
+  it('reads the switches from the agent environment or a root-only agent.conf', () => {
+    process.env.WHM_UPGRADE_ALLOW_UNVERIFIED = '1';
+    expect(upgradePolicy()).toMatchObject({ allowUnverified: true, panelManagedKeys: false });
+    delete process.env.WHM_UPGRADE_ALLOW_UNVERIFIED;
+    process.env.WHM_RELEASE_KEYS_PANEL_MANAGED = '1';
+    expect(upgradePolicy()).toMatchObject({ allowUnverified: false, panelManagedKeys: true });
+    delete process.env.WHM_RELEASE_KEYS_PANEL_MANAGED;
+    try {
+      fs.writeFileSync(agentConf, JSON.stringify({ extraAllowedRoots: [], upgrade: { allowUnverified: true, panelManagedKeys: 'yes' } }), { mode: 0o600 });
+      expect(upgradePolicy()).toMatchObject({ allowUnverified: true, panelManagedKeys: false });
+      // A config anyone else could write is not the host's decision.
+      fs.chmodSync(agentConf, 0o666);
+      expect(upgradePolicy()).toMatchObject({ allowUnverified: false, panelManagedKeys: false });
+      fs.unlinkSync(agentConf);
+      fs.writeFileSync(path.join(root, 'evil.conf'), JSON.stringify({ upgrade: { allowUnverified: true } }), { mode: 0o600 });
+      fs.symlinkSync(path.join(root, 'evil.conf'), agentConf);
+      expect(upgradePolicy()).toMatchObject({ allowUnverified: false });
+      fs.unlinkSync(agentConf);
+      fs.writeFileSync(agentConf, 'not json', { mode: 0o600 });
+      expect(upgradePolicy()).toMatchObject({ allowUnverified: false, panelManagedKeys: false });
+    } finally { fs.rmSync(agentConf, { force: true }); }
+  });
+});
+
 describe('release keys', () => {
   const { publicKey } = crypto.generateKeyPairSync('ed25519');
   const pem = publicKey.export({ type: 'spki', format: 'pem' });
 
+  it('refuses changes unless the host lets the panel manage keys', async () => {
+    expect(await runOp('cpanel.upgrade.keys', {}, ctx)).toEqual({ dir: keys, readOnly: true, policy: { allowUnverified: false, panelManagedKeys: false, configFile: agentConf }, keys: [] });
+    expect((await opError(runOp('cpanel.upgrade.key_add', { kid: 'k', pem }, ctx))).code).toBe('refused');
+    expect((await opError(runOp('cpanel.upgrade.key_remove', { kid: 'k' }, ctx))).code).toBe('refused');
+    expect(fs.existsSync(keys)).toBe(false);
+  });
+
   it('installs, lists and removes Ed25519 keys in the agent-owned directory only', async () => {
-    expect(await runOp('cpanel.upgrade.keys', {}, ctx)).toEqual({ dir: keys, readOnly: false, keys: [] });
+    process.env.WHM_RELEASE_KEYS_PANEL_MANAGED = '1';
+    expect(await runOp('cpanel.upgrade.keys', {}, ctx)).toMatchObject({ dir: keys, readOnly: false, keys: [] });
     const added = await runOp('cpanel.upgrade.key_add', { kid: 'release-2026', pem }, ctx);
     expect(added).toMatchObject({ kid: 'release-2026', type: 'ed25519', valid: true });
     expect(added.pem).toContain('BEGIN PUBLIC KEY');
@@ -143,13 +193,16 @@ describe('release keys', () => {
     expect(catalog.get('cpanel.upgrade.key_remove').destructive).toBe(true);
   });
 
-  it('refuses changes when keys are managed on the host', async () => {
-    process.env.WHM_RELEASE_KEYS_READONLY = '1';
-    try {
-      expect((await runOp('cpanel.upgrade.keys', {}, ctx)).readOnly).toBe(true);
-      expect((await opError(runOp('cpanel.upgrade.key_add', { kid: 'k', pem }, ctx))).code).toBe('refused');
-      expect((await opError(runOp('cpanel.upgrade.key_remove', { kid: 'k' }, ctx))).code).toBe('refused');
-    } finally { delete process.env.WHM_RELEASE_KEYS_READONLY; }
+  it('honours host-installed keys even while the panel may not manage them', async () => {
+    delete process.env.WHM_RELEASE_KEYS_PANEL_MANAGED;
+    fs.mkdirSync(keys, { recursive: true, mode: 0o755 });
+    fs.writeFileSync(path.join(keys, 'host-key.pub'), pem, { mode: 0o644 });
+    const res = await runOp('cpanel.upgrade.keys', {}, ctx);
+    expect(res.readOnly).toBe(true);
+    expect(res.keys.map((k) => [k.kid, k.valid])).toEqual([['host-key', true]]);
+    expect((await opError(runOp('cpanel.upgrade.key_remove', { kid: 'host-key' }, ctx))).code).toBe('refused');
+    fs.unlinkSync(path.join(keys, 'host-key.pub'));
+    process.env.WHM_RELEASE_KEYS_PANEL_MANAGED = '1';
   });
 });
 
@@ -177,6 +230,7 @@ describe('upgrade ops', () => {
       { archive: '/tmp/whm/x.zip', version: '9.9.9' }, { archive: '/tmp/whm/../x.tar.gz', version: '9.9.9' }, { archive: 'relative.tar.gz', version: '9.9.9' },
       { archive: `${root}/x.tar.gz` }, { archive: `${root}/x.tar.gz`, version: '../9' }, { archive: `${root}/x.tar.gz`, version: '9.9.9; rm -rf /' }, { archive: `${root}/x.tar.gz`, version: '9.9.9', destDir: '/home' },
       { archive: `${root}/x.tar.gz`, version: '9.9.9', sha256: 'nothex' }, { archive: `${root}/x.tar.gz`, version: '9.9.9', signature: 'short' }, { archive: `${root}/x.tar.gz`, version: '9.9.9', keyId: '../k' },
+      { archive: wrapped, version: '9.9.9', allowUnverified: true }, { archive: wrapped, version: '9.9.9', sha256: 'a'.repeat(64), allowUnverified: false },
     ]) {
       expect((await opError(runOp('cpanel.upgrade.extract', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
     }
@@ -204,19 +258,98 @@ describe('upgrade ops', () => {
     expect(exec).not.toHaveBeenCalled();
   });
 
-  it('always refuses a signature that does not verify, even when unverified upgrades are allowed', async () => {
+  it('always refuses a signature that does not verify, even when the host allows unverified upgrades', async () => {
     await runOp('cpanel.upgrade.key_add', { kid: 'release-2026', pem }, ctx);
     exec.mockClear();
     const forged = crypto.sign(null, digest, crypto.generateKeyPairSync('ed25519').privateKey).toString('base64');
-    for (const allowUnverified of [false, true]) {
-      const err = await opError(runOp('cpanel.upgrade.extract', { archive: wrapped, version: '9.9.9', sha256: digest.toString('hex'), signature: forged, keyId: 'release-2026', allowUnverified }, ctx));
-      expect(err.code, String(allowUnverified)).toBe('invalid_signature');
-    }
     const unknownKid = crypto.sign(null, digest, privateKey).toString('base64');
-    expect((await opError(runOp('cpanel.upgrade.extract', { archive: wrapped, version: '9.9.9', sha256: digest.toString('hex'), signature: unknownKid, keyId: 'other-key', allowUnverified: true }, ctx))).code).toBe('invalid_signature');
+    for (const allow of [false, true]) {
+      if (allow) process.env.WHM_UPGRADE_ALLOW_UNVERIFIED = '1'; else delete process.env.WHM_UPGRADE_ALLOW_UNVERIFIED;
+      try {
+        const err = await opError(runOp('cpanel.upgrade.extract', { archive: wrapped, version: '9.9.9', sha256: digest.toString('hex'), signature: forged, keyId: 'release-2026' }, ctx));
+        expect(err.code, String(allow)).toBe('invalid_signature');
+        expect((await opError(runOp('cpanel.upgrade.extract', { archive: wrapped, version: '9.9.9', sha256: digest.toString('hex'), signature: unknownKid, keyId: 'other-key' }, ctx))).code, String(allow)).toBe('invalid_signature');
+      } finally { delete process.env.WHM_UPGRADE_ALLOW_UNVERIFIED; }
+    }
     expect((await opError(runOp('cpanel.upgrade.extract', { archive: wrapped, version: '9.9.9', sha256: digest.toString('hex') }, ctx))).code).toBe('unsigned');
     expect(exec).not.toHaveBeenCalled();
     expect(fs.existsSync(path.join(staging, 'src-9.9.9'))).toBe(false);
+    expect(fs.existsSync(path.join(staging, 'whm-9.9.9.tar.gz'))).toBe(false);
+  });
+
+  it('refuses an unsigned or checksum-less archive whatever the caller sends, unless the host policy opts in', async () => {
+    exec.mockClear();
+    const signature = crypto.sign(null, digest, privateKey).toString('base64');
+    // Keys installed, no signature: refused. No keys at all, no signature: still refused.
+    expect((await opError(runOp('cpanel.upgrade.extract', { archive: wrapped, version: '9.9.7', sha256: digest.toString('hex') }, ctx))).code).toBe('unsigned');
+    await runOp('cpanel.upgrade.key_remove', { kid: 'release-2026' }, ctx);
+    expect((await opError(runOp('cpanel.upgrade.extract', { archive: wrapped, version: '9.9.7', sha256: digest.toString('hex') }, ctx))).code).toBe('unsigned');
+    expect((await opError(runOp('cpanel.upgrade.extract', { archive: wrapped, version: '9.9.7', sha256: digest.toString('hex'), signature }, ctx))).code).toBe('unverified');
+    expect((await opError(runOp('cpanel.upgrade.extract', { archive: wrapped, version: '9.9.7', signature }, ctx))).code).toBe('unverified');
+    expect(exec).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(staging, 'src-9.9.7'))).toBe(false);
+    expect(fs.existsSync(path.join(staging, 'whm-9.9.7.tar.gz'))).toBe(false);
+
+    // Root opted in through the agent's own environment: accepted, recorded as unverified.
+    process.env.WHM_UPGRADE_ALLOW_UNVERIFIED = '1';
+    let res;
+    try {
+      res = await runOp('cpanel.upgrade.extract', { archive: wrapped, version: '9.9.7', sha256: digest.toString('hex') }, ctx);
+    } finally { delete process.env.WHM_UPGRADE_ALLOW_UNVERIFIED; }
+    expect(res).toMatchObject({ version: '9.9.7', signer: null, signatureState: 'unsigned' });
+    expect(res.warnings).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(path.join(staging, 'src-9.9.7.json'), 'utf8')).signatureState).toBe('unsigned');
+
+    // ...but running it needs the permission to still be in force.
+    exec.mockClear();
+    expect((await opError(runOp('cpanel.upgrade.run', { version: '9.9.7', unit: 'whm-upgrade-unverified' }, ctx))).code).toBe('unverified');
+    expect(exec).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(staging, 'whm-upgrade-unverified.log'))).toBe(false);
+    exec.mockImplementationOnce(async (bin, argv) => ({ code: 0, stdout: '', stderr: '', bin, argv }));
+    fs.writeFileSync(agentConf, JSON.stringify({ upgrade: { allowUnverified: true } }), { mode: 0o600 });
+    try {
+      expect(await runOp('cpanel.upgrade.run', { version: '9.9.7', unit: 'whm-upgrade-unverified' }, ctx)).toMatchObject({ unit: 'whm-upgrade-unverified.service', detached: true });
+    } finally { fs.unlinkSync(agentConf); }
+    expect(exec).toHaveBeenCalledTimes(1);
+    expect(exec.mock.calls[0][0]).toBe('systemd-run');
+    expect(fs.readFileSync(path.join(staging, 'whm-upgrade-unverified.log'), 'utf8')).toMatch(/signer none/);
+    await runOp('cpanel.upgrade.key_add', { kid: 'release-2026', pem }, ctx);
+  });
+
+  it('never follows a symlink to the archive or through its directories, and keeps the staged copy private', async () => {
+    exec.mockClear();
+    const signature = crypto.sign(null, digest, privateKey).toString('base64');
+    const args = { version: '9.9.6', sha256: digest.toString('hex'), signature, keyId: 'release-2026' };
+    const linked = path.join(root, 'linked.tar.gz');
+    fs.symlinkSync(wrapped, linked);
+    expect((await opError(runOp('cpanel.upgrade.extract', { ...args, archive: linked }, ctx))).code).toBe('refused');
+    // A symlinked parent that leaves the allowed roots is caught on the resolved path.
+    const secret = path.join(outside, 'secret.tar.gz');
+    fs.copyFileSync(wrapped, secret);
+    fs.symlinkSync(outside, path.join(root, 'escape'));
+    expect((await opError(runOp('cpanel.upgrade.extract', { ...args, archive: path.join(root, 'escape', 'secret.tar.gz') }, ctx))).code).toBe('path_not_allowed');
+    fs.symlinkSync(root, path.join(root, 'loop'));
+    const dirAsArchive = path.join(root, 'dir.tar.gz');
+    fs.mkdirSync(dirAsArchive);
+    expect((await opError(runOp('cpanel.upgrade.extract', { ...args, archive: dirAsArchive }, ctx))).code).toBe('refused');
+    expect(exec).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(staging, 'whm-9.9.6.tar.gz'))).toBe(false);
+    expect(fs.existsSync(path.join(staging, 'src-9.9.6'))).toBe(false);
+
+    // A symlinked directory that stays inside the allowed roots is fine; the
+    // copy tar reads is root-only for as long as it exists.
+    const realExec = exec.getMockImplementation();
+    let stagedMode = null;
+    exec.mockImplementationOnce(async (bin, argv, opts) => { stagedMode = fs.statSync(argv[3]).mode & 0o777; return realExec(bin, argv, opts); });
+    const res = await runOp('cpanel.upgrade.extract', { ...args, archive: path.join(root, 'loop', 'wrapped.tar.gz') }, ctx);
+    expect(res).toMatchObject({ version: '9.9.6', signer: 'release-2026', signatureState: 'verified' });
+    expect(stagedMode).toBe(0o600);
+    expect(fs.existsSync(path.join(staging, 'whm-9.9.6.tar.gz'))).toBe(false);
+    fs.rmSync(path.join(staging, 'src-9.9.6'), { recursive: true, force: true });
+    fs.rmSync(path.join(staging, 'src-9.9.6.json'), { force: true });
+    fs.unlinkSync(linked);
+    fs.unlinkSync(path.join(root, 'escape'));
+    fs.unlinkSync(path.join(root, 'loop'));
   });
 
   it('copies, verifies and unpacks a release into the agent-owned staging area', async () => {
@@ -239,11 +372,15 @@ describe('upgrade ops', () => {
     const again = await runOp('cpanel.upgrade.extract', { archive: wrapped, version: '9.9.9', sha256: digest.toString('hex'), signature, keyId: 'release-2026' }, ctx);
     expect(again.sourceDir).toBe(res.sourceDir);
 
-    // Signed release, no key installed: only with allowUnverified, and recorded as such.
+    // Signed release, no key installed: only when the host allows it, and recorded as such.
     await runOp('cpanel.upgrade.key_remove', { kid: 'release-2026' }, ctx);
     const flatDigest = sha256(flat);
     expect((await opError(runOp('cpanel.upgrade.extract', { archive: flat, version: '9.9.8', sha256: flatDigest.toString('hex'), signature }, ctx))).code).toBe('unverified');
-    const flatRes = await runOp('cpanel.upgrade.extract', { archive: flat, version: '9.9.8', sha256: flatDigest.toString('hex'), signature, allowUnverified: true }, ctx);
+    process.env.WHM_UPGRADE_ALLOW_UNVERIFIED = '1';
+    let flatRes;
+    try {
+      flatRes = await runOp('cpanel.upgrade.extract', { archive: flat, version: '9.9.8', sha256: flatDigest.toString('hex'), signature }, ctx);
+    } finally { delete process.env.WHM_UPGRADE_ALLOW_UNVERIFIED; }
     expect(flatRes).toMatchObject({ sourceDir: path.join(staging, 'src-9.9.8'), signer: null, signatureState: 'no_trusted_key' });
     expect(flatRes.warnings).toHaveLength(1);
     expect(findReleaseRoot(path.join(staging, 'src-9.9.8'))).toBe(path.join(staging, 'src-9.9.8'));
@@ -254,7 +391,7 @@ describe('upgrade ops', () => {
     const foreign = path.join(staging, 'src-1.2.3');
     fs.mkdirSync(foreign, { recursive: true });
     fs.writeFileSync(path.join(foreign, 'precious'), 'keep me');
-    const err = await opError(runOp('cpanel.upgrade.extract', { archive: wrapped, version: '1.2.3', sha256: digest.toString('hex'), allowUnverified: true }, ctx));
+    const err = await opError(runOp('cpanel.upgrade.extract', { archive: wrapped, version: '1.2.3', sha256: digest.toString('hex') }, ctx));
     expect(err.code).toBe('exists');
     expect(fs.readFileSync(path.join(foreign, 'precious'), 'utf8')).toBe('keep me');
     fs.rmSync(foreign, { recursive: true, force: true });
@@ -264,7 +401,8 @@ describe('upgrade ops', () => {
     fs.writeFileSync(path.join(junkDir, 'README'), 'not a release');
     const junk = path.join(root, 'junk.tar.gz');
     execFileSync('tar', ['-czf', junk, '-C', root, 'junk']);
-    const bad = await opError(runOp('cpanel.upgrade.extract', { archive: junk, version: '1.2.4', sha256: sha256(junk).toString('hex'), allowUnverified: true }, ctx));
+    const junkDigest = sha256(junk);
+    const bad = await opError(runOp('cpanel.upgrade.extract', { archive: junk, version: '1.2.4', sha256: junkDigest.toString('hex'), signature: crypto.sign(null, junkDigest, privateKey).toString('base64'), keyId: 'release-2026' }, ctx));
     expect(bad.code).toBe('invalid_package');
     expect(fs.existsSync(path.join(staging, 'src-1.2.4'))).toBe(false);
     expect(fs.existsSync(path.join(staging, 'src-1.2.4.json'))).toBe(false);

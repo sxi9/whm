@@ -271,16 +271,50 @@ describe('Plugins category: bundled ImunifyAV, Server Monitoring and WP Toolkit'
       expect(dup.status).toBe(409);
     });
 
-    it('a WordPress install fails cleanly when WP-CLI is missing and records the error', async () => {
+    it('passwords with line breaks are refused before anything is provisioned (the agent rejects them too)', async () => {
+      const created = app.agent.callsTo('db.database.create').length;
+      const res = await post('/api/bundled-plugins/wp-toolkit/install', { username: 'bob', title: 'Bob', adminUser: 'bob', adminPassword: 'Str0ng-Pass\nw0rd!', dbName: 'site', dbPassword: 'Db-Pass\rw0rd!xyz' });
+      expect(res.status).toBe(422);
+      expect(Object.keys(res.body.error.fields).sort()).toEqual(['adminPassword', 'dbPassword']);
+      expect(app.agent.callsTo('db.database.create')).toHaveLength(created);
+    });
+
+    it('a WordPress install is refused with 501 when WP-CLI is missing, before any database is created', async () => {
       state.wp = false;
-      app.agent.fail('web.wp.install', 'capability_missing', 'WP-CLI (wp) is not installed on this server');
+      const created = app.agent.callsTo('db.database.create').length;
+      const res = await post('/api/bundled-plugins/wp-toolkit/install', { username: 'bob', title: 'Bob', adminUser: 'bob', adminPassword: 'Str0ng-Passw0rd!', dbName: 'site' });
+      expect(res.status).toBe(501);
+      expect(res.body.error.code).toBe('capability_missing');
+      expect(res.body.error.message).toMatch(/WP-CLI/);
+      expect(app.agent.callsTo('db.database.create')).toHaveLength(created);
+      expect(state.databases).toEqual(['alice_wp']);
+      expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM wp_installs WHERE username = ?').get('bob').n).toBe(0);
+      expect(app.agent.callsTo('web.wp.install')).toHaveLength(1);
+    });
+
+    it('a failed install drops the database and user it created, records the cleanup and can be retried', async () => {
+      state.wp = true;
+      app.agent.fail('web.wp.install', 'command_failed', 'wp core download failed: could not resolve host');
       const res = await post('/api/bundled-plugins/wp-toolkit/install', { username: 'bob', title: 'Bob', adminUser: 'bob', adminPassword: 'Str0ng-Passw0rd!', dbName: 'site' }).expect(202);
+      expect(res.body.data).toMatchObject({ database: 'bob_site', dbUser: 'bob_site' });
       const job = await waitForJob(app.ctx, Number(res.body.data.job.id));
       expect(job.status).toBe('failed');
-      expect(job.error).toMatch(/WP-CLI/);
-      const row = app.ctx.db.prepare('SELECT status, error FROM wp_installs WHERE id = ?').get(res.body.data.installId);
-      expect(row).toMatchObject({ status: 'failed' });
+      expect(job.error).toMatch(/could not resolve host/);
+      const row = app.ctx.db.prepare('SELECT status, error, cleanup FROM wp_installs WHERE id = ?').get(res.body.data.installId);
+      expect(row).toMatchObject({ status: 'failed', cleanup: 'dropped user bob_site; dropped database bob_site' });
+      expect(app.agent.callsTo('db.user.drop').map((c) => c.args.user)).toEqual(['bob_site']);
+      expect(app.agent.callsTo('db.database.drop').map((c) => c.args.name)).toEqual(['bob_site']);
+      expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM databases WHERE name = ?').get('bob_site').n).toBe(0);
+      expect(audit('db.database.drop').at(-1)).toMatchObject({ principal: 'system', target: 'bob_site' });
+      const list = await get('/api/bundled-plugins/wp-toolkit/installs').expect(200);
+      expect(list.body.data[0]).toMatchObject({ username: 'bob', status: 'failed', cleanup: expect.stringMatching(/dropped database bob_site/) });
+      // the same names work again once the orphans are gone
       app.agent.reset('web.wp.install');
+      const retry = await post('/api/bundled-plugins/wp-toolkit/install', { username: 'bob', title: 'Bob', adminUser: 'bob', adminPassword: 'Str0ng-Passw0rd!', dbName: 'site' }).expect(202);
+      expect(retry.body.data).toMatchObject({ database: 'bob_site', dbUser: 'bob_site' });
+      const done = await waitForJob(app.ctx, Number(retry.body.data.job.id));
+      expect(done.status).toBe('done');
+      expect(app.ctx.db.prepare('SELECT status, cleanup FROM wp_installs WHERE id = ?').get(retry.body.data.installId)).toEqual({ status: 'done', cleanup: null });
     });
   });
 });

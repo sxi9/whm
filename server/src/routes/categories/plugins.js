@@ -19,10 +19,10 @@ const wpInstallBody = z.object({
   title: z.string().trim().min(1).max(120).regex(/^[^\0\r\n]+$/),
   adminUser: z.string().regex(/^[a-z0-9][a-z0-9._@-]{0,59}$/i, 'Letters, digits, ".", "_", "@" or "-"'),
   adminEmail: fields.email.optional(),
-  adminPassword: fields.password,
+  adminPassword: fields.password.regex(/^[^\0\r\n]+$/, 'No line breaks or control characters'),
   dbName: fields.dbName,
   dbUser: z.string().regex(/^[a-z0-9_]{1,32}$/, 'Lowercase letters, digits or "_"; max 32 chars').optional(),
-  dbPassword: fields.password.optional(),
+  dbPassword: fields.password.regex(/^[^\0\r\n]+$/, 'No line breaks or control characters').optional(),
   tablePrefix: z.string().regex(/^[a-z0-9_]{1,20}_$/, 'Lowercase, ending in "_"').default('wp_'),
   locale: z.string().regex(/^[a-z]{2,3}(_[A-Z]{2})?(_[a-z]+)?$/).default('en_US'),
 }).strict();
