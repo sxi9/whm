@@ -8,6 +8,7 @@ import { BUNDLED_PLUGINS, BUNDLED_DIR, ENSURE_JOB, readBundledManifest } from '.
 const MON = 'net.whm.server-monitoring';
 const AV = 'net.whm.imunifyav';
 const WP = 'net.whm.wp-toolkit';
+const AB = 'net.whm.automated-backup';
 
 function pluginsAgent(state) {
   const grants = new Map();
@@ -66,21 +67,23 @@ describe('Plugins category: bundled ImunifyAV, Server Monitoring and WP Toolkit'
   afterAll(async () => { await app?.close(); });
 
   describe('boot install', () => {
-    it('ships three valid bundled plugins and installs + enables them at boot, idempotently', async () => {
-      expect(BUNDLED_PLUGINS.map((p) => p.id)).toEqual([MON, AV, WP]);
+    it('ships four valid bundled plugins and installs + enables them at boot, idempotently', async () => {
+      expect(BUNDLED_PLUGINS.map((p) => p.id)).toEqual([MON, AV, WP, AB]);
       for (const p of BUNDLED_PLUGINS) {
         expect(fs.existsSync(path.join(BUNDLED_DIR, p.id, 'main.js'))).toBe(true);
         expect(readBundledManifest(p.id)).toMatchObject({ id: p.id, main: 'main.js' });
         expect(app.ctx.plugins.isLive(p.id)).toBe(true);
       }
       const rows = app.ctx.db.prepare('SELECT id, action, installed_version FROM bundled_plugins ORDER BY id').all();
-      expect(rows.map((r) => r.action)).toEqual(['kept', 'kept', 'kept'].map(() => 'installed'));
+      expect(rows.map((r) => r.action)).toEqual(BUNDLED_PLUGINS.map(() => 'installed'));
       const again = await app.ctx.bundledPlugins.ensureInstalled();
-      expect(again.map((r) => r.action)).toEqual(['kept', 'kept', 'kept']);
-      // Server Monitoring samples on an in-process timer: no per-minute job schedule exists.
+      expect(again.map((r) => r.action)).toEqual(BUNDLED_PLUGINS.map(() => 'kept'));
+      // Server Monitoring samples on an in-process timer: no per-minute job schedule exists;
+      // Automated Backup is unscheduled until the operator sets its cron setting.
       expect(app.ctx.scheduler.listPrefix('plugin:').map((r) => r.name).sort()).toEqual([`plugin:${AV}:scheduled-scan`, `plugin:${WP}:discover`]);
       expect(app.ctx.scheduler.listPrefix(`plugin:${MON}:`)).toEqual([]);
-      expect(audit('plugin.install')).toHaveLength(3);
+      expect(app.ctx.scheduler.listPrefix(`plugin:${AB}:`)).toEqual([]);
+      expect(audit('plugin.install')).toHaveLength(4);
       expect(audit('plugin.install')[0]).toMatchObject({ principal: 'system', role: 'root' });
     });
 
@@ -107,9 +110,9 @@ describe('Plugins category: bundled ImunifyAV, Server Monitoring and WP Toolkit'
         deferred.ctx.jobs.start();
         const job = await waitForJob(deferred.ctx, queued[0].id);
         expect(job.status).toBe('done');
-        expect(job.result.results.map((r) => r.action)).toEqual(['installed', 'installed', 'installed']);
+        expect(job.result.results.map((r) => r.action)).toEqual(BUNDLED_PLUGINS.map(() => 'installed'));
         for (const p of BUNDLED_PLUGINS) expect(deferred.ctx.plugins.isLive(p.id)).toBe(true);
-        expect(deferred.ctx.db.prepare('SELECT action FROM bundled_plugins').all().map((r) => r.action)).toEqual(['installed', 'installed', 'installed']);
+        expect(deferred.ctx.db.prepare('SELECT action FROM bundled_plugins').all().map((r) => r.action)).toEqual(BUNDLED_PLUGINS.map(() => 'installed'));
       } finally { await deferred.close(); }
     }, 30_000);
   });
@@ -117,12 +120,12 @@ describe('Plugins category: bundled ImunifyAV, Server Monitoring and WP Toolkit'
   describe('GET /api/bundled-plugins', () => {
     it('lists state, versions and pages for root and resellers; plain users are refused', async () => {
       const res = await get('/api/bundled-plugins').expect(200);
-      expect(res.body.data.map((p) => [p.id, p.state, p.enabled, p.canManage, p.pages.length])).toEqual([[MON, 'enabled', true, true, 2], [AV, 'enabled', true, true, 2], [WP, 'enabled', true, true, 2]]);
-      expect(res.body.data.map((p) => [p.roles, p.canUse])).toEqual([[['root'], true], [['root'], true], [['root', 'reseller'], true]]);
+      expect(res.body.data.map((p) => [p.id, p.state, p.enabled, p.canManage, p.pages.length])).toEqual([[MON, 'enabled', true, true, 2], [AV, 'enabled', true, true, 2], [WP, 'enabled', true, true, 2], [AB, 'enabled', true, true, 8]]);
+      expect(res.body.data.map((p) => [p.roles, p.canUse])).toEqual([[['root'], true], [['root'], true], [['root', 'reseller'], true], [['root'], true]]);
       const r = await resellerHttp.get('/api/bundled-plugins').expect(200);
       expect(r.body.data[0].canManage).toBe(false);
       // the two root-only plugins say so up front, so the page shows a notice instead of 403 banners
-      expect(r.body.data.map((p) => [p.id, p.canUse])).toEqual([[MON, false], [AV, false], [WP, true]]);
+      expect(r.body.data.map((p) => [p.id, p.canUse])).toEqual([[MON, false], [AV, false], [WP, true], [AB, false]]);
       expect((await resellerHttp.get(`/api/bundled-plugins/${AV}`).expect(200)).body.data).toMatchObject({ canUse: false, canManage: false, roles: ['root'] });
       await userHttp.get('/api/bundled-plugins').expect(403);
       const one = await get(`/api/bundled-plugins/${MON}`).expect(200);

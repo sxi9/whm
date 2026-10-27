@@ -17,11 +17,13 @@ import { REPO_ROOT, loadPluginSdk } from '../lib/plugin-sdk.js';
 export const BUNDLED_DIR = path.join(REPO_ROOT, 'plugins', 'bundled');
 // `roles` mirrors the roles each plugin's main.js registers its routes with
 // (the host default is root only), so the function page can tell a reseller
-// up front instead of filling with 403 banners.
+// up front instead of filling with 403 banners. `fnKey: null` means the plugin
+// has no function page of its own: its ui:sidebar pages carry its UI.
 export const BUNDLED_PLUGINS = Object.freeze([
   { id: 'net.whm.server-monitoring', fnKey: 'plugins/server-monitoring', label: 'Server Monitoring', roles: ['root'] },
   { id: 'net.whm.imunifyav', fnKey: 'plugins/imunifyav', label: 'ImunifyAV', roles: ['root'] },
   { id: 'net.whm.wp-toolkit', fnKey: 'plugins/wp-toolkit', label: 'WP Toolkit', roles: ['root', 'reseller'] },
+  { id: 'net.whm.automated-backup', fnKey: null, label: 'Automated Backup', roles: ['root'] },
 ]);
 export const WP_INSTALL_JOB = 'plugins.wp.install';
 export const ENSURE_JOB = 'plugins.bundled.ensure';

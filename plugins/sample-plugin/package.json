@@ -1,0 +1,12 @@
+{
+  "name": "@whm/plugin-sample-notes",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Reference WHM plugin exercising every SDK extension point",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\"",
+    "fixtures": "node test/build-fixture.js",
+    "build": "node ../../scripts/build-plugin.js . --out dist/net.whm.sample-notes.whmplugin"
+  }
+}

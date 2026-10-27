@@ -1,0 +1,8 @@
+{
+  "name": "@whm/plugin-automated-backup",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bundled WHM plugin: scheduled account backups with locks, retention, destinations and token-confirmed restores",
+  "type": "commonjs",
+  "scripts": { "test": "node --test \"test/*.test.js\"" }
+}

@@ -13,6 +13,7 @@ const errors = require('./errors');
 const { createMockHost, MOCK_MASTER_KEY, MAX_STORE_VALUE_BYTES, MAX_FS_BYTES } = require('./mock-host');
 const semver = require('./semver');
 const cron = require('./cron');
+const pack = require('./pack');
 
 module.exports = {
   ...validate,
@@ -23,5 +24,6 @@ module.exports = {
   MAX_FS_BYTES,
   semver,
   cron,
+  pack,
   SDK_VERSION: '1.0.0',
 };

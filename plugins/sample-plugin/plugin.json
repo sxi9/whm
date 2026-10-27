@@ -1,0 +1,85 @@
+{
+  "$schema": "../sdk/manifest.schema.json",
+  "id": "net.whm.sample-notes",
+  "name": "Sample Notes",
+  "version": "1.1.0",
+  "description": "Reference plugin for the WHM plugin SDK: a small per-server notebook that exercises every extension point (settings, hooks, jobs, cron, pages, routes, store, fs, crypto, outbound fetch, events, i18n and migrations).",
+  "author": { "name": "WHM", "email": "plugins@trywhm.net", "url": "https://trywhm.net" },
+  "license": "MIT",
+  "homepage": "https://trywhm.net/plugins/sample-notes",
+  "engines": { "whm": "^1.0.0" },
+  "main": "main.js",
+  "keywords": ["sample", "reference", "notes", "sdk"],
+  "permissions": [
+    "settings:own",
+    "store:own",
+    "schedule",
+    "jobs",
+    "events:emit",
+    "ui:sidebar",
+    "api:routes",
+    "contacts:notify",
+    "audit:write",
+    "crypto:own",
+    "fs:own",
+    "accounts:read",
+    "accounts:write",
+    "net:outbound:hooks.example.net"
+  ],
+  "hooks": [
+    { "event": "account.created", "stage": "pre", "handler": "beforeAccountCreated" },
+    { "event": "account.created", "stage": "post", "handler": "afterAccountCreated" },
+    { "event": "account.terminated", "stage": "post", "handler": "afterAccountTerminated" }
+  ],
+  "settings": {
+    "groups": [
+      { "id": "general", "label": "General" },
+      { "id": "digest", "label": "Daily digest" },
+      { "id": "policy", "label": "Account policy" }
+    ],
+    "fields": [
+      { "key": "title", "type": "text", "label": "Notebook title", "default": "Server notes", "group": "general", "maxLength": 64, "help": "Shown as the heading of the digest." },
+      { "key": "maxNotes", "type": "number", "label": "Maximum notes kept", "default": 500, "min": 1, "max": 10000, "integer": true, "group": "general", "help": "Housekeeping removes the oldest notes beyond this count." },
+      { "key": "sortOrder", "type": "select", "label": "Sort order", "default": "newest", "group": "general", "options": [
+        { "value": "newest", "label": "Newest first" }, { "value": "oldest", "label": "Oldest first" }
+      ] },
+      { "key": "categories", "type": "multiselect", "label": "Categories in the digest", "default": ["ops", "billing"], "group": "digest", "options": [
+        { "value": "ops", "label": "Operations" }, { "value": "billing", "label": "Billing" }, { "value": "security", "label": "Security" }, { "value": "misc", "label": "Miscellaneous" }
+      ] },
+      { "key": "digestEnabled", "type": "toggle", "label": "Send the daily digest", "default": true, "group": "digest" },
+      { "key": "digestSchedule", "type": "cron", "label": "Digest schedule", "default": "0 8 * * *", "group": "digest", "help": "UTC cron expression; clear it to stop the digest job." },
+      { "key": "webhookToken", "type": "password", "label": "Webhook bearer token", "group": "digest", "help": "When set, the digest is also POSTed to https://hooks.example.net/whm-notes with this token.", "secret": true },
+      { "key": "blockedUsernames", "type": "textarea", "label": "Blocked usernames", "default": "", "group": "policy", "placeholder": "one username per line", "pattern": "^([a-z][a-z0-9_-]{0,31}(\\r?\\n)?)*$", "help": "Account creation is refused for these usernames (pre-stage hook)." }
+    ]
+  },
+  "jobs": {
+    "digest": { "label": "Send digest", "description": "Writes the digest file, notifies the server contacts and posts to the webhook when a token is set.", "timeoutSec": 300, "cancellable": true },
+    "housekeeping": { "label": "Housekeeping", "description": "Removes the oldest notes beyond the configured maximum.", "timeoutSec": 120, "cancellable": false }
+  },
+  "cron": [
+    { "name": "daily-digest", "job": "digest", "schedule": "setting:digestSchedule", "params": { "source": "cron" } },
+    { "name": "nightly-housekeeping", "job": "housekeeping", "schedule": "30 3 * * *", "params": { "source": "cron" } }
+  ],
+  "ui": {
+    "sidebar": [
+      { "category": "Plugins", "label": "Sample Notes", "route": "/", "icon": "notebook" }
+    ],
+    "pages": [
+      { "route": "/", "title": "Notes", "kind": "table", "icon": "notebook", "description": "Notes kept on this server.", "source": "/notes", "columns": [
+        { "key": "id", "label": "ID" }, { "key": "title", "label": "Title" }, { "key": "category", "label": "Category" }, { "key": "account", "label": "Account" }, { "key": "createdAt", "label": "Created" }
+      ] },
+      { "route": "/new", "title": "New note", "kind": "form", "source": "/notes", "fields": [
+        { "key": "title", "type": "text", "label": "Title", "required": true, "maxLength": 120 },
+        { "key": "body", "type": "textarea", "label": "Body", "maxLength": 4000 },
+        { "key": "category", "type": "select", "label": "Category", "default": "ops", "options": [
+          { "value": "ops", "label": "Operations" }, { "value": "billing", "label": "Billing" }, { "value": "security", "label": "Security" }, { "value": "misc", "label": "Miscellaneous" }
+        ] }
+      ] },
+      { "route": "/settings", "title": "Settings", "kind": "settings" },
+      { "route": "/digest", "title": "Send digest now", "kind": "action", "job": "digest", "confirm": true, "description": "Runs the digest job immediately." },
+      { "route": "/about", "title": "About", "kind": "markdown", "file": "pages/about.md" },
+      { "route": "/widget", "title": "Widget", "kind": "html", "file": "pages/widget.html" }
+    ]
+  },
+  "i18n": { "default": "en", "dir": "locales" }
+}

@@ -1,0 +1,87 @@
+{
+  "id": "net.whm.automated-backup",
+  "name": "Automated Backup",
+  "version": "1.0.0",
+  "description": "Scheduled account backups with per-account locks, verification, upload to configured destinations, day/week/month retention of the local archives, a run history and token-confirmed restores.",
+  "author": { "name": "WHM", "url": "https://trywhm.net" },
+  "license": "MIT",
+  "engines": { "whm": "^1.0.0" },
+  "main": "main.js",
+  "keywords": ["backup", "schedule", "retention", "restore"],
+  "permissions": [
+    "backups:read", "backups:write", "backups:restore", "accounts:read", "packages:read",
+    "settings:own", "store:own", "schedule", "jobs", "contacts:notify", "ui:sidebar", "api:routes"
+  ],
+  "hooks": [
+    { "event": "backup.completed", "stage": "post", "handler": "onBackupCompleted" },
+    { "event": "backup.failed", "stage": "post", "handler": "onBackupFailed" },
+    { "event": "account.terminated", "stage": "post", "handler": "onAccountTerminated" }
+  ],
+  "settings": {
+    "groups": [
+      { "id": "selection", "label": "Accounts" },
+      { "id": "archive", "label": "Archive" },
+      { "id": "schedule", "label": "Schedule" },
+      { "id": "retention", "label": "Retention (local archives)" },
+      { "id": "destinations", "label": "Destinations" },
+      { "id": "notifications", "label": "Notifications" },
+      { "id": "runtime", "label": "Runtime" }
+    ],
+    "fields": [
+      { "key": "scope", "type": "select", "label": "Back up", "default": "all", "group": "selection", "options": [
+        { "value": "all", "label": "All accounts" }, { "value": "packages", "label": "Accounts on the listed packages" }, { "value": "accounts", "label": "The listed accounts" }
+      ] },
+      { "key": "packages", "type": "textarea", "label": "Packages", "default": "", "group": "selection", "placeholder": "one package name per line", "pattern": "^([A-Za-z0-9_.-]{1,64}(\\r?\\n)?)*$", "help": "Used when \"Back up\" is set to packages; unknown names are reported as run warnings." },
+      { "key": "accounts", "type": "textarea", "label": "Accounts", "default": "", "group": "selection", "placeholder": "one username per line", "pattern": "^([a-z][a-z0-9_-]{0,31}(\\r?\\n)?)*$", "help": "Used when \"Back up\" is set to accounts; unknown usernames are reported as run warnings." },
+      { "key": "include", "type": "multiselect", "label": "Components", "default": ["home", "mail", "db", "dns", "ssl", "cron"], "group": "archive", "options": [
+        { "value": "home", "label": "Home directory" }, { "value": "mail", "label": "Mail" }, { "value": "db", "label": "Databases" }, { "value": "dns", "label": "DNS zones" }, { "value": "ssl", "label": "SSL certificates" }, { "value": "cron", "label": "Cron jobs" }
+      ] },
+      { "key": "verify", "type": "toggle", "label": "Verify each archive after it is written", "default": true, "group": "archive" },
+      { "key": "encrypt", "type": "toggle", "label": "Request encrypted archives", "default": false, "group": "archive", "help": "This panel version only produces gzip-compressed, unencrypted archives: when the host refuses (UNSUPPORTED) the archive is written unencrypted and the run carries a warning." },
+      { "key": "schedule", "type": "cron", "label": "Schedule (UTC cron)", "group": "schedule", "placeholder": "0 2 * * *", "help": "Leave empty to disable scheduled runs; \"Run now\" still works." },
+      { "key": "retention_daily", "type": "number", "label": "Daily archives to keep", "default": 7, "min": 0, "max": 365, "integer": true, "group": "retention" },
+      { "key": "retention_weekly", "type": "number", "label": "Weekly archives to keep", "default": 4, "min": 0, "max": 104, "integer": true, "group": "retention" },
+      { "key": "retention_monthly", "type": "number", "label": "Monthly archives to keep", "default": 3, "min": 0, "max": 120, "integer": true, "group": "retention", "help": "Retention removes local archives only; copies on a destination follow that destination's own retention." },
+      { "key": "destinations", "type": "textarea", "label": "Destination ids", "default": "", "group": "destinations", "placeholder": "one destination id per line", "pattern": "^([A-Za-z0-9_-]{1,64}(\\r?\\n)?)*$", "help": "Ids from the Destinations page (Backup › Backup Configuration). Unknown ids are skipped with a run warning." },
+      { "key": "notify_on", "type": "select", "label": "Notify the server contacts on", "default": "failure", "group": "notifications", "options": [
+        { "value": "failure", "label": "Failure" }, { "value": "success", "label": "Success" }, { "value": "both", "label": "Failure and success" }, { "value": "never", "label": "Never" }
+      ] },
+      { "key": "max_parallel", "type": "number", "label": "Accounts backed up in parallel", "default": 2, "min": 1, "max": 8, "integer": true, "group": "runtime" },
+      { "key": "lock_ttl_minutes", "type": "number", "label": "Per-account lock TTL (minutes)", "default": 180, "min": 5, "max": 1440, "integer": true, "group": "runtime", "help": "A lock left behind by an interrupted run expires after this long." }
+    ]
+  },
+  "jobs": {
+    "run": { "label": "Run backups", "description": "Back up the selected accounts now: create, verify, upload to every destination, record, then apply retention.", "timeoutSec": 86400, "cancellable": true },
+    "prune": { "label": "Apply retention", "description": "Delete local archives outside the daily/weekly/monthly retention buckets.", "timeoutSec": 3600, "cancellable": true },
+    "restore": { "label": "Restore an archive", "description": "Restore an archive over an account; needs a confirm token from POST /api/plugins/manage/net.whm.automated-backup/restore-token.", "timeoutSec": 86400, "cancellable": false }
+  },
+  "cron": [
+    { "name": "scheduled-run", "job": "run", "schedule": "setting:schedule", "params": { "source": "cron" } }
+  ],
+  "ui": {
+    "sidebar": [
+      { "category": "Backup", "label": "Automated Backup", "route": "/history", "icon": "archive" }
+    ],
+    "pages": [
+      { "route": "/settings", "title": "Automated Backup settings", "kind": "settings", "description": "Account selection, schedule, retention, destinations and notifications." },
+      { "route": "/history", "title": "Backup history", "kind": "table", "source": "/runs", "description": "Scheduled and manual runs, host-initiated backups, prunes and restores.", "columns": [
+        { "key": "startedAt", "label": "Started" }, { "key": "kind", "label": "Kind" }, { "key": "source", "label": "Source" }, { "key": "status", "label": "Status" }, { "key": "accounts", "label": "Accounts" }, { "key": "ok", "label": "OK" }, { "key": "failed", "label": "Failed" }, { "key": "warnings", "label": "Warnings" }, { "key": "finishedAt", "label": "Finished" }
+      ] },
+      { "route": "/destinations", "title": "Backup destinations", "kind": "table", "source": "/destinations", "description": "Destinations configured in Backup Configuration; copy an id into the Destination ids setting.", "columns": [
+        { "key": "id", "label": "ID" }, { "key": "name", "label": "Name" }, { "key": "kind", "label": "Kind" }, { "key": "selected", "label": "Selected" }
+      ] },
+      { "route": "/artefacts", "title": "Archives", "kind": "table", "source": "/artefacts", "description": "Archives known to Automated Backup (own and host-initiated) with their local and remote state.", "columns": [
+        { "key": "artefactId", "label": "Archive" }, { "key": "account", "label": "Account" }, { "key": "createdAt", "label": "Created" }, { "key": "size", "label": "Size" }, { "key": "createdBy", "label": "Created by" }, { "key": "local", "label": "Local" }, { "key": "deletedAt", "label": "Pruned" }
+      ] },
+      { "route": "/locks", "title": "Account locks", "kind": "table", "source": "/locks", "description": "Accounts currently locked by a run; release a stale lock with POST /locks/:account/release.", "columns": [
+        { "key": "account", "label": "Account" }, { "key": "jobId", "label": "Job" }, { "key": "acquiredAt", "label": "Acquired" }, { "key": "expiresAt", "label": "Expires" }, { "key": "expired", "label": "Expired" }
+      ] },
+      { "route": "/run-now", "title": "Run backups now", "kind": "action", "job": "run", "confirm": true, "description": "Starts a backup run for the configured accounts." },
+      { "route": "/restore", "title": "Restore an archive", "kind": "form", "source": "/restore", "description": "Restores an archive over an account. The confirm token comes from POST /api/plugins/manage/net.whm.automated-backup/restore-token { artefactId, account }.", "fields": [
+        { "key": "artefactId", "type": "text", "label": "Archive id", "required": true, "maxLength": 64 },
+        { "key": "account", "type": "text", "label": "Account", "required": true, "pattern": "^[a-z][a-z0-9_-]{0,31}$" },
+        { "key": "confirmToken", "type": "password", "label": "Confirm token", "required": true, "help": "Single-use, issued to root for exactly this archive and account." }
+      ] }
+    ]
+  }
+}

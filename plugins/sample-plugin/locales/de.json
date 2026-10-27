@@ -1,0 +1,9 @@
+{
+  "digest.subject": "{title}: {count} Notizen in den letzten 24 Stunden",
+  "digest.body": "{count} Notiz(en) wurden seit {since} zu \"{title}\" hinzugefügt.",
+  "digest.empty": "Seit {since} wurden keine Notizen zu \"{title}\" hinzugefügt.",
+  "note.welcome.title": "Willkommen, {username}",
+  "note.welcome.body": "Das Konto {username} ({domain}) wurde am {date} angelegt.",
+  "note.blocked": "Der Benutzername \"{username}\" steht auf der Sperrliste von Sample Notes.",
+  "housekeeping.summary": "{removed} Notiz(en) entfernt; {kept} verbleiben."
+}
