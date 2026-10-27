@@ -3,7 +3,8 @@
 This file is loaded automatically by Claude Code at the start of every session. It is the
 project's persistent memory: what we are building, the decisions already made, the
 conventions to follow, the current state, and how to resume. **Keep it current: update
-"Current state" and `CHECKLIST.md` before every push.**
+"Current state", `CHECKLIST.md` and `HANDOFF.md` (the brief for any other AI or engineer taking
+over — user ask 2026-10-27) before every push.**
 
 ## What this project is
 
