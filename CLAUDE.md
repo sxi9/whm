@@ -313,7 +313,10 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   expiring-threshold dedup persisted before notify, `origin` in the client fixture, app.js comment); green gate
   running, then commit `fix(phase5)`. Docs run **`wf_6fb27dfc-b56`** (`whm-install-manual-wf_6fb27dfc-b56.js`, user
   ask 07:40: `docs/INSTALL.md` + `docs/MANUAL.md` (parts A/B merged by the integrator at the `<!-- PART B -->`
-  marker) — link both from README and HANDOFF when landed),
+  marker) — link both from README and HANDOFF when landed), and the **live end-to-end run `wf_a77b6326-d1e`**
+  (`whm-live-e2e-wf_a77b6326-d1e.js`: operator runs hub + panel on :7443/:2088 under the scratch dir, publishes the
+  sample plugin, installs it with consent, revokes it; writes `e2e/live-hub-flow.sh`, adds Playwright steps 15–17,
+  refreshes `docs/screenshots/`; one reviewer re-runs the script),
   then the live hub+panel end-to-end flow (`scripts/install.sh --with-hub` is the production path; in dev: start
   the hub with test keys on :7443, point `WHM_LICENSE_HUB_URL` at it, activate a trial from Basic Setup → License,
   enable the `whm-hub` provider, install `net.whm.sample-notes` through the consent screen, revoke it from the admin
