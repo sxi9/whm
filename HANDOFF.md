@@ -4,7 +4,7 @@ For any AI or engineer taking over. Everything stated here is on the branch
 `claude/trusting-cori-ifp7wy` of `github.com/sxi9/whm`; this file is updated at every milestone
 together with `CHECKLIST.md` (tracker) and `CLAUDE.md` (conventions + memory). Read those two next.
 
-**Last updated:** 2026-10-27 08:15 UTC · head `974cb94`+ · checklist 234 done / 1 partial / 1 open
+**Last updated:** 2026-10-27 08:40 UTC · head `93e4faa`+ · checklist 234 done / 1 partial / 1 open
 
 ## 1. What this is
 
@@ -29,7 +29,7 @@ license + marketplace service with its own React portals (`hub/ui`).
 | Phase 5 docs/deploy (BLUEPRINT §16–18, `deploy/whm-hub.service`, `deploy/hub.conf.example`, `scripts/install.sh --with-hub`, README hub section) | done, `0be6f9c` | `bash -n`, hub `--check-config` |
 | Phase 5 fix round (8 carried findings) | done, landed `e49e500` | gate: server 1135 / agent 462 / client 48 / hub 181 / hub-ui 105 + SDK + plugins |
 | Live hub + panel end-to-end flow (`e2e/live-hub-flow.sh`), Phase-5 flow screenshots | done 08:10 — 11/11 PASS, no code fix needed | reviewer re-run green; screenshots `974cb94` |
-| Install guide + user manual (`docs/INSTALL.md`, `docs/MANUAL.md`) | **running** (07:40) | — |
+| Install guide + user manual (`docs/INSTALL.md`, `docs/MANUAL.md` + `docs/MANUAL-partB.md`) | done 08:35 — accuracy-reviewed, 10 findings fixed, all 212 functions present once | linked from README |
 | Phase 6 hardening | pending | — |
 
 Screenshots of every page (labelled, all 212 live) plus 17 flow shots incl. the Phase-5 pages are under
@@ -102,6 +102,7 @@ page degrades to an install prompt — that is by design), Playwright + Chromium
 
 ```
 BLUEPRINT.md   design of record (§1–18)       CHECKLIST.md  tracker + timeline     HANDOFF.md  this file
+docs/INSTALL.md  installation guide            docs/MANUAL.md + MANUAL-partB.md  user manual (every function)
 CLAUDE.md      conventions + memory            docs/design/  contracts, plugin host, marketplace, license, phase-5 plan
 server/        panel API (routes/categories/<slug>.js, services/<slug>.js, db/migrations 001–032)
 agent/         whm-agentd op families (sys svc user fs sec dns db net ssl mail pkg web hook acct backup transfer …)

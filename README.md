@@ -10,6 +10,17 @@ resellers — built on Node.js 22, Express, React and SQLite.
 
 ![WHM home dashboard](docs/screenshots/02-dashboard.png)
 
+## Documentation
+
+| Document | What it covers |
+|---|---|
+| [docs/INSTALL.md](docs/INSTALL.md) | Installation guide: components and deployment modes, requirements and ports, development quick start, production install with `scripts/install.sh` (every flag), the hub (keys, first admin, first license, connecting a panel, `hub.conf` reference), upgrades, backups, uninstall, full `WHM_*` / `WHM_HUB_*` reference, troubleshooting |
+| [docs/MANUAL.md](docs/MANUAL.md) | User manual part A: signing in, layout, roles, how a change reaches the server, and every function of categories 1–15 |
+| [docs/MANUAL-partB.md](docs/MANUAL-partB.md) | User manual part B: every function of categories 16–30, then licensing, plugins and the Marketplace, plugin developers, hub portals, troubleshooting |
+| [plugins/SDK.md](plugins/SDK.md) | Plugin developer reference (manifest, `ctx` API, lifecycle, packaging, signing, submission) |
+| [BLUEPRINT.md](BLUEPRINT.md) | Design of record (architecture, security model, every function, license server §16, plugin system §17, marketplace §18) |
+| [HANDOFF.md](HANDOFF.md) | Brief for anyone taking the project over; [CHECKLIST.md](CHECKLIST.md) is the live tracker |
+
 ## Architecture in one paragraph
 
 A React single-page app talks to an Express API (`server/`) that runs **unprivileged** as
