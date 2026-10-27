@@ -2,33 +2,39 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
-import { Writable } from 'node:stream';
+import { Transform } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { json } from '../db/index.js';
 import { HttpError, CapabilityError, notFound, conflict, unprocessable } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
 
 // cPanel category. Attached as ctx.cpanel; other categories may call:
-//   cpanel.branding.get()                -> what the browser applies (company name, colours, links, logo descriptor)
+//   cpanel.branding.get()                -> what the browser applies (company name, colours, links, logo descriptor);
+//                                           the same object is served unauthenticated from GET /api/branding
 //   cpanel.news.active(user)             -> news items the given principal should see right now
-//   cpanel.changelog.get()               -> parsed CHANGELOG.md
-//   cpanel.upgrade.status()              -> release check + last upgrade state (async)
-// Files: branding images under $WHM_DATA_DIR/branding/; release downloads under
-// $WHM_DATA_DIR/upgrades/. Trusted release-signing keys, the verified staging copy
-// and the installer log belong to the root agent (cpanel.upgrade.* ops), never to
-// this process: the panel only hands the agent the archive path and the feed's
-// checksum/signature, and the agent decides whether to unpack and run anything.
+//   cpanel.changelog.get(user)           -> parsed CHANGELOG.md
+//   cpanel.upgrade.status()              -> last upgrade state + the release Software last saw (async, read-only)
+// The release feed is Software's: ctx.software.panel.check()/status() answer
+// "what is the latest version"; cpanel never fetches the feed and only keeps
+// the upgrade-run record (cpanel.upgrade.last). Files: branding images under
+// $WHM_DATA_DIR/branding/; release downloads under $WHM_DATA_DIR/upgrades/ (removed
+// once the agent holds its copy). Trusted release-signing keys, the verified
+// staging copy and the installer log belong to the root agent (cpanel.upgrade.*
+// ops), never to this process: the panel only hands the agent the archive path
+// and the feed's checksum/signature, and the agent decides whether to unpack
+// and run anything.
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 export const UPGRADE_JOB = 'cpanel.upgrade';
-export const AUDIENCES = ['root', 'resellers', 'all'];
+// `own` = the accounts owned by the item's author (a reseller with the `news`
+// ACL, or root for the accounts it owns directly).
+export const AUDIENCES = ['root', 'resellers', 'all', 'own'];
 export const SEVERITIES = ['info', 'warning', 'critical'];
 export const IMAGE_KINDS = { logo: { maxBytes: 512 * 1024 }, favicon: { maxBytes: 128 * 1024 } };
-export const INLINE_LOGO_MAX_BYTES = 96 * 1024;
 const MAX_ARCHIVE_BYTES = 512 * 1024 * 1024;
 const UPGRADE_TIMEOUT_MS = 45 * 60 * 1000;
 const POLL_MS = 3000;
 const LOG_TAIL_BYTES = 64 * 1024;
+const KEYS_CACHE_MS = 10_000;
 
 export const BRANDING_KEYS = {
   companyName: 'branding.company_name',
