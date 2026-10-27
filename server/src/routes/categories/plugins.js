@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { validate, z, fields } from '../../lib/validate.js';
 import { requireRoot, requireReseller } from '../../middleware/rbac.js';
-import { createBundledPluginsService, WP_INSTALL_JOB } from '../../services/plugins-bundled.js';
+import { createBundledPluginsService, WP_INSTALL_JOB, ENSURE_JOB } from '../../services/plugins-bundled.js';
 
 // Plugins category: ImunifyAV, Server Monitoring and WP Toolkit are bundled
 // plugins on the SDK (plugins/bundled/<id>), served by the core plugin host
@@ -31,6 +31,7 @@ export async function register(ctx) {
   ctx.bundledPlugins = createBundledPluginsService(ctx);
   const s = ctx.bundledPlugins;
   ctx.jobs.register(WP_INSTALL_JOB, (job) => s.runWordPressInstall(job));
+  ctx.jobs.register(ENSURE_JOB, (job) => s.runEnsureInstalled(job));
   // Only the programs the plugins actually probe: sys.binaries is capped per
   // call and every extra name here costs every category.
   ctx.capabilities.register('imunifyav', { binaries: ['imunify-antivirus'], required: ['imunify-antivirus'] });
@@ -38,11 +39,16 @@ export async function register(ctx) {
   ctx.capabilities.register('wpcli', { binaries: ['wp'], required: ['wp'] });
   s.watchHost();
 
-  // The bundled plugins install into the host at boot. Test suites opt in
-  // (overrides.bundledPlugins = true) so the core plugin-host suite keeps an
-  // empty host to assert against.
-  const auto = ctx.config.bundledPlugins ?? ctx.config.env !== 'test';
-  if (auto && ctx.plugins?.sdkAvailable?.()) await s.ensureInstalled();
+  // The bundled plugins install into the host at boot, as a job that runs
+  // once the panel listens and the job workers start (see index.js start()).
+  // Test suites opt in to an immediate install (overrides.bundledPlugins =
+  // true) or to the job ('job'); without either the core plugin-host suite
+  // keeps an empty host to assert against.
+  const mode = ctx.config.bundledPlugins ?? (ctx.config.env === 'test' ? false : 'job');
+  if (mode && ctx.plugins?.sdkAvailable?.()) {
+    if (mode === true) await s.ensureInstalled();
+    else s.scheduleEnsureInstalled();
+  }
 
   const r = Router();
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.json(d?.meta ? d : { data: d })).catch(next);

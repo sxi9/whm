@@ -2,9 +2,9 @@ import { useEffect, useState } from 'react';
 import { api } from '../../api/client.js';
 
 // Branding from GET /api/branding (cPanel › Customization): company name, colours,
-// help links, login notice and the logo descriptor. The shell loads it once a
-// session exists and caches it, so the public login page paints with the last
-// known branding without a request (the API is behind authentication).
+// help links, login notice and the logo/favicon descriptors. The endpoint is
+// public, so the login page reads it before a session exists; a cached copy only
+// avoids a flash of defaults while the request is in flight.
 
 const CACHE_KEY = 'whm.branding';
 const STYLE_ID = 'whm-branding-css';
@@ -12,6 +12,7 @@ const EVENT = 'whm:branding-changed';
 export const DEFAULT_BRANDING = { companyName: 'WHM', tagline: 'WebHost Manager', primaryColor: '', chromeColor: '', helpUrl: '', docsUrl: '', supportUrl: '', loginNotice: '', footerText: '', logo: null, favicon: null };
 
 let current = null;
+let inflight = null;
 
 export function cachedBranding() {
   if (current) return current;
@@ -45,30 +46,37 @@ export function applyBranding(branding) {
 }
 
 export async function refreshBranding() {
-  const { data } = await api.get('/branding');
-  const branding = { ...DEFAULT_BRANDING, ...data };
-  cache(branding);
-  applyBranding(branding);
-  window.dispatchEvent(new Event(EVENT));
-  return branding;
+  if (inflight) return inflight;
+  inflight = api.get('/branding').then(({ data }) => {
+    const branding = { ...DEFAULT_BRANDING, ...data };
+    cache(branding);
+    applyBranding(branding);
+    window.dispatchEvent(new Event(EVENT));
+    return branding;
+  }).finally(() => { inflight = null; });
+  return inflight;
 }
 
 export function notifyBrandingChanged() { refreshBranding().catch(() => {}); }
 
-// Current branding for components; re-renders when the shell refreshes it.
+// Current branding for components. The first subscriber on a page load fetches
+// the server's copy (no session needed); every subscriber re-renders when it
+// changes.
+let loadedOnce = false;
 export function useBranding() {
   const [branding, setBranding] = useState(() => cachedBranding() || DEFAULT_BRANDING);
   useEffect(() => {
     applyBranding(cachedBranding());
     const onChange = () => setBranding(cachedBranding() || DEFAULT_BRANDING);
     window.addEventListener(EVENT, onChange);
+    if (!loadedOnce) { loadedOnce = true; refreshBranding().catch(() => { loadedOnce = false; }); }
     return () => window.removeEventListener(EVENT, onChange);
   }, []);
   return branding;
 }
 
-// Mounted once in the shell: paints the cached branding immediately and loads
-// the server's copy whenever a session starts.
+// Mounted once in the shell: re-reads the server's copy whenever a session
+// starts, so a change made from another browser shows up at the next login.
 export function useBrandingLoader(userId) {
   useEffect(() => { applyBranding(cachedBranding()); }, []);
   useEffect(() => {
@@ -78,5 +86,5 @@ export function useBrandingLoader(userId) {
 }
 
 export function logoSrc(branding) {
-  return branding?.logo?.dataUrl || branding?.logo?.url || null;
+  return branding?.logo?.url || null;
 }

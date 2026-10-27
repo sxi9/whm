@@ -4,9 +4,9 @@ import https from 'node:https';
 import { json, paginate } from '../db/index.js';
 import { DEFAULT_SETTINGS } from '../db/seed.js';
 import { HttpError, notFound, conflict, forbidden, unprocessable } from '../lib/errors.js';
-import { CONFIG_GROUPS, CONFIG_KEYS, GROUP_NAMES, groupOfKey, isPushableKey, keysOfGroup, validateIncoming, exportValue, APPLIERS } from './clusters-config.js';
+import { CONFIG_GROUPS, CONFIG_KEYS, GROUP_NAMES, DEFAULT_GROUPS, groupOfKey, isPushableKey, keysOfGroup, validateIncoming, exportValue, APPLIERS } from './clusters-config.js';
 
-export { CONFIG_GROUPS, CONFIG_KEYS, GROUP_NAMES, groupOfKey, isPushableKey, keysOfGroup };
+export { CONFIG_GROUPS, CONFIG_KEYS, GROUP_NAMES, DEFAULT_GROUPS, groupOfKey, isPushableKey, keysOfGroup };
 
 // ctx.clusters — peers (other instances of this panel) for the DNS cluster and
 // the configuration cluster. Peers are stored in the core dns_clusters table;
@@ -18,27 +18,46 @@ export { CONFIG_GROUPS, CONFIG_KEYS, GROUP_NAMES, groupOfKey, isPushableKey, key
 //   clusters.events.record({ ... })             -> log an exchange with a peer
 //   clusters.acceptsDnsPushes()                 -> the "Accept zones pushed by peers" toggle; the DNS
 //                                                  module's zone import must refuse token pushes when false
-//   clusters.dns.guardImport(req)               -> throws 403 for a token-authenticated request when it is off
+//   clusters.dns.guardImport(req)               -> throws 403 for a token-authenticated request when it is off;
+//                                                  otherwise logs the import's outcome (dns.receive ok/failed)
+//                                                  once the response finishes. Idempotent per request.
+//   clusters.peers.transport(id)                -> { verifyTls } for a peer, for callers that open their own
+//                                                  connection to it (the DNS module's zone pushes)
 // The allowlist of settings that may travel, their schemas and the owning
 // services' apply paths live in ./clusters-config.js.
 
 export const PEER_ROLES = ['write-only', 'sync', 'standalone'];
-export const CLUSTER_SCOPE = 'clustering';
+// A cluster token carries exactly one purpose. 'clustering:dns' lets a peer
+// push zones, 'clustering:config' lets it exchange settings; the bare
+// 'clustering' scope of tokens issued before the split keeps working for
+// zones only. Core (middleware/auth.js, via ctx.confinedScopes) lets a token
+// call only the routes of its scope; everything else answers 403 scope_confined.
+export const CLUSTER_SCOPES = Object.freeze({ dns: 'clustering:dns', config: 'clustering:config' });
+export const LEGACY_CLUSTER_SCOPE = 'clustering';
+export const TOKEN_PURPOSES = Object.freeze(Object.keys(CLUSTER_SCOPES));
 export const PUSH_JOB = 'clusters.config.push';
 export const PUSH_SCHEDULE = 'config-cluster-push';
 export const DNS_SYNC_SCHEDULE = 'dns-cluster-sync';
 export const EVENT_KINDS = ['peer.test', 'dns.receive', 'config.push', 'config.pull', 'config.receive', 'config.export'];
-// A cluster token belongs to root but core (middleware/auth.js, via
-// ctx.confinedScopes) lets it call only these routes; everything else answers
-// 403 scope_confined. The last one is what older panels' DNS sync jobs post to.
-export const CLUSTER_TOKEN_ROUTES = Object.freeze([
-  { method: 'GET', path: '/api/clusters/ping' },
-  { method: 'POST', path: '/api/clusters/dns/receive' },
-  { method: 'GET', path: '/api/clusters/config/export' },
-  { method: 'POST', path: '/api/clusters/config/receive' },
-  { method: 'POST', path: '/api/dns/zones/import' },
-].map(Object.freeze));
-export const TOKEN_ALLOWED = Object.freeze(CLUSTER_TOKEN_ROUTES.map((r) => `${r.method} ${r.path}`));
+const PING = Object.freeze({ method: 'GET', path: '/api/clusters/ping' });
+const DNS_ROUTES = Object.freeze([
+  PING,
+  Object.freeze({ method: 'POST', path: '/api/clusters/dns/receive' }),
+  // What the DNS module's sync job on an older panel posts to.
+  Object.freeze({ method: 'POST', path: '/api/dns/zones/import' }),
+]);
+const CONFIG_ROUTES = Object.freeze([
+  PING,
+  Object.freeze({ method: 'GET', path: '/api/clusters/config/export' }),
+  Object.freeze({ method: 'POST', path: '/api/clusters/config/receive' }),
+]);
+export const CLUSTER_TOKEN_ROUTES = Object.freeze({ [CLUSTER_SCOPES.dns]: DNS_ROUTES, [CLUSTER_SCOPES.config]: CONFIG_ROUTES, [LEGACY_CLUSTER_SCOPE]: DNS_ROUTES });
+export const ALL_CLUSTER_SCOPES = Object.freeze(Object.keys(CLUSTER_TOKEN_ROUTES));
+export const tokenAllowed = (scope) => (CLUSTER_TOKEN_ROUTES[scope] ?? []).map((r) => `${r.method} ${r.path}`);
+export const purposeOfScope = (scope) => (scope === CLUSTER_SCOPES.config ? 'config' : 'dns');
+export const isClusterScope = (scope) => Object.hasOwn(CLUSTER_TOKEN_ROUTES, scope);
+// Default-on would let any peer with a token rewrite this server (025b).
+export const ACCEPT_CONFIG_PUSHES_DEFAULT = false;
 
 // A peer address is a hostname or IP, optionally with scheme and port; the
 // panel's HTTPS port (2087) is assumed when none is given.
@@ -83,6 +102,9 @@ export function describeNetworkError(err, url) {
 }
 
 const errorOf = (res, fallback) => res.body?.error?.message || res.text?.slice(0, 120) || fallback;
+const likeEscape = (text) => String(text).replace(/[\\%_]/g, (c) => `\\${c}`);
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0', '::']);
+const bareHost = (url) => url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
 
 export function createClustersService(ctx) {
   const { db, settings, crypto: cryptoSvc, logger } = ctx;
@@ -97,7 +119,7 @@ export function createClustersService(ctx) {
     peerById: db.prepare(`SELECT c.*, c.api_token_enc IS NOT NULL AS has_token, o.verify_tls, o.config_enabled, o.status, o.last_checked_at, o.last_error, o.remote_json
       FROM dns_clusters c LEFT JOIN cluster_peer_options o ON o.cluster_id = c.id WHERE c.id = ?`),
     peerByName: db.prepare('SELECT id FROM dns_clusters WHERE name = ?'),
-    peerByHost: db.prepare('SELECT id FROM dns_clusters WHERE remote_host = ?'),
+    peerHosts: db.prepare('SELECT id, remote_host FROM dns_clusters'),
     insertPeer: db.prepare('INSERT INTO dns_clusters (name, remote_host, api_token_enc, role, enabled) VALUES (@name, @remote_host, @api_token_enc, @role, @enabled)'),
     updatePeer: db.prepare('UPDATE dns_clusters SET name = @name, remote_host = @remote_host, api_token_enc = @api_token_enc, role = @role, enabled = @enabled WHERE id = @id'),
     deletePeer: db.prepare('DELETE FROM dns_clusters WHERE id = ?'),
@@ -106,10 +128,16 @@ export function createClustersService(ctx) {
     checkOptions: db.prepare(`INSERT INTO cluster_peer_options (cluster_id, status, last_checked_at, last_error, remote_json) VALUES (@cluster_id, @status, datetime('now'), @last_error, @remote_json)
       ON CONFLICT (cluster_id) DO UPDATE SET status = excluded.status, last_checked_at = excluded.last_checked_at, last_error = excluded.last_error, remote_json = COALESCE(excluded.remote_json, cluster_peer_options.remote_json), updated_at = datetime('now')`),
     zoneSyncSummary: db.prepare(`SELECT cluster_id, SUM(status = 'ok') AS ok, SUM(status = 'failed') AS failed, MAX(synced_at) AS last FROM dns_zone_sync GROUP BY cluster_id`),
-    tokens: db.prepare(`SELECT t.id, t.name, t.prefix, t.description, t.expires_at, t.last_used_at, t.created_at, t.created_ip, u.username FROM api_tokens t JOIN users u ON u.id = t.user_id
-      WHERE t.scopes = ? ORDER BY t.created_at DESC`),
-    tokenById: db.prepare('SELECT t.*, u.username FROM api_tokens t JOIN users u ON u.id = t.user_id WHERE t.id = ? AND t.scopes = ?'),
-    insertToken: db.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, expires_at, prefix, description, created_ip) VALUES (@user_id, @name, @token_hash, @scopes, @expires_at, @prefix, @description, @created_ip)'),
+    // prefix/description/created_ip come from the Development category's
+    // migration; the statements use whichever of them this database has.
+    tokens: db.prepare(`SELECT t.*, u.username FROM api_tokens t JOIN users u ON u.id = t.user_id
+      WHERE t.scopes IN (${ALL_CLUSTER_SCOPES.map(() => '?').join(', ')}) ORDER BY t.created_at DESC, t.id DESC`),
+    tokenById: db.prepare(`SELECT t.*, u.username FROM api_tokens t JOIN users u ON u.id = t.user_id WHERE t.id = ? AND t.scopes IN (${ALL_CLUSTER_SCOPES.map(() => '?').join(', ')})`),
+    insertToken: (() => {
+      const have = new Set(db.pragma('table_info(api_tokens)').map((c) => c.name));
+      const cols = ['user_id', 'name', 'token_hash', 'scopes', 'expires_at', ...['prefix', 'description', 'created_ip'].filter((c) => have.has(c))];
+      return db.prepare(`INSERT INTO api_tokens (${cols.join(', ')}) VALUES (${cols.map((c) => `@${c}`).join(', ')})`);
+    })(),
     deleteToken: db.prepare('DELETE FROM api_tokens WHERE id = ?'),
     rootUser: db.prepare("SELECT id, username FROM users WHERE role = 'root' ORDER BY id LIMIT 1"),
     insertEvent: db.prepare('INSERT INTO cluster_events (cluster_id, kind, direction, source, status, message, details_json) VALUES (@cluster_id, @kind, @direction, @source, @status, @message, @details_json)'),
@@ -117,7 +145,9 @@ export function createClustersService(ctx) {
     recentEvents: db.prepare('SELECT e.*, c.name AS peer FROM cluster_events e LEFT JOIN dns_clusters c ON c.id = e.cluster_id ORDER BY e.id DESC LIMIT ?'),
     settingRow: db.prepare('SELECT 1 FROM settings WHERE key = ?'),
   };
-  const SCOPES_JSON = JSON.stringify([CLUSTER_SCOPE]);
+  const SCOPE_JSON = Object.fromEntries(ALL_CLUSTER_SCOPES.map((sc) => [sc, JSON.stringify([sc])]));
+  const SCOPE_JSON_LIST = ALL_CLUSTER_SCOPES.map((sc) => SCOPE_JSON[sc]);
+  const scopeOfRow = (row) => { try { const list = JSON.parse(row.scopes || '[]'); return list.length === 1 && isClusterScope(list[0]) ? list[0] : null; } catch { return null; } };
 
   const shapePeer = (row, syncRows = null) => {
     const sync = syncRows?.get?.(row.id);
@@ -143,21 +173,42 @@ export function createClustersService(ctx) {
       if (query.kind) { where.push('e.kind = @kind'); params.kind = query.kind; }
       if (query.clusterId) { where.push('e.cluster_id = @clusterId'); params.clusterId = query.clusterId; }
       if (query.status) { where.push('e.status = @status'); params.status = query.status; }
-      if (query.q) { where.push('(e.message LIKE @q OR e.source LIKE @q OR c.name LIKE @q)'); params.q = `%${query.q}%`; }
+      if (query.q) { where.push("(e.message LIKE @q ESCAPE '\\' OR e.source LIKE @q ESCAPE '\\' OR c.name LIKE @q ESCAPE '\\')"); params.q = `%${likeEscape(query.q)}%`; }
       const page = paginate(db, { select: 'e.*, c.name AS peer', from: 'cluster_events e LEFT JOIN dns_clusters c ON c.id = e.cluster_id', where, params, query, sortable: { ts: 'e.id', kind: 'e.kind', status: 'e.status', peer: 'c.name' }, defaultSort: 'ts' });
       return { data: page.data.map((e) => ({ ...e, details: json.parse(e.details_json, null), details_json: undefined })), meta: page.meta };
     },
     prune() { const days = Number(S('clusters.events.retention_days', 90)) || 90; return stmts.pruneEvents.run(`-${days} days`).changes; },
   };
 
+  // 'ns2.example.com', 'ns2.example.com:2087' and 'https://ns2.example.com'
+  // are the same peer: addresses are compared in their parsed form.
+  const samePeer = (url, exceptId = null) => stmts.peerHosts.all().some((r) => { if (r.id === exceptId) return false; try { return parsePeerHost(r.remote_host).href === url.href; } catch { return false; } });
+  const ownPorts = () => new Set([ctx.config?.port, ctx.config?.tlsPort, 2086, 2087].filter(Boolean).map(String));
+  const ownAddresses = () => {
+    const set = new Set();
+    for (const v of [S('basic.main_ip', ''), S('basic.main_ipv6', '')]) if (v) set.add(String(v).toLowerCase());
+    try { for (const list of Object.values(os.networkInterfaces())) for (const i of list ?? []) set.add(String(i.address).toLowerCase()); } catch { /* no interfaces to read */ }
+    return set;
+  };
+  // This server by name is always itself; by address only when the port is
+  // one of the panel's own (another panel on the same host is a peer).
+  const isSelf = (url) => {
+    const host = bareHost(url);
+    if ([localHostname(), os.hostname()].some((h) => h && h.toLowerCase() === host)) return true;
+    return (LOOPBACK.has(host) || ownAddresses().has(host)) && ownPorts().has(url.port);
+  };
+  const assertNotSelf = (url) => { if (isSelf(url)) throw unprocessable('Request validation failed', { host: ['That is this server'] }); };
+
   const peers = {
     list() { const sync = syncSummary(); return stmts.peers.all().map((r) => shapePeer(r, sync)); },
     get(id) { return shapePeer(loadPeer(id), syncSummary()); },
+    // For callers that connect to a peer themselves (the DNS module's zone pushes).
+    transport(id) { const row = loadPeer(id); return { verifyTls: row.verify_tls == null ? true : Boolean(row.verify_tls) }; },
     create(input, req) {
       const url = parsePeerHost(input.host);
       if (stmts.peerByName.get(input.name)) throw conflict(`A peer named "${input.name}" already exists`);
-      if (stmts.peerByHost.get(input.host)) throw conflict(`A peer at ${input.host} already exists`);
-      if (url.hostname === localHostname().toLowerCase()) throw unprocessable('Request validation failed', { host: ['That is this server'] });
+      if (samePeer(url)) throw conflict(`A peer at ${input.host} already exists`);
+      assertNotSelf(url);
       const id = db.transaction(() => {
         const { lastInsertRowid } = stmts.insertPeer.run({ name: input.name, remote_host: input.host, api_token_enc: cryptoSvc.encrypt(input.token), role: input.role, enabled: input.enabled === false ? 0 : 1 });
         stmts.upsertOptions.run({ cluster_id: lastInsertRowid, verify_tls: input.verifyTls === false ? 0 : 1, config_enabled: input.configEnabled ? 1 : 0 });
@@ -168,9 +219,12 @@ export function createClustersService(ctx) {
     },
     update(id, input, req) {
       const row = loadPeer(id);
-      if (input.host) parsePeerHost(input.host);
       if (input.name && input.name !== row.name && stmts.peerByName.get(input.name)) throw conflict(`A peer named "${input.name}" already exists`);
-      if (input.host && input.host !== row.remote_host && stmts.peerByHost.get(input.host)) throw conflict(`A peer at ${input.host} already exists`);
+      if (input.host) {
+        const url = parsePeerHost(input.host);
+        if (samePeer(url, id)) throw conflict(`A peer at ${input.host} already exists`);
+        assertNotSelf(url);
+      }
       db.transaction(() => {
         stmts.updatePeer.run({ id, name: input.name ?? row.name, remote_host: input.host ?? row.remote_host, api_token_enc: input.token ? cryptoSvc.encrypt(input.token) : row.api_token_enc, role: input.role ?? row.role, enabled: (input.enabled ?? Boolean(row.enabled)) ? 1 : 0 });
         stmts.upsertOptions.run({ cluster_id: id, verify_tls: (input.verifyTls ?? (row.verify_tls == null ? true : Boolean(row.verify_tls))) ? 1 : 0, config_enabled: (input.configEnabled ?? Boolean(row.config_enabled)) ? 1 : 0 });
@@ -228,22 +282,29 @@ export function createClustersService(ctx) {
   };
 
   // Tokens a *remote* panel uses to reach this one: issued for the root user
-  // with the "clustering" scope, which core confines to CLUSTER_TOKEN_ROUTES.
+  // with one cluster scope, which core confines to that scope's routes.
+  const shapeToken = (t) => {
+    const scope = scopeOfRow(t);
+    return { id: t.id, name: t.name, prefix: t.prefix ?? null, description: t.description ?? null, expiresAt: t.expires_at, lastUsedAt: t.last_used_at, createdAt: t.created_at, createdIp: t.created_ip ?? null, username: t.username, purpose: purposeOfScope(scope), scopes: [scope], legacy: scope === LEGACY_CLUSTER_SCOPE, access: 'confined', allowed: tokenAllowed(scope) };
+  };
   const tokens = {
-    list: () => stmts.tokens.all(SCOPES_JSON).map((t) => ({ id: t.id, name: t.name, prefix: t.prefix, description: t.description, expiresAt: t.expires_at, lastUsedAt: t.last_used_at, createdAt: t.created_at, createdIp: t.created_ip, username: t.username, scopes: [CLUSTER_SCOPE], access: 'confined', allowed: TOKEN_ALLOWED })),
+    // purpose narrows the list; legacy zone-only tokens count as 'dns'.
+    list: (purpose = null) => stmts.tokens.all(...SCOPE_JSON_LIST).map(shapeToken).filter((t) => !purpose || t.purpose === purpose),
     create(input, user, req) {
       const owner = user?.role === 'root' ? user : stmts.rootUser.get();
       if (!owner) throw notFound('Root user');
+      const scope = CLUSTER_SCOPES[input.purpose];
+      if (!scope) throw unprocessable('Request validation failed', { purpose: [`One of ${TOKEN_PURPOSES.join(', ')}`] });
       let expiresAt = null;
       if (input.expiresInDays) expiresAt = `${new Date(Date.now() + input.expiresInDays * 86_400_000).toISOString().slice(0, 19)}Z`;
       const secret = `whm_${cryptoSvc.randomToken(32)}`;
-      const { lastInsertRowid } = stmts.insertToken.run({ user_id: owner.id, name: input.name, token_hash: cryptoSvc.hashToken(secret), scopes: SCOPES_JSON, expires_at: expiresAt, prefix: secret.slice(0, 12), description: input.description || `Cluster token for ${input.name}`, created_ip: req?.ip || null });
-      audit(req, { action: 'clusters.token.create', target: input.name, args: { expiresAt, access: 'confined', scopes: [CLUSTER_SCOPE] } });
+      const { lastInsertRowid } = stmts.insertToken.run({ user_id: owner.id, name: input.name, token_hash: cryptoSvc.hashToken(secret), scopes: SCOPE_JSON[scope], expires_at: expiresAt, prefix: secret.slice(0, 12), description: input.description || `Cluster token (${input.purpose}) for ${input.name}`, created_ip: req?.ip || null });
+      audit(req, { action: 'clusters.token.create', target: input.name, args: { expiresAt, access: 'confined', purpose: input.purpose, scopes: [scope] } });
       // Shown exactly once; only its hash is stored.
       return { ...tokens.list().find((t) => t.id === Number(lastInsertRowid)), token: secret };
     },
     revoke(id, req) {
-      const row = stmts.tokenById.get(id, SCOPES_JSON);
+      const row = stmts.tokenById.get(id, ...SCOPE_JSON_LIST);
       if (!row) throw notFound('Cluster token');
       stmts.deleteToken.run(id);
       audit(req, { action: 'clusters.token.revoke', target: row.name, args: { id, prefix: row.prefix } });
@@ -256,9 +317,10 @@ export function createClustersService(ctx) {
   // What a peer learns about this server on a connectivity test.
   const identity = () => ({
     hostname: localHostname(), version: ctx.version ?? null, mode: ctx.config?.mode ?? null,
-    accepts: { dns: acceptsDnsPushes() && typeof ctx.dns?.importZone === 'function', config: Boolean(S('clusters.config.accept_pushes', true)) },
-    groups: GROUP_NAMES,
+    accepts: { dns: acceptsDnsPushes() && typeof ctx.dns?.importZone === 'function', config: acceptsConfigPushes() },
+    groups: GROUP_NAMES, sharedGroups: config.selectedGroups(),
   });
+  const acceptsConfigPushes = () => Boolean(S('clusters.config.accept_pushes', ACCEPT_CONFIG_PUSHES_DEFAULT));
 
   const dnsModule = () => { if (typeof ctx.dns?.enqueueSync !== 'function') throw new HttpError(501, 'capability_missing', 'The DNS Functions module is not loaded on this server, so zones cannot be synchronised'); return ctx.dns; };
 
@@ -269,10 +331,26 @@ export function createClustersService(ctx) {
     // ctx.clusters.dns.guardImport(). Sessions (a root user importing a zone
     // by hand) are not peer pushes and pass.
     guardImport(req) {
-      if (req?.auth?.via !== 'token' || acceptsDnsPushes()) return;
+      if (req?.auth?.via !== 'token') return;
       const domain = typeof req.body?.domain === 'string' && /^[a-z0-9.-]{1,253}$/i.test(req.body.domain) ? req.body.domain.toLowerCase() : null;
-      events.record({ kind: 'dns.receive', direction: 'in', source: req.ip ?? null, status: 'skipped', message: `${domain ?? 'zone'}: refused, this server does not accept DNS pushes`, details: { domain, path: req.originalUrl ?? null } });
-      throw forbidden('This server does not accept DNS pushes; enable them under Clusters > DNS Cluster');
+      const serial = Number.isInteger(req.body?.serial) ? req.body.serial : null;
+      const source = req.ip ?? null;
+      const path = req.originalUrl ?? null;
+      if (!acceptsDnsPushes()) {
+        events.record({ kind: 'dns.receive', direction: 'in', source, status: 'skipped', message: `${domain ?? 'zone'}: refused, this server does not accept DNS pushes`, details: { domain, path } });
+        throw forbidden('This server does not accept DNS pushes; enable them under Clusters > DNS Cluster');
+      }
+      // The outcome is known only once the DNS module has answered; both the
+      // guard router and the import route may call this, so log once.
+      const res = req.res;
+      if (!res || req.clustersImportLogged) return;
+      req.clustersImportLogged = true;
+      res.once('finish', () => {
+        const ok = res.statusCode < 300;
+        try {
+          events.record({ kind: 'dns.receive', direction: 'in', source, status: ok ? 'ok' : 'failed', message: ok ? `${domain ?? 'zone'} serial ${serial ?? '?'} (zone import)` : `${domain ?? 'zone'}: import answered HTTP ${res.statusCode}`, details: { domain, serial, path, status: res.statusCode } });
+        } catch (err) { logger.warn({ err }, 'could not log the zone import'); }
+      });
     },
     overview() {
       events.prune();
@@ -280,20 +358,19 @@ export function createClustersService(ctx) {
       let status = { clusters: [], zones: [] };
       try { status = ctx.dns?.syncStatus?.() ?? status; } catch (err) { logger.warn({ err }, 'dns sync status unavailable'); }
       return {
-        hostname: localHostname(), peers: peers.list(), tokens: tokens.list(), zones: status.zones, roles: PEER_ROLES,
-        settings: { verifyTls: Boolean(S('dns.cluster_verify_tls', true)), autoSync: Boolean(schedule?.enabled), acceptPushes: Boolean(S('clusters.dns.accept_pushes', true)) },
+        hostname: localHostname(), peers: peers.list(), tokens: tokens.list('dns'), zones: status.zones, roles: PEER_ROLES,
+        settings: { verifyTls: Boolean(S('dns.cluster_verify_tls', true)), autoSync: Boolean(schedule?.enabled), acceptPushes: acceptsDnsPushes() },
         schedule: schedule ? { name: schedule.name, cron: schedule.cron, enabled: Boolean(schedule.enabled), nextRunAt: schedule.next_run_at ?? null, lastRunAt: schedule.last_run_at ?? null } : null,
         dnsModule: typeof ctx.dns?.enqueueSync === 'function', bind: Boolean(ctx.capabilities?.has?.('bind')),
-        events: events.recent(15),
+        events: events.recent(15).filter((e) => e.kind === 'peer.test' || e.kind === 'dns.receive'),
       };
     },
     updateSettings(input, req) {
+      // Nothing is written when part of the request cannot be honoured.
+      if (input.autoSync != null && !ctx.scheduler.list().some((x) => x.name === DNS_SYNC_SCHEDULE)) throw new HttpError(501, 'capability_missing', 'The DNS Functions module is not loaded, so there is no synchronisation schedule to toggle');
       if (input.verifyTls != null) settings.set('dns.cluster_verify_tls', Boolean(input.verifyTls));
       if (input.acceptPushes != null) settings.set('clusters.dns.accept_pushes', Boolean(input.acceptPushes));
-      if (input.autoSync != null) {
-        const updated = ctx.scheduler.update(DNS_SYNC_SCHEDULE, { enabled: Boolean(input.autoSync) });
-        if (!updated) throw new HttpError(501, 'capability_missing', 'The DNS Functions module is not loaded, so there is no synchronisation schedule to toggle');
-      }
+      if (input.autoSync != null) ctx.scheduler.update(DNS_SYNC_SCHEDULE, { enabled: Boolean(input.autoSync) });
       audit(req, { action: 'clusters.dns.settings', target: 'dns-cluster', args: input });
       return dns.overview().settings;
     },
@@ -335,7 +412,15 @@ export function createClustersService(ctx) {
 
   const config = {
     groups: () => GROUP_NAMES.map((name) => { const snap = config.snapshot([name]); return { name, ...CONFIG_GROUPS[name], keys: snap.keys, keyCount: snap.keys.length }; }),
-    selectedGroups() { const list = S('clusters.config.groups', GROUP_NAMES); return (Array.isArray(list) ? list : GROUP_NAMES).filter((g) => GROUP_NAMES.includes(g)); },
+    selectedGroups() { const list = S('clusters.config.groups', DEFAULT_GROUPS); return (Array.isArray(list) ? list : DEFAULT_GROUPS).filter((g) => GROUP_NAMES.includes(g)); },
+    // Groups a caller names that this server has not chosen to share. Keys of
+    // such a group are refused on receive and never requested on pull.
+    unsharedGroups(groups) { const shared = new Set(config.selectedGroups()); return [...new Set(groups.filter((g) => !shared.has(g)))]; },
+    assertShared(groups, what) {
+      const unshared = config.unsharedGroups(groups);
+      if (!unshared.length) return;
+      throw new HttpError(422, 'group_not_shared', `This server does not share the ${unshared.join(', ')} group${unshared.length === 1 ? '' : 's'}${what ? ` ${what}` : ''}; it shares ${config.selectedGroups().join(', ') || 'nothing'}. Change the selection under Clusters > Configuration Cluster.`, { groups: unshared.map((g) => `${g}: not shared on this server`) });
+    },
     // The allowlisted keys of the given groups with their current values in
     // the shape that travels (per-host fields stripped). A key whose local
     // value does not fit its own schema is left out rather than exported.
@@ -357,7 +442,8 @@ export function createClustersService(ctx) {
       const selected = config.selectedGroups();
       return {
         hostname: localHostname(), peers: peers.list(), groups: config.groups(), selectedGroups: selected, keyCount: config.snapshot(selected).keys.length,
-        settings: { groups: selected, autoPush: Boolean(S('clusters.config.auto_push', false)), acceptPushes: Boolean(S('clusters.config.accept_pushes', true)), lastPushAt: S('clusters.config.last_push_at', null), lastPullAt: S('clusters.config.last_pull_at', null) },
+        settings: { groups: selected, autoPush: Boolean(S('clusters.config.auto_push', false)), acceptPushes: acceptsConfigPushes(), lastPushAt: S('clusters.config.last_push_at', null), lastPullAt: S('clusters.config.last_pull_at', null) },
+        tokens: tokens.list('config'),
         schedule: schedule ? { name: schedule.name, cron: schedule.cron, enabled: Boolean(schedule.enabled), nextRunAt: schedule.next_run_at ?? null, lastRunAt: schedule.last_run_at ?? null } : null,
         events: events.recent(15).filter((e) => e.kind.startsWith('config.')),
       };
@@ -380,14 +466,17 @@ export function createClustersService(ctx) {
       return { hostname: localHostname(), exportedAt: nowStamp(), groups: list, settings: snap.values };
     },
     // Which of a peer's settings would change here. Rejected keys carry the
-    // reason (not shared, unknown locally, or a value that fails the schema).
+    // reason (not shared at all, group not shared on this server, unknown
+    // locally, or a value that fails the schema).
     diff(remote) {
       const changes = [];
       const rejected = [];
       const rejections = {};
       const reject = (key, reason) => { rejected.push(key); rejections[key] = reason; };
+      const shared = new Set(config.selectedGroups());
       for (const [key, value] of Object.entries(remote || {})) {
         if (!isPushableKey(key)) { reject(key, 'not a shared setting'); continue; }
+        if (!shared.has(groupOfKey(key))) { reject(key, `group_not_shared: the ${groupOfKey(key)} group is not shared on this server`); continue; }
         if (!localExists(key)) { reject(key, 'unknown on this server'); continue; }
         const v = validateIncoming(key, value);
         if (!v.ok) { reject(key, v.reason); continue; }
@@ -435,10 +524,20 @@ export function createClustersService(ctx) {
       const by = (status) => keys.filter((k) => results[k].status === status);
       return { applied: by('applied'), stored: by('stored'), failed: by('failed') };
     },
-    // A peer pushes settings here (Bearer token with the clustering scope).
+    // A peer pushes settings here (Bearer token with the clustering:config
+    // scope). Pushes are opt-in, and a key of a group this server has not
+    // selected refuses the whole push: the sender's job log then names the
+    // group, instead of part of a push silently landing.
     async receive(input, req) {
-      if (!S('clusters.config.accept_pushes', true)) throw forbidden('This server does not accept configuration pushes; enable them under Clusters > Configuration Cluster');
+      if (!acceptsConfigPushes()) throw forbidden('This server does not accept configuration pushes; enable them under Clusters > Configuration Cluster');
       const source = input.source || req?.ip || null;
+      const pushedGroups = Object.keys(input.settings).map(groupOfKey).filter(Boolean);
+      const unshared = config.unsharedGroups(pushedGroups);
+      if (unshared.length) {
+        for (const key of Object.keys(input.settings)) if (unshared.includes(groupOfKey(key))) input.settings[key] = '[rejected]';
+        events.record({ kind: 'config.receive', direction: 'in', source, status: 'skipped', message: `refused: the ${unshared.join(', ')} group${unshared.length === 1 ? ' is' : 's are'} not shared on this server`, details: { groups: input.groups ?? null, unshared, shared: config.selectedGroups() } });
+        config.assertShared(pushedGroups, `that ${source ?? 'a peer'} pushed`);
+      }
       const { changes, rejected, rejections } = config.diff(input.settings);
       // The request audit records the body when the response finishes; a
       // refused value (a URL with credentials, say) must not get there.
@@ -480,7 +579,9 @@ export function createClustersService(ctx) {
             jobCtx.log(`${peer.name}: ${d.applied?.length ?? 0} changed, ${d.unchanged ?? 0} unchanged${d.rejected?.length ? `, rejected ${d.rejected.join(', ')}` : ''}${failed}`, d.failed?.length ? 'warn' : 'info');
             events.record({ clusterId: peer.id, kind: 'config.push', direction: 'out', source, status: d.failed?.length ? 'failed' : 'ok', message: `${d.applied?.length ?? 0} changed, ${d.failed?.length ?? 0} failed, ${d.rejected?.length ?? 0} rejected`, details: { groups: list, keys: snap.keys.length, applied: d.applied ?? [], failed: d.failed ?? [], rejected: d.rejected ?? [], results: d.results ?? null } });
           } else {
-            const msg = res.status === 404 ? 'the peer does not have the Clusters module (upgrade it)' : `HTTP ${res.status}: ${errorOf(res, 'no details')}`;
+            const msg = res.status === 404 ? 'the peer does not have the Clusters module (upgrade it)'
+              : res.body?.error?.code === 'group_not_shared' ? `the peer refused the push: ${errorOf(res, 'a group is not shared there')}`
+                : `HTTP ${res.status}: ${errorOf(res, 'no details')}`;
             summary.failed++; jobCtx.log(`${peer.name}: ${msg}`, 'error');
             events.record({ clusterId: peer.id, kind: 'config.push', direction: 'out', source, status: 'failed', message: msg, details: { groups: list, keys: snap.keys.length } });
           }
@@ -497,6 +598,7 @@ export function createClustersService(ctx) {
     async pull({ clusterId, groups, apply = false }, req) {
       const row = loadPeer(clusterId);
       const list = groups?.length ? groups.filter((g) => GROUP_NAMES.includes(g)) : config.selectedGroups();
+      config.assertShared(list, 'so it cannot pull them');
       const query = `?groups=${encodeURIComponent(list.join(','))}`;
       const fail = (code, message) => {
         events.record({ clusterId: row.id, kind: 'config.pull', direction: 'in', source: row.remote_host, status: 'failed', message });
@@ -522,5 +624,5 @@ export function createClustersService(ctx) {
     },
   };
 
-  return { PEER_ROLES, GROUP_NAMES, CONFIG_GROUPS, CONFIG_KEYS, peers, tokens, events, dns, config, identity, acceptsDnsPushes };
+  return { PEER_ROLES, GROUP_NAMES, DEFAULT_GROUPS, CONFIG_GROUPS, CONFIG_KEYS, peers, tokens, events, dns, config, identity, acceptsDnsPushes, acceptsConfigPushes };
 }

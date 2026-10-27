@@ -1393,6 +1393,7 @@ defineOp('sec.imunify.status', {
 
 defineOp('sec.imunify.scan', {
   description: 'Start an ImunifyAV on-demand scan of a directory',
+  destructive: true,
   schema: z.object({ path: arg.absPath.default('/home'), intensity: z.enum(['low', 'moderate', 'high']).default('moderate') }).strict(),
   run: async ({ path: target, intensity }, ctx) => {
     ctx.assertAllowedPath(target, 'read');

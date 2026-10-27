@@ -38,8 +38,10 @@ export async function register(ctx) {
     wrap((req) => dns().listZones(req.query, req.user)));
   r.post('/zones', requireReseller, validate({ body: z.object({ domain: fields.domain, ip: fields.ip.optional(), template: templateName.optional(), account: fields.username.optional(), ttl: ttl.optional() }).strict() }),
     wrap((req) => dns().createZone(req.body, req.user, req), 201));
+  // Peer pushes land here with an API token; the Clusters category's "accept
+  // pushes" toggle and exchange log apply through its guard when it is loaded.
   r.post('/zones/import', requireRoot, validate({ body: z.object({ domain: fields.domain, body: zoneBody, serial: z.number().int().optional() }).strict() }),
-    wrap((req) => dns().importZone(req.body, req.user, req)));
+    wrap(async (req) => { await ctx.clusters?.dns?.guardImport?.(req); return dns().importZone(req.body, req.user, req); }));
   r.post('/zones/ttl', requireReseller, validate({ body: z.object({ domains: domainList, ttl }).strict() }),
     wrap((req) => dns().setTtlBulk(req.body.domains, req.body.ttl, req.user, req)));
   r.get('/zones/:domain', requireReseller, validate({ params: domainParam }), wrap((req) => dns().getZone(req.params.domain, req.user)));

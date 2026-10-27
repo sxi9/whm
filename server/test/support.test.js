@@ -3,7 +3,10 @@ import crypto from 'node:crypto';
 import request from 'supertest';
 import { catalog } from '@whm/agent';
 import { createTestApp, createMockAgent } from './support/app.js';
-import { generateSshKeyPair, parseOpenSshPrivateKey, sshFingerprint, indexSections, extractSection, utcStamp, sshExpiryTime, authorizedKeyLine } from '../src/services/support.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { REPO_ROOT } from '../src/lib/plugin-sdk.js';
+import { generateSshKeyPair, parseOpenSshPrivateKey, sshFingerprint, indexSections, extractSection, utcStamp, sshExpiryTime, authorizedKeyLine, readDoc } from '../src/services/support.js';
 
 // Runs an op's real agent schema against the mock's arguments so a registration
 // overflow or a malformed key line fails here instead of only on a live host.
@@ -85,6 +88,7 @@ describe('Support API', () => {
   const get = (url) => app.http.get(url);
   const auditRows = (action) => app.ctx.db.prepare('SELECT * FROM audit_log WHERE action = ? ORDER BY id').all(action);
   const refresh = () => app.ctx.capabilities.refresh();
+  const schedule = () => app.ctx.scheduler.list().find((x) => x.name === 'support-access-expiry');
   const host = () => app.ctx.settings.get('basic.hostname') || 'test.example.com';
   // Mirrors the agent: an optional options token precedes the key type.
   const addKey = ({ publicKey }) => {
@@ -130,13 +134,21 @@ describe('Support API', () => {
       expect(d.settings.email).toBe('');
     });
 
-    it('lets a reseller see links and docs but not tickets or grants', async () => {
+    it('lets a reseller see links and the README but not the blueprint, tickets, grants or root-only pages', async () => {
       const res = await reseller.get('/api/support/center');
       expect(res.status).toBe(200);
       expect(res.body.data.tickets).toBeUndefined();
       expect(res.body.data.access).toBeUndefined();
       expect(res.body.data.mail).toBeUndefined();
       expect(res.body.data.settings.email).toBeUndefined();
+      expect(res.body.data.docs.map((d) => d.slug)).toEqual(['readme']);
+      expect(res.body.data.inApp.map((l) => l.key).sort()).toEqual(['api-cpanel', 'dev-docs']);
+      expect(res.body.data.panel.node).toBeUndefined();
+      expect(res.body.data.panel.mode).toBeUndefined();
+      expect((await reseller.get('/api/support/docs')).body.data.map((d) => d.slug)).toEqual(['readme']);
+      expect((await reseller.get('/api/support/docs/readme')).status).toBe(200);
+      expect((await reseller.get('/api/support/docs/blueprint')).status).toBe(403);
+      expect((await reseller.get('/api/support/docs/blueprint?section=1-overview')).status).toBe(403);
       expect((await reseller.get('/api/support/tickets')).status).toBe(403);
       expect((await reseller.get('/api/support/access')).status).toBe(403);
       expect((await reseller.get('/api/support/diagnostics')).status).toBe(403);
@@ -158,6 +170,23 @@ describe('Support API', () => {
       expect((await get('/api/support/docs/blueprint?section=nope')).status).toBe(404);
       expect((await get('/api/support/docs/nope')).status).toBe(404);
       expect((await get('/api/support/docs/..%2F..%2Fetc')).status).toBe(422);
+    });
+
+    it('reuses the parsed section index while the file is unchanged', async () => {
+      const file = path.join(REPO_ROOT, 'README.md');
+      const first = readDoc(file);
+      expect(readDoc(file)).toBe(first);
+      expect(first.sections.length).toBeGreaterThan(0);
+      const tmp = path.join(app.ctx.config.dataDir, 'cache-probe.md');
+      fs.writeFileSync(tmp, '# T\n\n## One\nx\n');
+      const a = readDoc(tmp);
+      expect(a.sections.map((x) => x.slug)).toEqual(['one']);
+      fs.writeFileSync(tmp, '# T\n\n## One\nx\n## Two\ny\n');
+      const b = readDoc(tmp);
+      expect(b).not.toBe(a);
+      expect(b.sections.map((x) => x.slug)).toEqual(['one', 'two']);
+      fs.unlinkSync(tmp);
+      expect(readDoc(tmp)).toBeNull();
     });
 
     it('downloads a diagnostics bundle without secrets', async () => {
@@ -248,6 +277,19 @@ describe('Support API', () => {
       expect((await get(`/api/support/tickets/${res.body.data.id}`)).body.data.snapshot).toBeNull();
     });
 
+    it('omits a snapshot that would not fit instead of storing a truncated one', async () => {
+      const original = app.ctx.system.status;
+      // redact() already bounds strings and arrays, so only a wide map can outgrow the limit.
+      app.ctx.system.status = async () => ({ ...(await original()), counts: Object.fromEntries(Array.from({ length: 600 }, (_, i) => [`k${i}`, 'x'.repeat(400)])) });
+      let res;
+      try { res = await post('/api/support/tickets', { subject: 'Huge', description: 'A ticket whose snapshot is far too large to keep.' }); } finally { app.ctx.system.status = original; }
+      expect(res.status).toBe(201);
+      expect(res.body.data.hasSnapshot).toBe(false);
+      expect((await get(`/api/support/tickets/${res.body.data.id}`)).body.data.snapshot).toBeNull();
+      expect(JSON.parse(auditRows('support.ticket.create').at(-1).args_redacted).snapshot).toMatch(/^omitted:\d+>200000$/);
+      expect((await del(`/api/support/tickets/${res.body.data.id}`)).status).toBe(200);
+    });
+
     it('emails the support address once a transport exists, with Reply-To and the snapshot', async () => {
       eximInstalled = true;
       await refresh();
@@ -294,7 +336,7 @@ describe('Support API', () => {
       expect((await del('/api/support/tickets/999')).status).toBe(404);
       expect((await del(`/api/support/tickets/${ticketId}`)).status).toBe(200);
       expect((await get(`/api/support/tickets/${ticketId}`)).status).toBe(404);
-      expect(auditRows('support.ticket.delete')).toHaveLength(1);
+      expect(auditRows('support.ticket.delete')).toHaveLength(2);
     });
   });
 
@@ -318,8 +360,10 @@ describe('Support API', () => {
       expect(res.status).toBe(501);
       expect(res.body.error).toMatchObject({ code: 'capability_missing', capability: 'sshd' });
       expect(app.agent.callsTo('sec.ssh_keys.add')).toHaveLength(0);
-      expect((await get('/api/support/access/status')).body.data).toMatchObject({ sshd: false, tokens: true, active: [] });
+      expect((await get('/api/support/access/status')).body.data).toMatchObject({ sshd: false, tokens: true, active: [], sshdPolicy: null, scheduleEnabled: false });
       expect((await get('/api/support/access')).body.meta.total).toBe(0);
+      // Nothing to expire, so the five-minute schedule stays off and enqueues nothing.
+      expect(schedule()).toMatchObject({ job_type: 'support.expire_access', cron: '*/5 * * * *', enabled: 0 });
     });
 
     it('issues a token only when SSH is not requested', async () => {
@@ -330,10 +374,20 @@ describe('Support API', () => {
       expect(res.body.data.apiToken.scopes).toEqual(['development:read']);
       expect(res.body.data.grant).toMatchObject({ status: 'active', ssh: null });
       expect(res.body.data.grant.apiToken.prefix).toBe(res.body.data.apiToken.token.slice(0, 12));
+      expect(schedule().enabled).toBe(1);
+      expect((await get('/api/support/access/status')).body.data.scheduleEnabled).toBe(true);
       const revoked = await del(`/api/support/access/${res.body.data.grant.id}`);
       expect(revoked.status).toBe(200);
       expect(revoked.body.data).toMatchObject({ status: 'revoked', endedBy: 'root', cleanup: { api: { expired: true }, ok: true } });
       expect(revoked.body.data.cleanup.ssh).toBeUndefined();
+      expect(schedule().enabled).toBe(0);
+    });
+
+    it('converges the schedule flag at boot to whether live grants exist', async () => {
+      app.ctx.scheduler.update('support-access-expiry', { enabled: true });
+      expect(schedule().enabled).toBe(1);
+      expect(app.ctx.support.syncSchedule()).toBe(false);
+      expect(schedule().enabled).toBe(0);
     });
 
     it('authorizes a fresh key for root and issues a token, both shown once', async () => {
@@ -401,6 +455,42 @@ describe('Support API', () => {
       expect((await get('/api/support/access')).body.meta.total).toBe(2);
     });
 
+    it('refuses SSH access while sshd would reject a root key, and says where to fix it', async () => {
+      const before = app.agent.callsTo('sec.ssh_keys.add').length;
+      for (const effective of [{ permitrootlogin: 'no' }, { permitrootlogin: 'forced-commands-only' }, { permitrootlogin: 'prohibit-password', pubkeyauthentication: 'no' }]) {
+        app.agent.set('sec.sshd.get', () => ({ installed: true, source: 'sshd -T', effective, managed: {}, shadowed: [] }));
+        const res = await post('/api/support/access', { label: 'hardened', hours: 1 });
+        expect(res.status).toBe(422);
+        expect(res.body.error.fields.ssh[0]).toMatch(/SSH Password Authorization Tweak/);
+        const status = (await get('/api/support/access/status')).body.data;
+        expect(status.sshdPolicy).toMatchObject({ known: true, allowsRootKey: false, fix: { path: '/security-center/ssh-password-authorization-tweak' } });
+        expect(status.sshdDetail).toMatch(/cannot log in/);
+      }
+      expect(app.agent.callsTo('sec.ssh_keys.add')).toHaveLength(before);
+      expect((await get('/api/support/access')).body.meta.total).toBe(2);
+      // A token-only grant is still fine on such a host.
+      const tokenOnly = await post('/api/support/access', { label: 'hardened-token', hours: 1, ssh: false });
+      expect(tokenOnly.status).toBe(201);
+      expect((await del(`/api/support/access/${tokenOnly.body.data.grant.id}`)).status).toBe(200);
+      app.agent.set('sec.sshd.get', () => ({ installed: true, source: 'sshd -T', effective: { permitrootlogin: 'prohibit-password', pubkeyauthentication: 'yes' }, managed: {}, shadowed: [] }));
+      const status = (await get('/api/support/access/status')).body.data;
+      expect(status.sshdPolicy).toMatchObject({ known: true, allowsRootKey: true, permitRootLogin: 'prohibit-password', detail: null });
+      expect(status.sshdDetail).toBeNull();
+      // An unreadable sshd config does not block the grant but is reported.
+      agentFail('sec.sshd.get', 'command_failed', 'sshd -T exploded');
+      expect((await get('/api/support/access/status')).body.data.sshdPolicy).toMatchObject({ known: false, allowsRootKey: true });
+      app.agent.set('sec.sshd.get', () => ({ installed: true, source: 'sshd -T', effective: { permitrootlogin: 'prohibit-password' }, managed: {}, shadowed: [] }));
+    });
+
+    it('will not extend its own time box: a support token cannot grant access', async () => {
+      const viaToken = await request(app.ctx.app).post('/api/support/access').set('Authorization', `Bearer ${tokenSecret}`).send({ label: 'escalate', hours: 1, apiToken: false });
+      expect(viaToken.status).toBe(403);
+      expect(viaToken.body.error.message).toMatch(/cannot be granted from an API token/);
+      expect(authorized).toEqual([grant.ssh.fingerprint]);
+      expect((await get('/api/support/access')).body.meta.total).toBe(3);
+      expect(auditRows('support.access.grant').some((r) => r.target.endsWith(':escalate'))).toBe(false);
+    });
+
     it('revokes early: key removed, token expired, audited', async () => {
       const res = await del(`/api/support/access/${grant.id}`);
       expect(res.status).toBe(200);
@@ -408,7 +498,8 @@ describe('Support API', () => {
       expect(authorized).toEqual([]);
       const viaToken = await request(app.ctx.app).get('/api/system/status').set('Authorization', `Bearer ${tokenSecret}`);
       expect(viaToken.status).toBe(401);
-      expect(auditRows('support.access.revoke')).toHaveLength(2);
+      expect(auditRows('support.access.revoke')).toHaveLength(3);
+      expect(schedule().enabled).toBe(0);
       expect((await del(`/api/support/access/${grant.id}`)).status).toBe(409);
       expect((await del('/api/support/access/999')).status).toBe(404);
     });
@@ -434,6 +525,7 @@ describe('Support API', () => {
       expect((await get(`/api/support/access/${c.body.data.grant.id}`)).body.data.status).toBe('active');
       expect(authorized).toEqual([c.body.data.ssh.fingerprint]);
       expect(auditRows('support.access.expire')).toHaveLength(2);
+      expect(schedule().enabled).toBe(1);
 
       const list = await get('/api/support/access?status=expired');
       expect(list.body.meta.total).toBe(2);
@@ -447,7 +539,7 @@ describe('Support API', () => {
       expect(authorized).toEqual([]);
       const row = auditRows('support.access.expire').at(-1);
       expect(row.principal).toBe('scheduler');
-      expect(app.ctx.scheduler.list().find((s) => s.name === 'support-access-expiry')).toMatchObject({ job_type: 'support.expire_access', cron: '*/5 * * * *' });
+      expect(schedule()).toMatchObject({ job_type: 'support.expire_access', cron: '*/5 * * * *', enabled: 0 });
     });
 
     it('keeps a grant live while the root key cannot be removed, retries it and ends it once the host is clean', async () => {
@@ -462,6 +554,8 @@ describe('Support API', () => {
       expect(res.body.data.endedAt).toBeTruthy();
       expect(authorized).toEqual([fingerprint]);
       expect(auditRows('support.access.revoke').at(-1).result).toBe('partial');
+      const auditedSoFar = auditRows('support.access.revoke').length;
+      expect(schedule().enabled).toBe(1);
       // Surfaced everywhere an admin looks, and still counted as live for other categories.
       expect((await get('/api/support/access/status')).body.data.cleanupPending.map((x) => x.id)).toEqual([id]);
       expect((await get('/api/support/center')).body.data.access).toMatchObject({ cleanupPending: [expect.objectContaining({ id })], active: [] });
@@ -477,7 +571,9 @@ describe('Support API', () => {
       expect(retry.grants[0]).toMatchObject({ id, status: 'cleanup_pending', cleanup: { ssh: { code: 'capability_missing' }, pending: 'revoked', attempts: 2 } });
       expect(tokenRow().expires_at).toBe(tokenExpiry);
       expect(authorized).toEqual([fingerprint]);
-      expect(auditRows('support.access.revoke').at(-1)).toMatchObject({ principal: 'scheduler', result: 'partial' });
+      // A retry that fails again is recorded on the row, not as another audit entry.
+      expect(auditRows('support.access.revoke')).toHaveLength(auditedSoFar);
+      expect(schedule().enabled).toBe(1);
 
       // Once the agent answers again the key goes and the grant ends with the status that was asked for.
       app.agent.set('sec.ssh_keys.remove', realSchema('sec.ssh_keys.remove', removeKey));
@@ -487,7 +583,9 @@ describe('Support API', () => {
       expect(run.body.data.grants[0]).toMatchObject({ id, status: 'revoked', cleanupPending: false, pendingStatus: null, endedBy: 'root', cleanup: { ssh: { removed: 1 }, api: { expired: true }, ok: true, attempts: 3 } });
       expect(authorized).toEqual([]);
       expect((await get('/api/support/access/status')).body.data.cleanupPending).toEqual([]);
-      expect(auditRows('support.access.revoke').at(-1).result).toBe('ok');
+      expect(auditRows('support.access.revoke')).toHaveLength(auditedSoFar + 1);
+      expect(auditRows('support.access.revoke').at(-1)).toMatchObject({ principal: 'root', result: 'ok' });
+      expect(schedule().enabled).toBe(0);
       expect((await del(`/api/support/access/${id}`)).status).toBe(409);
     });
 

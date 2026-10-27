@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
@@ -14,6 +14,9 @@ import { describePermission, PERMISSION_DESCRIPTIONS } from '../src/pages/cpanel
 import { DEFAULT_BRANDING, logoSrc } from '../src/pages/cpanel/branding.js';
 
 React.useLayoutEffect = React.useEffect;
+
+// Modify News adapts its audience choices to the signed-in role.
+vi.mock('../src/auth/AuthContext.jsx', () => ({ useAuth: () => ({ user: { id: 1, username: 'root', role: 'root' } }) }));
 
 const render = (el) => renderToStaticMarkup(<ToastProvider><ConfirmProvider><MemoryRouter>{el}</MemoryRouter></ConfirmProvider></ToastProvider>);
 
@@ -38,9 +41,9 @@ describe('cPanel pages', () => {
     expect(describePermission('made:up').sensitive).toBe(true);
   });
 
-  it('prefers an inline logo over the API url and has sane defaults', () => {
-    expect(logoSrc({ logo: { url: '/api/branding/logo?v=1', dataUrl: 'data:image/png;base64,AA' } })).toBe('data:image/png;base64,AA');
-    expect(logoSrc({ logo: { url: '/api/branding/logo?v=1' } })).toBe('/api/branding/logo?v=1');
+  it('uses the public logo url (no inline bytes) and has sane defaults', () => {
+    expect(logoSrc({ logo: { url: '/api/branding/logo?v=1', mime: 'image/png', size: 72 } })).toBe('/api/branding/logo?v=1');
+    expect(logoSrc({ logo: null })).toBeNull();
     expect(logoSrc(null)).toBeNull();
     expect(DEFAULT_BRANDING).toMatchObject({ companyName: 'WHM', tagline: 'WebHost Manager', logo: null });
   });

@@ -132,7 +132,7 @@ export default function Customization({ fn }) {
               <Field label="Support URL"><TextInput value={draft.supportUrl} onChange={set('supportUrl')} placeholder="https://support.example.com/tickets" type="url" /></Field>
             </div>
           </Card>
-          <Card title="Login page notice" subtitle="Plain text or simple Markdown shown above the login form, for example a legal or acceptable-use notice">
+          <Card title="Login page notice" subtitle="Plain text or simple Markdown shown above the login form, for example a legal or acceptable-use notice. Like the company name, logo and favicon it is served to anyone who opens the login page.">
             <Textarea value={draft.loginNotice} onChange={set('loginNotice')} rows={4} maxLength={2000} placeholder="Authorised administrators only. All activity is logged." />
           </Card>
           <div className="sticky-actions">

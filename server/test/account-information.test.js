@@ -165,6 +165,15 @@ describe('Account Information API', () => {
       } finally { app.ctx.db.prepare('UPDATE accounts SET disk_used_mb = 10 WHERE username = ?').run('bob'); }
     });
 
+    it('does not register the quota capability itself (Server Configuration owns it)', async () => {
+      // The owner's binary list includes quotaoff; a competing registration from
+      // this category would silently replace it with a shorter list.
+      const quota = app.ctx.capabilities.snapshot().capabilities.quota;
+      expect(quota).toBeTruthy();
+      expect(Object.keys(quota.binaries)).toEqual(expect.arrayContaining(['setquota', 'repquota', 'quotacheck', 'quotaon', 'quotaoff']));
+      expect(quota.installed).toBe(false);
+    });
+
     it('reports 501 for the system quota report when quota tools are missing', async () => {
       const res = await get('/quota/report').expect(501);
       expect(res.body.error).toMatchObject({ code: 'capability_missing', capability: 'quota' });

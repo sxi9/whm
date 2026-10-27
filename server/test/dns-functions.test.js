@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
 import { parseZone, renderZone, normalizeRecord, nextSerial, quoteTxt, checkConflicts } from '../src/services/dns-zonefile.js';
-import { CapabilityError } from '../src/lib/errors.js';
+import http from 'node:http';
+import { CapabilityError, HttpError } from '../src/lib/errors.js';
 
 // A mock agent that behaves like a host with BIND installed: named-checkzone
 // passes, writes succeed and every call is recorded for assertions.
@@ -622,6 +623,102 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
     expect(imported.body.data.domain).toBe('peerzone.net');
     expect(imported.body.data.records.length).toBeGreaterThan(0);
     await post('/zones/import', { domain: 'peerzone.net', body: 'garbage' }).expect(422);
+  });
+
+  it('runs the Clusters import guard before a zone import and returns its error as-is', async () => {
+    const text = app.ctx.dns.renderZoneText('bob.com').replace(/bob\.com/g, 'guarded.net');
+    const saved = app.ctx.clusters;
+    const calls = [];
+    app.ctx.clusters = { dns: { guardImport(req) { calls.push(req.body.domain); throw new HttpError(403, 'forbidden', 'This server does not accept DNS pushes'); } } };
+    try {
+      const refused = await post('/zones/import', { domain: 'guarded.net', body: text, serial: 3 }).expect(403);
+      expect(refused.body.error).toMatchObject({ code: 'forbidden', message: /does not accept DNS pushes/ });
+      expect(calls).toEqual(['guarded.net']);
+      expect(app.ctx.dns.zoneExists('guarded.net')).toBe(false);
+      app.ctx.clusters = { dns: { guardImport(req) { calls.push(req.body.domain); } } };
+      await post('/zones/import', { domain: 'guarded.net', body: text, serial: 3 }).expect(200);
+      expect(calls).toEqual(['guarded.net', 'guarded.net']);
+      app.ctx.clusters = undefined;
+      await post('/zones/import', { domain: 'guarded.net', body: text, serial: 4 }).expect(200);
+    } finally { app.ctx.clusters = saved; }
+  });
+
+  describe('cluster push endpoints', () => {
+    const received = [];
+    const state = { ping: true, status: 200 };
+    let server;
+    let port;
+    beforeAll(async () => {
+      server = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => { body += c; });
+        req.on('end', () => {
+          received.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: body ? JSON.parse(body) : null });
+          const send = (code, payload) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(payload)); };
+          if (req.headers.authorization !== 'Bearer peer-secret') return send(401, { error: { code: 'unauthorized', message: 'Invalid API token' } });
+          if (req.url === '/api/clusters/ping') return state.ping ? send(200, { data: { hostname: 'peer.example.com', accepts: { dns: true, config: false } } }) : send(404, { error: { code: 'not_found', message: 'No such API endpoint' } });
+          if (req.url === '/api/clusters/dns/receive' && req.method === 'POST') return state.ping ? send(state.status, state.status === 200 ? { data: { domain: received.at(-1).body.domain, serial: received.at(-1).body.serial } } : { error: { code: 'boom', message: 'receiver exploded' } }) : send(404, { error: { code: 'not_found', message: 'No such API endpoint' } });
+          if (req.url === '/api/dns/zones/import' && req.method === 'POST') return send(200, { data: { domain: received.at(-1).body.domain } });
+          send(404, { error: { code: 'not_found', message: 'No such API endpoint' } });
+        });
+      });
+      port = await new Promise((r) => server.listen(0, '127.0.0.1', () => r(server.address().port)));
+      app.ctx.db.prepare('DELETE FROM dns_clusters').run();
+      app.ctx.db.prepare("INSERT INTO dns_clusters (name, remote_host, api_token_enc, role) VALUES ('fake', ?, ?, 'write-only')").run(`http://127.0.0.1:${port}`, app.ctx.crypto.encrypt('peer-secret'));
+      app.ctx.jobs.start();
+    });
+    afterAll(async () => { app.ctx.jobs.stop(); await new Promise((r) => server.close(r)); });
+    beforeEach(() => { received.length = 0; });
+
+    const sync = async (body) => { const res = await post('/sync', body).expect(202); return waitForJob(app.ctx, res.body.data.job.id, 20000); };
+
+    it('prefers /api/clusters/dns/receive when the peer answers /api/clusters/ping, probing once per peer', async () => {
+      const job = await sync({ domains: ['bob.com', 'peerzone.net'] });
+      expect(job.status).toBe('done');
+      expect(job.result).toMatchObject({ peers: 1, zones: 2, ok: 2, failed: 0, endpoints: { fake: '/api/clusters/dns/receive' } });
+      expect(received.filter((r) => r.url === '/api/clusters/ping')).toHaveLength(1);
+      const pushes = received.filter((r) => r.method === 'POST');
+      expect(pushes.map((r) => r.url)).toEqual(['/api/clusters/dns/receive', '/api/clusters/dns/receive']);
+      expect(pushes[0]).toMatchObject({ auth: 'Bearer peer-secret', body: { domain: 'bob.com', serial: expect.any(Number), source: expect.any(String) } });
+      expect(pushes[0].body.body).toContain('$ORIGIN bob.com.');
+      const status = await get('/sync').expect(200);
+      expect(status.body.data.zones.find((z) => z.domain === 'bob.com')).toMatchObject({ cluster: 'fake', status: 'ok', endpoint: '/api/clusters/dns/receive', stale: false });
+    });
+
+    it('falls back to /api/dns/zones/import on a peer without the cluster endpoints', async () => {
+      state.ping = false;
+      const job = await sync({ domains: ['bob.com'] });
+      expect(job.result).toMatchObject({ ok: 1, failed: 0, endpoints: { fake: '/api/dns/zones/import' } });
+      expect(received.map((r) => r.url)).toEqual(['/api/clusters/ping', '/api/dns/zones/import']);
+      expect(received[1].body).toEqual({ domain: 'bob.com', body: expect.stringContaining('$ORIGIN bob.com.'), serial: expect.any(Number) });
+      expect(job.logs.some((l) => /pushing via \/api\/dns\/zones\/import/.test(l.line))).toBe(true);
+      const status = await get('/sync').expect(200);
+      expect(status.body.data.zones.find((z) => z.domain === 'bob.com')).toMatchObject({ status: 'ok', endpoint: '/api/dns/zones/import' });
+      state.ping = true;
+    });
+
+    it('drops to /api/dns/zones/import for the rest of the run when a cluster-aware peer lacks the receiver', async () => {
+      state.status = 404;
+      const job = await sync({ domains: ['bob.com', 'peerzone.net'] });
+      expect(job.result).toMatchObject({ ok: 2, failed: 0, endpoints: { fake: '/api/dns/zones/import' } });
+      expect(received.map((r) => r.url)).toEqual(['/api/clusters/ping', '/api/clusters/dns/receive', '/api/dns/zones/import', '/api/dns/zones/import']);
+      expect(received[2].body).not.toHaveProperty('source');
+      expect((await get('/sync').expect(200)).body.data.zones.filter((z) => z.cluster === 'fake').map((z) => z.endpoint)).toEqual(['/api/dns/zones/import', '/api/dns/zones/import']);
+      state.status = 200;
+    });
+
+    it('records a failed push with the peer error and skips acknowledged zones on a scheduled run', async () => {
+      state.status = 500;
+      const job = await sync({ domains: ['bob.com'] });
+      expect(job.result).toMatchObject({ ok: 0, failed: 1 });
+      expect((await get('/sync').expect(200)).body.data.zones.find((z) => z.domain === 'bob.com')).toMatchObject({ status: 'failed', message: 'receiver exploded', endpoint: '/api/clusters/dns/receive' });
+      state.status = 200;
+      await sync({ domains: ['bob.com'] });
+      received.length = 0;
+      const job2 = await waitForJob(app.ctx, app.ctx.jobs.enqueue('dns.sync', {}, {}).id, 20000);
+      expect(job2.result.skipped).toBeGreaterThanOrEqual(1);
+      expect(received.filter((r) => r.body?.domain === 'bob.com')).toHaveLength(0);
+    });
   });
 
   it('imports zone files already on disk into the database', async () => {

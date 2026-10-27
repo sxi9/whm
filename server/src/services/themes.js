@@ -8,14 +8,18 @@ import { isRoot } from '../middleware/rbac.js';
 //   themes.defaultSlug()                 -> theme the panel shows when a user has no override
 //   themes.accountDefault()              -> theme recorded for new hosting accounts when their package's theme is disabled/missing
 //   themes.resolve(slug)                 -> { slug, name, base, variables, css } or null
-//   themes.resolveForPackage(pkg)        -> slug for a package row ({ theme }) falling back to the account default
-//   themes.accountDefaultApplied()       -> true once core's packages.snapshot() resolves theme through resolveForPackage
-//                                           (integration-contracts §22); false while new accounts still record the package theme verbatim
+//   themes.resolveForPackage(pkg)        -> slug for a package row ({ theme }) falling back to the account default;
+//                                           core's packages.snapshot() records this in new accounts (integration-contracts §22)
 //   themes.slugs()                       -> every enabled theme slug
+//   themes.isEnabledSlug(slug)           -> true when slug names an enabled theme (packages.theme validation)
 //   themes.activeFor(user)               -> what the browser applies for that user
 // Uploaded CSS overrides live under $WHM_DATA_DIR/themes/<slug>.css.
+// `tweak.login_theme` (Tweak Settings) predates this table and is not consulted: the login
+// screen paints the last active theme cached in the browser. It is kept only as a legacy key.
 
 export const SLUG_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+// Route segments under /api/themes that would shadow a theme record of the same name.
+export const RESERVED_SLUGS = new Set(['active', 'variables', 'packages', 'preference', 'config']);
 export const BASES = ['light', 'dark'];
 export const MAX_CSS_BYTES = 256 * 1024;
 
@@ -170,9 +174,13 @@ export function createThemesService(ctx) {
     }
   }
 
+  // The stock built-in theme keeps the pre-themes behaviour of following the OS colour scheme;
+  // every other theme pins its base.
+  const schemeOf = (row) => (row.builtin && row.slug === 'jupiter' ? 'auto' : row.base);
+
   function shape(row, { withCss = false } = {}) {
     const out = {
-      slug: row.slug, name: row.name, base: row.base, builtin: Boolean(row.builtin), enabled: Boolean(row.enabled),
+      slug: row.slug, name: row.name, base: row.base, scheme: schemeOf(row), builtin: Boolean(row.builtin), enabled: Boolean(row.enabled),
       copiedFrom: row.copied_from ?? null, variables: json.parse(row.variables_json, {}),
       hasCss: Boolean(row.css_file), cssBytes: row.css_bytes ?? 0,
       isDefault: row.slug === defaultSlug(), isAccountDefault: row.slug === accountDefault(),
@@ -186,34 +194,21 @@ export function createThemesService(ctx) {
   const load = (slug) => { const row = stmts.bySlug.get(slug); if (!row) throw notFound(`Theme "${slug}"`); return row; };
   const assertEditable = (row) => { if (row.builtin) throw conflict(`"${row.slug}" is a built-in theme and cannot be changed; copy it to customise`); };
 
-  // packages.snapshot() is core-owned; whether it routes the theme through resolveForPackage
-  // is observed rather than assumed, so the UI never claims the account default is applied
-  // before the hook exists. snapshot() is read-only, so probing an existing package is safe.
-  let probeHits = 0;
-  function accountDefaultApplied() {
-    if (typeof ctx.packages?.snapshot !== 'function') return false;
-    const sample = stmts.packageList.all()[0];
-    if (!sample) return null;
-    probeHits = 0;
-    try { ctx.packages.snapshot(sample.name); } catch { return false; }
-    return probeHits > 0;
-  }
-  const meta = () => ({ default: defaultSlug(), accountDefault: accountDefault(), accountDefaultApplied: accountDefaultApplied(), allowUserOverride: allowUserOverride() });
+  const meta = () => ({ default: defaultSlug(), accountDefault: accountDefault(), allowUserOverride: allowUserOverride() });
 
   const service = {
     defaultSlug,
     accountDefault,
-    accountDefaultApplied,
     allowUserOverride,
     slugs: () => stmts.all.all().filter((r) => r.enabled).map((r) => r.slug),
+    isEnabledSlug: (slug) => typeof slug === 'string' && Boolean(stmts.bySlug.get(slug)?.enabled),
     catalog: () => VARIABLE_CATALOG,
     resolve(slug) {
       const row = slug ? stmts.bySlug.get(slug) : null;
       if (!row) return null;
-      return { slug: row.slug, name: row.name, base: row.base, variables: json.parse(row.variables_json, {}), css: readCss(row) };
+      return { slug: row.slug, name: row.name, base: row.base, scheme: schemeOf(row), variables: json.parse(row.variables_json, {}), css: readCss(row) };
     },
     resolveForPackage(pkg) {
-      probeHits++;
       const slug = pkg?.theme;
       const row = slug ? stmts.bySlug.get(slug) : null;
       return row?.enabled ? row.slug : accountDefault();
@@ -226,7 +221,9 @@ export function createThemesService(ctx) {
     },
     get(slug) { return shape(load(slug), { withCss: true }); },
 
-    // What the browser applies on load: the user's own choice when overrides are allowed, else the default.
+    // What the browser applies on load: the user's own choice when overrides are allowed, else the
+    // default. `preference` is only the stored choice when it is what gets applied; a stored choice
+    // that is ignored (overrides disabled, theme disabled) is reported as `ignoredPreference`.
     activeFor(user) {
       const pref = user?.id ? stmts.prefOf.get(user.id)?.theme ?? null : null;
       let row = null;
@@ -237,10 +234,12 @@ export function createThemesService(ctx) {
       }
       row ||= stmts.bySlug.get(defaultSlug()) ?? stmts.bySlug.get('jupiter') ?? stmts.all.all()[0];
       if (!row) throw notFound('Theme');
-      return { slug: row.slug, name: row.name, base: row.base, variables: json.parse(row.variables_json, {}), css: readCss(row), source, preference: pref, ...meta() };
+      const applied = source === 'user';
+      return { slug: row.slug, name: row.name, base: row.base, scheme: schemeOf(row), variables: json.parse(row.variables_json, {}), css: readCss(row), source, preference: applied ? pref : null, ignoredPreference: !applied && pref ? pref : null, ...meta() };
     },
 
     create({ slug, name, base, variables, copyFrom }, req) {
+      if (RESERVED_SLUGS.has(slug)) throw unprocessable(`"${slug}" is reserved`, { slug: ['Pick another slug'] });
       if (stmts.bySlug.get(slug)) throw conflict(`A theme with slug "${slug}" already exists`);
       const src = copyFrom ? load(copyFrom) : null;
       const vars = validateVariables({ ...(src ? json.parse(src.variables_json, {}) : {}), ...(variables ?? {}) });

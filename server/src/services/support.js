@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { json, paginate } from '../db/index.js';
-import { notFound, unprocessable, conflict, CapabilityError, HttpError } from '../lib/errors.js';
+import { notFound, unprocessable, conflict, forbidden, CapabilityError, HttpError } from '../lib/errors.js';
 import { redact } from '../middleware/audit.js';
 import { REPO_ROOT } from '../lib/plugin-sdk.js';
 
@@ -28,9 +28,21 @@ export const SUPPORT_LINKS = [
   { key: 'api', label: 'API documentation', url: 'https://api.docs.cpanel.net/', description: 'WHM API 1, UAPI and cPanel API 2 references.' },
 ];
 
+// The blueprint describes the privilege-separation design and allowed roots,
+// so it is root-only; resellers get the operating README.
 const DOCS = [
-  { slug: 'readme', title: 'README', file: 'README.md', summary: 'Installing, running and operating this panel.' },
-  { slug: 'blueprint', title: 'Blueprint (design of record)', file: 'BLUEPRINT.md', summary: 'Architecture, data model, security model and the specification of every function.' },
+  { slug: 'readme', title: 'README', file: 'README.md', summary: 'Installing, running and operating this panel.', roles: ['root', 'reseller'] },
+  { slug: 'blueprint', title: 'Blueprint (design of record)', file: 'BLUEPRINT.md', summary: 'Architecture, data model, security model and the specification of every function.', roles: ['root'] },
+];
+const docVisible = (d, user) => d.roles.includes(user?.role === 'root' ? 'root' : 'reseller');
+// Each in-app link names the lowest role whose sidebar carries the page.
+const IN_APP_LINKS = [
+  { key: 'api', label: 'OpenAPI reference (WHM)', path: '/development/openapi-documentation-for-whm', description: 'Every endpoint of this panel with roles and parameters.', role: 'root' },
+  { key: 'api-cpanel', label: 'OpenAPI reference (cPanel subset)', path: '/development/openapi-documentation-for-cpanel', description: 'The account-scoped subset resellers may call.', role: 'reseller' },
+  { key: 'dev-docs', label: 'Developer documentation', path: '/development/developer-documentation', description: 'Design documents and the plugin manifest contract.', role: 'reseller' },
+  { key: 'audit', label: 'Audit log', path: '/audit-log', description: 'Every privileged action taken through the panel.', role: 'root' },
+  { key: 'status', label: 'Server status', path: '/server-status/server-information', description: 'Live hardware, load and capacity.', role: 'root' },
+  { key: 'contacts', label: 'Contact Manager', path: '/server-contacts/contact-manager', description: 'Where ticket email leaves from (Exim or SMTP relay).', role: 'root' },
 ];
 const DOC_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,80}$/;
 const EMAIL_RE = /^[A-Za-z0-9_][A-Za-z0-9._%+-]*@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$/;
@@ -56,6 +68,21 @@ export function extractSection(text, slug) {
   const next = sections.slice(idx + 1).find((s) => s.level <= sections[idx].level);
   const lines = text.split('\n');
   return `${lines.slice(sections[idx].line - 1, next ? next.line - 1 : lines.length).join('\n').trim()}\n`;
+}
+
+// Section indexes are reused while the file on disk is unchanged (same size
+// and mtime), so the Support Center does not re-scan the blueprint per request.
+const docCache = new Map();
+export function readDoc(file) {
+  let stat;
+  try { stat = fs.statSync(file); } catch { docCache.delete(file); return null; }
+  const key = `${stat.size}:${stat.mtimeMs}`;
+  const hit = docCache.get(file);
+  if (hit && hit.key === key) return hit;
+  const text = fs.readFileSync(file, 'utf8');
+  const entry = { key, text, sections: indexSections(text), size: stat.size, updatedAt: stat.mtime.toISOString() };
+  docCache.set(file, entry);
+  return entry;
 }
 
 // ------------------------------------------------------------- SSH key pair ---
@@ -122,6 +149,10 @@ export const sshExpiryTime = (value) => {
 export const authorizedKeyLine = (publicKey, expiresAt) => `expiry-time="${sshExpiryTime(expiresAt)}" ${publicKey}`;
 export const hostTimeZone = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || null; } catch { return null; } };
 const SNAPSHOT_MAX = 200_000;
+const SNAPSHOT_MAX_SERVICES = 200;
+// sshd refuses a root key under these PermitRootLogin values whatever the
+// authorized_keys file says; 'prohibit-password'/'without-password' allow keys.
+const ROOT_KEY_BLOCKED = new Set(['no', 'forced-commands-only']);
 const LIVE = "status IN ('active', 'cleanup_pending')";
 
 export function createSupportService(ctx) {
@@ -196,7 +227,7 @@ export function createSupportService(ctx) {
       disks: (s.disks || []).map((d) => ({ mountpoint: d.mountpoint, filesystem: d.filesystem, sizeBytes: d.sizeBytes, usedBytes: d.usedBytes, usedPercent: d.usedPercent })),
       counts: status.counts,
       capabilities: status.capabilities,
-      services: (status.services || []).map((x) => ({ name: x.name, unit: x.unit ?? null, installed: x.installed, active: x.active, state: x.state })),
+      services: (status.services || []).slice(0, SNAPSHOT_MAX_SERVICES).map((x) => ({ name: x.name, unit: x.unit ?? null, installed: x.installed, active: x.active, state: x.state })),
       jobs: { failedRecently: stmts.failedJobs.all().slice(0, 10).map((j) => ({ id: j.id, type: j.type, errorCode: j.error_code, finishedAt: j.finished_at })) },
     };
     return redact(out);
@@ -231,7 +262,7 @@ export function createSupportService(ctx) {
       `Support ticket ${t.reference}`, '',
       `Subject:   ${t.subject}`, `Severity:  ${t.severity}`, `Category:  ${t.category}`, `Opened by: ${t.created_by || 'root'}`, `Reply to:  ${t.contact_email || '(none given)'}`,
       `Host:      ${snap?.hostname || ctx.settings.get('basic.hostname') || '-'}`, '', 'Description', '-----------', t.description, '',
-      'System snapshot (redacted)', '--------------------------', JSON.stringify(snap, null, 2), '',
+      'System snapshot (redacted)', '--------------------------', snap ? JSON.stringify(snap, null, 2) : '(not included)', '',
     ];
     return lines.join('\n');
   }
@@ -253,6 +284,18 @@ export function createSupportService(ctx) {
     }
   }
 
+  // A snapshot is stored whole or not at all: a truncated JSON document would
+  // read back as null while the ticket still claimed to carry one.
+  async function serializeSnapshot(wanted) {
+    if (!wanted) return { snapshotJson: null, snapshot: 'skipped' };
+    const text = JSON.stringify(await snapshot());
+    if (text.length > SNAPSHOT_MAX) {
+      logger?.warn({ bytes: text.length, max: SNAPSHOT_MAX }, 'support ticket snapshot omitted: too large');
+      return { snapshotJson: null, snapshot: `omitted:${text.length}>${SNAPSHOT_MAX}` };
+    }
+    return { snapshotJson: text, snapshot: 'included' };
+  }
+
   const tickets = {
     list(query) {
       const where = [];
@@ -264,8 +307,7 @@ export function createSupportService(ctx) {
     },
     get(id) { return shapeTicket(loadTicket(id), { withSnapshot: true }); },
     async create(input, user, req) {
-      const snap = input.includeSnapshot === false ? null : await snapshot();
-      const snapshotJson = snap ? JSON.stringify(snap).slice(0, SNAPSHOT_MAX) : null;
+      const { snapshotJson, snapshot: snapshotState } = await serializeSnapshot(input.includeSnapshot !== false);
       let reference = ticketReference();
       let id;
       for (let attempt = 0; ; attempt++) {
@@ -280,7 +322,7 @@ export function createSupportService(ctx) {
       const row = stmts.ticketById.get(id);
       const delivery = await deliverTicket(row, req);
       stmts.setDelivery.run({ id, status: delivery.status, detail: delivery.detail, to: delivery.to, at: delivery.status === 'sent' ? utcStamp(Date.now()) : null });
-      audit(req, { action: 'support.ticket.create', target: reference, args: { subject: input.subject, severity: input.severity, category: input.category, snapshot: Boolean(snap), delivery: delivery.status } });
+      audit(req, { action: 'support.ticket.create', target: reference, args: { subject: input.subject, severity: input.severity, category: input.category, snapshot: snapshotState, delivery: delivery.status } });
       return shapeTicket(stmts.ticketById.get(id));
     },
     async resend(id, req) {
@@ -376,10 +418,37 @@ export function createSupportService(ctx) {
       if (!cleanup.ok) logger?.warn({ grant: row.id, cleanup }, 'support access ended; API token cleanup incomplete');
     } else {
       stmts.pendGrant.run({ id: row.id, ended_by: by, cleanup: JSON.stringify({ ...cleanup, pending: status, attempts, lastAttemptAt: utcStamp(Date.now()) }) });
-      audit(req, { action: `support.access.${kind}`, target: `${row.id}:${row.label}`, args: { fingerprint: row.ssh_fingerprint, apiCredentialId: row.api_token_id, cleanup, attempts, pending: status }, result: 'partial' });
+      // Only the transition into cleanup_pending is audited; each retry is
+      // recorded in cleanup_json and the job log, not as another audit row.
+      if (row.status !== 'cleanup_pending') audit(req, { action: `support.access.${kind}`, target: `${row.id}:${row.label}`, args: { fingerprint: row.ssh_fingerprint, apiCredentialId: row.api_token_id, cleanup, attempts, pending: status }, result: 'partial' });
       logger?.warn({ grant: row.id, cleanup, attempts }, 'support access cleanup pending: root SSH key still authorized, will retry');
     }
+    syncSchedule();
     return shapeGrant(stmts.grantById.get(row.id));
+  }
+
+  // The expiry schedule runs only while there is a live grant to end, so an
+  // install that never grants access never accumulates no-op job rows.
+  function syncSchedule() {
+    const live = stmts.liveGrants.all().length > 0;
+    try { ctx.scheduler.update(SCHEDULE_EXPIRE, { enabled: live }); } catch (err) { logger?.warn({ err }, 'could not toggle the support access expiry schedule'); }
+    return live;
+  }
+
+  // What sshd will do with a root key: the panel's own Security Advisor
+  // recommends PermitRootLogin no, under which an authorized key is useless.
+  async function sshdKeyPolicy() {
+    let cfg;
+    try { cfg = await agent.op('sec.sshd.get'); } catch (err) { return { known: false, permitRootLogin: null, pubkeyAuthentication: null, allowsRootKey: true, detail: `sshd configuration could not be read (${err.message}); the grant may be refused by sshd.` }; }
+    const e = cfg?.effective || {};
+    const permitRootLogin = e.permitrootlogin ? String(e.permitrootlogin).toLowerCase() : null;
+    const pubkeyAuthentication = e.pubkeyauthentication ? String(e.pubkeyauthentication).toLowerCase() : null;
+    const blockedBy = permitRootLogin && ROOT_KEY_BLOCKED.has(permitRootLogin) ? `PermitRootLogin ${permitRootLogin}` : pubkeyAuthentication === 'no' ? 'PubkeyAuthentication no' : null;
+    return {
+      known: true, permitRootLogin, pubkeyAuthentication, allowsRootKey: !blockedBy,
+      detail: blockedBy ? `sshd is configured with ${blockedBy}, so a key authorized for root cannot log in. Set PermitRootLogin to prohibit-password (and PubkeyAuthentication yes) under Security Center → SSH Password Authorization Tweak, or grant an API token only.` : null,
+      fix: blockedBy ? { label: 'SSH Password Authorization Tweak', path: '/security-center/ssh-password-authorization-tweak' } : null,
+    };
   }
 
   // What a live row should become once its host cleanup succeeds.
@@ -395,24 +464,32 @@ export function createSupportService(ctx) {
       return { data: page.data.map(shapeGrant), meta: page.meta };
     },
     get(id) { return shapeGrant(loadGrant(id)); },
-    status() {
+    async status() {
       const sshd = capabilities.has('sshd');
+      const sshdPolicy = sshd ? await sshdKeyPolicy() : null;
       return {
         sshd, tokens: Boolean(ctx.development?.tokens), active: stmts.activeGrants.all().map(shapeGrant), cleanupPending: stmts.pendingGrants.all().map(shapeGrant),
-        settings: supportSettings().access, sshdDetail: sshd ? null : 'OpenSSH server (sshd) is not installed on this server; SSH access cannot be granted but an API token can.',
-        sshdMinVersion: SSHD_MIN_VERSION, expiryTimeZone: hostTimeZone(),
+        settings: supportSettings().access, sshdDetail: sshd ? sshdPolicy?.detail ?? null : 'OpenSSH server (sshd) is not installed on this server; SSH access cannot be granted but an API token can.',
+        sshdPolicy, sshdMinVersion: SSHD_MIN_VERSION, expiryTimeZone: hostTimeZone(),
+        scheduleEnabled: Boolean(ctx.scheduler.list().find((x) => x.name === SCHEDULE_EXPIRE)?.enabled),
       };
     },
     // Host first, database second: the key is authorized and the token issued,
     // then the grant row is written. If that last step fails both are undone.
     async grant(input, user, req) {
+      // A grant is a root credential whose time box only root's session can set;
+      // letting a support token mint another would make the box extend itself.
+      if (req?.auth?.via === 'token') throw forbidden('Support access cannot be granted from an API token; sign in to the panel to grant it');
       const { maxHours, defaultHours } = supportSettings().access;
       const hours = input.hours ?? defaultHours;
       if (hours > maxHours) throw unprocessable('Request validation failed', { hours: [`Support access may last at most ${maxHours} hours (Support Center → Settings)`] });
       if (!input.ssh && !input.apiToken) throw unprocessable('Request validation failed', { _: ['Grant at least one of SSH access or an API token'] });
+      let sshdPolicy = null;
       if (input.ssh) {
         await capabilities.ensureFresh();
         capabilities.require('sshd', 'OpenSSH server (sshd) is not installed on this server, so there is nothing for a support engineer to log in to. Install openssh-server or grant an API token only.');
+        sshdPolicy = await sshdKeyPolicy();
+        if (!sshdPolicy.allowsRootKey) throw unprocessable(sshdPolicy.detail, { ssh: [sshdPolicy.detail] });
       }
       if (input.apiToken && !ctx.development?.tokens) throw new HttpError(503, 'service_unavailable', 'API tokens are unavailable because the Development module is not loaded');
       const expiresAt = utcStamp(Date.now() + hours * 3_600_000);
@@ -435,9 +512,11 @@ export function createSupportService(ctx) {
         }
         const id = Number(stmts.insertGrant.run({ label, ssh_fingerprint: key?.fingerprint ?? null, ssh_key_type: key?.type ?? null, ssh_comment: key ? `whm-support-${label}` : null, ssh_expiry: key ? sshExpiry : null, api_token_id: token?.id ?? null, api_token_prefix: token?.prefix ?? null, granted_by: user?.username || null, granted_ip: req?.ip || null, note: input.note || null, expires_at: expiresAt }).lastInsertRowid);
         audit(req, { action: 'support.access.grant', target: `${id}:${label}`, args: { hours, expiresAt, ssh: Boolean(key), fingerprint: key?.fingerprint, sshExpiry: key ? sshExpiry : null, api: Boolean(token), apiCredentialId: token?.id, apiScopes: input.tokenScopes || [] } });
+        syncSchedule();
         const hostname = settings.get('basic.hostname') || null;
         return {
           grant: shapeGrant(stmts.grantById.get(id)),
+          sshdPolicy,
           // Shown once: the private key is never stored and the token is kept only as a hash.
           ssh: key ? { privateKey: key.privateKey, publicKey: key.publicKey, authorizedLine: authorizedKeyLine(key.publicKey, expiresAt), expiry: sshExpiry, expiryTimeZone: hostTimeZone(), sshdMinVersion: SSHD_MIN_VERSION, fingerprint: key.fingerprint, command: `ssh -i support-${label}.key root@${hostname || '<server>'}` } : null,
           apiToken: token ? { token: token.token, prefix: token.prefix, id: token.id, scopes: token.scopes, expiresAt: token.expiresAt, example: `curl -H "Authorization: Bearer <token>" https://${hostname || '<server>'}:2087/api/system/status` } : null,
@@ -465,6 +544,7 @@ export function createSupportService(ctx) {
         results.push(r);
       }
       if (!due.length) log('no support access grants were due');
+      syncSchedule();
       return { expired: results.filter((r) => !r.cleanupPending).length, pending: results.filter((r) => r.cleanupPending).length, grants: results };
     },
   };
@@ -472,29 +552,25 @@ export function createSupportService(ctx) {
   // ------------------------------------------------------------------- center ---
 
   const docs = {
-    list() {
-      return DOCS.map((d) => {
-        const file = path.join(REPO_ROOT, d.file);
-        let stat = null;
-        try { stat = fs.statSync(file); } catch { /* not shipped with this install */ }
-        const sections = stat ? indexSections(fs.readFileSync(file, 'utf8')).filter((s) => s.level === 2) : [];
-        return { slug: d.slug, title: d.title, file: d.file, summary: d.summary, available: Boolean(stat), size: stat?.size ?? null, updatedAt: stat?.mtime?.toISOString() ?? null, sections };
+    list(user) {
+      return DOCS.filter((d) => docVisible(d, user)).map((d) => {
+        const doc = readDoc(path.join(REPO_ROOT, d.file));
+        return { slug: d.slug, title: d.title, file: d.file, summary: d.summary, available: Boolean(doc), size: doc?.size ?? null, updatedAt: doc?.updatedAt ?? null, sections: doc ? doc.sections.filter((s) => s.level === 2) : [] };
       });
     },
-    get(slug, section) {
+    get(slug, section, user) {
       if (!DOC_SLUG_RE.test(slug) || (section && !DOC_SLUG_RE.test(section))) throw unprocessable('Invalid document reference');
       const d = DOCS.find((x) => x.slug === slug);
       if (!d) throw notFound(`Document "${slug}"`);
-      const file = path.join(REPO_ROOT, d.file);
-      if (!fs.existsSync(file)) throw notFound(`Document "${slug}" is not shipped with this install (${d.file})`);
-      const text = fs.readFileSync(file, 'utf8');
-      const sections = indexSections(text);
+      if (!docVisible(d, user)) throw forbidden(`Document "${slug}" is available to the root administrator only`);
+      const doc = readDoc(path.join(REPO_ROOT, d.file));
+      if (!doc) throw notFound(`Document "${slug}" is not shipped with this install (${d.file})`);
       if (section) {
-        const content = extractSection(text, section);
+        const content = extractSection(doc.text, section);
         if (content == null) throw notFound(`Section "${section}" in ${d.file}`);
-        return { slug, title: d.title, file: d.file, section, content, sections };
+        return { slug, title: d.title, file: d.file, section, content, sections: doc.sections };
       }
-      return { slug, title: d.title, file: d.file, content: text, sections };
+      return { slug, title: d.title, file: d.file, content: doc.text, sections: doc.sections };
     },
   };
 
@@ -504,20 +580,13 @@ export function createSupportService(ctx) {
     const transport = ctx.contacts?.mailTransport?.() ?? null;
     return {
       links: [...(cfg.portalUrl ? [{ key: 'portal', label: `${cfg.providerName} portal`, url: cfg.portalUrl, description: 'Where tickets from this server are handled.' }] : []), ...SUPPORT_LINKS],
-      inApp: [
-        { key: 'api', label: 'OpenAPI reference (WHM)', path: '/development/openapi-documentation-for-whm', description: 'Every endpoint of this panel with roles and parameters.' },
-        { key: 'api-cpanel', label: 'OpenAPI reference (cPanel subset)', path: '/development/openapi-documentation-for-cpanel', description: 'The account-scoped subset resellers may call.' },
-        { key: 'dev-docs', label: 'Developer documentation', path: '/development/developer-documentation', description: 'Design documents and the plugin manifest contract.' },
-        { key: 'audit', label: 'Audit log', path: '/audit-log', description: 'Every privileged action taken through the panel.' },
-        { key: 'status', label: 'Server status', path: '/server-status/server-information', description: 'Live hardware, load and capacity.' },
-        { key: 'contacts', label: 'Contact Manager', path: '/server-contacts/contact-manager', description: 'Where ticket email leaves from (Exim or SMTP relay).' },
-      ],
-      docs: docs.list(),
+      inApp: IN_APP_LINKS.filter((l) => root || l.role === 'reseller').map(({ role, ...l }) => l),
+      docs: docs.list(user),
       settings: root ? cfg : { providerName: cfg.providerName, portalUrl: cfg.portalUrl },
       mail: root ? { transport, configured: Boolean(cfg.email), address: cfg.email } : undefined,
       tickets: root ? { ...stmts.ticketCounts.get(), open: stmts.openTickets.all().map((r) => ({ id: r.id, reference: r.reference, subject: r.subject, severity: r.severity, category: r.category, createdAt: r.created_at })) } : undefined,
       access: root ? { ...stmts.grantCounts.get(), sshd: capabilities.has('sshd'), active: stmts.activeGrants.all().map(shapeGrant), cleanupPending: stmts.pendingGrants.all().map(shapeGrant) } : undefined,
-      panel: { version: ctx.version ?? null, mode: ctx.config?.mode ?? null, node: process.version },
+      panel: root ? { version: ctx.version ?? null, mode: ctx.config?.mode ?? null, node: process.version } : { version: ctx.version ?? null },
     };
   }
 
@@ -554,7 +623,7 @@ export function createSupportService(ctx) {
   return {
     JOB_EXPIRE, SCHEDULE_EXPIRE,
     settings: supportSettings, updateSettings,
-    snapshot, tickets, access, docs, center, diagnostics,
+    snapshot, tickets, access, docs, center, diagnostics, syncSchedule,
     // Other categories may check for a live grant before, say, disabling SSH
     // passwords. Includes grants whose key is still on the host pending cleanup.
     activeGrants: () => stmts.liveGrants.all().map(shapeGrant),

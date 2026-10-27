@@ -25,7 +25,7 @@ export function GrantResult({ result, onClose }) {
     <Modal open={Boolean(result)} title={g ? `Access granted: ${g.label}` : ''} onClose={onClose} size="lg" footer={<Button variant="primary" onClick={onClose}>I have saved these</Button>}>
       {g && (
         <>
-          <div className="banner banner-warning"><div><strong>Shown once.</strong><p>The private key is not stored on this server and the token is kept only as a hash. Hand them to the support engineer now; both stop working at {formatDate(g.expiresAt)} or as soon as you revoke the grant.</p></div></div>
+          <div className="banner banner-warning"><div><strong>Shown once.</strong><p>The private key is not stored on this server and the token is kept only as a hash. Hand them to the support engineer now; both stop working at {formatDate(g.expiresAt)} or as soon as you revoke the grant. The time box is cooperative: whoever holds root can add their own persistence, so revoke the grant when the engagement ends and review the audit log and root's SSH keys afterwards.</p></div></div>
           <KeyValue items={[['Expires', formatDate(g.expiresAt)], ['Granted by', g.grantedBy], result.ssh && ['Key fingerprint', <code>{result.ssh.fingerprint}</code>], result.apiToken && ['Token prefix', <code>{result.apiToken.prefix}…</code>]]} />
           {result.ssh && (
             <>
@@ -52,19 +52,21 @@ export function GrantForm({ status, onGranted }) {
   const { mutate, loading, error, fieldErrors } = useMutation((body) => api.post('/support/access', body));
   const set = (k) => (v) => setForm((f) => ({ ...f, [k]: v }));
   const sshdMissing = status && !status.sshd;
+  const sshdBlocked = Boolean(status?.sshdPolicy && !status.sshdPolicy.allowsRootKey);
+  const sshUnavailable = sshdMissing || sshdBlocked;
   const defaultHours = status?.settings?.defaultHours ?? 24;
   const maxHours = status?.settings?.maxHours ?? 168;
 
   const submit = async (e) => {
     e.preventDefault();
     try {
-      const body = { label: form.label.trim(), ssh: form.ssh && !sshdMissing, apiToken: form.apiToken };
+      const body = { label: form.label.trim(), ssh: form.ssh && !sshUnavailable, apiToken: form.apiToken };
       if (form.hours) body.hours = form.hours;
       if (form.scope && form.apiToken) body.tokenScopes = [form.scope];
       if (form.note.trim()) body.note = form.note.trim();
       const res = await mutate(body);
       toast.success(`Access granted until ${formatDate(res.data.grant.expiresAt)}`);
-      setForm({ label: '', hours: null, ssh: !sshdMissing, apiToken: true, scope: '', note: '' });
+      setForm({ label: '', hours: null, ssh: !sshUnavailable, apiToken: true, scope: '', note: '' });
       onGranted?.(res.data);
     } catch (err) { if (!err.fields) toast.error(err); }
   };
@@ -72,17 +74,20 @@ export function GrantForm({ status, onGranted }) {
   return (
     <Card title="Grant access" subtitle={`Creates a fresh SSH key authorized for root and an API token. The key line carries sshd's expiry-time option (OpenSSH ${status?.sshdMinVersion || '7.7'} or newer, stamped in the host's local time${status?.expiryTimeZone ? `, ${status.expiryTimeZone}` : ''}) so the daemon refuses it after the deadline, and the panel removes both when the time box ends.`}>
       {sshdMissing && <div className="banner banner-info"><div><strong>sshd is not installed</strong><p>{status.sshdDetail} Only an API token can be issued until <Link to="/software/install-distro-packages">openssh-server</Link> is installed.</p></div></div>}
+      {sshdBlocked && <div className="banner banner-warning"><div><strong>sshd would refuse a root key</strong><p>{status.sshdPolicy.detail} {status.sshdPolicy.fix && <Link to={status.sshdPolicy.fix.path}>{status.sshdPolicy.fix.label}</Link>}</p></div></div>}
+      {status?.sshdPolicy?.known === false && <div className="banner banner-info"><div><strong>sshd configuration could not be read</strong><p>{status.sshdPolicy.detail}</p></div></div>}
+      <p className="muted small">Granting is only possible from a signed-in root session, never through an API token, so a support token cannot extend its own time box. The box itself is cooperative: root access can be made persistent by its holder, so revoke the grant as soon as the engagement ends.</p>
       <form onSubmit={submit}>
         <ErrorBanner error={error && isCapabilityError(error) ? null : error && !fieldErrors ? error : null} />
         <RequestError error={isCapabilityError(error) ? error : null} />
         <Field label="Label" required error={fieldErrors?.label} help="Usually the support ticket or case number. Becomes the key comment and the token name."><TextInput value={form.label} onChange={set('label')} placeholder="case-1234567" maxLength={48} /></Field>
         <Field label="Duration (hours)" error={fieldErrors?.hours} help={`Default ${defaultHours} h, at most ${maxHours} h. Change the limits under Support Center → Settings.`}><NumberInput value={form.hours} onChange={set('hours')} min={1} max={maxHours} placeholder={String(defaultHours)} /></Field>
-        <Field error={fieldErrors?.ssh}><Toggle checked={form.ssh && !sshdMissing} disabled={Boolean(sshdMissing)} onChange={set('ssh')} label="SSH access as root" description="A new ed25519 key pair; the public half is appended to /root/.ssh/authorized_keys." /></Field>
+        <Field error={fieldErrors?.ssh}><Toggle checked={form.ssh && !sshUnavailable} disabled={sshUnavailable} onChange={set('ssh')} label="SSH access as root" description={sshdBlocked ? 'Unavailable until sshd accepts a root key (see above).' : 'A new ed25519 key pair; the public half is appended to /root/.ssh/authorized_keys.'} /></Field>
         <Field error={fieldErrors?.apiToken}><Toggle checked={form.apiToken} onChange={set('apiToken')} label="API token" description="A bearer token for this panel's API with the same expiry, listed under Development → Manage API Tokens." /></Field>
         {form.apiToken && <Field label="Token scope" error={fieldErrors?.tokenScopes}><Select value={form.scope} onChange={set('scope')} options={SCOPE_OPTIONS} /></Field>}
         <Field label="Note" error={fieldErrors?.note}><TextInput value={form.note} onChange={set('note')} placeholder="Why access is being granted" maxLength={500} /></Field>
         {fieldErrors?._ && <div className="field-message">{fieldErrors._.join(' ')}</div>}
-        <FormActions><Button type="submit" variant="primary" icon={KeyRound} loading={loading} disabled={!form.label.trim() || (!form.apiToken && (!form.ssh || sshdMissing))}>Grant access</Button></FormActions>
+        <FormActions><Button type="submit" variant="primary" icon={KeyRound} loading={loading} disabled={!form.label.trim() || (!form.apiToken && (!form.ssh || sshUnavailable))}>Grant access</Button></FormActions>
       </form>
     </Card>
   );

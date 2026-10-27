@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { exec, hasBinary } from '../src/exec.js';
 import { runOp, createContext, OpError } from '../src/lib.js';
+import { catalog } from '../src/ops/registry.js';
 import { execFileSync } from 'node:child_process';
 import { parseWpVersion, parseWpConfig, assertUnderHome, passwdHome, findWordPress, readSiteFile, regularFileStat, WP_READ_MAX_BYTES, WP_HARDENING_FIXES, WP_FALLBACK_THEME } from '../src/ops/web.js';
 
@@ -61,6 +62,23 @@ describe('web.wp.* schemas reject injection before anything runs', () => {
       expect((await runOp('web.wp.discover', { usernames: ['nosuchuser'] }, ctx))).toEqual({ installs: [], missing: ['nosuchuser'] });
       expect(exec).not.toHaveBeenCalled();
     } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+});
+
+describe('catalog metadata', () => {
+  it('marks every op that rewrites a site as destructive and keeps the reads plain', () => {
+    for (const op of ['web.wp.install', 'web.wp.update', 'web.wp.maintenance', 'web.wp.hardenfix']) expect(catalog.get(op).destructive, op).toBe(true);
+    for (const op of ['web.wp.detect', 'web.wp.discover', 'web.wp.inspect', 'web.wp.harden']) expect(catalog.get(op).destructive, op).toBe(false);
+  });
+
+  it('web.wp.detect probes WP-CLI with --allow-root, since the agent runs as root and WP-CLI refuses root by default', async () => {
+    hasBinary.mockImplementation((n) => n === 'wp' || n === 'runuser' || n === 'php');
+    exec.mockImplementation(async (bin, argv) => { expect(bin).toBe('wp'); return { code: 0, stdout: 'WP-CLI 2.10.0\n', stderr: '', bin, argv }; });
+    try {
+      expect(await runOp('web.wp.detect', {}, ctx)).toEqual({ installed: true, version: '2.10.0', php: true, runuser: true });
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(exec.mock.calls[0][1]).toEqual(['cli', 'version', '--no-color', '--allow-root']);
+    } finally { exec.mockReset(); exec.mockImplementation(async () => { throw new Error('exec should not run'); }); hasBinary.mockReset(); }
   });
 });
 
@@ -237,5 +255,55 @@ describe('WordPress install and hardening never touch the account tree as root',
       expect(err.code).toBe('command_failed');
       expect(err.details.step).toBe('theme');
     } finally { chmod.mockRestore(); restore(); fs.rmSync(path.dirname(site), { recursive: true, force: true }); }
+  });
+
+  // A failure after the download would otherwise leave a tree whose
+  // wp-config.php makes the retry fail with "exists"; the op removes what it
+  // created, as the account user, and reports it in the error details.
+  it('a failed install removes the tree it created as the account user so the retry is not refused', async () => {
+    const parent = fs.mkdtempSync(path.join(home, '.whm-wp-test-'));
+    let rmSync = null;
+    const install = { username: me, path: path.join(parent, 'blog'), url: 'https://alice.com/blog', title: 'Blog', adminUser: 'editor', adminEmail: 'a@b.co', adminPassword: 'Str0ng-Passw0rd!', dbName: 'alice_wp', dbUser: 'alice_wp', dbPassword: 'Db-Passw0rd!xyz' };
+    const failInstall = (argv) => { const a = argv[0] === 'wp' ? wpArgs(argv) : argv; return a[0] === 'core' && a[1] === 'install' ? { code: 1, stdout: '', stderr: 'Error: Database connection error', bin: 'runuser', argv } : ok(); };
+    try {
+      // the site directory did not exist: the whole directory goes
+      let seen = [];
+      fakeWpCli((argv) => { seen.push(argv); return failInstall(argv); });
+      let err = await opError(runOp('web.wp.install', install, userCtx));
+      expect(err.code).toBe('command_failed');
+      expect(err.details).toMatchObject({ step: 'install', steps: ['download', 'config'], cleanup: `removed ${install.path}` });
+      expect(seen.at(-1)).toEqual(['rm', '-rf', '--', install.path]);
+      // an existing directory keeps what it had; only the new entries are removed
+      const site = path.join(parent, 'existing');
+      fs.mkdirSync(site);
+      fs.writeFileSync(path.join(site, 'keep.html'), 'mine');
+      seen = [];
+      fakeWpCli((argv) => {
+        seen.push(argv);
+        const a = argv[0] === 'wp' ? wpArgs(argv) : argv;
+        if (a[0] === 'core' && a[1] === 'download') { fs.mkdirSync(path.join(site, 'wp-includes')); fs.writeFileSync(path.join(site, 'index.php'), '<?php'); }
+        return failInstall(argv);
+      });
+      err = await opError(runOp('web.wp.install', { ...install, path: site }, userCtx));
+      expect(err.details.cleanup).toBe(`removed the 2 new entries from ${site}`);
+      expect(seen.at(-1).slice(0, 3)).toEqual(['rm', '-rf', '--']);
+      expect(seen.at(-1).slice(3).sort()).toEqual([path.join(site, 'index.php'), path.join(site, 'wp-includes')]);
+      expect(seen.at(-1)).not.toContain(path.join(site, 'keep.html'));
+      expect(seen.at(-1)).not.toContain(site);
+      // a removal the user cannot perform is reported, never retried as root
+      fs.rmSync(path.join(site, 'wp-includes'), { recursive: true, force: true });
+      fs.rmSync(path.join(site, 'index.php'), { force: true });
+      rmSync = vi.spyOn(fs, 'rmSync');
+      fakeWpCli((argv) => {
+        const a = argv[0] === 'wp' ? wpArgs(argv) : argv;
+        if (a[0] === 'core' && a[1] === 'download') fs.writeFileSync(path.join(site, 'index.php'), '<?php');
+        if (a[0] === 'rm') return { code: 1, stdout: '', stderr: 'rm: cannot remove: Permission denied', bin: 'runuser', argv };
+        return failInstall(argv);
+      });
+      err = await opError(runOp('web.wp.install', { ...install, path: site }, userCtx));
+      expect(err.details.cleanup).toMatch(/was left in place .*Permission denied.*remove it before retrying/);
+      expect(rmSync).not.toHaveBeenCalled();
+      expect(fs.existsSync(path.join(site, 'keep.html'))).toBe(true);
+    } finally { rmSync?.mockRestore(); restore(); fs.rmSync(parent, { recursive: true, force: true }); }
   });
 });

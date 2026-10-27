@@ -32,7 +32,7 @@ export default function SynchronizeDnsRecords({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Pushes zones to the nameservers in your DNS cluster over their panel API, so every peer serves the same records. Synchronisation is push-only in this version: peers in the 'sync' role receive zones like 'write-only' ones, and changes made on a peer are not pulled back. The hourly run only sends zones a peer has not acknowledged at their current serial; this page pushes everything you select." actions={<Button onClick={() => refetch()}>Refresh</Button>} />
+      <PageHeader fn={fn} description="Pushes zones to the nameservers in your DNS cluster over their panel API, so every peer serves the same records. Synchronisation is push-only in this version: peers in the 'sync' role receive zones like 'write-only' ones, and changes made on a peer are not pulled back. The hourly run only sends zones a peer has not acknowledged at their current serial; this page pushes everything you select. Peers running a cluster-aware panel receive zones through their Clusters exchange log (/api/clusters/dns/receive); older panels fall back to the plain zone import." actions={<Button onClick={() => refetch()}>Refresh</Button>} />
       <ErrorBanner error={error} onRetry={refetch} />
       <Card title="Cluster peers" padded={false}>
         {data && !data.clusters.length ? (
@@ -68,6 +68,7 @@ export default function SynchronizeDnsRecords({ fn }) {
             { key: 'status', label: 'Status', render: (r) => <StatusPill status={r.status === 'ok' ? (r.stale ? 'warning' : 'ok') : 'failed'}>{r.status === 'ok' ? (r.stale ? 'stale' : 'in sync') : 'failed'}</StatusPill> },
             { key: 'serial', label: 'Pushed serial', render: (r) => <code>{r.serial}</code> },
             { key: 'current_serial', label: 'Current serial', render: (r) => <code>{r.current_serial}</code> },
+            { key: 'endpoint', label: 'Via', render: (r) => (r.endpoint ? <StatusPill status={r.endpoint === '/api/clusters/dns/receive' ? 'ok' : 'info'}>{r.endpoint === '/api/clusters/dns/receive' ? 'cluster receiver' : 'zone import'}</StatusPill> : <span className="muted">unknown</span>) },
             { key: 'message', label: 'Message', render: (r) => r.message || '' },
             { key: 'synced_at', label: 'When', render: (r) => formatDate(r.synced_at) },
           ]}

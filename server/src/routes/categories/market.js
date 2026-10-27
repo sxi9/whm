@@ -1,15 +1,16 @@
 import { Router } from 'express';
-import { validate, z } from '../../lib/validate.js';
+import { validate, pagination, z } from '../../lib/validate.js';
 import { requireRoot, requireReseller } from '../../middleware/rbac.js';
 import { createMarketService, PROVIDER_NAME_RE } from '../../services/market.js';
-import { CREATABLE_ADAPTERS } from '../../services/market-adapters.js';
+import { ADAPTER_IDS } from '../../services/market-adapters.js';
 
 const name = z.string().trim().regex(PROVIDER_NAME_RE, 'Lowercase letters, digits, "_" or "-"; must start with a letter; max 32 chars');
 // ACME rows carry a dot ("acme.sh"), so lookups accept it while creation does not.
 const lookupName = z.string().trim().regex(/^[a-z][a-z0-9_.-]{0,31}$/, 'Invalid provider name');
 const displayName = z.string().trim().min(1).max(80).regex(/^[^\r\n\0<>]*$/, 'Names are a single line without angle brackets');
 const type = z.enum(['ssl', 'plugin']);
-const adapter = z.enum(CREATABLE_ADAPTERS);
+// Every adapter id parses; the service tells a reserved one (409/422) from an unknown one.
+const adapter = z.enum(ADAPTER_IDS);
 const url = z.string().trim().max(512).regex(/^https:\/\/[^\s/$.?#][^\s]*$/i, 'Must be an https:// URL');
 const commission = z.coerce.number().min(0).max(100);
 const product = z.object({
@@ -25,7 +26,7 @@ const configValue = z.string().max(2048).nullable();
 const config = z.record(z.string().regex(/^[a-zA-Z][a-zA-Z0-9_]{0,31}$/), configValue);
 
 const nameParam = z.object({ name: lookupName });
-const listQuery = z.object({ type: type.optional() });
+const listQuery = pagination.extend({ type: type.optional() });
 const createBody = z.object({ name, displayName, type, adapter, url: url.optional(), commissionPercent: commission.optional(), products: products.optional(), config: config.optional() }).strict();
 const updateBody = z.object({ displayName: displayName.optional(), url: url.nullable().optional(), commissionPercent: commission.optional(), products: products.optional() }).strict()
   .refine((b) => Object.keys(b).length > 0, { message: 'Provide at least one field', path: ['displayName'] });
@@ -35,6 +36,7 @@ export async function register(ctx) {
   ctx.market = createMarketService(ctx);
   const s = ctx.market;
   // Make the setting SSL/TLS reads reflect the table from the first boot on.
+  s.adoptLegacySetting();
   s.syncSettings();
 
   const r = Router();

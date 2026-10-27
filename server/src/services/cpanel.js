@@ -128,19 +128,12 @@ export function compareVersions(a, b) {
   return 0;
 }
 
-const splitCredentials = (url) => {
-  try {
-    const u = new URL(url);
-    if (!u.username && !u.password) return { url, headers: {} };
-    const auth = `Basic ${Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64')}`;
-    u.username = ''; u.password = '';
-    return { url: u.href, headers: { Authorization: auth } };
-  } catch { return { url, headers: {} }; }
-};
-
 // The release feed: { version, url, sha256?, signature?, keyId?, notes?, publishedAt? }
 // at the top level or under tiers.<tier>. `signature` is a base64 Ed25519 signature
 // over the raw SHA-256 digest of the archive, made with the key named by keyId.
+// Software fetches the feed and stores its record; this shapes that record (or
+// a raw feed) and keeps the verification fields only in the strict forms the
+// agent accepts.
 export function parseRelease(body, tier) {
   const release = body?.tiers?.[tier] ?? body?.[tier] ?? body;
   if (!release || typeof release.version !== 'string' || !/^v?\d+(\.\d+){0,3}([.-][0-9A-Za-z.]+)?$/.test(release.version)) throw new Error('update feed has no usable "version" field');
@@ -259,63 +252,83 @@ export function createCpanelService(ctx) {
   };
 
   // --------------------------------------------------------------- news ----
+  // Status is derived in SQL so the list can filter and page there.
+  const STATUS_SQL = `CASE WHEN enabled = 0 THEN 'disabled' WHEN starts_at IS NOT NULL AND starts_at > @now THEN 'scheduled' WHEN ends_at IS NOT NULL AND ends_at <= @now THEN 'expired' ELSE 'active' END`;
   const newsStmts = {
-    insert: db.prepare(`INSERT INTO news (title, body_md, audience, severity, enabled, starts_at, ends_at, created_by) VALUES (@title, @body, @audience, @severity, @enabled, @starts_at, @ends_at, @created_by)`),
-    get: db.prepare('SELECT * FROM news WHERE id = ?'),
+    insert: db.prepare(`INSERT INTO news (title, body_md, audience, severity, enabled, starts_at, ends_at, owner_id, created_by) VALUES (@title, @body, @audience, @severity, @enabled, @starts_at, @ends_at, @owner_id, @created_by)`),
+    get: db.prepare(`SELECT *, ${STATUS_SQL} AS status FROM news WHERE id = @id`),
     update: db.prepare(`UPDATE news SET title = @title, body_md = @body, audience = @audience, severity = @severity, enabled = @enabled, starts_at = @starts_at, ends_at = @ends_at, updated_at = datetime('now') WHERE id = @id`),
     remove: db.prepare('DELETE FROM news WHERE id = ?'),
-    active: db.prepare(`SELECT * FROM news WHERE enabled = 1 AND (starts_at IS NULL OR starts_at <= @now) AND (ends_at IS NULL OR ends_at > @now) ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, id DESC`),
+    active: db.prepare(`SELECT *, 'active' AS status FROM news WHERE enabled = 1 AND (starts_at IS NULL OR starts_at <= @now) AND (ends_at IS NULL OR ends_at > @now) ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END, id DESC`),
+    accountOwner: db.prepare('SELECT owner_id FROM accounts WHERE username = ?'),
   };
   const shapeNews = (row) => row && ({
     id: row.id, title: row.title, body: row.body_md, audience: row.audience, severity: row.severity, enabled: Boolean(row.enabled),
-    startsAt: row.starts_at, endsAt: row.ends_at, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at,
-    status: !row.enabled ? 'disabled' : row.starts_at && row.starts_at > nowSql() ? 'scheduled' : row.ends_at && row.ends_at <= nowSql() ? 'expired' : 'active',
+    startsAt: row.starts_at, endsAt: row.ends_at, ownerId: row.owner_id, createdBy: row.created_by, createdAt: row.created_at, updatedAt: row.updated_at, status: row.status,
   });
-  const audienceFor = (user) => (isRoot(user) ? AUDIENCES : user?.role === 'reseller' ? ['resellers', 'all'] : ['all']);
+  const likeEscape = (s) => s.replace(/[\\%_]/g, (c) => `\\${c}`);
+  // Root manages every item; a reseller holding the `news` ACL manages only the
+  // items it published to its own accounts (audience `own`).
+  const requireNewsAcl = (user) => { if (!isRoot(user)) ctx.resellers?.assertAcl?.(user, 'news'); };
+  const ownsItem = (user, row) => isRoot(user) || (row.owner_id != null && row.owner_id === user?.id);
   const news = {
-    list({ page = 1, pageSize = 50, q, status } = {}) {
+    list({ page = 1, pageSize = 50, q, status } = {}, user) {
+      requireNewsAcl(user);
       const where = [];
-      const params = {};
-      if (q) { where.push('(title LIKE @q OR body_md LIKE @q)'); params.q = `%${q}%`; }
+      const params = { now: nowSql() };
+      if (q) { where.push(`(title LIKE @q ESCAPE '\\' OR body_md LIKE @q ESCAPE '\\')`); params.q = `%${likeEscape(q)}%`; }
+      if (status) { where.push(`${STATUS_SQL} = @status`); params.status = status; }
+      if (!isRoot(user)) { where.push('owner_id = @owner'); params.owner = user.id; }
       const sql = `FROM news ${where.length ? 'WHERE ' + where.join(' AND ') : ''}`;
-      let rows = db.prepare(`SELECT * ${sql} ORDER BY id DESC`).all(params).map(shapeNews);
-      if (status) rows = rows.filter((r) => r.status === status);
-      const total = rows.length;
-      return { data: rows.slice((page - 1) * pageSize, page * pageSize), meta: { page, pageSize, total } };
+      const total = db.prepare(`SELECT COUNT(*) AS n ${sql}`).get(params).n;
+      const rows = db.prepare(`SELECT *, ${STATUS_SQL} AS status ${sql} ORDER BY id DESC LIMIT @limit OFFSET @offset`).all({ ...params, limit: pageSize, offset: (page - 1) * pageSize }).map(shapeNews);
+      return { data: rows, meta: { page, pageSize, total } };
     },
-    get(id) {
-      const row = shapeNews(newsStmts.get.get(id));
-      if (!row) throw notFound('News item');
-      return row;
+    get(id, user) {
+      requireNewsAcl(user);
+      const row = newsStmts.get.get({ id, now: nowSql() });
+      if (!row || !ownsItem(user, row)) throw notFound('News item');
+      return shapeNews(row);
     },
     create(body, user, req) {
-      const values = news.normalise(body);
-      const { lastInsertRowid } = newsStmts.insert.run({ ...values, created_by: user?.username ?? null });
+      requireNewsAcl(user);
+      const values = news.normalise(body, user);
+      const { lastInsertRowid } = newsStmts.insert.run({ ...values, owner_id: user?.id ?? null, created_by: user?.username ?? null });
       req?.audit?.({ action: 'news.create', target: String(lastInsertRowid), args: { title: values.title, audience: values.audience } });
-      return news.get(Number(lastInsertRowid));
+      return news.get(Number(lastInsertRowid), user);
     },
-    update(id, body, req) {
-      const existing = news.get(id);
-      const values = news.normalise({ title: existing.title, body: existing.body, audience: existing.audience, severity: existing.severity, enabled: existing.enabled, startsAt: existing.startsAt, endsAt: existing.endsAt, ...body });
+    update(id, body, user, req) {
+      const existing = news.get(id, user);
+      const values = news.normalise({ title: existing.title, body: existing.body, audience: existing.audience, severity: existing.severity, enabled: existing.enabled, startsAt: existing.startsAt, endsAt: existing.endsAt, ...body }, user);
       newsStmts.update.run({ ...values, id });
       req?.audit?.({ action: 'news.update', target: String(id), args: { title: values.title, audience: values.audience, enabled: Boolean(values.enabled) } });
-      return news.get(id);
+      return news.get(id, user);
     },
-    remove(id, req) {
-      news.get(id);
+    remove(id, user, req) {
+      news.get(id, user);
       newsStmts.remove.run(id);
       req?.audit?.({ action: 'news.delete', target: String(id) });
       return { deleted: true };
     },
-    normalise(body) {
+    normalise(body, user) {
       const starts = sqlDate(body.startsAt);
       const ends = sqlDate(body.endsAt);
       if (starts && ends && ends <= starts) throw unprocessable('The end date must be after the start date', { endsAt: ['must be after startsAt'] });
-      return { title: body.title, body: body.body ?? '', audience: body.audience ?? 'all', severity: body.severity ?? 'info', enabled: body.enabled === false ? 0 : 1, starts_at: starts, ends_at: ends };
+      const audience = body.audience ?? (isRoot(user) ? 'all' : 'own');
+      if (!isRoot(user) && audience !== 'own') throw unprocessable('Resellers publish news to their own accounts only', { audience: ['must be "own"'] });
+      return { title: body.title, body: body.body ?? '', audience, severity: body.severity ?? 'info', enabled: body.enabled === false ? 0 : 1, starts_at: starts, ends_at: ends };
     },
+    // What a principal's dashboard shows: the server-wide audiences for its
+    // role plus `own` items from whoever owns its account (resellers also see
+    // the ones they published themselves).
     active(user) {
-      const allowed = audienceFor(user);
-      return newsStmts.active.all({ now: nowSql() }).map(shapeNews).filter((n) => allowed.includes(n.audience));
+      const allowed = isRoot(user) ? ['root', 'resellers', 'all'] : user?.role === 'reseller' ? ['resellers', 'all'] : ['all'];
+      let ownerId = null;
+      if (user?.role === 'reseller') ownerId = user.id;
+      else if (user?.role === 'user') ownerId = newsStmts.accountOwner.get(user.username)?.owner_id ?? null;
+      return newsStmts.active.all({ now: nowSql() })
+        .filter((n) => (n.audience === 'own' ? ownerId != null && n.owner_id === ownerId : allowed.includes(n.audience)))
+        .map(shapeNews);
     },
   };
 
@@ -359,25 +372,37 @@ export function createCpanelService(ctx) {
   // decisions (agent environment or agent.conf); nothing here can override them.
   const DEFAULT_POLICY = { allowUnverified: false, panelManagedKeys: false, configFile: null };
   const shapePolicy = (p) => ({ allowUnverified: p?.allowUnverified === true, panelManagedKeys: p?.panelManagedKeys === true, configFile: typeof p?.configFile === 'string' ? p.configFile : null });
+  // The key listing is an agent round-trip; status polls reuse it briefly, and
+  // every change through the panel drops the copy.
+  let keysCache = null;
+  const readKeys = async () => {
+    if (keysCache && keysCache.until > Date.now()) return keysCache.res;
+    const res = await ctx.agent.op('cpanel.upgrade.keys');
+    keysCache = { res, until: Date.now() + KEYS_CACHE_MS };
+    return res;
+  };
   const releaseKeys = {
     async list() {
-      const res = await ctx.agent.op('cpanel.upgrade.keys');
+      const res = await readKeys();
       return { dir: res.dir, readOnly: Boolean(res.readOnly), policy: shapePolicy(res.policy), keys: (res.keys || []).map(({ pem, ...k }) => k) };
     },
     async pems() {
-      const res = await ctx.agent.op('cpanel.upgrade.keys');
+      keysCache = null;
+      const res = await readKeys();
       return (res.keys || []).filter((k) => k.valid && k.pem);
     },
     async add(kid, pem, req) {
       let key;
       try { key = crypto.createPublicKey(pem); } catch (err) { throw unprocessable('Not a valid public key', { pem: [err.message] }); }
       if (key.asymmetricKeyType !== 'ed25519') throw unprocessable('Release keys must be Ed25519 public keys', { pem: [`got ${key.asymmetricKeyType}`] });
+      keysCache = null;
       const added = await ctx.agent.op('cpanel.upgrade.key_add', { kid, pem: key.export({ type: 'spki', format: 'pem' }) });
       req?.audit?.({ action: 'upgrade.key.add', target: kid, args: { fingerprint: added?.fingerprint ?? null } });
       const { pem: _pem, ...rest } = added || {};
       return rest;
     },
     async remove(kid, req) {
+      keysCache = null;
       await ctx.agent.op('cpanel.upgrade.key_remove', { kid });
       req?.audit?.({ action: 'upgrade.key.remove', target: kid });
       return { removed: true };
@@ -426,6 +451,21 @@ export function createCpanelService(ctx) {
     if (!st.installed) return logOutcome(log) ?? 'unknown';
     return null;
   };
+  // Software owns the release feed (Software › System Update checks it and
+  // records software.panel.last_check); this reads its answer and, when the
+  // feed published them, the verification fields it carried.
+  const softwarePanel = () => {
+    const sw = ctx.software?.panel;
+    if (!sw || typeof sw.status !== 'function') throw new CapabilityError('software', 'The Software category is not available; release checks run there');
+    return sw;
+  };
+  const releaseFromSoftware = () => {
+    const st = softwarePanel().status();
+    const tier = st.tier ?? S('updates.tier', 'stable');
+    let latest = null;
+    if (st.latest) { try { latest = parseRelease(st.latest, tier); } catch { latest = null; } }
+    return { updateUrl: st.updateUrl ?? '', tier, lastCheck: st.lastCheck ?? null, latest };
+  };
   const upgrade = {
     canRun() {
       const method = installMethod();
@@ -433,31 +473,17 @@ export function createCpanelService(ctx) {
       if (!fs.existsSync(path.join(REPO_ROOT, 'scripts', 'install.sh'))) return { ok: false, reason: 'scripts/install.sh is missing from this installation; follow the manual steps.' };
       return { ok: true, reason: null };
     },
+    // Read-only: the stored record, the release Software last saw, and the
+    // (briefly cached) key listing. Post-restart reconciliation is reconcile().
     async status() {
-      const url = S('software.update_url', '');
-      const lastCheck = S('cpanel.upgrade.last_check', null);
-      const latest = lastCheck?.latest ?? null;
+      const { updateUrl, tier, lastCheck, latest } = releaseFromSoftware();
       const last = S('cpanel.upgrade.last', null);
       const method = installMethod();
       const can = upgrade.canRun();
       let keys = { dir: null, readOnly: true, policy: DEFAULT_POLICY, keys: [], error: null };
       try { keys = { ...(await releaseKeys.list()), error: null }; } catch (err) { keys.error = err.message; }
       const trusted = keys.keys.filter((k) => k.valid);
-      let lastDetail = null;
-      if (last) {
-        lastDetail = { ...last, log: last.logFile ? tailLog(last.logFile) : null };
-        if (last.status === 'started' || last.status === 'unknown') {
-          if (last.version && compareVersions(ctx.version, last.version) === 0 && last.fromVersion !== ctx.version) lastDetail.status = 'succeeded';
-          else if (last.unit && last.status === 'started') {
-            try {
-              const st = await ctx.agent.op('cpanel.upgrade.unit_status', { unit: last.unit.replace(/\.service$/, '') });
-              lastDetail.status = st.installed && st.state === 'active' ? 'running' : unitOutcome(st, lastDetail.log) ?? 'unknown';
-              if (lastDetail.status === 'failed' && st.exitStatus != null) lastDetail.exitStatus = st.exitStatus;
-            } catch { lastDetail.status = 'unknown'; }
-          }
-          if (lastDetail.status !== last.status && lastDetail.status !== 'running') settings.set('cpanel.upgrade.last', { ...last, status: lastDetail.status, finishedAt: last.finishedAt ?? new Date().toISOString() });
-        }
-      }
+      const lastDetail = last ? { ...last, log: last.logFile ? tailLog(last.logFile) : null } : null;
       let verification = null;
       if (latest) {
         const keyKnown = latest.keyId ? trusted.some((k) => k.kid === latest.keyId) : trusted.length > 0;
@@ -473,7 +499,7 @@ export function createCpanelService(ctx) {
         };
       }
       return {
-        currentVersion: ctx.version, updateUrl: splitCredentials(url).url, updateUrlConfigured: Boolean(url), tier: S('updates.tier', 'stable'),
+        currentVersion: ctx.version, updateUrl, updateUrlConfigured: Boolean(updateUrl), tier,
         lastCheck, latest, updateAvailable: latest ? compareVersions(latest.version, ctx.version) > 0 : null,
         installMethod: method, repoRoot: REPO_ROOT, canRun: can.ok, reason: can.reason,
         verification, policy: keys.policy, releaseKeys: keys.keys, releaseKeyDir: keys.dir, releaseKeysReadOnly: keys.readOnly, releaseKeysError: keys.error,
@@ -485,33 +511,56 @@ export function createCpanelService(ctx) {
         ],
       };
     },
-    async check(req) {
-      const raw = S('software.update_url', '');
-      if (!raw) throw unprocessable('No update URL is configured', { url: ['Set the update URL under Server Configuration › Update Preferences first'] });
-      const target = splitCredentials(raw);
-      const entry = { at: new Date().toISOString(), url: target.url, ok: false, latest: null, error: null };
-      try {
-        const res = await fetch(target.url, { headers: { Accept: 'application/json', 'User-Agent': `whm-panel/${ctx.version}`, ...target.headers }, signal: AbortSignal.timeout(10_000), redirect: 'follow' });
-        if (!res.ok) throw new Error(`update server answered ${res.status}`);
-        entry.latest = parseRelease(await res.json(), S('updates.tier', 'stable'));
-        entry.ok = true;
-      } catch (err) {
-        entry.error = (err.name === 'TimeoutError' ? 'timed out after 10s' : err.message).split(raw).join(entry.url);
+    // The installer restarts the panel before the job loop can see the result,
+    // so a record left at 'started' (or 'unknown') is settled once, at boot: the
+    // running version proves success; otherwise the unit's state decides. A
+    // unit still active is left alone and settled on the next boot.
+    async reconcile() {
+      const last = S('cpanel.upgrade.last', null);
+      if (!last || !['started', 'unknown'].includes(last.status)) return last;
+      let status = last.status;
+      let exitStatus = last.exitStatus ?? null;
+      if (last.version && compareVersions(ctx.version, last.version) === 0 && last.fromVersion !== ctx.version) status = 'succeeded';
+      else if (last.unit && last.status === 'started') {
+        try {
+          const st = await ctx.agent.op('cpanel.upgrade.unit_status', { unit: last.unit.replace(/\.service$/, '') });
+          if (st.installed && st.state === 'active') return last;
+          status = unitOutcome(st, last.logFile ? tailLog(last.logFile) : null) ?? 'unknown';
+          if (status === 'failed' && st.exitStatus != null) exitStatus = st.exitStatus;
+          if (status !== 'succeeded') { try { await ctx.agent.op('cpanel.upgrade.unit_status', { unit: last.unit.replace(/\.service$/, ''), resetFailed: true }); } catch { /* unit already gone */ } }
+        } catch (err) {
+          // No systemd to ask: nothing will ever settle it. An agent that is
+          // merely unreachable right now gets another chance at the next boot.
+          if (!['capability_missing', 'binary_not_found', 'unsupported'].includes(err?.code)) return last;
+          status = 'unknown';
+        }
       }
-      settings.set('cpanel.upgrade.last_check', entry);
-      req?.audit?.({ action: 'upgrade.check', args: { url: entry.url, ok: entry.ok, latest: entry.latest?.version ?? null, error: entry.error } });
+      if (status === last.status) return last;
+      const record = { ...last, status, exitStatus, finishedAt: last.finishedAt ?? new Date().toISOString() };
+      settings.set('cpanel.upgrade.last', record);
+      logger?.info?.({ version: last.version, status }, 'settled the last panel upgrade');
+      return record;
+    },
+    async check(req) {
+      const sw = softwarePanel();
+      if (typeof sw.check !== 'function') throw new CapabilityError('software', 'The Software category does not expose a release check');
+      if (!S('software.update_url', '')) throw unprocessable('No update URL is configured', { url: ['Set the update URL under Server Configuration › Update Preferences first'] });
+      await sw.check(req);
+      const { lastCheck, latest } = releaseFromSoftware();
+      req?.audit?.({ action: 'upgrade.check', args: { url: lastCheck?.url ?? null, ok: Boolean(lastCheck?.ok), latest: latest?.version ?? null, error: lastCheck?.error ?? null } });
       return upgrade.status();
     },
     async start({ allowUnverified = false, skipNode = false } = {}, user, req) {
       const can = upgrade.canRun();
       if (!can.ok) throw unprocessable(can.reason, { installMethod: [installMethod()] });
-      const latest = S('cpanel.upgrade.last_check', null)?.latest;
+      const { latest } = releaseFromSoftware();
       if (!latest) throw unprocessable('Check for updates first', { latest: ['no release known'] });
       if (!latest.url) throw unprocessable('The release feed did not publish a download URL', { url: ['missing'] });
       if (compareVersions(latest.version, ctx.version) <= 0) throw conflict(`Version ${latest.version} is not newer than the running ${ctx.version}`);
       // Early, non-authoritative: the agent re-derives all of this from its
       // own policy and keys. allowUnverified is only the operator's
       // acknowledgement; it is never sent to the agent.
+      keysCache = null;
       const { verification, policy } = await upgrade.status();
       if (verification?.keyMissing) throw unprocessable(`The feed's signature names key "${latest.keyId}", which is not trusted on this host; a signature that does not verify is always refused`, { keyId: ['not trusted'] });
       if (verification?.unverifiable) {
@@ -534,6 +583,11 @@ export function createCpanelService(ctx) {
       const { version, url, sha256, signature, keyId, allowUnverified, skipNode } = job.params;
       fs.mkdirSync(dirs.upgrades, { recursive: true, mode: 0o750 });
       const archive = path.join(dirs.upgrades, `whm-${version}.tar.gz`);
+      const part = `${archive}.part`;
+      // The archive only exists on disk between a complete download and the
+      // agent taking its private copy; nothing partial or stale is left behind.
+      const discard = () => { fs.rmSync(part, { force: true }); fs.rmSync(archive, { force: true }); };
+      discard();
       job.log(`Downloading ${url}`);
       job.progress(2, 'downloading');
       const res = await fetch(url, { headers: { 'User-Agent': `whm-panel/${ctx.version}`, Accept: 'application/gzip, application/octet-stream' }, signal: AbortSignal.timeout(15 * 60 * 1000), redirect: 'follow' });
@@ -542,39 +596,51 @@ export function createCpanelService(ctx) {
       const hash = crypto.createHash('sha256');
       let received = 0;
       let lastPct = 2;
-      const out = fs.createWriteStream(archive, { mode: 0o644 });
-      await pipeline(res.body, new Writable({
-        write(chunk, _enc, cb) {
+      const meter = new Transform({
+        transform(chunk, _enc, cb) {
           received += chunk.length;
           if (received > MAX_ARCHIVE_BYTES) return cb(Object.assign(new Error(`archive exceeds ${MAX_ARCHIVE_BYTES} bytes`), { code: 'TOO_LARGE' }));
           hash.update(chunk);
           if (total) { const pct = 2 + Math.round((received / total) * 38); if (pct !== lastPct) { lastPct = pct; job.progress(pct, `downloading ${Math.round(received / 1048576)} / ${Math.round(total / 1048576)} MB`); } }
-          out.write(chunk, cb);
+          cb(null, chunk);
         },
-        final(cb) { out.end(cb); },
-      }));
+      });
+      try {
+        // pipeline() owns every stream: on any failure the file handle is
+        // destroyed before the partial file is removed.
+        await pipeline(res.body, meter, fs.createWriteStream(part, { mode: 0o644 }));
+        fs.renameSync(part, archive);
+      } catch (err) {
+        discard();
+        if (!err.code || err.code === 'ABORT_ERR' || err.name === 'TimeoutError') err.code = 'DOWNLOAD_FAILED';
+        throw err;
+      }
       const digest = hash.digest();
       const digestHex = digest.toString('hex');
       job.log(`Downloaded ${received} bytes, sha256 ${digestHex}`);
-      // Early failures only; the agent repeats every check on its own copy
-      // and applies the host policy to whatever cannot be verified.
-      if (sha256) {
-        if (digestHex !== sha256) throw Object.assign(new Error(`SHA-256 mismatch: feed says ${sha256}, archive is ${digestHex}`), { code: 'CHECKSUM_MISMATCH' });
-        job.log('SHA-256 checksum matches the feed');
-      } else job.log(`No checksum published for this release${allowUnverified ? '; unverified upgrade acknowledged by the operator' : ''}`, 'warn');
-      if (signature) {
-        const signer = await releaseKeys.verify(digest, signature, keyId);
-        if (signer === null) throw Object.assign(new Error(`The release signature does not verify against any trusted key${keyId ? ` (feed names "${keyId}")` : ''}`), { code: 'SIGNATURE_INVALID' });
-        if (signer === undefined) job.log('Signature cannot be checked here: no trusted release key is installed on the host', 'warn');
-        else job.log(`Signature matches trusted key "${signer}"`);
-      } else job.log('No signature published for this release', 'warn');
-      job.progress(45, 'verifying and unpacking');
       let unpacked;
       try {
-        unpacked = await ctx.agent.op('cpanel.upgrade.extract', { archive, version, sha256: sha256 ?? null, signature: signature ?? null, keyId: keyId ?? null }, { timeoutMs: 10 * 60 * 1000 });
-      } catch (err) {
-        const code = { checksum_mismatch: 'CHECKSUM_MISMATCH', invalid_signature: 'SIGNATURE_INVALID', unverified: 'UNVERIFIED', unsigned: 'UNSIGNED', invalid_package: 'INVALID_PACKAGE', refused: 'STAGING_REFUSED', path_not_allowed: 'STAGING_REFUSED' }[err?.code] ?? 'STAGING_FAILED';
-        throw Object.assign(new Error(`The agent refused to stage the release: ${err.message}`), { code });
+        // Early failures only; the agent repeats every check on its own copy
+        // and applies the host policy to whatever cannot be verified.
+        if (sha256) {
+          if (digestHex !== sha256) throw Object.assign(new Error(`SHA-256 mismatch: feed says ${sha256}, archive is ${digestHex}`), { code: 'CHECKSUM_MISMATCH' });
+          job.log('SHA-256 checksum matches the feed');
+        } else job.log(`No checksum published for this release${allowUnverified ? '; unverified upgrade acknowledged by the operator' : ''}`, 'warn');
+        if (signature) {
+          const signer = await releaseKeys.verify(digest, signature, keyId);
+          if (signer === null) throw Object.assign(new Error(`The release signature does not verify against any trusted key${keyId ? ` (feed names "${keyId}")` : ''}`), { code: 'SIGNATURE_INVALID' });
+          if (signer === undefined) job.log('Signature cannot be checked here: no trusted release key is installed on the host', 'warn');
+          else job.log(`Signature matches trusted key "${signer}"`);
+        } else job.log('No signature published for this release', 'warn');
+        job.progress(45, 'verifying and unpacking');
+        try {
+          unpacked = await ctx.agent.op('cpanel.upgrade.extract', { archive, version, sha256: sha256 ?? null, signature: signature ?? null, keyId: keyId ?? null }, { timeoutMs: 10 * 60 * 1000 });
+        } catch (err) {
+          const code = { checksum_mismatch: 'CHECKSUM_MISMATCH', invalid_signature: 'SIGNATURE_INVALID', unverified: 'UNVERIFIED', unsigned: 'UNSIGNED', invalid_package: 'INVALID_PACKAGE', refused: 'STAGING_REFUSED', path_not_allowed: 'STAGING_REFUSED' }[err?.code] ?? 'STAGING_FAILED';
+          throw Object.assign(new Error(`The agent refused to stage the release: ${err.message}`), { code });
+        }
+      } finally {
+        discard();
       }
       for (const w of unpacked.warnings || []) job.log(w, 'warn');
       job.log(`Agent verified sha256 ${unpacked.sha256}${unpacked.signer ? ` and signature (key "${unpacked.signer}")` : ''}; unpacked ${unpacked.name ?? 'release'} ${unpacked.packageVersion ?? ''} into ${unpacked.sourceDir}`);

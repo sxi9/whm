@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import https from 'node:https';
 import http from 'node:http';
+import os from 'node:os';
 import { json, paginate } from '../db/index.js';
 import { notFound, conflict, forbidden, badRequest, unprocessable, CapabilityError } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
@@ -66,8 +67,8 @@ export function createDnsService(ctx) {
     clusters: db.prepare("SELECT id, name, remote_host, role, enabled, last_sync_at, created_at, api_token_enc IS NOT NULL AS has_token FROM dns_clusters ORDER BY name"),
     clusterById: db.prepare('SELECT * FROM dns_clusters WHERE id = ?'),
     clusterSynced: db.prepare("UPDATE dns_clusters SET last_sync_at = datetime('now') WHERE id = ?"),
-    syncRow: db.prepare(`INSERT INTO dns_zone_sync (zone_id, cluster_id, serial, status, message, synced_at) VALUES (?, ?, ?, ?, ?, datetime('now'))
-      ON CONFLICT (zone_id, cluster_id) DO UPDATE SET serial = excluded.serial, status = excluded.status, message = excluded.message, synced_at = excluded.synced_at`),
+    syncRow: db.prepare(`INSERT INTO dns_zone_sync (zone_id, cluster_id, serial, status, message, endpoint, synced_at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+      ON CONFLICT (zone_id, cluster_id) DO UPDATE SET serial = excluded.serial, status = excluded.status, message = excluded.message, endpoint = excluded.endpoint, synced_at = excluded.synced_at`),
     syncStatus: db.prepare('SELECT s.*, z.domain, z.serial AS current_serial, c.name AS cluster FROM dns_zone_sync s JOIN dns_zones z ON z.id = s.zone_id JOIN dns_clusters c ON c.id = s.cluster_id ORDER BY z.domain, c.name'),
     syncRowFor: db.prepare('SELECT * FROM dns_zone_sync WHERE zone_id = ? AND cluster_id = ?'),
   };
@@ -425,14 +426,13 @@ export function createDnsService(ctx) {
     return url;
   }
 
-  function postJson(url, body, { token, verifyTls = true, timeoutMs = 15_000 } = {}) {
+  function requestJson(url, { method = 'GET', body, token, verifyTls = true, timeoutMs = 15_000 } = {}) {
     return new Promise((resolve, reject) => {
-      const payload = JSON.stringify(body);
+      const payload = body === undefined ? null : JSON.stringify(body);
       const mod = url.protocol === 'http:' ? http : https;
-      const req = mod.request(url, {
-        method: 'POST', timeout: timeoutMs, rejectUnauthorized: verifyTls,
-        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), Authorization: `Bearer ${token}`, Accept: 'application/json' },
-      }, (res) => {
+      const headers = { Authorization: `Bearer ${token}`, Accept: 'application/json' };
+      if (payload !== null) { headers['Content-Type'] = 'application/json'; headers['Content-Length'] = Buffer.byteLength(payload); }
+      const req = mod.request(url, { method, timeout: timeoutMs, rejectUnauthorized: verifyTls, headers }, (res) => {
         let data = '';
         res.setEncoding('utf8');
         res.on('data', (c) => { data += c; });
@@ -444,8 +444,41 @@ export function createDnsService(ctx) {
       });
       req.on('timeout', () => req.destroy(new Error('timed out')));
       req.on('error', reject);
-      req.end(payload);
+      req.end(payload ?? undefined);
     });
+  }
+  const postJson = (url, body, opts) => requestJson(url, { ...opts, method: 'POST', body });
+
+  // Peer TLS verification: the per-peer option (Clusters category) wins over
+  // the global dns.cluster_verify_tls setting; the table may not exist on a
+  // build without that category.
+  function peerVerifyTls(peer) {
+    try {
+      const row = db.prepare('SELECT verify_tls FROM cluster_peer_options WHERE cluster_id = ?').get(peer.id);
+      if (row && row.verify_tls != null) return Boolean(row.verify_tls);
+    } catch { /* no cluster_peer_options table */ }
+    return Boolean(setting('dns.cluster_verify_tls', true));
+  }
+
+  // Which endpoint a peer takes zones on: a cluster-aware panel answers
+  // /api/clusters/ping and receives on /api/clusters/dns/receive (logged in its
+  // exchange log); an older one only has /api/dns/zones/import. The answer
+  // is cached per peer for the run.
+  const PEER_RECEIVE = '/api/clusters/dns/receive';
+  const PEER_IMPORT = '/api/dns/zones/import';
+  async function probePeerEndpoint(base, { token, verifyTls }, log) {
+    try {
+      const res = await requestJson(new URL('/api/clusters/ping', base), { token, verifyTls, timeoutMs: 10_000 });
+      if (res.status === 200) {
+        const accepts = res.body?.data?.accepts;
+        if (accepts && accepts.dns === false) log?.('peer answers ping but does not accept DNS pushes', 'warn');
+        return { endpoint: PEER_RECEIVE, reason: 'cluster-aware peer' };
+      }
+      if (res.status === 401 || res.status === 403) return { endpoint: PEER_IMPORT, reason: `ping answered HTTP ${res.status}` };
+      return { endpoint: PEER_IMPORT, reason: res.status === 404 ? 'peer has no cluster endpoints' : `ping answered HTTP ${res.status}` };
+    } catch (err) {
+      return { endpoint: PEER_IMPORT, reason: `ping failed: ${err.message}` };
+    }
   }
 
   const service = {
@@ -1157,37 +1190,55 @@ export function createDnsService(ctx) {
       return { job };
     },
 
-    // Pushes rendered zones to every enabled peer's /api/dns/zones/import.
-    // Peers in role 'sync' are pushed to like 'write-only' ones: this version
-    // never pulls zones back from a peer.
+    // Pushes rendered zones to every enabled peer: a cluster-aware peer (one
+    // whose /api/clusters/ping answers) takes them on /api/clusters/dns/receive,
+    // any other on /api/dns/zones/import. Peers in role 'sync' are pushed to
+    // like 'write-only' ones: this version never pulls zones back from a peer.
     async runSync(jobCtx) {
       const { domains, clusterId, force = false } = jobCtx.params;
       const peers = db.prepare("SELECT * FROM dns_clusters WHERE enabled = 1 AND role IN ('write-only', 'sync')").all().filter((c) => !clusterId || c.id === clusterId);
-      if (!peers.length) { jobCtx.log('No DNS cluster peers are configured; nothing to synchronise'); return { peers: 0, zones: 0, ok: 0, failed: 0, skipped: 0 }; }
+      if (!peers.length) { jobCtx.log('No DNS cluster peers are configured; nothing to synchronise'); return { peers: 0, zones: 0, ok: 0, failed: 0, skipped: 0, endpoints: {} }; }
       const zones = db.prepare('SELECT * FROM dns_zones ORDER BY domain').all().filter((z) => !domains || domains.includes(z.domain));
-      const verifyTls = setting('dns.cluster_verify_tls', true);
       const full = Boolean(force || domains);
-      const summary = { peers: peers.length, zones: zones.length, ok: 0, failed: 0, skipped: 0 };
+      const source = setting('basic.hostname', '') || os.hostname();
+      const summary = { peers: peers.length, zones: zones.length, ok: 0, failed: 0, skipped: 0, endpoints: {} };
       let i = 0;
       for (const peer of peers) {
         if (!peer.api_token_enc) { jobCtx.log(`${peer.name}: no API token configured`, 'warn'); summary.failed += zones.length; continue; }
         let token;
-        let url;
-        try { token = cryptoSvc.decrypt(peer.api_token_enc); url = new URL('/api/dns/zones/import', parseRemote(peer.remote_host)); } catch (err) { jobCtx.log(`${peer.name}: ${err.message}`, 'error'); summary.failed += zones.length; continue; }
-        for (const zone of zones) {
+        let base;
+        try { token = cryptoSvc.decrypt(peer.api_token_enc); base = parseRemote(peer.remote_host); } catch (err) { jobCtx.log(`${peer.name}: ${err.message}`, 'error'); summary.failed += zones.length; continue; }
+        const verifyTls = peerVerifyTls(peer);
+        const pending = zones.filter((zone) => {
+          if (full) return true;
+          const last = stmts.syncRowFor.get(zone.id, peer.id);
+          return !(last?.status === 'ok' && last.serial === zone.serial);
+        });
+        summary.skipped += zones.length - pending.length;
+        if (!pending.length) { i += zones.length; stmts.clusterSynced.run(peer.id); continue; }
+        const probe = await probePeerEndpoint(base, { token, verifyTls }, (msg, level) => jobCtx.log(`${peer.name}: ${msg}`, level));
+        let endpoint = probe.endpoint;
+        summary.endpoints[peer.name] = endpoint;
+        jobCtx.log(`${peer.name}: pushing via ${endpoint} (${probe.reason})`);
+        const payloadFor = (zone, body) => (endpoint === PEER_RECEIVE ? { domain: zone.domain, body, serial: zone.serial, source } : { domain: zone.domain, body, serial: zone.serial });
+        for (const zone of pending) {
           i++;
           jobCtx.progress((i / Math.max(1, peers.length * zones.length)) * 100, `${zone.domain} → ${peer.name}`);
-          if (!full) {
-            const last = stmts.syncRowFor.get(zone.id, peer.id);
-            if (last?.status === 'ok' && last.serial === zone.serial) { summary.skipped++; continue; }
-          }
           const body = renderZone(zone, stmts.records.all(zone.id));
           try {
-            const res = await postJson(url, { domain: zone.domain, body, serial: zone.serial }, { token, verifyTls });
-            if (res.status >= 200 && res.status < 300) { stmts.syncRow.run(zone.id, peer.id, zone.serial, 'ok', null); summary.ok++; jobCtx.log(`${zone.domain} → ${peer.name}: ok`); }
-            else { const msg = res.body?.error?.message || `HTTP ${res.status}`; stmts.syncRow.run(zone.id, peer.id, zone.serial, 'failed', msg); summary.failed++; jobCtx.log(`${zone.domain} → ${peer.name}: ${msg}`, 'error'); }
+            let res = await postJson(new URL(endpoint, base), payloadFor(zone, body), { token, verifyTls });
+            // A peer that answers ping but lacks the receiver (an older
+            // cluster-aware build) takes the plain import for the rest of the run.
+            if (res.status === 404 && endpoint === PEER_RECEIVE) {
+              endpoint = PEER_IMPORT;
+              summary.endpoints[peer.name] = endpoint;
+              jobCtx.log(`${peer.name}: no ${PEER_RECEIVE} on this peer; falling back to ${PEER_IMPORT}`, 'warn');
+              res = await postJson(new URL(endpoint, base), payloadFor(zone, body), { token, verifyTls });
+            }
+            if (res.status >= 200 && res.status < 300) { stmts.syncRow.run(zone.id, peer.id, zone.serial, 'ok', null, endpoint); summary.ok++; jobCtx.log(`${zone.domain} → ${peer.name}: ok`); }
+            else { const msg = res.body?.error?.message || `HTTP ${res.status}`; stmts.syncRow.run(zone.id, peer.id, zone.serial, 'failed', msg, endpoint); summary.failed++; jobCtx.log(`${zone.domain} → ${peer.name}: ${msg}`, 'error'); }
           } catch (err) {
-            stmts.syncRow.run(zone.id, peer.id, zone.serial, 'failed', err.message); summary.failed++; jobCtx.log(`${zone.domain} → ${peer.name}: ${err.message}`, 'error');
+            stmts.syncRow.run(zone.id, peer.id, zone.serial, 'failed', err.message, endpoint); summary.failed++; jobCtx.log(`${zone.domain} → ${peer.name}: ${err.message}`, 'error');
           }
         }
         stmts.clusterSynced.run(peer.id);

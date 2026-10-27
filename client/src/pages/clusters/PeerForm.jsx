@@ -34,12 +34,12 @@ export function PeerForm({ initial, roles, saving, error, onSubmit, onCancel, fo
         <Field label="Name" required error={fields.name} help="How the peer appears in lists and logs."><TextInput value={draft.name} onChange={(v) => set('name', v)} placeholder="ns2" autoFocus /></Field>
         <Field label="Peer address" required error={fields.host} help="Hostname or IP of the other panel. Port 2087 (HTTPS) is assumed; use http://host:2086 for a plain-HTTP panel."><TextInput value={draft.host} onChange={(v) => set('host', v)} placeholder="ns2.example.com" /></Field>
       </div>
-      <Field label={editing ? 'Replace API token' : 'API token'} required={!editing} error={fields.token} help={editing ? 'Leave blank to keep the current token.' : 'A cluster token issued on the peer under Clusters > DNS Cluster > "Tokens for remote panels" (or any root API token of the peer).'}>
+      <Field label={editing ? 'Replace API token' : 'API token'} required={!editing} error={fields.token} help={editing ? 'Leave blank to keep the current token.' : 'A cluster token issued on the peer: under Clusters > DNS Cluster for pushing zones to it, under Clusters > Configuration Cluster for exchanging settings (one token serves one purpose).'}>
         <TextInput value={draft.token} onChange={(v) => set('token', v)} type="password" autoComplete="off" placeholder={editing ? '(unchanged)' : 'whm_…'} />
       </Field>
       <Field label="DNS role" error={fields.role} help={ROLE_HELP[draft.role]}><Select value={draft.role} onChange={(v) => set('role', v)} options={roles.map((r) => ({ value: r, label: ROLE_LABEL[r] || r }))} /></Field>
       <Field inline><Toggle checked={draft.configEnabled} onChange={(v) => set('configEnabled', v)} label="Configuration cluster" description="Pushes of shared settings from this server reach this peer." /></Field>
-      <Field inline><Toggle checked={draft.verifyTls} onChange={(v) => set('verifyTls', v)} label="Verify TLS certificate" description="Turn off only for a peer with a self-signed panel certificate." /></Field>
+      <Field inline><Toggle checked={draft.verifyTls} onChange={(v) => set('verifyTls', v)} label="Verify TLS certificate" description="Applies to connectivity tests and settings exchanges with this peer. Zone pushes follow the DNS cluster's global setting. Turn off only for a peer with a self-signed panel certificate." /></Field>
       <Field inline><Toggle checked={draft.enabled} onChange={(v) => set('enabled', v)} label="Enabled" description="Disabled peers are kept but skipped by every push." /></Field>
       <FormActions>
         <Button type="submit" variant="primary" loading={saving}>{editing ? 'Save peer' : 'Add peer'}</Button>

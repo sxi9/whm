@@ -1530,7 +1530,9 @@ defineOp('web.wp.detect', {
   description: 'Whether WP-CLI is installed and its version',
   run: async () => {
     if (!hasBinary('wp')) return { installed: false, version: null, php: hasBinary('php'), runuser: hasBinary('runuser') };
-    const r = await exec('wp', ['cli', 'version', '--no-color'], { allowFailure: true, timeoutMs: 60_000 });
+    // WP-CLI refuses every command under euid 0 unless told otherwise; this
+    // probe loads no site, so running it as root is harmless.
+    const r = await exec('wp', ['cli', 'version', '--no-color', '--allow-root'], { allowFailure: true, timeoutMs: 60_000 });
     const m = /WP-CLI\s+([0-9][0-9.]*)/.exec(r.stdout);
     return { installed: true, version: m ? m[1] : null, php: hasBinary('php'), runuser: hasBinary('runuser') };
   },
@@ -1587,6 +1589,7 @@ defineOp('web.wp.inspect', {
 
 defineOp('web.wp.update', {
   description: 'Update WordPress core, one plugin/theme or all of them (WP-CLI as the account user)',
+  destructive: true,
   timeoutMs: 1_800_000,
   schema: z.object({ ...wpSiteArgs, kind: z.enum(['core', 'plugin', 'theme']), name: wpName.optional(), all: z.boolean().default(false) }).strict()
     .refine((v) => v.kind === 'core' || v.name || v.all, 'name or all is required for plugin/theme updates'),
@@ -1602,6 +1605,7 @@ defineOp('web.wp.update', {
 
 defineOp('web.wp.maintenance', {
   description: 'Activate or deactivate WordPress maintenance mode',
+  destructive: true,
   schema: z.object({ ...wpSiteArgs, enabled: z.boolean() }).strict(),
   run: async ({ username, path: p, enabled }, ctx) => {
     const { home, site } = wpSite(username, p, ctx, 'write');
@@ -1647,6 +1651,7 @@ defineOp('web.wp.harden', {
 
 defineOp('web.wp.hardenfix', {
   description: 'Apply hardening fixes: private wp-config.php, DISALLOW_FILE_EDIT, WP_DEBUG off, automatic core updates',
+  destructive: true,
   schema: z.object({ ...wpSiteArgs, fixes: z.array(z.enum(WP_HARDENING_FIXES)).min(1).max(WP_HARDENING_FIXES.length) }).strict(),
   run: async ({ username, path: p, fixes }, ctx) => {
     const { home, site } = wpSite(username, p, ctx, 'write');
@@ -1678,8 +1683,27 @@ async function activeTheme(username, home, site) {
   return Array.isArray(list) && list.length ? { name: String(list[0].name), version: list[0].version ?? null } : null;
 }
 
+// What a failed install created is removed, so the retry the panel offers is
+// not refused with "already contains a WordPress installation". A directory
+// that existed before keeps every entry it already had (only the new ones go);
+// the removal runs as the account user, so root never deletes inside the tree.
+async function removeInstallLeftovers(username, home, site, before) {
+  let targets;
+  if (before === null) targets = [site];
+  else {
+    let names = [];
+    try { names = fs.readdirSync(site); } catch { names = []; }
+    targets = names.filter((n) => !before.has(n)).map((n) => path.join(site, n));
+  }
+  if (!targets.length) return `nothing was left behind in ${site}`;
+  const r = await exec('runuser', ['-u', username, '--', 'rm', '-rf', '--', ...targets], { allowFailure: true, timeoutMs: 300_000, env: { HOME: home } });
+  if (r.code !== 0) throw new OpError('command_failed', `rm -rf as ${username} failed: ${lastLineOf(r)}`);
+  return before === null ? `removed ${site}` : `removed the ${targets.length} new entr${targets.length === 1 ? 'y' : 'ies'} from ${site}`;
+}
+
 defineOp('web.wp.install', {
   description: 'Download WordPress with its default themes, write wp-config.php, run the installer as the account user (credentials via stdin) and verify a theme is active',
+  destructive: true,
   timeoutMs: 1_800_000,
   schema: z.object({
     ...wpSiteArgs, url: wpUrl, title: wpTitle, adminUser: wpUser, adminEmail: z.string().email().max(254), adminPassword: wpSecret,
@@ -1689,29 +1713,39 @@ defineOp('web.wp.install', {
     const { home, site } = wpSite(username, p, ctx, 'write');
     requireWpCli();
     if (lexists(path.join(site, 'wp-config.php'))) throw new OpError('exists', `${site} already contains a WordPress installation`);
+    let before = null;
+    if (lexists(site)) { try { before = new Set(fs.readdirSync(site)); } catch { before = new Set(); } }
     const mk = await exec('runuser', ['-u', username, '--', 'mkdir', '-p', '--', site], { allowFailure: true, env: { HOME: home } });
     if (mk.code !== 0) throw new OpError('command_failed', `could not create ${site} as ${username}: ${lastLineOf(mk)}`);
     const steps = [];
-    const dl = await wp(username, home, site, ['core', 'download', `--locale=${locale}`], { timeoutMs: 900_000, skip: false });
-    if (dl.code !== 0 && !/already present/i.test(dl.stderr)) throw new OpError('command_failed', `wp core download failed: ${lastLineOf(dl)}`, { step: 'download' });
-    steps.push('download');
-    const cfg = await wp(username, home, site, ['config', 'create', `--dbname=${dbName}`, `--dbuser=${dbUser}`, `--dbhost=${dbHost}`, `--dbprefix=${tablePrefix}`, `--locale=${locale}`, '--prompt=dbpass', '--skip-check'], { input: `${dbPassword}\n`, skip: false });
-    if (cfg.code !== 0) throw new OpError('command_failed', `wp config create failed: ${lastLineOf(cfg)}`, { step: 'config' });
-    steps.push('config');
-    const ins = await wp(username, home, site, ['core', 'install', `--url=${url}`, `--title=${title}`, `--admin_user=${adminUser}`, `--admin_email=${adminEmail}`, '--prompt=admin_password', '--skip-email'], { input: `${adminPassword}\n`, timeoutMs: 600_000, skip: false });
-    if (ins.code !== 0) throw new OpError('command_failed', `wp core install failed: ${lastLineOf(ins)}`, { step: 'install' });
-    steps.push('install');
-    let theme = await activeTheme(username, home, site);
-    if (!theme) {
-      const t = await wp(username, home, site, ['theme', 'install', WP_FALLBACK_THEME, '--activate'], { timeoutMs: 600_000, skip: false });
-      if (t.code !== 0) throw new OpError('command_failed', `WordPress is installed but no theme is active and ${WP_FALLBACK_THEME} could not be installed: ${lastLineOf(t)}`, { step: 'theme' });
-      theme = await activeTheme(username, home, site);
-      if (!theme) throw new OpError('command_failed', 'WordPress is installed but no theme is active; the site would render an error page', { step: 'theme' });
+    try {
+      const dl = await wp(username, home, site, ['core', 'download', `--locale=${locale}`], { timeoutMs: 900_000, skip: false });
+      if (dl.code !== 0 && !/already present/i.test(dl.stderr)) throw new OpError('command_failed', `wp core download failed: ${lastLineOf(dl)}`, { step: 'download' });
+      steps.push('download');
+      const cfg = await wp(username, home, site, ['config', 'create', `--dbname=${dbName}`, `--dbuser=${dbUser}`, `--dbhost=${dbHost}`, `--dbprefix=${tablePrefix}`, `--locale=${locale}`, '--prompt=dbpass', '--skip-check'], { input: `${dbPassword}\n`, skip: false });
+      if (cfg.code !== 0) throw new OpError('command_failed', `wp config create failed: ${lastLineOf(cfg)}`, { step: 'config' });
+      steps.push('config');
+      const ins = await wp(username, home, site, ['core', 'install', `--url=${url}`, `--title=${title}`, `--admin_user=${adminUser}`, `--admin_email=${adminEmail}`, '--prompt=admin_password', '--skip-email'], { input: `${adminPassword}\n`, timeoutMs: 600_000, skip: false });
+      if (ins.code !== 0) throw new OpError('command_failed', `wp core install failed: ${lastLineOf(ins)}`, { step: 'install' });
+      steps.push('install');
+      let theme = await activeTheme(username, home, site);
+      if (!theme) {
+        const t = await wp(username, home, site, ['theme', 'install', WP_FALLBACK_THEME, '--activate'], { timeoutMs: 600_000, skip: false });
+        if (t.code !== 0) throw new OpError('command_failed', `WordPress is installed but no theme is active and ${WP_FALLBACK_THEME} could not be installed: ${lastLineOf(t)}`, { step: 'theme' });
+        theme = await activeTheme(username, home, site);
+        if (!theme) throw new OpError('command_failed', 'WordPress is installed but no theme is active; the site would render an error page', { step: 'theme' });
+      }
+      steps.push('theme');
+      let warning = null;
+      try { await chmodAsUser(username, home, path.join(site, 'wp-config.php'), '600'); } catch (err) { warning = err.message; }
+      const v = await wp(username, home, site, ['core', 'version']);
+      return { path: site, url, version: v.code === 0 ? v.stdout.trim() : null, theme, steps, warning };
+    } catch (err) {
+      const failure = err instanceof OpError ? err : new OpError('command_failed', err.message);
+      let cleanup;
+      try { cleanup = await removeInstallLeftovers(username, home, site, before); } catch (rmErr) { cleanup = `${site} was left in place (${rmErr.message}); remove it before retrying`; }
+      failure.details = { ...(failure.details || {}), steps: steps.slice(), cleanup };
+      throw failure;
     }
-    steps.push('theme');
-    let warning = null;
-    try { await chmodAsUser(username, home, path.join(site, 'wp-config.php'), '600'); } catch (err) { warning = err.message; }
-    const v = await wp(username, home, site, ['core', 'version']);
-    return { path: site, url, version: v.code === 0 ? v.stdout.trim() : null, theme, steps, warning };
   },
 });

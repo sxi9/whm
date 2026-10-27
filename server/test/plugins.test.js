@@ -3,7 +3,7 @@ import request from 'supertest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { BUNDLED_PLUGINS, BUNDLED_DIR, readBundledManifest } from '../src/services/plugins-bundled.js';
+import { BUNDLED_PLUGINS, BUNDLED_DIR, ENSURE_JOB, readBundledManifest } from '../src/services/plugins-bundled.js';
 
 const MON = 'net.whm.server-monitoring';
 const AV = 'net.whm.imunifyav';
@@ -89,16 +89,41 @@ describe('Plugins category: bundled ImunifyAV, Server Monitoring and WP Toolkit'
       try {
         expect(bare.ctx.plugins.list()).toEqual([]);
         expect(typeof bare.ctx.bundledPlugins.ensureInstalled).toBe('function');
+        expect(bare.ctx.jobs.list({ type: ENSURE_JOB })).toEqual([]);
       } finally { await bare.close(); }
     });
+
+    it('the production boot defers the install to a one-shot job that runs once the workers start, never twice', async () => {
+      // start() in index.js starts the job workers after listen + loadAll, so
+      // the install never delays the first request; the queued job is the
+      // only thing register() leaves behind.
+      const deferred = await createTestApp({ agent: pluginsAgent({ ...state, installs: [], databases: [], dbUsers: [] }), overrides: { bundledPlugins: 'job' } });
+      try {
+        expect(deferred.ctx.plugins.list()).toEqual([]);
+        const queued = deferred.ctx.jobs.list({ type: ENSURE_JOB, status: 'queued' });
+        expect(queued).toHaveLength(1);
+        expect(deferred.ctx.bundledPlugins.scheduleEnsureInstalled().id).toBe(queued[0].id);
+        expect(deferred.ctx.jobs.list({ type: ENSURE_JOB })).toHaveLength(1);
+        deferred.ctx.jobs.start();
+        const job = await waitForJob(deferred.ctx, queued[0].id);
+        expect(job.status).toBe('done');
+        expect(job.result.results.map((r) => r.action)).toEqual(['installed', 'installed', 'installed']);
+        for (const p of BUNDLED_PLUGINS) expect(deferred.ctx.plugins.isLive(p.id)).toBe(true);
+        expect(deferred.ctx.db.prepare('SELECT action FROM bundled_plugins').all().map((r) => r.action)).toEqual(['installed', 'installed', 'installed']);
+      } finally { await deferred.close(); }
+    }, 30_000);
   });
 
   describe('GET /api/bundled-plugins', () => {
     it('lists state, versions and pages for root and resellers; plain users are refused', async () => {
       const res = await get('/api/bundled-plugins').expect(200);
       expect(res.body.data.map((p) => [p.id, p.state, p.enabled, p.canManage, p.pages.length])).toEqual([[MON, 'enabled', true, true, 2], [AV, 'enabled', true, true, 2], [WP, 'enabled', true, true, 2]]);
+      expect(res.body.data.map((p) => [p.roles, p.canUse])).toEqual([[['root'], true], [['root'], true], [['root', 'reseller'], true]]);
       const r = await resellerHttp.get('/api/bundled-plugins').expect(200);
       expect(r.body.data[0].canManage).toBe(false);
+      // the two root-only plugins say so up front, so the page shows a notice instead of 403 banners
+      expect(r.body.data.map((p) => [p.id, p.canUse])).toEqual([[MON, false], [AV, false], [WP, true]]);
+      expect((await resellerHttp.get(`/api/bundled-plugins/${AV}`).expect(200)).body.data).toMatchObject({ canUse: false, canManage: false, roles: ['root'] });
       await userHttp.get('/api/bundled-plugins').expect(403);
       const one = await get(`/api/bundled-plugins/${MON}`).expect(200);
       expect(one.body.data).toMatchObject({ id: MON, label: 'Server Monitoring', fnKey: 'plugins/server-monitoring', bundledVersion: '1.0.0', updateAvailable: false });
@@ -315,6 +340,45 @@ describe('Plugins category: bundled ImunifyAV, Server Monitoring and WP Toolkit'
       const done = await waitForJob(app.ctx, Number(retry.body.data.job.id));
       expect(done.status).toBe('done');
       expect(app.ctx.db.prepare('SELECT status, cleanup FROM wp_installs WHERE id = ?').get(retry.body.data.installId)).toEqual({ status: 'done', cleanup: null });
+    });
+
+    it('a failure after the download records what the agent removed (or left) next to the dropped database', async () => {
+      state.wp = true;
+      const fail = (details) => app.agent.set('web.wp.install', Object.assign(new Error('wp core install failed: Database connection error'), { agentError: true, code: 'command_failed', details }));
+      try {
+        fail({ step: 'install', steps: ['download', 'config'], cleanup: 'removed /home/bob/public_html/shop' });
+        let res = await post('/api/bundled-plugins/wp-toolkit/install', { username: 'bob', directory: 'shop', title: 'Shop', adminUser: 'bob', adminPassword: 'Str0ng-Passw0rd!', dbName: 'shop' }).expect(202);
+        expect((await waitForJob(app.ctx, Number(res.body.data.job.id))).status).toBe('failed');
+        let row = app.ctx.db.prepare('SELECT status, cleanup FROM wp_installs WHERE id = ?').get(res.body.data.installId);
+        expect(row).toEqual({ status: 'failed', cleanup: 'site /home/bob/public_html/shop: removed /home/bob/public_html/shop; dropped user bob_shop; dropped database bob_shop' });
+        // a tree the account user could not remove is flagged on the row the UI lists
+        fail({ step: 'theme', steps: ['download', 'config', 'install'], cleanup: '/home/bob/public_html/shop was left in place (rm -rf as bob failed: Permission denied); remove it before retrying' });
+        res = await post('/api/bundled-plugins/wp-toolkit/install', { username: 'bob', directory: 'shop', title: 'Shop', adminUser: 'bob', adminPassword: 'Str0ng-Passw0rd!', dbName: 'shop' }).expect(202);
+        expect((await waitForJob(app.ctx, Number(res.body.data.job.id))).status).toBe('failed');
+        row = app.ctx.db.prepare('SELECT status, cleanup FROM wp_installs WHERE id = ?').get(res.body.data.installId);
+        expect(row.cleanup).toMatch(/^site \/home\/bob\/public_html\/shop: \/home\/bob\/public_html\/shop was left in place .*remove it before retrying; dropped user bob_shop; dropped database bob_shop$/);
+        const logs = app.ctx.jobs.get(Number(res.body.data.job.id)).logs.map((l) => l.message || l.line || JSON.stringify(l));
+        expect(logs.join('\n')).toMatch(/left in place/);
+        // an older agent that reports no cleanup after the download still gets a warning on the row
+        fail({ step: 'config' });
+        res = await post('/api/bundled-plugins/wp-toolkit/install', { username: 'bob', directory: 'shop', title: 'Shop', adminUser: 'bob', adminPassword: 'Str0ng-Passw0rd!', dbName: 'shop' }).expect(202);
+        expect((await waitForJob(app.ctx, Number(res.body.data.job.id))).status).toBe('failed');
+        expect(app.ctx.db.prepare('SELECT cleanup FROM wp_installs WHERE id = ?').get(res.body.data.installId).cleanup).toMatch(/^site \/home\/bob\/public_html\/shop may still hold a partial WordPress tree; remove it before retrying; dropped user/);
+      } finally { app.agent.reset('web.wp.install'); }
+    });
+
+    it('the installs list applies ownership before the row limit, so a reseller still sees their own installs', async () => {
+      const bobRows = app.ctx.db.prepare('SELECT COUNT(*) AS n FROM wp_installs WHERE username = ?').get('bob').n;
+      expect(bobRows).toBeGreaterThan(0);
+      const insert = app.ctx.db.prepare("INSERT INTO wp_installs (username, path, url, db_name, db_user, status, requested_by) VALUES ('alice', ?, ?, 'alice_wp', 'alice_wp', 'done', 'root')");
+      for (let i = 0; i < 60; i++) insert.run(`/home/alice/public_html/site${i}`, `https://alice.com/site${i}`);
+      const mine = await resellerHttp.get('/api/bundled-plugins/wp-toolkit/installs').expect(200);
+      expect(mine.body.data).toHaveLength(bobRows);
+      expect(mine.body.data.every((r) => r.username === 'bob')).toBe(true);
+      const all = await get('/api/bundled-plugins/wp-toolkit/installs').expect(200);
+      expect(all.body.data).toHaveLength(50);
+      expect(all.body.data.every((r) => r.username === 'alice')).toBe(true);
+      await userHttp.get('/api/bundled-plugins/wp-toolkit/installs').expect(403);
     });
   });
 });

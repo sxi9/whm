@@ -1,6 +1,7 @@
 import express, { Router } from 'express';
 import { validate, z, fields } from '../../lib/validate.js';
 import { requireRoot, requireReseller } from '../../middleware/rbac.js';
+import { HttpError } from '../../lib/errors.js';
 import { createCpanelService, AUDIENCES, SEVERITIES, IMAGE_KINDS, UPGRADE_JOB } from '../../services/cpanel.js';
 
 const singleLine = (max) => z.string().trim().max(max).regex(/^[^\r\n\0<>]*$/, 'A single line without angle brackets');
@@ -22,7 +23,7 @@ const isoDate = z.string().datetime({ offset: true }).nullable().optional();
 const newsBody = z.object({
   title: singleLine(160).min(1),
   body: z.string().max(20_000).default(''),
-  audience: z.enum(AUDIENCES).default('all'),
+  audience: z.enum(AUDIENCES).optional(),
   severity: z.enum(SEVERITIES).default('info'),
   enabled: z.boolean().default(true),
   startsAt: isoDate,
@@ -38,13 +39,15 @@ export async function register(ctx) {
   ctx.cpanel = createCpanelService(ctx);
   const s = ctx.cpanel;
   ctx.jobs.register(UPGRADE_JOB, (job) => s.upgrade.run(job));
+  // One-shot: settle an upgrade record the installer's restart cut short.
+  s.upgrade.reconcile().catch((err) => ctx.logger?.warn?.({ err: err.message }, 'could not settle the last panel upgrade'));
 
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.json(d?.meta ? d : { data: d })).catch(next);
   const status = (code, fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(code).json({ data: d })).catch(next);
   const sendImage = (req, res, next) => {
     try {
       const img = s.branding.image(req.params.kind);
-      res.set('Cache-Control', 'private, max-age=86400');
+      res.set('Cache-Control', 'public, max-age=86400');
       res.set('ETag', `"${img.sha256.slice(0, 16)}"`);
       res.set('X-Content-Type-Options', 'nosniff');
       res.set('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'");
@@ -52,27 +55,38 @@ export async function register(ctx) {
       res.type(img.mime).sendFile(img.file);
     } catch (err) { next(err); }
   };
-  const rawImage = express.raw({ type: () => true, limit: `${Math.max(...Object.values(IMAGE_KINDS).map((k) => k.maxBytes)) + 1024}b` });
+  // Only image bodies are parsed raw; express.json has already consumed a JSON
+  // body by now, and anything else is not an upload.
+  const rawImage = [
+    express.raw({ type: ['image/*', 'application/octet-stream'], limit: `${Math.max(...Object.values(IMAGE_KINDS).map((k) => k.maxBytes)) + 1024}b` }),
+    (req, _res, next) => next(Buffer.isBuffer(req.body) ? undefined : new HttpError(415, 'unsupported_media_type', 'Send the image bytes with an image/* or application/octet-stream content type')),
+  ];
 
   const r = Router();
 
   // Change Log
-  r.get('/changelog', requireReseller, wrap(() => s.changelog.get()));
+  r.get('/changelog', requireReseller, wrap((req) => s.changelog.get(req.user)));
 
   // Customization
   r.get('/branding', wrap(() => s.branding.get()));
   r.put('/branding', requireRoot, validate({ body: brandingBody }), wrap((req) => s.branding.update(req.body, req)));
   r.get('/branding/:kind', validate({ params: imageKind }), sendImage);
-  r.post('/branding/:kind', requireRoot, validate({ params: imageKind }), rawImage, status(201, (req) => s.branding.setImage(req.params.kind, req.body, req)));
+  r.post('/branding/:kind', requireRoot, validate({ params: imageKind }), rawImage, status(201, (req) => {
+    // The audit middleware serialises req.body when the response finishes.
+    const buf = req.body;
+    req.body = { bytes: buf.length };
+    return s.branding.setImage(req.params.kind, buf, req);
+  }));
   r.delete('/branding/:kind', requireRoot, validate({ params: imageKind }), wrap((req) => s.branding.removeImage(req.params.kind, req)));
 
-  // Modify cPanel & WHM News
+  // Modify cPanel & WHM News: root manages every item; a reseller holding the
+  // `news` ACL (checked in the service) manages items for its own accounts.
   r.get('/news/active', wrap((req) => s.news.active(req.user)));
-  r.get('/news', requireRoot, validate({ query: z.object({ page: fields.page, pageSize: fields.pageSize, q: z.string().trim().max(200).optional(), status: z.enum(['active', 'scheduled', 'expired', 'disabled']).optional() }) }), wrap((req) => s.news.list(req.query)));
-  r.post('/news', requireRoot, validate({ body: newsBody }), status(201, (req) => s.news.create(req.body, req.user, req)));
-  r.get('/news/:id', requireRoot, validate({ params: idParam }), wrap((req) => s.news.get(req.params.id)));
-  r.put('/news/:id', requireRoot, validate({ params: idParam, body: newsPatch }), wrap((req) => s.news.update(req.params.id, req.body, req)));
-  r.delete('/news/:id', requireRoot, validate({ params: idParam }), wrap((req) => s.news.remove(req.params.id, req)));
+  r.get('/news', requireReseller, validate({ query: z.object({ page: fields.page, pageSize: fields.pageSize, q: z.string().trim().max(200).optional(), status: z.enum(['active', 'scheduled', 'expired', 'disabled']).optional() }) }), wrap((req) => s.news.list(req.query, req.user)));
+  r.post('/news', requireReseller, validate({ body: newsBody }), status(201, (req) => s.news.create(req.body, req.user, req)));
+  r.get('/news/:id', requireReseller, validate({ params: idParam }), wrap((req) => s.news.get(req.params.id, req.user)));
+  r.put('/news/:id', requireReseller, validate({ params: idParam, body: newsPatch }), wrap((req) => s.news.update(req.params.id, req.body, req.user, req)));
+  r.delete('/news/:id', requireReseller, validate({ params: idParam }), wrap((req) => s.news.remove(req.params.id, req.user, req)));
 
   // Reset a Mailman Password
   r.get('/mailman', requireRoot, wrap(() => s.mailman.detect()));
@@ -89,11 +103,12 @@ export async function register(ctx) {
   r.post('/upgrade/keys', requireRoot, validate({ body: z.object({ kid, pem: z.string().max(4096).regex(/-----BEGIN PUBLIC KEY-----/, 'Paste a PEM public key') }).strict() }), status(201, (req) => s.releaseKeys.add(req.body.kid, req.body.pem, req)));
   r.delete('/upgrade/keys/:kid', requireRoot, validate({ params: z.object({ kid }) }), wrap((req) => s.releaseKeys.remove(req.params.kid, req)));
 
-  // The client reads branding from /api/branding on load (every signed-in role);
-  // the same handlers serve the logo and favicon.
+  // Public, read-only: the login page paints company name, logo, favicon and
+  // the login notice before any session exists. Every mutation stays on the
+  // authenticated /cpanel/branding routes above.
   const b = Router();
   b.get('/', wrap(() => s.branding.get()));
   b.get('/:kind', validate({ params: imageKind }), sendImage);
 
-  return [{ path: '/cpanel', router: r }, { path: '/branding', router: b }];
+  return [{ path: '/cpanel', router: r }, { path: '/branding', router: b, public: true }];
 }

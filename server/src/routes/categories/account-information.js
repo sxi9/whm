@@ -25,7 +25,8 @@ export async function register(ctx) {
   ctx.scheduler.ensure('account-disk-usage', '25 */6 * * *', 'account_info.disk_refresh');
   // Parked (enabled = 0) by the service wherever no web server writes domlogs; see syncCollectSchedule.
   ctx.scheduler.ensure('account-bandwidth', '35 * * * *', 'account_info.bandwidth_collect');
-  ctx.capabilities.register('quota', { binaries: ['setquota', 'repquota', 'quotacheck', 'quotaon'], required: ['repquota', 'setquota'] });
+  // The 'quota' capability is owned by Server Configuration (Initial Quota Setup);
+  // this category only consumes ctx.capabilities.has('quota') / require('quota').
 
   const r = Router();
   // A service result is passed through only when it is a list envelope; a plain

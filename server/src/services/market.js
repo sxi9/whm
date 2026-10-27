@@ -1,16 +1,20 @@
 import { json } from '../db/index.js';
 import { notFound, conflict, unprocessable, CapabilityError } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
-import { ADAPTERS, CREATABLE_ADAPTERS, adapterCatalog, normalizeProducts, safeRequest } from './market-adapters.js';
+import { ADAPTERS, CREATABLE_ADAPTERS, LICENSE_KEY_RE, adapterCatalog, normalizeProducts, safeRequest } from './market-adapters.js';
 
 // Market providers. Attached as ctx.market; other categories may call:
 //   market.enabledProviders(type)   -> enabled rows of a type ('ssl' | 'plugin') with base prices, no secrets
 //   market.credentials(name)        -> decrypted adapter config for a provider (services only)
-//   market.hub()                    -> { enabled, url, licenseKey } of the plugin marketplace hub
+//   market.hub()                    -> { enabled, url, licenseKey } of the plugin marketplace hub; the hub is
+//                                      the single built-in 'whm-hub' row. Declared for the Phase 5 Plugins
+//                                      marketplace client; nothing reads it until then.
 //   market.sslProviders()           -> the list SSL/TLS reads from the market.providers setting
 // The market_providers table is the source of truth; every change to an SSL
 // provider is mirrored into the market.providers setting so Purchase and Install
-// an SSL Certificate keeps working without reaching into this service.
+// an SSL Certificate keeps working without reaching into this service. The
+// setting's own seed (006_ssl-tls.sql, immutable) predates the table: whatever it
+// holds is adopted once at boot and then overwritten from the table.
 
 export const PROVIDER_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 export const HUB_NAME = 'whm-hub';
@@ -22,6 +26,7 @@ const ACME_PRODUCTS = [{ id: 'dv', name: 'Domain Validated (ACME, 90 days)', pri
 const MANAGE_AUTOSSL = '/ssl-tls/manage-autossl';
 const HTTPS_URL_RE = /^https:\/\/[^\s/$.?#][^\s]*$/i;
 const PATH_RE = /^\/[A-Za-z0-9_./-]*$/;
+const LIST_SORT = { name: 'name', display_name: 'displayName', type: 'type', adapter: 'adapter', enabled: 'enabled' };
 
 const round2 = (n) => Math.round(Number(n) * 100) / 100;
 export const resalePrice = (price, commissionPercent) => (price == null ? null : round2(Number(price) * (1 + Number(commissionPercent || 0) / 100)));
@@ -130,6 +135,24 @@ export function createMarketService(ctx) {
   }
   function syncSettings() { settings.set('market.providers', sslProviders()); }
 
+  // Entries the legacy market.providers setting has and the table does not were
+  // placed there before the table existed; they become manual SSL providers.
+  function adoptLegacySetting() {
+    const legacy = settings.get('market.providers', []);
+    if (!Array.isArray(legacy)) return [];
+    const adopted = [];
+    for (const p of legacy) {
+      if (!p || typeof p !== 'object' || typeof p.name !== 'string' || !PROVIDER_NAME_RE.test(p.name) || isAcmeName(p.name) || stmts.byName.get(p.name)) continue;
+      const url = typeof p.url === 'string' && HTTPS_URL_RE.test(p.url) ? p.url : null;
+      const displayName = typeof p.displayName === 'string' ? p.displayName.replace(/[\r\n\0<>]/g, '').trim().slice(0, 80) : '';
+      stmts.insert.run({ name: p.name, display_name: displayName || p.name, type: 'ssl', adapter: 'manual', url, config_enc: null, commission_percent: 0, products_json: JSON.stringify(normalizeProducts(p.products)) });
+      if (p.enabled && url) stmts.setEnabled.run(1, p.name);
+      adopted.push(p.name);
+    }
+    if (adopted.length) logger.info({ providers: adopted }, 'market: adopted providers from the legacy market.providers setting');
+    return adopted;
+  }
+
   function validateConfigInput(row, input) {
     const a = adapterOf(row);
     const known = new Map(a.configFields.map((f) => [f.key, f]));
@@ -140,6 +163,7 @@ export function createMarketService(ctx) {
       if (value == null || value === '') continue;
       if (f.kind === 'url' && !HTTPS_URL_RE.test(value)) errors[key] = ['Must be an https:// URL'];
       if (f.kind === 'path' && !PATH_RE.test(value)) errors[key] = ['Must be a path like /v1/products (letters, digits, "/", ".", "_", "-")'];
+      if (f.kind === 'licenseKey' && !LICENSE_KEY_RE.test(String(value).trim())) errors[key] = ['License keys look like WHM-XXXX-XXXX-XXXX-XXXX'];
     }
     if (Object.keys(errors).length) throw unprocessable('Provider configuration is invalid', errors);
   }
@@ -148,12 +172,16 @@ export function createMarketService(ctx) {
     transport,
     adapters: () => adapterCatalog(),
 
-    async list({ type } = {}, user) {
+    async list({ type, q, page = 1, pageSize = 50, sort, dir = 'asc' } = {}, user) {
       const forRoot = isRoot(user);
       const orders = forRoot ? orderCounts() : null;
       const stored = stmts.all.all().map((r) => shape(r, { forRoot, orders }));
-      const all = [...stored, ...(await acmeRows({ forRoot }))];
-      return all.filter((p) => !type || p.type === type);
+      let all = [...stored, ...(await acmeRows({ forRoot }))].filter((p) => !type || p.type === type);
+      if (q) { const needle = q.toLowerCase(); all = all.filter((p) => p.name.toLowerCase().includes(needle) || p.displayName.toLowerCase().includes(needle)); }
+      const key = LIST_SORT[sort];
+      if (key) all.sort((a, b) => (a[key] === b[key] ? 0 : a[key] > b[key] ? 1 : -1) * (dir === 'desc' ? -1 : 1));
+      const total = all.length;
+      return { data: all.slice((page - 1) * pageSize, page * pageSize), meta: { page, pageSize, total } };
     },
 
     async get(name, user) {
@@ -168,9 +196,11 @@ export function createMarketService(ctx) {
     create({ name, displayName, type, adapter, url, commissionPercent = 0, products: list = [], config = {} }, req) {
       if (isAcmeName(name)) throw conflict(`"${name}" is reserved for the ACME client managed under Manage AutoSSL`);
       if (stmts.byName.get(name)) throw conflict(`Provider "${name}" already exists`);
+      if (ADAPTERS[adapter]?.singleton) throw conflict(`The ${ADAPTERS[adapter].label} is built in; configure "${HUB_NAME}" instead of adding another`);
       if (!CREATABLE_ADAPTERS.includes(adapter)) throw unprocessable('Unknown adapter', { adapter: [`Choose one of ${CREATABLE_ADAPTERS.join(', ')}`] });
       const a = ADAPTERS[adapter];
       if (!a.types.includes(type)) throw unprocessable('Adapter and type do not match', { adapter: [`The ${a.label} adapter provides ${a.types.join('/')} providers`] });
+      if (type !== 'ssl' && list.length) throw unprocessable('Only SSL providers carry a product list', { products: ['Plugin catalogs come from the hub'] });
       const draft = { name, adapter };
       validateConfigInput(draft, config);
       const clean = Object.fromEntries(Object.entries(config).filter(([, v]) => v != null && v !== ''));
@@ -184,6 +214,7 @@ export function createMarketService(ctx) {
       if (isAcmeName(name)) throw unprocessable(`"${name}" is managed under SSL/TLS → Manage AutoSSL`, { name: ['ACME clients are configured in Manage AutoSSL'] });
       const r = row(name);
       const a = adapterOf(r);
+      if (input.products !== undefined && r.type !== 'ssl') throw unprocessable('Only SSL providers carry a product list', { products: ['Plugin catalogs come from the hub; this field is not stored'] });
       const next = {
         name,
         display_name: input.displayName ?? r.display_name,
@@ -291,6 +322,7 @@ export function createMarketService(ctx) {
     // ---- integration surface for other categories ------------------------------
     sslProviders,
     syncSettings,
+    adoptLegacySetting,
     enabledProviders(type) { return stmts.all.all().filter((r) => r.enabled && (!type || r.type === type)).map((r) => shape(r, { wholesale: true })); },
     credentials(name) { const r = stmts.byName.get(name); return r ? readConfig(r) : null; },
     hub() {

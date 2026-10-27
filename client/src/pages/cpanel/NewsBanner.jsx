@@ -27,7 +27,7 @@ export function NewsBanner() {
           <div style={{ flex: 1 }}>
             <strong>{n.title}</strong>
             {n.body && <div className="markdown">{renderMarkdown(n.body)}</div>}
-            {user?.role === 'root' && <small><Link to="/cpanel/modify-cpanel-and-whm-news">Edit news</Link></small>}
+            {(user?.role === 'root' || (user?.role === 'reseller' && n.audience === 'own')) && <small><Link to="/cpanel/modify-cpanel-and-whm-news">Edit news</Link></small>}
           </div>
           {n.severity !== 'critical' && (
             <button className="icon-button" aria-label="Dismiss" title="Dismiss" onClick={() => setDismissed((d) => [...d, `${n.id}:${n.updatedAt}`])}><X size={16} /></button>

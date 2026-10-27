@@ -10,6 +10,7 @@ import { ProgressLog } from '../../components/ProgressLog.jsx';
 import { Modal, useConfirm } from '../../components/Modal.jsx';
 import { useToast } from '../../components/Toast.jsx';
 import { PeerTable } from './PeerTable.jsx';
+import { ClusterTokens } from './ClusterTokens.jsx';
 import { ExchangeLog } from './ExchangeLog.jsx';
 
 export function ConfigurationCluster() {
@@ -24,12 +25,13 @@ export function ConfigurationCluster() {
   return (
     <>
       <PeerTable peers={data.peers} loading={overview.loading} onChanged={refreshAll} focus="config"
-        subtitle={`Peers with "Receives config" on get the shared settings of ${data.hostname} when you push. A peer that should push to this server needs a token from Clusters > DNS Cluster.`} />
+        subtitle={`Peers with "Receives config" on get the shared settings of ${data.hostname} when you push. A peer that should push settings here, or that this server pulls from, needs a settings token issued below and this server must accept pushes for its shared groups.`} />
       <GroupSelection groups={data.groups} settings={data.settings} schedule={data.schedule} keyCount={data.keyCount} onSaved={refreshAll} />
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: 18, alignItems: 'start' }}>
         <PushCard peers={data.peers} groups={data.groups} selected={data.selectedGroups} onFinished={refreshAll} />
         <PullCard peers={data.peers} groups={data.groups} selected={data.selectedGroups} onApplied={refreshAll} />
       </div>
+      <ClusterTokens tokens={data.tokens} hostname={data.hostname} purpose="config" onChanged={refreshAll} />
       <ExchangeLog kinds={['config.push', 'config.pull', 'config.receive', 'config.export', 'peer.test']} version={logVersion} />
     </>
   );
@@ -98,7 +100,7 @@ function GroupSelection({ groups, settings, schedule, keyCount, onSaved }) {
       <div className="card-body">
         <div className="form-grid">
           <Field inline><Toggle checked={draft.autoPush} onChange={(v) => setDraft((d) => ({ ...d, autoPush: v }))} label="Push automatically" description={schedule ? `Every six hours (${schedule.cron}) to every peer that receives config. Next run ${formatDate(schedule.nextRunAt)}.` : 'Every six hours.'} /></Field>
-          <Field inline><Toggle checked={draft.acceptPushes} onChange={(v) => setDraft((d) => ({ ...d, acceptPushes: v }))} label="Accept settings pushed by peers" description="A peer holding a cluster token issued here may overwrite the shared groups on this server." /></Field>
+          <Field inline><Toggle checked={draft.acceptPushes} onChange={(v) => setDraft((d) => ({ ...d, acceptPushes: v }))} label="Accept settings pushed by peers" description="Off by default. On, a peer holding a settings token issued here may overwrite the groups selected above on this server; a push touching any other group is refused as a whole." /></Field>
         </div>
         <KeyValue items={[['Settings in the selected groups', keyCount], ['Last push from here', formatDate(settings.lastPushAt)], ['Last pull into here', formatDate(settings.lastPullAt)], ['Schedule', schedule ? <StatusPill status={schedule.enabled ? 'enabled' : 'disabled'}>{schedule.enabled ? 'enabled' : 'paused'}</StatusPill> : '—']]} />
       </div>
@@ -183,7 +185,7 @@ function PullCard({ peers, groups, selected, onApplied }) {
         </details>
       )}
       <Field label="Peer" required><Select value={clusterId} onChange={setClusterId} placeholder="Choose a peer" options={sources.map((p) => ({ value: String(p.id), label: `${p.name} (${p.host})` }))} /></Field>
-      <Field label="Group" help="Blank pulls every selected group."><Select value={groupName} onChange={setGroupName} placeholder="All selected groups" options={groups.map((g) => ({ value: g.name, label: g.label }))} /></Field>
+      <Field label="Group" help="Blank pulls every selected group; only groups shared on this server can be pulled into it."><Select value={groupName} onChange={setGroupName} placeholder="All selected groups" options={groups.filter((g) => selected.includes(g.name)).map((g) => ({ value: g.name, label: g.label }))} /></Field>
       <FormActions>
         <Button variant="primary" icon={Download} loading={busy} onClick={() => pull(false)} disabled={!clusterId || (!groupName && !selected.length)}>Preview differences</Button>
         {!sources.length && <span className="muted">Add a peer with an API token first. Peers need the Clusters module; see <Link to="/clusters/dns-cluster">DNS Cluster</Link> for tokens.</span>}

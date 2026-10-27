@@ -68,7 +68,9 @@ describe('GET /api/themes', () => {
     expect(res.body.meta).toMatchObject({ default: 'jupiter', accountDefault: 'jupiter', allowUserOverride: true });
     expect(res.body.meta.variables.primary.kind).toBe('color');
     const jupiter = res.body.data.find((t) => t.slug === 'jupiter');
-    expect(jupiter).toMatchObject({ builtin: true, enabled: true, isDefault: true, isAccountDefault: true, hasCss: false });
+    expect(jupiter).toMatchObject({ builtin: true, enabled: true, isDefault: true, isAccountDefault: true, hasCss: false, scheme: 'auto' });
+    expect(res.body.data.find((t) => t.slug === 'jupiter-dark').scheme).toBe('dark');
+    expect(res.body.data.find((t) => t.slug === 'high-contrast').scheme).toBe('light');
     expect(jupiter.usage.packages).toBe(2);
   });
   it('filters by q and is readable by resellers', async () => {
@@ -103,6 +105,15 @@ describe('theme CRUD', () => {
     await post('/api/themes', { slug: 'ok', base: 'sepia' }).expect(422);
     await post('/api/themes', { slug: 'ok', extra: 1 }).expect(422);
     await post('/api/themes', { slug: 'ok', copyFrom: 'nope' }).expect(404);
+  });
+  it('refuses slugs that would shadow a route segment', async () => {
+    for (const slug of ['active', 'variables', 'packages', 'preference', 'config']) {
+      const res = await post('/api/themes', { slug, copyFrom: 'jupiter' }).expect(422);
+      expect(res.body.error.fields.slug).toBeTruthy();
+      await get(`/api/themes/${slug}`).expect(slug === 'active' || slug === 'variables' || slug === 'packages' ? 200 : 404);
+    }
+    expect(() => app.ctx.themes.create({ slug: 'config', name: 'x' })).toThrow(/reserved/);
+    expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM themes WHERE builtin = 0').get().n).toBe(1);
   });
   it('updates name, base, variables and enabled', async () => {
     const res = await put('/api/themes/acme', { name: 'ACME Dark', base: 'dark', variables: { primary: '#ff6600', text: '' } }).expect(200);
@@ -152,15 +163,15 @@ describe('CSS overrides', () => {
 describe('defaults, preferences and the active theme', () => {
   it('serves the default to every role', async () => {
     const res = await plainUser.get('/api/themes/active').expect(200);
-    expect(res.body.data).toMatchObject({ slug: 'jupiter', base: 'light', source: 'default', preference: null, variables: {}, css: '' });
+    expect(res.body.data).toMatchObject({ slug: 'jupiter', base: 'light', scheme: 'auto', source: 'default', preference: null, ignoredPreference: null, variables: {}, css: '' });
   });
   it('configures the panel and account defaults', async () => {
     const res = await put('/api/themes/config', { default: 'acme', accountDefault: 'high-contrast', allowUserOverride: false }).expect(200);
-    expect(res.body.data).toEqual({ default: 'acme', accountDefault: 'high-contrast', accountDefaultApplied: true, allowUserOverride: false });
+    expect(res.body.data).toEqual({ default: 'acme', accountDefault: 'high-contrast', allowUserOverride: false });
     expect(app.ctx.themes.defaultSlug()).toBe('acme');
     expect(app.ctx.themes.accountDefault()).toBe('high-contrast');
     const active = await reseller.get('/api/themes/active').expect(200);
-    expect(active.body.data).toMatchObject({ slug: 'acme', base: 'dark', css: '.brand-mark { background: #ff6600; }\n' });
+    expect(active.body.data).toMatchObject({ slug: 'acme', base: 'dark', scheme: 'dark', css: '.brand-mark { background: #ff6600; }\n' });
     expect(active.body.data.variables.primary).toBe('#ff6600');
     await put('/api/themes/config', { default: 'nope' }).expect(422);
     await put('/api/themes/config', {}).expect(422);
@@ -180,6 +191,16 @@ describe('defaults, preferences and the active theme', () => {
     expect(cleared.body.data).toMatchObject({ slug: 'acme', source: 'default', preference: null });
     expect(auditCount('themes.preference')).toBe(3);
   });
+  it('reports a stored preference as ignored instead of applied when overrides are disabled', async () => {
+    await mutate(plainUser, 'put', '/api/themes/preference', { theme: 'high-contrast' }, plainCsrf).expect(200);
+    await put('/api/themes/config', { allowUserOverride: false }).expect(200);
+    const active = (await plainUser.get('/api/themes/active').expect(200)).body.data;
+    expect(active).toMatchObject({ slug: 'acme', source: 'default', preference: null, ignoredPreference: 'high-contrast' });
+    await put('/api/themes/config', { allowUserOverride: true }).expect(200);
+    const again = (await plainUser.get('/api/themes/active').expect(200)).body.data;
+    expect(again).toMatchObject({ slug: 'high-contrast', source: 'user', preference: 'high-contrast', ignoredPreference: null });
+    await mutate(plainUser, 'put', '/api/themes/preference', { theme: null }, plainCsrf).expect(200);
+  });
   it('cannot disable or delete a theme that is a default', async () => {
     await put('/api/themes/acme', { enabled: false }).expect(409);
     await del('/api/themes/acme').expect(409);
@@ -193,6 +214,10 @@ describe('defaults, preferences and the active theme', () => {
     await put('/api/themes/preference', { theme: 'acme2' }).expect(422);
     await put('/api/themes/config', { default: 'acme2' }).expect(422);
     expect(app.ctx.themes.slugs()).not.toContain('acme2');
+    expect(app.ctx.themes.isEnabledSlug('acme2')).toBe(false);
+    expect(app.ctx.themes.isEnabledSlug('jupiter')).toBe(true);
+    expect(app.ctx.themes.isEnabledSlug('missing')).toBe(false);
+    expect(app.ctx.themes.isEnabledSlug(null)).toBe(false);
   });
 });
 
@@ -202,17 +227,17 @@ describe('package assignment', () => {
     expect(res.body.data.map((p) => p.name)).toEqual(['default', 'starter']);
     expect(res.body.data[1]).toEqual({ id: expect.any(Number), name: 'starter', theme: 'jupiter', accounts: 0, themeKnown: true, effective: 'jupiter', owned: true });
   });
-  it('applies the account default when a package names a disabled or unknown theme', async () => {
+  it('resolves a disabled or unknown package theme to the account default in the snapshot', async () => {
     // packages.snapshot() resolves the theme through resolveForPackage (integration-contracts §22).
-    expect(app.ctx.themes.accountDefaultApplied()).toBe(true);
-    expect((await get('/api/themes').expect(200)).body.meta.accountDefaultApplied).toBe(true);
     expect(app.ctx.packages.snapshot('starter').theme).toBe('jupiter');
-    await app.ctx.db.prepare('UPDATE packages SET theme = ? WHERE name = ?').run('acme2', 'starter');
-    try {
-      expect(app.ctx.packages.snapshot('starter').theme).toBe(app.ctx.themes.resolveForPackage({ theme: 'acme2' }));
-      expect(app.ctx.packages.snapshot('starter').theme).not.toBe('acme2');
-    } finally {
-      await app.ctx.db.prepare('UPDATE packages SET theme = ? WHERE name = ?').run('jupiter', 'starter');
+    for (const dead of ['acme2', 'never-installed']) {
+      await app.ctx.db.prepare('UPDATE packages SET theme = ? WHERE name = ?').run(dead, 'starter');
+      try {
+        expect(app.ctx.packages.snapshot('starter').theme).toBe('jupiter');
+        expect(app.ctx.themes.resolveForPackage({ theme: dead })).toBe('jupiter');
+      } finally {
+        await app.ctx.db.prepare('UPDATE packages SET theme = ? WHERE name = ?').run('jupiter', 'starter');
+      }
     }
   });
   it('assigns a theme to a package through the packages service', async () => {
@@ -249,5 +274,32 @@ describe('package assignment', () => {
     expect(fs.existsSync(path.join(app.dir, 'themes', 'acme.css'))).toBe(false);
     await get('/api/themes/acme').expect(404);
     expect(auditCount('themes.delete')).toBe(1);
+  });
+});
+
+describe('account creation', () => {
+  it('records the account default when the package theme is disabled', async () => {
+    await post('/api/packages', { name: 'themed-plan', disk_mb: 256 }).expect(201);
+    // Assignment refuses disabled themes, so the stale slug is planted the way a later disable leaves it.
+    await app.ctx.db.prepare('UPDATE packages SET theme = ? WHERE name = ?').run('acme2', 'themed-plan');
+    await put('/api/themes/config', { accountDefault: 'high-contrast' }).expect(200);
+    try {
+      const list = (await get('/api/themes/packages').expect(200)).body.data.find((p) => p.name === 'themed-plan');
+      expect(list).toMatchObject({ theme: 'acme2', themeKnown: true, effective: 'high-contrast' });
+      await post('/api/accounts', { username: 'themed', domain: 'themed.example', package: 'themed-plan' }).expect(201);
+      const account = (await get('/api/accounts/themed').expect(200)).body.data;
+      expect(account.plan.theme).toBe('high-contrast');
+      expect(app.ctx.db.prepare(`SELECT json_extract(plan_snapshot_json, '$.theme') AS theme FROM accounts WHERE username = ?`).get('themed').theme).toBe('high-contrast');
+      const themes = (await get('/api/themes').expect(200)).body.data;
+      expect(themes.find((t) => t.slug === 'high-contrast').usage.accounts).toBe(1);
+      expect(themes.find((t) => t.slug === 'acme2').usage.accounts).toBe(0);
+    } finally {
+      await put('/api/themes/config', { accountDefault: 'jupiter' }).expect(200);
+    }
+  });
+  it('records the package theme verbatim while it is enabled', async () => {
+    await put('/api/themes/packages/themed-plan', { theme: 'jupiter-dark' }).expect(200);
+    await post('/api/accounts', { username: 'themed2', domain: 'themed2.example', package: 'themed-plan' }).expect(201);
+    expect((await get('/api/accounts/themed2').expect(200)).body.data.plan.theme).toBe('jupiter-dark');
   });
 });

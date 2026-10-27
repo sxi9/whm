@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import http from 'node:http';
 import request from 'supertest';
 import { createTestApp, waitForJob } from './support/app.js';
-import { parsePeerHost, groupOfKey, isPushableKey, PEER_HOST_RE, GROUP_NAMES, CONFIG_GROUPS, CONFIG_KEYS, keysOfGroup, TOKEN_ALLOWED, CLUSTER_TOKEN_ROUTES } from '../src/services/clusters.js';
+import { parsePeerHost, groupOfKey, isPushableKey, PEER_HOST_RE, GROUP_NAMES, DEFAULT_GROUPS, CONFIG_GROUPS, CONFIG_KEYS, keysOfGroup, tokenAllowed, CLUSTER_TOKEN_ROUTES, CLUSTER_SCOPES, LEGACY_CLUSTER_SCOPE } from '../src/services/clusters.js';
 import { validateIncoming, exportValue } from '../src/services/clusters-config.js';
 import { DEFAULT_SETTINGS } from '../src/db/seed.js';
 
@@ -61,6 +61,13 @@ describe('clusters helpers', () => {
     expect(isPushableKey('security.cphulk.enabled')).toBe(true);
     expect(Object.keys(CONFIG_GROUPS)).toEqual(GROUP_NAMES);
     for (const g of GROUP_NAMES) expect(keysOfGroup(g).length, g).toBeGreaterThan(0);
+    // Customization, themes, support and the market catalogue replicate; logo files and credentials do not.
+    expect(GROUP_NAMES).toContain('branding');
+    for (const key of ['branding.company_name', 'branding.login_notice', 'themes.default', 'themes.account_default', 'support.provider_name', 'support.access.max_hours', 'market.providers']) expect(groupOfKey(key), key).toBe('branding');
+    for (const key of ['branding.logo', 'branding.favicon', 'cpanel.upgrade.last', 'cpanel.upgrade.last_check', 'support.access.last_cleanup']) expect(isPushableKey(key), key).toBe(false);
+    // The login policy and the update feed never replicate unless chosen.
+    expect(DEFAULT_GROUPS).toEqual(GROUP_NAMES.filter((g) => g !== 'security' && g !== 'software'));
+    expect(DEFAULT_GROUPS).toContain('branding');
   });
 
   // Host identity, addresses, per-host daemon state, paths, timestamps and
@@ -82,6 +89,16 @@ describe('clusters helpers', () => {
     expect(validateIncoming('service_config.apache', [])).toMatchObject({ ok: false });
     expect(validateIncoming('service_config.apache', { timeout: 10, mpm: { module: 'event' }, unknownField: 1 })).toMatchObject({ ok: false, reason: expect.stringMatching(/unknownField|Unrecognized/i) });
     expect(validateIncoming('service_config.apache', { timeout: 10, mpm: { module: 'event' } })).toEqual({ ok: true, value: { timeout: 10, mpm: { module: 'event' } } });
+    // Free-form Apache directives are code: refused on receive, stripped on export.
+    expect(validateIncoming('service_config.apache', { timeout: 10, customDirectives: 'Include /etc/passwd' })).toMatchObject({ ok: false, reason: expect.stringMatching(/customDirectives|Unrecognized/i) });
+    expect(exportValue('service_config.apache', { timeout: 10, customDirectives: 'LoadModule evil' })).toEqual({ ok: true, value: { timeout: 10 } });
+    expect(validateIncoming('branding.primary_color', '#12AB')).toMatchObject({ ok: false });
+    expect(validateIncoming('branding.primary_color', '#1a2b3c')).toEqual({ ok: true, value: '#1a2b3c' });
+    expect(validateIncoming('branding.company_name', '<script>')).toMatchObject({ ok: false });
+    expect(validateIncoming('branding.help_url', 'https://u:p@help.example.com/')).toMatchObject({ ok: false, reason: expect.stringMatching(/credentials/i) });
+    expect(validateIncoming('themes.default', 'Bad Slug')).toMatchObject({ ok: false });
+    expect(validateIncoming('market.providers', [{ name: 'store', displayName: 'Store', url: 'https://u:p@store.example.com/', products: [] }])).toMatchObject({ ok: false });
+    expect(validateIncoming('market.providers', [{ name: 'store', displayName: 'Store', enabled: true, url: 'https://store.example.com', adapter: 'generic', commissionPercent: 10, products: [{ id: 'dv', name: 'DV', price: 9.99, basePrice: 9, currency: 'USD', termMonths: 12 }] }])).toMatchObject({ ok: true });
     expect(validateIncoming('basic.home_root', '/home/../etc')).toMatchObject({ ok: false });
     expect(validateIncoming('basic.home_root', 'home')).toMatchObject({ ok: false });
     expect(validateIncoming('basic.home_root', '/srv/www')).toEqual({ ok: true, value: '/srv/www' });
@@ -162,7 +179,10 @@ describe('Clusters API', () => {
       await post('/peers', { name: 'x', host: 'ns2.example.com', token: PEER_TOKEN, extra: 1 }).expect(422);
       await post('/peers', { name: 'x', host: 'test.example.com', token: PEER_TOKEN }).expect(422);
       await post('/tokens', { name: '' }).expect(422);
-      await post('/tokens', { name: 'ok', expiresInDays: 0 }).expect(422);
+      await post('/tokens', { name: 'ok' }).expect(422);
+      await post('/tokens', { name: 'ok', purpose: 'both' }).expect(422);
+      await post('/tokens', { name: 'ok', purpose: 'dns', expiresInDays: 0 }).expect(422);
+      await get('/tokens?purpose=all').expect(422);
       await put('/dns/settings', {}).expect(422);
       await put('/config/settings', { groups: ['nonsense'] }).expect(422);
       await post('/dns/sync', { domains: ['not a domain'] }).expect(422);
@@ -188,6 +208,20 @@ describe('Clusters API', () => {
       expect(audit.args_redacted).not.toContain(PEER_TOKEN);
       await post('/peers', { name: 'ns2', host: 'other.example.com', token: PEER_TOKEN }).expect(409);
       await post('/peers', { name: 'other', host: `http://127.0.0.1:${port}`, token: PEER_TOKEN }).expect(409);
+      // The same peer written another way is the same peer.
+      await post('/peers', { name: 'other', host: `HTTP://127.0.0.1:${port}`, token: PEER_TOKEN }).expect(409);
+      const named = await post('/peers', { name: 'ns9', host: 'ns9.example.com', token: PEER_TOKEN, role: 'standalone' }).expect(201);
+      await post('/peers', { name: 'ns9b', host: 'https://ns9.example.com:2087', token: PEER_TOKEN }).expect(409);
+      await post('/peers', { name: 'ns9c', host: 'NS9.example.com:2087', token: PEER_TOKEN }).expect(409);
+      await patch(`/peers/${named.body.data.id}`, { host: `http://127.0.0.1:${port}` }).expect(409);
+      await del(`/peers/${named.body.data.id}`).expect(200);
+      // This server by any of its names or addresses on its own ports is not a peer.
+      for (const self of ['test.example.com', 'TEST.example.com:2087', 'localhost', '127.0.0.1', 'http://127.0.0.1:2086', '[::1]', '10.0.0.5:2087']) {
+        app.ctx.settings.set('basic.main_ip', '10.0.0.5');
+        const r = await post('/peers', { name: 'me', host: self, token: PEER_TOKEN }).expect(422);
+        expect(r.body.error.fields.host[0], self).toMatch(/this server/);
+      }
+      await patch(`/peers/${peerId}`, { host: 'localhost:2087' }).expect(422);
       const list = await get('/peers').expect(200);
       expect(list.body.data).toHaveLength(1);
       await patch(`/peers/${peerId}`, {}).expect(422);
@@ -235,36 +269,54 @@ describe('Clusters API', () => {
     let tokenId;
     const asPeer = (method, path, body) => request(app.ctx.app)[method](`/api/clusters${path}`).set('Authorization', `Bearer ${secret}`).send(body);
 
-    it('issues a clustering-scoped token for root exactly once', async () => {
-      const res = await post('/tokens', { name: 'ns1 master', expiresInDays: 30 }).expect(201);
+    let configSecret;
+    let configTokenId;
+    const asConfigPeer = (method, path, body) => request(app.ctx.app)[method](`/api/clusters${path}`).set('Authorization', `Bearer ${configSecret}`).send(body);
+
+    it('issues a zone token and a settings token for root, each shown exactly once', async () => {
+      const res = await post('/tokens', { name: 'ns1 master', purpose: 'dns', expiresInDays: 30 }).expect(201);
       secret = res.body.data.token;
       tokenId = res.body.data.id;
       expect(secret).toMatch(/^whm_[A-Za-z0-9_-]{30,}$/);
-      expect(res.body.data).toMatchObject({ name: 'ns1 master', username: 'root', prefix: secret.slice(0, 12), expiresAt: expect.stringMatching(/Z$/) });
+      expect(res.body.data).toMatchObject({ name: 'ns1 master', username: 'root', prefix: secret.slice(0, 12), expiresAt: expect.stringMatching(/Z$/), purpose: 'dns', legacy: false });
       const list = await get('/tokens').expect(200);
       expect(list.body.data).toEqual([expect.objectContaining({ id: tokenId, name: 'ns1 master' })]);
       expect(JSON.stringify(list.body)).not.toContain(secret);
       const row = app.ctx.db.prepare('SELECT scopes, token_hash FROM api_tokens WHERE id = ?').get(tokenId);
-      expect(JSON.parse(row.scopes)).toEqual(['clustering']);
+      expect(JSON.parse(row.scopes)).toEqual(['clustering:dns']);
       expect(row.token_hash).toBe(app.ctx.crypto.hashToken(secret));
-      expect(res.body.data).toMatchObject({ access: 'confined', scopes: ['clustering'], allowed: TOKEN_ALLOWED });
+      expect(res.body.data).toMatchObject({ access: 'confined', scopes: ['clustering:dns'], allowed: tokenAllowed('clustering:dns') });
+      expect(res.body.data.allowed).toEqual(['GET /api/clusters/ping', 'POST /api/clusters/dns/receive', 'POST /api/dns/zones/import']);
       expect(list.body.data[0]).not.toHaveProperty('accessNote');
-      expect(JSON.parse(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'clusters.token.create'").get().args_redacted)).toMatchObject({ access: 'confined' });
+      expect(JSON.parse(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'clusters.token.create'").get().args_redacted)).toMatchObject({ access: 'confined', purpose: 'dns' });
+      const cfg = await post('/tokens', { name: 'ns1 config', purpose: 'config' }).expect(201);
+      configSecret = cfg.body.data.token;
+      configTokenId = cfg.body.data.id;
+      expect(cfg.body.data).toMatchObject({ purpose: 'config', scopes: ['clustering:config'], allowed: ['GET /api/clusters/ping', 'GET /api/clusters/config/export', 'POST /api/clusters/config/receive'] });
+      expect(JSON.parse(app.ctx.db.prepare('SELECT scopes FROM api_tokens WHERE id = ?').get(configTokenId).scopes)).toEqual(['clustering:config']);
+      // Each page lists the tokens of its own purpose.
+      expect((await get('/tokens?purpose=dns').expect(200)).body.data.map((t) => t.id)).toEqual([tokenId]);
+      expect((await get('/tokens?purpose=config').expect(200)).body.data.map((t) => t.id)).toEqual([configTokenId]);
+      expect((await get('/dns').expect(200)).body.data.tokens.map((t) => t.id)).toEqual([tokenId]);
+      expect((await get('/config').expect(200)).body.data.tokens.map((t) => t.id)).toEqual([configTokenId]);
     });
 
     // The token belongs to root, yet core confines it to the peer endpoints
-    // everywhere: a compromised peer gets no further than pushing to them.
-    it('confines a cluster token to the peer endpoints on every API, not only this module', async () => {
-      expect(app.ctx.confinedScopes.get('clustering')).toBe(CLUSTER_TOKEN_ROUTES);
-      const as = (method, path, body) => request(app.ctx.app)[method](path).set('Authorization', `Bearer ${secret}`).send(body);
+    // of its purpose everywhere: a compromised DNS slave gets no further than
+    // pushing zones, and never reaches the configuration endpoints.
+    it('confines a cluster token to its purpose\'s endpoints on every API, not only this module', async () => {
+      expect(app.ctx.confinedScopes.get('clustering:dns')).toBe(CLUSTER_TOKEN_ROUTES['clustering:dns']);
+      expect(app.ctx.confinedScopes.get('clustering:config')).toBe(CLUSTER_TOKEN_ROUTES['clustering:config']);
+      expect(app.ctx.confinedScopes.get('clustering')).toBe(CLUSTER_TOKEN_ROUTES['clustering:dns']);
+      const as = (method, path, body, token = secret) => request(app.ctx.app)[method](path).set('Authorization', `Bearer ${token}`).send(body);
       for (const p of ['/peers', '/tokens', '/events', '/dns', '/config']) {
         const r = await asPeer('get', p).expect(403);
         expect(r.body.error.code).toBe('scope_confined');
         expect(r.body.error.message).toMatch(/confined to GET \/api\/clusters\/ping/);
       }
       await asPeer('post', '/config/push', {}).expect(403);
-      await asPeer('post', '/tokens', { name: 'escalate' }).expect(403);
-      for (const p of ['/api/system/status', '/api/accounts', '/api/auth/me', '/api/packages', '/api/dns/zones', '/api/security/hulk/settings', '/api/clusters/config/export/']) {
+      await asPeer('post', '/tokens', { name: 'escalate', purpose: 'config' }).expect(403);
+      for (const p of ['/api/system/status', '/api/accounts', '/api/auth/me', '/api/packages', '/api/dns/zones', '/api/security/hulk/settings', '/api/clusters/config/export/', '/api/clusters/config/export']) {
         const r = await as('get', p).expect(403);
         expect(r.body.error.code).toBe('scope_confined');
       }
@@ -272,14 +324,21 @@ describe('Clusters API', () => {
       await as('post', '/api/auth/password', { newPassword: 'Changed-Passw0rd!1' }).expect(403);
       await as('delete', '/api/clusters/config/export').expect(403);
       await as('post', '/api/clusters/ping').expect(403);
+      // A zone token never pushes settings; a settings token never pushes zones.
+      expect((await as('post', '/api/clusters/config/receive', { settings: { 'dns.default_ttl': 1 } }).expect(403)).body.error.code).toBe('scope_confined');
+      expect((await as('post', '/api/clusters/dns/receive', { domain: 'x.example.com', body: ZONE('x.example.com') }, configSecret).expect(403)).body.error.code).toBe('scope_confined');
+      expect((await as('post', '/api/dns/zones/import', { domain: 'x.example.com', body: ZONE('x.example.com') }, configSecret).expect(403)).body.error.code).toBe('scope_confined');
+      expect(app.ctx.dns.zoneExists('x.example.com')).toBe(false);
       expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM users WHERE username = ?').get('pwned').n).toBe(0);
-      for (const { method, path } of CLUSTER_TOKEN_ROUTES) {
-        const r = await as(method.toLowerCase(), path, method === 'POST' ? {} : undefined);
-        expect(r.status, `${method} ${path}`).not.toBe(403);
-        expect(r.status, `${method} ${path}`).not.toBe(401);
+      for (const [token, scope] of [[secret, 'clustering:dns'], [configSecret, 'clustering:config']]) {
+        for (const { method, path } of CLUSTER_TOKEN_ROUTES[scope]) {
+          const r = await as(method.toLowerCase(), path, method === 'POST' ? {} : undefined, token);
+          expect(r.status, `${method} ${path}`).not.toBe(403);
+          expect(r.status, `${method} ${path}`).not.toBe(401);
+        }
       }
       // An unscoped root token is not confined, and a token mixing in a scope
-      // the registry does not know keeps the per-route requireScope() rules.
+      // the registry does not know keeps the per-route scope rules.
       const plain = `whm_${app.ctx.crypto.randomToken(32)}`;
       const insert = app.ctx.db.prepare("INSERT INTO api_tokens (user_id, name, token_hash, scopes, prefix) VALUES ((SELECT id FROM users WHERE username = 'root'), ?, ?, ?, ?)");
       insert.run('plain', app.ctx.crypto.hashToken(plain), '[]', plain.slice(0, 12));
@@ -287,17 +346,35 @@ describe('Clusters API', () => {
       await request(app.ctx.app).get('/api/clusters/ping').set('Authorization', `Bearer ${plain}`).expect(200);
       await request(app.ctx.app).get('/api/clusters/peers').set('Authorization', `Bearer ${plain}`).expect(200);
       const mixed = `whm_${app.ctx.crypto.randomToken(32)}`;
-      insert.run('mixed', app.ctx.crypto.hashToken(mixed), JSON.stringify(['clustering', 'development:read']), mixed.slice(0, 12));
+      insert.run('mixed', app.ctx.crypto.hashToken(mixed), JSON.stringify(['clustering:dns', 'development:read']), mixed.slice(0, 12));
       await request(app.ctx.app).get('/api/clusters/ping').set('Authorization', `Bearer ${mixed}`).expect(200);
       await request(app.ctx.app).get('/api/clusters/peers').set('Authorization', `Bearer ${mixed}`).expect(403);
+      await request(app.ctx.app).get('/api/clusters/config/export').set('Authorization', `Bearer ${mixed}`).expect(403);
       app.ctx.db.prepare("DELETE FROM api_tokens WHERE name IN ('plain', 'mixed')").run();
-      expect((await get('/tokens').expect(200)).body.data).toHaveLength(1);
+      expect((await get('/tokens').expect(200)).body.data).toHaveLength(2);
     });
 
-    it('answers ping and export to a peer holding the token, without CSRF', async () => {
+    // Tokens issued before the purpose split carry the bare scope: they keep
+    // pushing zones and nothing else, and the list says they are old.
+    it('keeps a legacy "clustering" token working for zones only and flags it', async () => {
+      const legacy = `whm_${app.ctx.crypto.randomToken(32)}`;
+      app.ctx.db.prepare("INSERT INTO api_tokens (user_id, name, token_hash, scopes, prefix) VALUES ((SELECT id FROM users WHERE username = 'root'), ?, ?, ?, ?)").run('old slave', app.ctx.crypto.hashToken(legacy), JSON.stringify([LEGACY_CLUSTER_SCOPE]), legacy.slice(0, 12));
+      const as = (method, path, body) => request(app.ctx.app)[method](path).set('Authorization', `Bearer ${legacy}`).send(body);
+      await as('get', '/api/clusters/ping').expect(200);
+      expect((await as('post', '/api/clusters/dns/receive', { domain: 'legacy.example.com', body: ZONE('legacy.example.com'), serial: 7 }).expect(200)).body.data.domain).toBe('legacy.example.com');
+      expect((await as('get', '/api/clusters/config/export').expect(403)).body.error.code).toBe('scope_confined');
+      expect((await as('post', '/api/clusters/config/receive', { settings: { 'dns.default_ttl': 1 } }).expect(403)).body.error.code).toBe('scope_confined');
+      const listed = (await get('/tokens?purpose=dns').expect(200)).body.data.find((t) => t.name === 'old slave');
+      expect(listed).toMatchObject({ legacy: true, purpose: 'dns', scopes: ['clustering'], allowed: tokenAllowed('clustering:dns') });
+      expect((await get('/tokens?purpose=config').expect(200)).body.data.map((t) => t.name)).not.toContain('old slave');
+      await del(`/tokens/${listed.id}`).expect(200);
+      await as('get', '/api/clusters/ping').expect(401);
+    });
+
+    it('answers ping and export to a peer holding the right token, without CSRF', async () => {
       const ping = await asPeer('get', '/ping').expect(200);
-      expect(ping.body.data).toMatchObject({ hostname: expect.any(String), accepts: { dns: true, config: true }, groups: GROUP_NAMES });
-      const exported = await asPeer('get', '/config/export?groups=dns,tweak').expect(200);
+      expect(ping.body.data).toMatchObject({ hostname: expect.any(String), accepts: { dns: true, config: false }, groups: GROUP_NAMES, sharedGroups: DEFAULT_GROUPS });
+      const exported = await asConfigPeer('get', '/config/export?groups=dns,tweak').expect(200);
       expect(exported.body.data.groups).toEqual(['dns', 'tweak']);
       expect(exported.body.data.settings['dns.default_ttl']).toBe(14400);
       expect(Object.keys(exported.body.data.settings).every((k) => k.startsWith('dns.') || k.startsWith('tweak.'))).toBe(true);
@@ -305,7 +382,48 @@ describe('Clusters API', () => {
       await request(app.ctx.app).get('/api/clusters/config/export').set('Authorization', 'Bearer whm_nope').expect(401);
     });
 
+    // Out of the box a token holder can push nothing: pushes are opt-in, and
+    // once on, only the groups this server itself shares are taken.
+    it('refuses configuration pushes until the operator opts in, and then only for shared groups', async () => {
+      expect(app.ctx.db.prepare("SELECT value FROM settings WHERE key = 'clusters.config.accept_pushes'").get().value).toBe('false');
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM settings WHERE key = 'clusters.config.groups'").get().n).toBe(0);
+      const overview = await get('/config').expect(200);
+      expect(overview.body.data.settings).toMatchObject({ acceptPushes: false, groups: DEFAULT_GROUPS });
+      expect(overview.body.data.selectedGroups).not.toContain('security');
+      expect(overview.body.data.selectedGroups).not.toContain('software');
+      const before = { ttl: app.ctx.settings.get('dns.default_ttl'), twofa: app.ctx.settings.get('security.2fa.required_for_root'), tier: app.ctx.settings.get('updates.tier') };
+      const refused = await asConfigPeer('post', '/config/receive', { source: 'ns1.example.com', settings: { 'dns.default_ttl': 3600 } }).expect(403);
+      expect(refused.body.error.message).toMatch(/does not accept configuration pushes/);
+      expect(app.ctx.settings.get('dns.default_ttl')).toBe(before.ttl);
+      await put('/config/settings', { acceptPushes: true }).expect(200);
+      // A push touching a group this server has not selected is refused as a whole.
+      const unshared = await asConfigPeer('post', '/config/receive', { source: 'ns1.example.com', groups: ['dns', 'security', 'software'], settings: { 'dns.default_ttl': 3600, 'security.2fa.required_for_root': false, 'security.policy.verified_ip_login': false, 'updates.tier': 'edge' } }).expect(422);
+      expect(unshared.body.error.code).toBe('group_not_shared');
+      expect(unshared.body.error.message).toMatch(/does not share the security, software groups/);
+      expect(unshared.body.error.fields.groups).toEqual(['security: not shared on this server', 'software: not shared on this server']);
+      expect(app.ctx.settings.get('dns.default_ttl')).toBe(before.ttl);
+      expect(app.ctx.settings.get('security.2fa.required_for_root')).toBe(before.twofa);
+      expect(app.ctx.settings.get('updates.tier')).toBe(before.tier);
+      const ev = app.ctx.db.prepare("SELECT * FROM cluster_events WHERE kind = 'config.receive' ORDER BY id DESC").get();
+      expect(ev).toMatchObject({ status: 'skipped', source: 'ns1.example.com', message: expect.stringMatching(/security, software groups are not shared/) });
+      expect(JSON.parse(ev.details_json)).toMatchObject({ unshared: ['security', 'software'] });
+      expect(JSON.stringify(app.ctx.db.prepare('SELECT args_redacted FROM audit_log').all())).not.toContain('"updates.tier":"edge"');
+      // diff() itself refuses such keys too, whatever the caller.
+      const diff = app.ctx.clusters.config.diff({ 'security.cphulk.enabled': false, 'dns.default_ttl': 3600 });
+      expect(diff.rejected).toEqual(['security.cphulk.enabled']);
+      expect(diff.rejections['security.cphulk.enabled']).toMatch(/^group_not_shared/);
+      // Pulling a group this server does not share is refused before the peer is contacted.
+      const n = peer.received.length;
+      const pull = await post('/config/pull', { clusterId: peerId, groups: ['security'] }).expect(422);
+      expect(pull.body.error.code).toBe('group_not_shared');
+      expect(peer.received.length).toBe(n);
+      // The rest of the suite shares everything.
+      await put('/config/settings', { groups: GROUP_NAMES }).expect(200);
+      expect((await asPeer('get', '/ping').expect(200)).body.data).toMatchObject({ accepts: { config: true }, sharedGroups: GROUP_NAMES });
+    });
+
     it('receives a configuration push, applying only pushable keys', async () => {
+      const asPeer = asConfigPeer;
       const res = await asPeer('post', '/config/receive', { source: 'ns1.example.com', settings: { 'dns.default_ttl': 3600, 'tweak.max_emails_per_hour': 250, 'basic.hostname': 'evil.example.com', 'contacts.smtp.password': 'x', 'news.html': '<b>hi</b>', 'dns.soa_retry': 1800 } }).expect(200);
       expect(res.body.data).toMatchObject({ applied: ['dns.default_ttl', 'tweak.max_emails_per_hour'], failed: [], rejected: ['basic.hostname', 'contacts.smtp.password', 'news.html'], unchanged: 1 });
       expect(res.body.data.rejections).toEqual({ 'basic.hostname': 'not a shared setting', 'contacts.smtp.password': 'not a shared setting', 'news.html': 'not a shared setting' });
@@ -313,7 +431,7 @@ describe('Clusters API', () => {
       expect(app.ctx.settings.get('dns.default_ttl')).toBe(3600);
       expect(app.ctx.settings.get('basic.hostname')).not.toBe('evil.example.com');
       expect(auditCount('clusters.config.receive')).toBe(1);
-      const ev = app.ctx.db.prepare("SELECT * FROM cluster_events WHERE kind = 'config.receive'").get();
+      const ev = app.ctx.db.prepare("SELECT * FROM cluster_events WHERE kind = 'config.receive' AND status = 'ok'").get();
       expect(ev).toMatchObject({ direction: 'in', source: 'ns1.example.com', status: 'ok' });
       await put('/config/settings', { acceptPushes: false }).expect(200);
       await asPeer('post', '/config/receive', { settings: { 'dns.default_ttl': 1 } }).expect(403);
@@ -321,6 +439,7 @@ describe('Clusters API', () => {
     });
 
     it('refuses wrong-typed values, unknown keys under a shared prefix and host-state keys', async () => {
+      const asPeer = asConfigPeer;
       const before = { timeout: app.ctx.settings.get('security.policy.session_timeout_minutes'), ports: app.ctx.settings.get('service_config.apache_ports'), outbound: app.ctx.settings.get('mail.outbound.ipv4'), home: app.ctx.settings.get('basic.home_root') };
       const res = await asPeer('post', '/config/receive', { settings: {
         'security.policy.session_timeout_minutes': 'abc', 'service_config.apache_ports': { http: 80, https: 443, bind: '10.9.9.9' }, 'tweak.max_emails_per_hour': {}, 'dns.bogus_new_key': 1, 'dns.default_ttl': 3600,
@@ -342,9 +461,17 @@ describe('Clusters API', () => {
       const partial = await asPeer('post', '/config/receive', { settings: { 'service_config.apache': { timeout: 42, newDirective: 'x' } } }).expect(200);
       expect(partial.body.data.rejected).toEqual(['service_config.apache']);
       expect(app.ctx.settings.get('service_config.apache').timeout).toBe(300);
+      // Apache directives are code, not a setting: a peer cannot write them here.
+      const code = await asPeer('post', '/config/receive', { settings: { 'service_config.apache': { timeout: 42, customDirectives: 'Include /etc/shadow' } } }).expect(200);
+      expect(code.body.data.rejected).toEqual(['service_config.apache']);
+      expect(code.body.data.rejections['service_config.apache']).toMatch(/customDirectives|Unrecognized/i);
+      expect(app.ctx.settings.get('service_config.apache').timeout).toBe(300);
+      expect(app.ctx.settings.get('service_config.apache').customDirectives ?? '').not.toContain('shadow');
+      expect(JSON.stringify((await asConfigPeer('get', '/config/export?groups=service_config').expect(200)).body)).not.toContain('customDirectives');
     });
 
     it('routes accepted keys through the owning services and reports what reached the host', async () => {
+      const asPeer = asConfigPeer;
       app.ctx.agent.reset();
       app.ctx.agent.set('ssl.acme.detect', { certbot: false, acmeSh: null, providers: [], provider: null });
       const res = await asPeer('post', '/config/receive', { source: 'ns1.example.com', settings: {
@@ -387,7 +514,42 @@ describe('Clusters API', () => {
       expect(again.body.data).toMatchObject({ applied: [], unchanged: 2 });
     });
 
+    it('replicates branding, themes, support and the market catalogue through their owners', async () => {
+      const res = await asConfigPeer('post', '/config/receive', { source: 'ns1.example.com', settings: {
+        'branding.company_name': 'Acme Hosting', 'branding.primary_color': '#336699', 'branding.login_notice': 'Authorised staff only', 'branding.help_url': 'https://help.acme.example/',
+        'themes.default': 'jupiter', 'themes.allow_user_override': false, 'themes.account_default': 'no-such-theme',
+        'support.provider_name': 'Acme Support', 'support.portal_url': 'https://support.acme.example/', 'support.access.default_hours': 12,
+        'market.providers': [{ name: 'cpstore', displayName: 'Acme Store', commissionPercent: 15, products: [{ id: 'dv', name: 'DV cert', price: 12.5, basePrice: 10, currency: 'USD', termMonths: 12 }] }],
+        'branding.logo': { file: '/etc/passwd' },
+      } }).expect(200);
+      const { results } = res.body.data;
+      expect(res.body.data.rejected).toEqual(['branding.logo']);
+      for (const k of ['branding.company_name', 'branding.primary_color', 'branding.login_notice', 'branding.help_url']) expect(results[k], k).toMatchObject({ status: 'applied', via: 'branding' });
+      expect(app.ctx.cpanel.branding.get()).toMatchObject({ companyName: 'Acme Hosting', primaryColor: '#336699', loginNotice: 'Authorised staff only', helpUrl: 'https://help.acme.example/' });
+      expect(auditCount('branding.update')).toBe(1);
+      // Themes validates slugs against what is installed here: the unknown one fails the whole themes patch and nothing of it sticks.
+      expect(results['themes.account_default']).toMatchObject({ status: 'failed', via: 'themes', note: expect.stringMatching(/no-such-theme/) });
+      expect(app.ctx.settings.get('themes.allow_user_override')).toBe(true);
+      expect(results['support.provider_name']).toMatchObject({ status: 'applied', via: 'support' });
+      expect(app.ctx.support.settings()).toMatchObject({ providerName: 'Acme Support', portalUrl: 'https://support.acme.example/', access: { defaultHours: 12 } });
+      expect(results['market.providers']).toMatchObject({ status: 'applied', via: 'market' });
+      const store = app.ctx.market.sslProviders().find((p) => p.name === 'cpstore');
+      expect(store).toMatchObject({ displayName: 'Acme Store', commissionPercent: 15, enabled: false });
+      expect(store.products).toEqual([expect.objectContaining({ id: 'dv', name: 'DV cert', basePrice: 10, price: 11.5 })]);
+      // A provider this host does not have is reported, not created (its adapter and credentials never travel).
+      const unknown = await asConfigPeer('post', '/config/receive', { settings: { 'market.providers': [{ name: 'otherstore', displayName: 'Other', adapter: 'generic', url: 'https://other.example.com', products: [] }] } }).expect(200);
+      expect(unknown.body.data.results['market.providers']).toMatchObject({ status: 'failed', via: 'market', note: expect.stringMatching(/otherstore/) });
+      expect(app.ctx.market.sslProviders().map((p) => p.name)).not.toContain('otherstore');
+      // Exported alongside the rest; file descriptors stay local.
+      const exported = await asConfigPeer('get', '/config/export?groups=branding').expect(200);
+      expect(exported.body.data.settings).toMatchObject({ 'branding.company_name': 'Acme Hosting', 'themes.default': 'jupiter', 'support.provider_name': 'Acme Support' });
+      expect(exported.body.data.settings).not.toHaveProperty('branding.logo');
+      expect(exported.body.data.settings).not.toHaveProperty('branding.favicon');
+      expect(Array.isArray(exported.body.data.settings['market.providers'])).toBe(true);
+    });
+
     it('serves no URL credentials to a peer and refuses to receive them', async () => {
+      const asPeer = asConfigPeer;
       const SECRET_URL = 'https://feeduser:feedpass@updates.example.com/feed.json';
       const before = app.ctx.settings.get('software.update_url');
       app.ctx.settings.set('software.update_url', SECRET_URL);
@@ -421,32 +583,46 @@ describe('Clusters API', () => {
       expect(app.ctx.dns.zoneExists('peerzone.net')).toBe(true);
       await asPeer('post', '/dns/receive', { domain: 'peerzone.net', body: 'garbage', source: 'ns1.example.com' }).expect(422);
       const events = await get('/events?kind=dns.receive').expect(200);
-      expect(events.body.data.map((e) => e.status)).toEqual(['failed', 'ok']);
+      expect(events.body.data.slice(0, 2).map((e) => e.status)).toEqual(['failed', 'ok']);
+      expect(events.body.data[1].message).toBe('peerzone.net serial 7');
       await put('/dns/settings', { acceptPushes: false }).expect(200);
       await asPeer('post', '/dns/receive', { domain: 'peerzone.net', body: ZONE('peerzone.net', 8) }).expect(403);
       await put('/dns/settings', { acceptPushes: true }).expect(200);
     });
 
-    it('enforces "accept pushes" on the DNS module\'s import endpoint that peers actually use', async () => {
+    it('enforces "accept pushes" on the DNS module\'s import endpoint that peers actually use, and logs what gets through', async () => {
       const importZone = (body) => request(app.ctx.app).post('/api/dns/zones/import').set('Authorization', `Bearer ${secret}`).send(body);
+      const dnsEvents = () => app.ctx.db.prepare("SELECT * FROM cluster_events WHERE kind = 'dns.receive' ORDER BY id DESC").all();
       await put('/dns/settings', { acceptPushes: false }).expect(200);
       const refused = await importZone({ domain: 'peerzone.net', body: ZONE('peerzone.net', 9), serial: 9 }).expect(403);
       expect(refused.body.error.message).toMatch(/does not accept DNS pushes/);
       expect((await app.ctx.dns.getZone('peerzone.net', { role: 'root' })).serial).toBe(7);
-      const ev = app.ctx.db.prepare("SELECT * FROM cluster_events WHERE kind = 'dns.receive' ORDER BY id DESC").get();
-      expect(ev).toMatchObject({ status: 'skipped', message: expect.stringMatching(/peerzone\.net: refused/) });
-      // A root session importing by hand is not a peer push.
+      expect(dnsEvents()[0]).toMatchObject({ status: 'skipped', message: expect.stringMatching(/peerzone\.net: refused/) });
+      // A root session importing by hand is not a peer push, and is not logged as one.
+      const n = dnsEvents().length;
       await app.http.post('/api/dns/zones/import').set('X-CSRF-Token', csrf).send({ domain: 'peerzone.net', body: ZONE('peerzone.net', 9), serial: 9 }).expect(200);
+      expect(dnsEvents()).toHaveLength(n);
       await put('/dns/settings', { acceptPushes: true }).expect(200);
       await importZone({ domain: 'peerzone.net', body: ZONE('peerzone.net', 10), serial: 10 }).expect(200);
       expect((await app.ctx.dns.getZone('peerzone.net', { role: 'root' })).serial).toBeGreaterThanOrEqual(10);
       expect(app.ctx.clusters.acceptsDnsPushes()).toBe(true);
+      // The exchange log shows the zones that arrived through the DNS module's route, once each, and what failed.
+      await new Promise((r) => setImmediate(r));
+      expect(dnsEvents()).toHaveLength(n + 1);
+      expect(dnsEvents()[0]).toMatchObject({ direction: 'in', status: 'ok', message: 'peerzone.net serial 10 (zone import)' });
+      expect(JSON.parse(dnsEvents()[0].details_json)).toMatchObject({ domain: 'peerzone.net', serial: 10, path: '/api/dns/zones/import', status: 200 });
+      await importZone({ domain: 'peerzone.net', body: 'garbage', serial: 11 }).expect(422);
+      await new Promise((r) => setImmediate(r));
+      expect(dnsEvents()[0]).toMatchObject({ status: 'failed', message: expect.stringMatching(/peerzone\.net: import answered HTTP 422/) });
+      expect((await get('/events?kind=dns.receive&status=ok').expect(200)).body.data.map((e) => e.message)).toContain('peerzone.net serial 10 (zone import)');
     });
 
-    it('revokes the token so the peer is locked out', async () => {
+    it('revokes the tokens so the peers are locked out', async () => {
       await del(`/tokens/${tokenId}`).expect(200);
       await asPeer('get', '/ping').expect(401);
       await del(`/tokens/${tokenId}`).expect(404);
+      await del(`/tokens/${configTokenId}`).expect(200);
+      await asConfigPeer('get', '/ping').expect(401);
       expect((await get('/tokens').expect(200)).body.data).toEqual([]);
     });
   });
@@ -493,6 +669,21 @@ describe('Clusters API', () => {
         expect(overview.body.data).toMatchObject({ dnsModule: false, zones: [] });
         await post('/dns/receive', { domain: 'peerzone.net', body: ZONE('peerzone.net') }).expect(501);
       } finally { app.ctx.dns = original; }
+      // Without the schedule, a settings request that includes autoSync is refused before anything is written.
+      const schedule = app.ctx.scheduler.list().find((x) => x.name === 'dns-cluster-sync');
+      app.ctx.scheduler.remove('dns-cluster-sync');
+      try {
+        const verify = app.ctx.settings.get('dns.cluster_verify_tls');
+        const audits = auditCount('clusters.dns.settings');
+        const res = await put('/dns/settings', { autoSync: true, verifyTls: !verify, acceptPushes: false }).expect(501);
+        expect(res.body.error.code).toBe('capability_missing');
+        expect(app.ctx.settings.get('dns.cluster_verify_tls')).toBe(verify);
+        expect(app.ctx.clusters.acceptsDnsPushes()).toBe(true);
+        expect(auditCount('clusters.dns.settings')).toBe(audits);
+      } finally {
+        app.ctx.scheduler.ensure(schedule.name, schedule.cron, schedule.job_type, schedule.params);
+        app.ctx.scheduler.update(schedule.name, { enabled: Boolean(schedule.enabled) });
+      }
     });
   });
 
@@ -566,6 +757,7 @@ describe('Clusters API', () => {
       const SECRET_URL = 'https://feeduser:feedpass@updates.example.com/feed.json';
       const before = app.ctx.settings.get('software.update_url');
       app.ctx.settings.set('software.update_url', SECRET_URL);
+      await put('/config/settings', { groups: ['dns', 'tweak', 'software'] }).expect(200);
       app.ctx.jobs.start();
       try {
         const job = await waitForJob(app.ctx, (await post('/config/push', { clusterIds: [peerId], groups: ['software'] }).expect(202)).body.data.job.id, 20000);
@@ -586,7 +778,7 @@ describe('Clusters API', () => {
         const applied = await post('/config/pull', { clusterId: peerId, groups: ['software'], apply: true }).expect(200);
         expect(JSON.stringify(applied.body)).not.toContain('other:pw');
         expect(app.ctx.settings.get('software.update_url')).toBe(before);
-      } finally { delete peer.state.exportSettings['software.update_url']; }
+      } finally { delete peer.state.exportSettings['software.update_url']; await put('/config/settings', { groups: ['dns', 'tweak'] }).expect(200); }
       const rows = app.ctx.db.prepare('SELECT details_json, message FROM cluster_events').all();
       expect(JSON.stringify(rows)).not.toMatch(/feedpass|other:pw/);
       expect(JSON.stringify(app.ctx.db.prepare('SELECT args_redacted FROM audit_log').all())).not.toMatch(/feedpass|other:pw/);
@@ -600,13 +792,32 @@ describe('Clusters API', () => {
       await del(`/peers/${dead.body.data.id}`).expect(200);
     });
 
-    it('filters and pages the exchange log', async () => {
+    it('filters and pages the exchange log, treating LIKE wildcards in the search as text', async () => {
       const all = await get('/events?pageSize=5').expect(200);
       expect(all.body.data).toHaveLength(5);
       expect(all.body.meta.total).toBeGreaterThan(5);
       const failed = await get('/events?status=failed&kind=config.pull').expect(200);
       expect(failed.body.data.every((e) => e.status === 'failed' && e.kind === 'config.pull')).toBe(true);
       expect(failed.body.meta.total).toBe(2);
+      app.ctx.clusters.events.record({ kind: 'peer.test', direction: 'out', source: 'test.example.com', status: 'ok', message: 'disk 100% full on peer_9' });
+      expect((await get('/events?q=100%25').expect(200)).body.meta.total).toBe(1);
+      expect((await get('/events?q=%25').expect(200)).body.meta.total).toBe(1);
+      expect((await get('/events?q=peer_9').expect(200)).body.meta.total).toBe(1);
+      expect((await get('/events?q=peer_').expect(200)).body.meta.total).toBe(1);
+      expect((await get('/events?q=peerX9').expect(200)).body.meta.total).toBe(0);
+    });
+
+    // Retention runs from the push job as well as the pages, so a server
+    // nobody opens still trims what chatty peers write.
+    it('prunes the exchange log from the scheduled push job', async () => {
+      app.ctx.db.prepare("INSERT INTO cluster_events (kind, direction, status, message, ts) VALUES ('config.export', 'out', 'ok', 'ancient', datetime('now', '-400 days'))").run();
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM cluster_events WHERE message = 'ancient'").get().n).toBe(1);
+      app.ctx.jobs.start();
+      try {
+        const job = await waitForJob(app.ctx, app.ctx.jobs.enqueue('clusters.config.push', {}, {}).id, 20000);
+        expect(job.result).toEqual({ skipped: 'disabled' });
+      } finally { app.ctx.jobs.stop(); }
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM cluster_events WHERE message = 'ancient'").get().n).toBe(0);
     });
   });
 });

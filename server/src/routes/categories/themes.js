@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { validate, z, fields } from '../../lib/validate.js';
 import { requireRoot, requireReseller } from '../../middleware/rbac.js';
-import { createThemesService, SLUG_RE, BASES, MAX_CSS_BYTES, VARIABLE_CATALOG } from '../../services/themes.js';
+import { createThemesService, SLUG_RE, RESERVED_SLUGS, BASES, MAX_CSS_BYTES, VARIABLE_CATALOG } from '../../services/themes.js';
 
 const slug = z.string().trim().toLowerCase().regex(SLUG_RE, 'Slugs use lowercase letters, digits, "_" and "-"; max 32 chars');
 const themeName = z.string().trim().min(1).max(80).regex(/^[^\r\n\0<>]*$/, 'Names are a single line without angle brackets');
@@ -10,7 +10,8 @@ const tokenKey = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/, 'Design token names 
 const tokenValue = z.string().trim().max(120).nullable();
 const variables = z.record(tokenKey, tokenValue);
 const slugParam = z.object({ slug });
-const createBody = z.object({ slug, name: themeName.optional(), base: base.optional(), variables: variables.optional(), copyFrom: slug.optional() }).strict();
+const newSlug = slug.refine((s) => !RESERVED_SLUGS.has(s), { message: 'This name is reserved; pick another slug' });
+const createBody = z.object({ slug: newSlug, name: themeName.optional(), base: base.optional(), variables: variables.optional(), copyFrom: slug.optional() }).strict();
 const updateBody = z.object({ name: themeName.optional(), base: base.optional(), variables: variables.optional(), enabled: z.boolean().optional() }).strict()
   .refine((b) => Object.keys(b).length > 0, { message: 'Provide at least one field', path: ['name'] });
 const cssBody = z.object({ css: z.string().max(MAX_CSS_BYTES) }).strict();

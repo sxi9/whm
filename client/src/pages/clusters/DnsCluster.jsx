@@ -34,8 +34,8 @@ export function DnsCluster() {
         <SyncNow peers={data.peers} onStarted={refreshAll} />
         <DnsSettings settings={data.settings} schedule={data.schedule} dnsModule={data.dnsModule} onSaved={refreshAll} />
       </div>
-      <ClusterTokens tokens={data.tokens} hostname={data.hostname} onChanged={refreshAll} />
-      <Card title="Zone status per peer" subtitle="The serial each peer last acknowledged. Stale zones are re-sent by the hourly run; a failed push shows the peer's answer." padded={false}>
+      <ClusterTokens tokens={data.tokens} hostname={data.hostname} purpose="dns" onChanged={refreshAll} />
+      <Card title="Zone status per peer" subtitle="The serial each peer last acknowledged. Stale zones are re-sent by the hourly run; a failed push shows the peer's answer. Pushes replicate existing zones only: a zone deleted here stays on the peers until it is removed there, and a sync peer's zones reach this server only when that peer pushes them." padded={false}>
         <DataTable dense rows={data.zones} rowKey={(r) => `${r.zone_id}-${r.cluster_id}`} emptyText="Nothing has been pushed yet."
           columns={[
             { key: 'domain', label: 'Zone' },
@@ -107,7 +107,7 @@ function DnsSettings({ settings, schedule, dnsModule, onSaved }) {
     <Card title="DNS cluster settings">
       <Field inline><Toggle checked={draft.autoSync} onChange={(v) => setDraft((d) => ({ ...d, autoSync: v }))} disabled={!dnsModule} label="Push changed zones automatically" description={schedule ? `Hourly (${schedule.cron}); only zones a peer has not acknowledged at their current serial. Next run ${formatDate(schedule.nextRunAt)}.` : 'The DNS module provides the schedule.'} /></Field>
       <Field inline><Toggle checked={draft.acceptPushes} onChange={(v) => setDraft((d) => ({ ...d, acceptPushes: v }))} label="Accept zones pushed by peers" description="Off refuses token-authenticated zone pushes on both the cluster endpoint and the DNS module's zone import that peers' sync jobs use; a root session importing a zone by hand is unaffected." /></Field>
-      <Field inline><Toggle checked={draft.verifyTls} onChange={(v) => setDraft((d) => ({ ...d, verifyTls: v }))} label="Verify peer TLS certificates on zone pushes" description="Applies to the hourly and manual zone pushes; per-peer verification applies to tests and configuration." /></Field>
+      <Field inline><Toggle checked={draft.verifyTls} onChange={(v) => setDraft((d) => ({ ...d, verifyTls: v }))} label="Verify peer TLS certificates on zone pushes" description="Applies to the hourly and manual zone pushes to every peer; the per-peer toggle covers connectivity tests and settings exchanges." /></Field>
       <KeyValue items={[['Last scheduled run', formatDate(schedule?.lastRunAt)], ['Schedule', schedule ? <StatusPill status={schedule.enabled ? 'enabled' : 'disabled'}>{schedule.enabled ? 'enabled' : 'paused'}</StatusPill> : '—']]} />
       <FormActions><Button variant="primary" loading={saving} disabled={!dirty} onClick={save}>Save settings</Button></FormActions>
     </Card>

@@ -81,7 +81,10 @@ export function ProviderFormModal({ open, provider, adapters, onClose, onSaved }
     setForm(provider ? { name: provider.name, displayName: provider.displayName, type: provider.type, adapter: provider.adapter, url: provider.url || '', commissionPercent: provider.commissionPercent, products: (provider.products || []).map((p) => ({ ...p, price: p.basePrice ?? p.price })) } : blank);
   }, [open, provider]);
   const adapter = (adapters || []).find((a) => a.id === form.adapter);
-  const creatable = (adapters || []).filter((a) => !a.readOnly && a.types.includes(form.type));
+  // Read-only adapters are reflected from elsewhere and singleton ones ship as a built-in row.
+  const addable = (adapters || []).filter((a) => !a.readOnly && !a.singleton);
+  const creatable = addable.filter((a) => a.types.includes(form.type));
+  const typeOptions = Object.entries(TYPE_LABELS).filter(([value]) => editing || !adapters || addable.some((a) => a.types.includes(value))).map(([value, label]) => ({ value, label }));
   const hasProducts = form.type === 'ssl';
 
   const save = async () => {
@@ -106,7 +109,7 @@ export function ProviderFormModal({ open, provider, adapters, onClose, onSaved }
       <div className="form-grid">
         <Field label="Identifier" required={!editing} help="Lowercase letters, digits, - and _. Used in orders and the API."><TextInput value={form.name} onChange={(v) => setForm({ ...form, name: v.toLowerCase() })} disabled={editing} placeholder="sectigo" /></Field>
         <Field label="Display name" required><TextInput value={form.displayName} onChange={(v) => setForm({ ...form, displayName: v })} placeholder="Sectigo" /></Field>
-        <Field label="Type"><Select value={form.type} onChange={(v) => { const next = (adapters || []).find((a) => !a.readOnly && a.types.includes(v)); setForm({ ...form, type: v, adapter: next?.id || form.adapter }); }} disabled={editing} options={Object.entries(TYPE_LABELS).map(([value, label]) => ({ value, label }))} /></Field>
+        <Field label="Type" help={!editing && typeOptions.length < Object.keys(TYPE_LABELS).length ? 'The plugin marketplace hub is built in: configure "WHM Marketplace (plugin hub)" in the list instead.' : undefined}><Select value={form.type} onChange={(v) => { const next = addable.find((a) => a.types.includes(v)); setForm({ ...form, type: v, adapter: next?.id || form.adapter }); }} disabled={editing} options={typeOptions} /></Field>
         <Field label="Adapter" help={adapter?.configFields?.length ? `Credentials (${adapter.configFields.map((f) => f.label).join(', ')}) are entered under Configure.` : 'No credentials needed.'}><Select value={form.adapter} onChange={(v) => setForm({ ...form, adapter: v })} disabled={editing} options={creatable.map((a) => ({ value: a.id, label: a.label }))} /></Field>
         <Field label={form.type === 'plugin' ? 'Hub URL' : 'Vendor URL'} required={adapter?.requiresUrl} help="https:// only"><TextInput value={form.url} onChange={(v) => setForm({ ...form, url: v })} placeholder="https://" /></Field>
         <Field label="Commission (%)" help="Added on top of the vendor price when the product is offered to resellers and accounts."><NumberInput value={form.commissionPercent} onChange={(v) => setForm({ ...form, commissionPercent: v })} nullable={false} min={0} max={100} step="0.5" /></Field>

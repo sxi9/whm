@@ -2,12 +2,30 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Eye, EyeOff, Upload } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
-import { StatusPill } from '../../components/Common.jsx';
+import { StatusPill, CapabilityNotice } from '../../components/Common.jsx';
 import { Field, TextInput, Select, Toggle, Textarea, Button, FormActions, ErrorBanner } from '../../components/Form.jsx';
 import { useToast } from '../../components/Toast.jsx';
 import { applyTheme, notifyThemeChanged } from '../../theme/applyTheme.js';
 
-export { RequestError, Tabs } from '../security/Shared.jsx';
+const isCapabilityError = (error) => Boolean(error) && (error.status === 501 || error.code === 'capability_missing' || error.code === 'binary_not_found');
+
+export function RequestError({ error, onRetry }) {
+  if (!error) return null;
+  if (isCapabilityError(error)) return <CapabilityNotice error={error} onRetry={onRetry} />;
+  return <ErrorBanner error={error} onRetry={onRetry} />;
+}
+
+export function Tabs({ tabs, value, onChange }) {
+  return (
+    <div className="row-actions" role="tablist" style={{ marginBottom: 14, flexWrap: 'wrap' }}>
+      {tabs.map((t) => (
+        <button key={t.value} role="tab" aria-selected={value === t.value} className={`btn btn-sm ${value === t.value ? 'btn-primary' : ''}`} onClick={() => onChange(t.value)}>
+          {t.label}{t.count != null && <span className="pill pill-muted" style={{ marginLeft: 6 }}>{t.count}</span>}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 export const BASES = [{ value: 'light', label: 'Light' }, { value: 'dark', label: 'Dark' }];
 
@@ -20,7 +38,6 @@ export function useThemes() {
     defaultSlug: themes.find((t) => t.isDefault)?.slug || res.meta?.default || 'jupiter',
     accountDefault: themes.find((t) => t.isAccountDefault)?.slug || res.meta?.accountDefault || 'jupiter',
     allowUserOverride: res.meta?.allowUserOverride !== false,
-    accountDefaultApplied: res.meta?.accountDefaultApplied ?? false,
     catalog: res.meta?.variables || {},
   };
 }
@@ -109,7 +126,8 @@ export function PreviewButton({ preview, theme }) {
 }
 
 // Name / base / enabled / tokens / CSS for a custom theme. `theme` is the server record.
-export function ThemeEditor({ theme, catalog, onSaved, onClose }) {
+// Built-in themes and viewers who cannot edit (resellers) get a read-only form with preview.
+export function ThemeEditor({ theme, catalog, onSaved, onClose, readOnly: forceReadOnly = false }) {
   const toast = useToast();
   const preview = usePreview();
   const [form, setForm] = useState({ name: theme.name, base: theme.base, enabled: theme.enabled, variables: { ...theme.variables } });
@@ -117,11 +135,13 @@ export function ThemeEditor({ theme, catalog, onSaved, onClose }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
   const fileRef = useRef(null);
-  const readOnly = Boolean(theme.builtin);
+  const readOnly = Boolean(theme.builtin) || forceReadOnly;
 
-  const draft = () => ({ ...theme, base: form.base, variables: form.variables, css });
-  const update = (patch) => { setForm((f) => { const next = { ...f, ...patch }; preview.update({ ...theme, base: next.base, variables: next.variables, css }); return next; }); };
-  const updateCss = (v) => { setCss(v); preview.update({ ...theme, base: form.base, variables: form.variables, css: v }); };
+  // A changed base scheme drops the stock theme's OS-following behaviour in the preview.
+  const paint = (base, variables, cssText) => ({ ...theme, base, scheme: base === theme.base ? theme.scheme : undefined, variables, css: cssText });
+  const draft = () => paint(form.base, form.variables, css);
+  const update = (patch) => { const next = { ...form, ...patch }; setForm(next); preview.update(paint(next.base, next.variables, css)); };
+  const updateCss = (v) => { setCss(v); preview.update(paint(form.base, form.variables, v)); };
 
   const pickFile = async (file) => {
     if (!file) return;
@@ -145,7 +165,7 @@ export function ThemeEditor({ theme, catalog, onSaved, onClose }) {
 
   return (
     <>
-      {readOnly && <div className="banner banner-info"><div>Built-in themes are read-only. Copy this theme from the list to customise it.</div></div>}
+      {readOnly && <div className="banner banner-info"><div>{theme.builtin ? 'Built-in themes are read-only. Copy this theme from the list to customise it.' : 'Only root can change themes; you can inspect and preview this one.'}</div></div>}
       <fieldset disabled={readOnly} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
       <div className="form-grid">
         <Field label="Name" required error={error?.fields?.name}><TextInput value={form.name} onChange={(v) => update({ name: v })} /></Field>

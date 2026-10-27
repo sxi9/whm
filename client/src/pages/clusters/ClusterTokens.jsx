@@ -7,8 +7,16 @@ import { Field, TextInput, NumberInput, Button, FormActions, ErrorBanner } from 
 import { Modal, useConfirm } from '../../components/Modal.jsx';
 import { useToast } from '../../components/Toast.jsx';
 
-// Tokens other panels use to reach this one. The secret is shown once.
-export function ClusterTokens({ tokens, hostname, onChanged }) {
+const PURPOSE = {
+  dns: { label: 'zones', title: 'Tokens for remote panels (zones)', can: 'push zones to', issued: 'under Clusters > DNS Cluster', endpoints: 'ping, receiving zones and the zone import' },
+  config: { label: 'settings', title: 'Tokens for remote panels (settings)', can: 'exchange settings with', issued: 'under Clusters > Configuration Cluster', endpoints: 'ping, serving an export and receiving settings' },
+};
+
+// Tokens other panels use to reach this one. Each carries one purpose (zones
+// or settings) and reaches nothing but that purpose's endpoints. The secret
+// is shown once.
+export function ClusterTokens({ tokens, hostname, purpose = 'dns', onChanged }) {
+  const p = PURPOSE[purpose] || PURPOSE.dns;
   const toast = useToast();
   const confirm = useConfirm();
   const [open, setOpen] = useState(false);
@@ -23,7 +31,7 @@ export function ClusterTokens({ tokens, hostname, onChanged }) {
     setSaving(true);
     setError(null);
     try {
-      const body = { name: name.trim() };
+      const body = { name: name.trim(), purpose };
       if (days) body.expiresInDays = days;
       const { data } = await api.post('/clusters/tokens', body);
       setIssued(data);
@@ -44,12 +52,12 @@ export function ClusterTokens({ tokens, hostname, onChanged }) {
 
   return (
     <>
-      <Card title="Tokens for remote panels" subtitle={`A peer that pushes zones or settings to ${hostname || 'this server'} authenticates with one of these. Issue one per peer so each can be revoked on its own. A cluster token is confined to the peer endpoints (ping, receiving zones and settings, serving an export and the zone import); every other API answers it with 403.`} padded={false}
+      <Card title={p.title} subtitle={`A peer that wants to ${p.can} ${hostname || 'this server'} authenticates with one of these. Issue one per peer so each can be revoked on its own. A ${p.label} token is confined to ${p.endpoints}; every other API, including the other cluster's endpoints, answers it with 403.${purpose === 'dns' ? ' Tokens issued before the split (marked legacy) keep pushing zones only; reissue them when convenient.' : ''}`} padded={false}
         actions={<Button size="sm" icon={KeyRound} onClick={() => { setIssued(null); setError(null); setOpen(true); }}>Issue token</Button>}>
         <DataTable dense rows={tokens || []} rowKey={(t) => t.id} emptyText="No cluster tokens issued. A peer needs one before it can push to this server."
           columns={[
             { key: 'name', label: 'Name', render: (t) => <><strong>{t.name}</strong><br /><code style={{ fontSize: 12 }}>{t.prefix}…</code></> },
-            { key: 'username', label: 'Acts as', render: (t) => <>{t.username}<br /><small className="muted" title={(t.allowed || []).join('\n')}>cluster endpoints only</small></> },
+            { key: 'username', label: 'Acts as', render: (t) => <>{t.username}<br /><small className="muted" title={(t.allowed || []).join('\n')}>{PURPOSE[t.purpose]?.label || t.purpose} endpoints only{t.legacy ? ' (legacy token)' : ''}</small></> },
             { key: 'lastUsedAt', label: 'Last used', render: (t) => formatDate(t.lastUsedAt) },
             { key: 'expiresAt', label: 'Expires', render: (t) => (t.expiresAt ? formatDate(t.expiresAt) : <span className="muted">never</span>) },
             { key: 'createdAt', label: 'Issued', render: (t) => <>{formatDate(t.createdAt)}{t.createdIp && <small className="muted"> from {t.createdIp}</small>}</> },
@@ -68,13 +76,14 @@ export function ClusterTokens({ tokens, hostname, onChanged }) {
               </div>
             </Field>
             <p className="muted">On the remote panel, add {hostname || 'this server'} as a peer and paste the token as its API token. It can call only: {(issued.allowed || []).map((a) => <code key={a} style={{ fontSize: 12, marginRight: 6 }}>{a}</code>)}</p>
+            {purpose === 'config' && <p className="muted">Settings arrive here only while "Accept settings pushed by peers" is on, and only for the groups this server shares.</p>}
             <FormActions><Button variant="primary" onClick={() => setOpen(false)}>Done</Button></FormActions>
           </>
         ) : (
           <form onSubmit={issue}>
             <ErrorBanner error={error && !error.fields ? error : null} />
             <Field label="Name" required error={error?.fields?.name} help="Usually the peer that will hold it."><TextInput value={name} onChange={setName} placeholder="ns1 master" autoFocus /></Field>
-            <Field label="Expires in (days)" error={error?.fields?.expiresInDays} help="Blank never expires. The token reaches the cluster endpoints only; revoke it when the peer is decommissioned."><NumberInput value={days} onChange={setDays} min={1} max={3650} /></Field>
+            <Field label="Expires in (days)" error={error?.fields?.expiresInDays} help={`Blank never expires. The token reaches the ${p.label} endpoints only; revoke it when the peer is decommissioned.`}><NumberInput value={days} onChange={setDays} min={1} max={3650} /></Field>
             <FormActions>
               <Button type="submit" variant="primary" loading={saving} disabled={!name.trim()}>Issue token</Button>
               <Button onClick={() => setOpen(false)}>Cancel</Button>

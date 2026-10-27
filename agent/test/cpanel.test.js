@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { exec } from '../src/exec.js';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { parseListLists, detectMailman, findReleaseRoot, isReleaseDir, listName, listPassword, execRedacted, verifyStagedRelease, upgradePolicy, AGENT_APP_DIR } from '../src/ops/cpanel.js';
+import { parseListLists, detectMailman, findReleaseRoot, isReleaseDir, listName, listPassword, execRedacted, verifyStagedRelease, upgradePolicy, pruneStageDirs, AGENT_APP_DIR, MAILMAN3_BINS } from '../src/ops/cpanel.js';
 
 // exec() is spied with the real implementation behind it so tests can prove an
 // op refused *before* running anything, and stub the one call (systemd-run)
@@ -91,6 +91,11 @@ describe('mailman helpers', () => {
     expect(listName.safeParse('announce-2026.dev_x').success).toBe(true);
     for (const bad of ['-rf', 'short', 'has\nnewline-ok', 'tab\tinside-pw', ' leading-space']) expect(listPassword.safeParse(bad).success, JSON.stringify(bad)).toBe(false);
     expect(listPassword.safeParse('Str0ng-list-pass!').success).toBe(true);
+  });
+
+  it('knows the Mailman 3 layouts that keep the CLI off $PATH', () => {
+    expect(MAILMAN3_BINS).toEqual(expect.arrayContaining(['/opt/mailman/venv/bin/mailman', '/usr/lib/mailman3/bin/mailman']));
+    expect(MAILMAN3_BINS.every((b) => path.isAbsolute(b) && path.basename(b) === 'mailman')).toBe(true);
   });
 
   it('refuses Mailman ops before any program runs when Mailman is absent', async () => {
@@ -409,12 +414,28 @@ describe('upgrade ops', () => {
   });
 
   it('launches the installer only from a verified staging directory, through systemd-run, without --collect', async () => {
+    // Left over from earlier unpacks: the agent's own 9.9.8 stage goes, a
+    // directory it did not create stays.
+    expect(fs.existsSync(path.join(staging, 'src-9.9.8.json'))).toBe(true);
+    const foreign = path.join(staging, 'src-1.2.3');
+    fs.mkdirSync(foreign, { recursive: true });
+    fs.writeFileSync(path.join(foreign, 'precious'), 'keep me');
+    fs.writeFileSync(path.join(staging, 'src-1.2.3.json'), JSON.stringify({ stageDir: '/elsewhere', sourceDir: '/elsewhere' }));
     exec.mockClear();
     exec.mockImplementationOnce(async (bin, argv) => ({ code: 0, stdout: '', stderr: '', bin, argv }));
     const res = await runOp('cpanel.upgrade.run', { version: '9.9.9', unit: 'whm-upgrade-20261026120000', skipNode: true }, ctx);
     const logFile = path.join(staging, 'whm-upgrade-20261026120000.log');
     const sourceDir = path.join(staging, 'src-9.9.9', 'whm-9.9.9');
-    expect(res).toMatchObject({ unit: 'whm-upgrade-20261026120000.service', logFile, detached: true, sourceDir, appDir: AGENT_APP_DIR });
+    expect(res).toMatchObject({ unit: 'whm-upgrade-20261026120000.service', logFile, detached: true, sourceDir, appDir: AGENT_APP_DIR, pruned: expect.arrayContaining(['9.9.8']) });
+    expect(res.pruned).not.toContain('9.9.9');
+    expect(res.pruned).not.toContain('1.2.3');
+    expect(fs.existsSync(path.join(staging, 'src-9.9.8'))).toBe(false);
+    expect(fs.existsSync(path.join(staging, 'src-9.9.8.json'))).toBe(false);
+    expect(fs.existsSync(path.join(staging, 'src-9.9.9', 'whm-9.9.9'))).toBe(true);
+    expect(fs.readFileSync(path.join(foreign, 'precious'), 'utf8')).toBe('keep me');
+    expect(pruneStageDirs('9.9.9')).toEqual([]);
+    fs.rmSync(foreign, { recursive: true, force: true });
+    fs.rmSync(path.join(staging, 'src-1.2.3.json'), { force: true });
     expect(exec).toHaveBeenCalledTimes(1);
     const [bin, argv] = exec.mock.calls[0];
     expect(bin).toBe('systemd-run');

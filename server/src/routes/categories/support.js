@@ -42,6 +42,7 @@ export async function register(ctx) {
   const s = ctx.support;
   ctx.jobs.register(s.JOB_EXPIRE, (job) => s.access.expireDue({ log: job.log }));
   ctx.scheduler.ensure(s.SCHEDULE_EXPIRE, '*/5 * * * *', s.JOB_EXPIRE);
+  s.syncSchedule();
 
   const r = Router();
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.json(d?.meta ? d : { data: d })).catch(next);
@@ -49,8 +50,8 @@ export async function register(ctx) {
 
   // Support Center
   r.get('/center', requireReseller, wrap((req) => s.center(req.user)));
-  r.get('/docs', requireReseller, wrap(() => s.docs.list()));
-  r.get('/docs/:slug', requireReseller, validate({ params: z.object({ slug: docSlug }), query: z.object({ section: docSlug.optional() }) }), wrap((req) => s.docs.get(req.params.slug, req.query.section)));
+  r.get('/docs', requireReseller, wrap((req) => s.docs.list(req.user)));
+  r.get('/docs/:slug', requireReseller, validate({ params: z.object({ slug: docSlug }), query: z.object({ section: docSlug.optional() }) }), wrap((req) => s.docs.get(req.params.slug, req.query.section, req.user)));
   r.get('/diagnostics', requireRoot, (req, res, next) => {
     s.diagnostics(req).then((bundle) => {
       res.set('Content-Disposition', `attachment; filename="whm-diagnostics-${bundle.generatedAt.replace(/[:.]/g, '-')}.json"`);

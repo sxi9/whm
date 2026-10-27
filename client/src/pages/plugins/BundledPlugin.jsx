@@ -1,6 +1,6 @@
 import { useCallback, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Puzzle, AlertTriangle } from 'lucide-react';
+import { Puzzle, AlertTriangle, Lock } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi, useMutation } from '../../hooks/useApi.js';
 import { usePluginNav } from '../../hooks/usePluginNav.js';
@@ -64,14 +64,34 @@ export function EnablePrompt({ fn, id, status, error, checking, onChanged }) {
   );
 }
 
+// A plugin whose routes are registered for root only (status.roles) is not
+// rendered for a reseller at all: the page would only fill with 403 banners.
+export function RootOnlyNotice({ fn, status }) {
+  return (
+    <>
+      <PageHeader fn={fn} />
+      <Card title={status?.label || fn.label}>
+        <EmptyState icon={Lock} title="This plugin is only available to the server administrator">
+          <p>{status?.description || fn.description}</p>
+          <p className="muted">Its routes are registered for the {(status?.roles || ['root']).join(' and ')} role{(status?.roles || []).length === 1 ? '' : 's'} only.</p>
+        </EmptyState>
+      </Card>
+    </>
+  );
+}
+
 // Tabs: the overview is the function's own React UI; every other tab is a page
 // the plugin manifest declares, rendered by the generic PluginPage renderer.
+// The Settings tab talks to the root-only /plugins/manage API, so it is shown
+// to root alone.
 export function BundledPluginShell({ fn, id, overview: Overview, tabs = [] }) {
   const { plugin, status, error, loading, checking, reload } = useBundledPlugin(id);
   const [tab, setTab] = useState('overview');
   if (loading) return <><PageHeader fn={fn} /><Loading /></>;
   if (!plugin) return <EnablePrompt fn={fn} id={id} status={status} error={error} checking={checking} onChanged={reload} />;
-  const pages = (plugin.pages || []).filter((p) => tabs.includes(p.route));
+  if (status && status.canUse === false) return <RootOnlyNotice fn={fn} status={status} />;
+  const canManage = Boolean(status?.canManage);
+  const pages = (plugin.pages || []).filter((p) => tabs.includes(p.route) && (canManage || p.route !== '/settings'));
   const active = tab === 'overview' ? null : pages.find((p) => p.route === tab);
   const nav = (
     <div className="action-row" style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }} role="tablist">

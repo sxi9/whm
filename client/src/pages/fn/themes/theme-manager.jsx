@@ -39,7 +39,7 @@ export default function ThemeManager({ fn }) {
       {tab === 'themes' && (editing
         ? (
           <Card title={`Edit "${editing.name}"`} subtitle={<span><code>{editing.slug}</code>{editing.copiedFrom && <> · copied from <code>{editing.copiedFrom}</code></>} · updated {formatDate(editing.updatedAt)}</span>}>
-            <ThemeEditor theme={editing} catalog={state.catalog} onSaved={(t) => { setEditing(t); state.refetch(); }} onClose={() => { setEditing(null); state.refetch(); }} />
+            <ThemeEditor theme={editing} catalog={state.catalog} readOnly={!isRoot} onSaved={(t) => { setEditing(t); state.refetch(); }} onClose={() => { setEditing(null); state.refetch(); }} />
           </Card>
         )
         : <ThemesTab state={state} isRoot={isRoot} onEdit={openEditor} />)}
@@ -64,7 +64,7 @@ function ThemesTab({ state, isRoot, onEdit }) {
     } catch (err) { toast.error(err); }
   };
   const remove = async (t) => {
-    const ok = await confirm({ title: `Delete theme "${t.name}"?`, message: `The theme and its CSS override are removed. ${t.usage.users} user preference(s) pointing at it will fall back to the default.`, confirmLabel: 'Delete', danger: true, typeToConfirm: t.slug });
+    const ok = await confirm({ title: `Delete theme "${t.name}"?`, message: `The theme and its CSS override are removed. ${t.usage.users} user preference(s) pointing at it will fall back to the default. ${t.usage.accounts} existing account(s) recorded "${t.slug}" in their plan snapshot and keep that slug until their package is changed.`, confirmLabel: 'Delete', danger: true, typeToConfirm: t.slug });
     if (!ok) return;
     try { await api.delete(`/themes/${t.slug}`); toast.success(`Theme "${t.name}" deleted`); notifyThemeChanged(); refetch(); } catch (err) { toast.error(err); }
   };
@@ -84,7 +84,7 @@ function ThemesTab({ state, isRoot, onEdit }) {
       <DataTable columns={columns} rows={themes} loading={loading} rowKey={(t) => t.slug} emptyText="No themes"
         rowActions={(t) => [
           !t.builtin && isRoot && { label: 'Edit', primary: true, onClick: () => onEdit(t.slug) },
-          t.builtin && { label: 'View', primary: true, onClick: () => onEdit(t.slug) },
+          (t.builtin || !isRoot) && { label: 'View', primary: true, onClick: () => onEdit(t.slug) },
           isRoot && { label: 'Copy', onClick: () => document.dispatchEvent(new CustomEvent('whm:theme-copy', { detail: t.slug })) },
           isRoot && !t.isDefault && t.enabled && { label: 'Set as panel default', onClick: () => setDefault(t, 'default') },
           isRoot && !t.isAccountDefault && t.enabled && { label: 'Set as account default', onClick: () => setDefault(t, 'accountDefault') },
@@ -138,7 +138,7 @@ function CreateButton({ state, onCreated }) {
 
 function DefaultsTab({ state }) {
   const toast = useToast();
-  const { themes, defaultSlug, accountDefault, accountDefaultApplied, allowUserOverride, loading, refetch } = state;
+  const { themes, defaultSlug, accountDefault, allowUserOverride, loading, refetch } = state;
   const [draft, setDraft] = useState(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
@@ -162,9 +162,8 @@ function DefaultsTab({ state }) {
     <Card title="Default themes" subtitle="The panel default is what every signed-in user sees unless they pick their own. The account default replaces a package's theme in new accounts' plan snapshots when that theme is disabled or missing.">
       <div className="form-grid">
         <Field label="Panel default" required error={error?.fields?.default}><ThemeSelect value={draft.default} onChange={(v) => setDraft({ ...draft, default: v })} themes={themes} filter={enabledOnly} placeholder={null} /></Field>
-        <Field label="Default for new accounts" required error={error?.fields?.accountDefault} help={accountDefaultApplied === false ? 'Stored but not applied yet' : undefined}><ThemeSelect value={draft.accountDefault} onChange={(v) => setDraft({ ...draft, accountDefault: v })} themes={themes} filter={enabledOnly} placeholder={null} /></Field>
+        <Field label="Default for new accounts" required error={error?.fields?.accountDefault}><ThemeSelect value={draft.accountDefault} onChange={(v) => setDraft({ ...draft, accountDefault: v })} themes={themes} filter={enabledOnly} placeholder={null} /></Field>
       </div>
-      {accountDefaultApplied === false && <AccountDefaultPending />}
       <Field label="Per-user overrides"><Toggle checked={draft.allowUserOverride} onChange={(v) => setDraft({ ...draft, allowUserOverride: v })} label={draft.allowUserOverride ? 'Resellers and users may choose their own theme' : 'Everyone except root follows the panel default'} /></Field>
       <p className="muted">Logos and company branding are configured per account under <Link to="/cpanel/customization">cPanel › Customization</Link>.</p>
       <ErrorBanner error={error} />
@@ -186,10 +185,7 @@ function PackagesTab({ state }) {
     setBusy(pkg.name);
     try { await api.put(`/themes/packages/${encodeURIComponent(pkg.name)}`, { theme: slug }); toast.success(`Package "${pkg.name}" now uses "${slug}"`); refetch(); state.refetch(); } catch (err) { toast.error(err); } finally { setBusy(null); }
   };
-  const applied = state.accountDefaultApplied;
-  const fallbackPill = (p) => (applied
-    ? <span className="pill pill-warn" style={{ marginLeft: 6 }} title="The assigned theme is disabled; new accounts record the account default instead">falls back to {p.effective}</span>
-    : <span className="pill pill-warn" style={{ marginLeft: 6 }} title="The assigned theme is disabled; new accounts still record it until the account-default hook is live">disabled</span>);
+  const fallbackPill = (p) => <span className="pill pill-warn" style={{ marginLeft: 6 }} title="The assigned theme is disabled; new accounts record the account default instead">falls back to {p.effective}</span>;
   const columns = [
     { key: 'name', label: 'Package', render: (p) => <strong>{p.name}</strong> },
     { key: 'accounts', label: 'Accounts', align: 'right' },
@@ -197,24 +193,10 @@ function PackagesTab({ state }) {
     { key: 'change', label: 'Change', render: (p) => <ThemeSelect value={p.theme} onChange={(v) => assign(p, v)} themes={themes} filter={(t) => t.enabled || t.slug === p.theme} placeholder={null} disabled={busy === p.name || !p.owned} title={p.owned ? undefined : 'Only the owner of a package can change its theme'} style={{ maxWidth: 280 }} /> },
   ];
   return (
-    <Card title="Theme per package" subtitle={applied
-      ? 'New accounts created from a package record its theme in their plan snapshot. Packages whose theme is disabled or missing fall back to the account default. Resellers can only retheme packages they own.'
-      : 'New accounts created from a package record its theme in their plan snapshot exactly as assigned here. Resellers can only retheme packages they own.'} padded={false}>
-      {applied === false && <div className="card-body"><AccountDefaultPending /></div>}
+    <Card title="Theme per package" subtitle="New accounts created from a package record its theme in their plan snapshot. Packages whose theme is disabled or missing fall back to the account default. Resellers can only retheme packages they own." padded={false}>
       <RequestError error={error} onRetry={refetch} />
       <DataTable columns={columns} rows={data || []} loading={loading} rowKey={(p) => p.name} emptyText="No packages yet" />
     </Card>
-  );
-}
-
-// The account default is resolved by core's package snapshot (integration-contracts §22); until
-// that hook lands the server reports it as not applied and the page must not promise otherwise.
-function AccountDefaultPending() {
-  return (
-    <p className="muted" role="note">
-      <strong>Not applied yet:</strong> accounts are currently created with their package's theme verbatim, even when that theme is disabled.
-      The "Default for new accounts" value is stored and audited, and takes effect once the package snapshot hook is in place.
-    </p>
   );
 }
 
@@ -248,7 +230,7 @@ function PreferenceTab({ state }) {
         <>
           <KeyValue items={[
             ['Currently applied', <span><strong>{current.name}</strong> <code>{current.slug}</code> <ThemeSwatch theme={current} size={14} /></span>],
-            ['Source', current.source === 'user' ? 'your preference' : `panel default (${defaultSlug})`],
+            ['Source', current.source === 'user' ? 'your preference' : `panel default (${defaultSlug})${current.ignoredPreference ? ` — your stored choice "${current.ignoredPreference}" is not applied` : ''}`],
             ['Per-user overrides', allowUserOverride ? 'allowed' : 'disabled by the administrator (root is exempt)'],
           ]} />
           <Field label="Preferred theme" help={locked ? 'Overrides are disabled on this server.' : undefined}>
@@ -256,7 +238,7 @@ function PreferenceTab({ state }) {
           </Field>
           <FormActions>
             {themes.filter((t) => t.enabled && t.slug !== current.slug).map((t) => (
-              <Button key={t.slug} size="sm" onClick={() => preview.start({ base: t.base, variables: t.variables, css: '' })} title={t.hasCss ? 'Preview without the CSS override' : undefined}>Preview {t.name}</Button>
+              <Button key={t.slug} size="sm" onClick={() => preview.start({ base: t.base, scheme: t.scheme, variables: t.variables, css: '' })} title={t.hasCss ? 'Preview without the CSS override' : undefined}>Preview {t.name}</Button>
             ))}
             {preview.on && <PreviewButton preview={preview} theme={current} />}
           </FormActions>

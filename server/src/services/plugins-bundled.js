@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { json } from '../db/index.js';
 import { HttpError, CapabilityError, notFound, conflict, badRequest } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
@@ -14,12 +15,16 @@ import { REPO_ROOT, loadPluginSdk } from '../lib/plugin-sdk.js';
 // plugin host itself.
 
 export const BUNDLED_DIR = path.join(REPO_ROOT, 'plugins', 'bundled');
+// `roles` mirrors the roles each plugin's main.js registers its routes with
+// (the host default is root only), so the function page can tell a reseller
+// up front instead of filling with 403 banners.
 export const BUNDLED_PLUGINS = Object.freeze([
-  { id: 'net.whm.server-monitoring', fnKey: 'plugins/server-monitoring', label: 'Server Monitoring' },
-  { id: 'net.whm.imunifyav', fnKey: 'plugins/imunifyav', label: 'ImunifyAV' },
-  { id: 'net.whm.wp-toolkit', fnKey: 'plugins/wp-toolkit', label: 'WP Toolkit' },
+  { id: 'net.whm.server-monitoring', fnKey: 'plugins/server-monitoring', label: 'Server Monitoring', roles: ['root'] },
+  { id: 'net.whm.imunifyav', fnKey: 'plugins/imunifyav', label: 'ImunifyAV', roles: ['root'] },
+  { id: 'net.whm.wp-toolkit', fnKey: 'plugins/wp-toolkit', label: 'WP Toolkit', roles: ['root', 'reseller'] },
 ]);
 export const WP_INSTALL_JOB = 'plugins.wp.install';
+export const ENSURE_JOB = 'plugins.bundled.ensure';
 const WP_DISCOVER_JOB = 'plugin:net.whm.wp-toolkit:discover';
 
 export function bundledDirOf(id) {
@@ -43,7 +48,8 @@ export function createBundledPluginsService(ctx) {
     wpInsert: db.prepare('INSERT INTO wp_installs (username, path, url, db_name, db_user, job_id, status, requested_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
     wpJob: db.prepare('UPDATE wp_installs SET job_id = ? WHERE id = ?'),
     wpFinish: db.prepare(`UPDATE wp_installs SET status = ?, error = ?, cleanup = ?, finished_at = datetime('now') WHERE id = ?`),
-    wpList: db.prepare('SELECT * FROM wp_installs WHERE (@username IS NULL OR username = @username) ORDER BY id DESC LIMIT 50'),
+    wpList: db.prepare('SELECT * FROM wp_installs ORDER BY id DESC LIMIT 50'),
+    wpListOwned: db.prepare('SELECT * FROM wp_installs WHERE username IN (SELECT username FROM accounts WHERE owner_id = @ownerId) ORDER BY id DESC LIMIT 50'),
   };
 
   const host = () => {
@@ -91,6 +97,23 @@ export function createBundledPluginsService(ctx) {
   // A plugin this service once installed (or saw installed) that the host no
   // longer has was removed by the operator: it is reported, never re-installed.
   const wasRemovedByOperator = (previous) => Boolean(previous && previous.installed_version != null && !['missing', 'failed', 'uninstalled'].includes(previous.action));
+
+  // In production the boot install runs as a one-shot job: the job workers
+  // start only after the panel listens and the host has loaded the plugins it
+  // already had, so a slow activation never delays the first request. One
+  // queued job is enough, however many boots were interrupted before it ran.
+  function scheduleEnsureInstalled() {
+    if (!ctx.jobs.types().includes(ENSURE_JOB)) return null;
+    const queued = ctx.jobs.list({ type: ENSURE_JOB, status: 'queued', limit: 1 });
+    if (queued.length) return queued[0];
+    return ctx.jobs.enqueue(ENSURE_JOB, { trigger: 'boot' });
+  }
+
+  async function runEnsureInstalled(jobCtx) {
+    const results = await ensureInstalled();
+    for (const r of results) jobCtx.log(`${r.id}: ${r.action}${r.version ? ` ${r.version}` : ''}${r.error ? ` (${r.error})` : ''}`, r.action === 'failed' ? 'error' : 'info');
+    return { results };
+  }
 
   // Idempotent: a plugin that is missing from the host is installed and
   // enabled; one whose bundled version is newer is upgraded in place (the host
@@ -143,7 +166,7 @@ export function createBundledPluginsService(ctx) {
       id: def.id, label: def.label, fnKey: def.fnKey, bundledVersion: manifest?.version ?? null, description: manifest?.description ?? null,
       installed: Boolean(row), installedVersion: row?.version ?? null, state: row ? (live ? 'enabled' : row.state) : 'not-installed', lastError: row?.lastError ?? null,
       enabled: live, pages: ui?.pages ?? [], updateAvailable: Boolean(row && manifest && semver && semver.compare(manifest.version, row.version) > 0),
-      bootAction: bundled?.action ?? null, bootError: bundled?.last_error ?? null, canManage: isRoot(user),
+      bootAction: bundled?.action ?? null, bootError: bundled?.last_error ?? null, canManage: isRoot(user), roles: def.roles.slice(), canUse: def.roles.includes(user?.role),
     };
   }
 
@@ -210,6 +233,17 @@ export function createBundledPluginsService(ctx) {
     return d;
   }
 
+  // A credential is only ever drawn from the CSPRNG; lib/crypto.js provides
+  // the usual generator and node:crypto stands in when a test context lacks it.
+  function generatedPassword(length) {
+    if (typeof ctx.crypto?.randomPassword === 'function') return ctx.crypto.randomPassword(length);
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#%^*-_=+';
+    const bytes = randomBytes(length);
+    let out = '';
+    for (let i = 0; i < length; i++) out += alphabet[bytes[i] % alphabet.length];
+    return out;
+  }
+
   function accountsForInstall(user) {
     const r = ctx.accounts.list({ page: 1, pageSize: 500 }, user);
     return r.data.filter((a) => !a.suspended).map((a) => ({ username: a.username, domain: a.domain, home: a.home_dir || `${ctx.settings.get('basic.home_root') || '/home'}/${a.username}`, owner: a.owner }));
@@ -231,7 +265,7 @@ export function createBundledPluginsService(ctx) {
     const url = input.url || `https://${account.domain}${rel ? `/${rel}` : ''}`;
     const databases = requireDatabases();
     await requireWpCli();
-    const dbPassword = input.dbPassword || ctx.crypto.randomPassword?.(20) || `Wp${Math.random().toString(36).slice(2, 12)}!${Date.now().toString(36)}`;
+    const dbPassword = input.dbPassword || generatedPassword(20);
     const created = await databases.createDatabase({ account: account.username, name: input.dbName }, user, req);
     let dbUserName;
     try {
@@ -274,19 +308,29 @@ export function createBundledPluginsService(ctx) {
       jobCtx.progress(100, 'done');
       return { path: r.path, url: p.url, version: r.version ?? null, steps: r.steps ?? [] };
     } catch (err) {
-      const cleanup = await compensateWordPressInstall(p, jobCtx);
+      const cleanup = await compensateWordPressInstall(p, jobCtx, err);
       stmts.wpFinish.run('failed', err.message, cleanup, p.installId);
       throw err;
     }
   }
 
-  // A failed install leaves nothing behind: the database user and database
-  // created for it are dropped (user first, it holds the grants) so the same
-  // names work on the retry. What happened is kept on the wp_installs row.
-  async function compensateWordPressInstall(p, jobCtx) {
-    if (!ctx.databases) return 'database cleanup skipped: Database Services is not loaded';
-    const req = bootRequest();
+  // A failed install leaves nothing behind: the agent removes the files it
+  // wrote (reported in the error details, as the account user) and the
+  // database user and database created for it are dropped here (user first,
+  // it holds the grants) so the same names work on the retry. What happened,
+  // including a tree that could not be removed, is kept on the wp_installs row.
+  async function compensateWordPressInstall(p, jobCtx, err = null) {
     const notes = [];
+    const files = err?.details?.cleanup;
+    if (typeof files === 'string' && files) {
+      notes.push(`site ${p.path}: ${files}`);
+      jobCtx.log(`site files: ${files}`, /left in place/i.test(files) ? 'warn' : 'info');
+    } else if (err?.details?.step && err.details.step !== 'download') {
+      notes.push(`site ${p.path} may still hold a partial WordPress tree; remove it before retrying`);
+      jobCtx.log(`the agent did not report what it left in ${p.path}; check the directory before retrying`, 'warn');
+    }
+    if (!ctx.databases) return [...notes, 'database cleanup skipped: Database Services is not loaded'].join('; ');
+    const req = bootRequest();
     const steps = [['user', p.dbUser, (name) => ctx.databases.dropUser(name, req.user, req)], ['database', p.dbName, (name) => ctx.databases.dropDatabase(name, req.user, req)]];
     for (const [kind, name, drop] of steps) {
       if (!name) continue;
@@ -304,14 +348,15 @@ export function createBundledPluginsService(ctx) {
   }
 
   function wordPressInstalls(user) {
-    const rows = stmts.wpList.all({ username: null });
-    const visible = isRoot(user) ? rows : rows.filter((r) => { try { ctx.accounts.get(r.username, user); return true; } catch { return false; } });
-    return visible.map((r) => ({ ...r, job: r.job_id ? (() => { try { const j = ctx.jobs.get(r.job_id); return { id: j.id, status: j.status, progress: j.progress, message: j.message }; } catch { return null; } })() : null }));
+    // Ownership is applied in SQL, before the LIMIT, so a reseller's installs
+    // are never pushed out of the window by newer rows of other owners.
+    const rows = isRoot(user) ? stmts.wpList.all() : user?.id != null ? stmts.wpListOwned.all({ ownerId: user.id }) : [];
+    return rows.map((r) => ({ ...r, job: r.job_id ? (() => { try { const j = ctx.jobs.get(r.job_id); return { id: j.id, status: j.status, progress: j.progress, message: j.message }; } catch { return null; } })() : null }));
   }
 
   return {
     BUNDLED_PLUGINS, bundledDir: bundledDirOf, readBundledManifest,
-    ensureInstalled, watchHost, noteUninstalled, list, status, enable, disable, reinstall,
+    ensureInstalled, scheduleEnsureInstalled, runEnsureInstalled, watchHost, noteUninstalled, list, status, enable, disable, reinstall,
     accountsForInstall, siteDirOf, installWordPress, runWordPressInstall, wordPressInstalls,
     dataDir: () => config.pluginDataDir,
     record: (id) => json.parse(JSON.stringify(stmts.row.get(id) ?? null), null),

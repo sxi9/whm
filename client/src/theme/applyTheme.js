@@ -1,5 +1,6 @@
-// Applies a theme from GET /api/themes/active to the document: the base scheme via
-// data-theme, token overrides as inline custom properties on <html> (they win over
+// Applies a theme from GET /api/themes/active to the document: the colour scheme via
+// data-theme (removed for scheme "auto" so tokens.css follows prefers-color-scheme, as the
+// stock theme does), token overrides as inline custom properties on <html> (they win over
 // tokens.css), and the uploaded CSS override in a dedicated <style>. The last applied
 // theme is cached so the login screen paints with it before any request completes.
 
@@ -10,7 +11,9 @@ let applied = [];
 
 export function applyTheme(theme) {
   const root = document.documentElement;
-  root.dataset.theme = theme?.base === 'dark' ? 'dark' : 'light';
+  const scheme = theme?.scheme || theme?.base;
+  if (scheme === 'auto') delete root.dataset.theme;
+  else root.dataset.theme = scheme === 'dark' ? 'dark' : 'light';
   for (const key of applied) root.style.removeProperty(`--${key}`);
   applied = [];
   for (const [key, value] of Object.entries(theme?.variables || {})) {
@@ -24,7 +27,7 @@ export function applyTheme(theme) {
 }
 
 export function cacheTheme(theme) {
-  try { localStorage.setItem(CACHE_KEY, JSON.stringify({ slug: theme.slug, base: theme.base, variables: theme.variables || {}, css: theme.css || '' })); } catch { /* storage unavailable */ }
+  try { localStorage.setItem(CACHE_KEY, JSON.stringify({ slug: theme.slug, base: theme.base, scheme: theme.scheme || theme.base, variables: theme.variables || {}, css: theme.css || '' })); } catch { /* storage unavailable */ }
 }
 
 export function cachedTheme() {

@@ -22,6 +22,9 @@ import { defineOp, arg, OpError } from './registry.js';
 // package use these directories. Mailman 3 ships a single `mailman` CLI.
 export const MAILMAN2_BIN_DIRS = ['/usr/lib/mailman/bin', '/usr/local/cpanel/3rdparty/mailman/bin', '/usr/local/mailman/bin', '/var/lib/mailman/bin'];
 const MM2_TOOLS = ['list_lists', 'change_pw', 'mmsitepass'];
+// Mailman 3 installs that keep the CLI off $PATH: the upstream venv layouts
+// and Debian's package wrapper directory.
+export const MAILMAN3_BINS = ['/opt/mailman/venv/bin/mailman', '/opt/mailman/mm/bin/mailman', '/usr/lib/mailman3/bin/mailman', '/usr/local/mailman3/bin/mailman'];
 
 export const listName = z.string().regex(/^[a-z0-9][a-z0-9_.-]{0,63}$/, 'Mailing list names use lowercase letters, digits, ".", "_" and "-"');
 // Passed to change_pw as an argument value: no control characters and never a
@@ -35,7 +38,8 @@ export function detectMailman() {
       return { installed: true, flavor: 'mailman2', binDir: dir, bins: Object.fromEntries(MM2_TOOLS.map((t) => [t, fs.existsSync(bins[t]) ? bins[t] : null])) };
     }
   }
-  if (hasBinary('mailman')) return { installed: true, flavor: 'mailman3', binDir: path.dirname(resolveBinary('mailman')), bins: { mailman: resolveBinary('mailman') } };
+  const mm3 = (hasBinary('mailman') ? resolveBinary('mailman') : null) ?? MAILMAN3_BINS.find((b) => { try { return fs.statSync(b).isFile(); } catch { return false; } }) ?? null;
+  if (mm3) return { installed: true, flavor: 'mailman3', binDir: path.dirname(mm3), bins: { mailman: mm3 } };
   return { installed: false, flavor: null, binDir: null, bins: {} };
 }
 
@@ -213,6 +217,23 @@ const stagePaths = (version) => {
   const root = stagingRoot();
   return { root, stageDir: path.join(root, `src-${version}`), marker: path.join(root, `src-${version}.json`), archive: path.join(root, `whm-${version}.tar.gz`) };
 };
+
+// Once a release's installer is launched, the staged copies of other releases
+// are dead weight; each goes under the same ownership checks as a re-extract,
+// and one that fails them is left alone.
+export function pruneStageDirs(keepVersion) {
+  const root = stagingRoot();
+  const removed = [];
+  let entries = [];
+  try { entries = fs.readdirSync(root); } catch { return removed; }
+  for (const name of entries) {
+    const m = /^src-(.+)\.json$/.exec(name);
+    if (!m || m[1] === keepVersion || !releaseVersion.safeParse(m[1]).success) continue;
+    const { stageDir, marker } = stagePaths(m[1]);
+    try { removeStageDir(stageDir, marker); removed.push(m[1]); } catch { /* not ours to remove */ }
+  }
+  return removed;
+}
 
 function readMarker(file) {
   try {
@@ -459,7 +480,7 @@ defineOp('cpanel.upgrade.run', {
     argv.push(bash, path.join(staged.sourceDir, 'scripts', 'install.sh'), '--upgrade');
     if (skipNode) argv.push('--skip-node');
     await exec('systemd-run', argv);
-    return { unit: `${unit}.service`, logFile: log, detached: true, sourceDir: staged.sourceDir, appDir: AGENT_APP_DIR };
+    return { unit: `${unit}.service`, logFile: log, detached: true, sourceDir: staged.sourceDir, appDir: AGENT_APP_DIR, pruned: pruneStageDirs(version) };
   },
 });
 

@@ -8,8 +8,11 @@ import { Field, TextInput, Textarea, Select, Toggle, Button, FormActions, ErrorB
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { renderMarkdown } from '../../plugins/PluginPage.jsx';
+import { useAuth } from '../../../auth/AuthContext.jsx';
 
-const AUDIENCES = [{ value: 'all', label: 'Everyone (root, resellers and users)' }, { value: 'resellers', label: 'Resellers and root' }, { value: 'root', label: 'Root only' }];
+// `own` reaches the accounts the author owns: the only audience a reseller
+// (with the Modify News privilege) can publish to.
+const AUDIENCES = [{ value: 'all', label: 'Everyone (root, resellers and users)' }, { value: 'resellers', label: 'Resellers and root' }, { value: 'root', label: 'Root only' }, { value: 'own', label: 'Accounts I own' }];
 const SEVERITIES = [{ value: 'info', label: 'Information' }, { value: 'warning', label: 'Warning' }, { value: 'critical', label: 'Critical (cannot be dismissed)' }];
 const EMPTY = { title: '', body: '', audience: 'all', severity: 'info', enabled: true, startsAt: '', endsAt: '' };
 
@@ -17,13 +20,14 @@ const EMPTY = { title: '', body: '', audience: 'all', severity: 'info', enabled:
 const toLocalInput = (sql) => { if (!sql) return ''; const d = new Date(sql.replace(' ', 'T') + 'Z'); const pad = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`; };
 const fromLocalInput = (v) => (v ? new Date(v).toISOString() : null);
 
-function Editor({ item, onClose, onSaved }) {
+function Editor({ item, onClose, onSaved, isRoot }) {
   const toast = useToast();
+  const audiences = isRoot ? AUDIENCES : AUDIENCES.filter((a) => a.value === 'own');
   const [draft, setDraft] = useState(EMPTY);
   const [preview, setPreview] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
-  useEffect(() => { setDraft(item ? { ...item, startsAt: toLocalInput(item.startsAt), endsAt: toLocalInput(item.endsAt) } : EMPTY); setError(null); }, [item]);
+  useEffect(() => { setDraft(item ? { ...item, startsAt: toLocalInput(item.startsAt), endsAt: toLocalInput(item.endsAt) } : { ...EMPTY, audience: isRoot ? 'all' : 'own' }); setError(null); }, [item, isRoot]);
   const set = (k) => (v) => setDraft((d) => ({ ...d, [k]: v }));
   const save = async () => {
     setSaving(true);
@@ -49,7 +53,7 @@ function Editor({ item, onClose, onSaved }) {
           <Field label="Title" required error={error?.fields?.title}><TextInput value={draft.title} onChange={set('title')} maxLength={160} autoFocus /></Field>
           <Field label="Body" help="Markdown: headings, lists, **bold**, `code` and http(s) links. HTML is shown as text." error={error?.fields?.body}><Textarea value={draft.body} onChange={set('body')} rows={8} /></Field>
           <div className="form-grid">
-            <Field label="Audience"><Select value={draft.audience} onChange={set('audience')} options={AUDIENCES} /></Field>
+            <Field label="Audience" help={isRoot ? undefined : 'Shown on the dashboards of the accounts you own.'}><Select value={draft.audience} onChange={set('audience')} options={audiences} /></Field>
             <Field label="Severity"><Select value={draft.severity} onChange={set('severity')} options={SEVERITIES} /></Field>
             <Field label="Show from" help="Empty = immediately" error={error?.fields?.startsAt}><TextInput type="datetime-local" value={draft.startsAt} onChange={set('startsAt')} /></Field>
             <Field label="Show until" help="Empty = until disabled" error={error?.fields?.endsAt}><TextInput type="datetime-local" value={draft.endsAt} onChange={set('endsAt')} /></Field>
@@ -64,6 +68,8 @@ function Editor({ item, onClose, onSaved }) {
 export default function ModifyNews({ fn }) {
   const toast = useToast();
   const confirm = useConfirm();
+  const { user } = useAuth();
+  const isRoot = user?.role === 'root';
   const [status, setStatus] = useState('');
   const [q, setQ] = useState('');
   const list = useApi(`/cpanel/news${queryString({ status, q, pageSize: 200 })}`);
@@ -95,7 +101,7 @@ export default function ModifyNews({ fn }) {
   return (
     <>
       <PageHeader fn={fn} actions={<Button variant="primary" onClick={() => setEditing(null)}>New item</Button>}>
-        <p className="muted small">Items appear at the top of the Home dashboard for the chosen audience while they are enabled and inside their time window. Users can dismiss information and warnings per browser; critical items stay until you hide them.</p>
+        <p className="muted small">{isRoot ? 'Items appear at the top of the Home dashboard for the chosen audience while they are enabled and inside their time window.' : 'Items appear at the top of the Home dashboard of the accounts you own while they are enabled and inside their time window (Modify News privilege).'} Users can dismiss information and warnings per browser; critical items stay until you hide them.</p>
       </PageHeader>
       <Card padded={false} title="News items" actions={(
         <Select value={status} onChange={setStatus} options={[{ value: 'active', label: 'Active' }, { value: 'scheduled', label: 'Scheduled' }, { value: 'expired', label: 'Expired' }, { value: 'disabled', label: 'Disabled' }]} placeholder="All statuses" />
@@ -105,7 +111,7 @@ export default function ModifyNews({ fn }) {
           <div className="card-body"><EmptyState icon={Megaphone} title="Nothing published yet"><p>Create an item to announce maintenance windows, policy changes or new features to resellers and users.</p></EmptyState></div>
         )}
       </Card>
-      {editing !== undefined && <Editor item={editing} onClose={() => setEditing(undefined)} onSaved={() => { setEditing(undefined); list.refetch(); }} />}
+      {editing !== undefined && <Editor item={editing} isRoot={isRoot} onClose={() => setEditing(undefined)} onSaved={() => { setEditing(undefined); list.refetch(); }} />}
     </>
   );
 }
