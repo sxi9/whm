@@ -259,10 +259,12 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   workflow dies with it (happened 2026-10-26 05:38; resumed 14:27 from cache). A self-bound hourly
   Routine `trig_015b4oBVtePikCYJAcFwKkTK` ("WHM build keep-alive check-in", minute :09) wakes this
   session to resume the run, integrate finished waves, snapshot to git and move to the next step.
-  Current runs: **wave-3 fix round `wf_914776c1-9db`** (script `<workflows>/scripts/whm-fix-wave-wf_f1a004d0-b80.js`,
-  `args: {wave: 3}`; resumed from cache at 01:07 after a container restart) and the **Phase-5 marketplace design
-  `wf_eed21b3a-bfc`** (`whm-marketplace-design-wf_eed21b3a-bfc.js`, writes `docs/design/marketplace.md` +
-  `docs/design/phase5-build-plan.md`). Wave 3 build `wf_cdfc582d-8cc` is complete and landed.
+  Current run: **Phase-5 build `wf_c7084ffb-2df`** (script `<workflows>/scripts/whm-phase5-build-wf_c7084ffb-2df.js`, no
+  args; resume with `Workflow({scriptPath, resumeFromRunId: 'wf_c7084ffb-2df'})`): three rounds of two units per
+  `docs/design/phase5-build-plan.md` (U1+U6, U2+U4, U3+U5), each with two verifiers and bounded fix rounds, then an
+  integration critic. Phase 2 (all waves + fix rounds) is complete and landed (`6c693e4`); the marketplace design
+  (`docs/design/marketplace.md`) and build plan are committed (`63d2f27`). After the build: the integrator checklist
+  at the end of the build plan (BLUEPRINT §16–18, workspaces, deploy unit, README, CHECKLIST), suites, screenshots.
   After the fix round: Phase 5 (license server, marketplace, SDK docs, sample + automated-backup plugins). Disable the Routine
   (`update_trigger enabled=false`) once CHECKLIST.md is fully done.
 - This dev container has 4 CPUs → at most 2 concurrent subagents; plan fan-outs accordingly.

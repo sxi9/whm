@@ -8,7 +8,7 @@
 
 ## Current state
 
-- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-27 01:35 UTC
+- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-27 01:45 UTC
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
 - **Tests:** server 93/93, agent 42/42 passing (`npm test`). Shared API test helper: `server/test/support/app.js`.
@@ -46,10 +46,11 @@ a fix round ~15 min; most categories need one fix round.
 | **P2 wave 3** — Clusters, Themes, Market, cPanel, Support, Plugins (6; the three Plugins functions ship as real bundled SDK plugins) | done — 16 functions, 52 agent runs, 10 findings carried to the fix round | 3 h 13 min | 00:03 (27th) |
 | Integrate wave 3 (suites 1046/451/30 green, build, boot, e2e; core: theme hook, public branding mounts, buffer-safe audit, core-owned event bus) → **all 212 functions built** | done | 25 min | 00:30 (27th) |
 | Wave-3 fix round (10 open findings + critic gaps; 8 categories incl. dns-functions and account-information follow-ups) | done — 0 open per category; integrator closed the core items (release-feed integrity fields, package theme validation, seed cleanup, core-only event bus, bundled-plugin tests in `npm test`) | 1 h 20 min (+ 1 h container restart) | 01:35 (27th) |
-| **P5** — marketplace design (`docs/design/marketplace.md` + six-unit build plan) | running since 01:08 | ~45 min | ~02:00 (27th) |
-| **P5 build** — license server (`hub/license`), marketplace (`hub/marketplace`, open dev registration with backend verification), hub UI, panel license + marketplace clients, `plugins/SDK.md`, sample plugin, automated-backup plugin | pending | ~5 h | ~07:30 (27th) |
-| **P6** — hardening pass, full e2e on a provisioned VM, Security Advisor rules (incl. the Oct-2026 PHP advisory check), final docs, performance | pending | ~2.5 h | ~10:00 (27th) |
-| **Total remaining** | | **~8.5 h wall-clock** (from 01:35 on the 27th) | |
+| **P5** — marketplace design (`docs/design/marketplace.md`, 683 lines, + six-unit build plan; two critique passes, 26 findings resolved) | done | 55 min | 01:40 (27th) |
+| **P5 build** — license server (`hub/license`), marketplace (`hub/marketplace`, open dev registration with backend verification), hub UI, panel license + marketplace clients, `plugins/SDK.md`, sample plugin, automated-backup plugin — 3 rounds × 2 units, each verified (`wf_c7084ffb-2df`) | running since 01:42 | ~5.5 h | ~07:15 (27th) |
+| Integrate Phase 5 (integrator checklist: BLUEPRINT §16–18, workspaces, deploy unit + install.sh --with-hub, contacts events, README, CHECKLIST) + fix round | pending | ~2 h | ~09:15 (27th) |
+| **P6** — hardening pass, full e2e on a provisioned VM, Security Advisor rules (incl. the Oct-2026 PHP advisory check), final docs, performance | pending | ~2.5 h | ~11:45 (27th) |
+| **Total remaining** | | **~10 h wall-clock** (from 01:45 on the 27th) | |
 
 Faster option: verification can be cut to one reviewer and one fix round per category
 (~30% less time, less thorough). Not applied unless requested.
