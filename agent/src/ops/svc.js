@@ -72,7 +72,7 @@ defineOp('svc.status', {
 for (const verb of ['start', 'stop', 'restart', 'reload', 'enable', 'disable']) {
   defineOp(`svc.${verb}`, {
     description: `systemctl ${verb} <unit>`,
-    destructive: verb === 'stop' || verb === 'disable',
+    destructive: verb === 'stop' || verb === 'disable' || verb === 'restart',
     timeoutMs: 120_000,
     schema: z.object({ unit: arg.unit }).strict(),
     run: async ({ unit }) => {

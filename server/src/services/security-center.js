@@ -19,6 +19,8 @@ import { notFound, conflict, badRequest, unprocessable, CapabilityError } from '
 //   security.firewall.reconcile(job)          -> re-apply recorded blocks + SMTP restriction
 //   security.reloadApache(req)                -> uses ctx.web.reload when that category exists
 //   security.modsec.detect() / security.ssh.config() / security.externalAuth.*
+//   security.phpAdvisories.forVersion({ id, version }) -> [{ id, severity, grade, title, url, fixedIn }]
+//        (setting security.advisories; Software badges MultiPHP versions with it)
 //   security.externalAuth.exchangeCode(name, { code, redirectUri, nonce })
 //        -> verified id_token claims (signature via jwks_uri or client secret,
 //           iss/aud/azp/exp/iat/nonce checked) merged with userinfo
@@ -225,6 +227,91 @@ export async function fetchJson(url, { method = 'GET', body, headers = {}, maxBy
 }
 
 const HOME_ROOT_SHAPE = /^\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+$/;
+
+// PHP advisory matching (setting security.advisories). Pure so the rules can be
+// unit-tested; versions compare numerically per segment ("8.3.6" < "8.3.36").
+const SEVERITY_GRADE = { critical: 'critical', high: 'critical', medium: 'warning', low: 'info', info: 'info' };
+const VERSION_RE = /^\d+(\.\d+){0,3}$/;
+
+export function comparePhpVersions(a, b) {
+  const pa = String(a).split('.').map(Number); const pb = String(b).split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
+// Range grammar: "*" | comparator list joined by spaces (all must hold) | alternatives joined by "||".
+export function phpVersionSatisfies(version, range) {
+  if (!VERSION_RE.test(String(version || ''))) return false;
+  const text = String(range ?? '').trim();
+  if (!text) return false;
+  return text.split('||').some((alt) => {
+    const parts = alt.trim().split(/\s+/).filter(Boolean);
+    if (!parts.length) return false;
+    return parts.every((part) => {
+      if (part === '*') return true;
+      const m = part.match(/^(<=|>=|<|>|=)?v?(\d+(?:\.\d+){0,3})$/);
+      if (!m) return false;
+      const c = comparePhpVersions(version, m[2]);
+      switch (m[1] || '=') {
+        case '<': return c < 0;
+        case '<=': return c <= 0;
+        case '>': return c > 0;
+        case '>=': return c >= 0;
+        default: return c === 0;
+      }
+    });
+  });
+}
+
+// Drops entries the operator stored in a shape the matcher cannot read, so one
+// bad edit never hides the rest of the list; `invalid` counts what was dropped.
+export function normalizeAdvisories(list) {
+  const out = []; let invalid = 0;
+  for (const raw of Array.isArray(list) ? list : []) {
+    if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || !raw.id.trim()) { invalid++; continue; }
+    const affected = {};
+    if (raw.affected && typeof raw.affected === 'object' && !Array.isArray(raw.affected)) {
+      for (const [minor, range] of Object.entries(raw.affected)) if (/^\d+\.\d+$/.test(minor) && typeof range === 'string') affected[minor] = range;
+    }
+    const fixedIn = raw.fixedIn && typeof raw.fixedIn === 'object' ? Object.fromEntries(Object.entries(raw.fixedIn).filter(([, v]) => typeof v === 'string')) : typeof raw.fixedIn === 'string' ? { '*': raw.fixedIn } : null;
+    const severity = String(raw.severity || 'medium').toLowerCase();
+    out.push({
+      id: raw.id.trim(), title: typeof raw.title === 'string' && raw.title ? raw.title : raw.id.trim(), severity: SEVERITY_GRADE[severity] ? severity : 'medium',
+      published: typeof raw.published === 'string' ? raw.published : null, url: typeof raw.url === 'string' && /^https?:\/\//.test(raw.url) ? raw.url : null,
+      affected, fixedIn, note: typeof raw.note === 'string' ? raw.note : null,
+    });
+  }
+  return { advisories: out, invalid };
+}
+
+export const advisoryGrade = (severity) => SEVERITY_GRADE[severity] || 'warning';
+
+// versions: [{ id: '8.3', version: '8.3.6', ... }] as reported by pkg.php.versions.
+// Returns one entry per advisory with the installed versions it covers; `unversioned`
+// lists advisories that carry no ranges yet (nothing to match, still worth showing).
+export function matchPhpAdvisories(advisories, versions) {
+  const matches = []; const unversioned = [];
+  for (const adv of advisories) {
+    if (!Object.keys(adv.affected).length) { unversioned.push(adv); continue; }
+    const hits = [];
+    for (const v of versions || []) {
+      const full = typeof v?.version === 'string' && VERSION_RE.test(v.version) ? v.version : null;
+      const minor = full ? full.split('.').slice(0, 2).join('.') : (typeof v?.id === 'string' && /^\d+\.\d+$/.test(v.id) ? v.id : null);
+      if (!minor || !(minor in adv.affected)) continue;
+      // Without a patch level the branch alone decides ("*" ranges); a bounded
+      // range cannot be evaluated and is reported as unknown rather than ignored.
+      const range = adv.affected[minor];
+      const affected = full ? phpVersionSatisfies(full, range) : range.trim() === '*' ? true : null;
+      if (affected === false) continue;
+      hits.push({ id: v.id ?? minor, version: full, minor, unknown: affected === null, fixedIn: adv.fixedIn?.[minor] ?? adv.fixedIn?.['*'] ?? null, isDefault: Boolean(v.isDefault) });
+    }
+    if (hits.length) matches.push({ advisory: adv, versions: hits });
+  }
+  return { matches, unversioned };
+}
 
 export function createSecurityCenterService(ctx) {
   const { db, agent, capabilities, settings, crypto, config, logger } = ctx;
@@ -951,6 +1038,18 @@ export function createSecurityCenterService(ctx) {
     },
   };
 
+  // PHP advisories: the stored list (setting security.advisories) matched against
+  // installed PHP versions. Software's MultiPHP data calls forVersions() so the
+  // badge in MultiPHP Manager and the advisor finding come from one rule set.
+  const phpAdvisories = {
+    list() { return normalizeAdvisories(settings.get('security.advisories', [])); },
+    forVersions(versions) { return matchPhpAdvisories(phpAdvisories.list().advisories, versions); },
+    // [{ id, severity, title, url, fixedIn }] for one installed version entry.
+    forVersion(v) {
+      return phpAdvisories.forVersions([v]).matches.map(({ advisory, versions: hits }) => ({ id: advisory.id, severity: advisory.severity, grade: advisoryGrade(advisory.severity), title: advisory.title, url: advisory.url, fixedIn: hits[0].fixedIn, unknown: hits[0].unknown }));
+    },
+  };
+
   // Read-only scanner. Every probe is isolated so one failing check never hides
   // the rest; "fix" links point at the panel's own pages.
   const advisor = {
@@ -1059,6 +1158,25 @@ export function createSecurityCenterService(ctx) {
           : { id: 'pkg.updates', grade: 'ok', title: 'All distribution packages are up to date' });
       });
 
+      await probe('php', 'PHP advisories', async () => {
+        const { advisories, invalid } = phpAdvisories.list();
+        const listFix = { label: 'Edit advisory list', path: '/security-center/security-advisor#advisories' };
+        if (invalid) add({ id: 'php.advisories.invalid', grade: 'warning', title: `${invalid} entr${invalid === 1 ? 'y' : 'ies'} in the PHP advisory list could not be read`, detail: 'Each entry of the security.advisories setting needs at least an "id"; unreadable entries are skipped, so their versions are not checked.', fix: listFix });
+        if (!advisories.length) { add({ id: 'php.advisories', grade: 'info', title: 'The PHP advisory list is empty', detail: 'No PHP vulnerability is known to this panel. Update the security.advisories setting with the current php.net advisories.', fix: listFix }); return; }
+        if (!capabilities.has('php') || typeof ctx.software?.php?.versions !== 'function') { add({ id: 'php.advisories', grade: 'info', title: 'No PHP installation found', detail: `${advisories.length} PHP advisor${advisories.length === 1 ? 'y' : 'ies'} on file, but no php binary is installed on this server, so there is nothing to check.` }); return; }
+        const { versions } = await ctx.software.php.versions();
+        if (!versions.length) { add({ id: 'php.advisories', grade: 'info', title: 'No PHP installation found', detail: 'MultiPHP Manager detected no PHP version; the advisory list was not applied.' }); return; }
+        const { matches, unversioned } = matchPhpAdvisories(advisories, versions);
+        const fix = { label: 'MultiPHP Manager', path: '/software/multiphp-manager' };
+        for (const { advisory, versions: hits } of matches) {
+          const names = hits.map((h) => `${h.version || `${h.minor}.x`}${h.isDefault ? ' (default)' : ''}`);
+          const lines = hits.map((h) => `PHP ${h.version || `${h.minor} (patch level unknown)`}: ${h.fixedIn ? `update to ${h.fixedIn}` : 'no packaged fix for this branch; move its sites to a supported version'}`);
+          add({ id: `php.advisory.${advisory.id}`, grade: advisoryGrade(advisory.severity), title: `PHP ${names.join(', ')} ${hits.length === 1 ? 'is' : 'are'} affected by ${advisory.id}`, detail: [advisory.title, ...lines, advisory.note].filter(Boolean).join('\n'), url: advisory.url, advisory: advisory.id, versions: hits, fix });
+        }
+        for (const advisory of unversioned) add({ id: `php.advisory.${advisory.id}`, grade: 'info', title: `${advisory.id} has no fixed release yet`, detail: [advisory.title, advisory.note].filter(Boolean).join('\n'), url: advisory.url, advisory: advisory.id, versions: [] });
+        if (!matches.length) add({ id: 'php.advisories', grade: 'ok', title: `Installed PHP ${versions.map((v) => v.version || v.id).join(', ')} not affected by ${advisories.length - unversioned.length} listed advisor${advisories.length - unversioned.length === 1 ? 'y' : 'ies'}` });
+      });
+
       await probe('filesystem', 'filesystem permissions', async () => {
         const fsScan = await op('sec.scan.filesystem', { root: settings.get('basic.home_root') || '/home', limit: 25 });
         for (const f of fsScan.sensitive) if (!f.ok) add({ id: `fs.${f.path}`, grade: 'critical', title: `${f.path} is too permissive (${f.mode})`, detail: `Expected at most ${f.maxMode}.` });
@@ -1117,6 +1235,6 @@ export function createSecurityCenterService(ctx) {
     policy,
     passwordStrength: passwordPolicy,
     passwordContexts: PASSWORD_CONTEXTS,
-    hostAccess, ssh, cphulk, firewall: firewallApi, smtp, compilers, traceroute, forkBomb, wheel, userdir, modsec, externalAuth, advisor,
+    hostAccess, ssh, cphulk, firewall: firewallApi, smtp, compilers, traceroute, forkBomb, wheel, userdir, modsec, externalAuth, advisor, phpAdvisories,
   };
 }

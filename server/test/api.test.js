@@ -62,6 +62,16 @@ async function freshCode(secret) {
   if (authenticator.timeRemaining() < 3) await new Promise((r) => setTimeout(r, (authenticator.timeRemaining() + 0.5) * 1000));
   return authenticator.generate(secret);
 }
+// A code that logged someone in is refused a second time, so a later login
+// in the same step waits for the next one.
+async function unusedCode(secret, used) {
+  let code = await freshCode(secret);
+  while (code === used) {
+    await new Promise((r) => setTimeout(r, (authenticator.timeRemaining() + 0.5) * 1000));
+    code = await freshCode(secret);
+  }
+  return code;
+}
 
 let tmp;
 let ctx;
@@ -653,6 +663,7 @@ describe('logout', () => {
 
 describe('two-factor authentication', () => {
   let secret;
+  let usedCode;
 
   it('enrolls and confirms with a valid code', async () => {
     const session = await login(root, 'root', ADMIN_PASSWORD);
@@ -695,6 +706,7 @@ describe('two-factor authentication', () => {
 
     const verified = await root.post('/api/auth/2fa').send({ code });
     expect(verified.status).toBe(200);
+    usedCode = code;
     expect(verified.body.data.user).toMatchObject({ username: 'root', totpEnabled: true });
     expect(typeof verified.body.data.csrfToken).toBe('string');
     csrf = verified.body.data.csrfToken;
@@ -708,7 +720,7 @@ describe('two-factor authentication', () => {
   it('changes the password, invalidates other sessions and keeps 2FA', async () => {
     const other = request.agent(ctx.app);
     expect((await login(other, 'root', ADMIN_PASSWORD)).body.data.requires2fa).toBe(true);
-    expect((await other.post('/api/auth/2fa').send({ code: await freshCode(secret) })).status).toBe(200);
+    expect((await other.post('/api/auth/2fa').send({ code: await unusedCode(secret, usedCode) })).status).toBe(200);
     expect((await other.get('/api/auth/me')).status).toBe(200);
 
     const wrongCurrent = await mutate(root, 'post', '/api/auth/password', { currentPassword: 'nope', newPassword: 'Another-Passw0rd!2' }, csrf);
@@ -727,5 +739,5 @@ describe('two-factor authentication', () => {
     expect(disable.status).toBe(200);
     expect(disable.body.data).toEqual({ enabled: false });
     expect((await root.get('/api/auth/me')).body.data.user.totpEnabled).toBe(false);
-  }, 20_000);
+  }, 45_000);
 });

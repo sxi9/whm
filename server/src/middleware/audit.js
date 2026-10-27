@@ -53,7 +53,7 @@ export function createAudit({ db, logger }) {
         record(req, {
           action: `${req.method} ${matched?.baseUrl ?? req.baseUrl}${routePath === '/' ? '' : routePath}`,
           target: Object.values(matched?.params ?? req.params ?? {}).join('/') || null,
-          args: req.body && Object.keys(req.body).length ? req.body : null,
+          args: Buffer.isBuffer(req.body) ? { bytes: req.body.length } : req.body && Object.keys(req.body).length ? req.body : null,
           result: res.statusCode < 400 ? 'ok' : `error:${res.statusCode}`,
         });
       });

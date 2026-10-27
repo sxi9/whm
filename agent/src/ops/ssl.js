@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { z } from 'zod';
 import { exec, hasBinary, resolveBinary } from '../exec.js';
-import { defineOp, arg, OpError } from './registry.js';
+import { defineOp, arg, OpError, ensurePrivateDir } from './registry.js';
 
 // SSL/TLS op family: key/CSR/self-signed generation, certificate inspection and
 // chain verification through openssl, per-domain bundles under /etc/ssl/whm,
@@ -101,8 +101,10 @@ function requireOpenssl() {
 // Private keys and CSR inputs are written to a private scratch directory for
 // the duration of one openssl call and shredded afterwards.
 async function withTempDir(fn) {
-  const base = exists(TMP_ROOT) || process.getuid?.() === 0 ? TMP_ROOT : os.tmpdir();
-  fs.mkdirSync(base, { recursive: true, mode: 0o1777 });
+  // As root the scratch root is the agent's private /tmp/whm (never a
+  // world-writable directory another user could have planted); an
+  // unprivileged test run falls back to a fresh mkdtemp under the system tmp.
+  const base = exists(TMP_ROOT) || process.getuid?.() === 0 ? ensurePrivateDir(TMP_ROOT) : os.tmpdir();
   const dir = fs.mkdtempSync(path.join(base, 'ssl-'));
   fs.chmodSync(dir, 0o700);
   try {

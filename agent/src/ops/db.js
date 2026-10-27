@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { z } from 'zod';
 import { exec, hasBinary } from '../exec.js';
-import { defineOp, arg, OpError } from './registry.js';
+import { defineOp, arg, OpError, ensurePrivateDir } from './registry.js';
 
 // Database Services op family. MySQL/MariaDB administration goes through the
 // mysql CLI with --defaults-extra-file pointing at a 0600 temp file that holds the
@@ -144,9 +144,9 @@ export function clientWarnings(stderr) {
 async function withDefaults(creds, ctx, fn) {
   if (creds && (creds.user || creds.password != null || creds.host || creds.socket || creds.bindAddress)) {
     ctx.assertAllowedPath(TMP_DIR, 'write');
-    fs.mkdirSync(TMP_DIR, { recursive: true, mode: 0o700 });
+    ensurePrivateDir(TMP_DIR);
     const file = path.join(TMP_DIR, `my-${process.pid}-${crypto.randomBytes(6).toString('hex')}.cnf`);
-    fs.writeFileSync(file, renderClientCnf(creds), { mode: 0o600 });
+    fs.writeFileSync(file, renderClientCnf(creds), { mode: 0o600, flag: 'wx' });
     try { return await fn([`--defaults-extra-file=${file}`]); } finally { try { fs.unlinkSync(file); } catch { /* gone */ } }
   }
   if (exists(ROOT_MY_CNF)) return fn([`--defaults-extra-file=${ROOT_MY_CNF}`]);

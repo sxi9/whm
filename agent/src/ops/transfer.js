@@ -544,6 +544,12 @@ export function unsafeMember(entry) {
   const name = entry.name.replace(/^\.\//, '');
   if (name.startsWith('/')) return `"${entry.name}" has an absolute path`;
   if (name.split('/').includes('..')) return `"${entry.name}" contains ".."`;
+  // A hard link is created against its target as named: one that reaches
+  // outside the destination would hand that inode to the account's chown.
+  if (entry.type === 'h') {
+    const link = String(entry.link ?? '').replace(/^\.\//, '');
+    if (!link || link.startsWith('/') || link.split('/').includes('..')) return `"${entry.name}" is a hard link to "${entry.link ?? ''}" outside the archive`;
+  }
   return null;
 }
 

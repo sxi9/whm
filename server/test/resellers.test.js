@@ -509,14 +509,16 @@ describe('Resellers API', () => {
         const calls = app.agent.callsTo('mail.sendmail');
         expect(calls).toHaveLength(2);
         expect(calls.find((c) => c.args.to[0] === 'alice@alice.com').args.text).toContain('Hello alice, you own 1 account(s).');
-        // Job records are readable by every reseller: no addresses, no message in them.
-        const asReseller = await resellerHttp.get(`/api/system/jobs/${res.body.data.job.id}`).expect(200);
-        const exposed = JSON.stringify(asReseller.body);
+        // Root's job is invisible to a reseller, and the job record itself keeps
+        // no addresses or message text even for the principal that may read it.
+        await resellerHttp.get(`/api/system/jobs/${res.body.data.job.id}`).expect(404);
+        const asRoot = await app.http.get(`/api/system/jobs/${res.body.data.job.id}`).expect(200);
+        const exposed = JSON.stringify(asRoot.body);
         expect(exposed).not.toContain('alice@alice.com');
         expect(exposed).not.toContain('sa@example.com');
         expect(exposed).not.toContain('Maintenance on');
         expect(exposed).not.toContain('you own');
-        expect(asReseller.body.data.params).toEqual({ broadcastId: res.body.data.broadcast, requestedBy: 'root' });
+        expect(job.params).toEqual({ broadcastId: res.body.data.broadcast, requestedBy: 'root' });
         expect(JSON.stringify(app.ctx.jobs.list({ type: 'resellers.email_all' }))).not.toContain('@');
         const history = await get('/email/history').expect(200);
         expect(history.body.data[0]).toMatchObject({ id: res.body.data.broadcast, subject: 'Maintenance on {{hostname}}', from: 'whm@test.example.com', requested_by: 'root', status: 'done', failed: [] });

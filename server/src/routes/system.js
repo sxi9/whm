@@ -1,10 +1,18 @@
 import { Router } from 'express';
 import { validate, z, fields } from '../lib/validate.js';
-import { requireRoot, requireReseller } from '../middleware/rbac.js';
+import { requireRoot, requireReseller, isRoot } from '../middleware/rbac.js';
+import { notFound } from '../lib/errors.js';
 
 export function systemRoutes({ system, serviceManager, jobs, scheduler, settings, audit }) {
   const r = Router();
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((data) => data !== undefined && res.json(data?.meta ? data : { data })).catch(next);
+  // A reseller follows the jobs it started and nothing else: another
+  // principal's job (its params, result and log lines) is reported as absent.
+  const ownJob = (req, id) => {
+    const job = jobs.get(id);
+    if (!isRoot(req.user) && job.created_by !== req.user.id) throw notFound('Job');
+    return job;
+  };
 
   // Dashboard + Server Status + System Health -----------------------------------
   r.get('/status', requireReseller, wrap(() => system.status()));
@@ -32,11 +40,12 @@ export function systemRoutes({ system, serviceManager, jobs, scheduler, settings
 
   // Jobs (Task Queue Monitor) ----------------------------------------------------
   r.get('/jobs', requireReseller, validate({ query: z.object({ status: z.enum(['queued', 'running', 'done', 'failed', 'cancelled']).optional(), type: z.string().regex(/^[a-z0-9._-]{1,60}$/).optional(), limit: z.coerce.number().int().min(1).max(500).default(100) }) }),
-    wrap((req) => jobs.list(req.query)));
-  r.get('/jobs/:id', requireReseller, validate({ params: z.object({ id: fields.id }) }), wrap((req) => jobs.get(req.params.id)));
+    wrap((req) => { const list = jobs.list(req.query); return isRoot(req.user) ? list : list.filter((j) => j.created_by === req.user.id); }));
+  r.get('/jobs/:id', requireReseller, validate({ params: z.object({ id: fields.id }) }), wrap((req) => ownJob(req, req.params.id)));
   r.post('/jobs/:id/cancel', requireRoot, validate({ params: z.object({ id: fields.id }) }), wrap((req) => { jobs.cancel(req.params.id); return { cancelled: true }; }));
-  r.get('/jobs/:id/stream', requireReseller, validate({ params: z.object({ id: fields.id }) }), (req, res) => {
-    const job = jobs.get(req.params.id);
+  r.get('/jobs/:id/stream', requireReseller, validate({ params: z.object({ id: fields.id }) }), (req, res, next) => {
+    let job;
+    try { job = ownJob(req, req.params.id); } catch (err) { return next(err); }
     res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
     res.flushHeaders();
     const send = (event) => res.write(`data: ${JSON.stringify(event)}\n\n`);

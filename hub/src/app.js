@@ -14,14 +14,20 @@ import { resellerRoutes } from '../license/routes/reseller.js';
 import { adminRoutes, billingWebhookRoutes, jobAliasRoutes } from '../license/routes/admin.js';
 import { portalRoutes } from '../license/routes/portal.js';
 
-function limiter({ max, windowMs }, { keyGenerator, message = 'Too many requests, slow down', skip } = {}) {
+function limiter({ max, windowMs }, { keyGenerator, message = 'Too many requests, slow down', skip, skipSuccessfulRequests = false } = {}) {
   return rateLimit({
-    windowMs, limit: max, standardHeaders: 'draft-7', legacyHeaders: false, validate: false, keyGenerator, skip,
+    windowMs, limit: max, standardHeaders: 'draft-7', legacyHeaders: false, validate: false, keyGenerator, skip, skipSuccessfulRequests,
     handler: (_req, res) => res.status(429).json({ error: { code: 'rate_limited', message } }),
   });
 }
 
 const NONCE_RE = /^[A-Za-z0-9_-]{16,128}$/;
+const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+export const acceptedRequestId = (value) => (typeof value === 'string' && REQUEST_ID_RE.test(value) ? value : null);
+// Portal routes that take a TOTP code from an already logged-in session: a
+// hijacked session must not be able to walk the code space to step up,
+// disable 2FA or change the password. Only wrong answers count.
+export const TOTP_LIMITED_PATHS = ['/v1/portal/stepup', '/v1/portal/2fa', '/v1/portal/password'];
 
 function keyPrefixOf(body) {
   const k = String(body?.key || '').toUpperCase().replace(/[^0-9A-Z]/g, '');
@@ -40,6 +46,7 @@ export function buildLimiters(ctx) {
     reseller: limiter(rl.reseller, { keyGenerator: (req) => req.principal?.keyId || req.principal?.userId || req.ip }),
     admin: limiter(rl.admin, { keyGenerator: (req) => req.principal?.keyId || req.principal?.userId || req.ip }),
     portalLogin: limiter(rl.portal_login, { keyGenerator: (req) => `${req.ip}|${String(req.body?.email || '').toLowerCase()}` }),
+    totp: limiter(rl.portal_login, { keyGenerator: (req) => (req.session?.userId ? `user|${req.session.userId}` : req.ip), skipSuccessfulRequests: true, message: 'Too many wrong codes, wait before trying again' }),
   };
 }
 
@@ -126,7 +133,7 @@ export function createApp(ctx) {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', config.trust_proxy);
-  app.use((req, _res, next) => { req.id = req.get('x-request-id') || crypto.randomUUID(); next(); });
+  app.use((req, _res, next) => { req.id = acceptedRequestId(req.get('x-request-id')) || crypto.randomUUID(); next(); });
   if (config.log_level !== 'silent') {
     app.use(pinoHttp({
       logger, genReqId: (req) => req.id,
@@ -135,7 +142,7 @@ export function createApp(ctx) {
     }));
   }
   app.use(helmet({
-    contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'"], styleSrc: ["'self'", "'unsafe-inline'"], imgSrc: ["'self'", 'data:', 'https:'], connectSrc: ["'self'"], objectSrc: ["'none'"], frameAncestors: ["'none'"], baseUri: ["'self'"], formAction: ["'self'"] } },
+    contentSecurityPolicy: { directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'"], styleSrc: ["'self'", "'unsafe-inline'"], imgSrc: ["'self'", 'data:', 'https:'], connectSrc: ["'self'"], objectSrc: ["'none'"], frameAncestors: ["'none'"], baseUri: ["'self'"], formAction: ["'self'"], upgradeInsecureRequests: config.tls ? [] : null } },
     crossOriginEmbedderPolicy: false,
     hsts: config.tls ? undefined : false,
   }));
@@ -165,6 +172,7 @@ export function createApp(ctx) {
   app.limiters = buildLimiters(ctx);
   app.signed = (...handlers) => [signedMiddleware(ctx), ...handlers];
   ctx.app = app;
+  app.use(TOTP_LIMITED_PATHS, app.limiters.totp);
 
   app.use('/v1', publicRoutes(ctx));
   app.use('/v1/reseller', resellerRoutes(ctx));

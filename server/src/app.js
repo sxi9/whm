@@ -14,17 +14,25 @@ import { createAudit } from './middleware/audit.js';
 import { errorHandler, notFoundHandler } from './middleware/error.js';
 import { apiRouter } from './routes/index.js';
 
+// A caller may name its request for log correlation, but only with a short
+// plain id; anything else is replaced so logs and error bodies stay clean.
+const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
+export const acceptedRequestId = (value) => (typeof value === 'string' && REQUEST_ID_RE.test(value) ? value : null);
+// Streams are matched on the path alone: a query string is never consulted,
+// so "?x=/stream" cannot opt a request out of the limiter or the access log.
+export const isStreamRequest = (req) => /\/stream$/i.test(String(req.originalUrl ?? req.url ?? '').split('?')[0]);
+
 export async function createApp(ctx) {
   const { config, db, logger, crypto: cryptoSvc } = ctx;
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', config.trustProxy ?? 'loopback');
 
-  app.use((req, _res, next) => { req.id = req.get('x-request-id') || crypto.randomUUID(); next(); });
+  app.use((req, _res, next) => { req.id = acceptedRequestId(req.get('x-request-id')) || crypto.randomUUID(); next(); });
   app.use(pinoHttp({
     logger,
     genReqId: (req) => req.id,
-    autoLogging: { ignore: (req) => req.url.startsWith('/api/system/jobs/') && req.url.endsWith('/stream') },
+    autoLogging: { ignore: (req) => String(req.originalUrl ?? req.url).startsWith('/api/system/jobs/') && isStreamRequest(req) },
     customLogLevel: (_req, res, err) => (err || res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info'),
     serializers: {
       req: (req) => ({ id: req.id, method: req.method, url: req.url, ip: req.remoteAddress }),
@@ -36,6 +44,9 @@ export async function createApp(ctx) {
       directives: {
         defaultSrc: ["'self'"], scriptSrc: ["'self'"], styleSrc: ["'self'", "'unsafe-inline'"], imgSrc: ["'self'", 'data:', 'blob:'],
         connectSrc: ["'self'"], fontSrc: ["'self'", 'data:'], objectSrc: ["'none'"], frameAncestors: ["'none'"], baseUri: ["'self'"], formAction: ["'self'"],
+        // Helmet's default would make browsers rewrite the SPA's own API calls
+        // to https on a plain-HTTP (port 2086 only) install.
+        upgradeInsecureRequests: config.tls ? [] : null,
       },
     },
     crossOriginEmbedderPolicy: false,
@@ -58,7 +69,7 @@ export async function createApp(ctx) {
 
   app.use('/api/auth/login', rateLimit({ windowMs: config.loginRateLimit.windowMs, limit: config.loginRateLimit.max, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: { code: 'rate_limited', message: 'Too many login attempts, please wait' } } }));
   app.use('/api/auth/2fa', rateLimit({ windowMs: config.loginRateLimit.windowMs, limit: config.loginRateLimit.max, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: { code: 'rate_limited', message: 'Too many attempts, please wait' } } }));
-  app.use('/api', rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: 'draft-7', legacyHeaders: false, skip: (req) => req.url.includes('/stream') }));
+  app.use('/api', rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: 'draft-7', legacyHeaders: false, skip: isStreamRequest }));
 
   // OIDC callbacks arrive as top-level navigations with the session cookie; the
   // redirect target lives on the same origin, so the SPA fallback below serves it.

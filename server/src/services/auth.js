@@ -4,6 +4,14 @@ const LOCKOUT_CODE = 'locked_out';
 // An address counts as "known" for verified-IP login when it logged in
 // successfully within this window.
 const KNOWN_IP_WINDOW = '-90 days';
+// A second factor is only ever tried after a correct password, so a run of
+// wrong codes for one user is an attack on that user rather than on an
+// address: the user's 2FA pauses for the window (per user, not per IP, so
+// a distributed guess cannot walk the code space) and the lock is audited.
+const TOTP_MAX_FAILURES = 5;
+const TOTP_LOCK_MS = 15 * 60_000;
+// RFC 6238 §5.2: a code that already logged someone in is not accepted again.
+const TOTP_REUSE_WINDOW_MS = 2 * 60_000;
 
 export function createAuthService(ctx) {
   const { db, crypto, settings, logger, sessionStore } = ctx;
@@ -47,6 +55,31 @@ export function createAuthService(ctx) {
       stmts.block.run(ip, `${failures} failed logins`, `+${minutes} minutes`);
       logger.warn({ ip, failures }, 'cPHulk: blocked address after repeated login failures');
     }
+  }
+
+  const totpFailures = new Map();
+  const totpAccepted = new Map();
+  function verifyTotp(user, code) {
+    const now = Date.now();
+    const state = totpFailures.get(user.id);
+    if (state && state.lockedUntil > now) throw new HttpError(429, LOCKOUT_CODE, 'Too many wrong verification codes; wait a few minutes and try again.');
+    const normalized = String(code).replace(/\s+/g, '');
+    const last = totpAccepted.get(user.id);
+    const reused = Boolean(last && last.code === normalized && now - last.at < TOTP_REUSE_WINDOW_MS);
+    if (!reused && crypto.totp.verify(normalized, crypto.decrypt(user.totp_secret_enc))) {
+      totpFailures.delete(user.id);
+      totpAccepted.set(user.id, { code: normalized, at: now });
+      return true;
+    }
+    const inWindow = state && now - state.firstAt < TOTP_LOCK_MS;
+    const count = (inWindow ? state.count : 0) + 1;
+    const lockedUntil = count >= TOTP_MAX_FAILURES ? now + TOTP_LOCK_MS : 0;
+    totpFailures.set(user.id, { count, firstAt: inWindow ? state.firstAt : now, lockedUntil });
+    if (lockedUntil) {
+      logger.warn({ username: user.username, failures: count }, 'two-factor login paused after repeated wrong codes');
+      ctx.auditRecord?.(null, { action: 'auth.2fa.locked', target: user.username, args: { failures: count, minutes: TOTP_LOCK_MS / 60_000 }, result: 'locked' });
+    }
+    return false;
   }
 
   function publicUser(u) {
@@ -103,8 +136,7 @@ export function createAuthService(ctx) {
       enforceBruteForce(ip);
       const user = stmts.byId.get(userId);
       if (!user?.totp_enabled) throw badRequest('Two-factor authentication is not pending for this session');
-      const secret = crypto.decrypt(user.totp_secret_enc);
-      if (!crypto.totp.verify(code, secret)) {
+      if (!verifyTotp(user, code)) {
         recordFailure(ip, user.username);
         throw unauthorized('Invalid verification code');
       }

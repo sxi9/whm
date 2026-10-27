@@ -165,7 +165,8 @@ describe('module registration and RBAC', () => {
     app.agent.calls.length = 0;
     const res = await reseller.get('/api/software/php/versions?modules=true');
     expect(res.status).toBe(200);
-    expect(res.body.data.versions).toEqual([{ id: '8.3', label: 'PHP 8.3', version: '8.3.6', isDefault: true }, { id: '8.2', label: 'PHP 8.2', version: '8.2.20', isDefault: false }]);
+    // Resellers get the advisory badge data (no binaries or paths); both fixture versions predate the October 2026 fixes.
+    expect(res.body.data.versions).toEqual([{ id: '8.3', label: 'PHP 8.3', version: '8.3.6', isDefault: true, advisories: [expect.objectContaining({ id: 'CVE-2026-109619', fixedIn: '8.3.36' })] }, { id: '8.2', label: 'PHP 8.2', version: '8.2.20', isDefault: false, advisories: [expect.objectContaining({ id: 'CVE-2026-109619', fixedIn: '8.2.35' })] }]);
     expect(res.body.data.effectiveDefault).toBe('8.3');
     expect(JSON.stringify(res.body.data)).not.toMatch(/iniPath|poolDir|fpmUnit|binary/);
     expect(app.agent.callsTo('pkg.php.versions').pop().args).toEqual({ modules: false });

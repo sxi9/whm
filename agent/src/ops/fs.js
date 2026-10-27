@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { z } from 'zod';
 import { exec } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
@@ -49,10 +50,17 @@ defineOp('fs.write_file', {
   run: async ({ path: p, content, backup, owner, group, mode }, ctx) => {
     ctx.assertAllowedPath(p, 'write');
     fs.mkdirSync(path.dirname(p), { recursive: true });
-    if (backup && fs.existsSync(p)) fs.copyFileSync(p, `${p}.whm-bak`);
-    const tmp = `${p}.whm-tmp-${process.pid}`;
-    fs.writeFileSync(tmp, content, { mode: mode ? parseInt(mode, 8) : 0o644 });
-    if (owner) { const { uid, gid } = ownership(owner, group); fs.chownSync(tmp, uid, gid); }
+    // The backup and the temporary file are created exclusively: a link an
+    // account planted under one of these names fails instead of being followed
+    // by root, and the final rename replaces (never follows) whatever sits at p.
+    if (backup && fs.existsSync(p)) {
+      const bak = `${p}.whm-bak`;
+      fs.rmSync(bak, { force: true });
+      fs.copyFileSync(p, bak, fs.constants.COPYFILE_EXCL);
+    }
+    const tmp = `${p}.whm-tmp-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+    fs.writeFileSync(tmp, content, { mode: mode ? parseInt(mode, 8) : 0o644, flag: 'wx' });
+    if (owner) { const { uid, gid } = ownership(owner, group); fs.lchownSync(tmp, uid, gid); }
     fs.renameSync(tmp, p);
     return { path: p, bytes: Buffer.byteLength(content) };
   },
@@ -136,7 +144,9 @@ defineOp('fs.copy_tree', {
   run: async ({ from, to, deleteExtraneous }, ctx) => {
     ctx.assertAllowedPath(from, 'read');
     ctx.assertAllowedPath(to, 'write');
-    const argv = ['-a', '--numeric-ids'];
+    // -a implies -D; a tree the account controls is never allowed to turn
+    // into device nodes or sockets created by root at the destination.
+    const argv = ['-a', '--no-devices', '--no-specials', '--numeric-ids'];
     if (deleteExtraneous) argv.push('--delete');
     argv.push(`${from.replace(/\/+$/, '')}/`, `${to.replace(/\/+$/, '')}/`);
     await exec('rsync', argv, { timeoutMs: 3_600_000 });

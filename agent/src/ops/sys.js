@@ -197,7 +197,7 @@ defineOp('sys.resolvers.get', {
 
 defineOp('sys.binaries', {
   description: 'Which of the given programs are installed (capability detection)',
-  schema: z.object({ names: z.array(z.string().regex(/^[A-Za-z0-9._-]{1,64}$/)).min(1).max(100) }).strict(),
+  schema: z.object({ names: z.array(z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9._-]{0,63}$/)).min(1).max(100) }).strict(),
   run: async ({ names }) => Object.fromEntries(names.map((n) => [n, hasBinary(n)])),
 });
 

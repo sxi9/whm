@@ -16,12 +16,15 @@ export class ExecError extends Error {
 export function resolveBinary(name) {
   if (resolved.has(name)) return resolved.get(name);
   let found = null;
+  // Only a regular file counts: a directory that happens to carry a program's
+  // name (or "..") must never be cached as that program.
+  const isFile = (p) => { try { return fs.statSync(p).isFile(); } catch { return false; } };
   if (path.isAbsolute(name)) {
-    if (fs.existsSync(name)) found = name;
+    if (isFile(name)) found = name;
   } else {
     for (const dir of SEARCH_DIRS) {
       const candidate = path.join(dir, name);
-      if (fs.existsSync(candidate)) { found = candidate; break; }
+      if (isFile(candidate)) { found = candidate; break; }
     }
   }
   if (found) resolved.set(name, found);

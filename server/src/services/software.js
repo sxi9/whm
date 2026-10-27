@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { json } from '../db/index.js';
+import { json, paginate } from '../db/index.js';
 import { notFound, conflict, badRequest, forbidden, unprocessable, CapabilityError } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
 
@@ -11,7 +11,7 @@ import { isRoot } from '../middleware/rbac.js';
 //   software.pkg.isInstalled(names[])                       -> { name: boolean }
 //   software.pkg.ensureInstalled(names[], { user, req })    -> { missing, job } (enqueues an install job when something is missing)
 //   software.pkg.install(names[], user, req)                -> job (202 semantics)
-//   software.php.versions()                                 -> { versions: [{ id, version, binary, iniPath, poolDir, fpmUnit, isDefault }], defaultId }
+//   software.php.versions()                                 -> { versions: [{ id, version, binary, iniPath, poolDir, fpmUnit, isDefault, advisories }], defaultId }
 //   software.php.systemDefault()                            -> { configured, detected, effective }
 //   software.php.versionForDomain(domain)                   -> { domain, phpVersion, effective, inherited } or null
 //   software.php.setDomainVersion(domains[], version|null, user, req) -> { results, job } (job when more than one domain)
@@ -106,11 +106,13 @@ export function createSoftwareService(ctx) {
   const op = (name, args = {}, req) => agent.op(name, args, { req });
   const S = (key, fallback) => { const v = settings.get(key, fallback); return v === undefined ? fallback : v; };
 
-  const stmts = {
-    allDomains: db.prepare(`SELECT a.domain, a.username, a.id AS account_id, a.owner_id, a.home_dir, a.suspended, 'main' AS type, NULL AS docroot, NULL AS php_version, 0 AS has_row FROM accounts a
+  // Every hosted domain: main domains without an account_domains row plus every
+  // recorded row (account_domains.domain is unique, so no domain repeats).
+  const ALL_DOMAINS_SQL = `SELECT a.domain, a.username, a.id AS account_id, a.owner_id, a.home_dir, a.suspended, 'main' AS type, NULL AS docroot, NULL AS php_version, 0 AS has_row FROM accounts a
       WHERE a.domain NOT IN (SELECT domain FROM account_domains)
-      UNION ALL SELECT d.domain, a.username, a.id, a.owner_id, a.home_dir, a.suspended, d.type, d.docroot, d.php_version, 1 FROM account_domains d JOIN accounts a ON a.id = d.account_id
-      ORDER BY 1`),
+      UNION ALL SELECT d.domain, a.username, a.id, a.owner_id, a.home_dir, a.suspended, d.type, d.docroot, d.php_version, 1 FROM account_domains d JOIN accounts a ON a.id = d.account_id`;
+  const stmts = {
+    allDomains: db.prepare(`${ALL_DOMAINS_SQL} ORDER BY 1`),
     accountMainDomains: db.prepare('SELECT id, domain FROM accounts'),
     accountByDomain: db.prepare('SELECT * FROM accounts WHERE domain = ?'),
     accountDomain: db.prepare('SELECT d.*, a.username, a.owner_id, a.home_dir, a.suspended FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE d.domain = ?'),
@@ -125,6 +127,7 @@ export function createSoftwareService(ctx) {
   };
 
   const requirePkg = () => capabilities.require('pkg', 'No supported package manager (apt-get, dnf or yum) was found on this server');
+  const likeEscape = (text) => String(text).replace(/[\\%_]/g, (c) => `\\${c}`);
   const requirePhp = () => capabilities.require('php', 'PHP is not installed on this server; install a php package (Install Distro Packages or EasyApache 4)');
   const enqueue = (type, params, user) => ctx.jobs.enqueue(type, params, { userId: user?.id ?? null });
   const docrootOf = (row) => row.docroot || `${row.home_dir || `/home/${row.username}`}/public_html`;
@@ -514,8 +517,12 @@ export function createSoftwareService(ctx) {
       const result = await op('pkg.php.versions', { modules: root && modules });
       const configured = S('php.default_version', null);
       const effectiveDefault = result.versions.some((v) => v.id === configured) ? configured : result.defaultId;
-      if (root) return { ...result, configuredDefault: configured, effectiveDefault };
-      return { versions: result.versions.map((v) => ({ id: v.id, label: v.label, version: v.version, isDefault: v.id === effectiveDefault })), defaultId: effectiveDefault, configuredDefault: configured, effectiveDefault };
+      // Security Center's advisory rules (setting security.advisories) badge each
+      // version here so MultiPHP Manager and the Security Advisor agree.
+      const advisoriesFor = (v) => { try { return ctx.security?.phpAdvisories?.forVersion(v) ?? []; } catch { return []; } };
+      const versions = result.versions.map((v) => ({ ...v, advisories: advisoriesFor(v) }));
+      if (root) return { ...result, versions, configuredDefault: configured, effectiveDefault };
+      return { versions: versions.map((v) => ({ id: v.id, label: v.label, version: v.version, isDefault: v.id === effectiveDefault, advisories: v.advisories })), defaultId: effectiveDefault, configuredDefault: configured, effectiveDefault };
     },
     async systemDefault() {
       const configured = S('php.default_version', null);
@@ -556,19 +563,21 @@ export function createSoftwareService(ctx) {
       if (failed.length && !applied) throw new Error(`No domain could be updated: ${failed.slice(0, 3).map((f) => `${f.domain} (${f.error})`).join('; ')}`);
       return { version, applied, failed, state: failed.length ? 'partial' : 'applied' };
     },
-    async domains(user, { account, q } = {}) {
+    // Paged in SQL: a server with tens of thousands of domains never materialises
+    // them all per request (pageSize is capped by the route).
+    async domains(user, { account, q, page = 1, pageSize = 500, sort, dir = 'asc' } = {}) {
       const def = await php.systemDefault();
-      const seen = new Set();
-      const out = [];
-      for (const d of stmts.allDomains.all()) {
-        if (seen.has(d.domain)) continue;
-        if (!isRoot(user) && d.owner_id !== user.id) continue;
-        if (account && d.username !== account) continue;
-        if (q && !d.domain.includes(q.toLowerCase()) && !d.username.includes(q.toLowerCase())) continue;
-        seen.add(d.domain);
-        out.push({ domain: d.domain, account: d.username, accountId: d.account_id, type: d.type, suspended: Boolean(d.suspended), docroot: docrootOf(d), phpVersion: d.php_version || null, effective: d.php_version || def.effective, inherited: !d.php_version });
-      }
-      return { systemDefault: def, domains: out };
+      const where = []; const params = { def: def.effective ?? '' };
+      if (!isRoot(user)) { where.push('d.owner_id = @owner'); params.owner = user.id; }
+      if (account) { where.push('d.username = @account'); params.account = account; }
+      if (q) { where.push("(d.domain LIKE @q ESCAPE '\\' OR d.username LIKE @q ESCAPE '\\')"); params.q = `%${likeEscape(q.toLowerCase())}%`; }
+      const result = paginate(db, {
+        select: 'd.*', from: `(${ALL_DOMAINS_SQL}) d`, where, params,
+        sortable: { domain: 'd.domain', account: 'd.username', type: 'd.type', effective: 'COALESCE(d.php_version, @def)' }, defaultSort: 'domain',
+        query: { page: Math.max(Number(page) || 1, 1), pageSize: Math.min(Math.max(Number(pageSize) || 500, 1), 500), sort, dir },
+      });
+      const domains = result.data.map((d) => ({ domain: d.domain, account: d.username, accountId: d.account_id, type: d.type, suspended: Boolean(d.suspended), docroot: docrootOf(d), phpVersion: d.php_version || null, effective: d.php_version || def.effective, inherited: !d.php_version }));
+      return { data: { systemDefault: def, domains }, meta: result.meta };
     },
     versionForDomain(domain) {
       const row = stmts.accountDomain.get(domain) || (stmts.accountByDomain.get(domain) ? { php_version: null } : null);

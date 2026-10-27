@@ -95,7 +95,7 @@ export async function register(ctx) {
   // MultiPHP Manager
   r.get('/php/versions', requireReseller, validate({ query: z.object({ modules: z.enum(['true', 'false']).default('false') }) }), wrap((req) => s.php.versions({ modules: req.query.modules === 'true', user: req.user })));
   r.put('/php/default', requireRoot, validate({ body: z.object({ version: phpVersionId }).strict() }), maybeAccepted((req) => s.php.setSystemDefault(req.body.version, req.user, req)));
-  r.get('/php/domains', requireReseller, validate({ query: z.object({ account: fields.username.optional(), q: z.string().trim().max(200).optional() }) }), wrap((req) => s.php.domains(req.user, req.query)));
+  r.get('/php/domains', requireReseller, validate({ query: pagination.extend({ account: fields.username.optional(), pageSize: z.coerce.number().int().min(1).max(500).default(500), sort: z.enum(['domain', 'account', 'type', 'effective']).optional() }) }), wrap((req) => s.php.domains(req.user, req.query)));
   r.put('/php/domains', requireReseller, validate({ body: z.object({ domains: z.array(fields.hostname).min(1).max(500), version: phpVersionId.nullable() }).strict() }), maybeAccepted((req) => s.php.setDomainVersion(req.body.domains, req.body.version, req.user, req)));
   r.get('/php/pools', requireRoot, validate({ query: z.object({ version: phpVersionId.optional() }) }), wrap((req) => s.php.pools(req.query.version)));
 

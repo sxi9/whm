@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { z } from 'zod';
 import { ExecError } from '../exec.js';
 
@@ -48,7 +49,9 @@ export const arg = {
   username: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/),
   domain: z.string().regex(/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/),
   hostname: z.string().regex(/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/),
-  unit: z.string().regex(/^[A-Za-z0-9@._-]{1,80}$/),
+  // A unit name never starts with "-": it is placed after the systemctl verb and
+  // would otherwise be read as an option.
+  unit: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9@._-]{0,79}$/),
   ipv4: z.string().ip({ version: 'v4' }),
   ipv6: z.string().ip({ version: 'v6' }),
   ip: z.string().ip(),
@@ -63,3 +66,21 @@ export const arg = {
   text: z.string().max(4 * 1024 * 1024),
   mysqlHost: z.string().regex(/^[A-Za-z0-9.%:_-]{1,255}$/),
 };
+
+// A scratch directory root writes secrets or executes from (/tmp/whm and the
+// like) must be the agent's own, not a directory another local user planted
+// under a sticky /tmp before the agent first ran. It is created 0700 when
+// missing; one the agent owns is tightened to 0700, anything else is refused.
+export function ensurePrivateDir(dir) {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+  let st;
+  try { st = fs.lstatSync(dir); } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    st = fs.lstatSync(dir);
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) throw new OpError('path_not_allowed', `${dir} is not a directory`);
+  if (st.uid !== uid && st.uid !== 0) throw new OpError('path_not_allowed', `${dir} is owned by uid ${st.uid}, not by the agent; remove it so the agent can create its own`);
+  if ((st.mode & 0o077) !== 0) fs.chmodSync(dir, 0o700);
+  return dir;
+}

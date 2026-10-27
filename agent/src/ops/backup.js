@@ -3,10 +3,12 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
+import readline from 'node:readline';
 import { z } from 'zod';
 import { exec, hasBinary, resolveBinary } from '../exec.js';
-import { defineOp, arg, OpError } from './registry.js';
+import { defineOp, arg, OpError, ensurePrivateDir } from './registry.js';
 import { renderClientCnf, classifyMysqlError, parseBatch, cloneUserStatements, parseGrant, q } from './db.js';
+import { createSqlCodeFilter, createClientCommandGuard } from './transfer.js';
 
 // Backup op family. An account archive is a cPanel-compatible tarball:
 //
@@ -61,8 +63,7 @@ function ownership(username) {
 
 function tmpDir(ctx) {
   ctx.assertAllowedPath(TMP_DIR, 'write');
-  fs.mkdirSync(TMP_DIR, { recursive: true, mode: 0o700 });
-  return TMP_DIR;
+  return ensurePrivateDir(TMP_DIR);
 }
 
 function secretFile(dir, prefix, content) {
@@ -574,6 +575,28 @@ export function createDatabaseStatement(database, createFileText = '') {
   return `CREATE DATABASE IF NOT EXISTS ${q.id(database)}${charset ? ` DEFAULT CHARACTER SET ${charset}` : ''}${collate ? ` COLLATE ${collate}` : ''}`;
 }
 
+// The mysql client runs its own commands from a dump ("system <cmd>", "\\!",
+// "tee", "source" ...), as the user running the client: root here, with the
+// admin credentials. An archive restored from another server is untrusted, so
+// the dump is screened line by line for those commands (and for a USE of any
+// other database) before the client ever opens it. SQL itself is not judged:
+// the panel's own dumps carry DROP DATABASE / CREATE DATABASE for the target.
+export async function screenDumpForClientCommands(file, { database } = {}) {
+  const stream = fs.createReadStream(file, { encoding: 'utf8' });
+  const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  const codeOf = createSqlCodeFilter();
+  const guard = createClientCommandGuard({ database });
+  let lineNo = 0;
+  try {
+    for await (const line of rl) {
+      lineNo++;
+      const reason = guard(codeOf(line));
+      if (reason) return { ok: false, line: lineNo, reason };
+    }
+  } finally { rl.close(); stream.destroy(); }
+  return { ok: true, lines: lineNo };
+}
+
 defineOp('backup.db.import', {
   description: 'Import a mysqldump file through the client (source <file>); with `database`, the schema is created first (mysql/<db>.create charset honoured) and the dump is sourced inside it',
   destructive: true,
@@ -585,6 +608,8 @@ defineOp('backup.db.import', {
     if (!bin) throw new OpError('capability_missing', 'The MySQL/MariaDB client (mysql or mariadb) is not installed on this server');
     const sql = ctx.assertAllowedPath(file, 'read');
     if (!/\.sql$/.test(sql) || !exists(sql)) throw new OpError('not_found', `${file} is not an existing .sql dump`);
+    const screen = await screenDumpForClientCommands(sql, { database });
+    if (!screen.ok) throw new OpError('refused', `${path.basename(sql)} line ${screen.line}: ${screen.reason}; review the dump and import it by hand if it is legitimate`);
     let created = false;
     if (database) {
       let createText = '';

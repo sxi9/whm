@@ -3,7 +3,7 @@ import Database from 'better-sqlite3';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { passwordStrength, ipInCidr, verifyIdToken, checkDiscoveryDocument, normalizeIpOrCidr, isPublicAddress, fetchJson } from '../src/services/security-center.js';
+import { passwordStrength, ipInCidr, verifyIdToken, checkDiscoveryDocument, normalizeIpOrCidr, isPublicAddress, fetchJson, comparePhpVersions, phpVersionSatisfies, normalizeAdvisories, matchPhpAdvisories } from '../src/services/security-center.js';
 
 const BIN_FULL = { sshd: true, 'ssh-keygen': true, iptables: true, nft: true, apache2ctl: true, 'apt-get': true };
 const MODSEC_DETECT = () => ({ installed: true, flavor: 'debian', baseDir: '/etc/modsecurity', mainConf: '/etc/modsecurity/modsecurity.conf', configConf: '/etc/apache2/conf-enabled/zz-whm-modsec-10-config.conf', vendorsDir: '/etc/modsecurity/whm-vendors', errorLog: '/var/log/apache2/error.log', apache: { flavor: 'debian' }, moduleLoaded: true });
@@ -958,6 +958,114 @@ describe('security advisor', () => {
       const without = Object.fromEntries((await post('/api/security/advisor/scan')).body.data.findings.map((f) => [f.id, f]));
       expect(without['pkg.updates']).toMatchObject({ grade: 'info', detail: 'The Software category is not loaded on this panel.' });
     } finally { app.ctx.software = software; }
+  });
+});
+
+describe('PHP advisories', () => {
+  const PHP = (id, version, extra = {}) => ({ id, label: `PHP ${id}`, binary: `/usr/bin/php${id}`, layout: 'debian', version, iniPath: `/etc/php/${id}/fpm/php.ini`, poolDir: `/etc/php/${id}/fpm/pool.d`, fpmUnit: `php${id}-fpm`, isDefault: false, fpmInstalled: true, fpmActive: true, ...extra });
+  const withPhp = async (versions) => {
+    app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, Boolean(BIN_FULL[n]) || n === 'php'])));
+    app.agent.set('pkg.php.versions', () => ({ versions, defaultId: versions[0]?.id ?? null, defaultBinary: versions[0]?.binary ?? null }));
+    await app.ctx.capabilities.refresh();
+  };
+  const scanById = async () => Object.fromEntries((await post('/api/security/advisor/scan')).body.data.findings.map((f) => [f.id, f]));
+
+  it('compares versions numerically and evaluates ranges', () => {
+    expect(comparePhpVersions('8.3.6', '8.3.36')).toBe(-1);
+    expect(comparePhpVersions('8.3.36', '8.3.36')).toBe(0);
+    expect(comparePhpVersions('8.10.0', '8.9.9')).toBe(1);
+    expect(comparePhpVersions('8.3', '8.3.0')).toBe(0);
+    expect(phpVersionSatisfies('8.3.35', '<8.3.36')).toBe(true);
+    expect(phpVersionSatisfies('8.3.36', '<8.3.36')).toBe(false);
+    expect(phpVersionSatisfies('8.3.36', '<=8.3.36')).toBe(true);
+    expect(phpVersionSatisfies('8.2.10', '>=8.2.0 <8.2.35')).toBe(true);
+    expect(phpVersionSatisfies('8.2.35', '>=8.2.0 <8.2.35')).toBe(false);
+    expect(phpVersionSatisfies('8.1.99', '*')).toBe(true);
+    expect(phpVersionSatisfies('8.4.1', '<8.4.0 || =8.4.1')).toBe(true);
+    expect(phpVersionSatisfies('8.4.2', '<8.4.0 || =8.4.1')).toBe(false);
+    expect(phpVersionSatisfies('8.3.1', '')).toBe(false);
+    expect(phpVersionSatisfies('8.3.1', 'latest')).toBe(false);
+    expect(phpVersionSatisfies('8.3.1-dev', '*')).toBe(false);
+    expect(phpVersionSatisfies(null, '*')).toBe(false);
+  });
+
+  it('normalises the stored list and skips entries it cannot read', () => {
+    const { advisories, invalid } = normalizeAdvisories([
+      { id: 'CVE-1', severity: 'CRITICAL', affected: { '8.3': '<8.3.36', bad: '*', '8.2': 5 }, fixedIn: { '8.3': '8.3.36' }, url: 'javascript:alert(1)' },
+      { id: 'CVE-2', severity: 'bogus', affected: 'all', fixedIn: '9.0.0' },
+      { title: 'no id' }, null, 'CVE-3',
+    ]);
+    expect(invalid).toBe(3);
+    expect(advisories).toEqual([
+      expect.objectContaining({ id: 'CVE-1', severity: 'critical', affected: { '8.3': '<8.3.36' }, fixedIn: { '8.3': '8.3.36' }, url: null }),
+      expect.objectContaining({ id: 'CVE-2', severity: 'medium', affected: {}, fixedIn: { '*': '9.0.0' } }),
+    ]);
+    expect(normalizeAdvisories('nope')).toEqual({ advisories: [], invalid: 0 });
+  });
+
+  it('matches installed versions per minor branch, reports unknown patch levels and unversioned advisories', () => {
+    const { advisories } = normalizeAdvisories([
+      { id: 'CVE-A', severity: 'critical', affected: { '8.3': '<8.3.36', '8.2': '<8.2.35', '8.1': '*' }, fixedIn: { '8.3': '8.3.36', '8.2': '8.2.35' } },
+      { id: 'CVE-B', severity: 'medium', affected: {} },
+    ]);
+    const { matches, unversioned } = matchPhpAdvisories(advisories, [PHP('8.3', '8.3.6', { isDefault: true }), PHP('8.2', '8.2.35'), PHP('8.1', null), PHP('8.4', '8.4.1'), PHP('7.4', null)]);
+    expect(unversioned.map((a) => a.id)).toEqual(['CVE-B']);
+    expect(matches).toHaveLength(1);
+    expect(matches[0].versions).toEqual([
+      { id: '8.3', version: '8.3.6', minor: '8.3', unknown: false, fixedIn: '8.3.36', isDefault: true },
+      { id: '8.1', version: null, minor: '8.1', unknown: false, fixedIn: null, isDefault: false },
+    ]);
+    // A bounded range cannot be decided without the patch level: flagged as unknown, never silently passed.
+    const { matches: m2 } = matchPhpAdvisories(advisories, [PHP('8.2', null)]);
+    expect(m2[0].versions).toEqual([{ id: '8.2', version: null, minor: '8.2', unknown: true, fixedIn: '8.2.35', isDefault: false }]);
+    expect(matchPhpAdvisories(advisories, []).matches).toEqual([]);
+  });
+
+  it('seeds the confirmed October 2026 advisories and flags vulnerable versions in the advisor with a MultiPHP link', async () => {
+    const seeded = app.ctx.settings.get('security.advisories');
+    expect(seeded.map((a) => a.id)).toEqual(['CVE-2026-109619', 'CVE-2026-115560']);
+    expect(seeded[0]).toMatchObject({ severity: 'critical', published: '2026-10-21', fixedIn: { '8.5': '8.5.12', '8.4': '8.4.27', '8.3': '8.3.36', '8.2': '8.2.35' } });
+    await provision(true);
+    await withPhp([PHP('8.3', '8.3.35', { isDefault: true }), PHP('8.2', '8.2.35'), PHP('8.1', '8.1.31')]);
+    try {
+      const byId = await scanById();
+      const finding = byId['php.advisory.CVE-2026-109619'];
+      expect(finding).toMatchObject({ grade: 'critical', title: 'PHP 8.3.35 (default), 8.1.31 are affected by CVE-2026-109619', url: 'https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp', fix: { label: 'MultiPHP Manager', path: '/software/multiphp-manager' } });
+      expect(finding.versions.map((v) => [v.version, v.fixedIn])).toEqual([['8.3.35', '8.3.36'], ['8.1.31', null]]);
+      expect(finding.detail).toContain('PHP 8.3.35: update to 8.3.36');
+      expect(finding.detail).toContain('PHP 8.1.31: no packaged fix');
+      expect(byId['php.advisory.CVE-2026-115560']).toMatchObject({ grade: 'info', title: 'CVE-2026-115560 has no fixed release yet' });
+      expect(byId['php.advisories']).toBeUndefined();
+      // MultiPHP data carries the same verdict per version.
+      const versions = (await get('/api/software/php/versions')).body.data.versions;
+      expect(versions.find((v) => v.id === '8.3').advisories).toEqual([{ id: 'CVE-2026-109619', severity: 'critical', grade: 'critical', title: seeded[0].title, url: seeded[0].url, fixedIn: '8.3.36', unknown: false }]);
+      expect(versions.find((v) => v.id === '8.2').advisories).toEqual([]);
+      expect(versions.find((v) => v.id === '8.1').advisories[0]).toMatchObject({ id: 'CVE-2026-109619', fixedIn: null });
+
+      await withPhp([PHP('8.3', '8.3.36', { isDefault: true }), PHP('8.2', '8.2.35')]);
+      const fixed = await scanById();
+      expect(fixed['php.advisory.CVE-2026-109619']).toBeUndefined();
+      expect(fixed['php.advisories']).toMatchObject({ grade: 'ok', title: 'Installed PHP 8.3.36, 8.2.35 not affected by 1 listed advisory' });
+    } finally { app.agent.reset('pkg.php.versions'); }
+  });
+
+  it('reports no PHP as informational and an empty or broken list as something to update', async () => {
+    await provision(true);
+    let byId = await scanById();
+    expect(byId['php.advisories']).toMatchObject({ grade: 'info', title: 'No PHP installation found' });
+    expect(byId['php.advisory.CVE-2026-109619']).toBeUndefined();
+    const original = app.ctx.settings.get('security.advisories');
+    try {
+      await put('/api/system/settings', { 'security.advisories': [] });
+      byId = await scanById();
+      expect(byId['php.advisories']).toMatchObject({ grade: 'info', title: 'The PHP advisory list is empty', fix: { path: '/security-center/security-advisor#advisories' } });
+      await put('/api/system/settings', { 'security.advisories': [{ nope: true }, { id: 'CVE-X', severity: 'high', affected: { '8.3': '*' } }] });
+      await withPhp([PHP('8.3', '8.3.36')]);
+      byId = await scanById();
+      expect(byId['php.advisories.invalid']).toMatchObject({ grade: 'warning', title: '1 entry in the PHP advisory list could not be read' });
+      expect(byId['php.advisory.CVE-X']).toMatchObject({ grade: 'critical', title: 'PHP 8.3.36 is affected by CVE-X' });
+      expect(byId['php.advisory.CVE-X'].url).toBeNull();
+    } finally { await put('/api/system/settings', { 'security.advisories': original }); app.agent.reset('pkg.php.versions'); }
   });
 });
 
