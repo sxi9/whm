@@ -541,6 +541,10 @@ describe('Upgrade to Latest Version', () => {
     const kept = ['sha256', 'signature', 'keyId'].filter((k) => rec.latest[k] !== undefined);
     if (kept.length === 3) {
       expect(rec.latest).toMatchObject({ sha256: feed.sha256, signature: feed.signature, keyId: feed.keyId });
+      // Software's own endpoint carries them, and cpanel reads a verifiable
+      // release from that record without any help from this suite.
+      expect((await get('/api/software/panel/update').expect(200)).body.data.latest).toMatchObject({ sha256: feed.sha256, signature: feed.signature, keyId: feed.keyId });
+      expect((await get('/api/cpanel/upgrade').expect(200)).body.data.verification).toMatchObject({ sha256: true, signature: true, keyId: 'release-2026' });
       console.info('software.panel.check keeps sha256/signature/keyId: the completing wrapper in cpanel.test.js can go');
     } else {
       console.warn(`software.panel.check drops ${['sha256', 'signature', 'keyId'].filter((k) => !kept.includes(k)).join('/')}: cpanel reads every release as unverifiable until services/software.js keeps them (parseRelease from services/cpanel.js has the shapes)`);
