@@ -68,6 +68,8 @@ export function authRoutes(ctx) {
       mustEnroll2fa: Boolean(req.session?.mustEnroll2fa), policy: auth.policy(),
       // The Server Profile decides which sidebar categories the shell shows.
       profile: ctx.serverConfig?.profile?.summary?.() ?? { name: 'standard', hiddenCategories: [] },
+      // Grace/degraded banner in the shell.
+      license: ctx.license?.summaryForShell?.() ?? { status: 'unlicensed', edition: null, daysLeft: null, enforce: false, degraded: true },
     } });
   });
 

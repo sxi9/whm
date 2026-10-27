@@ -285,6 +285,7 @@ export function createResellersService(ctx) {
     if (RESERVED_USERNAMES.includes(username)) throw unprocessable(`"${username}" is a reserved name`, { username: [`Reserved names: ${RESERVED_USERNAMES.join(', ')}`] });
     const existingUser = stmts.userByUsername.get(username);
     assertPromotable(username, existingUser);
+    ctx.license?.assertCapacity?.('resellers');
     const account = stmts.accountByUsername.get(username);
     if (input.fromAccount && !account) throw notFound(`Hosting account "${username}"`);
     // A hosting account becomes a reseller only on request; a standalone reseller never silently takes one over.

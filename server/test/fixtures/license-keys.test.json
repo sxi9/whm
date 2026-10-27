@@ -1,0 +1,20 @@
+{
+  "_comment": "Test-only pinned license keys: the hub fixture license pairs (hub/test/fixtures/keys/8456a2be, 4619cf0e) plus one key whose not_after has passed.",
+  "keys": [
+    {
+      "kid": "8456a2be",
+      "pub": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA+RhTC8O5R6xO3ywiTi2hslrN7DNlJwnDyuHlsk1I4FE=\n-----END PUBLIC KEY-----\n",
+      "not_after": null
+    },
+    {
+      "kid": "4619cf0e",
+      "pub": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA4v+2CXgmy97w3VZ8XBkmWj43qvVbb56BnkTaeh4Dhkw=\n-----END PUBLIC KEY-----\n",
+      "not_after": null
+    },
+    {
+      "kid": "7401af4e",
+      "pub": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA71ovIQCsQBa709MmO7DhmTgroWo+FjJ2j5HFRXZZwqQ=\n-----END PUBLIC KEY-----\n",
+      "not_after": "2020-01-01T00:00:00Z"
+    }
+  ]
+}

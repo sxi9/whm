@@ -29,6 +29,14 @@ const defaults = {
   pluginDataDir: null,
   pluginHookTimeoutMs: 30_000,
   pluginActivateTimeoutMs: 60_000,
+  // License client (§16.8): the bootstrap hub URL used until a token names its issuer,
+  // the pinned vendor keys, an optional private CA for the hub, and whether the
+  // degraded/feature/capacity gates are enforced (on in production, off for dev/tests).
+  licenseHubUrl: null,
+  licenseKeysFile: null,
+  licenseHubCa: null,
+  licenseEnforce: isProd,
+  licenseCheckinHours: 12,
 };
 
 function readConfigFile() {
@@ -67,6 +75,11 @@ function envOverrides() {
   if (e.WHM_PLUGIN_DATA_DIR) out.pluginDataDir = path.resolve(e.WHM_PLUGIN_DATA_DIR);
   if (e.WHM_PLUGIN_HOOK_TIMEOUT_MS) out.pluginHookTimeoutMs = Number(e.WHM_PLUGIN_HOOK_TIMEOUT_MS);
   if (e.WHM_PLUGIN_ACTIVATE_TIMEOUT_MS) out.pluginActivateTimeoutMs = Number(e.WHM_PLUGIN_ACTIVATE_TIMEOUT_MS);
+  if (e.WHM_LICENSE_HUB_URL) out.licenseHubUrl = e.WHM_LICENSE_HUB_URL;
+  if (e.WHM_LICENSE_KEYS_FILE) out.licenseKeysFile = path.resolve(e.WHM_LICENSE_KEYS_FILE);
+  if (e.WHM_LICENSE_HUB_CA) out.licenseHubCa = path.resolve(e.WHM_LICENSE_HUB_CA);
+  if (e.WHM_LICENSE_ENFORCE) out.licenseEnforce = e.WHM_LICENSE_ENFORCE === 'true';
+  if (e.WHM_LICENSE_CHECKIN_HOURS) out.licenseCheckinHours = Number(e.WHM_LICENSE_CHECKIN_HOURS);
   return out;
 }
 

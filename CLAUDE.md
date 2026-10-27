@@ -200,6 +200,14 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   Functions honours `ensureZoneForDomain({ nameservers })`, dead LEGACY registry rows removed. Core follow-ups done
   by hand: dead `sys.resolvers.set` op removed (networking-setup owns `resolver.*`), contracts doc
   §11–21, two load-sensitive tests made robust. Next: plugin host (core), then wave 3.
+- **2026-10-27 03:25: Phase 5 round 1 done** — `plugins/SDK.md` (developer reference against the real host),
+  `plugins/sdk/pack.js` (deterministic tar + sign/verify, parity-tested against `services/plugins.js`),
+  `scripts/build-plugin.js`, the sample plugin `plugins/sample-plugin` (`net.whm.sample-notes`, node:test, signed
+  fixture) and the **automated-backup plugin** as a fourth bundled plugin `plugins/bundled/net.whm.automated-backup`
+  (schedule/scope/retention/destinations/locks/run history/restore with confirm token) — unit passed both reviewers.
+  `hub/` workspace (`@whm/hub`): `hub/license` built (64 files, node:test suite, `hub/shared/*` helpers) with 3
+  reviewer findings left (check-in error path, app.js:55 auth seam, token test) for the Phase-5 fix round. Round 2
+  (hub/marketplace + panel license client) running; round 3 (hub/ui + panel marketplace client) follows.
 - **2026-10-27 00:03: Phase 2 wave 3 landed** — Clusters, Themes, Market, cPanel, Support, Plugins (16
   functions; migrations 025–030; `ctx.clusters/themes/market/cpanel/support/bundledPlugins`). The Plugins
   category's three functions are bundled SDK plugins under `plugins/bundled/<id>/` installed through

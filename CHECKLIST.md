@@ -8,7 +8,7 @@
 
 ## Current state
 
-- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-27 01:45 UTC
+- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-27 03:35 UTC
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
 - **Tests:** server 93/93, agent 42/42 passing (`npm test`). Shared API test helper: `server/test/support/app.js`.
@@ -47,7 +47,7 @@ a fix round ~15 min; most categories need one fix round.
 | Integrate wave 3 (suites 1046/451/30 green, build, boot, e2e; core: theme hook, public branding mounts, buffer-safe audit, core-owned event bus) → **all 212 functions built** | done | 25 min | 00:30 (27th) |
 | Wave-3 fix round (10 open findings + critic gaps; 8 categories incl. dns-functions and account-information follow-ups) | done — 0 open per category; integrator closed the core items (release-feed integrity fields, package theme validation, seed cleanup, core-only event bus, bundled-plugin tests in `npm test`) | 1 h 20 min (+ 1 h container restart) | 01:35 (27th) |
 | **P5** — marketplace design (`docs/design/marketplace.md`, 683 lines, + six-unit build plan; two critique passes, 26 findings resolved) | done | 55 min | 01:40 (27th) |
-| **P5 build** — license server (`hub/license`), marketplace (`hub/marketplace`, open dev registration with backend verification), hub UI, panel license + marketplace clients, `plugins/SDK.md`, sample plugin, automated-backup plugin — 3 rounds × 2 units, each verified (`wf_c7084ffb-2df`) | running since 01:42 | ~5.5 h | ~07:15 (27th) |
+| **P5 build** — license server (`hub/license`), marketplace (`hub/marketplace`, open dev registration with backend verification), hub UI, panel license + marketplace clients, `plugins/SDK.md`, sample plugin, automated-backup plugin — 3 rounds × 2 units, each verified (`wf_c7084ffb-2df`) | running since 01:42 — round 1 done 03:25 (SDK/plugins unit passed both reviewers; license server built, 3 findings carried); round 2 (marketplace + panel license client) building | ~5.5 h | ~07:15 (27th) |
 | Integrate Phase 5 (integrator checklist: BLUEPRINT §16–18, workspaces, deploy unit + install.sh --with-hub, contacts events, README, CHECKLIST) + fix round | pending | ~2 h | ~09:15 (27th) |
 | **P6** — hardening pass, full e2e on a provisioned VM, Security Advisor rules (incl. the Oct-2026 PHP advisory check), final docs, performance | pending | ~2.5 h | ~11:45 (27th) |
 | **Total remaining** | | **~10 h wall-clock** (from 01:45 on the 27th) | |
@@ -79,13 +79,13 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 
 - [x] License server design (saved: `docs/design/license-server.md`; to be integrated as BLUEPRINT §16)
 - [x] Plugin SDK reference code: `plugins/sdk/` — mock host with permission gate, manifest validator + constants, JSON Schema, semver/cron helpers, errors, 56 passing tests
-- [ ] `plugins/SDK.md` — binding plugin contract document (BLUEPRINT §17)
-- [ ] Plugin marketplace design (BLUEPRINT §18): open developer registration → backend verification queue → submission → automated scan → human review → marketplace signing → publish/revoke; catalog API; panel integration
-- [ ] `plugins/sample-plugin/` — canonical template exercising every extension point, with tests
-- [ ] `plugins/automated-backup/` — cron schedule, scope, per-account locks, destinations, checksum verify, daily/weekly/monthly retention, restore, notifications, with tests
-- [ ] Panel: `server/src/services/plugins.js` (plugin host), `license.js`, `marketplace-client.js`
-- [ ] `hub/license/` and `hub/marketplace/` services
-- Paused orchestration run to resume from: `wf_7104d0c5-441` (see CLAUDE.md → Resume notes)
+- [x] `plugins/SDK.md` — binding plugin contract document (BLUEPRINT §17) *(written against the real host; Phase-5 round 1)*
+- [x] Plugin marketplace design (BLUEPRINT §18; `docs/design/marketplace.md`, 683 lines, two critique passes): open developer registration → backend verification queue → submission → automated scan → human review → marketplace signing → publish/revoke; catalog API; panel integration
+- [x] `plugins/sample-plugin/` (`net.whm.sample-notes`) — canonical template exercising every extension point, node:test suite, signed `.whmplugin` fixture
+- [x] `plugins/bundled/net.whm.automated-backup/` (fourth bundled plugin) — cron schedule, scope, per-account locks, destinations, checksum verify, daily/weekly/monthly retention, restore, notifications, with tests
+- [~] Panel: `server/src/services/plugins.js` (plugin host — done, merged 10-26 20:55), `license.js` (round 2, building), `marketplace-client.js` (round 3)
+- [~] `hub/license/` (built in round 1, 64 files; 3 reviewer findings carried to the Phase-5 fix round) and `hub/marketplace/` (round 2, building); `hub/ui/` (round 3)
+- `plugins/sdk/pack.js` + `scripts/build-plugin.js` — pack/sign/verify `.whmplugin` packages (parity-tested against the host) — done (round 1)
 
 ## Functions — all 30 categories (212)
 

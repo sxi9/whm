@@ -1,0 +1,15 @@
+{
+  "_comment": "Vendor LICENSE signing public keys (Ed25519 SPKI PEM) pinned at build time; replace with the output of hub/scripts/gen-key.js --license before a release. These placeholders have no private half and can never sign a token. Hub responses are verified only against this set (or WHM_LICENSE_KEYS_FILE).",
+  "keys": [
+    {
+      "kid": "c9309da2",
+      "pub": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAA2dkLdxKEGO34536jYXaABgYtC96tUyIfpRlALIVq3k=\n-----END PUBLIC KEY-----\n",
+      "not_after": null
+    },
+    {
+      "kid": "c8e50311",
+      "pub": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAq9m6qp4czaYxckxjG6jOHd0f/i/KiuRWADAfEPa71rc=\n-----END PUBLIC KEY-----\n",
+      "not_after": null
+    }
+  ]
+}

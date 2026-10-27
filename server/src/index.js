@@ -21,6 +21,7 @@ import { createPackagesService } from './services/packages.js';
 import { createAccountsService } from './services/accounts.js';
 import { createAuditService } from './services/audit.js';
 import { createPluginHost } from './services/plugins.js';
+import { createLicenseService } from './services/license.js';
 import { createApp } from './app.js';
 
 const require = createRequire(import.meta.url);
@@ -49,6 +50,8 @@ export async function bootstrap(overrides = {}) {
   ctx.serviceManager = createServiceManager(ctx);
   ctx.audit = createAuditService(ctx);
   ctx.plugins = createPluginHost(ctx);
+  ctx.license = createLicenseService(ctx);
+  await ctx.license.boot();
   ctx.app = await createApp(ctx);
   if (overrides.loadPlugins !== false) await ctx.plugins.loadAll();
 

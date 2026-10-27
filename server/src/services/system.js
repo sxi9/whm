@@ -42,7 +42,7 @@ export function createSystemService(ctx) {
         counts: Object.fromEntries(Object.entries(counts).map(([k, s]) => [k, s.get().n])),
         capabilities: Object.fromEntries(Object.entries(snapshot.capabilities).map(([k, v]) => [k, v.installed])),
         services: await serviceSummary(),
-        license: { status: 'unlicensed', edition: null },
+        license: ctx.license?.summary?.() ?? { status: 'unlicensed', edition: null },
         // Server Profile (Server Configuration) decides which categories the shell shows.
         profile: ctx.serverConfig?.profile?.summary?.() ?? { name: 'standard', label: 'Standard Node', hiddenCategories: [], services: null },
       };

@@ -7,6 +7,8 @@ import { authRoutes } from './auth.js';
 import { systemRoutes } from './system.js';
 import { accountRoutes, packageRoutes } from './accounts.js';
 import { pluginRoutes } from './plugins.js';
+import { licenseRoutes } from './license.js';
+import { licenseGate } from '../middleware/license.js';
 
 const categoriesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'categories');
 
@@ -36,6 +38,9 @@ export async function apiRouter(ctx) {
   for (const mount of mounts.filter((m) => m.public)) api.use(mount.path, mount.router);
 
   api.use(requireAuth);
+  // The license routes sit before the gate so a degraded panel can always be re-licensed.
+  api.use('/license', licenseRoutes(ctx));
+  api.use(licenseGate(ctx));
   api.use('/system', systemRoutes(ctx));
   api.use('/accounts', accountRoutes(ctx));
   api.use('/packages', packageRoutes(ctx));

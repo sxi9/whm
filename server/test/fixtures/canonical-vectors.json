@@ -1,0 +1,18 @@
+{
+  "description": "Golden JCS (RFC 8785 subset) vectors shared by hub/shared/canonical.js and server/src/lib/canonical.js. `canonical` is the exact UTF-8 string canonicalize(value) must produce.",
+  "vectors": [
+    { "name": "empty object", "value": {}, "canonical": "{}" },
+    { "name": "empty array", "value": [], "canonical": "[]" },
+    { "name": "scalars", "value": [true, false, null, 0, -1, 1234567890], "canonical": "[true,false,null,0,-1,1234567890]" },
+    { "name": "key order is UTF-16 code unit order", "value": { "b": 1, "a": 2, "B": 3, "aa": 4, "_": 5, "10": 6, "9": 7 }, "canonical": "{\"10\":6,\"9\":7,\"B\":3,\"_\":5,\"a\":2,\"aa\":4,\"b\":1}" },
+    { "name": "surrogate pairs sort before U+FFFF", "value": { "￿": 1, "😀": 2, "é": 3 }, "canonical": "{\"é\":3,\"😀\":2,\"￿\":1}" },
+    { "name": "nested", "value": { "z": { "y": [1, { "x": null }] }, "a": [] }, "canonical": "{\"a\":[],\"z\":{\"y\":[1,{\"x\":null}]}}" },
+    { "name": "string escapes", "value": { "s": "quote\" backslash\\ nl\n cr\r tab\t bs\b ff\f ctl\u0001 del\u007f é 😀 </" }, "canonical": "{\"s\":\"quote\\\" backslash\\\\ nl\\n cr\\r tab\\t bs\\b ff\\f ctl\\u0001 del\u007f é 😀 </\"}" },
+    { "name": "no whitespace", "value": { "k": [1, 2, 3], "m": { "n": "v" } }, "canonical": "{\"k\":[1,2,3],\"m\":{\"n\":\"v\"}}" },
+    { "name": "max safe integer", "value": { "n": 9007199254740991, "m": -9007199254740991 }, "canonical": "{\"m\":-9007199254740991,\"n\":9007199254740991}" },
+    { "name": "token payload", "value": { "v": 1, "iss": "https://license.vendor.example", "kid": "a91f3c2e", "lid": "lic_01J9ZQ8X", "aid": "act_01JA02KQ", "cid": "cus_01J9ZP11", "ed": "pro", "rank": 30, "lim": { "max_accounts": -1, "max_resellers": 5, "max_activations": 1, "max_domains_per_account": -1 }, "feat": { "api": true, "transfers": true, "marketplace_paid": true, "clusters": false, "white_label": false }, "fp": "sha256:4f1b", "iat": 1761350400, "nbf": 1761350100, "exp": 1761955200, "lexp": 1792886400, "grace": 7, "nonce": "n_7c0b4d", "status": "active" }, "canonical": "{\"aid\":\"act_01JA02KQ\",\"cid\":\"cus_01J9ZP11\",\"ed\":\"pro\",\"exp\":1761955200,\"feat\":{\"api\":true,\"clusters\":false,\"marketplace_paid\":true,\"transfers\":true,\"white_label\":false},\"fp\":\"sha256:4f1b\",\"grace\":7,\"iat\":1761350400,\"iss\":\"https://license.vendor.example\",\"kid\":\"a91f3c2e\",\"lexp\":1792886400,\"lid\":\"lic_01J9ZQ8X\",\"lim\":{\"max_accounts\":-1,\"max_activations\":1,\"max_domains_per_account\":-1,\"max_resellers\":5},\"nbf\":1761350100,\"nonce\":\"n_7c0b4d\",\"rank\":30,\"status\":\"active\",\"v\":1}" },
+    { "name": "signed response envelope", "value": { "data": { "token": "WHMT1.x.y", "messages": [] }, "meta": { "nonce": "n_abc" } }, "canonical": "{\"data\":{\"messages\":[],\"token\":\"WHMT1.x.y\"},\"meta\":{\"nonce\":\"n_abc\"}}" },
+    { "name": "null lexp", "value": { "lexp": null, "exp": 1 }, "canonical": "{\"exp\":1,\"lexp\":null}" }
+  ],
+  "invalid": ["float", "nan", "infinity", "undefined", "unsafe integer", "buffer", "function", "bigint"]
+}

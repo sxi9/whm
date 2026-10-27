@@ -198,6 +198,7 @@ export function createAccountsService(ctx) {
       if (RESERVED.has(username)) throw badRequest(`"${username}" is a reserved username`);
       if (stmts.byUsername.get(username)) throw conflict(`An account named "${username}" already exists`);
       if (stmts.byDomain.get(input.domain)) throw conflict(`The domain "${input.domain}" is already hosted on this server`);
+      ctx.license?.assertCapacity?.('accounts');
       const pkgName = input.package || settings.get('basic.default_package');
       const pkgRow = stmts.packageByName.get(pkgName);
       if (!pkgRow) throw notFound(`Package "${pkgName}"`);
