@@ -4,7 +4,7 @@ For any AI or engineer taking over. Everything stated here is on the branch
 `claude/trusting-cori-ifp7wy` of `github.com/sxi9/whm`; this file is updated at every milestone
 together with `CHECKLIST.md` (tracker) and `CLAUDE.md` (conventions + memory). Read those two next.
 
-**Last updated:** 2026-10-27 07:15 UTC · head `c2fa8a6` · checklist 231 done / 3 partial / 2 open
+**Last updated:** 2026-10-27 07:45 UTC · head `e49e500`+ · checklist 232 done / 2 partial / 2 open
 
 ## 1. What this is
 
@@ -27,8 +27,9 @@ license + marketplace service with its own React portals (`hub/ui`).
 | Core plugin host (`server/src/services/plugins.js`) | done, `16286ee` | 31 host tests + 7 tar tests |
 | Phase 5 build (hub/license, hub/marketplace, hub/ui, panel license + marketplace clients, SDK.md, sample + automated-backup plugins) | done, landed `76483ef` | green gate: server 1135 / agent 462 / client 48 / hub 177 / hub-ui 97 + SDK + 5 plugin suites; both builds; boot; Playwright |
 | Phase 5 docs/deploy (BLUEPRINT §16–18, `deploy/whm-hub.service`, `deploy/hub.conf.example`, `scripts/install.sh --with-hub`, README hub section) | done, `0be6f9c` | `bash -n`, hub `--check-config` |
-| **Phase 5 fix round** (8 carried findings, list in §4) | **running** (started 06:55 UTC) | — |
-| Live hub + panel end-to-end flow, Phase-5 flow screenshots | pending | — |
+| Phase 5 fix round (8 carried findings) | done, landed `e49e500` | gate: server 1135 / agent 462 / client 48 / hub 181 / hub-ui 105 + SDK + plugins |
+| Live hub + panel end-to-end flow, Phase-5 flow screenshots | **running** (07:45) | — |
+| Install guide + user manual (`docs/INSTALL.md`, `docs/MANUAL.md`) | **running** (07:40) | — |
 | Phase 6 hardening | pending | — |
 
 Screenshots of every page (labelled, all 212 live) are under `docs/screenshots/` (last refresh
@@ -59,22 +60,9 @@ page degrades to an install prompt — that is by design), Playwright + Chromium
 
 ## 4. What is left, in order
 
-1. **Finish the Phase-5 fix round** (if you are not the session that launched it, re-run the items
-   by hand — they are small):
-   - hub check-in `409 fingerprint_mismatch` with a fractional `drift` is sent **unsigned**
-     (`hub/shared/canonical.js` rejects non-integers → `signResponse` throws → `hub/src/app.js:55`
-     logs and sends unsigned). Carry drift as an integer; make the signed wrapper fail closed (500).
-   - `hub/test/token.test.js:59` tamper test is non-deterministic (tampers the last 2 base64url
-     chars). Flip a middle byte instead.
-   - `hub/ui` admin Dashboard/Reports read `r.n`; the service returns `{ edition, active }` /
-     `{ day, created }`.
-   - Mount `POST /v1/reseller/market/entitlements` (service `billing.resellerGrant` exists);
-     add `GET /v1/reseller/products`; add `GET /v1/admin/market/payouts/:id`; add
-     `POST /v1/admin/resellers/:id/impersonate` (§16.9); one interaction test per hub/ui queue.
-   - Host page descriptors: provenance key `source` clashes with a page's data `source`; rename to
-     `origin` in `services/plugins.js`, `plugins/sdk/mock-host.js`, `PluginPage.jsx`, `plugins/SDK.md`
-     §5.11, and drop the workarounds in `plugins/sample-plugin` and `plugins/bundled/*`.
-   Then: `npm test`, commit `fix(phase5): …`, push.
+1. ~~Phase-5 fix round~~ — done (`e49e500`): signed fail-closed hub errors, deterministic token test,
+   hub/ui dashboard fields, reseller entitlement/products routes, payouts statement, admin impersonation,
+   hub/ui interaction tests, page-descriptor `origin` key.
 2. **Live hub + panel flow** (never run yet — the first time both talk): start the hub with test
    keys on :7443, point the panel at it with the hub's license public key in `WHM_LICENSE_KEYS_FILE`,
    activate a trial from *Basic WebHost Manager Setup → License*, enable the `whm-hub` provider in

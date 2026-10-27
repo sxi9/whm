@@ -8,7 +8,7 @@
 
 ## Current state
 
-- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-27 07:10 UTC
+- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-27 07:45 UTC
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
 - **Tests (06:50 on the 27th):** server 1135 / agent 462 / client 48 / hub 177 / hub-ui 97 / SDK 73 / sample plugin 13 / bundled plugins ×4 — all green (`npm test` runs every workspace, the SDK, the sample plugin and the bundled plugins); both builds (client, hub/ui), boot and Playwright pass.
@@ -49,9 +49,10 @@ a fix round ~15 min; most categories need one fix round.
 | **P5** — marketplace design (`docs/design/marketplace.md`, 683 lines, + six-unit build plan; two critique passes, 26 findings resolved) | done | 55 min | 01:40 (27th) |
 | **P5 build** — license server (`hub/license`), marketplace (`hub/marketplace`, open dev registration with backend verification), hub UI, panel license + marketplace clients, `plugins/SDK.md`, sample plugin, automated-backup plugin — 3 rounds × 2 units, each verified (`wf_c7084ffb-2df`) | done — 6 units, 49 agent runs, 0 errors; critic: nothing blocking at the seams | 5 h | 06:45 (27th) |
 | Integrate Phase 5 — docs/deploy half 05:40 (`0be6f9c`); code half (workspaces + scripts, Security Advisor integrity finding, hub ui_dist, errata); green gate: server 1135 / agent 462 / client 48 / hub 177 / hub-ui 97 + SDK + sample + 4 bundled plugins, both builds, boot, e2e | done | 1 h | 06:50 (27th) |
-| Phase-5 fix round (`wf_8f6db955-2a6`: unsigned fingerprint_mismatch answer, flaky token test, hub/ui dashboard fields, reseller entitlement + products routes, payouts statement, impersonation, hub/ui interaction tests, page-source label clash) | running since 06:55 | ~1 h | ~08:00 (27th) |
-| Live hub + panel end-to-end flow (trial → whm-hub provider → install sample-notes through consent → revoke → banner), e2e steps for License/Marketplace, screenshots, tracker | pending | ~45 min | ~08:45 (27th) |
-| **P6** — hardening pass (dependency audit, agent op sweep, rate-limit/CSRF/headers review), Security Advisor rules (incl. the Oct-2026 PHP advisory check), e2e against a provisioned host where available, final docs, performance pass | pending | ~2.5 h | ~11:15 (27th) |
+| Phase-5 fix round (`wf_8f6db955-2a6`: signed fail-closed hub errors, deterministic token test, hub/ui dashboard fields, reseller entitlement + products routes, payouts statement, admin impersonation, hub/ui interaction tests, page-descriptor `origin`) | done — 0 open; landed `e49e500`; gate server 1135 / agent 462 / client 48 / hub 181 / hub-ui 105 + SDK + 5 plugin suites, builds, boot | 45 min (+ 20 min container restart) | 07:40 (27th) |
+| Live hub + panel end-to-end flow (trial → whm-hub provider → install sample-notes through consent → revoke → banner), e2e steps for License/Marketplace, screenshots, tracker | running since 07:45 | ~45 min | ~08:30 (27th) |
+| Install guide + user manual (`docs/INSTALL.md`, `docs/MANUAL.md`: every flag/env var, all 212 functions, hub portals, plugins, licensing, troubleshooting; accuracy-reviewed) — user ask 07:40 | running since 07:40 | ~1 h | ~08:45 (27th) |
+| **P6** — hardening pass (dependency audit, agent op sweep, rate-limit/CSRF/headers review), Security Advisor rules (incl. the Oct-2026 PHP advisory check), e2e against a provisioned host where available, final docs, performance pass | pending | ~2.5 h | ~11:30 (27th) |
 | **Total remaining** | | **~4.5 h wall-clock** (from 06:55 on the 27th) | |
 
 Faster option: verification can be cut to one reviewer and one fix round per category
@@ -86,7 +87,7 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [x] `plugins/sample-plugin/` (`net.whm.sample-notes`) — canonical template exercising every extension point, node:test suite, signed `.whmplugin` fixture
 - [x] `plugins/bundled/net.whm.automated-backup/` (fourth bundled plugin) — cron schedule, scope, per-account locks, destinations, checksum verify, daily/weekly/monthly retention, restore, notifications, with tests
 - [x] Panel: `server/src/services/plugins.js` (plugin host), `license.js` + `routes/license.js` + migration 031 (offline verify, check-in, grace/degraded, feature gates, License tab, banners), `marketplace-client.js` + migration 032 (Marketplace tab with consent, hub catalog, revocation polling, developer mode)
-- [~] `hub/license/`, `hub/marketplace/` (177 node:test cases) and `hub/ui/` (vendor admin, developer and reseller portals) — built and reviewed; 4 reviewer findings + 3 integration gaps go to the Phase-5 fix round, then the live hub+panel end-to-end flow
+- [x] `hub/license/`, `hub/marketplace/` (181 node:test cases) and `hub/ui/` (105 tests; vendor admin, developer and reseller portals) — built, reviewed, fix round closed (`e49e500`); live hub+panel end-to-end flow in progress
 - `plugins/sdk/pack.js` + `scripts/build-plugin.js` — pack/sign/verify `.whmplugin` packages (parity-tested against the host) — done (round 1)
 
 ## Functions — all 30 categories (212)
