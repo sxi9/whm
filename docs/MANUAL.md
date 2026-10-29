@@ -36,9 +36,9 @@ Companion documents: [`README.md`](../README.md) (install, hub, configuration re
   - [13. Account Information](#13-account-information)
   - [14. Account Functions](#14-account-functions)
   - [15. Multi Account Functions](#15-multi-account-functions)
-- Part B — Categories 16–30 and appendices (Transfers, Themes, Packages, DNS Functions,
+- Part B — Categories 16–31 and appendices (Transfers, Themes, Packages, DNS Functions,
   Database Services, IP Functions, Software, Email, System Health, cPanel, SSL/TLS, Market,
-  Restart Services, Development, Plugins; licensing, marketplace, developer, hub-portal and
+  Restart Services, Development, Plugins, Application Manager; licensing, marketplace, developer, hub-portal and
   troubleshooting appendices): [MANUAL-partB.md](MANUAL-partB.md).
 
 ---
@@ -1424,4 +1424,4 @@ applied to the Linux user (quota, shell) and PHP-FPM pools where a package names
 
 ---
 
-The manual continues with categories 16–30 and the appendices in [MANUAL-partB.md](MANUAL-partB.md).
+The manual continues with categories 16–31 and the appendices in [MANUAL-partB.md](MANUAL-partB.md).

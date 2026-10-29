@@ -59,7 +59,7 @@ Related documents: [`README.md`](../README.md) (overview), [`BLUEPRINT.md`](../B
 
 | Component | Code | Runs as | What it is |
 |---|---|---|---|
-| **Panel** (`whm-panel`) | `server/` (Express API, services, SQLite) + `client/` (React SPA built to `client/dist`) | `whmpanel` (unprivileged) in production | The WHM web interface and its API: 30 categories, 212 functions, sessions, RBAC, audit log, jobs, scheduler, plugin host, license client and marketplace client. Keeps its own state in `whm.db` (SQLite, WAL) under the data directory. |
+| **Panel** (`whm-panel`) | `server/` (Express API, services, SQLite) + `client/` (React SPA built to `client/dist`) | `whmpanel` (unprivileged) in production | The WHM web interface and its API: 31 categories, 215 functions (212 WHM functions + Application Manager), sessions, RBAC, audit log, jobs, scheduler, plugin host, license client and marketplace client. Keeps its own state in `whm.db` (SQLite, WAL) under the data directory. |
 | **Agent** (`whm-agentd`) | `agent/` | root | A small daemon listening on a Unix socket (`/run/whm-agent.sock`) that executes an **allowlisted catalog of named operations** (create a Linux user, write a vhost, reload BIND, …). It only ever runs programs with `execFile(bin, argv[])`; there is deliberately no "run this command" op. |
 | **Hub** (`whm-hub`, optional) | `hub/` (API) + `hub/ui/` (vendor-admin, reseller and developer portal) | `whmhub` | The **license server** (keys, activations, check-ins, trials, resellers, billing webhooks) and the **plugin marketplace** (developer verification, signed packages, catalog, revocations, entitlements). Only a vendor who resells the panel runs one; panels only *pull* from it, so a hub outage never affects a running panel. |
 

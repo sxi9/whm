@@ -790,6 +790,18 @@ Each is an **ActionPage** that restarts the unit via `svc.restart` and streams o
   adds scopes is held `pending_consent` with the plugin disabled; revocations from the hub disable the plugin
   and raise a banner; sideloading (`upload`/`path`/`dir`) needs `plugins.developer_mode` once the hub is enabled.
 
+### 31. Application Manager *(our addition, 2026-10-29 — not a WHM function; design: `docs/design/application-manager.md`)*
+- **Application Manager** — Node.js, Python and built-frontend (React, Angular, Vue, Svelte, static) applications
+  per domain and base path: register (upload, git clone or scaffold), install dependencies and build as the account
+  user, run as a per-app systemd unit (`whm-app-<id>`, `User=<account>`, `127.0.0.1:<port>`, memory/task/CPU limits,
+  hardening), publish through the account's Apache vhost via `IncludeOptional <apache root>/whm-apps/<domain>.conf`
+  (ProxyPass with websockets, or DocumentRoot/Alias + SPA fallback for static builds), logs, env vars, start/stop/
+  restart/rebuild/deploy, remove. Service `ctx.apps`; agent family `app.*`; migration 033; API `/api/apps/*`.
+- **Runtime Versions** — system and managed Node.js (`/opt/whm/runtimes/node/<version>`, official tarballs verified
+  against `SHASUMS256.txt`), Python interpreters with venv support, git; defaults.
+- **Application Templates** — built-in framework presets (Express, NestJS, Next.js, Nuxt, React/Vite, CRA, Angular,
+  Vue, Svelte, Flask, Django, FastAPI, static files) plus root-defined custom templates.
+
 > Every function above has: a sidebar entry (from `nav.js`), a React page, a route, an
 > API endpoint, a service method, and — where it changes the system — an allowlisted
 > agent op. The capability layer makes each one behave correctly whether the underlying

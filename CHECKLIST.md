@@ -91,7 +91,7 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [x] `hub/license/`, `hub/marketplace/` (181 node:test cases) and `hub/ui/` (105 tests; vendor admin, developer and reseller portals) — built, reviewed, fix round closed (`e49e500`); live hub+panel end-to-end flow in progress
 - `plugins/sdk/pack.js` + `scripts/build-plugin.js` — pack/sign/verify `.whmplugin` packages (parity-tested against the host) — done (round 1)
 
-## Functions — all 30 categories (212)
+## Functions — all 31 categories (215)
 
 ### 1. Server Configuration
 - [x] Basic WebHost Manager Setup
@@ -364,6 +364,11 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [x] ImunifyAV
 - [x] Server Monitoring
 - [x] WP Toolkit
+
+### 31. Application Manager *(our addition — user ask 2026-10-29: Node.js, Python, React/Angular… app hosting)*
+- [ ] Application Manager
+- [ ] Runtime Versions
+- [ ] Application Templates
 
 ## Cross-cutting
 

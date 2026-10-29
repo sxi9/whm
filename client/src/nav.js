@@ -1,4 +1,4 @@
-// Single source of truth for the WHM navigation: 30 categories, 212 functions.
+// Single source of truth for the WHM navigation: 31 categories, 215 functions.
 // The sidebar, the Tools grid, the router and the function registry are all
 // derived from this file — never add a route anywhere else.
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates every screenshot in docs/screenshots (flow shots + all 212 pages) with
+# Regenerates every screenshot in docs/screenshots (flow shots + every function page) with
 # label bars, and the gallery READMEs. Needs a running panel serving the built client.
 #
 #   BASE=http://127.0.0.1:2086 PASSWORD='<root password>' bash e2e/screenshots.sh

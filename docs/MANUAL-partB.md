@@ -20,6 +20,7 @@ is [MANUAL.md](MANUAL.md); installation is covered in [INSTALL.md](INSTALL.md).
 - [28. Restart Services](#28-restart-services)
 - [29. Development](#29-development)
 - [30. Plugins](#30-plugins)
+- [31. Application Manager](#31-application-manager)
 - [Appendix A. Licensing from the panel](#appendix-a-licensing-from-the-panel)
 - [Appendix B. Plugins and the Marketplace](#appendix-b-plugins-and-the-marketplace)
 - [Appendix C. For plugin developers](#appendix-c-for-plugin-developers)
@@ -1161,6 +1162,64 @@ reachable from *cPanel › Manage Plugins*.
   recorded as a run warning.
 
 ---
+
+## 31. Application Manager
+
+Sidebar category 31 — an addition of this panel, not a WHM function. It hosts **Node.js**, **Python** and
+**built frontend** applications (React, Angular, Vue, Svelte, static exports) next to the PHP sites of an
+account, without Passenger: each Node/Python app runs as its own systemd unit **as the account user** on
+`127.0.0.1:<port>`, and the account's Apache virtual host publishes it (reverse proxy with websockets) or
+serves the built frontend directly (SPA fallback). NGINX in front of Apache passes everything through.
+Design and API contract: `docs/design/application-manager.md`.
+
+#### 31.1 Application Manager
+
+- **Purpose:** register, deploy, build, run and remove applications per domain and base path.
+- **Who:** root (all accounts) and resellers (their own accounts; `apps.allow_resellers`).
+- **Screen:** the applications table (name, kind, account, URL, runtime, status with the live unit state, port;
+  actions *Open*, *Logs*, *Start/Stop/Restart*, *Rebuild*, *Deploy* (git sources), *Edit*, *Remove*) and
+  *Create application*, a three-step dialog: **Where** (account → one of its domains, base path such as `/` or
+  `/api`, application root inside the home — *Inspect* reads `package.json`/`requirements.txt`/`angular.json`
+  as the user and guesses the preset), **What** (kind and preset, start/build fields prefilled from the preset,
+  runtime version, source: files already uploaded, a `https://` git repository and branch, or a starter
+  scaffold for Express/Flask/FastAPI/static), **Settings** (development/production, environment variables,
+  websockets, SPA fallback, memory/task/CPU limits). Submitting queues the deploy job whose log streams into the
+  page; the app detail shows status, journal lines, environment editor, source and the last error.
+- **Server:** the deploy job runs `app.prepare` (mkdir / `git clone` / scaffold, all as the user), `app.step`
+  (`npm ci`/`npm install`, `npm run <build>`, `python -m venv`, `pip install -r requirements.txt` [+ gunicorn/
+  uvicorn]), `app.unit.write` (unit `/etc/whm/apps/whm-app-<id>.service` + root-only env file, `systemctl
+  enable`), `app.proxy.write` (`<apache root>/whm-apps/<domain>.conf`, configtest with rollback, modules
+  `proxy proxy_http proxy_wstunnel headers rewrite` on Debian), `app.static.expose` (ACL or mode bits so the
+  web server can read a built frontend), then `svc.start`. Logs come from `journalctl -u whm-app-<id>`.
+  Everything that touches the account tree runs through `runuser -u <account>`; root never creates, removes
+  or follows anything inside a home. Ports come from `apps.port_range` (default 30000–39999).
+- **Needs:** Apache (`web.vhost.*`), systemd, Node.js (system or managed) for Node/static apps, `python3` with
+  `venv` for Python apps, `git` for git sources. Missing pieces show the usual install prompt.
+- **Status values:** `created` → `deploying` → `running` / `built` (static) / `stopped` / `failed` (with the
+  last error on the row).
+
+#### 31.2 Runtime Versions
+
+- **Purpose:** which Node.js and Python runtimes applications may use.
+- **Who:** root (resellers read).
+- **Screen:** *Node.js* (system `node` plus managed versions under `/opt/whm/runtimes/node/<version>`, the
+  apps using each, default, *Remove*; *Install a version* from the LTS/current list fetched from nodejs.org
+  or a typed version — a job downloads the official tarball, verifies it against `SHASUMS256.txt` and unpacks it
+  root-owned), *Python* (detected interpreters, venv support, an install hint for `python3-venv`/`python3-pip`
+  through *Install Distro Packages*), *git*, and the defaults form.
+- **Server:** `app.runtime.detect`, `app.runtime.node.install` (curl → sha256sum → tar, into a private
+  temporary directory, refuses an existing version or a checksum mismatch), `app.runtime.node.remove`
+  (refused while an app uses it).
+
+#### 31.3 Application Templates
+
+- **Purpose:** the framework presets behind *Create application* and custom templates.
+- **Who:** root (resellers read).
+- **Screen:** built-in preset cards (kind, install/build/start, output directory, websockets, SPA fallback) and
+  the custom templates table (name, slug, kind, preset fields) with create/edit/delete; *Use template* opens
+  the create dialog with the preset selected.
+- **Server:** built-ins live in code (`PRESETS`), custom ones in `app_templates`; `GET /api/apps/presets`
+  serves both.
 
 ## Appendix A. Licensing from the panel
 

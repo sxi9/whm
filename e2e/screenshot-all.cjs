@@ -136,7 +136,7 @@ function grid(items, perRow = 3) {
   // Top-level gallery: the flow screenshots inline + link to every page.
   const flow = FLOW_SHOTS.filter(([file]) => fs.existsSync(path.join(OUT, file))).map(([file, label]) => [file, label, null]);
   const topReadme = ['# Screenshots', '', `Updated ${DATE} at commit \`${SHA}\`. All images are captured automatically (Playwright) against the built interface served by the API, and each carries a label bar naming the screen, whether it is live or a placeholder, the date and the commit. They are regenerated at every milestone (\`e2e/screenshots.sh\`).`, '',
-    `- **[Every page →](pages/README.md)** — all 212 function pages grouped by category (${live}/${count} live) plus core pages.`, '', '## Flow', '', 'Login → dashboard → creating an account through the form → lists, status pages, configuration and search.', '', grid(flow, 2), '',
+    `- **[Every page →](pages/README.md)** — all ${count} function pages grouped by category (${live}/${count} live) plus core pages.`, '', '## Flow', '', 'Login → dashboard → creating an account through the form → lists, status pages, configuration and search.', '', grid(flow, 2), '',
     '## Regenerate', '', '```bash', "BASE=http://127.0.0.1:2086 PASSWORD='<root password>' bash e2e/screenshots.sh   # flow shots + every page + galleries", '```', ''];
   fs.writeFileSync(path.join(OUT, 'README.md'), topReadme.join('\n'));
 

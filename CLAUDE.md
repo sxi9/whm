@@ -12,7 +12,7 @@ A production-grade, self-hostable **WHM (WebHost Manager) clone** — the cPanel
 panel — that administers a **real Linux server**: Linux users and quotas, Apache/NGINX
 vhosts and PHP-FPM, BIND DNS, Exim/Dovecot mail, MySQL/MariaDB, FTP, SSL/ACME, systemd
 services, IPs, firewall, backups, transfers, resellers. It reproduces the entire WHM
-interface (`trywhm.net`): **30 sidebar categories, 212 functions**, plus the home
+interface (`trywhm.net`): **30 sidebar categories, 212 functions**, plus the home dashboard, plus our own 31st category **Application Manager** (3 functions: Node.js/Python/static-frontend apps, runtime versions, templates — 215 functions in total); it also serves the home
 dashboard. It will also be **resold**: a license server, a plugin marketplace with
 verified developers, and bundled plugins are part of the product (deferred to Phase 5).
 
@@ -125,7 +125,7 @@ Never edit `CHECKLIST.md`, `nav.js`, `registry.js`, `routes/index.js`, `ops/inde
   `ctx.serviceManager`, `ctx.auth`, `ctx.settings`, `ctx.jobs`, `ctx.scheduler`,
   `ctx.capabilities`; wave 2: `ctx.accountFunctions`, `ctx.accountInfo`, `ctx.multiAccount`,
   `ctx.resellers`, `ctx.backup`, `ctx.transfers`, `ctx.serverStatus`, `ctx.systemHealth`,
-  `ctx.serverConfig`, `ctx.networking`, `ctx.contacts`, `ctx.systemReboot`. Reference lazily inside
+  `ctx.serverConfig`, `ctx.networking`, `ctx.contacts`, `ctx.systemReboot`; 2026-10-29: `ctx.apps` (Application Manager). Reference lazily inside
   methods; tolerate absence. Hooks core relies on: `resellers.assertAcl/createPolicy/modifyPolicy/
   nameserversFor`, `accountFunctions.mountpointFor/renderTemplate/runBandwidthEnforce/resetBandwidth`,
   `serverConfig.profile.summary()`, `contacts.notify(event, payload)` / `contacts.sendMail(...)`.

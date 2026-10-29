@@ -1,7 +1,7 @@
 # WHM — WebHost Manager control panel
 
 A production-grade, self-hostable **WHM-compatible hosting control panel**: the complete
-WHM administrative interface (30 categories, 212 functions) that manages a **real Linux
+WHM administrative interface (31 categories, 215 functions: the 212 WHM functions plus the Application Manager) that manages a **real Linux
 server** — Linux users and quotas, Apache/NGINX and PHP-FPM, BIND DNS, Exim/Dovecot mail,
 MySQL/MariaDB, FTP, SSL/ACME, systemd services, IPs, security, backups, transfers and
 resellers — built on Node.js 22, Express, React and SQLite.
@@ -110,7 +110,7 @@ Full detail: [`BLUEPRINT.md`](BLUEPRINT.md) §4, §8, §10.
 
 ```
 server/   Express API, services, SQLite migrations, tests      agent/    whm-agentd op catalog + executor
-client/   React SPA (nav.js = all 212 functions)               hub/      whm-hub: license server + marketplace + portal UI
+client/   React SPA (nav.js = all 215 functions)               hub/      whm-hub: license server + marketplace + portal UI
 plugins/  SDK.md, sdk/ (validator, mock host, packer), sample-plugin/, bundled/ (4 plugins)
 deploy/   systemd units + config templates (panel, agent, hub)  scripts/  install.sh, whm-cli.js, build-plugin.js
 docs/     saved design sections + build plan                    BLUEPRINT.md · CHECKLIST.md · CLAUDE.md
@@ -346,5 +346,5 @@ master key as `client_secret_enc`. The installer writes `hub.conf` once; `--upgr
 ## Status
 
 See [`CHECKLIST.md`](CHECKLIST.md) for the live function-by-function status and the build
-phases. All 212 functions, the plugin host and the four bundled plugins are built; the hub
+phases. All 212 WHM functions plus the Application Manager category, the plugin host and the four bundled plugins are built; the hub
 (license server + marketplace) and its panel clients are the Phase-5 work tracked there.

@@ -364,3 +364,14 @@ registers `clustering:dns`, `clustering:config` and the legacy `clustering`.
 `own` keyed on `accounts.owner_id`), `ctx.cpanel.upgrade.status()` reads the release only through
 `ctx.software.panel.status()` (which keeps the feed's `sha256`/`signature`/`keyId`); release keys live
 under `/etc/whm/release-keys`. Bundled plugins' node:test suites run from the root `npm test`.
+
+## 33. Application Manager seams (2026-10-29; design `docs/design/application-manager.md`)
+- `web.vhost.write` renders `IncludeOptional "<apache root>/whm-apps/<domain>.conf"` into every VirtualHost block
+  (after the PHP handler, before TLS). **application-manager owns that file** (`app.proxy.write`/`app.proxy.remove`,
+  all apps of a domain in one file); service-configuration never writes it and a vhost re-render never touches it.
+- `ctx.apps.removeAccountApps(username, req)` is called from `accounts.cleanupAccount` before `ctx.web.removeAccount`
+  (units stopped and removed, includes dropped; the home goes with the Linux user).
+- Allowed roots: `/opt/whm/runtimes` (managed Node.js), `/etc/whm/apps` (units + env files, under `/etc/whm`).
+  Everything inside a home runs as the account through `runuser -u <user> --`.
+- App units are `whm-app-<id>` (`svc.status/start/stop/restart/journal` work on them); ports from
+  `apps.port_range`; `apps.allow_resellers` gates reseller mutations.
