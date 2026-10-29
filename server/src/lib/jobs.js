@@ -99,11 +99,14 @@ export function createJobs({ db, logger, agent, concurrency = 2 }) {
       if (!job) throw notFound('Job');
       return { ...job, logs: stmts.logs.all(id) };
     },
-    list({ status, type, limit = 100 } = {}) {
+    // `createdBy` narrows the list in SQL so a principal's own jobs are never
+    // crowded out of the LIMIT window by the scheduler's ownerless ones.
+    list({ status, type, limit = 100, createdBy } = {}) {
       const where = [];
       const params = { limit };
       if (status) { where.push('status = @status'); params.status = status; }
       if (type) { where.push('type = @type'); params.type = type; }
+      if (createdBy != null) { where.push('created_by = @createdBy'); params.createdBy = createdBy; }
       const sql = `SELECT * FROM jobs ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT @limit`;
       return db.prepare(sql).all(params).map(shape);
     },

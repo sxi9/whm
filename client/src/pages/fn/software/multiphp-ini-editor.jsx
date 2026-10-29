@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { api } from '../../../api/client.js';
+import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { useAuth } from '../../../auth/AuthContext.jsx';
 import { PageHeader, Card, StatusPill, Loading } from '../../../components/Common.jsx';
@@ -26,7 +26,11 @@ export default function MultiPhpIniEditor({ fn }) {
   const [saveError, setSaveError] = useState(null);
 
   const versions = useApi('/software/php/versions', { enabled: isRoot });
-  const domains = useApi('/software/php/domains');
+  // The domain list is paged (500 per page); the picker filters server-side so
+  // a server with more domains than one page can still reach every one of them.
+  const [domainFilter, setDomainFilter] = useState('');
+  const domains = useApi(`/software/php/domains${queryString({ q: domainFilter.trim() || undefined, pageSize: 500 })}`);
+  const domainsTruncated = (domains.meta?.total || 0) > (domains.data?.domains?.length || 0);
   const directives = useApi('/software/php/ini/directives');
   const path = scope === 'version' ? (version ? `/software/php/ini/${encodeURIComponent(version)}` : null) : (domain ? `/software/php/ini/domain/${encodeURIComponent(domain)}` : null);
   const ini = useApi(path, { enabled: Boolean(path) });
@@ -63,6 +67,7 @@ export default function MultiPhpIniEditor({ fn }) {
             </Field>
           )}
           {scope === 'version' && <Field label="PHP version"><Select value={version} onChange={setVersion} options={versionOptions} placeholder={versions.data ? 'Select a version…' : 'Loading…'} /></Field>}
+          {scope === 'domain' && <Field label="Find a domain" help={domainsTruncated ? `Showing the first ${domains.data?.domains?.length || 0} of ${domains.meta?.total} domains; type to narrow the list` : undefined}><TextInput value={domainFilter} onChange={setDomainFilter} placeholder="Domain or account name" /></Field>}
           {scope === 'domain' && <Field label="Domain"><Select value={domain} onChange={setDomain} options={domainOptions} placeholder={domains.data ? 'Select a domain…' : 'Loading…'} /></Field>}
         </div>
         <RequestError error={versions.error || domains.error} onRetry={() => { versions.refetch(); domains.refetch(); }} />

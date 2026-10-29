@@ -99,4 +99,15 @@ describe('job visibility by principal', () => {
     expect(own.text).toContain('"type":"snapshot"');
     expect(own.text).toContain('t-reseller');
   }, 10_000);
+
+  it('newer ownerless and root jobs never push a reseller\'s job out of the list window', async () => {
+    const rootId = ctx.db.prepare("SELECT id FROM users WHERE username = 'root'").get().id;
+    for (let i = 0; i < 120; i++) ctx.jobs.enqueue('test.secret', { who: `other-${i}` }, { userId: i % 2 ? rootId : null });
+    const list = await reseller.get('/api/system/jobs?type=test.secret&limit=100');
+    expect(list.status).toBe(200);
+    expect(list.body.data.map((j) => j.id)).toEqual([resellerJob.id]);
+    const all = await root.get('/api/system/jobs?type=test.secret&limit=100');
+    expect(all.body.data).toHaveLength(100);
+    expect(all.body.data.map((j) => j.id)).not.toContain(resellerJob.id);
+  }, 20_000);
 });

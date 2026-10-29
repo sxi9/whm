@@ -64,6 +64,16 @@ describe('audit log', () => {
     const row = app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action LIKE '%/plugins/manage/install' ORDER BY id DESC LIMIT 1").get();
     expect(JSON.parse(row.args_redacted)).toEqual({ bytes: body.length });
   });
+
+  it('records an empty raw body as zero bytes rather than nothing', async () => {
+    const csrf = await app.login();
+    const res = await app.http.post('/api/plugins/manage/install').set('X-CSRF-Token', csrf).set('Content-Type', 'application/gzip').send(Buffer.alloc(0));
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.status).toBeLessThan(500);
+    await new Promise((r) => setTimeout(r, 30));
+    const row = app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action LIKE '%/plugins/manage/install' ORDER BY id DESC LIMIT 1").get();
+    expect(JSON.parse(row.args_redacted)).toEqual({ bytes: 0 });
+  });
 });
 
 describe('second-factor brute force', () => {

@@ -225,6 +225,9 @@ describe('validation (422)', () => {
     expect((await put('/api/software/php/default', { version: 'PHP 8.3' })).status).toBe(422);
     expect((await put('/api/software/php/domains', { domains: ['bob.com'] })).status).toBe(422);
     expect((await put('/api/software/php/domains', { domains: ['-d'], version: '8.3' })).status).toBe(422);
+    expect((await get('/api/software/php/domains?pageSize=501')).status).toBe(422);
+    expect((await get('/api/software/php/domains?sort=bogus')).status).toBe(422);
+    expect((await get('/api/software/php/domains?pageSize=500&sort=domain')).status).toBe(200);
     expect((await put('/api/software/php/ini/8.3', {})).status).toBe(422);
     expect((await put('/api/software/php/ini/8.3', { directives: { 'memory_limit;x': '1' } })).status).toBe(422);
     expect((await put('/api/software/php/ini/8.3', { directives: { memory_limit: 'a\nb' } })).status).toBe(422);

@@ -621,6 +621,14 @@ Scan the server for security weaknesses. **Who:** root.
 services, panel integrity via `MANIFEST.sha256`, …) and groups findings by grade with
 remediation links; the summary shows counts and the last scan time and trigger.
 **Server:** `POST /api/security/advisor/scan`, last result from `GET /api/security/advisor`.
+**PHP advisories:** one rule compares every installed PHP version (Debian trees, EasyApache
+`ea-php*`, Remi `php*`) with the data-driven list in the `security.advisories` setting
+(seeded with CVE-2026-109618/109619 "PHP2Shell" ranges and the EOL branches; CVE-2026-115560 is
+listed without ranges until PHP publishes them). A finding names each affected version with the
+version that fixes it and links to MultiPHP Manager, which shows the same badge. Edit the list on
+the Security Advisor page (*Advisory list*); an entry without an id is dropped and counted as
+invalid, a range the matcher cannot read makes that branch show as **unknown** rather than pass,
+and a version whose patch level could not be read is reported as unknown too.
 **Gotchas:** scans never change anything.
 
 #### 4.15 Security Questions

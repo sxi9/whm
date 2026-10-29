@@ -432,7 +432,10 @@ the `source` of `table` and `form` pages is the plugin route path the panel fetc
 Declare jobs in `manifest.jobs`, implement them in `module.exports.jobs`, start them from a cron
 entry, an `action` page, `ctx.jobs.run()` or `POST /api/plugins/manage/<id>/jobs/<name>`
 (root). Keep handlers idempotent and honour `job.signal`; report `job.progress()` so the
-action page's log is useful. Manifest cron entries with `enabled: false` are not registered;
+action page's log is useful. A job started with `ctx.jobs.run()` has no owning principal, so
+the panel's Task Queue Monitor and `GET /api/system/jobs/<id>` show it to root only; a route
+meant for resellers should hand the job id to its own status endpoint (`ctx.jobs.status()`)
+rather than to the generic job stream. Manifest cron entries with `enabled: false` are not registered;
 a `setting:<key>` schedule follows the setting. Do not schedule work that will be skipped: bind
 the schedule to a setting and leave it empty instead (Automated Backup does exactly that).
 

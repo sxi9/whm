@@ -3,7 +3,7 @@ import Database from 'better-sqlite3';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { passwordStrength, ipInCidr, verifyIdToken, checkDiscoveryDocument, normalizeIpOrCidr, isPublicAddress, fetchJson, comparePhpVersions, phpVersionSatisfies, normalizeAdvisories, matchPhpAdvisories } from '../src/services/security-center.js';
+import { passwordStrength, ipInCidr, verifyIdToken, checkDiscoveryDocument, normalizeIpOrCidr, isPublicAddress, fetchJson, comparePhpVersions, phpVersionSatisfies, normalizeAdvisories, matchPhpAdvisories, isValidPhpRange, phpMinorFromId } from '../src/services/security-center.js';
 
 const BIN_FULL = { sshd: true, 'ssh-keygen': true, iptables: true, nft: true, apache2ctl: true, 'apt-get': true };
 const MODSEC_DETECT = () => ({ installed: true, flavor: 'debian', baseDir: '/etc/modsecurity', mainConf: '/etc/modsecurity/modsecurity.conf', configConf: '/etc/apache2/conf-enabled/zz-whm-modsec-10-config.conf', vendorsDir: '/etc/modsecurity/whm-vendors', errorLog: '/var/log/apache2/error.log', apache: { flavor: 'debian' }, moduleLoaded: true });
@@ -981,10 +981,36 @@ describe('PHP advisories', () => {
     expect(phpVersionSatisfies('8.2.10', '>=8.2.0 <8.2.35')).toBe(true);
     expect(phpVersionSatisfies('8.2.35', '>=8.2.0 <8.2.35')).toBe(false);
     expect(phpVersionSatisfies('8.1.99', '*')).toBe(true);
+  });
+
+  it('reports an unreadable range as unknown instead of not affected', () => {
+    expect(isValidPhpRange('>=8.2.0 <8.2.35 || *')).toBe(true);
+    expect(isValidPhpRange('<<8.3.36')).toBe(false);
+    expect(isValidPhpRange('~8.2')).toBe(false);
+    expect(phpVersionSatisfies('8.3.35', '<<8.3.36')).toBeNull();
+    expect(phpVersionSatisfies('8.3.35', '')).toBeNull();
+    const { advisories, invalid } = normalizeAdvisories([{ id: 'CVE-X', affected: { '8.3': '<<8.3.36', '8.2': '<8.2.35' } }]);
+    expect(invalid).toBe(1);
+    expect(advisories[0].affected).toEqual({ '8.3': '<<8.3.36', '8.2': '<8.2.35' });
+    const { matches } = matchPhpAdvisories(advisories, [{ id: '8.3', version: '8.3.35' }, { id: 'ea-php82', version: null }, { id: 'php81', version: '8.1.2' }]);
+    expect(matches).toHaveLength(1);
+    expect(matches[0].versions).toEqual([
+      expect.objectContaining({ id: '8.3', minor: '8.3', unknown: true }),
+      expect.objectContaining({ id: 'ea-php82', minor: '8.2', version: null, unknown: true }),
+    ]);
+  });
+
+  it('derives the branch from EasyApache and Remi ids when the patch level could not be read', () => {
+    expect(phpMinorFromId('ea-php83')).toBe('8.3');
+    expect(phpMinorFromId('remi-php82')).toBe('8.2');
+    expect(phpMinorFromId('php74')).toBe('7.4');
+    expect(phpMinorFromId('8.1')).toBe('8.1');
+    expect(phpMinorFromId('fpm')).toBeNull();
+    expect(phpMinorFromId(null)).toBeNull();
     expect(phpVersionSatisfies('8.4.1', '<8.4.0 || =8.4.1')).toBe(true);
     expect(phpVersionSatisfies('8.4.2', '<8.4.0 || =8.4.1')).toBe(false);
-    expect(phpVersionSatisfies('8.3.1', '')).toBe(false);
-    expect(phpVersionSatisfies('8.3.1', 'latest')).toBe(false);
+    expect(phpVersionSatisfies('8.3.1', '')).toBeNull();
+    expect(phpVersionSatisfies('8.3.1', 'latest')).toBeNull();
     expect(phpVersionSatisfies('8.3.1-dev', '*')).toBe(false);
     expect(phpVersionSatisfies(null, '*')).toBe(false);
   });

@@ -1,3 +1,4 @@
+import nodeCrypto from 'node:crypto';
 import { unauthorized, forbidden, badRequest, HttpError } from '../lib/errors.js';
 
 const LOCKOUT_CODE = 'locked_out';
@@ -57,24 +58,29 @@ export function createAuthService(ctx) {
     }
   }
 
-  const totpFailures = new Map();
-  const totpAccepted = new Map();
+  // Lockout and replay state live in totp_guard (migration 001d) so a restart
+  // of the panel neither frees a paused user nor re-admits a just-used code.
+  const guardStmts = {
+    get: db.prepare('SELECT * FROM totp_guard WHERE user_id = ?'),
+    put: db.prepare(`INSERT INTO totp_guard (user_id, failures, first_failure_ms, locked_until_ms, last_code_hash, last_code_ms) VALUES (@user_id, @failures, @first_failure_ms, @locked_until_ms, @last_code_hash, @last_code_ms)
+      ON CONFLICT (user_id) DO UPDATE SET failures = excluded.failures, first_failure_ms = excluded.first_failure_ms, locked_until_ms = excluded.locked_until_ms, last_code_hash = excluded.last_code_hash, last_code_ms = excluded.last_code_ms`),
+  };
+  const codeHash = (userId, code) => nodeCrypto.createHash('sha256').update(`${userId}:${code}`).digest('hex');
   function verifyTotp(user, code) {
     const now = Date.now();
-    const state = totpFailures.get(user.id);
-    if (state && state.lockedUntil > now) throw new HttpError(429, LOCKOUT_CODE, 'Too many wrong verification codes; wait a few minutes and try again.');
+    const state = guardStmts.get.get(user.id) || { failures: 0, first_failure_ms: null, locked_until_ms: null, last_code_hash: null, last_code_ms: null };
+    if (state.locked_until_ms && state.locked_until_ms > now) throw new HttpError(429, LOCKOUT_CODE, 'Too many wrong verification codes; wait a few minutes and try again.');
     const normalized = String(code).replace(/\s+/g, '');
-    const last = totpAccepted.get(user.id);
-    const reused = Boolean(last && last.code === normalized && now - last.at < TOTP_REUSE_WINDOW_MS);
+    const hash = codeHash(user.id, normalized);
+    const reused = Boolean(state.last_code_hash && state.last_code_hash === hash && now - (state.last_code_ms || 0) < TOTP_REUSE_WINDOW_MS);
     if (!reused && crypto.totp.verify(normalized, crypto.decrypt(user.totp_secret_enc))) {
-      totpFailures.delete(user.id);
-      totpAccepted.set(user.id, { code: normalized, at: now });
+      guardStmts.put.run({ user_id: user.id, failures: 0, first_failure_ms: null, locked_until_ms: null, last_code_hash: hash, last_code_ms: now });
       return true;
     }
-    const inWindow = state && now - state.firstAt < TOTP_LOCK_MS;
-    const count = (inWindow ? state.count : 0) + 1;
+    const inWindow = state.first_failure_ms != null && now - state.first_failure_ms < TOTP_LOCK_MS;
+    const count = (inWindow ? state.failures : 0) + 1;
     const lockedUntil = count >= TOTP_MAX_FAILURES ? now + TOTP_LOCK_MS : 0;
-    totpFailures.set(user.id, { count, firstAt: inWindow ? state.firstAt : now, lockedUntil });
+    guardStmts.put.run({ user_id: user.id, failures: count, first_failure_ms: inWindow ? state.first_failure_ms : now, locked_until_ms: lockedUntil || null, last_code_hash: state.last_code_hash, last_code_ms: state.last_code_ms });
     if (lockedUntil) {
       logger.warn({ username: user.username, failures: count }, 'two-factor login paused after repeated wrong codes');
       ctx.auditRecord?.(null, { action: 'auth.2fa.locked', target: user.username, args: { failures: count, minutes: TOTP_LOCK_MS / 60_000 }, result: 'locked' });

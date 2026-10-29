@@ -40,7 +40,7 @@ export function systemRoutes({ system, serviceManager, jobs, scheduler, settings
 
   // Jobs (Task Queue Monitor) ----------------------------------------------------
   r.get('/jobs', requireReseller, validate({ query: z.object({ status: z.enum(['queued', 'running', 'done', 'failed', 'cancelled']).optional(), type: z.string().regex(/^[a-z0-9._-]{1,60}$/).optional(), limit: z.coerce.number().int().min(1).max(500).default(100) }) }),
-    wrap((req) => { const list = jobs.list(req.query); return isRoot(req.user) ? list : list.filter((j) => j.created_by === req.user.id); }));
+    wrap((req) => jobs.list(isRoot(req.user) ? req.query : { ...req.query, createdBy: req.user.id })));
   r.get('/jobs/:id', requireReseller, validate({ params: z.object({ id: fields.id }) }), wrap((req) => ownJob(req, req.params.id)));
   r.post('/jobs/:id/cancel', requireRoot, validate({ params: z.object({ id: fields.id }) }), wrap((req) => { jobs.cancel(req.params.id); return { cancelled: true }; }));
   r.get('/jobs/:id/stream', requireReseller, validate({ params: z.object({ id: fields.id }) }), (req, res, next) => {

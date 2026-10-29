@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { exec, hasBinary, resolveBinary } from '../exec.js';
 import { defineOp, arg, OpError, ensurePrivateDir } from './registry.js';
 import { renderClientCnf, classifyMysqlError, parseBatch, cloneUserStatements, parseGrant, q } from './db.js';
-import { createSqlCodeFilter, createClientCommandGuard } from './transfer.js';
+import { createSqlCodeFilter, createClientCommandGuard, SQL_MODE_TRAP } from './transfer.js';
 
 // Backup op family. An account archive is a cPanel-compatible tarball:
 //
@@ -590,6 +590,10 @@ export async function screenDumpForClientCommands(file, { database } = {}) {
   try {
     for await (const line of rl) {
       lineNo++;
+      // A dump that switches the server to NO_BACKSLASH_ESCAPES / ANSI_QUOTES
+      // makes the client tokenise strings differently from this screen, which
+      // would let a later client command hide inside a literal.
+      if (SQL_MODE_TRAP.test(line)) return { ok: false, line: lineNo, reason: 'sql_mode changes that alter string quoting are not allowed in a restored dump' };
       const reason = guard(codeOf(line));
       if (reason) return { ok: false, line: lineNo, reason };
     }
@@ -610,6 +614,11 @@ defineOp('backup.db.import', {
     if (!/\.sql$/.test(sql) || !exists(sql)) throw new OpError('not_found', `${file} is not an existing .sql dump`);
     const screen = await screenDumpForClientCommands(sql, { database });
     if (!screen.ok) throw new OpError('refused', `${path.basename(sql)} line ${screen.line}: ${screen.reason}; review the dump and import it by hand if it is legitimate`);
+    // The screen tokenises strings the standard way; a server running with
+    // NO_BACKSLASH_ESCAPES would read the same bytes differently.
+    const modeRows = await mysqlQuery('SELECT @@GLOBAL.sql_mode', creds, ctx, { headers: false });
+    const sqlMode = [].concat(...(Array.isArray(modeRows) ? modeRows : [])).map(String).join(' ');
+    if (/\bNO_BACKSLASH_ESCAPES\b/i.test(sqlMode)) throw new OpError('refused', 'The MySQL server runs with sql_mode NO_BACKSLASH_ESCAPES, under which dumps cannot be screened for mysql client commands; import the dump by hand');
     let created = false;
     if (database) {
       let createText = '';

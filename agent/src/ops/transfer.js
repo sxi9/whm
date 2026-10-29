@@ -743,7 +743,10 @@ export function createClientCommandGuard({ database } = {}) {
     return `the dump contains the mysql client command "${com.name}", which the client would run outside SQL`;
   };
   return function feed(code) {
-    if (/\\(?![N\n]|$)/.test(code)) return 'the dump contains a backslash command ("\\!", "\\T", "\\." …) that the mysql client would run outside SQL';
+    // "\-" is the MariaDB sandbox switch (mariadb-dump ≥ 10.11.8 opens every
+    // dump with `/*M!999999\- enable the sandbox mode */`); it only forbids
+    // client commands, so it is the one backslash command a dump may carry.
+    if (/\\(?![N\n-]|$)/.test(code)) return 'the dump contains a backslash command ("\\!", "\\T", "\\." …) that the mysql client would run outside SQL';
     if (!stmt.trim() && (!code.includes(delimiter) || /^\s*delimiter\b/i.test(code))) {
       const com = clientCommand(code);
       if (com) return handle(com);
@@ -767,7 +770,7 @@ const USE_DB = /(?:^|;)\s*USE\s+[`'"]?([A-Za-z0-9_$]+)/gim;
 const DDL_DB = /\b(?:CREATE|ALTER)\s+(?:OR\s+REPLACE\s+)?(?:DATABASE|SCHEMA)\s+(?:IF\s+NOT\s+EXISTS\s+)?[`'"]?([A-Za-z0-9_$]+)/gi;
 // sql_mode changes that would make the server tokenise strings differently
 // from the filter below are refused on the raw text, literals included.
-const SQL_MODE_TRAP = /\bSQL_MODE\b[^\n]*\b(?:NO_BACKSLASH_ESCAPES|ANSI_QUOTES|ANSI)\b/i;
+export const SQL_MODE_TRAP = /\bSQL_MODE\b[^\n]*\b(?:NO_BACKSLASH_ESCAPES|ANSI_QUOTES|ANSI)\b/i;
 const SHORT_LITERAL = /^[A-Za-z0-9_.$%*@-]{0,80}$/;
 const definerUser = (token) => { const m = String(token).match(/^[`'"]?([^`'"@]+)[`'"]?@/); return m ? m[1] : token.replace(/[`'"]/g, ''); };
 

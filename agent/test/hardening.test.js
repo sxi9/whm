@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
 import { ensurePrivateDir, arg } from '../src/ops/registry.js';
-import { unsafeMember, parseTarListing } from '../src/ops/transfer.js';
+import { unsafeMember, parseTarListing, createClientCommandGuard } from '../src/ops/transfer.js';
 import { screenDumpForClientCommands } from '../src/ops/backup.js';
 
 // Phase 6 hardening pass: catalog-wide schema strictness, option smuggling
@@ -224,6 +224,22 @@ describe('backup.db.import screens dumps for mysql client commands', () => {
 
   it('passes a mysqldump of the target database, strings and triggers included', async () => {
     await expect(screenDumpForClientCommands(dump('clean'), { database: 'shop' })).resolves.toEqual({ ok: true, lines: header.length });
+  });
+
+  it('passes the sandbox header every current mariadb-dump writes first', async () => {
+    const f = path.join(root, 'mariadb.sql');
+    fs.writeFileSync(f, ['/*M!999999\\- enable the sandbox mode */', '-- MariaDB dump 10.19  Distrib 10.11.8-MariaDB, for debian-linux-gnu (x86_64)', ...header.slice(1)].join('\n') + '\n');
+    await expect(screenDumpForClientCommands(f, { database: 'shop' })).resolves.toEqual({ ok: true, lines: header.length + 1 });
+    expect(createClientCommandGuard({ database: 'shop' })('\\! id')).toMatch(/backslash command/);
+  });
+
+  it('refuses a dump that switches the server to a quoting mode the screen does not read', async () => {
+    for (const [name, line] of [['nbe', "SET sql_mode='NO_BACKSLASH_ESCAPES';"], ['ansi', 'SET SESSION sql_mode = "ANSI_QUOTES";'], ['ansi2', '/*!50503 SET sql_mode=ANSI */;']]) {
+      const r = await screenDumpForClientCommands(dump(name, [line, "INSERT INTO `t` VALUES (3,'\\\\');", 'source /home/eve/evil.sql']), { database: 'shop' });
+      expect(r.ok, name).toBe(false);
+      expect(r.line, name).toBe(header.length + 1);
+      expect(r.reason, name).toMatch(/sql_mode/);
+    }
   });
 
   it('refuses system, backslash, tee and source commands and a USE of another database', async () => {

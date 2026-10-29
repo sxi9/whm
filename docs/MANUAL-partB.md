@@ -590,7 +590,9 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
 - **Purpose:** PHP version per domain and the system default.
 - **Who:** root or reseller (own domains); the system default is root.
 - **Screen:** *Installed PHP versions* (detected from `/etc/php/*`, `/opt/cpanel/ea-php*`, Remi SCL and the stock
-  `php` package); *System default PHP version*; *PHP version per domain* (bulk selection, `inherit`); *PHP-FPM
+  `php` package; a version affected by a listed PHP advisory carries a badge naming the CVE and the fixed
+  version, from the same rule as Security Advisor 4.14); *System default PHP version*; *PHP version per domain*
+  (searchable, paged 500 at a time — the MultiPHP INI Editor's domain picker filters the same list); *PHP-FPM
   pools*; *Applying PHP version to the web server* progress.
 - **Server:** `PUT /php/domains` calls `ctx.web.setPhpVersion` per domain (a job when more than one
   domain); `PUT /php/default` updates the default and FPM.

@@ -243,17 +243,26 @@ export function comparePhpVersions(a, b) {
 }
 
 // Range grammar: "*" | comparator list joined by spaces (all must hold) | alternatives joined by "||".
-export function phpVersionSatisfies(version, range) {
-  if (!VERSION_RE.test(String(version || ''))) return false;
+const COMPARATOR_RE = /^(<=|>=|<|>|=)?v?(\d+(?:\.\d+){0,3})$/;
+export function isValidPhpRange(range) {
   const text = String(range ?? '').trim();
   if (!text) return false;
-  return text.split('||').some((alt) => {
+  return text.split('||').every((alt) => {
     const parts = alt.trim().split(/\s+/).filter(Boolean);
-    if (!parts.length) return false;
+    return parts.length > 0 && parts.every((part) => part === '*' || COMPARATOR_RE.test(part));
+  });
+}
+
+// null when the range cannot be read: a mistyped operator must surface as
+// "unknown", never as "not affected".
+export function phpVersionSatisfies(version, range) {
+  if (!VERSION_RE.test(String(version || ''))) return false;
+  if (!isValidPhpRange(range)) return null;
+  return String(range).trim().split('||').some((alt) => {
+    const parts = alt.trim().split(/\s+/).filter(Boolean);
     return parts.every((part) => {
       if (part === '*') return true;
-      const m = part.match(/^(<=|>=|<|>|=)?v?(\d+(?:\.\d+){0,3})$/);
-      if (!m) return false;
+      const m = part.match(COMPARATOR_RE);
       const c = comparePhpVersions(version, m[2]);
       switch (m[1] || '=') {
         case '<': return c < 0;
@@ -266,6 +275,15 @@ export function phpVersionSatisfies(version, range) {
   });
 }
 
+// "8.3" from the ids the PHP layouts report: Debian "8.3", EasyApache "ea-php83",
+// Remi "php83" / "remi-php83".
+export function phpMinorFromId(id) {
+  if (typeof id !== 'string') return null;
+  if (/^\d+\.\d+$/.test(id)) return id;
+  const m = id.match(/^(?:ea-|remi-)?php(\d)(\d)$/i);
+  return m ? `${m[1]}.${m[2]}` : null;
+}
+
 // Drops entries the operator stored in a shape the matcher cannot read, so one
 // bad edit never hides the rest of the list; `invalid` counts what was dropped.
 export function normalizeAdvisories(list) {
@@ -274,7 +292,13 @@ export function normalizeAdvisories(list) {
     if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || !raw.id.trim()) { invalid++; continue; }
     const affected = {};
     if (raw.affected && typeof raw.affected === 'object' && !Array.isArray(raw.affected)) {
-      for (const [minor, range] of Object.entries(raw.affected)) if (/^\d+\.\d+$/.test(minor) && typeof range === 'string') affected[minor] = range;
+      // A range the matcher cannot read is kept so its branch shows as
+      // "unknown" instead of silently passing; it still counts as invalid.
+      for (const [minor, range] of Object.entries(raw.affected)) {
+        if (!/^\d+\.\d+$/.test(minor) || typeof range !== 'string') continue;
+        affected[minor] = range;
+        if (!isValidPhpRange(range)) invalid++;
+      }
     }
     const fixedIn = raw.fixedIn && typeof raw.fixedIn === 'object' ? Object.fromEntries(Object.entries(raw.fixedIn).filter(([, v]) => typeof v === 'string')) : typeof raw.fixedIn === 'string' ? { '*': raw.fixedIn } : null;
     const severity = String(raw.severity || 'medium').toLowerCase();
@@ -299,7 +323,7 @@ export function matchPhpAdvisories(advisories, versions) {
     const hits = [];
     for (const v of versions || []) {
       const full = typeof v?.version === 'string' && VERSION_RE.test(v.version) ? v.version : null;
-      const minor = full ? full.split('.').slice(0, 2).join('.') : (typeof v?.id === 'string' && /^\d+\.\d+$/.test(v.id) ? v.id : null);
+      const minor = full ? full.split('.').slice(0, 2).join('.') : phpMinorFromId(v?.id);
       if (!minor || !(minor in adv.affected)) continue;
       // Without a patch level the branch alone decides ("*" ranges); a bounded
       // range cannot be evaluated and is reported as unknown rather than ignored.
