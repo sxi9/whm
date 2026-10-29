@@ -321,7 +321,7 @@ export const APPLIERS = {
   },
   bpk: (ctx, v, req) => need(ctx.systemHealth, 'System Health').setConfig(pick(v, 'system_health.bpk.'), req),
   stats: (ctx, v, req) => need(ctx.serverConfig?.stats, 'Server Configuration').update(pick(v, 'stats.'), req),
-  branding: (ctx, v, req) => need(ctx.cpanel?.branding, 'cPanel (Customization)').update(pick(v, 'branding.'), req),
+  branding: (ctx, v, req) => need(ctx.cpanel?.branding, 'HST Panel (Customization)').update(pick(v, 'branding.'), req),
   themes(ctx, v, req) {
     const t = need(ctx.themes, 'Themes');
     const patch = {};

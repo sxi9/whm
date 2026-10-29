@@ -6,6 +6,7 @@ import { PageHeader, Card, Loading, KeyValue, StatusPill, formatDate } from '../
 import { Field, RadioGroup, Toggle, Button, FormActions } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, JobCard } from '../../server-configuration/Shared.jsx';
+import { BRAND } from '../../../brand.js';
 
 const KEYS = ['tier', 'auto', 'autoOs', 'notifyContact'];
 const pick = (d) => Object.fromEntries(KEYS.map((k) => [k, d[k]]));
@@ -72,7 +73,7 @@ export default function UpdatePreferences({ fn }) {
             <Card title="Operating system packages">
               {data.os && !data.os.unavailable ? <KeyValue items={[['Package manager', data.os.manager], ['Pending updates', data.os.count], ['Security updates', data.os.security], ['Reboot required', data.os.rebootRequired ? <StatusPill key="r" status="warning">yes</StatusPill> : 'no'], ['Checked', formatDate(data.os.checkedAt)]]} /> : <p className="muted">{data.os?.reason || 'No package manager detected or the Software category is not loaded.'}</p>}
               <KeyValue items={[['Daily check schedule', data.schedule ? <>{data.schedule.cron} <StatusPill status={data.schedule.enabled ? 'enabled' : 'disabled'}>{data.schedule.enabled ? 'enabled' : 'disabled'}</StatusPill></> : 'not registered'], ['Last run', formatDate(data.schedule?.lastRunAt)], ['Next run', formatDate(data.schedule?.nextRunAt)]]} />
-              <p className="muted" style={{ marginTop: 8 }}>Apply pending packages from <Link to="/software/system-update">Software › System Update</Link>; adjust the check schedule in <Link to="/server-configuration/configure-cpanel-cron-jobs">Configure cPanel Cron Jobs</Link>.</p>
+              <p className="muted" style={{ marginTop: 8 }}>Apply pending packages from <Link to="/software/system-update">Software › System Update</Link>; adjust the check schedule in <Link to="/server-configuration/configure-cpanel-cron-jobs">Configure {BRAND.product} Cron Jobs</Link>.</p>
             </Card>
           </div>
           {data.lastCheck && (

@@ -14,7 +14,7 @@ is [MANUAL.md](MANUAL.md); installation is covered in [INSTALL.md](INSTALL.md).
 - [22. Software](#22-software)
 - [23. Email](#23-email)
 - [24. System Health](#24-system-health)
-- [25. cPanel](#25-cpanel)
+- [25. HST Panel](#25-hst-panel)
 - [26. SSL/TLS](#26-ssltls)
 - [27. Market](#27-market)
 - [28. Restart Services](#28-restart-services)
@@ -74,7 +74,7 @@ otherwise every request answers `403 feature_required`. Capabilities registered 
   restores started from other tools (the Backup category hands its restores to this service).
 - **Server:** `GET /runs`, `GET /runs/:id`, `GET /jobs`, `GET /jobs/:id` read the panel database only.
 
-#### 16.3 Transfer or Restore a cPanel Account
+#### 16.3 Transfer or Restore an HST Panel Account
 
 - **Purpose:** import an account from a `cpmove-<user>.tar.gz` or a full cPanel backup archive.
 - **Who:** root.
@@ -180,7 +180,7 @@ Sidebar category 18. API prefix `/api/packages` (core route, [`server/src/routes
 
 #### 18.4 Feature Manager
 
-- **Purpose:** feature lists: which cPanel-side features a plan grants (addon domains, subdomains, file manager,
+- **Purpose:** feature lists: which HST Panel-side features a plan grants (addon domains, subdomains, file manager,
   FTP, e-mail accounts, forwarders, autoresponders, SpamAssassin, MySQL, phpMyAdmin, PostgreSQL, cron, SSH,
   backup, bandwidth, …).
 - **Who:** root creates, edits and deletes lists; root or reseller reads them and picks one for a package.
@@ -637,7 +637,7 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
   tier* `stable`/`release`/`edge`, *Notify when a new version is published*); *Check now*.
 - **Server:** `POST /panel/update/check` fetches the feed at `software.update_url` and records the latest
   release with its `sha256`, `signature` and `keyId`; credentials in the URL are redacted in the audit log. The
-  actual upgrade is *cPanel › Upgrade to Latest Version* (25.6), which reads this record.
+  actual upgrade is *HST Panel › Upgrade to Latest Version* (25.6), which reads this record.
 
 #### 22.10 EasyApache 4
 
@@ -819,7 +819,7 @@ Current Disk Usage also exist on the core `/api/system` routes). Capability `pro
 
 ---
 
-## 25. cPanel
+## 25. HST Panel
 
 Sidebar category 25. API prefix `/api/cpanel`; the branding read endpoints are also served unauthenticated at
 `/api/branding` so the login page can paint the company name, logo, favicon and notice.
@@ -853,7 +853,7 @@ Sidebar category 25. API prefix `/api/cpanel`; the branding read endpoints are a
   `.whmplugin` or give a path under the data directory, `/root`, `/home`, `/tmp` or `/opt`); *Installed plugins*
   with enable/disable, settings, logs, jobs, *Uninstall* and *Uninstall and purge*.
 
-#### 25.4 Modify cPanel & WHM News
+#### 25.4 Modify HST Panel & WHM News
 
 - **Purpose:** news items shown to users in the panel.
 - **Who:** root for every item; a reseller holding the `news` ACL manages items for its own accounts.
@@ -1022,7 +1022,7 @@ Sidebar category 29. API prefix `/api/development`. Besides the role, every rout
 `development:read` or `development:write` scope when the caller is an API token. Schedule
 `development-maintenance` (03:23 daily) prunes hook run logs and expired tokens.
 
-#### 29.1 OpenAPI Documentation for cPanel
+#### 29.1 OpenAPI Documentation for HST Panel
 
 - **Purpose:** the API reference for the account-side (`cpanel` scope) endpoints.
 - **Who:** root or reseller.
@@ -1036,7 +1036,7 @@ Sidebar category 29. API prefix `/api/development`. Besides the role, every rout
 
 #### 29.3 Apps Managed by AppConfig
 
-- **Purpose:** third-party apps that appear in WHM, cPanel or Webmail menus.
+- **Purpose:** third-party apps that appear in WHM, HST Panel or Webmail menus.
 - **Who:** root; *Launchable by you* is root or reseller.
 - **Screen:** *Registered applications* (identifier, display name, URL, entry URL, service `whm`/`cpanel`/`webmail`,
   description, icon, required ACLs, required feature-list keys, show in menus, enabled); *Import an AppConfig
@@ -1044,14 +1044,14 @@ Sidebar category 29. API prefix `/api/development`. Besides the role, every rout
 - **Server:** rows; `GET /appconfig/launch` returns the enabled, displayed apps whose ACLs the current
   session holds.
 
-#### 29.4 cPanel Development Forum
+#### 29.4 HST Panel Development Forum
 
 - **Purpose:** a developer landing page (there is no external forum).
 - **Who:** root or reseller.
 - **Screen:** *Quickstart* and *Runtime* cards linking to API tokens, API endpoints, hooks, the event catalog,
   AppConfig apps and the Plugin SDK served under *Developer Documentation*.
 
-#### 29.5 cPanel Plugin File Generator
+#### 29.5 HST Panel Plugin File Generator
 
 - **Purpose:** scaffold a plugin that validates against the SDK manifest contract.
 - **Who:** root.
@@ -1103,7 +1103,7 @@ into the plugin host at boot (job `plugins.bundled.ensure`), exempt from `plugin
 served by the host under `/api/plugins/<id>/*`; their function pages talk to the host and to
 `/api/bundled-plugins/*` (root: enable, disable, reinstall; root or reseller: status). A fourth bundled plugin,
 **Automated Backup**, appears under the *Backup* category sidebar (30.4). Their settings, logs and jobs are also
-reachable from *cPanel › Manage Plugins*.
+reachable from *HST Panel › Manage Plugins*.
 
 #### 30.1 ImunifyAV
 
@@ -1346,7 +1346,7 @@ the panel, installed at boot), **sideloaded** (upload or a path on the server) a
 from the hub). Host API version is `1.0.0`; a manifest whose `engines.whm` does not match is refused with
 `422 incompatible_host`.
 
-### B.2 Manage Plugins (cPanel › Manage Plugins)
+### B.2 Manage Plugins (HST Panel › Manage Plugins)
 
 Root only.
 
@@ -1409,7 +1409,7 @@ provider it is a read-only preview.
 
 - **Reference:** [`plugins/SDK.md`](../plugins/SDK.md) — manifest, permissions, events, the `ctx.*` API, lifecycle,
   pages and sidebar, jobs and cron, errors, the trust model and sandbox, packaging, signatures, testing with
-  `createMockHost`, submitting, versioning. The scaffold from *Development › cPanel Plugin File Generator*
+  `createMockHost`, submitting, versioning. The scaffold from *Development › HST Panel Plugin File Generator*
   (29.5) validates against the same contract; `plugins/sample-plugin` (`net.whm.sample-notes`) is a complete
   worked example with tests.
 - **Build:** `node scripts/build-plugin.js <dir> [--out file.whmplugin] [--sign <private.pem> [--dev]] [--kid <kid>]
@@ -1530,7 +1530,7 @@ per-field hints.
   as records; a job that was running during the restart is marked failed on boot.
 - A **schedule** is a row in `schedules` (name, cron, job type, enabled, params) declared by the owning
   category with `ctx.scheduler.ensure(...)`; a minute-resolution scheduler enqueues the job when the cron matches.
-  Operators tune cron and enabled on *Server Configuration › Configure cPanel Cron Jobs* (`PATCH
+  Operators tune cron and enabled on *Server Configuration › Configure HST Panel Cron Jobs* (`PATCH
   /api/system/schedules/:name`). Schedules follow their feature: for example `nginx-proxy-sync` is enabled only
   while the proxy is on, `system-health-bpk` follows the Background Process Killer switch, and
   `license.checkin` is enabled only once a token exists. Schedules in this part: `transfers-cleanup`,

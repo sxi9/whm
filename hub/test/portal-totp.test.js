@@ -13,7 +13,14 @@ import { encodeQr, qrSvgPath } from '../ui/src/lib/qr.js';
 // /v1/portal/* answers.
 
 let h;
-before(async () => { h = await bootHub(); });
+let seeded;
+before(async () => {
+  h = await bootHub();
+  // The migration seeds the rule on; the test support may relax it for the
+  // other suites, so it is switched on explicitly here.
+  seeded = h.db.prepare("SELECT value_json FROM vendor_settings WHERE key = 'hub.require_totp_for_admins'").get();
+  h.ctx.portalUsers.updateSettings({ require_totp_for_admins: true }, { by: 'test' });
+});
 after(() => h.close());
 
 // A code generated within the last 15 s of its 30 s step could expire between
@@ -50,8 +57,7 @@ async function enrol(agent, csrf) {
 }
 
 test('migration 001d seeds the policy on and the portal reports it', () => {
-  const row = h.db.prepare("SELECT value_json FROM vendor_settings WHERE key = 'hub.require_totp_for_admins'").get();
-  assert.equal(row.value_json, 'true');
+  assert.equal(seeded?.value_json, 'true');
   assert.deepEqual(h.ctx.portalUsers.settings(), { require_totp_for_admins: true, enforced_roles: ['vendor_admin', 'reseller_admin'] });
   for (const col of ['totp_enrolled_at', 'totp_failures', 'totp_locked_until']) assert.ok(h.db.prepare('PRAGMA table_info(portal_users)').all().some((c) => c.name === col), col);
 });
@@ -94,8 +100,8 @@ test('a vendor admin must enrol at the first login: only /v1/portal/* answers un
   assert.equal((await agent.get('/v1/admin/licenses')).status, 200, 'the same session is open once the code is confirmed');
   assert.equal((await agent.get('/v1/portal/settings')).body.data.require_totp_for_admins, true);
   assert.equal((await agent.post('/v1/admin/signing-keys').set('X-CSRF-Token', csrf).send({ purpose: 'plugin' })).status, 201, 'enrolment counts as a fresh step-up');
-  const audit = h.db.prepare("SELECT args FROM audit_log WHERE action = 'portal.login' AND principal = ? ORDER BY id DESC LIMIT 1").get(`portal:${admin.id}`);
-  assert.ok(String(audit.args).includes('totp_enrol_required'));
+  const audit = h.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'portal.login' AND principal = ? ORDER BY id ASC LIMIT 1").get(`portal:${admin.id}`);
+  assert.ok(String(audit.args_redacted).includes('totp_enrol_required'));
 });
 
 test('enrolled: login requires the code, a wrong code is refused, step-up re-arms the session', async () => {

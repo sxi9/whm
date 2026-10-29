@@ -7,6 +7,7 @@ import { DataTable, useTableState } from '../../components/DataTable.jsx';
 import { Field, TextInput, NumberInput, Select, Toggle, Button, FormActions, ErrorBanner } from '../../components/Form.jsx';
 import { useToast } from '../../components/Toast.jsx';
 import { useConfirm } from '../../components/Modal.jsx';
+import { BRAND } from '../../brand.js';
 
 const RESULT_LABEL = { killed: 'Killed', failed: 'Failed', gone: 'Already exited', 'would-kill': 'Dry run' };
 const RESULT_STATUS = { killed: 'ok', failed: 'failed', gone: 'unknown', 'would-kill': 'pending' };
@@ -73,7 +74,7 @@ export function BackgroundProcessKiller() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: 18, alignItems: 'start' }}>
         <Card title="Status" actions={<StatusPill status={cfg.enabled ? 'enabled' : 'disabled'}>{cfg.enabled ? 'Enabled' : 'Disabled'}</StatusPill>}>
           <KeyValue items={[
-            ['Schedule', data.schedule ? <><code>{data.schedule.cron}</code> {data.schedule.enabled && !data.schedule.paused ? '' : <span className="muted">(paused: {PAUSED_LABEL[data.schedule.paused] || 'turned off in Configure cPanel Cron Jobs'})</span>}</> : 'not registered'],
+            ['Schedule', data.schedule ? <><code>{data.schedule.cron}</code> {data.schedule.enabled && !data.schedule.paused ? '' : <span className="muted">(paused: {PAUSED_LABEL[data.schedule.paused] || `turned off in Configure ${BRAND.product} Cron Jobs`})</span>}</> : 'not registered'],
             ['Next scheduled run', data.schedule?.enabled && !data.schedule.paused ? formatDate(data.schedule.nextRunAt) : '—'],
             ['Last run', run ? <>{formatDate(run.finished_at || run.started_at)} <span className="muted">({run.trigger}{run.dry_run ? ', dry run' : ''})</span></> : 'never'],
             ['Last result', run ? (run.error ? <StatusPill status="failed">{run.error}</StatusPill> : `${run.scanned} scanned, ${run.matched} matched, ${run.killed} killed${run.failed ? `, ${run.failed} failed` : ''}`) : '—'],
@@ -140,7 +141,7 @@ function Settings({ config, signals, scopes, onSaved }) {
   };
 
   return (
-    <Card title="Settings" subtitle="Turning the scheduled scan on or off here pauses or resumes its schedule; the cron expression (every 10 minutes by default) can be tuned in Configure cPanel Cron Jobs, where it can also be paused independently.">
+    <Card title="Settings" subtitle={`Turning the scheduled scan on or off here pauses or resumes its schedule; the cron expression (every 10 minutes by default) can be tuned in Configure ${BRAND.product} Cron Jobs, where it can also be paused independently.`}>
       <Field inline><Toggle checked={draft.enabled} onChange={(v) => set('enabled', v)} label="Enable the scheduled scan" description="When off, nothing is killed automatically; manual scans still work." /></Field>
       <Field label="Signal" help="SIGKILL cannot be caught or ignored; SIGTERM lets a process clean up.">
         <Select value={draft.signal} onChange={(v) => set('signal', v)} options={signals} />

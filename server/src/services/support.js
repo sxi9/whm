@@ -38,7 +38,7 @@ const docVisible = (d, user) => d.roles.includes(user?.role === 'root' ? 'root' 
 // Each in-app link names the lowest role whose sidebar carries the page.
 const IN_APP_LINKS = [
   { key: 'api', label: 'OpenAPI reference (WHM)', path: '/development/openapi-documentation-for-whm', description: 'Every endpoint of this panel with roles and parameters.', role: 'root' },
-  { key: 'api-cpanel', label: 'OpenAPI reference (cPanel subset)', path: '/development/openapi-documentation-for-cpanel', description: 'The account-scoped subset resellers may call.', role: 'reseller' },
+  { key: 'api-cpanel', label: 'OpenAPI reference (HST Panel subset)', path: '/development/openapi-documentation-for-cpanel', description: 'The account-scoped subset resellers may call.', role: 'reseller' },
   { key: 'dev-docs', label: 'Developer documentation', path: '/development/developer-documentation', description: 'Design documents and the plugin manifest contract.', role: 'reseller' },
   { key: 'audit', label: 'Audit log', path: '/audit-log', description: 'Every privileged action taken through the panel.', role: 'root' },
   { key: 'status', label: 'Server status', path: '/server-status/server-information', description: 'Live hardware, load and capacity.', role: 'root' },
@@ -188,7 +188,7 @@ export function createSupportService(ctx) {
   function supportSettings() {
     return {
       email: settings.get('support.email') || '',
-      providerName: settings.get('support.provider_name') || 'cPanel Support',
+      providerName: settings.get('support.provider_name') || 'Hostingsignal Support',
       portalUrl: settings.get('support.portal_url') || '',
       access: { defaultHours: Number(settings.get('support.access.default_hours')) || 24, maxHours: Number(settings.get('support.access.max_hours')) || 168 },
     };

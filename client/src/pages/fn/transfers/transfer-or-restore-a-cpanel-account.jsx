@@ -193,7 +193,7 @@ export default function TransferOrRestoreACpanelAccount({ fn }) {
   const step = run ? 3 : archive ? 2 : 1;
   return (
     <>
-      <PageHeader fn={fn} description="Imports one account from a cPanel account archive (cpmove-<user>.tar.gz / pkgacct backup): the account is created, the home directory extracted, databases and grants imported, zones, addon and parked domains recreated. To migrate from a live server use the Transfer Tool.">
+      <PageHeader fn={fn} description="Imports one account from a cPanel-compatible account archive (cpmove-<user>.tar.gz / pkgacct backup, the format this panel's own backups use): the account is created, the home directory extracted, databases and grants imported, zones, addon and parked domains recreated. To migrate from a live server use the Transfer Tool.">
         <p className="muted">Migrating from a running server? Use the <Link to="/transfers/transfer-tool">Transfer Tool</Link>.</p>
       </PageHeader>
       <Steps step={step} labels={['Choose archive', 'Options', 'Restore']} />

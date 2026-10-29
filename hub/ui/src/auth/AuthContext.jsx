@@ -59,8 +59,11 @@ export function impersonationOf(data) {
   return { reseller_id: imp.reseller_id, by: imp.by || null, expires_at: imp.expires_at || null, reseller_name: data?.reseller?.name || null };
 }
 
+// totp_enrol_required (hub.require_totp_for_admins): the hub answers 403
+// totp_enrol_required outside /v1/portal/* until the authenticator is
+// confirmed, so the guard sends the session to its Security page first.
 function portalSession(data) {
-  return { kind: 'portal', user: data.user, totpVerifiedAt: data.totp_verified_at || null, totpEnabled: !!data.user?.totp_enabled, brand: data.user?.reseller_id ? brandOf(data) : null, impersonating: impersonationOf(data) };
+  return { kind: 'portal', user: data.user, totpVerifiedAt: data.totp_verified_at || null, totpEnabled: !!data.user?.totp_enabled, totpEnrolRequired: Boolean(data.totp_enrol_required) && !data.user?.totp_enabled, brand: data.user?.reseller_id ? brandOf(data) : null, impersonating: impersonationOf(data) };
 }
 function developerSession(data) {
   return { kind: 'developer', developer: data.developer, scopes: data.scopes || ['*'], totpVerifiedAt: data.totp_verified_at || null, totpEnabled: !!data.developer?.totp_enabled };
@@ -135,7 +138,7 @@ export function AuthProvider({ children, initialPath = typeof window !== 'undefi
       try { await api.post('/portal/impersonate/end', {}); } finally { await refresh(); }
     },
     markTotpEnabled(enabled) {
-      setSession((s) => (s ? { ...s, totpEnabled: enabled, totpVerifiedAt: enabled ? Date.now() : null } : s));
+      setSession((s) => (s ? { ...s, totpEnabled: enabled, totpVerifiedAt: enabled ? Date.now() : null, totpEnrolRequired: enabled ? false : s.totpEnrolRequired } : s));
     },
   }), [session, ready, refresh]);
 

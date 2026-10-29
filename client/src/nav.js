@@ -11,13 +11,15 @@ export function slugify(label) {
     .replace(/^-+|-+$/g, '');
 }
 
-// [label, description, phase]
+// Category: [label, icon, functions, slug?]; function: [label, description, phase, slug?].
+// A slug is derived from the label unless given explicitly; renamed labels keep
+// their original slug so keys, routes, page file names and links never change.
 const CATEGORY_DEFS = [
   ['Server Configuration', 'Settings', [
     ['Basic WebHost Manager Setup', 'Contact details, main and shared IPs, nameservers and account defaults.', 1],
     ['Change Root Password', 'Rotate the server\'s root password.', 1],
-    ['Configure cPanel Analytics', 'Opt in or out of anonymous interface analytics.', 5],
-    ['Configure cPanel Cron Jobs', 'Schedules for the panel\'s own maintenance tasks.', 1],
+    ['Configure HST Panel Analytics', 'Opt in or out of anonymous interface analytics.', 5, 'configure-cpanel-analytics'],
+    ['Configure HST Panel Cron Jobs', 'Schedules for the panel\'s own maintenance tasks.', 1, 'configure-cpanel-cron-jobs'],
     ['Initial Quota Setup', 'Enable and verify filesystem disk quotas.', 2],
     ['Link Server Nodes', 'Register linked servers for distributed workloads.', 5],
     ['Server Profile', 'Choose which roles this server fulfils.', 5],
@@ -31,7 +33,7 @@ const CATEGORY_DEFS = [
   ['Support', 'LifeBuoy', [
     ['Account Conversations', 'Chat with the people you manage: one thread per account, visible to the account manager and the account.', 2],
     ['Create Support Ticket', 'Open a support request with a system snapshot.', 5],
-    ['Grant cPanel Support Access', 'Time-boxed access for support engineers.', 5],
+    ['Grant HST Panel Support Access', 'Time-boxed access for support engineers.', 5, 'grant-cpanel-support-access'],
     ['Support Center', 'Documentation, forums and support resources.', 5],
   ]],
   ['Networking Setup', 'Network', [
@@ -77,9 +79,9 @@ const CATEGORY_DEFS = [
   ]],
   ['Service Configuration', 'Server', [
     ['Apache Configuration', 'Global web server directives and includes.', 2],
-    ['cPanel Log Rotation Configuration', 'Log rotation policy.', 2],
-    ['cPanel Web Disk Configuration', 'WebDAV service settings.', 5],
-    ['cPanel Web Services Configuration', 'Panel web service tuning.', 5],
+    ['HST Panel Log Rotation Configuration', 'Log rotation policy.', 2, 'cpanel-log-rotation-configuration'],
+    ['HST Panel Web Disk Configuration', 'WebDAV service settings.', 5, 'cpanel-web-disk-configuration'],
+    ['HST Panel Web Services Configuration', 'Panel web service tuning.', 5, 'cpanel-web-services-configuration'],
     ['Exim Configuration Manager', 'Mail server configuration.', 3],
     ['FTP Server Selection', 'Choose the FTP daemon.', 2],
     ['Mailserver Configuration', 'IMAP/POP server settings.', 3],
@@ -155,7 +157,7 @@ const CATEGORY_DEFS = [
   ['Transfers', 'ArrowLeftRight', [
     ['Convert Addon Domain to Account', 'Promote an addon domain to its own account.', 4],
     ['Review Transfers and Restores', 'History and logs of transfer jobs.', 4],
-    ['Transfer or Restore a cPanel Account', 'Import an account from a backup or remote server.', 4],
+    ['Transfer or Restore an HST Panel Account', 'Import an account from a cPanel-compatible backup or a remote server.', 4, 'transfer-or-restore-a-cpanel-account'],
     ['Transfer Tool', 'Migrate many accounts from another server.', 4],
   ]],
   ['Themes', 'Palette', [
@@ -165,7 +167,7 @@ const CATEGORY_DEFS = [
     ['Add a Package', 'Create a hosting plan.', 1],
     ['Delete a Package', 'Remove an unused plan.', 1],
     ['Edit a Package', 'Change plan limits and features.', 1],
-    ['Feature Manager', 'Which cPanel features each plan includes.', 1],
+    ['Feature Manager', 'Which HST Panel features each plan includes.', 1],
   ]],
   ['DNS Functions', 'Globe', [
     ['Add a DNS Zone', 'Create a zone from a template.', 2],
@@ -246,14 +248,14 @@ const CATEGORY_DEFS = [
     ['Show Current Disk Usage', 'Filesystem usage.', 1],
     ['Show Current Running Processes', 'Snapshot of running processes.', 1],
   ]],
-  ['cPanel', 'LayoutDashboard', [
+  ['HST Panel', 'LayoutDashboard', [
     ['Change Log', 'What changed in each release.', 5],
     ['Customization', 'Branding, logos and help links.', 5],
     ['Manage Plugins', 'Install and enable plugins.', 5],
-    ['Modify cPanel & WHM News', 'News shown to users.', 5],
+    ['Modify HST Panel & WHM News', 'News shown to users.', 5, 'modify-cpanel-and-whm-news'],
     ['Reset a Mailman Password', 'Mailing list admin password.', 5],
     ['Upgrade to Latest Version', 'Upgrade the panel.', 5],
-  ]],
+  ], 'cpanel'],
   ['SSL/TLS', 'Lock', [
     ['Generate an SSL Certificate and Signing Request', 'Create a key and CSR.', 3],
     ['Install an SSL Certificate on a Domain', 'Deploy a certificate.', 3],
@@ -277,11 +279,11 @@ const CATEGORY_DEFS = [
     ['SSH Server (OpenSSH)', 'Restart the SSH daemon.', 1],
   ]],
   ['Development', 'Code', [
-    ['OpenAPI Documentation for cPanel', 'User-side API reference.', 5],
+    ['OpenAPI Documentation for HST Panel', 'User-side API reference.', 5, 'openapi-documentation-for-cpanel'],
     ['OpenAPI Documentation for WHM', 'Admin API reference.', 5],
     ['Apps Managed by AppConfig', 'Registered integration apps.', 5],
-    ['cPanel Development Forum', 'Developer community.', 5],
-    ['cPanel Plugin File Generator', 'Scaffold a plugin.', 5],
+    ['HST Panel Development Forum', 'Developer community.', 5, 'cpanel-development-forum'],
+    ['HST Panel Plugin File Generator', 'Scaffold a plugin.', 5, 'cpanel-plugin-file-generator'],
     ['Developer Documentation', 'Developer guides.', 5],
     ['Manage API Tokens', 'Create and revoke API tokens.', 5],
     ['Manage Hooks', 'Event hooks for automation.', 5],
@@ -305,15 +307,15 @@ export const RESTART_SERVICE_MAP = {
   'ssh-server-openssh': 'sshd',
 };
 
-export const CATEGORIES = CATEGORY_DEFS.map(([label, icon, fns], index) => {
-  const slug = slugify(label);
+export const CATEGORIES = CATEGORY_DEFS.map(([label, icon, fns, explicitSlug], index) => {
+  const slug = explicitSlug || slugify(label);
   return {
     index: index + 1,
     label,
     slug,
     icon,
-    functions: fns.map(([fnLabel, description, phase]) => {
-      const fnSlug = slugify(fnLabel);
+    functions: fns.map(([fnLabel, description, phase, explicitFnSlug]) => {
+      const fnSlug = explicitFnSlug || slugify(fnLabel);
       return { label: fnLabel, description, phase, slug: fnSlug, key: `${slug}/${fnSlug}`, path: `/${slug}/${fnSlug}`, category: label, categorySlug: slug };
     }),
   };

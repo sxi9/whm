@@ -1,6 +1,7 @@
 import { useApi } from '../../hooks/useApi.js';
 import { Card } from '../../components/Common.jsx';
 import { Field, TextInput, NumberInput, Select, Toggle, ErrorBanner } from '../../components/Form.jsx';
+import { BRAND } from '../../brand.js';
 
 export const EMPTY_PACKAGE = { name: '', disk_mb: 10240, bandwidth_mb: 102400, max_domains: 1, max_subdomains: 10, max_addons: 0, max_parked: 0, max_db: 10, max_email: 50, max_ftp: 10, max_email_per_hour: null, quota_inodes: null, php_version: 'ea-php83', feature_list: 'default', has_shell: false, has_dedicated_ip: false, cgi: true, digest_auth: false, theme: 'jupiter' };
 
@@ -36,7 +37,7 @@ export function PackageForm({ form, setForm, error, nameEditable = true }) {
         <div className="form-grid">
           <Field label="Feature list" error={error?.fields?.feature_list}><Select value={form.feature_list} onChange={set('feature_list')} options={(featureLists || []).map((f) => ({ value: f.name, label: f.name }))} /></Field>
           <Field label="PHP version" error={error?.fields?.php_version}><TextInput value={form.php_version || ''} onChange={(v) => set('php_version')(v || null)} placeholder="ea-php83" /></Field>
-          <Field label="cPanel theme" error={error?.fields?.theme}><Select value={form.theme} onChange={set('theme')} options={['jupiter', 'paper_lantern']} /></Field>
+          <Field label={`${BRAND.product} theme`} error={error?.fields?.theme}><Select value={form.theme} onChange={set('theme')} options={['jupiter', 'paper_lantern']} /></Field>
         </div>
         <Field inline><Toggle checked={form.has_shell} onChange={set('has_shell')} label="Shell access" description="Accounts get an interactive shell" /></Field>
         <Field inline><Toggle checked={form.has_dedicated_ip} onChange={set('has_dedicated_ip')} label="Dedicated IP" /></Field>

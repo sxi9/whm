@@ -37,7 +37,7 @@ Companion documents: [`README.md`](../README.md) (install, hub, configuration re
   - [14. Account Functions](#14-account-functions)
   - [15. Multi Account Functions](#15-multi-account-functions)
 - Part B — Categories 16–31 and appendices (Transfers, Themes, Packages, DNS Functions,
-  Database Services, IP Functions, Software, Email, System Health, cPanel, SSL/TLS, Market,
+  Database Services, IP Functions, Software, Email, System Health, HST Panel, SSL/TLS, Market,
   Restart Services, Development, Plugins, Application Manager; licensing, marketplace, developer, hub-portal and
   troubleshooting appendices): [MANUAL-partB.md](MANUAL-partB.md).
 
@@ -50,7 +50,7 @@ Companion documents: [`README.md`](../README.md) (install, hub, configuration re
 The panel listens on **http://server:2086** and, when a certificate is configured,
 **https://server:2087** (the installer generates a self-signed one and enables both). Open
 the address in a browser; the login card shows the vendor branding set under
-*cPanel › Customization* and, if one is configured, a login notice.
+*HST Panel › Customization* and, if one is configured, a login notice.
 
 ### Username and password
 
@@ -144,7 +144,7 @@ the sidebar to icons. Open/closed state and the collapsed flag are remembered in
 *Server Profile* are left out of the sidebar, the Tools grid and search, but their URLs still
 work.
 
-**Home.** The dashboard shows the news banner (*cPanel › Customization*), a marketplace
+**Home.** The dashboard shows the news banner (*HST Panel › Customization*), a marketplace
 updates notice, a **Favorites** card, the **Tools** grid (every category with a filter box),
 a **Statistics** card (user, hostname, main IP, load, uptime, OS, kernel, CPU, memory, disk `/`,
 account and reseller counts, panel version and mode, license status; refreshed every 30 s)
@@ -199,7 +199,7 @@ route.
 5. **Long operations** (backups, restores, bulk changes, package installs, statistics,
    migrations) return `202 { job }` and run in the job queue; the page shows a live
    **progress log** and the job appears in *Task Queue Monitor*. Schedules
-   (*Configure cPanel Cron Jobs*) enqueue the same job types on a cron expression.
+   (*Configure HST Panel Cron Jobs*) enqueue the same job types on a cron expression.
 6. **Missing daemon.** When the subsystem a function needs is not installed (BIND, Exim,
    Dovecot, Apache, MySQL, quota tools, iptables/nftables, timedatectl, …) the service raises a
    capability error. The API answers `501` and the page replaces the form with a
@@ -267,7 +267,7 @@ Fields: *New root password* (with strength meter and generator), *Confirm*; a da
 confirmation precedes the change. **Server:** `POST /api/system/root-password` → agent op `user.set_password`, which feeds
 `user:password` to `chpasswd` on stdin (never on a command line); audited without the secret. **Gotchas:** this is the OS account, not your WHM login — change that from the user menu.
 
-#### 1.3 Configure cPanel Analytics
+#### 1.3 Configure HST Panel Analytics
 
 Opt in or out of anonymous interface analytics. **Who:** root.
 Toggles: *Send anonymous interface analytics* (off by default; generates a random participant
@@ -276,7 +276,7 @@ discards the link to previously submitted data. **Server:** `PUT /api/server-con
 `POST …/analytics/rotate-id`; settings only. **Gotchas:** the *What is collected* card is the
 authoritative list; nothing is sent while the first toggle is off.
 
-#### 1.4 Configure cPanel Cron Jobs
+#### 1.4 Configure HST Panel Cron Jobs
 
 Schedules for the panel's own maintenance tasks. **Who:** root.
 A table of every registered schedule (name, job type, editable **cron expression**, **Enabled**
@@ -388,7 +388,7 @@ toggle is honoured by *Software*'s daily `os-update-check`, and packages are app
 
 Browse and install add-ons and plugins. **Who:** root.
 With the `whm-hub` provider enabled (*Market › Market Provider Manager*) the page lists the
-hub's verified, signed plugins (install goes through the consent screen of *cPanel › Manage
+hub's verified, signed plugins (install goes through the consent screen of *HST Panel › Manage
 Plugins › Marketplace*); below it, a searchable **Distribution packages** catalog (host software
 the package manager can install, filter by category). Without the hub it is a read-only preview.
 **Server:** `GET /api/server-config/marketplace`, `GET /api/marketplace/status`. **Needs:** a
@@ -413,7 +413,7 @@ the ticket id. **Needs:** a mail transport (Exim or the SMTP relay from *Contact
 delivery; without an address the ticket is stored only. **Gotchas:** deleting removes the local
 copy; anything already e-mailed stays with the provider.
 
-#### 2.2 Grant cPanel Support Access
+#### 2.2 Grant HST Panel Support Access
 
 Time-boxed access for support engineers. **Who:** root.
 **Grant access** form: *Label* (ticket number; becomes the key comment and token name),
@@ -834,7 +834,7 @@ renders `conf-enabled/whm.conf` or `conf.d/whm.conf`, validates with `apachectl 
 rejected saves are rolled back. **Needs:** Apache. **Gotchas:** a threaded MPM cannot be
 enabled while `mod_php` is loaded — the page warns.
 
-#### 7.2 cPanel Log Rotation Configuration
+#### 7.2 HST Panel Log Rotation Configuration
 
 Log rotation policy. **Who:** root.
 **Policy**: frequency, rotations to keep, *Rotate when larger than*, compress, delaycompress,
@@ -843,7 +843,7 @@ policies** (panel, accounts, web server: files under `/etc/logrotate.d/whm-*`, *
 *Force-rotate*); a **Preview** of the rendered files. **Server:** `PUT /api/service-config/logrotate`
 writes the three files; `POST …/logrotate/:name/run`. **Needs:** `logrotate`.
 
-#### 7.3 cPanel Web Disk Configuration
+#### 7.3 HST Panel Web Disk Configuration
 
 WebDAV service settings. **Who:** root.
 *Enable Web Disk*, *Plain port* (2077), *SSL port* (2078), idle timeout, maximum upload, *Who
@@ -852,7 +852,7 @@ unauthenticated OPTIONS/PROPFIND*). **Server:** settings only (`PUT /api/service
 **Gotchas:** the panel does not ship a WebDAV daemon yet; the values are stored for a service
 that does not run — the page says so.
 
-#### 7.4 cPanel Web Services Configuration
+#### 7.4 HST Panel Web Services Configuration
 
 Tuning for the panel's own HTTP services. **Who:** root.
 **API** (JSON API on/off, token lifetime, browser session timeout, rate limit, max concurrent
@@ -1387,7 +1387,7 @@ Table (account, archive on/off, keep months, last archived, source account/serve
 with **Edit** (*Archive logs in the home directory* — monthly into `~/logs/archive` —,
 *Remove old archives*, *Keep archives for (months)*) and **Archive now** (job, one account or
 all). **Server:** `/api/account-functions/log-retention*`. **Gotchas:** rotation of the live
-logs is *cPanel Log Rotation Configuration*; this page only governs the per-account archives.
+logs is *HST Panel Log Rotation Configuration*; this page only governs the per-account archives.
 
 #### 14.20 Web Template Editor
 

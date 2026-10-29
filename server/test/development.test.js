@@ -594,7 +594,7 @@ describe('OpenAPI documentation', () => {
 
   it('filters the cPanel reference to account-scoped endpoints', async () => {
     const res = await get('/api/development/openapi.json?scope=cpanel');
-    expect(res.body.data.info.title).toBe('cPanel (account) API');
+    expect(res.body.data.info.title).toBe('HST Panel (account) API');
     const ops = Object.values(res.body.data.paths).flatMap((p) => Object.values(p));
     expect(ops.length).toBeGreaterThan(10);
     expect(ops.every((op) => op['x-whm-role'] !== 'root')).toBe(true);

@@ -1,37 +1,43 @@
-import { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { PageHeader, Card, StatusPill } from '../../components/Common.jsx';
-import { Field, TextInput, PasswordInput, Button, ErrorBanner } from '../../components/Form.jsx';
+import { Field, TextInput, PasswordInput, Button, ErrorBanner, Toggle } from '../../components/Form.jsx';
+import { TotpEnrolment } from '../../components/QrCode.jsx';
 import { api } from '../../api/client.js';
 import { useAction } from '../../hooks/useAction.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
 
 // Portal (vendor + reseller) account security: TOTP enrolment through
-// POST /portal/2fa/enroll → /confirm, disable with a current code, and the
-// password change (the hub destroys the session, so the user signs in again).
-// Mounted at /admin/security and /reseller/security with `home` set per area.
+// POST /portal/2fa/enroll → /confirm (QR + secret + URI), disable with a
+// current code, the password change (the hub destroys the session, so the
+// user signs in again) and, for vendor admins, the portal-wide policy
+// hub.require_totp_for_admins. Mounted at /admin/security and
+// /reseller/security with `home` set per area.
 
-export function PortalTotpPanel() {
+export function PortalTotpPanel({ home = '/admin' }) {
   const { session, markTotpEnabled } = useAuth();
+  const navigate = useNavigate();
   const { run, busy, error } = useAction();
   const [pending, setPending] = useState(null);
   const [code, setCode] = useState('');
   const enabled = Boolean(session?.totpEnabled);
+  const required = Boolean(session?.totpEnrolRequired) && !enabled;
   const valid = /^\d{6}$/.test(code);
   const startEnrol = () => run(() => api.post('/portal/2fa/enroll', enabled && valid ? { code } : {}), { then: (r) => { setPending(r.data); setCode(''); } });
-  const confirm = () => run(() => api.post('/portal/2fa/confirm', { code }), { success: 'Two-factor authentication enabled', then: () => { setPending(null); setCode(''); markTotpEnabled(true); } });
+  const confirm = () => run(() => api.post('/portal/2fa/confirm', { code }), {
+    success: 'Two-factor authentication enabled',
+    then: () => { setPending(null); setCode(''); markTotpEnabled(true); if (required) navigate(home, { replace: true }); },
+  });
   const disable = () => run(() => api.post('/portal/2fa/disable', { code }), { success: 'Two-factor authentication disabled', then: () => { setCode(''); markTotpEnabled(false); } });
   return (
     <>
       <ErrorBanner error={error} />
       <p><StatusPill status={enabled ? 'enabled' : 'disabled'} /> <span className="muted">Every sensitive action (signing keys, API keys, portal users, marketplace decisions, money) asks for a fresh code; without 2FA those actions are refused.</span></p>
-      {!enabled && !pending && <Button variant="primary" loading={busy} onClick={startEnrol}>Start enrolment</Button>}
+      {!enabled && !pending && <Button variant="primary" loading={busy} onClick={startEnrol} data-testid="portal-totp-start">{required ? 'Enrol now' : 'Start enrolment'}</Button>}
       {pending && (
         <>
-          <p>Add this secret to your authenticator app, then confirm with a code:</p>
-          <pre className="code-block">{pending.secret}</pre>
-          <p className="muted"><code className="small">{pending.uri}</code></p>
-          <Field label="Code" htmlFor="portal-totp-confirm"><TextInput id="portal-totp-confirm" value={code} onChange={setCode} inputMode="numeric" autoComplete="one-time-code" maxLength={6} /></Field>
+          <TotpEnrolment secret={pending.secret} uri={pending.uri} account={session?.user?.email} />
+          <Field label="Code" htmlFor="portal-totp-confirm"><TextInput id="portal-totp-confirm" value={code} onChange={setCode} inputMode="numeric" autoComplete="one-time-code" maxLength={6} autoFocus /></Field>
           <div className="inline-list">
             <Button variant="primary" loading={busy} disabled={!valid} onClick={confirm}>Confirm</Button>
             <Button onClick={() => { setPending(null); setCode(''); }}>Cancel</Button>
@@ -71,16 +77,46 @@ export function PortalPasswordPanel({ home = '/admin' }) {
   );
 }
 
+// hub.require_totp_for_admins, vendor admins only. Loaded in an effect (not
+// useApi) so the page renders without the policy while it is fetched; the
+// PATCH is a step-up route, the API client re-prompts for the code.
+export function PortalPolicyPanel() {
+  const { session } = useAuth();
+  const { run, busy, error } = useAction();
+  const [policy, setPolicy] = useState(null);
+  const [loadError, setLoadError] = useState(null);
+  const canEdit = session?.user?.role === 'vendor_admin' && session?.totpEnabled;
+  useEffect(() => {
+    if (!canEdit) return undefined;
+    let alive = true;
+    api.get('/portal/settings').then((r) => { if (alive) setPolicy(r.data); }, (err) => { if (alive) setLoadError(err); });
+    return () => { alive = false; };
+  }, [canEdit]);
+  if (!canEdit) return null;
+  const save = (value) => run(() => api.patch('/portal/settings', { require_totp_for_admins: value }), { success: value ? 'Authenticator apps are now required for every admin' : 'Authenticator apps are now optional for admins', then: (r) => setPolicy(r.data) });
+  return (
+    <Card title="Portal policy" subtitle="Applies to every vendor and reseller administrator of this hub, including sessions that are open right now.">
+      <ErrorBanner error={error || loadError} />
+      <Toggle checked={Boolean(policy?.require_totp_for_admins)} disabled={busy || !policy} onChange={save}
+        label="Require an authenticator app for all admins" description="Vendor and reseller admins must enrol at their first sign-in; until they do, only the Security page answers. Support and staff roles may enrol voluntarily." />
+    </Card>
+  );
+}
+
 export default function PortalSecurity({ home = '/admin' }) {
   const { session } = useAuth();
+  const [params] = useSearchParams();
+  const required = (Boolean(session?.totpEnrolRequired) || params.get('enrol') === '1') && !session?.totpEnabled;
   return (
     <>
       <PageHeader title="Security" description="Two-factor authentication and password for this portal account. Sensitive actions re-prompt for a code." home={home} />
-      {!session?.totpEnabled && <div className="banner banner-warning"><div>Two-factor authentication is off. Enrol below before signing keys, API keys, portal users or marketplace decisions: the hub refuses those actions until a code is confirmed.</div></div>}
+      {required && <div className="banner banner-error" role="alert" data-testid="totp-enrol-required"><div><strong>An authenticator app is required for your role.</strong> This hub asks every admin to enrol before anything else: scan the code below, confirm it, and the portal opens.</div></div>}
+      {!required && !session?.totpEnabled && <div className="banner banner-warning"><div>Two-factor authentication is off. Enrol below before signing keys, API keys, portal users or marketplace decisions: the hub refuses those actions until a code is confirmed.</div></div>}
       <div className="two-col">
-        <Card title="Two-factor authentication"><PortalTotpPanel /></Card>
+        <Card title="Two-factor authentication"><PortalTotpPanel home={home} /></Card>
         <Card title="Password"><PortalPasswordPanel home={home} /></Card>
       </div>
+      <PortalPolicyPanel />
     </>
   );
 }

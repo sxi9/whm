@@ -7,6 +7,7 @@ import { DataTable } from '../../../components/DataTable.jsx';
 import { Field, TextInput, PasswordInput, Toggle, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
+import { BRAND } from '../../../brand.js';
 
 const isCapabilityError = (err) => err && (err.code === 'capability_missing' || err.code === 'binary_not_found' || err.status === 501);
 
@@ -57,7 +58,7 @@ export default function ResetMailmanPassword({ fn }) {
         <>
           <Card title="Mailing lists" subtitle={data.flavor === 'mailman3' ? 'Mailman 3: list administration is per user; per-list passwords do not exist' : 'Every Mailman 2 list on this server, advertised or not (list_lists)'} padded={false}>
             <DataTable columns={columns} rows={lists} loading={loading} rowActions={rowActions} rowKey={(l) => l.name} emptyText="No mailing lists exist" />
-            {lists.length === 0 && !loading && <div className="card-body"><EmptyState icon={Mails} title="No mailing lists"><p>Lists are created from a hosting account's cPanel (Mailing Lists) or with Mailman's <code>newlist</code> tool.</p></EmptyState></div>}
+            {lists.length === 0 && !loading && <div className="card-body"><EmptyState icon={Mails} title="No mailing lists"><p>Lists are created from a hosting account's {BRAND.product} (Mailing Lists) or with Mailman's <code>newlist</code> tool.</p></EmptyState></div>}
           </Card>
           <Card title="Reset a list administrator password" subtitle="Runs Mailman's change_pw for the selected list">
             {data.canResetPassword === false ? (

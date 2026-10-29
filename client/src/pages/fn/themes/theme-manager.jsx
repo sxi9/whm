@@ -10,6 +10,7 @@ import { Field, TextInput, Select, Toggle, Button, FormActions, ErrorBanner } fr
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { notifyThemeChanged } from '../../../theme/applyTheme.js';
+import { BRAND } from '../../../brand.js';
 import { RequestError, Tabs, useThemes, ThemeSelect, ThemePills, ThemeSwatch, ThemeEditor, BASES, usePreview, PreviewButton } from '../../themes/Shared.jsx';
 
 const TABS = [
@@ -165,7 +166,7 @@ function DefaultsTab({ state }) {
         <Field label="Default for new accounts" required error={error?.fields?.accountDefault}><ThemeSelect value={draft.accountDefault} onChange={(v) => setDraft({ ...draft, accountDefault: v })} themes={themes} filter={enabledOnly} placeholder={null} /></Field>
       </div>
       <Field label="Per-user overrides"><Toggle checked={draft.allowUserOverride} onChange={(v) => setDraft({ ...draft, allowUserOverride: v })} label={draft.allowUserOverride ? 'Resellers and users may choose their own theme' : 'Everyone except root follows the panel default'} /></Field>
-      <p className="muted">Logos and company branding are configured per account under <Link to="/cpanel/customization">cPanel › Customization</Link>.</p>
+      <p className="muted">Logos and company branding are configured per account under <Link to="/cpanel/customization">{BRAND.product} › Customization</Link>.</p>
       <ErrorBanner error={error} />
       <FormActions>
         <Button variant="primary" loading={saving} onClick={save}>Save</Button>

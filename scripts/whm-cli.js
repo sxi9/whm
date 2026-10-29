@@ -86,7 +86,8 @@ async function superadminInit() {
   if (!password) {
     password = await askSecret(`New super admin setup password (at least ${MIN_SETUP_PASSWORD_LENGTH} characters): `);
     assertSetupPassword(password);
-    const again = await askSecret('Repeat it: ');
+    // Piped input carries the password once; a terminal confirms it.
+    const again = stdin.isTTY ? await askSecret('Repeat it: ') : password;
     if (again !== password) throw new Error('the passwords do not match');
   }
   const { file } = await writeKey(config.dataDir, password, { current });

@@ -8,6 +8,7 @@ import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { useAction } from '../../hooks/useAction.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
+import { TotpEnrolment } from '../../components/QrCode.jsx';
 
 // TOTP enrol/disable, password change, session + event list; also the public
 // password-reset flow (mode="reset", /dev/password-reset?token=…).
@@ -24,10 +25,8 @@ export function TotpPanel() {
       {!enabled && !pending && <Button variant="primary" loading={busy} onClick={() => run(() => api.post('/dev/2fa/start'), { then: (r) => setPending(r.data) })}>Start enrolment</Button>}
       {pending && (
         <>
-          <p>Add this secret to your authenticator app, then confirm with a code:</p>
-          <pre className="code-block">{pending.secret}</pre>
-          <p className="muted"><code className="small">{pending.uri}</code></p>
-          <Field label="Code"><TextInput value={code} onChange={setCode} inputMode="numeric" maxLength={6} /></Field>
+          <TotpEnrolment secret={pending.secret} uri={pending.uri} account={session?.developer?.email} />
+          <Field label="Code"><TextInput value={code} onChange={setCode} inputMode="numeric" autoComplete="one-time-code" maxLength={6} /></Field>
           <Button variant="primary" loading={busy} disabled={!/^\d{6}$/.test(code)} onClick={() => run(() => api.post('/dev/2fa/confirm', { code }), { success: 'Two-factor authentication enabled', then: () => { setPending(null); setCode(''); markTotpEnabled(true); } })}>Confirm</Button>
         </>
       )}

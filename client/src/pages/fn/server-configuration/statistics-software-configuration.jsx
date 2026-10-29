@@ -7,6 +7,7 @@ import { Field, Toggle, Select, Button, FormActions } from '../../../components/
 import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { RequestError, JobCard, LastJob, CronField } from '../../server-configuration/Shared.jsx';
+import { BRAND } from '../../../brand.js';
 
 const GENERATORS = [
   { key: 'awstats', label: 'AWStats', blurb: 'Detailed visitor, referrer, robot and bandwidth reports, with a per-domain config in /etc/awstats.' },
@@ -79,7 +80,7 @@ export default function StatisticsSoftwareConfiguration({ fn }) {
             <div className="form-grid" style={{ marginTop: 12 }}>
               <Field label="Default generator for new accounts" help="Must be one of the enabled generators"><Select value={draft.defaultGenerator} onChange={(v) => setDraft((x) => ({ ...x, defaultGenerator: v }))} options={GENERATORS.map((g) => ({ value: g.key, label: g.label, disabled: !draft.generators[g.key] }))} /></Field>
             </div>
-            <Field inline><Toggle checked={draft.allowUserChoice} onChange={(v) => setDraft((x) => ({ ...x, allowUserChoice: v }))} label="Let account owners choose their generator" description="Shown in cPanel › Metrics when more than one generator is enabled." /></Field>
+            <Field inline><Toggle checked={draft.allowUserChoice} onChange={(v) => setDraft((x) => ({ ...x, allowUserChoice: v }))} label="Let account owners choose their generator" description={`Shown in ${BRAND.product} › Metrics when more than one generator is enabled.`} /></Field>
             <Field inline><Toggle checked={draft.includeSuspended} onChange={(v) => setDraft((x) => ({ ...x, includeSuspended: v }))} label="Process suspended accounts too" /></Field>
             <FormActions>
               <Button variant="primary" loading={busy} disabled={!dirty} onClick={() => save()}>Save</Button>
@@ -93,7 +94,7 @@ export default function StatisticsSoftwareConfiguration({ fn }) {
                   <Field inline><Toggle checked={data.scheduleEnabled} disabled={busy || !anyOn} onChange={(v) => save({ enabled: v })} label="Rebuild statistics on a schedule" description={anyOn ? 'Runs every enabled generator for all active domains.' : 'Enable a generator first.'} /></Field>
                   <Field label="Cron expression" help="Nightly after log rotation is typical"><CronField value={data.schedule.cron} onSave={(cron) => save({ cron })} saving={busy} /></Field>
                   <KeyValue items={[['Last run', formatDate(data.schedule.lastRunAt)], ['Next run', formatDate(data.schedule.nextRunAt)], ['Active domains', data.domains]]} />
-                  <p className="muted">The schedule pauses itself while no enabled generator is installed on this server (so no empty run is queued) and resumes when one appears. A schedule switched off in <Link to="/server-configuration/configure-cpanel-cron-jobs">Configure cPanel Cron Jobs</Link> stays off until it is switched on there or here.</p>
+                  <p className="muted">The schedule pauses itself while no enabled generator is installed on this server (so no empty run is queued) and resumes when one appears. A schedule switched off in <Link to="/server-configuration/configure-cpanel-cron-jobs">Configure {BRAND.product} Cron Jobs</Link> stays off until it is switched on there or here.</p>
                 </>
               ) : <p className="muted">Schedule not registered.</p>}
             </Card>

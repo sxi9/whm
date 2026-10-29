@@ -4,7 +4,10 @@ A production-grade, self-hostable **WHM-compatible hosting control panel**: the 
 WHM administrative interface (31 categories, 215 functions: the 212 WHM functions plus the Application Manager) that manages a **real Linux
 server** — Linux users and quotas, Apache/NGINX and PHP-FPM, BIND DNS, Exim/Dovecot mail,
 MySQL/MariaDB, FTP, SSL/ACME, systemd services, IPs, security, backups, transfers and
-resellers — built on Node.js 22, Express, React and SQLite.
+resellers — built on Node.js 22, Express, React and SQLite. The product is **HST Panel** by
+Hostingsignal: the hosted-account side carries that name, while the administrative side keeps the
+WHM name. The project started as a WHM/cPanel clone, so routes, keys and settings still use the
+original `cpanel` identifiers.
 
 - Design of record: [`BLUEPRINT.md`](BLUEPRINT.md) · Progress: [`CHECKLIST.md`](CHECKLIST.md) · Conventions: [`CLAUDE.md`](CLAUDE.md) · Screenshots: [`docs/screenshots/`](docs/screenshots/README.md)
 
@@ -257,7 +260,7 @@ flags (`api`, `transfers`, `clusters`, `marketplace_paid`, `white_label`, …).
 8. **Publish** — to `stable` or `beta` (`POST …/versions/:v/publish`). Yank hides a version; admins
    can revoke (panels disable it through the signed revocation feed) or take a plugin down.
 9. **Install from WHM** — enable the `whm-hub` row in *Market › Market Provider Manager*, then
-   *cPanel › Manage Plugins › Marketplace* (or *Server Configuration › WHM Marketplace*): install
+   *HST Panel › Manage Plugins › Marketplace* (or *Server Configuration › WHM Marketplace*): install
    opens a **consent screen** listing every scope with its description and the developer's
    justification; the package is downloaded through a signed single-use URL, its sha256 and
    `SIGNATURE.json` verified against the hub-pinned keys, then enabled. Updates that add scopes are

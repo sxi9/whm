@@ -7,6 +7,7 @@ import { Field, NumberInput, Toggle, Button, FormActions, ErrorBanner } from '..
 import { Modal } from '../../../components/Modal.jsx';
 import { ProgressLog } from '../../../components/ProgressLog.jsx';
 import { useToast } from '../../../components/Toast.jsx';
+import { BRAND } from '../../../brand.js';
 
 function EditModal({ row, onClose, onSaved }) {
   const toast = useToast();
@@ -42,7 +43,7 @@ export default function WebLogRetention({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Per-account policy for the raw Apache logs: whether a monthly archive is kept in the account's ~/logs/archive and for how long. Rotation of the live logs is configured under Service Configuration → cPanel Log Rotation Configuration. The archive job runs on the 1st of each month." actions={<Button variant="primary" loading={busy} onClick={() => archiveNow()}>Archive now (all enabled)</Button>} />
+      <PageHeader fn={fn} description={`Per-account policy for the raw Apache logs: whether a monthly archive is kept in the account's ~/logs/archive and for how long. Rotation of the live logs is configured under Service Configuration → ${BRAND.product} Log Rotation Configuration. The archive job runs on the 1st of each month.`} actions={<Button variant="primary" loading={busy} onClick={() => archiveNow()}>Archive now (all enabled)</Button>} />
       <CapabilityNotice error={runError} />
       <Card padded={false}>
         <ErrorBanner error={error} onRetry={refetch} />

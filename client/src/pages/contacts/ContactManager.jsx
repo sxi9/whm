@@ -9,6 +9,7 @@ import { Modal, useConfirm } from '../../components/Modal.jsx';
 import { useToast } from '../../components/Toast.jsx';
 import { ProgressLog } from '../../components/ProgressLog.jsx';
 import { ContactForm, CHANNEL_LABEL } from './ContactForm.jsx';
+import { BRAND } from '../../brand.js';
 
 const SEVERITY_STATUS = { info: 'info', warning: 'warning', error: 'failed', critical: 'failed' };
 
@@ -224,7 +225,7 @@ function ChecksCard({ settings, schedule, openAlerts, onChanged }) {
 
   const last = check.lastResult;
   return (
-    <Card title="Monitoring checks" subtitle="Every 10 minutes (Configure cPanel Cron Jobs → server-contacts-check) the panel raises service.down, service.restored, disk.space.low and ssl.expiring." actions={<StatusPill status={check.enabled && schedule?.enabled ? 'enabled' : 'disabled'}>{check.enabled && schedule?.enabled ? 'Enabled' : 'Disabled'}</StatusPill>}>
+    <Card title="Monitoring checks" subtitle={`Every 10 minutes (Configure ${BRAND.product} Cron Jobs → server-contacts-check) the panel raises service.down, service.restored, disk.space.low and ssl.expiring.`} actions={<StatusPill status={check.enabled && schedule?.enabled ? 'enabled' : 'disabled'}>{check.enabled && schedule?.enabled ? 'Enabled' : 'Disabled'}</StatusPill>}>
       <KeyValue items={[
         ['Last run', check.lastRunAt ? formatDate(check.lastRunAt) : 'never'],
         ['Last result', last ? `${last.services?.checked ?? 0} service(s), ${last.disks?.checked ?? 0} filesystem(s)${last.services?.down?.length ? `, down: ${last.services.down.join(', ')}` : ''}${last.disks?.low?.length ? `, low: ${last.disks.low.map((d) => `${d.mountpoint} ${d.usedPercent}%`).join(', ')}` : ''}${last.ssl?.expiring?.length ? `, ${last.ssl.expiring.length} certificate(s) expiring` : ''}` : '—'],

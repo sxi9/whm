@@ -258,7 +258,8 @@ Set these in the environment of the `sudo bash scripts/install.sh` call.
 | `WHM_APP_DIR` | `/opt/whm` | Where the application is deployed. Substituted into both panel units. |
 | `WHM_DATA_DIR` | `/var/lib/whm` | Panel data directory. Substituted into `whm-panel.service` (`ReadWritePaths`, `/var/lib/whm` occurrences). Note that the installed `panel.env` and `whm.conf` templates still say `/var/lib/whm`; edit them if you change this. |
 | `WHM_ADMIN_PASSWORD` | *(generated)* | Appended to `/etc/whm/panel.env` on a first install so the seed creates `root` with this password instead of generating one. |
-| `WHM_LICENSE_HUB_URL` | *(ask / local hub)* | Written to `panel.env` as the bootstrap license hub. Must start with `https://`. With `--with-hub` it defaults to the hub's public URL; on a terminal (first install, not `--upgrade`) the script asks once; blank leaves it unset. An existing `WHM_LICENSE_HUB_URL=` line is never changed. |
+| `WHM_LICENSE_HUB_URL` | `https://licserver.hostingsignal.in` (local hub with `--with-hub`) | Written to `panel.env` as the bootstrap license hub. Must start with `https://`. With `--with-hub` it defaults to the hub's public URL; on a terminal (first install, not `--upgrade`) the script asks once with the vendor hub `https://licserver.hostingsignal.in` as the default, which the panel also uses when the variable is unset. An existing `WHM_LICENSE_HUB_URL=` line is never changed. Only the super admin sees the hub address in the panel. |
+| `WHM_SUPERADMIN_SETUP_PASSWORD` | *(ask)* | The **super admin setup password** (at least 12 characters). Its bcrypt hash is written to `/var/lib/whm/superadmin.key` (`0600 root:root`); on a terminal (first install, not `--upgrade`) the script asks for it once (blank skips: run `whm-cli superadmin --init` later). `whm-cli superadmin <user>` only grants the super admin flag after this password verifies ([§4.7](#47-first-login)). |
 | `HUB_PUBLIC_URL` | `https://<hostname -f>:7443` | Hub `public_url` (the `iss` of every token). On an installed hub, the only hub.conf value an upgrade writes back. |
 | `HUB_DATA_DIR` | `/var/lib/whm-hub` | Hub databases, packages, PSL file. On an installed hub a *different* value aborts: move the directory by hand (see [§6.1](#61-upgrading)). |
 | `HUB_ADMIN_EMAIL` | *(unset)* | First-install only: create the vendor-admin portal user with this e-mail and print the password. |
@@ -289,14 +290,17 @@ Node major version 22.
    `whm.conf`, `agent.conf` and `panel.env` from `deploy/*.example` **only if missing**; appends
    `WHM_ADMIN_PASSWORD` to a new `panel.env`.
 8. **License hub URL** – see `WHM_LICENSE_HUB_URL` above.
-9. **Panel TLS** – generates `/etc/whm/ssl/panel.{crt,key}` if absent ([§4.5](#45-tls)).
-10. **Hub** (`--with-hub`) – [§5.1](#51-installing-the-hub). If the hub certificate was generated in this
+9. **Super admin setup password** – see `WHM_SUPERADMIN_SETUP_PASSWORD` above; writes
+   `/var/lib/whm/superadmin.key` through `whm-cli.js superadmin --init` (no database access, so it runs
+   before the first boot without creating root-owned secrets).
+10. **Panel TLS** – generates `/etc/whm/ssl/panel.{crt,key}` if absent ([§4.5](#45-tls)).
+11. **Hub** (`--with-hub`) – [§5.1](#51-installing-the-hub). If the hub certificate was generated in this
     run, a copy is installed as `/etc/whm/hub-ca.pem` (`0640 root:whmpanel`) and
     `WHM_LICENSE_HUB_CA=/etc/whm/hub-ca.pem` is appended to `panel.env` so the same-host panel trusts it.
-11. **Units** – writes `/etc/systemd/system/whm-agentd.service` and `whm-panel.service` from
+12. **Units** – writes `/etc/systemd/system/whm-agentd.service` and `whm-panel.service` from
     `deploy/`, substituting the node binary, `/opt/whm` and `/var/lib/whm`; `systemctl daemon-reload`,
     `enable whm-agentd whm-panel`, `restart whm-agentd`, then `restart whm-panel`.
-12. **Summary** – after 2 s, if `whm-panel` is active: prints the URL, the login, the password (from
+13. **Summary** – after 2 s, if `whm-panel` is active: prints the URL, the login, the password (from
     `initial-admin-password.txt` or "the WHM_ADMIN_PASSWORD you set"), log and firewall hints and the
     configured hub. Otherwise `whm-panel failed to start; see: journalctl -u whm-panel -n 50`.
 
@@ -311,6 +315,7 @@ Node major version 22.
 | `/etc/whm/ssl/panel.crt`, `panel.key` | `0640 root:whmpanel` | Self-signed panel certificate. |
 | `/etc/whm/hub-ca.pem` | `0640 root:whmpanel` | Copy of a same-host hub's self-signed certificate (only when the installer generated it). |
 | `/var/lib/whm` | `0750 whmpanel:whmpanel` | `whm.db` (+ `-wal`/`-shm`), `session.secret`, `master.key` (AES-256-GCM key for secrets at rest), `initial-admin-password.txt`, `plugins/`, `plugin-data/`, `plugin-keys/`. |
+| `/var/lib/whm/superadmin.key` | `0600 root:root` | bcrypt hash of the super admin setup password (`{ "v": 1, "hash", "created_at" }`). The panel process cannot read it; only `whm-cli superadmin` does. |
 | `/var/log/whm` | `0750 whmpanel:whmpanel` | Writable log directory (process output itself goes to the journal). |
 | `/run/whm-agent.sock` | `0660 root:whmpanel` | Created by `whm-agentd` at start. |
 | `/etc/systemd/system/whm-agentd.service` | | `User=root`, `WorkingDirectory=/opt/whm/agent`, `ExecStart=<node> /opt/whm/agent/src/index.js`, env `WHM_AGENT_SOCKET`, `WHM_AGENT_GROUP=whmpanel`, `WHM_AGENT_CONFIG=/etc/whm/agent.conf`, `Restart=always`. |
@@ -351,12 +356,27 @@ means the socket could not be opened (see [§8](#8-troubleshooting)).
    Then delete `initial-admin-password.txt`.
 4. Enrol TOTP under *Security Center › Two-Factor Authentication* (required once
    `security.2fa.required_for_root` is enabled there).
-5. If a hub was configured, enter the license key under *Server Configuration › Basic WebHost Manager
-   Setup › License* ([§5.5](#55-connecting-a-panel-to-the-hub)).
+5. **Make yourself the super admin.** The super admin is the one root user who owns the panel: only
+   that user sees the license hub address, the license key, the activations and the hub answers, and
+   only that user can activate, transfer, check in or deactivate the license. Every other root user
+   gets a *Licensed — managed by the panel owner* card (status, edition, expiry) and `403
+   superadmin_required` on the license API. The flag is never set from the web interface:
+   ```bash
+   sudo node /opt/whm/scripts/whm-cli.js superadmin root      # asks for the setup password
+   sudo node /opt/whm/scripts/whm-cli.js superadmin --revoke root
+   ```
+   The command verifies the password against `/var/lib/whm/superadmin.key` (bcrypt) and refuses
+   otherwise; without the file it explains how to create it: `whm-cli superadmin --init` (prompts twice,
+   or reads `WHM_SUPERADMIN_SETUP_PASSWORD`; replacing an existing key needs the current password).
+   Grants and revocations are audited (`auth.superadmin.grant` / `.revoke`, principal `whm-cli`).
+6. As the super admin, enter the license key under *Server Configuration › Basic WebHost Manager
+   Setup › License* ([§5.5](#55-connecting-a-panel-to-the-hub)). The hub is
+   `https://licserver.hostingsignal.in` unless `WHM_LICENSE_HUB_URL` says otherwise.
 
-Lost password later: `sudo node /opt/whm/scripts/whm-cli.js reset-password root` (prompts when the
-password is omitted). Other commands: `create-admin <user> [pw]`, `list-users`, `unlock-ip <ip>`
-(removes cPHulk blocks), `status`.
+Lost password later: `sudo node /opt/whm/scripts/whm-cli.js reset-password root` (prompts without echo
+when the password is omitted). Other commands: `create-admin <user> [pw]`, `list-users` (shows the
+`superadmin` column), `unlock-ip <ip>` (removes cPHulk blocks), `status` (reports `superadmins` and
+whether `superadmin.key` exists), `superadmin --init | <user> | --revoke <user>`.
 
 ---
 
@@ -450,10 +470,18 @@ characters) and printed once. `hub-cli.js` boots the hub services in-process, so
 `--keys-dir`, `--json`. After a CLI run as root, restore ownership:
 `chown -R whmhub:whmhub /var/lib/whm-hub` (the installer does this itself).
 
-Log in at `https://<hub>:7443/login` (`POST /v1/portal/login { email, password, totp? }`). After the
-first login enrol TOTP under *Security*: the portal warns until you do, and the hub refuses signing-key,
-API-key, portal-user and marketplace actions (TOTP step-up, `license.stepup_max_age_s`) until 2FA is
-enabled.
+Log in at `https://<hub>/login` (`POST /v1/portal/login { email, password, totp? }`). **The first
+login of an admin lands on the enrolment page:** `hub.require_totp_for_admins` (a vendor setting, on
+by default) makes every `vendor_admin` and `reseller_admin` enrol an authenticator app (QR code,
+secret and `otpauth://` URI under *Security › Two-factor authentication*, `POST /v1/portal/2fa/enroll`
+→ `/confirm`) before anything outside `/v1/portal/*` answers (`403 totp_enrol_required`; the login
+answer and `/v1/portal/me` carry `totp_enrol_required: true`). Once enabled, login asks for the code
+(`401 totp_required` without it), sensitive actions re-prompt for a fresh one (step-up,
+`license.stepup_max_age_s`), and five wrong codes pause the account's TOTP for 15 minutes
+(`429 totp_rate_limited`). Support and staff roles may enrol voluntarily; a stepped-up vendor admin can
+switch the rule off and on under *Admin › Security › Portal policy* (`GET/PATCH /v1/portal/settings`),
+which applies to open sessions at once. API keys are unaffected. Developers already enrol the same
+way on the developer portal.
 
 ### 5.4 Issuing the first license
 
@@ -478,12 +506,14 @@ From the portal: *Admin › Licenses* (`/admin/licenses`; API `POST /v1/admin/li
 
 ### 5.5 Connecting a panel to the hub
 
-1. **Tell the panel where the hub is.** `WHM_LICENSE_HUB_URL=https://hub.example.com:7443` in
-   `/etc/whm/panel.env` (the installer writes it from the variable, the local hub, or the prompt) — it
-   must be `https://`. This is only the **bootstrap** address used to activate, start a trial or
-   recover; once a token exists the panel talks to the hub named in the token's `iss`
-   (`hubUrl()` in `services/license.js`). Without it the License tab says *No hub is configured* and
-   activation answers `422 hub_not_configured`.
+1. **Tell the panel where the hub is.** The panel defaults to the vendor hub
+   `https://licserver.hostingsignal.in`; `WHM_LICENSE_HUB_URL=https://hub.example.com:7443` in
+   `/etc/whm/panel.env` (the installer writes it from the variable, the local hub, or the prompt)
+   points it elsewhere — it must be `https://`. This is only the **bootstrap** address used to activate,
+   start a trial or recover; once a token exists the panel talks to the hub named in the token's `iss`
+   (`hubUrl()` in `services/license.js`). The address is shown only to the super admin
+   ([§4.7](#47-first-login)); every other root user sees the restricted license card and
+   `403 superadmin_required` on the license routes.
 2. **Trust the hub's certificate.** Panels speak HTTPS only. For a self-signed hub set
    `WHM_LICENSE_HUB_CA=/etc/whm/hub-ca.pem` to a copy of `hub.crt` readable by `whmpanel` (done by
    the installer for a same-host hub it generated the certificate for). A CA-issued certificate needs
@@ -491,9 +521,9 @@ From the portal: *Admin › Licenses* (`/admin/licenses`; API `POST /v1/admin/li
 3. **Pin the license key** in the panel release (`server/src/services/license-keys.json`) or with
    `WHM_LICENSE_KEYS_FILE=/etc/whm/license-keys.json` ([§5.2](#52-keys-what-gen-keyjs-generates-and-what-to-pin-where)).
    Without a usable key the panel logs `no usable license keys are pinned; activation is impossible`.
-4. **Restart** `whm-panel`, then open *Server Configuration › Basic WebHost Manager Setup › License*
-   (`/server-configuration/basic-webhost-manager-setup#license`). The tab shows the status, hub, edition,
-   limits and features, and offers:
+4. **Restart** `whm-panel`, then, as the super admin, open *Server Configuration › Basic WebHost
+   Manager Setup › License* (`/server-configuration/basic-webhost-manager-setup#license`). The tab
+   shows the status, hub, edition, limits and features, and offers:
    - **Activate with a license key** — enter `WHM-XXXX-XXXX-XXXX-XXXX` (`POST /api/license/key`). If the
      license has no free activation, a *Transfer* dialog lists the other servers; transferring puts the
      other server into read-only mode at its next check-in.
@@ -513,7 +543,7 @@ From the portal: *Admin › Licenses* (`/admin/licenses`; API `POST /v1/admin/li
 
 The marketplace is a separate switch: enable the `whm-hub` row under *Market › Market Provider
 Manager* (it holds no key; it answers `hub_mismatch` if its origin differs from the license hub), then
-install plugins from *cPanel › Manage Plugins › Marketplace* or *Server Configuration › WHM Marketplace*.
+install plugins from *HST Panel › Manage Plugins › Marketplace* or *Server Configuration › WHM Marketplace*.
 
 Development hub next to a development panel:
 
@@ -549,7 +579,7 @@ environment (deep-merged on top) → defaults. An invalid file aborts with
 
 | Key | Default | Meaning |
 |---|---|---|
-| `public_url` | `https://localhost:7443` | URL panels and portals use; `iss` of every token. |
+| `public_url` | `https://licserver.hostingsignal.in` | URL panels and portals use; `iss` of every token. The installer writes `HUB_PUBLIC_URL` (default `https://<hostname -f>:7443`) into a new hub.conf. |
 | `serve_ui` | `false` (template: `true`) | Serve `hub/ui/dist` at `/` with SPA fallback for `/login`, `/admin/*`, `/reseller/*`, `/dev/*`. Logs `serve_ui is set but hub/ui/dist is missing` when the build is absent. |
 | `ui_dist` | *(unset)* | Alternative build directory. The server reads the `WHM_HUB_UI_DIST` environment variable for this (`uiDistDir()` in `hub/src/app.js`). |
 | `host` | `0.0.0.0` | Bind address. |
@@ -748,7 +778,7 @@ Precedence (`loadConfig()` in `server/src/config.js`): environment variables →
 | `WHM_PLUGIN_DATA_DIR` | `pluginDataDir` | `<dataDir>/plugin-data` | Per-plugin sandboxed data. |
 | `WHM_PLUGIN_HOOK_TIMEOUT_MS` | `pluginHookTimeoutMs` | `30000` | Plugin hook timeout. |
 | `WHM_PLUGIN_ACTIVATE_TIMEOUT_MS` | `pluginActivateTimeoutMs` | `60000` | Plugin activation timeout. |
-| `WHM_LICENSE_HUB_URL` | `licenseHubUrl` | `null` | Bootstrap hub URL (https) for activation/trial/recovery; the token's `iss` wins afterwards. |
+| `WHM_LICENSE_HUB_URL` | `licenseHubUrl` | `https://licserver.hostingsignal.in` | Bootstrap hub URL (https) for activation/trial/recovery; the token's `iss` wins afterwards. Visible to the super admin only. |
 | `WHM_LICENSE_KEYS_FILE` | `licenseKeysFile` | `server/src/services/license-keys.json` | Pinned vendor LICENSE public keys (`{ "keys": [ { kid, pub, not_after } ] }`). |
 | `WHM_LICENSE_HUB_CA` | `licenseHubCa` | `null` | PEM CA/certificate to trust for the hub (self-signed hubs). |
 | `WHM_LICENSE_ENFORCE` | `licenseEnforce` | `true` in prod, `false` otherwise | `'true'` enables the degraded (423), feature (403) and capacity gates. |
@@ -801,8 +831,9 @@ default from [§5.6](#56-hubconf-reference). Booleans accept `1`, `true`, `yes`.
 
 ### 7.4 Installer-only variables
 
-`WHM_APP_DIR`, `WHM_DATA_DIR`, `WHM_ADMIN_PASSWORD`, `WHM_LICENSE_HUB_URL`, `HUB_PUBLIC_URL`,
-`HUB_DATA_DIR`, `HUB_ADMIN_EMAIL`, `HUB_ADMIN_PASSWORD`, `HUB_SKIP_UI` — see [§4.2](#42-environment-overrides).
+`WHM_APP_DIR`, `WHM_DATA_DIR`, `WHM_ADMIN_PASSWORD`, `WHM_LICENSE_HUB_URL`, `WHM_SUPERADMIN_SETUP_PASSWORD`,
+`HUB_PUBLIC_URL`, `HUB_DATA_DIR`, `HUB_ADMIN_EMAIL`, `HUB_ADMIN_PASSWORD`, `HUB_SKIP_UI` — see
+[§4.2](#42-environment-overrides).
 
 ---
 
@@ -876,6 +907,12 @@ default from [§5.6](#56-hubconf-reference). Booleans accept `1`, `true`, `yes`.
 - Lost root password: `whm-cli.js reset-password root`.
 - Stuck on 2FA: `security.2fa.required_for_root` is on and no device is enrolled; the panel only lets
   you enrol or change the password until it is.
+- `403 superadmin_required` on `/api/license/*`, or the License tab says *managed by the panel owner*:
+  this root user is not the super admin. Grant it with `whm-cli superadmin <user>` (needs the setup
+  password; `whm-cli superadmin --init` creates `/var/lib/whm/superadmin.key` when it is missing).
+- Hub portal: `403 totp_enrol_required` means `hub.require_totp_for_admins` is on and this admin has
+  not confirmed an authenticator yet — finish enrolment under *Security*; `429 totp_rate_limited`
+  means five wrong codes in a row, wait 15 minutes.
 
 **License**
 - `no usable license keys are pinned` — `license-keys.json` (or `WHM_LICENSE_KEYS_FILE`) has no

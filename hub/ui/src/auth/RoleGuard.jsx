@@ -11,6 +11,14 @@ export function guardDecision(session, area, roles = null) {
   return 'ok';
 }
 
+// Where a portal session that must still enrol an authenticator is sent, or
+// null when it may stay where it is (its own Security page, or no obligation).
+export function enrolRedirect(session, area, pathname) {
+  if (!session || session.kind !== 'portal' || !session.totpEnrolRequired || session.totpEnabled) return null;
+  const security = `/${area}/security`;
+  return pathname === security ? null : `${security}?enrol=1`;
+}
+
 export function RequireArea({ area, roles = null, children }) {
   const { session, ready } = useAuth();
   const location = useLocation();
@@ -22,6 +30,8 @@ export function RequireArea({ area, roles = null, children }) {
     return <Navigate to={to} replace />;
   }
   if (decision === 'forbidden') return <ForbiddenPage />;
+  const enrol = enrolRedirect(session, area, location.pathname);
+  if (enrol) return <Navigate to={enrol} replace />;
   return children || <Outlet />;
 }
 

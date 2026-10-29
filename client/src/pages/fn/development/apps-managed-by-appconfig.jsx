@@ -7,9 +7,10 @@ import { Field, TextInput, Textarea, Select, Toggle, Button, ErrorBanner } from 
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, downloadText } from '../../development/Shared.jsx';
+import { BRAND } from '../../../brand.js';
 
 const EMPTY = { name: '', displayName: '', url: '', entryUrl: '', service: 'whm', description: '', icon: '', acls: ['all'], features: [], display: true, enabled: true, customAcl: '' };
-const SERVICES = [{ value: 'whm', label: 'WHM (administrators and resellers)' }, { value: 'cpanel', label: 'cPanel (account users)' }, { value: 'webmail', label: 'Webmail' }];
+const SERVICES = [{ value: 'whm', label: 'WHM (administrators and resellers)' }, { value: 'cpanel', label: `${BRAND.product} (account users)` }, { value: 'webmail', label: 'Webmail' }];
 
 export default function AppsManagedByAppConfig({ fn }) {
   const toast = useToast();
@@ -52,7 +53,7 @@ export default function AppsManagedByAppConfig({ fn }) {
     <>
       <PageHeader fn={fn} actions={<><Button icon={Upload} onClick={() => setImportText('')}>Import .conf</Button><Button variant="primary" icon={Plus} onClick={() => openEditor(null)}>Register app</Button></>} />
       <RequestError error={apps.error} onRetry={apps.refetch} />
-      <Card padded={false} title="Registered applications" subtitle="Third-party and custom apps that appear in WHM, cPanel or Webmail. ACLs decide which resellers see a WHM app; cPanel apps can be gated by feature-list keys.">
+      <Card padded={false} title="Registered applications" subtitle={`Third-party and custom apps that appear in WHM, ${BRAND.product} or Webmail. ACLs decide which resellers see a WHM app; ${BRAND.product} apps can be gated by feature-list keys.`}>
         {apps.loading && !apps.data && <Loading />}
         {apps.data && (
           <div className="table-wrap">

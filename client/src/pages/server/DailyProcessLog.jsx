@@ -7,6 +7,7 @@ import { Field, Select, NumberInput, Toggle, Button, FormActions, ErrorBanner } 
 import { Modal, useConfirm } from '../../components/Modal.jsx';
 import { useToast } from '../../components/Toast.jsx';
 import { RequestError, Tabs } from '../security/Shared.jsx';
+import { BRAND } from '../../brand.js';
 
 const SERIES = {
   cpu: { label: 'CPU % (sum of ps %CPU, lifetime average per process)', key: 'cpuPercent', color: 'var(--primary)', unit: '%' },
@@ -92,9 +93,9 @@ function SettingsCard({ settings, days, onSaved }) {
   return (
     <Card title="Sampler" subtitle={settings.schedule ? `${settings.schedule.cron} · next run ${settings.schedule.nextRunAt ? formatDate(settings.schedule.nextRunAt) : '—'}` : 'Schedule not registered'}>
       <ErrorBanner error={error} />
-      <Toggle checked={form.enabled} onChange={(v) => setForm({ ...form, enabled: v })} label="Record processes every 5 minutes" description="This switch is authoritative; the process-log-sampler schedule under Server Configuration > Configure cPanel Cron Jobs follows it, and scheduled runs record nothing while it is off." />
+      <Toggle checked={form.enabled} onChange={(v) => setForm({ ...form, enabled: v })} label="Record processes every 5 minutes" description={`This switch is authoritative; the process-log-sampler schedule under Server Configuration > Configure ${BRAND.product} Cron Jobs follows it, and scheduled runs record nothing while it is off.`} />
       {settings.schedule && settings.schedule.enabled !== settings.enabled && (
-        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>The process-log-sampler schedule is currently {settings.schedule.enabled ? 'enabled' : 'paused'} in Configure cPanel Cron Jobs; it is realigned to this setting on the next save or panel restart.</div>
+        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>The process-log-sampler schedule is currently {settings.schedule.enabled ? 'enabled' : 'paused'} in Configure {BRAND.product} Cron Jobs; it is realigned to this setting on the next save or panel restart.</div>
       )}
       <div className="form-grid" style={{ marginTop: 12 }}>
         <Field label="Processes per sample" help="Top N by CPU plus top N by memory, de-duplicated."><NumberInput value={form.topN} onChange={(v) => setForm({ ...form, topN: v })} min={1} max={200} nullable={false} /></Field>

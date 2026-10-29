@@ -61,7 +61,7 @@ export function PortalLoginPage() {
   const location = useLocation();
   if (ready && session) return <Navigate to={nextOf(location.search, homeOf(session))} replace />;
   return (
-    <LoginForm title="Vendor & reseller portal" subtitle="Sign in with your portal account. Two-factor authentication is required for sensitive actions."
+    <LoginForm title="Vendor & reseller portal" subtitle="Sign in with your portal account. Admins enrol an authenticator app at their first sign-in; every sensitive action asks for a fresh code."
       onLogin={loginPortal}
       footer={<p className="muted">Plugin developer? <Link to="/dev/login">Developer sign-in</Link> · <Link to="/dev/register">Register</Link></p>} />
   );

@@ -24,6 +24,12 @@ describe('nav.js is the single source of truth', () => {
     for (const key of keys) expect(FUNCTION_BY_KEY[key], `page registered for unknown function "${key}"`).toBeTruthy();
   });
 
+  it('keeps renamed labels on their original slugs through the explicit slug element', () => {
+    expect(FUNCTION_BY_KEY['cpanel/modify-cpanel-and-whm-news'].label).toBe('Modify HST Panel & WHM News');
+    expect(FUNCTION_BY_KEY['server-configuration/configure-cpanel-cron-jobs'].path).toBe('/server-configuration/configure-cpanel-cron-jobs');
+    for (const f of FUNCTIONS) if (slugify(f.label) !== f.slug) expect(f.slug, f.label).toContain('cpanel');
+  });
+
   it('maps every Restart Services entry to a service registry name', () => {
     const restart = CATEGORIES.find((c) => c.slug === 'restart-services');
     for (const fn of restart.functions) expect(RESTART_SERVICE_MAP[fn.slug], fn.label).toBeTruthy();
