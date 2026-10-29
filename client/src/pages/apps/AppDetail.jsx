@@ -9,7 +9,7 @@ import { Modal, useConfirm } from '../../components/Modal.jsx';
 import { useToast } from '../../components/Toast.jsx';
 import { RequestError, Tabs } from '../security/Shared.jsx';
 import { EnvEditor, envToRows, rowsToEnv, envErrors } from './EnvEditor.jsx';
-import { StartFields, BuildFields, LimitsFields, RuntimeSelect, cleanStart, cleanBuild, cleanLimits } from './AppForm.jsx';
+import { StartFields, BuildFields, LimitsFields, RuntimeSelect, cleanStart, cleanBuild, cleanLimits, needsRuntime } from './AppForm.jsx';
 import { KindBadge, AppStatusPill, runtimeLabel, sourceLabel, startLabel, formatMemory } from './Shared.jsx';
 
 // Start/stop/restart inline, rebuild/deploy as jobs; shared by the table and the drawer.
@@ -173,7 +173,7 @@ export function AppSettings({ app, runtimes, onSaved }) {
       <h3 style={{ margin: '12px 0 8px' }}>Build</h3>
       <BuildFields kind={app.kind} value={form.build} onChange={(build) => set({ build })} />
       {app.kind !== 'static' && (<><h3 style={{ margin: '6px 0 8px' }}>Start</h3><StartFields kind={app.kind} value={form.start} onChange={(start) => set({ start })} /></>)}
-      {(app.kind !== 'static' || form.build.install === 'npm') && <RuntimeSelect kind={app.kind} runtimes={runtimes} value={form.runtimeVersion} onChange={(runtimeVersion) => set({ runtimeVersion })} />}
+      {needsRuntime({ kind: app.kind, build: form.build }) && <RuntimeSelect kind={app.kind} runtimes={runtimes} value={form.runtimeVersion} onChange={(runtimeVersion) => set({ runtimeVersion })} />}
       <div className="field">
         {app.kind !== 'static' && <Toggle checked={form.websockets} onChange={(websockets) => set({ websockets })} label="Websockets" description="Forward Upgrade requests to the application" />}
         {app.kind === 'static' && <Toggle checked={form.spaFallback} onChange={(spaFallback) => set({ spaFallback })} label="SPA fallback" description="Serve index.html for unknown paths" />}
@@ -186,10 +186,14 @@ export function AppSettings({ app, runtimes, onSaved }) {
 }
 
 const TABS = [{ value: 'overview', label: 'Overview' }, { value: 'logs', label: 'Logs' }, { value: 'env', label: 'Environment' }, { value: 'settings', label: 'Settings' }];
+const READ_ONLY_TABS = TABS.slice(0, 2);
 
-export function AppDetailModal({ id, initialTab = 'overview', onClose, onChanged, runner, runtimes, onRemove }) {
+// readOnly: the viewer may look but not mutate (resellers when the policy
+// forbids them); every mutating control and the editing tabs are hidden.
+export function AppDetailModal({ id, initialTab = 'overview', onClose, onChanged, runner, runtimes, onRemove, readOnly = false }) {
   const detail = useApi(`/apps/${id}`, { refreshMs: 15000 });
-  const [tab, setTab] = useState(initialTab);
+  const tabs = readOnly ? READ_ONLY_TABS : TABS;
+  const [tab, setTab] = useState(() => (tabs.some((t) => t.value === initialTab) ? initialTab : 'overview'));
   const actions = useAppActions({ runner, onChanged: () => { detail.refetch(); onChanged?.(); } });
   const app = detail.data;
   const saved = () => { detail.refetch(); onChanged?.(); };
@@ -205,18 +209,18 @@ export function AppDetailModal({ id, initialTab = 'overview', onClose, onChanged
             <AppStatusPill app={app} live={app.live} />
             <a className="small" href={app.url} target="_blank" rel="noreferrer noopener">{app.url} <ExternalLink size={12} /></a>
             <span style={{ flex: 1 }} />
-            {app.kind !== 'static' && app.unit && !running && <Button size="sm" onClick={() => actions.control(app, 'start')} loading={actions.busy === `${app.id}:start`}>Start</Button>}
-            {app.kind !== 'static' && app.unit && running && <Button size="sm" onClick={() => actions.control(app, 'restart')} loading={actions.busy === `${app.id}:restart`}>Restart</Button>}
-            {app.kind !== 'static' && app.unit && running && <Button size="sm" variant="danger" onClick={() => actions.control(app, 'stop')} loading={actions.busy === `${app.id}:stop`}>Stop</Button>}
-            <Button size="sm" onClick={() => actions.rebuild(app)} loading={runner?.busy} disabled={app.status === 'deploying'}>Rebuild</Button>
-            {app.source?.type === 'git' && <Button size="sm" onClick={() => actions.deploy(app)} loading={runner?.busy} disabled={app.status === 'deploying'}>Deploy (git pull)</Button>}
-            {onRemove && <Button size="sm" variant="danger" onClick={() => onRemove(app)}>Remove</Button>}
+            {!readOnly && app.kind !== 'static' && app.unit && !running && <Button size="sm" onClick={() => actions.control(app, 'start')} loading={actions.busy === `${app.id}:start`}>Start</Button>}
+            {!readOnly && app.kind !== 'static' && app.unit && running && <Button size="sm" onClick={() => actions.control(app, 'restart')} loading={actions.busy === `${app.id}:restart`}>Restart</Button>}
+            {!readOnly && app.kind !== 'static' && app.unit && running && <Button size="sm" variant="danger" onClick={() => actions.control(app, 'stop')} loading={actions.busy === `${app.id}:stop`}>Stop</Button>}
+            {!readOnly && <Button size="sm" onClick={() => actions.rebuild(app)} loading={runner?.busy} disabled={app.status === 'deploying'}>Rebuild</Button>}
+            {!readOnly && app.source?.type === 'git' && <Button size="sm" onClick={() => actions.deploy(app)} loading={runner?.busy} disabled={app.status === 'deploying'}>Deploy (git pull)</Button>}
+            {!readOnly && onRemove && <Button size="sm" variant="danger" onClick={() => onRemove(app)}>Remove</Button>}
           </div>
-          <Tabs tabs={TABS} value={tab} onChange={setTab} />
+          <Tabs tabs={tabs} value={tab} onChange={setTab} />
           {tab === 'overview' && <AppOverview app={app} />}
           {tab === 'logs' && <AppLogs app={app} />}
-          {tab === 'env' && <AppEnv key={app.updatedAt} app={app} onSaved={saved} />}
-          {tab === 'settings' && <AppSettings key={app.updatedAt} app={app} runtimes={runtimes} onSaved={saved} />}
+          {!readOnly && tab === 'env' && <AppEnv key={app.updatedAt} app={app} onSaved={saved} />}
+          {!readOnly && tab === 'settings' && <AppSettings key={app.updatedAt} app={app} runtimes={runtimes} onSaved={saved} />}
         </>
       )}
     </Modal>

@@ -14,11 +14,15 @@ import { KINDS, KIND_LABELS, KIND_DESCRIPTIONS, START_MODES, MODE_FIELD, homeOf,
 const KIND_DEFAULT_START = { node: { mode: 'npm-script', script: 'start' }, python: { mode: 'file', entry: 'main.py' } };
 const GIT_URL = /^https:\/\/[A-Za-z0-9._-]+(:\d{1,5})?\/[A-Za-z0-9._/-]+(\.git)?$/;
 const BASE_PATH = /^\/(?:[A-Za-z0-9._-]+\/?)*$/;
+const APP_NAME = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$/;
+// A preset may carry a "<project>" placeholder in its output directory (Angular);
+// the request schema rejects it, the deploy job resolves it from angular.json.
+const PLACEHOLDER = /<[^>]*>/;
 
 export function emptyForm(overrides = {}) {
   return {
     name: '', username: '', domain: '', basePath: '/', root: '', rootTouched: false,
-    kind: 'node', preset: null,
+    kind: 'node', preset: null, presetOutputDir: '',
     start: { mode: 'npm-script', entry: '', script: 'start', module: '', workers: 2 },
     build: { install: 'npm', script: '', optional: false, outputDir: '', extraPackages: '' },
     runtimeVersion: 'system',
@@ -38,7 +42,7 @@ function startForm(start, kind) {
 export function applyKind(form, kind) {
   if (form.kind === kind && !form.preset) return form;
   return {
-    ...form, kind, preset: null,
+    ...form, kind, preset: null, presetOutputDir: '',
     start: startForm(null, kind),
     build: { install: kind === 'python' ? 'pip' : 'npm', script: kind === 'static' ? 'build' : '', optional: false, outputDir: kind === 'static' ? 'dist' : '', extraPackages: '' },
     websockets: kind !== 'static', spaFallback: kind === 'static',
@@ -54,10 +58,11 @@ export function applyPreset(form, preset) {
   if (!preset) return { ...form, preset: null };
   const kind = preset.kind;
   const install = preset.install === undefined ? (kind === 'python' ? 'pip' : 'npm') : preset.install;
+  const outputDir = kind === 'static' ? (preset.outputDir || '.') : '';
   return {
-    ...form, kind, preset: preset.id,
+    ...form, kind, preset: preset.id, presetOutputDir: outputDir,
     start: startForm(preset.start, kind),
-    build: { install: install ?? '', script: preset.build?.script || '', optional: Boolean(preset.build?.optional), outputDir: kind === 'static' ? (preset.outputDir || '.') : '', extraPackages: (preset.defaults?.extraPackages || []).join(' ') },
+    build: { install: install ?? '', script: preset.build?.script || '', optional: Boolean(preset.build?.optional), outputDir, extraPackages: (preset.defaults?.extraPackages || []).join(' ') },
     websockets: kind === 'static' ? false : preset.websockets !== false,
     spaFallback: kind === 'static' ? preset.spaFallback !== false : false,
     runtimeVersion: preset.defaults?.runtimeVersion || (runtimeKindOf(kind) === runtimeKindOf(form.kind) ? form.runtimeVersion : null) || 'system',
@@ -67,7 +72,9 @@ export function applyPreset(form, preset) {
   };
 }
 
-export const needsRuntime = (form) => form.kind !== 'static' || form.build.install === 'npm';
+// Mirrors the server's runtime rule: a static app needs Node.js as soon as it
+// installs with npm or runs a build script.
+export const needsRuntime = (form) => form.kind !== 'static' || form.build.install === 'npm' || Boolean(String(form.build.script || '').trim());
 export const parsePackages = (text) => String(text || '').split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
 
 export function cleanStart(start) {
@@ -90,7 +97,10 @@ export function cleanBuild(build, kind) {
   const script = String(build.script || '').trim();
   out.script = script || null;
   if (script) out.optional = Boolean(build.optional);
-  if (kind === 'static') out.outputDir = String(build.outputDir || '.').trim() || '.';
+  if (kind === 'static') {
+    const outputDir = String(build.outputDir || '.').trim() || '.';
+    if (!PLACEHOLDER.test(outputDir)) out.outputDir = outputDir;
+  }
   return out;
 }
 
@@ -123,6 +133,7 @@ export function stepErrors(step, form) {
   const errors = [];
   if (step === 1) {
     if (!form.name.trim()) errors.push('Give the application a name');
+    else if (!APP_NAME.test(form.name.trim())) errors.push('The name uses letters, digits, spaces, ".", "_" and "-" (max 64 characters) and starts with a letter or digit');
     if (!form.username) errors.push('Choose an account');
     if (!form.domain) errors.push('Choose a domain');
     if (!BASE_PATH.test(form.basePath.trim() || '/') || /(^|\/)\.\.(\/|$)/.test(form.basePath)) errors.push('The base path must look like / or /api');
@@ -133,7 +144,11 @@ export function stepErrors(step, form) {
       const field = MODE_FIELD[form.start.mode];
       if (!field || !String(form.start[field] || '').trim()) errors.push(`The start mode "${form.start.mode}" needs ${field === 'entry' ? 'an entry file' : field === 'script' ? 'an npm script' : 'a module'}`);
       if (field === 'module' && String(form.start.module).includes('<')) errors.push('Replace <project> in the module with your project name');
-    } else if (!String(form.build.outputDir || '').trim()) errors.push('Set the output directory Apache serves');
+    } else {
+      const outputDir = String(form.build.outputDir || '').trim();
+      if (!outputDir) errors.push('Set the output directory Apache serves');
+      else if (PLACEHOLDER.test(outputDir) && !(form.preset && outputDir === form.presetOutputDir)) errors.push('Replace <project> in the output directory with the Angular project name (Inspect reads it from angular.json)');
+    }
     if (form.source === 'git' && !GIT_URL.test(form.gitUrl.trim())) errors.push('The repository URL must be an https:// URL without credentials');
     if (form.source === 'scaffold' && !form.preset) errors.push('Scaffolds need a preset');
   }

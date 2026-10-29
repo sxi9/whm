@@ -124,6 +124,14 @@ async function stamp(page, text) {
   await page.waitForTimeout(600);
   await shot('17-whm-marketplace');
 
+  // Application Manager (category 31): the three pages degrade to install prompts here.
+  for (const [n, slug] of [['18', 'application-manager'], ['19', 'runtime-versions'], ['20', 'application-templates']]) {
+    await page.goto(`${BASE}/application-manager/${slug}`);
+    await page.waitForSelector('.page-header h1');
+    await page.waitForTimeout(600);
+    await shot(`${n}-${slug}`);
+  }
+
   // Count sidebar entries after expanding all.
   await page.goto(`${BASE}/`);
   await page.waitForSelector('.sidebar-tools');

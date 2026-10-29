@@ -1208,7 +1208,8 @@ Design and API contract: `docs/design/application-manager.md`.
   apps using each, default, *Remove*; *Install a version* from the LTS/current list fetched from nodejs.org
   or a typed version — a job downloads the official tarball, verifies it against `SHASUMS256.txt` and unpacks it
   root-owned), *Python* (detected interpreters, venv support, an install hint for `python3-venv`/`python3-pip`
-  through *Install Distro Packages*), *git*, and the defaults form.
+  through *Install Distro Packages*), *git*, the defaults form, and a *Policy* card (`GET`/`PUT /api/apps/settings`,
+  root: whether resellers may create and control applications, the port range).
 - **Server:** `app.runtime.detect`, `app.runtime.node.install` (curl → sha256sum → tar, into a private
   temporary directory, refuses an existing version or a checksum mismatch), `app.runtime.node.remove`
   (refused while an app uses it).

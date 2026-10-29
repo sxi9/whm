@@ -4,7 +4,7 @@ import { HttpError } from '../lib/errors.js';
 // Ops report problems with stable codes; validation-style failures (a bad
 // certificate, a key that does not match, an invalid config) are the caller's
 // fault and surface as 422 with the op's message rather than a 500.
-const CLIENT_FAULT_CODES = new Set(['config_invalid', 'refused', 'validation_failed', 'acme_failed', 'unsupported', 'in_use', 'conflict']);
+const CLIENT_FAULT_CODES = new Set(['config_invalid', 'refused', 'validation_failed', 'acme_failed', 'unsupported', 'in_use', 'conflict', 'build_failed', 'git_failed', 'download_failed']);
 export function agentErrorStatus(code = '') {
   if (code === 'capability_missing' || code === 'binary_not_found') return 501;
   if (code === 'invalid_args') return 422;

@@ -36,12 +36,15 @@ const SLUG = /^[a-z0-9][a-z0-9-]{0,47}$/;
 const RUN_USER = /^[a-z][a-z0-9_-]{0,31}$/;
 // Everything that becomes an ExecStart token must satisfy the agent's argToken.
 const ARG_TOKEN = /^[A-Za-z0-9_@.:=,+/-]{1,256}$/;
+// The root becomes WorkingDirectory=, PATH= and Alias/DocumentRoot arguments,
+// so it is limited to the agent's unitPath character set.
+const UNIT_PATH = /^[A-Za-z0-9._@+=,:/-]+$/;
 // A path relative to the app root, usable as an argv token: no whitespace or
 // shell characters, never starting with "-", no ".." segment.
 const REL_PATH = /^(?!\.\.(?:\/|$))(?!.*\/\.\.(?:\/|$))[A-Za-z0-9_@.+][A-Za-z0-9_@.+/-]{0,199}$/;
 
 const relPath = z.string().regex(REL_PATH, 'A relative path inside the application (letters, digits, ".", "_", "-", "/")');
-const scriptName = z.string().regex(SCRIPT_NAME, 'npm script names use letters, digits, ":", "_", "." and "-"');
+const scriptName = z.string().regex(SCRIPT_NAME, 'npm script names use letters, digits, ":", "_", "." and "-"').refine((s) => !s.startsWith('-'), 'Script names cannot start with "-"');
 const pipPackage = z.string().regex(PIP_PACKAGE, 'pip requirement such as gunicorn or flask==3.0.0');
 const nodeVersion = z.string().regex(NODE_VERSION, 'Node.js versions look like 20.11.0');
 const pythonVersion = z.string().regex(PYTHON_VERSION, 'Python versions look like 3.12');
@@ -63,7 +66,7 @@ const buildSchema = z.object({
 }).strict();
 const limitsSchema = z.object({
   memoryMaxMb: z.number().int().min(64).max(65536).optional(),
-  tasksMax: z.number().int().min(16).max(65536).optional(),
+  tasksMax: z.number().int().min(16).max(32768).optional(),
   cpuQuotaPercent: z.number().int().min(10).max(800).optional(),
 }).strict();
 
@@ -73,7 +76,8 @@ export const schemas = {
   status: z.enum(STATUSES),
   presetId: z.string().regex(SLUG, 'Preset ids are lowercase slugs'),
   slug: z.string().regex(SLUG, 'Lowercase letters, digits and "-"; max 48 characters'),
-  basePath: z.string().max(128).regex(BASE_PATH, 'Base paths look like / or /api').refine((p) => !/(^|\/)\.\.(\/|$)/.test(p), 'No ".." segments'),
+  basePath: z.string().max(128).regex(BASE_PATH, 'Base paths look like / or /api').refine((p) => !/(^|\/)\.\.?(\/|$)/.test(p), 'No "." or ".." segments'),
+  root: fields.absPath.max(512).regex(UNIT_PATH, 'Only letters, digits and . _ @ + = , : - in the application path'),
   env: z.record(z.string().regex(ENV_KEY, 'Variable names are UPPER_CASE'), envValue).refine((o) => Object.keys(o).length <= 64, 'At most 64 variables'),
   envValue,
   start: startSchema,
@@ -111,7 +115,7 @@ export const createSchema = presetFieldsSchema.extend({
   preset: schemas.presetId.optional(),
   domain: fields.hostname,
   basePath: schemas.basePath.default('/'),
-  root: fields.absPath.max(512),
+  root: schemas.root,
   env: schemas.env.optional(),
   source: schemas.source.optional(),
 }).strict();
@@ -210,7 +214,7 @@ export function resolvePreset(presetId, overrides = {}, templates = []) {
   return {
     kind,
     preset: base?.id ?? null,
-    runtimeKind: kind === 'static' ? (build.install === 'npm' ? 'node' : null) : kind,
+    runtimeKind: kind === 'static' ? (build.install === 'npm' || build.script ? 'node' : null) : kind,
     start,
     build,
     websockets: kind === 'static' ? false : (overrides.websockets ?? base?.websockets ?? true),
@@ -502,9 +506,25 @@ export function createApplicationManagerService(ctx) {
   }
   // Rewrites <apache root>/whm-apps/<domain>.conf from every published app of
   // the domain (longest base path first: ProxyPass takes the first match).
-  async function writeProxy(domain, { include = null, exclude = null } = {}, call) {
-    const rows = stmts.byDomain.all(domain).filter((r) => r.id !== exclude && (r.id === include || r.proxy_path));
-    return call('app.proxy.write', { domain, apps: rows.map(proxyEntry), reload: true });
+  // The domain's document root travels with every include write so an app
+  // published at "/" leaves /.well-known/acme-challenge on it (AutoSSL webroot).
+  const docrootStmts = {
+    domain: db.prepare('SELECT d.docroot, d.type, a.home_dir, a.username FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE d.domain = ?'),
+    main: db.prepare('SELECT home_dir, username FROM accounts WHERE domain = ?'),
+  };
+  const DOCROOT_RE = /^\/[A-Za-z0-9_.\/-]+$/;
+  function docrootFor(domain) {
+    const homeOf = (r) => r.home_dir || `${settings.get('basic.home_root') || '/home'}/${r.username}`;
+    const d = docrootStmts.domain.get(domain);
+    let docroot = null;
+    if (d) docroot = d.docroot || (d.type === 'main' ? `${homeOf(d)}/public_html` : `${homeOf(d)}/public_html/${domain}`);
+    else { const m = docrootStmts.main.get(domain); if (m) docroot = `${homeOf(m)}/public_html`; }
+    return docroot && DOCROOT_RE.test(docroot) ? docroot : null;
+  }
+  async function writeProxy(domain, { include = null, exclude = null, override = null } = {}, call) {
+    const rows = stmts.byDomain.all(domain).filter((r) => r.id !== exclude && (r.id === include || r.proxy_path)).map((r) => (override && r.id === override.id ? override : r));
+    const docroot = docrootFor(domain);
+    return call('app.proxy.write', { domain, apps: rows.map(proxyEntry), reload: true, ...(docroot ? { docroot } : {}) });
   }
   async function webRunUser(call) {
     try { const d = await call('web.detect', {}); if (RUN_USER.test(d?.apache?.runUser ?? '')) return d.apache.runUser; } catch (err) { logger.warn({ err }, 'web.detect failed; assuming www-data'); }
@@ -532,7 +552,7 @@ export function createApplicationManagerService(ctx) {
 
   // The deploy pipeline (jobs app.deploy / app.rebuild): prepare → runtime →
   // install → build → publish → start. A failing step leaves the row `failed`.
-  async function runDeploy(appId, { pull = false, scaffold = null, source = null, prepare = false } = {}, job) {
+  async function runDeploy(appId, { pull = false, scaffold = null, source = null, prepare = false, resume = false } = {}, job) {
     const row = stmts.byId.get(appId);
     if (!row) throw notFound('Application');
     const acct = stmts.accountById.get(row.account_id);
@@ -550,7 +570,15 @@ export function createApplicationManagerService(ctx) {
     patch(appId, { status: 'deploying', last_error: null, last_job_id: job?.job?.id ?? row.last_job_id });
     const logOutput = (r, label) => { for (const line of r.output || []) log(line); log(`${label} finished in ${Math.round((r.durationMs || 0) / 1000)}s`); };
     try {
-      if (prepare) {
+      let fresh = prepare;
+      if (prepare && resume) {
+        // A retry of a deploy whose clone or scaffold never finished: only an
+        // empty root is prepared again; one that has files is pulled or kept.
+        const insp = await call('app.inspect', { username, root });
+        fresh = !insp.exists || insp.empty;
+        if (!fresh) log(`${root} already has files; ${pull && source?.gitUrl ? 'pulling the latest commit' : 'keeping them'}`);
+      }
+      if (fresh) {
         progress(5, 'Preparing the application directory');
         const args = { username, root };
         if (source?.gitUrl) args.source = { gitUrl: source.gitUrl, ...(source.ref ? { ref: source.ref } : {}) };
@@ -591,7 +619,7 @@ export function createApplicationManagerService(ctx) {
         }
         if (run) {
           progress(55, `Running npm run ${build.script}`);
-          logOutput(await call('app.step', { username, root, step: 'npm-run', runtime: { kind: 'node', bin: runtime.bin }, script: build.script }, { timeoutMs: 1_800_000 }), `npm run ${build.script}`);
+          logOutput(await call('app.step', { username, root, step: 'npm-run', runtime: { kind: 'node', bin: runtime.bin }, script: build.script, production: row.mode === 'production' }, { timeoutMs: 1_800_000 }), `npm run ${build.script}`);
         }
       }
       let staticDir = null;
@@ -614,7 +642,8 @@ export function createApplicationManagerService(ctx) {
       } else {
         unit = `whm-app-${appId}`;
         progress(70, 'Writing the service unit');
-        const written = await call('app.unit.write', unitSpec({ ...row, build_json: JSON.stringify(build) }, start, env, runtime.bin));
+        const current = stmts.byId.get(appId) ?? row;
+        const written = await call('app.unit.write', unitSpec({ ...current, build_json: JSON.stringify(build) }, json.parse(current.start_json, null), decryptEnv(current), runtime.bin));
         patch(appId, { unit });
         log(`Service unit ${written.unit || unit} written`);
       }
@@ -672,6 +701,13 @@ export function createApplicationManagerService(ctx) {
   function jobActive(row) {
     if (!row.last_job_id) return false;
     try { return ['queued', 'running'].includes(ctx.jobs.get(row.last_job_id).status); } catch { return false; }
+  }
+  // An app that never published anything may still be missing its clone or
+  // scaffold, so a retried deploy or rebuild prepares the root again.
+  function resumeParams(row) {
+    if (row.unit || row.proxy_path) return {};
+    const source = json.parse(row.source_json, null);
+    return { prepare: true, resume: true, scaffold: source?.type === 'scaffold' ? source.template : null, source: source?.type === 'git' ? { gitUrl: source.url, ref: source.ref ?? null } : null };
   }
 
   // --- public API --------------------------------------------------------------
@@ -741,6 +777,7 @@ export function createApplicationManagerService(ctx) {
   async function update(id, input, user, req) {
     assertMutator(user);
     const { row } = load(id, user);
+    if (jobActive(row)) throw conflict('A deployment of this application is running; wait for it to finish');
     const curStart = json.parse(row.start_json, null);
     const curBuild = json.parse(row.build_json, {});
     const values = {};
@@ -761,7 +798,7 @@ export function createApplicationManagerService(ctx) {
       if (row.kind === 'static') build.outputDir = build.outputDir || '.';
       values.build_json = JSON.stringify(build);
       if (row.kind === 'static') {
-        const runtimeKind = build.install === 'npm' ? 'node' : null;
+        const runtimeKind = build.install === 'npm' || build.script ? 'node' : null;
         values.runtime_kind = runtimeKind;
         values.runtime_version = runtimeKind ? checkRuntimeVersion('node', input.runtimeVersion ?? (row.runtime_kind === 'node' ? row.runtime_version : undefined)) : null;
         if (!runtimeKind) values.runtime_bin = null;
@@ -782,24 +819,42 @@ export function createApplicationManagerService(ctx) {
       if (input.limits.tasksMax !== undefined) values.tasks_max = input.limits.tasksMax;
       if (input.limits.cpuQuotaPercent !== undefined) values.cpu_quota_percent = input.limits.cpuQuotaPercent;
     }
-    patch(id, values);
-    const next = stmts.byId.get(id);
+    // Host first, DB second: the unit and the include are rewritten from the
+    // candidate row and the change is persisted only once the host accepted it.
+    const next = { ...row, ...values };
     const applied = { unit: false, restarted: false, proxy: false, rebuildRequired: false };
     const unitKeys = ['name', 'start_json', 'env_enc', 'mode', 'memory_max_mb', 'tasks_max', 'cpu_quota_percent'];
-    if (next.unit && next.runtime_bin && unitKeys.some((k) => values[k] !== undefined)) {
-      requireSystemd();
-      await op('app.unit.write', unitSpec(next, json.parse(next.start_json, null), decryptEnv(next), next.runtime_bin), req);
+    const rewriteUnit = Boolean(next.unit && next.runtime_bin && unitKeys.some((k) => values[k] !== undefined));
+    const rewriteProxy = Boolean(next.proxy_path && (values.websockets !== undefined || values.spa_fallback !== undefined));
+    if (rewriteUnit) requireSystemd();
+    if (rewriteProxy) requireApache();
+    const call = (n, a, o) => op(n, a, req, o);
+    if (rewriteUnit) {
+      await call('app.unit.write', unitSpec(next, json.parse(next.start_json, null), decryptEnv(next), next.runtime_bin));
       applied.unit = true;
-      if (next.status === 'running') { await op('svc.restart', { unit: next.unit }, req); applied.restarted = true; }
     }
-    if (next.proxy_path && (values.websockets !== undefined || values.spa_fallback !== undefined)) {
-      requireApache();
-      await writeProxy(next.domain, {}, (n, a, o) => op(n, a, req, o));
+    if (rewriteProxy) {
+      try {
+        await writeProxy(next.domain, { override: next }, call);
+      } catch (err) {
+        if (applied.unit) await call('app.unit.write', unitSpec(row, curStart, decryptEnv(row), row.runtime_bin)).catch((e) => logger.warn({ err: e, app: id }, 'could not restore the unit after a failed include rewrite'));
+        throw err;
+      }
       applied.proxy = true;
+    }
+    patch(id, values);
+    if (rewriteUnit && next.status === 'running') {
+      try {
+        await call('svc.restart', { unit: next.unit });
+      } catch (err) {
+        patch(id, { status: 'failed', last_error: String(err.message || err).slice(0, 2000) });
+        throw err;
+      }
+      applied.restarted = true;
     }
     if (values.build_json !== undefined || (values.runtime_version !== undefined && values.runtime_version !== row.runtime_version)) applied.rebuildRequired = next.status !== 'created';
     audit(req, { action: 'app.update', target: String(id), args: { ...input, env: redactEnv(input.env), applied } });
-    return { ...shape(next), applied };
+    return { ...shape(stmts.byId.get(id)), applied };
   }
 
   async function control(id, verb, user, req) {
@@ -820,7 +875,7 @@ export function createApplicationManagerService(ctx) {
     requireApache();
     if (row.kind !== 'static') requireSystemd();
     if (jobActive(row)) throw conflict('A deployment of this application is already running');
-    const job = enqueue('app.rebuild', { appId: id }, user);
+    const job = enqueue('app.rebuild', { appId: id, ...resumeParams(row) }, user);
     patch(id, { last_job_id: job.id });
     audit(req, { action: 'app.rebuild', target: String(id), args: { username: row.username, jobId: job.id } });
     return { app: shape(stmts.byId.get(id)), job };
@@ -835,7 +890,7 @@ export function createApplicationManagerService(ctx) {
     if (row.kind !== 'static') requireSystemd();
     capabilities.require('git', 'git is not installed on this server');
     if (jobActive(row)) throw conflict('A deployment of this application is already running');
-    const job = enqueue('app.deploy', { appId: id, pull: true }, user);
+    const job = enqueue('app.deploy', { appId: id, pull: true, ...resumeParams(row) }, user);
     patch(id, { last_job_id: job.id });
     audit(req, { action: 'app.deploy', target: String(id), args: { username: row.username, url: source.url, ref: source.ref ?? null, jobId: job.id } });
     return { app: shape(stmts.byId.get(id)), job };
@@ -968,7 +1023,7 @@ export function createApplicationManagerService(ctx) {
 
   const jobs = {
     'app.deploy': (job) => runDeploy(job.params.appId, job.params, job),
-    'app.rebuild': (job) => runDeploy(job.params.appId, { prepare: false, pull: false }, job),
+    'app.rebuild': (job) => runDeploy(job.params.appId, { ...job.params, pull: false }, job),
     'app.runtime.install': (job) => runtimeInstallJob(job),
   };
 

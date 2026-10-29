@@ -10,6 +10,11 @@ const SYSTEM_PY = { version: '3.12.3', bin: '/usr/bin/python3', source: 'system'
 const SECRET = 'postgres://api:SecretPw1@db.internal/api';
 let managedNode = [];
 const stepFailures = new Set();
+const prepareFailures = new Set();
+const emptyRoots = new Set();
+const stepGates = new Map();
+const UNIT_WRITE = ({ id }) => ({ id, unit: `whm-app-${id}`, path: `/etc/whm/apps/whm-app-${id}.service`, envPath: `/etc/whm/apps/${id}.env` });
+const GIT_FAILED = () => Object.assign(new Error('fatal: could not read Username for https://github.com: terminal prompts disabled'), { agentError: true, code: 'git_failed', details: {} });
 
 let app;
 let csrf;
@@ -40,14 +45,18 @@ beforeAll(async () => {
     'app.runtime.detect': () => ({ node: [SYSTEM_NODE, ...managedNode], python: [SYSTEM_PY], git: { installed: true, version: '2.43.0' }, arch: 'x64' }),
     'app.runtime.node.install': ({ version }) => { const e = { version, bin: `/opt/whm/runtimes/node/${version}/bin/node`, path: `/opt/whm/runtimes/node/${version}`, source: 'managed', npm: `/opt/whm/runtimes/node/${version}/bin/npm` }; managedNode.push(e); return e; },
     'app.runtime.node.remove': ({ version }) => { managedNode = managedNode.filter((m) => m.version !== version); return { version, removed: true }; },
-    'app.inspect': ({ root }) => ({ root, exists: true, empty: false, files: ['package.json', 'server.js', 'package-lock.json'], packageJson: { name: 'demo', scripts: { start: 'next start', build: 'next build' }, dependencies: ['next', 'react', 'react-dom'] }, requirements: null, angularProjects: [], hints: { preset: null, outputDir: null, startEntry: 'server.js', lockfile: 'package-lock.json' } }),
-    'app.prepare': ({ root, source, scaffold }) => ({ root, cloned: Boolean(source), scaffolded: scaffold ? ['package.json', 'server.js'] : [] }),
+    'app.inspect': ({ root }) => ({ root, exists: true, empty: emptyRoots.has(root), files: ['package.json', 'server.js', 'package-lock.json'], packageJson: { name: 'demo', scripts: { start: 'next start', build: 'next build' }, dependencies: ['next', 'react', 'react-dom'] }, requirements: null, angularProjects: [], hints: { preset: null, outputDir: null, startEntry: 'server.js', lockfile: 'package-lock.json' } }),
+    'app.prepare': ({ root, source, scaffold }) => {
+      if (prepareFailures.has(root)) throw GIT_FAILED();
+      return { root, cloned: Boolean(source), scaffolded: scaffold ? ['package.json', 'server.js'] : [] };
+    },
     'app.pull': ({ root }) => ({ root, head: 'abcdef1234567890abcdef1234567890abcdef12' }),
-    'app.step': ({ step, root }) => {
+    'app.step': async ({ step, root }) => {
+      if (stepGates.has(root)) await stepGates.get(root);
       if (stepFailures.has(root)) throw Object.assign(new Error('npm ERR! missing script: build'), { agentError: true, code: 'build_failed', details: { output: ['npm ERR! missing script: build'] } });
       return { step, code: 0, durationMs: 1200, output: [`${step} ok`] };
     },
-    'app.unit.write': ({ id }) => ({ id, unit: `whm-app-${id}`, path: `/etc/whm/apps/whm-app-${id}.service`, envPath: `/etc/whm/apps/${id}.env` }),
+    'app.unit.write': UNIT_WRITE,
     'app.unit.remove': ({ id }) => ({ id, removed: true }),
     'app.proxy.write': ({ domain, apps }) => ({ domain, path: `/etc/apache2/whm-apps/${domain}.conf`, apps: apps.length, removed: apps.length === 0, modules: { enabled: [], missing: [] }, reloaded: true }),
     'app.static.expose': ({ dir }) => ({ dir, method: 'acl', chain: ['/home/alice', '/home/alice/public_html'] }),
@@ -109,6 +118,8 @@ describe('presets (pure)', () => {
     expect(resolvePreset('flask')).toMatchObject({ kind: 'python', preset: 'flask', runtimeKind: 'python', start: { mode: 'gunicorn', module: 'app:app', workers: 2 }, build: { install: 'pip', script: null, outputDir: null, extraPackages: [] }, websockets: true, spaFallback: false });
     expect(resolvePreset('react-vite', { build: { outputDir: 'out' }, spaFallback: false })).toMatchObject({ kind: 'static', runtimeKind: 'node', start: null, build: { install: 'npm', script: 'build', outputDir: 'out' }, websockets: false, spaFallback: false });
     expect(resolvePreset('static-files')).toMatchObject({ kind: 'static', runtimeKind: null, build: { install: null, script: null, outputDir: '.' } });
+    expect(resolvePreset('static-files', { build: { script: 'build' } })).toMatchObject({ runtimeKind: 'node', build: { install: null, script: 'build' } });
+    expect(resolvePreset('react-vite', { build: { install: null } })).toMatchObject({ runtimeKind: 'node', build: { install: null, script: 'build' } });
     expect(resolvePreset('express', { start: { entry: 'app.js' } }).start).toEqual({ mode: 'file', entry: 'app.js' });
     expect(resolvePreset('express', { start: { mode: 'npm-script', script: 'serve' } }).start).toEqual({ mode: 'npm-script', script: 'serve' });
     expect(resolvePreset('node-custom').build).toMatchObject({ script: 'build', optional: true });
@@ -190,6 +201,7 @@ describe('Application Manager API', () => {
     expect(res.body.data.preset.id).toBe('nextjs');
     expect((await post('/api/apps/inspect', { username: 'alice', root: '/home/bob/apps/next' })).status).toBe(422);
     expect((await post('/api/apps/inspect', { username: 'alice', root: '/home/alice/apps/../../etc' })).status).toBe(422);
+    expect((await post('/api/apps/inspect', { username: 'alice', root: '/home/alice/my app' })).status).toBe(422);
   });
 
   it('validates the create request before touching the host', async () => {
@@ -214,6 +226,15 @@ describe('Application Manager API', () => {
       [{ ...base, name: 'a;b' }, /validation/i],
       [{ ...base, source: { type: 'scaffold', template: 'flask' } }, /goes with/],
       [{ ...base, limits: { memoryMaxMb: 8 } }, /validation/i],
+      [{ ...base, limits: { tasksMax: 40000 } }, /validation/i],
+      [{ ...base, root: '/home/alice/my app' }, /validation/i],
+      [{ ...base, root: "/home/alice/apps/it's" }, /validation/i],
+      [{ ...base, root: '/home/alice/apps/100%' }, /validation/i],
+      [{ ...base, root: '/home/alice/apps/café' }, /validation/i],
+      [{ ...base, basePath: '/.' }, /validation/i],
+      [{ ...base, basePath: '/./x' }, /validation/i],
+      [{ ...base, basePath: '/x/..' }, /validation/i],
+      [{ ...base, start: { mode: 'npm-script', script: '-x' } }, /validation/i],
       [{ ...base, extra: true }, /validation/i],
     ];
     const before = app.agent.calls.length;
@@ -242,9 +263,9 @@ describe('Application Manager API', () => {
     expect(names(calls)).toEqual(['app.prepare', 'app.runtime.detect', 'app.step', 'app.step', 'app.unit.write', 'app.proxy.write', 'svc.start']);
     expect(calls[0].args).toEqual({ username: 'alice', root: '/home/alice/apps/api', source: { gitUrl: 'https://github.com/example/api.git', ref: 'main' } });
     expect(calls[2].args).toEqual({ username: 'alice', root: '/home/alice/apps/api', step: 'npm-install', runtime: { kind: 'node', bin: '/usr/bin/node' }, production: false });
-    expect(calls[3].args).toEqual({ username: 'alice', root: '/home/alice/apps/api', step: 'npm-run', runtime: { kind: 'node', bin: '/usr/bin/node' }, script: 'build' });
+    expect(calls[3].args).toEqual({ username: 'alice', root: '/home/alice/apps/api', step: 'npm-run', runtime: { kind: 'node', bin: '/usr/bin/node' }, script: 'build', production: true });
     expect(calls[4].args).toEqual({ id: apiId, username: 'alice', name: 'API', root: '/home/alice/apps/api', exec: { bin: '/usr/bin/node', args: ['dist/main.js'] }, port: apiPort, env: { DATABASE_URL: SECRET, LOG_LEVEL: 'info' }, pathDirs: ['/usr/bin', '/home/alice/apps/api/node_modules/.bin'], mode: 'production', limits: { memoryMaxMb: 512, tasksMax: 256, cpuQuotaPercent: 100 } });
-    expect(calls[5].args).toEqual({ domain: 'example.com', apps: [{ id: apiId, kind: 'proxy', basePath: '/api', port: apiPort, websockets: true, spaFallback: false }], reload: true });
+    expect(calls[5].args).toEqual({ domain: 'example.com', apps: [{ id: apiId, kind: 'proxy', basePath: '/api', port: apiPort, websockets: true, spaFallback: false }], reload: true, docroot: '/home/alice/public_html' });
     expect(calls[6].args).toEqual({ unit: `whm-app-${apiId}` });
     const shown = await get(`/api/apps/${apiId}`);
     expect(shown.status).toBe(200);
@@ -253,15 +274,45 @@ describe('Application Manager API', () => {
   });
 
   it('keeps env values out of every audit row', async () => {
-    const rows = app.ctx.db.prepare("SELECT action, args_redacted FROM audit_log WHERE args_redacted LIKE '%DATABASE_URL%'").all();
+    // Environment maps are redacted as a whole (audit middleware SECRET_KEYS): no key, no value.
+    const rows = app.ctx.db.prepare("SELECT action, args_redacted FROM audit_log WHERE args_redacted LIKE '%\"env\"%'").all();
     expect(rows.length).toBeGreaterThanOrEqual(2);
     for (const r of rows) {
       expect(r.args_redacted).not.toContain('SecretPw1');
-      expect(JSON.parse(r.args_redacted).env ?? JSON.parse(r.args_redacted).args?.env).toMatchObject({ DATABASE_URL: '[redacted]' });
+      expect(r.args_redacted).not.toContain('DATABASE_URL');
+      const parsed = JSON.parse(r.args_redacted);
+      expect(parsed.env ?? parsed.args?.env).toBe('[redacted]');
     }
     expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE args_redacted LIKE '%SecretPw1%'").get().n).toBe(0);
     expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'app.create'").get().n).toBe(1);
     expect(app.ctx.db.prepare("SELECT env_enc FROM apps WHERE id = ?").get(apiId).env_enc).toMatch(/^v1:/);
+  });
+
+  it('redacts env values in the automatic audit row when validation or RBAC rejects the request before the handler', async () => {
+    const base = { username: 'alice', name: 'Leak', preset: 'express', domain: 'example.com', root: '/home/alice/apps/leak', env: { DATABASE_URL: SECRET } };
+    const plain = await app.createUser('plainuser', 'user');
+    const uHttp = request.agent(app.ctx.app);
+    const uCsrf = (await uHttp.post('/api/auth/login').send({ username: plain.username, password: plain.password })).body.data.csrfToken;
+    const before = app.ctx.db.prepare('SELECT COUNT(*) AS n FROM audit_log').get().n;
+    expect((await post('/api/apps', { ...base, basePath: 'bad' })).status).toBe(422);
+    const badValue = await post('/api/apps', { ...base, basePath: '/leak', env: { DATABASE_URL: `${SECRET}\nextra` } });
+    expect(badValue.status).toBe(422);
+    expect(badValue.body.error.fields).toHaveProperty('env.DATABASE_URL');
+    expect((await post('/api/apps', { ...base, basePath: '/leak', env: `DATABASE_URL=${SECRET}` })).status).toBe(422);
+    expect((await put(`/api/apps/${apiId}`, { bogus: true, env: { DATABASE_URL: SECRET } })).status).toBe(422);
+    expect((await put(`/api/apps/${apiId}`, { env: { DATABASE_URL: `${SECRET}\nextra` } })).status).toBe(422);
+    expect((await mutate(uHttp, 'post', '/api/apps', base, uCsrf)).status).toBe(403);
+    expect((await mutate(uHttp, 'put', `/api/apps/${apiId}`, { env: { DATABASE_URL: SECRET } }, uCsrf)).status).toBe(403);
+    const rows = app.ctx.db.prepare('SELECT action, args_redacted, result FROM audit_log WHERE id > (SELECT MAX(id) FROM (SELECT id FROM audit_log ORDER BY id LIMIT ?))').all(before);
+    expect(rows.filter((r) => /^(POST|PUT) \/api\/apps/.test(r.action)).length).toBe(7);
+    for (const r of rows) {
+      expect(r.result).toMatch(/^error:4/);
+      expect(r.args_redacted).not.toContain('SecretPw1');
+      expect(JSON.parse(r.args_redacted).env).toEqual(expect.anything());
+    }
+    expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE args_redacted LIKE '%SecretPw1%'").get().n).toBe(0);
+    expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM apps WHERE name = 'Leak'").get().n).toBe(0);
+    expect(app.ctx.db.prepare('SELECT name FROM apps WHERE id = ?').get(apiId).name).toBe('API');
   });
 
   it('builds a static React app, exposes the output and writes a static block without a unit', async () => {
@@ -276,7 +327,7 @@ describe('Application Manager API', () => {
     expect(names(calls)).toEqual(['app.prepare', 'app.runtime.detect', 'app.step', 'app.step', 'web.detect', 'app.static.expose', 'app.proxy.write']);
     expect(calls[0].args).toEqual({ username: 'alice', root: '/home/alice/public_html/shop' });
     expect(calls[5].args).toEqual({ username: 'alice', dir: '/home/alice/public_html/shop/dist', runUser: 'www-data' });
-    expect(calls[6].args).toEqual({ domain: 'shop.example.com', apps: [{ id: shopId, kind: 'static', basePath: '/', staticDir: '/home/alice/public_html/shop/dist', websockets: false, spaFallback: true }], reload: true });
+    expect(calls[6].args).toEqual({ domain: 'shop.example.com', apps: [{ id: shopId, kind: 'static', basePath: '/', staticDir: '/home/alice/public_html/shop/dist', websockets: false, spaFallback: true }], reload: true, docroot: '/home/alice/public_html/shop' });
     expect(row(shopId)).toMatchObject({ status: 'built', unit: null, proxy_path: '/etc/apache2/whm-apps/shop.example.com.conf' });
     expect(JSON.parse(row(shopId).build_json)).toMatchObject({ outputDir: 'dist', resolvedOutputDir: 'dist' });
     expect(done.result).toMatchObject({ status: 'built', staticDir: '/home/alice/public_html/shop/dist' });
@@ -389,17 +440,43 @@ describe('Application Manager API', () => {
     expect(res.status).toBe(200);
     expect(res.body.data).toMatchObject({ name: 'API v2', websockets: false, limits: { memoryMaxMb: 1024 }, env: { NEW_SECRET: 'hunter2-value', LOG_LEVEL: 'debug' }, applied: { unit: true, restarted: true, proxy: true, rebuildRequired: false } });
     const calls = opsSince(before);
-    expect(names(calls)).toEqual(['app.unit.write', 'svc.restart', 'app.proxy.write']);
+    expect(names(calls)).toEqual(['app.unit.write', 'app.proxy.write', 'svc.restart']);
     expect(calls[0].args).toMatchObject({ id: apiId, name: 'API v2', env: { NEW_SECRET: 'hunter2-value', LOG_LEVEL: 'debug' }, limits: { memoryMaxMb: 1024, tasksMax: 256, cpuQuotaPercent: 100 } });
-    expect(calls[2].args.apps.find((a) => a.id === apiId).websockets).toBe(false);
+    expect(calls[1].args.apps.find((a) => a.id === apiId).websockets).toBe(false);
     expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE args_redacted LIKE '%hunter2-value%'").get().n).toBe(0);
-    expect(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'app.update'").get().args_redacted).toContain('"NEW_SECRET":"[redacted]"');
+    expect(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'app.update'").get().args_redacted).toContain('"env":"[redacted]"');
     const build = await put(`/api/apps/${apiId}`, { build: { script: 'compile' }, start: { entry: 'dist/server.js' } });
     expect(build.status).toBe(200);
     expect(build.body.data).toMatchObject({ start: { mode: 'file', entry: 'dist/server.js' }, build: { script: 'compile' }, applied: { rebuildRequired: true } });
     expect((await put(`/api/apps/${shopId}`, { start: { mode: 'file', entry: 'x.js' } })).status).toBe(422);
     expect((await put(`/api/apps/${apiId}`, { domain: 'other.example.com' })).status).toBe(422);
     expect((await put(`/api/apps/${apiId}`, { runtimeVersion: '3.12' })).status).toBe(422);
+  });
+
+  it('persists an update only after the host accepted it', async () => {
+    expect((await put(`/api/apps/${apiId}`, { limits: { tasksMax: 40000 } })).status).toBe(422);
+    expect((await put(`/api/apps/${apiId}`, { start: { mode: 'npm-script', script: '-x' } })).status).toBe(422);
+    const snapshot = row(apiId);
+    app.agent.fail('app.unit.write', 'invalid_args', 'limits.tasksMax: Number must be less than or equal to 32768');
+    let before = app.agent.calls.length;
+    const refused = await put(`/api/apps/${apiId}`, { limits: { tasksMax: 20000 }, env: { NEW_SECRET: 'other' }, websockets: true });
+    expect(refused.status).toBe(422);
+    expect(refused.body.error.code).toBe('invalid_args');
+    expect(names(opsSince(before))).toEqual(['app.unit.write']);
+    expect(row(apiId)).toEqual(snapshot);
+    expect(app.ctx.apps.shape(row(apiId)).env).toEqual({ NEW_SECRET: 'hunter2-value', LOG_LEVEL: 'debug' });
+    app.agent.set('app.unit.write', UNIT_WRITE);
+    app.agent.fail('app.proxy.write', 'config_invalid', 'Syntax error on line 3');
+    before = app.agent.calls.length;
+    const badInclude = await put(`/api/apps/${apiId}`, { name: 'API v3', websockets: true });
+    expect(badInclude.status).toBe(422);
+    const calls = opsSince(before);
+    expect(names(calls)).toEqual(['app.unit.write', 'app.proxy.write', 'app.unit.write']);
+    expect(calls[0].args.name).toBe('API v3');
+    expect(calls[2].args.name).toBe('API v2');
+    expect(row(apiId)).toEqual(snapshot);
+    app.agent.set('app.proxy.write', ({ domain, apps }) => ({ domain, path: `/etc/apache2/whm-apps/${domain}.conf`, apps: apps.length, removed: apps.length === 0, modules: { enabled: [], missing: [] }, reloaded: true }));
+    expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'app.update'").get().n).toBe(2);
   });
 
   it('marks the app failed when a build step fails', async () => {
@@ -454,7 +531,7 @@ describe('Application Manager API', () => {
     expect(names(calls)).toEqual(['svc.stop', 'app.unit.remove', 'app.proxy.write', 'app.purge']);
     expect(calls[0].args).toEqual({ unit: `whm-app-${flaskId}` });
     expect(calls[1].args).toEqual({ id: flaskId });
-    expect(calls[2].args).toEqual({ domain: 'example.com', apps: [{ id: apiId, kind: 'proxy', basePath: '/api', port: apiPort, websockets: false, spaFallback: false }], reload: true });
+    expect(calls[2].args).toEqual({ domain: 'example.com', apps: [{ id: apiId, kind: 'proxy', basePath: '/api', port: apiPort, websockets: false, spaFallback: false }], reload: true, docroot: '/home/alice/public_html' });
     expect(calls[3].args).toEqual({ username: 'alice', root: '/home/alice/apps/flask' });
     expect((await get(`/api/apps/${flaskId}`)).status).toBe(404);
     before = app.agent.calls.length;
@@ -462,7 +539,7 @@ describe('Application Manager API', () => {
     expect(stat.status).toBe(200);
     calls = opsSince(before);
     expect(names(calls)).toEqual(['app.proxy.write']);
-    expect(calls[0].args).toEqual({ domain: 'shop.example.com', apps: [], reload: true });
+    expect(calls[0].args).toEqual({ domain: 'shop.example.com', apps: [], reload: true, docroot: '/home/alice/public_html/shop' });
     expect(stat.body.data.cleanup.proxy).toMatchObject({ removed: true });
     expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'app.remove'").get().n).toBe(3);
   });
@@ -474,7 +551,7 @@ describe('Application Manager API', () => {
     expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM apps WHERE username = 'bob'").get().n).toBe(0);
     const calls = opsSince(before);
     expect(calls.find((c) => c.name === 'app.unit.remove')?.args).toEqual({ id: bobAppId });
-    expect(calls.find((c) => c.name === 'app.proxy.write')?.args).toEqual({ domain: 'bob.example.org', apps: [], reload: true });
+    expect(calls.find((c) => c.name === 'app.proxy.write')?.args).toEqual({ domain: 'bob.example.org', apps: [], reload: true, docroot: '/home/bob/public_html' });
     expect(calls.some((c) => c.name === 'app.purge')).toBe(false);
     const terminate = JSON.parse(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'account.terminate'").get().args_redacted);
     expect(terminate.cleanup.apps.removed).toEqual([bobAppId]);
@@ -599,5 +676,115 @@ describe('Application Templates API', () => {
     expect((await get(`/api/apps/templates/${templateId}`)).status).toBe(404);
     expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action LIKE 'app.template.%'").get().n).toBe(3);
     expect((await del(`/api/apps/${created.body.data.app.id}`)).status).toBe(200);
+  });
+});
+
+describe('deploy edge cases', () => {
+  it('resolves the Node runtime for a static app that only runs a build script', async () => {
+    const before = app.agent.calls.length;
+    const res = await post('/api/apps', { username: 'alice', name: 'Docs site', preset: 'static-files', domain: 'example.com', basePath: '/docs', root: '/home/alice/public_html/docs', build: { script: 'build' }, source: { type: 'upload' } });
+    expect(res.status).toBe(202);
+    const id = res.body.data.app.id;
+    expect(res.body.data.app).toMatchObject({ kind: 'static', runtime: { kind: 'node', version: 'system' }, build: { install: null, script: 'build', outputDir: '.' } });
+    const done = await waitForJob(app.ctx, res.body.data.job.id);
+    expect(done.status, done.error).toBe('done');
+    const calls = opsSince(before);
+    expect(names(calls)).toEqual(['app.prepare', 'app.runtime.detect', 'app.step', 'web.detect', 'app.static.expose', 'app.proxy.write']);
+    expect(calls[2].args).toEqual({ username: 'alice', root: '/home/alice/public_html/docs', step: 'npm-run', runtime: { kind: 'node', bin: '/usr/bin/node' }, script: 'build', production: true });
+    expect(row(id)).toMatchObject({ status: 'built', runtime_kind: 'node', runtime_bin: '/usr/bin/node', last_error: null });
+    const upd = await put(`/api/apps/${id}`, { build: { install: 'npm' } });
+    expect(upd.status).toBe(200);
+    expect(row(id).runtime_kind).toBe('node');
+    expect((await put(`/api/apps/${id}`, { build: { install: null, script: null } })).status).toBe(200);
+    expect(row(id)).toMatchObject({ runtime_kind: null, runtime_bin: null });
+    expect((await del(`/api/apps/${id}`)).status).toBe(200);
+  });
+
+  it('refuses an update while a deployment runs and writes the unit from the current row', async () => {
+    const root = '/home/alice/apps/slow';
+    let release;
+    stepGates.set(root, new Promise((resolve) => { release = resolve; }));
+    const before = app.agent.calls.length;
+    const res = await post('/api/apps', { username: 'alice', name: 'Slow', preset: 'express', domain: 'example.com', basePath: '/slow', root, env: { TOKEN_A: 'one' }, source: { type: 'scaffold', template: 'express' } });
+    expect(res.status).toBe(202);
+    const id = res.body.data.app.id;
+    for (let i = 0; i < 100 && !app.agent.callsTo('app.step').some((c) => c.args.root === root); i++) await new Promise((r) => setTimeout(r, 20));
+    expect(app.agent.callsTo('app.step').some((c) => c.args.root === root)).toBe(true);
+    const blocked = await put(`/api/apps/${id}`, { env: { TOKEN_A: 'two' } });
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.error.message).toMatch(/running/);
+    expect((await del(`/api/apps/${id}`)).status).toBe(409);
+    expect((await post(`/api/apps/${id}/rebuild`)).status).toBe(409);
+    app.ctx.db.prepare('UPDATE apps SET name = ?, env_enc = ? WHERE id = ?').run('Slow renamed', app.ctx.crypto.encrypt(JSON.stringify({ TOKEN_A: 'three' })), id);
+    release();
+    stepGates.delete(root);
+    const done = await waitForJob(app.ctx, res.body.data.job.id);
+    expect(done.status, done.error).toBe('done');
+    const unit = opsSince(before).find((c) => c.name === 'app.unit.write');
+    expect(unit.args).toMatchObject({ id, name: 'Slow renamed', env: { TOKEN_A: 'three' } });
+    expect((await put(`/api/apps/${id}`, { env: { TOKEN_A: 'four' } })).status).toBe(200);
+    expect((await del(`/api/apps/${id}`)).status).toBe(200);
+  });
+
+  it('recovers an app whose initial clone failed: deploy clones an empty root instead of pulling', async () => {
+    const root = '/home/alice/apps/private';
+    prepareFailures.add(root);
+    const res = await post('/api/apps', { username: 'alice', name: 'Private', preset: 'express', domain: 'example.com', basePath: '/private', root, source: { type: 'git', url: 'https://github.com/example/private.git' } });
+    expect(res.status).toBe(202);
+    const id = res.body.data.app.id;
+    const failed = await waitForJob(app.ctx, res.body.data.job.id);
+    expect(failed.status).toBe('failed');
+    expect(failed.error_code).toBe('git_failed');
+    expect(row(id)).toMatchObject({ status: 'failed', unit: null, proxy_path: null, last_error: expect.stringMatching(/terminal prompts disabled/) });
+    prepareFailures.delete(root);
+    emptyRoots.add(root);
+    let before = app.agent.calls.length;
+    const retry = await post(`/api/apps/${id}/deploy`);
+    expect(retry.status).toBe(202);
+    const done = await waitForJob(app.ctx, retry.body.data.job.id);
+    expect(done.status, done.error).toBe('done');
+    let calls = opsSince(before);
+    expect(names(calls)).toEqual(['app.inspect', 'app.prepare', 'app.runtime.detect', 'app.step', 'app.unit.write', 'app.proxy.write', 'svc.start']);
+    expect(calls[1].args).toEqual({ username: 'alice', root, source: { gitUrl: 'https://github.com/example/private.git' } });
+    expect(row(id)).toMatchObject({ status: 'running', unit: `whm-app-${id}` });
+    emptyRoots.delete(root);
+    before = app.agent.calls.length;
+    const again = await post(`/api/apps/${id}/deploy`);
+    expect(again.status).toBe(202);
+    expect((await waitForJob(app.ctx, again.body.data.job.id)).status).toBe('done');
+    expect(names(opsSince(before))).toEqual(['app.pull', 'app.runtime.detect', 'app.step', 'app.unit.write', 'app.proxy.write', 'svc.restart']);
+    expect((await del(`/api/apps/${id}`)).status).toBe(200);
+  });
+
+  it('pulls instead of cloning when the clone succeeded but a later step failed, and rebuild keeps the files', async () => {
+    const root = '/home/alice/apps/halfway';
+    stepFailures.add(root);
+    const res = await post('/api/apps', { username: 'alice', name: 'Halfway', preset: 'express', domain: 'example.com', basePath: '/halfway', root, source: { type: 'git', url: 'https://github.com/example/halfway.git', ref: 'v2' } });
+    expect(res.status).toBe(202);
+    const id = res.body.data.app.id;
+    expect((await waitForJob(app.ctx, res.body.data.job.id)).status).toBe('failed');
+    stepFailures.delete(root);
+    let before = app.agent.calls.length;
+    const rb = await post(`/api/apps/${id}/rebuild`);
+    expect(rb.status).toBe(202);
+    expect((await waitForJob(app.ctx, rb.body.data.job.id)).status).toBe('done');
+    let calls = opsSince(before);
+    expect(names(calls)).toEqual(['app.inspect', 'app.runtime.detect', 'app.step', 'app.unit.write', 'app.proxy.write', 'svc.start']);
+    expect(calls.some((c) => c.name === 'app.pull' || c.name === 'app.prepare')).toBe(false);
+    expect((await del(`/api/apps/${id}`)).status).toBe(200);
+    stepFailures.add(root);
+    const res2 = await post('/api/apps', { username: 'alice', name: 'Halfway 2', preset: 'express', domain: 'example.com', basePath: '/halfway2', root, source: { type: 'git', url: 'https://github.com/example/halfway.git', ref: 'v2' } });
+    expect(res2.status).toBe(202);
+    const id2 = res2.body.data.app.id;
+    expect((await waitForJob(app.ctx, res2.body.data.job.id)).status).toBe('failed');
+    stepFailures.delete(root);
+    before = app.agent.calls.length;
+    const dep = await post(`/api/apps/${id2}/deploy`);
+    expect(dep.status).toBe(202);
+    expect((await waitForJob(app.ctx, dep.body.data.job.id)).status).toBe('done');
+    calls = opsSince(before);
+    expect(names(calls)).toEqual(['app.inspect', 'app.pull', 'app.runtime.detect', 'app.step', 'app.unit.write', 'app.proxy.write', 'svc.start']);
+    expect(calls[1].args).toEqual({ username: 'alice', root, ref: 'v2' });
+    expect((await del(`/api/apps/${id2}`)).status).toBe(200);
   });
 });

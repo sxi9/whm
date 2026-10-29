@@ -1,4 +1,6 @@
-const SECRET_KEYS = /pass(word)?|secret|token|key|cert|private|totp|csrf/i;
+// `env` covers application environment variables, which routinely hold
+// credentials under arbitrary names.
+const SECRET_KEYS = /pass(word)?|secret|token|key|cert|private|totp|csrf|^env(ironment)?$/i;
 
 export function redact(value, depth = 0) {
   if (depth > 6 || value == null) return value;

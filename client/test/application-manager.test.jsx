@@ -23,12 +23,12 @@ vi.mock('../src/hooks/useApi.js', () => ({
 }));
 
 const { PresetCards, PresetCatalog, presetFields } = await import('../src/pages/apps/PresetCards.jsx');
-const { emptyForm, applyPreset, applyKind, buildCreatePayload, stepErrors, StepWhat, runtimeOptions } = await import('../src/pages/apps/AppForm.jsx');
+const { emptyForm, applyPreset, applyKind, buildCreatePayload, stepErrors, StepWhat, runtimeOptions, needsRuntime, cleanBuild } = await import('../src/pages/apps/AppForm.jsx');
 const { EnvEditor, envToRows, rowsToEnv, envErrors, parseDotenv } = await import('../src/pages/apps/EnvEditor.jsx');
 const { AppStatusPill, suggestRoot, FALLBACK_PRESETS, CapabilitySummary } = await import('../src/pages/apps/Shared.jsx');
 const { AppOverview, settingsPayload } = await import('../src/pages/apps/AppDetail.jsx');
 const ApplicationManager = (await import('../src/pages/fn/application-manager/application-manager.jsx')).default;
-const { AppsTable } = await import('../src/pages/fn/application-manager/application-manager.jsx');
+const { AppsTable, appRowActions, mayManageApps, RESELLERS_FORBIDDEN } = await import('../src/pages/fn/application-manager/application-manager.jsx');
 const RuntimeVersions = (await import('../src/pages/fn/application-manager/runtime-versions.jsx')).default;
 const { NodeRuntimeTable, AvailableNodeList } = await import('../src/pages/fn/application-manager/runtime-versions.jsx');
 const ApplicationTemplates = (await import('../src/pages/fn/application-manager/application-templates.jsx')).default;
@@ -176,6 +176,56 @@ describe('create form', () => {
     expect(suggestRoot({ home: '/home/alice', kind: 'static', name: '' })).toBe('/home/alice/public_html/app');
     expect(runtimeOptions('python', RUNTIMES).map((o) => o.value)).toEqual(['system', '3.12']);
   });
+
+  it('checks the name against the server pattern on step 1, not on the final POST', () => {
+    const where = { ...emptyForm(), username: 'alice', domain: 'alice.example', root: '/home/alice/apps/x' };
+    expect(stepErrors(1, { ...where, name: ' Shop API ' })).toEqual([]);
+    expect(stepErrors(1, { ...where, name: 'shop.api_v2-beta' })).toEqual([]);
+    for (const bad of ['Shop API (v2)', 'shop/api', '.hidden', '-dash', 'x'.repeat(65), 'tab\tname']) {
+      const errors = stepErrors(1, { ...where, name: bad });
+      expect(errors, bad).toHaveLength(1);
+      expect(errors[0]).toContain('letters, digits, spaces');
+    }
+    expect(stepErrors(1, { ...where, name: '   ' })).toEqual(['Give the application a name']);
+  });
+
+  it('keeps the Angular <project> placeholder out of the request body and flags a stray one', () => {
+    const blank = emptyForm({ name: 'NG', username: 'alice', domain: 'alice.example', root: '/home/alice/public_html/ng' });
+    const angular = applyPreset(blank, by('angular'));
+    expect(angular.build.outputDir).toBe('dist/<project>/browser');
+    expect(angular.presetOutputDir).toBe('dist/<project>/browser');
+    expect(stepErrors(2, angular)).toEqual([]);
+    const body = buildCreatePayload(angular);
+    expect(body.preset).toBe('angular');
+    expect(body.build).toEqual({ install: 'npm', script: 'build', optional: false });
+    expect(body.build.outputDir).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain('<');
+    // Inspect resolved the project name: the concrete directory is sent.
+    const resolved = { ...angular, build: { ...angular.build, outputDir: 'dist/shop/browser' } };
+    expect(stepErrors(2, resolved)).toEqual([]);
+    expect(buildCreatePayload(resolved).build.outputDir).toBe('dist/shop/browser');
+    // A placeholder that is not the selected preset's own must be replaced by hand.
+    expect(stepErrors(2, { ...angular, preset: null })[0]).toContain('<project>');
+    const vite = applyPreset(blank, by('react-vite'));
+    expect(stepErrors(2, { ...vite, build: { ...vite.build, outputDir: 'dist/<project>/browser' } })[0]).toContain('<project>');
+    expect(stepErrors(2, { ...vite, build: { ...vite.build, outputDir: '' } })[0]).toContain('output directory');
+    expect(applyKind(angular, 'static').presetOutputDir).toBe('');
+    expect(cleanBuild({ install: 'npm', script: 'build', outputDir: ' dist/<project>/browser ' }, 'static')).toEqual({ install: 'npm', script: 'build', optional: false });
+    expect(cleanBuild({ install: '', script: '', outputDir: '' }, 'static')).toEqual({ install: null, script: null, outputDir: '.' });
+  });
+
+  it('asks for a Node.js runtime when a static app runs a build script without npm install', () => {
+    const vite = applyPreset(emptyForm({ name: 'Blog', username: 'alice', domain: 'alice.example', root: '/home/alice/public_html/blog' }), by('react-vite'));
+    const noInstall = { ...vite, build: { ...vite.build, install: '' } };
+    expect(needsRuntime(vite)).toBe(true);
+    expect(needsRuntime(noInstall)).toBe(true);
+    expect(needsRuntime({ ...noInstall, build: { ...noInstall.build, script: ' ' } })).toBe(false);
+    expect(stepErrors(2, noInstall)).toEqual([]);
+    const body = buildCreatePayload({ ...noInstall, runtimeVersion: '20.11.0' });
+    expect(body.build).toEqual({ install: null, script: 'build', optional: false, outputDir: 'dist' });
+    expect(body.runtimeVersion).toBe('20.11.0');
+    expect(render(<StepWhat form={noInstall} setForm={() => {}} presets={PRESETS} runtimes={RUNTIMES} />)).toContain('Node.js 20.11.0 (managed)');
+  });
 });
 
 describe('environment editor', () => {
@@ -255,6 +305,47 @@ describe('applications table', () => {
     expect(settingsPayload(a, { ...base, name: 'Renamed', limits: { ...a.limits, memoryMaxMb: 1024 } })).toEqual({ name: 'Renamed', limits: { memoryMaxMb: 1024, tasksMax: 256, cpuQuotaPercent: 100 } });
     expect(settingsPayload(a, { ...base, start: { ...base.start, mode: 'npm-script', script: 'start' }, runtimeVersion: 'system' })).toEqual({ start: { mode: 'npm-script', script: 'start' }, runtimeVersion: 'system' });
   });
+
+  it('never re-sends the stored Angular placeholder when other build fields change', () => {
+    const ng = app({ id: 11, name: 'NG', kind: 'static', preset: 'angular', basePath: '/', status: 'built', unit: null, port: null, websockets: false, spaFallback: true, source: { type: 'upload' }, start: {}, runtime: { kind: 'node', version: 'system', bin: '/usr/bin/node' }, build: { install: 'npm', script: 'build', optional: false, outputDir: 'dist/<project>/browser', resolvedOutputDir: 'dist/shop/browser', extraPackages: [] } });
+    const base = { name: 'NG', mode: 'production', runtimeVersion: 'system', start: { mode: 'file', entry: '', script: '', module: '', workers: 2 }, build: { install: 'npm', script: 'build', optional: false, outputDir: 'dist/<project>/browser', extraPackages: '' }, websockets: false, spaFallback: true, limits: { ...ng.limits } };
+    expect(settingsPayload(ng, base)).toEqual({});
+    const changed = settingsPayload(ng, { ...base, build: { ...base.build, install: '' } });
+    expect(changed).toEqual({ build: { install: null, script: 'build', optional: false } });
+    expect(JSON.stringify(changed)).not.toContain('<');
+    expect(settingsPayload(ng, { ...base, build: { ...base.build, outputDir: 'dist/shop/browser' } })).toEqual({ build: { install: 'npm', script: 'build', optional: false, outputDir: 'dist/shop/browser' } });
+  });
+
+  it('hides the mutating controls from resellers when the policy forbids them', () => {
+    const forbidden = { ...RUNTIMES, policy: { ...RUNTIMES.policy, allowResellers: false } };
+    const reseller = { id: 2, username: 'res', role: 'reseller' };
+    expect(mayManageApps(reseller, RUNTIMES)).toBe(true);
+    expect(mayManageApps(reseller, forbidden)).toBe(false);
+    expect(mayManageApps(reseller, null)).toBe(true);
+    expect(mayManageApps({ id: 1, username: 'root', role: 'root' }, forbidden)).toBe(true);
+    expect(appRowActions(rows[0], { allowed: true }).map((a) => a.label)).toEqual(['Details', 'Open', 'Logs', 'Stop', 'Restart', 'Rebuild', 'Deploy (git pull)', 'Edit', 'Remove']);
+    expect(appRowActions(rows[0], { allowed: false }).map((a) => a.label)).toEqual(['Details', 'Open', 'Logs']);
+    expect(appRowActions(rows[3], {}).map((a) => a.label)).toContain('Start');
+
+    responses.clear();
+    responses.set('/apps/presets', { data: PRESETS });
+    responses.set('/apps/runtimes', { data: forbidden });
+    responses.set('/apps', { data: rows, meta: { page: 1, pageSize: 25, total: rows.length } });
+    const fn = FUNCTION_BY_KEY['application-manager/application-manager'];
+    const createDisabled = (html) => /<button[^>]*\bdisabled=""[^>]*>(?:(?!<\/button>).)*Create application<\/button>/s.test(html);
+    authState.user = reseller;
+    try {
+      const html = render(<ApplicationManager fn={fn} />);
+      expect(html).toContain(RESELLERS_FORBIDDEN);
+      expect(html).toContain('Runtime Versions › Policy');
+      expect(html).toContain(`title="${RESELLERS_FORBIDDEN}"`);
+      expect(createDisabled(html)).toBe(true);
+      expect(html).toContain('Shop API');
+    } finally { authState.user = { id: 1, username: 'root', role: 'root' }; }
+    const asRoot = render(<ApplicationManager fn={fn} />);
+    expect(asRoot).not.toContain(RESELLERS_FORBIDDEN);
+    expect(createDisabled(asRoot)).toBe(false);
+  });
 });
 
 describe('runtime versions page', () => {
@@ -310,6 +401,16 @@ describe('application templates page', () => {
     expect(form.limits.memoryMaxMb).toBe(1024);
     expect(form.runtimeVersion).toBe('20.11.0');
     expect(templatePayload(form)).toEqual({ slug: 'company-api', name: 'Company API', kind: 'node', description: 'NestJS with our defaults', preset: { build: { install: 'npm', script: 'build', optional: false }, mode: 'production', limits: { memoryMaxMb: 1024, tasksMax: 256, cpuQuotaPercent: 100 }, start: { mode: 'file', entry: 'dist/main.js' }, websockets: true, runtimeVersion: '20.11.0' } });
+  });
+
+  it('refuses to store the Angular placeholder in a custom template', () => {
+    const copied = { ...applyPreset(formFromTemplate(null), by('angular')), preset: null, name: 'NG', slug: 'ng', description: '' };
+    expect(copied.build.outputDir).toBe('dist/<project>/browser');
+    expect(stepErrors(2, { ...copied, source: 'upload' })[0]).toContain('<project>');
+    expect(templatePayload(copied).preset.build).toEqual({ install: 'npm', script: 'build', optional: false });
+    const fixed = { ...copied, build: { ...copied.build, outputDir: 'dist/ng/browser' } };
+    expect(stepErrors(2, { ...fixed, source: 'upload' })).toEqual([]);
+    expect(templatePayload(fixed).preset.build.outputDir).toBe('dist/ng/browser');
   });
 
   it('hides the custom templates for resellers', () => {

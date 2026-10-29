@@ -110,6 +110,8 @@ export function assertAppRoot(info, root, ctx, { allowPublicHtml = true, mustExi
   while (cur !== home && !lstatOrNull(cur)) cur = path.dirname(cur);
   const real = fs.realpathSync(cur);
   if (real !== realHome && !real.startsWith(`${realHome}/`)) throw new OpError('refused', `${root} escapes the home directory through a symbolic link`);
+  const realRoot = st ? real : path.join(real, path.relative(cur, resolved));
+  if (!allowPublicHtml && realRoot === path.join(realHome, 'public_html')) throw new OpError('refused', `${root} resolves to the account's public_html; a server application needs its own directory`);
   if (!st) {
     if (mustExist) throw new OpError('not_found', `${root} does not exist`);
     return { root: resolved, home, exists: false };
@@ -531,12 +533,16 @@ function npmArgv(nodeBin) {
   return real.endsWith('.js') ? [nodeBin, real] : [npm];
 }
 
-export function stepEnv(runtimeBin, root, home, production) {
+// NODE_ENV is exported only when production is requested: build tools default
+// to production bundles on their own, while an inherited "development" makes
+// Vite ship the React development build. CI is set only for the install step
+// because react-scripts turns every lint warning into a build error under CI.
+export function stepEnv(runtimeBin, root, home, { production = false, step = null } = {}) {
   return {
     HOME: home,
     PATH: `${path.dirname(runtimeBin)}:${root}/.venv/bin:/usr/local/bin:/usr/bin:/bin`,
-    NODE_ENV: production ? 'production' : 'development',
-    CI: '1',
+    ...(production ? { NODE_ENV: 'production' } : {}),
+    ...(step === 'npm-install' ? { CI: '1' } : {}),
     npm_config_fund: 'false',
     npm_config_audit: 'false',
     npm_config_update_notifier: 'false',
@@ -557,6 +563,7 @@ defineOp('app.step', {
     script: scriptName.optional(),
     packages: z.array(pipPackage).max(50).optional(),
     production: z.boolean().default(false),
+    omitDev: z.boolean().optional(),
   }).strict().superRefine((v, c) => {
     if (v.step === 'npm-run' && !v.script) c.addIssue({ code: z.ZodIssueCode.custom, path: ['script'], message: 'npm-run needs a script name' });
     const needs = v.step.startsWith('npm') ? 'node' : 'python';
@@ -567,12 +574,12 @@ defineOp('app.step', {
     requireRunuser();
     const { root, home } = assertAppRoot(info, a.root, ctx, { mustExist: true });
     const bin = assertRuntimeBin(a.runtime);
-    const env = stepEnv(bin, root, home, a.production);
+    const env = stepEnv(bin, root, home, { production: a.production, step: a.step });
     const hasFile = (f) => Boolean(lstatOrNull(path.join(root, f))?.isFile());
     let argv;
     switch (a.step) {
       case 'npm-install':
-        argv = [...npmArgv(bin), hasFile('package-lock.json') ? 'ci' : 'install', ...(a.production ? ['--omit=dev'] : [])];
+        argv = [...npmArgv(bin), hasFile('package-lock.json') ? 'ci' : 'install', ...((a.omitDev ?? a.production) ? ['--omit=dev'] : [])];
         break;
       case 'npm-run':
         argv = [...npmArgv(bin), 'run', '--', a.script];
@@ -768,8 +775,12 @@ const q = (s) => {
   return `"${str}"`;
 };
 const trimBase = (b) => b.replace(/\/+$/, '');
+const ACME_PATH = '/.well-known/acme-challenge';
+// A static application at "/" replaces the vhost DocumentRoot, so the ACME
+// webroot used by AutoSSL has to be aliased back to the domain's docroot.
+const acmeAlias = (statics, docroot) => Boolean(docroot && statics.some((a) => !trimBase(a.basePath)));
 
-export function modulesFor(apps, apacheVersion) {
+export function modulesFor(apps, apacheVersion, { docroot = null } = {}) {
   const proxies = apps.filter((a) => a.kind === 'proxy');
   const statics = apps.filter((a) => a.kind === 'static');
   const required = new Set();
@@ -779,12 +790,12 @@ export function modulesFor(apps, apacheVersion) {
     for (const m of ['proxy', 'proxy_http', 'proxy_wstunnel', 'headers', 'rewrite']) all.add(m);
     if (proxies.some((a) => a.websockets) && !supportsUpgradeWebsocket(apacheVersion)) { required.add('proxy_wstunnel'); required.add('rewrite'); }
   }
-  if (statics.some((a) => trimBase(a.basePath))) { required.add('alias'); all.add('alias'); }
+  if (statics.some((a) => trimBase(a.basePath)) || acmeAlias(statics, docroot)) { required.add('alias'); all.add('alias'); }
   if (statics.some((a) => a.spaFallback)) { required.add('dir'); all.add('dir'); }
   return { required: [...required], all: [...all] };
 }
 
-export function renderAppsInclude(domain, apps, { apacheVersion = null } = {}) {
+export function renderAppsInclude(domain, apps, { apacheVersion = null, docroot = null } = {}) {
   if (!apps.length) return null;
   const upgrade = supportsUpgradeWebsocket(apacheVersion);
   const lines = [
@@ -793,6 +804,7 @@ export function renderAppsInclude(domain, apps, { apacheVersion = null } = {}) {
   ];
   const statics = apps.filter((a) => a.kind === 'static').sort((x, y) => trimBase(y.basePath).length - trimBase(x.basePath).length);
   const proxies = apps.filter((a) => a.kind === 'proxy').sort((x, y) => trimBase(x.basePath).length - trimBase(y.basePath).length);
+  if (acmeAlias(statics, docroot)) lines.push('', '# ACME HTTP-01 challenges (AutoSSL) stay on the document root', `Alias ${q(ACME_PATH)} ${q(`${docroot}${ACME_PATH}`)}`);
   for (const a of statics) {
     const base = trimBase(a.basePath);
     lines.push('', `# Application ${a.id}: static files for ${base || '/'}`);
@@ -805,7 +817,9 @@ export function renderAppsInclude(domain, apps, { apacheVersion = null } = {}) {
     lines.push('', 'ProxyPreserveHost On', 'RequestHeader set X-Forwarded-Proto "https" env=HTTPS');
     for (const a of proxies) {
       const base = trimBase(a.basePath);
-      const target = `http://127.0.0.1:${a.port}/`;
+      // Location-form ProxyPass appends the rest of the URI verbatim, so the
+      // target ends in "/" only when the base is "/".
+      const target = `http://127.0.0.1:${a.port}${base ? '' : '/'}`;
       lines.push('', `# Application ${a.id}: proxy ${base || '/'} -> 127.0.0.1:${a.port}`);
       lines.push(`<Location ${q(base || '/')}>`, `  ProxyPass ${q(target)} retry=0 timeout=120${a.websockets && upgrade ? ' upgrade=websocket' : ''}`, `  ProxyPassReverse ${q(target)}`, '</Location>');
       for (const s of statics) {
@@ -813,11 +827,12 @@ export function renderAppsInclude(domain, apps, { apacheVersion = null } = {}) {
         if (sb && sb !== base && sb.startsWith(`${base}/`)) lines.push(`<Location ${q(sb)}>`, '  ProxyPass "!"', '</Location>');
       }
     }
+    lines.push('', '# ACME HTTP-01 challenges (AutoSSL) are answered by Apache, never proxied', `<Location ${q(ACME_PATH)}>`, '  ProxyPass "!"', '</Location>');
     const ws = proxies.filter((a) => a.websockets && !upgrade).sort((x, y) => trimBase(y.basePath).length - trimBase(x.basePath).length);
     if (ws.length) {
       lines.push('', '# WebSocket upgrades on Apache older than 2.4.47 go through mod_proxy_wstunnel', 'RewriteEngine On');
       for (const a of ws) {
-        lines.push('RewriteCond %{HTTP:Upgrade} =websocket [NC]', `RewriteRule ^${escapeRegex(trimBase(a.basePath))}/?(.*)$ ws://127.0.0.1:${a.port}/$1 [P,L]`);
+        lines.push('RewriteCond %{HTTP:Upgrade} =websocket [NC]', `RewriteCond %{REQUEST_URI} !^${escapeRegex(ACME_PATH)}/`, `RewriteRule ^${escapeRegex(trimBase(a.basePath))}/?(.*)$ ws://127.0.0.1:${a.port}/$1 [P,L]`);
       }
     }
   }
@@ -838,11 +853,12 @@ const proxyApp = z.object({
 });
 
 defineOp('app.proxy.write', {
-  description: 'Render <apache root>/whm-apps/<domain>.conf (proxy and static blocks for every application on the domain), ensure the Apache modules, configtest (rolled back on error) and reload; an empty list removes the file',
-  schema: z.object({ domain: arg.hostname, apps: z.array(proxyApp).max(20), reload: z.boolean().default(true) }).strict()
+  description: 'Render <apache root>/whm-apps/<domain>.conf (proxy and static blocks for every application on the domain, /.well-known/acme-challenge kept on the document root for AutoSSL), ensure the Apache modules, configtest (rolled back on error) and reload; an empty list removes the file',
+  schema: z.object({ domain: arg.hostname, apps: z.array(proxyApp).max(20), reload: z.boolean().default(true), docroot: unitPath.optional() }).strict()
     .refine((v) => new Set(v.apps.map((a) => trimBase(a.basePath) || '/')).size === v.apps.length, { message: 'base paths must be unique per domain', path: ['apps'] }),
-  run: async ({ domain, apps, reload }, ctx) => {
+  run: async ({ domain, apps, reload, docroot }, ctx) => {
     for (const a of apps) if (a.kind === 'static') ctx.assertAllowedPath(a.staticDir, 'read');
+    if (docroot) ctx.assertAllowedPath(docroot, 'read');
     const apache = requireApache();
     const dir = ctx.assertAllowedPath(path.join(apache.root, 'whm-apps'), 'write');
     const file = ctx.assertAllowedPath(path.join(dir, `${domain}.conf`), 'write');
@@ -856,7 +872,7 @@ defineOp('app.proxy.write', {
       return { domain, path: file, apps: 0, removed: true, modules: none, reloaded: r.reloaded, unit: r.unit, validated: test.ok };
     }
     const info = await apacheInfo(apache);
-    const wanted = modulesFor(apps, info.version);
+    const wanted = modulesFor(apps, info.version, { docroot });
     let loaded = new Set(info.modules);
     const toEnable = wanted.all.filter((m) => !loaded.has(m));
     if (toEnable.length && apache.flavor === 'debian' && apache.a2tools) {
@@ -867,7 +883,7 @@ defineOp('app.proxy.write', {
     const missing = wanted.all.filter((m) => !loaded.has(m));
     const requiredMissing = wanted.required.filter((m) => !loaded.has(m));
     if (requiredMissing.length) throw new OpError('capability_missing', `Apache modules required by these applications are not loaded: ${requiredMissing.join(', ')}`, { missing, enabled });
-    const content = renderAppsInclude(domain, apps, { apacheVersion: info.version });
+    const content = renderAppsInclude(domain, apps, { apacheVersion: info.version, docroot });
     ensureRootDir(dir);
     writeRootFile(file, content, 0o644);
     const test = await configtest(apache);

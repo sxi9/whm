@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { validate, z, fields, pagination } from '../../lib/validate.js';
 import { requireRoot, requireReseller } from '../../middleware/rbac.js';
+import { unprocessable } from '../../lib/errors.js';
 import { createApplicationManagerService, schemas, createSchema, updateSchema, templateSchema, policySchema } from '../../services/application-manager.js';
 
 const idParam = z.object({ id: fields.id });
@@ -19,20 +20,32 @@ export async function register(ctx) {
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.json(d?.meta ? d : { data: d })).catch(next);
   const created = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(201).json({ data: d })).catch(next);
   const accepted = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(202).json({ data: d })).catch(next);
-  // The audit middleware records req.body when the response finishes and env
-  // values are secrets under arbitrary names, so the real map leaves the body
-  // before the handler runs and only the key names are kept for the record.
-  const takeEnv = (req) => {
-    const env = req.body.env;
-    if (env) req.body.env = Object.fromEntries(Object.keys(env).map((k) => [k, '[redacted]']));
-    return env;
+  // The audit middleware records req.body when the response finishes, also for
+  // requests that validate() or RBAC reject, and env values are secrets under
+  // arbitrary names: the real map leaves the body before any route runs and only
+  // the key names stay for the record. Handlers validate it from req.appEnv.
+  r.use((req, _res, next) => {
+    if (req.body && typeof req.body === 'object' && req.body.env !== undefined) {
+      const env = req.body.env;
+      Object.defineProperty(req, 'appEnv', { value: env });
+      req.body.env = env && typeof env === 'object' && !Array.isArray(env) ? Object.fromEntries(Object.keys(env).map((k) => [k, '[redacted]'])) : '[redacted]';
+    }
+    next();
+  });
+  const envOf = (req) => {
+    if (req.appEnv === undefined) return undefined;
+    const result = schemas.env.safeParse(req.appEnv);
+    if (result.success) return result.data;
+    const issues = {};
+    for (const issue of result.error.issues) (issues[['env', ...issue.path].join('.')] ||= []).push(issue.message);
+    throw unprocessable('Request validation failed', issues);
   };
 
   // Application Manager
   r.get('/', requireReseller, validate({ query: pagination.extend({ account: fields.username.optional(), kind: schemas.kind.optional(), status: schemas.status.optional() }) }), wrap((req) => s.list(req.query, req.user)));
-  r.post('/', requireReseller, validate({ body: createSchema }), accepted((req) => s.create({ ...req.body, env: takeEnv(req) }, req.user, req)));
+  r.post('/', requireReseller, validate({ body: createSchema }), accepted((req) => s.create({ ...req.body, env: envOf(req) }, req.user, req)));
   r.get('/presets', requireReseller, wrap(() => s.presets()));
-  r.post('/inspect', requireReseller, validate({ body: z.object({ username: fields.username, root: fields.absPath.max(512) }).strict() }), wrap((req) => s.inspect(req.body, req.user)));
+  r.post('/inspect', requireReseller, validate({ body: z.object({ username: fields.username, root: schemas.root }).strict() }), wrap((req) => s.inspect(req.body, req.user)));
   r.get('/accounts/:username/domains', requireReseller, validate({ params: z.object({ username: fields.username }) }), wrap((req) => s.domainsFor(req.params.username, req.user)));
 
   // Runtime Versions
@@ -53,7 +66,7 @@ export async function register(ctx) {
 
   // One application
   r.get('/:id', requireReseller, validate({ params: idParam }), wrap((req) => s.get(req.params.id, req.user)));
-  r.put('/:id', requireReseller, validate({ params: idParam, body: updateSchema }), wrap((req) => s.update(req.params.id, { ...req.body, env: takeEnv(req) }, req.user, req)));
+  r.put('/:id', requireReseller, validate({ params: idParam, body: updateSchema }), wrap((req) => s.update(req.params.id, { ...req.body, env: envOf(req) }, req.user, req)));
   r.delete('/:id', requireReseller, validate({ params: idParam, query: z.object({ deleteFiles: boolQuery.default('false') }) }), wrap((req) => s.remove(req.params.id, req.query, req.user, req)));
   r.post('/:id/rebuild', requireReseller, validate({ params: idParam }), accepted((req) => s.rebuild(req.params.id, req.user, req)));
   r.post('/:id/deploy', requireReseller, validate({ params: idParam }), accepted((req) => s.deploy(req.params.id, req.user, req)));

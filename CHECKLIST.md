@@ -366,9 +366,9 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [x] WP Toolkit
 
 ### 31. Application Manager *(our addition — user ask 2026-10-29: Node.js, Python, React/Angular… app hosting)*
-- [ ] Application Manager
-- [ ] Runtime Versions
-- [ ] Application Templates
+- [x] Application Manager
+- [x] Runtime Versions
+- [x] Application Templates
 
 ## Cross-cutting
 

@@ -226,6 +226,7 @@ describe('schemas refuse injection before anything runs', () => {
     await invalid('app.step', step({ step: 'pip-install', runtime: python, packages: ['gunicorn; id'] }));
     await invalid('app.step', step({ step: 'pip-install', runtime: python, packages: Array.from({ length: 51 }, (_, i) => `p${i}`) }));
     await invalid('app.step', step({ step: 'npm-install', production: 'yes' }));
+    await invalid('app.step', step({ step: 'npm-install', omitDev: 'yes' }));
     expect(exec).not.toHaveBeenCalled();
   });
 
@@ -261,6 +262,7 @@ describe('schemas refuse injection before anything runs', () => {
     await invalid('app.proxy.write', { domain: 'example.com', apps: [{ ...proxy, basePath: '/api' }, { ...statik, basePath: '/api/' }] });
     await invalid('app.proxy.write', { domain: 'example.com', apps: Array.from({ length: 21 }, (_, i) => ({ ...proxy, id: i + 1, basePath: `/p${i}` })) });
     await invalid('app.proxy.write', { domain: 'example.com', apps: [proxy], reload: 'yes' });
+    for (const docroot of ['public_html', `${home}/public html`, `${home}/../x`, `${home}/x"y`, `${home}/%h`]) await invalid('app.proxy.write', { domain: 'example.com', apps: [proxy], docroot });
     await invalid('app.proxy.write', { domain: 'example.com' });
     for (const runUser of ['www data', '-x', 'WWW', '', 'a'.repeat(33), 'www;data']) await invalid('app.static.expose', { username: USER, dir: root(), runUser });
     expect(exec).not.toHaveBeenCalled();
@@ -313,6 +315,7 @@ describe('managed account and application root checks', () => {
     own(`${home}/apps/file`);
     const foreign = mkOwned(`${home}/apps/foreign`);
     if (myUid === 0) fs.chownSync(foreign, 65534, 65534);
+    fs.symlinkSync(home, `${home}/x`);
     const code = async (op, args) => (await opError(runOp(op, args, ctx))).code;
     const ops = {
       inspect: (root) => ['app.inspect', { username: USER, root }],
@@ -338,6 +341,8 @@ describe('managed account and application root checks', () => {
     // accepted as an intermediate component, never as the root itself.
     expect(await code(...ops.purge(`${home}/apps/escape-dir-link/inner`))).toBe('refused');
     for (const key of ['unit', 'purge']) expect(await code(...ops[key](`${home}/public_html`)), key).toBe('refused');
+    // public_html reached through a link that stays inside the home is still public_html.
+    for (const key of ['unit', 'purge']) for (const via of [`${home}/x/public_html`, `${home}/x/x/public_html/`]) expect(await code(...ops[key](via)), `${key} ${via}`).toBe('refused');
     for (const key of ['step', 'unit', 'expose', 'pull']) expect(await code(...ops[key](`${home}/apps/missing`)), key).toBe('not_found');
     await expect(runOp('app.inspect', { username: USER, root: `${home}/apps/missing` }, ctx)).resolves.toMatchObject({ exists: false, empty: true, files: [], hints: { preset: null } });
     await expect(runOp('app.purge', { username: USER, root: `${home}/apps/missing` }, ctx)).resolves.toEqual({ root: `${home}/apps/missing`, removed: false });
@@ -391,23 +396,33 @@ describe('renderers', () => {
     expect(renderEnvFile({})).toBe('\n');
   });
 
-  it('renderAppsInclude: proxy with websockets on new and old Apache', () => {
+  it('renderAppsInclude: proxy with websockets on new and old Apache, ACME challenges never proxied', () => {
     const apps = [{ id: 1, kind: 'proxy', basePath: '/api', port: 3001, websockets: true, spaFallback: false }];
+    const acme = '<Location "/.well-known/acme-challenge">\n  ProxyPass "!"\n</Location>\n';
     const fresh = renderAppsInclude('example.com', apps, { apacheVersion: '2.4.58' });
     expect(fresh.startsWith('# Managed by WHM panel (applications for example.com)')).toBe(true);
     expect(fresh).toContain('ProxyPreserveHost On\nRequestHeader set X-Forwarded-Proto "https" env=HTTPS\n');
-    expect(fresh).toContain('<Location "/api">\n  ProxyPass "http://127.0.0.1:3001/" retry=0 timeout=120 upgrade=websocket\n  ProxyPassReverse "http://127.0.0.1:3001/"\n</Location>\n');
+    // Location-form ProxyPass: a base without a trailing slash maps to a target without one.
+    expect(fresh).toContain('<Location "/api">\n  ProxyPass "http://127.0.0.1:3001" retry=0 timeout=120 upgrade=websocket\n  ProxyPassReverse "http://127.0.0.1:3001"\n</Location>\n');
+    expect(fresh).not.toContain('3001/"');
+    expect(fresh).toContain(acme);
+    expect(fresh.indexOf('<Location "/api">')).toBeLessThan(fresh.indexOf(acme));
     expect(fresh).not.toContain('Rewrite');
+    expect(fresh).not.toContain('Alias');
+    expect(renderAppsInclude('example.com', [{ ...apps[0], basePath: '/api/' }], { apacheVersion: '2.4.58' })).toContain('<Location "/api">\n  ProxyPass "http://127.0.0.1:3001" retry=0');
     const old = renderAppsInclude('example.com', apps, { apacheVersion: '2.4.41' });
-    expect(old).toContain('  ProxyPass "http://127.0.0.1:3001/" retry=0 timeout=120\n');
+    expect(old).toContain('  ProxyPass "http://127.0.0.1:3001" retry=0 timeout=120\n');
     expect(old).not.toContain('upgrade=');
-    expect(old).toContain('RewriteEngine On\nRewriteCond %{HTTP:Upgrade} =websocket [NC]\nRewriteRule ^/api/?(.*)$ ws://127.0.0.1:3001/$1 [P,L]\n');
+    expect(old).toContain('RewriteEngine On\nRewriteCond %{HTTP:Upgrade} =websocket [NC]\nRewriteCond %{REQUEST_URI} !^/\\.well-known/acme-challenge/\nRewriteRule ^/api/?(.*)$ ws://127.0.0.1:3001/$1 [P,L]\n');
+    expect(old.indexOf(acme)).toBeLessThan(old.indexOf('RewriteEngine On'));
     const noWs = renderAppsInclude('example.com', [{ ...apps[0], websockets: false }], { apacheVersion: '2.4.41' });
     expect(noWs).not.toContain('Rewrite');
     expect(noWs).not.toContain('upgrade=');
     const rootWs = renderAppsInclude('example.com', [{ ...apps[0], basePath: '/' }], { apacheVersion: null });
-    expect(rootWs).toContain('<Location "/">');
-    expect(rootWs).toContain('RewriteRule ^/?(.*)$ ws://127.0.0.1:3001/$1 [P,L]');
+    expect(rootWs).toContain('<Location "/">\n  ProxyPass "http://127.0.0.1:3001/" retry=0 timeout=120\n  ProxyPassReverse "http://127.0.0.1:3001/"\n</Location>\n');
+    expect(rootWs.indexOf('<Location "/">')).toBeLessThan(rootWs.indexOf(acme));
+    expect(rootWs).toContain('RewriteCond %{REQUEST_URI} !^/\\.well-known/acme-challenge/\nRewriteRule ^/?(.*)$ ws://127.0.0.1:3001/$1 [P,L]');
+    expect(rootWs).not.toContain('Alias');
   });
 
   it('renderAppsInclude: static root, static sub-path, several apps, empty list', () => {
@@ -415,22 +430,37 @@ describe('renderers', () => {
     expect(root).toContain('DocumentRoot "/home/alice/apps/site/dist"\n<Directory "/home/alice/apps/site/dist">\n  Options -Indexes +FollowSymLinks\n  AllowOverride None\n  Require all granted\n  FallbackResource "/index.html"\n</Directory>\n');
     expect(root).not.toContain('Alias');
     expect(root).not.toContain('Proxy');
+    expect(root).not.toContain('acme-challenge');
+    const rootDoc = renderAppsInclude('example.com', [{ id: 5, kind: 'static', basePath: '/', staticDir: '/home/alice/apps/site/dist', websockets: false, spaFallback: true }], { apacheVersion: '2.4.58', docroot: '/home/alice/public_html' });
+    expect(rootDoc).toContain('\nAlias "/.well-known/acme-challenge" "/home/alice/public_html/.well-known/acme-challenge"\n');
+    expect(rootDoc.indexOf('Alias "/.well-known')).toBeLessThan(rootDoc.indexOf('DocumentRoot'));
+    expect(rootDoc).not.toContain('Location');
     const sub = renderAppsInclude('example.com', [{ id: 6, kind: 'static', basePath: '/docs/', staticDir: '/home/alice/apps/docs/build', websockets: false, spaFallback: false }], { apacheVersion: '2.4.58' });
     expect(sub).toContain('Alias "/docs" "/home/alice/apps/docs/build"\n<Directory "/home/alice/apps/docs/build">');
     expect(sub).not.toContain('FallbackResource');
     expect(sub).not.toContain('DocumentRoot');
+    expect(renderAppsInclude('example.com', [{ id: 6, kind: 'static', basePath: '/docs/', staticDir: '/home/alice/apps/docs/build', websockets: false, spaFallback: false }], { apacheVersion: '2.4.58', docroot: '/home/alice/public_html' })).not.toContain('acme-challenge');
     const many = renderAppsInclude('example.com', [
       { id: 2, kind: 'proxy', basePath: '/api', port: 3002, websockets: false, spaFallback: false },
       { id: 1, kind: 'proxy', basePath: '/', port: 3001, websockets: true, spaFallback: false },
       { id: 3, kind: 'static', basePath: '/docs', staticDir: '/home/alice/apps/docs/dist', websockets: false, spaFallback: true },
-    ], { apacheVersion: '2.4.41' });
+    ], { apacheVersion: '2.4.41', docroot: '/home/alice/public_html' });
     expect(many.indexOf('<Location "/">')).toBeLessThan(many.indexOf('<Location "/api">'));
     expect(many).toContain('<Location "/docs">\n  ProxyPass "!"\n</Location>');
+    expect(many.match(/ProxyPass "!"/g)).toHaveLength(2);
+    expect(many.lastIndexOf('<Location "/.well-known/acme-challenge">')).toBeGreaterThan(many.lastIndexOf('<Location "/api">'));
+    expect(many).not.toContain('Alias "/.well-known');
     expect(many).toContain('FallbackResource "/docs/index.html"');
     expect(many.match(/ProxyPreserveHost On/g)).toHaveLength(1);
     expect(many.match(/^RewriteEngine On$/gm)).toHaveLength(1);
     expect(many).toContain('ws://127.0.0.1:3001/$1');
     expect(many).not.toContain('ws://127.0.0.1:3002/');
+    const mixed = renderAppsInclude('example.com', [
+      { id: 7, kind: 'proxy', basePath: '/api', port: 3007, websockets: false, spaFallback: false },
+      { id: 8, kind: 'static', basePath: '/', staticDir: '/home/alice/apps/site/dist', websockets: false, spaFallback: true },
+    ], { apacheVersion: '2.4.58', docroot: '/home/alice/public_html' });
+    expect(mixed).toContain('Alias "/.well-known/acme-challenge" "/home/alice/public_html/.well-known/acme-challenge"');
+    expect(mixed).toContain('<Location "/.well-known/acme-challenge">\n  ProxyPass "!"\n</Location>');
     expect(renderAppsInclude('example.com', [], { apacheVersion: '2.4.58' })).toBeNull();
     expect(() => renderAppsInclude('example.com', [{ id: 1, kind: 'static', basePath: '/', staticDir: '/home/alice/my site', websockets: false, spaFallback: true }])).toThrow(OpError);
     expect(() => renderAppsInclude('example.com', [{ id: 1, kind: 'static', basePath: '/', staticDir: '/home/alice/x"y', websockets: false, spaFallback: true }])).toThrow(/cannot be rendered/);
@@ -442,6 +472,9 @@ describe('renderers', () => {
     expect(modulesFor(proxyWs, '2.4.58').required).toEqual(['proxy', 'proxy_http', 'headers']);
     expect(modulesFor([{ ...proxyWs[0], websockets: false }], null).required).toEqual(['proxy', 'proxy_http', 'headers']);
     expect(modulesFor([{ id: 2, kind: 'static', basePath: '/', spaFallback: false }], '2.4.58')).toEqual({ required: [], all: [] });
+    expect(modulesFor([{ id: 2, kind: 'static', basePath: '/', spaFallback: false }], '2.4.58', { docroot: '/home/alice/public_html' })).toEqual({ required: ['alias'], all: ['alias'] });
+    expect(modulesFor([{ id: 2, kind: 'static', basePath: '/docs', spaFallback: false }], '2.4.58', { docroot: '/home/alice/public_html' })).toEqual({ required: ['alias'], all: ['alias'] });
+    expect(modulesFor([{ id: 1, kind: 'proxy', basePath: '/', port: 3000, websockets: false }], '2.4.58', { docroot: '/home/alice/public_html' }).required).toEqual(['proxy', 'proxy_http', 'headers']);
     expect(modulesFor([{ id: 2, kind: 'static', basePath: '/docs', spaFallback: true }], '2.4.58')).toEqual({ required: ['alias', 'dir'], all: ['alias', 'dir'] });
     expect(supportsUpgradeWebsocket('2.4.46')).toBe(false);
     expect(supportsUpgradeWebsocket('2.4.47')).toBe(true);
@@ -800,17 +833,32 @@ describe('app.step builds the exact argv for each step as the account user', () 
     expect(seen.argv).toEqual([nodeBin(), npmCli(), 'ci']);
     expect(seen.opts.cwd).toBe(root);
     expect(seen.opts.timeoutMs).toBe(1_800_000);
-    expect(seen.opts.env).toEqual(stepEnv(nodeBin(), root, home, false));
-    expect(seen.opts.env).toMatchObject({ HOME: home, PATH: `${nodeDir()}/bin:${root}/.venv/bin:/usr/local/bin:/usr/bin:/bin`, NODE_ENV: 'development', CI: '1', npm_config_fund: 'false', npm_config_audit: 'false', npm_config_update_notifier: 'false', PIP_DISABLE_PIP_VERSION_CHECK: '1' });
+    expect(seen.opts.env).toEqual(stepEnv(nodeBin(), root, home, { step: 'npm-install' }));
+    expect(seen.opts.env).toEqual({ HOME: home, PATH: `${nodeDir()}/bin:${root}/.venv/bin:/usr/local/bin:/usr/bin:/bin`, CI: '1', npm_config_fund: 'false', npm_config_audit: 'false', npm_config_update_notifier: 'false', PIP_DISABLE_PIP_VERSION_CHECK: '1' });
+    // NODE_ENV is never forced to "development": build tools keep their own production default.
+    expect(seen.opts.env).not.toHaveProperty('NODE_ENV');
     await runOp('app.step', { username: USER, root, step: 'npm-install', runtime, production: true }, ctx);
     expect(seen.argv).toEqual([nodeBin(), npmCli(), 'ci', '--omit=dev']);
+    expect(seen.opts.env).toMatchObject({ NODE_ENV: 'production', CI: '1' });
+    await runOp('app.step', { username: USER, root, step: 'npm-install', runtime, production: true, omitDev: false }, ctx);
+    expect(seen.argv).toEqual([nodeBin(), npmCli(), 'ci']);
     expect(seen.opts.env.NODE_ENV).toBe('production');
+    await runOp('app.step', { username: USER, root, step: 'npm-install', runtime, omitDev: true }, ctx);
+    expect(seen.argv).toEqual([nodeBin(), npmCli(), 'ci', '--omit=dev']);
+    expect(seen.opts.env).not.toHaveProperty('NODE_ENV');
     fs.unlinkSync(`${root}/package-lock.json`);
     await runOp('app.step', { username: USER, root, step: 'npm-install', runtime }, ctx);
     expect(seen.argv).toEqual([nodeBin(), npmCli(), 'install']);
     await runOp('app.step', { username: USER, root, step: 'npm-run', runtime, script: 'build', production: true }, ctx);
     expect(seen.argv).toEqual([nodeBin(), npmCli(), 'run', '--', 'build']);
     expect(seen.opts.env.NODE_ENV).toBe('production');
+    // CI stays with the install step: react-scripts fails a build on lint warnings under CI.
+    expect(seen.opts.env).not.toHaveProperty('CI');
+    expect(seen.opts.env).toMatchObject({ npm_config_fund: 'false', npm_config_update_notifier: 'false' });
+    await runOp('app.step', { username: USER, root, step: 'npm-run', runtime, script: 'build' }, ctx);
+    expect(seen.opts.env).toEqual(stepEnv(nodeBin(), root, home, { step: 'npm-run' }));
+    expect(seen.opts.env).not.toHaveProperty('NODE_ENV');
+    expect(seen.opts.env).not.toHaveProperty('CI');
   });
 
   it.skipIf(!canOwn || !havePython)('venv-create falls back without --upgrade-deps, pip-install uses the venv python and needs a venv', async () => {
@@ -821,6 +869,7 @@ describe('app.step builds the exact argv for each step as the account user', () 
     fakeUser(async (argv, opts) => {
       seen.push(argv);
       expect(opts.cwd).toBe(root);
+      expect(opts.env).not.toHaveProperty('CI');
       if (oldPython && argv.includes('--upgrade-deps')) return { code: 2, stdout: '', stderr: 'usage: venv [-h]\nvenv: error: unrecognized arguments: --upgrade-deps', bin: 'runuser', argv };
       return okResult();
     });
@@ -971,6 +1020,7 @@ describe('app.proxy.write', () => {
     exec.mockClear();
     const err = await opError(runOp('app.proxy.write', { domain: 'example.com', apps: [{ id: 1, kind: 'static', basePath: '/', staticDir: '/etc/dist' }] }, ctx));
     expect(err.code).toBe('path_not_allowed');
+    expect((await opError(runOp('app.proxy.write', { domain: 'example.com', apps: [{ id: 1, kind: 'proxy', basePath: '/', port: 3000 }], docroot: '/etc/www' }, ctx))).code).toBe('path_not_allowed');
     if (!apacheLayout()?.bin) {
       expect((await opError(runOp('app.proxy.write', { domain: 'example.com', apps: [{ id: 1, kind: 'proxy', basePath: '/', port: 3000 }] }, ctx))).code).toBe('capability_missing');
       expect((await opError(runOp('app.proxy.write', { domain: 'example.com', apps: [] }, ctx))).code).toBe('capability_missing');
@@ -1019,6 +1069,9 @@ describe('app.static.expose and app.purge', () => {
     expect((await opError(runOp('app.purge', { username: USER, root: `${home}/` }, ctx))).code).toBe('refused');
     expect((await opError(runOp('app.purge', { username: USER, root: `${home}/public_html` }, ctx))).code).toBe('refused');
     expect((await opError(runOp('app.purge', { username: USER, root: `${home}/public_html/` }, ctx))).code).toBe('refused');
+    fs.symlinkSync(home, `${home}/self`);
+    expect((await opError(runOp('app.purge', { username: USER, root: `${home}/self/public_html` }, ctx))).code).toBe('refused');
+    expect((await opError(runOp('app.purge', { username: USER, root: `${home}/self/self/public_html/` }, ctx))).code).toBe('refused');
     expect(seen).toEqual([]);
     await expect(runOp('app.purge', { username: USER, root: `${home}/public_html/old-site` }, ctx)).resolves.toEqual({ root: `${home}/public_html/old-site`, removed: false });
     expect(seen).toEqual([]);
