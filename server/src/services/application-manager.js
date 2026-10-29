@@ -514,7 +514,7 @@ export function createApplicationManagerService(ctx) {
     let detected = { node: [], python: [] };
     try { detected = await call('app.runtime.detect', {}); } catch (err) { logger.warn({ err }, 'app.runtime.detect failed'); }
     if (kind === 'node') {
-      const list = detected.node || [];
+      const list = (detected.node || []).filter((n) => n.present !== false);
       let hit = version === 'system' || !version ? list.find((n) => n.source === 'system') : (list.find((n) => n.source === 'managed' && n.version === version) || list.find((n) => n.version === version));
       if (!hit && version !== 'system') { const r = stmts.runtimeGet.get('node', version); if (r) hit = { version, bin: r.bin, path: r.path, source: 'managed' }; }
       if (!hit) throw new CapabilityError('node', version === 'system' || !version ? 'Node.js is not installed on this server' : `Node.js ${version} is not installed on this server`);
@@ -889,7 +889,7 @@ export function createApplicationManagerService(ctx) {
       try { detected = { ...detected, ...(await op('app.runtime.detect', {})) }; } catch (err) { error = err.message; logger.warn({ err }, 'app.runtime.detect failed'); }
       const usage = Object.fromEntries(stmts.nodeUsage.all().map((r) => [r.version ?? 'system', r.n]));
       const defaults = { node: S('apps.default_node', 'system'), python: S('apps.default_python', 'system') };
-      const node = (detected.node || []).map((n) => ({ ...n, managed: n.source === 'managed', missing: false, apps: (usage[n.version] ?? 0) + (n.source === 'system' ? (usage.system ?? 0) : 0), default: n.source === 'system' ? defaults.node === 'system' : defaults.node === n.version }));
+      const node = (detected.node || []).map((n) => ({ ...n, managed: n.source === 'managed', missing: n.present === false, apps: (usage[n.version] ?? 0) + (n.source === 'system' ? (usage.system ?? 0) : 0), default: n.source === 'system' ? defaults.node === 'system' : defaults.node === n.version }));
       for (const m of stmts.runtimesAll.all().filter((m) => m.kind === 'node')) {
         const hit = node.find((n) => n.source === 'managed' && n.version === m.version);
         if (hit) hit.installedAt = m.installed_at;
