@@ -39,7 +39,7 @@ export default function MailboxConversion({ fn }) {
   return (
     <>
       <PageHeader fn={fn} description="Converts a mailbox between Maildir, mdbox, sdbox and mbox with Dovecot's dsync: doveadm -o mail_location=<source> sync -1 -u <user> <target> reads the source through mail_location and writes a one-way copy into the target. The source stays untouched; switch the account's mail_location once the copy is verified. Use Dry run first to see the exact command." />
-      {dovecotMissing && <CapabilityNotice error={{ code: 'capability_missing', message: 'Dovecot (doveadm) is not installed on this server. Install dovecot-core / dovecot to convert mailboxes.' }} onRetry={refetchStatus} />}
+      {dovecotMissing && <CapabilityNotice capability="dovecot" error={{ code: 'capability_missing', message: 'Dovecot (doveadm) is not installed on this server. Install dovecot-core / dovecot to convert mailboxes.' }} onRetry={refetchStatus} />}
       <RequestError error={accountsError} onRetry={refetch} />
       <Card title="Account"><AccountPicker value={username} onChange={(v) => { setUsername(v); setJob(null); }} accounts={accounts} /></Card>
       {username && (

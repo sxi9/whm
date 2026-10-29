@@ -44,7 +44,7 @@ export default function ModsecurityConfiguration({ fn }) {
       <PageHeader fn={fn} />
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
-      {data && !data.installed && <CapabilityNotice error={{ code: 'capability_missing', message: 'ModSecurity is not installed. Install libapache2-mod-security2 (Debian/Ubuntu) or mod_security (RHEL) and refresh.' }} onRetry={refetch} />}
+      {data && !data.installed && <CapabilityNotice capability="modsecurity" error={{ code: 'capability_missing', message: 'ModSecurity is not installed. Install libapache2-mod-security2 (Debian/Ubuntu) or mod_security (RHEL) and refresh.' }} onRetry={refetch} />}
       {data && data.installed && (
         <>
           <Card title="Status">

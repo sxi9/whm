@@ -345,6 +345,17 @@ export function createLicenseService(ctx) {
     return { status: l.status, edition: l.edition, daysLeft: l.daysLeft, enforce: l.enforce, degraded: l.degraded, reason: l.reason, action: '/server-configuration/basic-webhost-manager-setup#license' };
   }
 
+  // What a root user who is not the panel owner may know: state, edition and
+  // expiry. No hub, no key, no activation, no fingerprint, no hub messages.
+  function restrictedView() {
+    const l = get();
+    return {
+      restricted: true, status: l.status, enforce: l.enforce, degraded: l.degraded, reason: l.reason, tokenVerified: l.tokenVerified,
+      edition: l.edition, editionLabel: l.editionLabel, limits: l.limits, features: l.features,
+      lexp: l.lexp, daysLeft: l.daysLeft, lastCheckinAt: l.lastCheckinAt,
+    };
+  }
+
   const token = () => cache.row?.token ?? null;
   // Only a signed `iss` may steer hub calls; an unverifiable token falls back to the bootstrap hub.
   const hubUrl = () => (tokenVerified() && typeof cache.payload?.iss === 'string' && /^https:\/\//.test(cache.payload.iss) ? cache.payload.iss : config.licenseHubUrl || null);
@@ -779,7 +790,7 @@ export function createLicenseService(ctx) {
   reload();
 
   const service = {
-    boot, get, summary, summaryForShell, token, hubUrl, isDegraded, hasFeature, requireFeature, assertCapacity,
+    boot, get, summary, summaryForShell, restrictedView, token, hubUrl, isDegraded, hasFeature, requireFeature, assertCapacity,
     activate, checkin, deactivate, startTrial, activations, events, pluginSigningKids, verifySigned, verifyToken,
     hub, transport, clock, keys: () => keys.map((k) => ({ kid: k.kid, notAfter: k.notAfter ? k.notAfter.toISOString() : null })),
     on(name, fn) { emitter.on(name, fn); return () => emitter.off(name, fn); },

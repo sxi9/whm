@@ -22,6 +22,22 @@ export const acceptedRequestId = (value) => (typeof value === 'string' && REQUES
 // so "?x=/stream" cannot opt a request out of the limiter or the access log.
 export const isStreamRequest = (req) => /\/stream$/i.test(String(req.originalUrl ?? req.url ?? '').split('?')[0]);
 
+// The health probe and the ACME webroot challenge stay reachable over plain
+// HTTP: monitors poll 2086 without TLS and a certificate renewal must work
+// while the current certificate is already broken.
+export const forceHttpsExempt = (path) => path === '/api/health' || path.startsWith('/.well-known/acme-challenge/');
+// Only a bare hostname/IP literal (with an optional port) is echoed into the
+// Location header; anything else leaves the request alone rather than
+// redirecting to a host the client made up.
+const HOST_RE = /^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}\.?)*|\[[0-9A-Fa-f:.]{2,45}\])(?::\d{1,5})?$/;
+export function httpsRedirectTarget(req, tlsPort) {
+  const host = String(req.headers?.host ?? '');
+  if (!host || !HOST_RE.test(host)) return null;
+  const bare = host.replace(/:\d{1,5}$/, '');
+  const url = String(req.originalUrl ?? req.url ?? '/');
+  return `https://${bare}:${tlsPort}${url.startsWith('/') ? url : `/${url}`}`;
+}
+
 export async function createApp(ctx) {
   const { config, db, logger, crypto: cryptoSvc } = ctx;
   const app = express();
@@ -29,6 +45,22 @@ export async function createApp(ctx) {
   app.set('trust proxy', config.trustProxy ?? 'loopback');
 
   app.use((req, _res, next) => { req.id = acceptedRequestId(req.get('x-request-id')) || crypto.randomUUID(); next(); });
+  // Once the panel has TLS, port 2086 only hands clients over to 2087. The
+  // listener a request came in on is known from its socket, so the same app
+  // serves both. config.forceHttps (or WHM_FORCE_HTTPS=false) overrides the
+  // setting panel.force_https; the setting is read per request so the toggle
+  // applies without a restart.
+  const envForceHttps = process.env.WHM_FORCE_HTTPS;
+  const forceHttps = () => (config.forceHttps != null ? Boolean(config.forceHttps) : envForceHttps != null ? envForceHttps !== 'false' : ctx.settings.get('panel.force_https', true) !== false);
+  if (config.tls) {
+    app.use((req, res, next) => {
+      if (req.socket?.encrypted || req.secure || !forceHttps()) return next();
+      if (forceHttpsExempt(String(req.originalUrl ?? req.url ?? '').split('?')[0])) return next();
+      const target = httpsRedirectTarget(req, config.tlsPort);
+      if (!target) return next();
+      return res.redirect(301, target);
+    });
+  }
   app.use(pinoHttp({
     logger,
     genReqId: (req) => req.id,

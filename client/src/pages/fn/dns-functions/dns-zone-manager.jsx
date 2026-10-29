@@ -4,16 +4,19 @@ import { Plus } from 'lucide-react';
 import { PageHeader, Card } from '../../../components/Common.jsx';
 import { ZonePicker, useZone } from '../../dns/ZonePicker.jsx';
 import { ZoneEditor } from '../../dns/ZoneEditor.jsx';
+import { CloudflareSetupCard, CloudflareZoneCard } from '../../dns/CloudflarePanel.jsx';
 
 export default function DnsZoneManager({ fn }) {
   const [domain, setDomain] = useState('');
   const { zone, loading, error, refetch, setData } = useZone(domain);
   return (
     <>
-      <PageHeader fn={fn} description="Edit A, AAAA, CNAME, MX, TXT, SRV, NS, CAA and PTR records, the SOA, or the raw zone file. Every change is validated, written to BIND and reloaded."
+      <PageHeader fn={fn} description="Edit A, AAAA, CNAME, MX, TXT, SRV, NS, CAA and PTR records, the SOA, or the raw zone file. Every change is validated, written to BIND and reloaded; zones linked to Cloudflare are pushed there as well."
         actions={<Link className="btn btn-primary" to="/dns-functions/add-a-dns-zone"><Plus size={16} /> Add a DNS Zone</Link>} />
       <Card title="Select a zone"><ZonePicker value={domain} onChange={setDomain} /></Card>
       {domain && <ZoneEditor domain={domain} zone={zone} loading={loading} error={error} refetch={refetch} setData={setData} />}
+      {domain && <CloudflareZoneCard domain={domain} onChanged={refetch} />}
+      <CloudflareSetupCard />
     </>
   );
 }

@@ -29,10 +29,12 @@ const defaults = {
   pluginDataDir: null,
   pluginHookTimeoutMs: 30_000,
   pluginActivateTimeoutMs: 60_000,
-  // License client (§16.8): the bootstrap hub URL used until a token names its issuer,
-  // the pinned vendor keys, an optional private CA for the hub, and whether the
-  // degraded/feature/capacity gates are enforced (on in production, off for dev/tests).
-  licenseHubUrl: null,
+  // License client (§16.8): the bootstrap hub URL used until a token names its issuer
+  // (the vendor hub unless WHM_LICENSE_HUB_URL overrides it; only the super admin
+  // ever sees it), the pinned vendor keys, an optional private CA for the hub, and
+  // whether the degraded/feature/capacity gates are enforced (on in production, off
+  // for dev/tests).
+  licenseHubUrl: 'https://licserver.hostingsignal.in',
   licenseKeysFile: null,
   licenseHubCa: null,
   licenseEnforce: isProd,
@@ -91,6 +93,14 @@ function persistedSecret(dataDir, name, bytes = 32) {
   const value = crypto.randomBytes(bytes).toString('hex');
   fs.writeFileSync(file, value + '\n', { mode: 0o600 });
   return value;
+}
+
+// The merged configuration without touching the data directory: for tooling
+// that must not create root-owned secrets before the panel's first boot.
+export function readConfig(overrides = {}) {
+  const cfg = { ...defaults, ...readConfigFile(), ...envOverrides(), ...overrides };
+  cfg.dataDir = path.resolve(cfg.dataDir);
+  return cfg;
 }
 
 export function loadConfig(overrides = {}) {

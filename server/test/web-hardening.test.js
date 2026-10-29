@@ -1,8 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import request from 'supertest';
 import { authenticator } from 'otplib';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createTestApp } from './support/app.js';
-import { acceptedRequestId, isStreamRequest } from '../src/app.js';
+import { acceptedRequestId, isStreamRequest, httpsRedirectTarget, forceHttpsExempt } from '../src/app.js';
+import { watchTlsFiles } from '../src/index.js';
 
 // Phase 6 hardening of the web platform: headers on a plain-HTTP panel,
 // limiter/log matching on the path only, raw upload bodies in the audit log,
@@ -124,5 +128,103 @@ describe('second-factor brute force', () => {
     const replay = await b.post('/api/auth/2fa').send({ code });
     expect(replay.status).toBe(401);
     expect(replay.body.error.code).toBe('unauthorized');
+  });
+});
+
+// loadConfig only checks that both TLS paths are set; the files are read by
+// start(), so a test panel "has TLS" without any certificate on disk.
+const TLS = { tlsCert: '/etc/whm/tls/cert.pem', tlsKey: '/etc/whm/tls/key.pem' };
+
+describe('HTTPS by default', () => {
+  let tls;
+  beforeAll(async () => { tls = await createTestApp({ overrides: TLS }); });
+  afterAll(async () => { await tls.close(); });
+  const plain = () => request.agent(tls.ctx.app);
+
+  it('sends plain-HTTP requests to the TLS port with path and query intact', async () => {
+    const res = await plain().get('/api/auth/me?x=1').set('Host', 'panel.example.com:2086');
+    expect(res.status).toBe(301);
+    expect(res.headers.location).toBe('https://panel.example.com:2087/api/auth/me?x=1');
+    expect((await plain().get('/some/page').set('Host', 'panel.example.com')).headers.location).toBe('https://panel.example.com:2087/some/page');
+    expect((await plain().get('/').set('Host', '[::1]:2086')).headers.location).toBe('https://[::1]:2087/');
+    expect((await plain().post('/api/auth/login').set('Host', '10.0.0.5').send({})).headers.location).toBe('https://10.0.0.5:2087/api/auth/login');
+    expect(tls.ctx.db.prepare('SELECT COUNT(*) AS n FROM sessions').get().n).toBe(0);
+  });
+
+  it('leaves the health probe and the ACME challenge on plain HTTP', async () => {
+    expect((await plain().get('/api/health').set('Host', 'panel.example.com')).status).toBe(200);
+    expect((await plain().get('/.well-known/acme-challenge/token123').set('Host', 'panel.example.com')).status).not.toBe(301);
+    expect((await plain().get('/api/health?x=/stream').set('Host', 'panel.example.com')).status).toBe(200);
+  });
+
+  it('never echoes a host it cannot trust into the Location header', async () => {
+    for (const host of ['evil.com/..@panel.example.com', 'a b', 'panel.example.com:2086:1', 'panel.example.com?x', 'panel\\example.com', '']) {
+      const res = await plain().get('/api/auth/me').set('Host', host);
+      expect(res.status, host).not.toBe(301);
+      expect(res.headers.location, host).toBeUndefined();
+    }
+  });
+
+  it('the setting panel.force_https turns the redirect off without a restart', async () => {
+    tls.ctx.settings.set('panel.force_https', false);
+    try {
+      const res = await plain().get('/api/auth/me').set('Host', 'panel.example.com');
+      expect(res.status).not.toBe(301);
+      expect(res.headers.location).toBeUndefined();
+    } finally { tls.ctx.settings.set('panel.force_https', true); }
+    expect((await plain().get('/api/auth/me').set('Host', 'panel.example.com')).status).toBe(301);
+  });
+
+  it('WHM_FORCE_HTTPS=false and config.forceHttps override the setting', async () => {
+    process.env.WHM_FORCE_HTTPS = 'false';
+    let env;
+    try { env = await createTestApp({ overrides: TLS }); } finally { delete process.env.WHM_FORCE_HTTPS; }
+    try { expect((await request.agent(env.ctx.app).get('/api/auth/me').set('Host', 'panel.example.com')).status).not.toBe(301); } finally { await env.close(); }
+    const cfg = await createTestApp({ overrides: { ...TLS, forceHttps: false } });
+    try { expect((await request.agent(cfg.ctx.app).get('/api/auth/me').set('Host', 'panel.example.com')).status).not.toBe(301); } finally { await cfg.close(); }
+  });
+
+  it('a panel without TLS never redirects', async () => {
+    const res = await fresh().get('/api/auth/me').set('Host', 'panel.example.com');
+    expect(res.status).not.toBe(301);
+    expect(res.headers.location).toBeUndefined();
+  });
+
+  it('redirect helpers', () => {
+    expect(httpsRedirectTarget({ headers: { host: 'h.example.com:2086' }, originalUrl: '/a?b=1' }, 2087)).toBe('https://h.example.com:2087/a?b=1');
+    expect(httpsRedirectTarget({ headers: { host: 'h.example.com' }, url: 'a' }, 2087)).toBe('https://h.example.com:2087/a');
+    expect(httpsRedirectTarget({ headers: { host: '[2001:db8::1]' }, originalUrl: '/' }, 2087)).toBe('https://[2001:db8::1]:2087/');
+    for (const host of ['', 'a/b', 'a b', 'h.example.com:1:2', 'h@example.com', 'h.example.com\n', 'ex ample']) expect(httpsRedirectTarget({ headers: { host }, originalUrl: '/' }, 2087), host).toBeNull();
+    expect(forceHttpsExempt('/api/health')).toBe(true);
+    expect(forceHttpsExempt('/.well-known/acme-challenge/abc')).toBe(true);
+    expect(forceHttpsExempt('/api/healthz')).toBe(false);
+    expect(forceHttpsExempt('/')).toBe(false);
+  });
+
+  it('watchTlsFiles swaps the secure context when the pair on disk changes, and never on a pair that does not load', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-tls-'));
+    const cert = path.join(dir, 'cert.pem');
+    const key = path.join(dir, 'key.pem');
+    fs.writeFileSync(cert, 'CERT-1');
+    fs.writeFileSync(key, 'KEY-1');
+    const contexts = [];
+    const server = { setSecureContext: (o) => { if (o.cert.toString() === 'BROKEN') throw new Error('bad cert'); contexts.push([o.cert.toString(), o.key.toString(), o.minVersion]); } };
+    const watch = watchTlsFiles({ server, cert, key, intervalMs: 0 });
+    try {
+      expect(watch.check()).toBe(false);
+      fs.writeFileSync(cert, 'CERT-22');
+      fs.writeFileSync(key, 'KEY-22');
+      expect(watch.check()).toBe(true);
+      expect(contexts).toEqual([['CERT-22', 'KEY-22', 'TLSv1.2']]);
+      expect(watch.check()).toBe(false);
+      fs.writeFileSync(cert, 'BROKEN');
+      expect(watch.check()).toBe(false);
+      fs.writeFileSync(cert, 'CERT-333');
+      expect(watch.check()).toBe(true);
+      expect(contexts).toHaveLength(2);
+      fs.rmSync(key);
+      expect(watch.check()).toBe(false);
+      expect(contexts).toHaveLength(2);
+    } finally { watch.stop(); fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });

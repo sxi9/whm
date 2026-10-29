@@ -61,6 +61,7 @@ const QUOTA_JOB = 'server_config.quota.enable';
 const SOFTWARE_CHECK_JOB = 'software.update.check';
 const SOFTWARE_CHECK_SCHEDULE = 'os-update-check';
 const TERMINAL_SWEEP_MS = 60_000;
+const TERMINAL_WAIT_MS = 1000;
 
 const CATALOG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'server-configuration.marketplace.json');
 const TIMEZONES = new Set(typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : []);
@@ -583,9 +584,13 @@ export function createServerConfigService(ctx) {
       }
       return expired;
     },
-    // Server-sent events: polls the agent for new output while the browser is
-    // attached. Several tabs may watch one session; input goes through write().
-    stream(id, req, res, { pollMs = 120, idlePollMs = 400 } = {}) {
+    // Server-sent events: while the browser is attached, terminal.read is
+    // issued back to back; each call long-polls inside the agent for up to
+    // waitMs, so output is relayed as soon as the shell produces it and an idle
+    // shell costs one request a second. pollMs/idlePollMs only space out the
+    // reads of an agent that answers at once (tests, or plain polling below).
+    // Several tabs may watch one session; input goes through write().
+    stream(id, req, res, { waitMs = TERMINAL_WAIT_MS, pollMs = 0, idlePollMs = 400, heartbeatMs = 15_000 } = {}) {
       const s = terminal.owned(id, req.user);
       res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
       res.flushHeaders?.();
@@ -594,6 +599,7 @@ export function createServerConfigService(ctx) {
       let since = Math.max(0, s.offset - 64 * 1024);
       let closed = false;
       let timer = null;
+      let wait = Math.max(0, Math.min(2000, Math.round(waitMs)));
       s.viewers++;
       send({ type: 'open', session: terminal.shape(s) });
       const finish = async (event) => {
@@ -607,11 +613,15 @@ export function createServerConfigService(ctx) {
       };
       const poll = async () => {
         if (closed) return;
+        const started = Date.now();
         let r;
         try {
-          r = await agent.op('terminal.read', { id, since });
+          r = await agent.op('terminal.read', { id, since, ...(wait ? { waitMs: wait } : {}) }, { timeoutMs: wait + 30_000 });
         } catch (err) {
           if (closed) return;
+          // In split mode the API may be upgraded before whm-agentd restarts;
+          // an agent that still rejects waitMs is polled the old way.
+          if (err.code === 'invalid_args' && wait) { wait = 0; return poll(); }
           if (err.code === 'not_found') { await terminal.forget(s, 'expired'); return finish({ type: 'exit', reason: 'expired', message: 'The session expired or was closed' }); }
           return finish({ type: 'error', message: err.message });
         }
@@ -624,10 +634,10 @@ export function createServerConfigService(ctx) {
           await terminal.forget(s, reason);
           return finish({ type: 'exit', code: r.exitCode, signal: r.signal, reason, message: reason === 'idle_timeout' ? `The session was idle for ${terminal.idleMs() / 60_000} minutes` : null });
         }
-        timer = setTimeout(poll, buf.length ? pollMs : idlePollMs);
-        timer.unref?.();
+        const delay = (buf.length ? pollMs : idlePollMs) - (Date.now() - started);
+        if (delay > 0) { timer = setTimeout(poll, delay); timer.unref?.(); } else setImmediate(poll);
       };
-      const heartbeat = setInterval(() => { if (!closed) res.write(': ping\n\n'); }, 15_000);
+      const heartbeat = setInterval(() => { if (!closed) res.write(': ping\n\n'); }, heartbeatMs);
       heartbeat.unref?.();
       req.on('close', () => finish());
       poll();

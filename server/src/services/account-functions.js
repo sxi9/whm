@@ -2,7 +2,8 @@ import { notFound, conflict, forbidden, unprocessable, CapabilityError } from '.
 import { isRoot } from '../middleware/rbac.js';
 
 // Account Functions. Attached as ctx.accountFunctions; other categories may call:
-//   accountFunctions.renderTemplate(name, vars)        -> HTML of a site/error page template ('index' | 'suspended' | 'moved' | 'error-4xx')
+//   accountFunctions.renderTemplate(name, vars)        -> HTML of a site/error page template ('index' | 'landing' | 'suspended' | 'moved' | 'error-4xx');
+//                                                        branding ({{company_name}} {{tagline}} {{logo_url}} {{panel_url}}) is filled in from cPanel › Customization
 //   accountFunctions.templatePath(name)                -> /etc/whm/templates/<name>.html, the file a vhost may reference (ErrorDocument, suspended docroot)
 //   accountFunctions.TEMPLATE_USAGE                     -> which templates are served today; a category that starts serving one updates its entry
 //   accountFunctions.changeIp(username, { ip }, user, req)
@@ -16,14 +17,20 @@ export const DOMLOGS_ROOT = '/var/log/whm/domlogs';
 export const NGINX_LOG_DIR = '/var/log/nginx';
 // Partitions an account home may live on; each is an allowed root of the agent.
 export const HOME_ROOTS = ['/home', '/home2', '/home3', '/home4', '/mnt/home', '/srv/home'];
-export const TEMPLATE_NAMES = ['index', 'suspended', 'moved', 'error-4xx'];
+export const TEMPLATE_NAMES = ['index', 'landing', 'suspended', 'moved', 'error-4xx'];
 export const TEMPLATE_DIR = '/etc/whm/templates';
-export const TEMPLATE_VARS = ['domain', 'username', 'hostname', 'contact_email', 'ip', 'status', 'status_text', 'reason'];
-// Which part of the panel serves each template today. Only "index" is consumed
-// (accounts.create writes it into public_html); the other three are kept under
-// TEMPLATE_DIR for the web server configuration to reference once it does.
+export const TEMPLATE_VARS = ['domain', 'username', 'hostname', 'contact_email', 'ip', 'status', 'status_text', 'reason', 'company_name', 'tagline', 'logo_url', 'panel_url'];
+export const DEFAULT_COMPANY_NAME = 'Hostingsignal Panel';
+// cPanel › Customization seeds the admin side's own name (migration 028); the
+// pages visitors see carry the product name unless the operator typed theirs.
+const ADMIN_BRANDING_DEFAULTS = { company_name: 'WHM', tagline: 'WebHost Manager' };
+// Which part of the panel serves each template today. "index" is written into
+// public_html by account creation and "landing" into the hostname's docroot by
+// Service Configuration; the other three are kept under TEMPLATE_DIR for the
+// web server configuration to reference once it does.
 export const TEMPLATE_USAGE = {
   index: { served: true, by: 'account creation: rendered into public_html/index.html of every new account' },
+  landing: { served: true, by: 'Service Configuration: rendered into /var/www/whm-default/index.html, the document root of the server hostname\'s own virtual host (re-rendered at boot and on every hostname change)' },
   suspended: { served: false, by: 'not yet served: account suspension calls ctx.web.setSuspended(username, true, req) when Service Configuration provides it; until then the page is only written to the template directory and the Linux account lock is what stops logins' },
   moved: { served: false, by: 'not yet served: no virtual host references this page yet; it is only written to the template directory' },
   'error-4xx': { served: false, by: 'not yet served: the virtual host renderer does not set ErrorDocument to this page yet; it is only written to the template directory' },
@@ -43,12 +50,58 @@ const page = (title, body, bg = '#f4f6f8') => `<!doctype html>
 <style>body{font-family:system-ui,sans-serif;display:grid;place-items:center;height:100vh;margin:0;background:${bg};color:#1f2a37}main{text-align:center;max-width:520px}h1{font-weight:600}</style></head>
 <body><main>${body}</main></body></html>
 `;
+// The two pages every visitor can meet before a site has content: branded with
+// the company name, tagline and logo from cPanel › Customization (an empty
+// {{logo_url}} renders nothing, per the HTML spec for an empty img src).
+const brandedPage = (title, body) => `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
+<style>
+:root{color-scheme:light}
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;background:linear-gradient(160deg,#f6f8fb 0%,#e9eef6 100%);color:#17202b}
+main{width:min(640px,calc(100% - 32px));background:#fff;border:1px solid #dfe5ee;border-radius:14px;padding:40px 36px;box-shadow:0 18px 50px rgba(23,32,43,.08)}
+header{display:flex;align-items:center;gap:12px;font-weight:600;letter-spacing:.01em;color:#2b3a4e}
+header img{max-height:40px;max-width:160px}
+.eyebrow{margin:28px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.12em;color:#5b6b80}
+h1{margin:0;font-size:38px;font-weight:700;line-height:1.1}
+.domain{margin:10px 0 22px;font-size:20px;color:#2563eb;word-break:break-all}
+p{line-height:1.55;margin:0 0 12px}
+code{background:#f1f4f8;border-radius:5px;padding:2px 6px;font-size:.95em}
+.button{display:inline-block;margin-top:6px;padding:10px 18px;border-radius:8px;background:#2563eb;color:#fff;text-decoration:none;font-weight:600}
+footer{margin-top:30px;padding-top:16px;border-top:1px solid #e6ebf2;font-size:13px;color:#6b7a90}
+</style></head>
+<body><main>
+<header><img src="{{logo_url}}" alt=""><span>{{company_name}}</span></header>
+${body}
+<footer>Hosted on {{hostname}} with {{company_name}}. {{tagline}}</footer>
+</main></body></html>
+`;
 export const DEFAULT_TEMPLATES = {
-  index: page('{{domain}}', '<h1>{{domain}}</h1><p>This site is hosted but has no content yet. Upload your files to <code>public_html</code>.</p>'),
+  index: brandedPage('{{domain}} — Ready to launch', '<p class="eyebrow">New website</p><h1>Ready to launch</h1><p class="domain">{{domain}}</p><p>This site is hosted and waiting for its first files. Upload your website to <code>public_html</code>; this page is replaced as soon as an <code>index.html</code> or <code>index.php</code> is there.</p>'),
+  landing: brandedPage('{{company_name}} — {{domain}}', '<p class="eyebrow">Server hostname</p><h1>Ready to launch</h1><p class="domain">{{domain}}</p><p>This server is managed with {{company_name}}. Every hosting account created here publishes its website by uploading to its own <code>public_html</code>; this address serves only the server itself.</p><p><a class="button" href="{{panel_url}}">Open the panel</a></p>'),
   suspended: page('Account suspended', '<h1>This account has been suspended</h1><p>The website for <strong>{{domain}}</strong> is temporarily unavailable.</p><p>Contact the hosting provider at <a href="mailto:{{contact_email}}">{{contact_email}}</a> for assistance.</p>', '#fff7ed'),
   moved: page('Site moved', '<h1>{{domain}} has moved</h1><p>This website is now served from a different address. If you keep seeing this page, the DNS change has not reached you yet.</p><p>Hosted on {{hostname}}.</p>'),
   'error-4xx': page('{{status}} {{status_text}}', '<h1>{{status}} {{status_text}}</h1><p>The page you requested on <strong>{{domain}}</strong> could not be served.</p><p>Hosted on {{hostname}}.</p>'),
 };
+
+// Migration 012 seeded every template row with the plain page of that time;
+// such a row is the stock page, not a customisation, so the current default
+// (the branded one) replaces it until the operator saves their own HTML.
+const LEGACY_TEMPLATES = {
+  index: [
+    page('{{domain}}', '<h1>{{domain}}</h1><p>This site is hosted but has no content yet. Upload your files to <code>public_html</code>.</p>'),
+    `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>{{domain}}</title>
+<style>body{font-family:system-ui,sans-serif;display:grid;place-items:center;height:100vh;margin:0;background:#f4f6f8;color:#1f2a37}main{text-align:center}h1{font-weight:600}</style></head>
+<body><main><h1>{{domain}}</h1><p>This site is hosted but has no content yet. Upload your files to <code>public_html</code>.</p></main></body></html>
+`,
+  ],
+};
+const normalizeHtml = (v) => String(v ?? '').replace(/\s+/g, ' ').trim();
+export function isStockTemplate(name, body) {
+  if (body == null) return true;
+  const n = normalizeHtml(body);
+  return n === normalizeHtml(DEFAULT_TEMPLATES[name]) || (LEGACY_TEMPLATES[name] || []).some((legacy) => normalizeHtml(legacy) === n);
+}
 
 const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 // HTML pages escape substituted values; plain-text mail (escape: false) must not.
@@ -147,22 +200,41 @@ export function createAccountFunctionsService(ctx) {
 
   // ------------------------------------------------------------- templates ---
 
+  // Branding comes from cPanel › Customization when that category is loaded;
+  // the raw company-name setting is read directly because branding.get()
+  // substitutes "WHM" for an empty one. The logo is only reachable through the
+  // panel, so its URL is absolute.
+  function brandingVars() {
+    let branding = null;
+    try { branding = ctx.cpanel?.branding?.get?.() ?? null; } catch { branding = null; }
+    const host = hostname();
+    const panelUrl = config?.tls ? `https://${host}:${config.tlsPort}` : `http://${host}:${config?.port ?? 2086}`;
+    const configured = String(settings.get('branding.company_name', '') ?? '').trim();
+    const company = configured && configured !== ADMIN_BRANDING_DEFAULTS.company_name ? configured : DEFAULT_COMPANY_NAME;
+    const rawTagline = String(branding?.tagline ?? settings.get('branding.tagline', '') ?? '').trim();
+    const tagline = rawTagline === ADMIN_BRANDING_DEFAULTS.tagline ? '' : rawTagline;
+    const logo = typeof branding?.logo?.url === 'string' && branding.logo.url.startsWith('/') ? `${panelUrl}${branding.logo.url}` : '';
+    return { company_name: company, tagline, logo_url: logo, panel_url: panelUrl };
+  }
+
+  // The operator's HTML when they saved some; the current default for a stock row.
+  const storedBody = (name) => { const row = stmts.template.get(name); return row && !isStockTemplate(name, row.body) ? row.body : null; };
+
   function renderTemplate(name, vars = {}) {
-    const row = stmts.template.get(name);
-    const body = row?.body ?? DEFAULT_TEMPLATES[name];
+    const body = storedBody(name) ?? DEFAULT_TEMPLATES[name];
     if (body == null) throw notFound(`Template "${name}"`);
-    return renderTemplateBody(body, { hostname: hostname(), contact_email: settings.get('basic.contact_email', '') || `root@${hostname()}`, ...vars });
+    return renderTemplateBody(body, { hostname: hostname(), contact_email: settings.get('basic.contact_email', '') || `root@${hostname()}`, ...brandingVars(), ...vars });
   }
 
   const templates = {
     list() {
       const rows = Object.fromEntries(stmts.templates.all().map((t) => [t.name, t]));
-      return { dir: TEMPLATE_DIR, variables: TEMPLATE_VARS, templates: TEMPLATE_NAMES.map((name) => ({ name, path: `${TEMPLATE_DIR}/${name}.html`, updated_at: rows[name]?.updated_at ?? null, customised: rows[name] ? rows[name].body !== DEFAULT_TEMPLATES[name] : false, bytes: Buffer.byteLength(rows[name]?.body ?? DEFAULT_TEMPLATES[name]), served: TEMPLATE_USAGE[name].served, served_by: TEMPLATE_USAGE[name].by })) };
+      return { dir: TEMPLATE_DIR, variables: TEMPLATE_VARS, templates: TEMPLATE_NAMES.map((name) => { const custom = rows[name] && !isStockTemplate(name, rows[name].body); return { name, path: `${TEMPLATE_DIR}/${name}.html`, updated_at: rows[name]?.updated_at ?? null, customised: Boolean(custom), bytes: Buffer.byteLength(custom ? rows[name].body : DEFAULT_TEMPLATES[name]), served: TEMPLATE_USAGE[name].served, served_by: TEMPLATE_USAGE[name].by }; }) };
     },
     get(name) {
       if (!TEMPLATE_NAMES.includes(name)) throw notFound(`Template "${name}"`);
       const row = stmts.template.get(name);
-      return { name, path: `${TEMPLATE_DIR}/${name}.html`, body: row?.body ?? DEFAULT_TEMPLATES[name], default: DEFAULT_TEMPLATES[name], updated_at: row?.updated_at ?? null, variables: TEMPLATE_VARS, served: TEMPLATE_USAGE[name].served, served_by: TEMPLATE_USAGE[name].by };
+      return { name, path: `${TEMPLATE_DIR}/${name}.html`, body: storedBody(name) ?? DEFAULT_TEMPLATES[name], default: DEFAULT_TEMPLATES[name], updated_at: row?.updated_at ?? null, variables: TEMPLATE_VARS, served: TEMPLATE_USAGE[name].served, served_by: TEMPLATE_USAGE[name].by };
     },
     async save(name, body, req) {
       if (!TEMPLATE_NAMES.includes(name)) throw notFound(`Template "${name}"`);
@@ -175,8 +247,8 @@ export function createAccountFunctionsService(ctx) {
     async reset(name, req) { return templates.save(name, DEFAULT_TEMPLATES[name], req); },
     preview(name, vars = {}) {
       if (!TEMPLATE_NAMES.includes(name)) throw notFound(`Template "${name}"`);
-      const body = vars.body ?? stmts.template.get(name)?.body ?? DEFAULT_TEMPLATES[name];
-      const sample = { domain: 'example.com', username: 'example', ip: settings.get('basic.main_ip', '') || '203.0.113.10', status: '404', status_text: 'Not Found', reason: 'Non-payment', hostname: hostname(), contact_email: settings.get('basic.contact_email', '') || `root@${hostname()}` };
+      const body = vars.body ?? storedBody(name) ?? DEFAULT_TEMPLATES[name];
+      const sample = { domain: name === 'landing' ? hostname() : 'example.com', username: 'example', ip: settings.get('basic.main_ip', '') || '203.0.113.10', status: '404', status_text: 'Not Found', reason: 'Non-payment', hostname: hostname(), contact_email: settings.get('basic.contact_email', '') || `root@${hostname()}`, ...brandingVars() };
       const { body: _b, ...rest } = vars;
       return { name, html: renderTemplateBody(body, { ...sample, ...Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== '' && v != null)) }) };
     },
@@ -781,6 +853,6 @@ export function createAccountFunctionsService(ctx) {
     setBandwidthLimit, resetBandwidth, exceeders, unsuspendExceeders, runBandwidthEnforce, runMonthlyBandwidthReset,
     bandwidthEnforcement, setBandwidthEnforcement, syncEnforcementSchedule,
     setShell, setQuota, quotaReport, logs, rearrange, logRetention, mountpointFor,
-    HOME_ROOTS, TEMPLATE_NAMES, TEMPLATE_USAGE, SHELLS, VHOST_WARNINGS,
+    HOME_ROOTS, TEMPLATE_NAMES, TEMPLATE_USAGE, SHELLS, VHOST_WARNINGS, brandingVars,
   };
 }

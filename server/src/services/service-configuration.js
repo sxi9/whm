@@ -21,6 +21,9 @@ import { notFound, badRequest, unprocessable, CapabilityError } from '../lib/err
 //   web.ensureEximAclChain()                        -> email: makes sure the RCPT ACL chain (and its macro) exists before it writes its filters file
 //   web.applyEximTls({ minProtocol, protocols, cipherList, cipherSuites, preferServerCiphers }, req)   -> ssl-tls presets for Exim
 //   web.applyMailserverTls({ minProtocol, cipherList, cipherSuites, preferServerCiphers }, req)       -> ssl-tls presets for Dovecot
+//   web.ensureHostnameVhost(req, { hostname? })      -> the 'server' vhost for the server's own name (branded landing page under
+//                                                       web.landingDocroot); never throws: { applied, reason?, landingPage }
+//   web.forceHttps()                                 -> whether vhosts with a certificate redirect HTTP to HTTPS (setting web.force_https)
 // The ones that change a live vhost/daemon persist the change first and then throw
 // CapabilityError('apache' | 'ftp') when the daemon is missing; consumers map that
 // to 'pending' / 'saved' (dns-functions, ip-functions, ssl-tls all do) and the next
@@ -48,6 +51,15 @@ const MANAGED = '# Managed by WHM panel';
 // writes as the account.
 export const DOMLOGS_ROOT = '/var/log/whm/domlogs';
 export const domlogDir = (username) => `${DOMLOGS_ROOT}/${username}`;
+// The server hostname's own vhost: no account behind it, served as Apache's run
+// user from a root-owned docroot that holds the branded landing page.
+export const LANDING_DOCROOT = '/var/www/whm-default';
+const HOSTNAME_RE = /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const escapeHtml = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fallbackLanding = (name) => `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(name)}</title></head>
+<body><main><h1>Ready to launch</h1><p>${escapeHtml(name)} is managed with Hostingsignal Panel. Sites hosted here publish by uploading to their account's <code>public_html</code>.</p></main></body></html>
+`;
 // /home/<user>/logs is owned and writable by the tenant, so logrotate must act
 // there as that tenant (one `su <user>` stanza per account), never as root over
 // a glob; only the root-owned domlogs tree is rotated as root.
@@ -238,6 +250,7 @@ export function createServiceConfigService(ctx) {
     vhostsByUser: db.prepare('SELECT * FROM web_vhosts WHERE username = ? ORDER BY type, domain'),
     vhostsAll: db.prepare('SELECT * FROM web_vhosts ORDER BY username, type, domain'),
     vhostsByIp: db.prepare('SELECT * FROM web_vhosts WHERE ip = ?'),
+    vhostsByType: db.prepare('SELECT * FROM web_vhosts WHERE type = ? ORDER BY domain'),
     upsertVhost: db.prepare(`INSERT INTO web_vhosts (domain, account_id, username, type, docroot, aliases_json, ip, ipv6, php_version, ssl_json, redirects_json, custom_directives, status)
       VALUES (@domain, @account_id, @username, @type, @docroot, @aliases_json, @ip, @ipv6, @php_version, @ssl_json, @redirects_json, @custom_directives, 'pending')
       ON CONFLICT (domain) DO UPDATE SET account_id = excluded.account_id, username = excluded.username, type = excluded.type, docroot = excluded.docroot, aliases_json = excluded.aliases_json, ip = excluded.ip, ipv6 = excluded.ipv6,
@@ -267,6 +280,9 @@ export function createServiceConfigService(ctx) {
   const recordApply = (component, ok, summary, error = null) => { stmts.recordApply.run(component, ok ? 1 : 0, JSON.stringify(summary ?? null), error); return lastApply(component); };
   const lastApply = (component) => { const r = stmts.applyFor.get(component); return r ? { at: r.applied_at, ok: Boolean(r.ok), summary: json.parse(r.summary, null), error: r.error } : null; };
   const hostname = () => settings.get('basic.hostname') || 'localhost';
+  const forceHttps = () => settings.get('web.force_https', true) !== false;
+  // The hostname vhost carries no account and must not count as one.
+  const accountVhosts = () => stmts.vhostsAll.all().filter((r) => r.type !== 'server');
 
   let detectCache = { at: 0, value: null };
   async function detect(force = false) {
@@ -327,6 +343,9 @@ export function createServiceConfigService(ctx) {
       if (spec.ipv6) args.ipv6 = spec.ipv6;
       if (spec.phpVersion) args.phpVersion = spec.phpVersion;
       if (spec.ssl) args.ssl = { cert: spec.ssl.cert, key: spec.ssl.key, ...(spec.ssl.chain ? { chain: spec.ssl.chain } : {}), ...(spec.ssl.fullchain ? { fullchain: spec.ssl.fullchain } : {}) };
+      // Only a vhost that can answer on HTTPS redirects to it; without a
+      // certificate the redirect would send visitors to a handshake failure.
+      args.redirectHttps = Boolean(spec.ssl) && forceHttps();
       args.logDir = spec.logDir || domlogDir(spec.username);
       const ports = listenPorts();
       args.port = ports.http;
@@ -464,6 +483,74 @@ export function createServiceConfigService(ctx) {
     return { username, removed, pool: pools.length > 0, pools: pools.map((p) => p.version) };
   }
 
+  // --------------------------------------------------------- hostname vhost ---
+
+  function landingHtml(name) {
+    try {
+      if (typeof ctx.accountFunctions?.renderTemplate === 'function') return ctx.accountFunctions.renderTemplate('landing', { domain: name, username: '', ip: settings.get('basic.main_ip', '') || '' });
+    } catch (err) { logger.warn({ err }, 'web: landing template unavailable; using the built-in page'); }
+    return fallbackLanding(name);
+  }
+
+  // A bundle SSL/TLS installed for the hostname (AutoSSL writes one under
+  // /etc/ssl/whm/<hostname>/) is picked up even before applySsl ran.
+  function installedBundle(name) {
+    try {
+      const cert = ctx.ssl?.certForDomain?.(name);
+      if (!cert || !(cert.installed > 0) || typeof ctx.ssl.bundlePaths !== 'function') return null;
+      const p = ctx.ssl.bundlePaths(name);
+      return { cert: p.cert, key: p.key, chain: p.chain || null, fullchain: p.fullchain || null };
+    } catch { return null; }
+  }
+
+  // Renders the 'server' vhost for the server's own name: the branded landing
+  // page from LANDING_DOCROOT, no PHP, the hostname's certificate when one is
+  // installed. Any previous hostname's vhost goes away. Never throws (boot and
+  // the hostname change report the outcome as a step).
+  async function ensureHostnameVhost(req = null, { hostname: wanted = null } = {}) {
+    const name = String(wanted || hostname()).trim().toLowerCase();
+    if (!HOSTNAME_RE.test(name) || name === 'localhost' || name.endsWith('.localdomain')) return { hostname: name, applied: false, reason: 'invalid_hostname', error: `"${name}" is not a fully qualified hostname; set one in Basic WebHost Manager Setup or Change Hostname` };
+    if (stmts.accountByDomain.get(name) || stmts.accountDomain.get(name)) return { hostname: name, applied: false, reason: 'hosted_domain', error: `${name} is a domain hosted by an account; its own virtual host serves it` };
+    const installed = capabilities.has('apache');
+    for (const stale of stmts.vhostsByType.all('server').filter((r) => r.domain !== name)) {
+      if (installed) await op('web.vhost.remove', { domain: stale.domain, reload: false }, req).catch((err) => logger.warn({ err, domain: stale.domain }, 'web: previous hostname vhost could not be removed'));
+      stmts.deleteVhost.run(stale.domain);
+    }
+    let landingPage = false;
+    try {
+      await op('fs.write_file', { path: `${LANDING_DOCROOT}/index.html`, content: landingHtml(name), owner: 'root', mode: '0644', backup: false }, req);
+      landingPage = true;
+    } catch (err) { logger.warn({ err }, 'web: landing page could not be written'); }
+    const d = installed ? await detect().catch(() => null) : null;
+    const user = d?.apache?.runUser || (d?.apache?.flavor === 'rhel' ? 'apache' : 'www-data');
+    const prev = stmts.vhostByDomain.get(name);
+    const spec = {
+      domain: name, accountId: null, username: user, type: 'server', docroot: LANDING_DOCROOT, aliases: [],
+      ip: settings.get('basic.main_ip', '') || settings.get('basic.shared_ip', '') || null, ipv6: settings.get('basic.main_ipv6', '') || null,
+      phpVersion: null, ssl: json.parse(prev?.ssl_json, null) || installedBundle(name), redirects: [], customDirectives: prev?.custom_directives || '', logDir: domlogDir(user),
+    };
+    if (!installed) { storeSpec(spec); stmts.setVhostStatus.run('pending', 'Apache is not installed', null, name); return { hostname: name, applied: false, reason: 'capability_missing', docroot: LANDING_DOCROOT, landingPage }; }
+    try {
+      let result;
+      try { result = await writeSpec(spec, req); } catch (err) {
+        // A certificate row without its files on disk (restored panel data,
+        // pruned bundle) must not cost the hostname its landing page.
+        if (!(spec.ssl && err.code === 'not_found')) throw err;
+        spec.ssl = null;
+        result = await writeSpec(spec, req);
+      }
+      audit(req, { action: 'web.vhost.server', target: name, args: { docroot: LANDING_DOCROOT, user, ssl: Boolean(spec.ssl), redirectHttps: Boolean(spec.ssl) && forceHttps() } });
+      return { hostname: name, docroot: LANDING_DOCROOT, landingPage, ...result };
+    } catch (err) {
+      logger.warn({ err, hostname: name }, 'web: hostname vhost could not be written');
+      return { hostname: name, applied: false, reason: err.code || 'error', error: err.message, docroot: LANDING_DOCROOT, landingPage };
+    }
+  }
+
+  if (typeof ctx.events?.on === 'function') {
+    ctx.events.on('panel.started', () => ensureHostnameVhost(null).catch((err) => logger.warn({ err }, 'web: hostname vhost at boot failed')));
+  }
+
   async function applySsl(domain, paths, req) {
     const spec = requireSpec(domain);
     if (!paths?.cert || !paths?.key) throw badRequest('applySsl needs { cert, key } paths');
@@ -588,6 +675,9 @@ export function createServiceConfigService(ctx) {
         job.log(`${a.username}: ${r.vhosts.map((v) => `${v.domain} ${v.applied ? 'ok' : v.reason}`).join(', ')}`);
       } catch (err) { summary.failed++; job.log(`${a.username}: ${err.message}`, 'error'); }
     }
+    const server = await ensureHostnameVhost(null);
+    job.log(`${server.hostname}: hostname vhost ${server.applied ? 'ok' : server.reason}`);
+    summary.hostname = { hostname: server.hostname, applied: Boolean(server.applied), reason: server.reason ?? null };
     recordApply('vhosts', summary.failed === 0, summary);
     return summary;
   }
@@ -602,9 +692,11 @@ export function createServiceConfigService(ctx) {
       const ports = listenPorts();
       const status = capabilities.has('apache') ? await op('web.status', { port: ports.http, bind: ports.bind }).catch((err) => ({ installed: true, error: err.message })) : { installed: false };
       const include = capabilities.has('apache') ? await op('web.global.read').catch(() => null) : null;
-      const rows = stmts.vhostsAll.all().map(shapeVhost);
+      const rows = accountVhosts().map(shapeVhost);
       return {
         installed: capabilities.has('apache'), detect: d.apache, php: d.php, nginx: d.nginx, status, include, settings: getConf('apache'), lastApply: lastApply('apache'), ports: listenPorts(), domlogsRoot: DOMLOGS_ROOT,
+        forceHttps: forceHttps(), rewriteModule: Array.isArray(d.apache?.modules) ? d.apache.modules.some((m) => m.name === 'rewrite') : null,
+        hostnameVhost: shapeVhost(stmts.vhostsByType.all('server')[0]) ?? null, landingDocroot: LANDING_DOCROOT,
         vhosts: { total: rows.length, applied: rows.filter((r) => r.status === 'applied').length, pending: rows.filter((r) => r.status === 'pending').length, failed: rows.filter((r) => r.status === 'failed').length },
         pools: stmts.pools.all().map((p) => ({ username: p.username, version: p.version, socket: p.socket, status: p.status, error: p.error })),
       };
@@ -647,6 +739,20 @@ export function createServiceConfigService(ctx) {
     },
     async reload(req) { requireApache(); const r = await op('web.reload', {}, req); audit(req, { action: 'apache.reload' }); invalidate(); return r; },
     async restart(req) { requireApache(); const r = await op('web.restart', {}, req); audit(req, { action: 'apache.restart' }); invalidate(); return r; },
+    // Flips the redirect and re-renders every vhost that has a certificate
+    // (the only ones the flag changes) with one reload.
+    async setForceHttps(enabled, req) {
+      settings.set('web.force_https', Boolean(enabled));
+      audit(req, { action: 'apache.force_https', args: { enabled: Boolean(enabled) } });
+      const rows = stmts.vhostsAll.all().filter((r) => r.ssl_json).map((r) => { const s = shapeVhost(r); s.logDir = domlogDir(s.username); return s; });
+      let written = 0;
+      const failed = [];
+      if (capabilities.has('apache')) {
+        for (const spec of rows) { try { await writeSpec(spec, req, { reload: false }); written++; } catch (err) { failed.push({ domain: spec.domain, error: err.message }); } }
+      }
+      const reload = await reloadAfter(written, req);
+      return { forceHttps: forceHttps(), vhosts: rows.length, written, failed, reload, applied: capabilities.has('apache') };
+    },
     vhosts: {
       async list() {
         const rows = stmts.vhostsAll.all().map(shapeVhost);
@@ -1045,7 +1151,7 @@ export function createServiceConfigService(ctx) {
       ftp: { installed: capabilities.has('ftp'), selected: ftp.selected(), daemons: (d?.ftp?.daemons || []).map((x) => ({ name: x.name, active: x.unit?.active ?? null })) },
       dns: { bind: capabilities.has('bind'), powerdns: capabilities.has('powerdns'), selected: getConf('nameserver').server },
       logrotate: { installed: capabilities.has('logrotate') }, openssl: capabilities.has('ssl'), applies,
-      vhosts: stmts.vhostsAll.all().length, pools: stmts.pools.all().length,
+      vhosts: accountVhosts().length, pools: stmts.pools.all().length, forceHttps: forceHttps(),
     };
   }
 
@@ -1054,6 +1160,7 @@ export function createServiceConfigService(ctx) {
     ensureVhost, syncAccount: ensureVhost, removeAccount, applySsl, removeSsl, setRedirects, addAlias, removeAlias, setAccountIpv6, replaceIp, setPhpVersion, writePhpPool, setListenPorts,
     reload: (req) => apache.reload(req), restart: (req) => apache.restart(req), configtest: () => op('web.configtest'),
     vhostFor: (domain) => shapeVhost(stmts.vhostByDomain.get(domain)) ?? null, syncAllJob,
+    ensureHostnameVhost, forceHttps, landingDocroot: LANDING_DOCROOT,
     ensureEximAclChain: (req) => exim.ensureEximAclChain(req), applyEximTls: (preset, req) => exim.applyEximTls(preset, req), applyMailserverTls: (preset, req) => mailserver.applyMailserverTls(preset, req),
   };
 }

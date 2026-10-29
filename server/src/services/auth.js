@@ -1,5 +1,6 @@
 import nodeCrypto from 'node:crypto';
 import { unauthorized, forbidden, badRequest, HttpError } from '../lib/errors.js';
+import { superadminOf } from '../middleware/rbac.js';
 
 const LOCKOUT_CODE = 'locked_out';
 // An address counts as "known" for verified-IP login when it logged in
@@ -88,8 +89,9 @@ export function createAuthService(ctx) {
     return false;
   }
 
+  const isSuperadmin = superadminOf(ctx);
   function publicUser(u) {
-    return { id: u.id, username: u.username, email: u.email, role: u.role, totpEnabled: Boolean(u.totp_enabled), mustChangePassword: Boolean(u.must_change_password) };
+    return { id: u.id, username: u.username, email: u.email, role: u.role, totpEnabled: Boolean(u.totp_enabled), mustChangePassword: Boolean(u.must_change_password), superadmin: isSuperadmin(u) };
   }
 
   function passwordExpired(user, p) {
@@ -122,6 +124,7 @@ export function createAuthService(ctx) {
   return {
     publicUser,
     policy,
+    isSuperadmin,
 
     async login({ username, password, ip }) {
       enforceBruteForce(ip);

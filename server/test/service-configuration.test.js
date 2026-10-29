@@ -22,6 +22,7 @@ const dnsCandidates = () => [
   { name: 'bind', label: 'BIND (named)', binaries: ['named'], units: ['named', 'bind9'], packages: { apt: 'bind9', dnf: 'bind' }, installed: true, unitName: 'named', unit: unit('named') },
   { name: 'powerdns', label: 'PowerDNS Authoritative Server', binaries: ['pdns_server'], units: ['pdns'], packages: { apt: 'pdns-server', dnf: 'pdns' }, installed: false, unitName: null, unit: { unit: null, present: false, active: false } },
 ];
+const VHOST_WRITE = ({ domain, ssl, sslPort, phpVersion, redirects, logDir, bind }) => ({ domain, path: `/etc/apache2/sites-available/${domain}.conf`, link: `/etc/apache2/sites-enabled/${domain}.conf`, logDir, validated: true, bytes: 500, ssl: Boolean(ssl && sslPort), bind: bind ?? null, phpVersion: phpVersion ?? null, redirects: redirects?.length ?? 0, reloaded: true, unit: 'apache2' });
 const CERT = '-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUQ\n-----END CERTIFICATE-----\n';
 const KEY = '-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49\n-----END PRIVATE KEY-----\n';
 
@@ -55,7 +56,7 @@ beforeAll(async () => {
     'web.configtest': () => ({ bin: 'apache2ctl', ok: true, output: 'Syntax OK' }),
     'web.reload': () => ({ validated: true, reloaded: true, unit: 'apache2' }),
     'web.restart': () => ({ validated: true, reloaded: true, unit: 'apache2', verb: 'restart' }),
-    'web.vhost.write': ({ domain, ssl, sslPort, phpVersion, redirects, logDir, bind }) => ({ domain, path: `/etc/apache2/sites-available/${domain}.conf`, link: `/etc/apache2/sites-enabled/${domain}.conf`, logDir, validated: true, bytes: 500, ssl: Boolean(ssl && sslPort), bind: bind ?? null, phpVersion: phpVersion ?? null, redirects: redirects?.length ?? 0, reloaded: true, unit: 'apache2' }),
+    'web.vhost.write': VHOST_WRITE,
     'web.vhost.remove': ({ domain }) => ({ domain, removed: true, validated: true, reloaded: true }),
     'web.vhost.list': () => ({ installed: true, dir: APACHE.sitesAvailable, vhosts: [{ domain: 'legacy.example.net', path: '/etc/apache2/sites-available/legacy.example.net.conf', enabled: true, meta: { domain: 'legacy.example.net', user: 'legacy', docroot: '/home/legacy/public_html', aliases: [], ssl: false } }] }),
     'web.vhost.read': ({ domain }) => ({ domain, path: `/etc/apache2/sites-available/${domain}.conf`, exists: true, managed: true, enabled: true, meta: { domain }, content: `<VirtualHost *:80>\n  ServerName ${domain}\n</VirtualHost>\n` }),
@@ -228,6 +229,89 @@ describe('cross-category helpers on ctx.web', () => {
     await app.ctx.web.removeSsl('example.com', null);
     expect(app.ctx.web.vhostFor('example.com').ssl).toBeNull();
     await expect(app.ctx.web.applySsl('nobody.example', paths, null)).rejects.toMatchObject({ status: 404 });
+  });
+
+  it('redirectHttps goes only to vhosts with a certificate while web.force_https (default on) is set; setForceHttps re-renders them', async () => {
+    const paths = { cert: '/etc/ssl/whm/example.com/cert.pem', key: '/etc/ssl/whm/example.com/key.pem' };
+    expect(app.ctx.web.forceHttps()).toBe(true);
+    await app.ctx.web.applySsl('example.com', paths, null);
+    expect(app.agent.callsTo('web.vhost.write').pop().args.redirectHttps).toBe(true);
+    await app.ctx.web.syncAccount('alice', null);
+    const synced = app.agent.callsTo('web.vhost.write').slice(-2);
+    expect(Object.fromEntries(synced.map((c) => [c.args.domain, c.args.redirectHttps]))).toEqual({ 'example.com': true, 'shop.example.com': false });
+    app.ctx.settings.set('web.force_https', false);
+    await app.ctx.web.syncAccount('alice', null);
+    expect(app.agent.callsTo('web.vhost.write').slice(-2).every((c) => c.args.redirectHttps === false)).toBe(true);
+    const on = await app.ctx.web.apache.setForceHttps(true, null);
+    expect(on).toMatchObject({ forceHttps: true, vhosts: 1, written: 1, failed: [], applied: true });
+    expect(app.agent.callsTo('web.vhost.write').pop().args).toMatchObject({ domain: 'example.com', redirectHttps: true, reload: false });
+    expect(app.agent.callsTo('web.reload').length).toBeGreaterThan(0);
+    const page = (await get('/api/service-config/apache')).body.data;
+    expect(page).toMatchObject({ forceHttps: true, rewriteModule: false, landingDocroot: '/var/www/whm-default' });
+    expect((await get('/api/service-config/status')).body.data.forceHttps).toBe(true);
+    await app.ctx.web.removeSsl('example.com', null);
+    expect(app.agent.callsTo('web.vhost.write').pop().args.redirectHttps).toBe(false);
+  });
+
+  it('ensureHostnameVhost renders the server vhost with the branded landing page and keeps it out of the account counts', async () => {
+    const previousHostname = app.ctx.settings.get('basic.hostname');
+    app.ctx.settings.setMany({ 'basic.hostname': 'panel.example.com', 'basic.main_ip': '203.0.113.5' });
+    try {
+    const r = await app.ctx.web.ensureHostnameVhost(null);
+    expect(r).toMatchObject({ hostname: 'panel.example.com', applied: true, docroot: '/var/www/whm-default', landingPage: true });
+    const write = app.agent.callsTo('web.vhost.write').pop().args;
+    expect(write).toMatchObject({ domain: 'panel.example.com', user: 'www-data', docroot: '/var/www/whm-default', ip: '203.0.113.5', logDir: '/var/log/whm/domlogs/www-data', redirectHttps: false, aliases: [], meta: { type: 'server', account: 'www-data' } });
+    expect(write.phpVersion).toBeUndefined();
+    expect(write.ssl).toBeUndefined();
+    const page = app.agent.callsTo('fs.write_file').find((c) => c.args.path === '/var/www/whm-default/index.html');
+    expect(page.args).toMatchObject({ owner: 'root', mode: '0644', backup: false });
+    expect(page.args.content).toContain('Ready to launch');
+    expect(page.args.content).toContain('panel.example.com');
+    expect(page.args.content).toContain('Hostingsignal Panel');
+    expect(app.ctx.web.vhostFor('panel.example.com')).toMatchObject({ type: 'server', username: 'www-data', accountId: null, status: 'applied', phpVersion: null });
+    const apache = (await get('/api/service-config/apache')).body.data;
+    expect(apache.hostnameVhost).toMatchObject({ domain: 'panel.example.com', type: 'server', status: 'applied' });
+    const accounts = app.ctx.db.prepare("SELECT COUNT(*) AS n FROM web_vhosts WHERE type != 'server'").get().n;
+    expect(apache.vhosts.total).toBe(accounts);
+    expect((await get('/api/service-config/status')).body.data.vhosts).toBe(accounts);
+    expect((await get('/api/service-config/apache/vhosts')).body.data.find((v) => v.domain === 'panel.example.com')).toMatchObject({ type: 'server', status: 'applied' });
+    // A hostname change replaces the previous server vhost; hosted and unqualified names are refused.
+    const moved = await app.ctx.web.ensureHostnameVhost(null, { hostname: 'Host2.example.com' });
+    expect(moved).toMatchObject({ hostname: 'host2.example.com', applied: true });
+    expect(app.agent.callsTo('web.vhost.remove').pop().args).toMatchObject({ domain: 'panel.example.com', reload: false });
+    expect(app.ctx.web.vhostFor('panel.example.com')).toBeNull();
+    expect(app.ctx.db.prepare("SELECT domain FROM web_vhosts WHERE type = 'server'").all()).toEqual([{ domain: 'host2.example.com' }]);
+    expect(await app.ctx.web.ensureHostnameVhost(null, { hostname: 'example.com' })).toMatchObject({ applied: false, reason: 'hosted_domain' });
+    expect(await app.ctx.web.ensureHostnameVhost(null, { hostname: 'localhost' })).toMatchObject({ applied: false, reason: 'invalid_hostname' });
+    expect(app.ctx.db.prepare("SELECT domain FROM web_vhosts WHERE type = 'server'").all()).toEqual([{ domain: 'host2.example.com' }]);
+    // An installed bundle for the hostname is used (and triggers the redirect); a bundle whose files are gone falls back to plain HTTP.
+    const originalSsl = app.ctx.ssl;
+    app.ctx.ssl = { ...originalSsl, certForDomain: (d) => (d === 'host2.example.com' ? { installed: 1 } : null) };
+    try {
+      const withCert = await app.ctx.web.ensureHostnameVhost(null, { hostname: 'host2.example.com' });
+      expect(withCert).toMatchObject({ applied: true, ssl: true });
+      expect(app.agent.callsTo('web.vhost.write').pop().args).toMatchObject({ ssl: { cert: '/etc/ssl/whm/host2.example.com/cert.pem', key: '/etc/ssl/whm/host2.example.com/key.pem', fullchain: '/etc/ssl/whm/host2.example.com/fullchain.pem' }, redirectHttps: true });
+      expect(app.ctx.web.vhostFor('host2.example.com').ssl).toMatchObject({ cert: '/etc/ssl/whm/host2.example.com/cert.pem' });
+      app.agent.set('web.vhost.write', (args) => { if (args.ssl) throw Object.assign(new Error('Certificate file does not exist'), { agentError: true, code: 'not_found', details: {} }); return VHOST_WRITE(args); });
+      const fallback = await app.ctx.web.ensureHostnameVhost(null, { hostname: 'host2.example.com' });
+      expect(fallback).toMatchObject({ applied: true, ssl: false });
+      expect(app.agent.callsTo('web.vhost.write').pop().args.ssl).toBeUndefined();
+      expect(app.ctx.web.vhostFor('host2.example.com')).toMatchObject({ ssl: null, status: 'applied' });
+    } finally { app.ctx.ssl = originalSsl; app.agent.set('web.vhost.write', VHOST_WRITE); }
+    // Boot: the panel.started event re-renders the hostname vhost.
+    app.ctx.settings.set('basic.hostname', 'host2.example.com');
+    app.agent.calls.length = 0;
+    await app.ctx.events.emit('panel.started', {});
+    expect(app.agent.callsTo('web.vhost.write').map((c) => c.args.domain)).toEqual(['host2.example.com']);
+    // The sync-all job covers it too and reports it apart from the accounts.
+    const all = await post('/api/service-config/apache/vhosts/sync', {}).expect(202);
+    const job = await waitForJob(app.ctx, all.body.data.job.id);
+    expect(job.result).toMatchObject({ accounts: 2, hostname: { hostname: 'host2.example.com', applied: true } });
+    } finally {
+      app.ctx.db.prepare("DELETE FROM web_vhosts WHERE type = 'server'").run();
+      app.ctx.settings.setMany({ 'basic.hostname': previousHostname, 'basic.main_ip': '' });
+      app.agent.set('web.vhost.write', VHOST_WRITE);
+    }
   });
 
   it('setRedirects, addAlias/removeAlias, setAccountIpv6, replaceIp, setPhpVersion and setListenPorts', async () => {
@@ -897,6 +981,16 @@ describe('capability-missing paths (no daemons installed)', () => {
     await expect(app.ctx.web.applySsl('example.com', { cert: '/etc/ssl/whm/example.com/cert.pem', key: '/etc/ssl/whm/example.com/key.pem' }, null)).rejects.toMatchObject({ status: 501, capability: 'apache' });
     await expect(app.ctx.web.setRedirects('example.com', [], null)).rejects.toMatchObject({ status: 501 });
     expect(app.ctx.web.vhostFor('example.com').ssl).toMatchObject({ cert: '/etc/ssl/whm/example.com/cert.pem' });
+  });
+
+  it('ensureHostnameVhost stores the server vhost as pending without Apache and still writes the landing page', async () => {
+    app.agent.calls.length = 0;
+    const r = await app.ctx.web.ensureHostnameVhost(null, { hostname: 'pending.example.com' });
+    expect(r).toMatchObject({ hostname: 'pending.example.com', applied: false, reason: 'capability_missing', landingPage: true });
+    expect(app.agent.callsTo('web.vhost.write')).toHaveLength(0);
+    expect(app.agent.callsTo('fs.write_file').map((c) => c.args.path)).toEqual(['/var/www/whm-default/index.html']);
+    expect(app.ctx.web.vhostFor('pending.example.com')).toMatchObject({ type: 'server', status: 'pending', username: 'www-data' });
+    app.ctx.db.prepare("DELETE FROM web_vhosts WHERE type = 'server'").run();
   });
 });
 

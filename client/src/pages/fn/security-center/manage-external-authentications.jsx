@@ -8,10 +8,12 @@ import { Field, TextInput, PasswordInput, Toggle, Button, FormActions, ErrorBann
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError } from '../../security/Shared.jsx';
+import { PresetPicker, PresetForm, CopyValue, redirectUriFor } from '../../security/ExternalAuthPresets.jsx';
 
 const EMPTY = { name: '', displayName: '', issuerUrl: '', clientId: '', clientSecret: '', scopes: 'openid email profile', enabled: true };
 
-function ProviderForm({ initial, onDone }) {
+// Full form: any OpenID Connect issuer, and editing of every provider.
+export function ProviderForm({ initial, redirectUriTemplate, onDone }) {
   const toast = useToast();
   const [form, setForm] = useState(initial || EMPTY);
   const [error, setError] = useState(null);
@@ -31,6 +33,7 @@ function ProviderForm({ initial, onDone }) {
   return (
     <form onSubmit={submit}>
       <ErrorBanner error={error} />
+      {redirectUriTemplate && <Field label="Redirect URI (register it at the provider)"><CopyValue value={redirectUriFor(redirectUriTemplate, form.name)} label="Redirect URI" /></Field>}
       <div className="form-grid">
         {!editing && <Field label="Identifier" required help="Lowercase; used in URLs" error={error?.fields?.name}><TextInput value={form.name} onChange={set('name')} placeholder="okta" /></Field>}
         <Field label="Display name" required error={error?.fields?.displayName}><TextInput value={form.displayName} onChange={set('displayName')} placeholder="Company SSO" /></Field>
@@ -45,11 +48,22 @@ function ProviderForm({ initial, onDone }) {
   );
 }
 
+const modalTitle = (modal) => {
+  if (!modal) return '';
+  if (modal.mode === 'edit') return `Edit ${modal.provider.displayName}`;
+  if (modal.mode === 'preset') return `Add ${modal.preset.label}`;
+  if (modal.mode === 'generic') return 'Add an OpenID Connect provider';
+  return 'Add an identity provider';
+};
+
 export default function ManageExternalAuthentications({ fn }) {
   const toast = useToast();
   const confirm = useConfirm();
   const { data, loading, error, refetch } = useApi('/security/external-auth');
   const { data: settings, refetch: refetchSettings } = useApi('/system/settings?prefix=security.external_auth');
+  const { data: presetData, loading: presetsLoading } = useApi('/security/external-auth/presets');
+  const presets = presetData?.presets || [];
+  const presetLabel = (id) => presets.find((p) => p.id === id)?.label || id;
   const [modal, setModal] = useState(null);
 
   const setSetting = async (key, value) => { try { await api.put('/system/settings', { [key]: value }); toast.success('Saved'); refetchSettings(); } catch (err) { toast.error(err); } };
@@ -72,10 +86,11 @@ export default function ManageExternalAuthentications({ fn }) {
     if (!(await confirm({ title: `Delete provider "${p.displayName}"?`, message: `${p.links} linked user${p.links === 1 ? '' : 's'} will lose the ability to sign in through it.`, confirmLabel: 'Delete', danger: true }))) return;
     try { await api.delete(`/security/external-auth/${p.name}`); toast.success('Provider deleted'); refetch(); } catch (err) { toast.error(err); }
   };
+  const done = (changed) => { setModal(null); if (changed) refetch(); };
 
   return (
     <>
-      <PageHeader fn={fn} actions={<Button variant="primary" icon={Plus} onClick={() => setModal({ mode: 'create' })}>Add provider</Button>} description="OpenID Connect providers (Okta, Azure AD, Keycloak, Google Workspace…) that panel users may link to their account and sign in with." />
+      <PageHeader fn={fn} actions={<Button variant="primary" icon={Plus} onClick={() => setModal({ mode: 'create' })}>Add provider</Button>} description="Sign-in providers (Google, Microsoft Entra ID, Apple, Meta, Cloudflare Access, GitLab, Okta, Auth0, Keycloak or any OpenID Connect issuer) that panel users may link to their account and sign in with." />
       <RequestError error={error} onRetry={refetch} />
       {settings && (
         <Card title="Policy">
@@ -87,7 +102,7 @@ export default function ManageExternalAuthentications({ fn }) {
       {data && (
         <Card title="Providers" padded={false}>
           <DataTable columns={[
-            { key: 'displayName', label: 'Provider', render: (p) => <><div>{p.displayName}</div><small className="muted"><code>{p.name}</code></small></> },
+            { key: 'displayName', label: 'Provider', render: (p) => <><div>{p.displayName}</div><small className="muted"><code>{p.name}</code>{p.preset && p.preset !== 'generic' && <> · {presetLabel(p.preset)}</>}</small></> },
             { key: 'issuerUrl', label: 'Issuer', render: (p) => <a href={p.issuerUrl} target="_blank" rel="noreferrer">{p.issuerUrl}</a> },
             { key: 'clientId', label: 'Client ID', render: (p) => <code className="small">{p.clientId}</code> },
             { key: 'discovery', label: 'Discovery', render: (p) => (p.discovery ? <StatusPill status="ok">fetched {formatDate(p.discovery.fetchedAt)}</StatusPill> : <StatusPill status="warning">not run</StatusPill>) },
@@ -102,8 +117,11 @@ export default function ManageExternalAuthentications({ fn }) {
             ]} />
         </Card>
       )}
-      <Modal open={Boolean(modal)} title={modal?.mode === 'edit' ? `Edit ${modal.provider.displayName}` : 'Add an identity provider'} onClose={() => setModal(null)} size="lg">
-        {modal && <ProviderForm initial={modal.mode === 'edit' ? { ...modal.provider, clientSecret: '' } : null} onDone={(changed) => { setModal(null); if (changed) refetch(); }} />}
+      <Modal open={Boolean(modal)} title={modalTitle(modal)} onClose={() => setModal(null)} size="lg">
+        {modal?.mode === 'create' && <PresetPicker presets={presets} loading={presetsLoading} onPick={(p) => setModal(p.generic ? { mode: 'generic' } : { mode: 'preset', preset: p })} />}
+        {modal?.mode === 'preset' && <PresetForm preset={modal.preset} redirectUriTemplate={presetData?.redirectUriTemplate} currentRedirectUriTemplate={presetData?.currentRedirectUriTemplate} onBack={() => setModal({ mode: 'create' })} onDone={done} />}
+        {modal?.mode === 'generic' && <ProviderForm initial={null} redirectUriTemplate={presetData?.redirectUriTemplate} onDone={done} />}
+        {modal?.mode === 'edit' && <ProviderForm initial={{ ...modal.provider, clientSecret: '' }} redirectUriTemplate={presetData?.redirectUriTemplate} onDone={done} />}
       </Modal>
     </>
   );

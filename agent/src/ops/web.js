@@ -310,7 +310,7 @@ const hostList = z.array(arg.hostname).max(50);
 const vhostSchema = z.object({
   domain: arg.hostname, aliases: hostList.default([]), docroot: confPath, user: arg.username, group: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/).optional(),
   ip: arg.ipv4.nullable().optional(), ipv6: arg.ipv6.nullable().optional(), bind: arg.ip.nullable().optional(), port: z.number().int().min(1).max(65535).default(80), sslPort: z.number().int().min(1).max(65535).nullable().default(443),
-  phpVersion: phpVersion.nullable().optional(), ssl: sslPaths.nullable().optional(), redirects: z.array(redirect).max(100).default([]),
+  phpVersion: phpVersion.nullable().optional(), ssl: sslPaths.nullable().optional(), redirects: z.array(redirect).max(100).default([]), redirectHttps: z.boolean().default(false),
   customDirectives: freeText.default(''), logDir: confPath.optional(), serverAdmin: emailAddress.optional(), options: z.string().regex(/^[A-Za-z +-]{0,200}$/).optional(),
   meta: z.record(z.string().regex(/^[A-Za-z0-9_]{1,32}$/), metaValue).default({}), reload: z.boolean().default(true),
 }).strict();
@@ -400,6 +400,23 @@ export function renderRedirects(redirects, indent = '  ') {
   return lines;
 }
 
+// The plain-HTTP block sends every request to HTTPS except the ACME webroot
+// challenge, which must stay reachable over port 80 for renewals. Behind the
+// nginx proxy (bind set) Apache only ever sees plain HTTP, so the client's
+// scheme is what nginx forwarded; %{HTTPS} would redirect forever.
+export function renderHttpsRedirect(bind, indent = '  ') {
+  const condition = bind ? 'RewriteCond %{HTTP:X-Forwarded-Proto} !=https' : 'RewriteCond %{HTTPS} off';
+  return [
+    `${indent}# Redirect HTTP to HTTPS (Apache Configuration: web.force_https)`,
+    `${indent}<IfModule mod_rewrite.c>`,
+    `${indent}  RewriteEngine On`,
+    `${indent}  ${condition}`,
+    `${indent}  RewriteCond %{REQUEST_URI} !^/\\.well-known/acme-challenge/`,
+    `${indent}  RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]`,
+    `${indent}</IfModule>`,
+  ];
+}
+
 function vhostBlock(v, { ssl, port }) {
   const addrs = v.bind ? [listenAddr(v.bind, port)] : [v.ip ? `${v.ip}:${port}` : null, v.ipv6 ? `[${v.ipv6}]:${port}` : null].filter(Boolean);
   const listen = addrs.length ? addrs.join(' ') : `*:${port}`;
@@ -411,6 +428,7 @@ function vhostBlock(v, { ssl, port }) {
   lines.push(`  CustomLog ${q(`${logDir}/${v.domain}${ssl ? '-ssl' : ''}-access.log`)} combined`, `  ErrorLog ${q(`${logDir}/${v.domain}${ssl ? '-ssl' : ''}-error.log`)}`);
   lines.push('  <IfModule mod_userdir.c>', '    UserDir disabled', '  </IfModule>');
   lines.push(`  <Directory ${q(v.docroot)}>`, `    Options ${v.options || '-Indexes +FollowSymLinks'}`, '    AllowOverride All', '    Require all granted', '  </Directory>');
+  if (!ssl && v.redirectHttps) lines.push(...renderHttpsRedirect(v.bind ?? null));
   if (v.phpVersion) {
     // proxy_fcgi drops the Authorization header unless it is re-exported, so
     // PHP applications using HTTP Basic auth get it on both vhosts.
@@ -432,7 +450,7 @@ function vhostBlock(v, { ssl, port }) {
 }
 
 export function renderVhost(v) {
-  const meta = { domain: v.domain, user: v.user, docroot: v.docroot, aliases: v.aliases, ip: v.ip ?? null, ipv6: v.ipv6 ?? null, bind: v.bind ?? null, phpVersion: v.phpVersion ?? null, ssl: Boolean(v.ssl && v.sslPort), redirects: v.redirects.length, ...v.meta };
+  const meta = { domain: v.domain, user: v.user, docroot: v.docroot, aliases: v.aliases, ip: v.ip ?? null, ipv6: v.ipv6 ?? null, bind: v.bind ?? null, phpVersion: v.phpVersion ?? null, ssl: Boolean(v.ssl && v.sslPort), redirects: v.redirects.length, redirectHttps: Boolean(v.redirectHttps), ...v.meta };
   const lines = [`${MANAGED} (virtual host ${v.domain}). Edit through the panel; manual changes are overwritten.`, `${VHOST_MARK}${JSON.stringify(meta)}`, ''];
   lines.push(...vhostBlock(v, { ssl: false, port: v.port }));
   if (v.ssl && v.sslPort) lines.push('', '<IfModule ssl_module>', ...vhostBlock(v, { ssl: true, port: v.sslPort }), '</IfModule>');

@@ -7,7 +7,7 @@ import { runOp, createContext, OpError } from '../src/lib.js';
 import {
   renderVhost, parseVhostMeta, renderRedirects, renderGlobalInclude, renderPhpPool, renderLogrotate, mergeKeyValueFile, renderProftpd, vsftpdSettings, pureFtpdSettings,
   ftpSettingsFrom, parseServerStatus, parseApacheVersion, parseModules, parseDoveconf, rewriteListen, apacheLayout, eximLayout, phpLayout, SERVICE_ROLES, hintsFor, ensureRootLogDir, confPath, parseEximVersion,
-  mergeEximBlock, readEximBlock, stripEximBlock, eximTlsLibrary, primaryGroupName, EXIM_SENTINEL_MACRO,
+  mergeEximBlock, readEximBlock, stripEximBlock, eximTlsLibrary, primaryGroupName, EXIM_SENTINEL_MACRO, renderHttpsRedirect,
 } from '../src/ops/web.js';
 
 // Fake host for the layout detection: which paths exist, what they contain, which binaries resolve.
@@ -52,6 +52,7 @@ describe('web op schemas reject injection and traversal before anything runs', (
       { ...VHOST, ssl: { cert: '/etc/ssl/whm/c pem', key: '/etc/ssl/whm/k.pem' } }, { ...VHOST, ssl: { cert: '/etc/ssl/whm/c.pem', key: '/etc/ssl/whm/k.pem', fullchain: '/etc/ssl/whm/f.pem\n' } },
       { ...VHOST, logDir: '/var/log/whm/domlogs/alice\n' }, { ...VHOST, logDir: '/var/log/whm/domlogs/alice;x' },
       { ...VHOST, bind: 'localhost' }, { ...VHOST, bind: '127.0.0.1:8080' }, { ...VHOST, sslPort: 0 },
+      { ...VHOST, redirectHttps: 'yes' }, { ...VHOST, redirectHttps: 1 },
     ];
     for (const args of bad) expect((await opError(runOp('web.vhost.write', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
     for (const domain of ['-r', 'a;b', '../x', 'a b']) {
@@ -188,6 +189,41 @@ describe('renderers produce the expected daemon syntax', () => {
     expect(renderVhost({ ...VHOST, ip: null })).toContain('<VirtualHost *:80>');
     expect(renderVhost(VHOST)).toContain('CustomLog "/var/log/whm/domlogs/alice/example.com-access.log" combined');
     expect(renderRedirects([{ from: '/a.b', to: 'https://t/', type: 'permanent', matchWww: true, keepPath: true }])).toEqual(['  RedirectMatch 301 "^/a\\.b/?(.*)$" "https://t/$1"']);
+  });
+
+  it('redirectHttps adds a mod_rewrite block to the plain vhost only, keyed on the scheme Apache can see', () => {
+    const ssl = { cert: '/etc/ssl/whm/example.com/cert.pem', key: '/etc/ssl/whm/example.com/key.pem', fullchain: '/etc/ssl/whm/example.com/fullchain.pem' };
+    const direct = renderVhost({ ...VHOST, ssl, redirectHttps: true, redirects: [{ from: '/old', to: 'https://x.org/landing', type: '302', matchWww: true, keepPath: false }] });
+    const [plain, tls] = direct.split('<IfModule ssl_module>');
+    expect(plain).toContain([
+      '  # Redirect HTTP to HTTPS (Apache Configuration: web.force_https)',
+      '  <IfModule mod_rewrite.c>',
+      '    RewriteEngine On',
+      '    RewriteCond %{HTTPS} off',
+      '    RewriteCond %{REQUEST_URI} !^/\\.well-known/acme-challenge/',
+      '    RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]',
+      '  </IfModule>',
+    ].join('\n'));
+    expect(plain).not.toContain('X-Forwarded-Proto');
+    // The redirect precedes the domain forwarding and the Application Manager include, and the TLS block has none of it.
+    expect(plain.indexOf('RewriteRule ^ https://')).toBeLessThan(plain.indexOf('RedirectMatch 302'));
+    expect(plain.indexOf('RewriteRule ^ https://')).toBeLessThan(plain.indexOf('IncludeOptional'));
+    expect(tls).not.toContain('RewriteEngine');
+    expect(tls).not.toContain('RewriteCond');
+    expect(parseVhostMeta(direct)).toMatchObject({ ssl: true, redirectHttps: true });
+    // Behind nginx Apache never terminates TLS itself: the forwarded scheme decides.
+    const proxied = renderVhost({ ...VHOST, bind: '127.0.0.1', port: 8080, sslPort: null, ssl, redirectHttps: true });
+    expect(proxied).toContain('    RewriteCond %{HTTP:X-Forwarded-Proto} !=https');
+    expect(proxied).not.toContain('%{HTTPS} off');
+    expect(proxied).toContain('    RewriteCond %{REQUEST_URI} !^/\\.well-known/acme-challenge/');
+    expect(proxied.match(/RewriteEngine On/g)).toHaveLength(1);
+    expect(parseVhostMeta(proxied)).toMatchObject({ bind: '127.0.0.1', ssl: false, redirectHttps: true });
+    // Off by default and when unset: the block never appears.
+    expect(renderVhost({ ...VHOST, ssl })).not.toContain('RewriteEngine');
+    expect(renderVhost({ ...VHOST, ssl, redirectHttps: false })).not.toContain('mod_rewrite');
+    expect(parseVhostMeta(renderVhost({ ...VHOST, ssl }))).toMatchObject({ redirectHttps: false });
+    expect(renderHttpsRedirect('::1')).toContain('    RewriteCond %{HTTP:X-Forwarded-Proto} !=https');
+    expect(renderHttpsRedirect(null)[3]).toBe('    RewriteCond %{HTTPS} off');
   });
 
   it('a bind address replaces the account IPs so proxied requests to 127.0.0.1:8080 match; a null sslPort drops the TLS block', () => {

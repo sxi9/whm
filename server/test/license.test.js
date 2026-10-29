@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import request from 'supertest';
 import { createTestApp, createMockAgent } from './support/app.js';
 import { bootstrap } from '../src/index.js';
 import { canonicalize, canonicalString } from '../src/lib/canonical.js';
@@ -94,6 +95,8 @@ async function bootPanel({ enforce = true, hubUrl = HUB, agent, overrides = {}, 
   app.ctx.license.transport = h2.transport;
   app.ctx.license.clock.now = () => h2.now();
   app.hub = h2;
+  // The license API belongs to the panel owner: the test root is made the super admin.
+  app.ctx.db.prepare("UPDATE users SET superadmin = 1 WHERE username = 'root'").run();
   app.csrf = await app.login();
   app.post = (url, body = {}) => app.http.post(url).set('X-CSRF-Token', app.csrf).send(body);
   app.put = (url, body = {}) => app.http.put(url).set('X-CSRF-Token', app.csrf).send(body);
@@ -347,6 +350,66 @@ describe('activation, hub.request and hubUrl()', () => {
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(hub.calls.at(-1).body.key).toBe('WHM-TR1A-2B3C-4D5E-6F7G');
       expect(res.body.data.status).toBe('active');
+    } finally { await app.close(); }
+  });
+});
+
+describe('super admin gating', () => {
+  it('hides the hub, key and activations from a root user who is not the super admin', async () => {
+    const app = await bootPanel();
+    try {
+      await app.post('/api/license/key', { key: 'WHM-7K3Q-M2DF-9XA1-P0R6' }).expect(200);
+      const full = await app.http.get('/api/license').expect(200);
+      expect(full.body.data).toMatchObject({ restricted: false, hubUrl: ISSUER, bootstrapHubUrl: HUB, hasKey: true, edition: 'pro' });
+      expect(Object.keys(full.body.data)).toEqual(expect.arrayContaining(['activationId', 'fingerprint', 'events', 'pinnedKeys', 'messages']));
+      const me = await app.http.get('/api/auth/me').expect(200);
+      expect(me.body.data.superadmin).toBe(true);
+      expect(me.body.data.user.superadmin).toBe(true);
+      expect(me.body.data.license).not.toHaveProperty('hubUrl');
+
+      const other = await app.createUser('secondroot', 'root');
+      const agent = request.agent(app.ctx.app);
+      const login = await agent.post('/api/auth/login').send({ username: other.username, password: other.password }).expect(200);
+      const csrf = login.body.data.csrfToken;
+      expect(login.body.data.user.superadmin).toBe(false);
+      const me2 = await agent.get('/api/auth/me').expect(200);
+      expect(me2.body.data.superadmin).toBe(false);
+      expect(me2.body.data.license).toMatchObject({ status: 'active', edition: 'pro' });
+      expect(JSON.stringify(me2.body)).not.toContain('hub.test');
+      expect(JSON.stringify(me2.body)).not.toContain('issuer.test');
+
+      const restricted = await agent.get('/api/license').expect(200);
+      expect(restricted.body.data).toMatchObject({ restricted: true, status: 'active', edition: 'pro', editionLabel: 'Pro', enforce: true, degraded: false });
+      expect(restricted.body.data.daysLeft).toBeGreaterThan(300);
+      for (const field of ['hubUrl', 'bootstrapHubUrl', 'activationId', 'keyPrefix', 'hasKey', 'fingerprint', 'hostname', 'messages', 'events', 'pinnedKeys', 'knownActivations', 'licenseId', 'pluginSigningKids']) expect(restricted.body.data).not.toHaveProperty(field);
+      expect(JSON.stringify(restricted.body)).not.toContain('hub.test');
+      expect(JSON.stringify(restricted.body)).not.toContain('issuer.test');
+
+      const gated = [
+        ['get', '/api/license/activations', undefined], ['get', '/api/license/events', undefined],
+        ['post', '/api/license/key', { key: 'WHM-7K3Q-M2DF-9XA1-P0R6' }], ['post', '/api/license/checkin', {}],
+        ['post', '/api/license/deactivate', {}], ['post', '/api/license/trial', { email: 'ops@example.com' }],
+      ];
+      const before = app.hub.calls.length;
+      for (const [method, url, body] of gated) {
+        const res = await (method === 'get' ? agent.get(url) : agent.post(url).set('X-CSRF-Token', csrf).send(body));
+        expect(res.status, `${method} ${url}`).toBe(403);
+        expect(res.body.error.code, `${method} ${url}`).toBe('superadmin_required');
+      }
+      expect(app.hub.calls.length).toBe(before);
+      expect(app.ctx.license.get().status).toBe('active');
+
+      // A reseller is refused before the super admin check (role first).
+      const reseller = await app.createUser('policyres', 'reseller');
+      const r = request.agent(app.ctx.app);
+      await r.post('/api/auth/login').send({ username: reseller.username, password: reseller.password }).expect(200);
+      expect((await r.get('/api/license')).status).toBe(403);
+      expect((await r.get('/api/license/activations')).status).toBe(403);
+
+      // Revoking the flag closes the full view again, without a new login.
+      app.ctx.db.prepare("UPDATE users SET superadmin = 0 WHERE username = 'root'").run();
+      expect((await app.http.get('/api/license')).body.data.restricted).toBe(true);
+      expect((await app.http.get('/api/license/activations')).status).toBe(403);
     } finally { await app.close(); }
   });
 });

@@ -4,8 +4,11 @@ import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
 import { PageHeader, Card, KeyValue, StatusPill } from '../../components/Common.jsx';
+import { AccountManager } from './AccountDetails.jsx';
 import { Field, TextInput, PasswordInput, Select, Toggle, Button, FormActions, ErrorBanner } from '../../components/Form.jsx';
 import { useToast } from '../../components/Toast.jsx';
+
+const EMPTY_FORM = { domain: '', username: '', password: '', contactEmail: '', package: '', ip: '', owner: '', manager: '' };
 
 function suggestUsername(domain) {
   return domain.toLowerCase().replace(/^www\./, '').split('.')[0].replace(/[^a-z0-9]/g, '').replace(/^[^a-z]+/, '').slice(0, 16);
@@ -15,15 +18,23 @@ export default function CreateAccount({ fn }) {
   const toast = useToast();
   const { user } = useAuth();
   const { data: packages } = useApi('/packages?pageSize=500');
-  const [form, setForm] = useState({ domain: '', username: '', password: '', contactEmail: '', package: '', ip: '', owner: '' });
+  const { data: managers } = useApi('/accounts/managers');
+  const [form, setForm] = useState({ ...EMPTY_FORM });
   const [provision, setProvision] = useState({ web: true, dns: true, mail: true });
   const [auto, setAuto] = useState(true);
+  // The manager follows the owner until it is picked by hand.
+  const [managerTouched, setManagerTouched] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
   const set = (k) => (v) => setForm((f) => ({ ...f, [k]: v }));
 
   useEffect(() => { if (auto) setForm((f) => ({ ...f, username: suggestUsername(f.domain) })); }, [form.domain, auto]);
+  useEffect(() => {
+    if (managerTouched || user.role !== 'root') return;
+    const follows = form.owner && (managers || []).some((m) => m.username === form.owner) ? form.owner : '';
+    setForm((f) => (f.manager === follows ? f : { ...f, manager: follows }));
+  }, [form.owner, managers, managerTouched, user.role]);
 
   const submit = async (e) => {
     e.preventDefault();
@@ -48,9 +59,10 @@ export default function CreateAccount({ fn }) {
     return (
       <>
         <PageHeader fn={fn} />
-        <Card title="Account created" actions={<button className="btn" onClick={() => { setResult(null); setForm({ domain: '', username: '', password: '', contactEmail: '', package: '', ip: '', owner: '' }); }}>Create another</button>}>
+        <Card title="Account created" actions={<button className="btn" onClick={() => { setResult(null); setForm({ ...EMPTY_FORM }); setManagerTouched(false); }}>Create another</button>}>
           <KeyValue items={[
             ['Domain', result.domain], ['Username', <code key="u">{result.username}</code>], ['Package', result.package_name], ['IP address', result.ip || 'shared'], ['Home directory', <code key="h">{result.home_dir}</code>],
+            ['Account manager', <AccountManager key="m" account={result} />],
             ['Linux user', <StatusPill key="s" status={result.provisioning?.systemUser ? 'ok' : 'warning'}>{result.provisioning?.systemUser ? 'created' : 'not created (development mode)'}</StatusPill>],
             step('web', 'Web vhost'), step('dns', 'DNS zone'), step('mail', 'Mail routing'), step('database', 'Databases'),
           ]} />
@@ -84,6 +96,13 @@ export default function CreateAccount({ fn }) {
             </Field>
             <Field label="Dedicated IP address" error={fieldErr('ip')} help="Leave blank to use the shared IP"><TextInput value={form.ip} onChange={set('ip')} placeholder="203.0.113.10" /></Field>
             {user.role === 'root' && <Field label="Owner" error={fieldErr('owner')} help="Reseller username that will own this account (default: root)"><TextInput value={form.owner} onChange={set('owner')} placeholder="root" /></Field>}
+          </div>
+        </Card>
+        <Card title="Account manager" subtitle="Who the account turns to for support. The manager is shown to the account and shares its conversation under Support › Account Conversations.">
+          <div className="form-grid">
+            <Field label="Managed by" error={fieldErr('manager')} help={user.role === 'root' ? 'Any root or reseller user; follows the owner until you choose one' : 'Yourself or a root user'}>
+              <Select value={form.manager} onChange={(v) => { setManagerTouched(true); set('manager')(v); }} options={(managers || []).map((m) => ({ value: m.username, label: `${m.username} (${m.role}${m.email ? `, ${m.email}` : ''})` }))} placeholder={`Default: you (${user.username})`} />
+            </Field>
           </div>
         </Card>
         <Card title="Provisioning" subtitle="Each step runs through its own category when that service exists on this server; a missing daemon leaves the step pending until it is installed.">

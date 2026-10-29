@@ -68,7 +68,7 @@ export default function ModsecurityTools({ fn }) {
       <PageHeader fn={fn} />
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
-      {data && !data.installed && <RequestError error={{ status: 501, code: 'capability_missing', message: 'ModSecurity is not installed on this server.' }} onRetry={refetch} />}
+      {data && !data.installed && <RequestError error={{ status: 501, code: 'capability_missing', capability: 'modsecurity', message: 'ModSecurity is not installed on this server.' }} onRetry={refetch} />}
       {data && data.installed && (
         <>
           <Tabs value={tab} onChange={setTab} tabs={[{ value: 'hits', label: 'Hits list' }, { value: 'rules', label: 'Rules list', count: data.disabledRules.length ? `${data.disabledRules.length} disabled` : undefined }]} />

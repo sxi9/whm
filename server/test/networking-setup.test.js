@@ -1,8 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent } from './support/app.js';
-import { validateHostname, updateHostsFile, parseHosts, parseResolvConf, renderResolvedDropIn, detectResolverManager, HOSTS_PATH, RESOLVED_DROPIN } from '../src/services/networking-setup.js';
-import { CapabilityError } from '../src/lib/errors.js';
+import { validateHostname, updateHostsFile, parseHosts, parseResolvConf, renderResolvedDropIn, detectResolverManager, isPublicIpv6, HOSTS_PATH, RESOLVED_DROPIN, HOSTNAME_CERT_SERVICES } from '../src/services/networking-setup.js';
+import { CapabilityError, notFound } from '../src/lib/errors.js';
+
+const CERT = '-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUQ\n-----END CERTIFICATE-----\n';
+const KEY = '-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49\n-----END PRIVATE KEY-----\n';
+const CHAIN = '-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUR\n-----END CERTIFICATE-----\n';
 
 const DEBIAN_HOSTS = `127.0.0.1\tlocalhost
 127.0.1.1\told.example.com old
@@ -97,6 +101,12 @@ describe('hostname helpers', () => {
     expect(parseHosts(r.content).filter((l) => l.ip)[0].names).toEqual(['host.example.com', 'host', 'db.internal', 'cache']);
     const v6 = updateHostsFile('', { ip: '10.0.0.5', ipv6: '2001:db8::5', hostname: 'host.example.com' });
     expect(parseHosts(v6.content).filter((l) => l.ip).map((l) => l.ip)).toEqual(['10.0.0.5', '2001:db8::5']);
+  });
+
+  it('publishes an AAAA record only for a public IPv6 address', () => {
+    expect(isPublicIpv6('2001:db8::10')).toBe(true);
+    expect(isPublicIpv6('2a01:4f8:1::1')).toBe(true);
+    for (const v of ['::1', '::', 'fe80::1', 'FE80::abcd', 'fd00::1', 'fc00::1', '::ffff:10.0.0.5', '10.0.0.5', '', null, 'not-an-ip']) expect(isPublicIpv6(v), v).toBe(false);
   });
 
   it('parses resolv.conf and detects who manages it', () => {
@@ -197,7 +207,8 @@ describe('Networking Setup API', () => {
     expect(data).toMatchObject({ current: 'old.example.com', configured: 'old.example.com', inSync: true, ip: '10.0.0.5', configuredIp: '10.0.0.5', detectedIp: '10.0.0.5' });
     expect(data.validation.ok).toBe(true);
     expect(data.hosts).toMatchObject({ path: HOSTS_PATH, exists: true, entry: { ip: '127.0.1.1', names: ['old.example.com', 'old'] }, ok: true });
-    expect(data.capability).toEqual({ hostnamectl: true, dns: true });
+    expect(data.capability).toEqual({ hostnamectl: true, dns: true, ssl: true, web: true });
+    expect(data.certificate).toBeNull();
     expect(data.dns).toMatchObject({ available: true });
     expect(data.defaults).toEqual({ updateHosts: true, addDnsRecord: true });
     expect(data.lastChange).toBeNull();
@@ -277,10 +288,14 @@ describe('Networking Setup API', () => {
     const res = await post('/api/networking/hostname', { hostname: 'new.example.com', addDnsRecord: false }).expect(200);
     const { data } = res.body;
     expect(data).toMatchObject({ ok: true, hostname: 'new.example.com', previous: 'old.example.com', ip: '10.0.0.5', restartHint: ['exim', 'imap', 'httpd'] });
-    expect(data.steps.map((s) => [s.step, s.ok])).toEqual([['hostname', true], ['hosts', true], ['settings', true], ['certs', true]]);
+    // Without Apache the landing vhost is stored for later; without an ACME client the certificate is skipped, not failed.
+    expect(data.steps.map((s) => [s.step, s.ok])).toEqual([['hostname', true], ['hosts', true], ['settings', true], ['certs', true], ['landing', true], ['certificate', true]]);
     expect(data.steps.find((s) => s.step === 'certs')).toMatchObject({ reissued: [], manual: [], failed: [] });
+    expect(data.steps.find((s) => s.step === 'landing')).toMatchObject({ ok: true, skipped: true, capability: 'apache' });
+    expect(data.steps.find((s) => s.step === 'certificate')).toMatchObject({ ok: true, skipped: true, capability: 'acme' });
+    expect(app.ctx.web.vhostFor('new.example.com')).toMatchObject({ type: 'server', status: 'pending', docroot: '/var/www/whm-default' });
     expect(app.agent.callsTo('sys.hostname.set')[0].args).toEqual({ hostname: 'new.example.com' });
-    const write = app.agent.callsTo('fs.write_file')[0];
+    const write = app.agent.callsTo('fs.write_file').find((c) => c.args.path === HOSTS_PATH);
     expect(write.args).toMatchObject({ path: HOSTS_PATH, backup: true, mode: '0644', owner: 'root' });
     expect(write.args.content).toContain('10.0.0.5\tnew.example.com new');
     expect(write.args.content).not.toContain('old.example.com');
@@ -290,7 +305,7 @@ describe('Networking Setup API', () => {
     const audit = auditRows('networking.hostname.set');
     expect(audit).toHaveLength(1);
     expect(audit[0].target).toBe('new.example.com');
-    expect(JSON.parse(audit[0].args_redacted)).toMatchObject({ previous: 'old.example.com', ip: '10.0.0.5', updateHosts: true, addDnsRecord: false, reissueSelfSigned: true });
+    expect(JSON.parse(audit[0].args_redacted)).toMatchObject({ previous: 'old.example.com', ip: '10.0.0.5', updateHosts: true, addDnsRecord: false, reissueSelfSigned: true, hostnameTls: true });
     const history = (await get('/api/networking/history?kind=hostname').expect(200)).body.data;
     expect(history[0]).toMatchObject({ kind: 'hostname', principal: 'root', before: { hostname: 'old.example.com' }, after: { hostname: 'new.example.com', ip: '10.0.0.5' } });
     const status = (await get('/api/networking/hostname').expect(200)).body.data;
@@ -303,7 +318,7 @@ describe('Networking Setup API', () => {
     const skip = (await post('/api/networking/hostname', { hostname: 'a.example.com', ip: '192.0.2.9', updateHosts: false }).expect(200)).body.data;
     expect(skip.ip).toBe('192.0.2.9');
     expect(skip.steps.find((s) => s.step === 'hosts')).toMatchObject({ ok: true, skipped: true });
-    expect(app.agent.callsTo('fs.write_file')).toHaveLength(0);
+    expect(app.agent.callsTo('fs.write_file').filter((c) => c.args.path === HOSTS_PATH)).toHaveLength(0);
     app.agent.fail('fs.write_file', 'path_not_allowed', 'nope');
     const failed = (await post('/api/networking/hostname', { hostname: 'b.example.com' }).expect(200)).body.data;
     expect(failed.ok).toBe(false);
@@ -360,6 +375,121 @@ describe('Networking Setup API', () => {
     expect(zone).toBeTruthy();
     expect(app.ctx.db.prepare("SELECT value FROM dns_records WHERE zone_id = ? AND name = 'c' AND type = 'A'").get(zone.id)).toEqual({ value: '10.0.0.5' });
     expect(auditRows('dns.hostname.a')).toHaveLength(1);
+  });
+
+  it('POST /hostname publishes AAAA (public IPv6 only), www CNAME and MX records next to the A record', async () => {
+    app.ctx.settings.set('basic.main_ipv6', '2001:db8::10');
+    const { data } = (await post('/api/networking/hostname', { hostname: 'v6.example.com', addDnsRecord: true }).expect(200)).body;
+    const dns = data.steps.find((s) => s.step === 'dns');
+    expect(dns).toMatchObject({ ok: true, zone: 'example.com' });
+    expect(dns.records.map((r) => [r.type, r.name, r.value, r.ok])).toEqual([['A', 'v6.example.com', '10.0.0.5', true], ['AAAA', 'v6.example.com', '2001:db8::10', true], ['CNAME', 'www.v6.example.com', 'v6.example.com', true], ['MX', 'v6.example.com', 'v6.example.com', true]]);
+    expect(dns.detail).toMatch(/www\.v6\.example\.com IN CNAME v6\.example\.com/);
+    const zone = app.ctx.db.prepare('SELECT id FROM dns_zones WHERE domain = ?').get('example.com');
+    const rows = app.ctx.db.prepare("SELECT name, type, value, priority FROM dns_records WHERE zone_id = ? AND name IN ('v6', 'www.v6') ORDER BY type, name").all(zone.id);
+    expect(rows).toEqual([{ name: 'v6', type: 'A', value: '10.0.0.5', priority: null }, { name: 'v6', type: 'AAAA', value: '2001:db8::10', priority: null }, { name: 'www.v6', type: 'CNAME', value: 'v6.example.com.', priority: null }, { name: 'v6', type: 'MX', value: 'v6.example.com.', priority: 0 }]);
+    app.ctx.settings.set('basic.main_ipv6', 'fe80::1');
+    const local = (await post('/api/networking/hostname', { hostname: 'v6b.example.com', addDnsRecord: true }).expect(200)).body.data.steps.find((s) => s.step === 'dns');
+    expect(local.records.map((r) => r.type)).toEqual(['A', 'CNAME', 'MX']);
+    app.ctx.settings.set('basic.main_ipv6', '');
+    // A record API that fails for one record is reported inside the step without undoing the A record.
+    const original = app.ctx.dns.upsertRecords;
+    app.ctx.dns.upsertRecords = async (domain, name, type) => { if (type === 'MX') throw new Error('MX refused'); return { applied: true }; };
+    try {
+      const partial = (await post('/api/networking/hostname', { hostname: 'v6c.example.com', addDnsRecord: true }).expect(200)).body.data.steps.find((s) => s.step === 'dns');
+      expect(partial).toMatchObject({ ok: false });
+      expect(partial.records.find((r) => r.type === 'MX')).toMatchObject({ ok: false, error: 'MX refused' });
+      expect(partial.error).toMatch(/MX v6c\.example\.com: MX refused/);
+    } finally { app.ctx.dns.upsertRecords = original; }
+  });
+
+  it('POST /hostname renders the landing vhost, then issues the hostname certificate and installs it for the panel, mail and FTP', async () => {
+    const calls = { landing: [], issue: [], installs: [], issueFor: 0 };
+    const originalWeb = app.ctx.web;
+    const originalSsl = app.ctx.ssl;
+    app.ctx.web = { ...originalWeb, ensureHostnameVhost: async (req, { hostname: h }) => { calls.landing.push({ h, hasReq: Boolean(req) }); return { hostname: h, applied: true, docroot: '/var/www/whm-default', landingPage: true }; } };
+    app.ctx.ssl = {
+      ...originalSsl,
+      autossl: { settings: () => ({ provider: 'certbot', method: 'webroot' }), detect: async () => ({ providers: ['certbot'] }), issue: async (row, s, opts) => { calls.issue.push({ row, provider: s.provider, force: opts.force, hasReq: Boolean(opts.req) }); return { cert: { id: 77 }, certificate: { issuerCommonName: 'R3', notAfter: '2027-01-01T00:00:00Z' }, renewed: false, web: 'applied' }; } },
+      issueFor: async () => { calls.issueFor++; throw notFound('Domain "tls.example.com"'); },
+      certs: { raw: (id) => (id === 77 ? { cert_pem: CERT, key_enc: app.ctx.crypto.encrypt(KEY), chain_pem: CHAIN } : null) },
+      certForDomain: () => null,
+      installServiceCert: async (service, pems, req) => { calls.installs.push({ service, pems, hasReq: Boolean(req) }); if (service === 'exim') throw new CapabilityError('exim', 'Exim is not installed'); return { service }; },
+    };
+    try {
+      const { data } = (await post('/api/networking/hostname', { hostname: 'tls.example.com', addDnsRecord: true }).expect(200)).body;
+      expect(data.steps.map((s) => s.step)).toEqual(['hostname', 'hosts', 'settings', 'certs', 'dns', 'landing', 'certificate']);
+      expect(data.steps.find((s) => s.step === 'landing')).toMatchObject({ ok: true, docroot: '/var/www/whm-default', landingPage: true });
+      expect(calls.landing).toEqual([{ h: 'tls.example.com', hasReq: true }]);
+      const cert = data.steps.find((s) => s.step === 'certificate');
+      expect(cert).toMatchObject({ ok: false, certId: 77, issuer: 'R3', notAfter: '2027-01-01T00:00:00Z', web: 'applied', installed: ['panel', 'dovecot', 'ftp'], failed: [{ service: 'exim', code: 'capability_missing' }] });
+      expect(cert.error).toMatch(/exim: Exim is not installed/);
+      expect(cert.detail).toMatch(/R3 certificate for tls\.example\.com until 2027-01-01T00:00:00Z; installed for panel, dovecot, ftp; hostname vhost applied/);
+      expect(data.ok).toBe(false);
+      expect(data.hostname).toBe('tls.example.com');
+      expect(calls.issueFor).toBe(1);
+      expect(calls.issue).toEqual([{ row: { domain: 'tls.example.com', account: null, accountId: null, type: 'server', suspended: false, docroot: '/var/www/whm-default', certificate: null }, provider: 'certbot', force: false, hasReq: true }]);
+      expect(calls.installs.map((i) => i.service)).toEqual(HOSTNAME_CERT_SERVICES);
+      expect(calls.installs[0]).toMatchObject({ hasReq: true, pems: { certPem: CERT, keyPem: KEY, chainPem: CHAIN } });
+      expect(auditRows('ssl.autossl.issue').pop()).toMatchObject({ target: 'tls.example.com', principal: 'root' });
+      // The name not resolving to this server yet is reported and nothing is issued.
+      calls.issue.length = 0;
+      resolverAnswers.system = ['203.0.113.9'];
+      const unresolved = (await post('/api/networking/hostname', { hostname: 'tls2.example.com', addDnsRecord: false }).expect(200)).body.data.steps.find((s) => s.step === 'certificate');
+      expect(unresolved).toMatchObject({ ok: false, skipped: true, answers: ['203.0.113.9'] });
+      expect(unresolved.error).toMatch(/does not resolve to 10\.0\.0\.5 yet/);
+      expect(calls.issue).toEqual([]);
+      resolverAnswers.system = ['10.0.0.5'];
+      // Without an ACME client the step is skipped, not failed, and names the capability; same when AutoSSL is off.
+      app.ctx.ssl.autossl.detect = async () => ({ providers: [] });
+      const noAcme = (await post('/api/networking/hostname', { hostname: 'tls3.example.com', addDnsRecord: false }).expect(200)).body.data;
+      expect(noAcme.steps.find((s) => s.step === 'certificate')).toMatchObject({ ok: true, skipped: true, capability: 'acme', code: 'capability_missing' });
+      expect(noAcme.ok).toBe(true);
+      app.ctx.ssl.autossl.settings = () => ({ provider: 'disabled' });
+      expect((await post('/api/networking/hostname', { hostname: 'tls4.example.com', addDnsRecord: false }).expect(200)).body.data.steps.find((s) => s.step === 'certificate')).toMatchObject({ ok: true, skipped: true, capability: 'acme' });
+      expect(calls.issue).toEqual([]);
+      // Internal callers may leave the certificate out; a landing failure is a step, never an exception.
+      app.ctx.web.ensureHostnameVhost = async () => ({ applied: false, reason: 'config_invalid', error: 'Apache rejected the vhost' });
+      const internal = await app.ctx.networking.setHostname({ hostname: 'tls5.example.com', addDnsRecord: false, issueCertificate: false }, null);
+      expect(internal.steps.map((s) => [s.step, s.ok])).toEqual([['hostname', true], ['hosts', true], ['settings', true], ['certs', true], ['landing', false]]);
+      expect(internal.steps.at(-1)).toMatchObject({ error: 'Apache rejected the vhost', code: 'config_invalid' });
+      expect(hostname).toBe('tls5.example.com');
+    } finally { app.ctx.web = originalWeb; app.ctx.ssl = originalSsl; }
+  });
+
+  it('reissueHostnameCertificate re-renders the landing vhost, forces a fresh certificate for the current hostname and audits', async () => {
+    const calls = { issue: [], installs: [] };
+    const originalWeb = app.ctx.web;
+    const originalSsl = app.ctx.ssl;
+    app.ctx.web = { ...originalWeb, ensureHostnameVhost: async (req, { hostname: h }) => ({ hostname: h, applied: true, docroot: '/var/www/whm-default', ssl: { cert: '/etc/ssl/whm/x/cert.pem', key: '/etc/ssl/whm/x/key.pem' }, landingPage: true }) };
+    app.ctx.ssl = {
+      ...originalSsl,
+      autossl: { settings: () => ({ provider: 'acme.sh' }), detect: async () => ({ providers: ['acme.sh'] }), issue: async (row, s, opts) => { calls.issue.push({ domain: row.domain, force: opts.force }); return { cert: { id: 5 }, certificate: { issuerCommonName: 'ZeroSSL', notAfter: '2027-02-01T00:00:00Z' }, renewed: true, web: 'applied' }; } },
+      issueFor: async () => { throw notFound('Domain'); },
+      certs: { raw: () => ({ cert_pem: CERT, key_enc: app.ctx.crypto.encrypt(KEY), chain_pem: null }) },
+      certForDomain: () => ({ installed: 1 }),
+      installServiceCert: async (service, pems) => { calls.installs.push({ service, hasChain: 'chainPem' in pems }); return { service }; },
+    };
+    try {
+      const r = await app.ctx.networking.reissueHostnameCertificate({}, null);
+      expect(r).toMatchObject({ hostname: 'old.example.com', ip: '10.0.0.5', ok: true });
+      expect(r.steps.map((s) => [s.step, s.ok])).toEqual([['landing', true], ['certificate', true]]);
+      expect(r.steps[0].detail).toMatch(/\(HTTPS\)$/);
+      expect(r.steps[1]).toMatchObject({ renewed: true, issuer: 'ZeroSSL', installed: HOSTNAME_CERT_SERVICES, failed: [] });
+      expect(calls.issue).toEqual([{ domain: 'old.example.com', force: true }]);
+      expect(calls.installs).toEqual(HOSTNAME_CERT_SERVICES.map((service) => ({ service, hasChain: false })));
+      expect(auditRows('networking.hostname.certificate').pop()).toMatchObject({ target: 'old.example.com' });
+      expect(JSON.parse(auditRows('networking.hostname.certificate').pop().args_redacted)).toMatchObject({ force: true, ip: '10.0.0.5' });
+      // A hostname that is not fully qualified cannot get a certificate.
+      app.ctx.settings.set('basic.hostname', 'localhost');
+      await expect(app.ctx.networking.reissueHostnameCertificate({}, null)).rejects.toMatchObject({ status: 422 });
+      // GET /hostname surfaces the hostname's certificate and landing vhost.
+      app.ctx.settings.set('basic.hostname', 'old.example.com');
+      app.ctx.ssl.certForDomain = () => ({ id: 5, issuer: 'CN=ZeroSSL', notAfter: '2027-02-01T00:00:00Z', daysRemaining: 90, expired: false, autossl: true, state: 'installed', selfSigned: false });
+      app.ctx.web.vhostFor = () => ({ domain: 'old.example.com', status: 'applied', docroot: '/var/www/whm-default', ssl: { cert: 'c' }, error: null });
+      const status = (await get('/api/networking/hostname').expect(200)).body.data;
+      expect(status.certificate).toEqual({ id: 5, issuer: 'CN=ZeroSSL', notAfter: '2027-02-01T00:00:00Z', daysRemaining: 90, expired: false, autossl: true, state: 'installed', selfSigned: false });
+      expect(status.landing).toEqual({ domain: 'old.example.com', status: 'applied', docroot: '/var/www/whm-default', ssl: true, error: null });
+    } finally { app.ctx.web = originalWeb; app.ctx.ssl = originalSsl; }
   });
 
   it('POST /hostname reports a DNS failure (missing BIND) as a failed step while the hostname is still changed', async () => {

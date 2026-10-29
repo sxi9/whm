@@ -59,13 +59,25 @@ export function MarketplaceUpdatesNotice() {
   );
 }
 
+// The hub origins are the panel owner's business: /me carries
+// `superadmin: false` for every other user and the shell then shows the
+// generic hub label instead (the API strips the origins for them as well).
+export const HUB_LABEL = 'WHM Marketplace hub';
+export function canSeeHubOrigin(user) {
+  return user?.superadmin !== false;
+}
+
 export function HubMismatchNotice({ status }) {
+  const { user } = useAuth();
+  const showOrigins = canSeeHubOrigin(user);
   return (
     <div className="banner banner-error" role="alert" data-testid="hub-mismatch">
       <AlertTriangle size={18} />
       <div>
         <strong>Hub mismatch</strong>
-        <p>The <code>whm-hub</code> provider points at <code>{status.url || 'no URL'}</code> but this panel's license was issued by <code>{status.hubUrl || 'no hub'}</code>. Packages are only installed from the hub that issued the license: fix the provider URL in <Link to={PROVIDER_PATH}>Market Provider Manager</Link> or the license under <Link to={LICENSE_PATH}>Basic Setup → License</Link>.</p>
+        {showOrigins
+          ? <p>The <code>whm-hub</code> provider points at <code>{status.url || 'no URL'}</code> but this panel's license was issued by <code>{status.hubUrl || 'no hub'}</code>. Packages are only installed from the hub that issued the license: fix the provider URL in <Link to={PROVIDER_PATH}>Market Provider Manager</Link> or the license under <Link to={LICENSE_PATH}>Basic Setup → License</Link>.</p>
+          : <p>The <code>whm-hub</code> provider does not point at the hub that issued this panel's license, so no package is installed from it. Ask the owner of this panel to correct the provider in <Link to={PROVIDER_PATH}>Market Provider Manager</Link>.</p>}
       </div>
     </div>
   );
@@ -236,6 +248,8 @@ export function PluginDetailDrawer({ id, manage, onClose, onInstall, onUpdate, o
 export function MarketplaceTab({ manage = true, status: statusProp = null }) {
   const toast = useToast();
   const confirm = useConfirm();
+  const { user } = useAuth();
+  const showOrigin = canSeeHubOrigin(user);
   const [q, setQ] = useState('');
   const [category, setCategory] = useState('');
   const ownStatus = useApi('/marketplace/status', { enabled: !statusProp });
@@ -330,7 +344,7 @@ export function MarketplaceTab({ manage = true, status: statusProp = null }) {
         <div className="datatable-toolbar" style={{ padding: 12, flexWrap: 'wrap', gap: 8 }}>
           <TextInput value={q} onChange={setQ} placeholder="Search plugins…" style={{ maxWidth: 280 }} />
           <Select value={category} onChange={setCategory} options={(categories.data || []).map((c) => ({ value: c.slug, label: `${c.name}${c.count != null ? ` (${c.count})` : ''}` }))} placeholder="All categories" style={{ maxWidth: 240 }} />
-          <span className="muted">{catalog.meta?.total ?? rows.length} plugin{(catalog.meta?.total ?? rows.length) === 1 ? '' : 's'} · hub {status.hubUrl?.replace(/^https:\/\//, '')}{Array.isArray(status.hubKids) ? ` · ${status.hubKids.length} signing key${status.hubKids.length === 1 ? '' : 's'} pinned` : ''}</span>
+          <span className="muted">{catalog.meta?.total ?? rows.length} plugin{(catalog.meta?.total ?? rows.length) === 1 ? '' : 's'} · {showOrigin && status.hubUrl ? `hub ${status.hubUrl.replace(/^https:\/\//, '')}` : HUB_LABEL}{Array.isArray(status.hubKids) ? ` · ${status.hubKids.length} signing key${status.hubKids.length === 1 ? '' : 's'} pinned` : ''}</span>
           {manage && <Button size="sm" icon={RefreshCw} onClick={checkUpdates}>Check for updates</Button>}
           <Button size="sm" onClick={refreshAll}>Refresh</Button>
         </div>

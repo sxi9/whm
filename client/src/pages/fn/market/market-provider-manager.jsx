@@ -10,11 +10,16 @@ import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError } from '../../ssl/Shared.jsx';
 import { LICENSE_PATH } from '../../server-configuration/LicenseTab.jsx';
+import { HUB_LABEL, canSeeHubOrigin } from '../../cpanel/MarketplaceTab.jsx';
 import { useProviders, ProviderStatus, LastTest, ProviderFormModal, ConfigureModal, TestResultCard, money, TYPE_LABELS } from '../../market/Shared.jsx';
 
 export default function MarketProviderManager({ fn }) {
   const { user } = useAuth();
   const isRoot = user?.role === 'root';
+  // The marketplace hub row (adapter "hub") carries the vendor hub origin: only
+  // the panel owner sees or edits it; other root users still switch it on/off.
+  const showHubOrigin = canSeeHubOrigin(user);
+  const hubHidden = (p) => p.adapter === 'hub' && !showHubOrigin;
   const navigate = useNavigate();
   const toast = useToast();
   const confirm = useConfirm();
@@ -77,7 +82,7 @@ export default function MarketProviderManager({ fn }) {
               { key: 'type', label: 'Type', render: (p) => TYPE_LABELS[p.type] || p.type },
               { key: 'adapter', label: 'Adapter', render: (p) => p.adapterLabel },
               { key: 'enabled', label: 'Status', render: (p) => <ProviderStatus p={p} /> },
-              { key: 'url', label: 'URL', render: (p) => (p.url ? <a href={p.url} target="_blank" rel="noreferrer">{p.url.replace(/^https:\/\//, '')}</a> : <span className="muted">—</span>) },
+              { key: 'url', label: 'URL', render: (p) => (hubHidden(p) ? <span className="muted" title="Only the panel owner sees the hub address">{HUB_LABEL}</span> : p.url ? <a href={p.url} target="_blank" rel="noreferrer">{p.url.replace(/^https:\/\//, '')}</a> : <span className="muted">—</span>) },
               { key: 'products', label: isRoot ? 'Products (resale)' : 'Products', render: (p) => (p.type === 'ssl' ? (p.products.length ? p.products.map((x) => `${x.name} (${money(x.price, x.currency)})`).join(' · ') : <span className="muted">none</span>) : <span className="muted">catalog from hub{p.adapter === 'hub' && <> · <Link to={LICENSE_PATH}>License key is entered under Basic Setup → License</Link></>}</span>) },
               ...(isRoot ? [
                 { key: 'commissionPercent', label: 'Commission', align: 'right', render: (p) => (p.readOnly ? '—' : `${p.commissionPercent}%`) },
@@ -89,9 +94,9 @@ export default function MarketProviderManager({ fn }) {
               isRoot && { label: testing === p.name ? 'Testing…' : 'Test', onClick: () => test(p), disabled: testing === p.name },
             ] : [
               isRoot && { label: p.enabled ? 'Disable' : 'Enable', primary: true, onClick: () => toggle(p), disabled: !p.enabled && !p.configured },
-              isRoot && { label: 'Configure', primary: !p.configured, onClick: () => setConfiguring(p) },
+              isRoot && !hubHidden(p) && { label: 'Configure', primary: !p.configured, onClick: () => setConfiguring(p) },
               isRoot && { label: testing === p.name ? 'Testing…' : 'Test', onClick: () => test(p), disabled: testing === p.name },
-              isRoot && { label: 'Edit', onClick: () => setForm({ open: true, provider: p }) },
+              isRoot && !hubHidden(p) && { label: 'Edit', onClick: () => setForm({ open: true, provider: p }) },
               isRoot && p.hasProducts && { label: 'Sync products', onClick: () => sync(p) },
               isRoot && !p.builtin && { label: 'Delete', danger: true, onClick: () => remove(p) },
             ])} emptyText="No providers." />

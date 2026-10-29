@@ -6,7 +6,7 @@ import { z } from 'zod';
 const rateLimit = (max, windowMs) => z.object({ max: z.number().int().min(1).default(max), windowMs: z.number().int().min(1000).default(windowMs) }).default({ max, windowMs });
 
 const schema = z.object({
-  public_url: z.string().url().default('https://localhost:7443'),
+  public_url: z.string().url().default('https://licserver.hostingsignal.in'),
   serve_ui: z.boolean().default(false),
   ui_dist: z.string().optional(),
   host: z.string().default('0.0.0.0'),

@@ -49,6 +49,7 @@ export const DEFAULT_SETTINGS = {
   'updates.tier': 'stable',
   'updates.auto': true,
   'analytics.enabled': false,
+  'setup.completed': false,
 };
 
 export const DEFAULT_ZONE_TEMPLATE = `; Zone template: %domain%

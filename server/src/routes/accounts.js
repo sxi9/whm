@@ -8,8 +8,10 @@ export function accountRoutes({ accounts }) {
   const r = Router();
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((data) => res.json(data?.meta ? data : { data })).catch(next);
 
-  r.get('/', requireReseller, validate({ query: pagination.extend({ suspended: z.enum(['true', 'false']).transform((v) => v === 'true').optional(), package: fields.packageName.optional(), owner: fields.username.optional() }) }),
+  r.get('/', requireReseller, validate({ query: pagination.extend({ suspended: z.enum(['true', 'false']).transform((v) => v === 'true').optional(), package: fields.packageName.optional(), owner: fields.username.optional(), manager: fields.username.optional() }) }),
     wrap((req) => accounts.list(req.query, req.user)));
+  // Before /:username: "managers" is a valid username.
+  r.get('/managers', requireReseller, wrap((req) => accounts.managers(req.user)));
 
   r.post('/', requireReseller, validate({
     body: z.object({
@@ -20,6 +22,8 @@ export function accountRoutes({ accounts }) {
       contactEmail: fields.email.optional(),
       ip: fields.ip.optional(),
       owner: fields.username.optional(),
+      // The root or reseller user the account turns to for support (default: the creator).
+      manager: fields.username.optional(),
       // Which subsystems to provision besides the Linux user. All three are on by default (WHM creates the zone and routes mail locally); pass false to opt out.
       provision: z.object({ web: z.boolean().optional(), dns: z.boolean().optional(), mail: z.boolean().optional() }).strict().optional(),
     }).strict(),
@@ -40,6 +44,7 @@ export function accountRoutes({ accounts }) {
       demoMode: z.boolean().optional(),
       forcePasswordChange: z.boolean().optional(),
       owner: fields.username.optional(),
+      manager: fields.username.nullable().optional(),
     }).strict(),
   }), wrap((req) => accounts.modify(req.params.username, req.body, req.user, req)));
 

@@ -1,7 +1,23 @@
 import { Router } from 'express';
 import { validate, z, fields } from '../../lib/validate.js';
-import { requireRoot, requireReseller } from '../../middleware/rbac.js';
+import { requireRoot, requireReseller, requireRole } from '../../middleware/rbac.js';
 import { createSupportService, TICKET_CATEGORIES, TICKET_SEVERITIES, TICKET_STATUSES, GRANT_STATUSES } from '../../services/support.js';
+import { createSupportChatService, CONVERSATION_STATUSES, MESSAGE_MAX_CHARS } from '../../services/support-chat.js';
+
+// Account Conversations are the one Support surface the hosted-account login uses.
+const requireParticipant = requireRole('root', 'reseller', 'user');
+const accountParam = z.object({ username: fields.username });
+const chatListQuery = z.object({
+  page: fields.page, pageSize: fields.pageSize, q: z.string().trim().max(100).optional(),
+  status: z.enum(CONVERSATION_STATUSES).optional(), unread: z.enum(['true', 'false']).transform((v) => v === 'true').optional(),
+  sort: z.enum(['activity', 'username', 'domain', 'unread', 'status']).default('activity'), dir: z.enum(['asc', 'desc']).default('desc'),
+});
+const chatThreadQuery = z.object({ before: fields.id.optional(), limit: z.coerce.number().int().min(1).max(500).default(100) });
+const messageBody = z.object({ body: z.string().regex(/^[^\0]*$/).transform((v) => v.replace(/\r\n?/g, '\n').trim()).pipe(z.string().min(1, 'Write a message first').max(MESSAGE_MAX_CHARS, `Messages are limited to ${MESSAGE_MAX_CHARS} characters`)) }).strict();
+const conversationPatch = z.object({
+  status: z.enum(CONVERSATION_STATUSES).optional(),
+  subject: z.string().trim().min(1).max(200).regex(/^[^\r\n\0]*$/, 'Must be a single line').optional(),
+}).strict().refine((b) => b.status !== undefined || b.subject !== undefined, { message: 'Nothing to change', path: ['_'] });
 
 const idParam = z.object({ id: fields.id });
 const singleLine = (max) => z.string().trim().min(1).max(max).regex(/^[^\r\n\0]*$/, 'Must be a single line');
@@ -39,7 +55,9 @@ const settingsBody = z.object({
 
 export async function register(ctx) {
   ctx.support = createSupportService(ctx);
+  ctx.supportChat = createSupportChatService(ctx);
   const s = ctx.support;
+  const chat = ctx.supportChat;
   ctx.jobs.register(s.JOB_EXPIRE, (job) => s.access.expireDue({ log: job.log }));
   ctx.scheduler.ensure(s.SCHEDULE_EXPIRE, '*/5 * * * *', s.JOB_EXPIRE);
   s.syncSchedule();
@@ -77,6 +95,32 @@ export async function register(ctx) {
   r.post('/access/expire-due', requireRoot, wrap((req) => s.access.expireDue({ req })));
   r.get('/access/:id', requireRoot, validate({ params: idParam }), wrap((req) => s.access.get(req.params.id)));
   r.delete('/access/:id', requireRoot, validate({ params: idParam }), wrap((req) => s.access.revoke(req.params.id, req.user, req)));
+
+  // Account Conversations
+  r.get('/chat', requireParticipant, validate({ query: chatListQuery }), wrap((req) => chat.listConversations(req.query, req.user)));
+  r.get('/chat/unread', requireParticipant, wrap((req) => chat.unread(req.user)));
+  r.get('/chat/:username', requireParticipant, validate({ params: accountParam, query: chatThreadQuery }), wrap((req) => chat.get(req.params.username, req.user, req.query)));
+  r.get('/chat/:username/stream', requireParticipant, validate({ params: accountParam }), (req, res, next) => {
+    let snapshot;
+    try { snapshot = chat.get(req.params.username, req.user, { limit: 50 }); } catch (err) { return next(err); }
+    res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+    res.flushHeaders();
+    const send = (event) => res.write(`data: ${JSON.stringify(event)}\n\n`);
+    send({ type: 'snapshot', ...snapshot });
+    const unsubscribe = chat.subscribe(snapshot.account.id, send);
+    const heartbeat = setInterval(() => res.write(': ping\n\n'), 15_000);
+    req.on('close', () => { clearInterval(heartbeat); unsubscribe(); });
+  });
+  r.post('/chat/:username/messages', requireParticipant, validate({ params: accountParam, body: messageBody }), (req, res, next) => {
+    Promise.resolve(chat.post(req.params.username, req.body.body, req.user, req)).then((d) => {
+      // The request-level audit row is written when the response finishes and
+      // would carry the message text; it records the length instead.
+      req.body = { chars: req.body.body.length };
+      res.status(201).json({ data: d });
+    }).catch(next);
+  });
+  r.post('/chat/:username/read', requireParticipant, validate({ params: accountParam }), wrap((req) => chat.markRead(req.params.username, req.user)));
+  r.patch('/chat/:username', requireReseller, validate({ params: accountParam, body: conversationPatch }), wrap((req) => chat.update(req.params.username, req.body, req.user, req)));
 
   return { path: '/support', router: r };
 }

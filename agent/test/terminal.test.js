@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { exec } from '../src/exec.js';
 import { runOp, createContext, OpError } from '../src/lib.js';
-import { sessions, sweep, LIMITS } from '../src/ops/terminal.js';
+import { sessions, sweep, track, append, LIMITS } from '../src/ops/terminal.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
@@ -91,6 +92,106 @@ describe('terminal op schemas', () => {
       sessions.set(ID, { ...fake, exited: true, exitedAt: 0 });
       expect((await opError(runOp('terminal.write', { id: ID, data: 'id\r' }, ctx))).code).toBe('exited');
       expect(sweep(LIMITS.exitedKeepMs + 1)).toEqual([ID]);
+    } finally { sessions.delete(ID); }
+  });
+});
+
+// A session wired like terminal.open does it, around a child that is only an
+// event emitter: output and exit are simulated, nothing is spawned.
+function fakeSession(id = ID) {
+  const child = new EventEmitter();
+  child.pid = 1;
+  child.kills = [];
+  child.kill = (sig) => child.kills.push(sig);
+  child.stdin = Object.assign(new EventEmitter(), { written: [], write(data) { this.written.push(data); } });
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  return track({ id, child, shell: '/bin/bash', chunks: [], offset: 0, bytes: 0, startedAt: 0, lastActivity: Date.now(), exited: false, exitCode: null, signal: null, exitedAt: null, idleMs: 60_000, closeReason: null, closedAt: null, waiters: new Set() });
+}
+const text = (r) => Buffer.from(r.data, 'base64').toString();
+const timed = async (promise) => { const started = Date.now(); const result = await promise; return { result, ms: Date.now() - started }; };
+
+describe('terminal.read long-polling', () => {
+  it('bounds waitMs to 0..2000 whole milliseconds', async () => {
+    sessions.set(ID, fakeSession());
+    try {
+      for (const waitMs of [-1, 2001, 1.5, '100', null]) expect((await opError(runOp('terminal.read', { id: ID, waitMs }, ctx))).code, String(waitMs)).toBe('invalid_args');
+      await expect(runOp('terminal.read', { id: ID, waitMs: 0 }, ctx)).resolves.toMatchObject({ offset: 0, data: '' });
+      expect(LIMITS.maxWaitMs).toBe(2000);
+    } finally { sessions.delete(ID); }
+  });
+
+  it('returns at once when output is already available or the session has ended', async () => {
+    const s = fakeSession();
+    sessions.set(ID, s);
+    try {
+      s.child.stdout.emit('data', Buffer.from('ready'));
+      const { result, ms } = await timed(runOp('terminal.read', { id: ID, waitMs: 2000 }, ctx));
+      expect(text(result)).toBe('ready');
+      expect(ms).toBeLessThan(500);
+      s.closeReason = 'idle';
+      expect((await timed(runOp('terminal.read', { id: ID, since: 5, waitMs: 2000 }, ctx))).ms).toBeLessThan(500);
+      s.closeReason = null;
+      s.exited = true;
+      expect((await timed(runOp('terminal.read', { id: ID, since: 5, waitMs: 2000 }, ctx))).ms).toBeLessThan(500);
+    } finally { sessions.delete(ID); }
+  });
+
+  it('wakes early on output, on input, on exit and on close, otherwise times out empty', async () => {
+    const s = fakeSession();
+    sessions.set(ID, s);
+    try {
+      const idle = await timed(runOp('terminal.read', { id: ID, waitMs: 60 }, ctx));
+      expect(idle.result).toMatchObject({ offset: 0, data: '', exited: false });
+      expect(idle.ms).toBeGreaterThanOrEqual(50);
+
+      let pending = timed(runOp('terminal.read', { id: ID, waitMs: 2000 }, ctx));
+      setTimeout(() => s.child.stdout.emit('data', Buffer.from('$ ')), 20);
+      let got = await pending;
+      expect(text(got.result)).toBe('$ ');
+      expect(got.result.offset).toBe(2);
+      expect(got.ms).toBeLessThan(1000);
+
+      // Two viewers waiting on one session both learn about the same output.
+      const a = runOp('terminal.read', { id: ID, since: 2, waitMs: 2000 }, ctx);
+      const b = runOp('terminal.read', { id: ID, since: 2, waitMs: 2000 }, ctx);
+      setTimeout(() => append(s, Buffer.from('out')), 20);
+      expect((await Promise.all([a, b])).map(text)).toEqual(['out', 'out']);
+      expect(s.waiters.size).toBe(0);
+
+      pending = timed(runOp('terminal.read', { id: ID, since: 5, waitMs: 2000 }, ctx));
+      setTimeout(() => runOp('terminal.write', { id: ID, data: 'ls\r' }, ctx), 20);
+      got = await pending;
+      expect(got.result).toMatchObject({ offset: 5, data: '', exited: false });
+      expect(got.ms).toBeLessThan(1000);
+      expect(s.child.stdin.written).toEqual(['ls\r']);
+
+      pending = timed(runOp('terminal.read', { id: ID, since: 5, waitMs: 2000 }, ctx));
+      setTimeout(() => s.child.emit('exit', 0, null), 20);
+      got = await pending;
+      expect(got.result).toMatchObject({ offset: 5, data: '', exited: true, exitCode: 0 });
+      expect(got.ms).toBeLessThan(1000);
+
+      const other = fakeSession('e'.repeat(32));
+      sessions.set(other.id, other);
+      pending = timed(runOp('terminal.read', { id: other.id, waitMs: 2000 }, ctx));
+      setTimeout(() => runOp('terminal.close', { id: other.id }, ctx), 20);
+      await expect(pending).rejects.toMatchObject({ code: 'not_found' });
+      expect(other.child.kills).toEqual(['SIGHUP']);
+      expect(other.waiters.size).toBe(0);
+    } finally { sessions.delete(ID); sessions.delete('e'.repeat(32)); }
+  });
+
+  it('the idle sweep ends a waiting read with the close reason', async () => {
+    const s = fakeSession();
+    sessions.set(ID, s);
+    try {
+      const pending = timed(runOp('terminal.read', { id: ID, waitMs: 2000 }, ctx));
+      setTimeout(() => expect(sweep(Date.now() + 61_000)).toEqual([ID]), 20);
+      const { result, ms } = await pending;
+      expect(result).toMatchObject({ closeReason: 'idle', exited: false, data: '' });
+      expect(ms).toBeLessThan(1000);
+      expect(s.child.kills).toEqual(['SIGHUP']);
     } finally { sessions.delete(ID); }
   });
 });

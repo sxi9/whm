@@ -4,7 +4,7 @@ import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, Loading, StatusPill, KeyValue, CapabilityNotice } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
-import { Button, Toggle, Field } from '../../../components/Form.jsx';
+import { Button, Toggle } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { RequestError, JobCard, LastJob, YesNo } from '../../server-configuration/Shared.jsx';
@@ -44,33 +44,29 @@ export default function InitialQuotaSetup({ fn }) {
     try { const { data: d } = await api.post('/server-config/quota/install-tools'); if (d.job) { setJobId(d.job.id); toast.info('Installing the quota package'); } else { toast.success('Quota tools already installed'); refetch(); } } catch (err) { toast.error(err); } finally { setBusy(null); }
   };
 
+  const manual = data ? data.filesystems.filter((f) => f.proposedFstabLine) : [];
+
   return (
     <>
-      <PageHeader fn={fn} description="Disk quotas let packages limit how much space each account may use. This checks the filesystem that holds account home directories, enables user quotas where the mount allows it and otherwise shows the exact /etc/fstab change required." />
+      <PageHeader fn={fn} description="Disk quotas let packages limit how much space each account may use. This checks the filesystem that holds account home directories and enables user quotas where the mount allows it." />
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
       {data && (
         <>
-          <div className="form-grid">
-            <Card title="Summary" actions={<LastJob job={data.lastJob} />}>
-              <KeyValue items={[['Account homes', <code key="h">{data.homeRoot}</code>], ['Filesystem holding homes', data.homeFilesystem ? <code key="f">{data.homeFilesystem}</code> : 'not found'], ['User quotas on that filesystem', <YesNo key="q" value={data.enabled} yes="enabled" no="not enabled" />], ['Quota tools (quotacheck, quotaon, quotaoff, repquota, setquota)', <YesNo key="t" value={data.toolsInstalled} yes="installed" no="missing" />], ['Package disk limits enforceable', <YesNo key="e" value={data.enforceable} yes="yes" no={data.enabled ? 'no: tools missing' : 'no: quotas not enabled'} />]]} />
-              {!data.toolsInstalled && (
-                <div style={{ marginTop: 12 }}>
-                  <CapabilityNotice error={{ code: 'capability_missing', message: `The quota tools are not installed. Install the "${data.installPackages.join('", "')}" package, then enable quotas below.` }} onRetry={refetch} />
-                  <div className="row-actions" style={{ marginTop: 8 }}>
-                    {data.pkgAvailable ? <Button variant="primary" loading={busy === 'install'} onClick={installTools}>Install quota tools</Button> : <Link className="btn" to="/software/install-distro-packages">Open Install Distro Packages</Link>}
-                  </div>
+          <Card title="Summary" actions={<LastJob job={data.lastJob} />}>
+            <KeyValue items={[['Account homes', <code key="h">{data.homeRoot}</code>], ['Filesystem holding homes', data.homeFilesystem ? <code key="f">{data.homeFilesystem}</code> : 'not found'], ['User quotas on that filesystem', <YesNo key="q" value={data.enabled} yes="enabled" no="not enabled" />], ['Quota tools (quotacheck, quotaon, quotaoff, repquota, setquota)', <YesNo key="t" value={data.toolsInstalled} yes="installed" no="missing" />], ['Package disk limits enforceable', <YesNo key="e" value={data.enforceable} yes="yes" no={data.enabled ? 'no: tools missing' : 'no: quotas not enabled'} />]]} />
+            {!data.toolsInstalled && (
+              <div style={{ marginTop: 12 }}>
+                <CapabilityNotice error={{ code: 'capability_missing', message: `The quota tools are not installed. Install the "${data.installPackages.join('", "')}" package, then enable quotas below.` }} onRetry={refetch} />
+                <div className="row-actions" style={{ marginTop: 8 }}>
+                  {data.pkgAvailable ? <Button variant="primary" loading={busy === 'install'} onClick={installTools}>Install quota tools</Button> : <Link className="btn" to="/software/install-distro-packages">Open Install Distro Packages</Link>}
                 </div>
-              )}
-            </Card>
-            <Card title="Options">
-              <Field inline><Toggle checked={groupQuota} onChange={setGroupQuota} label="Also enable group quotas" description="Adds grpquota alongside usrquota; needed for per-group limits only." /></Field>
-              <p className="muted">Quotas are enforced by the kernel per filesystem. The <code>usrquota</code> mount option (or the ext4 <code>quota</code> feature) must be present; <code>quotacheck</code> then builds the accounting files and <code>quotaon</code> activates them. XFS reads its <code>uquota</code> option only at mount time, so it needs a reboot after the fstab change.</p>
-            </Card>
-          </div>
+              </div>
+            )}
+          </Card>
           <CapabilityNotice error={capError} onRetry={() => { setCapError(null); refetch(); }} />
           <JobCard jobId={jobId} title="Quota setup" onFinished={() => refetch()} />
-          <Card title="Filesystems" padded={false}>
+          <Card title="Filesystems" padded={false} actions={<Toggle checked={groupQuota} onChange={setGroupQuota} label="Also enable group quotas" />}>
             <DataTable
               rows={data.filesystems} rowKey={(f) => f.mountpoint}
               columns={[
@@ -86,17 +82,21 @@ export default function InitialQuotaSetup({ fn }) {
                 f.active.user === true && { label: 'Turn off', danger: true, disabled: busy === f.mountpoint, onClick: () => disable(f) },
               ]}
             />
+            <div className="card-body">
+              <p className="muted" style={{ margin: 0 }}>Quotas need the <code>usrquota</code> mount option (or the ext4 <code>quota</code> feature); XFS reads it only at mount time, so it needs a reboot after the fstab change.</p>
+              {manual.length > 0 && (
+                <details style={{ marginTop: 10 }}>
+                  <summary>Show manual steps</summary>
+                  {manual.map((f) => (
+                    <div key={f.mountpoint} style={{ marginTop: 10 }}>
+                      <div className="muted">{f.mountpoint} (/etc/fstab line {f.fstab.lineNo}); the "Update fstab and enable" action does the same:</div>
+                      <pre className="log">{`- ${f.fstab.line}\n+ ${f.proposedFstabLine}\n\n# then:\nmount -o remount ${f.mountpoint}\nquotacheck -cug -m -f ${f.mountpoint}\nquotaon -ug ${f.mountpoint}`}</pre>
+                    </div>
+                  ))}
+                </details>
+              )}
+            </div>
           </Card>
-          {data.filesystems.filter((f) => f.proposedFstabLine).length > 0 && (
-            <Card title="Required /etc/fstab change" subtitle="Apply this with the button above, or edit the file yourself and remount (or reboot for XFS)">
-              {data.filesystems.filter((f) => f.proposedFstabLine).map((f) => (
-                <div key={f.mountpoint} style={{ marginBottom: 10 }}>
-                  <div className="muted">{f.mountpoint} (line {f.fstab.lineNo}):</div>
-                  <pre className="log">{`- ${f.fstab.line}\n+ ${f.proposedFstabLine}\n\n# then:\nmount -o remount ${f.mountpoint}\nquotacheck -cug -m -f ${f.mountpoint}\nquotaon -ug ${f.mountpoint}`}</pre>
-                </div>
-              ))}
-            </Card>
-          )}
         </>
       )}
     </>

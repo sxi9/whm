@@ -21,6 +21,8 @@ export default function StatisticsSoftwareConfiguration({ fn }) {
   const [draft, setDraft] = useState(null);
   const [busy, setBusy] = useState(false);
   const [jobId, setJobId] = useState(null);
+  const [jobTitle, setJobTitle] = useState('Statistics generation');
+  const [installing, setInstalling] = useState(null);
   const [runError, setRunError] = useState(null);
   useEffect(() => { if (data) setDraft({ generators: data.generators, defaultGenerator: data.defaultGenerator, allowUserChoice: data.allowUserChoice, includeSuspended: data.includeSuspended }); }, [data]);
   const base = data && { generators: data.generators, defaultGenerator: data.defaultGenerator, allowUserChoice: data.allowUserChoice, includeSuspended: data.includeSuspended };
@@ -35,7 +37,12 @@ export default function StatisticsSoftwareConfiguration({ fn }) {
   const run = async (generator) => {
     if (!(await confirm({ title: 'Generate statistics now?', message: `Runs ${generator || 'every enabled generator'} for all ${data.domains} active domain(s) as a background job. Large logs take a while.`, confirmLabel: 'Generate' }))) return;
     setRunError(null);
-    try { const { data: d } = await api.post('/server-config/stats/run', generator ? { generator } : {}); setJobId(d.job.id); if (d.skipped.length) toast.warning(`Skipped (not installed): ${d.skipped.join(', ')}`); } catch (err) { if (err.status === 501) setRunError(err); else toast.error(err); }
+    try { const { data: d } = await api.post('/server-config/stats/run', generator ? { generator } : {}); setJobId(d.job.id); setJobTitle('Statistics generation'); if (d.skipped.length) toast.warning(`Skipped (not installed): ${d.skipped.join(', ')}`); } catch (err) { if (err.status === 501) setRunError(err); else toast.error(err); }
+  };
+  // Generators install from here through the stack catalog (one job per generator).
+  const install = async (g) => {
+    setInstalling(g.key);
+    try { const { data: d } = await api.post(`/system/capabilities/${g.key}/install`); setJobTitle(`Installing ${g.label}`); setJobId(d.job.id); } catch (err) { if (err.status === 501) setRunError(err); else toast.error(err); } finally { setInstalling(null); }
   };
 
   const det = data?.detect?.generators || {};
@@ -59,9 +66,11 @@ export default function StatisticsSoftwareConfiguration({ fn }) {
                   return (
                     <tr key={g.key}>
                       <td><strong>{g.label}</strong><br /><small className="muted">{g.blurb}</small></td>
-                      <td>{d.installed ? <StatusPill status="installed">{d.version ? `v${d.version}` : 'installed'}</StatusPill> : <><StatusPill status="not-installed">not installed</StatusPill><br /><small className="muted">{d.packages ? <Link to="/software/install-distro-packages">install {d.packages.apt?.[0]}</Link> : null}</small></>}</td>
+                      <td>{d.installed ? <StatusPill status="installed">{d.version ? `v${d.version}` : 'installed'}</StatusPill> : <><StatusPill status="not-installed">not installed</StatusPill><br /><small className="muted">{d.packages ? <>package <code>{d.packages.apt?.[0]}</code> · <Link to="/software/install-distro-packages">Install Distro Packages</Link></> : null}</small></>}</td>
                       <td><Toggle checked={Boolean(draft.generators[g.key])} onChange={(v) => setDraft((x) => ({ ...x, generators: { ...x.generators, [g.key]: v } }))} /></td>
-                      <td><Button size="sm" disabled={!d.installed} onClick={() => run(g.key)}>Run {g.label}</Button></td>
+                      <td>{d.installed
+                        ? <Button size="sm" onClick={() => run(g.key)}>Run {g.label}</Button>
+                        : <Button size="sm" variant="primary" loading={installing === g.key} disabled={Boolean(installing) || data.pkgAvailable === false} title={data.pkgAvailable === false ? 'No package manager detected on this server' : undefined} onClick={() => install(g)}>Install {g.label}</Button>}</td>
                     </tr>
                   );
                 })}
@@ -92,7 +101,7 @@ export default function StatisticsSoftwareConfiguration({ fn }) {
               {data.lastRun ? <KeyValue items={[['When', formatDate(data.lastRun.at)], ['Generators', (data.lastRun.generators || []).join(', ') || '—'], ['Domains', data.lastRun.domains], ['Generated', data.lastRun.generated], ['Skipped (no log yet)', data.lastRun.skipped], ['Failed', data.lastRun.failed]]} /> : <p className="muted">Statistics have not been generated yet.</p>}
             </Card>
           </div>
-          <JobCard jobId={jobId} title="Statistics generation" onFinished={() => refetch()} />
+          <JobCard jobId={jobId} title={jobTitle} onFinished={() => refetch()} />
         </>
       )}
     </>

@@ -3,7 +3,7 @@ import Database from 'better-sqlite3';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { passwordStrength, ipInCidr, verifyIdToken, checkDiscoveryDocument, normalizeIpOrCidr, isPublicAddress, fetchJson, comparePhpVersions, phpVersionSatisfies, normalizeAdvisories, matchPhpAdvisories, isValidPhpRange, phpMinorFromId } from '../src/services/security-center.js';
+import { passwordStrength, ipInCidr, verifyIdToken, checkDiscoveryDocument, normalizeIpOrCidr, isPublicAddress, fetchJson, comparePhpVersions, phpVersionSatisfies, normalizeAdvisories, matchPhpAdvisories, isValidPhpRange, phpMinorFromId, EXTERNAL_AUTH_PRESETS, presetById, resolvePresetIssuer } from '../src/services/security-center.js';
 
 const BIN_FULL = { sshd: true, 'ssh-keygen': true, iptables: true, nft: true, apache2ctl: true, 'apt-get': true };
 const MODSEC_DETECT = () => ({ installed: true, flavor: 'debian', baseDir: '/etc/modsecurity', mainConf: '/etc/modsecurity/modsecurity.conf', configConf: '/etc/apache2/conf-enabled/zz-whm-modsec-10-config.conf', vendorsDir: '/etc/modsecurity/whm-vendors', errorLog: '/var/log/apache2/error.log', apache: { flavor: 'debian' }, moduleLoaded: true });
@@ -899,6 +899,175 @@ describe('external authentications', () => {
     for (const a of ['203.0.113.10', '8.8.8.8', '2001:db8::1', '2606:4700::1111']) expect(isPublicAddress(a), a).toBe(true);
     for (const a of ['10.1.2.3', '172.16.0.1', '172.31.255.254', '192.168.1.1', '127.0.0.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '::1', '::', 'fe80::1', 'fc00::1', 'fd12::1', '::ffff:10.0.0.1', 'not-an-ip']) expect(isPublicAddress(a), a).toBe(false);
     expect(isPublicAddress('172.32.0.1')).toBe(true);
+  });
+});
+
+describe('external authentication presets', () => {
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+  const { publicKey, privateKey } = nodeCrypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const jwk = { ...publicKey.export({ format: 'jwk' }), kid: 'apple-k', use: 'sig', alg: 'RS256' };
+  const signFor = (claims) => {
+    const h = b64({ alg: 'RS256', kid: 'apple-k' });
+    const p = b64(claims);
+    return `${h}.${p}.${nodeCrypto.sign('sha256', Buffer.from(`${h}.${p}`), privateKey).toString('base64url')}`;
+  };
+  const docFor = (issuer, extra = {}) => ({ issuer, authorization_endpoint: `${issuer}/authorize`, token_endpoint: `${issuer}/token`, jwks_uri: `${issuer}/jwks`, ...extra });
+
+  it('resolves issuers from templates with validated field values', () => {
+    expect(EXTERNAL_AUTH_PRESETS.map((p) => p.id)).toEqual(expect.arrayContaining(['google', 'microsoft', 'apple', 'facebook', 'cloudflare-access', 'gitlab', 'auth0', 'okta', 'keycloak', 'generic', 'github']));
+    expect(resolvePresetIssuer(presetById('google')).issuerUrl).toBe('https://accounts.google.com');
+    expect(resolvePresetIssuer(presetById('microsoft'), { fields: { tenant: '9188040d-6c67-4c5b-b112-36a304b66dad' } }).issuerUrl).toBe('https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0');
+    expect(resolvePresetIssuer(presetById('cloudflare-access'), { fields: { team: 'acme' }, clientId: 'abc123' }).issuerUrl).toBe('https://acme.cloudflareaccess.com/cdn-cgi/access/sso/oidc/abc123');
+    expect(resolvePresetIssuer(presetById('gitlab')).issuerUrl).toBe('https://gitlab.com');
+    expect(resolvePresetIssuer(presetById('gitlab'), { fields: { host: 'git.example.com:8443' } }).issuerUrl).toBe('https://git.example.com:8443');
+    expect(resolvePresetIssuer(presetById('auth0'), { fields: { issuer: 'https://acme.us.auth0.com/' } }).issuerUrl).toBe('https://acme.us.auth0.com');
+    expect(resolvePresetIssuer(presetById('keycloak'), { fields: { issuer: 'https://sso.example.com/realms/panel' } }).issuerUrl).toBe('https://sso.example.com/realms/panel');
+    const fails = (preset, input, key, re) => {
+      let err;
+      try { resolvePresetIssuer(presetById(preset), input); } catch (e) { err = e; }
+      expect(err?.status, `${preset} ${key}`).toBe(422);
+      expect(err.fields[key][0]).toMatch(re);
+    };
+    fails('microsoft', { fields: { tenant: 'common' } }, 'fields.tenant', /tenantid/);
+    fails('microsoft', { fields: { tenant: 'Organizations' } }, 'fields.tenant', /tenantid/);
+    fails('microsoft', { fields: { tenant: 'x/../y' } }, 'fields.tenant', /Letters/);
+    fails('microsoft', {}, 'fields.tenant', /required/);
+    fails('cloudflare-access', { fields: { team: 'evil.com' }, clientId: 'abc' }, 'fields.team', /Letters/);
+    fails('cloudflare-access', { fields: { team: 'acme' }, clientId: 'a/b' }, 'clientId', /client ID/);
+    fails('gitlab', { fields: { host: 'not a host' } }, 'fields.host', /hostname/);
+    fails('gitlab', { fields: { host: 'gitlab.com/evil' } }, 'fields.host', /hostname/);
+    fails('auth0', { fields: { issuer: 'http://acme.auth0.com' } }, 'fields.issuer', /https/);
+    fails('keycloak', { fields: { issuer: 'https://sso.example.com/realms/x?y=1' } }, 'fields.issuer', /query/);
+    fails('okta', {}, 'fields.issuer', /required/);
+    expect(presetById('github')).toMatchObject({ supported: false });
+    expect(presetById('nope')).toBeNull();
+  });
+
+  it('lists presets with the redirect URI to register and marks GitHub unsupported', async () => {
+    const res = await get('/api/security/external-auth/presets');
+    expect(res.status).toBe(200);
+    const { presets, redirectUriTemplate, currentRedirectUriTemplate } = res.body.data;
+    expect(redirectUriTemplate).toMatch(/^https:\/\/.+:2087\/api\/auth\/external\/\{name\}\/callback$/);
+    expect(currentRedirectUriTemplate).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/api\/auth\/external\/\{name\}\/callback$/);
+    const google = presets.find((p) => p.id === 'google');
+    expect(google).toMatchObject({ supported: true, issuerTemplate: 'https://accounts.google.com', scopes: 'openid email profile', secret: { required: true }, fields: [] });
+    expect(google.instructions.length).toBeGreaterThan(1);
+    expect(google.docsUrl).toMatch(/^https:\/\//);
+    expect(presets.find((p) => p.id === 'microsoft').fields).toEqual([expect.objectContaining({ key: 'tenant', label: 'Directory (tenant) ID' })]);
+    expect(presets.find((p) => p.id === 'gitlab').fields[0]).toMatchObject({ key: 'host', default: 'gitlab.com' });
+    expect(presets.find((p) => p.id === 'github')).toMatchObject({ supported: false, reason: expect.stringMatching(/OAuth 2\.0 only/) });
+    expect(presets.find((p) => p.id === 'facebook').pinnedEndpoints).toEqual(expect.arrayContaining([{ name: 'token_endpoint', url: 'https://graph.facebook.com/oauth/access_token' }]));
+    expect(presets.find((p) => p.id === 'generic')).toMatchObject({ generic: true });
+    expect(JSON.stringify(presets)).not.toContain('issuerFromDiscovery');
+    expect((await reseller.get('/api/security/external-auth/presets')).status).toBe(403);
+  });
+
+  it('creates providers from presets through discovery validation', async () => {
+    const responses = {};
+    const seen = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init = {}) => {
+      seen.push({ url: String(url), init });
+      const body = responses[String(url)];
+      if (!body) return new Response('{}', { status: 404 });
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+    try {
+      // Google: endpoints on the hosts the vendor documents need no approval.
+      responses['https://accounts.google.com/.well-known/openid-configuration'] = { issuer: 'https://accounts.google.com', authorization_endpoint: 'https://accounts.google.com/o/oauth2/v2/auth', token_endpoint: 'https://oauth2.googleapis.com/token', userinfo_endpoint: 'https://openidconnect.googleapis.com/v1/userinfo', jwks_uri: 'https://www.googleapis.com/oauth2/v3/certs', token_endpoint_auth_methods_supported: ['client_secret_post', 'client_secret_basic'] };
+      const missingSecret = await post('/api/security/external-auth', { preset: 'google', name: 'google', clientId: 'gid' });
+      expect(missingSecret.status).toBe(422);
+      expect(missingSecret.body.error.fields).toHaveProperty('clientSecret');
+      const google = await post('/api/security/external-auth', { preset: 'google', name: 'google', clientId: 'gid', clientSecret: 'gsecret' });
+      expect(google.status).toBe(201);
+      expect(google.body.data).toMatchObject({ name: 'google', displayName: 'Google', issuerUrl: 'https://accounts.google.com', preset: 'google', scopes: 'openid email profile', hasClientSecret: true, enabled: true, discovery: { tokenEndpoint: 'https://oauth2.googleapis.com/token', tokenEndpointAuthMethods: ['client_secret_post', 'client_secret_basic'], foreignEndpoints: expect.arrayContaining(['tokenEndpoint on oauth2.googleapis.com']), preset: 'google' } });
+      expect(google.body.data.clientSecret).toBeUndefined();
+      // A host the vendor does not document still needs the operator's approval, and nothing is stored meanwhile.
+      responses['https://accounts.google.com/.well-known/openid-configuration'].token_endpoint = 'https://oauth2.example.net/token';
+      const unexpected = await post('/api/security/external-auth', { preset: 'google', name: 'google2', clientId: 'gid', clientSecret: 's' });
+      expect(unexpected.status).toBe(400);
+      expect(unexpected.body.error.fields).toHaveProperty('allowForeignEndpoints');
+      expect(unexpected.body.error.message).toContain('oauth2.example.net');
+      expect(unexpected.body.error.message).not.toContain('googleapis.com');
+      expect((await get('/api/security/external-auth/google2')).status).toBe(404);
+      const approved = await post('/api/security/external-auth', { preset: 'google', name: 'google2', clientId: 'gid', clientSecret: 's', allowForeignEndpoints: true });
+      expect(approved.status).toBe(201);
+      // Microsoft: a tenant domain is answered with the tenant-GUID issuer, which is adopted and pinned.
+      const guid = 'https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0';
+      const tenantBase = guid.replace(/\/v2\.0$/, '');
+      responses['https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0/.well-known/openid-configuration'] = { issuer: guid, authorization_endpoint: `${tenantBase}/oauth2/v2.0/authorize`, token_endpoint: `${tenantBase}/oauth2/v2.0/token`, userinfo_endpoint: 'https://graph.microsoft.com/oidc/userinfo', jwks_uri: `${tenantBase}/discovery/v2.0/keys` };
+      const ms = await post('/api/security/external-auth', { preset: 'microsoft', name: 'entra', displayName: 'Contoso', clientId: 'app-id', clientSecret: 's', fields: { tenant: 'contoso.onmicrosoft.com' } });
+      expect(ms.status).toBe(201);
+      expect(ms.body.data).toMatchObject({ displayName: 'Contoso', issuerUrl: guid, preset: 'microsoft', discovery: { issuer: guid, userinfoEndpoint: 'https://graph.microsoft.com/oidc/userinfo', foreignEndpoints: ['userinfoEndpoint on graph.microsoft.com'] } });
+      // The multi-tenant aliases are refused before any request leaves the panel.
+      const before = seen.length;
+      const common = await post('/api/security/external-auth', { preset: 'microsoft', name: 'entra2', clientId: 'app-id', clientSecret: 's', fields: { tenant: 'common' } });
+      expect(common.status).toBe(422);
+      expect(common.body.error.fields['fields.tenant'][0]).toMatch(/tenantid/);
+      expect(seen.length).toBe(before);
+      // A {tenantid} issuer that somehow reaches discovery is still a mismatch.
+      responses['https://login.microsoftonline.com/9188040d-6c67-4c5b-b112-36a304b66dad/v2.0/.well-known/openid-configuration'] = { ...responses['https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0/.well-known/openid-configuration'], issuer: 'https://login.microsoftonline.com/{tenantid}/v2.0' };
+      const mismatch = await post('/api/security/external-auth', { preset: 'microsoft', name: 'entra2', clientId: 'app-id', clientSecret: 's', fields: { tenant: '9188040d-6c67-4c5b-b112-36a304b66dad' } });
+      expect(mismatch.status).toBe(400);
+      expect(mismatch.body.error.message).toMatch(/does not match/);
+      // Meta: no token endpoint in the vendor document; the pinned Graph API endpoint fills it in.
+      responses['https://www.facebook.com/.well-known/openid-configuration'] = { issuer: 'https://www.facebook.com', authorization_endpoint: 'https://facebook.com/dialog/oauth/', jwks_uri: 'https://www.facebook.com/.well-known/oauth/openid/jwks/' };
+      const fb = await post('/api/security/external-auth', { preset: 'facebook', name: 'meta', clientId: '12345', clientSecret: 'appsecret' });
+      expect(fb.status).toBe(201);
+      expect(fb.body.data).toMatchObject({ scopes: 'openid email', discovery: { authorizationEndpoint: 'https://www.facebook.com/dialog/oauth', tokenEndpoint: 'https://graph.facebook.com/oauth/access_token', jwksUri: 'https://www.facebook.com/.well-known/oauth/openid/jwks/', tokenEndpointAuthMethods: ['client_secret_post'], foreignEndpoints: ['tokenEndpoint on graph.facebook.com'] } });
+      // Apple: no scopes requested; the secret goes in the token request body (client_secret_post only).
+      responses['https://appleid.apple.com/.well-known/openid-configuration'] = { issuer: 'https://appleid.apple.com', authorization_endpoint: 'https://appleid.apple.com/auth/authorize', token_endpoint: 'https://appleid.apple.com/auth/token', jwks_uri: 'https://appleid.apple.com/auth/keys', token_endpoint_auth_methods_supported: ['client_secret_post'] };
+      const apple = await post('/api/security/external-auth', { preset: 'apple', name: 'apple', clientId: 'net.whm.panel', clientSecret: 'eyJ.secret.jwt' });
+      expect(apple.status).toBe(201);
+      expect(apple.body.data.scopes).toBe('');
+      const authUrl = new URL(app.ctx.security.externalAuth.authorizationUrl('apple', { state: 's', nonce: 'n', redirectUri: 'https://panel/cb' }));
+      expect(authUrl.origin + authUrl.pathname).toBe('https://appleid.apple.com/auth/authorize');
+      expect(authUrl.searchParams.has('scope')).toBe(false);
+      const now = Math.floor(Date.now() / 1000);
+      responses['https://appleid.apple.com/auth/token'] = { id_token: signFor({ iss: 'https://appleid.apple.com', aud: 'net.whm.panel', sub: 'apple-sub', iat: now, exp: now + 300, nonce: 'n' }), access_token: 'at', token_type: 'Bearer' };
+      responses['https://appleid.apple.com/auth/keys'] = { keys: [jwk] };
+      const result = await app.ctx.security.externalAuth.exchangeCode('apple', { code: 'c', redirectUri: 'https://panel/cb', nonce: 'n' });
+      expect(result).toMatchObject({ subject: 'apple-sub', email: null });
+      const tokenCall = seen.find((c) => c.url === 'https://appleid.apple.com/auth/token');
+      expect(tokenCall.init.headers.Authorization).toBeUndefined();
+      expect(String(tokenCall.init.body)).toContain('client_secret=eyJ.secret.jwt');
+      // Cloudflare Access: team and client ID form the issuer.
+      const cf = 'https://acme.cloudflareaccess.com/cdn-cgi/access/sso/oidc/abc123';
+      responses[`${cf}/.well-known/openid-configuration`] = docFor(cf, { userinfo_endpoint: `${cf}/userinfo` });
+      const cfRes = await post('/api/security/external-auth', { preset: 'cloudflare-access', name: 'cloudflare', clientId: 'abc123', clientSecret: 's', fields: { team: 'acme' } });
+      expect(cfRes.status).toBe(201);
+      expect(cfRes.body.data).toMatchObject({ issuerUrl: cf, discovery: { tokenEndpoint: `${cf}/token`, foreignEndpoints: [] } });
+      // Re-running discovery on a preset provider keeps the preset's pinned endpoints and host allowances.
+      const again = await post('/api/security/external-auth/meta/discover');
+      expect(again.status).toBe(200);
+      expect(again.body.data.discovery).toMatchObject({ tokenEndpoint: 'https://graph.facebook.com/oauth/access_token', preset: 'facebook' });
+      // A discovery failure stores nothing.
+      const gl = await post('/api/security/external-auth', { preset: 'gitlab', name: 'gitlab', clientId: 'g', clientSecret: 's', fields: { host: 'git.example.com' } });
+      expect(gl.status).toBe(400);
+      expect(gl.body.error.message).toMatch(/discovery failed/);
+      expect((await get('/api/security/external-auth/gitlab')).status).toBe(404);
+      // Unsupported or unknown presets and malformed bodies.
+      const gh = await post('/api/security/external-auth', { preset: 'github', name: 'github', clientId: 'g', clientSecret: 's' });
+      expect(gh.status).toBe(422);
+      expect(gh.body.error.message).toMatch(/OAuth 2\.0 only/);
+      expect((await post('/api/security/external-auth', { preset: 'nope', name: 'x', clientId: 'g' })).status).toBe(422);
+      const bad = await post('/api/security/external-auth', { preset: 'google', name: 'x' });
+      expect(bad.status).toBe(422);
+      expect(bad.body.error.fields).toHaveProperty('clientId');
+      expect((await post('/api/security/external-auth', { preset: 'google', name: 'x', clientId: 'g', fields: { 'bad key': 'v' } })).status).toBe(422);
+      expect((await post('/api/security/external-auth', { preset: 'google', name: 'google', clientId: 'gid', clientSecret: 's' })).status).toBe(409);
+      // The generic shape still works on the same endpoint.
+      const generic = await post('/api/security/external-auth', { name: 'plain', displayName: 'Plain', issuerUrl: 'https://login.example.com', clientId: 'c' });
+      expect(generic.status).toBe(201);
+      expect(generic.body.data.preset).toBeNull();
+      // Secrets never reach audit rows.
+      const audit = app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'POST /api/security/external-auth' AND args_redacted LIKE '%apple%' ORDER BY id DESC LIMIT 1").get();
+      expect(audit.args_redacted).not.toContain('eyJ.secret.jwt');
+      expect(seen.every((c) => c.init.redirect === 'manual')).toBe(true);
+    } finally {
+      globalThis.fetch = realFetch;
+      for (const name of ['google', 'google2', 'entra', 'meta', 'apple', 'cloudflare', 'plain']) await del(`/api/security/external-auth/${name}`);
+    }
   });
 });
 

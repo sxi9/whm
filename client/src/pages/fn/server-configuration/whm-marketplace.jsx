@@ -2,10 +2,12 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ExternalLink } from 'lucide-react';
 import { useApi } from '../../../hooks/useApi.js';
-import { queryString } from '../../../api/client.js';
+import { api, queryString } from '../../../api/client.js';
 import { useAuth } from '../../../auth/AuthContext.jsx';
 import { PageHeader, Card, Loading, StatusPill, EmptyState } from '../../../components/Common.jsx';
-import { TextInput, Select } from '../../../components/Form.jsx';
+import { TextInput, Select, Button } from '../../../components/Form.jsx';
+import { ProgressLog } from '../../../components/ProgressLog.jsx';
+import { useToast } from '../../../components/Toast.jsx';
 import { RequestError } from '../../server-configuration/Shared.jsx';
 import { MarketplaceTab, MarketplaceDisabledNotice } from '../../cpanel/MarketplaceTab.jsx';
 
@@ -26,9 +28,20 @@ export default function WhmMarketplace({ fn }) {
 }
 
 export function StaticCatalog({ title = null }) {
+  const toast = useToast();
   const [q, setQ] = useState('');
   const [category, setCategory] = useState('');
   const { data, loading, error, refetch } = useApi(`/server-config/marketplace${queryString({ q, category })}`);
+  // One install job at a time; the item that started it shows the log inline.
+  const [install, setInstall] = useState({ itemId: null, jobId: null, busy: null });
+
+  const installPackages = async (item) => {
+    setInstall({ itemId: item.id, jobId: null, busy: item.id });
+    try {
+      const { data: d } = await api.post('/software/pkg/install', { packages: item.packagesForHost });
+      setInstall({ itemId: item.id, jobId: d.job.id, busy: null });
+    } catch (err) { toast.error(err); setInstall({ itemId: null, jobId: null, busy: null }); }
+  };
 
   return (
     <>
@@ -56,10 +69,16 @@ export function StaticCatalog({ title = null }) {
                     {item.price} · {item.packagesForHost?.length ? <>packages: {item.packagesForHost.map((p) => <code key={p} style={{ marginRight: 4 }}>{p}</code>)}</> : 'packages: see distribution'}
                   </div>
                   <div className="row-actions" style={{ marginTop: 10, flexWrap: 'wrap' }}>
-                    {!item.installed && <Link className="btn btn-sm btn-primary" to={item.installPath}>Install packages</Link>}
+                    {!item.installed && item.packagesForHost?.length > 0 && <Button variant="primary" size="sm" loading={install.busy === item.id} disabled={Boolean(install.jobId) && install.itemId !== item.id} onClick={() => installPackages(item)}>Install packages</Button>}
+                    {!item.installed && !item.packagesForHost?.length && <Link className="btn btn-sm btn-primary" to={item.installPath}>Install packages</Link>}
                     {item.installed && item.configure && <Link className="btn btn-sm" to={item.configure}>Configure</Link>}
                     {item.docs && <a className="btn btn-sm btn-ghost" href={item.docs} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Docs</a>}
                   </div>
+                  {install.itemId === item.id && install.jobId && (
+                    <div style={{ marginTop: 10 }}>
+                      <ProgressLog jobId={install.jobId} onFinished={(event) => { if (event.type === 'done') toast.success(`${item.name} packages installed`); refetch(); }} />
+                    </div>
+                  )}
                 </div>
               </section>
             ))}

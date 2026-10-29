@@ -2,10 +2,23 @@ import { Router } from 'express';
 import { validate, z, fields } from '../lib/validate.js';
 import { requireRoot, requireReseller, isRoot } from '../middleware/rbac.js';
 import { notFound } from '../lib/errors.js';
+import { createSystemStackService, STACK_INSTALL_JOB } from '../services/system-stack.js';
+import { STACK_PROFILE_KEYS, STACK_COMPONENT_KEYS } from '../lib/stack-catalog.js';
 
-export function systemRoutes({ system, serviceManager, jobs, scheduler, settings, audit }) {
+const serviceName = z.string().regex(/^[a-z0-9-]{1,40}$/);
+const capabilityName = z.string().regex(/^[a-z][a-z0-9_-]{0,39}$/);
+
+export function systemRoutes(ctx) {
+  const { system, serviceManager, jobs, scheduler, settings, audit } = ctx;
+  // The stack installer is core (it has no category module to register it in),
+  // so it is created where the core routes are mounted, once per app.
+  if (!ctx.stack) {
+    ctx.stack = createSystemStackService(ctx);
+    jobs.register(STACK_INSTALL_JOB, (job) => ctx.stack.installJob(job));
+  }
   const r = Router();
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((data) => data !== undefined && res.json(data?.meta ? data : { data })).catch(next);
+  const accepted = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((data) => res.status(202).json({ data })).catch(next);
   // A reseller follows the jobs it started and nothing else: another
   // principal's job (its params, result and log lines) is reported as absent.
   const ownJob = (req, id) => {
@@ -27,13 +40,23 @@ export function systemRoutes({ system, serviceManager, jobs, scheduler, settings
   r.post('/root-password', requireRoot, validate({ body: z.object({ password: fields.password }).strict() }), wrap((req) => system.setRootPassword(req.body.password, req)));
   r.get('/capabilities', requireRoot, wrap(() => system.capabilities()));
   r.post('/capabilities/refresh', requireRoot, wrap(() => system.refreshCapabilities()));
+  r.post('/capabilities/:cap/install', requireRoot, validate({ params: z.object({ cap: capabilityName }) }), accepted((req) => ctx.stack.capabilityInstall(req.params.cap, req.user, req)));
+
+  // Server stack (install software from the panel) + first-run setup -------------
+  r.get('/stack', requireRoot, wrap(() => ctx.stack.status()));
+  r.post('/stack/install', requireRoot, validate({ body: z.object({ profile: z.enum(STACK_PROFILE_KEYS).optional(), components: z.array(z.enum(STACK_COMPONENT_KEYS)).max(STACK_COMPONENT_KEYS.length).optional() }).strict() }),
+    accepted((req) => ctx.stack.install(req.body, req.user, req)));
+  r.post('/setup/complete', requireRoot, validate({ body: z.object({ skipped: z.boolean().default(false) }).strict() }), wrap((req) => ctx.stack.setup.complete(req.body, req)));
 
   // Service Manager + Restart Services -------------------------------------------
   r.get('/services', requireReseller, wrap(() => serviceManager.list()));
-  r.get('/services/:name', requireReseller, validate({ params: z.object({ name: z.string().regex(/^[a-z0-9-]{1,40}$/) }) }), wrap((req) => serviceManager.status(req.params.name)));
-  r.get('/services/:name/journal', requireRoot, validate({ params: z.object({ name: z.string().regex(/^[a-z0-9-]{1,40}$/) }), query: z.object({ lines: z.coerce.number().int().min(1).max(5000).default(200) }) }),
+  r.get('/services/:name', requireReseller, validate({ params: z.object({ name: serviceName }) }), wrap((req) => serviceManager.status(req.params.name)));
+  r.get('/services/:name/journal', requireRoot, validate({ params: z.object({ name: serviceName }), query: z.object({ lines: z.coerce.number().int().min(1).max(5000).default(200) }) }),
     wrap((req) => serviceManager.journal(req.params.name, req.query.lines)));
-  r.post('/services/:name/:verb', requireRoot, validate({ params: z.object({ name: z.string().regex(/^[a-z0-9-]{1,40}$/), verb: z.enum(['start', 'stop', 'restart', 'reload', 'enable', 'disable']) }) }),
+  // Install and repair sit before the verb route so its enum does not reject them.
+  r.post('/services/:name/install', requireRoot, validate({ params: z.object({ name: serviceName }) }), accepted((req) => ctx.stack.serviceInstall(req.params.name, req.user, req)));
+  r.post('/services/:name/repair', requireRoot, validate({ params: z.object({ name: serviceName }) }), wrap((req) => serviceManager.repair(req.params.name, req)));
+  r.post('/services/:name/:verb', requireRoot, validate({ params: z.object({ name: serviceName, verb: z.enum(['start', 'stop', 'restart', 'reload', 'enable', 'disable']) }) }),
     wrap((req) => serviceManager.action(req.params.name, req.params.verb, req)));
   r.patch('/services/:name', requireRoot, validate({ params: z.object({ name: z.string().regex(/^[a-z0-9-]{1,40}$/) }), body: z.object({ monitored: z.boolean().optional(), enabled: z.boolean().optional(), restartOnFailure: z.boolean().optional() }).strict() }),
     wrap((req) => serviceManager.configure(req.params.name, req.body)));

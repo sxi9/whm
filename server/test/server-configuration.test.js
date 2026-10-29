@@ -49,6 +49,10 @@ describe('Server Configuration API', () => {
   let terminalExited = false;
   let terminalCloseReason = null;
   let agentTerminals = [];
+  const readTerminal = ({ since }) => {
+    const data = Buffer.concat(terminalOutput.map((t) => Buffer.from(t))).subarray(since);
+    return { id: TERM_ID, since, offset: since + data.length, data: data.toString('base64'), truncated: false, exited: terminalExited, exitCode: terminalExited ? 0 : null, signal: null, closeReason: terminalCloseReason };
+  };
   const ORPHAN_ID = 'd'.repeat(32);
   let quotaResult = { mountpoint: '/', enabled: true, steps: [{ step: 'quotacheck', ok: true, detail: 'created' }, { step: 'quotaon', ok: true, detail: 'on' }], active: { user: true, group: true } };
 
@@ -64,10 +68,7 @@ describe('Server Configuration API', () => {
       'stats.detect': () => ({ domlogsRoot: '/var/log/whm/domlogs', generators: { awstats: { installed: statsInstalled, bin: statsInstalled ? '/usr/lib/cgi-bin/awstats.pl' : null }, webalizer: { installed: false, bin: null }, analog: { installed: false, bin: null } } }),
       'stats.generate': ({ generator, domain, username }) => (domain === 'nolog.test' ? { generator, domain, skipped: true, reason: 'no_log' } : { generator, domain, username, skipped: false, outputDir: `/var/lib/whm/stats/${username}/${domain}/${generator}` }),
       'terminal.open': ({ shell }) => ({ id: TERM_ID, pid: 4321, shell, exited: false }),
-      'terminal.read': ({ since }) => {
-        const data = Buffer.concat(terminalOutput.map((t) => Buffer.from(t))).subarray(since);
-        return { id: TERM_ID, since, offset: since + data.length, data: data.toString('base64'), truncated: false, exited: terminalExited, exitCode: terminalExited ? 0 : null, signal: null, closeReason: terminalCloseReason };
-      },
+      'terminal.read': readTerminal,
       'terminal.write': ({ id, data }) => ({ id, bytes: Buffer.byteLength(data) }),
       'terminal.close': ({ id }) => ({ id, existed: true }),
       'terminal.list': () => agentTerminals,
@@ -532,6 +533,8 @@ describe('Server Configuration API', () => {
       await new Promise((r) => setTimeout(r, 80));
       expect(events[0]).toMatchObject({ type: 'open', session: { id: TERM_ID } });
       expect(events.filter((e) => e.type === 'output').map((e) => e.data).join('')).toBe('root@host:~# id\r\nuid=0(root)\r\n');
+      // Every read long-polls inside the agent for up to a second.
+      expect(app.agent.callsTo('terminal.read').at(-1).args).toEqual({ id: TERM_ID, since: 30, waitMs: 1000 });
       session.lastActivity = Date.now() - 60 * 60_000;
       terminalOutput.push('still running\r\n');
       await new Promise((r) => setTimeout(r, 80));
@@ -570,6 +573,89 @@ describe('Server Configuration API', () => {
       const done = await del(`/terminal/${closed.body.data.id}`).expect(200);
       expect(done.body.data.closed).toBe(true);
       await del(`/terminal/${closed.body.data.id}`).expect(404);
+    });
+
+    it('relays output the moment the agent\'s long-poll returns, keeps the heartbeat and stops on close', async () => {
+      await post('/terminal').expect(201);
+      let wakeRead = null;
+      // Like whm-agentd: an empty read waits for the next event or waitMs.
+      app.agent.set('terminal.read', async ({ since, waitMs }) => {
+        const idle = readTerminal({ since });
+        if (waitMs && !idle.data && !idle.exited) await new Promise((r) => { wakeRead = r; setTimeout(r, Math.min(waitMs, 300)); });
+        return readTerminal({ since });
+      });
+      const emit = (text) => { terminalOutput.push(text); wakeRead?.(); };
+      const events = [];
+      let pings = 0;
+      let onClose = null;
+      const fakeRes = { set() {}, flushHeaders() {}, write(chunk) { const m = String(chunk).match(/^data: (.*)\n\n$/s); if (m) events.push({ ...JSON.parse(m[1]), at: Date.now() }); else if (String(chunk).startsWith(': ping')) pings++; }, end() { this.ended = true; } };
+      const session = app.ctx.serverConfig.terminal.sessionsForTest().get(TERM_ID);
+      const fakeReq = { user: { ...session.user }, on(name, fn) { if (name === 'close') onClose = fn; } };
+      try {
+        app.ctx.serverConfig.terminal.stream(TERM_ID, fakeReq, fakeRes, { heartbeatMs: 20 });
+        await new Promise((r) => setTimeout(r, 30));
+        expect(session.viewers).toBe(1);
+        const reads = app.agent.callsTo('terminal.read').length;
+        expect(reads).toBe(1);
+        const sentAt = Date.now();
+        emit('$ ');
+        await new Promise((r) => setTimeout(r, 40));
+        const output = events.find((e) => e.type === 'output');
+        expect(output.data).toBe('$ ');
+        expect(output.at - sentAt).toBeLessThan(30);
+        // The next read follows the delivery at once, without an idle sleep.
+        expect(app.agent.callsTo('terminal.read').length).toBe(reads + 1);
+        expect(app.agent.callsTo('terminal.read').at(-1).args).toMatchObject({ since: 2, waitMs: 1000 });
+        emit('one\r\n'); emit('two\r\n');
+        await new Promise((r) => setTimeout(r, 40));
+        expect(events.filter((e) => e.type === 'output').map((e) => e.data).join('')).toBe('$ one\r\ntwo\r\n');
+        expect(pings).toBeGreaterThanOrEqual(2);
+        onClose();
+        expect(fakeRes.ended).toBe(true);
+        expect(session.viewers).toBe(0);
+        const after = app.agent.callsTo('terminal.read').length;
+        emit('late\r\n');
+        await new Promise((r) => setTimeout(r, 40));
+        expect(app.agent.callsTo('terminal.read').length).toBe(after);
+        expect(events.filter((e) => e.type === 'output').map((e) => e.data).join('')).toBe('$ one\r\ntwo\r\n');
+        expect(app.ctx.serverConfig.terminal.sessionsForTest().has(TERM_ID)).toBe(true);
+      } finally {
+        app.agent.set('terminal.read', readTerminal);
+        terminalOutput = [];
+        await del(`/terminal/${TERM_ID}`).expect(200);
+      }
+    });
+
+    it('falls back to plain polling when the agent does not know waitMs yet', async () => {
+      await post('/terminal').expect(201);
+      app.agent.set('terminal.read', ({ since, waitMs }) => {
+        if (waitMs !== undefined) throw Object.assign(new Error('Invalid arguments for "terminal.read"'), { agentError: true, code: 'invalid_args', details: { fields: { waitMs: ['Unrecognized key'] } } });
+        return readTerminal({ since });
+      });
+      terminalOutput = ['old agent\r\n'];
+      const events = [];
+      const fakeRes = { set() {}, flushHeaders() {}, write(chunk) { const m = String(chunk).match(/^data: (.*)\n\n$/s); if (m) events.push(JSON.parse(m[1])); }, end() { this.ended = true; } };
+      const session = app.ctx.serverConfig.terminal.sessionsForTest().get(TERM_ID);
+      const fakeReq = { user: { ...session.user }, on() {} };
+      try {
+        app.ctx.serverConfig.terminal.stream(TERM_ID, fakeReq, fakeRes, { idlePollMs: 10 });
+        await new Promise((r) => setTimeout(r, 60));
+        expect(events.filter((e) => e.type === 'output').map((e) => e.data).join('')).toBe('old agent\r\n');
+        expect(events.some((e) => e.type === 'error')).toBe(false);
+        const reads = app.agent.callsTo('terminal.read');
+        expect(reads[0].args).toMatchObject({ waitMs: 1000 });
+        expect(reads.slice(1).every((c) => c.args.waitMs === undefined)).toBe(true);
+        expect(reads.length).toBeGreaterThanOrEqual(3);
+        terminalExited = true;
+        await new Promise((r) => setTimeout(r, 60));
+        expect(events.at(-1)).toMatchObject({ type: 'exit', code: 0 });
+        expect(fakeRes.ended).toBe(true);
+        expect(app.ctx.serverConfig.terminal.sessionsForTest().has(TERM_ID)).toBe(false);
+      } finally {
+        app.agent.set('terminal.read', readTerminal);
+        terminalOutput = [];
+        terminalExited = false;
+      }
     });
 
     it('reports the agent\'s idle kill as idle_timeout to the viewer and the audit log', async () => {

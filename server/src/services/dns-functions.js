@@ -98,8 +98,25 @@ export function createDnsService(ctx) {
     return zone;
   }
 
-  function assertPublishable() {
-    if (!bindAvailable() && strict()) throw new CapabilityError('bind', 'BIND (named) is not installed on this server. Install bind9 / bind to publish DNS zones.');
+  // A zone mirrored to Cloudflare is served from there, so it stays editable
+  // on a host without BIND; everything else needs named in production.
+  function assertPublishable(domain) {
+    if (bindAvailable() || !strict()) return;
+    if (domain && stmts.zoneByDomain.get(domain)?.provider === 'cloudflare') return;
+    throw new CapabilityError('bind', 'BIND (named) is not installed on this server. Install bind9 / bind to publish DNS zones.');
+  }
+
+  // After a committed change of a Cloudflare zone the records are pushed in a
+  // job; a failure to queue it is reported on the zone, never to the caller.
+  function mirror(fresh, { mirror: enabled = true, req } = {}) {
+    if (!enabled || fresh?.provider !== 'cloudflare' || !ctx.dnsCloudflare) return null;
+    try {
+      const job = ctx.dnsCloudflare.enqueuePush(fresh.domain, { reason: 'zone changed', userId: req?.user?.id ?? null });
+      return job ? { provider: 'cloudflare', jobId: job.id } : null;
+    } catch (err) {
+      logger.warn({ err, domain: fresh.domain }, 'could not queue the Cloudflare push');
+      return { provider: 'cloudflare', jobId: null, error: err.message };
+    }
   }
 
   // Walks up the labels of a name to find the zone that contains it.
@@ -182,13 +199,13 @@ export function createDnsService(ctx) {
   // reloads named, reconfiguring first when the zone's stanza changed. On a
   // dev box without BIND the DB is still updated and the caller learns the
   // zone is unpublished.
-  async function publish(zone, req, { reload = true } = {}) {
+  async function publish(zone, req, { reload = true, mirror: mirrorEnabled = true } = {}) {
     const fresh = stmts.zoneByDomain.get(zone.domain);
     const records = stmts.records.all(fresh.id);
     const body = renderZone(fresh, records);
     if (!bindAvailable()) {
-      if (strict()) throw new CapabilityError('bind', 'BIND (named) is not installed; the zone was saved but cannot be published');
-      return { applied: false, reason: 'capability_missing', serial: fresh.serial };
+      if (strict() && fresh.provider !== 'cloudflare') throw new CapabilityError('bind', 'BIND (named) is not installed; the zone was saved but cannot be published');
+      return { applied: false, reason: 'capability_missing', serial: fresh.serial, mirror: mirror(fresh, { mirror: mirrorEnabled, req }) };
     }
     const check = await agent.op('dns.checkzone', { domain: fresh.domain, body }, { req });
     if (check?.ok === false) throw unprocessable(`Zone ${fresh.domain} failed named-checkzone`, { zone: [check.output || 'named-checkzone reported an error'] });
@@ -213,7 +230,7 @@ export function createDnsService(ctx) {
     if (reload) {
       try { await agent.op('dns.reload', { domain: fresh.domain, reconfig }, { req }); reloaded = true; } catch (err) { reloadError = err.message; logger.warn({ err, domain: fresh.domain }, 'zone written but named reload failed'); }
     }
-    return { applied: true, reloaded, reloadError, reconfigured: reconfig, external, file: written?.path ?? null, serial: fresh.serial };
+    return { applied: true, reloaded, reloadError, reconfigured: reconfig, external, file: written?.path ?? null, serial: fresh.serial, mirror: mirror(fresh, { mirror: mirrorEnabled, req }) };
   }
 
   // Mutations commit to SQLite (the source of truth) and then publish; when
@@ -560,7 +577,7 @@ export function createDnsService(ctx) {
 
     // Raw edit mode: parse → replace every record → re-render canonically.
     async saveRawZone(domain, body, user, req, { create = false, minSerial = 0 } = {}) {
-      assertPublishable();
+      assertPublishable(domain);
       let zone = stmts.zoneByDomain.get(domain);
       if (!zone) {
         if (!create) throw notFound(`Zone ${domain}`);
@@ -594,7 +611,7 @@ export function createDnsService(ctx) {
 
     // --------------------------------------------------------------- records
     async addRecord(domain, input, user, req) {
-      assertPublishable();
+      assertPublishable(domain);
       const zone = await load(domain, user);
       let rec;
       try { rec = normalizeRecord(input, domain); } catch (err) { if (err instanceof ZoneError) throw unprocessable(err.message, err.fields); throw err; }
@@ -612,7 +629,7 @@ export function createDnsService(ctx) {
     },
 
     async updateRecord(domain, id, input, user, req) {
-      assertPublishable();
+      assertPublishable(domain);
       const zone = await load(domain, user);
       const existing = stmts.recordById.get(id, zone.id);
       if (!existing || existing.type === 'SOA') throw notFound('Record');
@@ -626,7 +643,7 @@ export function createDnsService(ctx) {
     },
 
     async deleteRecord(domain, id, user, req) {
-      assertPublishable();
+      assertPublishable(domain);
       const zone = await load(domain, user);
       const existing = stmts.recordById.get(id, zone.id);
       if (!existing || existing.type === 'SOA') throw notFound('Record');
@@ -636,7 +653,7 @@ export function createDnsService(ctx) {
     },
 
     async setSoa(domain, input, user, req) {
-      assertPublishable();
+      assertPublishable(domain);
       const zone = await load(domain, user);
       const records = stmts.records.all(zone.id);
       const soaRec = records.find((r) => r.type === 'SOA');
@@ -654,7 +671,7 @@ export function createDnsService(ctx) {
     },
 
     async setTtl(domain, ttl, user, req) {
-      assertPublishable();
+      assertPublishable(domain);
       const zone = await load(domain, user);
       const { result } = await commitAndPublish(zone, () => { bump(zone, { ttl }); }, req);
       audit(req, { action: 'dns.zone.ttl', target: domain, args: { ttl } });
@@ -799,7 +816,7 @@ export function createDnsService(ctx) {
     },
 
     async setSpf(domain, input, user, req) {
-      assertPublishable();
+      assertPublishable(domain);
       const zone = await load(domain, user);
       const value = (input.value || suggestedSpf(stmts.records.all(zone.id))).trim().replace(/\s+/g, ' ');
       if (!SPF_RE.test(value)) throw unprocessable('Not a valid SPF record', { value: ['SPF must start with v=spf1 and use a[:host], mx[:host], ptr, ip4:, ip6:, include:, exists:, redirect= and ~all / -all mechanisms'] });
@@ -814,7 +831,7 @@ export function createDnsService(ctx) {
     },
 
     async ensureDkim(domain, input, user, req) {
-      assertPublishable();
+      assertPublishable(domain);
       const zone = await load(domain, user);
       const snap = snapshotZone(zone.id);
       const dkim = await ensureDkimInternal(zone, input, req);
@@ -827,7 +844,7 @@ export function createDnsService(ctx) {
     },
 
     async removeDkim(domain, user, req) {
-      assertPublishable();
+      assertPublishable(domain);
       const zone = await load(domain, user);
       const { result } = await commitAndPublish(zone, () => {
         for (const r of stmts.records.all(zone.id)) if (r.type === 'TXT' && r.name.endsWith('._domainkey')) stmts.deleteRecord.run(r.id);
@@ -840,7 +857,7 @@ export function createDnsService(ctx) {
     },
 
     async setDmarc(domain, input, user, req) {
-      assertPublishable();
+      assertPublishable(domain);
       const zone = await load(domain, user);
       const value = input.value ? input.value.trim() : buildDmarc(input);
       if (!DMARC_RE.test(value)) throw unprocessable('Not a valid DMARC record', { value: ['DMARC must start with v=DMARC1; p=none|quarantine|reject'] });
@@ -935,7 +952,7 @@ export function createDnsService(ctx) {
     },
 
     async setRouting(domain, input, user, req) {
-      assertPublishable();
+      assertPublishable(domain);
       const zone = await load(domain, user);
       const { routing } = input;
       const exchanges = (input.exchanges || []).map((e) => ({ priority: e.priority, value: fqdn(e.exchange, domain) }));
@@ -1271,6 +1288,38 @@ export function createDnsService(ctx) {
     layout: () => agent.op('dns.layout', {}),
 
     // ----------------------------------------------- helpers for other categories
+    // The zone row after the ownership check (resellers: own accounts only).
+    loadZone: (domain, user) => load(domain, user),
+    // Replaces every record of a zone with records fetched from an external
+    // provider (Cloudflare import). The SOA and apex NS stay local, records
+    // the panel cannot hold are skipped with a reason, and the publish does
+    // not mirror back to the provider.
+    async replaceRecordsFromProvider(domain, records, user, req) {
+      const zone = await load(domain, user);
+      const keep = stmts.records.all(zone.id).filter((r) => r.type === 'SOA' || (r.type === 'NS' && r.name === '@'));
+      const accepted = [];
+      const skipped = [];
+      for (const input of records) {
+        let rec;
+        try { rec = normalizeRecord(input, domain); } catch (err) {
+          if (err instanceof ZoneError) { skipped.push({ type: input.type, name: input.name, reason: Object.values(err.fields || {}).flat().join('; ') || err.message }); continue; }
+          throw err;
+        }
+        const conflictMsg = checkConflicts([...keep, ...accepted], rec);
+        if (conflictMsg) { skipped.push({ type: rec.type, name: rec.name, reason: conflictMsg }); continue; }
+        if (accepted.some((r) => r.name === rec.name && r.type === rec.type && r.value === rec.value && (r.priority ?? null) === (rec.priority ?? null))) { skipped.push({ type: rec.type, name: rec.name, reason: 'duplicate' }); continue; }
+        accepted.push(rec);
+      }
+      const { result } = await commitAndPublish(zone, () => {
+        stmts.deleteRecordsOfZone.run(zone.id);
+        let line = 0;
+        for (const r of keep) stmts.restoreRecord.run({ id: r.id, zone_id: r.zone_id, name: r.name, type: r.type, ttl: r.ttl, priority: r.priority, value: r.value, line_index: r.type === 'SOA' ? 0 : ++line });
+        for (const r of accepted) stmts.insertRecord.run({ zone_id: zone.id, name: r.name, type: r.type, ttl: r.ttl ?? null, priority: r.priority ?? null, value: r.value, line_index: ++line });
+        bump(zone);
+      }, req, { mirror: false });
+      audit(req, { action: 'dns.zone.replace_records', target: domain, args: { records: accepted.length, skipped: skipped.length, kept: keep.length } });
+      return { ...result, records: accepted.length, skipped };
+    },
     zoneExists: (domain) => Boolean(stmts.zoneByDomain.get(domain)),
     zoneFor: (name) => { const z = zoneContaining(name); return z ? shapeZone(z) : null; },
     renderZoneText(domain) {

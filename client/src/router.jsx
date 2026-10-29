@@ -5,6 +5,7 @@ import { PAGE_REGISTRY } from './pages/registry.js';
 import { HomePage } from './pages/Home.jsx';
 import { LoginPage } from './pages/Login.jsx';
 import { ChangePasswordPage } from './pages/ChangePassword.jsx';
+import SetupPage from './pages/Setup.jsx';
 import { FunctionPage, NotFoundPage } from './pages/FunctionPage.jsx';
 import { AuditLogPage } from './pages/AuditLog.jsx';
 import PluginPage from './pages/plugins/PluginPage.jsx';
@@ -24,6 +25,7 @@ export const router = createBrowserRouter([
     children: [
       { index: true, element: <HomePage /> },
       { path: 'change-password', element: <ChangePasswordPage /> },
+      { path: 'setup', element: <SetupPage /> },
       { path: 'audit-log', element: <AuditLogPage /> },
       ...functionRoutes,
       // Enabled plugins register pages at runtime; one dynamic route serves them all.

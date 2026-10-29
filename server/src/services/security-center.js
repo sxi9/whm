@@ -90,22 +90,231 @@ export function verifyIdToken(idToken, { issuer, clientId, nonce = null, jwks = 
 
 // Discovery metadata must be served over TLS and, unless the operator opts in,
 // stay on the issuer's host: the token endpoint receives the client secret.
-export function checkDiscoveryDocument(doc, issuerUrl, { allowForeignEndpoints = false } = {}) {
+// `allowedForeignHosts` are hosts a vendor preset documents; they need no
+// per-discovery approval but are still reported in foreignEndpoints.
+export function checkDiscoveryDocument(doc, issuerUrl, { allowForeignEndpoints = false, allowedForeignHosts = [] } = {}) {
   if (!doc || typeof doc !== 'object') throw badRequest('The discovery document is not a JSON object');
   if (doc.issuer && stripSlash(doc.issuer) !== stripSlash(issuerUrl)) throw badRequest(`The discovery document declares issuer "${doc.issuer}", which does not match the configured issuer ${issuerUrl}`);
   const issuerHost = new URL(issuerUrl).host;
   const endpoints = { authorizationEndpoint: doc.authorization_endpoint, tokenEndpoint: doc.token_endpoint, userinfoEndpoint: doc.userinfo_endpoint, jwksUri: doc.jwks_uri };
   if (!endpoints.authorizationEndpoint || !endpoints.tokenEndpoint) throw badRequest('The discovery document lacks authorization_endpoint or token_endpoint');
   const foreign = [];
+  const unexpected = [];
   for (const [name, value] of Object.entries(endpoints)) {
     if (value == null) continue;
     let u;
     try { u = new URL(String(value)); } catch { throw badRequest(`${name} in the discovery document is not a valid URL`); }
     if (u.protocol !== 'https:') throw badRequest(`${name} must use https:// (the provider published ${value})`);
-    if (u.host !== issuerHost) foreign.push(`${name} on ${u.host}`);
+    if (u.host === issuerHost) continue;
+    foreign.push(`${name} on ${u.host}`);
+    if (!allowedForeignHosts.includes(u.host)) unexpected.push(`${name} on ${u.host}`);
   }
-  if (foreign.length && !allowForeignEndpoints) throw badRequest(`The discovery document points at hosts other than ${issuerHost}: ${foreign.join(', ')}. Re-run discovery allowing endpoints on other hosts if that is expected for this provider.`, { allowForeignEndpoints: ['Endpoints on other hosts need explicit approval'] });
-  return { ...endpoints, issuer: doc.issuer || issuerUrl, scopesSupported: doc.scopes_supported || [], foreignEndpoints: foreign, fetchedAt: new Date().toISOString() };
+  if (unexpected.length && !allowForeignEndpoints) throw badRequest(`The discovery document points at hosts other than ${issuerHost}: ${unexpected.join(', ')}. Re-run discovery allowing endpoints on other hosts if that is expected for this provider.`, { allowForeignEndpoints: ['Endpoints on other hosts need explicit approval'] });
+  const authMethods = Array.isArray(doc.token_endpoint_auth_methods_supported) ? doc.token_endpoint_auth_methods_supported.filter((m) => typeof m === 'string').slice(0, 10) : [];
+  return { ...endpoints, issuer: doc.issuer || issuerUrl, scopesSupported: doc.scopes_supported || [], tokenEndpointAuthMethods: authMethods, foreignEndpoints: foreign, fetchedAt: new Date().toISOString() };
+}
+
+// Vendor presets for Manage External Authentications. The issuer is
+// `issuerTemplate` with the preset's `fields` (and {clientId}) substituted;
+// `foreignHosts` are the endpoint hosts the vendor documents outside the issuer
+// host; `endpoints` pin what a vendor's discovery document omits;
+// `issuerFromDiscovery` adopts the issuer the vendor declares when it matches
+// that pattern (Microsoft answers a tenant domain with the tenant-GUID issuer).
+// Discovery still runs through checkDiscoveryDocument and every id_token
+// through verifyIdToken; a preset only fills in what the vendor documents.
+const PRESET_VALUE_RULES = {
+  label: { re: /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i, message: 'Letters, digits and "-" only' },
+  host: { re: /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?::\d{1,5})?$/i, message: 'A hostname such as gitlab.example.com' },
+  segment: { re: /^[a-z0-9][a-z0-9._-]{0,127}$/i, message: 'Letters, digits, ".", "_" or "-" only' },
+};
+const REDIRECT_PATH = '/api/auth/external/{name}/callback';
+const SECRET_OPTIONAL = { required: false, label: 'Client secret', help: 'Leave empty only for a public client; confidential clients (recommended) have one.' };
+const ISSUER_FIELD = (help, placeholder) => ({ key: 'issuer', label: 'Issuer URL', kind: 'url', help, placeholder });
+
+export const EXTERNAL_AUTH_PRESETS = [
+  {
+    id: 'google', label: 'Google', vendor: 'Google', issuerTemplate: 'https://accounts.google.com', fields: [], scopes: 'openid email profile',
+    secret: { required: true, label: 'Client secret', help: 'From the OAuth client in Google Cloud Console.' },
+    foreignHosts: ['oauth2.googleapis.com', 'openidconnect.googleapis.com', 'www.googleapis.com'],
+    docsUrl: 'https://developers.google.com/identity/openid-connect/openid-connect',
+    instructions: [
+      'In Google Cloud Console open APIs & Services › Credentials and create an OAuth client ID of type "Web application" (set up the OAuth consent screen first if asked).',
+      'Add the redirect URI shown below under "Authorised redirect URIs".',
+      'Paste the client ID and client secret here.',
+    ],
+    limitations: null,
+  },
+  {
+    id: 'microsoft', label: 'Microsoft Entra ID', vendor: 'Microsoft', issuerTemplate: 'https://login.microsoftonline.com/{tenant}/v2.0', scopes: 'openid email profile',
+    fields: [{
+      key: 'tenant', label: 'Directory (tenant) ID', kind: 'segment', placeholder: '00000000-0000-0000-0000-000000000000',
+      help: 'The tenant GUID from the Entra admin center Overview; a verified tenant domain such as contoso.onmicrosoft.com also works. The multi-tenant aliases common, organizations and consumers are not supported.',
+      reject: { values: ['common', 'organizations', 'consumers'], message: 'Microsoft publishes the issuer of the common, organizations and consumers endpoints as https://login.microsoftonline.com/{tenantid}/v2.0 and signs each tenant\'s tokens under its own issuer, so the panel cannot pin one. Enter the Directory (tenant) ID instead.' },
+    }],
+    secret: { required: true, label: 'Client secret', help: 'The secret value (not the secret ID) from Certificates & secrets.' },
+    issuerFromDiscovery: '^https://login\\.microsoftonline\\.com/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/v2\\.0$',
+    foreignHosts: ['graph.microsoft.com'],
+    docsUrl: 'https://learn.microsoft.com/entra/identity-platform/v2-protocols-oidc',
+    instructions: [
+      'In the Microsoft Entra admin center open Identity › Applications › App registrations › New registration and choose the single-tenant account type.',
+      'Under Authentication add a Web platform with the redirect URI shown below.',
+      'Under Certificates & secrets create a client secret; paste its value here with the Application (client) ID and the Directory (tenant) ID from Overview.',
+    ],
+    limitations: 'One tenant per provider: members and guests of that tenant can sign in, users of other tenants cannot. The common, organizations and consumers endpoints cannot be pinned to one issuer and are refused.',
+  },
+  {
+    id: 'apple', label: 'Apple', vendor: 'Apple', issuerTemplate: 'https://appleid.apple.com', fields: [], scopes: '',
+    secret: { required: true, label: 'Client secret (JWT)', help: 'Apple issues no static secret: paste a client-secret JWT generated with your Sign in with Apple key (ES256; iss = Team ID, sub = Services ID, aud = https://appleid.apple.com; valid at most 6 months). Renew it here before it expires.' },
+    foreignHosts: [],
+    docsUrl: 'https://developer.apple.com/documentation/signinwithapplerestapi',
+    instructions: [
+      'In Apple Developer › Certificates, Identifiers & Profiles register an App ID with the Sign in with Apple capability, then a Services ID (its identifier is the client ID) with Sign in with Apple enabled.',
+      'Configure the Services ID with the panel hostname as a domain and the redirect URI shown below as a return URL. If Apple rejects the port, serve the panel on the standard HTTPS port behind a reverse proxy.',
+      'Create a Sign in with Apple key under Keys, generate the client-secret JWT with it and paste the JWT as the client secret.',
+    ],
+    limitations: 'Apple answers with a POSTed form (response_mode=form_post) whenever scopes are requested, which the panel\'s callback does not accept, so this preset requests no scopes: Apple provides a stable subject only, no email. Users link their Apple ID while signed in to the panel; automatic linking by email is not possible.',
+  },
+  {
+    id: 'facebook', label: 'Meta (Facebook Login)', vendor: 'Meta', issuerTemplate: 'https://www.facebook.com', fields: [], scopes: 'openid email',
+    secret: { required: true, label: 'App secret', help: 'Settings › Basic › App secret in Meta for Developers.' },
+    endpoints: { authorization_endpoint: 'https://www.facebook.com/dialog/oauth', token_endpoint: 'https://graph.facebook.com/oauth/access_token', jwks_uri: 'https://www.facebook.com/.well-known/oauth/openid/jwks/', token_endpoint_auth_methods_supported: ['client_secret_post'] },
+    foreignHosts: ['graph.facebook.com'],
+    docsUrl: 'https://developers.facebook.com/docs/facebook-login/guides/advanced/oidc-token',
+    instructions: [
+      'In Meta for Developers create an app, add the Facebook Login product and put the redirect URI shown below into Facebook Login › Settings › Valid OAuth Redirect URIs.',
+      'Paste the App ID as the client ID and the App secret (Settings › Basic) as the secret.',
+      'While the app is in development mode only its roles (admins, developers, testers) can sign in; the email permission needs App Review for everyone else.',
+    ],
+    limitations: 'Meta\'s discovery document publishes no token endpoint, so the panel uses the documented Graph API endpoint https://graph.facebook.com/oauth/access_token (secret sent in the request body) and verifies the id_token with Meta\'s published keys.',
+  },
+  {
+    id: 'cloudflare-access', label: 'Cloudflare Access', vendor: 'Cloudflare', issuerTemplate: 'https://{team}.cloudflareaccess.com/cdn-cgi/access/sso/oidc/{clientId}', scopes: 'openid email profile',
+    fields: [{ key: 'team', label: 'Team name', kind: 'label', placeholder: 'mycompany', help: 'The <team> in https://<team>.cloudflareaccess.com (Zero Trust › Settings › Custom Pages › Team domain).' }],
+    secret: { required: true, label: 'Client secret', help: 'Shown once when the SaaS application is saved.' },
+    foreignHosts: [],
+    docsUrl: 'https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/saas-apps/generic-oidc-saas/',
+    instructions: [
+      'In Zero Trust open Access › Applications › Add an application › SaaS, choose OIDC as the authentication protocol and add the redirect URI shown below as a redirect URL.',
+      'Save the application: Cloudflare shows the client ID and client secret. Paste them here with your team name.',
+      'Assign an Access policy to the application; only identities it allows can sign in.',
+    ],
+    limitations: 'Cloudflare publishes the issuer as https://<team>.cloudflareaccess.com/cdn-cgi/access/sso/oidc/<client-id>, so the client ID is part of the issuer.',
+  },
+  {
+    id: 'gitlab', label: 'GitLab', vendor: 'GitLab', issuerTemplate: 'https://{host}', scopes: 'openid email profile',
+    fields: [{ key: 'host', label: 'GitLab host', kind: 'host', default: 'gitlab.com', placeholder: 'gitlab.com', help: 'gitlab.com or your self-managed instance.' }],
+    secret: { required: true, label: 'Secret', help: 'The application secret GitLab shows after saving.' },
+    foreignHosts: [],
+    docsUrl: 'https://docs.gitlab.com/integration/openid_connect_provider/',
+    instructions: [
+      'In GitLab open User Settings › Applications (or a group\'s or the Admin Area\'s Applications) and add a confidential application with the scopes openid, profile and email.',
+      'Set the redirect URI shown below.',
+      'Paste the Application ID as the client ID and the Secret as the client secret.',
+    ],
+    limitations: null,
+  },
+  {
+    id: 'auth0', label: 'Auth0', vendor: 'Okta', issuerTemplate: '{issuer}', scopes: 'openid email profile',
+    fields: [ISSUER_FIELD('The application\'s Domain with https:// in front, e.g. https://your-tenant.us.auth0.com', 'https://your-tenant.us.auth0.com')],
+    secret: SECRET_OPTIONAL, foreignHosts: [],
+    docsUrl: 'https://auth0.com/docs/get-started/applications/application-settings',
+    instructions: [
+      'In the Auth0 Dashboard open Applications › Create Application and choose Regular Web Application.',
+      'Add the redirect URI shown below to Allowed Callback URLs and save.',
+      'Copy Domain, Client ID and Client Secret from the application settings.',
+    ],
+    limitations: null,
+  },
+  {
+    id: 'okta', label: 'Okta', vendor: 'Okta', issuerTemplate: '{issuer}', scopes: 'openid email profile',
+    fields: [ISSUER_FIELD('Your Okta org URL, e.g. https://dev-123456.okta.com, or an authorization server such as https://dev-123456.okta.com/oauth2/default', 'https://dev-123456.okta.com')],
+    secret: SECRET_OPTIONAL, foreignHosts: [],
+    docsUrl: 'https://developer.okta.com/docs/guides/sign-into-web-app-redirect/',
+    instructions: [
+      'In the Admin Console open Applications › Create App Integration › OIDC - OpenID Connect › Web Application.',
+      'Set the redirect URI shown below as a Sign-in redirect URI and assign the users or groups allowed to sign in.',
+      'Copy the Client ID and Client secret.',
+    ],
+    limitations: null,
+  },
+  {
+    id: 'keycloak', label: 'Keycloak', vendor: 'Keycloak', issuerTemplate: '{issuer}', scopes: 'openid email profile',
+    fields: [ISSUER_FIELD('https://<keycloak-host>/realms/<realm>', 'https://sso.example.com/realms/master')],
+    secret: SECRET_OPTIONAL, foreignHosts: [],
+    docsUrl: 'https://www.keycloak.org/docs/latest/server_admin/#_oidc_clients',
+    instructions: [
+      'In the admin console open the realm › Clients › Create client (OpenID Connect) with Client authentication on.',
+      'Add the redirect URI shown below under Valid redirect URIs.',
+      'Copy the client ID and, from the Credentials tab, the client secret.',
+    ],
+    limitations: null,
+  },
+  {
+    id: 'generic', label: 'Other OpenID Connect provider', vendor: null, generic: true, issuerTemplate: '{issuer}', scopes: 'openid email profile',
+    fields: [ISSUER_FIELD('Discovery reads <issuer>/.well-known/openid-configuration', 'https://login.example.com')],
+    secret: SECRET_OPTIONAL, foreignHosts: [], docsUrl: 'https://openid.net/specs/openid-connect-discovery-1_0.html',
+    instructions: ['Register the panel as a confidential web client at the provider with the redirect URI shown below.', 'Paste the issuer URL, client ID and client secret here.'],
+    limitations: null,
+  },
+  {
+    id: 'github', label: 'GitHub', vendor: 'GitHub', supported: false,
+    reason: 'GitHub is OAuth 2.0 only: it publishes no OpenID Connect discovery document and issues no id_token, so the panel cannot verify who signed in. Support needs a separate OAuth 2.0 + user API flow.',
+    docsUrl: 'https://docs.github.com/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps',
+  },
+];
+
+export function presetById(id) {
+  return EXTERNAL_AUTH_PRESETS.find((p) => p.id === id) || null;
+}
+
+function checkPresetValue(field, value) {
+  if (!value) return `${field.label} is required`;
+  if (field.reject?.values?.includes(value.toLowerCase())) return field.reject.message;
+  if (field.kind === 'url') {
+    let u;
+    try { u = new URL(value); } catch { return 'Must be an https:// URL'; }
+    if (u.protocol !== 'https:') return 'Must use https://';
+    if (u.search || u.hash || u.username || u.password) return 'A plain https:// URL without query, fragment or credentials';
+    return null;
+  }
+  const rule = PRESET_VALUE_RULES[field.kind] || PRESET_VALUE_RULES.segment;
+  return rule.re.test(value) ? null : rule.message;
+}
+
+// Substitutes the preset fields into the issuer template; every value is
+// checked against its field kind so nothing can escape its host label or
+// path segment, and the result must still parse as an https URL.
+export function resolvePresetIssuer(preset, { fields = {}, clientId = '' } = {}) {
+  const errors = {};
+  const values = {};
+  for (const field of preset.fields || []) {
+    const value = String(fields?.[field.key] ?? field.default ?? '').trim();
+    const problem = checkPresetValue(field, value);
+    if (problem) errors[`fields.${field.key}`] = [problem];
+    values[field.key] = field.kind === 'url' ? stripSlash(value) : value;
+  }
+  if (preset.issuerTemplate.includes('{clientId}')) {
+    const id = String(clientId || '').trim();
+    if (!PRESET_VALUE_RULES.segment.re.test(id)) errors.clientId = ['The client ID is part of the issuer URL for this provider: letters, digits, ".", "_" or "-" only'];
+    values.clientId = id;
+  }
+  if (Object.keys(errors).length) throw unprocessable('Check the provider fields', errors);
+  const issuerUrl = stripSlash(preset.issuerTemplate.replace(/\{(\w+)\}/g, (_, key) => values[key] ?? ''));
+  let u;
+  try { u = new URL(issuerUrl); } catch { throw unprocessable('The resolved issuer is not a valid URL', { issuerUrl: [issuerUrl] }); }
+  if (u.protocol !== 'https:') throw unprocessable('The issuer must use https://', { issuerUrl: [issuerUrl] });
+  return { issuerUrl, values };
+}
+
+function publicPreset(p) {
+  if (p.supported === false) return { id: p.id, label: p.label, vendor: p.vendor, supported: false, reason: p.reason, docsUrl: p.docsUrl || null };
+  return {
+    id: p.id, label: p.label, vendor: p.vendor, supported: true, generic: Boolean(p.generic), issuerTemplate: p.issuerTemplate,
+    fields: (p.fields || []).map(({ key, label, kind, help, placeholder, default: def }) => ({ key, label, kind, help: help || null, placeholder: placeholder || null, default: def ?? '' })),
+    scopes: p.scopes, secret: p.secret, foreignHosts: p.foreignHosts || [],
+    pinnedEndpoints: p.endpoints ? Object.entries(p.endpoints).filter(([k]) => k.endsWith('_endpoint') || k === 'jwks_uri').map(([k, v]) => ({ name: k, url: v })) : [],
+    docsUrl: p.docsUrl, instructions: p.instructions || [], limitations: p.limitations || null,
+  };
 }
 
 export function passwordStrength(pw) {
@@ -377,6 +586,8 @@ export function createSecurityCenterService(ctx) {
     providers: db.prepare('SELECT * FROM external_auth_providers ORDER BY name'),
     providerByName: db.prepare('SELECT * FROM external_auth_providers WHERE name = ?'),
     insertProvider: db.prepare('INSERT INTO external_auth_providers (name, display_name, issuer_url, client_id, client_secret_enc, scopes, enabled) VALUES (@name, @display_name, @issuer_url, @client_id, @client_secret_enc, @scopes, @enabled)'),
+    insertProviderDiscovered: db.prepare('INSERT INTO external_auth_providers (name, display_name, issuer_url, client_id, client_secret_enc, scopes, enabled, discovery_json) VALUES (@name, @display_name, @issuer_url, @client_id, @client_secret_enc, @scopes, @enabled, @discovery_json)'),
+    setDiscovery: db.prepare("UPDATE external_auth_providers SET discovery_json = @discovery_json, issuer_url = @issuer_url, updated_at = datetime('now') WHERE id = @id"),
     updateProvider: db.prepare(`UPDATE external_auth_providers SET display_name = @display_name, issuer_url = @issuer_url, client_id = @client_id, client_secret_enc = @client_secret_enc, scopes = @scopes, enabled = @enabled, discovery_json = @discovery_json, updated_at = datetime('now') WHERE id = @id`),
     deleteProvider: db.prepare('DELETE FROM external_auth_providers WHERE id = ?'),
     providerLinks: db.prepare('SELECT COUNT(*) AS n FROM external_auth_links WHERE provider_id = ?'),
@@ -949,9 +1160,52 @@ export function createSecurityCenterService(ctx) {
   const externalAuth = {
     shape(row) {
       if (!row) return null;
-      return { id: row.id, name: row.name, displayName: row.display_name, issuerUrl: row.issuer_url, clientId: row.client_id, hasClientSecret: Boolean(row.client_secret_enc), scopes: row.scopes, enabled: Boolean(row.enabled), discovery: json.parse(row.discovery_json, null), links: stmts.providerLinks.get(row.id).n, createdAt: row.created_at, updatedAt: row.updated_at };
+      const discovery = json.parse(row.discovery_json, null);
+      return { id: row.id, name: row.name, displayName: row.display_name, issuerUrl: row.issuer_url, clientId: row.client_id, hasClientSecret: Boolean(row.client_secret_enc), scopes: row.scopes, enabled: Boolean(row.enabled), discovery, preset: discovery?.preset || null, links: stmts.providerLinks.get(row.id).n, createdAt: row.created_at, updatedAt: row.updated_at };
     },
     list: () => stmts.providers.all().map(externalAuth.shape),
+    // The redirect URI auth.js sends is built from the origin the browser used,
+    // so both that one and the canonical panel address are reported.
+    presets({ redirectBase = '' } = {}) {
+      const hostname = settings.get('basic.hostname', '') || 'localhost';
+      return {
+        presets: EXTERNAL_AUTH_PRESETS.map(publicPreset),
+        redirectUriTemplate: `https://${hostname}:${config.tlsPort || 2087}${REDIRECT_PATH}`,
+        currentRedirectUriTemplate: redirectBase ? `${redirectBase}${REDIRECT_PATH}` : null,
+      };
+    },
+    // Discovery for a preset: the vendor's document, with pinned endpoints
+    // filling what it omits, validated against the resolved issuer (or the one
+    // the vendor declares when the preset says that form is authoritative).
+    async presetDiscovery(preset, issuerUrl, { allowForeignEndpoints = false } = {}) {
+      const url = `${issuerUrl}/.well-known/openid-configuration`;
+      let doc = null;
+      let fetchError = null;
+      try { doc = await fetchJson(url, { timeoutMs: 10_000 }); } catch (err) { fetchError = err; }
+      if (preset.endpoints) doc = { ...(doc && typeof doc === 'object' ? doc : {}), ...preset.endpoints };
+      if (!doc) throw badRequest(`OpenID discovery failed for ${url}: ${fetchError.message}`);
+      let issuer = issuerUrl;
+      if (preset.issuerFromDiscovery && typeof doc.issuer === 'string' && new RegExp(preset.issuerFromDiscovery).test(stripSlash(doc.issuer))) issuer = stripSlash(doc.issuer);
+      const discovery = checkDiscoveryDocument(doc, issuer, { allowForeignEndpoints, allowedForeignHosts: preset.foreignHosts || [] });
+      return { issuerUrl: issuer, discovery: { ...discovery, preset: preset.id } };
+    },
+    async createFromPreset(input, req) {
+      const preset = presetById(input.preset);
+      if (!preset) throw unprocessable(`Unknown provider preset "${input.preset}"`, { preset: ['Unknown preset'] });
+      if (preset.supported === false) throw unprocessable(`${preset.label} is not supported yet: ${preset.reason}`, { preset: [preset.reason] });
+      if (stmts.providerByName.get(input.name)) throw conflict(`Provider "${input.name}" already exists`);
+      const { issuerUrl: templated, values } = resolvePresetIssuer(preset, { fields: input.fields, clientId: input.clientId });
+      if (preset.secret?.required && !input.clientSecret) throw unprocessable(`${preset.label} needs a client secret`, { clientSecret: [preset.secret.help || 'Required'] });
+      const { issuerUrl, discovery } = await externalAuth.presetDiscovery(preset, templated, { allowForeignEndpoints: input.allowForeignEndpoints === true });
+      if (stmts.providerByName.get(input.name)) throw conflict(`Provider "${input.name}" already exists`);
+      stmts.insertProviderDiscovered.run({
+        name: input.name, display_name: input.displayName || preset.label, issuer_url: issuerUrl, client_id: input.clientId,
+        client_secret_enc: input.clientSecret ? crypto.encrypt(input.clientSecret) : null, scopes: typeof input.scopes === 'string' ? input.scopes : preset.scopes,
+        enabled: input.enabled === false ? 0 : 1, discovery_json: JSON.stringify(discovery),
+      });
+      req?.audit?.({ action: 'security.external_auth.create', target: input.name, args: { preset: preset.id, issuerUrl, clientId: input.clientId, fields: values, foreignEndpoints: discovery.foreignEndpoints } });
+      return externalAuth.get(input.name);
+    },
     get(name) {
       const row = stmts.providerByName.get(name);
       if (!row) throw notFound('Provider');
@@ -985,17 +1239,24 @@ export function createSecurityCenterService(ctx) {
     async discover(name, req, { allowForeignEndpoints = false } = {}) {
       const row = stmts.providerByName.get(name);
       if (!row) throw notFound('Provider');
-      const url = `${row.issuer_url}/.well-known/openid-configuration`;
-      let doc;
-      try {
-        doc = await fetchJson(url, { timeoutMs: 10_000 });
-      } catch (err) {
-        throw badRequest(`OpenID discovery failed for ${url}: ${err.message}`);
+      const preset = presetById(json.parse(row.discovery_json, null)?.preset);
+      let discovery;
+      let issuerUrl = row.issuer_url;
+      if (preset && preset.supported !== false) {
+        ({ discovery, issuerUrl } = await externalAuth.presetDiscovery(preset, row.issuer_url, { allowForeignEndpoints }));
+      } else {
+        const url = `${row.issuer_url}/.well-known/openid-configuration`;
+        let doc;
+        try {
+          doc = await fetchJson(url, { timeoutMs: 10_000 });
+        } catch (err) {
+          throw badRequest(`OpenID discovery failed for ${url}: ${err.message}`);
+        }
+        discovery = checkDiscoveryDocument(doc, row.issuer_url, { allowForeignEndpoints });
       }
-      const discovery = checkDiscoveryDocument(doc, row.issuer_url, { allowForeignEndpoints });
-      db.prepare("UPDATE external_auth_providers SET discovery_json = ?, updated_at = datetime('now') WHERE id = ?").run(JSON.stringify(discovery), row.id);
+      stmts.setDiscovery.run({ id: row.id, discovery_json: JSON.stringify(discovery), issuer_url: issuerUrl });
       jwksCache.delete(row.id);
-      req?.audit?.({ action: 'security.external_auth.discover', target: name, args: { allowForeignEndpoints, foreignEndpoints: discovery.foreignEndpoints } });
+      req?.audit?.({ action: 'security.external_auth.discover', target: name, args: { preset: preset?.id || null, allowForeignEndpoints, foreignEndpoints: discovery.foreignEndpoints } });
       return externalAuth.get(name);
     },
     async jwks(row, discovery) {
@@ -1029,7 +1290,10 @@ export function createSecurityCenterService(ctx) {
       const body = new URLSearchParams({ grant_type: 'authorization_code', code, redirect_uri: redirectUri, client_id: row.client_id });
       const headers = { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' };
       const clientSecret = row.client_secret_enc ? crypto.decrypt(row.client_secret_enc) : null;
-      if (clientSecret) headers.Authorization = `Basic ${Buffer.from(`${encodeURIComponent(row.client_id)}:${encodeURIComponent(clientSecret)}`).toString('base64')}`;
+      // RFC 6749 §2.3.1: HTTP Basic unless the provider only takes the secret in the body (Apple, Meta).
+      const authMethods = Array.isArray(discovery.tokenEndpointAuthMethods) ? discovery.tokenEndpointAuthMethods : [];
+      if (clientSecret && authMethods.includes('client_secret_post') && !authMethods.includes('client_secret_basic')) body.set('client_secret', clientSecret);
+      else if (clientSecret) headers.Authorization = `Basic ${Buffer.from(`${encodeURIComponent(row.client_id)}:${encodeURIComponent(clientSecret)}`).toString('base64')}`;
       let tokens;
       try { tokens = await fetchJson(discovery.tokenEndpoint, { method: 'POST', headers, body, timeoutMs: 15_000 }); } catch (err) { throw badRequest(`Token exchange failed: ${err.message}`); }
       if (!tokens.id_token) throw badRequest('The token response has no id_token: the provider is not OpenID Connect or "openid" is missing from the scopes');

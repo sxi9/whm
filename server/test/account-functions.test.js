@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { renderTemplateBody, DEFAULT_TEMPLATES, HOME_ROOTS, domainLogFile } from '../src/services/account-functions.js';
+import { renderTemplateBody, DEFAULT_TEMPLATES, HOME_ROOTS, domainLogFile, isStockTemplate } from '../src/services/account-functions.js';
 
 // A host with the account tooling installed: users, quota, rsync and Exim exist,
 // Apache/BIND/NGINX do not, so the web/dns steps stay "pending" while the ops
@@ -126,7 +126,9 @@ describe('Account Functions API', () => {
       expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM dns_zones WHERE domain = ?').get('dave.com').n).toBe(1);
       expect(app.ctx.mail.routingLists().local).toContain('dave.com');
       const index = app.agent.callsTo('fs.write_file').find((c) => c.args.path === '/home/dave/public_html/index.html');
-      expect(index.args.content).toContain('<h1>dave.com</h1>');
+      expect(index.args.content).toContain('<h1>Ready to launch</h1>');
+      expect(index.args.content).toContain('<p class="domain">dave.com</p>');
+      expect(index.args.content).toContain('Hostingsignal Panel');
       expect(index.args.content).not.toContain('{{');
     });
 
@@ -582,12 +584,60 @@ describe('Account Functions API', () => {
     });
   });
 
+  describe('branded default pages', () => {
+    it('renders the index and landing pages with the company branding, the panel URL and an absolute logo', async () => {
+      const svc = app.ctx.accountFunctions;
+      // The seeded admin-side name (migration 028) is not what visitors see; only an operator's own name is.
+      app.ctx.settings.set('basic.hostname', 'panel.example.com');
+      expect(app.ctx.settings.get('branding.company_name')).toBe('WHM');
+      expect(svc.brandingVars()).toEqual({ company_name: 'Hostingsignal Panel', tagline: '', logo_url: '', panel_url: 'http://panel.example.com:2086' });
+      app.ctx.settings.setMany({ 'branding.company_name': '', 'branding.tagline': '' });
+      expect(svc.brandingVars()).toEqual({ company_name: 'Hostingsignal Panel', tagline: '', logo_url: '', panel_url: 'http://panel.example.com:2086' });
+      // The row migration 012 seeded for "index" is the stock page: the branded default replaces it and it is not "customised".
+      expect(app.ctx.db.prepare("SELECT body FROM web_templates WHERE name = 'index'").get().body).toMatch(/no content yet/);
+      expect(isStockTemplate('index', app.ctx.db.prepare("SELECT body FROM web_templates WHERE name = 'index'").get().body)).toBe(true);
+      expect(isStockTemplate('index', '<html><body>mine</body></html>')).toBe(false);
+      expect(isStockTemplate('landing', null)).toBe(true);
+      expect((await get('/templates')).body.data.templates.find((t) => t.name === 'index').customised).toBe(false);
+      expect((await get('/templates/index')).body.data.body).toBe(DEFAULT_TEMPLATES.index);
+      const landing = svc.renderTemplate('landing', { domain: 'panel.example.com' });
+      expect(landing).toContain('<h1>Ready to launch</h1>');
+      expect(landing).toContain('<span>Hostingsignal Panel</span>');
+      expect(landing).toContain('<p class="domain">panel.example.com</p>');
+      expect(landing).toContain('<code>public_html</code>');
+      expect(landing).toContain('href="http://panel.example.com:2086"');
+      expect(landing).toContain('<img src="" alt="">');
+      expect(landing).toContain('Hosted on panel.example.com with Hostingsignal Panel. </footer>');
+      expect(landing).not.toMatch(/\{\{/);
+      app.ctx.settings.setMany({ 'branding.company_name': 'Acme & Sons', 'branding.tagline': 'Hosting <fast>' });
+      const index = svc.renderTemplate('index', { domain: 'alice.com', username: 'alice' });
+      expect(index).toContain('<title>alice.com — Ready to launch</title>');
+      expect(index).toContain('<span>Acme &amp; Sons</span>');
+      expect(index).toContain('Hosting &lt;fast&gt;');
+      expect(index).toContain('Upload your website to <code>public_html</code>');
+      expect(index).not.toContain('Hostingsignal Panel');
+      // The logo descriptor from cPanel › Customization becomes an absolute panel URL (the page is served by Apache, not the panel).
+      const originalCpanel = app.ctx.cpanel;
+      app.ctx.cpanel = { ...originalCpanel, branding: { get: () => ({ companyName: 'Acme & Sons', tagline: 'From branding', logo: { url: '/api/branding/logo?v=abc123' } }) } };
+      try {
+        expect(svc.brandingVars()).toEqual({ company_name: 'Acme & Sons', tagline: 'From branding', logo_url: 'http://panel.example.com:2086/api/branding/logo?v=abc123', panel_url: 'http://panel.example.com:2086' });
+        expect(svc.renderTemplate('landing', { domain: 'panel.example.com' })).toContain('<img src="http://panel.example.com:2086/api/branding/logo?v=abc123" alt="">');
+      } finally { app.ctx.cpanel = originalCpanel; }
+      const preview = await post('/templates/landing/preview', {}).expect(200);
+      expect(preview.body.data.html).toContain('<p class="domain">panel.example.com</p>');
+      expect(preview.body.data.html).toContain('Acme &amp; Sons');
+      app.ctx.settings.setMany({ 'branding.company_name': 'WHM', 'branding.tagline': 'WebHost Manager' });
+    });
+  });
+
   describe('web template editor', () => {
     it('lists, previews, saves to /etc/whm/templates and resets templates (root only)', async () => {
       const list = await get('/templates').expect(200);
-      expect(list.body.data.templates.map((t) => t.name)).toEqual(['index', 'suspended', 'moved', 'error-4xx']);
-      expect(list.body.data.templates.map((t) => t.served)).toEqual([true, false, false, false]);
-      expect(list.body.data.templates[1].served_by).toMatch(/not yet served/);
+      expect(list.body.data.templates.map((t) => t.name)).toEqual(['index', 'landing', 'suspended', 'moved', 'error-4xx']);
+      expect(list.body.data.templates.map((t) => t.served)).toEqual([true, true, false, false, false]);
+      expect(list.body.data.templates[1].served_by).toMatch(/whm-default/);
+      expect(list.body.data.templates[2].served_by).toMatch(/not yet served/);
+      expect(list.body.data.variables).toEqual(expect.arrayContaining(['company_name', 'tagline', 'logo_url', 'panel_url']));
       expect(app.ctx.accountFunctions.templatePath('error-4xx')).toBe('/etc/whm/templates/error-4xx.html');
       const preview = await post('/templates/error-4xx/preview', { status: '403', status_text: 'Forbidden', domain: 'alice.com' }).expect(200);
       expect(preview.body.data.html).toContain('403 Forbidden');

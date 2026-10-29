@@ -50,7 +50,7 @@ export default function SpamdStartupConfiguration({ fn }) {
       <PageHeader fn={fn} description="Options passed to the SpamAssassin daemon at start-up (OPTIONS in /etc/default/spamassassin or SPAMDOPTIONS in /etc/sysconfig/spamassassin). Saving rewrites the file and restarts spamd." />
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
-      {data && !data.installed && <CapabilityNotice error={{ code: 'capability_missing', message: 'SpamAssassin is not installed on this server. Install the spamassassin package to run spamd; the options file below is shown for reference.' }} onRetry={refetch} />}
+      {data && !data.installed && <CapabilityNotice capability="spamassassin" error={{ code: 'capability_missing', message: 'SpamAssassin is not installed on this server. Install the spamassassin package to run spamd; the options file below is shown for reference.' }} onRetry={refetch} />}
       {data && draft && (
         <>
           <Card title="Daemon">

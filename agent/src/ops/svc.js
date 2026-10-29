@@ -25,11 +25,22 @@ defineOp('svc.list_units', {
 });
 
 defineOp('svc.resolve', {
-  description: 'Pick the first unit name that exists from a list of candidates',
-  schema: z.object({ candidates: z.array(arg.unit).min(1).max(10) }).strict(),
-  run: async ({ candidates }) => {
+  description: 'Pick the first unit name that exists from a list of candidates (fresh: re-read the unit list, e.g. right after a package install)',
+  schema: z.object({ candidates: z.array(arg.unit).min(1).max(10), fresh: z.boolean().default(false) }).strict(),
+  run: async ({ candidates, fresh }) => {
+    if (fresh) unitCache.at = 0;
     const units = await knownUnits();
     return { unit: candidates.find((c) => units.has(c)) || null };
+  },
+});
+
+defineOp('svc.reset_failed', {
+  description: 'systemctl reset-failed <unit>: clear the failed state and start-limit counters before a repair restart',
+  schema: z.object({ unit: arg.unit }).strict(),
+  run: async ({ unit }) => {
+    if (!hasBinary('systemctl')) throw new OpError('capability_missing', 'systemd is not available on this host');
+    const { code, stderr } = await exec('systemctl', ['reset-failed', `${unit}.service`], { allowFailure: true });
+    return { unit, ok: code === 0, output: stderr.trim() };
   },
 });
 

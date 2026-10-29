@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { validate, z, fields, pagination } from '../../lib/validate.js';
 import { requireRoot, requireReseller } from '../../middleware/rbac.js';
 import { createDnsService } from '../../services/dns-functions.js';
+import { createDnsCloudflareService } from '../../services/dns-cloudflare.js';
 
 const domainParam = z.object({ domain: fields.domain });
 const recordParam = z.object({ domain: fields.domain, id: fields.id });
@@ -22,6 +23,8 @@ const domainList = z.array(fields.domain).min(1).max(500);
 
 export async function register(ctx) {
   ctx.dns = createDnsService(ctx);
+  ctx.dnsCloudflare = createDnsCloudflareService(ctx);
+  ctx.jobs.register('dns.cloudflare.push', (job) => ctx.dnsCloudflare.runPushJob(job));
   ctx.jobs.register('dns.sync', (job) => ctx.dns.runSync(job));
   ctx.jobs.register('dns.email_auth_all', (job) => ctx.dns.runEmailAuthAll(job));
   ctx.jobs.register('dns.resign', (job) => ctx.dns.runResign(job));
@@ -129,6 +132,24 @@ export async function register(ctx) {
   r.delete('/templates/:name', requireRoot, validate({ params: z.object({ name: templateName }) }), wrap((req) => dns().deleteTemplate(req.params.name, req)));
   r.post('/templates/:name/preview', requireRoot, validate({ params: z.object({ name: templateName }), body: z.object({ domain: fields.domain.optional(), ip: fields.ip.optional() }).strict() }),
     wrap((req) => dns().previewTemplate(req.params.name, req.body)));
+
+  // Cloudflare DNS --------------------------------------------------------------
+  // The token is root-only and only ever written; zone-level actions use the
+  // DNS service's ownership check, so a reseller mirrors only zones they own.
+  const cf = () => ctx.dnsCloudflare;
+  const cfZoneId = z.string().regex(/^[a-f0-9]{32}$/, 'Cloudflare zone IDs are 32 hex characters');
+  r.get('/cloudflare/status', requireReseller, wrap((req) => cf().status(req.user)));
+  r.put('/cloudflare/token', requireRoot, validate({ body: z.object({ apiToken: z.string().trim().min(20).max(256) }).strict() }),
+    wrap((req) => cf().configure(req.body, req.user, req)));
+  r.delete('/cloudflare/token', requireRoot, wrap((req) => cf().remove(req.user, req)));
+  r.get('/cloudflare/zones', requireRoot, validate({ query: z.object({ refresh: z.enum(['true', 'false']).transform((v) => v === 'true').optional() }) }),
+    wrap((req) => cf().zones(req.query, req.user)));
+  r.get('/zones/:domain/cloudflare', requireReseller, validate({ params: domainParam }), wrap((req) => cf().zoneStatus(req.params.domain, req.user)));
+  r.post('/zones/:domain/cloudflare/link', requireReseller, validate({ params: domainParam, body: z.object({ cloudflareZoneId: cfZoneId.optional() }).strict() }),
+    wrap((req) => cf().link(req.params.domain, req.body, req.user, req)));
+  r.post('/zones/:domain/cloudflare/unlink', requireReseller, validate({ params: domainParam }), wrap((req) => cf().unlink(req.params.domain, req.user, req)));
+  r.post('/zones/:domain/cloudflare/import', requireReseller, validate({ params: domainParam }), wrap((req) => cf().import(req.params.domain, req.user, req)));
+  r.post('/zones/:domain/cloudflare/push', requireReseller, validate({ params: domainParam }), wrap((req) => cf().requestPush(req.params.domain, req.user, req), 202));
 
   // Cluster synchronisation ----------------------------------------------------
   r.get('/sync', requireRoot, wrap(() => dns().syncStatus()));

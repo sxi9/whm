@@ -63,8 +63,15 @@ export function authRoutes(ctx) {
   });
 
   r.get('/me', requireAuth, (req, res) => {
+    // First-run wizard: root only, until Setup completes (or skips) it. Carried
+    // on the user too so the shell can route on it without a context change.
+    const setupPending = Boolean(ctx.stack?.setup?.pending?.(req.user));
+    const me = auth.publicUser(req.user);
     res.json({ data: {
-      user: auth.publicUser(req.user), csrfToken: issueCsrfToken(req, crypto), hostname: settings.get('basic.hostname'),
+      user: { ...me, setupPending }, csrfToken: issueCsrfToken(req, crypto), hostname: settings.get('basic.hostname'),
+      setupPending,
+      // The panel owner: the only user who sees the license hub and key.
+      superadmin: me.superadmin,
       mustEnroll2fa: Boolean(req.session?.mustEnroll2fa), policy: auth.policy(),
       // The Server Profile decides which sidebar categories the shell shows.
       profile: ctx.serverConfig?.profile?.summary?.() ?? { name: 'standard', hiddenCategories: [] },

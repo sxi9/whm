@@ -136,6 +136,33 @@ describe('required two-factor authentication', () => {
   });
 });
 
+describe('super admin flag', () => {
+  it('reports users.superadmin on /me and on the login answer, false until whm-cli grants it', async () => {
+    const agent = fresh();
+    const login = await loginWith(agent);
+    expect(login.body.data.user.superadmin).toBe(false);
+    let me = await agent.get('/api/auth/me');
+    expect(me.body.data.superadmin).toBe(false);
+    expect(me.body.data.user.superadmin).toBe(false);
+    app.ctx.db.prepare("UPDATE users SET superadmin = 1 WHERE username = 'root'").run();
+    try {
+      me = await agent.get('/api/auth/me');
+      expect(me.body.data.superadmin).toBe(true);
+      expect(me.body.data.user.superadmin).toBe(true);
+      expect(app.ctx.auth.isSuperadmin({ id: me.body.data.user.id, role: 'root' })).toBe(true);
+      // Only a root user can be the super admin, whatever the column says.
+      const reseller = await app.createUser('superres', 'reseller');
+      app.ctx.db.prepare('UPDATE users SET superadmin = 1 WHERE id = ?').run(reseller.id);
+      expect(app.ctx.auth.isSuperadmin({ id: reseller.id, role: 'reseller' })).toBe(false);
+      const r = fresh();
+      expect((await loginWith(r, reseller.username)).body.data.user.superadmin).toBe(false);
+    } finally {
+      app.ctx.db.prepare('UPDATE users SET superadmin = 0').run();
+      app.ctx.db.prepare("DELETE FROM users WHERE username = 'superres'").run();
+    }
+  });
+});
+
 describe('verified-IP login', () => {
   it('flags a login from an address not used in the last 90 days', async () => {
     app.ctx.settings.set('security.policy.verified_ip_login', true);

@@ -39,6 +39,24 @@ const hostSource = z.string().regex(/^(ALL|LOCAL|KNOWN|UNKNOWN|PARANOID|\[?[A-Za
 const keyName = z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/);
 const vendorName = z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/);
 const providerName = z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/, 'Lowercase letters, digits, "_" or "-"');
+const providerScopes = z.string().regex(/^[A-Za-z0-9_.:\/ -]{0,200}$/);
+const providerCommon = { clientId: z.string().min(1).max(256), clientSecret: z.string().max(4096).optional(), scopes: providerScopes.optional(), enabled: z.boolean().optional() };
+const genericProviderBody = z.object({
+  name: providerName, displayName: z.string().min(1).max(64), issuerUrl: z.string().url().max(512).startsWith('https://', 'Issuer must use https://'), ...providerCommon,
+}).strict();
+const presetProviderBody = z.object({
+  preset: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/), name: providerName, displayName: z.string().min(1).max(64).optional(),
+  fields: z.record(z.string().regex(/^[a-z][A-Za-z0-9]{0,31}$/), z.string().max(512)).optional(), allowForeignEndpoints: z.boolean().optional(), ...providerCommon,
+}).strict();
+// One endpoint, two shapes: a body naming a preset is validated as such, so field
+// errors keep their paths instead of a union's generic "invalid input".
+const createProviderBody = z.unknown().transform((value, ctx) => {
+  const schema = value && typeof value === 'object' && 'preset' in value ? presetProviderBody : genericProviderBody;
+  const result = schema.safeParse(value);
+  if (result.success) return result.data;
+  for (const issue of result.error.issues) ctx.addIssue(issue);
+  return z.NEVER;
+});
 const groupName = z.string().regex(/^[a-z_][a-z0-9_-]{0,31}$/i);
 const boolQuery = z.enum(['true', 'false']).transform((v) => v === 'true').optional();
 
@@ -160,14 +178,12 @@ export async function register(ctx) {
   r.get('/policy', wrap(() => s.policy()));
   r.post('/password-strength', validate({ body: z.object({ password: z.string().max(256), context: z.enum(['account', 'email', 'ftp', 'mysql', 'panel', 'ssh']).default('account') }).strict() }), wrap((req) => s.passwordStrength(req.body.password, req.body.context)));
   r.get('/external-auth', wrap(() => s.externalAuth.list()));
-  r.post('/external-auth', validate({ body: z.object({
-    name: providerName, displayName: z.string().min(1).max(64), issuerUrl: z.string().url().max(512).startsWith('https://', 'Issuer must use https://'), clientId: z.string().min(1).max(256),
-    clientSecret: z.string().max(1024).optional(), scopes: z.string().regex(/^[A-Za-z0-9_.:\/ -]{1,200}$/).optional(), enabled: z.boolean().optional(),
-  }).strict() }), (req, res, next) => Promise.resolve(s.externalAuth.create(req.body, req)).then((data) => res.status(201).json({ data })).catch(next));
+  r.get('/external-auth/presets', wrap((req) => s.externalAuth.presets({ redirectBase: `${req.protocol}://${req.get('host')}` })));
+  r.post('/external-auth', validate({ body: createProviderBody }), (req, res, next) => Promise.resolve(req.body.preset ? s.externalAuth.createFromPreset(req.body, req) : s.externalAuth.create(req.body, req)).then((data) => res.status(201).json({ data })).catch(next));
   r.get('/external-auth/:name', validate({ params: z.object({ name: providerName }) }), wrap((req) => s.externalAuth.get(req.params.name)));
   r.put('/external-auth/:name', validate({ params: z.object({ name: providerName }), body: z.object({
     displayName: z.string().min(1).max(64).optional(), issuerUrl: z.string().url().max(512).startsWith('https://').optional(), clientId: z.string().min(1).max(256).optional(),
-    clientSecret: z.string().max(1024).optional(), scopes: z.string().regex(/^[A-Za-z0-9_.:\/ -]{1,200}$/).optional(), enabled: z.boolean().optional(),
+    clientSecret: z.string().max(4096).optional(), scopes: providerScopes.optional(), enabled: z.boolean().optional(),
   }).strict() }), wrap((req) => s.externalAuth.update(req.params.name, req.body, req)));
   r.delete('/external-auth/:name', validate({ params: z.object({ name: providerName }) }), wrap((req) => s.externalAuth.remove(req.params.name, req)));
   r.post('/external-auth/:name/discover', validate({ params: z.object({ name: providerName }), body: z.object({ allowForeignEndpoints: z.boolean().optional() }).strict() }), wrap((req) => s.externalAuth.discover(req.params.name, req, { allowForeignEndpoints: req.body.allowForeignEndpoints === true })));

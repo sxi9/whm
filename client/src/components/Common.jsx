@@ -1,7 +1,11 @@
+import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Star, AlertTriangle, Download, Info } from 'lucide-react';
+import { api } from '../api/client.js';
+import { useAuth } from '../auth/AuthContext.jsx';
 import { useFavorites } from '../hooks/useFavorites.js';
 import { useT } from '../i18n/useT.js';
+import { ProgressLog } from './ProgressLog.jsx';
 
 export function PageHeader({ fn, title, description, actions, children }) {
   const { isFavorite, toggle } = useFavorites();
@@ -74,18 +78,54 @@ export function EmptyState({ title, children, icon: Icon = Info }) {
 }
 
 // Shown when the API says the feature's daemon is missing on this host.
-export function CapabilityNotice({ error, onRetry }) {
+// Labels for the capabilities the stack catalog (server/src/lib/stack-catalog.js)
+// can install; anything else falls back to the capability key.
+export const CAPABILITY_LABELS = {
+  apache: 'Apache', php: 'PHP', nginx: 'NGINX', mysql: 'MariaDB', postgres: 'PostgreSQL', bind: 'BIND', exim: 'Exim', dovecot: 'Dovecot', ftp: 'Pure-FTPd',
+  spamassassin: 'SpamAssassin', clamav: 'ClamAV', modsecurity: 'ModSecurity', acme: 'Certbot', quota: 'quota tools', firewall: 'the firewall', awstats: 'AWStats',
+  webalizer: 'Webalizer', analog: 'Analog', mailman: 'Mailman', rsync: 'rsync', git: 'Git', node: 'Node.js', python: 'Python', fail2ban: 'Fail2ban',
+};
+
+// Pages render this outside the shell in tests; the install button only needs
+// to know whether a root session is present, so a missing provider means "no".
+function useIsRoot() {
+  try { return useAuth().user?.role === 'root'; } catch { return false; }
+}
+
+export function CapabilityNotice({ error, onRetry, capability }) {
+  const isRoot = useIsRoot();
+  const [install, setInstall] = useState({ jobId: null, busy: false, error: null, done: false });
   if (!error) return null;
   if (error.code !== 'capability_missing' && error.code !== 'binary_not_found' && error.status !== 501) return null;
+  const cap = capability || error.capability || null;
+  const label = cap ? CAPABILITY_LABELS[cap] || cap : null;
+  const start = async () => {
+    setInstall({ jobId: null, busy: true, error: null, done: false });
+    try {
+      const { data } = await api.post(`/system/capabilities/${cap}/install`);
+      setInstall({ jobId: data.job.id, busy: false, error: null, done: false });
+    } catch (err) { setInstall({ jobId: null, busy: false, error: err, done: false }); }
+  };
+  const finished = (event) => {
+    setInstall((s) => ({ ...s, done: event.type === 'done' }));
+    if (event.type === 'done') onRetry?.();
+  };
   return (
-    <div className="banner banner-warning">
+    <div className="banner banner-warning capability-notice">
       <AlertTriangle size={18} />
-      <div>
+      <div style={{ flex: 1, minWidth: 0 }}>
         <strong>Service not installed</strong>
         <p>{error.message}</p>
-        <p className="muted">Install the required software on this server (for example via <Link to="/software/install-distro-packages">Install Distro Packages</Link>) and refresh. The rest of the panel keeps working.</p>
+        {cap && isRoot
+          ? <p className="muted">Install {label} from here with the server's package manager, or do it by hand via <Link to="/software/install-distro-packages">Install Distro Packages</Link>. The rest of the panel keeps working meanwhile.</p>
+          : <p className="muted">Install the required software on this server (for example via <Link to="/software/install-distro-packages">Install Distro Packages</Link>) and refresh. The rest of the panel keeps working.</p>}
+        {install.error && <p className="field-message">{install.error.message}</p>}
+        {install.jobId && <ProgressLog jobId={install.jobId} onFinished={finished} />}
       </div>
-      {onRetry && <button className="btn btn-sm" onClick={onRetry}>Re-check</button>}
+      <div className="row-actions" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+        {cap && isRoot && !install.jobId && <button className="btn btn-sm btn-primary" onClick={start} disabled={install.busy}>{install.busy ? 'Starting…' : `Install ${label}`}</button>}
+        {onRetry && <button className="btn btn-sm" onClick={onRetry}>Re-check</button>}
+      </div>
     </div>
   );
 }

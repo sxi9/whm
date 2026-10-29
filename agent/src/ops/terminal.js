@@ -7,12 +7,12 @@ import { defineOp, OpError } from './registry.js';
 
 // The in-browser Terminal. An interactive shell outlives any single request, so
 // this family keeps the child processes inside the agent and hands out chunks
-// of their output on demand (the API polls terminal.read and streams the chunks
-// over SSE). `script` gives the shell a real PTY while the agent talks to it over
-// plain pipes; it is started with spawn() on an argv array for the same reason
-// exec() uses execFile: nothing is ever parsed by a shell.
+// of their output on demand (the API long-polls terminal.read and streams the
+// chunks over SSE). `script` gives the shell a real PTY while the agent talks to
+// it over plain pipes; it is started with spawn() on an argv array for the same
+// reason exec() uses execFile: nothing is ever parsed by a shell.
 export const sessions = new Map();
-export const LIMITS = { maxSessions: 8, historyBytes: 512 * 1024, exitedKeepMs: 5 * 60_000, sweepMs: 30_000 };
+export const LIMITS = { maxSessions: 8, historyBytes: 512 * 1024, exitedKeepMs: 5 * 60_000, sweepMs: 30_000, maxWaitMs: 2000 };
 
 const sessionId = z.string().regex(/^[a-f0-9]{32}$/);
 let sweeper = null;
@@ -49,6 +49,24 @@ function terminate(s, reason, { keep = false } = {}) {
     t.unref();
   }
   if (!keep) sessions.delete(s.id);
+  wake(s);
+}
+
+// Readers waiting for the session's next event (output, exit, input, close).
+export function wake(s) {
+  if (!s.waiters?.size) return;
+  const waiters = [...s.waiters];
+  s.waiters.clear();
+  for (const resolve of waiters) resolve();
+}
+
+function waitForEvent(s, ms) {
+  return new Promise((resolve) => {
+    s.waiters ||= new Set();
+    const timer = setTimeout(done, ms);
+    function done() { clearTimeout(timer); s.waiters.delete(done); resolve(); }
+    s.waiters.add(done);
+  });
 }
 
 // Self-reported by the API, so not a security boundary; it keeps jobs and
@@ -57,7 +75,7 @@ function requireRootPrincipal(ctx) {
   if (ctx?.principal?.role !== 'root') throw new OpError('refused', 'The terminal is available to the root administrator only');
 }
 
-function append(s, buf) {
+export function append(s, buf) {
   s.chunks.push({ offset: s.offset, data: buf });
   s.offset += buf.length;
   s.bytes += buf.length;
@@ -65,6 +83,17 @@ function append(s, buf) {
     const dropped = s.chunks.shift();
     s.bytes -= dropped.data.length;
   }
+  wake(s);
+}
+
+export function track(s) {
+  const { child } = s;
+  child.stdout.on('data', (buf) => { append(s, buf); s.lastActivity = Date.now(); });
+  child.stderr.on('data', (buf) => { append(s, buf); });
+  child.stdin.on('error', () => {});
+  child.on('error', (err) => { append(s, Buffer.from(`\r\n[terminal error: ${err.message}]\r\n`)); });
+  child.on('exit', (code, signal) => { s.exited = true; s.exitCode = code; s.signal = signal; s.exitedAt = Date.now(); wake(s); });
+  return s;
 }
 
 export function publicInfo(s) {
@@ -100,12 +129,7 @@ defineOp('terminal.open', {
       env: { PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', HOME: home, USER: 'root', LOGNAME: 'root', SHELL: shell, TERM: 'xterm-256color', LANG: 'C.UTF-8', COLUMNS: String(cols), LINES: String(rows), WHM_TERMINAL: id },
       windowsHide: true,
     });
-    const s = { id, child, shell, chunks: [], offset: 0, bytes: 0, startedAt: Date.now(), lastActivity: Date.now(), exited: false, exitCode: null, signal: null, exitedAt: null, idleMs: idleMinutes * 60_000, closeReason: null, closedAt: null };
-    child.stdout.on('data', (buf) => { append(s, buf); s.lastActivity = Date.now(); });
-    child.stderr.on('data', (buf) => { append(s, buf); });
-    child.stdin.on('error', () => {});
-    child.on('error', (err) => { append(s, Buffer.from(`\r\n[terminal error: ${err.message}]\r\n`)); });
-    child.on('exit', (code, signal) => { s.exited = true; s.exitCode = code; s.signal = signal; s.exitedAt = Date.now(); });
+    const s = track({ id, child, shell, chunks: [], offset: 0, bytes: 0, startedAt: Date.now(), lastActivity: Date.now(), exited: false, exitCode: null, signal: null, exitedAt: null, idleMs: idleMinutes * 60_000, closeReason: null, closedAt: null, waiters: new Set() });
     // script never sets the PTY window size, so the shell is told the size the
     // client asked for (both values are validated integers; the leading space
     // keeps the line out of the shell history).
@@ -117,10 +141,15 @@ defineOp('terminal.open', {
 });
 
 defineOp('terminal.read', {
-  description: 'Output produced by a terminal session since a byte offset (base64)',
-  schema: z.object({ id: sessionId, since: z.number().int().min(0).default(0), maxBytes: z.number().int().min(1).max(1024 * 1024).default(64 * 1024) }).strict(),
-  run: async ({ id, since, maxBytes }) => {
-    const s = get(id);
+  description: 'Output produced by a terminal session since a byte offset (base64); waitMs long-polls for the next output, input or exit',
+  schema: z.object({ id: sessionId, since: z.number().int().min(0).default(0), maxBytes: z.number().int().min(1).max(1024 * 1024).default(64 * 1024), waitMs: z.number().int().min(0).max(LIMITS.maxWaitMs).default(0) }).strict(),
+  run: async ({ id, since, maxBytes, waitMs }) => {
+    let s = get(id);
+    // A session that already ended answers at once so the API learns why.
+    if (waitMs > 0 && s.offset <= since && !s.exited && !s.closeReason) {
+      await waitForEvent(s, waitMs);
+      s = get(id);
+    }
     const oldest = s.chunks[0]?.offset ?? s.offset;
     const from = Math.max(since, oldest);
     const parts = [];
@@ -146,6 +175,7 @@ defineOp('terminal.write', {
     if (s.exited || s.closeReason) throw new OpError('exited', 'The shell has exited');
     s.lastActivity = Date.now();
     s.child.stdin.write(data);
+    wake(s);
     return { id, bytes: Buffer.byteLength(data) };
   },
 });

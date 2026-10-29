@@ -1,10 +1,10 @@
 import { useState } from 'react';
 import { api } from '../../../api/client.js';
-import { PageHeader, Card, Loading, StatusPill, KeyValue, formatBytes, formatDuration } from '../../../components/Common.jsx';
+import { PageHeader, Card, Loading, StatusPill, KeyValue, CapabilityNotice, formatBytes, formatDuration } from '../../../components/Common.jsx';
 import { Field, TextInput, NumberInput, Select, Toggle, Textarea, Button, FormActions } from '../../../components/Form.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
-import { useSettingsForm, SaveBar, RequestError, DaemonNotice, LastApply, UnitPill, Tabs, ListEditor } from '../../service-config/Shared.jsx';
+import { useSettingsForm, SaveBar, RequestError, LastApply, UnitPill, Tabs, ListEditor } from '../../service-config/Shared.jsx';
 
 const TOKENS = ['Prod', 'Major', 'Minor', 'Min', 'OS', 'Full'];
 const MPMS = [{ value: 'event', label: 'event (threaded, recommended with PHP-FPM)' }, { value: 'worker', label: 'worker (threaded)' }, { value: 'prefork', label: 'prefork (one process per request; required by mod_php)' }];
@@ -35,6 +35,17 @@ export default function ApacheConfiguration({ fn }) {
     setBusy('sync');
     try { const { data: d } = await api.post('/service-config/apache/vhosts/sync', {}); toast.success(`Virtual host sync queued (job #${d.job.id})`); } catch (err) { toast.error(err); } finally { setBusy(null); }
   };
+  // The flag lives in the panel settings; the vhosts that carry a certificate
+  // are re-rendered by the sync job so the change reaches Apache.
+  const setForceHttps = async (enabled) => {
+    setBusy('https');
+    try {
+      await api.put('/system/settings', { 'web.force_https': enabled });
+      const { data: d } = await api.post('/service-config/apache/vhosts/sync', {});
+      toast.success(`HTTP to HTTPS redirect ${enabled ? 'enabled' : 'disabled'}; virtual hosts re-render in job #${d.job.id}`);
+      form.refetch();
+    } catch (err) { toast.error(err); } finally { setBusy(null); }
+  };
 
   const threaded = draft?.mpm?.module !== 'prefork';
   return (
@@ -49,7 +60,7 @@ export default function ApacheConfiguration({ fn }) {
       {form.loading && !data && <Loading />}
       {data && (
         <>
-          <DaemonNotice installed={data.installed} message="Apache is not installed on this server. Install apache2 (Debian/Ubuntu) or httpd (RHEL); the settings you save here are kept and applied once it is." onRetry={form.refetch} />
+          {!data.installed && <CapabilityNotice capability="apache" error={{ code: 'capability_missing', message: 'Apache is not installed on this server. Install apache2 (Debian/Ubuntu) or httpd (RHEL); the settings you save here are kept and applied once it is.' }} onRetry={form.refetch} />}
           <Card title="Server" actions={<LastApply apply={data.lastApply} />}>
             <KeyValue items={[
               ['Unit', <UnitPill key="u" unit={data.status?.unit} />],
@@ -60,6 +71,8 @@ export default function ApacheConfiguration({ fn }) {
               ['Domain logs', <span key="l"><code>{data.domlogsRoot || '/var/log/whm/domlogs'}/&lt;user&gt;/</code> <span className="small muted">root-owned, readable by the account</span></span>],
               ['Managed include', data.include?.path ? <span key="i"><code>{data.include.path}</code> {data.include.exists ? <StatusPill status="ok">present{data.include.enabled ? ', enabled' : ', not enabled'}</StatusPill> : <StatusPill status="pending">not written yet</StatusPill>}</span> : '—'],
               ['Virtual hosts', <span key="v">{data.vhosts.total} total · {data.vhosts.applied} applied · {data.vhosts.pending} pending · {data.vhosts.failed} failed <Button size="sm" onClick={syncVhosts} loading={busy === 'sync'} disabled={!data.installed}>Re-render all</Button></span>],
+              ['Hostname site', data.hostnameVhost ? <span key="h"><code>{data.hostnameVhost.domain}</code> <StatusPill status={data.hostnameVhost.status === 'applied' ? 'ok' : data.hostnameVhost.status === 'pending' ? 'pending' : 'failed'}>{data.hostnameVhost.status}</StatusPill> <span className="small muted">landing page from <code>{data.landingDocroot || '/var/www/whm-default'}</code>{data.hostnameVhost.ssl ? ', HTTPS' : ', no certificate yet'}; edit it under Account Functions › Web Template Editor</span></span> : <span key="h" className="muted">not rendered yet (set a fully qualified hostname in Networking Setup › Change Hostname)</span>],
+              ['HTTPS redirect', <div key="r"><Toggle checked={Boolean(data.forceHttps)} onChange={setForceHttps} disabled={busy === 'https'} label="Redirect HTTP to HTTPS when a certificate is installed" description="Every virtual host with a certificate answers port 80 with a 301 to https:// (the ACME challenge path stays on HTTP). Sites without a certificate are not touched." />{data.rewriteModule === false && <div className="banner banner-warning"><div>mod_rewrite is not loaded, so the redirect block in each virtual host is inert. Run <code>a2enmod rewrite</code> (Debian/Ubuntu) or load <code>mod_rewrite</code> (RHEL) and reload Apache.</div></div>}</div>],
               ['PHP-FPM', data.php?.versions?.length ? data.php.versions.map((v) => `${v.version} (${v.poolDir})`).join(', ') : 'no PHP-FPM trees found'],
               data.status?.serverStatus && ['mod_status', <span key="s">{data.status.serverStatus.busyWorkers} busy / {data.status.serverStatus.idleWorkers} idle workers · {data.status.serverStatus.requestsPerSecond?.toFixed?.(2) ?? data.status.serverStatus.requestsPerSecond} req/s · {formatBytes((data.status.serverStatus.totalKBytes || 0) * 1024)} served · up {formatDuration(data.status.serverStatus.uptimeSeconds)}</span>],
               data.status?.modules?.length && ['Loaded modules', <span key="m" className="small">{data.status.modules.map((m) => m.name).join(', ')}</span>],

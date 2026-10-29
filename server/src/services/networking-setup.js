@@ -11,6 +11,20 @@ export const MAX_RESOLVERS = 4;
 // Per-name budget of a live resolver test; the names run in parallel per server.
 export const RESOLVER_TEST_TIMEOUT_MS = 1500;
 export const DEFAULT_TEST_NAMES = ['example.com', 'example.net'];
+// Services whose certificate is the hostname's: the panel listener, mail and
+// FTP. Apache's "default SSL vhost" is the hostname vhost itself (ctx.web).
+export const HOSTNAME_CERT_SERVICES = ['panel', 'exim', 'dovecot', 'ftp'];
+const LANDING_DOCROOT = '/var/www/whm-default';
+
+// A DNS AAAA record only helps when the address is reachable from outside:
+// loopback, link-local, unique-local and v4-mapped addresses are left out.
+export function isPublicIpv6(value) {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (!v || !v.includes(':')) return false;
+  if (v === '::' || v === '::1' || v.startsWith('::ffff:') || v.startsWith('fe8') || v.startsWith('fe9') || v.startsWith('fea') || v.startsWith('feb')) return false;
+  if (/^f[cd][0-9a-f]{2}:/.test(v)) return false;
+  return fields.ipv6.safeParse(v).success;
+}
 
 const RESERVED_HOSTNAMES = new Set(['localhost', 'localhost.localdomain', 'localhost6', 'localhost6.localdomain6', 'ip6-localhost', 'ip6-loopback', 'ip6-localnet', 'ip6-mcastprefix', 'ip6-allnodes', 'ip6-allrouters', 'ip6-allhosts']);
 const RESERVED_LABELS = new Set(['localhost', 'localhost6', 'ip6-localhost', 'ip6-loopback']);
@@ -301,6 +315,100 @@ export function createNetworkingSetupService(ctx) {
     }
   }
 
+  // Every record the hostname needs, published through DNS Functions: the A
+  // record (creating the parent zone when needed), AAAA for a public IPv6,
+  // www as a CNAME and an MX pointing at the host itself. The A record decides
+  // the step; the rest are reported one by one.
+  async function publishHostnameRecords(fqdn, { ipv4, ipv6 }, req) {
+    if (!ctx.dns?.ensureHostnameA) return { step: 'dns', ok: false, skipped: true, error: 'DNS Functions are not available on this panel' };
+    try {
+      const r = await ctx.dns.ensureHostnameA({ ip: ipv4 || undefined }, req?.user, req);
+      const records = [{ type: 'A', name: fqdn, value: r.ip, ok: true }];
+      const extra = [];
+      if (ipv6) extra.push(['AAAA', fqdn, [{ value: ipv6 }]]);
+      extra.push(['CNAME', `www.${fqdn}`, [{ value: fqdn }]], ['MX', fqdn, [{ priority: 0, value: fqdn }]]);
+      if (typeof ctx.dns.upsertRecords === 'function') {
+        for (const [type, name, values] of extra) {
+          try { await ctx.dns.upsertRecords(r.zone, name, type, values, req); records.push({ type, name, value: values[0].value, ok: true }); } catch (err) { records.push({ type, name, value: values[0].value, ok: false, error: err.message }); }
+        }
+      } else records.push(...extra.map(([type, name, values]) => ({ type, name, value: values[0].value, ok: false, error: 'DNS Functions has no record API on this panel' })));
+      const failed = records.filter((x) => !x.ok);
+      return {
+        step: 'dns', ok: failed.length === 0, zone: r.zone, createdZone: r.createdZone ?? null, records,
+        detail: `${records.filter((x) => x.ok).map((x) => `${x.name} IN ${x.type} ${x.value}`).join(', ')} in zone ${r.zone}${r.createdZone ? ` (zone ${r.createdZone} created)` : ''}`,
+        ...(failed.length ? { error: failed.map((x) => `${x.type} ${x.name}: ${x.error}`).join('; ') } : {}),
+      };
+    } catch (err) {
+      return { step: 'dns', ok: false, error: err.message, code: err.code ?? null, capability: err.capability ?? null };
+    }
+  }
+
+  // The hostname's own vhost (branded landing page) comes from Service Configuration.
+  async function ensureLanding(fqdn, req) {
+    if (typeof ctx.web?.ensureHostnameVhost !== 'function') return { step: 'landing', ok: true, skipped: true, error: 'Service Configuration is not available on this panel' };
+    try {
+      const r = await ctx.web.ensureHostnameVhost(req, { hostname: fqdn });
+      if (r.applied) return { step: 'landing', ok: true, detail: `${fqdn} serves the landing page from ${r.docroot || LANDING_DOCROOT}${r.ssl ? ' (HTTPS)' : ''}`, docroot: r.docroot ?? null, ssl: Boolean(r.ssl), landingPage: Boolean(r.landingPage) };
+      if (r.reason === 'capability_missing') return { step: 'landing', ok: true, skipped: true, capability: 'apache', detail: `Apache is not installed; the ${fqdn} virtual host is stored and written once it is`, landingPage: Boolean(r.landingPage) };
+      return { step: 'landing', ok: false, error: r.error || r.reason || 'virtual host not written', code: r.reason ?? null, landingPage: Boolean(r.landingPage) };
+    } catch (err) {
+      return { step: 'landing', ok: false, error: err.message, code: err.code ?? null, capability: err.capability ?? null };
+    }
+  }
+
+  // ssl.issueFor only knows hosted domains; the server's own name is never one
+  // (setHostname refuses it), so the AutoSSL issuer takes a synthetic row for it.
+  async function issueCertificate(fqdn, user, req, { force, autossl }) {
+    try { return await ctx.ssl.issueFor(fqdn, user, req, { force }); } catch (err) {
+      if (!(err.status === 404 || err.code === 'not_found') || typeof ctx.ssl.autossl?.issue !== 'function') throw err;
+      const row = { domain: fqdn, account: null, accountId: null, type: 'server', suspended: false, docroot: ctx.web?.landingDocroot || LANDING_DOCROOT, certificate: ctx.ssl.certForDomain?.(fqdn) ?? null };
+      const result = await ctx.ssl.autossl.issue(row, autossl, { force, req });
+      audit(req, { action: 'ssl.autossl.issue', target: fqdn, args: { provider: autossl.provider, renewed: result.renewed, hostname: true } });
+      return result;
+    }
+  }
+
+  function issuedPems(certId, user) {
+    const row = certId != null && typeof ctx.ssl.certs?.raw === 'function' ? ctx.ssl.certs.raw(certId, user) : null;
+    if (!row?.cert_pem || !row.key_enc) throw new Error('The issued certificate was not stored with its private key');
+    return { certPem: row.cert_pem, keyPem: ctx.crypto.decrypt(row.key_enc), ...(row.chain_pem ? { chainPem: row.chain_pem } : {}) };
+  }
+
+  // Issues the hostname's certificate through AutoSSL once the name resolves
+  // to this server, then installs it for the panel, mail and FTP; the hostname
+  // vhost gets it through the issuer's web hook. Every outcome is a step.
+  async function issueHostnameCertificate(fqdn, { ip, force = false }, req) {
+    const ssl = ctx.ssl;
+    if (typeof ssl?.autossl?.settings !== 'function' || typeof ssl.installServiceCert !== 'function') return { step: 'certificate', ok: true, skipped: true, error: 'SSL/TLS is not available on this panel' };
+    try {
+      const autossl = ssl.autossl.settings();
+      if (autossl.provider === 'disabled') return { step: 'certificate', ok: true, skipped: true, capability: 'acme', error: 'AutoSSL is disabled; choose a provider under SSL/TLS › Manage AutoSSL, then re-issue the hostname certificate' };
+      const detect = await ssl.autossl.detect();
+      if (!detect?.providers?.includes(autossl.provider)) return { step: 'certificate', ok: true, skipped: true, capability: 'acme', code: 'capability_missing', error: `${autossl.provider} is not installed on this server; install it, then re-issue the hostname certificate` };
+      const publicIp = ip && !isLoopback(ip) && ip !== LOOPBACK_HOSTNAME_IP && fields.ipv4.safeParse(ip).success ? ip : null;
+      const lookup = await resolveWith(fqdn, null, 3000);
+      if (!publicIp || !lookup.answers.includes(publicIp)) {
+        return { step: 'certificate', ok: false, skipped: true, answers: lookup.answers, error: `${fqdn} does not resolve to ${publicIp || 'a public address of this server'} yet (${lookup.answers.length ? `answers: ${lookup.answers.join(', ')}` : lookup.error || 'no answer'}); re-issue the hostname certificate once DNS has propagated` };
+      }
+      const user = req?.user ?? { role: 'root' };
+      const issued = await issueCertificate(fqdn, user, req, { force, autossl });
+      const pems = issuedPems(issued.cert?.id, user);
+      const installed = [];
+      const failed = [];
+      for (const service of HOSTNAME_CERT_SERVICES) {
+        try { await ssl.installServiceCert(service, pems, req); installed.push(service); } catch (err) { failed.push({ service, error: err.message, code: err.code ?? null }); }
+      }
+      const issuer = issued.certificate?.issuerCommonName || issued.certificate?.issuerText || autossl.provider;
+      return {
+        step: 'certificate', ok: failed.length === 0, certId: issued.cert?.id ?? null, issuer, notAfter: issued.certificate?.notAfter ?? null, renewed: issued.renewed ?? null, web: issued.web ?? null, installed, failed,
+        detail: `${issuer} certificate for ${fqdn}${issued.certificate?.notAfter ? ` until ${issued.certificate.notAfter}` : ''}; installed for ${installed.join(', ') || 'no service'}; hostname vhost ${issued.web || 'pending'}`,
+        ...(failed.length ? { error: failed.map((f) => `${f.service}: ${f.error}`).join('; '), code: failed[0].code } : {}),
+      };
+    } catch (err) {
+      return { step: 'certificate', ok: false, error: err.message, code: err.code ?? null, capability: err.capability ?? null };
+    }
+  }
+
   const service = {
     // -------------------------------------------------------------- hostname
     async hostnameStatus() {
@@ -334,12 +442,18 @@ export function createNetworkingSetupService(ctx) {
         const r = await resolveWith(current, null);
         resolves = { answers: r.answers, error: r.error, matches: Boolean(addresses.ipv4 && r.answers.includes(addresses.ipv4)) };
       }
+      let certificate = null;
+      let landing = null;
+      try { certificate = (configured && ctx.ssl?.certForDomain?.(configured)) || null; } catch { certificate = null; }
+      try { landing = (configured && ctx.web?.vhostFor?.(configured)) || null; } catch { landing = null; }
       return {
         current, configured, inSync: Boolean(current && configured && current === configured),
         validation: current ? validateHostname(current) : { hostname: '', ok: false, problems: ['No hostname is set'] },
         ip: addresses.ipv4, ipv6: addresses.ipv6, detectedIp: addresses.detectedIpv4, configuredIp: addresses.configuredIpv4,
         hosts, dns, resolves,
-        capability: { hostnamectl: capabilities.has('hostnamectl'), dns: Boolean(ctx.dns?.ensureHostnameA) },
+        certificate: certificate ? { id: certificate.id, issuer: certificate.issuer, notAfter: certificate.notAfter, daysRemaining: certificate.daysRemaining, expired: certificate.expired, autossl: certificate.autossl, state: certificate.state, selfSigned: certificate.selfSigned } : null,
+        landing: landing ? { domain: landing.domain, status: landing.status, docroot: landing.docroot, ssl: Boolean(landing.ssl), error: landing.error ?? null } : null,
+        capability: { hostnamectl: capabilities.has('hostnamectl'), dns: Boolean(ctx.dns?.ensureHostnameA), ssl: typeof ctx.ssl?.issueFor === 'function', web: typeof ctx.web?.ensureHostnameVhost === 'function' },
         defaults: service.hostnameDefaults(),
         lastChange: shapeChange(stmts.lastChange.get('hostname')),
       };
@@ -358,8 +472,10 @@ export function createNetworkingSetupService(ctx) {
     },
 
     // Order matters: hostnamectl first (the host is the source of truth), then
-    // /etc/hosts, then the panel's own setting, then the optional DNS record.
-    async setHostname({ hostname, ip, ipv6, updateHosts = true, addDnsRecord = false, reissueServiceCerts = true }, req) {
+    // /etc/hosts, the panel's own setting, the service certificates, the DNS
+    // records, the hostname's landing vhost and last its certificate (which
+    // needs the records and the vhost in place).
+    async setHostname({ hostname, ip, ipv6, updateHosts = true, addDnsRecord = true, reissueServiceCerts = true, issueCertificate: wantCertificate = true }, req) {
       const check = validateHostname(hostname);
       if (!check.ok) throw unprocessable('That hostname cannot be used', { hostname: check.problems });
       const fqdn = check.hostname;
@@ -396,26 +512,36 @@ export function createNetworkingSetupService(ctx) {
 
       steps.push(await refreshServiceCerts(fqdn, reissueServiceCerts, req));
 
+      const publicIpv4 = fields.ipv4.safeParse(targetIp).success && targetIp !== LOOPBACK_HOSTNAME_IP && !isLoopback(targetIp) ? targetIp : null;
       if (addDnsRecord) {
-        if (!ctx.dns?.ensureHostnameA) {
-          steps.push({ step: 'dns', ok: false, skipped: true, error: 'DNS Functions are not available on this panel' });
-        } else {
-          try {
-            const r = await ctx.dns.ensureHostnameA({ ip: /^\d+\.\d+\.\d+\.\d+$/.test(targetIp) && targetIp !== LOOPBACK_HOSTNAME_IP ? targetIp : undefined }, req?.user, req);
-            steps.push({ step: 'dns', ok: true, detail: `${r.recordName} IN A ${r.ip} in zone ${r.zone}${r.createdZone ? ` (zone ${r.createdZone} created)` : ''}`, zone: r.zone, createdZone: r.createdZone ?? null });
-          } catch (err) {
-            steps.push({ step: 'dns', ok: false, error: err.message, code: err.code ?? null, capability: err.capability ?? null });
-          }
-        }
+        const v6 = ipv6 || addresses.ipv6;
+        steps.push(await publishHostnameRecords(fqdn, { ipv4: publicIpv4, ipv6: isPublicIpv6(v6) ? v6 : null }, req));
       }
 
+      steps.push(await ensureLanding(fqdn, req));
+      if (wantCertificate) steps.push(await issueHostnameCertificate(fqdn, { ip: publicIpv4 }, req));
+
       recordChange('hostname', req, { hostname: previous }, { hostname: fqdn, ip: targetIp }, steps.map((s) => `${s.step}:${s.ok ? 'ok' : 'failed'}`).join(','));
-      audit(req, { action: 'networking.hostname.set', target: fqdn, args: { previous, ip: targetIp, updateHosts, addDnsRecord, reissueSelfSigned: reissueServiceCerts, steps: steps.map((s) => ({ step: s.step, ok: s.ok })) } });
+      audit(req, { action: 'networking.hostname.set', target: fqdn, args: { previous, ip: targetIp, updateHosts, addDnsRecord, reissueSelfSigned: reissueServiceCerts, hostnameTls: wantCertificate, steps: steps.map((s) => ({ step: s.step, ok: s.ok })) } });
       return {
         hostname: fqdn, previous, ip: targetIp, steps, ok: steps.every((s) => s.ok),
         // Daemons read the hostname at start-up; these are the ones that embed it.
         restartHint: ['exim', 'imap', 'httpd'],
       };
+    },
+
+    // "Reissue hostname certificate": the landing vhost is made current first
+    // so the issuer's web hook has somewhere to install the certificate.
+    async reissueHostnameCertificate({ force = true } = {}, req) {
+      const check = validateHostname(settings.get('basic.hostname', ''));
+      if (!check.ok) throw unprocessable('Set a fully qualified hostname first', { hostname: check.problems });
+      const fqdn = check.hostname;
+      await capabilities.ensureFresh();
+      const addresses = await mainAddresses(await hostInfo());
+      const publicIpv4 = addresses.ipv4 && !isLoopback(addresses.ipv4) ? addresses.ipv4 : null;
+      const steps = [await ensureLanding(fqdn, req), await issueHostnameCertificate(fqdn, { ip: publicIpv4, force }, req)];
+      audit(req, { action: 'networking.hostname.certificate', target: fqdn, args: { force, ip: publicIpv4, steps: steps.map((s) => ({ step: s.step, ok: s.ok })) } });
+      return { hostname: fqdn, ip: publicIpv4, steps, ok: steps.every((s) => s.ok) };
     },
 
     hostnameDefaults() {

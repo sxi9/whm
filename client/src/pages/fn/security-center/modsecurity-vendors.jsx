@@ -38,7 +38,7 @@ export default function ModsecurityVendors({ fn }) {
       <PageHeader fn={fn} />
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
-      {data && !data.installed && <RequestError error={{ status: 501, code: 'capability_missing', message: 'ModSecurity is not installed on this server.' }} onRetry={refetch} />}
+      {data && !data.installed && <RequestError error={{ status: 501, code: 'capability_missing', capability: 'modsecurity', message: 'ModSecurity is not installed on this server.' }} onRetry={refetch} />}
       {data && data.installed && (
         <>
           <Card title="Installed vendors" padded={false}>

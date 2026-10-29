@@ -26,6 +26,8 @@ export function Layout() {
   if (user.mustEnroll2fa && !['/security-center/two-factor-authentication', '/change-password'].includes(location.pathname)) {
     return <Navigate to="/security-center/two-factor-authentication" replace />;
   }
+  // First root login: the setup wizard runs until it completes or is skipped.
+  if (user.setupPending && location.pathname !== '/setup') return <Navigate to="/setup" replace />;
 
   return (
     <PluginNavProvider enabled={!user.mustChangePassword && !user.mustEnroll2fa}>

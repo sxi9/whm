@@ -104,6 +104,11 @@ export function attachPrincipal(ctx) {
       // identity stays on the principal so every audit row names the admin.
       const imp = impersonationOf(req, user, ctx);
       if (imp) Object.assign(principal, { role: 'reseller_admin', ownerType: 'reseller', ownerId: imp.reseller_id, scopes: ROLE_SCOPES.reseller_admin, impersonation: imp });
+      // hub.require_totp_for_admins: until the authenticator is confirmed the
+      // session carries no scope at all, so only /v1/portal/* (me, enrolment,
+      // password, logout) answers it. Read live, so flipping the setting
+      // applies to open sessions too.
+      if (!user.totp_enabled && Boolean(ctx.portalUsers?.enrolmentRequired?.(user))) Object.assign(principal, { totpEnrolRequired: true, scopes: [] });
       const refused = assertResellerActive(principal);
       if (refused) {
         req.session.destroy(() => next(refused));
@@ -129,9 +134,12 @@ export function impersonationOf(req, user, ctx) {
   return null;
 }
 
+export const totpEnrolRequired = () => new HttpError(403, 'totp_enrol_required', 'Enrol an authenticator app (Security › Two-factor authentication) before using the portal');
+
 export function apiKeyAuth({ ownerType }) {
   return (req, _res, next) => {
     if (!req.principal) return next(unauthorized());
+    if (req.principal.totpEnrolRequired) return next(totpEnrolRequired());
     if (ownerType && req.principal.ownerType !== ownerType) return next(forbidden(`This API is for ${ownerType} principals`, 'wrong_owner_type'));
     next();
   };
@@ -140,6 +148,7 @@ export function apiKeyAuth({ ownerType }) {
 export function requireScope(scope) {
   return (req, _res, next) => {
     if (!req.principal) return next(unauthorized());
+    if (req.principal.totpEnrolRequired) return next(totpEnrolRequired());
     if (!scopeAllows(req.principal.scopes, scope)) return next(forbidden(`Scope "${scope}" is required`, 'insufficient_scope'));
     next();
   };
@@ -149,6 +158,7 @@ export function requireRole(...roles) {
   return (req, _res, next) => {
     if (!req.principal) return next(unauthorized());
     if (req.principal.type !== 'portal') return next(forbidden('A portal session is required', 'portal_session_required'));
+    if (req.principal.totpEnrolRequired) return next(totpEnrolRequired());
     if (!roles.includes(req.principal.role)) return next(forbidden('Your role cannot do that', 'insufficient_role'));
     next();
   };

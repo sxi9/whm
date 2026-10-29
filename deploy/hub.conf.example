@@ -1,6 +1,6 @@
 {
   "_comment": "whm-hub configuration. JSON has no comments: every key below is explained in README.md under 'License server & marketplace (hub)' > 'hub.conf reference'. Installed to /etc/whm-hub/hub.conf by scripts/install.sh --with-hub (written once; --upgrade never rewrites it); WHM_HUB_* environment variables (hub/src/config.js ENV_MAP) override these keys. Billing webhook secrets belong in /etc/whm-hub/hub.env (WHM_HUB_STRIPE_SECRET, WHM_HUB_WHMCS_SECRET, WHM_HUB_PADDLE_SECRET). The GitHub OAuth client secret has no environment variable: add marketplace.github_oauth = { client_id, client_secret or client_secret_enc, redirect_url } here (the file is 0640 root:whmhub); absent, the GitHub verification method answers 501 github_not_configured. Note that `node hub/src/index.js --check-config` creates marketplace.packages_dir from the file it checks.",
-  "public_url": "https://hub.example.com:7443",
+  "public_url": "https://licserver.hostingsignal.in",
   "serve_ui": true,
   "host": "0.0.0.0",
   "port": 7443,
@@ -37,7 +37,7 @@
     "backup_dir": "/var/backups/whm-hub",
     "backup_keep": 48,
     "mail": {
-      "from": "whm-hub@hub.example.com",
+      "from": "whm-hub@licserver.hostingsignal.in",
       "enabled": true,
       "transport": "sendmail"
     },
@@ -59,7 +59,7 @@
     "vendor": {
       "name": "WHM Vendor",
       "support_email": "support@hub.example.com",
-      "portal_url": "https://hub.example.com:7443/"
+      "portal_url": "https://licserver.hostingsignal.in/"
     }
   },
   "marketplace": {

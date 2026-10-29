@@ -12,10 +12,11 @@ const softFailure = (err) => err?.code === 'capability_missing' || err?.code ===
 export function createAccountsService(ctx) {
   const { db, agent, capabilities, packages, settings, config, logger } = ctx;
   const stmts = {
-    byUsername: db.prepare('SELECT a.*, u.username AS owner FROM accounts a JOIN users u ON u.id = a.owner_id WHERE a.username = ?'),
+    byUsername: db.prepare(`SELECT a.*, u.username AS owner, m.username AS manager, m.role AS manager_role, m.email AS manager_email
+      FROM accounts a JOIN users u ON u.id = a.owner_id LEFT JOIN users m ON m.id = a.manager_user_id WHERE a.username = ?`),
     byDomain: db.prepare('SELECT 1 FROM account_domains WHERE domain = ?'),
-    insert: db.prepare(`INSERT INTO accounts (username, domain, owner_id, package_id, package_name, ip, contact_email, plan_snapshot_json, shell, uid, gid, home_dir, disk_quota_mb, bandwidth_limit_mb)
-      VALUES (@username, @domain, @owner_id, @package_id, @package_name, @ip, @contact_email, @plan, @shell, @uid, @gid, @home_dir, @disk_quota_mb, @bandwidth_limit_mb)`),
+    insert: db.prepare(`INSERT INTO accounts (username, domain, owner_id, manager_user_id, package_id, package_name, ip, contact_email, plan_snapshot_json, shell, uid, gid, home_dir, disk_quota_mb, bandwidth_limit_mb)
+      VALUES (@username, @domain, @owner_id, @manager_user_id, @package_id, @package_name, @ip, @contact_email, @plan, @shell, @uid, @gid, @home_dir, @disk_quota_mb, @bandwidth_limit_mb)`),
     insertDomain: db.prepare('INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, ?, ?, ?)'),
     domains: db.prepare('SELECT * FROM account_domains WHERE account_id = ? ORDER BY type, domain'),
     suspend: db.prepare("UPDATE accounts SET suspended = 1, suspend_reason = ?, suspended_at = datetime('now'), updated_at = datetime('now') WHERE id = ?"),
@@ -23,9 +24,11 @@ export function createAccountsService(ctx) {
     remove: db.prepare('DELETE FROM accounts WHERE id = ?'),
     update: db.prepare(`UPDATE accounts SET contact_email = @contact_email, package_id = @package_id, package_name = @package_name, plan_snapshot_json = @plan,
       ip = @ip, shell = @shell, disk_quota_mb = @disk_quota_mb, bandwidth_limit_mb = @bandwidth_limit_mb, demo_mode = @demo_mode, force_password_change = @force_password_change,
-      owner_id = @owner_id, updated_at = datetime('now') WHERE id = @id`),
+      owner_id = @owner_id, manager_user_id = @manager_user_id, updated_at = datetime('now') WHERE id = @id`),
     packageByName: db.prepare('SELECT id FROM packages WHERE name = ?'),
     ownerByUsername: db.prepare("SELECT id FROM users WHERE username = ? AND role IN ('root', 'reseller')"),
+    managerByUsername: db.prepare("SELECT id, username, role, email, suspended FROM users WHERE username = ? AND role IN ('root', 'reseller')"),
+    managers: db.prepare("SELECT id, username, role, email FROM users WHERE role IN ('root', 'reseller') AND suspended = 0 ORDER BY CASE role WHEN 'root' THEN 0 ELSE 1 END, username"),
     deleteMailDomains: db.prepare('DELETE FROM mail_domains WHERE account_id = ?'),
     deleteMailDomain: db.prepare('DELETE FROM mail_domains WHERE domain = ?'),
   };
@@ -43,6 +46,15 @@ export function createAccountsService(ctx) {
   function visible(account, user) {
     if (!isRoot(user) && account.owner_id !== user.id) throw forbidden('That account belongs to another reseller');
     return account;
+  }
+
+  // The manager is a root or reseller user. A reseller may name itself or a
+  // root user; handing an account to another reseller is root's decision.
+  function resolveManager(username, user) {
+    const manager = stmts.managerByUsername.get(username);
+    if (!manager || manager.suspended) throw notFound(`Manager "${username}"`);
+    if (!isRoot(user) && manager.id !== user.id && manager.role !== 'root') throw forbidden('A reseller may only assign itself or a root user as the account manager');
+    return manager;
   }
 
   function load(username, user) {
@@ -177,13 +189,14 @@ export function createAccountsService(ctx) {
       const where = [];
       const params = {};
       if (!isRoot(user)) { where.push('a.owner_id = @owner'); params.owner = user.id; }
-      if (query.q) { where.push('(a.username LIKE @q OR a.domain LIKE @q OR a.contact_email LIKE @q OR u.username LIKE @q)'); params.q = `%${query.q}%`; }
+      if (query.q) { where.push('(a.username LIKE @q OR a.domain LIKE @q OR a.contact_email LIKE @q OR u.username LIKE @q OR m.username LIKE @q)'); params.q = `%${query.q}%`; }
       if (query.suspended != null) { where.push('a.suspended = @suspended'); params.suspended = query.suspended ? 1 : 0; }
       if (query.package) { where.push('a.package_name = @package'); params.package = query.package; }
       if (query.owner) { where.push('u.username = @ownerName'); params.ownerName = query.owner; }
+      if (query.manager) { where.push('m.username = @managerName'); params.managerName = query.manager; }
       const result = paginate(db, {
-        select: 'a.*, u.username AS owner', from: 'accounts a JOIN users u ON u.id = a.owner_id', where, params,
-        sortable: { username: 'a.username', domain: 'a.domain', owner: 'u.username', package: 'a.package_name', created_at: 'a.created_at', disk_used_mb: 'a.disk_used_mb', suspended: 'a.suspended' },
+        select: 'a.*, u.username AS owner, m.username AS manager, m.role AS manager_role', from: 'accounts a JOIN users u ON u.id = a.owner_id LEFT JOIN users m ON m.id = a.manager_user_id', where, params,
+        sortable: { username: 'a.username', domain: 'a.domain', owner: 'u.username', manager: 'm.username', package: 'a.package_name', created_at: 'a.created_at', disk_used_mb: 'a.disk_used_mb', suspended: 'a.suspended' },
         defaultSort: 'username', query,
       });
       return { ...result, data: result.data.map(shape) };
@@ -192,6 +205,11 @@ export function createAccountsService(ctx) {
     get(username, user) {
       const account = load(username, user);
       return { ...shape(account), domains: stmts.domains.all(account.id) };
+    },
+
+    // Who may be named as an account manager by this caller.
+    managers(user) {
+      return stmts.managers.all().filter((m) => isRoot(user) || m.role === 'root' || m.id === user.id).map((m) => ({ username: m.username, role: m.role, email: m.email }));
     },
 
     async create(input, user, req) {
@@ -210,6 +228,7 @@ export function createAccountsService(ctx) {
         if (!owner) throw notFound(`Owner "${input.owner}"`);
         ownerId = owner.id;
       }
+      const managerId = input.manager ? resolveManager(input.manager, user).id : user.id;
       const homeRoot = settings.get('basic.home_root');
       const homeDir = `${homeRoot}/${username}`;
       const shell = plan.has_shell ? '/bin/bash' : '/usr/sbin/nologin';
@@ -235,7 +254,7 @@ export function createAccountsService(ctx) {
 
         const account = db.transaction(() => {
           const { lastInsertRowid } = stmts.insert.run({
-            username, domain: input.domain, owner_id: ownerId, package_id: pkgRow.id, package_name: pkgName, ip,
+            username, domain: input.domain, owner_id: ownerId, manager_user_id: managerId, package_id: pkgRow.id, package_name: pkgName, ip,
             contact_email: input.contactEmail || null, plan: JSON.stringify(plan), shell,
             uid: sysUser?.uid ?? null, gid: sysUser?.gid ?? null, home_dir: homeDir,
             disk_quota_mb: plan.disk_mb, bandwidth_limit_mb: plan.bandwidth_mb,
@@ -246,7 +265,7 @@ export function createAccountsService(ctx) {
 
         undo.push(() => Promise.resolve(stmts.remove.run(account.id)));
         const provisioning = await provision(account, { ip, user, req, undo, want: { web: true, dns: true, mail: true, ...(input.provision || {}) } });
-        audit(req, { action: 'account.create', target: username, args: { domain: input.domain, package: pkgName, owner: ownerId, ip, provisioning: Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])) } });
+        audit(req, { action: 'account.create', target: username, args: { domain: input.domain, package: pkgName, owner: ownerId, manager: managerId, ip, provisioning: Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])) } });
         return { ...shape(stmts.byUsername.get(username)), domains: stmts.domains.all(account.id), provisioning: { systemUser: Boolean(sysUser), ...Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])), steps: provisioning.steps } };
       } catch (err) {
         for (const step of undo.reverse()) await step().catch((e) => logger.error({ err: e }, 'rollback step failed'));
@@ -323,6 +342,8 @@ export function createAccountsService(ctx) {
         if (!owner) throw notFound(`Owner "${input.owner}"`);
         next.owner_id = owner.id;
       }
+      if (input.manager === null) next.manager_user_id = null;
+      else if (input.manager) next.manager_user_id = resolveManager(input.manager, user).id;
       // Resellers stay within their ACLs, limits, package list and IP delegation after creation too.
       if (!isRoot(user)) ctx.resellers?.modifyPolicy?.(user, account, { pkgName: input.package, diskQuotaMb: next.disk_quota_mb, bandwidthLimitMb: next.bandwidth_limit_mb, ip: next.ip });
       if (account.uid != null) {

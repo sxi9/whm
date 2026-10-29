@@ -55,6 +55,23 @@ export function createServiceManager({ db, agent, capabilities }) {
       return agent.op('svc.journal', { unit, lines });
     },
 
+    // Repair a failed or stopped service: clear systemd's failed state and
+    // start-limit counters, restart, then report the state with the last
+    // journal lines so the operator sees why it failed if it still does.
+    async repair(name, req) {
+      await capabilities.ensureFresh();
+      const { row, unit } = resolve(name);
+      if (!unit) throw notFound(`An installed unit for ${row.display_name}`);
+      const steps = [];
+      try { await agent.op('svc.reset_failed', { unit }, { req }); steps.push({ step: 'reset-failed', ok: true }); } catch (err) { steps.push({ step: 'reset-failed', ok: false, error: err.message }); }
+      try { await agent.op('svc.restart', { unit }, { req }); steps.push({ step: 'restart', ok: true }); } catch (err) { steps.push({ step: 'restart', ok: false, error: err.message }); }
+      const status = await agent.op('svc.status', { unit });
+      let journal = [];
+      try { journal = (await agent.op('svc.journal', { unit, lines: 30 })).lines || []; } catch (err) { journal = [`journal unavailable: ${err.message}`]; }
+      req?.audit?.({ action: 'service.repair', target: unit, args: { steps, active: Boolean(status.active) } });
+      return { name, displayName: row.display_name, unit, repaired: Boolean(status.active), steps, status, journal };
+    },
+
     configure(name, { monitored, enabled, restartOnFailure }) {
       const { row } = resolve(name);
       update.run({ name, monitored: monitored ?? row.monitored ? 1 : 0, enabled: enabled ?? row.enabled ? 1 : 0, restart_on_failure: restartOnFailure ?? row.restart_on_failure ? 1 : 0 });

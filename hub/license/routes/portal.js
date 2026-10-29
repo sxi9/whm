@@ -16,7 +16,9 @@ export function portalRoutes(ctx) {
     const user = ctx.portalUsers.publicView(ctx.portalUsers.get(req.principal.userId));
     const imp = req.principal.impersonation || null;
     const resellerId = imp?.reseller_id || user.reseller_id || null;
-    const out = { user: imp ? { ...user, role: 'reseller_admin', reseller_id: imp.reseller_id } : user, totp_verified_at: req.session.totpVerifiedAt || null, csrfToken: issueCsrfToken(req, ctx.crypto), impersonating: imp ? { reseller_id: imp.reseller_id, by: imp.by, expires_at: new Date(imp.expires_at).toISOString() } : null };
+    // totp_enrol_required: the SPA sends the user to the enrolment page and the
+    // hub answers 403 totp_enrol_required everywhere outside /v1/portal/*.
+    const out = { user: imp ? { ...user, role: 'reseller_admin', reseller_id: imp.reseller_id } : user, totp_verified_at: req.session.totpVerifiedAt || null, totp_enrol_required: Boolean(user.totp_enrol_required), csrfToken: issueCsrfToken(req, ctx.crypto), impersonating: imp ? { reseller_id: imp.reseller_id, by: imp.by, expires_at: new Date(imp.expires_at).toISOString() } : null };
     if (resellerId) { try { const rs = ctx.resellers.get(resellerId); out.reseller = { id: rs.id, name: rs.name, brand: rs.brand || {} }; } catch { out.reseller = null; } }
     return out;
   };
@@ -33,8 +35,9 @@ export function portalRoutes(ctx) {
     req.session.userId = user.id;
     req.session.totpVerifiedAt = user.totp_enabled ? ctx.clock.now() : null;
     req.principal = { type: 'portal', userId: user.id };
-    ctx.audit.record({ principal: `portal:${user.id}`, ip: req.ip, action: 'portal.login', target: user.id, args: null, result: 'ok' });
-    res.json({ data: { user: ctx.portalUsers.publicView(user), csrfToken: issueCsrfToken(req, ctx.crypto), totp_verified_at: req.session.totpVerifiedAt } });
+    const enrol = ctx.portalUsers.enrolmentRequired(user);
+    ctx.audit.record({ principal: `portal:${user.id}`, ip: req.ip, action: 'portal.login', target: user.id, args: enrol ? { totp_enrol_required: true } : null, result: 'ok' });
+    res.json({ data: { user: ctx.portalUsers.publicView(user), csrfToken: issueCsrfToken(req, ctx.crypto), totp_verified_at: req.session.totpVerifiedAt, totp_enrol_required: enrol } });
   }));
   r.post('/logout', requireSession, (req, res) => {
     req.session.destroy(() => res.json({ data: { loggedOut: true } }));
@@ -78,6 +81,15 @@ export function portalRoutes(ctx) {
   const admin = [requireSession, requireRole('vendor_admin')];
   // Minting or altering portal users is as sensitive as minting keys: fresh TOTP required.
   const mutate = [...admin, requireStepUp(ctx.config.license.stepup_max_age_s, () => ctx.clock.now())];
+  // Vendor-wide portal policy (hub.require_totp_for_admins). requireRole
+  // refuses an admin who has not enrolled, so the rule cannot be switched off
+  // to escape it.
+  r.get('/settings', ...admin, (_req, res) => res.json({ data: ctx.portalUsers.settings() }));
+  r.patch('/settings', ...mutate, validate({ body: z.object({ require_totp_for_admins: z.boolean() }).strict() }), (req, res) => {
+    const out = ctx.portalUsers.updateSettings(req.body, { by: `portal:${req.principal.userId}` });
+    req.audit({ action: 'portal.settings_update', target: 'vendor_settings', args: req.body });
+    res.json({ data: out });
+  });
   r.get('/users', ...admin, validate({ query: pagination }), (req, res) => res.json(ctx.portalUsers.list(req.query)));
   r.post('/users', ...mutate, validate({ body: z.object({ email: fields.email, password: fields.password, role: z.enum(PORTAL_ROLES), reseller_id: fields.id.optional() }).strict() }), wrap(async (req, res) => {
     const user = await ctx.portalUsers.create(req.body);

@@ -6,6 +6,7 @@ import { DataTable, useTableState } from '../../../components/DataTable.jsx';
 import { Button } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
+import { ProviderBadge } from '../../dns/CloudflarePanel.jsx';
 
 export default function DeleteDnsZone({ fn }) {
   const toast = useToast();
@@ -18,7 +19,7 @@ export default function DeleteDnsZone({ fn }) {
   const remove = async (domains) => {
     const ok = await confirm({
       title: domains.length === 1 ? `Delete zone ${domains[0]}?` : `Delete ${domains.length} zones?`,
-      message: 'The zone file and its stanza are removed from the panel-managed BIND include and named is reloaded, so the domain stops resolving from this server. A zone declared by hand elsewhere in named.conf is refused until that stanza is removed. This cannot be undone.',
+      message: 'The zone file and its stanza are removed from the panel-managed BIND include and named is reloaded, so the domain stops resolving from this server. A zone declared by hand elsewhere in named.conf is refused until that stanza is removed. Records at Cloudflare are left untouched. This cannot be undone.',
       confirmLabel: 'Delete', danger: true, typeToConfirm: domains.length === 1 ? domains[0] : 'DELETE',
     });
     if (!ok) return;
@@ -39,6 +40,7 @@ export default function DeleteDnsZone({ fn }) {
           columns={[
             { key: 'domain', label: 'Zone', sortable: true, render: (z) => <code>{z.domain}</code> },
             { key: 'account', label: 'Account', sortable: true, render: (z) => z.account || <StatusPill status="warning">orphan</StatusPill> },
+            { key: 'provider', label: 'Provider', width: 180, render: (z) => <ProviderBadge zone={z} /> },
             { key: 'record_count', label: 'Records', sortable: true, align: 'right' },
             { key: 'serial', label: 'Serial', sortable: true, render: (z) => <code>{z.serial}</code> },
             { key: 'updated_at', label: 'Updated', sortable: true, render: (z) => formatDate(z.updated_at) },

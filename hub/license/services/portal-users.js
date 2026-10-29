@@ -4,9 +4,20 @@ import { PORTAL_ROLES } from '../../shared/auth.js';
 
 const LOCK_AFTER = 10;
 const LOCK_MS = 15 * 60_000;
+// Every code the account presents (login, step-up, re-enrol, confirm, disable)
+// draws on one budget, so a stolen session cookie cannot be stepped up by
+// guessing and a distributed guess cannot walk the code space either.
+const TOTP_MAX_FAILURES = 5;
+const TOTP_LOCK_MS = 15 * 60_000;
 // Compared against when the e-mail is unknown so login timing does not reveal
 // which portal accounts exist (same bcrypt cost as real hashes).
 const DUMMY_HASH = '$2a$12$LL9KdAMmGS4Dx5kqDJb.O.eY7dDnLy6NYwhdUcAhZzs8Uw1zVx2.G';
+
+// hub.require_totp_for_admins: the roles that must enrol an authenticator app
+// at their first login (vendor_support and reseller_staff may enrol freely).
+export const TOTP_ENFORCED_ROLES = ['vendor_admin', 'reseller_admin'];
+export const REQUIRE_TOTP_SETTING = 'hub.require_totp_for_admins';
+const SETTING_DEFAULTS = { [REQUIRE_TOTP_SETTING]: true };
 
 function assertRoleTenant(role, resellerId) {
   if (!PORTAL_ROLES.includes(role)) throw new HttpError(422, 'validation_failed', 'Unknown role');
@@ -23,20 +34,66 @@ export function createPortalUsersService(ctx) {
     byEmail: db.prepare('SELECT * FROM portal_users WHERE email = ?'),
     insert: db.prepare(`INSERT INTO portal_users (id, reseller_id, email, password_hash, role, status, created_at) VALUES (@id, @reseller_id, @email, @password_hash, @role, 'active', @now)`),
     setPassword: db.prepare('UPDATE portal_users SET password_hash = ? WHERE id = ?'),
-    setTotp: db.prepare('UPDATE portal_users SET totp_secret_enc = ?, totp_enabled = ?, totp_pending_enc = NULL WHERE id = ?'),
+    setTotp: db.prepare('UPDATE portal_users SET totp_secret_enc = ?, totp_enabled = ?, totp_pending_enc = NULL, totp_enrolled_at = ? WHERE id = ?'),
     setPendingTotp: db.prepare('UPDATE portal_users SET totp_pending_enc = ? WHERE id = ?'),
     setStatus: db.prepare('UPDATE portal_users SET status = ?, role = ? WHERE id = ?'),
     loginOk: db.prepare('UPDATE portal_users SET failed_logins = 0, locked_until = NULL, last_login_at = ? WHERE id = ?'),
     loginFail: db.prepare('UPDATE portal_users SET failed_logins = failed_logins + 1, locked_until = @locked WHERE id = @id'),
+    totpOk: db.prepare('UPDATE portal_users SET totp_failures = 0, totp_locked_until = NULL WHERE id = ?'),
+    totpFail: db.prepare('UPDATE portal_users SET totp_failures = @failures, totp_locked_until = @locked WHERE id = @id'),
     linkReseller: db.prepare('UPDATE resellers SET portal_user_id = ? WHERE id = ?'),
+    setting: db.prepare('SELECT value_json FROM vendor_settings WHERE key = ?'),
+    putSetting: db.prepare(`INSERT INTO vendor_settings (key, value_json, updated_at, updated_by) VALUES (@key, @value, @now, @by)
+      ON CONFLICT (key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at, updated_by = excluded.updated_by`),
   };
 
+  function getSetting(key, fallback = SETTING_DEFAULTS[key]) {
+    const row = stmts.setting.get(key);
+    if (!row) return fallback;
+    try { return JSON.parse(row.value_json); } catch { return fallback; }
+  }
+  function setSetting(key, value, { by = null } = {}) {
+    stmts.putSetting.run({ key, value: JSON.stringify(value), now: nowIso(now()), by });
+  }
+  const requireTotpForAdmins = () => getSetting(REQUIRE_TOTP_SETTING) === true;
+  // True when this user may only reach /v1/portal/* until an authenticator is confirmed.
+  function enrolmentRequired(u) {
+    return Boolean(u) && !u.totp_enabled && TOTP_ENFORCED_ROLES.includes(u.role) && requireTotpForAdmins();
+  }
+
   function publicView(u) {
-    return u ? { id: u.id, email: u.email, role: u.role, reseller_id: u.reseller_id, totp_enabled: !!u.totp_enabled, status: u.status, last_login_at: u.last_login_at, created_at: u.created_at } : null;
+    return u ? { id: u.id, email: u.email, role: u.role, reseller_id: u.reseller_id, totp_enabled: !!u.totp_enabled, totp_enrolled_at: u.totp_enrolled_at || null, totp_enrol_required: enrolmentRequired(u), status: u.status, last_login_at: u.last_login_at, created_at: u.created_at } : null;
+  }
+
+  const totpLocked = (u) => Boolean(u.totp_locked_until && new Date(u.totp_locked_until).getTime() > now());
+
+  // Verifies one code against the live secret (or the pending one during
+  // enrolment). 429 while the budget is exhausted; a wrong code counts, a right
+  // one resets the count.
+  function checkCode(u, code, secretEnc = u.totp_secret_enc) {
+    if (totpLocked(u)) throw Object.assign(new HttpError(429, 'totp_rate_limited', 'Too many wrong codes; wait a few minutes and try again'), { retryAfterS: Math.ceil(TOTP_LOCK_MS / 1000) });
+    if (secretEnc && crypto.totp.verify(code || '', crypto.decrypt(secretEnc))) {
+      stmts.totpOk.run(u.id);
+      return true;
+    }
+    // A lock that has lapsed starts a fresh budget.
+    const failures = (u.totp_locked_until ? 0 : u.totp_failures || 0) + 1;
+    stmts.totpFail.run({ id: u.id, failures, locked: failures >= TOTP_MAX_FAILURES ? nowIso(now() + TOTP_LOCK_MS) : null });
+    return false;
   }
 
   return {
     publicView,
+    enrolmentRequired,
+    requireTotpForAdmins,
+    // Vendor-wide portal policy, read by the admin Security page.
+    settings() {
+      return { require_totp_for_admins: requireTotpForAdmins(), enforced_roles: TOTP_ENFORCED_ROLES };
+    },
+    updateSettings({ require_totp_for_admins }, { by = null } = {}) {
+      if (typeof require_totp_for_admins === 'boolean') setSetting(REQUIRE_TOTP_SETTING, require_totp_for_admins, { by });
+      return this.settings();
+    },
     get(id) {
       const u = stmts.byId.get(id);
       if (!u) throw notFound('Portal user');
@@ -59,7 +116,8 @@ export function createPortalUsersService(ctx) {
       if (reseller_id && role === 'reseller_admin') stmts.linkReseller.run(id, reseller_id);
       return publicView(stmts.byId.get(id));
     },
-    // Password + (when enrolled) TOTP. 10 failures lock the account for 15 min.
+    // Password + (when enrolled) TOTP. 10 failures lock the account for 15 min;
+    // a wrong code also spends the TOTP budget.
     async authenticate({ email, password, totp }) {
       const u = stmts.byEmail.get(String(email).toLowerCase());
       const fail = () => { if (u) stmts.loginFail.run({ id: u.id, locked: u.failed_logins + 1 >= LOCK_AFTER ? nowIso(now() + LOCK_MS) : null }); throw unauthorized('Invalid e-mail, password or code'); };
@@ -69,7 +127,7 @@ export function createPortalUsersService(ctx) {
       if (u.reseller_id) ctx.resellers.assertActive(u.reseller_id);
       if (u.totp_enabled) {
         if (!totp) throw new HttpError(401, 'totp_required', 'Enter your two-factor code');
-        if (!crypto.totp.verify(totp, crypto.decrypt(u.totp_secret_enc))) fail();
+        if (!checkCode(u, totp)) fail();
       }
       stmts.loginOk.run(nowIso(now()), u.id);
       return u;
@@ -77,7 +135,7 @@ export function createPortalUsersService(ctx) {
     verifyTotp(id, code) {
       const u = this.get(id);
       if (!u.totp_enabled) return false;
-      return crypto.totp.verify(code, crypto.decrypt(u.totp_secret_enc));
+      return checkCode(u, code);
     },
     // Enrolment never weakens an enabled account: re-enrolling needs the
     // current code, and the new secret waits in totp_pending_enc until
@@ -87,23 +145,23 @@ export function createPortalUsersService(ctx) {
       const u = this.get(id);
       if (u.totp_enabled) {
         if (!code) throw new HttpError(403, 'totp_required', 'Enter your current two-factor code to re-enrol');
-        if (!crypto.totp.verify(code, crypto.decrypt(u.totp_secret_enc))) throw new HttpError(422, 'totp_invalid', 'Wrong code');
+        if (!checkCode(u, code)) throw new HttpError(422, 'totp_invalid', 'Wrong code');
       }
       const secret = crypto.totp.generateSecret();
       stmts.setPendingTotp.run(crypto.encrypt(secret), id);
-      return { secret, uri: crypto.totp.keyUri(u.email, 'WHM Hub', secret), reenrol: !!u.totp_enabled };
+      return { secret, uri: crypto.totp.keyUri(u.email, ctx.config?.license?.vendor?.name || 'WHM Hub', secret), reenrol: !!u.totp_enabled, required: enrolmentRequired(u) };
     },
     totpConfirm(id, code) {
       const u = this.get(id);
       if (!u.totp_pending_enc) throw new HttpError(409, 'totp_not_enrolled', 'Start enrolment first');
-      if (!crypto.totp.verify(code, crypto.decrypt(u.totp_pending_enc))) throw new HttpError(422, 'totp_invalid', 'Wrong code');
-      stmts.setTotp.run(u.totp_pending_enc, 1, id);
+      if (!checkCode(u, code, u.totp_pending_enc)) throw new HttpError(422, 'totp_invalid', 'Wrong code');
+      stmts.setTotp.run(u.totp_pending_enc, 1, nowIso(now()), id);
       return publicView(stmts.byId.get(id));
     },
     totpDisable(id, code) {
       const u = this.get(id);
-      if (u.totp_enabled && !crypto.totp.verify(code, crypto.decrypt(u.totp_secret_enc))) throw new HttpError(422, 'totp_invalid', 'Wrong code');
-      stmts.setTotp.run(null, 0, id);
+      if (u.totp_enabled && !checkCode(u, code)) throw new HttpError(422, 'totp_invalid', 'Wrong code');
+      stmts.setTotp.run(null, 0, null, id);
       return publicView(stmts.byId.get(id));
     },
     async changePassword(id, { current, next }) {

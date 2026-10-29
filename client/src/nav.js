@@ -1,4 +1,4 @@
-// Single source of truth for the WHM navigation: 31 categories, 215 functions.
+// Single source of truth for the WHM navigation: 31 categories, 216 functions.
 // The sidebar, the Tools grid, the router and the function registry are all
 // derived from this file — never add a route anywhere else.
 
@@ -29,6 +29,7 @@ const CATEGORY_DEFS = [
     ['WHM Marketplace', 'Browse and install add-ons and plugins.', 5],
   ]],
   ['Support', 'LifeBuoy', [
+    ['Account Conversations', 'Chat with the people you manage: one thread per account, visible to the account manager and the account.', 2],
     ['Create Support Ticket', 'Open a support request with a system snapshot.', 5],
     ['Grant cPanel Support Access', 'Time-boxed access for support engineers.', 5],
     ['Support Center', 'Documentation, forums and support resources.', 5],

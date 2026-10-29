@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { AlertTriangle, KeyRound, RefreshCw } from 'lucide-react';
+import { AlertTriangle, KeyRound, Lock, RefreshCw } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
@@ -38,6 +38,27 @@ export function LicenseBanner({ license }) {
         <small>{grace ? 'The panel could not refresh its license token; it keeps working while it retries. ' : 'The panel is read-only until a valid license is active; sites, mail and databases keep running. '}<Link to={license.action || LICENSE_PATH}>Open the License tab</Link></small>
       </div>
     </div>
+  );
+}
+
+// What a root user who is not the panel owner sees: the server answers the
+// restricted view (no hub, key, activation or hub messages), so there is
+// nothing to act on here. The owner is whoever `whm-cli superadmin` named.
+export function OwnerManagedLicenseCard({ license }) {
+  const l = license;
+  return (
+    <Card title="Licensed — managed by the panel owner" subtitle={describeStatus(l)}>
+      <KeyValue items={[
+        ['Status', <StatusPill key="s" status={TONE[l.status] || 'unknown'}>{l.status}</StatusPill>],
+        ['Edition', l.editionLabel || l.edition || '—'],
+        ['License expires', l.lexp ? `${formatDate(l.lexp * 1000)}${l.daysLeft != null ? ` (${l.daysLeft} days)` : ''}` : '—'],
+        ['Last check-in', l.lastCheckinAt ? formatDate(l.lastCheckinAt) : 'never'],
+        ['Enforcement', l.enforce ? 'on' : <span className="muted">off (development)</span>],
+      ]} />
+      <p className="muted" data-testid="license-owner-managed" style={{ marginTop: 10 }}>
+        <Lock size={14} /> The license key, the activation and the vendor connection of this server are only visible to the owner of this panel. Contact the owner to renew, replace or move the license.
+      </p>
+    </Card>
   );
 }
 
@@ -166,9 +187,12 @@ export function TransferModal({ open, activations, onClose, onTransfer, busy }) 
 export default function LicenseTab({ fn }) {
   const toast = useToast();
   const confirm = useConfirm();
-  const { refresh } = useAuth();
+  const { refresh, user } = useAuth();
+  // /me says whether this user is the panel owner; the API answer (`restricted`)
+  // is what decides the rendering, the flag only spares a refused request.
+  const owner = user?.superadmin !== false;
   const { data: license, loading, error, refetch } = useApi('/license');
-  const { data: activations, refetch: refetchActivations } = useApi('/license/activations');
+  const { data: activations, refetch: refetchActivations } = useApi('/license/activations', { enabled: owner });
   const [busy, setBusy] = useState(null);
   const [actionError, setActionError] = useState(null);
   const [transfer, setTransfer] = useState(null);
@@ -204,12 +228,19 @@ export default function LicenseTab({ fn }) {
   const startTrial = (email) => run('trial', () => api.post('/license/trial', { email }), () => 'Trial started');
   const doTransfer = async (a) => { setTransfer(null); await activate(pendingKey ?? undefined, a.id); };
 
+  const restricted = Boolean(license?.restricted);
   return (
     <>
-      <PageHeader fn={fn} title="License" description="Activate, replace or check in the license for this server. The key is entered only here." />
+      <PageHeader fn={fn} title="License" description={restricted ? 'The license of this server is managed by the panel owner.' : 'Activate, replace or check in the license for this server. The key is entered only here.'} />
       {loading && !license && <Loading />}
       <ErrorBanner error={error} onRetry={refetch} />
-      {license && (
+      {license && restricted && (
+        <>
+          <OwnerManagedLicenseCard license={license} />
+          <EntitlementsCard license={license} />
+        </>
+      )}
+      {license && !restricted && (
         <>
           <LicenseStatusCard license={license} onCheckin={checkin} checking={busy === 'checkin'} />
           <ErrorBanner error={actionError} />
