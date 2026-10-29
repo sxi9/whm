@@ -183,6 +183,22 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Current state (update every push)
 
+- **2026-10-29 (session `claude/pensive-curie-9r0rcx`, user AFK — "take all decisions, keep working"):** the user's
+  priorities are (1) application hosting, (2) the 26-item live-server issue list in the session upload, (3) a full
+  audit, then tests. Done so far: Phase-6 verifier run (49 agents) → 11 confirmed findings fixed (`50d0f14`: dump
+  screen sql_mode trap + MariaDB sandbox header, reseller job list in SQL, `totp_guard` persistence via migration
+  001d, advisory unknown ranges, EA4/Remi ids, INI-editor picker) + a fresh-clone gate fix (`/tmp/whm` in
+  `pkg.test.js`, 20 s 2FA test timeout) + SMTP REJECT rule `-p tcp` (iptables-nft), host-aware time zones
+  (`sys.time.zones`, ICU legacy ids mapped), package-index page tab switch; **category 31 Application Manager
+  landed** (`81417ea`, design `docs/design/application-manager.md`, 3 functions → 215, `ctx.apps`, agent family
+  `app.*`, migration 033, two review lenses + fix round; gate server 1201 / agent 547 / client 74 / hub 184 /
+  hub-ui 105, builds, boot, Playwright 216 links). **Running:** platform-fixes workflow (`wf_d0005cdd-38a`, script in
+  the session scratchpad `platform-fixes.workflow.js`: installer profiles + install-from-panel + setup wizard,
+  HTTPS/hostname/branded pages, super admin + hidden hub + hub TOTP, external-auth presets, Cloudflare DNS,
+  account manager + chat, terminal latency, quota page, HST Panel rename). Next: full audit bug-hunt
+  (`full-audit.workflow.js`), final gate, screenshots, HANDOFF rewrite (correction notes in the scratchpad
+  `handoff-notes.md`: op count, 9-step live flow, screenshot commit `5f61846`, deferred-item list).
+
 - **2026-10-25:** Blueprint complete and pushed. **Phase 0 foundation works end to end**
   (`npm install` → `node server/src/index.js` boots, migrates, seeds root; login with forced
   password change; CSRF; RBAC; status/services via real agent ops; packages CRUD; account
