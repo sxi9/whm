@@ -35,6 +35,7 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/etc/aliases',
   '/etc/resolv.conf',
   '/var/cache/whm',
+  '/opt/whm/runtimes',
 ];
 
 export function createContext({ allowedRoots = DEFAULT_ALLOWED_ROOTS, principal = null, log = () => {} } = {}) {

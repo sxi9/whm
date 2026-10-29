@@ -3,13 +3,13 @@
 import {
   Settings, LifeBuoy, Network, Shield, Contact, Users, Server, Languages, Archive, Share2, Power, Activity,
   UserSearch, UserCog, UsersRound, ArrowLeftRight, Palette, Package, Globe, Database, Wifi, Wrench, Mail,
-  HeartPulse, LayoutDashboard, Lock, Store, RotateCw, Code, Puzzle, Circle,
+  HeartPulse, LayoutDashboard, Lock, Store, RotateCw, Code, Puzzle, Rocket, Circle,
 } from 'lucide-react';
 
 export const CATEGORY_ICONS = {
   Settings, LifeBuoy, Network, Shield, Contact, Users, Server, Languages, Archive, Share2, Power, Activity,
   UserSearch, UserCog, UsersRound, ArrowLeftRight, Palette, Package, Globe, Database, Wifi, Wrench, Mail,
-  HeartPulse, LayoutDashboard, Lock, Store, RotateCw, Code, Puzzle,
+  HeartPulse, LayoutDashboard, Lock, Store, RotateCw, Code, Puzzle, Rocket,
 };
 
 export function iconFor(name) {

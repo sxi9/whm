@@ -135,6 +135,7 @@ export function createAccountsService(ctx) {
     const cleanup = {};
     const attempt = async (name, fn) => { try { const r = await fn(); if (r) cleanup[name] = r; } catch (err) { logger.warn({ err, username, step: name }, 'termination cleanup step failed'); cleanup[name] = { error: err.message }; } };
     await attempt('ssl', async () => (ctx.ssl?.removeAccountCerts ? ctx.ssl.removeAccountCerts(id, req) : null));
+    await attempt('apps', async () => (ctx.apps?.removeAccountApps ? ctx.apps.removeAccountApps(username, req) : null));
     await attempt('web', async () => (ctx.web?.removeAccount ? ctx.web.removeAccount(username, req) : null));
     await attempt('databases', async () => (ctx.databases?.removeAccountData ? ctx.databases.removeAccountData(username, req) : null));
     // Every hosted domain leaves Exim's local-domain list on termination (WHM

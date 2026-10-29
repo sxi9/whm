@@ -3,11 +3,11 @@ import { CATEGORIES, FUNCTIONS, FUNCTION_BY_KEY, RESTART_SERVICE_MAP, searchFunc
 import { PAGE_REGISTRY } from '../src/pages/registry.js';
 
 describe('nav.js is the single source of truth', () => {
-  it('lists 30 categories and 212 functions with unique keys and paths', () => {
-    expect(CATEGORIES).toHaveLength(30);
-    expect(FUNCTIONS).toHaveLength(212);
-    expect(new Set(FUNCTIONS.map((f) => f.key)).size).toBe(212);
-    expect(new Set(FUNCTIONS.map((f) => f.path)).size).toBe(212);
+  it('lists 31 categories and 215 functions with unique keys and paths', () => {
+    expect(CATEGORIES).toHaveLength(31);
+    expect(FUNCTIONS).toHaveLength(215);
+    expect(new Set(FUNCTIONS.map((f) => f.key)).size).toBe(215);
+    expect(new Set(FUNCTIONS.map((f) => f.path)).size).toBe(215);
     for (const f of FUNCTIONS) expect(f.path).toBe(`/${f.key}`);
   });
 
@@ -32,7 +32,7 @@ describe('nav.js is the single source of truth', () => {
   it('searches across label, category and description', () => {
     expect(searchFunctions('restart apache').map((f) => f.key)).toContain('restart-services/http-server-apache');
     expect(searchFunctions('zone').some((f) => f.categorySlug === 'dns-functions')).toBe(true);
-    expect(searchFunctions('')).toHaveLength(212);
+    expect(searchFunctions('')).toHaveLength(215);
     expect(searchFunctions('no-such-function-xyz')).toHaveLength(0);
   });
 });

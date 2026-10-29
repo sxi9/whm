@@ -117,6 +117,7 @@ describe('pkg op schemas reject injection before anything runs', () => {
 // /tmp/whm is an allowed root, so these exercise the real filesystem checks the
 // way a hostile account would see them.
 describe('.user.ini ops never follow links planted in an account docroot', () => {
+  fs.mkdirSync('/tmp/whm', { recursive: true, mode: 0o700 });
   const base = fs.mkdtempSync('/tmp/whm/pkg-userini-');
   afterAll(() => fs.rmSync(base, { recursive: true, force: true }));
 

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import http from 'node:http';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { PROFILES, isValidTimezone, createTextDecoder } from '../src/services/server-configuration.js';
+import { PROFILES, isValidTimezone, timezoneForHost, createTextDecoder } from '../src/services/server-configuration.js';
 
 const TERM_ID = 'a'.repeat(32);
 const QUOTA_FS = { device: '/dev/vda1', mountpoint: '/', fstype: 'ext4', mountOptions: ['rw', 'relatime'], supported: true, userQuotaMounted: false, groupQuotaMounted: false, ext4QuotaFeature: false, quotaFiles: { user: false, group: false }, active: { user: null, group: null }, fstab: { lineNo: 2, line: '/dev/vda1 / ext4 defaults 0 1', options: ['defaults'], hasUserQuota: false, hasGroupQuota: false }, proposedFstabLine: '/dev/vda1\t/\text4\tusrquota,grpquota\t0\t1', rebootRequired: false };
@@ -12,6 +12,16 @@ describe('server-configuration helpers', () => {
     expect(isValidTimezone('Europe/London')).toBe(true);
     expect(isValidTimezone('UTC')).toBe(true);
     expect(isValidTimezone('Mars/Olympus')).toBe(false);
+  });
+
+  it('accepts ICU legacy ids against a host list that only has the current names', () => {
+    const host = new Set(['Asia/Kolkata', 'Europe/Kyiv', 'UTC']);
+    expect(isValidTimezone('Asia/Calcutta', host)).toBe(true);
+    expect(isValidTimezone('Europe/Kiev', host)).toBe(true);
+    expect(isValidTimezone('Europe/Berlin', host)).toBe(false);
+    expect(timezoneForHost('Asia/Calcutta', host)).toBe('Asia/Kolkata');
+    expect(timezoneForHost('Asia/Kolkata', host)).toBe('Asia/Kolkata');
+    expect(timezoneForHost('Europe/Berlin')).toBe('Europe/Berlin');
   });
 
   it('decodes multi-byte output split across chunks', () => {
@@ -179,6 +189,19 @@ describe('Server Configuration API', () => {
       expect(app.agent.callsTo('sys.time.set').pop().args).toEqual({ timezone: 'Europe/Berlin', ntp: false });
       expect(body.data.timedatectl).toBe(true);
       expect(auditCount('server_config.time.set')).toBe(1);
+    });
+
+    it('offers the host zone list and hands timedatectl the current name of an ICU legacy id', async () => {
+      await provision({ timedatectl: true });
+      app.agent.set('sys.time.zones', () => ({ zones: ['Asia/Kolkata', 'Europe/Berlin', 'Etc/UTC'] }));
+      const { body } = await get('/time').expect(200);
+      expect(body.data.timezoneSource).toBe('host');
+      expect(body.data.timezones).toContain('Asia/Kolkata');
+      expect(body.data.timezones).not.toContain('Asia/Calcutta');
+      await put('/time', { timezone: 'Asia/Calcutta' }).expect(200);
+      expect(app.agent.callsTo('sys.time.set').pop().args).toEqual({ timezone: 'Asia/Kolkata' });
+      await put('/time', { timezone: 'Europe/London' }).expect(422);
+      expect(app.agent.callsTo('sys.time.set').pop().args).toEqual({ timezone: 'Asia/Kolkata' });
     });
   });
 

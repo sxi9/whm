@@ -67,7 +67,30 @@ const TIMEZONES = new Set(typeof Intl.supportedValuesOf === 'function' ? Intl.su
 TIMEZONES.add('UTC');
 TIMEZONES.add('Etc/UTC');
 
-export const isValidTimezone = (tz) => TIMEZONES.has(tz);
+// ICU keeps a few pre-1993 names as its canonical ids; tzdata ships them only as
+// "backward" links, which Ubuntu 24.04 moved into tzdata-legacy. timedatectl then
+// rejects e.g. Asia/Calcutta, so the panel sets the current IANA name instead.
+export const LEGACY_TIMEZONES = {
+  'Africa/Asmera': 'Africa/Asmara', 'America/Buenos_Aires': 'America/Argentina/Buenos_Aires', 'America/Catamarca': 'America/Argentina/Catamarca',
+  'America/Cordoba': 'America/Argentina/Cordoba', 'America/Fort_Wayne': 'America/Indiana/Indianapolis', 'America/Godthab': 'America/Nuuk',
+  'America/Indianapolis': 'America/Indiana/Indianapolis', 'America/Jujuy': 'America/Argentina/Jujuy', 'America/Louisville': 'America/Kentucky/Louisville',
+  'America/Mendoza': 'America/Argentina/Mendoza', 'Asia/Ashkhabad': 'Asia/Ashgabat', 'Asia/Calcutta': 'Asia/Kolkata', 'Asia/Chongqing': 'Asia/Shanghai',
+  'Asia/Dacca': 'Asia/Dhaka', 'Asia/Harbin': 'Asia/Shanghai', 'Asia/Kashgar': 'Asia/Urumqi', 'Asia/Katmandu': 'Asia/Kathmandu', 'Asia/Macao': 'Asia/Macau',
+  'Asia/Rangoon': 'Asia/Yangon', 'Asia/Saigon': 'Asia/Ho_Chi_Minh', 'Asia/Thimbu': 'Asia/Thimphu', 'Asia/Ujung_Pandang': 'Asia/Makassar',
+  'Asia/Ulan_Bator': 'Asia/Ulaanbaatar', 'Atlantic/Faeroe': 'Atlantic/Faroe', 'Europe/Kiev': 'Europe/Kyiv', 'Europe/Uzhgorod': 'Europe/Kyiv',
+  'Europe/Zaporozhye': 'Europe/Kyiv', 'Pacific/Enderbury': 'Pacific/Kanton', 'Pacific/Johnston': 'Pacific/Honolulu', 'Pacific/Ponape': 'Pacific/Pohnpei',
+  'Pacific/Truk': 'Pacific/Chuuk',
+};
+export const canonicalTimezone = (tz) => LEGACY_TIMEZONES[tz] || tz;
+// With the host's own list (timedatectl list-timezones) a zone is valid when the
+// host knows it or its current name; without it the ICU list decides.
+export const isValidTimezone = (tz, hostZones = null) => {
+  const known = hostZones || TIMEZONES;
+  return known.has(tz) || known.has(canonicalTimezone(tz));
+};
+// The name to hand to timedatectl: the requested one when the host accepts it,
+// otherwise its current IANA name.
+export const timezoneForHost = (tz, hostZones = null) => ((hostZones || TIMEZONES).has(tz) ? tz : canonicalTimezone(tz));
 
 // Decodes the terminal's byte stream into text without splitting multi-byte
 // characters across two SSE events.
@@ -169,6 +192,18 @@ export function createServerConfigService(ctx) {
 
   // --- Server Time -----------------------------------------------------------
   const NTP_UNITS = ['systemd-timesyncd', 'chronyd', 'chrony', 'ntpd', 'ntp', 'ntpsec'];
+  let hostZones = { at: 0, zones: null };
+  async function timezonesOnHost() {
+    if (hostZones.zones && Date.now() - hostZones.at < 3_600_000) return hostZones.zones;
+    let zones = null;
+    try {
+      const r = await agent.op('sys.time.zones');
+      const list = Array.isArray(r?.zones) ? r.zones.filter((z) => typeof z === 'string' && /^[A-Za-z_]+(\/[A-Za-z0-9_+-]+){0,2}$/.test(z)) : [];
+      if (list.length) zones = new Set([...list, 'UTC']);
+    } catch (err) { logger.warn({ err }, 'timedatectl list-timezones failed; using the ICU list'); }
+    hostZones = { at: Date.now(), zones };
+    return zones;
+  }
   const time = {
     async get() {
       await capabilities.ensureFresh();
@@ -178,14 +213,17 @@ export function createServerConfigService(ctx) {
         const { unit } = await agent.op('svc.resolve', { candidates: NTP_UNITS });
         if (unit) { const st = await agent.op('svc.status', { unit }); ntpService = { unit, active: st.active, state: st.state, enabled: st.enabled }; }
       } catch (err) { logger.warn({ err }, 'ntp unit lookup failed'); }
-      return { ...state, ntpService, timedatectl: capabilities.has('timedatectl'), timezones: [...TIMEZONES].sort(), serverEpochMs: Date.now() };
+      const zones = (await timezonesOnHost()) || TIMEZONES;
+      return { ...state, ntpService, timedatectl: capabilities.has('timedatectl'), timezones: [...zones].sort(), timezoneSource: zones === TIMEZONES ? 'icu' : 'host', serverEpochMs: Date.now() };
     },
     async set({ timezone, ntp }, req) {
-      if (timezone !== undefined && !isValidTimezone(timezone)) throw unprocessable('Unknown timezone', { timezone: ['Must be an IANA timezone such as Europe/London'] });
+      const zones = await timezonesOnHost();
+      if (timezone !== undefined && !isValidTimezone(timezone, zones)) throw unprocessable('Unknown timezone', { timezone: ['Must be an IANA timezone such as Europe/London'] });
+      const effective = timezone !== undefined ? timezoneForHost(timezone, zones) : undefined;
       await capabilities.ensureFresh();
       capabilities.require('timedatectl', 'timedatectl (systemd) is required to change the timezone or NTP synchronisation');
-      const result = await agent.op('sys.time.set', { ...(timezone !== undefined ? { timezone } : {}), ...(ntp !== undefined ? { ntp } : {}) }, { req });
-      audit(req, { action: 'server_config.time.set', args: { timezone, ntp } });
+      const result = await agent.op('sys.time.set', { ...(effective !== undefined ? { timezone: effective } : {}), ...(ntp !== undefined ? { ntp } : {}) }, { req });
+      audit(req, { action: 'server_config.time.set', args: { timezone: effective, requested: timezone, ntp } });
       return { ...result, ...(await time.get()) };
     },
   };

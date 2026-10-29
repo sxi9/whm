@@ -50,7 +50,7 @@ export default function InstallDistroPackages({ fn }) {
       <RequestError error={detect.error} onRetry={detect.refetch} />
       {detect.data && !detect.data.capability && <div className="banner banner-warning"><div><strong>No supported package manager</strong><p>This host has neither apt-get nor dnf/yum; package management is unavailable.</p></div></div>}
       <RebootBanner required={detect.data?.rebootRequired} />
-      <Card title="Packages" actions={<Button onClick={() => runner.start(() => api.post('/software/pkg/update-index'), 'Refresh package index')} loading={runner.busy}>Refresh package index</Button>}>
+      <Card title="Packages" actions={<Button onClick={() => runner.start(() => api.post('/software/pkg/update-index'), 'Refresh package index').then((d) => { if (d) setTab('installed'); })} loading={runner.busy}>Refresh package index</Button>}>
         <Tabs value={tab} onChange={setTab} tabs={[{ value: 'search', label: 'Search repositories' }, { value: 'installed', label: 'Installed packages', count: installed.meta?.installedTotal }, { value: 'history', label: 'History', count: recent.data?.length }]} />
         {tab === 'search' && (
           <>

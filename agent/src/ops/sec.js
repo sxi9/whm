@@ -829,7 +829,10 @@ async function iptablesSmtpApply(bin, groups) {
   await exec(bin, ['-A', SMTP_CHAIN, '-o', 'lo', '-j', 'ACCEPT']);
   await exec(bin, ['-A', SMTP_CHAIN, '-m', 'owner', '--uid-owner', '0', '-j', 'ACCEPT']);
   for (const g of groups) await exec(bin, ['-A', SMTP_CHAIN, '-m', 'owner', '--gid-owner', String(g.gid), '-j', 'ACCEPT']);
-  await exec(bin, ['-A', SMTP_CHAIN, '-j', 'REJECT', '--reject-with', 'tcp-reset']);
+  // iptables-nft refuses "--reject-with tcp-reset" unless the rule itself
+  // matches tcp (RULE_APPEND failed: Invalid argument), even inside a chain
+  // that is only reached for tcp/25.
+  await exec(bin, ['-A', SMTP_CHAIN, '-p', 'tcp', '-j', 'REJECT', '--reject-with', 'tcp-reset']);
 }
 
 defineOp('sec.smtp_restrict.set', {

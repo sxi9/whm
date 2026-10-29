@@ -416,6 +416,9 @@ function vhostBlock(v, { ssl, port }) {
     // PHP applications using HTTP Basic auth get it on both vhosts.
     lines.push('  <IfModule proxy_fcgi_module>', '    SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1', '    <FilesMatch "\\.ph(ar|p|tml)$">', `      SetHandler "proxy:unix:${phpSocket(v.phpVersion, v.user)}|fcgi://localhost"`, '    </FilesMatch>', '  </IfModule>');
   }
+  // Application Manager drops per-domain proxy/static blocks into
+  // <apache root>/whm-apps/<domain>.conf; the vhost itself never changes.
+  lines.push(`  IncludeOptional ${q(`${v.appsDir || path.join(apacheLayout()?.root || '/etc/apache2', 'whm-apps')}/${v.domain}.conf`)}`);
   if (ssl) {
     lines.push('  SSLEngine on');
     if (v.ssl.fullchain) lines.push(`  SSLCertificateFile ${q(v.ssl.fullchain)}`);
@@ -707,7 +710,7 @@ defineOp('web.vhost.write', {
     if (link) ctx.assertAllowedPath(link, 'write');
     ensureRootLogDir(logDir, passwdEntry(v.user)?.gid);
     if (v.ssl) { for (const f of [v.ssl.cert, v.ssl.key]) if (!exists(f)) throw new OpError('not_found', `Certificate file ${f} does not exist`); }
-    const content = renderVhost({ ...v, logDir });
+    const content = renderVhost({ ...v, logDir, appsDir: path.join(apache.root, 'whm-apps') });
     const written = await writeApacheFile(apache, file, content, { link });
     const reload = v.reload ? await reloadUnit(apache.units) : { reloaded: false, unit: null };
     return { domain: v.domain, ...written, link, logDir, bytes: Buffer.byteLength(content), ssl: Boolean(v.ssl && v.sslPort), bind: v.bind ?? null, phpVersion: v.phpVersion ?? null, ...reload };

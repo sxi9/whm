@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import request from 'supertest';
 import { authenticator } from 'otplib';
 import { createTestApp } from './support/app.js';
@@ -7,6 +7,9 @@ import { acceptedRequestId, isStreamRequest } from '../src/app.js';
 // Phase 6 hardening of the web platform: headers on a plain-HTTP panel,
 // limiter/log matching on the path only, raw upload bodies in the audit log,
 // and brute-force protection on the second factor.
+// The second-factor tests hash passwords and walk six login rounds; under a
+// loaded full-suite run that passes vitest's 5 s default.
+vi.setConfig({ testTimeout: 20_000 });
 let app;
 const PASSWORD = 'Test-Passw0rd!1';
 beforeAll(async () => { app = await createTestApp(); });

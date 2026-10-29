@@ -219,6 +219,11 @@ const CATEGORY_DEFS = [
     ['Update Server Software', 'Update the control panel.', 5],
     ['EasyApache 4', 'Build Apache and PHP profiles.', 5],
   ]],
+  ['Application Manager', 'Rocket', [
+    ['Application Manager', 'Node.js, Python and built frontend (React, Angular, Vue…) applications per domain: deploy, build, run, proxy and logs.', 2],
+    ['Runtime Versions', 'Node.js and Python runtimes available to applications; install and remove managed Node.js versions.', 2],
+    ['Application Templates', 'Framework presets (Express, NestJS, Next.js, React, Angular, Vue, Flask, Django, FastAPI…) and custom templates for new applications.', 2],
+  ]],
   ['Email', 'Mail', [
     ['Email Deliverability', 'SPF, DKIM and reverse DNS health per domain.', 3],
     ['Filter Incoming Emails by Country', 'Country-based mail filtering.', 3],

@@ -172,6 +172,17 @@ defineOp('sys.time.get', {
   },
 });
 
+// The names timedatectl accepts come from the host's tzdata, which may lack the
+// pre-1993 aliases ICU still reports (Ubuntu 24.04 ships them in tzdata-legacy).
+defineOp('sys.time.zones', {
+  description: 'Time zone names timedatectl accepts on this host',
+  run: async () => {
+    if (!hasBinary('timedatectl')) return { zones: [] };
+    const { stdout } = await exec('timedatectl', ['list-timezones', '--no-pager'], { allowFailure: true, maxBuffer: 4 * 1024 * 1024 });
+    return { zones: stdout.split('\n').map((l) => l.trim()).filter((l) => /^[A-Za-z_]+(\/[A-Za-z0-9_+-]+){0,2}$/.test(l)) };
+  },
+});
+
 defineOp('sys.time.set', {
   description: 'Set timezone and NTP synchronisation',
   schema: z.object({
