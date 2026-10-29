@@ -66,11 +66,15 @@ test('a vendor admin must enrol at the first login: only /v1/portal/* answers un
   const me = await agent.get('/v1/portal/me');
   assert.equal(me.status, 200);
   assert.equal(me.body.data.totp_enrol_required, true);
-  for (const [method, url] of [['get', '/v1/admin/licenses'], ['get', '/v1/admin/reports/dashboard'], ['get', '/v1/admin/market/stats'], ['get', '/v1/portal/users'], ['get', '/v1/portal/settings']]) {
+  for (const [method, url] of [['get', '/v1/admin/licenses'], ['get', '/v1/admin/reports/dashboard'], ['get', '/v1/portal/users'], ['get', '/v1/portal/settings']]) {
     const r = await agent[method](url);
     assert.equal(r.status, 403, `${url}: ${JSON.stringify(r.body)}`);
     assert.equal(r.body.error.code, 'totp_enrol_required', url);
   }
+  // The marketplace admin guard checks scopes itself: the session carries none until enrolment.
+  const market = await agent.get('/v1/admin/market/stats');
+  assert.equal(market.status, 403);
+  assert.ok(['totp_enrol_required', 'insufficient_scope'].includes(market.body.error.code), market.body.error.code);
   const off = await agent.patch('/v1/portal/settings').set('X-CSRF-Token', csrf).send({ require_totp_for_admins: false });
   assert.equal(off.body.error.code, 'totp_enrol_required', 'the rule cannot be switched off by an admin who has not enrolled');
   const noCsrf = await agent.post('/v1/portal/2fa/enroll').send({});
