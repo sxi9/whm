@@ -7,9 +7,9 @@ import { q, parseBatch, parseGrant, parseMysqlcheck, parseCnf, renderCnf, render
 // that would talk to a server must stop at capability_missing or invalid_args.
 vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
-  return { ...mod, exec: vi.fn(mod.exec) };
+  return { ...mod, exec: vi.fn(mod.exec), hasBinary: vi.fn(mod.hasBinary) };
 });
-const { exec } = await import('../src/exec.js');
+const { exec, hasBinary } = await import('../src/exec.js');
 
 const ctx = createContext();
 const noMysql = !detectEngine().installed;
@@ -381,5 +381,25 @@ describe('SQL quoting and parsers', () => {
     expect(PRIVILEGES).toContain('ALL PRIVILEGES');
     expect(PRIVILEGES).not.toContain('SUPER');
     expect(PRIVILEGES).not.toContain('FILE');
+  });
+});
+
+describe('db.grants.list', () => {
+  it('returns parsed grants only, never the SHOW GRANTS text that carries the MariaDB password hash', async () => {
+    const actual = await vi.importActual('../src/exec.js');
+    hasBinary.mockImplementation((name) => name === 'mysql' || actual.hasBinary(name));
+    exec.mockClear();
+    const lines = ["GRANT USAGE ON *.* TO `app`@`localhost` IDENTIFIED BY PASSWORD '*94BDCEBE19083CE2A1F959FD02F964C7AF4CFC29'", 'GRANT ALL PRIVILEGES ON `shop`.* TO `app`@`localhost`', 'GRANT SELECT, INSERT ON `blog`.* TO `app`@`localhost`'];
+    exec.mockImplementation(async (bin, argv, opts) => ({ code: 0, stdout: `${lines.join('\n')}\n`, stderr: '', bin, argv, opts }));
+    try {
+      const result = await runOp('db.grants.list', { user: 'app' }, ctx);
+      expect(result).toEqual({ user: 'app', host: 'localhost', grants: [{ privileges: ['ALL PRIVILEGES'], database: 'shop', table: '*' }, { privileges: ['SELECT', 'INSERT'], database: 'blog', table: '*' }] });
+      expect(JSON.stringify(result)).not.toMatch(/94BDCEBE|IDENTIFIED|"raw"/);
+      expect(exec).toHaveBeenCalledTimes(1);
+      const [bin, argv, opts] = exec.mock.calls[0];
+      expect(bin).toBe('mysql');
+      expect(argv).toContain('--skip-column-names');
+      expect(opts.input).toMatch(/^SHOW GRANTS FOR .*app.*localhost/);
+    } finally { hasBinary.mockImplementation(actual.hasBinary); exec.mockImplementation(actual.exec); }
   });
 });

@@ -8,12 +8,35 @@ import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { Tabs, RequestError } from '../../security/Shared.jsx';
 
+const baseName = (file) => String(file || '').split('/').pop();
+
+// Each hit names the error log it was parsed from: the global Apache log
+// (user and domain null) or one account vhost's log under the domlogs root.
+export function hitLogLabel(hit) {
+  if (hit.domain) return hit.domain;
+  if (hit.user) return hit.user;
+  return hit.log ? 'server' : '';
+}
+
+export function hitsSubtitle(data) {
+  if (!data) return undefined;
+  const files = data.files || [];
+  const unreadable = files.filter((f) => !f.readable).length;
+  const parts = [`Parsed from ${data.file}`];
+  if (!data.available) parts.push('log not readable');
+  else if (unreadable) parts.push(`${unreadable} of ${files.length} logs not readable`);
+  if (data.truncated) parts.push('more vhost logs exist than were scanned');
+  return parts.join(' · ');
+}
+
 function Hits({ onDisable }) {
   const { data, loading, error, refetch } = useApi('/security/modsec/hits?limit=500', { refreshMs: 30_000 });
+  const files = data?.files || [];
   return (
-    <Card title="Recent hits" subtitle={data ? `Parsed from ${data.file}${data.available ? '' : ' (log not readable)'}` : undefined} padded={false} actions={<button className="btn btn-sm" onClick={() => refetch()}>Refresh</button>}>
+    <Card title="Recent hits" subtitle={hitsSubtitle(data)} padded={false} actions={<button className="btn btn-sm" onClick={() => refetch()}>Refresh</button>}>
       <DataTable dense columns={[
         { key: 'ts', label: 'Time' },
+        { key: 'log', label: 'Log', render: (h) => <><div>{hitLogLabel(h)}</div>{h.log && <small className="muted"><code title={h.log}>{baseName(h.log)}</code></small>}</> },
         { key: 'client', label: 'Client', render: (h) => <code>{h.client}</code> },
         { key: 'hostname', label: 'Host' },
         { key: 'uri', label: 'URI', render: (h) => <code className="small">{h.uri}</code> },
@@ -23,6 +46,28 @@ function Hits({ onDisable }) {
         { key: 'action', label: 'Action' },
       ]} rows={data?.hits || []} loading={loading} error={error} rowKey={(h) => `${h.uniqueId || h.ts}-${h.id}-${h.client}`} emptyText="No ModSecurity events in the error log tail."
         rowActions={(h) => (h.id ? [{ label: 'Disable rule', primary: true, onClick: () => onDisable(h.id) }] : [])} />
+      {files.length > 0 && (
+        <div className="card-body">
+          <details>
+            <summary>Logs scanned ({files.length})</summary>
+            <div className="table-wrap">
+              <table className="dense">
+                <thead><tr><th>Log file</th><th>Account</th><th>Domain</th><th>Readable</th></tr></thead>
+                <tbody>
+                  {files.map((f) => (
+                    <tr key={f.file}>
+                      <td><code className="small">{f.file}</code></td>
+                      <td>{f.user || <span className="muted">server</span>}</td>
+                      <td>{f.domain || <span className="muted">—</span>}</td>
+                      <td><StatusPill status={f.readable ? 'ok' : 'failed'}>{f.readable ? 'yes' : 'no'}</StatusPill></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        </div>
+      )}
     </Card>
   );
 }

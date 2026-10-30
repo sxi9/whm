@@ -36,6 +36,10 @@ export function createJobs({ db, logger, agent, concurrency = 2 }) {
   }
 
   async function run(jobId) {
+    // Yield once so a handler that throws synchronously cannot reach the
+    // `finally` below before tick() has recorded this run in `running`
+    // (otherwise the slot would never be released).
+    await Promise.resolve();
     const row = stmts.get.get(jobId);
     if (!row) return;
     const handler = handlers.get(row.type);

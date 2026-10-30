@@ -104,6 +104,21 @@ In both modes the ops, their argument schemas and the allowed path roots are ide
   does not check for a minimum free space.
 - **Outbound HTTPS** from the installer host to NodeSource (Node install) and the npm registry
   (`npm ci`), and from panels to their hub.
+- **AlmaLinux / Rocky / RHEL with SELinux.** Apache and PHP-FPM run confined as `httpd_t`, which by
+  default may neither search `/home/<user>` nor write a docroot, `tmp` or `logs` tree under it: without
+  the policy below every hosted site answers **403** and PHP cannot save sessions or uploads. The
+  installer (RHEL branch, when `getenforce` reports *Enforcing* or *Permissive*) installs
+  `policycoreutils-python-utils` (`semanage`), turns on `httpd_enable_homedirs`,
+  `httpd_read_user_content`, `httpd_can_network_connect` and `httpd_can_sendmail` (`setsebool -P`, only
+  the ones that are off), adds the file contexts `/home/[^/]+/public_html(/.*)?`,
+  `/home/[^/]+/tmp(/.*)?` and `/home/[^/]+/logs(/.*)?` → `httpd_sys_rw_content_t` and
+  `/var/log/whm/domlogs(/.*)?` → `httpd_log_t` (`semanage fcontext -a -t …`), and runs
+  `restorecon -R /home /var/log/whm` so pre-existing accounts are labelled too. The agent applies the
+  same booleans and rules on every vhost and PHP-FPM pool write (`ensureSelinuxWebAccess` in
+  `agent/src/ops/web.js`; the vhost result carries `selinux`), labels a changed SSH port
+  (`semanage port -a -t ssh_port_t -p tcp <port>`, *SSH Password Authorization Tweak*) and reports the
+  mode in `web.detect().selinux`. Without `semanage` the labels are set with `chcon` and do not survive
+  a relabel (the result says so). Nothing is touched when SELinux is disabled or on the Debian family.
 
 ### 2.2 Ports
 
@@ -152,6 +167,18 @@ required })`); the registry is refreshed after the agent self-check (`capabiliti
 Other functions check for their binary at call time: `agent/src/exec.js` resolves a program name
 in `/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin` and rejects with
 `binary_not_found` when it is absent.
+
+**Quotas on an XFS root filesystem** (the AlmaLinux/Rocky 9 default layout: `/` on XFS with `/home`
+inside it) need a kernel argument, not just `/etc/fstab`: the initramfs mounts `/` from the kernel
+command line before fstab is read, and XFS takes quota options only at mount time, so `usrquota` in
+fstab alone never enables them. *Server Configuration › Initial Quota Setup › Update fstab and enable*
+therefore also puts `rootflags=uquota` (plus `gquota` with group quotas, merged with the flags already
+present) on the kernel arguments — `grubby --update-kernel=ALL --args=rootflags=…` on the RHEL family,
+`GRUB_CMDLINE_LINUX` in `/etc/default/grub` followed by `update-grub`/`grub2-mkconfig` elsewhere (backup
+`/etc/default/grub.whm-bak`) — and reports `kernel_args_required` until the boot loader passes the flag,
+then `reboot_required` until the next boot (`agent/src/ops/quota.js`). Putting `/home` on its own
+filesystem (ext4, or XFS mounted from fstab with `uquota`) avoids the reboot. Until quotas are active,
+account creation records the package's disk limit as *pending* instead of failing.
 
 **When a daemon is absent** nothing crashes: the agent answers `capability_missing` or
 `binary_not_found`, `server/src/middleware/error.js` maps both to **HTTP 501**, and the page shows an
@@ -314,10 +341,15 @@ Node major version 22.
     `WHM_LICENSE_HUB_CA=/etc/whm/hub-ca.pem` is appended to `panel.env` so the same-host panel trusts it.
 12. **Hosting stack** – `--stack`/`--components`, `WHM_STACK`/`WHM_STACK_COMPONENTS`, or the menu on a
     terminal ([§4.1](#41-flags)); nothing on a non-interactive run or `--upgrade` without the flag.
-13. **Units** – writes `/etc/systemd/system/whm-agentd.service` and `whm-panel.service` from
+13. **SELinux** (RHEL family only, when `getenforce` reports Enforcing or Permissive; also on `--upgrade`) –
+    installs `policycoreutils-python-utils` if `semanage` is missing, sets the `httpd_*` booleans, adds the
+    `/home/[^/]+/{public_html,tmp,logs}` and `/var/log/whm/domlogs` file contexts and runs
+    `restorecon -R /home /var/log/whm` ([§2.1](#21-operating-system-and-tools)). Failures are logged,
+    never fatal: the agent repeats the same steps on the first vhost write.
+14. **Units** – writes `/etc/systemd/system/whm-agentd.service` and `whm-panel.service` from
     `deploy/`, substituting the node binary, `/opt/whm` and `/var/lib/whm`; `systemctl daemon-reload`,
     `enable whm-agentd whm-panel`, `restart whm-agentd`, then `restart whm-panel`.
-14. **Summary** – after 2 s, if `whm-panel` is active: prints the URL, the login, the password (from
+15. **Summary** – after 2 s, if `whm-panel` is active: prints the URL, the login, the password (from
     `initial-admin-password.txt` or "the WHM_ADMIN_PASSWORD you set"), log, firewall, TLS and stack
     lines, the configured hub and the super admin command. Otherwise `whm-panel failed to start; see:
     journalctl -u whm-panel -n 50`.
@@ -472,6 +504,19 @@ sudo HUB_PUBLIC_URL=https://hub.example.com:7443 HUB_ADMIN_EMAIL=you@example.com
 The summary prints the hub URL, config/key/data locations, the firewall rule (`allow TCP 7443`,
 never 7440), the generated **license** key as a ready-to-pin JSON entry, the plugin key kid, the
 portal admin credentials (or the `create-admin` command) and the `issue` command for a first license.
+
+**Outbound mail.** The hub sends verification, reset, license and trial mails over **SMTP to
+`127.0.0.1:25`** by default (`license.mail.transport: "smtp"`, [§5.6](#56-hubconf-reference)), so the
+hub host needs an MTA listening on loopback (Exim or Postfix — the panel's *Full* stack installs
+Exim) or `license.mail.smtp.*` pointed at a remote submission service (`host`, `port` 587/465,
+`user`/`pass` via `WHM_HUB_SMTP_USER`/`WHM_HUB_SMTP_PASS` in `hub.env`, `starttls: "require"`). The
+`sendmail` transport is not usable under `whm-hub.service`: the unit runs with `NoNewPrivileges=yes`,
+which makes the kernel ignore the setuid/setgid bit on `sendmail`, so Exim's or Postfix's wrapper can
+not write its spool and every submission fails with `EACCES`; the hub detects `NoNewPrivs` at boot,
+logs `sendmail transport cannot deliver` and reports it on `/healthz` (`data.mail`). The configured
+transport is probed at boot (connect/EHLO/QUIT for SMTP) — `journalctl -u whm-hub` shows `mail
+transport verified` or `mail transport check failed`; a hub without any MTA sets `"transport": "none"`
+(messages are recorded, not sent).
 
 Validate an installed configuration at any time:
 
@@ -660,9 +705,15 @@ environment (deep-merged on top) → defaults. An invalid file aborts with
 | `license.lookup_block` | `{ "failures": 20, "windowMs": 3600000, "blockMs": 86400000 }` | Failed key lookups per IP before a block. |
 | `license.backup_dir` | `/var/backups/whm-hub` | Hourly `license.db` backup target; `null` disables. |
 | `license.backup_keep` | `48` | Backups kept. |
-| `license.mail.from` | `whm-hub@localhost` | Sender. |
+| `license.mail.from` | `whm-hub@localhost` | Sender (envelope and `From:`). |
 | `license.mail.enabled` | `true` | Outbound mail on/off. |
-| `license.mail.transport` | `sendmail` | `sendmail` or `none` (records only). |
+| `license.mail.transport` | `smtp` | `smtp` (SMTP submission to `license.mail.smtp.*`; the only transport that delivers under the unit's `NoNewPrivileges=yes`), `sendmail` (`sendmail -t -i` found on PATH — unhardened deployments only: with no_new_privs the setuid/setgid MTA wrapper cannot reach its spool, the hub logs `sendmail transport cannot deliver` at boot, `/healthz` `data.mail.ok` is false and every message is lost) or `none` (records only; use it for a hub without an MTA). The transport is probed at boot (`mail transport verified` / `mail transport check failed`). |
+| `license.mail.smtp.host` / `.port` | `127.0.0.1` / `25` | MTA or submission service (`587` for submission, `465` with `secure`). |
+| `license.mail.smtp.secure` | `false` | Implicit TLS from the first byte. |
+| `license.mail.smtp.starttls` | `auto` | `auto` (upgrade when the server offers STARTTLS), `require` (fail when it does not), `off`. TLS 1.2 or newer. |
+| `license.mail.smtp.user` / `.pass` | *(unset)* | AUTH PLAIN or LOGIN. Credentials are sent only over TLS or to the loopback interface (a plaintext remote server is refused); prefer `hub.env` (`WHM_HUB_SMTP_USER`/`PASS`). |
+| `license.mail.smtp.reject_unauthorized` / `.ca_file` | `true` / *(unset)* | Certificate verification and an extra CA bundle (PEM). |
+| `license.mail.smtp.timeout_ms` | `20000` | Per-connection timeout (min 1000). |
 | `license.billing.stripe.secret`, `.whmcs.secret`, `.paddle.secret` | *(unset)* | Inbound webhook secrets — prefer `hub.env`. |
 | `license.rate_limits.<group>` | `activate` 10/h, `checkin` 12/h, `trial` 3/24 h, `recover` 3/h, `reseller` 600/h, `admin` 1200/h, `portal_login` 10/15 min, `public` 600/h | `{ "max", "windowMs" }` per route group (windowMs ≥ 1000). |
 | `license.vendor.name` | `WHM Vendor` | Shown in mails and panel messages. |
@@ -706,8 +757,9 @@ WHM_HUB_LOG_LEVEL=info
 # WHM_HUB_PADDLE_SECRET=
 ```
 
-Billing webhook secrets belong here, not in `hub.conf`. Any `WHM_HUB_*` key from
-[§7.3](#73-hub-whm_hub_-variables) can be added; `hub.env` overrides `hub.conf`. The GitHub OAuth client
+Billing webhook secrets and SMTP credentials (`WHM_HUB_SMTP_USER`, `WHM_HUB_SMTP_PASS`, with the
+host/port and `starttls: "require"` in `hub.conf` `license.mail.smtp`) belong here, not in `hub.conf`.
+Any `WHM_HUB_*` key from [§7.3](#73-hub-whm_hub_-variables) can be added; `hub.env` overrides `hub.conf`. The GitHub OAuth client
 secret is the exception: it goes into `hub.conf` as `marketplace.github_oauth.client_secret` (or
 `client_secret_enc`, pre-encrypted with the master key). Secrets at rest: `master.key` (`0600 whmhub`)
 and `keys/*` (`0600`, directory `0700`). `--upgrade` never rewrites `hub.env`, `hub.conf`, keys or
@@ -879,6 +931,9 @@ default from [§5.6](#56-hubconf-reference). Booleans accept `1`, `true`, `yes`.
 | `WHM_HUB_KEYS_DIR` | `keys.dir` |
 | `WHM_HUB_ACTIVE_LICENSE_KID` / `WHM_HUB_ACTIVE_PLUGIN_KID` | `keys.active_kid.license` / `.plugin` |
 | `WHM_HUB_MAIL_FROM` | `license.mail.from` |
+| `WHM_HUB_MAIL_TRANSPORT` | `license.mail.transport` (`smtp`, `sendmail`, `none`) |
+| `WHM_HUB_SMTP_HOST` / `WHM_HUB_SMTP_PORT` | `license.mail.smtp.host` / `.port` (int) |
+| `WHM_HUB_SMTP_USER` / `WHM_HUB_SMTP_PASS` | `license.mail.smtp.user` / `.pass` |
 | `WHM_HUB_STRIPE_SECRET` / `WHM_HUB_WHMCS_SECRET` / `WHM_HUB_PADDLE_SECRET` | `license.billing.{stripe,whmcs,paddle}.secret` |
 | `WHM_HUB_ADMIN_PASSWORD` | *(not a config key: password for `hub-cli.js create-admin`)* |
 

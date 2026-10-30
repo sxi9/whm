@@ -1,5 +1,6 @@
 import { z, fields } from '../lib/validate.js';
 import { isValidCron } from '../lib/cron.js';
+import { UPDATE_TIERS } from './server-configuration.js';
 
 // The configuration cluster moves settings between peers key by key. Every
 // key that may travel is listed here explicitly with the shape a peer must
@@ -199,7 +200,7 @@ def('software', 'software.update_url', httpsUrlOrEmpty, 'panelUpdates');
 def('software', 'software.updates.auto_os', bool, 'osUpdates');
 def('software', 'updates.auto', bool, 'panelUpdates');
 def('software', 'updates.notify_contact', bool);
-def('software', 'updates.tier', z.enum(['stable', 'release', 'edge']), 'panelUpdates');
+def('software', 'updates.tier', z.enum(UPDATE_TIERS), 'panelUpdates');
 
 def('service_config', 'service_config.apache', apache, 'apache');
 def('service_config', 'service_config.exim', exim, 'exim');

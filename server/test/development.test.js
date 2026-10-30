@@ -282,7 +282,14 @@ describe('Manage API Tokens', () => {
     expect(granted.status).toBe(201);
     expect((await client.get(`/api/development/tokens/${granted.body.data.id}`)).status).toBe(200);
     expect((await post('/api/development/tokens', { name: 'from root', username: 'devacl' })).status).toBe(201);
+    // The token works while the ACL holds and stops authenticating the moment it is revoked (core's Bearer check).
+    const bearer = (path) => request(app.ctx.app).get(path).set('Authorization', `Bearer ${granted.body.data.token}`);
+    expect((await bearer('/api/accounts')).status).toBe(200);
     setAcl.run(limited.id, 'cpanel-api', 0);
+    const revoked = await bearer('/api/accounts');
+    expect(revoked.status).toBe(401);
+    expect(revoked.body.error.message).toMatch(/Access the panel API/);
+    expect((await bearer('/api/auth/me')).status).toBe(401);
     expect((await client.get(`/api/development/tokens/${granted.body.data.id}`)).status).toBe(403);
     expect((await client.get(`/api/development/tokens/${granted.body.data.id}/usage`)).status).toBe(403);
     expect((await mutate(client, 'patch', `/api/development/tokens/${granted.body.data.id}`, { name: 'renamed' }, token)).status).toBe(403);

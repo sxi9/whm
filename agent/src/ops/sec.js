@@ -273,6 +273,15 @@ function sshdEffectiveFromFiles() {
 
 const sshdNorm = (v) => { const s = String(v).trim().toLowerCase(); return SSHD_VALUE_ALIASES[s] || s; };
 
+// sshd -T echoes the deprecated spelling (without-password) for the default
+// PermitRootLogin, so effective and managed values are reported with the one
+// spelling the page offers and the advisor compares against.
+const SSHD_ALIASED_KEYS = new Set(['permitrootlogin']);
+export function normalizeSshdValues(settings) {
+  for (const [k, v] of Object.entries(settings)) if (v != null && SSHD_ALIASED_KEYS.has(k.toLowerCase())) settings[k] = sshdNorm(v);
+  return settings;
+}
+
 // Managed values that sshd does not actually apply, each with the earlier file
 // that supplies the winning value when it can be identified.
 export function sshdShadowed(managed, effective, sources = []) {
@@ -314,8 +323,9 @@ defineOp('sec.sshd.get', {
   run: async () => {
     const installed = hasBinary('sshd');
     const { effective, source } = await sshdEffective();
+    normalizeSshdValues(effective);
     const legacy = exists(SSHD_LEGACY_MANAGED) && !exists(SSHD_MANAGED);
-    const managed = readSshdManaged(legacy ? SSHD_LEGACY_MANAGED : SSHD_MANAGED);
+    const managed = normalizeSshdValues(readSshdManaged(legacy ? SSHD_LEGACY_MANAGED : SSHD_MANAGED));
     const mainText = readText(SSHD_CONFIG);
     const includeActive = mainText == null ? false : mainText.includes(SSHD_INCLUDE);
     return { installed, source, effective, managed, managedPath: SSHD_MANAGED, legacyPath: legacy ? SSHD_LEGACY_MANAGED : null, includeActive, configPresent: mainText != null, shadowed: sshdShadowed(managed, effective, sshdSourcesBefore().sources) };
@@ -405,13 +415,22 @@ async function openSshdFirewallPort(port) {
   return out;
 }
 
+const SYSTEMD_UNIT_DIR = '/etc/systemd/system';
+const SSHD_SOCKET_DROPIN = '00-whm.conf';
+
 // Ubuntu 22.10+ runs sshd through ssh.socket: the listener comes from the socket
 // unit's ListenStream, so Port in sshd_config is ignored and a reload keeps
-// port 22. The socket unit's own drop-in directory is outside the agent's
-// roots, so a port change moves the host to the classic service (Ubuntu's
-// documented alternative): the socket is disabled and stopped, which also stops
-// the service it is required by, and ssh.service is enabled and started so it
-// binds from sshd_config. Open sessions survive (KillMode=process).
+// port 22. The port moves with a drop-in on the socket unit (Ubuntu's
+// documented way), a daemon-reload and a restart of the socket, which also
+// restarts the service that requires it; open sessions survive
+// (KillMode=process). A bare port binds dual-stack where IPv6 exists and IPv4
+// only where it does not, so the drop-in also works under ipv6.disable=1.
+export function renderSshdSocketDropIn(port) {
+  return `${MANAGED} (SSH port). Replaces the socket unit's listeners; Port in sshd_config is not read under socket activation.\n[Socket]\nListenStream=\nListenStream=${port}\n`;
+}
+
+export const sshdSocketDropInPath = (unit, dir = SYSTEMD_UNIT_DIR) => path.join(dir, `${unit}.socket.d`, SSHD_SOCKET_DROPIN);
+
 async function sshdSocketActivation() {
   if (!hasBinary('systemctl')) return null;
   for (const unit of SSHD_UNITS) {
@@ -421,6 +440,35 @@ async function sshdSocketActivation() {
   return null;
 }
 
+// Writes the drop-in and restarts the socket; a failed restart puts the previous
+// drop-in (or none) back and restarts the socket again so the old port stays
+// reachable. Returns ok: false instead of throwing so the caller can fall back.
+export async function applySshdSocketPort(unit, port, ctx, { dir = SYSTEMD_UNIT_DIR } = {}) {
+  const file = sshdSocketDropInPath(unit, dir);
+  ctx.assertAllowedPath(file, 'write');
+  const previous = readText(file);
+  writeAtomic(file, renderSshdSocketDropIn(port), 0o644);
+  const rollback = async () => {
+    restore(file, previous);
+    await exec('systemctl', ['daemon-reload'], { allowFailure: true, timeoutMs: 120_000 });
+    await exec('systemctl', ['restart', `${unit}.socket`], { allowFailure: true, timeoutMs: 120_000 });
+  };
+  const reload = await exec('systemctl', ['daemon-reload'], { allowFailure: true, timeoutMs: 120_000 });
+  const restart = reload.code === 0 ? await exec('systemctl', ['restart', `${unit}.socket`], { allowFailure: true, timeoutMs: 120_000 }) : null;
+  if (!restart || restart.code !== 0) {
+    const failed = restart || reload;
+    const error = `${restart ? `systemctl restart ${unit}.socket` : 'systemctl daemon-reload'} failed: ${lastLine(failed.stderr) || `exit ${failed.code}`}`;
+    await rollback();
+    return { ok: false, file, error };
+  }
+  return { ok: true, file, unit: `${unit}.socket`, rollback };
+}
+
+// The classic-service fallback (Ubuntu's documented alternative) for a host
+// whose socket drop-in cannot be written or whose socket refuses to restart:
+// the socket is disabled and stopped, which also stops the service it is
+// required by, and ssh.service is enabled and started so it binds from
+// sshd_config.
 async function convertSshdToService(unit) {
   await exec('systemctl', ['disable', '--now', `${unit}.socket`], { timeoutMs: 120_000 });
   await exec('systemctl', ['enable', `${unit}.service`], { timeoutMs: 120_000 });
@@ -454,6 +502,7 @@ defineOp('sec.sshd.set', {
       if (v === undefined) continue;
       if (v === null) delete current[k]; else current[k] = String(v);
     }
+    normalizeSshdValues(current);
     const port = current.Port != null ? Number(current.Port) : null;
     const warnings = [];
     const selinux = port != null ? await ensureSshdSelinuxPort(port) : { mode: null, labelled: null, warnings: [] };
@@ -481,20 +530,32 @@ defineOp('sec.sshd.set', {
     warnings.push(...firewall.warnings);
     const socketUnit = port != null ? await sshdSocketActivation() : null;
     let reload;
+    let socketActivation = null;
+    let socketRollback = null;
     if (socketUnit) {
-      reload = await convertSshdToService(socketUnit);
-      warnings.push(`${socketUnit}.socket (systemd socket activation, which ignores Port) was disabled; sshd now runs as ${socketUnit}.service and listens on the configured port`);
+      let applied;
+      try { applied = await applySshdSocketPort(socketUnit, port, ctx); } catch (err) { applied = { ok: false, error: err.message }; }
+      if (applied.ok) {
+        reload = { reloaded: true, unit: applied.unit };
+        socketRollback = applied.rollback;
+        socketActivation = { unit: applied.unit, dropIn: applied.file, disabled: false };
+      } else {
+        reload = await convertSshdToService(socketUnit);
+        socketActivation = { unit: `${socketUnit}.socket`, dropIn: null, disabled: true };
+        warnings.push(`${applied.error}; ${socketUnit}.socket (systemd socket activation, which ignores Port) was disabled instead and sshd now runs as ${socketUnit}.service, listening on the configured port`);
+      }
     } else reload = await reloadUnit(SSHD_UNITS);
     const { effective } = await sshdEffective();
     const expectPort = Number(effective.port) || port || SSH_PORT_DEFAULT;
     const listening = reload.reloaded ? await sshdListening(expectPort) : null;
     if (listening === false) {
       rollback();
+      if (socketRollback) await socketRollback();
       const again = await reloadUnit(SSHD_UNITS);
       const restored = again.reloaded ? await sshdListening(Number((await sshdEffective()).effective.port) || SSH_PORT_DEFAULT) : null;
       throw new OpError('config_invalid', `sshd is not listening on port ${expectPort} after the reload (check "journalctl -u ${reload.unit || 'sshd'}"); the previous files were restored${restored ? ' and sshd is listening again on its previous port' : again.reloaded ? ' but sshd is still not listening: check the journal before closing this session' : ''}`, { port: expectPort, restored, warnings });
     }
-    return { path: SSHD_MANAGED, settings: current, includeAdded, migratedLegacy: previousLegacy != null, ...reload, port: expectPort, listening, selinux: { mode: selinux.mode, labelled: selinux.labelled }, firewall: { firewalld: firewall.firewalld, ufw: firewall.ufw }, socketActivation: socketUnit ? { unit: `${socketUnit}.socket`, disabled: true } : null, warnings, shadowed: sshdShadowed(current, effective, sshdSourcesBefore().sources) };
+    return { path: SSHD_MANAGED, settings: current, includeAdded, migratedLegacy: previousLegacy != null, ...reload, port: expectPort, listening, selinux: { mode: selinux.mode, labelled: selinux.labelled }, firewall: { firewalld: firewall.firewalld, ufw: firewall.ufw }, socketActivation, warnings, shadowed: sshdShadowed(current, effective, sshdSourcesBefore().sources) };
   },
 });
 
@@ -1051,7 +1112,8 @@ const MODSEC_DIRECTIVES = {
   SecRequestBodyNoFilesLimit: z.number().int().min(1024).max(2_147_483_647),
   SecRequestBodyLimitAction: z.enum(['Reject', 'ProcessPartial']),
   SecResponseBodyLimit: z.number().int().min(1024).max(2_147_483_647),
-  SecAuditLogRelevantStatus: z.string().regex(/^[\^$()|\[\]\d\-.?+*]{1,64}$/),
+  // The stock value is ^(?:5|4(?!04)), a regex the route accepts verbatim.
+  SecAuditLogRelevantStatus: z.string().regex(/^[\^$()|\[\]\d\-.?+*:!]{1,64}$/),
   SecAuditLogParts: z.string().regex(/^[A-KZ]{1,12}$/),
   SecPcreMatchLimit: z.number().int().min(1000).max(100_000_000),
   SecPcreMatchLimitRecursion: z.number().int().min(1000).max(100_000_000),

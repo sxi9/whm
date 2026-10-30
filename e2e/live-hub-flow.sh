@@ -132,7 +132,9 @@ if [ ! -f "$CERT" ]; then
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 -subj '/CN=127.0.0.1' \
     -addext 'subjectAltName=IP:127.0.0.1,DNS:localhost' -keyout "$HUB/tls/hub.key" -out "$CERT" >> "$LOG" 2>&1 || fail 'openssl could not create the self-signed certificate'
 fi
-# The hub's only mail transport is the local sendmail binary; this stand-in keeps every message as a file.
+# The hub defaults to SMTP submission (license.mail.transport "smtp", 127.0.0.1:25); this flow pins the
+# "sendmail" transport instead, which works here because the hub runs outside systemd (no NoNewPrivileges),
+# and this stand-in binary keeps every message as a file instead of delivering it.
 cat > "$SCRATCH/bin/sendmail" <<EOF
 #!/bin/sh
 cat > "$HUB/mail/\$(date +%s%N).eml"

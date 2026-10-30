@@ -199,6 +199,14 @@ describe('Backup API', () => {
       expect(unpinned.body.error.fields['config.hostKeySha256']).toBeDefined();
       await post('/destinations', { name: 'bad', config: { kind: 'gdrive', folder: 'x' } }).expect(422);
       await post('/destinations', { name: 'bad', config: { kind: 'webdav', url: 'ftp://nope' } }).expect(422);
+      // curl reads its configuration line by line: a newline or control character in the URL is a field error at save time (the agent refuses it too).
+      for (const bad of ['https://dav.example.com/x\ny', 'https://dav.example.com/x\r\nuser=evil', 'https://dav.example.com/x\u0000y', 'https://dav.example.com/a b', 'https://dav.example.com/"x']) {
+        const res = await post('/destinations', { name: 'bad', config: { kind: 'webdav', url: bad } }).expect(422);
+        expect(res.body.error.fields['config.url']).toBeDefined();
+        const s3 = await post('/destinations', { name: 'bad', config: { kind: 's3', endpoint: bad, bucket: 'whm-backups', accessKey: 'a', secretKey: 'b' } }).expect(422);
+        expect(s3.body.error.fields['config.endpoint']).toBeDefined();
+      }
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM backup_destinations WHERE name = 'bad'").get().n).toBe(0);
     });
 
     it('keeps stored secrets when an update leaves them blank', async () => {
@@ -338,6 +346,65 @@ describe('Backup API', () => {
       await put('/config', { 'backup.strict': false }).expect(200);
     });
 
+    it('finalises runs and restores interrupted by a panel restart once the panel is up', async () => {
+      const fresh = await createTestApp({ agent: backupAgent() });
+      try {
+        const { db } = fresh.ctx;
+        const rootId = db.prepare("SELECT id FROM users WHERE username = 'root'").get().id;
+        const job = (type, status = 'running') => Number(db.prepare("INSERT INTO jobs (type, params_json, created_by, status, started_at) VALUES (?, '{}', ?, ?, datetime('now'))").run(type, rootId, status).lastInsertRowid);
+        const runJob = job('backup.run');
+        const runId = Number(db.prepare("INSERT INTO backup_runs (job_id, kind, status, started_by, accounts_total, accounts_ok) VALUES (?, 'manual', 'running', 'root', 3, 1)").run(runJob).lastInsertRowid);
+        const restoreJob = job('backup.restore');
+        const restoreId = Number(db.prepare("INSERT INTO backup_restores (job_id, account_name, kind, status, started_by) VALUES (?, 'alice', 'account', 'running', 'root')").run(restoreJob).lastInsertRowid);
+        const orphan = Number(db.prepare("INSERT INTO backup_runs (kind, status, started_by) VALUES ('scheduled', 'queued', 'root')").run().lastInsertRowid);
+        // A run whose job is still queued at boot gets claimed by the worker; it must not be swept.
+        const liveJob = job('backup.run', 'queued');
+        const live = Number(db.prepare("INSERT INTO backup_runs (job_id, kind, status, started_by) VALUES (?, 'manual', 'queued', 'root')").run(liveJob).lastInsertRowid);
+        fresh.ctx.jobs.register('backup.run', () => new Promise(() => {}));
+        expect(fresh.ctx.backup.reconcileRuns()).toEqual({ runs: [orphan], restores: [] });
+        fresh.ctx.jobs.start();
+        expect(fresh.ctx.jobs.get(runJob)).toMatchObject({ status: 'failed', error_code: 'PANEL_RESTARTED' });
+        await fresh.ctx.events.emit('panel.started', {});
+        expect(db.prepare('SELECT status, error, finished_at, accounts_ok FROM backup_runs WHERE id = ?').get(runId)).toMatchObject({ status: 'failed', error: expect.stringMatching(/restarted/), finished_at: expect.any(String), accounts_ok: 1 });
+        expect(db.prepare('SELECT status, error, finished_at FROM backup_restores WHERE id = ?').get(restoreId)).toMatchObject({ status: 'failed', error: expect.stringMatching(/restarted/), finished_at: expect.any(String) });
+        expect(db.prepare('SELECT status, error FROM backup_runs WHERE id = ?').get(orphan)).toMatchObject({ status: 'failed', error: expect.stringMatching(/no longer exists/) });
+        await fresh.login();
+        expect((await fresh.http.get(`/api/backup/runs/${runId}`).expect(200)).body.data.status).toBe('failed');
+        expect(db.prepare('SELECT r.status, j.status AS job FROM backup_runs r JOIN jobs j ON j.id = r.job_id WHERE r.id = ?').get(live)).toEqual({ status: 'queued', job: 'running' });
+        expect(fresh.ctx.backup.reconcileRuns()).toEqual({ runs: [], restores: [] });
+      } finally {
+        await fresh.close();
+      }
+    });
+
+    it('finalises a run or restore whose job fails without reaching it, or is cancelled while queued', async () => {
+      const { db } = app.ctx;
+      // A handler that dies before runStart/restoreStart leaves the rows queued; the job's failed event closes them.
+      app.ctx.jobs.register('backup.test.crash', async () => { throw new Error('worker crashed before the run started'); });
+      const runId = Number(db.prepare("INSERT INTO backup_runs (kind, status, started_by, accounts_total) VALUES ('manual', 'queued', 'root', 1)").run().lastInsertRowid);
+      const runJob = app.ctx.jobs.enqueue('backup.test.crash', { runId });
+      db.prepare('UPDATE backup_runs SET job_id = ? WHERE id = ?').run(runJob.id, runId);
+      const restoreId = Number(db.prepare("INSERT INTO backup_restores (account_name, kind, status, started_by) VALUES ('alice', 'files', 'running', 'root')").run().lastInsertRowid);
+      const restoreJob = app.ctx.jobs.enqueue('backup.test.crash', { restoreId });
+      db.prepare('UPDATE backup_restores SET job_id = ? WHERE id = ?').run(restoreJob.id, restoreId);
+      expect((await waitForJob(app.ctx, runJob.id)).status).toBe('failed');
+      expect((await waitForJob(app.ctx, restoreJob.id)).status).toBe('failed');
+      expect(db.prepare('SELECT status, error, finished_at FROM backup_runs WHERE id = ?').get(runId)).toMatchObject({ status: 'failed', error: 'worker crashed before the run started', finished_at: expect.any(String) });
+      expect(db.prepare('SELECT status, error, finished_at FROM backup_restores WHERE id = ?').get(restoreId)).toMatchObject({ status: 'failed', error: 'worker crashed before the run started', finished_at: expect.any(String) });
+      // A run that finished on its own keeps its outcome when its job later reports failure (strict mode rethrows after runFinish).
+      const doneRun = Number(db.prepare("INSERT INTO backup_runs (kind, status, started_by, accounts_ok) VALUES ('manual', 'done', 'root', 2)").run().lastInsertRowid);
+      const doneJob = app.ctx.jobs.enqueue('backup.test.crash', { runId: doneRun });
+      db.prepare('UPDATE backup_runs SET job_id = ? WHERE id = ?').run(doneJob.id, doneRun);
+      expect((await waitForJob(app.ctx, doneJob.id)).status).toBe('failed');
+      expect(db.prepare('SELECT status, error FROM backup_runs WHERE id = ?').get(doneRun)).toEqual({ status: 'done', error: null });
+      // Cancelled while queued: the job never starts, the row is closed by the event.
+      const cancelledRun = Number(db.prepare("INSERT INTO backup_runs (kind, status, started_by) VALUES ('manual', 'queued', 'root')").run().lastInsertRowid);
+      const cancelledJob = Number(db.prepare("INSERT INTO jobs (type, params_json, created_by) VALUES ('backup.run', '{}', (SELECT id FROM users WHERE username = 'root'))").run().lastInsertRowid);
+      db.prepare('UPDATE backup_runs SET job_id = ? WHERE id = ?').run(cancelledJob, cancelledRun);
+      app.ctx.jobs.cancel(cancelledJob);
+      expect(db.prepare('SELECT status, error FROM backup_runs WHERE id = ?').get(cancelledRun)).toMatchObject({ status: 'failed', error: expect.stringMatching(/cancelled/) });
+    });
+
     it('a scheduled run while backups are disabled is a skipped run, not an error', async () => {
       const result = await app.ctx.backup.runBackupJob({ params: { kind: 'scheduled' }, job: {}, log: () => {}, progress: () => {} });
       expect(result.skipped).toBe(true);
@@ -431,15 +498,22 @@ describe('Backup API', () => {
   describe('File and Directory Restoration', () => {
     it('restores selected paths into the home with ownership as a job', async () => {
       const alice = (await resellerHttp.get('/api/backup/backups?account=alice').expect(200)).body.data[0];
-      const res = await resellerHttp.post(`/api/backup/backups/${alice.id}/restore`).set('X-CSRF-Token', resellerCsrf).send({ kind: 'files', options: { paths: ['public_html/index.html', 'missing.txt'], overwrite: false } }).expect(202);
-      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      // Restored files are checked for .htaccess Options the vhost AllowOverride refuses; FollowSymLinks is healed in the account's own files.
+      app.agent.set('web.htaccess.audit', ({ roots, username, fix }) => ({ roots, username, fix, scanned: 1, rewritten: [{ file: '/home/alice/public_html/.htaccess', lines: 1 }], unsupported: [], skipped: [], skippedRoots: [], truncated: false }));
+      let res; let job;
+      try {
+        res = await resellerHttp.post(`/api/backup/backups/${alice.id}/restore`).set('X-CSRF-Token', resellerCsrf).send({ kind: 'files', options: { paths: ['public_html/index.html', 'missing.txt'], overwrite: false } }).expect(202);
+        job = await waitForJob(app.ctx, res.body.data.job.id);
+      } finally { app.agent.set('web.htaccess.audit', () => ({})); }
       expect(job.status).toBe('done');
       const call = app.agent.callsTo('backup.files.restore')[0];
       expect(call.args).toMatchObject({ archive: alice.path, username: 'alice', homeDir: '/home/alice', paths: ['public_html/index.html', 'missing.txt'], overwrite: false });
+      expect(app.agent.callsTo('web.htaccess.audit').at(-1).args).toEqual({ roots: ['/home/alice/public_html/index.html'], username: 'alice', fix: true });
+      expect(job.logs.some((l) => /public_html\/\.htaccess: Options FollowSymLinks rewritten to SymLinksIfOwnerMatch/.test(l.line))).toBe(true);
       expect(app.agent.callsTo('backup.archive.verify')[0].args.sha256).toBe(alice.sha256);
       const restore = await resellerHttp.get(`/api/backup/restores/${res.body.data.restore.id}`).expect(200);
       expect(restore.body.data).toMatchObject({ status: 'done', kind: 'files', account_name: 'alice' });
-      expect(restore.body.data.summary.steps.files).toMatchObject({ restored: ['public_html/index.html'], missing: ['missing.txt'] });
+      expect(restore.body.data.summary.steps.files).toMatchObject({ restored: ['public_html/index.html'], missing: ['missing.txt'], htaccessRewritten: ['/home/alice/public_html/.htaccess'], detail: expect.stringMatching(/1 \.htaccess FollowSymLinks line\(s\) rewritten$/) });
       expect((await resellerHttp.get('/api/backup/restores').expect(200)).body.data[0].id).toBe(res.body.data.restore.id);
     });
 
@@ -503,6 +577,7 @@ describe('Backup API', () => {
       expect(app.ctx.db.prepare("SELECT username, domain FROM accounts WHERE username = 'bob'").get()).toEqual({ username: 'bob', domain: 'bob.com' });
       expect(app.agent.callsTo('backup.archive.extract')[0].args).toMatchObject({ archive: backup.path, dest: expect.stringMatching(/^\/backup\/\.restore-\d+$/) });
       expect(app.agent.callsTo('backup.files.restore')[0].args).toMatchObject({ username: 'bob', paths: [], overwrite: true });
+      expect(app.agent.callsTo('web.htaccess.audit').at(-1).args).toEqual({ roots: [expect.stringMatching(/\/bob$/)], username: 'bob', fix: true });
       expect(app.agent.callsTo('backup.db.import')[0].args.file).toMatch(/mysql\/bob_shop\.sql$/);
       const usersCall = app.agent.callsTo('backup.db.restore_users')[0].args;
       expect(usersCall.users[0]).toMatchObject({ user: 'bob_app', host: 'localhost', hashHex: '2A41' });

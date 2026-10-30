@@ -1164,6 +1164,30 @@ describe('security advisor', () => {
     } finally { app.agent.reset('pkg.upgradable'); }
   });
 
+  it('flags .htaccess Options lines the account AllowOverride refuses, read-only, over every document root', async () => {
+    await provision(true);
+    const db = app.ctx.db;
+    db.prepare("INSERT INTO accounts (username, domain, owner_id, home_dir, uid, gid) VALUES ('alice', 'alice.example', 1, '/home/alice', 30001, 30001)").run();
+    const aliceId = db.prepare("SELECT id FROM accounts WHERE username = 'alice'").get().id;
+    db.prepare("INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, 'shop.example', 'addon', '/home/alice/shop'), (?, 'blog.alice.example', 'sub', '/home/alice/public_html/blog')").run(aliceId, aliceId);
+    app.agent.set('web.htaccess.audit', ({ roots, fix }) => ({ roots, fix, scanned: 3, rewritten: [], unsupported: [{ file: '/home/alice/public_html/.htaccess', line: 2, tokens: ['FollowSymLinks'] }, { file: '/home/alice/shop/.htaccess', line: 1, tokens: ['All'] }], skipped: [], skippedRoots: [], truncated: false }));
+    try {
+      let byId = Object.fromEntries((await post('/api/security/advisor/scan')).body.data.findings.map((f) => [f.id, f]));
+      expect(byId['htaccess.options']).toMatchObject({ grade: 'warning', title: '2 .htaccess file(s) set Options Apache refuses for account sites', files: ['/home/alice/public_html/.htaccess', '/home/alice/shop/.htaccess'] });
+      expect(byId['htaccess.options'].detail).toMatch(/public_html\/\.htaccess line 2: Options FollowSymLinks/);
+      expect(byId['htaccess.options'].detail).toMatch(/Replace FollowSymLinks with SymLinksIfOwnerMatch/);
+      // public_html plus the docroots outside it (the sub-domain's lives under public_html), never with fix.
+      expect(app.agent.callsTo('web.htaccess.audit').at(-1).args).toEqual({ roots: ['/home/alice/public_html', '/home/alice/shop'], maxFiles: 2000 });
+      app.agent.set('web.htaccess.audit', ({ roots }) => ({ roots, fix: false, scanned: 3, rewritten: [], unsupported: [], skipped: [], skippedRoots: [], truncated: false }));
+      byId = Object.fromEntries((await post('/api/security/advisor/scan')).body.data.findings.map((f) => [f.id, f]));
+      expect(byId['htaccess.options']).toMatchObject({ grade: 'ok', title: 'No .htaccess under 2 document root(s) sets Options Apache refuses (3 file(s) checked)' });
+    } finally {
+      app.agent.reset('web.htaccess.audit');
+      db.prepare('DELETE FROM account_domains WHERE account_id = ?').run(aliceId);
+      db.prepare('DELETE FROM accounts WHERE id = ?').run(aliceId);
+    }
+  });
+
   it('degrades on a bare host (no package manager) and when the Software category is absent', async () => {
     await provision(false);
     const res = await post('/api/security/advisor/scan');

@@ -29,8 +29,9 @@ const { AppStatusPill, suggestRoot, FALLBACK_PRESETS, CapabilitySummary } = awai
 const { AppOverview, settingsPayload } = await import('../src/pages/apps/AppDetail.jsx');
 const ApplicationManager = (await import('../src/pages/fn/application-manager/application-manager.jsx')).default;
 const { AppsTable, appRowActions, mayManageApps, RESELLERS_FORBIDDEN } = await import('../src/pages/fn/application-manager/application-manager.jsx');
-const RuntimeVersions = (await import('../src/pages/fn/application-manager/runtime-versions.jsx')).default;
-const { NodeRuntimeTable, AvailableNodeList } = await import('../src/pages/fn/application-manager/runtime-versions.jsx');
+const runtimePage = await import('../src/pages/fn/application-manager/runtime-versions.jsx');
+const RuntimeVersions = runtimePage.default;
+const { NodeRuntimeTable, AvailableNodeList } = runtimePage;
 const ApplicationTemplates = (await import('../src/pages/fn/application-manager/application-templates.jsx')).default;
 const { formFromTemplate, templatePayload } = await import('../src/pages/fn/application-manager/application-templates.jsx');
 
@@ -400,6 +401,34 @@ describe('runtime versions page', () => {
     expect(html).toContain('pill-warn">missing');
     expect(html).toContain('href="/software/install-distro-packages"');
     expect(html).toContain('without venv support cannot run applications');
+    expect(html).toContain('Install Python</button>');
+  });
+
+  it('offers the one-click capability install for Python and git instead of a hand-install recipe', () => {
+    const { pythonMissingMessage, gitMissingMessage } = runtimePage;
+    expect(pythonMissingMessage(RUNTIMES)).toBeNull();
+    expect(gitMissingMessage(RUNTIMES)).toBeNull();
+    expect(pythonMissingMessage({ ...RUNTIMES, python: [], capabilities: { ...RUNTIMES.capabilities, python: false } })).toMatch(/^No Python 3 found\./);
+    expect(pythonMissingMessage({ ...RUNTIMES, capabilities: { ...RUNTIMES.capabilities, python: false } })).toMatch(/python3-venv/);
+    expect(gitMissingMessage({ ...RUNTIMES, git: { installed: false, version: null }, capabilities: { ...RUNTIMES.capabilities, git: false } })).toMatch(/git is not installed/);
+    responses.clear();
+    responses.set('/apps/runtimes/node/available', { data: { available: [], error: null } });
+    responses.set('/apps/runtimes', { data: { ...RUNTIMES, python: [], git: { installed: false, version: null }, capabilities: { ...RUNTIMES.capabilities, python: false, git: false } } });
+    responses.set('/apps/settings', { data: RUNTIMES.policy });
+    const html = render(<RuntimeVersions fn={FUNCTION_BY_KEY['application-manager/runtime-versions']} />);
+    expect(html).toContain('No Python 3 found.');
+    expect(html).toContain('Install Python</button>');
+    expect(html).toContain('Install Git</button>');
+    expect(html).toContain('deploying or pulling an application from a repository is refused');
+    expect(html).not.toContain('Install <code>python3</code>');
+    expect((html.match(/Service not installed/g) || []).length).toBe(2);
+    const reseller = { id: 2, username: 'resell1', role: 'reseller' };
+    authState.user = reseller;
+    try {
+      const asReseller = render(<RuntimeVersions fn={FUNCTION_BY_KEY['application-manager/runtime-versions']} />);
+      expect(asReseller).toContain('No Python 3 found.');
+      expect(asReseller).not.toContain('Install Python</button>');
+    } finally { authState.user = { id: 1, username: 'root', role: 'root' }; }
   });
 });
 

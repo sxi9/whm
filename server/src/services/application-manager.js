@@ -558,16 +558,33 @@ export function createApplicationManagerService(ctx) {
   async function resolveRuntime(kind, version, call) {
     let detected = { node: [], python: [] };
     try { detected = await call('app.runtime.detect', {}); } catch (err) { logger.warn({ err }, 'app.runtime.detect failed'); }
+    const selinux = detected.selinux ?? null;
     if (kind === 'node') {
       const list = (detected.node || []).filter((n) => n.present !== false);
       let hit = version === 'system' || !version ? list.find((n) => n.source === 'system') : (list.find((n) => n.source === 'managed' && n.version === version) || list.find((n) => n.version === version));
       if (!hit && version !== 'system') { const r = stmts.runtimeGet.get('node', version); if (r) hit = { version, bin: r.bin, path: r.path, source: 'managed' }; }
       if (!hit) throw new CapabilityError('node', version === 'system' || !version ? 'Node.js is not installed on this server' : `Node.js ${version} is not installed on this server`);
-      return { kind, version: hit.version, bin: hit.bin, source: hit.source };
+      return { kind, version: hit.version, bin: hit.bin, source: hit.source, selinux };
     }
     const hit = pythonFor(detected.python, version);
     if (!hit) throw pythonMissing(detected, version);
-    return { kind, version: hit.version, bin: hit.bin, source: hit.source };
+    return { kind, version: hit.version, bin: hit.bin, source: hit.source, selinux };
+  }
+  // What the agent did about SELinux (app.runtime.detect reports the mode,
+  // app.proxy.write the booleans/labels it set) goes into the deploy log: on
+  // an enforcing host a 403 from Apache is otherwise invisible here.
+  function logSelinux(log, selinux, what) {
+    if (!selinux || !selinux.mode || selinux.mode === 'disabled') return;
+    if (selinux.applied) {
+      const parts = [];
+      if (selinux.booleans?.length) parts.push(`booleans ${selinux.booleans.join(', ')} turned on`);
+      if (selinux.rules?.length) parts.push(`${selinux.rules.length} file context rule(s) added`);
+      if (selinux.relabelled?.length) parts.push(`relabelled ${selinux.relabelled.join(', ')}`);
+      log(`SELinux is ${selinux.mode}: ${parts.length ? parts.join('; ') : `httpd access to ${what} already allowed`}${selinux.persistent === false ? ' (not persistent: semanage is missing)' : ''}`);
+    } else {
+      log(`SELinux is ${selinux.mode}${selinux.semanage === false ? '; semanage is missing (policycoreutils-python-utils), so file labels cannot be made persistent' : ''}`, selinux.mode === 'enforcing' && selinux.semanage === false ? 'warn' : 'info');
+    }
+    for (const w of selinux.warnings || []) log(`SELinux: ${w}`, 'warn');
   }
   async function liveStatus(unit, req) {
     if (!unit) return null;
@@ -622,6 +639,7 @@ export function createApplicationManagerService(ctx) {
         runtime = await resolveRuntime(row.runtime_kind, row.runtime_version, call);
         patch(appId, { runtime_bin: runtime.bin });
         log(`Using ${row.runtime_kind} ${runtime.version} (${runtime.bin})`);
+        logSelinux(log, runtime.selinux, root);
       }
       if (build.install === 'npm') {
         progress(30, 'Installing npm dependencies');
@@ -675,6 +693,7 @@ export function createApplicationManagerService(ctx) {
       const proxy = await writeProxy(row.domain, { include: appId }, call);
       patch(appId, { proxy_path: proxy.path ?? null });
       log(`Apache include ${proxy.path} rewritten for ${row.domain} (${proxy.apps} application${proxy.apps === 1 ? '' : 's'})${proxy.reloaded ? ', Apache reloaded' : ''}`);
+      logSelinux(log, proxy.selinux, `the ${row.domain} applications`);
       if (unit) {
         progress(90, 'Starting the service');
         await call(row.unit ? 'svc.restart' : 'svc.start', { unit });

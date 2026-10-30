@@ -440,3 +440,54 @@ under `/etc/whm/release-keys`. Bundled plugins' node:test suites run from the ro
 - **Branding migrations:** `029c_support-branding.sql` (support provider name default → *Hostingsignal Support*),
   `011b_locales-branding.sql` (seeded locales translate the category as *HST Panel*). `client/src/brand.js` is the
   source of the product names; slugs, keys, routes and settings keep the `cpanel` identifiers.
+
+## 35. Full-audit seams (2026-10-30; `fix(audit): full audit round 1`, `b100fd3`, and its integration round)
+- **The web-server group on document roots** (accounts, service-configuration and transfers share it): Apache walks a
+  docroot as its own user (`www-data` on Debian/Ubuntu, `apache` on RHEL — `web.detect().apache.runUser`, the names
+  `apacheLayout` hardcodes), which is in no account's group, so every docroot the panel creates or receives is
+  `<user>:<web group>` with mode `0750` (cPanel's `user:nobody` layout) and the home stays `0700`-style private.
+  `accounts.webServerGroup(req)` is the probe (`user.get` for `www-data`, then `apache`; `null` when neither exists,
+  e.g. before Apache is installed — the docroot is then `user:user` until the next write puts the group on it);
+  `fs.mkdir { owner, group, mode: '0750' }` at account creation, `fs.chown { owner, group }` after a transfer
+  (`transfers.shareDocroot`: rsync `--chown`, cpmove extract, addon copy; the result carries `webGroup`).
+  Addon/sub-domain docroots are **not created by the panel today** (service-configuration's vhost write only
+  validates the path; `account_domains.docroot` is recorded, never `mkdir`ed): whichever category adds that
+  creation must use the same `fs.mkdir { owner, group: accounts.webServerGroup(req), mode: '0750' }` call, never
+  `0755`. Never widen the mode instead (`0755`/`o+x` on a home lets every local user read other accounts' files),
+  and never give the web server the account's group.
+- **`.htaccess` `Options` under the hardened `AllowOverride`** (web, transfers, backup, security-center): account
+  vhosts render `AllowOverride AuthConfig FileInfo Indexes Limit Options=Indexes,MultiViews,SymLinksIfOwnerMatch,
+  IncludesNOEXEC` (`DOCROOT_ALLOW_OVERRIDE`, agent `web.js`), and Apache's `set_options()` refuses in a `.htaccess`
+  any other token whatever its sign, and `All` outright — the whole directory then answers 500 with only the
+  domain error log saying why. Every category that writes files into an account (transfers: rsync, cpmove
+  extract, addon copy; backup: both restore kinds) therefore calls `lib/htaccess.js reconcileHtaccess(agent,
+  { roots, username, req, log })` after its chown step: the agent op `web.htaccess.audit { roots, username, fix }`
+  walks the roots without following links, rewrites `FollowSymLinks` → `SymLinksIfOwnerMatch` **in place and only
+  in files the account's uid owns** (fstat on the open descriptor, never uid 0), and returns `rewritten` /
+  `unsupported` (`{ file, line, tokens }`), which the caller logs (warn for what it could not fix) and attaches to
+  its step as `htaccessRewritten` / `htaccessUnsupported`. The Security Advisor runs the same op read-only
+  (`fix: false`) over every `public_html` plus the `account_domains.docroot`s outside it (`htaccess.options`
+  finding). The allowed tokens are stated in MANUAL 7.1; nothing re-enables `FollowSymLinks`.
+- **Account suspension = password lock + account expiry** (`user.lock` → `usermod -L -e 1 <user>`, `user.unlock` →
+  `usermod -U -e '' <user>`): `-L` alone only prefixes the hash, which sshd under `UsePAM` and key logins never
+  consult; the expiry (day 1) makes every PAM account stage — SSH with keys, FTP, IMAP/POP, cron — refuse the user.
+  Existing sessions are not killed (the op stays non-destructive; the Rearrange/move flow calls it too), so a
+  category that must end them does it explicitly and audited. Callers add no second mechanism (shell swap, key
+  removal): unlock would have to undo it.
+- **Confined API tokens never attach a user outside their endpoints** (`middleware/auth.js`): a token whose scopes
+  are confined (`ctx.confinedScopes`: `clustering:dns`, `clustering:config`, §31) always gets `req.auth.confinedTo`,
+  but `req.user` only on a request matching one of its `{ method, path }` entries (`confinementAllows`);
+  `requireAuth` answers `403 scope_confined` before `401`. Consequently a route mounted before `requireAuth`
+  (`{ public: true }` mounts such as `/api/branding`, `/api/auth/*` including the OIDC `?link=1` path) sees no
+  principal for a confined token and must never act for a user it did not authenticate itself. Reseller tokens
+  also stop authenticating once the `cpanel-api` ACL is revoked (`ctx.resellers.hasAcl`, checked per request).
+- **Run rows are swept on `panel.started`:** every service that keeps a run table beside a job (transfers
+  `transfer_runs`/items, backup `backup_runs` + `backup_restores`, multi-account runs/items) subscribes
+  `ctx.events.on('panel.started', reconcileRuns)` and `ctx.jobs.onAny('failed' | 'cancelled')`, and marks a row
+  still `running` whose job is not running any more as `failed` ("interrupted by a panel restart") with its open
+  items `skipped`; `lib/jobs.js` recovers only the job rows (`recoverStale`) and emits no event for them. A new
+  category with run rows copies the recipe (abandon-run helper + the two hooks) and never leaves a row `running`
+  with no live job.
+- **SameSite=lax session cookie:** `app.js` sets `sameSite: 'lax'` (not `strict`) because the external-auth callback
+  is a cross-site top-level navigation that must carry the session with the OIDC state/nonce; the CSRF token
+  remains the mutation guard, so no route may rely on the cookie's SameSite for that.

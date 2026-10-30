@@ -19,7 +19,7 @@ vi.mock('../src/hooks/useApi.js', () => ({
 
 const page = await import('../src/pages/fn/server-configuration/initial-quota-setup.jsx');
 const InitialQuotaSetup = page.default;
-const { manualSteps, ManualSteps } = page;
+const { manualSteps, ManualSteps, MountOptionsNote, applyStep, kernelArgsFor, needsManualSteps } = page;
 
 React.useLayoutEffect = React.useEffect;
 const render = (el) => renderToStaticMarkup(
@@ -41,6 +41,18 @@ const xfs = () => ext4({
   device: '/dev/sdb1', fstype: 'xfs', rebootRequired: true,
   fstab: { lineNo: 6, line: '/dev/sdb1\t/home\txfs\tdefaults\t0\t0', options: ['defaults'], hasUserQuota: false, hasGroupQuota: false },
   proposedFstabLine: '/dev/sdb1\t/home\txfs\tdefaults,uquota,gquota\t0\t0',
+});
+// An xfs "/" (stock AlmaLinux 9): the agent adds kernelArgs (computed with
+// group quotas on) because the initramfs mounts it from the kernel command
+// line, and kernelArgsRequired until rootflags= is in the boot entries.
+const grubby = { method: 'grubby', arg: 'rootflags=uquota,gquota', command: 'grubby --update-kernel=ALL --args=rootflags=uquota,gquota', configured: false };
+const grubDefault = { method: 'grub-default', arg: 'rootflags=uquota,gquota', command: 'add rootflags=uquota,gquota to GRUB_CMDLINE_LINUX in /etc/default/grub, then run update-grub', configured: false };
+const xfsRoot = (over = {}) => ext4({
+  device: '/dev/sda3', mountpoint: '/', fstype: 'xfs', rebootRequired: true, holdsHomes: true,
+  fstab: { lineNo: 2, line: 'UUID=root\t/\txfs\tdefaults\t0\t0', options: ['defaults'], hasUserQuota: false, hasGroupQuota: false },
+  proposedFstabLine: 'UUID=root\t/\txfs\tdefaults,uquota,gquota\t0\t0',
+  kernelArgsRequired: true, kernelArgs: grubby,
+  ...over,
 });
 const status = (filesystems) => ({
   toolsInstalled: true, tools: {}, fstabPath: '/etc/fstab', fstabPresent: true, homeRoot: '/home', homeFilesystem: '/home',
@@ -102,5 +114,75 @@ describe('Initial Quota Setup manual steps', () => {
     expect(html).toContain('Show manual steps');
     expect(html).toContain('quotacheck -cug -m -f /home');
     expect(html).toContain('Update fstab and enable');
+    expect(html).not.toContain('GRUB_CMDLINE_LINUX');
+    expect(html).not.toContain('kernel args:');
+  });
+});
+
+describe('Initial Quota Setup on an XFS root filesystem', () => {
+  it('prints the grubby line and a reboot instead of "reboot after editing fstab"', () => {
+    const text = manualSteps(xfsRoot(), true);
+    expect(text).toContain('+ UUID=root\t/\txfs\tdefaults,uquota,gquota\t0\t0');
+    expect(text).toContain('grubby --update-kernel=ALL --args=rootflags=uquota,gquota\n# then reboot: / is mounted by the initramfs from the kernel command line');
+    expect(text).not.toContain('mount -o remount');
+    expect(text).not.toContain('# reboot (XFS applies quota options only at mount time)');
+    expect(text).toContain('quotaon -ug /');
+  });
+
+  it('follows the group switch in the kernel argument as it does in the fstab line', () => {
+    const off = manualSteps(xfsRoot(), false);
+    expect(off).toContain('--args=rootflags=uquota\n');
+    expect(off).not.toContain('gquota');
+    expect(kernelArgsFor(xfsRoot(), false)).toMatchObject({ method: 'grubby', configured: false, arg: 'rootflags=uquota', command: 'grubby --update-kernel=ALL --args=rootflags=uquota' });
+    const mountedGroup = xfsRoot({ groupQuotaMounted: true });
+    expect(kernelArgsFor(mountedGroup, false).arg).toBe('rootflags=uquota,gquota');
+    expect(kernelArgsFor(ext4(), true)).toBeNull();
+  });
+
+  it('shows the GRUB_CMDLINE_LINUX + update-grub route outside the RHEL family', () => {
+    const text = manualSteps(xfsRoot({ kernelArgs: grubDefault }), true);
+    expect(text).toContain('add rootflags=uquota,gquota to GRUB_CMDLINE_LINUX in /etc/default/grub, then run update-grub');
+    expect(text).toContain('# then reboot');
+    expect(manualSteps(xfsRoot({ kernelArgs: grubDefault }), false)).toContain('add rootflags=uquota to GRUB_CMDLINE_LINUX');
+  });
+
+  it('only asks for the reboot once the boot loader already carries rootflags', () => {
+    const ready = xfsRoot({ kernelArgsRequired: false, kernelArgs: { ...grubby, configured: true } });
+    expect(applyStep(ready, true)).toBe('# the boot loader already passes rootflags=uquota,gquota; reboot so XFS mounts / with the quota options');
+    expect(applyStep(xfsRoot(), true)).toContain('grubby');
+    expect(applyStep(xfs(), true)).toBe('# reboot (XFS applies quota options only at mount time)');
+    expect(applyStep(ext4(), true)).toBe('mount -o remount /home');
+  });
+
+  it('keeps the manual block and the fstab action when fstab already has uquota but the boot entries do not', () => {
+    const f = xfsRoot({ proposedFstabLine: null, fstab: { lineNo: 2, line: 'UUID=root\t/\txfs\tdefaults,uquota,gquota\t0\t0', options: ['defaults', 'uquota', 'gquota'], hasUserQuota: true, hasGroupQuota: true } });
+    expect(needsManualSteps(f)).toBe(true);
+    expect(needsManualSteps(ext4({ proposedFstabLine: null }))).toBe(false);
+    const text = manualSteps(f, true);
+    expect(text).not.toContain('+ UUID');
+    expect(text.startsWith('grubby --update-kernel=ALL')).toBe(true);
+    const block = render(<ManualSteps filesystems={[f]} groupQuota={true} />);
+    expect(block).toContain('Show manual steps');
+    expect(block).toContain('grubby --update-kernel=ALL');
+    responses.clear();
+    responses.set('/server-config/quota', { data: status([f]) });
+    const html = render(<InitialQuotaSetup fn={fn} />);
+    expect(html).toContain('Update fstab and enable');
+  });
+
+  it('page footer and table explain the kernel-args requirement with the exact command', () => {
+    responses.clear();
+    responses.set('/server-config/quota', { data: status([xfsRoot()]) });
+    const html = render(<InitialQuotaSetup fn={fn} />);
+    expect(html).toContain('boot loader change needed');
+    expect(html).toContain('kernel args: rootflags= missing');
+    expect(html).toContain('mounted by the initramfs from the kernel command line');
+    expect(html).toContain('grubby --update-kernel=ALL --args=…');
+    expect(html).toContain('GRUB_CMDLINE_LINUX');
+    expect(html).toContain('runs <code>grubby --update-kernel=ALL --args=rootflags=uquota,gquota</code> for you; reboot afterwards');
+    expect(html).not.toContain('so it needs a reboot after the fstab change.</p>');
+    const note = render(<MountOptionsNote filesystems={[xfsRoot({ kernelArgsRequired: false, kernelArgs: { ...grubby, configured: true } })]} />);
+    expect(note).toContain('The boot loader already passes it; reboot to mount with quotas.');
+    expect(render(<MountOptionsNote filesystems={[ext4(), xfs()]} />)).not.toContain('initramfs');
   });
 });

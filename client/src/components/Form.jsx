@@ -119,6 +119,18 @@ export function Button({ children, variant = 'default', loading = false, icon: I
   );
 }
 
+export function isBlank(value) {
+  return value === null || value === undefined || value === '';
+}
+
+// Messages a failed request attached to one field (the API's error.fields),
+// for display next to that field instead of only in the banner.
+export function fieldErrors(error, key) {
+  const v = error?.fields?.[key];
+  if (v == null) return [];
+  return (Array.isArray(v) ? v : [v]).map(String);
+}
+
 // Generic error banner for a failed request (shows field errors when present).
 export function ErrorBanner({ error, onRetry }) {
   if (!error) return null;

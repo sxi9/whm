@@ -4,6 +4,7 @@ import { json } from '../db/index.js';
 import { notFound, forbidden, conflict, unprocessable, HttpError, CapabilityError } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
 import { PRIVILEGES } from './database-services.js';
+import { reconcileHtaccess, htaccessSummary, htaccessFields } from '../lib/htaccess.js';
 
 // Transfers. Attached as ctx.transfers; other categories may call:
 //   transfers.capabilityStatus()                                  -> { ssh, sshpass, rsync, tar, mysql } install state
@@ -268,6 +269,31 @@ export function createTransfersService(ctx) {
     const req = { user, ip: null, id: requestId ?? null };
     req.audit = (entry) => ctx.auditRecord?.(req, entry);
     return req;
+  }
+
+  // Apache walks a document root as its own user (www-data / apache, the
+  // names the web layout hardcodes), which is in no account's group: account
+  // creation gives public_html that group, and a home received from another
+  // server (rsync --chown, cpmove extract, addon copy) is user:user until the
+  // same group is put back on it. The probe mirrors accounts.webServerGroup.
+  async function webServerGroup(req) {
+    for (const name of ['www-data', 'apache']) {
+      try { if ((await agent.op('user.get', { username: name }, { req }))?.uid != null) return name; } catch { /* absent: no group */ }
+    }
+    return null;
+  }
+  async function shareDocroot(account, req, log) {
+    if (account.uid == null) return null;
+    const group = await webServerGroup(req);
+    if (!group) return null;
+    const docroot = `${account.home_dir}/public_html`;
+    try {
+      await agent.op('fs.chown', { path: docroot, owner: account.username, group }, { req });
+      return group;
+    } catch (err) {
+      log?.(`${account.username}: ${docroot} could not be given the ${group} group (${err.message}); the web server may answer 403 until it is`, 'warn');
+      return null;
+    }
   }
 
   function actorForRun(run, userId, jobCtx) {
@@ -760,7 +786,9 @@ export function createTransfersService(ctx) {
       steps.home = await step(async () => {
         const r = await op('transfer.remote.rsync', { connection: connectionOf(sessionRow), remotePath: remoteHome, localPath: account.home_dir, directory: true, excludes: HOME_EXCLUDES, bwlimitKbps: bwlimit(), owner: account.uid != null ? account.username : undefined }, req);
         if (account.uid != null) await agent.op('fs.chown', { path: account.home_dir, owner: account.username, recursive: true }, { req });
-        return { detail: `${r.filesTransferred ?? r.files ?? '?'} file(s), ${r.transferredBytes ?? 0} bytes copied from ${remoteHome}${r.partial ? ' (some files vanished or were unreadable)' : ''}`, bytes: r.transferredBytes ?? null };
+        const group = await shareDocroot(account, req, log);
+        const htaccess = account.uid != null ? await reconcileHtaccess(agent, { roots: [account.home_dir], username: account.username, req, log }) : null;
+        return { detail: `${r.filesTransferred ?? r.files ?? '?'} file(s), ${r.transferredBytes ?? 0} bytes copied from ${remoteHome}${r.partial ? ' (some files vanished or were unreadable)' : ''}${group ? `; public_html shared with ${group}` : ''}${htaccessSummary(htaccess)}`, bytes: r.transferredBytes ?? null, ...(group ? { webGroup: group } : {}), ...htaccessFields(htaccess) };
       });
       log(`${item.username}: home ${steps.home.status}${steps.home.detail ? ` – ${steps.home.detail}` : ''}`, steps.home.status === 'failed' ? 'error' : 'info');
     }
@@ -1027,7 +1055,9 @@ export function createTransfersService(ctx) {
     else {
       steps.home = await step(async () => {
         const r = await op('transfer.cpmove.extract', { path: file, destination: account.home_dir, members: [member('homedir/*')], stripComponents: 2, owner: account.uid != null ? account.username : undefined }, req);
-        return { detail: r.extracted ? `homedir extracted into ${account.home_dir}` : 'homedir/ was empty' };
+        const group = r.extracted ? await shareDocroot(account, req, log) : null;
+        const htaccess = r.extracted && account.uid != null ? await reconcileHtaccess(agent, { roots: [account.home_dir], username: account.username, req, log }) : null;
+        return { detail: r.extracted ? `homedir extracted into ${account.home_dir}${group ? `; public_html shared with ${group}` : ''}${htaccessSummary(htaccess)}` : 'homedir/ was empty', ...(group ? { webGroup: group } : {}), ...htaccessFields(htaccess) };
       });
       log(`${item.username}: home ${steps.home.status}${steps.home.detail ? ` – ${steps.home.detail}` : ''}`, steps.home.status === 'failed' ? 'error' : 'info');
     }
@@ -1225,7 +1255,9 @@ export function createTransfersService(ctx) {
         if (!st.exists) return { status: 'skipped', detail: `${docroot} does not exist` };
         await agent.op('fs.copy_tree', { from: docroot, to: `${account.home_dir}/public_html` }, { req });
         if (account.uid != null) await agent.op('fs.chown', { path: `${account.home_dir}/public_html`, owner: account.username, recursive: true }, { req });
-        return { detail: `${docroot} copied to ${account.home_dir}/public_html` };
+        const group = await shareDocroot(account, req, log);
+        const htaccess = account.uid != null ? await reconcileHtaccess(agent, { roots: [`${account.home_dir}/public_html`], username: account.username, req, log }) : null;
+        return { detail: `${docroot} copied to ${account.home_dir}/public_html${group ? ` (shared with ${group})` : ''}${htaccessSummary(htaccess)}`, ...(group ? { webGroup: group } : {}), ...htaccessFields(htaccess) };
       });
       log(`${target.username}: files ${steps.files.status} – ${steps.files.detail}`, steps.files.status === 'failed' ? 'error' : 'info');
     }

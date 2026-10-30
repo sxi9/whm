@@ -57,8 +57,10 @@ verified developers, and bundled plugins are part of the product (deferred to Ph
   `$WHM_DATA_DIR/master.key`). Tokens are stored only as SHA-256 hashes. Passwords bcrypt.
 - Every privileged/mutating action writes an `audit_log` row (principal, role, IP, action,
   target, redacted args, result).
-- Session cookies `httpOnly`/`sameSite=strict`/`secure` when TLS; CSRF token on all
-  mutations; rate limits on auth.
+- Session cookies `httpOnly`/`sameSite=lax`/`secure` when TLS (`lax`, not `strict`: the OIDC
+  callback `GET /api/auth/external/:name/callback` is a cross-site top-level navigation that must
+  carry the session holding the state and nonce, and real browsers drop a `strict` cookie there;
+  mutations stay protected by the CSRF token); CSRF token on all mutations; rate limits on auth.
 - Path inputs: absolute, no `..`, and services pin them under an allowed root.
 - A missing subsystem (BIND, Exim, MySQL…) must raise `CapabilityError` → the UI shows an
   install prompt. It must never crash a page or fail opaquely.

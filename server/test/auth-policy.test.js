@@ -344,7 +344,9 @@ describe('external (OpenID Connect) login', () => {
     for (const token of [cluster, full]) {
       const attacker = fresh();
       const start = await attacker.get(`/api/auth/external/${name}/start?link=1`).set('Authorization', `Bearer ${token}`);
-      expect(start.status).toBe(403);
+      // The confined token reaches this public route with no principal at all
+      // (401, nobody to link); the full token is refused as a token (403).
+      expect(start.status).toBe(token === cluster ? 401 : 403);
       const cb = await attacker.get(`/api/auth/external/${name}/callback?code=abc&state=anything`).set('Authorization', `Bearer ${token}`);
       expect(cb.headers.location).toBe('/login?error=external_state');
     }
@@ -360,5 +362,53 @@ describe('external (OpenID Connect) login', () => {
     const me = await request(app.ctx.app).get('/api/auth/me').set('Authorization', `Bearer ${cluster}`);
     expect(me.status).toBe(403);
     expect(me.body.error.code).toBe('scope_confined');
+  });
+
+  // Belt and braces under the route check above: outside its endpoints a
+  // confined token is attached to the request as no user at all, so a route
+  // mounted before requireAuth (the public branding mount, /auth) cannot act
+  // for the token's owner even if it forgets to look at req.auth.
+  it('gives a confined token no principal outside its endpoints, on routes mounted before the session check too', async () => {
+    const insert = app.ctx.db.prepare("INSERT INTO api_tokens (user_id, name, token_hash, scopes, prefix) VALUES ((SELECT id FROM users WHERE username = 'root'), ?, ?, ?, ?)");
+    const cluster = `whm_${app.ctx.crypto.randomToken(24)}`;
+    insert.run('peer2', app.ctx.crypto.hashToken(cluster), JSON.stringify(['clustering:dns']), cluster.slice(0, 12));
+    const as = (path) => request(app.ctx.app).get(path).set('Authorization', `Bearer ${cluster}`);
+    const start = await as(`/api/auth/external/${name}/start?link=1`);
+    expect(start.status).toBe(401);
+    expect(start.body.error.message).toMatch(/Log in before linking/);
+    // Public mounts keep answering, as to an anonymous visitor.
+    expect((await as('/api/branding')).status).toBe(200);
+    expect((await as('/api/health')).status).toBe(200);
+    // Inside the confinement the owner is attached; outside, requireAuth still names the confinement rather than a plain 401.
+    expect((await as('/api/clusters/ping')).status).toBe(200);
+    const me = await as('/api/auth/me');
+    expect(me.status).toBe(403);
+    expect(me.body.error.code).toBe('scope_confined');
+    expect((await as('/api/accounts')).body.error.code).toBe('scope_confined');
+    // A mutation refused outside the confinement is audited without a principal.
+    const refused = await request(app.ctx.app).post('/api/accounts').set('Authorization', `Bearer ${cluster}`).send({ username: 'nope', domain: 'nope.example.com', password: 'Nope-Passw0rd!1' });
+    expect(refused.status).toBe(403);
+    expect(app.ctx.db.prepare("SELECT principal FROM audit_log WHERE action = 'POST /api/accounts' ORDER BY id DESC LIMIT 1").get()).toEqual({ principal: null });
+    app.ctx.db.prepare("DELETE FROM api_tokens WHERE name = 'peer2'").run();
+  });
+
+  it('stops authenticating a reseller\'s API tokens once the cpanel-api privilege is revoked', async () => {
+    const reseller = await app.createUser('tokacl', 'reseller');
+    const token = `whm_${app.ctx.crypto.randomToken(24)}`;
+    app.ctx.db.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, prefix) VALUES (?, ?, ?, ?, ?)').run(reseller.id, 'tokacl', app.ctx.crypto.hashToken(token), '[]', token.slice(0, 12));
+    const me = () => request(app.ctx.app).get('/api/auth/me').set('Authorization', `Bearer ${token}`);
+    // No ACL rows configured: the reseller holds every privilege.
+    expect((await me()).status).toBe(200);
+    const setAcl = app.ctx.db.prepare('INSERT OR REPLACE INTO reseller_acls (reseller_id, acl_key, value) VALUES (?, ?, ?)');
+    setAcl.run(reseller.id, 'list-accts', 1);
+    setAcl.run(reseller.id, 'cpanel-api', 0);
+    const refused = await me();
+    expect(refused.status).toBe(401);
+    expect(refused.body.error.message).toMatch(/Access the panel API/);
+    setAcl.run(reseller.id, 'cpanel-api', 1);
+    expect((await me()).status).toBe(200);
+    app.ctx.db.prepare('DELETE FROM api_tokens WHERE user_id = ?').run(reseller.id);
+    app.ctx.db.prepare('DELETE FROM reseller_acls WHERE reseller_id = ?').run(reseller.id);
+    app.ctx.db.prepare('DELETE FROM users WHERE id = ?').run(reseller.id);
   });
 });

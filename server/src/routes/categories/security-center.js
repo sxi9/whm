@@ -130,7 +130,7 @@ export async function register(ctx) {
   r.get('/fork-bomb', wrap(() => s.forkBomb.status()));
   r.put('/fork-bomb', validate({ body: z.object({
     enabled: z.boolean(), maxProcesses: z.number().int().min(1).max(1_000_000).optional(), maxOpenFiles: z.number().int().min(16).max(10_000_000).optional(),
-    maxMemoryMb: z.number().int().min(16).max(16_000_000).optional(), excludeGroups: z.array(groupName).max(20).optional(),
+    maxMemoryMb: z.number().int().min(4096).max(16_000_000).nullable().optional(), excludeGroups: z.array(groupName).max(20).optional(),
   }).strict() }), wrap((req) => s.forkBomb.set(req.body, req)));
 
   // cPHulk + firewall

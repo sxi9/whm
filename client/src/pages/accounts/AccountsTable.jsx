@@ -1,4 +1,5 @@
-import { useNavigate } from 'react-router-dom';
+import { useEffect } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api, queryString } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { DataTable, useTableState } from '../../components/DataTable.jsx';
@@ -10,7 +11,13 @@ export function AccountsTable({ suspendedOnly = false, toolbar }) {
   const navigate = useNavigate();
   const toast = useToast();
   const confirm = useConfirm();
-  const t = useTableState({ sort: 'username' });
+  // Deep links (Manage Databases, Service Manager) arrive as ?q=<account>;
+  // the search box seeds from it and follows a later link, while typing a
+  // different search leaves the URL alone.
+  const [params] = useSearchParams();
+  const linkedQuery = params.get('q') || '';
+  const t = useTableState({ sort: 'username', q: linkedQuery });
+  useEffect(() => { if (linkedQuery) t.setSearch(linkedQuery); }, [linkedQuery]);
   const query = { ...t.state, suspended: suspendedOnly ? 'true' : undefined };
   const { data, meta, loading, error, refetch } = useApi(`/accounts${queryString(query)}`);
 
@@ -45,6 +52,7 @@ export function AccountsTable({ suspendedOnly = false, toolbar }) {
 
   return (
     <DataTable
+      key={linkedQuery}
       columns={columns} rows={data || []} loading={loading} error={error} rowKey={(r) => r.username}
       total={meta?.total} page={t.state.page} pageSize={t.state.pageSize} onPageChange={t.setPage}
       sort={t.state.sort} dir={t.state.dir} onSortChange={t.setSort}

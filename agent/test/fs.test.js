@@ -194,3 +194,23 @@ describe('fs.copy_tree never rsyncs through a planted link', () => {
     expect(fs.existsSync(path.join(to, 'secret.txt'))).toBe(false);
   });
 });
+
+describe('fs.mkdir applies mode and owner through a descriptor, never through a link', () => {
+  it('an allowed root that is itself a link is accepted as a parent but never chmodded or chowned through', async () => {
+    const real = path.join(root, 'desc-real');
+    const link = path.join(root, 'desc-root');
+    fs.mkdirSync(real, { mode: 0o755 });
+    fs.symlinkSync(real, link);
+    const before = mode(real);
+    const linkedCtx = createContext({ allowedRoots: [link] });
+    exec.mockClear();
+    const err = await opError(runOp('fs.mkdir', { path: link, mode: '0700', owner: 'root' }, linkedCtx));
+    expect(err.code).toBe('refused');
+    expect(err.message).toMatch(/no longer a plain directory \((ELOOP|ENOTDIR)\)/);
+    expect(mode(real)).toBe(before);
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    // Without a mode or owner there is nothing to apply, so the tree is only confirmed.
+    await expect(runOp('fs.mkdir', { path: link }, linkedCtx)).resolves.toEqual({ path: link });
+    expect(exec).not.toHaveBeenCalled();
+  });
+});

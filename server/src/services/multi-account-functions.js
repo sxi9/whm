@@ -56,6 +56,11 @@ export function createMultiAccountService(ctx) {
     finishItem: db.prepare("UPDATE multi_account_run_items SET status = @status, detail = @detail, after_json = @after_json, steps_json = @steps_json, finished_at = datetime('now') WHERE id = @id"),
     itemCounts: db.prepare('SELECT status, COUNT(*) AS n FROM multi_account_run_items WHERE run_id = ? GROUP BY status'),
     pruneRuns: db.prepare("DELETE FROM multi_account_runs WHERE finished_at IS NOT NULL AND finished_at < datetime('now', ?)"),
+    openRun: db.prepare("SELECT id FROM multi_account_runs WHERE id = ? AND status IN ('queued', 'running')"),
+    failRunningItems: db.prepare("UPDATE multi_account_run_items SET status = 'failed', detail = ?, finished_at = datetime('now') WHERE run_id = ? AND status = 'running'"),
+    skipQueuedItems: db.prepare("UPDATE multi_account_run_items SET status = 'skipped', detail = ?, finished_at = datetime('now') WHERE run_id = ? AND status = 'queued'"),
+    runByJob: db.prepare('SELECT id FROM multi_account_runs WHERE job_id = ?'),
+    orphanedRuns: db.prepare("SELECT r.id, r.job_id, j.status AS job_status, j.error AS job_error FROM multi_account_runs r LEFT JOIN jobs j ON j.id = r.job_id WHERE r.status IN ('queued', 'running') AND (j.id IS NULL OR j.status NOT IN ('queued', 'running')) ORDER BY r.id"),
   };
 
   const audit = (req, entry) => (req?.audit ? req.audit(entry) : ctx.auditRecord?.(req ?? null, entry));
@@ -72,13 +77,39 @@ export function createMultiAccountService(ctx) {
     return req;
   }
 
-  // Marks every queued item skipped and the run failed when it cannot start.
-  function abandonRun(runId, reason) {
-    db.transaction(() => {
-      for (const item of stmts.queuedItems.all(runId)) finishItem(item, { status: 'skipped', detail: reason, steps: json.parse(item.steps_json, {}) });
-      stmts.finishRun.run('failed', JSON.stringify(totalsOf(runId)), runId);
-    })();
+  // A run whose job ended without reaching finishRun (it could not start, the
+  // handler threw, the job was cancelled, the panel restarted mid-run) would
+  // otherwise show as running forever: the item being worked on failed, the
+  // queued ones never started.
+  const abandonRun = db.transaction((runId, reason) => {
+    if (!stmts.openRun.get(runId)) return false;
+    stmts.failRunningItems.run(reason, runId);
+    stmts.skipQueuedItems.run(reason, runId);
+    stmts.finishRun.run('failed', JSON.stringify(totalsOf(runId)), runId);
+    return true;
+  });
+  const orphanReason = (r) => (r.job_id == null || r.job_status == null ? 'the job driving this run no longer exists'
+    : r.job_status === 'cancelled' ? 'the job was cancelled'
+      : r.job_status === 'done' ? 'the job finished without recording the run'
+        : r.job_error || 'the job failed');
+  // jobs.start() marks the jobs interrupted by a restart as failed without
+  // emitting events; the runs they drove are reconciled once the panel is up.
+  function reconcileRuns() {
+    const abandoned = [];
+    for (const r of stmts.orphanedRuns.all()) if (abandonRun(r.id, orphanReason(r))) abandoned.push(r.id);
+    if (abandoned.length) logger.warn({ runs: abandoned }, 'multi-account: finalised runs whose job ended without them');
+    return abandoned;
   }
+  jobs.onAny((event) => {
+    if (event.type !== 'failed' && event.type !== 'cancelled') return;
+    try {
+      const run = stmts.runByJob.get(event.jobId);
+      if (run) abandonRun(run.id, event.type === 'cancelled' ? 'the job was cancelled before it started' : event.error || 'the job failed');
+    } catch (err) {
+      logger.warn({ err, jobId: event.jobId }, 'multi-account: run could not be finalised after its job failed');
+    }
+  });
+  ctx.events?.on?.('panel.started', () => { try { reconcileRuns(); } catch (err) { logger.warn({ err }, 'multi-account: run reconciliation at boot failed'); } });
 
   const summary = (a) => ({
     id: a.id, username: a.username, domain: a.domain, owner: a.owner, ip: a.ip, package_name: a.package_name, contact_email: a.contact_email,
@@ -544,9 +575,6 @@ export function createMultiAccountService(ctx) {
     stmts.runStatus.run('running', runId);
     const items = stmts.queuedItems.all(runId);
     jobCtx.log(`Modifying ${items.length} account(s): ${Object.entries(patch).map(([k, v]) => `${FIELD_LABELS[k] || k} = ${v === null ? 'unlimited' : v}`).join(', ')}`);
-    // accounts.modify only surfaces a failed user.set_quota in production (strict)
-    // mode; elsewhere the limit is recorded and the op outcome is unknown.
-    const quotaStrict = ctx.config?.env === 'production';
     let phpApplied = 0;
     for (const [i, item] of items.entries()) {
       const steps = json.parse(item.steps_json, {});
@@ -558,11 +586,13 @@ export function createMultiAccountService(ctx) {
         const updated = await ctx.accounts.modify(item.username, patch, user, req);
         const result = { account: { status: 'applied', detail: `${steps.plan?.changes?.length ?? 0} field(s) updated` } };
         if (steps.plan?.quota) {
+          // accounts.modify reports the setquota outcome itself (applied,
+          // pending until Initial Quota Setup, or failed) whenever it ran it.
           const limit = updated.disk_quota_mb == null ? 'unlimited' : `${updated.disk_quota_mb} MB`;
-          result.quota = account.uid == null ? { status: 'skipped', detail: 'no system user on this host' }
-            : !capabilities.has('quota') ? { status: 'pending', detail: 'quota tools are not installed; the limit is enforced once they are' }
-              : quotaStrict ? { status: 'applied', detail: `quota set to ${limit}` }
-                : { status: 'recorded', detail: `limit ${limit} recorded; outside production mode a failed setquota is logged, not reported` };
+          result.quota = updated.quota ? { status: updated.quota.status, detail: `${limit}: ${updated.quota.detail}` }
+            : account.uid == null ? { status: 'skipped', detail: 'no system user on this host' }
+              : !capabilities.has('quota') ? { status: 'pending', detail: 'quota tools are not installed; the limit is enforced once they are' }
+                : { status: 'unchanged', detail: `the account already had ${limit}` };
         }
         if (applyPhp && steps.plan?.php && ctx.web?.setPhpVersion) {
           try { await ctx.web.setPhpVersion(account.domain, steps.plan.php, req, { reload: false }); phpApplied++; result.php = { status: 'applied', detail: `PHP ${steps.plan.php} applied to ${account.domain}` }; }
@@ -640,6 +670,7 @@ export function createMultiAccountService(ctx) {
     listRuns({ kind, limit = 50 } = {}, user) {
       return stmts.runs.all({ kind: kind ?? null, owner: isRoot(user) ? null : user.id, limit }).map((r) => ({ ...shapeRun(r), totals: Object.keys(json.parse(r.totals_json, {})).length ? json.parse(r.totals_json, {}) : totalsOf(r.id) }));
     },
+    reconcileRuns,
     getRun: (id, user) => { const run = shapeRun(loadRun(id, user), { withItems: true }); return { ...run, totals: Object.keys(run.totals).length ? run.totals : totalsOf(run.id) }; },
     report, cleanup,
     selectAccounts, capabilityStatus,

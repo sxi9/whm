@@ -138,6 +138,13 @@ describe('List Accounts', () => {
     expect(html).toContain('resell1');
     expect(html).toContain('manager or email');
   });
+
+  it('seeds the search from a ?q= deep link (Manage Databases, Service Manager) so the linked account is shown', () => {
+    apiData['/accounts'] = [{ username: 'alice', domain: 'alice.example', owner: 'root', manager: 'root', manager_role: 'root', package_name: 'default', ip: '203.0.113.10', disk_used_mb: 1, disk_quota_mb: 100, contact_email: 'a@example.com', created_at: '2026-10-29 10:00:00', suspended: 0 }];
+    const html = render(<AccountsTable />, ['/account-information/list-accounts?q=alice']);
+    expect(html).toContain('value="alice"');
+    expect(render(<AccountsTable />, ['/account-information/list-accounts'])).toContain('value=""');
+  });
 });
 
 describe('TopBar unread badge', () => {

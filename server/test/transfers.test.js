@@ -22,11 +22,15 @@ const HANDLERS = {
     'sys.binaries': ({ names }) => Object.fromEntries(names.map((n) => [n, Boolean(BINS[n])])),
     'fs.mkdir': ({ path }) => ({ path }),
     'fs.write_file': ({ path, content }) => ({ path, bytes: Buffer.byteLength(content) }),
-    'fs.chown': ({ path, owner }) => ({ path, owner }),
+    'fs.chown': ({ path, owner, group }) => ({ path, owner, group }),
+    // The host runs Apache as www-data: every restored public_html gets that group (as account creation does).
+    'user.get': ({ username }) => (username === 'www-data' ? { username, uid: 33, gid: 33, home: '/var/www', shell: '/usr/sbin/nologin' } : null),
     'fs.remove': ({ path }) => ({ path }),
     // Only cpmove-dave.tar.gz is present in the upload directory (as transfer.archive.list says); other archives exist elsewhere.
     'fs.stat': ({ path }) => (path.startsWith('/var/lib/whm/transfers/uploads/') && !path.endsWith('/cpmove-dave.tar.gz') ? { path, exists: false } : path.endsWith('.tar.gz') ? { path, exists: true, isDirectory: false, size: 2048, mtime: '2026-10-26T00:00:00.000Z' } : { path, exists: true, isDirectory: true }),
     'fs.copy_tree': ({ from, to }) => ({ from, to }),
+    // Files received from another server: a Drupal FollowSymLinks line is healed, a legacy `Options All` is left for the owner.
+    'web.htaccess.audit': ({ roots, username, fix }) => { const docroot = roots[0].endsWith('/public_html') ? roots[0] : `${roots[0]}/public_html`; return { roots, username, fix, scanned: 2, rewritten: [{ file: `${docroot}/drupal/.htaccess`, lines: 1 }], unsupported: [{ file: `${docroot}/legacy/.htaccess`, line: 1, tokens: ['All'] }], skipped: [], skippedRoots: [], truncated: false }; },
     'transfer.remote.probe': ({ connection }) => ({ ok: true, hostname: connection.host, kernel: '6.1.0', uid: 0, isRoot: true, addresses: [REMOTE_IP], tools: { rsync: true, mysqldump: true, mysql: true }, cpanel: true, os: { id: 'almalinux', name: 'AlmaLinux 9', version: '9' }, homeDisk: null }),
     'transfer.remote.list_accounts': () => ({ cpanel: true, accounts: [
       { username: 'bob', uid: 1001, gid: 1001, home: '/home/bob', shell: '/bin/bash', domain: 'bob.com', domains: ['shop.bob.com', 'bobshop.net', 'bobalias.org', 'bobshop.bob.com'], homeListed: true },
@@ -321,9 +325,17 @@ describe('Transfers API', () => {
       expect(optionsOf('transfer.remote.rsync').map((o) => o.timeoutMs)).toEqual([86_460_000, 86_460_000]);
       expect(optionsOf('transfer.remote.dump_database').map((o) => o.timeoutMs)).toEqual([7_260_000]);
       expect(app.agent.callsTo('fs.chown')[0].args).toMatchObject({ path: account.home_dir, owner: 'robert', recursive: true });
+      // rsync --chown leaves public_html user:user; Apache (www-data) needs the group on the document root.
+      expect(app.agent.callsTo('fs.chown')[1].args).toEqual({ path: `${account.home_dir}/public_html`, owner: 'robert', group: 'www-data' });
 
       const run = (await get(`/runs/${runId}`).expect(200)).body.data;
       expect(run).toMatchObject({ kind: 'transfer', status: 'done', source: 'root@src.example.com' });
+      expect(run.items[0].steps.home).toMatchObject({ status: 'applied', webGroup: 'www-data', detail: expect.stringMatching(/public_html shared with www-data/) });
+      // The vhost's AllowOverride refuses FollowSymLinks/All in .htaccess: the whole home is checked, healed where possible, the rest named in the step and the log.
+      expect(app.agent.callsTo('web.htaccess.audit').map((c) => c.args)).toContainEqual({ roots: [account.home_dir], username: 'robert', fix: true });
+      expect(run.items[0].steps.home).toMatchObject({ htaccessRewritten: [`${account.home_dir}/public_html/drupal/.htaccess`], htaccessUnsupported: [{ file: `${account.home_dir}/public_html/legacy/.htaccess`, line: 1, tokens: ['All'] }], detail: expect.stringMatching(/1 \.htaccess FollowSymLinks line\(s\) rewritten; 1 \.htaccess file\(s\) need attention/) });
+      expect(run.job.logs.some((l) => l.level === 'warn' && /legacy\/\.htaccess line 1: Options All is not allowed in an account \.htaccess/.test(l.line))).toBe(true);
+      expect(run.job.logs.some((l) => /drupal\/\.htaccess: Options FollowSymLinks rewritten to SymLinksIfOwnerMatch/.test(l.line))).toBe(true);
       expect(run.job.logs.length).toBeGreaterThan(2);
       const item = run.items[0];
       expect(item).toMatchObject({ source_username: 'bob', username: 'robert', domain: 'bob.com' });
@@ -541,7 +553,11 @@ describe('Transfers API', () => {
       expect(app.agent.callsTo('transfer.cpmove.inspect')).toHaveLength(0);
       const run = (await get(`/runs/${res.body.data.run.id}`).expect(200)).body.data;
       const item = run.items[0];
-      expect(item.steps.home.status).toBe('applied');
+      expect(item.steps.home).toMatchObject({ status: 'applied', webGroup: 'www-data' });
+      // The extract chowns the tree user:user; the document root then gets the web server's group.
+      expect(app.agent.callsTo('fs.chown').map((c) => c.args)).toContainEqual({ path: `${account.home_dir}/public_html`, owner: 'dave', group: 'www-data' });
+      expect(app.agent.callsTo('web.htaccess.audit').map((c) => c.args)).toContainEqual({ roots: [account.home_dir], username: 'dave', fix: true });
+      expect(item.steps.home).toMatchObject({ htaccessRewritten: [`${account.home_dir}/public_html/drupal/.htaccess`], htaccessUnsupported: [{ file: `${account.home_dir}/public_html/legacy/.htaccess`, line: 1, tokens: ['All'] }] });
       expect(item.steps.databases[0]).toMatchObject({ name: 'dave_blog', status: 'pending' });
       expect(app.agent.callsTo('transfer.user.set_password_hash')[0].args).toEqual({ username: 'dave', hash: SHADOW });
       expect(item.steps.password).toMatchObject({ status: 'applied', detail: expect.stringMatching(/hash copied/) });
@@ -677,13 +693,17 @@ describe('Transfers API', () => {
       expect(alice.domains.map((d) => d.domain)).toEqual(['alice.com']);
       const copy = app.agent.callsTo('fs.copy_tree');
       expect(copy[0].args).toMatchObject({ from: `${alice.home_dir}/public_html/aliceshop`, to: `${shop.home_dir}/public_html` });
+      const chowns = app.agent.callsTo('fs.chown').map((c) => c.args);
+      expect(chowns).toContainEqual({ path: `${shop.home_dir}/public_html`, owner: 'shop', recursive: true });
+      expect(chowns).toContainEqual({ path: `${shop.home_dir}/public_html`, owner: 'shop', group: 'www-data' });
       expect(copy.some((c) => c.args.from === `${alice.home_dir}/mail/aliceshop.com`)).toBe(true);
       expect(app.agent.callsTo('fs.remove').some((c) => c.args.path === `${alice.home_dir}/public_html/aliceshop` && c.args.recursive)).toBe(true);
       expect(app.agent.callsTo('user.set_password')[0].args).toMatchObject({ username: 'shop' });
       const run = (await get(`/runs/${res.body.data.run.id}`).expect(200)).body.data;
       const item = run.items[0];
       expect(['done', 'pending']).toContain(item.status);
-      expect(item.steps.files.status).toBe('applied');
+      expect(item.steps.files).toMatchObject({ status: 'applied', webGroup: 'www-data', htaccessRewritten: [`${shop.home_dir}/public_html/drupal/.htaccess`], htaccessUnsupported: [{ file: `${shop.home_dir}/public_html/legacy/.htaccess`, line: 1, tokens: ['All'] }] });
+      expect(app.agent.callsTo('web.htaccess.audit').map((c) => c.args)).toContainEqual({ roots: [`${shop.home_dir}/public_html`], username: 'shop', fix: true });
       expect(item.steps.domains.removed.sort()).toEqual(['aliceshop.alice.com', 'aliceshop.com']);
       // No BIND on this host: the zone row is created for the new account and published later.
       expect(['applied', 'pending']).toContain(item.steps.dns.status);

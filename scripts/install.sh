@@ -559,6 +559,47 @@ case "$STACK" in
   *) STACK_RESULT="not chosen (no terminal): the setup wizard offers the profiles at the first login, or re-run with --stack full|web" ;;
 esac
 
+# RHEL family with SELinux: Apache and every PHP-FPM pool run confined as httpd_t, which may
+# neither search /home/<user> nor write the docroot, tmp and logs trees under it, nor append to
+# the per-domain logs, so every hosted site answers 403 until the homedir booleans are on and the
+# trees are labelled. The agent applies exactly these booleans and file contexts on every vhost
+# and PHP-FPM pool write (agent/src/ops/web.js ensureSelinuxWebAccess); doing it once here labels
+# accounts that already exist and makes the first vhost work. semanage
+# (policycoreutils-python-utils) is also what the agent needs to label a changed SSH port.
+# Every failure is logged, never fatal: the agent repeats the steps and reports them.
+apply_selinux_web_policy() {
+  local mode name type rule
+  local -a off=()
+  command -v getenforce >/dev/null || return 0
+  mode=$(getenforce 2>/dev/null || true)
+  case "$mode" in Enforcing|Permissive) ;; *) return 0 ;; esac
+  log "SELinux is $mode: allowing httpd to serve account homes"
+  if ! command -v semanage >/dev/null; then
+    install_packages policycoreutils-python-utils || log "policycoreutils-python-utils could not be installed: the panel labels with chcon (lost on a relabel) until semanage exists"
+  fi
+  for name in httpd_enable_homedirs httpd_read_user_content httpd_can_network_connect httpd_can_sendmail; do
+    if getsebool "$name" 2>/dev/null | grep -q -- '--> *off$'; then off+=("$name=on"); fi
+  done
+  if [ ${#off[@]} -gt 0 ]; then
+    setsebool -P "${off[@]}" || log "setsebool -P ${off[*]} failed: hosted sites answer 403 until the booleans are on"
+  fi
+  if command -v semanage >/dev/null; then
+    while IFS=$'\t' read -r type rule; do
+      [ -n "$rule" ] || continue
+      if ! semanage fcontext -a -t "$type" "$rule" >/dev/null 2>&1; then
+        semanage fcontext -l 2>/dev/null | grep -qF -- "$rule" || log "semanage fcontext -a -t $type '$rule' failed"
+      fi
+    done <<'EOF'
+httpd_sys_rw_content_t	/home/[^/]+/public_html(/.*)?
+httpd_sys_rw_content_t	/home/[^/]+/tmp(/.*)?
+httpd_sys_rw_content_t	/home/[^/]+/logs(/.*)?
+httpd_log_t	/var/log/whm/domlogs(/.*)?
+EOF
+    restorecon -R /home "$LOG_DIR" >/dev/null 2>&1 || log "restorecon -R /home $LOG_DIR failed; run it by hand so existing accounts are labelled"
+  fi
+}
+case "$PKG" in apt) ;; *) apply_selinux_web_policy ;; esac
+
 log "Installing systemd units"
 sed "s#/usr/bin/node#$NODE_BIN#g; s#/opt/whm#$APP_DIR#g" "$APP_DIR/deploy/whm-agentd.service" > /etc/systemd/system/whm-agentd.service
 sed "s#/usr/bin/node#$NODE_BIN#g; s#/opt/whm#$APP_DIR#g; s#/var/lib/whm#$DATA_DIR#g" "$APP_DIR/deploy/whm-panel.service" > /etc/systemd/system/whm-panel.service

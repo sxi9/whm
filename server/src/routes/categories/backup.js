@@ -10,7 +10,10 @@ const remotePath = z.string().max(512).regex(/^(?!.*(^|\/)\.\.(\/|$))[A-Za-z0-9.
 const hostField = fields.hostname.or(fields.ip);
 const secret = z.string().max(256).regex(/^[^\n\r\0]*$/);
 const nonEmpty = z.string().min(1).max(256).regex(/^[^\n\r\0]+$/);
-const url = z.string().url().max(2048).refine((u) => /^https?:\/\//.test(u), 'http(s) URL required');
+// The WHATWG parser behind .url() strips tabs and newlines, so the agent's
+// character class runs first: a URL that curl would read line by line is a
+// field error on save, not an invalid_args at the first upload.
+const url = z.string().max(2048).regex(/^https?:\/\/[^\s"'\\\x00-\x1f\x7f]+$/, 'http(s) URL without whitespace, quotes or control characters').url();
 const port = z.number().int().min(1).max(65535);
 
 // Mirrors the agent's destinationConfig so a bad configuration fails here with

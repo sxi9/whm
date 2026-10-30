@@ -539,9 +539,11 @@ defineOp('db.grants.list', {
   description: 'SHOW GRANTS for a user at a host, parsed per database',
   schema: withCreds({ user: mysqlUser, host: host.default('localhost') }),
   run: async ({ user, host: h, credentials: creds }, ctx) => {
+    // The raw SHOW GRANTS lines never leave the agent: MariaDB prints the
+    // account's password hash in them (IDENTIFIED BY PASSWORD '*...').
     const lines = (await mysql(`SHOW GRANTS FOR ${q.account(user, h)}`, creds, ctx, { headers: false })).map((r) => r[0]);
     const grants = lines.map(parseGrant).filter(Boolean).filter((g) => !(g.database === '*' && g.privileges.length === 1 && g.privileges[0] === 'USAGE')).map(({ raw, ...g }) => g);
-    return { user, host: h, raw: lines, grants };
+    return { user, host: h, grants };
   },
 });
 

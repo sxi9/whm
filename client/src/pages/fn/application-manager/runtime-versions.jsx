@@ -1,10 +1,9 @@
 import { useState } from 'react';
-import { Link } from 'react-router-dom';
 import { Download, RefreshCw } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { useAuth } from '../../../auth/AuthContext.jsx';
-import { PageHeader, Card, StatusPill, KeyValue, Loading, formatDate } from '../../../components/Common.jsx';
+import { PageHeader, Card, StatusPill, KeyValue, Loading, CapabilityNotice, formatDate } from '../../../components/Common.jsx';
 import { Field, TextInput, NumberInput, Select, Toggle, Button, ErrorBanner } from '../../../components/Form.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
@@ -12,6 +11,24 @@ import { RequestError, useJobRunner, JobPanel } from '../../software/Shared.jsx'
 import { CapabilitySummary } from '../../apps/Shared.jsx';
 
 const NODE_VERSION = /^\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+
+// The API clears capabilities.python whenever no interpreter can create a
+// venv (python3 on PATH alone is not enough), so the page offers the one-click
+// capability install instead of a hand-install recipe. Null means usable.
+export function pythonMissingMessage(data) {
+  const list = data?.python || [];
+  const usable = list.some((p) => p.venv);
+  if (data?.capabilities?.python !== false && usable) return null;
+  const lead = list.length ? 'An interpreter without venv support cannot run applications.' : 'No Python 3 found.';
+  return `${lead} Python applications need python3 with the venv module: python3, python3-venv and python3-pip (Debian/Ubuntu) or python3 and python3-pip (RHEL).`;
+}
+
+export function gitMissingMessage(data) {
+  if (data?.git?.installed !== false && data?.capabilities?.git !== false) return null;
+  return 'git is not installed on this server; deploying or pulling an application from a repository is refused until it is.';
+}
+
+const capabilityError = (message) => ({ code: 'capability_missing', status: 501, message });
 
 export function NodeRuntimeTable({ node, defaultNode, onDefault, onRemove, isRoot }) {
   const list = node || [];
@@ -174,6 +191,8 @@ export default function RuntimeVersions({ fn }) {
   const pythonOptions = [{ value: 'system', label: 'system (first interpreter with venv)' }, ...pythonMinors.map((v) => ({ value: v, label: `Python ${v}` }))];
   const dirty = Boolean(data?.defaults) && (defaults.node !== data.defaults.node || defaults.python !== data.defaults.python);
   const managedInstalled = new Set((data?.node || []).filter((n) => n.source === 'managed').map((n) => n.version));
+  const pythonMissing = pythonMissingMessage(data);
+  const gitMissing = gitMissingMessage(data);
 
   return (
     <>
@@ -205,10 +224,9 @@ export default function RuntimeVersions({ fn }) {
           <Card title="Python" subtitle="Interpreters on the search path; applications run inside a virtual environment, so venv support is required."
             actions={isRoot && <Select value={defaults.python} onChange={(python) => setDefaults({ ...defaults, python })} options={pythonOptions} style={{ width: 240 }} aria-label="Default Python" />}>
             <PythonRuntimeTable python={data.python} />
-            {(!data.python?.length || data.python.some((p) => !p.venv)) && (
-              <p className="muted" style={{ marginTop: 10 }}>
-                {data.python?.length ? 'An interpreter without venv support cannot run applications.' : 'No Python 3 found.'} Install <code>python3</code>, <code>python3-venv</code> and <code>python3-pip</code> (Debian/Ubuntu) or <code>python3</code> and <code>python3-pip</code> (RHEL) with <Link to="/software/install-distro-packages">Install Distro Packages</Link>.
-              </p>
+            {pythonMissing && <div style={{ marginTop: 10 }}><CapabilityNotice capability="python" error={capabilityError(pythonMissing)} onRetry={runtimes.refetch} /></div>}
+            {!pythonMissing && data.python?.some((p) => !p.venv) && (
+              <p className="muted" style={{ marginTop: 10 }}>An interpreter without venv support cannot run applications; the default is the first one that can create a virtual environment.</p>
             )}
           </Card>
           <Card title="Tools">
@@ -219,6 +237,7 @@ export default function RuntimeVersions({ fn }) {
               ['systemd', <StatusPill key="s" status={data.capabilities?.systemd ? 'installed' : 'not-installed'}>{data.capabilities?.systemd ? 'available' : 'missing'}</StatusPill>],
               ['ACL tools (setfacl)', <StatusPill key="acl" status={data.capabilities?.acl ? 'installed' : 'unknown'}>{data.capabilities?.acl ? 'installed' : 'missing (chmod fallback for static builds)'}</StatusPill>],
             ]} />
+            {gitMissing && <div style={{ marginTop: 10 }}><CapabilityNotice capability="git" error={capabilityError(gitMissing)} onRetry={runtimes.refetch} /></div>}
           </Card>
           {isRoot && <PolicyCard />}
         </>

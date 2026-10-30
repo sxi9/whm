@@ -474,6 +474,32 @@ describe('Application Manager API', () => {
     expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action IN ('app.deploy', 'app.rebuild')").get().n).toBe(2);
   });
 
+  it('writes what the agent did about SELinux into the deploy log', async () => {
+    const detect = app.agent.calls.find((c) => c.name === 'app.runtime.detect');
+    expect(detect).toBeDefined();
+    app.agent.set('app.runtime.detect', () => ({ node: [SYSTEM_NODE, ...managedNode], python: systemPython, git: { installed: true, version: '2.43.0' }, arch: 'x64', selinux: { mode: 'enforcing', enforcing: true, semanage: false } }));
+    app.agent.set('app.proxy.write', ({ domain, apps }) => ({ domain, path: `/etc/apache2/whm-apps/${domain}.conf`, apps: apps.length, removed: apps.length === 0, modules: { enabled: [], missing: [] }, reloaded: true, selinux: { mode: 'enforcing', applied: true, persistent: false, booleans: ['httpd_can_network_connect', 'httpd_read_user_content'], rules: [], relabelled: ['/home/alice/public_html'], warnings: ['semanage is missing (policycoreutils-python-utils): the labels were set with chcon and will not survive a relabel'] } }));
+    try {
+      const rb = await post(`/api/apps/${flaskId}/rebuild`);
+      expect(rb.status).toBe(202);
+      const done = await waitForJob(app.ctx, rb.body.data.job.id);
+      expect(done.status, done.error).toBe('done');
+      const lines = done.logs.map((l) => [l.level, l.line]);
+      expect(lines).toContainEqual(['warn', 'SELinux is enforcing; semanage is missing (policycoreutils-python-utils), so file labels cannot be made persistent']);
+      expect(lines).toContainEqual(['info', 'SELinux is enforcing: booleans httpd_can_network_connect, httpd_read_user_content turned on; relabelled /home/alice/public_html (not persistent: semanage is missing)']);
+      expect(lines).toContainEqual(['warn', 'SELinux: semanage is missing (policycoreutils-python-utils): the labels were set with chcon and will not survive a relabel']);
+      // A host without SELinux (no field, or disabled) adds nothing.
+      app.agent.set('app.proxy.write', ({ domain, apps }) => ({ domain, path: `/etc/apache2/whm-apps/${domain}.conf`, apps: apps.length, removed: false, modules: { enabled: [], missing: [] }, reloaded: true, selinux: { mode: 'disabled', applied: false } }));
+      app.agent.set('app.runtime.detect', () => ({ node: [SYSTEM_NODE, ...managedNode], python: systemPython, git: { installed: true, version: '2.43.0' }, arch: 'x64', selinux: { mode: null, enforcing: false, semanage: false } }));
+      const quiet = await waitForJob(app.ctx, (await post(`/api/apps/${flaskId}/rebuild`)).body.data.job.id);
+      expect(quiet.status, quiet.error).toBe('done');
+      expect(quiet.logs.some((l) => /SELinux/.test(l.line))).toBe(false);
+    } finally {
+      app.agent.set('app.runtime.detect', () => ({ node: [SYSTEM_NODE, ...managedNode], python: systemPython, git: { installed: true, version: '2.43.0' }, arch: 'x64' }));
+      app.agent.set('app.proxy.write', ({ domain, apps }) => ({ domain, path: `/etc/apache2/whm-apps/${domain}.conf`, apps: apps.length, removed: apps.length === 0, modules: { enabled: [], missing: [] }, reloaded: true }));
+    }
+  });
+
   it('updates env, limits and flags in place, rewriting the unit and the include', async () => {
     const before = app.agent.calls.length;
     const res = await put(`/api/apps/${apiId}`, { env: { NEW_SECRET: 'hunter2-value', LOG_LEVEL: 'debug' }, limits: { memoryMaxMb: 1024 }, websockets: false, name: 'API v2' });

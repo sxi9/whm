@@ -108,6 +108,27 @@ defineOp('user.unlock', {
   },
 });
 
+// `quotaon -p` reports "user quota on <mountpoint> (<device>) is on|off" and
+// fails when the filesystem carries no quota at all. Probing first turns a
+// bare setquota failure on a host whose tools are installed but whose
+// filesystem was never set up into a code the panel treats as pending.
+export function parseQuotaonState(stdout, stderr = '') {
+  const m = `${stdout}\n${stderr}`.match(/user quota on \S.* is (on|off)\b/);
+  return m ? m[1] === 'on' : null;
+}
+
+async function assertUserQuotaEnabled(filesystem) {
+  if (!hasBinary('quotaon')) return null;
+  const { code, stdout, stderr } = await exec('quotaon', ['-p', '-u', filesystem], { allowFailure: true, timeoutMs: 30_000 });
+  const on = parseQuotaonState(stdout, stderr);
+  if (on === true) return true;
+  if (on === false || code !== 0) {
+    const reason = on === false ? 'quotaon reports them off' : `${String(stderr || stdout).trim().split('\n').pop() || `quotaon exited ${code}`}`;
+    throw new OpError('quota_not_enabled', `User quotas are not enabled on ${filesystem} (${reason}); enable them with Initial Quota Setup first`, { filesystem });
+  }
+  return null;
+}
+
 defineOp('user.set_quota', {
   description: 'Set filesystem disk quota for a user (MB; 0 = unlimited)',
   schema: z.object({
@@ -119,10 +140,11 @@ defineOp('user.set_quota', {
   run: async ({ username, softMb, hardMb, filesystem }) => {
     assertManaged(username);
     if (!hasBinary('setquota')) throw new OpError('capability_missing', 'Disk quotas are not installed (quota package missing). Use Initial Quota Setup first.');
+    const enabled = await assertUserQuotaEnabled(filesystem);
     const soft = String(softMb * 1024);
     const hard = String(hardMb * 1024);
     await exec('setquota', ['-u', username, soft, hard, '0', '0', filesystem]);
-    return { username, softMb, hardMb, filesystem };
+    return { username, softMb, hardMb, filesystem, quotaActive: enabled };
   },
 });
 

@@ -222,6 +222,17 @@ export function createSystemStackService(ctx) {
           steps.push({ step: step.kind, ok: false, error: err.message });
         }
       }
+      // A component that stands for a Service Manager row is not installed
+      // until its daemon can be enabled: packages that leave no unit behind
+      // (a CLI-only package, a renamed daemon package) are a failure to act
+      // on, not a warning in the log.
+      const enable = component.service ? steps.find((st) => st.step === 'enable' && (st.skipped || st.ok === false)) : null;
+      if (enable) {
+        const error = enable.error ? `the ${component.service} service could not be enabled: ${enable.error}` : `no systemd unit found among ${(enable.candidates || component.units).join(', ')} after installing ${packages.join(', ')}; the ${component.service} service cannot start`;
+        job.log(`${component.label}: ${error}`, 'error');
+        results.push({ key: component.key, ok: false, error, installed: missing, steps });
+        continue;
+      }
       results.push({ key: component.key, ok: true, installed: missing, steps });
     }
     job.progress(95, 'Refreshing capability detection');

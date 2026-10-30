@@ -73,7 +73,12 @@ defineOp('fs.mkdir', {
     if (mode || ids) {
       // The mode and owner are applied through a descriptor that refuses to
       // open a link, so a swap between the check and here changes nothing else.
-      const fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      let fd;
+      try {
+        fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      } catch (err) {
+        throw new OpError('refused', `${p} is no longer a plain directory (${err.code}); refusing to chown or chmod it as root`);
+      }
       try {
         if (mode) fs.fchmodSync(fd, parseInt(mode, 8));
         if (ids) fs.fchownSync(fd, ids.uid, ids.gid);

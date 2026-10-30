@@ -305,3 +305,25 @@ describe('schemas of ops that had no rejection tests', () => {
     expect(exec).not.toHaveBeenCalled();
   });
 });
+
+describe('fs.mkdir never chowns or chmods through a planted link', () => {
+  it('refuses a link to a directory another user owns, leaving its owner, mode and contents untouched', async () => {
+    const home = path.join(root, 'mkdir-home');
+    const victim = path.join(root, 'mkdir-victim');
+    fs.mkdirSync(home);
+    fs.mkdirSync(victim, { mode: 0o700 });
+    if (process.getuid?.() === 0) fs.chownSync(victim, 65534, 65534);
+    const before = fs.lstatSync(victim);
+    const link = path.join(home, 'public_html');
+    fs.symlinkSync(victim, link);
+    exec.mockClear();
+    for (const args of [{ path: link, owner: 'root', mode: '0755' }, { path: `${link}/cgi-bin`, owner: 'root', group: 'root' }, { path: link }, { path: `${link}/a/b`, mode: '0777' }]) {
+      expect((await opError(runOp('fs.mkdir', args, ctx))).code, JSON.stringify(args)).toBe('refused');
+    }
+    const after = fs.lstatSync(victim);
+    expect([after.uid, after.gid, after.mode & 0o7777]).toEqual([before.uid, before.gid, before.mode & 0o7777]);
+    expect(fs.readdirSync(victim)).toEqual([]);
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(exec).not.toHaveBeenCalled();
+  });
+});

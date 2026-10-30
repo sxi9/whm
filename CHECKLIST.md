@@ -58,9 +58,9 @@ a fix round ~15 min; most categories need one fix round.
 | Phase-6 verification (49 agents: 3 areas × lenses, 3 refuters per finding, docs check, critic) → 11 confirmed findings fixed with tests (`50d0f14`); fresh-clone gate fixes | done | 2 h | 2026-10-29 21:00 |
 | **Category 31 — Application Manager** (design `docs/design/application-manager.md`; agent family `app.*`, `ctx.apps`, migration 033, 3 pages, 15 presets; 2 review lenses + fix round, 21 findings closed; gate server 1201 / agent 547 / client 74) — owner ask | done, `81417ea` | 3 h | 2026-10-29 21:20 |
 | **Platform fixes round 1** — the owner's 26-item issue list as 9 units (U1 installer/stack/setup wizard/install-from-panel, U2 HTTPS/hostname/branded pages, U3 HST Panel rename, U4 super admin + hidden hub + hub TOTP, U5 external-auth presets, U6 Cloudflare DNS, U7 account manager + chat, U8 terminal latency, U9 quota page) — 13 reviews, 55 findings verified, fix round (33 fixed, 18 cross-unit leftovers) | done — `wf_d0005cdd-38a` (193 agents) + integration round `wf_52f47b76-660` (5 agents + regression review, 3 findings fixed); gate server 1309 / agent 573 / client 131 / hub 197 | 7 h | 2026-10-30 05:00 |
-| Full audit bug-hunt (lens × scope finders until dry, 3 refuters each, grouped fixes) — owner ask | pending | ~4 h | — |
+| **Full audit bug-hunt** (lens × scope finders until dry, 3 refuters each, grouped fixes) — owner ask | done — **81 confirmed findings** (6 blocking / 47 major / 28 minor), **84 fixes by 49 grouped fixers** with tests, landed `b100fd3` (server suite 1349 green); **this integration round** closes the fixers' cross-area companions (`audit-outcome.md` NOT FIXED notes: web-server group on every docroot, SELinux at install + docs, XFS-root quota kernel args in the page/docs, hub mail default `smtp` docs, SameSite=lax docs, confined tokens in core middleware, run-row sweeps for backup/multi-account, ui_dist test) | 4 h 30 min | 2026-10-30 12:51 (fixes) |
 | Final gate + screenshots + HANDOFF/CLAUDE.md rewrite (correction notes from the verifier's docs check) | pending | 1 h | — |
-| **Total remaining** | | **~5 h** (fix round, audit, final gate) | |
+| **Total remaining** | | **~1 h** (audit integration review, final gate) | |
 
 Faster option: verification can be cut to one reviewer and one fix round per category
 (~30% less time, less thorough). Not applied unless requested.
@@ -130,7 +130,7 @@ Round history: platform-fixes build (9 units) → adversarial review (two lenses
 | 24 | Hide the license hub from everyone but the super admin; password-protected setup command | done — `users.superadmin` (001e), `whm-cli superadmin` gated by the setup password (`/etc/whm/superadmin.key`, root-owned), License tab, marketplace/market hub origin and audit text hidden for other roots |
 | 25 | Installer: company logo, friendlier flow | done — HST Panel banner, stack menu, hub URL and super admin prompts (each with a non-interactive variable), TLS/stack/super-admin lines in the summary |
 | 26 | Hub: `licserver.hostingsignal.in` default, hidden calls, authenticator support on all dashboards | done — default URLs, server-side-only hub calls, forced TOTP enrolment (`hub.require_totp_for_admins`), login/step-up with once-per-step codes for vendor, reseller and developer portal users |
-| — | "Full audit, find more bugs" | pending — `full-audit` workflow after the fix round |
+| — | "Full audit, find more bugs" | done — `full-audit` workflow: 81 confirmed findings (6 blocking / 47 major / 28 minor), 84 fixes by 49 fixers (`b100fd3`); cross-area companions closed by the audit integration round (see the timeline row) |
 
 ## Functions — all 31 categories (216)
 

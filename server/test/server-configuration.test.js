@@ -265,6 +265,32 @@ describe('Server Configuration API', () => {
       expect(job2.status).toBe('done');
       expect(job2.result.enabled).toBe(false);
       expect(job2.logs.some((l) => l.line.includes('/etc/fstab'))).toBe(true);
+      // An XFS root is mounted from the kernel command line: the log carries the exact boot-loader command.
+      const kernelArgs = { method: 'grubby', arg: 'rootflags=uquota,gquota', command: 'grubby --update-kernel=ALL --args=rootflags=uquota,gquota', configured: false };
+      quotaResult = { mountpoint: '/', enabled: false, reason: 'kernel_args_required', steps: [{ step: 'kernel-args', ok: false, detail: '/ is mounted by the initramfs' }], fstab: '/dev/vda1\t/\txfs\tdefaults,uquota,gquota\t0\t1', kernelArgs };
+      const res3 = await post('/quota/enable', { mountpoint: '/' }).expect(202);
+      const job3 = await waitForJob(app.ctx, res3.body.data.job.id);
+      expect(job3.status).toBe('done');
+      const manual = job3.logs.find((l) => l.level === 'warn' && l.line.includes('kernel command line'));
+      expect(manual.line).toContain('Run: grubby --update-kernel=ALL --args=rootflags=uquota,gquota');
+      expect(manual.line).toContain('then reboot');
+      expect(job3.logs.some((l) => l.line.includes('kernel_args_required'))).toBe(false);
+      // Once the boot loader carries the flags, only the reboot is left.
+      quotaResult = { ...quotaResult, reason: 'reboot_required', kernelArgs: { ...kernelArgs, configured: true } };
+      const job4 = await waitForJob(app.ctx, (await post('/quota/enable', { mountpoint: '/' }).expect(202)).body.data.job.id);
+      expect(job4.logs.some((l) => l.level === 'warn' && /already passes rootflags=uquota,gquota .*reboot/.test(l.line))).toBe(true);
+      // "Update fstab and enable" applies the kernel arguments itself and says what it changed.
+      const fstabOp = app.agent.calls.find((c) => c.name === 'quota.fstab.enable');
+      app.agent.set('quota.fstab.enable', ({ mountpoint }) => ({ mountpoint, changed: true, previousLine: '/dev/vda1 / xfs defaults 0 1', line: '/dev/vda1\t/\txfs\tdefaults,uquota,gquota\t0\t1', backup: '/etc/fstab.whm-bak', kernelArgs: { ...kernelArgs, configured: true, applied: true } }));
+      try {
+        const job5 = await waitForJob(app.ctx, (await post('/quota/enable', { mountpoint: '/', updateFstab: true }).expect(202)).body.data.job.id);
+        expect(job5.result.fstab.kernelArgs).toMatchObject({ applied: true, command: kernelArgs.command });
+        expect(job5.logs.some((l) => l.line === `boot loader: ${kernelArgs.command}; the kernel passes rootflags=uquota,gquota on the next boot`)).toBe(true);
+      } finally {
+        app.agent.set('quota.fstab.enable', ({ mountpoint }) => ({ mountpoint, changed: true, previousLine: '/dev/vda1 / ext4 defaults 0 1', line: '/dev/vda1\t/\text4\tdefaults,usrquota,grpquota\t0\t1', backup: '/etc/fstab.whm-bak' }));
+        expect(fstabOp).toBeDefined();
+      }
+      quotaResult = { mountpoint: '/', enabled: true, steps: [], active: { user: true, group: true } };
       const off = await post('/quota/disable', { mountpoint: '/' }).expect(200);
       expect(off.body.data.disabled).toBe(true);
     });

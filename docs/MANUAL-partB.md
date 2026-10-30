@@ -93,7 +93,11 @@ otherwise every request answers `403 feature_required`. Capabilities registered 
 - **Needs:** `tar`; `mysql` for database import; BIND and Exim for the DNS and mail steps (otherwise those
   items stay `pending`).
 - **Gotchas:** a path entered by hand must be absolute and under an allowed root; anything else is refused with
-  `403 path_not_allowed`. Leaving the password empty keeps the password hash found in the archive.
+  `403 path_not_allowed`. Leaving the password empty keeps the password hash found in the archive. The restored
+  home is checked for `.htaccess` `Options` lines the account vhost refuses (MANUAL 7.1): `Options +FollowSymLinks`
+  (Drupal, Joomla) is rewritten to `SymLinksIfOwnerMatch` in the account's own files; `All`, `ExecCGI` and
+  `Includes` are named in the run log and the `home` step (`htaccessUnsupported`) because the site answers 500
+  until that line is changed.
 
 #### 16.4 Transfer Tool
 
@@ -114,7 +118,10 @@ otherwise every request answers `403 feature_required`. Capabilities registered 
 - **Needs:** `ssh` (and `sshpass` for password logins; the API says so with a `501` and the package name —
   connect with a private key instead), `rsync`, `tar`, `mysql`.
 - **Gotchas:** private keys are limited to 16 KB and must be unencrypted; passwords must be a single line. A
-  remote server without root access cannot hand over password hashes, so set passwords explicitly.
+  remote server without root access cannot hand over password hashes, so set passwords explicitly. After the
+  home copy the account's `.htaccess` files are checked as in 16.3 (`FollowSymLinks` healed, `All`/`ExecCGI`/
+  `Includes` named in the log and the `home` step); the same check runs on the copied document root of an addon
+  conversion (16.1, `files` step).
 
 ---
 

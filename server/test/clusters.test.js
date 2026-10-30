@@ -109,6 +109,9 @@ describe('clusters helpers', () => {
     expect(validateIncoming('dns.spf_default', 'v=spf1 +mx -all')).toMatchObject({ ok: true });
     expect(validateIncoming('dns.spf_default', 'v=spf1\ninclude:x')).toMatchObject({ ok: false });
     expect(validateIncoming('dns.bogus_new_key', 1)).toMatchObject({ ok: false, reason: 'not a shared setting' });
+    // Every tier Tweak Settings offers (UPDATE_TIERS) is accepted from a peer, "current" included.
+    for (const tier of ['stable', 'release', 'current', 'edge']) expect(validateIncoming('updates.tier', tier)).toEqual({ ok: true, value: tier });
+    expect(validateIncoming('updates.tier', 'nightly')).toMatchObject({ ok: false });
     // Exim's TLS block and Dovecot's cipher/mailbox-layout fields are per host: dropped on export, refused on receive.
     const exim = exportValue('service_config.exim', { rblEnabled: true, rbls: ['zen.spamhaus.org'], tls: { minProtocol: 'TLSv1.2' } });
     expect(exim).toEqual({ ok: true, value: { rblEnabled: true, rbls: ['zen.spamhaus.org'] } });
@@ -324,6 +327,13 @@ describe('Clusters API', () => {
       await as('post', '/api/auth/password', { newPassword: 'Changed-Passw0rd!1' }).expect(403);
       await as('delete', '/api/clusters/config/export').expect(403);
       await as('post', '/api/clusters/ping').expect(403);
+      // Outside the confinement the token is nobody: the refused mutation is
+      // audited without a principal, while a peer push inside it is root's.
+      expect(app.ctx.db.prepare("SELECT principal FROM audit_log WHERE action = 'POST /api/accounts' ORDER BY id DESC LIMIT 1").get()).toEqual({ principal: null });
+      await as('post', '/api/clusters/dns/receive', {}).expect(422);
+      expect(app.ctx.db.prepare("SELECT principal FROM audit_log WHERE action = 'POST /api/clusters/dns/receive' ORDER BY id DESC LIMIT 1").get()).toEqual({ principal: 'root' });
+      // Public mounts answer a confined token as they answer anyone.
+      await as('get', '/api/branding').expect(200);
       // A zone token never pushes settings; a settings token never pushes zones.
       expect((await as('post', '/api/clusters/config/receive', { settings: { 'dns.default_ttl': 1 } }).expect(403)).body.error.code).toBe('scope_confined');
       expect((await as('post', '/api/clusters/dns/receive', { domain: 'x.example.com', body: ZONE('x.example.com') }, configSecret).expect(403)).body.error.code).toBe('scope_confined');

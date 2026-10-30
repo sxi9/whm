@@ -349,6 +349,10 @@ describe('Multi Account Functions API', () => {
     });
   });
 
+  // Takes a queued job away from the worker without the cancel event, which
+  // (rightly) finalises the run; these tests then drive the run by hand.
+  const detachJob = (id) => app.ctx.db.prepare("UPDATE jobs SET status = 'cancelled', finished_at = datetime('now') WHERE id = ? AND status = 'queued'").run(id);
+
   describe('dedication through the real IP Functions service', () => {
     beforeAll(() => {
       app.ctx.settings.set('basic.main_ip', '203.0.113.10');
@@ -419,7 +423,7 @@ describe('Multi Account Functions API', () => {
       const aliceId = app.ctx.db.prepare('SELECT id FROM accounts WHERE username = ?').get('alice').id;
       try {
         const res = await post('/ip', { changes: [{ username: 'carol', ip: '203.0.113.12' }], updateDns: false, updateVhosts: false }).expect(202);
-        app.ctx.jobs.cancel(res.body.data.job.id);
+        detachJob(res.body.data.job.id);
         app.ctx.ip.allocateDedicated(aliceId, null, { address: '203.0.113.12' });
         await app.ctx.multiAccount.runChangeIp({ params: { runId: res.body.data.run.id, userId: 1 }, log() {}, progress() {} });
         const run = await get(`/runs/${res.body.data.run.id}`).expect(200);
@@ -441,7 +445,7 @@ describe('Multi Account Functions API', () => {
       app.ctx.jobs.stop();
       try {
         const modify = await rpost('/modify', { usernames: ['bob'], changes: { contactEmail: 'bob@example.net' } }).expect(202);
-        app.ctx.jobs.cancel(modify.body.data.job.id);
+        detachJob(modify.body.data.job.id);
         const jobCtx = { params: { runId: modify.body.data.run.id, userId: 999999 }, log() {}, progress() {} };
         await expect(app.ctx.multiAccount.runModify(jobCtx)).rejects.toThrow(/no longer exists/);
         const run = await get(`/runs/${modify.body.data.run.id}`).expect(200);
@@ -450,7 +454,7 @@ describe('Multi Account Functions API', () => {
         expect((await app.http.get('/api/accounts/bob')).body.data.contact_email).not.toBe('bob@example.net');
 
         const orphan = await post('/ip', { changes: [{ username: 'carol', ip: '203.0.113.12' }], updateDns: false, updateVhosts: false }).expect(202);
-        app.ctx.jobs.cancel(orphan.body.data.job.id);
+        detachJob(orphan.body.data.job.id);
         app.ctx.db.prepare('UPDATE multi_account_runs SET created_by = NULL WHERE id = ?').run(orphan.body.data.run.id);
         await expect(app.ctx.multiAccount.runChangeIp({ params: { runId: orphan.body.data.run.id, userId: null }, log() {}, progress() {} })).rejects.toThrow(/no longer exists/);
         expect((await get(`/runs/${orphan.body.data.run.id}`)).body.data.status).toBe('failed');
@@ -517,8 +521,8 @@ describe('Multi Account Functions API', () => {
         const run = await get(`/runs/${res.body.data.run.id}`).expect(200);
         const item = run.body.data.items.find((i) => i.username === 'alice');
         expect(item).toMatchObject({ status: 'pending', after: { package_name: 'gold', shell: '/bin/bash' } });
-        // Outside production mode accounts.modify swallows a failed setquota, so the step is only "recorded".
-        expect(item.steps).toMatchObject({ account: { status: 'applied' }, quota: { status: 'recorded' }, php: { status: 'pending' } });
+        // accounts.modify reports the setquota outcome it saw; here the host applied it.
+        expect(item.steps).toMatchObject({ account: { status: 'applied' }, quota: { status: 'applied', detail: expect.stringMatching(/^20480 MB: 20480 MB on \//) }, php: { status: 'pending' } });
         const csv = await get(`/runs/${res.body.data.run.id}/report`).expect(200);
         expect(csv.text).toContain('modify,alice,alice.com,pending');
       } finally { app.ctx.web = web; }
@@ -576,6 +580,66 @@ describe('Multi Account Functions API', () => {
       expect((await rget(`/runs/${rootRun.id}/report`)).status).toBe(403);
       expect((await get('/runs/999999')).status).toBe(404);
       expect((await get('/runs?kind=other')).status).toBe(422);
+    });
+
+    it('reports a quota the host could not apply as pending or failed on the item', async () => {
+      app.agent.fail('user.set_quota', 'command_failed', 'setquota: Mountpoint (or device) / not found or has no quota enabled.');
+      try {
+        const res = await post('/modify', { usernames: ['carol'], changes: { diskQuotaMb: 777 } }).expect(202);
+        const job = await finished(res.body.data.job.id);
+        expect(job.result).toMatchObject({ total: 1, failed: 1 });
+        const item = (await get(`/runs/${res.body.data.run.id}`).expect(200)).body.data.items[0];
+        expect(item.status).toBe('failed');
+        expect(item.steps.quota).toMatchObject({ status: 'failed', detail: expect.stringMatching(/^777 MB: .*Initial Quota Setup/) });
+        expect((await app.http.get('/api/accounts/carol')).body.data.disk_quota_mb).toBe(777);
+      } finally { app.agent.set('user.set_quota', (args) => args); }
+    });
+
+    it('finalises the run of a job interrupted by a panel restart once the panel is up', async () => {
+      const fresh = await createTestApp({ agent: hostAgent() });
+      try {
+        const { db } = fresh.ctx;
+        const rootId = db.prepare("SELECT id FROM users WHERE username = 'root'").get().id;
+        const job = Number(db.prepare("INSERT INTO jobs (type, params_json, created_by, status, started_at) VALUES ('multi_account.modify', '{}', ?, 'running', datetime('now'))").run(rootId).lastInsertRowid);
+        const runId = Number(db.prepare("INSERT INTO multi_account_runs (kind, job_id, created_by, requested_by, status, params_json) VALUES ('modify', ?, ?, 'root', 'running', '{}')").run(job, rootId).lastInsertRowid);
+        const item = db.prepare("INSERT INTO multi_account_run_items (run_id, username, domain, status, steps_json) VALUES (?, ?, ?, ?, '{\"plan\":{\"changes\":[\"shell\"]}}')");
+        item.run(runId, 'a1', 'a1.com', 'done');
+        item.run(runId, 'a2', 'a2.com', 'running');
+        item.run(runId, 'a3', 'a3.com', 'queued');
+        const liveJob = Number(db.prepare("INSERT INTO jobs (type, params_json, created_by) VALUES ('multi_account.change_ip', '{}', ?)").run(rootId).lastInsertRowid);
+        const live = Number(db.prepare("INSERT INTO multi_account_runs (kind, job_id, created_by, requested_by, status, params_json) VALUES ('change_ip', ?, ?, 'root', 'queued', '{}')").run(liveJob, rootId).lastInsertRowid);
+        // The live run's job is still queued at boot and gets claimed by the worker; it must not be swept.
+        fresh.ctx.jobs.register('multi_account.change_ip', () => new Promise(() => {}));
+        expect(fresh.ctx.multiAccount.reconcileRuns()).toEqual([]);
+        fresh.ctx.jobs.start();
+        expect(fresh.ctx.jobs.get(job)).toMatchObject({ status: 'failed', error_code: 'PANEL_RESTARTED' });
+        await fresh.ctx.events.emit('panel.started', {});
+        await fresh.login();
+        const shown = (await fresh.http.get(`/api/multi-account/runs/${runId}`).expect(200)).body.data;
+        expect(shown.status).toBe('failed');
+        expect(shown.finished_at).toBeTruthy();
+        expect(shown.totals).toMatchObject({ total: 3, done: 1, failed: 1, skipped: 1 });
+        expect(shown.items.map((i) => [i.status, i.detail])).toEqual([['done', null], ['failed', expect.stringMatching(/restarted/)], ['skipped', expect.stringMatching(/restarted/)]]);
+        // The steps recorded before the restart survive on the interrupted item.
+        expect(shown.items[1].steps).toEqual({ plan: { changes: ['shell'] } });
+        expect(db.prepare('SELECT r.status, j.status AS job FROM multi_account_runs r JOIN jobs j ON j.id = r.job_id WHERE r.id = ?').get(live)).toEqual({ status: 'queued', job: 'running' });
+        expect(fresh.ctx.multiAccount.reconcileRuns()).toEqual([]);
+      } finally {
+        await fresh.close();
+      }
+    });
+
+    it('finalises a run whose job is cancelled while queued', async () => {
+      const { db } = app.ctx;
+      const rootId = db.prepare("SELECT id FROM users WHERE username = 'root'").get().id;
+      const runId = Number(db.prepare("INSERT INTO multi_account_runs (kind, created_by, requested_by, status, params_json) VALUES ('modify', ?, 'root', 'queued', '{}')").run(rootId).lastInsertRowid);
+      db.prepare("INSERT INTO multi_account_run_items (run_id, username, domain, status, steps_json) VALUES (?, 'carol', 'carol.com', 'queued', '{}')").run(runId);
+      const jobId = Number(db.prepare("INSERT INTO jobs (type, params_json, created_by) VALUES ('multi_account.modify', '{}', ?)").run(rootId).lastInsertRowid);
+      db.prepare('UPDATE multi_account_runs SET job_id = ? WHERE id = ?').run(jobId, runId);
+      app.ctx.jobs.cancel(jobId);
+      const shown = (await get(`/runs/${runId}`).expect(200)).body.data;
+      expect(shown.status).toBe('failed');
+      expect(shown.items[0]).toMatchObject({ status: 'skipped', detail: expect.stringMatching(/cancelled/) });
     });
 
     it('marks a run failed when every account fails and keeps the error per item', async () => {

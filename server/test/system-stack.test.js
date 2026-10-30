@@ -213,6 +213,29 @@ describe('Server stack API', () => {
     app.agent.set('pkg.install', ({ packages }) => ({ manager: 'apt', packages, output: [] }));
   });
 
+  it('fails a component that stands for a service when no unit exists after the install', async () => {
+    // exim's package installs but leaves no exim/exim4 unit behind (e.g. a CLI-only package): the component fails, git (no service) still succeeds.
+    app.agent.set('svc.resolve', ({ candidates }) => (candidates.some((c) => /^exim/.test(c)) ? { unit: null } : { unit: candidates.find((c) => units.includes(c)) || candidates[0] }));
+    try {
+      const res = await post('/stack/install', { components: ['exim', 'git'] }).expect(202);
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.status).toBe('done');
+      expect(job.result.failed).toEqual(['exim']);
+      const exim = job.result.results.find((r) => r.key === 'exim');
+      expect(exim).toMatchObject({ ok: false, error: expect.stringMatching(/no systemd unit found among exim4.*service cannot start/), steps: [{ step: 'enable', skipped: true }] });
+      expect(job.result.results.find((r) => r.key === 'git')).toMatchObject({ ok: true });
+      expect(job.logs.some((l) => l.level === 'error' && /Exim.*no systemd unit found/.test(l.line))).toBe(true);
+      expect(app.agent.callsTo('svc.enable').some((c) => /^exim/.test(c.args.unit))).toBe(false);
+      // Nothing to enable at all is still fatal for the job.
+      app.agent.set('svc.resolve', () => ({ unit: null }));
+      const only = await waitForJob(app.ctx, (await post('/stack/install', { components: ['exim'] }).expect(202)).body.data.job.id);
+      expect(only.status).toBe('failed');
+      expect(only.error).toMatch(/No component could be installed: no systemd unit found/);
+    } finally {
+      app.agent.set('svc.resolve', ({ candidates }) => ({ unit: candidates.find((c) => units.includes(c)) || candidates[0] }));
+    }
+  });
+
   it('fails the job when nothing could be installed', async () => {
     app.agent.fail('pkg.install', 'command_failed', 'apt-get exited with status 100');
     const res = await post('/stack/install', { components: ['rsync'] }).expect(202);

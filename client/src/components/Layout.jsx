@@ -4,6 +4,7 @@ import { useAuth } from '../auth/AuthContext.jsx';
 import { TopBar } from './TopBar.jsx';
 import { Sidebar } from './Sidebar.jsx';
 import { Loading } from './Common.jsx';
+import { ErrorBoundary } from './ErrorBoundary.jsx';
 import { PluginNavProvider } from '../hooks/usePluginNav.js';
 import { useBranding, useBrandingLoader } from '../pages/cpanel/branding.js';
 import { LicenseBanner } from '../pages/server-configuration/LicenseTab.jsx';
@@ -50,9 +51,11 @@ export function Layout() {
         <main className="content" id="main">
           <LicenseBanner license={user.license} />
           <RevocationBanner />
-          <Suspense fallback={<Loading />}>
-            <Outlet />
-          </Suspense>
+          <ErrorBoundary key={location.pathname}>
+            <Suspense fallback={<Loading />}>
+              <Outlet />
+            </Suspense>
+          </ErrorBoundary>
         </main>
       </div>
       <footer className="app-footer">

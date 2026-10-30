@@ -8,7 +8,8 @@ import {
   renderVhost, parseVhostMeta, renderRedirects, renderGlobalInclude, renderPhpPool, renderLogrotate, mergeKeyValueFile, renderProftpd, vsftpdSettings, pureFtpdSettings,
   ftpSettingsFrom, parseServerStatus, parseApacheVersion, parseModules, parseDoveconf, rewriteListen, apacheLayout, eximLayout, phpLayout, SERVICE_ROLES, hintsFor, ensureRootLogDir, confPath, parseEximVersion,
   mergeEximBlock, readEximBlock, stripEximBlock, eximTlsLibrary, primaryGroupName, EXIM_SENTINEL_MACRO, renderHttpsRedirect, enableApacheModules,
-  applyListen, listenDropIns, ensureSelinuxWebAccess, selinuxRules, DOMLOGS_ROOT,
+  applyListen, listenDropIns, ensureSelinuxWebAccess, selinuxRules, DOMLOGS_ROOT, unitState, DOCROOT_OPTIONS, DOCROOT_ALLOW_OVERRIDE,
+  reconcileHtaccessOptions, HTACCESS_OPTIONS,
 } from '../src/ops/web.js';
 
 // Fake host for the layout detection: which paths exist, what they contain, which binaries resolve.
@@ -47,6 +48,7 @@ describe('web op schemas reject injection and traversal before anything runs', (
       { ...VHOST, redirects: [{ to: 'javascript:alert(1)' }] }, { ...VHOST, redirects: [{ to: 'https://x.com/"><script>' }] }, { ...VHOST, redirects: [{ from: '../x', to: 'https://x.com' }] }, { ...VHOST, redirects: [{ to: 'https://x.com', type: '999' }] },
       { ...VHOST, ssl: { cert: 'relative/cert.pem', key: '/etc/ssl/whm/k.pem' } }, { ...VHOST, ssl: { cert: '/etc/ssl/whm/c.pem' } },
       { ...VHOST, logDir: '/home/alice/../../var/log' }, { ...VHOST, serverAdmin: 'not-an-email' }, { ...VHOST, options: 'Indexes; rm' },
+      { ...VHOST, options: '-Indexes +FollowSymLinks' }, { ...VHOST, options: 'FollowSymLinks' }, { ...VHOST, options: '+followsymlinks' },
       { ...VHOST, meta: { 'bad key': 'x' } }, { ...VHOST, extra: true }, { ...VHOST, port: 70000 },
       // Paths are rendered into a root-parsed config: no directive injection through newlines, quotes or spaces.
       { ...VHOST, docroot: '/home/alice/x\nCustomLog |/home/alice/evil.sh combined\n<Directory /x' }, { ...VHOST, docroot: '/home/alice/my site' }, { ...VHOST, docroot: '/home/alice/"x' }, { ...VHOST, docroot: "/home/alice/'x" }, { ...VHOST, docroot: '/home/alice/x\tt' },
@@ -287,6 +289,14 @@ describe('renderers produce the expected daemon syntax', () => {
     expect(text).toContain('SSLCertificateKeyFile "/etc/ssl/whm/example.com/key.pem"');
     expect(text).toContain('  Header set X-Test "1"');
     expect(text).not.toContain('SuexecUserGroup');
+    // Account docroots never follow links into other accounts' www-data-readable
+    // files, and .htaccess cannot turn FollowSymLinks, ExecCGI or full SSI back on.
+    expect(DOCROOT_OPTIONS).toBe('-Indexes +SymLinksIfOwnerMatch');
+    expect(DOCROOT_ALLOW_OVERRIDE).toBe('AuthConfig FileInfo Indexes Limit Options=Indexes,MultiViews,SymLinksIfOwnerMatch,IncludesNOEXEC');
+    expect(text.match(/<Directory "\/home\/alice\/public_html">\n    Options -Indexes \+SymLinksIfOwnerMatch\n    AllowOverride AuthConfig FileInfo Indexes Limit Options=Indexes,MultiViews,SymLinksIfOwnerMatch,IncludesNOEXEC\n    Require all granted\n  <\/Directory>/g)).toHaveLength(2);
+    expect(text).not.toMatch(/FollowSymLinks|AllowOverride All/);
+    expect(renderVhost({ ...VHOST, options: '+Indexes +SymLinksIfOwnerMatch' })).toContain('    Options +Indexes +SymLinksIfOwnerMatch\n    AllowOverride AuthConfig FileInfo');
+    expect(() => renderVhost({ ...VHOST, options: '-Indexes +FollowSymLinks' })).toThrow(OpError);
     const meta = parseVhostMeta(text);
     expect(meta).toMatchObject({ domain: 'example.com', user: 'alice', ssl: true, redirects: 2, account: 'alice', type: 'main', phpVersion: '8.3' });
     expect(renderVhost(VHOST)).not.toContain('SSLEngine');
@@ -760,5 +770,116 @@ describe('SELinux: vhost and pool writes label the account trees and switch the 
         expect(c.some(([bin]) => bin === 'semanage' || bin === 'setsebool' || bin === 'restorecon')).toBe(false);
       });
     } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  });
+});
+
+describe('unitState reports every UnitFileState that starts at boot as enabled, like svc.status', () => {
+  const show = (state) => `ActiveState=active\nSubState=running\nUnitFileState=${state}\nLoadState=loaded\nMainPID=42\nNRestarts=0\n`;
+
+  it('generated, indirect, enabled-runtime and alias units are enabled; disabled, masked and unknown are not', async () => {
+    for (const state of ['enabled', 'enabled-runtime', 'static', 'indirect', 'generated', 'alias']) {
+      await withBinaries(['systemctl'], (bin, argv) => (argv[0] === 'show' ? { stdout: show(state) } : {}), async (calls) => {
+        expect(await unitState('pure-ftpd'), state).toMatchObject({ unit: 'pure-ftpd', present: true, active: true, enabled: true, unitFileState: state, pid: 42 });
+        expect(calls()).toEqual([['systemctl', 'show', 'pure-ftpd.service', '--no-pager', '--property=ActiveState,SubState,UnitFileState,LoadState,MainPID,NRestarts']]);
+      });
+    }
+    for (const state of ['disabled', 'masked', 'masked-runtime', 'linked', 'transient', 'bad', '']) {
+      await withBinaries(['systemctl'], (bin, argv) => (argv[0] === 'show' ? { stdout: show(state) } : {}), async () => {
+        const r = await unitState('pure-ftpd');
+        expect(r.enabled, JSON.stringify(state)).toBe(false);
+        expect(r.unitFileState).toBe(state || null);
+      });
+    }
+    await withBinaries(['systemctl'], () => ({ stdout: 'LoadState=not-found\nActiveState=inactive\nUnitFileState=\n' }), async () => {
+      expect(await unitState('nope')).toMatchObject({ present: false, active: false, enabled: false, unitFileState: null });
+    });
+    await withBinaries([], () => ({}), async (calls) => {
+      expect(await unitState('pure-ftpd')).toEqual({ unit: 'pure-ftpd', present: false, active: false, state: null, enabled: null });
+      expect(calls()).toEqual([]);
+    });
+  });
+});
+
+// Account vhosts allow .htaccess only Options=Indexes,MultiViews,SymLinksIfOwnerMatch,IncludesNOEXEC;
+// the audit finds the lines Apache refuses under that list and heals the FollowSymLinks ones.
+describe('web.htaccess.audit', () => {
+  const passwd = (name) => { const l = (fs.readFileSync('/etc/passwd', 'utf8').split('\n').find((x) => x.startsWith(`${name}:`)) || '').split(':'); return l[2] ? { name, uid: Number(l[2]), gid: Number(l[3]) } : null; };
+  const asRoot = process.getuid() === 0;
+  const owner = (asRoot && passwd('nobody')) || { name: os.userInfo().username, uid: process.getuid(), gid: process.getgid() };
+  const DRUPAL = 'Options -Indexes\nOptions +FollowSymLinks\r\nOptions All -Indexes\n';
+
+  function tree() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-htaccess-'));
+    const docroot = path.join(root, 'public_html');
+    fs.mkdirSync(path.join(docroot, 'drupal', 'sites'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'elsewhere'));
+    fs.writeFileSync(path.join(docroot, '.htaccess'), '# WordPress\nOptions -Indexes\n<IfModule mod_rewrite.c>\nRewriteEngine On\n</IfModule>\n', { mode: 0o644 });
+    fs.writeFileSync(path.join(docroot, 'drupal', '.htaccess'), DRUPAL);
+    fs.chmodSync(path.join(docroot, 'drupal', '.htaccess'), 0o664);
+    fs.writeFileSync(path.join(docroot, 'drupal', 'sites', '.htaccess'), 'Options -ExecCGI +Includes\n');
+    fs.writeFileSync(path.join(root, 'elsewhere', '.htaccess'), 'Options +FollowSymLinks\n');
+    fs.symlinkSync(path.join(root, 'elsewhere'), path.join(docroot, 'linked'));
+    fs.symlinkSync(path.join(root, 'elsewhere', '.htaccess'), path.join(docroot, 'drupal', 'sites', 'link.htaccess'));
+    if (asRoot) for (const f of ['', 'drupal', 'drupal/sites', '.htaccess', 'drupal/.htaccess', 'drupal/sites/.htaccess']) fs.chownSync(path.join(docroot, f), owner.uid, owner.gid);
+    return { root, docroot, ctx: createContext({ allowedRoots: [root] }) };
+  }
+
+  it('rewrites FollowSymLinks and lists what Apache still refuses, line by line', () => {
+    expect(HTACCESS_OPTIONS).toEqual(['Indexes', 'MultiViews', 'SymLinksIfOwnerMatch', 'IncludesNOEXEC']);
+    const r = reconcileHtaccessOptions('# Options All\nOptions -Indexes +FollowSymLinks\n  options +FollowSymlinks\r\nOptions All -Indexes\nOptions -ExecCGI +Includes\nOptions None\nOptions +MultiViews +IncludesNOEXEC Indexes\nOptionsX FollowSymLinks\n');
+    expect(r.text).toBe('# Options All\nOptions -Indexes +SymLinksIfOwnerMatch\n  options +SymLinksIfOwnerMatch\r\nOptions All -Indexes\nOptions -ExecCGI +Includes\nOptions None\nOptions +MultiViews +IncludesNOEXEC Indexes\nOptionsX FollowSymLinks\n');
+    expect(r.rewritten).toBe(2);
+    expect(r.before).toEqual([{ line: 2, tokens: ['FollowSymLinks'] }, { line: 3, tokens: ['FollowSymlinks'] }, { line: 4, tokens: ['All'] }, { line: 5, tokens: ['ExecCGI', 'Includes'] }]);
+    expect(r.after).toEqual([{ line: 4, tokens: ['All'] }, { line: 5, tokens: ['ExecCGI', 'Includes'] }]);
+    expect(reconcileHtaccessOptions('RewriteEngine On\n')).toEqual({ text: 'RewriteEngine On\n', rewritten: 0, before: [], after: [] });
+  });
+
+  it('rejects loose arguments and roots outside the allowed locations', async () => {
+    for (const args of [{}, { roots: [] }, { roots: ['home/x'] }, { roots: ['/home/../etc'] }, { roots: ['/home/x'], fix: true }, { roots: ['/home/x'], username: 'Bad User' }, { roots: ['/home/x'], maxFiles: 0 }, { roots: ['/home/x'], extra: 1 }]) {
+      expect((await opError(runOp('web.htaccess.audit', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
+    }
+    expect((await opError(runOp('web.htaccess.audit', { roots: ['/usr/share/doc'] }, ctx))).code).toBe('path_not_allowed');
+    expect((await opError(runOp('web.htaccess.audit', { roots: ['/home/alice/public_html'], username: 'no-such-user-xyz', fix: true }, ctx))).code).toBe('not_found');
+  });
+
+  it('audits without touching files and never walks through a link', async () => {
+    const { root, docroot, ctx: c } = tree();
+    const r = await runOp('web.htaccess.audit', { roots: [docroot, path.join(root, 'missing'), path.join(docroot, 'linked')] }, c);
+    expect(r).toMatchObject({ fix: false, scanned: 3, rewritten: [], truncated: false, skipped: [] });
+    expect(r.skippedRoots).toEqual([path.join(root, 'missing'), path.join(docroot, 'linked')]);
+    expect(r.unsupported).toEqual([
+      { file: path.join(docroot, 'drupal', '.htaccess'), line: 2, tokens: ['FollowSymLinks'] },
+      { file: path.join(docroot, 'drupal', '.htaccess'), line: 3, tokens: ['All'] },
+      { file: path.join(docroot, 'drupal', 'sites', '.htaccess'), line: 1, tokens: ['ExecCGI', 'Includes'] },
+    ]);
+    expect(fs.readFileSync(path.join(docroot, 'drupal', '.htaccess'), 'utf8')).toBe(DRUPAL);
+  });
+
+  it('with fix rewrites the account\'s own files in place and reports the rest', async () => {
+    const { root, docroot, ctx: c } = tree();
+    const r = await runOp('web.htaccess.audit', { roots: [docroot], username: owner.name, fix: true }, c);
+    expect(r).toMatchObject({ fix: true, username: owner.name, scanned: 3, rewritten: [{ file: path.join(docroot, 'drupal', '.htaccess'), lines: 1 }], skipped: [] });
+    expect(r.unsupported).toEqual([
+      { file: path.join(docroot, 'drupal', '.htaccess'), line: 3, tokens: ['All'] },
+      { file: path.join(docroot, 'drupal', 'sites', '.htaccess'), line: 1, tokens: ['ExecCGI', 'Includes'] },
+    ]);
+    const st = fs.statSync(path.join(docroot, 'drupal', '.htaccess'));
+    expect(fs.readFileSync(path.join(docroot, 'drupal', '.htaccess'), 'utf8')).toBe('Options -Indexes\nOptions +SymLinksIfOwnerMatch\r\nOptions All -Indexes\n');
+    expect([st.uid, st.mode & 0o777]).toEqual([owner.uid, 0o664]);
+    expect(fs.readFileSync(path.join(root, 'elsewhere', '.htaccess'), 'utf8')).toBe('Options +FollowSymLinks\n');
+    // A .htaccess given as a root is audited on its own; a second pass finds nothing left to rewrite.
+    const again = await runOp('web.htaccess.audit', { roots: [path.join(docroot, 'drupal', '.htaccess')], username: owner.name, fix: true }, c);
+    expect(again).toMatchObject({ scanned: 1, rewritten: [], unsupported: [{ line: 3, tokens: ['All'] }] });
+  });
+
+  it.skipIf(!asRoot)('never rewrites a file the account does not own', async () => {
+    const { docroot, ctx: c } = tree();
+    fs.mkdirSync(path.join(docroot, 'other'));
+    fs.writeFileSync(path.join(docroot, 'other', '.htaccess'), 'Options +FollowSymLinks\n');
+    const r = await runOp('web.htaccess.audit', { roots: [path.join(docroot, 'other')], username: owner.name, fix: true }, c);
+    expect(r).toMatchObject({ scanned: 1, rewritten: [], skipped: [{ file: path.join(docroot, 'other', '.htaccess'), reason: 'owner' }] });
+    expect(r.unsupported).toEqual([{ file: path.join(docroot, 'other', '.htaccess'), line: 1, tokens: ['FollowSymLinks'] }]);
+    expect(fs.readFileSync(path.join(docroot, 'other', '.htaccess'), 'utf8')).toBe('Options +FollowSymLinks\n');
+    expect((await opError(runOp('web.htaccess.audit', { roots: [docroot], username: 'root', fix: true }, c))).code).toBe('refused');
   });
 });

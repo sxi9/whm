@@ -7,12 +7,14 @@ import {
   renderHostsAllow, hostSourceForm, hostsDenyManaged, accessMode, archiveFormat, parseDistroCrsInclude, parseSshdConfig, sshdShadowed, parseAuthorizedKeys, parsePublicKeyLine, fingerprintOf, renderForkBombConf, parseForkBombConf,
   parseIptablesRules, parseNftChain, parseModsecDirectives, parseModsecRules, parseModsecErrorLog, renderUserdirConf, parseUserdirConf, firewallBackend, privateTempDir,
   semanagePorts, selinuxPortLabelled, parseListeningPorts, findLibwrap, domlogErrorLogs, modsecHitTime, collectModsecHits, sanitizeExtractedTree, extractArchive, FORKBOMB_MEMORY_FLOOR_MB,
+  normalizeSshdValues, renderSshdSocketDropIn, sshdSocketDropInPath, applySshdSocketPort,
 } from '../src/ops/sec.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
-  return { ...mod, exec: vi.fn(mod.exec) };
+  return { ...mod, exec: vi.fn(mod.exec), hasBinary: vi.fn(mod.hasBinary) };
 });
+const { hasBinary } = await import('../src/exec.js');
 
 const ctx = createContext();
 
@@ -141,6 +143,8 @@ describe('sec ops refuse to act when the subsystem is missing (no side effects)'
     if (detect.installed) return;
     exec.mockClear();
     expect((await opError(runOp('sec.modsec.set_config', { directives: { SecRuleEngine: 'On' } }, ctx))).code).toBe('capability_missing');
+    // The stock SecAuditLogRelevantStatus (what the route accepts) passes the op's schema too.
+    expect((await opError(runOp('sec.modsec.set_config', { directives: { SecAuditLogRelevantStatus: '^(?:5|4(?!04))' } }, ctx))).code).toBe('capability_missing');
     expect((await opError(runOp('sec.modsec.set_disabled', { ids: [1] }, ctx))).code).toBe('capability_missing');
     expect((await opError(runOp('sec.modsec.vendors.apply', { vendors: [] }, ctx))).code).toBe('capability_missing');
     expect((await opError(runOp('sec.modsec.hits', {}, ctx))).code).toBe('capability_missing');
@@ -445,5 +449,80 @@ describe('pure renderers and parsers', () => {
     const off = renderUserdirConf({ enabled: false, excludeUsers: [], homeRoot: '/home' });
     expect(parseUserdirConf(off)).toEqual({ configured: true, enabled: false, excludeUsers: [] });
     expect(parseUserdirConf(null)).toEqual({ configured: false, enabled: false, excludeUsers: [] });
+  });
+});
+
+describe('sshd: one PermitRootLogin spelling, and the port under socket activation', () => {
+  it('normalizeSshdValues maps the deprecated without-password to prohibit-password for effective and managed values', () => {
+    expect(normalizeSshdValues({ permitrootlogin: 'without-password', passwordauthentication: 'yes', port: '22' })).toEqual({ permitrootlogin: 'prohibit-password', passwordauthentication: 'yes', port: '22' });
+    expect(normalizeSshdValues({ PermitRootLogin: 'Without-Password', MaxAuthTries: '4' })).toEqual({ PermitRootLogin: 'prohibit-password', MaxAuthTries: '4' });
+    expect(normalizeSshdValues({ PermitRootLogin: 'no' })).toEqual({ PermitRootLogin: 'no' });
+    expect(normalizeSshdValues({})).toEqual({});
+  });
+
+  it('sec.sshd.get reports the without-password that sshd -T prints on stock Debian/Ubuntu as prohibit-password', async () => {
+    const actual = await vi.importActual('../src/exec.js');
+    hasBinary.mockImplementation((name) => name === 'sshd' || actual.hasBinary(name));
+    exec.mockClear();
+    exec.mockImplementation(async (bin, argv, opts) => (bin === 'sshd' && argv[0] === '-T' ? { code: 0, stdout: 'port 22\npermitrootlogin without-password\npasswordauthentication yes\nmaxauthtries 6\n', stderr: '' } : actual.exec(bin, argv, opts)));
+    try {
+      const r = await runOp('sec.sshd.get', {}, ctx);
+      expect(r).toMatchObject({ installed: true, source: 'sshd -T' });
+      expect(r.effective).toMatchObject({ port: '22', permitrootlogin: 'prohibit-password', passwordauthentication: 'yes' });
+      expect(JSON.stringify(r)).not.toContain('without-password');
+      expect(exec.mock.calls.filter(([bin]) => bin === 'sshd').map(([, argv]) => argv)).toEqual([['-T']]);
+    } finally { hasBinary.mockImplementation(actual.hasBinary); exec.mockImplementation(actual.exec); }
+  });
+
+  it('renders the socket drop-in and resolves the default paths the agent may write', () => {
+    expect(renderSshdSocketDropIn(2222)).toBe("# Managed by WHM panel (SSH port). Replaces the socket unit's listeners; Port in sshd_config is not read under socket activation.\n[Socket]\nListenStream=\nListenStream=2222\n");
+    expect(sshdSocketDropInPath('ssh')).toBe('/etc/systemd/system/ssh.socket.d/00-whm.conf');
+    expect(sshdSocketDropInPath('sshd')).toBe('/etc/systemd/system/sshd.socket.d/00-whm.conf');
+    for (const unit of ['ssh', 'sshd']) expect(ctx.assertAllowedPath(sshdSocketDropInPath(unit), 'write')).toBe(sshdSocketDropInPath(unit));
+    expect(() => ctx.assertAllowedPath('/etc/systemd/system/ssh.service.d/00-whm.conf', 'write')).toThrow(OpError);
+    expect(() => ctx.assertAllowedPath('/etc/systemd/system/ssh.socket', 'write')).toThrow(OpError);
+  });
+
+  it('applySshdSocketPort writes the drop-in, reloads systemd and restarts the socket; a failed restart or a rollback puts the previous listener back', async () => {
+    fs.mkdirSync('/tmp/whm', { recursive: true });
+    const base = fs.mkdtempSync('/tmp/whm/sec-socket-');
+    const local = createContext({ allowedRoots: [base] });
+    const actual = await vi.importActual('../src/exec.js');
+    const calls = () => exec.mock.calls.map(([bin, argv]) => [bin, ...argv]);
+    const file = path.join(base, 'ssh.socket.d', '00-whm.conf');
+    try {
+      exec.mockClear();
+      exec.mockImplementation(async (bin, argv) => ({ code: 0, stdout: '', stderr: '', bin, argv }));
+      const first = await applySshdSocketPort('ssh', 2222, local, { dir: base });
+      expect(first).toMatchObject({ ok: true, file, unit: 'ssh.socket' });
+      expect(fs.readFileSync(file, 'utf8')).toBe(renderSshdSocketDropIn(2222));
+      expect(fs.statSync(file).mode & 0o777).toBe(0o644);
+      expect(calls()).toEqual([['systemctl', 'daemon-reload'], ['systemctl', 'restart', 'ssh.socket']]);
+
+      // A later change keeps the previous drop-in for its rollback.
+      exec.mockClear();
+      const second = await applySshdSocketPort('ssh', 2200, local, { dir: base });
+      expect(fs.readFileSync(file, 'utf8')).toContain('ListenStream=\nListenStream=2200\n');
+      await second.rollback();
+      expect(fs.readFileSync(file, 'utf8')).toBe(renderSshdSocketDropIn(2222));
+      expect(calls()).toEqual([['systemctl', 'daemon-reload'], ['systemctl', 'restart', 'ssh.socket'], ['systemctl', 'daemon-reload'], ['systemctl', 'restart', 'ssh.socket']]);
+      await first.rollback();
+      expect(fs.existsSync(file)).toBe(false);
+
+      // A socket that refuses to restart is rolled back by the helper and reported, never thrown.
+      exec.mockClear();
+      exec.mockImplementation(async (bin, argv) => (argv[0] === 'restart' ? { code: 1, stdout: '', stderr: 'Job for ssh.socket failed.\nSee "systemctl status ssh.socket" for details.\n', bin, argv } : { code: 0, stdout: '', stderr: '', bin, argv }));
+      const failed = await applySshdSocketPort('ssh', 2222, local, { dir: base });
+      expect(failed).toMatchObject({ ok: false, file });
+      expect(failed.error).toBe('systemctl restart ssh.socket failed: See "systemctl status ssh.socket" for details.');
+      expect(fs.existsSync(file)).toBe(false);
+      expect(calls()).toEqual([['systemctl', 'daemon-reload'], ['systemctl', 'restart', 'ssh.socket'], ['systemctl', 'daemon-reload'], ['systemctl', 'restart', 'ssh.socket']]);
+
+      // Outside the agent's roots nothing is written and nothing runs.
+      exec.mockClear();
+      expect((await opError(applySshdSocketPort('ssh', 2222, local, { dir: path.dirname(base) }))).code).toBe('path_not_allowed');
+      expect(fs.existsSync(path.join(path.dirname(base), 'ssh.socket.d'))).toBe(false);
+      expect(calls()).toEqual([]);
+    } finally { exec.mockImplementation(actual.exec); fs.rmSync(base, { recursive: true, force: true }); }
   });
 });

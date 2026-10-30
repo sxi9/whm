@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { ArrowUp, ArrowDown, Trash2, Plus } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
@@ -8,6 +9,26 @@ import { useToast } from '../../../components/Toast.jsx';
 import { RequestError } from '../../security/Shared.jsx';
 
 const EMPTY = { service: 'sshd', source: '', action: 'allow', comment: '' };
+
+// The agent reports whether the installed sshd links libwrap (ldd). false
+// means the rules are written but SSH never reads them: upstream OpenSSH
+// dropped TCP wrappers in 6.7 and current Debian, Ubuntu and RHEL builds ship
+// without the patch. null means the probe could not run (no sshd or no ldd).
+export function sshdIgnoresRules(files) {
+  return files?.daemons?.sshd === false;
+}
+
+export function SshdNotice({ files }) {
+  if (!sshdIgnoresRules(files)) return null;
+  return (
+    <div className="banner banner-warning" role="alert">
+      <div>
+        <strong>sshd on this host does not consult these rules.</strong> The installed OpenSSH is not linked against libwrap (<code>ldd</code> shows no <code>libwrap.so</code>): upstream OpenSSH removed TCP wrappers support in 6.7, and current Debian, Ubuntu and RHEL builds ship without the patch.
+        Rules for <code>sshd</code> are still written to <code>/etc/hosts.allow</code> but have no effect on SSH logins. Restrict SSH with <code>AllowUsers</code> or <code>Match Address</code> blocks in <code>sshd_config</code>, or block addresses at the firewall through <Link to="/security-center/cphulk-brute-force-protection">cPHulk Brute Force Protection</Link>. Daemons that do link libwrap (vsftpd, dovecot, …) keep honouring the rules.
+      </div>
+    </div>
+  );
+}
 
 export default function HostAccessControl({ fn }) {
   const toast = useToast();
@@ -39,6 +60,7 @@ export default function HostAccessControl({ fn }) {
       {data && (
         <>
           {data.files && !data.files.supported && <div className="banner banner-info"><div>libwrap was not detected on this host; the files are still written but only daemons linked against TCP wrappers honour them.</div></div>}
+          <SshdNotice files={data.files} />
           {data.files && data.files.denyManaged === false && <div className="banner banner-warning"><div><strong>/etc/hosts.deny contains rules the panel did not write.</strong> They keep applying after every save here (the panel only rewrites that file once it manages it). Review them below and move them into this list if they should be managed from the panel.</div></div>}
           <Card title="Rules" actions={<Button size="sm" icon={Plus} onClick={() => setRules((rs) => [...rs, { ...EMPTY }])}>Add rule</Button>} padded={false}>
             <div className="table-wrap">
@@ -48,7 +70,7 @@ export default function HostAccessControl({ fn }) {
                   {rules.length === 0 && <tr><td colSpan={5} className="table-state">No rules. Every connection is allowed.</td></tr>}
                   {rules.map((r, i) => (
                     <tr key={i}>
-                      <td><TextInput value={r.service} onChange={(v) => update(i, { service: v })} list="whm-known-services" /></td>
+                      <td><TextInput value={r.service} onChange={(v) => update(i, { service: v })} list="whm-known-services" />{r.service.trim() === 'sshd' && sshdIgnoresRules(data.files) && <small className="muted">not honoured by sshd</small>}</td>
                       <td><TextInput value={r.source} onChange={(v) => update(i, { source: v })} placeholder="192.0.2.0/24 or [2001:db8::]/32" /></td>
                       <td><Select value={r.action} onChange={(v) => update(i, { action: v })} options={[{ value: 'allow', label: 'Allow' }, { value: 'deny', label: 'Deny' }]} /></td>
                       <td><TextInput value={r.comment} onChange={(v) => update(i, { comment: v })} placeholder="optional" /></td>

@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { exec, hasBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
 import { eximBaseLayout, includesFile, EXIM_WHM_FILES } from './exim-layout.js';
+import { unitStartsAtBoot } from './svc.js';
 
 // Web op family: Apache (Debian apache2 or RHEL httpd layout) virtual hosts,
 // the panel's global include, MPM switching, status; PHP-FPM per-account pools;
@@ -108,11 +109,11 @@ async function firstUnit(candidates) {
   return candidates.find((u) => units.has(u)) || null;
 }
 
-async function unitState(unit) {
+export async function unitState(unit) {
   if (!unit || !hasBinary('systemctl')) return { unit, present: false, active: false, state: null, enabled: null };
   const { stdout } = await exec('systemctl', ['show', `${unit}.service`, '--no-pager', '--property=ActiveState,SubState,UnitFileState,LoadState,MainPID,NRestarts'], { allowFailure: true });
   const kv = Object.fromEntries(stdout.trim().split('\n').map((l) => { const i = l.indexOf('='); return [l.slice(0, i), l.slice(i + 1)]; }));
-  return { unit, present: Boolean(kv.LoadState) && kv.LoadState !== 'not-found', active: kv.ActiveState === 'active', state: kv.ActiveState || null, subState: kv.SubState || null, enabled: kv.UnitFileState === 'enabled' || kv.UnitFileState === 'static', unitFileState: kv.UnitFileState || null, pid: Number(kv.MainPID) || null, restarts: Number(kv.NRestarts) || 0 };
+  return { unit, present: Boolean(kv.LoadState) && kv.LoadState !== 'not-found', active: kv.ActiveState === 'active', state: kv.ActiveState || null, subState: kv.SubState || null, enabled: unitStartsAtBoot(kv.UnitFileState), unitFileState: kv.UnitFileState || null, pid: Number(kv.MainPID) || null, restarts: Number(kv.NRestarts) || 0 };
 }
 
 async function reloadUnit(candidates, verb = 'reload-or-restart') {
@@ -303,6 +304,43 @@ const emailAddress = z.string().max(254).regex(/^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]
 const sizeSpec = z.string().regex(/^\d{1,6}[kKmMgG]?$/, 'size such as 100M');
 const logGlob = z.string().max(512).regex(/^\/(?!(?:.*\/)?\.\.(?:\/|$))[A-Za-z0-9._*\/-]+$/, 'absolute path or glob');
 const hostList = z.array(arg.hostname).max(50);
+// FollowSymLinks lets a docroot (or, through .htaccess, any subdirectory) walk
+// into every file the web server user can read in other accounts' homes;
+// SymLinksIfOwnerMatch only follows links the account owns both ends of.
+const directoryOptions = z.string().regex(/^[A-Za-z +-]{0,200}$/).refine((v) => !/\bFollowSymLinks\b/i.test(v), 'FollowSymLinks is never enabled for account docroots; use SymLinksIfOwnerMatch');
+export const DOCROOT_OPTIONS = '-Indexes +SymLinksIfOwnerMatch';
+// Options= caps what .htaccess may turn on (no FollowSymLinks, ExecCGI or
+// full server-side includes as the web server user).
+export const DOCROOT_ALLOW_OVERRIDE = 'AuthConfig FileInfo Indexes Limit Options=Indexes,MultiViews,SymLinksIfOwnerMatch,IncludesNOEXEC';
+// Under that Options= list Apache's set_options() refuses, in a .htaccess, any
+// other token whatever its sign and `All` outright, and the whole directory
+// answers 500: the tokens an account .htaccess may set are exactly these.
+export const HTACCESS_OPTIONS = ['Indexes', 'MultiViews', 'SymLinksIfOwnerMatch', 'IncludesNOEXEC'];
+const HTACCESS_OPTION_OK = new Set([...HTACCESS_OPTIONS, 'None'].map((t) => t.toLowerCase()));
+export const HTACCESS_MAX_BYTES = 256 * 1024;
+
+// Rewrites FollowSymLinks (what Drupal's and Joomla's shipped .htaccess carry)
+// to SymLinksIfOwnerMatch, which Apache accepts there and is the same thing
+// for the account's own files, and lists the Options lines it still refuses:
+// `before` as the text stands, `after` with the rewrite applied.
+export function reconcileHtaccessOptions(text) {
+  const before = []; const after = [];
+  let rewritten = 0;
+  const refused = (rest) => rest.split(/\s+/).map((t) => t.replace(/^[+-]/, '')).filter((t) => t && !HTACCESS_OPTION_OK.has(t.toLowerCase()));
+  const lines = text.split('\n').map((line, i) => {
+    const m = /^(\s*Options\s+)([^\r]*)(\r?)$/i.exec(line);
+    if (!m) return line;
+    const original = refused(m[2]);
+    if (original.length) before.push({ line: i + 1, tokens: original });
+    if (!/\bFollowSymLinks\b/i.test(m[2])) { if (original.length) after.push({ line: i + 1, tokens: original }); return line; }
+    const next = m[2].replace(/\bFollowSymLinks\b/gi, 'SymLinksIfOwnerMatch');
+    rewritten++;
+    const remaining = refused(next);
+    if (remaining.length) after.push({ line: i + 1, tokens: remaining });
+    return m[1] + next + m[3];
+  });
+  return { text: lines.join('\n'), rewritten, before, after };
+}
 
 // `bind` (set while nginx fronts Apache on 127.0.0.1:<port>) replaces the
 // account IPs in the <VirtualHost> address; a null `sslPort` drops the TLS
@@ -311,7 +349,7 @@ const vhostSchema = z.object({
   domain: arg.hostname, aliases: hostList.default([]), docroot: confPath, user: arg.username, group: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/).optional(),
   ip: arg.ipv4.nullable().optional(), ipv6: arg.ipv6.nullable().optional(), bind: arg.ip.nullable().optional(), port: z.number().int().min(1).max(65535).default(80), sslPort: z.number().int().min(1).max(65535).nullable().default(443),
   phpVersion: phpVersion.nullable().optional(), ssl: sslPaths.nullable().optional(), redirects: z.array(redirect).max(100).default([]), redirectHttps: z.boolean().default(false),
-  customDirectives: freeText.default(''), logDir: confPath.optional(), serverAdmin: emailAddress.optional(), options: z.string().regex(/^[A-Za-z +-]{0,200}$/).optional(),
+  customDirectives: freeText.default(''), logDir: confPath.optional(), serverAdmin: emailAddress.optional(), options: directoryOptions.optional(),
   meta: z.record(z.string().regex(/^[A-Za-z0-9_]{1,32}$/), metaValue).default({}), reload: z.boolean().default(true),
 }).strict();
 
@@ -418,6 +456,7 @@ export function renderHttpsRedirect(bind, indent = '  ') {
 }
 
 function vhostBlock(v, { ssl, port }) {
+  if (v.options && /\bFollowSymLinks\b/i.test(v.options)) throw new OpError('refused', `FollowSymLinks is never enabled for ${v.docroot}; use SymLinksIfOwnerMatch`);
   const addrs = v.bind ? [listenAddr(v.bind, port)] : [v.ip ? `${v.ip}:${port}` : null, v.ipv6 ? `[${v.ipv6}]:${port}` : null].filter(Boolean);
   const listen = addrs.length ? addrs.join(' ') : `*:${port}`;
   const logDir = v.logDir || domlogDir(v.user);
@@ -427,7 +466,7 @@ function vhostBlock(v, { ssl, port }) {
   lines.push(`  ServerAdmin ${v.serverAdmin || `webmaster@${v.domain}`}`, `  DocumentRoot ${q(v.docroot)}`, '  UseCanonicalName Off');
   lines.push(`  CustomLog ${q(`${logDir}/${v.domain}${ssl ? '-ssl' : ''}-access.log`)} combined`, `  ErrorLog ${q(`${logDir}/${v.domain}${ssl ? '-ssl' : ''}-error.log`)}`);
   lines.push('  <IfModule mod_userdir.c>', '    UserDir disabled', '  </IfModule>');
-  lines.push(`  <Directory ${q(v.docroot)}>`, `    Options ${v.options || '-Indexes +FollowSymLinks'}`, '    AllowOverride All', '    Require all granted', '  </Directory>');
+  lines.push(`  <Directory ${q(v.docroot)}>`, `    Options ${v.options || DOCROOT_OPTIONS}`, `    AllowOverride ${DOCROOT_ALLOW_OVERRIDE}`, '    Require all granted', '  </Directory>');
   if (!ssl && v.redirectHttps) lines.push(...renderHttpsRedirect(v.bind ?? null));
   if (v.phpVersion) {
     // proxy_fcgi drops the Authorization header unless it is re-exported, so
@@ -810,6 +849,92 @@ defineOp('web.vhost.write', {
     const written = await writeApacheFile(apache, file, content, { link });
     const reload = v.reload ? await reloadUnit(apache.units) : { reloaded: false, unit: null };
     return { domain: v.domain, ...written, link, logDir, bytes: Buffer.byteLength(content), ssl: Boolean(v.ssl && v.sslPort), bind: v.bind ?? null, phpVersion: v.phpVersion ?? null, selinux, ...reload };
+  },
+});
+
+// .htaccess files under a document root, found without following links (a
+// linked directory is never entered, a linked .htaccess never opened).
+function findHtaccessFiles(root, out, limits) {
+  const stack = [root];
+  while (stack.length && !limits.truncated) {
+    const dir = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const d of entries) {
+      if (++limits.entries > limits.maxEntries || out.length >= limits.maxFiles) { limits.truncated = true; break; }
+      if (d.isDirectory()) stack.push(path.join(dir, d.name));
+      else if (d.isFile() && d.name === '.htaccess') out.push(path.join(dir, d.name));
+    }
+  }
+}
+
+function openRegular(file, flags) {
+  let fd = null;
+  try {
+    fd = fs.openSync(file, flags | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const st = fs.fstatSync(fd);
+    if (st.isFile()) return { fd, st, writable: (flags & fs.constants.O_RDWR) === fs.constants.O_RDWR };
+  } catch { /* vanished, a link, a FIFO or unreadable */ }
+  if (fd !== null) { try { fs.closeSync(fd); } catch { /* closed */ } }
+  return null;
+}
+
+// Root rewrites only the account's own file (fstat of the open descriptor:
+// never root's, never one reached through a directory the account swapped for
+// a link between the walk and the open) and in place, so owner and mode stay.
+function auditHtaccessFile(file, { uid, fix }) {
+  const o = (fix && openRegular(file, fs.constants.O_RDWR)) || openRegular(file, fs.constants.O_RDONLY);
+  if (!o) return null;
+  const { fd, st } = o;
+  try {
+    if (st.size > HTACCESS_MAX_BYTES) return { rewritten: 0, unsupported: [], skipped: 'too_large' };
+    const buf = Buffer.alloc(st.size);
+    const n = fs.readSync(fd, buf, 0, st.size, 0);
+    const r = reconcileHtaccessOptions(buf.subarray(0, n).toString('utf8'));
+    if (!r.rewritten) return { rewritten: 0, unsupported: r.before };
+    if (!fix) return { rewritten: 0, unsupported: r.before };
+    if (!(uid > 0 && st.uid === uid)) return { rewritten: 0, unsupported: r.before, skipped: 'owner' };
+    if (!o.writable) return { rewritten: 0, unsupported: r.before, skipped: 'read_only' };
+    const next = Buffer.from(r.text, 'utf8');
+    fs.writeSync(fd, next, 0, next.length, 0);
+    fs.ftruncateSync(fd, next.length);
+    return { rewritten: r.rewritten, unsupported: r.after };
+  } finally { try { fs.closeSync(fd); } catch { /* closed */ } }
+}
+
+const htaccessAuditSchema = z.object({
+  roots: z.array(arg.absPath).min(1).max(5000), username: arg.username.optional(), fix: z.boolean().default(false),
+  maxFiles: z.number().int().min(1).max(50_000).default(5000),
+}).strict().refine((v) => !v.fix || Boolean(v.username), { message: 'fix needs the account username', path: ['username'] });
+
+defineOp('web.htaccess.audit', {
+  description: 'List .htaccess Options lines Apache refuses under the account AllowOverride; with fix, rewrite FollowSymLinks to SymLinksIfOwnerMatch in the account\'s own files',
+  schema: htaccessAuditSchema,
+  run: async ({ roots, username, fix, maxFiles }, ctx) => {
+    let uid = null;
+    if (username) { const entry = passwdEntry(username); if (!entry) throw new OpError('not_found', `Unknown user "${username}"`); uid = entry.uid; }
+    if (fix && uid === 0) throw new OpError('refused', `.htaccess files are never rewritten for uid 0 (${username})`);
+    const files = []; const skippedRoots = [];
+    const limits = { entries: 0, maxEntries: 1_000_000, maxFiles, truncated: false };
+    for (const root of roots) {
+      const dir = ctx.assertAllowedPath(root, fix ? 'write' : 'read');
+      let st = null;
+      try { st = fs.lstatSync(dir); } catch { skippedRoots.push(dir); continue; }
+      if (st.isFile()) { if (path.basename(dir) === '.htaccess') files.push(dir); continue; }
+      if (!st.isDirectory()) { skippedRoots.push(dir); continue; }
+      findHtaccessFiles(dir, files, limits);
+    }
+    const rewritten = []; const unsupported = []; const skipped = [];
+    let scanned = 0;
+    for (const file of files.sort()) {
+      const r = auditHtaccessFile(file, { uid, fix });
+      if (!r) continue;
+      scanned++;
+      if (r.rewritten) rewritten.push({ file, lines: r.rewritten });
+      for (const u of r.unsupported) unsupported.push({ file, line: u.line, tokens: u.tokens });
+      if (r.skipped) skipped.push({ file, reason: r.skipped });
+    }
+    return { roots, username: username ?? null, fix, scanned, rewritten, unsupported, skipped, skippedRoots, truncated: limits.truncated };
   },
 });
 

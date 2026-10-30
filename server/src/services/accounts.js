@@ -331,8 +331,9 @@ export function createAccountsService(ctx) {
       const account = load(username, user);
       ctx.resellers?.assertAcl?.(user, 'suspend-acct');
       if (account.suspended) throw conflict('Account is already suspended');
-      // usermod -L blocks every login that authenticates against the system
-      // user (SSH, FTP, IMAP/POP via PAM); the web sites go through the hook.
+      // user.lock locks the password and expires the account, so every PAM
+      // login is refused (SSH with keys too, FTP, IMAP/POP, cron); the web
+      // sites go through the hook.
       if (account.uid != null) await tryOp('user.lock', { username }, req, []);
       stmts.suspend.run(reason || null, account.id);
       const web = await applyWebSuspension(username, true, req);

@@ -231,6 +231,15 @@ export function createServerConfigService(ctx) {
   };
 
   // --- Initial Quota Setup -----------------------------------------------------
+  // The line an operator acts on when quota.enable stops short: fstab options,
+  // the boot-loader command for an xfs "/", or a reboot.
+  const quotaManualStep = (result) => {
+    if (result.reason === 'fstab_option_required') return `Add the quota mount options to /etc/fstab: ${result.fstab}`;
+    if (result.reason === 'kernel_args_required') return `${result.mountpoint} is an XFS root filesystem mounted from the kernel command line, so /etc/fstab alone cannot enable quotas on it. Run: ${result.kernelArgs?.command || 'add rootflags=uquota to the kernel command line in the boot loader configuration'} (the "Update fstab and enable" action does this), then reboot`;
+    if (result.reason === 'reboot_required') return result.kernelArgs?.configured ? `The boot loader already passes ${result.kernelArgs.arg} to the kernel; reboot the server so XFS mounts / with quotas` : 'Reboot the server so XFS picks up the quota mount options';
+    return `Quotas are not active (${result.reason})`;
+  };
+
   const quota = {
     async status() {
       await capabilities.ensureFresh();
@@ -275,11 +284,14 @@ export function createServerConfigService(ctx) {
       if (updateFstab) {
         fstab = await job.agent.op('quota.fstab.enable', { mountpoint, groupQuota });
         job.log(fstab.changed ? `fstab: ${fstab.previousLine}  ->  ${fstab.line} (backup ${fstab.backup})` : 'fstab already has the quota options');
+        // An xfs "/" is mounted from the kernel command line: the op also
+        // passes rootflags= through the boot loader when it can.
+        if (fstab.kernelArgs) job.log(fstab.kernelArgs.applied ? `boot loader: ${fstab.kernelArgs.command}${fstab.kernelArgs.backup ? ` (backup ${fstab.kernelArgs.backup})` : ''}; the kernel passes ${fstab.kernelArgs.arg} on the next boot` : `boot loader already passes ${fstab.kernelArgs.arg} to the kernel`);
       }
       job.progress(20, 'quotacheck (this scans the whole filesystem)');
       const result = await job.agent.op('quota.enable', { mountpoint, groupQuota });
       for (const s of result.steps || []) job.log(`${s.step}: ${s.ok ? 'ok' : 'failed'} - ${s.detail}`, s.ok ? 'info' : 'warn');
-      if (!result.enabled) job.log(result.reason === 'fstab_option_required' ? `Add the quota mount options to /etc/fstab: ${result.fstab}` : result.reason === 'reboot_required' ? 'Reboot the server so XFS picks up the quota mount options' : `Quotas are not active (${result.reason})`, 'warn');
+      if (!result.enabled) job.log(quotaManualStep(result), 'warn');
       else job.log(`User quotas are active on ${mountpoint}`);
       job.progress(100, result.enabled ? 'quotas enabled' : 'manual step required');
       return { ...result, fstab };

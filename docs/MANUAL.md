@@ -74,7 +74,7 @@ What the login path enforces (`server/src/services/auth.js`, `routes/auth.js`):
 |---|---|
 | Brute-force block | With cPHulk enabled, an address with an active block gets `429 locked_out`; failures are counted per address and per window configured in *Security Center › cPHulk Brute Force Protection*. |
 | Rate limit | 20 attempts per 15 minutes per address and user (`config.loginRateLimit`). |
-| Session | Cookie session, `httpOnly`, `sameSite=strict`, `secure` when served over TLS; 8 h lifetime by default (`sessionTtlMs`), shortened by the *idle session timeout* policy. |
+| Session | Cookie session, `httpOnly`, `sameSite=lax` (not `strict`: the external-authentication callback `GET /api/auth/external/:name/callback` is a cross-site top-level navigation that must carry the session holding the OIDC state and nonce — a `strict` cookie is dropped there by real browsers; every mutation stays protected by the CSRF token), `secure` for TLS sessions (`auto`; `config.cookieSecure` forces it); 8 h lifetime by default (`sessionTtlMs`), shortened by the *idle session timeout* policy. |
 | One session per user | When *One active session per user* is on, a new login destroys the user's other sessions. |
 | Password age | When *Maximum password age* is set and the password is older, the login succeeds but the user is forced to change it before anything else. |
 
@@ -331,13 +331,24 @@ Packages*) and a **Filesystems** card whose header holds *Also enable group quot
 (mount point, device, fstype, user-quota state, mounted with quota option, `/etc/fstab` entry, quota
 files) has per-row actions **Enable quotas**, **Update fstab and enable** (danger) and **Turn off**;
 the manual fstab diff and commands are under *Show manual steps* beneath the table (they follow the
-group-quota switch and tell XFS operators to reboot instead of remounting); a job card appears while
+group-quota switch; for XFS they end with a reboot instead of a remount, and for an XFS **root**
+filesystem they start with the boot-loader command); a job card appears while
 setup runs. **Server:** `POST /api/server-config/quota/enable`
 runs as a job: rewrites the fstab line (backup `/etc/fstab.whm-bak`), remounts, `quotacheck`,
 `quotaon`; `…/disable` runs `quotaoff`; `…/install-tools` installs the distro `quota` package as a
-job. **Needs:** `quota` tools; a filesystem that supports user quotas (XFS needs a reboot after
-the fstab change). **Gotchas:** without kernel quotas, packages' disk limits are recorded and
-measured by `du` but not enforced.
+job. **XFS root filesystem** (the AlmaLinux/Rocky 9 default layout, `/home` inside `/`): the
+initramfs mounts `/` from the kernel command line before `/etc/fstab` is read and XFS takes quota
+options only at mount time, so fstab alone can never enable quotas there. The row shows *boot loader
+change needed* (`/etc/fstab` column: *kernel args: rootflags= missing*) and **Update fstab and enable**
+also puts `rootflags=uquota` (plus `gquota` with the group switch, merged with the flags already
+there) on the kernel arguments — `grubby --update-kernel=ALL --args=rootflags=…` on the RHEL family,
+`GRUB_CMDLINE_LINUX` in `/etc/default/grub` plus `update-grub`/`grub2-mkconfig` elsewhere (backup
+`/etc/default/grub.whm-bak`) — and the job log prints the command it ran; quotas become active after
+the next reboot (status `kernel_args_required` until the boot loader passes the flag, `reboot_required`
+once it does; `quotacheck`/`quotaon` then follow from *Enable quotas*). **Needs:** `quota` tools; a
+filesystem that supports user quotas (XFS applies the options only at mount time: reboot after the
+change). **Gotchas:** without kernel quotas, packages' disk limits are recorded and measured by `du`
+but not enforced; account creation records the limit as *pending* instead of failing.
 
 #### 1.6 Link Server Nodes
 
@@ -583,9 +594,9 @@ Login and session policies. **Who:** root.
 | Minimum password strength | `security.min_password_strength` | every password set |
 
 **Server:** plain settings (`PUT /api/system/settings`), read by `services/auth.js` through
-`ctx.security.policy()`. **Gotchas:** the page's help text still says "not enforced yet" for
-most switches — that wording predates the core enforcement described above (see
-`server/test/auth-policy.test.js`); treat the switches as live.
+`ctx.security.policy()`; every switch is enforced by core exactly as the table says
+(`server/test/auth-policy.test.js`), the page's help text names the enforcement point, and the
+Security Advisor reports a policy as *enforced* once it is on.
 
 #### 4.5 cPHulk Brute Force Protection
 
@@ -695,7 +706,9 @@ mixed case and symbols) and **per-context overrides** (`security.password.streng
 
 Scan the server for security weaknesses. **Who:** root.
 **Scan now / Scan again** runs read-only probes (SSH, firewall, cPHulk, ModSecurity,
-services, panel integrity via `MANIFEST.sha256`, …) and groups findings by grade with
+services, panel integrity via `MANIFEST.sha256`, `.htaccess` `Options` lines Apache refuses under
+the account `AllowOverride` — `FollowSymLinks`, `All`, `ExecCGI`, `Includes`, see 7.1 — in every
+document root, …) and groups findings by grade with
 remediation links; the summary shows counts and the last scan time and trigger.
 **Server:** `POST /api/security/advisor/scan`, last result from `GET /api/security/advisor`.
 **PHP advisories:** one rule compares every installed PHP version (Debian trees, EasyApache
@@ -915,7 +928,18 @@ ThreadsPerChild; switching the module restarts Apache), **Include editor** (cust
 appended verbatim; **Test configuration**). **Server:** `PUT /api/service-config/apache`
 renders `conf-enabled/whm.conf` or `conf.d/whm.conf`, validates with `apachectl -t`, reloads;
 rejected saves are rolled back. **Needs:** Apache. **Gotchas:** a threaded MPM cannot be
-enabled while `mod_php` is loaded — the page warns.
+enabled while `mod_php` is loaded — the page warns. Every account vhost renders its document
+root with `Options -Indexes +SymLinksIfOwnerMatch` and `AllowOverride AuthConfig FileInfo Indexes
+Limit Options=Indexes,MultiViews,SymLinksIfOwnerMatch,IncludesNOEXEC`, so an account `.htaccess`
+may set only those four `Options` tokens (and `None`): Apache refuses any other token whatever its
+`+`/`-` sign, and `All` outright, and every URL below such a line answers **500 Internal Server
+Error** with `.htaccess: Option FollowSymLinks not allowed here` in the domain error log. Sites
+brought in by the Transfer Tool, a cpmove restore, an addon conversion or a backup restore are
+checked on arrival: `Options +FollowSymLinks` (Drupal, Joomla) is rewritten to the equivalent
+`SymLinksIfOwnerMatch` in the account's own files and lines carrying `All`, `ExecCGI` or
+`Includes` are named in the run log and the step; the Security Advisor reports the same for
+existing accounts. `FollowSymLinks` is never enabled (it lets a docroot walk into other accounts'
+web-server-readable files).
 
 #### 7.2 HST Panel Log Rotation Configuration
 
@@ -1115,7 +1139,10 @@ you to type the account name. **Import an archive** registers a hand-copied cPan
 history** shows each restore with its step outcomes. **Server:**
 `POST /api/backup/backups/:id/restore { kind: 'account' }` (job), `POST /api/backup/archives/import`.
 **Gotchas:** database grants are replayed only for databases the account owns; untrusted
-archives never recreate device nodes.
+archives never recreate device nodes. Restored files are checked for `.htaccess` `Options`
+lines the account vhost refuses (7.1): `FollowSymLinks` is rewritten to `SymLinksIfOwnerMatch`
+in the account's own files, anything else (`All`, `ExecCGI`, `Includes`) is named in the restore
+log and the `files` step, because such a site answers 500 until the line is changed.
 
 #### 9.3 Backup User Selection
 

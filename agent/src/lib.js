@@ -31,6 +31,7 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/var/cache/nginx',
   '/home2', '/home3', '/home4', '/mnt/home', '/srv/home',
   '/etc/systemd/resolved.conf.d',
+  '/etc/systemd/system/ssh.socket.d', '/etc/systemd/system/sshd.socket.d',
   '/etc/awstats',
   '/etc/aliases',
   '/etc/resolv.conf',

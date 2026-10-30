@@ -1505,6 +1505,27 @@ export function createSecurityCenterService(ctx) {
         if (ud.enabled) add({ id: 'userdir', grade: 'info', title: 'Apache mod_userdir (~user URLs) is enabled', detail: 'Sites served from ~user URLs share the main IP and bypass per-domain SSL.', fix: { label: 'Apache mod_userdir Tweak', path: '/security-center/apache-mod-userdir-tweak' } });
       });
 
+      // Account vhosts allow .htaccess only Options=Indexes,MultiViews,SymLinksIfOwnerMatch,
+      // IncludesNOEXEC (agent web.js DOCROOT_ALLOW_OVERRIDE): a site whose .htaccess still
+      // says `Options +FollowSymLinks` or `Options All -Indexes` answers 500 on every URL
+      // with only the domain error log saying why.
+      await probe('htaccess', '.htaccess Options', async () => {
+        if (!capabilities.has('apache')) return;
+        const homeRoot = settings.get('basic.home_root') || '/home';
+        const roots = new Set();
+        for (const a of db.prepare('SELECT a.username, a.home_dir, d.docroot FROM accounts a LEFT JOIN account_domains d ON d.account_id = a.id').all()) {
+          const docroot = `${a.home_dir || `${homeRoot}/${a.username}`}/public_html`;
+          roots.add(docroot);
+          if (a.docroot && a.docroot !== docroot && !a.docroot.startsWith(`${docroot}/`)) roots.add(a.docroot);
+        }
+        if (!roots.size) return;
+        const r = await op('web.htaccess.audit', { roots: [...roots], maxFiles: 2000 });
+        const bad = Array.isArray(r.unsupported) ? r.unsupported : [];
+        if (!bad.length) { add({ id: 'htaccess.options', grade: 'ok', title: `No .htaccess under ${roots.size} document root(s) sets Options Apache refuses (${r.scanned ?? 0} file(s) checked${r.truncated ? ', scan truncated' : ''})` }); return; }
+        const files = [...new Set(bad.map((b) => b.file))];
+        add({ id: 'htaccess.options', grade: 'warning', title: `${files.length} .htaccess file(s) set Options Apache refuses for account sites`, detail: [...bad.slice(0, 20).map((b) => `${b.file} line ${b.line}: Options ${b.tokens.join(' ')}`), 'An account .htaccess may set only Indexes, MultiViews, SymLinksIfOwnerMatch and IncludesNOEXEC (the vhost AllowOverride); every directory below such a line answers 500 Internal Server Error. Replace FollowSymLinks with SymLinksIfOwnerMatch and drop All, ExecCGI and Includes.'].join('\n'), files });
+      });
+
       await probe('hostaccess', 'host access control', async () => {
         if (!stmts.hostRules.all().length) add({ id: 'hostaccess', grade: 'info', title: 'No host access rules are defined', detail: 'TCP wrappers can limit SSH and FTP to trusted networks.', fix: { label: 'Host Access Control', path: '/security-center/host-access-control' } });
       });

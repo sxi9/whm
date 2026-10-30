@@ -3,6 +3,7 @@ import { json, paginate } from '../db/index.js';
 import { notFound, conflict, forbidden, badRequest, unprocessable, CapabilityError, HttpError } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
 import { isValidCron } from '../lib/cron.js';
+import { reconcileHtaccess, htaccessSummary, htaccessFields } from '../lib/htaccess.js';
 
 // Backup. Attached as ctx.backup; other categories (Transfers, Account Functions)
 // may call:
@@ -126,6 +127,12 @@ export function createBackupService(ctx) {
     restoreStart: db.prepare("UPDATE backup_restores SET status = 'running' WHERE id = ?"),
     restoreFinish: db.prepare("UPDATE backup_restores SET status = ?, summary_json = ?, error = ?, finished_at = datetime('now') WHERE id = ?"),
     restores: db.prepare('SELECT * FROM backup_restores WHERE (@owner IS NULL OR owner_id = @owner) AND (@account IS NULL OR account_name = @account) ORDER BY id DESC LIMIT @limit'),
+    abandonRun: db.prepare("UPDATE backup_runs SET status = 'failed', error = ?, finished_at = datetime('now') WHERE id = ? AND status IN ('queued', 'running')"),
+    abandonRestore: db.prepare("UPDATE backup_restores SET status = 'failed', error = ?, finished_at = datetime('now') WHERE id = ? AND status IN ('queued', 'running')"),
+    runsOfJob: db.prepare("SELECT id FROM backup_runs WHERE job_id = ? AND status IN ('queued', 'running')"),
+    restoresOfJob: db.prepare("SELECT id FROM backup_restores WHERE job_id = ? AND status IN ('queued', 'running')"),
+    orphanedRuns: db.prepare("SELECT r.id, r.job_id, j.status AS job_status, j.error AS job_error FROM backup_runs r LEFT JOIN jobs j ON j.id = r.job_id WHERE r.status IN ('queued', 'running') AND (j.id IS NULL OR j.status NOT IN ('queued', 'running')) ORDER BY r.id"),
+    orphanedRestores: db.prepare("SELECT r.id, r.job_id, j.status AS job_status, j.error AS job_error FROM backup_restores r LEFT JOIN jobs j ON j.id = r.job_id WHERE r.status IN ('queued', 'running') AND (j.id IS NULL OR j.status NOT IN ('queued', 'running')) ORDER BY r.id"),
     userById: db.prepare('SELECT id, username, role FROM users WHERE id = ?'),
     dbProfileSecret: db.prepare('SELECT * FROM db_instances WHERE id = ?'),
     dnsZonesFor: db.prepare('SELECT domain FROM dns_zones WHERE account_id = ? ORDER BY domain'),
@@ -621,6 +628,40 @@ export function createBackupService(ctx) {
 
   // ---------------------------------------------------------------- runs ---
 
+  // A run or restore whose job ended without reaching runFinish/restoreFinish
+  // (the handler threw before the row was started, the job was cancelled,
+  // the panel restarted mid-run) would otherwise stay "running" forever.
+  const abandonRun = (runId, reason) => stmts.abandonRun.run(reason, runId).changes > 0;
+  const abandonRestore = (restoreId, reason) => stmts.abandonRestore.run(reason, restoreId).changes > 0;
+  function abandonForJob(jobId, reason) {
+    const out = { runs: [], restores: [] };
+    for (const r of stmts.runsOfJob.all(jobId)) if (abandonRun(r.id, reason)) out.runs.push(r.id);
+    for (const r of stmts.restoresOfJob.all(jobId)) if (abandonRestore(r.id, reason)) out.restores.push(r.id);
+    return out;
+  }
+  const orphanReason = (r) => (r.job_id == null || r.job_status == null ? 'the job driving this run no longer exists'
+    : r.job_status === 'cancelled' ? 'the job was cancelled'
+      : r.job_status === 'done' ? 'the job finished without recording the run'
+        : r.job_error || 'the job failed');
+  // jobs.start() marks the jobs interrupted by a restart as failed without
+  // emitting events; the rows they drove are reconciled once the panel is up.
+  function reconcileRuns() {
+    const abandoned = { runs: [], restores: [] };
+    for (const r of stmts.orphanedRuns.all()) if (abandonRun(r.id, orphanReason(r))) abandoned.runs.push(r.id);
+    for (const r of stmts.orphanedRestores.all()) if (abandonRestore(r.id, orphanReason(r))) abandoned.restores.push(r.id);
+    if (abandoned.runs.length || abandoned.restores.length) logger.warn(abandoned, 'backup: finalised runs/restores whose job ended without them');
+    return abandoned;
+  }
+  jobs.onAny((event) => {
+    if (event.type !== 'failed' && event.type !== 'cancelled') return;
+    try {
+      abandonForJob(event.jobId, event.type === 'cancelled' ? 'the job was cancelled before it started' : event.error || 'the job failed');
+    } catch (err) {
+      logger.warn({ err, jobId: event.jobId }, 'backup: run could not be finalised after its job failed');
+    }
+  });
+  ctx.events?.on?.('panel.started', () => { try { reconcileRuns(); } catch (err) { logger.warn({ err }, 'backup: run reconciliation at boot failed'); } });
+
   function shapeRun(row) {
     if (!row) return null;
     return { ...row, summary: json.parse(row.summary_json, {}), summary_json: undefined };
@@ -881,7 +922,8 @@ export function createBackupService(ctx) {
         if (!account) throw new Error(`account ${restore.account_name} does not exist`);
         jobCtx.progress(30, 'restoring files');
         const r = await op('backup.files.restore', { archive, username: account.username, homeDir: homeOf(account), paths: options.paths, overwrite: options.overwrite !== false }, req);
-        step('files', { status: r.missing.length && !r.restored.length ? 'failed' : 'done', detail: `${r.restored.length} path(s) restored${r.missing.length ? `, not in archive: ${r.missing.join(', ')}` : ''}`, restored: r.restored, missing: r.missing });
+        const htaccess = r.restored.length ? await reconcileHtaccess(agent, { roots: r.restored.map((p) => path.resolve(homeOf(account), p)), username: account.username, req, log: jobCtx.log }) : null;
+        step('files', { status: r.missing.length && !r.restored.length ? 'failed' : 'done', detail: `${r.restored.length} path(s) restored${r.missing.length ? `, not in archive: ${r.missing.join(', ')}` : ''}${htaccessSummary(htaccess)}`, restored: r.restored, missing: r.missing, ...htaccessFields(htaccess) });
       } else {
         staging = `${localDir()}/.restore-${restore.id}`;
         jobCtx.progress(15, 'extracting metadata');
@@ -908,7 +950,8 @@ export function createBackupService(ctx) {
         if (options.files !== false) {
           jobCtx.progress(35, 'restoring home directory');
           const r = await op('backup.files.restore', { archive, username: account.username, homeDir: homeOf(account), paths: [], overwrite: options.overwrite !== false }, req);
-          step('files', { status: 'done', detail: `home directory restored into ${homeOf(account)}${r.warnings.length ? ` (${r.warnings.length} warning(s))` : ''}`, warnings: r.warnings });
+          const htaccess = await reconcileHtaccess(agent, { roots: [homeOf(account)], username: account.username, req, log: jobCtx.log });
+          step('files', { status: 'done', detail: `home directory restored into ${homeOf(account)}${r.warnings.length ? ` (${r.warnings.length} warning(s))` : ''}${htaccessSummary(htaccess)}`, warnings: r.warnings, ...htaccessFields(htaccess) });
         }
         if (options.databases !== false && ex.mysql.length) {
           jobCtx.progress(55, 'importing databases');
@@ -1024,7 +1067,7 @@ export function createBackupService(ctx) {
     listBackups, getBackup, inspect, archiveInfo, pinBackup, deleteBackup, rescan, registerArchive, accountsOverview,
     archiveAccount, enqueueRun, runBackupJob, listRuns, getRun: (id) => { const r = stmts.runById.get(id); if (!r) throw notFound('Backup run'); return shapeRun(r); },
     enqueueRestore, runRestoreJob, listRestores, getRestore: (id, user) => { const r = stmts.restoreById.get(id); if (!r) throw notFound('Restore'); if (!isRoot(user) && (r.owner_id == null || r.owner_id !== user.id)) throw forbidden('That restore belongs to another reseller\'s account'); return shapeRestore(r); },
-    enqueueFetch, runFetchJob,
+    enqueueFetch, runFetchJob, reconcileRuns,
     retentionClassFor, planPrune, grantDatabase, rewriteDocroot,
   };
 }

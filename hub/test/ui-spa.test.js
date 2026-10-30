@@ -67,15 +67,39 @@ test('serve_ui: index.html for portal routes, static assets, API and health unto
   }
 });
 
-test('uiDistDir: only WHM_HUB_UI_DIST overrides the bundled dist (hub.conf has no ui_dist key)', () => {
+// hub.conf `ui_dist` is honoured (Phase-6 handoff item); the environment
+// variable still wins so a unit drop-in can point at another build without
+// editing the file, and the shipped hub/ui/dist is the fallback.
+test('uiDistDir: hub.conf ui_dist is used, WHM_HUB_UI_DIST overrides it, the bundled dist is the fallback', () => {
   const saved = process.env.WHM_HUB_UI_DIST;
   delete process.env.WHM_HUB_UI_DIST;
   try {
-    assert.equal(uiDistDir({ ui_dist: '/elsewhere' }), path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../ui/dist'));
+    assert.equal(uiDistDir({ ui_dist: '/elsewhere' }), '/elsewhere');
+    assert.equal(uiDistDir({}), path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../ui/dist'));
     process.env.WHM_HUB_UI_DIST = '/from-env';
     assert.equal(uiDistDir({ ui_dist: '/elsewhere' }), '/from-env');
+    assert.equal(uiDistDir({}), '/from-env');
   } finally {
     if (saved === undefined) delete process.env.WHM_HUB_UI_DIST; else process.env.WHM_HUB_UI_DIST = saved;
+  }
+});
+
+test('serve_ui: a hub.conf ui_dist directory is served without the environment override', async () => {
+  const dist = fakeDist();
+  const saved = process.env.WHM_HUB_UI_DIST;
+  delete process.env.WHM_HUB_UI_DIST;
+  const hub = await bootHub({ config: { serve_ui: true, ui_dist: dist } });
+  try {
+    assert.equal(uiDistDir(hub.ctx.config), dist);
+    const res = await hub.http.get('/admin/licenses');
+    assert.equal(res.status, 200);
+    assert.match(res.text, /id="root"/);
+    const asset = await hub.http.get('/assets/index-abc123.js');
+    assert.equal(asset.status, 200);
+  } finally {
+    if (saved === undefined) delete process.env.WHM_HUB_UI_DIST; else process.env.WHM_HUB_UI_DIST = saved;
+    await hub.close();
+    fs.rmSync(dist, { recursive: true, force: true });
   }
 });
 

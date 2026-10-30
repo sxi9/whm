@@ -349,7 +349,7 @@ master key as `client_secret_enc`. The installer writes `hub.conf` once; `--upgr
 | `license.checkin_retention_days` | `90` | `checkins` rows pruned after this |
 | `license.lookup_block` | `{ failures: 20, windowMs, blockMs }` | failed key lookups per IP before a 24 h block |
 | `license.backup_dir` / `backup_keep` | `/var/backups/whm-hub` / `48` | hourly `sqlite .backup` target and how many to keep (`null` disables) |
-| `license.mail` | `{ from, enabled: true, transport: "sendmail" }` | outbound mail (`sendmail -t -i`; `none` records only) |
+| `license.mail` | `{ from, enabled: true, transport: "smtp", smtp: { host: "127.0.0.1", port: 25, secure: false, starttls: "auto", user?, pass?, reject_unauthorized: true, ca_file?, timeout_ms: 20000 } }` | outbound mail. `smtp` (default) submits to a local or remote MTA (STARTTLS `auto`/`require`/`off`, `secure` for implicit TLS, AUTH PLAIN/LOGIN sent only over TLS or to loopback); `sendmail` runs `sendmail -t -i` and **cannot deliver under `whm-hub.service`** (`NoNewPrivileges=yes` strips the setuid/setgid bit the MTA wrapper needs — the hub logs `sendmail transport cannot deliver` and `/healthz` `data.mail.ok` is false); `none` records only. The transport is probed at boot (`mail transport verified` / `mail transport check failed`). Env: `WHM_HUB_MAIL_TRANSPORT`, `WHM_HUB_SMTP_HOST/PORT/USER/PASS` |
 | `license.billing.{stripe,whmcs,paddle}.secret` | — | inbound webhook signing secrets (prefer `hub.env`) |
 | `license.rate_limits.*` | §16.10 values | `{ max, windowMs }` per route group: `activate`, `checkin`, `trial`, `recover`, `reseller`, `admin`, `portal_login`, `public` |
 | `license.vendor` | `{ name, support_email?, portal_url? }` | shown in mails and panel messages |
