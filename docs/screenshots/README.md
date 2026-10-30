@@ -1,6 +1,6 @@
 # Screenshots
 
-Updated 2026-10-30 at commit `4ebd34b`. All images are captured automatically (Playwright) against the built interface served by the API, and each carries a label bar naming the screen, whether it is live or a placeholder, the date and the commit. They are regenerated at every milestone (`e2e/screenshots.sh`).
+Updated 2026-10-30 at commit `ace1b39`. All images are captured automatically (Playwright) against the built interface served by the API, and each carries a label bar naming the screen, whether it is live or a placeholder, the date and the commit. They are regenerated at every milestone (`e2e/screenshots.sh`).
 
 - **[Every page →](pages/README.md)** — all 216 function pages grouped by category (216/216 live) plus core pages.
 
