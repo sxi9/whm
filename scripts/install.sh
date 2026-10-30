@@ -15,7 +15,8 @@
 # The license hub defaults to https://licserver.hostingsignal.in (the vendor hub); only the
 # super admin of the panel ever sees it. The super admin setup password (asked once on a
 # terminal, or WHM_SUPERADMIN_SETUP_PASSWORD) is stored as a bcrypt hash in
-# $WHM_DATA_DIR/superadmin.key (0600 root); without it `whm-cli superadmin <user>` refuses.
+# /etc/whm/superadmin.key (0600 root:root, in a directory the panel user cannot write);
+# without it `whm-cli superadmin <user>` refuses.
 # With --with-hub it additionally creates the whmhub user, /etc/whm-hub (hub.conf, hub.env,
 # master key, signing keys, download HMAC), /var/lib/whm-hub and /var/log/whm-hub, and
 # installs whm-hub.service (HTTPS :7443, loopback :7440). HUB_* variables override the
@@ -213,11 +214,17 @@ if ! grep -q '^WHM_LICENSE_HUB_URL=' "$ETC_DIR/panel.env"; then
   fi
 fi
 
-# Super admin setup password: its bcrypt hash goes to $DATA_DIR/superadmin.key (0600 root:root,
-# the panel process cannot read it). `whm-cli superadmin <user>` grants the flag only after this
-# password verifies; without the file the command refuses and points at `superadmin --init`.
-# Non-interactive via WHM_SUPERADMIN_SETUP_PASSWORD; asked once on a terminal; never rewritten.
-if [ ! -f "$DATA_DIR/superadmin.key" ]; then
+# Super admin setup password: its bcrypt hash goes to $ETC_DIR/superadmin.key (0600 root:root;
+# $ETC_DIR is root-owned, so the panel user can neither read nor replace it). `whm-cli superadmin
+# <user>` grants the flag only after this password verifies; without the file the command refuses
+# and points at `superadmin --init`. Non-interactive via WHM_SUPERADMIN_SETUP_PASSWORD; asked once
+# on a terminal; never rewritten. A key an earlier build left in $DATA_DIR moves here.
+if [ -f "$DATA_DIR/superadmin.key" ] && [ ! -f "$ETC_DIR/superadmin.key" ]; then
+  log "Moving $DATA_DIR/superadmin.key to $ETC_DIR/superadmin.key"
+  mv "$DATA_DIR/superadmin.key" "$ETC_DIR/superadmin.key"
+  chown root:root "$ETC_DIR/superadmin.key"; chmod 0600 "$ETC_DIR/superadmin.key"
+fi
+if [ ! -f "$ETC_DIR/superadmin.key" ]; then
   SUPERADMIN_SETUP_PASSWORD=${WHM_SUPERADMIN_SETUP_PASSWORD:-}
   if [ -z "$SUPERADMIN_SETUP_PASSWORD" ] && [ -t 0 ] && [ "$UPGRADE" -eq 0 ]; then
     printf 'Super admin setup password (at least 12 characters; blank to set it later with "whm-cli superadmin --init"): '
@@ -231,10 +238,10 @@ if [ ! -f "$DATA_DIR/superadmin.key" ]; then
     fi
   fi
   if [ -n "$SUPERADMIN_SETUP_PASSWORD" ]; then
-    log "Storing the super admin setup password hash in $DATA_DIR/superadmin.key"
-    WHM_CONFIG="$ETC_DIR/whm.conf" WHM_DATA_DIR="$DATA_DIR" WHM_SUPERADMIN_SETUP_PASSWORD="$SUPERADMIN_SETUP_PASSWORD" \
+    log "Storing the super admin setup password hash in $ETC_DIR/superadmin.key"
+    WHM_CONFIG="$ETC_DIR/whm.conf" WHM_DATA_DIR="$DATA_DIR" WHM_SUPERADMIN_KEY_FILE="$ETC_DIR/superadmin.key" WHM_SUPERADMIN_SETUP_PASSWORD="$SUPERADMIN_SETUP_PASSWORD" \
       "$NODE_BIN" "$APP_DIR/scripts/whm-cli.js" superadmin --init >/dev/null
-    chown root:root "$DATA_DIR/superadmin.key"; chmod 0600 "$DATA_DIR/superadmin.key"
+    chown root:root "$ETC_DIR/superadmin.key"; chmod 0600 "$ETC_DIR/superadmin.key"
   else
     log "No super admin setup password given: run \"sudo node $APP_DIR/scripts/whm-cli.js superadmin --init\" before granting the super admin"
   fi
@@ -385,7 +392,7 @@ if systemctl is-active --quiet whm-panel; then
   else
     echo "  License:   hub $DEFAULT_LICENSE_HUB_URL (default) — the super admin enters the key under Server Configuration › Basic WebHost Manager Setup › License"
   fi
-  if [ -f "$DATA_DIR/superadmin.key" ]; then
+  if [ -f "$ETC_DIR/superadmin.key" ]; then
     echo "  Super admin: sudo node $APP_DIR/scripts/whm-cli.js superadmin root   (asks for the setup password; only that user sees the license hub and key)"
   else
     echo "  Super admin: sudo node $APP_DIR/scripts/whm-cli.js superadmin --init, then: superadmin root"

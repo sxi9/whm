@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { fromCloudflareRecord, toCloudflareRecord, diffRecords, unquoteTxt, CLOUDFLARE_API } from '../src/services/dns-cloudflare.js';
+import { fromCloudflareRecord, toCloudflareRecord, remoteKey, diffRecords, unquoteTxt, canonicalIpv6, CLOUDFLARE_API } from '../src/services/dns-cloudflare.js';
 
 const TOKEN = 'cf_test_token_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 const BOB_ZONE = '0123456789abcdef0123456789abcdef';
@@ -31,12 +31,19 @@ function fakeCloudflare() {
     records: { [BOB_ZONE]: [], [ALICE_ZONE]: [] },
     calls: [],
     failNext: [],
+    // Milliseconds the next record listing is held before answering.
+    delayNextListing: 0,
   };
   let nextId = 1;
-  const reply = (status, payload) => new Response(JSON.stringify(payload), { status, headers: { 'content-type': 'application/json' } });
+  const reply = (status, payload, headers = {}) => new Response(JSON.stringify(payload), { status, headers: { 'content-type': 'application/json', ...headers } });
   const ok = (result, extra = {}) => reply(200, { success: true, errors: [], messages: [], result, ...extra });
-  const fail = (status, code, message) => reply(status, { success: false, errors: [{ code, message }], messages: [], result: null });
-  const page = (list) => ({ result_info: { page: 1, per_page: 1000, total_pages: 1, count: list.length, total_count: list.length } });
+  const fail = (status, code, message, headers) => reply(status, { success: false, errors: [{ code, message }], messages: [], result: null }, headers);
+  const paged = (list, u) => {
+    const perPage = Number(u.searchParams.get('per_page')) || 20;
+    const page = Number(u.searchParams.get('page')) || 1;
+    const slice = list.slice((page - 1) * perPage, page * perPage);
+    return ok(slice, { result_info: { page, per_page: perPage, total_pages: Math.max(1, Math.ceil(list.length / perPage)), count: slice.length, total_count: list.length } });
+  };
   const fetch = async (url, init = {}) => {
     const u = new URL(url);
     const method = init.method || 'GET';
@@ -45,7 +52,7 @@ function fakeCloudflare() {
     if (state.failNext.length) {
       const f = state.failNext.shift();
       if (f instanceof Error) throw f;
-      return fail(f.status, f.code, f.message);
+      return fail(f.status, f.code, f.message, f.retryAfter ? { 'retry-after': String(f.retryAfter) } : {});
     }
     if (!u.href.startsWith(CLOUDFLARE_API)) return fail(404, 7000, 'No route');
     if (init.headers?.Authorization !== `Bearer ${TOKEN}`) return fail(401, 10000, 'Authentication error');
@@ -53,15 +60,17 @@ function fakeCloudflare() {
     if (path === '/user/tokens/verify') return ok({ id: 'tok1', status: 'active' });
     if (path === '/zones') {
       const name = u.searchParams.get('name');
-      const list = state.zones.filter((z) => !name || z.name === name);
-      return ok(list, page(list));
+      return paged(state.zones.filter((z) => !name || z.name === name), u);
     }
     let m = path.match(/^\/zones\/([a-f0-9]{32})$/);
     if (m) { const z = state.zones.find((x) => x.id === m[1]); return z ? ok(z) : fail(404, 7003, 'Could not route to /zones'); }
     m = path.match(/^\/zones\/([a-f0-9]{32})\/dns_records(?:\/([^/]+))?$/);
     if (m) {
       const list = (state.records[m[1]] ||= []);
-      if (!m[2] && method === 'GET') return ok(list, page(list));
+      if (!m[2] && method === 'GET') {
+        if (state.delayNextListing) { const ms = state.delayNextListing; state.delayNextListing = 0; await new Promise((r) => setTimeout(r, ms)); }
+        return paged(list, u);
+      }
       if (!m[2] && method === 'POST') { const rec = { id: `r${nextId++}`, proxied: false, ...body }; list.push(rec); return ok(rec); }
       const idx = list.findIndex((r) => r.id === m[2]);
       if (idx < 0) return fail(404, 81044, 'Record does not exist.');
@@ -87,6 +96,7 @@ describe('Cloudflare record mapping', () => {
     const map = (r) => fromCloudflareRecord(r, D);
     expect(map({ type: 'A', name: 'example.com', content: '203.0.113.9', ttl: 1 }).record).toEqual({ name: '@', type: 'A', ttl: null, priority: null, value: '203.0.113.9' });
     expect(map({ type: 'AAAA', name: 'www.example.com', content: '2001:DB8::1', ttl: 300 }).record).toEqual({ name: 'www', type: 'AAAA', ttl: 300, priority: null, value: '2001:db8::1' });
+    expect(map({ type: 'AAAA', name: 'www.example.com', content: '2001:DB8:0:0:0:0:0:7', ttl: 1 }).record).toMatchObject({ value: '2001:db8::7' });
     expect(map({ type: 'CNAME', name: 'blog.example.com', content: 'example.com', ttl: 1 }).record).toMatchObject({ name: 'blog', type: 'CNAME', value: 'example.com.' });
     expect(map({ type: 'MX', name: 'example.com', content: 'mail.example.com', priority: 10, ttl: 1 }).record).toMatchObject({ name: '@', type: 'MX', priority: 10, value: 'mail.example.com.' });
     expect(map({ type: 'TXT', name: 'example.com', content: '"v=spf1 +mx ~all"', ttl: 1 }).record).toMatchObject({ name: '@', type: 'TXT', value: 'v=spf1 +mx ~all' });
@@ -111,6 +121,25 @@ describe('Cloudflare record mapping', () => {
     expect(to({ name: '@', type: 'TXT', ttl: null, value: 'v=spf1 +mx ~all' }).payload.content).toBe('v=spf1 +mx ~all');
   });
 
+  it('canonicalises IPv6 addresses on both sides so an expanded panel value pairs with the compressed remote one', () => {
+    expect(canonicalIpv6('2001:DB8:0:0:0:0:0:1')).toBe('2001:db8::1');
+    expect(canonicalIpv6('2001:db8::1')).toBe('2001:db8::1');
+    expect(canonicalIpv6('not-an-ip')).toBe('not-an-ip');
+    const to = toCloudflareRecord({ name: 'www', type: 'AAAA', ttl: null, value: '2001:db8:0:0:0:0:0:1' }, D);
+    expect(to).toMatchObject({ key: 'AAAA|www.example.com|2001:db8::1', payload: { type: 'AAAA', name: 'www.example.com', content: '2001:db8::1', ttl: 1 } });
+    const diff = diffRecords([{ name: 'www', type: 'AAAA', ttl: null, value: '2001:db8:0:0:0:0:0:1' }], [{ id: 'r1', type: 'AAAA', name: 'www.example.com', content: '2001:db8::1', ttl: 1 }], D);
+    expect(diff).toMatchObject({ unchanged: 1, creates: [], updates: [], deletes: [] });
+  });
+
+  it('never compares or sends the TTL of a proxied record: Cloudflare pins it to Auto', () => {
+    const remote = [{ id: 'r1', type: 'A', name: 'example.com', content: '203.0.113.9', ttl: 1, proxied: true }];
+    const diff = diffRecords([{ name: '@', type: 'A', ttl: 3600, value: '203.0.113.9' }], remote, D);
+    expect(diff).toMatchObject({ unchanged: 1, updates: [], creates: [], deletes: [], proxiedTtl: ['A example.com (ttl 3600)'] });
+    const plain = diffRecords([{ name: '@', type: 'A', ttl: 3600, value: '203.0.113.9' }], [{ ...remote[0], proxied: false }], D);
+    expect(plain.updates.map((u) => [u.remote.id, u.ttl, u.payload.ttl])).toEqual([['r1', 3600, 3600]]);
+    expect(plain.proxiedTtl).toEqual([]);
+  });
+
   it('computes a minimal diff by (type, name, content) and leaves unmanaged types alone', () => {
     const desired = [
       { name: '@', type: 'A', ttl: null, value: '203.0.113.9' },
@@ -128,10 +157,12 @@ describe('Cloudflare record mapping', () => {
       { id: 'r6', type: 'HTTPS', name: 'example.com', content: '1 . alpn="h2"', ttl: 1 },
     ];
     const diff = diffRecords(desired, remote, D);
-    expect(diff.unchanged).toBe(2);
+    // r2 is proxied: its explicit panel TTL is ignored rather than re-pushed forever.
+    expect(diff.unchanged).toBe(3);
     expect(diff.creates.map((c) => c.key)).toEqual(['CNAME|new.example.com|example.com']);
-    expect(diff.updates.map((u) => [u.remote.id, u.ttl, u.priority])).toEqual([['r2', 300, null], ['r3', 1, 20]]);
+    expect(diff.updates.map((u) => [u.remote.id, u.ttl, u.priority])).toEqual([['r3', 1, 20]]);
     expect(diff.deletes.map((r) => r.id)).toEqual(['r5']);
+    expect(diff.proxiedTtl).toEqual(['A www.example.com (ttl 300)']);
   });
 });
 
@@ -140,6 +171,7 @@ describe('Cloudflare DNS API', () => {
   let csrf;
   let resellerHttp;
   let resellerCsrf;
+  let resellerId;
   let cf;
   const realFetch = globalThis.fetch;
 
@@ -148,6 +180,7 @@ describe('Cloudflare DNS API', () => {
     delete app.ctx.web;
     csrf = await app.login();
     const reseller = await app.createUser('resell1', 'reseller');
+    resellerId = reseller.id;
     await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'alice', domain: 'alice.com', owner: 'resell1', provision: { dns: false, mail: false } }).expect(201);
     await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'bob', domain: 'bob.com', provision: { dns: false, mail: false } }).expect(201);
     await app.http.post('/api/dns/zones').set('X-CSRF-Token', csrf).send({ domain: 'bob.com', ip: '203.0.113.9' }).expect(201);
@@ -218,21 +251,58 @@ describe('Cloudflare DNS API', () => {
     await resellerHttp.put('/api/dns/cloudflare/token').set('X-CSRF-Token', resellerCsrf).send({ apiToken: TOKEN }).expect(403);
   });
 
-  it('links a zone to its Cloudflare zone, enforcing reseller ownership', async () => {
+  it('does not seed the zone cache from a partial first page', async () => {
+    const extra = Array.from({ length: 60 }, (_, i) => ({ id: `${'f'.repeat(24)}${i.toString(16).padStart(8, '0')}`, name: `zone${i}.example`, status: 'active', paused: false, type: 'full', name_servers: [], account: { id: 'acct1', name: 'Hostingsignal' }, plan: { name: 'Free Website' } }));
+    cf.state.zones.push(...extra);
+    try {
+      await put('/cloudflare/token', { apiToken: TOKEN }).expect(200);
+      const start = cf.state.calls.length;
+      const res = await get('/cloudflare/zones').expect(200);
+      expect(res.body.data).toHaveLength(62);
+      expect(cf.state.calls.slice(start).map((c) => c.path)).toEqual(['/client/v4/zones?per_page=50&page=1', '/client/v4/zones?per_page=50&page=2']);
+    } finally {
+      cf.state.zones.splice(2);
+      await get('/cloudflare/zones?refresh=true').expect(200);
+    }
+    expect((await get('/cloudflare/zones').expect(200)).body.data).toHaveLength(2);
+  });
+
+  it('links a zone to its Cloudflare zone (root only): a reseller cannot link a zone root did not assign, but imports and pushes one root linked on their account', async () => {
     await rpost('/zones/bob.com/cloudflare/link').expect(403);
+    // alice.com belongs to the reseller, yet the Cloudflare account is root's: linking is root's decision.
+    await rpost('/zones/alice.com/cloudflare/link').expect(403);
     expect(zoneRow('bob.com').provider).toBe('bind');
+    expect(zoneRow('alice.com').provider).toBe('bind');
+    expect(auditRows().filter((r) => r.action === 'dns.cloudflare.link')).toEqual([]);
     const res = await post('/zones/bob.com/cloudflare/link').expect(200);
     expect(res.body.data).toMatchObject({ domain: 'bob.com', provider: 'cloudflare', cloudflareZoneId: BOB_ZONE, status: 'linked', remote: { name: 'bob.com', status: 'active' } });
     expect((await get('/zones/bob.com').expect(200)).body.data).toMatchObject({ provider: 'cloudflare', cloudflare_zone_id: BOB_ZONE });
     await post('/zones/alice.com/cloudflare/link', { cloudflareZoneId: BOB_ZONE }).expect(422);
     await post('/zones/alice.com/cloudflare/link', { cloudflareZoneId: 'nothex' }).expect(422);
-    const mine = await rpost('/zones/alice.com/cloudflare/link').expect(200);
+    const mine = await post('/zones/alice.com/cloudflare/link').expect(200);
     expect(mine.body.data).toMatchObject({ provider: 'cloudflare', cloudflareZoneId: ALICE_ZONE });
-    cf.state.zones = cf.state.zones.filter((z) => z.name !== 'alice.com');
-    await rpost('/zones/alice.com/cloudflare/unlink').expect(200);
+
+    // Root linked it on the reseller's account: the reseller now follows, pushes and imports it, nothing more.
+    const status = await resellerHttp.get('/api/dns/zones/alice.com/cloudflare').expect(200);
+    expect(status.body.data).toMatchObject({ provider: 'cloudflare', cloudflareZoneId: ALICE_ZONE, canLink: false });
+    expect((await resellerHttp.get('/api/dns/cloudflare/status').expect(200)).body.data.linked.map((z) => z.domain)).toEqual(['alice.com']);
+    const pushed = await rpost('/zones/alice.com/cloudflare/push').expect(202);
+    expect(pushed.body.data.job).toEqual({ id: expect.any(Number), status: expect.any(String), reused: false });
+    const job = await waitForJob(app.ctx, pushed.body.data.job.id);
+    expect(job.status).toBe('done');
+    expect(job.created_by).toBe(resellerId);
+    expect(cf.state.records[ALICE_ZONE].length).toBeGreaterThan(0);
+    await resellerHttp.get(`/api/system/jobs/${job.id}`).expect(200);
+    expect((await resellerHttp.post('/api/dns/zones/alice.com/cloudflare/import').set('X-CSRF-Token', resellerCsrf).expect(200)).body.data).toMatchObject({ status: 'ok' });
+    await rpost('/zones/alice.com/cloudflare/unlink').expect(403);
+    expect(zoneRow('alice.com').provider).toBe('cloudflare');
+    await rpost('/zones/bob.com/cloudflare/push').expect(403);
+
+    await post('/zones/alice.com/cloudflare/unlink').expect(200);
     expect(zoneRow('alice.com')).toMatchObject({ provider: 'bind', cloudflare_zone_id: null });
+    cf.state.zones = cf.state.zones.filter((z) => z.name !== 'alice.com');
     await get('/cloudflare/zones?refresh=true').expect(200);
-    await rpost('/zones/alice.com/cloudflare/link').expect(404);
+    await post('/zones/alice.com/cloudflare/link').expect(404);
     expect(auditRows().filter((r) => r.action === 'dns.cloudflare.link').map((r) => r.target)).toEqual(['bob.com', 'alice.com']);
     expect((await get('/cloudflare/status').expect(200)).body.data.linked.map((z) => z.domain)).toEqual(['bob.com']);
   });
@@ -266,7 +336,7 @@ describe('Cloudflare DNS API', () => {
     expect(zone.soa.primary).toBeTruthy();
     expect(zone.serial).toBeGreaterThan(before.serial);
     expect(app.agent.callsTo('dns.zone.write').length).toBeGreaterThan(0);
-    expect(app.ctx.jobs.list({ type: 'dns.cloudflare.push' })).toEqual([]);
+    expect(app.ctx.jobs.list({ type: 'dns.cloudflare.push' }).filter((j) => j.params.domain === 'bob.com')).toEqual([]);
     expect(zoneRow('bob.com')).toMatchObject({ cloudflare_status: 'ok', cloudflare_last_error: null });
     expect(zoneRow('bob.com').cloudflare_synced_at).toBeTruthy();
     await rpost('/zones/bob.com/cloudflare/import').expect(403);
@@ -295,14 +365,25 @@ describe('Cloudflare DNS API', () => {
     expect(remote.find((r) => r.id === 'c8')).toBeTruthy();
     expect(zoneRow('bob.com')).toMatchObject({ cloudflare_status: 'ok', cloudflare_last_error: null });
 
-    // A TTL change updates in place and keeps the proxied flag of the record.
-    const apexA = (await get('/zones/bob.com').expect(200)).body.data.records.find((r) => r.type === 'A' && r.name === '@');
-    const updated = await put(`/zones/bob.com/records/${apexA.id}`, { ttl: 3600 }).expect(200);
+    // A TTL change updates a DNS-only record in place and keeps its proxied flag.
+    const records = (await get('/zones/bob.com').expect(200)).body.data.records;
+    const wwwAAAA = records.find((r) => r.type === 'AAAA' && r.name === 'www');
+    const updated = await put(`/zones/bob.com/records/${wwwAAAA.id}`, { ttl: 3600 }).expect(200);
     const job2 = await waitForJob(app.ctx, updated.body.data.mirror.jobId);
     expect(job2.result).toMatchObject({ created: 0, updated: 1, deleted: 0 });
-    expect(remote.find((r) => r.id === 'c2')).toMatchObject({ ttl: 3600, proxied: true, content: '198.51.100.7' });
+    expect(remote.find((r) => r.id === 'c3')).toMatchObject({ ttl: 3600, proxied: false, content: '2001:db8::7' });
     const patch = cf.state.calls.find((c) => c.method === 'PATCH');
-    expect(patch.body).toMatchObject({ type: 'A', name: 'bob.com', content: '198.51.100.7', ttl: 3600, proxied: true });
+    expect(patch.body).toMatchObject({ type: 'AAAA', name: 'www.bob.com', content: '2001:db8::7', ttl: 3600, proxied: false });
+
+    // A proxied (orange-cloud) record keeps Cloudflare's Auto TTL: the panel's TTL is noted once, never re-pushed.
+    const apexA = records.find((r) => r.type === 'A' && r.name === '@');
+    cf.state.calls.length = 0;
+    const proxied = await put(`/zones/bob.com/records/${apexA.id}`, { ttl: 7200 }).expect(200);
+    const job2b = await waitForJob(app.ctx, proxied.body.data.mirror.jobId);
+    expect(job2b.result).toMatchObject({ created: 0, updated: 0, deleted: 0, unchanged: 7 });
+    expect(cf.state.calls.filter((c) => c.method !== 'GET')).toEqual([]);
+    expect(remote.find((r) => r.id === 'c2')).toMatchObject({ ttl: 1, proxied: true });
+    expect(job2b.logs.some((l) => /proxied records keep Cloudflare's Auto TTL.*A bob\.com \(ttl 7200\)/.test(l.line))).toBe(true);
 
     // Deleting the record removes it remotely; a manual push afterwards changes nothing.
     const shop = (await get('/zones/bob.com').expect(200)).body.data.records.find((r) => r.name === 'shop');
@@ -310,6 +391,8 @@ describe('Cloudflare DNS API', () => {
     await waitForJob(app.ctx, removed.body.data.mirror.jobId);
     expect(remote.find((r) => r.name === 'shop.bob.com')).toBeUndefined();
     const manual = await post('/zones/bob.com/cloudflare/push').expect(202);
+    expect(manual.body.data.job).toEqual({ id: expect.any(Number), status: expect.any(String), reused: false });
+    expect(manual.body.data.job.logs).toBeUndefined();
     const job3 = await waitForJob(app.ctx, manual.body.data.job.id);
     expect(job3.result).toMatchObject({ created: 0, updated: 0, deleted: 0 });
     await rpost('/zones/bob.com/cloudflare/push').expect(403);
@@ -339,16 +422,86 @@ describe('Cloudflare DNS API', () => {
     app.ctx.settings.set('dns.cloudflare.push_attempts', 3);
   });
 
-  it('coalesces queued pushes for the same zone', async () => {
+  it('does not retry a deterministic Cloudflare answer (401/403/404/400) and fails after one attempt', async () => {
+    cf.state.failNext = [{ status: 403, code: 9109, message: 'Unauthorized to access requested resource' }];
+    const syncRows = () => app.ctx.db.prepare("SELECT COUNT(*) AS n FROM dns_cloudflare_sync WHERE domain = 'bob.com' AND action = 'push' AND status = 'failed'").get().n;
+    const before = syncRows();
+    const manual = await post('/zones/bob.com/cloudflare/push').expect(202);
+    const job = await waitForJob(app.ctx, manual.body.data.job.id);
+    expect(job.status).toBe('failed');
+    expect(job.error).toMatch(/Unauthorized/);
+    expect(job.logs.filter((l) => /attempt \d failed/.test(l.line)).map((l) => l.line)).toEqual([expect.stringMatching(/attempt 1 failed: .*not retried/)]);
+    expect(syncRows()).toBe(before + 1);
+    expect(cf.state.calls.filter((c) => c.path.includes('/dns_records'))).toHaveLength(1);
+  });
+
+  it("re-queues a rate-limited push as a new job instead of sleeping Cloudflare's Retry-After in a worker slot", async () => {
+    cf.state.failNext = [{ status: 429, code: 10000, message: 'rate limited', retryAfter: 1 }];
+    const manual = await post('/zones/bob.com/cloudflare/push').expect(202);
+    const first = await waitForJob(app.ctx, manual.body.data.job.id);
+    expect(first.status).toBe('failed');
+    expect(first.error).toMatch(/rate limited — retry scheduled in 1 s/);
+    expect(first.logs.some((l) => /attempt 2 of 3 runs in 1 s as a new job \(worker slot released\)/.test(l.line))).toBe(true);
+    expect(app.ctx.jobs.runningCount()).toBe(0);
+    const pending = (await get('/zones/bob.com/cloudflare').expect(200)).body.data;
+    expect(pending).toMatchObject({ status: 'failed', pendingRetry: { attempt: 2 } });
+    let retry = null;
+    for (let i = 0; i < 60 && !retry; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      retry = app.ctx.jobs.list({ type: 'dns.cloudflare.push' }).find((j) => j.params.retryOf === first.id) ?? null;
+    }
+    expect(retry).toBeTruthy();
+    expect(retry.params).toMatchObject({ domain: 'bob.com', attempt: 2, retryOf: first.id });
+    expect(retry.created_by).toBe(first.created_by);
+    const done = await waitForJob(app.ctx, retry.id);
+    expect(done.status).toBe('done');
+    expect(done.logs[0].line).toMatch(new RegExp(`retry 2 .*continuing job ${first.id}`));
+    expect(app.ctx.db.prepare("SELECT attempt FROM dns_cloudflare_sync WHERE job_id = ? AND status = 'ok'").get(retry.id)).toEqual({ attempt: 2 });
+    expect((await get('/zones/bob.com/cloudflare').expect(200)).body.data).toMatchObject({ status: 'ok', lastError: null, pendingRetry: null });
+  });
+
+  it('coalesces queued pushes for the same zone, but never hands one principal another\'s job', async () => {
     app.ctx.jobs.stop();
     const first = await post('/zones/bob.com/records', { name: 'a1', type: 'A', value: '198.51.100.21' }).expect(201);
     const second = await post('/zones/bob.com/records', { name: 'a2', type: 'A', value: '198.51.100.22' }).expect(201);
     expect(second.body.data.mirror.jobId).toBe(first.body.data.mirror.jobId);
     expect(zoneRow('bob.com').cloudflare_status).toBe('pending');
+    // Root's queued job is not reused for a different principal: the jobs API would hide it from them.
+    const other = app.ctx.dnsCloudflare.enqueuePush('bob.com', { reason: 'manual push by someone else', userId: resellerId });
+    expect(other).toMatchObject({ reused: false });
+    expect(other.id).not.toBe(first.body.data.mirror.jobId);
+    expect(app.ctx.jobs.get(other.id).created_by).toBe(resellerId);
+    expect(app.ctx.dnsCloudflare.enqueuePush('bob.com', { userId: resellerId })).toEqual({ id: other.id, reused: true });
     app.ctx.jobs.start();
     const job = await waitForJob(app.ctx, first.body.data.mirror.jobId);
     expect(job.result.created).toBe(2);
+    expect((await waitForJob(app.ctx, other.id)).result).toMatchObject({ created: 0, deleted: 0 });
     expect(cf.state.records[BOB_ZONE].filter((r) => ['a1.bob.com', 'a2.bob.com'].includes(r.name)).length).toBe(2);
+  });
+
+  it('serialises pushes of one zone so a later edit never races an earlier listing', async () => {
+    const remoteKeys = () => cf.state.records[BOB_ZONE].map((r) => remoteKey(r, 'bob.com')).filter(Boolean).sort();
+    const panelKeys = async () => (await get('/zones/bob.com').expect(200)).body.data.records
+      .filter((r) => r.type !== 'SOA' && !(r.type === 'NS' && r.name === '@'))
+      .map((r) => toCloudflareRecord(r, 'bob.com').key).sort();
+    // Job A's record listing is held while the record is deleted again; job B must wait for A.
+    cf.state.delayNextListing = 300;
+    const added = await post('/zones/bob.com/records', { name: 'racy', type: 'A', value: '198.51.100.44' }).expect(201);
+    const jobA = added.body.data.mirror.jobId;
+    const racy = (await get('/zones/bob.com').expect(200)).body.data.records.find((r) => r.name === 'racy');
+    const removed = await del(`/zones/bob.com/records/${racy.id}`).expect(200);
+    const jobB = removed.body.data.mirror.jobId;
+    expect(jobB).not.toBe(jobA);
+    expect(app.ctx.jobs.get(jobA).status).toBe('running');
+    const a = await waitForJob(app.ctx, jobA);
+    const b = await waitForJob(app.ctx, jobB);
+    expect(a.status).toBe('done');
+    expect(b.status).toBe('done');
+    expect(a.result).toMatchObject({ created: 1 });
+    expect(b.result).toMatchObject({ created: 0, deleted: 1 });
+    expect(cf.state.records[BOB_ZONE].find((r) => r.name === 'racy.bob.com')).toBeUndefined();
+    expect(remoteKeys()).toEqual(await panelKeys());
+    expect(zoneRow('bob.com')).toMatchObject({ cloudflare_status: 'ok', cloudflare_last_error: null });
   });
 
   it('unlinks a zone (remote records untouched) and removes the token', async () => {

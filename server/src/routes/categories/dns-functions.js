@@ -134,8 +134,10 @@ export async function register(ctx) {
     wrap((req) => dns().previewTemplate(req.params.name, req.body)));
 
   // Cloudflare DNS --------------------------------------------------------------
-  // The token is root-only and only ever written; zone-level actions use the
-  // DNS service's ownership check, so a reseller mirrors only zones they own.
+  // The token is root-only and only ever written. Linking is root-only too
+  // (the token is account-wide, so a link hands over the Cloudflare zone of
+  // that name); import/push/status use the DNS service's ownership check, so
+  // a reseller mirrors only zones root linked on accounts they own.
   const cf = () => ctx.dnsCloudflare;
   const cfZoneId = z.string().regex(/^[a-f0-9]{32}$/, 'Cloudflare zone IDs are 32 hex characters');
   r.get('/cloudflare/status', requireReseller, wrap((req) => cf().status(req.user)));
@@ -145,9 +147,9 @@ export async function register(ctx) {
   r.get('/cloudflare/zones', requireRoot, validate({ query: z.object({ refresh: z.enum(['true', 'false']).transform((v) => v === 'true').optional() }) }),
     wrap((req) => cf().zones(req.query, req.user)));
   r.get('/zones/:domain/cloudflare', requireReseller, validate({ params: domainParam }), wrap((req) => cf().zoneStatus(req.params.domain, req.user)));
-  r.post('/zones/:domain/cloudflare/link', requireReseller, validate({ params: domainParam, body: z.object({ cloudflareZoneId: cfZoneId.optional() }).strict() }),
+  r.post('/zones/:domain/cloudflare/link', requireRoot, validate({ params: domainParam, body: z.object({ cloudflareZoneId: cfZoneId.optional() }).strict() }),
     wrap((req) => cf().link(req.params.domain, req.body, req.user, req)));
-  r.post('/zones/:domain/cloudflare/unlink', requireReseller, validate({ params: domainParam }), wrap((req) => cf().unlink(req.params.domain, req.user, req)));
+  r.post('/zones/:domain/cloudflare/unlink', requireRoot, validate({ params: domainParam }), wrap((req) => cf().unlink(req.params.domain, req.user, req)));
   r.post('/zones/:domain/cloudflare/import', requireReseller, validate({ params: domainParam }), wrap((req) => cf().import(req.params.domain, req.user, req)));
   r.post('/zones/:domain/cloudflare/push', requireReseller, validate({ params: domainParam }), wrap((req) => cf().requestPush(req.params.domain, req.user, req), 202));
 

@@ -95,7 +95,8 @@ export default function MarketProviderManager({ fn }) {
             ] : [
               isRoot && { label: p.enabled ? 'Disable' : 'Enable', primary: true, onClick: () => toggle(p), disabled: !p.enabled && !p.configured },
               isRoot && !hubHidden(p) && { label: 'Configure', primary: !p.configured, onClick: () => setConfiguring(p) },
-              isRoot && { label: testing === p.name ? 'Testing…' : 'Test', onClick: () => test(p), disabled: testing === p.name },
+              // A test answer names the hub host: owner only, like the URL.
+              isRoot && !hubHidden(p) && { label: testing === p.name ? 'Testing…' : 'Test', onClick: () => test(p), disabled: testing === p.name },
               isRoot && !hubHidden(p) && { label: 'Edit', onClick: () => setForm({ open: true, provider: p }) },
               isRoot && p.hasProducts && { label: 'Sync products', onClick: () => sync(p) },
               isRoot && !p.builtin && { label: 'Delete', danger: true, onClick: () => remove(p) },

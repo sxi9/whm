@@ -6,19 +6,23 @@
 //   whm-cli create-admin <user> [pw]    create another root-level panel user
 //   whm-cli list-users                  list panel users
 //   whm-cli unlock-ip <ip>              remove cPHulk blocks for an address
-//   whm-cli superadmin --init           create <dataDir>/superadmin.key from the setup password
-//                                       (prompted, or WHM_SUPERADMIN_SETUP_PASSWORD); root only
+//   whm-cli superadmin --init           create the super admin key file from the setup password
+//                                       (prompted, or WHM_SUPERADMIN_SETUP_PASSWORD)
 //   whm-cli superadmin <user>           make an existing root user the super admin (asks for
 //                                       the setup password; refused without the key file)
 //   whm-cli superadmin --revoke <user>  clear the flag (same check)
 //
-// Reads the same configuration as the panel (WHM_CONFIG / env / defaults).
+// Reads the same configuration as the panel (WHM_CONFIG / env / defaults). The super admin
+// commands run as root on an installed host: the key file lives next to whm.conf
+// (config superadminKeyFile / WHM_SUPERADMIN_KEY_FILE), in a directory the panel user cannot
+// write, so neither a panel-user shell nor a mistaken `sudo -u whmpanel` can mint or replace it.
+import fs from 'node:fs';
 import { stdin, stdout } from 'node:process';
 import readline from 'node:readline/promises';
 import { loadConfig, readConfig } from '../server/src/config.js';
 import { openDatabase } from '../server/src/db/index.js';
 import { createCrypto } from '../server/src/lib/crypto.js';
-import { keyExists, keyPath, verifyKey, writeKey, assertSetupPassword, MIN_SETUP_PASSWORD_LENGTH } from '../server/src/lib/superadmin-key.js';
+import { keyExists, verifyKey, writeKey, assertKeyDir, assertSetupPassword, MIN_SETUP_PASSWORD_LENGTH } from '../server/src/lib/superadmin-key.js';
 
 const [cmd, ...rest] = process.argv.slice(2);
 
@@ -63,24 +67,37 @@ async function askSecret(prompt) {
 
 const askPassword = askSecret;
 
+// The super admin commands belong to whoever owns the key file's directory:
+// root on an installed host (/etc/whm), the developer on a checkout (./data).
+// Run as the panel user they are refused before anything is read or written.
+function assertKeyAccess(file) {
+  const uid = process.getuid?.();
+  if (uid === undefined || uid === 0) { assertKeyDir(file); return; }
+  const dir = assertKeyDir(file);
+  if (fs.statSync(dir).uid !== uid) throw new Error(`run this command as root: ${file} lives in ${dir}, which belongs to another user`);
+}
+
 // The setup password gate shared by grant and revoke: no key file → explain
 // how to create one; wrong password → refuse. Nothing is changed either way.
-async function verifySetupPassword(dataDir) {
-  if (!keyExists(dataDir)) {
-    throw new Error(`no super admin key at ${keyPath(dataDir)}: create it first with "whm-cli superadmin --init" (as root), then run this command again`);
+async function verifySetupPassword(file) {
+  assertKeyAccess(file);
+  if (!keyExists(file)) {
+    throw new Error(`no super admin key at ${file}: create it first with "whm-cli superadmin --init" (as root), then run this command again`);
   }
   const password = process.env.WHM_SUPERADMIN_SETUP_PASSWORD || await askSecret('Super admin setup password: ');
-  if (!(await verifyKey(dataDir, password))) throw new Error('the setup password does not match; the super admin was not changed');
+  if (!(await verifyKey(file, password))) throw new Error('the setup password does not match; the super admin was not changed');
 }
 
 async function superadminInit() {
   const config = readConfig();
+  const file = config.superadminKeyFile;
+  assertKeyAccess(file);
   const given = process.env.WHM_SUPERADMIN_SETUP_PASSWORD;
   let current = null;
-  if (keyExists(config.dataDir)) {
-    if (given) throw new Error(`${keyPath(config.dataDir)} already exists; run "whm-cli superadmin --init" interactively to replace it with the current setup password`);
+  if (keyExists(file)) {
+    if (given) throw new Error(`${file} already exists; run "whm-cli superadmin --init" interactively to replace it with the current setup password`);
     current = await askSecret('Current super admin setup password (the key file exists): ');
-    if (!(await verifyKey(config.dataDir, current))) throw new Error('the current setup password does not match; the key file was not replaced');
+    if (!(await verifyKey(file, current))) throw new Error('the current setup password does not match; the key file was not replaced');
   }
   let password = given;
   if (!password) {
@@ -90,7 +107,7 @@ async function superadminInit() {
     const again = stdin.isTTY ? await askSecret('Repeat it: ') : password;
     if (again !== password) throw new Error('the passwords do not match');
   }
-  const { file } = await writeKey(config.dataDir, password, { current });
+  await writeKey(file, password, { current });
   console.log(`super admin setup password stored in ${file} (0600). Grant the flag with: whm-cli superadmin <root-username>`);
 }
 
@@ -111,7 +128,7 @@ async function main() {
         dataDir: config.dataDir, mode: config.mode, port: config.port, tls: config.tls,
         users: n('SELECT COUNT(*) AS n FROM users'), accounts: n('SELECT COUNT(*) AS n FROM accounts'),
         suspended: n('SELECT COUNT(*) AS n FROM accounts WHERE suspended = 1'), packages: n('SELECT COUNT(*) AS n FROM packages'),
-        superadmins: n('SELECT COUNT(*) AS n FROM users WHERE superadmin = 1'), superadminKey: keyExists(config.dataDir),
+        superadmins: n('SELECT COUNT(*) AS n FROM users WHERE superadmin = 1'), superadminKey: keyExists(config.superadminKeyFile), superadminKeyFile: config.superadminKeyFile,
         jobsRunning: n("SELECT COUNT(*) AS n FROM jobs WHERE status = 'running'"),
         activeBlocks: n("SELECT COUNT(*) AS n FROM cphulk_blocks WHERE expires_at IS NULL OR expires_at > datetime('now')"),
       }, null, 2));
@@ -156,7 +173,7 @@ async function main() {
       const user = db.prepare('SELECT id, username, role, superadmin FROM users WHERE username = ?').get(username);
       if (!user) throw new Error(`no panel user "${username}"`);
       if (user.role !== 'root') throw new Error(`"${username}" is a ${user.role} user; only a root user can be the super admin`);
-      await verifySetupPassword(config.dataDir);
+      await verifySetupPassword(config.superadminKeyFile);
       db.prepare('UPDATE users SET superadmin = ? WHERE id = ?').run(revoke ? 0 : 1, user.id);
       db.prepare("INSERT INTO audit_log (principal, role, ip, action, target, args_redacted, result) VALUES ('whm-cli', 'root', NULL, ?, ?, '{}', 'ok')").run(revoke ? 'auth.superadmin.revoke' : 'auth.superadmin.grant', username);
       console.log(revoke ? `${username} is no longer the super admin` : `${username} is now the super admin of this panel (sees the license hub and key)`);

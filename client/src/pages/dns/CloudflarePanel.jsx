@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Cloud } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
@@ -89,7 +89,7 @@ export function CloudflareSetupCard() {
       subtitle="Mirror zones to Cloudflare: every record change in the panel is pushed to the matching Cloudflare zone; BIND keeps serving the zone locally."
       actions={<StatusPill status={data.configured ? 'ok' : 'muted'}>{data.configured ? 'Token configured' : 'Not configured'}</StatusPill>}>
       {!isRoot && (data.configured
-        ? <p className="muted">The root administrator has connected a Cloudflare account. Select one of your zones below to link, import or push it.</p>
+        ? <p className="muted">The root administrator has connected a Cloudflare account. Zones root has linked for your accounts can be imported and pushed from the zone card above; ask root to link a zone.</p>
         : <p className="muted">Cloudflare is not connected on this server. Ask the root administrator to add an API token.</p>)}
       {isRoot && data.configured && !editing && (
         <>
@@ -129,7 +129,10 @@ export function CloudflareSetupCard() {
   );
 }
 
-// Per-zone card: provider badge, link / import / push / unlink and the sync log.
+// Per-zone card: provider badge, link / unlink (root), import / push and the
+// sync log. While a push is queued or a retry is scheduled the zone status is
+// polled, so the outcome shows even when the job stream is not available
+// (another principal's job, a retry re-queued by the service).
 export function CloudflareZoneCard({ domain, onChanged }) {
   const toast = useToast();
   const confirm = useConfirm();
@@ -137,6 +140,12 @@ export function CloudflareZoneCard({ domain, onChanged }) {
   const [busy, setBusy] = useState(null);
   const [jobId, setJobId] = useState(null);
   const [last, setLast] = useState(null);
+  const polling = data?.status === 'pending' || Boolean(data?.pendingRetry);
+  useEffect(() => {
+    if (!polling) return undefined;
+    const timer = setInterval(() => refetch(), 3000);
+    return () => clearInterval(timer);
+  }, [polling, refetch]);
   const run = async (what, fn, okMessage) => {
     setBusy(what);
     try { const res = await fn(); if (okMessage) toast.success(typeof okMessage === 'function' ? okMessage(res) : okMessage); refetch(); onChanged?.(); return res; } catch (err) { toast.error(err); return null; } finally { setBusy(null); }
@@ -165,20 +174,23 @@ export function CloudflareZoneCard({ domain, onChanged }) {
     <Card title={<><Cloud size={16} style={{ verticalAlign: '-3px', marginRight: 6 }} />Cloudflare</>} actions={<ProviderBadge zone={{ provider: data.provider, cloudflare_status: data.status }} />}>
       {!data.configured && <p className="muted">Cloudflare is not connected on this server{linked ? '; changes to this zone are not pushed until the root administrator saves a token' : ''}.</p>}
       {data.lastError && <div className="banner banner-error"><div><strong>Last Cloudflare sync failed</strong><p>{data.lastError}</p></div></div>}
+      {data.pendingRetry && <div className="banner banner-warning"><div><strong>Retry scheduled</strong><p>Attempt {data.pendingRetry.attempt} runs at {formatDate(data.pendingRetry.at)} as a new job; this card refreshes until it finishes.</p></div></div>}
       {linked ? (
         <KeyValue items={[
           ['Cloudflare zone ID', <code key="z">{data.cloudflareZoneId}</code>],
           ['Sync state', SYNC_LABEL[data.status] || data.status || '—'],
           ['Last sync', data.syncedAt ? formatDate(data.syncedAt) : 'never'],
         ]} />
-      ) : (
+      ) : data.canLink ? (
         <p className="muted">This zone is served by BIND only. Link it to the zone of the same name in the Cloudflare account to mirror it; then import Cloudflare's records here or push the panel's records there. Point the domain's nameservers at Cloudflare once the records match.</p>
+      ) : (
+        <p className="muted">This zone is served by BIND only. Linking a zone to the Cloudflare account is done by the root administrator; once linked, you can import and push it here.</p>
       )}
       <FormActions>
-        {!linked && <Button variant="primary" onClick={link} loading={busy === 'link'} disabled={!data.configured}>Link to Cloudflare</Button>}
+        {!linked && data.canLink && <Button variant="primary" onClick={link} loading={busy === 'link'} disabled={!data.configured}>Link to Cloudflare</Button>}
         {linked && <Button onClick={doImport} loading={busy === 'import'} disabled={!data.configured}>Import from Cloudflare</Button>}
         {linked && <Button variant="primary" onClick={push} loading={busy === 'push'} disabled={!data.configured}>Push to Cloudflare</Button>}
-        {linked && <Button variant="danger" onClick={unlink} loading={busy === 'unlink'}>Unlink</Button>}
+        {linked && data.canLink && <Button variant="danger" onClick={unlink} loading={busy === 'unlink'}>Unlink</Button>}
       </FormActions>
       {last?.skippedRecords?.length > 0 && (
         <div className="banner banner-warning"><div><strong>{last.skippedRecords.length} record(s) were not imported</strong><ul>{last.skippedRecords.map((s, i) => <li key={i}><code>{s.type} {s.name}</code> — {s.reason}</li>)}</ul></div></div>

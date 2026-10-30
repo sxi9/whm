@@ -1,9 +1,11 @@
+import { authenticator } from 'otplib';
 import { HttpError, notFound, conflict, unauthorized } from '../../shared/errors.js';
 import { newId, nowIso, paginate } from '../../shared/db.js';
 import { PORTAL_ROLES } from '../../shared/auth.js';
 
 const LOCK_AFTER = 10;
 const LOCK_MS = 15 * 60_000;
+const TOTP_STEP_MS = 30_000;
 // Every code the account presents (login, step-up, re-enrol, confirm, disable)
 // draws on one budget, so a stolen session cookie cannot be stepped up by
 // guessing and a distributed guess cannot walk the code space either.
@@ -39,7 +41,7 @@ export function createPortalUsersService(ctx) {
     setStatus: db.prepare('UPDATE portal_users SET status = ?, role = ? WHERE id = ?'),
     loginOk: db.prepare('UPDATE portal_users SET failed_logins = 0, locked_until = NULL, last_login_at = ? WHERE id = ?'),
     loginFail: db.prepare('UPDATE portal_users SET failed_logins = failed_logins + 1, locked_until = @locked WHERE id = @id'),
-    totpOk: db.prepare('UPDATE portal_users SET totp_failures = 0, totp_locked_until = NULL WHERE id = ?'),
+    totpOk: db.prepare('UPDATE portal_users SET totp_failures = 0, totp_locked_until = NULL, totp_last_step = @step WHERE id = @id'),
     totpFail: db.prepare('UPDATE portal_users SET totp_failures = @failures, totp_locked_until = @locked WHERE id = @id'),
     linkReseller: db.prepare('UPDATE resellers SET portal_user_id = ? WHERE id = ?'),
     setting: db.prepare('SELECT value_json FROM vendor_settings WHERE key = ?'),
@@ -67,13 +69,28 @@ export function createPortalUsersService(ctx) {
 
   const totpLocked = (u) => Boolean(u.totp_locked_until && new Date(u.totp_locked_until).getTime() > now());
 
+  // The time step a code belongs to, or null when it does not verify. otplib
+  // reads the clock itself, so the same instant is handed to it and used for
+  // the index: a step boundary between two reads could not shift the result.
+  // Wall-clock time on purpose (ctx.clock is for the hub's own bookkeeping):
+  // authenticator apps are on wall-clock time too.
+  function codeStep(code, secretEnc) {
+    if (!secretEnc) return null;
+    const epoch = Date.now();
+    const delta = authenticator.clone({ epoch }).checkDelta(String(code || '').replace(/\s+/g, ''), crypto.decrypt(secretEnc));
+    return delta === null ? null : Math.floor(epoch / TOTP_STEP_MS) + delta;
+  }
+
   // Verifies one code against the live secret (or the pending one during
   // enrolment). 429 while the budget is exhausted; a wrong code counts, a right
-  // one resets the count.
+  // one resets the count. RFC 6238 §5.2: a code is accepted once per account,
+  // so a step at or before the last accepted one (totp_last_step) is a replay
+  // and counts as wrong, whatever the purpose the first use had.
   function checkCode(u, code, secretEnc = u.totp_secret_enc) {
     if (totpLocked(u)) throw Object.assign(new HttpError(429, 'totp_rate_limited', 'Too many wrong codes; wait a few minutes and try again'), { retryAfterS: Math.ceil(TOTP_LOCK_MS / 1000) });
-    if (secretEnc && crypto.totp.verify(code || '', crypto.decrypt(secretEnc))) {
-      stmts.totpOk.run(u.id);
+    const step = codeStep(code, secretEnc);
+    if (step !== null && (u.totp_last_step == null || step > u.totp_last_step)) {
+      stmts.totpOk.run({ id: u.id, step });
       return true;
     }
     // A lock that has lapsed starts a fresh budget.

@@ -7,10 +7,10 @@ import { bootHub } from './support.js';
 import { encodeQr, qrSvgPath } from '../ui/src/lib/qr.js';
 
 // Portal TOTP everywhere (U4): enrolment with secret + otpauth URI, login that
-// asks for the code once enabled, step-up on a fresh code, the per-account
-// wrong-code budget, and hub.require_totp_for_admins forcing vendor and
-// reseller admins to enrol at their first login before anything but
-// /v1/portal/* answers.
+// asks for the code once enabled, step-up on a fresh code, a code accepted
+// once per account (RFC 6238 §5.2), the per-account wrong-code budget, and
+// hub.require_totp_for_admins forcing vendor and reseller admins to enrol at
+// their first login before anything but /v1/portal/* answers.
 
 let h;
 let seeded;
@@ -23,12 +23,15 @@ before(async () => {
 });
 after(() => h.close());
 
-// A code generated within the last 15 s of its 30 s step could expire between
-// generate() and verify(); wait for the next step instead.
-function freshTotpStep() {
-  const left = 30_000 - (Date.now() % 30_000);
-  return left < 15_000 ? new Promise((resolve) => setTimeout(resolve, left + 50)) : Promise.resolve();
+// Authenticator codes live on wall-clock time, which otplib and the hub read
+// from the same Date: freezing it keeps a code valid for the whole test and
+// ticking 30 s moves everyone to the next step (a code is accepted once)
+// without waiting for it. The hub's own clock (h.advance) is separate.
+function frozenClock(t) {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  return { nextStep: () => t.mock.timers.tick(30_000) };
 }
+const lastStep = (id) => h.db.prepare('SELECT totp_last_step FROM portal_users WHERE id = ?').get(id).totp_last_step;
 
 let counter = 0;
 async function createUser(role, { reseller = false } = {}) {
@@ -59,11 +62,11 @@ async function enrol(agent, csrf) {
 test('migration 001d seeds the policy on and the portal reports it', () => {
   assert.equal(seeded?.value_json, 'true');
   assert.deepEqual(h.ctx.portalUsers.settings(), { require_totp_for_admins: true, enforced_roles: ['vendor_admin', 'reseller_admin'] });
-  for (const col of ['totp_enrolled_at', 'totp_failures', 'totp_locked_until']) assert.ok(h.db.prepare('PRAGMA table_info(portal_users)').all().some((c) => c.name === col), col);
+  for (const col of ['totp_enrolled_at', 'totp_failures', 'totp_locked_until', 'totp_last_step']) assert.ok(h.db.prepare('PRAGMA table_info(portal_users)').all().some((c) => c.name === col), col);
 });
 
-test('a vendor admin must enrol at the first login: only /v1/portal/* answers until the code is confirmed', async () => {
-  await freshTotpStep();
+test('a vendor admin must enrol at the first login: only /v1/portal/* answers until the code is confirmed', async (t) => {
+  frozenClock(t);
   const admin = await createUser('vendor_admin');
   const { agent, res, csrf } = await signIn(admin);
   assert.equal(res.status, 200, JSON.stringify(res.body));
@@ -104,24 +107,34 @@ test('a vendor admin must enrol at the first login: only /v1/portal/* answers un
   assert.ok(String(audit.args_redacted).includes('totp_enrol_required'));
 });
 
-test('enrolled: login requires the code, a wrong code is refused, step-up re-arms the session', async () => {
-  await freshTotpStep();
+test('enrolled: login requires the code, a wrong code is refused, step-up re-arms the session, a code is accepted once', async (t) => {
+  const clock = frozenClock(t);
   const admin = await createUser('vendor_admin');
   const first = await signIn(admin);
   const { secret } = await enrol(first.agent, first.csrf);
+  const confirmStep = lastStep(admin.id);
+  assert.equal(confirmStep, Math.floor(Date.now() / 30_000), 'the confirm code is recorded as spent');
+  // RFC 6238 §5.2: the code that confirmed enrolment cannot log in during its step.
+  const replayedLogin = await signIn(admin, authenticator.generate(secret));
+  assert.equal(replayedLogin.res.status, 401, JSON.stringify(replayedLogin.res.body));
+  assert.equal(replayedLogin.res.body.error.code, 'unauthorized');
+  assert.equal(h.db.prepare('SELECT totp_failures FROM portal_users WHERE id = ?').get(admin.id).totp_failures, 1, 'a replay spends the TOTP budget like a wrong code');
 
+  clock.nextStep();
   const noCode = await signIn(admin);
   assert.equal(noCode.res.status, 401);
   assert.equal(noCode.res.body.error.code, 'totp_required');
   const wrong = await signIn(admin, '123456');
   assert.equal(wrong.res.status, 401);
   assert.equal(wrong.res.body.error.code, 'unauthorized');
-  assert.equal(h.db.prepare('SELECT totp_failures FROM portal_users WHERE id = ?').get(admin.id).totp_failures, 1, 'a wrong login code spends the TOTP budget');
-  const { agent, res, csrf } = await signIn(admin, authenticator.generate(secret));
+  assert.equal(h.db.prepare('SELECT totp_failures FROM portal_users WHERE id = ?').get(admin.id).totp_failures, 2, 'a wrong login code spends the TOTP budget');
+  const loginCode = authenticator.generate(secret);
+  const { agent, res, csrf } = await signIn(admin, loginCode);
   assert.equal(res.status, 200, JSON.stringify(res.body));
   assert.equal(res.body.data.totp_enrol_required, false);
   assert.ok(res.body.data.totp_verified_at, 'a TOTP login counts as a step-up');
   assert.equal(h.db.prepare('SELECT totp_failures FROM portal_users WHERE id = ?').get(admin.id).totp_failures, 0, 'a right code resets the budget');
+  assert.equal(lastStep(admin.id), confirmStep + 1);
 
   h.advance(6 * 60_000);
   const stale = await agent.post('/v1/portal/users').set('X-CSRF-Token', csrf).send({ email: `n${++counter}@vendor.test`, password: 'New-Pass-12345', role: 'vendor_support' });
@@ -130,20 +143,29 @@ test('enrolled: login requires the code, a wrong code is refused, step-up re-arm
   assert.equal(bad.status, 422);
   assert.equal(bad.body.error.code, 'totp_invalid');
   assert.equal((await agent.post('/v1/portal/stepup').set('X-CSRF-Token', csrf).send({ totp: 'abcdef' })).status, 422, 'zod rejects a non-numeric code');
+  // The login code, observed once, is refused by the step-up (stolen-cookie threat model).
+  const replayedStepup = await agent.post('/v1/portal/stepup').set('X-CSRF-Token', csrf).send({ totp: loginCode });
+  assert.equal(replayedStepup.status, 422, JSON.stringify(replayedStepup.body));
+  assert.equal(replayedStepup.body.error.code, 'totp_invalid');
+  assert.equal((await agent.post('/v1/portal/2fa/disable').set('X-CSRF-Token', csrf).send({ code: loginCode })).body.error.code, 'totp_invalid', 'nor can it disable 2FA');
+  assert.equal((await agent.post('/v1/portal/2fa/enroll').set('X-CSRF-Token', csrf).send({ code: loginCode })).body.error.code, 'totp_invalid', 'nor re-enrol');
+  assert.equal(h.db.prepare('SELECT totp_enabled, totp_pending_enc FROM portal_users WHERE id = ?').get(admin.id).totp_enabled, 1);
+  assert.equal(lastStep(admin.id), confirmStep + 1, 'a refused replay records nothing');
+  clock.nextStep();
   const good = await agent.post('/v1/portal/stepup').set('X-CSRF-Token', csrf).send({ totp: authenticator.generate(secret) });
-  assert.equal(good.status, 200);
+  assert.equal(good.status, 200, JSON.stringify(good.body));
   assert.ok(good.body.data.totp_verified_at);
+  assert.equal(lastStep(admin.id), confirmStep + 2);
   const created = await agent.post('/v1/portal/users').set('X-CSRF-Token', csrf).send({ email: `n${++counter}@vendor.test`, password: 'New-Pass-12345', role: 'vendor_support' });
   assert.equal(created.status, 201, JSON.stringify(created.body));
   assert.equal(created.body.data.totp_enrol_required, false, 'support staff are not forced to enrol');
 });
 
-test('five wrong codes pause TOTP for the account (429) until the window lapses', async () => {
-  await freshTotpStep();
+test('five wrong codes pause TOTP for the account (429) until the window lapses', async (t) => {
+  const clock = frozenClock(t);
   const admin = await createUser('vendor_admin');
-  const first = await signIn(admin);
-  const { secret } = await enrol(first.agent, first.csrf);
-  const { agent, csrf } = await signIn(admin, authenticator.generate(secret));
+  const { agent, csrf } = await signIn(admin);
+  const { secret } = await enrol(agent, csrf);
   h.advance(6 * 60_000);
   for (let i = 0; i < 4; i++) assert.equal((await agent.post('/v1/portal/stepup').set('X-CSRF-Token', csrf).send({ totp: '000000' })).body.error.code, 'totp_invalid');
   const fifth = await agent.post('/v1/portal/stepup').set('X-CSRF-Token', csrf).send({ totp: '000000' });
@@ -155,13 +177,14 @@ test('five wrong codes pause TOTP for the account (429) until the window lapses'
   assert.equal(loginLocked.res.status, 429, 'the budget is per account: a new login attempt is paused as well');
   assert.equal((await agent.post('/v1/portal/2fa/disable').set('X-CSRF-Token', csrf).send({ code: authenticator.generate(secret) })).status, 429, 'disabling 2FA shares the budget');
   h.advance(15 * 60_000 + 1000);
+  clock.nextStep();
   const again = await agent.post('/v1/portal/stepup').set('X-CSRF-Token', csrf).send({ totp: authenticator.generate(secret) });
   assert.equal(again.status, 200, JSON.stringify(again.body));
   assert.deepEqual(h.db.prepare('SELECT totp_failures, totp_locked_until FROM portal_users WHERE id = ?').get(admin.id), { totp_failures: 0, totp_locked_until: null });
 });
 
-test('reseller admins are forced too, reseller staff and vendor support are not', async () => {
-  await freshTotpStep();
+test('reseller admins are forced too, reseller staff and vendor support are not', async (t) => {
+  frozenClock(t);
   const rsAdmin = await createUser('reseller_admin', { reseller: true });
   const forced = await signIn(rsAdmin);
   assert.equal(forced.res.status, 200, JSON.stringify(forced.res.body));
@@ -183,12 +206,11 @@ test('reseller admins are forced too, reseller staff and vendor support are not'
   assert.equal((await sp.agent.get('/v1/admin/licenses')).status, 200);
 });
 
-test('the vendor setting switches the rule off and on, live for open sessions, through a stepped-up admin', async () => {
-  await freshTotpStep();
+test('the vendor setting switches the rule off and on, live for open sessions, through a stepped-up admin', async (t) => {
+  const clock = frozenClock(t);
   const owner = await createUser('vendor_admin');
-  const first = await signIn(owner);
-  const { secret } = await enrol(first.agent, first.csrf);
-  const { agent, csrf } = await signIn(owner, authenticator.generate(secret));
+  const { agent, csrf } = await signIn(owner);
+  const { secret } = await enrol(agent, csrf);
   assert.equal((await agent.patch('/v1/portal/settings').set('X-CSRF-Token', csrf).send({ require_totp_for_admins: 'no' })).status, 422);
   assert.equal((await agent.patch('/v1/portal/settings').set('X-CSRF-Token', csrf).send({ require_totp_for_admins: false, other: 1 })).status, 422);
   const off = await agent.patch('/v1/portal/settings').set('X-CSRF-Token', csrf).send({ require_totp_for_admins: false });
@@ -205,7 +227,8 @@ test('the vendor setting switches the rule off and on, live for open sessions, t
   // Back on: the open session of the admin without an authenticator is blocked at once.
   h.advance(6 * 60_000);
   assert.equal((await agent.patch('/v1/portal/settings').set('X-CSRF-Token', csrf).send({ require_totp_for_admins: true })).body.error.code, 'totp_stepup_required');
-  await agent.post('/v1/portal/stepup').set('X-CSRF-Token', csrf).send({ totp: authenticator.generate(secret) });
+  clock.nextStep();
+  assert.equal((await agent.post('/v1/portal/stepup').set('X-CSRF-Token', csrf).send({ totp: authenticator.generate(secret) })).status, 200);
   assert.equal((await agent.patch('/v1/portal/settings').set('X-CSRF-Token', csrf).send({ require_totp_for_admins: true })).body.data.require_totp_for_admins, true);
   const blocked = await relaxed.agent.get('/v1/admin/licenses');
   assert.equal(blocked.status, 403);

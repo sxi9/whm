@@ -23,7 +23,8 @@ export function licenseRoutes(ctx) {
 
   r.post('/key', owner, validate({ body: z.object({ key: keyField.optional(), transferFrom: activationId.optional() }).strict() }), wrap(async (req) => {
     const out = await license().activate(req.body.key, req.user, req, { transferFrom: req.body.transferFrom ?? null });
-    req.audit({ action: 'license.key', target: out.keyPrefix, args: { transferFrom: req.body.transferFrom ?? null, replaced: Boolean(req.body.key) } });
+    // Audit rows are read by every root user: the activation, never the key.
+    req.audit({ action: 'license.key', target: out.activationId ?? null, args: { transferFrom: req.body.transferFrom ?? null, replaced: Boolean(req.body.key) } });
     return out;
   }));
 
@@ -41,7 +42,7 @@ export function licenseRoutes(ctx) {
 
   r.post('/trial', owner, validate({ body: z.object({ email: fields.email }).strict() }), wrap(async (req) => {
     const out = await license().startTrial(req.body.email, req.user, req);
-    req.audit({ action: 'license.trial', target: out.keyPrefix, args: { email: req.body.email } });
+    req.audit({ action: 'license.trial', target: out.activationId ?? null, args: { email: req.body.email } });
     return out;
   }, 201));
 

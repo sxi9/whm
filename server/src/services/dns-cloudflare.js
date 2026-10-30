@@ -206,12 +206,57 @@ export function createDnsCloudflareService(ctx) {
     log: db.prepare('INSERT INTO dns_cloudflare_sync (zone_id, domain, action, status, attempt, summary, message, job_id, principal) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
     logFor: db.prepare('SELECT id, action, status, attempt, summary, message, job_id, principal, created_at FROM dns_cloudflare_sync WHERE zone_id = ? ORDER BY id DESC LIMIT ?'),
     linked: db.prepare("SELECT z.domain, z.cloudflare_zone_id, z.cloudflare_status, z.cloudflare_synced_at, z.cloudflare_last_error, a.username AS account, a.owner_id FROM dns_zones z LEFT JOIN accounts a ON a.id = z.account_id WHERE z.provider = 'cloudflare' ORDER BY z.domain"),
-    queuedJobs: db.prepare("SELECT id, params_json FROM jobs WHERE type = 'dns.cloudflare.push' AND status = 'queued'"),
+    queuedJobs: db.prepare("SELECT id, params_json, created_by FROM jobs WHERE type = 'dns.cloudflare.push' AND status = 'queued'"),
   };
 
   let zoneCache = { at: 0, list: null };
   const audit = (req, entry) => (req?.audit ? req.audit(entry) : ctx.auditRecord?.(null, entry));
   const apiBase = () => ctx.config?.cloudflareApiBase || CLOUDFLARE_API;
+
+  // One push or import per zone at a time: a job may be claimed while an
+  // earlier one for the same domain is still writing, and a diff computed
+  // from a stale listing would undo or duplicate the other's work.
+  const zoneLocks = new Map();
+  async function withZoneLock(domain, fn) {
+    const prev = zoneLocks.get(domain) ?? Promise.resolve();
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const chain = prev.then(() => gate);
+    zoneLocks.set(domain, chain);
+    await prev;
+    try { return await fn(); } finally {
+      release();
+      if (zoneLocks.get(domain) === chain) zoneLocks.delete(domain);
+    }
+  }
+
+  // Deterministic Cloudflare answers (bad request, revoked token, missing
+  // permission or zone) fail at once; only rate limits, Cloudflare 5xx and
+  // network errors are worth another attempt.
+  const isRetryable = (err) => {
+    if (err.cloudflare) { const s = Number(err.cloudflare.status); return s === 429 || s >= 500 || s < 400; }
+    return !err.status || err.status >= 500;
+  };
+
+  // A retry that cannot sleep inside the worker slot is re-queued by a timer;
+  // one pending timer per domain, lost on restart (the zone then stays
+  // 'failed' until the next change or a manual push).
+  const pendingRetries = new Map();
+  function scheduleRetry(domain, { reason, attempt, waitMs, retryOf, userId }) {
+    const existing = pendingRetries.get(domain);
+    if (existing) return existing;
+    const at = Date.now() + waitMs;
+    const timer = setTimeout(() => {
+      pendingRetries.delete(domain);
+      try { service.enqueuePush(domain, { reason: `retry ${attempt} (${reason || 'zone changed'})`, userId, attempt, retryOf }); } catch (err) {
+        logger?.warn?.({ err, domain }, 'could not queue the deferred Cloudflare push');
+      }
+    }, waitMs);
+    timer.unref?.();
+    const entry = { at, attempt, timer };
+    pendingRetries.set(domain, entry);
+    return entry;
+  }
 
   function tokenOf(row = stmts.settingsRow.get()) {
     if (!row) throw new HttpError(409, 'cloudflare_not_configured', 'Cloudflare is not configured: the root administrator must add an API token in DNS Zone Manager › Cloudflare first');
@@ -321,14 +366,15 @@ export function createDnsCloudflareService(ctx) {
       try {
         verify = (await cfRequest('/user/tokens/verify', { token })).result || {};
         if (verify.status && verify.status !== 'active') throw unprocessable(`The Cloudflare token is ${verify.status}`, { apiToken: ['The token must be active'] });
-        zones = (await cfRequest('/zones?per_page=50&page=1', { token })).result || [];
+        zones = (await cfRequest(`/zones?per_page=${ZONES_PAGE}&page=1`, { token })).result || [];
       } catch (err) {
         if (err.code === 'cloudflare_error') throw unprocessable(`Cloudflare rejected the token: ${err.message.replace(/^Cloudflare: /, '')}`, { apiToken: ['The token must be valid and allow Zone:Read and DNS:Edit'] });
         throw err;
       }
       const account = zones[0]?.account || null;
       stmts.upsertSettings.run({ api_token_enc: cryptoSvc.encrypt(token), token_id: verify.id ?? null, account_id: account?.id ?? null, account_name: account?.name ?? null, created_by: user.username ?? null });
-      zoneCache = { at: Date.now(), list: zones.map(shapeRemoteZone) };
+      // The verification page seeds the zone cache only when it is the whole account.
+      zoneCache = zones.length < ZONES_PAGE ? { at: Date.now(), list: zones.map(shapeRemoteZone) } : { at: 0, list: null };
       audit(req, { action: 'dns.cloudflare.configure', target: 'cloudflare', args: { tokenId: verify.id ?? null, accountId: account?.id ?? null, zones: zones.length } });
       return service.status(user);
     },
@@ -350,7 +396,11 @@ export function createDnsCloudflareService(ctx) {
       return list.map((z) => ({ ...z, linkedDomain: linked.get(z.id) ?? null, localZone: local.has(stripDot(z.name)) }));
     },
 
+    // Linking is root's decision: the token is account-wide, so whoever links
+    // a name gains the Cloudflare zone of that name. Resellers only import and
+    // push zones root has linked on accounts they own.
     async link(domain, { cloudflareZoneId } = {}, user, req) {
+      if (!isRoot(user)) throw forbidden('Only root can link a zone to Cloudflare');
       const zone = await ctx.dns.loadZone(domain, user);
       const remote = await findRemoteZone(tokenOf(), domain, { zoneId: cloudflareZoneId });
       const taken = stmts.linked.all().find((z) => z.cloudflare_zone_id === remote.id && z.domain !== domain);
@@ -362,6 +412,7 @@ export function createDnsCloudflareService(ctx) {
     },
 
     async unlink(domain, user, req) {
+      if (!isRoot(user)) throw forbidden('Only root can unlink a zone from Cloudflare');
       const zone = await ctx.dns.loadZone(domain, user);
       if (zone.provider !== 'cloudflare') throw conflict(`${domain} is not linked to Cloudflare`);
       stmts.clearLink.run(zone.id);
@@ -375,34 +426,36 @@ export function createDnsCloudflareService(ctx) {
     async import(domain, user, req) {
       const zone = await loadLinked(domain, user);
       const token = tokenOf();
-      let remote;
-      try {
-        remote = await cfPaged(`/zones/${encodeURIComponent(zone.cloudflare_zone_id)}/dns_records`, { token, perPage: 1000 });
-      } catch (err) {
-        stmts.setFailed.run(err.message, zone.id);
-        record(zone, 'import', 'failed', { message: err.message, principal: user?.username ?? null });
-        throw err;
-      }
-      const records = [];
-      const skipped = [];
-      for (const r of remote) {
-        const mapped = fromCloudflareRecord(r, domain);
-        if (mapped.record) records.push(mapped.record); else skipped.push({ type: r.type, name: r.name, reason: mapped.skipped });
-      }
-      let result;
-      try {
-        result = await ctx.dns.replaceRecordsFromProvider(domain, records, user, req);
-      } catch (err) {
-        stmts.setFailed.run(err.message, zone.id);
-        record(zone, 'import', 'failed', { message: err.message, principal: user?.username ?? null });
-        throw err;
-      }
-      skipped.push(...result.skipped);
-      stmts.setSynced.run(zone.id);
-      const summary = { remote: remote.length, imported: result.records, skipped: skipped.length };
-      record(zone, 'import', 'ok', { summary, principal: user?.username ?? null });
-      audit(req, { action: 'dns.cloudflare.import', target: domain, args: summary });
-      return { ...zoneShape(stmts.zoneByDomain.get(domain)), ...summary, skippedRecords: skipped, applied: result.applied, serial: result.serial, reloaded: result.reloaded ?? null };
+      return withZoneLock(domain, async () => {
+        let remote;
+        try {
+          remote = await cfPaged(`/zones/${encodeURIComponent(zone.cloudflare_zone_id)}/dns_records`, { token, perPage: 1000 });
+        } catch (err) {
+          stmts.setFailed.run(err.message, zone.id);
+          record(zone, 'import', 'failed', { message: err.message, principal: user?.username ?? null });
+          throw err;
+        }
+        const records = [];
+        const skipped = [];
+        for (const r of remote) {
+          const mapped = fromCloudflareRecord(r, domain);
+          if (mapped.record) records.push(mapped.record); else skipped.push({ type: r.type, name: r.name, reason: mapped.skipped });
+        }
+        let result;
+        try {
+          result = await ctx.dns.replaceRecordsFromProvider(domain, records, user, req);
+        } catch (err) {
+          stmts.setFailed.run(err.message, zone.id);
+          record(zone, 'import', 'failed', { message: err.message, principal: user?.username ?? null });
+          throw err;
+        }
+        skipped.push(...result.skipped);
+        stmts.setSynced.run(zone.id);
+        const summary = { remote: remote.length, imported: result.records, skipped: skipped.length };
+        record(zone, 'import', 'ok', { summary, principal: user?.username ?? null });
+        audit(req, { action: 'dns.cloudflare.import', target: domain, args: summary });
+        return { ...zoneShape(stmts.zoneByDomain.get(domain)), ...summary, skippedRecords: skipped, applied: result.applied, serial: result.serial, reloaded: result.reloaded ?? null };
+      });
     },
 
     // Panel → Cloudflare, computing the minimal change set first. Existing
@@ -413,83 +466,112 @@ export function createDnsCloudflareService(ctx) {
       if (zone.provider !== 'cloudflare' || !zone.cloudflare_zone_id) throw conflict(`${domain} is not linked to Cloudflare`);
       const log = (line, level) => jobCtx?.log?.(line, level);
       const principal = user?.username ?? null;
-      try {
-        const token = tokenOf();
-        const desired = stmts.records.all(zone.id).filter((r) => r.type !== 'SOA' && !(r.type === 'NS' && r.name === '@') && RECORD_TYPES.includes(r.type));
-        const remote = await cfPaged(`/zones/${encodeURIComponent(zone.cloudflare_zone_id)}/dns_records`, { token, perPage: 1000 });
-        const diff = diffRecords(desired, remote, domain);
-        for (const c of diff.clamped) log(`ttl clamped to Cloudflare's range: ${c}`, 'warn');
-        const base = `/zones/${encodeURIComponent(zone.cloudflare_zone_id)}/dns_records`;
-        let i = 0;
-        const total = diff.creates.length + diff.updates.length + diff.deletes.length;
-        const step = (what) => { i++; jobCtx?.progress?.((i / Math.max(1, total)) * 100, what); log(what); };
-        for (const d of diff.creates) {
-          const payload = PROXIABLE.has(d.payload.type) ? { ...d.payload, proxied: false } : d.payload;
-          await cfRequest(base, { method: 'POST', body: payload, token });
-          step(`created ${d.payload.type} ${d.payload.name}`);
+      const token = tokenOf();
+      return withZoneLock(domain, async () => {
+        try {
+          // Read the desired set only once the lock is held: an earlier push may still be committing.
+          const desired = stmts.records.all(zone.id).filter((r) => r.type !== 'SOA' && !(r.type === 'NS' && r.name === '@') && RECORD_TYPES.includes(r.type));
+          const remote = await cfPaged(`/zones/${encodeURIComponent(zone.cloudflare_zone_id)}/dns_records`, { token, perPage: 1000 });
+          const diff = diffRecords(desired, remote, domain);
+          for (const c of diff.clamped) log(`ttl clamped to Cloudflare's range: ${c}`, 'warn');
+          if (diff.proxiedTtl.length) log(`proxied records keep Cloudflare's Auto TTL, panel TTL ignored: ${diff.proxiedTtl.join(', ')}`, 'warn');
+          const base = `/zones/${encodeURIComponent(zone.cloudflare_zone_id)}/dns_records`;
+          let i = 0;
+          const total = diff.creates.length + diff.updates.length + diff.deletes.length;
+          const step = (what) => { i++; jobCtx?.progress?.((i / Math.max(1, total)) * 100, what); log(what); };
+          for (const d of diff.creates) {
+            const payload = PROXIABLE.has(d.payload.type) ? { ...d.payload, proxied: false } : d.payload;
+            await cfRequest(base, { method: 'POST', body: payload, token });
+            step(`created ${d.payload.type} ${d.payload.name}`);
+          }
+          for (const d of diff.updates) {
+            const proxied = Boolean(d.remote.proxied);
+            const payload = PROXIABLE.has(d.payload.type) ? { ...d.payload, ttl: proxied ? TTL_AUTO : d.payload.ttl, proxied } : d.payload;
+            await cfRequest(`${base}/${encodeURIComponent(d.remote.id)}`, { method: 'PATCH', body: payload, token });
+            step(`updated ${d.payload.type} ${d.payload.name}`);
+          }
+          for (const r of diff.deletes) {
+            await cfRequest(`${base}/${encodeURIComponent(r.id)}`, { method: 'DELETE', token });
+            step(`deleted ${r.type} ${r.name}`);
+          }
+          const summary = { created: diff.creates.length, updated: diff.updates.length, deleted: diff.deletes.length, unchanged: diff.unchanged, remote: remote.length, clamped: diff.clamped.length };
+          stmts.setSynced.run(zone.id);
+          record(zone, 'push', 'ok', { attempt, summary, jobId: jobCtx?.job?.id ?? null, principal });
+          audit(req, { action: 'dns.cloudflare.push', target: domain, args: { ...summary, attempt, job: jobCtx?.job?.id ?? null } });
+          return { ...zoneShape(stmts.zoneByDomain.get(domain)), ...summary };
+        } catch (err) {
+          stmts.setFailed.run(err.message, zone.id);
+          record(zone, 'push', 'failed', { attempt, message: err.message, jobId: jobCtx?.job?.id ?? null, principal });
+          throw err;
         }
-        for (const d of diff.updates) {
-          const payload = PROXIABLE.has(d.payload.type) ? { ...d.payload, proxied: Boolean(d.remote.proxied) } : d.payload;
-          await cfRequest(`${base}/${encodeURIComponent(d.remote.id)}`, { method: 'PATCH', body: payload, token });
-          step(`updated ${d.payload.type} ${d.payload.name}`);
-        }
-        for (const r of diff.deletes) {
-          await cfRequest(`${base}/${encodeURIComponent(r.id)}`, { method: 'DELETE', token });
-          step(`deleted ${r.type} ${r.name}`);
-        }
-        const summary = { created: diff.creates.length, updated: diff.updates.length, deleted: diff.deletes.length, unchanged: diff.unchanged, remote: remote.length, clamped: diff.clamped.length };
-        stmts.setSynced.run(zone.id);
-        record(zone, 'push', 'ok', { attempt, summary, jobId: jobCtx?.job?.id ?? null, principal });
-        audit(req, { action: 'dns.cloudflare.push', target: domain, args: { ...summary, attempt, job: jobCtx?.job?.id ?? null } });
-        return { ...zoneShape(stmts.zoneByDomain.get(domain)), ...summary };
-      } catch (err) {
-        stmts.setFailed.run(err.message, zone.id);
-        record(zone, 'push', 'failed', { attempt, message: err.message, jobId: jobCtx?.job?.id ?? null, principal });
-        throw err;
-      }
+      });
     },
 
     // Called by the DNS service after every committed change of a Cloudflare
-    // zone. A push already queued for the domain is reused.
-    enqueuePush(domain, { reason = 'zone changed', userId = null } = {}) {
+    // zone. A push already queued for the domain by the same principal is
+    // reused (the jobs API hides other principals' jobs, so a reseller must
+    // never be handed root's); a running one is not, since its listing may
+    // predate this change — the per-zone lock serialises the two.
+    enqueuePush(domain, { reason = 'zone changed', userId = null, attempt = 1, retryOf = null } = {}) {
       const zone = stmts.zoneByDomain.get(domain);
       if (!zone || zone.provider !== 'cloudflare' || !zone.cloudflare_zone_id) return null;
       for (const row of stmts.queuedJobs.all()) {
         let params = null;
         try { params = JSON.parse(row.params_json); } catch { params = null; }
-        if (params?.domain === domain) return { id: row.id, reused: true };
+        if (params?.domain === domain && (row.created_by ?? null) === (userId ?? null)) return { id: row.id, reused: true };
       }
-      const job = ctx.jobs.enqueue('dns.cloudflare.push', { domain, reason }, { userId });
+      const params = { domain, reason };
+      if (attempt > 1) Object.assign(params, { attempt, retryOf });
+      const job = ctx.jobs.enqueue('dns.cloudflare.push', params, { userId });
       stmts.setPending.run(zone.id);
       return { id: job.id, reused: false };
     },
 
     // Manual push from the page: ownership and the link are checked here, the
-    // work runs in the job so the UI can follow it.
+    // work runs in the job so the UI can follow it (always the caller's own
+    // job, so the stream is never refused).
     async requestPush(domain, user, req) {
       const zone = await loadLinked(domain, user);
       tokenOf();
       const queued = service.enqueuePush(domain, { reason: `manual push by ${user.username}`, userId: user.id });
       audit(req, { action: 'dns.cloudflare.push_requested', target: domain, args: { job: queued?.id ?? null, reused: Boolean(queued?.reused) } });
-      return { job: ctx.jobs.get(queued.id), zone: zoneShape(stmts.zoneByDomain.get(zone.domain)) };
+      const job = ctx.jobs.get(queued.id);
+      return { job: { id: job.id, status: job.status, reused: queued.reused }, zone: zoneShape(stmts.zoneByDomain.get(zone.domain)) };
     },
 
+    // Attempts continue across jobs: a retry that would wait longer than a
+    // worker slot may be held for is re-queued by scheduleRetry() with the
+    // next attempt number, and this job ends as failed with the reason.
     async runPushJob(jobCtx) {
-      const { domain, reason } = jobCtx.params;
+      const { domain, reason, attempt: startAt, retryOf = null } = jobCtx.params;
       const attempts = Math.max(1, Number(settings.get('dns.cloudflare.push_attempts', 3)));
       const backoff = settings.get('dns.cloudflare.retry_backoff_ms', [5000, 20000, 60000]);
-      if (reason) jobCtx.log(`${domain}: pushing to Cloudflare (${reason})`);
-      for (let attempt = 1; attempt <= attempts; attempt++) {
+      if (reason) jobCtx.log(`${domain}: pushing to Cloudflare (${reason})${retryOf ? `, continuing job ${retryOf}` : ''}`);
+      for (let attempt = Math.max(1, Number(startAt) || 1); attempt <= attempts; attempt++) {
         try {
           const result = await service.push(domain, { jobCtx, attempt });
           jobCtx.log(`${domain}: ${result.created} created, ${result.updated} updated, ${result.deleted} deleted, ${result.unchanged} unchanged`);
           return result;
         } catch (err) {
-          const last = attempt >= attempts || (err.status && err.status < 500 && err.code !== 'cloudflare_error');
-          jobCtx.log(`${domain}: attempt ${attempt} failed: ${err.message}`, last ? 'error' : 'warn');
-          if (last) throw err;
-          const wait = Math.max(0, Number(err.cloudflare?.retryAfter) * 1000 || Number(backoff[Math.min(attempt - 1, backoff.length - 1)]) || 0);
-          await new Promise((resolve) => setTimeout(resolve, wait));
+          const last = attempt >= attempts || !isRetryable(err);
+          if (last) {
+            jobCtx.log(`${domain}: attempt ${attempt} failed: ${err.message}${attempt < attempts ? ' (not retried)' : ''}`, 'error');
+            throw err;
+          }
+          const retryAfterMs = Math.max(0, Number(err.cloudflare?.retryAfter) * 1000 || 0);
+          const wait = Math.min(MAX_RETRY_WAIT_MS, retryAfterMs || Math.max(0, Number(backoff[Math.min(attempt - 1, backoff.length - 1)]) || 0));
+          if (!retryAfterMs && wait <= SLOT_WAIT_MS) {
+            jobCtx.log(`${domain}: attempt ${attempt} failed: ${err.message}; retrying in ${wait} ms`, 'warn');
+            await new Promise((resolve) => setTimeout(resolve, wait));
+            continue;
+          }
+          const retry = scheduleRetry(domain, { reason, attempt: attempt + 1, waitMs: wait, retryOf: jobCtx.job.id, userId: jobCtx.job.created_by ?? null });
+          const seconds = Math.max(1, Math.round((retry.at - Date.now()) / 1000));
+          jobCtx.log(`${domain}: attempt ${attempt} failed: ${err.message}; attempt ${retry.attempt} of ${attempts} runs in ${seconds} s as a new job (worker slot released)`, 'warn');
+          const deferred = new HttpError(err.status || 502, err.code || 'cloudflare_error', `${err.message} — retry scheduled in ${seconds} s`);
+          deferred.cloudflare = err.cloudflare;
+          deferred.retryAt = new Date(retry.at).toISOString();
+          throw deferred;
         }
       }
       return null;
@@ -497,7 +579,12 @@ export function createDnsCloudflareService(ctx) {
 
     async zoneStatus(domain, user) {
       const zone = await ctx.dns.loadZone(domain, user);
-      return { ...zoneShape(zone), configured: service.isConfigured(), log: stmts.logFor.all(zone.id, 20).map((r) => ({ ...r, summary: r.summary ? JSON.parse(r.summary) : null })) };
+      const retry = pendingRetries.get(domain);
+      return {
+        ...zoneShape(zone), configured: service.isConfigured(), canLink: isRoot(user),
+        pendingRetry: retry ? { at: new Date(retry.at).toISOString(), attempt: retry.attempt } : null,
+        log: stmts.logFor.all(zone.id, 20).map((r) => ({ ...r, summary: r.summary ? JSON.parse(r.summary) : null })),
+      };
     },
   };
 

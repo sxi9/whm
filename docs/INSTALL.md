@@ -259,7 +259,7 @@ Set these in the environment of the `sudo bash scripts/install.sh` call.
 | `WHM_DATA_DIR` | `/var/lib/whm` | Panel data directory. Substituted into `whm-panel.service` (`ReadWritePaths`, `/var/lib/whm` occurrences). Note that the installed `panel.env` and `whm.conf` templates still say `/var/lib/whm`; edit them if you change this. |
 | `WHM_ADMIN_PASSWORD` | *(generated)* | Appended to `/etc/whm/panel.env` on a first install so the seed creates `root` with this password instead of generating one. |
 | `WHM_LICENSE_HUB_URL` | `https://licserver.hostingsignal.in` (local hub with `--with-hub`) | Written to `panel.env` as the bootstrap license hub. Must start with `https://`. With `--with-hub` it defaults to the hub's public URL; on a terminal (first install, not `--upgrade`) the script asks once with the vendor hub `https://licserver.hostingsignal.in` as the default, which the panel also uses when the variable is unset. An existing `WHM_LICENSE_HUB_URL=` line is never changed. Only the super admin sees the hub address in the panel. |
-| `WHM_SUPERADMIN_SETUP_PASSWORD` | *(ask)* | The **super admin setup password** (at least 12 characters). Its bcrypt hash is written to `/var/lib/whm/superadmin.key` (`0600 root:root`); on a terminal (first install, not `--upgrade`) the script asks for it once (blank skips: run `whm-cli superadmin --init` later). `whm-cli superadmin <user>` only grants the super admin flag after this password verifies ([§4.7](#47-first-login)). |
+| `WHM_SUPERADMIN_SETUP_PASSWORD` | *(ask)* | The **super admin setup password** (at least 12 characters). Its bcrypt hash is written to `/etc/whm/superadmin.key` (`0600 root:root`, in a directory the panel user cannot write); on a terminal (first install, not `--upgrade`) the script asks for it once (blank skips: run `whm-cli superadmin --init` later). `whm-cli superadmin <user>` only grants the super admin flag after this password verifies ([§4.7](#47-first-login)). |
 | `HUB_PUBLIC_URL` | `https://<hostname -f>:7443` | Hub `public_url` (the `iss` of every token). On an installed hub, the only hub.conf value an upgrade writes back. |
 | `HUB_DATA_DIR` | `/var/lib/whm-hub` | Hub databases, packages, PSL file. On an installed hub a *different* value aborts: move the directory by hand (see [§6.1](#61-upgrading)). |
 | `HUB_ADMIN_EMAIL` | *(unset)* | First-install only: create the vendor-admin portal user with this e-mail and print the password. |
@@ -291,8 +291,9 @@ Node major version 22.
    `WHM_ADMIN_PASSWORD` to a new `panel.env`.
 8. **License hub URL** – see `WHM_LICENSE_HUB_URL` above.
 9. **Super admin setup password** – see `WHM_SUPERADMIN_SETUP_PASSWORD` above; writes
-   `/var/lib/whm/superadmin.key` through `whm-cli.js superadmin --init` (no database access, so it runs
-   before the first boot without creating root-owned secrets).
+   `/etc/whm/superadmin.key` through `whm-cli.js superadmin --init` (no database access, so it runs
+   before the first boot without creating root-owned secrets). A key an earlier build left in
+   `/var/lib/whm` is moved to `/etc/whm` on `--upgrade`.
 10. **Panel TLS** – generates `/etc/whm/ssl/panel.{crt,key}` if absent ([§4.5](#45-tls)).
 11. **Hub** (`--with-hub`) – [§5.1](#51-installing-the-hub). If the hub certificate was generated in this
     run, a copy is installed as `/etc/whm/hub-ca.pem` (`0640 root:whmpanel`) and
@@ -315,7 +316,7 @@ Node major version 22.
 | `/etc/whm/ssl/panel.crt`, `panel.key` | `0640 root:whmpanel` | Self-signed panel certificate. |
 | `/etc/whm/hub-ca.pem` | `0640 root:whmpanel` | Copy of a same-host hub's self-signed certificate (only when the installer generated it). |
 | `/var/lib/whm` | `0750 whmpanel:whmpanel` | `whm.db` (+ `-wal`/`-shm`), `session.secret`, `master.key` (AES-256-GCM key for secrets at rest), `initial-admin-password.txt`, `plugins/`, `plugin-data/`, `plugin-keys/`. |
-| `/var/lib/whm/superadmin.key` | `0600 root:root` | bcrypt hash of the super admin setup password (`{ "v": 1, "hash", "created_at" }`). The panel process cannot read it; only `whm-cli superadmin` does. |
+| `/etc/whm/superadmin.key` | `0600 root:root` | bcrypt hash of the super admin setup password (`{ "v": 1, "hash", "created_at" }`). Only `whm-cli superadmin` reads it; `/etc/whm` is root-owned, so the panel user can neither read nor replace it. Location: `superadminKeyFile` / `WHM_SUPERADMIN_KEY_FILE` (default: next to the config file in use, or `<dataDir>/superadmin.key` without one). |
 | `/var/log/whm` | `0750 whmpanel:whmpanel` | Writable log directory (process output itself goes to the journal). |
 | `/run/whm-agent.sock` | `0660 root:whmpanel` | Created by `whm-agentd` at start. |
 | `/etc/systemd/system/whm-agentd.service` | | `User=root`, `WorkingDirectory=/opt/whm/agent`, `ExecStart=<node> /opt/whm/agent/src/index.js`, env `WHM_AGENT_SOCKET`, `WHM_AGENT_GROUP=whmpanel`, `WHM_AGENT_CONFIG=/etc/whm/agent.conf`, `Restart=always`. |
@@ -365,10 +366,21 @@ means the socket could not be opened (see [§8](#8-troubleshooting)).
    sudo node /opt/whm/scripts/whm-cli.js superadmin root      # asks for the setup password
    sudo node /opt/whm/scripts/whm-cli.js superadmin --revoke root
    ```
-   The command verifies the password against `/var/lib/whm/superadmin.key` (bcrypt) and refuses
+   The command verifies the password against `/etc/whm/superadmin.key` (bcrypt) and refuses
    otherwise; without the file it explains how to create it: `whm-cli superadmin --init` (prompts twice,
-   or reads `WHM_SUPERADMIN_SETUP_PASSWORD`; replacing an existing key needs the current password).
-   Grants and revocations are audited (`auth.superadmin.grant` / `.revoke`, principal `whm-cli`).
+   or reads `WHM_SUPERADMIN_SETUP_PASSWORD`; replacing an existing key needs the current password). Both
+   commands run as **root**: the key lives in `/etc/whm`, which only root can write, so they refuse under
+   the panel user (on a dev checkout without `/etc/whm/whm.conf` the key is `./data/superadmin.key` and
+   the checkout's owner may run them; if the directory does not exist yet the command says so — start
+   the panel once, it creates it). Grants and revocations are audited (`auth.superadmin.grant` /
+   `.revoke`, principal `whm-cli`).
+
+   What the setup password protects: no other panel user, operator or support login can make a root
+   user the owner without it. What it does not protect: the flag is `users.superadmin` in the panel's
+   own SQLite database, so code already running as the panel user (an escaped plugin, a compromised
+   API process) could set it directly — the gate keeps the hub address and key from other *panel
+   users*, not from the panel *process*. Treat a compromise of `whmpanel` as a compromise of the
+   license view.
 6. As the super admin, enter the license key under *Server Configuration › Basic WebHost Manager
    Setup › License* ([§5.5](#55-connecting-a-panel-to-the-hub)). The hub is
    `https://licserver.hostingsignal.in` unless `WHM_LICENSE_HUB_URL` says otherwise.
@@ -783,6 +795,7 @@ Precedence (`loadConfig()` in `server/src/config.js`): environment variables →
 | `WHM_LICENSE_HUB_CA` | `licenseHubCa` | `null` | PEM CA/certificate to trust for the hub (self-signed hubs). |
 | `WHM_LICENSE_ENFORCE` | `licenseEnforce` | `true` in prod, `false` otherwise | `'true'` enables the degraded (423), feature (403) and capacity gates. |
 | `WHM_LICENSE_CHECKIN_HOURS` | `licenseCheckinHours` | `12` | Check-in interval. |
+| `WHM_SUPERADMIN_KEY_FILE` | `superadminKeyFile` | next to the config file in use (`/etc/whm/superadmin.key`), else `<dataDir>/superadmin.key` | Super admin setup key (bcrypt hash) read by `whm-cli superadmin`; the panel process never opens it. |
 | — | `sessionTtlMs` | `28800000` (8 h) | Session lifetime and cookie `maxAge`. |
 | — | `loginRateLimit` | `{ "windowMs": 900000, "max": 20 }` | Login and 2FA attempts per window per IP+user. |
 | — | `checkinIntervalMs` | `60000` | Defined in `config.js` but not consumed by any code in this release; setting it has no effect. |
@@ -908,8 +921,12 @@ default from [§5.6](#56-hubconf-reference). Booleans accept `1`, `true`, `yes`.
 - Stuck on 2FA: `security.2fa.required_for_root` is on and no device is enrolled; the panel only lets
   you enrol or change the password until it is.
 - `403 superadmin_required` on `/api/license/*`, or the License tab says *managed by the panel owner*:
-  this root user is not the super admin. Grant it with `whm-cli superadmin <user>` (needs the setup
-  password; `whm-cli superadmin --init` creates `/var/lib/whm/superadmin.key` when it is missing).
+  this root user is not the super admin. Grant it with `sudo whm-cli superadmin <user>` (needs the setup
+  password; `whm-cli superadmin --init` creates `/etc/whm/superadmin.key` when it is missing). *run this
+  command as root* means the key's directory belongs to root; *the directory … does not exist yet* on a
+  checkout means the panel has not created `./data` — start it once.
+- The audit log (every root user can read it) names license events by activation id and keeps the
+  key prefix, hub address and hub error text out; the owner's License tab event list carries them.
 - Hub portal: `403 totp_enrol_required` means `hub.require_totp_for_admins` is on and this admin has
   not confirmed an authenticator yet — finish enrolment under *Security*; `429 totp_rate_limited`
   means five wrong codes in a row, wait 15 minutes.

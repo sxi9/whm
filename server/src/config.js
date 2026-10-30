@@ -39,6 +39,11 @@ const defaults = {
   licenseHubCa: null,
   licenseEnforce: isProd,
   licenseCheckinHours: 12,
+  // The super admin setup key (bcrypt hash, 0600 root). Unset = next to the
+  // config file in use (/etc/whm/superadmin.key on an installed host, where
+  // the panel user cannot replace it), or in the data directory when the
+  // panel runs without a config file (dev checkouts, tests).
+  superadminKeyFile: null,
 };
 
 function readConfigFile() {
@@ -49,12 +54,21 @@ function readConfigFile() {
   ].filter(Boolean);
   for (const file of candidates) {
     try {
-      if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (fs.existsSync(file)) return { file, values: JSON.parse(fs.readFileSync(file, 'utf8')) };
     } catch (err) {
       throw new Error(`Failed to read config file ${file}: ${err.message}`);
     }
   }
-  return {};
+  return { file: null, values: {} };
+}
+
+function merged(overrides) {
+  const { file, values } = readConfigFile();
+  const cfg = { ...defaults, ...values, ...envOverrides(), ...overrides };
+  cfg.configFile = file;
+  cfg.dataDir = path.resolve(cfg.dataDir);
+  cfg.superadminKeyFile = path.resolve(cfg.superadminKeyFile || path.join(file ? path.dirname(file) : cfg.dataDir, 'superadmin.key'));
+  return cfg;
 }
 
 function envOverrides() {
@@ -82,6 +96,7 @@ function envOverrides() {
   if (e.WHM_LICENSE_HUB_CA) out.licenseHubCa = path.resolve(e.WHM_LICENSE_HUB_CA);
   if (e.WHM_LICENSE_ENFORCE) out.licenseEnforce = e.WHM_LICENSE_ENFORCE === 'true';
   if (e.WHM_LICENSE_CHECKIN_HOURS) out.licenseCheckinHours = Number(e.WHM_LICENSE_CHECKIN_HOURS);
+  if (e.WHM_SUPERADMIN_KEY_FILE) out.superadminKeyFile = path.resolve(e.WHM_SUPERADMIN_KEY_FILE);
   return out;
 }
 
@@ -98,13 +113,11 @@ function persistedSecret(dataDir, name, bytes = 32) {
 // The merged configuration without touching the data directory: for tooling
 // that must not create root-owned secrets before the panel's first boot.
 export function readConfig(overrides = {}) {
-  const cfg = { ...defaults, ...readConfigFile(), ...envOverrides(), ...overrides };
-  cfg.dataDir = path.resolve(cfg.dataDir);
-  return cfg;
+  return merged(overrides);
 }
 
 export function loadConfig(overrides = {}) {
-  const cfg = { ...defaults, ...readConfigFile(), ...envOverrides(), ...overrides };
+  const cfg = merged(overrides);
   if (!['monolithic', 'split'].includes(cfg.mode)) {
     throw new Error(`WHM_MODE must be "monolithic" or "split", got "${cfg.mode}"`);
   }

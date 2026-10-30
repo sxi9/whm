@@ -192,11 +192,21 @@ export function createLicenseService(ctx) {
     return batch.length;
   }
 
+  // The audit log is read by every root user, while license_events belong to
+  // the panel owner: the mirrored row names the activation (never the key
+  // prefix) and drops hub-written text, which can carry the hub origin.
+  const AUDIT_OMIT = ['message', 'text', 'keyPrefix'];
+  function auditDetail(detail) {
+    const out = { ...detail };
+    for (const k of AUDIT_OMIT) delete out[k];
+    return redact(out);
+  }
+
   function recordEvent(event, detail = {}, { notify = true, severity, subject, req = null } = {}) {
     try {
       stmts.event.run(nowIso(clock.now()), event, JSON.stringify(redact(detail)));
       stmts.pruneEvents.run();
-      stmts.audit.run({ principal: req?.user?.username ?? null, role: req?.user?.role ?? null, ip: req?.ip ?? null, action: event, target: cache.meta.keyPrefix ?? null, args: JSON.stringify(redact(detail)), result: 'ok' });
+      stmts.audit.run({ principal: req?.user?.username ?? null, role: req?.user?.role ?? null, ip: req?.ip ?? null, action: event, target: cache.row?.activation_id ?? null, args: JSON.stringify(auditDetail(detail)), result: 'ok' });
     } catch (err) {
       log.error({ err, event }, 'failed to record license event');
     }
@@ -418,8 +428,13 @@ export function createLicenseService(ctx) {
     async request(pathname, body = {}, { timeoutMs = 30_000 } = {}) {
       const base = hubUrl();
       if (!base) throw new HttpError(422, 'hub_not_configured', 'No license hub is configured: set WHM_LICENSE_HUB_URL (the vendor hub) before activating');
+      // Hub errors reach root users who are not the panel owner (marketplace
+      // installs, catalog reads): the origin goes to the log, never the answer.
       let url;
-      try { url = new URL(pathname, base); } catch { throw new HttpError(422, 'hub_url_invalid', `The license hub URL "${base}" is not valid`); }
+      try { url = new URL(pathname, base); } catch {
+        log.warn({ hub: base }, 'license hub URL is not valid');
+        throw new HttpError(422, 'hub_url_invalid', 'The license hub URL is not valid: check WHM_LICENSE_HUB_URL');
+      }
       if (url.protocol !== 'https:') throw new HttpError(422, 'hub_url_insecure', 'The license hub URL must use https://');
       if (!keys.length) throw new HttpError(422, 'no_pinned_keys', 'This release ships no license keys; hub responses cannot be verified');
       const nonce = `n_${crypto.randomBytes(16).toString('hex')}`;
@@ -432,10 +447,16 @@ export function createLicenseService(ctx) {
           headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'X-WHM-Nonce': nonce, 'X-WHM-Timestamp': String(ts), 'User-Agent': `whm-panel/${ctx.version}` },
         });
       } catch (err) {
-        throw new HttpError(503, 'hub_unreachable', `The license hub at ${url.origin} could not be reached: ${err.message}`);
+        log.warn({ hub: url.origin, path: pathname, err: err.message }, 'license hub unreachable');
+        // DNS and TLS errors spell the hostname out; the error code says enough.
+        const reason = String(err.code || err.message || 'network error').split(url.hostname).join('the hub');
+        throw new HttpError(503, 'hub_unreachable', `The license hub could not be reached: ${reason}`);
       }
       const header = res.headers?.['x-whm-signature'] ?? res.headers?.['X-WHM-Signature'];
-      if (!verifySigned(res.body, header)) throw new HttpError(502, 'hub_signature_invalid', `The answer from ${url.origin} is not signed by a trusted license key`);
+      if (!verifySigned(res.body, header)) {
+        log.warn({ hub: url.origin, path: pathname }, 'license hub answer is not signed by a trusted license key');
+        throw new HttpError(502, 'hub_signature_invalid', 'The answer from the license hub is not signed by a trusted license key');
+      }
       const parsed = JSON.parse(res.body.toString('utf8'));
       if (parsed?.meta?.nonce !== nonce) throw new HttpError(502, 'hub_nonce_mismatch', 'The hub answer does not echo this request (possible replay)');
       if (res.status >= 400 || parsed.error) {

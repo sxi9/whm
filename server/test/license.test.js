@@ -249,6 +249,8 @@ describe('activation, hub.request and hubUrl()', () => {
       let res = await app.post('/api/license/key', { key: 'WHM-7K3Q-M2DF-9XA1-P0R6' });
       expect(res.status).toBe(502);
       expect(res.body.error.code).toBe('hub_signature_invalid');
+      // hub errors also reach non-owners through the marketplace: no origin in the text
+      expect(JSON.stringify(res.body)).not.toContain('hub.test');
       expect(ctx.license.get().status).toBe('unlicensed');
 
       hub.tamper = (res) => ({ ...res, headers: { 'x-whm-signature': res.headers['x-whm-signature'].replace(/kid=[0-9a-f]{8}/, 'kid=deadbeef') } });
@@ -285,6 +287,18 @@ describe('activation, hub.request and hubUrl()', () => {
       res = await app.post('/api/license/key', { key: 'WHM-7K3Q-M2DF-9XA1-P0R6' });
       expect(res.status).toBe(503);
       expect(res.body.error.code).toBe('hub_unreachable');
+      expect(res.body.error.message).toBe('The license hub could not be reached: ECONNREFUSED');
+      // DNS and TLS errors spell the hostname out: the code is reported, the host is not
+      hub.transport.request = async () => { throw Object.assign(new Error('getaddrinfo ENOTFOUND hub.test'), { code: 'ENOTFOUND' }); };
+      res = await app.post('/api/license/key', { key: 'WHM-7K3Q-M2DF-9XA1-P0R6' });
+      expect(res.body.error.message).toBe('The license hub could not be reached: ENOTFOUND');
+      hub.transport.request = async () => { throw new Error("Hostname/IP does not match certificate's altnames: Host: hub.test. is not in the cert's altnames") };
+      res = await app.post('/api/license/key', { key: 'WHM-7K3Q-M2DF-9XA1-P0R6' });
+      expect(res.body.error.message).not.toContain('hub.test');
+      expect(res.body.error.message).toContain('the hub');
+      // every failure is in the owner's event log, while the audit log keeps the hub out
+      expect(eventRows(ctx, 'license.activation_failed').length).toBeGreaterThanOrEqual(3);
+      expect(JSON.stringify(auditRows(ctx, 'license.activation_failed'))).not.toContain('hub.test');
     } finally { await app.close(); }
 
     const insecure = await bootPanel({ hubUrl: 'http://hub.test' });
@@ -399,6 +413,25 @@ describe('super admin gating', () => {
       expect(app.hub.calls.length).toBe(before);
       expect(app.ctx.license.get().status).toBe('active');
 
+      // The audit log is readable by every root user: the owner's activation,
+      // a failed one (hub down) and the trial/key routes leave neither the key
+      // prefix nor the hub there; the owner's event log keeps the detail.
+      const realRequest = app.hub.transport.request;
+      app.hub.transport.request = async () => { throw Object.assign(new Error('getaddrinfo ENOTFOUND issuer.test'), { code: 'ENOTFOUND' }); };
+      expect((await app.post('/api/license/key', { key: 'WHM-7K3Q-M2DF-9XA1-P0R6' })).status).toBe(503);
+      app.hub.transport.request = realRequest;
+      const audit = await agent.get('/api/system/audit?action=license.&pageSize=100').expect(200);
+      const actions = audit.body.data.map((r) => r.action);
+      expect(actions).toEqual(expect.arrayContaining(['license.key', 'license.activate', 'license.activated', 'license.activation_failed']));
+      const text = JSON.stringify(audit.body);
+      for (const secret of ['WHM-7K3Q', '7K3Q', 'hub.test', 'issuer.test']) expect(text, secret).not.toContain(secret);
+      expect(audit.body.data.find((r) => r.action === 'license.key').target).toBe('act_test0001');
+      expect(audit.body.data.find((r) => r.action === 'license.activate').target).toBe('act_test0001');
+      const failed = audit.body.data.find((r) => r.action === 'license.activation_failed');
+      expect(JSON.parse(failed.args_redacted)).toEqual({ code: 'hub_unreachable', transferFrom: null });
+      expect(eventRows(app.ctx, 'license.activation_failed').at(-1).detail_json).toContain('ENOTFOUND');
+      expect(JSON.stringify(auditRows(app.ctx, 'POST /api/license/key'))).not.toContain('7K3Q');
+
       // A reseller is refused before the super admin check (role first).
       const reseller = await app.createUser('policyres', 'reseller');
       const r = request.agent(app.ctx.app);
@@ -412,6 +445,12 @@ describe('super admin gating', () => {
       expect((await app.http.get('/api/license/activations')).status).toBe(403);
     } finally { await app.close(); }
   });
+
+  // Owed by services/marketplace-client.js (status(), hub_mismatch/hub_unreachable
+  // text), routes/marketplace.js (view(req).superadmin) and services/market.js
+  // (shape() url/lastTest for adapter "hub"): outside this unit's files.
+  it.todo('GET /api/marketplace/status and /api/market/providers never carry the hub origin for a non-owner root or a reseller');
+  it.todo('marketplace hub_mismatch and hub_unreachable answers name no origin for a non-owner root');
 });
 
 describe('state machine and events', () => {
