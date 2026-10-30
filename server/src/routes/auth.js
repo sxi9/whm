@@ -12,9 +12,13 @@ export function authRoutes(ctx) {
   const { auth, crypto, settings } = ctx;
   const r = Router();
 
-  // Turns an accepted login into a session, applying the session policy.
+  // Turns an accepted login into a session, applying the session policy. The
+  // user object carries the first-run wizard flag like /me does: the SPA keeps
+  // whichever it received last (a forced password change replaces it without
+  // another /me round trip).
   function establish(req, result) {
-    const { user, mustEnroll2fa = false } = result;
+    const { mustEnroll2fa = false } = result;
+    const user = { ...result.user, setupPending: Boolean(ctx.stack?.setup?.pending?.(result.user)) };
     return new Promise((resolve, reject) => {
       if (auth.policy().disallowConcurrentSessions) ctx.sessionStore.destroyUserSessions(user.id);
       req.session.regenerate((err) => {

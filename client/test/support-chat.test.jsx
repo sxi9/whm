@@ -16,7 +16,7 @@ vi.mock('../src/hooks/useApi.js', () => ({
   useMutation: (fn) => ({ mutate: fn, loading: false, error: null, fieldErrors: null, reset: () => {} }),
 }));
 
-const { ChatWorkspace, ConversationList, MessageList, Composer, groupByDay, listPath, conversationPath, conversationLabel, describeParty, MESSAGE_MAX_CHARS } = await import('../src/pages/support/ChatWorkspace.jsx');
+const { ChatWorkspace, ConversationList, MessageList, Composer, groupByDay, mergeSnapshot, listPath, conversationPath, conversationLabel, describeParty, MESSAGE_MAX_CHARS } = await import('../src/pages/support/ChatWorkspace.jsx');
 const { default: AccountConversationsPage } = await import('../src/pages/fn/support/account-conversations.jsx');
 const { AccountSummary, AccountManager } = await import('../src/pages/accounts/AccountDetails.jsx');
 const { default: CreateAccount } = await import('../src/pages/accounts/CreateAccount.jsx');
@@ -99,6 +99,29 @@ describe('Account Conversations', () => {
     expect(describeParty('manager', 'manager')).toBe('you');
     expect(describeParty('manager', 'account')).toBe('your account manager');
     expect(describeParty('account', 'manager')).toBe('the account');
+  });
+
+  it('merges the snapshot of a reconnected stream instead of dropping it', () => {
+    const msg = (id, side = 'account') => ({ id, author: side === 'account' ? 'alice' : 'root', authorRole: side === 'account' ? 'user' : 'root', side, body: `m${id}`, createdAt: `2026-10-29 10:0${id}:00` });
+    const conversation = { id: 1, status: 'open', subject: 'Mail delivery', unread: 0 };
+    const first = mergeSnapshot(null, { account: rows[0].account, conversation, messages: [msg(1), msg(2)], viewerSide: 'manager', canModerate: true, hasMore: false });
+    expect(first).toMatchObject({ viewerSide: 'manager', canModerate: true, hasMore: false, messages: [msg(1), msg(2)] });
+    // Nothing new: the thread object is kept as is.
+    expect(mergeSnapshot(first, { account: rows[0].account, conversation, messages: [msg(1), msg(2)], viewerSide: 'manager', canModerate: true, hasMore: false })).toBe(first);
+    // Reconnect after the panel restarted: alice replied meanwhile, the window moved.
+    const merged = mergeSnapshot(first, { account: rows[0].account, conversation: { ...conversation, unread: 2 }, messages: [msg(2), msg(3), msg(4)], viewerSide: 'manager', canModerate: true, hasMore: true });
+    expect(merged.messages.map((m) => m.id)).toEqual([1, 2, 3, 4]);
+    expect(merged.conversation.unread).toBe(2);
+    // The snapshot window starts after our oldest message, so our own hasMore stands.
+    expect(merged.hasMore).toBe(false);
+    const reaching = mergeSnapshot(first, { account: rows[0].account, conversation, messages: [msg(1), msg(2), msg(3)], viewerSide: 'manager', canModerate: true, hasMore: true });
+    expect(reaching.messages.map((m) => m.id)).toEqual([1, 2, 3]);
+    expect(reaching.hasMore).toBe(true);
+    // A status change alone is applied too.
+    const closed = mergeSnapshot(first, { account: rows[0].account, conversation: { ...conversation, status: 'closed' }, messages: [msg(1), msg(2)], viewerSide: 'manager', canModerate: true, hasMore: false });
+    expect(closed.conversation.status).toBe('closed');
+    expect(closed.messages).toEqual(first.messages);
+    expect(mergeSnapshot(first, { account: rows[0].account, conversation: null, messages: [], viewerSide: 'manager', canModerate: true, hasMore: false }).conversation).toBeNull();
   });
 
   it('ConversationList marks the selected row', () => {

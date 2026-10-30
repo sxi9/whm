@@ -750,6 +750,11 @@ describe('external authentications', () => {
     expect((await post('/api/security/external-auth', { name: 'corp', displayName: 'Dup', issuerUrl: 'https://x.example.com', clientId: 'a' })).status).toBe(409);
     expect((await post('/api/security/external-auth', { name: 'Bad Name', displayName: 'x', issuerUrl: 'https://x.example.com', clientId: 'a' })).status).toBe(422);
     expect((await post('/api/security/external-auth', { name: 'plain', displayName: 'x', issuerUrl: 'http://x.example.com', clientId: 'a' })).status).toBe(422);
+    // "presets" is the catalogue route, so a provider cannot take that name.
+    const reserved = await post('/api/security/external-auth', { name: 'presets', displayName: 'Presets', issuerUrl: 'https://login.example.com', clientId: 'c' });
+    expect(reserved.status).toBe(422);
+    expect(reserved.body.error.fields).toHaveProperty('name');
+    expect((await get('/api/security/external-auth/presets')).body.data).toHaveProperty('presets');
 
     const updated = await put('/api/security/external-auth/corp', { enabled: false, scopes: 'openid email' });
     expect(updated.body.data).toMatchObject({ enabled: false, scopes: 'openid email' });
@@ -1010,11 +1015,24 @@ describe('external authentication presets', () => {
       const mismatch = await post('/api/security/external-auth', { preset: 'microsoft', name: 'entra2', clientId: 'app-id', clientSecret: 's', fields: { tenant: '9188040d-6c67-4c5b-b112-36a304b66dad' } });
       expect(mismatch.status).toBe(400);
       expect(mismatch.body.error.message).toMatch(/does not match/);
-      // Meta: no token endpoint in the vendor document; the pinned Graph API endpoint fills it in.
-      responses['https://www.facebook.com/.well-known/openid-configuration'] = { issuer: 'https://www.facebook.com', authorization_endpoint: 'https://facebook.com/dialog/oauth/', jwks_uri: 'https://www.facebook.com/.well-known/oauth/openid/jwks/' };
+      // Meta: the pinned endpoints only fill a fetched vendor document; an unreachable one is an error and nothing is stored.
+      const fbDoc = { issuer: 'https://www.facebook.com', authorization_endpoint: 'https://facebook.com/dialog/oauth/', jwks_uri: 'https://www.facebook.com/.well-known/oauth/openid/jwks/' };
+      const fbDown = await post('/api/security/external-auth', { preset: 'facebook', name: 'meta', clientId: '12345', clientSecret: 'appsecret' });
+      expect(fbDown.status).toBe(400);
+      expect(fbDown.body.error.message).toMatch(/discovery failed for https:\/\/www\.facebook\.com\/\.well-known\/openid-configuration: HTTP 404/);
+      expect((await get('/api/security/external-auth/meta')).status).toBe(404);
+      // No token endpoint in the vendor document; the pinned Graph API endpoint fills it in.
+      responses['https://www.facebook.com/.well-known/openid-configuration'] = fbDoc;
       const fb = await post('/api/security/external-auth', { preset: 'facebook', name: 'meta', clientId: '12345', clientSecret: 'appsecret' });
       expect(fb.status).toBe(201);
       expect(fb.body.data).toMatchObject({ scopes: 'openid email', discovery: { authorizationEndpoint: 'https://www.facebook.com/dialog/oauth', tokenEndpoint: 'https://graph.facebook.com/oauth/access_token', jwksUri: 'https://www.facebook.com/.well-known/oauth/openid/jwks/', tokenEndpointAuthMethods: ['client_secret_post'], foreignEndpoints: ['tokenEndpoint on graph.facebook.com'] } });
+      // A later Discover while the vendor document is unreachable fails too and keeps the stored one.
+      delete responses['https://www.facebook.com/.well-known/openid-configuration'];
+      const fbDiscoverDown = await post('/api/security/external-auth/meta/discover');
+      expect(fbDiscoverDown.status).toBe(400);
+      expect(fbDiscoverDown.body.error.message).toMatch(/discovery failed/);
+      expect((await get('/api/security/external-auth/meta')).body.data.discovery.fetchedAt).toBe(fb.body.data.discovery.fetchedAt);
+      responses['https://www.facebook.com/.well-known/openid-configuration'] = fbDoc;
       // Apple: no scopes requested; the secret goes in the token request body (client_secret_post only).
       responses['https://appleid.apple.com/.well-known/openid-configuration'] = { issuer: 'https://appleid.apple.com', authorization_endpoint: 'https://appleid.apple.com/auth/authorize', token_endpoint: 'https://appleid.apple.com/auth/token', jwks_uri: 'https://appleid.apple.com/auth/keys', token_endpoint_auth_methods_supported: ['client_secret_post'] };
       const apple = await post('/api/security/external-auth', { preset: 'apple', name: 'apple', clientId: 'net.whm.panel', clientSecret: 'eyJ.secret.jwt' });
@@ -1041,6 +1059,24 @@ describe('external authentication presets', () => {
       const again = await post('/api/security/external-auth/meta/discover');
       expect(again.status).toBe(200);
       expect(again.body.data.discovery).toMatchObject({ tokenEndpoint: 'https://graph.facebook.com/oauth/access_token', preset: 'facebook' });
+      // Editing the issuer drops the fetched document but keeps the preset, so the next discovery still applies the vendor rules.
+      const edited = await put('/api/security/external-auth/meta', { issuerUrl: 'https://facebook.com' });
+      expect(edited.status).toBe(200);
+      expect(edited.body.data).toMatchObject({ issuerUrl: 'https://facebook.com', preset: 'facebook', discovery: null });
+      expect((await get('/api/security/external-auth')).body.data.find((p) => p.name === 'meta')).toMatchObject({ preset: 'facebook', discovery: null });
+      expect(() => app.ctx.security.externalAuth.authorizationUrl('meta', { state: 's', nonce: 'n', redirectUri: 'https://panel/cb' })).toThrow(/Run discovery/);
+      expect((await put('/api/security/external-auth/meta', { issuerUrl: 'https://www.facebook.com/' })).body.data).toMatchObject({ issuerUrl: 'https://www.facebook.com', preset: 'facebook', discovery: null });
+      const rediscovered = await post('/api/security/external-auth/meta/discover');
+      expect(rediscovered.status).toBe(200);
+      expect(rediscovered.body.data).toMatchObject({ preset: 'facebook', discovery: { tokenEndpoint: 'https://graph.facebook.com/oauth/access_token', tokenEndpointAuthMethods: ['client_secret_post'], preset: 'facebook' } });
+      // Same for Microsoft: the tenant-domain issuer re-entered by hand is answered with the GUID issuer and the documented Graph host needs no approval.
+      const msEdited = await put('/api/security/external-auth/entra', { issuerUrl: 'https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0' });
+      expect(msEdited.body.data).toMatchObject({ issuerUrl: 'https://login.microsoftonline.com/contoso.onmicrosoft.com/v2.0', preset: 'microsoft', discovery: null });
+      const msAgain = await post('/api/security/external-auth/entra/discover');
+      expect(msAgain.status).toBe(200);
+      expect(msAgain.body.data).toMatchObject({ issuerUrl: guid, preset: 'microsoft', discovery: { issuer: guid, foreignEndpoints: ['userinfoEndpoint on graph.microsoft.com'], preset: 'microsoft' } });
+      // An unchanged issuer keeps the fetched document.
+      expect((await put('/api/security/external-auth/entra', { issuerUrl: `${guid}/`, displayName: 'Contoso Ltd' })).body.data).toMatchObject({ displayName: 'Contoso Ltd', discovery: { issuer: guid } });
       // A discovery failure stores nothing.
       const gl = await post('/api/security/external-auth', { preset: 'gitlab', name: 'gitlab', clientId: 'g', clientSecret: 's', fields: { host: 'git.example.com' } });
       expect(gl.status).toBe(400);
@@ -1055,6 +1091,9 @@ describe('external authentication presets', () => {
       expect(bad.status).toBe(422);
       expect(bad.body.error.fields).toHaveProperty('clientId');
       expect((await post('/api/security/external-auth', { preset: 'google', name: 'x', clientId: 'g', fields: { 'bad key': 'v' } })).status).toBe(422);
+      const reservedPreset = await post('/api/security/external-auth', { preset: 'google', name: 'presets', clientId: 'gid', clientSecret: 's' });
+      expect(reservedPreset.status).toBe(422);
+      expect(reservedPreset.body.error.fields).toHaveProperty('name');
       expect((await post('/api/security/external-auth', { preset: 'google', name: 'google', clientId: 'gid', clientSecret: 's' })).status).toBe(409);
       // The generic shape still works on the same endpoint.
       const generic = await post('/api/security/external-auth', { name: 'plain', displayName: 'Plain', issuerUrl: 'https://login.example.com', clientId: 'c' });

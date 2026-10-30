@@ -1,5 +1,5 @@
 import { json } from '../db/index.js';
-import { notFound, badRequest, unprocessable, CapabilityError } from '../lib/errors.js';
+import { notFound, badRequest, conflict, unprocessable, CapabilityError } from '../lib/errors.js';
 
 // Service Configuration. Attached as ctx.web (ctx.ftp aliases ctx.web.ftp);
 // other categories may call:
@@ -24,6 +24,8 @@ import { notFound, badRequest, unprocessable, CapabilityError } from '../lib/err
 //   web.ensureHostnameVhost(req, { hostname? })      -> the 'server' vhost for the server's own name (branded landing page under
 //                                                       web.landingDocroot); never throws: { applied, reason?, landingPage }
 //   web.forceHttps()                                 -> whether vhosts with a certificate redirect HTTP to HTTPS (setting web.force_https)
+//   web.isServerName(domain)                         -> true for the server hostname and www.<hostname>: the vhost layer refuses to host
+//                                                       them for an account (409), and accounts/domains must refuse them at creation
 // The ones that change a live vhost/daemon persist the change first and then throw
 // CapabilityError('apache' | 'ftp') when the daemon is missing; consumers map that
 // to 'pending' / 'saved' (dns-functions, ip-functions, ssl-tls all do) and the next
@@ -284,6 +286,18 @@ export function createServiceConfigService(ctx) {
   // The hostname vhost carries no account and must not count as one.
   const accountVhosts = () => stmts.vhostsAll.all().filter((r) => r.type !== 'server');
 
+  // The server's own name (and www.<name>) is never hosted by an account: a
+  // tenant vhost for it would answer with the hostname's certificate and
+  // receive the panel's host-only session cookie from the admin's browser.
+  const serverNames = () => { const name = String(hostname()).toLowerCase(); return HOSTNAME_RE.test(name) ? [name, `www.${name}`] : []; };
+  const isServerName = (domain) => serverNames().includes(String(domain ?? '').trim().toLowerCase());
+  function assertNotServerName(spec) {
+    if (spec.type === 'server') return;
+    const hit = [spec.domain, ...(spec.aliases || [])].find((d) => isServerName(d));
+    if (hit) throw conflict(`${hit} is the server hostname; it cannot be hosted by an account`);
+    if (stmts.vhostByDomain.get(spec.domain)?.type === 'server') throw conflict(`${spec.domain} is the server hostname's own virtual host; it cannot be hosted by an account`);
+  }
+
   let detectCache = { at: 0, value: null };
   async function detect(force = false) {
     if (!force && detectCache.value && Date.now() - detectCache.at < 30_000) return detectCache.value;
@@ -316,13 +330,17 @@ export function createServiceConfigService(ctx) {
   }
 
   // Builds the vhost specs an account needs from accounts + account_domains.
+  // Only a row the same account wrote is carried over (certificate, custom
+  // directives, IPv6, PHP version): another owner's row, the hostname's
+  // included, is treated as absent.
   function specsFor(account) {
     const home = account.home_dir || `${settings.get('basic.home_root') || '/home'}/${account.username}`;
     const domains = stmts.accountDomains.all(account.id);
     const aliases = domains.filter((d) => ['parked', 'alias'].includes(d.type)).map((d) => d.domain);
-    const existing = stmts.vhostByDomain.get(account.domain);
+    const own = (row) => (row && row.type !== 'server' && row.username === account.username ? row : null);
+    const existing = own(stmts.vhostByDomain.get(account.domain));
     const base = (domain, type, docroot, extraAliases = []) => {
-      const prev = stmts.vhostByDomain.get(domain);
+      const prev = own(stmts.vhostByDomain.get(domain));
       return { domain, accountId: account.id, username: account.username, type, docroot, aliases: extraAliases, ip: account.ip || settings.get('basic.shared_ip') || null, ipv6: prev?.ipv6 ?? existing?.ipv6 ?? null, phpVersion: prev?.php_version ?? null, ssl: json.parse(prev?.ssl_json, null), redirects: json.parse(prev?.redirects_json, []), customDirectives: prev?.custom_directives || '', logDir: domlogDir(account.username) };
     };
     const specs = [base(account.domain, 'main', `${home}/public_html`, aliases)];
@@ -331,6 +349,7 @@ export function createServiceConfigService(ctx) {
   }
 
   function storeSpec(spec) {
+    assertNotServerName(spec);
     stmts.upsertVhost.run({ domain: spec.domain, account_id: spec.accountId ?? null, username: spec.username, type: spec.type, docroot: spec.docroot, aliases_json: JSON.stringify(spec.aliases || []), ip: spec.ip ?? null, ipv6: spec.ipv6 ?? null, php_version: spec.phpVersion ?? null, ssl_json: spec.ssl ? JSON.stringify(spec.ssl) : null, redirects_json: JSON.stringify(spec.redirects || []), custom_directives: spec.customDirectives || '' });
   }
 
@@ -431,6 +450,7 @@ export function createServiceConfigService(ctx) {
     const account = typeof usernameOrAccount === 'string' ? stmts.accountByUsername.get(usernameOrAccount) : usernameOrAccount;
     if (!account) throw notFound(`Account "${usernameOrAccount}"`);
     const specs = specsFor(account);
+    for (const spec of specs) assertNotServerName(spec);
     const installed = capabilities.has('apache');
     let phpVersion = null;
     const poolErrors = {};
@@ -1160,7 +1180,7 @@ export function createServiceConfigService(ctx) {
     ensureVhost, syncAccount: ensureVhost, removeAccount, applySsl, removeSsl, setRedirects, addAlias, removeAlias, setAccountIpv6, replaceIp, setPhpVersion, writePhpPool, setListenPorts,
     reload: (req) => apache.reload(req), restart: (req) => apache.restart(req), configtest: () => op('web.configtest'),
     vhostFor: (domain) => shapeVhost(stmts.vhostByDomain.get(domain)) ?? null, syncAllJob,
-    ensureHostnameVhost, forceHttps, landingDocroot: LANDING_DOCROOT,
+    ensureHostnameVhost, forceHttps, landingDocroot: LANDING_DOCROOT, isServerName,
     ensureEximAclChain: (req) => exim.ensureEximAclChain(req), applyEximTls: (preset, req) => exim.applyEximTls(preset, req), applyMailserverTls: (preset, req) => mailserver.applyMailserverTls(preset, req),
   };
 }

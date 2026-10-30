@@ -24,7 +24,8 @@ describe('stack catalog', () => {
         for (const p of c.packages[family]) expect(p, `${c.key}.${family}`).toMatch(PKG_RE);
       }
       expect(Array.isArray(c.units)).toBe(true);
-      for (const step of c.postInstall) expect(['a2enmod', 'enable']).toContain(step.kind);
+      for (const step of c.postInstall) expect(['a2enmod', 'enable', 'initdb']).toContain(step.kind);
+      if (c.key === 'postgres') expect(c.postInstall.map((s) => s.kind)).toEqual(['initdb', 'enable']);
       if (c.service) expect(SERVICE_REGISTRY.some((s) => s.name === c.service), `${c.key} → ${c.service}`).toBe(true);
     }
     // The capabilities the owner's findings named all have an installer.
@@ -55,6 +56,8 @@ describe('Server stack API', () => {
   let units = [];
   let installedPackages = [];
   let unitStates = {};
+  let pkgFamily = 'debian';
+  const waitUntil = async (cond, timeoutMs = 5000) => { const t = Date.now(); while (!cond()) { if (Date.now() - t > timeoutMs) throw new Error('condition not met in time'); await new Promise((r) => setTimeout(r, 20)); } };
 
   beforeAll(async () => {
     const agent = createMockAgent({
@@ -63,13 +66,16 @@ describe('Server stack API', () => {
       'svc.resolve': ({ candidates }) => ({ unit: candidates.find((c) => units.includes(c)) || candidates[0] }),
       'svc.status': ({ unit }) => ({ unit, installed: true, active: unitStates[unit] !== 'failed', state: unitStates[unit] || 'active', subState: 'running', enabled: true, pid: 10, memoryBytes: 1, restarts: 0 }),
       'svc.enable': ({ unit }) => ({ unit, verb: 'enable', output: '' }),
+      'svc.reload': ({ unit }) => ({ unit, verb: 'reload', output: '' }),
       'svc.restart': ({ unit }) => { unitStates[unit] = 'active'; return { unit, verb: 'restart', output: '' }; },
       'svc.reset_failed': ({ unit }) => ({ unit, ok: true, output: '' }),
       'svc.journal': ({ unit, lines }) => ({ unit, lines: Array.from({ length: Math.min(lines, 3) }, (_, i) => `${unit} line ${i + 1}`) }),
-      'pkg.detect': () => (binaries['apt-get'] ? { manager: 'apt', family: 'debian', binary: 'apt-get', rpm: false, rebootRequired: false } : { manager: null, family: null, binary: null, rpm: false, rebootRequired: false }),
+      'pkg.detect': () => (binaries['apt-get'] ? (pkgFamily === 'rhel' ? { manager: 'dnf', family: 'rhel', binary: 'dnf', rpm: true, rebootRequired: false } : { manager: 'apt', family: 'debian', binary: 'apt-get', rpm: false, rebootRequired: false }) : { manager: null, family: null, binary: null, rpm: false, rebootRequired: false }),
+      'pkg.update_index': () => ({ manager: 'apt', output: ['Reading package lists...'] }),
       'pkg.list_installed': ({ prefix }) => ({ manager: 'apt', total: installedPackages.length, packages: installedPackages.filter((p) => !prefix || prefix.some((pre) => p === pre || p.startsWith(pre))).map((name) => ({ name, version: '1', arch: 'amd64', summary: '' })) }),
       'pkg.install': ({ packages }) => { installedPackages.push(...packages); return { manager: 'apt', packages, output: [`installed ${packages.join(' ')}`] }; },
       'stack.apache_enmod': ({ modules }) => ({ skipped: false, enabled: modules, alreadyEnabled: [], failed: [], reloaded: false }),
+      'stack.postgres_initdb': () => ({ skipped: false, initialised: true, dataDir: '/var/lib/pgsql/data', output: [] }),
     });
     app = await createTestApp({ agent });
     app.ctx.jobs.start();
@@ -152,6 +158,12 @@ describe('Server stack API', () => {
     expect(installs[2].args.packages).toEqual(['mariadb-server', 'mariadb-client']);
     const order = app.agent.calls.map((c) => c.name);
     expect(order.indexOf('pkg.install')).toBeGreaterThan(order.indexOf('pkg.detect'));
+    // The index is refreshed once, after detection and before any install.
+    expect(app.agent.callsTo('pkg.update_index')).toHaveLength(1);
+    expect(app.agent.callsTo('pkg.update_index')[0].args).toEqual({ wait: false });
+    expect(order.indexOf('pkg.update_index')).toBeGreaterThan(order.indexOf('pkg.detect'));
+    expect(order.indexOf('pkg.update_index')).toBeLessThan(order.indexOf('pkg.install'));
+    expect(job.logs.some((l) => /Reading package lists/.test(l.line))).toBe(true);
     expect(app.agent.callsTo('stack.apache_enmod')[0].args.modules).toContain('rewrite');
     expect(app.agent.callsTo('svc.resolve').every((c) => c.args.fresh === true)).toBe(true);
     expect(app.agent.callsTo('svc.enable').map((c) => c.args.unit)).toEqual(expect.arrayContaining(['apache2', 'php-fpm', 'mariadb']));
@@ -262,6 +274,111 @@ describe('Server stack API', () => {
     expect(app.ctx.settings.get('setup.completed_reason')).toBe('skipped');
     expect((await app.http.get('/api/auth/me')).body.data.setupPending).toBe(false);
     expect(auditRows('setup.complete')).toHaveLength(1);
+  });
+
+  it('installs against the current index when the refresh fails', async () => {
+    app.agent.fail('pkg.update_index', 'command_failed', 'E: Could not resolve deb.debian.org');
+    const res = await post('/stack/install', { components: ['rsync'] }).expect(202);
+    const job = await waitForJob(app.ctx, res.body.data.job.id);
+    expect(job.status).toBe('done');
+    expect(job.result.failed).toEqual([]);
+    expect(job.logs.some((l) => l.level === 'warn' && /package index refresh failed: .*deb\.debian\.org.*current index/.test(l.line))).toBe(true);
+    expect(app.agent.callsTo('pkg.install')).toHaveLength(1);
+    app.agent.reset('pkg.update_index');
+  });
+
+  it('refuses a second installation while one is queued or running and reports it in the status', async () => {
+    let release = null;
+    app.agent.set('pkg.install', ({ packages }) => new Promise((resolve) => { release = () => resolve({ manager: 'apt', packages, output: [] }); }));
+    const first = await post('/stack/install', { components: ['git'] }).expect(202);
+    const id = first.body.data.job.id;
+    await waitUntil(() => release && app.ctx.jobs.get(id).status === 'running');
+    const second = await post('/stack/install', { components: ['rsync'] }).expect(409);
+    expect(second.body.error.code).toBe('conflict');
+    expect(second.body.error.message).toMatch(new RegExp(`job ${id}, ${STACK_INSTALL_JOB}.*running`));
+    await post('/capabilities/awstats/install').expect(409);
+    await post('/services/httpd/install').expect(409);
+    const status = await app.http.get('/api/system/stack').expect(200);
+    expect(status.body.data).toMatchObject({ installing: true, activeJob: { id, type: STACK_INSTALL_JOB, status: 'running' } });
+    expect(app.ctx.jobs.list({ type: STACK_INSTALL_JOB, status: 'queued' })).toHaveLength(0);
+    expect(auditRows('stack.install').filter((r) => JSON.parse(r.args_redacted).jobId === id)).toHaveLength(1);
+    release();
+    expect((await waitForJob(app.ctx, id)).status).toBe('done');
+    expect((await app.http.get('/api/system/stack')).body.data).toMatchObject({ installing: false, activeJob: null });
+    app.agent.set('pkg.install', ({ packages }) => ({ manager: 'apt', packages, output: [] }));
+    // A Software package job holds the same lock.
+    let releaseIndex = null;
+    app.agent.set('pkg.update_index', () => new Promise((resolve) => { releaseIndex = () => resolve({ manager: 'apt', output: [] }); }));
+    const { job: indexJob } = app.ctx.software.pkg.updateIndex({ id: 1, role: 'root' }, null);
+    await waitUntil(() => releaseIndex);
+    const blocked = await post('/stack/install', { components: ['git'] }).expect(409);
+    expect(blocked.body.error.message).toMatch(new RegExp(`job ${indexJob.id}, software.pkg.update_index`));
+    expect((await app.http.get('/api/system/stack')).body.data.activeJob).toMatchObject({ id: indexJob.id, type: 'software.pkg.update_index' });
+    releaseIndex();
+    await waitForJob(app.ctx, indexJob.id);
+    app.agent.reset('pkg.update_index');
+    await post('/stack/install', { components: ['git'] }).expect(202);
+  });
+
+  it('reloads a running Apache on the RHEL family after ModSecurity installs and initialises PostgreSQL before enabling it', async () => {
+    pkgFamily = 'rhel';
+    units = ['httpd'];
+    unitStates = {};
+    try {
+      const res = await post('/stack/install', { components: ['modsecurity', 'postgres'] }).expect(202);
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.status, JSON.stringify(job.logs)).toBe('done');
+      expect(job.result.family).toBe('rhel');
+      expect(app.agent.callsTo('pkg.install').map((c) => c.args.packages)).toEqual([['mod_security', 'mod_security_crs'], ['postgresql-server', 'postgresql-contrib']]);
+      expect(app.agent.callsTo('stack.apache_enmod')).toHaveLength(0);
+      expect(app.agent.callsTo('svc.resolve').some((c) => c.args.candidates[0] === 'httpd' && c.args.fresh === true)).toBe(true);
+      expect(app.agent.callsTo('svc.reload').map((c) => c.args.unit)).toEqual(['httpd']);
+      const order = app.agent.calls.map((c) => c.name);
+      expect(order.indexOf('svc.reload')).toBeGreaterThan(order.indexOf('pkg.install'));
+      expect(order.indexOf('stack.postgres_initdb')).toBeGreaterThan(order.lastIndexOf('pkg.install'));
+      expect(order.indexOf('stack.postgres_initdb')).toBeLessThan(order.indexOf('svc.enable'));
+      expect(app.agent.callsTo('svc.enable').map((c) => c.args.unit)).toEqual(['postgresql']);
+      const mods = job.result.results.find((r) => r.key === 'modsecurity');
+      expect(mods.steps[0]).toMatchObject({ step: 'a2enmod', skipped: true, reloaded: true, unit: 'httpd' });
+      expect(job.result.results.find((r) => r.key === 'postgres').steps.map((s) => s.step)).toEqual(['initdb', 'enable']);
+      expect(job.logs.some((l) => /httpd reloaded/.test(l.line))).toBe(true);
+      expect(job.logs.some((l) => /cluster initialised in \/var\/lib\/pgsql\/data/.test(l.line))).toBe(true);
+      // Apache not running: nothing to reload, and the step says so.
+      unitStates = { httpd: 'failed' };
+      app.agent.calls.length = 0;
+      const again = await post('/stack/install', { components: ['modsecurity'] }).expect(202);
+      const job2 = await waitForJob(app.ctx, again.body.data.job.id);
+      expect(job2.status).toBe('done');
+      expect(app.agent.callsTo('svc.reload')).toHaveLength(0);
+      expect(job2.logs.some((l) => /httpd is not running/.test(l.line))).toBe(true);
+      // Debian keeps the a2enmod path and never calls initdb's op for a cluster that exists.
+      pkgFamily = 'debian';
+      unitStates = {};
+      app.agent.set('stack.postgres_initdb', () => ({ skipped: true, reason: 'postgresql-setup is not available on this host; the distribution initialises the cluster itself' }));
+      app.agent.calls.length = 0;
+      const deb = await post('/stack/install', { components: ['postgres'] }).expect(202);
+      const job3 = await waitForJob(app.ctx, deb.body.data.job.id);
+      expect(job3.status).toBe('done');
+      expect(job3.result.results[0].steps[0]).toMatchObject({ step: 'initdb', skipped: true });
+      expect(job3.logs.some((l) => /postgresql-setup is not available/.test(l.line))).toBe(true);
+    } finally { pkgFamily = 'debian'; units = []; unitStates = {}; app.agent.reset('stack.postgres_initdb'); }
+  });
+
+  it('carries setupPending on the user returned by login and by a forced password change', async () => {
+    const other = await createTestApp();
+    try {
+      other.ctx.db.prepare("UPDATE users SET must_change_password = 1 WHERE username = 'root'").run();
+      const login = await other.http.post('/api/auth/login').send({ username: 'root', password: 'Test-Passw0rd!1' }).expect(200);
+      expect(login.body.data.user).toMatchObject({ role: 'root', mustChangePassword: true, setupPending: true });
+      const changed = await other.http.post('/api/auth/password').set('X-CSRF-Token', login.body.data.csrfToken).send({ newPassword: 'Another-Passw0rd!2' }).expect(200);
+      expect(changed.body.data.user).toMatchObject({ username: 'root', role: 'root', mustChangePassword: false, setupPending: true });
+      await other.http.post('/api/system/setup/complete').set('X-CSRF-Token', changed.body.data.csrfToken).send({ skipped: true }).expect(200);
+      const again = await other.http.post('/api/auth/password').set('X-CSRF-Token', changed.body.data.csrfToken).send({ currentPassword: 'Another-Passw0rd!2', newPassword: 'Third-Passw0rd!3' }).expect(200);
+      expect(again.body.data.user.setupPending).toBe(false);
+      const reseller = await other.createUser('resell2', 'reseller');
+      const rl = await request.agent(other.ctx.app).post('/api/auth/login').send({ username: 'resell2', password: reseller.password }).expect(200);
+      expect(rl.body.data.user.setupPending).toBe(false);
+    } finally { await other.close(); }
   });
 
   it('treats a server that already hosts accounts as set up', async () => {

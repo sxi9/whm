@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent } from './support/app.js';
-import { validateHostname, updateHostsFile, parseHosts, parseResolvConf, renderResolvedDropIn, detectResolverManager, isPublicIpv6, HOSTS_PATH, RESOLVED_DROPIN, HOSTNAME_CERT_SERVICES } from '../src/services/networking-setup.js';
+import { validateHostname, updateHostsFile, parseHosts, parseResolvConf, renderResolvedDropIn, detectResolverManager, isPublicIpv6, HOSTS_PATH, RESOLVED_DROPIN, HOSTNAME_CERT_SERVICES, HOSTNAME_CERT_JOB, HOSTNAME_CERT_SCHEDULE, HOSTNAME_CERT_CRON } from '../src/services/networking-setup.js';
 import { CapabilityError, notFound } from '../src/lib/errors.js';
 
 const CERT = '-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUQ\n-----END CERTIFICATE-----\n';
@@ -149,6 +149,15 @@ describe('Networking Setup API', () => {
   const get = (url) => app.http.get(url);
   const auditRows = (action) => app.ctx.db.prepare('SELECT * FROM audit_log WHERE action = ? ORDER BY id').all(action);
   const agentFail = (code, message) => Object.assign(new Error(message), { agentError: true, code, details: {} });
+  // The pair the production panel listener reads (deploy/whm.conf.example); the
+  // service compares the agent's report against ctx.config, read per call.
+  const PANEL_TLS = { tlsCert: '/etc/whm/ssl/panel.crt', tlsKey: '/etc/whm/ssl/panel.key' };
+  const withPanelTls = async (fn, pair = PANEL_TLS) => {
+    const before = { tlsCert: app.ctx.config.tlsCert, tlsKey: app.ctx.config.tlsKey };
+    Object.assign(app.ctx.config, pair);
+    try { return await fn(); } finally { Object.assign(app.ctx.config, before); }
+  };
+  const installResult = (service, applied = service === 'panel' ? [PANEL_TLS.tlsCert, PANEL_TLS.tlsKey] : [`/etc/${service}/whm`]) => ({ service, applied, note: null });
 
   beforeAll(async () => {
     const agent = createMockAgent({
@@ -194,11 +203,13 @@ describe('Networking Setup API', () => {
     app.agent.calls.length = 0;
   });
 
-  it('registers the module: service on ctx and capabilities', () => {
+  it('registers the module: service on ctx, capabilities, the hostname certificate renewal job and its schedule', () => {
     expect(typeof app.ctx.networking.setHostname).toBe('function');
     expect(typeof app.ctx.networking.setResolvers).toBe('function');
     expect(app.ctx.capabilities.snapshot().capabilities.hostnamectl).toMatchObject({ installed: true });
     expect(app.ctx.capabilities.snapshot().capabilities.resolvectl).toMatchObject({ installed: false });
+    expect(app.ctx.jobs.types()).toContain(HOSTNAME_CERT_JOB);
+    expect(app.ctx.scheduler.list().find((s) => s.name === HOSTNAME_CERT_SCHEDULE)).toMatchObject({ job_type: HOSTNAME_CERT_JOB, cron: HOSTNAME_CERT_CRON });
   });
 
   // -------------------------------------------------------------- hostname
@@ -413,15 +424,15 @@ describe('Networking Setup API', () => {
       issueFor: async () => { calls.issueFor++; throw notFound('Domain "tls.example.com"'); },
       certs: { raw: (id) => (id === 77 ? { cert_pem: CERT, key_enc: app.ctx.crypto.encrypt(KEY), chain_pem: CHAIN } : null) },
       certForDomain: () => null,
-      installServiceCert: async (service, pems, req) => { calls.installs.push({ service, pems, hasReq: Boolean(req) }); if (service === 'exim') throw new CapabilityError('exim', 'Exim is not installed'); return { service }; },
+      installServiceCert: async (service, pems, req) => { calls.installs.push({ service, pems, hasReq: Boolean(req) }); if (service === 'exim') throw new CapabilityError('exim', 'Exim is not installed'); return installResult(service); },
     };
     try {
-      const { data } = (await post('/api/networking/hostname', { hostname: 'tls.example.com', addDnsRecord: true }).expect(200)).body;
+      const { data } = await withPanelTls(async () => (await post('/api/networking/hostname', { hostname: 'tls.example.com', addDnsRecord: true }).expect(200)).body);
       expect(data.steps.map((s) => s.step)).toEqual(['hostname', 'hosts', 'settings', 'certs', 'dns', 'landing', 'certificate']);
       expect(data.steps.find((s) => s.step === 'landing')).toMatchObject({ ok: true, docroot: '/var/www/whm-default', landingPage: true });
       expect(calls.landing).toEqual([{ h: 'tls.example.com', hasReq: true }]);
       const cert = data.steps.find((s) => s.step === 'certificate');
-      expect(cert).toMatchObject({ ok: false, certId: 77, issuer: 'R3', notAfter: '2027-01-01T00:00:00Z', web: 'applied', installed: ['panel', 'dovecot', 'ftp'], failed: [{ service: 'exim', code: 'capability_missing' }] });
+      expect(cert).toMatchObject({ ok: false, certId: 77, issuer: 'R3', notAfter: '2027-01-01T00:00:00Z', web: 'applied', installed: ['panel', 'dovecot', 'ftp'], pending: [], failed: [{ service: 'exim', code: 'capability_missing' }] });
       expect(cert.error).toMatch(/exim: Exim is not installed/);
       expect(cert.detail).toMatch(/R3 certificate for tls\.example\.com until 2027-01-01T00:00:00Z; installed for panel, dovecot, ftp; hostname vhost applied/);
       expect(data.ok).toBe(false);
@@ -431,6 +442,23 @@ describe('Networking Setup API', () => {
       expect(calls.installs.map((i) => i.service)).toEqual(HOSTNAME_CERT_SERVICES);
       expect(calls.installs[0]).toMatchObject({ hasReq: true, pems: { certPem: CERT, keyPem: KEY, chainPem: CHAIN } });
       expect(auditRows('ssl.autossl.issue').pop()).toMatchObject({ target: 'tls.example.com', principal: 'root' });
+      // The panel is only "installed" when the agent wrote the pair the listener reads: another
+      // location (the op's /etc/whm/tls default against whm.conf's /etc/whm/ssl) is written but not live.
+      app.ctx.ssl.installServiceCert = async (service) => ({ ...installResult(service, service === 'panel' ? ['/etc/whm/tls/cert.pem', '/etc/whm/tls/key.pem'] : undefined), note: service === 'panel' ? 'Point WHM_TLS_CERT/WHM_TLS_KEY at /etc/whm/tls/cert.pem and key.pem and restart whm-panel.' : null });
+      const elsewhere = await withPanelTls(async () => (await post('/api/networking/hostname', { hostname: 'tlsp.example.com', addDnsRecord: false }).expect(200)).body.data);
+      const held = elsewhere.steps.find((s) => s.step === 'certificate');
+      expect(held).toMatchObject({ ok: false, code: 'not_live', installed: ['exim', 'dovecot', 'ftp'], failed: [], pending: [{ service: 'panel', paths: ['/etc/whm/tls/cert.pem', '/etc/whm/tls/key.pem'] }] });
+      expect(held.pending[0].error).toMatch(/reads \/etc\/whm\/ssl\/panel\.crt and \/etc\/whm\/ssl\/panel\.key, not \/etc\/whm\/tls\/cert\.pem, \/etc\/whm\/tls\/key\.pem/);
+      expect(held.pending[0].error).toMatch(/Point WHM_TLS_CERT\/WHM_TLS_KEY/);
+      expect(held.error).toMatch(/^panel: the panel listener reads/);
+      expect(held.detail).toMatch(/installed for exim, dovecot, ftp; written but not live for panel/);
+      expect(elsewhere.ok).toBe(false);
+      // A panel without a TLS listener cannot serve the certificate either.
+      app.ctx.ssl.installServiceCert = async (service) => installResult(service);
+      const noTls = await withPanelTls(async () => (await post('/api/networking/hostname', { hostname: 'tlsn.example.com', addDnsRecord: false }).expect(200)).body.data, { tlsCert: null, tlsKey: null });
+      expect(noTls.steps.find((s) => s.step === 'certificate')).toMatchObject({ ok: false, installed: ['exim', 'dovecot', 'ftp'], pending: [{ service: 'panel' }] });
+      expect(noTls.steps.find((s) => s.step === 'certificate').pending[0].error).toMatch(/no TLS listener/);
+      app.ctx.ssl.installServiceCert = async (service) => { if (service === 'exim') throw new CapabilityError('exim', 'Exim is not installed'); return installResult(service); };
       // The name not resolving to this server yet is reported and nothing is issued.
       calls.issue.length = 0;
       resolverAnswers.system = ['203.0.113.9'];
@@ -467,14 +495,14 @@ describe('Networking Setup API', () => {
       issueFor: async () => { throw notFound('Domain'); },
       certs: { raw: () => ({ cert_pem: CERT, key_enc: app.ctx.crypto.encrypt(KEY), chain_pem: null }) },
       certForDomain: () => ({ installed: 1 }),
-      installServiceCert: async (service, pems) => { calls.installs.push({ service, hasChain: 'chainPem' in pems }); return { service }; },
+      installServiceCert: async (service, pems) => { calls.installs.push({ service, hasChain: 'chainPem' in pems }); return installResult(service); },
     };
     try {
-      const r = await app.ctx.networking.reissueHostnameCertificate({}, null);
+      const r = await withPanelTls(() => app.ctx.networking.reissueHostnameCertificate({}, null));
       expect(r).toMatchObject({ hostname: 'old.example.com', ip: '10.0.0.5', ok: true });
       expect(r.steps.map((s) => [s.step, s.ok])).toEqual([['landing', true], ['certificate', true]]);
       expect(r.steps[0].detail).toMatch(/\(HTTPS\)$/);
-      expect(r.steps[1]).toMatchObject({ renewed: true, issuer: 'ZeroSSL', installed: HOSTNAME_CERT_SERVICES, failed: [] });
+      expect(r.steps[1]).toMatchObject({ renewed: true, issuer: 'ZeroSSL', installed: HOSTNAME_CERT_SERVICES, failed: [], pending: [] });
       expect(calls.issue).toEqual([{ domain: 'old.example.com', force: true }]);
       expect(calls.installs).toEqual(HOSTNAME_CERT_SERVICES.map((service) => ({ service, hasChain: false })));
       expect(auditRows('networking.hostname.certificate').pop()).toMatchObject({ target: 'old.example.com' });
@@ -489,7 +517,64 @@ describe('Networking Setup API', () => {
       const status = (await get('/api/networking/hostname').expect(200)).body.data;
       expect(status.certificate).toEqual({ id: 5, issuer: 'CN=ZeroSSL', notAfter: '2027-02-01T00:00:00Z', daysRemaining: 90, expired: false, autossl: true, state: 'installed', selfSigned: false });
       expect(status.landing).toEqual({ domain: 'old.example.com', status: 'applied', docroot: '/var/www/whm-default', ssl: true, error: null });
+      expect(status.renewal).toMatchObject({ schedule: HOSTNAME_CERT_SCHEDULE, cron: HOSTNAME_CERT_CRON, enabled: true, renewDays: 30 });
     } finally { app.ctx.web = originalWeb; app.ctx.ssl = originalSsl; }
+  });
+
+  it('the daily renewal job re-issues and re-installs the hostname certificate only inside the AutoSSL renewal window', async () => {
+    const schedule = () => app.ctx.scheduler.list().find((s) => s.name === HOSTNAME_CERT_SCHEDULE);
+    const calls = { issue: [], installs: [] };
+    let cert = { id: 5, autossl: true, daysRemaining: 60, expired: false };
+    const originalWeb = app.ctx.web;
+    const originalSsl = app.ctx.ssl;
+    app.ctx.web = { ...originalWeb, ensureHostnameVhost: async (req, { hostname: h }) => ({ hostname: h, applied: true, docroot: '/var/www/whm-default', landingPage: true }) };
+    app.ctx.ssl = {
+      ...originalSsl,
+      autossl: { settings: () => ({ provider: 'acme.sh', renewDays: 30 }), detect: async () => ({ providers: ['acme.sh'] }), issue: async (row, s, opts) => { calls.issue.push({ domain: row.domain, force: opts.force }); return { cert: { id: 5 }, certificate: { issuerCommonName: 'ZeroSSL', notAfter: '2027-02-01T00:00:00Z' }, renewed: true, web: 'applied' }; } },
+      issueFor: async () => { throw notFound('Domain'); },
+      certs: { raw: () => ({ cert_pem: CERT, key_enc: app.ctx.crypto.encrypt(KEY), chain_pem: null }) },
+      certForDomain: () => cert,
+      installServiceCert: async (service) => { calls.installs.push(service); return installResult(service); },
+    };
+    const logs = [];
+    const job = { params: {}, log: (line) => logs.push(line) };
+    try {
+      await withPanelTls(async () => {
+        // Not due: nothing is issued and no daemon is reloaded.
+        expect(await app.ctx.networking.renewHostnameCertificate(job)).toEqual({ hostname: 'old.example.com', skipped: true, reason: 'not_due', daysRemaining: 60, renewDays: 30 });
+        expect(calls.issue).toEqual([]);
+        expect(calls.installs).toEqual([]);
+        expect(logs.pop()).toMatch(/valid for 60 more days \(renewal starts at 30\)/);
+        // Inside the window: re-issued (the client's own due rule applies, so not forced) and re-installed everywhere.
+        cert = { ...cert, daysRemaining: 20 };
+        const renewed = await app.ctx.networking.renewHostnameCertificate(job);
+        expect(renewed).toMatchObject({ hostname: 'old.example.com', skipped: false, daysRemaining: 20, renewDays: 30, ok: true });
+        expect(renewed.steps.map((s) => [s.step, s.ok])).toEqual([['landing', true], ['certificate', true]]);
+        expect(calls.issue).toEqual([{ domain: 'old.example.com', force: false }]);
+        expect(calls.installs).toEqual(HOSTNAME_CERT_SERVICES);
+        expect(schedule().enabled).toBe(1);
+        expect(auditRows('networking.hostname.certificate').pop()).toMatchObject({ target: 'old.example.com' });
+        // A forced run ignores the window.
+        cert = { ...cert, daysRemaining: 80 };
+        calls.issue.length = 0;
+        expect(await app.ctx.networking.renewHostnameCertificate({ params: { force: true }, log: () => {} })).toMatchObject({ skipped: false });
+        expect(calls.issue).toEqual([{ domain: 'old.example.com', force: true }]);
+        // A custom or missing certificate pauses the schedule; the next issuance enables it again.
+        calls.installs.length = 0;
+        cert = { id: 9, autossl: false, daysRemaining: 10 };
+        expect(await app.ctx.networking.renewHostnameCertificate(job)).toEqual({ hostname: 'old.example.com', skipped: true, reason: 'custom_certificate' });
+        expect(schedule().enabled).toBe(0);
+        cert = null;
+        expect(await app.ctx.networking.renewHostnameCertificate(job)).toEqual({ hostname: 'old.example.com', skipped: true, reason: 'no_certificate' });
+        expect(calls.installs).toEqual([]);
+        expect((await get('/api/networking/hostname').expect(200)).body.data.renewal).toMatchObject({ enabled: false });
+        expect((await app.ctx.networking.reissueHostnameCertificate({}, null)).ok).toBe(true);
+        expect(schedule().enabled).toBe(1);
+        // An unqualified hostname has nothing to renew.
+        app.ctx.settings.set('basic.hostname', 'localhost');
+        expect(await app.ctx.networking.renewHostnameCertificate(job)).toMatchObject({ skipped: true, reason: 'invalid_hostname' });
+      });
+    } finally { app.ctx.web = originalWeb; app.ctx.ssl = originalSsl; app.ctx.settings.set('basic.hostname', 'old.example.com'); app.ctx.scheduler.update(HOSTNAME_CERT_SCHEDULE, { enabled: true }); }
   });
 
   it('POST /hostname reports a DNS failure (missing BIND) as a failed step while the hostname is still changed', async () => {

@@ -34,6 +34,24 @@ export function describeParty(side, viewerSide) {
   return side === 'manager' ? 'your account manager' : 'the account';
 }
 
+// A snapshot arrives on every (re)connect of the stream; messages posted while
+// it was down exist only in that snapshot, so later ones are merged, never dropped.
+export function mergeSnapshot(thread, data) {
+  const fresh = { account: data.account, conversation: data.conversation, messages: data.messages || [], viewerSide: data.viewerSide, canModerate: data.canModerate, hasMore: data.hasMore };
+  if (!thread) return fresh;
+  const known = new Set(thread.messages.map((m) => m.id));
+  const added = fresh.messages.filter((m) => !known.has(m.id));
+  const conversationChanged = data.conversation?.status !== thread.conversation?.status || data.conversation?.subject !== thread.conversation?.subject;
+  if (!added.length && !conversationChanged) return thread;
+  const oldestKnown = thread.messages[0]?.id ?? Infinity;
+  const reachesBack = (fresh.messages[0]?.id ?? Infinity) <= oldestKnown;
+  return {
+    ...thread, account: fresh.account, conversation: fresh.conversation,
+    messages: [...thread.messages, ...added].sort((a, b) => a.id - b.id),
+    hasMore: reachesBack ? fresh.hasMore : thread.hasMore,
+  };
+}
+
 function ManagerLine({ account }) {
   if (!account?.manager) return <span className="muted">No manager assigned yet</span>;
   const { username, role, email } = account.manager;
@@ -149,7 +167,7 @@ export function ChatThread({ username, onActivity }) {
     let open = true;
     const applySnapshot = (data) => {
       sideRef.current = data.viewerSide;
-      setThread((t) => t || { account: data.account, conversation: data.conversation, messages: data.messages, viewerSide: data.viewerSide, canModerate: data.canModerate, hasMore: data.hasMore });
+      setThread((t) => mergeSnapshot(t, data));
       if (data.conversation?.unread > 0) markRead();
     };
     const close = api.stream(`/support/chat/${encodeURIComponent(username)}/stream`, (event) => {

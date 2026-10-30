@@ -1,4 +1,4 @@
-import { notFound, unprocessable, CapabilityError } from '../lib/errors.js';
+import { notFound, unprocessable, conflict, CapabilityError } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
 import { STACK_COMPONENTS, STACK_PROFILES, componentByKey, componentForCapability, componentForService, profileComponents } from '../lib/stack-catalog.js';
 
@@ -38,6 +38,16 @@ export function createSystemStackService(ctx) {
     return present;
   }
 
+  // One package manager, one installer at a time: a second apt/dnf run would
+  // only fail on the lock (or wait for the whole first job) while its
+  // post-install steps interleaved with the first one's.
+  function activeInstall() {
+    return ['running', 'queued'].flatMap((status) => ctx.jobs.list({ status, limit: 50 })).find((j) => j.type === STACK_INSTALL_JOB || j.type.startsWith('software.pkg.')) || null;
+  }
+  const jobSummary = (j) => (j ? { id: j.id, type: j.type, status: j.status, progress: j.progress, message: j.message, created_at: j.created_at } : null);
+  // list-unit-files names a template (clamd@.service), never its instances.
+  const unitPresent = (set, name) => set.has(name) || (name.includes('@') && set.has(`${name.split('@')[0]}@`));
+
   async function status() {
     const snapshot = await capabilities.ensureFresh();
     const pkg = await detectPkg();
@@ -49,7 +59,7 @@ export function createSystemStackService(ctx) {
     }
     const components = STACK_COMPONENTS.map((c) => {
       const cap = c.capability ? snapshot.capabilities[c.capability] ?? null : null;
-      const unit = c.units.find((u) => unitsPresent.has(u)) || null;
+      const unit = c.units.find((u) => unitPresent(unitsPresent, u)) || null;
       const packages = pkg.family ? c.packages[pkg.family] : [];
       const packagesInstalled = packagesPresent && packages.length ? packages.every((p) => packagesPresent[p]) : null;
       return {
@@ -69,10 +79,13 @@ export function createSystemStackService(ctx) {
         }
       } catch (err) { logger.warn({ err }, 'service status unavailable for the stack status'); }
     }
+    const active = activeInstall();
     return {
       packageManager: pkg.manager, family: pkg.family, pkgAvailable: Boolean(pkg.manager),
       profiles: STACK_PROFILES.map((p) => ({ key: p.key, label: p.label, description: p.description, components: p.components })),
       components,
+      installing: Boolean(active),
+      activeJob: jobSummary(active),
       lastJob: ctx.jobs.list({ type: STACK_INSTALL_JOB, limit: 1 })[0] ?? null,
     };
   }
@@ -86,6 +99,8 @@ export function createSystemStackService(ctx) {
     if (!selection.length) throw unprocessable('Choose at least one component or a profile');
     if (!ctx.software?.pkg?.install) throw unprocessable('Package installation is not available on this panel');
     capabilities.require('pkg', 'No supported package manager (apt-get, dnf or yum) was found on this server; install the software by hand');
+    const active = activeInstall();
+    if (active) throw conflict(`A package installation (job ${active.id}, ${active.type}) is already ${active.status}; wait for it to finish before starting another`);
     const job = ctx.jobs.enqueue(STACK_INSTALL_JOB, { components: selection, profile: profile ?? null }, { userId: user?.id ?? null });
     req?.audit?.({ action: 'stack.install', target: selection.join(','), args: { profile: profile ?? null, components: selection, jobId: job.id } });
     return { job, components: selection };
@@ -127,9 +142,24 @@ export function createSystemStackService(ctx) {
     throw new Error(`${label} ${reason}`);
   }
 
+  // The RHEL family loads modules from conf.modules.d, so a freshly installed
+  // mod_security or php.conf only takes effect once the running httpd reloads.
+  async function reloadApache(job, component) {
+    const { unit } = await job.agent.op('svc.resolve', { candidates: ['httpd', 'apache2'], fresh: true });
+    if (!unit) return { reloaded: false, unit: null };
+    const state = await job.agent.op('svc.status', { unit });
+    if (!state.active) { job.log(`${component.label}: ${unit} is not running; the new modules load when it starts`); return { reloaded: false, unit }; }
+    await job.agent.op('svc.reload', { unit });
+    job.log(`${component.label}: ${unit} reloaded so the new modules are active`);
+    return { reloaded: true, unit };
+  }
+
   async function postInstall(job, component, step, family) {
     if (step.kind === 'a2enmod') {
-      if (family !== 'debian') { job.log(`${component.label}: Apache modules load from conf.modules.d on this family; nothing to enable`); return { step: 'a2enmod', skipped: true }; }
+      if (family !== 'debian') {
+        job.log(`${component.label}: Apache modules load from conf.modules.d on this family; nothing to enable`);
+        return { step: 'a2enmod', skipped: true, ...(await reloadApache(job, component)) };
+      }
       const r = await job.agent.op('stack.apache_enmod', { modules: step.modules });
       if (r.skipped) job.log(`${component.label}: ${r.reason}`);
       else job.log(`${component.label}: Apache modules enabled ${r.enabled.join(', ') || '(none new)'}${r.alreadyEnabled.length ? `; already on: ${r.alreadyEnabled.join(', ')}` : ''}${r.failed.length ? `; failed: ${r.failed.map((f) => f.module).join(', ')}` : ''}${r.reloaded ? '; Apache reloaded' : ''}`);
@@ -144,6 +174,11 @@ export function createSystemStackService(ctx) {
       job.log(`${component.label}: ${unit} enabled and started`);
       return { step: 'enable', unit, ok: true };
     }
+    if (step.kind === 'initdb') {
+      const r = await job.agent.op('stack.postgres_initdb');
+      job.log(`${component.label}: ${r.skipped ? r.reason : `database cluster initialised in ${r.dataDir}`}`);
+      return { step: 'initdb', ...r };
+    }
     return { step: step.kind, skipped: true };
   }
 
@@ -154,6 +189,11 @@ export function createSystemStackService(ctx) {
     const family = detect.family || (detect.manager === 'apt' ? 'debian' : detect.manager ? 'rhel' : null);
     if (!family) throw new CapabilityError('pkg', 'No supported package manager (apt-get, dnf or yum) is installed on this server');
     job.log(`package manager: ${detect.manager} (${family} family); installing ${keys.length} component(s): ${keys.map((c) => c.key).join(', ')}`);
+    // A stale index makes apt fetch superseded package versions (404) and fail
+    // every component; the refresh is best effort so an offline mirror does
+    // not stop an install that the current index can still serve.
+    job.progress(2, 'Refreshing the package index');
+    try { await runLongOp(job, 'pkg.update_index', {}, 'package index refresh'); } catch (err) { job.log(`package index refresh failed: ${err.message}; installing against the current index`, 'warn'); }
     const results = [];
     for (const [i, component] of keys.entries()) {
       job.progress(Math.round((i / keys.length) * 90), `Installing ${component.label}`);

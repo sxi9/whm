@@ -24,6 +24,7 @@ const FLOW_SHOTS = [
   ['01-login.png', 'Login'],
   ['02-dashboard.png', 'Home dashboard'],
   ['02-dashboard-full.png', 'Home dashboard (full page)'],
+  ['02a-setup-wizard.png', 'First-run setup wizard (new servers)'],
   ['03-create-account-form.png', 'Create a New Account — form'],
   ['04-create-account-result.png', 'Create a New Account — result'],
   ['05-list-accounts.png', 'List Accounts'],
@@ -95,6 +96,8 @@ function grid(items, perRow = 3) {
   await page.fill('#username', 'root');
   await page.fill('#password', PASSWORD);
   await page.click('button[type=submit]');
+  await page.waitForSelector('.setup-steps, .home', { timeout: 15000 }).catch(() => {});
+  if (await page.$('.setup-steps')) await page.click('button:has-text("Skip for now")');
   await settle('.home .kv');
   await stamp(page, tag('Home', 'live'));
   await shot(path.join(pagesDir, '_core', 'home.jpg'));

@@ -8,6 +8,7 @@
 // postInstall kinds:
 //   { kind: 'a2enmod', modules: [...] }  → agent op stack.apache_enmod (Debian family only; RHEL loads modules from conf.modules.d)
 //   { kind: 'enable', unit?, units? }    → agent op svc.enable on the first existing unit (the component's own candidates when none is given)
+//   { kind: 'initdb' }                   → agent op stack.postgres_initdb (RHEL family creates no cluster on install; Debian reports skipped)
 const EPEL = 'Needs the EPEL repository on RHEL, AlmaLinux and Rocky (dnf install epel-release) before this package resolves.';
 
 export const STACK_COMPONENTS = [
@@ -44,10 +45,10 @@ export const STACK_COMPONENTS = [
   },
   {
     key: 'postgres', label: 'PostgreSQL server', capability: 'postgres', service: 'postgresql', recommended: false,
-    description: 'PostgreSQL for accounts that need it. On the RHEL family run postgresql-setup --initdb before the service starts.',
+    description: 'PostgreSQL for accounts that need it. On the RHEL family the cluster is initialised (postgresql-setup --initdb) before the service starts.',
     packages: { debian: ['postgresql', 'postgresql-contrib'], rhel: ['postgresql-server', 'postgresql-contrib'] },
     units: ['postgresql'],
-    postInstall: [{ kind: 'enable' }],
+    postInstall: [{ kind: 'initdb' }, { kind: 'enable' }],
   },
   {
     key: 'bind', label: 'BIND DNS server', capability: 'bind', service: 'named', recommended: true,

@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { validate, z, fields } from '../../lib/validate.js';
+import { unprocessable } from '../../lib/errors.js';
 import { requireRoot, requireReseller, requireRole } from '../../middleware/rbac.js';
 import { createSupportService, TICKET_CATEGORIES, TICKET_SEVERITIES, TICKET_STATUSES, GRANT_STATUSES } from '../../services/support.js';
 import { createSupportChatService, CONVERSATION_STATUSES, MESSAGE_MAX_CHARS } from '../../services/support-chat.js';
@@ -14,6 +15,21 @@ const chatListQuery = z.object({
 });
 const chatThreadQuery = z.object({ before: fields.id.optional(), limit: z.coerce.number().int().min(1).max(500).default(100) });
 const messageBody = z.object({ body: z.string().regex(/^[^\0]*$/).transform((v) => v.replace(/\r\n?/g, '\n').trim()).pipe(z.string().min(1, 'Write a message first').max(MESSAGE_MAX_CHARS, `Messages are limited to ${MESSAGE_MAX_CHARS} characters`)) }).strict();
+// The request-level audit row carries req.body whatever the outcome, so the
+// text is lifted off the request before anything on the route can fail; the
+// row keeps the length only.
+const liftMessageText = (req, _res, next) => {
+  const raw = req.body?.body;
+  const parsed = messageBody.safeParse(req.body ?? {});
+  req.body = { chars: parsed.success ? parsed.data.body.length : (typeof raw === 'string' ? raw.length : 0) };
+  if (!parsed.success) {
+    const issues = {};
+    for (const issue of parsed.error.issues) (issues[issue.path.join('.') || '_'] ||= []).push(issue.message);
+    return next(unprocessable('Request validation failed', issues));
+  }
+  req.messageText = parsed.data.body;
+  next();
+};
 const conversationPatch = z.object({
   status: z.enum(CONVERSATION_STATUSES).optional(),
   subject: z.string().trim().min(1).max(200).regex(/^[^\r\n\0]*$/, 'Must be a single line').optional(),
@@ -111,14 +127,7 @@ export async function register(ctx) {
     const heartbeat = setInterval(() => res.write(': ping\n\n'), 15_000);
     req.on('close', () => { clearInterval(heartbeat); unsubscribe(); });
   });
-  r.post('/chat/:username/messages', requireParticipant, validate({ params: accountParam, body: messageBody }), (req, res, next) => {
-    Promise.resolve(chat.post(req.params.username, req.body.body, req.user, req)).then((d) => {
-      // The request-level audit row is written when the response finishes and
-      // would carry the message text; it records the length instead.
-      req.body = { chars: req.body.body.length };
-      res.status(201).json({ data: d });
-    }).catch(next);
-  });
+  r.post('/chat/:username/messages', liftMessageText, requireParticipant, validate({ params: accountParam }), created((req) => chat.post(req.params.username, req.messageText, req.user, req)));
   r.post('/chat/:username/read', requireParticipant, validate({ params: accountParam }), wrap((req) => chat.markRead(req.params.username, req.user)));
   r.patch('/chat/:username', requireReseller, validate({ params: accountParam, body: conversationPatch }), wrap((req) => chat.update(req.params.username, req.body, req.user, req)));
 

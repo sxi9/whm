@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { z } from 'zod';
 import { exec, hasBinary } from '../exec.js';
 import { defineOp, OpError } from './registry.js';
@@ -27,7 +29,12 @@ defineOp('stack.apache_enmod', {
       const ctl = hasBinary('apache2ctl') ? 'apache2ctl' : hasBinary('apachectl') ? 'apachectl' : null;
       if (ctl) {
         const test = await exec(ctl, ['-t'], { allowFailure: true });
-        if (test.code !== 0) throw new OpError('config_invalid', `Apache rejected the configuration after enabling ${enabled.join(', ')}: ${test.stderr.trim().split('\n').pop() || 'configtest failed'}`, { enabled });
+        if (test.code !== 0) {
+          // The running Apache is untouched, but the symlinks would break its
+          // next restart: take back exactly what this call switched on.
+          for (const m of enabled) await exec('a2dismod', ['-q', '-f', m], { allowFailure: true, timeoutMs: 60_000 });
+          throw new OpError('config_invalid', `Apache rejected the configuration after enabling ${enabled.join(', ')}; the modules were disabled again: ${test.stderr.trim().split('\n').pop() || 'configtest failed'}`, { enabled, rolledBack: enabled });
+        }
       }
       if (hasBinary('systemctl')) {
         const active = await exec('systemctl', ['is-active', '--quiet', 'apache2.service'], { allowFailure: true });
@@ -35,5 +42,21 @@ defineOp('stack.apache_enmod', {
       }
     }
     return { skipped: false, enabled, alreadyEnabled, failed, reloaded };
+  },
+});
+
+// RHEL, AlmaLinux and Rocky ship postgresql-server without a cluster;
+// postgresql.service refuses to start until one exists. Debian creates the
+// cluster on package install and has no postgresql-setup, so the op skips.
+const PG_VERSION_FILE = '/var/lib/pgsql/data/PG_VERSION';
+
+defineOp('stack.postgres_initdb', {
+  description: 'Initialise the PostgreSQL cluster with postgresql-setup --initdb (RHEL family) when none exists yet',
+  timeoutMs: 300_000,
+  run: async () => {
+    if (!hasBinary('postgresql-setup')) return { skipped: true, reason: 'postgresql-setup is not available on this host; the distribution initialises the cluster itself' };
+    if (fs.existsSync(PG_VERSION_FILE)) return { skipped: true, reason: `a cluster already exists in ${path.dirname(PG_VERSION_FILE)}` };
+    const { stdout, stderr } = await exec('postgresql-setup', ['--initdb'], { timeoutMs: 300_000 });
+    return { skipped: false, initialised: true, dataDir: path.dirname(PG_VERSION_FILE), output: `${stdout}\n${stderr}`.trim().split('\n').filter(Boolean).slice(-20) };
   },
 });

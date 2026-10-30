@@ -24,13 +24,17 @@ defineOp('svc.list_units', {
   run: async () => [...(await knownUnits())].sort(),
 });
 
+// list-unit-files names a template (clamd@.service) but never its instances,
+// so an instance candidate counts as present when its template is.
+export const unitPresent = (units, name) => units.has(name) || (name.includes('@') && units.has(`${name.split('@')[0]}@`));
+
 defineOp('svc.resolve', {
   description: 'Pick the first unit name that exists from a list of candidates (fresh: re-read the unit list, e.g. right after a package install)',
   schema: z.object({ candidates: z.array(arg.unit).min(1).max(10), fresh: z.boolean().default(false) }).strict(),
   run: async ({ candidates, fresh }) => {
     if (fresh) unitCache.at = 0;
     const units = await knownUnits();
-    return { unit: candidates.find((c) => units.has(c)) || null };
+    return { unit: candidates.find((c) => unitPresent(units, c)) || null };
   },
 });
 

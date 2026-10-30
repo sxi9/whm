@@ -62,6 +62,7 @@ const SOFTWARE_CHECK_JOB = 'software.update.check';
 const SOFTWARE_CHECK_SCHEDULE = 'os-update-check';
 const TERMINAL_SWEEP_MS = 60_000;
 const TERMINAL_WAIT_MS = 1000;
+const TERMINAL_DATA_GAP_MS = 16;
 
 const CATALOG_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), 'server-configuration.marketplace.json');
 const TIMEZONES = new Set(typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : []);
@@ -586,11 +587,13 @@ export function createServerConfigService(ctx) {
     },
     // Server-sent events: while the browser is attached, terminal.read is
     // issued back to back; each call long-polls inside the agent for up to
-    // waitMs, so output is relayed as soon as the shell produces it and an idle
-    // shell costs one request a second. pollMs/idlePollMs only space out the
-    // reads of an agent that answers at once (tests, or plain polling below).
+    // waitMs and write() wakes it, so output and keystroke echo are relayed as
+    // soon as the shell produces them while an idle shell costs one request a
+    // second. pollMs spaces the reads that follow an answer carrying data,
+    // which bounds the relay rate under flooding output; idlePollMs spaces
+    // empty answers only when the agent cannot long-poll (plain polling below).
     // Several tabs may watch one session; input goes through write().
-    stream(id, req, res, { waitMs = TERMINAL_WAIT_MS, pollMs = 0, idlePollMs = 400, heartbeatMs = 15_000 } = {}) {
+    stream(id, req, res, { waitMs = TERMINAL_WAIT_MS, pollMs = TERMINAL_DATA_GAP_MS, idlePollMs = 400, heartbeatMs = 15_000 } = {}) {
       const s = terminal.owned(id, req.user);
       res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
       res.flushHeaders?.();
@@ -634,7 +637,7 @@ export function createServerConfigService(ctx) {
           await terminal.forget(s, reason);
           return finish({ type: 'exit', code: r.exitCode, signal: r.signal, reason, message: reason === 'idle_timeout' ? `The session was idle for ${terminal.idleMs() / 60_000} minutes` : null });
         }
-        const delay = (buf.length ? pollMs : idlePollMs) - (Date.now() - started);
+        const delay = (buf.length ? pollMs : (wait ? 0 : idlePollMs)) - (Date.now() - started);
         if (delay > 0) { timer = setTimeout(poll, delay); timer.unref?.(); } else setImmediate(poll);
       };
       const heartbeat = setInterval(() => { if (!closed) res.write(': ping\n\n'); }, heartbeatMs);

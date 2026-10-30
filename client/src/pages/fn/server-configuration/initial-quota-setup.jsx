@@ -17,6 +17,33 @@ function quotaState(f) {
   return <StatusPill status="warning">not configured</StatusPill>;
 }
 
+// The server proposes the fstab line with both quota options; the manual
+// block must match what "Update fstab and enable" writes with the group
+// switch, so the group option is dropped here when the switch is off and
+// the line did not already carry one.
+export function manualSteps(f, groupQuota) {
+  const want = groupQuota ? 'ug' : 'u';
+  const line = groupQuota || f.fstab.hasGroupQuota ? f.proposedFstabLine : f.proposedFstabLine.replace(/,(grpquota|gquota)(?=[\s,]|$)/, '');
+  const apply = f.rebootRequired ? '# reboot (XFS applies quota options only at mount time)' : `mount -o remount ${f.mountpoint}`;
+  return `- ${f.fstab.line}\n+ ${line}\n\n# then:\n${apply}\nquotacheck -c${want} -m -f ${f.mountpoint}\nquotaon -${want} ${f.mountpoint}`;
+}
+
+export function ManualSteps({ filesystems, groupQuota }) {
+  const manual = filesystems.filter((f) => f.proposedFstabLine && f.fstab);
+  if (!manual.length) return null;
+  return (
+    <details style={{ marginTop: 10 }}>
+      <summary>Show manual steps</summary>
+      {manual.map((f) => (
+        <div key={f.mountpoint} style={{ marginTop: 10 }}>
+          <div className="muted">{f.mountpoint} (/etc/fstab line {f.fstab.lineNo}); the "Update fstab and enable" action runs these steps for you, with group quotas following the switch above:</div>
+          <pre className="log">{manualSteps(f, groupQuota)}</pre>
+        </div>
+      ))}
+    </details>
+  );
+}
+
 export default function InitialQuotaSetup({ fn }) {
   const toast = useToast();
   const confirm = useConfirm();
@@ -43,8 +70,6 @@ export default function InitialQuotaSetup({ fn }) {
     setBusy('install');
     try { const { data: d } = await api.post('/server-config/quota/install-tools'); if (d.job) { setJobId(d.job.id); toast.info('Installing the quota package'); } else { toast.success('Quota tools already installed'); refetch(); } } catch (err) { toast.error(err); } finally { setBusy(null); }
   };
-
-  const manual = data ? data.filesystems.filter((f) => f.proposedFstabLine) : [];
 
   return (
     <>
@@ -84,17 +109,7 @@ export default function InitialQuotaSetup({ fn }) {
             />
             <div className="card-body">
               <p className="muted" style={{ margin: 0 }}>Quotas need the <code>usrquota</code> mount option (or the ext4 <code>quota</code> feature); XFS reads it only at mount time, so it needs a reboot after the fstab change.</p>
-              {manual.length > 0 && (
-                <details style={{ marginTop: 10 }}>
-                  <summary>Show manual steps</summary>
-                  {manual.map((f) => (
-                    <div key={f.mountpoint} style={{ marginTop: 10 }}>
-                      <div className="muted">{f.mountpoint} (/etc/fstab line {f.fstab.lineNo}); the "Update fstab and enable" action does the same:</div>
-                      <pre className="log">{`- ${f.fstab.line}\n+ ${f.proposedFstabLine}\n\n# then:\nmount -o remount ${f.mountpoint}\nquotacheck -cug -m -f ${f.mountpoint}\nquotaon -ug ${f.mountpoint}`}</pre>
-                    </div>
-                  ))}
-                </details>
-              )}
+              <ManualSteps filesystems={data.filesystems} groupQuota={groupQuota} />
             </div>
           </Card>
         </>

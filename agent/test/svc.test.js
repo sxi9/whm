@@ -105,3 +105,78 @@ describe('stack.apache_enmod', () => {
     } finally { const mod = await vi.importActual('../src/exec.js'); hasBinary.mockImplementation(mod.hasBinary); exec.mockImplementation(mod.exec); }
   });
 });
+
+describe('stack.apache_enmod rollback', () => {
+  it('disables exactly the modules it enabled when the configtest fails, and never reloads', async () => {
+    const { hasBinary } = await import('../src/exec.js');
+    hasBinary.mockImplementation((name) => ['a2enmod', 'a2query', 'a2dismod', 'apache2ctl', 'systemctl'].includes(name));
+    exec.mockImplementation(async (bin, argv) => {
+      if (bin === 'a2query') return { code: argv[2] === 'ssl' ? 0 : 1, stdout: '', stderr: '', bin, argv };
+      if (bin === 'apache2ctl') return { code: 1, stdout: '', stderr: 'AH00526: Syntax error on line 3 of /etc/apache2/mods-enabled/suexec.load:\nCannot load mod_suexec.so', bin, argv };
+      return { code: 0, stdout: '', stderr: '', bin, argv };
+    });
+    try {
+      const err = await opError(runOp('stack.apache_enmod', { modules: ['rewrite', 'ssl', 'suexec'] }, ctx));
+      expect(err.code).toBe('config_invalid');
+      expect(err.message).toMatch(/disabled again/);
+      expect(err.details).toMatchObject({ enabled: ['rewrite', 'suexec'], rolledBack: ['rewrite', 'suexec'] });
+      const calls = exec.mock.calls.map(([bin, argv]) => [bin, ...argv]);
+      expect(calls.filter(([bin]) => bin === 'a2dismod')).toEqual([['a2dismod', '-q', '-f', 'rewrite'], ['a2dismod', '-q', '-f', 'suexec']]);
+      expect(calls).not.toContainEqual(['a2dismod', '-q', '-f', 'ssl']);
+      expect(calls.some(([bin, verb]) => bin === 'systemctl' && verb === 'reload')).toBe(false);
+      expect(calls.findIndex(([bin]) => bin === 'a2dismod')).toBeGreaterThan(calls.findIndex(([bin]) => bin === 'apache2ctl'));
+    } finally { const mod = await vi.importActual('../src/exec.js'); hasBinary.mockImplementation(mod.hasBinary); exec.mockImplementation(mod.exec); }
+  });
+});
+
+describe('stack.postgres_initdb', () => {
+  it('takes no arguments and is not destructive', async () => {
+    const op = catalog.get('stack.postgres_initdb');
+    expect(op).toBeTruthy();
+    expect(op.destructive).toBe(false);
+    expect((await opError(runOp('stack.postgres_initdb', { dataDir: '/tmp/x' }, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('skips where postgresql-setup does not exist (Debian) or a cluster already exists, else runs --initdb with argv only', async () => {
+    const fs = (await import('node:fs')).default;
+    const { hasBinary } = await import('../src/exec.js');
+    const existsSync = vi.spyOn(fs, 'existsSync');
+    try {
+      hasBinary.mockImplementation(() => false);
+      expect(await runOp('stack.postgres_initdb', {}, ctx)).toMatchObject({ skipped: true, reason: expect.stringMatching(/postgresql-setup/) });
+      hasBinary.mockImplementation((name) => name === 'postgresql-setup');
+      existsSync.mockImplementation((p) => p === '/var/lib/pgsql/data/PG_VERSION');
+      expect(await runOp('stack.postgres_initdb', {}, ctx)).toMatchObject({ skipped: true, reason: expect.stringMatching(/already exists/) });
+      expect(exec).not.toHaveBeenCalled();
+      existsSync.mockImplementation(() => false);
+      exec.mockResolvedValueOnce({ code: 0, stdout: ' * Initializing database in /var/lib/pgsql/data\n * Initialized, logs are in /var/lib/pgsql/initdb_postgresql.log\n', stderr: '', bin: '/usr/bin/postgresql-setup', argv: [] });
+      const result = await runOp('stack.postgres_initdb', {}, ctx);
+      expect(result).toMatchObject({ skipped: false, initialised: true, dataDir: '/var/lib/pgsql/data' });
+      expect(result.output).toHaveLength(2);
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(exec.mock.calls[0][0]).toBe('postgresql-setup');
+      expect(exec.mock.calls[0][1]).toEqual(['--initdb']);
+    } finally { existsSync.mockRestore(); const mod = await vi.importActual('../src/exec.js'); hasBinary.mockImplementation(mod.hasBinary); }
+  });
+});
+
+describe('svc.resolve template instances', () => {
+  it('treats an instance as present when list-unit-files only names its template', async () => {
+    const { unitPresent } = await import('../src/ops/svc.js');
+    const units = new Set(['clamd@', 'clamav-freshclam', 'apache2']);
+    expect(unitPresent(units, 'clamd@scan')).toBe(true);
+    expect(unitPresent(units, 'apache2')).toBe(true);
+    expect(unitPresent(units, 'clamd')).toBe(false);
+    expect(unitPresent(units, 'php-fpm@www')).toBe(false);
+    const { hasBinary } = await import('../src/exec.js');
+    hasBinary.mockImplementation((name) => name === 'systemctl');
+    exec.mockResolvedValueOnce({ code: 0, stdout: 'clamd@.service                 disabled        disabled\nclamav-freshclam.service       enabled         enabled\n', stderr: '', bin: '/bin/systemctl', argv: [] });
+    try {
+      const result = await runOp('svc.resolve', { candidates: ['clamav-daemon', 'clamd@scan', 'clamd'], fresh: true }, ctx);
+      expect(result).toEqual({ unit: 'clamd@scan' });
+      expect(exec.mock.calls[0][0]).toBe('systemctl');
+      expect(exec.mock.calls[0][1]).toEqual(['list-unit-files', '--type=service', '--no-legend', '--no-pager', '--plain']);
+    } finally { const mod = await vi.importActual('../src/exec.js'); hasBinary.mockImplementation(mod.hasBinary); }
+  });
+});

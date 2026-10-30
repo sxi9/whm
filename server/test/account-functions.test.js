@@ -656,6 +656,40 @@ describe('Account Functions API', () => {
       expect((await rget('/templates')).status).toBe(403);
       expect((await rput('/templates/index', { body: custom })).status).toBe(403);
     });
+
+    it('saving or resetting the landing template re-renders the hostname page at once', async () => {
+      // The real Service Configuration service (no Apache on this host, so the vhost stays pending but the page is written).
+      app.ctx.web = savedWeb;
+      app.ctx.settings.set('basic.hostname', 'panel.example.com');
+      const landingPage = () => app.agent.callsTo('fs.write_file').filter((c) => c.args.path === '/var/www/whm-default/index.html');
+      const custom = '<!doctype html><html><body><h1>Welcome to {{hostname}}</h1><p>custom landing</p></body></html>';
+      try {
+        app.agent.calls.length = 0;
+        const saved = await put('/templates/landing', { body: custom }).expect(200);
+        expect(saved.body.data).toMatchObject({ name: 'landing', written: true, rendered: { hostname: 'panel.example.com', landingPage: true, applied: false, reason: 'capability_missing' } });
+        expect(landingPage()).toHaveLength(1);
+        expect(landingPage()[0].args).toMatchObject({ owner: 'root', mode: '0644' });
+        expect(landingPage()[0].args.content).toContain('<h1>Welcome to panel.example.com</h1><p>custom landing</p>');
+        app.agent.calls.length = 0;
+        const reset = await post('/templates/landing/reset').expect(200);
+        expect(reset.body.data.rendered).toMatchObject({ hostname: 'panel.example.com', landingPage: true });
+        expect(landingPage()[0].args.content).toContain('Ready to launch');
+        expect(landingPage()[0].args.content).not.toContain('custom landing');
+        // Other templates never touch the hostname page.
+        app.agent.calls.length = 0;
+        const moved = await put('/templates/moved', { body: custom }).expect(200);
+        expect(moved.body.data).not.toHaveProperty('rendered');
+        expect(app.agent.callsTo('fs.write_file').map((c) => c.args.path)).toEqual(['/etc/whm/templates/moved.html']);
+        await post('/templates/moved/reset').expect(200);
+        // Without Service Configuration the save still succeeds and says nothing about the page.
+        delete app.ctx.web;
+        expect((await put('/templates/landing', { body: custom }).expect(200)).body.data).not.toHaveProperty('rendered');
+        await post('/templates/landing/reset').expect(200);
+      } finally {
+        delete app.ctx.web;
+        app.ctx.db.prepare("DELETE FROM web_vhosts WHERE type = 'server'").run();
+      }
+    });
   });
 
   describe('email all users', () => {

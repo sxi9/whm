@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { badRequest, conflict, unprocessable } from '../lib/errors.js';
 import { fields } from '../lib/validate.js';
 
@@ -14,6 +15,11 @@ export const DEFAULT_TEST_NAMES = ['example.com', 'example.net'];
 // Services whose certificate is the hostname's: the panel listener, mail and
 // FTP. Apache's "default SSL vhost" is the hostname vhost itself (ctx.web).
 export const HOSTNAME_CERT_SERVICES = ['panel', 'exim', 'dovecot', 'ftp'];
+// AutoSSL's own run only visits hosted domains, so the hostname certificate
+// has its own daily renewal pass (job + schedule, same hour as autossl-daily).
+export const HOSTNAME_CERT_JOB = 'networking.hostname.certificate';
+export const HOSTNAME_CERT_SCHEDULE = 'hostname-certificate-renew';
+export const HOSTNAME_CERT_CRON = '47 3 * * *';
 const LANDING_DOCROOT = '/var/www/whm-default';
 
 // A DNS AAAA record only helps when the address is reachable from outside:
@@ -374,6 +380,21 @@ export function createNetworkingSetupService(ctx) {
     return { certPem: row.cert_pem, keyPem: ctx.crypto.decrypt(row.key_enc), ...(row.chain_pem ? { chainPem: row.chain_pem } : {}) };
   }
 
+  // The panel listener only ever reads config.tlsCert/tlsKey (whm.conf or
+  // WHM_TLS_CERT/KEY) and watches those two files; a pair the agent wrote
+  // anywhere else is stored but not served, so it is reported as pending.
+  function panelNotLive(result) {
+    const cfg = ctx.config || {};
+    const applied = (Array.isArray(result?.applied) ? result.applied : []).map((p) => path.resolve(String(p)));
+    const written = applied.join(', ') || 'the panel bundle';
+    const note = result?.note ? ` ${result.note}` : '';
+    if (!cfg.tlsCert || !cfg.tlsKey) return `the panel has no TLS listener (WHM_TLS_CERT/WHM_TLS_KEY are not set), so the certificate written to ${written} is not served on the panel port.${note}`;
+    if (!applied.includes(path.resolve(cfg.tlsCert)) || !applied.includes(path.resolve(cfg.tlsKey))) return `the panel listener reads ${cfg.tlsCert} and ${cfg.tlsKey}, not ${written}; copy the pair there (readable by the whm-panel service user) or point WHM_TLS_CERT/WHM_TLS_KEY at the written files and restart whm-panel.${note}`;
+    return null;
+  }
+
+  const syncRenewalSchedule = (enabled) => { try { ctx.scheduler?.update?.(HOSTNAME_CERT_SCHEDULE, { enabled: Boolean(enabled) }); } catch (err) { logger.warn({ err }, 'hostname certificate schedule could not be updated'); } };
+
   // Issues the hostname's certificate through AutoSSL once the name resolves
   // to this server, then installs it for the panel, mail and FTP; the hostname
   // vhost gets it through the issuer's web hook. Every outcome is a step.
@@ -393,16 +414,24 @@ export function createNetworkingSetupService(ctx) {
       const user = req?.user ?? { role: 'root' };
       const issued = await issueCertificate(fqdn, user, req, { force, autossl });
       const pems = issuedPems(issued.cert?.id, user);
+      syncRenewalSchedule(true);
       const installed = [];
       const failed = [];
+      const pending = [];
       for (const service of HOSTNAME_CERT_SERVICES) {
-        try { await ssl.installServiceCert(service, pems, req); installed.push(service); } catch (err) { failed.push({ service, error: err.message, code: err.code ?? null }); }
+        try {
+          const result = await ssl.installServiceCert(service, pems, req);
+          const hold = service === 'panel' ? panelNotLive(result) : null;
+          if (hold) pending.push({ service, error: hold, paths: Array.isArray(result?.applied) ? result.applied : [] });
+          else installed.push(service);
+        } catch (err) { failed.push({ service, error: err.message, code: err.code ?? null }); }
       }
       const issuer = issued.certificate?.issuerCommonName || issued.certificate?.issuerText || autossl.provider;
+      const problems = [...failed, ...pending].map((f) => `${f.service}: ${f.error}`);
       return {
-        step: 'certificate', ok: failed.length === 0, certId: issued.cert?.id ?? null, issuer, notAfter: issued.certificate?.notAfter ?? null, renewed: issued.renewed ?? null, web: issued.web ?? null, installed, failed,
-        detail: `${issuer} certificate for ${fqdn}${issued.certificate?.notAfter ? ` until ${issued.certificate.notAfter}` : ''}; installed for ${installed.join(', ') || 'no service'}; hostname vhost ${issued.web || 'pending'}`,
-        ...(failed.length ? { error: failed.map((f) => `${f.service}: ${f.error}`).join('; '), code: failed[0].code } : {}),
+        step: 'certificate', ok: failed.length === 0 && pending.length === 0, certId: issued.cert?.id ?? null, issuer, notAfter: issued.certificate?.notAfter ?? null, renewed: issued.renewed ?? null, web: issued.web ?? null, installed, failed, pending,
+        detail: `${issuer} certificate for ${fqdn}${issued.certificate?.notAfter ? ` until ${issued.certificate.notAfter}` : ''}; installed for ${installed.join(', ') || 'no service'}${pending.length ? `; written but not live for ${pending.map((p) => p.service).join(', ')}` : ''}; hostname vhost ${issued.web || 'pending'}`,
+        ...(problems.length ? { error: problems.join('; '), code: failed[0]?.code ?? 'not_live' } : {}),
       };
     } catch (err) {
       return { step: 'certificate', ok: false, error: err.message, code: err.code ?? null, capability: err.capability ?? null };
@@ -444,8 +473,13 @@ export function createNetworkingSetupService(ctx) {
       }
       let certificate = null;
       let landing = null;
+      let renewal = null;
       try { certificate = (configured && ctx.ssl?.certForDomain?.(configured)) || null; } catch { certificate = null; }
       try { landing = (configured && ctx.web?.vhostFor?.(configured)) || null; } catch { landing = null; }
+      try {
+        const schedule = ctx.scheduler?.list?.().find((x) => x.name === HOSTNAME_CERT_SCHEDULE) || null;
+        renewal = schedule ? { schedule: schedule.name, cron: schedule.cron, enabled: Boolean(schedule.enabled), nextRunAt: schedule.next_run_at ?? null, renewDays: Number(ctx.ssl?.autossl?.settings?.()?.renewDays ?? 30) } : null;
+      } catch { renewal = null; }
       return {
         current, configured, inSync: Boolean(current && configured && current === configured),
         validation: current ? validateHostname(current) : { hostname: '', ok: false, problems: ['No hostname is set'] },
@@ -453,6 +487,7 @@ export function createNetworkingSetupService(ctx) {
         hosts, dns, resolves,
         certificate: certificate ? { id: certificate.id, issuer: certificate.issuer, notAfter: certificate.notAfter, daysRemaining: certificate.daysRemaining, expired: certificate.expired, autossl: certificate.autossl, state: certificate.state, selfSigned: certificate.selfSigned } : null,
         landing: landing ? { domain: landing.domain, status: landing.status, docroot: landing.docroot, ssl: Boolean(landing.ssl), error: landing.error ?? null } : null,
+        renewal,
         capability: { hostnamectl: capabilities.has('hostnamectl'), dns: Boolean(ctx.dns?.ensureHostnameA), ssl: typeof ctx.ssl?.issueFor === 'function', web: typeof ctx.web?.ensureHostnameVhost === 'function' },
         defaults: service.hostnameDefaults(),
         lastChange: shapeChange(stmts.lastChange.get('hostname')),
@@ -542,6 +577,32 @@ export function createNetworkingSetupService(ctx) {
       const steps = [await ensureLanding(fqdn, req), await issueHostnameCertificate(fqdn, { ip: publicIpv4, force }, req)];
       audit(req, { action: 'networking.hostname.certificate', target: fqdn, args: { force, ip: publicIpv4, steps: steps.map((s) => ({ step: s.step, ok: s.ok })) } });
       return { hostname: fqdn, ip: publicIpv4, steps, ok: steps.every((s) => s.ok) };
+    },
+
+    // Daily renewal pass (HOSTNAME_CERT_SCHEDULE): re-issues and re-installs
+    // only inside AutoSSL's renewal window, so the mail and FTP daemons are not
+    // reloaded every night; a hostname without an AutoSSL certificate pauses
+    // the schedule until the next issuance enables it again.
+    async renewHostnameCertificate(job = null) {
+      const check = validateHostname(settings.get('basic.hostname', ''));
+      if (!check.ok) return { hostname: check.hostname, skipped: true, reason: 'invalid_hostname' };
+      const fqdn = check.hostname;
+      let cert = null;
+      try { cert = ctx.ssl?.certForDomain?.(fqdn) ?? null; } catch { cert = null; }
+      if (!cert?.autossl) {
+        syncRenewalSchedule(false);
+        job?.log?.(`${fqdn}: ${cert ? 'certificate was not issued by AutoSSL' : 'no certificate installed'}; renewal paused until one is issued`);
+        return { hostname: fqdn, skipped: true, reason: cert ? 'custom_certificate' : 'no_certificate' };
+      }
+      const renewDays = Number(ctx.ssl.autossl?.settings?.()?.renewDays ?? 30);
+      const force = Boolean(job?.params?.force);
+      if (!force && cert.daysRemaining != null && cert.daysRemaining > renewDays) {
+        job?.log?.(`${fqdn}: valid for ${cert.daysRemaining} more days (renewal starts at ${renewDays})`);
+        return { hostname: fqdn, skipped: true, reason: 'not_due', daysRemaining: cert.daysRemaining, renewDays };
+      }
+      job?.log?.(`${fqdn}: ${cert.daysRemaining == null ? 'expiry unknown' : `${cert.daysRemaining} days left`}; re-issuing and re-installing for ${HOSTNAME_CERT_SERVICES.join(', ')}`);
+      const result = await service.reissueHostnameCertificate({ force }, null);
+      return { hostname: fqdn, skipped: false, daysRemaining: cert.daysRemaining ?? null, renewDays, ...result };
     },
 
     hostnameDefaults() {
@@ -659,6 +720,11 @@ export function createNetworkingSetupService(ctx) {
       return stmts.changes.all({ kind, limit }).map(shapeChange);
     },
   };
+
+  if (typeof ctx.jobs?.register === 'function') {
+    ctx.jobs.register(HOSTNAME_CERT_JOB, (job) => service.renewHostnameCertificate(job));
+    ctx.scheduler?.ensure?.(HOSTNAME_CERT_SCHEDULE, HOSTNAME_CERT_CRON, HOSTNAME_CERT_JOB);
+  }
 
   return service;
 }

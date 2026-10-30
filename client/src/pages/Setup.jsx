@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { Server, Settings2, Boxes, Download, CheckCircle2 } from 'lucide-react';
 import { api } from '../api/client.js';
 import { useApi } from '../hooks/useApi.js';
@@ -8,6 +8,7 @@ import { PageHeader, Card, StatusPill, Loading, CapabilityNotice } from '../comp
 import { Field, TextInput, Button, ErrorBanner, FormActions } from '../components/Form.jsx';
 import { ProgressLog } from '../components/ProgressLog.jsx';
 import { useToast } from '../components/Toast.jsx';
+import { LICENSE_PATH } from '../components/Layout.jsx';
 
 export const PRODUCT = { name: 'HST Panel', vendor: 'Hostingsignal' };
 
@@ -49,6 +50,7 @@ export default function SetupPage() {
     <>
       <PageHeader title={`${PRODUCT.name} setup`} description={`Get this server ready to host accounts. Everything here can be changed later; "Skip for now" takes you straight to the dashboard.`}
         actions={current.key !== 'done' && <Button onClick={() => finish(true)} loading={completing}>Skip for now</Button>} />
+      <LicenseGateCard license={user?.license} />
       <StepBar steps={SETUP_STEPS} current={step} />
       {current.key === 'welcome' && <WelcomeStep onNext={next} />}
       {current.key === 'basics' && <BasicsStep onNext={next} onBack={back} />}
@@ -56,6 +58,20 @@ export default function SetupPage() {
       {current.key === 'install' && <InstallStep selection={selection} jobId={jobId} onStarted={setJobId} result={jobResult} onResult={setJobResult} onNext={next} onBack={back} />}
       {current.key === 'done' && <DoneStep result={jobResult} onFinish={() => finish(false)} busy={completing} />}
     </>
+  );
+}
+
+// An enforced license that is not active makes the API refuse the wizard's
+// mutations (settings, installs); the only way out is the License tab, which the
+// shell keeps reachable while this card is shown.
+export function LicenseGateCard({ license }) {
+  if (!license || !license.enforce || !license.degraded) return null;
+  const status = license.status || 'unlicensed';
+  return (
+    <Card title="Activate the license first" className="setup-license-gate">
+      <p>This panel enforces licensing and its license is <strong>{status}</strong>{license.reason ? ` (${license.reason.replace(/_/g, ' ')})` : ''}, so the server is read-only: the setup cannot save settings or install services until a license is active. Activate the license, then come back here, or skip the setup and run the installer from Service Manager later.</p>
+      <FormActions><Link className="btn btn-primary" to={license.action || LICENSE_PATH}>Open the License tab</Link></FormActions>
+    </Card>
   );
 }
 
@@ -193,6 +209,10 @@ export function ServicesStep({ selection, onChange, onNext, onBack }) {
 export function InstallStep({ selection, jobId, onStarted, result, onResult, onNext, onBack }) {
   const [error, setError] = useState(null);
   const [starting, setStarting] = useState(false);
+  // One package installation runs at a time (the API answers 409 otherwise);
+  // a job started elsewhere can be followed from here instead.
+  const stack = useApi('/system/stack');
+  const active = !jobId && stack.data?.activeJob ? stack.data.activeJob : null;
   const nothing = selection.profile === 'manual' && selection.components.length === 0;
   const start = async () => {
     setStarting(true);
@@ -207,7 +227,16 @@ export function InstallStep({ selection, jobId, onStarted, result, onResult, onN
   return (
     <Card title="Install" subtitle={nothing ? 'No components were selected.' : `Installing ${selection.profile === 'manual' ? `${selection.components.length} selected component(s)` : `the "${selection.profile}" profile`}.`}>
       {error?.status === 501 ? <CapabilityNotice error={error} /> : <ErrorBanner error={error} />}
-      {!jobId && !nothing && <p>The package manager runs on the server; output appears below. You can leave this page, the job keeps running and Service Manager shows its progress.</p>}
+      {active && (
+        <div className="banner banner-info" role="status">
+          <div>
+            <strong>An installation is already running</strong>
+            <p>Job #{active.id} ({active.type}) is {active.status}{active.message ? `: ${active.message}` : ''}. Wait for it to finish before starting another, or follow it here.</p>
+          </div>
+          <Button size="sm" onClick={() => onStarted(active.id)}>Follow it</Button>
+        </div>
+      )}
+      {!jobId && !nothing && !active && <p>The package manager runs on the server; output appears below. You can leave this page, the job keeps running and Service Manager shows its progress.</p>}
       {jobId && <ProgressLog jobId={jobId} onFinished={finished} />}
       {result && (
         <p>
@@ -217,7 +246,7 @@ export function InstallStep({ selection, jobId, onStarted, result, onResult, onN
       )}
       <FormActions>
         <Button onClick={onBack} disabled={Boolean(jobId) && !result}>Back</Button>
-        {!jobId && !nothing && <Button variant="primary" onClick={start} loading={starting}>Start installation</Button>}
+        {!jobId && !nothing && <Button variant="primary" onClick={start} loading={starting} disabled={Boolean(active)}>Start installation</Button>}
         {(nothing || result || (error && error.status === 501)) && <Button variant="primary" onClick={onNext}>Continue</Button>}
         {jobId && !result && <Button onClick={onNext}>Continue in the background</Button>}
       </FormActions>

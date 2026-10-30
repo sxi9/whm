@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createTestApp } from './support/app.js';
+import { migrate } from '../src/db/index.js';
 
 // accounts.manager_user_id: who manages an account for support (U7).
 describe('account manager assignment', () => {
@@ -79,6 +80,23 @@ describe('account manager assignment', () => {
     expect(root.body.data[0]).toMatchObject({ role: 'root' });
     const reseller = await resellerHttp.get('/api/accounts/managers').expect(200);
     expect(reseller.body.data.map((m) => m.username)).toEqual(['root', 'resell1']);
+  });
+
+  it('the upgrade backfill names the owner as manager of accounts that had none', async () => {
+    const BACKFILL = '034b_support-chat-manager-backfill.sql';
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'gina', domain: 'gina.example', owner: 'resell1', manager: 'root' }).expect(201);
+    // An account that existed before the column arrived: no manager at all.
+    app.ctx.db.prepare("UPDATE accounts SET manager_user_id = NULL WHERE username = 'gina'").run();
+    app.ctx.db.prepare('DELETE FROM schema_migrations WHERE name = ?').run(BACKFILL);
+    migrate(app.ctx.db);
+    expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM schema_migrations WHERE name = ?').get(BACKFILL).n).toBe(1);
+    const res = await app.http.get('/api/accounts/gina').expect(200);
+    expect(res.body.data).toMatchObject({ owner: 'resell1', manager: 'resell1', manager_role: 'reseller' });
+    // Accounts that already had a manager keep it.
+    expect((await app.http.get('/api/accounts/bob').expect(200)).body.data.manager).toBe('resell2');
+    expect((await app.http.get('/api/accounts/erin').expect(200)).body.data.manager).toBe('root');
+    migrate(app.ctx.db);
+    expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM schema_migrations WHERE name = ?').get(BACKFILL).n).toBe(1);
   });
 
   it('a deleted manager leaves the account unmanaged instead of blocking the delete', async () => {

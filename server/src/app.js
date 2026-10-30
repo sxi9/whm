@@ -84,6 +84,13 @@ export async function createApp(ctx) {
     crossOriginEmbedderPolicy: false,
     hsts: config.tls ? undefined : false,
   }));
+  // The branding images are embedded by pages Apache serves on other origins
+  // (the hostname landing page, every new account's index page); helmet's
+  // same-origin resource policy would make browsers drop them there.
+  app.use('/api/branding', (req, res, next) => {
+    if (req.method === 'GET' || req.method === 'HEAD') res.set('Cross-Origin-Resource-Policy', 'cross-origin');
+    next();
+  });
   app.use(express.json({ limit: '2mb' }));
   app.use(express.urlencoded({ extended: false, limit: '1mb' }));
   app.use(cookieParser());

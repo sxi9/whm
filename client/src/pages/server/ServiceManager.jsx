@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
@@ -21,6 +21,13 @@ export default function ServiceManager({ fn }) {
   const [repair, setRepair] = useState(null);
   const [busy, setBusy] = useState(null);
   const installable = useMemo(() => new Set((stack.data?.components || []).filter((c) => c.service).map((c) => c.service)), [stack.data]);
+  // One package installation at a time: a job started from the setup wizard
+  // (or Software) is shown here with its log, and the install buttons wait.
+  const installing = Boolean(stack.data?.installing);
+  const activeJob = stack.data?.activeJob || null;
+  useEffect(() => {
+    if (activeJob && jobId !== activeJob.id) { setJobTitle(activeJob.type === 'stack.install' ? 'Installation in progress' : `Package job in progress (${activeJob.type})`); setJobId(activeJob.id); }
+  }, [activeJob?.id]);
 
   const configure = async (s, patch) => {
     setData((rows) => rows.map((r) => (r.name === s.name ? { ...r, ...patch } : r)));
@@ -63,7 +70,7 @@ export default function ServiceManager({ fn }) {
           rows={data || []} loading={loading} error={error} rowKey={(s) => s.name}
           rowActions={(s) => {
             if (!isRoot) return [];
-            if (!s.installed) return installable.has(s.name) ? [{ label: 'Install', primary: true, disabled: Boolean(busy) || !stack.data?.pkgAvailable, onClick: () => installService(s) }] : [];
+            if (!s.installed) return installable.has(s.name) ? [{ label: 'Install', primary: true, disabled: Boolean(busy) || installing || !stack.data?.pkgAvailable, onClick: () => installService(s) }] : [];
             if (!s.active) return [{ label: 'Start', primary: true, onClick: () => run(s, 'start') }, { label: 'Repair', primary: true, disabled: busy === s.name, onClick: () => repairService(s) }, { label: 'Restart', onClick: () => run(s, 'restart') }];
             return [{ label: 'Restart', primary: true, onClick: () => run(s, 'restart') }, { label: 'Stop', danger: true, onClick: () => run(s, 'stop') }];
           }}
@@ -83,7 +90,8 @@ export function StackCard({ stack, busy, onInstall }) {
   const profile = (key) => d.profiles.find((p) => p.key === key);
   const missingIn = (p) => (p ? p.components.filter((k) => missing.some((c) => c.key === k)) : []);
   const full = profile('full'); const web = profile('web');
-  const canInstall = Boolean(d?.pkgAvailable) && !busy;
+  const active = d?.activeJob || null;
+  const canInstall = Boolean(d?.pkgAvailable) && !busy && !active;
   return (
     <Card title="Server stack" subtitle={d ? `${installed.length} of ${components.length} components installed · package manager: ${d.packageManager || 'none detected'}` : undefined}
       actions={d && (
@@ -95,6 +103,7 @@ export function StackCard({ stack, busy, onInstall }) {
       {stack.loading && !d && <Loading />}
       {stack.error && <ErrorBanner error={stack.error} onRetry={stack.refetch} />}
       {d && !d.pkgAvailable && <CapabilityNotice error={{ code: 'capability_missing', message: 'No supported package manager (apt-get, dnf or yum) was found on this server, so the panel cannot install software here. Install the services by hand; detection picks them up on the next refresh.' }} onRetry={stack.refetch} />}
+      {active && <p className="banner banner-info stack-installing" role="status">An installation is already running (job #{active.id}, {active.type}, {active.status}{active.message ? `: ${active.message}` : ''}); the install buttons return once it finishes.</p>}
       {d && (
         <div className="form-grid">
           <section>

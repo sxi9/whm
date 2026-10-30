@@ -39,13 +39,15 @@ const hostSource = z.string().regex(/^(ALL|LOCAL|KNOWN|UNKNOWN|PARANOID|\[?[A-Za
 const keyName = z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$/);
 const vendorName = z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/);
 const providerName = z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/, 'Lowercase letters, digits, "_" or "-"');
+// GET /external-auth/presets is the catalogue, so no provider may take that name.
+const newProviderName = providerName.refine((n) => n !== 'presets', 'Reserved identifier');
 const providerScopes = z.string().regex(/^[A-Za-z0-9_.:\/ -]{0,200}$/);
 const providerCommon = { clientId: z.string().min(1).max(256), clientSecret: z.string().max(4096).optional(), scopes: providerScopes.optional(), enabled: z.boolean().optional() };
 const genericProviderBody = z.object({
-  name: providerName, displayName: z.string().min(1).max(64), issuerUrl: z.string().url().max(512).startsWith('https://', 'Issuer must use https://'), ...providerCommon,
+  name: newProviderName, displayName: z.string().min(1).max(64), issuerUrl: z.string().url().max(512).startsWith('https://', 'Issuer must use https://'), ...providerCommon,
 }).strict();
 const presetProviderBody = z.object({
-  preset: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/), name: providerName, displayName: z.string().min(1).max(64).optional(),
+  preset: z.string().regex(/^[a-z][a-z0-9-]{0,31}$/), name: newProviderName, displayName: z.string().min(1).max(64).optional(),
   fields: z.record(z.string().regex(/^[a-z][A-Za-z0-9]{0,31}$/), z.string().max(512)).optional(), allowForeignEndpoints: z.boolean().optional(), ...providerCommon,
 }).strict();
 // One endpoint, two shapes: a body naming a preset is validated as such, so field

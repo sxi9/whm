@@ -9,7 +9,7 @@ depends on the hosted-account ("HST Panel") login.
 
 | Piece | Where |
 |---|---|
-| Column | `accounts.manager_user_id` (nullable, `REFERENCES users ON DELETE SET NULL`), migration `034_support-chat.sql`. |
+| Column | `accounts.manager_user_id` (nullable, `REFERENCES users ON DELETE SET NULL`), migration `034_support-chat.sql`. `034b_support-chat-manager-backfill.sql` names the **owner** as manager of every account that has none, so a host upgraded in place does not leave its existing accounts unmanaged (no notice mail, "No manager assigned" on both sides). |
 | Rules | The manager is a `root` or `reseller` user that is not suspended. Root may name anyone; a reseller may name **itself or a root user** (handing an account to another reseller is root's decision, otherwise a reseller could grant a third party read access to the thread). Default on create: **the creator**. `manager: null` on modify clears it. |
 | API | `POST /api/accounts { manager? }`, `PATCH /api/accounts/:username { manager?: username \| null }`, `GET /api/accounts/managers` (the candidates the caller may pick), `GET /api/accounts?manager=<username>&sort=manager`. Account rows carry `manager`, `manager_role`, `manager_email`, `manager_user_id`. |
 | Audit | `account.create` args include `manager` (user id); `account.modify` records the input. |
@@ -55,7 +55,7 @@ reseller cannot enumerate other resellers' accounts.
 | `GET /chat/unread` | root, reseller, user | badge figure (sits before `/chat/:username`, "unread" is a valid username) |
 | `GET /chat/:username` | root, reseller, user | `?before=<id>&limit=1..500` |
 | `GET /chat/:username/stream` | root, reseller, user | SSE: `snapshot` (same shape as `get`), then `message`, `read`, `status`; `: ping` every 15 s; the path ends in `/stream` so the API rate limiter and access log skip it like the job streams |
-| `POST /chat/:username/messages` | root, reseller, user | `{ body }` — CRLF normalised, trimmed, 1–4000 chars, no NUL. **The request-level audit row would carry the text; the handler replaces `req.body` with `{ chars }` before the response finishes.** |
+| `POST /chat/:username/messages` | root, reseller, user | `{ body }` — CRLF normalised, trimmed, 1–4000 chars, no NUL. **The request-level audit row would carry the text; `liftMessageText` runs first on the route, replaces `req.body` with `{ chars }` and hands the text on as `req.messageText`, so a 404, 422 or 5xx row carries the length only.** Responses sent before the route is reached (401 expired session, 403 CSRF, 423 license-degraded) still finish with the raw body — see below. |
 | `POST /chat/:username/read` | root, reseller, user | |
 | `PATCH /chat/:username` | root, reseller | `{ status?, subject? }` |
 
@@ -66,7 +66,10 @@ reseller cannot enumerate other resellers' accounts.
 side, unread badges, closed pills, last message preview), thread on the right with day separators,
 left/right bubbles by side, *Load earlier messages*, Close/Reopen for the manager side, and a composer
 (Ctrl+Enter sends, character counter). The thread opens the SSE stream and also fetches the thread
-once, so a proxy that buffers SSE still shows the messages. `?account=<username>` deep-links a thread
+once, so a proxy that buffers SSE still shows the messages. `EventSource` reconnects by itself after a panel
+restart or a proxy idle timeout and the route sends a fresh `snapshot`; `mergeSnapshot` folds every snapshot into
+the open thread (new ids appended, status/subject refreshed, `hasMore` taken from a snapshot that reaches back to
+the oldest known message), so messages posted while the stream was down appear without leaving the page. `?account=<username>` deep-links a thread
 (used by the *Conversation* button in the account summary). Hosted-account logins (`role: user`) see
 the page as **My support**: a banner naming their manager and their single thread, opened automatically.
 
@@ -88,6 +91,11 @@ rest of the sidebar. The chat needs no change for that.
 
 ## Not done here (shared files)
 
+- Audit rows for responses sent before the route runs: `middleware/audit.js` records `req.body` on
+  `finish` for every mutation, and `requireAuth` (401), CSRF (403) and the license gate (423) answer before
+  `/support/chat/:username/messages` can replace it, so those rows carry the message text. Fix in the
+  shared middleware, e.g. a `bodyAudit` map keyed by `METHOD /path-pattern` (or `req.auditArgs` set by an
+  early `app.use`) that stores `{ chars }` for this route whatever the outcome.
 - Top bar badge: `TopBar.jsx` has a Bell button but no count mechanism; `GET /api/support/chat/unread`
   is ready for it (poll every 60 s, show `total`, link to the page).
 - List Accounts manager column: `client/src/pages/accounts/AccountsTable.jsx` — add

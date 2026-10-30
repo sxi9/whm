@@ -37,6 +37,20 @@ describe('response headers', () => {
     expect(res.headers['referrer-policy']).toBe('no-referrer');
     expect(res.headers['x-content-type-options']).toBe('nosniff');
   });
+
+  it('lets pages on other origins (the hostname landing page, account index pages) embed the branding images, and nothing else', async () => {
+    const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64, 1)]);
+    const csrf = await app.login();
+    await app.http.post('/api/cpanel/branding/logo').set('X-CSRF-Token', csrf).set('Content-Type', 'image/png').send(png).expect(201);
+    try {
+      const img = await fresh().get('/api/branding/logo').expect(200);
+      expect(img.headers['cross-origin-resource-policy']).toBe('cross-origin');
+      expect(img.headers['content-security-policy']).toContain("default-src 'none'");
+      expect((await fresh().get('/api/branding')).headers['cross-origin-resource-policy']).toBe('cross-origin');
+      for (const url of ['/api/health', '/api/auth/me', '/api/cpanel/branding/logo']) expect((await fresh().get(url)).headers['cross-origin-resource-policy'], url).toBe('same-origin');
+      expect((await fresh().post('/api/branding/logo').set('Content-Type', 'image/png').send(png)).headers['cross-origin-resource-policy']).toBe('same-origin');
+    } finally { await app.http.delete('/api/cpanel/branding/logo').set('X-CSRF-Token', csrf); }
+  });
 });
 
 describe('request ids and stream matching', () => {

@@ -314,6 +314,59 @@ describe('cross-category helpers on ctx.web', () => {
     }
   });
 
+  it('the server hostname and www.<hostname> can never become an account vhost, and another owner\'s row is never inherited', async () => {
+    const db = app.ctx.db;
+    const previousHostname = app.ctx.settings.get('basic.hostname');
+    app.ctx.settings.setMany({ 'basic.hostname': 'panel.example.com', 'basic.main_ip': '203.0.113.5' });
+    let srvId = null;
+    try {
+      expect(await app.ctx.web.ensureHostnameVhost(null)).toMatchObject({ hostname: 'panel.example.com', applied: true });
+      expect(app.ctx.web.isServerName('PANEL.example.com')).toBe(true);
+      expect(app.ctx.web.isServerName('www.panel.example.com')).toBe(true);
+      expect(app.ctx.web.isServerName('example.com')).toBe(false);
+      // An account whose main domain is the hostname (account_domains alone does not stop it) gets no vhost: 409, server row untouched.
+      srvId = Number(db.prepare("INSERT INTO accounts (username, domain, owner_id, home_dir, uid, gid, ip, plan_snapshot_json) VALUES ('srv', 'panel.example.com', 1, '/home/srv', 30002, 30002, '203.0.113.5', '{}')").run().lastInsertRowid);
+      db.prepare("INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, 'panel.example.com', 'main', '/home/srv/public_html')").run(srvId);
+      app.agent.calls.length = 0;
+      await expect(app.ctx.web.ensureVhost('srv', null)).rejects.toMatchObject({ status: 409, code: 'conflict' });
+      expect(app.agent.callsTo('web.vhost.write')).toEqual([]);
+      expect(app.agent.callsTo('web.phpfpm.pool.write')).toEqual([]);
+      expect(app.ctx.web.vhostFor('panel.example.com')).toMatchObject({ type: 'server', username: 'www-data', accountId: null, docroot: '/var/www/whm-default', status: 'applied' });
+      expect(db.prepare("SELECT COUNT(*) AS n FROM web_vhosts WHERE username = 'srv'").get().n).toBe(0);
+      // www.<hostname> as an alias or an addon domain of another account is refused the same way.
+      await expect(app.ctx.web.addAlias({ username: 'alice', alias: 'www.panel.example.com' }, null)).rejects.toMatchObject({ status: 409 });
+      expect(app.ctx.web.vhostFor('example.com').aliases).not.toContain('www.panel.example.com');
+      const aliceId = db.prepare("SELECT id FROM accounts WHERE username = 'alice'").get().id;
+      db.prepare("INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, 'www.panel.example.com', 'addon', '/home/alice/public_html/www')").run(aliceId);
+      try {
+        await expect(app.ctx.web.ensureVhost('alice', null)).rejects.toMatchObject({ status: 409 });
+        expect(app.ctx.web.vhostFor('www.panel.example.com')).toBeNull();
+      } finally { db.prepare("DELETE FROM account_domains WHERE domain = 'www.panel.example.com'").run(); }
+      // A stale 'server' row for a domain that is no longer the hostname is still never taken over by an account.
+      db.prepare("DELETE FROM account_domains WHERE account_id = ?").run(srvId);
+      db.prepare("UPDATE accounts SET domain = 'srv.example.net' WHERE id = ?").run(srvId);
+      db.prepare("INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, 'srv.example.net', 'main', '/home/srv/public_html')").run(srvId);
+      db.prepare("INSERT INTO web_vhosts (domain, account_id, username, type, docroot, aliases_json, redirects_json, custom_directives, status) VALUES ('srv.example.net', NULL, 'www-data', 'server', '/var/www/whm-default', '[]', '[]', '', 'applied')").run();
+      await expect(app.ctx.web.ensureVhost('srv', null)).rejects.toMatchObject({ status: 409 });
+      db.prepare("DELETE FROM web_vhosts WHERE domain = 'srv.example.net'").run();
+      // A row another owner wrote for bob's domain is treated as absent: its certificate and directives are not inherited.
+      db.prepare(`INSERT INTO web_vhosts (domain, account_id, username, type, docroot, aliases_json, redirects_json, ssl_json, custom_directives, ipv6, status) VALUES ('bob.example.org', NULL, 'mallory', 'main', '/home/mallory/public_html', '[]', '[]', '{"cert":"/etc/ssl/whm/panel.example.com/cert.pem","key":"/etc/ssl/whm/panel.example.com/key.pem"}', 'Header set X-Owned 1', '2001:db8::7', 'applied')
+        ON CONFLICT (domain) DO UPDATE SET username = excluded.username, type = excluded.type, docroot = excluded.docroot, ssl_json = excluded.ssl_json, custom_directives = excluded.custom_directives, ipv6 = excluded.ipv6`).run();
+      app.agent.calls.length = 0;
+      const bob = await app.ctx.web.ensureVhost('bob', null);
+      expect(bob.applied).toBe(true);
+      const write = app.agent.callsTo('web.vhost.write').find((c) => c.args.domain === 'bob.example.org').args;
+      expect(write).toMatchObject({ user: 'bob', docroot: '/home/bob/public_html', customDirectives: '', redirectHttps: false });
+      expect(write.ssl).toBeUndefined();
+      expect(write.ipv6).toBeUndefined();
+      expect(app.ctx.web.vhostFor('bob.example.org')).toMatchObject({ username: 'bob', ssl: null, customDirectives: '', ipv6: null });
+    } finally {
+      if (srvId != null) { db.prepare('DELETE FROM account_domains WHERE account_id = ?').run(srvId); db.prepare('DELETE FROM accounts WHERE id = ?').run(srvId); }
+      db.prepare("DELETE FROM web_vhosts WHERE username IN ('srv', 'mallory') OR type = 'server'").run();
+      app.ctx.settings.setMany({ 'basic.hostname': previousHostname, 'basic.main_ip': '' });
+    }
+  });
+
   it('setRedirects, addAlias/removeAlias, setAccountIpv6, replaceIp, setPhpVersion and setListenPorts', async () => {
     await app.ctx.web.setRedirects('example.com', [{ from: '/', to: 'https://new.example.com', type: '301', matchWww: true, keepPath: true }], null);
     expect(app.agent.callsTo('web.vhost.write').pop().args.redirects).toEqual([{ from: '/', to: 'https://new.example.com', type: '301', matchWww: true, keepPath: true }]);

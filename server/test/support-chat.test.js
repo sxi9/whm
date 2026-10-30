@@ -161,6 +161,25 @@ describe('Account Conversations API', () => {
     await root.http.get('/api/support/chat/not%20a%20user').expect(422);
   });
 
+  it('failed posts leave no message text in the audit log', async () => {
+    const probe = (n) => `SECRET-PROBE-${n} ${'z'.repeat(n)}`;
+    const before = app.ctx.db.prepare('SELECT MAX(id) AS id FROM audit_log').get().id;
+    await resell1.http.post('/api/support/chat/bob/messages').set('X-CSRF-Token', resell1.csrf).send({ body: probe(10) }).expect(404);
+    await alice.http.post('/api/support/chat/bob/messages').set('X-CSRF-Token', alice.csrf).send({ body: probe(20) }).expect(404);
+    await root.http.post('/api/support/chat/alice/messages').set('X-CSRF-Token', root.csrf).send({ body: probe(MESSAGE_MAX_CHARS) }).expect(422);
+    await root.http.post('/api/support/chat/alice/messages').set('X-CSRF-Token', root.csrf).send({ body: `SECRET-PROBE-nul\0x` }).expect(422);
+    await root.http.post('/api/support/chat/alice/messages').set('X-CSRF-Token', root.csrf).send({ text: 'SECRET-PROBE-shape' }).expect(422);
+    await root.http.post('/api/support/chat/not%20a%20user/messages').set('X-CSRF-Token', root.csrf).send({ body: 'SECRET-PROBE-param' }).expect(422);
+    const rows = app.ctx.db.prepare('SELECT action, args_redacted, result FROM audit_log WHERE id > ? ORDER BY id').all(before);
+    expect(rows.map((r) => r.action)).toEqual(Array(6).fill('POST /api/support/chat/:username/messages'));
+    expect(rows.map((r) => r.result)).toEqual(['error:404', 'error:404', 'error:422', 'error:422', 'error:422', 'error:422']);
+    for (const r of rows) {
+      expect(r.args_redacted).not.toMatch(/SECRET|zzz/);
+      expect(Object.keys(JSON.parse(r.args_redacted))).toEqual(['chars']);
+    }
+    expect(rows.map((r) => JSON.parse(r.args_redacted).chars)).toEqual([probe(10).length, probe(20).length, probe(MESSAGE_MAX_CHARS).length, 18, 0, 18]);
+  });
+
   it('pages a thread backwards with before/limit', async () => {
     const latest = await root.http.get('/api/support/chat/alice?limit=2').expect(200);
     expect(latest.body.data.messages).toHaveLength(2);

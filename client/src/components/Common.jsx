@@ -79,7 +79,9 @@ export function EmptyState({ title, children, icon: Icon = Info }) {
 
 // Shown when the API says the feature's daemon is missing on this host.
 // Labels for the capabilities the stack catalog (server/src/lib/stack-catalog.js)
-// can install; anything else falls back to the capability key.
+// can install; the Install button is offered for these only, since
+// /system/capabilities/:cap/install answers 404 for anything else (sshd,
+// systemd, tar, the package manager itself).
 export const CAPABILITY_LABELS = {
   apache: 'Apache', php: 'PHP', nginx: 'NGINX', mysql: 'MariaDB', postgres: 'PostgreSQL', bind: 'BIND', exim: 'Exim', dovecot: 'Dovecot', ftp: 'Pure-FTPd',
   spamassassin: 'SpamAssassin', clamav: 'ClamAV', modsecurity: 'ModSecurity', acme: 'Certbot', quota: 'quota tools', firewall: 'the firewall', awstats: 'AWStats',
@@ -98,11 +100,12 @@ export function CapabilityNotice({ error, onRetry, capability }) {
   if (!error) return null;
   if (error.code !== 'capability_missing' && error.code !== 'binary_not_found' && error.status !== 501) return null;
   const cap = capability || error.capability || null;
-  const label = cap ? CAPABILITY_LABELS[cap] || cap : null;
+  const label = cap && Object.hasOwn(CAPABILITY_LABELS, cap) ? CAPABILITY_LABELS[cap] : null;
+  const installable = Boolean(label) && isRoot;
   const start = async () => {
     setInstall({ jobId: null, busy: true, error: null, done: false });
     try {
-      const { data } = await api.post(`/system/capabilities/${cap}/install`);
+      const { data } = await api.post(`/system/capabilities/${encodeURIComponent(cap)}/install`);
       setInstall({ jobId: data.job.id, busy: false, error: null, done: false });
     } catch (err) { setInstall({ jobId: null, busy: false, error: err, done: false }); }
   };
@@ -116,14 +119,14 @@ export function CapabilityNotice({ error, onRetry, capability }) {
       <div style={{ flex: 1, minWidth: 0 }}>
         <strong>Service not installed</strong>
         <p>{error.message}</p>
-        {cap && isRoot
+        {installable
           ? <p className="muted">Install {label} from here with the server's package manager, or do it by hand via <Link to="/software/install-distro-packages">Install Distro Packages</Link>. The rest of the panel keeps working meanwhile.</p>
           : <p className="muted">Install the required software on this server (for example via <Link to="/software/install-distro-packages">Install Distro Packages</Link>) and refresh. The rest of the panel keeps working.</p>}
         {install.error && <p className="field-message">{install.error.message}</p>}
         {install.jobId && <ProgressLog jobId={install.jobId} onFinished={finished} />}
       </div>
       <div className="row-actions" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-        {cap && isRoot && !install.jobId && <button className="btn btn-sm btn-primary" onClick={start} disabled={install.busy}>{install.busy ? 'Starting…' : `Install ${label}`}</button>}
+        {installable && !install.jobId && <button className="btn btn-sm btn-primary" onClick={start} disabled={install.busy}>{install.busy ? 'Starting…' : `Install ${label}`}</button>}
         {onRetry && <button className="btn btn-sm" onClick={onRetry}>Re-check</button>}
       </div>
     </div>

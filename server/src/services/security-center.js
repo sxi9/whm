@@ -1160,8 +1160,10 @@ export function createSecurityCenterService(ctx) {
   const externalAuth = {
     shape(row) {
       if (!row) return null;
-      const discovery = json.parse(row.discovery_json, null);
-      return { id: row.id, name: row.name, displayName: row.display_name, issuerUrl: row.issuer_url, clientId: row.client_id, hasClientSecret: Boolean(row.client_secret_enc), scopes: row.scopes, enabled: Boolean(row.enabled), discovery, preset: discovery?.preset || null, links: stmts.providerLinks.get(row.id).n, createdAt: row.created_at, updatedAt: row.updated_at };
+      // After an issuer edit the row only remembers its preset: discovery is not run.
+      const stored = json.parse(row.discovery_json, null);
+      const discovery = stored?.authorizationEndpoint ? stored : null;
+      return { id: row.id, name: row.name, displayName: row.display_name, issuerUrl: row.issuer_url, clientId: row.client_id, hasClientSecret: Boolean(row.client_secret_enc), scopes: row.scopes, enabled: Boolean(row.enabled), discovery, preset: stored?.preset || null, links: stmts.providerLinks.get(row.id).n, createdAt: row.created_at, updatedAt: row.updated_at };
     },
     list: () => stmts.providers.all().map(externalAuth.shape),
     // The redirect URI auth.js sends is built from the origin the browser used,
@@ -1175,15 +1177,14 @@ export function createSecurityCenterService(ctx) {
       };
     },
     // Discovery for a preset: the vendor's document, with pinned endpoints
-    // filling what it omits, validated against the resolved issuer (or the one
+    // filling what a fetched document omits (never standing in for one that
+    // could not be fetched), validated against the resolved issuer (or the one
     // the vendor declares when the preset says that form is authoritative).
     async presetDiscovery(preset, issuerUrl, { allowForeignEndpoints = false } = {}) {
       const url = `${issuerUrl}/.well-known/openid-configuration`;
-      let doc = null;
-      let fetchError = null;
-      try { doc = await fetchJson(url, { timeoutMs: 10_000 }); } catch (err) { fetchError = err; }
-      if (preset.endpoints) doc = { ...(doc && typeof doc === 'object' ? doc : {}), ...preset.endpoints };
-      if (!doc) throw badRequest(`OpenID discovery failed for ${url}: ${fetchError.message}`);
+      let doc;
+      try { doc = await fetchJson(url, { timeoutMs: 10_000 }); } catch (err) { throw badRequest(`OpenID discovery failed for ${url}: ${err.message}`); }
+      if (preset.endpoints && doc && typeof doc === 'object' && !Array.isArray(doc)) doc = { ...doc, ...preset.endpoints };
       let issuer = issuerUrl;
       if (preset.issuerFromDiscovery && typeof doc.issuer === 'string' && new RegExp(preset.issuerFromDiscovery).test(stripSlash(doc.issuer))) issuer = stripSlash(doc.issuer);
       const discovery = checkDiscoveryDocument(doc, issuer, { allowForeignEndpoints, allowedForeignHosts: preset.foreignHosts || [] });
@@ -1221,10 +1222,12 @@ export function createSecurityCenterService(ctx) {
       const row = stmts.providerByName.get(name);
       if (!row) throw notFound('Provider');
       const issuer = input.issuerUrl ? input.issuerUrl.replace(/\/+$/, '') : row.issuer_url;
+      const preset = json.parse(row.discovery_json, null)?.preset || null;
       stmts.updateProvider.run({
         id: row.id, display_name: input.displayName ?? row.display_name, issuer_url: issuer, client_id: input.clientId ?? row.client_id,
         client_secret_enc: input.clientSecret ? crypto.encrypt(input.clientSecret) : row.client_secret_enc, scopes: input.scopes ?? row.scopes,
-        enabled: input.enabled == null ? row.enabled : input.enabled ? 1 : 0, discovery_json: issuer === row.issuer_url ? row.discovery_json : null,
+        enabled: input.enabled == null ? row.enabled : input.enabled ? 1 : 0,
+        discovery_json: issuer === row.issuer_url ? row.discovery_json : preset ? JSON.stringify({ preset }) : null,
       });
       req?.audit?.({ action: 'security.external_auth.update', target: name, args: input });
       return externalAuth.get(name);

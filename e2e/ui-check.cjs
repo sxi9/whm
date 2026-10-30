@@ -14,6 +14,7 @@ const DATE = new Date().toISOString().slice(0, 10);
 let SHA = process.env.GIT_SHA || '';
 if (!SHA) { try { SHA = require('child_process').execSync('git rev-parse --short HEAD', { cwd: path.join(__dirname, '..') }).toString().trim(); } catch { SHA = 'working-tree'; } }
 const LABELS = {
+  '02a-setup-wizard': 'First-run setup wizard (new servers)',
   '01-login': 'Login', '02-dashboard': 'Home dashboard', '03-create-account-form': 'Create a New Account — form', '04-create-account-result': 'Create a New Account — result',
   '05-list-accounts': 'List Accounts', '06-service-status': 'Service Status', '07-server-information': 'Server Information', '08-feature-manager': 'Feature Manager',
   '09-tweak-settings': 'Tweak Settings', '10-wp-toolkit-plugin': 'WP Toolkit (bundled plugin page)', '11-sidebar-search': 'Sidebar search',
@@ -48,7 +49,14 @@ async function stamp(page, text) {
   await page.fill('#username', 'root');
   await page.fill('#password', PASSWORD);
   await page.click('button[type=submit]');
-  await page.waitForSelector('.home', { timeout: 15000 });
+  // A fresh database sends root to the first-run setup wizard; capture it, then skip it.
+  await page.waitForSelector('.setup-steps, .home', { timeout: 15000 });
+  if (await page.$('.setup-steps')) {
+    await page.waitForTimeout(400);
+    await shot('02a-setup-wizard');
+    await page.click('button:has-text("Skip for now")');
+    await page.waitForSelector('.home', { timeout: 15000 });
+  }
   await page.waitForSelector('.kv', { timeout: 15000 });
   await shot('02-dashboard');
   await stamp(page, `WHM › Home dashboard (full page) · ${DATE} · ${SHA}`);

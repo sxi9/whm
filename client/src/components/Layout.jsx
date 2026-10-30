@@ -9,6 +9,21 @@ import { useBranding, useBrandingLoader } from '../pages/cpanel/branding.js';
 import { LicenseBanner } from '../pages/server-configuration/LicenseTab.jsx';
 import { RevocationBanner } from './RevocationBanner.jsx';
 
+export const LICENSE_PATH = '/server-configuration/basic-webhost-manager-setup';
+
+// Where the shell sends a signed-in user before any page renders, or null.
+// The order is the order the server enforces: password, 2FA, then the first-run
+// wizard. While an enforced license is degraded the API refuses the wizard's
+// mutations, so the License tab (the only place that activates one) stays
+// reachable instead of bouncing back to /setup.
+export function shellRedirect(user, pathname) {
+  if (user.mustChangePassword && pathname !== '/change-password') return '/change-password';
+  if (user.mustEnroll2fa && !['/security-center/two-factor-authentication', '/change-password'].includes(pathname)) return '/security-center/two-factor-authentication';
+  const licenseBlocked = Boolean(user.license?.enforce && user.license?.degraded);
+  if (user.setupPending && pathname !== '/setup' && !(licenseBlocked && pathname === LICENSE_PATH)) return '/setup';
+  return null;
+}
+
 export function Layout() {
   const { user, ready } = useAuth();
   const location = useLocation();
@@ -22,12 +37,8 @@ export function Layout() {
 
   if (!ready) return <div className="app-loading"><Loading text="Starting WHM…" /></div>;
   if (!user) return <Navigate to="/login" state={{ from: location.pathname }} replace />;
-  if (user.mustChangePassword && location.pathname !== '/change-password') return <Navigate to="/change-password" replace />;
-  if (user.mustEnroll2fa && !['/security-center/two-factor-authentication', '/change-password'].includes(location.pathname)) {
-    return <Navigate to="/security-center/two-factor-authentication" replace />;
-  }
-  // First root login: the setup wizard runs until it completes or is skipped.
-  if (user.setupPending && location.pathname !== '/setup') return <Navigate to="/setup" replace />;
+  const redirect = shellRedirect(user, location.pathname);
+  if (redirect) return <Navigate to={redirect} replace />;
 
   return (
     <PluginNavProvider enabled={!user.mustChangePassword && !user.mustEnroll2fa}>

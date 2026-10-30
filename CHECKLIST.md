@@ -8,7 +8,8 @@
 
 ## Current state
 
-- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-27 09:00 UTC · **the building session ended here — continue from `HANDOFF.md` §4**
+- **Branch:** `claude/pensive-curie-9r0rcx` (continues `claude/trusting-cori-ifp7wy`) · **Last updated:** 2026-10-30 · **owner asks 2026-10-29:** application hosting first, then the 26-item live-server issue list (session upload), then a full audit — see *Owner's issue list* below
+- **2026-10-29/30:** Phase-6 verifier run done (11 confirmed findings fixed, `50d0f14`); **category 31 Application Manager landed** (`81417ea`, 3 functions); platform-fixes round 1 for the issue list built (9 units: installer profiles + install-from-panel + setup wizard, HTTPS/hostname/branded pages, super admin + hidden hub + hub authenticator, external-auth presets, Cloudflare DNS, account manager + chat (Support › Account Conversations → 216 functions), terminal latency, quota page, HST Panel rename) — review + fix round in progress; screenshots refreshed with the new pages.
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
 - **Tests (06:50 on the 27th):** server 1135 / agent 462 / client 48 / hub 177 / hub-ui 97 / SDK 73 / sample plugin 13 / bundled plugins ×4 — all green (`npm test` runs every workspace, the SDK, the sample plugin and the bundled plugins); both builds (client, hub/ui), boot and Playwright pass.
@@ -53,8 +54,12 @@ a fix round ~15 min; most categories need one fix round.
 | Live hub + panel end-to-end flow (`e2e/live-hub-flow.sh`: hub with generated keys + TLS → trial activation + key pinning + check-in → developer registration, e-mail verify, TOTP, namespace, signed upload, admin review, hub signing, publish → provider enable → install → pending_consent → consent → revoke → disable + banner + audit → update 1.1.1 held for consent) | done — 11/11 steps PASS on the first live run, **no code fix needed**; reviewer re-ran it green; Playwright steps 15–17 + full screenshot refresh (`974cb94`) | 45 min | 08:10 (27th) |
 | Install guide + user manual (`docs/INSTALL.md` 903 lines; `docs/MANUAL.md` + `MANUAL-partB.md` 2936 lines: every flag/env var, all 212 functions, hub portals, plugins, licensing, troubleshooting; accuracy reviewer fixed 10 findings) — user ask 07:40 | done | 55 min | 08:35 (27th) |
 | **P6** — hardening: three audits done (36 findings: 21 fixed with tests, 8 accepted risks, 7 deferred — list in `HANDOFF.md` §4); Security Advisor PHP-advisory rule (CVE-2026-109618/109619) + perf indexes landed `b01bd30` | audits done 08:50; full gate green 09:05; **verifier not run — session ended** | 30 min | 09:05 (27th) |
-| Remaining (next session): verify the Phase-6 fixes with the full gate, close the 7 deferred items, tick P6 | pending | ~2 h | — |
-| **Total remaining** | | **~2 h** of ordinary engineering (see `HANDOFF.md` §4) | |
+| Phase-6 verification (49 agents: 3 areas × lenses, 3 refuters per finding, docs check, critic) → 11 confirmed findings fixed with tests (`50d0f14`); fresh-clone gate fixes | done | 2 h | 2026-10-29 21:00 |
+| **Category 31 — Application Manager** (design `docs/design/application-manager.md`; agent family `app.*`, `ctx.apps`, migration 033, 3 pages, 15 presets; 2 review lenses + fix round, 21 findings closed; gate server 1201 / agent 547 / client 74) — owner ask | done, `81417ea` | 3 h | 2026-10-29 21:20 |
+| **Platform fixes round 1** — the owner's 26-item issue list as 9 units (U1 installer/stack/setup wizard/install-from-panel, U2 HTTPS/hostname/branded pages, U3 HST Panel rename, U4 super admin + hidden hub + hub TOTP, U5 external-auth presets, U6 Cloudflare DNS, U7 account manager + chat, U8 terminal latency, U9 quota page) — 13 reviews, ~55 findings verified, fix round | built; review + fix round running (`wf_d0005cdd-38a`) | ~6 h | 2026-10-30 |
+| Full audit bug-hunt (lens × scope finders until dry, 3 refuters each, grouped fixes) — owner ask | pending | ~4 h | — |
+| Final gate + screenshots + HANDOFF/CLAUDE.md rewrite (correction notes from the verifier's docs check) | pending | 1 h | — |
+| **Total remaining** | | **~5 h** (fix round, audit, final gate) | |
 
 Faster option: verification can be cut to one reviewer and one fix round per category
 (~30% less time, less thorough). Not applied unless requested.
@@ -91,7 +96,41 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [x] `hub/license/`, `hub/marketplace/` (181 node:test cases) and `hub/ui/` (105 tests; vendor admin, developer and reseller portals) — built, reviewed, fix round closed (`e49e500`); live hub+panel end-to-end flow in progress
 - `plugins/sdk/pack.js` + `scripts/build-plugin.js` — pack/sign/verify `.whmplugin` packages (parity-tested against the host) — done (round 1)
 
-## Functions — all 31 categories (215)
+## Owner's issue list (2026-10-29, live server 3.7.253.240) — status
+
+Legend: **done** = built, tested, in the tree · **built** = built by the platform-fixes round, review/fix running · **partial** · **open**.
+
+| # | Finding | Status / where |
+|---|---|---|
+| 1 | Installer does not ask which stack to install (2 presets + manual) | built — `scripts/install.sh --stack full\|web\|none` + interactive menu; `whm-cli install-stack`; first-login setup wizard (`/setup`) |
+| 2 | Missing services show Restart instead of Install | built — Service Manager: Install / Repair actions, server stack card |
+| 3 | Refresh package index shows the job but no list | done — switches to the Installed packages tab after the job |
+| 4 | Initial Quota Setup has extra cards | built — two cards (Summary, Filesystems), manual steps behind a disclosure |
+| 5 | HTTPS by default everywhere | built — panel 2086→2087 redirect (`panel.force_https`), vhost HTTP→HTTPS when a certificate exists (`web.force_https`), ACME path exempt |
+| 6 | `timedatectl` rejects Asia/Calcutta | done — host zone list (`sys.time.zones`), ICU legacy ids mapped to current names |
+| 7 | Statistics Software Configuration says "not installed" with no install button | built — per-generator Install buttons (install-from-panel) |
+| 8 | Web terminal slow and laggy | built — long-polled `terminal.read` (waitMs), input wake-up, 16 ms client flush |
+| 9 | WHM Marketplace "Install" redirects instead of installing | built — installs the host packages inline with a job log |
+| 10 | Install missing services directly; Repair broken ones | built — same as 2 (`svc.reset_failed` + restart + journal tail) |
+| 11 | SMTP Restrictions: iptables RULE_APPEND failed (nf_tables) | done — REJECT rule carries `-p tcp` (`agent/test/sec-smtp.test.js`) |
+| 12 | External authentication presets (Google, Meta, Apple, Cloudflare…) | built — preset cards: Google, Microsoft, Apple, Meta, Cloudflare Access, GitLab, Auth0/Okta/Keycloak/generic; GitHub listed as unsupported (no OIDC) |
+| 13 | ModSecurity configuration/tools/vendors "not installed" | built — Install button on the three pages (capability `modsecurity` → packages) |
+| 14 | Contact Manager: Exim not installed | built — Install Exim from the notice |
+| 15 | No mail transport in System Mail Preferences | built — same install path |
+| 16 | Apache Configuration shows not installed | built — Install Apache from the notice; stack profile installs it |
+| 17 | Account manager on create/modify + support chat | built — `accounts.manager_user_id`, Support › Account Conversations (manager ↔ account), migration 034 |
+| 18 | Rename cPanel → HST Panel | built — `client/src/brand.js`, labels renamed with stable slugs, user-visible strings and manuals |
+| 19 | First install asks which services to use | built — setup wizard step "Services" (profiles Full / Web + database / Manual) |
+| 20 | Two CLI commands: default stack install, manual selection | built — `whm-cli install-stack --profile full` / `--select …` and `install.sh --stack` |
+| 21 | Branded index/welcome page for new sites and the hostname, editable | built — templates `index` + `landing` (Web Template Editor), hostname landing vhost; license-group option deferred to the hub |
+| 22 | Hostname records recreated + SSL installed automatically | built — Change Hostname: A/AAAA/www records, certificate step (ACME) installed for panel/exim/dovecot/ftp |
+| 23 | Cloudflare DNS management | built — DNS Zone Manager › Cloudflare (token, link/import/push, sync log), migration 035 |
+| 24 | Hide the license hub from everyone but the super admin; password-protected setup command | built — `users.superadmin`, `whm-cli superadmin` gated by the setup password (`superadmin.key`), License tab/hub origin hidden for other roots |
+| 25 | Installer: company logo, friendlier flow | built — banner + guided prompts in `install.sh` |
+| 26 | Hub: `licserver.hostingsignal.in` default, hidden calls, authenticator support on all dashboards | built — default URLs, server-side-only hub calls, TOTP enrolment/login/step-up for vendor + reseller portal users |
+| — | "Full audit, find more bugs" | pending — `full-audit` workflow after the fix round |
+
+## Functions — all 31 categories (216)
 
 ### 1. Server Configuration
 - [x] Basic WebHost Manager Setup
@@ -112,6 +151,7 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [x] Create Support Ticket
 - [x] Grant cPanel Support Access
 - [x] Support Center
+- [x] Account Conversations *(our addition 2026-10-29: one thread per account between the account manager and the account)*
 
 ### 3. Networking Setup
 - [x] Change Hostname

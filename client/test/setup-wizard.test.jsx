@@ -16,9 +16,10 @@ vi.mock('../src/hooks/useApi.js', () => ({
   useMutation: (fn) => ({ mutate: fn, loading: false, error: null, fieldErrors: null, reset: () => {} }),
 }));
 
-const { default: SetupPage, SETUP_STEPS, PRODUCT, WelcomeStep, BasicsStep, ServicesStep, InstallStep, DoneStep, StepBar } = await import('../src/pages/Setup.jsx');
+const { default: SetupPage, SETUP_STEPS, PRODUCT, WelcomeStep, BasicsStep, ServicesStep, InstallStep, DoneStep, StepBar, LicenseGateCard } = await import('../src/pages/Setup.jsx');
 const { CapabilityNotice, CAPABILITY_LABELS } = await import('../src/components/Common.jsx');
 const { StackCard } = await import('../src/pages/server/ServiceManager.jsx');
+const { shellRedirect, LICENSE_PATH } = await import('../src/components/Layout.jsx');
 
 React.useLayoutEffect = React.useEffect;
 const render = (el) => renderToStaticMarkup(<ToastProvider><ConfirmProvider><MemoryRouter initialEntries={['/setup']}>{el}</MemoryRouter></ConfirmProvider></ToastProvider>);
@@ -36,8 +37,9 @@ const stack = {
     { key: 'mysql', label: 'MariaDB (MySQL) server', description: 'db', capability: 'mysql', service: 'mysql', recommended: true, packages: ['mariadb-server'], units: ['mariadb'], unit: null, installed: false, active: null, requires: null },
     { key: 'exim', label: 'Exim mail transfer agent', description: 'mail', capability: 'exim', service: 'exim', recommended: true, packages: ['exim4-daemon-heavy'], units: ['exim4'], unit: null, installed: false, active: null, requires: 'Needs the EPEL repository' },
   ],
-  lastJob: null,
+  installing: false, activeJob: null, lastJob: null,
 };
+const running = { ...stack, installing: true, activeJob: { id: 42, type: 'stack.install', status: 'running', progress: 30, message: 'Installing PHP (PHP-FPM + common extensions)' } };
 
 describe('Setup wizard', () => {
   it('names the product and lists the five steps in order', () => {
@@ -100,6 +102,18 @@ describe('Setup wizard', () => {
     expect(after).toContain('progress-log');
     const partial = render(<InstallStep selection={{ profile: 'web', components: [] }} jobId={8} onStarted={() => {}} result={{ status: 'done', result: { failed: ['exim'] } }} onResult={() => {}} onNext={() => {}} onBack={() => {}} />);
     expect(partial).toContain('Failed: exim');
+    // Another installation is running: Start waits, the job can be followed instead.
+    apiData['/system/stack'] = running;
+    const blocked = render(<InstallStep selection={{ profile: 'full', components: [] }} jobId={null} onStarted={() => {}} result={null} onResult={() => {}} onNext={() => {}} onBack={() => {}} />);
+    expect(blocked).toContain('An installation is already running');
+    expect(blocked).toContain('Job #42 (stack.install) is running: Installing PHP');
+    expect(blocked).toContain('Follow it');
+    expect(blocked).toMatch(/<button[^>]*disabled=""[^>]*>Start installation<\/button>/);
+    expect(blocked).not.toContain('You can leave this page');
+    const following = render(<InstallStep selection={{ profile: 'full', components: [] }} jobId={42} onStarted={() => {}} result={null} onResult={() => {}} onNext={() => {}} onBack={() => {}} />);
+    expect(following).not.toContain('An installation is already running');
+    expect(following).toContain('progress-log');
+    apiData['/system/stack'] = stack;
     const done = render(<DoneStep result={{ status: 'done' }} onFinish={() => {}} busy={false} />);
     expect(done).toContain('HST Panel is ready.');
     expect(done).toContain('Go to the dashboard');
@@ -117,8 +131,19 @@ describe('CapabilityNotice install button', () => {
     expect(CAPABILITY_LABELS.modsecurity).toBe('ModSecurity');
     const fromError = render(<CapabilityNotice error={{ status: 501, code: 'capability_missing', capability: 'modsecurity', message: 'ModSecurity is not installed' }} />);
     expect(fromError).toContain('Install ModSecurity');
-    const unknownCap = render(<CapabilityNotice error={{ code: 'capability_missing', capability: 'frobnicator', message: 'x' }} />);
-    expect(unknownCap).toContain('Install frobnicator');
+  });
+
+  it('offers no button for a capability the stack catalog cannot install (the API would answer 404)', () => {
+    for (const cap of ['frobnicator', 'pkg', 'sshd', 'systemd', 'tar', 'ssl', 'wpcli', '../x']) {
+      const html = render(<CapabilityNotice error={{ status: 501, code: 'capability_missing', capability: cap, message: `${cap} is missing` }} />);
+      expect(html, cap).not.toContain('btn-primary');
+      expect(html, cap).not.toContain(`Install ${cap}`);
+      expect(html, cap).toContain('Install the required software on this server');
+      expect(html, cap).toContain('Install Distro Packages');
+    }
+    expect(render(<CapabilityNotice capability="pkg" error={{ code: 'capability_missing', message: 'No supported package manager' }} onRetry={() => {}} />)).not.toContain('Install pkg');
+    expect(Object.hasOwn(CAPABILITY_LABELS, 'pkg')).toBe(false);
+    expect(Object.hasOwn(CAPABILITY_LABELS, 'sshd')).toBe(false);
   });
 
   it('shows no install button without a capability or for a non-root user', () => {
@@ -147,5 +172,61 @@ describe('Service Manager stack card', () => {
     expect(html).toContain('running');
     const bare = render(<StackCard stack={{ data: { ...stack, packageManager: null, pkgAvailable: false }, loading: false, error: null, refetch: () => {} }} busy={null} onInstall={() => {}} />);
     expect(bare).toContain('cannot install software here');
+  });
+
+  it('disables every install button while another installation runs and says which job it is', () => {
+    const idle = render(<StackCard stack={{ data: stack, loading: false, error: null, refetch: () => {} }} busy={null} onInstall={() => {}} />);
+    expect(idle).toMatch(/<button[^>]*>Install full hosting stack \(recommended\)<\/button>/);
+    expect(idle).not.toMatch(/<button[^>]*disabled=""[^>]*>Install full hosting stack/);
+    expect(idle).not.toContain('already running');
+    const html = render(<StackCard stack={{ data: running, loading: false, error: null, refetch: () => {} }} busy={null} onInstall={() => {}} />);
+    expect(html).toContain('An installation is already running (job #42, stack.install, running: Installing PHP');
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Install full hosting stack \(recommended\)<\/button>/);
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Web \+ database only<\/button>/);
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Install selected \(0\)<\/button>/);
+  });
+});
+
+describe('shell redirects around the setup wizard', () => {
+  const root = { role: 'root', setupPending: true };
+  it('sends a pending root to /setup from everywhere but the wizard itself', () => {
+    expect(shellRedirect(root, '/')).toBe('/setup');
+    expect(shellRedirect(root, '/account-functions/create-a-new-account')).toBe('/setup');
+    expect(shellRedirect(root, LICENSE_PATH)).toBe('/setup');
+    expect(shellRedirect(root, '/setup')).toBeNull();
+    expect(shellRedirect({ role: 'root', setupPending: false }, '/')).toBeNull();
+    expect(shellRedirect({ ...root, mustChangePassword: true }, '/setup')).toBe('/change-password');
+    expect(shellRedirect({ ...root, mustEnroll2fa: true }, '/setup')).toBe('/security-center/two-factor-authentication');
+    expect(shellRedirect({ role: 'root', mustEnroll2fa: true }, '/change-password')).toBeNull();
+    expect(shellRedirect({ ...root, mustEnroll2fa: true }, '/change-password')).toBe('/setup');
+  });
+
+  it('keeps the License tab reachable while an enforced license is degraded, and only then', () => {
+    const unlicensed = { ...root, license: { status: 'unlicensed', enforce: true, degraded: true } };
+    expect(shellRedirect(unlicensed, LICENSE_PATH)).toBeNull();
+    expect(shellRedirect(unlicensed, '/')).toBe('/setup');
+    expect(shellRedirect(unlicensed, '/setup')).toBeNull();
+    expect(shellRedirect({ ...root, license: { status: 'unlicensed', enforce: false, degraded: true } }, LICENSE_PATH)).toBe('/setup');
+    expect(shellRedirect({ ...root, license: { status: 'active', enforce: true, degraded: false } }, LICENSE_PATH)).toBe('/setup');
+    expect(shellRedirect({ ...root, license: { status: 'grace', enforce: true, degraded: false } }, LICENSE_PATH)).toBe('/setup');
+  });
+
+  it('shows the license gate card in the wizard only while an enforced license is degraded', () => {
+    expect(render(<SetupPage />)).not.toContain('Activate the license first');
+    expect(render(<LicenseGateCard license={{ status: 'unlicensed', enforce: false, degraded: true }} />)).not.toContain('Activate the license first');
+    expect(render(<LicenseGateCard license={{ status: 'active', enforce: true, degraded: false }} />)).not.toContain('Activate the license first');
+    expect(render(<LicenseGateCard license={null} />)).not.toContain('Activate the license first');
+    auth.user = { ...auth.user, license: { status: 'unlicensed', enforce: true, degraded: true, action: `${LICENSE_PATH}#license` } };
+    try {
+      const html = render(<SetupPage />);
+      expect(html).toContain('Activate the license first');
+      expect(html).toContain('license is <strong>unlicensed</strong>');
+      expect(html).toContain(`href="${LICENSE_PATH}#license"`);
+      expect(html).toContain('Open the License tab');
+      expect(html).toContain('Skip for now');
+    } finally { auth.user = { id: 1, username: 'root', role: 'root', setupPending: true }; }
+    const expired = render(<LicenseGateCard license={{ status: 'expired', reason: 'token_expired', enforce: true, degraded: true }} />);
+    expect(expired).toContain('license is <strong>expired</strong> (token expired)');
+    expect(expired).toContain(`href="${LICENSE_PATH}"`);
   });
 });

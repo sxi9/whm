@@ -10,21 +10,30 @@ import { ChangeHostname } from '../../networking/ChangeHostname.jsx';
 
 const STEP_LABELS = { landing: 'Hostname landing page', certificate: 'Hostname certificate' };
 
+// A step is "pending" when the certificate was written but a service does not
+// read it from there yet (the panel listener's configured pair differs).
+const stepState = (s) => (s.ok ? (s.skipped ? 'skipped' : 'done') : s.pending?.length && !s.failed?.length ? 'pending' : 'failed');
+const PILL = { done: 'ok', skipped: 'disabled', pending: 'pending', failed: 'failed' };
+
 function CertificateSteps({ steps }) {
   return (
     <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
-      {steps.map((s) => (
-        <li key={s.step} style={{ display: 'flex', gap: 10, alignItems: 'flex-start', padding: '6px 0', borderBottom: '1px dashed var(--border)' }}>
-          <StatusPill status={s.ok ? (s.skipped ? 'disabled' : 'ok') : 'failed'}>{s.ok ? (s.skipped ? 'skipped' : 'done') : 'failed'}</StatusPill>
-          <div>
-            <strong>{STEP_LABELS[s.step] || s.step}</strong>
-            {s.detail && <div className="muted"><code>{s.detail}</code></div>}
-            {s.error && <div className="muted">{s.error}</div>}
-            {s.step === 'certificate' && s.capability === 'acme' && <div className="muted">Install certbot or acme.sh and pick it under <Link to="/ssl-tls/manage-autossl">Manage AutoSSL</Link>.</div>}
-            {s.step === 'certificate' && s.failed?.length > 0 && <div className="muted">Install it by hand for <strong>{s.failed.map((f) => f.service).join(', ')}</strong> from <Link to="/service-configuration/manage-service-ssl-certificates">Manage Service SSL Certificates</Link>.</div>}
-          </div>
-        </li>
-      ))}
+      {steps.map((s) => {
+        const state = stepState(s);
+        return (
+          <li key={s.step} style={{ display: 'flex', gap: 10, alignItems: 'flex-start', padding: '6px 0', borderBottom: '1px dashed var(--border)' }}>
+            <StatusPill status={PILL[state]}>{state}</StatusPill>
+            <div>
+              <strong>{STEP_LABELS[s.step] || s.step}</strong>
+              {s.detail && <div className="muted"><code>{s.detail}</code></div>}
+              {s.error && !s.pending?.length && <div className="muted">{s.error}</div>}
+              {s.step === 'certificate' && s.capability === 'acme' && <div className="muted">Install certbot or acme.sh and pick it under <Link to="/ssl-tls/manage-autossl">Manage AutoSSL</Link>.</div>}
+              {s.step === 'certificate' && s.failed?.length > 0 && <div className="muted">Install it by hand for <strong>{s.failed.map((f) => f.service).join(', ')}</strong> from <Link to="/service-configuration/manage-service-ssl-certificates">Manage Service SSL Certificates</Link>.</div>}
+              {s.step === 'certificate' && s.pending?.map((p) => <div key={p.service} className="muted"><strong>{p.service}</strong>: {p.error}</div>)}
+            </div>
+          </li>
+        );
+      })}
     </ul>
   );
 }
@@ -53,7 +62,9 @@ function HostnameCertificate() {
     try {
       const { data } = await api.post('/networking/hostname/certificate', {});
       setResult(data);
+      const pending = data.steps?.find((s) => s.step === 'certificate')?.pending?.length;
       if (data.ok) toast.success(`Certificate issued for ${data.hostname}`);
+      else if (pending && data.steps.every((s) => s.ok || s.pending?.length)) toast.warning(`Certificate issued for ${data.hostname}, but a service does not serve it yet; see below`);
       else toast.warning(`Certificate run for ${data.hostname} finished with problems; see below`);
       await refetch();
     } catch (err) { setError(err); toast.error(err); } finally { setBusy(false); }
@@ -61,12 +72,14 @@ function HostnameCertificate() {
 
   const cert = status?.certificate;
   const landing = status?.landing;
+  const renewal = status?.renewal;
   return (
-    <Card title="Hostname certificate and landing page" subtitle="Visitors who open the hostname see the branded landing page (Account Functions › Web Template Editor, template “landing”); the panel, mail and FTP services present the hostname certificate." actions={<Button variant="primary" onClick={reissue} loading={busy} disabled={!status?.configured || !status?.capability?.ssl}>Reissue hostname certificate</Button>}>
+    <Card title="Hostname certificate and landing page" subtitle="Visitors who open the hostname see the branded landing page (Account Functions › Web Template Editor, template “landing”; saving it re-renders the page); the panel, mail and FTP services present the hostname certificate, which is renewed by a daily pass once it enters the AutoSSL renewal window. The hostname can never be hosted by an account." actions={<Button variant="primary" onClick={reissue} loading={busy} disabled={!status?.configured || !status?.capability?.ssl}>Reissue hostname certificate</Button>}>
       {status && (
         <KeyValue items={[
           ['Certificate', cert ? <span key="c">{cert.issuer || 'unknown issuer'} {cert.expired ? <StatusPill status="failed">expired</StatusPill> : <StatusPill status={cert.autossl ? 'ok' : 'enabled'}>{cert.autossl ? 'AutoSSL' : cert.selfSigned ? 'self-signed' : 'installed'}</StatusPill>} <span className="muted">valid until {formatDate(cert.notAfter)}{cert.daysRemaining != null ? ` (${cert.daysRemaining} days)` : ''}</span></span> : <span key="c"><StatusPill status="warning">none for {status.configured || 'the hostname'}</StatusPill> <span className="muted">service certificates are self-signed until one is issued</span></span>],
-          ['Landing page', landing ? <span key="l"><StatusPill status={landing.status === 'applied' ? 'ok' : landing.status === 'pending' ? 'pending' : 'failed'}>{landing.status}</StatusPill> <code>{landing.docroot}</code>{landing.ssl ? ' over HTTPS' : ''}{landing.error ? <span className="muted"> — {landing.error}</span> : null}</span> : <span key="l" className="muted">not rendered yet; it is written when the hostname changes or the panel starts</span>],
+          ['Renewal', renewal ? <span key="n"><StatusPill status={renewal.enabled ? 'ok' : 'disabled'}>{renewal.enabled ? 'scheduled' : 'paused'}</StatusPill> <span className="muted">daily pass <code>{renewal.schedule}</code> ({renewal.cron}); re-issues and re-installs the certificate for the panel, Exim, Dovecot and FTP once {renewal.renewDays} days or fewer remain{renewal.enabled ? '' : '; resumes after the next issuance'}</span></span> : <span key="n" className="muted">no renewal schedule on this panel</span>],
+          ['Landing page', landing ? <span key="l"><StatusPill status={landing.status === 'applied' ? 'ok' : landing.status === 'pending' ? 'pending' : 'failed'}>{landing.status}</StatusPill> <code>{landing.docroot}</code>{landing.ssl ? ' over HTTPS' : ''}{landing.error ? <span className="muted"> — {landing.error}</span> : null}</span> : <span key="l" className="muted">not rendered yet; it is written when the hostname changes, the landing template is saved or the panel starts</span>],
           ['Resolves here', status.resolves ? (status.resolves.matches ? <StatusPill key="r" status="ok">yes</StatusPill> : <StatusPill key="r" status="warning">{status.resolves.answers?.length ? `resolves to ${status.resolves.answers.join(', ')}` : status.resolves.error || 'no answer'} — the certificate can only be issued once the DNS records point here</StatusPill>) : <span key="r" className="muted">not checked</span>],
           ['AutoSSL', status.capability?.ssl ? <span key="a">available — provider chosen under <Link to="/ssl-tls/manage-autossl">Manage AutoSSL</Link></span> : <span key="a" className="muted">SSL/TLS is not available on this panel</span>],
         ]} />

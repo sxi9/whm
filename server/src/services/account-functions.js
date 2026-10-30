@@ -30,7 +30,7 @@ const ADMIN_BRANDING_DEFAULTS = { company_name: 'WHM', tagline: 'WebHost Manager
 // web server configuration to reference once it does.
 export const TEMPLATE_USAGE = {
   index: { served: true, by: 'account creation: rendered into public_html/index.html of every new account' },
-  landing: { served: true, by: 'Service Configuration: rendered into /var/www/whm-default/index.html, the document root of the server hostname\'s own virtual host (re-rendered at boot and on every hostname change)' },
+  landing: { served: true, by: 'Service Configuration: rendered into /var/www/whm-default/index.html, the document root of the server hostname\'s own virtual host (re-rendered when this template is saved, at boot and on every hostname change)' },
   suspended: { served: false, by: 'not yet served: account suspension calls ctx.web.setSuspended(username, true, req) when Service Configuration provides it; until then the page is only written to the template directory and the Linux account lock is what stops logins' },
   moved: { served: false, by: 'not yet served: no virtual host references this page yet; it is only written to the template directory' },
   'error-4xx': { served: false, by: 'not yet served: the virtual host renderer does not set ErrorDocument to this page yet; it is only written to the template directory' },
@@ -242,7 +242,15 @@ export function createAccountFunctionsService(ctx) {
       const written = await tolerant('fs.write_file', { path: `${TEMPLATE_DIR}/${name}.html`, content: body, owner: 'root', mode: '0644', backup: true }, req);
       stmts.saveTemplate.run(name, body);
       audit(req, { action: 'account.template.save', target: name, args: { bytes: Buffer.byteLength(body), written: written.ok } });
-      return { ...templates.get(name), written: written.ok, writeError: written.error ?? null };
+      const out = { ...templates.get(name), written: written.ok, writeError: written.error ?? null };
+      // The landing page is live on the hostname vhost: re-render it now rather
+      // than at the next boot or hostname change.
+      if (name === 'landing' && typeof ctx.web?.ensureHostnameVhost === 'function') {
+        out.rendered = await ctx.web.ensureHostnameVhost(req)
+          .then((r) => ({ hostname: r.hostname ?? null, applied: Boolean(r.applied), landingPage: Boolean(r.landingPage), reason: r.reason ?? null, error: r.error ?? null }))
+          .catch((err) => ({ hostname: null, applied: false, landingPage: false, reason: err.code || 'error', error: err.message }));
+      }
+      return out;
     },
     async reset(name, req) { return templates.save(name, DEFAULT_TEMPLATES[name], req); },
     preview(name, vars = {}) {
