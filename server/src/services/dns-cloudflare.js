@@ -10,9 +10,21 @@ const TTL_AUTO = 1;
 const TTL_MIN = 60;
 const TTL_MAX = 86400;
 const MAX_PAGES = 100;
+const ZONES_PAGE = 50;
+// A retry never holds a job-worker slot longer than this; longer waits
+// (Cloudflare's Retry-After, later backoff steps) are deferred to a timer.
+const SLOT_WAIT_MS = 5_000;
+const MAX_RETRY_WAIT_MS = 60_000;
 
 const stripDot = (h) => String(h || '').trim().toLowerCase().replace(/\.$/, '');
 const withDot = (h) => `${stripDot(h)}.`;
+
+// Cloudflare stores IPv6 addresses compressed and lowercase; the diff key must
+// match whatever form the operator typed.
+export function canonicalIpv6(value) {
+  const s = String(value || '').trim();
+  try { return new URL(`http://[${s}]`).hostname.slice(1, -1); } catch { return s.toLowerCase(); }
+}
 
 // Cloudflare returns TXT content quoted ("a" "b" for long strings) since 2023
 // and accepts it either way; the panel stores the bare text.
@@ -57,7 +69,8 @@ export function fromCloudflareRecord(rec, domain) {
   let value;
   let priority = null;
   switch (type) {
-    case 'A': case 'AAAA': value = String(rec.content || '').trim(); break;
+    case 'A': value = String(rec.content || '').trim(); break;
+    case 'AAAA': value = canonicalIpv6(rec.content); break;
     case 'CNAME': case 'NS': case 'PTR': value = withDot(rec.content); break;
     case 'MX': value = withDot(rec.content); priority = rec.priority ?? rec.data?.priority ?? null; break;
     case 'TXT': value = unquoteTxt(rec.content); break;
@@ -106,7 +119,8 @@ export function toCloudflareRecord(rec, domain) {
   const payload = { type, name, ttl };
   let content;
   switch (type) {
-    case 'A': case 'AAAA': content = rec.value.toLowerCase(); payload.content = rec.value; break;
+    case 'A': content = rec.value.toLowerCase(); payload.content = rec.value; break;
+    case 'AAAA': content = canonicalIpv6(rec.value); payload.content = content; break;
     case 'CNAME': case 'NS': case 'PTR': content = stripDot(rec.value); payload.content = content; break;
     case 'MX': content = stripDot(rec.value); payload.content = content; payload.priority = Number(rec.priority ?? 0); break;
     case 'TXT': content = rec.value; payload.content = rec.value; break;
@@ -138,6 +152,9 @@ export function remoteKey(rec, domain) {
 // Minimal change set: pair desired and remote records by (type, name, content);
 // paired records are updated only when ttl/priority differ, unpaired desired
 // ones are created and unpaired remote ones (of managed types) deleted.
+// Cloudflare pins proxied (orange-cloud) records to ttl Auto, so their TTL is
+// never compared or sent; the names whose explicit TTL was ignored are listed
+// in `proxiedTtl` so the job can say so once.
 export function diffRecords(desired, remote, domain) {
   const pool = new Map();
   for (const r of remote) {
@@ -150,18 +167,22 @@ export function diffRecords(desired, remote, domain) {
   const updates = [];
   let unchanged = 0;
   const clamped = [];
+  const proxiedTtl = [];
   for (const rec of desired) {
     const d = toCloudflareRecord(rec, domain);
     if (d.clamped) clamped.push(`${rec.type} ${absoluteName(rec.name, domain)} ttl ${rec.ttl} → ${d.ttl}`);
     const match = pool.get(d.key)?.shift();
     if (!match) { creates.push(d); continue; }
-    const remoteTtl = Number(match.ttl ?? TTL_AUTO);
+    const proxied = Boolean(match.proxied);
+    if (proxied && d.ttl !== TTL_AUTO) proxiedTtl.push(`${rec.type} ${absoluteName(rec.name, domain)} (ttl ${rec.ttl})`);
+    const wantTtl = proxied ? TTL_AUTO : d.ttl;
+    const remoteTtl = proxied ? TTL_AUTO : Number(match.ttl ?? TTL_AUTO);
     const remotePriority = ['MX', 'SRV'].includes(rec.type) ? Number(match.priority ?? match.data?.priority ?? 0) : null;
-    if (remoteTtl !== d.ttl || remotePriority !== d.priority) updates.push({ ...d, remote: match });
+    if (remoteTtl !== wantTtl || remotePriority !== d.priority) updates.push({ ...d, ttl: wantTtl, payload: { ...d.payload, ttl: wantTtl }, remote: match });
     else unchanged++;
   }
   const deletes = [...pool.values()].flat();
-  return { creates, updates, deletes, unchanged, clamped };
+  return { creates, updates, deletes, unchanged, clamped, proxiedTtl };
 }
 
 // ctx.dnsCloudflare — mirrors panel zones to Cloudflare DNS. The API token is
