@@ -13,7 +13,7 @@ export const SERVICE_REGISTRY = [
   { name: 'imap', display_name: 'IMAP Server (Dovecot)', units: ['dovecot'], position: 40 },
   { name: 'exim', display_name: 'Mail Server (Exim)', units: ['exim4', 'exim'], position: 50 },
   { name: 'mailman', display_name: 'Mailing List Manager (Mailman)', units: ['mailman3', 'mailman'], position: 60, monitored: 0 },
-  { name: 'php-fpm', display_name: 'PHP-FPM service for Apache', units: ['php-fpm', 'php8.3-fpm', 'php8.2-fpm', 'php8.1-fpm'], position: 70 },
+  { name: 'php-fpm', display_name: 'PHP-FPM service for Apache', units: ['php-fpm', 'php*-fpm'], position: 70 },
   { name: 'sshd', display_name: 'SSH Server (OpenSSH)', units: ['ssh', 'sshd'], position: 80 },
   { name: 'ftpd', display_name: 'FTP Server', units: ['pure-ftpd', 'proftpd', 'vsftpd'], position: 90 },
   { name: 'cron', display_name: 'Cron Daemon', units: ['cron', 'crond'], position: 100 },
@@ -86,8 +86,12 @@ export async function seed({ db, config, crypto, logger }) {
     const putSetting = db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)');
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) putSetting.run(key, JSON.stringify(value));
 
-    const putService = db.prepare(`INSERT OR IGNORE INTO services (name, display_name, unit_candidates, monitored, position)
-      VALUES (@name, @display_name, @units, @monitored, @position)`);
+    // The registry owns display_name, unit_candidates and position: a row kept
+    // from an earlier release would otherwise never learn a new unit name.
+    // monitored/enabled/restart_on_failure belong to the operator and are kept.
+    const putService = db.prepare(`INSERT INTO services (name, display_name, unit_candidates, monitored, position)
+      VALUES (@name, @display_name, @units, @monitored, @position)
+      ON CONFLICT(name) DO UPDATE SET display_name = excluded.display_name, unit_candidates = excluded.unit_candidates, position = excluded.position`);
     for (const s of SERVICE_REGISTRY) {
       putService.run({ ...s, units: JSON.stringify(s.units), monitored: s.monitored ?? 1 });
     }

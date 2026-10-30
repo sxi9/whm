@@ -9,12 +9,16 @@ let app;
 const PASSWORD = 'Test-Passw0rd!1';
 const POLICY_KEYS = ['security.policy.verified_ip_login', 'security.policy.password_max_age_days', 'security.2fa.required_for_root', 'security.policy.require_2fa_for_resellers', 'security.policy.session_timeout_minutes', 'security.policy.disallow_concurrent_sessions', 'security.policy.api_tokens_require_2fa'];
 
-beforeAll(async () => { app = await createTestApp(); });
+// Every test logs in from the same address; the per-address login limiter
+// (config.loginRateLimit, exercised in api.test.js) is lifted so adding a test
+// cannot turn the later ones into 429s.
+beforeAll(async () => { app = await createTestApp({ overrides: { loginRateLimit: { windowMs: 15 * 60 * 1000, max: 1000 } } }); });
 afterAll(async () => { await app.close(); });
 beforeEach(() => {
   app.ctx.settings.setMany(Object.fromEntries(POLICY_KEYS.map((k) => [k, k.includes('days') || k.includes('minutes') ? 0 : false])));
   app.ctx.db.prepare('UPDATE users SET totp_secret_enc = NULL, totp_enabled = 0, must_change_password = 0, password_changed_at = NULL, last_login_ip = NULL').run();
   app.ctx.db.prepare('DELETE FROM sessions').run();
+  app.ctx.db.prepare('DELETE FROM totp_guard').run();
   app.ctx.db.prepare('DELETE FROM login_attempts').run();
 });
 
@@ -136,6 +140,79 @@ describe('required two-factor authentication', () => {
   });
 });
 
+describe('two-factor enrolment never replaces or disables an active factor', () => {
+  const totpRow = () => app.ctx.db.prepare("SELECT totp_secret_enc, totp_pending_secret_enc, totp_enabled FROM users WHERE username = 'root'").get();
+
+  async function enrolRoot() {
+    const agent = fresh();
+    const res = await loginWith(agent);
+    expect(res.status).toBe(200);
+    const csrf = res.body.data.csrfToken;
+    const enroll = await agent.post('/api/auth/2fa/enroll').set('X-CSRF-Token', csrf);
+    expect(enroll.status).toBe(200);
+    // An enrolment in progress arms nothing: the active secret stays untouched
+    // and a login in between is not asked for a code.
+    expect(totpRow()).toMatchObject({ totp_enabled: 0, totp_secret_enc: null });
+    expect(totpRow().totp_pending_secret_enc).toBeTruthy();
+    expect((await loginWith(fresh())).body.data.requires2fa).toBeUndefined();
+    const confirm = await agent.post('/api/auth/2fa/confirm').set('X-CSRF-Token', csrf).send({ code: authenticator.generate(enroll.body.data.secret) });
+    expect(confirm.status).toBe(200);
+    expect(totpRow()).toMatchObject({ totp_enabled: 1, totp_pending_secret_enc: null });
+    expect(app.ctx.crypto.decrypt(totpRow().totp_secret_enc)).toBe(enroll.body.data.secret);
+    return { agent, csrf, secret: enroll.body.data.secret };
+  }
+
+  it('refuses to start or confirm another enrolment while one is enabled', async () => {
+    app.ctx.settings.set('security.2fa.required_for_root', true);
+    const { agent, csrf, secret } = await enrolRoot();
+    const before = totpRow();
+    const again = await agent.post('/api/auth/2fa/enroll').set('X-CSRF-Token', csrf);
+    expect(again.status).toBe(409);
+    expect(again.body.data?.secret).toBeUndefined();
+    expect(totpRow()).toEqual(before);
+    const confirm = await agent.post('/api/auth/2fa/confirm').set('X-CSRF-Token', csrf).send({ code: authenticator.generate(secret) });
+    expect(confirm.status).toBe(409);
+    expect(totpRow()).toEqual(before);
+    // The authenticator that was set up still logs the user in.
+    const next = fresh();
+    expect((await loginWith(next)).body.data).toEqual({ requires2fa: true });
+    expect((await next.post('/api/auth/2fa').send({ code: authenticator.generate(secret) })).status).toBe(200);
+  });
+
+  it('disabling with the current code clears the factor and allows a fresh enrolment', async () => {
+    const { agent, csrf, secret } = await enrolRoot();
+    const disable = await agent.post('/api/auth/2fa/disable').set('X-CSRF-Token', csrf).send({ code: authenticator.generate(secret) });
+    expect(disable.status).toBe(200);
+    expect(totpRow()).toEqual({ totp_enabled: 0, totp_secret_enc: null, totp_pending_secret_enc: null });
+    expect((await agent.post('/api/auth/2fa/enroll').set('X-CSRF-Token', csrf)).status).toBe(200);
+  });
+
+  it('refuses credential changes from an API token, whatever its scopes', async () => {
+    const { secret } = await enrolRoot();
+    const before = totpRow();
+    const token = app.ctx.crypto.randomToken();
+    const root = app.ctx.db.prepare("SELECT id FROM users WHERE username = 'root'").get();
+    app.ctx.db.prepare(`INSERT INTO api_tokens (user_id, name, token_hash, scopes) VALUES (?, 'enrol-test', ?, '["*"]')`).run(root.id, app.ctx.crypto.hashToken(token));
+    const calls = [
+      ['/api/auth/2fa/enroll', undefined],
+      ['/api/auth/2fa/confirm', { code: authenticator.generate(secret) }],
+      ['/api/auth/2fa/disable', { code: authenticator.generate(secret) }],
+      ['/api/auth/2fa/disable', { password: PASSWORD }],
+      ['/api/auth/password', { currentPassword: PASSWORD, newPassword: 'Another-Passw0rd!2' }],
+    ];
+    for (const [path, body] of calls) {
+      const res = await request(app.ctx.app).post(path).set('Authorization', `Bearer ${token}`).send(body);
+      expect(res.status, path).toBe(403);
+      expect(res.body.error.message, path).toMatch(/API token/);
+    }
+    expect(totpRow()).toEqual(before);
+    // The token itself still works and the password is unchanged.
+    expect((await request(app.ctx.app).get('/api/auth/me').set('Authorization', `Bearer ${token}`)).status).toBe(200);
+    expect((await loginWith(fresh())).body.data).toEqual({ requires2fa: true });
+    app.ctx.db.prepare("DELETE FROM api_tokens WHERE name = 'enrol-test'").run();
+  });
+});
+
 describe('super admin flag', () => {
   it('reports users.superadmin on /me and on the login answer, false until whm-cli grants it', async () => {
     const agent = fresh();
@@ -201,6 +278,10 @@ describe('external (OpenID Connect) login', () => {
     expect(url.searchParams.get('redirect_uri')).toMatch(/\/api\/auth\/external\/corp\/callback$/);
     expect(url.searchParams.get('state')).toHaveLength(32);
     expect(url.searchParams.get('nonce')).toHaveLength(32);
+    // The state lives in the session and the callback is a top-level
+    // navigation arriving from the provider's site: a browser sends a Lax
+    // cookie there but withholds a Strict one (supertest attaches either).
+    expect((start.headers['set-cookie'] || []).join(';')).toMatch(/whm\.sid=.*SameSite=Lax/);
     exchangeOk();
     const bad = await agent.get(`/api/auth/external/${name}/callback?code=abc&state=wrong`);
     expect(bad.status).toBe(302);
@@ -251,5 +332,33 @@ describe('external (OpenID Connect) login', () => {
   it('requires a login before linking', async () => {
     const res = await request(app.ctx.app).get(`/api/auth/external/${name}/start?link=1`);
     expect(res.status).toBe(401);
+  });
+
+  it('refuses to link an identity from an API token, a confined cluster token included', async () => {
+    const insert = app.ctx.db.prepare("INSERT INTO api_tokens (user_id, name, token_hash, scopes, prefix) VALUES ((SELECT id FROM users WHERE username = 'root'), ?, ?, ?, ?)");
+    const cluster = `whm_${app.ctx.crypto.randomToken(24)}`;
+    insert.run('peer', app.ctx.crypto.hashToken(cluster), JSON.stringify(['clustering:dns']), cluster.slice(0, 12));
+    const full = `whm_${app.ctx.crypto.randomToken(24)}`;
+    insert.run('full', app.ctx.crypto.hashToken(full), '[]', full.slice(0, 12));
+    exchangeOk('sub-attacker', 'attacker@example.com');
+    for (const token of [cluster, full]) {
+      const attacker = fresh();
+      const start = await attacker.get(`/api/auth/external/${name}/start?link=1`).set('Authorization', `Bearer ${token}`);
+      expect(start.status).toBe(403);
+      const cb = await attacker.get(`/api/auth/external/${name}/callback?code=abc&state=anything`).set('Authorization', `Bearer ${token}`);
+      expect(cb.headers.location).toBe('/login?error=external_state');
+    }
+    // A link started in a session cannot be completed by a token for the same user either.
+    const owner = fresh();
+    await loginWith(owner);
+    const linkStart = await owner.get(`/api/auth/external/${name}/start?link=1`);
+    expect(linkStart.status).toBe(302);
+    const forged = await owner.get(`/api/auth/external/${name}/callback?code=abc&state=${stateFrom(linkStart.headers.location)}`).set('Authorization', `Bearer ${cluster}`);
+    expect(forged.headers.location).toBe('/login?error=external_state');
+    expect(app.ctx.security.externalAuth.findLinkedUser(name, 'sub-attacker')).toBeFalsy();
+    // The token still cannot reach anything outside its scope.
+    const me = await request(app.ctx.app).get('/api/auth/me').set('Authorization', `Bearer ${cluster}`);
+    expect(me.status).toBe(403);
+    expect(me.body.error.code).toBe('scope_confined');
   });
 });

@@ -50,6 +50,28 @@ describe('Plugins category pages', () => {
     expect(wp).toContain('WordPress sites');
   });
 
+  it('hides the settings and action tabs (root-only manage API) from resellers of a reseller-usable plugin', () => {
+    // The WP Toolkit manifest declares /settings (kind settings) and /discover
+    // (kind action); both post to /plugins/manage/* which is requireRoot, so a
+    // reseller must not be offered them even though the plugin routes admit
+    // resellers (status.canUse true). The Overview keeps its own Discover button.
+    const wp = { ...plugin('net.whm.wp-toolkit', 'WP Toolkit'), pages: [
+      { route: '/settings', title: 'WP Toolkit settings', kind: 'settings', origin: 'manifest' },
+      { route: '/discover', title: 'Discover sites now', kind: 'action', job: 'discover', origin: 'manifest' },
+    ] };
+    statusData = { state: 'enabled', canManage: false, canUse: true, roles: ['root', 'reseller'] };
+    const reseller = render(WpToolkit, fns['wp-toolkit'], [wp]);
+    expect(reseller).toContain('Overview');
+    expect(reseller).toContain('>Discover sites<');
+    expect(reseller).not.toContain('Discover sites now');
+    expect(reseller).not.toContain('WP Toolkit settings');
+    statusData = { state: 'enabled', canManage: true, canUse: true, roles: ['root', 'reseller'] };
+    const root = render(WpToolkit, fns['wp-toolkit'], [wp]);
+    expect(root).toContain('Discover sites now');
+    expect(root).toContain('WP Toolkit settings');
+    statusData = null;
+  });
+
   it('show the enable prompt (with Manage Plugins link) when the plugin is not enabled', () => {
     for (const [Page, fn] of [[ServerMonitoring, fns['server-monitoring']], [ImunifyAv, fns.imunifyav], [WpToolkit, fns['wp-toolkit']]]) {
       const html = render(Page, fn, []);

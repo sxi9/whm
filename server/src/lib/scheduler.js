@@ -1,5 +1,6 @@
 import { cronMatches, nextCronRun, isValidCron } from './cron.js';
 import { json } from '../db/index.js';
+import { notFound, unprocessable } from './errors.js';
 
 // Minute-resolution scheduler over the `schedules` table. Each row names a job
 // type; when its cron matches the current minute the job is enqueued. Rows are
@@ -18,6 +19,16 @@ export function createScheduler({ db, jobs, logger }) {
     update: db.prepare('UPDATE schedules SET cron = @cron, enabled = @enabled, params_json = @params, next_run_at = @next WHERE name = @name'),
   };
 
+  // A schedule's previous run that is still queued or running (the worker's
+  // slots are taken by long jobs) must not be joined by a duplicate every
+  // minute its cron matches. The match is on type AND params so an operator's
+  // job of the same type (a one-account backup) never cancels the scheduled
+  // one (the nightly full backup).
+  function stillPending(jobType, params) {
+    const want = JSON.stringify(params);
+    return ['queued', 'running'].some((status) => jobs.list({ type: jobType, status }).some((j) => JSON.stringify(j.params) === want));
+  }
+
   function tick() {
     const now = new Date();
     const minuteKey = now.toISOString().slice(0, 16);
@@ -26,7 +37,13 @@ export function createScheduler({ db, jobs, logger }) {
         if (row.last_run_at && new Date(row.last_run_at.replace(' ', 'T') + 'Z').toISOString().slice(0, 16) === minuteKey) continue;
         if (!cronMatches(row.cron, now)) continue;
         if (!jobs.types().includes(row.job_type)) continue;
-        jobs.enqueue(row.job_type, json.parse(row.params_json, {}));
+        const params = json.parse(row.params_json, {});
+        if (stillPending(row.job_type, params)) {
+          stmts.mark.run(nextCronRun(row.cron, now)?.toISOString() ?? null, row.id);
+          logger.debug({ schedule: row.name, job: row.job_type }, 'scheduled job skipped: previous run still pending');
+          continue;
+        }
+        jobs.enqueue(row.job_type, params);
         stmts.mark.run(nextCronRun(row.cron, now)?.toISOString() ?? null, row.id);
         logger.info({ schedule: row.name, job: row.job_type }, 'scheduled job enqueued');
       } catch (err) {
@@ -45,18 +62,25 @@ export function createScheduler({ db, jobs, logger }) {
     remove: (name) => stmts.remove.run(name).changes > 0,
     update(name, { cron, enabled, params }) {
       const current = stmts.all.all().find((r) => r.name === name);
-      if (!current) return null;
+      if (!current) throw notFound('Schedule');
       const nextCron = cron ?? current.cron;
-      if (!isValidCron(nextCron)) throw new Error('invalid cron expression');
+      if (!isValidCron(nextCron)) throw unprocessable('Invalid cron expression', { cron: ['Not a valid 5-field cron expression'] });
       stmts.update.run({ name, cron: nextCron, enabled: enabled == null ? current.enabled : enabled ? 1 : 0, params: JSON.stringify(params ?? json.parse(current.params_json, {})), next: nextCronRun(nextCron)?.toISOString() ?? null });
       return stmts.all.all().find((r) => r.name === name);
     },
     start() {
-      // Align to the next minute boundary so a schedule never fires twice or skips.
-      const delay = 60_000 - (Date.now() % 60_000);
-      setTimeout(() => { tick(); timer = setInterval(tick, 60_000); timer.unref(); }, delay).unref();
+      // Every tick arms the next one for the coming minute boundary, so a late
+      // tick (busy event loop) never carries its lateness forward into a
+      // skipped minute the way a fixed setInterval would.
+      const arm = () => {
+        timer = setTimeout(() => {
+          try { tick(); } finally { if (timer) arm(); }
+        }, 60_000 - (Date.now() % 60_000));
+        timer.unref();
+      };
+      arm();
     },
-    stop() { clearInterval(timer); },
+    stop() { clearTimeout(timer); timer = null; },
     tick,
   };
 }

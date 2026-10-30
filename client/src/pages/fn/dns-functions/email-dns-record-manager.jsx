@@ -103,11 +103,35 @@ function DkimCard({ domain, status, onChange }) {
   );
 }
 
-function DmarcCard({ domain, status, onChange }) {
+const dmarcDefaults = (domain) => ({ p: 'none', sp: '', rua: `postmaster@${domain}`, ruf: '', pct: 100, adkim: '', aspf: '' });
+const mailtoList = (v) => v.split(',').map((a) => a.trim().replace(/^mailto:/i, '')).filter(Boolean).join(', ');
+
+// An existing record is mirrored as published (no rua is added behind the
+// operator's back); without one the form starts from the suggestion.
+export function parseDmarc(value, domain) {
+  const tags = {};
+  for (const part of String(value || '').split(';')) {
+    const m = part.trim().match(/^([a-z]+)\s*=\s*(.+)$/i);
+    if (m) tags[m[1].toLowerCase()] = m[2].trim();
+  }
+  if (!/^dmarc1$/i.test(tags.v || '')) return dmarcDefaults(domain);
+  const out = { ...dmarcDefaults(domain), rua: '' };
+  if (/^(none|quarantine|reject)$/i.test(tags.p || '')) out.p = tags.p.toLowerCase();
+  if (/^(none|quarantine|reject)$/i.test(tags.sp || '')) out.sp = tags.sp.toLowerCase();
+  if (tags.rua) out.rua = mailtoList(tags.rua);
+  if (tags.ruf) out.ruf = mailtoList(tags.ruf);
+  if (/^\d{1,3}$/.test(tags.pct || '') && Number(tags.pct) <= 100) out.pct = Number(tags.pct);
+  if (/^[rs]$/i.test(tags.adkim || '')) out.adkim = tags.adkim.toLowerCase();
+  if (/^[rs]$/i.test(tags.aspf || '')) out.aspf = tags.aspf.toLowerCase();
+  return out;
+}
+
+export function DmarcCard({ domain, status, onChange }) {
   const toast = useToast();
-  const [form, setForm] = useState({ p: 'none', sp: '', rua: `postmaster@${domain}`, ruf: '', pct: 100, adkim: '', aspf: '' });
+  const [form, setForm] = useState(() => parseDmarc(status.dmarc?.value, domain));
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+  useEffect(() => { setForm(parseDmarc(status.dmarc?.value, domain)); }, [status, domain]);
   const set = (k) => (v) => setForm((f) => ({ ...f, [k]: v }));
   const save = async () => {
     setBusy(true); setError(null);
@@ -132,17 +156,22 @@ function DmarcCard({ domain, status, onChange }) {
   );
 }
 
+// useApi keeps the previous zone's payload while the next one loads; the cards
+// must never see it, or a save would publish it under the new domain.
+export const currentStatus = (domain, data) => (domain && data && data.domain === domain ? data : null);
+
 export default function EmailDnsRecordManager({ fn }) {
   const [domain, setDomain] = useState('');
-  const { data: status, loading, error, refetch, setData } = useApi(domain ? `/dns/zones/${domain}/email` : null, { enabled: Boolean(domain) });
-  const onChange = (data) => { if (data?.domain) setData(data); refetch(); };
+  const { data, error, refetch, setData } = useApi(domain ? `/dns/zones/${domain}/email` : null, { enabled: Boolean(domain) });
+  const status = currentStatus(domain, data);
+  const onChange = (next) => { if (next?.domain) setData(next); refetch(); };
   return (
     <>
       <PageHeader fn={fn} description="Generate and publish SPF, DKIM and DMARC records for a domain. DKIM private keys are stored encrypted and handed to the mail server." />
       <Card title="Select a domain"><ZonePicker value={domain} onChange={setDomain} label="Domain" /></Card>
-      {domain && loading && !status && <Loading />}
+      {domain && !status && !error && <Loading />}
       {domain && error && <><CapabilityNotice error={error} onRetry={refetch} />{error.code !== 'capability_missing' && <ErrorBanner error={error} onRetry={refetch} />}</>}
-      {domain && status && (
+      {status && (
         <>
           <Card title="Mail exchangers">
             {status.mx.length ? <KeyValue items={status.mx.map((m) => [`MX ${m.priority}`, <code key={m.id}>{m.value}</code>])} /> : <p className="muted">No MX records; see Email Routing Configuration.</p>}

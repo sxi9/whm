@@ -327,12 +327,37 @@ export function createApplicationManagerService(ctx) {
 
   const requireApache = () => capabilities.require('apache', 'Apache is not installed on this server; applications are published through the account vhost. Install apache2 (Debian/Ubuntu) or httpd (RHEL) first.');
   const requireSystemd = () => capabilities.require('systemd', 'systemd is required to run applications as services on this server');
-  function requireRuntime(kind, version) {
+  // Applications run inside a venv, and Debian/Ubuntu ship venv + ensurepip
+  // separately (python3-venv), so a python3 on PATH is not enough: the
+  // interpreter list from app.runtime.detect decides, for the create/update
+  // gate as well as for the deploy job.
+  const sameMinor = (p, version) => p.version === version || String(p.version).startsWith(`${version}.`);
+  function pythonFor(list, version) {
+    const withVenv = (list || []).filter((p) => p.venv);
+    return (version === 'system' || !version ? withVenv[0] : withVenv.find((p) => sameMinor(p, version))) ?? null;
+  }
+  function pythonMissing(detected, version) {
+    const list = detected?.python || [];
+    const wanted = version === 'system' || !version ? '3' : version;
+    if (!list.length) return new CapabilityError('python', 'Python 3 is not installed on this server; install python3 and python3-venv');
+    const candidates = wanted === '3' ? list : list.filter((p) => sameMinor(p, wanted));
+    if (!candidates.length) return new CapabilityError('python', `Python ${wanted} is not installed on this server (found ${list.map((p) => p.version).join(', ')})`);
+    return new CapabilityError('python', `Python ${wanted} with venv support is not installed; install python3-venv (${candidates.map((p) => p.bin).join(', ')} cannot import venv and ensurepip)`);
+  }
+  async function requireRuntime(kind, version) {
     if (kind === 'node') {
       if (version !== 'system' && stmts.runtimeGet.get('node', version)) return;
       if (!capabilities.has('node')) throw new CapabilityError('node', version === 'system' ? 'Node.js is not installed on this server; install the nodejs package or a managed version under Runtime Versions' : `Node.js ${version} is not installed; install it under Runtime Versions`);
     }
-    if (kind === 'python') capabilities.require('python', 'Python 3 is not installed on this server; install python3 and python3-venv (Software › Install Distro Packages)');
+    if (kind === 'python') {
+      let detected;
+      try { detected = await op('app.runtime.detect', {}); } catch (err) {
+        logger.warn({ err }, 'app.runtime.detect failed');
+        capabilities.require('python', 'Python 3 is not installed on this server; install python3 and python3-venv (Software › Install Distro Packages)');
+        return;
+      }
+      if (!pythonFor(detected.python, version)) throw pythonMissing(detected, version);
+    }
   }
   function checkRuntimeVersion(kind, version) {
     if (!kind) return null;
@@ -540,9 +565,8 @@ export function createApplicationManagerService(ctx) {
       if (!hit) throw new CapabilityError('node', version === 'system' || !version ? 'Node.js is not installed on this server' : `Node.js ${version} is not installed on this server`);
       return { kind, version: hit.version, bin: hit.bin, source: hit.source };
     }
-    const list = (detected.python || []).filter((p) => p.venv);
-    const hit = version === 'system' || !version ? list[0] : list.find((p) => p.version === version || String(p.version).startsWith(`${version}.`));
-    if (!hit) throw new CapabilityError('python', (detected.python || []).length ? `Python ${version === 'system' ? '3' : version} with venv support is not installed; install python3-venv` : 'Python 3 is not installed on this server');
+    const hit = pythonFor(detected.python, version);
+    if (!hit) throw pythonMissing(detected, version);
     return { kind, version: hit.version, bin: hit.bin, source: hit.source };
   }
   async function liveStatus(unit, req) {
@@ -744,7 +768,6 @@ export function createApplicationManagerService(ctx) {
     const resolved = resolvePreset(presetId, input, customPresets());
     if (resolved.kind !== 'static') requireSystemd();
     const runtimeVersion = checkRuntimeVersion(resolved.runtimeKind, resolved.defaults.runtimeVersion);
-    requireRuntime(resolved.runtimeKind, runtimeVersion);
     if (input.source?.type === 'git') capabilities.require('git', 'git is not installed on this server; install it to deploy from a repository');
     if (!domainsFor(input.username, user).some((d) => d.domain === input.domain)) throw unprocessable(`Domain "${input.domain}" does not belong to account "${input.username}"`, { domain: ['Not one of the account domains'] });
     const basePath = input.basePath.length > 1 ? input.basePath.replace(/\/+$/, '') : '/';
@@ -754,6 +777,10 @@ export function createApplicationManagerService(ctx) {
     for (const other of stmts.roots.all(input.username)) {
       if (other.root === root || root.startsWith(`${other.root}/`) || other.root.startsWith(`${root}/`)) throw conflict(`The directory ${root} overlaps application #${other.id} (${other.root})`);
     }
+    // Probes the host only once the request itself is valid, and before a row
+    // and a port exist: a missing interpreter must reach the create form as a
+    // 501 (install prompt), not the deploy job's log.
+    await requireRuntime(resolved.runtimeKind, runtimeVersion);
     const mode = resolved.defaults.mode ?? 'production';
     const limits = { memoryMaxMb: Number(S('apps.default_memory_mb', 512)) || 512, tasksMax: 256, cpuQuotaPercent: 100, ...stripUndefined(resolved.defaults.limits) };
     const build = resolved.build;
@@ -808,7 +835,7 @@ export function createApplicationManagerService(ctx) {
       const kind = values.runtime_kind === undefined ? row.runtime_kind : values.runtime_kind;
       if (!kind) throw unprocessable('This application has no runtime', { runtimeVersion: ['Not applicable'] });
       values.runtime_version = checkRuntimeVersion(kind, input.runtimeVersion);
-      requireRuntime(kind, values.runtime_version);
+      await requireRuntime(kind, values.runtime_version);
     }
     if (input.env !== undefined) values.env_enc = encryptEnv(input.env);
     if (input.mode !== undefined) values.mode = input.mode;
@@ -953,10 +980,14 @@ export function createApplicationManagerService(ctx) {
       node.sort((a, b) => (a.source === b.source ? compareSemver(b.version, a.version) : a.source === 'system' ? -1 : 1));
       const python = (detected.python || []).map((p) => ({ ...p, default: defaults.python === 'system' ? false : (p.version === defaults.python || String(p.version).startsWith(`${defaults.python}.`)) }));
       if (python.length && defaults.python === 'system') { const first = python.find((p) => p.venv) ?? python[0]; first.default = true; }
+      const caps = Object.fromEntries(['apache', 'systemd', 'node', 'python', 'git', 'acl'].map((c) => [c, capabilities.has(c)]));
+      // What applications need is an interpreter that can build a venv, which
+      // the capability snapshot (python3 on PATH) cannot tell.
+      if (!error) caps.python = Boolean(pythonFor(detected.python, 'system'));
       return {
         node, python, git: detected.git ?? { installed: false, version: null }, arch: detected.arch ?? process.arch, defaults, error,
         policy: policy.get(),
-        capabilities: Object.fromEntries(['apache', 'systemd', 'node', 'python', 'git', 'acl'].map((c) => [c, capabilities.has(c)])),
+        capabilities: caps,
       };
     },
     async available() {

@@ -4,6 +4,7 @@ import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
 import { STACK_COMPONENTS, STACK_PROFILES, PACKAGE_FAMILIES, componentForCapability, componentForService, profileComponents } from '../src/lib/stack-catalog.js';
 import { STACK_INSTALL_JOB } from '../src/services/system-stack.js';
 import { SERVICE_REGISTRY, DEFAULT_SETTINGS } from '../src/db/seed.js';
+import { resolveUnit } from '../src/lib/capabilities.js';
 
 const PKG_RE = /^[A-Za-z0-9][A-Za-z0-9+._-]{0,99}$/;
 
@@ -33,6 +34,29 @@ describe('stack catalog', () => {
     expect(componentForService('httpd').key).toBe('apache');
     expect(componentForService('imap').key).toBe('dovecot');
     expect(componentForService('sshd')).toBeNull();
+  });
+
+  it('lists every unit a component installs among its Service Manager row candidates', () => {
+    // A unit the catalog installs but the registry row cannot see (php8.4-fpm
+    // before the php*-fpm glob) leaves Service Manager saying "not installed"
+    // right after a successful install.
+    for (const c of STACK_COMPONENTS.filter((c) => c.service)) {
+      const row = SERVICE_REGISTRY.find((s) => s.name === c.service);
+      for (const unit of c.units) expect(resolveUnit(row.units, new Set([unit])), `${c.key}: ${unit} → ${c.service}`).toBe(unit);
+    }
+    expect(resolveUnit(SERVICE_REGISTRY.find((s) => s.name === 'php-fpm').units, new Set(['php8.5-fpm']))).toBe('php8.5-fpm');
+  });
+
+  it('installs the SpamAssassin daemon package on the Debian family, not just the CLI', () => {
+    // On Debian 12 / Ubuntu 24.04 `spamassassin` does not pull in `spamd`, so without it the
+    // component installs no systemd unit and Service Manager can never start spamd.
+    const sa = componentForService('spamd');
+    expect(sa.key).toBe('spamassassin');
+    expect(sa.packages.debian).toContain('spamd');
+    expect(sa.packages.debian).toContain('spamassassin');
+    expect(sa.packages.debian).toContain('spamc');
+    expect(sa.units).toContain('spamd');
+    expect(sa.postInstall.map((s) => s.kind)).toContain('enable');
   });
 
   it('defines the full, web and manual profiles over known components', () => {

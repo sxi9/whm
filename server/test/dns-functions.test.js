@@ -274,6 +274,14 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
     const own = await resellerHttp.post('/api/dns/zones').set('X-CSRF-Token', resellerCsrf).send({ domain: 'alice.com' }).expect(201);
     expect(own.body.data.account).toBe('alice');
     await resellerHttp.get('/api/dns/zones/alice.com').expect(200);
+    // Naming one of their own accounts must not let a reseller claim another
+    // tenant's domain or a name under it (the apex refusal wins over 409 too).
+    for (const body of [{ domain: 'www.bob.com', account: 'alice', ip: '198.51.100.66' }, { domain: 'bob.com', account: 'alice' }, { domain: 'www.bob.com' }]) {
+      const denied = await resellerHttp.post('/api/dns/zones').set('X-CSRF-Token', resellerCsrf).send(body).expect(403);
+      expect(denied.body.error.message).toMatch(/another reseller/);
+    }
+    expect(app.ctx.db.prepare('SELECT 1 FROM dns_zones WHERE domain = ?').get('www.bob.com')).toBeUndefined();
+    await resellerHttp.get('/api/dns/zones/www.bob.com').expect(404);
     await resellerHttp.put('/api/dns/zones/alice.com/dnssec').set('X-CSRF-Token', resellerCsrf).send({ enabled: true }).expect(403);
     await resellerHttp.get('/api/dns/zones/alice.com/dnssec').expect(403);
     for (const path of ['/templates', '/hostname', '/cleanup', '/sync']) await resellerHttp.get(`/api/dns${path}`).expect(403);
@@ -426,6 +434,25 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
     expect(un.body.data).toMatchObject({ unparked: true, zoneRemoved: true, web: 'pending' });
     await get('/zones/bob-alias.com').expect(404);
     await del('/parked/bob-alias.com').expect(404);
+  });
+
+  it('refuses to park a name under another tenant\'s domain on a reseller\'s own account', async () => {
+    const snapshot = app.ctx.db.prepare("SELECT plan_snapshot_json FROM accounts WHERE username = 'alice'").get().plan_snapshot_json;
+    app.ctx.db.prepare("UPDATE accounts SET plan_snapshot_json = ? WHERE username = 'alice'").run(JSON.stringify({ ...JSON.parse(snapshot || '{}'), max_parked: 10 }));
+    try {
+      const denied = await resellerHttp.post('/api/dns/parked').set('X-CSRF-Token', resellerCsrf).send({ domain: 'shop.bob.com', account: 'alice' }).expect(403);
+      expect(denied.body.error.message).toMatch(/another reseller/);
+      expect(app.agent.callsTo('dns.zone.write')).toHaveLength(0);
+      expect(app.ctx.db.prepare('SELECT 1 FROM dns_zones WHERE domain = ?').get('shop.bob.com')).toBeUndefined();
+      expect(app.ctx.db.prepare('SELECT 1 FROM account_domains WHERE domain = ?').get('shop.bob.com')).toBeUndefined();
+      // A name under the reseller's own account is still theirs to park.
+      const own = await resellerHttp.post('/api/dns/parked').set('X-CSRF-Token', resellerCsrf).send({ domain: 'shop.alice.com', account: 'alice' }).expect(201);
+      expect(own.body.data).toMatchObject({ domain: 'shop.alice.com', account: 'alice', target: 'alice.com' });
+      await resellerHttp.delete('/api/dns/parked/shop.alice.com?removeZone=true').set('X-CSRF-Token', resellerCsrf).expect(200);
+      // Root may still park a name hosted elsewhere onto a different account.
+      await post('/parked', { domain: 'shop.bob.com', account: 'alice' }).expect(201);
+      await del('/parked/shop.bob.com?removeZone=true').expect(200);
+    } finally { app.ctx.db.prepare("UPDATE accounts SET plan_snapshot_json = ? WHERE username = 'alice'").run(snapshot); }
   });
 
   it('refuses to park the server hostname (or www.<hostname>) before any zone or web work', async () => {

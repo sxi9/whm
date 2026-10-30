@@ -2,32 +2,70 @@ import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client.js';
 import { StatusPill } from './Common.jsx';
 
+export const TERMINAL_JOB_STATUSES = ['done', 'failed', 'cancelled'];
+
+const formatLine = (ts, level, line) => `${ts}  ${String(level).toUpperCase().padEnd(5)}  ${line}`;
+
+// Follows a job over its SSE stream. The server ends the response right after
+// the terminal event, and right after the snapshot of a job that already
+// finished; the browser treats that as a dropped connection and reconnects
+// every few seconds, so the source is closed here as soon as the job is
+// terminal. `onFinished` fires at most once per subscription, also for a job
+// that finished before (or between) subscriptions. Returns a close function.
+export function followJob(jobId, { onSnapshot, onLog, onProgress, onStatus, onFinished } = {}) {
+  let finished = false;
+  let close = null;
+  const finish = (event) => {
+    if (finished) return;
+    finished = true;
+    close?.();
+    onFinished?.(event);
+  };
+  close = api.stream(`/system/jobs/${jobId}/stream`, (event) => {
+    if (finished) return;
+    if (event.type === 'snapshot') {
+      const job = event.job || {};
+      onSnapshot?.(job);
+      if (TERMINAL_JOB_STATUSES.includes(job.status)) finish({ type: job.status, result: job.result ?? null, error: job.error ?? null, ...(job.error_code ? { code: job.error_code } : {}) });
+    } else if (event.type === 'log') {
+      onLog?.(event);
+    } else if (event.type === 'progress') {
+      onProgress?.(event);
+    } else if (event.type === 'started') {
+      onStatus?.('running', event);
+    } else if (TERMINAL_JOB_STATUSES.includes(event.type)) {
+      onStatus?.(event.type, event);
+      finish(event);
+    }
+  });
+  if (finished) close();
+  return () => { finished = true; close(); };
+}
+
 // Live view of a background job via the SSE stream.
 export function ProgressLog({ jobId, onFinished }) {
   const [job, setJob] = useState(null);
   const [lines, setLines] = useState([]);
   const [progress, setProgress] = useState({ pct: 0, message: null });
   const endRef = useRef(null);
+  const finishedRef = useRef(onFinished);
+  finishedRef.current = onFinished;
 
   useEffect(() => {
     if (!jobId) return undefined;
     setLines([]);
-    const close = api.stream(`/system/jobs/${jobId}/stream`, (event) => {
-      if (event.type === 'snapshot') {
-        setJob(event.job);
-        setProgress({ pct: event.job.progress, message: event.job.message });
-        setLines((event.job.logs || []).map((l) => `${l.ts}  ${l.level.toUpperCase().padEnd(5)}  ${l.line}`));
-      } else if (event.type === 'log') {
-        setLines((l) => [...l, `${new Date().toISOString().slice(11, 19)}  ${event.level.toUpperCase().padEnd(5)}  ${event.line}`]);
-      } else if (event.type === 'progress') {
-        setProgress({ pct: event.progress, message: event.message });
-      } else if (['done', 'failed', 'cancelled', 'started'].includes(event.type)) {
-        setJob((j) => ({ ...(j || {}), status: event.type === 'started' ? 'running' : event.type, result: event.result, error: event.error }));
-        if (event.type !== 'started') onFinished?.(event);
-      }
+    return followJob(jobId, {
+      onSnapshot: (j) => {
+        setJob(j);
+        setProgress({ pct: j.progress, message: j.message });
+        setLines((j.logs || []).map((l) => formatLine(l.ts, l.level, l.line)));
+      },
+      onLog: (e) => setLines((l) => [...l, formatLine(new Date().toISOString().slice(11, 19), e.level, e.line)]),
+      onProgress: (e) => setProgress({ pct: e.progress, message: e.message }),
+      onStatus: (status, e) => setJob((j) => ({ ...(j || {}), status, result: e.result, error: e.error })),
+      onFinished: (e) => finishedRef.current?.(e),
     });
-    return close;
-  }, [jobId, onFinished]);
+  }, [jobId]);
 
   useEffect(() => { endRef.current?.scrollIntoView({ block: 'nearest' }); }, [lines]);
 

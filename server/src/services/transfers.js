@@ -218,6 +218,10 @@ export function createTransfersService(ctx) {
     itemStatus: db.prepare('UPDATE transfer_run_items SET status = ? WHERE id = ?'),
     finishItem: db.prepare("UPDATE transfer_run_items SET status = @status, detail = @detail, steps_json = @steps_json, finished_at = datetime('now') WHERE id = @id"),
     itemCounts: db.prepare('SELECT status, COUNT(*) AS n FROM transfer_run_items WHERE run_id = ? GROUP BY status'),
+    openRun: db.prepare("SELECT id FROM transfer_runs WHERE id = ? AND status IN ('queued', 'running')"),
+    failRunningItems: db.prepare("UPDATE transfer_run_items SET status = 'failed', detail = ?, finished_at = datetime('now') WHERE run_id = ? AND status = 'running'"),
+    skipQueuedItems: db.prepare("UPDATE transfer_run_items SET status = 'skipped', detail = ?, finished_at = datetime('now') WHERE run_id = ? AND status = 'queued'"),
+    orphanedRuns: db.prepare("SELECT r.id, r.job_id, j.status AS job_status, j.error AS job_error FROM transfer_runs r LEFT JOIN jobs j ON j.id = r.job_id WHERE r.status IN ('queued', 'running') AND (j.id IS NULL OR j.status NOT IN ('queued', 'running')) ORDER BY r.id"),
     jobsOfKinds: db.prepare("SELECT j.*, u.username AS created_by_name FROM jobs j LEFT JOIN users u ON u.id = j.created_by WHERE (j.type LIKE 'transfer.%' OR j.type LIKE 'restore.%') AND (@owner IS NULL OR j.created_by = @owner) AND (@status IS NULL OR j.status = @status) ORDER BY j.id DESC LIMIT @limit"),
     job: db.prepare('SELECT j.*, u.username AS created_by_name FROM jobs j LEFT JOIN users u ON u.id = j.created_by WHERE j.id = ?'),
     runByJob: db.prepare('SELECT id, kind FROM transfer_runs WHERE job_id = ?'),
@@ -270,7 +274,7 @@ export function createTransfersService(ctx) {
     try {
       return actorRequest(userId ?? run.created_by, `job:${jobCtx.job?.id ?? ''}`);
     } catch (err) {
-      stmts.finishRun.run('failed', JSON.stringify({ ...totalsOf(run.id), error: err.message }), run.id);
+      abandonRun(run.id, err.message);
       throw err;
     }
   }
@@ -447,6 +451,47 @@ export function createTransfersService(ctx) {
     stmts.finishRun.run(totals.failed && totals.failed === items.length ? 'failed' : 'done', JSON.stringify(totals), runId);
     return totals;
   }
+
+  // A run whose job ended without reaching finishRunRow (the handler threw, the
+  // job was cancelled, the panel restarted mid-run) would otherwise show as
+  // running forever: the item being worked on failed, the rest never started.
+  const abandonRun = db.transaction((runId, reason) => {
+    if (!stmts.openRun.get(runId)) return false;
+    stmts.failRunningItems.run(reason, runId);
+    stmts.skipQueuedItems.run(reason, runId);
+    stmts.finishRun.run('failed', JSON.stringify({ ...totalsOf(runId), error: reason }), runId);
+    return true;
+  });
+
+  function abandonRunForJob(jobId, reason) {
+    const run = stmts.runByJob.get(jobId);
+    return run ? abandonRun(run.id, reason) : false;
+  }
+
+  // jobs.start() marks the jobs interrupted by a restart as failed without
+  // emitting events; the runs they drove are reconciled once the panel is up.
+  function reconcileRuns() {
+    const abandoned = [];
+    for (const r of stmts.orphanedRuns.all()) {
+      const reason = r.job_id == null || r.job_status == null ? 'the job driving this run no longer exists'
+        : r.job_status === 'cancelled' ? 'the job was cancelled'
+          : r.job_status === 'done' ? 'the job finished without recording the run'
+            : r.job_error || 'the job failed';
+      if (abandonRun(r.id, reason)) abandoned.push(r.id);
+    }
+    if (abandoned.length) logger.warn({ runs: abandoned }, 'transfers: finalised runs whose job ended without them');
+    return abandoned;
+  }
+
+  jobs.onAny((event) => {
+    if (event.type !== 'failed' && event.type !== 'cancelled') return;
+    try {
+      abandonRunForJob(event.jobId, event.type === 'cancelled' ? 'the job was cancelled before it started' : event.error || 'the job failed');
+    } catch (err) {
+      logger.warn({ err, jobId: event.jobId }, 'transfers: run could not be finalised after its job failed');
+    }
+  });
+  ctx.events?.on?.('panel.started', () => { try { reconcileRuns(); } catch (err) { logger.warn({ err }, 'transfers: run reconciliation at boot failed'); } });
 
   // ---------------------------------------------------------- shared steps ---
 
@@ -713,7 +758,7 @@ export function createTransfersService(ctx) {
     if (options.skipHome) steps.home = { status: 'skipped', detail: 'not requested' };
     else {
       steps.home = await step(async () => {
-        const r = await op('transfer.remote.rsync', { connection: connectionOf(sessionRow), remotePath: remoteHome, localPath: account.home_dir, directory: true, excludes: HOME_EXCLUDES, bwlimitKbps: bwlimit() }, req);
+        const r = await op('transfer.remote.rsync', { connection: connectionOf(sessionRow), remotePath: remoteHome, localPath: account.home_dir, directory: true, excludes: HOME_EXCLUDES, bwlimitKbps: bwlimit(), owner: account.uid != null ? account.username : undefined }, req);
         if (account.uid != null) await agent.op('fs.chown', { path: account.home_dir, owner: account.username, recursive: true }, { req });
         return { detail: `${r.filesTransferred ?? r.files ?? '?'} file(s), ${r.transferredBytes ?? 0} bytes copied from ${remoteHome}${r.partial ? ' (some files vanished or were unreadable)' : ''}`, bytes: r.transferredBytes ?? null };
       });
@@ -1304,6 +1349,7 @@ export function createTransfersService(ctx) {
       return { ...shapeJob(row), logs: jobs.get(id).logs };
     },
     cleanup,
+    reconcileRuns,
     JOB_TYPES,
   };
 }

@@ -14,6 +14,22 @@ describe('audit redaction', () => {
     expect(out.note.length).toBeLessThan(600);
   });
 
+  it('never passes a container through once nesting exceeds the depth limit', () => {
+    const nest = (n, leaf) => (n === 0 ? leaf : { level: nest(n - 1, leaf) });
+    for (const depth of [7, 8, 12]) {
+      for (const opaque of [false, true]) {
+        const row = JSON.stringify(redact(nest(depth, { password: 'hunter2', token: 'tok-1', env: { KEY: 'k' } }), 0, { opaque }));
+        expect(row).not.toContain('hunter2');
+        expect(row).not.toContain('tok-1');
+        expect(row).toContain('[…]');
+      }
+    }
+    // arrays past the limit are replaced too, and the limit does not touch what sits within it
+    expect(JSON.stringify(redact(nest(7, [{ secret: 's3cr3t' }])))).not.toContain('s3cr3t');
+    expect(redact(nest(6, { password: 'p', note: 'n' }))).toEqual(nest(6, { password: '[redacted]', note: 'n' }));
+    expect(redact(nest(7, 'leaf'))).toEqual(nest(7, 'leaf'));
+  });
+
   it('drops free text whole for audit rows (opaque), at any depth, and keeps every other key', () => {
     const input = { body: 'Welcome aboard', text: 't', message: 'm', content: 'c', env: { DATABASE_URL: 'pg://x' }, environment: { A: 1 }, name: 'kept', nested: { Body: 'x', note: 'n' }, list: [{ MESSAGE: 'z', chars: 3 }] };
     expect(redact(input, 0, { opaque: true })).toEqual({ body: '[redacted]', text: '[redacted]', message: '[redacted]', content: '[redacted]', env: '[redacted]', environment: '[redacted]', name: 'kept', nested: { Body: '[redacted]', note: 'n' }, list: [{ MESSAGE: '[redacted]', chars: 3 }] });

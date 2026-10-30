@@ -1,5 +1,14 @@
 import { ConfigPage } from '../../components/ConfigPage.jsx';
 
+// Same key and tiers as Update Preferences (server UPDATE_TIERS): a stored tier
+// missing here would render the select blank and saving would silently move it.
+export const UPDATE_TIER_OPTIONS = [
+  { value: 'stable', label: 'Stable' },
+  { value: 'release', label: 'Release' },
+  { value: 'current', label: 'Current' },
+  { value: 'edge', label: 'Edge (development builds)' },
+];
+
 export default function TweakSettings({ fn }) {
   return (
     <ConfigPage fn={fn} prefix="" groups={[
@@ -21,7 +30,7 @@ export default function TweakSettings({ fn }) {
       { title: 'System', fields: [
         { key: 'dns.default_ttl', label: 'Default DNS zone TTL (seconds)', type: 'number', min: 60 },
         { key: 'php.default_version', label: 'Default PHP version for new accounts', type: 'text', placeholder: 'ea-php83' },
-        { key: 'updates.tier', label: 'Update tier', type: 'select', options: ['stable', 'release', 'edge'] },
+        { key: 'updates.tier', label: 'Update tier', type: 'select', options: UPDATE_TIER_OPTIONS, help: 'Shared with Server Configuration › Update Preferences.' },
         { key: 'updates.auto', label: 'Automatic updates', type: 'toggle' },
         { key: 'analytics.enabled', label: 'Interface analytics', type: 'toggle', help: 'Anonymous usage statistics.' },
       ] },

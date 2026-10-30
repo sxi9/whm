@@ -90,7 +90,7 @@ defineOp('sys.processes', {
   schema: z.object({
     sort: z.enum(['cpu', 'mem', 'pid', 'time']).default('cpu'),
     limit: z.number().int().min(1).max(5000).default(500),
-    user: arg.username.optional(),
+    user: arg.psUser.optional(),
   }).strict(),
   run: async ({ sort, limit, user }) => {
     const sortFlag = { cpu: '-pcpu', mem: '-pmem', pid: 'pid', time: '-etimes' }[sort];

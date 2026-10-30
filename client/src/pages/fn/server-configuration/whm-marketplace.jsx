@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ExternalLink } from 'lucide-react';
 import { useApi } from '../../../hooks/useApi.js';
+import { FUNCTIONS } from '../../../nav.js';
 import { api, queryString } from '../../../api/client.js';
 import { useAuth } from '../../../auth/AuthContext.jsx';
 import { PageHeader, Card, Loading, StatusPill, EmptyState } from '../../../components/Common.jsx';
@@ -13,6 +14,8 @@ import { MarketplaceTab, MarketplaceDisabledNotice, canSeeHubOrigin, hubLabelOf 
 
 // Hub enabled → the hub catalog (resellers read-only, root manages) with the
 // static distribution packages underneath; hub off → the static catalog alone.
+// The static catalog is root-only (its route is requireRoot and it installs
+// host packages), so resellers get the hub catalog alone.
 // The hub is named by its origin for the panel owner only; everyone else
 // (the API answers them with `hubUrl: null`) sees the generic label.
 export default function WhmMarketplace({ fn }) {
@@ -25,10 +28,16 @@ export default function WhmMarketplace({ fn }) {
       <PageHeader fn={fn} description={hubOn ? `Plugins published on ${hubName}, verified and signed by the vendor, plus the distribution packages that extend the host.` : 'Add-ons that extend the panel. This is a read-only catalog for now: each entry links to the distribution packages behind it and the page that configures it once installed.'} />
       {status.data && !hubOn && user?.role === 'root' && <MarketplaceDisabledNotice />}
       {hubOn && <MarketplaceTab manage={user?.role === 'root'} status={status.data} />}
-      <StaticCatalog title={hubOn ? 'Distribution packages' : null} />
+      {user?.role === 'root' && <StaticCatalog title={hubOn ? 'Distribution packages' : null} />}
+      {user?.role !== 'root' && status.data && !hubOn && <EmptyState title="Marketplace not enabled">The plugin marketplace is not enabled on this server; the server owner can turn it on under Market Provider Manager.</EmptyState>}
     </>
   );
 }
+
+// The catalog is static data; a `configure` path that is not a panel function
+// would render as a dead link (NotFoundPage) exactly on hosts where the add-on
+// is installed, so only paths that nav.js knows get a Configure button.
+export const configureHref = (p) => (typeof p === 'string' && FUNCTIONS.some((f) => f.path === p.split(/[?#]/)[0]) ? p : null);
 
 export function StaticCatalog({ title = null }) {
   const toast = useToast();
@@ -74,7 +83,7 @@ export function StaticCatalog({ title = null }) {
                   <div className="row-actions" style={{ marginTop: 10, flexWrap: 'wrap' }}>
                     {!item.installed && item.packagesForHost?.length > 0 && <Button variant="primary" size="sm" loading={install.busy === item.id} disabled={Boolean(install.jobId) && install.itemId !== item.id} onClick={() => installPackages(item)}>Install packages</Button>}
                     {!item.installed && !item.packagesForHost?.length && <Link className="btn btn-sm btn-primary" to={item.installPath}>Install packages</Link>}
-                    {item.installed && item.configure && <Link className="btn btn-sm" to={item.configure}>Configure</Link>}
+                    {item.installed && configureHref(item.configure) && <Link className="btn btn-sm" to={item.configure}>Configure</Link>}
                     {item.docs && <a className="btn btn-sm btn-ghost" href={item.docs} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Docs</a>}
                   </div>
                   {install.itemId === item.id && install.jobId && (

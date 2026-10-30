@@ -205,6 +205,10 @@ describe('Backup API', () => {
       const res = await put(`/destinations/${s3Id}`, { config: { kind: 's3', bucket: 'whm-backups-2', region: 'eu-west-1', accessKey: 'AKIA2', secretKey: '' } }).expect(200);
       expect(res.body.data.config).toMatchObject({ bucket: 'whm-backups-2', accessKey: 'AKIA2', has_secret_key: true });
       expect(app.ctx.backup.destinationConfig(s3Id).secretKey).toBe('topsecret');
+      // The edit form never sends an S3 secret back ("leave blank to keep"): an update without the field keeps it too.
+      const noSecret = await put(`/destinations/${s3Id}`, { config: { kind: 's3', bucket: 'whm-backups-2', region: 'eu-west-1', accessKey: 'AKIA2', prefix: 'panel/', pathStyle: true } }).expect(200);
+      expect(noSecret.body.data.config).toMatchObject({ bucket: 'whm-backups-2', prefix: 'panel/', pathStyle: true, has_secret_key: true });
+      expect(app.ctx.backup.destinationConfig(s3Id)).toMatchObject({ secretKey: 'topsecret', pathStyle: true });
       await put(`/destinations/${ftpId}`, { enabled: false }).expect(200);
       expect((await get('/destinations').expect(200)).body.data.find((d) => d.id === ftpId).enabled).toBe(false);
       await put(`/destinations/${ftpId}`, { enabled: true }).expect(200);

@@ -180,7 +180,9 @@ export function renderEximMain(s, layout, support = eximSupport(layout)) {
 export function renderEximRcptAcl(s, support = { spf: true, dkim: true }, layout = null) {
   const emailAcl = layout?.emailAclFile || layout?.slots?.acl_rcpt?.includes || '/etc/exim/whm/acl-email-filters.conf';
   const lines = [`${MANAGED} (Exim Configuration Manager: RCPT ACL chain). Include inside acl_check_rcpt after the local/authenticated accepts, before the final accept.`];
-  const unauth = ['        !authenticated = *', '        !hosts = : 127.0.0.1 : ::1'];
+  // `::` inside a colon-separated Exim list is an escaped colon (the item would
+  // become the host-name pattern `:1`), so the list uses `;` as its separator.
+  const unauth = ['        !authenticated = *', '        !hosts = <; ; 127.0.0.1 ; ::1'];
   if (s.dictionaryAttackProtection) {
     lines.push('# Dictionary attack protection: slow down and then drop clients that keep guessing recipients',
       `drop    condition = \${if > {$rcpt_fail_count}{${s.rcptFailLimit}}}`, '        message = Too many invalid recipients from your host', `        delay = ${s.rcptFailDelay}s`, '        log_message = WHM dictionary attack protection ($rcpt_fail_count failed recipients)',

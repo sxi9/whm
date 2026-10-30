@@ -39,7 +39,8 @@
     "mail": {
       "from": "whm-hub@licserver.hostingsignal.in",
       "enabled": true,
-      "transport": "sendmail"
+      "transport": "smtp",
+      "smtp": { "host": "127.0.0.1", "port": 25, "secure": false, "starttls": "auto", "reject_unauthorized": true, "timeout_ms": 20000 }
     },
     "billing": {
       "stripe": {},

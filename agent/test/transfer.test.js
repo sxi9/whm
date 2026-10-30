@@ -137,6 +137,9 @@ describe('remote command construction', () => {
     expect(argv[0]).toBe('-rlpt');
     expect(argv).toEqual(expect.arrayContaining(['--partial', '--exclude=tmp/', '--bwlimit=500', '-e', 'ssh -p 22', 'root@src.example.com:/home/bob/', '/home/robert/']));
     expect(argv).not.toContain('--delete');
+    // A 4755 binary from the source must never exist as a setuid-root file in the new home, not even between the copy and the chown.
+    expect(argv).toContain('--chmod=u-s,g-s');
+    expect(argv.some((a) => a.startsWith('--chown'))).toBe(false);
     // The copy runs as root: device and special files from the source are never recreated.
     for (const flag of ['-D', '--devices', '--specials', '-a', '--archive']) expect(argv, flag).not.toContain(flag);
     expect(argv.filter((a) => /^-[a-zA-Z]+$/.test(a)).some((a) => a.includes('D'))).toBe(false);
@@ -144,6 +147,13 @@ describe('remote command construction', () => {
     expect(argv).toContain('--no-human-readable');
     expect(argv.some((a) => a.startsWith('--human-readable'))).toBe(false);
     expect(rsyncArgv({ transport: 'ssh', destination: 'root@h', src: '/tmp/whm-transfer-x.sql', dest: '/var/lib/whm/transfers/x.sql', directory: false, deleteExtraneous: true }).slice(-3)).toEqual(['--delete', 'root@h:/tmp/whm-transfer-x.sql', '/var/lib/whm/transfers/x.sql']);
+  });
+
+  it('creates received files as the account when an owner is given, with the special bits stripped', () => {
+    const argv = rsyncArgv({ transport: 'ssh', destination: 'root@h', src: '/home/bob', dest: '/home/robert', owner: { uid: 1001, gid: 1001 } });
+    expect(argv).toEqual(expect.arrayContaining(['--chmod=u-s,g-s', '--chown=1001:1001']));
+    expect(argv.indexOf('--chmod=u-s,g-s')).toBeLessThan(argv.indexOf('-e'));
+    expect(argv.slice(-2)).toEqual(['root@h:/home/bob/', '/home/robert/']);
   });
 
   it('brackets IPv6 hosts so rsync does not split the address at its first colon', () => {
@@ -190,7 +200,7 @@ describe('remote ops refuse bad connections and arguments before anything runs',
     for (const database of ['bob;drop', 'Bob_x', '--all-databases', 'a b', '']) {
       expect((await opError(runOp('transfer.remote.dump_database', { connection: conn, database }, ctx))).code, database).toBe('invalid_args');
     }
-    for (const args of [{ remotePath: '/home/bob', localPath: 'home/bob' }, { remotePath: 'home/bob', localPath: '/home/bob' }, { remotePath: '/home/bob;x', localPath: '/home/bob' }, { remotePath: '/home/bob', localPath: '/home/../etc' }, { remotePath: '/home/bob', localPath: '/home/bob', excludes: ['--delete'] }, { remotePath: '/home/bob', localPath: '/home/bob', bwlimitKbps: -1 }]) {
+    for (const args of [{ remotePath: '/home/bob', localPath: 'home/bob' }, { remotePath: 'home/bob', localPath: '/home/bob' }, { remotePath: '/home/bob;x', localPath: '/home/bob' }, { remotePath: '/home/bob', localPath: '/home/../etc' }, { remotePath: '/home/bob', localPath: '/home/bob', excludes: ['--delete'] }, { remotePath: '/home/bob', localPath: '/home/bob', bwlimitKbps: -1 }, { remotePath: '/home/bob', localPath: '/home/bob', owner: 'Bob' }, { remotePath: '/home/bob', localPath: '/home/bob', owner: 'bob:bob' }, { remotePath: '/home/bob', localPath: '/home/bob', owner: '1001' }]) {
       expect((await opError(runOp('transfer.remote.rsync', { connection: conn, ...args }, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
     }
     expect(exec).not.toHaveBeenCalled();
@@ -204,6 +214,23 @@ describe('remote ops refuse bad connections and arguments before anything runs',
       expect((await opError(runOp('transfer.remote.rsync', { connection: conn, remotePath: '/home/bob', localPath: '/etc/bob' }, ctx))).code).toBe('path_not_allowed');
     }
     expect(exec).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(!hasBinary('rsync'))('resolves the owner to a local uid/gid before connecting and refuses unknown users', async () => {
+    exec.mockClear();
+    const dest = path.join(root, 'rsync-owner');
+    expect((await opError(runOp('transfer.remote.rsync', { connection: conn, remotePath: '/home/bob', localPath: dest, owner: 'no-such-whm-user' }, ctx))).code).toBe('not_found');
+    expect(exec).not.toHaveBeenCalled();
+    expect(fs.existsSync(dest)).toBe(false);
+    if (!hasBinary('ssh')) return;
+    const nobody = fs.readFileSync('/etc/passwd', 'utf8').split('\n').find((l) => l.startsWith('nobody:'))?.split(':');
+    if (!nobody) return;
+    exec.mockImplementationOnce(async () => ({ code: 0, stdout: 'Number of files: 1\nNumber of regular files transferred: 1\nTotal file size: 10\nTotal transferred file size: 10\n', stderr: '' }));
+    const r = await runOp('transfer.remote.rsync', { connection: conn, remotePath: '/home/bob', localPath: dest, owner: 'nobody' }, ctx);
+    expect(r).toMatchObject({ to: dest, code: 0, filesTransferred: 1 });
+    const [bin, argv] = exec.mock.calls[0];
+    expect(bin).toBe('rsync');
+    expect(argv).toEqual(expect.arrayContaining(['--chmod=u-s,g-s', `--chown=${nobody[2]}:${nobody[3]}`]));
   });
 
   it.skipIf(hasBinary('ssh'))('reports a missing ssh client as a capability error without running anything', async () => {

@@ -7,7 +7,7 @@ export function AccountDiskTable({ accounts, loading, error }) {
   return (
     <DataTable dense rows={accounts || []} loading={loading} error={error} rowKey={(a) => a.username} emptyText="No accounts yet."
       columns={[
-        { key: 'username', label: 'Account', render: (a) => <><Link to={`/account-information/list-accounts?q=${encodeURIComponent(a.username)}`}>{a.username}</Link>{a.suspended && <> <StatusPill status="suspended">Suspended</StatusPill></>}</> },
+        { key: 'username', label: 'Account', render: (a) => <><Link to={`/account-functions/modify-an-account?username=${encodeURIComponent(a.username)}`}>{a.username}</Link>{a.suspended && <> <StatusPill status="suspended">Suspended</StatusPill></>}</> },
         { key: 'domain', label: 'Domain' },
         { key: 'owner', label: 'Owner' },
         { key: 'homeDir', label: 'Home', render: (a) => <code>{a.homeDir}</code> },

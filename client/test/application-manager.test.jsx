@@ -23,7 +23,7 @@ vi.mock('../src/hooks/useApi.js', () => ({
 }));
 
 const { PresetCards, PresetCatalog, presetFields } = await import('../src/pages/apps/PresetCards.jsx');
-const { emptyForm, applyPreset, applyKind, buildCreatePayload, stepErrors, StepWhat, runtimeOptions, needsRuntime, cleanBuild } = await import('../src/pages/apps/AppForm.jsx');
+const { emptyForm, applyPreset, applyKind, buildCreatePayload, stepErrors, StepWhat, LimitsFields, limitsErrors, runtimeOptions, needsRuntime, cleanBuild } = await import('../src/pages/apps/AppForm.jsx');
 const { EnvEditor, envToRows, rowsToEnv, envErrors, parseDotenv } = await import('../src/pages/apps/EnvEditor.jsx');
 const { AppStatusPill, suggestRoot, FALLBACK_PRESETS, CapabilitySummary } = await import('../src/pages/apps/Shared.jsx');
 const { AppOverview, settingsPayload } = await import('../src/pages/apps/AppDetail.jsx');
@@ -175,6 +175,26 @@ describe('create form', () => {
     expect(suggestRoot({ home: '/home/alice', kind: 'node', name: 'Shop API!' })).toBe('/home/alice/apps/shop-api');
     expect(suggestRoot({ home: '/home/alice', kind: 'static', name: '' })).toBe('/home/alice/public_html/app');
     expect(runtimeOptions('python', RUNTIMES).map((o) => o.value)).toEqual(['system', '3.12']);
+  });
+
+  it('keeps the limits editor within the server schema ranges', () => {
+    const blank = emptyForm();
+    const html = render(<LimitsFields value={blank.limits} onChange={() => {}} />);
+    expect(html).toContain('min="16" max="32768"');
+    expect(html).toContain('16–32768');
+    expect(html).not.toContain('16–65536');
+    expect(html).toContain('min="64" max="65536"');
+    expect(html).toContain('min="10" max="800"');
+    expect(limitsErrors(blank.limits)).toEqual([]);
+    expect(limitsErrors({ ...blank.limits, tasksMax: 32768 })).toEqual([]);
+    expect(limitsErrors({ ...blank.limits, tasksMax: 40000 })[0]).toContain('between 16 and 32768');
+    expect(limitsErrors({ ...blank.limits, tasksMax: 65536 })[0]).toContain('between 16 and 32768');
+    expect(limitsErrors({ ...blank.limits, memoryMaxMb: 65537 })[0]).toContain('Memory limit');
+    expect(limitsErrors({ ...blank.limits, cpuQuotaPercent: 801 })[0]).toContain('CPU quota');
+    expect(limitsErrors({ ...blank.limits, cpuQuotaPercent: 12.5 })[0]).toContain('whole number');
+    expect(stepErrors(3, { ...blank, limits: { ...blank.limits, tasksMax: 40000 } })[0]).toContain('Max tasks');
+    expect(stepErrors(3, { ...blank, kind: 'static', limits: { ...blank.limits, tasksMax: 40000 } })).toEqual([]);
+    expect(stepErrors(3, blank)).toEqual([]);
   });
 
   it('checks the name against the server pattern on step 1, not on the final POST', () => {

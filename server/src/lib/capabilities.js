@@ -56,6 +56,24 @@ const REQUIRED = {
   perl: ['perl'],
 };
 
+// A service row's unit candidate may be a glob (php*-fpm): Debian/Ubuntu
+// version the PHP-FPM unit name (php8.4-fpm on Debian 13) and the stored row
+// cannot list every release. Exact names resolve in the order given; a glob
+// resolves to the newest of the units it matches (8.10 sorts after 8.4).
+const globToRegExp = (glob) => new RegExp(`^${glob.split('*').map((s) => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*')}$`);
+export function resolveUnit(candidates, present) {
+  for (const candidate of candidates) {
+    if (!candidate.includes('*')) {
+      if (present.has(candidate)) return candidate;
+      continue;
+    }
+    const re = globToRegExp(candidate);
+    const matches = [...present].filter((u) => re.test(u)).sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    if (matches.length) return matches[0];
+  }
+  return null;
+}
+
 export function createCapabilities({ agent, db, logger }) {
   let snapshot = { at: 0, binaries: {}, paths: {}, capabilities: {}, units: {} };
 
@@ -85,7 +103,7 @@ export function createCapabilities({ agent, db, logger }) {
     try {
       const present = new Set(await agent.op('svc.list_units'));
       for (const row of db.prepare('SELECT name, unit_candidates FROM services').all()) {
-        units[row.name] = JSON.parse(row.unit_candidates).find((u) => present.has(u)) || null;
+        units[row.name] = resolveUnit(JSON.parse(row.unit_candidates), present);
       }
     } catch (err) {
       logger.warn({ err }, 'could not list systemd units');

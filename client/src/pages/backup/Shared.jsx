@@ -113,13 +113,16 @@ const EMPTY = { local: { dir: '/backup/offsite' }, ftp: { host: '', port: 21, us
 
 export function emptyDestination(kind) { return { kind, ...EMPTY[kind] }; }
 
+const SECRET_FIELDS = ['password', 'secretKey', 'privateKey'];
+
 // Strips blanks the API would reject and keeps the shape of the agent schema.
-export function cleanDestination(cfg) {
+// On an edit a blank secret is sent as '' so the server keeps the stored one.
+export function cleanDestination(cfg, { editing = false } = {}) {
   const out = { kind: cfg.kind };
   for (const [k, v] of Object.entries(cfg)) {
     if (k === 'kind') continue;
     if (v === '' || v === null || v === undefined) {
-      if (cfg.kind === 'ftp' && k === 'password') out[k] = '';
+      if ((cfg.kind === 'ftp' && k === 'password') || (editing && SECRET_FIELDS.includes(k))) out[k] = '';
       continue;
     }
     out[k] = v;

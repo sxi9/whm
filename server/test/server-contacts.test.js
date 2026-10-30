@@ -335,6 +335,26 @@ describe('Server Contacts API', () => {
     expect(auditRows('contacts.remove').at(-1).target).toBe('hooks.slack.com/services/T0AB…/…0099');
   });
 
+  it('keeps a credential-bearing address out of the route-level audit row when the request is rejected', async () => {
+    const leak = 'https://hooks.slack.com/services/T0LEAKLEAK/B0LEAKLEAK/LeakToken7777777';
+    const bad = await post('/api/server-contacts/contacts', { channel: 'slack', address: leak, events: ['Bad Key!'] });
+    expect(bad.status).toBe(422);
+    expect(Object.keys(bad.body.error.fields).some((k) => k.startsWith('events'))).toBe(true);
+    expect((await reseller.post('/api/server-contacts/contacts').set('X-CSRF-Token', resellerCsrf).send({ channel: 'slack', address: leak })).status).toBe(403);
+    const created = await post('/api/server-contacts/contacts', { channel: 'slack', address: leak }).expect(201);
+    expect(created.body.data.address).toBe('hooks.slack.com/services/T0LE…/…7777');
+    expect((await patch(`/api/server-contacts/contacts/${created.body.data.id}`, { address: leak, channel: 'slack', events: ['Bad Key!'] })).status).toBe(422);
+    // Without a channel in the patch the row's channel is unknown before the service runs: URLs are redacted outright.
+    expect((await patch(`/api/server-contacts/contacts/${created.body.data.id}`, { address: 'https://hooks.slack.com/services/T0LEAKLEAK/B0LEAKLEAK/LeakToken8888888', name: 'x'.repeat(81) })).status).toBe(422);
+    expect((await patch(`/api/server-contacts/contacts/${created.body.data.id}`, { address: 'https://user:LeakPw999@127.0.0.1/hook', channel: 'webhook' })).status).toBe(422);
+    expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE args_redacted LIKE '%LeakToken%' OR target LIKE '%LeakToken%' OR args_redacted LIKE '%LeakPw%'").get().n).toBe(0);
+    const generic = auditRows('POST /api/server-contacts/contacts').slice(-3).map((r) => [r.result, JSON.parse(r.args_redacted).address]);
+    expect(generic).toEqual([['error:422', 'hooks.slack.com/services/T0LE…/…7777'], ['error:403', 'hooks.slack.com/services/T0LE…/…7777'], ['ok', 'hooks.slack.com/services/T0LE…/…7777']]);
+    const patches = auditRows('PATCH /api/server-contacts/contacts/:id').slice(-3).map((r) => JSON.parse(r.args_redacted).address);
+    expect(patches).toEqual(['hooks.slack.com/services/T0LE…/…7777', '[redacted]', '[redacted]']);
+    await del(`/api/server-contacts/contacts/${created.body.data.id}`).expect(200);
+  });
+
   it('converts plaintext webhook URLs stored by earlier versions into the encrypted form at boot', async () => {
     const legacy = 'https://hooks.slack.com/services/T0LEGACY/B0LEGACY/LegacyToken4321';
     const { lastInsertRowid } = app.ctx.db.prepare("INSERT INTO contacts (channel, address, events_json, enabled, config_json) VALUES ('slack', ?, '[\"*\"]', 1, '{\"channelName\":\"#old\"}')").run(legacy);

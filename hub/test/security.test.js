@@ -226,10 +226,18 @@ test('portal: login with password + TOTP, step-up gate, CSRF, lockout, 2FA enrol
   assert.equal((await agent3.get('/v1/portal/users')).body.error.code, 'insufficient_role');
   void support;
 
-  // password change destroys every session of the user
+  // password change destroys every session of the user; neither the attempted
+  // nor the accepted passwords reach audit_log (admin:read can list it)
+  assert.equal((await agent.post('/v1/portal/password').set('X-CSRF-Token', csrf).send({ current: 'Wrong-Pass-999', next: 'Vendor-Pass-456' })).status, 401);
   const pw = await agent.post('/v1/portal/password').set('X-CSRF-Token', csrf).send({ current: 'Vendor-Pass-123', next: 'Vendor-Pass-456' });
   assert.equal(pw.status, 200);
   assert.equal((await agent2.get('/v1/portal/me')).status, 401);
+  // the refused attempt is filed under 'POST /password' (Express restores req.baseUrl before the error handler runs)
+  const pwRows = h.db.prepare("SELECT args_redacted, result FROM audit_log WHERE action IN ('POST /v1/portal/password', 'POST /password') ORDER BY id").all();
+  assert.deepEqual(pwRows.map((r) => r.result), ['error:401', 'ok']);
+  for (const row of pwRows) assert.deepEqual(JSON.parse(row.args_redacted), { current: '[redacted]', next: '[redacted]' });
+  const auditText = JSON.stringify(h.db.prepare('SELECT args_redacted FROM audit_log').all());
+  assert.ok(!/Vendor-Pass-|Wrong-Pass-/.test(auditText), 'portal passwords never reach audit_log');
 
   // lockout after 10 failures
   const lockHub = await bootHub({ config: { license: { rate_limits: { portal_login: { max: 100, windowMs: 60_000 } } } } });

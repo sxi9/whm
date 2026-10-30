@@ -114,7 +114,10 @@ function createMockHub({ now = () => Date.now(), features = FEATURES, edition = 
     post(u, parsed) {
       const p = u.pathname;
       if (p === '/v1/activate') return hub.answer(parsed, { data: { ...hub.extras(), token: hub.mintToken({ fp: parsed.fingerprint }), activation_id: 'act_test0001', checkin_interval_hours: 12, messages: hub.messages, status: 'active' } });
-      if (p === '/v1/checkin') return hub.answer(parsed, { data: { ...hub.extras(), token: hub.mintToken({ fp: parsed.fingerprint }), activation_id: 'act_test0001', status: 'active', revoked: false, license: { edition, expires_at: new Date(now() + 365 * DAY * 1000).toISOString(), days_left: 365 }, messages: hub.messages } });
+      if (p === '/v1/checkin') {
+        if (hub.checkinError) return hub.answer(parsed, { status: 403, error: hub.checkinError });
+        return hub.answer(parsed, { data: { ...hub.extras(), token: hub.mintToken({ fp: parsed.fingerprint }), activation_id: 'act_test0001', status: 'active', revoked: false, license: { edition, expires_at: new Date(now() + 365 * DAY * 1000).toISOString(), days_left: 365 }, messages: hub.messages } });
+      }
       if (p === '/v1/deactivate') return hub.answer(parsed, { data: { deactivated: true } });
       if (p === '/v1/market/download') {
         if (!/^WHMT1\./.test(parsed.token || '')) return hub.answer(parsed, { status: 401, error: { code: 'token_invalid', message: 'no token' } });
@@ -872,6 +875,33 @@ describe('degraded license and install sources', () => {
   it('registers both job types and the two schedules', () => {
     expect(app.ctx.jobs.types()).toEqual(expect.arrayContaining([INSTALL_JOB, UPDATE_JOB, REVOCATIONS_JOB, 'marketplace.update-check']));
     expect(app.ctx.scheduler.list().map((s) => s.name)).toEqual(expect.arrayContaining([REVOCATIONS_SCHEDULE, UPDATE_CHECK_SCHEDULE]));
+  });
+
+  it('skips the scheduled revocation poll while the license is degraded but its token is still stored', async () => {
+    const lastInstall = app.ctx.jobs.list({ type: INSTALL_JOB, limit: 1 })[0];
+    if (lastInstall) await waitForJob(app.ctx, lastInstall.id, 15_000);
+    const feedCalls = () => hub.calls.filter((c) => c.url.endsWith('/v1/market/revocations')).length;
+    const n0 = feedCalls();
+    // The hub's word at check-in (suspended) degrades the license and keeps the
+    // token: the poll must not run against a token the hub now refuses.
+    hub.checkinError = { code: 'suspended', message: 'License suspended' };
+    try {
+      expect((await post('/api/license/checkin').expect(200)).body.data).toMatchObject({ ok: false, status: 'suspended', code: 'suspended' });
+      expect(app.ctx.license.get()).toMatchObject({ status: 'suspended', degraded: true, enforce: true, hasToken: true });
+      expect(app.ctx.license.token()).toBeTruthy();
+      expect((await get('/api/marketplace/status').expect(200)).body.data).toMatchObject({ enabled: true, licenseDegraded: true, hasToken: true });
+      expect(await app.ctx.marketplace.pollRevocations()).toEqual({ skipped: 'license_degraded', applied: [] });
+      const job = await waitForJob(app.ctx, app.ctx.jobs.enqueue(REVOCATIONS_JOB, { reason: 'scheduled' }).id, 15_000);
+      expect(job.status, job.error).toBe('done');
+      expect(job.result).toEqual({ skipped: 'license_degraded', applied: [] });
+      expect(feedCalls()).toBe(n0);
+      expect(stateRow().fail_count).toBe(0);
+    } finally { hub.checkinError = null; }
+    // The next good check-in restores the license and the poll reaches the hub again.
+    expect((await post('/api/license/checkin').expect(200)).body.data).toMatchObject({ ok: true, status: 'active' });
+    expect(app.ctx.license.get().degraded).toBe(false);
+    expect((await post('/api/marketplace/revocations/poll').expect(200)).body.data).toMatchObject({ applied: [] });
+    expect(feedCalls()).toBe(n0 + 1);
   });
 });
 

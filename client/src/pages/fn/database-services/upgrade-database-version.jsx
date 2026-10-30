@@ -10,6 +10,14 @@ import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { RequestError, engineLabel } from '../../databases/Shared.jsx';
 
+// With no candidate from the package manager the Select can only show "Other
+// package…" and never fires onChange, so the typed name is the target even
+// though nothing was explicitly selected.
+export function resolveTarget({ target, customTarget, options }) {
+  const customMode = target === '__custom' || (!options.length && !target);
+  return { customMode, chosen: customMode ? customTarget.trim() : target || options[0]?.value || '' };
+}
+
 export default function UpgradeDatabaseVersion({ fn }) {
   const toast = useToast();
   const confirm = useConfirm();
@@ -21,7 +29,7 @@ export default function UpgradeDatabaseVersion({ fn }) {
   const [runError, setRunError] = useState(null);
   const [busy, setBusy] = useState(false);
   const options = (data?.packages?.available || []).map((p) => ({ value: p.name, label: `${p.name} → ${p.candidate}${p.installed ? ` (installed ${p.installed})` : ''}` }));
-  const chosen = target === '__custom' ? customTarget.trim() : target || options[0]?.value || '';
+  const { customMode, chosen } = resolveTarget({ target, customTarget, options });
 
   const run = async () => {
     const ok = await confirm({ title: `Upgrade to ${chosen}?`, message: `${backup ? 'All databases are dumped to the backup directory first. ' : ''}The package is installed through the system package manager, the server restarts and system tables are upgraded. Downgrades are not supported; keep the backup until applications have been verified.`, confirmLabel: 'Start upgrade', danger: true, typeToConfirm: 'UPGRADE' });
@@ -54,7 +62,7 @@ export default function UpgradeDatabaseVersion({ fn }) {
               <Field label="Target package" help={options.length ? 'Candidates offered by the package manager' : 'No candidate found; enter the package name'}>
                 <Select value={target || options[0]?.value || '__custom'} onChange={setTarget} options={[...options, { value: '__custom', label: 'Other package…' }]} />
               </Field>
-              {(target === '__custom' || !options.length) && <Field label="Package name" required><TextInput value={customTarget} onChange={setCustomTarget} placeholder="mariadb-server" /></Field>}
+              {customMode && <Field label="Package name" required><TextInput value={customTarget} onChange={setCustomTarget} placeholder="mariadb-server" /></Field>}
             </div>
             <Field inline><Toggle checked={backup} onChange={setBackup} label="Dump all databases before upgrading" description="mysqldump --all-databases into the backup directory (recommended)" /></Field>
             <FormActions><Button variant="danger" loading={busy} onClick={run} disabled={!chosen || !data.local || !data.installerAvailable}>Upgrade database server</Button></FormActions>

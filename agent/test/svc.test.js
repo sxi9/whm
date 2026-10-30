@@ -180,3 +180,41 @@ describe('svc.resolve template instances', () => {
     } finally { const mod = await vi.importActual('../src/exec.js'); hasBinary.mockImplementation(mod.hasBinary); }
   });
 });
+
+describe('svc.status enabled', () => {
+  const show = (unitFileState, extra = '') => `ActiveState=active\nSubState=running\nUnitFileState=${unitFileState}\nMainPID=1234\nLoadState=loaded\nDescription=Test unit\n${extra}`;
+
+  it('reports enabled for every UnitFileState that starts at boot, not only enabled/static', async () => {
+    const { unitStartsAtBoot } = await import('../src/ops/svc.js');
+    const { hasBinary } = await import('../src/exec.js');
+    hasBinary.mockImplementation((name) => name === 'systemctl');
+    try {
+      // Debian pure-ftpd ships only /etc/init.d/pure-ftpd -> systemd-sysv-generator -> 'generated'.
+      for (const state of ['enabled', 'enabled-runtime', 'static', 'indirect', 'generated', 'alias']) {
+        expect(unitStartsAtBoot(state), state).toBe(true);
+        exec.mockResolvedValueOnce({ code: 0, stdout: show(state), stderr: '', bin: '/bin/systemctl', argv: [] });
+        const result = await runOp('svc.status', { unit: 'pure-ftpd' }, ctx);
+        expect(result, state).toMatchObject({ unit: 'pure-ftpd', installed: true, active: true, enabled: true, unitFileState: state, pid: 1234 });
+      }
+      for (const state of ['disabled', 'masked', 'masked-runtime', 'linked', 'linked-runtime', 'transient', 'bad', '']) {
+        expect(unitStartsAtBoot(state), JSON.stringify(state)).toBe(false);
+        exec.mockResolvedValueOnce({ code: 0, stdout: show(state), stderr: '', bin: '/bin/systemctl', argv: [] });
+        const result = await runOp('svc.status', { unit: 'pure-ftpd' }, ctx);
+        expect(result.enabled, JSON.stringify(state)).toBe(false);
+        expect(result.unitFileState).toBe(state || null);
+      }
+      expect(unitStartsAtBoot(undefined)).toBe(false);
+      expect(exec.mock.calls.every(([bin, argv]) => bin === 'systemctl' && argv[0] === 'show' && argv[1] === 'pure-ftpd.service')).toBe(true);
+    } finally { const mod = await vi.importActual('../src/exec.js'); hasBinary.mockImplementation(mod.hasBinary); }
+  });
+
+  it('reports a unit that systemd does not know as not installed and not enabled', async () => {
+    const { hasBinary } = await import('../src/exec.js');
+    hasBinary.mockImplementation((name) => name === 'systemctl');
+    exec.mockResolvedValueOnce({ code: 0, stdout: 'ActiveState=inactive\nSubState=dead\nUnitFileState=\nMainPID=0\nLoadState=not-found\n', stderr: '', bin: '/bin/systemctl', argv: [] });
+    try {
+      const result = await runOp('svc.status', { unit: 'nope' }, ctx);
+      expect(result).toMatchObject({ unit: 'nope', installed: false, active: false, enabled: false, unitFileState: null, pid: null });
+    } finally { const mod = await vi.importActual('../src/exec.js'); hasBinary.mockImplementation(mod.hasBinary); }
+  });
+});

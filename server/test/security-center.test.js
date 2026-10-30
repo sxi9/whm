@@ -570,7 +570,9 @@ describe('SMTP restrictions, mod_userdir, wheel group', () => {
   });
 
   it('normalises the Basic Setup home root before handing it to the agent', async () => {
-    await put('/api/system/settings', { 'basic.home_root': '/home/' });
+    // The settings API now refuses a trailing slash; a value stored before
+    // that, or set directly, still reaches the agent in canonical form.
+    app.ctx.settings.set('basic.home_root', '/home/');
     try {
       const res = await put('/api/security/userdir', { enabled: true, excludeUsers: [] });
       expect(res.status).toBe(200);
@@ -631,6 +633,11 @@ describe('ModSecurity', () => {
     const res = await put('/api/security/modsec/config', { directives: { SecRuleEngine: 'On', SecRequestBodyLimit: 13107200 } });
     expect(res.status).toBe(200);
     expect(res.body.data.directives).toEqual({ SecRuleEngine: 'On', SecRequestBodyLimit: 13107200 });
+    // The stock value every distribution ships (and the page's placeholder) carries ":" and "!".
+    const stock = await put('/api/security/modsec/config', { directives: { SecAuditLogRelevantStatus: '^(?:5|4(?!04))' } });
+    expect(stock.status).toBe(200);
+    expect(stock.body.data.directives).toEqual({ SecAuditLogRelevantStatus: '^(?:5|4(?!04))' });
+    expect((await put('/api/security/modsec/config', { directives: { SecAuditLogRelevantStatus: '^(?:5|4(?!04))"' } })).status).toBe(422);
     expect((await put('/api/security/modsec/config', { directives: { SecRuleEngine: 'Maybe' } })).status).toBe(422);
     expect((await put('/api/security/modsec/config', { directives: { SecAuditLog: '/tmp/x' } })).status).toBe(422);
   });
@@ -1128,14 +1135,19 @@ describe('security advisor', () => {
     expect(findings.find((f) => f.id === 'pkg.updates')).toMatchObject({ grade: 'ok', title: 'All distribution packages are up to date' });
     expect(findings.find((f) => f.id === 'smtp.restricted')).toMatchObject({ grade: 'warning' });
     expect(findings.find((f) => f.id === 'policy.unenforced')).toBeUndefined();
-    await put('/api/system/settings', { 'security.policy.verified_ip_login': true, 'security.2fa.required_for_root': true });
+    expect(findings.find((f) => f.id === 'policy.enforced')).toBeUndefined();
+    await put('/api/system/settings', { 'security.policy.verified_ip_login': true, 'security.2fa.required_for_root': true, 'security.questions.enabled': true });
+    let lastSummary = summary;
     try {
       const again = await post('/api/security/advisor/scan');
-      expect(again.body.data.findings.find((f) => f.id === 'policy.unenforced')).toMatchObject({ grade: 'warning', title: '2 login policies are stored but not enforced yet', fix: { path: '/security-center/configure-security-policies' } });
-    } finally { await put('/api/system/settings', { 'security.policy.verified_ip_login': false, 'security.2fa.required_for_root': false }); }
+      lastSummary = again.body.data.summary;
+      // Core auth enforces the login policies; only security questions have no reader yet.
+      expect(again.body.data.findings.find((f) => f.id === 'policy.enforced')).toMatchObject({ grade: 'ok', title: '2 login policies are active (verified-IP login, 2FA for root)' });
+      expect(again.body.data.findings.find((f) => f.id === 'policy.unenforced')).toMatchObject({ grade: 'warning', title: 'Security questions are enabled but not enforced yet', fix: { path: '/security-center/security-questions' } });
+    } finally { await put('/api/system/settings', { 'security.policy.verified_ip_login': false, 'security.2fa.required_for_root': false, 'security.questions.enabled': false }); }
     expect(findings.map((f) => f.grade)).toEqual([...findings.map((f) => f.grade)].sort((a, b) => ({ critical: 0, warning: 1, info: 2, ok: 3 })[a] - ({ critical: 0, warning: 1, info: 2, ok: 3 })[b]));
     const last = await get('/api/security/advisor');
-    expect(last.body.data.summary).toEqual(summary);
+    expect(last.body.data.summary).toEqual(lastSummary);
     expect(last.body.data.trigger).toBe('manual');
   });
 

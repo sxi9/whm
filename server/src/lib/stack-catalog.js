@@ -83,7 +83,8 @@ export const STACK_COMPONENTS = [
   {
     key: 'spamassassin', label: 'SpamAssassin (spamd)', capability: 'spamassassin', service: 'spamd', recommended: true,
     description: 'Spam scoring for incoming mail (Email › Spamd Startup Configuration).',
-    packages: { debian: ['spamassassin', 'spamc'], rhel: ['spamassassin'] },
+    // Debian 12 / Ubuntu 24.04 ship the daemon as the separate `spamd` package; `spamassassin` alone installs no unit.
+    packages: { debian: ['spamassassin', 'spamd', 'spamc'], rhel: ['spamassassin'] },
     units: ['spamd', 'spamassassin'],
     postInstall: [{ kind: 'enable' }],
   },

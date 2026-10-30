@@ -87,7 +87,7 @@ export function StackCard({ stack, busy, onInstall }) {
   const installed = components.filter((c) => c.installed);
   const missing = components.filter((c) => !c.installed);
   const toggle = (key, on) => setSelected((s) => (on ? [...new Set([...s, key])] : s.filter((k) => k !== key)));
-  const profile = (key) => d.profiles.find((p) => p.key === key);
+  const profile = (key) => d?.profiles?.find((p) => p.key === key) ?? null;
   const missingIn = (p) => (p ? p.components.filter((k) => missing.some((c) => c.key === k)) : []);
   const full = profile('full'); const web = profile('web');
   const active = d?.activeJob || null;

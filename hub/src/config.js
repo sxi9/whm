@@ -40,7 +40,25 @@ const schema = z.object({
     lookup_block: z.object({ failures: z.number().int().min(1).default(20), windowMs: z.number().int().default(3600_000), blockMs: z.number().int().default(24 * 3600_000) }).default({}),
     backup_dir: z.string().nullable().default('/var/backups/whm-hub'),
     backup_keep: z.number().int().min(1).default(48),
-    mail: z.object({ from: z.string().default('whm-hub@localhost'), enabled: z.boolean().default(true), transport: z.enum(['sendmail', 'none']).default('sendmail') }).default({}),
+    // "smtp" is the default because deploy/whm-hub.service runs with
+    // NoNewPrivileges=yes, under which the setuid/setgid `sendmail` wrapper
+    // cannot reach the MTA spool; "sendmail" stays for unhardened deployments.
+    mail: z.object({
+      from: z.string().default('whm-hub@localhost'),
+      enabled: z.boolean().default(true),
+      transport: z.enum(['smtp', 'sendmail', 'none']).default('smtp'),
+      smtp: z.object({
+        host: z.string().min(1).default('127.0.0.1'),
+        port: z.number().int().min(1).max(65535).default(25),
+        secure: z.boolean().default(false),
+        starttls: z.enum(['auto', 'require', 'off']).default('auto'),
+        user: z.string().optional(),
+        pass: z.string().optional(),
+        reject_unauthorized: z.boolean().default(true),
+        ca_file: z.string().optional(),
+        timeout_ms: z.number().int().min(1000).default(20_000),
+      }).default({}),
+    }).default({}),
     billing: z.object({
       stripe: z.object({ secret: z.string().optional() }).default({}),
       whmcs: z.object({ secret: z.string().optional() }).default({}),
@@ -79,6 +97,11 @@ const ENV_MAP = {
   WHM_HUB_ACTIVE_LICENSE_KID: ['keys.active_kid.license'],
   WHM_HUB_ACTIVE_PLUGIN_KID: ['keys.active_kid.plugin'],
   WHM_HUB_MAIL_FROM: ['license.mail.from'],
+  WHM_HUB_MAIL_TRANSPORT: ['license.mail.transport'],
+  WHM_HUB_SMTP_HOST: ['license.mail.smtp.host'],
+  WHM_HUB_SMTP_PORT: ['license.mail.smtp.port', 'int'],
+  WHM_HUB_SMTP_USER: ['license.mail.smtp.user'],
+  WHM_HUB_SMTP_PASS: ['license.mail.smtp.pass'],
   WHM_HUB_STRIPE_SECRET: ['license.billing.stripe.secret'],
   WHM_HUB_WHMCS_SECRET: ['license.billing.whmcs.secret'],
   WHM_HUB_PADDLE_SECRET: ['license.billing.paddle.secret'],

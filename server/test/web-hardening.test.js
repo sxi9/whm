@@ -189,6 +189,26 @@ describe('HTTPS by default', () => {
     expect((await plain().get('/api/auth/me').set('Host', 'panel.example.com')).status).toBe(301);
   });
 
+  it('logs in over plain HTTP once the redirect is off, keeping the Secure flag for TLS sessions', async () => {
+    // express-session never puts a Secure cookie on a plain-HTTP response, so a
+    // static secure=true left every WHM_FORCE_HTTPS=false install looping at
+    // the login page on 2086: 200 from /login, no cookie, 401 from /me.
+    tls.ctx.settings.set('panel.force_https', false);
+    try {
+      const http = plain();
+      const login = await http.post('/api/auth/login').set('Host', 'panel.example.com').send({ username: 'root', password: 'Test-Passw0rd!1' });
+      expect(login.status).toBe(200);
+      const cookie = (login.headers['set-cookie'] || []).join(';');
+      expect(cookie).toMatch(/whm\.sid=.*HttpOnly/);
+      expect(cookie).not.toMatch(/Secure/);
+      expect((await http.get('/api/auth/me').set('Host', 'panel.example.com')).status).toBe(200);
+      // A session established over TLS (here a loopback proxy saying so) keeps the flag.
+      const proxied = await plain().post('/api/auth/login').set('Host', 'panel.example.com').set('X-Forwarded-Proto', 'https').send({ username: 'root', password: 'Test-Passw0rd!1' });
+      expect(proxied.status).toBe(200);
+      expect((proxied.headers['set-cookie'] || []).join(';')).toMatch(/whm\.sid=.*Secure/);
+    } finally { tls.ctx.settings.set('panel.force_https', true); }
+  });
+
   it('WHM_FORCE_HTTPS=false and config.forceHttps override the setting', async () => {
     process.env.WHM_FORCE_HTTPS = 'false';
     let env;

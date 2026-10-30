@@ -25,7 +25,7 @@ const killsQuery = z.object({
   user: psUser.optional(), result: z.enum(['killed', 'failed', 'gone', 'would-kill']).optional(),
   sort: z.enum(['killed_at', 'pid', 'user', 'command', 'pattern', 'result']).optional(), dir: z.enum(['asc', 'desc']).optional(),
 });
-const processesQuery = z.object({ sort: z.enum(['cpu', 'mem', 'pid', 'time']).default('cpu'), limit: z.coerce.number().int().min(1).max(5000).default(500), user: fields.username.optional() });
+const processesQuery = z.object({ sort: z.enum(['cpu', 'mem', 'pid', 'time']).default('cpu'), limit: z.coerce.number().int().min(1).max(5000).default(500), user: psUser.optional() });
 
 export async function register(ctx) {
   ctx.systemHealth = createSystemHealthService(ctx);

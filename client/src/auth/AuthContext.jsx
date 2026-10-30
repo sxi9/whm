@@ -3,6 +3,13 @@ import { api } from '../api/client.js';
 
 const AuthContext = createContext(null);
 
+// /auth/password answers with the login shape (publicUser + mustEnroll2fa), not
+// the /auth/me one: merged over the shell user so policy, profile and license
+// survive and the pending 2FA enrolment still redirects.
+export function userAfterPasswordChange(user, data) {
+  return { ...user, ...data.user, mustEnroll2fa: Boolean(data.mustEnroll2fa) };
+}
+
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [hostname, setHostname] = useState('');
@@ -46,7 +53,7 @@ export function AuthProvider({ children }) {
     async changePassword(currentPassword, newPassword) {
       const { data } = await api.post('/auth/password', currentPassword ? { currentPassword, newPassword } : { newPassword });
       api.setCsrfToken(data.csrfToken);
-      setUser(data.user);
+      setUser((u) => userAfterPasswordChange(u, data));
     },
     async logout() {
       try { await api.post('/auth/logout'); } finally { setUser(null); api.setCsrfToken(null); }

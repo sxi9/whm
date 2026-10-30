@@ -640,12 +640,18 @@ describe('Exim Configuration Manager', () => {
     expect(renderEximRcptAcl({ ...s, requireHelo: false, rblEnabled: false, verifySender: false, spfVerify: false, dictionaryAttackProtection: false }, undefined, EXIM_LAYOUT)).toContain(`No RCPT protections are enabled.\n# Email filters`);
     expect(acl).toContain('drop    condition = ${if > {$rcpt_fail_count}{4}}');
     expect(acl).toContain('        delay = 10s');
-    expect(acl).toContain('deny\n        !authenticated = *\n        !hosts = : 127.0.0.1 : ::1\n        dnslists = zen.spamhaus.org : bl.spamcop.net');
+    expect(acl).toContain('deny\n        !authenticated = *\n        !hosts = <; ; 127.0.0.1 ; ::1\n        dnslists = zen.spamhaus.org : bl.spamcop.net');
     expect(acl).toContain('condition = ${if def:sender_helo_name{no}{yes}}');
     expect(acl).toContain('!verify = sender');
     expect(acl).not.toContain('reverse_host_lookup');
-    expect(renderEximRcptAcl({ ...s, reverseDnsRequired: true })).toContain('deny\n        !authenticated = *\n        !hosts = : 127.0.0.1 : ::1\n        !verify = reverse_host_lookup');
+    expect(renderEximRcptAcl({ ...s, reverseDnsRequired: true })).toContain('deny\n        !authenticated = *\n        !hosts = <; ; 127.0.0.1 ; ::1\n        !verify = reverse_host_lookup');
     expect(renderEximRcptAcl({ ...s, domainRblEnabled: true })).toContain('dnslists = dbl.spamhaus.org/$sender_address_domain');
+    // `::1` in a colon-separated list is '' + ':1' (a host-name pattern that forces a PTR lookup and can defer the deny).
+    for (const out of [acl, renderEximRcptAcl({ ...s, reverseDnsRequired: true, domainRblEnabled: true, spfReject: true })]) {
+      expect(out).toContain('!hosts = <;');
+      expect(out).not.toMatch(/hosts = : /);
+      expect(out).not.toMatch(/: ::1/);
+    }
     expect(acl).toContain('spf = fail : softfail');
     expect(acl).not.toContain('        spf = fail\n');
     const reject = renderEximRcptAcl({ ...s, spfReject: true });

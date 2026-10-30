@@ -9,7 +9,15 @@ import { useConfirm } from '../../../components/Modal.jsx';
 import { RequestError, ManagedFileNote } from '../../security/Shared.jsx';
 
 const YES_NO = [{ value: 'yes', label: 'Yes' }, { value: 'no', label: 'No' }];
-const ROOT_LOGIN = [{ value: 'yes', label: 'Yes (password or key)' }, { value: 'prohibit-password', label: 'Key only (prohibit-password)' }, { value: 'forced-commands-only', label: 'Forced commands only' }, { value: 'no', label: 'No' }];
+export const ROOT_LOGIN = [{ value: 'yes', label: 'Yes (password or key)' }, { value: 'prohibit-password', label: 'Key only (prohibit-password)' }, { value: 'forced-commands-only', label: 'Forced commands only' }, { value: 'no', label: 'No' }];
+// `sshd -T` reports the compiled default with the deprecated spelling
+// `without-password`, which the select does not offer.
+const ROOT_LOGIN_ALIAS = { 'without-password': 'prohibit-password' };
+
+export function draftFromEffective(e = {}) {
+  const rootLogin = String(e.permitrootlogin || 'yes').toLowerCase();
+  return { PasswordAuthentication: e.passwordauthentication || 'yes', PermitRootLogin: ROOT_LOGIN_ALIAS[rootLogin] || rootLogin, PubkeyAuthentication: e.pubkeyauthentication || 'yes', PermitEmptyPasswords: e.permitemptypasswords || 'no', MaxAuthTries: Number(e.maxauthtries) || 6, Port: Number(e.port) || 22 };
+}
 
 export default function SshPasswordAuthorizationTweak({ fn }) {
   const toast = useToast();
@@ -18,11 +26,7 @@ export default function SshPasswordAuthorizationTweak({ fn }) {
   const [draft, setDraft] = useState(null);
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => {
-    if (!data) return;
-    const e = data.effective || {};
-    setDraft({ PasswordAuthentication: e.passwordauthentication || 'yes', PermitRootLogin: e.permitrootlogin || 'yes', PubkeyAuthentication: e.pubkeyauthentication || 'yes', PermitEmptyPasswords: e.permitemptypasswords || 'no', MaxAuthTries: Number(e.maxauthtries) || 6, Port: Number(e.port) || 22 });
-  }, [data]);
+  useEffect(() => { if (data) setDraft(draftFromEffective(data.effective)); }, [data]);
 
   const save = async () => {
     // The API refuses this combination unless force is sent; the confirm here

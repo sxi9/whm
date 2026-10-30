@@ -67,7 +67,7 @@ export function ToggleFeaturePage({ fn, path, field, onLabel = 'Enable', offLabe
       {loading && !data && <Loading />}
       {data && (
         <Card title="Current state">
-          {notInstalled && notInstalled(data) ? notInstalled(data) : (
+          {notInstalled && notInstalled(data, refetch) ? notInstalled(data, refetch) : (
             <>
               <KeyValue items={[['Status', <StatusPill key="s" status={on ? 'enabled' : 'disabled'}>{renderStatus ? renderStatus(data, on) : on ? 'Enabled' : 'Disabled'}</StatusPill>]]} />
               <FormActions>

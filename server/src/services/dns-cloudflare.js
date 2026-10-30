@@ -258,8 +258,10 @@ export function createDnsCloudflareService(ctx) {
     return entry;
   }
 
+  const notConfigured = () => new HttpError(409, 'cloudflare_not_configured', 'Cloudflare is not configured: the root administrator must add an API token in DNS Zone Manager › Cloudflare first');
+
   function tokenOf(row = stmts.settingsRow.get()) {
-    if (!row) throw new HttpError(409, 'cloudflare_not_configured', 'Cloudflare is not configured: the root administrator must add an API token in DNS Zone Manager › Cloudflare first');
+    if (!row) throw notConfigured();
     return cryptoSvc.decrypt(row.api_token_enc);
   }
 
@@ -466,9 +468,11 @@ export function createDnsCloudflareService(ctx) {
       if (zone.provider !== 'cloudflare' || !zone.cloudflare_zone_id) throw conflict(`${domain} is not linked to Cloudflare`);
       const log = (line, level) => jobCtx?.log?.(line, level);
       const principal = user?.username ?? null;
-      const token = tokenOf();
       return withZoneLock(domain, async () => {
         try {
+          // The token is read inside the try: a removed token fails the push
+          // on the zone's record like any other error, instead of before it.
+          const token = tokenOf();
           // Read the desired set only once the lock is held: an earlier push may still be committing.
           const desired = stmts.records.all(zone.id).filter((r) => r.type !== 'SOA' && !(r.type === 'NS' && r.name === '@') && RECORD_TYPES.includes(r.type));
           const remote = await cfPaged(`/zones/${encodeURIComponent(zone.cloudflare_zone_id)}/dns_records`, { token, perPage: 1000 });
@@ -515,6 +519,15 @@ export function createDnsCloudflareService(ctx) {
     enqueuePush(domain, { reason = 'zone changed', userId = null, attempt = 1, retryOf = null } = {}) {
       const zone = stmts.zoneByDomain.get(domain);
       if (!zone || zone.provider !== 'cloudflare' || !zone.cloudflare_zone_id) return null;
+      // Without a token the job could only fail: the zone is marked failed
+      // now (not left 'pending' behind a job that cannot run) and the caller
+      // is told why; a manual push after a new token is saved catches it up.
+      if (!stmts.settingsRow.get()) {
+        const err = notConfigured();
+        stmts.setFailed.run(err.message, zone.id);
+        record(zone, 'push', 'failed', { attempt, message: err.message });
+        throw err;
+      }
       for (const row of stmts.queuedJobs.all()) {
         let params = null;
         try { params = JSON.parse(row.params_json); } catch { params = null; }

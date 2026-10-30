@@ -3,8 +3,9 @@ import net from 'node:net';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { z } from 'zod';
-import { exec, hasBinary } from '../exec.js';
+import { exec, hasBinary, resolveBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
+import { DOMLOGS_ROOT, selinuxMode } from './web.js';
 
 // Security Center op family: TCP wrappers, sshd, root SSH keys, compiler and
 // traceroute access, fork bomb limits, the panel's firewall chains, SMTP
@@ -36,6 +37,9 @@ function writeAtomic(file, content, mode = 0o644) {
 function restore(file, previous) {
   if (previous == null) { try { fs.unlinkSync(file); } catch { /* already gone */ } } else fs.writeFileSync(file, previous);
 }
+
+const lastLine = (s) => String(s || '').trim().split('\n').pop() || '';
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
 // Scratch space for files root will execute or unpack. A world-writable parent
 // such as /tmp lets any local user plant the directory (or a symlink) ahead of
@@ -153,11 +157,35 @@ export function hostsDenyManaged(text) {
   return !text.split('\n').some((l) => l.trim() && !l.trim().startsWith('#'));
 }
 
+// Whether the host honours hosts.allow at all is decided by the TCP wrappers
+// library being present (Debian/Ubuntu multiarch dirs, RHEL lib64), never by the
+// files themselves: the panel writes those on every host, including RHEL 8+
+// where tcp_wrappers was removed and nothing consults them.
+const LIBWRAP_DIRS = ['/lib', '/usr/lib', '/lib64', '/usr/lib64'];
+
+export function findLibwrap(dirs = LIBWRAP_DIRS) {
+  for (const dir of dirs) {
+    for (const name of ['libwrap.so.0', 'libwrap.so']) if (exists(path.join(dir, name))) return path.join(dir, name);
+    let entries = [];
+    try { entries = fs.readdirSync(dir); } catch { continue; }
+    for (const e of entries.sort()) if (/-linux-(gnu|musl)/.test(e) && exists(path.join(dir, e, 'libwrap.so.0'))) return path.join(dir, e, 'libwrap.so.0');
+  }
+  return null;
+}
+
+async function daemonLinksLibwrap(name) {
+  const bin = resolveBinary(name);
+  if (!bin || !hasBinary('ldd')) return null;
+  const { code, stdout } = await exec('ldd', [bin], { allowFailure: true, timeoutMs: 15_000 });
+  return code === 0 ? /\blibwrap\.so/.test(stdout) : null;
+}
+
 defineOp('sec.hosts_allow.read', {
-  description: 'Current /etc/hosts.allow and /etc/hosts.deny contents',
+  description: 'Current /etc/hosts.allow and /etc/hosts.deny contents, plus whether libwrap exists and sshd links it',
   run: async () => {
     const deny = readText(HOSTS_DENY);
-    return { allow: readText(HOSTS_ALLOW), deny, denyManaged: hostsDenyManaged(deny), supported: exists('/etc/hosts.allow') || exists('/etc/hosts.deny') || exists('/lib/x86_64-linux-gnu/libwrap.so.0') || exists('/usr/lib64/libwrap.so.0') };
+    const library = findLibwrap();
+    return { allow: readText(HOSTS_ALLOW), deny, denyManaged: hostsDenyManaged(deny), supported: library !== null, library, daemons: { sshd: await daemonLinksLibwrap('sshd') } };
   },
 });
 
@@ -294,8 +322,125 @@ defineOp('sec.sshd.get', {
   },
 });
 
+const SSH_PORT_DEFAULT = 22;
+const SSHD_UNITS = ['ssh', 'sshd'];
+
+// `semanage port -l` lines: "ssh_port_t   tcp   22" or "http_port_t   tcp   80, 81, 443, 8008-8010".
+export function semanagePorts(stdout, type = 'ssh_port_t', proto = 'tcp') {
+  const ranges = [];
+  for (const line of String(stdout || '').split('\n')) {
+    const m = line.match(/^(\S+)\s+(tcp|udp|sctp|dccp)\s+(.+)$/);
+    if (!m || m[1] !== type || m[2] !== proto) continue;
+    for (const item of m[3].split(',')) {
+      const r = item.trim().match(/^(\d+)(?:-(\d+))?$/);
+      if (r) ranges.push({ from: Number(r[1]), to: Number(r[2] ?? r[1]) });
+    }
+  }
+  return ranges;
+}
+
+export const selinuxPortLabelled = (stdout, port, type = 'ssh_port_t') => semanagePorts(stdout, type).some((r) => port >= r.from && port <= r.to);
+
+// `ss -ltnH` rows: "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*" (the header is skipped
+// when an old iproute2 ignores -H); the port is whatever follows the last ":"
+// of the local address, which also covers "[::]:22" and "*:22".
+export function parseListeningPorts(stdout) {
+  const ports = new Set();
+  for (const line of String(stdout || '').split('\n')) {
+    const cols = line.trim().split(/\s+/);
+    if (cols.length < 4 || cols[0] !== 'LISTEN') continue;
+    const port = Number(cols[3].slice(cols[3].lastIndexOf(':') + 1));
+    if (Number.isInteger(port) && port > 0) ports.add(port);
+  }
+  return ports;
+}
+
+// A re-exec'd sshd cannot bind a port SELinux has not labelled ssh_port_t: it
+// logs "Bind to port N failed: Permission denied" and exits while the reload
+// itself returns 0. The label is added before any file changes so a missing
+// semanage (policycoreutils-python-utils) refuses the change with nothing touched.
+async function ensureSshdSelinuxPort(port) {
+  const mode = await selinuxMode();
+  if (!mode || mode === 'disabled' || port === SSH_PORT_DEFAULT) return { mode, labelled: null, warnings: [] };
+  const type = 'ssh_port_t';
+  if (!hasBinary('semanage')) {
+    if (mode === 'enforcing') throw new OpError('capability_missing', `SELinux is enforcing and semanage is not installed, so sshd could not bind port ${port}: install policycoreutils-python-utils (dnf install policycoreutils-python-utils) and save again`);
+    return { mode, labelled: false, warnings: [`semanage is missing (policycoreutils-python-utils): port ${port} is not labelled ${type} and sshd will fail to bind it once SELinux enforces`] };
+  }
+  const list = await exec('semanage', ['port', '-l'], { allowFailure: true, timeoutMs: 120_000 });
+  if (list.code === 0 && selinuxPortLabelled(list.stdout, port, type)) return { mode, labelled: true, added: false, warnings: [] };
+  let r = await exec('semanage', ['port', '-a', '-t', type, '-p', 'tcp', String(port)], { allowFailure: true, timeoutMs: 120_000 });
+  if (r.code !== 0 && /already defined/i.test(r.stderr)) r = await exec('semanage', ['port', '-m', '-t', type, '-p', 'tcp', String(port)], { allowFailure: true, timeoutMs: 120_000 });
+  if (r.code !== 0) {
+    const reason = `SELinux refused to label port ${port} as ${type}: ${lastLine(r.stderr) || `exit ${r.code}`}`;
+    if (mode === 'enforcing') throw new OpError('command_failed', `${reason}; sshd would not be able to bind it, so nothing was changed`);
+    return { mode, labelled: false, warnings: [reason] };
+  }
+  return { mode, labelled: true, added: true, warnings: [] };
+}
+
+// A host firewall that only admits the ssh service locks the operator out the
+// moment sshd moves; firewalld (runtime + permanent) and an active ufw get the
+// port opened before sshd rebinds. A failure is reported, not fatal.
+async function openSshdFirewallPort(port) {
+  const out = { firewalld: null, ufw: null, warnings: [] };
+  if (port === SSH_PORT_DEFAULT) return out;
+  if (hasBinary('firewall-cmd')) {
+    const state = await exec('firewall-cmd', ['--state'], { allowFailure: true, timeoutMs: 30_000 });
+    if (state.code === 0 && /running/i.test(state.stdout)) {
+      const runtime = await exec('firewall-cmd', [`--add-port=${port}/tcp`], { allowFailure: true, timeoutMs: 60_000 });
+      const permanent = await exec('firewall-cmd', ['--permanent', `--add-port=${port}/tcp`], { allowFailure: true, timeoutMs: 60_000 });
+      out.firewalld = runtime.code === 0 && permanent.code === 0 ? 'opened' : 'failed';
+      if (out.firewalld === 'failed') out.warnings.push(`firewalld did not open ${port}/tcp: ${lastLine(permanent.stderr || runtime.stderr) || 'unknown error'}; open it before reconnecting`);
+    } else out.firewalld = 'inactive';
+  }
+  if (hasBinary('ufw')) {
+    const status = await exec('ufw', ['status'], { allowFailure: true, timeoutMs: 30_000 });
+    if (status.code === 0 && /^Status:\s*active/m.test(status.stdout)) {
+      const r = await exec('ufw', ['allow', `${port}/tcp`], { allowFailure: true, timeoutMs: 60_000 });
+      out.ufw = r.code === 0 ? 'opened' : 'failed';
+      if (out.ufw === 'failed') out.warnings.push(`ufw did not allow ${port}/tcp: ${lastLine(r.stderr) || 'unknown error'}; open it before reconnecting`);
+    } else out.ufw = 'inactive';
+  }
+  return out;
+}
+
+// Ubuntu 22.10+ runs sshd through ssh.socket: the listener comes from the socket
+// unit's ListenStream, so Port in sshd_config is ignored and a reload keeps
+// port 22. The socket unit's own drop-in directory is outside the agent's
+// roots, so a port change moves the host to the classic service (Ubuntu's
+// documented alternative): the socket is disabled and stopped, which also stops
+// the service it is required by, and ssh.service is enabled and started so it
+// binds from sshd_config. Open sessions survive (KillMode=process).
+async function sshdSocketActivation() {
+  if (!hasBinary('systemctl')) return null;
+  for (const unit of SSHD_UNITS) {
+    const r = await exec('systemctl', ['is-active', `${unit}.socket`], { allowFailure: true, timeoutMs: 30_000 });
+    if (r.stdout.trim() === 'active') return unit;
+  }
+  return null;
+}
+
+async function convertSshdToService(unit) {
+  await exec('systemctl', ['disable', '--now', `${unit}.socket`], { timeoutMs: 120_000 });
+  await exec('systemctl', ['enable', `${unit}.service`], { timeoutMs: 120_000 });
+  await exec('systemctl', ['restart', `${unit}.service`], { timeoutMs: 120_000 });
+  return { reloaded: true, unit };
+}
+
+async function sshdListening(port) {
+  if (!hasBinary('ss')) return null;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const r = await exec('ss', ['-ltnH'], { allowFailure: true, timeoutMs: 15_000 });
+    if (r.code !== 0) return null;
+    if (parseListeningPorts(r.stdout).has(port)) return true;
+    await sleep(300);
+  }
+  return false;
+}
+
 defineOp('sec.sshd.set', {
-  description: `Write sshd settings to ${SSHD_MANAGED}, validate with sshd -t, reload and report values other files override`,
+  description: `Write sshd settings to ${SSHD_MANAGED}, validate with sshd -t, label/open a changed port (SELinux, firewalld/ufw), reload, verify the listener and report values other files override`,
   schema: z.object({ settings: sshdSettings }).strict(),
   run: async ({ settings }, ctx) => {
     ctx.assertAllowedPath(SSHD_MANAGED, 'write');
@@ -309,6 +454,10 @@ defineOp('sec.sshd.set', {
       if (v === undefined) continue;
       if (v === null) delete current[k]; else current[k] = String(v);
     }
+    const port = current.Port != null ? Number(current.Port) : null;
+    const warnings = [];
+    const selinux = port != null ? await ensureSshdSelinuxPort(port) : { mode: null, labelled: null, warnings: [] };
+    warnings.push(...selinux.warnings);
     const previousMain = readText(SSHD_CONFIG);
     let includeAdded = false;
     if (previousMain != null && !previousMain.includes(SSHD_INCLUDE)) {
@@ -318,16 +467,34 @@ defineOp('sec.sshd.set', {
     }
     writeAtomic(SSHD_MANAGED, renderSshdManaged(current), 0o600);
     if (previousLegacy != null) { try { fs.unlinkSync(SSHD_LEGACY_MANAGED); } catch { /* already gone */ } }
-    const { code, stderr } = await exec('sshd', ['-t'], { allowFailure: true, timeoutMs: 30_000 });
-    if (code !== 0) {
+    const rollback = () => {
       restore(SSHD_MANAGED, previousManaged);
       if (previousLegacy != null) restore(SSHD_LEGACY_MANAGED, previousLegacy);
       if (includeAdded) restore(SSHD_CONFIG, previousMain);
-      throw new OpError('config_invalid', `sshd rejected the configuration; the previous files were restored: ${stderr.trim().split('\n').pop()}`, { output: stderr.trim() });
+    };
+    const { code, stderr } = await exec('sshd', ['-t'], { allowFailure: true, timeoutMs: 30_000 });
+    if (code !== 0) {
+      rollback();
+      throw new OpError('config_invalid', `sshd rejected the configuration; the previous files were restored: ${lastLine(stderr)}`, { output: stderr.trim() });
     }
-    const reload = await reloadUnit(['ssh', 'sshd']);
+    const firewall = port != null ? await openSshdFirewallPort(port) : { firewalld: null, ufw: null, warnings: [] };
+    warnings.push(...firewall.warnings);
+    const socketUnit = port != null ? await sshdSocketActivation() : null;
+    let reload;
+    if (socketUnit) {
+      reload = await convertSshdToService(socketUnit);
+      warnings.push(`${socketUnit}.socket (systemd socket activation, which ignores Port) was disabled; sshd now runs as ${socketUnit}.service and listens on the configured port`);
+    } else reload = await reloadUnit(SSHD_UNITS);
     const { effective } = await sshdEffective();
-    return { path: SSHD_MANAGED, settings: current, includeAdded, migratedLegacy: previousLegacy != null, ...reload, shadowed: sshdShadowed(current, effective, sshdSourcesBefore().sources) };
+    const expectPort = Number(effective.port) || port || SSH_PORT_DEFAULT;
+    const listening = reload.reloaded ? await sshdListening(expectPort) : null;
+    if (listening === false) {
+      rollback();
+      const again = await reloadUnit(SSHD_UNITS);
+      const restored = again.reloaded ? await sshdListening(Number((await sshdEffective()).effective.port) || SSH_PORT_DEFAULT) : null;
+      throw new OpError('config_invalid', `sshd is not listening on port ${expectPort} after the reload (check "journalctl -u ${reload.unit || 'sshd'}"); the previous files were restored${restored ? ' and sshd is listening again on its previous port' : again.reloaded ? ' but sshd is still not listening: check the journal before closing this session' : ''}`, { port: expectPort, restored, warnings });
+    }
+    return { path: SSHD_MANAGED, settings: current, includeAdded, migratedLegacy: previousLegacy != null, ...reload, port: expectPort, listening, selinux: { mode: selinux.mode, labelled: selinux.labelled }, firewall: { firewalld: firewall.firewalld, ufw: firewall.ufw }, socketActivation: socketUnit ? { unit: `${socketUnit}.socket`, disabled: true } : null, warnings, shadowed: sshdShadowed(current, effective, sshdSourcesBefore().sources) };
   },
 });
 
@@ -589,21 +756,24 @@ defineOp('sec.traceroute.set', {
 // ---------------------------------------------------- fork bomb protection ---
 
 const FORKBOMB_CONF = '/etc/security/limits.d/whm-forkbomb.conf';
-const FORKBOMB_DEFAULTS = { maxProcesses: 35, maxOpenFiles: 1024, maxMemoryMb: 512, excludeGroups: ['wheel', 'sudo'] };
+const FORKBOMB_DEFAULTS = { maxProcesses: 35, maxOpenFiles: 1024, excludeGroups: ['wheel', 'sudo'] };
+// pam_limits applies a hard "as" (RLIMIT_AS) to every account shell and cron
+// job; Node.js, Java and Go reserve more address space than a few hundred MB at
+// startup and abort under it (WHM's own limits.sh sets -v unlimited). The memory
+// cap is therefore opt-in and never below a size those runtimes start under.
+export const FORKBOMB_MEMORY_FLOOR_MB = 4096;
 
-export function renderForkBombConf({ maxProcesses, maxOpenFiles, maxMemoryMb, excludeGroups }) {
+export function renderForkBombConf({ maxProcesses, maxOpenFiles, maxMemoryMb = null, excludeGroups }) {
   const lines = [`${MANAGED} (Shell Fork Bomb Protection). Limits apply to PAM login sessions; root and the groups below are exempt.`];
-  lines.push(`*          hard    nproc     ${maxProcesses}`);
-  lines.push(`*          hard    nofile    ${maxOpenFiles}`);
-  lines.push(`*          hard    as        ${maxMemoryMb * 1024}`);
-  for (const who of ['root', ...excludeGroups.map((g) => `@${g}`)]) {
-    lines.push(`${who.padEnd(10)} hard    nproc     unlimited`);
-    lines.push(`${who.padEnd(10)} hard    nofile    unlimited`);
-    lines.push(`${who.padEnd(10)} hard    as        unlimited`);
-  }
+  const limits = [['nproc', maxProcesses], ['nofile', maxOpenFiles]];
+  if (maxMemoryMb != null) limits.push(['as', maxMemoryMb * 1024]);
+  for (const [item, value] of limits) lines.push(`*          hard    ${item.padEnd(9)} ${value}`);
+  for (const who of ['root', ...excludeGroups.map((g) => `@${g}`)]) for (const [item] of limits) lines.push(`${who.padEnd(10)} hard    ${item.padEnd(9)} unlimited`);
   return `${lines.join('\n')}\n`;
 }
 
+// maxMemoryMb is only present when the file carries an "as" line, so a page
+// that echoes the state back enables protection without a memory cap.
 export function parseForkBombConf(text) {
   if (text == null) return { enabled: false, ...FORKBOMB_DEFAULTS };
   const out = { enabled: true, ...FORKBOMB_DEFAULTS, excludeGroups: [] };
@@ -621,16 +791,20 @@ export function parseForkBombConf(text) {
 
 defineOp('sec.fork_bomb.get', {
   description: 'Current shell fork bomb protection limits',
-  run: async () => ({ path: FORKBOMB_CONF, supported: exists('/etc/security/limits.d') || exists('/etc/security/limits.conf'), ...parseForkBombConf(readText(FORKBOMB_CONF)) }),
+  run: async () => {
+    const state = parseForkBombConf(readText(FORKBOMB_CONF));
+    const warnings = state.maxMemoryMb != null && state.maxMemoryMb < FORKBOMB_MEMORY_FLOOR_MB ? [`The current file caps virtual memory at ${state.maxMemoryMb} MB, which makes Node.js, Java and Go abort at startup in every account shell and cron job; raise the memory limit to at least ${FORKBOMB_MEMORY_FLOOR_MB} MB, or disable and re-enable the protection to drop the cap`] : [];
+    return { path: FORKBOMB_CONF, supported: exists('/etc/security/limits.d') || exists('/etc/security/limits.conf'), memoryFloorMb: FORKBOMB_MEMORY_FLOOR_MB, ...state, warnings };
+  },
 });
 
 defineOp('sec.fork_bomb.set', {
-  description: 'Enable or disable per-user process/memory limits via /etc/security/limits.d',
+  description: 'Enable or disable per-user process/file limits via /etc/security/limits.d (virtual-memory cap optional, never below the runtime floor)',
   schema: z.object({
     enabled: z.boolean(),
     maxProcesses: z.number().int().min(1).max(1_000_000).default(FORKBOMB_DEFAULTS.maxProcesses),
     maxOpenFiles: z.number().int().min(16).max(10_000_000).default(FORKBOMB_DEFAULTS.maxOpenFiles),
-    maxMemoryMb: z.number().int().min(16).max(16_000_000).default(FORKBOMB_DEFAULTS.maxMemoryMb),
+    maxMemoryMb: z.number().int().min(FORKBOMB_MEMORY_FLOOR_MB, `A virtual-memory cap below ${FORKBOMB_MEMORY_FLOOR_MB} MB aborts Node.js, Java and Go at startup in every account shell and cron job; leave it empty to apply no memory limit`).max(16_000_000).nullable().optional(),
     excludeGroups: z.array(groupName).max(20).default(FORKBOMB_DEFAULTS.excludeGroups),
   }).strict(),
   run: async ({ enabled, ...limits }, ctx) => {
@@ -639,8 +813,9 @@ defineOp('sec.fork_bomb.set', {
       try { fs.unlinkSync(FORKBOMB_CONF); } catch { /* already disabled */ }
       return { path: FORKBOMB_CONF, enabled: false };
     }
-    writeAtomic(FORKBOMB_CONF, renderForkBombConf(limits));
-    return { path: FORKBOMB_CONF, enabled: true, ...limits };
+    const applied = { ...limits, maxMemoryMb: limits.maxMemoryMb ?? null };
+    writeAtomic(FORKBOMB_CONF, renderForkBombConf(applied));
+    return { path: FORKBOMB_CONF, enabled: true, ...applied };
   },
 });
 
@@ -1070,26 +1245,89 @@ export function parseModsecErrorLog(text) {
   return hits;
 }
 
+function tailText(file, maxBytes) {
+  try {
+    const size = fs.statSync(file).size;
+    const fd = fs.openSync(file, 'r');
+    try {
+      const length = Math.min(size, maxBytes);
+      const buf = Buffer.alloc(length);
+      fs.readSync(fd, buf, 0, length, Math.max(0, size - length));
+      return buf.toString('utf8');
+    } finally { fs.closeSync(fd); }
+  } catch { return null; }
+}
+
+const MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+
+// Apache's "[Wed Oct 25 10:00:00.123456 2026]" stamp as epoch milliseconds (0
+// when unparseable), used only to interleave hits from several logs.
+export function modsecHitTime(ts) {
+  const m = String(ts || '').match(/^\w{3} (\w{3}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d+))? (\d{4})$/);
+  if (!m || !(m[1].toLowerCase() in MONTHS)) return 0;
+  return Date.UTC(Number(m[7]), MONTHS[m[1].toLowerCase()], Number(m[2]), Number(m[3]), Number(m[4]), Number(m[5]), Number((m[6] || '0').padEnd(3, '0').slice(0, 3)));
+}
+
+// ModSecurity 2 logs through ap_log_rerror, i.e. into the ErrorLog of the vhost
+// that served the request, and every panel vhost has its own
+// <domlogs>/<user>/<domain>[-ssl]-error.log (web.js); only requests that land
+// on the default vhost ever reach the global error log.
+export function domlogErrorLogs(root = DOMLOGS_ROOT) {
+  const out = [];
+  let users = [];
+  try { users = fs.readdirSync(root, { withFileTypes: true }); } catch { return out; }
+  for (const u of users) {
+    if (!u.isDirectory()) continue;
+    let names = [];
+    try { names = fs.readdirSync(path.join(root, u.name)); } catch { continue; }
+    for (const name of names) {
+      const m = name.match(/^(.+?)(-ssl)?-error\.log$/);
+      if (!m) continue;
+      const file = path.join(root, u.name, name);
+      let st;
+      try { st = fs.lstatSync(file); } catch { continue; }
+      if (!st.isFile()) continue;
+      out.push({ file, user: u.name, domain: m[1], ssl: Boolean(m[2]), mtimeMs: st.mtimeMs, size: st.size });
+    }
+  }
+  return out.sort((a, b) => b.mtimeMs - a.mtimeMs);
+}
+
+const MODSEC_HIT_FILES_MAX = 200;
+const MODSEC_HIT_FILE_MIN_BYTES = 32 * 1024;
+
+// Tails every log (the byte budget is shared, never below 32 KB per file) and
+// merges the hits by timestamp, newest last; each row names the log it came from.
+export function collectModsecHits(logs, { maxBytes, limit }) {
+  const perFile = Math.max(MODSEC_HIT_FILE_MIN_BYTES, Math.floor(maxBytes / Math.max(1, logs.length)));
+  const files = [];
+  const hits = [];
+  for (const log of logs) {
+    const content = tailText(log.file, perFile);
+    files.push({ file: log.file, user: log.user ?? null, domain: log.domain ?? null, readable: content != null });
+    if (content == null) continue;
+    for (const hit of parseModsecErrorLog(content)) hits.push({ ...hit, log: log.file, user: log.user ?? null, domain: log.domain ?? null, time: modsecHitTime(hit.ts) });
+  }
+  hits.sort((a, b) => a.time - b.time);
+  return { files, total: hits.length, hits: hits.slice(-limit).reverse().map(({ time, ...h }) => h) };
+}
+
 defineOp('sec.modsec.hits', {
-  description: 'Recent ModSecurity events parsed from the Apache error log',
+  description: "Recent ModSecurity events parsed from the global Apache error log and every panel vhost's error log",
   schema: z.object({ maxBytes: z.number().int().min(4096).max(32 * 1024 * 1024).default(2 * 1024 * 1024), limit: z.number().int().min(1).max(5000).default(500) }).strict(),
   run: async ({ maxBytes, limit }, ctx) => {
     const layout = requireModsec();
-    const file = layout.errorLog;
-    ctx.assertAllowedPath(file, 'read');
-    let content = '';
-    try {
-      const size = fs.statSync(file).size;
-      const fd = fs.openSync(file, 'r');
-      try {
-        const length = Math.min(size, maxBytes);
-        const buf = Buffer.alloc(length);
-        fs.readSync(fd, buf, 0, length, Math.max(0, size - length));
-        content = buf.toString('utf8');
-      } finally { fs.closeSync(fd); }
-    } catch { return { file, hits: [], available: false }; }
-    const hits = parseModsecErrorLog(content);
-    return { file, available: true, total: hits.length, hits: hits.slice(-limit).reverse() };
+    ctx.assertAllowedPath(layout.errorLog, 'read');
+    const domlogs = domlogErrorLogs();
+    const logs = [{ file: layout.errorLog, user: null, domain: null }, ...domlogs.slice(0, MODSEC_HIT_FILES_MAX)];
+    for (const log of logs) ctx.assertAllowedPath(log.file, 'read');
+    const { files, total, hits } = collectModsecHits(logs, { maxBytes, limit });
+    const vhostLogs = files.length - 1;
+    return {
+      file: vhostLogs ? `${layout.errorLog} and ${vhostLogs} vhost error log${vhostLogs === 1 ? '' : 's'} under ${DOMLOGS_ROOT}` : layout.errorLog,
+      errorLog: layout.errorLog, files, truncated: domlogs.length > MODSEC_HIT_FILES_MAX,
+      available: files.some((f) => f.readable), total, hits,
+    };
   },
 });
 
@@ -1141,30 +1379,53 @@ function readHead(file, bytes) {
   } finally { fs.closeSync(fd); }
 }
 
+// The archive is unpacked as root into Apache's config tree and its rule files
+// are Included by Apache, so nothing the archive says about modes or special
+// entries may survive: symlinks (a rules/x.conf -> /etc/shadow), device nodes,
+// fifos and sockets are removed and every directory/file is reset to 0755/0644,
+// which is what keeps a hosting account from editing a vendor rule.
+export function sanitizeExtractedTree(root) {
+  const removed = [];
+  const walk = (dir) => {
+    fs.chmodSync(dir, 0o755);
+    for (const name of fs.readdirSync(dir)) {
+      const p = path.join(dir, name);
+      const st = fs.lstatSync(p);
+      if (st.isDirectory()) walk(p);
+      else if (st.isFile()) fs.chmodSync(p, 0o644);
+      else { fs.unlinkSync(p); removed.push(p); }
+    }
+  };
+  walk(root);
+  return removed;
+}
+
 // A zip has no --strip-components: when it unpacks to a single top-level
 // directory (GitHub archives do), that directory's contents become the root.
+// lstat, so a top-level symlink can never have its target's entries moved.
 function flattenSingleDir(staging) {
   const entries = fs.readdirSync(staging);
   if (entries.length !== 1) return;
   const only = path.join(staging, entries[0]);
-  if (!fs.statSync(only).isDirectory()) return;
+  if (!fs.lstatSync(only).isDirectory()) return;
   for (const e of fs.readdirSync(only)) fs.renameSync(path.join(only, e), path.join(staging, e));
   fs.rmdirSync(only);
 }
 
-async function extractArchive(archive, staging) {
+export async function extractArchive(archive, staging) {
   const format = archiveFormat(readHead(archive, 512));
   if (!format) throw new OpError('unsupported', 'The download is not a recognised archive (expected .tar.gz, .tar.bz2, .tar.xz, .tar or .zip)');
   if (format === 'zip') {
     if (!hasBinary('unzip')) throw new OpError('capability_missing', 'unzip is not installed; install it or use a .tar.gz archive');
     await exec('unzip', ['-q', '-o', archive, '-d', staging], { timeoutMs: 600_000 });
+    const removed = sanitizeExtractedTree(staging);
     flattenSingleDir(staging);
-    return format;
+    return { format, removed };
   }
   if (!hasBinary('tar')) throw new OpError('capability_missing', 'tar is not installed');
   const flag = { 'tar.gz': '-xzf', 'tar.bz2': '-xjf', 'tar.xz': '-xJf', tar: '-xf' }[format];
-  await exec('tar', [flag, archive, '-C', staging, '--strip-components=1', '--no-same-owner'], { timeoutMs: 600_000 });
-  return format;
+  await exec('tar', [flag, archive, '-C', staging, '--strip-components=1', '--no-same-owner', '--no-same-permissions'], { timeoutMs: 600_000 });
+  return { format, removed: sanitizeExtractedTree(staging) };
 }
 
 defineOp('sec.modsec.vendor.install', {
@@ -1185,8 +1446,8 @@ defineOp('sec.modsec.vendor.install', {
       const bytes = await download(url, archive, 100 * 1024 * 1024);
       fs.rmSync(staging, { recursive: true, force: true });
       fs.mkdirSync(staging, { recursive: true, mode: 0o755 });
-      const format = await extractArchive(archive, staging);
-      return { ...finishVendorInstall(name, dir, staging, bytes), format };
+      const { format, removed } = await extractArchive(archive, staging);
+      return { ...finishVendorInstall(name, dir, staging, bytes), format, removedEntries: removed.length };
     } catch (err) {
       fs.rmSync(staging, { recursive: true, force: true });
       throw err;
@@ -1489,6 +1750,11 @@ function homeOfUser(username) {
 export const CLAMAV_CALL_MAX_SEC = 3300;
 export const CLAMAV_CALL_DEFAULT_SEC = 2700;
 const CLAMAV_SKIP_ENTRIES = new Set(['.cache', '.wp-cli', 'tmp', '.trash']);
+// clamscan follows symlinks by default (--follow-dir-symlinks=1 and
+// --follow-file-symlinks=1 cover links named on the command line), which as
+// root would walk wherever an account points one; both are off, so a link
+// inside a home is reported by name and never traversed.
+export const CLAMSCAN_BASE_ARGV = ['-i', '--no-summary', '--stdout', '--follow-dir-symlinks=0', '--follow-file-symlinks=0', '--exclude-dir=^/home/[^/]+/\\.cache', '--exclude-dir=^/proc', '--exclude-dir=^/sys'];
 
 // Splits a home directory into scan chunks: every directory down to `depth`
 // levels becomes its own chunk and the loose files of each level are grouped
@@ -1545,15 +1811,21 @@ defineOp('sec.clamav.scan', {
   }).strict().refine((v) => v.usernames.length + v.paths.length > 0, 'usernames or paths is required'),
   run: async ({ usernames, paths, maxFileMb, recursive, maxDurationSec }, ctx) => {
     const targets = [];
-    for (const p of paths) { ctx.assertAllowedPath(p, 'read'); if (exists(p)) targets.push(p); }
+    const skipped = [];
+    // A target is listed by sec.clamav.targets minutes before it is scanned, so
+    // the account may have swapped it for a symlink by now; a link named on the
+    // command line would otherwise be followed by root (into / if it points there).
+    const isLink = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch { return false; } };
+    const add = (p) => { if (!exists(p)) return; if (isLink(p)) skipped.push({ path: p, reason: 'symlink' }); else targets.push(p); };
+    for (const p of paths) { ctx.assertAllowedPath(p, 'read'); add(p); }
     for (const u of usernames) {
       const home = homeOfUser(u);
       ctx.assertAllowedPath(home, 'read');
-      if (exists(home)) targets.push(home);
+      add(home);
     }
     if (!hasBinary('clamscan')) throw new OpError('capability_missing', 'ClamAV is not installed on this server (clamscan not found)');
-    if (!targets.length) return { targets: [], infected: [], errors: [], scanned: 0, exitCode: 0 };
-    const argv = ['-i', '--no-summary', '--stdout', `--max-filesize=${maxFileMb}M`, `--max-scansize=${Math.max(maxFileMb * 4, 100)}M`, '--exclude-dir=^/home/[^/]+/\\.cache', '--exclude-dir=^/proc', '--exclude-dir=^/sys'];
+    if (!targets.length) return { targets: [], skipped, infected: [], errors: [], scanned: 0, exitCode: 0 };
+    const argv = [...CLAMSCAN_BASE_ARGV, `--max-filesize=${maxFileMb}M`, `--max-scansize=${Math.max(maxFileMb * 4, 100)}M`];
     if (recursive) argv.unshift('-r');
     const started = Date.now();
     let r;
@@ -1565,7 +1837,7 @@ defineOp('sec.clamav.scan', {
     }
     const parsed = parseClamscanOutput(r.stdout);
     if (r.code === 2 && parsed.infected.length === 0 && !parsed.errors.length) throw new OpError('command_failed', `clamscan failed: ${r.stderr.trim().split('\n').pop() || 'no error output'}`, { targets });
-    return { targets, ...parsed, exitCode: r.code, durationMs: Date.now() - started };
+    return { targets, skipped, ...parsed, exitCode: r.code, durationMs: Date.now() - started };
   },
 });
 

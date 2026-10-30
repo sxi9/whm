@@ -517,6 +517,39 @@ describe('Cloudflare DNS API', () => {
     expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM dns_cloudflare_settings').get().n).toBe(0);
     expect(JSON.stringify(auditRows())).not.toContain(TOKEN);
   });
+
+  it('removing the token leaves linked zones linked but marks an unpushed change failed instead of queuing a job that cannot run', async () => {
+    await put('/cloudflare/token', { apiToken: TOKEN }).expect(200);
+    await post('/zones/bob.com/cloudflare/link').expect(200);
+    const manual = await post('/zones/bob.com/cloudflare/push').expect(202);
+    expect((await waitForJob(app.ctx, manual.body.data.job.id)).status).toBe('done');
+    expect(zoneRow('bob.com')).toMatchObject({ provider: 'cloudflare', cloudflare_status: 'ok' });
+    expect((await del('/cloudflare/token').expect(200)).body.data).toMatchObject({ removed: true, configured: false, linked: [{ domain: 'bob.com' }] });
+
+    const pushJobs = () => app.ctx.db.prepare("SELECT COUNT(*) AS n FROM jobs WHERE type = 'dns.cloudflare.push'").get().n;
+    const syncRows = () => app.ctx.db.prepare("SELECT status, message FROM dns_cloudflare_sync WHERE domain = 'bob.com' AND action = 'push' ORDER BY id DESC").all();
+    const jobsBefore = pushJobs();
+    const rowsBefore = syncRows().length;
+    const added = await post('/zones/bob.com/records', { name: 'orphan', type: 'A', value: '198.51.100.40' }).expect(201);
+    expect(added.body.data.mirror).toEqual({ provider: 'cloudflare', jobId: null, error: expect.stringMatching(/Cloudflare is not configured/) });
+    expect(pushJobs()).toBe(jobsBefore);
+    expect(zoneRow('bob.com')).toMatchObject({ provider: 'cloudflare', cloudflare_zone_id: BOB_ZONE, cloudflare_status: 'failed', cloudflare_last_error: expect.stringMatching(/Cloudflare is not configured/) });
+    expect(syncRows().slice(0, 1)).toEqual([{ status: 'failed', message: expect.stringMatching(/Cloudflare is not configured/) }]);
+    expect((await get('/cloudflare/status').expect(200)).body.data).toMatchObject({ configured: false, failed: 1 });
+    await post('/zones/bob.com/cloudflare/push').expect(409);
+
+    // A push that reaches the service without a token (a retry timer, a job queued before the removal) fails on the zone's record too.
+    await expect(app.ctx.dnsCloudflare.push('bob.com')).rejects.toMatchObject({ status: 409, code: 'cloudflare_not_configured' });
+    expect(syncRows().length).toBe(rowsBefore + 2);
+    expect(cf.state.records[BOB_ZONE].find((r) => r.name === 'orphan.bob.com')).toBeUndefined();
+
+    // A new token and a manual push catch the zone up.
+    await put('/cloudflare/token', { apiToken: TOKEN }).expect(200);
+    const catchUp = await post('/zones/bob.com/cloudflare/push').expect(202);
+    expect((await waitForJob(app.ctx, catchUp.body.data.job.id)).status).toBe('done');
+    expect(zoneRow('bob.com')).toMatchObject({ cloudflare_status: 'ok', cloudflare_last_error: null });
+    expect(cf.state.records[BOB_ZONE].find((r) => r.name === 'orphan.bob.com')).toMatchObject({ type: 'A', content: '198.51.100.40' });
+  });
 });
 
 describe('Cloudflare zones on a host without BIND', () => {

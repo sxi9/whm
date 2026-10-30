@@ -318,7 +318,7 @@ export function createDatabaseServicesService(ctx) {
     if (query.q) { const needle = query.q.toLowerCase(); rows = rows.filter((r) => r.name.toLowerCase().includes(needle) || (r.account || '').toLowerCase().includes(needle)); }
     if (!query.system) rows = rows.filter((r) => !r.system);
     for (const r of rows) r.users = byName.has(r.name) ? stmts.grantsForDb.all(byName.get(r.name).id).map((g) => g.user) : [];
-    const sortKey = query.sort || 'name';
+    const sortKey = query.sort === 'size_bytes' ? 'sizeBytes' : (query.sort || 'name');
     rows.sort((a, b) => { const x = a[sortKey] ?? ''; const y = b[sortKey] ?? ''; return (typeof x === 'number' ? x - y : String(x).localeCompare(String(y))) * (query.dir === 'desc' ? -1 : 1); });
     const page = query.page || 1; const pageSize = query.pageSize || 50;
     return { data: rows.slice((page - 1) * pageSize, page * pageSize).map(({ owner_id, ...r }) => r), meta: { page, pageSize, total: rows.length, engineError } };
@@ -489,19 +489,18 @@ export function createDatabaseServicesService(ctx) {
 
   // Database-level grants of a user at every host it exists at. `grants` is the
   // union across hosts; a database whose privileges differ between hosts is
-  // flagged `mixed` so the editor normalises all hosts on save.
+  // flagged `mixed` so the editor normalises all hosts on save. The op's `raw`
+  // SHOW GRANTS lines are never returned: MariaDB prints the password hash in them.
   async function liveGrants(name, hosts, profile, req) {
     if (isPg(profile)) {
       const live = await run('grants.list', { user: name }, req, profile);
       const grants = live.grants.filter((g) => g.table === '*' && g.database !== '*').map((g) => ({ database: g.database, privileges: g.privileges.map((p) => p.toUpperCase()).sort() }));
-      return { grants, raw: live.raw, perHost: {} };
+      return { grants, perHost: {} };
     }
     const perHost = {};
-    const raw = [];
     for (const h of hosts) {
       const live = await run('grants.list', { user: name, host: h }, req, profile);
       perHost[h] = live.grants.filter((g) => g.table === '*' && g.database !== '*').map((g) => ({ database: g.database, privileges: g.privileges.map((p) => p.toUpperCase()).sort() }));
-      raw.push(...(live.raw || []));
     }
     const byDb = new Map();
     for (const h of hosts) {
@@ -513,7 +512,7 @@ export function createDatabaseServicesService(ctx) {
       }
     }
     const grants = [...byDb.values()].map((g) => ({ ...g, mixed: g.mixed || g.hosts.length !== hosts.length })).sort((a, b) => a.database.localeCompare(b.database));
-    return { grants, raw, perHost };
+    return { grants, perHost };
   }
 
   async function grantsFor(name, user) {
@@ -524,7 +523,7 @@ export function createDatabaseServicesService(ctx) {
     const hosts = isPg(profile) ? [] : await resolveHosts(name, row, profile, null);
     const live = await liveGrants(name, hosts, profile, null);
     const grants = live.grants.map((g) => ({ database: g.database, privileges: g.privileges, ...(isPg(profile) ? {} : { hosts: g.hosts, mixed: g.mixed }) }));
-    return { name, account: row?.account ?? null, hosts, grants, perHost: live.perHost, raw: live.raw, recorded: row ? stmts.grantsForUser.all(row.id).map((g) => ({ database: g.database, privileges: g.privileges.split(',').map((p) => p.trim()) })) : [] };
+    return { name, account: row?.account ?? null, hosts, grants, perHost: live.perHost, recorded: row ? stmts.grantsForUser.all(row.id).map((g) => ({ database: g.database, privileges: g.privileges.split(',').map((p) => p.trim()) })) : [] };
   }
 
   // Ownership and system-database checks for a grant list, shared by

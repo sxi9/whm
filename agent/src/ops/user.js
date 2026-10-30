@@ -90,7 +90,10 @@ defineOp('user.lock', {
   schema: z.object({ username: arg.username }).strict(),
   run: async ({ username }) => {
     assertManaged(username);
-    await exec('usermod', ['-L', username]);
+    // -L only prefixes the password hash, which sshd ignores under UsePAM and
+    // pam_unix never checks; expiring the account (day 1) is what makes every
+    // PAM account stage refuse the user, SSH keys and cron included.
+    await exec('usermod', ['-L', '-e', '1', username]);
     return { username, locked: true };
   },
 });
@@ -100,7 +103,7 @@ defineOp('user.unlock', {
   schema: z.object({ username: arg.username }).strict(),
   run: async ({ username }) => {
     assertManaged(username);
-    await exec('usermod', ['-U', username]);
+    await exec('usermod', ['-U', '-e', '', username]);
     return { username, locked: false };
   },
 });

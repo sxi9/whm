@@ -22,7 +22,7 @@ export default function EditPackage({ fn }) {
     setBusy(true);
     setError(null);
     try {
-      const { data } = await api.put(`/packages/${encodeURIComponent(name)}`, formToBody(form, { rename: true, original: name }));
+      const { data } = await api.put(`/packages/${encodeURIComponent(name)}`, formToBody(form, { rename: true, original: name, current: pkg }));
       toast.success(`Package "${data.name}" saved`);
       await refetch();
       setName(data.name);

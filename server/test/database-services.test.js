@@ -1,6 +1,10 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
 
+// What MariaDB (and MySQL <= 5.6) prints in the USAGE line of SHOW GRANTS: the
+// account's password hash, which must never reach the API.
+const MARIADB_HASH = '*2470C0C06DEE42FD1618BB99005ADCA2EC9D1E19';
+
 // A mock agent that behaves like a host with MariaDB installed: it keeps an
 // in-memory catalogue of databases, users (per host) and grants so the service's
 // bookkeeping can be checked end to end without a daemon.
@@ -34,7 +38,7 @@ function mysqlAgent() {
     'db.user.drop': ({ user, hosts }) => { const targets = hosts || hostsOf(user); const missing = targets.filter((h) => !state.users.has(`${user}@${h}`)); if (missing.length) throw Object.assign(new Error(`MySQL: Operation DROP USER failed for '${user}'@'${missing[0]}'`), { agentError: true, code: 'exists', details: { errno: 1396 } }); for (const h of targets) { state.users.delete(`${user}@${h}`); state.grants.delete(`${user}@${h}`); } return { user, dropped: targets, missing: [] }; },
     'db.user.set_password': ({ user }) => { const hosts = hostsOf(user); if (!hosts.length) throw Object.assign(new Error(`No MySQL user named "${user}"`), { agentError: true, code: 'not_found', details: {} }); return { user, hosts }; },
     'db.user.add_host': ({ user, fromHost, toHost }) => { if (!state.users.has(`${user}@${fromHost}`)) throw Object.assign(new Error('missing'), { agentError: true, code: 'not_found', details: {} }); const created = !state.users.has(`${user}@${toHost}`); state.users.set(`${user}@${toHost}`, {}); state.grants.set(`${user}@${toHost}`, new Map(state.grants.get(`${user}@${fromHost}`) || [])); return { user, host: toHost, created, grants: 0 }; },
-    'db.grants.list': ({ user, host }) => { if (!state.users.has(`${user}@${host}`)) throw Object.assign(new Error(`MySQL: There is no such grant defined for user '${user}' on host '${host}'`), { agentError: true, code: 'not_found', details: { errno: 1141 } }); return { user, host, raw: [], grants: [...(state.grants.get(`${user}@${host}`) || new Map())].map(([database, privileges]) => ({ database, table: '*', privileges })) }; },
+    'db.grants.list': ({ user, host }) => { if (!state.users.has(`${user}@${host}`)) throw Object.assign(new Error(`MySQL: There is no such grant defined for user '${user}' on host '${host}'`), { agentError: true, code: 'not_found', details: { errno: 1141 } }); const grants = [...(state.grants.get(`${user}@${host}`) || new Map())].map(([database, privileges]) => ({ database, table: '*', privileges })); return { user, host, raw: [`GRANT USAGE ON *.* TO \`${user}\`@\`${host}\` IDENTIFIED BY PASSWORD '${MARIADB_HASH}'`, ...grants.map((g) => `GRANT ${g.privileges.join(', ')} ON \`${g.database}\`.* TO \`${user}\`@\`${host}\``)], grants }; },
     'db.grant': ({ user, database, privileges, hosts }) => { for (const h of hosts) { const g = state.grants.get(`${user}@${h}`) || new Map(); g.set(database, privileges); state.grants.set(`${user}@${h}`, g); } return { user, database, privileges, hosts }; },
     'db.revoke': ({ user, database, hosts }) => { for (const h of hosts) state.grants.get(`${user}@${h}`)?.delete(database); return { user, database, hosts, revoked: true }; },
     'db.root_password.set': ({ password, updateMyCnf }) => { state.rootPassword = password; return { hosts: ['localhost', '127.0.0.1'], myCnfUpdated: updateMyCnf, path: updateMyCnf ? '/root/.my.cnf' : null }; },
@@ -202,6 +206,20 @@ describe('Database Services API (MariaDB via mock agent)', () => {
       expect(withSystem.body.data.some((d) => d.name === 'mysql')).toBe(true);
     });
 
+    it('sorts by size through the wire key size_bytes; the camelCase field name fails the sort validator', async () => {
+      const original = app.agent.ops['db.databases.list'];
+      const sizes = { alice_shop: 1, legacy_shop: 99999 };
+      app.agent.set('db.databases.list', () => original().map((d) => ({ ...d, sizeBytes: sizes[d.name] ?? 4096 })));
+      try {
+        const desc = await get('/databases?sort=size_bytes&dir=desc&pageSize=100').expect(200);
+        expect(desc.body.data[0]).toMatchObject({ name: 'legacy_shop', sizeBytes: 99999 });
+        const asc = await get('/databases?sort=size_bytes&pageSize=100').expect(200);
+        expect(asc.body.data[0]).toMatchObject({ name: 'alice_shop', sizeBytes: 1 });
+        expect(asc.body.data.map((d) => d.sizeBytes)).toEqual([...asc.body.data.map((d) => d.sizeBytes)].sort((a, b) => a - b));
+        expect((await get('/databases?sort=sizeBytes').expect(422)).body.error.fields.sort).toBeDefined();
+      } finally { app.agent.set('db.databases.list', original); }
+    });
+
     it('resellers can drop their own databases only', async () => {
       await rDel('/databases/shared_cache').expect(403);
       await rDel('/databases/legacy_shop').expect(403);
@@ -288,6 +306,16 @@ describe('Database Services API (MariaDB via mock agent)', () => {
       expect(fixed.body.data.changes).toEqual([{ database: 'alice_shop', action: 'changed', privileges: ['ALL PRIVILEGES'] }]);
       expect(app.agent.callsTo('db.grant')[0].args).toMatchObject({ database: 'alice_shop', hosts: ['localhost', '203.0.113.5'] });
       expect(app.agent.state.grants.get('alice_app@203.0.113.5').get('alice_shop')).toEqual(['ALL PRIVILEGES']);
+    });
+
+    it('never returns the raw SHOW GRANTS text, which carries the password hash on MariaDB', async () => {
+      expect(app.agent.ops['db.grants.list']({ user: 'alice_app', host: 'localhost' }).raw.join('\n')).toContain(MARIADB_HASH);
+      for (const res of [await get('/users/alice_app/grants').expect(200), await rGet('/users/alice_app/grants').expect(200)]) {
+        expect(res.body.data).not.toHaveProperty('raw');
+        expect(res.body.data.grants).toEqual([{ database: 'alice_shop', privileges: ['ALL PRIVILEGES'], hosts: ['localhost', '203.0.113.5'], mixed: false }]);
+        expect(res.text).not.toContain(MARIADB_HASH);
+        expect(res.text).not.toMatch(/IDENTIFIED BY/i);
+      }
     });
 
     it('lists users with hosts and grants, scoped per role', async () => {
@@ -851,7 +879,9 @@ describe('Database Services API (PostgreSQL via mock agent)', () => {
     const edited = await rPut('/users/dana_app/grants', { grants: [{ database: 'dana_shop', privileges: ['connect', 'CREATE'] }] }).expect(200);
     expect(edited.body.data.grants).toEqual([{ database: 'dana_shop', privileges: ['CONNECT', 'CREATE'] }]);
     expect(app.agent.callsTo('pg.revoke')[0].args).toEqual({ user: 'dana_app', database: 'dana_shop' });
-    expect((await rGet('/users/dana_app/grants').expect(200)).body.data.grants).toEqual([{ database: 'dana_shop', privileges: ['CONNECT', 'CREATE'] }]);
+    const live = await rGet('/users/dana_app/grants').expect(200);
+    expect(live.body.data.grants).toEqual([{ database: 'dana_shop', privileges: ['CONNECT', 'CREATE'] }]);
+    expect(live.body.data).not.toHaveProperty('raw');
     const bad = await rPut('/users/dana_app/grants', { grants: [{ database: 'dana_shop', privileges: ['INSERT'] }] }).expect(422);
     expect(bad.body.error.fields.privileges[0]).toMatch(/INSERT/);
     await rPut('/users/legacy_role/grants', { grants: [] }).expect(403);

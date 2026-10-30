@@ -131,6 +131,19 @@ describe('user ops', () => {
     expect(exec).not.toHaveBeenCalled();
   });
 
+  it('user.lock expires the account as well as locking the password; user.unlock clears both', async () => {
+    exec.mockClear();
+    const ok = async (bin, argv) => ({ code: 0, stdout: '', stderr: '', bin, argv });
+    exec.mockImplementationOnce(ok).mockImplementationOnce(ok);
+    const username = 'definitely-no-such-user-xyz';
+    await expect(runOp('user.lock', { username }, ctx)).resolves.toEqual({ username, locked: true });
+    await expect(runOp('user.unlock', { username }, ctx)).resolves.toEqual({ username, locked: false });
+    expect(exec.mock.calls.map(([bin, argv]) => [bin, argv])).toEqual([
+      ['usermod', ['-L', '-e', '1', username]],
+      ['usermod', ['-U', '-e', '', username]],
+    ]);
+  });
+
   it('user.set_quota reports a missing quota toolchain as capability_missing', async () => {
     if (hasBinary('setquota')) return;
     exec.mockClear();

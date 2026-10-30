@@ -72,8 +72,13 @@ export function portalRoutes(ctx) {
     req.audit({ action: 'portal.2fa_disable', target: user.id });
     res.json({ data: user });
   });
+  // The request audit (shared/audit.js) stores req.body when the response
+  // finishes and its key filter does not match `current`/`next`: both
+  // passwords are read out and replaced before anything can end the request.
   r.post('/password', requireSession, validate({ body: z.object({ current: z.string().min(1).max(128), next: fields.password }).strict() }), wrap(async (req, res) => {
-    await ctx.portalUsers.changePassword(req.principal.userId, req.body);
+    const { current, next } = req.body;
+    req.body = { current: '[redacted]', next: '[redacted]' };
+    await ctx.portalUsers.changePassword(req.principal.userId, { current, next });
     req.audit({ action: 'portal.password_change', target: req.principal.userId });
     req.session.destroy(() => res.json({ data: { changed: true, reauthenticate: true } }));
   }));

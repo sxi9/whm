@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import { validate, z, fields } from '../../lib/validate.js';
 import { requireRoot } from '../../middleware/rbac.js';
-import { createServerContactsService, CHANNELS, SEVERITIES, SMTP_SECURITY, EVENT_KEY_RE, MANAGED_MAIL_USERS } from '../../services/server-contacts.js';
+import { unprocessable } from '../../lib/errors.js';
+import { createServerContactsService, maskAddress, CHANNELS, SEVERITIES, SMTP_SECURITY, EVENT_KEY_RE, MANAGED_MAIL_USERS } from '../../services/server-contacts.js';
 
 const idParam = z.object({ id: fields.id });
 const eventKey = z.string().regex(EVENT_KEY_RE, 'Event keys look like "service.down"');
@@ -44,6 +45,38 @@ const deliveriesQuery = z.object({
   sort: z.enum(['ts', 'event', 'channel', 'status', 'severity', 'address']).optional(), dir: z.enum(['asc', 'desc']).optional(),
 });
 const notifyBody = z.object({ event: eventKey, subject: z.string().trim().min(1).max(200), body: z.string().max(20_000).optional(), severity: z.enum(SEVERITIES).optional() }).strict();
+// The route-level audit row (middleware/audit.js) mirrors req.body when the
+// response finishes, so a credential-bearing "address" is swapped for its
+// display form before anything can reject the request (RBAC, validation):
+// a 403/422 must not record a Slack or tokenised webhook URL either. The real
+// body travels on req.contactInput and is validated from there.
+const URL_LIKE = /^[a-z][a-z0-9+.-]*:\/\//i;
+function auditSafeAddress(channel, address) {
+  if (!URL_LIKE.test(address)) return address;
+  try {
+    const { display, secret } = maskAddress(channel, address);
+    if (secret) return display;
+    const url = new URL(address);
+    if (channel === 'webhook' && !url.username && !url.password) return display;
+  } catch { /* unparseable: redacted below */ }
+  return '[redacted]';
+}
+function stashContactBody(req, _res, next) {
+  const raw = req.body;
+  req.contactInput = raw;
+  if (raw && typeof raw === 'object' && typeof raw.address === 'string') req.body = { ...raw, address: auditSafeAddress(raw.channel, raw.address) };
+  next();
+}
+const parseContactBody = (schema) => (req, _res, next) => {
+  const result = schema.safeParse(req.contactInput ?? {});
+  if (!result.success) {
+    const fieldErrors = {};
+    for (const issue of result.error.issues) (fieldErrors[issue.path.join('.') || '_'] ||= []).push(issue.message);
+    return next(unprocessable('Request validation failed', fieldErrors));
+  }
+  req.contactInput = result.data;
+  next();
+};
 const sendTestBody = z.object({ to: fields.email.regex(/^[A-Za-z0-9_]/, 'May not start with "-"') }).strict();
 const aliasTarget = z.union([fields.username, fields.email.regex(/^[A-Za-z0-9_]/, 'May not start with "-"')]);
 const aliasList = z.array(aliasTarget).max(20);
@@ -74,9 +107,9 @@ export async function register(ctx) {
   r.get('/', requireRoot, wrap(() => s.overview()));
   r.get('/events', requireRoot, wrap(() => s.events()));
   r.get('/contacts', requireRoot, wrap(() => s.list()));
-  r.post('/contacts', requireRoot, validate({ body: createBody }), created((req) => s.create(req.body, req)));
+  r.post('/contacts', stashContactBody, requireRoot, parseContactBody(createBody), created((req) => s.create(req.contactInput, req)));
   r.get('/contacts/:id', requireRoot, validate({ params: idParam }), wrap((req) => s.get(req.params.id)));
-  r.patch('/contacts/:id', requireRoot, validate({ params: idParam, body: updateBody }), wrap((req) => s.update(req.params.id, req.body, req)));
+  r.patch('/contacts/:id', stashContactBody, requireRoot, validate({ params: idParam }), parseContactBody(updateBody), wrap((req) => s.update(req.params.id, req.contactInput, req)));
   r.delete('/contacts/:id', requireRoot, validate({ params: idParam }), wrap((req) => s.remove(req.params.id, req)));
   r.post('/contacts/:id/test', requireRoot, validate({ params: idParam }), wrap((req) => s.test(req.params.id, req)));
   r.get('/settings', requireRoot, wrap(() => s.settings()));

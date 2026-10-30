@@ -814,5 +814,18 @@ describe('Server Configuration API', () => {
       expect(filtered.body.data.items.map((i) => i.id)).toEqual(['webalizer']);
       await get('/marketplace?category=Bad;Thing').expect(422);
     });
+
+    it('every configure link in the catalog is a panel function path (the UI shows it on installed add-ons)', async () => {
+      const { FUNCTIONS } = await import('../../client/src/nav.js');
+      const paths = new Set(FUNCTIONS.map((f) => f.path));
+      const { body } = await get('/marketplace').expect(200);
+      for (const item of body.data.items) {
+        if (item.configure == null) continue;
+        expect(paths.has(item.configure.split(/[?#]/)[0]), `${item.id}: ${item.configure}`).toBe(true);
+      }
+      expect(body.data.items.find((i) => i.id === 'postgresql').configure).toBe('/database-services/manage-database-profiles');
+      expect(body.data.items.find((i) => i.id === 'mailman').configure).toBe('/cpanel/reset-a-mailman-password');
+      expect(body.data.items.find((i) => i.id === 'roundcube').configure).toBeNull();
+    });
   });
 });

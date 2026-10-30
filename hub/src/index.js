@@ -14,7 +14,7 @@ import { notFound } from '../shared/errors.js';
 import { loadSigningKeys } from '../shared/keys.js';
 import { createAudit, principalLabel } from '../shared/audit.js';
 import * as webhooks from '../shared/webhooks.js';
-import { createMailer, sendmailTransport, recordingTransport } from '../shared/mailer.js';
+import { createMailer, sendmailTransport, smtpTransport, recordingTransport } from '../shared/mailer.js';
 import { createScheduler, LICENSE_SCHEDULES } from '../shared/scheduler.js';
 import { createNonceStore } from '../shared/nonce.js';
 import { createSafeFetch } from '../shared/safe-fetch.js';
@@ -138,9 +138,10 @@ export async function bootstrap(overrides = {}) {
   const keys = loadSigningKeys(config.keys.dir, dbs.license, { activeKids: config.keys.active_kid, logger, now: clock.now });
   const audit = createAudit({ db: dbs.license, logger, now: clock.now });
   const safeFetch = overrides.fetch || createSafeFetch();
+  const mailCfg = config.license.mail;
   const mailer = createMailer({
-    from: config.license.mail.from, logger, enabled: config.license.mail.enabled,
-    transport: overrides.mailTransport || (config.license.mail.transport === 'none' ? recordingTransport() : sendmailTransport()),
+    from: mailCfg.from, logger, enabled: mailCfg.enabled, now: clock.now,
+    transport: overrides.mailTransport || (mailCfg.transport === 'none' ? recordingTransport() : mailCfg.transport === 'smtp' ? smtpTransport(mailCfg.smtp) : sendmailTransport()),
   });
   const ctx = {
     config, logger, clock, dbs, crypto: cryptoSvc, keys, audit, mailer, safeFetch, psl, metrics: createMetrics(),
@@ -180,7 +181,8 @@ export async function bootstrap(overrides = {}) {
     const license = keys.active('license');
     const plugin = keys.active('plugin');
     const clockOk = Math.abs(Date.now() - clock.now()) < 24 * 3600_000;
-    return { ok: dbOk && !!license?.privateKey && !!plugin?.privateKey && clockOk, db: dbOk, keys: { license: license?.kid || null, plugin: plugin?.kid || null }, clock: clockOk, version: 1 };
+    // mail is reported, not folded into ok: a dead MTA must not take license check-ins down.
+    return { ok: dbOk && !!license?.privateKey && !!plugin?.privateKey && clockOk, db: dbOk, keys: { license: license?.kid || null, plugin: plugin?.kid || null }, clock: clockOk, mail: mailer.status(), version: 1 };
   };
   ctx.metrics.gauges.push(() => [
     ...dbs.license.prepare("SELECT l.edition, COUNT(*) AS n FROM activations a JOIN licenses l ON l.id = a.license_id WHERE a.status = 'active' GROUP BY l.edition").all().map((r) => ['activations_active', r.n, `edition="${r.edition}"`]),
@@ -249,6 +251,10 @@ export async function start() {
     servers.push(lb);
   }
   ctx.scheduler.start();
+  ctx.mailer.verify().then(
+    (r) => { if (!r.skipped) logger.info({ transport: config.license.mail.transport }, 'mail transport verified'); },
+    (err) => logger.error({ err, transport: config.license.mail.transport }, 'mail transport check failed: outbound mail is not being delivered (see /healthz data.mail)'),
+  );
   const shutdown = async () => { for (const s of servers) s.close(); await ctx.close(); process.exit(0); };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);

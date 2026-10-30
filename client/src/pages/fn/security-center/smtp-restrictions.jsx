@@ -10,7 +10,7 @@ export default function SmtpRestrictions({ fn }) {
       onLabel="Enable SMTP restrictions" offLabel="Disable SMTP restrictions"
       confirmOn="Outbound connections to port 25 will be rejected unless they come from root or the mail server groups. Scripts that talk to remote SMTP servers directly (instead of through the local mail server) will stop working."
       renderStatus={(d, on) => (on ? `Restricted (${d.backend})` : 'Not restricted')}
-      notInstalled={(d) => (!d.installed ? <CapabilityNotice error={{ code: 'capability_missing', message: 'No supported firewall (iptables or nftables) is installed, so outbound SMTP cannot be restricted.' }} /> : null)}
+      notInstalled={(d, refetch) => (!d.installed ? <CapabilityNotice capability="firewall" error={{ code: 'capability_missing', message: 'No supported firewall (iptables or nftables) is installed, so outbound SMTP cannot be restricted.' }} onRetry={refetch} /> : null)}
       renderDetails={(d) => (
         <>
           {d.families && (

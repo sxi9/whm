@@ -262,6 +262,37 @@ describe('Manage API Tokens', () => {
     expect((await post('/api/development/tokens', { name: 'nobody', username: 'ghost' })).status).toBe(404);
   });
 
+  it('a reseller without the cpanel-api ACL can neither manage tokens nor be issued one', async () => {
+    const limited = await app.createUser('devacl', 'reseller');
+    const setAcl = app.ctx.db.prepare('INSERT OR REPLACE INTO reseller_acls (reseller_id, acl_key, value) VALUES (?, ?, ?)');
+    setAcl.run(limited.id, 'list-accts', 1);
+    setAcl.run(limited.id, 'cpanel-api', 0);
+    const client = request.agent(app.ctx.app);
+    const token = (await client.post('/api/auth/login').send({ username: limited.username, password: limited.password })).body.data.csrfToken;
+    const denied = await mutate(client, 'post', '/api/development/tokens', { name: 'mine' }, token);
+    expect(denied.status).toBe(403);
+    expect(denied.body.error.message).toMatch(/Access the panel API/);
+    expect((await client.get('/api/development/tokens')).status).toBe(403);
+    expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM api_tokens WHERE user_id = ?').get(limited.id).n).toBe(0);
+    const byRoot = await post('/api/development/tokens', { name: 'from root', username: 'devacl' });
+    expect(byRoot.status).toBe(403);
+    expect(byRoot.body.error.message).toMatch(/devacl.*Access the panel API/);
+    setAcl.run(limited.id, 'cpanel-api', 1);
+    const granted = await mutate(client, 'post', '/api/development/tokens', { name: 'mine' }, token);
+    expect(granted.status).toBe(201);
+    expect((await client.get(`/api/development/tokens/${granted.body.data.id}`)).status).toBe(200);
+    expect((await post('/api/development/tokens', { name: 'from root', username: 'devacl' })).status).toBe(201);
+    setAcl.run(limited.id, 'cpanel-api', 0);
+    expect((await client.get(`/api/development/tokens/${granted.body.data.id}`)).status).toBe(403);
+    expect((await client.get(`/api/development/tokens/${granted.body.data.id}/usage`)).status).toBe(403);
+    expect((await mutate(client, 'patch', `/api/development/tokens/${granted.body.data.id}`, { name: 'renamed' }, token)).status).toBe(403);
+    expect((await mutate(client, 'post', `/api/development/tokens/${granted.body.data.id}/expire`, {}, token)).status).toBe(403);
+    expect((await mutate(client, 'delete', `/api/development/tokens/${granted.body.data.id}`, undefined, token)).status).toBe(403);
+    // Root manages the reseller's tokens regardless of the reseller's ACLs.
+    expect((await del(`/api/development/tokens/${granted.body.data.id}`)).status).toBe(200);
+    app.ctx.db.prepare('DELETE FROM users WHERE id = ?').run(limited.id);
+  });
+
   it('expiry takes effect at the same instant on a non-UTC host', async () => {
     const bare = request(app.ctx.app);
     const previousTz = process.env.TZ;
@@ -626,6 +657,18 @@ describe('Developer Documentation', () => {
     expect((await get('/api/development/docs/../etc')).status).not.toBe(200);
     const schema = await get('/api/development/docs/plugin-manifest-schema');
     expect(() => JSON.parse(schema.body.data.content)).not.toThrow();
+  });
+
+  it('withholds the root-only documents from resellers, as Support does', async () => {
+    const list = await reseller.get('/api/development/docs');
+    expect(list.status).toBe(200);
+    expect(list.body.data.map((d) => d.slug).sort()).toEqual(['function-pages', 'plugin-manifest-schema', 'readme']);
+    for (const slug of ['blueprint', 'category-modules', 'license-server']) {
+      expect((await reseller.get(`/api/development/docs/${slug}`)).status, slug).toBe(403);
+    }
+    expect((await reseller.get('/api/development/docs/blueprint?section=1-overview')).status).toBe(403);
+    expect((await reseller.get('/api/development/docs/readme')).status).toBe(200);
+    expect((await get('/api/development/docs')).body.data.map((d) => d.slug)).toContain('blueprint');
   });
 
   it('the overview summarises the category', async () => {

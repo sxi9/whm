@@ -477,14 +477,26 @@ defineOp('backup.archive.inspect', {
 
 // ---------------------------------------------------------------- restore ---
 
+// An archive from a destination is untrusted: before tar touches it the members
+// to be extracted are listed and device nodes, absolute names and ".." segments
+// are refused. tar --list on a missing member only reports it (exit 2); the
+// extraction tolerates missing members itself.
+async function refuseUnsafeMembers(file, members) {
+  const listing = await exec('tar', ['--list', '--verbose', '--absolute-names', '--file', file, '--', ...members], { allowFailure: true, timeoutMs: 7_200_000, maxBuffer: 256 * 1024 * 1024 });
+  const unsafe = unsafeMembers(parseTarListing(listing.stdout));
+  if (unsafe.length) throw new OpError('invalid_archive', `${path.basename(file)} carries members that are never restored: ${unsafe.slice(0, 5).map((m) => `${m.name} (${m.reason})`).join(', ')}${unsafe.length > 5 ? ', …' : ''}`, { unsafe: unsafe.slice(0, 50) });
+}
+
 // With `as`, tar runs under the account's uid/gid (setpriv) so every write into
 // the home tree is subject to the account's own permissions: a symlink the
 // account planted (public_html -> /etc) cannot turn a restore into a root file
 // write, whatever tar version the host has. The root-only archive stays
 // readable through an ambient CAP_DAC_READ_SEARCH, which grants no write access.
+// Without `as` tar runs as root, which by default recreates archived modes
+// including setuid/setgid bits; --no-same-permissions applies the umask instead.
 async function extractMembers(file, destDir, members, { strip, overwrite = true, as = null }) {
   const argv = ['--extract', '--file', file, '-C', destDir, '--no-same-owner', `--strip-components=${strip}`, '--warning=no-unknown-keyword'];
-  if (as) argv.push('--preserve-permissions');
+  argv.push(as ? '--preserve-permissions' : '--no-same-permissions');
   if (!overwrite) argv.push('--skip-old-files');
   argv.push('--', ...members);
   const tarBin = resolveBinary('tar');
@@ -511,8 +523,10 @@ defineOp('backup.archive.extract', {
     const destDir = ctx.assertAllowedPath(dest, 'write');
     if (!exists(file)) throw new OpError('not_found', `${archive} does not exist`);
     const top = archiveTop(file);
+    const members = ['mysql', 'dnszones', 'cp', 'meta', 'pds', 'addons', 'sds2'].map((m) => `${top}/${m}`);
+    await refuseUnsafeMembers(file, members);
     fs.mkdirSync(destDir, { recursive: true, mode: 0o700 });
-    const { missing } = await extractMembers(file, destDir, ['mysql', 'dnszones', 'cp', 'meta', 'pds', 'addons', 'sds2'].map((m) => `${top}/${m}`), { strip: 1 });
+    const { missing } = await extractMembers(file, destDir, members, { strip: 1 });
     const listDir = (sub, ext) => { try { return fs.readdirSync(path.join(destDir, sub)).filter((f) => f.endsWith(ext)).sort().map((f) => ({ name: f.slice(0, -ext.length), file: path.join(destDir, sub, f) })); } catch { return []; } };
     const readText = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return null; } };
     const readJson = (p) => { try { return JSON.parse(readText(p)); } catch { return null; } };
@@ -551,9 +565,7 @@ defineOp('backup.files.restore', {
     if (!exists(home)) { fs.mkdirSync(home, { recursive: true, mode: 0o711 }); fs.chownSync(home, uid, gid); }
     const rel = paths.map((p) => p.replace(/\/+$/, ''));
     const members = rel.length ? rel.map((p) => `${top}/homedir/${p}`) : [`${top}/homedir`];
-    const listing = await exec('tar', ['--list', '--verbose', '--absolute-names', '--file', file, '--', ...members], { allowFailure: true, timeoutMs: 7_200_000, maxBuffer: 256 * 1024 * 1024 });
-    const unsafe = unsafeMembers(parseTarListing(listing.stdout));
-    if (unsafe.length) throw new OpError('invalid_archive', `${path.basename(file)} carries members that are never restored: ${unsafe.slice(0, 5).map((m) => `${m.name} (${m.reason})`).join(', ')}${unsafe.length > 5 ? ', …' : ''}`, { unsafe: unsafe.slice(0, 50) });
+    await refuseUnsafeMembers(file, members);
     const { missing, warnings } = await extractMembers(file, home, members, { strip: 2, overwrite, as: { uid, gid } });
     const restored = [];
     for (const p of rel.length ? rel : ['.']) {
@@ -723,7 +735,11 @@ defineOp('backup.staging.remove', {
 
 const remotePath = z.string().max(512).regex(/^(?!.*(^|\/)\.\.(\/|$))[A-Za-z0-9._~/-]*$/, 'Remote path: letters, digits, "._~/-", no ".."');
 const hostField = arg.hostname.or(z.string().ip());
-const urlField = z.string().url().max(2048).refine((u) => /^https?:\/\//.test(u), 'http(s) URL required');
+// The URL is written as a quoted literal into curl's -K config file, which is
+// read line by line; the WHATWG parser behind .url() strips tabs and newlines
+// before validating, so they are refused here together with quotes and
+// backslashes.
+const urlField = z.string().max(2048).regex(/^https?:\/\/[^\s"'\\\x00-\x1f\x7f]+$/, 'http(s) URL without whitespace, quotes or control characters').url();
 const nonEmpty = z.string().min(1).max(256).regex(/^[^\n\r\0]+$/);
 const secretField = z.string().max(256).regex(/^[^\n\r\0]*$/);
 
@@ -744,10 +760,66 @@ export const destinationConfig = z.discriminatedUnion('kind', [
 
 const CURL_CODES = { 5: 'could not resolve proxy', 6: 'could not resolve host', 7: 'failed to connect', 9: 'access denied to the remote path', 19: 'file not found on the server', 22: 'the server returned an HTTP error', 25: 'upload failed (STOR/PUT refused)', 28: 'operation timed out', 35: 'TLS handshake failed', 51: 'TLS certificate verification failed', 60: 'TLS certificate could not be verified (enable "insecure" or install the CA)', 67: 'login denied', 78: 'the remote file does not exist', 79: 'SSH session error (host key or authentication)' };
 
-function curlFailure(result, what) {
+// curl reports a rejected SSH host key with the TLS verification codes.
+const SFTP_CODES = { 51: 'SSH host key verification failed (it does not match the pinned fingerprint)', 60: 'SSH host key verification failed (it does not match the pinned fingerprint)' };
+
+function curlFailure(result, what, kind) {
   const line = result.stderr.trim().split('\n').filter((l) => /^curl:/.test(l)).pop() || result.stderr.trim().split('\n').pop() || '';
-  const reason = CURL_CODES[result.code] || `curl exited with status ${result.code}`;
+  const reason = (kind === 'sftp' && SFTP_CODES[result.code]) || CURL_CODES[result.code] || `curl exited with status ${result.code}`;
   return new OpError('destination_failed', `${what}: ${reason}${line ? ` (${line.replace(/^curl: \(\d+\) /, '')})` : ''}`, { exitCode: result.code });
+}
+
+export function parseCurlVersion(stdout) {
+  const m = /^curl (\d+)\.(\d+)/.exec(String(stdout || ''));
+  return m ? { major: Number(m[1]), minor: Number(m[2]) } : null;
+}
+
+// --hostpubsha256 exists since curl 7.80; RHEL/Alma/Rocky 9 ship 7.76 for the
+// whole release, where the option is only a warning in a -K file and the
+// transfer then fails host verification.
+export const curlPinsHostKey = (v) => Boolean(v && (v.major > 7 || (v.major === 7 && v.minor >= 80)));
+
+let curlVersionCache = null;
+async function curlVersion() {
+  if (curlVersionCache) return curlVersionCache;
+  const r = await exec('curl', ['--version'], { allowFailure: true, timeoutMs: 15_000 });
+  const v = parseCurlVersion(r.stdout);
+  if (v) curlVersionCache = v;
+  return v;
+}
+export function resetCurlVersionCache() { curlVersionCache = null; }
+
+// ssh-keyscan prints "host keytype base64 [comment]" per key; OpenSSH's SHA-256
+// fingerprint of a key (ssh-keygen -lf) is base64(sha256(key)) without padding.
+export function matchHostKeyLines(stdout, pinnedSha256) {
+  const pinned = String(pinnedSha256 || '').replace(/=+$/, '');
+  const matched = [];
+  const offered = [];
+  for (const raw of String(stdout || '').split('\n')) {
+    const parts = raw.trim().split(/\s+/);
+    if (parts.length < 3 || parts[0].startsWith('#') || !/^[A-Za-z0-9+/]+=*$/.test(parts[2])) continue;
+    const fp = crypto.createHash('sha256').update(Buffer.from(parts[2], 'base64')).digest('base64').replace(/=+$/, '');
+    offered.push(`${parts[1]} SHA256:${fp}`);
+    if (fp === pinned) matched.push(parts.slice(0, 3).join(' '));
+  }
+  return { matched, offered };
+}
+
+// Older curl cannot pin a host key itself: the key is read with ssh-keyscan,
+// compared with the pinned fingerprint here, and handed to curl as the only
+// known_hosts entry of a private HOME (both the libssh and libssh2 backends
+// read $HOME/.ssh/known_hosts). Returns that HOME; the caller removes it.
+async function pinnedKnownHostsHome(config, dir) {
+  if (!hasBinary('ssh-keyscan')) throw new OpError('destination_failed', 'curl on this server is older than 7.80 and cannot pin an SSH host key by fingerprint; install ssh-keyscan (openssh-clients / openssh-client) or upgrade curl');
+  const r = await exec('ssh-keyscan', ['-p', String(config.port), '-T', '15', '--', config.host], { allowFailure: true, timeoutMs: 60_000 });
+  const { matched, offered } = matchHostKeyLines(r.stdout, config.hostKeySha256);
+  const where = `${config.host}:${config.port}`;
+  if (!offered.length) { const line = r.stderr.trim().split('\n').filter((l) => !l.startsWith('#')).pop(); throw new OpError('destination_failed', `could not read the SSH host key of ${where}${line ? ` (${line})` : ''}`); }
+  if (!matched.length) throw new OpError('destination_failed', `the SSH host key of ${where} does not match the pinned fingerprint; the server offers ${offered.join(', ')}`);
+  const home = fs.mkdtempSync(path.join(dir, 'backup-sshhome-'));
+  fs.mkdirSync(path.join(home, '.ssh'), { mode: 0o700 });
+  fs.writeFileSync(path.join(home, '.ssh', 'known_hosts'), `${matched.join('\n')}\n`, { mode: 0o600 });
+  return home;
 }
 
 const curlQuote = (v) => `"${String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
@@ -774,30 +846,33 @@ async function curl(config, lines, ctx, { what, timeoutMs = 3_600_000 } = {}) {
   const dir = tmpDir(ctx);
   const all = ['silent', 'show-error', 'connect-timeout = 20', `max-time = ${Math.floor(timeoutMs / 1000)}`, ...lines];
   const cleanup = [];
-  if (config.kind === 'ftp') {
-    all.push(`user = ${curlQuote(`${config.username}:${config.password}`)}`);
-    if (config.tls) all.push('ssl-reqd');
-    if (config.insecure) all.push('insecure');
-    if (!config.passive) all.push('ftp-port = "-"');
-    all.push('ftp-create-dirs');
-  } else if (config.kind === 'sftp') {
-    all.push(`user = ${curlQuote(`${config.username}:${config.password || ''}`)}`);
-    if (config.privateKey) { const key = secretFile(dir, 'backup-sshkey', config.privateKey.endsWith('\n') ? config.privateKey : `${config.privateKey}\n`); cleanup.push(key); all.push(`key = ${curlQuote(key)}`); }
-    if (config.hostKeySha256) all.push(`hostpubsha256 = ${curlQuote(config.hostKeySha256)}`);
-    else if (config.insecure) all.push('insecure');
-    all.push('ftp-create-dirs');
-  } else if (config.kind === 'webdav') {
-    if (config.username) all.push(`user = ${curlQuote(`${config.username}:${config.password || ''}`)}`, 'anyauth');
-    if (config.insecure) all.push('insecure');
-    all.push('fail', 'location');
-  }
-  const cnf = secretFile(dir, 'backup-curl', `${all.join('\n')}\n`);
-  cleanup.push(cnf);
+  let env;
   try {
-    const r = await exec('curl', ['-K', cnf], { allowFailure: true, timeoutMs: timeoutMs + 5000, maxBuffer: 64 * 1024 * 1024 });
-    if (r.code !== 0) throw curlFailure(r, what);
+    if (config.kind === 'ftp') {
+      all.push(`user = ${curlQuote(`${config.username}:${config.password}`)}`);
+      if (config.tls) all.push('ssl-reqd');
+      if (config.insecure) all.push('insecure');
+      if (!config.passive) all.push('ftp-port = "-"');
+      all.push('ftp-create-dirs');
+    } else if (config.kind === 'sftp') {
+      all.push(`user = ${curlQuote(`${config.username}:${config.password || ''}`)}`);
+      if (config.privateKey) { const key = secretFile(dir, 'backup-sshkey', config.privateKey.endsWith('\n') ? config.privateKey : `${config.privateKey}\n`); cleanup.push(key); all.push(`key = ${curlQuote(key)}`); }
+      if (config.hostKeySha256) {
+        if (curlPinsHostKey(await curlVersion())) all.push(`hostpubsha256 = ${curlQuote(config.hostKeySha256)}`);
+        else { const home = await pinnedKnownHostsHome(config, dir); cleanup.push(home); env = { HOME: home }; }
+      } else if (config.insecure) all.push('insecure');
+      all.push('ftp-create-dirs');
+    } else if (config.kind === 'webdav') {
+      if (config.username) all.push(`user = ${curlQuote(`${config.username}:${config.password || ''}`)}`, 'anyauth');
+      if (config.insecure) all.push('insecure');
+      all.push('fail', 'location');
+    }
+    const cnf = secretFile(dir, 'backup-curl', `${all.join('\n')}\n`);
+    cleanup.push(cnf);
+    const r = await exec('curl', ['-K', cnf], { allowFailure: true, timeoutMs: timeoutMs + 5000, maxBuffer: 64 * 1024 * 1024, env });
+    if (r.code !== 0) throw curlFailure(r, what, config.kind);
     return r;
-  } finally { for (const f of cleanup) unlinkQuiet(f); }
+  } finally { for (const f of cleanup) fs.rmSync(f, { recursive: true, force: true }); }
 }
 
 // --- S3 SigV4 (node:crypto + node:https; AWS, Backblaze B2, MinIO, Wasabi, …)

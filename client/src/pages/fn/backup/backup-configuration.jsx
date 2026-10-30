@@ -157,7 +157,7 @@ function Destinations() {
   const save = async () => {
     setBusy('save'); setFormError(null);
     try {
-      const body = { name: name.trim(), enabled, config: cleanDestination(cfg) };
+      const body = { name: name.trim(), enabled, config: cleanDestination(cfg, { editing: editing !== 'new' }) };
       if (editing === 'new') await api.post('/backup/destinations', body); else await api.put(`/backup/destinations/${editing.id}`, body);
       toast.success(editing === 'new' ? 'Destination added' : 'Destination saved');
       setEditing(null); refetch();

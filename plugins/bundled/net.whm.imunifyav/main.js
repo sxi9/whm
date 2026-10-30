@@ -93,7 +93,14 @@ module.exports = {
       const settings = await ctx.settings.getAll();
       const d = await detect(ctx);
       if (d.imunify.installed && !job.params.force) { job.log('ImunifyAV is installed and keeps its own schedule; the ClamAV fallback is skipped'); return { skipped: true, reason: 'imunifyav-installed' }; }
-      if (!d.clamav.installed) throw capabilityError(ctx, 'clamav');
+      if (!d.clamav.installed) {
+        // A cron run on a host without clamscan is not a failure: the
+        // scheduled scan is skipped until ClamAV is installed. Only a manual
+        // run (the /scan route) reports the missing capability.
+        if (job.params.trigger === 'manual') throw capabilityError(ctx, 'clamav');
+        job.log('ClamAV (clamscan) is not installed; the scheduled scan is skipped');
+        return { skipped: true, reason: 'clamav-missing', install: VENDOR };
+      }
       if (settings.fallbackEnabled === false && job.params.trigger !== 'manual') { job.log('ClamAV fallback is disabled in the settings'); return { skipped: true, reason: 'fallback-disabled' }; }
       const wanted = Array.isArray(job.params.usernames) && job.params.usernames.length ? job.params.usernames : null;
       const page = await ctx.api.accounts.list({ pageSize: 500 });

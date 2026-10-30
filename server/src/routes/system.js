@@ -4,9 +4,27 @@ import { requireRoot, requireReseller, isRoot } from '../middleware/rbac.js';
 import { notFound } from '../lib/errors.js';
 import { createSystemStackService, STACK_INSTALL_JOB } from '../services/system-stack.js';
 import { STACK_PROFILE_KEYS, STACK_COMPONENT_KEYS } from '../lib/stack-catalog.js';
+import { CONFIG_KEYS } from '../services/clusters-config.js';
+import { PS_USER_RE } from '../services/system-health.js';
 
 const serviceName = z.string().regex(/^[a-z0-9-]{1,40}$/);
 const capabilityName = z.string().regex(/^[a-z][a-z0-9_-]{0,39}$/);
+// Process owners as ps prints them: system accounts such as "_apt" or
+// "Debian-exim" are not panel usernames.
+const processUser = z.string().regex(PS_USER_RE, 'Not a valid process owner name');
+// A setting the configuration cluster knows has the value shape its consumer
+// expects (clusters-config.js); it is refused here rather than stored for the
+// consumer to trip over at runtime (a null cPHulk threshold blocks an address
+// after a single failed login). Keys outside that registry are stored as sent.
+const settingsBody = z.record(z.string().regex(/^[a-z0-9_.]{1,60}$/), z.any()).superRefine((values, rctx) => {
+  for (const [key, value] of Object.entries(values)) {
+    const def = CONFIG_KEYS[key];
+    if (!def) continue;
+    const r = def.schema.safeParse(value);
+    if (r.success) continue;
+    for (const issue of r.error.issues) rctx.addIssue({ code: 'custom', path: [key, ...issue.path], message: issue.message });
+  }
+});
 
 export function systemRoutes(ctx) {
   const { system, serviceManager, jobs, scheduler, settings, audit } = ctx;
@@ -31,7 +49,7 @@ export function systemRoutes(ctx) {
   r.get('/status', requireReseller, wrap(() => system.status()));
   r.get('/info', requireRoot, wrap(() => system.info()));
   r.get('/disk', requireRoot, wrap(() => system.diskUsage()));
-  r.get('/processes', requireRoot, validate({ query: z.object({ sort: z.enum(['cpu', 'mem', 'pid', 'time']).default('cpu'), limit: z.coerce.number().int().min(1).max(5000).default(500), user: fields.username.optional() }) }),
+  r.get('/processes', requireRoot, validate({ query: z.object({ sort: z.enum(['cpu', 'mem', 'pid', 'time']).default('cpu'), limit: z.coerce.number().int().min(1).max(5000).default(500), user: processUser.optional() }) }),
     wrap((req) => system.processes(req.query)));
   r.post('/processes/:pid/signal', requireRoot, validate({ params: z.object({ pid: fields.id }), body: z.object({ signal: z.enum(['SIGTERM', 'SIGKILL', 'SIGHUP', 'SIGINT', 'SIGSTOP', 'SIGCONT']).default('SIGTERM') }).strict() }),
     wrap((req) => system.signal(req.params.pid, req.body.signal, req)));
@@ -86,7 +104,7 @@ export function systemRoutes(ctx) {
 
   // Settings (Basic Setup, Tweak Settings, ...) -----------------------------------
   r.get('/settings', requireRoot, validate({ query: z.object({ prefix: z.string().regex(/^[a-z0-9_.]{0,40}$/).default('') }) }), wrap((req) => settings.getPrefix(req.query.prefix)));
-  r.put('/settings', requireRoot, validate({ body: z.record(z.string().regex(/^[a-z0-9_.]{1,60}$/), z.any()) }), wrap((req) => { settings.setMany(req.body); req.audit({ action: 'settings.update', args: req.body }); return settings.getPrefix(''); }));
+  r.put('/settings', requireRoot, validate({ body: settingsBody }), wrap((req) => { settings.setMany(req.body); req.audit({ action: 'settings.update', args: req.body }); return settings.getPrefix(''); }));
 
   // Audit log --------------------------------------------------------------------
   r.get('/audit', requireRoot, validate({ query: z.object({ page: fields.page, pageSize: fields.pageSize, q: z.string().max(200).optional(), principal: z.string().max(64).optional(), action: z.string().max(80).optional(), result: z.string().max(20).optional(), sort: z.string().optional(), dir: fields.sortDir.optional() }) }),

@@ -6,6 +6,15 @@ import { Field, TextInput, Select, Toggle, Button, FormActions, ErrorBanner } fr
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError } from '../../software/Shared.jsx';
 
+// GET answers with the credentials stripped from the feed URL; sending that
+// redacted echo back would replace the stored user:password. Only a URL the
+// admin actually changed goes on the wire.
+export function settingsBody(form, data) {
+  const body = { tier: form.tier, autoUpdate: form.autoUpdate };
+  if (form.url !== (data?.updateUrl || '')) body.url = form.url;
+  return body;
+}
+
 export default function UpdateServerSoftware({ fn }) {
   const toast = useToast();
   const { data, loading, error, refetch, setData } = useApi('/software/panel/update');
@@ -22,7 +31,7 @@ export default function UpdateServerSoftware({ fn }) {
   const save = async () => {
     setBusy('save');
     setSaveError(null);
-    try { const { data: d } = await api.put('/software/panel/update/settings', form); setData(d); toast.success('Update settings saved'); } catch (err) { setSaveError(err); toast.error(err); } finally { setBusy(null); }
+    try { const { data: d } = await api.put('/software/panel/update/settings', settingsBody(form, data)); setData(d); toast.success('Update settings saved'); } catch (err) { setSaveError(err); toast.error(err); } finally { setBusy(null); }
   };
   const dirty = data && (form.url !== (data.updateUrl || '') || form.tier !== data.tier || form.autoUpdate !== data.autoUpdate);
 
@@ -53,7 +62,7 @@ export default function UpdateServerSoftware({ fn }) {
           </Card>
           <Card title="Update settings">
             <div className="form-grid">
-              <Field label="Update feed URL" help='JSON document with { "version": "x.y.z", "url": "...", "notes": "..." } or { "tiers": { "stable": {...}, "edge": {...} } }'>
+              <Field label="Update feed URL" help={data.updateUrlHasCredentials ? 'The stored URL carries credentials (user:password@host), hidden here. Leave the field unchanged to keep them, or enter the full URL again to replace them.' : 'JSON document with { "version": "x.y.z", "url": "...", "notes": "..." } or { "tiers": { "stable": {...}, "edge": {...} } }'}>
                 <TextInput value={form.url} onChange={(v) => setForm({ ...form, url: v })} placeholder="https://updates.example.com/whm/latest.json" />
               </Field>
               <Field label="Release tier"><Select value={form.tier} onChange={(v) => setForm({ ...form, tier: v })} options={[{ value: 'stable', label: 'Stable' }, { value: 'release', label: 'Release' }, { value: 'edge', label: 'Edge (pre-release)' }]} /></Field>

@@ -46,8 +46,22 @@ export function createPackagesService(ctx) {
     return row;
   }
 
+  // Reads let a reseller see root's global packages; writes are confined to its own.
   function assertVisible(pkg, user) {
     if (!isRoot(user) && pkg.owner_id && pkg.owner_id !== user.id) throw forbidden('That package belongs to another reseller');
+  }
+  function assertOwned(pkg, user) {
+    if (!isRoot(user) && pkg.owner_id !== user.id) throw forbidden('That package belongs to root or another reseller');
+  }
+  // Turning on shell access or a dedicated IP in a package needs the same reseller
+  // privileges as granting them to an account; resubmitted unchanged values are not grants.
+  function assertPrivileges(input, current, user) {
+    if (isRoot(user) || !ctx.resellers?.assertAcl) return;
+    if (input.has_shell && !current.has_shell) {
+      if (ctx.resellers.aclsFor?.(user.id)?.has('disallow-shell')) throw forbidden('Your reseller privileges forbid granting shell access (Disallow Shell Access)');
+      ctx.resellers.assertAcl(user, 'add-pkg-shell');
+    }
+    if (input.has_dedicated_ip && !current.has_dedicated_ip) ctx.resellers.assertAcl(user, 'add-pkg-ip');
   }
 
   return {
@@ -69,6 +83,8 @@ export function createPackagesService(ctx) {
       return shape(pkg);
     },
     create(input, user) {
+      if (!isRoot(user)) ctx.resellers?.assertAcl?.(user, 'add-pkg');
+      assertPrivileges(input, {}, user);
       if (stmts.byName.get(input.name)) throw conflict(`A package named "${input.name}" already exists`);
       const row = fromInput(input);
       stmts.insert.run({ ...row, name: input.name, owner_id: isRoot(user) ? null : user.id });
@@ -77,7 +93,9 @@ export function createPackagesService(ctx) {
     update(name, input, user) {
       const pkg = stmts.byName.get(name);
       if (!pkg) throw notFound('Package');
-      assertVisible(pkg, user);
+      assertOwned(pkg, user);
+      if (!isRoot(user)) ctx.resellers?.assertAcl?.(user, 'edit-pkg');
+      assertPrivileges(input, pkg, user);
       const row = fromInput(input, pkg);
       db.transaction(() => {
         stmts.update.run({ ...row, name });
@@ -92,7 +110,8 @@ export function createPackagesService(ctx) {
     remove(name, user) {
       const pkg = stmts.byName.get(name);
       if (!pkg) throw notFound('Package');
-      assertVisible(pkg, user);
+      assertOwned(pkg, user);
+      if (!isRoot(user)) ctx.resellers?.assertAcl?.(user, 'add-pkg');
       if (stmts.usage.get(pkg.id).n > 0) throw conflict('Package is in use by one or more accounts; move them to another package first');
       stmts.remove.run(name);
     },

@@ -435,6 +435,11 @@ export function createMarketplaceClient(ctx) {
     const s = identity();
     if (!s.enabled || s.hubMismatch) return { skipped: s.enabled ? 'hub_mismatch' : 'disabled', applied: [] };
     if (!license().token()) return { skipped: 'no_token', applied: [] };
+    // An expired, suspended or revoked license keeps its token, which the hub
+    // refuses (401/403): the 6-hourly poll is a skip, not a failed job, until
+    // a valid license is active again (same rule as the update check).
+    const lic = license().get();
+    if (lic.enforce && lic.degraded) return { skipped: 'license_degraded', applied: [] };
     raiseHeadFloor(signedHeadTs());
     const st = state();
     const res = await license().hub.request('/v1/market/revocations', { token: license().token(), since: st.last_revocation_ts });

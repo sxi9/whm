@@ -23,7 +23,7 @@ vi.mock('../src/hooks/useApi.js', () => ({
   useMutation: (fn) => ({ mutate: fn, loading: false, error: null, fieldErrors: null, reset() {} }),
 }));
 
-const { MarketplaceTab, MarketplaceDisabledNotice, HubMismatchNotice, MarketplaceUpdatesNotice, PluginDetailDrawer, priceLabel, safeHref } = await import('../src/pages/cpanel/MarketplaceTab.jsx');
+const { MarketplaceTab, MarketplaceDisabledNotice, HubMismatchNotice, MarketplaceUpdatesNotice, PluginDetailDrawer, priceLabel, safeHref, MANAGE_PLUGINS_PATH } = await import('../src/pages/cpanel/MarketplaceTab.jsx');
 const { HomePage } = await import('../src/pages/Home.jsx');
 const { ConsentModal, PermissionList, TrustNotice } = await import('../src/pages/cpanel/ConsentModal.jsx');
 const { RevocationBanner, describeRevocation } = await import('../src/components/RevocationBanner.jsx');
@@ -45,6 +45,7 @@ const catalog = [
   { id: 'net.example.minimal', name: 'Minimal', summary: 'Smallest valid plugin.', developer: { display_name: 'Example Dev', verified: true }, category: { slug: 'developer-tools', name: 'Developer tools' }, pricing: { model: 'free' }, latest: { version: '1.0.0', engines_whm: '>=1.0.0' }, install_count: 12, rating_avg: 4.5, rating_count: 2, installed: null },
   { id: 'net.example.scoped', name: 'Scoped', summary: 'Reads accounts.', developer: { display_name: 'Example Dev', verified: true }, category: { slug: 'security', name: 'Security' }, pricing: { model: 'one_time', amount_cents: 4900, currency: 'USD' }, latest: { version: '1.0.1' }, install_count: 3, rating_avg: null, rating_count: 0, installed: { version: '1.0.0', state: 'enabled', source: 'marketplace', marketplace: true, consentState: 'consented', update: { id: 'net.example.scoped', current: '1.0.0', latest: '1.0.1' } } },
   { id: 'net.whm.server-monitoring', name: 'Server Monitoring', summary: 'Bundled.', developer: { display_name: 'WHM', verified: true }, category: null, pricing: { model: 'free' }, latest: { version: '1.0.0' }, install_count: 0, rating_count: 0, installed: { version: '1.0.0', state: 'enabled', source: 'bundled', marketplace: false, consentState: null, update: null } },
+  { id: 'net.example.side', name: 'Side', summary: 'Sideloaded.', developer: { display_name: 'Example Dev', verified: false }, category: null, pricing: { model: 'free' }, latest: { version: '1.0.0' }, install_count: 0, rating_count: 0, installed: { version: '1.0.0', state: 'installed', source: 'upload', marketplace: false, consentState: null, update: null } },
 ];
 const detail = {
   ...catalog[1], description_md: 'Builds a **report** of every account.', homepage: 'https://example.net/scoped', support_url: null,
@@ -90,7 +91,9 @@ describe('Marketplace tab', () => {
     expect(root).toContain('Install');
     expect(root).toContain('Update to 1.0.1');
     expect(root).toContain('Uninstall');
-    expect(root).toContain('Bundled');
+    expect(root).toContain('>Bundled<');
+    expect(root).toContain('>Sideloaded<');
+    expect(root).toContain(`href="${MANAGE_PLUGINS_PATH}"`);
     expect(root).toContain('49.00 USD');
     expect(root).toContain('Free');
     expect(root).toContain('Security (1)');
@@ -113,6 +116,11 @@ describe('Marketplace tab', () => {
     expect(reseller).not.toContain('Uninstall');
     expect(reseller).not.toContain('Check for updates');
     expect(reseller).not.toContain('data-testid="pending-updates"');
+    // `installed: { state }` has no `marketplace`/`source`: no Sideloaded/Bundled label, and no link to the root-only Manage Plugins page.
+    expect(reseller).not.toContain('>Sideloaded<');
+    expect(reseller).not.toContain('>Bundled<');
+    expect(reseller).not.toContain(MANAGE_PLUGINS_PATH);
+    expect(reseller).toContain('>installed<');
   });
 
   it('warns about a degraded license while browsing keeps working', () => {
@@ -276,13 +284,47 @@ describe('Manage Plugins and WHM Marketplace integration', () => {
     const reseller = render(<WhmMarketplace fn={fn} />);
     expect(reseller).toContain('catalog-net.example.minimal');
     expect(reseller).not.toContain('>Install<');
-    authState.user = { id: 1, username: 'root', role: 'root' };
+    // /server-config/marketplace is requireRoot: the static catalog would only show a 403 banner to a reseller.
+    expect(reseller).not.toContain('Distribution packages');
+    expect(reseller).not.toContain('NGINX');
     responses.set('/marketplace/status', { data: { ...enabledStatus, enabled: false } });
+    const resellerOff = render(<WhmMarketplace fn={fn} />);
+    expect(resellerOff).toContain('Marketplace not enabled');
+    expect(resellerOff).not.toContain('NGINX');
+    expect(resellerOff).not.toContain('data-testid="marketplace-disabled"');
+    authState.user = { id: 1, username: 'root', role: 'root' };
     const off = render(<WhmMarketplace fn={fn} />);
+    expect(off).not.toContain('Marketplace not enabled');
     expect(off).not.toContain('catalog-net.example.minimal');
     expect(off).not.toContain('Distribution packages');
     expect(off).toContain('NGINX');
     expect(off).toContain('data-testid="marketplace-disabled"');
+  });
+
+  it('static catalog only offers Configure for a path nav.js routes, and every catalog configure path is one', async () => {
+    const { StaticCatalog, configureHref } = await import('../src/pages/fn/server-configuration/whm-marketplace.jsx');
+    const catalogJson = (await import('../../server/src/services/server-configuration.marketplace.json')).default;
+    for (const item of catalogJson.items) {
+      if (item.configure == null) continue;
+      expect(configureHref(item.configure), `${item.id} configure "${item.configure}" is not a nav.js path`).toBe(item.configure);
+    }
+    expect(catalogJson.items.find((i) => i.id === 'postgresql').configure).toBe('/database-services/manage-database-profiles');
+    expect(catalogJson.items.find((i) => i.id === 'mailman').configure).toBe('/cpanel/reset-a-mailman-password');
+    expect(catalogJson.items.find((i) => i.id === 'roundcube').configure).toBeNull();
+    expect(configureHref('/database-services/postgresql-config')).toBeNull();
+    expect(configureHref('/server-configuration/basic-webhost-manager-setup#license')).toBe('/server-configuration/basic-webhost-manager-setup#license');
+
+    responses.clear();
+    const base = { vendor: 'x', category: 'Databases', description: 'd', price: 'Free', installed: true, installPath: '/software/install-distro-packages', packagesForHost: ['pkg'], docs: 'https://example.net/' };
+    responses.set('/server-config/marketplace', { data: { total: 2, categories: ['Databases'], packageManager: 'apt', items: [
+      { ...base, id: 'good', name: 'Good', configure: '/database-services/manage-database-profiles' },
+      { ...base, id: 'dead', name: 'Dead', configure: '/database-services/postgresql-config' },
+    ] } });
+    const html = render(<StaticCatalog />);
+    expect(html).toContain('href="/database-services/manage-database-profiles"');
+    expect(html).not.toContain('/database-services/postgresql-config');
+    expect((html.match(/>Configure</g) || []).length).toBe(1);
+    expect((html.match(/href="https:\/\/example.net\/"/g) || []).length).toBe(2);
   });
 
   it('Market Provider Manager points the hub row at the License tab for the key', () => {

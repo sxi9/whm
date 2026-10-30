@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import util from 'node:util';
 import { createRequire } from 'node:module';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { json } from '../db/index.js';
 import { HttpError, CapabilityError, notFound, conflict } from '../lib/errors.js';
 import { agentErrorStatus } from '../middleware/error.js';
@@ -731,6 +732,10 @@ export function createPluginHost(ctx) {
 
   // ------------------------------------------------------------------ jobs
   const jobType = (id, name) => `plugin:${id}:${name}`;
+  // Carries the principal of the plugin route being dispatched: a job a plugin
+  // starts from ctx.jobs.run there is owned by that principal (the core jobs API
+  // shows a non-root user only the jobs they created).
+  const requestScope = new AsyncLocalStorage();
   function shapeJob(entry, j) {
     const wrapped = isObj(j.params) && 'trigger' in j.params ? j.params : { trigger: 'manual', params: j.params };
     return {
@@ -754,7 +759,7 @@ export function createPluginHost(ctx) {
     if (params !== undefined && !isObj(params)) throw new E.ValidationError('job params must be an object');
     const handler = entry.module?.jobs?.[name];
     if (typeof handler !== 'function') throw new E.NotFoundError('job handler', name);
-    return ctx.jobs.enqueue(jobType(entry.id, name), { trigger, params: clone(params || {}) }, { userId });
+    return ctx.jobs.enqueue(jobType(entry.id, name), { trigger, params: clone(params || {}) }, { userId: userId ?? requestScope.getStore()?.userId ?? null });
   }
   function setProgress(run, pct, msg) {
     if (typeof pct !== 'number' || pct < 0 || pct > 100) throw new E.ValidationError('progress must be a number 0..100');
@@ -780,7 +785,9 @@ export function createPluginHost(ctx) {
     };
     let timer = null;
     try {
-      const work = handler(job, entry.ctx);
+      // The worker tick can start inside a route's async continuation; a job
+      // handler must not inherit that principal for the jobs it starts itself.
+      const work = requestScope.exit(() => handler(job, entry.ctx));
       const timeout = def.timeoutSec ? new Promise((_, reject) => { timer = setTimeout(() => { ac.abort(); reject(new E.PluginError(`job "${name}" exceeded ${def.timeoutSec}s`, { code: 'JOB_TIMEOUT', status: 504 })); }, def.timeoutSec * 1000); timer.unref(); }) : null;
       const result = timeout ? await Promise.race([work, timeout]) : await work;
       if (run.cancelled) throw new E.PluginError('cancelled', { code: 'JOB_CANCELLED', status: 409 });
@@ -1034,7 +1041,7 @@ export function createPluginHost(ctx) {
       error(code, message, status = 400) { if (state.sent) throw new E.ConflictError('response already sent'); send(status, { error: { code, message } }); },
     };
     try {
-      await route.handler(facadeReq, facadeRes);
+      await requestScope.run({ userId: principal.id }, () => route.handler(facadeReq, facadeRes));
       if (!state.sent) send(204, undefined);
     } catch (err) {
       const status = err instanceof E.PluginError ? err.status : 500;

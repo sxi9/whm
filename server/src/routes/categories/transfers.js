@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { validate, z, fields } from '../../lib/validate.js';
 import { requireRoot, requireReseller } from '../../middleware/rbac.js';
+import { unprocessable } from '../../lib/errors.js';
 import { createTransfersService, RUN_KINDS, ARCHIVE_NAME, JOB_TYPES } from '../../services/transfers.js';
 
 const bareHostname = z.string().toLowerCase().regex(/^[a-z0-9][a-z0-9-]{0,62}$/, 'Must be a hostname or IP address');
@@ -32,6 +33,25 @@ const archiveName = z.string().regex(ARCHIVE_NAME, 'Must end in .tar.gz, .tgz or
 const uploadBody = z.object({ filename: archiveName, size: z.number().int().min(1).max(500 * 1024 * 1024 * 1024) }).strict();
 // Base64 of UPLOAD_CHUNK_BYTES fits under the 2 MB JSON body limit.
 const chunkBody = z.object({ data: z.string().min(1).max(1_800_000).regex(/^[A-Za-z0-9+/=]+$/, 'Chunk must be base64') }).strict();
+// A chunk is 1.25 MiB of base64 and a large archive sends thousands of them:
+// the route-level audit row (middleware/audit.js mirrors req.body when the
+// response finishes) keeps only the chunk size; the upload's begin/finish/
+// abort entries are its audit trail.
+function stashUploadChunk(req, _res, next) {
+  const raw = req.body;
+  req.uploadChunk = raw;
+  req.body = { bytes: typeof raw?.data === 'string' ? Buffer.byteLength(raw.data, 'base64') : 0 };
+  next();
+}
+function parseUploadChunk(req) {
+  const result = chunkBody.safeParse(req.uploadChunk ?? {});
+  if (!result.success) {
+    const fieldErrors = {};
+    for (const issue of result.error.issues) (fieldErrors[issue.path.join('.') || '_'] ||= []).push(issue.message);
+    throw unprocessable('Request validation failed', fieldErrors);
+  }
+  return result.data.data;
+}
 const idParam = z.object({ id: fields.id });
 const uploadParam = z.object({ id: z.string().regex(/^[a-f0-9]{24}$/) });
 
@@ -67,7 +87,7 @@ export async function register(ctx) {
   r.post('/archives/inspect', requireRoot, validate({ body: z.object({ path: fields.absPath }).strict() }), wrap((req) => svc().archives.inspect(req.body.path, req.user, req)));
   r.post('/uploads', requireRoot, validate({ body: uploadBody }), wrap((req) => svc().uploads.begin(req.body, req.user, req), 201));
   r.get('/uploads/:id', requireRoot, validate({ params: uploadParam }), wrap((req) => svc().uploads.status(req.params.id, req.user)));
-  r.put('/uploads/:id/chunks', requireRoot, validate({ params: uploadParam, body: chunkBody }), wrap((req) => svc().uploads.chunk(req.params.id, req.body.data, req.user, req)));
+  r.put('/uploads/:id/chunks', stashUploadChunk, requireRoot, validate({ params: uploadParam }), wrap((req) => svc().uploads.chunk(req.params.id, parseUploadChunk(req), req.user, req)));
   r.post('/uploads/:id/finish', requireRoot, validate({ params: uploadParam }), wrap((req) => svc().uploads.finish(req.params.id, req.user, req)));
   r.delete('/uploads/:id', requireRoot, validate({ params: uploadParam }), wrap((req) => svc().uploads.abort(req.params.id, req.user, req)));
   r.post('/restore', requireRoot, validate({ body: restoreBody }), wrap((req) => svc().startRestore(req.body, req.user, req), 202));

@@ -9,7 +9,10 @@ const SECRET_KEYS = /pass(word)?|secret|token|key|cert|private|totp|csrf|^env(ir
 const OPAQUE_KEYS = /^(body|text|message|content)$/i;
 
 export function redact(value, depth = 0, { opaque = false } = {}) {
-  if (depth > 6 || value == null) return value;
+  if (value == null) return value;
+  // Past the depth limit a container is replaced, never passed through: its
+  // secret-named children would otherwise reach the log unmasked.
+  if (depth > 6 && typeof value === 'object') return '[…]';
   if (Array.isArray(value)) return value.slice(0, 50).map((v) => redact(v, depth + 1, { opaque }));
   if (Buffer.isBuffer(value) || ArrayBuffer.isView(value)) return { bytes: value.byteLength };
   if (typeof value === 'object') {

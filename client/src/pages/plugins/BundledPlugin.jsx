@@ -82,8 +82,11 @@ export function RootOnlyNotice({ fn, status }) {
 
 // Tabs: the overview is the function's own React UI; every other tab is a page
 // the plugin manifest declares, rendered by the generic PluginPage renderer.
-// The Settings tab talks to the root-only /plugins/manage API, so it is shown
-// to root alone.
+// Settings and action pages talk to the root-only /plugins/manage API
+// (settings, jobs/:name), so they are shown to root alone even when the
+// plugin's own routes admit resellers.
+export const MANAGE_ONLY_PAGE_KINDS = ['settings', 'action'];
+
 export function BundledPluginShell({ fn, id, overview: Overview, tabs = [] }) {
   const { plugin, status, error, loading, checking, reload } = useBundledPlugin(id);
   const [tab, setTab] = useState('overview');
@@ -91,7 +94,7 @@ export function BundledPluginShell({ fn, id, overview: Overview, tabs = [] }) {
   if (!plugin) return <EnablePrompt fn={fn} id={id} status={status} error={error} checking={checking} onChanged={reload} />;
   if (status && status.canUse === false) return <RootOnlyNotice fn={fn} status={status} />;
   const canManage = Boolean(status?.canManage);
-  const pages = (plugin.pages || []).filter((p) => tabs.includes(p.route) && (canManage || p.route !== '/settings'));
+  const pages = (plugin.pages || []).filter((p) => tabs.includes(p.route) && (canManage || !MANAGE_ONLY_PAGE_KINDS.includes(p.kind)));
   const active = tab === 'overview' ? null : pages.find((p) => p.route === tab);
   const nav = (
     <div className="action-row" style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }} role="tablist">

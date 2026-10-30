@@ -9,6 +9,18 @@ import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { EngineBanner, RequestError, AccountSelect, useDbStatus, useIsRoot } from '../../databases/Shared.jsx';
 
+// Column keys travel as the list's `sort` query value, which the API only
+// accepts in lowercase/underscore form (size_bytes sorts on sizeBytes).
+export const databaseColumns = (isRoot) => [
+  { key: 'name', label: 'Database', sortable: true, render: (r) => <><code>{r.name}</code>{r.system && <StatusPill status="info"> system</StatusPill>}</> },
+  { key: 'account', label: 'Account', sortable: true, render: (r) => (r.account ? <Link to={`/account-information/list-accounts?q=${r.account}`}>{r.account}</Link> : <span className="muted">{isRoot ? <Link to="/database-services/database-map-tool">unmapped</Link> : '—'}</span>) },
+  { key: 'users', label: 'Users with access', render: (r) => (r.users?.length ? r.users.map((u) => <code key={u} style={{ marginRight: 6 }}>{u}</code>) : <span className="muted">none</span>) },
+  { key: 'size_bytes', label: 'Size', sortable: true, align: 'right', render: (r) => (r.sizeBytes == null ? '—' : formatBytes(r.sizeBytes)) },
+  { key: 'tables', label: 'Tables', align: 'right', render: (r) => r.tables ?? '—' },
+  { key: 'charset', label: 'Charset', render: (r) => (r.charset ? `${r.charset}${r.collation ? ` / ${r.collation}` : ''}` : '—') },
+  { key: 'onServer', label: 'State', render: (r) => <StatusPill status={r.onServer === false ? 'failed' : r.onServer === null ? 'unknown' : 'ok'}>{r.onServer === false ? 'missing on server' : r.onServer === null ? 'server unreachable' : 'present'}</StatusPill> },
+];
+
 export default function ManageDatabases({ fn }) {
   const toast = useToast();
   const confirm = useConfirm();
@@ -61,15 +73,7 @@ export default function ManageDatabases({ fn }) {
       </form>
       <Card title="Databases" padded={false}>
         <DataTable
-          columns={[
-            { key: 'name', label: 'Database', sortable: true, render: (r) => <><code>{r.name}</code>{r.system && <StatusPill status="info"> system</StatusPill>}</> },
-            { key: 'account', label: 'Account', sortable: true, render: (r) => (r.account ? <Link to={`/account-information/list-accounts?q=${r.account}`}>{r.account}</Link> : <span className="muted">{isRoot ? <Link to="/database-services/database-map-tool">unmapped</Link> : '—'}</span>) },
-            { key: 'users', label: 'Users with access', render: (r) => (r.users?.length ? r.users.map((u) => <code key={u} style={{ marginRight: 6 }}>{u}</code>) : <span className="muted">none</span>) },
-            { key: 'sizeBytes', label: 'Size', sortable: true, align: 'right', render: (r) => (r.sizeBytes == null ? '—' : formatBytes(r.sizeBytes)) },
-            { key: 'tables', label: 'Tables', align: 'right', render: (r) => r.tables ?? '—' },
-            { key: 'charset', label: 'Charset', render: (r) => (r.charset ? `${r.charset}${r.collation ? ` / ${r.collation}` : ''}` : '—') },
-            { key: 'onServer', label: 'State', render: (r) => <StatusPill status={r.onServer === false ? 'failed' : r.onServer === null ? 'unknown' : 'ok'}>{r.onServer === false ? 'missing on server' : r.onServer === null ? 'server unreachable' : 'present'}</StatusPill> },
-          ]}
+          columns={databaseColumns(isRoot)}
           rows={data || []} loading={loading} error={error} rowKey={(r) => r.name}
           total={meta?.total} page={t.state.page} pageSize={t.state.pageSize} onPageChange={t.setPage}
           sort={t.state.sort} dir={t.state.dir} onSortChange={t.setSort}

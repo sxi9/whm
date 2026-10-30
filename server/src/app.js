@@ -103,15 +103,23 @@ export async function createApp(ctx) {
     resave: false,
     saveUninitialized: false,
     rolling: true,
-    cookie: { httpOnly: true, sameSite: 'strict', secure: config.tls || config.cookieSecure === true, maxAge: config.sessionTtlMs, path: '/' },
+    // Lax, not Strict: the OpenID Connect callback is a top-level navigation
+    // that comes back from the identity provider's site, where browsers
+    // withhold a Strict cookie, so the pending state (and a linking user's
+    // session) would be invisible to it. Mutations stay behind X-CSRF-Token.
+    // 'auto' marks every TLS session Secure while a panel whose redirect is
+    // off (WHM_FORCE_HTTPS=false) can still log in on 2086: express-session
+    // never puts a Secure cookie on a plain-HTTP response.
+    cookie: { httpOnly: true, sameSite: 'lax', secure: config.cookieSecure === true ? true : config.tls ? 'auto' : false, maxAge: config.sessionTtlMs, path: '/' },
   }));
 
   app.use('/api/auth/login', rateLimit({ windowMs: config.loginRateLimit.windowMs, limit: config.loginRateLimit.max, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: { code: 'rate_limited', message: 'Too many login attempts, please wait' } } }));
   app.use('/api/auth/2fa', rateLimit({ windowMs: config.loginRateLimit.windowMs, limit: config.loginRateLimit.max, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: { code: 'rate_limited', message: 'Too many attempts, please wait' } } }));
   app.use('/api', rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: 'draft-7', legacyHeaders: false, skip: isStreamRequest }));
 
-  // OIDC callbacks arrive as top-level navigations with the session cookie; the
-  // redirect target lives on the same origin, so the SPA fallback below serves it.
+  // OIDC callbacks arrive as top-level navigations carrying the (Lax) session
+  // cookie; the redirect target lives on the same origin, so the SPA fallback
+  // below serves it.
   app.use('/api', attachUser(ctx));
   app.use('/api', csrfProtection);
   const audit = createAudit(ctx);

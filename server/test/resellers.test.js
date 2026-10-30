@@ -285,6 +285,59 @@ describe('Resellers API', () => {
       await app.http.patch('/api/accounts/bob').set('X-CSRF-Token', csrf).send({ contactEmail: 'bob@bob.com' }).expect(200);
     });
 
+    it('gates shells and demo mode on the core modify/create routes like the account functions do', async () => {
+      await app.http.post('/api/packages').set('X-CSRF-Token', csrf).send({ name: 'shellpkg', disk_mb: 1024, bandwidth_mb: 1024, has_shell: true }).expect(201);
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'edit-account', 'upgrade-account'] }).expect(200);
+      const shell = await acct('patch', '/bob', { shell: '/bin/bash' });
+      expect(shell.status).toBe(403);
+      expect(shell.body.error.message).toMatch(/Shell Access/);
+      const demo = await acct('patch', '/bob', { demoMode: true });
+      expect(demo.status).toBe(403);
+      expect(demo.body.error.message).toMatch(/Demo Mode/);
+      // The package's shell needs the same privilege as an explicit one.
+      const viaPackage = await acct('patch', '/bob', { package: 'shellpkg' });
+      expect(viaPackage.status).toBe(403);
+      expect(viaPackage.body.error.message).toMatch(/Shell Access/);
+      // The Modify Account page sends the unchanged values along; those are not grants.
+      expect((await acct('patch', '/bob', { shell: '/usr/sbin/nologin', demoMode: false, contactEmail: 'bob@bob.com' })).status).toBe(200);
+      expect(app.ctx.db.prepare('SELECT shell, demo_mode, package_name FROM accounts WHERE username = ?').get('bob')).toEqual({ shell: '/usr/sbin/nologin', demo_mode: 0, package_name: 'default' });
+      expect(app.agent.callsTo('user.set_shell')).toEqual([]);
+      // Creation withholds the package's shell instead of refusing (WHM's behaviour).
+      const created = await acct('post', '/', { username: 'shelly', domain: 'shelly.com', package: 'shellpkg' });
+      expect(created.status).toBe(201);
+      expect(created.body.data.shell).toBe('/usr/sbin/nologin');
+      expect(app.agent.callsTo('user.create')[0].args.shell).toBe('/usr/sbin/nologin');
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'edit-account', 'upgrade-account', 'add-pkg-shell', 'demo-setup'] }).expect(200);
+      const granted = await acct('patch', '/bob', { package: 'shellpkg', demoMode: true });
+      expect(granted.status).toBe(200);
+      expect(granted.body.data).toMatchObject({ shell: '/bin/bash', demo_mode: true, package_name: 'shellpkg' });
+      expect(app.agent.callsTo('user.set_shell').map((c) => c.args)).toEqual([{ username: 'bob', shell: '/bin/bash' }]);
+      // Disallow Shell Access wins over the grant.
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'edit-account', 'upgrade-account', 'add-pkg-shell', 'disallow-shell'] }).expect(200);
+      const disallowed = await acct('patch', '/shelly', { shell: '/bin/bash' });
+      expect(disallowed.status).toBe(403);
+      expect(disallowed.body.error.message).toMatch(/Disallow Shell Access/);
+      expect((await acct('patch', '/bob', { shell: '/usr/sbin/nologin' })).status).toBe(200);
+      await app.http.delete('/api/accounts/shelly').set('X-CSRF-Token', csrf).expect(200);
+      await app.http.patch('/api/accounts/bob').set('X-CSRF-Token', csrf).send({ package: 'default', shell: '/usr/sbin/nologin', demoMode: false }).expect(200);
+    });
+
+    it('applies the List Accounts privilege to the account list and detail routes', async () => {
+      await put('/resell1/privileges', { acls: ['create-acct', 'viewglobalpackages', 'edit-account', 'passwd'] }).expect(200);
+      for (const path of ['', '/bob', '/bob/domains']) {
+        const res = await resellerHttp.get(`/api/accounts${path}`);
+        expect(res.status, path).toBe(403);
+        expect(res.body.error.message).toMatch(/List Accounts/);
+      }
+      // Mutations keep their own ACLs; reading is not a prerequisite.
+      expect((await acct('patch', '/bob', { contactEmail: 'bob@bob.com' })).status).toBe(200);
+      expect((await acct('post', '/bob/password', { password: 'New-Passw0rd!1' })).status).toBe(200);
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'edit-account'] }).expect(200);
+      expect((await resellerHttp.get('/api/accounts')).body.data.map((a) => a.username)).toContain('bob');
+      expect((await resellerHttp.get('/api/accounts/bob')).status).toBe(200);
+      expect((await resellerHttp.get('/api/accounts/bob/domains')).status).toBe(200);
+    });
+
     it('re-checks limits, package ownership and IP delegation when an account is modified', async () => {
       await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'edit-account', 'upgrade-account', 'quota', 'limit-bandwidth', 'add-pkg-ip'] }).expect(200);
       // bob and dave hold the default package (10240 MB disk, 102400 MB bandwidth each).
@@ -330,7 +383,9 @@ describe('Resellers API', () => {
       const quota = await resellerHttp.put('/api/account-functions/quota/bob').set('X-CSRF-Token', resellerCsrf).send({ diskQuotaMb: 0 });
       expect(quota.status).toBe(409);
       expect(quota.body.error).toMatchObject({ code: 'reseller_limit' });
-      // A reseller-owned package with no quota is "unlimited" too.
+      // A reseller-owned package with no quota is "unlimited" too (creating one is the add-pkg privilege).
+      expect((await resellerHttp.post('/api/packages').set('X-CSRF-Token', resellerCsrf).send({ name: 'freepkg', disk_mb: 0, bandwidth_mb: 0 })).status).toBe(403);
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'edit-account', 'upgrade-account', 'quota', 'limit-bandwidth', 'add-pkg-ip', 'add-pkg'] }).expect(200);
       await resellerHttp.post('/api/packages').set('X-CSRF-Token', resellerCsrf).send({ name: 'freepkg', disk_mb: 0, bandwidth_mb: 0 }).expect(201);
       const viaPackage = await resellerHttp.post('/api/accounts').set('X-CSRF-Token', resellerCsrf).send({ username: 'frank', domain: 'frank.com', package: 'freepkg' });
       expect(viaPackage.status).toBe(409);
@@ -350,6 +405,65 @@ describe('Resellers API', () => {
       app.ctx.db.prepare('DELETE FROM packages WHERE name = ?').run('freepkg');
       await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'edit-account', 'upgrade-account', 'quota', 'limit-bandwidth', 'add-pkg-ip'] }).expect(200);
       await put('/resell1', { maxDiskMb: null, maxBandwidthMb: null }).expect(200);
+    });
+
+    it('confines package writes to the reseller\'s own packages and the package privileges', async () => {
+      const pkg = (method, path, body) => { const req = resellerHttp[method](`/api/packages${path}`).set('X-CSRF-Token', resellerCsrf); return body ? req.send(body) : req; };
+      const row = (name) => app.ctx.db.prepare('SELECT * FROM packages WHERE name = ?').get(name);
+      await app.http.post('/api/packages').set('X-CSRF-Token', csrf).send({ name: 'global1', disk_mb: 100, bandwidth_mb: 100 }).expect(201);
+      const before = row('global1');
+      // With every package privilege a reseller still cannot touch root's or another reseller's packages.
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'add-pkg', 'edit-pkg', 'add-pkg-shell', 'add-pkg-ip'] }).expect(200);
+      expect((await resellerHttp.get('/api/packages/global1')).status).toBe(200);
+      for (const name of ['global1', 'alicepkg']) {
+        const edit = await pkg('put', `/${name}`, { disk_mb: null, bandwidth_mb: null, newName: `${name}x` });
+        expect(edit.status, name).toBe(403);
+        expect(edit.body.error.message).toMatch(/belongs to root or another reseller/);
+        expect((await pkg('delete', `/${name}`)).status, name).toBe(403);
+      }
+      expect(row('global1')).toEqual(before);
+      expect(row('global1x')).toBeUndefined();
+      expect(row('alicepkg')).toBeTruthy();
+      // Own packages: add-pkg creates and deletes, edit-pkg edits; shell and dedicated IP need their privileges.
+      const created = await pkg('post', '', { name: 'rspkg', disk_mb: 100, bandwidth_mb: 100, has_shell: true, has_dedicated_ip: true });
+      expect(created.status).toBe(201);
+      expect(created.body.data).toMatchObject({ owner_id: reseller.id, has_shell: true, has_dedicated_ip: true });
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'edit-pkg'] }).expect(200);
+      const noAdd = await pkg('post', '', { name: 'rspkg2', disk_mb: 100, bandwidth_mb: 100 });
+      expect(noAdd.status).toBe(403);
+      expect(noAdd.body.error.message).toMatch(/Add \/ Remove Packages/);
+      const noDel = await pkg('delete', '/rspkg');
+      expect(noDel.status).toBe(403);
+      expect(noDel.body.error.message).toMatch(/Add \/ Remove Packages/);
+      // The Edit Package form resubmits the current flags; those are not grants.
+      expect((await pkg('put', '/rspkg', { disk_mb: 200, has_shell: true, has_dedicated_ip: true })).status).toBe(200);
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'add-pkg'] }).expect(200);
+      const noEdit = await pkg('put', '/rspkg', { disk_mb: 300 });
+      expect(noEdit.status).toBe(403);
+      expect(noEdit.body.error.message).toMatch(/Edit Packages/);
+      const noShell = await pkg('post', '', { name: 'rspkg2', disk_mb: 100, bandwidth_mb: 100, has_shell: true });
+      expect(noShell.status).toBe(403);
+      expect(noShell.body.error.message).toMatch(/Grant Shell Access/);
+      const noIp = await pkg('post', '', { name: 'rspkg2', disk_mb: 100, bandwidth_mb: 100, has_dedicated_ip: true });
+      expect(noIp.status).toBe(403);
+      expect(noIp.body.error.message).toMatch(/Dedicated IP/);
+      expect(row('rspkg2')).toBeUndefined();
+      expect((await pkg('post', '', { name: 'rspkg2', disk_mb: 100, bandwidth_mb: 100 })).status).toBe(201);
+      // Disallow Shell Access wins over the grant, on update too.
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'add-pkg', 'edit-pkg', 'add-pkg-shell', 'disallow-shell'] }).expect(200);
+      const disallowed = await pkg('put', '/rspkg2', { has_shell: true });
+      expect(disallowed.status).toBe(403);
+      expect(disallowed.body.error.message).toMatch(/Disallow Shell Access/);
+      expect(row('rspkg2').has_shell).toBe(0);
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'add-pkg', 'edit-pkg', 'add-pkg-shell', 'add-pkg-ip'] }).expect(200);
+      const renamed = await pkg('put', '/rspkg2', { has_shell: true, newName: 'rspkg3' });
+      expect(renamed.status).toBe(200);
+      expect(renamed.body.data).toMatchObject({ name: 'rspkg3', owner_id: reseller.id, has_shell: true });
+      expect((await pkg('delete', '/rspkg3')).status).toBe(200);
+      expect((await pkg('delete', '/rspkg')).status).toBe(200);
+      expect(row('rspkg')).toBeUndefined();
+      await app.http.delete('/api/packages/global1').set('X-CSRF-Token', csrf).expect(200);
+      await put('/resell1/privileges', { acls: ['list-accts', 'create-acct', 'viewglobalpackages', 'edit-account', 'upgrade-account', 'quota', 'limit-bandwidth', 'add-pkg-ip'] }).expect(200);
     });
   });
 

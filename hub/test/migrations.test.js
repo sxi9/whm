@@ -33,6 +33,22 @@ test('skipExistingColumns drops only single-line ADD COLUMN statements for exist
   db.close();
 });
 
+test('001f purges the portal password-change bodies an earlier hub stored in audit_log', () => {
+  const db = openDb(':memory:', { migrationsDir: LICENSE_MIGRATIONS });
+  const insert = db.prepare("INSERT INTO audit_log (ts, principal, action, args_redacted, result) VALUES ('2026-10-01T00:00:00.000Z', 'portal:pu_1', ?, ?, 'ok')");
+  insert.run('POST /v1/portal/password', JSON.stringify({ current: 'Old-Pass-123', next: 'New-Pass-456' }));
+  insert.run('POST /password', JSON.stringify({ current: 'Old-Pass-124', next: 'New-Pass-456' }));
+  insert.run('POST /v1/portal/settings', JSON.stringify({ require_totp_for_admins: true }));
+  db.prepare("DELETE FROM schema_migrations WHERE name = '001f_portal-audit-purge.sql'").run();
+  assert.deepEqual(migrate(db, LICENSE_MIGRATIONS), ['001f_portal-audit-purge.sql']);
+  const rows = db.prepare('SELECT action, args_redacted FROM audit_log ORDER BY id').all();
+  assert.equal(rows[0].args_redacted, null);
+  assert.equal(rows[1].args_redacted, null, 'refused attempts recorded under the bare route path are purged too');
+  assert.equal(rows[2].args_redacted, JSON.stringify({ require_totp_for_admins: true }), 'other rows keep their args');
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE args_redacted LIKE '%Old-Pass-%' OR args_redacted LIKE '%New-Pass-%'").get().n, 0);
+  db.close();
+});
+
 test('migrations run against a file database the same way', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-hub-mig-'));
   const db = openDb(path.join(dir, 'license.db'), { migrationsDir: LICENSE_MIGRATIONS });

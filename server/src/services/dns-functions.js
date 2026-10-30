@@ -157,6 +157,17 @@ export function createDnsService(ctx) {
     return account;
   }
 
+  // A name hosted by an account (its main, addon or parked domain, or any label
+  // under one) is only that account's to claim; a reseller cannot take it for
+  // another tenant's name or move it between their own accounts without root.
+  function assertDomainClaimable(domain, account, user) {
+    const hosted = accountForDomain(domain);
+    if (!hosted || isRoot(user)) return hosted;
+    if (hosted.owner_id !== user.id) throw forbidden('That domain belongs to another reseller\'s account');
+    if (account && hosted.id !== account.id) throw forbidden(`${domain} is hosted by account ${hosted.username}; only root can assign it to another account`);
+    return hosted;
+  }
+
   // Pull zones that exist on disk but not in the DB (first run on a host that
   // already had BIND zones). Cheap when nothing changed; throttled.
   async function importFromDisk(force = false) {
@@ -536,12 +547,12 @@ export function createDnsService(ctx) {
       let ip = input.ip || null;
       if (input.account) {
         const account = loadAccount(input.account, user);
+        assertDomainClaimable(input.domain, account, user);
         accountId = account.id;
         ip ||= account.ip;
       } else {
-        const account = accountForDomain(input.domain);
+        const account = assertDomainClaimable(input.domain, null, user);
         if (account) {
-          if (!isRoot(user) && account.owner_id !== user.id) throw forbidden('That domain belongs to another reseller\'s account');
           accountId = account.id;
           ip ||= account.ip;
         } else if (!isRoot(user)) throw forbidden('Resellers can only add zones for domains on their own accounts');
@@ -1057,6 +1068,7 @@ export function createDnsService(ctx) {
       const { domain, createZone = true } = input;
       const account = loadAccount(input.account, user);
       if (stmts.domainHosted.get(domain, domain)) throw conflict(`${domain} is already hosted on this server`);
+      assertDomainClaimable(domain, account, user);
       if (isServerName(domain)) throw conflict(`${domain} is the server hostname; it cannot be parked on an account`);
       if (createZone) assertPublishable();
       if (account.suspended) throw conflict('That account is suspended');

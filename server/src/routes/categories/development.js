@@ -114,8 +114,8 @@ export async function register(ctx) {
   r.get('/openapi/endpoints', requireReseller, read, validate({ query: z.object({ scope: specScope }) }), wrap((req) => s.openapi.endpoints(req.query.scope)));
 
   // Developer Documentation / cPanel Development Forum
-  r.get('/docs', requireReseller, read, wrap(() => s.docs.list()));
-  r.get('/docs/:slug', requireReseller, read, validate({ params: z.object({ slug: docSlug }), query: z.object({ section: docSlug.optional() }) }), wrap((req) => s.docs.get(req.params.slug, req.query.section)));
+  r.get('/docs', requireReseller, read, wrap((req) => s.docs.list(req.user)));
+  r.get('/docs/:slug', requireReseller, read, validate({ params: z.object({ slug: docSlug }), query: z.object({ section: docSlug.optional() }) }), wrap((req) => s.docs.get(req.params.slug, req.query.section, req.user)));
 
   return { path: '/development', router: r };
 }

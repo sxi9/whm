@@ -15,8 +15,18 @@ const LIMITS = [
   ['max_parked', 'Max parked domains'], ['max_addons', 'Max addon domains'], ['quota_inodes', 'Inode quota'],
 ];
 
+// The server accepts only enabled theme slugs (packages.fromInput), so the choices come from
+// GET /themes. A package whose theme was since disabled or deleted keeps it as a selectable
+// option so the form still shows what is stored; accounts fall back to the account default.
+export function themeOptions(themes, current) {
+  const options = (themes || []).filter((t) => t.enabled).map((t) => ({ value: t.slug, label: t.name }));
+  if (current && !options.some((o) => o.value === current)) options.push({ value: current, label: themes ? `${current} (not enabled)` : current });
+  return options;
+}
+
 export function PackageForm({ form, setForm, error, nameEditable = true }) {
   const { data: featureLists } = useApi('/packages/feature-lists');
+  const { data: themes } = useApi('/themes');
   const set = (k) => (v) => setForm((f) => ({ ...f, [k]: v }));
   return (
     <>
@@ -37,7 +47,7 @@ export function PackageForm({ form, setForm, error, nameEditable = true }) {
         <div className="form-grid">
           <Field label="Feature list" error={error?.fields?.feature_list}><Select value={form.feature_list} onChange={set('feature_list')} options={(featureLists || []).map((f) => ({ value: f.name, label: f.name }))} /></Field>
           <Field label="PHP version" error={error?.fields?.php_version}><TextInput value={form.php_version || ''} onChange={(v) => set('php_version')(v || null)} placeholder="ea-php83" /></Field>
-          <Field label={`${BRAND.product} theme`} error={error?.fields?.theme}><Select value={form.theme} onChange={set('theme')} options={['jupiter', 'paper_lantern']} /></Field>
+          <Field label={`${BRAND.product} theme`} error={error?.fields?.theme}><Select value={form.theme} onChange={set('theme')} options={themeOptions(themes, form.theme)} /></Field>
         </div>
         <Field inline><Toggle checked={form.has_shell} onChange={set('has_shell')} label="Shell access" description="Accounts get an interactive shell" /></Field>
         <Field inline><Toggle checked={form.has_dedicated_ip} onChange={set('has_dedicated_ip')} label="Dedicated IP" /></Field>
@@ -48,9 +58,13 @@ export function PackageForm({ form, setForm, error, nameEditable = true }) {
   );
 }
 
-export function formToBody(form, { rename = false, original } = {}) {
+// `current` is the stored package on edit: an unchanged theme is left out of the body because the
+// server re-validates every theme it receives, which would block edits of other fields once the
+// package's theme has been disabled under Themes.
+export function formToBody(form, { rename = false, original, current } = {}) {
   const body = { ...form };
   if (rename) { if (form.name !== original) body.newName = form.name; delete body.name; }
+  if (current && body.theme === current.theme) delete body.theme;
   for (const [k, v] of Object.entries(body)) if (v === '' ) body[k] = null;
   return body;
 }

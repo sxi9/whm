@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
 import {
   appId, unitName, envKey, envValue, argToken, basePath, nodeVersion, scriptName, pipPackage, moduleSpec, gitUrl, gitRef, unitPath,
-  renderUnit, renderEnvFile, renderAppsInclude, modulesFor, supportsUpgradeWebsocket, apacheVersionNumber,
+  renderUnit, renderEnvFile, renderAppsInclude, modulesFor, supportsUpgradeWebsocket, apacheVersionNumber, publishApps,
   detectHints, parsePackageJson, parseRequirements, parseAngularProjects, stepEnv, SCAFFOLDS, assertRuntimeBin, assertExecBin,
 } from '../src/ops/app.js';
 import { apacheLayout } from '../src/ops/web.js';
@@ -427,7 +427,7 @@ describe('renderers', () => {
 
   it('renderAppsInclude: static root, static sub-path, several apps, empty list', () => {
     const root = renderAppsInclude('example.com', [{ id: 5, kind: 'static', basePath: '/', staticDir: '/home/alice/apps/site/dist', websockets: false, spaFallback: true }], { apacheVersion: '2.4.58' });
-    expect(root).toContain('DocumentRoot "/home/alice/apps/site/dist"\n<Directory "/home/alice/apps/site/dist">\n  Options -Indexes +FollowSymLinks\n  AllowOverride None\n  Require all granted\n  FallbackResource "/index.html"\n</Directory>\n');
+    expect(root).toContain('DocumentRoot "/home/alice/apps/site/dist"\n<Directory "/home/alice/apps/site/dist">\n  Options -Indexes +SymLinksIfOwnerMatch\n  AllowOverride None\n  Require all granted\n  FallbackResource "/index.html"\n</Directory>\n');
     expect(root).not.toContain('Alias');
     expect(root).not.toContain('Proxy');
     expect(root).not.toContain('acme-challenge');
@@ -461,6 +461,14 @@ describe('renderers', () => {
     ], { apacheVersion: '2.4.58', docroot: '/home/alice/public_html' });
     expect(mixed).toContain('Alias "/.well-known/acme-challenge" "/home/alice/public_html/.well-known/acme-challenge"');
     expect(mixed).toContain('<Location "/.well-known/acme-challenge">\n  ProxyPass "!"\n</Location>');
+    // A static Directory block is served as the web server user, which can read
+    // every account's 0644 files: links planted in a build output must only be
+    // followed into the account's own files, and .htaccess cannot widen that.
+    for (const rendered of [root, rootDoc, sub, many, mixed]) {
+      expect(rendered).not.toMatch(/FollowSymLinks/);
+      expect(rendered).not.toMatch(/AllowOverride (?!None)/);
+    }
+    expect(sub).toContain('<Directory "/home/alice/apps/docs/build">\n  Options -Indexes +SymLinksIfOwnerMatch\n  AllowOverride None\n');
     expect(renderAppsInclude('example.com', [], { apacheVersion: '2.4.58' })).toBeNull();
     expect(() => renderAppsInclude('example.com', [{ id: 1, kind: 'static', basePath: '/', staticDir: '/home/alice/my site', websockets: false, spaFallback: true }])).toThrow(OpError);
     expect(() => renderAppsInclude('example.com', [{ id: 1, kind: 'static', basePath: '/', staticDir: '/home/alice/x"y', websockets: false, spaFallback: true }])).toThrow(/cannot be rendered/);
@@ -556,6 +564,7 @@ describe('app.runtime.detect', () => {
       expect(r.arch).toBe(process.arch);
       expect(r.runtimesRoot).toBe(runtimes);
       expect(typeof r.git.installed).toBe('boolean');
+      expect(r.selinux).toEqual({ mode: hasBinary('getenforce') ? expect.any(String) : null, enforcing: expect.any(Boolean), semanage: expect.any(Boolean) });
       expect(Array.isArray(r.python)).toBe(true);
       for (const p of r.python) expect(p).toMatchObject({ version: expect.stringMatching(/^\d+\.\d+\.\d+$/), bin: expect.stringMatching(/^\//), source: 'system', venv: expect.any(Boolean) });
       const managed = r.node.filter((n) => n.source === 'managed');
@@ -1026,6 +1035,91 @@ describe('app.proxy.write', () => {
       expect((await opError(runOp('app.proxy.write', { domain: 'example.com', apps: [] }, ctx))).code).toBe('capability_missing');
     }
     expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+// publishApps is the op body behind app.proxy.write with the Apache layout
+// injected, so the publish path runs here against a fake /etc/httpd under the
+// allowed /tmp/whm root and a scripted httpd/systemctl/SELinux toolchain.
+describe('publishApps (app.proxy.write) on an SELinux host', () => {
+  const APACHE_V = 'Server version: Apache/2.4.57 (AlmaLinux)\n';
+  const MODULES = 'Loaded Modules:\n core_module (static)\n proxy_module (shared)\n proxy_http_module (shared)\n proxy_wstunnel_module (shared)\n headers_module (shared)\n rewrite_module (shared)\n alias_module (shared)\n dir_module (shared)\n';
+  function fakeApache() {
+    const root = fs.mkdtempSync(path.join(base, 'httpd-'));
+    return { flavor: 'rhel', root, bin: 'httpd', confD: path.join(root, 'conf.d'), units: ['httpd'], a2tools: false };
+  }
+  function toolchain(binaries, answer) {
+    hasBinary.mockImplementation((n) => binaries.includes(n));
+    exec.mockClear();
+    exec.mockImplementation(async (bin, argv) => ({ code: 0, stdout: '', stderr: '', bin, argv, ...(answer(bin, argv) || {}) }));
+    return () => exec.mock.calls.map(([bin, argv]) => [bin, ...argv]);
+  }
+  const httpd = (bin, argv) => {
+    if (bin === 'httpd' && argv[0] === '-v') return { stdout: APACHE_V };
+    if (bin === 'httpd' && argv[0] === '-M') return { stdout: MODULES };
+    if (bin === 'httpd' && argv[0] === '-t') return { stderr: 'Syntax OK\n' };
+    return null;
+  };
+  const staticApp = (dir) => ({ id: 8, kind: 'static', basePath: '/', staticDir: dir, websockets: false, spaFallback: true });
+  const proxyApp = { id: 7, kind: 'proxy', basePath: '/api', port: 30000, websockets: true, spaFallback: false };
+
+  it('enforcing with the httpd booleans off: the include is validated, the off booleans are switched on persistently before the reload and the result says so', async () => {
+    const apache = fakeApache();
+    const dist = mkOwned(`${home}/apps/site/dist`);
+    const calls = toolchain(['httpd', 'systemctl', 'getenforce', 'getsebool', 'setsebool', 'semanage', 'restorecon', 'stat'], (bin, argv) => {
+      if (bin === 'getenforce') return { stdout: 'Enforcing\n' };
+      if (bin === 'getsebool') return { stdout: 'httpd_enable_homedirs --> off\nhttpd_read_user_content --> off\nhttpd_can_network_connect --> off\nhttpd_can_sendmail --> on\n' };
+      return httpd(bin, argv);
+    });
+    const r = await publishApps({ domain: 'example.com', apps: [proxyApp, staticApp(dist)], reload: true, docroot: `${home}/public_html` }, apache, ctx);
+    expect(r).toMatchObject({ domain: 'example.com', apps: 2, validated: true, reloaded: true, unit: 'httpd', apacheVersion: '2.4.57', modules: { missing: [] } });
+    expect(r.selinux).toMatchObject({ mode: 'enforcing', applied: true, persistent: true, booleans: ['httpd_enable_homedirs', 'httpd_read_user_content', 'httpd_can_network_connect'], rules: [], relabelled: [], warnings: [] });
+    const c = calls();
+    expect(c).toContainEqual(['setsebool', '-P', 'httpd_enable_homedirs=on', 'httpd_read_user_content=on', 'httpd_can_network_connect=on']);
+    expect(c.findIndex(([bin, a]) => bin === 'httpd' && a === '-t')).toBeLessThan(c.findIndex(([bin]) => bin === 'setsebool'));
+    expect(c.findIndex(([bin]) => bin === 'setsebool')).toBeLessThan(c.findIndex(([bin]) => bin === 'systemctl'));
+    expect(c).toContainEqual(['systemctl', 'reload-or-restart', 'httpd.service']);
+    expect(c.some(([bin]) => bin === 'semanage' || bin === 'restorecon' || bin === 'chcon')).toBe(false);
+    const written = fs.readFileSync(path.join(apache.root, 'whm-apps', 'example.com.conf'), 'utf8');
+    expect(written).toContain(`DocumentRoot "${dist}"\n<Directory "${dist}">\n  Options -Indexes +SymLinksIfOwnerMatch\n  AllowOverride None\n`);
+    expect(written).toContain('ProxyPass "http://127.0.0.1:30000" retry=0 timeout=120 upgrade=websocket');
+    expect(written).not.toContain('FollowSymLinks');
+  });
+
+  it('enforcing with every boolean already on: nothing is set; without SELinux tooling the publish runs unchanged and reports it', async () => {
+    const apache = fakeApache();
+    let calls = toolchain(['httpd', 'systemctl', 'getenforce', 'getsebool', 'setsebool'], (bin, argv) => {
+      if (bin === 'getenforce') return { stdout: 'Enforcing\n' };
+      if (bin === 'getsebool') return { stdout: 'httpd_enable_homedirs --> on\nhttpd_read_user_content --> on\nhttpd_can_network_connect --> on\nhttpd_can_sendmail --> on\n' };
+      return httpd(bin, argv);
+    });
+    let r = await publishApps({ domain: 'example.com', apps: [proxyApp], reload: false }, apache, ctx);
+    expect(r.selinux).toMatchObject({ mode: 'enforcing', applied: true, booleans: [], warnings: [] });
+    expect(calls().some(([bin]) => bin === 'setsebool')).toBe(false);
+
+    calls = toolchain(['httpd', 'systemctl'], httpd);
+    r = await publishApps({ domain: 'example.com', apps: [proxyApp], reload: false }, apache, ctx);
+    expect(r).toMatchObject({ apps: 1, validated: true, reloaded: false, selinux: { mode: null, applied: false } });
+    expect(calls().map(([bin]) => bin)).toEqual(['httpd', 'httpd', 'httpd']);
+
+    calls = toolchain(['httpd', 'systemctl', 'getenforce', 'getsebool', 'setsebool'], (bin, argv) => (bin === 'getenforce' ? { stdout: 'Enforcing\n' } : httpd(bin, argv)));
+    r = await publishApps({ domain: 'example.com', apps: [], reload: false }, apache, ctx);
+    expect(r).toMatchObject({ apps: 0, removed: true });
+    expect(calls().some(([bin]) => bin === 'getenforce' || bin === 'getsebool')).toBe(false);
+    expect(fs.existsSync(path.join(apache.root, 'whm-apps', 'example.com.conf'))).toBe(false);
+  });
+
+  it('a rejected include is rolled back before any SELinux change', async () => {
+    const apache = fakeApache();
+    const calls = toolchain(['httpd', 'systemctl', 'getenforce', 'getsebool', 'setsebool'], (bin, argv) => {
+      if (bin === 'httpd' && argv[0] === '-t') return { code: 1, stderr: 'AH00526: Syntax error\n' };
+      if (bin === 'getenforce') return { stdout: 'Enforcing\n' };
+      return httpd(bin, argv);
+    });
+    const err = await opError(publishApps({ domain: 'example.com', apps: [proxyApp], reload: true }, apache, ctx));
+    expect(err.code).toBe('config_invalid');
+    expect(fs.existsSync(path.join(apache.root, 'whm-apps', 'example.com.conf'))).toBe(false);
+    expect(calls().some(([bin]) => bin === 'getenforce' || bin === 'setsebool' || bin === 'systemctl')).toBe(false);
   });
 });
 

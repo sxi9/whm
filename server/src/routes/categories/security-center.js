@@ -71,7 +71,7 @@ const modsecDirectives = z.object({
   SecRequestBodyNoFilesLimit: z.number().int().min(1024).nullable().optional(),
   SecRequestBodyLimitAction: z.enum(['Reject', 'ProcessPartial']).nullable().optional(),
   SecResponseBodyLimit: z.number().int().min(1024).nullable().optional(),
-  SecAuditLogRelevantStatus: z.string().regex(/^[\^$()|\[\]\d\-.?+*]{1,64}$/).nullable().optional(),
+  SecAuditLogRelevantStatus: z.string().regex(/^[\^$()|\[\]\d\-.?+*:!]{1,64}$/).nullable().optional(),
   SecAuditLogParts: z.string().regex(/^[A-KZ]{1,12}$/).nullable().optional(),
   SecPcreMatchLimit: z.number().int().min(1000).nullable().optional(),
   SecPcreMatchLimitRecursion: z.number().int().min(1000).nullable().optional(),

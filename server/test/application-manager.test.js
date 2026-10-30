@@ -9,6 +9,7 @@ const SYSTEM_NODE = { version: '22.4.0', bin: '/usr/bin/node', source: 'system',
 const SYSTEM_PY = { version: '3.12.3', bin: '/usr/bin/python3', source: 'system', venv: true };
 const SECRET = 'postgres://api:SecretPw1@db.internal/api';
 let managedNode = [];
+let systemPython = [SYSTEM_PY];
 const stepFailures = new Set();
 const prepareFailures = new Set();
 const emptyRoots = new Set();
@@ -42,7 +43,7 @@ async function provision(installed, extra = {}) {
 
 beforeAll(async () => {
   const agent = createMockAgent({
-    'app.runtime.detect': () => ({ node: [SYSTEM_NODE, ...managedNode], python: [SYSTEM_PY], git: { installed: true, version: '2.43.0' }, arch: 'x64' }),
+    'app.runtime.detect': () => ({ node: [SYSTEM_NODE, ...managedNode], python: systemPython, git: { installed: true, version: '2.43.0' }, arch: 'x64' }),
     'app.runtime.node.install': ({ version }) => { const e = { version, bin: `/opt/whm/runtimes/node/${version}/bin/node`, path: `/opt/whm/runtimes/node/${version}`, source: 'managed', npm: `/opt/whm/runtimes/node/${version}/bin/npm` }; managedNode.push(e); return e; },
     'app.runtime.node.remove': ({ version }) => { managedNode = managedNode.filter((m) => m.version !== version); return { version, removed: true }; },
     'app.inspect': ({ root }) => ({ root, exists: true, empty: emptyRoots.has(root), files: ['package.json', 'server.js', 'package-lock.json'], packageJson: { name: 'demo', scripts: { start: 'next start', build: 'next build' }, dependencies: ['next', 'react', 'react-dom'] }, requirements: null, angularProjects: [], hints: { preset: null, outputDir: null, startEntry: 'server.js', lockfile: 'package-lock.json' } }),
@@ -165,12 +166,14 @@ describe('Application Manager API', () => {
   let bobAppId;
 
   it('refuses to create an application while Apache is missing (501 with the capability)', async () => {
+    systemPython = [];
     const res = await post('/api/apps', { username: 'alice', name: 'API', preset: 'express', domain: 'example.com', root: '/home/alice/apps/api' });
     expect(res.status).toBe(501);
     expect(res.body.error).toMatchObject({ code: 'capability_missing', capability: 'apache' });
     const runtimes = await get('/api/apps/runtimes');
     expect(runtimes.status).toBe(200);
     expect(runtimes.body.data.capabilities).toMatchObject({ apache: false, node: false, python: false });
+    systemPython = [SYSTEM_PY];
   });
 
   it('names the missing runtime when only Node.js is absent', async () => {
@@ -349,13 +352,50 @@ describe('Application Manager API', () => {
     const done = await waitForJob(app.ctx, res.body.data.job.id);
     expect(done.status, done.error).toBe('done');
     const calls = opsSince(before);
-    expect(names(calls)).toEqual(['app.prepare', 'app.runtime.detect', 'app.step', 'app.step', 'app.unit.write', 'app.proxy.write', 'svc.start']);
-    expect(calls[0].args).toEqual({ username: 'alice', root: '/home/alice/apps/flask', scaffold: { template: 'flask', name: 'Flask API' } });
-    expect(calls[2].args).toEqual({ username: 'alice', root: '/home/alice/apps/flask', step: 'venv-create', runtime: { kind: 'python', bin: '/usr/bin/python3' } });
-    expect(calls[3].args).toEqual({ username: 'alice', root: '/home/alice/apps/flask', step: 'pip-install', runtime: { kind: 'python', bin: '/usr/bin/python3' }, packages: ['psycopg2-binary==2.9.9', 'gunicorn'] });
-    expect(calls[4].args).toMatchObject({ exec: { bin: '/home/alice/apps/flask/.venv/bin/gunicorn', args: ['app:app', '--bind', `127.0.0.1:${flaskPort}`, '--workers', '2'] }, pathDirs: ['/home/alice/apps/flask/.venv/bin'], env: {} });
-    expect(calls[5].args.apps).toEqual([{ id: apiId, kind: 'proxy', basePath: '/api', port: apiPort, websockets: true, spaFallback: false }, { id: flaskId, kind: 'proxy', basePath: '/py', port: flaskPort, websockets: true, spaFallback: false }]);
+    // The create request checks for a venv-capable interpreter before the row exists; the job resolves it again.
+    expect(names(calls)).toEqual(['app.runtime.detect', 'app.prepare', 'app.runtime.detect', 'app.step', 'app.step', 'app.unit.write', 'app.proxy.write', 'svc.start']);
+    expect(calls[1].args).toEqual({ username: 'alice', root: '/home/alice/apps/flask', scaffold: { template: 'flask', name: 'Flask API' } });
+    expect(calls[3].args).toEqual({ username: 'alice', root: '/home/alice/apps/flask', step: 'venv-create', runtime: { kind: 'python', bin: '/usr/bin/python3' } });
+    expect(calls[4].args).toEqual({ username: 'alice', root: '/home/alice/apps/flask', step: 'pip-install', runtime: { kind: 'python', bin: '/usr/bin/python3' }, packages: ['psycopg2-binary==2.9.9', 'gunicorn'] });
+    expect(calls[5].args).toMatchObject({ exec: { bin: '/home/alice/apps/flask/.venv/bin/gunicorn', args: ['app:app', '--bind', `127.0.0.1:${flaskPort}`, '--workers', '2'] }, pathDirs: ['/home/alice/apps/flask/.venv/bin'], env: {} });
+    expect(calls[6].args.apps).toEqual([{ id: apiId, kind: 'proxy', basePath: '/api', port: apiPort, websockets: true, spaFallback: false }, { id: flaskId, kind: 'proxy', basePath: '/py', port: flaskPort, websockets: true, spaFallback: false }]);
     expect(row(flaskId)).toMatchObject({ status: 'running', unit: `whm-app-${flaskId}`, runtime_bin: '/usr/bin/python3' });
+  });
+
+  it('refuses a Python application at creation while python3-venv is missing (501 with the capability, nothing allocated)', async () => {
+    // Fresh Debian/Ubuntu: python3 on PATH, but `import venv, ensurepip` fails until python3-venv is installed.
+    systemPython = [{ ...SYSTEM_PY, venv: false }];
+    const apps = app.ctx.db.prepare('SELECT COUNT(*) AS n FROM apps').get().n;
+    const before = app.agent.calls.length;
+    const res = await post('/api/apps', { username: 'alice', name: 'No venv', domain: 'example.com', basePath: '/novenv', root: '/home/alice/apps/novenv', source: { type: 'scaffold', template: 'fastapi' } });
+    expect(res.status).toBe(501);
+    expect(res.body.error).toMatchObject({ code: 'capability_missing', capability: 'python', message: expect.stringMatching(/python3-venv/) });
+    expect(names(opsSince(before))).toEqual(['app.runtime.detect']);
+    expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM apps').get().n).toBe(apps);
+    // Switching an existing app to a version without venv support is refused the same way.
+    const upd = await put(`/api/apps/${flaskId}`, { runtimeVersion: '3.12' });
+    expect(upd.status).toBe(501);
+    expect(upd.body.error).toMatchObject({ capability: 'python', message: expect.stringMatching(/3\.12 with venv support/) });
+    expect(row(flaskId).runtime_version).toBe('system');
+    // Runtime Versions reports Python as missing although python3 is on PATH.
+    expect((await get('/api/apps/runtimes')).body.data.capabilities).toMatchObject({ python: false, node: true });
+    // A requested version that no interpreter provides names what was found.
+    systemPython = [SYSTEM_PY];
+    const other = await put(`/api/apps/${flaskId}`, { runtimeVersion: '3.11' });
+    expect(other.status).toBe(501);
+    expect(other.body.error.message).toMatch(/Python 3\.11 is not installed on this server \(found 3\.12\.3\)/);
+    // No interpreter at all.
+    systemPython = [];
+    const none = await post('/api/apps', { username: 'alice', name: 'No python', domain: 'example.com', basePath: '/nopy', root: '/home/alice/apps/nopy', source: { type: 'scaffold', template: 'flask' } });
+    expect(none.status).toBe(501);
+    expect(none.body.error).toMatchObject({ capability: 'python', message: expect.stringMatching(/Python 3 is not installed/) });
+    expect((await get('/api/apps/runtimes')).body.data.capabilities.python).toBe(false);
+    // A Node.js app does not probe the interpreters.
+    const nodeBefore = app.agent.calls.length;
+    expect((await post('/api/apps', { username: 'alice', name: 'Bad domain', preset: 'express', domain: 'bob.example.org', root: '/home/alice/apps/x' })).status).toBe(422);
+    expect(names(opsSince(nodeBefore))).toEqual([]);
+    systemPython = [SYSTEM_PY];
+    expect((await get('/api/apps/runtimes')).body.data.capabilities.python).toBe(true);
   });
 
   it('runs uvicorn for FastAPI with the port on the command line', () => {

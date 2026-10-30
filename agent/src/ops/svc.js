@@ -57,6 +57,13 @@ function parseShow(stdout) {
   return kv;
 }
 
+// The UnitFileState values that start at boot: the set `systemctl is-enabled`
+// exits 0 for. 'generated' is a SysV init script (Debian pure-ftpd, proftpd),
+// 'indirect' is pulled in via Also= of another unit, 'alias' is a symlink to an
+// enabled unit; none of them are ever reported as plain 'enabled'.
+export const ENABLED_UNIT_FILE_STATES = new Set(['enabled', 'enabled-runtime', 'static', 'indirect', 'generated', 'alias']);
+export const unitStartsAtBoot = (unitFileState) => ENABLED_UNIT_FILE_STATES.has(unitFileState);
+
 defineOp('svc.status', {
   description: 'Service state, enablement, PID, memory and uptime',
   schema: z.object({ unit: arg.unit }).strict(),
@@ -72,7 +79,7 @@ defineOp('svc.status', {
       active: kv.ActiveState === 'active',
       state: kv.ActiveState || 'unknown',
       subState: kv.SubState || null,
-      enabled: kv.UnitFileState === 'enabled' || kv.UnitFileState === 'static',
+      enabled: unitStartsAtBoot(kv.UnitFileState),
       unitFileState: kv.UnitFileState || null,
       pid: Number(kv.MainPID) || null,
       startedAt: kv.ExecMainStartTimestamp || null,

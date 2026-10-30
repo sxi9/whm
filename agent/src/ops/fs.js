@@ -4,6 +4,36 @@ import crypto from 'node:crypto';
 import { z } from 'zod';
 import { exec } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
+import { assertRealPath } from './acct.js';
+
+// The allowed-root check is lexical. Every op below that creates, chmods,
+// chowns or rsyncs inside an account home therefore also requires the path
+// to be its own real path: a link a tenant planted (public_html -> /etc,
+// addon docroot -> /var/lib/whm) would otherwise be followed by root.
+// Components above an allowed root are the administrator's layout and are
+// not checked; a root that is itself a link is accepted by assertRealPath
+// when root owns it.
+const insideRoot = (p, ctx) => ctx.allowedRoots.some((root) => p === root || p.startsWith(root.endsWith('/') ? root : `${root}/`));
+
+// For a path that may not exist yet (mkdir -p, an rsync destination): the
+// deepest existing prefix must not go through a link below an allowed root.
+function assertExistingPathReal(resolved, ctx, mode) {
+  let existing = resolved;
+  let st;
+  for (;;) {
+    try { st = fs.lstatSync(existing); break; } catch (err) {
+      if (err.code !== 'ENOENT' && err.code !== 'ENOTDIR') throw err;
+    }
+    const parent = path.dirname(existing);
+    if (parent === existing) return null;
+    existing = parent;
+  }
+  if (!insideRoot(existing, ctx)) return null;
+  if (st.isSymbolicLink()) {
+    try { fs.realpathSync(existing); } catch { throw new OpError('refused', `${existing} is a dangling symbolic link; refusing to create through it`); }
+  }
+  return assertRealPath(existing, ctx, mode);
+}
 
 function ownership(owner, group) {
   const passwd = fs.readFileSync('/etc/passwd', 'utf8').split('\n');
@@ -36,10 +66,19 @@ defineOp('fs.mkdir', {
   description: 'Create a directory (recursively) with owner and mode',
   schema: z.object({ path: arg.absPath }).merge(ownerSchema).strict(),
   run: async ({ path: p, owner, group, mode }, ctx) => {
-    ctx.assertAllowedPath(p, 'write');
-    fs.mkdirSync(p, { recursive: true, mode: mode ? parseInt(mode, 8) : 0o755 });
-    if (mode) fs.chmodSync(p, parseInt(mode, 8));
-    if (owner) { const { uid, gid } = ownership(owner, group); fs.chownSync(p, uid, gid); }
+    const target = ctx.assertAllowedPath(p, 'write');
+    const ids = owner ? ownership(owner, group) : null;
+    assertExistingPathReal(target, ctx, 'write');
+    fs.mkdirSync(target, { recursive: true, mode: mode ? parseInt(mode, 8) : 0o755 });
+    if (mode || ids) {
+      // The mode and owner are applied through a descriptor that refuses to
+      // open a link, so a swap between the check and here changes nothing else.
+      const fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      try {
+        if (mode) fs.fchmodSync(fd, parseInt(mode, 8));
+        if (ids) fs.fchownSync(fd, ids.uid, ids.gid);
+      } finally { fs.closeSync(fd); }
+    }
     return { path: p };
   },
 });
@@ -93,9 +132,12 @@ defineOp('fs.chown', {
   description: 'Change owner/group (optionally recursive)',
   schema: z.object({ path: arg.absPath, owner: arg.username.or(z.literal('root')), group: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/).optional(), recursive: z.boolean().default(false) }).strict(),
   run: async ({ path: p, owner, group, recursive }, ctx) => {
-    ctx.assertAllowedPath(p, 'write');
-    const argv = recursive ? ['-R'] : [];
-    argv.push(group ? `${owner}:${group}` : owner, p);
+    const target = ctx.assertAllowedPath(p, 'write');
+    assertRealPath(target, ctx, 'write');
+    // -h: a link that appears after the check gets its own owner changed,
+    // never the file it points to.
+    const argv = recursive ? ['-h', '-R'] : ['-h'];
+    argv.push(group ? `${owner}:${group}` : owner, target);
     await exec('chown', argv, { timeoutMs: 600_000 });
     return { path: p, owner, group };
   },
@@ -105,8 +147,10 @@ defineOp('fs.chmod', {
   description: 'Change permissions (optionally recursive)',
   schema: z.object({ path: arg.absPath, mode: arg.mode, recursive: z.boolean().default(false) }).strict(),
   run: async ({ path: p, mode, recursive }, ctx) => {
-    ctx.assertAllowedPath(p, 'write');
-    const argv = recursive ? ['-R', mode, p] : [mode, p];
+    const target = ctx.assertAllowedPath(p, 'write');
+    // chmod follows a link named on the command line and has no -h on Linux.
+    assertRealPath(target, ctx, 'write');
+    const argv = recursive ? ['-R', mode, target] : [mode, target];
     await exec('chmod', argv, { timeoutMs: 600_000 });
     return { path: p, mode };
   },
@@ -142,13 +186,17 @@ defineOp('fs.copy_tree', {
   timeoutMs: 3_600_000,
   schema: z.object({ from: arg.absPath, to: arg.absPath, deleteExtraneous: z.boolean().default(false) }).strict(),
   run: async ({ from, to, deleteExtraneous }, ctx) => {
-    ctx.assertAllowedPath(from, 'read');
-    ctx.assertAllowedPath(to, 'write');
+    const src = ctx.assertAllowedPath(from, 'read');
+    const dst = ctx.assertAllowedPath(to, 'write');
+    // rsync resolves a trailing-slash source or destination through a link.
+    const realSrc = assertRealPath(src, ctx, 'read');
+    if (!fs.lstatSync(realSrc).isDirectory()) throw new OpError('refused', `${from} is not a directory`);
+    assertExistingPathReal(dst, ctx, 'write');
     // -a implies -D; a tree the account controls is never allowed to turn
     // into device nodes or sockets created by root at the destination.
     const argv = ['-a', '--no-devices', '--no-specials', '--numeric-ids'];
     if (deleteExtraneous) argv.push('--delete');
-    argv.push(`${from.replace(/\/+$/, '')}/`, `${to.replace(/\/+$/, '')}/`);
+    argv.push(`${src}/`, `${dst}/`);
     await exec('rsync', argv, { timeoutMs: 3_600_000 });
     return { from, to };
   },

@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { validate, z, fields } from '../lib/validate.js';
 import { requireAuth } from '../middleware/auth.js';
 import { issueCsrfToken } from '../middleware/csrf.js';
-import { badRequest, notFound, unauthorized, conflict, HttpError } from '../lib/errors.js';
+import { badRequest, notFound, unauthorized, forbidden, conflict, HttpError } from '../lib/errors.js';
 import { constantTimeEqual } from '../lib/crypto.js';
 
 const providerName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/);
@@ -34,6 +34,11 @@ export function authRoutes(ctx) {
   }
 
   r.get('/csrf', (req, res) => res.json({ data: { csrfToken: issueCsrfToken(req, crypto) } }));
+
+  // Credentials change from an interactive session only: an API token,
+  // whatever its scopes, must not be able to reset the password it was issued
+  // under or to turn its owner's second factor off or over to another device.
+  const sessionOnly = (req, _res, next) => (req.auth?.via === 'session' ? next() : next(forbidden('This cannot be changed from an API token; sign in to the panel to change it')));
 
   r.post('/login', validate({ body: z.object({ username: fields.username, password: z.string().min(1).max(256) }).strict() }), async (req, res, next) => {
     try {
@@ -84,7 +89,7 @@ export function authRoutes(ctx) {
     } });
   });
 
-  r.post('/password', requireAuth, validate({ body: z.object({ currentPassword: z.string().max(256).optional(), newPassword: fields.password }).strict() }), async (req, res, next) => {
+  r.post('/password', requireAuth, sessionOnly, validate({ body: z.object({ currentPassword: z.string().max(256).optional(), newPassword: fields.password }).strict() }), async (req, res, next) => {
     try {
       await auth.changePassword(req.user.id, { ...req.body, force: Boolean(req.user.must_change_password) });
       req.audit({ action: 'auth.password.change', target: req.user.username });
@@ -93,8 +98,8 @@ export function authRoutes(ctx) {
     } catch (err) { next(err); }
   });
 
-  r.post('/2fa/enroll', requireAuth, (req, res) => res.json({ data: auth.begin2faEnrollment(req.user.id) }));
-  r.post('/2fa/confirm', requireAuth, validate({ body: z.object({ code: z.string().regex(/^\d{6}$/) }).strict() }), (req, res, next) => {
+  r.post('/2fa/enroll', requireAuth, sessionOnly, (req, res) => res.json({ data: auth.begin2faEnrollment(req.user.id) }));
+  r.post('/2fa/confirm', requireAuth, sessionOnly, validate({ body: z.object({ code: z.string().regex(/^\d{6}$/) }).strict() }), (req, res, next) => {
     try {
       auth.confirm2faEnrollment(req.user.id, req.body.code);
       if (req.session) req.session.mustEnroll2fa = false;
@@ -102,7 +107,7 @@ export function authRoutes(ctx) {
       res.json({ data: { enabled: true } });
     } catch (err) { next(err); }
   });
-  r.post('/2fa/disable', requireAuth, validate({ body: z.object({ code: z.string().regex(/^\d{6}$/, 'Enter the 6-digit code').optional(), password: z.string().min(1).max(128).optional() }).strict() }), async (req, res, next) => {
+  r.post('/2fa/disable', requireAuth, sessionOnly, validate({ body: z.object({ code: z.string().regex(/^\d{6}$/, 'Enter the 6-digit code').optional(), password: z.string().min(1).max(128).optional() }).strict() }), async (req, res, next) => {
     try { await auth.disable2fa(req.user.id, req.body); req.audit({ action: 'auth.2fa.disable', target: req.user.username, args: { via: req.body.code ? 'code' : 'password' } }); res.json({ data: { enabled: false } }); } catch (err) { next(err); }
   });
 
@@ -124,6 +129,11 @@ export function authRoutes(ctx) {
       if (!ea) throw notFound('External authentication');
       const link = Boolean(req.query.link);
       if (link && !req.user) throw unauthorized('Log in before linking an external identity');
+      // Linking is a credential change for the principal: only an interactive
+      // session may do it. This router is mounted before requireAuth, so a
+      // Bearer token (a confined cluster token included) reaches here with
+      // req.user set and must not be able to attach an identity to its owner.
+      if (link && req.auth?.via !== 'session') throw forbidden('An external identity cannot be linked from an API token; sign in to the panel to link it');
       const state = crypto.randomToken(24);
       const nonce = crypto.randomToken(24);
       req.session.oidc = { name: req.params.name, state, nonce, link, userId: req.user?.id ?? null, at: Date.now() };
@@ -146,7 +156,7 @@ export function authRoutes(ctx) {
       const identity = await ea.exchangeCode(req.params.name, { code: req.query.code, redirectUri: redirectUri(req, req.params.name), nonce: pending.nonce });
 
       if (pending.link) {
-        if (!req.user || req.user.id !== pending.userId) return backToLogin(res, { error: 'external_state' });
+        if (!req.user || req.auth?.via !== 'session' || req.user.id !== pending.userId) return backToLogin(res, { error: 'external_state' });
         const existing = ea.findLinkedUser(req.params.name, identity.subject);
         const existingUserId = existing ? (existing.user_id ?? existing.userId) : null;
         if (existing && existingUserId !== req.user.id) throw conflict('That external identity is already linked to another panel user');

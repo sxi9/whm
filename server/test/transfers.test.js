@@ -311,9 +311,11 @@ describe('Transfers API', () => {
       expect(types['bobshop.bob.com']).toBeUndefined();
 
       const rsync = app.agent.callsTo('transfer.remote.rsync');
-      expect(rsync[0].args).toMatchObject({ remotePath: '/home/bob', localPath: account.home_dir, directory: true, excludes: expect.arrayContaining(['tmp/']) });
+      // The home tree is received as the account (never root-owned, even mid-copy); staged dumps stay root's.
+      expect(rsync[0].args).toMatchObject({ remotePath: '/home/bob', localPath: account.home_dir, directory: true, excludes: expect.arrayContaining(['tmp/']), owner: 'robert' });
       expect(rsync[0].args.connection.privateKey).toBe(KEY);
       expect(rsync[1].args).toMatchObject({ remotePath: '/tmp/whm-transfer-bob_shop-abcd.sql', directory: false });
+      expect(rsync[1].args.owner).toBeUndefined();
       expect(app.agent.callsTo('transfer.remote.remove_file')[0].args.path).toBe('/tmp/whm-transfer-bob_shop-abcd.sql');
       // Copies and dumps may run for hours: the split-mode socket client must not give up after its 1 h default.
       expect(optionsOf('transfer.remote.rsync').map((o) => o.timeoutMs)).toEqual([86_460_000, 86_460_000]);
@@ -494,6 +496,12 @@ describe('Transfers API', () => {
       const appends = app.agent.callsTo('transfer.upload.append');
       expect(appends[0].args).toMatchObject({ truncate: true, path: '/var/lib/whm/transfers/uploads/cpmove-new.tar.gz' });
       expect(appends[1].args.truncate).toBe(false);
+      // The route-level audit row records the chunk size, never the base64 payload.
+      const chunkRows = app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'PUT /api/transfers/uploads/:id/chunks' ORDER BY id").all();
+      expect(chunkRows.length).toBeGreaterThanOrEqual(3);
+      for (const row of chunkRows) expect(JSON.parse(row.args_redacted)).toEqual({ bytes: expect.any(Number) });
+      expect(JSON.parse(chunkRows.at(-1).args_redacted)).toEqual({ bytes: 5 });
+      expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM audit_log WHERE args_redacted LIKE ?').get(`%${chunk}%`).n).toBe(0);
       const fin = await post(`/uploads/${id}/finish`).expect(200);
       expect(fin.body.data.archive.username).toBe('dave');
       expect((await post(`/uploads/${id}/finish`)).status).toBe(404);
@@ -803,6 +811,73 @@ describe('Transfers API', () => {
       expect((await get(`/jobs/${other.id}`).expect(200)).body.data.type).toBe('transfer.cleanup');
       const foreign = app.ctx.db.prepare("INSERT INTO jobs (type, params_json) VALUES ('multi_account.modify', '{}')").run();
       expect((await get(`/jobs/${foreign.lastInsertRowid}`)).status).toBe(404);
+    });
+
+    it('finalises the run of a job interrupted by a panel restart once the panel is up', async () => {
+      const fresh = await createTestApp({ agent: hostAgent() });
+      try {
+        const { db } = fresh.ctx;
+        const rootId = db.prepare("SELECT id FROM users WHERE username = 'root'").get().id;
+        const job = Number(db.prepare("INSERT INTO jobs (type, params_json, created_by, status, started_at) VALUES ('transfer.remote', '{}', ?, 'running', datetime('now'))").run(rootId).lastInsertRowid);
+        const runId = Number(db.prepare("INSERT INTO transfer_runs (kind, job_id, created_by, requested_by, status, source, params_json) VALUES ('transfer', ?, ?, 'root', 'running', 'root@old.example.com', '{}')").run(job, rootId).lastInsertRowid);
+        db.prepare('UPDATE jobs SET params_json = ? WHERE id = ?').run(JSON.stringify({ runId, userId: rootId }), job);
+        const item = db.prepare("INSERT INTO transfer_run_items (run_id, source_username, username, domain, status, steps_json) VALUES (?, ?, ?, ?, ?, '{}')");
+        item.run(runId, 'a1', 'a1', 'a1.com', 'done');
+        item.run(runId, 'a2', 'a2', 'a2.com', 'running');
+        item.run(runId, 'a3', 'a3', 'a3.com', 'queued');
+        const live = Number(db.prepare("INSERT INTO transfer_runs (kind, created_by, requested_by, status, source, params_json) VALUES ('restore', ?, 'root', 'queued', '/backup/x.tar.gz', '{}')").run(rootId).lastInsertRowid);
+        db.prepare('UPDATE transfer_runs SET job_id = ? WHERE id = ?').run(Number(db.prepare("INSERT INTO jobs (type, params_json, created_by) VALUES ('restore.cpmove', '{}', ?)").run(rootId).lastInsertRowid), live);
+        // The live run's job is still queued at boot and gets claimed by the worker; it must not be swept.
+        fresh.ctx.jobs.register('restore.cpmove', () => new Promise(() => {}));
+        expect(fresh.ctx.transfers.reconcileRuns()).toEqual([]);
+
+        fresh.ctx.jobs.start();
+        expect(fresh.ctx.jobs.get(job)).toMatchObject({ status: 'failed', error_code: 'PANEL_RESTARTED' });
+        await fresh.ctx.events.emit('panel.started', {});
+        await fresh.login();
+        const shown = (await fresh.http.get(`/api/transfers/runs/${runId}`).expect(200)).body.data;
+        expect(shown.status).toBe('failed');
+        expect(shown.finished_at).toBeTruthy();
+        expect(shown.totals).toMatchObject({ total: 3, done: 1, failed: 1, skipped: 1, error: expect.stringMatching(/restarted/) });
+        expect(shown.items.map((i) => [i.status, i.detail])).toEqual([['done', null], ['failed', expect.stringMatching(/restarted/)], ['skipped', expect.stringMatching(/restarted/)]]);
+        expect(shown.items.filter((i) => i.finished_at)).toHaveLength(2);
+        expect(db.prepare('SELECT r.status, j.status AS job FROM transfer_runs r JOIN jobs j ON j.id = r.job_id WHERE r.id = ?').get(live)).toEqual({ status: 'queued', job: 'running' });
+        expect(fresh.ctx.transfers.reconcileRuns()).toEqual([]);
+      } finally {
+        await fresh.close();
+      }
+    });
+
+    it('finalises a run whose job fails before reaching it, or is cancelled while queued', async () => {
+      const { db } = app.ctx;
+      const rootId = db.prepare("SELECT id FROM users WHERE username = 'root'").get().id;
+      const makeRun = () => {
+        const id = Number(db.prepare("INSERT INTO transfer_runs (kind, created_by, requested_by, status, source, params_json) VALUES ('transfer', ?, 'root', 'queued', 'root@gone.example.com', ?)").run(rootId, JSON.stringify({ options: {}, accounts: [], remoteIps: [] })).lastInsertRowid);
+        db.prepare("INSERT INTO transfer_run_items (run_id, source_username, username, domain, status, steps_json) VALUES (?, 'zed', 'zed', 'zed.com', 'queued', '{}')").run(id);
+        return id;
+      };
+      // No session row: the connection expired before the worker picked the job up, so the handler throws before any item starts.
+      const expired = makeRun();
+      const job = app.ctx.jobs.enqueue('transfer.remote', { runId: expired, userId: rootId }, { userId: rootId });
+      db.prepare('UPDATE transfer_runs SET job_id = ? WHERE id = ?').run(job.id, expired);
+      expect((await waitForJob(app.ctx, job.id)).status).toBe('failed');
+      const shown = (await get(`/runs/${expired}`).expect(200)).body.data;
+      expect(shown.status).toBe('failed');
+      expect(shown.totals).toMatchObject({ total: 1, skipped: 1, error: expect.stringMatching(/session expired/) });
+      expect(shown.items[0]).toMatchObject({ status: 'skipped', detail: expect.stringMatching(/session expired/) });
+
+      app.ctx.jobs.stop();
+      const cancelled = makeRun();
+      const queued = app.ctx.jobs.enqueue('transfer.remote', { runId: cancelled, userId: rootId }, { userId: rootId });
+      db.prepare('UPDATE transfer_runs SET job_id = ? WHERE id = ?').run(queued.id, cancelled);
+      app.ctx.jobs.cancel(queued.id);
+      app.ctx.jobs.start();
+      expect(db.prepare('SELECT status, finished_at FROM transfer_runs WHERE id = ?').get(cancelled)).toMatchObject({ status: 'failed', finished_at: expect.any(String) });
+      expect(db.prepare('SELECT status, detail FROM transfer_run_items WHERE run_id = ?').get(cancelled)).toMatchObject({ status: 'skipped', detail: expect.stringMatching(/cancelled/) });
+      // A run that already finished is never rewritten by a late job event.
+      const done = db.prepare("SELECT id, job_id FROM transfer_runs WHERE status = 'done' AND job_id IS NOT NULL ORDER BY id DESC LIMIT 1").get();
+      expect(app.ctx.transfers.reconcileRuns()).toEqual([]);
+      expect(db.prepare('SELECT status FROM transfer_runs WHERE id = ?').get(done.id).status).toBe('done');
     });
 
     it('prunes old runs and expired sessions on the schedule', async () => {

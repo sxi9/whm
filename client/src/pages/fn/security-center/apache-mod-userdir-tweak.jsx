@@ -29,7 +29,7 @@ export default function ApacheModUserdirTweak({ fn }) {
       <PageHeader fn={fn} description="mod_userdir serves http://host/~user/ from each account's public_html. Because those URLs share the server's main domain they bypass per-domain bandwidth accounting and SSL, so WHM disables them by default." />
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
-      {data && !data.installed && <CapabilityNotice error={{ code: 'capability_missing', message: 'Apache is not installed on this server, so mod_userdir cannot be configured.' }} onRetry={refetch} />}
+      {data && !data.installed && <CapabilityNotice capability="apache" error={{ code: 'capability_missing', message: 'Apache is not installed on this server, so mod_userdir cannot be configured.' }} onRetry={refetch} />}
       {data && data.installed && (
         <>
           <Card title="Status">

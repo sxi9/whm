@@ -90,6 +90,14 @@ describe('arg schemas', () => {
     for (const good of ['web01', 'a', 'a_b-c', 'a'.repeat(32)]) expect(accepts(arg.username, good), good).toBe(true);
   });
 
+  it('psUser takes the owner names ps prints but nothing option-like', () => {
+    for (const good of ['Debian-exim', '_apt', 'systemd+', 'www-data', 'root', '1000', 'machine$', 'a'.repeat(32)]) expect(accepts(arg.psUser, good), good).toBe(true);
+    for (const bad of ['-r', '--help', 'a b', 'root;id', 'a/b', 'a\nb', '', '$(id)', 'a'.repeat(33)]) expect(accepts(arg.psUser, bad), bad).toBe(false);
+    const schema = catalog.get('sys.processes').schema;
+    expect(schema.safeParse({ user: 'Debian-exim' }).success).toBe(true);
+    expect(schema.safeParse({ user: '-u' }).success).toBe(false);
+  });
+
   it('absPath rejects traversal and relative paths', () => {
     for (const bad of ['/home/../etc', 'relative', '/home/x/..', '/../etc', '/..', '/home/x\n/../etc', '', '/home/x\0']) expect(accepts(arg.absPath, bad), bad).toBe(false);
     for (const good of ['/home/x', '/', '/home/x/..hidden', '/var/lib/whm/a b/c.txt']) expect(accepts(arg.absPath, good), good).toBe(true);

@@ -1076,11 +1076,20 @@ const PROXY_HEADERS = [
 export const nginxRejectHandshake = (version) => Boolean(version) && versionAtLeast(version, '1.19.4');
 export const NGINX_DEFAULT_CERT_DIR = '/etc/nginx/whm-default';
 
+// nginx -t opens its listening sockets, so a `listen [::]:…` line is fatal on
+// a host booted with ipv6.disable=1 (no /proc/net/if_inet6) and useless when
+// every interface has IPv6 switched off (the file is empty).
+export const PROC_IF_INET6 = '/proc/net/if_inet6';
+export function hostHasIpv6(procFile = PROC_IF_INET6) {
+  try { return fs.readFileSync(procFile, 'utf8').trim() !== ''; } catch { return false; }
+}
+
 // A hostname is routed to a tenant's HTTPS block only when it is one of that
 // block's names; everything else lands on the catch-all, never on the first
 // ssl block nginx happens to find.
-export function renderNginxProxy({ apachePort, cache, cacheMaxSizeMb = 1024, cacheTtl = '10m', domains = [], httpsPort = 443, httpPort = 80, http2Directive = false, cachePath = CACHE_PATH, rejectHandshake = false, defaultCert = null }) {
+export function renderNginxProxy({ apachePort, cache, cacheMaxSizeMb = 1024, cacheTtl = '10m', domains = [], httpsPort = 443, httpPort = 80, http2Directive = false, cachePath = CACHE_PATH, rejectHandshake = false, defaultCert = null, ipv6 = true }) {
   const ind = (lines, n = 1) => lines.map((l) => `${'  '.repeat(n)}${l}`);
+  const listen = (port, flags = '') => [`listen ${port}${flags};`, ...(ipv6 ? [`listen [::]:${port}${flags};`] : [])];
   const cacheLines = cache ? [
     `proxy_cache whm;`,
     `proxy_cache_valid 200 301 302 ${cacheTtl};`,
@@ -1105,18 +1114,18 @@ export function renderNginxProxy({ apachePort, cache, cacheMaxSizeMb = 1024, cac
     '',
   ];
   if (cache) out.push(`proxy_cache_path ${cachePath} levels=1:2 keys_zone=whm:64m max_size=${cacheMaxSizeMb}m inactive=60m use_temp_path=off;`, '');
-  out.push('server {', ...ind([`listen ${httpPort} default_server;`, `listen [::]:${httpPort} default_server;`, 'server_name _;', ...common, ...location]), '}', '');
+  out.push('server {', ...ind([...listen(httpPort, ' default_server'), 'server_name _;', ...common, ...location]), '}', '');
   const sslListen = http2Directive ? 'ssl' : 'ssl http2';
   if (rejectHandshake) {
-    out.push('server {', ...ind([`listen ${httpsPort} ssl default_server;`, `listen [::]:${httpsPort} ssl default_server;`, 'server_name _;', 'ssl_reject_handshake on;']), '}', '');
+    out.push('server {', ...ind([...listen(httpsPort, ' ssl default_server'), 'server_name _;', 'ssl_reject_handshake on;']), '}', '');
   } else if (defaultCert) {
-    out.push('server {', ...ind([`listen ${httpsPort} ssl default_server;`, `listen [::]:${httpsPort} ssl default_server;`, 'server_name _;', `ssl_certificate ${defaultCert.cert};`, `ssl_certificate_key ${defaultCert.key};`, 'ssl_protocols TLSv1.2 TLSv1.3;', 'return 444;']), '}', '');
+    out.push('server {', ...ind([...listen(httpsPort, ' ssl default_server'), 'server_name _;', `ssl_certificate ${defaultCert.cert};`, `ssl_certificate_key ${defaultCert.key};`, 'ssl_protocols TLSv1.2 TLSv1.3;', 'return 444;']), '}', '');
   }
   for (const d of domains) {
     if (!d.ssl) continue;
     const names = [...new Set([d.domain, ...(d.aliases || [])])].join(' ');
     out.push('server {', ...ind([
-      `listen ${httpsPort} ${sslListen};`, `listen [::]:${httpsPort} ${sslListen};`, ...(http2Directive ? ['http2 on;'] : []), `server_name ${names};`,
+      ...listen(httpsPort, ` ${sslListen}`), ...(http2Directive ? ['http2 on;'] : []), `server_name ${names};`,
       `ssl_certificate ${d.ssl.cert};`, `ssl_certificate_key ${d.ssl.key};`,
       'ssl_session_cache shared:whm_ssl:10m;', 'ssl_session_timeout 1d;', 'ssl_protocols TLSv1.2 TLSv1.3;', 'ssl_prefer_server_ciphers off;',
       ...common, ...location,
@@ -1217,7 +1226,8 @@ defineOp('pkg.nginx.proxy.write', {
     const version = await nginxVersion();
     const rejectHandshake = nginxRejectHandshake(version);
     const defaultCert = rejectHandshake ? null : await ensureDefaultCert(ctx);
-    const content = renderNginxProxy({ ...args, domains: usable, http2Directive: nginxHttp2Directive(version), rejectHandshake, defaultCert });
+    const ipv6 = hostHasIpv6();
+    const content = renderNginxProxy({ ...args, domains: usable, http2Directive: nginxHttp2Directive(version), rejectHandshake, defaultCert, ipv6 });
     const backup = writeIni(NGINX_PROXY_CONF, content);
     const previousState = readProxyState();
     const changed = disableStockDefaults(ctx);
@@ -1229,7 +1239,7 @@ defineOp('pkg.nginx.proxy.write', {
     }
     ctx.assertAllowedPath(NGINX_STATE_FILE, 'write');
     writeProxyState({ ...previousState, ...changed });
-    return { path: NGINX_PROXY_CONF, bytes: Buffer.byteLength(content), nginxVersion: version, http2Directive: nginxHttp2Directive(version), catchAll: rejectHandshake ? 'reject-handshake' : defaultCert ? 'self-signed' : 'none', domains: usable.length, sslDomains: usable.filter((d) => d.ssl).length, sslNames: usable.filter((d) => d.ssl).reduce((n, d) => n + 1 + (d.aliases?.length || 0), 0), skipped: args.domains.length - usable.length, stockDefaultsDisabled: Object.keys(changed), configtest: test };
+    return { path: NGINX_PROXY_CONF, bytes: Buffer.byteLength(content), nginxVersion: version, http2Directive: nginxHttp2Directive(version), ipv6, catchAll: rejectHandshake ? 'reject-handshake' : defaultCert ? 'self-signed' : 'none', domains: usable.length, sslDomains: usable.filter((d) => d.ssl).length, sslNames: usable.filter((d) => d.ssl).reduce((n, d) => n + 1 + (d.aliases?.length || 0), 0), skipped: args.domains.length - usable.length, stockDefaultsDisabled: Object.keys(changed), configtest: test };
   },
 });
 

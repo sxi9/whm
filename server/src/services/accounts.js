@@ -85,6 +85,41 @@ export function createAccountsService(ctx) {
   async function homeFilesystem(dir) {
     try { return (await ctx.accountFunctions?.mountpointFor?.(dir)) || '/'; } catch { return '/'; }
   }
+  // Apache walks the document root as its own user (www-data on Debian/Ubuntu,
+  // apache on RHEL: the names apacheLayout hardcodes), which is not in the
+  // account's group, so public_html gets the web server's group (cPanel's
+  // user:nobody layout). Debian ships www-data before Apache is installed; on
+  // RHEL the group only exists with httpd, and fs.mkdir rejects an unknown one.
+  async function webServerGroup(req) {
+    for (const name of ['www-data', 'apache']) {
+      try { if ((await agent.op('user.get', { username: name }, { req }))?.uid != null) return name; } catch { /* absent: no group */ }
+    }
+    return null;
+  }
+  // Installed quota tools do not mean quotas are enabled on the home filesystem
+  // (fstab usrquota + quotaon, Initial Quota Setup): setquota then exits 1. The
+  // limit stays on the account and the outcome is reported; it never unwinds a
+  // creation or blocks a change.
+  async function applyQuota(username, mb, homeDir, req) {
+    const args = quotaArgs(username, mb, await homeFilesystem(homeDir));
+    try {
+      await agent.op('user.set_quota', args, { req });
+      return { status: 'applied', detail: `${mb ? `${mb} MB` : 'unlimited'} on ${args.filesystem}`, filesystem: args.filesystem };
+    } catch (err) {
+      if (!['capability_missing', 'binary_not_found', 'quota_not_enabled', 'path_not_allowed', 'command_failed', 'spawn_failed'].includes(err.code)) throw err;
+      logger.warn({ op: 'user.set_quota', code: err.code, username }, `${err.message} — the quota is recorded but not enforced`);
+      const pending = err.code === 'capability_missing' || err.code === 'binary_not_found' || err.code === 'quota_not_enabled';
+      return { status: pending ? 'pending' : 'failed', detail: `${err.message}; enable quotas on ${args.filesystem} with Initial Quota Setup, then set the limit again in Quota Modification`, filesystem: args.filesystem };
+    }
+  }
+  // A reseller grants a shell only with add-pkg-shell and never with
+  // disallow-shell (the rule of account-functions.setShell and the bulk modify).
+  function shellIssue(user) {
+    if (isRoot(user) || !ctx.resellers?.hasAcl) return null;
+    if (ctx.resellers.aclsFor?.(user.id)?.has('disallow-shell')) return 'Your reseller privileges forbid granting shell access (Disallow Shell Access); only /usr/sbin/nologin can be set';
+    if (!ctx.resellers.hasAcl(user, 'add-pkg-shell')) return 'Your reseller privileges do not include "Grant Shell Access" (add-pkg-shell)';
+    return null;
+  }
   // The web side of a suspension (every vhost pointed at the suspended page) is
   // Service Configuration's: ctx.web.setSuspended(username, suspended, req) ->
   // { applied, reason }. Without the hook the Linux lock alone applies and the
@@ -199,7 +234,7 @@ export function createAccountsService(ctx) {
     list(query, user) {
       const where = [];
       const params = {};
-      if (!isRoot(user)) { where.push('a.owner_id = @owner'); params.owner = user.id; }
+      if (!isRoot(user)) { ctx.resellers?.assertAcl?.(user, 'list-accts'); where.push('a.owner_id = @owner'); params.owner = user.id; }
       if (query.q) { where.push('(a.username LIKE @q OR a.domain LIKE @q OR a.contact_email LIKE @q OR u.username LIKE @q OR m.username LIKE @q)'); params.q = `%${query.q}%`; }
       if (query.suspended != null) { where.push('a.suspended = @suspended'); params.suspended = query.suspended ? 1 : 0; }
       if (query.package) { where.push('a.package_name = @package'); params.package = query.package; }
@@ -213,7 +248,10 @@ export function createAccountsService(ctx) {
       return { ...result, data: result.data.map(shape) };
     },
 
+    // Reading an account (the row, its domains) is the List Accounts privilege;
+    // the internal load() used by the mutations stays bound to their own ACLs.
     get(username, user) {
+      if (!isRoot(user)) ctx.resellers?.assertAcl?.(user, 'list-accts');
       const account = load(username, user);
       return { ...shape(account), domains: stmts.domains.all(account.id) };
     },
@@ -243,25 +281,27 @@ export function createAccountsService(ctx) {
       const managerId = input.manager ? resolveManager(input.manager, user).id : user.id;
       const homeRoot = settings.get('basic.home_root');
       const homeDir = `${homeRoot}/${username}`;
-      const shell = plan.has_shell ? '/bin/bash' : '/usr/sbin/nologin';
+      // As in WHM, a reseller who may not grant shells creates the account without one.
+      const shellWithheld = plan.has_shell ? shellIssue(user) : null;
+      const shell = plan.has_shell && !shellWithheld ? '/bin/bash' : '/usr/sbin/nologin';
       // Resellers are bound by their limits, ACLs, package list and IP delegation (Reseller Center).
       const policy = !isRoot(user) && ctx.resellers?.createPolicy ? ctx.resellers.createPolicy(user, { pkgName, plan, ip: input.ip }) : null;
       const ip = input.ip || policy?.sharedIp || settings.get('basic.shared_ip') || settings.get('basic.main_ip') || null;
 
       const undo = [];
       let sysUser = null;
+      let quota = null;
       try {
         sysUser = await tryOp('user.create', { username, homeDir, shell, comment: `WHM account ${input.domain}` }, req, undo,
           () => agent.op('user.delete', { username, removeHome: true }, { req }));
         if (sysUser) {
+          const group = await webServerGroup(req);
           for (const sub of ['public_html', 'mail', 'etc', 'tmp', 'logs', 'ssl']) {
-            await agent.op('fs.mkdir', { path: `${homeDir}/${sub}`, owner: username, mode: sub === 'public_html' ? '0750' : '0700' }, { req });
+            await agent.op('fs.mkdir', { path: `${homeDir}/${sub}`, owner: username, ...(sub === 'public_html' && group ? { group } : {}), mode: sub === 'public_html' ? '0750' : '0700' }, { req });
           }
           await agent.op('fs.write_file', { path: `${homeDir}/public_html/index.html`, content: indexHtml(input.domain, username), owner: username, mode: '0644', backup: false }, { req });
           if (input.password) await agent.op('user.set_password', { username, password: input.password }, { req });
-          if (plan.disk_mb && capabilities.has('quota')) {
-            await tryOp('user.set_quota', quotaArgs(username, plan.disk_mb, await homeFilesystem(homeDir)), req, undo);
-          }
+          if (plan.disk_mb && capabilities.has('quota')) quota = await applyQuota(username, plan.disk_mb, homeDir, req);
         }
 
         const account = db.transaction(() => {
@@ -277,8 +317,10 @@ export function createAccountsService(ctx) {
 
         undo.push(() => Promise.resolve(stmts.remove.run(account.id)));
         const provisioning = await provision(account, { ip, user, req, undo, want: { web: true, dns: true, mail: true, ...(input.provision || {}) } });
-        audit(req, { action: 'account.create', target: username, args: { domain: input.domain, package: pkgName, owner: ownerId, manager: managerId, ip, provisioning: Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])) } });
-        return { ...shape(stmts.byUsername.get(username)), domains: stmts.domains.all(account.id), provisioning: { systemUser: Boolean(sysUser), ...Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])), steps: provisioning.steps } };
+        const steps = { ...(quota ? { quota } : {}), ...provisioning.steps };
+        const statuses = Object.fromEntries(Object.entries(steps).map(([k, v]) => [k, v.status]));
+        audit(req, { action: 'account.create', target: username, args: { domain: input.domain, package: pkgName, owner: ownerId, manager: managerId, ip, shell, ...(shellWithheld ? { shellWithheld } : {}), provisioning: statuses } });
+        return { ...shape(stmts.byUsername.get(username)), domains: stmts.domains.all(account.id), provisioning: { systemUser: Boolean(sysUser), ...statuses, steps } };
       } catch (err) {
         for (const step of undo.reverse()) await step().catch((e) => logger.error({ err: e }, 'rollback step failed'));
         throw err;
@@ -357,19 +399,25 @@ export function createAccountsService(ctx) {
       if (input.manager === null) next.manager_user_id = null;
       else if (input.manager) next.manager_user_id = resolveManager(input.manager, user).id;
       // Resellers stay within their ACLs, limits, package list and IP delegation after creation too.
-      if (!isRoot(user)) ctx.resellers?.modifyPolicy?.(user, account, { pkgName: input.package, diskQuotaMb: next.disk_quota_mb, bandwidthLimitMb: next.bandwidth_limit_mb, ip: next.ip });
+      if (!isRoot(user)) {
+        if (next.demo_mode !== account.demo_mode) ctx.resellers?.assertAcl?.(user, 'demo-setup');
+        if (next.shell !== account.shell && next.shell !== '/usr/sbin/nologin') { const issue = shellIssue(user); if (issue) throw forbidden(issue); }
+        ctx.resellers?.modifyPolicy?.(user, account, { pkgName: input.package, diskQuotaMb: next.disk_quota_mb, bandwidthLimitMb: next.bandwidth_limit_mb, ip: next.ip });
+      }
+      let quota = null;
       if (account.uid != null) {
         if (next.shell !== account.shell) await tryOp('user.set_shell', { username, shell: next.shell }, req, []);
-        if (next.disk_quota_mb !== account.disk_quota_mb && capabilities.has('quota')) {
-          await tryOp('user.set_quota', quotaArgs(username, next.disk_quota_mb, await homeFilesystem(account.home_dir || `${settings.get('basic.home_root')}/${username}`)), req, []);
-        }
+        if (next.disk_quota_mb !== account.disk_quota_mb && capabilities.has('quota')) quota = await applyQuota(username, next.disk_quota_mb, account.home_dir || `${settings.get('basic.home_root')}/${username}`, req);
       }
       stmts.update.run({ ...next, id: account.id, plan: next.plan_snapshot_json });
-      audit(req, { action: 'account.modify', target: username, args: input });
-      return shape(stmts.byUsername.get(username));
+      audit(req, { action: 'account.modify', target: username, args: quota ? { ...input, quota: quota.status } : input });
+      return { ...shape(stmts.byUsername.get(username)), ...(quota ? { quota } : {}) };
     },
 
-    domains: (username, user) => stmts.domains.all(load(username, user).id),
+    domains(username, user) {
+      if (!isRoot(user)) ctx.resellers?.assertAcl?.(user, 'list-accts');
+      return stmts.domains.all(load(username, user).id);
+    },
   };
 }
 

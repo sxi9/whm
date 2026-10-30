@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
+import { useAuth } from '../../../auth/AuthContext.jsx';
 import { CATEGORIES } from '../../../nav.js';
 import { PageHeader, Card, Loading, StatusPill } from '../../../components/Common.jsx';
 import { RadioGroup, Button, FormActions } from '../../../components/Form.jsx';
@@ -10,9 +11,17 @@ import { RequestError } from '../../server-configuration/Shared.jsx';
 
 const labelFor = (slug) => CATEGORIES.find((c) => c.slug === slug)?.label || slug;
 
+export function profileSwitchMessage(def, restoreLabel = 'Standard Node') {
+  const hidden = def.hiddenCategories.length
+    ? `${def.hiddenCategories.length} categories (${def.hiddenCategories.map(labelFor).join(', ')}) disappear from the sidebar, the Tools grid and search for every user as soon as the profile is applied; their pages stay reachable by URL and their APIs stay mounted. Switching back to ${restoreLabel} brings them back.`
+    : 'Every category stays visible.';
+  return `Service monitoring follows the profile (${def.monitoredServices.join(', ')}). ${hidden} No daemon is stopped or uninstalled.`;
+}
+
 export default function ServerProfile({ fn }) {
   const toast = useToast();
   const confirm = useConfirm();
+  const { refresh } = useAuth();
   const { data, loading, error, refetch } = useApi('/server-config/profile');
   const [choice, setChoice] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -21,10 +30,10 @@ export default function ServerProfile({ fn }) {
   const def = data?.profiles.find((p) => p.name === selected);
 
   const apply = async () => {
-    const ok = await confirm({ title: `Switch to ${def.label}?`, message: `Service monitoring follows the profile (${def.monitoredServices.join(', ')}). ${def.hiddenCategories.length ? `${def.hiddenCategories.length} categories are reported as hidden for linked nodes and integrations; the sidebar keeps showing every category until the shell consumes that list.` : 'Every category stays available.'} No daemon is stopped or uninstalled.`, confirmLabel: 'Apply profile' });
+    const ok = await confirm({ title: `Switch to ${def.label}?`, message: profileSwitchMessage(def, data.profiles.find((p) => p.name === 'standard')?.label), confirmLabel: 'Apply profile' });
     if (!ok) return;
     setBusy(true);
-    try { const { data: d } = await api.put('/server-config/profile', { name: selected }); setResult(d); setChoice(null); toast.success(`Profile set to ${def.label}; service monitoring updated`); refetch(); } catch (err) { toast.error(err); } finally { setBusy(false); }
+    try { const { data: d } = await api.put('/server-config/profile', { name: selected }); setResult(d); setChoice(null); toast.success(`Profile set to ${def.label}; service monitoring updated`); refetch(); refresh(); } catch (err) { toast.error(err); } finally { setBusy(false); }
   };
 
   return (
@@ -47,7 +56,7 @@ export default function ServerProfile({ fn }) {
                 {data.services.map((s) => { const will = def.monitoredServices.includes(s.name); return <tr key={s.name}><td>{s.displayName}<br /><small className="muted"><code>{s.name}</code></small></td><td><StatusPill status={will ? 'enabled' : 'disabled'}>{will ? 'monitored' : 'not monitored'}</StatusPill>{will !== s.monitored && <small className="muted"> (now: {s.monitored ? 'monitored' : 'off'})</small>}</td></tr>; })}
               </tbody></table></div>
             </Card>
-            <Card title="Categories not applicable to this role" subtitle="Published in GET /api/system/status as profile.hiddenCategories; the sidebar and these categories' APIs stay available until the panel shell applies the list">
+            <Card title="Categories not applicable to this role" subtitle="Published as profile.hiddenCategories in GET /api/auth/me and /api/system/status. The shell hides them from the sidebar, the Tools grid and search for every user; their pages stay reachable by URL and their APIs stay mounted.">
               {def.hiddenCategories.length === 0 ? <p className="muted">Every category applies to this profile.</p> : <ul>{def.hiddenCategories.map((slug) => <li key={slug}>{labelFor(slug)} <small className="muted"><code>{slug}</code></small></li>)}</ul>}
             </Card>
           </div>

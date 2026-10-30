@@ -185,6 +185,17 @@ describe('Service Manager stack card', () => {
     expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Web \+ database only<\/button>/);
     expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Install selected \(0\)<\/button>/);
   });
+
+  it('renders while the stack is still loading and when the request failed, before any data exists', () => {
+    const loading = render(<StackCard stack={{ data: null, loading: true, error: null, refetch: () => {} }} busy={null} onInstall={() => {}} />);
+    expect(loading).toContain('Server stack');
+    expect(loading).toContain('Loading');
+    expect(loading).not.toContain('Install full hosting stack');
+    const failed = render(<StackCard stack={{ data: null, loading: false, error: { code: 'agent_unavailable', message: 'The agent is not running' }, refetch: () => {} }} busy={null} onInstall={() => {}} />);
+    expect(failed).toContain('Server stack');
+    expect(failed).toContain('The agent is not running');
+    expect(failed).not.toContain('Install full hosting stack');
+  });
 });
 
 describe('shell redirects around the setup wizard', () => {

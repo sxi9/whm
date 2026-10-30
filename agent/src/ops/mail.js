@@ -1202,6 +1202,20 @@ export function assertNoSymlinks(base, target) {
   }
 }
 
+// chown(2) follows symlinks, and the account user owns the parent of every
+// directory root creates in their home: between mkdir and chown they can rename
+// the new directory away and plant a link in its place. Ownership is therefore
+// applied through a descriptor opened with O_NOFOLLOW, never by path.
+export function chownDirNoFollow(p, uid, gid) {
+  let fd;
+  try {
+    fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+  } catch (err) {
+    throw new OpError('path_not_allowed', `${p} is no longer a plain directory (${err.code}); refusing to chown it as root`);
+  }
+  try { fs.fchownSync(fd, uid, gid); } finally { fs.closeSync(fd); }
+}
+
 defineOp('mail.mailbox.fix_perms', {
   description: "Repair ownership and permissions of an account's mail tree (user:user, dirs 0700, files 0600) without following symlinks",
   // dirs are direct children of the home: "." or ".." would turn the recursive
@@ -1258,7 +1272,7 @@ defineOp('mail.mailbox.convert', {
     const owner = fs.statSync(homeDir);
     const missing = [];
     for (let p = path.dirname(target.path); p.startsWith(`${homeDir}/`) && !exists(p); p = path.dirname(p)) missing.push(p);
-    for (const p of missing.reverse()) { fs.mkdirSync(p, { mode: 0o700 }); fs.chownSync(p, owner.uid, owner.gid); }
+    for (const p of missing.reverse()) { fs.mkdirSync(p, { mode: 0o700 }); chownDirNoFollow(p, owner.uid, owner.gid); }
     // Dovecot's conversion recipe: the user's mail_location (-o) is the source
     // and the positional location is where dsync writes.
     const argv = ['-o', `mail_location=${srcLocation}`, 'sync', '-1', '-u', user, dstLocation];

@@ -8,6 +8,7 @@ import {
   renderVhost, parseVhostMeta, renderRedirects, renderGlobalInclude, renderPhpPool, renderLogrotate, mergeKeyValueFile, renderProftpd, vsftpdSettings, pureFtpdSettings,
   ftpSettingsFrom, parseServerStatus, parseApacheVersion, parseModules, parseDoveconf, rewriteListen, apacheLayout, eximLayout, phpLayout, SERVICE_ROLES, hintsFor, ensureRootLogDir, confPath, parseEximVersion,
   mergeEximBlock, readEximBlock, stripEximBlock, eximTlsLibrary, primaryGroupName, EXIM_SENTINEL_MACRO, renderHttpsRedirect, enableApacheModules,
+  applyListen, listenDropIns, ensureSelinuxWebAccess, selinuxRules, DOMLOGS_ROOT,
 } from '../src/ops/web.js';
 
 // Fake host for the layout detection: which paths exist, what they contain, which binaries resolve.
@@ -585,5 +586,179 @@ describe('renderers produce the expected daemon syntax', () => {
     expect(Array.isArray(v.vhosts)).toBe(true);
     const e = await runOp('web.exim.detect', {}, ctx);
     expect(typeof e.installed).toBe('boolean');
+  });
+});
+
+// Mocks the binaries a host has and what each answers; everything else runs
+// unchanged.
+async function withBinaries(binaries, answer, fn) {
+  const { hasBinary } = await import('../src/exec.js');
+  const actual = await vi.importActual('../src/exec.js');
+  hasBinary.mockImplementation((name) => binaries.includes(name));
+  exec.mockClear();
+  exec.mockImplementation(async (bin, argv) => ({ code: 0, stdout: '', stderr: '', bin, argv, ...(answer(bin, argv) || {}) }));
+  try { await fn(() => exec.mock.calls.map(([bin, argv]) => [bin, ...argv])); } finally { hasBinary.mockImplementation(actual.hasBinary); exec.mockImplementation(actual.exec); }
+}
+
+describe('web.ports.set on the RHEL layout silences the Listen of every conf.d drop-in (mod_ssl ssl.conf)', () => {
+  const SSL_CONF = 'Listen 443 https\n\nSSLPassPhraseDialog exec:/usr/libexec/httpd-ssl-pass-dialog\n<VirtualHost _default_:443>\nSSLEngine on\n</VirtualHost>\n';
+  const HTTPD_CONF = 'ServerRoot "/etc/httpd"\nListen 80\nInclude conf.modules.d/*.conf\nIncludeOptional conf.d/*.conf\n';
+  const WELCOME = '<LocationMatch "^/+$">\n    Options -Indexes\n</LocationMatch>\n';
+
+  function fakeHttpd() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-httpd-'));
+    fs.mkdirSync(path.join(root, 'conf'));
+    fs.mkdirSync(path.join(root, 'conf.d'));
+    fs.writeFileSync(path.join(root, 'conf', 'httpd.conf'), HTTPD_CONF);
+    fs.writeFileSync(path.join(root, 'conf.d', 'ssl.conf'), SSL_CONF);
+    fs.writeFileSync(path.join(root, 'conf.d', 'welcome.conf'), WELCOME);
+    fs.writeFileSync(path.join(root, 'conf.d', 'README'), 'Listen 9999 would be ignored: not a .conf\n');
+    const apache = { flavor: 'rhel', root, bin: 'httpd', confD: path.join(root, 'conf.d'), units: ['httpd'], a2tools: false };
+    return { root, apache, tctx: createContext({ allowedRoots: [root] }), read: (f) => fs.readFileSync(path.join(root, f), 'utf8') };
+  }
+
+  it('finds only .conf drop-ins that carry a top-level Listen', () => {
+    const { root } = fakeHttpd();
+    try {
+      expect(listenDropIns(path.join(root, 'conf.d'))).toEqual([path.join(root, 'conf.d', 'ssl.conf')]);
+      expect(listenDropIns(path.join(root, 'missing'))).toEqual([]);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('comments the drop-in Listen alongside httpd.conf so nginx can take 443, and applying it twice is stable', async () => {
+    const { root, apache, tctx, read } = fakeHttpd();
+    try {
+      await withBinaries(['httpd', 'systemctl'], (bin, argv) => (bin === 'httpd' && argv[0] === '-t' ? { stderr: 'Syntax OK\n' } : {}), async (calls) => {
+        const result = await applyListen(apache, { http: 8080, https: null, bind: '127.0.0.1' }, tctx);
+        expect(result).toMatchObject({ path: path.join(root, 'conf', 'httpd.conf'), dropIns: [path.join(root, 'conf.d', 'ssl.conf')], validated: true, http: 8080, https: null });
+        expect(read('conf/httpd.conf')).toContain('#Listen 80');
+        expect(read('conf/httpd.conf')).toContain('\nListen 127.0.0.1:8080\n');
+        expect(read('conf.d/ssl.conf')).toContain('#Listen 443 https');
+        expect(read('conf.d/ssl.conf')).not.toMatch(/^\s*Listen /m);
+        expect(read('conf.d/ssl.conf')).toContain('<VirtualHost _default_:443>');
+        expect(read('conf.d/welcome.conf')).toBe(WELCOME);
+        expect(calls()).toContainEqual(['httpd', '-t']);
+        const again = await applyListen(apache, { http: 80, https: 443 }, tctx);
+        expect(again.dropIns).toEqual([]);
+        expect(read('conf/httpd.conf').match(/^Listen 80$/gm)).toHaveLength(1);
+        expect(read('conf.d/ssl.conf')).toContain('#Listen 443 https');
+      });
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('restores httpd.conf and every drop-in when httpd -t rejects the change', async () => {
+    const { root, apache, tctx, read } = fakeHttpd();
+    try {
+      await withBinaries(['httpd', 'systemctl'], (bin, argv) => (bin === 'httpd' && argv[0] === '-t' ? { code: 1, stderr: 'AH00072: make_sock: could not bind to address 127.0.0.1:8443\n' } : {}), async () => {
+        const err = await opError(applyListen(apache, { http: 8080, https: 8443, bind: '127.0.0.1' }, tctx));
+        expect(err.code).toBe('config_invalid');
+        expect(err.message).toMatch(/files were restored/);
+        expect(read('conf/httpd.conf')).toBe(HTTPD_CONF);
+        expect(read('conf.d/ssl.conf')).toBe(SSL_CONF);
+      });
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('debian touches ports.conf only', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-apache2-'));
+    try {
+      fs.writeFileSync(path.join(root, 'ports.conf'), 'Listen 80\n<IfModule ssl_module>\n\tListen 443\n</IfModule>\n');
+      const apache = { flavor: 'debian', root, bin: 'apache2ctl', units: ['apache2'], a2tools: true };
+      await withBinaries(['apache2ctl', 'systemctl'], () => ({}), async () => {
+        const result = await applyListen(apache, { http: 8080, https: 8443 }, createContext({ allowedRoots: [root] }));
+        expect(result).toMatchObject({ path: path.join(root, 'ports.conf'), dropIns: [] });
+        expect(fs.readFileSync(path.join(root, 'ports.conf'), 'utf8')).toContain('\nListen 8080\n');
+      });
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe('SELinux: vhost and pool writes label the account trees and switch the httpd homedir booleans on', () => {
+  function fakeHome() {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-selinux-'));
+    const home = path.join(base, 'alice');
+    for (const d of ['public_html', 'tmp', 'logs', 'addon.example']) fs.mkdirSync(path.join(home, d), { recursive: true });
+    return { base, home };
+  }
+
+  it('selinuxRules: one generic rule per standard tree, a specific one for anything else, domlogs as httpd_log_t', () => {
+    const rules = selinuxRules({ home: '/home/alice', contentDirs: ['/home/alice/public_html', '/home/alice/tmp', '/home/alice/addon.example', '/home/alice/logs'], logDirs: [`${DOMLOGS_ROOT}/alice`] });
+    expect(rules.map((r) => [r.spec, r.type])).toEqual([
+      ['/home/[^/]+/public_html(/.*)?', 'httpd_sys_rw_content_t'],
+      ['/home/[^/]+/tmp(/.*)?', 'httpd_sys_rw_content_t'],
+      ['/home/alice/addon\\.example(/.*)?', 'httpd_sys_rw_content_t'],
+      ['/home/[^/]+/logs(/.*)?', 'httpd_sys_rw_content_t'],
+      ['/var/log/whm/domlogs(/.*)?', 'httpd_log_t'],
+    ]);
+    expect(selinuxRules({ home: '/root', contentDirs: ['/root/public_html'] })[0].spec).toBe('/root/public_html(/.*)?');
+    expect(selinuxRules({ home: null, contentDirs: ['/srv/www/x'], logDirs: ['/var/log/custom'] }).map((r) => r.spec)).toEqual(['/srv/www/x(/.*)?', '/var/log/custom(/.*)?']);
+    expect(selinuxRules({ home: '/home/alice', contentDirs: ['/home/alice/tmp', '/home/alice/tmp', null] })).toHaveLength(1);
+  });
+
+  it('does nothing when SELinux is absent or disabled', async () => {
+    await withBinaries(['stat'], () => ({}), async (calls) => {
+      expect(await ensureSelinuxWebAccess({ home: '/home/alice', docroot: '/home/alice/public_html' })).toEqual({ mode: null, applied: false });
+      expect(calls()).toEqual([]);
+    });
+    await withBinaries(['getenforce', 'semanage', 'setsebool', 'restorecon'], (bin) => (bin === 'getenforce' ? { stdout: 'Disabled\n' } : {}), async (calls) => {
+      expect(await ensureSelinuxWebAccess({ home: '/home/alice', docroot: '/home/alice/public_html' })).toEqual({ mode: 'disabled', applied: false });
+      expect(calls()).toEqual([['getenforce']]);
+    });
+  });
+
+  it('enforcing: turns only the booleans that are off on, adds the fcontext rules once, tolerates "already defined" and relabels the unlabelled trees', async () => {
+    const { base, home } = fakeHome();
+    const docroot = path.join(home, 'public_html');
+    const logDir = `${DOMLOGS_ROOT}/alice`;
+    const generic = `${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/[^/]+`;
+    try {
+      await withBinaries(['getenforce', 'getsebool', 'setsebool', 'semanage', 'restorecon', 'chcon', 'stat'], (bin, argv) => {
+        if (bin === 'getenforce') return { stdout: 'Enforcing\n' };
+        if (bin === 'getsebool') return { stdout: 'httpd_enable_homedirs --> off\nhttpd_read_user_content --> off\nhttpd_can_network_connect --> on\nhttpd_can_sendmail --> on\n' };
+        if (bin === 'semanage' && argv[4] === `${generic}/tmp(/.*)?`) return { code: 1, stderr: `ValueError: File context for ${argv[4]} already defined\n` };
+        if (bin === 'stat') return { stdout: argv[2] === docroot ? 'unconfined_u:object_r:httpd_sys_rw_content_t:s0\n' : 'unconfined_u:object_r:user_home_t:s0\n' };
+        return {};
+      }, async (calls) => {
+        const result = await ensureSelinuxWebAccess({ home, docroot, logDir });
+        expect(result).toMatchObject({ mode: 'enforcing', applied: true, persistent: true, booleans: ['httpd_enable_homedirs', 'httpd_read_user_content'], warnings: [] });
+        expect(result.rules).toEqual([`${generic}/public_html(/.*)?`, `${generic}/logs(/.*)?`, '/var/log/whm/domlogs(/.*)?']);
+        expect(result.relabelled).toEqual([path.join(home, 'tmp'), path.join(home, 'logs')]);
+        const c = calls();
+        expect(c).toContainEqual(['setsebool', '-P', 'httpd_enable_homedirs=on', 'httpd_read_user_content=on']);
+        expect(c).toContainEqual(['semanage', 'fcontext', '-a', '-t', 'httpd_sys_rw_content_t', `${generic}/public_html(/.*)?`]);
+        expect(c).toContainEqual(['semanage', 'fcontext', '-a', '-t', 'httpd_log_t', '/var/log/whm/domlogs(/.*)?']);
+        expect(c).toContainEqual(['restorecon', '-R', path.join(home, 'tmp')]);
+        expect(c).not.toContainEqual(['restorecon', '-R', docroot]);
+        expect(c.some(([bin]) => bin === 'chcon')).toBe(false);
+        expect(c.some(([bin, , dir]) => bin === 'restorecon' && dir === logDir)).toBe(false);
+
+        exec.mockClear();
+        const again = await ensureSelinuxWebAccess({ home, docroot, logDir });
+        expect(again).toMatchObject({ booleans: ['httpd_enable_homedirs', 'httpd_read_user_content'], rules: [], warnings: [] });
+        expect(calls().some(([bin]) => bin === 'semanage')).toBe(false);
+      });
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  });
+
+  it('permissive without semanage: chcon labels the trees and the result warns that the labels are not persistent', async () => {
+    const { base, home } = fakeHome();
+    const docroot = path.join(home, 'addon.example');
+    try {
+      await withBinaries(['getenforce', 'getsebool', 'setsebool', 'restorecon', 'chcon', 'stat'], (bin, argv) => {
+        if (bin === 'getenforce') return { stdout: 'Permissive\n' };
+        if (bin === 'getsebool') return { stdout: 'httpd_enable_homedirs --> on\nhttpd_read_user_content --> on\nhttpd_can_network_connect --> on\nhttpd_can_sendmail --> on\n' };
+        if (bin === 'stat') return { stdout: 'unconfined_u:object_r:user_home_t:s0\n' };
+        if (bin === 'chcon' && argv[3] === path.join(home, 'logs')) return { code: 1, stderr: 'chcon: failed to change context\n' };
+        return {};
+      }, async (calls) => {
+        const result = await ensureSelinuxWebAccess({ home, docroot, tmpDir: path.join(home, 'tmp'), errorLog: path.join(home, 'logs', 'php-error.log') });
+        expect(result).toMatchObject({ mode: 'permissive', applied: true, persistent: false, booleans: [], rules: [], relabelled: [docroot, path.join(home, 'tmp')] });
+        expect(result.warnings.some((w) => /semanage is missing/.test(w))).toBe(true);
+        expect(result.warnings.some((w) => /chcon.*failed to change context/.test(w))).toBe(true);
+        const c = calls();
+        expect(c).toContainEqual(['chcon', '-R', '-t', 'httpd_sys_rw_content_t', docroot]);
+        expect(c.some(([bin]) => bin === 'semanage' || bin === 'setsebool' || bin === 'restorecon')).toBe(false);
+      });
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
 });

@@ -47,6 +47,9 @@ export async function runOp(name, args, ctx) {
 // the agent must not trust that the API validated anything.
 export const arg = {
   username: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/),
+  // A process owner as `ps -o user` prints it ("_apt", "Debian-exim", a bare
+  // UID): one argv element after "-u", so it may never start with "-".
+  psUser: z.string().regex(/^[A-Za-z0-9_][A-Za-z0-9._$+-]{0,31}$/),
   domain: z.string().regex(/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/),
   hostname: z.string().regex(/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/),
   // A unit name never starts with "-": it is placed after the systemctl verb and

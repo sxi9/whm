@@ -6,7 +6,7 @@ import { exec, hasBinary } from '../src/exec.js';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
 import {
   parseInstalledList, parseAptSearch, parseDnfSearch, parseAptSimulation, parseDnfCheckUpdate, parseAptPolicy, parsePeclList, parseGemList,
-  parsePerlModules, parseIni, setIniDirectives, parseFpmPool, renderNginxProxy, parseProxyHeader, NGINX_PROXY_CONF,
+  parsePerlModules, parseIni, setIniDirectives, parseFpmPool, renderNginxProxy, parseProxyHeader, NGINX_PROXY_CONF, hostHasIpv6,
   versionAtLeast, nginxHttp2Directive, nginxRejectHandshake, disableServerBlocks, restoreServerBlocks,
   parseAptRemoveSimulation, parseDnfRemoveSimulation, peclIniHint, startRun, pollRun, PKG_RUN_DIR, NGINX_SSL_ROOTS, nginxSslPath,
 } from '../src/ops/pkg.js';
@@ -315,6 +315,30 @@ describe('nginx proxy rendering is valid for every supported nginx', () => {
     expect(modern).not.toContain('ssl http2');
   });
 
+  it('omits the [::] listeners when the host has no usable IPv6', () => {
+    const dir = fs.mkdtempSync('/tmp/whm/pkg-ipv6-');
+    expect(hostHasIpv6(path.join(dir, 'if_inet6'))).toBe(false);
+    fs.writeFileSync(path.join(dir, 'if_inet6'), '');
+    expect(hostHasIpv6(path.join(dir, 'if_inet6'))).toBe(false);
+    fs.writeFileSync(path.join(dir, 'if_inet6'), '00000000000000000000000000000001 01 80 10 80       lo\n');
+    expect(hostHasIpv6(path.join(dir, 'if_inet6'))).toBe(true);
+    const domains = [{ domain: 'example.com', aliases: ['www.example.com'], ssl: { cert: '/etc/ssl/whm/c.pem', key: '/etc/ssl/whm/k.pem' } }];
+    const dual = renderNginxProxy({ apachePort: 8080, cache: false, domains, rejectHandshake: true });
+    expect(dual).toContain('listen [::]:80 default_server;');
+    expect(dual).toContain('listen [::]:443 ssl default_server;');
+    expect(dual).toContain('listen [::]:443 ssl http2;');
+    const v4 = renderNginxProxy({ apachePort: 8080, cache: false, domains, rejectHandshake: true, ipv6: false });
+    expect(v4).not.toContain('[::]');
+    expect(v4.split(/^server \{/m).slice(1)).toHaveLength(3);
+    expect(v4).toContain('listen 80 default_server;');
+    expect(v4).toContain('listen 443 ssl default_server;');
+    expect(v4).toContain('listen 443 ssl http2;');
+    const legacy = renderNginxProxy({ apachePort: 8080, cache: false, domains, rejectHandshake: false, defaultCert: { cert: '/etc/nginx/whm-default/cert.pem', key: '/etc/nginx/whm-default/key.pem' }, ipv6: false });
+    expect(legacy).not.toContain('[::]');
+    expect(legacy).toContain('listen 443 ssl default_server;');
+    expect(legacy).toContain('return 444;');
+  });
+
   it('comments out stock server blocks in nginx.conf reversibly', () => {
     const rhel = ['user nginx;', 'http {', '    include /etc/nginx/conf.d/*.conf;', '', '    server {', '        listen       80 default_server;', '        listen       [::]:80 default_server;', '        server_name  _;', '        location / {', '        }', '        error_page 404 /404.html; # not { a brace', '    }', '', '# Settings for a TLS enabled server.', '#    server {', '#        listen 443 ssl;', '#    }', '}', ''].join('\n');
     const { text, changed } = disableServerBlocks(rhel);
@@ -341,7 +365,7 @@ describe('nginx proxy rendering is valid for every supported nginx', () => {
       }
       const version = execFileSync('nginx', ['-v'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).match(/nginx\/(\d+(?:\.\d+)*)/)?.[1];
       for (const cache of [false, true]) {
-        const proxy = renderNginxProxy({ apachePort: 8080, cache, cacheMaxSizeMb: 64, cacheTtl: '1m', domains, http2Directive: nginxHttp2Directive(version), cachePath: path.join(dir, 'cache') });
+        const proxy = renderNginxProxy({ apachePort: 8080, cache, cacheMaxSizeMb: 64, cacheTtl: '1m', domains, http2Directive: nginxHttp2Directive(version), cachePath: path.join(dir, 'cache'), ipv6: hostHasIpv6() });
         fs.writeFileSync(path.join(dir, 'whm-proxy.conf'), proxy);
         fs.writeFileSync(path.join(dir, 'nginx.conf'), `pid ${dir}/nginx.pid;\nerror_log ${dir}/error.log;\nevents {}\nhttp {\n  access_log off;\n  include ${dir}/whm-proxy.conf;\n}\n`);
         const out = execFileSync('nginx', ['-t', '-p', dir, '-c', path.join(dir, 'nginx.conf')], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });

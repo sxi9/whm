@@ -7,7 +7,7 @@ import { runOp, createContext, OpError } from '../src/lib.js';
 import {
   parseEximQueue, ageToSeconds, sizeToBytes, parseMainlogLine, aggregateMainlog, summarizeMail, parseAddressTest,
   parseSpamdOptions, renderSpamdOptions, parseSpamdDefaults, renderSpamdDefaults, eximLayout, spamdLayout, greylistBackend,
-  parseUpdateExim4Conf, versionAtLeast, renderManagedBlock, mergeManagedBlock, readManagedBlock, renderDkimTransportFragment, assertNoSymlinks,
+  parseUpdateExim4Conf, versionAtLeast, renderManagedBlock, mergeManagedBlock, readManagedBlock, renderDkimTransportFragment, assertNoSymlinks, chownDirNoFollow,
   queueResults, blockState, renderInterfaceList, renderTransportFragment,
 } from '../src/ops/mail.js';
 
@@ -184,6 +184,78 @@ describe('mailbox ops never follow symlinks planted by the hosting user', () => 
     expect(exec.mock.calls[0][1]).toEqual(expected);
     expect(real).toMatchObject({ dryRun: false, source: `mbox:${path.join(home, 'etc', 'inbox')}`, target: `maildir:${path.join(home, 'etc', 'Maildir')}` });
     expect(fs.readdirSync(victim)).toEqual([]);
+  });
+
+  it('convert creates missing target parents owned by the account through a descriptor, never by path', async () => {
+    fs.writeFileSync(path.join(home, 'etc', 'inbox'), 'From alice\n\nhi\n');
+    hasBinary.mockImplementation((bin) => bin === 'doveadm');
+    exec.mockImplementation(async () => ({ code: 0, stdout: '', stderr: '' }));
+    const chown = vi.spyOn(fs, 'chownSync');
+    const fchown = vi.spyOn(fs, 'fchownSync');
+    try {
+      const target = path.join(home, 'etc', 'new', 'deeper', 'mdbox');
+      await runOp('mail.mailbox.convert', { user: 'alice', homeDir: home, source: { format: 'mbox', path: path.join(home, 'etc', 'inbox') }, target: { format: 'mdbox', path: target } }, tmpCtx);
+      const owner = fs.statSync(home);
+      for (const p of [path.join(home, 'etc', 'new'), path.join(home, 'etc', 'new', 'deeper')]) {
+        const st = fs.lstatSync(p);
+        expect(st.isDirectory()).toBe(true);
+        expect([st.uid, st.gid]).toEqual([owner.uid, owner.gid]);
+        expect(st.mode & 0o777).toBe(0o700);
+      }
+      expect(chown).not.toHaveBeenCalled();
+      expect(fchown).toHaveBeenCalledTimes(2);
+      expect(fchown.mock.calls.every(([fd]) => Number.isInteger(fd))).toBe(true);
+    } finally {
+      chown.mockRestore(); fchown.mockRestore();
+      fs.rmSync(path.join(home, 'etc', 'new'), { recursive: true, force: true });
+    }
+  });
+
+  it('convert refuses to chown a parent the user swapped for a symlink between mkdir and chown', async () => {
+    fs.writeFileSync(path.join(home, 'etc', 'inbox'), 'From alice\n\nhi\n');
+    hasBinary.mockImplementation((bin) => bin === 'doveadm');
+    exec.mockImplementation(async () => ({ code: 0, stdout: '', stderr: '' }));
+    const bait = path.join(home, 'etc', 'new');
+    const prey = path.join(root, 'prey');
+    fs.mkdirSync(prey);
+    // The hosting user cannot be given a different uid in a non-root test run,
+    // so the ownership assertion below only bites when the suite runs as root.
+    const asRoot = process.getuid?.() === 0;
+    if (asRoot) fs.chownSync(prey, 65534, 65534);
+    const before = fs.lstatSync(prey);
+    const realMkdir = fs.mkdirSync;
+    const mkdir = vi.spyOn(fs, 'mkdirSync').mockImplementation((p, opts) => {
+      const r = realMkdir(p, opts);
+      if (p === bait) { fs.renameSync(bait, `${bait}.moved`); fs.symlinkSync(prey, bait); }
+      return r;
+    });
+    const chown = vi.spyOn(fs, 'chownSync');
+    try {
+      const err = await opError(runOp('mail.mailbox.convert', { user: 'alice', homeDir: home, source: { format: 'mbox', path: path.join(home, 'etc', 'inbox') }, target: { format: 'mdbox', path: path.join(bait, 'mdbox') } }, tmpCtx));
+      expect(err.code).toBe('path_not_allowed');
+      // Linux reports ENOTDIR for a link when O_DIRECTORY and O_NOFOLLOW are combined.
+      expect(err.message).toMatch(/ELOOP|ENOTDIR/);
+      expect(exec).not.toHaveBeenCalled();
+      expect(chown).not.toHaveBeenCalled();
+      const after = fs.lstatSync(prey);
+      expect([after.uid, after.gid]).toEqual([before.uid, before.gid]);
+      if (asRoot) expect(after.uid).toBe(65534);
+    } finally {
+      mkdir.mockRestore(); chown.mockRestore();
+      fs.rmSync(bait, { force: true });
+      fs.rmSync(`${bait}.moved`, { recursive: true, force: true });
+      fs.rmSync(prey, { recursive: true, force: true });
+    }
+  });
+
+  it('chownDirNoFollow rejects a symlink or a file in place of the directory', () => {
+    const file = path.join(home, 'etc', 'plain');
+    fs.writeFileSync(file, '');
+    expect(() => chownDirNoFollow(path.join(home, 'mail'), 0, 0)).toThrow(/ELOOP|ENOTDIR/);
+    expect(() => chownDirNoFollow(file, 0, 0)).toThrow(/ENOTDIR/);
+    expect(() => chownDirNoFollow(path.join(home, 'etc', 'absent'), 0, 0)).toThrow(/ENOENT/);
+    expect(fs.lstatSync(path.join(home, 'mail')).isSymbolicLink()).toBe(true);
+    fs.rmSync(file);
   });
 });
 

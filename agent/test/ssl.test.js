@@ -4,7 +4,7 @@ import path from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import { exec, hasBinary } from '../src/exec.js';
 import { runOp, createContext, OpError } from '../src/lib.js';
-import { parseDn, parseSans, parseX509Fields, parseOpensslDate, renderApacheTls, renderEximTls, renderDovecotCertInclude, serviceCopies, bundlePaths, groupId, parseEximTlsLibrary, writeEximInclude, eximLayout, parseUpdateExim4Conf, mergeEximBlock, readEximBlock, stripEximBlock, writeEximFragment, dovecotLayout, ACME_OP_TIMEOUT_MS, installPanelPair, PANEL_TLS_DIR, PANEL_TLS_NOTE } from '../src/ops/ssl.js';
+import { parseDn, parseSans, parseX509Fields, parseOpensslDate, renderApacheTls, renderEximTls, renderDovecotCertInclude, serviceCopies, bundlePaths, groupId, parseEximTlsLibrary, writeEximInclude, eximLayout, parseUpdateExim4Conf, mergeEximBlock, readEximBlock, stripEximBlock, writeEximFragment, dovecotLayout, ftpLayout, VSFTPD_CONF_FILES, ACME_OP_TIMEOUT_MS, installPanelPair, PANEL_TLS_DIR, PANEL_TLS_NOTE } from '../src/ops/ssl.js';
 import { catalog } from '../src/ops/index.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
@@ -250,7 +250,31 @@ describe('service certificate wiring', () => {
     expect(proftpd).toHaveLength(1);
     expect(proftpd[0].content).toContain(`TLSRSACertificateKeyFile ${paths.key}`);
     expect(serviceCopies('ftp', paths, { ftp: { flavor: 'vsftpd', confFile: '/etc/vsftpd.conf', units: ['vsftpd'] } })).toEqual([{ vsftpd: '/etc/vsftpd.conf' }]);
+    expect(serviceCopies('ftp', paths, { ftp: { flavor: 'vsftpd', confFile: '/etc/vsftpd/vsftpd.conf', units: ['vsftpd'] } })).toEqual([{ vsftpd: '/etc/vsftpd/vsftpd.conf' }]);
     expect(serviceCopies('ftp', paths, { ftp: null })).toEqual([]);
+  });
+
+  it('ftpLayout finds vsftpd at the RHEL path as well as the Debian one and the agent may write both', () => {
+    expect(VSFTPD_CONF_FILES).toEqual(['/etc/vsftpd.conf', '/etc/vsftpd/vsftpd.conf']);
+    for (const file of VSFTPD_CONF_FILES) expect(ctx.assertAllowedPath(file, 'write')).toBe(file);
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-ftp-layout-'));
+    const debian = path.join(dir, 'vsftpd.conf');
+    const rhel = path.join(dir, 'vsftpd', 'vsftpd.conf');
+    const opts = { pureDir: path.join(dir, 'pure-ftpd'), proftpdDir: path.join(dir, 'proftpd'), vsftpdFiles: [debian, rhel] };
+    try {
+      expect(ftpLayout(opts)).toBeNull();
+      fs.mkdirSync(path.dirname(rhel), { recursive: true });
+      fs.writeFileSync(rhel, 'listen=YES\n');
+      expect(ftpLayout(opts)).toEqual({ flavor: 'vsftpd', confFile: rhel, units: ['vsftpd'] });
+      expect(serviceCopies('ftp', paths, { ftp: ftpLayout(opts) })).toEqual([{ vsftpd: rhel }]);
+      fs.writeFileSync(debian, 'listen=YES\n');
+      expect(ftpLayout(opts).confFile).toBe(debian);
+      fs.mkdirSync(opts.proftpdDir);
+      expect(ftpLayout(opts).flavor).toBe('proftpd');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('exim gets a world-readable chain and a key shared with its run group', () => {

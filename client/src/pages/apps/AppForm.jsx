@@ -104,11 +104,26 @@ export function cleanBuild(build, kind) {
   return out;
 }
 
+// Mirrors the server's strict limitsSchema (services/application-manager.js);
+// the request is refused with 422 outside these ranges.
+export const LIMIT_RANGES = {
+  memoryMaxMb: { min: 64, max: 65536, label: 'Memory limit' },
+  tasksMax: { min: 16, max: 32768, label: 'Max tasks' },
+  cpuQuotaPercent: { min: 10, max: 800, label: 'CPU quota' },
+};
+
 export const cleanLimits = (limits) => ({
   memoryMaxMb: Number(limits?.memoryMaxMb) || 512,
   tasksMax: Number(limits?.tasksMax) || 256,
   cpuQuotaPercent: Number(limits?.cpuQuotaPercent) || 100,
 });
+
+export function limitsErrors(limits) {
+  const clean = cleanLimits(limits);
+  return Object.entries(LIMIT_RANGES)
+    .filter(([key, r]) => !Number.isInteger(clean[key]) || clean[key] < r.min || clean[key] > r.max)
+    .map(([, r]) => `${r.label} must be a whole number between ${r.min} and ${r.max}`);
+}
 
 // The POST /apps body for the form state.
 export function buildCreatePayload(form) {
@@ -152,7 +167,10 @@ export function stepErrors(step, form) {
     if (form.source === 'git' && !GIT_URL.test(form.gitUrl.trim())) errors.push('The repository URL must be an https:// URL without credentials');
     if (form.source === 'scaffold' && !form.preset) errors.push('Scaffolds need a preset');
   }
-  if (step === 3) errors.push(...envErrors(form.env));
+  if (step === 3) {
+    errors.push(...envErrors(form.env));
+    if (form.kind !== 'static') errors.push(...limitsErrors(form.limits));
+  }
   return errors;
 }
 
@@ -220,9 +238,9 @@ export function LimitsFields({ value, onChange }) {
   const set = (patch) => onChange({ ...value, ...patch });
   return (
     <div className="form-grid">
-      <Field label="Memory limit (MB)" help="64–65536; the service is killed above it"><NumberInput value={value.memoryMaxMb} onChange={(memoryMaxMb) => set({ memoryMaxMb })} min={64} max={65536} nullable={false} /></Field>
-      <Field label="Max tasks (threads + processes)" help="16–65536"><NumberInput value={value.tasksMax} onChange={(tasksMax) => set({ tasksMax })} min={16} max={65536} nullable={false} /></Field>
-      <Field label="CPU quota (%)" help="100 = one core, up to 800"><NumberInput value={value.cpuQuotaPercent} onChange={(cpuQuotaPercent) => set({ cpuQuotaPercent })} min={10} max={800} nullable={false} /></Field>
+      <Field label="Memory limit (MB)" help={`${LIMIT_RANGES.memoryMaxMb.min}–${LIMIT_RANGES.memoryMaxMb.max}; the service is killed above it`}><NumberInput value={value.memoryMaxMb} onChange={(memoryMaxMb) => set({ memoryMaxMb })} min={LIMIT_RANGES.memoryMaxMb.min} max={LIMIT_RANGES.memoryMaxMb.max} nullable={false} /></Field>
+      <Field label="Max tasks (threads + processes)" help={`${LIMIT_RANGES.tasksMax.min}–${LIMIT_RANGES.tasksMax.max}`}><NumberInput value={value.tasksMax} onChange={(tasksMax) => set({ tasksMax })} min={LIMIT_RANGES.tasksMax.min} max={LIMIT_RANGES.tasksMax.max} nullable={false} /></Field>
+      <Field label="CPU quota (%)" help={`100 = one core, up to ${LIMIT_RANGES.cpuQuotaPercent.max}`}><NumberInput value={value.cpuQuotaPercent} onChange={(cpuQuotaPercent) => set({ cpuQuotaPercent })} min={LIMIT_RANGES.cpuQuotaPercent.min} max={LIMIT_RANGES.cpuQuotaPercent.max} nullable={false} /></Field>
     </div>
   );
 }

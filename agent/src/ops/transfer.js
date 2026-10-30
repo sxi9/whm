@@ -401,12 +401,15 @@ defineOp('transfer.remote.remove_file', {
 });
 
 // Modes are preserved (-p) so 0600 credential files and 0700 directories stay
-// private and scripts keep their execute bit; ownership is reassigned afterwards.
-// Device and special files are never recreated (no -D): the copy runs as root
-// and the tree is handed to the account afterwards.
+// private and scripts keep their execute bit, minus the setuid/setgid bits: the
+// copy runs as root, so until the tree is chowned a 4755 binary from the source
+// would be a setuid-root binary inside a home the account can already reach.
+// With an owner, every received file is created as that user (--chown, rsync
+// >= 3.1.0) instead of root. Device and special files are never recreated (no -D).
 // rsync splits "user@host:path" at the first ':', so an IPv6 host is bracketed.
-export function rsyncArgv({ transport, destination, src, dest, directory = true, excludes = [], deleteExtraneous = false, bwlimitKbps = 0, dryRun = false }) {
-  const argv = ['-rlpt', '-z', '--partial', '--stats', '--no-human-readable', '-e', transport];
+export function rsyncArgv({ transport, destination, src, dest, directory = true, excludes = [], deleteExtraneous = false, bwlimitKbps = 0, dryRun = false, owner = null }) {
+  const argv = ['-rlpt', '-z', '--partial', '--stats', '--no-human-readable', '--chmod=u-s,g-s', '-e', transport];
+  if (owner) argv.push(`--chown=${owner.uid}:${owner.gid}`);
   if (deleteExtraneous) argv.push('--delete');
   if (bwlimitKbps) argv.push(`--bwlimit=${bwlimitKbps}`);
   if (dryRun) argv.push('--dry-run');
@@ -430,15 +433,18 @@ defineOp('transfer.remote.rsync', {
     deleteExtraneous: z.boolean().default(false),
     bwlimitKbps: z.number().int().min(0).max(10_000_000).default(0),
     dryRun: z.boolean().default(false),
+    owner: arg.username.optional(),
     timeoutMs: z.number().int().min(10_000).max(86_400_000).default(43_200_000),
   }).strict(),
-  run: async ({ connection: conn, remotePath: src, localPath, directory, excludes, deleteExtraneous, bwlimitKbps, dryRun, timeoutMs }, ctx) => {
+  run: async ({ connection: conn, remotePath: src, localPath, directory, excludes, deleteExtraneous, bwlimitKbps, dryRun, owner: ownerName, timeoutMs }, ctx) => {
     if (!hasBinary('rsync')) throw new OpError('capability_missing', 'rsync is not installed on this server; install the rsync package');
     const dest = ctx.assertAllowedPath(localPath, 'write');
+    const owner = ownerName ? localPasswd(ownerName) : null;
+    if (ownerName && !owner) throw new OpError('not_found', `Linux user "${ownerName}" does not exist on this server`);
     if (directory) fs.mkdirSync(dest, { recursive: true });
     else fs.mkdirSync(path.dirname(dest), { recursive: true });
     return withAuth(conn, async ({ env, transport, destination }) => {
-      const argv = rsyncArgv({ transport, destination, src, dest, directory, excludes, deleteExtraneous, bwlimitKbps, dryRun });
+      const argv = rsyncArgv({ transport, destination, src, dest, directory, excludes, deleteExtraneous, bwlimitKbps, dryRun, owner });
       const { code, stdout, stderr } = await exec('rsync', argv, { env, timeoutMs, allowFailure: true });
       const sshErr = classifySsh(code === 255 ? 255 : 0, stderr);
       if (sshErr) throw sshErr;

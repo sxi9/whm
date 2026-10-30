@@ -413,10 +413,14 @@ async function validateDovecot() {
   return { ok: code === 0, output: `${stderr}\n${stdout}`.trim() };
 }
 
-export function ftpLayout() {
-  if (exists('/etc/pure-ftpd')) return { flavor: 'pure-ftpd', confDir: '/etc/pure-ftpd', units: ['pure-ftpd'] };
-  if (exists('/etc/proftpd')) return { flavor: 'proftpd', confDir: '/etc/proftpd', units: ['proftpd'] };
-  if (exists('/etc/vsftpd.conf')) return { flavor: 'vsftpd', confFile: '/etc/vsftpd.conf', units: ['vsftpd'] };
+// Debian ships vsftpd's config as /etc/vsftpd.conf, RHEL/Alma/Rocky as /etc/vsftpd/vsftpd.conf.
+export const VSFTPD_CONF_FILES = ['/etc/vsftpd.conf', '/etc/vsftpd/vsftpd.conf'];
+
+export function ftpLayout({ pureDir = '/etc/pure-ftpd', proftpdDir = '/etc/proftpd', vsftpdFiles = VSFTPD_CONF_FILES } = {}) {
+  if (exists(pureDir)) return { flavor: 'pure-ftpd', confDir: pureDir, units: ['pure-ftpd'] };
+  if (exists(proftpdDir)) return { flavor: 'proftpd', confDir: proftpdDir, units: ['proftpd'] };
+  const vsconf = vsftpdFiles.find(exists);
+  if (vsconf) return { flavor: 'vsftpd', confFile: vsconf, units: ['vsftpd'] };
   return null;
 }
 

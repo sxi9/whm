@@ -335,6 +335,21 @@ describe('built-in providers', () => {
     await put('/api/market/providers/cpstore/config', { url: 'https://store.cpanel.net', config: { accountEmail: 'ops@example.com' } }).expect(200);
     expect((await get('/api/market/providers/cpstore').expect(200)).body.data.config.accountEmail).toBe('ops@example.com');
   });
+  it('keeps the hub origin out of the route-level audit row when the body is rejected', async () => {
+    const origin = 'https://hub.secret-owner.example';
+    const oput = (url, body) => mutate(otherRoot, 'put', url, body, otherCsrf);
+    expect((await put('/api/market/providers/whm-hub/config', { url: 'http://hub.secret-owner.example', config: {} })).status).toBe(422);
+    expect((await put('/api/market/providers/whm-hub/config', { url: origin, config: { 'bad-key!': 'x' } })).status).toBe(422);
+    expect((await put('/api/market/providers/whm-hub', { url: origin, displayName: '' })).status).toBe(422);
+    expect((await oput('/api/market/providers/whm-hub/config', { url: origin, config: {} })).status).toBe(403);
+    expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE args_redacted LIKE '%secret-owner%' OR target LIKE '%secret-owner%'").get().n).toBe(0);
+    const rows = app.ctx.db.prepare("SELECT action, result, args_redacted FROM audit_log WHERE action LIKE 'PUT /api/market/providers/:name%' ORDER BY id DESC LIMIT 4").all();
+    expect(rows.map((r) => [r.result, JSON.parse(r.args_redacted).url])).toEqual([['error:403', '[owner-only]'], ['error:422', '[owner-only]'], ['error:422', '[owner-only]'], ['error:422', '[owner-only]']]);
+    // Another provider's URL is ordinary configuration and stays readable.
+    expect((await put('/api/market/providers/cpstore/config', { url: 'http://store.example', config: {} })).status).toBe(422);
+    expect(JSON.parse(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'PUT /api/market/providers/:name/config' ORDER BY id DESC LIMIT 1").get().args_redacted).url).toBe('http://store.example');
+    expect(app.ctx.market.hub()).toEqual({ enabled: false, url: null });
+  });
   it('configures the plugin hub and exposes it to the marketplace client', async () => {
     expect(app.ctx.market.hub()).toEqual({ enabled: false, url: null });
     expect((await post('/api/market/providers/whm-hub/enable')).status).toBe(422);

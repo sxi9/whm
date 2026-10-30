@@ -659,6 +659,81 @@ async function writeApacheFile(apache, file, content, { link = null } = {}) {
   return { path: file, validated: test.ok === true, output: test.output, linked: Boolean(link) };
 }
 
+// ---------------------------------------------------------------- selinux ---
+// On the RHEL family SELinux confines Apache and every PHP-FPM pool as httpd_t,
+// which may neither search /home/<user> (user_home_dir_t) nor write the
+// account's docroot, tmp and logs (user_home_t), nor append to logs that are
+// not httpd_log_t: with the defaults every hosted site answers 403 and PHP can
+// not save sessions or uploads. Writing a vhost or pool therefore turns the
+// homedir booleans on and labels the trees it points Apache at. Persistent
+// rules need semanage (policycoreutils-python-utils); without it chcon labels
+// the trees until the next relabel and the result says so.
+const SELINUX_BOOLEANS = ['httpd_enable_homedirs', 'httpd_read_user_content', 'httpd_can_network_connect', 'httpd_can_sendmail'];
+const SELINUX_HOME_DIRS = ['public_html', 'tmp', 'logs'];
+const selinuxEnsured = new Set();
+const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+export async function selinuxMode() {
+  if (!hasBinary('getenforce')) return null;
+  const { code, stdout } = await exec('getenforce', [], { allowFailure: true, timeoutMs: 10_000 });
+  const mode = stdout.trim().toLowerCase();
+  return code === 0 && ['enforcing', 'permissive', 'disabled'].includes(mode) ? mode : null;
+}
+
+// One rule per standard tree (`/home/[^/]+/public_html(/.*)?`) covers every
+// account; anything else (an addon docroot, a custom log directory) gets a
+// rule of its own.
+export function selinuxRules({ home = null, contentDirs = [], logDirs = [] }) {
+  const parent = home ? path.dirname(home) : null;
+  const generic = parent && parent !== '/' ? `${escapeRegex(parent)}/[^/]+` : null;
+  const spec = (dir) => {
+    const rel = home && dir.startsWith(`${home}/`) ? dir.slice(home.length + 1) : null;
+    return generic && rel && SELINUX_HOME_DIRS.includes(rel) ? `${generic}/${rel}(/.*)?` : `${escapeRegex(dir)}(/.*)?`;
+  };
+  const rules = [];
+  for (const dir of contentDirs.filter(Boolean)) rules.push({ dir, spec: spec(dir), type: 'httpd_sys_rw_content_t' });
+  for (const dir of logDirs.filter(Boolean)) rules.push({ dir, spec: dir.startsWith(`${DOMLOGS_ROOT}/`) || dir === DOMLOGS_ROOT ? `${escapeRegex(DOMLOGS_ROOT)}(/.*)?` : `${escapeRegex(dir)}(/.*)?`, type: 'httpd_log_t' });
+  return rules.filter((r, i) => rules.findIndex((o) => o.dir === r.dir) === i);
+}
+
+export async function ensureSelinuxWebAccess({ home = null, docroot = null, tmpDir = null, errorLog = null, logDir = null }) {
+  const mode = await selinuxMode();
+  if (!mode || mode === 'disabled') return { mode, applied: false };
+  const warnings = [];
+  const run = async (bin, argv, timeoutMs = 60_000, tolerated = null) => {
+    if (!hasBinary(bin)) return null;
+    const r = await exec(bin, argv, { allowFailure: true, timeoutMs });
+    r.ok = r.code === 0 || Boolean(tolerated && tolerated.test(`${r.stderr}${r.stdout}`));
+    if (!r.ok) warnings.push(`${bin} ${argv[0] || ''}: ${lastLine(r.stderr || r.stdout) || `exit ${r.code}`}`.trim());
+    return r;
+  };
+  const booleans = [];
+  const current = await run('getsebool', SELINUX_BOOLEANS);
+  for (const b of SELINUX_BOOLEANS) if (current && new RegExp(`^${b}\\s*-->\\s*off\\s*$`, 'm').test(current.stdout)) booleans.push(b);
+  if (booleans.length) { const r = await run('setsebool', ['-P', ...booleans.map((b) => `${b}=on`)], 300_000); if (!r || r.code !== 0) booleans.length = 0; }
+  const contentDirs = [docroot, home ? tmpDir || `${home}/tmp` : tmpDir, errorLog ? path.dirname(errorLog) : home ? `${home}/logs` : null];
+  const rules = selinuxRules({ home, contentDirs, logDirs: [logDir] });
+  const persistent = hasBinary('semanage');
+  const added = [];
+  for (const rule of rules) {
+    if (!persistent || selinuxEnsured.has(rule.spec)) continue;
+    const r = await run('semanage', ['fcontext', '-a', '-t', rule.type, rule.spec], 120_000, /already defined/i);
+    if (!r?.ok) continue;
+    selinuxEnsured.add(rule.spec);
+    if (r.code === 0) added.push(rule.spec);
+  }
+  const relabelled = [];
+  for (const rule of rules) {
+    if (!exists(rule.dir)) continue;
+    const st = await run('stat', ['-c', '%C', rule.dir]);
+    if (st && st.code === 0 && st.stdout.includes(`:${rule.type}:`)) continue;
+    const r = persistent ? await run('restorecon', ['-R', rule.dir], 600_000) : await run('chcon', ['-R', '-t', rule.type, rule.dir], 600_000);
+    if (r && r.code === 0) relabelled.push(rule.dir);
+  }
+  if (!persistent && rules.length) warnings.push('semanage is missing (policycoreutils-python-utils): the labels were set with chcon and will not survive a relabel');
+  return { mode, applied: true, persistent, booleans, rules: added, relabelled, warnings };
+}
+
 // ----------------------------------------------------------------- detect ---
 
 defineOp('web.detect', {
@@ -680,6 +755,7 @@ defineOp('web.detect', {
       dovecot: dovecot ? { ...dovecot, unit: await unitState(await firstUnit(dovecot.units)) } : { installed: false },
       exim: exim ? { ...exim, unit: await unitState(await firstUnit(exim.units)) } : { installed: false },
       systemd: hasBinary('systemctl'), logrotate: hasBinary('logrotate'),
+      selinux: { mode: await selinuxMode(), semanage: hasBinary('semanage') },
     };
   },
 });
@@ -726,12 +802,14 @@ defineOp('web.vhost.write', {
     const file = ctx.assertAllowedPath(vhostFile(apache, v.domain), 'write');
     const link = vhostLink(apache, v.domain);
     if (link) ctx.assertAllowedPath(link, 'write');
-    ensureRootLogDir(logDir, passwdEntry(v.user)?.gid);
+    const owner = passwdEntry(v.user);
+    ensureRootLogDir(logDir, owner?.gid);
     if (v.ssl) { for (const f of [v.ssl.cert, v.ssl.key]) if (!exists(f)) throw new OpError('not_found', `Certificate file ${f} does not exist`); }
+    const selinux = await ensureSelinuxWebAccess({ home: owner?.home || null, docroot: v.docroot, logDir });
     const content = renderVhost({ ...v, logDir, appsDir: path.join(apache.root, 'whm-apps') });
     const written = await writeApacheFile(apache, file, content, { link });
     const reload = v.reload ? await reloadUnit(apache.units) : { reloaded: false, unit: null };
-    return { domain: v.domain, ...written, link, logDir, bytes: Buffer.byteLength(content), ssl: Boolean(v.ssl && v.sslPort), bind: v.bind ?? null, phpVersion: v.phpVersion ?? null, ...reload };
+    return { domain: v.domain, ...written, link, logDir, bytes: Buffer.byteLength(content), ssl: Boolean(v.ssl && v.sslPort), bind: v.bind ?? null, phpVersion: v.phpVersion ?? null, selinux, ...reload };
   },
 });
 
@@ -916,8 +994,11 @@ defineOp('web.module.enable', {
 // moving them (e.g. to 127.0.0.1:8080 behind an nginx proxy) rewrites those
 // lines only. A bind address pins every listener to it; a null https releases
 // 443 so the proxy can terminate TLS.
+const LISTEN_LINE = /^\s*Listen\s+/;
+const commentListen = (lines) => lines.map((l) => (LISTEN_LINE.test(l) ? `#${l.replace(/^#+/, '')}` : l));
+
 export function rewriteListen(text, { http, https, bind = null }) {
-  const lines = (text || '').split('\n').filter((l) => !l.startsWith(MANAGED)).map((l) => (/^\s*Listen\s+/.test(l) ? `#${l.replace(/^#+/, '')}` : l));
+  const lines = commentListen((text || '').split('\n').filter((l) => !l.startsWith(MANAGED)));
   while (lines.length && lines[lines.length - 1] === '') lines.pop();
   const addr = (port) => (bind ? listenAddr(bind, port) : String(port));
   lines.push(`${MANAGED} (Apache ports${bind ? `, bound to ${bind}` : ''})`, `Listen ${addr(http)}`);
@@ -925,18 +1006,34 @@ export function rewriteListen(text, { http, https, bind = null }) {
   return `${lines.join('\n')}\n`;
 }
 
+// On the RHEL family mod_ssl's conf.d/ssl.conf opens with `Listen 443 https`
+// (Listen is server-wide, so a drop-in can bind a port no matter what
+// httpd.conf says); every such drop-in is silenced with the same comment pass.
+export function listenDropIns(dir) {
+  let files = [];
+  try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.conf')).sort(); } catch { return []; }
+  return files.map((f) => path.join(dir, f)).filter((file) => (readText(file) || '').split('\n').some((l) => LISTEN_LINE.test(l)));
+}
+
+export async function applyListen(apache, { http, https, bind = null }, ctx) {
+  const file = ctx.assertAllowedPath(path.join(apache.root, apache.flavor === 'debian' ? 'ports.conf' : 'conf/httpd.conf'), 'write');
+  const dropIns = apache.flavor === 'rhel' && apache.confD ? listenDropIns(apache.confD).filter((f) => f !== file).map((f) => ctx.assertAllowedPath(f, 'write')) : [];
+  const previous = [file, ...dropIns].map((f) => ({ file: f, content: readText(f) }));
+  writeAtomic(file, rewriteListen(previous[0].content, { http, https, bind }));
+  for (const { file: f, content } of previous.slice(1)) writeAtomic(f, commentListen(content.split('\n')).join('\n'));
+  const test = await configtest(apache);
+  if (test.ok === false) { restoreAll(previous); throw new OpError('config_invalid', `Apache rejected the new ports; the previous file${previous.length > 1 ? 's were' : ' was'} restored: ${lastLine(test.output)}`, { output: test.output }); }
+  return { path: file, dropIns, http, https, bind, validated: test.ok };
+}
+
 defineOp('web.ports.set', {
-  description: 'Change the ports (and optionally the bind address) Apache listens on (ports.conf / httpd.conf Listen lines), validate (rolled back on error) and restart',
+  description: 'Change the ports (and optionally the bind address) Apache listens on (ports.conf / httpd.conf Listen lines, plus any conf.d drop-in such as mod_ssl\'s ssl.conf), validate (rolled back on error) and restart',
   destructive: true,
   schema: z.object({ http: z.number().int().min(1).max(65535), https: z.number().int().min(1).max(65535).nullable().default(443), bind: arg.ip.nullable().default(null) }).strict(),
   run: async ({ http: httpPort, https: httpsPort, bind }, ctx) => {
     const apache = requireApache();
-    const file = ctx.assertAllowedPath(apache.flavor === 'debian' ? '/etc/apache2/ports.conf' : '/etc/httpd/conf/httpd.conf', 'write');
-    const previous = readText(file);
-    writeAtomic(file, rewriteListen(previous, { http: httpPort, https: httpsPort, bind }));
-    const test = await configtest(apache);
-    if (test.ok === false) { restore(file, previous); throw new OpError('config_invalid', `Apache rejected the new ports; the previous file was restored: ${lastLine(test.output)}`, { output: test.output }); }
-    return { path: file, http: httpPort, https: httpsPort, bind, validated: test.ok, ...(await reloadUnit(apache.units, 'restart')) };
+    const written = await applyListen(apache, { http: httpPort, https: httpsPort, bind }, ctx);
+    return { ...written, ...(await reloadUnit(apache.units, 'restart')) };
   },
 });
 
@@ -958,6 +1055,7 @@ defineOp('web.phpfpm.pool.write', {
     const file = ctx.assertAllowedPath(path.join(tree.poolDir, `whm-${p.user}.conf`), 'write');
     const socket = phpSocket(p.version, p.user);
     const content = renderPhpPool(p, { listenOwner: tree.listenOwner, socket, homeDir: user.home });
+    const selinux = await ensureSelinuxWebAccess({ home: user.home, tmpDir: p.tmpDir || null, errorLog: p.errorLog || null });
     const previous = readText(file);
     writeAtomic(file, content);
     let validated = null;
@@ -967,7 +1065,7 @@ defineOp('web.phpfpm.pool.write', {
       if (!validated) { restore(file, previous); throw new OpError('config_invalid', `PHP-FPM rejected the pool; the previous file was restored: ${lastLine(stderr || stdout)}`, { output: `${stdout}${stderr}`.trim() }); }
     }
     const reload = p.reload ? await reloadUnit(tree.units) : { reloaded: false, unit: null };
-    return { user: p.user, version: p.version, path: file, socket, validated, bytes: Buffer.byteLength(content), ...reload };
+    return { user: p.user, version: p.version, path: file, socket, validated, bytes: Buffer.byteLength(content), selinux, ...reload };
   },
 });
 

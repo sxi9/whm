@@ -64,6 +64,20 @@ describe('bundled plugin: Automated Backup installs at boot', () => {
     await r.get(`/api/plugins/${AB}/runs`).expect(403);
   });
 
+  it('a job started from a plugin route is owned by the request principal, so a reseller can follow it', async () => {
+    const reseller = await app.createUser('resell1', 'reseller');
+    await post('/api/accounts', { username: 'racct1', domain: 'racct1.com', owner: 'resell1' }).expect(201);
+    app.agent.set('web.wp.discover', () => ({ installs: [] }));
+    const r = (await import('supertest')).default.agent(app.ctx.app);
+    const login = await r.post('/api/auth/login').send({ username: reseller.username, password: reseller.password }).expect(200);
+    const res = await r.post('/api/plugins/net.whm.wp-toolkit/discover').set('X-CSRF-Token', login.body.data.csrfToken).send({ background: true }).expect(202);
+    const id = Number(res.body.data.jobId);
+    expect(app.ctx.jobs.get(id)).toMatchObject({ type: 'plugin:net.whm.wp-toolkit:discover', created_by: reseller.id, params: { trigger: 'manual', params: { usernames: ['racct1'] } } });
+    expect((await r.get(`/api/system/jobs/${id}`).expect(200)).body.data).toMatchObject({ id, created_by: reseller.id });
+    expect((await r.get('/api/system/jobs').expect(200)).body.data.map((j) => j.id)).toContain(id);
+    expect((await waitForJob(app.ctx, id, 15_000)).status).toBe('done');
+  }, 30_000);
+
   it('a run job on the real host records warnings for unknown accounts and destinations and leaves no locks', async () => {
     await put(`/api/plugins/manage/${AB}/settings`, { scope: 'accounts', accounts: 'ghost', destinations: 'nope' }).expect(200);
     const res = await post(`/api/plugins/manage/${AB}/jobs/run`, { params: { source: 'manual' } }).expect(202);

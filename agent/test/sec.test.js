@@ -2,9 +2,11 @@ import { describe, it, expect, vi } from 'vitest';
 import { exec } from '../src/exec.js';
 import { runOp, createContext, OpError } from '../src/lib.js';
 import fs from 'node:fs';
+import path from 'node:path';
 import {
   renderHostsAllow, hostSourceForm, hostsDenyManaged, accessMode, archiveFormat, parseDistroCrsInclude, parseSshdConfig, sshdShadowed, parseAuthorizedKeys, parsePublicKeyLine, fingerprintOf, renderForkBombConf, parseForkBombConf,
   parseIptablesRules, parseNftChain, parseModsecDirectives, parseModsecRules, parseModsecErrorLog, renderUserdirConf, parseUserdirConf, firewallBackend, privateTempDir,
+  semanagePorts, selinuxPortLabelled, parseListeningPorts, findLibwrap, domlogErrorLogs, modsecHitTime, collectModsecHits, sanitizeExtractedTree, extractArchive, FORKBOMB_MEMORY_FLOOR_MB,
 } from '../src/ops/sec.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
@@ -76,6 +78,13 @@ describe('sec op schemas reject injection and traversal before anything runs', (
     expect((await opError(runOp('sec.fork_bomb.set', { enabled: true, maxProcesses: -1 }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('sec.fork_bomb.set', { enabled: true, excludeGroups: ['wheel sudo'] }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('sec.fork_bomb.set', { enabled: true, excludeGroups: ['-r'] }, ctx))).code).toBe('invalid_args');
+    // A hard RLIMIT_AS of a few hundred MB aborts node/java/go in every account
+    // shell and cron job, so the memory cap is refused below the runtime floor.
+    for (const maxMemoryMb of [16, 512, 1024, FORKBOMB_MEMORY_FLOOR_MB - 1]) {
+      const err = await opError(runOp('sec.fork_bomb.set', { enabled: true, maxMemoryMb }, ctx));
+      expect(err.code, String(maxMemoryMb)).toBe('invalid_args');
+      expect(err.details.fields.maxMemoryMb[0]).toMatch(/Node\.js, Java and Go/);
+    }
     expect(exec).not.toHaveBeenCalled();
   });
 
@@ -263,13 +272,151 @@ describe('pure renderers and parsers', () => {
     expect(parsePublicKeyLine('ssh-rsa not-base64!!')).toBeNull();
   });
 
-  it('fork bomb conf round-trips', () => {
-    const text = renderForkBombConf({ maxProcesses: 40, maxOpenFiles: 200, maxMemoryMb: 300, excludeGroups: ['wheel'] });
+  it('fork bomb conf round-trips and carries no virtual-memory cap unless one is asked for', () => {
+    const text = renderForkBombConf({ maxProcesses: 40, maxOpenFiles: 200, excludeGroups: ['wheel'] });
     expect(text).toContain('*          hard    nproc     40');
-    expect(text).toContain('*          hard    as        307200');
+    expect(text).toContain('*          hard    nofile    200');
     expect(text).toContain('@wheel     hard    nproc     unlimited');
-    expect(parseForkBombConf(text)).toEqual({ enabled: true, maxProcesses: 40, maxOpenFiles: 200, maxMemoryMb: 300, excludeGroups: ['wheel'] });
-    expect(parseForkBombConf(null).enabled).toBe(false);
+    expect(text).toContain('root       hard    nofile    unlimited');
+    expect(text).not.toMatch(/\bas\b/);
+    expect(parseForkBombConf(text)).toEqual({ enabled: true, maxProcesses: 40, maxOpenFiles: 200, excludeGroups: ['wheel'] });
+    const capped = renderForkBombConf({ maxProcesses: 40, maxOpenFiles: 200, maxMemoryMb: 4096, excludeGroups: ['wheel'] });
+    expect(capped).toContain('*          hard    as        4194304');
+    expect(capped).toContain('@wheel     hard    as        unlimited');
+    expect(parseForkBombConf(capped)).toEqual({ enabled: true, maxProcesses: 40, maxOpenFiles: 200, maxMemoryMb: 4096, excludeGroups: ['wheel'] });
+    // A file written before the cap became opt-in still reports its limit so the
+    // page can warn about it.
+    expect(parseForkBombConf('*          hard    nproc     35\n*          hard    as        524288\n').maxMemoryMb).toBe(512);
+    expect(parseForkBombConf(null)).toEqual({ enabled: false, maxProcesses: 35, maxOpenFiles: 1024, excludeGroups: ['wheel', 'sudo'] });
+  });
+
+  it('sshd port helpers: semanage port listings and ss listeners', () => {
+    const semanage = 'SELinux Port Type               Proto    Port Number\n\nhttp_port_t                    tcp      80, 81, 443, 488, 8008, 8009, 8443, 9000\nssh_port_t                     tcp      22\nsyslogd_port_t                 udp      514, 601, 20514\nunreserved_port_t              tcp      61001-65535\n';
+    expect(semanagePorts(semanage)).toEqual([{ from: 22, to: 22 }]);
+    expect(semanagePorts(semanage, 'http_port_t').map((r) => r.from)).toEqual([80, 81, 443, 488, 8008, 8009, 8443, 9000]);
+    expect(selinuxPortLabelled(semanage, 22)).toBe(true);
+    expect(selinuxPortLabelled(semanage, 2222)).toBe(false);
+    expect(selinuxPortLabelled(semanage.replace('tcp      22', 'tcp      22, 2222'), 2222)).toBe(true);
+    expect(selinuxPortLabelled(semanage, 62000, 'unreserved_port_t')).toBe(true);
+    expect(selinuxPortLabelled('', 22)).toBe(false);
+    const ss = 'State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process\nLISTEN 0      4096       127.0.0.54:53        0.0.0.0:*\nLISTEN 0      128           0.0.0.0:2222      0.0.0.0:*    users:(("sshd",pid=1,fd=3))\nLISTEN 0      128              [::]:2222         [::]:*\nLISTEN 0      511                 *:443              *:*\n';
+    expect([...parseListeningPorts(ss)].sort((a, b) => a - b)).toEqual([53, 443, 2222]);
+    expect(parseListeningPorts('').size).toBe(0);
+  });
+
+  it('hosts.allow support comes from libwrap, never from the files the panel itself writes', async () => {
+    const base = fs.mkdtempSync('/tmp/whm/sec-libwrap-');
+    try {
+      // AlmaLinux 9 after a first save: hosts.allow/hosts.deny exist, no library.
+      fs.writeFileSync(path.join(base, 'hosts.allow'), 'sshd: 203.0.113.0/24: DENY\n');
+      fs.mkdirSync(path.join(base, 'lib64'));
+      expect(findLibwrap([path.join(base, 'lib'), path.join(base, 'lib64')])).toBeNull();
+      // aarch64 Debian/Ubuntu keep it under a multiarch triplet.
+      fs.mkdirSync(path.join(base, 'lib', 'aarch64-linux-gnu'), { recursive: true });
+      fs.writeFileSync(path.join(base, 'lib', 'aarch64-linux-gnu', 'libwrap.so.0'), '');
+      expect(findLibwrap([path.join(base, 'lib'), path.join(base, 'lib64')])).toBe(path.join(base, 'lib', 'aarch64-linux-gnu', 'libwrap.so.0'));
+      fs.writeFileSync(path.join(base, 'lib64', 'libwrap.so.0'), '');
+      expect(findLibwrap([path.join(base, 'lib64')])).toBe(path.join(base, 'lib64', 'libwrap.so.0'));
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+    const read = await runOp('sec.hosts_allow.read', {}, ctx);
+    expect(read.supported).toBe(findLibwrap() !== null);
+    expect(read.library).toBe(findLibwrap());
+    expect([true, false, null]).toContain(read.daemons.sshd);
+  });
+
+  it('modsec hits merge the global error log with every vhost error log, newest first', () => {
+    const line = (ts, host, id) => `[${ts}] [:error] [pid 12] [client 203.0.113.5:4444] ModSecurity: Access denied with code 403 (phase 2). Pattern match "x" at ARGS:q. [file "/x.conf"] [line "1"] [id "${id}"] [msg "XSS"] [severity "CRITICAL"] [hostname "${host}"] [uri "/"] [unique_id "${host}-${id}"]\n`;
+    const base = fs.mkdtempSync('/tmp/whm/sec-domlogs-');
+    try {
+      const root = path.join(base, 'domlogs');
+      fs.mkdirSync(path.join(root, 'alice'), { recursive: true });
+      fs.mkdirSync(path.join(root, 'bob'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'alice', 'example.com-error.log'), `${line('Wed Oct 25 10:00:02.000000 2026', 'example.com', 941100)}[Wed Oct 25 10:00:03 2026] [core:notice] unrelated\n`);
+      fs.writeFileSync(path.join(root, 'alice', 'example.com-ssl-error.log'), line('Wed Oct 25 10:00:04.000000 2026', 'example.com', 942100));
+      fs.writeFileSync(path.join(root, 'alice', 'example.com-access.log'), 'GET / 200\n');
+      fs.writeFileSync(path.join(root, 'alice', 'example.com-error.log.1'), line('Wed Oct 25 09:00:00.000000 2026', 'example.com', 1));
+      fs.writeFileSync(path.join(root, 'bob', 'notes.txt'), 'x');
+      fs.symlinkSync('/etc/passwd', path.join(root, 'bob', 'evil.tld-error.log'));
+      fs.symlinkSync('/etc', path.join(root, 'mallory'));
+      const logs = domlogErrorLogs(root);
+      expect(logs.map((l) => [l.user, l.domain, l.ssl]).sort()).toEqual([['alice', 'example.com', false], ['alice', 'example.com', true]]);
+      expect(domlogErrorLogs(path.join(base, 'missing'))).toEqual([]);
+      const global = path.join(base, 'error.log');
+      fs.writeFileSync(global, line('Wed Oct 25 10:00:01.000000 2026', '203.0.113.9', 920350));
+      const { files, total, hits } = collectModsecHits([{ file: global, user: null, domain: null }, ...logs, { file: path.join(base, 'absent.log'), user: 'carol', domain: 'gone.tld' }], { maxBytes: 4096, limit: 2 });
+      expect(files.map((f) => f.readable)).toEqual([true, true, true, false]);
+      expect(total).toBe(3);
+      expect(hits.map((h) => [h.id, h.log, h.user, h.domain])).toEqual([
+        [942100, path.join(root, 'alice', 'example.com-ssl-error.log'), 'alice', 'example.com'],
+        [941100, path.join(root, 'alice', 'example.com-error.log'), 'alice', 'example.com'],
+      ]);
+      expect(hits[0]).not.toHaveProperty('time');
+      expect(hits[0].action).toMatch(/^Access denied/);
+      expect(modsecHitTime('Wed Oct 25 10:00:02.123456 2026')).toBe(Date.UTC(2026, 9, 25, 10, 0, 2, 123));
+      expect(modsecHitTime('Wed Oct  5 10:00:02 2026')).toBe(Date.UTC(2026, 9, 5, 10, 0, 2));
+      expect(modsecHitTime('garbage')).toBe(0);
+      expect(modsecHitTime(null)).toBe(0);
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  });
+
+  it('vendor archives are unpacked without archive-supplied modes, symlinks, fifos or device nodes', async () => {
+    const { exec: realExec } = await vi.importActual('../src/exec.js');
+    const base = fs.mkdtempSync('/tmp/whm/sec-vendor-');
+    const inspect = (staging) => {
+      const out = {};
+      const walk = (dir, rel) => { for (const name of fs.readdirSync(dir)) { const p = path.join(dir, name); const st = fs.lstatSync(p); out[path.posix.join(rel, name)] = `${st.isDirectory() ? 'd' : st.isFile() ? 'f' : st.isSymbolicLink() ? 'l' : 'x'}${(st.mode & 0o7777).toString(8)}`; if (st.isDirectory()) walk(p, path.posix.join(rel, name)); } };
+      walk(staging, '');
+      return out;
+    };
+    try {
+      const src = path.join(base, 'src');
+      fs.mkdirSync(path.join(src, 'rules'), { recursive: true });
+      fs.writeFileSync(path.join(src, 'rules', 'a.conf'), 'SecRule ARGS "x" "id:1,phase:2,deny"\n', { mode: 0o666 });
+      fs.writeFileSync(path.join(src, 'crs-setup.conf.example'), '# setup\n', { mode: 0o4755 });
+      fs.symlinkSync('/etc/shadow', path.join(src, 'rules', 'shadow.conf'));
+      fs.symlinkSync('/', path.join(src, 'rootlink'));
+      await realExec('mkfifo', [path.join(src, 'rules', 'pipe')]);
+      const device = (await realExec('mknod', [path.join(src, 'rules', 'sda'), 'b', '8', '0'], { allowFailure: true })).code === 0;
+      fs.chmodSync(path.join(src, 'rules'), 0o777);
+      const tgz = path.join(base, 'vendor.tgz');
+      await realExec('tar', ['-czf', tgz, '-C', base, 'src']);
+      const staging = path.join(base, 'staging');
+      fs.mkdirSync(staging, { mode: 0o755 });
+      const { format, removed } = await extractArchive(tgz, staging);
+      expect(format).toBe('tar.gz');
+      expect(removed.map((p) => path.relative(staging, p)).sort()).toEqual(['rootlink', 'rules/pipe', ...(device ? ['rules/sda'] : []), 'rules/shadow.conf']);
+      expect(inspect(staging)).toEqual({ 'crs-setup.conf.example': 'f644', rules: 'd755', 'rules/a.conf': 'f644' });
+      expect(fs.readFileSync(path.join(staging, 'rules', 'a.conf'), 'utf8')).toContain('SecRule');
+      // A zip that unpacks to one top-level symlink must not have its target's entries moved into the staging tree.
+      const zipSrc = path.join(base, 'zipsrc');
+      fs.mkdirSync(zipSrc);
+      fs.symlinkSync('/etc', path.join(zipSrc, 'vendor-1.0'));
+      const zip = path.join(base, 'vendor.zip');
+      await realExec('zip', ['-q', '-y', '-r', zip, 'vendor-1.0'], { cwd: zipSrc });
+      const zipStaging = path.join(base, 'zipstaging');
+      fs.mkdirSync(zipStaging, { mode: 0o755 });
+      expect((await extractArchive(zip, zipStaging)).removed).toEqual([path.join(zipStaging, 'vendor-1.0')]);
+      expect(fs.readdirSync(zipStaging)).toEqual([]);
+      expect(fs.existsSync('/etc/passwd')).toBe(true);
+      // And a regular single-directory zip is flattened with its modes reset.
+      const zipSrc2 = path.join(base, 'zipsrc2');
+      fs.mkdirSync(path.join(zipSrc2, 'vendor-1.0', 'rules'), { recursive: true });
+      fs.writeFileSync(path.join(zipSrc2, 'vendor-1.0', 'rules', 'b.conf'), 'SecAction "id:2,phase:1,pass"\n', { mode: 0o777 });
+      fs.symlinkSync('/etc/shadow', path.join(zipSrc2, 'vendor-1.0', 'rules', 'c.conf'));
+      const zip2 = path.join(base, 'vendor2.zip');
+      await realExec('zip', ['-q', '-y', '-r', zip2, 'vendor-1.0'], { cwd: zipSrc2 });
+      const zipStaging2 = path.join(base, 'zipstaging2');
+      fs.mkdirSync(zipStaging2, { mode: 0o755 });
+      expect((await extractArchive(zip2, zipStaging2)).removed).toEqual([path.join(zipStaging2, 'vendor-1.0', 'rules', 'c.conf')]);
+      expect(inspect(zipStaging2)).toEqual({ rules: 'd755', 'rules/b.conf': 'f644' });
+      // sanitizeExtractedTree on its own resets a tree in place.
+      const loose = path.join(base, 'loose');
+      fs.mkdirSync(path.join(loose, 'd'), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(loose, 'd', 'f'), 'x', { mode: 0o600 });
+      fs.symlinkSync('/etc/passwd', path.join(loose, 'd', 'l'));
+      expect(sanitizeExtractedTree(loose)).toEqual([path.join(loose, 'd', 'l')]);
+      expect(inspect(loose)).toEqual({ d: 'd755', 'd/f': 'f644' });
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
 
   it('parses iptables -S and nft -j output', () => {

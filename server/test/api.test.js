@@ -7,7 +7,10 @@ import { authenticator } from 'otplib';
 import { catalog } from '@whm/agent';
 import { bootstrap } from '../src/index.js';
 import { AgentError } from '../src/lib/agent-client.js';
-import { CAPABILITY_PATHS } from '../src/lib/capabilities.js';
+import Database from 'better-sqlite3';
+import { CAPABILITY_PATHS, resolveUnit } from '../src/lib/capabilities.js';
+import { migrate } from '../src/db/index.js';
+import { seed, SERVICE_REGISTRY } from '../src/db/seed.js';
 
 const ADMIN_PASSWORD = 'Test-Passw0rd!1';
 const RESELLER_PASSWORD = 'Reseller-Pass1!';
@@ -115,6 +118,65 @@ describe('bootstrap', () => {
     expect(ctx.capabilities.unitFor('httpd')).toBeNull();
   });
 
+  it('resolves a versioned PHP-FPM unit through the php*-fpm candidate and prefers the newest', async () => {
+    // Debian 13 / Ubuntu 25.04+: the unit is php8.4-fpm, a name no stored list knew.
+    agent.set('svc.list_units', () => ['apache2', 'php8.4-fpm']);
+    await ctx.capabilities.refresh();
+    expect(ctx.capabilities.unitFor('php-fpm')).toBe('php8.4-fpm');
+    expect(ctx.capabilities.unitFor('httpd')).toBe('apache2');
+    // several co-installed versions: the newest, compared numerically (8.10 after 8.4)
+    agent.set('svc.list_units', () => ['php8.1-fpm', 'php8.10-fpm', 'php8.4-fpm']);
+    await ctx.capabilities.refresh();
+    expect(ctx.capabilities.unitFor('php-fpm')).toBe('php8.10-fpm');
+    // the RHEL family's unversioned unit is listed first and wins when present
+    agent.set('svc.list_units', () => ['php8.4-fpm', 'php-fpm']);
+    await ctx.capabilities.refresh();
+    expect(ctx.capabilities.unitFor('php-fpm')).toBe('php-fpm');
+    // the glob is anchored and its punctuation is literal
+    expect(resolveUnit(['php*-fpm'], new Set(['php8.4-fpmd', 'xphp8.4-fpm', 'php8x4-fpm']))).toBe('php8x4-fpm');
+    expect(resolveUnit(['php*-fpm'], new Set(['php8.4-fpmd', 'xphp8.4-fpm']))).toBeNull();
+    agent.set('svc.list_units', () => []);
+    await ctx.capabilities.refresh();
+    expect(ctx.capabilities.unitFor('php-fpm')).toBeNull();
+  });
+
+  it('migration 001f gives an existing php-fpm row the php*-fpm candidate and leaves rows that have it alone', () => {
+    const db = new Database(':memory:');
+    migrate(db);
+    const candidates = () => JSON.parse(db.prepare("SELECT unit_candidates FROM services WHERE name = 'php-fpm'").get().unit_candidates);
+    const rerun = () => { db.prepare("DELETE FROM schema_migrations WHERE name = '001f_init-php-fpm-units.sql'").run(); migrate(db); };
+    db.prepare("INSERT INTO services (name, display_name, unit_candidates, position) VALUES ('php-fpm', 'PHP-FPM service for Apache', ?, 70)")
+      .run(JSON.stringify(['php-fpm', 'php8.3-fpm', 'php8.2-fpm', 'php8.1-fpm']));
+    rerun();
+    expect(candidates()).toEqual(['php-fpm', 'php*-fpm']);
+    db.prepare("UPDATE services SET unit_candidates = ? WHERE name = 'php-fpm'").run(JSON.stringify(['php-fpm', 'php*-fpm', 'custom-fpm']));
+    rerun();
+    expect(candidates()).toEqual(['php-fpm', 'php*-fpm', 'custom-fpm']);
+    db.close();
+  });
+
+  it('seed() refreshes the registry-owned columns of an existing services row and keeps the operator toggles', async () => {
+    const db = new Database(':memory:');
+    migrate(db);
+    const deps = { config: { adminPassword: 'Seed-Passw0rd!1', dataDir: tmp }, crypto: { hashPassword: async () => 'hash', randomPassword: () => 'x' }, logger: { info() {}, warn() {} } };
+    await seed({ db, ...deps });
+    // A database created before php8.4-fpm existed, on a host whose operator
+    // switched the row off: the next boot must bring the unit list up to date
+    // without touching what the operator set.
+    db.prepare("UPDATE services SET unit_candidates = ?, display_name = 'old name', position = 1, monitored = 0, enabled = 0, restart_on_failure = 0 WHERE name = 'php-fpm'")
+      .run(JSON.stringify(['php-fpm', 'php8.3-fpm', 'php8.2-fpm', 'php8.1-fpm']));
+    await seed({ db, ...deps });
+    const row = db.prepare("SELECT * FROM services WHERE name = 'php-fpm'").get();
+    const registry = SERVICE_REGISTRY.find((s) => s.name === 'php-fpm');
+    expect(JSON.parse(row.unit_candidates)).toEqual(registry.units);
+    expect(row.display_name).toBe(registry.display_name);
+    expect(row.position).toBe(registry.position);
+    expect([row.monitored, row.enabled, row.restart_on_failure]).toEqual([0, 0, 0]);
+    expect(db.prepare('SELECT COUNT(*) AS n FROM services').get().n).toBe(SERVICE_REGISTRY.length);
+    expect(db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'root'").get().n).toBe(1);
+    db.close();
+  });
+
   it('detects ModSecurity by the files its package installs, since the module ships no program', async () => {
     expect(ctx.capabilities.snapshot().capabilities.modsecurity).toEqual({ installed: false, binaries: {}, paths: Object.fromEntries(CAPABILITY_PATHS.modsecurity.map((p) => [p, false])) });
     agent.set('fs.stat', ({ path: p }) => ({ path: p, exists: p === '/etc/httpd/conf.d/mod_security.conf', isDirectory: false }));
@@ -189,7 +251,9 @@ describe('login', () => {
     expect(res.body.data.requires2fa).toBeUndefined();
     expect(typeof res.body.data.csrfToken).toBe('string');
     expect(res.headers['set-cookie'].join(';')).toMatch(/whm\.sid=.*HttpOnly/);
-    expect(res.headers['set-cookie'].join(';')).toMatch(/SameSite=Strict/);
+    // Lax so the OpenID Connect callback, a navigation from the provider's site, still carries it.
+    expect(res.headers['set-cookie'].join(';')).toMatch(/SameSite=Lax/);
+    expect(res.headers['set-cookie'].join(';')).not.toMatch(/Secure/);
     csrf = res.body.data.csrfToken;
   });
 
@@ -411,14 +475,32 @@ describe('accounts', () => {
     expect(res.body.data.domains).toEqual([expect.objectContaining({ domain: 'web01.example.com', type: 'main', docroot: '/home/web01/public_html' })]);
     expect(res.body.data.provisioning.systemUser).toBe(true);
 
-    expect(agent.names()).toEqual(['user.create', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.write_file', 'user.set_password']);
+    // The web server's run user is probed (www-data, then apache); this host has neither, so public_html keeps the account's group.
+    expect(agent.names()).toEqual(['user.create', 'user.get', 'user.get', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.write_file', 'user.set_password']);
     expect(agent.calls[0].args).toEqual({ username: 'web01', homeDir: '/home/web01', shell: '/usr/sbin/nologin', comment: 'WHM account web01.example.com' });
-    expect(agent.calls.slice(1, 7).map((c) => c.args.path)).toEqual(['public_html', 'mail', 'etc', 'tmp', 'logs', 'ssl'].map((s) => `/home/web01/${s}`));
-    expect(agent.calls.slice(1, 7).map((c) => c.args.mode)).toEqual(['0750', '0700', '0700', '0700', '0700', '0700']);
-    expect(agent.calls.slice(1, 7).every((c) => c.args.owner === 'web01')).toBe(true);
-    expect(agent.calls[7].args).toMatchObject({ path: '/home/web01/public_html/index.html', owner: 'web01', mode: '0644', backup: false });
-    expect(agent.calls[7].args.content).toContain('web01.example.com');
-    expect(agent.calls[8].args).toEqual({ username: 'web01', password: ACCOUNT_PASSWORD });
+    expect(agent.calls.slice(1, 3).map((c) => c.args)).toEqual([{ username: 'www-data' }, { username: 'apache' }]);
+    expect(agent.calls.slice(3, 9).map((c) => c.args.path)).toEqual(['public_html', 'mail', 'etc', 'tmp', 'logs', 'ssl'].map((s) => `/home/web01/${s}`));
+    expect(agent.calls.slice(3, 9).map((c) => c.args.mode)).toEqual(['0750', '0700', '0700', '0700', '0700', '0700']);
+    expect(agent.calls.slice(3, 9).every((c) => c.args.owner === 'web01' && c.args.group === undefined)).toBe(true);
+    expect(agent.calls[9].args).toMatchObject({ path: '/home/web01/public_html/index.html', owner: 'web01', mode: '0644', backup: false });
+    expect(agent.calls[9].args.content).toContain('web01.example.com');
+    expect(agent.calls[10].args).toEqual({ username: 'web01', password: ACCOUNT_PASSWORD });
+  });
+
+  it('gives public_html the web server group so Apache can read the document root', async () => {
+    agent.reset();
+    agent.set('user.get', ({ username }) => (username === 'www-data' ? { username, uid: 33, gid: 33, home: '/var/www', shell: '/usr/sbin/nologin' } : null));
+    try {
+      const res = await mutate(root, 'post', '/api/accounts', { username: 'webgrp', domain: 'webgrp.example.com' }, csrf);
+      expect(res.status).toBe(201);
+      expect(agent.names().filter((n) => n === 'user.get')).toHaveLength(1);
+      const mkdirs = agent.calls.filter((c) => c.name === 'fs.mkdir');
+      expect(mkdirs[0].args).toEqual({ path: '/home/webgrp/public_html', owner: 'webgrp', group: 'www-data', mode: '0750' });
+      expect(mkdirs.slice(1).every((c) => c.args.group === undefined && c.args.mode === '0700')).toBe(true);
+    } finally {
+      agent.set('user.get', undefined);
+      await mutate(root, 'delete', '/api/accounts/webgrp', undefined, csrf);
+    }
   });
 
   it('skips the password op when no password is given', async () => {
@@ -534,8 +616,8 @@ describe('rollback', () => {
     const res = await mutate(root, 'post', '/api/accounts', { username: 'rollback1', domain: 'rollback1.example.com', password: ACCOUNT_PASSWORD }, csrf);
     expect(res.status).toBeGreaterThanOrEqual(400);
     expect(res.body.error.code).toBe('command_failed');
-    expect(agent.names()).toEqual(['user.create', 'fs.mkdir', 'user.delete']);
-    expect(agent.calls[2].args).toEqual({ username: 'rollback1', removeHome: true });
+    expect(agent.names()).toEqual(['user.create', 'user.get', 'user.get', 'fs.mkdir', 'user.delete']);
+    expect(agent.calls[4].args).toEqual({ username: 'rollback1', removeHome: true });
     expect(ctx.db.prepare('SELECT 1 FROM accounts WHERE username = ?').get('rollback1')).toBeUndefined();
     expect(ctx.db.prepare('SELECT 1 FROM account_domains WHERE domain = ?').get('rollback1.example.com')).toBeUndefined();
     expect((await root.get('/api/accounts/rollback1')).status).toBe(404);

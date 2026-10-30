@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { z } from 'zod';
 import { exec, hasBinary, resolveBinary } from '../exec.js';
 import { defineOp, arg, OpError, ensurePrivateDir } from './registry.js';
-import { apacheLayout, parseApacheVersion, parseModules } from './web.js';
+import { apacheLayout, parseApacheVersion, parseModules, selinuxMode, ensureSelinuxWebAccess } from './web.js';
 
 // Application Manager: Node.js, Python and static applications. A server
 // application runs as its account user from a systemd unit bound to
@@ -207,7 +207,8 @@ defineOp('app.runtime.detect', {
     }
     python.sort(byVersionDesc);
     const git = hasBinary('git') ? { installed: true, version: await versionOf('git', /git version (\d+(?:\.\d+)+)/) } : { installed: false, version: null };
-    return { node, python, git, arch: process.arch, runtimesRoot: runtimesRoot(), runuser: hasBinary('runuser'), systemd: hasBinary('systemctl'), acl: hasBinary('setfacl') };
+    const selinux = await selinuxMode();
+    return { node, python, git, arch: process.arch, runtimesRoot: runtimesRoot(), runuser: hasBinary('runuser'), systemd: hasBinary('systemctl'), acl: hasBinary('setfacl'), selinux: { mode: selinux, enforcing: selinux === 'enforcing', semanage: hasBinary('semanage') } };
   },
 });
 
@@ -809,7 +810,10 @@ export function renderAppsInclude(domain, apps, { apacheVersion = null, docroot 
     const base = trimBase(a.basePath);
     lines.push('', `# Application ${a.id}: static files for ${base || '/'}`);
     lines.push(base ? `Alias ${q(base)} ${q(a.staticDir)}` : `DocumentRoot ${q(a.staticDir)}`);
-    lines.push(`<Directory ${q(a.staticDir)}>`, '  Options -Indexes +FollowSymLinks', '  AllowOverride None', '  Require all granted');
+    // Never FollowSymLinks: the web server reads other accounts' 0644 files,
+    // so a link the account plants in its build output must not be followed
+    // unless the target is the account's own.
+    lines.push(`<Directory ${q(a.staticDir)}>`, '  Options -Indexes +SymLinksIfOwnerMatch', '  AllowOverride None', '  Require all granted');
     if (a.spaFallback) lines.push(`  FallbackResource ${q(`${base}/index.html`)}`);
     lines.push('</Directory>');
   }
@@ -852,47 +856,56 @@ const proxyApp = z.object({
   if (a.kind === 'static' && !a.staticDir) c.addIssue({ code: z.ZodIssueCode.custom, path: ['staticDir'], message: 'a static application needs its output directory' });
 });
 
+export async function publishApps({ domain, apps, reload = true, docroot = null }, apache, ctx) {
+  const dir = ctx.assertAllowedPath(path.join(apache.root, 'whm-apps'), 'write');
+  const file = ctx.assertAllowedPath(path.join(dir, `${domain}.conf`), 'write');
+  const previous = readText(file);
+  const none = { enabled: [], missing: [] };
+  if (!apps.length) {
+    if (previous == null) return { domain, path: file, apps: 0, removed: false, modules: none, reloaded: false };
+    fs.unlinkSync(file);
+    const test = await configtest(apache);
+    const r = reload ? await reloadApache(apache) : { reloaded: false, unit: null };
+    return { domain, path: file, apps: 0, removed: true, modules: none, reloaded: r.reloaded, unit: r.unit, validated: test.ok };
+  }
+  const info = await apacheInfo(apache);
+  const wanted = modulesFor(apps, info.version, { docroot });
+  let loaded = new Set(info.modules);
+  const toEnable = wanted.all.filter((m) => !loaded.has(m));
+  if (toEnable.length && apache.flavor === 'debian' && apache.a2tools) {
+    for (const m of toEnable) await exec('a2enmod', ['-q', m], { allowFailure: true, timeoutMs: 60_000 });
+    loaded = new Set((await apacheInfo(apache)).modules);
+  }
+  const enabled = wanted.all.filter((m) => loaded.has(m));
+  const missing = wanted.all.filter((m) => !loaded.has(m));
+  const requiredMissing = wanted.required.filter((m) => !loaded.has(m));
+  if (requiredMissing.length) throw new OpError('capability_missing', `Apache modules required by these applications are not loaded: ${requiredMissing.join(', ')}`, { missing, enabled });
+  const content = renderAppsInclude(domain, apps, { apacheVersion: info.version, docroot });
+  ensureRootDir(dir);
+  writeRootFile(file, content, 0o644);
+  const test = await configtest(apache);
+  if (!test.ok) {
+    if (previous == null) fs.unlinkSync(file); else fs.writeFileSync(file, previous);
+    throw new OpError('config_invalid', `Apache rejected the application include; the previous file was restored: ${lastLine(test.output)}`, { output: test.output, path: file });
+  }
+  // With SELinux enforcing (RHEL family) httpd_t may neither connect to the
+  // application's loopback port (httpd_can_network_connect) nor read a build
+  // output under the account home (httpd_enable_homedirs +
+  // httpd_read_user_content) until the booleans are on: the include would be
+  // valid and the site dead with 503/403.
+  const selinux = await ensureSelinuxWebAccess({});
+  const r = reload ? await reloadApache(apache) : { reloaded: false, unit: null };
+  return { domain, path: file, apps: apps.length, removed: false, modules: { enabled, missing }, reloaded: r.reloaded, unit: r.unit, validated: test.ok, apacheVersion: info.version, selinux };
+}
+
 defineOp('app.proxy.write', {
-  description: 'Render <apache root>/whm-apps/<domain>.conf (proxy and static blocks for every application on the domain, /.well-known/acme-challenge kept on the document root for AutoSSL), ensure the Apache modules, configtest (rolled back on error) and reload; an empty list removes the file',
+  description: 'Render <apache root>/whm-apps/<domain>.conf (proxy and static blocks for every application on the domain, /.well-known/acme-challenge kept on the document root for AutoSSL), ensure the Apache modules, configtest (rolled back on error), switch the SELinux httpd booleans on where it is enforcing, and reload; an empty list removes the file',
   schema: z.object({ domain: arg.hostname, apps: z.array(proxyApp).max(20), reload: z.boolean().default(true), docroot: unitPath.optional() }).strict()
     .refine((v) => new Set(v.apps.map((a) => trimBase(a.basePath) || '/')).size === v.apps.length, { message: 'base paths must be unique per domain', path: ['apps'] }),
   run: async ({ domain, apps, reload, docroot }, ctx) => {
     for (const a of apps) if (a.kind === 'static') ctx.assertAllowedPath(a.staticDir, 'read');
     if (docroot) ctx.assertAllowedPath(docroot, 'read');
-    const apache = requireApache();
-    const dir = ctx.assertAllowedPath(path.join(apache.root, 'whm-apps'), 'write');
-    const file = ctx.assertAllowedPath(path.join(dir, `${domain}.conf`), 'write');
-    const previous = readText(file);
-    const none = { enabled: [], missing: [] };
-    if (!apps.length) {
-      if (previous == null) return { domain, path: file, apps: 0, removed: false, modules: none, reloaded: false };
-      fs.unlinkSync(file);
-      const test = await configtest(apache);
-      const r = reload ? await reloadApache(apache) : { reloaded: false, unit: null };
-      return { domain, path: file, apps: 0, removed: true, modules: none, reloaded: r.reloaded, unit: r.unit, validated: test.ok };
-    }
-    const info = await apacheInfo(apache);
-    const wanted = modulesFor(apps, info.version, { docroot });
-    let loaded = new Set(info.modules);
-    const toEnable = wanted.all.filter((m) => !loaded.has(m));
-    if (toEnable.length && apache.flavor === 'debian' && apache.a2tools) {
-      for (const m of toEnable) await exec('a2enmod', ['-q', m], { allowFailure: true, timeoutMs: 60_000 });
-      loaded = new Set((await apacheInfo(apache)).modules);
-    }
-    const enabled = wanted.all.filter((m) => loaded.has(m));
-    const missing = wanted.all.filter((m) => !loaded.has(m));
-    const requiredMissing = wanted.required.filter((m) => !loaded.has(m));
-    if (requiredMissing.length) throw new OpError('capability_missing', `Apache modules required by these applications are not loaded: ${requiredMissing.join(', ')}`, { missing, enabled });
-    const content = renderAppsInclude(domain, apps, { apacheVersion: info.version, docroot });
-    ensureRootDir(dir);
-    writeRootFile(file, content, 0o644);
-    const test = await configtest(apache);
-    if (!test.ok) {
-      if (previous == null) fs.unlinkSync(file); else fs.writeFileSync(file, previous);
-      throw new OpError('config_invalid', `Apache rejected the application include; the previous file was restored: ${lastLine(test.output)}`, { output: test.output, path: file });
-    }
-    const r = reload ? await reloadApache(apache) : { reloaded: false, unit: null };
-    return { domain, path: file, apps: apps.length, removed: false, modules: { enabled, missing }, reloaded: r.reloaded, unit: r.unit, validated: test.ok, apacheVersion: info.version };
+    return publishApps({ domain, apps, reload, docroot }, requireApache(), ctx);
   },
 });
 

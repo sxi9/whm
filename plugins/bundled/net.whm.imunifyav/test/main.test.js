@@ -80,9 +80,27 @@ test('no scanner at all answers 501 CAPABILITY_MISSING with the vendor instructi
   assert.equal(r.status, 501);
   assert.equal(r.body.error.code, 'CAPABILITY_MISSING');
   assert.ok(r.body.error.details.install.steps.length > 0);
-  const job = await h.runJob('clamscan', { force: true });
+  const job = await h.runJob('clamscan', { force: true, trigger: 'manual' });
   assert.equal(job.status, 'failed');
   assert.equal(job.error.code, 'CAPABILITY_MISSING');
+});
+
+test('the scheduled ClamAV job on a host without clamscan is skipped, not failed', async () => {
+  const h = host({ 'sec.imunify.detect': { installed: false }, 'sec.clamav.detect': { installed: false } });
+  await h.load(mod);
+  assert.equal(h.state.cron[0].expr, '0 3 * * 0');
+  await h.advance(7 * 24 * 3600 * 1000);
+  const runs = h.state.jobs.filter((j) => j.trigger === 'cron:scheduled-scan');
+  assert.equal(runs.length, 1, 'the weekly cron fired once');
+  assert.equal(runs[0].status, 'done');
+  assert.equal(runs[0].error, null);
+  assert.equal(runs[0].result.skipped, true);
+  assert.equal(runs[0].result.reason, 'clamav-missing');
+  assert.ok(runs[0].result.install.clamav.some((s) => /apt-get install clamav/.test(s)), 'the skipped result carries the install steps');
+  assert.ok(runs[0].log.some((l) => /not installed; the scheduled scan is skipped/.test(l.msg)));
+  const manual = await h.runJob('clamscan', { trigger: 'manual' });
+  assert.equal(manual.status, 'failed', 'a manual run still reports the missing capability');
+  assert.equal(manual.error.code, 'CAPABILITY_MISSING');
 });
 
 test('the scheduled ClamAV job is skipped while ImunifyAV is installed and is bound to the cron setting', async () => {

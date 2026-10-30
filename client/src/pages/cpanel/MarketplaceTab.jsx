@@ -132,7 +132,8 @@ function PluginCard({ entry, manage, onDetails, onInstall, onUpdate, onUninstall
           {manage && !inst && <Button size="sm" variant="primary" icon={Download} onClick={() => onInstall(entry)}>Install</Button>}
           {manage && inst?.marketplace && inst.update && <Button size="sm" variant="primary" icon={RefreshCw} onClick={() => onUpdate(entry)}>Update to {inst.update.latest}</Button>}
           {manage && inst?.marketplace && <Button size="sm" onClick={() => onUninstall(entry)}>Uninstall</Button>}
-          {inst && !inst.marketplace && <Link className="btn btn-sm" to={MANAGE_PLUGINS_PATH}>{inst.source === 'bundled' ? 'Bundled' : 'Sideloaded'}</Link>}
+          {/* The browse view gets `installed: { state }` only, and Manage Plugins is root-only. */}
+          {manage && inst && !inst.marketplace && <Link className="btn btn-sm" to={MANAGE_PLUGINS_PATH}>{inst.source === 'bundled' ? 'Bundled' : 'Sideloaded'}</Link>}
         </div>
       </div>
     </section>
