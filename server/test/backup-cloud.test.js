@@ -1,6 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import Database from 'better-sqlite3';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
 import { pkceChallenge, authorizationUrl, fetchJson, PROVIDERS } from '../src/services/backup-cloud.js';
+
+const MIGRATIONS = path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/db/migrations');
 
 // A host with tar, curl and rclone. Legacy (curl/S3) ops and rclone ops keep
 // separate stores so a test can prove which transport carried a copy; the
@@ -72,6 +78,30 @@ function fakeProviders() {
 }
 
 const SECRETS = ['google-secret', 'ms-secret', 'dbx-secret', 'rt-1', 'rt-2', 'rt-ms-1', 'rt-dbx-1', 'at-google', 'at-ms', 'at-dbx'];
+
+describe('migration 039', () => {
+  it('widens the destination kinds and keeps upload links and the FK across the table rebuild', () => {
+    const db = new Database(':memory:');
+    db.pragma('foreign_keys = ON');
+    const files = fs.readdirSync(MIGRATIONS).filter((f) => f.endsWith('.sql')).sort();
+    for (const f of files.filter((n) => n < '039')) db.exec(fs.readFileSync(path.join(MIGRATIONS, f), 'utf8'));
+    db.prepare("INSERT INTO backup_destinations (id, name, kind, config_enc, enabled, last_test_ok) VALUES (1, 'offsite', 's3', 'v1:x', 1, 1)").run();
+    db.prepare("INSERT INTO backups (id, account_name, type, path, status) VALUES (5, 'alice', 'full', '/backup/a.tar.gz', 'done')").run();
+    db.prepare("INSERT INTO backup_uploads (backup_id, destination_id, destination_name, remote_path, status) VALUES (5, 1, 'offsite', 's3://x/a', 'done')").run();
+    db.prepare("INSERT INTO backup_uploads (backup_id, destination_id, destination_name, remote_path, status) VALUES (5, NULL, 'gone', NULL, 'failed')").run();
+    db.transaction(() => db.exec(fs.readFileSync(path.join(MIGRATIONS, '039_backup-cloud.sql'), 'utf8')))();
+    expect(db.prepare('SELECT destination_id, encrypted FROM backup_uploads ORDER BY id').all()).toEqual([{ destination_id: 1, encrypted: 0 }, { destination_id: null, encrypted: 0 }]);
+    expect(db.prepare('SELECT id, name, kind, enabled, last_test_ok, last_upload_ok FROM backup_destinations').get()).toEqual({ id: 1, name: 'offsite', kind: 's3', enabled: 1, last_test_ok: 1, last_upload_ok: null });
+    for (const kind of ['gdrive', 'onedrive', 'dropbox', 'azureblob', 'b2']) db.prepare('INSERT INTO backup_destinations (name, kind) VALUES (?, ?)').run(kind, kind);
+    expect(() => db.prepare("INSERT INTO backup_destinations (name, kind) VALUES ('x', 'box')").run()).toThrow(/CHECK/);
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'backup_destinations%'").all()).toEqual([{ name: 'backup_destinations' }]);
+    // The uploads FK follows the rebuilt table: deleting the destination nulls the link.
+    db.prepare('DELETE FROM backup_destinations WHERE id = 1').run();
+    expect(db.prepare('SELECT destination_id FROM backup_uploads WHERE id = 1').get().destination_id).toBeNull();
+    expect(db.pragma('foreign_key_check')).toEqual([]);
+    db.close();
+  });
+});
 
 describe('backup cloud helpers', () => {
   it('derives the PKCE challenge like RFC 7636 and builds provider authorization URLs', () => {

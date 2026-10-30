@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, KeyValue, Loading, formatBytes, formatDate } from '../../../components/Common.jsx';
@@ -9,6 +9,7 @@ import { ProgressLog } from '../../../components/ProgressLog.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm, Modal } from '../../../components/Modal.jsx';
 import { RequestError, BackupCapabilityBanner, DestinationFields, emptyDestination, cleanDestination, KIND_LABELS } from '../../backup/Shared.jsx';
+import { ProviderCards, OAuthClientModal, EncryptionKeyNotice, ConnectLink, OAUTH_KINDS, connectUrl, destinationTarget, uploadMethod } from '../../backup/CloudProviders.jsx';
 
 const SCHEDULES = [
   { value: '0 2 * * *', label: 'Daily at 02:00' }, { value: '0 3 * * *', label: 'Daily at 03:00' }, { value: '0 2 * * 0', label: 'Weekly (Sunday 02:00)' },
@@ -50,7 +51,7 @@ export default function BackupConfiguration({ fn }) {
   const status = data?.status;
   return (
     <>
-      <PageHeader fn={fn} description="Schedule nightly account archives (home directory, mail, databases, DNS zones and metadata), keep daily/weekly/monthly copies and send them to remote destinations." actions={<Button variant="primary" loading={starting} disabled={!status?.capability?.installed} onClick={runNow}>Run backup now</Button>} />
+      <PageHeader fn={fn} description="Schedule nightly account archives (home directory, mail, databases, DNS zones and metadata), keep daily/weekly/monthly copies and send them, encrypted, to cloud storage and other destinations." actions={<Button variant="primary" loading={starting} disabled={!status?.capability?.installed} onClick={runNow}>Run backup now</Button>} />
       {loading && !data && <Loading />}
       <RequestError error={error} onRetry={refetch} />
       <BackupCapabilityBanner status={status} onRetry={refetch} />
@@ -63,7 +64,7 @@ export default function BackupConfiguration({ fn }) {
             <div className="stat"><div className="label">Local directory</div><div className="value" style={{ fontSize: 14 }}><code>{status.localDir.path}</code> {status.localDir.exists === false && <span className="pill pill-warn">created on first run</span>}</div></div>
             <div className="stat"><div className="label">Last run</div><div className="value" style={{ fontSize: 14 }}>{status.lastRun ? <><StatusPill status={status.lastRun.status} /> {status.lastRun.accounts_ok} ok / {status.lastRun.accounts_failed} failed · {formatBytes(status.lastRun.bytes)}</> : 'never'}</div></div>
           </div>
-          <p className="muted" style={{ marginTop: 10 }}>Tools: {Object.entries(status.capability.binaries).map(([b, ok]) => <span key={b} className={`pill ${ok ? 'pill-ok' : 'pill-muted'}`} style={{ marginRight: 4 }}>{b}</span>)} — mysqldump is needed to include databases, curl for FTP/SFTP/WebDAV destinations. Choose which accounts are archived under <Link to="/backup/backup-user-selection">Backup User Selection</Link>.</p>
+          <p className="muted" style={{ marginTop: 10 }}>Tools: {Object.entries(status.capability.binaries).map(([b, ok]) => <span key={b} className={`pill ${ok ? 'pill-ok' : 'pill-muted'}`} style={{ marginRight: 4 }}>{b}</span>)} — mysqldump is needed to include databases, curl for plain FTP/SFTP/WebDAV destinations, rclone for cloud providers and encrypted destinations. Choose which accounts are archived under <Link to="/backup/backup-user-selection">Backup User Selection</Link>.</p>
           {jobId && <ProgressLog jobId={jobId} onFinished={(e) => { if (e.type === 'done') toast.success(`Backup run finished: ${e.result?.ok ?? 0} ok, ${e.result?.failed ?? 0} failed`); else toast.error(e.error || 'Backup run failed'); refetch(); runs.refetch(); }} />}
         </Card>
       )}
@@ -134,33 +135,60 @@ export default function BackupConfiguration({ fn }) {
   );
 }
 
-function Destinations() {
+// The destination modal has three stages: the form, the one-time encryption
+// key after a save that generated one, and (OAuth kinds) the hand-off to the
+// provider's sign-in, which leaves the page and returns through ?cloud=….
+export function Destinations() {
   const toast = useToast();
   const confirm = useConfirm();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { data, loading, error, refetch } = useApi('/backup/destinations');
+  const providers = useApi('/backup/destinations/providers');
   const [editing, setEditing] = useState(null);
+  const [stage, setStage] = useState('form');
   const [name, setName] = useState('');
   const [enabled, setEnabled] = useState(true);
   const [cfg, setCfg] = useState(emptyDestination('s3'));
   const [formError, setFormError] = useState(null);
   const [busy, setBusy] = useState(null);
   const [testResult, setTestResult] = useState(null);
+  const [saved, setSaved] = useState(null);
+  const [oauthProvider, setOauthProvider] = useState(null);
 
-  const open = (d) => {
+  useEffect(() => {
+    const outcome = searchParams.get('cloud');
+    if (!outcome) return;
+    if (outcome === 'connected') toast.success('Cloud account connected; test the destination to confirm access');
+    else toast.error(searchParams.get('message') || 'The cloud account could not be connected');
+    const next = new URLSearchParams(searchParams);
+    next.delete('cloud'); next.delete('message'); next.delete('destination');
+    setSearchParams(next, { replace: true });
+    refetch();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
+  const open = (d, kind = 's3') => {
     setEditing(d || 'new');
+    setStage('form');
+    setSaved(null);
     setName(d?.name || '');
     setEnabled(d ? d.enabled : true);
-    setCfg(d ? { ...emptyDestination(d.kind), ...Object.fromEntries(Object.entries(d.config).filter(([k]) => !k.startsWith('has_'))), kind: d.kind } : emptyDestination('s3'));
+    setCfg(d ? { ...emptyDestination(d.kind), ...Object.fromEntries(Object.entries(d.config).filter(([k]) => !k.startsWith('has_'))), kind: d.kind } : emptyDestination(kind));
     setFormError(null); setTestResult(null);
   };
+  const close = () => { setEditing(null); setStage('form'); setSaved(null); };
 
   const save = async () => {
     setBusy('save'); setFormError(null);
     try {
       const body = { name: name.trim(), enabled, config: cleanDestination(cfg, { editing: editing !== 'new' }) };
-      if (editing === 'new') await api.post('/backup/destinations', body); else await api.put(`/backup/destinations/${editing.id}`, body);
+      const { data: result } = editing === 'new' ? await api.post('/backup/destinations', body) : await api.put(`/backup/destinations/${editing.id}`, body);
       toast.success(editing === 'new' ? 'Destination added' : 'Destination saved');
-      setEditing(null); refetch();
+      refetch(); providers.refetch();
+      setSaved(result);
+      if (result.encryptionKey) setStage('key');
+      else if (OAUTH_KINDS.includes(result.kind) && !result.connection?.connected) setStage('connect');
+      else close();
     } catch (err) { setFormError(err); } finally { setBusy(null); }
   };
 
@@ -178,49 +206,84 @@ function Destinations() {
   };
 
   const remove = async (d) => {
-    if (!(await confirm({ title: `Delete destination ${d.name}?`, message: 'Archives already uploaded there are not deleted, but the panel can no longer fetch or prune them.', danger: true, confirmLabel: 'Delete' }))) return;
-    try { await api.delete(`/backup/destinations/${d.id}`); toast.success('Destination deleted'); refetch(); } catch (err) { toast.error(err); }
+    if (!(await confirm({ title: `Delete destination ${d.name}?`, message: `Archives already uploaded there are not deleted, but the panel can no longer fetch or prune them${d.encrypted ? ' — and without the destination\'s encryption key they stay unreadable; keep the key file you downloaded' : ''}.`, danger: true, confirmLabel: 'Delete' }))) return;
+    try { await api.delete(`/backup/destinations/${d.id}`); toast.success('Destination deleted'); refetch(); providers.refetch(); } catch (err) { toast.error(err); }
   };
 
   const toggle = async (d) => {
     try { await api.put(`/backup/destinations/${d.id}`, { enabled: !d.enabled }); refetch(); } catch (err) { toast.error(err); }
   };
 
+  const encrypt = async (d) => {
+    if (!(await confirm({ title: `Encrypt new uploads to ${d.name}?`, message: 'From now on archives are encrypted before they are copied there (rclone crypt, file names and contents). Copies already on the destination stay as they are and remain restorable. Encryption cannot be turned off afterwards; the key is shown once on the next screen.', confirmLabel: 'Enable encryption' }))) return;
+    setBusy(`encrypt-${d.id}`);
+    try {
+      const { data: result } = await api.post(`/backup/destinations/${d.id}/encryption`);
+      refetch();
+      setEditing(d); setName(d.name); setSaved(result); setStage('key'); setFormError(null); setTestResult(null);
+    } catch (err) { toast.error(err); } finally { setBusy(null); }
+  };
+
+  const rows = data || [];
+  const current = saved || (editing !== 'new' ? editing : null);
+  const title = stage === 'key' ? `Encryption key for ${name.trim() || current?.name || 'the destination'}` : stage === 'connect' ? `Connect ${KIND_LABELS[current?.kind] || 'the account'}` : editing === 'new' ? `Add destination${cfg.kind ? ` — ${KIND_LABELS[cfg.kind]}` : ''}` : `Edit ${editing?.name}`;
   return (
-    <Card title="Additional destinations" subtitle="Every enabled destination receives a copy of each archive. Credentials are stored encrypted." actions={<Button onClick={() => open(null)}>Add destination</Button>} padded={false}>
-      <DataTable
-        columns={[
-          { key: 'name', label: 'Name', render: (d) => <strong>{d.name}</strong> },
-          { key: 'kind', label: 'Type', render: (d) => KIND_LABELS[d.kind] || d.kind },
-          { key: 'target', label: 'Target', render: (d) => <code>{d.kind === 's3' ? `${d.config.bucket}/${d.config.prefix || ''}` : d.kind === 'webdav' ? d.config.url : d.kind === 'local' ? d.config.dir : `${d.config.username}@${d.config.host}:${d.config.port}/${d.config.path || ''}`}</code> },
-          { key: 'enabled', label: 'Enabled', render: (d) => <StatusPill status={d.enabled ? 'enabled' : 'disabled'} /> },
-          { key: 'lastTest', label: 'Last test', render: (d) => (d.lastTest ? <><StatusPill status={d.lastTest.ok ? 'ok' : 'failed'} /> <span className="muted">{formatDate(d.lastTest.at)} — {d.lastTest.message}</span></> : <span className="muted">never</span>) },
-        ]}
-        rows={data || []} loading={loading} error={error} rowKey={(d) => d.id} dense emptyText="No destinations. Archives stay in the local directory only."
-        rowActions={(d) => [
-          { label: busy === `test-${d.id}` ? 'Testing…' : 'Test', primary: true, disabled: Boolean(busy), onClick: () => test(d) },
-          { label: 'Edit', onClick: () => open(d) },
-          { label: d.enabled ? 'Disable' : 'Enable', onClick: () => toggle(d) },
-          { label: 'Delete', danger: true, onClick: () => remove(d) },
-        ]}
-      />
-      <Modal open={Boolean(editing)} title={editing === 'new' ? 'Add destination' : `Edit ${editing?.name}`} onClose={() => setEditing(null)} size="lg"
-        footer={(
-          <>
-            <Button onClick={() => setEditing(null)}>Cancel</Button>
-            <Button loading={busy === 'test'} disabled={Boolean(busy) || editing !== 'new'} onClick={testUnsaved} title={editing !== 'new' ? 'Save first, then test from the table' : undefined}>Test connection</Button>
-            <Button variant="primary" loading={busy === 'save'} disabled={!name.trim() || Boolean(busy)} onClick={save}>{editing === 'new' ? 'Add' : 'Save'}</Button>
-          </>
-        )}>
-        <ErrorBanner error={formError} />
-        {testResult && <div className={`banner ${testResult.ok ? 'banner-info' : 'banner-error'}`}><div>{testResult.message} ({testResult.ms} ms)</div></div>}
-        <div className="form-grid">
-          <Field label="Name" required error={formError?.fields?.name}><TextInput value={name} onChange={setName} placeholder="offsite-s3" /></Field>
-          <Field inline><Toggle checked={enabled} onChange={setEnabled} label="Enabled" /></Field>
-        </div>
-        <DestinationFields value={cfg} onChange={setCfg} errors={formError?.fields || {}} editing={editing !== 'new'} />
-        <KeyValue items={[['Upload method', cfg.kind === 's3' ? 'Single signed PUT (AWS Signature V4) straight from the panel; archives above 5 GB exceed the single-PUT object limit of AWS and most providers' : cfg.kind === 'local' ? 'File copy' : 'curl with a private config file (credentials never appear on the command line)']]} />
-      </Modal>
-    </Card>
+    <>
+      <Card title="Cloud storage" subtitle="Where the encrypted copies go. Google Drive, OneDrive and Dropbox sign in with the provider's own consent screen (register an OAuth client once); the others take access keys. Everything is encrypted before it leaves the server unless you turn encryption off when adding a destination.">
+        <ProviderCards catalog={providers.data} error={providers.error} onRetry={providers.refetch} onAdd={(kind) => open(null, kind)} onConfigure={setOauthProvider} />
+        <OAuthClientModal provider={oauthProvider} open={Boolean(oauthProvider)} onClose={() => setOauthProvider(null)} onSaved={() => { providers.refetch(); toast.success('OAuth client saved'); }} />
+      </Card>
+      <Card title="Destinations" subtitle="Every enabled destination receives a copy of each archive. Credentials, tokens and encryption keys are stored encrypted." actions={<Button onClick={() => open(null)}>Add destination</Button>} padded={false}>
+        <DataTable
+          columns={[
+            { key: 'name', label: 'Name', render: (d) => <strong>{d.name}</strong> },
+            { key: 'kind', label: 'Type', render: (d) => KIND_LABELS[d.kind] || d.kind },
+            { key: 'target', label: 'Target', render: (d) => <code>{destinationTarget(d)}</code> },
+            { key: 'encrypted', label: 'Encryption', render: (d) => (d.encrypted ? <span className="pill pill-ok">encrypted</span> : <span className="pill pill-warn">plain</span>) },
+            { key: 'connection', label: 'Connection', render: (d) => (d.connection ? (d.connection.connected ? <span><span className="pill pill-ok">connected</span> <span className="muted">{d.connection.account}{d.connection.email ? ` (${d.connection.email})` : ''}</span></span> : <span><span className="pill pill-warn">not connected</span> <ConnectLink destination={d} className="btn btn-sm btn-primary" /></span>) : <span className="muted">{d.engine === 'rclone' ? 'rclone' : d.engine === 'native' ? 'signed requests' : d.engine === 'copy' ? 'file copy' : 'curl'}</span>) },
+            { key: 'enabled', label: 'Enabled', render: (d) => <StatusPill status={d.enabled ? 'enabled' : 'disabled'} /> },
+            { key: 'lastTest', label: 'Last test', render: (d) => (d.lastTest ? <><StatusPill status={d.lastTest.ok ? 'ok' : 'failed'} /> <span className="muted">{formatDate(d.lastTest.at)} — {d.lastTest.message}</span></> : <span className="muted">never</span>) },
+            { key: 'lastUpload', label: 'Last upload', render: (d) => (d.lastUpload ? <><StatusPill status={d.lastUpload.ok ? 'ok' : 'failed'} /> <span className="muted">{formatDate(d.lastUpload.at)} — {d.lastUpload.message}</span></> : <span className="muted">none yet</span>) },
+          ]}
+          rows={rows} loading={loading} error={error} rowKey={(d) => d.id} dense emptyText="No destinations. Archives stay in the local directory only."
+          rowActions={(d) => [
+            { label: busy === `test-${d.id}` ? 'Testing…' : 'Test', primary: true, disabled: Boolean(busy) || (d.connection && !d.connection.connected), onClick: () => test(d) },
+            d.connection && { label: d.connection.connected ? 'Reconnect' : 'Connect', onClick: () => { window.location.assign(connectUrl(d.kind, d.id)); } },
+            { label: 'Edit', onClick: () => open(d) },
+            !d.encrypted && { label: busy === `encrypt-${d.id}` ? 'Enabling…' : 'Enable encryption', disabled: Boolean(busy), onClick: () => encrypt(d) },
+            { label: d.enabled ? 'Disable' : 'Enable', onClick: () => toggle(d) },
+            { label: 'Delete', danger: true, onClick: () => remove(d) },
+          ].filter(Boolean)}
+        />
+        <Modal open={Boolean(editing)} title={title} onClose={close} size="lg"
+          footer={stage === 'form' ? (
+            <>
+              <Button onClick={close}>Cancel</Button>
+              <Button loading={busy === 'test'} disabled={Boolean(busy) || editing !== 'new' || OAUTH_KINDS.includes(cfg.kind)} onClick={testUnsaved} title={editing !== 'new' ? 'Save first, then test from the table' : OAUTH_KINDS.includes(cfg.kind) ? 'Save and connect the account first' : undefined}>Test connection</Button>
+              <Button variant="primary" loading={busy === 'save'} disabled={!name.trim() || Boolean(busy)} onClick={save}>{editing === 'new' ? (OAUTH_KINDS.includes(cfg.kind) ? 'Save and continue' : 'Add') : 'Save'}</Button>
+            </>
+          ) : (
+            <>
+              <Button onClick={close}>{stage === 'key' && current && OAUTH_KINDS.includes(current.kind) && !current.connection?.connected ? 'Connect later' : 'Done'}</Button>
+              {current && OAUTH_KINDS.includes(current.kind) && !current.connection?.connected && <a className="btn btn-primary" href={connectUrl(current.kind, current.id)}>Connect {KIND_LABELS[current.kind]}</a>}
+            </>
+          )}>
+          {stage === 'key' && <EncryptionKeyNotice encryptionKey={saved?.encryptionKey} destinationName={name.trim() || current?.name} />}
+          {stage === 'connect' && <p>The destination is saved. Sign in to {KIND_LABELS[current?.kind]} to let the panel upload into <code>{current?.config?.folder || 'the folder'}</code>; you return here afterwards. The panel only receives a refresh token, stored encrypted.</p>}
+          {stage === 'form' && (
+            <>
+              <ErrorBanner error={formError} />
+              {testResult && <div className={`banner ${testResult.ok ? 'banner-info' : 'banner-error'}`}><div>{testResult.message} ({testResult.ms} ms)</div></div>}
+              <div className="form-grid">
+                <Field label="Name" required error={formError?.fields?.name}><TextInput value={name} onChange={setName} placeholder={cfg.kind === 'gdrive' ? 'google-drive' : 'offsite-s3'} /></Field>
+                <Field inline><Toggle checked={enabled} onChange={setEnabled} label="Enabled" /></Field>
+              </div>
+              <DestinationFields value={cfg} onChange={setCfg} errors={formError?.fields || {}} editing={editing !== 'new'} />
+              <KeyValue items={[['Upload method', uploadMethod(cfg)]]} />
+            </>
+          )}
+        </Modal>
+      </Card>
+    </>
   );
 }

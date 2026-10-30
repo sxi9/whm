@@ -454,6 +454,7 @@ export function createBackupService(ctx) {
   function enqueueImportRemote(id, { name, encrypted = false }, user, req) {
     if (!isRoot(user)) throw forbidden('Only root can import archives from a destination');
     const row = loadDestination(id);
+    if (encrypted && !destinationConfig(row).crypt) throw conflict(`Destination "${row.name}" has no encryption key; the copy cannot be an encrypted one`);
     const target = `${localDir()}/${name}`;
     const existing = stmts.backupByPath.get(target);
     if (existing) throw conflict(`${name} is already registered (backup #${existing.id})`);
@@ -748,6 +749,17 @@ export function createBackupService(ctx) {
     if (error) throw Object.assign(error, { backupId: Number(lastInsertRowid) });
     for (const w of result.warnings || []) log(`${username}: ${w}`, 'warn');
     return { ...shapeBackup(stmts.backupById.get(lastInsertRowid)), archive: result };
+  }
+
+  // One file to one destination through the engine the destination needs
+  // (plugins and other categories call this instead of the agent ops).
+  async function uploadFile(destinationId, file, req) {
+    const dest = loadDestination(destinationId);
+    const config = agentConfig(dest);
+    const r = await op(opFor(config, 'backup.destination.upload', 'backup.rclone.upload'), { config, file }, req);
+    persistTokenUpdate(dest, r.tokenUpdate, req);
+    const { tokenUpdate: _t, ...rest } = r;
+    return { ...rest, destination: dest.name, encrypted: Boolean(config.crypt) };
   }
 
   async function uploadBackup(row, req, log = () => {}) {
@@ -1229,7 +1241,7 @@ export function createBackupService(ctx) {
     config, status, updateConfig, syncSchedule, localDir,
     listDestinations: () => stmts.destinations.all().map(shapeDestination),
     createDestination, updateDestination, removeDestination, testDestination, testDestinationConfig, listRemote, destinationConfig: (id) => destinationConfig(id),
-    enableEncryption, connectDestination, loadDestination: (id) => shapeDestination(loadDestination(id)), enqueueImportRemote, runCloudFetchJob,
+    enableEncryption, connectDestination, loadDestination: (id) => shapeDestination(loadDestination(id)), enqueueImportRemote, runCloudFetchJob, uploadFile,
     listSelection, setSelection, includedAccounts: () => includedAccounts().map((a) => a.username),
     listBackups, getBackup, inspect, archiveInfo, pinBackup, deleteBackup, rescan, registerArchive, accountsOverview,
     archiveAccount, enqueueRun, runBackupJob, listRuns, getRun: (id) => { const r = stmts.runById.get(id); if (!r) throw notFound('Backup run'); return shapeRun(r); },

@@ -5,6 +5,8 @@ import { useApi } from '../../hooks/useApi.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
 import { CapabilityNotice, StatusPill, formatBytes, formatDate } from '../../components/Common.jsx';
 import { Field, Select, TextInput, NumberInput, Toggle, Textarea, PasswordInput, ErrorBanner } from '../../components/Form.jsx';
+import { ProgressLog } from '../../components/ProgressLog.jsx';
+import { READ_ONLY_FIELDS, encryptionOn } from './CloudProviders.jsx';
 
 export function isCapabilityError(error) {
   return Boolean(error) && (error.status === 501 || error.code === 'capability_missing' || error.code === 'binary_not_found');
@@ -31,7 +33,7 @@ export function BackupCapabilityBanner({ status, error, onRetry }) {
   return <CapabilityNotice error={{ code: 'capability_missing', message: 'tar and gzip are not installed on this server; archives cannot be created or restored until they are.' }} onRetry={onRetry} />;
 }
 
-export const KIND_LABELS = { local: 'Local directory', ftp: 'FTP / FTPS', sftp: 'SFTP', webdav: 'WebDAV', s3: 'S3-compatible (AWS, Backblaze B2, MinIO, Wasabi…)' };
+export const KIND_LABELS = { gdrive: 'Google Drive', onedrive: 'Microsoft OneDrive', dropbox: 'Dropbox', s3: 'Amazon S3 / S3-compatible (Wasabi, MinIO, R2…)', azureblob: 'Azure Blob Storage', b2: 'Backblaze B2', sftp: 'SFTP', ftp: 'FTP / FTPS', webdav: 'WebDAV', local: 'Local directory' };
 
 export function BackupRow({ backup }) {
   return (
@@ -87,9 +89,61 @@ export function BackupPicker({ account, onAccountChange, backup, onBackupChange,
             </table>
           </div>
           {requireLocal && backup && !backup.local_present && <div className="banner banner-warning"><div>This archive is not on local disk. Fetch it from a destination before browsing or restoring it.</div></div>}
+          <CloudCopies account={account} onImported={backups.refetch} />
         </>
       )}
     </>
+  );
+}
+
+// What a destination holds for the account, with an import for copies the
+// panel no longer knows about (a reinstall, an archive made on another
+// server). Root only: destinations are server configuration.
+export function CloudCopies({ account, onImported }) {
+  const isRoot = useIsRoot();
+  const destinations = useApi(isRoot ? '/backup/destinations' : null, { enabled: isRoot });
+  const [destId, setDestId] = useState('');
+  const listing = useApi(destId ? `/backup/destinations/${destId}/archives` : null, { enabled: Boolean(destId) });
+  const [jobId, setJobId] = useState(null);
+  const [busy, setBusy] = useState(null);
+  const [error, setError] = useState(null);
+  if (!isRoot) return null;
+  const rows = (listing.data?.archives || []).filter((a) => !account || a.username === account);
+  const importOne = async (a) => {
+    setBusy(a.name); setError(null);
+    try { const { data } = await api.post(`/backup/destinations/${destId}/archives/import`, { name: a.name, encrypted: Boolean(a.encrypted) }); setJobId(data.job.id); } catch (err) { setError(err); } finally { setBusy(null); }
+  };
+  return (
+    <details style={{ marginTop: 12 }}>
+      <summary>Copies on destinations</summary>
+      <p className="muted">List the archives a destination holds for this account and import one the panel does not list above (after a reinstall, or made on another server). Encrypted copies are decrypted with the destination's key.</p>
+      <div className="form-grid">
+        <Field label="Destination"><Select value={destId} onChange={setDestId} options={(destinations.data || []).map((d) => ({ value: String(d.id), label: `${d.name} — ${KIND_LABELS[d.kind] || d.kind}${d.encrypted ? ' (encrypted)' : ''}` }))} placeholder={(destinations.data || []).length ? 'Choose a destination' : 'No destinations configured'} /></Field>
+      </div>
+      <RequestError error={destinations.error || listing.error || error} onRetry={listing.refetch} />
+      {listing.data?.warnings?.length > 0 && <div className="banner banner-warning"><div>{listing.data.warnings.join('; ')}</div></div>}
+      {destId && (
+        <div className="table-wrap">
+          <table className="dense">
+            <thead><tr><th>Archive</th><th>Size</th><th>Modified</th><th>Encrypted</th><th /></tr></thead>
+            <tbody>
+              {rows.map((a) => (
+                <tr key={`${a.name}-${a.encrypted ? 1 : 0}`}>
+                  <td><code>{a.name}</code></td>
+                  <td>{formatBytes(a.sizeBytes)}</td>
+                  <td>{a.mtime ? formatDate(a.mtime) : '—'}</td>
+                  <td>{a.encrypted ? <span className="pill pill-ok">encrypted</span> : <span className="pill pill-muted">plain</span>}</td>
+                  <td className="row-actions"><button className="btn btn-sm" disabled={Boolean(busy)} onClick={() => importOne(a)}>{busy === a.name ? 'Queuing…' : 'Import'}</button></td>
+                </tr>
+              ))}
+              {!listing.loading && listing.data && rows.length === 0 && <tr><td colSpan={5} className="table-state">No archives for {account || 'this account'} on this destination.</td></tr>}
+              {listing.loading && !listing.data && <tr><td colSpan={5} className="table-state"><span className="spinner" /> Listing…</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {jobId && <ProgressLog jobId={jobId} onFinished={(e) => { if (e.type === 'done') onImported?.(); }} />}
+    </details>
   );
 }
 
@@ -109,18 +163,30 @@ export function FetchButton({ backup, onQueued }) {
   );
 }
 
-const EMPTY = { local: { dir: '/backup/offsite' }, ftp: { host: '', port: 21, username: '', password: '', path: '', tls: false, insecure: false, passive: true }, sftp: { host: '', port: 22, username: '', password: '', privateKey: '', hostKeySha256: '', path: '', insecure: false }, webdav: { url: '', username: '', password: '', insecure: false }, s3: { endpoint: '', region: 'us-east-1', bucket: '', prefix: '', accessKey: '', secretKey: '', pathStyle: false, insecure: false } };
+const EMPTY = {
+  local: { dir: '/backup/offsite' },
+  ftp: { host: '', port: 21, username: '', password: '', path: '', tls: false, insecure: false, passive: true },
+  sftp: { host: '', port: 22, username: '', password: '', privateKey: '', hostKeySha256: '', path: '', insecure: false },
+  webdav: { url: '', username: '', password: '', insecure: false },
+  s3: { endpoint: '', region: 'us-east-1', bucket: '', prefix: '', accessKey: '', secretKey: '', pathStyle: false, insecure: false },
+  gdrive: { folder: 'whm-backups' },
+  onedrive: { folder: 'whm-backups' },
+  dropbox: { folder: 'whm-backups' },
+  azureblob: { account: '', container: '', prefix: '', accountKey: '', sasToken: '', endpoint: '' },
+  b2: { keyId: '', applicationKey: '', bucket: '', prefix: '' },
+};
 
 export function emptyDestination(kind) { return { kind, ...EMPTY[kind] }; }
 
-const SECRET_FIELDS = ['password', 'secretKey', 'privateKey'];
+const SECRET_FIELDS = ['password', 'secretKey', 'privateKey', 'accountKey', 'sasToken', 'applicationKey'];
 
 // Strips blanks the API would reject and keeps the shape of the agent schema.
-// On an edit a blank secret is sent as '' so the server keeps the stored one.
+// On an edit a blank secret is sent as '' so the server keeps the stored one;
+// what the API only reports (connected account, key date) never goes back.
 export function cleanDestination(cfg, { editing = false } = {}) {
   const out = { kind: cfg.kind };
   for (const [k, v] of Object.entries(cfg)) {
-    if (k === 'kind') continue;
+    if (k === 'kind' || READ_ONLY_FIELDS.includes(k)) continue;
     if (v === '' || v === null || v === undefined) {
       if ((cfg.kind === 'ftp' && k === 'password') || (editing && SECRET_FIELDS.includes(k))) out[k] = '';
       continue;
@@ -134,9 +200,30 @@ export function DestinationFields({ value, onChange, errors = {}, editing = fals
   const set = (k, v) => onChange({ ...value, [k]: v });
   const err = (k) => errors[`config.${k}`];
   const secretHelp = editing ? 'Leave blank to keep the stored value' : undefined;
+  const oauth = ['gdrive', 'onedrive', 'dropbox'].includes(value.kind);
   return (
     <div className="form-grid">
       <Field label="Type" required><Select value={value.kind} onChange={(kind) => onChange(emptyDestination(kind))} options={Object.entries(KIND_LABELS).map(([k, label]) => ({ value: k, label }))} disabled={editing} /></Field>
+      {oauth && <Field label="Folder" error={err('folder')} help="Path inside the connected account; created on the first upload. The account is connected after saving."><TextInput value={value.folder} onChange={(v) => set('folder', v.trim())} placeholder="whm-backups" /></Field>}
+      {value.kind === 'gdrive' && <Field label="Root folder ID (optional)" error={err('rootFolderId')} help="Drive folder ID to use as the root instead of My Drive (shared drives, a dedicated folder)"><TextInput value={value.rootFolderId || ''} onChange={(v) => set('rootFolderId', v.trim())} /></Field>}
+      {value.kind === 'azureblob' && (
+        <>
+          <Field label="Storage account" required error={err('account')}><TextInput value={value.account} onChange={(v) => set('account', v.trim().toLowerCase())} /></Field>
+          <Field label="Container" required error={err('container')}><TextInput value={value.container} onChange={(v) => set('container', v.trim().toLowerCase())} /></Field>
+          <Field label="Prefix (folder)" error={err('prefix')}><TextInput value={value.prefix} onChange={(v) => set('prefix', v.trim())} placeholder="hst/" /></Field>
+          <Field label="Account key" error={err('accountKey')} help={secretHelp || 'Either the account key or a container SAS token'}><PasswordInput value={value.accountKey} onChange={(v) => set('accountKey', v)} showStrength={false} allowGenerate={false} autoComplete="new-password" /></Field>
+          <Field label="SAS token" error={err('sasToken')} help={secretHelp || 'Query string of a container SAS with read, write, list and delete (used when no account key is given)'}><PasswordInput value={value.sasToken} onChange={(v) => set('sasToken', v.trim())} showStrength={false} allowGenerate={false} autoComplete="new-password" /></Field>
+          <Field label="Endpoint (optional)" error={err('endpoint')} help="Leave empty for the public cloud; e.g. https://account.blob.core.chinacloudapi.cn"><TextInput value={value.endpoint} onChange={(v) => set('endpoint', v.trim())} /></Field>
+        </>
+      )}
+      {value.kind === 'b2' && (
+        <>
+          <Field label="Application key ID" required error={err('keyId')}><TextInput value={value.keyId} onChange={(v) => set('keyId', v.trim())} autoComplete="off" /></Field>
+          <Field label="Application key" required={!editing} error={err('applicationKey')} help={secretHelp}><PasswordInput value={value.applicationKey} onChange={(v) => set('applicationKey', v.trim())} showStrength={false} allowGenerate={false} autoComplete="new-password" /></Field>
+          <Field label="Bucket" required error={err('bucket')}><TextInput value={value.bucket} onChange={(v) => set('bucket', v.trim())} /></Field>
+          <Field label="Prefix (folder)" error={err('prefix')}><TextInput value={value.prefix} onChange={(v) => set('prefix', v.trim())} placeholder="hst/" /></Field>
+        </>
+      )}
       {value.kind === 'local' && <Field label="Directory" required error={err('dir')} help="A second local copy, e.g. a mounted drive under /backup or /var/backups/whm"><TextInput value={value.dir} onChange={(v) => set('dir', v)} /></Field>}
       {(value.kind === 'ftp' || value.kind === 'sftp') && (
         <>
@@ -179,8 +266,12 @@ export function DestinationFields({ value, onChange, errors = {}, editing = fals
           <Field label="Secret key" required={!editing} error={err('secretKey')} help={secretHelp}><PasswordInput value={value.secretKey} onChange={(v) => set('secretKey', v)} showStrength={false} allowGenerate={false} autoComplete="new-password" /></Field>
           <Field inline><Toggle checked={value.pathStyle} onChange={(v) => set('pathStyle', v)} label="Path-style addressing" description="Required by MinIO and some self-hosted gateways" /></Field>
           <Field inline><Toggle checked={value.insecure} onChange={(v) => set('insecure', v)} label="Skip TLS certificate verification" /></Field>
+          {!encryptionOn(value) && <Field inline><Toggle checked={value.transport === 'rclone'} onChange={(v) => set('transport', v ? 'rclone' : 'native')} label="Transfer with rclone" description="Multipart uploads (no 5 GB single-object limit); needs rclone on the server. Encrypted destinations always use it." /></Field>}
         </>
       )}
+      {editing && value.crypt
+        ? <Field inline><span className="pill pill-ok">Encrypted at rest</span> <span className="muted">Archives on this destination are encrypted (rclone crypt). Encryption cannot be turned off.</span></Field>
+        : <Field inline><Toggle checked={encryptionOn(value)} onChange={(v) => set('crypt', v)} label="Encrypt archives at rest (recommended)" description="File names and contents are encrypted before they leave the server (rclone crypt). A key is generated and shown once after saving; keep a copy. It cannot be turned off later." /></Field>}
     </div>
   );
 }
