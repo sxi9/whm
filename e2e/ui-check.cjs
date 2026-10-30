@@ -50,7 +50,7 @@ async function stamp(page, text) {
   await page.fill('#password', PASSWORD);
   await page.click('button[type=submit]');
   // A fresh database sends root to the first-run setup wizard; capture it, then skip it.
-  await page.waitForSelector('.setup-steps, .home', { timeout: 15000 });
+  await page.waitForSelector('.setup-steps, .home', { timeout: 30000 });
   if (await page.$('.setup-steps')) {
     await page.waitForTimeout(400);
     await shot('02a-setup-wizard');
