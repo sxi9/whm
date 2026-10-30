@@ -750,13 +750,38 @@ const requireSftpHostKey = (c, issues) => {
   if (c.kind === 'sftp' && !c.hostKeySha256 && !c.insecure) issues.addIssue({ code: z.ZodIssueCode.custom, path: ['hostKeySha256'], message: 'Pin the server host key (SHA-256 fingerprint from ssh-keyscan | ssh-keygen -lf -) or explicitly skip host key verification' });
 };
 
+// Values written into the rendered rclone.conf (`key = value`, one per line).
+// rclone's INI reader takes a value that starts with a quote or backtick as
+// quoted and trims surrounding whitespace, so those shapes are refused rather
+// than silently changed; the secrets themselves never reach argv.
+const iniValue = (max) => z.string().max(max).regex(/^(?!["'`#;\s])(?:[^\n\r\0]*[^\s\n\r\0])?$/, 'No quotes, comment markers, surrounding whitespace or control characters');
+const cryptFields = { crypt: z.boolean().default(false), cryptPassword: iniValue(256).optional(), cryptPassword2: iniValue(256).optional() };
+const oauthFields = { clientId: iniValue(512), clientSecret: iniValue(512), refreshToken: iniValue(8192), folder: remotePath.default('') };
+const requireCryptKeys = (c, issues) => {
+  if (c.crypt && !(c.cryptPassword && c.cryptPassword2)) issues.addIssue({ code: z.ZodIssueCode.custom, path: ['cryptPassword'], message: 'An encrypted destination needs its encryption password and salt' });
+  if (c.kind === 'azureblob' && !c.accountKey && !c.sasToken) issues.addIssue({ code: z.ZodIssueCode.custom, path: ['accountKey'], message: 'Azure Blob needs an account key or a SAS token' });
+};
+
 export const destinationConfig = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('local'), dir: arg.absPath }).strict(),
-  z.object({ kind: z.literal('ftp'), host: hostField, port: z.number().int().min(1).max(65535).default(21), username: nonEmpty, password: secretField.default(''), path: remotePath.default(''), tls: z.boolean().default(false), insecure: z.boolean().default(false), passive: z.boolean().default(true) }).strict(),
-  z.object({ kind: z.literal('sftp'), host: hostField, port: z.number().int().min(1).max(65535).default(22), username: nonEmpty, password: secretField.optional(), privateKey: z.string().max(16384).optional(), hostKeySha256: z.string().regex(/^[A-Za-z0-9+/=]{40,48}$/).optional(), path: remotePath.default(''), insecure: z.boolean().default(false) }).strict(),
-  z.object({ kind: z.literal('webdav'), url: urlField, username: nonEmpty.optional(), password: secretField.optional(), insecure: z.boolean().default(false) }).strict(),
-  z.object({ kind: z.literal('s3'), endpoint: urlField.optional(), region: z.string().regex(/^[a-z0-9-]{1,32}$/).default('us-east-1'), bucket: z.string().regex(/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/), prefix: remotePath.default(''), accessKey: nonEmpty, secretKey: nonEmpty, pathStyle: z.boolean().default(false), insecure: z.boolean().default(false) }).strict(),
-]).superRefine(requireSftpHostKey);
+  z.object({ kind: z.literal('local'), dir: arg.absPath, ...cryptFields }).strict(),
+  z.object({ kind: z.literal('ftp'), host: hostField, port: z.number().int().min(1).max(65535).default(21), username: nonEmpty, password: secretField.default(''), path: remotePath.default(''), tls: z.boolean().default(false), insecure: z.boolean().default(false), passive: z.boolean().default(true), ...cryptFields }).strict(),
+  z.object({ kind: z.literal('sftp'), host: hostField, port: z.number().int().min(1).max(65535).default(22), username: nonEmpty, password: secretField.optional(), privateKey: z.string().max(16384).optional(), hostKeySha256: z.string().regex(/^[A-Za-z0-9+/=]{40,48}$/).optional(), path: remotePath.default(''), insecure: z.boolean().default(false), ...cryptFields }).strict(),
+  z.object({ kind: z.literal('webdav'), url: urlField, username: nonEmpty.optional(), password: secretField.optional(), insecure: z.boolean().default(false), ...cryptFields }).strict(),
+  z.object({ kind: z.literal('s3'), endpoint: urlField.optional(), region: z.string().regex(/^[a-z0-9-]{1,32}$/).default('us-east-1'), bucket: z.string().regex(/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/), prefix: remotePath.default(''), accessKey: nonEmpty, secretKey: nonEmpty, pathStyle: z.boolean().default(false), insecure: z.boolean().default(false), ...cryptFields }).strict(),
+  z.object({ kind: z.literal('gdrive'), ...oauthFields, rootFolderId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).optional(), ...cryptFields }).strict(),
+  z.object({ kind: z.literal('onedrive'), ...oauthFields, driveId: z.string().regex(/^[A-Za-z0-9!_-]{1,128}$/), driveType: z.enum(['personal', 'business', 'documentLibrary']), ...cryptFields }).strict(),
+  z.object({ kind: z.literal('dropbox'), ...oauthFields, ...cryptFields }).strict(),
+  z.object({ kind: z.literal('azureblob'), account: z.string().regex(/^[a-z0-9]{3,24}$/), container: z.string().regex(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/), prefix: remotePath.default(''), accountKey: iniValue(256).optional(), sasToken: iniValue(2048).optional(), endpoint: urlField.optional(), ...cryptFields }).strict(),
+  z.object({ kind: z.literal('b2'), keyId: z.string().regex(/^[A-Za-z0-9]{1,64}$/), applicationKey: iniValue(256), bucket: z.string().regex(/^[A-Za-z0-9-]{6,63}$/), prefix: remotePath.default(''), ...cryptFields }).strict(),
+]).superRefine((c, issues) => { requireSftpHostKey(c, issues); requireCryptKeys(c, issues); });
+
+// Cloud providers are reached through rclone only; any kind becomes an rclone
+// remote once it is wrapped in a crypt remote.
+const RCLONE_ONLY_KINDS = ['gdrive', 'onedrive', 'dropbox', 'azureblob', 'b2'];
+export const needsRclone = (config) => RCLONE_ONLY_KINDS.includes(config.kind) || Boolean(config.crypt);
+function assertLegacyEngine(config) {
+  if (needsRclone(config)) throw new OpError('unsupported', `${config.kind}${config.crypt ? ' (encrypted)' : ''} destinations are served by the backup.rclone.* ops`);
+}
 
 const CURL_CODES = { 5: 'could not resolve proxy', 6: 'could not resolve host', 7: 'failed to connect', 9: 'access denied to the remote path', 19: 'file not found on the server', 22: 'the server returned an HTTP error', 25: 'upload failed (STOR/PUT refused)', 28: 'operation timed out', 35: 'TLS handshake failed', 51: 'TLS certificate verification failed', 60: 'TLS certificate could not be verified (enable "insecure" or install the CA)', 67: 'login denied', 78: 'the remote file does not exist', 79: 'SSH session error (host key or authentication)' };
 
@@ -1021,6 +1046,7 @@ defineOp('backup.destination.test', {
   timeoutMs: 300_000,
   schema: z.object({ config: destinationConfig }).strict(),
   run: async ({ config }, ctx) => {
+    assertLegacyEngine(config);
     const started = Date.now();
     const name = `whm-backup-test-${crypto.randomBytes(6).toString('hex')}.txt`;
     const probe = path.join(tmpDir(ctx), name);
@@ -1057,12 +1083,13 @@ defineOp('backup.destination.upload', {
   timeoutMs: 7_200_000,
   schema: z.object({ config: destinationConfig, file: archivePath, remoteName: readableName.optional() }).strict(),
   run: async ({ config, file, remoteName }, ctx) => {
+    assertLegacyEngine(config);
     const local = ctx.assertAllowedPath(file, 'read');
     if (!exists(local)) throw new OpError('not_found', `${file} does not exist`);
     const started = Date.now();
     const name = remoteName || path.basename(local);
     const result = await uploadTo(config, local, name, ctx);
-    return { kind: config.kind, name, ...result, ms: Date.now() - started };
+    return { kind: config.kind, name, ...result, encrypted: false, ms: Date.now() - started };
   },
 });
 
@@ -1071,6 +1098,7 @@ defineOp('backup.destination.download', {
   timeoutMs: 7_200_000,
   schema: z.object({ config: destinationConfig, remoteName: readableName, dest: arg.absPath }).strict(),
   run: async ({ config, remoteName, dest }, ctx) => {
+    assertLegacyEngine(config);
     const dir = ctx.assertAllowedPath(dest, 'write');
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const target = path.join(dir, remoteName);
@@ -1094,7 +1122,7 @@ defineOp('backup.destination.list', {
   description: 'Account archives present on a destination',
   timeoutMs: 300_000,
   schema: z.object({ config: destinationConfig }).strict(),
-  run: async ({ config }, ctx) => ({ kind: config.kind, archives: (await listRemote(config, ctx)).map((a) => ({ ...a, username: archiveUser(a.name) })) }),
+  run: async ({ config }, ctx) => { assertLegacyEngine(config); return { kind: config.kind, encrypted: false, archives: (await listRemote(config, ctx)).map((a) => ({ ...a, username: archiveUser(a.name) })) }; },
 });
 
 defineOp('backup.destination.remove', {
@@ -1102,5 +1130,290 @@ defineOp('backup.destination.remove', {
   destructive: true,
   timeoutMs: 300_000,
   schema: z.object({ config: destinationConfig, remoteName: readableName }).strict(),
-  run: async ({ config, remoteName }, ctx) => ({ kind: config.kind, name: remoteName, ...(await removeFrom(config, remoteName, ctx)) }),
+  run: async ({ config, remoteName }, ctx) => { assertLegacyEngine(config); return { kind: config.kind, name: remoteName, ...(await removeFrom(config, remoteName, ctx)) }; },
+});
+
+// --- rclone: cloud providers and at-rest encryption ---------------------------
+//
+// Every call renders a root-only rclone.conf into a fresh private directory
+// (secrets never reach argv or /proc), runs one rclone command against the
+// remote "whm:" and removes the directory afterwards. With `crypt` set the
+// backend sits in "[whmbase]" and "whm" is a crypt remote on top of it, so
+// names and contents are ciphertext at rest; the operator's encryption key is
+// the (password, salt) pair rendered as rclone's obscured password/password2.
+
+// rclone's reversible obscuring of config passwords (lib/obscure): AES-256-CTR
+// under a key compiled into every rclone build, base64url without padding.
+const RCLONE_OBSCURE_KEY = Buffer.from([0x9c, 0x93, 0x5b, 0x48, 0x73, 0x0a, 0x55, 0x4d, 0x6b, 0xfd, 0x7c, 0x63, 0xc8, 0x86, 0xa9, 0x2b, 0xd3, 0x90, 0x19, 0x8e, 0xb8, 0x12, 0x8a, 0xfb, 0xf4, 0xde, 0x16, 0x2b, 0x8b, 0x95, 0xf6, 0x38]);
+export function rcloneObscure(value, iv = crypto.randomBytes(16)) {
+  const cipher = crypto.createCipheriv('aes-256-ctr', RCLONE_OBSCURE_KEY, iv);
+  return Buffer.concat([iv, cipher.update(Buffer.from(String(value), 'utf8')), cipher.final()]).toString('base64url');
+}
+
+const RCLONE_CODES = { 1: 'usage error', 2: 'the operation failed', 3: 'directory not found', 4: 'file not found', 5: 'temporary error, retries exhausted', 6: 'the remote refused the operation', 7: 'fatal error (authentication or configuration)', 8: 'transfer limit exceeded', 9: 'nothing was transferred' };
+const RCLONE_SECRET_FIELDS = ['password', 'secretKey', 'privateKey', 'refreshToken', 'clientSecret', 'accountKey', 'sasToken', 'applicationKey', 'cryptPassword', 'cryptPassword2'];
+const OAUTH_KINDS = ['gdrive', 'onedrive', 'dropbox'];
+
+// The token rclone refreshes and rewrites itself; an expired placeholder makes
+// the first call refresh it from the stored refresh token.
+const oauthToken = (refreshToken) => JSON.stringify({ access_token: '', token_type: 'Bearer', refresh_token: refreshToken, expiry: '2000-01-01T00:00:00Z' });
+const joinRemote = (...parts) => parts.map((p) => String(p || '').replace(/^\/+|\/+$/g, '')).filter(Boolean).join('/');
+
+export function scrubSecrets(text, config) {
+  let out = String(text || '');
+  for (const f of RCLONE_SECRET_FIELDS) {
+    const v = config?.[f];
+    if (typeof v === 'string' && v.length >= 4) out = out.split(v).join('[redacted]');
+  }
+  return out;
+}
+
+// Backend section of the rendered config plus the path inside it that holds
+// the archives (`root`). Files needed by the backend (SSH key, pinned
+// known_hosts) are written into `dir`, which the caller removes.
+async function rcloneBackend(config, dir, ctx) {
+  const s = {};
+  const flags = [];
+  let root = '';
+  switch (config.kind) {
+    case 'local': s.type = 'local'; root = ctx.assertAllowedPath(config.dir, 'write'); break;
+    case 'ftp':
+      s.type = 'ftp'; s.host = config.host; s.port = String(config.port); s.user = config.username; s.pass = rcloneObscure(config.password || '');
+      if (config.tls) s.explicit_tls = 'true';
+      if (config.insecure) flags.push('--no-check-certificate');
+      root = config.path.replace(/^\/+/, '');
+      break;
+    case 'sftp':
+      s.type = 'sftp'; s.host = config.host; s.port = String(config.port); s.user = config.username;
+      if (config.password) s.pass = rcloneObscure(config.password);
+      if (config.privateKey) s.key_file = secretFile(dir, 'rclone-sshkey', config.privateKey.endsWith('\n') ? config.privateKey : `${config.privateKey}\n`);
+      if (config.hostKeySha256) s.known_hosts_file = path.join(await pinnedKnownHostsHome(config, dir), '.ssh', 'known_hosts');
+      root = config.path.replace(/^~\/?/, '');
+      break;
+    case 'webdav':
+      s.type = 'webdav'; s.url = config.url; s.vendor = 'other';
+      if (config.username) { s.user = config.username; s.pass = rcloneObscure(config.password || ''); }
+      if (config.insecure) flags.push('--no-check-certificate');
+      break;
+    case 's3':
+      s.type = 's3'; s.provider = config.endpoint ? 'Other' : 'AWS'; s.access_key_id = config.accessKey; s.secret_access_key = config.secretKey; s.region = config.region;
+      if (config.endpoint) s.endpoint = config.endpoint;
+      s.force_path_style = config.pathStyle ? 'true' : 'false';
+      if (config.insecure) flags.push('--no-check-certificate');
+      root = joinRemote(config.bucket, config.prefix);
+      break;
+    case 'gdrive':
+      s.type = 'drive'; s.scope = 'drive.file'; s.client_id = config.clientId; s.client_secret = config.clientSecret; s.token = oauthToken(config.refreshToken);
+      if (config.rootFolderId) s.root_folder_id = config.rootFolderId;
+      root = joinRemote(config.folder);
+      break;
+    case 'onedrive':
+      s.type = 'onedrive'; s.client_id = config.clientId; s.client_secret = config.clientSecret; s.token = oauthToken(config.refreshToken); s.drive_id = config.driveId; s.drive_type = config.driveType;
+      root = joinRemote(config.folder);
+      break;
+    case 'dropbox':
+      s.type = 'dropbox'; s.client_id = config.clientId; s.client_secret = config.clientSecret; s.token = oauthToken(config.refreshToken);
+      root = joinRemote(config.folder);
+      break;
+    case 'azureblob': {
+      s.type = 'azureblob'; s.account = config.account;
+      const endpoint = (config.endpoint || `https://${config.account}.blob.core.windows.net`).replace(/\/+$/, '');
+      if (config.accountKey) s.key = config.accountKey;
+      else s.sas_url = `${endpoint}/${config.container}?${String(config.sasToken).replace(/^\?/, '')}`;
+      if (config.endpoint) s.endpoint = config.endpoint;
+      root = joinRemote(config.container, config.prefix);
+      break;
+    }
+    case 'b2':
+      s.type = 'b2'; s.account = config.keyId; s.key = config.applicationKey;
+      root = joinRemote(config.bucket, config.prefix);
+      break;
+    default: throw new OpError('unsupported', `${config.kind} has no rclone backend`);
+  }
+  return { section: s, root, flags };
+}
+
+function assertIniValue(key, value) {
+  if (!/^(?!["'`#;\s])(?:[^\n\r\0]*[^\s\n\r\0])?$/.test(String(value))) throw new OpError('invalid_args', `rclone.conf value for "${key}" contains characters the configuration file cannot carry`);
+}
+
+export function renderRcloneConf(config, backend) {
+  const sections = [];
+  let root;
+  if (config.crypt) {
+    sections.push(['whmbase', backend.section]);
+    sections.push(['whm', { type: 'crypt', remote: `whmbase:${backend.root}`, filename_encryption: 'standard', directory_name_encryption: 'true', password: rcloneObscure(config.cryptPassword), password2: rcloneObscure(config.cryptPassword2) }]);
+    root = '';
+  } else {
+    sections.push(['whm', backend.section]);
+    root = backend.root;
+  }
+  const lines = [];
+  for (const [name, kv] of sections) {
+    lines.push(`[${name}]`);
+    for (const [k, v] of Object.entries(kv)) {
+      if (v == null || v === '') continue;
+      assertIniValue(k, v);
+      lines.push(`${k} = ${v}`);
+    }
+    lines.push('');
+  }
+  return { text: lines.join('\n'), root };
+}
+
+// "whm:" plus the path inside the remote; an empty root and name address the
+// remote itself. Never starts with "-", so it is safe after the flags.
+export const rcloneTarget = (root, name = '') => `whm:${root ? `${root.replace(/\/+$/, '')}${name ? '/' : ''}` : ''}${name}`;
+
+// A refresh token the provider rotated during the call (rclone writes the new
+// token back into its config file) so the panel can persist it.
+export function readTokenUpdate(text, config) {
+  if (!OAUTH_KINDS.includes(config.kind)) return null;
+  const section = config.crypt ? 'whmbase' : 'whm';
+  let inSection = false;
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.trim();
+    if (/^\[.*\]$/.test(line)) { inSection = line === `[${section}]`; continue; }
+    if (!inSection) continue;
+    const m = /^token\s*=\s*(.+)$/.exec(line);
+    if (!m) continue;
+    try {
+      const tok = JSON.parse(m[1]);
+      if (typeof tok?.refresh_token === 'string' && tok.refresh_token && tok.refresh_token !== config.refreshToken) return { refreshToken: tok.refresh_token };
+    } catch { /* not ours to repair */ }
+    return null;
+  }
+  return null;
+}
+
+function rcloneFailure(result, what, config) {
+  const line = result.stderr.trim().split('\n').map((l) => l.trim()).filter(Boolean).pop() || '';
+  const reason = RCLONE_CODES[result.code] || `rclone exited with status ${result.code}`;
+  const detail = scrubSecrets(line.replace(/^\d{4}\/\d\d\/\d\d \d\d:\d\d:\d\d\s+(ERROR|NOTICE|INFO|DEBUG)?\s*:?\s*/, ''), config).slice(0, 500);
+  return new OpError('destination_failed', `${what}: ${reason}${detail ? ` (${detail})` : ''}`, { exitCode: result.code });
+}
+
+export function parseLsjson(stdout) {
+  let entries;
+  try { entries = JSON.parse(String(stdout || '[]')); } catch { throw new OpError('destination_failed', 'rclone returned an unreadable listing'); }
+  if (!Array.isArray(entries)) return [];
+  return entries.filter((e) => e && !e.IsDir && typeof e.Name === 'string').map((e) => ({ name: e.Name, sizeBytes: Number.isFinite(e.Size) && e.Size >= 0 ? e.Size : null, mtime: typeof e.ModTime === 'string' ? e.ModTime : null }));
+}
+
+// Runs one rclone command. `argv` receives the root inside the remote (empty
+// for a crypt remote, whose root is part of its definition) and returns the
+// command and its arguments; the config file is removed whatever happens.
+async function rclone(config, argv, ctx, { what, timeoutMs = 600_000 } = {}) {
+  if (!hasBinary('rclone')) throw new OpError('capability_missing', 'rclone is not installed on this server; install the rclone package to use cloud storage destinations and encrypted uploads', { bin: 'rclone', capability: 'rclone' });
+  const dir = fs.mkdtempSync(path.join(tmpDir(ctx), 'backup-rclone-'));
+  try {
+    const backend = await rcloneBackend(config, dir, ctx);
+    const conf = renderRcloneConf(config, backend);
+    const confFile = secretFile(dir, 'rclone', conf.text);
+    const cache = path.join(dir, 'cache');
+    fs.mkdirSync(cache, { mode: 0o700 });
+    const args = ['--config', confFile, '--cache-dir', cache, '--contimeout', '30s', '--timeout', '5m', '--retries', '3', '--retries-sleep', '5s', '--low-level-retries', '10', '--stats', '0', '--log-level', 'ERROR', ...backend.flags, ...argv(conf.root)];
+    const r = await exec('rclone', args, { allowFailure: true, timeoutMs: timeoutMs + 5000, maxBuffer: 64 * 1024 * 1024, env: { HOME: dir } });
+    let tokenUpdate = null;
+    try { tokenUpdate = readTokenUpdate(fs.readFileSync(confFile, 'utf8'), config); } catch { tokenUpdate = null; }
+    if (r.code !== 0) throw rcloneFailure(r, what, config);
+    return { stdout: r.stdout, code: r.code, root: backend.root, tokenUpdate };
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+const displayPath = (config, root, name) => `${config.kind}://${joinRemote(root, name)}${config.crypt ? ' (encrypted)' : ''}`;
+
+defineOp('backup.rclone.test', {
+  description: 'Upload, list and delete a probe file through rclone (cloud providers, encrypted remotes); returns ok:false with the reason instead of throwing',
+  timeoutMs: 300_000,
+  schema: z.object({ config: destinationConfig }).strict(),
+  run: async ({ config }, ctx) => {
+    const started = Date.now();
+    const name = `whm-backup-test-${crypto.randomBytes(6).toString('hex')}.txt`;
+    const probe = path.join(tmpDir(ctx), name);
+    fs.writeFileSync(probe, `WHM backup destination test ${new Date().toISOString()}\n`, { mode: 0o600 });
+    try {
+      const up = await rclone(config, (root) => ['copyto', probe, rcloneTarget(root, name)], ctx, { what: 'test upload', timeoutMs: 120_000 });
+      const ls = await rclone(config, (root) => ['lsjson', rcloneTarget(root, name)], ctx, { what: 'test listing', timeoutMs: 120_000 });
+      const seen = parseLsjson(ls.stdout).some((e) => e.name === name);
+      let cleaned = true;
+      try { await rclone(config, (root) => ['deletefile', rcloneTarget(root, name)], ctx, { what: 'test delete', timeoutMs: 120_000 }); } catch { cleaned = false; }
+      const where = displayPath(config, up.root, '');
+      if (!seen) return { ok: false, message: `test listing: the probe file was uploaded to ${where} but does not show in the listing`, code: 'destination_failed', ms: Date.now() - started, tokenUpdate: ls.tokenUpdate || up.tokenUpdate };
+      return { ok: true, message: `Uploaded, listed and ${cleaned ? 'deleted' : 'could not delete'} a probe file at ${where}`, encrypted: Boolean(config.crypt), ms: Date.now() - started, tokenUpdate: ls.tokenUpdate || up.tokenUpdate };
+    } catch (err) {
+      if (err.code === 'capability_missing' || err.code === 'path_not_allowed' || err.code === 'invalid_args') throw err;
+      return { ok: false, message: err.message, code: err.code || 'failed', ms: Date.now() - started };
+    } finally { unlinkQuiet(probe); }
+  },
+});
+
+defineOp('backup.rclone.upload', {
+  description: 'Copy a local archive to a destination through rclone (cloud providers, encrypted remotes)',
+  timeoutMs: 7_200_000,
+  schema: z.object({ config: destinationConfig, file: archivePath, remoteName: readableName.optional() }).strict(),
+  run: async ({ config, file, remoteName }, ctx) => {
+    const local = ctx.assertAllowedPath(file, 'read');
+    if (!exists(local)) throw new OpError('not_found', `${file} does not exist`);
+    const started = Date.now();
+    const name = remoteName || path.basename(local);
+    const size = fs.statSync(local).size;
+    const up = await rclone(config, (root) => ['copyto', local, rcloneTarget(root, name)], ctx, { what: `upload to ${config.kind}`, timeoutMs: 7_200_000 });
+    const ls = await rclone(config, (root) => ['lsjson', rcloneTarget(root, name)], ctx, { what: `verify upload to ${config.kind}`, timeoutMs: 120_000 });
+    const entry = parseLsjson(ls.stdout).find((e) => e.name === name);
+    if (!entry) throw new OpError('destination_failed', `upload to ${config.kind}: ${name} is not listed on the destination after the copy`);
+    if (entry.sizeBytes != null && entry.sizeBytes !== size) throw new OpError('destination_failed', `upload to ${config.kind}: the destination holds ${entry.sizeBytes} bytes for ${name}, the archive has ${size}`);
+    return { kind: config.kind, name, remotePath: displayPath(config, up.root, name), sizeBytes: size, encrypted: Boolean(config.crypt), ms: Date.now() - started, tokenUpdate: ls.tokenUpdate || up.tokenUpdate };
+  },
+});
+
+defineOp('backup.rclone.download', {
+  description: 'Fetch an archive from an rclone destination into a local directory (decrypts through the crypt remote)',
+  timeoutMs: 7_200_000,
+  schema: z.object({ config: destinationConfig, remoteName: readableName, dest: arg.absPath }).strict(),
+  run: async ({ config, remoteName, dest }, ctx) => {
+    const dir = ctx.assertAllowedPath(dest, 'write');
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const target = path.join(dir, remoteName);
+    const started = Date.now();
+    let r;
+    try {
+      r = await rclone(config, (root) => ['copyto', rcloneTarget(root, remoteName), target], ctx, { what: `download from ${config.kind}`, timeoutMs: 7_200_000 });
+    } catch (err) { unlinkQuiet(target); throw err; }
+    if (!exists(target)) throw new OpError('destination_failed', `download from ${config.kind}: rclone finished but ${remoteName} was not written`);
+    fs.chmodSync(target, 0o600);
+    return { path: target, name: remoteName, sizeBytes: fs.statSync(target).size, sha256: await sha256File(target), encrypted: Boolean(config.crypt), ms: Date.now() - started, tokenUpdate: r.tokenUpdate };
+  },
+});
+
+defineOp('backup.rclone.list', {
+  description: 'Account archives present on an rclone destination (names decrypted through the crypt remote)',
+  timeoutMs: 300_000,
+  schema: z.object({ config: destinationConfig }).strict(),
+  run: async ({ config }, ctx) => {
+    let r;
+    try {
+      r = await rclone(config, (root) => ['lsjson', '--files-only', rcloneTarget(root)], ctx, { what: `list ${config.kind}`, timeoutMs: 300_000 });
+    } catch (err) {
+      if (err.code === 'destination_failed' && err.details?.exitCode === 3) return { kind: config.kind, encrypted: Boolean(config.crypt), archives: [], tokenUpdate: null };
+      throw err;
+    }
+    return { kind: config.kind, encrypted: Boolean(config.crypt), archives: parseLsjson(r.stdout).filter((a) => READ_NAME.test(a.name)).map((a) => ({ ...a, username: archiveUser(a.name) })), tokenUpdate: r.tokenUpdate };
+  },
+});
+
+defineOp('backup.rclone.delete', {
+  description: 'Delete an archive from an rclone destination (retention pruning)',
+  destructive: true,
+  timeoutMs: 300_000,
+  schema: z.object({ config: destinationConfig, remoteName: readableName }).strict(),
+  run: async ({ config, remoteName }, ctx) => {
+    try {
+      const r = await rclone(config, (root) => ['deletefile', rcloneTarget(root, remoteName)], ctx, { what: `delete on ${config.kind}`, timeoutMs: 300_000 });
+      return { kind: config.kind, name: remoteName, removed: true, tokenUpdate: r.tokenUpdate };
+    } catch (err) {
+      if (err.code === 'destination_failed' && (err.details?.exitCode === 3 || err.details?.exitCode === 4)) return { kind: config.kind, name: remoteName, removed: false, tokenUpdate: null };
+      throw err;
+    }
+  },
 });

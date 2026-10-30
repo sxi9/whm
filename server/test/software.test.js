@@ -14,6 +14,9 @@ const phpSource = { configured: false };
 const PHP_SOURCE_LABEL = 'Ondřej Surý PPA (ppa:ondrej/php)';
 let installedPkgs = [{ name: 'apache2', version: '2.4.58', arch: 'amd64', summary: 'Apache HTTP Server' }, { name: 'php-fpm', version: '8.3', arch: 'all', summary: 'FPM' }, { name: 'curl', version: '8.5.0', arch: 'amd64', summary: 'cli' }, { name: 'libapache2-mod-evasive', version: '1.1', arch: 'amd64', summary: 'evasive' }];
 let nginxState = { installed: true, active: true, proxyConfigured: false, content: null };
+// Names the mocked repositories do not carry (pkg.offers answers offered: false).
+const notOffered = new Set(['netdata', 'php8.2-redis']);
+const offersHandler = ({ packages }) => ({ manager: 'apt', packages: Object.fromEntries(packages.map((n) => [n, notOffered.has(n) ? { installed: null, candidate: null, origin: null, offered: false } : { installed: installedPkgs.find((p) => p.name === n)?.version ?? null, candidate: '1.0-1', origin: 'http://archive.ubuntu.com/ubuntu', offered: true }])) });
 let rpmPresent = false;
 
 let app;
@@ -43,7 +46,16 @@ beforeAll(async () => {
       if (prefix) list = list.filter((p) => prefix.some((pre) => p.name === pre || p.name.startsWith(pre)));
       return { manager: 'apt', total: installedPkgs.length, packages: list };
     },
-    'pkg.search': ({ q, limit }) => ({ manager: 'apt', q, results: [{ name: q, summary: `the ${q} package`, installed: installedPkgs.some((p) => p.name === q), installedVersion: null }, { name: `lib${q}`, summary: 'library', installed: false, installedVersion: null }].slice(0, limit) }),
+    'pkg.search': ({ q, limit, all }) => {
+      const mark = (name, summary, variants = []) => ({ name, summary, installed: installedPkgs.some((p) => p.name === name), installedVersion: installedPkgs.find((p) => p.name === name)?.version ?? null, variants, variantCount: variants.length });
+      const rows = all
+        ? [mark(q, `the ${q} package`), mark(`${q}-dev`, 'headers'), mark(`${q}-doc`, 'docs'), mark(`lib${q}`, 'library')]
+        : [mark(q, `the ${q} package`, [{ name: `${q}-dev`, summary: 'headers', kind: 'dev', installed: false, installedVersion: null }, { name: `${q}-doc`, summary: 'docs', kind: 'doc', installed: false, installedVersion: null }]), mark(`lib${q}`, 'library')];
+      const shown = rows.slice(0, limit);
+      const collapsed = shown.reduce((n, r) => n + r.variantCount, 0);
+      return { manager: 'apt', q, all: Boolean(all), results: shown, total: 4, shown: shown.length, collapsed, hidden: 4 - shown.length - collapsed, more: rows.length > limit, truncated: rows.length - shown.length };
+    },
+    'pkg.offers': offersHandler,
     'pkg.info': ({ name }) => ({ manager: 'apt', name, installed: null, candidate: '1.0', summary: 'info', section: 'web', homepage: null, size: null }),
     'pkg.install': ({ packages }) => { installedPkgs = [...installedPkgs, ...packages.filter((p) => !installedPkgs.some((i) => i.name === p)).map((name) => ({ name, version: '1.0', arch: 'amd64', summary: 'installed by test' }))]; return { manager: 'apt', packages, output: [`Setting up ${packages.join(' ')}`] }; },
     'pkg.remove': ({ packages, purge }) => { installedPkgs = installedPkgs.filter((p) => !packages.includes(p.name)); return { manager: 'apt', packages, purge, output: [`Removing ${packages.join(' ')}`] }; },
@@ -172,7 +184,7 @@ describe('module registration and RBAC', () => {
   });
 
   it('server-wide functions are root only', async () => {
-    for (const url of ['/api/software/pkg/detect', '/api/software/pkg/installed', '/api/software/pkg/search?q=curl', '/api/software/update/status', '/api/software/rpmdb', '/api/software/perl/modules', '/api/software/modules/installers', '/api/software/panel/update', '/api/software/php/pools', '/api/software/php/ini/8.3', '/api/software/php/installable', '/api/software/nginx', '/api/software/ea4/profiles']) {
+    for (const url of ['/api/software/pkg/detect', '/api/software/pkg/installed', '/api/software/pkg/search?q=curl', '/api/software/pkg/catalog', '/api/software/update/status', '/api/software/rpmdb', '/api/software/perl/modules', '/api/software/modules/installers', '/api/software/panel/update', '/api/software/php/pools', '/api/software/php/ini/8.3', '/api/software/php/installable', '/api/software/nginx', '/api/software/ea4/profiles']) {
       expect((await reseller.get(url)).status, url).toBe(403);
     }
     expect((await mutate(reseller, 'post', '/api/software/php/install', { version: '8.4' }, resellerCsrf)).status).toBe(403);
@@ -180,6 +192,7 @@ describe('module registration and RBAC', () => {
     expect(app.agent.callsTo('pkg.php.sources.detect')).toHaveLength(0);
     expect(app.agent.callsTo('pkg.php.remove')).toHaveLength(0);
     expect((await mutate(reseller, 'post', '/api/software/pkg/install', { packages: ['nginx'] }, resellerCsrf)).status).toBe(403);
+    expect((await mutate(reseller, 'post', '/api/software/pkg/catalog/redis/install', {}, resellerCsrf)).status).toBe(403);
     expect((await mutate(reseller, 'post', '/api/software/update/run', {}, resellerCsrf)).status).toBe(403);
     expect((await mutate(reseller, 'put', '/api/software/php/default', { version: '8.2' }, resellerCsrf)).status).toBe(403);
     expect((await mutate(reseller, 'put', '/api/software/php/ini/8.3', { directives: { memory_limit: '1G' } }, resellerCsrf)).status).toBe(403);
@@ -285,6 +298,7 @@ describe('capability degradation (501)', () => {
     await provision(false);
     const checks = [
       ['get', '/api/software/pkg/installed', undefined, 'pkg'], ['get', '/api/software/pkg/search?q=curl', undefined, 'pkg'], ['post', '/api/software/pkg/install', { packages: ['curl'] }, 'pkg'],
+      ['get', '/api/software/pkg/catalog', undefined, 'pkg'], ['post', '/api/software/pkg/catalog/redis/install', {}, 'pkg'],
       ['post', '/api/software/pkg/update-index', {}, 'pkg'], ['get', '/api/software/update/status', undefined, 'pkg'], ['post', '/api/software/update/run', {}, 'pkg'],
       ['post', '/api/software/rpmdb/rebuild', {}, 'rpm'], ['get', '/api/software/perl/modules', undefined, 'perl'], ['post', '/api/software/perl/install', { modules: ['DBI'] }, 'perl'],
       ['get', '/api/software/modules/gem', undefined, 'gem'], ['post', '/api/software/modules/pip/install', { name: 'requests' }, 'pip'],
@@ -345,7 +359,17 @@ describe('Install Distro Packages', () => {
     expect(installed.body.data.map((p) => p.name)).toEqual(['apache2', 'libapache2-mod-evasive']);
     expect(installed.body.meta).toMatchObject({ page: 1, pageSize: 10, total: 2, manager: 'apt' });
     const search = await get('/api/software/pkg/search?q=curl');
-    expect(search.body.data.results[0]).toMatchObject({ name: 'curl', installed: true });
+    expect(search.body.data.results[0]).toMatchObject({ name: 'curl', installed: true, variantCount: 2 });
+    expect(search.body.data.results[0].variants.map((v) => v.name)).toEqual(['curl-dev', 'curl-doc']);
+    expect(search.body.data).toMatchObject({ all: false, total: 4, shown: 2, collapsed: 2, hidden: 0, more: false });
+    expect(app.agent.callsTo('pkg.search').pop().args).toEqual({ q: 'curl', limit: 60, all: false });
+    // "Show everything": the raw ranked list, no folding, with the cap the page asked for.
+    const everything = await get('/api/software/pkg/search?q=curl&all=true&limit=3');
+    expect(everything.body.data).toMatchObject({ all: true, total: 4, shown: 3, collapsed: 0, hidden: 1, more: true, truncated: 1 });
+    expect(everything.body.data.results.map((r) => r.name)).toEqual(['curl', 'curl-dev', 'curl-doc']);
+    expect(app.agent.callsTo('pkg.search').pop().args).toEqual({ q: 'curl', limit: 3, all: true });
+    expect((await get('/api/software/pkg/search?q=curl&all=maybe')).status).toBe(422);
+    expect((await get('/api/software/pkg/search?q=curl&limit=0')).status).toBe(422);
     const info = await get('/api/software/pkg/info/curl');
     expect(info.body.data).toMatchObject({ name: 'curl', candidate: '1.0' });
   });
@@ -437,6 +461,140 @@ describe('Install Distro Packages', () => {
     const r2 = await app.ctx.software.pkg.ensureInstalled(['curl', 'bind9'], { user: { id: 1 } });
     expect(r2.missing).toEqual(['bind9']);
     expect((await waitForJob(app.ctx, r2.job.id)).status).toBe('done');
+  });
+});
+
+describe('Package catalog (Install Distro Packages opens on it)', () => {
+  const entry = (body, key) => body.data.groups.flatMap((g) => g.entries).find((e) => e.key === key);
+
+  it('lists the curated groups with installed and offered state per entry and per PHP version', async () => {
+    app.agent.calls.length = 0;
+    const res = await get('/api/software/pkg/catalog');
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({ manager: 'apt', family: 'debian', offersKnown: true, installedTotal: installedPkgs.length });
+    expect(res.body.data.groups.map((g) => g.key)).toEqual(['web', 'php', 'databases', 'mail', 'security', 'tools', 'monitoring', 'services']);
+    expect(res.body.data.entries).toBe(res.body.data.total);
+    expect(res.body.data.phpVersions.map((v) => v.id)).toEqual(['8.3', '8.2']);
+    const apache = entry(res.body, 'apache');
+    expect(apache).toMatchObject({ installed: true, partial: false, offered: true, missing: [], category: 'web', recommended: true, capability: 'apache', configure: '/service-configuration/apache-configuration' });
+    expect(apache.packages).toEqual([{ name: 'apache2', installed: true, version: '2.4.58', offered: true, candidate: null }]);
+    // The stack's PHP meta set is only partly there (php-fpm alone).
+    expect(entry(res.body, 'php')).toMatchObject({ installed: false, partial: true, offered: true });
+    expect(entry(res.body, 'imagemagick')).toMatchObject({ installed: true, packages: [{ name: 'imagemagick', installed: true }] });
+    const redis = entry(res.body, 'redis');
+    expect(redis).toMatchObject({ installed: false, partial: false, offered: true, missing: [], php: null });
+    expect(redis.packages).toEqual([{ name: 'redis-server', installed: false, version: null, offered: true, candidate: '1.0-1' }]);
+    // Not in the repositories: the card says so instead of offering an install that would fail.
+    expect(entry(res.body, 'netdata')).toMatchObject({ installed: false, offered: false, missing: ['netdata'] });
+    // PHP extensions expand per installed version; 8.2's redis is not offered here, so the entry is partly offered.
+    const phpRedis = entry(res.body, 'php-redis');
+    expect(phpRedis.packages.map((p) => p.name)).toEqual(['php8.3-redis', 'php8.2-redis']);
+    expect(phpRedis.php.unversioned).toBe(false);
+    expect(phpRedis.php.versions).toEqual([
+      { id: '8.3', label: 'PHP 8.3', name: 'php8.3-redis', installed: false, version: null, offered: true, candidate: '1.0-1' },
+      { id: '8.2', label: 'PHP 8.2', name: 'php8.2-redis', installed: false, version: null, offered: false, candidate: null },
+    ]);
+    expect(phpRedis).toMatchObject({ offered: false, missing: ['php8.2-redis'] });
+    // One dpkg listing and one offers batch; the batch never asks about names already installed.
+    expect(app.agent.callsTo('pkg.list_installed')).toHaveLength(1);
+    const offers = app.agent.callsTo('pkg.offers');
+    expect(offers).toHaveLength(1);
+    expect(offers[0].args.packages).not.toContain('apache2');
+    expect(offers[0].args.packages).toEqual(expect.arrayContaining(['redis-server', 'php8.3-redis', 'netdata']));
+  });
+
+  it('filters by group and by text, and refuses other shapes', async () => {
+    const mail = await get('/api/software/pkg/catalog?group=mail');
+    expect(mail.body.data.groups.map((g) => g.key)).toEqual(['mail']);
+    expect(mail.body.data.groups[0].entries.map((e) => e.key)).toEqual(expect.arrayContaining(['exim', 'dovecot', 'spamassassin', 'clamav', 'roundcube']));
+    expect(mail.body.data.total).toBeGreaterThan(mail.body.data.entries);
+    const redis = await get('/api/software/pkg/catalog?q=redis');
+    // Key, label, description and package names of either family count (memcached's description names Redis).
+    expect(redis.body.data.groups.flatMap((g) => g.entries).map((e) => e.key).sort()).toEqual(['memcached', 'php-igbinary', 'php-msgpack', 'php-redis', 'redis']);
+    expect((await get('/api/software/pkg/catalog?q=nothing-like-this')).body.data.groups).toEqual([]);
+    expect((await get('/api/software/pkg/catalog?q=a;b')).status).toBe(422);
+    expect((await get('/api/software/pkg/catalog?group=Mail!')).status).toBe(422);
+    expect((await get('/api/software/pkg/catalog?refresh=yes')).status).toBe(422);
+  });
+
+  it('serves the offered state from a cache until an install, a refresh or a new name invalidates it', async () => {
+    app.agent.calls.length = 0;
+    await get('/api/software/pkg/catalog');
+    await get('/api/software/pkg/catalog?group=tools');
+    expect(app.agent.callsTo('pkg.offers')).toHaveLength(0);
+    await get('/api/software/pkg/catalog?refresh=true');
+    expect(app.agent.callsTo('pkg.offers')).toHaveLength(1);
+    const res = await post('/api/software/pkg/catalog/redis/install', {});
+    expect(res.status).toBe(202);
+    expect((await waitForJob(app.ctx, res.body.data.job.id)).status).toBe('done');
+    app.agent.calls.length = 0;
+    await get('/api/software/pkg/catalog');
+    expect(app.agent.callsTo('pkg.offers')).toHaveLength(1);
+  });
+
+  it('installs one entry by key with the family names, as a job with an audit row', async () => {
+    const res = await post('/api/software/pkg/catalog/memcached/install', {});
+    expect(res.status).toBe(202);
+    expect(res.body.data).toMatchObject({ key: 'memcached', packages: ['memcached'] });
+    const job = await waitForJob(app.ctx, res.body.data.job.id);
+    expect(job.status).toBe('done');
+    expect(job.result).toMatchObject({ packages: ['memcached'], catalogEntry: 'memcached', skipped: [] });
+    expect(app.agent.callsTo('pkg.install').pop().args).toEqual({ packages: ['memcached'], noRecommends: false, wait: false });
+    expect(installedPkgs.some((p) => p.name === 'memcached')).toBe(true);
+    expect(entry((await get('/api/software/pkg/catalog?group=databases')).body, 'memcached')).toMatchObject({ installed: true });
+    const audit = app.ctx.db.prepare("SELECT target, args_redacted FROM audit_log WHERE action = 'software.pkg.catalog.install' ORDER BY id DESC LIMIT 1").get();
+    expect(audit.target).toBe('memcached');
+    expect(JSON.parse(audit.args_redacted)).toMatchObject({ packages: ['memcached'], family: 'debian', phpVersion: null });
+    expect((await post('/api/software/pkg/catalog/no-such-entry/install', {})).status).toBe(404);
+    expect((await post('/api/software/pkg/catalog/Bad.Key/install', {})).status).toBe(422);
+    expect((await post('/api/software/pkg/catalog/memcached/install', { extra: true })).status).toBe(422);
+  });
+
+  it('installs a PHP extension for one version or for every installed version, skipping what the repositories lack', async () => {
+    const one = await post('/api/software/pkg/catalog/php-redis/install', { phpVersion: '8.3' });
+    expect(one.status).toBe(202);
+    expect(one.body.data.packages).toEqual(['php8.3-redis']);
+    expect((await waitForJob(app.ctx, one.body.data.job.id)).result).toMatchObject({ packages: ['php8.3-redis'], skipped: [] });
+    installedPkgs = installedPkgs.filter((p) => p.name !== 'php8.3-redis');
+    const all = await post('/api/software/pkg/catalog/php-redis/install', {});
+    expect(all.body.data.packages).toEqual(['php8.3-redis', 'php8.2-redis']);
+    const job = await waitForJob(app.ctx, all.body.data.job.id);
+    expect(job.status).toBe('done');
+    expect(job.result).toMatchObject({ packages: ['php8.3-redis'], skipped: ['php8.2-redis'] });
+    expect(job.logs.some((l) => /php8.2-redis: not offered/.test(l.line))).toBe(true);
+    expect(app.agent.callsTo('pkg.install').pop().args.packages).toEqual(['php8.3-redis']);
+    expect((await post('/api/software/pkg/catalog/php-redis/install', { phpVersion: '7.0' })).status).toBe(422);
+    expect((await post('/api/software/pkg/catalog/redis/install', { phpVersion: '8.3' })).status).toBe(422);
+    // Nothing offered at all: the job fails with the names instead of running an installer that cannot succeed.
+    notOffered.add('nethogs'); notOffered.add('iftop');
+    try {
+      const none = await waitForJob(app.ctx, (await post('/api/software/pkg/catalog/iftop-nethogs/install', {})).body.data.job.id);
+      expect(none.status).toBe('failed');
+      expect(none.error).toMatch(/None of the packages of "iftop-nethogs" is offered/);
+    } finally { notOffered.delete('nethogs'); notOffered.delete('iftop'); }
+  });
+
+  it('keeps working without PHP (unversioned meta-packages) and when the agent cannot report offers', async () => {
+    await provision(true, { php: false, 'php-fpm': false });
+    try {
+      const res = await get('/api/software/pkg/catalog?q=redis');
+      expect(res.body.data.phpVersions).toEqual([]);
+      const phpRedis = entry(res.body, 'php-redis');
+      expect(phpRedis.packages.map((p) => p.name)).toEqual(['php-redis']);
+      expect(phpRedis.php).toEqual({ versions: [], unversioned: true });
+    } finally { await provision(true); }
+    app.agent.fail('pkg.offers', 'unknown_op', 'Unknown op "pkg.offers"');
+    try {
+      const res = await get('/api/software/pkg/catalog?refresh=true&group=databases');
+      expect(res.status).toBe(200);
+      expect(res.body.data.offersKnown).toBe(false);
+      expect(entry(res.body, 'postgresql')).toMatchObject({ installed: false, offered: null, missing: [] });
+      // The failure is not cached: the next page load asks again once the op answers.
+      app.agent.set('pkg.offers', offersHandler);
+      app.agent.calls.length = 0;
+      expect((await get('/api/software/pkg/catalog?group=databases')).body.data.offersKnown).toBe(true);
+      expect(app.agent.callsTo('pkg.offers')).toHaveLength(1);
+    } finally { app.agent.set('pkg.offers', offersHandler); }
   });
 });
 

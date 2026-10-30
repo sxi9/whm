@@ -23,6 +23,7 @@ export const PACKAGE_GROUPS = [
   { key: 'security', label: 'Security', description: 'Brute-force protection, the web application firewall, rootkit and audit scanners.' },
   { key: 'tools', label: 'Tools', description: 'Version control, archivers, media libraries and language toolchains that applications depend on.' },
   { key: 'monitoring', label: 'Monitoring', description: 'Process, disk, I/O and network observation for the server itself.' },
+  { key: 'services', label: 'Hosting services', description: 'The remaining daemons a hosting server runs: authoritative DNS, FTP access and per-account disk quotas.' },
 ];
 
 export const PACKAGE_CATALOG = [
@@ -35,6 +36,9 @@ export const PACKAGE_CATALOG = [
   { key: 'nginx', category: 'web', stack: 'nginx', recommended: false, configure: '/software/nginx-manager' },
   { key: 'certbot', category: 'web', stack: 'acme', recommended: true, configure: '/ssl-tls/manage-autossl' },
   { key: 'varnish', category: 'web', label: 'Varnish Cache', description: 'HTTP accelerator for sites that need a full-page cache in front of Apache.', packages: { debian: ['varnish'], rhel: ['varnish'] }, requires: { rhel: EPEL }, recommended: false },
+  { key: 'awstats', category: 'web', stack: 'awstats', recommended: true, configure: '/server-configuration/statistics-software-configuration' },
+  { key: 'webalizer', category: 'web', stack: 'webalizer', recommended: false, configure: '/server-configuration/statistics-software-configuration' },
+  { key: 'analog', category: 'web', stack: 'analog', recommended: false, configure: '/server-configuration/statistics-software-configuration' },
 
   // --- PHP -------------------------------------------------------------------
   { key: 'php', category: 'php', stack: 'php', recommended: true, configure: '/software/multiphp-manager' },
@@ -75,7 +79,7 @@ export const PACKAGE_CATALOG = [
   { key: 'exim', category: 'mail', stack: 'exim', recommended: true, configure: '/service-configuration/exim-configuration-manager' },
   { key: 'dovecot', category: 'mail', stack: 'dovecot', recommended: true, configure: '/service-configuration/mailserver-configuration' },
   { key: 'spamassassin', category: 'mail', stack: 'spamassassin', recommended: true, configure: '/email/spamd-startup-configuration' },
-  { key: 'clamav', category: 'mail', stack: 'clamav', recommended: false, configure: '/plugins/clamav-scanner' },
+  { key: 'clamav', category: 'mail', stack: 'clamav', recommended: false, configure: '/plugins/imunifyav' },
   { key: 'roundcube', category: 'mail', label: 'Roundcube webmail', description: 'Browser-based IMAP client for every mailbox on the server.', packages: { debian: ['roundcube', 'roundcube-mysql'], rhel: ['roundcubemail'] }, requires: { rhel: EPEL }, recommended: true },
   { key: 'mailman', category: 'mail', stack: 'mailman', recommended: false, configure: '/cpanel/reset-a-mailman-password' },
 
@@ -112,6 +116,11 @@ export const PACKAGE_CATALOG = [
   { key: 'smartmontools', category: 'monitoring', label: 'smartmontools', description: 'S.M.A.R.T. disk health checks and failure warnings.', packages: { debian: ['smartmontools'], rhel: ['smartmontools'] }, recommended: false },
   { key: 'logwatch', category: 'monitoring', label: 'Logwatch', description: 'Daily digest of the system logs by mail.', packages: { debian: ['logwatch'], rhel: ['logwatch'] }, recommended: false },
   { key: 'ncdu', category: 'monitoring', label: 'ncdu', description: 'Finds what fills the disk, directory by directory.', packages: { debian: ['ncdu'], rhel: ['ncdu'] }, requires: { rhel: EPEL }, recommended: false },
+
+  // --- Hosting services --------------------------------------------------------
+  { key: 'bind', category: 'services', stack: 'bind', recommended: true, configure: '/dns-functions/dns-zone-manager' },
+  { key: 'ftp', category: 'services', stack: 'ftp', recommended: true, configure: '/service-configuration/ftp-server-selection' },
+  { key: 'quota', category: 'services', stack: 'quota', recommended: true, configure: '/server-configuration/initial-quota-setup' },
 ];
 
 export const PACKAGE_FAMILIES = ['debian', 'rhel'];

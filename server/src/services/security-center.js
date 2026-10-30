@@ -1526,6 +1526,13 @@ export function createSecurityCenterService(ctx) {
         add({ id: 'htaccess.options', grade: 'warning', title: `${files.length} .htaccess file(s) set Options Apache refuses for account sites`, detail: [...bad.slice(0, 20).map((b) => `${b.file} line ${b.line}: Options ${b.tokens.join(' ')}`), 'An account .htaccess may set only Indexes, MultiViews, SymLinksIfOwnerMatch and IncludesNOEXEC (the vhost AllowOverride); every directory below such a line answers 500 Internal Server Error. Replace FollowSymLinks with SymLinksIfOwnerMatch and drop All, ExecCGI and Includes.'].join('\n'), files });
       });
 
+      // One finding per Hardening item (Security Advisor › Hardening card);
+      // ctx.hardening is created by this category's register().
+      await probe('hardening', 'hardening items', async () => {
+        if (typeof ctx.hardening?.findings !== 'function') return;
+        for (const f of await ctx.hardening.findings()) add(f);
+      });
+
       await probe('hostaccess', 'host access control', async () => {
         if (!stmts.hostRules.all().length) add({ id: 'hostaccess', grade: 'info', title: 'No host access rules are defined', detail: 'TCP wrappers can limit SSH and FTP to trusted networks.', fix: { label: 'Host Access Control', path: '/security-center/host-access-control' } });
       });

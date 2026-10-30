@@ -6,6 +6,7 @@ import { Button, Textarea, ErrorBanner } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, GradePill, FixLink } from '../../security/Shared.jsx';
 import { AlertsPanel } from '../../contacts/SecurityAlerts.jsx';
+import { HardeningCard } from '../../security/Hardening.jsx';
 
 const ORDER = ['critical', 'warning', 'info', 'ok'];
 const TITLES = { critical: 'Critical', warning: 'Warnings', info: 'Informational', ok: 'Passed checks' };
@@ -110,6 +111,7 @@ export default function SecurityAdvisor({ fn }) {
           })}
         </>
       )}
+      <HardeningCard />
       <AlertsPanel />
       <AdvisoryListCard />
     </>

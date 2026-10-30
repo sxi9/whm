@@ -3,6 +3,7 @@ import { Router } from 'express';
 import { validate, z, fields, pagination } from '../../lib/validate.js';
 import { requireRoot } from '../../middleware/rbac.js';
 import { createSecurityCenterService, normalizeIpOrCidr } from '../../services/security-center.js';
+import { createHardeningService, ITEM_IDS as HARDENING_ITEMS, F2B_JAILS, RECONCILE_JOB as HARDENING_RECONCILE } from '../../services/hardening.js';
 
 const yesNo = z.enum(['yes', 'no']);
 const sshdSettings = z.object({
@@ -61,6 +62,13 @@ const createProviderBody = z.unknown().transform((value, ctx) => {
 });
 const groupName = z.string().regex(/^[a-z_][a-z0-9_-]{0,31}$/i);
 const boolQuery = z.enum(['true', 'false']).transform((v) => v === 'true').optional();
+const port = z.number().int().min(1).max(65535);
+const hardeningItem = z.enum(HARDENING_ITEMS);
+const hardeningApplyBody = z.object({
+  confirmSshPort: port.optional(), extraTcp: z.array(port).max(32).optional(), extraUdp: z.array(port).max(32).optional(),
+  jails: z.array(z.enum(F2B_JAILS)).min(1).max(F2B_JAILS.length).optional(), bantimeSeconds: z.number().int().min(60).max(31_536_000).optional(),
+  findtimeSeconds: z.number().int().min(60).max(86_400).optional(), maxretry: z.number().int().min(1).max(100).optional(),
+}).strict();
 
 const modsecDirectives = z.object({
   SecRuleEngine: z.enum(['On', 'Off', 'DetectionOnly']).nullable().optional(),
@@ -92,6 +100,12 @@ export async function register(ctx) {
   if (ctx.security.smtp.desired() || ctx.settings.get('security.cphulk.firewall_sync') || ctx.security.firewall.recorded().length) {
     ctx.jobs.enqueue('security.firewall.reconcile', { trigger: 'boot' });
   }
+  // Hardening (Security Advisor › Hardening card): the firewall baseline is
+  // kernel state like WHM_BLOCK, so it is put back at boot when it was left on.
+  ctx.hardening = createHardeningService(ctx);
+  ctx.capabilities.register('fail2ban', { binaries: ['fail2ban-client', 'fail2ban-server'], required: ['fail2ban-client'] });
+  ctx.jobs.register(HARDENING_RECONCILE, (job) => ctx.hardening.reconcile(job));
+  if (ctx.hardening.desired('firewall')) ctx.jobs.enqueue(HARDENING_RECONCILE, { trigger: 'boot' });
 
   const s = ctx.security;
   const r = Router();
@@ -191,6 +205,16 @@ export async function register(ctx) {
   r.post('/external-auth/:name/discover', validate({ params: z.object({ name: providerName }), body: z.object({ allowForeignEndpoints: z.boolean().optional() }).strict() }), wrap((req) => s.externalAuth.discover(req.params.name, req, { allowForeignEndpoints: req.body.allowForeignEndpoints === true })));
   r.get('/advisor', wrap(() => s.advisor.last()));
   r.post('/advisor/scan', wrap((req) => s.advisor.scan('manual', req)));
+
+  // Hardening: live status per item, Apply / Revert, Fail2ban unban + install
+  const h = ctx.hardening;
+  const applied = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(d?.job ? 202 : 200).json({ data: d })).catch(next);
+  r.get('/hardening', wrap(() => h.status()));
+  r.get('/hardening/firewall/plan', wrap(() => h.firewall.plan()));
+  r.post('/hardening/fail2ban/unban', validate({ body: z.object({ jail: z.enum(F2B_JAILS), ip: z.string().ip() }).strict() }), wrap((req) => h.fail2ban.unban(req.body, req)));
+  r.post('/hardening/fail2ban/install', accepted((req) => h.fail2ban.install(req.user, req)));
+  r.post('/hardening/:item/apply', validate({ params: z.object({ item: hardeningItem }), body: hardeningApplyBody }), applied((req) => h.apply(req.params.item, req.body, req)));
+  r.post('/hardening/:item/revert', validate({ params: z.object({ item: hardeningItem }) }), wrap((req) => h.revert(req.params.item, req)));
 
   return { path: '/security', router: r };
 }

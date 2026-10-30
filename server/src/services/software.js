@@ -316,6 +316,25 @@ export function createSoftwareService(ctx) {
     return { manager: result.manager, packages: result.packages, purge: result.purge, lines: result.output?.length ?? 0 };
   }
 
+  // A catalog entry names packages for the whole family; the ones this host's
+  // repositories do not carry (a PHP build without a separate opcache package,
+  // an EPEL-only tool before EPEL is enabled) are left out instead of failing
+  // the whole transaction, and the job says which.
+  async function catalogInstallJob(job) {
+    const { packages, noRecommends, catalogEntry } = job.params;
+    let install = packages;
+    let skipped = [];
+    try {
+      const offers = (await job.agent.op('pkg.offers', { packages })).packages;
+      skipped = packages.filter((n) => offers[n]?.offered === false);
+      install = packages.filter((n) => !skipped.includes(n));
+    } catch (err) { job.log(`could not check which packages the repositories offer (${err.message}); installing all of them`, 'warn'); }
+    for (const n of skipped) job.log(`${n}: not offered by the configured repositories; skipped`, 'warn');
+    if (!install.length) throw new Error(`None of the packages of "${catalogEntry}" is offered by the configured repositories: ${skipped.join(', ')}`);
+    const result = await pkgJob(job, 'pkg.install', { packages: install, noRecommends: Boolean(noRecommends) }, `installing ${catalogEntry}`);
+    return { ...result, catalogEntry, skipped };
+  }
+
   // --- system update -------------------------------------------------------
   // The simulation (apt-get -s dist-upgrade / dnf check-update) can take minutes,
   // so its result is kept in settings and served to page loads; the job runs
@@ -1252,7 +1271,7 @@ export function createSoftwareService(ctx) {
   };
 
   const jobs = {
-    'software.pkg.install': (job) => pkgJob(job, 'pkg.install', { packages: job.params.packages, noRecommends: Boolean(job.params.noRecommends) }, 'installing packages'),
+    'software.pkg.install': (job) => (job.params.catalogEntry ? catalogInstallJob(job) : pkgJob(job, 'pkg.install', { packages: job.params.packages, noRecommends: Boolean(job.params.noRecommends) }, 'installing packages')),
     'software.pkg.remove': (job) => pkgJob(job, 'pkg.remove', { packages: job.params.packages, purge: Boolean(job.params.purge) }, 'removing packages'),
     'software.pkg.update_index': (job) => pkgJob(job, 'pkg.update_index', {}, 'refreshing package index'),
     'software.system.update': (job) => update.runJob(job),

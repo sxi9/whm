@@ -15,7 +15,7 @@ import { reconcileHtaccess, htaccessSummary, htaccessFields } from '../lib/htacc
 //   backup.destinationConfig(id)                                    -> decrypted destination config (root-only callers)
 //   backup.localDir()                                               -> the configured local archive directory
 
-export const DESTINATION_KINDS = ['local', 'ftp', 'sftp', 'webdav', 's3'];
+export const DESTINATION_KINDS = ['local', 'ftp', 'sftp', 'webdav', 's3', 'gdrive', 'onedrive', 'dropbox', 'azureblob', 'b2'];
 export const SETTING_KEYS = ['backup.enabled', 'backup.schedule', 'backup.retention_daily', 'backup.retention_weekly', 'backup.retention_monthly', 'backup.local_dir', 'backup.include_home', 'backup.include_mail', 'backup.include_dbs', 'backup.include_dns', 'backup.include_metadata', 'backup.compression_level', 'backup.strict', 'backup.keep_local', 'backup.prune_remote', 'backup.default_include', 'backup.skip_suspended', 'backup.excludes', 'backup.notify_on_failure'];
 const DEFAULTS = {
   'backup.enabled': false, 'backup.schedule': '0 2 * * *', 'backup.retention_daily': 7, 'backup.retention_weekly': 4, 'backup.retention_monthly': 3,
@@ -23,14 +23,15 @@ const DEFAULTS = {
   'backup.compression_level': 6, 'backup.strict': false, 'backup.keep_local': true, 'backup.prune_remote': true, 'backup.default_include': true, 'backup.skip_suspended': false,
   'backup.excludes': ['tmp', 'logs', '.cache'], 'backup.notify_on_failure': true,
 };
-const SECRET_FIELDS = ['password', 'secretKey', 'privateKey'];
+const SECRET_FIELDS = ['password', 'secretKey', 'privateKey', 'refreshToken', 'accountKey', 'sasToken', 'applicationKey', 'cryptPassword', 'cryptPassword2'];
+const OAUTH_KINDS = ['gdrive', 'onedrive', 'dropbox'];
 const SCHEDULE_NAME = 'backup-run';
 // Hand-copied archives are registered from the panel's own directories only;
 // a file in an account home is moved there by root first.
 const IMPORT_ROOTS = ['/backup', '/var/backups/whm'];
 // Ops declared with a longer agent-side timeout than the socket client's 1 h
 // default get a matching per-call timeout (contract §5).
-const LONG_OPS = { 'backup.account.archive': 7_200_000, 'backup.archive.extract': 7_200_000, 'backup.files.restore': 7_200_000, 'backup.db.import': 7_200_000, 'backup.destination.upload': 7_200_000, 'backup.destination.download': 7_200_000, 'backup.archive.verify': 3_600_000 };
+const LONG_OPS = { 'backup.account.archive': 7_200_000, 'backup.archive.extract': 7_200_000, 'backup.files.restore': 7_200_000, 'backup.db.import': 7_200_000, 'backup.destination.upload': 7_200_000, 'backup.destination.download': 7_200_000, 'backup.rclone.upload': 7_200_000, 'backup.rclone.download': 7_200_000, 'backup.archive.verify': 3_600_000 };
 const RESTORABLE_DOMAIN_TYPES = ['addon', 'sub', 'parked', 'alias'];
 
 const isCapabilityMissing = (err) => err instanceof CapabilityError || err?.code === 'capability_missing' || err?.code === 'binary_not_found';
@@ -97,7 +98,9 @@ export function createBackupService(ctx) {
     destinationByName: db.prepare('SELECT id FROM backup_destinations WHERE name = ?'),
     insertDestination: db.prepare(`INSERT INTO backup_destinations (name, kind, config_enc, enabled, updated_at) VALUES (?, ?, ?, ?, datetime('now'))`),
     updateDestination: db.prepare(`UPDATE backup_destinations SET name = @name, kind = @kind, config_enc = @config_enc, enabled = @enabled, updated_at = datetime('now') WHERE id = @id`),
+    updateDestinationConfig: db.prepare(`UPDATE backup_destinations SET config_enc = ?, updated_at = datetime('now') WHERE id = ?`),
     testDestination: db.prepare(`UPDATE backup_destinations SET last_test_at = datetime('now'), last_test_ok = ?, last_test_message = ? WHERE id = ?`),
+    uploadOutcome: db.prepare(`UPDATE backup_destinations SET last_upload_at = datetime('now'), last_upload_ok = ?, last_upload_message = ? WHERE id = ?`),
     deleteDestination: db.prepare('DELETE FROM backup_destinations WHERE id = ?'),
     // Ownership comes from the row (owner_id, fixed when it was written), never
     // from whichever account currently carries the username; the join only
@@ -112,7 +115,7 @@ export function createBackupService(ctx) {
     pinBackup: db.prepare('UPDATE backups SET pinned = ? WHERE id = ?'),
     deleteBackup: db.prepare('DELETE FROM backups WHERE id = ?'),
     uploadsFor: db.prepare('SELECT * FROM backup_uploads WHERE backup_id = ? ORDER BY id'),
-    insertUpload: db.prepare('INSERT INTO backup_uploads (backup_id, destination_id, destination_name, remote_path, status, error) VALUES (?, ?, ?, ?, ?, ?)'),
+    insertUpload: db.prepare('INSERT INTO backup_uploads (backup_id, destination_id, destination_name, remote_path, status, error, encrypted) VALUES (?, ?, ?, ?, ?, ?, ?)'),
     uploadStatus: db.prepare('UPDATE backup_uploads SET status = ?, error = ? WHERE id = ?'),
     insertRun: db.prepare('INSERT INTO backup_runs (job_id, kind, status, started_by, accounts_total) VALUES (?, ?, ?, ?, ?)'),
     runJob: db.prepare('UPDATE backup_runs SET job_id = ? WHERE id = ?'),
@@ -178,7 +181,7 @@ export function createBackupService(ctx) {
   }
 
   function translate(err) {
-    if (isCapabilityMissing(err)) return new CapabilityError('backup', err.message);
+    if (isCapabilityMissing(err)) return new CapabilityError(err.details?.capability === 'rclone' || err.details?.bin === 'rclone' ? 'rclone' : 'backup', err.message);
     if (err?.code === 'path_not_allowed') return unprocessable(`${err.message}. Backup directories must be under /backup, /var/backups/whm, /var/lib/whm or a home root.`, { dir: [err.message] });
     if (err?.code === 'not_found') return notFound(err.message);
     if (err?.code === 'exists') return conflict(err.message);
@@ -212,7 +215,7 @@ export function createBackupService(ctx) {
     await capabilities.ensureFresh();
     const snap = capabilities.snapshot();
     const bins = snap.binaries || {};
-    const capability = { installed: capabilities.has('backup'), binaries: { tar: Boolean(bins.tar), gzip: Boolean(bins.gzip), curl: Boolean(bins.curl), mysqldump: Boolean(bins.mysqldump || bins['mariadb-dump']) } };
+    const capability = { installed: capabilities.has('backup'), binaries: { tar: Boolean(bins.tar), gzip: Boolean(bins.gzip), curl: Boolean(bins.curl), mysqldump: Boolean(bins.mysqldump || bins['mariadb-dump']), rclone: Boolean(bins.rclone) } };
     if (!isRoot(user)) {
       const own = (a) => a.owner_id === user.id;
       return { capability, includedAccounts: includedAccounts().filter(own).length, totalAccounts: stmts.accounts.all().filter(own).length };
@@ -252,11 +255,22 @@ export function createBackupService(ctx) {
 
   // ------------------------------------------------------- destinations ---
 
+  const cloud = () => ctx.backupCloud;
+  const engineOf = (cfg) => (cloud()?.needsRclone(cfg) ? 'rclone' : cfg.kind === 'local' ? 'copy' : cfg.kind === 's3' ? 'native' : 'curl');
+
   function shapeDestination(row) {
     if (!row) return null;
     let cfg = {};
     try { cfg = row.config_enc ? JSON.parse(crypto.decrypt(row.config_enc)) : {}; } catch { cfg = { error: 'configuration could not be decrypted' }; }
-    return { id: row.id, name: row.name, kind: row.kind, enabled: Boolean(row.enabled), config: publicDestinationConfig(cfg), lastTest: row.last_test_at ? { at: row.last_test_at, ok: Boolean(row.last_test_ok), message: row.last_test_message } : null, created_at: row.created_at, updated_at: row.updated_at };
+    const oauth = OAUTH_KINDS.includes(row.kind);
+    return {
+      id: row.id, name: row.name, kind: row.kind, enabled: Boolean(row.enabled), config: publicDestinationConfig(cfg),
+      encrypted: Boolean(cfg.crypt), engine: engineOf({ kind: row.kind, ...cfg }),
+      connection: oauth ? { connected: Boolean(cfg.refreshToken), account: cfg.accountName ?? null, email: cfg.accountEmail ?? null, at: cfg.connectedAt ?? null } : null,
+      lastTest: row.last_test_at ? { at: row.last_test_at, ok: Boolean(row.last_test_ok), message: row.last_test_message } : null,
+      lastUpload: row.last_upload_at ? { at: row.last_upload_at, ok: Boolean(row.last_upload_ok), message: row.last_upload_message } : null,
+      created_at: row.created_at, updated_at: row.updated_at,
+    };
   }
 
   function destinationConfig(row) {
@@ -266,18 +280,59 @@ export function createBackupService(ctx) {
     return { kind: r.kind, ...cfg };
   }
 
+  // The configuration an agent op takes for a destination (OAuth client merged
+  // in, panel bookkeeping dropped); `encrypted: false` addresses the plain
+  // layer of a destination that was encrypted later, for the copies made before.
+  function agentConfig(row, { encrypted = null } = {}) {
+    const cfg = destinationConfig(row);
+    if (encrypted === false && cfg.crypt) { cfg.crypt = false; delete cfg.cryptPassword; delete cfg.cryptPassword2; }
+    if (encrypted === true && !cfg.crypt) throw conflict('This copy is encrypted but the destination no longer carries an encryption key');
+    return cloud() ? cloud().agentConfig(cfg) : cfg;
+  }
+  const isRcloneConfig = (cfg) => Boolean(cloud()?.needsRclone(cfg));
+  const opFor = (cfg, legacy, rclone) => (isRcloneConfig(cfg) ? rclone : legacy);
+
+  // A provider may rotate the refresh token during a call (rclone writes the
+  // new one into its config); it replaces the stored one so the next call works.
+  function persistTokenUpdate(row, update, req) {
+    if (!update?.refreshToken) return;
+    const current = stmts.destinationById.get(row.id);
+    if (!current) return;
+    const cfg = destinationConfig(current);
+    if (cfg.refreshToken === update.refreshToken) return;
+    delete cfg.kind;
+    cfg.refreshToken = update.refreshToken;
+    stmts.updateDestinationConfig.run(crypto.encrypt(JSON.stringify(cfg)), row.id);
+    audit(req, { action: 'backup.destination.token_rotated', target: current.name });
+  }
+
+  // A fresh crypt password + salt for a destination; returned once with a
+  // downloadable text the operator must keep.
+  function issueEncryptionKey(name, kind) {
+    const key = cloud().newEncryptionKey();
+    return { key, shown: { ...key, ...cloud().encryptionKeyFile({ name, kind }, key) } };
+  }
+
   function loadDestination(id) {
     const row = stmts.destinationById.get(id);
     if (!row) throw notFound('Destination');
     return row;
   }
 
+  // Encryption is on unless the caller turns it off (a plain local copy is the
+  // only kind that defaults to off); the key is generated here and shown once.
   function createDestination({ name, kind, enabled = true, config: cfg }, req) {
     if (stmts.destinationByName.get(name)) throw conflict(`A destination named "${name}" already exists`);
     const { kind: _k, ...rest } = cfg;
+    let encryptionKey = null;
+    if (rest.crypt ?? kind !== 'local') {
+      const issued = issueEncryptionKey(name, kind);
+      Object.assign(rest, { crypt: true, ...issued.key, cryptSince: new Date().toISOString() });
+      encryptionKey = issued.shown;
+    } else rest.crypt = false;
     const { lastInsertRowid } = stmts.insertDestination.run(name, kind, crypto.encrypt(JSON.stringify(rest)), enabled ? 1 : 0);
     audit(req, { action: 'backup.destination.create', target: name, args: { kind, config: publicDestinationConfig(rest) } });
-    return shapeDestination(stmts.destinationById.get(lastInsertRowid));
+    return { ...shapeDestination(stmts.destinationById.get(lastInsertRowid)), ...(encryptionKey ? { encryptionKey } : {}) };
   }
 
   // Secrets left empty in an update keep their stored value; an explicit null
@@ -287,18 +342,57 @@ export function createBackupService(ctx) {
     const current = destinationConfig(row);
     const kind = patch.config?.kind || row.kind;
     let merged;
+    let encryptionKey = null;
     if (patch.config) {
       const { kind: _k, ...incoming } = patch.config;
+      if (current.crypt && incoming.crypt === false) throw conflict('Encryption cannot be turned off once it is enabled on a destination; add a new destination for plain copies');
       merged = kind === row.kind ? { ...current, ...incoming } : { ...incoming };
       delete merged.kind;
       for (const f of SECRET_FIELDS) {
         if (incoming[f] === null) { delete merged[f]; continue; }
         if (kind === row.kind && (incoming[f] === '' || incoming[f] === undefined) && current[f] !== undefined) merged[f] = current[f];
       }
+      // The crypt layer and an OAuth connection survive a change of kind that the
+      // schema allows; the remote they point at is the operator's to fix.
+      if (kind !== row.kind) for (const f of ['crypt', 'cryptPassword', 'cryptPassword2', 'cryptSince']) if (current[f] !== undefined && merged[f] === undefined) merged[f] = current[f];
+      if (kind === row.kind && OAUTH_KINDS.includes(kind)) for (const f of ['refreshToken', 'accountName', 'accountEmail', 'connectedAt', 'driveId', 'driveType']) if (current[f] !== undefined) merged[f] = current[f];
+      if (merged.crypt && !merged.cryptPassword) {
+        const issued = issueEncryptionKey(patch.name ?? row.name, kind);
+        Object.assign(merged, { crypt: true, ...issued.key, cryptSince: new Date().toISOString() });
+        encryptionKey = issued.shown;
+      }
+      if (!merged.crypt) merged.crypt = false;
     } else { merged = { ...current }; delete merged.kind; }
     if (patch.name && patch.name !== row.name && stmts.destinationByName.get(patch.name)) throw conflict(`A destination named "${patch.name}" already exists`);
     stmts.updateDestination.run({ id, name: patch.name ?? row.name, kind, config_enc: crypto.encrypt(JSON.stringify(merged)), enabled: patch.enabled == null ? row.enabled : patch.enabled ? 1 : 0 });
     audit(req, { action: 'backup.destination.update', target: patch.name ?? row.name, args: { kind, enabled: patch.enabled, config: patch.config ? publicDestinationConfig(merged) : undefined } });
+    return { ...shapeDestination(stmts.destinationById.get(id)), ...(encryptionKey ? { encryptionKey } : {}) };
+  }
+
+  // Turns encryption on for a plain destination: copies made from now on are
+  // ciphertext, the ones already there stay readable through the plain path.
+  function enableEncryption(id, req) {
+    const row = loadDestination(id);
+    const cfg = destinationConfig(row);
+    if (cfg.crypt) throw conflict(`Destination "${row.name}" is already encrypted`);
+    delete cfg.kind;
+    const issued = issueEncryptionKey(row.name, row.kind);
+    Object.assign(cfg, { crypt: true, ...issued.key, cryptSince: new Date().toISOString() });
+    stmts.updateDestinationConfig.run(crypto.encrypt(JSON.stringify(cfg)), id);
+    audit(req, { action: 'backup.destination.encrypt', target: row.name, args: { kind: row.kind } });
+    return { ...shapeDestination(stmts.destinationById.get(id)), encryptionKey: issued.shown };
+  }
+
+  // Stores the outcome of an OAuth sign-in on the destination (refresh token
+  // encrypted with the rest of the configuration).
+  function connectDestination(id, fields, req) {
+    const row = loadDestination(id);
+    if (!OAUTH_KINDS.includes(row.kind)) throw conflict(`Destination "${row.name}" is not an OAuth destination`);
+    const cfg = destinationConfig(row);
+    delete cfg.kind;
+    Object.assign(cfg, fields);
+    stmts.updateDestinationConfig.run(crypto.encrypt(JSON.stringify(cfg)), id);
+    audit(req, { action: 'backup.destination.connect', target: row.name, args: { provider: row.kind, account: fields.accountName ?? null } });
     return shapeDestination(stmts.destinationById.get(id));
   }
 
@@ -311,20 +405,84 @@ export function createBackupService(ctx) {
 
   async function testDestination(id, req) {
     const row = loadDestination(id);
-    const result = await op('backup.destination.test', { config: destinationConfig(row) }, req);
+    const config = agentConfig(row);
+    const result = await op(opFor(config, 'backup.destination.test', 'backup.rclone.test'), { config }, req);
+    persistTokenUpdate(row, result.tokenUpdate, req);
     stmts.testDestination.run(result.ok ? 1 : 0, result.message, id);
     audit(req, { action: 'backup.destination.test', target: row.name, args: { ok: result.ok, message: result.message }, result: result.ok ? 'ok' : 'failed' });
-    return { ...result, destination: shapeDestination(stmts.destinationById.get(id)) };
+    const { tokenUpdate: _t, ...rest } = result;
+    return { ...rest, destination: shapeDestination(stmts.destinationById.get(id)) };
   }
 
+  // An unsaved configuration has no encryption key and no OAuth tokens yet: the
+  // backend itself is probed, the crypt layer is added on save.
   async function testDestinationConfig(cfg, req) {
-    return op('backup.destination.test', { config: cfg }, req);
+    if (OAUTH_KINDS.includes(cfg.kind)) throw conflict('Save the destination and connect the account first; the connection is tested from the destination list');
+    const { crypt: _c, cryptPassword: _p, cryptPassword2: _s, transport, ...plain } = cfg;
+    const config = cloud() ? cloud().agentConfig({ ...plain, crypt: false }) : { ...plain, crypt: false };
+    const result = await op(isRcloneConfig({ ...config, transport }) ? 'backup.rclone.test' : 'backup.destination.test', { config }, req);
+    const { tokenUpdate: _t, ...rest } = result;
+    return rest;
   }
 
+  // Encrypted destinations are listed through the crypt remote (names
+  // decrypted) and, for the copies made before encryption was enabled, through
+  // the plain path as well.
   async function listRemote(id, req) {
     const row = loadDestination(id);
-    const result = await op('backup.destination.list', { config: destinationConfig(row) }, req);
-    return { destination: shapeDestination(row), archives: result.archives };
+    const stored = destinationConfig(row);
+    const layers = stored.crypt ? [true, false] : [false];
+    const archives = [];
+    const errors = [];
+    for (const encrypted of layers) {
+      const config = agentConfig(row, { encrypted });
+      try {
+        const result = await op(opFor(config, 'backup.destination.list', 'backup.rclone.list'), { config }, req);
+        persistTokenUpdate(row, result.tokenUpdate, req);
+        for (const a of result.archives) archives.push({ ...a, encrypted });
+      } catch (err) {
+        if (encrypted || !stored.crypt) throw err;
+        errors.push(`plain copies: ${err.message}`);
+      }
+    }
+    return { destination: shapeDestination(row), archives, warnings: errors };
+  }
+
+  // Registers an archive found on a destination (the panel was reinstalled, the
+  // rows were lost) by fetching it into the local directory: a job, since the
+  // download can take a while.
+  function enqueueImportRemote(id, { name, encrypted = false }, user, req) {
+    if (!isRoot(user)) throw forbidden('Only root can import archives from a destination');
+    const row = loadDestination(id);
+    const target = `${localDir()}/${name}`;
+    const existing = stmts.backupByPath.get(target);
+    if (existing) throw conflict(`${name} is already registered (backup #${existing.id})`);
+    const job = jobs.enqueue('backup.cloud.fetch', { destinationId: row.id, name, encrypted: Boolean(encrypted), userId: user?.id ?? null }, { userId: user?.id ?? null });
+    audit(req, { action: 'backup.destination.import', target: row.name, args: { name, encrypted: Boolean(encrypted), jobId: job.id } });
+    return { job };
+  }
+
+  async function runCloudFetchJob(jobCtx) {
+    const { destinationId, name, encrypted } = jobCtx.params;
+    const req = actorRequest(jobCtx.params.userId, `job:${jobCtx.job?.id ?? ''}`);
+    const dest = stmts.destinationById.get(destinationId);
+    if (!dest) throw new Error('the destination no longer exists');
+    await requireTar();
+    jobCtx.log(`fetching ${name} from ${dest.name}${encrypted ? ' (decrypting)' : ''}…`);
+    const config = agentConfig(dest, { encrypted: Boolean(encrypted) });
+    const r = await op(opFor(config, 'backup.destination.download', 'backup.rclone.download'), { config, remoteName: name, dest: localDir() }, req);
+    persistTokenUpdate(dest, r.tokenUpdate, req);
+    jobCtx.progress(70, 'verifying archive');
+    const info = await op('backup.archive.info', { archive: r.path }, req);
+    const username = info.username || info.metadata?.account?.username;
+    if (!username) { await op('backup.archive.remove', { archive: r.path }, req).catch(() => {}); throw new Error('the archive name does not identify an account'); }
+    const account = stmts.accountByUsername.get(username);
+    const { lastInsertRowid } = stmts.insertBackup.run({ account_id: account?.id ?? null, account_name: username, owner_id: account?.owner_id ?? null, type: 'import', path: r.path, size: r.sizeBytes, sha256: r.sha256, status: 'done', run_id: null, retention_class: 'daily', components_json: JSON.stringify(info.components || {}), error: null, local_present: 1, created_at: info.info?.createdAt ? info.info.createdAt.replace('T', ' ').slice(0, 19) : null });
+    stmts.insertUpload.run(lastInsertRowid, dest.id, dest.name, `${dest.kind}://${name}`, 'done', null, encrypted ? 1 : 0);
+    stmts.pinBackup.run(1, lastInsertRowid);
+    jobCtx.progress(100, 'registered');
+    audit(req, { action: 'backup.import', target: r.path, args: { account: username, destination: dest.name, encrypted: Boolean(encrypted) } });
+    return { backupId: Number(lastInsertRowid), account: username, path: r.path, sizeBytes: r.sizeBytes };
   }
 
   // ---------------------------------------------------------- selection ---
@@ -376,7 +534,7 @@ export function createBackupService(ctx) {
       id: row.id, account: row.account_name, accountExists: row.live_account_id != null || row.account_id != null, home_dir: row.live_home_dir ?? null, type: row.type, path: row.path, name: row.path ? path.basename(row.path) : null,
       size: row.size, sha256: row.sha256, status: row.status, error: row.error, created_at: row.created_at, run_id: row.run_id,
       retention_class: row.retention_class, pinned: Boolean(row.pinned), local_present: Boolean(row.local_present), components: json.parse(row.components_json, {}),
-      uploads: withUploads ? stmts.uploadsFor.all(row.id).map((u) => ({ id: u.id, destination_id: u.destination_id, destination: u.destination_name, remote_path: u.remote_path, status: u.status, error: u.error, uploaded_at: u.uploaded_at })) : undefined,
+      uploads: withUploads ? stmts.uploadsFor.all(row.id).map((u) => ({ id: u.id, destination_id: u.destination_id, destination: u.destination_name, remote_path: u.remote_path, status: u.status, error: u.error, encrypted: Boolean(u.encrypted), uploaded_at: u.uploaded_at })) : undefined,
     };
   }
 
@@ -440,7 +598,9 @@ export function createBackupService(ctx) {
         const dest = stmts.destinationById.get(u.destination_id);
         if (!dest) { outcome.remote.push({ destination: u.destination_name, removed: false, error: 'destination no longer exists' }); continue; }
         try {
-          await op('backup.destination.remove', { config: destinationConfig(dest), remoteName: path.basename(row.path || u.remote_path) }, req);
+          const config = agentConfig(dest, { encrypted: Boolean(u.encrypted) });
+          const r = await op(opFor(config, 'backup.destination.remove', 'backup.rclone.delete'), { config, remoteName: path.basename(row.path || u.remote_path) }, req);
+          persistTokenUpdate(dest, r.tokenUpdate, req);
           stmts.uploadStatus.run('removed', null, u.id);
           outcome.remote.push({ destination: dest.name, removed: true });
         } catch (err) { outcome.remote.push({ destination: dest.name, removed: false, error: err.message }); log(`could not remove ${u.remote_path} from ${dest.name}: ${err.message}`, 'warn'); }
@@ -594,12 +754,16 @@ export function createBackupService(ctx) {
     const outcomes = [];
     for (const dest of stmts.destinations.all().filter((d) => d.enabled)) {
       try {
-        const r = await op('backup.destination.upload', { config: destinationConfig(dest), file: row.path }, req);
-        stmts.insertUpload.run(row.id, dest.id, dest.name, r.remotePath, 'done', null);
-        outcomes.push({ destination: dest.name, ok: true, remotePath: r.remotePath, ms: r.ms });
+        const config = agentConfig(dest);
+        const r = await op(opFor(config, 'backup.destination.upload', 'backup.rclone.upload'), { config, file: row.path }, req);
+        persistTokenUpdate(dest, r.tokenUpdate, req);
+        stmts.insertUpload.run(row.id, dest.id, dest.name, r.remotePath, 'done', null, config.crypt ? 1 : 0);
+        stmts.uploadOutcome.run(1, `${path.basename(row.path)} (${row.account_name})`, dest.id);
+        outcomes.push({ destination: dest.name, ok: true, remotePath: r.remotePath, encrypted: Boolean(config.crypt), ms: r.ms });
         log(`${row.account_name}: uploaded to ${dest.name} (${r.remotePath})`);
       } catch (err) {
-        stmts.insertUpload.run(row.id, dest.id, dest.name, null, 'failed', err.message);
+        stmts.insertUpload.run(row.id, dest.id, dest.name, null, 'failed', err.message, 0);
+        stmts.uploadOutcome.run(0, String(err.message).slice(0, 500), dest.id);
         outcomes.push({ destination: dest.name, ok: false, error: err.message });
         log(`${row.account_name}: upload to ${dest.name} failed: ${err.message}`, 'error');
       }
@@ -762,9 +926,11 @@ export function createBackupService(ctx) {
       if (u.status !== 'done' || !u.destination_id) continue;
       const dest = stmts.destinationById.get(u.destination_id);
       if (!dest) continue;
-      log(`fetching ${name} from ${dest.name}…`);
+      log(`fetching ${name} from ${dest.name}${u.encrypted ? ' (decrypting)' : ''}…`);
       try {
-        const r = await op('backup.destination.download', { config: destinationConfig(dest), remoteName: name, dest: localDir() }, req);
+        const config = agentConfig(dest, { encrypted: Boolean(u.encrypted) });
+        const r = await op(opFor(config, 'backup.destination.download', 'backup.rclone.download'), { config, remoteName: name, dest: localDir() }, req);
+        persistTokenUpdate(dest, r.tokenUpdate, req);
         if (row.sha256 && r.sha256 !== row.sha256) { await op('backup.archive.remove', { archive: r.path }, req).catch(() => {}); throw new HttpError(502, 'checksum_mismatch', `The copy on ${dest.name} does not match the recorded sha256`); }
         stmts.updateBackupLocal.run(1, r.path, row.id);
         log(`fetched ${name} (${Math.round(r.sizeBytes / 1024)} KB)`);
@@ -1063,6 +1229,7 @@ export function createBackupService(ctx) {
     config, status, updateConfig, syncSchedule, localDir,
     listDestinations: () => stmts.destinations.all().map(shapeDestination),
     createDestination, updateDestination, removeDestination, testDestination, testDestinationConfig, listRemote, destinationConfig: (id) => destinationConfig(id),
+    enableEncryption, connectDestination, loadDestination: (id) => shapeDestination(loadDestination(id)), enqueueImportRemote, runCloudFetchJob,
     listSelection, setSelection, includedAccounts: () => includedAccounts().map((a) => a.username),
     listBackups, getBackup, inspect, archiveInfo, pinBackup, deleteBackup, rescan, registerArchive, accountsOverview,
     archiveAccount, enqueueRun, runBackupJob, listRuns, getRun: (id) => { const r = stmts.runById.get(id); if (!r) throw notFound('Backup run'); return shapeRun(r); },

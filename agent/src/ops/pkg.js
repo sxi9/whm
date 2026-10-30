@@ -596,7 +596,8 @@ export function dedupeSearchResults(results, q, { limit = 60 } = {}) {
   });
   const shown = ranked.slice(0, limit).map((r) => { const { stem, ...rest } = r; return { ...rest, variants: rankSearchResults(r.variants, q), variantCount: r.variants.length }; });
   const collapsed = shown.reduce((n, r) => n + r.variantCount, 0);
-  return { results: shown, total: results.length, shown: shown.length, collapsed, hidden: results.length - shown.length, more: ranked.length > limit, truncated: ranked.length - shown.length };
+  // `hidden` counts the names beyond the cap (rows and their variants); folded variants are shown, under their row.
+  return { results: shown, total: results.length, shown: shown.length, collapsed, hidden: results.length - shown.length - collapsed, more: ranked.length > limit, truncated: ranked.length - shown.length };
 }
 
 defineOp('pkg.search', {

@@ -9,6 +9,7 @@ import {
   parsePerlModules, parseIni, setIniDirectives, parseFpmPool, renderNginxProxy, parseProxyHeader, NGINX_PROXY_CONF, hostHasIpv6,
   versionAtLeast, nginxHttp2Directive, nginxRejectHandshake, disableServerBlocks, restoreServerBlocks,
   parseAptRemoveSimulation, parseDnfRemoveSimulation, peclIniHint, startRun, pollRun, PKG_RUN_DIR, NGINX_SSL_ROOTS, nginxSslPath,
+  packageStem, bindingBase, rankSearchResults, dedupeSearchResults, detectManager,
 } from '../src/ops/pkg.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
@@ -518,5 +519,152 @@ describe('pure parsers', () => {
     expect(plain).not.toContain('proxy_cache');
     expect(parseProxyHeader(plain)).toMatchObject({ apachePort: 8081, cache: false, domains: 0 });
     expect(parseProxyHeader('server {}')).toBeNull();
+  });
+});
+
+describe('search dedupe and ranking', () => {
+  const row = (name, summary = `${name} summary`) => ({ name, summary });
+  // What `apt-cache search --names-only redis` answers on Ubuntu, in the
+  // arbitrary order the cache returns it.
+  const REDIS = [
+    row('libhiredis-dev'), row('php8.2-redis'), row('redis-tools'), row('python3-redis'), row('libhiredis1.1.0'), row('redis-sentinel'),
+    row('php-redis'), row('redis-server'), row('ruby-redis'), row('redis'), row('php8.3-redis'), row('php-redis-dev'), row('libredis-perl'),
+    row('redis-tools:i386'), row('golang-github-go-redis-redis-dev'), row('redis-doc'), row('php8.3-redis:i386'),
+  ];
+
+  it('derives the stem every shape of one package shares', () => {
+    expect(packageStem('php8.3-redis')).toBe('php-redis');
+    expect(packageStem('php8.3-redis:i386')).toBe('php-redis');
+    expect(packageStem('php-redis-dev')).toBe('php-redis');
+    expect(packageStem('php83-php-pecl-redis')).toBe('php-pecl-redis');
+    expect(packageStem('ea-php83-php-pecl-redis')).toBe('php-pecl-redis');
+    expect(packageStem('redis-tools:i386')).toBe('redis-tools');
+    expect(packageStem('nginx-doc')).toBe('nginx');
+    expect(packageStem('nginx-common')).toBe('nginx');
+    expect(packageStem('libssl3t64')).toBe('libssl');
+    expect(packageStem('libssl-dev')).toBe('libssl');
+    expect(packageStem('libhiredis1.1.0')).toBe('libhiredis');
+    expect(packageStem('postgresql-16')).toBe('postgresql');
+    expect(packageStem('postgresql-16-postgis-3')).toBe('postgresql-postgis-3');
+    expect(packageStem('python3.12-venv')).toBe('python3-venv');
+    expect(packageStem('curl-dbgsym')).toBe('curl');
+    expect(packageStem('ImageMagick')).toBe('imagemagick');
+    expect(packageStem('redis')).toBe('redis');
+  });
+
+  it('recognises language bindings of a package', () => {
+    expect(bindingBase('python3-redis')).toEqual({ language: 'python3', base: 'redis' });
+    expect(bindingBase('php-pecl-redis')).toEqual({ language: 'php', base: 'redis' });
+    expect(bindingBase('php-redis')).toEqual({ language: 'php', base: 'redis' });
+    expect(bindingBase('libredis-perl')).toEqual({ language: 'perl', base: 'redis' });
+    expect(bindingBase('ruby-redis')).toEqual({ language: 'ruby', base: 'redis' });
+    expect(bindingBase('redis-server')).toBeNull();
+    expect(bindingBase('nginx')).toBeNull();
+  });
+
+  it('ranks exact matches first, then prefix matches, then the rest, alphabetically within a tier', () => {
+    const ranked = rankSearchResults([row('libcurl4'), row('curlftpfs'), row('curl'), row('python3-pycurl'), row('curl-dev')], 'curl').map((r) => r.name);
+    expect(ranked).toEqual(['curl', 'curl-dev', 'curlftpfs', 'libcurl4', 'python3-pycurl']);
+    expect(rankSearchResults([row('Nginx'), row('nginx-common'), row('apache2')], 'nginx').map((r) => r.name)).toEqual(['Nginx', 'nginx-common', 'apache2']);
+  });
+
+  it('folds -dev/-doc/arch/per-version shapes and language bindings under one row per piece of software', () => {
+    const out = dedupeSearchResults(REDIS, 'redis');
+    const names = out.results.map((r) => r.name);
+    expect(names[0]).toBe('redis');
+    expect(names).toEqual(expect.arrayContaining(['redis', 'redis-server', 'redis-tools', 'redis-sentinel', 'libhiredis1.1.0']));
+    expect(names).not.toContain('php8.3-redis');
+    expect(names).not.toContain('python3-redis');
+    expect(names).not.toContain('redis-tools:i386');
+    expect(names).not.toContain('redis-doc');
+    const redis = out.results.find((r) => r.name === 'redis');
+    const variants = Object.fromEntries(redis.variants.map((v) => [v.name, v.kind]));
+    expect(variants['redis-doc']).toBe('doc');
+    expect(variants['php-redis']).toBe('php binding');
+    expect(variants['php8.3-redis']).toBe('php binding');
+    expect(variants['php8.3-redis:i386']).toBe('php binding');
+    expect(variants['php-redis-dev']).toBe('php binding');
+    expect(variants['python3-redis']).toBe('python3 binding');
+    expect(variants['ruby-redis']).toBe('ruby binding');
+    expect(variants['libredis-perl']).toBe('perl binding');
+    expect(redis.variantCount).toBe(redis.variants.length);
+    expect(redis.variants.map((v) => v.name)).toEqual(rankSearchResults(redis.variants, 'redis').map((v) => v.name));
+    const tools = out.results.find((r) => r.name === 'redis-tools');
+    expect(tools.variants).toEqual([{ name: 'redis-tools:i386', summary: 'redis-tools:i386 summary', kind: 'arch' }]);
+    const hiredis = out.results.find((r) => r.name === 'libhiredis1.1.0');
+    expect(hiredis.variants.map((v) => [v.name, v.kind])).toEqual([['libhiredis-dev', 'dev']]);
+    expect(out.results.every((r) => !('stem' in r))).toBe(true);
+    expect(out).toMatchObject({ total: REDIS.length, shown: out.results.length, more: false, truncated: 0, hidden: 0 });
+    expect(out.collapsed).toBe(out.results.reduce((n, r) => n + r.variantCount, 0));
+    expect(out.shown + out.collapsed).toBe(REDIS.length);
+  });
+
+  it('keeps the exact match as its own row even when it looks like a binding of another row', () => {
+    const out = dedupeSearchResults([row('php-redis'), row('redis'), row('php8.3-redis'), row('php-redis-dev')], 'php-redis');
+    expect(out.results.map((r) => r.name)).toEqual(['php-redis', 'redis']);
+    expect(out.results[0].variants.map((v) => [v.name, v.kind])).toEqual([['php-redis-dev', 'dev'], ['php8.3-redis', 'version']]);
+  });
+
+  it('picks the plain name as the main row over a suffixed or versioned one, whatever the input order', () => {
+    const out = dedupeSearchResults([row('nginx-doc'), row('nginx-common'), row('nginx-core'), row('nginx')], 'nginx');
+    // nginx-core is a separately installable flavour, not a -dev/-doc split: it keeps its own row.
+    expect(out.results.map((r) => r.name)).toEqual(['nginx', 'nginx-core']);
+    expect(out.results[0].variants.map((v) => v.name)).toEqual(['nginx-common', 'nginx-doc']);
+    const noPlain = dedupeSearchResults([row('php8.3-gd'), row('php8.2-gd'), row('php8.3-gd:i386')], 'gd');
+    expect(noPlain.results.map((r) => r.name)).toEqual(['php8.2-gd']);
+    expect(noPlain.results[0].variants.map((v) => v.name)).toEqual(['php8.3-gd', 'php8.3-gd:i386']);
+  });
+
+  it('caps the rows, reports how many were cut and how many names stayed hidden', () => {
+    const many = Array.from({ length: 150 }, (_, i) => row(`pkg${String(i).padStart(3, '0')}`));
+    const out = dedupeSearchResults([row('pkg'), ...many, row('pkg-dev')], 'pkg', { limit: 60 });
+    expect(out.results).toHaveLength(60);
+    expect(out.results[0]).toMatchObject({ name: 'pkg', variantCount: 1 });
+    // 151 rows (pkg with its -dev folded, 150 pkgNNN); 60 shown with 1 variant, so 91 names are beyond the cap.
+    expect(out).toMatchObject({ total: 152, shown: 60, collapsed: 1, more: true, truncated: 91, hidden: 91 });
+    expect(dedupeSearchResults([], 'x')).toEqual({ results: [], total: 0, shown: 0, collapsed: 0, hidden: 0, more: false, truncated: 0 });
+  });
+
+  it('never folds unrelated software that merely shares a prefix', () => {
+    const out = dedupeSearchResults([row('curl'), row('curlftpfs'), row('libcurl4'), row('libcurl4-doc'), row('python3-pycurl')], 'curl');
+    const names = out.results.map((r) => r.name);
+    expect(names).toEqual(['curl', 'curlftpfs', 'libcurl4', 'python3-pycurl']);
+    expect(out.results.find((r) => r.name === 'libcurl4').variants.map((v) => v.name)).toEqual(['libcurl4-doc']);
+    expect(out.results.find((r) => r.name === 'curl').variants).toEqual([]);
+  });
+
+  it('pkg.offers refuses bad names and oversized batches before any command runs', async () => {
+    exec.mockClear();
+    for (const bad of INJECTION) expect((await opError(runOp('pkg.offers', { packages: [bad] }, ctx))).code, bad).toBe('invalid_args');
+    expect((await opError(runOp('pkg.offers', { packages: [] }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('pkg.offers', { packages: Array.from({ length: 301 }, (_, i) => `p${i}`) }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('pkg.offers', { packages: ['curl'], extra: 1 }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('pkg.search', { q: 'curl', all: 'yes' }, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  const apt = detectManager().family === 'debian';
+  it.skipIf(!apt)('pkg.search answers one row per piece of software with installed marks, and the raw list with all: true', async () => {
+    const original = exec.getMockImplementation();
+    exec.mockImplementation(async (bin, argv) => {
+      if (bin === 'apt-cache' && argv[0] === 'search') return { code: 0, stdout: 'redis - Persistent key-value database\nredis-server - server\nredis-tools - tools\nredis-doc - docs\nphp8.3-redis - php binding\npython3-redis - python binding\n', stderr: '' };
+      if (bin === 'dpkg-query') return { code: 0, stdout: 'redis-tools\t7:7.0.15-1\tamd64\tii \ttools\nphp8.3-redis\t6.0.2\tamd64\tii \tbinding\n', stderr: '' };
+      throw new Error(`unexpected exec ${bin} ${argv.join(' ')}`);
+    });
+    try {
+      const out = await runOp('pkg.search', { q: 'redis' }, ctx);
+      expect(exec.mock.calls.find((c) => c[0] === 'apt-cache')[1]).toEqual(['search', '--names-only', '--', 'redis']);
+      expect(out).toMatchObject({ manager: 'apt', q: 'redis', all: false, total: 6, more: false, hidden: 0 });
+      expect(out.results.map((r) => r.name)).toEqual(['redis', 'redis-server', 'redis-tools']);
+      expect(out.results[2]).toMatchObject({ installed: true, installedVersion: '7:7.0.15-1' });
+      const redis = out.results[0];
+      expect(redis.installed).toBe(false);
+      expect(redis.variants.find((v) => v.name === 'php8.3-redis')).toMatchObject({ installed: true, installedVersion: '6.0.2', kind: 'php binding' });
+      expect(redis.variants.find((v) => v.name === 'redis-doc')).toMatchObject({ installed: false, kind: 'doc' });
+      const raw = await runOp('pkg.search', { q: 'redis', all: true, limit: 4 }, ctx);
+      expect(raw).toMatchObject({ all: true, total: 6, shown: 4, collapsed: 0, hidden: 2, more: true, truncated: 2 });
+      expect(raw.results.map((r) => r.name)).toEqual(['redis', 'redis-doc', 'redis-server', 'redis-tools']);
+      expect(raw.results.every((r) => r.variantCount === 0)).toBe(true);
+    } finally { exec.mockImplementation(original); }
   });
 });

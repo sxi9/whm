@@ -178,14 +178,14 @@ describe('Backup API', () => {
     let ftpId;
 
     it('creates destinations with encrypted config and never returns secrets', async () => {
-      const s3 = await post('/destinations', { name: 'offsite-s3', config: { kind: 's3', bucket: 'whm-backups', region: 'eu-west-1', accessKey: 'AKIA', secretKey: 'topsecret', prefix: 'panel/' } }).expect(201);
+      const s3 = await post('/destinations', { name: 'offsite-s3', config: { kind: 's3', bucket: 'whm-backups', region: 'eu-west-1', accessKey: 'AKIA', secretKey: 'topsecret', prefix: 'panel/', crypt: false } }).expect(201);
       s3Id = s3.body.data.id;
       expect(s3.body.data).toMatchObject({ name: 'offsite-s3', kind: 's3', enabled: true, config: { bucket: 'whm-backups', region: 'eu-west-1', accessKey: 'AKIA', has_secret_key: true } });
       expect(JSON.stringify(s3.body)).not.toContain('topsecret');
       const row = app.ctx.db.prepare('SELECT config_enc FROM backup_destinations WHERE id = ?').get(s3Id);
       expect(row.config_enc.startsWith('v1:')).toBe(true);
       expect(app.ctx.backup.destinationConfig(s3Id)).toMatchObject({ kind: 's3', secretKey: 'topsecret', bucket: 'whm-backups' });
-      const ftp = await post('/destinations', { name: 'ftp-mirror', config: { kind: 'ftp', host: 'down.example.com', username: 'u', password: 'pw', path: 'backups', tls: true } }).expect(201);
+      const ftp = await post('/destinations', { name: 'ftp-mirror', config: { kind: 'ftp', host: 'down.example.com', username: 'u', password: 'pw', path: 'backups', tls: true, crypt: false } }).expect(201);
       ftpId = ftp.body.data.id;
       await post('/destinations', { name: 'offsite-s3', config: { kind: 's3', bucket: 'x-y-z', accessKey: 'a', secretKey: 'b' } }).expect(409);
     });
@@ -197,7 +197,8 @@ describe('Backup API', () => {
       await post('/destinations', { name: 'bad', config: { kind: 'sftp', host: 'h.example.com', username: 'u', path: '../x', insecure: true } }).expect(422);
       const unpinned = await post('/destinations', { name: 'bad', config: { kind: 'sftp', host: 'h.example.com', username: 'u', password: 'p' } }).expect(422);
       expect(unpinned.body.error.fields['config.hostKeySha256']).toBeDefined();
-      await post('/destinations', { name: 'bad', config: { kind: 'gdrive', folder: 'x' } }).expect(422);
+      await post('/destinations', { name: 'bad', config: { kind: 'gdrive', folder: '../x' } }).expect(422);
+      await post('/destinations', { name: 'bad', config: { kind: 'gdrive', folder: 'x', refreshToken: 'smuggled' } }).expect(422);
       await post('/destinations', { name: 'bad', config: { kind: 'webdav', url: 'ftp://nope' } }).expect(422);
       // curl reads its configuration line by line: a newline or control character in the URL is a field error at save time (the agent refuses it too).
       for (const bad of ['https://dav.example.com/x\ny', 'https://dav.example.com/x\r\nuser=evil', 'https://dav.example.com/x\u0000y', 'https://dav.example.com/a b', 'https://dav.example.com/"x']) {
@@ -224,14 +225,14 @@ describe('Backup API', () => {
 
     it('an explicit null removes a stored secret (key → password and back)', async () => {
       const fp = 'A'.repeat(43);
-      const created = await post('/destinations', { name: 'sftp-box', enabled: false, config: { kind: 'sftp', host: 'sftp.example.com', username: 'u', password: 'pw', hostKeySha256: fp } }).expect(201);
+      const created = await post('/destinations', { name: 'sftp-box', enabled: false, config: { kind: 'sftp', host: 'sftp.example.com', username: 'u', password: 'pw', hostKeySha256: fp, crypt: false } }).expect(201);
       const id = created.body.data.id;
       expect(created.body.data.config).toMatchObject({ has_password: true, hostKeySha256: fp });
       expect(created.body.data.config.has_private_key).toBeUndefined();
       const keyed = await put(`/destinations/${id}`, { config: { kind: 'sftp', host: 'sftp.example.com', username: 'u', password: null, privateKey: '-----BEGIN KEY-----', hostKeySha256: fp } }).expect(200);
       expect(keyed.body.data.config).toMatchObject({ has_private_key: true });
       expect(keyed.body.data.config.has_password).toBeUndefined();
-      expect(app.ctx.backup.destinationConfig(id)).toEqual({ kind: 'sftp', host: 'sftp.example.com', port: 22, username: 'u', privateKey: '-----BEGIN KEY-----', hostKeySha256: fp, path: '', insecure: false });
+      expect(app.ctx.backup.destinationConfig(id)).toEqual({ kind: 'sftp', host: 'sftp.example.com', port: 22, username: 'u', privateKey: '-----BEGIN KEY-----', hostKeySha256: fp, path: '', insecure: false, crypt: false });
       const back = await put(`/destinations/${id}`, { config: { kind: 'sftp', host: 'sftp.example.com', username: 'u', password: 'pw2', privateKey: null, hostKeySha256: fp } }).expect(200);
       expect(back.body.data.config).toMatchObject({ has_password: true });
       expect(back.body.data.config.has_private_key).toBeUndefined();
@@ -908,6 +909,6 @@ describe('Backup API without tar on the host', () => {
 
   it('settings and destinations keep working without tar', async () => {
     await app.http.put('/api/backup/config').set('X-CSRF-Token', csrf).send({ 'backup.enabled': true }).expect(200);
-    await app.http.post('/api/backup/destinations').set('X-CSRF-Token', csrf).send({ name: 'later', config: { kind: 'sftp', host: 'sftp.example.com', username: 'u', password: 'p', path: '~/backups', insecure: true } }).expect(201);
+    await app.http.post('/api/backup/destinations').set('X-CSRF-Token', csrf).send({ name: 'later', config: { kind: 'sftp', host: 'sftp.example.com', username: 'u', password: 'p', path: '~/backups', insecure: true, crypt: false } }).expect(201);
   });
 });
