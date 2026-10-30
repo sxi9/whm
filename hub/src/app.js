@@ -199,8 +199,10 @@ export function isSpaPath(reqPath) {
   return !STATIC_EXTENSIONS.has(path.extname(reqPath).toLowerCase());
 }
 
+// The environment variable wins over hub.conf `ui_dist` (both are accepted by
+// the config schema); the shipped build is the fallback.
 export function uiDistDir(config = {}) {
-  return process.env.WHM_HUB_UI_DIST || path.resolve(path.dirname(new URL(import.meta.url).pathname), '../ui/dist');
+  return process.env.WHM_HUB_UI_DIST || config.ui_dist || path.resolve(path.dirname(new URL(import.meta.url).pathname), '../ui/dist');
 }
 
 export function finalizeApp(ctx) {

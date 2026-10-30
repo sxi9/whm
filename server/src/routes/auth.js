@@ -102,8 +102,8 @@ export function authRoutes(ctx) {
       res.json({ data: { enabled: true } });
     } catch (err) { next(err); }
   });
-  r.post('/2fa/disable', requireAuth, (req, res, next) => {
-    try { auth.disable2fa(req.user.id); req.audit({ action: 'auth.2fa.disable', target: req.user.username }); res.json({ data: { enabled: false } }); } catch (err) { next(err); }
+  r.post('/2fa/disable', requireAuth, validate({ body: z.object({ code: z.string().regex(/^\d{6}$/, 'Enter the 6-digit code').optional(), password: z.string().min(1).max(128).optional() }).strict() }), async (req, res, next) => {
+    try { await auth.disable2fa(req.user.id, req.body); req.audit({ action: 'auth.2fa.disable', target: req.user.username, args: { via: req.body.code ? 'code' : 'password' } }); res.json({ data: { enabled: false } }); } catch (err) { next(err); }
   });
 
   // External (OpenID Connect) login. Providers are managed in Security Center ›

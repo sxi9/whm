@@ -772,7 +772,13 @@ describe('two-factor authentication', () => {
     expect((await login(other, 'root', ADMIN_PASSWORD)).status).toBe(401);
     expect((await login(other, 'root', 'Another-Passw0rd!2')).body.data).toEqual({ requires2fa: true });
 
-    const disable = await mutate(root, 'post', '/api/auth/2fa/disable', undefined, csrf);
+    // Disabling the second factor re-verifies the password or a current code.
+    expect((await mutate(root, 'post', '/api/auth/2fa/disable', {}, csrf)).status).toBe(400);
+    const wrong = await mutate(root, 'post', '/api/auth/2fa/disable', { password: 'not-the-password' }, csrf);
+    expect(wrong.status).toBe(403);
+    expect(wrong.body.error.code).toBe('verification_failed');
+    expect((await root.get('/api/auth/me')).body.data.user.totpEnabled).toBe(true);
+    const disable = await mutate(root, 'post', '/api/auth/2fa/disable', { password: 'Another-Passw0rd!2' }, csrf);
     expect(disable.status).toBe(200);
     expect(disable.body.data).toEqual({ enabled: false });
     expect((await root.get('/api/auth/me')).body.data.user.totpEnabled).toBe(false);

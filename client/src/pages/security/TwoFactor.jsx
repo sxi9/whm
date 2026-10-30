@@ -23,9 +23,13 @@ export default function TwoFactor({ fn }) {
     setBusy(true); setError(null);
     try { await api.post('/auth/2fa/confirm', { code }); toast.success('Two-factor authentication enabled'); setEnrollment(null); setCode(''); await refresh(); } catch (err) { setError(err); } finally { setBusy(false); }
   };
-  const disable = async () => {
+  const [disabling, setDisabling] = useState(false);
+  const [disableCode, setDisableCode] = useState('');
+  const disable = async (e) => {
+    e?.preventDefault();
     if (!(await confirm({ title: 'Disable two-factor authentication?', message: 'Your account will be protected by password only.', confirmLabel: 'Disable', danger: true }))) return;
-    try { await api.post('/auth/2fa/disable'); toast.success('Two-factor authentication disabled'); await refresh(); } catch (err) { toast.error(err); }
+    setBusy(true);
+    try { await api.post('/auth/2fa/disable', { code: disableCode.trim() }); toast.success('Two-factor authentication disabled'); setDisabling(false); setDisableCode(''); await refresh(); } catch (err) { toast.error(err); } finally { setBusy(false); }
   };
   const setPolicy = async (v) => { try { await api.put('/system/settings', { 'security.2fa.required_for_root': v }); toast.success('Policy saved'); refetch(); } catch (err) { toast.error(err); } };
 
@@ -41,7 +45,18 @@ export default function TwoFactor({ fn }) {
       <Card title="Your account" subtitle={`Signed in as ${user.username}`}>
         <KeyValue items={[['Status', <StatusPill key="s" status={user.totpEnabled ? 'ok' : 'warning'}>{user.totpEnabled ? 'Enabled' : 'Not enabled'}</StatusPill>]]} />
         {!user.totpEnabled && !enrollment && <FormActions><Button variant="primary" loading={busy} onClick={enroll}>Set up two-factor authentication</Button></FormActions>}
-        {user.totpEnabled && <FormActions><Button variant="danger" onClick={disable}>Disable</Button></FormActions>}
+        {user.totpEnabled && !disabling && <FormActions><Button variant="danger" onClick={() => setDisabling(true)}>Disable</Button></FormActions>}
+        {user.totpEnabled && disabling && (
+          <form onSubmit={disable} className="form-narrow" style={{ marginTop: 14 }}>
+            <Field label="Current authenticator code" help="Disabling the second factor needs the code your app shows right now.">
+              <TextInput value={disableCode} onChange={setDisableCode} inputMode="numeric" autoComplete="one-time-code" placeholder="123456" />
+            </Field>
+            <FormActions>
+              <Button type="submit" variant="danger" loading={busy} disabled={!/^\d{6}$/.test(disableCode.trim())}>Disable two-factor authentication</Button>
+              <Button onClick={() => { setDisabling(false); setDisableCode(''); }}>Cancel</Button>
+            </FormActions>
+          </form>
+        )}
         {enrollment && (
           <form onSubmit={confirmCode} className="form-narrow" style={{ marginTop: 14 }}>
             <p>Add this key to your authenticator app (Google Authenticator, Authy, 1Password…), then enter the current 6-digit code to finish.</p>

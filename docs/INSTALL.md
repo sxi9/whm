@@ -631,7 +631,7 @@ environment (deep-merged on top) → defaults. An invalid file aborts with
 |---|---|---|
 | `public_url` | `https://licserver.hostingsignal.in` | URL panels and portals use; `iss` of every token. The installer writes `HUB_PUBLIC_URL` (default `https://<hostname -f>:7443`) into a new hub.conf. |
 | `serve_ui` | `false` (template: `true`) | Serve `hub/ui/dist` at `/` with SPA fallback for `/login`, `/admin/*`, `/reseller/*`, `/dev/*`. Logs `serve_ui is set but hub/ui/dist is missing` when the build is absent. |
-| `ui_dist` | *(unset)* | Alternative build directory. The server reads the `WHM_HUB_UI_DIST` environment variable for this (`uiDistDir()` in `hub/src/app.js`). |
+| `ui_dist` | *(unset)* | Alternative build directory for the portals; `WHM_HUB_UI_DIST` overrides it (`uiDistDir()` in `hub/src/app.js`). |
 | `host` | `0.0.0.0` | Bind address. |
 | `port` | `7443` | Public listener (1–65535). |
 | `loopback_port` | `7440` | `127.0.0.1` listener for `/healthz` and `/metrics`; `0` disables it. |

@@ -188,9 +188,20 @@ export function createAuthService(ctx) {
       stmts.setTotp.run(user.totp_secret_enc, 1, userId);
     },
 
-    disable2fa(userId) {
+    // Turning the second factor off is itself a sensitive change: a hijacked
+    // session must not be able to do it, so the current code or the password
+    // is re-verified (the lockout and replay rules of verifyTotp apply).
+    async disable2fa(userId, { password, code } = {}) {
       const user = stmts.byId.get(userId);
       if (user && needsEnrollment({ ...user, totp_enabled: 0 }, policy())) throw forbidden('Two-factor authentication is required for your role by the server security policy');
+      if (!user) throw forbidden('Unknown user');
+      if (code != null && code !== '') {
+        if (!user.totp_enabled || !verifyTotp(user, code)) throw new HttpError(403, 'verification_failed', 'The verification code is wrong');
+      } else if (password != null && password !== '') {
+        if (!(await crypto.verifyPassword(password, user.password_hash))) throw new HttpError(403, 'verification_failed', 'The password is wrong');
+      } else {
+        throw badRequest('Confirm with the current authenticator code or your password');
+      }
       stmts.setTotp.run(null, 0, userId);
     },
   };

@@ -83,7 +83,7 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [x] **P3 Security & mail** — Security Center, Email, Exim/Dovecot config, SSL/TLS + AutoSSL (ACME)
 - [x] **P4 Resellers, IP, backup, transfers** — Resellers, IP Functions, Backup + scheduler + destinations, Transfers + Transfer Tool, Networking Setup, Server Contacts, System Reboot
 - [x] **P5 Software & platform** — Software (MultiPHP, EasyApache, updates), Locales, Clusters, Themes, Market, cPanel section, Development (API tokens, hooks, OpenAPI), Support, **license client + hub/license server, plugin host + plugin marketplace, sample + automated-backup plugins** *(deferred items land here)*
-- [ ] **P6 Hardening & deploy** — `scripts/install.sh`, systemd units, panel TLS, Security Advisor rules, docs, e2e tests, performance pass
+- [x] **P6 Hardening & deploy** — `scripts/install.sh` (stack profiles, super admin, TLS pair), systemd units, panel TLS + HTTPS by default, Security Advisor rules (PHP advisories), docs, e2e tests, performance pass; three audits + the 2026-10-29 verifier run (11 findings fixed) *(dependency bumps zod 4 / react-router 7 and the restricted-user `backup.db.import` stay listed in `HANDOFF.md` §4 as follow-ups)*
 
 ## Deferred work (do at the end — Phase 5)
 
