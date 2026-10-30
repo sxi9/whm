@@ -195,6 +195,15 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   templates, and the docs for every round-1 unit (MANUAL A/B, INSTALL, README, contracts §34, CHECKLIST issue table).
   Open after this unit (see the integrator notes): the agent's `panel` certificate branch must leave `key.pem` readable
   by the panel's service group; `whm-cli install-stack` is not built (the installer flags cover the CLI ask).
+- **2026-10-30 14:15 — full audit landed.** `full-audit` workflow (28 lens × scope finders, 112 reports merged by file/line,
+  1–2 refuters by severity → 81 confirmed: 6 blocking / 47 major / 28 minor; 49 fixers in ≤6-finding batches → 84 fixes,
+  `b100fd3`) + an integration round for the cross-area companions (`06843dd`: web-server group on docroots, confined
+  tokens in core middleware, `cpanel-api` ACL on Bearer tokens, run-row sweeps, quota kernel args, `SymLinksIfOwnerMatch`
+  + restricted `AllowOverride`, sshd socket drop-in, SELinux at install, ErrorBoundary, job worker slot leak). Final gate on
+  `06843dd`: server 1360 / agent 651 / client 206 / hub 211 / hub-ui 105 / SDK + plugins, builds, boot, Playwright.
+  Lesson recorded: Playwright steps that expect an action button must allow for the install prompt the page shows
+  when the daemon is absent (Restart pages now do that); `pkill -f` with a pattern that appears in the same command
+  kills the shell (it killed one gate run).
 - **2026-10-30 05:10 (session `claude/pensive-curie-9r0rcx`, owner asks of 2026-10-29: app hosting → issue list → full
   audit):** Phase-6 verifier run → 11 findings fixed (`50d0f14`); **category 31 Application Manager** (`81417ea`);
   **owner's 26-item issue list round 1** (`bf181a0`: installer profiles + install-from-panel + setup wizard, HTTPS by

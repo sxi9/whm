@@ -6,8 +6,8 @@ For any AI or engineer taking over. Everything stated here is on the branch
 the owner wants it merged). This file is updated at every milestone together with `CHECKLIST.md`
 (tracker) and `CLAUDE.md` (conventions + memory). Read those two next.
 
-**Last updated:** 2026-10-30 05:10 UTC · checklist 239 done / 1 partial / 0 open · a full audit bug-hunt
-(`wf_5bd01820-f02`) was running when this was written — see §4.
+**Last updated:** 2026-10-30 14:15 UTC · checklist 239 done / 1 partial / 0 open · the full audit bug-hunt and its
+integration round are landed (`b100fd3`, `06843dd`); the final gate is green — see §2 and §4.
 
 ## 1. What this is
 
@@ -32,13 +32,13 @@ marketplace service with its own React portals (`hub/ui`).
 | **Category 31 — Application Manager** (owner ask) | done `81417ea`: design `docs/design/application-manager.md`; agent family `app.*` (12 ops), `ctx.apps`, migration 033, 3 pages, 15 framework presets; two review lenses + fix round (21 findings) | `agent/test/app.test.js` 43, `server/test/application-manager.test.js` 37, `client/test/application-manager.test.jsx` 22 |
 | **Owner's 26-item issue list, round 1** (`CHECKLIST.md` › *Owner's issue list*) | done `bf181a0`: 9 units, 13 adversarial reviews (55 findings, 3 refuters each), fix round, integration round `wf_52f47b76-660` (regression review, 3 findings fixed) | gate below |
 | Deferred items from the 27 Oct handoff | closed: root `npm install` lockfile links hub workspaces; web-hardening timeout; hub `ui_dist` (`uiDistDir(config)`); 2FA disable re-verifies code/password. **Open:** zod 3 → 4, react-router-dom 6 → 7, `backup.db.import` as a restricted temp user (its dump screen now matches `transfer.mysql.import`) | §4 |
-| Screenshots | refreshed `8da0d63` from the integrated tree: 216/216 pages live + 22 flow shots (setup wizard, Application Manager, HST Panel labels) | `docs/screenshots/` |
+| **Full audit bug-hunt** (owner ask: "find more bugs") | done: 28 lens × scope finders → 112 reports → 81 confirmed by refuters (6 blocking / 47 major / 28 minor) → 84 fixes by 49 grouped fixers `b100fd3`; integration round `06843dd` (web-server group on restored docroots, confined tokens never attach a user outside their endpoints, reseller tokens honour the `cpanel-api` ACL, run-row sweeps after restarts, quota kernel-args guidance, `SymLinksIfOwnerMatch` vhost defaults, sshd socket drop-in, SELinux install step, ErrorBoundary, docs); regression review 2 findings fixed | `scratchpad` notes `audit-outcome.md`; suites below |
+| Screenshots | refreshed after the final gate (see the commit after `06843dd`): 216/216 pages live + 22 flow shots (setup wizard, Application Manager, HST Panel labels, install prompts on every "not installed" page) | `docs/screenshots/` |
 
-**Final gate (2026-10-30 04:49 UTC, `bf181a0`):** server 1309 (49 files) · agent 573 (32 files) · client 131 (18 files) ·
-hub 197 (node --test) · hub/ui 105 · plugins/sdk 73 · sample plugin 13 · 4 bundled plugins · `vite build` client +
-hub/ui · monolithic boot · `e2e/ui-check.cjs` (login → setup wizard → account → pages → 216 sidebar links, no
-console/5xx errors). The 2FA/ui_dist change afterwards re-ran `api`, `auth-policy`, `web-hardening`, the client
-suite and build green.
+**Final gate (2026-10-30 14:03 UTC, `06843dd`):** server 1360 (52 files) · agent 651 (34 files) · client 206 (32 files) ·
+hub 211 (node --test) · hub/ui 105 · plugins/sdk 73 · sample plugin 13 · 4 bundled plugins · `vite build` client + hub/ui ·
+monolithic boot · `e2e/ui-check.cjs` (login → setup wizard → account → pages → search → 217 sidebar links, no console/5xx
+errors). Run it with the scratchpad `gate.sh` pattern: random panel port, check the boot log for EADDRINUSE before Playwright.
 
 ## 3. How to run and verify (from a fresh clone)
 
@@ -74,17 +74,20 @@ an install prompt with an *Install* button for root — by design), Playwright +
 
 **Session of 2026-10-29/30** (owner AFK, "take all decisions, keep working"). Order of the owner's asks:
 (1) application hosting → done; (2) the 26-item issue list → round 1 done (table in `CHECKLIST.md`);
-(3) "full audit, find more bugs" → the loop-until-dry bug-hunt workflow was launched at 04:50 UTC from the
-session scratchpad script `full-audit.workflow.js` (lens × scope finders, three refuters per finding, grouped
-fixers; up to 3 rounds). **If you are a new session, that run is gone with the container**: its confirmed
-findings and fixes, if any landed, are in the git log after `bf181a0` (`fix(audit): …` commits) — anything
-not committed did not happen. Re-run the audit if you want it: the pattern is in `CLAUDE.md` (builders per
-unit, two adversarial lenses for root/auth/signing code, one fix round, full gate).
+(3) "full audit, find more bugs" → done: one finder round (7 lenses × 4 scopes), 81 confirmed findings, fixes
+`b100fd3`, companions `06843dd`. The confirmed list with every fixer's notes is in the session scratchpad
+(`audit-outcome.md`, gone with the container) — the git log of those two commits is the durable record. A second
+finder round was not run (the first was already 112 reports; the dedupe/verify pattern is in the script notes
+of `CLAUDE.md` › Resume notes).
 
 ### Continue from here (in order)
 
-1. **Finish the audit** (or re-run it): apply its confirmed findings with tests, run the full gate (§3),
-   refresh screenshots, commit.
+1. **Audit residuals** (small, listed by the fixers): a cheap agent op for `quota.active` so capabilities can say
+   "enforceable"; `required: true` on ConfigPage number fields whose schemas refuse null (Tweak Settings, security
+   policies/questions); existing hosts keep the old `+FollowSymLinks` vhost block until every vhost is rewritten once
+   (Apache Configuration › save, or `ctx.web.vhosts.syncAll`); `server/test/security-center.test.js` mocks still return
+   the pre-audit agent shapes (passing); surface `web.detect().selinux` in Server Profile / System Health;
+   `e2e/live-hub-flow.sh` pins the hub mail transport to sendmail (fine outside systemd).
 2. **Owner's issue list, round 2** — the items round 1 left partial or interpreted narrowly:
    - #21 "index page option while creating license groups" on the hub side (the panel's landing/index
      templates exist; the hub has no license-group page option yet).

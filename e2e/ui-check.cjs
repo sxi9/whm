@@ -111,7 +111,8 @@ async function stamp(page, text) {
   await page.waitForSelector('.search-results li');
   await shot('12-top-search');
   await page.keyboard.press('Enter');
-  await page.waitForSelector('text=Restart HTTP Server (Apache)');
+  // The page shows an Install prompt instead of the Restart action while Apache is absent (dev container).
+  await page.waitForSelector('.page-header h1:has-text("HTTP Server (Apache)")');
   await shot('13-restart-service');
 
   await page.goto(`${BASE}/system-health/process-manager`);
