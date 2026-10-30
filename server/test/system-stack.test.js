@@ -79,6 +79,7 @@ describe('Server stack API', () => {
   let binaries = { 'apt-get': true, 'dpkg-query': true };
   let units = [];
   let installedPackages = [];
+  let unavailablePackages = [];
   let unitStates = {};
   let pkgFamily = 'debian';
   const waitUntil = async (cond, timeoutMs = 5000) => { const t = Date.now(); while (!cond()) { if (Date.now() - t > timeoutMs) throw new Error('condition not met in time'); await new Promise((r) => setTimeout(r, 20)); } };
@@ -98,6 +99,7 @@ describe('Server stack API', () => {
       'pkg.update_index': () => ({ manager: 'apt', output: ['Reading package lists...'] }),
       'pkg.list_installed': ({ prefix }) => ({ manager: 'apt', total: installedPackages.length, packages: installedPackages.filter((p) => !prefix || prefix.some((pre) => p === pre || p.startsWith(pre))).map((name) => ({ name, version: '1', arch: 'amd64', summary: '' })) }),
       'pkg.install': ({ packages }) => { installedPackages.push(...packages); return { manager: 'apt', packages, output: [`installed ${packages.join(' ')}`] }; },
+      'pkg.available': ({ packages }) => ({ manager: 'apt', offered: packages.filter((p) => !unavailablePackages.includes(p)), missing: packages.filter((p) => unavailablePackages.includes(p)) }),
       'stack.apache_enmod': ({ modules }) => ({ skipped: false, enabled: modules, alreadyEnabled: [], failed: [], reloaded: false }),
       'stack.postgres_initdb': () => ({ skipped: false, initialised: true, dataDir: '/var/lib/pgsql/data', output: [] }),
     });
@@ -439,5 +441,19 @@ describe('Server stack API', () => {
       expect(other.ctx.settings.get('setup.completed')).toBe(true);
       expect(other.ctx.settings.get('setup.completed_reason')).toBe('existing-install');
     } finally { await other.close(); }
+  });
+
+  it('skips packages the distribution does not offer instead of failing the component', async () => {
+    unavailablePackages = ['php-opcache'];
+    try {
+      const csrf = await app.login();
+      const res = await app.http.post('/api/system/stack/install').set('X-CSRF-Token', csrf).send({ components: ['php'] }).expect(202);
+      const job = await waitForJob(app.ctx, res.body.data.job.id, 20_000);
+      expect(job.status).toBe('done');
+      const installed = app.agent.callsTo('pkg.install').flatMap((c) => c.args.packages);
+      expect(installed).toContain('php-fpm');
+      expect(installed).not.toContain('php-opcache');
+      expect(job.logs.some((l) => /not offered by this distribution, skipped: php-opcache/.test(l.line))).toBe(true);
+    } finally { unavailablePackages = []; }
   });
 });

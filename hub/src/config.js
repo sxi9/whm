@@ -54,7 +54,10 @@ const schema = z.object({
         starttls: z.enum(['auto', 'require', 'off']).default('auto'),
         user: z.string().optional(),
         pass: z.string().optional(),
-        reject_unauthorized: z.boolean().default(true),
+        // Unset: the transport verifies the server certificate except for a
+        // loopback MTA (127.0.0.1 / ::1 / localhost), whose self-signed
+        // certificate never leaves the host.
+        reject_unauthorized: z.boolean().optional(),
         ca_file: z.string().optional(),
         timeout_ms: z.number().int().min(1000).default(20_000),
       }).default({}),

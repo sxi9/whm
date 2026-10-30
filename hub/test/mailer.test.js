@@ -182,7 +182,12 @@ test('smtp transport: STARTTLS auto/require/off and implicit TLS', { skip: !cert
     assert.equal(r.ok, false);
     assert.match(r.error, /does not offer STARTTLS/);
     assert.equal(bare.messages.length, 0);
-    const untrusted = createMailer({ transport: smtpTransport({ host: '127.0.0.1', port: srv.port, timeoutMs: 5000 }), from: 'a@hub.test' });
+    // A loopback MTA's self-signed certificate is accepted by default (the hop never
+    // leaves the host); verification stays a hard failure when the operator asks for it.
+    const loopbackDefault = createMailer({ transport: smtpTransport({ host: '127.0.0.1', port: srv.port, timeoutMs: 5000 }), from: 'a@hub.test' });
+    assert.deepEqual(await loopbackDefault.send({ to: 'c@example.test', template: 'portal.security_event', data: { event: 'x' } }), { ok: true });
+    assert.equal(srv.messages[srv.messages.length - 1].secure, true, 'still upgraded with STARTTLS, just not verified');
+    const untrusted = createMailer({ transport: smtpTransport({ host: '127.0.0.1', port: srv.port, reject_unauthorized: true, timeoutMs: 5000 }), from: 'a@hub.test' });
     const u = await untrusted.send({ to: 'c@example.test', template: 'portal.security_event', data: { event: 'x' } });
     assert.equal(u.ok, false);
     assert.match(u.error, /STARTTLS with 127\.0\.0\.1:\d+ failed/, 'an untrusted certificate is a delivery failure, not a silent downgrade');
@@ -308,7 +313,7 @@ test('hub boots with transport "smtp" against a local MTA and /healthz tracks it
 test('config: smtp is the default transport, WHM_HUB_SMTP_* override it, hub.conf.example is valid', () => {
   const none = loadConfig({ file: '/nonexistent/hub.conf', env: {} });
   assert.equal(none.license.mail.transport, 'smtp');
-  assert.deepEqual(none.license.mail.smtp, { host: '127.0.0.1', port: 25, secure: false, starttls: 'auto', reject_unauthorized: true, timeout_ms: 20_000 });
+  assert.deepEqual(none.license.mail.smtp, { host: '127.0.0.1', port: 25, secure: false, starttls: 'auto', timeout_ms: 20_000 }, 'reject_unauthorized is unset by default: the transport decides per host');
   const env = loadConfig({ file: '/nonexistent/hub.conf', env: { WHM_HUB_MAIL_TRANSPORT: 'smtp', WHM_HUB_SMTP_HOST: 'smtp.example.test', WHM_HUB_SMTP_PORT: '587', WHM_HUB_SMTP_USER: 'hub', WHM_HUB_SMTP_PASS: 'pw' } });
   assert.deepEqual({ host: env.license.mail.smtp.host, port: env.license.mail.smtp.port, user: env.license.mail.smtp.user, pass: env.license.mail.smtp.pass }, { host: 'smtp.example.test', port: 587, user: 'hub', pass: 'pw' });
   assert.throws(() => loadConfig({ file: '/nonexistent/hub.conf', env: {}, overrides: { license: { mail: { transport: 'exim' } } } }), /license\.mail\.transport/);
@@ -316,4 +321,12 @@ test('config: smtp is the default transport, WHM_HUB_SMTP_* override it, hub.con
   assert.equal(example.license.mail.transport, 'smtp');
   assert.equal(example.license.mail.smtp.host, '127.0.0.1');
   assert.equal(loadConfig({ file: '/nonexistent/hub.conf', env: {}, overrides: { license: { mail: { transport: 'sendmail' } } } }).license.mail.transport, 'sendmail', 'sendmail stays available for unhardened deployments');
+});
+
+test('smtp transport verifies certificates except for a loopback MTA unless told otherwise', () => {
+  assert.equal(smtpTransport({ host: '127.0.0.1', port: 25 }).policy.rejectUnauthorized, false);
+  assert.equal(smtpTransport({ host: 'localhost', port: 25 }).policy.rejectUnauthorized, false);
+  assert.equal(smtpTransport({ host: 'smtp.example.com', port: 587 }).policy.rejectUnauthorized, true);
+  assert.equal(smtpTransport({ host: '127.0.0.1', port: 25, reject_unauthorized: true }).policy.rejectUnauthorized, true);
+  assert.equal(smtpTransport({ host: 'smtp.example.com', port: 587, reject_unauthorized: false }).policy.rejectUnauthorized, false);
 });

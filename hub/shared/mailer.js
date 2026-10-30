@@ -115,12 +115,15 @@ export function smtpTransport(options = {}) {
   const user = options.user || null;
   const pass = options.pass || null;
   const timeoutMs = options.timeoutMs ?? options.timeout_ms ?? 20_000;
-  const rejectUnauthorized = options.rejectUnauthorized ?? options.reject_unauthorized ?? true;
+  const loopback = isLoopbackHost(host);
+  // A loopback MTA presents the self-signed certificate the distribution
+  // generated; that hop never leaves the host, so it is accepted unless the
+  // operator says otherwise. Any other host is verified.
+  const rejectUnauthorized = options.rejectUnauthorized ?? options.reject_unauthorized ?? !loopback;
   const caFile = options.ca_file || null;
   const ca = options.ca || (caFile ? fs.readFileSync(caFile) : undefined);
   const servername = options.servername || (net.isIP(host) ? undefined : host);
   const ehloName = options.ehlo || os.hostname() || 'localhost';
-  const loopback = isLoopbackHost(host);
   const tlsOptions = { servername, rejectUnauthorized, ca, minVersion: 'TLSv1.2' };
 
   function connection() {
@@ -249,6 +252,8 @@ export function smtpTransport(options = {}) {
 
   return {
     name: 'smtp',
+    // For diagnostics and tests: the effective connection policy.
+    policy: { host, port, secure, starttls, loopback, rejectUnauthorized },
     target: `${host}:${port}`,
     unavailable: null,
     async verify() {

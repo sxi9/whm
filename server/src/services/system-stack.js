@@ -206,7 +206,20 @@ export function createSystemStackService(ctx) {
         const set = new Set(present.map((p) => p.name));
         missing = packages.filter((p) => !set.has(p));
       } catch (err) { job.log(`could not read the installed package list (${err.message}); installing every package`, 'warn'); }
-      if (!missing.length) job.log(`${component.label}: packages already installed (${packages.join(', ')})`);
+      // Names the distribution does not offer are skipped (logged), never sent
+      // to the package manager, where one unknown name fails the whole step.
+      let skipped = [];
+      if (missing.length) {
+        try {
+          const avail = await job.agent.op('pkg.available', { packages: missing });
+          if (Array.isArray(avail?.missing) && avail.missing.length) {
+            skipped = avail.missing;
+            missing = missing.filter((p) => !skipped.includes(p));
+            job.log(`${component.label}: not offered by this distribution, skipped: ${skipped.join(' ')}`, 'warn');
+          }
+        } catch (err) { job.log(`could not check package availability (${err.message}); installing every missing package`, 'warn'); }
+      }
+      if (!missing.length) job.log(`${component.label}: packages already installed (${packages.filter((p) => !skipped.includes(p)).join(', ') || 'none offered'})`);
       else {
         job.log(`${component.label}: installing ${missing.join(' ')}`);
         try { await runLongOp(job, 'pkg.install', { packages: missing }, `${component.label} install`); } catch (err) {

@@ -537,6 +537,31 @@ defineOp('pkg.info', {
   },
 });
 
+// Which of the names the package manager can actually install: present already,
+// or offered by a repository. A name the distribution dropped (php-opcache once
+// opcache is built in, for example) would otherwise fail the whole transaction.
+defineOp('pkg.available', {
+  description: 'Split package names into those the package manager offers (installed or in a repository) and those it does not',
+  timeoutMs: 300_000,
+  schema: z.object({ packages: z.array(pkgName).min(1).max(200) }).strict(),
+  run: async ({ packages }) => {
+    const pm = requireManager();
+    const offered = []; const missing = [];
+    for (const name of packages) {
+      let ok;
+      if (pm.family === 'debian') {
+        const policy = parseAptPolicy((await exec('apt-cache', ['policy', '--', name], { allowFailure: true, env: APT_ENV })).stdout);
+        ok = Boolean(policy.installed || (policy.candidate && policy.candidate !== '(none)'));
+      } else {
+        ok = (await exec('rpm', ['-q', '--', name], { allowFailure: true })).code === 0
+          || (await exec(pm.binary, ['-q', '-y', 'info', '--', name], { allowFailure: true, timeoutMs: 120_000 })).code === 0;
+      }
+      (ok ? offered : missing).push(name);
+    }
+    return { manager: pm.manager, offered, missing };
+  },
+});
+
 defineOp('pkg.install', {
   description: 'Install distro packages non-interactively',
   timeoutMs: LONG,

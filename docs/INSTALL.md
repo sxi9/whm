@@ -1017,6 +1017,22 @@ default from [§5.6](#56-hubconf-reference). Booleans accept `1`, `true`, `yes`.
 **Login**
 - `rate_limited` — more than 20 login/2FA attempts in 15 minutes per IP+user; wait or adjust
   `loginRateLimit` in `whm.conf`.
+- Fresh install fails with `Cannot find package 'better-sqlite3'`: an older installer ran `npm ci` a second time
+  inside `hub/`, which wiped the hoisted root `node_modules`. The installer now installs once at the project root
+  (every workspace, hub and portal included) and prunes dev tooling after the builds; re-run `install.sh --upgrade`.
+- A stack component fails because one package does not exist on this release (for example `php-opcache`, built into
+  PHP ≥ 8.5): the installer and the panel's stack installer now skip names the distribution does not offer and log
+  them (`pkg.available`); the component still installs. Check the skipped list in the job log or the installer output.
+- The panel refuses the hub certificate (`hub_unreachable`, "certificate is not valid for" the public address): the
+  self-signed hub certificate now lists every local address, the public address (looked up over HTTPS at install time)
+  and the host of `public_url`. Regenerate it by deleting `/etc/whm-hub/ssl/hub.{crt,key}` and running
+  `install.sh --upgrade`, or install a CA-issued pair there.
+- Hub mail fails with a certificate error against the local MTA: `license.mail.smtp.reject_unauthorized` is unset by
+  default, which accepts the self-signed certificate of a loopback MTA (`127.0.0.1` / `localhost`) and verifies every
+  other host; set it to `true` to verify the local one too, or `false` to accept any (not recommended).
+- License activation fails with an unknown signing key after a same-host hub install: the installer now pins the hub's
+  license key into `/etc/whm/license-keys.json` and sets `WHM_LICENSE_KEYS_FILE` in `panel.env`; for a hub installed
+  elsewhere, pin its key by hand ([§5.2](#52-keys-what-gen-keyjs-generates-and-what-to-pin-where)).
 - cPHulk block: `sudo node /opt/whm/scripts/whm-cli.js unlock-ip <ip>`.
 - Lost root password: `whm-cli.js reset-password root`.
 - Stuck on 2FA: `security.2fa.required_for_root` is on and no device is enrolled; the panel only lets

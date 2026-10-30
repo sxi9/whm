@@ -106,6 +106,16 @@ fi
 
 if command -v apt-get >/dev/null; then PKG=apt; elif command -v dnf >/dev/null; then PKG=dnf; elif command -v yum >/dev/null; then PKG=yum; else die "no supported package manager (apt-get/dnf/yum)"; fi
 
+# package_offered <name>: whether the package manager can install it (installed or in a
+# repository). dpkg/apt need the index refreshed first (done before the first install).
+package_offered() {
+  case "$PKG" in
+    apt) apt-cache show -- "$1" >/dev/null 2>&1 ;;
+    dnf|yum) "$PKG" -q info -- "$1" >/dev/null 2>&1 || rpm -q -- "$1" >/dev/null 2>&1 ;;
+    *) return 0 ;;
+  esac
+}
+
 install_packages() {
   case "$PKG" in
     apt) DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$@" ;;
@@ -171,13 +181,39 @@ create_system_user() {
 }
 
 # self_signed_cert <dir> <base name> <owner group>: one certificate per listener, replaceable later.
+# Every name and address a client may use to reach this host goes into the SAN list:
+# the FQDN and short name, localhost, every local address, the public address a cloud
+# NAT hides from `hostname -I` (looked up over HTTPS, best effort), and the host of
+# HUB_PUBLIC_URL when it is set. A certificate that only names the private address
+# is refused by the panel as soon as it connects through the public one.
+cert_sans() {
+  local host=$1 extra=${2:-} out="DNS:$host,DNS:localhost,IP:127.0.0.1" short ip pub
+  short=$(hostname -s 2>/dev/null || true)
+  [ -n "$short" ] && [ "$short" != "$host" ] && out="$out,DNS:$short"
+  for ip in $(hostname -I 2>/dev/null); do
+    case ",$out," in *",IP:$ip,"*) ;; *) out="$out,IP:$ip" ;; esac
+  done
+  pub=$(curl -4 -fsS --max-time 4 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]')
+  if printf '%s' "$pub" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+    case ",$out," in *",IP:$pub,"*) ;; *) out="$out,IP:$pub" ;; esac
+  fi
+  if [ -n "$extra" ]; then
+    if printf '%s' "$extra" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+      case ",$out," in *",IP:$extra,"*) ;; *) out="$out,IP:$extra" ;; esac
+    elif printf '%s' "$extra" | grep -Eq '^[A-Za-z0-9.-]+$'; then
+      case ",$out," in *",DNS:$extra,"*) ;; *) out="$out,DNS:$extra" ;; esac
+    fi
+  fi
+  printf '%s' "$out"
+}
+
 self_signed_cert() {
-  local dir=$1 name=$2 group=$3 host ip
+  local dir=$1 name=$2 group=$3 extra=${4:-} host sans
   [ -f "$dir/$name.crt" ] && return 0
   host=$(hostname -f 2>/dev/null || hostname)
-  ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  sans=$(cert_sans "$host" "$extra")
   openssl req -x509 -newkey rsa:2048 -nodes -days 1095 -subj "/CN=$host" \
-    -addext "subjectAltName=DNS:$host,IP:${ip:-127.0.0.1}" \
+    -addext "subjectAltName=$sans" \
     -keyout "$dir/$name.key" -out "$dir/$name.crt" >/dev/null 2>&1
   chown root:"$group" "$dir/$name.key" "$dir/$name.crt"
   chmod 0640 "$dir/$name.key" "$dir/$name.crt"
@@ -192,26 +228,24 @@ rsync -a --delete \
   "$SRC_DIR"/ "$APP_DIR"/
 
 log "Installing dependencies and building the web interface"
-( cd "$APP_DIR" && npm ci --no-audit --no-fund && npm run build --workspace client && npm prune --omit=dev --no-audit --no-fund )
+# One install at the project root: server, agent, client, hub and hub/ui are all npm
+# workspaces of the root lockfile, so their packages are hoisted into one node_modules.
+# Running npm ci inside hub/ again would wipe that tree (the panel then fails with
+# "Cannot find package 'better-sqlite3'"). Dev tooling is pruned once every build is done.
+( cd "$APP_DIR" && npm ci --no-audit --no-fund && npm run build --workspace client ) || die "npm ci / client build failed"
 if [ "$WITH_HUB" -eq 1 ]; then
-  log "Installing hub dependencies"
-  ( cd "$APP_DIR/hub" && npm ci --omit=dev --no-audit --no-fund )
-  # The portal is its own npm package (not a root workspace): npm ci with a lockfile, npm install
-  # without one. Build tooling is removed after the build; serve_ui only needs hub/ui/dist.
   if [ "${HUB_SKIP_UI:-0}" = "1" ]; then
     log "HUB_SKIP_UI=1: hub/ui is not built; set serve_ui to false in hub.conf or build it later"
   elif [ -f "$APP_DIR/hub/ui/package.json" ] && grep -q '"build"' "$APP_DIR/hub/ui/package.json"; then
     log "Building the hub portal (hub/ui)"
-    if [ -f "$APP_DIR/hub/ui/package-lock.json" ]; then HUB_UI_INSTALL=(npm ci --no-audit --no-fund); else HUB_UI_INSTALL=(npm install --no-audit --no-fund); fi
-    if ( cd "$APP_DIR/hub/ui" && "${HUB_UI_INSTALL[@]}" && npm run build ); then
-      rm -rf "$APP_DIR/hub/ui/node_modules"
-    else
+    if ! ( cd "$APP_DIR" && npm run build --workspace hub/ui ); then
       log "hub/ui build failed; the hub API still runs, the portal is served once hub/ui/dist exists (set serve_ui accordingly)"
     fi
   else
     log "hub/ui has no build script in this checkout; the hub API runs without the portal (set serve_ui to false if the warning bothers you)"
   fi
 fi
+( cd "$APP_DIR" && npm prune --omit=dev --no-audit --no-fund ) || log "npm prune failed; dev dependencies stay installed (harmless)"
 chown -R root:root "$APP_DIR"
 chmod -R o-w "$APP_DIR"
 
@@ -364,7 +398,8 @@ install_hub() {
   fi
   if [ ! -f "$HUB_ETC_DIR/ssl/hub.crt" ]; then
     log "Generating a self-signed TLS certificate for the hub (replace $HUB_ETC_DIR/ssl/hub.{crt,key} with a real one; panels only talk https)"
-    self_signed_cert "$HUB_ETC_DIR/ssl" hub "$HUB_USER"
+    HUB_PUBLIC_HOST=$(printf '%s' "$HUB_PUBLIC_URL" | sed -E 's#^[a-z]+://##; s#[:/].*$##')
+    self_signed_cert "$HUB_ETC_DIR/ssl" hub "$HUB_USER" "$HUB_PUBLIC_HOST"
     HUB_SELF_SIGNED=1
   fi
 
@@ -425,6 +460,29 @@ if [ "$WITH_HUB" -eq 1 ]; then install_hub; fi
 if [ "${HUB_SELF_SIGNED:-0}" -eq 1 ] && ! grep -q '^WHM_LICENSE_HUB_CA=' "$ETC_DIR/panel.env"; then
   install -m 0640 -o root -g "$SERVICE_USER" "$HUB_ETC_DIR/ssl/hub.crt" "$ETC_DIR/hub-ca.pem"
   printf 'WHM_LICENSE_HUB_CA=%s\n' "$ETC_DIR/hub-ca.pem" >> "$ETC_DIR/panel.env"
+fi
+
+# A panel installed next to its hub trusts the hub's license signing key without a manual
+# step: the key this run generated is merged into /etc/whm/license-keys.json (shape
+# { "keys": [ { kid, pub, not_after } ] }) and the panel is pointed at that file. Nothing
+# from the key is interpolated into shell; node reads it from the environment.
+if [ -n "${HUB_LICENSE_KEY_JSON:-}" ]; then
+  LICENSE_KEYS_FILE=$ETC_DIR/license-keys.json
+  [ -f "$LICENSE_KEYS_FILE" ] || printf '{ "keys": [] }\n' > "$LICENSE_KEYS_FILE"
+  HUB_LICENSE_KEY_JSON="$HUB_LICENSE_KEY_JSON" "$NODE_BIN" -e '
+const fs = require("node:fs");
+const file = process.argv[1];
+const k = JSON.parse(process.env.HUB_LICENSE_KEY_JSON);
+let doc = { keys: [] };
+try { doc = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
+if (!Array.isArray(doc.keys)) doc.keys = [];
+if (!doc.keys.some((e) => e && e.kid === k.kid)) doc.keys.push({ kid: k.kid, pub: k.pub, not_after: null });
+fs.writeFileSync(file, JSON.stringify(doc, null, 2) + "\n");
+console.log(`  pinned hub license key ${k.kid} in ${file}`);' -- "$LICENSE_KEYS_FILE"
+  chown root:"$SERVICE_USER" "$LICENSE_KEYS_FILE"; chmod 0640 "$LICENSE_KEYS_FILE"
+  if ! grep -q '^WHM_LICENSE_KEYS_FILE=' "$ETC_DIR/panel.env"; then
+    printf 'WHM_LICENSE_KEYS_FILE=%s\n' "$LICENSE_KEYS_FILE" >> "$ETC_DIR/panel.env"
+  fi
 fi
 
 
@@ -503,6 +561,16 @@ install_stack() {
   if [ "$epel" -eq 1 ] && [ "$family" = rhel ]; then
     install_packages epel-release || log "epel-release could not be installed; packages that need EPEL may fail below"
   fi
+  # A package the distribution no longer ships (php-opcache is built into PHP ≥ 8.5 on
+  # Ubuntu 26.04, for example) would fail the whole transaction; skip it and say so.
+  local -a offered=() skipped=()
+  local p
+  for p in "${pkgs[@]}"; do
+    if package_offered "$p"; then offered+=("$p"); else skipped+=("$p"); fi
+  done
+  [ ${#skipped[@]} -gt 0 ] && log "Not offered by this distribution, skipped: ${skipped[*]}"
+  pkgs=("${offered[@]}")
+  [ ${#pkgs[@]} -gt 0 ] || { STACK_RESULT="nothing to install: none of the packages is offered by this distribution"; return 0; }
   if ! install_packages "${pkgs[@]}"; then
     STACK_RESULT="package installation failed (see above); re-run with --stack/--components, or use Service Manager › Server stack in the panel"
     return 1
