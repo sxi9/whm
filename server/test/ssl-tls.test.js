@@ -20,6 +20,7 @@ let app;
 let csrf;
 let reseller;
 let resellerCsrf;
+let resellerUser;
 const mutate = (client, method, url, body, token) => client[method](url).set('X-CSRF-Token', token).send(body);
 const put = (url, body) => mutate(app.http, 'put', url, body, csrf);
 const post = (url, body = {}) => mutate(app.http, 'post', url, body, csrf);
@@ -58,6 +59,7 @@ beforeAll(async () => {
   app = await createTestApp({ agent });
   csrf = await app.login();
   const r = await app.createUser('resell1', 'reseller');
+  resellerUser = { id: r.id, username: r.username, role: 'reseller' };
   reseller = request.agent(app.ctx.app);
   resellerCsrf = (await reseller.post('/api/auth/login').send({ username: r.username, password: r.password })).body.data.csrfToken;
   await post('/api/accounts', { username: 'alice', domain: 'alice.com', owner: 'resell1' }).expect(201);
@@ -581,6 +583,26 @@ describe('AutoSSL', () => {
     expect((await mutate(reseller, 'post', '/api/ssl/autossl/issue', { domain: 'alice.com' }, resellerCsrf)).status).toBe(501);
     expect((await post('/api/ssl/autossl/run', {})).status).toBe(501);
     await provision(true);
+  });
+
+  it('issueFor accepts the server hostname natively for root (no account owns it) and for nobody else', async () => {
+    const previous = app.ctx.settings.get('basic.hostname');
+    app.ctx.settings.set('basic.hostname', 'panel.example.com');
+    try {
+      app.agent.calls.length = 0;
+      const result = await app.ctx.ssl.issueFor('panel.example.com', { role: 'root' }, null, { force: true });
+      expect(result.cert).toMatchObject({ domain: 'panel.example.com', autossl: true });
+      const issue = app.agent.callsTo('ssl.acme.issue');
+      expect(issue).toHaveLength(1);
+      expect(issue[0].args.domains[0]).toBe('panel.example.com');
+      expect(issue[0].args.force).toBe(true);
+      expect(app.ctx.db.prepare('SELECT account_id FROM ssl_certs WHERE id = ?').get(result.cert.id).account_id).toBeNull();
+      // a reseller never reaches it; www.<hostname> and any other unknown name stay unknown to root
+      await expect(app.ctx.ssl.issueFor('panel.example.com', resellerUser, null)).rejects.toMatchObject({ status: 404 });
+      await expect(app.ctx.ssl.issueFor('www.panel.example.com', { role: 'root' }, null)).rejects.toMatchObject({ status: 404 });
+      await expect(app.ctx.ssl.issueFor('nobody.example.com', { role: 'root' }, null)).rejects.toMatchObject({ status: 404 });
+      expect(app.agent.callsTo('ssl.acme.issue')).toHaveLength(1);
+    } finally { app.ctx.settings.set('basic.hostname', previous); }
   });
 });
 

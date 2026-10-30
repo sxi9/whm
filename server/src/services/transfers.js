@@ -609,6 +609,7 @@ export function createTransfersService(ctx) {
     for (const d of extra) {
       if (!d.domain || d.domain === account.domain) continue;
       if (stmts.domainHosted.get(d.domain)) { skipped.push(d.domain); continue; }
+      if (isServerHostname(ctx, d.domain)) { skipped.push(d.domain); continue; }
       const type = d.type || (d.domain.endsWith(`.${account.domain}`) ? 'sub' : 'addon');
       const docroot = d.docroot || (type === 'parked' ? `${account.home_dir}/public_html` : `${account.home_dir}/public_html/${type === 'sub' ? d.domain.slice(0, -(account.domain.length + 1)) : d.domain}`);
       stmts.insertDomain.run(account.id, d.domain, type, docroot);
@@ -1305,4 +1306,14 @@ export function createTransfersService(ctx) {
     cleanup,
     JOB_TYPES,
   };
+}
+
+// The server hostname owns the panel's landing vhost and certificate; an
+// imported account must never claim it (accounts.create refuses it the same way).
+function isServerHostname(ctx, domain) {
+  const name = String(domain || '').toLowerCase();
+  if (!name) return false;
+  if (ctx.web?.isServerName?.(name)) return true;
+  const host = String(ctx.settings?.get?.('basic.hostname') || '').toLowerCase();
+  return Boolean(host) && (name === host || name === `www.${host}`);
 }

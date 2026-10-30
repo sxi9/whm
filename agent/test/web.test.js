@@ -7,7 +7,7 @@ import { runOp, createContext, OpError } from '../src/lib.js';
 import {
   renderVhost, parseVhostMeta, renderRedirects, renderGlobalInclude, renderPhpPool, renderLogrotate, mergeKeyValueFile, renderProftpd, vsftpdSettings, pureFtpdSettings,
   ftpSettingsFrom, parseServerStatus, parseApacheVersion, parseModules, parseDoveconf, rewriteListen, apacheLayout, eximLayout, phpLayout, SERVICE_ROLES, hintsFor, ensureRootLogDir, confPath, parseEximVersion,
-  mergeEximBlock, readEximBlock, stripEximBlock, eximTlsLibrary, primaryGroupName, EXIM_SENTINEL_MACRO, renderHttpsRedirect,
+  mergeEximBlock, readEximBlock, stripEximBlock, eximTlsLibrary, primaryGroupName, EXIM_SENTINEL_MACRO, renderHttpsRedirect, enableApacheModules,
 } from '../src/ops/web.js';
 
 // Fake host for the layout detection: which paths exist, what they contain, which binaries resolve.
@@ -17,7 +17,7 @@ function hostIo({ files = {}, dirs = [], binaries = [] }) {
 
 vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
-  return { ...mod, exec: vi.fn(mod.exec) };
+  return { ...mod, exec: vi.fn(mod.exec), hasBinary: vi.fn(mod.hasBinary) };
 });
 
 const ctx = createContext();
@@ -100,6 +100,16 @@ describe('web op schemas reject injection and traversal before anything runs', (
     expect(exec).not.toHaveBeenCalled();
   });
 
+  it('module names must be plain a2enmod names, at most ten, never flags or paths', async () => {
+    exec.mockClear();
+    for (const modules of [['-m'], ['Rewrite'], ['proxy fcgi'], ['x;y'], ['../ssl'], ['rewrite\n'], [''], [], Array.from({ length: 11 }, (_, i) => `m${i}`), 'rewrite', [{ name: 'rewrite' }]]) {
+      expect((await opError(runOp('web.module.enable', { modules }, ctx))).code, JSON.stringify(modules)).toBe('invalid_args');
+    }
+    expect((await opError(runOp('web.module.enable', { modules: ['rewrite'], reload: true }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('web.module.enable', {}, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
   it('php-fpm pools', async () => {
     exec.mockClear();
     const ok = { user: 'alice', version: '8.3' };
@@ -153,11 +163,104 @@ describe('web op schemas reject injection and traversal before anything runs', (
 
   it('daemon-backed ops report capability_missing on a host without the daemon', async () => {
     if (apacheLayout()?.bin) return;
-    for (const [name, args] of [['web.configtest', {}], ['web.vhost.write', VHOST], ['web.global.write', { directives: { timeout: 30 } }], ['web.mpm.set', { module: 'event' }]]) {
+    for (const [name, args] of [['web.configtest', {}], ['web.vhost.write', VHOST], ['web.global.write', { directives: { timeout: 30 } }], ['web.mpm.set', { module: 'event' }], ['web.module.enable', { modules: ['rewrite'] }]]) {
       expect((await opError(runOp(name, args, ctx))).code, name).toBe('capability_missing');
     }
     if (!eximLayout()?.installed) expect((await opError(runOp('web.exim.include.write', { slot: 'main', content: 'x' }, ctx))).code).toBe('capability_missing');
     if (!phpLayout().versions.some((v) => v.version === '7.0')) expect((await opError(runOp('web.phpfpm.pool.write', { user: 'root', version: '7.0' }, ctx))).code).toBe('capability_missing');
+  });
+});
+
+// Runs before any op touches the host, so the unit cache inside web.js is
+// still empty and the mocked `systemctl list-unit-files` answer is what
+// reloadUnit sees.
+describe('web.module.enable enables what is off, validates, rolls back and reloads', () => {
+  const DEBIAN = { flavor: 'debian', root: '/etc/apache2', bin: 'apache2ctl', units: ['apache2'], a2tools: true };
+  const RHEL = { flavor: 'rhel', root: '/etc/httpd', bin: 'httpd', units: ['httpd'], a2tools: false };
+  const calls = () => exec.mock.calls.map(([bin, argv]) => [bin, ...argv]);
+
+  async function withHost(binaries, answer, fn) {
+    const { hasBinary } = await import('../src/exec.js');
+    const actual = await vi.importActual('../src/exec.js');
+    hasBinary.mockImplementation((name) => binaries.includes(name));
+    exec.mockClear();
+    exec.mockImplementation(async (bin, argv) => ({ code: 0, stdout: '', stderr: '', bin, argv, ...answer(bin, argv) }));
+    try { await fn(); } finally { hasBinary.mockImplementation(actual.hasBinary); exec.mockImplementation(actual.exec); }
+  }
+
+  const apacheAnswers = (bin, argv) => {
+    if (bin === 'apache2ctl' && argv[0] === '-V') return { stdout: 'Server version: Apache/2.4.58 (Ubuntu)\nServer MPM:     event\n' };
+    if (bin === 'apache2ctl' && argv[0] === '-M') return { stdout: 'Loaded Modules:\n core_module (static)\n ssl_module (shared)\n' };
+    if (bin === 'systemctl' && argv[0] === 'list-unit-files') return { stdout: 'apache2.service enabled enabled\nssh.service enabled enabled\n' };
+    return {};
+  };
+
+  it('debian: a2query decides, a2enmod runs only for modules that are off, configtest precedes the reload', async () => {
+    await withHost(['a2enmod', 'a2query', 'a2dismod', 'apache2ctl', 'systemctl'], (bin, argv) => {
+      if (bin === 'a2query') return { code: argv[2] === 'headers' ? 0 : 1 };
+      if (bin === 'a2enmod') return argv[1] === 'nope' ? { code: 1, stderr: 'ERROR: Module nope does not exist!\n' } : {};
+      if (bin === 'apache2ctl' && argv[0] === '-t') return { stderr: 'Syntax OK\n' };
+      return apacheAnswers(bin, argv);
+    }, async () => {
+      const result = await enableApacheModules(DEBIAN, ['rewrite', 'ssl', 'headers', 'nope']);
+      expect(result).toMatchObject({ skipped: false, flavor: 'debian', enabled: ['rewrite'], alreadyEnabled: ['ssl', 'headers'], missing: ['nope'], validated: true, reloaded: true, unit: 'apache2' });
+      expect(result.failed).toEqual([{ module: 'nope', error: 'ERROR: Module nope does not exist!' }]);
+      const c = calls();
+      expect(c).toContainEqual(['a2enmod', '-q', 'rewrite']);
+      expect(c).toContainEqual(['a2enmod', '-q', 'nope']);
+      expect(c).not.toContainEqual(['a2enmod', '-q', 'ssl']);
+      expect(c).not.toContainEqual(['a2enmod', '-q', 'headers']);
+      expect(c.filter(([bin]) => bin === 'a2query').map((x) => x[3])).toEqual(['rewrite', 'headers', 'nope']);
+      expect(c).toContainEqual(['apache2ctl', '-t']);
+      expect(c).toContainEqual(['systemctl', 'reload-or-restart', 'apache2.service']);
+      expect(c.findIndex(([bin, a]) => bin === 'apache2ctl' && a === '-t')).toBeLessThan(c.findIndex(([bin, verb]) => bin === 'systemctl' && verb === 'reload-or-restart'));
+      expect(c.some(([bin]) => bin === 'a2dismod')).toBe(false);
+    });
+  });
+
+  it('debian: nothing to enable means no configtest and no reload', async () => {
+    await withHost(['a2enmod', 'a2query', 'apache2ctl', 'systemctl'], (bin, argv) => (bin === 'a2query' ? { code: 0 } : apacheAnswers(bin, argv)), async () => {
+      const result = await enableApacheModules(DEBIAN, ['ssl', 'rewrite']);
+      expect(result).toMatchObject({ skipped: false, enabled: [], alreadyEnabled: ['ssl', 'rewrite'], failed: [], reloaded: false, validated: null });
+      expect(calls().some(([bin, a]) => (bin === 'apache2ctl' && a === '-t') || bin === 'systemctl' && a !== 'list-unit-files')).toBe(false);
+    });
+  });
+
+  it('debian: a failed configtest disables exactly what was switched on and never reloads', async () => {
+    await withHost(['a2enmod', 'a2query', 'a2dismod', 'apache2ctl', 'systemctl'], (bin, argv) => {
+      if (bin === 'a2query') return { code: argv[2] === 'headers' ? 0 : 1 };
+      if (bin === 'apache2ctl' && argv[0] === '-t') return { code: 1, stderr: 'AH00526: Syntax error on line 3 of /etc/apache2/mods-enabled/suexec.load:\nCannot load mod_suexec.so\n' };
+      return apacheAnswers(bin, argv);
+    }, async () => {
+      const err = await opError(enableApacheModules(DEBIAN, ['rewrite', 'headers', 'suexec']));
+      expect(err.code).toBe('config_invalid');
+      expect(err.message).toMatch(/disabled again/);
+      expect(err.details).toMatchObject({ enabled: ['rewrite', 'suexec'], rolledBack: ['rewrite', 'suexec'] });
+      const c = calls();
+      expect(c.filter(([bin]) => bin === 'a2dismod')).toEqual([['a2dismod', '-q', '-f', 'rewrite'], ['a2dismod', '-q', '-f', 'suexec']]);
+      expect(c.findIndex(([bin]) => bin === 'a2dismod')).toBeGreaterThan(c.findIndex(([bin, a]) => bin === 'apache2ctl' && a === '-t'));
+      expect(c.some(([bin, verb]) => bin === 'systemctl' && verb === 'reload-or-restart')).toBe(false);
+    });
+  });
+
+  it('debian without a2enmod/a2query reports capability_missing before running anything', async () => {
+    await withHost(['apache2ctl', 'systemctl'], apacheAnswers, async () => {
+      expect((await opError(enableApacheModules(DEBIAN, ['rewrite']))).code).toBe('capability_missing');
+      expect(calls().some(([bin]) => bin === 'a2enmod' || bin === 'a2dismod')).toBe(false);
+    });
+  });
+
+  it('rhel: verifies against httpd -M, reports the conf.modules.d hint and touches nothing', async () => {
+    await withHost(['httpd', 'systemctl'], (bin, argv) => (bin === 'httpd' && argv[0] === '-M' ? { stdout: 'Loaded Modules:\n core_module (static)\n rewrite_module (shared)\n' } : {}), async () => {
+      const result = await enableApacheModules(RHEL, ['rewrite', 'headers']);
+      expect(result).toMatchObject({ skipped: true, flavor: 'rhel', enabled: [], alreadyEnabled: ['rewrite'], missing: ['headers'], failed: [], reloaded: false });
+      expect(result.reason).toMatch(/\/etc\/httpd\/conf\.modules\.d/);
+      expect(result.reason).toMatch(/mod_headers/);
+      expect(result.reason).toMatch(/reload httpd/);
+      expect(calls().every(([bin]) => bin === 'httpd')).toBe(true);
+      const all = await enableApacheModules(RHEL, ['rewrite']);
+      expect(all).toMatchObject({ skipped: true, missing: [], reason: expect.stringMatching(/already loaded/) });
+    });
   });
 });
 

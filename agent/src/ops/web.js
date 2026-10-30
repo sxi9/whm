@@ -863,6 +863,55 @@ defineOp('web.mpm.set', {
   },
 });
 
+// Modules the panel's rendered configuration relies on (the HTTPS redirect
+// block sits inside <IfModule mod_rewrite.c>, so it is inert until mod_rewrite
+// loads). Debian: a2enmod what a2query reports off, configtest, take back
+// exactly what this call switched on when Apache rejects it, then reload. The
+// RHEL family loads modules from conf.modules.d/*.conf, so there the op only
+// verifies them against `httpd -M` and names what is still missing.
+const apacheModuleName = z.string().regex(/^[a-z0-9_]{1,40}$/);
+
+export async function enableApacheModules(apache, modules) {
+  const info = await apacheInfo(apache);
+  const loaded = new Set(info.modules.map((m) => m.name));
+  const alreadyEnabled = modules.filter((m) => loaded.has(m));
+  if (apache.flavor !== 'debian') {
+    const missing = modules.filter((m) => !loaded.has(m));
+    const confDir = path.join(apache.root, 'conf.modules.d');
+    return {
+      skipped: true, flavor: apache.flavor, enabled: [], alreadyEnabled, failed: [], missing, validated: null, reloaded: false, unit: null,
+      reason: missing.length
+        ? `Apache on this host loads modules from ${confDir}/*.conf; add a LoadModule line for ${missing.map((m) => `mod_${m}`).join(', ')} there and reload ${apache.units[0]}.`
+        : 'every requested module is already loaded',
+    };
+  }
+  if (!hasBinary('a2enmod') || !hasBinary('a2query')) throw new OpError('capability_missing', 'a2enmod/a2query are not available on this server');
+  const enabled = []; const failed = [];
+  for (const m of modules) {
+    if (loaded.has(m)) continue;
+    const query = await exec('a2query', ['-q', '-m', m], { allowFailure: true });
+    if (query.code === 0) { alreadyEnabled.push(m); continue; }
+    const r = await exec('a2enmod', ['-q', m], { allowFailure: true, timeoutMs: 60_000 });
+    if (r.code === 0) enabled.push(m);
+    else failed.push({ module: m, error: lastLine(r.stderr || r.stdout) || `a2enmod exited with status ${r.code}` });
+  }
+  if (!enabled.length) return { skipped: false, flavor: 'debian', enabled, alreadyEnabled, failed, missing: failed.map((f) => f.module), validated: null, reloaded: false, unit: null };
+  const test = await configtest(apache);
+  if (test.ok === false) {
+    for (const m of enabled) await exec('a2dismod', ['-q', '-f', m], { allowFailure: true, timeoutMs: 60_000 });
+    throw new OpError('config_invalid', `Apache rejected the configuration after enabling ${enabled.join(', ')}; the modules were disabled again: ${lastLine(test.output) || 'configtest failed'}`, { output: test.output, enabled, rolledBack: enabled });
+  }
+  const reload = await reloadUnit(apache.units);
+  return { skipped: false, flavor: 'debian', enabled, alreadyEnabled, failed, missing: failed.map((f) => f.module), validated: test.ok === true, ...reload };
+}
+
+defineOp('web.module.enable', {
+  description: 'Enable Apache modules (a2enmod on Debian, validated and rolled back on a failed configtest, then reload); on the RHEL family verify them with httpd -M and report what conf.modules.d still lacks',
+  timeoutMs: 180_000,
+  schema: z.object({ modules: z.array(apacheModuleName).min(1).max(10) }).strict(),
+  run: async ({ modules }) => enableApacheModules(requireApache(), [...new Set(modules)]),
+});
+
 // Apache's Listen directives live in ports.conf (Debian) or httpd.conf (RHEL);
 // moving them (e.g. to 127.0.0.1:8080 behind an nginx proxy) rewrites those
 // lines only. A bind address pins every listener to it; a null https releases

@@ -18,9 +18,12 @@ export const featureGates = {
 export const manualGates = new Set(['POST /marketplace/install', 'POST /marketplace/update/:id']);
 
 // Mutations that stay allowed while the license is degraded: everything the
-// operator needs to rescue data and reach a licensed state again.
+// operator needs to rescue data and reach a licensed state again, plus the
+// first-run wizard's exit (an enforced fresh install has no license yet, so
+// "Skip for now" must not answer 423; the wizard's other writes stay gated).
 export const degradedAllow = [
   'ALL /auth/*', 'ALL /license/*',
+  'POST /system/setup/complete',
   'POST /system/services/:name/restart', 'POST /system/services/:name/start', 'POST /system/services/:name/reload',
   'ALL /backup/*',
   'POST /accounts/:username/unsuspend',

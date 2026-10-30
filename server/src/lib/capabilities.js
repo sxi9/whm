@@ -22,13 +22,24 @@ export const CAPABILITY_BINARIES = {
   rsync: ['rsync'],
   tar: ['tar'],
   spamassassin: ['spamd', 'spamassassin'],
-  modsecurity: ['modsecurity'],
+  modsecurity: [],
   pkg: ['apt-get', 'dnf', 'yum'],
   perl: ['perl', 'cpan', 'cpanm'],
   mailman: ['mailman'],
 };
 
-// A capability is "installed" when at least one of its *required* programs exists.
+// Features that ship no program of their own are detected by the files their
+// package installs, through the agent's fs.stat (sys.binaries only knows
+// names on PATH). ModSecurity is an Apache module: these are the files
+// sec.modsec.detect reads on Debian (security2.load, /etc/modsecurity) and
+// on the RHEL family (mod_security.conf, modsecurity.d); all lie under the
+// agent's allowed roots.
+export const CAPABILITY_PATHS = {
+  modsecurity: ['/etc/apache2/mods-available/security2.load', '/etc/modsecurity/modsecurity.conf', '/etc/httpd/conf.d/mod_security.conf', '/etc/httpd/modsecurity.d'],
+};
+
+// A capability is "installed" when at least one of its *required* programs
+// exists, or one of its paths does.
 const REQUIRED = {
   apache: ['apache2ctl', 'apachectl', 'httpd'],
   bind: ['named'],
@@ -46,17 +57,29 @@ const REQUIRED = {
 };
 
 export function createCapabilities({ agent, db, logger }) {
-  let snapshot = { at: 0, binaries: {}, capabilities: {}, units: {} };
+  let snapshot = { at: 0, binaries: {}, paths: {}, capabilities: {}, units: {} };
 
   async function refresh() {
     const names = [...new Set(Object.values(CAPABILITY_BINARIES).flat())];
     const binaries = {};
     // sys.binaries accepts at most 100 names per call and categories keep registering more.
     for (let i = 0; i < names.length; i += 100) Object.assign(binaries, await agent.op('sys.binaries', { names: names.slice(i, i + 100) }));
+    const paths = {};
+    for (const p of [...new Set(Object.values(CAPABILITY_PATHS).flat())]) {
+      try { paths[p] = Boolean((await agent.op('fs.stat', { path: p }))?.exists); } catch (err) {
+        paths[p] = false;
+        logger.debug({ err, path: p }, 'capability path probe failed');
+      }
+    }
     const capabilities = {};
     for (const [cap, bins] of Object.entries(CAPABILITY_BINARIES)) {
       const required = REQUIRED[cap] || bins;
-      capabilities[cap] = { installed: required.some((b) => binaries[b]), binaries: Object.fromEntries(bins.map((b) => [b, Boolean(binaries[b])])) };
+      const capPaths = CAPABILITY_PATHS[cap] || [];
+      capabilities[cap] = {
+        installed: required.some((b) => binaries[b]) || capPaths.some((p) => paths[p]),
+        binaries: Object.fromEntries(bins.map((b) => [b, Boolean(binaries[b])])),
+        ...(capPaths.length ? { paths: Object.fromEntries(capPaths.map((p) => [p, Boolean(paths[p])])) } : {}),
+      };
     }
     const units = {};
     try {
@@ -67,7 +90,7 @@ export function createCapabilities({ agent, db, logger }) {
     } catch (err) {
       logger.warn({ err }, 'could not list systemd units');
     }
-    snapshot = { at: Date.now(), binaries, capabilities, units };
+    snapshot = { at: Date.now(), binaries, paths, capabilities, units };
     logger.info({ installed: Object.entries(capabilities).filter(([, v]) => v.installed).map(([k]) => k) }, 'capability detection complete');
     return snapshot;
   }
@@ -76,9 +99,10 @@ export function createCapabilities({ agent, db, logger }) {
     refresh,
     // Category modules declare the programs their feature needs; detection picks
     // them up on the next refresh (boot refreshes after all modules register).
-    register(cap, { binaries, required }) {
+    register(cap, { binaries, required, paths }) {
       CAPABILITY_BINARIES[cap] = binaries;
       REQUIRED[cap] = required || binaries;
+      if (paths) CAPABILITY_PATHS[cap] = paths;
       snapshot.at = 0;
     },
     snapshot: () => snapshot,

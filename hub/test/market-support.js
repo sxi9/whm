@@ -74,19 +74,22 @@ export function manifestFor(id, extra = {}) {
   return { id, name: extra.name || id.split('.').pop(), version: '1.0.0', description: 'A test plugin for the marketplace suite.', author: { name: 'Test' }, license: 'MIT', engines: { whm: '^1.0.0' }, main: 'main.js', permissions: [], ...extra };
 }
 
-// otplib verifies with window 0 and a bcrypt round (300 ms idle, seconds under
-// a parallel run) sits between a test minting a code and the server checking
-// it; a code minted in the last seconds of a 30-second step would straddle it,
-// so generation waits for the next step instead.
-// The hub verifies through the same otplib singleton, so accepting the
-// previous step here (window [1, 0]) removes the straddle entirely for the
-// marketplace suites; the production hub keeps otplib's default window.
-authenticator.options = { ...authenticator.options, window: [1, 0] };
-const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-export function totpCode(secret) {
-  const remaining = authenticator.timeRemaining();
-  if (remaining < 6) sleepSync(remaining * 1000 + 100);
-  return authenticator.generate(secret);
+// Developer TOTP checks run on the hub clock (frozen in tests, moved by
+// h.advance), so codes are minted against it: a bcrypt round can no longer
+// straddle a 30-second step and the production window (the current step only)
+// stays in force. A code is accepted once per account (RFC 6238 §5.2), so a
+// test that presents a second code within a step first calls h.nextTotpStep();
+// d.login() and d.stepUp() do that themselves when the helper already spent
+// the current step for that account, and not otherwise, so the clock stays
+// where a test put it.
+export const TOTP_STEP_MS = 30_000;
+// The clocks of the markets booted by this file that are still open: the
+// bare totpCode() follows the newest one, so a temporary hub a test boots and
+// closes never leaves its clock behind; market.totpCode is bound to its hub.
+const openClocks = [];
+const hubNow = () => (openClocks.length ? openClocks[openClocks.length - 1]() : Date.now());
+export function totpCode(secret, now = hubNow) {
+  return authenticator.clone({ epoch: now() }).generate(secret);
 }
 
 // A marketplace hub: bootHub + developer/admin helpers.
@@ -97,6 +100,11 @@ export async function bootMarket({ config = {}, ...rest } = {}) {
   const { ctx } = h;
   const m = ctx.marketplace;
   const market = { ...h, m, mdb: m.db, sent: ctx.mailer.sent };
+  const clockNow = () => ctx.clock.now();
+  openClocks.push(clockNow);
+  market.totpCode = (secret) => totpCode(secret, clockNow);
+  market.nextTotpStep = () => h.advance(TOTP_STEP_MS);
+  market.close = async () => { const i = openClocks.lastIndexOf(clockNow); if (i !== -1) openClocks.splice(i, 1); await h.close(); };
   let n = 0;
 
   // Developer with e-mail verified, TOTP enabled, logged in and stepped up.
@@ -109,19 +117,22 @@ export async function bootMarket({ config = {}, ...rest } = {}) {
     const row = m.developers.get(reg.id);
     let secret = null;
     if (totp) {
+      // Enabled on the row rather than through totpConfirm: the fixture spends
+      // one code per step, and that is the login below.
       secret = m.developers.totpStart(row).secret;
-      m.developers.totpConfirm(row, totpCode(secret));
+      m.db.prepare('UPDATE developers SET totp_enabled = 1 WHERE id = ?').run(reg.id);
     }
     const agent = request.agent(ctx.app);
     let csrf = null;
-    // bcrypt under a parallel test run can straddle a 30-second TOTP step, so a
-    // rejected code is retried once with a freshly generated one.
+    let spentStep = null;
+    const currentStep = () => Math.floor(clockNow() / TOTP_STEP_MS);
+    const freshCode = () => {
+      if (spentStep !== null && currentStep() <= spentStep) market.nextTotpStep();
+      spentStep = currentStep();
+      return market.totpCode(secret);
+    };
     const login = async () => {
-      let res;
-      for (let attempt = 0; attempt < 3; attempt++) {
-        res = await agent.post('/v1/dev/login').send({ email: mail, password, ...(secret ? { totp: totpCode(secret) } : {}) });
-        if (res.status === 200 || res.body?.error?.code !== 'invalid_totp') break;
-      }
+      const res = await agent.post('/v1/dev/login').send({ email: mail, password, ...(secret ? { totp: freshCode() } : {}) });
       if (res.status !== 200) throw new Error(`developer login failed: ${res.status} ${JSON.stringify(res.body)}`);
       csrf = res.body.data.csrfToken;
       return res;
@@ -139,7 +150,7 @@ export async function bootMarket({ config = {}, ...rest } = {}) {
         if (changelog) req = req.set('X-WHM-Changelog', b64(changelog));
         return req.send(buf);
       },
-      stepUp: () => d.post('/v1/dev/2fa/stepup', { totp: totpCode(secret) }),
+      stepUp: () => d.post('/v1/dev/2fa/stepup', { totp: freshCode() }),
       row: () => m.developers.get(reg.id),
       // Re-authenticates after the clock moved past the session TTL.
       login: async () => { const res = await login(); d.csrf = csrf; return res; },

@@ -109,8 +109,8 @@ In both modes the ops, their argument schemas and the allowed path roots are ide
 
 | Port | Process | Bound to | Purpose |
 |---|---|---|---|
-| **2086/tcp** | whm-panel | `WHM_HOST` (default `0.0.0.0`) | HTTP interface and API. Always opened. |
-| **2087/tcp** | whm-panel | `WHM_HOST` | HTTPS interface; opened only when both `WHM_TLS_CERT` and `WHM_TLS_KEY` (or `tlsCert`/`tlsKey` in `whm.conf`) are set. Minimum TLS 1.2. |
+| **2086/tcp** | whm-panel | `WHM_HOST` (default `0.0.0.0`) | HTTP listener. Always opened; with a TLS listener it only answers `301` to `https://<host>:2087` (setting `panel.force_https`, default on; `WHM_FORCE_HTTPS=false` or `forceHttps: false` in `whm.conf` serves the panel over plain HTTP again). `/api/health` and `/.well-known/acme-challenge/` stay on HTTP. |
+| **2087/tcp** | whm-panel | `WHM_HOST` | HTTPS interface; opened only when both `WHM_TLS_CERT` and `WHM_TLS_KEY` (or `tlsCert`/`tlsKey` in `whm.conf`) are set — the installer sets them to `/etc/whm/tls/cert.pem` and `key.pem`. Minimum TLS 1.2. |
 | **7443/tcp** | whm-hub | `host` (default `0.0.0.0`) | Hub HTTPS: `/v1/*` license API, `/v1/market/*`, `/v1/dev/*`, `/v1/admin/*`, `/v1/reseller/*`, `/v1/portal/*`, and the portal SPA at `/` when `serve_ui` is on. |
 | **7440/tcp** | whm-hub | `127.0.0.1` only | `/healthz` and `/metrics`. `loopback_port: 0` disables it. Never expose it. |
 | `/run/whm-agent.sock` | whm-agentd | Unix socket, `0660 root:whmpanel` | Panel → agent requests (split mode). |
@@ -245,9 +245,19 @@ header comment.
 | `--upgrade` | Redeploy the code, dependencies, UI build and units; keep data and configuration; restart. Also upgrades an installed hub automatically (`/etc/systemd/system/whm-hub.service` present) without `--with-hub`. See [§6.1](#61-upgrading). |
 | `--with-hub` | Additionally install **whm-hub** on this host (user, directories, config, keys, certificate, unit). Requires `hub/package.json` and `hub/src/index.js` in the checkout. |
 | `--skip-node` | Do not install Node.js from NodeSource; the installed `node` must still be ≥ 22. |
+| `--stack full` / `--stack web` / `--stack none` | Install a hosting-stack **profile** from the panel's own catalog (`server/src/lib/stack-catalog.js`, the same list the setup wizard and *Service Manager › Server stack* use) with the host's package manager, before the units start: **full** = everything marked recommended (Apache, PHP-FPM, MariaDB, BIND, Exim, Dovecot, SpamAssassin, pure-ftpd, ModSecurity + CRS, certbot, quota tools, firewall, AWStats/Webalizer/Analog, rsync, git, Fail2ban …); **web** = Apache, PHP, MariaDB, certbot, quota, firewall; **none** = nothing now. Also `--stack=<profile>`. Works with `--upgrade` to add software to an existing install. |
+| `--components a,b,c` | Manual selection: comma-separated component keys from the catalog (`apache, php, nginx, mysql, postgres, bind, exim, dovecot, ftp, spamassassin, clamav, modsecurity, acme, quota, firewall, awstats, webalizer, analog, mailman, rsync, git, node, python, fail2ban`); an unknown key aborts before anything is installed. |
 | `-h`, `--help` | Print usage and exit. |
 
-Any other argument aborts with `unknown option`.
+Any other argument aborts with `unknown option`. Without `--stack`/`--components`, a first install
+on a terminal shows a numbered menu of the profiles (default **1**, the full stack); non-interactive
+runs and `--upgrade` install nothing and leave the choice to the setup wizard at the first login.
+What a stack install does: packages (`apt-get install` / `dnf install`, `epel-release` first on the
+RHEL family when a chosen component needs it), then `a2enmod` for the catalog's Apache modules
+(Debian family), `postgresql-setup --initdb` when PostgreSQL was chosen on RHEL and no cluster
+exists, `systemctl enable --now` on the first existing unit of each component, and an Apache reload
+when it is running. A failed package step is logged and the install goes on; the summary's
+`Stack:` line and *Service Manager* show what is left (Install / Repair).
 
 ### 4.2 Environment overrides
 
@@ -259,6 +269,8 @@ Set these in the environment of the `sudo bash scripts/install.sh` call.
 | `WHM_DATA_DIR` | `/var/lib/whm` | Panel data directory. Substituted into `whm-panel.service` (`ReadWritePaths`, `/var/lib/whm` occurrences). Note that the installed `panel.env` and `whm.conf` templates still say `/var/lib/whm`; edit them if you change this. |
 | `WHM_ADMIN_PASSWORD` | *(generated)* | Appended to `/etc/whm/panel.env` on a first install so the seed creates `root` with this password instead of generating one. |
 | `WHM_LICENSE_HUB_URL` | `https://licserver.hostingsignal.in` (local hub with `--with-hub`) | Written to `panel.env` as the bootstrap license hub. Must start with `https://`. With `--with-hub` it defaults to the hub's public URL; on a terminal (first install, not `--upgrade`) the script asks once with the vendor hub `https://licserver.hostingsignal.in` as the default, which the panel also uses when the variable is unset. An existing `WHM_LICENSE_HUB_URL=` line is never changed. Only the super admin sees the hub address in the panel. |
+| `WHM_STACK` | *(ask on a terminal, else none)* | Non-interactive form of `--stack` (`full`, `web`, `none`). |
+| `WHM_STACK_COMPONENTS` | *(unset)* | Non-interactive form of `--components` (comma-separated catalog keys). |
 | `WHM_SUPERADMIN_SETUP_PASSWORD` | *(ask)* | The **super admin setup password** (at least 12 characters). Its bcrypt hash is written to `/etc/whm/superadmin.key` (`0600 root:root`, in a directory the panel user cannot write); on a terminal (first install, not `--upgrade`) the script asks for it once (blank skips: run `whm-cli superadmin --init` later). `whm-cli superadmin <user>` only grants the super admin flag after this password verifies ([§4.7](#47-first-login)). |
 | `HUB_PUBLIC_URL` | `https://<hostname -f>:7443` | Hub `public_url` (the `iss` of every token). On an installed hub, the only hub.conf value an upgrade writes back. |
 | `HUB_DATA_DIR` | `/var/lib/whm-hub` | Hub databases, packages, PSL file. On an installed hub a *different* value aborts: move the directory by hand (see [§6.1](#61-upgrading)). |
@@ -285,7 +297,7 @@ Node major version 22.
    installed (`npm ci` with a lockfile, `npm install` without) and built; its `node_modules` is
    removed after the build. A failed UI build is logged, not fatal.
 6. **Ownership** – `/opt/whm` is `root:root`, world-unwritable.
-7. **Config and data directories** – creates `/etc/whm` and `/etc/whm/ssl` (`0750 root:whmpanel`),
+7. **Config and data directories** – creates `/etc/whm` and `/etc/whm/tls` (`0750 root:whmpanel`),
    `/var/lib/whm`, `/var/lib/whm/plugins` and `/var/log/whm` (`0750 whmpanel:whmpanel`); installs
    `whm.conf`, `agent.conf` and `panel.env` from `deploy/*.example` **only if missing**; appends
    `WHM_ADMIN_PASSWORD` to a new `panel.env`.
@@ -294,16 +306,21 @@ Node major version 22.
    `/etc/whm/superadmin.key` through `whm-cli.js superadmin --init` (no database access, so it runs
    before the first boot without creating root-owned secrets). A key an earlier build left in
    `/var/lib/whm` is moved to `/etc/whm` on `--upgrade`.
-10. **Panel TLS** – generates `/etc/whm/ssl/panel.{crt,key}` if absent ([§4.5](#45-tls)).
+10. **Panel TLS** – generates `/etc/whm/tls/cert.pem` + `key.pem` if absent ([§4.5](#45-tls)). An
+    install from an earlier build whose `whm.conf` still points at `/etc/whm/ssl/panel.{crt,key}` has that
+    pair copied to `/etc/whm/tls/` and `whm.conf` repointed (unless `panel.env` sets `WHM_TLS_CERT`).
 11. **Hub** (`--with-hub`) – [§5.1](#51-installing-the-hub). If the hub certificate was generated in this
     run, a copy is installed as `/etc/whm/hub-ca.pem` (`0640 root:whmpanel`) and
     `WHM_LICENSE_HUB_CA=/etc/whm/hub-ca.pem` is appended to `panel.env` so the same-host panel trusts it.
-12. **Units** – writes `/etc/systemd/system/whm-agentd.service` and `whm-panel.service` from
+12. **Hosting stack** – `--stack`/`--components`, `WHM_STACK`/`WHM_STACK_COMPONENTS`, or the menu on a
+    terminal ([§4.1](#41-flags)); nothing on a non-interactive run or `--upgrade` without the flag.
+13. **Units** – writes `/etc/systemd/system/whm-agentd.service` and `whm-panel.service` from
     `deploy/`, substituting the node binary, `/opt/whm` and `/var/lib/whm`; `systemctl daemon-reload`,
     `enable whm-agentd whm-panel`, `restart whm-agentd`, then `restart whm-panel`.
-13. **Summary** – after 2 s, if `whm-panel` is active: prints the URL, the login, the password (from
-    `initial-admin-password.txt` or "the WHM_ADMIN_PASSWORD you set"), log and firewall hints and the
-    configured hub. Otherwise `whm-panel failed to start; see: journalctl -u whm-panel -n 50`.
+14. **Summary** – after 2 s, if `whm-panel` is active: prints the URL, the login, the password (from
+    `initial-admin-password.txt` or "the WHM_ADMIN_PASSWORD you set"), log, firewall, TLS and stack
+    lines, the configured hub and the super admin command. Otherwise `whm-panel failed to start; see:
+    journalctl -u whm-panel -n 50`.
 
 ### 4.4 What it creates
 
@@ -313,7 +330,7 @@ Node major version 22.
 | `/etc/whm/whm.conf` | `0640 root:whmpanel` | Panel JSON config (template `deploy/whm.conf.example`: ports, TLS paths, `dataDir`, `mode: split`, `agentSocket`, `serveClient`, `clientDist`, `logLevel`, `trustProxy`, `sessionTtlMs`, `loginRateLimit`). |
 | `/etc/whm/agent.conf` | `0640 root:root` | Agent JSON config: `extraAllowedRoots: []`. |
 | `/etc/whm/panel.env` | `0640 root:whmpanel` | `EnvironmentFile` of `whm-panel.service`: `NODE_ENV=production`, `WHM_CONFIG=/etc/whm/whm.conf`, `WHM_MODE=split`, `WHM_DATA_DIR=/var/lib/whm`, `WHM_AGENT_SOCKET=/run/whm-agent.sock`, `WHM_SERVE_CLIENT=true`, `WHM_LOG_LEVEL=info`, plus `WHM_ADMIN_PASSWORD`, `WHM_LICENSE_HUB_URL`, `WHM_LICENSE_HUB_CA` when applicable. |
-| `/etc/whm/ssl/panel.crt`, `panel.key` | `0640 root:whmpanel` | Self-signed panel certificate. |
+| `/etc/whm/tls/cert.pem`, `key.pem` | `0640 root:whmpanel` | The panel listener's certificate pair: self-signed at install, replaced in place by the hostname certificate (*Networking Setup › Change Hostname*, agent op `ssl.service_cert.install` for `panel`); the listener re-reads a changed pair within 30 s. |
 | `/etc/whm/hub-ca.pem` | `0640 root:whmpanel` | Copy of a same-host hub's self-signed certificate (only when the installer generated it). |
 | `/var/lib/whm` | `0750 whmpanel:whmpanel` | `whm.db` (+ `-wal`/`-shm`), `session.secret`, `master.key` (AES-256-GCM key for secrets at rest), `initial-admin-password.txt`, `plugins/`, `plugin-data/`, `plugin-keys/`. |
 | `/etc/whm/superadmin.key` | `0600 root:root` | bcrypt hash of the super admin setup password (`{ "v": 1, "hash", "created_at" }`). Only `whm-cli superadmin` reads it; `/etc/whm` is root-owned, so the panel user can neither read nor replace it. Location: `superadminKeyFile` / `WHM_SUPERADMIN_KEY_FILE` (default: next to the config file in use, or `<dataDir>/superadmin.key` without one). |
@@ -326,13 +343,22 @@ Node major version 22.
 
 `self_signed_cert` in the installer runs
 `openssl req -x509 -newkey rsa:2048 -nodes -days 1095 -subj "/CN=<hostname -f>" -addext "subjectAltName=DNS:<host>,IP:<first IP>"`
-and writes `panel.crt`/`panel.key` (`0640 root:whmpanel`) once; an existing certificate is never
+and writes `/etc/whm/tls/cert.pem` + `key.pem` (`0640 root:whmpanel`) once; an existing pair is never
 overwritten. The panel opens HTTPS 2087 because `whm.conf` points `tlsCert`/`tlsKey` at these files
-(`WHM_TLS_CERT`/`WHM_TLS_KEY` override them). Replace the pair with a CA-issued one from the panel
-under *SSL/TLS › Manage Service SSL Certificates*, or by overwriting the two files and restarting
-`whm-panel`. Session cookies are marked `secure` whenever TLS is on (`server/src/app.js`).
+(`WHM_TLS_CERT`/`WHM_TLS_KEY` override them) and watches them: a changed pair is picked up within
+30 s without a restart (`watchTlsFiles` in `server/src/index.js`). The same two files are where
+*Networking Setup › Change Hostname* (and its daily `hostname-certificate-renew` schedule) installs
+the hostname's Let's Encrypt certificate (`ssl.service_cert.install` for the `panel` service, which
+also serves it to Exim, Dovecot and FTP) — so after the hostname step the panel is trusted without
+any manual copy. *SSL/TLS › Manage Service SSL Certificates* installs a certificate of your own into
+the same place; overwriting the two files by hand works too. Session cookies are marked `secure`
+whenever TLS is on (`server/src/app.js`).
 
-Browsers warn about the self-signed certificate until it is replaced; HTTP on 2086 stays available.
+Browsers warn about the self-signed certificate until the hostname certificate is issued. HTTP on
+2086 only redirects to 2087 while TLS is on; `WHM_FORCE_HTTPS=false` in `panel.env` (or
+`forceHttps: false` in `whm.conf`) keeps plain HTTP (the login cookie is still `secure`, so logging
+in over 2086 needs a TLS-terminating proxy in front). Earlier builds kept the pair under
+`/etc/whm/ssl/panel.{crt,key}`; `--upgrade` moves it ([§4.3](#43-what-the-installer-does-step-by-step) step 10).
 
 ### 4.6 Post-install checks
 
@@ -342,6 +368,9 @@ journalctl -u whm-panel -u whm-agentd -f         # "whm-agentd listening", "WHM 
 ls -l /run/whm-agent.sock                        # srw-rw---- root whmpanel
 curl -k https://127.0.0.1:2087/api/auth/csrf     # {"data":{"csrfToken":"…"}}
 sudo node /opt/whm/scripts/whm-cli.js status     # panel/agent state and counts (reads /etc/whm/whm.conf)
+sudo node /opt/whm/scripts/whm-cli.js stack-status                 # which hosting-stack components are installed
+sudo node /opt/whm/scripts/whm-cli.js install-stack --profile full # default install: every recommended component
+sudo node /opt/whm/scripts/whm-cli.js install-stack --select apache,php,mysql --dry-run   # manual selection (drop --dry-run to install)
 ```
 
 A line `whm-agentd is not reachable; privileged operations will fail until it starts` in the panel log
@@ -357,7 +386,13 @@ means the socket could not be opened (see [§8](#8-troubleshooting)).
    Then delete `initial-admin-password.txt`.
 4. Enrol TOTP under *Security Center › Two-Factor Authentication* (required once
    `security.2fa.required_for_root` is enabled there).
-5. **Make yourself the super admin.** The super admin is the one root user who owns the panel: only
+5. **Setup wizard.** The first root login on a fresh database lands on `/setup` (setting
+   `setup.completed`): *Welcome* → *Server basics* (hostname, contact e-mail, nameservers, main IP) →
+   *Services* (the stack profiles **Full hosting stack** / **Web + database only** / manual checklist,
+   installed as the job `stack.install`) → *Done*. *Skip for now* completes it without installing;
+   everything it offers is also under *Service Manager › Server stack* later. Components the installer
+   already put on the host (`--stack`) show as installed.
+6. **Make yourself the super admin.** The super admin is the one root user who owns the panel: only
    that user sees the license hub address, the license key, the activations and the hub answers, and
    only that user can activate, transfer, check in or deactivate the license. Every other root user
    gets a *Licensed — managed by the panel owner* card (status, edition, expiry) and `403
@@ -381,9 +416,12 @@ means the socket could not be opened (see [§8](#8-troubleshooting)).
    API process) could set it directly — the gate keeps the hub address and key from other *panel
    users*, not from the panel *process*. Treat a compromise of `whmpanel` as a compromise of the
    license view.
-6. As the super admin, enter the license key under *Server Configuration › Basic WebHost Manager
+7. As the super admin, enter the license key under *Server Configuration › Basic WebHost Manager
    Setup › License* ([§5.5](#55-connecting-a-panel-to-the-hub)). The hub is
    `https://licserver.hostingsignal.in` unless `WHM_LICENSE_HUB_URL` says otherwise.
+8. Set the hostname under *Networking Setup › Change Hostname*: it publishes the hostname's DNS
+   records, renders the branded landing page and issues the hostname certificate for the panel, Exim,
+   Dovecot and FTP (details in `docs/design/https-defaults.md`).
 
 Lost password later: `sudo node /opt/whm/scripts/whm-cli.js reset-password root` (prompts without echo
 when the password is omitted). Other commands: `create-admin <user> [pw]`, `list-users` (shows the
@@ -691,7 +729,8 @@ What happens: the checkout is rsync'ed over `/opt/whm` (`--delete`, excluding `n
 units are rewritten and the services restarted. An installed hub is upgraded in the same run.
 
 **Preserved** (never rewritten once present): `/etc/whm/whm.conf`, `agent.conf`, `panel.env` (including
-`WHM_LICENSE_HUB_URL`/`WHM_LICENSE_HUB_CA`), `/etc/whm/ssl/*`, `/var/lib/whm` (database, keys, plugins),
+`WHM_LICENSE_HUB_URL`/`WHM_LICENSE_HUB_CA`), `/etc/whm/tls/*` (and a legacy `/etc/whm/ssl/*`, whose panel pair is
+copied to `/etc/whm/tls/` once), `/var/lib/whm` (database, keys, plugins),
 `/etc/whm-hub/hub.conf`, `hub.env`, `master.key`, `keys/`, `ssl/`, `/var/lib/whm-hub`. For the hub, the
 data and backup directories are read back from `hub.env`/`hub.conf` so `HUB_DATA_DIR` need not be
 repeated; a *different* `HUB_DATA_DIR` aborts before anything is touched. Only an explicit
@@ -778,6 +817,7 @@ Precedence (`loadConfig()` in `server/src/config.js`): environment variables →
 | `WHM_TLS_PORT` | `tlsPort` | `2087` | HTTPS port (only with cert + key). |
 | `WHM_TLS_CERT` | `tlsCert` | `null` | PEM certificate; HTTPS is enabled when both cert and key are set. |
 | `WHM_TLS_KEY` | `tlsKey` | `null` | PEM private key. |
+| `WHM_FORCE_HTTPS` | `forceHttps` | `null` (→ setting `panel.force_https`, default `true`) | With a TLS listener, `false` keeps the panel reachable over plain HTTP on 2086 instead of redirecting every request to 2087; `true` pins the redirect on regardless of the setting. Read per request, no restart. Does not affect `web.force_https` (the per-site redirect). |
 | `WHM_DATA_DIR` | `dataDir` | `/var/lib/whm` (prod) / `./data` (dev, relative to cwd) | Data directory: `whm.db`, `session.secret`, `master.key`, plugin dirs. Created `0750` at boot. |
 | `WHM_MODE` | `mode` | `monolithic` | `split` or `monolithic` ([§1.2](#12-deployment-modes-split-and-monolithic)). |
 | `WHM_AGENT_SOCKET` | `agentSocket` | `/run/whm-agent.sock` | Agent socket path (split mode). |
@@ -845,7 +885,8 @@ default from [§5.6](#56-hubconf-reference). Booleans accept `1`, `true`, `yes`.
 ### 7.4 Installer-only variables
 
 `WHM_APP_DIR`, `WHM_DATA_DIR`, `WHM_ADMIN_PASSWORD`, `WHM_LICENSE_HUB_URL`, `WHM_SUPERADMIN_SETUP_PASSWORD`,
-`HUB_PUBLIC_URL`, `HUB_DATA_DIR`, `HUB_ADMIN_EMAIL`, `HUB_ADMIN_PASSWORD`, `HUB_SKIP_UI` — see
+`WHM_STACK`, `WHM_STACK_COMPONENTS`, `HUB_PUBLIC_URL`, `HUB_DATA_DIR`, `HUB_ADMIN_EMAIL`, `HUB_ADMIN_PASSWORD`,
+`HUB_SKIP_UI` — see
 [§4.2](#42-environment-overrides).
 
 ---
@@ -887,10 +928,15 @@ default from [§5.6](#56-hubconf-reference). Booleans accept `1`, `true`, `yes`.
 
 **TLS**
 - The panel starts HTTPS only when **both** `WHM_TLS_CERT` and `WHM_TLS_KEY` (or `tlsCert`/`tlsKey`)
-  are set and readable by `whmpanel`; otherwise only HTTP 2086 is open. Files under `/etc/whm/ssl` are
-  `0640 root:whmpanel`.
-- Browser warning: the installer's certificate is self-signed (`CN=<hostname>`, 3 years). Replace it
-  via *SSL/TLS › Manage Service SSL Certificates* or by overwriting `panel.crt`/`panel.key`.
+  are set and readable by `whmpanel`; otherwise only HTTP 2086 is open. Files under `/etc/whm/tls` are
+  `0640 root:whmpanel`; `panel certificate files unreadable` / `panel certificate reload failed` in the
+  journal means a new pair was written there with permissions the panel user cannot read (the
+  previous certificate stays in use until the files are readable).
+- Browser warning: the installer's certificate is self-signed (`CN=<hostname>`, 3 years). Run
+  *Networking Setup › Change Hostname* (or *Reissue hostname certificate*) for a Let's Encrypt one,
+  install your own via *SSL/TLS › Manage Service SSL Certificates*, or overwrite `cert.pem`/`key.pem`.
+- Everything on 2086 answers `301` to 2087: that is `panel.force_https` (default). Set
+  `WHM_FORCE_HTTPS=false` in `panel.env` to serve plain HTTP.
 - The hub refuses to start with `TLS is required: set tls.cert/tls.key in hub.conf (or insecure_http:
   true behind a TLS proxy)`.
 - Panel → hub: `WHM_LICENSE_HUB_URL must start with https://` (installer) / `hub_not_configured` (API).

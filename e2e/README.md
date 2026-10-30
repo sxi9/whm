@@ -19,7 +19,13 @@ pointed at it, and drives both through the public, developer, admin and panel AP
    `GET /v1/keys`, `GET /v1/market/keys`, `hub-cli.js create-admin`; vendor admin portal login,
    TOTP enrolment, an `admin:*` API key;
 2. panel up with `WHM_LICENSE_HUB_URL`, `WHM_LICENSE_HUB_CA` and `WHM_LICENSE_KEYS_FILE` (the
-   hub's license public key), API login as root;
+   hub's license public key) and an empty `WHM_CONFIG` file (so an installed `/etc/whm/whm.conf`
+   is never read), API login as root;
+2b. super admin — `POST /api/license/trial` answers `403 superadmin_required` for a plain root user;
+   `whm-cli superadmin --init` writes the setup-password key file (`$WHM_SUPERADMIN_KEY_FILE`,
+   0600, under the panel data directory here), a wrong setup password is refused, `whm-cli
+   superadmin root` grants the flag and the session from step 2 sees `superadmin: true` on
+   `GET /api/auth/me` without logging in again, `auth.superadmin.grant` audit row;
 3. license — `POST /api/license/trial`, `GET /api/license` (active trial, pinned plugin-signing kid,
    `$WHM_DATA_DIR/plugin-keys/<kid>.pub`), the activation on the hub, `POST /api/license/checkin`;
 4. developer publishing — `POST /v1/dev/register`, e-mail verification (the hub's `sendmail` is
@@ -40,6 +46,11 @@ pointed at it, and drives both through the public, developer, admin and panel AP
    (`pending_consent`, `added: ["packages:read"]`), consent enables the new version;
 7. both processes stopped (also on failure, through the pid files).
 
+Ten steps in all (1, 1b, 2, 2b, 3, 4, 5, 6, 6b, 7 are the labels in the summary; a green run
+prints ten `PASS` lines). TOTP codes are minted by a helper that waits for the next 30-second
+step when a secret's code was already used in the current one: both hubs accept a code once per
+account.
+
 ```bash
 SCRATCH=/tmp/whm-live-e2e HUB_PORT=7443 HUB_LB_PORT=7440 PANEL_PORT=2088 bash e2e/live-hub-flow.sh
 # KEEP_RUNNING=1 leaves the hub and the panel up after a green run (pid files in $SCRATCH),
@@ -50,8 +61,9 @@ kill "$(cat /tmp/whm-live-e2e/panel.pid)" "$(cat /tmp/whm-live-e2e/hub.pid)"
 
 Every run starts from empty hub and panel data directories under `$SCRATCH` (the trial can only
 be started once per server fingerprint and e-mail on a given hub). Needs `node`, `openssl`, `curl`,
-`jq`; `BUILD_CLIENT=1` builds the client first. Other knobs: `PANEL_PASSWORD`, `HUB_ADMIN_EMAIL`,
-`HUB_ADMIN_PASSWORD`, `DEV_EMAIL`, `DEV_PASSWORD`, `TRIAL_EMAIL`. The hub config written by the
+`jq`; `BUILD_CLIENT=1` builds the client first. Other knobs: `PANEL_PASSWORD`,
+`SUPERADMIN_SETUP_PASSWORD`, `HUB_ADMIN_EMAIL`, `HUB_ADMIN_PASSWORD`, `DEV_EMAIL`, `DEV_PASSWORD`,
+`TRIAL_EMAIL`. The hub config written by the
 script sets `review.require_two_reviewers_for_high_risk: false` so one admin approval signs the
 sample plugin; the production default needs a second reviewer for high-risk versions.
 

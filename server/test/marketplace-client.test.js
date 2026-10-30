@@ -298,6 +298,136 @@ describe('hub identity', () => {
   });
 });
 
+// The hub origins belong to the panel owner (users.superadmin): a root user
+// without the flag gets the full marketplace view with both origins replaced
+// by the label, cannot set or probe the whm-hub URL, and reads error texts
+// that name no origin. The owner keeps everything.
+describe('hub origin confinement (plain root)', () => {
+  let other;
+  let ocsrf;
+  const HUB_HOST = new URL(HUB).host;
+  const oget = (url) => other.get(url);
+  const opost = (url, body = {}) => other.post(url).set('X-CSRF-Token', ocsrf).send(body);
+  const oput = (url, body = {}) => other.put(url).set('X-CSRF-Token', ocsrf).send(body);
+  const noOrigin = (body) => { const text = JSON.stringify(body); expect(text).not.toContain(HUB_HOST); expect(text).not.toContain('other.test'); };
+
+  beforeAll(async () => {
+    const plainRoot = await app.createUser('root2', 'root');
+    expect(app.ctx.db.prepare('SELECT superadmin FROM users WHERE username = ?').get('root2').superadmin).toBe(0);
+    other = (await import('supertest')).default.agent(app.ctx.app);
+    const login = await other.post('/api/auth/login').send({ username: plainRoot.username, password: plainRoot.password });
+    expect(login.status, JSON.stringify(login.body)).toBe(200);
+    ocsrf = login.body.data.csrfToken;
+    expect(login.body.data.user).toMatchObject({ role: 'root', superadmin: false });
+  });
+
+  it('answers the full status with both origins replaced by the label, while the owner still sees them', async () => {
+    const mine = (await oget('/api/marketplace/status').expect(200)).body;
+    expect(mine.data).toMatchObject({ enabled: true, hubMismatch: false, url: null, hubUrl: null, hubLabel: 'WHM Marketplace hub', licenseStatus: 'active', hasToken: true, hubKids: [PLUGIN_KID_B, PLUGIN_KID_A].sort(), developerMode: false });
+    expect(Array.isArray(mine.data.pendingUpdates)).toBe(true);
+    noOrigin(mine);
+    const owner = (await get('/api/marketplace/status').expect(200)).body.data;
+    expect(owner).toMatchObject({ url: `${HUB}/`, hubUrl: HUB });
+    expect(owner.hubLabel).toBeUndefined();
+    expect(app.ctx.marketplace.isOwner({ id: app.ctx.db.prepare('SELECT id FROM users WHERE username = ?').get('root').id, role: 'root' })).toBe(true);
+    expect(app.ctx.marketplace.isOwner({ id: app.ctx.db.prepare('SELECT id FROM users WHERE username = ?').get('root2').id, role: 'root' })).toBe(false);
+    // Catalog reads work for the plain root and never carry the origin.
+    const cat = (await oget('/api/marketplace/catalog?q=scoped').expect(200)).body;
+    expect(cat.data.map((e) => e.id)).toEqual(['net.example.scoped']);
+    noOrigin(cat);
+    noOrigin((await oget('/api/marketplace/categories').expect(200)).body);
+    noOrigin((await oget('/api/marketplace/plugins/net.example.scoped').expect(200)).body);
+    noOrigin((await oget('/api/marketplace/plugins/net.example.scoped/versions').expect(200)).body);
+  });
+
+  it('hides the whm-hub URL and test answer in the Market Provider rows and keeps the URL, config and test behind the owner', async () => {
+    // A test answer names the hub host: run one as the owner first.
+    const realRequest = app.ctx.market.transport.request;
+    app.ctx.market.transport.request = async (url) => { throw new Error(`${new URL(url).host}: connection refused`); };
+    try {
+      const probe = (await post('/api/market/providers/whm-hub/test').expect(200)).body.data;
+      expect(probe.result.message).toContain(HUB_HOST);
+      expect(probe.provider).toMatchObject({ url: `${HUB}/`, lastTest: { ok: false, message: expect.stringContaining(HUB_HOST) } });
+    } finally { app.ctx.market.transport.request = realRequest; }
+    const list = (await oget('/api/market/providers').expect(200)).body;
+    const hubRow = list.data.find((p) => p.name === 'whm-hub');
+    expect(hubRow).toMatchObject({ enabled: true, configured: true, url: null, hubLabel: 'WHM Marketplace hub', lastTest: { ok: false, message: expect.stringMatching(/visible to the panel owner/) } });
+    expect(hubRow.missing).toEqual([]);
+    noOrigin(list);
+    const single = (await oget('/api/market/providers/whm-hub').expect(200)).body;
+    expect(single.data).toMatchObject({ url: null, hubLabel: 'WHM Marketplace hub' });
+    noOrigin(single);
+    // Only the hub row is confined: another built-in row keeps its URL for every root.
+    expect(list.data.find((p) => p.name === 'cpstore').url).toBe('https://store.cpanel.net');
+    for (const [method, url, body] of [
+      ['put', '/api/market/providers/whm-hub/config', { url: 'https://guess.test/', config: {} }],
+      ['put', '/api/market/providers/whm-hub', { url: 'https://guess.test/' }],
+      ['put', '/api/market/providers/whm-hub', { displayName: 'Renamed' }],
+      ['post', '/api/market/providers/whm-hub/test', {}],
+    ]) {
+      const res = await (method === 'put' ? oput(url, body) : opost(url, body));
+      expect(res.status, `${method} ${url}`).toBe(403);
+      expect(res.body.error.code).toBe('superadmin_required');
+      noOrigin(res.body);
+    }
+    expect(app.ctx.market.hub()).toEqual({ enabled: true, url: `${HUB}/` });
+    // The enable switch stays with every root user, and its answer is confined too.
+    const off = (await opost('/api/market/providers/whm-hub/disable').expect(200)).body;
+    expect(off.data).toMatchObject({ enabled: false, url: null, hubLabel: 'WHM Marketplace hub' });
+    noOrigin(off);
+    expect(schedulesEnabled()).toEqual([0, 0]);
+    const on = (await opost('/api/market/providers/whm-hub/enable').expect(200)).body;
+    expect(on.data).toMatchObject({ enabled: true, url: null });
+    noOrigin(on);
+    expect(schedulesEnabled()).toEqual([1, 1]);
+    // The owner's rows are untouched.
+    const ownerRow = (await get('/api/market/providers/whm-hub').expect(200)).body.data;
+    expect(ownerRow).toMatchObject({ url: `${HUB}/`, lastTest: { ok: false, message: expect.stringContaining(HUB_HOST) } });
+    expect(ownerRow.hubLabel).toBeUndefined();
+  });
+
+  it('names no origin in hub_mismatch and hub_unreachable answers for the plain root, both for the owner', async () => {
+    await put('/api/market/providers/whm-hub/config', { url: 'https://other.test/', config: {} }).expect(200);
+    try {
+      for (const res of [await oget('/api/marketplace/catalog'), await oget('/api/marketplace/categories'), await oget('/api/marketplace/plugins/net.example.scoped'), await opost('/api/marketplace/install', { pluginId: 'net.example.minimal' }), await opost('/api/marketplace/updates/check')]) {
+        expect(res.status).toBe(409);
+        expect(res.body.error.code).toBe('hub_mismatch');
+        expect(res.body.error.message).toMatch(/owner of this panel/);
+        noOrigin(res.body);
+      }
+      const owner = await get('/api/marketplace/catalog');
+      expect(owner.status).toBe(409);
+      expect(owner.body.error.message).toContain('https://other.test/');
+      expect(owner.body.error.message).toContain(HUB);
+      // The plain root's status still reports the mismatch, without saying where either side points.
+      const status = (await oget('/api/marketplace/status').expect(200)).body;
+      expect(status.data).toMatchObject({ enabled: true, hubMismatch: true, url: null, hubUrl: null });
+      noOrigin(status);
+    } finally {
+      await put('/api/market/providers/whm-hub/config', { url: `${HUB}/`, config: {} }).expect(200);
+    }
+    expect(schedulesEnabled()).toEqual([1, 1]);
+    // Audit rows are read by every root user: the hub row's URL never lands in them.
+    const configured = audits('market.provider.configure').filter((r) => r.target === 'whm-hub');
+    expect(configured.length).toBeGreaterThan(0);
+    for (const row of configured) { expect(row.args_redacted).not.toContain('other.test'); expect(row.args_redacted).not.toContain(HUB_HOST); expect(JSON.parse(row.args_redacted)).toMatchObject({ urlChanged: true }); }
+    for (const row of audits('market.provider.test').filter((r) => r.target === 'whm-hub')) expect(row.args_redacted).not.toContain(HUB_HOST);
+    const transport = app.ctx.license.transport;
+    app.ctx.license.transport = { ...transport, request: async (url, opts) => { if (opts?.method === 'GET') throw new Error(`getaddrinfo ENOTFOUND ${new URL(url).host}`); return transport.request(url, opts); } };
+    try {
+      const res = await oget('/api/marketplace/categories');
+      expect(res.status).toBe(503);
+      expect(res.body.error.code).toBe('hub_unreachable');
+      expect(res.body.error.message).toMatch(/owner of this panel/);
+      noOrigin(res.body);
+      const owner = await get('/api/marketplace/categories');
+      expect(owner.status).toBe(503);
+      expect(owner.body.error.message).toContain(HUB);
+      expect(owner.body.error.message).toContain('ENOTFOUND');
+    } finally { app.ctx.license.transport = transport; }
+  });
+});
+
 describe('install flow', () => {
   it('downloads through hub.request, checks the sha256 and signature, consents against the installed manifest and enables', async () => {
     const job = await runJob(await post('/api/marketplace/install', { pluginId: 'net.example.minimal' }));
@@ -534,8 +664,10 @@ describe('install flow', () => {
     const rcsrf = login.body.data.csrfToken;
     const rstatus = await other.get('/api/marketplace/status');
     expect(rstatus.status).toBe(200);
-    expect(Object.keys(rstatus.body.data).sort()).toEqual(['enabled', 'hostVersion', 'hubMismatch', 'hubUrl', 'licenseDegraded', 'licenseStatus', 'url']);
-    expect(rstatus.body.data).toMatchObject({ enabled: true, hubMismatch: false, hubUrl: HUB, licenseStatus: 'active' });
+    expect(Object.keys(rstatus.body.data).sort()).toEqual(['enabled', 'hostVersion', 'hubLabel', 'hubMismatch', 'hubUrl', 'licenseDegraded', 'licenseStatus', 'url']);
+    // The browse view names no origin either: resellers get the label.
+    expect(rstatus.body.data).toMatchObject({ enabled: true, hubMismatch: false, url: null, hubUrl: null, hubLabel: 'WHM Marketplace hub', licenseStatus: 'active' });
+    expect(JSON.stringify(rstatus.body)).not.toContain('hub.test');
     const rcat = await other.get('/api/marketplace/catalog?q=minimal');
     expect(rcat.status).toBe(200);
     expect(rcat.body.data[0].installed).toEqual({ state: 'enabled' });

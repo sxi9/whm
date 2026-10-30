@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Live hub + panel end-to-end flow (Phase 5): starts a whm-hub with fresh keys and
 # a self-signed certificate, a panel pointed at it, then drives the real API of
-# both through trial activation, check-in, developer publishing, marketplace
-# install with consent, and revocation. Prints PASS/FAIL per step, stops both
-# processes on exit (also on failure) and leaves every file under $SCRATCH.
+# both through the super admin grant (whm-cli superadmin), trial activation,
+# check-in, developer publishing, marketplace install with consent, and
+# revocation. Prints PASS/FAIL per step, stops both processes on exit (also on
+# failure) and leaves every file under $SCRATCH.
 #
 #   SCRATCH=/tmp/whm-live-e2e HUB_PORT=7443 HUB_LB_PORT=7440 PANEL_PORT=2088 bash e2e/live-hub-flow.sh
 #
@@ -17,6 +18,7 @@ HUB_PORT=${HUB_PORT:-7443}
 HUB_LB_PORT=${HUB_LB_PORT:-7440}
 PANEL_PORT=${PANEL_PORT:-2088}
 PANEL_PASSWORD=${PANEL_PASSWORD:-'Live-E2e-Passw0rd!'}
+SUPERADMIN_SETUP_PASSWORD=${SUPERADMIN_SETUP_PASSWORD:-'Live-E2e-Setup-Passw0rd!'}
 HUB_ADMIN_EMAIL=${HUB_ADMIN_EMAIL:-admin@hub.test}
 HUB_ADMIN_PASSWORD=${HUB_ADMIN_PASSWORD:-'Hub-Admin-Passw0rd!'}
 DEV_EMAIL=${DEV_EMAIL:-dev@example.test}
@@ -27,6 +29,9 @@ HUB_URL="https://127.0.0.1:${HUB_PORT}"
 PANEL_URL="http://127.0.0.1:${PANEL_PORT}"
 HUB=$SCRATCH/hub
 PANEL=$SCRATCH/panel-data
+# An empty config file keeps the panel and whm-cli off /etc/whm/whm.conf on a host that has one.
+PANEL_CONF=$SCRATCH/panel.conf
+SUPERADMIN_KEY=$PANEL/superadmin.key
 CERT=$HUB/tls/hub.crt
 export NODE_PATH=$REPO/node_modules
 
@@ -99,13 +104,29 @@ hub_dev() { http "$1" "$HUB_URL$2" "${3:-}" -b "$SCRATCH/dev.cookies" -c "$SCRAT
 panel() { http "$1" "$PANEL_URL$2" "${3:-}" -b "$SCRATCH/panel.cookies" -c "$SCRATCH/panel.cookies" -H "X-CSRF-Token: ${PANEL_CSRF:-}"; }
 jqr() { printf '%s' "$BODY" | jq -r "$1" 2>/dev/null; }
 expect_code() { [ "$CODE" = "$1" ] || fail "${2:-request} answered HTTP $CODE: ${BODY:0:300}"; }
-totp() { node -e "const {authenticator}=require('otplib');const r=authenticator.timeRemaining();if(r<4)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,r*1000+200);console.log(authenticator.generate(process.argv[1]))" "$1"; }
+# A code is accepted once per account (RFC 6238 §5.2): the helper remembers the step of the last
+# code it minted for a secret and waits for the next 30-second step when asked again within it;
+# a code minted in the last seconds of a step waits as well so a slow request cannot straddle it.
+totp() {
+  node -e "
+const { authenticator } = require('otplib'); const fs = require('fs'); const crypto = require('crypto');
+const [secret, memoFile] = process.argv.slice(1);
+const id = crypto.createHash('sha256').update(secret).digest('hex').slice(0, 16);
+let memo = {}; try { memo = JSON.parse(fs.readFileSync(memoFile, 'utf8')); } catch {}
+const step = () => Math.floor(Date.now() / 30000);
+const wait = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+if (memo[id] !== undefined && step() <= memo[id]) wait(authenticator.timeRemaining() * 1000 + 200);
+if (authenticator.timeRemaining() < 4) wait(authenticator.timeRemaining() * 1000 + 200);
+memo[id] = step(); fs.writeFileSync(memoFile, JSON.stringify(memo));
+console.log(authenticator.generate(secret));
+" "$1" "$SCRATCH/totp-steps.json"
+}
 b64() { printf '%s' "$1" | base64 -w0; }
 
 # =============================================================================
 step '1. hub up (keys, TLS, config, healthz, vendor admin)'
 stop_processes
-rm -rf "$HUB/data" "$HUB/keys" "$HUB/mail" "$PANEL" "$SCRATCH"/*.cookies "$SCRATCH/pkg" "$SCRATCH/dev"
+rm -rf "$HUB/data" "$HUB/keys" "$HUB/mail" "$PANEL" "$SCRATCH"/*.cookies "$SCRATCH/pkg" "$SCRATCH/dev" "$SCRATCH/totp-steps.json"
 mkdir -p "$HUB/data" "$HUB/keys" "$HUB/mail" "$SCRATCH/pkg" "$SCRATCH/dev"
 if [ ! -f "$CERT" ]; then
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 -subj '/CN=127.0.0.1' \
@@ -170,7 +191,8 @@ if [ "${BUILD_CLIENT:-0}" = 1 ] || [ ! -f "$REPO/client/dist/index.html" ]; then
 fi
 curl -s -o /dev/null "$PANEL_URL/api/health" && fail "port $PANEL_PORT is already in use by another process"
 cd "$REPO"
-WHM_MODE=monolithic WHM_DATA_DIR="$PANEL" WHM_PORT="$PANEL_PORT" WHM_SERVE_CLIENT=true WHM_ADMIN_PASSWORD="$PANEL_PASSWORD" \
+printf '{}\n' > "$PANEL_CONF"
+WHM_MODE=monolithic WHM_DATA_DIR="$PANEL" WHM_CONFIG="$PANEL_CONF" WHM_SUPERADMIN_KEY_FILE="$SUPERADMIN_KEY" WHM_PORT="$PANEL_PORT" WHM_SERVE_CLIENT=true WHM_ADMIN_PASSWORD="$PANEL_PASSWORD" \
   WHM_LICENSE_HUB_URL="$HUB_URL" WHM_LICENSE_HUB_CA="$CERT" WHM_LICENSE_KEYS_FILE="$SCRATCH/license-keys.json" NODE_ENV=development \
   nohup node server/src/index.js > "$SCRATCH/panel.log" 2>&1 &
 PANEL_PID=$!; echo "$PANEL_PID" > "$SCRATCH/panel.pid"
@@ -182,6 +204,30 @@ PANEL_CSRF=$(jqr .data.csrfToken)
 panel GET /api/auth/me; expect_code 200 'auth/me'
 [ "$(jqr .data.license.status)" = unlicensed ] || fail "fresh panel is not unlicensed: $(jqr .data.license)"
 pass "root session, csrf token, license status $(jqr .data.license.status)"
+
+# =============================================================================
+# The license API belongs to the panel owner: a root user becomes the super admin only through
+# whm-cli after the setup password stored in $WHM_SUPERADMIN_KEY_FILE (0600) by `superadmin --init`.
+step '2b. super admin: whm-cli superadmin --init, wrong password refused, root granted without re-login'
+whm_cli() { # [SETUP_PW=…] whm_cli <args>: the panel CLI against this run's data directory and config
+  (cd "$REPO" && WHM_MODE=monolithic WHM_DATA_DIR="$PANEL" WHM_CONFIG="$PANEL_CONF" WHM_SUPERADMIN_KEY_FILE="$SUPERADMIN_KEY" \
+    WHM_SUPERADMIN_SETUP_PASSWORD="${SETUP_PW-$SUPERADMIN_SETUP_PASSWORD}" node scripts/whm-cli.js "$@") >> "$LOG" 2>&1
+}
+panel POST /api/license/trial "$(jq -n --arg e "$TRIAL_EMAIL" '{email:$e}')"
+[ "$CODE" = 403 ] && [ "$(jqr .error.code)" = superadmin_required ] || fail "trial before the grant answered $CODE $(jqr .error.code), expected 403 superadmin_required"
+whm_cli superadmin --init || fail "whm-cli superadmin --init failed (see $LOG)"
+[ -f "$SUPERADMIN_KEY" ] || fail "$SUPERADMIN_KEY was not written"
+[ "$(stat -c %a "$SUPERADMIN_KEY")" = 600 ] || fail "$SUPERADMIN_KEY is mode $(stat -c %a "$SUPERADMIN_KEY"), expected 600"
+SETUP_PW='not-the-setup-password' whm_cli superadmin root && fail 'a wrong setup password granted the super admin'
+panel GET /api/auth/me; expect_code 200 'auth/me'
+[ "$(jqr .data.superadmin)" = false ] || fail 'root became the super admin without the setup password'
+whm_cli superadmin root || fail "whm-cli superadmin root failed (see $LOG)"
+# The flag is read per request, so the session opened in step 2 sees it at once.
+panel GET /api/auth/me; expect_code 200 'auth/me'
+[ "$(jqr .data.superadmin)" = true ] || fail "root is not the super admin after the grant: $(jqr '{superadmin, user: .user.username}')"
+panel GET '/api/system/audit?action=auth.superadmin.grant&pageSize=5'; expect_code 200 'GET /api/system/audit'
+printf '%s' "$BODY" | jq -e '.data[] | select(.action == "auth.superadmin.grant" and .target == "root")' > /dev/null || fail 'no auth.superadmin.grant audit row'
+pass "key file $SUPERADMIN_KEY, wrong setup password refused, root is the super admin"
 
 # =============================================================================
 step '3. license: trial, hub activation, pinned plugin key, check-in'

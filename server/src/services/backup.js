@@ -820,6 +820,7 @@ export function createBackupService(ctx) {
     let added = 0;
     for (const d of meta.domains) {
       if (typeof d?.domain !== 'string' || !RESTORABLE_DOMAIN_TYPES.includes(d.type) || d.domain === account.domain) continue;
+      if (isServerHostname(ctx, d.domain)) { domains.push({ domain: d.domain, type: d.type, status: 'skipped', detail: 'is the server hostname' }); log(`domain ${d.domain} skipped: it is the server hostname`, 'warn'); continue; }
       const owner = stmts.domainOwner.get(d.domain);
       const claim = ownedByAccount(owner, account);
       if (!claim.ok) { domains.push({ domain: d.domain, type: d.type, status: 'skipped', detail: claim.reason }); log(`domain ${d.domain} skipped: ${claim.reason}`, 'warn'); continue; }
@@ -1026,4 +1027,14 @@ export function createBackupService(ctx) {
     enqueueFetch, runFetchJob,
     retentionClassFor, planPrune, grantDatabase, rewriteDocroot,
   };
+}
+
+// The server hostname owns the panel's landing vhost and certificate; an
+// imported account must never claim it (accounts.create refuses it the same way).
+function isServerHostname(ctx, domain) {
+  const name = String(domain || '').toLowerCase();
+  if (!name) return false;
+  if (ctx.web?.isServerName?.(name)) return true;
+  const host = String(ctx.settings?.get?.('basic.hostname') || '').toLowerCase();
+  return Boolean(host) && (name === host || name === `www.${host}`);
 }

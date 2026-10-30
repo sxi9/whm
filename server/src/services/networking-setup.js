@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { badRequest, conflict, unprocessable } from '../lib/errors.js';
 import { fields } from '../lib/validate.js';
@@ -390,6 +391,15 @@ export function createNetworkingSetupService(ctx) {
     const note = result?.note ? ` ${result.note}` : '';
     if (!cfg.tlsCert || !cfg.tlsKey) return `the panel has no TLS listener (WHM_TLS_CERT/WHM_TLS_KEY are not set), so the certificate written to ${written} is not served on the panel port.${note}`;
     if (!applied.includes(path.resolve(cfg.tlsCert)) || !applied.includes(path.resolve(cfg.tlsKey))) return `the panel listener reads ${cfg.tlsCert} and ${cfg.tlsKey}, not ${written}; copy the pair there (readable by the whm-panel service user) or point WHM_TLS_CERT/WHM_TLS_KEY at the written files and restart whm-panel.${note}`;
+    // The agent writes as root; this process is the listener (whmpanel in
+    // split mode), so a pair it cannot read is not live and would stop the
+    // next restart. Only a permission refusal is the listener's own verdict.
+    for (const file of [cfg.tlsCert, cfg.tlsKey]) {
+      try { fs.accessSync(path.resolve(file), fs.constants.R_OK); } catch (err) {
+        if (err.code === 'ENOENT') continue;
+        return `the whm-panel service user cannot read ${file} (${err.code}), so the listener keeps its previous certificate and would not start after a restart; make the pair readable by the panel's group (root:whmpanel 0640, the layout install.sh creates under /etc/whm/tls) and reissue the hostname certificate.${note}`;
+      }
+    }
     return null;
   }
 

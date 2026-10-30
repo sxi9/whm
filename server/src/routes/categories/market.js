@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { validate, pagination, z } from '../../lib/validate.js';
-import { requireRoot, requireReseller } from '../../middleware/rbac.js';
-import { createMarketService, PROVIDER_NAME_RE } from '../../services/market.js';
+import { requireRoot, requireReseller, requireSuperadmin } from '../../middleware/rbac.js';
+import { createMarketService, PROVIDER_NAME_RE, HUB_NAME } from '../../services/market.js';
 import { ADAPTER_IDS } from '../../services/market-adapters.js';
 
 const name = z.string().trim().regex(PROVIDER_NAME_RE, 'Lowercase letters, digits, "_" or "-"; must start with a letter; max 32 chars');
@@ -42,17 +42,31 @@ export async function register(ctx) {
   const r = Router();
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.json(d?.meta ? d : { data: d })).catch(next);
   const created = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(201).json({ data: d })).catch(next);
+  // The whm-hub row's URL is the license hub origin: only the panel owner may
+  // see, set or probe it (a test answer names the host, and setting a guess
+  // would turn hubMismatch into an oracle). Every root user still switches
+  // the row on and off.
+  const owner = requireSuperadmin(ctx);
+  const ownerForHub = (req, res, next) => (req.params.name === HUB_NAME ? owner(req, res, next) : next());
+  // The route-level audit row (middleware/audit.js) mirrors req.body when the
+  // response finishes, and audit rows are read by every root user: the hub
+  // row's URL goes to the service and is replaced on the request first.
+  const withoutHubUrl = (fn) => (req) => {
+    const body = req.body;
+    if (req.params.name === HUB_NAME && body && typeof body === 'object' && body.url != null) req.body = { ...body, url: '[owner-only]' };
+    return fn(req, body);
+  };
 
   // Market Provider Manager
   r.get('/adapters', requireRoot, wrap(() => s.adapters()));
   r.get('/providers', requireReseller, validate({ query: listQuery }), wrap((req) => s.list(req.query, req.user)));
   r.post('/providers', requireRoot, validate({ body: createBody }), created((req) => s.create(req.body, req)));
   r.get('/providers/:name', requireReseller, validate({ params: nameParam }), wrap((req) => s.get(req.params.name, req.user)));
-  r.put('/providers/:name', requireRoot, validate({ params: nameParam, body: updateBody }), wrap((req) => s.update(req.params.name, req.body, req)));
-  r.put('/providers/:name/config', requireRoot, validate({ params: nameParam, body: configureBody }), wrap((req) => s.configure(req.params.name, req.body, req)));
+  r.put('/providers/:name', requireRoot, validate({ params: nameParam, body: updateBody }), ownerForHub, wrap(withoutHubUrl((req, body) => s.update(req.params.name, body, req))));
+  r.put('/providers/:name/config', requireRoot, validate({ params: nameParam, body: configureBody }), ownerForHub, wrap(withoutHubUrl((req, body) => s.configure(req.params.name, body, req))));
   r.post('/providers/:name/enable', requireRoot, validate({ params: nameParam }), wrap((req) => s.setEnabled(req.params.name, true, req)));
   r.post('/providers/:name/disable', requireRoot, validate({ params: nameParam }), wrap((req) => s.setEnabled(req.params.name, false, req)));
-  r.post('/providers/:name/test', requireRoot, validate({ params: nameParam }), wrap((req) => s.test(req.params.name, req)));
+  r.post('/providers/:name/test', requireRoot, validate({ params: nameParam }), ownerForHub, wrap((req) => s.test(req.params.name, req)));
   r.post('/providers/:name/products/sync', requireRoot, validate({ params: nameParam }), wrap((req) => s.syncProducts(req.params.name, req)));
   r.delete('/providers/:name', requireRoot, validate({ params: nameParam }), wrap((req) => s.remove(req.params.name, req)));
 

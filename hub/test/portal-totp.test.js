@@ -15,11 +15,10 @@ import { encodeQr, qrSvgPath } from '../ui/src/lib/qr.js';
 let h;
 let seeded;
 before(async () => {
-  h = await bootHub();
-  // The migration seeds the rule on; the test support may relax it for the
-  // other suites, so it is switched on explicitly here.
+  // bootHub relaxes the rule for the other suites unless asked to keep the
+  // migration's seeded value; this suite is about that rule.
+  h = await bootHub({ requireTotp: true });
   seeded = h.db.prepare("SELECT value_json FROM vendor_settings WHERE key = 'hub.require_totp_for_admins'").get();
-  h.ctx.portalUsers.updateSettings({ require_totp_for_admins: true }, { by: 'test' });
 });
 after(() => h.close());
 
@@ -116,9 +115,9 @@ test('enrolled: login requires the code, a wrong code is refused, step-up re-arm
   assert.equal(confirmStep, Math.floor(Date.now() / 30_000), 'the confirm code is recorded as spent');
   // RFC 6238 §5.2: the code that confirmed enrolment cannot log in during its step.
   const replayedLogin = await signIn(admin, authenticator.generate(secret));
-  assert.equal(replayedLogin.res.status, 401, JSON.stringify(replayedLogin.res.body));
-  assert.equal(replayedLogin.res.body.error.code, 'unauthorized');
-  assert.equal(h.db.prepare('SELECT totp_failures FROM portal_users WHERE id = ?').get(admin.id).totp_failures, 1, 'a replay spends the TOTP budget like a wrong code');
+  assert.equal(replayedLogin.res.status, 422, JSON.stringify(replayedLogin.res.body));
+  assert.equal(replayedLogin.res.body.error.code, 'totp_reused');
+  assert.deepEqual(h.db.prepare('SELECT totp_failures, failed_logins FROM portal_users WHERE id = ?').get(admin.id), { totp_failures: 0, failed_logins: 0 }, 'a replay verified, so it spends neither the TOTP budget nor a login strike');
 
   clock.nextStep();
   const noCode = await signIn(admin);
@@ -127,7 +126,7 @@ test('enrolled: login requires the code, a wrong code is refused, step-up re-arm
   const wrong = await signIn(admin, '123456');
   assert.equal(wrong.res.status, 401);
   assert.equal(wrong.res.body.error.code, 'unauthorized');
-  assert.equal(h.db.prepare('SELECT totp_failures FROM portal_users WHERE id = ?').get(admin.id).totp_failures, 2, 'a wrong login code spends the TOTP budget');
+  assert.equal(h.db.prepare('SELECT totp_failures FROM portal_users WHERE id = ?').get(admin.id).totp_failures, 1, 'a wrong login code spends the TOTP budget');
   const loginCode = authenticator.generate(secret);
   const { agent, res, csrf } = await signIn(admin, loginCode);
   assert.equal(res.status, 200, JSON.stringify(res.body));
@@ -146,11 +145,12 @@ test('enrolled: login requires the code, a wrong code is refused, step-up re-arm
   // The login code, observed once, is refused by the step-up (stolen-cookie threat model).
   const replayedStepup = await agent.post('/v1/portal/stepup').set('X-CSRF-Token', csrf).send({ totp: loginCode });
   assert.equal(replayedStepup.status, 422, JSON.stringify(replayedStepup.body));
-  assert.equal(replayedStepup.body.error.code, 'totp_invalid');
-  assert.equal((await agent.post('/v1/portal/2fa/disable').set('X-CSRF-Token', csrf).send({ code: loginCode })).body.error.code, 'totp_invalid', 'nor can it disable 2FA');
-  assert.equal((await agent.post('/v1/portal/2fa/enroll').set('X-CSRF-Token', csrf).send({ code: loginCode })).body.error.code, 'totp_invalid', 'nor re-enrol');
+  assert.equal(replayedStepup.body.error.code, 'totp_reused');
+  assert.equal((await agent.post('/v1/portal/2fa/disable').set('X-CSRF-Token', csrf).send({ code: loginCode })).body.error.code, 'totp_reused', 'nor can it disable 2FA');
+  assert.equal((await agent.post('/v1/portal/2fa/enroll').set('X-CSRF-Token', csrf).send({ code: loginCode })).body.error.code, 'totp_reused', 'nor re-enrol');
   assert.equal(h.db.prepare('SELECT totp_enabled, totp_pending_enc FROM portal_users WHERE id = ?').get(admin.id).totp_enabled, 1);
   assert.equal(lastStep(admin.id), confirmStep + 1, 'a refused replay records nothing');
+  assert.equal(h.db.prepare('SELECT totp_failures FROM portal_users WHERE id = ?').get(admin.id).totp_failures, 1, 'three replays after the one wrong code: the budget still stands at one');
   clock.nextStep();
   const good = await agent.post('/v1/portal/stepup').set('X-CSRF-Token', csrf).send({ totp: authenticator.generate(secret) });
   assert.equal(good.status, 200, JSON.stringify(good.body));

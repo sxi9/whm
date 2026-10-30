@@ -47,10 +47,19 @@ Companion documents: [`README.md`](../README.md) (install, hub, configuration re
 
 ## Signing in
 
-The panel listens on **http://server:2086** and, when a certificate is configured,
-**https://server:2087** (the installer generates a self-signed one and enables both). Open
-the address in a browser; the login card shows the vendor branding set under
-*HST Panel › Customization* and, if one is configured, a login notice.
+The panel listens on **https://server:2087** and on **http://server:2086**. HTTPS is the
+default: the installer generates a self-signed certificate (`/etc/whm/tls/cert.pem` + `key.pem`,
+replaced by the hostname's Let's Encrypt certificate once *Networking Setup › Change Hostname* has
+run), and port 2086 only answers with a redirect to 2087 (setting `panel.force_https`;
+`WHM_FORCE_HTTPS=false` in `/etc/whm/panel.env` serves plain HTTP again). Open the address in a
+browser; the login card shows the vendor branding set under *HST Panel › Customization* and, if one
+is configured, a login notice.
+
+**Naming.** The product is **HST Panel** by Hostingsignal: the hosted-account side carries that
+name, the administrative side keeps the **WHM** name, and the sidebar category that cPanel calls
+"cPanel" is *HST Panel* here (`client/src/brand.js` holds the names). Routes, setting keys, slugs and
+file names keep the original `cpanel` identifiers, so bookmarks, API calls and stored settings did
+not change with the labels.
 
 ### Username and password
 
@@ -109,6 +118,11 @@ panel looks up the identity link. Errors come back as query parameters on the lo
 | `external_denied` / `external_failed` | The provider refused or the exchange failed. |
 
 Providers can also auto-link by e-mail when `security.external_auth.auto_link_by_email` is on.
+The token exchange follows the provider's discovery document: a provider whose
+`token_endpoint_auth_methods_supported` lists only `client_secret_post` (Apple, Meta) receives the
+client secret in the token request body instead of an HTTP Basic header; everything else uses
+Basic. The redirect URI a provider must register is
+`https://<hostname>:2087/api/auth/external/<identifier>/callback`.
 
 ## The layout
 
@@ -229,6 +243,18 @@ lists).
 
 Routes under `/api/server-config/*` and `/api/system/*`; everything here is **root only**.
 
+**First login: the setup wizard.** On a fresh install the first root login (after the forced
+password change and, when required, 2FA enrolment) opens the **HST Panel setup wizard** at `/setup`
+instead of the dashboard, until the setting `setup.completed` is true. Steps: *Welcome* → *Server
+basics* (hostname, contact e-mail, nameservers, main IP: the same settings as *Basic WebHost Manager
+Setup*) → *Services* (profile cards **Full hosting stack**, **Web + database only**, or a manual
+checklist of the stack catalog, from `GET /api/system/stack`) → *Install* (one job `stack.install`
+with its progress log) → *Done* (`POST /api/system/setup/complete`). *Skip for now* completes the
+wizard without installing anything; a server that already has hosting accounts is treated as set
+up. The wizard works on a host without a package manager (the notice is shown and you can continue).
+The same profiles are offered by the installer (`install.sh --stack full|web|none`,
+`--components …`) and afterwards by *Service Manager › Server stack* (7.10).
+
 #### 1.1 Basic WebHost Manager Setup
 
 Contact details, main and shared IPs, nameservers and account defaults, plus the **License** tab.
@@ -252,8 +278,17 @@ license key (`WHM-XXXX-XXXX-XXXX-XXXX`, stored encrypted, never shown again), *C
 *Deactivate this server*, *Transfer here* from another activation when all seats are used,
 *Start a free trial* (e-mail only; 14 days, 5 accounts, one per server fingerprint and
 e-mail) and a list of recent license events.
+Only the **super admin** sees this tab in full: the one root user flagged with
+`sudo node /opt/whm/scripts/whm-cli.js superadmin <user>`, which asks for the super admin setup
+password chosen at install time (its bcrypt hash lives in `/etc/whm/superadmin.key`, `0600
+root:root`; `whm-cli superadmin --init` creates it, `--revoke <user>` clears the flag). Every other
+root user gets a *Licensed — managed by the panel owner* card with status, edition and expiry,
+`403 superadmin_required` on the license API, and never sees the hub address, the key prefix, the
+activations or the hub's answers (the audit log names license events by activation id only). The
+flag is never set from the web interface.
 **Server:** settings are stored in SQLite; license actions talk to the hub named by
-`WHM_LICENSE_HUB_URL` (bootstrap) or by the token's issuer, verify every answer against the keys
+`WHM_LICENSE_HUB_URL` (bootstrap; the vendor hub `https://licserver.hostingsignal.in` when unset)
+or by the token's issuer, verify every answer against the keys
 pinned in the release, and check in every 12 h. **Needs:** a reachable hub over https for
 activation; nothing for the Settings tab. **Gotchas:** with `licenseEnforce` on (default under
 `NODE_ENV=production`) a lapsed license puts the panel into read-only degraded mode (`423` on
@@ -292,10 +327,12 @@ off even if the feature is on.
 
 Enable and verify filesystem disk quotas. **Who:** root.
 **Summary** card (tools installed? *Install quota tools* button or link to *Install Distro
-Packages*), **Options** (*Also enable group quotas*), a **Filesystems** table (mount point,
-device, fstype, user-quota state, mounted with quota option, `/etc/fstab` entry, quota files) with
-per-row actions **Enable quotas**, **Update fstab and enable** (danger) and **Turn off**, a job
-card, and the *Required /etc/fstab change* preview. **Server:** `POST /api/server-config/quota/enable`
+Packages*) and a **Filesystems** card whose header holds *Also enable group quotas*; the table
+(mount point, device, fstype, user-quota state, mounted with quota option, `/etc/fstab` entry, quota
+files) has per-row actions **Enable quotas**, **Update fstab and enable** (danger) and **Turn off**;
+the manual fstab diff and commands are under *Show manual steps* beneath the table (they follow the
+group-quota switch and tell XFS operators to reboot instead of remounting); a job card appears while
+setup runs. **Server:** `POST /api/server-config/quota/enable`
 runs as a job: rewrites the fstab line (backup `/etc/fstab.whm-bak`), remounts, `quotacheck`,
 `quotaon`; `…/disable` runs `quotaoff`; `…/install-tools` installs the distro `quota` package as a
 job. **Needs:** `quota` tools; a filesystem that supports user quotas (XFS needs a reboot after
@@ -351,8 +388,11 @@ In-browser root shell. **Who:** root.
 **Attach** and **Close**; a session ends after the configured idle time even while attached.
 **Server:** `POST /api/server-config/terminal` opens a PTY through the agent (`terminal.open`),
 output streams over `GET …/terminal/:id/stream` (SSE), keystrokes go to `POST …/input`;
-open/close are audited. Limits: `terminal.max_sessions` (3) and `terminal.idle_minutes` (15,
-max 240). **Needs:** the `terminal` capability on the host. **Gotchas:** sessions belong to the
+open/close are audited. Output is long-polled from the agent (`terminal.read` with `waitMs`, up to
+1 s) and relayed over SSE as it appears, keystrokes wake a pending read and the browser batches them
+at 16 ms, so echo is immediate; in split mode restart `whm-agentd` together with `whm-panel` after
+an upgrade (until then the stream falls back to 400 ms polling). Limits: `terminal.max_sessions`
+(3) and `terminal.idle_minutes` (15, max 240). **Needs:** the `terminal` capability on the host. **Gotchas:** sessions belong to the
 administrator who opened them; closing sends SIGHUP to the shell and whatever runs in it.
 
 #### 1.11 Tweak Settings
@@ -441,6 +481,22 @@ section by section, with copy/download), and **Settings** (root): *Support email
 *Provider name*, *Support portal URL*, *Default grant length*, *Maximum grant length*.
 **Server:** `/api/support/center`, `/docs`, `/diagnostics`, `/settings`.
 
+#### 2.4 Account Conversations
+
+One support thread per hosting account between its **account manager** and the account. **Who:**
+root (every account), reseller (accounts it owns or manages), the hosted-account login (`user`
+role: its own thread, shown as *My support* with a banner naming the manager).
+Conversation list on the left (filter, unread badges, closed pills, last message), the thread on
+the right (day separators, *Load earlier messages*, **Close**/**Reopen** for the manager side) and a
+composer (Ctrl+Enter sends, 4000 characters). `?account=<username>` opens a thread directly (the
+*Conversation* button on the account summary). **Server:** `/api/support/chat*`; the thread is
+created on the first message, a closed thread reopens on a new message, updates arrive live over
+`GET …/chat/:username/stream` (SSE, with a fresh snapshot after every reconnect), the other party
+gets a mail notice through *Contact Manager* when mail can leave the server, and the audit row of a
+post records the length only, never the text. **Gotchas:** being the manager grants the
+conversation, not the account's settings; the account side exists once the hosted-account login
+creates `user` rows per account.
+
 ## 3. Networking Setup
 
 Routes under `/api/networking/*`; **root only**.
@@ -448,17 +504,28 @@ Routes under `/api/networking/*`; **root only**.
 #### 3.1 Change Hostname
 
 Set the server's fully qualified hostname. **Who:** root.
-Shows the current hostname; form: *Hostname* (at least three labels, no `www`, not an IP, not a
-reserved loopback name, not a domain hosted on this server), *IP address for /etc/hosts*
-(blank = main IP, `127.0.1.1` when none), toggles *Update /etc/hosts*, *Re-issue self-signed
-service certificates*, *Add an A record for the hostname* (needs the DNS module);
-**Preview /etc/hosts**, *Save toggles as defaults*, **Change hostname** (type the new name to
-confirm). The result lists each step (system hostname, `/etc/hosts`, panel setting, service
-SSL certificates, DNS A record) with its outcome. **Server:** `POST /api/networking/hostname` →
-`hostnamectl set-hostname`, hosts-file rewrite, `basic.hostname`, optional certificate
-re-issue and zone record. **Needs:** `hostnamectl` (systemd). **Gotchas:** the preview flags a
-conflict when the name is a domain of an account; partial failures are reported step by step,
-not rolled back.
+Shows the current hostname, its installed certificate (issuer, expiry, the **Renewal** row with the
+daily `hostname-certificate-renew` schedule) and the hostname landing vhost; form: *Hostname* (at
+least three labels, no `www`, not an IP, not a reserved loopback name, not a domain hosted on this
+server), *IP address for /etc/hosts* (blank = main IP, `127.0.1.1` when none), toggles *Update
+/etc/hosts*, *Re-issue self-signed service certificates*, *Add DNS records for the hostname* (on by
+default; needs the DNS module); **Preview /etc/hosts**, *Save toggles as defaults*, **Change
+hostname** (type the new name to confirm), **Reissue hostname certificate**. The result lists each
+step in order — system hostname, `/etc/hosts`, panel setting, self-signed service certificates,
+**DNS** (A record, AAAA when the server has a public IPv6, `www.<hostname>` CNAME, MX to the host),
+**landing** (the branded hostname page rendered from the `landing` web template into
+`/var/www/whm-default`, served by a `server` vhost that no account can take over) and
+**certificate** (the hostname's Let's Encrypt certificate through AutoSSL, installed for the panel,
+Exim, Dovecot and FTP) — with its outcome. **Server:** `POST /api/networking/hostname` →
+`hostnamectl set-hostname`, hosts-file rewrite, `basic.hostname`, certificates, zone records,
+`ctx.web.ensureHostnameVhost`, `ctx.ssl.issueFor` + `installServiceCert`;
+`POST /api/networking/hostname/certificate` repeats the certificate step; the schedule re-issues it
+within AutoSSL's renewal window. **Needs:** `hostnamectl` (systemd); a public A record and an
+AutoSSL provider for the certificate. **Gotchas:** the preview flags a conflict when the name is a
+domain of an account (and account creation refuses the hostname in return); partial failures are
+reported step by step, not rolled back; the panel's own certificate is live only when the agent
+writes the pair the listener reads (`/etc/whm/tls/cert.pem` + `key.pem`, the installer's default —
+the step says *pending* otherwise, see `docs/design/https-defaults.md`).
 
 #### 3.2 Resolver Configuration
 
@@ -549,12 +616,22 @@ remove), **Save and write /etc/hosts.allow**, and the current `/etc/hosts.allow`
 OpenID Connect providers for panel login. **Who:** root.
 **Policy** card: *Allow external authentication on the login page*, *Automatically link by
 verified e-mail*. **Providers** table (issuer, client ID, discovery state, linked users,
-enabled) with **Discover**, **Edit**, **Enable/Disable**, **Delete**. Provider form:
-*Identifier* (lowercase, used in URLs), *Display name*, *Issuer URL* (discovery reads
-`/.well-known/openid-configuration`), *Client ID*, *Client secret* (stored encrypted), *Scopes*,
-*Enabled*. **Server:** `/api/security/external-auth*`; login flow under
+enabled) with **Discover**, **Edit**, **Enable/Disable**, **Delete**. **Add provider** first offers
+vendor **presets** — Google, Microsoft Entra ID, Apple, Meta, Cloudflare Access, GitLab, Auth0,
+Okta, Keycloak — pick one, enter the vendor-specific field (tenant ID, team name, host or issuer
+URL) plus the OAuth client ID and secret, and register the shown redirect URI
+`https://<hostname>:2087/api/auth/external/<identifier>/callback` at the provider; discovery runs on
+creation and the provider is stored only when it validates. GitHub is listed as *not supported*
+(OAuth 2.0 only, no OIDC). The generic form stays for anything else: *Identifier* (lowercase, used
+in URLs), *Display name*, *Issuer URL* (discovery reads `/.well-known/openid-configuration`),
+*Client ID*, *Client secret* (stored encrypted), *Scopes*, *Enabled*. **Server:**
+`GET /api/security/external-auth/presets`, `POST /api/security/external-auth` with `{ preset, name,
+clientId, clientSecret, fields }`, `/api/security/external-auth*`; login flow under
 `/api/auth/external/:name/start|callback`. **Gotchas:** discovery refuses endpoints on other
-hosts unless you explicitly allow them (the client secret is sent to the token endpoint).
+hosts unless you explicitly allow them (the client secret is sent to the token endpoint); Microsoft
+needs a specific tenant (`common`, `organizations` and `consumers` are refused); Apple requests no
+scopes (subject only, no e-mail) and needs a pre-generated client-secret JWT (at most 6 months);
+Meta uses the pinned Graph API token endpoint; Apple and Meta get the secret as `client_secret_post`.
 
 #### 4.8 Manage root's SSH Keys
 
@@ -823,7 +900,13 @@ reading the service list.
 
 Global web server directives and includes. **Who:** root.
 **Server** card (version, MPM, modules, vhost counts with *Sync vhosts* job; *Reload* /
-*Restart*). Tabs: **Global directives** (Timeout, KeepAlive, MaxKeepAliveRequests,
+*Restart*; the **HTTPS redirect** toggle *Redirect HTTP to HTTPS when a certificate is installed* —
+setting `web.force_https`, on by default: every vhost with a certificate answers port 80 with a 301
+to `https://`, the ACME challenge path excepted, sites without a certificate are not touched, and
+saving re-renders every vhost; a warning appears while `mod_rewrite` is not loaded, because the
+redirect block is wrapped in `<IfModule mod_rewrite.c>` — the agent op `web.module.enable`
+(`a2enmod` on Debian with configtest and rollback, a `conf.modules.d` check on RHEL) switches it
+on — and the **Hostname site** row names the hostname landing vhost). Tabs: **Global directives** (Timeout, KeepAlive, MaxKeepAliveRequests,
 KeepAliveTimeout, ServerTokens, ServerSignature, TraceEnable, HostnameLookups, ServerAdmin,
 FileETag, LimitRequestBody, *Default PHP-FPM version for new accounts*, DirectoryIndex list,
 *Enable mod_status for localhost*), **MPM / workers** (module event/worker/prefork,
@@ -916,12 +999,26 @@ daemon. **Gotchas:** after an install job finishes, select the daemon again to e
 
 #### 7.10 Service Manager
 
-Enable, monitor and auto-restart services. **Who:** root (resellers can view the list).
-Table (service, unit or the candidate units looked for, status, *Start at boot*, *Monitor*,
-*Auto-restart*) with **Restart**, **Stop/Start** and a journal view. **Server:**
-`GET /api/system/services`, `POST …/services/:name/:verb`, `PATCH …/services/:name`; the monitor
-loop restarts failed monitored services and raises `service.down`/`service.restored`.
-**Gotchas:** the monitored set follows the *Server Profile*.
+Enable, monitor, install and repair services. **Who:** root (resellers can view the list).
+A **Server stack** card on top lists the stack catalog grouped into installed and missing components
+with checkboxes, **Install selected** and the profile buttons **Install full hosting stack
+(recommended)** / **Web + database only** (one job `stack.install` with a progress log; a second
+install while one runs is refused). The table (service, unit or the candidate units looked for,
+status, *Start at boot*, *Monitor*, *Auto-restart*) offers **Install** for a service that is not
+installed, **Repair** next to *Start* for one that is installed but failed (`systemctl
+reset-failed` → restart → status + the last 30 journal lines in the answer), **Restart**,
+**Stop/Start** and a journal view. Everywhere else in the panel a *Service not installed* notice
+offers root an **Install <service>** button for the same catalog entry (Apache, Exim, ModSecurity,
+the statistics generators, …) and shows the job inline. **Server:** `GET /api/system/services`,
+`GET /api/system/stack`, `POST /api/system/stack/install { profile | components }` (202),
+`POST …/capabilities/:cap/install` (202, 404 when the catalog has no entry),
+`POST …/services/:name/install` (202), `POST …/services/:name/repair`, `POST …/services/:name/:verb`,
+`PATCH …/services/:name`; the installer refreshes the package index first, runs the catalog's
+post-install steps (Apache modules, PostgreSQL `initdb` on RHEL, unit enable, Apache reload on
+RHEL after mod_security/php-fpm) and refreshes the capability registry; the monitor loop restarts
+failed monitored services and raises `service.down`/`service.restored`. **Needs:** `apt-get`,
+`dnf` or `yum` for installs. **Gotchas:** the monitored set follows the *Server Profile*; RHEL
+packages that need EPEL are flagged in the catalog (`requires`).
 
 ## 8. Locales
 
@@ -1232,7 +1329,9 @@ Provision a hosting account. **Who:** root, reseller (ACL `create-acct`, within 
 package list).
 **Domain information** (*Domain*, *Username* — lowercase, starts with a letter, ≤ 32 —,
 *Password* (blank = set later), *Contact email*), **Package** (*Package*, *Dedicated IP
-address*, *Owner* for root), **Provisioning** toggles (*Web server virtual host*, *DNS zone*
+address*, *Owner* for root), **Account manager** (who answers the account's support thread in
+*Support › Account Conversations*: defaults to the creator; root may name any root or reseller
+user, a reseller may name itself or a root user; also on *Modify an Account*), **Provisioning** toggles (*Web server virtual host*, *DNS zone*
 from the standard template with the server nameservers, *Local mail routing*). The result card
 shows the state of each provisioning step. **Server:** `POST /api/accounts` creates the Linux
 user and home tree through the agent, then runs each enabled step through its category
@@ -1392,13 +1491,17 @@ logs is *HST Panel Log Rotation Configuration*; this page only governs the per-a
 #### 14.20 Web Template Editor
 
 Default and error page templates. **Who:** root.
-Pick a page — *Default site page (new accounts)*, *Suspended account page*, *Site moved page*,
-*4xx error page* — edit the HTML (variables are HTML-escaped), **Preview** (sandboxed iframe
-with sample values), **Save**, **Reset to default**. **Server:**
-`/api/account-functions/templates/:name` under `/etc/whm/templates`. **Gotchas:** only the
-default site page is served today (written into `public_html` of new accounts); the others are
-saved for the web server configuration that will reference them, and the page says when a
-template is "saved in the panel only".
+Pick a page — *Default site page (new accounts)*, *Server hostname landing page*, *Suspended
+account page*, *Site moved page*, *4xx error page* — edit the HTML (variables are HTML-escaped:
+`{{company_name}}`, `{{tagline}}`, `{{logo_url}}`, `{{panel_url}}`, `{{domain}}`, `{{hostname}}`),
+**Preview** (sandboxed iframe with sample values), **Save**, **Reset to default**. The stock
+`index` and `landing` pages are the branded "Ready to launch" page with the company name, tagline
+and logo from *HST Panel › Customization*. **Server:** `/api/account-functions/templates/:name`
+under `/etc/whm/templates`; saving or resetting `landing` re-renders the hostname page at once (the
+answer carries `rendered`). **Gotchas:** the default site page is written into `public_html` of
+new accounts and the landing page is served for the hostname; the other templates are saved for
+the web server configuration that will reference them, and the page says when a template is
+"saved in the panel only".
 
 ## 15. Multi Account Functions
 

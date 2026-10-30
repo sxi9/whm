@@ -1,14 +1,20 @@
 // `env` covers application environment variables, which routinely hold
 // credentials under arbitrary names.
 const SECRET_KEYS = /pass(word)?|secret|token|key|cert|private|totp|csrf|^env(ironment)?$/i;
+// Free text is dropped whole from audit rows (`opaque`): message bodies and
+// file contents carry what the log must not keep, and a request refused
+// before its route (401/403 from requireAuth, 423 from the license gate) is
+// recorded with the raw body. Other callers (the license event log, support
+// snapshots) keep messages: they are the operator's own error detail.
+const OPAQUE_KEYS = /^(body|text|message|content)$/i;
 
-export function redact(value, depth = 0) {
+export function redact(value, depth = 0, { opaque = false } = {}) {
   if (depth > 6 || value == null) return value;
-  if (Array.isArray(value)) return value.slice(0, 50).map((v) => redact(v, depth + 1));
+  if (Array.isArray(value)) return value.slice(0, 50).map((v) => redact(v, depth + 1, { opaque }));
   if (Buffer.isBuffer(value) || ArrayBuffer.isView(value)) return { bytes: value.byteLength };
   if (typeof value === 'object') {
     const out = {};
-    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEYS.test(k) ? '[redacted]' : redact(v, depth + 1);
+    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEYS.test(k) || (opaque && OPAQUE_KEYS.test(k)) ? '[redacted]' : redact(v, depth + 1, { opaque });
     return out;
   }
   if (typeof value === 'string' && value.length > 500) return value.slice(0, 500) + '…';
@@ -27,7 +33,7 @@ export function createAudit({ db, logger }) {
         ip: req?.ip ?? null,
         action,
         target: target == null ? null : String(target),
-        args: args == null ? null : JSON.stringify(redact(args)),
+        args: args == null ? null : JSON.stringify(redact(args, 0, { opaque: true })),
         result,
         requestId: req?.id ?? null,
       });

@@ -48,6 +48,17 @@ export function createAccountsService(ctx) {
     return account;
   }
 
+  // The server's own name (and www.<name>) has its own landing vhost; an
+  // account for it would answer with the hostname certificate and receive the
+  // panel's session cookie. Service Configuration owns the rule; without it
+  // the panel's hostname setting decides.
+  function isServerName(domain) {
+    if (typeof ctx.web?.isServerName === 'function') return ctx.web.isServerName(domain);
+    const name = String(settings.get('basic.hostname', '') || '').trim().toLowerCase();
+    const d = String(domain || '').trim().toLowerCase();
+    return Boolean(name) && (d === name || d === `www.${name}`);
+  }
+
   // The manager is a root or reseller user. A reseller may name itself or a
   // root user; handing an account to another reseller is root's decision.
   function resolveManager(username, user) {
@@ -217,6 +228,7 @@ export function createAccountsService(ctx) {
       if (RESERVED.has(username)) throw badRequest(`"${username}" is a reserved username`);
       if (stmts.byUsername.get(username)) throw conflict(`An account named "${username}" already exists`);
       if (stmts.byDomain.get(input.domain)) throw conflict(`The domain "${input.domain}" is already hosted on this server`);
+      if (isServerName(input.domain)) throw conflict(`"${input.domain}" is the server hostname; it cannot be hosted by an account`);
       ctx.license?.assertCapacity?.('accounts');
       const pkgName = input.package || settings.get('basic.default_package');
       const pkgRow = stmts.packageByName.get(pkgName);

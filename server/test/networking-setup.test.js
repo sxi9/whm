@@ -1,4 +1,6 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent } from './support/app.js';
 import { validateHostname, updateHostsFile, parseHosts, parseResolvConf, renderResolvedDropIn, detectResolverManager, isPublicIpv6, HOSTS_PATH, RESOLVED_DROPIN, HOSTNAME_CERT_SERVICES, HOSTNAME_CERT_JOB, HOSTNAME_CERT_SCHEDULE, HOSTNAME_CERT_CRON } from '../src/services/networking-setup.js';
@@ -379,13 +381,29 @@ describe('Networking Setup API', () => {
   });
 
   it('POST /hostname adds the A record through DNS Functions (zone created, publish pending without BIND)', async () => {
+    // earlier hostname changes publish records by default, so the parent zone may already exist
+    app.ctx.db.prepare("DELETE FROM dns_records WHERE zone_id IN (SELECT id FROM dns_zones WHERE domain = 'example.com')").run();
+    app.ctx.db.prepare("DELETE FROM dns_zones WHERE domain = 'example.com'").run();
+    const audited = auditRows('dns.hostname.a').length;
     const { data } = (await post('/api/networking/hostname', { hostname: 'c.example.com', addDnsRecord: true }).expect(200)).body;
     expect(data.ok).toBe(true);
     expect(data.steps.find((s) => s.step === 'dns')).toMatchObject({ ok: true, zone: 'example.com', createdZone: 'example.com' });
     const zone = app.ctx.db.prepare('SELECT id FROM dns_zones WHERE domain = ?').get('example.com');
     expect(zone).toBeTruthy();
     expect(app.ctx.db.prepare("SELECT value FROM dns_records WHERE zone_id = ? AND name = 'c' AND type = 'A'").get(zone.id)).toEqual({ value: '10.0.0.5' });
-    expect(auditRows('dns.hostname.a')).toHaveLength(1);
+    expect(auditRows('dns.hostname.a')).toHaveLength(audited + 1);
+  });
+
+  it('POST /hostname with only a hostname publishes the records and issues the certificate by default; issueCertificate:false skips it', async () => {
+    const { data } = (await post('/api/networking/hostname', { hostname: 'defaults.example.com' }).expect(200)).body;
+    expect(data.steps.map((s) => s.step)).toEqual(['hostname', 'hosts', 'settings', 'certs', 'dns', 'landing', 'certificate']);
+    expect(data.steps.find((s) => s.step === 'dns')).toMatchObject({ ok: true, zone: 'example.com' });
+    expect(data.steps.find((s) => s.step === 'dns').records.map((r) => [r.type, r.name])).toEqual([['A', 'defaults.example.com'], ['CNAME', 'www.defaults.example.com'], ['MX', 'defaults.example.com']]);
+    expect(JSON.parse(auditRows('networking.hostname.set').pop().args_redacted)).toMatchObject({ addDnsRecord: true, hostnameTls: true });
+    const skipped = (await post('/api/networking/hostname', { hostname: 'nocert.example.com', issueCertificate: false }).expect(200)).body.data;
+    expect(skipped.steps.map((s) => s.step)).toEqual(['hostname', 'hosts', 'settings', 'certs', 'dns', 'landing']);
+    expect(JSON.parse(auditRows('networking.hostname.set').pop().args_redacted)).toMatchObject({ addDnsRecord: true, hostnameTls: false });
+    expect((await post('/api/networking/hostname', { hostname: 'x.example.com', issueCertificate: 'no' })).status).toBe(422);
   });
 
   it('POST /hostname publishes AAAA (public IPv6 only), www CNAME and MX records next to the A record', async () => {
@@ -453,6 +471,16 @@ describe('Networking Setup API', () => {
       expect(held.error).toMatch(/^panel: the panel listener reads/);
       expect(held.detail).toMatch(/installed for exim, dovecot, ftp; written but not live for panel/);
       expect(elsewhere.ok).toBe(false);
+      // The right pair written root-only (0600) is not live either: this process is the listener and cannot read the key.
+      app.ctx.ssl.installServiceCert = async (service) => installResult(service);
+      const access = vi.spyOn(fs, 'accessSync').mockImplementation((file) => { if (file === path.resolve(PANEL_TLS.tlsKey)) throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }); });
+      try {
+        const unreadable = await withPanelTls(async () => (await post('/api/networking/hostname', { hostname: 'tlsu.example.com', addDnsRecord: false }).expect(200)).body.data);
+        const heldKey = unreadable.steps.find((s) => s.step === 'certificate');
+        expect(heldKey).toMatchObject({ ok: false, code: 'not_live', installed: ['exim', 'dovecot', 'ftp'], pending: [{ service: 'panel', paths: [PANEL_TLS.tlsCert, PANEL_TLS.tlsKey] }] });
+        expect(heldKey.pending[0].error).toMatch(/cannot read \/etc\/whm\/ssl\/panel\.key \(EACCES\)/);
+        expect(access).toHaveBeenCalledWith(path.resolve(PANEL_TLS.tlsCert), fs.constants.R_OK);
+      } finally { access.mockRestore(); }
       // A panel without a TLS listener cannot serve the certificate either.
       app.ctx.ssl.installServiceCert = async (service) => installResult(service);
       const noTls = await withPanelTls(async () => (await post('/api/networking/hostname', { hostname: 'tlsn.example.com', addDnsRecord: false }).expect(200)).body.data, { tlsCert: null, tlsKey: null });
@@ -518,6 +546,35 @@ describe('Networking Setup API', () => {
       expect(status.certificate).toEqual({ id: 5, issuer: 'CN=ZeroSSL', notAfter: '2027-02-01T00:00:00Z', daysRemaining: 90, expired: false, autossl: true, state: 'installed', selfSigned: false });
       expect(status.landing).toEqual({ domain: 'old.example.com', status: 'applied', docroot: '/var/www/whm-default', ssl: true, error: null });
       expect(status.renewal).toMatchObject({ schedule: HOSTNAME_CERT_SCHEDULE, cron: HOSTNAME_CERT_CRON, enabled: true, renewDays: 30 });
+    } finally { app.ctx.web = originalWeb; app.ctx.ssl = originalSsl; }
+  });
+
+  it('POST /hostname/certificate re-issues the hostname certificate through the service (root only) and validates its body', async () => {
+    const calls = [];
+    const originalWeb = app.ctx.web;
+    const originalSsl = app.ctx.ssl;
+    app.ctx.web = { ...originalWeb, ensureHostnameVhost: async (req, { hostname: h }) => ({ hostname: h, applied: true, docroot: '/var/www/whm-default', ssl: null, landingPage: true }) };
+    app.ctx.ssl = {
+      ...originalSsl,
+      autossl: { settings: () => ({ provider: 'acme.sh' }), detect: async () => ({ providers: ['acme.sh'] }), issue: async () => { throw new Error('issueFor answered, the synthetic-row fallback must not run'); } },
+      issueFor: async (domain, user, req, opts) => { calls.push({ domain, user: user?.username, force: opts.force, hasReq: Boolean(req) }); return { cert: { id: 7 }, certificate: { issuerCommonName: "Let's Encrypt", notAfter: '2027-03-01T00:00:00Z' }, renewed: true, web: 'applied' }; },
+      certs: { raw: () => ({ cert_pem: CERT, key_enc: app.ctx.crypto.encrypt(KEY), chain_pem: CHAIN }) },
+      certForDomain: () => null,
+      installServiceCert: async (service) => installResult(service),
+    };
+    try {
+      const res = await withPanelTls(() => post('/api/networking/hostname/certificate', {}).expect(200));
+      expect(res.body.data).toMatchObject({ hostname: 'old.example.com', ip: '10.0.0.5', ok: true });
+      expect(res.body.data.steps.map((s) => [s.step, s.ok])).toEqual([['landing', true], ['certificate', true]]);
+      expect(res.body.data.steps[1]).toMatchObject({ certId: 7, issuer: "Let's Encrypt", renewed: true, installed: HOSTNAME_CERT_SERVICES, failed: [], pending: [] });
+      expect(calls).toEqual([{ domain: 'old.example.com', user: 'root', force: true, hasReq: true }]);
+      await post('/api/networking/hostname/certificate', { force: false }).expect(200);
+      expect(calls[1]).toMatchObject({ force: false });
+      for (const body of [{ force: 'yes' }, { bogus: true }]) expect((await post('/api/networking/hostname/certificate', body)).status).toBe(422);
+      expect(calls).toHaveLength(2);
+      expect(auditRows('networking.hostname.certificate').pop()).toMatchObject({ target: 'old.example.com', principal: 'root' });
+      await reseller.post('/api/networking/hostname/certificate').set('X-CSRF-Token', resellerCsrf).send({}).expect(403);
+      expect(calls).toHaveLength(2);
     } finally { app.ctx.web = originalWeb; app.ctx.ssl = originalSsl; }
   });
 
@@ -852,6 +909,7 @@ describe('Networking Setup API', () => {
     await reseller.get('/api/networking/hostname').expect(403);
     await reseller.post('/api/networking/hostname/preview').set('X-CSRF-Token', resellerCsrf).send({ hostname: 'x.example.com' }).expect(403);
     await reseller.post('/api/networking/hostname').set('X-CSRF-Token', resellerCsrf).send({ hostname: 'x.example.com' }).expect(403);
+    await reseller.post('/api/networking/hostname/certificate').set('X-CSRF-Token', resellerCsrf).send({}).expect(403);
     await reseller.put('/api/networking/hostname/defaults').set('X-CSRF-Token', resellerCsrf).send({ updateHosts: false }).expect(403);
     await reseller.get('/api/networking/resolvers').expect(403);
     await reseller.put('/api/networking/resolvers').set('X-CSRF-Token', resellerCsrf).send({ nameservers: ['1.1.1.1'] }).expect(403);

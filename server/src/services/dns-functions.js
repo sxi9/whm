@@ -77,6 +77,14 @@ export function createDnsService(ctx) {
   const strict = () => config.env === 'production';
   const bindAvailable = () => capabilities.has('bind');
   const setting = (key, fallback) => settings.get(key, fallback);
+  // The server hostname (and www.<name>) is served by its own landing vhost,
+  // never by an account; Service Configuration owns the rule when loaded.
+  const isServerName = (domain) => {
+    if (typeof ctx.web?.isServerName === 'function') return ctx.web.isServerName(domain);
+    const name = String(setting('basic.hostname', '') || '').trim().toLowerCase();
+    const d = String(domain || '').trim().toLowerCase();
+    return Boolean(name) && (d === name || d === `www.${name}`);
+  };
   // A reseller's own nameservers (Edit Reseller Nameservers) take precedence over the server defaults.
   const nameservers = (override) => {
     const ns = Array.isArray(override) && override.length ? override : setting('basic.nameservers', []);
@@ -1049,6 +1057,7 @@ export function createDnsService(ctx) {
       const { domain, createZone = true } = input;
       const account = loadAccount(input.account, user);
       if (stmts.domainHosted.get(domain, domain)) throw conflict(`${domain} is already hosted on this server`);
+      if (isServerName(domain)) throw conflict(`${domain} is the server hostname; it cannot be parked on an account`);
       if (createZone) assertPublishable();
       if (account.suspended) throw conflict('That account is suspended');
       const limit = json.parse(account.plan_snapshot_json, {}).max_parked;

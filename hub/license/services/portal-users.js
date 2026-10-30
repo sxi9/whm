@@ -85,13 +85,17 @@ export function createPortalUsersService(ctx) {
   // enrolment). 429 while the budget is exhausted; a wrong code counts, a right
   // one resets the count. RFC 6238 §5.2: a code is accepted once per account,
   // so a step at or before the last accepted one (totp_last_step) is a replay
-  // and counts as wrong, whatever the purpose the first use had.
+  // and refused, whatever the purpose the first use had; it did verify, so it
+  // is no guessing signal and leaves the budget alone.
   function checkCode(u, code, secretEnc = u.totp_secret_enc) {
     if (totpLocked(u)) throw Object.assign(new HttpError(429, 'totp_rate_limited', 'Too many wrong codes; wait a few minutes and try again'), { retryAfterS: Math.ceil(TOTP_LOCK_MS / 1000) });
     const step = codeStep(code, secretEnc);
-    if (step !== null && (u.totp_last_step == null || step > u.totp_last_step)) {
-      stmts.totpOk.run({ id: u.id, step });
-      return true;
+    if (step !== null) {
+      if (u.totp_last_step == null || step > u.totp_last_step) {
+        stmts.totpOk.run({ id: u.id, step });
+        return true;
+      }
+      throw new HttpError(422, 'totp_reused', 'That code was already used; wait for the next one');
     }
     // A lock that has lapsed starts a fresh budget.
     const failures = (u.totp_locked_until ? 0 : u.totp_failures || 0) + 1;

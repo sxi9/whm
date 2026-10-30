@@ -199,7 +199,7 @@ export function createLicenseService(ctx) {
   function auditDetail(detail) {
     const out = { ...detail };
     for (const k of AUDIT_OMIT) delete out[k];
-    return redact(out);
+    return redact(out, 0, { opaque: true });
   }
 
   function recordEvent(event, detail = {}, { notify = true, severity, subject, req = null } = {}) {

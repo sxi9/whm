@@ -140,8 +140,10 @@ test('data minimisation: no raw machine-id/MAC/key/token in any stored row or au
   assert.deepEqual(redacted, { key: '[redacted]', token: '[redacted]', fingerprint: '[redacted]', fp_components: '[redacted]', machine_id: '[redacted]', mac: '[redacted]', hostname: 'h', nested: { password: '[redacted]' } });
 });
 
-test('portal: login with password + TOTP, step-up gate, CSRF, lockout, 2FA enrol/disable, password change kills sessions', async () => {
-  await freshTotpStep();
+test('portal: login with password + TOTP, step-up gate, CSRF, lockout, 2FA enrol/disable, password change kills sessions', async (t) => {
+  // A TOTP code is accepted once (RFC 6238 §5.2): Date is frozen (otplib and the hub read the same
+  // one) and ticked 30 s wherever a flow presents a second code.
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const admin = await h.ctx.portalUsers.create({ email: 'admin@vendor.test', password: 'Vendor-Pass-123', role: 'vendor_admin' });
   const support = await h.ctx.portalUsers.create({ email: 'support@vendor.test', password: 'Support-Pass-123', role: 'vendor_support' });
   const agent = request.agent(h.ctx.app);
@@ -175,6 +177,7 @@ test('portal: login with password + TOTP, step-up gate, CSRF, lockout, 2FA enrol
   const stale = await agent.post('/v1/admin/signing-keys').set('X-CSRF-Token', csrf).send({ purpose: 'plugin' });
   assert.equal(stale.status, 403);
   assert.equal(stale.body.error.code, 'totp_stepup_required');
+  t.mock.timers.tick(30_000);
   const stepup = await agent.post('/v1/portal/stepup').set('X-CSRF-Token', csrf).send({ totp: authenticator.generate(secret) });
   assert.equal(stepup.status, 200);
   assert.equal((await agent.post('/v1/admin/signing-keys').set('X-CSRF-Token', csrf).send({ purpose: 'plugin' })).status, 201);
@@ -191,6 +194,7 @@ test('portal: login with password + TOTP, step-up gate, CSRF, lockout, 2FA enrol
   const needs = await agent2.post('/v1/portal/login').send({ email: 'admin@vendor.test', password: 'Vendor-Pass-123' });
   assert.equal(needs.body.error.code, 'totp_required');
   assert.equal((await agent2.post('/v1/portal/login').send({ email: 'admin@vendor.test', password: 'Vendor-Pass-123', totp: '123456' })).status, 401);
+  t.mock.timers.tick(30_000);
   assert.equal((await agent2.post('/v1/portal/login').send({ email: 'admin@vendor.test', password: 'Vendor-Pass-123', totp: authenticator.generate(secret) })).status, 200);
 
   // portal user management needs a fresh step-up and keeps the role ↔ tenant invariant
@@ -198,6 +202,7 @@ test('portal: login with password + TOTP, step-up gate, CSRF, lockout, 2FA enrol
   const staleUser = await agent.post('/v1/portal/users').set('X-CSRF-Token', csrf).send({ email: 'new@vendor.test', password: 'New-Pass-12345', role: 'vendor_admin' });
   assert.equal(staleUser.status, 403);
   assert.equal(staleUser.body.error.code, 'totp_stepup_required');
+  t.mock.timers.tick(30_000);
   assert.equal((await agent.post('/v1/portal/stepup').set('X-CSRF-Token', csrf).send({ totp: authenticator.generate(secret) })).status, 200);
   const created = await agent.post('/v1/portal/users').set('X-CSRF-Token', csrf).send({ email: 'new@vendor.test', password: 'New-Pass-12345', role: 'vendor_admin' });
   assert.equal(created.status, 201, JSON.stringify(created.body));
@@ -326,8 +331,8 @@ test('unknown portal e-mails take the bcrypt path too (no account enumeration by
   assert.ok(med(unknown) > med(known) * 0.5, `unknown ${med(unknown)}ms vs known ${med(known)}ms`);
 });
 
-test('2FA re-enrolment needs the current code and never weakens an enabled account (hijacked session with a lapsed step-up)', async () => {
-  await freshTotpStep();
+test('2FA re-enrolment needs the current code and never weakens an enabled account (hijacked session with a lapsed step-up)', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   const owner = await h.ctx.portalUsers.create({ email: 'owner@vendor.test', password: 'Owner-Pass-1234', role: 'vendor_admin' });
   const agent = request.agent(h.ctx.app);
   const login = await agent.post('/v1/portal/login').send({ email: 'owner@vendor.test', password: 'Owner-Pass-1234' });
@@ -358,18 +363,22 @@ test('2FA re-enrolment needs the current code and never weakens an enabled accou
   assert.equal((await mint()).body.error.code, 'totp_stepup_required', 'the step-up gate still holds');
 
   // with the current code the owner may rotate; the live secret stays until the new one is confirmed
+  t.mock.timers.tick(30_000);
   const rotate = await agent.post('/v1/portal/2fa/enroll').set('X-CSRF-Token', csrf).send({ code: authenticator.generate(secret) });
   assert.equal(rotate.status, 200);
   assert.equal(rotate.body.data.reenrol, true);
   assert.notEqual(rotate.body.data.secret, secret);
   assert.deepEqual({ enabled: row().totp_enabled, live: row().totp_secret_enc }, { enabled: 1, live: liveSecretEnc });
   assert.ok(row().totp_pending_enc);
+  t.mock.timers.tick(30_000);
   assert.equal((await agent.post('/v1/portal/stepup').set('X-CSRF-Token', csrf).send({ totp: authenticator.generate(secret) })).status, 200, 'the old secret still works while the new one is pending');
+  t.mock.timers.tick(30_000);
   assert.equal((await agent.post('/v1/portal/2fa/confirm').set('X-CSRF-Token', csrf).send({ code: authenticator.generate(rotate.body.data.secret) })).status, 200);
   assert.equal(row().totp_pending_enc, null);
   assert.notEqual(row().totp_secret_enc, liveSecretEnc);
   assert.equal(h.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'portal.2fa_reenroll' AND target = ?").get(owner.id).n, 1);
   const agent2 = request.agent(h.ctx.app);
   assert.equal((await agent2.post('/v1/portal/login').send({ email: 'owner@vendor.test', password: 'Owner-Pass-1234', totp: authenticator.generate(secret) })).status, 401, 'the old secret is gone');
+  t.mock.timers.tick(30_000);
   assert.equal((await agent2.post('/v1/portal/login').send({ email: 'owner@vendor.test', password: 'Owner-Pass-1234', totp: authenticator.generate(rotate.body.data.secret) })).status, 200);
 });

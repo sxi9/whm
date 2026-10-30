@@ -22,6 +22,7 @@ export function AccountsTable({ suspendedOnly = false, toolbar }) {
     { key: 'domain', label: 'Domain', sortable: true, render: (r) => <a href={`http://${r.domain}`} target="_blank" rel="noreferrer">{r.domain}</a> },
     { key: 'username', label: 'User', sortable: true, render: (r) => <code>{r.username}</code> },
     { key: 'owner', label: 'Owner', sortable: true },
+    { key: 'manager', label: 'Manager', sortable: true },
     { key: 'package', label: 'Package', sortable: true, render: (r) => r.package_name },
     { key: 'ip', label: 'IP' },
     { key: 'disk_used_mb', label: 'Disk', sortable: true, align: 'right', render: (r) => `${formatMb(r.disk_used_mb)} / ${formatMb(r.disk_quota_mb)}` },
@@ -47,7 +48,7 @@ export function AccountsTable({ suspendedOnly = false, toolbar }) {
       columns={columns} rows={data || []} loading={loading} error={error} rowKey={(r) => r.username}
       total={meta?.total} page={t.state.page} pageSize={t.state.pageSize} onPageChange={t.setPage}
       sort={t.state.sort} dir={t.state.dir} onSortChange={t.setSort}
-      searchable q={t.state.q} onSearch={t.setSearch} searchPlaceholder="Search user, domain, owner or email…"
+      searchable q={t.state.q} onSearch={t.setSearch} searchPlaceholder="Search user, domain, owner, manager or email…"
       rowActions={rowActions} toolbar={toolbar}
       emptyText={suspendedOnly ? 'No suspended accounts.' : 'No accounts yet. Create one to get started.'}
     />

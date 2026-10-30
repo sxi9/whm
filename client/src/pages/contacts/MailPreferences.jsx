@@ -92,7 +92,7 @@ export function MailPreferences() {
     <>
       {aliasesUnavailable && <CapabilityNotice error={{ code: 'capability_missing', message: `The agent could not read ${data.aliases?.path || '/etc/aliases'} (${data.aliasError.message}). The forwarding list below is the last one saved from this panel.` }} onRetry={refetch} />}
       {data.aliasError && !aliasesUnavailable && <ErrorBanner error={{ message: `Could not read /etc/aliases: ${data.aliasError.message}` }} onRetry={refetch} />}
-      {!data.capability.mailTransport && <div className="banner banner-warning"><div><strong>No mail transport</strong><p>Exim is not installed and no SMTP relay is configured in Contact Manager, so copies of events cannot be mailed to root yet. Forwarding in /etc/aliases is still saved for when the mail server is installed.</p></div></div>}
+      {!data.capability.mailTransport && <CapabilityNotice capability="exim" error={{ code: 'capability_missing', message: 'Exim is not installed and no SMTP relay is configured in Contact Manager, so copies of events cannot be mailed to root yet. Forwarding in /etc/aliases is still saved for when the mail server is installed.' }} onRetry={refetch} />}
       {data.capability.mailTransport === 'smtp' && (
         <div className={`banner ${data.rootDelivery?.error ? 'banner-warning' : 'banner-info'}`}><div>
           <strong>Root mail goes through the SMTP relay</strong>

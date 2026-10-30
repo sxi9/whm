@@ -61,7 +61,7 @@ export function ContactManager() {
   return (
     <>
       {!capability.mailTransport && (
-        <CapabilityNotice error={{ code: 'capability_missing', message: 'Exim is not installed and no SMTP relay is configured, so email and SMS contacts cannot be reached yet. Slack, Pushover and webhook contacts work regardless. Install Exim, or enter an SMTP relay below.' }} onRetry={() => api.post('/system/capabilities/refresh').then(refreshAll).catch(toast.error)} />
+        <CapabilityNotice capability="exim" error={{ code: 'capability_missing', message: 'Exim is not installed and no SMTP relay is configured, so email and SMS contacts cannot be reached yet. Slack, Pushover and webhook contacts work regardless. Install Exim, or enter an SMTP relay below.' }} onRetry={() => api.post('/system/capabilities/refresh').then(refreshAll).catch(toast.error)} />
       )}
       <Card title="Contacts" subtitle="Each contact picks the events it receives and a minimum severity. Other parts of the panel (backups, monitoring, security) raise these events." padded={false}
         actions={<Button variant="primary" icon={Plus} size="sm" onClick={() => { setFormError(null); setEditing({}); }}>Add contact</Button>}>

@@ -6,7 +6,7 @@ import { Field, Textarea, Select, Button, FormActions, ErrorBanner } from '../..
 import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 
-const LABELS = { index: 'Default site page (new accounts)', suspended: 'Suspended account page', moved: 'Site moved page', 'error-4xx': '4xx error page' };
+const LABELS = { index: 'Default site page (new accounts)', landing: 'Server hostname landing page', suspended: 'Suspended account page', moved: 'Site moved page', 'error-4xx': '4xx error page' };
 
 export default function WebTemplateEditor({ fn }) {
   const toast = useToast();
@@ -45,13 +45,13 @@ export default function WebTemplateEditor({ fn }) {
   const meta = list?.templates.find((t) => t.name === name);
   return (
     <>
-      <PageHeader fn={fn} description={`Edits the HTML page templates kept under ${list?.dir || '/etc/whm/templates'}. Today only the default site page is served: it is written into public_html when an account is created. The suspended, moved and 4xx pages are saved and written to the template directory but are not referenced by the web server configuration yet.`} />
+      <PageHeader fn={fn} description={`Edits the HTML page templates kept under ${list?.dir || '/etc/whm/templates'}. Two pages are served today: the default site page is written into public_html when an account is created, and the server hostname landing page is rendered into the hostname's own document root (again whenever it is saved, at boot and on every hostname change). The suspended, moved and 4xx pages are saved to the template directory but are not referenced by the web server configuration yet.`} />
       <Card title="Template">
         <div className="form-grid">
           <Field label="Page"><Select value={name} onChange={setName} options={(list?.templates || Object.keys(LABELS).map((n) => ({ name: n }))).map((t) => ({ value: t.name, label: `${LABELS[t.name] || t.name}${t.customised ? ' (customised)' : ''}${t.served === false ? ' (not yet served)' : ''}` }))} /></Field>
         </div>
         {meta && <KeyValue items={[['File', <code key="f">{meta.path}</code>], ['Status', <StatusPill key="s" status={meta.customised ? 'enabled' : 'muted'}>{meta.customised ? 'customised' : 'built-in default'}</StatusPill>], ['Served', <span key="u"><StatusPill status={meta.served ? 'enabled' : 'warning'}>{meta.served ? 'in use' : 'not yet served'}</StatusPill> {meta.served_by}</span>], ['Last saved', formatDate(meta.updated_at)], ['Variables', <code key="v">{(list?.variables || []).map((v) => `{{${v}}}`).join('  ')}</code>]]} />}
-        {meta && meta.served === false && <div className="banner banner-warning"><div><strong>This page is not served yet</strong><p>Saving it writes {meta.path} for the web server configuration to reference, but no virtual host points at it today, so visitors do not see it. The default site page is the only template in use.</p></div></div>}
+        {meta && meta.served === false && <div className="banner banner-warning"><div><strong>This page is not served yet</strong><p>Saving it writes {meta.path} for the web server configuration to reference, but no virtual host points at it today, so visitors do not see it. Only the default site page and the server hostname landing page are in use.</p></div></div>}
       </Card>
       <Card title={LABELS[name] || name} actions={<Button size="sm" onClick={doPreview} loading={busy}>Preview</Button>}>
         <ErrorBanner error={loadError || error} />

@@ -17,9 +17,10 @@ export default function MarketProviderManager({ fn }) {
   const { user } = useAuth();
   const isRoot = user?.role === 'root';
   // The marketplace hub row (adapter "hub") carries the vendor hub origin: only
-  // the panel owner sees or edits it; other root users still switch it on/off.
+  // the panel owner sees or edits it (the API answers everyone else with
+  // `url: null` plus `hubLabel`); other root users still switch it on/off.
   const showHubOrigin = canSeeHubOrigin(user);
-  const hubHidden = (p) => p.adapter === 'hub' && !showHubOrigin;
+  const hubHidden = (p) => p.adapter === 'hub' && (!showHubOrigin || Boolean(p.hubLabel));
   const navigate = useNavigate();
   const toast = useToast();
   const confirm = useConfirm();
@@ -82,7 +83,7 @@ export default function MarketProviderManager({ fn }) {
               { key: 'type', label: 'Type', render: (p) => TYPE_LABELS[p.type] || p.type },
               { key: 'adapter', label: 'Adapter', render: (p) => p.adapterLabel },
               { key: 'enabled', label: 'Status', render: (p) => <ProviderStatus p={p} /> },
-              { key: 'url', label: 'URL', render: (p) => (hubHidden(p) ? <span className="muted" title="Only the panel owner sees the hub address">{HUB_LABEL}</span> : p.url ? <a href={p.url} target="_blank" rel="noreferrer">{p.url.replace(/^https:\/\//, '')}</a> : <span className="muted">—</span>) },
+              { key: 'url', label: 'URL', render: (p) => (hubHidden(p) ? <span className="muted" title="Only the panel owner sees the hub address">{p.hubLabel || HUB_LABEL}</span> : p.url ? <a href={p.url} target="_blank" rel="noreferrer">{p.url.replace(/^https:\/\//, '')}</a> : <span className="muted">—</span>) },
               { key: 'products', label: isRoot ? 'Products (resale)' : 'Products', render: (p) => (p.type === 'ssl' ? (p.products.length ? p.products.map((x) => `${x.name} (${money(x.price, x.currency)})`).join(' · ') : <span className="muted">none</span>) : <span className="muted">catalog from hub{p.adapter === 'hub' && <> · <Link to={LICENSE_PATH}>License key is entered under Basic Setup → License</Link></>}</span>) },
               ...(isRoot ? [
                 { key: 'commissionPercent', label: 'Commission', align: 'right', render: (p) => (p.readOnly ? '—' : `${p.commissionPercent}%`) },

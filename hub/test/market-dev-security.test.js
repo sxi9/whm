@@ -25,6 +25,7 @@ test('11 failed logins lock the account (audit + mail); the lock expires', async
   const again = await h.http.post('/v1/dev/login').set('X-Forwarded-For', ip).send({ email: dev.email, password: dev.password, totp: totpCode(dev.secret) });
   assert.equal(again.status, 200, JSON.stringify(again.body));
   // a login from a new address writes a security event + mail
+  h.nextTotpStep();
   const newIp = await request.agent(h.ctx.app).post('/v1/dev/login').set('X-Forwarded-For', '198.51.100.99').send({ email: dev.email, password: dev.password, totp: totpCode(dev.secret) });
   assert.equal(newIp.status, 200);
   assert.ok(h.sent.some((s) => s.to === dev.email && /new address/.test(s.message)));
@@ -73,15 +74,18 @@ test('disabling TOTP revokes API keys; a password change invalidates every sessi
   const dev = await h.developer({ key: null });
   const key = (await dev.post('/v1/dev/api-keys', { name: 'ci', scopes: ['plugin:read'] })).body.data.key;
   assert.equal((await h.http.get('/v1/dev/me').set('X-Dev-Api-Key', key)).status, 200);
+  h.nextTotpStep();
   const off = await dev.post('/v1/dev/2fa/disable', { code: totpCode(dev.secret) });
   assert.equal(off.status, 200);
   assert.equal(off.body.data.api_keys_revoked, 1);
   assert.equal((await h.http.get('/v1/dev/me').set('X-Dev-Api-Key', key)).status, 401);
   // re-enable, mint a key and a second session, then change the password
   const start = await dev.post('/v1/dev/2fa/start');
+  h.nextTotpStep();
   assert.equal((await dev.post('/v1/dev/2fa/confirm', { code: totpCode(start.body.data.secret) })).status, 200);
   const key2 = (await dev.post('/v1/dev/api-keys', { name: 'ci2', scopes: ['plugin:read'] })).body.data.key;
   const second = request.agent(h.ctx.app);
+  h.nextTotpStep();
   assert.equal((await second.post('/v1/dev/login').send({ email: dev.email, password: dev.password, totp: totpCode(start.body.data.secret) })).status, 200);
   const change = await dev.post('/v1/dev/password/change', { current_password: dev.password, password: 'Another-Strong-Passw0rd' });
   assert.equal(change.status, 200, JSON.stringify(change.body));
@@ -100,6 +104,7 @@ test('password reset: 202 always, single-use token, 15-minute TTL, TOTP required
   const token = /reset\/([A-Za-z0-9_-]+)/.exec(mail.message)[1];
   const noTotp = await h.http.post(`/v1/dev/password/reset/${token}`).send({ password: 'Fresh-Passw0rd-Again' });
   assert.equal(noTotp.body.error.code, 'invalid_totp');
+  h.nextTotpStep();
   const ok = await h.http.post(`/v1/dev/password/reset/${token}`).send({ password: 'Fresh-Passw0rd-Again', totp: totpCode(dev.secret) });
   assert.equal(ok.status, 200, JSON.stringify(ok.body));
   const reuse = await h.http.post(`/v1/dev/password/reset/${token}`).send({ password: 'Fresh-Passw0rd-Again', totp: totpCode(dev.secret) });
@@ -147,9 +152,11 @@ test('developer API keys never reach account, verification, key or session manag
   assert.equal((await h.http.get('/v1/dev/me').set('X-Dev-Api-Key', key)).status, 200, 'the key itself still works');
   assert.equal((await viaKey('get', '/v1/dev/plugins')).body.error.code, 'insufficient_scope', 'scoped routes still check scopes');
   // a TOTP code sent to 2fa/confirm or 2fa/disable is redacted in the request audit
+  h.nextTotpStep();
   const off = await dev.post('/v1/dev/2fa/disable', { code: totpCode(dev.secret) });
   assert.equal(off.status, 200, JSON.stringify(off.body));
   const fresh = await dev.post('/v1/dev/2fa/start');
+  h.nextTotpStep();
   const code = totpCode(fresh.body.data.secret);
   assert.equal((await dev.post('/v1/dev/2fa/confirm', { code })).status, 200);
   for (const action of ['POST /v1/dev/2fa/confirm', 'POST /v1/dev/2fa/disable']) {

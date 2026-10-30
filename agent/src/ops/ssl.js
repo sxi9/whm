@@ -631,6 +631,27 @@ function applyVsftpd(file, paths) {
   writeAtomic(file, `${lines.join('\n')}\n`, 0o644);
 }
 
+export const PANEL_TLS_DIR = '/etc/whm/tls';
+export const PANEL_TLS_NOTE = `The panel listener reloads ${PANEL_TLS_DIR}/cert.pem and key.pem in place while whm.conf tlsCert/tlsKey (or WHM_TLS_CERT/WHM_TLS_KEY) point at them; otherwise point them there and restart whm-panel.`;
+
+// The pair the panel listener serves. whm-panel.service runs as the non-root
+// whmpanel user and install.sh creates the directory root:whmpanel 0750, so
+// the key is handed to the directory's group (0640) instead of being locked
+// to root; a root-owned directory (manual install) keeps it 0600. The owner
+// is never changed: the agent runs as root, so a new file is root's already.
+export function installPanelPair(dest, paths) {
+  fs.mkdirSync(dest, { recursive: true, mode: 0o750 });
+  const { gid } = fs.statSync(dest);
+  const files = [['cert.pem', paths.fullchain, 0o644], ['key.pem', paths.key, gid ? 0o640 : 0o600]];
+  return files.map(([name, from, mode]) => {
+    const file = path.join(dest, name);
+    fs.copyFileSync(from, file);
+    fs.chownSync(file, -1, gid);
+    fs.chmodSync(file, mode);
+    return file;
+  });
+}
+
 async function installServiceCert(svc, { certPem, keyPem, chainPem }, ctx) {
   const dir = ctx.assertAllowedPath(path.join(SERVICE_ROOT, svc), 'write');
   requireOpenssl();
@@ -679,12 +700,8 @@ async function installServiceCert(svc, { certPem, keyPem, chainPem }, ctx) {
     } else if (exim) notes.push(`Set tls_advertise_hosts = *, tls_certificate = ${exim.cert} and tls_privatekey = ${exim.key} in the main section of the Exim configuration.`);
   }
   if (svc === 'panel') {
-    const dest = ctx.assertAllowedPath('/etc/whm/tls', 'write');
-    fs.mkdirSync(dest, { recursive: true, mode: 0o750 });
-    fs.copyFileSync(paths.fullchain, path.join(dest, 'cert.pem')); fs.chmodSync(path.join(dest, 'cert.pem'), 0o644);
-    fs.copyFileSync(paths.key, path.join(dest, 'key.pem')); fs.chmodSync(path.join(dest, 'key.pem'), 0o600);
-    applied.push(path.join(dest, 'cert.pem'), path.join(dest, 'key.pem'));
-    notes.push('Point WHM_TLS_CERT/WHM_TLS_KEY at /etc/whm/tls/cert.pem and key.pem and restart whm-panel.');
+    applied.push(...installPanelPair(ctx.assertAllowedPath(PANEL_TLS_DIR, 'write'), paths));
+    notes.push(PANEL_TLS_NOTE);
   } else if (!copies.length) notes.push(`No ${svc} daemon configuration was found on this server; the bundle was stored under ${dir} only.`);
   const reload = copies.length ? await reloadUnit(SERVICE_UNITS[svc]) : { reloaded: false, unit: null };
   return { service: svc, paths, applied, removed, validated, reload, certificate: await inspectCert(certPem), note: notes.length ? notes.join(' ') : null };

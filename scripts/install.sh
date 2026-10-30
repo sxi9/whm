@@ -7,10 +7,18 @@
 #   sudo bash scripts/install.sh --with-hub      # also install whm-hub (license server + marketplace)
 #   sudo WHM_LICENSE_HUB_URL=https://hub.example.com:7443 bash scripts/install.sh   # pin another hub
 #   sudo WHM_SUPERADMIN_SETUP_PASSWORD='...' bash scripts/install.sh   # super admin setup password, non-interactive
+#   sudo bash scripts/install.sh --stack full    # also install the full hosting stack (web, PHP, MariaDB, DNS, mail, FTP, ...)
+#   sudo bash scripts/install.sh --stack web     # Apache, PHP, MariaDB, Let's Encrypt, quotas, firewall only
+#   sudo bash scripts/install.sh --stack none    # no host software now (the setup wizard and Service Manager install it later)
+#   sudo bash scripts/install.sh --components apache,php,mysql,bind   # manual selection from the stack catalog
 #
 # What it does: installs Node.js 22 if missing, creates the whmpanel service user,
 # copies the application to /opt/whm, installs dependencies and builds the UI,
-# writes /etc/whm config, generates a self-signed TLS certificate for the panel,
+# writes /etc/whm config, generates a self-signed TLS certificate for the panel
+# (/etc/whm/tls/cert.pem + key.pem, the pair the hostname certificate step later
+# replaces in place), optionally installs a hosting stack from the panel's own
+# catalog (server/src/lib/stack-catalog.js: --stack full|web|none, --components a,b,c,
+# or a menu on a terminal; WHM_STACK / WHM_STACK_COMPONENTS non-interactively),
 # installs and starts whm-agentd (root) and whm-panel (unprivileged) units.
 # The license hub defaults to https://licserver.hostingsignal.in (the vendor hub); only the
 # super admin of the panel ever sees it. The super admin setup password (asked once on a
@@ -47,20 +55,46 @@ HUB_BACKUP_DIR=/var/backups/whm-hub
 HUB_PORT=7443
 HUB_LOOPBACK_PORT=7440
 HUB_SELF_SIGNED=0
-for arg in "$@"; do
-  case "$arg" in
+TLS_DIR=$ETC_DIR/tls
+LEGACY_TLS_DIR=$ETC_DIR/ssl
+# Hosting stack: a profile key from the catalog (full, web) or none; --components lists
+# component keys by hand. Empty = ask on a terminal (first install only), otherwise skip.
+STACK=${WHM_STACK:-}
+STACK_COMPONENTS=${WHM_STACK_COMPONENTS:-}
+STACK_RESULT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
     --upgrade) UPGRADE=1 ;;
     --skip-node) SKIP_NODE=1 ;;
     --with-hub) WITH_HUB=1 ;;
-    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
-    *) echo "unknown option: $arg" >&2; exit 2 ;;
+    --stack) [ $# -ge 2 ] || { echo "--stack needs a value: full, web or none" >&2; exit 2; }; STACK=$2; shift ;;
+    --stack=*) STACK=${1#--stack=} ;;
+    --components) [ $# -ge 2 ] || { echo "--components needs a comma-separated list of component keys" >&2; exit 2; }; STACK_COMPONENTS=$2; shift ;;
+    --components=*) STACK_COMPONENTS=${1#--components=} ;;
+    -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
+  shift
 done
+case "$STACK" in
+  ''|full|web|none) ;;
+  manual) STACK=none ;;
+  *) echo "unknown --stack profile: $STACK (use full, web or none)" >&2; exit 2 ;;
+esac
+if [ -n "$STACK_COMPONENTS" ]; then
+  case "$STACK_COMPONENTS" in
+    *[!a-z0-9,_-]*) echo "--components takes lowercase component keys separated by commas (got: $STACK_COMPONENTS)" >&2; exit 2 ;;
+  esac
+  STACK=components
+fi
 # An installed hub is upgraded together with the panel even without --with-hub.
 if [ "$UPGRADE" -eq 1 ] && [ -f /etc/systemd/system/whm-hub.service ]; then WITH_HUB=1; fi
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+printf '\n\033[1m  HST Panel by Hostingsignal\033[0m  -  WHM control panel %s\n' "$([ "$UPGRADE" -eq 1 ] && echo upgrade || echo installer)"
+printf '  %s\n\n' "Questions are asked on a terminal only; every answer can be given up front with the variables and flags named in --help."
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo)"
 command -v systemctl >/dev/null || die "systemd is required"
@@ -182,7 +216,12 @@ chown -R root:root "$APP_DIR"
 chmod -R o-w "$APP_DIR"
 
 log "Preparing $ETC_DIR, $DATA_DIR, $LOG_DIR"
-install -d -m 0750 -o root -g "$SERVICE_USER" "$ETC_DIR" "$ETC_DIR/ssl"
+# $TLS_DIR holds the pair the panel listener reads (whm.conf tlsCert/tlsKey): the self-signed
+# bootstrap pair now, the hostname certificate once Change Hostname installs it there
+# (ssl.service_cert.install writes cert.pem/key.pem into this directory and the listener
+# picks the new files up without a restart). root:whmpanel 0750, so the unprivileged panel
+# can read what the root agent writes.
+install -d -m 0750 -o root -g "$SERVICE_USER" "$ETC_DIR" "$TLS_DIR"
 install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DATA_DIR" "$DATA_DIR/plugins" "$LOG_DIR"
 [ -f "$ETC_DIR/whm.conf" ] || install -m 0640 -o root -g "$SERVICE_USER" "$APP_DIR/deploy/whm.conf.example" "$ETC_DIR/whm.conf"
 [ -f "$ETC_DIR/agent.conf" ] || install -m 0640 -o root -g root "$APP_DIR/deploy/agent.conf.example" "$ETC_DIR/agent.conf"
@@ -248,14 +287,10 @@ if [ ! -f "$ETC_DIR/superadmin.key" ]; then
   unset SUPERADMIN_SETUP_PASSWORD SUPERADMIN_SETUP_PASSWORD_AGAIN
 fi
 
-if [ ! -f "$ETC_DIR/ssl/panel.crt" ]; then
-  log "Generating a self-signed TLS certificate for the panel (replace via SSL/TLS › Manage Service SSL Certificates)"
-  self_signed_cert "$ETC_DIR/ssl" panel "$SERVICE_USER"
-fi
-
-# hub_conf_set <hub.conf> key=value...: hub.conf is JSON, so values are set with node instead
-# of sed and nothing is interpolated into the document. Arguments arrive as argv, never as code.
-hub_conf_set() {
+# json_conf_set <file.conf> key=value...: whm.conf and hub.conf are JSON, so values are set
+# with node instead of sed and nothing is interpolated into the document. Arguments arrive
+# as argv, never as code.
+json_conf_set() {
   "$NODE_BIN" - "$@" <<'EOF'
 const fs = require('node:fs');
 const [file, ...pairs] = process.argv.slice(2);
@@ -270,6 +305,35 @@ for (const pair of pairs) {
 fs.writeFileSync(file, JSON.stringify(conf, null, 2) + '\n');
 EOF
 }
+
+# json_conf_get <file.conf> <dotted key>: prints a string value, empty when unset.
+json_conf_get() {
+  [ -f "$1" ] || return 0
+  "$NODE_BIN" -e 'let c = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+for (const k of process.argv[2].split(".")) c = (c && typeof c === "object") ? c[k] : undefined;
+if (typeof c === "string") process.stdout.write(c);' "$1" "$2"
+}
+
+# Panel TLS. A fresh install gets a self-signed pair in $TLS_DIR. An install from an earlier
+# build has whm.conf pointing at $LEGACY_TLS_DIR/panel.{crt,key}, where the hostname
+# certificate step never writes: that pair is copied to $TLS_DIR and whm.conf is pointed
+# there, so the panel keeps serving the same certificate and later installs become live.
+# Explicit WHM_TLS_CERT/WHM_TLS_KEY lines in panel.env are respected and left alone.
+if [ "$(json_conf_get "$ETC_DIR/whm.conf" tlsCert)" = "$LEGACY_TLS_DIR/panel.crt" ] && ! grep -q '^WHM_TLS_CERT=' "$ETC_DIR/panel.env"; then
+  if [ -f "$LEGACY_TLS_DIR/panel.crt" ] && [ -f "$LEGACY_TLS_DIR/panel.key" ]; then
+    log "Moving the panel certificate from $LEGACY_TLS_DIR/panel.{crt,key} to $TLS_DIR/{cert,key}.pem"
+    [ -f "$TLS_DIR/cert.pem" ] || install -m 0640 -o root -g "$SERVICE_USER" "$LEGACY_TLS_DIR/panel.crt" "$TLS_DIR/cert.pem"
+    [ -f "$TLS_DIR/key.pem" ] || install -m 0640 -o root -g "$SERVICE_USER" "$LEGACY_TLS_DIR/panel.key" "$TLS_DIR/key.pem"
+  fi
+  json_conf_set "$ETC_DIR/whm.conf" "tlsCert=$TLS_DIR/cert.pem" "tlsKey=$TLS_DIR/key.pem"
+fi
+if [ ! -f "$TLS_DIR/cert.pem" ] || [ ! -f "$TLS_DIR/key.pem" ]; then
+  log "Generating a self-signed TLS certificate for the panel in $TLS_DIR (Change Hostname replaces it with a Let's Encrypt one; SSL/TLS › Manage Service SSL Certificates installs your own)"
+  rm -f "$TLS_DIR/cert.pem" "$TLS_DIR/key.pem"
+  self_signed_cert "$TLS_DIR" panel "$SERVICE_USER"
+  mv "$TLS_DIR/panel.crt" "$TLS_DIR/cert.pem"
+  mv "$TLS_DIR/panel.key" "$TLS_DIR/key.pem"
+fi
 
 install_hub() {
   local conf="$HUB_ETC_DIR/hub.conf" conf_new=0
@@ -308,14 +372,14 @@ install_hub() {
   # (public_url, a CA-issued tls.* pair, custom directories) is left alone on --upgrade; only an
   # explicitly supplied HUB_PUBLIC_URL updates public_url.
   if [ "$conf_new" -eq 1 ]; then
-    hub_conf_set "$conf" "public_url=$HUB_PUBLIC_URL" \
+    json_conf_set "$conf" "public_url=$HUB_PUBLIC_URL" \
       "db_dir=$HUB_DATA_DIR" "tls.cert=$HUB_ETC_DIR/ssl/hub.crt" "tls.key=$HUB_ETC_DIR/ssl/hub.key" \
       "keys.dir=$HUB_ETC_DIR/keys" "marketplace.packages_dir=$HUB_DATA_DIR/packages" \
       "marketplace.download_hmac_file=$HUB_ETC_DIR/keys/download.hmac" "marketplace.public_suffix_list=$HUB_DATA_DIR/public_suffix_list.dat" \
       "license.backup_dir=$HUB_BACKUP_DIR"
   elif [ -n "$HUB_PUBLIC_URL_SET" ]; then
     log "Updating public_url in $conf (HUB_PUBLIC_URL given)"
-    hub_conf_set "$conf" "public_url=$HUB_PUBLIC_URL"
+    json_conf_set "$conf" "public_url=$HUB_PUBLIC_URL"
   fi
 
   # Keys: master key (AES-256-GCM for stored secrets), download HMAC, one LICENSE and one
@@ -331,7 +395,7 @@ install_hub() {
     HUB_LICENSE_KEY_JSON=$("${genkey[@]}" --license --json)
     HUB_PLUGIN_KEY_JSON=$("${genkey[@]}" --plugin --json)
     # Record the active kids in hub.conf (informational: the signing_keys table is authoritative).
-    hub_conf_set "$conf" "keys.active_kid.license=$("$NODE_BIN" -p 'JSON.parse(process.argv[1]).kid' "$HUB_LICENSE_KEY_JSON")" \
+    json_conf_set "$conf" "keys.active_kid.license=$("$NODE_BIN" -p 'JSON.parse(process.argv[1]).kid' "$HUB_LICENSE_KEY_JSON")" \
       "keys.active_kid.plugin=$("$NODE_BIN" -p 'JSON.parse(process.argv[1]).kid' "$HUB_PLUGIN_KEY_JSON")"
   fi
   chown -R "$HUB_USER":"$HUB_USER" "$HUB_ETC_DIR/keys" "$HUB_DATA_DIR" "$HUB_LOG_DIR" "$HUB_BACKUP_DIR"
@@ -363,6 +427,138 @@ if [ "${HUB_SELF_SIGNED:-0}" -eq 1 ] && ! grep -q '^WHM_LICENSE_HUB_CA=' "$ETC_D
   printf 'WHM_LICENSE_HUB_CA=%s\n' "$ETC_DIR/hub-ca.pem" >> "$ETC_DIR/panel.env"
 fi
 
+
+# ---------------------------------------------------------------- hosting stack ---
+# The panel's stack catalog (server/src/lib/stack-catalog.js) is the single source of
+# truth for what a profile installs: package names per family, the systemd units to
+# enable, Apache modules to switch on and the PostgreSQL initdb step. The same catalog
+# drives the setup wizard and Service Manager › Server stack, so an install from here and
+# one from the panel end in the same state. The catalog is read with node; nothing from
+# it is evaluated as shell.
+STACK_CATALOG=$APP_DIR/server/src/lib/stack-catalog.js
+
+# stack_profiles: one line per profile, "key<TAB>label<TAB>description".
+stack_profiles() {
+  "$NODE_BIN" --input-type=module -e '
+const { pathToFileURL } = await import("node:url");
+const m = await import(pathToFileURL(process.argv[1]).href);
+for (const p of m.STACK_PROFILES) console.log([p.key, p.label, p.description].join("\t"));
+' -- "$STACK_CATALOG"
+}
+
+# stack_plan <full|web|components> <component list> <debian|rhel>: tab-separated plan lines
+# (component, pkg, requires, a2enmod, enable, initdb). Exits 2 on an unknown key.
+stack_plan() {
+  "$NODE_BIN" --input-type=module -e '
+const [catalog, mode, list, family] = process.argv.slice(1);
+const { pathToFileURL } = await import("node:url");
+const m = await import(pathToFileURL(catalog).href);
+let keys;
+if (mode === "components") {
+  keys = [...new Set(list.split(",").map((k) => k.trim()).filter(Boolean))];
+  const unknown = keys.filter((k) => !m.componentByKey(k));
+  if (!keys.length || unknown.length) { console.error(`unknown stack components: ${unknown.join(", ") || "(none given)"}; known keys: ${m.STACK_COMPONENT_KEYS.join(", ")}`); process.exit(2); }
+} else {
+  keys = m.profileComponents(mode);
+  if (!keys) { console.error(`unknown stack profile: ${mode}`); process.exit(2); }
+}
+const out = [];
+for (const key of keys) {
+  const c = m.componentByKey(key);
+  out.push(["component", c.key, c.label].join("\t"));
+  for (const pkg of c.packages?.[family] || []) out.push(["pkg", pkg].join("\t"));
+  if (c.requires?.[family]) out.push(["requires", c.key, c.requires[family]].join("\t"));
+  for (const step of c.postInstall || []) {
+    if (step.kind === "a2enmod") for (const mod of step.modules) out.push(["a2enmod", mod].join("\t"));
+    else if (step.kind === "enable") out.push(["enable", (step.units || (step.unit ? [step.unit] : c.units) || []).join(" ")].join("\t"));
+    else if (step.kind === "initdb") out.push("initdb");
+  }
+}
+process.stdout.write(out.join("\n") + "\n");
+' -- "$STACK_CATALOG" "$1" "$2" "$3"
+}
+
+# install_stack <full|web|components> <component list>: packages first, then the Apache
+# modules, the PostgreSQL cluster and the units, in the catalog's order. Every failure
+# after the package step is logged and skipped: the panel's Service Manager shows the
+# remaining work (Install / Repair) once it is up.
+install_stack() {
+  local mode=$1 list=$2 family plan kind a b epel=0 initdb=0 unit group
+  local -a pkgs=() mods=() enables=() comps=()
+  case "$PKG" in apt) family=debian ;; *) family=rhel ;; esac
+  plan=$(stack_plan "$mode" "$list" "$family") || { STACK_RESULT="not installed: unknown profile or component (see above)"; return 1; }
+  while IFS=$'\t' read -r kind a b; do
+    case "$kind" in
+      component) comps+=("$a") ;;
+      pkg) pkgs+=("$a") ;;
+      requires) epel=1; log "$a: $b" ;;
+      a2enmod) mods+=("$a") ;;
+      enable) enables+=("$a") ;;
+      initdb) initdb=1 ;;
+    esac
+  done <<< "$plan"
+  [ ${#pkgs[@]} -gt 0 ] || { STACK_RESULT="nothing to install for ${comps[*]:-no components}"; return 0; }
+  mapfile -t pkgs < <(printf '%s\n' "${pkgs[@]}" | awk '!seen[$0]++')
+  log "Installing the hosting stack (${comps[*]}): ${#pkgs[@]} packages"
+  if [ "$epel" -eq 1 ] && [ "$family" = rhel ]; then
+    install_packages epel-release || log "epel-release could not be installed; packages that need EPEL may fail below"
+  fi
+  if ! install_packages "${pkgs[@]}"; then
+    STACK_RESULT="package installation failed (see above); re-run with --stack/--components, or use Service Manager › Server stack in the panel"
+    return 1
+  fi
+  if [ ${#mods[@]} -gt 0 ] && command -v a2enmod >/dev/null; then
+    mapfile -t mods < <(printf '%s\n' "${mods[@]}" | awk '!seen[$0]++')
+    for a in "${mods[@]}"; do a2enmod -q "$a" >/dev/null 2>&1 || log "a2enmod $a failed (module not available on this release?)"; done
+  fi
+  if [ "$initdb" -eq 1 ] && command -v postgresql-setup >/dev/null && [ ! -f /var/lib/pgsql/data/PG_VERSION ]; then
+    postgresql-setup --initdb >/dev/null 2>&1 || log "postgresql-setup --initdb failed; initialise the cluster by hand before starting postgresql"
+  fi
+  for group in "${enables[@]}"; do
+    for unit in $group; do
+      if systemctl list-unit-files --type=service --no-legend --plain "$unit.service" 2>/dev/null | grep -q "^$unit.service"; then
+        systemctl enable --now "$unit.service" >/dev/null 2>&1 || log "could not enable/start $unit (Service Manager › Repair shows the journal)"
+        break
+      fi
+    done
+  done
+  if [ "$family" = debian ] && [ ${#mods[@]} -gt 0 ] && systemctl is-active --quiet apache2.service; then
+    if apache2ctl -t >/dev/null 2>&1; then systemctl reload apache2.service || true; else log "apache2ctl -t failed after enabling modules; fix the configuration and reload apache2"; fi
+  fi
+  STACK_RESULT="installed ${comps[*]} (${#pkgs[@]} packages)"
+}
+
+# Which stack to install: --stack/--components or WHM_STACK/WHM_STACK_COMPONENTS, else a
+# menu on a terminal during a first install. --upgrade asks nothing (pass --stack to add
+# software to an existing install); non-interactive runs install nothing and leave it to
+# the setup wizard. Profiles come from the catalog, so the menu matches the wizard.
+if [ -z "$STACK" ] && [ -t 0 ] && [ "$UPGRADE" -eq 0 ]; then
+  echo
+  echo "Which hosting software should this server run? The first login can also choose this (setup wizard),"
+  echo "and Service Manager › Server stack installs more at any time."
+  STACK_MENU_KEYS=()
+  n=0
+  while IFS=$'\t' read -r key label description; do
+    n=$((n + 1)); STACK_MENU_KEYS+=("$key")
+    case "$key" in manual) printf '  %d) %s - nothing now\n' "$n" "None" ;; *) printf '  %d) %s - %s\n' "$n" "$label" "$description" ;; esac
+  done < <(stack_profiles)
+  printf 'Choice [1]: '
+  read -r STACK_CHOICE || STACK_CHOICE=""
+  STACK_CHOICE=${STACK_CHOICE:-1}
+  case "$STACK_CHOICE" in
+    *[!0-9]*) die "enter the number of a choice" ;;
+  esac
+  [ "$STACK_CHOICE" -ge 1 ] && [ "$STACK_CHOICE" -le "$n" ] || die "choice out of range"
+  STACK=${STACK_MENU_KEYS[$((STACK_CHOICE - 1))]}
+  [ "$STACK" != manual ] || STACK=none
+fi
+case "$STACK" in
+  full|web) install_stack "$STACK" "" || true ;;
+  components) install_stack components "$STACK_COMPONENTS" || true ;;
+  none) STACK_RESULT="skipped (--stack none): the setup wizard offers the same profiles at the first login" ;;
+  *) STACK_RESULT="not chosen (no terminal): the setup wizard offers the profiles at the first login, or re-run with --stack full|web" ;;
+esac
+
 log "Installing systemd units"
 sed "s#/usr/bin/node#$NODE_BIN#g; s#/opt/whm#$APP_DIR#g" "$APP_DIR/deploy/whm-agentd.service" > /etc/systemd/system/whm-agentd.service
 sed "s#/usr/bin/node#$NODE_BIN#g; s#/opt/whm#$APP_DIR#g; s#/var/lib/whm#$DATA_DIR#g" "$APP_DIR/deploy/whm-panel.service" > /etc/systemd/system/whm-panel.service
@@ -386,7 +582,9 @@ if systemctl is-active --quiet whm-panel; then
   fi
   echo
   echo "  Logs:      journalctl -u whm-panel -u whm-agentd -f"
-  echo "  Firewall:  allow TCP 2086 and 2087"
+  echo "  Firewall:  allow TCP 2086 and 2087 (2086 only redirects to 2087; WHM_FORCE_HTTPS=false in $ETC_DIR/panel.env serves plain HTTP)"
+  echo "  TLS:       $TLS_DIR/cert.pem + key.pem (self-signed until Networking Setup › Change Hostname issues the hostname certificate)"
+  echo "  Stack:     ${STACK_RESULT:-nothing installed}"
   if grep -q '^WHM_LICENSE_HUB_URL=' "$ETC_DIR/panel.env"; then
     echo "  License:   hub $(sed -n 's/^WHM_LICENSE_HUB_URL=//p' "$ETC_DIR/panel.env" | head -1) — the super admin enters the key under Server Configuration › Basic WebHost Manager Setup › License"
   else

@@ -375,3 +375,68 @@ under `/etc/whm/release-keys`. Bundled plugins' node:test suites run from the ro
   Everything inside a home runs as the account through `runuser -u <user> --`.
 - App units are `whm-app-<id>` (`svc.status/start/stop/restart/journal` work on them); ports from
   `apps.port_range`; `apps.allow_resellers` gates reseller mutations.
+
+## 34. Platform-fixes seams (2026-10-30; designs `docs/design/https-defaults.md`, `docs/design/support-chat.md`)
+- **`ctx.stack`** (core, `services/system-stack.js`, created in `routes/system.js` with the job `stack.install`):
+  `status()`, `install({ profile | components }, user, req)` (one job at a time: a second request is refused while one
+  runs), `capabilityInstall(cap, user, req)`, `serviceInstall(name, user, req)`, `setup.pending(user)` /
+  `setup.complete({ skipped }, req)` (setting `setup.completed`; servers with accounts count as set up), `catalog()`,
+  `profiles()`. The catalog `server/src/lib/stack-catalog.js` (`STACK_COMPONENTS`, `STACK_PROFILES`) is the single
+  source of truth for packages per family, units, capability names and post-install steps; `scripts/install.sh
+  --stack|--components` reads the same file. Post-install kinds: `a2enmod` → agent op `stack.apache_enmod`
+  (Debian; rolls back on a failed configtest), `enable` → `svc.enable`, `initdb` → `stack.postgres_initdb` (RHEL).
+  Any `CapabilityNotice` with a `capability` prop offers root *Install <X>* through
+  `POST /api/system/capabilities/:cap/install` when the catalog has an entry. `POST /system/setup/complete` is on the
+  license middleware's degraded allow-list so *Skip for now* works unlicensed.
+- **`web.module.enable { modules }`** (agent, `ops/web.js`, ≤ 10 names `[a-z0-9_]{1,40}`): Debian — `a2query` decides,
+  `a2enmod` only what is off, configtest, `a2dismod -f` of exactly what was switched on when Apache rejects it
+  (`config_invalid`), then reload; RHEL — verifies against `httpd -M` and returns `{ skipped: true, missing, reason }`
+  naming `conf.modules.d`. It is the op Apache Configuration should call to switch `mod_rewrite` on (the HTTPS
+  redirect block is wrapped in `<IfModule mod_rewrite.c>`; `apache.status.rewriteModule === false` is the warning).
+- **HTTPS defaults:** setting `panel.force_https` (default true; `config.forceHttps` / `WHM_FORCE_HTTPS` pins it,
+  `app.js` reads it per request; `/api/health` and `/.well-known/acme-challenge/` exempt) and setting
+  `web.force_https` (default true; `ctx.web.forceHttps()`, `ctx.web.apache.setForceHttps(enabled, req)` saves and
+  re-renders every vhost; `web.vhost.write` takes `redirectHttps`). Panel TLS pair: `config.tlsCert/tlsKey` =
+  `/etc/whm/tls/cert.pem` + `key.pem` on an installed host (`deploy/whm.conf.example`, `install.sh`, legacy
+  `/etc/whm/ssl/panel.*` migrated on `--upgrade`); `ssl.service_cert.install` for `panel` writes exactly that pair
+  and `watchTlsFiles` (`server/src/index.js`) swaps it in without a restart. The agent must leave the pair readable by
+  the panel's service group (`WHM_AGENT_GROUP`), or the listener keeps the previous certificate.
+- **Hostname vhost:** `ctx.web.ensureHostnameVhost(req, { hostname? })` (never throws; runs on `panel.started`, on a
+  hostname change, on `landing` template save/reset and in the re-render job), `ctx.web.landingDocroot`
+  (`/var/www/whm-default`), `ctx.web.isServerName(domain)` — **binding for account, addon, parked and sub-domain
+  creation and for restores**: refuse the hostname and `www.<hostname>` before a Linux user exists; the vhost layer
+  itself answers 409 `conflict`. `ctx.networking.reissueHostnameCertificate({ force }, req)` and the scheduled
+  `renewHostnameCertificate(job)` (`hostname-certificate-renew`) install the hostname certificate for `panel`,
+  `exim`, `dovecot`, `ftp` (`HOSTNAME_CERT_SERVICES`).
+- **`ctx.dnsCloudflare`** (`services/dns-cloudflare.js`, migration `035_dns-cloudflare.sql`): `status(user)`,
+  `configure({ apiToken }, user, req)` / `remove(user, req)` (root), `zones({ refresh })`, `zoneStatus(domain, user)`,
+  `link(domain, { cloudflareZoneId? }, user, req)` / `unlink` (root; the account's zone id is recorded so a reseller
+  cannot claim a foreign zone), `import(domain, user, req)`, `requestPush(domain, user, req)` (202; one job per zone,
+  per-zone lock), `runPushJob(job)` (job `dns.cloudflare.push`; settings `dns.cloudflare.push_attempts` = 3,
+  `dns.cloudflare.retry_backoff_ms` = `[5000, 20000, 60000]`; 4xx never retried). DNS Functions exposes
+  `ctx.dns.loadZone(domain, user)` (ownership-checked zone row) and `ctx.dns.replaceRecordsFromProvider(domain,
+  records, user, req)` (keeps SOA + apex NS, skips what the panel cannot hold, publishes without mirroring back); a
+  publish of a linked zone queues a push and carries `mirror` in its result. The token never leaves the service.
+- **`ctx.supportChat`** (`services/support-chat.js`, migrations `034_support-chat.sql` + `034b` backfill):
+  `listConversations(query, user)`, `get(username, user, { before, limit })`, `post(username, body, user, req)`
+  (audits `chars` only), `markRead`, `update(username, { status, subject }, user, req)`, `unread(user)`,
+  `subscribe(accountId, fn)`. Read-only for other categories; scope is root → all, reseller → owned or managed
+  accounts, `user` → the account named like the login. `accounts.manager_user_id` (`POST/PATCH /api/accounts
+  { manager }`, `GET /api/accounts/managers`) defaults to the creator; a reseller may name itself or a root user.
+  Events `support.chat.message` / `support.chat.status` carry no text.
+- **Super admin** (migration `001e_users-superadmin.sql`, `users.superadmin`): `ctx.auth.isSuperadmin(user)`,
+  `requireSuperadmin(ctx)` (`middleware/rbac.js`: root **and** flag). The flag is set only by `scripts/whm-cli.js
+  superadmin <user>` after the setup password verifies against `config.superadminKeyFile` (`/etc/whm/superadmin.key`,
+  `lib/superadmin-key.js`; `superadmin --init` writes it; the panel process never opens it). License key, hub
+  origin, activations and hub answers go to the super admin only: `license.js` summaries, the marketplace client
+  status (`url`/`hubUrl` null + `hubLabel` for others), `market.js` provider shape and the `whm-hub` config/test routes
+  are gated; `config.licenseHubUrl` defaults to `https://licserver.hostingsignal.in`. The audit log keeps key prefix
+  and hub text out.
+- **Hub TOTP** (hub migrations `001d_portal-totp.sql`, `001e_portal-totp-step.sql`, marketplace
+  `001b_developer-totp-step.sql`): vendor setting `hub.require_totp_for_admins` (default true) makes `vendor_admin`
+  and `reseller_admin` enrol before anything outside `/v1/portal/*` answers (`403 totp_enrol_required`); codes are
+  accepted once per time step (`portal_users.totp_last_step`, `developers.totp_last_step`; a replayed code answers `totp_reused` and, having verified, spends neither the wrong-code budget nor a failed-login strike); `PATCH /v1/portal/settings`
+  toggles the rule (stepped-up vendor admin). Hub tests boot with the rule off unless `bootHub({ requireTotp: true })`.
+- **Branding migrations:** `029c_support-branding.sql` (support provider name default → *Hostingsignal Support*),
+  `011b_locales-branding.sql` (seeded locales translate the category as *HST Panel*). `client/src/brand.js` is the
+  source of the product names; slugs, keys, routes and settings keep the `cpanel` identifiers.

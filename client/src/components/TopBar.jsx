@@ -5,6 +5,32 @@ import { useAuth } from '../auth/AuthContext.jsx';
 import { useSearch } from '../hooks/usePluginNav.js';
 import { useBranding, logoSrc } from '../pages/cpanel/branding.js';
 
+// Unread support-chat messages for the bell: polled once a minute while the tab
+// is visible, with plain fetch so a background 401 never signs the viewer out.
+const UNREAD_POLL_MS = 60_000;
+export function useUnreadSupport() {
+  const [unread, setUnread] = useState(0);
+  useEffect(() => {
+    let stopped = false;
+    const poll = async () => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      try {
+        const res = await fetch('/api/support/chat/unread', { headers: { Accept: 'application/json' }, credentials: 'same-origin' });
+        if (!res.ok) return;
+        const body = await res.json();
+        if (!stopped) setUnread(Number(body?.data?.total) || 0);
+      } catch { /* offline: keep the last count */ }
+    };
+    poll();
+    const timer = setInterval(poll, UNREAD_POLL_MS);
+    return () => { stopped = true; clearInterval(timer); };
+  }, []);
+  return unread;
+}
+
+export const unreadBadge = (n) => (n > 99 ? '99+' : String(n));
+const BADGE_STYLE = { position: 'absolute', top: 2, right: 2, minWidth: 16, height: 16, padding: '0 4px', borderRadius: 8, background: 'var(--bad)', color: '#fff', fontSize: 10, fontWeight: 700, lineHeight: '16px', textAlign: 'center' };
+
 export function TopBar({ onMenu }) {
   const { user, hostname, logout } = useAuth();
   const branding = useBranding();
@@ -16,6 +42,7 @@ export function TopBar({ onMenu }) {
   const inputRef = useRef(null);
   const searchFunctions = useSearch();
   const results = q.trim() ? searchFunctions(q).slice(0, 8) : [];
+  const unread = useUnreadSupport();
 
   useEffect(() => {
     const onKey = (e) => {
@@ -56,7 +83,10 @@ export function TopBar({ onMenu }) {
       <div className="topbar-right">
         <span className="topbar-host" title="Server hostname">{hostname}</span>
         <Link to="/audit-log" className="icon-button" title="Audit log" aria-label="Audit log"><ScrollText size={18} /></Link>
-        <button className="icon-button" title="Notifications" aria-label="Notifications"><Bell size={18} /></button>
+        <Link to="/support/account-conversations" className="icon-button" style={{ position: 'relative' }} title={unread ? `${unread} unread support message${unread === 1 ? '' : 's'}` : 'Notifications'} aria-label={unread ? `Notifications: ${unread} unread support messages` : 'Notifications'}>
+          <Bell size={18} />
+          {unread > 0 && <span className="topbar-badge" aria-hidden="true" style={BADGE_STYLE}>{unreadBadge(unread)}</span>}
+        </Link>
         <div className="menu" onMouseLeave={() => setOpenMenu(false)}>
           <button className="user-menu" onClick={() => setOpenMenu((o) => !o)} aria-haspopup="menu" aria-expanded={openMenu}>
             <span className="avatar">{user?.username?.[0]?.toUpperCase()}</span>

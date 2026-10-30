@@ -239,6 +239,22 @@ reloads `named` afterwards (a failed reload is reported as a warning, the zone s
   signs with `dnssec-signzone` and re-signs nightly through `dns-resign`.
 - **Gotchas:** values never pass shell characters; the validators refuse them with `422`.
 
+**Cloudflare.** The page's *Cloudflare* card mirrors panel zones to a Cloudflare account: root stores
+an API token (**Zone:Read + DNS:Edit** on the zones to manage; stored encrypted, verified against the
+Cloudflare API, never shown again, *Remove token* deletes it) and the zone list from the account is
+cached for a minute. Per zone (root to link/unlink, root or the zone's owner to import/push): **Link**
+pairs the panel zone with the Cloudflare zone of the same name (the account's zone id is recorded, so
+a reseller cannot claim a zone that is not theirs), **Import** replaces the panel's records with the
+provider's (the SOA and apex NS stay local, records the panel cannot hold are listed as skipped),
+**Push** mirrors the panel's records to Cloudflare (one job `dns.cloudflare.push` per zone at a time,
+retried `dns.cloudflare.push_attempts` = 3 times with `dns.cloudflare.retry_backoff_ms` =
+`[5000, 20000, 60000]`; Cloudflare 4xx answers are not retried) and **Unlink** returns the zone to
+BIND. Every publish of a linked zone queues a push and reports it under `mirror`; the zone card shows
+the sync log (action, status, attempt, message). Proxied A/AAAA/CNAME records keep Cloudflare's
+automatic TTL. The mirror is live for visitors only once the domain's nameservers point at Cloudflare.
+Server: `/api/dns/cloudflare/status|token|zones`, `/api/dns/zones/:domain/cloudflare[/link|unlink|import|push]`;
+migration `035_dns-cloudflare.sql`.
+
 #### 19.5 Edit Zone Templates
 
 - **Purpose:** the templates new zones are rendered from.
@@ -1250,7 +1266,7 @@ stay reachable in every state). Installing and connecting a hub is covered in
 
 | Card | What it does |
 |---|---|
-| **License** | status pill, edition, days left, last/next check-in, activation id, hostname and fingerprint; *Check in now* (`POST /api/license/checkin`, forced). |
+| **License** | status pill, edition, days left, last/next check-in, activation id, hostname and fingerprint; *Check in now* (`POST /api/license/checkin`, forced). Shown in full to the **super admin** only (`whm-cli superadmin <user>`, gated by the setup password in `/etc/whm/superadmin.key`); every other root user sees a *Licensed — managed by the panel owner* card (status, edition, expiry), no hub address or key, and `403 superadmin_required` on the license API. |
 | **Activate with a license key** / **Replace the license key** | enter `WHM-XXXX-XXXX-XXXX-XXXX`; the key is stored encrypted and never shown again; *Activate with the stored key* re-activates without retyping. `POST /api/license/key`. |
 | **Edition limits and features** | the `lim` and `feat` maps of the verified token: limits are enforced when accounts or resellers are created; features gate whole functions (A.6). |
 | **Activations** | this server with *Deactivate this server* (`POST /api/license/deactivate`, releases the activation; the panel becomes read-only here until a key is activated again) and the other known activations with *Transfer here*. |
@@ -1366,7 +1382,10 @@ provider it is a read-only preview.
 
 - **Prerequisites:** the `whm-hub` provider enabled in *Market Provider Manager*; a license token on this
   panel (`422 license_required` otherwise); the provider URL must share its origin with the hub that issued the
-  license (`409 hub_mismatch`, shown as a red banner); the hub must be reached over `https://`.
+  license (`409 hub_mismatch`, shown as a red banner); the hub must be reached over `https://`. The hub's address
+  is shown to the super admin only — other root users and resellers see *WHM Marketplace hub* in the toolbar and
+  generic `hub_mismatch`/`hub_unreachable` messages, and only the super admin may edit or test the `whm-hub`
+  provider row.
 - **Browse:** search, category, channel `stable`/`beta`, sort by installs/rating/updated/name, featured;
   cards show the developer (with a verified badge), category, pricing and compatibility; *Details* opens the
   listing with versions, permissions and reviews. Root can leave a review (rating 1–5).
@@ -1435,6 +1454,14 @@ provider it is a read-only preview.
 The hub ([`hub/`](../hub/), ports 7443 public and 7440 loopback) serves three single-page portals from one
 `hub/ui` build: `/admin/*` (vendor admin), `/reseller/*` and `/dev/*` (developer). Portal accounts
 (`portal_users`) log in with password and TOTP; developer accounts are separate (`/dev/login`, `/dev/register`).
+**Authenticator enrolment is enforced for admins:** with the vendor setting `hub.require_totp_for_admins` (on by
+default) every `vendor_admin` and `reseller_admin` lands on *Security › Two-factor authentication* after the first
+login (QR code, secret, `otpauth://` URI, confirm with one code) and nothing outside `/v1/portal/*` answers until
+the device is confirmed (`403 totp_enrol_required`). Once enabled, login asks for the code (`401 totp_required`),
+sensitive actions ask for a fresh one (step-up), a code is accepted once per time step (no replay), and five
+wrong codes pause the account's TOTP for 15 minutes (`429 totp_rate_limited`). A stepped-up vendor admin can turn
+the rule off and on under *Admin › Security › Portal policy* (`PATCH /v1/portal/settings`); support and staff roles
+enrol voluntarily; API keys are unaffected. Developers enrol the same way on the developer portal.
 Creating the first vendor admin and issuing the first license from the command line (`hub/scripts/hub-cli.js
 create-admin | issue | revoke | status | activate-key`) is described in [`INSTALL.md` §5.3–5.4](INSTALL.md#53-the-first-vendor-admin).
 

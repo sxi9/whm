@@ -13,6 +13,9 @@ const defaults = {
   tlsPort: 2087,
   tlsCert: null,
   tlsKey: null,
+  // Port 2086 → 2087 redirect once TLS is on. null defers to the setting
+  // panel.force_https (app.js); WHM_FORCE_HTTPS=false pins it off.
+  forceHttps: null,
   dataDir: isProd ? '/var/lib/whm' : path.resolve(process.cwd(), 'data'),
   mode: 'monolithic',
   agentSocket: '/run/whm-agent.sock',
@@ -79,6 +82,7 @@ function envOverrides() {
   if (e.WHM_TLS_PORT) out.tlsPort = Number(e.WHM_TLS_PORT);
   if (e.WHM_TLS_CERT) out.tlsCert = e.WHM_TLS_CERT;
   if (e.WHM_TLS_KEY) out.tlsKey = e.WHM_TLS_KEY;
+  if (e.WHM_FORCE_HTTPS) out.forceHttps = e.WHM_FORCE_HTTPS !== 'false';
   if (e.WHM_DATA_DIR) out.dataDir = path.resolve(e.WHM_DATA_DIR);
   if (e.WHM_MODE) out.mode = e.WHM_MODE;
   if (e.WHM_AGENT_SOCKET) out.agentSocket = e.WHM_AGENT_SOCKET;

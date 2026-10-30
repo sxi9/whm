@@ -4,7 +4,7 @@ import path from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import { exec, hasBinary } from '../src/exec.js';
 import { runOp, createContext, OpError } from '../src/lib.js';
-import { parseDn, parseSans, parseX509Fields, parseOpensslDate, renderApacheTls, renderEximTls, renderDovecotCertInclude, serviceCopies, bundlePaths, groupId, parseEximTlsLibrary, writeEximInclude, eximLayout, parseUpdateExim4Conf, mergeEximBlock, readEximBlock, stripEximBlock, writeEximFragment, dovecotLayout, ACME_OP_TIMEOUT_MS } from '../src/ops/ssl.js';
+import { parseDn, parseSans, parseX509Fields, parseOpensslDate, renderApacheTls, renderEximTls, renderDovecotCertInclude, serviceCopies, bundlePaths, groupId, parseEximTlsLibrary, writeEximInclude, eximLayout, parseUpdateExim4Conf, mergeEximBlock, readEximBlock, stripEximBlock, writeEximFragment, dovecotLayout, ACME_OP_TIMEOUT_MS, installPanelPair, PANEL_TLS_DIR, PANEL_TLS_NOTE } from '../src/ops/ssl.js';
 import { catalog } from '../src/ops/index.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
@@ -288,6 +288,60 @@ describe('service certificate wiring', () => {
     // Without a validator the fragment is written and reported as unvalidated.
     expect(await writeEximInclude({ validate: null }, fresh, 'MAIN_TLS_ENABLE = true\n')).toEqual({ path: fresh, validated: false });
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('panel certificate pair', () => {
+  const mode = (file) => fs.statSync(file).mode & 0o777;
+  const bundle = (root) => {
+    const src = bundlePaths(path.join(root, 'bundle'));
+    fs.mkdirSync(src.dir, { recursive: true });
+    fs.writeFileSync(src.fullchain, CHAIN, { mode: 0o644 });
+    fs.writeFileSync(src.key, KEY, { mode: 0o600 });
+    return src;
+  };
+
+  it('hands key.pem to the TLS directory group (0640) so the non-root whm-panel service can load it, on first install and on replace', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-ssl-panel-'));
+    const src = bundle(root);
+    const dest = path.join(root, 'tls');
+    fs.mkdirSync(dest, { mode: 0o750 });
+    // install.sh creates /etc/whm/tls root:whmpanel; root may hand the test directory to any group, anyone else to their own.
+    const gid = process.getuid() === 0 ? 65534 : process.getgid();
+    fs.chownSync(dest, -1, gid);
+    const applied = installPanelPair(dest, src);
+    expect(applied).toEqual([path.join(dest, 'cert.pem'), path.join(dest, 'key.pem')]);
+    expect(fs.readFileSync(applied[0], 'utf8')).toBe(CHAIN);
+    expect(fs.readFileSync(applied[1], 'utf8')).toBe(KEY);
+    expect(mode(applied[0])).toBe(0o644);
+    expect(mode(applied[1])).toBe(gid ? 0o640 : 0o600);
+    expect(fs.statSync(applied[1]).gid).toBe(gid);
+    expect(fs.statSync(applied[0]).gid).toBe(gid);
+    // A renewal replaces the pair in place with the same ownership and modes.
+    fs.chmodSync(applied[1], 0o600);
+    expect(installPanelPair(dest, src)).toEqual(applied);
+    expect(mode(applied[1])).toBe(gid ? 0o640 : 0o600);
+    expect(fs.statSync(applied[1]).gid).toBe(gid);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('keeps the key root-only (0600) under a root-owned directory and creates a missing directory 0750', () => {
+    if (process.getuid() !== 0) return;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-ssl-panel-root-'));
+    const src = bundle(root);
+    const dest = path.join(root, 'missing', 'tls');
+    const applied = installPanelPair(dest, src);
+    expect(mode(dest)).toBe(0o750);
+    expect(fs.statSync(dest).gid).toBe(0);
+    expect(mode(applied[1])).toBe(0o600);
+    expect(mode(applied[0])).toBe(0o644);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('the op writes the pair under /etc/whm/tls and its note says the listener reloads it in place', () => {
+    expect(PANEL_TLS_DIR).toBe('/etc/whm/tls');
+    expect(PANEL_TLS_NOTE).toMatch(/reloads \/etc\/whm\/tls\/cert\.pem and key\.pem in place/);
+    expect(PANEL_TLS_NOTE).not.toMatch(/^Point WHM_TLS_CERT/);
   });
 });
 

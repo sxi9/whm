@@ -129,6 +129,7 @@ test('single-use secrets never reach either audit_log: payout details, ID docume
   assert.equal((await h.http.post('/v1/dev/password/reset').send({ email: dev.email })).status, 202);
   const token = /reset\/([A-Za-z0-9_-]+)/.exec(h.sent.slice(-1)[0].message)[1];
   assert.equal((await h.http.post(`/v1/dev/password/reset/${token}`).send({ password: 'Fresh-Passw0rd-Again' })).body.error.code, 'invalid_totp');
+  h.nextTotpStep();
   assert.equal((await h.http.post(`/v1/dev/password/reset/${token}`).send({ password: 'Fresh-Passw0rd-Again', totp: totpCode(dev.secret) })).status, 200);
   const resetRows = h.db.prepare("SELECT target FROM audit_log WHERE action LIKE '%/password/reset/:token'").all();
   assert.ok(resetRows.length >= 2);

@@ -59,17 +59,24 @@ export function MarketplaceUpdatesNotice() {
   );
 }
 
-// The hub origins are the panel owner's business: /me carries
-// `superadmin: false` for every other user and the shell then shows the
-// generic hub label instead (the API strips the origins for them as well).
+// The hub origins are the panel owner's business: the API answers every other
+// principal with `url`/`hubUrl` null plus `hubLabel`, and /me carries
+// `superadmin: false` for them, so the pages show the generic label instead.
 export const HUB_LABEL = 'WHM Marketplace hub';
 export function canSeeHubOrigin(user) {
   return user?.superadmin !== false;
 }
+// True when the status (or a provider row) came back with the origin stripped.
+export function hubOriginHidden(status) {
+  return Boolean(status?.hubLabel) && status?.url == null && status?.hubUrl == null;
+}
+export function hubLabelOf(status) {
+  return status?.hubLabel || HUB_LABEL;
+}
 
 export function HubMismatchNotice({ status }) {
   const { user } = useAuth();
-  const showOrigins = canSeeHubOrigin(user);
+  const showOrigins = canSeeHubOrigin(user) && !hubOriginHidden(status);
   return (
     <div className="banner banner-error" role="alert" data-testid="hub-mismatch">
       <AlertTriangle size={18} />
@@ -344,7 +351,7 @@ export function MarketplaceTab({ manage = true, status: statusProp = null }) {
         <div className="datatable-toolbar" style={{ padding: 12, flexWrap: 'wrap', gap: 8 }}>
           <TextInput value={q} onChange={setQ} placeholder="Search plugins…" style={{ maxWidth: 280 }} />
           <Select value={category} onChange={setCategory} options={(categories.data || []).map((c) => ({ value: c.slug, label: `${c.name}${c.count != null ? ` (${c.count})` : ''}` }))} placeholder="All categories" style={{ maxWidth: 240 }} />
-          <span className="muted">{catalog.meta?.total ?? rows.length} plugin{(catalog.meta?.total ?? rows.length) === 1 ? '' : 's'} · {showOrigin && status.hubUrl ? `hub ${status.hubUrl.replace(/^https:\/\//, '')}` : HUB_LABEL}{Array.isArray(status.hubKids) ? ` · ${status.hubKids.length} signing key${status.hubKids.length === 1 ? '' : 's'} pinned` : ''}</span>
+          <span className="muted">{catalog.meta?.total ?? rows.length} plugin{(catalog.meta?.total ?? rows.length) === 1 ? '' : 's'} · {showOrigin && status.hubUrl ? `hub ${status.hubUrl.replace(/^https:\/\//, '')}` : hubLabelOf(status)}{Array.isArray(status.hubKids) ? ` · ${status.hubKids.length} signing key${status.hubKids.length === 1 ? '' : 's'} pinned` : ''}</span>
           {manage && <Button size="sm" icon={RefreshCw} onClick={checkUpdates}>Check for updates</Button>}
           <Button size="sm" onClick={refreshAll}>Refresh</Button>
         </div>

@@ -15,7 +15,7 @@ export const KEY_OPTS = { licenseA: KIDS.licenseA, pluginA: KIDS.pluginA };
 
 // Boots a hub against a temp directory with the fixture keys installed:
 // license-a and plugin-a active, license-b and plugin-b pending.
-export async function bootHub({ config = {}, now, fetch, webhookFetch, keys = true } = {}) {
+export async function bootHub({ config = {}, now, fetch, webhookFetch, keys = true, requireTotp = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-hub-test-'));
   const keysDir = copyKeys(path.join(dir, 'keys'));
   const clock = { t: now ?? Date.now() };
@@ -37,6 +37,9 @@ export async function bootHub({ config = {}, now, fetch, webhookFetch, keys = tr
       },
     }, config),
   });
+  // Migration 001d seeds hub.require_totp_for_admins on; the suites create admin sessions
+  // without an authenticator, so it is relaxed unless a test asks for it (portal-totp.test.js).
+  if (!requireTotp) ctx.portalUsers.updateSettings({ require_totp_for_admins: false }, { by: 'test' });
   if (keys) {
     ctx.keys.register({ purpose: 'license', publicPem: pubOf(KIDS.licenseA), status: 'active', activatedAt: new Date(clock.t - 100 * 86_400_000).toISOString() });
     ctx.keys.register({ purpose: 'license', publicPem: pubOf(KIDS.licenseB), status: 'pending' });

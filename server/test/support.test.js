@@ -132,6 +132,30 @@ describe('Support API', () => {
       expect(d.access).toMatchObject({ active: [], cleanupPending: [], sshd: false });
       expect(d.mail).toMatchObject({ transport: null, configured: false });
       expect(d.settings.email).toBe('');
+      // 029c: the seeded provider name follows the Hostingsignal branding and the
+      // portal link waits for a URL the operator sets; no setting names the old vendor.
+      expect(d.settings).toMatchObject({ providerName: 'Hostingsignal Support', portalUrl: '' });
+      expect(d.links.some((l) => l.key === 'portal')).toBe(false);
+      expect(JSON.stringify(d.settings)).not.toMatch(/cpanel/i);
+      const asReseller = (await reseller.get('/api/support/center').expect(200)).body.data;
+      expect(asReseller.settings).toEqual({ providerName: 'Hostingsignal Support', portalUrl: '' });
+    });
+
+    it('migration 029c moves only the seeded support branding and is idempotent', () => {
+      const sql = fs.readFileSync(path.join(REPO_ROOT, 'server', 'src', 'db', 'migrations', '029c_support-branding.sql'), 'utf8');
+      const current = () => ({ name: app.ctx.settings.get('support.provider_name'), portal: app.ctx.settings.get('support.portal_url') });
+      expect(current()).toEqual({ name: 'Hostingsignal Support', portal: '' });
+      app.ctx.db.exec(sql);
+      expect(current()).toEqual({ name: 'Hostingsignal Support', portal: '' });
+      // Operator values are left alone.
+      app.ctx.settings.setMany({ 'support.provider_name': 'Acme Support', 'support.portal_url': 'https://help.example.net/' });
+      app.ctx.db.exec(sql);
+      expect(current()).toEqual({ name: 'Acme Support', portal: 'https://help.example.net/' });
+      // The 029 seed values are what the migration moves.
+      app.ctx.db.prepare('UPDATE settings SET value = ? WHERE key = ?').run('"cPanel Support"', 'support.provider_name');
+      app.ctx.db.prepare('UPDATE settings SET value = ? WHERE key = ?').run('"https://support.cpanel.net/"', 'support.portal_url');
+      app.ctx.db.exec(sql);
+      expect(current()).toEqual({ name: 'Hostingsignal Support', portal: '' });
     });
 
     it('lets a reseller see links and the README but not the blueprint, tickets, grants or root-only pages', async () => {

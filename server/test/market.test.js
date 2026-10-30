@@ -11,6 +11,8 @@ let csrf;
 let reseller;
 let plainUser;
 let plainCsrf;
+let otherRoot;
+let otherCsrf;
 
 const mutate = (client, method, url, body, token) => client[method](url).set('X-CSRF-Token', token).send(body);
 const put = (url, body) => mutate(app.http, 'put', url, body, csrf);
@@ -40,7 +42,12 @@ function fakeHttps({ status = 200, headers = {}, chunks = [], hang = false } = {
 
 beforeAll(async () => {
   app = await createTestApp();
+  // The whm-hub row's URL, config and test belong to the panel owner (users.superadmin): the suite's root is made the owner.
+  app.ctx.db.prepare("UPDATE users SET superadmin = 1 WHERE username = 'root'").run();
   csrf = await app.login();
+  const second = await app.createUser('root2', 'root');
+  otherRoot = request.agent(app.ctx.app);
+  otherCsrf = (await otherRoot.post('/api/auth/login').send({ username: second.username, password: second.password })).body.data.csrfToken;
   const r = await app.createUser('resell1', 'reseller');
   reseller = request.agent(app.ctx.app);
   await reseller.post('/api/auth/login').send({ username: r.username, password: r.password });
@@ -371,6 +378,68 @@ describe('built-in providers', () => {
     expect(products.body.error.fields.products).toBeDefined();
     expect((await put('/api/market/providers/whm-hub', { displayName: 'WHM Marketplace' }).expect(200)).body.data.products).toEqual([]);
     expect(sslSetting().map((p) => p.name)).toEqual(['cpstore']);
+  });
+  it('hides the hub origin from every principal but the panel owner and keeps the hub URL, config and test behind the owner', async () => {
+    const noOrigin = (body) => expect(JSON.stringify(body)).not.toContain('hub.example.com');
+    const oget = (url) => otherRoot.get(url);
+    const oput = (url, body) => mutate(otherRoot, 'put', url, body, otherCsrf);
+    const opost = (url, body = {}) => mutate(otherRoot, 'post', url, body, otherCsrf);
+    // A plain root: the full root view (config, missing, lastTest) with the URL and the test text replaced.
+    const list = (await oget('/api/market/providers').expect(200)).body;
+    const hub = list.data.find((p) => p.name === 'whm-hub');
+    expect(hub).toMatchObject({ enabled: true, configured: true, url: null, hubLabel: 'WHM Marketplace hub', missing: [], secretsSet: [], config: {}, lastTest: { ok: false, message: 'The last test failed; its details are visible to the panel owner' } });
+    noOrigin(list);
+    expect(list.data.find((p) => p.name === 'cpstore').url).toBe('https://store.cpanel.net');
+    const single = (await oget('/api/market/providers/whm-hub').expect(200)).body;
+    expect(single.data).toMatchObject({ url: null, hubLabel: 'WHM Marketplace hub' });
+    noOrigin(single);
+    // Resellers never saw the config; now they do not see the hub URL either.
+    const rlist = (await reseller.get('/api/market/providers').expect(200)).body;
+    expect(rlist.data.find((p) => p.name === 'whm-hub')).toMatchObject({ url: null, hubLabel: 'WHM Marketplace hub' });
+    expect(rlist.data.find((p) => p.name === 'whm-hub').lastTest).toBeUndefined();
+    noOrigin(rlist);
+    // Setting a URL would make hubMismatch an oracle; a test answer names the host: owner only.
+    for (const [method, url, body] of [
+      ['put', '/api/market/providers/whm-hub/config', { url: 'https://guess.example.com/', config: {} }],
+      ['put', '/api/market/providers/whm-hub', { url: 'https://guess.example.com/' }],
+      ['put', '/api/market/providers/whm-hub', { displayName: 'Renamed' }],
+      ['post', '/api/market/providers/whm-hub/test', {}],
+    ]) {
+      const res = await (method === 'put' ? oput(url, body) : opost(url, body));
+      expect(res.status, `${method} ${url}`).toBe(403);
+      expect(res.body.error.code).toBe('superadmin_required');
+      noOrigin(res.body);
+    }
+    expect(app.ctx.market.hub()).toEqual({ enabled: true, url: 'https://hub.example.com/' });
+    expect((await get('/api/market/providers/whm-hub').expect(200)).body.data.displayName).toBe('WHM Marketplace');
+    // The gate is the hub row's alone: the same root configures and tests other providers.
+    expect((await oput('/api/market/providers/cpstore/config', { url: 'https://store.cpanel.net', config: { accountEmail: 'ops@example.com' } })).status).toBe(200);
+    app.ctx.market.transport.request = async () => ({ status: 200, ok: true, json: null, text: '' });
+    expect((await opost('/api/market/providers/cpstore/test')).status).toBe(200);
+    // The enable switch stays with every root user; its answer is confined too.
+    const off = (await opost('/api/market/providers/whm-hub/disable').expect(200)).body;
+    expect(off.data).toMatchObject({ enabled: false, url: null, hubLabel: 'WHM Marketplace hub' });
+    noOrigin(off);
+    expect(app.ctx.market.hub()).toEqual({ enabled: false, url: 'https://hub.example.com/' });
+    const on = (await opost('/api/market/providers/whm-hub/enable').expect(200)).body;
+    expect(on.data).toMatchObject({ enabled: true, url: null });
+    noOrigin(on);
+    // The owner keeps the URL and the real test text; the service surface other categories use keeps the URL as well.
+    const owner = (await get('/api/market/providers/whm-hub').expect(200)).body.data;
+    expect(owner).toMatchObject({ url: 'https://hub.example.com/', lastTest: { ok: false, message: 'hub.example.com does not know license WHM-7K3Q' } });
+    expect(owner.hubLabel).toBeUndefined();
+    expect(app.ctx.market.enabledProviders('plugin')[0].url).toBe('https://hub.example.com/');
+    // Audit rows are read by every root user: the hub URL and the test text stay out of them,
+    // including the route-level rows the audit middleware writes from the request body.
+    const rows = app.ctx.db.prepare("SELECT action, args_redacted, result FROM audit_log WHERE target = 'whm-hub' ORDER BY id").all();
+    expect(rows.map((r) => r.action)).toEqual(expect.arrayContaining(['market.provider.configure', 'market.provider.test', 'market.provider.update', 'market.provider.enable', 'market.provider.disable', 'PUT /api/market/providers/:name/config', 'PUT /api/market/providers/:name', 'POST /api/market/providers/:name/test']));
+    for (const row of rows) expect(row.args_redacted || '', `${row.action} ${row.result}`).not.toContain('hub.example.com');
+    expect(JSON.parse(rows.find((r) => r.action === 'market.provider.configure').args_redacted)).toMatchObject({ urlChanged: true, fields: [] });
+    expect(JSON.parse(rows.find((r) => r.action === 'market.provider.test').args_redacted)).toEqual({ ok: true });
+    expect(JSON.parse(rows.find((r) => r.action === 'PUT /api/market/providers/:name/config' && r.result === 'ok').args_redacted)).toMatchObject({ url: '[owner-only]' });
+    // A non-hub row still audits its URL.
+    const cp = app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'market.provider.configure' AND target = 'cpstore' ORDER BY id DESC").get();
+    expect(JSON.parse(cp.args_redacted)).toMatchObject({ url: 'https://store.cpanel.net' });
   });
   it('adopts providers the legacy market.providers setting knows and the table does not', async () => {
     const before = sslSetting();

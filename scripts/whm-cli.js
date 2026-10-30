@@ -6,6 +6,9 @@
 //   whm-cli create-admin <user> [pw]    create another root-level panel user
 //   whm-cli list-users                  list panel users
 //   whm-cli unlock-ip <ip>              remove cPHulk blocks for an address
+//   whm-cli stack-status                which hosting-stack components are installed
+//   whm-cli install-stack [--profile full|web] [--select apache,php,...] [--dry-run]
+//                                       install the hosting stack with the distribution package manager
 //   whm-cli superadmin --init           create the super admin key file from the setup password
 //                                       (prompted, or WHM_SUPERADMIN_SETUP_PASSWORD)
 //   whm-cli superadmin <user>           make an existing root user the super admin (asks for
@@ -22,6 +25,8 @@ import readline from 'node:readline/promises';
 import { loadConfig, readConfig } from '../server/src/config.js';
 import { openDatabase } from '../server/src/db/index.js';
 import { createCrypto } from '../server/src/lib/crypto.js';
+import { execFileSync } from 'node:child_process';
+import { STACK_COMPONENTS, STACK_PROFILES, componentByKey, profileComponents } from '../server/src/lib/stack-catalog.js';
 import { keyExists, verifyKey, writeKey, assertKeyDir, assertSetupPassword, MIN_SETUP_PASSWORD_LENGTH } from '../server/src/lib/superadmin-key.js';
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -111,6 +116,65 @@ async function superadminInit() {
   console.log(`super admin setup password stored in ${file} (0600). Grant the flag with: whm-cli superadmin <root-username>`);
 }
 
+
+// --- hosting stack (owner ask: a default install and a manual selection) ----
+function packageManager() {
+  const has = (bin) => ['/usr/bin', '/usr/sbin', '/bin', '/sbin'].some((d) => { try { return fs.statSync(`${d}/${bin}`).isFile(); } catch { return false; } });
+  if (has('apt-get')) return { family: 'debian', bin: 'apt-get', query: 'dpkg-query' };
+  if (has('dnf')) return { family: 'rhel', bin: 'dnf', query: 'rpm' };
+  if (has('yum')) return { family: 'rhel', bin: 'yum', query: 'rpm' };
+  return null;
+}
+function packageInstalled(pm, name) {
+  try {
+    if (pm.query === 'dpkg-query') return /^install ok installed/.test(execFileSync('dpkg-query', ['-W', '-f=${Status}', name], { stdio: ['ignore', 'pipe', 'ignore'] }).toString());
+    execFileSync('rpm', ['-q', name], { stdio: 'ignore' });
+    return true;
+  } catch { return false; }
+}
+function componentsFor(args) {
+  const profile = args.find((a) => a.startsWith('--profile='))?.slice(10) ?? (args.includes('--profile') ? args[args.indexOf('--profile') + 1] : null);
+  const select = args.find((a) => a.startsWith('--select='))?.slice(9) ?? (args.includes('--select') ? args[args.indexOf('--select') + 1] : null);
+  const keys = new Set();
+  if (profile) {
+    const list = profileComponents(profile);
+    if (!list) throw new Error(`unknown profile "${profile}" (${STACK_PROFILES.map((p) => p.key).join(', ')})`);
+    for (const k of list) keys.add(k);
+  }
+  if (select) for (const k of select.split(',').map((x) => x.trim()).filter(Boolean)) { if (!componentByKey(k)) throw new Error(`unknown component "${k}" (${STACK_COMPONENTS.map((c) => c.key).join(', ')})`); keys.add(k); }
+  if (!profile && !select) throw new Error('give --profile full|web or --select <component,...>; see stack-status for the component keys');
+  return [...keys].map(componentByKey);
+}
+function stackStatus(pm) {
+  return STACK_COMPONENTS.map((c) => {
+    const packages = pm ? c.packages[pm.family] || [] : [];
+    const installed = pm ? packages.length > 0 && packages.every((p) => packageInstalled(pm, p)) : null;
+    return { component: c.key, label: c.label, recommended: c.recommended ? 'yes' : '', packages: packages.join(' '), installed: installed == null ? 'unknown' : installed ? 'yes' : 'no' };
+  });
+}
+function installStack(pm, components, { dryRun }) {
+  if (!pm) throw new Error('no supported package manager (apt-get/dnf/yum)');
+  const packages = [...new Set(components.flatMap((c) => c.packages[pm.family] || []))].filter((p) => !packageInstalled(pm, p));
+  const units = [...new Set(components.flatMap((c) => c.units || []))];
+  const modules = [...new Set(components.flatMap((c) => (c.postInstall || []).filter((p) => p.kind === 'a2enmod').flatMap((p) => p.modules || [])))];
+  console.log(`components: ${components.map((c) => c.key).join(', ')}`);
+  console.log(`packages to install (${pm.family}): ${packages.length ? packages.join(' ') : 'none (all present)'}`);
+  if (dryRun) { console.log('dry run: nothing installed'); return; }
+  if (process.getuid?.() !== 0) throw new Error('install-stack must run as root');
+  const env = { ...process.env, DEBIAN_FRONTEND: 'noninteractive' };
+  if (packages.length) {
+    if (pm.bin === 'apt-get') execFileSync('apt-get', ['update', '-q'], { stdio: 'inherit', env });
+    execFileSync(pm.bin, ['install', '-y', '-q', ...packages], { stdio: 'inherit', env });
+  }
+  if (pm.family === 'debian' && modules.length) {
+    try { execFileSync('a2enmod', ['-q', ...modules], { stdio: 'inherit' }); } catch (err) { console.warn(`a2enmod: ${err.message}`); }
+  }
+  for (const unit of units) {
+    try { execFileSync('systemctl', ['enable', '--now', `${unit}.service`], { stdio: 'ignore' }); console.log(`enabled ${unit}`); } catch { /* unit absent on this distribution */ }
+  }
+  console.log('done; open the panel and re-check capabilities (Service Manager › Server stack)');
+}
+
 async function main() {
   if (!cmd || cmd === '-h' || cmd === '--help') usage(0);
   // --init must not open the database or create the panel's secrets: on a fresh
@@ -164,6 +228,16 @@ async function main() {
       if (!ip) usage(2);
       const { changes } = db.prepare('DELETE FROM cphulk_blocks WHERE ip = ?').run(ip);
       console.log(`removed ${changes} block(s) for ${ip}`);
+      break;
+    }
+    case 'stack-status': {
+      const pm = packageManager();
+      console.log(`package manager: ${pm ? `${pm.bin} (${pm.family})` : 'none found'}`);
+      console.table(stackStatus(pm));
+      break;
+    }
+    case 'install-stack': {
+      installStack(packageManager(), componentsFor(rest), { dryRun: rest.includes('--dry-run') });
       break;
     }
     case 'superadmin': {

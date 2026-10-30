@@ -23,7 +23,7 @@ export default function EximConfigurationManager({ fn }) {
       {form.loading && !data && <Loading />}
       {data && draft && (
         <>
-          <DaemonNotice installed={data.installed} message="Exim is not installed on this server. Install exim4 (Debian/Ubuntu) or exim (RHEL); the policy you save here is kept and rendered once it is." onRetry={form.refetch} />
+          <DaemonNotice capability="exim" installed={data.installed} message="Exim is not installed on this server. Install exim4 (Debian/Ubuntu) or exim (RHEL); the policy you save here is kept and rendered once it is." onRetry={form.refetch} />
           <Card title="Mail server" actions={<LastApply apply={data.lastApply} />}>
             <KeyValue items={[
               ['Unit', <UnitPill key="u" unit={data.layout?.unit} />],

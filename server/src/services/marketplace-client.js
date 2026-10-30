@@ -5,6 +5,7 @@ import { json } from '../db/index.js';
 import { HttpError, notFound } from '../lib/errors.js';
 import { loadPluginSdk } from '../lib/plugin-sdk.js';
 import { HOST_API_VERSION, MAX_PACKAGE_BYTES } from './plugins.js';
+import { HUB_LABEL } from './market.js';
 
 // Panel marketplace client (§18.6). It has no transport of its own: signed
 // calls go through ctx.license.hub.request() (verified against the compiled-in
@@ -80,15 +81,29 @@ export function createMarketplaceClient(ctx) {
   const hubRow = () => { try { return ctx.market?.hub?.() ?? { enabled: false, url: null }; } catch { return { enabled: false, url: null }; } };
   const hubUrl = () => { try { return license().hubUrl(); } catch { return null; } };
   const developerMode = () => ctx.settings.get('plugins.developer_mode', false) === true;
+  // The hub origins (the provider row's URL and the license hub) belong to the
+  // panel owner (users.superadmin). Every other principal gets null plus the
+  // generic label, and error texts that name no origin. Internal callers use
+  // identity(), which always carries the real values.
+  const isOwner = (user) => { try { return Boolean(ctx.auth?.isSuperadmin?.(user)); } catch { return false; } };
 
-  // A pure read. `full: false` (resellers) is the browse view only: no pinned
-  // keys, feed health or plugin inventory.
-  function status({ full = true } = {}) {
+  function identity() {
     const row = hubRow();
     const url = hubUrl();
+    const enabled = Boolean(row.enabled);
+    return { enabled, providerUrl: row.url || null, hubUrl: url, hubMismatch: enabled && (!url || !row.url || originOf(row.url) !== originOf(url)) };
+  }
+
+  // A pure read. `full: false` (resellers) is the browse view only: no pinned
+  // keys, feed health or plugin inventory. `superadmin: false` (the default,
+  // every principal but the owner) replaces both origins with the label.
+  function status({ full = true, superadmin = false } = {}) {
+    const id = identity();
     const lic = ctx.license ? ctx.license.get() : null;
-    const hubMismatch = Boolean(row.enabled) && (!url || !row.url || originOf(row.url) !== originOf(url));
-    const base = { enabled: Boolean(row.enabled), url: row.url || null, hubUrl: url, hubMismatch, licenseStatus: lic?.status ?? null, licenseDegraded: lic ? lic.enforce && lic.degraded : false, hostVersion: HOST_API_VERSION };
+    const base = {
+      enabled: id.enabled, url: superadmin ? id.providerUrl : null, hubUrl: superadmin ? id.hubUrl : null, ...(superadmin ? {} : { hubLabel: HUB_LABEL }),
+      hubMismatch: id.hubMismatch, licenseStatus: lic?.status ?? null, licenseDegraded: lic ? lic.enforce && lic.degraded : false, hostVersion: HOST_API_VERSION,
+    };
     if (!full) return base;
     const st = state();
     return {
@@ -101,11 +116,17 @@ export function createMarketplaceClient(ctx) {
 
   // Every marketplace action needs the hub row on and pointing at the license
   // hub. A pure read: catalog GETs go through it, so nothing is written here.
-  function requireHub() {
-    const s = status();
-    if (!s.enabled) throw new HttpError(422, 'marketplace_disabled', 'The WHM marketplace hub is disabled: enable the whm-hub provider in Market Provider Manager');
-    if (s.hubMismatch) throw new HttpError(409, 'hub_mismatch', `The whm-hub provider points at ${s.url || 'no URL'} but this panel's license was issued by ${s.hubUrl || 'no hub'}; the two must share an origin`);
-    return s;
+  // The answer carries the real hub URL for the caller's own use; only the
+  // owner's error text names the origins.
+  function requireHub({ superadmin = false } = {}) {
+    const id = identity();
+    if (!id.enabled) throw new HttpError(422, 'marketplace_disabled', 'The WHM marketplace hub is disabled: enable the whm-hub provider in Market Provider Manager');
+    if (id.hubMismatch) {
+      throw new HttpError(409, 'hub_mismatch', superadmin
+        ? `The whm-hub provider points at ${id.providerUrl || 'no URL'} but this panel's license was issued by ${id.hubUrl || 'no hub'}; the two must share an origin`
+        : 'The whm-hub provider does not point at the hub that issued this panel\'s license, so nothing is installed from it; ask the owner of this panel to correct the provider in Market Provider Manager');
+    }
+    return id;
   }
   function requireLicensed() {
     const lic = license().get();
@@ -122,8 +143,8 @@ export function createMarketplaceClient(ctx) {
 
   // ---- public catalog reads (unsigned GET through the license transport) ----
 
-  async function publicGet(pathname, query = {}) {
-    const base = requireHub().hubUrl;
+  async function publicGet(pathname, query = {}, { superadmin = false } = {}) {
+    const base = requireHub({ superadmin }).hubUrl;
     const url = new URL(pathname, base);
     for (const [k, v] of Object.entries(query)) if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
     if (!isHttps(url.href)) throw new HttpError(422, 'hub_url_insecure', 'The marketplace hub must be reached over https://');
@@ -131,7 +152,11 @@ export function createMarketplaceClient(ctx) {
     try {
       res = await license().transport.request(url.href, { method: 'GET', headers: { Accept: 'application/json', 'User-Agent': `whm-panel/${ctx.version}` }, timeoutMs: 30_000 });
     } catch (err) {
-      throw new HttpError(503, 'hub_unreachable', `The marketplace hub at ${url.origin} could not be reached: ${err.message}`);
+      // The transport's own message may name the host: owner only, like the origin.
+      log.warn({ err: err.message, origin: url.origin, path: pathname }, 'marketplace hub unreachable');
+      throw new HttpError(503, 'hub_unreachable', superadmin
+        ? `The marketplace hub at ${url.origin} could not be reached: ${err.message}`
+        : 'The marketplace hub could not be reached; ask the owner of this panel to check the hub connection under Market Provider Manager');
     }
     let parsed = null;
     try { parsed = JSON.parse(Buffer.isBuffer(res.body) ? res.body.toString('utf8') : String(res.body ?? '')); } catch { parsed = null; }
@@ -156,17 +181,17 @@ export function createMarketplaceClient(ctx) {
     return { ...entry, installed: full || !local ? local : { state: local.state } };
   }
 
-  async function catalog(query = {}, { full = true } = {}) {
-    const res = await publicGet('/v1/market/catalog', { q: query.q, category: query.category, channel: query.channel, page: query.page, pageSize: query.pageSize, sort: query.sort, dir: query.dir, featured: query.featured });
+  async function catalog(query = {}, view = {}) {
+    const res = await publicGet('/v1/market/catalog', { q: query.q, category: query.category, channel: query.channel, page: query.page, pageSize: query.pageSize, sort: query.sort, dir: query.dir, featured: query.featured }, view);
     saveState({ last_catalog_sync_at: nowIso() });
-    return { data: Array.isArray(res.data) ? res.data.map((e) => annotate(e, { full })) : [], meta: res.meta ?? { page: 1, pageSize: 24, total: 0 } };
+    return { data: Array.isArray(res.data) ? res.data.map((e) => annotate(e, view)) : [], meta: res.meta ?? { page: 1, pageSize: 24, total: 0 } };
   }
-  const categories = async () => (await publicGet('/v1/market/categories')).data;
-  async function plugin(id, { full = true } = {}) {
-    const res = await publicGet(`/v1/market/plugins/${encodeURIComponent(id)}`, { host: HOST_API_VERSION });
-    return annotate(res.data, { full });
+  const categories = async (view = {}) => (await publicGet('/v1/market/categories', {}, view)).data;
+  async function plugin(id, view = {}) {
+    const res = await publicGet(`/v1/market/plugins/${encodeURIComponent(id)}`, { host: HOST_API_VERSION }, view);
+    return annotate(res.data, view);
   }
-  const versions = async (id) => (await publicGet(`/v1/market/plugins/${encodeURIComponent(id)}/versions`)).data;
+  const versions = async (id, view = {}) => (await publicGet(`/v1/market/plugins/${encodeURIComponent(id)}/versions`, {}, view)).data;
 
   // ---- package download ----------------------------------------------------
 
@@ -302,13 +327,14 @@ export function createMarketplaceClient(ctx) {
   }
 
   async function install({ pluginId, version, channel, consent, allowDowngrade } = {}, user, req) {
+    const view = { superadmin: isOwner(user) };
     syncSchedules();
-    requireHub();
+    requireHub(view);
     requireLicensed();
     if (!ID_RE.test(pluginId || '')) throw new HttpError(422, 'validation_failed', 'Malformed plugin id', { pluginId: ['Reverse-DNS plugin id with at least three segments'] });
     assertMarketplaceSource(pluginId);
     let detail = null;
-    try { detail = await plugin(pluginId); } catch (err) { if (err.status === 404) throw err; log.warn({ err: err.message, pluginId }, 'catalog lookup failed before install; the hub decides at download time'); }
+    try { detail = await plugin(pluginId, view); } catch (err) { if (err.status === 404) throw err; log.warn({ err: err.message, pluginId }, 'catalog lookup failed before install; the hub decides at download time'); }
     if (detail) requirePaidFeature(detail.pricing);
     const job = ctx.jobs.enqueue(INSTALL_JOB, installParams({ pluginId, version, channel, consent: consent ? { permissions: scopes(consent.permissions) } : undefined, allowDowngrade: allowDowngrade === true }, user, req), { userId: user?.id ?? null });
     audit(req, { action: 'plugin.marketplace.install.request', target: pluginId, args: { version: version ?? null, channel: channel ?? null, allowDowngrade: allowDowngrade === true, job: job.id } });
@@ -316,14 +342,15 @@ export function createMarketplaceClient(ctx) {
   }
 
   async function update(id, user, req) {
+    const view = { superadmin: isOwner(user) };
     syncSchedules();
-    requireHub();
+    requireHub(view);
     requireLicensed();
     const row = stmts.install.get(id);
     if (!row) throw new HttpError(409, 'not_marketplace', `${id} was not installed from the marketplace; bundled and sideloaded plugins are never updated from the hub`);
     const pending = pendingUpdates().find((u) => u.id === id);
     let detail = null;
-    try { detail = await plugin(id); } catch (err) { if (err.status === 404) throw err; }
+    try { detail = await plugin(id, view); } catch (err) { if (err.status === 404) throw err; }
     if (detail) requirePaidFeature(detail.pricing);
     const job = ctx.jobs.enqueue(UPDATE_JOB, installParams({ pluginId: id, version: pending?.latest, channel: row.channel }, user, req), { userId: user?.id ?? null });
     audit(req, { action: 'plugin.marketplace.update.request', target: id, args: { from: row.version, to: pending?.latest ?? 'latest', job: job.id } });
@@ -358,7 +385,7 @@ export function createMarketplaceClient(ctx) {
   // ---- update feed ---------------------------------------------------------
 
   async function checkUpdates({ req = null } = {}) {
-    requireHub();
+    requireHub({ superadmin: isOwner(req?.user) });
     requireLicensed();
     const installed = stmts.installs.all().map((r) => ({ id: r.plugin_id, version: r.version }));
     if (!installed.length) { saveState({ last_update_check_at: nowIso(), pending_updates_json: '[]' }); return []; }
@@ -405,7 +432,7 @@ export function createMarketplaceClient(ctx) {
   }
 
   async function pollRevocations({ req = null, reason = 'scheduled' } = {}) {
-    const s = status();
+    const s = identity();
     if (!s.enabled || s.hubMismatch) return { skipped: s.enabled ? 'hub_mismatch' : 'disabled', applied: [] };
     if (!license().token()) return { skipped: 'no_token', applied: [] };
     raiseHeadFloor(signedHeadTs());
@@ -479,7 +506,7 @@ export function createMarketplaceClient(ctx) {
   // ---- reviews and listings ------------------------------------------------
 
   async function review(id, { rating, title, body }, user, req) {
-    requireHub();
+    requireHub({ superadmin: isOwner(user) });
     requireLicensed();
     const res = await license().hub.request(`/v1/market/plugins/${encodeURIComponent(id)}/reviews`, { token: license().token(), rating, ...(title ? { title } : {}), ...(body ? { body } : {}) });
     audit(req, { action: 'plugin.marketplace.review', target: id, args: { rating } });
@@ -515,7 +542,7 @@ export function createMarketplaceClient(ctx) {
       const existing = ctx.scheduler.list().filter((row) => names.has(row.name)).map((row) => row.name);
       if (!existing.includes(REVOCATIONS_SCHEDULE)) ctx.scheduler.ensure(REVOCATIONS_SCHEDULE, `${crypto.randomInt(0, 60)} */6 * * *`, REVOCATIONS_JOB, { reason: 'scheduled' });
       if (!existing.includes(UPDATE_CHECK_SCHEDULE)) ctx.scheduler.ensure(UPDATE_CHECK_SCHEDULE, `${crypto.randomInt(0, 60)} 4 * * *`, UPDATE_CHECK_JOB);
-      const s = status({ full: false });
+      const s = identity();
       const desired = s.enabled && !s.hubMismatch;
       const applied = ctx.settings.get(SCHEDULES_SETTING, null);
       if (applied === desired && existing.length === 2) return;
@@ -529,7 +556,7 @@ export function createMarketplaceClient(ctx) {
 
   function enqueueRevocationPoll(reason) {
     try {
-      const s = status();
+      const s = identity();
       if (!s.enabled || s.hubMismatch) return null;
       return ctx.jobs.enqueue(REVOCATIONS_JOB, { reason });
     } catch (err) { log.warn({ err }, 'could not queue the revocation poll'); return null; }
@@ -568,7 +595,7 @@ export function createMarketplaceClient(ctx) {
 
   return {
     INSTALL_JOB, UPDATE_JOB, REVOCATIONS_JOB, UPDATE_CHECK_JOB, cacheDir, boot,
-    status, requireHub, onHubChanged, catalog, categories, plugin, versions, updates, checkUpdates,
+    status, requireHub, isOwner, onHubChanged, catalog, categories, plugin, versions, updates, checkUpdates,
     install, update, consent, uninstall, installs,
     pollRevocations, revocations, acknowledgeRevocation, enableGuard, review,
   };

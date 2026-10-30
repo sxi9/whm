@@ -29,17 +29,24 @@ export function hostnameProblems(value) {
 
 const isCapability = (e) => e && (e.status === 501 || e.code === 'capability_missing' || e.code === 'binary_not_found');
 
-function StepList({ steps }) {
-  const labels = { hostname: 'System hostname', hosts: '/etc/hosts', settings: 'Panel setting', certs: 'Service SSL certificates', dns: 'DNS A record' };
+// A step is "pending" when the certificate was issued but a service does not
+// serve it from there yet; the fn page's certificate card lists the services.
+const stepState = (s) => (s.ok ? (s.skipped ? 'skipped' : 'done') : s.pending?.length && !s.failed?.length ? 'pending' : 'failed');
+const STEP_PILL = { done: 'ok', skipped: 'disabled', pending: 'pending', failed: 'failed' };
+const CAPABILITY_HINT = { dns: ' (install the DNS server to publish records)', certificate: ' (install certbot or acme.sh and choose it under Manage AutoSSL)', certs: ' (install openssl to re-issue certificates)' };
+
+export function StepList({ steps }) {
+  const labels = { hostname: 'System hostname', hosts: '/etc/hosts', settings: 'Panel setting', certs: 'Service SSL certificates', dns: 'DNS records', landing: 'Hostname landing page', certificate: 'Hostname certificate' };
   return (
     <ul className="step-list" style={{ listStyle: 'none', padding: 0, margin: 0 }}>
       {steps.map((s) => (
         <li key={s.step} style={{ display: 'flex', gap: 10, alignItems: 'flex-start', padding: '6px 0', borderBottom: '1px dashed var(--border)' }}>
-          <StatusPill status={s.ok ? (s.skipped ? 'disabled' : 'ok') : 'failed'}>{s.ok ? (s.skipped ? 'skipped' : 'done') : 'failed'}</StatusPill>
+          <StatusPill status={STEP_PILL[stepState(s)]}>{stepState(s)}</StatusPill>
           <div>
             <strong>{labels[s.step] || s.step}</strong>
             {s.detail && <div className="muted"><code>{s.detail}</code></div>}
-            {s.error && <div className="muted">{s.error}{isCapability(s) ? (s.step === 'dns' ? ' (install the DNS server to publish records)' : ' (install openssl to re-issue certificates)') : ''}</div>}
+            {s.error && stepState(s) !== 'pending' && <div className="muted">{s.error}{isCapability(s) ? CAPABILITY_HINT[s.step] || '' : ''}</div>}
+            {s.pending?.map((p) => <div key={p.service} className="muted"><strong>{p.service}</strong>: {p.error}</div>)}
             {s.step === 'certs' && s.manual?.length > 0 && <div className="muted">Re-issue or re-install the certificate for <strong>{s.manual.join(', ')}</strong> from <Link to="/service-configuration/manage-service-ssl-certificates">Manage Service SSL Certificates</Link>.</div>}
           </div>
         </li>
@@ -55,8 +62,9 @@ export function ChangeHostname() {
   const [hostname, setHostname] = useState('');
   const [ip, setIp] = useState('');
   const [updateHosts, setUpdateHosts] = useState(true);
-  const [addDnsRecord, setAddDnsRecord] = useState(false);
+  const [addDnsRecord, setAddDnsRecord] = useState(true);
   const [reissueServiceCerts, setReissueServiceCerts] = useState(true);
+  const [issueCertificate, setIssueCertificate] = useState(true);
   const [preview, setPreview] = useState(null);
   const [previewError, setPreviewError] = useState(null);
   const [result, setResult] = useState(null);
@@ -74,6 +82,7 @@ export function ChangeHostname() {
     seeded.current = true;
     setUpdateHosts(status.defaults?.updateHosts ?? true);
     setAddDnsRecord(Boolean(status.capability?.dns && (status.defaults?.addDnsRecord ?? true)));
+    if (status.capability?.ssl === false) setIssueCertificate(false);
   }, [status]);
 
   const defaultsDirty = status && (updateHosts !== (status.defaults?.updateHosts ?? true) || addDnsRecord !== (status.defaults?.addDnsRecord ?? true));
@@ -107,7 +116,7 @@ export function ChangeHostname() {
     if (!canSubmit) return;
     const ok = await confirm({
       title: `Change the hostname to ${normalized}?`,
-      message: `hostnamectl sets the kernel hostname immediately${updateHosts ? ', /etc/hosts is rewritten to map it to ' + (ip.trim() || status?.ip || '127.0.1.1') : ''}${reissueServiceCerts ? ', self-signed service certificates that name the old host are re-issued' : ''}${addDnsRecord ? ', and an A record is added to the DNS zone' : ''}. Mail and web daemons pick the new name up when they are restarted. Type the new hostname to confirm.`,
+      message: `hostnamectl sets the kernel hostname immediately${updateHosts ? ', /etc/hosts is rewritten to map it to ' + (ip.trim() || status?.ip || '127.0.1.1') : ''}${reissueServiceCerts ? ', self-signed service certificates that name the old host are re-issued' : ''}${addDnsRecord ? ', its A/AAAA, www and MX records are published in the DNS zone' : ''}, the branded landing page is rendered for it${issueCertificate ? ' and its certificate is issued for the panel, mail and FTP' : ''}. Mail and web daemons pick the new name up when they are restarted. Type the new hostname to confirm.`,
       confirmLabel: 'Change hostname', danger: true, typeToConfirm: normalized,
     });
     if (!ok) return;
@@ -115,7 +124,7 @@ export function ChangeHostname() {
     setSubmitError(null);
     setResult(null);
     try {
-      const { data } = await api.post('/networking/hostname', { ...body(), updateHosts, addDnsRecord, reissueServiceCerts });
+      const { data } = await api.post('/networking/hostname', { ...body(), updateHosts, addDnsRecord, reissueServiceCerts, issueCertificate });
       setResult(data);
       if (data.ok) toast.success(`Hostname changed to ${data.hostname}`);
       else toast.warning(`Hostname changed to ${data.hostname}, but some steps failed; see below`);
@@ -156,8 +165,9 @@ export function ChangeHostname() {
           </Field>
           <Field inline><Toggle checked={updateHosts} onChange={setUpdateHosts} label="Update /etc/hosts" description="Map the new name to the IP above and drop the old name. Required for sudo, Exim and local tools to resolve the hostname." /></Field>
           <Field inline><Toggle checked={reissueServiceCerts} onChange={setReissueServiceCerts} label="Re-issue self-signed service certificates" description="Service certificates (Exim, Dovecot, Apache, FTP, panel) that are self-signed and name the old host are regenerated for the new name. CA-issued certificates are never replaced; they are listed for manual re-issue." /></Field>
-          <Field inline><Toggle checked={addDnsRecord} onChange={setAddDnsRecord} disabled={!status?.capability?.dns} label="Add an A record for the hostname" description={status?.capability?.dns ? 'Creates the record in the matching zone (creating the parent zone when needed) through DNS Functions.' : 'DNS Functions are not available on this panel.'} /></Field>
-          {unchanged && <p className="muted">This is already the hostname; applying again only repairs /etc/hosts and the DNS record.</p>}
+          <Field inline><Toggle checked={addDnsRecord} onChange={setAddDnsRecord} disabled={!status?.capability?.dns} label="Publish DNS records for the hostname" description={status?.capability?.dns ? 'Creates the A/AAAA, www and MX records in the matching zone (creating the parent zone when needed) through DNS Functions.' : 'DNS Functions are not available on this panel.'} /></Field>
+          <Field inline><Toggle checked={issueCertificate} onChange={setIssueCertificate} disabled={status?.capability?.ssl === false} label="Issue the hostname certificate" description={status?.capability?.ssl === false ? 'SSL/TLS is not available on this panel.' : 'Requests a certificate for the new name through AutoSSL once it resolves here and installs it for the panel, Exim, Dovecot, FTP and the landing page; repeat it later with Reissue hostname certificate.'} /></Field>
+          {unchanged && <p className="muted">This is already the hostname; applying again only repairs /etc/hosts, the DNS records, the landing page and the certificate.</p>}
           <FormActions>
             <Button type="submit" variant="danger" loading={busy} disabled={!canSubmit}>Change hostname</Button>
             <Button onClick={doPreview} disabled={!normalized || problems.length > 0}>Preview /etc/hosts</Button>

@@ -34,6 +34,8 @@ export const DEFAULT_SETTINGS = {
   'tweak.allow_remote_domains': false,
   'tweak.prevent_unlimited_bandwidth': false,
   'tweak.login_theme': 'jupiter',
+  'web.force_https': true,
+  'panel.force_https': true,
   'security.min_password_strength': 65,
   'security.cphulk.enabled': true,
   'security.cphulk.max_failures_per_ip': 15,

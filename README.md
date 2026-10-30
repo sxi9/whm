@@ -1,13 +1,14 @@
 # WHM — WebHost Manager control panel
 
 A production-grade, self-hostable **WHM-compatible hosting control panel**: the complete
-WHM administrative interface (31 categories, 215 functions: the 212 WHM functions plus the Application Manager) that manages a **real Linux
+WHM administrative interface (31 categories, 216 functions: the 212 WHM functions plus the Application Manager category and Support › Account Conversations) that manages a **real Linux
 server** — Linux users and quotas, Apache/NGINX and PHP-FPM, BIND DNS, Exim/Dovecot mail,
 MySQL/MariaDB, FTP, SSL/ACME, systemd services, IPs, security, backups, transfers and
 resellers — built on Node.js 22, Express, React and SQLite. The product is **HST Panel** by
 Hostingsignal: the hosted-account side carries that name, while the administrative side keeps the
-WHM name. The project started as a WHM/cPanel clone, so routes, keys and settings still use the
-original `cpanel` identifiers.
+WHM name (the sidebar category cPanel calls "cPanel" is *HST Panel* here; `client/src/brand.js` is
+the source of the names). The project started as a WHM/cPanel clone, so routes, keys, slugs and
+settings still use the original `cpanel` identifiers.
 
 - Design of record: [`BLUEPRINT.md`](BLUEPRINT.md) · Progress: [`CHECKLIST.md`](CHECKLIST.md) · Conventions: [`CLAUDE.md`](CLAUDE.md) · Screenshots: [`docs/screenshots/`](docs/screenshots/README.md)
 
@@ -46,12 +47,20 @@ not installed degrade to a clear "service not installed" prompt instead of faili
 ```bash
 git clone https://github.com/sxi9/whm.git
 cd whm
-sudo bash scripts/install.sh            # add WHM_ADMIN_PASSWORD='…' to choose the first password
+sudo bash scripts/install.sh                    # asks on a terminal: hosting stack, license hub, super admin setup password
+sudo bash scripts/install.sh --stack full       # panel + the full hosting stack (Apache, PHP-FPM, MariaDB, BIND, Exim, Dovecot, FTP, ModSecurity, certbot, quotas, firewall, stats, Fail2ban)
+sudo bash scripts/install.sh --stack web        # panel + Apache, PHP, MariaDB, certbot, quotas, firewall
+sudo bash scripts/install.sh --components apache,php,mysql,bind   # manual selection from the stack catalog
+sudo bash scripts/install.sh --stack none       # panel only; the first-login setup wizard or Service Manager › Server stack installs software later
+# WHM_ADMIN_PASSWORD='…' chooses the first password; WHM_STACK / WHM_SUPERADMIN_SETUP_PASSWORD / WHM_LICENSE_HUB_URL answer the prompts non-interactively
 ```
 
 The installer deploys to `/opt/whm`, creates the `whmpanel` service user, writes
-`/etc/whm/{whm.conf,agent.conf,panel.env}`, generates a self-signed certificate, and starts
-two units:
+`/etc/whm/{whm.conf,agent.conf,panel.env}`, generates a self-signed certificate in `/etc/whm/tls/`
+(replaced in place by the hostname's Let's Encrypt certificate once *Networking Setup › Change
+Hostname* runs), optionally installs a hosting stack from the same catalog the panel's setup wizard
+and *Service Manager › Server stack* use, stores the super admin setup password hash in
+`/etc/whm/superadmin.key`, and starts two units:
 
 | Unit | Runs as | Purpose |
 |---|---|---|
@@ -60,7 +69,13 @@ two units:
 
 Log in as `root` with the generated password printed by the installer (also in
 `/var/lib/whm/initial-admin-password.txt` — delete it after first login). You will be asked
-to change it immediately. Open TCP 2086/2087 in your firewall.
+to change it immediately, then the **setup wizard** (`/setup`) asks for the server basics and which
+services to install. Open TCP 2086/2087 in your firewall: HTTPS is the default — port 2086 only
+redirects to 2087 (`WHM_FORCE_HTTPS=false` in `/etc/whm/panel.env` serves plain HTTP), and every
+site with a certificate redirects HTTP to HTTPS (setting `web.force_https`, toggle under *Service
+Configuration › Apache Configuration*). Make the owning root user the **super admin**
+(`sudo node /opt/whm/scripts/whm-cli.js superadmin root`, asks for the setup password): only that
+user sees the license hub (`https://licserver.hostingsignal.in` by default) and the license key.
 
 Useful commands:
 
@@ -92,7 +107,8 @@ boot writes `data/initial-admin-password.txt`.
 Precedence: environment variables → `/etc/whm/whm.conf` (or `WHM_CONFIG`) → defaults.
 See [`.env.example`](.env.example) and [`deploy/whm.conf.example`](deploy/whm.conf.example).
 Key settings: `WHM_MODE` (`split` in production, `monolithic` for dev), `WHM_DATA_DIR`,
-`WHM_PORT`/`WHM_TLS_PORT`, `WHM_TLS_CERT`/`WHM_TLS_KEY`, `WHM_SERVE_CLIENT`.
+`WHM_PORT`/`WHM_TLS_PORT`, `WHM_TLS_CERT`/`WHM_TLS_KEY` (`/etc/whm/tls/cert.pem` + `key.pem` on an
+installed host), `WHM_FORCE_HTTPS`, `WHM_SERVE_CLIENT`, `WHM_LICENSE_HUB_URL`.
 The agent's writable path roots can be widened in `/etc/whm/agent.conf`.
 
 ## Security model (summary)
@@ -113,7 +129,7 @@ Full detail: [`BLUEPRINT.md`](BLUEPRINT.md) §4, §8, §10.
 
 ```
 server/   Express API, services, SQLite migrations, tests      agent/    whm-agentd op catalog + executor
-client/   React SPA (nav.js = all 215 functions)               hub/      whm-hub: license server + marketplace + portal UI
+client/   React SPA (nav.js = all 216 functions)               hub/      whm-hub: license server + marketplace + portal UI
 plugins/  SDK.md, sdk/ (validator, mock host, packer), sample-plugin/, bundled/ (4 plugins)
 deploy/   systemd units + config templates (panel, agent, hub)  scripts/  install.sh, whm-cli.js, build-plugin.js
 docs/     saved design sections + build plan                    BLUEPRINT.md · CHECKLIST.md · CLAUDE.md
@@ -158,7 +174,13 @@ unit, move it, edit `WHM_HUB_DB_DIR` in `hub.env` and `db_dir`/`marketplace.*` i
 | `whm-hub.service` | whmhub | **:7443** HTTPS — `/v1/*` license API, `/v1/market/*` catalog, `/v1/dev/*`, `/v1/admin/*`, `/v1/reseller/*`, portal SPA; **127.0.0.1:7440** `/healthz`, `/metrics` (never expose) |
 
 The panel learns its hub from `WHM_LICENSE_HUB_URL` in `/etc/whm/panel.env` (the installer asks on a
-terminal, takes the variable non-interactively, and defaults to the local hub with `--with-hub`).
+terminal with the vendor hub `https://licserver.hostingsignal.in` as the default — the panel's own
+fallback when the variable is unset —, takes the variable non-interactively, and defaults to the local
+hub with `--with-hub`). The address, the key and every hub answer are shown to the panel's **super
+admin** only (`whm-cli superadmin <user>`, gated by the setup password in `/etc/whm/superadmin.key`);
+other root users see a *managed by the panel owner* card. Hub portal admins (vendor and reseller) must
+enrol an authenticator app at their first login (`hub.require_totp_for_admins`, on by default; *Admin ›
+Security › Portal policy* switches it).
 That URL is only the **bootstrap** address for activation and trials; once a token exists the panel
 talks to the hub named in the token (`iss`). Panels speak https only; for a hub with a self-signed
 certificate set `WHM_LICENSE_HUB_CA=/etc/whm/hub-ca.pem` (a copy of `hub.crt` readable by

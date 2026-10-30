@@ -9,17 +9,20 @@ import { TextInput, Select, Button } from '../../../components/Form.jsx';
 import { ProgressLog } from '../../../components/ProgressLog.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError } from '../../server-configuration/Shared.jsx';
-import { MarketplaceTab, MarketplaceDisabledNotice } from '../../cpanel/MarketplaceTab.jsx';
+import { MarketplaceTab, MarketplaceDisabledNotice, canSeeHubOrigin, hubLabelOf } from '../../cpanel/MarketplaceTab.jsx';
 
 // Hub enabled → the hub catalog (resellers read-only, root manages) with the
 // static distribution packages underneath; hub off → the static catalog alone.
+// The hub is named by its origin for the panel owner only; everyone else
+// (the API answers them with `hubUrl: null`) sees the generic label.
 export default function WhmMarketplace({ fn }) {
   const { user } = useAuth();
   const status = useApi('/marketplace/status');
   const hubOn = status.data?.enabled === true;
+  const hubName = canSeeHubOrigin(user) && status.data?.hubUrl ? `the marketplace hub at ${status.data.hubUrl.replace(/^https:\/\//, '').replace(/\/$/, '')}` : `the ${hubLabelOf(status.data)}`;
   return (
     <>
-      <PageHeader fn={fn} description={hubOn ? 'Plugins published on the WHM marketplace hub, verified and signed by the vendor, plus the distribution packages that extend the host.' : 'Add-ons that extend the panel. This is a read-only catalog for now: each entry links to the distribution packages behind it and the page that configures it once installed.'} />
+      <PageHeader fn={fn} description={hubOn ? `Plugins published on ${hubName}, verified and signed by the vendor, plus the distribution packages that extend the host.` : 'Add-ons that extend the panel. This is a read-only catalog for now: each entry links to the distribution packages behind it and the page that configures it once installed.'} />
       {status.data && !hubOn && user?.role === 'root' && <MarketplaceDisabledNotice />}
       {hubOn && <MarketplaceTab manage={user?.role === 'root'} status={status.data} />}
       <StaticCatalog title={hubOn ? 'Distribution packages' : null} />

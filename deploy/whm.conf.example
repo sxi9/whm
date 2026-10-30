@@ -1,10 +1,10 @@
 {
-  "_comment": "Panel configuration. Installed to /etc/whm/whm.conf by scripts/install.sh. Environment variables (see .env.example) override these keys.",
+  "_comment": "Panel configuration. Installed to /etc/whm/whm.conf by scripts/install.sh. Environment variables (see .env.example) override these keys. tlsCert/tlsKey are the pair the listener serves and watches: the installer's self-signed pair, then the hostname certificate that Networking Setup > Change Hostname installs there (ssl.service_cert.install writes /etc/whm/tls/cert.pem and key.pem; the listener reloads them without a restart). forceHttps: false (or WHM_FORCE_HTTPS=false) keeps plain HTTP on 2086 instead of redirecting to 2087.",
   "host": "0.0.0.0",
   "port": 2086,
   "tlsPort": 2087,
-  "tlsCert": "/etc/whm/ssl/panel.crt",
-  "tlsKey": "/etc/whm/ssl/panel.key",
+  "tlsCert": "/etc/whm/tls/cert.pem",
+  "tlsKey": "/etc/whm/tls/key.pem",
   "dataDir": "/var/lib/whm",
   "mode": "split",
   "agentSocket": "/run/whm-agent.sock",

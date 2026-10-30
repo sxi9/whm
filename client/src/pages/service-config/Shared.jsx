@@ -12,9 +12,9 @@ export function isCapabilityError(error) {
 }
 
 // Error display that distinguishes "install the daemon" from real failures.
-export function RequestError({ error, onRetry }) {
+export function RequestError({ error, onRetry, capability }) {
   if (!error) return null;
-  if (isCapabilityError(error)) return <CapabilityNotice error={error} onRetry={onRetry} />;
+  if (isCapabilityError(error)) return <CapabilityNotice error={error} onRetry={onRetry} capability={capability} />;
   return <ErrorBanner error={error} onRetry={onRetry} />;
 }
 
@@ -83,9 +83,9 @@ export function SaveBar({ form, label = 'Save and apply', disabled = false, chil
   );
 }
 
-export function DaemonNotice({ installed, message, onRetry }) {
+export function DaemonNotice({ installed, message, onRetry, capability }) {
   if (installed) return null;
-  return <CapabilityNotice error={{ code: 'capability_missing', message }} onRetry={onRetry} />;
+  return <CapabilityNotice error={{ code: 'capability_missing', message }} onRetry={onRetry} capability={capability} />;
 }
 
 export function LastApply({ apply, label = 'Last apply' }) {

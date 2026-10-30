@@ -543,6 +543,7 @@ This section enumerates **all 30 categories** from the WHM sidebar — nothing o
 - **Create Support Ticket** — ticket form (captures system snapshot). `jobs`/outbound.
 - **Grant cPanel Support Access** — time-boxed support SSH access + token. *creates temp key* · audit.
 - **Support Center** — links/resources hub.
+- **Account Conversations** *(our addition, 2026-10-29)* — one support thread per account between the account manager (`accounts.manager_user_id`, chosen at create/modify) and the account; SSE-streamed messages, unread badge; design `docs/design/support-chat.md`, migration 034, `ctx.supportChat`.
 
 ### 3. Networking Setup
 - **Change Hostname** — set FQDN. *`hostnamectl`, `/etc/hosts`, update vhosts/certs refs*.

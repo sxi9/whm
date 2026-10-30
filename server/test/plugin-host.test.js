@@ -95,6 +95,8 @@ const pluginModule = () => app.ctx.plugins.entry(ID).module;
 
 beforeAll(async () => {
   app = await createTestApp();
+  // The whm-hub row's URL and config belong to the panel owner (users.superadmin): the suite's root is made the owner.
+  app.ctx.db.prepare("UPDATE users SET superadmin = 1 WHERE username = 'root'").run();
   app.ctx.jobs.start();
   csrf = await app.login();
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-plugin-'));

@@ -1,3 +1,4 @@
+import { authenticator } from 'otplib';
 import { HttpError, unauthorized, forbidden, notFound } from '../../shared/errors.js';
 import { constantTimeEqual } from '../../shared/crypto.js';
 import { newId, nowIso, json, paginate } from '../../shared/db.js';
@@ -13,6 +14,7 @@ const LOGIN_MAX = 10;
 // per-account budget so a stolen session cookie cannot be stepped up by guessing.
 const TOTP_WINDOW_MS = 15 * 60_000;
 const TOTP_MAX = 5;
+const TOTP_STEP_MS = 30_000;
 
 // Only the session cookie is read; a malformed percent-escape in any cookie
 // must not turn into a 500 on every developer route.
@@ -48,6 +50,9 @@ export function createDevSecurityService(m) {
     revokeKey: db.prepare('UPDATE developer_api_keys SET revoked_at = ? WHERE id = ? AND developer_id = ? AND revoked_at IS NULL'),
     revokeAllKeys: db.prepare('UPDATE developer_api_keys SET revoked_at = ? WHERE developer_id = ? AND revoked_at IS NULL'),
     setLogin: db.prepare('UPDATE developers SET failed_logins = @failed_logins, locked_until = @locked_until, lockouts = @lockouts, last_login_ip_hash = COALESCE(@ip_hash, last_login_ip_hash), updated_at = @now WHERE id = @id'),
+    // Compare-and-set on the last accepted time step: the row changes only for
+    // a newer step, so two requests carrying the same code cannot both pass.
+    acceptTotpStep: db.prepare('UPDATE developers SET totp_last_step = @step WHERE id = @id AND (totp_last_step IS NULL OR totp_last_step < @step)'),
     insertEvent: db.prepare('INSERT INTO developer_security_events (developer_id, event, ip_hash, detail, ts) VALUES (?, ?, ?, ?, ?)'),
     listEvents: db.prepare('SELECT event, ip_hash, detail, ts FROM developer_security_events WHERE developer_id = ? ORDER BY id DESC LIMIT 100'),
     insertReset: db.prepare('INSERT INTO developer_password_resets (token_hash, developer_id, expires_at) VALUES (?, ?, ?)'),
@@ -166,14 +171,33 @@ export function createDevSecurityService(m) {
     return { totp_verified_at: m.now() };
   }
 
+  // The time step a code belongs to (null when it does not verify), from the
+  // hub clock every other marketplace time check uses: the same otplib
+  // instance checks the code and names the step, so a step boundary between
+  // two reads cannot shift the result.
+  function codeStep(code, secretEnc) {
+    if (!secretEnc) return null;
+    const epoch = m.now();
+    const delta = authenticator.clone({ epoch }).checkDelta(String(code || '').replace(/\s+/g, ''), ctx.crypto.decrypt(secretEnc));
+    return delta === null ? null : Math.floor(epoch / TOTP_STEP_MS) + delta;
+  }
+
   // Every TOTP check: refused while the account is locked, 429 after TOTP_MAX
   // wrong codes in TOTP_WINDOW_MS, and each wrong code also counts as a failed
-  // login so the §18.9 doubling lockout applies.
+  // login so the §18.9 doubling lockout applies. RFC 6238 §5.2: a code is
+  // accepted once per account, so a step at or before the last accepted one
+  // (developers.totp_last_step) is a replay and refused, whatever the purpose
+  // the first use had; it did verify, so it is no guessing signal and spends
+  // neither budget (two checks inside one step are a normal flow).
   function verifyTotp(developer, code, { ip = null, secretEnc = developer.totp_secret_enc } = {}) {
     assertNotLocked(developer);
     const key = `totp:${developer.id}`;
     if (m.limits.count(key, TOTP_WINDOW_MS) >= TOTP_MAX) throw Object.assign(new HttpError(429, 'totp_rate_limited', 'Too many invalid codes; try again later'), { retryAfterS: Math.ceil(TOTP_WINDOW_MS / 1000) });
-    if (secretEnc && ctx.crypto.totp.verify(code || '', ctx.crypto.decrypt(secretEnc))) return true;
+    const step = codeStep(code, secretEnc);
+    if (step !== null) {
+      if (stmts.acceptTotpStep.run({ id: developer.id, step }).changes === 1) return true;
+      throw new HttpError(401, 'totp_reused', 'That code was already used; wait for the next one');
+    }
     m.limits.hit(key);
     const r = recordFailedLogin(developer, ip);
     if (r.locked) throw Object.assign(new HttpError(423, 'account_locked', 'Too many failed attempts; the account is locked for a while'), { retryAfterS: 900 });

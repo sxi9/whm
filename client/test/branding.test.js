@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { readdirSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { CATEGORIES, FUNCTIONS, FUNCTION_BY_KEY, FUNCTION_BY_PATH } from '../src/nav.js';
 import { BRAND } from '../src/brand.js';
@@ -40,6 +40,24 @@ describe('product branding', () => {
       expect(FUNCTION_BY_PATH[`/${key}`], key).toBe(FUNCTION_BY_KEY[key]);
       expect(FUNCTION_BY_KEY[key].label).toContain(BRAND.product);
     }
+  });
+
+  it('the English catalog agrees with nav.js on every category and function label it carries', () => {
+    const en = JSON.parse(readFileSync(new URL('../src/i18n/en.json', import.meta.url), 'utf8'));
+    let checked = 0;
+    for (const c of CATEGORIES) {
+      if (Object.hasOwn(en, `category.${c.slug}`)) { expect(en[`category.${c.slug}`], c.slug).toBe(c.label); checked += 1; }
+      for (const f of c.functions) {
+        for (const [field, value] of [['label', f.label], ['description', f.description]]) {
+          const key = `fn.${f.key}.${field}`;
+          if (Object.hasOwn(en, key)) { expect(en[key], key).toBe(value); checked += 1; }
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(400);
+    expect(en['category.cpanel']).toBe(BRAND.product);
+    for (const key of RENAMED_KEYS) expect(en[`fn.${key}.label`], key).toContain(BRAND.product);
+    for (const [key, value] of Object.entries(en)) if (key.endsWith('.label') || key.startsWith('category.')) expect(value, key).not.toContain(BRAND.legacyName);
   });
 
   it('every page file under pages/fn still maps to a function key', () => {

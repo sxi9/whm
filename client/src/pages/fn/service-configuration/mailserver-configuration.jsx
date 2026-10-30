@@ -18,7 +18,7 @@ export default function MailserverConfiguration({ fn }) {
       {form.loading && !data && <Loading />}
       {data && draft && (
         <>
-          <DaemonNotice installed={data.installed} message="Dovecot is not installed on this server. Install dovecot-imapd/dovecot-pop3d (Debian/Ubuntu) or dovecot (RHEL); the settings you save here are written once it is." onRetry={form.refetch} />
+          <DaemonNotice capability="dovecot" installed={data.installed} message="Dovecot is not installed on this server. Install dovecot-imapd/dovecot-pop3d (Debian/Ubuntu) or dovecot (RHEL); the settings you save here are written once it is." onRetry={form.refetch} />
           <Card title="Dovecot" actions={<LastApply apply={data.lastApply} />}>
             <KeyValue items={[
               ['Unit', <UnitPill key="u" unit={data.detect?.unit} />],

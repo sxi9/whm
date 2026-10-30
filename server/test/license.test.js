@@ -449,8 +449,8 @@ describe('super admin gating', () => {
   // Owed by services/marketplace-client.js (status(), hub_mismatch/hub_unreachable
   // text), routes/marketplace.js (view(req).superadmin) and services/market.js
   // (shape() url/lastTest for adapter "hub"): outside this unit's files.
-  it.todo('GET /api/marketplace/status and /api/market/providers never carry the hub origin for a non-owner root or a reseller');
-  it.todo('marketplace hub_mismatch and hub_unreachable answers name no origin for a non-owner root');
+
+
 });
 
 describe('state machine and events', () => {
@@ -575,6 +575,7 @@ describe('state machine and events', () => {
   it('notifies license.expiring once per threshold', async () => {
     const hub = createMockHub({ license: { lexpDays: 10 } });
     const app = await bootPanel({ hub });
+    app.ctx.scheduler.stop();
     try {
       const notify = vi.fn(async () => ({ sent: 0 }));
       app.ctx.contacts = { notify };
@@ -602,7 +603,7 @@ describe('state machine and events', () => {
     let ctx = await reboot(createMockAgent({ 'sys.fingerprint': fingerprintOp() }), () => t0 + 60_000);
     expect(ctx.license.get()).toMatchObject({ status: 'active', edition: 'pro', activationId: 'act_test0001' });
     expect(ctx.license.hubUrl()).toBe(ISSUER);
-    expect(ctx.agent.calls.filter((c) => /^(user|fs|dns|web|mail|db|acct)\./.test(c.name))).toEqual([]);
+    expect(ctx.agent.calls.filter((c) => /^(user|fs|dns|web|mail|db|acct)\./.test(c.name) && c.name !== 'fs.stat')).toEqual([]);
     closeCtx(ctx);
 
     ctx = await reboot(createMockAgent({ 'sys.fingerprint': fingerprintOp({ ...FP, mac: h('new-nic') }) }), () => t0 + 60_000);
@@ -692,6 +693,9 @@ describe('degraded gate, feature gates and capacity', () => {
     expect(degradedAllow).toContain('POST /accounts/:username/unsuspend');
     expect(isAllowedWhileDegraded('POST', '/auth/logout')).toBe(true);
     expect(isAllowedWhileDegraded('POST', '/license/key')).toBe(true);
+    expect(isAllowedWhileDegraded('POST', '/system/setup/complete')).toBe(true);
+    expect(isAllowedWhileDegraded('POST', '/system/stack/install')).toBe(false);
+    expect(isAllowedWhileDegraded('PUT', '/system/settings')).toBe(false);
     expect(isAllowedWhileDegraded('POST', '/system/services/httpd/restart')).toBe(true);
     expect(isAllowedWhileDegraded('POST', '/system/services/httpd/stop')).toBe(false);
     expect(isAllowedWhileDegraded('DELETE', '/backup/destinations/3')).toBe(true);
@@ -729,6 +733,9 @@ describe('degraded gate, feature gates and capacity', () => {
         () => app.http.post('/api/plugins/manage/install').set('X-CSRF-Token', app.csrf).set('Content-Type', 'application/octet-stream').send(Buffer.from('x')),
         () => app.post('/api/packages', { name: 'blocked' }),
         () => app.post('/api/system/services/httpd/stop'),
+        () => app.post('/api/system/stack/install', { profile: 'full' }),
+        () => app.put('/api/system/settings', { 'basic.contact_email': 'ops@example.com' }),
+        () => app.post('/api/support/chat/alice/messages', { body: 'SECRET-PROBE while unlicensed' }),
       ];
       for (const send of blocked) {
         const res = await send();
@@ -754,14 +761,25 @@ describe('degraded gate, feature gates and capacity', () => {
         ['/api/accounts/nobody/unsuspend', () => app.post('/api/accounts/nobody/unsuspend')],
         ['/api/license/checkin', () => app.post('/api/license/checkin')],
         ['/api/auth/password', () => app.post('/api/auth/password', { newPassword: 'short' })],
+        ['/api/system/setup/complete', () => app.post('/api/system/setup/complete', { skipped: true })],
       ];
       for (const [url, send] of allowed) {
         const res = await send();
         expect(res.status, url).not.toBe(423);
       }
-      expect(ctx.agent.calls.filter((c) => /^(user|fs|dns|web|mail|db|acct)\./.test(c.name))).toEqual([]);
-      // the audit middleware still records the refused mutation
+      // capability detection probes files through fs.stat at boot; no host work happened
+      expect(ctx.agent.calls.filter((c) => /^(user|fs|dns|web|mail|db|acct)\./.test(c.name) && c.name !== 'fs.stat')).toEqual([]);
+      // the audit middleware still records the refused mutation, without the text a 423'd request carried
       expect(auditRows(ctx, 'POST /api/accounts').at(-1).result).toBe('error:423');
+      const chat = auditRows(ctx, 'POST /api/support/chat/alice/messages').at(-1);
+      expect(chat.result).toBe('error:423');
+      expect(JSON.parse(chat.args_redacted)).toEqual({ body: '[redacted]' });
+      // the first-run wizard can be finished (or skipped) on an enforced install that has no license yet
+      const setup = await app.post('/api/system/setup/complete', { skipped: true });
+      expect(setup.status).toBe(200);
+      expect(setup.body.data).toEqual({ completed: true, skipped: true });
+      expect(ctx.settings.get('setup.completed')).toBe(true);
+      expect((await app.http.get('/api/system/stack')).status).toBe(200);
     } finally { await app.close(); }
   });
 

@@ -39,6 +39,8 @@ export const TLS_PRESETS = {
 
 export const SSL_SERVICES = ['exim', 'dovecot', 'apache', 'ftp', 'panel'];
 const BUNDLE_ROOT = '/etc/ssl/whm';
+// Document root of the server hostname's own landing vhost (Service Configuration).
+const LANDING_DOCROOT = '/var/www/whm-default';
 const AUTOSSL_DEFAULTS = { provider: 'disabled', email: '', method: 'webroot', staging: false, key_type: 'ecdsa', renew_days: 30, include_www: true, replace_custom: false };
 const INSTALL_STATE = { 0: 'stored', 1: 'installed', 2: 'pending' };
 
@@ -586,16 +588,22 @@ export function createSslService(ctx) {
     },
   };
 
+  // The server's own hostname is never an account domain, yet root issues its
+  // certificate the same way (the landing vhost takes it through the web hook).
+  const serverHostname = () => String(settings.get('basic.hostname', '') || '').trim().toLowerCase();
+  const isServerHostname = (domain) => { const name = serverHostname(); return name.includes('.') && String(domain || '').toLowerCase() === name; };
+  const serverRow = (domain) => ({ domain, account: null, accountId: null, type: 'server', suspended: false, docroot: ctx.web?.landingDocroot || LANDING_DOCROOT, certificate: shape(stmts.installedByDomain.get(domain)) });
+
   async function issueFor(domain, user, req, { force = false } = {}) {
     const s = autossl.settings();
     if (s.provider === 'disabled') throw badRequest('AutoSSL is disabled');
     const detect = await autossl.detect();
     if (!detect.providers.includes(s.provider)) throw new CapabilityError('acme', `${s.provider} is not installed on this server`);
-    resolveDomain(domain, user);
-    const d = domains(user).find((x) => x.domain === domain);
+    const target = resolveDomain(domain, user);
+    const d = domains(user).find((x) => x.domain === domain) || (target.type === 'server' && isServerHostname(domain) ? serverRow(domain) : null);
     if (!d) throw notFound(`Domain "${domain}"`);
     const result = await autossl.issue(d, s, { force, req });
-    req?.audit?.({ action: 'ssl.autossl.issue', target: domain, args: { provider: s.provider, renewed: result.renewed } });
+    req?.audit?.({ action: 'ssl.autossl.issue', target: domain, args: { provider: s.provider, renewed: result.renewed, ...(d.type === 'server' ? { hostname: true } : {}) } });
     return result;
   }
 

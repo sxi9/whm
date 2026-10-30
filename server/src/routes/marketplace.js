@@ -20,17 +20,19 @@ const revocationId = z.object({ id: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/) })
 
 // Root manages; resellers browse (WHM Marketplace is read-only for them) and
 // see the browse view only: no pinned keys, feed health or plugin inventory.
+// The hub origins reach the panel owner (users.superadmin) alone: everyone
+// else gets the generic hub label and error texts that name no origin.
 export function marketplaceRoutes(ctx) {
   const r = Router();
   const m = () => ctx.marketplace;
   const wrap = (fn, status = 200) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(status).json(d?.meta ? d : { data: d })).catch(next);
-  const view = (req) => ({ full: isRoot(req.user) });
+  const view = (req) => ({ full: isRoot(req.user), superadmin: ctx.auth?.isSuperadmin?.(req.user) === true });
 
   r.get('/status', requireReseller, wrap((req) => m().status(view(req))));
   r.get('/catalog', requireReseller, validate({ query: catalogQuery }), wrap((req) => m().catalog({ ...req.query, featured: req.query.featured === 'true' ? true : undefined }, view(req))));
-  r.get('/categories', requireReseller, wrap(() => m().categories()));
+  r.get('/categories', requireReseller, wrap((req) => m().categories(view(req))));
   r.get('/plugins/:id', requireReseller, validate({ params: idParam }), wrap((req) => m().plugin(req.params.id, view(req))));
-  r.get('/plugins/:id/versions', requireReseller, validate({ params: idParam }), wrap((req) => m().versions(req.params.id)));
+  r.get('/plugins/:id/versions', requireReseller, validate({ params: idParam }), wrap((req) => m().versions(req.params.id, view(req))));
   r.get('/installs', requireRoot, wrap(() => m().installs()));
   r.get('/updates', requireRoot, wrap(() => m().updates()));
   r.post('/updates/check', requireRoot, wrap((req) => m().checkUpdates({ req })));

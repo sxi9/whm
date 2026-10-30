@@ -7,6 +7,7 @@ import { authenticator } from 'otplib';
 import { catalog } from '@whm/agent';
 import { bootstrap } from '../src/index.js';
 import { AgentError } from '../src/lib/agent-client.js';
+import { CAPABILITY_PATHS } from '../src/lib/capabilities.js';
 
 const ADMIN_PASSWORD = 'Test-Passw0rd!1';
 const RESELLER_PASSWORD = 'Reseller-Pass1!';
@@ -41,6 +42,7 @@ function createMockAgent() {
     names: () => agent.calls.map((c) => c.name),
     failOnce(name, err) { failures.set(name, err); },
     reset() { agent.calls.length = 0; failures.clear(); },
+    set(name, handler) { canned[name] = handler; },
     async op(name, args = {}) {
       agent.calls.push({ name, args });
       if (failures.has(name)) {
@@ -102,12 +104,31 @@ describe('bootstrap', () => {
     expect(ctx.db.prepare("SELECT username, role, must_change_password FROM users WHERE role = 'root'").get()).toEqual({ username: 'root', role: 'root', must_change_password: 0 });
     expect(fs.existsSync(path.join(tmp, 'master.key'))).toBe(true);
     expect(fs.existsSync(path.join(tmp, 'initial-admin-password.txt'))).toBe(false);
-    // Detection asks for binaries in chunks of at most 100 names, then lists units once.
-    expect([...new Set(agent.names())]).toEqual(['sys.binaries', 'svc.list_units']);
+    // Detection asks for binaries in chunks of at most 100 names, probes the
+    // files of program-less capabilities, then lists units once.
+    expect([...new Set(agent.names())]).toEqual(['sys.binaries', 'fs.stat', 'svc.list_units']);
     expect(agent.names().at(-1)).toBe('svc.list_units');
     expect(agent.calls.filter((c) => c.name === 'sys.binaries').every((c) => c.args.names.length >= 1 && c.args.names.length <= 100)).toBe(true);
+    expect(agent.calls.filter((c) => c.name === 'fs.stat').map((c) => c.args.path)).toEqual(CAPABILITY_PATHS.modsecurity);
     expect(ctx.capabilities.has('quota')).toBe(false);
+    expect(ctx.capabilities.has('modsecurity')).toBe(false);
     expect(ctx.capabilities.unitFor('httpd')).toBeNull();
+  });
+
+  it('detects ModSecurity by the files its package installs, since the module ships no program', async () => {
+    expect(ctx.capabilities.snapshot().capabilities.modsecurity).toEqual({ installed: false, binaries: {}, paths: Object.fromEntries(CAPABILITY_PATHS.modsecurity.map((p) => [p, false])) });
+    agent.set('fs.stat', ({ path: p }) => ({ path: p, exists: p === '/etc/httpd/conf.d/mod_security.conf', isDirectory: false }));
+    await ctx.capabilities.refresh();
+    expect(ctx.capabilities.has('modsecurity')).toBe(true);
+    expect(ctx.capabilities.snapshot().capabilities.modsecurity.paths['/etc/httpd/conf.d/mod_security.conf']).toBe(true);
+    expect(ctx.capabilities.snapshot().paths['/etc/modsecurity/modsecurity.conf']).toBe(false);
+    // a probe the agent refuses counts as absent and never fails detection as a whole
+    agent.set('fs.stat', () => { throw Object.assign(new Error('nope'), { agentError: true, code: 'path_not_allowed' }); });
+    await expect(ctx.capabilities.refresh()).resolves.toBeTruthy();
+    expect(ctx.capabilities.has('modsecurity')).toBe(false);
+    expect(ctx.capabilities.has('systemd')).toBe(false);
+    agent.set('fs.stat', undefined);
+    await ctx.capabilities.refresh();
   });
 
   it('detects capabilities within the agent schema limit however many categories register', async () => {
@@ -470,6 +491,22 @@ describe('accounts', () => {
     expect(res.body.data).toEqual({ username: 'web01' });
     expect(agent.calls).toEqual([{ name: 'user.set_password', args: { username: 'web01', password: 'New-Secret-456' } }]);
     expect((await mutate(root, 'post', '/api/accounts/web01/password', { password: 'short' }, csrf)).status).toBe(422);
+  });
+
+  it('refuses the server hostname (and www.<hostname>) as an account domain before any host work', async () => {
+    const previous = ctx.settings.get('basic.hostname');
+    ctx.settings.set('basic.hostname', 'panel.example.com');
+    try {
+      agent.reset();
+      for (const domain of ['panel.example.com', 'www.panel.example.com', 'PANEL.Example.com']) {
+        const res = await mutate(root, 'post', '/api/accounts', { username: 'hostacct', domain, password: ACCOUNT_PASSWORD }, csrf);
+        expect(res.status, domain).toBe(409);
+        expect(res.body.error.message).toMatch(/server hostname/);
+      }
+      expect(agent.names()).toEqual([]);
+      expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM accounts WHERE username = 'hostacct'").get().n).toBe(0);
+      expect(ctx.db.prepare("SELECT COUNT(*) AS n FROM account_domains WHERE domain LIKE '%panel.example.com'").get().n).toBe(0);
+    } finally { ctx.settings.set('basic.hostname', previous); }
   });
 
   it('lists domains for an account', async () => {

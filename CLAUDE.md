@@ -37,6 +37,10 @@ verified developers, and bundled plugins are part of the product (deferred to Ph
 | 2026-10-27 | **Panel identity:** `ctx.license` owns the hub URL (token `iss`, bootstrap `WHM_LICENSE_HUB_URL`) and the license key (License tab only); the Market Provider `whm-hub` row is just an enable switch (`hub_mismatch` if its origin differs). Enforcement gates (degraded 423, feature gates, capacity) run only when `config.licenseEnforce` is true (default true under `NODE_ENV=production`, false in dev/tests). |
 | 2026-10-27 | **Plugins distribution:** the three monitoring/security/WordPress plugins **and the automated-backup plugin** are bundled (`plugins/bundled/*`, installed at boot, exempt from `plugins.require_signature`); the sample plugin `net.whm.sample-notes` is marketplace-distributed under the vendor developer `net.whm`. Marketplace installs go through the host's additive `install(input, { policy: { requireSigned, signers, activate: false, expectedId } })`; consent is compared against the installed, signature-verified manifest. |
 | 2026-10-27 | `hub/ui` **copies** the panel's component kit (`hub/ui/src/components/SYNC.md` records the source commit) instead of importing across packages. Hub tests are `node --test`; hub/ui and the panel use vitest. |
+| 2026-10-29 | **Product naming:** the hosted-account side is **HST Panel** by Hostingsignal; the admin side keeps the WHM name; `client/src/brand.js` is the source of the names (the sidebar category "cPanel" is labelled *HST Panel*). Slugs, keys, routes, settings and file names keep the `cpanel` identifiers (nav.js explicit-slug entries); branding defaults ship as migrations (`029c`, `011b`). |
+| 2026-10-29 | **Super admin:** `users.superadmin` (migration `001e`) is set only by `whm-cli superadmin <user>` after the setup password verifies against `/etc/whm/superadmin.key` (bcrypt, `0600 root:root`, written by `superadmin --init` / the installer; the panel process never opens it). Only that user sees the license hub, key, activations and hub answers (License tab, marketplace client, Market Provider Manager, audit text); other roots get `403 superadmin_required` and a *managed by the panel owner* card. Panel hub default `https://licserver.hostingsignal.in` (`config.licenseHubUrl`, installer prompt default); hub portal admins must enrol TOTP (`hub.require_totp_for_admins`, default true). |
+| 2026-10-29 | **HTTPS by default:** `panel.force_https` (2086 → 301 to 2087; `WHM_FORCE_HTTPS=false` / `forceHttps` pins it off) and `web.force_https` (every vhost with a certificate redirects HTTP → HTTPS, `<IfModule mod_rewrite.c>`, ACME path exempt). The panel's TLS pair is `/etc/whm/tls/cert.pem` + `key.pem` (`whm.conf.example`, `install.sh`, agent `ssl.service_cert.install` for `panel`, `watchTlsFiles` reloads it); a hostname change publishes A/AAAA/www/MX, renders the branded landing vhost (`ctx.web.ensureHostnameVhost`, hostname never a hosted domain: `ctx.web.isServerName`) and issues the hostname certificate for panel/Exim/Dovecot/FTP with a daily renewal schedule. |
+| 2026-10-30 | **Stack installs** come from one catalog, `server/src/lib/stack-catalog.js`: the setup wizard, Service Manager › Server stack, `POST /api/system/stack/install` (`ctx.stack`) and `scripts/install.sh --stack full|web|none` / `--components …` all read it; never hard-code package lists elsewhere. |
 
 ## Non-negotiable conventions
 
@@ -183,6 +187,12 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Current state (update every push)
 
+- **2026-10-30: platform-fixes integration round.** Unit I4 landed the agent op `web.module.enable` (`agent/src/ops/web.js`,
+  tests in `agent/test/web.test.js`), `install.sh --stack`/`--components` + the HST Panel banner, the panel TLS pair at
+  `/etc/whm/tls/{cert,key}.pem` (legacy `/etc/whm/ssl/panel.*` migrated on `--upgrade`), `WHM_FORCE_HTTPS` in the deploy
+  templates, and the docs for every round-1 unit (MANUAL A/B, INSTALL, README, contracts §34, CHECKLIST issue table).
+  Open after this unit (see the integrator notes): the agent's `panel` certificate branch must leave `key.pem` readable
+  by the panel's service group; `whm-cli install-stack` is not built (the installer flags cover the CLI ask).
 - **2026-10-29 (session `claude/pensive-curie-9r0rcx`, user AFK — "take all decisions, keep working"):** the user's
   priorities are (1) application hosting, (2) the 26-item live-server issue list in the session upload, (3) a full
   audit, then tests. Done so far: Phase-6 verifier run (49 agents) → 11 confirmed findings fixed (`50d0f14`: dump

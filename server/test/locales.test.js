@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import fs from 'node:fs';
 import request from 'supertest';
 import { createTestApp, createMockAgent } from './support/app.js';
 import { buildLocaleXml, parseLocaleXml, decodeEntities, escapeXml, MAX_XML_BYTES } from '../src/services/locales-xml.js';
@@ -135,6 +136,30 @@ describe('module registration, seeds and RBAC', () => {
     expect(active.body.data).toMatchObject({ code: 'en', default: 'en', enabled: ['en'] });
     expect(active.body.data.strings['common.home']).toBe('Home');
     expect((await request(app.ctx.app).get('/api/locales/active')).status).toBe(401);
+  });
+
+  it('seeded locales translate the hosted-account category as HST Panel (011b) and keep an operator\'s own translation', async () => {
+    for (const code of ['es', 'de', 'fr', 'pt_br']) {
+      const res = await get(`/api/locales/${code}`);
+      expect(res.status, code).toBe(200);
+      expect(res.body.data.strings['category.cpanel'], code).toBe('HST Panel');
+      expect(JSON.stringify(res.body.data.strings), code).not.toContain('cPanel');
+    }
+    expect(app.ctx.locales.t('category.cpanel', null, 'de')).toBe('HST Panel');
+    expect(app.ctx.locales.t('common.home', null, 'es')).toBe('Inicio');
+    const sql = fs.readFileSync(new URL('../src/db/migrations/011b_locales-branding.sql', import.meta.url), 'utf8');
+    const read = (code) => JSON.parse(app.ctx.db.prepare('SELECT strings_json FROM locales WHERE code = ?').get(code).strings_json);
+    const setCategory = (code, value) => app.ctx.db.prepare(`UPDATE locales SET strings_json = json_set(strings_json, '$."category.cpanel"', ?) WHERE code = ?`).run(value, code);
+    const before = read('de');
+    app.ctx.db.exec(sql);
+    expect(read('de')).toEqual(before);
+    setCategory('de', 'Kundenpanel');
+    app.ctx.db.exec(sql);
+    expect(read('de')['category.cpanel']).toBe('Kundenpanel');
+    setCategory('de', 'cPanel');
+    app.ctx.db.exec(sql);
+    expect(read('de')).toEqual(before);
+    expect(Object.keys(read('de'))).toEqual(Object.keys(before));
   });
 });
 

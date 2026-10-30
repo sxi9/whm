@@ -13,9 +13,11 @@ const hostnameBody = z.object({
   ip: fields.ipv4.optional(),
   ipv6: fields.ipv6.optional(),
   updateHosts: z.boolean().default(true),
-  addDnsRecord: z.boolean().default(false),
+  addDnsRecord: z.boolean().default(true),
   reissueServiceCerts: z.boolean().default(true),
+  issueCertificate: z.boolean().default(true),
 }).strict();
+const certificateBody = z.object({ force: z.boolean().default(true) }).strict();
 const previewBody = z.object({ hostname: hostnameInput, ip: fields.ipv4.optional(), ipv6: fields.ipv6.optional() }).strict();
 const defaultsBody = z.object({ updateHosts: z.boolean().optional(), addDnsRecord: z.boolean().optional() }).strict().refine((b) => b.updateHosts != null || b.addDnsRecord != null, 'Nothing to change');
 const nameservers = z.array(fields.ip).min(1, 'At least one nameserver is required').max(MAX_RESOLVERS, `At most ${MAX_RESOLVERS} nameservers (the resolver library ignores the rest)`);
@@ -42,6 +44,7 @@ export async function register(ctx) {
   r.get('/hostname', requireRoot, wrap(() => s.hostnameStatus()));
   r.post('/hostname/preview', requireRoot, validate({ body: previewBody }), wrap((req) => s.previewHostname(req.body)));
   r.post('/hostname', requireRoot, validate({ body: hostnameBody }), wrap((req) => s.setHostname(req.body, req)));
+  r.post('/hostname/certificate', requireRoot, validate({ body: certificateBody }), wrap((req) => s.reissueHostnameCertificate(req.body, req)));
   r.put('/hostname/defaults', requireRoot, validate({ body: defaultsBody }), wrap((req) => s.setHostnameDefaults(req.body, req)));
 
   // Resolver Configuration

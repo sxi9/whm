@@ -428,6 +428,20 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
     await del('/parked/bob-alias.com').expect(404);
   });
 
+  it('refuses to park the server hostname (or www.<hostname>) before any zone or web work', async () => {
+    const previous = app.ctx.settings.get('basic.hostname');
+    app.ctx.settings.set('basic.hostname', 'panel.example.com');
+    try {
+      for (const domain of ['panel.example.com', 'www.panel.example.com']) {
+        const res = await post('/parked', { domain, account: 'bob' }).expect(409);
+        expect(res.body.error.message).toMatch(/server hostname/);
+      }
+      expect(app.agent.callsTo('dns.zone.write')).toHaveLength(0);
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM account_domains WHERE domain LIKE '%panel.example.com'").get().n).toBe(0);
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM dns_zones WHERE domain LIKE '%panel.example.com'").get().n).toBe(0);
+    } finally { app.ctx.settings.set('basic.hostname', previous); }
+  });
+
   it('parking leaves no row behind when the zone cannot be created, and treats a missing web server as pending', async () => {
     app.agent.set('dns.checkzone', () => ({ ok: false, output: 'bad zone' }));
     await post('/parked', { domain: 'bob-broken.com', account: 'bob' }).expect(422);

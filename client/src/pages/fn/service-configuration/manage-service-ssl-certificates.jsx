@@ -39,7 +39,7 @@ export default function ManageServiceSslCertificates({ fn }) {
       {loading && !data && <Loading />}
       {data && (
         <>
-          <DaemonNotice installed={data.openssl} message="openssl is not installed on this server; certificates cannot be inspected or generated until the openssl package is installed." onRetry={refetch} />
+          <DaemonNotice capability="ssl" installed={data.openssl} message="openssl is not installed on this server; certificates cannot be inspected or generated until the openssl package is installed." onRetry={refetch} />
           <Card title="Service certificates" subtitle={`Server hostname: ${data.hostname}. Stored under /etc/ssl/whm/service/<service>/ and wired into each daemon's configuration.`} actions={<Field label="Self-signed validity (days)"><NumberInput value={days} onChange={(v) => setDays(v || 365)} min={1} max={3650} nullable={false} /></Field>}>
             <div className="table-wrap">
               <table>
@@ -66,7 +66,7 @@ export default function ManageServiceSslCertificates({ fn }) {
                 </tbody>
               </table>
             </div>
-            <p className="muted" style={{ marginTop: 10 }}>Per-domain website certificates are managed under <Link to="/ssl-tls/manage-ssl-hosts">Manage SSL Hosts</Link>{data.sslCategory ? '' : ' (SSL/TLS category not loaded; installs go straight to the agent)'}. The panel certificate needs WHM_TLS_CERT/WHM_TLS_KEY pointed at /etc/whm/tls and a panel restart.</p>
+            <p className="muted" style={{ marginTop: 10 }}>Per-domain website certificates are managed under <Link to="/ssl-tls/manage-ssl-hosts">Manage SSL Hosts</Link>{data.sslCategory ? '' : ' (SSL/TLS category not loaded; installs go straight to the agent)'}. The panel certificate is written to /etc/whm/tls/cert.pem and key.pem, the pair the listener serves and reloads in place (whm.conf tlsCert/tlsKey or WHM_TLS_CERT/WHM_TLS_KEY); a panel pointed elsewhere needs those settings changed and a restart.</p>
           </Card>
           <Modal open={Boolean(editing)} title={editing ? `Install certificate for ${editing.label}` : ''} onClose={() => setEditing(null)} size="lg" footer={<><Button onClick={() => setEditing(null)}>Cancel</Button><Button variant="primary" loading={busy === 'install'} disabled={!pems.certPem.trim() || !pems.keyPem.trim()} onClick={install}>Install</Button></>}>
             <ErrorBanner error={formError} />
