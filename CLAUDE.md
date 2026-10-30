@@ -193,60 +193,17 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   templates, and the docs for every round-1 unit (MANUAL A/B, INSTALL, README, contracts §34, CHECKLIST issue table).
   Open after this unit (see the integrator notes): the agent's `panel` certificate branch must leave `key.pem` readable
   by the panel's service group; `whm-cli install-stack` is not built (the installer flags cover the CLI ask).
-- **2026-10-29 (session `claude/pensive-curie-9r0rcx`, user AFK — "take all decisions, keep working"):** the user's
-  priorities are (1) application hosting, (2) the 26-item live-server issue list in the session upload, (3) a full
-  audit, then tests. Done so far: Phase-6 verifier run (49 agents) → 11 confirmed findings fixed (`50d0f14`: dump
-  screen sql_mode trap + MariaDB sandbox header, reseller job list in SQL, `totp_guard` persistence via migration
-  001d, advisory unknown ranges, EA4/Remi ids, INI-editor picker) + a fresh-clone gate fix (`/tmp/whm` in
-  `pkg.test.js`, 20 s 2FA test timeout) + SMTP REJECT rule `-p tcp` (iptables-nft), host-aware time zones
-  (`sys.time.zones`, ICU legacy ids mapped), package-index page tab switch; **category 31 Application Manager
-  landed** (`81417ea`, design `docs/design/application-manager.md`, 3 functions → 215, `ctx.apps`, agent family
-  `app.*`, migration 033, two review lenses + fix round; gate server 1201 / agent 547 / client 74 / hub 184 /
-  hub-ui 105, builds, boot, Playwright 216 links). **Running:** platform-fixes workflow (`wf_d0005cdd-38a`, script in
-  the session scratchpad `platform-fixes.workflow.js`: installer profiles + install-from-panel + setup wizard,
-  HTTPS/hostname/branded pages, super admin + hidden hub + hub TOTP, external-auth presets, Cloudflare DNS,
-  account manager + chat, terminal latency, quota page, HST Panel rename). Next: full audit bug-hunt
-  (`full-audit.workflow.js`), final gate, screenshots, HANDOFF rewrite (correction notes in the scratchpad
-  `handoff-notes.md`: op count, 9-step live flow, screenshot commit `5f61846`, deferred-item list).
-
-- **2026-10-25:** Blueprint complete and pushed. **Phase 0 foundation works end to end**
-  (`npm install` → `node server/src/index.js` boots, migrates, seeds root; login with forced
-  password change; CSRF; RBAC; status/services via real agent ops; packages CRUD; account
-  create provisions a real Linux user + home tree, suspend locks it, terminate removes it;
-  audit log with redaction; jobs + scheduler + SSE wired). Agent catalog: 40 ops across
-  `sys`/`svc`/`user`/`fs`. `plugins/sdk/` reference code committed (56 tests pass).
-  License-server design saved under `docs/design/`. Client workspace has only a manifest.
-- **2026-10-25 (later): Phase 1 shell is live.** `client/` React SPA: `nav.js` (30
-  categories / 212 functions, single source of truth for sidebar, Tools grid, router and
-  search), WHM-style layout, dashboard, login/2FA/forced password, audit log, shared
-  components, and 29 real pages (accounts, packages + feature manager, server status,
-  service manager, restart services ×8, process manager, disk usage, basic setup, tweak
-  settings, cron jobs, root password, 2FA). Unimplemented functions render
-  `pages/FunctionPage.jsx` with their phase. `npm run build --workspace client` then
-  `WHM_SERVE_CLIENT=true` serves it from the API. Playwright check script lives in the
-  session scratchpad (`ui-check.cjs`): login → create account via form → pages → search.
-- **Next:** finish vitest suites, then fan out P2 categories (Account Information/Functions
-  remainder, DNS, Database Services, Service Configuration, Server Status remainder) with
-  real `web`/`dns`/`db`/`mail` agent ops; add pages to `client/src/pages/registry.js`.
-- **2026-10-26: Phase 2 wave 1 landed** (`79097b1`): Security Center, DNS Functions, Database
-  Services, IP Functions, SSL/TLS, Email, Software, Service Configuration, Development, Locales —
-  106/109 functions done, 222 new agent ops (267 total), migrations 002–012, 107 pages; suites
-  server 426 / agent 233 / client 5. The **fix round** (03:12) closed every reviewer finding
-  and integration seam per `docs/design/integration-contracts.md`; suites now server 479 /
-  agent 260 / client 5. **Wave 2 launched 03:20** (12 categories; same build workflow, args
-  `{wave: 2}`). Core follow-ups done by hand: split-mode socket timeout now 1 h with a per-call
-  override, `/var/cache/nginx` allowed root.
-- **2026-10-26 19:00: Phase 2 wave 2 landed** — 12 categories, 67 functions, 49 new agent ops (316
-  total), migrations 012–023, 12 services on ctx (names in the contract list above); suites server
-  807 / agent 381 / client 7, build + boot + e2e green. Ten reviewer findings stayed open after the
-  in-wave fix rounds (Rearrange lock, domlog cap, replaceIp for multi-account IP changes, backup
-  timeouts/domains/grants, transfers device nodes/removeSource/reseller DB move) and were closed by the
-  **wave-2 fix round** (20:40, `whm-fix-wave` `args {wave: 2}`, 27 runs, 0 open, final check pass) together with
-  the critic's integration gaps. Core follow-ups done afterwards: the shell hides the Server Profile's
-  `hiddenCategories` (`/api/auth/me` carries `profile`; `useMergedCategories`/`useSearch` filter by slug), DNS
-  Functions honours `ensureZoneForDomain({ nameservers })`, dead LEGACY registry rows removed. Core follow-ups done
-  by hand: dead `sys.resolvers.set` op removed (networking-setup owns `resolver.*`), contracts doc
-  §11–21, two load-sensitive tests made robust. Next: plugin host (core), then wave 3.
+- **2026-10-30 05:10 (session `claude/pensive-curie-9r0rcx`, owner asks of 2026-10-29: app hosting → issue list → full
+  audit):** Phase-6 verifier run → 11 findings fixed (`50d0f14`); **category 31 Application Manager** (`81417ea`);
+  **owner's 26-item issue list round 1** (`bf181a0`: installer profiles + install-from-panel + setup wizard, HTTPS by
+  default + hostname DNS/certificate + branded landing, super admin + hidden hub + hub TOTP, external-auth presets,
+  Cloudflare DNS, account manager + Support › Account Conversations (216 functions), terminal latency, quota page,
+  HST Panel rename; 193 + 7 agents, 55 findings verified, integration round); deferred items closed (`533c0b9`: 2FA
+  disable re-verification, hub `ui_dist`; lockfile; test timeout); screenshots refreshed (`8da0d63`, 216/216 live);
+  `whm-cli stack-status / install-stack`. Gate at `bf181a0`: server 1309 / agent 573 / client 131 / hub 197 / hub-ui
+  105 / SDK + plugins, builds, boot, Playwright. **Full audit bug-hunt** `wf_5bd01820-f02` was running at the end
+  (fixes land as `fix(audit): …` commits). Open: zod 4, react-router 7, restricted-user `backup.db.import`, issue-list
+  round 2 (`HANDOFF.md` §4).
 - **2026-10-27 09:00: session ended during Phase 6 — continue from `HANDOFF.md` §4.** Phase 5 fix round
   landed (`e49e500`); the live hub + panel flow passed 11/11 with no code fix (`e2e/live-hub-flow.sh`);
   `docs/INSTALL.md` + `docs/MANUAL.md`/`MANUAL-partB.md` written and accuracy-reviewed (`029510f`); the
@@ -328,20 +285,14 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Resume notes
 
-- Working branch: `claude/trusting-cori-ifp7wy` (push with `git push -u origin <branch>`).
-- A multi-agent design run for the deferred Phase 5 items was paused:
-  run id `wf_7104d0c5-441`, script
-  `/root/.claude/projects/-home-user-whm/0c92c5a2-840d-518f-8036-382a362911d8/workflows/scripts/whm-license-marketplace-plugins-wf_7104d0c5-441.js`
-  (only exists on the original session's machine). Its finished outputs are already in
-  the repo (`docs/design/license-server.md`, `plugins/sdk/`). When resuming Phase 5, write
-  `plugins/SDK.md` against the committed `plugins/sdk/` code and design the marketplace
-  to match its packaging/signing constants — do not regenerate the SDK code.
-- **No run is in progress.** The ended session's keep-alive Routine `trig_015b4oBVtePikCYJAcFwKkTK` is
-  disabled; its workflow scripts are not needed — the remaining work is ordinary engineering listed in
-  `HANDOFF.md` §4 (verify the Phase-6 fixes with the full gate, close the deferred items, tick P6).
-  If a future session wants multi-agent runs again: builders per category/unit, two adversarial
-  reviewers for root-level or signing code (one otherwise), one fix round, then a full gate — the
-  pattern that produced every phase here.
+- Working branch: `claude/pensive-curie-9r0rcx` (push with `git push -u origin <branch>`); the repository's
+  default branch is still `claude/trusting-cori-ifp7wy`, which this branch continues — open a PR when the owner wants it merged.
+- **No run survives the container.** The 2026-10-29/30 session drove four multi-agent runs (Application Manager
+  build, platform fixes round 1, integration round, full audit) from scripts in its scratchpad; their outputs are
+  in the git log. The pattern that works here: builders per unit with disjoint file lists, two adversarial
+  reviewers for root-level/auth/signing code (one otherwise), three refuters per finding, one fix round, an
+  integration round for cross-unit leftovers, then the full gate (`npm test`, builds, boot, `e2e/ui-check.cjs`).
+  Remaining work is listed in `HANDOFF.md` §4.
 - This dev container has 4 CPUs → at most 2 concurrent subagents; plan fan-outs accordingly.
 - The container has `systemctl` and `useradd` but no Apache/BIND/Exim/MySQL daemons; the
   capability layer must make every page degrade gracefully here and work fully on a

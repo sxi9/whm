@@ -1,40 +1,44 @@
-# HANDOFF — pick up the WHM build here
+# HANDOFF — pick up the HST Panel / WHM build here
 
 For any AI or engineer taking over. Everything stated here is on the branch
-`claude/trusting-cori-ifp7wy` of `github.com/sxi9/whm`; this file is updated at every milestone
-together with `CHECKLIST.md` (tracker) and `CLAUDE.md` (conventions + memory). Read those two next.
+`claude/pensive-curie-9r0rcx` of `github.com/sxi9/whm` (the repository's default branch is still
+`claude/trusting-cori-ifp7wy`, which this branch continues — open a pull request from this branch when
+the owner wants it merged). This file is updated at every milestone together with `CHECKLIST.md`
+(tracker) and `CLAUDE.md` (conventions + memory). Read those two next.
 
-**Last updated:** 2026-10-27 09:00 UTC · the session that built this has ENDED here · checklist 234 done / 1 partial / 1 open
+**Last updated:** 2026-10-30 05:10 UTC · checklist 239 done / 1 partial / 0 open · a full audit bug-hunt
+(`wf_5bd01820-f02`) was running when this was written — see §4.
 
 ## 1. What this is
 
 A production-grade WHM (cPanel WebHost Manager) clone that administers a real Linux server —
-**30 sidebar categories, all 212 WHM functions built, reviewed and fixed** — plus the commercial
-layer the owner asked for: a **license server** for reselling the panel, a **plugin marketplace**
-where anyone registers as a developer and must be **verified in the vendor backend** before
-publishing, a plugin SDK with docs, a **sample plugin**, and an **automated-backup plugin**.
+**31 sidebar categories, 216 functions**: the 212 WHM functions plus our own **Application Manager**
+category (Node.js, Python and built-frontend apps) and **Support › Account Conversations** — plus the
+commercial layer the owner asked for: a **license server** for reselling the panel, a **plugin marketplace**
+with verified developers, a plugin SDK with docs, a sample plugin and an automated-backup plugin.
+Since 2026-10-29 the hosted-account side is branded **HST Panel by Hostingsignal** (`client/src/brand.js`;
+the admin side keeps the WHM name; slugs, keys, settings and file names keep the `cpanel` identifiers).
 
 Stack: Node 22 + Express 4 + better-sqlite3 (panel) · React 18 + Vite (UI) · root agent daemon
-(`agent/`) over a Unix socket with an allowlisted op catalog (316 ops) · hub (`hub/`) =
-license + marketplace service with its own React portals (`hub/ui`).
+(`agent/`) over a Unix socket with an allowlisted op catalog (369 ops) · hub (`hub/`) = license +
+marketplace service with its own React portals (`hub/ui`).
 
 ## 2. State of play
 
 | Area | State | Proof |
 |---|---|---|
-| Phase 0–4 (foundation, shell, all hosting categories) | done | `CHECKLIST.md` functions section; suites green |
-| Phase 2 waves 1–3 + fix rounds (all 212 functions) | done, landed `6c693e4` | server 1081 / agent 457 / client 30 at that point |
-| Core plugin host (`server/src/services/plugins.js`) | done, `16286ee` | 31 host tests + 7 tar tests |
-| Phase 5 build (hub/license, hub/marketplace, hub/ui, panel license + marketplace clients, SDK.md, sample + automated-backup plugins) | done, landed `76483ef` | green gate: server 1135 / agent 462 / client 48 / hub 177 / hub-ui 97 + SDK + 5 plugin suites; both builds; boot; Playwright |
-| Phase 5 docs/deploy (BLUEPRINT §16–18, `deploy/whm-hub.service`, `deploy/hub.conf.example`, `scripts/install.sh --with-hub`, README hub section) | done, `0be6f9c` | `bash -n`, hub `--check-config` |
-| Phase 5 fix round (8 carried findings) | done, landed `e49e500` | gate: server 1135 / agent 462 / client 48 / hub 181 / hub-ui 105 + SDK + plugins |
-| Live hub + panel end-to-end flow (`e2e/live-hub-flow.sh`), Phase-5 flow screenshots | done 08:10 — 11/11 PASS, no code fix needed | reviewer re-run green; screenshots `974cb94` |
-| Install guide + user manual (`docs/INSTALL.md`, `docs/MANUAL.md` + `docs/MANUAL-partB.md`) | done 08:35 — accuracy-reviewed, 10 findings fixed, all 212 functions present once | linked from README |
-| **Phase 6 hardening** | three audits done, fixes landed `b01bd30`; full gate green 09:05; **the verifier (per-fix review) was stopped before it ran** — see §4 | gate table in §4 |
+| Phases 0–5 (foundation, shell, all 212 WHM functions, plugin host, hub, docs, screenshots) | done (see the 27 Oct history in `CHECKLIST.md`) | suites green at each milestone |
+| Phase 6 hardening | done: three audits (27 Oct) + the independent verifier run (29 Oct, 49 agents) → 11 confirmed findings fixed `50d0f14` (dump screen sql_mode trap + MariaDB sandbox header, reseller job list in SQL, `totp_guard` persistence, advisory unknown ranges, EasyApache/Remi ids, INI-editor picker, audit empty-body test) | `agent/test/hardening.test.js`, `server/test/{jobs-ownership,web-hardening,security-center}.test.js` |
+| **Category 31 — Application Manager** (owner ask) | done `81417ea`: design `docs/design/application-manager.md`; agent family `app.*` (12 ops), `ctx.apps`, migration 033, 3 pages, 15 framework presets; two review lenses + fix round (21 findings) | `agent/test/app.test.js` 43, `server/test/application-manager.test.js` 37, `client/test/application-manager.test.jsx` 22 |
+| **Owner's 26-item issue list, round 1** (`CHECKLIST.md` › *Owner's issue list*) | done `bf181a0`: 9 units, 13 adversarial reviews (55 findings, 3 refuters each), fix round, integration round `wf_52f47b76-660` (regression review, 3 findings fixed) | gate below |
+| Deferred items from the 27 Oct handoff | closed: root `npm install` lockfile links hub workspaces; web-hardening timeout; hub `ui_dist` (`uiDistDir(config)`); 2FA disable re-verifies code/password. **Open:** zod 3 → 4, react-router-dom 6 → 7, `backup.db.import` as a restricted temp user (its dump screen now matches `transfer.mysql.import`) | §4 |
+| Screenshots | refreshed `8da0d63` from the integrated tree: 216/216 pages live + 22 flow shots (setup wizard, Application Manager, HST Panel labels) | `docs/screenshots/` |
 
-Screenshots of every page (labelled, all 212 live) plus 17 flow shots incl. the Phase-5 pages are under
-`docs/screenshots/` (last refresh `974cb94`, taken from a panel with a live trial license and an
-installed marketplace plugin).
+**Final gate (2026-10-30 04:49 UTC, `bf181a0`):** server 1309 (49 files) · agent 573 (32 files) · client 131 (18 files) ·
+hub 197 (node --test) · hub/ui 105 · plugins/sdk 73 · sample plugin 13 · 4 bundled plugins · `vite build` client +
+hub/ui · monolithic boot · `e2e/ui-check.cjs` (login → setup wizard → account → pages → 216 sidebar links, no
+console/5xx errors). The 2FA/ui_dist change afterwards re-ran `api`, `auth-policy`, `web-hardening`, the client
+suite and build green.
 
 ## 3. How to run and verify (from a fresh clone)
 
@@ -44,130 +48,107 @@ cp .env.example .env                          # dev: monolithic mode, ./data, po
 npm run build                                 # client + hub/ui
 WHM_DATA_DIR=./data WHM_PORT=2086 WHM_SERVE_CLIENT=true node server/src/index.js
 #   first boot seeds root; password from WHM_ADMIN_PASSWORD or $WHM_DATA_DIR/initial-admin-password.txt
+#   first root login opens the HST Panel setup wizard (/setup); "Skip for now" completes it
 npm test                                      # every workspace + plugins/sdk + sample plugin + bundled plugins
-BASE=http://127.0.0.1:2086 PASSWORD='<root pw>' node e2e/ui-check.cjs        # Playwright flow
-BASE=http://127.0.0.1:2086 PASSWORD='<root pw>' bash e2e/screenshots.sh      # all 212 pages + galleries
+BASE=http://127.0.0.1:2086 PASSWORD='<root pw>' node e2e/ui-check.cjs        # Playwright flow (skips the wizard itself)
+BASE=http://127.0.0.1:2086 PASSWORD='<root pw>' bash e2e/screenshots.sh      # every page + galleries, label bars
 ```
-Hub in dev: `node hub/scripts/gen-key.js --master|--hmac|--license|--plugin` against a temp
-config, then `node hub/src/index.js` (config via `WHM_HUB_CONFIG=<file>`; `--check-config` boots
-once and exits); `node hub/scripts/hub-cli.js create-admin <email>` / `issue <sku> <email>`.
-Panel → hub: `WHM_LICENSE_HUB_URL`, `WHM_LICENSE_KEYS_FILE` (pinned license public keys; the shipped
-`server/src/services/license-keys.json` holds placeholders), `WHM_LICENSE_ENFORCE` (default on only
-under `NODE_ENV=production`). Production install: `scripts/install.sh [--with-hub]`.
+The session scratchpad's `gate.sh` did exactly this on a random port (the dev container may have stray
+listeners on 2097–2099 from earlier agent runs; pick a free port).
+Hub in dev: `node hub/scripts/gen-key.js --master|--hmac|--license|--plugin` against a temp config, then
+`node hub/src/index.js` (`WHM_HUB_CONFIG=<file>`; `--check-config` boots once and exits);
+`node hub/scripts/hub-cli.js create-admin <email>` / `issue <sku> <email>`. Hub portal admins must enrol an
+authenticator app (`hub.require_totp_for_admins`, default true; `hub/test/support.js` relaxes it for tests).
+Panel → hub: `WHM_LICENSE_HUB_URL` (default `https://licserver.hostingsignal.in`), `WHM_LICENSE_KEYS_FILE`,
+`WHM_LICENSE_ENFORCE` (default on only under `NODE_ENV=production`). **Super admin:** only a root user flagged by
+`node scripts/whm-cli.js superadmin <user>` (after `superadmin --init` stored the setup password hash in
+`/etc/whm/superadmin.key`) sees the license hub, key and activations; `e2e/live-hub-flow.sh` step 2b does this.
+Production install: `scripts/install.sh [--with-hub] [--stack full|web|none]` (HST Panel banner, interactive
+stack menu, super admin setup password, TLS pair `/etc/whm/tls/{cert,key}.pem`); later `whm-cli stack-status`
+/ `whm-cli install-stack --profile full|web | --select a,b,c`.
 
-Dev container facts: 4 CPUs (run at most 2 agents), no Apache/BIND/Exim/MySQL daemons (every
-page degrades to an install prompt — that is by design), Playwright + Chromium preinstalled.
+Dev container facts: 4 CPUs (run at most 2 agents), no Apache/BIND/Exim/MySQL daemons (every page degrades to
+an install prompt with an *Install* button for root — by design), Playwright + Chromium preinstalled.
 
 ## 4. Where the previous session ended — and where to continue
 
-**Ended at 09:00 UTC, 27 Oct 2026.** Everything is committed and pushed; no workflow is running; the
-keep-alive Routine is disabled; no panel/hub process is left running. Phases 0–5 are complete and
-verified end to end (including the live hub + panel flow). **Phase 6 is three-quarters done**: the
-three hardening audits ran and applied their fixes with tests, but the independent verifier that
-re-checks those fixes was stopped before it ran, so the next session starts there.
+**Session of 2026-10-29/30** (owner AFK, "take all decisions, keep working"). Order of the owner's asks:
+(1) application hosting → done; (2) the 26-item issue list → round 1 done (table in `CHECKLIST.md`);
+(3) "full audit, find more bugs" → the loop-until-dry bug-hunt workflow was launched at 04:50 UTC from the
+session scratchpad script `full-audit.workflow.js` (lens × scope finders, three refuters per finding, grouped
+fixers; up to 3 rounds). **If you are a new session, that run is gone with the container**: its confirmed
+findings and fixes, if any landed, are in the git log after `bf181a0` (`fix(audit): …` commits) — anything
+not committed did not happen. Re-run the audit if you want it: the pattern is in `CLAUDE.md` (builders per
+unit, two adversarial lenses for root/auth/signing code, one fix round, full gate).
 
 ### Continue from here (in order)
 
-1. **Verify the Phase-6 fixes** (what the stopped verifier would have done). Run the full gate:
-   `npm test` (every workspace + SDK + plugins), `npm run build`, a monolithic boot with a temp data
-   dir, `e2e/ui-check.cjs` against a served build. The final gate run by the ending session is
-   recorded at the end of this section. Then open each fix and confirm it is real, minimal and tested:
-   - privileged surface (auditor A, 16 findings, 10 fixed): `agent/src/ops/backup.js` `backup.db.import`
-     now screens mysql client commands (`system`, `\!`, `source`, `tee`…) before `source <file>`;
-     `agent/src/ops/fs.js` `fs.write_file` temp/backup files are created O_EXCL/O_NOFOLLOW (symlink
-     plant in account-writable trees); `server/src/routes/system.js` job endpoints are now ownership-
-     checked for resellers; plus schema/flag/`--` tightenings across ops with rejection tests
-     (`agent/test/hardening*.test.js`, `server/test/jobs*.test.js`).
-   - web platform (auditor B, 12 findings, 7 fixed): helmet/CSP/cookie/CSRF/rate-limit/session
-     tightenings in `server/src/app.js`, `server/src/middleware/*`, hub `app.js`/`shared/auth.js`/`nonce.js`;
-     tests `server/test/web-hardening.test.js`, `hub/test/web-hardening.test.js`.
-   - advisor + performance (auditor C, 8 findings, 4 fixed): Security Advisor PHP advisory rule — data-
-     driven `security.advisories` setting seeded by `server/src/db/migrations/002c_security-center-advisories.sql`
-     with CVE-2026-109618/109619 ("PHP2Shell": PHP < 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35) and EOL
-     8.1/8.0/7.4; CVE-2026-115560 (the "another unpatched" advisory, 23 Oct) is seeded without version
-     ranges because none were published — update it when PHP publishes the fix; MultiPHP Manager shows
-     the badge; `server/test/perf/{seed.js,list-endpoints.test.js}` asserts list endpoints stay under
-     150 ms with no table scan on 20k rows, with the index migrations the auditor added.
-2. **Close the deferred items the audits left** (each is small except the first two):
-   - `zod` 3.x → 4.6.7 (GHSA-mrhx-c7xc-m3w5, high; memory exhaustion on oversized constrained
-     collections) — a major bump touching every schema in server/agent/hub; do it as its own commit with
-     the full gate. Until then the API body-size limits bound the exposure.
-   - `react-router-dom` 6 → 7 (GHSA-wrjc-x8rr-h8h6 open redirect, GHSA-337j-9hxr-rhxg) — client only.
-   - Run `npm install` once at the root so `package-lock.json` links the `hub` and `hub/ui` workspaces
-     (`npm ls` reports `@whm/hub`/`@whm/hub-ui` UNMET; they only run because deps are hoisted).
-   - `backup.db.import` still executes the dump's SQL as the MySQL admin — switch to a temporary
-     restricted user like `transfer.mysql.import` does.
-   - `POST /api/auth/2fa/disable` should re-verify the password or a current code.
-   - `hub/src/app.js` `uiDistDir()` honours only `WHM_HUB_UI_DIST`; also read `config.ui_dist`
-     (accepted by the schema since `029510f`); fix the sentence in `docs/INSTALL.md` §5.6 afterwards.
-   - `server/test/web-hardening.test.js` "never accepts the same code twice" can exceed 5 s under full-
-     suite load — raise its timeout or isolate it.
-   - Accepted risks to re-judge if the threat model changes: certbot webroot under account docroots,
-     `find -exec chmod` TOCTOU in `mail.mailbox.fix_perms`, ModSecurity vendor archives unpacked as
-     root, `z.any()` on tweak-settings/schedule values, rolling sessions without an absolute cap.
-3. **Finish Phase 6 and close out**: tick `- [ ] **P6 Hardening & deploy**` in `CHECKLIST.md`, set the
-   last partial (SSL › Purchase and Install a Certificate — needs a real provider account) to done or
-   document it as "vendor account required", refresh screenshots if any page changed
-   (`bash e2e/screenshots.sh`), update this file, `CHECKLIST.md` and `CLAUDE.md`, push.
-4. **Optional, after that**: e2e on a provisioned host (`scripts/install.sh` on a VM with Apache/BIND/
-   Exim/MySQL to exercise the real agent ops — never possible in the dev container), the hub portals in
-   a browser (the live flow drove them through the API), and the "Push now"/impersonation gaps listed
-   in `docs/design/phase5-build-plan.md` cross-unit table as DEFERRED.
+1. **Finish the audit** (or re-run it): apply its confirmed findings with tests, run the full gate (§3),
+   refresh screenshots, commit.
+2. **Owner's issue list, round 2** — the items round 1 left partial or interpreted narrowly:
+   - #21 "index page option while creating license groups" on the hub side (the panel's landing/index
+     templates exist; the hub has no license-group page option yet).
+   - #26 "more features" for the hub is open-ended — ask the owner which (billing, reseller self-service, …).
+   - #17 the account (end-user) side of the support chat lights up when the hosted-account login lands (the
+     `user` role can read its own thread through the API; there is no cPanel-style user UI yet).
+   - #23 Cloudflare: the domain's nameservers must point at Cloudflare for the mirrored zone to serve; a
+     "switch nameservers" helper is not built.
+   - #12 GitHub sign-in needs an OAuth 2.0 + user-API flow (no OIDC) — listed as unsupported in the presets.
+   - Support Center external links still point at cpanel.net documentation (no Hostingsignal docs URLs exist).
+3. **Dependency bumps** as their own commits with the full gate: `zod` 3.x → 4.x (GHSA-mrhx-c7xc-m3w5; every
+   schema in server/agent/hub), `react-router-dom` 6 → 7 (client + hub/ui).
+4. `backup.db.import` still sources the dump as the MySQL admin — switch to a temporary restricted user like
+   `transfer.mysql.import` (`withImportUser`).
+5. Accepted risks to re-judge if the threat model changes: certbot webroot under account docroots,
+   `find -exec chmod` TOCTOU in `mail.mailbox.fix_perms`, ModSecurity vendor archives unpacked as root,
+   `z.any()` on tweak-settings/schedule values, rolling sessions without an absolute cap.
+6. Optional: e2e on a provisioned host (`scripts/install.sh --stack full` on a VM) to exercise the real agent ops;
+   the hub portals in a browser; the "Push now"/impersonation gaps in `docs/design/phase5-build-plan.md`.
 
-### Final gate recorded by the ending session (09:0x UTC, head of branch)
+### Corrections to the 27 Oct handoff (found by the verifier's docs check)
 
-Run at 09:05 UTC on `b01bd30` (the auditors' fixes) with the dev panel stopped — **all green**:
-
-| Suite | Result |
-|---|---|
-| server (vitest) | 43 files, 1158 passed |
-| agent (vitest) | 501 passed, 2 skipped |
-| client (vitest) | 52 passed |
-| hub (node --test) | 184 passed, 0 failed |
-| hub/ui (vitest) | 105 passed |
-| plugins/sdk, sample plugin, 4 bundled plugins (node --test) | all passed |
-| `vite build` client + hub/ui | ok |
-| monolithic boot with a temp data dir (migrate, seed, `/api/health`) | ok |
-
-So the audit fixes do not break anything; what the stopped verifier still owed is the *reading* in
-step 1 above (is each fix real, minimal and tested), not a red suite. `e2e/ui-check.cjs` and the
-screenshot refresh were not re-run after the audit fixes (the pages they touch: Security Advisor and
-MultiPHP Manager badge).
+The op count was 352 then (369 now); the live hub flow has 9 steps (not "11/11"; now 10 with the super-admin
+step 2b); the screenshot refresh commit was `5f61846` (not `974cb94`); `docs/design/marketplace.md` is 691
+lines; the hub `shared/auth.js`/`nonce.js` files were not part of the Phase-6 range; the "36 findings: 21/8/7"
+arithmetic cannot be reconstructed (only 5 accepted risks were ever named — they are the list in item 5 above);
+the keep-alive Routine from that session no longer exists.
 
 ## 5. Rules that matter (full text in `CLAUDE.md`)
 
-- Runs as root: never a shell string; every system call is an allowlisted agent op with a zod
-  schema and `execFile(argv[])`; paths pinned under allowed roots; destructive ops marked.
-- Every route validates with zod, has RBAC, writes an audit row; secrets encrypted at rest.
+- Runs as root: never a shell string; every system call is an allowlisted agent op with a zod schema and
+  `execFile(argv[])`; paths pinned under allowed roots; destructive ops marked; everything inside an account
+  tree runs as the account through `runuser`.
+- Every route validates with zod, has RBAC (root / reseller / user, super admin for the license hub), writes an
+  audit row (free text — body, text, message, content, env — is redacted whole); secrets encrypted at rest.
 - Category module contract: new categories/plugins add files, never edit shared files.
 - Migrations are immutable once committed (`0NNb_` follow-ups); host first, DB second.
-- `client/src/nav.js` is the single source of truth for the 212 functions.
-- Integration contracts (binding) in `docs/design/integration-contracts.md` §1–32.
-- Token economy: screenshots only at milestones; one fix round + one re-review; two review lenses
-  only for root-level or signing code.
+- `client/src/nav.js` is the single source of truth for the 216 functions (explicit slugs keep routes stable
+  when labels change).
+- Integration contracts (binding) in `docs/design/integration-contracts.md` §1–34.
+- Token economy: screenshots only at milestones or on request; one fix round + one re-review; two review
+  lenses only for root-level, auth or signing code.
 - Update `CHECKLIST.md`, `CLAUDE.md` and this file before every push.
 
-## 6. Automation (none running)
+## 6. Automation (none that survives this session)
 
-- The hourly keep-alive Routine `trig_015b4oBVtePikCYJAcFwKkTK` on the owner's account is **disabled**
-  (09:00 UTC); it belonged to the ended session. Delete it or leave it off.
-- No workflow run is in progress. The multi-agent scripts the ended session used live only on its
-  machine; their inputs (design docs, contracts) are in `docs/design/`. A new session needs none of
-  them — the remaining work in §4 is ordinary engineering.
+Workflow scripts (Application Manager build, platform fixes, integration round, full audit) live only in the
+session scratchpad; their outputs are in the repository. Safety check-in reminders were scheduled through the
+session's own tools and die with it. A new session needs none of them — the remaining work in §4 is ordinary
+engineering.
 
 ## 7. Where things are
 
 ```
-BLUEPRINT.md   design of record (§1–18)       CHECKLIST.md  tracker + timeline     HANDOFF.md  this file
-docs/INSTALL.md  installation guide            docs/MANUAL.md + MANUAL-partB.md  user manual (every function)
-CLAUDE.md      conventions + memory            docs/design/  contracts, plugin host, marketplace, license, phase-5 plan
-server/        panel API (routes/categories/<slug>.js, services/<slug>.js, db/migrations 001–032)
-agent/         whm-agentd op families (sys svc user fs sec dns db net ssl mail pkg web hook acct backup transfer …)
-client/        React SPA (pages/fn/<category>/<function>.jsx auto-registered; pages/plugins/PluginPage.jsx)
+BLUEPRINT.md   design of record (§1–18, §13.31 Application Manager)   CHECKLIST.md  tracker + owner's issue list   HANDOFF.md  this file
+docs/INSTALL.md  installation guide (stack profiles, super admin, TLS pair, hub)   docs/MANUAL.md + MANUAL-partB.md  user manual (31 categories)
+CLAUDE.md      conventions + memory          docs/design/  contracts (§1–34), application-manager, https-defaults, dns-cloudflare, support-chat, plugin host, marketplace, license
+server/        panel API (routes/categories/<slug>.js, services/<slug>.js, db/migrations 001–035 + letter follow-ups, lib/stack-catalog.js)
+agent/         whm-agentd op families (sys svc user fs sec dns db net ssl mail pkg web hook acct backup transfer app stack terminal …)
+client/        React SPA (nav.js, brand.js, pages/fn/<category>/<function>.jsx auto-registered, pages/Setup.jsx wizard, pages/apps, pages/support)
 plugins/       sdk/ (contract + mock host + pack.js), SDK.md, sample-plugin/, bundled/net.whm.{server-monitoring,imunifyav,wp-toolkit,automated-backup}
-hub/           license + marketplace service (src/, shared/, license/, marketplace/, scripts/, test/) and ui/ portals
-deploy/        whm-panel.service, whm-agentd.service, whm-hub.service, config templates
-scripts/       install.sh (--with-hub, --upgrade), whm-cli.js, build-plugin.js
-e2e/           ui-check.cjs (flow), screenshot-all.cjs (every page), screenshots.sh, live-hub-flow.sh (hub+panel end-to-end), README.md
-docs/screenshots/  labelled captures + galleries
+hub/           license + marketplace service (src/, shared/, license/, marketplace/, scripts/, test/) and ui/ portals (TOTP for all portal users)
+deploy/        whm-panel.service, whm-agentd.service, whm-hub.service, config templates (TLS pair /etc/whm/tls)
+scripts/       install.sh (--with-hub, --upgrade, --stack), whm-cli.js (status, users, superadmin, stack-status, install-stack), build-plugin.js
+e2e/           ui-check.cjs (flow incl. setup wizard), screenshot-all.cjs (every page), screenshots.sh, live-hub-flow.sh (hub+panel, 10 steps), README.md
+docs/screenshots/  labelled captures + galleries (216/216 live)
 ```
