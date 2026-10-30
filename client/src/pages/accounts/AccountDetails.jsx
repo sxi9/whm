@@ -2,6 +2,7 @@ import { Link } from 'react-router-dom';
 import { MessageSquare } from 'lucide-react';
 import { KeyValue, StatusPill, formatMb, formatDate } from '../../components/Common.jsx';
 import { conversationPath } from '../support/ChatWorkspace.jsx';
+import { DomainsPanel } from './DomainsPanel.jsx';
 
 // Who the account turns to for support, with the way in to its conversation.
 export function AccountManager({ account, link = true }) {
@@ -15,10 +16,13 @@ export function AccountManager({ account, link = true }) {
   );
 }
 
-// The summary block shared by the account pages: status, ownership, manager and usage.
-export function AccountSummary({ account }) {
+// The summary block shared by the account pages: status, ownership, manager and
+// usage, followed by the account's domains (addon / sub / parked) unless the
+// caller turns them off.
+export function AccountSummary({ account, domains = true }) {
   if (!account) return null;
   return (
+    <>
     <KeyValue items={[
       ['Status', <StatusPill key="s" status={account.suspended ? 'suspended' : 'active'}>{account.suspended ? 'Suspended' : 'Active'}</StatusPill>],
       ['Owner', account.owner],
@@ -28,5 +32,7 @@ export function AccountSummary({ account }) {
       ['Bandwidth used', `${formatMb(account.bandwidth_used_mb)} of ${formatMb(account.bandwidth_limit_mb)}`],
       ['Created', formatDate(account.created_at)],
     ]} />
+    {domains && <DomainsPanel username={account.username} />}
+    </>
   );
 }

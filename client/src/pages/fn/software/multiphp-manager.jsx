@@ -8,7 +8,100 @@ import { DataTable, useTableState } from '../../../components/DataTable.jsx';
 import { Field, Select, Button, ErrorBanner } from '../../../components/Form.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
-import { RequestError, PhpVersionPill, useJobRunner, JobPanel } from '../../software/Shared.jsx';
+import { RequestError, PhpVersionPill, useJobRunner, JobPanel, JobHistory } from '../../software/Shared.jsx';
+
+// Which action a catalog row offers and why it may be disabled; the server
+// decides for real (409 for the default / a used version, 501 without a
+// package manager), this only keeps the buttons honest.
+export function phpRowAction(v, source) {
+  if (v.installed) {
+    if (v.removable) return { kind: 'remove', disabled: false, reason: null };
+    const reason = v.isDefault ? 'system default' : v.isCliDefault ? 'CLI default (/usr/bin/php)' : v.inUse ? `used by ${v.inUse} domain${v.inUse === 1 ? '' : 's'}` : 'not a versioned package set';
+    return { kind: 'remove', disabled: true, reason };
+  }
+  if (v.offered) return { kind: 'install', disabled: false, reason: null };
+  if (source?.supported && !source.configured) return { kind: 'install', disabled: false, reason: `enables ${source.label} first` };
+  return { kind: 'install', disabled: true, reason: source?.configured ? `not offered by ${source.label}` : source?.reason || 'no PHP package source for this host' };
+}
+
+// Install a PHP version: every branch the family's package source can offer
+// (ppa:ondrej/php on Ubuntu, packages.sury.org on Debian, Remi on the RHEL
+// family) with an install job per branch and a removal for spare ones.
+export function PhpInstallCard({ enabled = true, onChanged }) {
+  const confirm = useConfirm();
+  const installable = useApi('/software/php/installable', { enabled });
+  const runner = useJobRunner({ onFinished: () => { installable.refetch(); onChanged?.(); } });
+  const [pending, setPending] = useState(null);
+  const d = installable.data;
+  const source = d?.source;
+
+  const install = async (v) => {
+    const note = v.offered ? '' : source?.configured ? ` ${source.label} does not offer it on this host; the job reports that and stops.` : ` ${source?.label || 'The PHP package source'} is enabled first and the package index refreshed.`;
+    if (!(await confirm({ title: `Install PHP ${v.version}?`, message: `PHP-FPM, the CLI and the common extensions (MySQL, GD, mbstring, XML, zip, intl, bcmath, SOAP, opcache; those the repository does not ship are skipped) are installed with the package manager as a background job and the FPM unit is enabled.${note} Domains keep their current version until you change it here.`, confirmLabel: `Install PHP ${v.version}` }))) return;
+    setPending(v.version);
+    try { await runner.start(() => api.post('/software/php/install', { version: v.version }), `Install PHP ${v.version}`); } finally { setPending(null); }
+  };
+  const remove = async (v) => {
+    if (!(await confirm({ title: `Remove PHP ${v.version}?`, message: `The ${v.id} package set is removed after its ${v.fpmUnit || 'PHP-FPM'} unit is stopped. Only a version no domain uses, that is neither the system nor the CLI default, can be removed; the server checks again before anything runs.`, confirmLabel: 'Remove', danger: true, typeToConfirm: v.id }))) return;
+    setPending(v.version);
+    try { await runner.start(() => api.delete(`/software/php/versions/${encodeURIComponent(v.id)}`), `Remove PHP ${v.version}`); } finally { setPending(null); }
+  };
+
+  return (
+    <>
+      <Card title="Install a PHP version" subtitle="Add another PHP branch next to the installed ones. The package manager does the work as a background job; the log appears below."
+        actions={<>
+          {source && <StatusPill status={source.configured ? 'ok' : source.supported ? 'inactive' : 'not-installed'}>{source.label ? `${source.label} · ${source.configured ? 'enabled' : source.supported ? 'not enabled yet' : 'unavailable'}` : 'no PHP source for this host'}</StatusPill>}
+          <Button size="sm" onClick={() => installable.refetch()} loading={installable.loading && Boolean(d)}>Re-check</Button>
+        </>}>
+        <RequestError error={installable.error} onRetry={installable.refetch} />
+        {installable.loading && !d && <Loading text="Asking the package manager which PHP versions it offers…" />}
+        {d && (
+          <>
+            <p className="muted small">
+              {d.os?.name || d.family}{d.os?.codename ? ` (${d.os.codename})` : ''} · {d.manager || 'no package manager'}{d.stock ? ` · the distribution's own branch is PHP ${d.stock}` : ''}
+              {source?.url && <> · source: <a href={source.url} target="_blank" rel="noreferrer noopener">{source.url}</a></>}
+              {source && !source.configured && source.supported && <> — enabled automatically on the first install of a version the distribution does not ship.</>}
+              {source && !source.supported && source.reason && <> — {source.reason}</>}
+            </p>
+            <div className="table-wrap">
+              <table>
+                <thead><tr><th>Version</th><th>Status</th><th>Source</th><th>Domains</th><th className="actions-col">Action</th></tr></thead>
+                <tbody>
+                  {d.versions.map((v) => {
+                    const action = phpRowAction(v, source);
+                    const busy = runner.busy && pending === v.version;
+                    return (
+                      <tr key={v.id}>
+                        <td><strong>{v.label || `PHP ${v.version}`}</strong>{v.stock && <> <StatusPill status="info">distribution</StatusPill></>}<PhpAdvisoryBadge advisories={v.advisories} /></td>
+                        <td>
+                          {v.installed ? <StatusPill status="installed">installed{v.installedVersion ? ` · ${v.installedVersion}` : ''}</StatusPill> : v.offered ? <StatusPill status="pending">available{v.candidate ? ` · ${v.candidate}` : ''}</StatusPill> : <StatusPill status="not-installed">not offered</StatusPill>}
+                          {v.isDefault && <> <StatusPill status="ok">system default</StatusPill></>}
+                          {v.isCliDefault && !v.isDefault && <> <StatusPill status="info">CLI</StatusPill></>}
+                        </td>
+                        <td className="small">{v.source === 'distro' ? 'distribution' : v.source || (v.installed ? v.layout || '—' : '—')}</td>
+                        <td className="small">{v.inUse ? `${v.inUse}` : '—'}</td>
+                        <td className="actions-col">
+                          {action.kind === 'install'
+                            ? <Button size="sm" variant="primary" loading={busy} disabled={action.disabled || runner.busy} title={action.reason || undefined} onClick={() => install(v)}>Install</Button>
+                            : <Button size="sm" variant="danger" loading={busy} disabled={action.disabled || runner.busy} title={action.reason || undefined} onClick={() => remove(v)}>Remove</Button>}
+                          {action.reason && <div className="muted small">{action.reason}</div>}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <ErrorBanner error={runner.error} />
+          </>
+        )}
+      </Card>
+      <JobPanel runner={runner} title="PHP install log" />
+      {d?.recent?.length > 0 && <Card title="Previous PHP installs and removals"><JobHistory jobs={d.recent} onSelect={(id) => runner.setJobId(id)} /></Card>}
+    </>
+  );
+}
 
 // Security Center's advisory rules (setting security.advisories) mark versions
 // with a known vulnerability; the Security Advisor page carries the details.
@@ -94,7 +187,7 @@ export default function MultiPhpManager({ fn }) {
             <table>
               <thead><tr><th>Version</th><th>Binary</th><th>PHP-FPM</th><th>php.ini</th><th>Default</th></tr></thead>
               <tbody>
-                {installed.length === 0 && <tr><td colSpan={5} className="table-state">No PHP installation found. Add one with <Link to="/software/easyapache-4">EasyApache 4</Link> or Install Distro Packages.</td></tr>}
+                {installed.length === 0 && <tr><td colSpan={5} className="table-state">No PHP installation found. Install a version with the card below, or build a web stack with <Link to="/software/easyapache-4">EasyApache 4</Link>.</td></tr>}
                 {installed.map((v) => (
                   <tr key={v.id}>
                     <td><strong>{v.label || v.id}</strong> <span className="muted small">{v.version}</span> <PhpAdvisoryBadge advisories={v.advisories} /></td>
@@ -119,6 +212,7 @@ export default function MultiPhpManager({ fn }) {
         </Card>
       )}
       <JobPanel runner={runner} title="Applying PHP version to the web server" />
+      {isRoot && <PhpInstallCard onChanged={() => { versions.refetch(); domains.refetch(); pools.refetch(); }} />}
       <Card title="PHP version per domain" subtitle={domains.data ? `${domains.meta?.total ?? domains.data.domains.length} domains · system default ${domains.data.systemDefault.effective || 'not set'}` : undefined} padded={false}>
         <RequestError error={domains.error} onRetry={domains.refetch} />
         {selected.length > 0 && (

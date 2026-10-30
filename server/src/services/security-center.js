@@ -1534,10 +1534,18 @@ export function createSecurityCenterService(ctx) {
       findings.sort((a, b) => order[a.grade] - order[b.grade]);
       const summary = { critical: 0, warning: 0, info: 0, ok: 0 };
       for (const f of findings) summary[f.grade]++;
+      const previous = stmts.lastRun.get();
       const { lastInsertRowid } = stmts.insertRun.run(trigger, JSON.stringify(summary), JSON.stringify(findings));
       stmts.pruneRuns.run();
       req?.audit?.({ action: 'security.advisor.scan', args: summary });
-      return { id: Number(lastInsertRowid), trigger, finishedAt: new Date().toISOString(), summary, findings };
+      const run = { id: Number(lastInsertRowid), trigger, finishedAt: new Date().toISOString(), summary, findings };
+      // Critical findings new since the previous run become security alerts
+      // (ctx.securityAlerts, Server Contacts); the scan never depends on it.
+      try {
+        const previousCritical = previous ? json.parse(previous.findings_json, []).filter((f) => f.grade === 'critical').map((f) => f.id) : [];
+        run.alerts = ctx.securityAlerts?.onAdvisorScan?.(run, { previousCritical }) ?? null;
+      } catch (err) { logger.warn({ err }, 'security alerts for the advisor scan failed'); run.alerts = null; }
+      return run;
     },
   };
 

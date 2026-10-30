@@ -10,6 +10,7 @@ import {
   mergeEximBlock, readEximBlock, stripEximBlock, eximTlsLibrary, primaryGroupName, EXIM_SENTINEL_MACRO, renderHttpsRedirect, enableApacheModules,
   applyListen, listenDropIns, ensureSelinuxWebAccess, selinuxRules, DOMLOGS_ROOT, unitState, DOCROOT_OPTIONS, DOCROOT_ALLOW_OVERRIDE,
   reconcileHtaccessOptions, HTACCESS_OPTIONS,
+  renderDefaultVhost, parseDefaultVhostMeta, writeDefaultVhost, removeDefaultVhost, defaultVhostFile, DEFAULT_SSL_FALLBACKS,
 } from '../src/ops/web.js';
 
 // Fake host for the layout detection: which paths exist, what they contain, which binaries resolve.
@@ -881,5 +882,211 @@ describe('web.htaccess.audit', () => {
     expect(r.unsupported).toEqual([{ file: path.join(docroot, 'other', '.htaccess'), line: 1, tokens: ['FollowSymLinks'] }]);
     expect(fs.readFileSync(path.join(docroot, 'other', '.htaccess'), 'utf8')).toBe('Options +FollowSymLinks\n');
     expect((await opError(runOp('web.htaccess.audit', { roots: [docroot], username: 'root', fix: true }, c))).code).toBe('refused');
+  });
+});
+
+describe('default (catch-all) virtual host: landing page for the bare address and unmatched names', () => {
+  const BASE = { hostname: 'panel.example.com', docroot: '/var/www/whm-default', user: 'www-data', addresses: ['203.0.113.5', '2001:db8::5'] };
+  const HOST_SSL = { cert: '/etc/ssl/whm/panel.example.com/cert.pem', key: '/etc/ssl/whm/panel.example.com/key.pem', fullchain: '/etc/ssl/whm/panel.example.com/fullchain.pem', source: 'hostname' };
+
+  it('renders _default_ plus every tenant address on both ports, the hostname certificate on 443 and never a PHP handler', () => {
+    const text = renderDefaultVhost({ ...BASE, ssl: HOST_SSL });
+    expect(text).toMatch(/^# Managed by WHM panel \(default virtual host/);
+    expect(text).toContain('<VirtualHost _default_:80 203.0.113.5:80 [2001:db8::5]:80>');
+    expect(text).toContain('<VirtualHost _default_:443 203.0.113.5:443 [2001:db8::5]:443>');
+    expect(text.match(/ServerName default\.invalid/g)).toHaveLength(2);
+    expect(text).toContain('ServerAdmin webmaster@panel.example.com');
+    expect(text.match(/DocumentRoot "\/var\/www\/whm-default"/g)).toHaveLength(2);
+    expect(text).toContain('CustomLog "/var/log/whm/domlogs/www-data/default-access.log" combined');
+    expect(text).toContain('ErrorLog "/var/log/whm/domlogs/www-data/default-ssl-error.log"');
+    expect(text).toContain('<IfModule ssl_module>');
+    expect(text).toContain('SSLEngine on');
+    expect(text).toContain('SSLCertificateFile "/etc/ssl/whm/panel.example.com/fullchain.pem"');
+    expect(text).toContain('SSLCertificateKeyFile "/etc/ssl/whm/panel.example.com/key.pem"');
+    expect(text).toContain('AllowOverride None');
+    expect(text).not.toMatch(/SetHandler|proxy_fcgi|RewriteEngine|IncludeOptional|FollowSymLinks/);
+    expect(parseDefaultVhostMeta(text)).toMatchObject({ hostname: 'panel.example.com', docroot: '/var/www/whm-default', addresses: ['203.0.113.5', '2001:db8::5'], port: 80, sslPort: 443, ssl: true, sslSource: 'hostname' });
+    // cert + chain without a fullchain file
+    const chained = renderDefaultVhost({ ...BASE, ssl: { cert: '/etc/ssl/whm/x/cert.pem', key: '/etc/ssl/whm/x/key.pem', chain: '/etc/ssl/whm/x/chain.pem' } });
+    expect(chained).toContain('SSLCertificateFile "/etc/ssl/whm/x/cert.pem"');
+    expect(chained).toContain('SSLCertificateChainFile "/etc/ssl/whm/x/chain.pem"');
+  });
+
+  it('without a certificate pair only the HTTP block is rendered; behind the proxy it binds to the loopback port only', () => {
+    const plain = renderDefaultVhost({ ...BASE, ssl: null });
+    expect(plain).toContain('<VirtualHost _default_:80 203.0.113.5:80 [2001:db8::5]:80>');
+    expect(plain).not.toContain('SSLEngine');
+    expect(plain).not.toContain('_default_:443');
+    expect(plain).toContain('# No certificate pair is available for HTTPS');
+    expect(parseDefaultVhostMeta(plain)).toMatchObject({ ssl: false, sslSource: null });
+    const proxied = renderDefaultVhost({ ...BASE, bind: '127.0.0.1', port: 8080, sslPort: null, ssl: HOST_SSL });
+    expect(proxied).toContain('<VirtualHost _default_:8080 127.0.0.1:8080>');
+    expect(proxied).not.toContain('203.0.113.5');
+    expect(proxied).not.toContain('SSLEngine');
+    expect(proxied).not.toContain('No certificate pair');
+    expect(parseDefaultVhostMeta(proxied)).toMatchObject({ addresses: ['127.0.0.1'], port: 8080, sslPort: null, ssl: false });
+    expect(renderDefaultVhost({ ...BASE, addresses: [] })).toContain('<VirtualHost _default_:80>');
+    expect(() => renderDefaultVhost({ ...BASE, docroot: '/var/www/x y' })).toThrow(OpError);
+  });
+
+  it('the op schema rejects injection, traversal and foreign values', async () => {
+    exec.mockClear();
+    const bad = [
+      { ...BASE, hostname: 'a;b.com' }, { ...BASE, hostname: '-x' }, { ...BASE, docroot: 'relative' }, { ...BASE, docroot: '/var/www/../etc' }, { ...BASE, docroot: '/var/www/x\nServerAlias evil' },
+      { ...BASE, user: 'www data' }, { ...BASE, user: 'Root' }, { ...BASE, addresses: ['203.0.113.5; id'] }, { ...BASE, addresses: ['not-an-ip'] }, { ...BASE, bind: '1.2.3.4.5' },
+      { ...BASE, port: 0 }, { ...BASE, port: '80' }, { ...BASE, sslPort: 70000 }, { ...BASE, ssl: { cert: '/etc/ssl/whm/c.pem' } }, { ...BASE, ssl: { cert: 'c.pem', key: '/etc/ssl/whm/k.pem' } },
+      { ...BASE, logDir: '/var/log/whm/../../etc' }, { ...BASE, serverAdmin: 'nope' }, { ...BASE, extra: true },
+    ];
+    for (const args of bad) expect((await opError(runOp('web.default_vhost.write', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
+    expect((await opError(runOp('web.default_vhost.remove', { reload: 'yes' }, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  function fakeApache2() {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-default-vhost-'));
+    for (const d of ['sites-available', 'sites-enabled', 'logs', 'landing', 'ssl']) fs.mkdirSync(path.join(root, d), { recursive: true });
+    fs.writeFileSync(path.join(root, 'sites-available', '000-default.conf'), '<VirtualHost *:80>\n  DocumentRoot /var/www/html\n</VirtualHost>\n');
+    fs.symlinkSync('../sites-available/000-default.conf', path.join(root, 'sites-enabled', '000-default.conf'));
+    fs.writeFileSync(path.join(root, 'landing', 'index.html'), '<h1>landing</h1>');
+    const apache = { flavor: 'debian', root, bin: 'apache2ctl', sitesAvailable: path.join(root, 'sites-available'), sitesEnabled: path.join(root, 'sites-enabled'), units: ['apache2'], a2tools: true };
+    const tctx = createContext({ allowedRoots: [root] });
+    const args = { ...BASE, docroot: path.join(root, 'landing'), logDir: path.join(root, 'logs') };
+    return { root, apache, tctx, args, lexists: (f) => { try { fs.lstatSync(path.join(root, f)); return true; } catch { return false; } } };
+  }
+
+  it('debian: writes 000-whm-default.conf + its sites-enabled link, disables the stock 000-default site with a2dissite, validates and reports the certificate source', async () => {
+    const { root, apache, tctx, args, lexists: has } = fakeApache2();
+    const hostCert = { cert: path.join(root, 'ssl', 'cert.pem'), key: path.join(root, 'ssl', 'key.pem'), fullchain: path.join(root, 'ssl', 'fullchain.pem') };
+    for (const f of Object.values(hostCert)) fs.writeFileSync(f, 'pem');
+    try {
+      await withBinaries(['apache2ctl', 'a2dissite', 'a2ensite', 'systemctl'], (bin, argv) => {
+        if (bin === 'a2dissite') { fs.unlinkSync(path.join(root, 'sites-enabled', `${argv[1]}.conf`)); return {}; }
+        if (bin === 'apache2ctl' && argv[0] === '-t') return { stderr: 'Syntax OK\n' };
+        return {};
+      }, async (calls) => {
+        const r = await writeDefaultVhost(apache, { ...args, ssl: hostCert }, tctx);
+        expect(r).toMatchObject({ name: '000-whm-default', path: path.join(root, 'sites-available', '000-whm-default.conf'), link: path.join(root, 'sites-enabled', '000-whm-default.conf'), validated: true, addresses: ['203.0.113.5', '2001:db8::5'], stockSite: { disabled: true, site: '000-default', via: 'a2dissite' } });
+        expect(r.ssl).toEqual({ cert: hostCert.fullchain, key: hostCert.key, source: 'hostname', generated: false });
+        expect(calls()).toContainEqual(['a2dissite', '-q', '000-default']);
+        expect(calls()).toContainEqual(['apache2ctl', '-t']);
+        expect(calls().some(([bin]) => bin === 'openssl')).toBe(false);
+        expect(has('sites-enabled/000-default.conf')).toBe(false);
+        expect(fs.readlinkSync(path.join(root, 'sites-enabled', '000-whm-default.conf'))).toBe('../sites-available/000-whm-default.conf');
+        const text = fs.readFileSync(r.path, 'utf8');
+        expect(text).toContain(`DocumentRoot "${path.join(root, 'landing')}"`);
+        expect(text).toContain(`SSLCertificateFile "${hostCert.fullchain}"`);
+        expect(text).toContain(`CustomLog "${path.join(root, 'logs')}/default-access.log" combined`);
+        expect(fs.readdirSync(path.join(root, 'sites-enabled')).sort()[0]).toBe('000-whm-default.conf');
+        // Second write: the stock site is already off, nothing else changes.
+        const again = await writeDefaultVhost(apache, { ...args, ssl: hostCert }, tctx);
+        expect(again.stockSite).toEqual({ disabled: false, site: '000-default' });
+        expect(calls().filter(([bin]) => bin === 'a2dissite')).toHaveLength(1);
+        // Removal takes the file and the link and validates.
+        const removed = await removeDefaultVhost(apache, tctx);
+        expect(removed).toMatchObject({ path: r.path, removed: true, validated: true });
+        expect(has('sites-available/000-whm-default.conf')).toBe(false);
+        expect(has('sites-enabled/000-whm-default.conf')).toBe(false);
+        expect(await removeDefaultVhost(apache, tctx)).toMatchObject({ removed: false });
+      });
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('falls back to the panel pair, then generates a self-signed pair when the hostname bundle is missing; a rejected configtest restores everything including the stock site', async () => {
+    const { root, apache, tctx, args, lexists: has } = fakeApache2();
+    try {
+      await withBinaries(['apache2ctl', 'a2dissite', 'a2ensite', 'openssl', 'systemctl'], (bin, argv) => {
+        if (bin === 'a2dissite') { fs.unlinkSync(path.join(root, 'sites-enabled', `${argv[1]}.conf`)); return {}; }
+        if (bin === 'a2ensite') { fs.symlinkSync(`../sites-available/${argv[1]}.conf`, path.join(root, 'sites-enabled', `${argv[1]}.conf`)); return {}; }
+        if (bin === 'openssl') { const key = argv[argv.indexOf('-keyout') + 1]; const cert = argv[argv.indexOf('-out') + 1]; fs.mkdirSync(path.dirname(key), { recursive: true }); fs.writeFileSync(key, 'k'); fs.writeFileSync(cert, 'c'); return {}; }
+        if (bin === 'apache2ctl' && argv[0] === '-t') return fs.existsSync(path.join(root, 'reject')) ? { code: 1, stderr: 'AH00526: Syntax error\n' } : { stderr: 'Syntax OK\n' };
+        return {};
+      }, async (calls) => {
+        // The hostname bundle names files that do not exist: the first controlled pair that exists takes over, generated when nothing else exists.
+        const panel = { source: 'panel', cert: path.join(root, 'tls', 'cert.pem'), key: path.join(root, 'tls', 'key.pem') };
+        const generated = { source: 'generated', cert: path.join(root, 'default-ssl', 'cert.pem'), key: path.join(root, 'default-ssl', 'key.pem') };
+        const fallbacks = [{ source: 'apache-service', cert: path.join(root, 'svc', 'fullchain.pem'), key: path.join(root, 'svc', 'key.pem') }, panel, generated];
+        expect(DEFAULT_SSL_FALLBACKS.map((c) => c.source)).toEqual(['apache-service', 'panel', 'generated']);
+        const missing = { cert: path.join(root, 'ssl', 'missing.pem'), key: path.join(root, 'ssl', 'missing.key') };
+        const r = await writeDefaultVhost(apache, { ...args, ssl: missing }, tctx, { fallbacks });
+        expect(r.ssl).toMatchObject({ cert: generated.cert, key: generated.key, source: 'generated', generated: true });
+        const gen = calls().find(([bin]) => bin === 'openssl');
+        expect(gen.slice(1)).toEqual(['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', generated.key, '-out', generated.cert, '-days', '3650', '-subj', '/CN=panel.example.com']);
+        expect(fs.statSync(generated.key).mode & 0o777).toBe(0o600);
+        expect(fs.readFileSync(r.path, 'utf8')).toContain(`SSLCertificateFile "${generated.cert}"`);
+        expect(has('sites-enabled/000-default.conf')).toBe(false);
+        // The generated pair is reused, and the panel pair wins over it once it exists.
+        const again = await writeDefaultVhost(apache, { ...args, ssl: missing }, tctx, { fallbacks });
+        expect(again.ssl).toMatchObject({ source: 'generated', generated: false });
+        expect(calls().filter(([bin]) => bin === 'openssl')).toHaveLength(1);
+        fs.mkdirSync(path.dirname(panel.cert)); fs.writeFileSync(panel.cert, 'c'); fs.writeFileSync(panel.key, 'k');
+        const withPanel = await writeDefaultVhost(apache, { ...args, ssl: null }, tctx, { fallbacks });
+        expect(withPanel.ssl).toMatchObject({ cert: panel.cert, key: panel.key, source: 'panel' });
+        expect(fs.readFileSync(r.path, 'utf8')).toContain(`SSLCertificateKeyFile "${panel.key}"`);
+        // Rollback: a rejected configtest puts the previous file back and re-enables the stock site it disabled.
+        fs.symlinkSync('../sites-available/000-default.conf', path.join(root, 'sites-enabled', '000-default.conf'));
+        const before = fs.readFileSync(r.path, 'utf8');
+        fs.writeFileSync(path.join(root, 'reject'), '');
+        const err = await opError(writeDefaultVhost(apache, { ...args, addresses: ['198.51.100.9'], ssl: null }, tctx, { fallbacks }));
+        expect(err.code).toBe('config_invalid');
+        expect(fs.readFileSync(r.path, 'utf8')).toBe(before);
+        expect(has('sites-enabled/000-default.conf')).toBe(true);
+        expect(calls()).toContainEqual(['a2ensite', '-q', '000-default']);
+      });
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('rhel: a conf.d/00-whm-default.conf without a link, sorted ahead of ssl.conf and welcome.conf', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-default-httpd-'));
+    try {
+      for (const d of ['conf.d', 'logs', 'landing']) fs.mkdirSync(path.join(root, d), { recursive: true });
+      fs.writeFileSync(path.join(root, 'conf.d', 'ssl.conf'), '<VirtualHost _default_:443>\n</VirtualHost>\n');
+      fs.writeFileSync(path.join(root, 'conf.d', 'welcome.conf'), '<LocationMatch "^/+$">\n</LocationMatch>\n');
+      const apache = { flavor: 'rhel', root, bin: 'httpd', confD: path.join(root, 'conf.d'), units: ['httpd'], a2tools: false };
+      const tctx = createContext({ allowedRoots: [root] });
+      await withBinaries(['httpd', 'systemctl'], (bin, argv) => (bin === 'httpd' && argv[0] === '-t' ? { stderr: 'Syntax OK\n' } : {}), async (calls) => {
+        const r = await writeDefaultVhost(apache, { ...BASE, docroot: path.join(root, 'landing'), logDir: path.join(root, 'logs'), sslPort: null }, tctx);
+        expect(r).toMatchObject({ name: '00-whm-default', path: path.join(root, 'conf.d', '00-whm-default.conf'), link: null, ssl: null, stockSite: { disabled: false, site: null } });
+        expect(fs.readdirSync(path.join(root, 'conf.d')).sort()).toEqual(['00-whm-default.conf', 'ssl.conf', 'welcome.conf']);
+        expect(calls().some(([bin]) => bin === 'a2dissite')).toBe(false);
+        expect(defaultVhostFile(apache)).toEqual({ file: path.join(root, 'conf.d', '00-whm-default.conf'), link: null, name: '00-whm-default' });
+      });
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe('web.docroot.ensure / remove run inside the account home as the account', () => {
+  const ARGS = { username: 'alice', docroot: '/home/alice/public_html/addon.example' };
+
+  it('schemas refuse traversal, foreign users and reserved values before anything runs', async () => {
+    exec.mockClear();
+    const bad = [
+      { ...ARGS, username: 'Alice' }, { ...ARGS, username: 'root;id' }, { ...ARGS, docroot: 'public_html/x' }, { ...ARGS, docroot: '/home/alice/../bob/public_html' }, { ...ARGS, docroot: '/home/alice/x y' },
+      { ...ARGS, group: 'www data' }, { ...ARGS, index: 'a\0b' }, { ...ARGS, mode: '0777' },
+    ];
+    for (const args of bad) expect((await opError(runOp('web.docroot.ensure', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
+    expect((await opError(runOp('web.docroot.remove', { ...ARGS, recursive: true }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('web.docroot.remove', { username: 'alice', docroot: '/home/alice/../etc' }, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('refuses a user that does not exist, a system user, a path outside the home, the home itself and reserved directories, before running anything', async () => {
+    exec.mockClear();
+    expect((await opError(runOp('web.docroot.ensure', { username: 'nosuchuser0', docroot: '/home/nosuchuser0/site' }, ctx))).code).toBe('not_found');
+    expect((await opError(runOp('web.docroot.ensure', { username: 'root', docroot: '/home/root/site' }, ctx))).code).toBe('refused');
+    expect((await opError(runOp('web.docroot.remove', { username: 'root', docroot: '/root/x' }, ctx))).code).toBe('refused');
+    expect(exec).not.toHaveBeenCalled();
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-docroot-'));
+    try {
+      const home = path.join(base, 'alice');
+      fs.mkdirSync(path.join(home, 'public_html'), { recursive: true });
+      const tctx = createContext({ allowedRoots: [base] });
+      const { passwdHome: ph, assertUnderHome: under } = await import('../src/ops/web.js');
+      expect(typeof ph).toBe('function');
+      expect(() => under(home, path.join(base, 'bob', 'site'))).toThrow(OpError);
+      fs.symlinkSync('/etc', path.join(home, 'linked'));
+      expect(() => under(home, path.join(home, 'linked', 'site'))).toThrow(OpError);
+      expect(under(home, path.join(home, 'public_html', 'addon.example'))).toBe(path.join(home, 'public_html', 'addon.example'));
+      void tctx;
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
 });

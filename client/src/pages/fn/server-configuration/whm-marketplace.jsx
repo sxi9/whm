@@ -11,6 +11,12 @@ import { ProgressLog } from '../../../components/ProgressLog.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError } from '../../server-configuration/Shared.jsx';
 import { MarketplaceTab, MarketplaceDisabledNotice, canSeeHubOrigin, hubLabelOf } from '../../cpanel/MarketplaceTab.jsx';
+import { installDistroHref } from '../../software/PackageCatalog.jsx';
+
+// "Add" lands on the item's entry in the Install Distro Packages catalog (the
+// catalog keys match these ids); an id the catalog does not carry falls back
+// to a search for its first package name there.
+export const catalogHref = (item) => installDistroHref({ entry: item.id, q: item.packagesForHost?.[0] || item.packages?.apt?.[0] || item.id });
 
 // Hub enabled → the hub catalog (resellers read-only, root manages) with the
 // static distribution packages underneath; hub off → the static catalog alone.
@@ -82,7 +88,7 @@ export function StaticCatalog({ title = null }) {
                   </div>
                   <div className="row-actions" style={{ marginTop: 10, flexWrap: 'wrap' }}>
                     {!item.installed && item.packagesForHost?.length > 0 && <Button variant="primary" size="sm" loading={install.busy === item.id} disabled={Boolean(install.jobId) && install.itemId !== item.id} onClick={() => installPackages(item)}>Install packages</Button>}
-                    {!item.installed && !item.packagesForHost?.length && <Link className="btn btn-sm btn-primary" to={item.installPath}>Install packages</Link>}
+                    {!item.installed && <Link className={`btn btn-sm ${item.packagesForHost?.length ? '' : 'btn-primary'}`} to={catalogHref(item)} data-testid={`catalog-link-${item.id}`}>{item.packagesForHost?.length ? 'Open in catalog' : 'Add'}</Link>}
                     {item.installed && configureHref(item.configure) && <Link className="btn btn-sm" to={item.configure}>Configure</Link>}
                     {item.docs && <a className="btn btn-sm btn-ghost" href={item.docs} target="_blank" rel="noreferrer"><ExternalLink size={14} /> Docs</a>}
                   </div>

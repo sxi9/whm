@@ -9,6 +9,7 @@ import { Modal, useConfirm } from '../../components/Modal.jsx';
 import { useToast } from '../../components/Toast.jsx';
 import { ProgressLog } from '../../components/ProgressLog.jsx';
 import { ContactForm, CHANNEL_LABEL } from './ContactForm.jsx';
+import { SecurityAlertsCard } from './SecurityAlerts.jsx';
 import { BRAND } from '../../brand.js';
 
 const SEVERITY_STATUS = { info: 'info', warning: 'warning', error: 'failed', critical: 'failed' };
@@ -88,6 +89,7 @@ export function ContactManager() {
         <ChecksCard settings={settings} schedule={data.schedule} openAlerts={data.openAlerts} onChanged={refreshAll} />
       </div>
 
+      <SecurityAlertsCard key={logVersion} />
       <EventCatalog events={data.events} />
       <DeliveryLog version={logVersion} events={data.events} />
 

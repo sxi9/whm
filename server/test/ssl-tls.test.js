@@ -730,3 +730,53 @@ describe('TLS configuration and service certificates', () => {
     app.agent.set('ssl.bundle.remove_for_domain', ({ domain }) => ({ domain, removed: true }));
   });
 });
+
+describe('Manage SSL Hosts: the server hostname row', () => {
+  it('root sees the hostname with its certificate, the services carrying it, the renewal schedule, AutoSSL state and the landing vhost; resellers do not', async () => {
+    const previous = app.ctx.settings.get('basic.hostname');
+    const previousProvider = app.ctx.settings.get('ssl.autossl.provider', 'disabled');
+    const originalWeb = app.ctx.web;
+    app.ctx.settings.setMany({ 'basic.hostname': 'panel.example.com', 'ssl.autossl.provider': 'certbot' });
+    app.ctx.web = { ...originalWeb, applySsl: async () => ({ applied: true }), removeSsl: async () => ({ applied: true }), vhostFor: (d) => (d === 'panel.example.com' ? { domain: d, type: 'server', status: 'applied', docroot: '/var/www/whm-default', ssl: { cert: '/etc/ssl/whm/panel.example.com/cert.pem' }, error: null } : null), landingDocroot: '/var/www/whm-default' };
+    app.agent.set('ssl.service_cert.status', () => ({
+      panel: { service: 'panel', daemonPresent: true, hasCertificate: true, paths: PATHS('service/panel'), certificate: { ...certInfo, commonName: 'panel.example.com', subjectText: 'CN=panel.example.com', sans: ['panel.example.com'] } },
+      exim: { service: 'exim', daemonPresent: true, hasCertificate: true, paths: PATHS('service/exim'), certificate: { ...certInfo, commonName: 'old.example.net', subjectText: 'CN=old.example.net', sans: ['old.example.net'], selfSigned: true } },
+      apache: { service: 'apache', daemonPresent: true, hasCertificate: false, paths: PATHS('service/apache'), certificate: null },
+    }));
+    try {
+      // Whatever an earlier issuance left on the hostname goes first: the row starts empty.
+      app.ctx.db.prepare("UPDATE ssl_certs SET installed = 0 WHERE domain = 'panel.example.com'").run();
+      const empty = (await get('/api/ssl/hosts')).body.data;
+      expect(empty.serverHostname).toMatchObject({ hostname: 'panel.example.com', valid: true, certificate: null, docroot: '/var/www/whm-default', autossl: { provider: 'certbot', enabled: true, lastEntry: null }, landing: { status: 'applied', ssl: true }, reissue: { path: '/networking/hostname/certificate', available: true } });
+      expect(empty.serverHostname.services.map((s) => s.service)).toEqual(['exim', 'dovecot', 'ftp', 'panel'].sort((a, b) => ['exim', 'dovecot', 'apache', 'ftp', 'panel'].indexOf(a) - ['exim', 'dovecot', 'apache', 'ftp', 'panel'].indexOf(b)));
+      expect(empty.serverHostname.services.find((s) => s.service === 'panel')).toMatchObject({ hasCertificate: true, subject: 'CN=panel.example.com', coversHostname: true, selfSigned: false });
+      expect(empty.serverHostname.services.find((s) => s.service === 'exim')).toMatchObject({ hasCertificate: true, coversHostname: false, selfSigned: true });
+      expect(empty.serverHostname.services.find((s) => s.service === 'dovecot')).toMatchObject({ hasCertificate: false, coversHostname: null });
+      expect(empty.serverHostname.renewal).toMatchObject({ schedule: 'hostname-certificate-renew', renewDays: Number(app.ctx.settings.get('ssl.autossl.renew_days', 30)) });
+      expect(empty.hosts.some((h) => h.hostname)).toBe(false);
+      // The hostname's certificate (root installs it on the server row, as the issuer does) shows up and the host row is flagged.
+      const installed = await post('/api/ssl/install', { domain: 'panel.example.com', certPem: CERT, keyPem: KEY, force: true });
+      expect(installed.status, JSON.stringify(installed.body)).toBe(200);
+      const withCert = (await get('/api/ssl/hosts')).body.data;
+      expect(withCert.serverHostname.certificate).toMatchObject({ domain: 'panel.example.com', account: null, installed: 1, state: 'installed' });
+      expect(withCert.hosts.find((h) => h.domain === 'panel.example.com')).toMatchObject({ hostname: true, account: null });
+      expect(withCert.hosts.filter((h) => h.hostname)).toHaveLength(1);
+      // The download of the hostname certificate goes through the stored row.
+      const dl = await get(`/api/ssl/certs/${withCert.serverHostname.certificate.id}/download?part=cert`);
+      expect(dl.status).toBe(200);
+      expect(dl.body.data.filename).toBe('panel.example.com.crt');
+      // Resellers get neither the row nor the flag.
+      const mine = (await reseller.get('/api/ssl/hosts')).body.data;
+      expect(mine.serverHostname).toBeNull();
+      expect(mine.hosts.map((h) => h.domain)).not.toContain('panel.example.com');
+      await del('/api/ssl/hosts/panel.example.com').expect(200);
+      // An unqualified hostname gives an inert row.
+      app.ctx.settings.set('basic.hostname', 'localhost');
+      expect((await get('/api/ssl/hosts')).body.data.serverHostname).toMatchObject({ hostname: 'localhost', valid: false, certificate: null, services: [] });
+    } finally {
+      app.ctx.web = originalWeb;
+      app.ctx.settings.setMany({ 'basic.hostname': previous, 'ssl.autossl.provider': previousProvider });
+      app.agent.set('ssl.service_cert.status', () => ({ exim: { service: 'exim', daemonPresent: true, hasCertificate: false, paths: PATHS('service/exim'), certificate: null } }));
+    }
+  });
+});

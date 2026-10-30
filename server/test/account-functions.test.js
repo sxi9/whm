@@ -809,6 +809,225 @@ describe('Account Functions API', () => {
     });
   });
 
+  describe('domains of an account (addon / sub / parked)', () => {
+    const order = [];
+    const calls = { web: [], dns: [], ssl: [], mail: [] };
+    const certs = new Map();
+    const zones = new Map();
+    let savedDns;
+    let home;
+    let ip;
+    let savedSsl;
+    let savedMail;
+    const zoneContaining = (name) => [...zones.keys()].filter((z) => name === z || name.endsWith(`.${z}`)).sort((a, b) => b.length - a.length)[0] || null;
+    const stubs = () => {
+      app.ctx.web = {
+        isServerName: (d) => ['panel.example.com', 'www.panel.example.com'].includes(d),
+        vhosts: { sync: async (username) => { order.push('web'); calls.web.push(['sync', username]); return { username, applied: true, vhosts: [{ domain: 'x', applied: true }], reload: { reloaded: true } }; } },
+        removeDomain: async (domain) => { order.push('web'); calls.web.push(['remove', domain]); return { domain, removed: true, recorded: true, applied: true }; },
+        vhostFor: (domain) => ({ domain, status: 'applied', error: null, path: `/etc/apache2/sites-available/${domain}.conf` }),
+        landingDocroot: '/var/www/whm-default',
+      };
+      app.ctx.dns = {
+        zoneFor: (name) => { const z = zoneContaining(name); return z ? { domain: z } : null; },
+        ensureZoneForDomain: async (domain, opts) => { order.push('dns'); calls.dns.push(['ensure', domain, opts]); zones.set(domain, opts.accountId); return { domain, applied: true, created: true, serial: 2026103001 }; },
+        upsertRecords: async (zone, name, type, values) => { order.push('dns'); calls.dns.push(['upsert', zone, name, type, values]); return { applied: true }; },
+        deleteZone: async (domain) => { order.push('dns'); calls.dns.push(['delete', domain]); zones.delete(domain); return { domain, removed: true }; },
+        parkDomain: async (input, user) => {
+          order.push('dns'); calls.dns.push(['park', input, user.username]);
+          const account = app.ctx.db.prepare('SELECT * FROM accounts WHERE username = ?').get(input.account);
+          app.ctx.db.prepare('INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, ?, ?, ?)').run(account.id, input.domain, 'parked', `${account.home_dir}/public_html`);
+          zones.set(input.domain, account.id);
+          return { domain: input.domain, account: input.account, target: account.domain, docroot: `${account.home_dir}/public_html`, zone: { domain: input.domain, applied: true }, web: true, webDetail: null };
+        },
+        unparkDomain: async (domain, opts, user) => {
+          order.push('dns'); calls.dns.push(['unpark', domain, opts, user.username]);
+          app.ctx.db.prepare('DELETE FROM account_domains WHERE domain = ?').run(domain);
+          zones.delete(domain);
+          return { domain, unparked: true, zoneRemoved: true, web: true, webDetail: null };
+        },
+      };
+      app.ctx.ssl = {
+        autossl: { settings: () => ({ provider: 'certbot', renewDays: 30 }) },
+        certForDomain: (domain) => certs.get(domain) ?? null,
+        issueFor: async (domain, user) => { order.push('ssl'); calls.ssl.push(['issue', domain, user.username]); certs.set(domain, { id: 7, installed: 1, state: 'installed', issuer: 'CN=R3', notAfter: '2027-01-01T00:00:00.000Z', daysRemaining: 400, expired: false, autossl: true, selfSigned: false }); return { cert: { id: 7 }, certificate: { issuerCommonName: 'R3', notAfter: '2027-01-01T00:00:00.000Z' }, web: 'applied', renewed: true }; },
+        uninstall: async (domain) => { order.push('ssl'); calls.ssl.push(['uninstall', domain]); certs.delete(domain); return { domain, removed: true, web: 'applied' }; },
+      };
+      app.ctx.mail = { setRouting: async (domain, routing) => { order.push('mail'); calls.mail.push([domain, routing]); return { applied: true, routing }; } };
+    };
+    const reset = () => { order.length = 0; for (const k of Object.keys(calls)) calls[k].length = 0; app.agent.calls.length = 0; };
+    const dnsResolve = (answers) => app.agent.set('dns.resolve', ({ name }) => { order.push('resolve'); return { name, answers, error: null }; });
+
+    beforeAll(() => {
+      savedDns = app.ctx.dns; savedSsl = app.ctx.ssl; savedMail = app.ctx.mail;
+      // Rearrange moved alice to /home2 earlier in this file; the home is whatever the account row says.
+      home = app.ctx.db.prepare('SELECT home_dir FROM accounts WHERE username = ?').get('alice').home_dir;
+      // Change Site IP gave alice an address earlier in this file; the zone and the A record use it.
+      ip = app.ctx.db.prepare('SELECT ip FROM accounts WHERE username = ?').get('alice').ip || '203.0.113.10';
+      stubs();
+      app.ctx.settings.setMany({ 'basic.main_ip': '203.0.113.10', 'basic.hostname': 'panel.example.com' });
+      app.agent.set('web.docroot.ensure', ({ username, docroot, index }) => { order.push('docroot'); return { username, docroot, created: true, group: 'www-data', mode: '0750', indexWritten: Boolean(index) }; });
+      app.agent.set('web.docroot.remove', ({ username, docroot }) => { order.push('files'); return { username, docroot, removed: true }; });
+      dnsResolve(['203.0.113.10']);
+      zones.set('alice.com', 1); zones.set('bob.com', 2);
+    });
+    afterAll(() => { app.ctx.dns = savedDns; app.ctx.ssl = savedSsl; app.ctx.mail = savedMail; delete app.ctx.web; app.ctx.settings.setMany({ 'basic.main_ip': '', 'basic.hostname': '' }); app.agent.reset('dns.resolve'); });
+    beforeEach(reset);
+
+    it('adds an addon domain: docroot + index as the account first, then the row, vhost, zone, mail and AutoSSL once the name resolves here', async () => {
+      const res = await post('/domains/alice', { domain: 'Blog.Example', type: 'addon' });
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(res.body.data).toMatchObject({ domain: 'blog.example', type: 'addon', docroot: `${home}/public_html/blog.example`, username: 'alice', parent: null });
+      expect(res.body.data.steps).toMatchObject({ docroot: { status: 'applied', created: true, indexWritten: true }, web: { status: 'applied' }, dns: { status: 'applied', zone: 'blog.example', created: true }, mail: { status: 'applied' }, ssl: { status: 'applied', certId: 7 } });
+      expect(order).toEqual(['docroot', 'web', 'dns', 'mail', 'resolve', 'ssl']);
+      const ensure = app.agent.callsTo('web.docroot.ensure');
+      expect(ensure).toHaveLength(1);
+      expect(ensure[0].args).toMatchObject({ username: 'alice', docroot: `${home}/public_html/blog.example` });
+      expect(ensure[0].args.index).toContain('Ready to launch');
+      expect(ensure[0].args.index).toContain('blog.example');
+      expect(ensure[0].args.index).toContain('panel.example.com');
+      expect(ensure[0].args.group).toBeUndefined();
+      expect(calls.web).toEqual([['sync', 'alice']]);
+      expect(calls.dns).toEqual([['ensure', 'blog.example', { ip, accountId: expect.any(Number), nameservers: undefined }]]);
+      expect(calls.mail).toEqual([['blog.example', 'local']]);
+      expect(calls.ssl).toEqual([['issue', 'blog.example', 'root']]);
+      expect(app.ctx.db.prepare('SELECT type, docroot FROM account_domains WHERE domain = ?').get('blog.example')).toEqual({ type: 'addon', docroot: `${home}/public_html/blog.example` });
+      expect(res.body.data.entry).toMatchObject({ domain: 'blog.example', type: 'addon', ssl: { installed: 1, issuer: 'CN=R3', autossl: true }, zone: true, vhost: { status: 'applied' } });
+      const audit = app.ctx.db.prepare("SELECT target, args_redacted FROM audit_log WHERE action = 'account.domain.add' ORDER BY id DESC LIMIT 1").get();
+      expect(audit.target).toBe('blog.example');
+      expect(JSON.parse(audit.args_redacted)).toMatchObject({ username: 'alice', type: 'addon', steps: { docroot: 'applied', web: 'applied', dns: 'applied', ssl: 'applied' } });
+      // Listed with limits and capabilities; resellers cannot read another owner's account.
+      const list = await get('/domains/alice').expect(200);
+      expect(list.body.data).toMatchObject({ username: 'alice', domain: 'alice.com', home: `${home}`, limits: { addon: { used: 1 }, sub: { used: 0 }, parked: { used: 0 } }, capabilities: { dns: true, ssl: true, autossl: true } });
+      expect(list.body.data.domains.map((d) => [d.domain, d.type])).toEqual([['blog.example', 'addon'], ['alice.com', 'main']]);
+      expect(list.body.data.domains.find((d) => d.type === 'main').docroot).toBe(`${home}/public_html`);
+      expect((await rget('/domains/alice')).status).toBe(403);
+    });
+
+    it('a sub domain must sit under one of the account\'s domains; its A record goes into the containing zone and its docroot is the label', async () => {
+      const bad = await post('/domains/alice', { domain: 'shop.other.com', type: 'sub' });
+      expect(bad.status).toBe(422);
+      expect(bad.body.error.fields.domain[0]).toMatch(/subdomain of one of the account/);
+      expect(order).toEqual([]);
+      const res = await post('/domains/alice', { domain: 'shop.alice.com', type: 'sub' });
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(res.body.data).toMatchObject({ type: 'sub', docroot: `${home}/public_html/shop`, parent: 'alice.com', steps: { dns: { status: 'applied', zone: 'alice.com' } } });
+      expect(calls.dns).toEqual([['upsert', 'alice.com', 'shop.alice.com', 'A', [{ value: ip }]]]);
+      // Under the addon domain too, with a dotted label.
+      const deep = await post('/domains/alice', { domain: 'a.b.blog.example', type: 'sub', autossl: false });
+      expect(deep.status).toBe(201);
+      expect(deep.body.data).toMatchObject({ docroot: `${home}/public_html/a.b`, parent: 'blog.example', steps: { ssl: { status: 'skipped', detail: 'not requested' } } });
+      expect(calls.ssl).toEqual([['issue', 'shop.alice.com', 'root']]);
+    });
+
+    it('refuses the server hostname, www. names, domains hosted elsewhere, bad document roots and unknown types before touching the host', async () => {
+      for (const [body, status, re] of [
+        [{ domain: 'panel.example.com', type: 'addon' }, 409, /server hostname/],
+        [{ domain: 'www.panel.example.com', type: 'addon' }, 422, /www\./],
+        [{ domain: 'www.alice.com', type: 'sub' }, 422, /www\./],
+        [{ domain: 'bob.com', type: 'addon' }, 409, /already hosted/],
+        [{ domain: 'alice.com', type: 'addon' }, 409, /already hosted/],
+        [{ domain: 'x.example', type: 'alias' }, 422, /./],
+        [{ domain: 'x.example', type: 'addon', docroot: '/home/bob/public_html/x' }, 422, /inside the account home/],
+        [{ domain: 'x.example', type: 'addon', docroot: `${home}/public_html` }, 422, /Reserved|public_html directory/],
+        [{ domain: 'x.example', type: 'addon', docroot: `${home}/public_html/x y` }, 422, /./],
+        [{ domain: 'x.example', type: 'addon', docroot: `${home}/../bob/x` }, 422, /./],
+        [{ domain: 'x.example', type: 'addon', docroot: `${home}/public_html/blog.example` }, 409, /already the document root of blog\.example/],
+        [{ domain: 'x.example', type: 'addon', extra: 1 }, 422, /./],
+      ]) {
+        const res = await post('/domains/alice', body);
+        expect(res.status, JSON.stringify(body)).toBe(status);
+        expect(res.body.error.message).toMatch(re);
+      }
+      expect(order).toEqual([]);
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM account_domains WHERE domain = 'x.example'").get().n).toBe(0);
+      expect((await post('/domains/nobody', { domain: 'x.example', type: 'addon' })).status).toBe(404);
+    });
+
+    it('a refused document root (planted link, reserved directory) stops before anything is recorded', async () => {
+      app.agent.fail('web.docroot.ensure', 'refused', `${home}/public_html/evil escapes the home directory through a symbolic link`);
+      try {
+        const res = await post('/domains/alice', { domain: 'evil.example', type: 'addon' });
+        expect(res.status).toBe(422);
+        expect(res.body.error.message).toMatch(/symbolic link/);
+        expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM account_domains WHERE domain = 'evil.example'").get().n).toBe(0);
+        expect(calls.web).toEqual([]);
+        expect(calls.dns).toEqual([]);
+      } finally { app.agent.set('web.docroot.ensure', ({ username, docroot, index }) => { order.push('docroot'); return { username, docroot, created: true, group: 'www-data', mode: '0750', indexWritten: Boolean(index) }; }); }
+    });
+
+    it('AutoSSL is skipped (not failed) while the name resolves elsewhere or AutoSSL is off', async () => {
+      dnsResolve(['198.51.100.7']);
+      const res = await post('/domains/alice', { domain: 'elsewhere.example', type: 'addon' });
+      expect(res.status).toBe(201);
+      expect(res.body.data.steps.ssl).toMatchObject({ status: 'skipped', answers: ['198.51.100.7'] });
+      expect(res.body.data.steps.ssl.detail).toMatch(/does not resolve to this server yet/);
+      expect(calls.ssl).toEqual([]);
+      dnsResolve(['203.0.113.10']);
+      const settings = app.ctx.ssl.autossl.settings;
+      app.ctx.ssl.autossl.settings = () => ({ provider: 'disabled' });
+      try {
+        const off = await post('/domains/alice', { domain: 'noacme.example', type: 'addon' });
+        expect(off.body.data.steps.ssl).toMatchObject({ status: 'skipped' });
+        expect(off.body.data.steps.ssl.detail).toMatch(/AutoSSL is disabled/);
+      } finally { app.ctx.ssl.autossl.settings = settings; }
+      expect(calls.ssl).toEqual([]);
+    });
+
+    it('parked domains go through DNS Functions (parkDomain / unparkDomain) and never create a document root', async () => {
+      const res = await post('/domains/alice', { domain: 'parked.example', type: 'parked' });
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(res.body.data).toMatchObject({ type: 'parked', docroot: `${home}/public_html`, steps: { dns: { status: 'applied' }, web: { status: 'applied' } } });
+      expect(calls.dns).toEqual([['park', { domain: 'parked.example', account: 'alice', createZone: true }, 'root']]);
+      expect(app.agent.callsTo('web.docroot.ensure')).toEqual([]);
+      expect(calls.web).toEqual([]);
+      expect(app.ctx.db.prepare('SELECT type FROM account_domains WHERE domain = ?').get('parked.example')).toEqual({ type: 'parked' });
+      reset();
+      const gone = await app.http.delete('/api/account-functions/domains/alice/parked.example').set('X-CSRF-Token', csrf).expect(200);
+      expect(gone.body.data).toMatchObject({ removed: true, type: 'parked', steps: { dns: { status: 'applied' } } });
+      expect(calls.dns).toEqual([['unpark', 'parked.example', { removeZone: true }, 'root']]);
+      expect(app.ctx.db.prepare('SELECT 1 FROM account_domains WHERE domain = ?').get('parked.example')).toBeUndefined();
+    });
+
+    it('removes an addon domain: certificate, vhost, zone, mail routing, the row, then the files as the account only when asked', async () => {
+      const kept = await app.http.delete('/api/account-functions/domains/alice/a.b.blog.example').set('X-CSRF-Token', csrf).expect(200);
+      expect(kept.body.data).toMatchObject({ removed: true, type: 'sub', steps: { web: { status: 'applied' }, dns: { status: 'applied' }, files: { status: 'skipped' } } });
+      expect(calls.dns).toEqual([['upsert', 'blog.example', 'a.b.blog.example', 'A', []]]);
+      expect(app.agent.callsTo('web.docroot.remove')).toEqual([]);
+      reset();
+      const res = await app.http.delete('/api/account-functions/domains/alice/blog.example?deleteFiles=true').set('X-CSRF-Token', csrf).expect(200);
+      expect(res.body.data).toMatchObject({ domain: 'blog.example', type: 'addon', removed: true, docroot: `${home}/public_html/blog.example`, steps: { ssl: { status: 'applied' }, web: { status: 'applied' }, dns: { status: 'applied' }, mail: { status: 'applied' }, files: { status: 'applied' } } });
+      expect(order).toEqual(['ssl', 'web', 'dns', 'mail', 'files']);
+      expect(calls.ssl).toEqual([['uninstall', 'blog.example']]);
+      expect(calls.web).toEqual([['remove', 'blog.example']]);
+      expect(calls.dns).toEqual([['delete', 'blog.example']]);
+      expect(calls.mail).toEqual([['blog.example', 'remote']]);
+      expect(app.agent.callsTo('web.docroot.remove').map((c) => c.args)).toEqual([{ username: 'alice', docroot: `${home}/public_html/blog.example` }]);
+      expect(app.ctx.db.prepare('SELECT 1 FROM account_domains WHERE domain = ?').get('blog.example')).toBeUndefined();
+      expect(JSON.parse(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'account.domain.remove' AND target = 'blog.example'").get().args_redacted)).toMatchObject({ username: 'alice', deleteFiles: true, steps: { files: 'applied' } });
+      // The main domain, a foreign domain and an unknown one are refused.
+      expect((await app.http.delete('/api/account-functions/domains/alice/alice.com').set('X-CSRF-Token', csrf)).status).toBe(409);
+      expect((await app.http.delete('/api/account-functions/domains/alice/bob.com').set('X-CSRF-Token', csrf)).status).toBe(404);
+      expect((await app.http.delete('/api/account-functions/domains/alice/nothing.example').set('X-CSRF-Token', csrf)).status).toBe(404);
+    });
+
+    it('resellers manage only their own accounts and stay within the package limits; root does not', async () => {
+      expect((await rpost('/domains/alice', { domain: 'r1.example', type: 'addon' })).status).toBe(403);
+      app.ctx.db.prepare("UPDATE accounts SET plan_snapshot_json = '{\"max_addons\":1}' WHERE username = 'bob'").run();
+      const first = await rpost('/domains/bob', { domain: 'r1.example', type: 'addon' });
+      expect(first.status, JSON.stringify(first.body)).toBe(201);
+      expect(calls.ssl).toEqual([['issue', 'r1.example', 'resell1']]);
+      const second = await rpost('/domains/bob', { domain: 'r2.example', type: 'addon' });
+      expect(second.status).toBe(403);
+      expect(second.body.error.message).toMatch(/allows 1 addon/);
+      expect((await post('/domains/bob', { domain: 'r2.example', type: 'addon' })).status).toBe(201);
+      const mine = await rget('/domains/bob').expect(200);
+      expect(mine.body.data.limits.addon).toEqual({ used: 2, max: 1 });
+      expect((await resellerHttp.delete('/api/account-functions/domains/bob/r2.example').set('X-CSRF-Token', resellerCsrf)).status).toBe(200);
+      expect((await resellerHttp.delete('/api/account-functions/domains/alice/shop.alice.com').set('X-CSRF-Token', resellerCsrf)).status).toBe(403);
+    });
+  });
+
   describe('quota filesystem at creation', () => {
     it('sets the package quota on the filesystem that holds the home, not on /', async () => {
       const homeRoot = app.ctx.settings.get('basic.home_root');

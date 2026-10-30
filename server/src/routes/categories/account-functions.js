@@ -11,6 +11,10 @@ const templateName = z.enum(TEMPLATE_NAMES);
 const logKind = z.enum(['apache', 'nginx']);
 const logFile = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$/, 'Log file name');
 const mb = z.number().int().min(0).max(1_000_000_000);
+const domainType = z.enum(['addon', 'sub', 'parked']);
+// The agent's confPath alphabet: an absolute path without "..", spaces or quotes.
+const docrootPath = z.string().max(4096).regex(/^\/(?!(?:.*\/)?\.\.(?:\/|$))[A-Za-z0-9._~+@=\/-]+$/, 'Absolute path without spaces, quotes or ".."');
+const boolQuery = z.enum(['true', 'false']).transform((v) => v === 'true');
 
 export async function register(ctx) {
   ctx.accountFunctions = createAccountFunctionsService(ctx);
@@ -34,6 +38,13 @@ export async function register(ctx) {
 
   // Change Site's IP Address ----------------------------------------------------
   r.put('/ip/:username', requireReseller, validate({ params: nameParam, body: z.object({ ip: fields.ip }).strict() }), wrap((req) => svc().changeIp(req.params.username, req.body, req.user, req)));
+
+  // Domains of an account (addon / sub / parked) ---------------------------------
+  r.get('/domains/:username', requireReseller, validate({ params: nameParam }), wrap((req) => svc().domains.list(req.params.username, req.user)));
+  r.post('/domains/:username', requireReseller, validate({ params: nameParam, body: z.object({ domain: fields.domain, type: domainType, docroot: docrootPath.optional(), autossl: z.boolean().optional() }).strict() }),
+    wrap((req) => svc().domains.add(req.params.username, req.body, req.user, req), 201));
+  r.delete('/domains/:username/:domain', requireReseller, validate({ params: nameParam.extend({ domain: fields.domain }), query: z.object({ deleteFiles: boolQuery.optional() }) }),
+    wrap((req) => svc().domains.remove(req.params.username, req.params.domain, { deleteFiles: Boolean(req.query.deleteFiles) }, req.user, req)));
 
   // Email All Users -------------------------------------------------------------
   r.get('/email/recipients', requireReseller, validate({ query: z.object({ scope: z.enum(['all', 'active', 'suspended']).default('all'), owner: fields.username.optional() }) }), wrap((req) => svc().recipients(req.query, req.user)));

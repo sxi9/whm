@@ -31,6 +31,7 @@ export const EVENTS = [
   { key: 'bpk.killed', label: 'Background Process Killer terminated processes', severity: 'warning', group: 'Security' },
   { key: 'login.failed.blocked', label: 'Address blocked after failed logins', severity: 'warning', group: 'Security', wired: false },
   { key: 'login.new_ip', label: 'Login from a new address', severity: 'warning', group: 'Security' },
+  { key: 'security.alert', label: 'Security alert (critical findings, security updates, emergency update notices)', severity: 'critical', group: 'Security' },
   { key: 'ssl.expiring', label: 'SSL certificate expiring', severity: 'warning', group: 'SSL' },
   { key: 'updates.available', label: 'Software updates available', severity: 'info', group: 'Software' },
   { key: 'license.expiring', label: 'License expiring', severity: 'warning', group: 'Licensing', wired: false },

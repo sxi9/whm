@@ -7,11 +7,15 @@ import { createSoftwareService } from '../../services/software.js';
 // before any op call, and the agent refuses them again regardless.
 const pkgName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9+._-]{0,99}$/, 'Package names use letters, digits, "+", ".", "_" and "-" and cannot start with "-"');
 const searchTerm = z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9+._-]{0,63}$/, 'Search with letters, digits, "+", ".", "_" or "-"');
+const catalogQuery = z.string().trim().max(60).regex(/^[A-Za-z0-9 +._-]*$/, 'Filter with letters, digits, spaces, "+", ".", "_" or "-"');
+const catalogGroup = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/, 'Group key');
+const catalogKey = z.string().regex(/^[a-z][a-z0-9-]{0,39}$/, 'Catalog entry key');
 const perlModule = z.string().max(128).regex(/^[A-Za-z][A-Za-z0-9_]*(::[A-Za-z0-9_]+)*$/, 'Perl module names look like Foo::Bar');
 const moduleKind = z.enum(['pecl', 'pear', 'gem', 'pip']);
 const moduleName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/, 'Letters, digits, ".", "_" and "-" only');
 const versionSpec = z.string().regex(/^[0-9][0-9A-Za-z.+~:-]{0,63}$/, 'Version must start with a digit');
 const phpVersionId = z.string().regex(/^[a-z0-9][a-z0-9.-]{0,31}$/, 'PHP version id such as 8.3 or ea-php83');
+const phpBranch = z.string().regex(/^\d\.\d$/, 'PHP branch such as 8.3');
 const sapi = z.enum(['fpm', 'apache2', 'cli', 'php']).optional();
 const iniKey = z.string().regex(/^[A-Za-z_][A-Za-z0-9_.]{0,63}$/);
 const iniValue = z.string().max(1024).regex(/^[^\r\n\0]*$/, 'Directive values are a single line');
@@ -61,7 +65,11 @@ export async function register(ctx) {
   // Install Distro Packages
   r.get('/pkg/detect', requireRoot, wrap(() => s.pkg.detect()));
   r.get('/pkg/installed', requireRoot, validate({ query: pagination.extend({ q: searchTerm.optional() }) }), wrap((req) => s.pkg.installed(req.query)));
-  r.get('/pkg/search', requireRoot, validate({ query: z.object({ q: searchTerm, limit: z.coerce.number().int().min(1).max(500).default(100) }) }), wrap((req) => s.pkg.search(req.query.q, req.query.limit)));
+  // One row per piece of software with its variants folded; all=true is the raw list behind "Show everything".
+  r.get('/pkg/search', requireRoot, validate({ query: z.object({ q: searchTerm, limit: z.coerce.number().int().min(1).max(500).default(60), all: z.enum(['true', 'false']).default('false') }) }), wrap((req) => s.pkg.search(req.query.q, { limit: req.query.limit, all: req.query.all === 'true' })));
+  // The curated catalog (server/src/lib/package-catalog.js) the page opens on, and an install of one entry by key.
+  r.get('/pkg/catalog', requireRoot, validate({ query: z.object({ q: catalogQuery.optional(), group: catalogGroup.optional(), refresh: z.enum(['true', 'false']).default('false') }) }), wrap((req) => s.pkg.catalog({ q: req.query.q, group: req.query.group, refresh: req.query.refresh === 'true' })));
+  r.post('/pkg/catalog/:key/install', requireRoot, validate({ params: z.object({ key: catalogKey }), body: z.object({ phpVersion: phpVersionId.optional() }).strict() }), accepted((req) => s.pkg.installEntry(req.params.key, req.body, req.user, req)));
   r.get('/pkg/info/:name', requireRoot, validate({ params: z.object({ name: pkgName }) }), wrap((req) => s.pkg.info(req.params.name)));
   r.get('/pkg/recent', requireRoot, wrap(() => s.pkg.recent()));
   r.post('/pkg/install', requireRoot, validate({ body: packagesBody.extend({ noRecommends: z.boolean().default(false) }).strict() }), accepted((req) => s.pkg.install(req.body.packages, req.user, req, { noRecommends: req.body.noRecommends })));
@@ -98,6 +106,10 @@ export async function register(ctx) {
   r.get('/php/domains', requireReseller, validate({ query: pagination.extend({ account: fields.username.optional(), pageSize: z.coerce.number().int().min(1).max(500).default(500), sort: z.enum(['domain', 'account', 'type', 'effective']).optional() }) }), wrap((req) => s.php.domains(req.user, req.query)));
   r.put('/php/domains', requireReseller, validate({ body: z.object({ domains: z.array(fields.hostname).min(1).max(500), version: phpVersionId.nullable() }).strict() }), maybeAccepted((req) => s.php.setDomainVersion(req.body.domains, req.body.version, req.user, req)));
   r.get('/php/pools', requireRoot, validate({ query: z.object({ version: phpVersionId.optional() }) }), wrap((req) => s.php.pools(req.query.version)));
+  // Install a PHP version: the branches the family's package source offers, an install job, a removal job.
+  r.get('/php/installable', requireRoot, wrap(() => s.php.installable()));
+  r.post('/php/install', requireRoot, validate({ body: z.object({ version: phpBranch }).strict() }), accepted((req) => s.php.installVersion(req.body.version, req.user, req)));
+  r.delete('/php/versions/:id', requireRoot, validate({ params: z.object({ id: phpVersionId }) }), accepted((req) => s.php.removeVersion(req.params.id, req.user, req)));
 
   // MultiPHP INI Editor
   r.get('/php/ini/directives', requireReseller, wrap(() => s.ini.directives()));

@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import { json } from '../db/index.js';
 import { notFound, badRequest, conflict, unprocessable, CapabilityError } from '../lib/errors.js';
 
@@ -22,7 +23,12 @@ import { notFound, badRequest, conflict, unprocessable, CapabilityError } from '
 //   web.applyEximTls({ minProtocol, protocols, cipherList, cipherSuites, preferServerCiphers }, req)   -> ssl-tls presets for Exim
 //   web.applyMailserverTls({ minProtocol, cipherList, cipherSuites, preferServerCiphers }, req)       -> ssl-tls presets for Dovecot
 //   web.ensureHostnameVhost(req, { hostname? })      -> the 'server' vhost for the server's own name (branded landing page under
-//                                                       web.landingDocroot); never throws: { applied, reason?, landingPage }
+//                                                       web.landingDocroot); never throws: { applied, reason?, landingPage, defaultVhost }
+//   web.ensureDefaultVhost(req, { hostname? })       -> the catch-all vhost (000-whm-default / 00-whm-default: the landing page for the
+//                                                       bare address and names no site claims, :80 and :443); never throws
+//   web.removeDefaultVhost(req)                      -> delete the catch-all vhost file
+//   web.removeDomain(domain, req)                    -> delete one domain's vhost (file + row), never the hostname's; account-functions
+//                                                       calls it when an addon/sub domain is removed
 //   web.forceHttps()                                 -> whether vhosts with a certificate redirect HTTP to HTTPS (setting web.force_https)
 //   web.isServerName(domain)                         -> true for the server hostname and www.<hostname>: the vhost layer refuses to host
 //                                                       them for an account (409), and accounts/domains must refuse them at creation
@@ -525,33 +531,108 @@ export function createServiceConfigService(ctx) {
     } catch { return null; }
   }
 
+  async function writeLandingPage(name, req) {
+    try {
+      await op('fs.write_file', { path: `${LANDING_DOCROOT}/index.html`, content: landingHtml(name), owner: 'root', mode: '0644', backup: false }, req);
+      return true;
+    } catch (err) { logger.warn({ err }, 'web: landing page could not be written'); return false; }
+  }
+
+  async function apacheRunUser(installed) {
+    const d = installed ? await detect().catch(() => null) : null;
+    return d?.apache?.runUser || (d?.apache?.flavor === 'rhel' ? 'apache' : 'www-data');
+  }
+
+  // Every address a tenant vhost binds to: the catch-all must list them, since
+  // Apache picks the first vhost of the most specific address set and a plain
+  // _default_ never beats an IP-specific tenant vhost for that IP.
+  function listenAddresses() {
+    const set = new Set();
+    for (const r of stmts.vhostsAll.all()) { if (r.ip) set.add(r.ip); if (r.ipv6) set.add(r.ipv6); }
+    for (const key of ['basic.main_ip', 'basic.shared_ip', 'basic.main_ipv6']) { const v = String(settings.get(key, '') || '').trim(); if (v) set.add(v); }
+    try { for (const row of db.prepare('SELECT address FROM ip_addresses').all()) if (row.address) set.add(String(row.address)); } catch { /* ip table absent */ }
+    return [...set].filter((a) => isIP(a) > 0).sort().slice(0, 64);
+  }
+
+  const serverSsl = (name) => { const prev = stmts.vhostByDomain.get(name); return (prev?.type === 'server' ? json.parse(prev.ssl_json, null) : null) || installedBundle(name); };
+
+  // The catch-all vhost (agent web.default_vhost.write): the landing page for
+  // the bare address and for names no site claims, on the HTTP and HTTPS
+  // ports, with the hostname's certificate when one is installed. Written
+  // with the hostname vhost (boot, hostname change, template save, re-render
+  // job) and whenever the hostname's certificate changes. Never throws.
+  async function ensureDefaultVhost(req = null, { hostname: wanted = null } = {}) {
+    const name = String(wanted || hostname()).trim().toLowerCase() || 'localhost';
+    const installed = capabilities.has('apache');
+    if (!installed) { recordApply('default_vhost', false, { hostname: name, pending: true }, 'Apache is not installed'); return { hostname: name, applied: false, reason: 'capability_missing', docroot: LANDING_DOCROOT }; }
+    const user = await apacheRunUser(installed);
+    const ports = listenPorts();
+    const args = { hostname: name, docroot: LANDING_DOCROOT, user, addresses: listenAddresses(), port: ports.http, sslPort: ports.https, logDir: domlogDir(user), reload: true };
+    if (ports.bind) args.bind = ports.bind;
+    const ssl = serverSsl(name);
+    if (ssl?.cert && ssl?.key) args.ssl = { cert: ssl.cert, key: ssl.key, ...(ssl.chain ? { chain: ssl.chain } : {}), ...(ssl.fullchain ? { fullchain: ssl.fullchain } : {}) };
+    try {
+      const r = await op('web.default_vhost.write', args, req);
+      recordApply('default_vhost', true, { hostname: name, path: r.path ?? null, ssl: r.ssl ?? null, addresses: r.addresses ?? args.addresses, stockSite: r.stockSite ?? null, reloaded: Boolean(r.reloaded) });
+      audit(req, { action: 'web.vhost.default', target: name, args: { docroot: LANDING_DOCROOT, addresses: args.addresses.length, ssl: r.ssl?.source ?? null, stockSite: r.stockSite?.disabled ?? false } });
+      return { hostname: name, applied: true, docroot: LANDING_DOCROOT, path: r.path ?? null, ssl: r.ssl ?? null, addresses: r.addresses ?? args.addresses, stockSite: r.stockSite ?? null, reload: { reloaded: Boolean(r.reloaded), unit: r.unit ?? null } };
+    } catch (err) {
+      logger.warn({ err, hostname: name }, 'web: default vhost could not be written');
+      recordApply('default_vhost', false, { hostname: name }, err.message);
+      return { hostname: name, applied: false, reason: err.code || 'error', error: err.message, docroot: LANDING_DOCROOT };
+    }
+  }
+
+  async function removeDefaultVhost(req = null) {
+    if (!capabilities.has('apache')) return { removed: false, reason: 'capability_missing' };
+    const r = await op('web.default_vhost.remove', {}, req);
+    recordApply('default_vhost', true, { removed: Boolean(r.removed), path: r.path ?? null });
+    audit(req, { action: 'web.vhost.default.remove', target: r.path ?? 'default', args: { removed: Boolean(r.removed) } });
+    return { removed: Boolean(r.removed), path: r.path ?? null, reload: { reloaded: Boolean(r.reloaded), unit: r.unit ?? null } };
+  }
+
+  // One domain's vhost goes (file and row); the hostname's never does this
+  // way and a main domain keeps its vhost until the account is removed.
+  async function removeDomain(domain, req) {
+    const row = stmts.vhostByDomain.get(domain);
+    if (row?.type === 'server') throw conflict(`${domain} is the server hostname's own virtual host`);
+    if (row?.type === 'main') throw conflict(`${domain} is the main domain of ${row.username}; terminate the account to remove it`);
+    let removed = false;
+    if (capabilities.has('apache')) {
+      try { removed = Boolean((await op('web.vhost.remove', { domain, reload: true }, req)).removed); } catch (err) { logger.warn({ err, domain }, 'web: vhost removal failed'); }
+    }
+    if (row) stmts.deleteVhost.run(domain);
+    audit(req, { action: 'web.vhost.domain.remove', target: domain, args: { removed, recorded: Boolean(row), username: row?.username ?? null } });
+    return { domain, removed, recorded: Boolean(row), applied: removed || !capabilities.has('apache') };
+  }
+
   // Renders the 'server' vhost for the server's own name: the branded landing
   // page from LANDING_DOCROOT, no PHP, the hostname's certificate when one is
-  // installed. Any previous hostname's vhost goes away. Never throws (boot and
-  // the hostname change report the outcome as a step).
+  // installed. Any previous hostname's vhost goes away. The catch-all vhost is
+  // refreshed afterwards so it carries the same certificate and addresses.
+  // Never throws (boot and the hostname change report the outcome as a step).
   async function ensureHostnameVhost(req = null, { hostname: wanted = null } = {}) {
     const name = String(wanted || hostname()).trim().toLowerCase();
-    if (!HOSTNAME_RE.test(name) || name === 'localhost' || name.endsWith('.localdomain')) return { hostname: name, applied: false, reason: 'invalid_hostname', error: `"${name}" is not a fully qualified hostname; set one in Basic WebHost Manager Setup or Change Hostname` };
-    if (stmts.accountByDomain.get(name) || stmts.accountDomain.get(name)) return { hostname: name, applied: false, reason: 'hosted_domain', error: `${name} is a domain hosted by an account; its own virtual host serves it` };
+    if (!HOSTNAME_RE.test(name) || name === 'localhost' || name.endsWith('.localdomain')) {
+      const landingPage = await writeLandingPage(name, req);
+      const defaultVhost = await ensureDefaultVhost(req, { hostname: name });
+      return { hostname: name, applied: false, reason: 'invalid_hostname', error: `"${name}" is not a fully qualified hostname; set one in Basic WebHost Manager Setup or Change Hostname`, landingPage, defaultVhost };
+    }
+    if (stmts.accountByDomain.get(name) || stmts.accountDomain.get(name)) return { hostname: name, applied: false, reason: 'hosted_domain', error: `${name} is a domain hosted by an account; its own virtual host serves it`, defaultVhost: await ensureDefaultVhost(req, { hostname: name }) };
     const installed = capabilities.has('apache');
     for (const stale of stmts.vhostsByType.all('server').filter((r) => r.domain !== name)) {
       if (installed) await op('web.vhost.remove', { domain: stale.domain, reload: false }, req).catch((err) => logger.warn({ err, domain: stale.domain }, 'web: previous hostname vhost could not be removed'));
       stmts.deleteVhost.run(stale.domain);
     }
-    let landingPage = false;
-    try {
-      await op('fs.write_file', { path: `${LANDING_DOCROOT}/index.html`, content: landingHtml(name), owner: 'root', mode: '0644', backup: false }, req);
-      landingPage = true;
-    } catch (err) { logger.warn({ err }, 'web: landing page could not be written'); }
-    const d = installed ? await detect().catch(() => null) : null;
-    const user = d?.apache?.runUser || (d?.apache?.flavor === 'rhel' ? 'apache' : 'www-data');
+    const landingPage = await writeLandingPage(name, req);
+    const user = await apacheRunUser(installed);
     const prev = stmts.vhostByDomain.get(name);
     const spec = {
       domain: name, accountId: null, username: user, type: 'server', docroot: LANDING_DOCROOT, aliases: [],
       ip: settings.get('basic.main_ip', '') || settings.get('basic.shared_ip', '') || null, ipv6: settings.get('basic.main_ipv6', '') || null,
       phpVersion: null, ssl: json.parse(prev?.ssl_json, null) || installedBundle(name), redirects: [], customDirectives: prev?.custom_directives || '', logDir: domlogDir(user),
     };
-    if (!installed) { storeSpec(spec); stmts.setVhostStatus.run('pending', 'Apache is not installed', null, name); return { hostname: name, applied: false, reason: 'capability_missing', docroot: LANDING_DOCROOT, landingPage }; }
+    if (!installed) { storeSpec(spec); stmts.setVhostStatus.run('pending', 'Apache is not installed', null, name); return { hostname: name, applied: false, reason: 'capability_missing', docroot: LANDING_DOCROOT, landingPage, defaultVhost: await ensureDefaultVhost(req, { hostname: name }) }; }
     try {
       let result;
       try { result = await writeSpec(spec, req); } catch (err) {
@@ -562,10 +643,10 @@ export function createServiceConfigService(ctx) {
         result = await writeSpec(spec, req);
       }
       audit(req, { action: 'web.vhost.server', target: name, args: { docroot: LANDING_DOCROOT, user, ssl: Boolean(spec.ssl), redirectHttps: Boolean(spec.ssl) && forceHttps() } });
-      return { hostname: name, docroot: LANDING_DOCROOT, landingPage, ...result };
+      return { hostname: name, docroot: LANDING_DOCROOT, landingPage, ...result, defaultVhost: await ensureDefaultVhost(req, { hostname: name }) };
     } catch (err) {
       logger.warn({ err, hostname: name }, 'web: hostname vhost could not be written');
-      return { hostname: name, applied: false, reason: err.code || 'error', error: err.message, docroot: LANDING_DOCROOT, landingPage };
+      return { hostname: name, applied: false, reason: err.code || 'error', error: err.message, docroot: LANDING_DOCROOT, landingPage, defaultVhost: await ensureDefaultVhost(req, { hostname: name }) };
     }
   }
 
@@ -581,6 +662,7 @@ export function createServiceConfigService(ctx) {
     requireApache();
     const result = await writeSpec(spec, req);
     audit(req, { action: 'web.ssl.apply', target: domain, args: { cert: paths.cert } });
+    if (spec.type === 'server') result.defaultVhost = await ensureDefaultVhost(req, { hostname: domain });
     return result;
   }
 
@@ -591,6 +673,7 @@ export function createServiceConfigService(ctx) {
     requireApache();
     const result = await writeSpec(spec, req);
     audit(req, { action: 'web.ssl.remove', target: domain });
+    if (spec.type === 'server') result.defaultVhost = await ensureDefaultVhost(req, { hostname: domain });
     return result;
   }
 
@@ -718,7 +801,7 @@ export function createServiceConfigService(ctx) {
       return {
         installed: capabilities.has('apache'), detect: d.apache, php: d.php, nginx: d.nginx, status, include, settings: getConf('apache'), lastApply: lastApply('apache'), ports: listenPorts(), domlogsRoot: DOMLOGS_ROOT,
         forceHttps: forceHttps(), rewriteModule: Array.isArray(d.apache?.modules) ? d.apache.modules.some((m) => m.name === 'rewrite') : null,
-        hostnameVhost: shapeVhost(stmts.vhostsByType.all('server')[0]) ?? null, landingDocroot: LANDING_DOCROOT,
+        hostnameVhost: shapeVhost(stmts.vhostsByType.all('server')[0]) ?? null, landingDocroot: LANDING_DOCROOT, defaultVhost: lastApply('default_vhost'),
         vhosts: { total: rows.length, applied: rows.filter((r) => r.status === 'applied').length, pending: rows.filter((r) => r.status === 'pending').length, failed: rows.filter((r) => r.status === 'failed').length },
         pools: stmts.pools.all().map((p) => ({ username: p.username, version: p.version, socket: p.socket, status: p.status, error: p.error })),
       };
@@ -1182,7 +1265,7 @@ export function createServiceConfigService(ctx) {
     ensureVhost, syncAccount: ensureVhost, removeAccount, applySsl, removeSsl, setRedirects, addAlias, removeAlias, setAccountIpv6, replaceIp, setPhpVersion, writePhpPool, setListenPorts,
     reload: (req) => apache.reload(req), restart: (req) => apache.restart(req), configtest: () => op('web.configtest'),
     vhostFor: (domain) => shapeVhost(stmts.vhostByDomain.get(domain)) ?? null, syncAllJob,
-    ensureHostnameVhost, forceHttps, landingDocroot: LANDING_DOCROOT, isServerName,
+    ensureHostnameVhost, ensureDefaultVhost, removeDefaultVhost, removeDomain, forceHttps, landingDocroot: LANDING_DOCROOT, isServerName,
     ensureEximAclChain: (req) => exim.ensureEximAclChain(req), applyEximTls: (preset, req) => exim.applyEximTls(preset, req), applyMailserverTls: (preset, req) => mailserver.applyMailserverTls(preset, req),
   };
 }

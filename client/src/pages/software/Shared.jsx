@@ -104,18 +104,44 @@ function summarizeResult(result) {
   return 'done';
 }
 
+// The distro packages that provide each module installer, so a card whose
+// tool is missing can install it from here instead of pointing elsewhere.
+export const MODULE_TOOL_PACKAGES = {
+  pecl: { debian: ['php-pear', 'php-dev'], rhel: ['php-pear', 'php-devel'] },
+  pear: { debian: ['php-pear'], rhel: ['php-pear'] },
+  gem: { debian: ['ruby'], rhel: ['ruby'] },
+  pip: { debian: ['python3-pip'], rhel: ['python3-pip'] },
+};
+
 // One installer card: list of what is installed + an install form that queues a job.
-export function InstallerCard({ title, subtitle, kind, listPath, installPath, nameLabel = 'Name', namePlaceholder, allowVersion = true, present, installHint, runner, disabledReason }) {
+// When the tool itself is missing, the card offers to install its packages
+// (installPackages, or the family's entry from MODULE_TOOL_PACKAGES).
+export function InstallerCard({ title, subtitle, kind, listPath, installPath, nameLabel = 'Name', namePlaceholder, allowVersion = true, present, installHint, runner, disabledReason, installPackages }) {
   const { data, loading, error, refetch } = useApi(listPath, { enabled: Boolean(present) });
+  const detect = useApi('/software/pkg/detect', { enabled: !present && !installPackages });
   const [name, setName] = useState('');
   const [version, setVersion] = useState('');
   const [q, setQ] = useState('');
   const items = (data?.items || []).filter((i) => !q || i.name.toLowerCase().includes(q.toLowerCase()));
   const install = () => runner.start(() => api.post(installPath, { name: name.trim(), ...(allowVersion && version.trim() ? { version: version.trim() } : {}) }), `${title}: install ${name.trim()}`).then((d) => { if (d) { setName(''); setVersion(''); } });
+  const packages = installPackages || (detect.data?.family ? MODULE_TOOL_PACKAGES[kind]?.[detect.data.family] : null) || null;
+  const noManager = !present && detect.data && !detect.data.capability;
+  const installTool = () => runner.start(() => api.post('/software/pkg/install', { packages }), `Install ${packages.join(', ')}`);
 
   return (
     <Card title={title} subtitle={subtitle} actions={<StatusPill status={present ? 'installed' : 'not-installed'}>{present ? 'available' : 'not installed'}</StatusPill>}>
-      {!present && <p className="muted">{disabledReason || installHint}</p>}
+      {!present && (
+        <>
+          <p className="muted">{disabledReason || installHint}</p>
+          {noManager && <p className="muted small">No supported package manager (apt-get, dnf or yum) was found on this server, so the panel cannot install it for you.</p>}
+          {packages && !noManager && (
+            <div className="action-row">
+              <Button variant="primary" loading={runner.busy} onClick={installTool}>Install {packages.join(' + ')}</Button>
+              <span className="muted small">Installed with the server's package manager as a background job; reload this page when it has finished.</span>
+            </div>
+          )}
+        </>
+      )}
       {present && (
         <>
           <div className="form-grid">

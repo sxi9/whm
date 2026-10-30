@@ -499,25 +499,129 @@ defineOp('pkg.list_installed', {
   },
 });
 
+// --- search ranking and dedupe ------------------------------------------------
+// A repository search for "php" or "redis" answers with hundreds of names that
+// are the same software in another shape: -dev/-doc/-dbg/-common splits, an
+// architecture or a runtime so-version in the name, one copy per PHP or Python
+// release, and the bindings for every language. The groups below fold those
+// into one row per piece of software; the folded names stay reachable as its
+// `variants`, and `all: true` returns the raw ranked list instead.
+
+const VARIANT_SUFFIX = /-(dev|devel|dbg|dbgsym|debuginfo|debugsource|doc|docs|common|data|static|headers|source|src)$/;
+const ARCH_SUFFIX = /(?::(?:i386|amd64|arm64|armhf|x86_64|i686|aarch64|noarch|all)|-(?:i386|amd64|arm64|armhf|x86-64|i686|aarch64|32bit|64bit))$/;
+const VERSION_INFIX = [
+  [/^php\d+\.\d+-/, 'php-'], [/^php\d+\.\d+$/, 'php'], [/^php\d\d-php-/, 'php-'], [/^php\d\d$/, 'php'], [/^(?:ea|rh)-php\d\d-php-/, 'php-'],
+  [/^python3\.\d+-/, 'python3-'], [/^python3\.\d+$/, 'python3'],
+  [/^(postgresql|ruby|nodejs|perl|openjdk|golang|llvm|clang|gcc|g\+\+|mariadb|mysql)-?\d+(?:\.\d+)*(-|$)/, '$1$2'],
+];
+const BINDING_PREFIX = /^(python3|python2|python|php|ruby|perl|node|nodejs|golang|lua|r-cran|octave|haskell|ocaml|rust|librust|elpa|tcl|gir1\.2|java|erlang|elixir|dotnet)-(.+)$/;
+const BINDING_SUFFIX = /^(.+)-(perl|java|ruby|python|python3|lua|tcl|cil|gir|jni|ocaml|php)$/;
+
+const SUFFIX_KIND = { dev: 'dev', devel: 'dev', headers: 'dev', dbg: 'debug', dbgsym: 'debug', debuginfo: 'debug', debugsource: 'debug', doc: 'doc', docs: 'doc', common: 'common', data: 'common', static: 'source', source: 'source', src: 'source' };
+const variantKind = (name) => {
+  const lower = String(name).toLowerCase();
+  if (ARCH_SUFFIX.test(lower)) return 'arch';
+  const m = lower.match(VARIANT_SUFFIX);
+  if (m) return SUFFIX_KIND[m[1]];
+  if (VERSION_INFIX.some(([re]) => re.test(lower))) return 'version';
+  if (lower.startsWith('lib') && /\d(?:\.\d+)*(?:t64)?$/.test(lower)) return 'runtime';
+  return 'flavor';
+};
+
+// The name every shape of one package shares: php8.3-redis, php-redis:i386 and
+// php-redis-dev are all "php-redis"; libssl3, libssl3t64 and libssl-dev are "libssl".
+export function packageStem(name) {
+  let stem = String(name).toLowerCase().replace(ARCH_SUFFIX, '');
+  for (let i = 0; i < 2; i++) { const next = stem.replace(VARIANT_SUFFIX, ''); if (next === stem) break; stem = next; }
+  for (const [re, repl] of VERSION_INFIX) stem = stem.replace(re, repl);
+  if (stem.startsWith('lib')) {
+    stem = stem.replace(/t64$/, '');
+    const m = stem.match(/^(lib[a-z][a-z0-9+_.-]*?[a-z+_])\d+(?:\.\d+)*$/);
+    if (m) stem = m[1];
+  }
+  return stem;
+}
+
+// python3-redis, php-pecl-redis and libredis-perl are bindings of "redis".
+export function bindingBase(stem) {
+  let m = stem.match(BINDING_PREFIX);
+  if (m) return { language: m[1], base: m[2].replace(/^pecl-/, '') };
+  m = stem.match(BINDING_SUFFIX);
+  if (m) return { language: m[2], base: m[1].replace(/^lib/, '') };
+  return null;
+}
+
+const matchTier = (name, needle) => { const n = name.toLowerCase(); return n === needle ? 0 : n.startsWith(needle) ? 1 : n.includes(needle) ? 2 : 3; };
+
+// Exact name first, then names that start with the term, then the rest; alphabetical within a tier.
+export function rankSearchResults(results, q) {
+  const needle = String(q).toLowerCase();
+  return [...results].sort((a, b) => matchTier(a.name, needle) - matchTier(b.name, needle) || a.name.localeCompare(b.name));
+}
+
+// One row per piece of software, ranked, capped; everything folded is listed
+// under the row's `variants` (bindings carry their own folded shapes along).
+export function dedupeSearchResults(results, q, { limit = 60 } = {}) {
+  const needle = String(q).toLowerCase();
+  const groups = new Map();
+  for (const r of results) {
+    const stem = packageStem(r.name);
+    const g = groups.get(stem) || groups.set(stem, { stem, members: [] }).get(stem);
+    if (!g.members.some((m) => m.name === r.name)) g.members.push(r);
+  }
+  const pickMain = (g) => {
+    const score = (m) => {
+      const lower = m.name.toLowerCase();
+      return [lower === needle ? 0 : 1, lower === g.stem ? 0 : 1, lower.replace(ARCH_SUFFIX, '').replace(VARIANT_SUFFIX, '') === lower ? 0 : 1, m.name.length];
+    };
+    return [...g.members].sort((a, b) => { const sa = score(a); const sb = score(b); for (let i = 0; i < sa.length; i++) if (sa[i] !== sb[i]) return sa[i] - sb[i]; return a.name.localeCompare(b.name); })[0];
+  };
+  const rows = new Map();
+  for (const g of groups.values()) {
+    const main = pickMain(g);
+    rows.set(g.stem, { ...main, stem: g.stem, variants: g.members.filter((m) => m !== main).map((m) => ({ ...m, kind: variantKind(m.name) })) });
+  }
+  // A binding folds into the package it binds only when that package is itself a row.
+  for (const [stem, row] of [...rows.entries()]) {
+    const binding = bindingBase(stem);
+    if (!binding || binding.base === stem || !rows.has(binding.base) || row.name.toLowerCase() === needle) continue;
+    const target = rows.get(binding.base);
+    target.variants.push({ name: row.name, summary: row.summary, kind: `${binding.language} binding` }, ...row.variants.map((v) => ({ ...v, kind: `${binding.language} binding` })));
+    rows.delete(stem);
+  }
+  const ranked = [...rows.values()].sort((a, b) => {
+    const ta = Math.min(matchTier(a.name, needle), ...a.variants.map((v) => matchTier(v.name, needle) + 0.5));
+    const tb = Math.min(matchTier(b.name, needle), ...b.variants.map((v) => matchTier(v.name, needle) + 0.5));
+    return ta - tb || a.name.localeCompare(b.name);
+  });
+  const shown = ranked.slice(0, limit).map((r) => { const { stem, ...rest } = r; return { ...rest, variants: rankSearchResults(r.variants, q), variantCount: r.variants.length }; });
+  const collapsed = shown.reduce((n, r) => n + r.variantCount, 0);
+  return { results: shown, total: results.length, shown: shown.length, collapsed, hidden: results.length - shown.length, more: ranked.length > limit, truncated: ranked.length - shown.length };
+}
+
 defineOp('pkg.search', {
-  description: 'Search the package repositories by name',
+  description: 'Search the package repositories by name; one row per piece of software with its -dev/-doc/arch/version/binding variants folded (all: true for the raw list)',
   timeoutMs: 120_000,
-  schema: z.object({ q: searchTerm, limit: z.number().int().min(1).max(500).default(100) }).strict(),
-  run: async ({ q, limit }) => {
+  schema: z.object({ q: searchTerm, limit: z.number().int().min(1).max(500).default(60), all: z.boolean().default(false) }).strict(),
+  run: async ({ q, limit, all }) => {
     const pm = requireManager();
     let results;
     if (pm.family === 'debian') {
-      const { stdout } = await exec('apt-cache', ['search', '--names-only', '--', q], { allowFailure: true, env: APT_ENV });
+      const { stdout } = await exec('apt-cache', ['search', '--names-only', '--', q], { allowFailure: true, env: APT_ENV, maxBuffer: BIG });
       results = parseAptSearch(stdout);
     } else {
-      const { stdout } = await exec(pm.binary, ['-q', '-y', 'search', '--', q], { allowFailure: true, timeoutMs: 120_000 });
+      const { stdout } = await exec(pm.binary, ['-q', '-y', 'search', '--', q], { allowFailure: true, timeoutMs: 120_000, maxBuffer: BIG });
       results = parseDnfSearch(stdout);
     }
-    const needle = q.toLowerCase();
-    results.sort((a, b) => (a.name.toLowerCase() === needle ? -1 : b.name.toLowerCase() === needle ? 1 : a.name.toLowerCase().startsWith(needle) === b.name.toLowerCase().startsWith(needle) ? a.name.localeCompare(b.name) : a.name.toLowerCase().startsWith(needle) ? -1 : 1));
-    results = results.slice(0, limit);
     const installed = new Map((await installedPackages()).packages.map((p) => [p.name, p.version]));
-    return { manager: pm.manager, q, results: results.map((r) => ({ ...r, installed: installed.has(r.name), installedVersion: installed.get(r.name) ?? null })) };
+    const mark = (r) => ({ ...r, installed: installed.has(r.name), installedVersion: installed.get(r.name) ?? null });
+    if (all) {
+      const ranked = rankSearchResults(results, q);
+      const shown = ranked.slice(0, limit).map((r) => ({ ...mark(r), variants: [], variantCount: 0 }));
+      return { manager: pm.manager, q, all: true, results: shown, total: results.length, shown: shown.length, collapsed: 0, hidden: results.length - shown.length, more: ranked.length > limit, truncated: ranked.length - shown.length };
+    }
+    const deduped = dedupeSearchResults(results, q, { limit });
+    return { manager: pm.manager, q, all: false, ...deduped, results: deduped.results.map((r) => ({ ...mark(r), variants: r.variants.map(mark) })) };
   },
 });
 
@@ -991,6 +1095,365 @@ defineOp('pkg.phpfpm.pools', {
       }
     }
     return { pools };
+  },
+});
+
+// --- PHP branches: package sources, install, remove ---------------------------
+//
+// Each family has one catalogued source that offers every maintained PHP branch
+// side by side with the distribution's own: Ubuntu the ppa:ondrej/php PPA,
+// Debian packages.sury.org/php (the same maintainer), the RHEL family Remi's
+// SCL packages (php8x-php-*, one tree per branch under /opt/remi — the layout
+// discoverPhp() and the web category's phpLayout() already read, so a branch
+// installed here is a pool target at once). The modular stream (php:remi-8.x)
+// would replace the single system PHP instead of adding one, so it is not used.
+// Nothing here is user input beyond the branch and the source key; URLs, PPA
+// names and file names come from this catalog only.
+
+const phpBranch = z.string().regex(/^\d\.\d$/, 'PHP branch such as 8.3');
+const phpExtension = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/, 'extension suffix');
+export const PHP_BRANCHES = ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5'];
+// The php component of server/src/lib/stack-catalog.js, as suffixes; the
+// service passes the catalog's current list and this is the fallback.
+export const PHP_EXTENSIONS = {
+  debian: ['mysql', 'curl', 'gd', 'mbstring', 'xml', 'zip', 'intl', 'bcmath', 'soap', 'opcache'],
+  rhel: ['mysqlnd', 'gd', 'mbstring', 'xml', 'pdo', 'intl', 'bcmath', 'soap', 'opcache', 'pecl-zip'],
+};
+export const PHP_SOURCES = {
+  ondrej: { key: 'ondrej', family: 'debian', flavor: 'ubuntu', label: 'Ondřej Surý PPA (ppa:ondrej/php)', url: 'https://launchpad.net/~ondrej/+archive/ubuntu/php', ppa: 'ppa:ondrej/php', match: /ppa\.launchpad(?:content)?\.net\/ondrej\/php(?:\/|\s|$)/ },
+  sury: { key: 'sury', family: 'debian', flavor: 'debian', label: 'DEB.SURY.ORG (packages.sury.org/php)', url: 'https://packages.sury.org/php/', keyUrl: 'https://packages.sury.org/php/apt.gpg', repo: 'https://packages.sury.org/php/', match: /packages\.sury\.org\/php(?:\/|\s|$)/ },
+  remi: { key: 'remi', family: 'rhel', flavor: 'rhel', label: 'Remi\'s RPM repository (remi-safe)', url: 'https://rpms.remirepo.net/', releasePackage: 'remi-release' },
+};
+const SURY_KEYRING = 'whm-sury-php';
+const SURY_LIST = 'whm-sury-php.list';
+const EPEL_URL = (major) => `https://dl.fedoraproject.org/pub/epel/epel-release-latest-${major}.noarch.rpm`;
+const REMI_URL = (os, major) => (os.id === 'fedora' ? `https://rpms.remirepo.net/fedora/remi-release-${major}.rpm` : `https://rpms.remirepo.net/enterprise/remi-release-${major}.rpm`);
+
+// Tests point these under /tmp/whm; production reads /etc.
+const aptRoot = () => process.env.WHM_APT_ROOT || '/etc/apt';
+const osReleaseFile = () => process.env.WHM_OS_RELEASE_FILE || '/etc/os-release';
+
+export function readOsRelease(file = osReleaseFile()) {
+  const raw = {};
+  try {
+    for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+      const m = line.match(/^([A-Z_]+)="?(.*?)"?$/);
+      if (m) raw[m[1]] = m[2];
+    }
+  } catch { /* unknown distribution */ }
+  const like = `${raw.ID || ''} ${raw.ID_LIKE || ''}`.toLowerCase().split(/\s+/).filter(Boolean);
+  return { id: (raw.ID || '').toLowerCase() || null, like, name: raw.PRETTY_NAME || raw.NAME || null, versionId: raw.VERSION_ID || null, codename: raw.VERSION_CODENAME || null, ubuntuCodename: raw.UBUNTU_CODENAME || null };
+}
+
+// Which catalogued source fits this host, with what it needs (codename or OS major).
+export function phpSourceFor(pm, os) {
+  if (pm.family === 'debian') {
+    if (os.like.includes('ubuntu')) {
+      const codename = os.ubuntuCodename || os.codename;
+      return { ...PHP_SOURCES.ondrej, codename, supported: Boolean(codename), reason: codename ? null : 'the Ubuntu release codename could not be read from /etc/os-release' };
+    }
+    const codename = os.codename;
+    return { ...PHP_SOURCES.sury, codename, supported: Boolean(codename), reason: codename ? null : 'the Debian release codename could not be read from /etc/os-release (packages.sury.org needs it)' };
+  }
+  if (pm.family === 'rhel') {
+    const major = Number.parseInt(String(os.versionId || ''), 10) || null;
+    return { ...PHP_SOURCES.remi, major, supported: Boolean(major), reason: major ? null : 'the OS major version could not be read from /etc/os-release (Remi needs it)' };
+  }
+  return { key: null, label: null, url: null, supported: false, reason: 'no supported package manager' };
+}
+
+// Package names of one branch: Debian php8.3-<x>, Remi SCL php83-php-<x>.
+export function phpPackageNames(family, version, extensions) {
+  const ext = extensions?.length ? extensions : PHP_EXTENSIONS[family] || PHP_EXTENSIONS.debian;
+  const prefix = family === 'debian' ? `php${version}-` : `php${version.replace('.', '')}-php-`;
+  const id = family === 'debian' ? version : `php${version.replace('.', '')}`;
+  return { id, prefix, probe: `${prefix}fpm`, core: ['fpm', 'cli', 'common'].map((s) => `${prefix}${s}`), extensions: ext.map((e) => `${prefix}${e}`), fpmUnit: family === 'debian' ? `php${version}-fpm` : `${id}-php-fpm` };
+}
+
+// `apt-cache policy a b c` prints one block per known package; the origin of
+// the candidate is the first repository line under its entry in the version
+// table (never the dpkg status line). Unknown packages print nothing.
+export function parseAptPolicyBlocks(stdout) {
+  const out = {};
+  let current = null; let inTable = false; let entryVersion = null;
+  for (const raw of stdout.split('\n')) {
+    const header = raw.match(/^(\S+):$/);
+    if (header) { current = { installed: null, candidate: null, origin: null }; out[header[1]] = current; inTable = false; entryVersion = null; continue; }
+    if (!current) continue;
+    const inst = raw.match(/^\s+Installed:\s*(.+)$/);
+    if (inst) { current.installed = inst[1].trim() === '(none)' ? null : inst[1].trim(); continue; }
+    const cand = raw.match(/^\s+Candidate:\s*(.+)$/);
+    if (cand) { current.candidate = cand[1].trim() === '(none)' ? null : cand[1].trim(); continue; }
+    if (/^\s+Version table:/.test(raw)) { inTable = true; continue; }
+    if (!inTable) continue;
+    const entry = raw.match(/^\s+(?:\*\*\*\s+)?(\S+)\s+-?\d+\s*$/);
+    if (entry) { entryVersion = entry[1]; continue; }
+    const src = raw.match(/^\s+-?\d+\s+(\S+)/);
+    if (src && entryVersion === current.candidate && !current.origin && !src[1].startsWith('/')) current.origin = src[1];
+  }
+  return out;
+}
+
+// `dnf list a b c`: "Installed Packages" / "Available Packages" sections of
+// "name.arch version repo" rows; a long name wraps onto its own line.
+export function parseDnfList(stdout) {
+  const out = {};
+  let section = null; let pendingName = null;
+  const record = (name, version, repo) => {
+    const e = out[name] || (out[name] = { installed: null, candidate: null, origin: null });
+    if (section === 'installed') { e.installed = version; e.origin = e.origin || repo.replace(/^@/, ''); } else { e.candidate = version; e.origin = repo.replace(/^@/, ''); }
+  };
+  for (const line of stdout.split('\n')) {
+    if (/^Installed Packages/i.test(line)) { section = 'installed'; pendingName = null; continue; }
+    if (/^Available Packages/i.test(line)) { section = 'available'; pendingName = null; continue; }
+    if (!section) continue;
+    const full = line.match(/^(\S+)\.(noarch|x86_64|i686|aarch64|src)\s+(\S+)\s+(\S+)\s*$/);
+    if (full) { record(full[1], full[3], full[4]); pendingName = null; continue; }
+    const nameOnly = line.match(/^(\S+)\.(noarch|x86_64|i686|aarch64|src)\s*$/);
+    if (nameOnly) { pendingName = nameOnly[1]; continue; }
+    const rest = line.match(/^\s+(\S+)\s+(\S+)\s*$/);
+    if (rest && pendingName) { record(pendingName, rest[1], rest[2]); pendingName = null; }
+  }
+  return out;
+}
+
+// Installed / candidate / origin for several names in two package-manager
+// calls at most (pkg.available asks per name; a branch install asks for 13).
+async function packageOffers(pm, names) {
+  if (!names.length) return {};
+  if (pm.family === 'debian') {
+    return parseAptPolicyBlocks((await exec('apt-cache', ['policy', '--', ...names], { allowFailure: true, env: APT_ENV, timeoutMs: 120_000, maxBuffer: BIG })).stdout);
+  }
+  const out = {};
+  const installed = await exec('rpm', ['-q', '--qf', '%{NAME}\t%{VERSION}-%{RELEASE}\n', '--', ...names], { allowFailure: true });
+  for (const line of installed.stdout.split('\n')) {
+    const [name, version] = line.split('\t');
+    if (name && version && names.includes(name)) out[name] = { installed: version.trim(), candidate: null, origin: null };
+  }
+  const listed = parseDnfList((await exec(pm.binary, ['-q', '-y', 'list', '--', ...names], { allowFailure: true, timeoutMs: 300_000, maxBuffer: BIG })).stdout);
+  for (const [name, e] of Object.entries(listed)) out[name] = { installed: out[name]?.installed ?? e.installed, candidate: e.candidate, origin: e.origin };
+  return out;
+}
+const isOffered = (e) => Boolean(e && (e.installed || e.candidate));
+
+// The package catalog asks about ~150 names per page load; pkg.available's
+// one-call-per-name probe would take seconds, this is one apt-cache / dnf call.
+defineOp('pkg.offers', {
+  description: 'Installed version, candidate version and origin of several package names in one package-manager call',
+  timeoutMs: 300_000,
+  schema: z.object({ packages: z.array(pkgName).min(1).max(300) }).strict(),
+  run: async ({ packages }) => {
+    const pm = requireManager();
+    const names = [...new Set(packages)];
+    const offers = await packageOffers(pm, names);
+    return { manager: pm.manager, packages: Object.fromEntries(names.map((n) => [n, { installed: offers[n]?.installed ?? null, candidate: offers[n]?.candidate ?? null, origin: offers[n]?.origin ?? null, offered: isOffered(offers[n]) }])) };
+  },
+});
+
+function classifyOrigin(origin, source) {
+  if (!origin) return null;
+  if (PHP_SOURCES.ondrej.match.test(origin)) return 'ondrej';
+  if (PHP_SOURCES.sury.match.test(origin)) return 'sury';
+  if (/^remi/i.test(origin)) return 'remi';
+  if (source?.key === 'remi' && /^@?remi/i.test(origin)) return 'remi';
+  return 'distro';
+}
+
+// Active (uncommented) lines of every apt source file; deb822 .sources included.
+function aptSourcesText() {
+  const files = [path.join(aptRoot(), 'sources.list'), ...safeReaddir(path.join(aptRoot(), 'sources.list.d')).map((f) => path.join(aptRoot(), 'sources.list.d', f))];
+  const lines = [];
+  for (const file of files) {
+    let text = '';
+    try { if (fs.lstatSync(file).isFile()) text = fs.readFileSync(file, 'utf8'); } catch { continue; }
+    let disabled = false;
+    for (const line of text.split('\n')) {
+      if (/^\s*Enabled:\s*no\b/i.test(line)) disabled = true;
+      if (line.trim() === '') disabled = false;
+      if (!disabled && !/^\s*#/.test(line)) lines.push(line);
+    }
+  }
+  return lines.join('\n');
+}
+
+async function phpSourceConfigured(source) {
+  if (source.key === 'remi') return (await exec('rpm', ['-q', '--', source.releasePackage], { allowFailure: true })).code === 0;
+  if (source.key === 'ondrej' || source.key === 'sury') return source.match.test(aptSourcesText());
+  return false;
+}
+
+// The branch the distribution's own php-fpm meta-package resolves to.
+async function stockPhpBranch(pm) {
+  if (pm.family === 'debian') {
+    const r = await exec('apt-cache', ['depends', '--', 'php-fpm'], { allowFailure: true, env: APT_ENV, timeoutMs: 60_000 });
+    return r.stdout.match(/Depends:\s*php(\d\.\d)-fpm/)?.[1] ?? null;
+  }
+  const offers = await packageOffers(pm, ['php-fpm']);
+  return (offers['php-fpm']?.installed || offers['php-fpm']?.candidate || '').match(/^(?:\d+:)?(\d\.\d)/)?.[1] ?? null;
+}
+
+const sourceSummary = (source) => ({ key: source.key, label: source.label, url: source.url, flavor: source.flavor ?? null, codename: source.codename ?? null, major: source.major ?? null, supported: source.supported, reason: source.reason });
+
+defineOp('pkg.php.sources.detect', {
+  description: 'The catalogued PHP package source for this host (ondrej PPA / packages.sury.org / Remi), whether it is configured, the stock branch and which PHP branches the repositories offer or have installed',
+  timeoutMs: 300_000,
+  schema: z.object({ branches: z.array(phpBranch).max(20).optional() }).strict(),
+  run: async ({ branches }) => {
+    const pm = requireManager();
+    const os = readOsRelease();
+    const source = phpSourceFor(pm, os);
+    const configured = source.key ? await phpSourceConfigured(source) : false;
+    const list = branches?.length ? branches : PHP_BRANCHES;
+    const names = list.map((v) => phpPackageNames(pm.family, v));
+    const offers = await packageOffers(pm, names.map((n) => n.probe));
+    const stock = await stockPhpBranch(pm);
+    const versions = list.map((version, i) => {
+      const e = offers[names[i].probe];
+      return { version, id: names[i].id, package: names[i].probe, fpmUnit: names[i].fpmUnit, offered: isOffered(e), installed: Boolean(e?.installed), candidate: e?.candidate ?? null, installedVersion: e?.installed ?? null, origin: e?.origin ?? null, source: classifyOrigin(e?.origin, source) };
+    });
+    return { manager: pm.manager, family: pm.family, os: { id: os.id, name: os.name, versionId: os.versionId, codename: source.codename ?? os.codename ?? null }, source: { ...sourceSummary(source), configured }, stock, versions };
+  },
+});
+
+const aptInstallArgv = (packages) => ['install', '-y', '-q', ...APT_DPKG_OPTS, '--no-install-recommends', '--', ...packages];
+
+async function enableOndrej(source) {
+  const steps = [];
+  if (!hasBinary('add-apt-repository')) {
+    await exec('apt-get', aptInstallArgv(['software-properties-common']), { env: APT_ENV, timeoutMs: LONG, maxBuffer: BIG });
+    steps.push({ step: 'software-properties-common', ok: true });
+  }
+  // -n: the index refresh is this op's own last step, detached when asked.
+  await exec('add-apt-repository', ['-y', '-n', source.ppa], { env: APT_ENV, timeoutMs: 5 * 60_000, maxBuffer: BIG });
+  steps.push({ step: `add-apt-repository ${source.ppa}`, ok: true });
+  return steps;
+}
+
+const isArmoredKey = (buf) => buf.subarray(0, 64).toString('latin1').includes('-----BEGIN PGP PUBLIC KEY BLOCK-----');
+// Binary OpenPGP: the first byte is a packet tag with the high bit set, and a
+// keyring starts with a public-key packet (old format tag 6 → 0x99/0x98, new format → 0xC6).
+const isBinaryKey = (buf) => buf.length > 0 && [0x99, 0x98, 0xc6].includes(buf[0]);
+
+async function enableSury(source, ctx) {
+  const steps = [];
+  const keyringDir = path.join(aptRoot(), 'keyrings');
+  const listFile = path.join(aptRoot(), 'sources.list.d', SURY_LIST);
+  ctx.assertAllowedPath(keyringDir, 'write');
+  ctx.assertAllowedPath(listFile, 'write');
+  let fetcher = hasBinary('curl') ? 'curl' : hasBinary('wget') ? 'wget' : null;
+  if (!fetcher) {
+    await exec('apt-get', aptInstallArgv(['curl', 'ca-certificates']), { env: APT_ENV, timeoutMs: LONG, maxBuffer: BIG });
+    steps.push({ step: 'curl', ok: true });
+    fetcher = 'curl';
+  }
+  fs.mkdirSync(keyringDir, { recursive: true, mode: 0o755 });
+  const tmp = path.join(keyringDir, `${SURY_KEYRING}.whm-${randomSuffix()}`);
+  let keyring;
+  try {
+    const argv = fetcher === 'curl' ? ['-fsSL', '--max-time', '60', '-o', tmp, source.keyUrl] : ['-q', '-T', '60', '-O', tmp, source.keyUrl];
+    await exec(fetcher, argv, { timeoutMs: 90_000 });
+    let st;
+    try { st = fs.lstatSync(tmp); } catch { throw new Error('the download left no file behind'); }
+    if (!st.isFile()) throw new Error(`${tmp} is not a regular file`);
+    const key = fs.readFileSync(tmp);
+    const armored = isArmoredKey(key);
+    if (!armored && !isBinaryKey(key)) throw new Error(`the download is not an OpenPGP key (${key.length} bytes)`);
+    // apt reads armored keys only from a .asc file.
+    keyring = path.join(keyringDir, `${SURY_KEYRING}.${armored ? 'asc' : 'gpg'}`);
+    fs.chmodSync(tmp, 0o644);
+    fs.renameSync(tmp, keyring);
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    throw new OpError('command_failed', `Could not fetch the packages.sury.org signing key from ${source.keyUrl}: ${err.message}`);
+  }
+  steps.push({ step: 'signing key', ok: true, path: keyring });
+  writeAtomic(listFile, `deb [signed-by=${keyring}] ${source.repo} ${source.codename} main\n`, { mode: 0o644 });
+  steps.push({ step: 'sources list', ok: true, path: listFile });
+  return steps;
+}
+
+async function enableRemi(source, os) {
+  const steps = [];
+  const bin = detectManager().binary;
+  const rpmPresent = async (name) => (await exec('rpm', ['-q', '--', name], { allowFailure: true })).code === 0;
+  if (!(await rpmPresent('epel-release')) && os.id !== 'fedora') {
+    let epel = await exec(bin, ['-y', '-q', 'install', '--', 'epel-release'], { allowFailure: true, timeoutMs: LONG, maxBuffer: BIG });
+    // RHEL proper has no epel-release package in its own repositories.
+    if (epel.code !== 0) epel = await exec(bin, ['-y', '-q', 'install', '--', EPEL_URL(source.major)], { allowFailure: true, timeoutMs: LONG, maxBuffer: BIG });
+    steps.push({ step: 'epel-release', ok: epel.code === 0, output: epel.code === 0 ? null : tail(`${epel.stdout}\n${epel.stderr}`, 5).join('\n') });
+  }
+  await exec(bin, ['-y', '-q', 'install', '--', REMI_URL(os, source.major)], { timeoutMs: LONG, maxBuffer: BIG });
+  steps.push({ step: source.releasePackage, ok: true });
+  // Some Remi builds need CodeReady Builder (crb on EL9, powertools on EL8); best effort, needs dnf-plugins-core.
+  if (os.id !== 'fedora' && bin === 'dnf') {
+    const repo = source.major >= 9 ? 'crb' : 'powertools';
+    const crb = await exec(bin, ['-q', 'config-manager', '--set-enabled', repo], { allowFailure: true, timeoutMs: 120_000 });
+    steps.push({ step: `enable ${repo}`, ok: crb.code === 0, output: crb.code === 0 ? null : tail(`${crb.stdout}\n${crb.stderr}`, 3).join('\n') });
+  }
+  return steps;
+}
+
+defineOp('pkg.php.source.enable', {
+  description: 'Enable the catalogued PHP package source for this host (ppa:ondrej/php on Ubuntu, packages.sury.org on Debian, Remi on the RHEL family) and refresh the package index; idempotent',
+  timeoutMs: LONG,
+  schema: z.object({ source: z.enum(['ondrej', 'sury', 'remi']), wait }).strict(),
+  run: async ({ source: key, wait: waitFor }, ctx) => {
+    const pm = requireManager();
+    const os = readOsRelease();
+    const source = phpSourceFor(pm, os);
+    if (source.key !== key) throw new OpError('unsupported', `${PHP_SOURCES[key].label} is not the PHP source for this host (${os.name || pm.family}); it uses ${source.label || 'none'}`);
+    if (!source.supported) throw new OpError('unsupported', `${source.label} cannot be enabled: ${source.reason}`);
+    const already = await phpSourceConfigured(source);
+    let steps = [];
+    if (!already) steps = key === 'ondrej' ? await enableOndrej(source) : key === 'sury' ? await enableSury(source, ctx) : await enableRemi(source, os);
+    const argv = pm.family === 'debian' ? ['update', '-q'] : ['-y', '-q', 'makecache'];
+    const refresh = await runLong({ kind: 'update_index', bin: pm.binary, argv, env: APT_ENV, timeoutMs: 15 * 60_000, wait: waitFor }, ctx);
+    return { source: key, label: source.label, changed: !already, alreadyConfigured: already, steps, ...finished(refresh) };
+  },
+});
+
+async function enableFpmUnit(unit) {
+  if (!hasBinary('systemctl')) return { unit, enabled: null, note: 'systemctl is not available' };
+  const r = await exec('systemctl', ['enable', '--now', `${unit}.service`], { allowFailure: true, timeoutMs: 120_000 });
+  return { unit, enabled: r.code === 0, note: r.code === 0 ? null : tail(`${r.stdout}\n${r.stderr}`, 3).join('\n') };
+}
+
+defineOp('pkg.php.install', {
+  description: 'Install one PHP branch (FPM, CLI, common and the stack extensions the repositories offer) and enable its FPM unit',
+  timeoutMs: LONG,
+  schema: z.object({ version: phpBranch, extensions: z.array(phpExtension).max(50).optional(), wait }).strict(),
+  run: async ({ version, extensions, wait: waitFor }, ctx) => {
+    const pm = requireManager();
+    const names = phpPackageNames(pm.family, version, extensions);
+    const wanted = [...names.core, ...names.extensions];
+    const offers = await packageOffers(pm, wanted);
+    if (!isOffered(offers[names.probe])) throw new OpError('unsupported', `PHP ${version} (${names.probe}) is not offered by any configured repository on this server; enable the PHP package source first`);
+    const packages = wanted.filter((n) => isOffered(offers[n]));
+    const skipped = wanted.filter((n) => !isOffered(offers[n]));
+    const argv = pm.family === 'debian' ? ['install', '-y', '-q', ...APT_DPKG_OPTS, '--', ...packages] : ['-y', '-q', 'install', '--', ...packages];
+    const result = await runLong({ kind: 'php_install', bin: pm.binary, argv, env: APT_ENV, wait: waitFor }, ctx);
+    const unit = result.background ? { unit: names.fpmUnit, enabled: null, note: 'enable the unit once the installer has finished' } : await enableFpmUnit(names.fpmUnit);
+    return { manager: pm.manager, family: pm.family, version, id: names.id, packages, skipped, alreadyInstalled: packages.filter((n) => offers[n]?.installed), fpmUnit: names.fpmUnit, prefix: names.prefix, unit, ...finished(result) };
+  },
+});
+
+defineOp('pkg.php.remove', {
+  description: 'Remove one PHP branch installed as a versioned package set (Debian php8.x-*, Remi php8x-php-*): stops its FPM unit, then removes its packages; refuses the branch /usr/bin/php resolves to',
+  destructive: true,
+  timeoutMs: LONG,
+  schema: z.object({ version: phpBranch, purge: z.boolean().default(false), wait }).strict(),
+  run: async ({ version, purge, wait: waitFor }, ctx) => {
+    const pm = requireManager();
+    const names = phpPackageNames(pm.family, version);
+    const { versions, defaultId } = discoverPhp();
+    const entry = versions.find((v) => (v.layout === 'debian' || v.layout === 'remi') && v.packagePrefix === names.prefix);
+    if (!entry) throw new OpError('not_found', `PHP ${version} is not installed as a versioned package set on this server (installed: ${versions.map((v) => v.id).join(', ') || 'none'})`);
+    if (entry.id === defaultId) throw new OpError('refused', `PHP ${version} is what /usr/bin/php resolves to; make another version the default before removing it`);
+    const installed = (await installedPackages()).packages.map((p) => p.name).filter((n) => n.startsWith(names.prefix));
+    if (!installed.length) throw new OpError('not_found', `No ${names.prefix}* package is installed`);
+    if (hasBinary('systemctl')) await exec('systemctl', ['disable', '--now', `${entry.fpmUnit}.service`], { allowFailure: true, timeoutMs: 120_000 });
+    const argv = pm.family === 'debian' ? [purge ? 'purge' : 'remove', '-y', '-q', ...APT_DPKG_OPTS, '--', ...installed] : ['-y', '-q', 'remove', '--', ...installed];
+    return { manager: pm.manager, version, id: entry.id, packages: installed, purge, fpmUnit: entry.fpmUnit, ...finished(await runLong({ kind: 'php_remove', bin: pm.binary, argv, env: APT_ENV, wait: waitFor }, ctx)) };
   },
 });
 

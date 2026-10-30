@@ -3,6 +3,7 @@ import { validate, z, fields } from '../../lib/validate.js';
 import { requireRoot } from '../../middleware/rbac.js';
 import { unprocessable } from '../../lib/errors.js';
 import { createServerContactsService, maskAddress, CHANNELS, SEVERITIES, SMTP_SECURITY, EVENT_KEY_RE, MANAGED_MAIL_USERS } from '../../services/server-contacts.js';
+import { createSecurityAlertsService } from '../../services/security-alerts.js';
 
 const idParam = z.object({ id: fields.id });
 const eventKey = z.string().regex(EVENT_KEY_RE, 'Event keys look like "service.down"');
@@ -85,6 +86,16 @@ const mailPrefsBody = nonEmpty(z.object({
   users: z.object(Object.fromEntries(MANAGED_MAIL_USERS.map((u) => [u, aliasList.optional()]))).strict().optional(),
   rootMailEvents: z.array(eventKey).max(100).optional(),
 }).strict());
+const freeText = (max) => z.string().trim().min(1).max(max).regex(/^[^\0]*$/);
+const alertSettingsBody = nonEmpty(z.object({
+  enabled: z.boolean().optional(),
+  notifyAccounts: z.boolean().optional(),
+  minSeverity: z.enum(SEVERITIES).optional(),
+  digestMinutes: z.number().int().min(0).max(1440).optional(),
+}).strict());
+const alertTestBody = z.object({ includeAccounts: z.boolean().optional() }).strict();
+const alertBroadcastBody = z.object({ title: freeText(200).regex(/^[^\r\n]*$/, 'One line'), body: freeText(10_000), severity: z.enum(SEVERITIES).optional(), notifyAccounts: z.boolean().optional() }).strict();
+const alertListQuery = z.object({ limit: z.coerce.number().int().min(1).max(200).optional() });
 
 export async function register(ctx) {
   ctx.contacts = createServerContactsService(ctx);
@@ -99,9 +110,18 @@ export async function register(ctx) {
   ctx.scheduler.ensure(s.SCHEDULE, '*/10 * * * *', s.JOB);
   if (!s.checkConfig().enabled) ctx.scheduler.update(s.SCHEDULE, { enabled: false });
 
+  // Security alerts ride on the contacts transports; alerts left pending by a
+  // restart (a digest window that never closed) are delivered once the job
+  // worker starts.
+  ctx.securityAlerts = createSecurityAlertsService(ctx);
+  const a = ctx.securityAlerts;
+  ctx.jobs.register(a.JOB, (job) => a.deliverJob(job));
+  if (a.pendingCount() > 0) { try { a.scheduleDelivery(); } catch (err) { ctx.logger.warn({ err }, 'could not schedule pending security alerts'); } }
+
   const r = Router();
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.json(d?.meta ? d : { data: d })).catch(next);
   const created = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(201).json({ data: d })).catch(next);
+  const accepted = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((d) => res.status(202).json({ data: d })).catch(next);
 
   // Contact Manager
   r.get('/', requireRoot, wrap(() => s.overview()));
@@ -128,6 +148,14 @@ export async function register(ctx) {
   r.get('/mail-preferences', requireRoot, wrap(() => s.mailPreferences()));
   r.put('/mail-preferences', requireRoot, validate({ body: mailPrefsBody }), wrap((req) => s.setMailPreferences(req.body, req)));
   r.post('/mail-preferences/test', requireRoot, wrap((req) => s.testRootMail(req)));
+
+  // Security notifications (emergency update notices)
+  r.get('/security-alerts', requireRoot, wrap(() => a.overview()));
+  r.get('/security-alerts/alerts', requireRoot, validate({ query: alertListQuery }), wrap((req) => a.list(req.query)));
+  r.put('/security-alerts/settings', requireRoot, validate({ body: alertSettingsBody }), wrap((req) => a.updateSettings(req.body, req)));
+  r.post('/security-alerts/test', requireRoot, validate({ body: alertTestBody }), accepted((req) => a.test(req.body, req)));
+  r.post('/security-alerts/raise', requireRoot, validate({ body: alertBroadcastBody }), accepted((req) => a.broadcast(req.body, req)));
+  r.post('/security-alerts/deliver', requireRoot, accepted((req) => a.deliverNow(req)));
 
   return { path: '/server-contacts', router: r };
 }

@@ -12,6 +12,8 @@ import { isRoot } from '../middleware/rbac.js';
 //                                                        ssl.autossl.issueNow, which enqueues the ssl.autossl.run job
 //   ssl.installServiceCert(service, { certPem, keyPem, chainPem }, req)  service ∈ exim|dovecot|apache|ftp|panel
 //   ssl.serviceCertStatus()
+//   ssl.hosts.list(user)                              -> { hosts, serverHostname (root only: the hostname's certificate, the services
+//                                                        carrying it, the renewal schedule, the AutoSSL state, the landing vhost), ... }
 //   ssl.inspect(certPem, chainPem?)                   -> parsed certificate (+ chain verification)
 //   ssl.removeAccountCerts(accountId, req)            -> async; call BEFORE the accounts row is deleted: uninstalls
 //                                                        every installed bundle (files, vhost SSL, ACME client) then purges rows
@@ -41,6 +43,9 @@ export const SSL_SERVICES = ['exim', 'dovecot', 'apache', 'ftp', 'panel'];
 const BUNDLE_ROOT = '/etc/ssl/whm';
 // Document root of the server hostname's own landing vhost (Service Configuration).
 const LANDING_DOCROOT = '/var/www/whm-default';
+// Services that carry the hostname's certificate (networking-setup installs it for them).
+const HOSTNAME_SERVICES = ['panel', 'exim', 'dovecot', 'ftp'];
+const HOSTNAME_RENEW_SCHEDULE = 'hostname-certificate-renew';
 const AUTOSSL_DEFAULTS = { provider: 'disabled', email: '', method: 'webroot', staging: false, key_type: 'ecdsa', renew_days: 30, include_www: true, replace_custom: false };
 const INSTALL_STATE = { 0: 'stored', 1: 'installed', 2: 'pending' };
 
@@ -377,7 +382,39 @@ export function createSslService(ctx) {
         return { ...r, files: b ? { present: true, hasKey: b.hasKey, hasChain: b.hasChain, notAfter: b.certificate?.notAfter ?? r.notAfter ?? null } : { present: listed ? false : null } };
       });
       for (const b of bundles) if (!known.has(b.domain)) hostsOut.push({ id: null, domain: b.domain, account: null, state: 'unmanaged', installed: 0, subject: b.certificate?.subjectText ?? null, issuer: b.certificate?.issuerText ?? null, notAfter: b.certificate?.notAfter ?? null, daysRemaining: daysUntil(b.certificate?.notAfter), expired: b.certificate ? b.certificate.expired : null, autossl: false, selfSigned: b.certificate?.selfSigned ?? false, files: { present: true, hasKey: b.hasKey, hasChain: b.hasChain } });
-      return { hosts: hostsOut.sort((a, b) => a.domain.localeCompare(b.domain)), bundleRoot: BUNDLE_ROOT, bundlesListed: listed, webLinked: typeof ctx.web?.applySsl === 'function' };
+      const name = serverHostname();
+      for (const h of hostsOut) h.hostname = name.includes('.') && h.domain === name;
+      return { hosts: hostsOut.sort((a, b) => a.domain.localeCompare(b.domain)), bundleRoot: BUNDLE_ROOT, bundlesListed: listed, webLinked: typeof ctx.web?.applySsl === 'function', serverHostname: isRoot(user) ? await hosts.server() : null };
+    },
+    // The server hostname's row for Manage SSL Hosts: its certificate (issued by
+    // networking-setup through AutoSSL), the services it was installed for, the
+    // renewal schedule, the AutoSSL state and the landing vhost. Root only.
+    async server() {
+      const name = serverHostname();
+      if (!name.includes('.')) return { hostname: name || null, valid: false, certificate: null, services: [], renewal: null, autossl: null, landing: null };
+      const certificate = shape(stmts.installedByDomain.get(name));
+      let services = [];
+      try {
+        services = (await serviceCertStatus()).filter((s) => HOSTNAME_SERVICES.includes(s.service)).map((s) => ({
+          service: s.service, daemonPresent: s.daemonPresent ?? null, hasCertificate: Boolean(s.hasCertificate), subject: s.certificate?.subjectText ?? null, issuer: s.certificate?.issuerText ?? null,
+          notAfter: s.certificate?.notAfter ?? s.stored?.notAfter ?? null, daysRemaining: s.daysRemaining ?? null, selfSigned: s.certificate?.selfSigned ?? null, expired: s.certificate?.expired ?? null,
+          coversHostname: s.certificate ? certCovers(s.certificate, name) : null,
+        }));
+      } catch (err) { logger.warn({ err }, 'ssl: service certificate status unavailable for the hostname row'); }
+      let renewal = null;
+      try {
+        const schedule = ctx.scheduler.list().find((x) => x.name === HOSTNAME_RENEW_SCHEDULE) || null;
+        renewal = schedule ? { schedule: schedule.name, cron: schedule.cron, enabled: Boolean(schedule.enabled), lastRunAt: schedule.last_run_at ?? null, nextRunAt: schedule.next_run_at ?? null, renewDays: Number(autossl.settings().renewDays) } : null;
+      } catch { renewal = null; }
+      const s = autossl.settings();
+      const lastEntry = autossl.runs(20).flatMap((r) => r.entries.filter((e) => e.domain === name).map((e) => ({ runId: r.id, trigger: r.trigger, finishedAt: r.finishedAt, action: e.action, message: e.message })))[0] ?? null;
+      let landing = null;
+      try { const v = ctx.web?.vhostFor?.(name) ?? null; landing = v ? { status: v.status, ssl: Boolean(v.ssl), docroot: v.docroot, error: v.error ?? null } : null; } catch { landing = null; }
+      return {
+        hostname: name, valid: true, certificate, docroot: ctx.web?.landingDocroot || LANDING_DOCROOT, services, renewal,
+        autossl: { provider: s.provider, enabled: s.provider !== 'disabled', lastEntry },
+        landing, reissue: { path: '/networking/hostname/certificate', available: typeof ctx.networking?.reissueHostnameCertificate === 'function' },
+      };
     },
     // One host with what is on disk (also for "unmanaged" directories that have no row).
     async get(domain, user) {

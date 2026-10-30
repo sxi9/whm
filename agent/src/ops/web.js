@@ -990,6 +990,283 @@ defineOp('web.vhost.read', {
   },
 });
 
+// ------------------------------------------------------------ default vhost ---
+// The catch-all virtual host: it is loaded before every tenant vhost (the file
+// name sorts first in sites-enabled / conf.d) and lists `_default_` plus every
+// address the tenant vhosts bind to, so a request for the bare address or for a
+// name no vhost claims lands on the landing page instead of the distribution
+// test page or whichever tenant sorts first. Port 443 uses the hostname's
+// certificate when the panel has one, otherwise the first self-signed pair the
+// panel controls (the apache service certificate, the panel listener's pair, or
+// one generated here with openssl). Debian's stock 000-default site is disabled
+// because it also claims `_default_:80`.
+const DEFAULT_VHOST_MARK = '# whm-default-vhost ';
+export const DEFAULT_VHOST_NAMES = { debian: '000-whm-default', rhel: '00-whm-default' };
+export const DEFAULT_VHOST_SERVER_NAME = 'default.invalid';
+export const DEFAULT_SSL_DIR = '/etc/ssl/whm/default';
+const DEBIAN_STOCK_SITE = '000-default';
+// Candidate pairs for the HTTPS block when no hostname bundle is installed, in
+// order of preference; all live under the agent's allowed roots.
+export const DEFAULT_SSL_FALLBACKS = [
+  { source: 'apache-service', cert: '/etc/ssl/whm/service/apache/fullchain.pem', key: '/etc/ssl/whm/service/apache/key.pem' },
+  { source: 'panel', cert: '/etc/whm/tls/cert.pem', key: '/etc/whm/tls/key.pem' },
+  { source: 'generated', cert: `${DEFAULT_SSL_DIR}/cert.pem`, key: `${DEFAULT_SSL_DIR}/key.pem` },
+];
+
+export function defaultVhostFile(apache) {
+  const name = DEFAULT_VHOST_NAMES[apache.flavor];
+  return apache.flavor === 'debian'
+    ? { file: path.join(apache.sitesAvailable, `${name}.conf`), link: path.join(apache.sitesEnabled, `${name}.conf`), name }
+    : { file: path.join(apache.confD, `${name}.conf`), link: null, name };
+}
+
+const defaultVhostSchema = z.object({
+  hostname: arg.hostname, docroot: confPath, user: arg.username, addresses: z.array(arg.ip).max(64).default([]), bind: arg.ip.nullable().optional(),
+  port: z.number().int().min(1).max(65535).default(80), sslPort: z.number().int().min(1).max(65535).nullable().default(443),
+  ssl: sslPaths.nullable().optional(), logDir: confPath.optional(), serverAdmin: emailAddress.optional(), reload: z.boolean().default(true),
+}).strict();
+
+function defaultVhostBlock(v, { ssl, port }) {
+  const addrs = v.bind ? [`_default_:${port}`, listenAddr(v.bind, port)] : [`_default_:${port}`, ...v.addresses.map((a) => listenAddr(a, port))];
+  const logDir = v.logDir || domlogDir(v.user);
+  const lines = [`<VirtualHost ${[...new Set(addrs)].join(' ')}>`, `  ServerName ${DEFAULT_VHOST_SERVER_NAME}`];
+  lines.push(`  ServerAdmin ${v.serverAdmin || `webmaster@${v.hostname}`}`, `  DocumentRoot ${q(v.docroot)}`, '  UseCanonicalName Off');
+  lines.push(`  CustomLog ${q(`${logDir}/default${ssl ? '-ssl' : ''}-access.log`)} combined`, `  ErrorLog ${q(`${logDir}/default${ssl ? '-ssl' : ''}-error.log`)}`);
+  lines.push('  <IfModule mod_userdir.c>', '    UserDir disabled', '  </IfModule>');
+  lines.push(`  <Directory ${q(v.docroot)}>`, `    Options ${DOCROOT_OPTIONS}`, '    AllowOverride None', '    Require all granted', '  </Directory>');
+  if (ssl) {
+    lines.push('  SSLEngine on');
+    if (v.ssl.fullchain) lines.push(`  SSLCertificateFile ${q(v.ssl.fullchain)}`);
+    else { lines.push(`  SSLCertificateFile ${q(v.ssl.cert)}`); if (v.ssl.chain) lines.push(`  SSLCertificateChainFile ${q(v.ssl.chain)}`); }
+    lines.push(`  SSLCertificateKeyFile ${q(v.ssl.key)}`);
+  }
+  lines.push('</VirtualHost>');
+  return lines;
+}
+
+export function renderDefaultVhost(v) {
+  const spec = { ...v, addresses: v.addresses || [], sslPort: v.sslPort === undefined ? 443 : v.sslPort, port: v.port || 80 };
+  const meta = { hostname: spec.hostname, docroot: spec.docroot, user: spec.user, addresses: spec.bind ? [spec.bind] : spec.addresses, port: spec.port, sslPort: spec.sslPort, ssl: Boolean(spec.ssl && spec.sslPort), sslSource: spec.ssl?.source ?? null };
+  const lines = [`${MANAGED} (default virtual host: the landing page for the bare address and for names no site claims). Edit through the panel; manual changes are overwritten.`, `${DEFAULT_VHOST_MARK}${JSON.stringify(meta)}`, ''];
+  lines.push(...defaultVhostBlock(spec, { ssl: false, port: spec.port }));
+  if (spec.ssl && spec.sslPort) lines.push('', '<IfModule ssl_module>', ...defaultVhostBlock(spec, { ssl: true, port: spec.sslPort }), '</IfModule>');
+  else if (spec.sslPort) lines.push('', '# No certificate pair is available for HTTPS; the reverse proxy or the first SSL vhost answers port 443 until one exists.');
+  return `${lines.join('\n')}\n`;
+}
+
+export function parseDefaultVhostMeta(text) {
+  const line = (text || '').split('\n').find((l) => l.startsWith(DEFAULT_VHOST_MARK));
+  if (!line) return null;
+  try { return JSON.parse(line.slice(DEFAULT_VHOST_MARK.length)); } catch { return null; }
+}
+
+// A self-signed pair under DEFAULT_SSL_DIR for hosts that have no other pair;
+// generated once and kept (openssl is the only tool used).
+async function ensureGeneratedPair(hostname, ctx, candidate) {
+  const dir = ctx.assertAllowedPath(path.dirname(candidate.cert), 'write');
+  const cert = ctx.assertAllowedPath(candidate.cert, 'write');
+  const key = ctx.assertAllowedPath(candidate.key, 'write');
+  if (exists(cert) && exists(key)) return { cert, key, generated: false };
+  if (!hasBinary('openssl')) return null;
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+  await exec('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert, '-days', '3650', '-subj', `/CN=${hostname}`], { timeoutMs: 60_000 });
+  fs.chmodSync(key, 0o600);
+  return { cert, key, generated: true };
+}
+
+// The certificate pair the HTTPS block uses: the caller's (hostname) bundle when
+// its files exist, else the first fallback that does, else a generated one.
+export async function resolveDefaultSsl(wanted, hostname, ctx, fallbacks = DEFAULT_SSL_FALLBACKS) {
+  if (wanted && exists(wanted.cert) && exists(wanted.key)) {
+    for (const f of [wanted.cert, wanted.key, wanted.chain, wanted.fullchain].filter(Boolean)) ctx.assertAllowedPath(f, 'read');
+    return { cert: wanted.cert, key: wanted.key, chain: wanted.chain || null, fullchain: wanted.fullchain && exists(wanted.fullchain) ? wanted.fullchain : null, source: 'hostname' };
+  }
+  for (const c of fallbacks) {
+    if (c.source === 'generated') {
+      const pair = await ensureGeneratedPair(hostname, ctx, c);
+      if (pair) return { cert: pair.cert, key: pair.key, chain: null, fullchain: null, source: 'generated', generated: pair.generated };
+      continue;
+    }
+    if (exists(c.cert) && exists(c.key)) { ctx.assertAllowedPath(c.cert, 'read'); ctx.assertAllowedPath(c.key, 'read'); return { cert: c.cert, key: c.key, chain: null, fullchain: null, source: c.source }; }
+  }
+  return null;
+}
+
+// Debian enables 000-default (ServerName-less `*:80`) by default; it sorts
+// before ours and would keep answering the bare address. a2dissite when it is
+// there, falling back to unlinking the sites-enabled entry.
+async function disableStockSite(apache, ctx) {
+  if (apache.flavor !== 'debian') return { disabled: false, site: null };
+  const link = ctx.assertAllowedPath(path.join(apache.sitesEnabled, `${DEBIAN_STOCK_SITE}.conf`), 'write');
+  if (!lexists(link)) return { disabled: false, site: DEBIAN_STOCK_SITE };
+  if (hasBinary('a2dissite')) {
+    const r = await exec('a2dissite', ['-q', DEBIAN_STOCK_SITE], { allowFailure: true, timeoutMs: 60_000 });
+    if (r.code === 0 && !lexists(link)) return { disabled: true, site: DEBIAN_STOCK_SITE, via: 'a2dissite' };
+  }
+  try { fs.unlinkSync(link); } catch { /* raced away */ }
+  return { disabled: true, site: DEBIAN_STOCK_SITE, via: 'unlink' };
+}
+
+async function reenableStockSite(apache, stock) {
+  if (!stock?.disabled) return;
+  if (hasBinary('a2ensite')) { const r = await exec('a2ensite', ['-q', DEBIAN_STOCK_SITE], { allowFailure: true, timeoutMs: 60_000 }); if (r.code === 0) return; }
+  const link = path.join(apache.sitesEnabled, `${DEBIAN_STOCK_SITE}.conf`);
+  const target = path.join(apache.sitesAvailable, `${DEBIAN_STOCK_SITE}.conf`);
+  if (!lexists(link) && exists(target)) { try { fs.symlinkSync(path.relative(path.dirname(link), target), link); } catch { /* best effort */ } }
+}
+
+export async function writeDefaultVhost(apache, v, ctx, { fallbacks = DEFAULT_SSL_FALLBACKS } = {}) {
+  ctx.assertAllowedPath(v.docroot, 'read');
+  const logDir = ctx.assertAllowedPath(v.logDir || domlogDir(v.user), 'write');
+  const { file, link, name } = defaultVhostFile(apache);
+  ctx.assertAllowedPath(file, 'write');
+  if (link) ctx.assertAllowedPath(link, 'write');
+  const owner = passwdEntry(v.user);
+  ensureRootLogDir(logDir, owner?.gid);
+  const sslPort = v.sslPort === undefined ? 443 : v.sslPort;
+  const ssl = sslPort ? await resolveDefaultSsl(v.ssl ?? null, v.hostname, ctx, fallbacks) : null;
+  const content = renderDefaultVhost({ ...v, sslPort, logDir, ssl });
+  const previous = readText(file);
+  const linkExisted = link ? lexists(link) : null;
+  const stock = await disableStockSite(apache, ctx);
+  writeAtomic(file, content);
+  if (link && !linkExisted) { fs.mkdirSync(path.dirname(link), { recursive: true }); fs.symlinkSync(path.relative(path.dirname(link), file), link); }
+  const test = await configtest(apache);
+  if (test.ok === false) {
+    restore(file, previous);
+    if (link && !linkExisted) { try { fs.unlinkSync(link); } catch { /* gone */ } }
+    await reenableStockSite(apache, stock);
+    throw new OpError('config_invalid', `Apache rejected the default virtual host; the previous file was restored: ${lastLine(test.output)}`, { output: test.output, path: file });
+  }
+  return { name, path: file, link, logDir, validated: test.ok === true, output: test.output, bytes: Buffer.byteLength(content), ssl: ssl ? { cert: ssl.fullchain || ssl.cert, key: ssl.key, source: ssl.source, generated: Boolean(ssl.generated) } : null, addresses: v.bind ? [v.bind] : v.addresses, stockSite: stock };
+}
+
+export async function removeDefaultVhost(apache, ctx) {
+  const { file, link } = defaultVhostFile(apache);
+  ctx.assertAllowedPath(file, 'write');
+  const text = readText(file);
+  if (text != null && !text.includes(DEFAULT_VHOST_MARK)) throw new OpError('refused', `${file} was not written by the panel; refusing to delete it`);
+  if (link) { ctx.assertAllowedPath(link, 'write'); try { fs.unlinkSync(link); } catch { /* none */ } }
+  let removed = false;
+  if (text != null) { fs.unlinkSync(file); removed = true; dropLegacyBackup(file); }
+  const test = removed ? await configtest(apache) : { ok: null, output: '' };
+  return { path: file, removed, validated: test.ok };
+}
+
+defineOp('web.default_vhost.write', {
+  description: 'Render and install the catch-all virtual host (landing page for the bare address and unmatched names on the HTTP and HTTPS ports), disable the distribution default site, validate (rolled back on error) and reload',
+  schema: defaultVhostSchema,
+  run: async (v, ctx) => {
+    const apache = requireApache();
+    const written = await writeDefaultVhost(apache, v, ctx);
+    const reload = v.reload ? await reloadUnit(apache.units) : { reloaded: false, unit: null };
+    return { ...written, ...reload };
+  },
+});
+
+defineOp('web.default_vhost.read', {
+  description: 'The panel-managed catch-all virtual host file, if any',
+  run: async (_args, ctx) => {
+    const apache = apacheLayout();
+    if (!apache) return { installed: false, exists: false, content: null };
+    const { file, link } = defaultVhostFile(apache);
+    ctx.assertAllowedPath(file, 'read');
+    const content = readText(file);
+    return { installed: Boolean(apache.bin), path: file, exists: content != null, enabled: link ? lexists(link) : content != null, meta: parseDefaultVhostMeta(content), content };
+  },
+});
+
+defineOp('web.default_vhost.remove', {
+  description: 'Remove the panel-managed catch-all virtual host and reload',
+  destructive: true,
+  schema: z.object({ reload: z.boolean().default(true) }).strict(),
+  run: async ({ reload }, ctx) => {
+    const apache = requireApache();
+    const result = await removeDefaultVhost(apache, ctx);
+    return { ...result, ...(reload && result.removed ? await reloadUnit(apache.units) : { reloaded: false, unit: null }) };
+  },
+});
+
+// ------------------------------------------------------- account docroots ---
+// A document root for an addon or sub domain is created inside the account's
+// home as the account itself (runuser): root never creates, writes or removes
+// anything below a home it does not own, so a planted link can only ever hurt
+// the account. The only root action is handing the new directory to the web
+// server's group (0750 <user>:<web group>, the layout account creation uses)
+// through a descriptor that refuses to open a link and that must belong to the
+// account.
+const docrootSchema = z.object({ username: arg.username, docroot: confPath, group: groupName.optional(), index: z.string().max(256 * 1024).regex(/^[^\0]*$/s).optional() }).strict();
+const RESERVED_HOME_DIRS = new Set(['public_html', 'mail', 'etc', 'tmp', 'logs', 'ssl', '.ssh']);
+
+function groupEntry(name) {
+  const line = (readText('/etc/group') || '').split('\n').find((l) => l.startsWith(`${name}:`));
+  return line ? { name, gid: Number(line.split(':')[2]) } : null;
+}
+
+function accountDocroot(username, docroot, ctx) {
+  const owner = passwdEntry(username);
+  if (!owner) throw new OpError('not_found', `Linux user "${username}" does not exist`);
+  if (owner.uid < 1000) throw new OpError('refused', `"${username}" has a system UID (${owner.uid}) and is not managed by the panel`);
+  const home = path.resolve(owner.home);
+  ctx.assertAllowedPath(home, 'write');
+  const target = assertUnderHome(home, docroot);
+  ctx.assertAllowedPath(target, 'write');
+  const rel = path.relative(home, target);
+  if (!rel || rel === '.') throw new OpError('refused', `${docroot} is the home directory itself`);
+  if (RESERVED_HOME_DIRS.has(rel)) throw new OpError('refused', `${docroot} is the account's ${rel} directory; a domain's document root must be a directory of its own`);
+  return { owner, home, target };
+}
+
+const asUser = (username, home, argv, opts = {}) => exec('runuser', ['-u', username, '--', ...argv], { allowFailure: true, timeoutMs: 60_000, env: { HOME: home }, ...opts });
+
+defineOp('web.docroot.ensure', {
+  description: 'Create a domain document root inside the account home as the account user (0750, web-server group), writing the index page only when the directory has none',
+  schema: docrootSchema,
+  run: async ({ username, docroot, group, index }, ctx) => {
+    const { owner, home, target } = accountDocroot(username, docroot, ctx);
+    if (!hasBinary('runuser')) throw new OpError('capability_missing', 'runuser is required to create files as the account user');
+    const existed = lexists(target);
+    const mk = await asUser(username, home, ['mkdir', '-p', '-m', '0750', '--', target]);
+    if (mk.code !== 0) throw new OpError('command_failed', `could not create ${target} as ${username}: ${lastLine(mk.stderr || mk.stdout)}`);
+    const webGroup = group ? groupEntry(group) : groupEntry(apacheLayout()?.runUser || 'www-data') || groupEntry('apache');
+    if (group && !webGroup) throw new OpError('not_found', `Unknown group "${group}"`);
+    let fd = null;
+    try {
+      fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      const st = fs.fstatSync(fd);
+      if (st.uid !== owner.uid) throw new OpError('refused', `${target} is not owned by ${username}`);
+      if (webGroup) fs.fchownSync(fd, owner.uid, webGroup.gid);
+      fs.fchmodSync(fd, 0o750);
+    } finally { if (fd !== null) { try { fs.closeSync(fd); } catch { /* closed */ } } }
+    let indexWritten = false;
+    if (index) {
+      const file = path.join(target, 'index.html');
+      const probe = await asUser(username, home, ['test', '-e', file]);
+      if (probe.code !== 0) {
+        const w = await asUser(username, home, ['tee', '--', file], { input: index, maxBuffer: 1024 * 1024 });
+        if (w.code !== 0) throw new OpError('command_failed', `could not write ${file} as ${username}: ${lastLine(w.stderr)}`);
+        indexWritten = true;
+      }
+    }
+    return { username, docroot: target, created: !existed, group: webGroup?.name ?? null, mode: '0750', indexWritten };
+  },
+});
+
+defineOp('web.docroot.remove', {
+  description: 'Remove a domain document root inside the account home as the account user (never the home, public_html or another reserved directory)',
+  destructive: true,
+  schema: z.object({ username: arg.username, docroot: confPath }).strict(),
+  run: async ({ username, docroot }, ctx) => {
+    const { home, target } = accountDocroot(username, docroot, ctx);
+    if (!hasBinary('runuser')) throw new OpError('capability_missing', 'runuser is required to remove files as the account user');
+    if (!lexists(target)) return { username, docroot: target, removed: false };
+    const r = await asUser(username, home, ['rm', '-rf', '--', target], { timeoutMs: 600_000 });
+    if (r.code !== 0) throw new OpError('command_failed', `rm -rf ${target} as ${username} failed: ${lastLine(r.stderr || r.stdout)}`);
+    return { username, docroot: target, removed: true };
+  },
+});
+
 // ------------------------------------------------------------ global include ---
 
 defineOp('web.global.read', {

@@ -1,21 +1,30 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { json, paginate } from '../db/index.js';
 import { notFound, conflict, badRequest, forbidden, unprocessable, CapabilityError } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
+import { componentByKey } from '../lib/stack-catalog.js';
+import { PACKAGE_GROUPS, catalogEntries, entryByKey, packagesFor, phpExtensionPackage, matchesEntry } from '../lib/package-catalog.js';
 
 // Software. Attached as ctx.software; other categories may call:
 //   software.pkg.detect()                                   -> { manager: 'apt'|'dnf'|'yum'|null, family, rpm, capability }
 //   software.pkg.isInstalled(names[])                       -> { name: boolean }
+//   software.pkg.catalog({ q, group, refresh })             -> the curated package catalog (lib/package-catalog.js) with installed / offered state per entry
+//   software.pkg.installEntry(key, { phpVersion }, user, req) -> job (202 semantics) installing one catalog entry's packages for this family
+//   software.pkg.search(q, { limit, all })                  -> { results: [{ name, summary, installed, variants: [...] }], total, hidden, more } (deduped unless all)
 //   software.pkg.ensureInstalled(names[], { user, req })    -> { missing, job } (enqueues an install job when something is missing)
 //   software.pkg.install(names[], user, req)                -> job (202 semantics)
 //   software.php.versions()                                 -> { versions: [{ id, version, binary, iniPath, poolDir, fpmUnit, isDefault, advisories }], defaultId }
 //   software.php.systemDefault()                            -> { configured, detected, effective }
 //   software.php.versionForDomain(domain)                   -> { domain, phpVersion, effective, inherited } or null
 //   software.php.setDomainVersion(domains[], version|null, user, req) -> { results, job } (job when more than one domain)
-//   software.nginx.status()                                 -> install + proxy state (never throws CapabilityError); stale: true when the
+//   software.php.installable()                              -> { source, stock, versions: [{ version, id, offered, installed, isDefault, inUse, removable }] }
+//   software.php.installVersion(branch, user, req)          -> { job } (enables the family's PHP source when needed, installs, enables FPM)
+//   software.php.removeVersion(id, user, req)               -> { job } (409 for the default or a version domains still use)
+//   software.nginx.status()                               -> install + proxy state (never throws CapabilityError); stale: true when the
 //                                                              rendered proxy no longer matches the current domains / certificates
 //   software.nginx.sync(req)                                -> re-render the reverse-proxy config from current domains and certificates;
 //                                                              { skipped: true } when the proxy is disabled, so SSL/TLS and Accounts
@@ -105,6 +114,10 @@ export function createSoftwareService(ctx) {
   const { db, agent, capabilities, settings, logger } = ctx;
   const op = (name, args = {}, req) => agent.op(name, args, { req });
   const S = (key, fallback) => { const v = settings.get(key, fallback); return v === undefined ? fallback : v; };
+  const hostname = () => S('basic.hostname', '') || os.hostname() || 'localhost';
+  // Security alerts (Server Contacts) are a courtesy: an update run never fails
+  // because the notice could not be recorded.
+  const raiseSecurityAlert = (input) => { try { return ctx.securityAlerts?.raise?.(input) ?? null; } catch (err) { logger.warn({ err, kind: input.kind }, 'security alert not raised'); return null; } };
 
   // Every hosted domain: main domains without an account_domains row plus every
   // recorded row (account_domains.domain is unique, so no domain repeats).
@@ -118,6 +131,8 @@ export function createSoftwareService(ctx) {
     accountDomain: db.prepare('SELECT d.*, a.username, a.owner_id, a.home_dir, a.suspended FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE d.domain = ?'),
     setDomainPhp: db.prepare('UPDATE account_domains SET php_version = ? WHERE domain = ?'),
     insertMainDomain: db.prepare('INSERT INTO account_domains (account_id, domain, type, docroot, php_version) VALUES (?, ?, ?, ?, ?)'),
+    phpUsage: db.prepare('SELECT php_version, COUNT(*) AS n FROM account_domains WHERE php_version IS NOT NULL GROUP BY php_version'),
+    phpUsageFor: db.prepare('SELECT COUNT(*) AS n FROM account_domains WHERE php_version = ?'),
     profiles: db.prepare('SELECT * FROM ea4_profiles ORDER BY stock DESC, name'),
     profileById: db.prepare('SELECT * FROM ea4_profiles WHERE id = ?'),
     profileByName: db.prepare('SELECT * FROM ea4_profiles WHERE name = ?'),
@@ -188,8 +203,59 @@ export function createSoftwareService(ctx) {
       const page = query.page || 1; const pageSize = query.pageSize || 50;
       return { data: packages.slice((page - 1) * pageSize, page * pageSize), meta: { page, pageSize, total: packages.length, installedTotal: total, manager } };
     },
-    async search(q, limit = 100) { requirePkg(); return op('pkg.search', { q, limit }); },
+    async search(q, { limit = 60, all = false } = {}) { requirePkg(); return op('pkg.search', { q, limit, all: Boolean(all) }); },
     async info(name) { requirePkg(); return op('pkg.info', { name }); },
+    // The curated catalog with what this host has and what its repositories
+    // offer. Installed state comes from one dpkg/rpm listing; the offered state
+    // of everything not installed from one pkg.offers call, kept for a while
+    // because it is the slow part and only an index refresh or an install
+    // changes it (pkgJob drops the cache after each of those).
+    async catalog({ q, group, refresh = false } = {}) {
+      requirePkg();
+      const detected = await pkg.detect();
+      const fam = detected.family === 'rhel' ? 'rhel' : detected.family === 'debian' ? 'debian' : null;
+      if (!fam) throw new CapabilityError('pkg', 'No supported package manager (apt-get, dnf or yum) was found on this server');
+      let phpVersions = [];
+      if (capabilities.has('php')) { try { phpVersions = (await php.versions()).versions; } catch (err) { logger.warn({ err }, 'php detection failed'); } }
+      const entries = catalogEntries();
+      const wanted = new Set();
+      for (const e of entries) for (const n of packagesFor(e, fam, { phpVersions })) wanted.add(n);
+      const listing = await op('pkg.list_installed', {});
+      const installed = new Map(listing.packages.map((p) => [p.name, p.version]));
+      const offers = await offersFor([...wanted].filter((n) => !installed.has(n)), { refresh, family: fam });
+      const packageState = (name) => ({ name, installed: installed.has(name), version: installed.get(name) ?? null, offered: installed.has(name) ? true : offers.known ? Boolean(offers.map[name]?.offered) : null, candidate: offers.map[name]?.candidate ?? null });
+      const shape = (e) => {
+        const names = packagesFor(e, fam, { phpVersions });
+        const packages = names.map(packageState);
+        const notInstalled = packages.filter((p) => !p.installed);
+        const offered = !notInstalled.length ? true : notInstalled.some((p) => p.offered === null) ? null : notInstalled.every((p) => p.offered);
+        const perVersion = e.php && phpVersions.length ? phpVersions.map((v) => ({ id: v.id, label: v.label || `PHP ${v.id}`, ...packageState(phpExtensionPackage(e, v, fam)) })) : null;
+        return {
+          key: e.key, label: e.label, description: e.description, category: e.category, recommended: e.recommended, stack: e.stack, capability: e.capability,
+          requires: e.requires?.[fam] ?? null, configure: e.configure, packages,
+          installed: packages.length > 0 && notInstalled.length === 0, partial: notInstalled.length > 0 && notInstalled.length < packages.length,
+          offered, missing: notInstalled.filter((p) => p.offered === false).map((p) => p.name), php: e.php ? { versions: perVersion ?? [], unversioned: !perVersion } : null,
+        };
+      };
+      const shaped = entries.filter((e) => (!group || e.category === group) && matchesEntry(e, q)).map(shape);
+      const groups = PACKAGE_GROUPS.map((g) => ({ ...g, entries: shaped.filter((e) => e.category === g.key) })).filter((g) => g.entries.length);
+      return { manager: detected.manager, family: fam, phpVersions: phpVersions.map((v) => ({ id: v.id, label: v.label || `PHP ${v.id}`, layout: v.layout ?? null })), installedTotal: listing.total, offersKnown: offers.known, offersAt: offers.at, entries: shaped.length, total: entries.length, groups };
+    },
+    async installEntry(key, { phpVersion } = {}, user, req) {
+      requirePkg();
+      const entry = entryByKey(key);
+      if (!entry) throw notFound(`Catalog entry "${key}"`);
+      const fam = (await family()) === 'rhel' ? 'rhel' : 'debian';
+      let phpVersions = [];
+      if (entry.php && capabilities.has('php')) { try { phpVersions = (await php.versions()).versions; } catch (err) { logger.warn({ err }, 'php detection failed'); } }
+      if (phpVersion && !entry.php) throw unprocessable(`"${entry.label}" is not a PHP extension; it has no per-version package`, { phpVersion: ['Leave phpVersion out for this entry'] });
+      if (phpVersion && !phpVersions.some((v) => v.id === phpVersion)) throw unprocessable(`PHP "${phpVersion}" is not installed on this server`, { phpVersion: ['Pick one of the installed versions'] });
+      const packages = phpVersion ? [phpExtensionPackage(entry, phpVersions.find((v) => v.id === phpVersion), fam)] : packagesFor(entry, fam, { phpVersions });
+      if (!packages.length) throw unprocessable(`"${entry.label}" has no packages for the ${fam} family`, { key: ['Nothing to install on this host'] });
+      const job = enqueue('software.pkg.install', { packages, noRecommends: false, catalogEntry: key }, user);
+      req?.audit?.({ action: 'software.pkg.catalog.install', target: key, args: { packages, phpVersion: phpVersion ?? null, family: fam, jobId: job.id } });
+      return { job, key, packages };
+    },
     async isInstalled(names) {
       requirePkg();
       const { packages } = await op('pkg.list_installed', { prefix: names });
@@ -223,10 +289,29 @@ export function createSoftwareService(ctx) {
     recent(limit = 20) { return ctx.jobs.list({ limit: 200 }).filter((j) => j.type.startsWith('software.pkg.')).slice(0, limit); },
   };
 
+  // Offered state of names not installed, from pkg.offers in batches; an agent
+  // without the op (or a failing one) leaves the state unknown rather than
+  // failing the catalog page.
+  const OFFERS_TTL_MS = 15 * 60_000;
+  let offersCache = null;
+  async function offersFor(names, { refresh = false, family: fam } = {}) {
+    const now = Date.now();
+    if (!refresh && offersCache && offersCache.family === fam && now - offersCache.at < OFFERS_TTL_MS && names.every((n) => n in offersCache.map)) return offersCache;
+    const map = {};
+    let known = true;
+    for (let i = 0; i < names.length; i += 300) {
+      const chunk = names.slice(i, i + 300);
+      try { Object.assign(map, (await op('pkg.offers', { packages: chunk })).packages); } catch (err) { logger.warn({ err }, 'pkg.offers failed; offered state unknown'); known = false; }
+    }
+    offersCache = known ? { at: now, family: fam, map, known } : null;
+    return { at: known ? now : null, family: fam, map, known };
+  }
+
   async function pkgJob(job, opName, args, label) {
     job.log(`${label}: ${JSON.stringify(args.packages || args)}`);
     job.progress(5, label);
     const result = await runLongOp(job, opName, args, label);
+    offersCache = null;
     job.progress(100, 'finished');
     return { manager: result.manager, packages: result.packages, purge: result.purge, lines: result.output?.length ?? 0 };
   }
@@ -297,7 +382,16 @@ export function createSoftwareService(ctx) {
       job.progress(100, rebootRequired ? 'done; reboot required' : 'done');
       if (rebootRequired) job.log('A reboot is required to finish applying these updates', 'warn');
       const upgraded = packages?.length ? pending.packages.filter((p) => packages.includes(p.name)) : pending.packages;
-      return { upgraded: upgraded.length, packages: upgraded.map((p) => p.name), stillPending: after.count, rebootRequired };
+      const securityApplied = upgraded.filter((p) => p.security);
+      if (securityApplied.length) {
+        raiseSecurityAlert({
+          kind: 'updates.security_applied', title: `Emergency security update applied: ${securityApplied.length} package${securityApplied.length === 1 ? '' : 's'} on ${hostname()}`,
+          body: securityApplied.slice(0, 50).map((p) => `${p.name} ${p.current ?? ''} -> ${p.candidate ?? ''}`.trim()).join('\n'),
+          dedupeKey: `updates.security_applied:${job.job.id}`, source: `software.system.update#${job.job.id}`,
+          data: { count: securityApplied.length, packages: securityApplied.slice(0, 50).map((p) => p.name), rebootRequired: Boolean(rebootRequired), stillPending: after.count, jobId: job.job.id },
+        });
+      }
+      return { upgraded: upgraded.length, packages: upgraded.map((p) => p.name), stillPending: after.count, rebootRequired, securityApplied: securityApplied.length };
     },
     async checkJob(job) {
       if (!capabilities.has('pkg')) { job.log('no package manager detected; skipping'); return { skipped: true }; }
@@ -307,6 +401,15 @@ export function createSoftwareService(ctx) {
       job.progress(40, 'checking for updates');
       const pending = recordCheck(await job.agent.op('pkg.upgradable'));
       job.log(`${pending.count} pending update(s), ${pending.security} security`);
+      if (pending.security > 0) {
+        const names = pending.packages.filter((p) => p.security).map((p) => p.name).sort();
+        raiseSecurityAlert({
+          kind: 'updates.security_available', title: `${pending.security} security update${pending.security === 1 ? '' : 's'} available on ${hostname()}`,
+          body: names.slice(0, 50).join(', ') + (names.length > 50 ? ', …' : ''),
+          dedupeKey: `updates.security_available:${crypto.createHash('sha256').update(names.join('\n')).digest('hex').slice(0, 16)}`, source: `software.update.check#${job.job.id}`,
+          data: { count: pending.count, security: pending.security, packages: names.slice(0, 50), rebootRequired: Boolean(pending.rebootRequired), autoApply: Boolean(S('software.updates.auto_os', false)) },
+        });
+      }
       if (pending.count > 0 && S('software.updates.auto_os', false)) {
         job.log('automatic OS updates are enabled; applying');
         const run = enqueue('software.system.update', { dist: true, autoremove: true, refreshIndex: false }, null);
@@ -457,12 +560,22 @@ export function createSoftwareService(ctx) {
           sha256: typeof release.sha256 === 'string' && /^[0-9a-f]{64}$/i.test(release.sha256) ? release.sha256.toLowerCase() : null,
           signature: typeof release.signature === 'string' && /^[A-Za-z0-9+/=_-]{1,1024}$/.test(release.signature) ? release.signature : null,
           keyId: typeof release.keyId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(release.keyId) ? release.keyId : null,
+          // A release flagged "security" by the feed raises a security alert once per version.
+          security: release.security === true || release.security === 'true' || (Array.isArray(release.tags) && release.tags.includes('security')),
         };
       } catch (err) {
         entry.error = (err.name === 'TimeoutError' ? 'timed out after 10s' : err.message).split(url).join(entry.url);
       }
       settings.set('software.panel.last_check', entry);
       req?.audit?.({ action: 'software.panel.check', args: { url: entry.url, ok: entry.ok, latest: entry.latest?.version ?? null, error: entry.error } });
+      if (entry.ok && entry.latest.security && compareVersions(entry.latest.version, ctx.version) > 0) {
+        raiseSecurityAlert({
+          kind: 'panel.security_release', title: `Panel security release ${entry.latest.version} is available (running ${ctx.version})`,
+          body: entry.latest.notes ? entry.latest.notes.slice(0, 2000) : `Release ${entry.latest.version} on the ${entry.latest.tier} tier is flagged as a security release.`,
+          dedupeKey: `panel.security_release:${entry.latest.version}`, source: 'software.panel.check',
+          data: { version: entry.latest.version, currentVersion: ctx.version, url: entry.latest.url, tier: entry.latest.tier, publishedAt: entry.latest.publishedAt },
+        });
+      }
       return panel.status();
     },
     updateSettings({ url, tier, autoUpdate }, req) {
@@ -628,7 +741,124 @@ export function createSoftwareService(ctx) {
       return { version, applied, failed, state: failed.length ? 'partial' : 'applied' };
     },
     async pools(version) { requirePhp(); return op('pkg.phpfpm.pools', version ? { version } : {}); },
+
+    // --- install / remove branches ----------------------------------------
+    // Works without any PHP on the host: that is when it matters most. The
+    // agent's source catalog (ppa:ondrej/php, packages.sury.org, Remi) decides
+    // what each family can offer; the install job enables the source on first use.
+    async installable() {
+      requirePkg();
+      const detect = await op('pkg.php.sources.detect');
+      let installed = { versions: [], defaultId: null, effectiveDefault: null };
+      if (capabilities.has('php')) { try { installed = await php.versions(); } catch (err) { logger.warn({ err }, 'php detection failed'); } }
+      const byId = new Map(installed.versions.map((v) => [v.id, v]));
+      const inUse = Object.fromEntries(stmts.phpUsage.all().map((r) => [r.php_version, r.n]));
+      const effectiveDefault = installed.effectiveDefault ?? installed.defaultId ?? null;
+      const shape = (v, found) => ({
+        version: v.version, id: v.id, label: found?.label ?? `PHP ${v.version}`, offered: Boolean(v.offered), installed: Boolean(found) || Boolean(v.installed), installedVersion: found?.version ?? v.installedVersion ?? null,
+        candidate: v.candidate ?? null, source: v.source ?? null, fpmUnit: found?.fpmUnit ?? v.fpmUnit ?? null, layout: found?.layout ?? null, stock: Boolean(detect.stock) && detect.stock === v.version,
+        isDefault: Boolean(found) && found.id === effectiveDefault, isCliDefault: Boolean(found?.isDefault), inUse: inUse[v.id] ?? 0, advisories: found?.advisories ?? [],
+        removable: Boolean(found) && found.id !== effectiveDefault && !found.isDefault && !(inUse[v.id] ?? 0) && ['debian', 'remi'].includes(found.layout) && Boolean(branchOf(found)),
+      });
+      const versions = detect.versions.map((v) => shape(v, byId.get(v.id)));
+      // Installed trees outside the branch catalog (ea-php*, rh-php*, the stock RHEL php) are listed read-only.
+      for (const found of installed.versions) if (!versions.some((x) => x.id === found.id)) versions.push(shape({ version: branchOf(found) ?? found.version?.match(/^\d\.\d/)?.[0] ?? found.id, id: found.id, offered: false, installed: true }, found));
+      const recent = ctx.jobs.list({ limit: 100 }).filter((j) => j.type === 'software.php.install' || j.type === 'software.php.remove').slice(0, 10);
+      return { manager: detect.manager, family: detect.family, os: detect.os, source: detect.source, stock: detect.stock, effectiveDefault, versions, recent };
+    },
+    async installVersion(version, user, req) {
+      requirePkg();
+      if (capabilities.has('php')) {
+        const [{ versions }, fam] = await Promise.all([php.versions(), family()]);
+        const id = fam === 'debian' ? version : `php${version.replace('.', '')}`;
+        if (versions.some((v) => v.id === id)) throw conflict(`PHP ${version} is already installed on this server (${id})`);
+      }
+      const job = enqueue('software.php.install', { version }, user);
+      req?.audit?.({ action: 'software.php.install', target: version, args: { version, jobId: job.id } });
+      return { job, version };
+    },
+    async installJob(job) {
+      const { version } = job.params;
+      job.progress(3, 'checking package sources');
+      let detect = await job.agent.op('pkg.php.sources.detect', { branches: [version] });
+      const host = `${detect.os?.name || detect.family}${detect.os?.codename ? ` (${detect.os.codename})` : ''}`;
+      job.log(`${host}: PHP source ${detect.source.label || 'none'} is ${detect.source.configured ? 'configured' : 'not configured'}; stock branch ${detect.stock || 'unknown'}`);
+      let entry = detect.versions[0];
+      let sourceEnabled = false;
+      if (!entry?.offered) {
+        if (!detect.source.key || !detect.source.supported) throw new Error(`PHP ${version} is not offered by the configured repositories and no PHP package source is available for this host${detect.source.reason ? ` (${detect.source.reason})` : ''}`);
+        if (detect.source.configured) throw new Error(`PHP ${version} is not offered by ${detect.source.label} for ${host}`);
+        job.progress(10, `enabling ${detect.source.label}`);
+        const enabled = await runLongOp(job, 'pkg.php.source.enable', { source: detect.source.key }, `enable ${detect.source.label}`);
+        for (const step of enabled.steps || []) job.log(`${step.step}: ${step.ok ? 'ok' : `failed${step.output ? ` (${step.output})` : ''}`}`, step.ok ? 'info' : 'warn');
+        sourceEnabled = Boolean(enabled.changed);
+        detect = await job.agent.op('pkg.php.sources.detect', { branches: [version] });
+        entry = detect.versions[0];
+        if (!entry?.offered) throw new Error(`PHP ${version} is still not offered after enabling ${detect.source.label}; it may not be published for ${host} yet`);
+      }
+      job.log(`PHP ${version}: ${entry.package} ${entry.candidate || entry.installedVersion || ''} from ${entry.source || 'the distribution'}`);
+      job.progress(30, `installing PHP ${version}`);
+      const result = await runLongOp(job, 'pkg.php.install', { version, extensions: phpExtensionsFor(detect.family) }, `PHP ${version} install`);
+      job.log(`installed ${result.packages.length} package(s): ${result.packages.join(', ')}`);
+      if (result.skipped?.length) job.log(`not offered by any repository, skipped: ${result.skipped.join(', ')}`, 'warn');
+      job.progress(80, `enabling ${result.fpmUnit}`);
+      let unit = result.unit?.enabled == null ? null : result.unit;
+      if (!unit) {
+        try { await job.agent.op('svc.enable', { unit: result.fpmUnit }); unit = { unit: result.fpmUnit, enabled: true, note: null }; } catch (err) { unit = { unit: result.fpmUnit, enabled: false, note: err.message }; }
+      }
+      job.log(`${result.fpmUnit}: ${unit.enabled ? 'enabled and started' : `could not be enabled: ${unit.note}`}`, unit.enabled ? 'info' : 'warn');
+      job.progress(90, 'refreshing detection');
+      await refreshPhpDetection(job);
+      job.progress(100, 'done');
+      return { version, id: result.id, packages: result.packages, skipped: result.skipped ?? [], fpmUnit: result.fpmUnit, unitEnabled: unit.enabled, source: detect.source.key, sourceEnabled };
+    },
+    async removeVersion(id, user, req) {
+      requirePkg();
+      const { versions, effectiveDefault } = await php.versions();
+      const entry = versions.find((v) => v.id === id);
+      if (!entry) throw notFound(`PHP version "${id}"`);
+      if (entry.id === effectiveDefault) throw conflict(`PHP ${id} is the system default; make another version the default before removing it`);
+      if (entry.isDefault) throw conflict(`PHP ${id} is what /usr/bin/php resolves to (CLI default); make another version the default before removing it`);
+      const used = stmts.phpUsageFor.get(id).n;
+      if (used) throw conflict(`PHP ${id} is still used by ${used} domain(s); move them to another version first`);
+      const version = branchOf(entry);
+      if (!version || !['debian', 'remi'].includes(entry.layout)) throw unprocessable(`PHP ${id} was not installed as a versioned package set and cannot be removed from here`, { id: ['Only php8.x-* (Debian/Ubuntu) and Remi php8x-php-* sets can be removed'] });
+      const job = enqueue('software.php.remove', { id, version }, user);
+      req?.audit?.({ action: 'software.php.remove', target: id, args: { version, jobId: job.id } });
+      return { job, id, version };
+    },
+    async removeJob(job) {
+      const { id, version } = job.params;
+      // Re-checked here: a domain may have been moved onto it since the request.
+      const used = stmts.phpUsageFor.get(id).n;
+      if (used) throw new Error(`PHP ${id} is now used by ${used} domain(s); nothing was removed`);
+      job.progress(10, `removing PHP ${version}`);
+      const result = await runLongOp(job, 'pkg.php.remove', { version }, `PHP ${version} removal`);
+      job.log(`removed ${result.packages.length} package(s): ${result.packages.join(', ')}`);
+      job.progress(90, 'refreshing detection');
+      await refreshPhpDetection(job);
+      job.progress(100, 'done');
+      return { id, version, packages: result.packages, fpmUnit: result.fpmUnit };
+    },
   };
+
+  // '8.3' for Debian ids (8.3) and Remi ids (php83); null for ea-php*/rh-php*/system.
+  function branchOf(entry) {
+    const m = String(entry?.id ?? '').match(/^(\d)\.(\d)$/) || String(entry?.id ?? '').match(/^php(\d)(\d)$/);
+    return m ? `${m[1]}.${m[2]}` : null;
+  }
+  // The stack catalog's php component, as the suffixes the agent turns into php8.3-<x> / php83-php-<x>.
+  function phpExtensionsFor(fam) {
+    const names = componentByKey('php')?.packages?.[fam] || [];
+    return names.map((n) => n.replace(/^php-/, '')).filter((n) => n && !['fpm', 'cli', 'common'].includes(n) && /^[a-z][a-z0-9-]{0,31}$/.test(n));
+  }
+  // Capabilities, the web category's PHP-FPM tree cache and php-fpm detection
+  // all see the new (or removed) branch at once.
+  async function refreshPhpDetection(job) {
+    await capabilities.refresh();
+    try { const fpm = await job.agent.op('web.phpfpm.detect'); job.log(`PHP-FPM trees on this host: ${(fpm.versions || []).map((v) => v.version).join(', ') || 'none'}`); } catch (err) { job.log(`php-fpm detection: ${err.message}`, 'warn'); }
+    try { await ctx.web?.detect?.(true); } catch (err) { logger.warn({ err }, 'web detect refresh failed'); }
+  }
 
   // --- php.ini / .user.ini ------------------------------------------------
   const ini = {
@@ -1034,6 +1264,8 @@ export function createSoftwareService(ctx) {
     'software.nginx.sync': (job) => nginx.syncJob(job),
     'software.php.resync': (job) => php.resyncJob(job),
     'software.php.apply': (job) => php.applyJob(job),
+    'software.php.install': (job) => php.installJob(job),
+    'software.php.remove': (job) => php.removeJob(job),
     'software.ea4.build': (job) => ea4.buildJob(job),
   };
 

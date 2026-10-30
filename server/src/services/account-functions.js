@@ -1,3 +1,4 @@
+import { json } from '../db/index.js';
 import { notFound, conflict, forbidden, unprocessable, CapabilityError } from '../lib/errors.js';
 import { isRoot } from '../middleware/rbac.js';
 
@@ -11,6 +12,9 @@ import { isRoot } from '../middleware/rbac.js';
 //   accountFunctions.setShell / setQuota / setDemoMode / forcePasswordChange
 //   accountFunctions.logRetention.get(username) / logs.list(username, kind, user)
 //   accountFunctions.mountpointFor(dir)                -> the filesystem a quota for files under dir must be set on
+//   accountFunctions.domains.list(username, user) / add(username, { domain, type: addon|sub|parked, docroot?, autossl? }, user, req)
+//                   / remove(username, domain, { deleteFiles }, user, req)   -> an account's addon/sub/parked domains (docroot as the
+//                                                        account + index template, vhost, zone, mail routing, optional AutoSSL)
 // Accounts themselves (create/suspend/modify/terminate) stay on ctx.accounts.
 
 export const DOMLOGS_ROOT = '/var/log/whm/domlogs';
@@ -123,6 +127,9 @@ export function createAccountFunctionsService(ctx) {
     all: db.prepare('SELECT a.*, u.username AS owner FROM accounts a JOIN users u ON u.id = a.owner_id ORDER BY a.username'),
     byOwner: db.prepare('SELECT a.*, u.username AS owner FROM accounts a JOIN users u ON u.id = a.owner_id WHERE a.owner_id = ? ORDER BY a.username'),
     domains: db.prepare('SELECT * FROM account_domains WHERE account_id = ? ORDER BY type, domain'),
+    domainByName: db.prepare('SELECT * FROM account_domains WHERE domain = ?'),
+    insertDomain: db.prepare('INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, ?, ?, ?)'),
+    deleteDomain: db.prepare('DELETE FROM account_domains WHERE id = ?'),
     setIp: db.prepare("UPDATE accounts SET ip = ?, updated_at = datetime('now') WHERE id = ?"),
     setBandwidthLimit: db.prepare("UPDATE accounts SET bandwidth_limit_mb = ?, updated_at = datetime('now') WHERE id = ?"),
     resetBandwidth: db.prepare("UPDATE accounts SET bandwidth_used_mb = 0, updated_at = datetime('now') WHERE id = ?"),
@@ -799,6 +806,225 @@ export function createAccountFunctionsService(ctx) {
     },
   };
 
+  // ---------------------------------------------------------------- domains ---
+  // Addon, sub and parked domains of an account from the admin side (cPanel's
+  // Domains page, done as root/reseller). Host first: the document root and its
+  // index page are created as the account (agent web.docroot.ensure), then the
+  // account_domains row, then the vhost, the zone, mail routing and (when the
+  // name already resolves here) an AutoSSL certificate; every provisioning step
+  // after the row is reported, never fatal. Parked domains go through DNS
+  // Functions' parkDomain/unparkDomain, which own that path.
+  const DOMAIN_TYPES = ['addon', 'sub', 'parked'];
+  const RESERVED_SUBDIRS = ['public_html', 'mail', 'etc', 'tmp', 'logs', 'ssl', '.ssh'];
+  const DOCROOT_RE = /^\/(?!(?:.*\/)?\.\.(?:\/|$))[A-Za-z0-9._~+@=\/-]{1,4096}$/;
+  const LIMIT_KEY = { addon: 'max_addons', sub: 'max_subdomains', parked: 'max_parked' };
+  const stepOf = (p) => p.then((r) => r).catch((err) => ({ status: 'failed', detail: err.message, code: err.code ?? null }));
+
+  function accountDomainRows(account) {
+    return stmts.domains.all(account.id);
+  }
+
+  function serverAddresses(account) {
+    return [...new Set([account.ip, settings.get('basic.main_ip', ''), settings.get('basic.shared_ip', '')].map((v) => String(v || '').trim()).filter(Boolean))];
+  }
+
+  async function resolvesHere(domain, addresses) {
+    try {
+      const r = await op('dns.resolve', { name: domain, type: 'A', timeoutMs: 3000 });
+      const answers = Array.isArray(r?.answers) ? r.answers : [];
+      return { answers, matches: answers.some((a) => addresses.includes(a)), error: r?.error ?? null };
+    } catch (err) { return { answers: [], matches: false, error: err.message }; }
+  }
+
+  function parentDomainOf(domain, account) {
+    const candidates = [account.domain, ...accountDomainRows(account).filter((d) => ['addon', 'sub', 'parked', 'alias'].includes(d.type)).map((d) => d.domain)];
+    return candidates.filter((p) => domain.endsWith(`.${p}`)).sort((a, b) => b.length - a.length)[0] || null;
+  }
+
+  function defaultDocroot(account, domain, type, parent) {
+    const home = homeOf(account);
+    if (type === 'parked') return accountDomainRows(account).find((d) => d.type === 'main')?.docroot || `${home}/public_html`;
+    if (type === 'sub' && parent) return `${home}/public_html/${domain.slice(0, -(parent.length + 1))}`;
+    return `${home}/public_html/${domain}`;
+  }
+
+  function validateDocroot(account, docroot, domain) {
+    const home = homeOf(account);
+    if (!DOCROOT_RE.test(docroot) || docroot.endsWith('/')) throw unprocessable('The document root must be an absolute path made of letters, digits, ". _ - ~ + @ =" and "/", without ".."', { docroot: ['Invalid path'] });
+    if (!docroot.startsWith(`${home}/`)) throw unprocessable(`The document root must be inside the account home ${home}`, { docroot: [`Must start with ${home}/`] });
+    const rel = docroot.slice(home.length + 1);
+    if (RESERVED_SUBDIRS.includes(rel)) throw unprocessable(`${docroot} is the account's ${rel} directory; choose a directory of its own`, { docroot: ['Reserved directory'] });
+    const taken = accountDomainRows(account).find((d) => d.docroot === docroot && d.domain !== domain && !['parked', 'alias'].includes(d.type));
+    if (taken) throw conflict(`${docroot} is already the document root of ${taken.domain}`);
+    return docroot;
+  }
+
+  function shapeDomain(account, row, { vhost = null } = {}) {
+    let ssl = null;
+    try { ssl = ctx.ssl?.certForDomain?.(row.domain) ?? null; } catch { ssl = null; }
+    let zone = false;
+    try { zone = typeof ctx.dns?.zoneFor === 'function' ? ctx.dns.zoneFor(row.domain)?.domain === row.domain : Boolean(db.prepare('SELECT 1 FROM dns_zones WHERE domain = ?').get(row.domain)); } catch { zone = false; }
+    const v = vhost ?? (() => { try { return ctx.web?.vhostFor?.(row.domain) ?? null; } catch { return null; } })();
+    return {
+      id: row.id, domain: row.domain, type: row.type, docroot: row.docroot || (row.type === 'main' ? `${homeOf(account)}/public_html` : null), createdAt: row.created_at,
+      ssl: ssl ? { id: ssl.id, installed: ssl.installed, state: ssl.state, issuer: ssl.issuer, notAfter: ssl.notAfter, daysRemaining: ssl.daysRemaining, expired: ssl.expired, autossl: ssl.autossl, selfSigned: ssl.selfSigned } : null,
+      zone, vhost: v ? { status: v.status, error: v.error ?? null, path: v.path ?? null } : null,
+    };
+  }
+
+  const domains = {
+    list(username, user) {
+      const account = load(username, user);
+      const plan = json.parse(account.plan_snapshot_json, {});
+      const rows = accountDomainRows(account);
+      const count = (types) => rows.filter((d) => types.includes(d.type)).length;
+      const limit = (key) => (plan[key] == null || Number(plan[key]) < 0 ? null : Number(plan[key]));
+      return {
+        username, domain: account.domain, home: homeOf(account), suspended: Boolean(account.suspended), systemUser: account.uid != null,
+        domains: rows.map((d) => shapeDomain(account, d)),
+        limits: { addon: { used: count(['addon']), max: limit('max_addons') }, sub: { used: count(['sub']), max: limit('max_subdomains') }, parked: { used: count(['parked', 'alias']), max: limit('max_parked') } },
+        capabilities: { apache: capabilities.has('apache'), bind: capabilities.has('bind'), acme: capabilities.has('acme'), dns: Boolean(ctx.dns), ssl: typeof ctx.ssl?.issueFor === 'function', autossl: ctx.ssl?.autossl?.settings?.().provider ? ctx.ssl.autossl.settings().provider !== 'disabled' : false },
+      };
+    },
+
+    async add(username, { domain: rawDomain, type, docroot: wantedDocroot, autossl = true }, user, req) {
+      const account = load(username, user);
+      requireAcl(user, 'edit-account');
+      const domain = String(rawDomain || '').trim().toLowerCase();
+      if (!DOMAIN_TYPES.includes(type)) throw unprocessable(`type must be one of ${DOMAIN_TYPES.join(', ')}`, { type: ['Unknown type'] });
+      if (account.suspended) throw conflict('That account is suspended');
+      if (domain.startsWith('www.')) throw unprocessable('Add the domain without "www."; every site answers for its www. name too', { domain: ['Drop the www. prefix'] });
+      if (typeof ctx.web?.isServerName === 'function' ? ctx.web.isServerName(domain) : [hostname(), `www.${hostname()}`].includes(domain)) throw conflict(`${domain} is the server hostname; it cannot be hosted by an account`);
+      if (db.prepare('SELECT 1 FROM account_domains WHERE domain = ? UNION SELECT 1 FROM accounts WHERE domain = ?').get(domain, domain)) throw conflict(`${domain} is already hosted on this server`);
+      const plan = json.parse(account.plan_snapshot_json, {});
+      const limit = plan[LIMIT_KEY[type]];
+      const used = accountDomainRows(account).filter((d) => (type === 'parked' ? ['parked', 'alias'] : [type]).includes(d.type)).length;
+      if (!isRoot(user) && limit != null && Number(limit) >= 0 && used >= Number(limit)) throw forbidden(`The account's package allows ${limit} ${type} domain(s)`);
+      const steps = {};
+      if (type === 'parked') {
+        if (typeof ctx.dns?.parkDomain !== 'function') {
+          const docroot = defaultDocroot(account, domain, 'parked');
+          stmts.insertDomain.run(account.id, domain, 'parked', docroot);
+          steps.web = await stepOf(syncWeb(account, req));
+          audit(req, { action: 'account.domain.add', target: domain, args: { username, type, docroot, steps: Object.fromEntries(Object.entries(steps).map(([k, v]) => [k, v.status])) } });
+          return { domain, type, docroot, username, steps, entry: shapeDomain(account, stmts.domainByName.get(domain)) };
+        }
+        const parked = await ctx.dns.parkDomain({ domain, account: username, createZone: true }, user, req);
+        steps.dns = parked.zone ? { status: parked.zone.applied ? 'applied' : 'pending', detail: parked.zone.applied ? `zone ${domain} published` : 'zone recorded; published once BIND is installed' } : { status: 'skipped', detail: 'zone already existed' };
+        steps.web = { status: parked.web === true || parked.web === 'applied' ? 'applied' : parked.web === false ? 'skipped' : 'pending', detail: typeof parked.webDetail === 'string' ? parked.webDetail : parked.webDetail?.reason || `alias added to the ${account.domain} virtual host` };
+        audit(req, { action: 'account.domain.add', target: domain, args: { username, type, docroot: parked.docroot, steps: Object.fromEntries(Object.entries(steps).map(([k, v]) => [k, v.status])) } });
+        return { domain, type, docroot: parked.docroot, username, steps, entry: shapeDomain(account, stmts.domainByName.get(domain)) };
+      }
+      const parent = type === 'sub' ? parentDomainOf(domain, account) : null;
+      if (type === 'sub' && !parent) throw unprocessable(`${domain} is not under one of ${username}'s domains (${[account.domain, ...accountDomainRows(account).filter((d) => d.type !== 'main').map((d) => d.domain)].join(', ')})`, { domain: ['Must be a subdomain of one of the account\'s domains'] });
+      const docroot = validateDocroot(account, wantedDocroot || defaultDocroot(account, domain, type, parent), domain);
+      // Host first: the directory and its index page as the account; a refusal
+      // (a planted link, a reserved directory) stops here with nothing recorded.
+      if (account.uid != null) {
+        const created = await tolerant('web.docroot.ensure', { username, docroot, index: renderTemplate('index', { domain, username, hostname: hostname() }) }, req);
+        steps.docroot = created.ok ? { status: 'applied', detail: `${docroot} ${created.result.created ? 'created' : 'already existed'} (${created.result.group ? `${username}:${created.result.group}` : username} 0750)${created.result.indexWritten ? ', index page written' : ''}`, created: Boolean(created.result.created), indexWritten: Boolean(created.result.indexWritten) } : { status: 'pending', detail: created.error, code: created.code };
+      } else steps.docroot = { status: 'skipped', detail: 'no Linux user for this account; the directory is created once it exists' };
+      stmts.insertDomain.run(account.id, domain, type, docroot);
+      steps.web = await stepOf(syncWeb(account, req));
+      steps.dns = await stepOf(provisionDns(account, domain, type, req));
+      steps.mail = await stepOf(routeMail(domain, 'local', req));
+      steps.ssl = await stepOf(issueSsl(account, domain, autossl, user, req));
+      audit(req, { action: 'account.domain.add', target: domain, args: { username, type, docroot, parent, steps: Object.fromEntries(Object.entries(steps).map(([k, v]) => [k, v.status])) } });
+      return { domain, type, docroot, username, parent, steps, entry: shapeDomain(account, stmts.domainByName.get(domain)) };
+    },
+
+    async remove(username, rawDomain, { deleteFiles = false } = {}, user, req) {
+      const account = load(username, user);
+      requireAcl(user, 'edit-account');
+      const domain = String(rawDomain || '').trim().toLowerCase();
+      const row = stmts.domainByName.get(domain);
+      if (!row || row.account_id !== account.id) throw notFound(`Domain "${domain}" on ${username}`);
+      if (row.type === 'main') throw conflict(`${domain} is the main domain of ${username}; terminate the account to remove it`);
+      const steps = {};
+      if (['parked', 'alias'].includes(row.type)) {
+        if (typeof ctx.dns?.unparkDomain === 'function') {
+          const r = await ctx.dns.unparkDomain(domain, { removeZone: true }, user, req);
+          steps.dns = { status: r.zoneRemoved ? 'applied' : 'skipped', detail: r.zoneRemoved ? 'zone removed' : 'no zone to remove' };
+          steps.web = { status: r.web === true || r.web === 'applied' ? 'applied' : 'pending', detail: typeof r.webDetail === 'string' ? r.webDetail : r.webDetail?.reason || 'alias removed' };
+        } else {
+          stmts.deleteDomain.run(row.id);
+          steps.web = await stepOf(syncWeb(account, req));
+        }
+        audit(req, { action: 'account.domain.remove', target: domain, args: { username, type: row.type, steps: Object.fromEntries(Object.entries(steps).map(([k, v]) => [k, v.status])) } });
+        return { domain, type: row.type, username, removed: true, steps };
+      }
+      let cert = null;
+      try { cert = ctx.ssl?.certForDomain?.(domain) ?? null; } catch { cert = null; }
+      if (cert && typeof ctx.ssl?.uninstall === 'function') steps.ssl = await stepOf(ctx.ssl.uninstall(domain, user, req).then((r) => ({ status: 'applied', detail: `certificate removed (${r.web})` })));
+      steps.web = await stepOf(typeof ctx.web?.removeDomain === 'function' ? ctx.web.removeDomain(domain, req).then((r) => ({ status: r.applied ? 'applied' : 'pending', detail: r.removed ? 'virtual host removed' : r.recorded ? 'virtual host row removed; the file was not there' : 'nothing to remove' })) : Promise.resolve({ status: 'skipped', detail: 'Service Configuration is not loaded' }));
+      steps.dns = await stepOf(removeDns(domain, row.type, user, req));
+      steps.mail = await stepOf(routeMail(domain, 'remote', req));
+      stmts.deleteDomain.run(row.id);
+      const shared = accountDomainRows(account).some((d) => d.docroot === row.docroot) || !row.docroot || row.docroot === `${homeOf(account)}/public_html`;
+      if (deleteFiles) {
+        if (shared) steps.files = { status: 'skipped', detail: `${row.docroot || 'the document root'} is shared with another domain of the account and was kept` };
+        else if (account.uid == null) steps.files = { status: 'skipped', detail: 'no Linux user for this account' };
+        else steps.files = await stepOf(op('web.docroot.remove', { username, docroot: row.docroot }, req).then((r) => ({ status: 'applied', detail: r.removed ? `${row.docroot} removed` : `${row.docroot} was already gone` })));
+      } else steps.files = { status: 'skipped', detail: `${row.docroot || 'the document root'} was kept` };
+      audit(req, { action: 'account.domain.remove', target: domain, args: { username, type: row.type, docroot: row.docroot, deleteFiles, steps: Object.fromEntries(Object.entries(steps).map(([k, v]) => [k, v.status])) } });
+      return { domain, type: row.type, username, docroot: row.docroot, removed: true, steps };
+    },
+  };
+
+  async function syncWeb(account, req) {
+    if (typeof ctx.web?.vhosts?.sync !== 'function' && typeof ctx.web?.ensureVhost !== 'function') return { status: 'skipped', detail: 'Service Configuration is not loaded' };
+    const r = typeof ctx.web.vhosts?.sync === 'function' ? await ctx.web.vhosts.sync(account.username, req) : await ctx.web.ensureVhost(account.username, req);
+    if (r.applied || vhostWritten(r)) return { status: 'applied', detail: `${r.vhosts?.length ?? 1} virtual host(s) written${r.reload?.reloaded ? ', web server reloaded' : ''}${r.reason ? ` (${r.reason})` : ''}` };
+    if (r.reason === 'capability_missing') return { status: 'pending', detail: 'Apache is not installed; the virtual host is written when it is' };
+    return { status: 'failed', detail: r.vhosts?.find((v) => !v.applied)?.error || r.reason || 'virtual host not written' };
+  }
+
+  async function provisionDns(account, domain, type, req) {
+    if (!ctx.dns) return { status: 'skipped', detail: 'DNS Functions is not loaded' };
+    const ip = account.ip || settings.get('basic.main_ip', '') || settings.get('basic.shared_ip', '') || null;
+    const nameservers = ctx.resellers?.nameserversFor?.(account.owner_id) ?? [];
+    const containing = type === 'sub' && typeof ctx.dns.zoneFor === 'function' ? ctx.dns.zoneFor(domain) : null;
+    if (containing && containing.domain !== domain) {
+      if (!ip) return { status: 'skipped', detail: 'no IP address to publish' };
+      const r = await ctx.dns.upsertRecords(containing.domain, domain, 'A', [{ value: ip }], req);
+      return { status: r?.applied === false ? 'pending' : 'applied', detail: `${domain} A ${ip} in zone ${containing.domain}${r?.applied === false ? ' (published once BIND is installed)' : ''}`, zone: containing.domain };
+    }
+    const r = await ctx.dns.ensureZoneForDomain(domain, { ip: ip || undefined, accountId: account.id, nameservers: nameservers.length ? nameservers : undefined }, req);
+    if (r.applied) return { status: 'applied', detail: `zone ${domain} published (serial ${r.serial})`, zone: domain, created: r.created ?? null };
+    if (r.reason === 'capability_missing' || r.applied === false) return { status: 'pending', detail: 'BIND is not installed; the zone is published when it is', zone: domain };
+    return { status: 'applied', detail: r.created === false ? 'zone already existed and now belongs to this account' : `zone ${domain} recorded`, zone: domain };
+  }
+
+  async function removeDns(domain, type, user, req) {
+    if (!ctx.dns) return { status: 'skipped', detail: 'DNS Functions is not loaded' };
+    const containing = typeof ctx.dns.zoneFor === 'function' ? ctx.dns.zoneFor(domain) : null;
+    if (!containing) return { status: 'skipped', detail: 'no zone holds this name' };
+    if (containing.domain === domain) { await ctx.dns.deleteZone(domain, user, req); return { status: 'applied', detail: `zone ${domain} removed` }; }
+    if (type !== 'sub') return { status: 'skipped', detail: `${domain} lives in zone ${containing.domain}, which was kept` };
+    await ctx.dns.upsertRecords(containing.domain, domain, 'A', [], req);
+    return { status: 'applied', detail: `${domain} A records removed from zone ${containing.domain}` };
+  }
+
+  async function routeMail(domain, routing, req) {
+    if (typeof ctx.mail?.setRouting !== 'function') return { status: 'skipped', detail: 'Email is not loaded' };
+    const r = await ctx.mail.setRouting(domain, routing, req);
+    return { status: r?.applied ? 'applied' : 'pending', detail: r?.applied ? `${domain} ${routing === 'local' ? 'added to' : 'removed from'} Exim's local domains` : r?.reason || 'Exim is not installed; applied when it is' };
+  }
+
+  // AutoSSL only when the name already points here: an ACME order for a name
+  // that still resolves elsewhere fails and burns the rate limit.
+  async function issueSsl(account, domain, wanted, user, req) {
+    if (!wanted) return { status: 'skipped', detail: 'not requested' };
+    if (typeof ctx.ssl?.issueFor !== 'function') return { status: 'skipped', detail: 'SSL/TLS is not loaded' };
+    const provider = ctx.ssl.autossl?.settings?.().provider ?? 'disabled';
+    if (provider === 'disabled') return { status: 'skipped', detail: 'AutoSSL is disabled (SSL/TLS > Manage AutoSSL)' };
+    const addresses = serverAddresses(account);
+    const lookup = await resolvesHere(domain, addresses);
+    if (!lookup.matches) return { status: 'skipped', detail: `${domain} does not resolve to this server yet (${lookup.answers.length ? `answers: ${lookup.answers.join(', ')}` : lookup.error || 'no answer'}); run AutoSSL once DNS points here`, answers: lookup.answers };
+    const r = await ctx.ssl.issueFor(domain, user, req);
+    return { status: 'applied', detail: `${r.certificate?.issuerCommonName || provider} certificate until ${r.certificate?.notAfter || 'unknown'} (${r.web})`, certId: r.cert?.id ?? null };
+  }
+
   // -------------------------------------------------------- log retention ---
 
   const shapeRetention = (a, row) => ({ username: a.username, domain: a.domain, owner: a.owner, archive_logs: row ? Boolean(row.archive_logs) : Boolean(settings.get('account_functions.log_archive_default', false)), remove_old_archives: row ? Boolean(row.remove_old_archives) : true, retain_months: row?.retain_months ?? 3, last_archived_at: row?.last_archived_at ?? null, configured: Boolean(row), archive_dir: `${homeOf(a)}/logs/archive`, log_dir: `${DOMLOGS_ROOT}/${a.username}` });
@@ -860,7 +1086,7 @@ export function createAccountFunctionsService(ctx) {
     forcePasswordChange, setDemoMode,
     setBandwidthLimit, resetBandwidth, exceeders, unsuspendExceeders, runBandwidthEnforce, runMonthlyBandwidthReset,
     bandwidthEnforcement, setBandwidthEnforcement, syncEnforcementSchedule,
-    setShell, setQuota, quotaReport, logs, rearrange, logRetention, mountpointFor,
+    setShell, setQuota, quotaReport, logs, rearrange, logRetention, mountpointFor, domains,
     HOME_ROOTS, TEMPLATE_NAMES, TEMPLATE_USAGE, SHELLS, VHOST_WARNINGS, brandingVars,
   };
 }

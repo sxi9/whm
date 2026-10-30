@@ -104,6 +104,16 @@ describe('pkg op schemas reject injection before anything runs', () => {
       expect((await opError(runOp('pkg.php.userini.read', { docroot: bad }, ctx))).code, bad).toBe('invalid_args');
     }
     expect((await opError(runOp('pkg.php.userini.write', { docroot: '/home/bob/public_html', owner: 'Bob', content: '' }, ctx))).code).toBe('invalid_args');
+    // Branch installs take a bare d.d branch and a catalogued source key, nothing else (argv is built from the catalog).
+    for (const bad of [...INJECTION, '83', '8.3.1', 'php8.3', 'ea-php83', '8.10', 'PHP 8.3']) {
+      expect((await opError(runOp('pkg.php.install', { version: bad }, ctx))).code, bad).toBe('invalid_args');
+      expect((await opError(runOp('pkg.php.remove', { version: bad }, ctx))).code, bad).toBe('invalid_args');
+      expect((await opError(runOp('pkg.php.sources.detect', { branches: [bad] }, ctx))).code, bad).toBe('invalid_args');
+    }
+    for (const bad of [...INJECTION, 'ppa:ondrej/php', 'https://packages.sury.org/php/', 'remi-safe', 'SURY']) expect((await opError(runOp('pkg.php.source.enable', { source: bad }, ctx))).code, bad).toBe('invalid_args');
+    for (const bad of [...INJECTION, 'Curl', 'x'.repeat(33)]) expect((await opError(runOp('pkg.php.install', { version: '8.3', extensions: [bad] }, ctx))).code, bad).toBe('invalid_args');
+    expect((await opError(runOp('pkg.php.install', { version: '8.3', purge: true }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('pkg.php.source.enable', { source: 'remi', force: true }, ctx))).code).toBe('invalid_args');
     expect(exec).not.toHaveBeenCalled();
   });
 
@@ -432,6 +442,9 @@ describe('nginx proxy rendering is valid for every supported nginx', () => {
     expect(catalog.get('pkg.php.userini.write').destructive).toBe(true);
     expect(catalog.get('pkg.php.userini.read').destructive).toBe(false);
     expect(catalog.get('pkg.install').destructive).toBe(false);
+    expect(catalog.get('pkg.php.remove').destructive).toBe(true);
+    expect(catalog.get('pkg.php.install').destructive).toBe(false);
+    expect(catalog.get('pkg.php.source.enable').destructive).toBe(false);
     expect(NGINX_PROXY_CONF).toBe('/etc/nginx/conf.d/whm-proxy.conf');
   });
 

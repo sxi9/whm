@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { useAuth } from '../../../auth/AuthContext.jsx';
@@ -66,7 +66,13 @@ export default function MultiPhpIniEditor({ fn }) {
               <Select value={scope} onChange={setScope} options={[{ value: 'version', label: 'A PHP version (php.ini, server-wide)' }, { value: 'domain', label: 'A domain (.user.ini in its document root)' }]} />
             </Field>
           )}
-          {scope === 'version' && <Field label="PHP version"><Select value={version} onChange={setVersion} options={versionOptions} placeholder={versions.data ? 'Select a version…' : 'Loading…'} /></Field>}
+          {scope === 'version' && <Field label="PHP version" help={versions.data && !versionOptions.length ? 'No PHP version is installed yet.' : undefined}><Select value={version} onChange={setVersion} options={versionOptions} placeholder={versions.data ? (versionOptions.length ? 'Select a version…' : 'No PHP installed') : 'Loading…'} /></Field>}
+          {scope === 'version' && isRoot && (
+            <div className="action-row" style={{ alignSelf: 'end' }}>
+              <Button size="sm" onClick={() => versions.refetch()} loading={versions.loading && Boolean(versions.data)}>Re-detect versions</Button>
+              <Link className="btn btn-sm" to="/software/multiphp-manager">Install a PHP version</Link>
+            </div>
+          )}
           {scope === 'domain' && <Field label="Find a domain" help={domainsTruncated ? `Showing the first ${domains.data?.domains?.length || 0} of ${domains.meta?.total} domains; type to narrow the list` : undefined}><TextInput value={domainFilter} onChange={setDomainFilter} placeholder="Domain or account name" /></Field>}
           {scope === 'domain' && <Field label="Domain"><Select value={domain} onChange={setDomain} options={domainOptions} placeholder={domains.data ? 'Select a domain…' : 'Loading…'} /></Field>}
         </div>

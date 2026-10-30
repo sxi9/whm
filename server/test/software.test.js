@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
 import { compareVersions, pickBasic, BASIC_DIRECTIVES, EA4_CATALOG } from '../src/services/software.js';
@@ -8,6 +8,10 @@ const BIN_FULL = { 'apt-get': true, 'dpkg-query': true, php: true, 'php-fpm': tr
 const PHP = { id: '8.3', label: 'PHP 8.3', binary: '/usr/bin/php8.3', layout: 'debian', version: '8.3.6', iniPath: '/etc/php/8.3/fpm/php.ini', iniPaths: { fpm: '/etc/php/8.3/fpm/php.ini', cli: '/etc/php/8.3/cli/php.ini' }, poolDir: '/etc/php/8.3/fpm/pool.d', fpmUnit: 'php8.3-fpm', isDefault: true, fpmActive: true, fpmInstalled: true };
 const PHP82 = { ...PHP, id: '8.2', label: 'PHP 8.2', binary: '/usr/bin/php8.2', version: '8.2.20', iniPath: '/etc/php/8.2/fpm/php.ini', fpmUnit: 'php8.2-fpm', isDefault: false, fpmActive: false };
 const INI = '[PHP]\nmemory_limit = 128M\nupload_max_filesize = 2M\n;display_errors = On\n';
+let phpVersions = [PHP, PHP82];
+// The Ubuntu host's PHP source: nothing but the stock 8.3 (and the installed 8.2) until ppa:ondrej/php is enabled.
+const phpSource = { configured: false };
+const PHP_SOURCE_LABEL = 'Ondřej Surý PPA (ppa:ondrej/php)';
 let installedPkgs = [{ name: 'apache2', version: '2.4.58', arch: 'amd64', summary: 'Apache HTTP Server' }, { name: 'php-fpm', version: '8.3', arch: 'all', summary: 'FPM' }, { name: 'curl', version: '8.5.0', arch: 'amd64', summary: 'cli' }, { name: 'libapache2-mod-evasive', version: '1.1', arch: 'amd64', summary: 'evasive' }];
 let nginxState = { installed: true, active: true, proxyConfigured: false, content: null };
 let rpmPresent = false;
@@ -59,7 +63,25 @@ beforeAll(async () => {
     'pkg.pip.install': ({ package: name }) => ({ installer: 'pip3', package: name, output: [`Successfully installed ${name}`] }),
     'pkg.pecl.list': () => ({ extensions: [] }),
     'pkg.pecl.install': ({ extension }) => ({ installer: 'pecl', extension, output: ['Build complete.'], iniHint: `extension=${extension}.so` }),
-    'pkg.php.versions': () => ({ versions: [PHP, PHP82], defaultId: '8.3', defaultBinary: '/usr/bin/php8.3' }),
+    'pkg.php.versions': () => ({ versions: phpVersions, defaultId: '8.3', defaultBinary: '/usr/bin/php8.3' }),
+    'pkg.php.sources.detect': ({ branches }) => {
+      const list = branches?.length ? branches : ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5'];
+      const versions = list.map((version) => {
+        const installed = phpVersions.find((v) => v.id === version);
+        const offered = Boolean(installed) || version === '8.3' || (phpSource.configured && ['8.1', '8.2', '8.4'].includes(version));
+        return { version, id: version, package: `php${version}-fpm`, fpmUnit: `php${version}-fpm`, offered, installed: Boolean(installed), candidate: offered ? `${version}.1-1` : null, installedVersion: installed?.version ?? null, origin: offered ? (version === '8.3' ? 'http://archive.ubuntu.com/ubuntu' : 'https://ppa.launchpadcontent.net/ondrej/php/ubuntu') : null, source: offered ? (version === '8.3' ? 'distro' : 'ondrej') : null };
+      });
+      return { manager: 'apt', family: 'debian', os: { id: 'ubuntu', name: 'Ubuntu 24.04.1 LTS', versionId: '24.04', codename: 'noble' }, source: { key: 'ondrej', label: PHP_SOURCE_LABEL, url: 'https://launchpad.net/~ondrej/+archive/ubuntu/php', flavor: 'ubuntu', codename: 'noble', major: null, supported: true, reason: null, configured: phpSource.configured }, stock: '8.3', versions };
+    },
+    'pkg.php.source.enable': ({ source }) => { const already = phpSource.configured; phpSource.configured = true; return { source, label: PHP_SOURCE_LABEL, changed: !already, alreadyConfigured: already, steps: already ? [] : [{ step: 'add-apt-repository ppa:ondrej/php', ok: true }], output: ['Hit:1 https://ppa.launchpadcontent.net/ondrej/php/ubuntu noble InRelease'] }; },
+    'pkg.php.install': ({ version, extensions }) => {
+      if (!phpVersions.some((v) => v.id === version)) phpVersions = [...phpVersions, { ...PHP, id: version, label: `PHP ${version}`, binary: `/usr/bin/php${version}`, version: `${version}.1`, iniPath: `/etc/php/${version}/fpm/php.ini`, poolDir: `/etc/php/${version}/fpm/pool.d`, fpmUnit: `php${version}-fpm`, isDefault: false, fpmActive: false }];
+      const wanted = [`php${version}-fpm`, `php${version}-cli`, `php${version}-common`, ...(extensions || []).map((e) => `php${version}-${e}`)];
+      const skipped = wanted.filter((n) => n.endsWith('-opcache'));
+      return { manager: 'apt', family: 'debian', version, id: version, packages: wanted.filter((n) => !skipped.includes(n)), skipped, alreadyInstalled: [], fpmUnit: `php${version}-fpm`, prefix: `php${version}-`, unit: { unit: `php${version}-fpm`, enabled: null, note: 'enable the unit once the installer has finished' }, output: [`Setting up php${version}-fpm`] };
+    },
+    'pkg.php.remove': ({ version }) => { phpVersions = phpVersions.filter((v) => v.id !== version); return { manager: 'apt', version, id: version, packages: [`php${version}-fpm`, `php${version}-cli`, `php${version}-common`], purge: false, fpmUnit: `php${version}-fpm`, output: [`Removing php${version}-fpm`] }; },
+    'web.phpfpm.detect': () => ({ versions: phpVersions.map((v) => ({ version: v.id, flavor: 'debian', poolDir: v.poolDir, units: [v.fpmUnit] })), installed: phpVersions.length > 0 }),
     'pkg.php.default.set': ({ version }) => ({ version, binary: `/usr/bin/php${version}`, tool: 'update-alternatives' }),
     'pkg.php.ini.read': ({ version, sapi }) => { if (!['8.3', '8.2'].includes(version)) throw Object.assign(new Error(`PHP version "${version}" is not installed on this server`), { agentError: true, code: 'not_found', details: {} }); return { version, path: sapi ? `/etc/php/${version}/${sapi}/php.ini` : `/etc/php/${version}/fpm/php.ini`, sapis: PHP.iniPaths, content: INI, directives: { memory_limit: '128M', upload_max_filesize: '2M' } }; },
     'pkg.php.ini.write': ({ version, directives, content }) => ({ version, path: `/etc/php/${version}/fpm/php.ini`, bytes: 100, directives: { memory_limit: directives?.memory_limit ?? '128M', ...(content ? { from: 'content' } : {}) }, fpmUnit: `php${version}-fpm` }),
@@ -125,7 +147,7 @@ describe('module registration and RBAC', () => {
     expect(typeof app.ctx.software.php.versionForDomain).toBe('function');
     expect(typeof app.ctx.software.nginx.sync).toBe('function');
     expect(typeof app.ctx.software.update.status).toBe('function');
-    for (const t of ['software.pkg.install', 'software.pkg.remove', 'software.system.update', 'software.update.check', 'software.perl.install', 'software.module.install', 'software.nginx.install', 'software.nginx.sync', 'software.rpmdb.rebuild', 'software.php.resync', 'software.php.apply', 'software.ea4.build']) expect(app.ctx.jobs.types()).toContain(t);
+    for (const t of ['software.pkg.install', 'software.pkg.remove', 'software.system.update', 'software.update.check', 'software.perl.install', 'software.module.install', 'software.nginx.install', 'software.nginx.sync', 'software.rpmdb.rebuild', 'software.php.resync', 'software.php.apply', 'software.php.install', 'software.php.remove', 'software.ea4.build']) expect(app.ctx.jobs.types()).toContain(t);
     expect(app.ctx.scheduler.list().find((s) => s.name === 'os-update-check')?.cron).toBe('41 5 * * *');
     // Hourly, and paused at boot because the proxy is off: no skipped job rows pile up.
     expect(app.ctx.scheduler.list().find((s) => s.name === 'nginx-proxy-sync')).toMatchObject({ cron: '23 * * * *', job_type: 'software.nginx.sync', enabled: 0 });
@@ -150,9 +172,13 @@ describe('module registration and RBAC', () => {
   });
 
   it('server-wide functions are root only', async () => {
-    for (const url of ['/api/software/pkg/detect', '/api/software/pkg/installed', '/api/software/pkg/search?q=curl', '/api/software/update/status', '/api/software/rpmdb', '/api/software/perl/modules', '/api/software/modules/installers', '/api/software/panel/update', '/api/software/php/pools', '/api/software/php/ini/8.3', '/api/software/nginx', '/api/software/ea4/profiles']) {
+    for (const url of ['/api/software/pkg/detect', '/api/software/pkg/installed', '/api/software/pkg/search?q=curl', '/api/software/update/status', '/api/software/rpmdb', '/api/software/perl/modules', '/api/software/modules/installers', '/api/software/panel/update', '/api/software/php/pools', '/api/software/php/ini/8.3', '/api/software/php/installable', '/api/software/nginx', '/api/software/ea4/profiles']) {
       expect((await reseller.get(url)).status, url).toBe(403);
     }
+    expect((await mutate(reseller, 'post', '/api/software/php/install', { version: '8.4' }, resellerCsrf)).status).toBe(403);
+    expect((await mutate(reseller, 'delete', '/api/software/php/versions/8.2', undefined, resellerCsrf)).status).toBe(403);
+    expect(app.agent.callsTo('pkg.php.sources.detect')).toHaveLength(0);
+    expect(app.agent.callsTo('pkg.php.remove')).toHaveLength(0);
     expect((await mutate(reseller, 'post', '/api/software/pkg/install', { packages: ['nginx'] }, resellerCsrf)).status).toBe(403);
     expect((await mutate(reseller, 'post', '/api/software/update/run', {}, resellerCsrf)).status).toBe(403);
     expect((await mutate(reseller, 'put', '/api/software/php/default', { version: '8.2' }, resellerCsrf)).status).toBe(403);
@@ -232,6 +258,9 @@ describe('validation (422)', () => {
     expect((await put('/api/software/php/ini/8.3', { directives: { 'memory_limit;x': '1' } })).status).toBe(422);
     expect((await put('/api/software/php/ini/8.3', { directives: { memory_limit: 'a\nb' } })).status).toBe(422);
     expect((await get('/api/software/php/ini/8.3?sapi=cgi')).status).toBe(422);
+    for (const body of [{ version: '83' }, { version: 'php8.3' }, { version: '8.3.1' }, { version: '8.3;id' }, { version: 'ea-php83' }, {}, { version: '8.3', extensions: ['curl'] }]) expect((await post('/api/software/php/install', body)).status, JSON.stringify(body)).toBe(422);
+    expect((await del('/api/software/php/versions/PHP%208.3')).status).toBe(422);
+    expect((await del('/api/software/php/versions/-x')).status).toBe(422);
     expect((await put('/api/software/nginx', { apachePort: 0 })).status).toBe(422);
     expect((await put('/api/software/nginx', { cacheTtl: '10 m' })).status).toBe(422);
     expect((await post('/api/software/nginx/kill')).status).toBe(422);
@@ -260,6 +289,7 @@ describe('capability degradation (501)', () => {
       ['post', '/api/software/rpmdb/rebuild', {}, 'rpm'], ['get', '/api/software/perl/modules', undefined, 'perl'], ['post', '/api/software/perl/install', { modules: ['DBI'] }, 'perl'],
       ['get', '/api/software/modules/gem', undefined, 'gem'], ['post', '/api/software/modules/pip/install', { name: 'requests' }, 'pip'],
       ['get', '/api/software/php/versions', undefined, 'php'], ['put', '/api/software/php/default', { version: '8.3' }, 'php'], ['get', '/api/software/php/ini/8.3', undefined, 'php'], ['get', '/api/software/php/pools', undefined, 'php'],
+      ['get', '/api/software/php/installable', undefined, 'pkg'], ['post', '/api/software/php/install', { version: '8.4' }, 'pkg'], ['delete', '/api/software/php/versions/8.2', undefined, 'pkg'],
       ['put', '/api/software/nginx', { enabled: true }, 'nginx'], ['post', '/api/software/nginx/sync', {}, 'nginx'], ['post', '/api/software/nginx/configtest', {}, 'nginx'], ['post', '/api/software/nginx/reload', {}, 'nginx'],
       ['get', '/api/software/ea4/installed', undefined, 'pkg'], ['get', '/api/software/ea4/profiles/1/diff', undefined, 'pkg'], ['post', '/api/software/ea4/profiles/1/build', {}, 'pkg'],
     ];
@@ -658,6 +688,122 @@ describe('MultiPHP Manager', () => {
       expect(unloaded.body.data.web.state).toBe('not-loaded');
       expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'software.php.default'").get().n).toBeGreaterThanOrEqual(4);
     } finally { app.ctx.web = prevWeb; }
+  });
+});
+
+describe('Install a PHP version', () => {
+  const reset = () => { phpVersions = [PHP, PHP82]; phpSource.configured = false; app.ctx.settings.set('php.default_version', '8.3'); };
+  beforeEach(reset);
+  afterEach(reset);
+  const phpCalls = (from) => app.agent.calls.slice(from).map((c) => c.name).filter((n) => n.startsWith('pkg.php.') || n === 'svc.enable' || n === 'web.phpfpm.detect' || n === 'pkg.detect');
+
+  it('lists the catalog branches with offered, installed, default, usage and removable flags', async () => {
+    await put('/api/software/php/domains', { domains: ['bob.com'], version: '8.2' });
+    const res = await get('/api/software/php/installable');
+    expect(res.status).toBe(200);
+    const d = res.body.data;
+    expect(d).toMatchObject({ manager: 'apt', family: 'debian', os: { id: 'ubuntu', codename: 'noble' }, source: { key: 'ondrej', label: PHP_SOURCE_LABEL, configured: false, supported: true }, stock: '8.3', effectiveDefault: '8.3' });
+    expect(d.versions.map((v) => v.version)).toEqual(['7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5']);
+    const by = Object.fromEntries(d.versions.map((v) => [v.version, v]));
+    expect(by['8.3']).toMatchObject({ id: '8.3', label: 'PHP 8.3', installed: true, offered: true, isDefault: true, isCliDefault: true, stock: true, inUse: 0, removable: false, layout: 'debian', fpmUnit: 'php8.3-fpm', installedVersion: '8.3.6' });
+    expect(by['8.2']).toMatchObject({ id: '8.2', installed: true, isDefault: false, isCliDefault: false, inUse: 1, removable: false });
+    expect(by['8.4']).toMatchObject({ id: '8.4', label: 'PHP 8.4', installed: false, offered: false, source: null, removable: false, inUse: 0 });
+    expect(by['8.3'].advisories[0]).toMatchObject({ id: 'CVE-2026-109619' });
+    expect(Array.isArray(d.recent)).toBe(true);
+    await put('/api/software/php/domains', { domains: ['bob.com'], version: null });
+    phpSource.configured = true;
+    const again = (await get('/api/software/php/installable')).body.data;
+    expect(again.source.configured).toBe(true);
+    expect(again.versions.find((v) => v.version === '8.4')).toMatchObject({ offered: true, installed: false, source: 'ondrej', candidate: '8.4.1-1' });
+    expect(again.versions.find((v) => v.version === '8.2')).toMatchObject({ inUse: 0, removable: true });
+    expect(again.versions.find((v) => v.version === '8.5')).toMatchObject({ offered: false, installed: false });
+    // A tree outside the branch catalog is listed read-only.
+    phpVersions = [...phpVersions, { ...PHP, id: 'ea-php74', label: 'ea-php74', layout: 'ea4', binary: '/opt/cpanel/ea-php74/root/usr/bin/php', version: '7.4.33', isDefault: false, fpmUnit: 'ea-php74-php-fpm' }];
+    const ea = (await get('/api/software/php/installable')).body.data.versions.find((v) => v.id === 'ea-php74');
+    expect(ea).toMatchObject({ version: '7.4', installed: true, offered: false, removable: false, layout: 'ea4' });
+    // Without any PHP on the host the list still answers: that is when installing one matters most.
+    await provision(true, { php: false, 'php-fpm': false });
+    phpVersions = [];
+    const none = await get('/api/software/php/installable');
+    expect(none.status).toBe(200);
+    expect(none.body.data.versions.every((v) => !v.installed)).toBe(true);
+    expect(none.body.data.effectiveDefault).toBeNull();
+    await provision(true);
+  });
+
+  it('installs a branch through a job: source enabled on first use, packages, FPM unit, detection refreshed', async () => {
+    const detects = app.agent.callsTo('pkg.php.sources.detect').length;
+    const dup = await post('/api/software/php/install', { version: '8.3' });
+    expect(dup.status).toBe(409);
+    expect(app.agent.callsTo('pkg.php.sources.detect')).toHaveLength(detects);
+    const from = app.agent.calls.length;
+    const res = await post('/api/software/php/install', { version: '8.4' });
+    expect(res.status).toBe(202);
+    expect(res.body.data).toMatchObject({ version: '8.4', job: { type: 'software.php.install' } });
+    const job = await waitForJob(app.ctx, res.body.data.job.id);
+    expect(job.status).toBe('done');
+    expect(job.result).toEqual({ version: '8.4', id: '8.4', packages: ['php8.4-fpm', 'php8.4-cli', 'php8.4-common', 'php8.4-mysql', 'php8.4-curl', 'php8.4-gd', 'php8.4-mbstring', 'php8.4-xml', 'php8.4-zip', 'php8.4-intl', 'php8.4-bcmath', 'php8.4-soap'], skipped: ['php8.4-opcache'], fpmUnit: 'php8.4-fpm', unitEnabled: true, source: 'ondrej', sourceEnabled: true });
+    // Order: already-installed check, source detection, source enabled (not offered yet), re-detected, installed, FPM enabled, php-fpm trees re-read.
+    expect(phpCalls(from)).toEqual(['pkg.php.versions', 'pkg.detect', 'pkg.php.sources.detect', 'pkg.php.source.enable', 'pkg.php.sources.detect', 'pkg.php.install', 'svc.enable', 'web.phpfpm.detect']);
+    expect(app.agent.callsTo('pkg.php.source.enable').pop().args).toEqual({ source: 'ondrej', wait: false });
+    // The extension set is the stack catalog's php component, as suffixes.
+    expect(app.agent.callsTo('pkg.php.install').pop().args).toEqual({ version: '8.4', extensions: ['mysql', 'curl', 'gd', 'mbstring', 'xml', 'zip', 'intl', 'bcmath', 'soap', 'opcache'], wait: false });
+    expect(app.agent.callsTo('svc.enable').pop().args).toEqual({ unit: 'php8.4-fpm' });
+    expect(job.logs.some((l) => l.line.includes('add-apt-repository ppa:ondrej/php: ok'))).toBe(true);
+    expect(job.logs.some((l) => l.level === 'warn' && l.line.includes('skipped: php8.4-opcache'))).toBe(true);
+    expect((await get('/api/software/php/versions')).body.data.versions.map((v) => v.id)).toEqual(['8.3', '8.2', '8.4']);
+    expect((await get('/api/software/php/installable')).body.data.versions.find((v) => v.version === '8.4')).toMatchObject({ installed: true, removable: true });
+    expect(app.ctx.db.prepare("SELECT target, args_redacted FROM audit_log WHERE action = 'software.php.install' ORDER BY id DESC").get()).toMatchObject({ target: '8.4' });
+    // A configured source that does not carry the branch fails the job without touching the source again.
+    const before = app.agent.callsTo('pkg.php.source.enable').length;
+    const missing = await post('/api/software/php/install', { version: '8.5' });
+    expect(missing.status).toBe(202);
+    const failed = await waitForJob(app.ctx, missing.body.data.job.id);
+    expect(failed.status).toBe('failed');
+    expect(failed.error).toMatch(/PHP 8\.5 is not offered by Ondřej Surý PPA/);
+    expect(app.agent.callsTo('pkg.php.source.enable')).toHaveLength(before);
+    expect(app.agent.callsTo('pkg.php.install').filter((c) => c.args.version === '8.5')).toHaveLength(0);
+  });
+
+  it('refuses to remove the system default, the CLI default and a version domains use; removes the rest through a job', async () => {
+    expect((await del('/api/software/php/versions/7.4')).status).toBe(404);
+    const def = await del('/api/software/php/versions/8.3');
+    expect(def.status).toBe(409);
+    expect(def.body.error.message).toMatch(/system default/);
+    app.ctx.settings.set('php.default_version', '8.2');
+    const cli = await del('/api/software/php/versions/8.3');
+    expect(cli.status).toBe(409);
+    expect(cli.body.error.message).toMatch(/CLI default/);
+    app.ctx.settings.set('php.default_version', '8.3');
+    await put('/api/software/php/domains', { domains: ['bob.com'], version: '8.2' });
+    const used = await del('/api/software/php/versions/8.2');
+    expect(used.status).toBe(409);
+    expect(used.body.error.message).toMatch(/1 domain/);
+    expect(app.agent.callsTo('pkg.php.remove')).toHaveLength(0);
+    phpVersions = [...phpVersions, { ...PHP, id: 'ea-php74', label: 'ea-php74', layout: 'ea4', version: '7.4.33', isDefault: false }];
+    expect((await del('/api/software/php/versions/ea-php74')).status).toBe(422);
+    await put('/api/software/php/domains', { domains: ['bob.com'], version: null });
+    const from = app.agent.calls.length;
+    const res = await del('/api/software/php/versions/8.2');
+    expect(res.status).toBe(202);
+    expect(res.body.data).toMatchObject({ id: '8.2', version: '8.2', job: { type: 'software.php.remove' } });
+    const job = await waitForJob(app.ctx, res.body.data.job.id);
+    expect(job.status).toBe('done');
+    expect(job.result).toMatchObject({ id: '8.2', version: '8.2', packages: ['php8.2-fpm', 'php8.2-cli', 'php8.2-common'], fpmUnit: 'php8.2-fpm' });
+    expect(app.agent.callsTo('pkg.php.remove').pop().args).toEqual({ version: '8.2', wait: false });
+    expect(phpCalls(from)).toEqual(['pkg.php.versions', 'pkg.php.remove', 'web.phpfpm.detect']);
+    expect((await get('/api/software/php/versions')).body.data.versions.map((v) => v.id)).toEqual(['8.3', 'ea-php74']);
+    expect(app.ctx.db.prepare("SELECT target FROM audit_log WHERE action = 'software.php.remove' ORDER BY id DESC").get()).toMatchObject({ target: '8.2' });
+    // The job re-checks usage: a domain moved onto the version between the request and the run stops the removal.
+    phpVersions = [PHP, PHP82];
+    await put('/api/software/php/domains', { domains: ['bob.com'], version: '8.2' });
+    const removes = app.agent.callsTo('pkg.php.remove').length;
+    const queued = app.ctx.jobs.enqueue('software.php.remove', { id: '8.2', version: '8.2' }, { userId: null });
+    const stopped = await waitForJob(app.ctx, queued.id);
+    expect(app.agent.callsTo('pkg.php.remove')).toHaveLength(removes);
+    expect(stopped.status).toBe('failed');
+    expect(stopped.error).toMatch(/now used by 1 domain/);
+    await put('/api/software/php/domains', { domains: ['bob.com'], version: null });
   });
 });
 
