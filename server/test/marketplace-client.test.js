@@ -187,6 +187,8 @@ beforeAll(async () => {
   hub = createMockHub();
   const agent = createMockAgent({ 'sys.fingerprint': () => ({ version: 'whmfp1', fingerprint: fpOf(FP), components: FP, available: { machine_id: true, mac: true, disk: true } }) });
   app = await createTestApp({ agent, overrides: { licenseEnforce: true, licenseHubUrl: HUB, licenseKeysFile: KEYS_FILE } });
+  // The license API belongs to the panel owner (requireSuperadmin): the suite's root is made the super admin.
+  app.ctx.db.prepare("UPDATE users SET superadmin = 1 WHERE username = 'root'").run();
   realTransport = app.ctx.license.transport;
   app.ctx.license.transport = hub.transport;
   app.ctx.license.clock.now = () => hub.now();

@@ -18,6 +18,8 @@ import { ADAPTERS, CREATABLE_ADAPTERS, adapterCatalog, normalizeProducts, safeRe
 
 export const PROVIDER_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 export const HUB_NAME = 'whm-hub';
+// What every principal but the panel owner sees in place of the hub origin.
+export const HUB_LABEL = 'WHM Marketplace hub';
 const ACME_CLIENTS = [
   { name: 'certbot', displayName: 'certbot (Let\'s Encrypt)' },
   { name: 'acme.sh', displayName: 'acme.sh (Let\'s Encrypt / ZeroSSL)' },
@@ -52,6 +54,12 @@ export function createMarketService(ctx) {
   const io = { request: (url, opts) => transport.request(url, opts), licensePrefix: () => { try { return ctx.license?.get?.().keyPrefix ?? null; } catch { return null; } } };
 
   const adapterOf = (row) => ADAPTERS[row.adapter] || ADAPTERS.manual;
+  // The whm-hub row's URL is the license hub origin, the panel owner's business
+  // (users.superadmin): every other principal gets the generic label instead,
+  // and a hub test answer, which names the host, stays with the owner as well.
+  const isOwner = (user) => { try { return Boolean(ctx.auth?.isSuperadmin?.(user)); } catch { return false; } };
+  const hidesOrigin = (row, superadmin) => row.adapter === 'hub' && !superadmin;
+  const ownerOnlyTestMessage = (ok) => (ok ? 'The last test succeeded; its details are visible to the panel owner' : 'The last test failed; its details are visible to the panel owner');
   const readConfig = (row) => {
     if (!row.config_enc) return {};
     try { return json.parse(crypto.decrypt(row.config_enc), {}) || {}; } catch (err) { logger.warn({ err, provider: row.name }, 'market: provider config could not be decrypted'); return {}; }
@@ -69,9 +77,10 @@ export function createMarketService(ctx) {
   // Resellers only ever see the resale price: vendor prices, the commission,
   // config field names and test results are the operator's business.
   // `wholesale` keeps the economics for other services without exposing config.
-  function shape(row, { forRoot = false, wholesale = forRoot, orders = null } = {}) {
+  function shape(row, { forRoot = false, wholesale = forRoot, orders = null, superadmin = false } = {}) {
     const a = adapterOf(row);
     const config = readConfig(row);
+    const hideOrigin = hidesOrigin(row, superadmin);
     const visible = {};
     const secretsSet = [];
     for (const f of a.configFields) {
@@ -81,14 +90,15 @@ export function createMarketService(ctx) {
     const resale = (p) => ({ id: p.id, name: p.name, price: resalePrice(p.price, row.commission_percent), currency: p.currency, termMonths: p.termMonths, wildcard: p.wildcard });
     return {
       name: row.name, displayName: row.display_name, type: row.type, adapter: row.adapter, adapterLabel: a.label,
-      builtin: Boolean(row.builtin), readOnly: false, enabled: Boolean(row.enabled), url: row.url || null,
+      builtin: Boolean(row.builtin), readOnly: false, enabled: Boolean(row.enabled), url: hideOrigin ? null : row.url || null,
+      ...(hideOrigin ? { hubLabel: HUB_LABEL } : {}),
       ...(wholesale ? { commissionPercent: Number(row.commission_percent) || 0 } : {}),
       products: products(row).map((p) => (wholesale ? { ...resale(p), basePrice: p.price } : resale(p))),
       hasProducts: typeof a.listProducts === 'function',
       configured: Object.keys(missing).length === 0,
       ...(forRoot ? {
         missing: Object.keys(missing), config: visible, secretsSet,
-        lastTest: row.last_test_at ? { at: row.last_test_at, ok: row.last_test_ok == null ? null : Boolean(row.last_test_ok), message: row.last_test_message } : null,
+        lastTest: row.last_test_at ? { at: row.last_test_at, ok: row.last_test_ok == null ? null : Boolean(row.last_test_ok), message: hideOrigin ? ownerOnlyTestMessage(Boolean(row.last_test_ok)) : row.last_test_message } : null,
       } : {}),
       orders: orders == null ? null : orders[row.name] || 0,
       createdAt: row.created_at, updatedAt: row.updated_at,
@@ -180,8 +190,9 @@ export function createMarketService(ctx) {
 
     async list({ type, q, page = 1, pageSize = 50, sort, dir = 'asc' } = {}, user) {
       const forRoot = isRoot(user);
+      const superadmin = isOwner(user);
       const orders = forRoot ? orderCounts() : null;
-      const stored = stmts.all.all().map((r) => shape(r, { forRoot, orders }));
+      const stored = stmts.all.all().map((r) => shape(r, { forRoot, superadmin, orders }));
       let all = [...stored, ...(await acmeRows({ forRoot }))].filter((p) => !type || p.type === type);
       if (q) { const needle = q.toLowerCase(); all = all.filter((p) => p.name.toLowerCase().includes(needle) || p.displayName.toLowerCase().includes(needle)); }
       const key = LIST_SORT[sort];
@@ -196,7 +207,7 @@ export function createMarketService(ctx) {
         if (!found) throw notFound(`Provider "${name}"`);
         return found;
       }
-      return shape(row(name), { forRoot: isRoot(user), orders: isRoot(user) ? orderCounts() : null });
+      return shape(row(name), { forRoot: isRoot(user), superadmin: isOwner(user), orders: isRoot(user) ? orderCounts() : null });
     },
 
     create({ name, displayName, type, adapter, url, commissionPercent = 0, products: list = [], config = {} }, req) {
@@ -213,7 +224,7 @@ export function createMarketService(ctx) {
       stmts.insert.run({ name, display_name: displayName, type, adapter, url: url || null, config_enc: Object.keys(clean).length ? crypto.encrypt(JSON.stringify(clean)) : null, commission_percent: round2(commissionPercent), products_json: JSON.stringify(normalizeProducts(list)) });
       if (type === 'ssl') syncSettings();
       req?.audit?.({ action: 'market.provider.create', target: name, args: { type, adapter, url: url || null, commissionPercent, products: normalizeProducts(list).length, configFields: Object.keys(clean) } });
-      return shape(stmts.byName.get(name), { forRoot: true });
+      return shape(stmts.byName.get(name), { forRoot: true, superadmin: isOwner(req?.user) });
     },
 
     update(name, input, req) {
@@ -232,8 +243,9 @@ export function createMarketService(ctx) {
       stmts.update.run(next);
       if (r.type === 'ssl') syncSettings();
       hubChanged(name);
-      req?.audit?.({ action: 'market.provider.update', target: name, args: { displayName: next.display_name, url: next.url, commissionPercent: next.commission_percent, products: input.products === undefined ? undefined : normalizeProducts(input.products).length } });
-      return shape(stmts.byName.get(name), { forRoot: true });
+      // Audit rows are read by every root user: the hub origin stays out of them.
+      req?.audit?.({ action: 'market.provider.update', target: name, args: { displayName: next.display_name, ...(hidesOrigin(r, false) ? { urlChanged: input.url !== undefined } : { url: next.url }), commissionPercent: next.commission_percent, products: input.products === undefined ? undefined : normalizeProducts(input.products).length } });
+      return shape(stmts.byName.get(name), { forRoot: true, superadmin: isOwner(req?.user) });
     },
 
     // Stores credentials encrypted. Secret fields left empty keep their stored
@@ -260,8 +272,8 @@ export function createMarketService(ctx) {
       stmts.setConfig.run(Object.keys(merged).length ? crypto.encrypt(JSON.stringify(merged)) : null, nextUrl || null, name);
       if (r.type === 'ssl') syncSettings();
       hubChanged(name);
-      req?.audit?.({ action: 'market.provider.configure', target: name, args: { url: nextUrl || null, fields: Object.keys(config), cleared: Object.keys(config).filter((k) => config[k] === null) } });
-      return shape(stmts.byName.get(name), { forRoot: true });
+      req?.audit?.({ action: 'market.provider.configure', target: name, args: { ...(hidesOrigin(r, false) ? { urlChanged: url !== undefined } : { url: nextUrl || null }), fields: Object.keys(config), cleared: Object.keys(config).filter((k) => config[k] === null) } });
+      return shape(stmts.byName.get(name), { forRoot: true, superadmin: isOwner(req?.user) });
     },
 
     setEnabled(name, enabled, req) {
@@ -275,7 +287,7 @@ export function createMarketService(ctx) {
       if (r.type === 'ssl') syncSettings();
       hubChanged(name);
       req?.audit?.({ action: enabled ? 'market.provider.enable' : 'market.provider.disable', target: name });
-      return shape(stmts.byName.get(name), { forRoot: true });
+      return shape(stmts.byName.get(name), { forRoot: true, superadmin: isOwner(req?.user) });
     },
 
     async test(name, req) {
@@ -296,8 +308,8 @@ export function createMarketService(ctx) {
       else if (typeof a.test !== 'function') result = { ok: true, message: 'This adapter has nothing to test' };
       else result = await a.test({ name: r.name, url: r.url, type: r.type }, config, io);
       stmts.setTest.run(result.ok ? 1 : 0, String(result.message || '').slice(0, 500), name);
-      req?.audit?.({ action: 'market.provider.test', target: name, args: { ok: result.ok, message: result.message }, result: result.ok ? 'ok' : 'failed' });
-      return { provider: shape(stmts.byName.get(name), { forRoot: true }), result };
+      req?.audit?.({ action: 'market.provider.test', target: name, args: { ok: result.ok, ...(hidesOrigin(r, false) ? {} : { message: result.message }) }, result: result.ok ? 'ok' : 'failed' });
+      return { provider: shape(stmts.byName.get(name), { forRoot: true, superadmin: isOwner(req?.user) }), result };
     },
 
     async syncProducts(name, req) {
@@ -314,7 +326,7 @@ export function createMarketService(ctx) {
       stmts.setProducts.run(JSON.stringify(list), name);
       if (r.type === 'ssl') syncSettings();
       req?.audit?.({ action: 'market.provider.sync_products', target: name, args: { products: list.length } });
-      return shape(stmts.byName.get(name), { forRoot: true });
+      return shape(stmts.byName.get(name), { forRoot: true, superadmin: isOwner(req?.user) });
     },
 
     remove(name, req) {
@@ -332,7 +344,8 @@ export function createMarketService(ctx) {
     sslProviders,
     syncSettings,
     adoptLegacySetting,
-    enabledProviders(type) { return stmts.all.all().filter((r) => r.enabled && (!type || r.type === type)).map((r) => shape(r, { wholesale: true })); },
+    // Service-to-service: the caller is code, not a principal, so the hub URL stays in.
+    enabledProviders(type) { return stmts.all.all().filter((r) => r.enabled && (!type || r.type === type)).map((r) => shape(r, { wholesale: true, superadmin: true })); },
     credentials(name) { const r = stmts.byName.get(name); return r ? readConfig(r) : null; },
     // Enable switch and display URL only; a stored licenseKey from older releases is never read again.
     hub() {
