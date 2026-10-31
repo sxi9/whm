@@ -29,6 +29,7 @@ export function itemDetailLines(item) {
   switch (item.id) {
     case 'fail2ban':
       if (d.installed && d.jails?.length) lines.push(`Jails: ${d.jails.map((j) => `${j.name}${j.running ? '' : ' (stopped)'}`).join(', ')} · ${d.bannedTotal ?? 0} address${d.bannedTotal === 1 ? '' : 'es'} banned now`);
+      if (d.ignoreIps?.length) lines.push(`Never banned from the panel (whm-panel jail only): ${d.ignoreIps.join(', ')}`);
       break;
     case 'auto-updates':
       if (d.family) lines.push(`${d.family === 'debian' ? 'unattended-upgrades' : 'dnf-automatic'}${d.installed ? '' : ' (not installed)'}${d.timer ? ` · ${d.timer}` : ''}`);
@@ -105,16 +106,18 @@ export function FirewallConfirmModal({ open, onClose, onApplied }) {
   const [port, setPort] = useState('');
   const [agree, setAgree] = useState(false);
   const [extraTcp, setExtraTcp] = useState('');
+  const [extraUdp, setExtraUdp] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
-  useEffect(() => { if (open) { setPort(''); setAgree(false); setExtraTcp(''); setError(null); } }, [open]);
+  useEffect(() => { if (open) { setPort(''); setAgree(false); setExtraTcp(''); setExtraUdp(''); setError(null); } }, [open]);
   const sshPorts = plan.data?.sshPorts || [];
   const ready = agree && /^\d{1,5}$/.test(port) && sshPorts.includes(Number(port));
+  const parsePorts = (text) => text.split(/[\s,]+/).filter(Boolean).map(Number).filter((n) => Number.isInteger(n) && n > 0 && n < 65536);
   const apply = async () => {
     setBusy(true); setError(null);
     try {
-      const extras = extraTcp.split(/[\s,]+/).filter(Boolean).map(Number).filter((n) => Number.isInteger(n) && n > 0 && n < 65536);
-      await api.post('/security/hardening/firewall/apply', { confirmSshPort: Number(port), ...(extras.length ? { extraTcp: extras } : {}) });
+      const tcp = parsePorts(extraTcp); const udp = parsePorts(extraUdp);
+      await api.post('/security/hardening/firewall/apply', { confirmSshPort: Number(port), ...(tcp.length ? { extraTcp: tcp } : {}), ...(udp.length ? { extraUdp: udp } : {}) });
       toast.success('Firewall baseline applied');
       onApplied?.();
       onClose?.();
@@ -133,11 +136,13 @@ export function FirewallConfirmModal({ open, onClose, onApplied }) {
               <tbody>
                 {plan.data.tcp.map((e) => <tr key={`tcp-${portLabel(e.port)}`}><td><code>{portLabel(e.port)}</code></td><td>tcp</td><td>{e.reasons.join(', ')}</td></tr>)}
                 {plan.data.udp.map((e) => <tr key={`udp-${portLabel(e.port)}`}><td><code>{portLabel(e.port)}</code></td><td>udp</td><td>{e.reasons.join(', ')}</td></tr>)}
+                {(plan.data.builtin || []).map((e) => <tr key={`builtin-${e.proto}-${portLabel(e.port)}`}><td><code>{portLabel(e.port)}</code></td><td>{e.proto}</td><td>{e.reasons.join(', ')}{e.scope ? ` (${e.scope})` : ''}</td></tr>)}
               </tbody>
             </table>
           </div>
           <p className="muted" style={{ marginTop: 8 }}>sshd is listening on port {sshPorts.join(', ') || 'unknown'} ({plan.data.sshSource}). Backend: {plan.data.backend || 'none'}.</p>
           <label className="field"><span className="field-label">Extra TCP ports to keep open (optional, comma separated)</span><TextInput value={extraTcp} onChange={setExtraTcp} placeholder="8443, 3000" /></label>
+          <label className="field"><span className="field-label">Extra UDP ports to keep open (optional, comma separated)</span><TextInput value={extraUdp} onChange={setExtraUdp} placeholder="1194, 51820" /></label>
           <label className="field"><span className="field-label">The SSH port you are connected on</span><TextInput value={port} onChange={setPort} inputMode="numeric" placeholder={String(sshPorts[0] ?? 22)} aria-label="SSH port" /></label>
           <Toggle checked={agree} onChange={setAgree} label={`I can still reach SSH on port ${/^\d{1,5}$/.test(port) ? port : 'N'} and I have a second session open`} description="The baseline is refused for any port sshd is not listening on. It is re-applied at every boot until you revert it." />
         </>
@@ -170,7 +175,7 @@ export function HardeningRow({ item, onChanged, onFirewall }) {
         <div><strong>{item.label}</strong></div>
         <small className="muted">{item.description}</small>
         {itemDetailLines(item).map((line, i) => <div key={i} className="muted" style={{ fontSize: 12, marginTop: 2 }}>{line}</div>)}
-        {item.id === 'ssh' && item.detail?.blocked && <div style={{ marginTop: 4 }}><Link className="btn btn-sm" to="/security-center/manage-roots-ssh-keys">Manage root's SSH Keys</Link></div>}
+        {item.id === 'ssh' && item.detail?.blocked && <div style={{ marginTop: 4 }}>{item.detail?.authorizedKeys > 0 ? <Link className="btn btn-sm" to="/security-center/ssh-password-authorization-tweak">SSH Password Authorization Tweak</Link> : <Link className="btn btn-sm" to="/security-center/manage-roots-ssh-keys">Manage root's SSH Keys</Link>}</div>}
         {item.id === 'fail2ban' && <BannedList item={item} onChanged={onChanged} />}
         {item.id === 'firewall' && canApply && !item.detail?.backend && <CapabilityNotice error={{ status: 501, code: 'capability_missing', capability: 'firewall', message: item.detail?.reason || 'No supported firewall is installed' }} onRetry={onChanged} />}
       </td>

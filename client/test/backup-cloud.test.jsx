@@ -22,7 +22,7 @@ vi.mock('../src/hooks/useApi.js', () => ({
 }));
 
 const { ProviderCards, EncryptionKeyNotice, ConnectLink, OAuthClientModal, destinationTarget, uploadMethod, needsRclone, encryptionOn, connectUrl, READ_ONLY_FIELDS } = await import('../src/pages/backup/CloudProviders.jsx');
-const { cleanDestination, emptyDestination, DestinationFields, CloudCopies, KIND_LABELS } = await import('../src/pages/backup/Shared.jsx');
+const { cleanDestination, emptyDestination, destinationFormState, DestinationFields, CloudCopies, KIND_LABELS } = await import('../src/pages/backup/Shared.jsx');
 const BackupConfiguration = (await import('../src/pages/fn/backup/backup-configuration.jsx')).default;
 
 React.useLayoutEffect = React.useEffect;
@@ -141,6 +141,23 @@ describe('destination form payloads for the cloud kinds', () => {
     const plainS3 = render(<DestinationFields value={{ ...emptyDestination('s3'), crypt: false }} onChange={() => {}} />);
     expect(plainS3).toContain('Transfer with rclone');
   });
+
+  it('the edit form shows the stored encryption state, not the default, for a destination from before encryption existed', () => {
+    const legacy = { id: 9, name: 'legacy-s3', kind: 's3', enabled: true, encrypted: false, engine: 'native', config: { bucket: 'old-bucket', prefix: '', accessKey: 'AKIA', has_secret_key: true }, connection: null };
+    const seeded = destinationFormState(legacy);
+    expect(seeded).toEqual({ kind: 's3', endpoint: '', region: 'us-east-1', bucket: 'old-bucket', prefix: '', accessKey: 'AKIA', secretKey: '', pathStyle: false, insecure: false, crypt: false });
+    expect(destinationFormState(DESTINATIONS[0])).toMatchObject({ kind: 'gdrive', folder: 'hst/backups', crypt: true, accountName: 'Alice Example' });
+    expect(destinationFormState({ ...legacy, encrypted: true, config: { ...legacy.config, crypt: true } }).crypt).toBe(true);
+    // Toggle off (no checked input anywhere on a plain S3 form) and sent as false, so an unrelated edit keeps the destination plain.
+    const html = render(<DestinationFields value={seeded} onChange={() => {}} editing />);
+    expect(html).toContain('Encrypt archives at rest (recommended)');
+    expect(html).not.toContain('checked=""');
+    expect(cleanDestination(seeded, { editing: true })).toEqual({ kind: 's3', bucket: 'old-bucket', accessKey: 'AKIA', secretKey: '', region: 'us-east-1', pathStyle: false, insecure: false, crypt: false });
+    expect(cleanDestination({ ...seeded, crypt: true }, { editing: true }).crypt).toBe(true);
+    // Even without the seeding, an edit never shows the create-time default as checked.
+    expect(render(<DestinationFields value={emptyDestination('s3')} onChange={() => {}} editing />)).not.toContain('checked=""');
+    expect(render(<DestinationFields value={emptyDestination('s3')} onChange={() => {}} />)).toContain('checked=""');
+  });
 });
 
 describe('Backup Configuration page with cloud destinations', () => {
@@ -163,6 +180,25 @@ describe('Backup Configuration page with cloud destinations', () => {
     expect(html).toContain('S3 responded 403 AccessDenied');
     expect(html).toContain('rclone</span>');
     expect(html).not.toContain('has_refresh_token');
+  });
+
+  it('shows an OAuth destination whose sign-in expired with the reconnect link', () => {
+    responses.clear();
+    const expired = { ...DESTINATIONS[0], connection: { ...DESTINATIONS[0].connection, reauthRequired: true }, lastUpload: { at: '2026-10-31 02:00:00', ok: false, message: 'upload to gdrive: fatal error (authentication or configuration) (oauth2: invalid_grant)' } };
+    responses.set('/backup/config', { data: { settings: {}, status: { capability: { installed: true, binaries: { tar: true, rclone: true } }, localDir: { path: '/backup', exists: true }, schedule: null, destinations: [expired], lastRun: null, includedAccounts: 1, totalAccounts: 1 } } });
+    responses.set('/backup/runs', { data: [] });
+    responses.set('/backup/destinations/providers', { data: CATALOG });
+    responses.set('/backup/destinations', { data: [expired] });
+    const html = render(<BackupConfiguration fn={{ key: 'backup-configuration', label: 'Backup Configuration', path: '/backup/backup-configuration' }} />, { initialEntries: ['/backup/backup-configuration'] });
+    expect(html).toContain('sign-in expired');
+    expect(html).not.toContain('>connected<');
+    expect(html).toContain('/api/backup/destinations/oauth/gdrive/start?destination=1');
+    expect(html).toContain('Reconnect');
+    responses.set('/backup/destinations', { data: DESTINATIONS });
+    responses.set('/backup/config', { data: { settings: {}, status: { capability: { installed: true, binaries: { tar: true, rclone: true } }, localDir: { path: '/backup', exists: true }, schedule: null, destinations: DESTINATIONS, lastRun: null, includedAccounts: 1, totalAccounts: 1 } } });
+    const fine = render(<BackupConfiguration fn={{ key: 'backup-configuration', label: 'Backup Configuration', path: '/backup/backup-configuration' }} />, { initialEntries: ['/backup/backup-configuration'] });
+    expect(fine).toContain('>connected<');
+    expect(fine).not.toContain('sign-in expired');
   });
 
   it('the restore picker lists the copies a destination holds for the account', () => {

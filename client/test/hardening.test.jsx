@@ -27,7 +27,7 @@ const render = (el) => renderToStaticMarkup(<ToastProvider><ConfirmProvider><Mem
 
 const item = (id, label, status, detail = {}, extra = {}) => ({ id, label, description: `${label} description`, status, desired: status === 'applied', detail, ...extra });
 const items = [
-  item('fail2ban', 'Fail2ban intrusion blocking', 'applied', { installed: true, configured: true, running: true, bannedTotal: 2, jails: [{ name: 'sshd', running: true, bannedIps: ['203.0.113.5', '198.51.100.9'] }, { name: 'whm-panel', running: true, bannedIps: [] }] }, { capability: 'fail2ban' }),
+  item('fail2ban', 'Fail2ban intrusion blocking', 'applied', { installed: true, configured: true, running: true, bannedTotal: 2, ignoreIps: ['203.0.113.7'], jails: [{ name: 'sshd', running: true, bannedIps: ['203.0.113.5', '198.51.100.9'] }, { name: 'whm-panel', running: true, bannedIps: [] }] }, { capability: 'fail2ban' }),
   item('auto-updates', 'Automatic security updates', 'not_applied', { family: 'debian', installed: false, installable: true, reason: 'The unattended-upgrades package is not installed', packages: ['unattended-upgrades'] }),
   item('ssh', 'SSH daemon hardening', 'not_applied', { failing: ['PermitRootLogin'], reason: 'PermitRootLogin is not hardened', blocked: 'Root has no authorized SSH key; authorize one first', authorizedKeys: 0, effective: { PermitRootLogin: 'yes', MaxAuthTries: '4', LoginGraceTime: '30', X11Forwarding: 'no' } }),
   item('sysctl', 'Kernel network hardening', 'not_applied', { reason: 'The sysctl.d file is not written', installed: true, mismatched: [{ key: 'net.ipv4.tcp_syncookies', expected: '1', current: '0' }] }),
@@ -43,7 +43,8 @@ describe('helpers', () => {
   });
 
   it('itemDetailLines summarises each item from its live detail', () => {
-    expect(itemDetailLines(items[0])).toEqual(['Jails: sshd, whm-panel · 2 addresses banned now']);
+    expect(itemDetailLines(items[0])).toEqual(['Jails: sshd, whm-panel · 2 addresses banned now', 'Never banned from the panel (whm-panel jail only): 203.0.113.7']);
+    expect(itemDetailLines({ ...items[0], detail: { ...items[0].detail, ignoreIps: [] } })).toEqual(['Jails: sshd, whm-panel · 2 addresses banned now']);
     expect(itemDetailLines(items[1])).toEqual(['The unattended-upgrades package is not installed', 'unattended-upgrades (not installed)']);
     expect(itemDetailLines(items[2])).toEqual(['PermitRootLogin is not hardened', 'Root has no authorized SSH key; authorize one first', 'PermitRootLogin yes · MaxAuthTries 4 · LoginGraceTime 30 · X11Forwarding no', '0 authorized root keys']);
     expect(itemDetailLines(items[3])).toEqual(['The sysctl.d file is not written', 'net.ipv4.tcp_syncookies = 0 (want 1)']);
@@ -71,6 +72,9 @@ describe('HardeningCard', () => {
     // ssh: blocked by the missing key → link to the keys page instead of Apply
     expect(html).toContain('/security-center/manage-roots-ssh-keys');
     expect(html).toContain('Root has no authorized SSH key');
+    expect(html).not.toContain('/security-center/ssh-password-authorization-tweak');
+    // fail2ban: the panel jail's exemption is visible
+    expect(html).toContain('Never banned from the panel (whm-panel jail only): 203.0.113.7');
     // sysctl: plain Apply; firewall not applicable → no action
     expect((html.match(/>Apply</g) || []).length).toBe(1);
     expect(html).not.toContain('Apply…');
@@ -78,6 +82,20 @@ describe('HardeningCard', () => {
     // Apply all counts only the applicable safe items that are installed and not blocked (sysctl)
     expect(html).toContain('Apply 1 recommended');
     expect((html.match(/>Revert</g) || []).length).toBe(1);
+  });
+
+  it('an ssh item blocked by an sshd setting (key present) links to the password tweak page and is skipped by Apply all', () => {
+    responses.clear();
+    responses.set('/security/hardening', { data: { items: [
+      item('ssh', 'SSH daemon hardening', 'not_applied', { failing: ['PermitRootLogin'], reason: 'PermitRootLogin is not hardened', blocked: 'PubkeyAuthentication is off, so root could not log in with a key; switch it on first (SSH Password Authorization Tweak)', authorizedKeys: 1, effective: { PermitRootLogin: 'yes' } }),
+      item('sysctl', 'Kernel network hardening', 'not_applied', { reason: 'The sysctl.d file is not written', installed: true, mismatched: [] }),
+    ] } });
+    const html = render(<HardeningCard />);
+    expect(html).toContain('PubkeyAuthentication is off');
+    expect(html).toContain('/security-center/ssh-password-authorization-tweak');
+    expect(html).not.toContain('/security-center/manage-roots-ssh-keys');
+    expect((html.match(/>Apply</g) || []).length).toBe(1);
+    expect(html).toContain('Apply 1 recommended');
   });
 
   it('offers Apply… for the firewall baseline when it is not applied and no "apply all" when nothing is pending', () => {
@@ -110,13 +128,19 @@ describe('HardeningCard', () => {
 describe('FirewallConfirmModal', () => {
   it('lists the planned ports with their reasons, the sshd port and the confirmation sentence, with the apply button disabled until confirmed', () => {
     responses.clear();
-    responses.set('/security/hardening/firewall/plan', { data: { backend: 'iptables', sshPorts: [22], sshSource: 'listening', tcp: [{ port: 2087, reasons: ['panel'] }, { port: 22, reasons: ['ssh'] }, { port: { from: 49152, to: 65534 }, reasons: ['ftp passive'] }], udp: [{ port: 53, reasons: ['dns'] }], conflicts: { firewalld: false, ufw: false } } });
+    responses.set('/security/hardening/firewall/plan', { data: { backend: 'iptables', sshPorts: [22], sshSource: 'listening', tcp: [{ port: 2087, reasons: ['panel'] }, { port: 22, reasons: ['ssh'] }, { port: { from: 49152, to: 65534 }, reasons: ['ftp passive'] }], udp: [{ port: 53, reasons: ['dns'] }], builtin: [{ port: 546, proto: 'udp', reasons: ['dhcpv6 client'], scope: 'IPv6 link-local, from port 547' }], conflicts: { firewalld: false, ufw: false } } });
     const html = render(<FirewallConfirmModal open onClose={() => {}} />);
     expect(html).toContain('Apply the firewall baseline');
     expect(html).toContain('2087');
     expect(html).toContain('49152-65534');
     expect(html).toContain('ftp passive');
+    expect(html).toContain('dhcpv6 client (IPv6 link-local, from port 547)');
+    expect(html).toContain('Extra TCP ports to keep open');
+    expect(html).toContain('Extra UDP ports to keep open');
     expect(html).toContain('sshd is listening on port 22 (listening)');
+    expect(render(<FirewallConfirmModal open onClose={() => {}} />)).toContain('sshd is listening on port 22 (listening)');
+    responses.set('/security/hardening/firewall/plan', { data: { backend: 'nft', sshPorts: [2222], sshSource: 'ssh.socket', tcp: [{ port: 2222, reasons: ['ssh'] }], udp: [], conflicts: {} } });
+    expect(render(<FirewallConfirmModal open onClose={() => {}} />)).toContain('sshd is listening on port 2222 (ssh.socket)');
     expect(html).toContain('I can still reach SSH on port N');
     expect(html).toMatch(/Apply default-deny baseline<\/button>/);
     expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Apply default-deny baseline/);

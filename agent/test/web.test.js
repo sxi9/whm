@@ -10,7 +10,7 @@ import {
   mergeEximBlock, readEximBlock, stripEximBlock, eximTlsLibrary, primaryGroupName, EXIM_SENTINEL_MACRO, renderHttpsRedirect, enableApacheModules,
   applyListen, listenDropIns, ensureSelinuxWebAccess, selinuxRules, DOMLOGS_ROOT, unitState, DOCROOT_OPTIONS, DOCROOT_ALLOW_OVERRIDE,
   reconcileHtaccessOptions, HTACCESS_OPTIONS,
-  renderDefaultVhost, parseDefaultVhostMeta, writeDefaultVhost, removeDefaultVhost, defaultVhostFile, DEFAULT_SSL_FALLBACKS,
+  renderDefaultVhost, parseDefaultVhostMeta, writeDefaultVhost, removeDefaultVhost, defaultVhostFile, DEFAULT_SSL_FALLBACKS, DEFAULT_VHOST_NAMES,
 } from '../src/ops/web.js';
 
 // Fake host for the layout detection: which paths exist, what they contain, which binaries resolve.
@@ -942,22 +942,45 @@ describe('default (catch-all) virtual host: landing page for the bare address an
     expect(exec).not.toHaveBeenCalled();
   });
 
+  // The catch-all must load before every tenant vhost whatever the tenant is
+  // called: `0-0.com.conf`, `0.io.conf` and `00.net.conf` all sort before a
+  // digit-led name, so the order is structural (Debian: conf-enabled, which
+  // apache2.conf includes before sites-enabled) or a name below every
+  // character a domain may start with (RHEL: '+').
+  const TENANT_FILES = ['0-0.com.conf', '0.io.conf', '00.net.conf', '0a.org.conf', 'a.com.conf'];
+
+  it('the catch-all cannot be out-sorted by a tenant file: conf-enabled on Debian, a "+" name in conf.d on RHEL', () => {
+    const debian = { flavor: 'debian', sitesAvailable: '/etc/apache2/sites-available', sitesEnabled: '/etc/apache2/sites-enabled', confAvailable: '/etc/apache2/conf-available', confEnabled: '/etc/apache2/conf-enabled' };
+    expect(defaultVhostFile(debian)).toEqual({ file: '/etc/apache2/conf-available/000-whm-default.conf', link: '/etc/apache2/conf-enabled/000-whm-default.conf', name: '000-whm-default' });
+    const rhel = { flavor: 'rhel', confD: '/etc/httpd/conf.d' };
+    expect(defaultVhostFile(rhel)).toEqual({ file: '/etc/httpd/conf.d/+whm-default.conf', link: null, name: '+whm-default' });
+    const rhelName = `${DEFAULT_VHOST_NAMES.rhel}.conf`;
+    for (const tenant of [...TENANT_FILES, 'ssl.conf', 'welcome.conf']) expect(Buffer.compare(Buffer.from(rhelName), Buffer.from(tenant)), tenant).toBe(-1);
+    expect([...TENANT_FILES, 'ssl.conf', rhelName].sort()[0]).toBe(rhelName);
+    // The old Debian name would lose to those tenants in sites-enabled; it no longer lives there.
+    expect(['000-whm-default.conf', ...TENANT_FILES].sort()[0]).toBe('0-0.com.conf');
+  });
+
   function fakeApache2() {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-default-vhost-'));
-    for (const d of ['sites-available', 'sites-enabled', 'logs', 'landing', 'ssl']) fs.mkdirSync(path.join(root, d), { recursive: true });
+    for (const d of ['sites-available', 'sites-enabled', 'conf-available', 'conf-enabled', 'logs', 'landing', 'ssl']) fs.mkdirSync(path.join(root, d), { recursive: true });
     fs.writeFileSync(path.join(root, 'sites-available', '000-default.conf'), '<VirtualHost *:80>\n  DocumentRoot /var/www/html\n</VirtualHost>\n');
     fs.symlinkSync('../sites-available/000-default.conf', path.join(root, 'sites-enabled', '000-default.conf'));
+    for (const f of TENANT_FILES) { fs.writeFileSync(path.join(root, 'sites-available', f), '<VirtualHost *:80>\n</VirtualHost>\n'); fs.symlinkSync(`../sites-available/${f}`, path.join(root, 'sites-enabled', f)); }
     fs.writeFileSync(path.join(root, 'landing', 'index.html'), '<h1>landing</h1>');
-    const apache = { flavor: 'debian', root, bin: 'apache2ctl', sitesAvailable: path.join(root, 'sites-available'), sitesEnabled: path.join(root, 'sites-enabled'), units: ['apache2'], a2tools: true };
+    const apache = { flavor: 'debian', root, bin: 'apache2ctl', sitesAvailable: path.join(root, 'sites-available'), sitesEnabled: path.join(root, 'sites-enabled'), confAvailable: path.join(root, 'conf-available'), confEnabled: path.join(root, 'conf-enabled'), units: ['apache2'], a2tools: true };
     const tctx = createContext({ allowedRoots: [root] });
     const args = { ...BASE, docroot: path.join(root, 'landing'), logDir: path.join(root, 'logs') };
     return { root, apache, tctx, args, lexists: (f) => { try { fs.lstatSync(path.join(root, f)); return true; } catch { return false; } } };
   }
 
-  it('debian: writes 000-whm-default.conf + its sites-enabled link, disables the stock 000-default site with a2dissite, validates and reports the certificate source', async () => {
+  it('debian: writes conf-available/000-whm-default.conf + its conf-enabled link (ahead of every site), drops a legacy sites-enabled copy, disables the stock 000-default site with a2dissite, validates and reports the certificate source', async () => {
     const { root, apache, tctx, args, lexists: has } = fakeApache2();
     const hostCert = { cert: path.join(root, 'ssl', 'cert.pem'), key: path.join(root, 'ssl', 'key.pem'), fullchain: path.join(root, 'ssl', 'fullchain.pem') };
     for (const f of Object.values(hostCert)) fs.writeFileSync(f, 'pem');
+    // A catch-all written by an earlier panel as a site, plus a foreign file of the same name that is left alone.
+    fs.writeFileSync(path.join(root, 'sites-available', '000-whm-default.conf'), '# Managed by WHM panel\n# whm-default-vhost {}\n<VirtualHost _default_:80>\n</VirtualHost>\n');
+    fs.symlinkSync('../sites-available/000-whm-default.conf', path.join(root, 'sites-enabled', '000-whm-default.conf'));
     try {
       await withBinaries(['apache2ctl', 'a2dissite', 'a2ensite', 'systemctl'], (bin, argv) => {
         if (bin === 'a2dissite') { fs.unlinkSync(path.join(root, 'sites-enabled', `${argv[1]}.conf`)); return {}; }
@@ -965,28 +988,39 @@ describe('default (catch-all) virtual host: landing page for the bare address an
         return {};
       }, async (calls) => {
         const r = await writeDefaultVhost(apache, { ...args, ssl: hostCert }, tctx);
-        expect(r).toMatchObject({ name: '000-whm-default', path: path.join(root, 'sites-available', '000-whm-default.conf'), link: path.join(root, 'sites-enabled', '000-whm-default.conf'), validated: true, addresses: ['203.0.113.5', '2001:db8::5'], stockSite: { disabled: true, site: '000-default', via: 'a2dissite' } });
+        expect(r).toMatchObject({ name: '000-whm-default', path: path.join(root, 'conf-available', '000-whm-default.conf'), link: path.join(root, 'conf-enabled', '000-whm-default.conf'), validated: true, addresses: ['203.0.113.5', '2001:db8::5'], stockSite: { disabled: true, site: '000-default', via: 'a2dissite' }, legacy: { path: path.join(root, 'sites-available', '000-whm-default.conf'), removed: true } });
         expect(r.ssl).toEqual({ cert: hostCert.fullchain, key: hostCert.key, source: 'hostname', generated: false });
         expect(calls()).toContainEqual(['a2dissite', '-q', '000-default']);
         expect(calls()).toContainEqual(['apache2ctl', '-t']);
         expect(calls().some(([bin]) => bin === 'openssl')).toBe(false);
         expect(has('sites-enabled/000-default.conf')).toBe(false);
-        expect(fs.readlinkSync(path.join(root, 'sites-enabled', '000-whm-default.conf'))).toBe('../sites-available/000-whm-default.conf');
+        expect(has('sites-available/000-whm-default.conf')).toBe(false);
+        expect(has('sites-enabled/000-whm-default.conf')).toBe(false);
+        expect(fs.readlinkSync(path.join(root, 'conf-enabled', '000-whm-default.conf'))).toBe('../conf-available/000-whm-default.conf');
         const text = fs.readFileSync(r.path, 'utf8');
         expect(text).toContain(`DocumentRoot "${path.join(root, 'landing')}"`);
         expect(text).toContain(`SSLCertificateFile "${hostCert.fullchain}"`);
         expect(text).toContain(`CustomLog "${path.join(root, 'logs')}/default-access.log" combined`);
-        expect(fs.readdirSync(path.join(root, 'sites-enabled')).sort()[0]).toBe('000-whm-default.conf');
-        // Second write: the stock site is already off, nothing else changes.
+        // Nothing of ours is in sites-enabled, where the tenants out-sort the old name.
+        expect(fs.readdirSync(path.join(root, 'sites-enabled')).sort()).toEqual([...TENANT_FILES].sort());
+        expect(fs.readdirSync(path.join(root, 'conf-enabled'))).toEqual(['000-whm-default.conf']);
+        // Second write: the stock site is already off, no legacy copy, nothing else changes.
         const again = await writeDefaultVhost(apache, { ...args, ssl: hostCert }, tctx);
         expect(again.stockSite).toEqual({ disabled: false, site: '000-default' });
+        expect(again.legacy).toBeNull();
         expect(calls().filter(([bin]) => bin === 'a2dissite')).toHaveLength(1);
         // Removal takes the file and the link and validates.
         const removed = await removeDefaultVhost(apache, tctx);
         expect(removed).toMatchObject({ path: r.path, removed: true, validated: true });
-        expect(has('sites-available/000-whm-default.conf')).toBe(false);
-        expect(has('sites-enabled/000-whm-default.conf')).toBe(false);
+        expect(has('conf-available/000-whm-default.conf')).toBe(false);
+        expect(has('conf-enabled/000-whm-default.conf')).toBe(false);
         expect(await removeDefaultVhost(apache, tctx)).toMatchObject({ removed: false });
+        // A legacy site copy alone is removed by the remove op too; a file without the panel mark is never touched.
+        fs.writeFileSync(path.join(root, 'sites-available', '000-whm-default.conf'), '# whm-default-vhost {}\n');
+        expect(await removeDefaultVhost(apache, tctx)).toMatchObject({ removed: true, legacy: { removed: true } });
+        fs.writeFileSync(path.join(root, 'sites-available', '000-whm-default.conf'), '<VirtualHost *:80>\n</VirtualHost>\n');
+        expect(await removeDefaultVhost(apache, tctx)).toMatchObject({ removed: false, legacy: null });
+        expect(has('sites-available/000-whm-default.conf')).toBe(true);
       });
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
@@ -1035,20 +1069,22 @@ describe('default (catch-all) virtual host: landing page for the bare address an
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 
-  it('rhel: a conf.d/00-whm-default.conf without a link, sorted ahead of ssl.conf and welcome.conf', async () => {
+  it('rhel: a conf.d/+whm-default.conf without a link, sorted ahead of every tenant file, ssl.conf and welcome.conf', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-default-httpd-'));
     try {
       for (const d of ['conf.d', 'logs', 'landing']) fs.mkdirSync(path.join(root, d), { recursive: true });
       fs.writeFileSync(path.join(root, 'conf.d', 'ssl.conf'), '<VirtualHost _default_:443>\n</VirtualHost>\n');
       fs.writeFileSync(path.join(root, 'conf.d', 'welcome.conf'), '<LocationMatch "^/+$">\n</LocationMatch>\n');
+      for (const f of TENANT_FILES) fs.writeFileSync(path.join(root, 'conf.d', f), '<VirtualHost *:80>\n</VirtualHost>\n');
       const apache = { flavor: 'rhel', root, bin: 'httpd', confD: path.join(root, 'conf.d'), units: ['httpd'], a2tools: false };
       const tctx = createContext({ allowedRoots: [root] });
       await withBinaries(['httpd', 'systemctl'], (bin, argv) => (bin === 'httpd' && argv[0] === '-t' ? { stderr: 'Syntax OK\n' } : {}), async (calls) => {
         const r = await writeDefaultVhost(apache, { ...BASE, docroot: path.join(root, 'landing'), logDir: path.join(root, 'logs'), sslPort: null }, tctx);
-        expect(r).toMatchObject({ name: '00-whm-default', path: path.join(root, 'conf.d', '00-whm-default.conf'), link: null, ssl: null, stockSite: { disabled: false, site: null } });
-        expect(fs.readdirSync(path.join(root, 'conf.d')).sort()).toEqual(['00-whm-default.conf', 'ssl.conf', 'welcome.conf']);
+        expect(r).toMatchObject({ name: '+whm-default', path: path.join(root, 'conf.d', '+whm-default.conf'), link: null, ssl: null, stockSite: { disabled: false, site: null }, legacy: null });
+        expect(fs.readdirSync(path.join(root, 'conf.d')).sort()).toEqual(['+whm-default.conf', '0-0.com.conf', '0.io.conf', '00.net.conf', '0a.org.conf', 'a.com.conf', 'ssl.conf', 'welcome.conf']);
         expect(calls().some(([bin]) => bin === 'a2dissite')).toBe(false);
-        expect(defaultVhostFile(apache)).toEqual({ file: path.join(root, 'conf.d', '00-whm-default.conf'), link: null, name: '00-whm-default' });
+        expect(defaultVhostFile(apache)).toEqual({ file: path.join(root, 'conf.d', '+whm-default.conf'), link: null, name: '+whm-default' });
+        expect(await removeDefaultVhost(apache, tctx)).toMatchObject({ removed: true, legacy: null });
       });
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
@@ -1072,6 +1108,9 @@ describe('web.docroot.ensure / remove run inside the account home as the account
   it('refuses a user that does not exist, a system user, a path outside the home, the home itself and reserved directories, before running anything', async () => {
     exec.mockClear();
     expect((await opError(runOp('web.docroot.ensure', { username: 'nosuchuser0', docroot: '/home/nosuchuser0/site' }, ctx))).code).toBe('not_found');
+    // The index page takes a rendered template as large as the template editor accepts (512 KiB); the schema passes it through to the user lookup.
+    expect((await opError(runOp('web.docroot.ensure', { username: 'nosuchuser0', docroot: '/home/nosuchuser0/site', index: 'x'.repeat(512 * 1024) }, ctx))).code).toBe('not_found');
+    expect((await opError(runOp('web.docroot.ensure', { username: 'nosuchuser0', docroot: '/home/nosuchuser0/site', index: 'x'.repeat(512 * 1024 + 1) }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('web.docroot.ensure', { username: 'root', docroot: '/home/root/site' }, ctx))).code).toBe('refused');
     expect((await opError(runOp('web.docroot.remove', { username: 'root', docroot: '/root/x' }, ctx))).code).toBe('refused');
     expect(exec).not.toHaveBeenCalled();

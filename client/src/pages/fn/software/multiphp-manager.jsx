@@ -16,13 +16,17 @@ import { RequestError, PhpVersionPill, useJobRunner, JobPanel, JobHistory } from
 export function phpRowAction(v, source) {
   if (v.installed) {
     if (v.removable) return { kind: 'remove', disabled: false, reason: null };
-    const reason = v.isDefault ? 'system default' : v.isCliDefault ? 'CLI default (/usr/bin/php)' : v.inUse ? `used by ${v.inUse} domain${v.inUse === 1 ? '' : 's'}` : 'not a versioned package set';
+    const reason = v.isDefault ? 'system default' : v.isCliDefault ? 'CLI default (/usr/bin/php)' : v.inUse ? `used by ${v.inUseDetail || `${v.inUse} domain${v.inUse === 1 ? '' : 's'}`}` : 'not a versioned package set';
     return { kind: 'remove', disabled: true, reason };
   }
   if (v.offered) return { kind: 'install', disabled: false, reason: null };
   if (source?.supported && !source.configured) return { kind: 'install', disabled: false, reason: `enables ${source.label} first` };
   return { kind: 'install', disabled: true, reason: source?.configured ? `not offered by ${source.label}` : source?.reason || 'no PHP package source for this host' };
 }
+
+// apt/dnf hold one lock: every row waits while a request is in flight or the
+// started job is still running (the server refuses a second job as well).
+export const phpRowLocked = (action, runner) => Boolean(action.disabled || runner?.busy || runner?.running);
 
 // Install a PHP version: every branch the family's package source can offer
 // (ppa:ondrej/php on Ubuntu, packages.sury.org on Debian, Remi on the RHEL
@@ -36,13 +40,13 @@ export function PhpInstallCard({ enabled = true, onChanged }) {
   const source = d?.source;
 
   const install = async (v) => {
-    const note = v.offered ? '' : source?.configured ? ` ${source.label} does not offer it on this host; the job reports that and stops.` : ` ${source?.label || 'The PHP package source'} is enabled first and the package index refreshed.`;
-    if (!(await confirm({ title: `Install PHP ${v.version}?`, message: `PHP-FPM, the CLI and the common extensions (MySQL, GD, mbstring, XML, zip, intl, bcmath, SOAP, opcache; those the repository does not ship are skipped) are installed with the package manager as a background job and the FPM unit is enabled.${note} Domains keep their current version until you change it here.`, confirmLabel: `Install PHP ${v.version}` }))) return;
+    const note = v.offered ? '' : source?.configured ? ` ${source.label} does not offer it on this host; the job reports that and stops.` : ` ${source?.label || 'The PHP package source'} is enabled first and the package index refreshed (and removed again should the refresh fail).`;
+    if (!(await confirm({ title: `Install PHP ${v.version}?`, message: `PHP-FPM, the CLI and the common extensions (MySQL, GD, mbstring, XML, zip, intl, bcmath, SOAP, opcache; those the repository does not ship are skipped) are installed with the package manager as a background job and the FPM unit is enabled.${note} Domains, new accounts and the system default keep their current version; if the install moves /usr/bin/php to the new branch, the job points it back.`, confirmLabel: `Install PHP ${v.version}` }))) return;
     setPending(v.version);
     try { await runner.start(() => api.post('/software/php/install', { version: v.version }), `Install PHP ${v.version}`); } finally { setPending(null); }
   };
   const remove = async (v) => {
-    if (!(await confirm({ title: `Remove PHP ${v.version}?`, message: `The ${v.id} package set is removed after its ${v.fpmUnit || 'PHP-FPM'} unit is stopped. Only a version no domain uses, that is neither the system nor the CLI default, can be removed; the server checks again before anything runs.`, confirmLabel: 'Remove', danger: true, typeToConfirm: v.id }))) return;
+    if (!(await confirm({ title: `Remove PHP ${v.version}?`, message: `The ${v.id} package set is purged (packages and their configuration tree) after its ${v.fpmUnit || 'PHP-FPM'} unit is stopped. Only a version that no domain, rendered vhost, PHP-FPM pool, hosting package or the Apache web default uses, and that is neither the system nor the CLI default, can be removed; the server checks all of that again when the job starts.`, confirmLabel: 'Remove', danger: true, typeToConfirm: v.id }))) return;
     setPending(v.version);
     try { await runner.start(() => api.delete(`/software/php/versions/${encodeURIComponent(v.id)}`), `Remove PHP ${v.version}`); } finally { setPending(null); }
   };
@@ -66,7 +70,7 @@ export function PhpInstallCard({ enabled = true, onChanged }) {
             </p>
             <div className="table-wrap">
               <table>
-                <thead><tr><th>Version</th><th>Status</th><th>Source</th><th>Domains</th><th className="actions-col">Action</th></tr></thead>
+                <thead><tr><th>Version</th><th>Status</th><th>Source</th><th>In use by</th><th className="actions-col">Action</th></tr></thead>
                 <tbody>
                   {d.versions.map((v) => {
                     const action = phpRowAction(v, source);
@@ -80,11 +84,11 @@ export function PhpInstallCard({ enabled = true, onChanged }) {
                           {v.isCliDefault && !v.isDefault && <> <StatusPill status="info">CLI</StatusPill></>}
                         </td>
                         <td className="small">{v.source === 'distro' ? 'distribution' : v.source || (v.installed ? v.layout || '—' : '—')}</td>
-                        <td className="small">{v.inUse ? `${v.inUse}` : '—'}</td>
+                        <td className="small">{v.inUseDetail || (v.inUse ? `${v.inUse}` : '—')}</td>
                         <td className="actions-col">
                           {action.kind === 'install'
-                            ? <Button size="sm" variant="primary" loading={busy} disabled={action.disabled || runner.busy} title={action.reason || undefined} onClick={() => install(v)}>Install</Button>
-                            : <Button size="sm" variant="danger" loading={busy} disabled={action.disabled || runner.busy} title={action.reason || undefined} onClick={() => remove(v)}>Remove</Button>}
+                            ? <Button size="sm" variant="primary" loading={busy} disabled={phpRowLocked(action, runner)} title={action.reason || undefined} onClick={() => install(v)}>Install</Button>
+                            : <Button size="sm" variant="danger" loading={busy} disabled={phpRowLocked(action, runner)} title={action.reason || undefined} onClick={() => remove(v)}>Remove</Button>}
                           {action.reason && <div className="muted small">{action.reason}</div>}
                         </td>
                       </tr>

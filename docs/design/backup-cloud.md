@@ -10,12 +10,12 @@ list and import the copies a destination holds.
 
 | Kind | Label | Auth | Transport | Path inside the remote | Notes |
 |---|---|---|---|---|---|
-| `gdrive` | Google Drive | OAuth 2.0 (PKCE S256, `access_type=offline`, `prompt=consent`) | rclone `drive`, scope `drive.file` | `folder` (default `whm-backups`) | The panel only sees files it created. `rootFolderId` optional. |
+| `gdrive` | Google Drive | OAuth 2.0 (PKCE S256, `access_type=offline`, `prompt=consent`) | rclone `drive`, scope `drive.file`, `use_trash = false` | `folder` (default `whm-backups`) | The panel only sees files it created. `rootFolderId` optional. Pruning deletes outright (the Drive trash would keep the ciphertext for 30 days and count it against the quota). |
 | `onedrive` | Microsoft OneDrive | OAuth 2.0 (PKCE, scopes `Files.ReadWrite offline_access User.Read`) | rclone `onedrive` with `drive_id`/`drive_type` read from Graph `/me/drive` at connect time | `folder` | Personal and business drives. |
 | `dropbox` | Dropbox | OAuth 2.0 (PKCE, `token_access_type=offline`) | rclone `dropbox` | `folder` | Scoped app with `files.content.write/read`, `files.metadata.read`. |
 | `s3` | Amazon S3 / compatible | access key + secret | native SigV4 (as before) **or** rclone `s3` (`transport: 'rclone'`, or always when encrypted) | `bucket/prefix` | Wasabi, MinIO, R2, Spaces via `endpoint` + `pathStyle`. rclone lifts the 5 GB single-PUT limit (multipart). |
-| `azureblob` | Azure Blob Storage | storage account key **or** container SAS token | rclone `azureblob` (`key` or `sas_url = <endpoint>/<container>?<sas>`) | `container/prefix` | `endpoint` optional for sovereign clouds. |
-| `b2` | Backblaze B2 | application key id + key | rclone `b2` | `bucket/prefix` | — |
+| `azureblob` | Azure Blob Storage | storage account key **or** container SAS token | rclone `azureblob` (`key` or `sas_url = <endpoint>/<container>?<sas>`) | `container/prefix` | `endpoint` optional for sovereign clouds. With an account key, rclone 1.60 (Debian 12 / Ubuntu 24.04 apt) composes `https://<account>.<endpoint>` itself, so the agent probes `rclone version` and writes the bare domain for it (`https://<account>.<domain>` endpoints only; anything else answers `unsupported` → use the SAS form or rclone ≥ 1.61). An update that removes both credentials is refused (`422`). |
+| `b2` | Backblaze B2 | application key id + key | rclone `b2`, `hard_delete = true` | `bucket/prefix` | Pruning deletes the version outright (a hidden version would stay stored and billed). |
 | `local`, `ftp`, `sftp`, `webdav` | (as before) | (as before) | curl / file copy, **or** rclone (`local`/`ftp`/`sftp`/`webdav` backends) when encrypted | `dir` / `path` / URL | SFTP host-key pinning is kept: the pinned key becomes rclone's `known_hosts_file`. |
 
 `rclone` is a new capability (binary `rclone`, registered by the backup category; the stack
@@ -39,7 +39,8 @@ local/FTP/SFTP/WebDAV/S3 destinations keep working without rclone exactly as bef
 | rclone configuration | **never on disk permanently**: rendered per call into `/tmp/whm/backup-rclone-<random>/rclone` (0600, root) by the agent and removed in `finally` | secrets never reach argv or `/proc` |
 
 Migration `039_backup-cloud.sql` rebuilds `backup_destinations` with the widened `kind`
-CHECK (keeping `backup_uploads.destination_id` links across the `DROP TABLE`), adds
+CHECK (keeping the `backup_uploads.destination_id` and `backups.destination_id` links across
+the `DROP TABLE`, whose implicit delete would otherwise fire their `ON DELETE SET NULL`), adds
 `backup_uploads.encrypted` and the `backup_oauth_apps` table.
 
 ## Encryption model
@@ -57,7 +58,10 @@ CHECK (keeping `backup_uploads.destination_id` links across the `DROP TABLE`), a
   → on); the UI shows the toggle before creation. **Not switchable off once enabled**:
   `PUT` with `crypt: false` on an encrypted destination is `409`.
 - A destination created before this unit (plain S3/WebDAV/SFTP/FTP/local) keeps working
-  unchanged and gets an **Enable encryption** action (`POST /destinations/:id/encryption`)
+  unchanged: its stored configuration carries no `crypt` key, the API reports `config.crypt:
+  false` explicitly and the edit form seeds its toggle from the row's `encrypted` state
+  (`destinationFormState`), so saving an unrelated change keeps it plain and switching the
+  toggle on is what issues a key. It gets an **Enable encryption** action (`POST /destinations/:id/encryption`)
   that only affects new uploads: each `backup_uploads` row records `encrypted`, and fetches,
   prunes and listings use the transport that wrote the copy (`agentConfig(row, { encrypted })`
   strips the crypt layer for plain copies). `GET /destinations/:id/archives` lists both
@@ -67,6 +71,20 @@ CHECK (keeping `backup_uploads.destination_id` links across the `DROP TABLE`), a
 - Token rotation: rclone writes a refreshed OAuth token back into its (temporary) config;
   the agent diffs it (`readTokenUpdate`) and returns `tokenUpdate`; the service persists the
   new refresh token (`backup.destination.token_rotated` audit row, no token in it).
+- Expired or revoked grants: when a test or an upload to an OAuth destination fails with
+  `invalid_grant` (or "token has been expired or revoked"), the service sets `reauthRequired`
+  in the stored configuration (panel-only, never sent to the agent; audit row
+  `backup.destination.reauth_required`), `connection.reauthRequired` is true in responses and
+  the Connection column shows *sign-in expired* with the *Reconnect* link; the next successful
+  call or a new connect clears it.
+- Deletion semantics: a pruned or deleted copy is removed outright everywhere (Drive
+  `use_trash = false`, B2 `hard_delete = true`); `backup.rclone.delete` answers `removed: false`
+  for a copy that is already gone on every rclone version (exit 3/4, or rclone 1.60's plain
+  "is a directory or doesn't exist" error with exit 1).
+- Error hygiene: every rclone failure — a non-zero exit, a timeout (`timeout`, 503) or a
+  process that could not be started — leaves the agent as an `OpError` whose message went
+  through `scrubSecrets`; the raw stderr and argv of the `ExecError` are dropped, so nothing of
+  a SAS query string or a token reaches `backup_uploads.error`, the API or the panel log.
 
 ## Agent ops (`agent/src/ops/backup.js`, family `backup.rclone.*`)
 
@@ -115,7 +133,11 @@ PKCE verifier and the client secret, so the request log line carrying it is not 
 ### OAuth app setup per provider
 
 **Google Drive** — Google Cloud console › *APIs & Services* › *Enabled APIs* › enable
-**Google Drive API**; *OAuth consent screen* (External, add the test users or publish);
+**Google Drive API**; *OAuth consent screen* (External) and **publish it** (*Publishing
+status: In production*; the `drive.file` scope is non-sensitive, so no verification review is
+needed). A consent screen left in *Testing* issues refresh tokens that **expire after 7
+days**: backups work for a week, then every upload fails with `invalid_grant` until the account
+is reconnected (the Connection column then shows *sign-in expired* with *Reconnect*).
 *Credentials* › *Create credentials* › *OAuth client ID* › type **Web application** ›
 *Authorised redirect URIs*: `https://<hostname>:2087/api/backup/destinations/oauth/gdrive/callback`.
 Copy the client ID and secret into the panel. Scope requested: `drive.file`.
@@ -148,7 +170,7 @@ with read/write/list/delete.
 | `GET/PUT/DELETE /backup/destinations/oauth-apps[/:provider]` | OAuth client registry (`clientId`, `clientSecret` write-only) |
 | `GET /backup/destinations/oauth/:provider/start?destination=` / `…/callback` | the browser flow above |
 | `POST /backup/destinations` | create; `encryptionKey` returned once when encryption is on |
-| `PUT /backup/destinations/:id` | update; `crypt: false` on an encrypted destination → 409; turning it on returns the key once |
+| `PUT /backup/destinations/:id` | update; `crypt: false` on an encrypted destination → 409; turning it on returns the key once; an Azure update that leaves neither `accountKey` nor `sasToken` → 422 |
 | `POST /backup/destinations/:id/encryption` | enable encryption on a plain destination (key returned once) |
 | `GET /backup/destinations/:id/archives` | copies on the destination with `encrypted` per entry (both layers) |
 | `POST /backup/destinations/:id/archives/import` `{ name, encrypted }` | 202 job `backup.cloud.fetch`: download (decrypt), verify, register as a pinned `import` backup |

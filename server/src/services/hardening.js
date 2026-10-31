@@ -1,3 +1,4 @@
+import net from 'node:net';
 import { CapabilityError, unprocessable } from '../lib/errors.js';
 import { json } from '../db/index.js';
 
@@ -20,13 +21,18 @@ export const F2B_JAILS = ['sshd', 'exim', 'dovecot', 'pure-ftpd', 'proftpd', 'ap
 export const SSH_HARDENING = { PermitRootLogin: 'prohibit-password', MaxAuthTries: 4, LoginGraceTime: 30, X11Forwarding: 'no' };
 const SSH_KEYS = Object.keys(SSH_HARDENING);
 const ROOT_LOGIN_OK = new Set(['prohibit-password', 'without-password', 'no', 'forced-commands-only']);
+// Values stricter than prohibit-password that an apply must never replace.
+const ROOT_LOGIN_KEEP = new Set(['no', 'forced-commands-only']);
+const ROOT_AUTHORIZED_KEYS = '/root/.ssh/authorized_keys';
 const HUB_PORT = 7443;
+// Accepted by the baseline before any port rule; shown in the plan, never sent as a port.
+const BUILTIN_RULES = [{ port: 546, proto: 'udp', reasons: ['dhcpv6 client'], scope: 'IPv6 link-local, from port 547' }];
 const ADVISOR_FIX = { label: 'Hardening', path: '/security-center/security-advisor#hardening' };
 
 export const ITEMS = [
   { id: 'fail2ban', label: 'Fail2ban intrusion blocking', description: 'Bans addresses that repeatedly fail SSH, mail, FTP, Apache or panel logins (jail.d/whm.local + a filter for the panel log).', capability: 'fail2ban', grade: 'warning' },
   { id: 'auto-updates', label: 'Automatic security updates', description: 'unattended-upgrades (Debian/Ubuntu) or dnf-automatic (RHEL family) applying security updates only, never rebooting.', grade: 'warning' },
-  { id: 'ssh', label: 'SSH daemon hardening', description: 'PermitRootLogin prohibit-password, MaxAuthTries 4, LoginGraceTime 30, X11Forwarding no — refused while root has no authorized key.', capability: 'sshd', grade: 'warning' },
+  { id: 'ssh', label: 'SSH daemon hardening', description: 'PermitRootLogin prohibit-password, MaxAuthTries 4, LoginGraceTime 30, X11Forwarding no — refused while root could not log in with a key.', capability: 'sshd', grade: 'warning' },
   { id: 'sysctl', label: 'Kernel network hardening', description: 'sysctl.d/90-whm-hardening.conf: reverse-path filtering, SYN cookies, no ICMP redirects or source routing, martians logged.', grade: 'info' },
   { id: 'firewall', label: 'Firewall baseline (default deny)', description: 'Only the panel, SSH, web, mail, DNS and FTP ports stay reachable; the input policy drops everything else. Needs your confirmation of the SSH port.', capability: 'firewall', grade: 'warning' },
 ];
@@ -38,8 +44,29 @@ export const sshChecks = (effective = {}) => ({
   X11Forwarding: String(effective.x11forwarding || 'no').toLowerCase() === 'no',
 });
 
-const portOf = (p) => (typeof p === 'number' ? p : null);
+// Why PermitRootLogin prohibit-password would lock root out: no authorized key,
+// or sshd would not consult it (PubkeyAuthentication off, AuthenticationMethods
+// without a chain that works once passwords are refused, AuthorizedKeysFile
+// pointing elsewhere). Null when a key login is possible.
+export function sshKeyLoginBlocked(effective = {}, authorizedKeys = 0) {
+  if (!(authorizedKeys > 0)) return 'Root has no authorized SSH key; authorize one first';
+  if (String(effective.pubkeyauthentication || 'yes').toLowerCase() === 'no') return 'PubkeyAuthentication is off, so root could not log in with a key; switch it on first (SSH Password Authorization Tweak)';
+  const methods = String(effective.authenticationmethods || 'any').trim().toLowerCase();
+  if (methods && methods !== 'any') {
+    const keyChain = methods.split(/\s+/).some((chain) => { const m = chain.split(','); return m.includes('publickey') && !m.includes('password') && !m.includes('keyboard-interactive'); });
+    if (!keyChain) return `AuthenticationMethods "${effective.authenticationmethods}" leaves root no key login once passwords are refused`;
+  }
+  const files = String(effective.authorizedkeysfile ?? '').trim();
+  if (files) {
+    const resolved = files.split(/\s+/).map((f) => { const p = f.replace(/%h/g, '/root').replace(/%u/g, 'root').replace(/%%/g, '%'); return p.startsWith('/') ? p : `/root/${p}`; });
+    if (!resolved.includes(ROOT_AUTHORIZED_KEYS)) return `AuthorizedKeysFile "${files}" does not read ${ROOT_AUTHORIZED_KEYS}, where root's authorized key is`;
+  }
+  return null;
+}
+
 const inPorts = (list, n) => list.some((p) => (typeof p === 'number' ? p === n : n >= p.from && n <= p.to));
+// Express reports IPv4 clients of the dual-stack listener as ::ffff:a.b.c.d.
+const clientIp = (req) => { const ip = String(req?.ip || '').replace(/^::ffff:/i, ''); return net.isIP(ip) ? ip : null; };
 
 export function createHardeningService(ctx) {
   const { db, agent, capabilities, settings, config, logger } = ctx;
@@ -91,16 +118,20 @@ export function createHardeningService(ctx) {
       const live = await op('hardening.jails.status');
       if (!live.installed) throw new CapabilityError('fail2ban', 'Fail2ban is not installed on this server');
       const cfg = fail2ban.config();
+      // The panel jail exempts the chosen addresses, by default the one this apply
+      // came from, so the operator cannot ban themselves out of the panel; the
+      // other jails never exempt anyone.
+      const own = clientIp(req);
       const params = {
         jails: body.jails?.length ? [...new Set(body.jails)] : fail2ban.jailsFor(),
         bantime: body.bantimeSeconds ?? cfg.bantime, findtime: body.findtimeSeconds ?? cfg.findtime, maxretry: body.maxretry ?? cfg.maxretry,
         panelPorts: [...new Set([config.port, config.tlsPort].filter(Boolean))],
-        ignoreIps: req?.ip && /^[0-9a-fA-F:.]+$/.test(req.ip) && !req.ip.startsWith('::ffff:') ? [req.ip] : [],
+        ignoreIps: Array.isArray(body.ignoreIps) ? [...new Set(body.ignoreIps)] : own ? [own] : [],
       };
       const result = await op('hardening.jails.apply', params, req);
       settings.setMany({ 'security.hardening.fail2ban.bantime_seconds': params.bantime, 'security.hardening.fail2ban.findtime_seconds': params.findtime, 'security.hardening.fail2ban.maxretry': params.maxretry });
       record('fail2ban', true, { params });
-      audit(req, { action: 'security.hardening.apply', target: 'fail2ban', args: { jails: params.jails, bantime: params.bantime, findtime: params.findtime, maxretry: params.maxretry } });
+      audit(req, { action: 'security.hardening.apply', target: 'fail2ban', args: { jails: params.jails, bantime: params.bantime, findtime: params.findtime, maxretry: params.maxretry, ignoreIps: params.ignoreIps } });
       return { item: 'fail2ban', ...result };
     },
     async revert(req) {
@@ -163,18 +194,20 @@ export function createHardeningService(ctx) {
       const authorizedKeys = keys.authorized?.length ?? 0;
       return shape('ssh', failing.length ? 'not_applied' : 'applied', {
         checks, failing, authorizedKeys, effective: Object.fromEntries(SSH_KEYS.map((k) => [k, cfg.effective?.[k.toLowerCase()] ?? null])), managed: cfg.managed || {}, shadowed: cfg.shadowed || [],
-        reason: failing.length ? `${failing.join(', ')} ${failing.length === 1 ? 'is' : 'are'} not hardened` : null, blocked: authorizedKeys === 0 ? 'Root has no authorized SSH key; authorize one first' : null,
+        reason: failing.length ? `${failing.join(', ')} ${failing.length === 1 ? 'is' : 'are'} not hardened` : null, blocked: sshKeyLoginBlocked(cfg.effective || {}, authorizedKeys),
       });
     },
     async apply(_body, req) {
       capabilities.require('sshd', 'OpenSSH server (sshd) is not installed on this server');
       const keys = await op('sec.ssh_keys.list').catch(() => ({ authorized: [] }));
-      if (!(keys.authorized?.length > 0)) throw unprocessable('Restricting root SSH login to keys while root has no authorized key would lock root out of SSH. Authorize a key first (Manage root\'s SSH Keys).', { authorizedKeys: ['Authorize at least one root SSH key before applying'] });
       const cfg = await op('sec.sshd.get');
       const e = cfg.effective || {};
+      const blocked = sshKeyLoginBlocked(e, keys.authorized?.length ?? 0);
+      if (blocked) throw unprocessable(`Restricting root SSH login to keys would lock root out of SSH: ${blocked}`, { authorizedKeys: [blocked] });
       // Never loosen a stricter value another file already applies.
+      const current = String(e.permitrootlogin || '').toLowerCase();
       const target = {
-        PermitRootLogin: String(e.permitrootlogin || '').toLowerCase() === 'no' ? 'no' : SSH_HARDENING.PermitRootLogin,
+        PermitRootLogin: ROOT_LOGIN_KEEP.has(current) ? current : SSH_HARDENING.PermitRootLogin,
         MaxAuthTries: Math.min(SSH_HARDENING.MaxAuthTries, Number(e.maxauthtries) || SSH_HARDENING.MaxAuthTries),
         LoginGraceTime: Math.min(SSH_HARDENING.LoginGraceTime, Number(e.logingracetime) || SSH_HARDENING.LoginGraceTime),
         X11Forwarding: 'no',
@@ -229,7 +262,7 @@ export function createHardeningService(ctx) {
     async plan({ extraTcp = [], extraUdp = [] } = {}, live = null) {
       const fw = live || await op('hardening.firewall.status');
       let sshPorts = fw.sshdPorts || [];
-      let sshSource = 'listening';
+      let sshSource = fw.sshdSocket || 'listening';
       if (!sshPorts.length) {
         const cfg = await op('sec.sshd.get').catch(() => null);
         sshPorts = [Number(cfg?.effective?.port) || 22];
@@ -243,17 +276,17 @@ export function createHardeningService(ctx) {
       add(tcp, 80, 'web'); add(tcp, 443, 'web');
       if (capabilities.has('exim')) for (const p of [25, 465, 587]) add(tcp, p, 'mail (smtp)');
       if (capabilities.has('dovecot')) for (const p of [110, 143, 993, 995]) add(tcp, p, 'mail (imap/pop3)');
-      if (capabilities.has('bind')) { add(tcp, 53, 'dns'); add(udp, 53, 'dns'); }
+      if (capabilities.has('bind') || capabilities.has('powerdns')) { add(tcp, 53, 'dns'); add(udp, 53, 'dns'); }
       if (capabilities.has('ftp')) {
         add(tcp, 21, 'ftp');
         const f = ctx.web?.ftp?.settings?.() || {};
         const from = Number(f.passivePortMin) || 49152; const to = Number(f.passivePortMax) || 65534;
         if (from <= to) add(tcp, { from, to }, 'ftp passive');
       }
-      if (fw.hubUnit) add(tcp, HUB_PORT, 'license hub');
+      if (fw.hubUnit) for (const p of (fw.hubPorts?.length ? fw.hubPorts : [HUB_PORT])) add(tcp, p, 'license hub');
       for (const p of extraTcp) add(tcp, p, 'extra');
       for (const p of extraUdp) add(udp, p, 'extra');
-      return { backend: fw.backend, sshPorts, sshSource, tcp: [...tcp.values()], udp: [...udp.values()], conflicts: fw.conflicts, extraTcp, extraUdp };
+      return { backend: fw.backend, sshPorts, sshSource, tcp: [...tcp.values()], udp: [...udp.values()], builtin: BUILTIN_RULES, conflicts: fw.conflicts, extraTcp, extraUdp };
     },
     async status() {
       const live = await op('hardening.firewall.status');

@@ -10,11 +10,14 @@ import { useToast } from '../../components/Toast.jsx';
 export { RequestError, Tabs, isCapabilityError } from '../security/Shared.jsx';
 
 // Starts a background job from an API call and shows its live log until it
-// finishes; the caller is told when it did so lists can refresh.
+// finishes; the caller is told when it did so lists can refresh. `busy` covers
+// the request, `running` the job itself (queued until the log reports its end),
+// so a page can keep a second package-manager job from colliding on the lock.
 export function useJobRunner({ onFinished } = {}) {
   const toast = useToast();
   const [jobId, setJobId] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [running, setRunning] = useState(false);
   const [error, setError] = useState(null);
   const start = useCallback(async (fn, label = 'Job') => {
     setBusy(true);
@@ -22,6 +25,7 @@ export function useJobRunner({ onFinished } = {}) {
     try {
       const { data } = await fn();
       setJobId(data.job.id);
+      setRunning(true);
       toast.info(`${label} queued (job #${data.job.id})`);
       return data;
     } catch (err) {
@@ -34,9 +38,10 @@ export function useJobRunner({ onFinished } = {}) {
   }, [toast]);
   const finished = useCallback((event) => {
     setBusy(false);
+    setRunning(false);
     onFinished?.(event);
   }, [onFinished]);
-  return { jobId, busy, error, start, setJobId, finished };
+  return { jobId, busy, running, error, start, setJobId, finished };
 }
 
 export function JobPanel({ runner, title = 'Progress' }) {

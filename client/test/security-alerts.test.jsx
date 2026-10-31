@@ -45,6 +45,7 @@ describe('deliveryLabel', () => {
     expect(deliveryLabel(heldAlert)).toBe('held for the next digest');
     expect(deliveryLabel(skippedAlert)).toBe('not sent: below the minimum severity');
     expect(deliveryLabel({ state: 'pending' })).toBe('queued for delivery');
+    expect(deliveryLabel({ state: 'pending', admin: { matched: 0, sent: 0, failed: 0, skipped: 'no_recipients' } })).toBe('waiting: no administrator can receive it yet (add a contact or route root mail)');
     expect(deliveryLabel({ state: 'failed', admin: { error: 'relay down' } })).toBe('administrators: failed (relay down)');
     expect(deliveryLabel({ state: 'sent', admin: { matched: 1, sent: 1, failed: 0 }, accounts: { skipped: 'notify_accounts_off' } })).toBe('administrators: 1 of 1 contact sent · accounts: off');
     expect(deliveryLabel({ state: 'sent', admin: { matched: 0, sent: 0, failed: 0 }, accounts: { skipped: 'admins_only' } })).toBe('administrators: 0 of 0 contacts sent · accounts: administrators only');

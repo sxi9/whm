@@ -518,6 +518,7 @@ const BINDING_PREFIX = /^(python3|python2|python|php|ruby|perl|node|nodejs|golan
 const BINDING_SUFFIX = /^(.+)-(perl|java|ruby|python|python3|lua|tcl|cil|gir|jni|ocaml|php)$/;
 
 const SUFFIX_KIND = { dev: 'dev', devel: 'dev', headers: 'dev', dbg: 'debug', dbgsym: 'debug', debuginfo: 'debug', debugsource: 'debug', doc: 'doc', docs: 'doc', common: 'common', data: 'common', static: 'source', source: 'source', src: 'source' };
+const KIND_RANK = { flavor: 0, common: 1, runtime: 2, version: 3, arch: 4, dev: 5, source: 6, doc: 7, debug: 8 };
 const variantKind = (name) => {
   const lower = String(name).toLowerCase();
   if (ARCH_SUFFIX.test(lower)) return 'arch';
@@ -569,10 +570,12 @@ export function dedupeSearchResults(results, q, { limit = 60 } = {}) {
     const g = groups.get(stem) || groups.set(stem, { stem, members: [] }).get(stem);
     if (!g.members.some((m) => m.name === r.name)) g.members.push(r);
   }
+  // The installable shape heads the row: with no plain member the kind decides
+  // (imagemagick-6-common over imagemagick-6-doc), never the shorter name.
   const pickMain = (g) => {
     const score = (m) => {
       const lower = m.name.toLowerCase();
-      return [lower === needle ? 0 : 1, lower === g.stem ? 0 : 1, lower.replace(ARCH_SUFFIX, '').replace(VARIANT_SUFFIX, '') === lower ? 0 : 1, m.name.length];
+      return [lower === needle ? 0 : 1, lower === g.stem ? 0 : 1, lower.replace(ARCH_SUFFIX, '').replace(VARIANT_SUFFIX, '') === lower ? 0 : 1, KIND_RANK[variantKind(m.name)] ?? 9, m.name.length];
     };
     return [...g.members].sort((a, b) => { const sa = score(a); const sb = score(b); for (let i = 0; i < sa.length; i++) if (sa[i] !== sb[i]) return sa[i] - sb[i]; return a.name.localeCompare(b.name); })[0];
   };
@@ -1222,9 +1225,39 @@ export function parseDnfList(stdout) {
   return out;
 }
 
+// "name\tversion" lines of rpm --qf / dnf repoquery --qf output; the last
+// line wins when one name appears per architecture or build (highest EVR
+// last, as both print them).
+export function parseProviderLines(stdout) {
+  let found = null;
+  for (const line of stdout.split('\n')) {
+    const [name, version] = line.split('\t');
+    if (name && version && pkgName.safeParse(name.trim()).success) found = { name: name.trim(), version: version.trim() };
+  }
+  return found;
+}
+
+// Remi ships phpredis as php-pecl-redis6 / php83-php-pecl-redis6 and Imagick
+// as php-pecl-imagick-im7: those only Provide the unversioned names the
+// catalog asks for. `rpm -q` and `dnf list` match NAME, `dnf install` resolves
+// Provides, so a name neither answered is looked up by capability, one call
+// per name so the provider is attributable (the capability never starts with
+// "-", pkgName makes sure, and must not follow "--": dnf's option takes it).
+const PROVIDES_LOOKUPS = 50;
+async function providerOf(pm, name) {
+  const rpm = await exec('rpm', ['-q', '--whatprovides', '--qf', '%{NAME}\t%{VERSION}-%{RELEASE}\n', '--', name], { allowFailure: true });
+  const installed = rpm.code === 0 ? parseProviderLines(rpm.stdout) : null;
+  if (installed && installed.name !== name) return { installed: installed.version, candidate: null, origin: null, provider: installed.name };
+  const repo = await exec(pm.binary, ['-q', '-C', 'repoquery', '--qf', '%{name}\t%{version}-%{release}\n', `--whatprovides=${name}`], { allowFailure: true, timeoutMs: 120_000, maxBuffer: BIG });
+  const candidate = repo.code === 0 ? parseProviderLines(repo.stdout) : null;
+  if (candidate && candidate.name !== name) return { installed: null, candidate: candidate.version, origin: null, provider: candidate.name };
+  return null;
+}
+
 // Installed / candidate / origin for several names in two package-manager
-// calls at most (pkg.available asks per name; a branch install asks for 13).
-async function packageOffers(pm, names) {
+// calls at most (pkg.available asks per name; a branch install asks for 13);
+// `provides: true` adds the per-name capability lookup for what both missed.
+export async function packageOffers(pm, names, { provides = false } = {}) {
   if (!names.length) return {};
   if (pm.family === 'debian') {
     return parseAptPolicyBlocks((await exec('apt-cache', ['policy', '--', ...names], { allowFailure: true, env: APT_ENV, timeoutMs: 120_000, maxBuffer: BIG })).stdout);
@@ -1237,6 +1270,12 @@ async function packageOffers(pm, names) {
   }
   const listed = parseDnfList((await exec(pm.binary, ['-q', '-y', 'list', '--', ...names], { allowFailure: true, timeoutMs: 300_000, maxBuffer: BIG })).stdout);
   for (const [name, e] of Object.entries(listed)) out[name] = { installed: out[name]?.installed ?? e.installed, candidate: e.candidate, origin: e.origin };
+  if (provides) {
+    for (const name of names.filter((n) => !isOffered(out[n])).slice(0, PROVIDES_LOOKUPS)) {
+      const found = await providerOf(pm, name);
+      if (found) out[name] = found;
+    }
+  }
   return out;
 }
 const isOffered = (e) => Boolean(e && (e.installed || e.candidate));
@@ -1244,14 +1283,14 @@ const isOffered = (e) => Boolean(e && (e.installed || e.candidate));
 // The package catalog asks about ~150 names per page load; pkg.available's
 // one-call-per-name probe would take seconds, this is one apt-cache / dnf call.
 defineOp('pkg.offers', {
-  description: 'Installed version, candidate version and origin of several package names in one package-manager call',
+  description: 'Installed version, candidate version, origin and (RHEL) providing package of several package names in one package-manager call',
   timeoutMs: 300_000,
   schema: z.object({ packages: z.array(pkgName).min(1).max(300) }).strict(),
   run: async ({ packages }) => {
     const pm = requireManager();
     const names = [...new Set(packages)];
-    const offers = await packageOffers(pm, names);
-    return { manager: pm.manager, packages: Object.fromEntries(names.map((n) => [n, { installed: offers[n]?.installed ?? null, candidate: offers[n]?.candidate ?? null, origin: offers[n]?.origin ?? null, offered: isOffered(offers[n]) }])) };
+    const offers = await packageOffers(pm, names, { provides: true });
+    return { manager: pm.manager, packages: Object.fromEntries(names.map((n) => [n, { installed: offers[n]?.installed ?? null, candidate: offers[n]?.candidate ?? null, origin: offers[n]?.origin ?? null, provider: offers[n]?.provider ?? null, offered: isOffered(offers[n]) }])) };
   },
 });
 

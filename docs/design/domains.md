@@ -18,10 +18,20 @@ landing vhost and the catch-all default vhost).
 
 A custom `docroot` must be an absolute path inside the account home, in the agent's path alphabet
 (letters, digits, `. _ - ~ + @ =`, `/`, no `..`, no spaces or quotes), not the home, not one of the
-account's reserved directories (`public_html`, `mail`, `etc`, `tmp`, `logs`, `ssl`, `.ssh`) and not
-the document root of another addon/sub domain of the account. The server hostname and
+account's reserved directories (`public_html`, `mail`, `etc`, `tmp`, `logs`, `ssl`, `.ssh`), not
+the document root of another addon/sub domain of the account and not a directory that *holds*
+another domain's document root (409: `rm -rf` of it would take that site; a directory *below*
+another site's root, the `public_html` layout itself, is fine). The server hostname and
 `www.<hostname>` are refused everywhere (`ctx.web.isServerName`); a name hosted by any account is
 refused (409); `www.` names are refused because every vhost already answers for its `www.` alias.
+
+**Who may claim a name** (`assertClaimable`, the rule DNS Functions' `parkDomain` applies to parked
+names, run for every type before any host step): for a non-root caller the name must not be a label
+under the server hostname (`ns1.<hostname>`, `mail.<hostname>`: only root hosts names there), the
+account hosting the name or any parent label of it (`accounts.domain`, `account_domains.domain`,
+nearest label first) must be the target account, and a DNS zone of exactly that name owned by
+another account is never handed over (`ensureZoneForDomain` would reassign it). Root may still move
+a name or a zone between accounts.
 
 Package limits (`max_addons`, `max_subdomains`, `max_parked` in the plan snapshot) bind resellers;
 root is not limited. Resellers reach only the accounts they own (`load(username, user)` in the
@@ -39,9 +49,11 @@ Restores and transfers deliberately do **not** re-render the index page: they br
 files back and an index page would overwrite content. Only creation renders it.
 
 Removal (`domains.remove(username, domain, { deleteFiles })`) deletes the files only when asked, only
-for addon/sub domains, only when no other domain of the account shares the directory, and only as the
-account (`web.docroot.remove`: `runuser -u <user> -- rm -rf <docroot>`, never the home, `public_html` or
-a reserved directory). Root never writes or removes anything below a home it does not own.
+for addon/sub domains, only when no other domain of the account lives in the directory (a document
+root equal to it or anywhere below it, `public_html` included: `rm -rf` would take that site too), and
+only as the account (`web.docroot.remove`: `runuser -u <user> -- rm -rf <docroot>`, never the home,
+`public_html` or a reserved directory). Root never writes or removes anything below a home it does
+not own.
 
 ## Virtual hosts
 
@@ -60,16 +72,28 @@ Two vhosts belong to no account:
   hostname change, when the `landing` template is saved and by the re-render job.
 - **The catch-all default vhost** (`ctx.web.ensureDefaultVhost`, agent `web.default_vhost.write`):
   the owner's finding "no custom landing page on the IP address". Written right after the hostname
-  vhost every time it runs, and again whenever the hostname's certificate is installed or removed
-  through `ctx.web.applySsl` / `removeSsl`. Debian: `sites-available/000-whm-default.conf` (+ its
-  `sites-enabled` link; the stock `000-default` site is disabled with `a2dissite`, re-enabled if the
-  configtest rejects ours). RHEL: `conf.d/00-whm-default.conf`, which sorts ahead of `ssl.conf`'s
-  `_default_:443` and `welcome.conf`. It is
+  vhost every time it runs, whenever the hostname's certificate is installed or removed through
+  `ctx.web.applySsl` / `removeSsl`, at the end of `setListenPorts`, `replaceIp` and `setAccountIpv6`
+  (a port, bind or address change would otherwise leave it on the old ones until the next boot), and
+  after any `ensureVhost` whose address set differs from the one recorded for the catch-all
+  (`service_config_applies.default_vhost.summary.addresses`). Its place in the load order is
+  structural, never lexical: a tenant file such as `0-0.com.conf`, `0.io.conf` or `00.net.conf` sorts
+  before any digit-led name. Debian: `conf-available/000-whm-default.conf` + its `conf-enabled` link,
+  which `apache2.conf` includes before `sites-enabled/*.conf` (a copy an earlier panel left under
+  `sites-available`/`sites-enabled` is removed on the next write; the stock `000-default` site is
+  disabled with `a2dissite`, re-enabled if the configtest rejects ours). RHEL, where `conf.d/*.conf`
+  is the only glob: `conf.d/+whm-default.conf` (`+` is 0x2B, below `-`, `.` and every character a
+  domain may start with), ahead of `ssl.conf`'s `_default_:443` and `welcome.conf`. It is
   `<VirtualHost _default_:80 <every tenant address>:80>` and the same on the HTTPS port inside
   `<IfModule ssl_module>`: Apache picks the first vhost of the most specific address set, so a plain
   `_default_` would never beat an IP-specific tenant vhost for the bare IP; listing every address the
   tenant vhosts bind to (`web_vhosts.ip`/`ipv6`, the main/shared addresses, `ip_addresses`) makes the
-  catch-all the first vhost of every set. `ServerName default.invalid` so it never steals the hostname
+  catch-all the first vhost of every set. The reverse holds too: Apache consults no `*:80` vhost for
+  a connection whose address another vhost names, so a tenant vhost is never rendered on `*` while
+  an address is known (`specsFor`: the account's IP, else the shared, else the main address, as
+  account creation picks it), and while a tenant row still has no address (written before any was
+  known) the catch-all stays a plain `_default_` until the next sync binds that row.
+  `ServerName default.invalid` so it never steals the hostname
   from the hostname vhost. Docroot `/var/www/whm-default` (the landing page), `AllowOverride None`, no
   PHP, no redirect (a redirect of `http://<ip>/` to HTTPS would end on a certificate warning). The
   certificate on 443: the hostname's bundle when installed, else the first pair the panel controls —
@@ -85,9 +109,14 @@ Two vhosts belong to no account:
 `domains.add` publishes through DNS Functions (`ctx.dns`): an addon gets its own zone
 (`ensureZoneForDomain(domain, { ip, accountId, nameservers })`, the reseller's nameservers when it
 has some); a sub domain gets an `A` record in the zone that contains it (`zoneFor` +
-`upsertRecords(zone, name, 'A', [{ value: ip }])`) or its own zone when no zone holds it; a parked
-domain's zone is `parkDomain`'s. BIND absent keeps the zone/record recorded and `pending`. Removal
-deletes an addon's zone (`deleteZone`), a sub's `A` records (or its own zone), and `unparkDomain`
+`upsertRecords(zone, name, 'A', [{ value: ip }])`) **only when that zone belongs to the same
+account** (`zoneFor` carries `account_id`; `upsertRecords` has no owner check of its own) — a
+containing zone of another account leaves the step `skipped` with the reason, root excepted — or
+its own zone when no zone holds it; a parked domain's zone is `parkDomain`'s. A zone of exactly the
+added name that another account owns is refused up front (403, see *who may claim a name*) and, as a
+second line, reported `failed` by the DNS step instead of being reassigned. BIND absent keeps the
+zone/record recorded and `pending`. Removal deletes an addon's zone (`deleteZone`, owner-checked in
+DNS Functions), a sub's `A` records (same owner rule as above) or its own zone, and `unparkDomain`
 handles parked names. Mail routing follows: addon/sub domains are added to Exim's local domains
 (`ctx.mail.setRouting(domain, 'local')`) and set back to `remote` on removal.
 

@@ -1168,6 +1168,40 @@ export function scrubSecrets(text, config) {
   return out;
 }
 
+export function parseRcloneVersion(stdout) {
+  const m = /^rclone v(\d+)\.(\d+)/m.exec(String(stdout || ''));
+  return m ? { major: Number(m[1]), minor: Number(m[2]) } : null;
+}
+
+// The installed rclone version, probed when a backend renders differently
+// across versions and remembered for a while (the package may be upgraded
+// while the agent runs). Unknown when the probe fails.
+const RCLONE_VERSION_TTL_MS = 10 * 60_000;
+let rcloneVersionCache = null;
+export function resetRcloneVersion() { rcloneVersionCache = null; }
+async function rcloneVersion() {
+  if (rcloneVersionCache && rcloneVersionCache.until > Date.now()) return rcloneVersionCache.version;
+  let version = null;
+  try { version = parseRcloneVersion((await exec('rclone', ['version'], { timeoutMs: 15_000 })).stdout); } catch { version = null; }
+  rcloneVersionCache = { version, until: Date.now() + RCLONE_VERSION_TTL_MS };
+  return version;
+}
+
+// rclone 1.61 takes the Azure service URL as `endpoint`; 1.60 (the apt package
+// of Debian 12 and Ubuntu 24.04) composes https://<account>.<endpoint> itself,
+// so the operator's URL is reduced to the bare domain for it. The SAS form
+// carries the URL in sas_url and works on both.
+async function azureEndpointValue(config) {
+  const version = await rcloneVersion();
+  if (!version || version.major > 1 || (version.major === 1 && version.minor >= 61)) return config.endpoint;
+  const u = new URL(config.endpoint);
+  const prefix = `${config.account}.`;
+  if (u.protocol !== 'https:' || !u.host.startsWith(prefix) || u.host.length === prefix.length || (u.pathname !== '/' && u.pathname !== '') || u.search) {
+    throw new OpError('unsupported', `rclone ${version.major}.${version.minor} reaches a custom Azure endpoint with an account key only as https://${config.account}.<domain>; use a SAS token for ${config.endpoint} or install rclone 1.61 or later`);
+  }
+  return u.host.slice(prefix.length);
+}
+
 // Backend section of the rendered config plus the path inside it that holds
 // the archives (`root`). Files needed by the backend (SSH key, pinned
 // known_hosts) are written into `dir`, which the caller removes.
@@ -1205,6 +1239,8 @@ async function rcloneBackend(config, dir, ctx) {
     case 'gdrive':
       s.type = 'drive'; s.scope = 'drive.file'; s.client_id = config.clientId; s.client_secret = config.clientSecret; s.token = oauthToken(config.refreshToken);
       if (config.rootFolderId) s.root_folder_id = config.rootFolderId;
+      // Pruned archives must leave the account, not move to its trash.
+      s.use_trash = 'false';
       root = joinRemote(config.folder);
       break;
     case 'onedrive':
@@ -1220,12 +1256,14 @@ async function rcloneBackend(config, dir, ctx) {
       const endpoint = (config.endpoint || `https://${config.account}.blob.core.windows.net`).replace(/\/+$/, '');
       if (config.accountKey) s.key = config.accountKey;
       else s.sas_url = `${endpoint}/${config.container}?${String(config.sasToken).replace(/^\?/, '')}`;
-      if (config.endpoint) s.endpoint = config.endpoint;
+      if (config.endpoint) s.endpoint = config.accountKey ? await azureEndpointValue(config) : config.endpoint;
       root = joinRemote(config.container, config.prefix);
       break;
     }
     case 'b2':
       s.type = 'b2'; s.account = config.keyId; s.key = config.applicationKey;
+      // A pruned archive is deleted, not hidden as a stored (and billed) version.
+      s.hard_delete = 'true';
       root = joinRemote(config.bucket, config.prefix);
       break;
     default: throw new OpError('unsupported', `${config.kind} has no rclone backend`);
@@ -1290,8 +1328,13 @@ function rcloneFailure(result, what, config) {
   const line = result.stderr.trim().split('\n').map((l) => l.trim()).filter(Boolean).pop() || '';
   const reason = RCLONE_CODES[result.code] || `rclone exited with status ${result.code}`;
   const detail = scrubSecrets(line.replace(/^\d{4}\/\d\d\/\d\d \d\d:\d\d:\d\d\s+(ERROR|NOTICE|INFO|DEBUG)?\s*:?\s*/, ''), config).slice(0, 500);
-  return new OpError('destination_failed', `${what}: ${reason}${detail ? ` (${detail})` : ''}`, { exitCode: result.code });
+  return new OpError('destination_failed', `${what}: ${reason}${detail ? ` (${detail})` : ''}`, { exitCode: result.code, detail });
 }
+
+// rclone 1.60 reports an absent file from deletefile as a plain error (exit 1,
+// "is a directory or doesn't exist"); 1.61 and later as file not found (exit 4).
+const MISSING_FILE = /is a directory or doesn't exist|object not found|file not found/i;
+const isMissingFile = (err) => err.code === 'destination_failed' && ([3, 4].includes(err.details?.exitCode) || ([1, 2].includes(err.details?.exitCode) && MISSING_FILE.test(err.details?.detail || '')));
 
 export function parseLsjson(stdout) {
   let entries;
@@ -1313,7 +1356,14 @@ async function rclone(config, argv, ctx, { what, timeoutMs = 600_000 } = {}) {
     const cache = path.join(dir, 'cache');
     fs.mkdirSync(cache, { mode: 0o700 });
     const args = ['--config', confFile, '--cache-dir', cache, '--contimeout', '30s', '--timeout', '5m', '--retries', '3', '--retries-sleep', '5s', '--low-level-retries', '10', '--stats', '0', '--log-level', 'ERROR', ...backend.flags, ...argv(conf.root)];
-    const r = await exec('rclone', args, { allowFailure: true, timeoutMs: timeoutMs + 5000, maxBuffer: 64 * 1024 * 1024, env: { HOME: dir } });
+    let r;
+    try {
+      r = await exec('rclone', args, { allowFailure: true, timeoutMs: timeoutMs + 5000, maxBuffer: 64 * 1024 * 1024, env: { HOME: dir } });
+    } catch (err) {
+      // A killed or unstartable rclone carries its raw stderr and argv on the
+      // ExecError; only a scrubbed message leaves the agent.
+      throw new OpError(err.code === 'timeout' ? 'timeout' : 'destination_failed', `${what}: ${scrubSecrets(err.message, config)}`, { exitCode: null });
+    }
     let tokenUpdate = null;
     try { tokenUpdate = readTokenUpdate(fs.readFileSync(confFile, 'utf8'), config); } catch { tokenUpdate = null; }
     if (r.code !== 0) throw rcloneFailure(r, what, config);
@@ -1412,7 +1462,7 @@ defineOp('backup.rclone.delete', {
       const r = await rclone(config, (root) => ['deletefile', rcloneTarget(root, remoteName)], ctx, { what: `delete on ${config.kind}`, timeoutMs: 300_000 });
       return { kind: config.kind, name: remoteName, removed: true, tokenUpdate: r.tokenUpdate };
     } catch (err) {
-      if (err.code === 'destination_failed' && (err.details?.exitCode === 3 || err.details?.exitCode === 4)) return { kind: config.kind, name: remoteName, removed: false, tokenUpdate: null };
+      if (isMissingFile(err)) return { kind: config.kind, name: remoteName, removed: false, tokenUpdate: null };
       throw err;
     }
   },

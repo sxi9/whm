@@ -23,7 +23,7 @@ vi.mock('../src/hooks/useApi.js', () => ({
   useMutation: (fn) => ({ mutate: fn, loading: false, error: null, fieldErrors: null, reset() {} }),
 }));
 
-const { PackageCatalog, CatalogEntryCard, SearchResults, installDistroHref, catalogEntryState, canInstallEntry, variantLabel, INSTALL_DISTRO_PATH } = await import('../src/pages/software/PackageCatalog.jsx');
+const { PackageCatalog, CatalogEntryCard, SearchResults, installDistroHref, catalogEntryState, canInstallEntry, installLabel, variantLabel, INSTALL_DISTRO_PATH } = await import('../src/pages/software/PackageCatalog.jsx');
 const { default: InstallDistroPackages } = await import('../src/pages/fn/software/install-distro-packages.jsx');
 const { StaticCatalog, catalogHref } = await import('../src/pages/fn/server-configuration/whm-marketplace.jsx');
 
@@ -37,6 +37,8 @@ const NGINX = entry('nginx', 'web', { label: 'NGINX (reverse proxy)', configure:
 const REDIS = entry('redis', 'databases', { label: 'Redis server', recommended: true, packages: [pkg('redis-server')] });
 const NETDATA = entry('netdata', 'monitoring', { label: 'Netdata', requires: 'Needs the EPEL repository.', packages: [pkg('netdata', { offered: false, candidate: null })], offered: false, missing: ['netdata'] });
 const ARCHIVERS = entry('archivers', 'tools', { label: 'Archive tools', packages: [pkg('zip', { installed: true, version: '3.0' }), pkg('unzip')], partial: true });
+// AlmaLinux without EPEL: mod_security is in AppStream, the rule set is not.
+const MODSEC = entry('modsecurity', 'security', { label: 'ModSecurity', requires: 'Needs the EPEL repository.', packages: [pkg('mod_security'), pkg('mod_security_crs', { offered: false, candidate: null })], offered: false, missing: ['mod_security_crs'] });
 const PHP_REDIS = entry('php-redis', 'php', { label: 'Redis client', recommended: true, packages: [pkg('php8.3-redis'), pkg('php8.2-redis', { installed: true, version: '6.0.2' })], partial: true, php: { unversioned: false, versions: [{ id: '8.3', label: 'PHP 8.3', name: 'php8.3-redis', installed: false, version: null, offered: true, candidate: '1.0-1' }, { id: '8.2', label: 'PHP 8.2', name: 'php8.2-redis', installed: true, version: '6.0.2', offered: true, candidate: null }] } });
 const CATALOG = {
   manager: 'apt', family: 'debian', phpVersions: [{ id: '8.3', label: 'PHP 8.3', layout: 'debian' }, { id: '8.2', label: 'PHP 8.2', layout: 'debian' }], installedTotal: 812, offersKnown: true, offersAt: Date.now(), entries: 6, total: 6,
@@ -110,6 +112,15 @@ describe('catalog entry state', () => {
     expect(canInstallEntry(REDIS)).toBe(true);
     expect(canInstallEntry(NETDATA)).toBe(false);
     expect(canInstallEntry({ ...REDIS, offered: null })).toBe(true);
+    // Partly offered: the job installs the offered names and skips the rest, so Install stays, labelled for it.
+    expect(canInstallEntry(MODSEC)).toBe(true);
+    expect(installLabel(MODSEC, false)).toBe('Install what is offered');
+    expect(canInstallEntry({ ...ARCHIVERS, packages: [pkg('zip', { installed: true, version: '3.0' }), pkg('unzip', { offered: false, candidate: null })], offered: false, missing: ['unzip'] })).toBe(false);
+    expect(installLabel(REDIS, false)).toBe('Install');
+    expect(installLabel(ARCHIVERS, false)).toBe('Install the rest');
+    expect(installLabel(PHP_REDIS, true)).toBe('Install for the rest');
+    expect(installLabel({ ...PHP_REDIS, partial: false }, true)).toBe('Install for all versions');
+    expect(installLabel({ ...PHP_REDIS, missing: ['php8.2-redis'] }, true)).toBe('Install what is offered');
     expect(variantLabel('dev')).toBe('development files');
     expect(variantLabel('php binding')).toBe('php binding');
     expect(variantLabel(undefined)).toBe('variant');
@@ -168,6 +179,16 @@ describe('PackageCatalog', () => {
     expect(html).toContain('Redis server');
     expect(html).toContain('<code');
     expect(html).toContain('redis-server');
+  });
+
+  it('keeps Install on a partly offered card, says what it installs and which names the repositories lack', () => {
+    const html = render(<CatalogEntryCard entry={MODSEC} onInstall={() => {}} />);
+    expect(html).toContain('>partly offered<');
+    expect(html).toContain('>Install what is offered<');
+    expect(html).toContain('Not offered by the configured repositories: mod_security_crs.');
+    expect(html).toContain('Needs the EPEL repository.');
+    expect(html).toContain('line-through');
+    expect(html).not.toContain('>Install<');
   });
 });
 

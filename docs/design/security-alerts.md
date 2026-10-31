@@ -9,12 +9,14 @@ what the panel now does, the events, the settings, the delivery rules and what i
 | Piece | Where |
 |---|---|
 | Service `ctx.securityAlerts` | `server/src/services/security-alerts.js` (created by the Server Contacts module, after `ctx.contacts`) |
-| Table `security_alerts` + `security_alert_deliveries`, settings defaults | migration `037_security-alerts.sql` |
-| Job `security.alerts.deliver` | registered in `routes/categories/server-contacts.js`; pending alerts found at boot are scheduled again |
+| Table `security_alerts` + `security_alert_deliveries`, settings defaults | migration `037_security-alerts.sql`; `037b_security-alerts-root-mail.sql` adds `security.alert` to `contacts.root_mail_events` once (idempotent, keeps an operator's list) so a fresh install mails root |
+| Job `security.alerts.deliver` | registered in `routes/categories/server-contacts.js`; pending alerts found at boot are scheduled again; runs are serialised inside the service (the job worker runs two jobs at once) |
+| Schedule `panel-update-check` (`23 6 * * *`, job `software.panel.check`) | ensured by `services/software.js`; enabled only while `software.update_url` is set (`panel.updateSettings` toggles it); the job skips without a URL |
 | Routes (root only) | `/api/server-contacts/security-alerts` (overview), `/alerts?limit`, `PUT /settings`, `POST /test`, `POST /raise`, `POST /deliver` |
 | Contacts event | `security.alert` (group Security, default severity critical) in `server-contacts.js` `EVENTS`, routable per contact and through Edit System Mail Preferences (root mail) |
 | UI | Contact Manager › "Security notifications" card (`client/src/pages/contacts/SecurityAlerts.jsx`), Security Advisor › "Alerts" panel |
-| Hooks | `security-center.js` `advisor.scan()`, `software.js` `update.checkJob()`, `update.runJob()`, `panel.check()` |
+| Hooks | `security-center.js` `advisor.scan()`, `software.js` `update.checkJob()`, `update.runJob()`, `panel.check()` (manual "Check now" and the scheduled `panel.checkJob()`) |
+| Recipient changes | `server-contacts.js` `create/update/setMailPreferences` call `ctx.securityAlerts.recipientsChanged()`: alerts that found nobody to tell are flushed once a contact subscribes or root mail is routed |
 
 ## Kinds (what raises an alert)
 
@@ -22,11 +24,17 @@ what the panel now does, the events, the settings, the delivery rules and what i
 |---|---|---|---|---|
 | `advisor.critical` | Security Advisor scan: every finding graded `critical` that was **not** critical in the previous run | critical | admins | `advisor:<finding id>` |
 | `php.advisory` | the same scan, for `php.advisory.<CVE>` findings (an advisory from `security.advisories` matched an installed PHP version) | critical | admins | `advisor:php.advisory.<CVE>` |
-| `updates.security_available` | `software.update.check` (nightly `os-update-check`, "Check now") when the simulation lists security updates | warning | admins | `updates.security_available:<sha256 of the sorted security package names>` — a new set alerts at once, the same set at most once per 24 h |
+| `updates.security_available` | `software.update.check` (nightly `os-update-check`, "Check now") when the simulation lists security updates **and** a package or candidate version is new since the last alerted set (`software.updates.security_alerted`, kept apart from `last_check` because page loads rewrite that; cleared when no security update is pending) — an unapplied set is alerted when it appears, not every other night | warning | admins | `updates.security_available:<sha256 of the sorted security package names>` — the same set at most once per 24 h |
 | `updates.security_applied` | `software.system.update` when the packages it upgraded include security updates (auto-apply or a manual run) | critical | **all** | `updates.security_applied:<job id>` |
-| `panel.security_release` | `software.panel.check()` when the feed's release carries `security: true` (or `tags: ["security"]`) and is newer than the running version | critical | admins | `panel.security_release:<version>` |
-| `manual` | an administrator, Contact Manager › Send a notice | critical (chosen) | **all** (chosen per notice) | random |
-| `test` | Contact Manager › Send a test alert | info (bypasses the minimum) | **all** only when "Test with accounts too" is confirmed | random |
+| `panel.security_release` | `software.panel.check()` — the manual "Check now" and the daily schedule `panel-update-check` — when the feed's release carries `security: true` (or `tags: ["security"]`) and is newer than the running version | critical | admins | `panel.security_release:<version>` |
+| `manual` | an administrator, Contact Manager › Send a notice | critical (chosen) | **all** (chosen per notice, stored as `data.notifyAccounts`) | random |
+| `test` | Contact Manager › Send a test alert | info (bypasses the minimum) | **all** only when "Test with accounts too" is confirmed (stored as `data.notifyAccounts`) | random |
+
+**Security flag per package manager.** The agent marks a pending update as security from the repository
+name (`/security/i`): Debian/Ubuntu (`Debian-Security`, `noble-security`) work; on the RHEL family
+(`dnf check-update` prints `baseos`/`appstream`/`epel`) nothing is flagged, so
+`updates.security_available` / `updates.security_applied` fire only on apt hosts until
+`pkg.upgradable` consults `dnf updateinfo list --security` (integrator item in `agent/src/ops/pkg.js`).
 
 `raise({ kind, severity?, title, body, dedupeKey, source?, data? })` is synchronous and idempotent:
 a key seen within the last 24 h returns the existing alert (`deduped: true`); an older row with the same
@@ -44,7 +52,9 @@ The feed field `latest.security` (boolean) is new in `software.panel.status()`; 
 | `security.alerts.notify_accounts` | `false` | On: audience-"all" alerts are mailed to the contact address of every **active** hosting account (`accounts.suspended = 0`, usable `contact_email`). |
 | `security.alerts.min_severity` | `critical` | Alerts below it are recorded with state `skipped` and never delivered (test and manual notices bypass it). |
 | `security.alerts.digest_minutes` | `60` | After a delivery, alerts raised inside this window are `held` and sent together as one digest when the window closes (an unref'd timer; pending rows are re-scheduled at boot). `0` delivers every alert at once. |
-| `security.alerts.last_delivery_at` | — | Written by the job; the digest window counts from it. |
+| `security.alerts.last_delivery_at` | — | Written by the job when administrators were addressed; the digest window counts from it. |
+| `contacts.root_mail_events` | includes `security.alert` (037b) | Root mail receives every alert out of the box; Edit System Mail Preferences changes it. |
+| `software.updates.security_alerted` | — | Written by `software.update.check`: `{ at, entries: ["<name> <candidate>", …] }` of the last alerted security set. |
 
 ## Delivery rules
 
@@ -56,15 +66,25 @@ The feed field `latest.security` (boolean) is new in `software.panel.status()`; 
      per run (a digest when several alerts are pending). Contacts subscribed to `security.alert` or to
      all events, at or above their minimum severity, receive it on their channel; root mail follows
      `contacts.root_mail_events`. The result (`matched/sent/failed`) is stored in `admin_result_json`,
-     `notified_admins_at` is set, the state becomes `sent` (or `failed` when notify threw).
+     `notified_admins_at` is set, the state becomes `sent` (or `failed` when notify threw). When no
+     contact matched and root mail was not sent (`matched = 0`, no delivery attempted), the alert is
+     **not** delivered: `admin_result_json` records `skipped: no_recipients`, the state stays `pending`,
+     `notified_admins_at` and `last_delivery_at` are left alone, the card shows it as waiting, and the
+     next flush (boot, a raise, "Deliver now", or `recipientsChanged()` from the contacts service) retries.
+   - Runs are serialised in the service: a flush enqueued while another runs waits for it and then
+     re-reads the pending rows, so administrators never receive the same alert twice.
    - **Accounts:** only when `notify_accounts` is on (or the test/notice asked for it) and only for
-     alerts whose kind has audience `all`. Recipients are grouped by address, processed in chunks of 25
+     alerts whose kind has audience `all`. A test or notice carries the administrator's own choice on the
+     row (`data.notifyAccounts`); a generic flush honours it per alert instead of the global setting, so
+     a restart or a digest flush never mails every account a test or an admin-only notice.
+     Recipients are grouped by address, processed in chunks of 25
      with a 500 ms pause between chunks, one mail per address through `ctx.contacts.mail` (Exim or the
      SMTP relay). `security_alert_deliveries (alert_id, account_id)` is unique: a claim row is inserted
      before the send, so an account is never mailed twice for the same alert (a `failed` row may be
      retried by a later run, a `sent` one never). Without a mail transport the step is recorded as
      `skippedReason: no_mail_transport`. Admin-only kinds are recorded as `skipped: admins_only`.
-   - `security.alerts.last_delivery_at` is set; an audit row `security.alerts.deliver` records counts.
+   - `security.alerts.last_delivery_at` is set when administrators were addressed; an audit row
+     `security.alerts.deliver` records counts.
 3. Alerts older than 180 days that are no longer pending are pruned on the next `raise()`.
 
 ## Templates (`renderMail`, exported for tests)

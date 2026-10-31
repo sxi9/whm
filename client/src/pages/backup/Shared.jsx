@@ -178,6 +178,13 @@ const EMPTY = {
 
 export function emptyDestination(kind) { return { kind, ...EMPTY[kind] }; }
 
+// Form state for an existing destination: the stored configuration over the
+// kind's defaults, with the encryption toggle taken from the row's actual state
+// (a destination from before encryption existed carries no `crypt` key).
+export function destinationFormState(d) {
+  return { ...emptyDestination(d.kind), ...Object.fromEntries(Object.entries(d.config || {}).filter(([k]) => !k.startsWith('has_'))), kind: d.kind, crypt: Boolean(d.encrypted) };
+}
+
 const SECRET_FIELDS = ['password', 'secretKey', 'privateKey', 'accountKey', 'sasToken', 'applicationKey'];
 
 // Strips blanks the API would reject and keeps the shape of the agent schema.
@@ -271,7 +278,7 @@ export function DestinationFields({ value, onChange, errors = {}, editing = fals
       )}
       {editing && value.crypt
         ? <Field inline><span className="pill pill-ok">Encrypted at rest</span> <span className="muted">Archives on this destination are encrypted (rclone crypt). Encryption cannot be turned off.</span></Field>
-        : <Field inline><Toggle checked={encryptionOn(value)} onChange={(v) => set('crypt', v)} label="Encrypt archives at rest (recommended)" description="File names and contents are encrypted before they leave the server (rclone crypt). A key is generated and shown once after saving; keep a copy. It cannot be turned off later." /></Field>}
+        : <Field inline><Toggle checked={editing ? Boolean(value.crypt) : encryptionOn(value)} onChange={(v) => set('crypt', v)} label="Encrypt archives at rest (recommended)" description="File names and contents are encrypted before they leave the server (rclone crypt). A key is generated and shown once after saving; keep a copy. It cannot be turned off later." /></Field>}
     </div>
   );
 }

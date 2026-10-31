@@ -829,7 +829,7 @@ describe('Account Functions API', () => {
         landingDocroot: '/var/www/whm-default',
       };
       app.ctx.dns = {
-        zoneFor: (name) => { const z = zoneContaining(name); return z ? { domain: z } : null; },
+        zoneFor: (name) => { const z = zoneContaining(name); return z ? { domain: z, account_id: zones.get(z) ?? null } : null; },
         ensureZoneForDomain: async (domain, opts) => { order.push('dns'); calls.dns.push(['ensure', domain, opts]); zones.set(domain, opts.accountId); return { domain, applied: true, created: true, serial: 2026103001 }; },
         upsertRecords: async (zone, name, type, values) => { order.push('dns'); calls.dns.push(['upsert', zone, name, type, values]); return { applied: true }; },
         deleteZone: async (domain) => { order.push('dns'); calls.dns.push(['delete', domain]); zones.delete(domain); return { domain, removed: true }; },
@@ -1025,6 +1025,122 @@ describe('Account Functions API', () => {
       expect(mine.body.data.limits.addon).toEqual({ used: 2, max: 1 });
       expect((await resellerHttp.delete('/api/account-functions/domains/bob/r2.example').set('X-CSRF-Token', resellerCsrf)).status).toBe(200);
       expect((await resellerHttp.delete('/api/account-functions/domains/alice/shop.alice.com').set('X-CSRF-Token', resellerCsrf)).status).toBe(403);
+    });
+
+    const del = (path) => app.http.delete(`/api/account-functions${path}`).set('X-CSRF-Token', csrf);
+    const rdel = (path) => resellerHttp.delete(`/api/account-functions${path}`).set('X-CSRF-Token', resellerCsrf);
+    const accountId = (username) => app.ctx.db.prepare('SELECT id FROM accounts WHERE username = ?').get(username).id;
+    const rows = (domain) => app.ctx.db.prepare('SELECT COUNT(*) AS n FROM account_domains WHERE domain = ?').get(domain).n;
+
+    it('a reseller cannot claim a label under another owner\'s domain, a name under the server hostname, or a name whose zone another account owns; root can', async () => {
+      // alice (root's) hosts alice.com; bob is resell1's. parkDomain refuses this for parked names; addon/sub must too.
+      for (const type of ['addon', 'sub', 'parked']) {
+        const res = await rpost('/domains/bob', { domain: 'store.alice.com', type });
+        expect(res.status, type).toBe(403);
+        expect(res.body.error.message).toMatch(/another reseller/);
+      }
+      expect(order).toEqual([]);
+      expect(calls.dns).toEqual([]);
+      expect(rows('store.alice.com')).toBe(0);
+      // Only the exact hostname and www. are refused for root; every label under it is for non-root.
+      for (const name of ['ns1.panel.example.com', 'mail.panel.example.com']) {
+        const res = await rpost('/domains/bob', { domain: name, type: 'addon' });
+        expect(res.status, name).toBe(403);
+        expect(res.body.error.message).toMatch(/server hostname/);
+      }
+      expect(order).toEqual([]);
+      expect(rows('ns1.panel.example.com')).toBe(0);
+      const asRoot = await post('/domains/alice', { domain: 'ns1.panel.example.com', type: 'addon', autossl: false });
+      expect(asRoot.status, JSON.stringify(asRoot.body)).toBe(201);
+      await del('/domains/alice/ns1.panel.example.com').expect(200);
+      // A DNS-only zone of another account (no account_domains row) is never handed over by a reseller's add.
+      reset();
+      zones.set('dnsonly.example', accountId('alice'));
+      const zoneTaken = await rpost('/domains/bob', { domain: 'dnsonly.example', type: 'addon' });
+      expect(zoneTaken.status).toBe(403);
+      expect(zoneTaken.body.error.message).toMatch(/zone/);
+      expect(zones.get('dnsonly.example')).toBe(accountId('alice'));
+      expect(calls.dns).toEqual([]);
+      expect(app.agent.callsTo('web.docroot.ensure')).toEqual([]);
+      expect(rows('dnsonly.example')).toBe(0);
+      // Root may still assign it (ensureZoneForDomain moves the zone to bob).
+      const moved = await post('/domains/bob', { domain: 'dnsonly.example', type: 'addon', autossl: false });
+      expect(moved.status, JSON.stringify(moved.body)).toBe(201);
+      expect(moved.body.data.steps.dns.status).toBe('applied');
+      expect(zones.get('dnsonly.example')).toBe(accountId('bob'));
+      await del('/domains/bob/dnsonly.example').expect(200);
+      expect(zones.has('dnsonly.example')).toBe(false);
+    });
+
+    it('a sub domain never writes into, or deletes from, a zone of another account: the DNS step is skipped and the zone untouched; root may', async () => {
+      const aliceId = accountId('alice');
+      const bobIp = app.ctx.db.prepare('SELECT ip FROM accounts WHERE username = ?').get('bob').ip || '203.0.113.10';
+      zones.set('alicezone.example', aliceId);
+      // bob legitimately hosts blog.alicezone.example (root added it) but its own zone never came to be.
+      const addon = await post('/domains/bob', { domain: 'blog.alicezone.example', type: 'addon', autossl: false });
+      expect(addon.status, JSON.stringify(addon.body)).toBe(201);
+      zones.delete('blog.alicezone.example');
+      reset();
+      const sub = await rpost('/domains/bob', { domain: 'x.blog.alicezone.example', type: 'sub', autossl: false });
+      expect(sub.status, JSON.stringify(sub.body)).toBe(201);
+      expect(sub.body.data.steps.dns).toMatchObject({ status: 'skipped', zone: 'alicezone.example' });
+      expect(sub.body.data.steps.dns.detail).toMatch(/not this account's/);
+      expect(calls.dns).toEqual([]);
+      expect(zones.get('alicezone.example')).toBe(aliceId);
+      const gone = await rdel('/domains/bob/x.blog.alicezone.example').expect(200);
+      expect(gone.body.data.steps.dns).toMatchObject({ status: 'skipped' });
+      expect(gone.body.data.steps.dns.detail).toMatch(/not this account's/);
+      expect(calls.dns).toEqual([]);
+      // Root writes the record where the name falls, as DNS Functions lets root edit any zone.
+      const asRoot = await post('/domains/bob', { domain: 'y.blog.alicezone.example', type: 'sub', autossl: false });
+      expect(asRoot.status).toBe(201);
+      expect(asRoot.body.data.steps.dns).toMatchObject({ status: 'applied', zone: 'alicezone.example' });
+      expect(calls.dns).toEqual([['upsert', 'alicezone.example', 'y.blog.alicezone.example', 'A', [{ value: bobIp }]]]);
+      await del('/domains/bob/y.blog.alicezone.example').expect(200);
+      expect(calls.dns.pop()).toEqual(['upsert', 'alicezone.example', 'y.blog.alicezone.example', 'A', []]);
+      await del('/domains/bob/blog.alicezone.example').expect(200);
+      zones.delete('alicezone.example');
+    });
+
+    it('a document root may sit below another site\'s root but never hold one, and a directory another domain lives in is never deleted', async () => {
+      const top = await post('/domains/alice', { domain: 'sites.example', type: 'addon', docroot: `${home}/www`, autossl: false });
+      expect(top.status, JSON.stringify(top.body)).toBe(201);
+      const below = await post('/domains/alice', { domain: 'blog.sites.example', type: 'sub', docroot: `${home}/www/blog`, autossl: false });
+      expect(below.status, JSON.stringify(below.body)).toBe(201);
+      const deep = await post('/domains/alice', { domain: 'deep.sites.example', type: 'sub', docroot: `${home}/www/a/b`, autossl: false });
+      expect(deep.status).toBe(201);
+      reset();
+      const wrap = await post('/domains/alice', { domain: 'wrap.example', type: 'addon', docroot: `${home}/www/a` });
+      expect(wrap.status).toBe(409);
+      expect(wrap.body.error.message).toMatch(/contains the document root of deep\.sites\.example/);
+      expect(order).toEqual([]);
+      expect(rows('wrap.example')).toBe(0);
+      // Deleting the top site's files would take blog and deep with it: the directory is kept.
+      const kept = await del('/domains/alice/sites.example?deleteFiles=true').expect(200);
+      expect(kept.body.data.steps.files).toMatchObject({ status: 'skipped' });
+      expect(kept.body.data.steps.files.detail).toMatch(/holds, the document root of another domain/);
+      expect(app.agent.callsTo('web.docroot.remove')).toEqual([]);
+      expect(rows('sites.example')).toBe(0);
+      // A directory nobody else lives in goes.
+      const removed = await del('/domains/alice/blog.sites.example?deleteFiles=true').expect(200);
+      expect(removed.body.data.steps.files).toMatchObject({ status: 'applied' });
+      expect(app.agent.callsTo('web.docroot.remove').map((c) => c.args)).toEqual([{ username: 'alice', docroot: `${home}/www/blog` }]);
+      await del('/domains/alice/deep.sites.example').expect(200);
+    });
+
+    it('a parked domain whose virtual host rewrite failed is reported as failed with the error, not as pending', async () => {
+      const { parkDomain, unparkDomain } = app.ctx.dns;
+      const insert = (domain) => { const account = app.ctx.db.prepare('SELECT * FROM accounts WHERE username = ?').get('alice'); app.ctx.db.prepare('INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, ?, ?, ?)').run(account.id, domain, 'parked', `${account.home_dir}/public_html`); return account; };
+      app.ctx.dns.parkDomain = async (input) => { const account = insert(input.domain); return { domain: input.domain, account: 'alice', target: account.domain, docroot: `${account.home_dir}/public_html`, zone: { domain: input.domain, applied: true }, web: 'failed: Apache rejected the alias', webDetail: 'Apache rejected the alias' }; };
+      app.ctx.dns.unparkDomain = async (domain) => { app.ctx.db.prepare('DELETE FROM account_domains WHERE domain = ?').run(domain); return { domain, unparked: true, zoneRemoved: true, web: 'failed: configtest failed', webDetail: null }; };
+      try {
+        const res = await post('/domains/alice', { domain: 'broken.example', type: 'parked' });
+        expect(res.status, JSON.stringify(res.body)).toBe(201);
+        expect(res.body.data.steps.web).toEqual({ status: 'failed', detail: 'Apache rejected the alias' });
+        expect(JSON.parse(app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action = 'account.domain.add' AND target = 'broken.example'").get().args_redacted).steps.web).toBe('failed');
+        const gone = await del('/domains/alice/broken.example').expect(200);
+        expect(gone.body.data.steps.web).toEqual({ status: 'failed', detail: 'configtest failed' });
+      } finally { app.ctx.dns.parkDomain = parkDomain; app.ctx.dns.unparkDomain = unparkDomain; }
     });
   });
 

@@ -5,10 +5,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { exec } from '../src/exec.js';
 import { runOp, createContext, OpError, DEFAULT_ALLOWED_ROOTS } from '../src/lib.js';
 import {
-  F2B_JAILS, PANEL_FAILREGEX, renderFail2banJail, renderFail2banPanelFilter, parseFail2banStatus, parseFail2banJailStatus, parseJailFile, fail2banStatus, applyFail2ban, revertFail2ban,
+  F2B_JAILS, PANEL_FAILREGEX, renderFail2banJail, renderFail2banPanelFilter, parseFail2banStatus, parseFail2banJailStatus, parseJailFile, parseJailIgnoreIps, fail2banStatus, applyFail2ban, revertFail2ban,
   renderAptPeriodic, renderAptUnattended, parseIni, setIniValues, DNF_AUTOMATIC_VALUES, updatesStatus, applyUpdates, revertUpdates,
   SYSCTL_SETTINGS, SYSCTL_KEYS, renderSysctl, sysctlStatus, applySysctl, revertSysctl,
-  BASELINE_CHAIN, parseSshdPorts, parseIptablesBaseline, parseNftBaseline, firewallStatus, applyFirewallBaseline, revertFirewallBaseline,
+  BASELINE_CHAIN, DHCPV6_IP6TABLES, DHCPV6_NFT, parseListeners, parseSshdPorts, isRootSshdPid, parseSocketListen, parseIptablesBaseline, parseNftBaseline, firewallStatus, applyFirewallBaseline, revertFirewallBaseline,
 } from '../src/ops/hardening.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
@@ -91,13 +91,28 @@ describe('fail2ban rendering and parsing', () => {
   it('jail.local enables the chosen jails, disables the rest and carries the panel jail settings', () => {
     const text = renderFail2banJail({ jails: ['sshd', 'whm-panel', 'exim'], bantime: 3600, findtime: 600, maxretry: 5, panelPorts: [2086, 2087], ignoreIps: ['203.0.113.9'] });
     expect(text).toContain('Managed by WHM panel');
-    expect(text).toMatch(/\[DEFAULT\]\nbantime {2}= 3600\nfindtime = 600\nmaxretry = 5\nignoreip = 127\.0\.0\.1\/8 ::1 203\.0\.113\.9/);
+    expect(text).toMatch(/\[DEFAULT\]\nbantime {2}= 3600\nfindtime = 600\nmaxretry = 5\nignoreip = 127\.0\.0\.1\/8 ::1\nbanaction = iptables-multiport\nbanaction_allports = iptables-allports\n/);
     expect(text).toMatch(/\[sshd\]\nenabled = true\nmode = aggressive/);
     expect(text).toMatch(/\[exim\]\nenabled = true/);
     expect(text).toMatch(/\[dovecot\]\nenabled = false/);
-    expect(text).toMatch(/\[whm-panel\]\nenabled = true\nfilter = whm-panel\nbackend = systemd\njournalmatch = SYSLOG_IDENTIFIER=whm-panel\nport = 2086,2087/);
+    expect(text).toMatch(/\[whm-panel\]\nenabled = true\nfilter = whm-panel\nbackend = systemd\njournalmatch = SYSLOG_IDENTIFIER=whm-panel\nport = 2086,2087\nignoreip = 127\.0\.0\.1\/8 ::1 203\.0\.113\.9\n/);
     for (const jail of F2B_JAILS) expect(text).toContain(`[${jail}]`);
     expect(parseJailFile(text).sort()).toEqual(['exim', 'sshd', 'whm-panel']);
+  });
+
+  it('the operator exemption is confined to the panel jail and read back from the file', () => {
+    const text = renderFail2banJail({ jails: ['sshd', 'whm-panel'], bantime: 3600, findtime: 600, maxretry: 5, panelPorts: [2087], ignoreIps: ['203.0.113.9', '2001:db8::/48'] });
+    expect(text.match(/ignoreip = /g)).toHaveLength(2);
+    expect(text.slice(0, text.indexOf('[whm-panel]'))).not.toContain('203.0.113.9');
+    expect(parseJailIgnoreIps(text)).toEqual(['203.0.113.9', '2001:db8::/48']);
+    expect(parseJailIgnoreIps(renderFail2banJail({ jails: ['sshd'], bantime: 3600, findtime: 600, maxretry: 5, panelPorts: [2087] }))).toEqual([]);
+  });
+
+  it('the ban action follows the firewall backend so bans do not call a tool that is not in charge', () => {
+    const base = { jails: ['sshd'], bantime: 3600, findtime: 600, maxretry: 5, panelPorts: [2087] };
+    expect(renderFail2banJail({ ...base, backend: 'nft' })).toMatch(/\[DEFAULT\][^[]*banaction = nftables-multiport\nbanaction_allports = nftables-allports\n/);
+    expect(renderFail2banJail({ ...base, backend: 'iptables' })).toMatch(/banaction = iptables-multiport\nbanaction_allports = iptables-allports\n/);
+    expect(renderFail2banJail(base)).toContain('banaction = iptables-multiport');
   });
 
   it('the panel filter matches a failed login as pino-http logs it, and nothing else', () => {
@@ -153,10 +168,23 @@ describe('fail2ban apply validates before enabling, rolls back on a failed test,
       expect(test).toBeGreaterThanOrEqual(0);
       expect(test).toBeLessThan(enable);
       expect(enable).toBeLessThan(reload);
-      expect(result).toMatchObject({ validated: true, enabled: true, reloaded: true, jails: ['sshd', 'whm-panel'] });
-      expect(result.status).toMatchObject({ installed: true, configured: true, running: true, bannedTotal: 1 });
+      expect(result).toMatchObject({ validated: true, enabled: true, reloaded: true, jails: ['sshd', 'whm-panel'], banaction: 'iptables-multiport', ignoreIps: [] });
+      expect(result.status).toMatchObject({ installed: true, configured: true, running: true, bannedTotal: 1, ignoreIps: [] });
       expect(result.status.jails.find((j) => j.name === 'sshd')).toMatchObject({ enabled: true, running: true, currentlyBanned: 1, bannedIps: ['203.0.113.5'] });
       expect(result.status.jails.find((j) => j.name === 'whm-panel')).toMatchObject({ currentlyBanned: 0, bannedIps: [] });
+    });
+  });
+
+  it('on an nft-only host the jails ban through nftables and the status reports the panel exemptions', async () => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    await withHost(['fail2ban-client', 'systemctl', 'nft'], statusAnswers, async () => {
+      const result = await applyFail2ban({ ...args, ignoreIps: ['203.0.113.9'] }, ctx, { dir });
+      const jail = read(path.join(dir, 'jail.d/whm.local'));
+      expect(jail).toContain('banaction = nftables-multiport\nbanaction_allports = nftables-allports\n');
+      expect(jail).toMatch(/\[whm-panel\][^[]*ignoreip = 127\.0\.0\.1\/8 ::1 203\.0\.113\.9\n/);
+      expect(result).toMatchObject({ banaction: 'nftables-multiport', ignoreIps: ['203.0.113.9'] });
+      expect(result.status.ignoreIps).toEqual(['203.0.113.9']);
+      expect(await fail2banStatus({ dir })).toMatchObject({ configured: true, ignoreIps: ['203.0.113.9'] });
     });
   });
 
@@ -223,6 +251,10 @@ describe('automatic updates rendering', () => {
     expect(policy).toContain('#clear Unattended-Upgrade::Origins-Pattern;');
     expect(policy).toContain('"origin=Debian,codename=${distro_codename}-security,label=Debian-Security";');
     expect(policy).toContain('"origin=Ubuntu,archive=${distro_codename}-security,label=Ubuntu";');
+    // esm.ubuntu.com is labelled UbuntuESM/UbuntuESMApps, never "Ubuntu Pro": origin + archive only.
+    expect(policy).toContain('"origin=UbuntuESMApps,archive=${distro_codename}-apps-security";');
+    expect(policy).toContain('"origin=UbuntuESM,archive=${distro_codename}-infra-security";');
+    expect(policy).not.toContain('Ubuntu Pro');
     expect(policy).toContain('Unattended-Upgrade::Automatic-Reboot "false";');
     expect(policy).not.toMatch(/-updates"/);
   });
@@ -259,7 +291,9 @@ describe('automatic updates apply: validation before activation, originals prese
       const result = await applyUpdates(ctx, { aptDir, dnfConf });
       expect(result).toMatchObject({ family: 'debian', validated: true, timers: { 'apt-daily.timer': true, 'apt-daily-upgrade.timer': true } });
       expect(read(path.join(aptDir, '20auto-upgrades'))).toContain('Unattended-Upgrade "1"');
-      expect(read(path.join(aptDir, '20auto-upgrades.whm-orig'))).toContain('Unattended-Upgrade "0"');
+      expect(read(path.join(aptDir, '20auto-upgrades.whm-orig.disabled'))).toContain('Unattended-Upgrade "0"');
+      // apt prints a notice for any last extension outside its silent-skip list; only names it reads (no extension, .conf) or skips silently (.disabled) may be left there.
+      for (const name of fs.readdirSync(aptDir)) expect(name, name).toMatch(/^[A-Za-z0-9_-]+$|\.(conf|disabled)$/);
       expect(read(path.join(aptDir, '52whm-unattended-upgrades'))).toContain('#clear Unattended-Upgrade::Allowed-Origins;');
       const c = calls();
       expect(c.findIndex(([bin, a]) => bin === 'apt-config' && a === 'dump')).toBeLessThan(c.findIndex(([bin, a]) => bin === 'systemctl' && a === 'enable'));
@@ -270,7 +304,7 @@ describe('automatic updates apply: validation before activation, originals prese
       expect(reverted).toMatchObject({ family: 'debian', policy: 'removed', periodic: 'restored' });
       expect(read(path.join(aptDir, '20auto-upgrades'))).toContain('Unattended-Upgrade "0"');
       expect(fs.existsSync(path.join(aptDir, '52whm-unattended-upgrades'))).toBe(false);
-      expect(fs.existsSync(path.join(aptDir, '20auto-upgrades.whm-orig'))).toBe(false);
+      expect(fs.existsSync(path.join(aptDir, '20auto-upgrades.whm-orig.disabled'))).toBe(false);
     });
   });
 
@@ -408,12 +442,57 @@ describe('sysctl', () => {
 
 // ---------------------------------------------------------------- firewall ---
 
-const SS = 'LISTEN 0      128          0.0.0.0:22        0.0.0.0:*    users:(("sshd",pid=812,fd=3))\nLISTEN 0      128             [::]:22           [::]:*    users:(("sshd",pid=812,fd=4))\nLISTEN 0      511          0.0.0.0:2087      0.0.0.0:*    users:(("node",pid=900,fd=20))\nLISTEN 0      128          0.0.0.0:2222      0.0.0.0:*    users:(("sshd",pid=813,fd=3))\n';
+// A fake /proc: 812 is root's real sshd, 813 a tenant's program that calls itself sshd.
+const procRoot = path.join(tmp, 'proc');
+const sshdBin = path.join(tmp, 'bin', 'sshd');
+const evilBin = path.join(tmp, 'home', 'evil', 'sshd');
+for (const [pid, uid, exe] of [[812, 0, sshdBin], [813, 1001, evilBin], [815, 0, evilBin]]) {
+  fs.mkdirSync(path.join(procRoot, String(pid)), { recursive: true });
+  fs.mkdirSync(path.dirname(exe), { recursive: true });
+  if (!fs.existsSync(exe)) fs.writeFileSync(exe, '');
+  fs.writeFileSync(path.join(procRoot, String(pid), 'status'), `Name:\tsshd\nUmask:\t0022\nState:\tS (sleeping)\nPid:\t${pid}\nUid:\t${uid}\t${uid}\t${uid}\t${uid}\nGid:\t${uid}\t${uid}\t${uid}\t${uid}\n`);
+  fs.symlinkSync(exe, path.join(procRoot, String(pid), 'exe'));
+}
+const FW = { procRoot, sshdBin };
+const ssLine = (local, users, extra = '') => `LISTEN 0      128          ${local.padEnd(16)} ${local.includes('[') ? '[::]:*' : '0.0.0.0:*'}    users:(${users})${extra} ino:40${users.length} sk:1 cgroup:/system.slice <->`;
+// `ss -ltnpeH` on a host where a tenant runs two listeners named sshd: 2222 (its own uid, no uid: filter in play) and 4444 (uid: printed).
+const SS = [
+  ssLine('0.0.0.0:22', '("sshd",pid=812,fd=3)'), ssLine('[::]:22', '("sshd",pid=812,fd=4)'),
+  ssLine('0.0.0.0:2087', '("node",pid=900,fd=20)'),
+  ssLine('0.0.0.0:2222', '("sshd",pid=813,fd=3)'),
+  ssLine('0.0.0.0:4444', '("sshd",pid=814,fd=3)', ' uid:1001'),
+  '',
+].join('\n');
+const rootSshd = (pid) => isRootSshdPid(pid, FW);
 
 describe('firewall parsers', () => {
-  it('parseSshdPorts keeps only sshd listeners, de-duplicated and sorted', () => {
-    expect(parseSshdPorts(SS)).toEqual([22, 2222]);
-    expect(parseSshdPorts('')).toEqual([]);
+  it('parseListeners reads port, address, owner uid and the processes of every LISTEN row', () => {
+    const rows = parseListeners(SS);
+    expect(rows.map((r) => [r.port, r.addr, r.uid, r.users.map((u) => `${u.name}:${u.pid}`).join(',')])).toEqual([
+      [22, '0.0.0.0', 0, 'sshd:812'], [22, '::', 0, 'sshd:812'], [2087, '0.0.0.0', 0, 'node:900'], [2222, '0.0.0.0', 0, 'sshd:813'], [4444, '0.0.0.0', 1001, 'sshd:814'],
+    ]);
+    expect(parseListeners('')).toEqual([]);
+  });
+
+  it('parseSshdPorts counts a listener as sshd only when its pid is root\'s real sshd: no verifier, no ports', () => {
+    expect(parseSshdPorts(SS, { isRootSshd: rootSshd })).toEqual([22]);
+    expect(parseSshdPorts(SS, { isRootSshd: () => true })).toEqual([22, 2222]);
+    expect(parseSshdPorts(SS)).toEqual([]);
+    expect(parseSshdPorts('', { isRootSshd: rootSshd })).toEqual([]);
+  });
+
+  it('isRootSshdPid requires Uid 0 and /proc/<pid>/exe to be the installed sshd', () => {
+    expect(isRootSshdPid(812, FW)).toBe(true);
+    expect(isRootSshdPid(813, FW)).toBe(false); // tenant uid
+    expect(isRootSshdPid(815, FW)).toBe(false); // root, but another binary
+    expect(isRootSshdPid(999, FW)).toBe(false); // no such process
+    expect(isRootSshdPid(812, { procRoot, sshdBin: null })).toBe(false); // sshd not installed
+    expect(isRootSshdPid('812; id', FW)).toBe(false);
+  });
+
+  it('parseSocketListen reads the Stream ports of systemctl show -p Listen', () => {
+    expect(parseSocketListen('Listen=[::]:2222 (Stream)\nListen=0.0.0.0:2222 (Stream)\nListen=/run/x.sock (Stream)\nListen=[::]:514 (Datagram)\n')).toEqual([2222]);
+    expect(parseSocketListen('')).toEqual([]);
   });
 
   it('parseIptablesBaseline reads the policy, the hook and the accepted ports', () => {
@@ -429,6 +508,8 @@ describe('firewall parsers', () => {
       { rule: { family: 'inet', table: 'whm', chain: 'baseline', handle: 5, expr: [{ match: { op: '==', left: { payload: { protocol: 'tcp', field: 'dport' } }, right: { set: [22, 80, { range: [49152, 65534] }] } } }, { accept: null }] } },
       { rule: { family: 'inet', table: 'whm', chain: 'baseline', handle: 6, expr: [{ match: { op: '==', left: { payload: { protocol: 'udp', field: 'dport' } }, right: 53 } }, { accept: null }] } },
       { rule: { family: 'inet', table: 'whm', chain: 'block', handle: 7, expr: [{ match: { op: '==', left: { payload: { protocol: 'tcp', field: 'dport' } }, right: 99 } }, { drop: null }] } },
+      // the fixed DHCPv6 rule (source port matched too) is not an allowed port
+      { rule: { family: 'inet', table: 'whm', chain: 'baseline', handle: 8, expr: [{ match: { op: '==', left: { payload: { protocol: 'udp', field: 'sport' } }, right: 547 } }, { match: { op: '==', left: { payload: { protocol: 'udp', field: 'dport' } }, right: 546 } }, { accept: null }] } },
     ] });
     expect(parseNftBaseline(json)).toEqual({ chainPresent: true, policy: 'drop', tcp: [22, 80, { from: 49152, to: 65534 }], udp: [53] });
     expect(parseNftBaseline('not json')).toEqual({ chainPresent: false, policy: null, tcp: [], udp: [] });
@@ -438,7 +519,7 @@ describe('firewall parsers', () => {
 describe('firewall baseline apply/revert: argv order and the SSH guard', () => {
   const ipt = (bin, argv, state) => {
     if (bin === 'ss') return { stdout: SS.split('\n').filter((l) => !l.includes('2222')).join('\n') };
-    if (bin === 'systemctl' && argv[0] === 'is-active') return { code: 3 };
+    if (bin === 'systemctl' && argv[0] === 'is-active') return { code: 3, stdout: 'inactive\n' };
     if (bin === 'systemctl' && argv[0] === 'list-unit-files') return { stdout: '' };
     if ((bin === 'iptables' || bin === 'ip6tables') && argv[0] === '-S' && argv[1] === 'INPUT') return { stdout: state.policy === 'DROP' ? `-P INPUT DROP\n-A INPUT -j ${BASELINE_CHAIN}\n` : '-P INPUT ACCEPT\n' };
     if ((bin === 'iptables' || bin === 'ip6tables') && argv[0] === '-S' && argv[1] === BASELINE_CHAIN) return state.policy === 'DROP' ? { stdout: `-N ${BASELINE_CHAIN}\n-A ${BASELINE_CHAIN} -p tcp -m tcp --dport 22 -j ACCEPT\n` } : { code: 1 };
@@ -450,8 +531,9 @@ describe('firewall baseline apply/revert: argv order and the SSH guard', () => {
   it('iptables: chain rules first, hook appended (not inserted), the DROP policy last, both address families', async () => {
     const state = { policy: 'ACCEPT' };
     await withHost(['iptables', 'ip6tables', 'ss', 'systemctl'], (bin, argv) => ipt(bin, argv, state), async () => {
-      const result = await applyFirewallBaseline({ tcp: [22, 2086, 2087, 80, 443, { from: 49152, to: 65534 }], udp: [53], sshPorts: [22] }, ctx);
+      const result = await applyFirewallBaseline({ tcp: [22, 2086, 2087, 80, 443, { from: 49152, to: 65534 }], udp: [53], sshPorts: [22] }, ctx, FW);
       expect(result).toMatchObject({ backend: 'iptables', previousPolicy: 'ACCEPT', sshPorts: [22], tcp: ['22', '2086', '2087', '80', '443', '49152-65534'], udp: ['53'] });
+      expect(calls()).toContainEqual(['ss', '-ltnpeH']);
       const c = calls().filter(([bin]) => bin === 'iptables');
       const idx = (pred) => c.findIndex(pred);
       expect(c).toContainEqual(['iptables', '-A', BASELINE_CHAIN, '-i', 'lo', '-j', 'ACCEPT']);
@@ -467,6 +549,11 @@ describe('firewall baseline apply/revert: argv order and the SSH guard', () => {
       expect(idx(([, a, b]) => a === '-A' && b === 'INPUT')).toBeLessThan(idx(([, a, b, c2]) => a === '-P' && b === 'INPUT' && c2 === 'DROP'));
       const v6 = calls().filter(([bin]) => bin === 'ip6tables');
       expect(v6).toContainEqual(['ip6tables', '-A', BASELINE_CHAIN, '-p', 'ipv6-icmp', '-j', 'ACCEPT']);
+      // DHCPv6 replies are never ESTABLISHED: accepted before the port rules, IPv6 only.
+      const dhcp = v6.findIndex((x) => x[1] === '-A' && x[2] === BASELINE_CHAIN && x.includes('--sport'));
+      expect(v6[dhcp]).toEqual(['ip6tables', '-A', BASELINE_CHAIN, ...DHCPV6_IP6TABLES]);
+      expect(dhcp).toBeLessThan(v6.findIndex((x) => x.includes('--dport') && x.includes('22')));
+      expect(c.some((x) => x.includes('--sport'))).toBe(false);
       expect(v6).toContainEqual(['ip6tables', '-P', 'INPUT', 'DROP']);
       expect(result.status).toMatchObject({ applied: true, policy: 'DROP', hooked: true });
     });
@@ -475,12 +562,12 @@ describe('firewall baseline apply/revert: argv order and the SSH guard', () => {
   it('refuses when a declared or a live sshd port is missing from the allow list, before any rule is written', async () => {
     const state = { policy: 'ACCEPT' };
     await withHost(['iptables', 'ss', 'systemctl'], (bin, argv) => ipt(bin, argv, state), async () => {
-      const declared = await opError(applyFirewallBaseline({ tcp: [80, 443], udp: [], sshPorts: [22] }, ctx));
+      const declared = await opError(applyFirewallBaseline({ tcp: [80, 443], udp: [], sshPorts: [22] }, ctx, FW));
       expect(declared.code).toBe('refused');
       expect(declared.message).toMatch(/SSH port 22 is not in the allow list/);
       expect(calls().some(([bin]) => bin === 'iptables')).toBe(false);
       exec.mockClear();
-      const live = await opError(applyFirewallBaseline({ tcp: [80, 443, 2222], udp: [], sshPorts: [2222] }, ctx));
+      const live = await opError(applyFirewallBaseline({ tcp: [80, 443, 2222], udp: [], sshPorts: [2222] }, ctx, FW));
       expect(live.code).toBe('refused');
       expect(live.message).toMatch(/sshd is listening on port 22/);
       expect(calls().some(([bin]) => bin === 'iptables')).toBe(false);
@@ -488,10 +575,53 @@ describe('firewall baseline apply/revert: argv order and the SSH guard', () => {
     });
   });
 
+  it('a tenant listener that calls itself sshd neither blocks the apply nor counts as an SSH port', async () => {
+    const state = { policy: 'ACCEPT' };
+    await withHost(['iptables', 'ss', 'systemctl'], (bin, argv) => (bin === 'ss' ? { stdout: SS } : ipt(bin, argv, state)), async () => {
+      expect((await firewallStatus(FW)).sshdPorts).toEqual([22]);
+      const result = await applyFirewallBaseline({ tcp: [22, 80], udp: [], sshPorts: [22] }, ctx, FW);
+      expect(result.status).toMatchObject({ applied: true, sshdPorts: [22] });
+      expect(calls().some((x) => x.includes('2222') || x.includes('4444'))).toBe(false);
+    });
+  });
+
+  it('under socket activation the socket unit\'s ListenStream ports count as sshd\'s before any connection', async () => {
+    const state = { policy: 'ACCEPT' };
+    const socketHost = (bin, argv) => {
+      if (bin === 'ss') return { stdout: `${ssLine('[::]:2222', '("systemd",pid=1,fd=40)')}\n` };
+      if (bin === 'systemctl' && argv[0] === 'is-active' && argv[1] === 'ssh.socket') return { code: 0, stdout: 'active\n' };
+      if (bin === 'systemctl' && argv[0] === 'show' && argv[3] === 'ssh.socket') return { stdout: 'Listen=[::]:2222 (Stream)\n' };
+      return ipt(bin, argv, state);
+    };
+    await withHost(['iptables', 'ss', 'systemctl'], socketHost, async () => {
+      expect(await firewallStatus(FW)).toMatchObject({ sshdPorts: [2222], sshdSocket: 'ssh.socket' });
+      expect(calls()).toContainEqual(['systemctl', 'show', '-p', 'Listen', 'ssh.socket']);
+      exec.mockClear();
+      const err = await opError(applyFirewallBaseline({ tcp: [22, 80], udp: [], sshPorts: [22] }, ctx, FW));
+      expect(err.code).toBe('refused');
+      expect(err.message).toMatch(/listening on port 2222/);
+      expect(calls().some(([bin, a]) => bin === 'iptables' && a !== '-S')).toBe(false);
+    });
+  });
+
+  it('status reports the hub\'s non-loopback listener ports from whm-hub.service\'s main pid', async () => {
+    const state = { policy: 'ACCEPT' };
+    const hubHost = (bin, argv) => {
+      if (bin === 'ss') return { stdout: `${SS}${ssLine('0.0.0.0:8443', '("node",pid=950,fd=20)')}\n${ssLine('127.0.0.1:7440', '("node",pid=950,fd=21)')}\n` };
+      if (bin === 'systemctl' && argv[0] === 'list-unit-files') return { stdout: 'whm-hub.service enabled enabled\n' };
+      if (bin === 'systemctl' && argv[0] === 'show' && argv.includes('whm-hub.service')) return { stdout: '950\n' };
+      return ipt(bin, argv, state);
+    };
+    await withHost(['iptables', 'ss', 'systemctl'], hubHost, async () => {
+      expect(await firewallStatus(FW)).toMatchObject({ hubUnit: true, hubPorts: [8443], sshdPorts: [22] });
+      expect(calls()).toContainEqual(['systemctl', 'show', '-p', 'MainPID', '--value', 'whm-hub.service']);
+    });
+  });
+
   it('refuses while firewalld is active', async () => {
     const state = { policy: 'ACCEPT' };
     await withHost(['iptables', 'ss', 'systemctl'], (bin, argv) => (bin === 'systemctl' && argv[0] === 'is-active' ? { code: 0 } : ipt(bin, argv, state)), async () => {
-      const err = await opError(applyFirewallBaseline({ tcp: [22], udp: [], sshPorts: [22] }, ctx));
+      const err = await opError(applyFirewallBaseline({ tcp: [22], udp: [], sshPorts: [22] }, ctx, FW));
       expect(err.code).toBe('refused');
       expect(err.message).toMatch(/firewalld/);
       expect(calls().some(([bin, a]) => bin === 'iptables' && a !== '-S')).toBe(false);
@@ -504,7 +634,7 @@ describe('firewall baseline apply/revert: argv order and the SSH guard', () => {
       if (bin === 'iptables' && argv[0] === '-A' && argv.includes('--dport') && argv.includes('443')) throw Object.assign(new Error('iptables: No chain/target/match by that name.'), { code: 'command_failed' });
       return ipt(bin, argv, state);
     }, async () => {
-      const err = await opError(applyFirewallBaseline({ tcp: [22, 443], udp: [], sshPorts: [22] }, ctx));
+      const err = await opError(applyFirewallBaseline({ tcp: [22, 443], udp: [], sshPorts: [22] }, ctx, FW));
       expect(err.code).toBe('config_invalid');
       const c = calls().filter(([bin]) => bin === 'iptables');
       const failed = c.findIndex((x) => x.includes('443'));
@@ -514,6 +644,26 @@ describe('firewall baseline apply/revert: argv order and the SSH guard', () => {
       expect(tail).toContainEqual(['iptables', '-F', BASELINE_CHAIN]);
       expect(tail).toContainEqual(['iptables', '-X', BASELINE_CHAIN]);
       expect(c.some(([, a, b, p]) => a === '-P' && b === 'INPUT' && p === 'DROP')).toBe(false);
+    });
+  });
+
+  it('a failed apply puts each family\'s INPUT policy back to what it was, not to ACCEPT', async () => {
+    // The host ran its own -P INPUT DROP (v4) with an accepting v6; the ip6tables conntrack rule is rejected.
+    const v4 = { policy: 'DROP' }; const v6 = { policy: 'ACCEPT' };
+    await withHost(['iptables', 'ip6tables', 'ss', 'systemctl'], (bin, argv) => {
+      const state = bin === 'ip6tables' ? v6 : v4;
+      if (bin === 'ip6tables' && argv[0] === '-A' && argv.includes('conntrack')) throw Object.assign(new Error('ip6tables: No chain/target/match by that name.'), { code: 'command_failed' });
+      if (bin === 'iptables' && argv[0] === '-S' && argv[1] === 'INPUT') return { stdout: `-P INPUT ${state.policy}\n-A INPUT -p tcp --dport 22 -j ACCEPT\n` };
+      if (bin === 'iptables' && argv[0] === '-S' && argv[1] === BASELINE_CHAIN) return { code: 1 };
+      return ipt(bin, argv, state);
+    }, async () => {
+      const err = await opError(applyFirewallBaseline({ tcp: [22, 443], udp: [], sshPorts: [22] }, ctx, FW));
+      expect(err.code).toBe('config_invalid');
+      const teardown4 = calls().filter(([bin, a, b]) => bin === 'iptables' && a === '-P' && b === 'INPUT');
+      expect(teardown4[teardown4.length - 1]).toEqual(['iptables', '-P', 'INPUT', 'DROP']);
+      expect(calls().filter(([bin, a, b]) => bin === 'ip6tables' && a === '-P' && b === 'INPUT').pop()).toEqual(['ip6tables', '-P', 'INPUT', 'ACCEPT']);
+      expect(v4.policy).toBe('DROP');
+      expect(v6.policy).toBe('ACCEPT');
     });
   });
 
@@ -533,17 +683,19 @@ describe('firewall baseline apply/revert: argv order and the SSH guard', () => {
     let policy = null;
     await withHost(['nft', 'ss', 'systemctl'], (bin, argv) => {
       if (bin === 'ss') return { stdout: SS.split('\n').filter((l) => !l.includes('2222')).join('\n') };
-      if (bin === 'systemctl') return { code: 3, stdout: '' };
+      if (bin === 'systemctl') return { code: 3, stdout: 'inactive\n' };
       if (bin === 'nft' && argv[0] === 'add' && argv[1] === 'chain') { policy = argv[argv.length - 1].includes('drop') ? 'drop' : 'accept'; return {}; }
       if (bin === 'nft' && argv[0] === 'delete') { policy = null; return {}; }
       if (bin === 'nft' && argv[0] === '-j') return policy ? { stdout: JSON.stringify({ nftables: [{ chain: { name: 'baseline', policy } }] }) } : { code: 1 };
       return {};
     }, async () => {
-      const result = await applyFirewallBaseline({ tcp: [22, 80, { from: 49152, to: 65534 }], udp: [53], sshPorts: [22] }, ctx);
+      const result = await applyFirewallBaseline({ tcp: [22, 80, { from: 49152, to: 65534 }], udp: [53], sshPorts: [22] }, ctx, FW);
       const c = calls().filter(([bin]) => bin === 'nft');
       expect(c[0]).toEqual(['nft', 'add', 'table', 'inet', 'whm']);
       expect(c[1]).toEqual(['nft', 'add', 'chain', 'inet', 'whm', 'baseline', '{ type filter hook input priority 0 ; policy accept ; }']);
       expect(c).toContainEqual(['nft', 'add', 'rule', 'inet', 'whm', 'baseline', 'ct', 'state', 'established,related', 'accept']);
+      expect(c).toContainEqual(['nft', 'add', 'rule', 'inet', 'whm', 'baseline', ...DHCPV6_NFT]);
+      expect(c.findIndex((x) => x.includes('sport'))).toBeLessThan(c.findIndex((x) => x[2] === 'rule' && x[6] === 'tcp'));
       expect(c).toContainEqual(['nft', 'add', 'rule', 'inet', 'whm', 'baseline', 'tcp', 'dport', '{ 22, 80, 49152-65534 }', 'accept']);
       expect(c).toContainEqual(['nft', 'add', 'rule', 'inet', 'whm', 'baseline', 'udp', 'dport', '{ 53 }', 'accept']);
       const drop = c.findIndex((x) => x[2] === 'chain' && x[6] === '{ policy drop ; }');
@@ -560,14 +712,15 @@ describe('firewall baseline apply/revert: argv order and the SSH guard', () => {
     await withHost(['iptables', 'ss', 'systemctl', 'ufw'], (bin, argv) => {
       if (bin === 'ss') return { stdout: SS };
       if (bin === 'ufw') return { stdout: 'Status: active\n' };
-      if (bin === 'systemctl' && argv[0] === 'is-active') return { code: 0 };
+      if (bin === 'systemctl' && argv[0] === 'is-active') return { code: 0, stdout: argv[1] === 'firewalld.service' ? 'active\n' : 'inactive\n' };
       if (bin === 'systemctl' && argv[0] === 'list-unit-files') return { stdout: 'whm-hub.service enabled enabled\n' };
       if (bin === 'iptables' && argv[1] === 'INPUT') return { stdout: '-P INPUT ACCEPT\n' };
       if (bin === 'iptables') return { code: 1 };
       return {};
     }, async () => {
-      const s = await firewallStatus();
-      expect(s).toMatchObject({ backend: 'iptables', applied: false, policy: 'ACCEPT', sshdPorts: [22, 2222], hubUnit: true, conflicts: { firewalld: true, ufw: true } });
+      const s = await firewallStatus(FW);
+      // 2222 and 4444 are the tenant's listeners named sshd; the hub unit exists but is not running (no MainPID) → no hub ports.
+      expect(s).toMatchObject({ backend: 'iptables', applied: false, policy: 'ACCEPT', sshdPorts: [22], sshdSocket: null, hubUnit: true, hubPorts: [], conflicts: { firewalld: true, ufw: true } });
     });
   });
 });

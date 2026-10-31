@@ -9,7 +9,7 @@ import {
   parsePerlModules, parseIni, setIniDirectives, parseFpmPool, renderNginxProxy, parseProxyHeader, NGINX_PROXY_CONF, hostHasIpv6,
   versionAtLeast, nginxHttp2Directive, nginxRejectHandshake, disableServerBlocks, restoreServerBlocks,
   parseAptRemoveSimulation, parseDnfRemoveSimulation, peclIniHint, startRun, pollRun, PKG_RUN_DIR, NGINX_SSL_ROOTS, nginxSslPath,
-  packageStem, bindingBase, rankSearchResults, dedupeSearchResults, detectManager,
+  packageStem, bindingBase, rankSearchResults, dedupeSearchResults, detectManager, parseAptPolicyBlocks, parseDnfList, parseProviderLines, packageOffers,
 } from '../src/ops/pkg.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
@@ -618,6 +618,18 @@ describe('search dedupe and ranking', () => {
     expect(noPlain.results[0].variants.map((v) => v.name)).toEqual(['php8.3-gd', 'php8.3-gd:i386']);
   });
 
+  it('heads a group without a plain member by the installable kind, never by the shorter -doc or -dev name', () => {
+    const im = dedupeSearchResults([row('imagemagick-6-doc'), row('imagemagick-6-common')], 'imagemagick');
+    expect(im.results.map((r) => r.name)).toEqual(['imagemagick-6-common']);
+    expect(im.results[0].variants.map((v) => [v.name, v.kind])).toEqual([['imagemagick-6-doc', 'doc']]);
+    const dev = dedupeSearchResults([row('libfoo-dev'), row('libfoo-doc'), row('libfoo2')], 'foo');
+    expect(dev.results.map((r) => r.name)).toEqual(['libfoo2']);
+    expect(dev.results[0].variants.map((v) => v.name)).toEqual(['libfoo-dev', 'libfoo-doc']);
+    // The shorter -doc loses to the shared-files package; equal lengths fall to the kind too.
+    expect(dedupeSearchResults([row('bar-doc'), row('bar-data')], 'bar').results[0].name).toBe('bar-data');
+    expect(dedupeSearchResults([row('foo-src'), row('foo-dev')], 'foo').results[0].name).toBe('foo-dev');
+  });
+
   it('caps the rows, reports how many were cut and how many names stayed hidden', () => {
     const many = Array.from({ length: 150 }, (_, i) => row(`pkg${String(i).padStart(3, '0')}`));
     const out = dedupeSearchResults([row('pkg'), ...many, row('pkg-dev')], 'pkg', { limit: 60 });
@@ -636,6 +648,83 @@ describe('search dedupe and ranking', () => {
     expect(out.results.find((r) => r.name === 'curl').variants).toEqual([]);
   });
 
+  it('reads apt-cache policy blocks: installed, candidate, the candidate origin and the version table', () => {
+    const out = parseAptPolicyBlocks([
+      'php8.3-redis:', '  Installed: (none)', '  Candidate: 6.0.2-1+ubuntu24.04.1+deb.sury.org+1', '  Version table:',
+      '     6.0.2-1+ubuntu24.04.1+deb.sury.org+1 500', '        500 https://ppa.launchpadcontent.net/ondrej/php/ubuntu noble/main amd64 Packages',
+      'curl:', '  Installed: 8.5.0-2ubuntu10.6', '  Candidate: 8.5.0-2ubuntu10.6', '  Version table:',
+      ' *** 8.5.0-2ubuntu10.6 500', '        500 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages', '        500 http://security.ubuntu.com/ubuntu noble-security/main amd64 Packages', '        100 /var/lib/dpkg/status',
+      '     8.5.0-2ubuntu10 500', '        500 http://archive.ubuntu.com/ubuntu noble/main amd64 Packages',
+      'nothing-here:', '  Installed: (none)', '  Candidate: (none)', '  Version table:', '',
+    ].join('\n'));
+    expect(out['php8.3-redis']).toEqual({ installed: null, candidate: '6.0.2-1+ubuntu24.04.1+deb.sury.org+1', origin: 'https://ppa.launchpadcontent.net/ondrej/php/ubuntu', versions: [{ version: '6.0.2-1+ubuntu24.04.1+deb.sury.org+1', origin: 'https://ppa.launchpadcontent.net/ondrej/php/ubuntu' }] });
+    expect(out.curl).toEqual({ installed: '8.5.0-2ubuntu10.6', candidate: '8.5.0-2ubuntu10.6', origin: 'http://archive.ubuntu.com/ubuntu', versions: [{ version: '8.5.0-2ubuntu10.6', origin: 'http://archive.ubuntu.com/ubuntu' }, { version: '8.5.0-2ubuntu10', origin: 'http://archive.ubuntu.com/ubuntu' }] });
+    expect(out['nothing-here']).toEqual({ installed: null, candidate: null, origin: null, versions: [] });
+    expect(out.unknown).toBeUndefined();
+    expect(parseAptPolicyBlocks('')).toEqual({});
+  });
+
+  it('reads dnf list sections, including a long name wrapped onto its own line', () => {
+    const out = parseDnfList([
+      'Last metadata expiration check: 0:10:00 ago.', 'Installed Packages',
+      'php83-php-fpm.x86_64                 8.3.6-1.el9.remi                 @remi-safe',
+      'Available Packages',
+      'php83-php-pecl-imagick-im7.x86_64', '                                     3.7.0-1.el9.remi                 remi-safe',
+      'htop.x86_64                          3.3.0-1.el9                      epel',
+      'ImageMagick.x86_64                   1:6.9.12.93-1.el9                epel', '',
+    ].join('\n'));
+    expect(out).toEqual({
+      'php83-php-fpm': { installed: '8.3.6-1.el9.remi', candidate: null, origin: 'remi-safe' },
+      'php83-php-pecl-imagick-im7': { installed: null, candidate: '3.7.0-1.el9.remi', origin: 'remi-safe' },
+      htop: { installed: null, candidate: '3.3.0-1.el9', origin: 'epel' },
+      ImageMagick: { installed: null, candidate: '1:6.9.12.93-1.el9', origin: 'epel' },
+    });
+    expect(parseDnfList('Error: No matching Packages to list\n')).toEqual({});
+    expect(parseProviderLines('php83-php-pecl-redis5\t5.3.7-1.el9.remi\nphp83-php-pecl-redis6\t6.0.2-1.el9.remi\n\n')).toEqual({ name: 'php83-php-pecl-redis6', version: '6.0.2-1.el9.remi' });
+    expect(parseProviderLines('no package provides php-pecl-redis\n')).toBeNull();
+    expect(parseProviderLines('$(id)\t1\n')).toBeNull();
+  });
+
+  it('resolves RHEL names that only a Provides answers (Remi php-pecl-redis6, php-pecl-imagick-im7) through rpm/dnf --whatprovides, one call per name', async () => {
+    const pm = { manager: 'dnf', family: 'rhel', binary: 'dnf', rpm: true };
+    const names = ['php83-php-fpm', 'php83-php-pecl-redis', 'php-pecl-imagick', 'netdata'];
+    const original = exec.getMockImplementation();
+    const calls = [];
+    exec.mockImplementation(async (bin, argv) => {
+      calls.push([bin, argv]);
+      if (bin === 'rpm' && argv[1] === '--qf') return { code: 1, stdout: 'php83-php-fpm\t8.3.6-1.el9.remi\npackage php83-php-pecl-redis is not installed\npackage php-pecl-imagick is not installed\npackage netdata is not installed\n', stderr: '' };
+      if (bin === 'dnf' && argv[2] === 'list') return { code: 1, stdout: 'Installed Packages\nphp83-php-fpm.x86_64   8.3.6-1.el9.remi   @remi-safe\n', stderr: 'Error: No matching Packages to list' };
+      if (bin === 'rpm' && argv[1] === '--whatprovides') {
+        const name = argv.at(-1);
+        return name === 'php-pecl-imagick' ? { code: 0, stdout: 'php-pecl-imagick-im7\t3.7.0-1.el9.remi\n', stderr: '' } : { code: 1, stdout: `no package provides ${name}\n`, stderr: '' };
+      }
+      if (bin === 'dnf' && argv[2] === 'repoquery') {
+        const name = argv.at(-1).replace('--whatprovides=', '');
+        return name === 'php83-php-pecl-redis' ? { code: 0, stdout: 'php83-php-pecl-redis5\t5.3.7-1.el9.remi\nphp83-php-pecl-redis6\t6.0.2-1.el9.remi\n\n', stderr: '' } : { code: 0, stdout: '\n', stderr: '' };
+      }
+      throw new Error(`unexpected exec ${bin} ${argv.join(' ')}`);
+    });
+    try {
+      const out = await packageOffers(pm, names, { provides: true });
+      expect(out['php83-php-fpm']).toEqual({ installed: '8.3.6-1.el9.remi', candidate: null, origin: 'remi-safe' });
+      expect(out['php83-php-pecl-redis']).toEqual({ installed: null, candidate: '6.0.2-1.el9.remi', origin: null, provider: 'php83-php-pecl-redis6' });
+      expect(out['php-pecl-imagick']).toEqual({ installed: '3.7.0-1.el9.remi', candidate: null, origin: null, provider: 'php-pecl-imagick-im7' });
+      expect(out.netdata).toBeUndefined();
+      // Names rpm or dnf list answered are never looked up again; the capability follows "--" for rpm and is the option's own value for dnf.
+      const provides = calls.filter(([, argv]) => argv.some((a) => a.startsWith('--whatprovides')));
+      expect(provides.map(([bin, argv]) => [bin, argv.at(-1)])).toEqual([
+        ['rpm', 'php83-php-pecl-redis'], ['dnf', '--whatprovides=php83-php-pecl-redis'], ['rpm', 'php-pecl-imagick'], ['rpm', 'netdata'], ['dnf', '--whatprovides=netdata'],
+      ]);
+      expect(calls.find(([bin, argv]) => bin === 'rpm' && argv[1] === '--whatprovides')[1]).toEqual(['-q', '--whatprovides', '--qf', '%{NAME}\t%{VERSION}-%{RELEASE}\n', '--', 'php83-php-pecl-redis']);
+      expect(calls.find(([bin, argv]) => bin === 'dnf' && argv[2] === 'repoquery')[1]).toEqual(['-q', '-C', 'repoquery', '--qf', '%{name}\t%{version}-%{release}\n', '--whatprovides=php83-php-pecl-redis']);
+      // Without the option (the PHP source probe) the two batched calls are all there is.
+      calls.length = 0;
+      const plain = await packageOffers(pm, names);
+      expect(plain['php83-php-pecl-redis']).toBeUndefined();
+      expect(calls.map(([bin, argv]) => `${bin} ${argv[1] === '--qf' ? '-q' : argv[2]}`)).toEqual(['rpm -q', 'dnf list']);
+    } finally { exec.mockImplementation(original); }
+  });
+
   it('pkg.offers refuses bad names and oversized batches before any command runs', async () => {
     exec.mockClear();
     for (const bad of INJECTION) expect((await opError(runOp('pkg.offers', { packages: [bad] }, ctx))).code, bad).toBe('invalid_args');
@@ -647,6 +736,24 @@ describe('search dedupe and ranking', () => {
   });
 
   const apt = detectManager().family === 'debian';
+  it.skipIf(!apt)('pkg.offers answers every asked name with installed, candidate, origin, provider and offered from one apt-cache policy call', async () => {
+    const original = exec.getMockImplementation();
+    exec.mockImplementation(async (bin, argv) => {
+      if (bin === 'apt-cache' && argv[0] === 'policy') return { code: 0, stdout: 'curl:\n  Installed: 8.5.0-2ubuntu10.6\n  Candidate: 8.5.0-2ubuntu10.6\n  Version table:\n *** 8.5.0-2ubuntu10.6 500\n        500 http://archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages\nnetdata:\n  Installed: (none)\n  Candidate: 1.44.3-2\n  Version table:\n     1.44.3-2 500\n        500 http://archive.ubuntu.com/ubuntu noble/universe amd64 Packages\n', stderr: 'N: Unable to locate package no-such' };
+      throw new Error(`unexpected exec ${bin} ${argv.join(' ')}`);
+    });
+    try {
+      const out = await runOp('pkg.offers', { packages: ['curl', 'netdata', 'no-such', 'curl'] }, ctx);
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(exec.mock.calls[0][1]).toEqual(['policy', '--', 'curl', 'netdata', 'no-such']);
+      expect(out.packages).toEqual({
+        curl: { installed: '8.5.0-2ubuntu10.6', candidate: '8.5.0-2ubuntu10.6', origin: 'http://archive.ubuntu.com/ubuntu', provider: null, offered: true },
+        netdata: { installed: null, candidate: '1.44.3-2', origin: 'http://archive.ubuntu.com/ubuntu', provider: null, offered: true },
+        'no-such': { installed: null, candidate: null, origin: null, provider: null, offered: false },
+      });
+    } finally { exec.mockImplementation(original); exec.mockClear(); }
+  });
+
   it.skipIf(!apt)('pkg.search answers one row per piece of software with installed marks, and the raw list with all: true', async () => {
     const original = exec.getMockImplementation();
     exec.mockImplementation(async (bin, argv) => {

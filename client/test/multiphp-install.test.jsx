@@ -22,21 +22,21 @@ vi.mock('../src/hooks/useApi.js', () => ({
   useMutation: (fn) => ({ mutate: fn, loading: false, error: null, fieldErrors: null, reset() {} }),
 }));
 
-const { default: MultiPhpManager, PhpInstallCard, phpRowAction } = await import('../src/pages/fn/software/multiphp-manager.jsx');
+const { default: MultiPhpManager, PhpInstallCard, phpRowAction, phpRowLocked } = await import('../src/pages/fn/software/multiphp-manager.jsx');
 const { default: MultiPhpIniEditor } = await import('../src/pages/fn/software/multiphp-ini-editor.jsx');
-const { InstallerCard, MODULE_TOOL_PACKAGES } = await import('../src/pages/software/Shared.jsx');
+const { InstallerCard, MODULE_TOOL_PACKAGES, useJobRunner } = await import('../src/pages/software/Shared.jsx');
 
 React.useLayoutEffect = React.useEffect;
 const render = (el) => renderToStaticMarkup(<ToastProvider><ConfirmProvider><MemoryRouter>{el}</MemoryRouter></ConfirmProvider></ToastProvider>);
 
 const SOURCE = { key: 'ondrej', label: 'Ondřej Surý PPA (ppa:ondrej/php)', url: 'https://launchpad.net/~ondrej/+archive/ubuntu/php', flavor: 'ubuntu', codename: 'noble', major: null, supported: true, reason: null, configured: false };
-const row = (version, extra = {}) => ({ version, id: version, label: `PHP ${version}`, offered: false, installed: false, installedVersion: null, candidate: null, source: null, fpmUnit: `php${version}-fpm`, layout: null, stock: false, isDefault: false, isCliDefault: false, inUse: 0, advisories: [], removable: false, ...extra });
+const row = (version, extra = {}) => ({ version, id: version, label: `PHP ${version}`, offered: false, installed: false, installedVersion: null, candidate: null, source: null, fpmUnit: `php${version}-fpm`, layout: null, stock: false, isDefault: false, isCliDefault: false, inUse: 0, usage: { domains: 0, vhosts: 0, pools: 0, packages: [], accounts: 0, apachePin: false, total: 0 }, inUseDetail: null, advisories: [], removable: false, ...extra });
 const INSTALLABLE = {
   manager: 'apt', family: 'debian', os: { id: 'ubuntu', name: 'Ubuntu 24.04.1 LTS', versionId: '24.04', codename: 'noble' }, source: SOURCE, stock: '8.3', effectiveDefault: '8.3',
   versions: [
     row('7.4'), row('8.0'),
     row('8.1', { offered: true, candidate: '8.1.31-1', source: 'ondrej' }),
-    row('8.2', { offered: true, installed: true, installedVersion: '8.2.20', source: 'ondrej', layout: 'debian', inUse: 2 }),
+    row('8.2', { offered: true, installed: true, installedVersion: '8.2.20', source: 'ondrej', layout: 'debian', inUse: 2, usage: { domains: 2, total: 2 }, inUseDetail: '2 domains' }),
     row('8.3', { offered: true, installed: true, installedVersion: '8.3.6', source: 'distro', layout: 'debian', stock: true, isDefault: true, isCliDefault: true }),
     row('8.4', { offered: true, installed: true, installedVersion: '8.4.1', source: 'ondrej', layout: 'debian', removable: true }),
     row('8.5'),
@@ -83,6 +83,9 @@ describe('PhpInstallCard', () => {
     expect(phpRowAction(INSTALLABLE.versions[0], SOURCE)).toEqual({ kind: 'install', disabled: false, reason: 'enables Ondřej Surý PPA (ppa:ondrej/php) first' });
     expect(phpRowAction(INSTALLABLE.versions[0], { ...SOURCE, supported: false, configured: false, reason: 'the Debian release codename could not be read' })).toEqual({ kind: 'install', disabled: true, reason: 'the Debian release codename could not be read' });
     expect(phpRowAction(INSTALLABLE.versions[3], SOURCE)).toEqual({ kind: 'remove', disabled: true, reason: 'used by 2 domains' });
+    // The server's breakdown names every pinning store; without it the domain count stands in.
+    expect(phpRowAction(row('8.2', { installed: true, layout: 'debian', inUse: 3, inUseDetail: "1 PHP-FPM pool, package 'biz', Apache Configuration's web default" }), SOURCE)).toEqual({ kind: 'remove', disabled: true, reason: "used by 1 PHP-FPM pool, package 'biz', Apache Configuration's web default" });
+    expect(phpRowAction(row('8.2', { installed: true, layout: 'debian', inUse: 1 }), SOURCE)).toEqual({ kind: 'remove', disabled: true, reason: 'used by 1 domain' });
     expect(phpRowAction(INSTALLABLE.versions[4], SOURCE)).toEqual({ kind: 'remove', disabled: true, reason: 'system default' });
     expect(phpRowAction({ ...INSTALLABLE.versions[4], isDefault: false }, SOURCE)).toEqual({ kind: 'remove', disabled: true, reason: 'CLI default (/usr/bin/php)' });
     expect(phpRowAction(INSTALLABLE.versions[5], SOURCE)).toEqual({ kind: 'remove', disabled: false, reason: null });
@@ -93,6 +96,25 @@ describe('PhpInstallCard', () => {
     expect(html).toContain('ppa:ondrej/php) · enabled');
     expect(html).toContain('not offered by Ondřej Surý PPA');
     expect(html).not.toContain('enabled automatically');
+  });
+
+  it('shows the usage breakdown per row and keeps every button locked while a job runs', () => {
+    responses.clear();
+    responses.set('/software/php/installable', { data: { ...INSTALLABLE, versions: [row('8.2', { installed: true, layout: 'debian', inUse: 4, inUseDetail: "1 domain, 1 rendered vhost, package 'biz', Apache Configuration's web default" }), row('8.4', { offered: true, installed: true, layout: 'debian', removable: true })] } });
+    const html = render(<PhpInstallCard />);
+    expect(html).toContain('In use by');
+    expect(html).toContain('1 domain, 1 rendered vhost, package &#x27;biz&#x27;, Apache Configuration&#x27;s web default');
+    expect(html).toContain('used by 1 domain, 1 rendered vhost');
+    const live = { kind: 'install', disabled: false, reason: null };
+    expect(phpRowLocked(live, { busy: false, running: false })).toBe(false);
+    expect(phpRowLocked(live, { busy: true, running: false })).toBe(true);
+    // The 202 came back (busy cleared) but apt-get is still running: a second job would only fail on the dpkg lock.
+    expect(phpRowLocked(live, { busy: false, running: true })).toBe(true);
+    expect(phpRowLocked({ ...live, disabled: true }, { busy: false, running: false })).toBe(true);
+    expect(phpRowLocked(live, undefined)).toBe(false);
+    // The runner starts idle and reports `running` separately from `busy`.
+    const Probe = () => { const r = useJobRunner(); return <span>{`busy=${r.busy} running=${r.running} job=${String(r.jobId)}`}</span>; };
+    expect(render(<Probe />)).toContain('busy=false running=false job=null');
   });
 
   it('shows the capability prompt when the host has no package manager and a loading line before the answer', () => {

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   PACKAGE_CATALOG, PACKAGE_GROUPS, PACKAGE_GROUP_KEYS, PACKAGE_FAMILIES, catalogEntries, entryByKey, groupByKey, resolveEntry,
-  packagesFor, phpExtensionPackage, matchesEntry,
+  packagesFor, phpExtensionPackage, phpRuntimePackages, matchesEntry,
 } from '../src/lib/package-catalog.js';
 import { STACK_COMPONENTS, componentByKey } from '../src/lib/stack-catalog.js';
 
@@ -122,6 +122,35 @@ describe('PHP extension expansion', () => {
     expect(packagesFor(entryByKey('nginx'), 'debian', { phpVersions: [debian83] })).toEqual(['nginx']);
     expect(packagesFor(redis, 'alpine')).toEqual([]);
     expect(packagesFor(null, 'debian')).toEqual([]);
+  });
+
+  it('names the PHP runtime per installed version, so a MultiPHP host is not judged by the distribution meta packages', () => {
+    const php = entryByKey('php');
+    const component = componentByKey('php');
+    expect(php.phpVersioned).toEqual({ debian: component.packages.debian, rhel: component.packages.rhel });
+    expect(phpRuntimePackages(php, debian83, 'debian')).toEqual(['php8.3-fpm', 'php8.3-cli', 'php8.3-common', 'php8.3-mysql', 'php8.3-curl', 'php8.3-gd', 'php8.3-mbstring', 'php8.3-xml', 'php8.3-zip', 'php8.3-intl', 'php8.3-bcmath', 'php8.3-soap', 'php8.3-opcache']);
+    expect(phpRuntimePackages(php, remi83, 'rhel')).toEqual(['php83-php-fpm', 'php83-php-cli', 'php83-php-common', 'php83-php-mysqlnd', 'php83-php-gd', 'php83-php-mbstring', 'php83-php-xml', 'php83-php-pdo', 'php83-php-intl', 'php83-php-bcmath', 'php83-php-soap', 'php83-php-opcache', 'php83-php-pecl-zip']);
+    expect(phpRuntimePackages(php, ea83, 'rhel')[0]).toBe('ea-php83-php-fpm');
+    expect(phpRuntimePackages(php, system, 'rhel')).toEqual(component.packages.rhel);
+    expect(phpRuntimePackages(php, { id: 'system', layout: 'unknown', packagePrefix: 'php-' }, 'debian')).toEqual(component.packages.debian);
+    expect(phpRuntimePackages(entryByKey('nginx'), debian83, 'debian')).toEqual([]);
+    expect(phpRuntimePackages(php, debian83, 'alpine')).toEqual([]);
+    expect(packagesFor(php, 'debian', { phpVersions: [debian83, debian82] })).toEqual([...phpRuntimePackages(php, debian83, 'debian'), ...phpRuntimePackages(php, debian82, 'debian')]);
+    expect(packagesFor(php, 'rhel', { phpVersions: [remi83, system] })).toEqual([...phpRuntimePackages(php, remi83, 'rhel'), ...component.packages.rhel]);
+    // No PHP yet: the meta packages are what installs one.
+    expect(packagesFor(php, 'debian')).toEqual(component.packages.debian);
+    expect(packagesFor(php, 'rhel')).toEqual(component.packages.rhel);
+    expect(entryByKey('redis').phpVersioned).toBeNull();
+    expect(resolveEntry({ key: 'x', category: 'web', packages: { debian: ['php-x', 'other'], rhel: ['php-y'] }, phpVersioned: true }).phpVersioned).toEqual({ debian: ['php-x'], rhel: ['php-y'] });
+  });
+
+  it('versions the PHP headers of the PECL build tools but keeps the names the distribution ships once', () => {
+    const tools = entryByKey('php-pecl-tools');
+    expect(tools.phpVersioned).toEqual({ debian: ['php-dev'], rhel: ['php-pear', 'php-devel'] });
+    expect(packagesFor(tools, 'debian', { phpVersions: [debian83, debian82] })).toEqual(['php-pear', 'php8.3-dev', 'php8.2-dev']);
+    expect(packagesFor(tools, 'rhel', { phpVersions: [remi83] })).toEqual(['php83-php-pear', 'php83-php-devel']);
+    expect(packagesFor(tools, 'rhel', { phpVersions: [system] })).toEqual(['php-pear', 'php-devel']);
+    expect(packagesFor(tools, 'debian')).toEqual(['php-pear', 'php-dev']);
   });
 
   it('never hands the family a mutable reference to the catalog', () => {

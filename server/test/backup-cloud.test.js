@@ -86,11 +86,13 @@ describe('migration 039', () => {
     const files = fs.readdirSync(MIGRATIONS).filter((f) => f.endsWith('.sql')).sort();
     for (const f of files.filter((n) => n < '039')) db.exec(fs.readFileSync(path.join(MIGRATIONS, f), 'utf8'));
     db.prepare("INSERT INTO backup_destinations (id, name, kind, config_enc, enabled, last_test_ok) VALUES (1, 'offsite', 's3', 'v1:x', 1, 1)").run();
-    db.prepare("INSERT INTO backups (id, account_name, type, path, status) VALUES (5, 'alice', 'full', '/backup/a.tar.gz', 'done')").run();
+    db.prepare("INSERT INTO backups (id, account_name, type, destination_id, path, status) VALUES (5, 'alice', 'full', 1, '/backup/a.tar.gz', 'done')").run();
+    db.prepare("INSERT INTO backups (id, account_name, type, path, status) VALUES (6, 'bob', 'full', '/backup/b.tar.gz', 'done')").run();
     db.prepare("INSERT INTO backup_uploads (backup_id, destination_id, destination_name, remote_path, status) VALUES (5, 1, 'offsite', 's3://x/a', 'done')").run();
     db.prepare("INSERT INTO backup_uploads (backup_id, destination_id, destination_name, remote_path, status) VALUES (5, NULL, 'gone', NULL, 'failed')").run();
     db.transaction(() => db.exec(fs.readFileSync(path.join(MIGRATIONS, '039_backup-cloud.sql'), 'utf8')))();
     expect(db.prepare('SELECT destination_id, encrypted FROM backup_uploads ORDER BY id').all()).toEqual([{ destination_id: 1, encrypted: 0 }, { destination_id: null, encrypted: 0 }]);
+    expect(db.prepare('SELECT id, destination_id FROM backups ORDER BY id').all()).toEqual([{ id: 5, destination_id: 1 }, { id: 6, destination_id: null }]);
     expect(db.prepare('SELECT id, name, kind, enabled, last_test_ok, last_upload_ok FROM backup_destinations').get()).toEqual({ id: 1, name: 'offsite', kind: 's3', enabled: 1, last_test_ok: 1, last_upload_ok: null });
     for (const kind of ['gdrive', 'onedrive', 'dropbox', 'azureblob', 'b2']) db.prepare('INSERT INTO backup_destinations (name, kind) VALUES (?, ?)').run(kind, kind);
     expect(() => db.prepare("INSERT INTO backup_destinations (name, kind) VALUES ('x', 'box')").run()).toThrow(/CHECK/);
@@ -98,6 +100,7 @@ describe('migration 039', () => {
     // The uploads FK follows the rebuilt table: deleting the destination nulls the link.
     db.prepare('DELETE FROM backup_destinations WHERE id = 1').run();
     expect(db.prepare('SELECT destination_id FROM backup_uploads WHERE id = 1').get().destination_id).toBeNull();
+    expect(db.prepare('SELECT destination_id FROM backups WHERE id = 5').get().destination_id).toBeNull();
     expect(db.pragma('foreign_key_check')).toEqual([]);
     db.close();
   });
@@ -444,6 +447,67 @@ describe('Backup cloud API', () => {
       const missing = await post(`/destinations/${b2.body.data.id}/test`).expect(501);
       expect(missing.body.error).toMatchObject({ code: 'capability_missing', capability: 'rclone' });
     } finally { app.agent.reset('backup.rclone.test'); }
+  });
+
+  it('a destination from before encryption existed reports crypt false explicitly and stays plain across an edit', async () => {
+    const legacy = app.ctx.db.prepare("INSERT INTO backup_destinations (name, kind, config_enc, enabled) VALUES ('legacy-s3', 's3', ?, 0)").run(app.ctx.crypto.encrypt(JSON.stringify({ bucket: 'old-bucket', region: 'us-east-1', prefix: '', accessKey: 'AKIA', secretKey: 'oldsecret', pathStyle: false, insecure: false }))).lastInsertRowid;
+    const listed = (await get('/destinations').expect(200)).body.data.find((d) => d.id === legacy);
+    expect(listed).toMatchObject({ encrypted: false, engine: 'native', config: { bucket: 'old-bucket', crypt: false, has_secret_key: true } });
+    // The edit form sends the toggle as stored (off) and a blank secret: nothing changes but the field edited.
+    const same = await put(`/destinations/${legacy}`, { config: { kind: 's3', bucket: 'old-bucket', accessKey: 'AKIA', secretKey: '', prefix: 'moved', crypt: false } }).expect(200);
+    expect(same.body.data).toMatchObject({ encrypted: false, config: { prefix: 'moved', crypt: false } });
+    expect(same.body.data).not.toHaveProperty('encryptionKey');
+    expect(app.ctx.backup.destinationConfig(legacy)).toMatchObject({ secretKey: 'oldsecret', crypt: false });
+    // A script that omits the toggle keeps it plain too; only an explicit true issues a key.
+    await put(`/destinations/${legacy}`, { config: { kind: 's3', bucket: 'old-bucket', accessKey: 'AKIA' } }).expect(200);
+    expect(app.ctx.backup.destinationConfig(legacy).crypt).toBe(false);
+    const on = await put(`/destinations/${legacy}`, { config: { kind: 's3', bucket: 'old-bucket', accessKey: 'AKIA', crypt: true } }).expect(200);
+    expect(on.body.data).toMatchObject({ encrypted: true, engine: 'rclone', config: { crypt: true } });
+    expect(on.body.data.encryptionKey.cryptPassword).toMatch(/^[A-Za-z0-9_-]{20,}$/);
+  });
+
+  it('an Azure update cannot remove both credentials', async () => {
+    const azure = (await get('/destinations').expect(200)).body.data.find((d) => d.name === 'azure-main');
+    const body = { kind: 'azureblob', account: 'acct', container: 'backups' };
+    for (const patch of [{ sasToken: null }, { accountKey: null, sasToken: null }]) {
+      const res = await put(`/destinations/${azure.id}`, { config: { ...body, ...patch } }).expect(422);
+      expect(res.body.error.fields['config.accountKey']).toMatch(/account key or a container SAS token/);
+    }
+    expect(app.ctx.backup.destinationConfig(azure.id).sasToken).toBe('sv=2024&sig=abc%2F');
+    const swapped = await put(`/destinations/${azure.id}`, { config: { ...body, accountKey: 'newaccountkey', sasToken: null } }).expect(200);
+    expect(swapped.body.data.config).toMatchObject({ has_account_key: true });
+    expect(swapped.body.data.config).not.toHaveProperty('has_sas_token');
+    expect(app.ctx.backup.destinationConfig(azure.id)).toMatchObject({ accountKey: 'newaccountkey' });
+    expect(app.ctx.backup.destinationConfig(azure.id)).not.toHaveProperty('sasToken');
+    expect(JSON.stringify(swapped.body)).not.toContain('newaccountkey');
+  });
+
+  it('flags an OAuth destination whose grant expired and clears it on the next success or reconnect', async () => {
+    const expired = 'test upload: fatal error (authentication or configuration) (Failed to refresh token: oauth2: "invalid_grant" "Token has been expired or revoked.")';
+    app.agent.set('backup.rclone.test', () => ({ ok: false, message: expired, code: 'destination_failed', ms: 1, tokenUpdate: null }));
+    const failed = await post(`/destinations/${gdriveId}/test`).expect(200);
+    expect(failed.body.data).toMatchObject({ ok: false, destination: { connection: { connected: true, reauthRequired: true } } });
+    expect(auditText()).toContain('backup.destination.reauth_required');
+    expect(app.ctx.backup.destinationConfig(gdriveId).reauthRequired).toBe(true);
+    // The flag is panel bookkeeping: the agent never sees it, and a plain failure does not set it.
+    app.agent.set('backup.rclone.test', ({ config }) => ({ ok: !('reauthRequired' in config), message: 'probe ok', encrypted: Boolean(config.crypt), ms: 1, tokenUpdate: null }));
+    const ok = await post(`/destinations/${gdriveId}/test`).expect(200);
+    expect(ok.body.data).toMatchObject({ ok: true, destination: { connection: { connected: true, reauthRequired: false } } });
+    expect(app.ctx.backup.destinationConfig(gdriveId)).not.toHaveProperty('reauthRequired');
+    app.agent.set('backup.rclone.test', () => ({ ok: false, message: 'test upload: temporary error, retries exhausted', code: 'destination_failed', ms: 1, tokenUpdate: null }));
+    expect((await post(`/destinations/${gdriveId}/test`).expect(200)).body.data.destination.connection.reauthRequired).toBe(false);
+    // A failed scheduled upload sets it as well; a new sign-in clears it.
+    await put(`/destinations/${gdriveId}`, { enabled: true }).expect(200);
+    app.agent.set('backup.rclone.upload', ({ config }) => { if (config.kind === 'gdrive') throw Object.assign(new Error(`upload to gdrive: fatal error (authentication or configuration) (oauth2: "invalid_grant")`), { agentError: true, code: 'destination_failed', details: { exitCode: 7 } }); return { kind: config.kind, name: 'x', remotePath: `${config.kind}://x`, sizeBytes: 1, encrypted: Boolean(config.crypt), ms: 1, tokenUpdate: null }; });
+    const run = await waitForJob(app.ctx, (await post('/runs', { accounts: ['alice'] }).expect(202)).body.data.job.id);
+    expect(run.status).toBe('done');
+    expect((await get('/destinations').expect(200)).body.data.find((d) => d.id === gdriveId).connection).toMatchObject({ connected: true, reauthRequired: true });
+    const again = await startFlow('gdrive', gdriveId);
+    await callback('gdrive', { code: 'good-code', state: again.searchParams.get('state') }).expect(302);
+    expect((await get('/destinations').expect(200)).body.data.find((d) => d.id === gdriveId).connection).toMatchObject({ connected: true, reauthRequired: false });
+    expect(app.ctx.backup.destinationConfig(gdriveId)).not.toHaveProperty('reauthRequired');
+    await put(`/destinations/${gdriveId}`, { enabled: false }).expect(200);
+    for (const s of SECRETS) expect(auditText(), s).not.toContain(s);
   });
 
   it('every cloud endpoint is root-only', async () => {

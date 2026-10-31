@@ -10,6 +10,11 @@
 // the Software service expands them per installed PHP version (php8.3-redis,
 // php83-php-pecl-redis, ea-php83-php-pecl-redis, php-pecl-redis) and falls back
 // to the distribution's unversioned meta-package when no PHP is installed yet.
+// The runtime itself and its build tools name the distribution's php-* meta
+// packages, which MultiPHP never installs (it installs php8.3-* / php83-php-*
+// sets, and on Sury the meta packages follow the newest branch): `phpVersioned`
+// names the packages that mean the per-version package once a PHP is installed
+// (true: every php-* name of the entry).
 import { componentByKey } from './stack-catalog.js';
 
 const EPEL = 'Needs the EPEL repository on RHEL, AlmaLinux and Rocky (dnf install epel-release) before this package resolves.';
@@ -41,8 +46,8 @@ export const PACKAGE_CATALOG = [
   { key: 'analog', category: 'web', stack: 'analog', recommended: false, configure: '/server-configuration/statistics-software-configuration' },
 
   // --- PHP -------------------------------------------------------------------
-  { key: 'php', category: 'php', stack: 'php', recommended: true, configure: '/software/multiphp-manager' },
-  { key: 'php-pecl-tools', category: 'php', label: 'PECL / PEAR build tools', description: 'pecl, pear and the PHP headers needed to build extensions that the distribution does not package (Software › Module Installers).', packages: { debian: ['php-pear', 'php-dev'], rhel: ['php-pear', 'php-devel'] }, recommended: false, configure: '/software/module-installers' },
+  { key: 'php', category: 'php', stack: 'php', phpVersioned: true, recommended: true, configure: '/software/multiphp-manager' },
+  { key: 'php-pecl-tools', category: 'php', label: 'PECL / PEAR build tools', description: 'pecl, pear and the PHP headers needed to build extensions that the distribution does not package (Software › Module Installers).', packages: { debian: ['php-pear', 'php-dev'], rhel: ['php-pear', 'php-devel'] }, phpVersioned: { debian: ['php-dev'], rhel: ['php-pear', 'php-devel'] }, recommended: false, configure: '/software/module-installers' },
   { key: 'php-mysql', category: 'php', label: 'MySQL / MariaDB driver', description: 'mysqli and PDO_MySQL; WordPress, Joomla and nearly every PHP application need it.', php: { debian: 'mysql', rhel: 'mysqlnd' }, recommended: true },
   { key: 'php-pgsql', category: 'php', label: 'PostgreSQL driver', description: 'pgsql and PDO_PgSQL for applications on PostgreSQL.', php: { debian: 'pgsql', rhel: 'pgsql' }, recommended: false },
   { key: 'php-sqlite3', category: 'php', label: 'SQLite driver', description: 'sqlite3 and PDO_SQLite for file-based databases (Nextcloud installs, small apps).', php: { debian: 'sqlite3', rhel: 'pdo' }, recommended: false },
@@ -140,8 +145,10 @@ export function resolveEntry(entry) {
     recommended: Boolean(entry.recommended), stack: entry.stack ?? null, capability: component?.capability ?? null, service: component?.service ?? null,
     units: entry.units ?? component?.units ?? [], requires: { ...(component?.requires ?? {}), ...(entry.requires ?? {}) },
     php: entry.php ? { ...entry.php } : null, packages, configure: entry.configure ?? null,
+    phpVersioned: entry.phpVersioned === true ? { debian: packages.debian.filter(isPhpName), rhel: packages.rhel.filter(isPhpName) } : entry.phpVersioned ? { debian: [...(entry.phpVersioned.debian ?? [])], rhel: [...(entry.phpVersioned.rhel ?? [])] } : null,
   };
 }
+const isPhpName = (name) => name.startsWith('php-');
 
 let resolved = null;
 export function catalogEntries() {
@@ -163,11 +170,27 @@ export function phpExtensionPackage(entry, version, family) {
   return `${prefix}${debianNames ? entry.php.debian : entry.php.rhel}`;
 }
 
+// The packages of a `phpVersioned` entry for one installed PHP version:
+// php-fpm is php8.3-fpm, php83-php-fpm or php-fpm by the version's layout
+// (as phpExtensionPackage names them); names the entry does not version
+// (Debian's single php-pear) stay as they are.
+export function phpRuntimePackages(entry, version, family) {
+  if (!entry?.phpVersioned || !PACKAGE_FAMILIES.includes(family)) return [];
+  const layout = version?.layout || 'unknown';
+  const prefix = version?.packagePrefix || (layout === 'debian' ? `php${version.id}-` : 'php-');
+  const debianNames = layout === 'debian' || (layout === 'unknown' && family === 'debian');
+  const fam = debianNames ? 'debian' : 'rhel';
+  const versioned = new Set(entry.phpVersioned[fam]);
+  return entry.packages[fam].map((name) => (versioned.has(name) ? `${prefix}${name.slice('php-'.length)}` : name));
+}
+
 // Package names an install of `entry` means on one family; for PHP extensions
-// the per-version names when versions are given, else the unversioned ones.
+// and the versioned runtime entries the per-version names when versions are
+// given, else the unversioned ones.
 export function packagesFor(entry, family, { phpVersions = [] } = {}) {
   if (!entry || !PACKAGE_FAMILIES.includes(family)) return [];
   if (entry.php && phpVersions.length) return [...new Set(phpVersions.map((v) => phpExtensionPackage(entry, v, family)).filter(Boolean))];
+  if (entry.phpVersioned && phpVersions.length) return [...new Set(phpVersions.flatMap((v) => phpRuntimePackages(entry, v, family)))];
   return [...entry.packages[family]];
 }
 

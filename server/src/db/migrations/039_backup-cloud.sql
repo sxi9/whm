@@ -3,8 +3,9 @@
 
 -- SQLite cannot widen the kind CHECK in place, so the destinations table is
 -- rebuilt with its rows carried over. Dropping the old table fires the
--- ON DELETE SET NULL of backup_uploads.destination_id, so those links are kept
--- aside and restored once the rebuilt table carries the name again.
+-- ON DELETE SET NULL of backup_uploads.destination_id and backups.destination_id,
+-- so those links are kept aside and restored once the rebuilt table carries the
+-- name again.
 CREATE TABLE IF NOT EXISTS backup_destinations_v2 (
   id                  INTEGER PRIMARY KEY,
   name                TEXT NOT NULL UNIQUE,
@@ -23,11 +24,15 @@ CREATE TABLE IF NOT EXISTS backup_destinations_v2 (
 INSERT OR IGNORE INTO backup_destinations_v2 (id, name, kind, config_enc, enabled, created_at, last_test_at, last_test_ok, last_test_message, updated_at)
   SELECT id, name, kind, config_enc, enabled, created_at, last_test_at, last_test_ok, last_test_message, updated_at FROM backup_destinations;
 CREATE TEMP TABLE backup_upload_links AS SELECT id, destination_id FROM backup_uploads WHERE destination_id IS NOT NULL;
+CREATE TEMP TABLE backup_links AS SELECT id, destination_id FROM backups WHERE destination_id IS NOT NULL;
 DROP TABLE backup_destinations;
 ALTER TABLE backup_destinations_v2 RENAME TO backup_destinations;
 UPDATE backup_uploads SET destination_id = (SELECT l.destination_id FROM backup_upload_links l WHERE l.id = backup_uploads.id)
   WHERE destination_id IS NULL AND id IN (SELECT id FROM backup_upload_links);
+UPDATE backups SET destination_id = (SELECT l.destination_id FROM backup_links l WHERE l.id = backups.id)
+  WHERE destination_id IS NULL AND id IN (SELECT id FROM backup_links);
 DROP TABLE backup_upload_links;
+DROP TABLE backup_links;
 
 -- Which copies are ciphertext (uploaded through the crypt remote): a copy made
 -- before encryption was enabled on its destination is fetched and pruned

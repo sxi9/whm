@@ -18,7 +18,7 @@ export const OAUTH_KINDS = ['gdrive', 'onedrive', 'dropbox'];
 export const RCLONE_ONLY_KINDS = ['gdrive', 'onedrive', 'dropbox', 'azureblob', 'b2'];
 export const CLOUD_KINDS = ['gdrive', 'onedrive', 'dropbox', 's3', 'azureblob', 'b2'];
 // Fields the panel keeps on a destination that the agent schema does not take.
-const PANEL_ONLY_FIELDS = ['accountName', 'accountEmail', 'connectedAt', 'cryptSince', 'transport'];
+const PANEL_ONLY_FIELDS = ['accountName', 'accountEmail', 'connectedAt', 'cryptSince', 'transport', 'reauthRequired'];
 const STATE_TTL_MS = 10 * 60 * 1000;
 
 export const PROVIDERS = [

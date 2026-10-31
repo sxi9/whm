@@ -24,7 +24,7 @@ export function deliveryLabel(alert) {
   if (!alert) return '';
   switch (alert.state) {
     case 'skipped': return 'not sent: below the minimum severity';
-    case 'pending': return 'queued for delivery';
+    case 'pending': return alert.admin?.skipped === 'no_recipients' ? 'waiting: no administrator can receive it yet (add a contact or route root mail)' : 'queued for delivery';
     case 'held': return 'held for the next digest';
     case 'failed': return `administrators: failed${alert.admin?.error ? ` (${alert.admin.error})` : ''}`;
     default: break;
@@ -145,7 +145,7 @@ export function SecurityAlertsCard() {
     <Card title="Security notifications" subtitle={`Critical Security Advisor findings, security updates found or applied, PHP advisories and panel security releases are raised as alerts. Administrators receive them as the contacts event security.alert; hosting accounts can be mailed an "emergency update applied" notice at their contact address, signed ${BRAND.product}.`}
       actions={<StatusPill status={settings.enabled ? 'enabled' : 'disabled'}>{settings.enabled ? 'Enabled' : 'Disabled'}</StatusPill>}>
       {settings.enabled && capability.contactsSubscribed === 0 && !capability.rootMail && (
-        <div className="banner banner-warning"><div><strong>No administrator receives security alerts yet</strong><p style={{ margin: '4px 0 0' }}>Add a contact above subscribed to <code>security.alert</code> (or to all events), or select the event under Edit System Mail Preferences so root is mailed.</p></div></div>
+        <div className="banner banner-warning"><div><strong>No administrator receives security alerts yet</strong><p style={{ margin: '4px 0 0' }}>Add a contact above subscribed to <code>security.alert</code> (or to all events), or select the event under Edit System Mail Preferences so root is mailed. Alerts raised meanwhile wait and go out as soon as somebody can receive them.</p></div></div>
       )}
       {draft.notifyAccounts && !transportLabel && (
         <div className="banner banner-warning"><div><strong>Hosting accounts cannot be mailed yet</strong><p style={{ margin: '4px 0 0' }}>Install Exim or configure an SMTP relay in the notification settings; alerts for accounts are recorded as skipped until then.</p></div></div>

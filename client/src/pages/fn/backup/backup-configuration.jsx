@@ -8,7 +8,7 @@ import { Field, TextInput, NumberInput, Select, Toggle, Button, FormActions, Err
 import { ProgressLog } from '../../../components/ProgressLog.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm, Modal } from '../../../components/Modal.jsx';
-import { RequestError, BackupCapabilityBanner, DestinationFields, emptyDestination, cleanDestination, KIND_LABELS } from '../../backup/Shared.jsx';
+import { RequestError, BackupCapabilityBanner, DestinationFields, emptyDestination, destinationFormState, cleanDestination, KIND_LABELS } from '../../backup/Shared.jsx';
 import { ProviderCards, OAuthClientModal, EncryptionKeyNotice, ConnectLink, OAUTH_KINDS, connectUrl, destinationTarget, uploadMethod } from '../../backup/CloudProviders.jsx';
 
 const SCHEDULES = [
@@ -173,7 +173,7 @@ export function Destinations() {
     setSaved(null);
     setName(d?.name || '');
     setEnabled(d ? d.enabled : true);
-    setCfg(d ? { ...emptyDestination(d.kind), ...Object.fromEntries(Object.entries(d.config).filter(([k]) => !k.startsWith('has_'))), kind: d.kind } : emptyDestination(kind));
+    setCfg(d ? destinationFormState(d) : emptyDestination(kind));
     setFormError(null); setTestResult(null);
   };
   const close = () => { setEditing(null); setStage('form'); setSaved(null); };
@@ -240,7 +240,7 @@ export function Destinations() {
             { key: 'kind', label: 'Type', render: (d) => KIND_LABELS[d.kind] || d.kind },
             { key: 'target', label: 'Target', render: (d) => <code>{destinationTarget(d)}</code> },
             { key: 'encrypted', label: 'Encryption', render: (d) => (d.encrypted ? <span className="pill pill-ok">encrypted</span> : <span className="pill pill-warn">plain</span>) },
-            { key: 'connection', label: 'Connection', render: (d) => (d.connection ? (d.connection.connected ? <span><span className="pill pill-ok">connected</span> <span className="muted">{d.connection.account}{d.connection.email ? ` (${d.connection.email})` : ''}</span></span> : <span><span className="pill pill-warn">not connected</span> <ConnectLink destination={d} className="btn btn-sm btn-primary" /></span>) : <span className="muted">{d.engine === 'rclone' ? 'rclone' : d.engine === 'native' ? 'signed requests' : d.engine === 'copy' ? 'file copy' : 'curl'}</span>) },
+            { key: 'connection', label: 'Connection', render: (d) => (d.connection ? (d.connection.connected ? <span><span className={`pill ${d.connection.reauthRequired ? 'pill-warn' : 'pill-ok'}`}>{d.connection.reauthRequired ? 'sign-in expired' : 'connected'}</span> <span className="muted">{d.connection.account}{d.connection.email ? ` (${d.connection.email})` : ''}</span>{d.connection.reauthRequired && <> <ConnectLink destination={d} className="btn btn-sm btn-primary" /></>}</span> : <span><span className="pill pill-warn">not connected</span> <ConnectLink destination={d} className="btn btn-sm btn-primary" /></span>) : <span className="muted">{d.engine === 'rclone' ? 'rclone' : d.engine === 'native' ? 'signed requests' : d.engine === 'copy' ? 'file copy' : 'curl'}</span>) },
             { key: 'enabled', label: 'Enabled', render: (d) => <StatusPill status={d.enabled ? 'enabled' : 'disabled'} /> },
             { key: 'lastTest', label: 'Last test', render: (d) => (d.lastTest ? <><StatusPill status={d.lastTest.ok ? 'ok' : 'failed'} /> <span className="muted">{formatDate(d.lastTest.at)} — {d.lastTest.message}</span></> : <span className="muted">never</span>) },
             { key: 'lastUpload', label: 'Last upload', render: (d) => (d.lastUpload ? <><StatusPill status={d.lastUpload.ok ? 'ok' : 'failed'} /> <span className="muted">{formatDate(d.lastUpload.at)} — {d.lastUpload.message}</span></> : <span className="muted">none yet</span>) },

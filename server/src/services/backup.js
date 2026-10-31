@@ -264,9 +264,10 @@ export function createBackupService(ctx) {
     try { cfg = row.config_enc ? JSON.parse(crypto.decrypt(row.config_enc)) : {}; } catch { cfg = { error: 'configuration could not be decrypted' }; }
     const oauth = OAUTH_KINDS.includes(row.kind);
     return {
-      id: row.id, name: row.name, kind: row.kind, enabled: Boolean(row.enabled), config: publicDestinationConfig(cfg),
+      // `crypt` is explicit even for a destination from before encryption existed, so an edit form shows the stored state.
+      id: row.id, name: row.name, kind: row.kind, enabled: Boolean(row.enabled), config: publicDestinationConfig({ ...cfg, crypt: Boolean(cfg.crypt) }),
       encrypted: Boolean(cfg.crypt), engine: engineOf({ kind: row.kind, ...cfg }),
-      connection: oauth ? { connected: Boolean(cfg.refreshToken), account: cfg.accountName ?? null, email: cfg.accountEmail ?? null, at: cfg.connectedAt ?? null } : null,
+      connection: oauth ? { connected: Boolean(cfg.refreshToken), reauthRequired: Boolean(cfg.refreshToken && cfg.reauthRequired), account: cfg.accountName ?? null, email: cfg.accountEmail ?? null, at: cfg.connectedAt ?? null } : null,
       lastTest: row.last_test_at ? { at: row.last_test_at, ok: Boolean(row.last_test_ok), message: row.last_test_message } : null,
       lastUpload: row.last_upload_at ? { at: row.last_upload_at, ok: Boolean(row.last_upload_ok), message: row.last_upload_message } : null,
       created_at: row.created_at, updated_at: row.updated_at,
@@ -304,6 +305,24 @@ export function createBackupService(ctx) {
     cfg.refreshToken = update.refreshToken;
     stmts.updateDestinationConfig.run(crypto.encrypt(JSON.stringify(cfg)), row.id);
     audit(req, { action: 'backup.destination.token_rotated', target: current.name });
+  }
+
+  // A provider that no longer honours the stored refresh token (invalid_grant:
+  // a Google consent screen left in testing expires tokens after 7 days, the
+  // grant was revoked) needs a new sign-in; the flag turns "connected" into
+  // "reconnect" in the UI and is cleared by the next successful call or connect.
+  const REAUTH_MESSAGE = /invalid_grant|token has been (expired|revoked)/i;
+  function noteAuthOutcome(row, err, req) {
+    if (!OAUTH_KINDS.includes(row.kind)) return;
+    const current = stmts.destinationById.get(row.id);
+    if (!current) return;
+    const cfg = destinationConfig(current);
+    const required = Boolean(err) && REAUTH_MESSAGE.test(String(err.message || ''));
+    if (Boolean(cfg.reauthRequired) === required) return;
+    delete cfg.kind;
+    if (required) cfg.reauthRequired = true; else delete cfg.reauthRequired;
+    stmts.updateDestinationConfig.run(crypto.encrypt(JSON.stringify(cfg)), row.id);
+    if (required) audit(req, { action: 'backup.destination.reauth_required', target: current.name, args: { provider: row.kind } });
   }
 
   // A fresh crypt password + salt for a destination; returned once with a
@@ -362,6 +381,7 @@ export function createBackupService(ctx) {
         encryptionKey = issued.shown;
       }
       if (!merged.crypt) merged.crypt = false;
+      if (kind === 'azureblob' && !merged.accountKey && !merged.sasToken) throw unprocessable('Azure Blob needs an account key or a SAS token', { 'config.accountKey': 'Enter the storage account key or a container SAS token; removing both leaves the destination unusable' });
     } else { merged = { ...current }; delete merged.kind; }
     if (patch.name && patch.name !== row.name && stmts.destinationByName.get(patch.name)) throw conflict(`A destination named "${patch.name}" already exists`);
     stmts.updateDestination.run({ id, name: patch.name ?? row.name, kind, config_enc: crypto.encrypt(JSON.stringify(merged)), enabled: patch.enabled == null ? row.enabled : patch.enabled ? 1 : 0 });
@@ -390,6 +410,7 @@ export function createBackupService(ctx) {
     if (!OAUTH_KINDS.includes(row.kind)) throw conflict(`Destination "${row.name}" is not an OAuth destination`);
     const cfg = destinationConfig(row);
     delete cfg.kind;
+    delete cfg.reauthRequired;
     Object.assign(cfg, fields);
     stmts.updateDestinationConfig.run(crypto.encrypt(JSON.stringify(cfg)), id);
     audit(req, { action: 'backup.destination.connect', target: row.name, args: { provider: row.kind, account: fields.accountName ?? null } });
@@ -408,6 +429,7 @@ export function createBackupService(ctx) {
     const config = agentConfig(row);
     const result = await op(opFor(config, 'backup.destination.test', 'backup.rclone.test'), { config }, req);
     persistTokenUpdate(row, result.tokenUpdate, req);
+    noteAuthOutcome(row, result.ok ? null : { message: result.message }, req);
     stmts.testDestination.run(result.ok ? 1 : 0, result.message, id);
     audit(req, { action: 'backup.destination.test', target: row.name, args: { ok: result.ok, message: result.message }, result: result.ok ? 'ok' : 'failed' });
     const { tokenUpdate: _t, ...rest } = result;
@@ -769,11 +791,13 @@ export function createBackupService(ctx) {
         const config = agentConfig(dest);
         const r = await op(opFor(config, 'backup.destination.upload', 'backup.rclone.upload'), { config, file: row.path }, req);
         persistTokenUpdate(dest, r.tokenUpdate, req);
+        noteAuthOutcome(dest, null, req);
         stmts.insertUpload.run(row.id, dest.id, dest.name, r.remotePath, 'done', null, config.crypt ? 1 : 0);
         stmts.uploadOutcome.run(1, `${path.basename(row.path)} (${row.account_name})`, dest.id);
         outcomes.push({ destination: dest.name, ok: true, remotePath: r.remotePath, encrypted: Boolean(config.crypt), ms: r.ms });
         log(`${row.account_name}: uploaded to ${dest.name} (${r.remotePath})`);
       } catch (err) {
+        noteAuthOutcome(dest, err, req);
         stmts.insertUpload.run(row.id, dest.id, dest.name, null, 'failed', err.message, 0);
         stmts.uploadOutcome.run(0, String(err.message).slice(0, 500), dest.id);
         outcomes.push({ destination: dest.name, ok: false, error: err.message });

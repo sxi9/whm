@@ -68,6 +68,7 @@ const hardeningApplyBody = z.object({
   confirmSshPort: port.optional(), extraTcp: z.array(port).max(32).optional(), extraUdp: z.array(port).max(32).optional(),
   jails: z.array(z.enum(F2B_JAILS)).min(1).max(F2B_JAILS.length).optional(), bantimeSeconds: z.number().int().min(60).max(31_536_000).optional(),
   findtimeSeconds: z.number().int().min(60).max(86_400).optional(), maxretry: z.number().int().min(1).max(100).optional(),
+  ignoreIps: z.array(ipOrCidr).max(20).optional(),
 }).strict();
 
 const modsecDirectives = z.object({

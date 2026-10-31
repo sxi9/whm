@@ -1042,7 +1042,7 @@ export function createAccountFunctionsService(ctx) {
     const foreign = Boolean(containing) && containing.account_id != null && containing.account_id !== account.id && !isRoot(user);
     if (containing && containing.domain === domain && foreign) return { status: 'failed', detail: `the DNS zone ${domain} belongs to another account and was left untouched`, code: 'forbidden', zone: domain };
     if (type === 'sub' && containing && containing.domain !== domain) {
-      if (foreign || (containing.account_id == null && !isRoot(user))) return { status: 'skipped', detail: `${domain} falls in zone ${containing.domain}, which belongs to another account and was left untouched; add the record there or create a zone for ${domain} in DNS Functions`, zone: containing.domain };
+      if (foreign || (containing.account_id == null && !isRoot(user))) return { status: 'skipped', detail: `${domain} falls in zone ${containing.domain}, which is not this account's and was left untouched; add the record there or create a zone for ${domain} in DNS Functions`, zone: containing.domain };
       if (!ip) return { status: 'skipped', detail: 'no IP address to publish' };
       const r = await ctx.dns.upsertRecords(containing.domain, domain, 'A', [{ value: ip }], req);
       return { status: r?.applied === false ? 'pending' : 'applied', detail: `${domain} A ${ip} in zone ${containing.domain}${r?.applied === false ? ' (published once BIND is installed)' : ''}`, zone: containing.domain };
@@ -1059,7 +1059,7 @@ export function createAccountFunctionsService(ctx) {
     if (!containing) return { status: 'skipped', detail: 'no zone holds this name' };
     if (containing.domain === domain) { await ctx.dns.deleteZone(domain, user, req); return { status: 'applied', detail: `zone ${domain} removed` }; }
     if (type !== 'sub') return { status: 'skipped', detail: `${domain} lives in zone ${containing.domain}, which was kept` };
-    if (containing.account_id !== account.id && !isRoot(user)) return { status: 'skipped', detail: `${domain} falls in zone ${containing.domain}, which belongs to another account and was left untouched` };
+    if (containing.account_id !== account.id && !isRoot(user)) return { status: 'skipped', detail: `${domain} falls in zone ${containing.domain}, which is not this account's and was left untouched` };
     await ctx.dns.upsertRecords(containing.domain, domain, 'A', [], req);
     return { status: 'applied', detail: `${domain} A records removed from zone ${containing.domain}` };
   }

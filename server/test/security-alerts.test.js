@@ -1,5 +1,8 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
 import { renderMail, accountText, KINDS, ALERT_EVENT, JOB } from '../src/services/security-alerts.js';
@@ -64,6 +67,9 @@ describe('security alerts service and routes', () => {
   let upgradable = { manager: 'apt', count: 0, security: 0, packages: [], rebootRequired: false };
   let feed = null;
   let feedUrl = '';
+  let defaultRootMailEvents = null;
+  const migration037b = path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/db/migrations/037b_security-alerts-root-mail.sql');
+  const until = async (fn, timeoutMs = 5000) => { const started = Date.now(); while (!fn()) { if (Date.now() - started > timeoutMs) throw new Error('condition not met in time'); await new Promise((r) => setTimeout(r, 25)); } };
   const post = (url, body = {}) => app.http.post(url).set('X-CSRF-Token', csrf).send(body);
   const put = (url, body = {}) => app.http.put(url).set('X-CSRF-Token', csrf).send(body);
   const get = (url) => app.http.get(url);
@@ -100,6 +106,7 @@ describe('security alerts service and routes', () => {
       'pkg.reboot_required': () => ({ rebootRequired: false }),
     });
     app = await createTestApp({ agent });
+    defaultRootMailEvents = app.ctx.settings.get('contacts.root_mail_events');
     app.ctx.jobs.start();
     csrf = await app.login();
     const r = await app.createUser('resell1', 'reseller');
@@ -376,6 +383,9 @@ describe('security alerts service and routes', () => {
     expect(overview.event).toBe('security.alert');
     expect(overview.kinds.map((k) => k.key)).toEqual(Object.keys(KINDS));
     expect(overview.capability).toMatchObject({ mailTransport: 'exim', contactsSubscribed: 0, rootMail: false, accountRecipients: 1 });
+    app.ctx.settings.set('contacts.root_mail_events', defaultRootMailEvents);
+    expect((await get('/api/server-contacts/security-alerts')).body.data.capability.rootMail).toBe(true);
+    app.ctx.settings.set('contacts.root_mail_events', []);
     expect(overview.panelUrl).toBe('http://panel.example.com:2086');
     expect(overview.alerts).toEqual([]);
     const saved = await put('/api/server-contacts/security-alerts/settings', { notifyAccounts: true, minSeverity: 'warning', digestMinutes: 15 });
@@ -393,5 +403,181 @@ describe('security alerts service and routes', () => {
       expect(res.status, `${method} ${url}`).toBe(403);
     }
     expect(app.ctx.securityAlerts.config().enabled).toBe(true);
+  });
+
+  it('routes security.alert to root mail out of the box; migration 037b is idempotent and keeps an operator list', () => {
+    expect(defaultRootMailEvents).toContain('security.alert');
+    expect(defaultRootMailEvents).toContain('service.down');
+    const sql = fs.readFileSync(migration037b, 'utf8');
+    app.ctx.settings.set('contacts.root_mail_events', ['backup.failed']);
+    app.ctx.db.exec(sql);
+    app.ctx.db.exec(sql);
+    expect(app.ctx.settings.get('contacts.root_mail_events')).toEqual(['backup.failed', 'security.alert']);
+    app.ctx.db.prepare("DELETE FROM settings WHERE key = 'contacts.root_mail_events'").run();
+    app.ctx.db.exec(sql);
+    expect(app.ctx.settings.get('contacts.root_mail_events')).toEqual(defaultRootMailEvents);
+  });
+
+  it('an alert nobody can receive stays pending and goes out once a contact subscribes', async () => {
+    expect(app.ctx.securityAlerts.recipientsChanged()).toBe('none');
+    const r = app.ctx.securityAlerts.raise({ kind: 'advisor.critical', title: 'Root has no 2FA', body: 'detail', dedupeKey: 'advisor:2fa.root' });
+    expect(r.delivery).toBe('queued');
+    const job = await waitDelivery();
+    expect(job.status).toBe('done');
+    expect(job.result.admins).toMatchObject({ matched: 0, sent: 0, failed: 0, skipped: 'no_recipients', addressed: false });
+    expect(app.ctx.securityAlerts.get(r.alert.id)).toMatchObject({ state: 'pending', admin: { skipped: 'no_recipients' }, notifiedAdminsAt: null });
+    expect(app.ctx.securityAlerts.config().lastDeliveryAt).toBeNull();
+    expect((await get('/api/server-contacts/security-alerts')).body.data.stats.pending).toBe(1);
+    expect(app.ctx.jobs.get(job.id).logs.some((l) => l.level === 'warn' && /stays waiting/.test(l.line))).toBe(true);
+    expect(sent).toHaveLength(0);
+    expect(app.ctx.securityAlerts.recipientsChanged()).toBe('no_recipients');
+    // A contact subscribed to the event triggers the retry.
+    expect((await post('/api/server-contacts/contacts', { name: 'Ops', channel: 'email', address: 'ops@example.com', events: ['security.alert'] })).status).toBe(201);
+    const retry = await waitDelivery();
+    expect(retry.id).not.toBe(job.id);
+    expect(retry.result.admins).toMatchObject({ matched: 1, sent: 1, addressed: true });
+    expect(sent.map((m) => m.to[0])).toEqual(['ops@example.com']);
+    const a = app.ctx.securityAlerts.get(r.alert.id);
+    expect(a.state).toBe('sent');
+    expect(a.notifiedAdminsAt).toBeTruthy();
+    expect(app.ctx.securityAlerts.config().lastDeliveryAt).toBeTruthy();
+    // Routing the event to root mail schedules the waiting alerts as well.
+    app.ctx.db.prepare('DELETE FROM contacts').run();
+    sent = [];
+    const b = app.ctx.securityAlerts.raise({ kind: 'advisor.critical', title: 'B', dedupeKey: 'advisor:b' });
+    const waiting = await waitDelivery();
+    expect(app.ctx.securityAlerts.get(b.alert.id).state).toBe('pending');
+    expect(app.ctx.securityAlerts.recipientsChanged()).toBe('no_recipients');
+    expect((await put('/api/server-contacts/mail-preferences', { rootMailEvents: ['security.alert'] })).status).toBe(200);
+    const viaRoot = await waitDelivery();
+    expect(viaRoot.id).not.toBe(waiting.id);
+    expect(viaRoot.result.admins).toMatchObject({ addressed: true, sent: 1 });
+    expect(sent).toHaveLength(1);
+    expect(sent[0].subject).toContain('Security alert: B');
+    expect(app.ctx.securityAlerts.get(b.alert.id).state).toBe('sent');
+    expect(app.ctx.securityAlerts.recipientsChanged()).toBe('none');
+  });
+
+  it('a generic flush honours each test or notice audience choice instead of the global setting', async () => {
+    addAccount('alice', 'alice@example.org');
+    app.ctx.settings.set('security.alerts.notify_accounts', true);
+    await withNotifySpy(async (calls) => {
+      const test = await post('/api/server-contacts/security-alerts/test', { includeAccounts: false });
+      expect(test.status).toBe(202);
+      expect(test.body.data.alert.data).toMatchObject({ notifyAccounts: false });
+      await waitForJob(app.ctx, test.body.data.job.id);
+      const notice = await post('/api/server-contacts/security-alerts/raise', { title: 'Admins only', body: 'internal', notifyAccounts: false });
+      expect(notice.body.data.alert.data).toMatchObject({ notifyAccounts: false });
+      await waitForJob(app.ctx, notice.body.data.job.id);
+      expect(sent).toHaveLength(0);
+      // The panel restarted while the one-off jobs ran: the rows are pending
+      // again and the boot-time generic flush picks them up.
+      app.ctx.db.prepare("UPDATE security_alerts SET state = 'pending', notified_admins_at = NULL, accounts_result_json = NULL").run();
+      const flush = await post('/api/server-contacts/security-alerts/deliver');
+      expect(flush.status).toBe(202);
+      const job = await waitForJob(app.ctx, flush.body.data.job.id);
+      expect(job.result).toMatchObject({ delivered: 2, accounts: null });
+      expect(sent).toHaveLength(0);
+      for (const a of alerts()) expect(a).toMatchObject({ state: 'sent', accounts: { skipped: 'notify_accounts_off' } });
+      // A notice the admin did send to accounts is mailed to them by a generic flush, once.
+      const toAll = app.ctx.securityAlerts.raise({ kind: 'manual', title: 'Emergency update pushed', body: 'We patched tonight.', dedupeKey: 'manual:flush', force: true, defer: true, data: { sentBy: 'root', notifyAccounts: true } });
+      app.ctx.settings.set('security.alerts.notify_accounts', false);
+      const flush2 = await post('/api/server-contacts/security-alerts/deliver');
+      const job2 = await waitForJob(app.ctx, flush2.body.data.job.id);
+      expect(job2.result.accounts).toMatchObject({ sent: 1, failed: 0 });
+      expect(sent.map((m) => m.to[0])).toEqual(['alice@example.org']);
+      expect(sent[0].subject).toBe('[HST Panel] Emergency update pushed');
+      expect(app.ctx.securityAlerts.get(toAll.alert.id).accounts).toMatchObject({ sent: 1 });
+      expect(calls).toHaveLength(4);
+    });
+  });
+
+  it('deliveries run one at a time: a flush started while another runs never repeats an alert to administrators', async () => {
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const calls = [];
+    const original = app.ctx.contacts.notify;
+    app.ctx.contacts.notify = async (event, payload, req) => {
+      if (event !== ALERT_EVENT) return original(event, payload, req);
+      calls.push(payload.data.alerts.map((a) => a.id));
+      if (calls.length === 1) await gate;
+      return { event, matched: 1, sent: 1, failed: 0, deliveries: [] };
+    };
+    try {
+      const first = app.ctx.securityAlerts.raise({ kind: 'advisor.critical', title: 'A', dedupeKey: 'c1' });
+      const jobA = lastDeliverJob();
+      await until(() => calls.length === 1);
+      const second = app.ctx.securityAlerts.raise({ kind: 'advisor.critical', title: 'B', dedupeKey: 'c2' });
+      expect(second.delivery).toBe('queued');
+      const jobB = lastDeliverJob();
+      expect(jobB.id).not.toBe(jobA.id);
+      await until(() => app.ctx.jobs.get(jobB.id).status === 'running');
+      await new Promise((r) => setTimeout(r, 100));
+      expect(calls).toHaveLength(1);
+      release();
+      await waitForJob(app.ctx, jobA.id);
+      const b = await waitForJob(app.ctx, jobB.id);
+      expect(calls).toEqual([[first.alert.id], [second.alert.id]]);
+      expect(b.result.alertIds).toEqual([second.alert.id]);
+      expect(alerts().map((a) => a.state)).toEqual(['sent', 'sent']);
+    } finally { app.ctx.contacts.notify = original; }
+  });
+
+  it('an unapplied security-update set alerts once, not on every nightly check; a new package or version alerts again', async () => {
+    const libssl = { name: 'libssl3', current: '3.0.1', candidate: '3.0.2', security: true };
+    upgradable = { manager: 'apt', count: 1, security: 1, packages: [libssl], rebootRequired: false };
+    app.ctx.settings.setMany({ 'security.alerts.min_severity': 'warning', 'software.updates.security_alerted': null });
+    const check = () => waitForJob(app.ctx, app.ctx.jobs.enqueue('software.update.check', {}).id);
+    await withNotifySpy(async (calls) => {
+      await check();
+      expect(alerts()).toHaveLength(1);
+      expect(app.ctx.settings.get('software.updates.security_alerted')).toMatchObject({ entries: ['libssl3 3.0.2'] });
+      await waitDelivery();
+      expect(calls).toHaveLength(1);
+      // Day 2 with a slower index refresh: the 24 h key window has passed but
+      // the set is the same; a page load re-recording last_check changes nothing.
+      app.ctx.db.prepare("UPDATE security_alerts SET created_at = datetime('now', '-25 hours')").run();
+      await app.ctx.software.update.status({ cached: false });
+      const day2 = await check();
+      expect(day2.status).toBe('done');
+      expect(alerts()).toHaveLength(1);
+      expect(app.ctx.jobs.get(day2.id).logs.some((l) => /alerted before/.test(l.line))).toBe(true);
+      // A new security package joins the set.
+      upgradable = { manager: 'apt', count: 2, security: 2, packages: [libssl, { name: 'openssh-server', current: '9.6', candidate: '9.7', security: true }], rebootRequired: false };
+      await check();
+      expect(alerts()).toHaveLength(2);
+      expect(alerts()[0]).toMatchObject({ kind: 'updates.security_available', title: '2 security updates available on panel.example.com', data: { packages: ['libssl3', 'openssh-server'] } });
+      // Everything applied: the record clears, so the same package with a newer candidate alerts again.
+      upgradable = { manager: 'apt', count: 0, security: 0, packages: [], rebootRequired: false };
+      await check();
+      expect(app.ctx.settings.get('software.updates.security_alerted')).toBeNull();
+      upgradable = { manager: 'apt', count: 1, security: 1, packages: [{ ...libssl, current: '3.0.2', candidate: '3.0.3' }], rebootRequired: false };
+      app.ctx.db.prepare("UPDATE security_alerts SET created_at = datetime('now', '-25 hours')").run();
+      await check();
+      expect(alerts()).toHaveLength(3);
+      expect(alerts()[0]).toMatchObject({ kind: 'updates.security_available', title: '1 security update available on panel.example.com', dedupeKey: expect.stringMatching(/^updates\.security_available:[0-9a-f]{16}$/) });
+    });
+  });
+
+  it('checks the panel release feed on a schedule that runs only while an update URL is set', async () => {
+    expect(app.ctx.jobs.types()).toContain('software.panel.check');
+    const schedule = () => app.ctx.scheduler.list().find((s) => s.name === 'panel-update-check');
+    expect(schedule()).toMatchObject({ job_type: 'software.panel.check', cron: '23 6 * * *' });
+    expect(Boolean(schedule().enabled)).toBe(false);
+    const skipped = await waitForJob(app.ctx, app.ctx.jobs.enqueue('software.panel.check', {}).id);
+    expect(skipped.result).toEqual({ skipped: true });
+    await withNotifySpy(async (calls) => {
+      expect((await put('/api/software/panel/update/settings', { url: feedUrl })).status).toBe(200);
+      expect(Boolean(schedule().enabled)).toBe(true);
+      const job = await waitForJob(app.ctx, app.ctx.jobs.enqueue('software.panel.check', {}).id);
+      expect(job.status).toBe('done');
+      expect(job.result).toMatchObject({ ok: true, latest: '99.0.0', updateAvailable: true, security: true, error: null });
+      expect(alerts()).toHaveLength(1);
+      expect(alerts()[0]).toMatchObject({ kind: 'panel.security_release', dedupeKey: 'panel.security_release:99.0.0', source: 'software.panel.check' });
+      await waitDelivery();
+      expect(calls).toHaveLength(1);
+      expect((await put('/api/software/panel/update/settings', { url: '' })).status).toBe(200);
+      expect(Boolean(schedule().enabled)).toBe(false);
+    });
   });
 });

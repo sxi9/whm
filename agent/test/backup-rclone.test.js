@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { rcloneObscure, renderRcloneConf, rcloneTarget, readTokenUpdate, parseLsjson, scrubSecrets, needsRclone, destinationConfig } from '../src/ops/backup.js';
+import { rcloneObscure, renderRcloneConf, rcloneTarget, readTokenUpdate, parseLsjson, scrubSecrets, needsRclone, destinationConfig, parseRcloneVersion, resetRcloneVersion } from '../src/ops/backup.js';
 
 // exec is spied with the real implementation behind it; every rclone call is
 // answered by a fake that records argv and reads the rendered config file at
@@ -12,12 +12,14 @@ vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
   return { ...mod, exec: vi.fn(mod.exec), hasBinary: vi.fn(mod.hasBinary) };
 });
-const { exec, hasBinary } = await import('../src/exec.js');
+const { exec, hasBinary, ExecError } = await import('../src/exec.js');
 
 const ctx = createContext();
 const GDRIVE = { kind: 'gdrive', clientId: '123.apps.googleusercontent.com', clientSecret: 'GOCSPX-clientsecretvalue', refreshToken: '1//refresh-token-value-abc', folder: 'whm-backups', crypt: true, cryptPassword: 'cryptpassword-plain-value', cryptPassword2: 'cryptsalt-plain-value' };
 const S3 = { kind: 's3', bucket: 'whm-backups', region: 'eu-west-1', accessKey: 'AKIA', secretKey: 'topsecretkey', prefix: 'panel/' };
 const SFTP = { kind: 'sftp', host: 'sftp.example.com', port: 22, username: 'u', password: 'sftp-password', path: '/srv/backups', insecure: true, crypt: true, cryptPassword: 'pw', cryptPassword2: 'salt' };
+const AZURE_SAS = { kind: 'azureblob', account: 'acct', container: 'backups', sasToken: 'sv=2024&sig=supersecretsignature' };
+const NAME = 'backup-10.26.2026_02-00-00_alice.tar.gz';
 
 async function opError(promise) {
   try {
@@ -242,13 +244,91 @@ describe('rclone calls with a mocked binary', () => {
     expect(seen.at(-1).conf).toBe('[whm]\ntype = azureblob\naccount = acct\nsas_url = https://acct.blob.core.windows.net/backups?sv=2024&sig=abc\n');
     expect(seen.at(-1).argv.at(-1)).toBe('whm:backups/whm');
     await run({ kind: 'b2', keyId: '0012abc', applicationKey: 'K00abc', bucket: 'whm-backups' });
-    expect(seen.at(-1).conf).toBe('[whm]\ntype = b2\naccount = 0012abc\nkey = K00abc\n');
+    expect(seen.at(-1).conf).toBe('[whm]\ntype = b2\naccount = 0012abc\nkey = K00abc\nhard_delete = true\n');
+    // Pruning must delete on Drive and B2, not trash or hide the (billed) object.
+    await run(GDRIVE);
+    expect(seen.at(-1).conf).toContain('"expiry":"2000-01-01T00:00:00Z"}\nuse_trash = false\n\n[whm]\ntype = crypt\n');
+    await run({ ...GDRIVE, crypt: false, cryptPassword: undefined, cryptPassword2: undefined, rootFolderId: 'folder_1' });
+    expect(seen.at(-1).conf).toMatch(/\nroot_folder_id = folder_1\nuse_trash = false\n$/);
     await run({ kind: 'onedrive', clientId: 'cid', clientSecret: 'csec', refreshToken: 'rt', driveId: 'b!abc', driveType: 'business', folder: 'Backups/whm' });
     expect(seen.at(-1).conf).toContain('type = onedrive\nclient_id = cid\nclient_secret = csec\ntoken = {"access_token":"","token_type":"Bearer","refresh_token":"rt","expiry":"2000-01-01T00:00:00Z"}\ndrive_id = b!abc\ndrive_type = business\n');
     expect(seen.at(-1).argv.at(-1)).toBe('whm:Backups/whm');
     await run({ kind: 'local', dir: '/backup/offsite', crypt: true, cryptPassword: 'p', cryptPassword2: 's' });
     expect(seen.at(-1).conf).toMatch(/^\[whmbase\]\ntype = local\n\n\[whm\]\ntype = crypt\nremote = whmbase:\/backup\/offsite\n/);
     expect(rcloneDirs()).toEqual([]);
+  });
+
+  it('a killed or unstartable rclone reports a scrubbed message and drops the raw stderr and argv', async () => {
+    const calls = fakeRclone(({ argv }) => { throw new ExecError('timeout', '"rclone" did not finish within 7205000ms', { bin: '/usr/bin/rclone', argv, stderr: `2026/10/30 10:00:00 ERROR : PUT https://acct.blob.core.windows.net/backups?${AZURE_SAS.sasToken} : 403\n` }); });
+    const err = await opError(runOp('backup.rclone.upload', { config: AZURE_SAS, file: ARCHIVE }, ctx));
+    expect(err.code).toBe('timeout');
+    expect(err.message).toBe('upload to azureblob: "rclone" did not finish within 7205000ms');
+    expect(err.details).toEqual({ exitCode: null });
+    expect(JSON.stringify({ message: err.message, details: err.details })).not.toContain('supersecretsignature');
+    expect(fs.existsSync(calls[0].confPath)).toBe(false);
+    expect(rcloneDirs()).toEqual([]);
+    fakeRclone(({ argv }) => { throw new ExecError('spawn_failed', `Could not run "rclone": spawn EAGAIN ${GDRIVE.refreshToken}`, { bin: '/usr/bin/rclone', argv }); });
+    const spawn = await opError(runOp('backup.rclone.list', { config: GDRIVE }, ctx));
+    expect(spawn.code).toBe('destination_failed');
+    expect(spawn.message).toBe('list gdrive: Could not run "rclone": spawn EAGAIN [redacted]');
+    expect(spawn.details).toEqual({ exitCode: null });
+    const probe = await runOp('backup.rclone.test', { config: GDRIVE }, ctx);
+    expect(probe).toMatchObject({ ok: false, code: 'destination_failed', message: 'test upload: Could not run "rclone": spawn EAGAIN [redacted]' });
+    expect(rcloneDirs()).toEqual([]);
+  });
+
+  it('delete tolerates rclone 1.60 reporting a missing file as a plain error, but not other failures', async () => {
+    fakeRclone(() => ({ code: 1, stderr: `2026/10/30 10:00:00 Failed to deletefile: whm:${NAME} is a directory or doesn't exist\n` }));
+    expect(await runOp('backup.rclone.delete', { config: GDRIVE, remoteName: NAME }, ctx)).toEqual({ kind: 'gdrive', name: NAME, removed: false, tokenUpdate: null });
+    fakeRclone(() => ({ code: 2, stderr: 'ERROR : object not found\n' }));
+    expect(await runOp('backup.rclone.delete', { config: GDRIVE, remoteName: NAME }, ctx)).toMatchObject({ removed: false });
+    fakeRclone(() => ({ code: 1, stderr: `Failed to deletefile: didn't find section in config file for ${GDRIVE.clientSecret}\n` }));
+    const err = await opError(runOp('backup.rclone.delete', { config: GDRIVE, remoteName: NAME }, ctx));
+    expect(err.code).toBe('destination_failed');
+    expect(err.details).toEqual({ exitCode: 1, detail: "Failed to deletefile: didn't find section in config file for [redacted]" });
+    fakeRclone(() => ({ code: 2, stderr: '2026/10/30 10:00:00 ERROR : connection refused\n' }));
+    expect((await opError(runOp('backup.rclone.delete', { config: GDRIVE, remoteName: NAME }, ctx))).message).toBe('delete on gdrive: the operation failed (connection refused)');
+    expect(rcloneDirs()).toEqual([]);
+  });
+
+  it('writes the Azure endpoint of the account-key form the way the installed rclone reads it', async () => {
+    expect(parseRcloneVersion('rclone v1.60.1\n- os/version: ubuntu 24.04 (64 bit)\n')).toEqual({ major: 1, minor: 60 });
+    expect(parseRcloneVersion('rclone v1.68.2\n')).toEqual({ major: 1, minor: 68 });
+    expect(parseRcloneVersion('')).toBeNull();
+    const seen = [];
+    let version = 'rclone v1.60.1\n- os/version: ubuntu 24.04 (64 bit)\n';
+    const calls = fakeRclone(({ argv, conf, sub }) => { if (argv[0] === 'version') return { stdout: version }; seen.push({ conf, argv }); return sub === 'lsjson' ? { stdout: '[]' } : {}; });
+    const probes = () => calls.filter((c) => c.argv[0] === 'version').length;
+    const run = (config) => runOp('backup.rclone.list', { config }, ctx);
+    const china = { kind: 'azureblob', account: 'acct', container: 'backups', accountKey: 'K3yvalue', endpoint: 'https://acct.blob.core.chinacloudapi.cn' };
+    resetRcloneVersion();
+    await run(china);
+    expect(seen.at(-1).conf).toBe('[whm]\ntype = azureblob\naccount = acct\nkey = K3yvalue\nendpoint = blob.core.chinacloudapi.cn\n');
+    await run(china);
+    expect(probes()).toBe(1);
+    // An endpoint 1.60 cannot compose from the account name is refused, not mangled.
+    for (const endpoint of ['http://127.0.0.1:10000/devstoreaccount1', 'https://other.blob.core.chinacloudapi.cn', 'https://acct.blob.core.chinacloudapi.cn/path']) {
+      const err = await opError(run({ ...china, endpoint }));
+      expect(err.code, endpoint).toBe('unsupported');
+      expect(err.message).toMatch(/rclone 1\.60 .*SAS token .*1\.61/);
+    }
+    // The SAS form carries the URL itself and never needs the probe; the public cloud neither.
+    await run({ ...AZURE_SAS, endpoint: 'https://acct.blob.core.chinacloudapi.cn' });
+    expect(seen.at(-1).conf).toBe('[whm]\ntype = azureblob\naccount = acct\nsas_url = https://acct.blob.core.chinacloudapi.cn/backups?sv=2024&sig=supersecretsignature\nendpoint = https://acct.blob.core.chinacloudapi.cn\n');
+    await run({ ...china, endpoint: undefined });
+    expect(seen.at(-1).conf).toBe('[whm]\ntype = azureblob\naccount = acct\nkey = K3yvalue\n');
+    expect(probes()).toBe(1);
+    resetRcloneVersion();
+    version = 'rclone v1.68.2\n';
+    await run(china);
+    expect(seen.at(-1).conf).toBe('[whm]\ntype = azureblob\naccount = acct\nkey = K3yvalue\nendpoint = https://acct.blob.core.chinacloudapi.cn\n');
+    resetRcloneVersion();
+    version = '';
+    await run(china);
+    expect(seen.at(-1).conf).toContain('endpoint = https://acct.blob.core.chinacloudapi.cn\n');
+    expect(probes()).toBe(3);
+    expect(rcloneDirs()).toEqual([]);
+    resetRcloneVersion();
   });
 
   it('a local directory outside the allowed roots is refused before rclone runs', async () => {

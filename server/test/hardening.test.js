@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent } from './support/app.js';
-import { sshChecks, ITEMS, SSH_HARDENING } from '../src/services/hardening.js';
+import { sshChecks, sshKeyLoginBlocked, ITEMS, SSH_HARDENING } from '../src/services/hardening.js';
 
 const BIN_FULL = { sshd: true, 'ssh-keygen': true, iptables: true, nft: true, 'fail2ban-client': true, 'apt-get': true, exim4: true, dovecot: true, 'pure-ftpd': true, named: true, apache2ctl: true };
 
@@ -15,7 +15,7 @@ const get = (url) => app.http.get(url);
 const auditRows = (action) => app.ctx.db.prepare('SELECT * FROM audit_log WHERE action = ? ORDER BY id').all(action);
 
 const sshdGet = (effective = {}, managed = {}) => () => ({ installed: true, source: 'sshd -T', effective: { passwordauthentication: 'yes', permitrootlogin: 'yes', port: '22', maxauthtries: '6', logingracetime: '120', x11forwarding: 'yes', ...effective }, managed, managedPath: '/etc/ssh/sshd_config.d/00-whm.conf', legacyPath: null, includeActive: true, configPresent: true, shadowed: [] });
-const fwStatus = (over = {}) => () => ({ backend: 'iptables', applied: false, chainPresent: false, policy: 'ACCEPT', hooked: false, families: {}, sshdPorts: [22], hubUnit: false, conflicts: { firewalld: false, ufw: false }, tcp: [], udp: [], ...over });
+const fwStatus = (over = {}) => () => ({ backend: 'iptables', applied: false, chainPresent: false, policy: 'ACCEPT', hooked: false, families: {}, sshdPorts: [22], sshdSocket: null, hubUnit: false, hubPorts: [], conflicts: { firewalld: false, ufw: false }, tcp: [], udp: [], ...over });
 
 async function provision(installed) {
   app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, installed ? Boolean(BIN_FULL[n]) : false])));
@@ -86,6 +86,26 @@ describe('sshChecks', () => {
   });
 });
 
+describe('sshKeyLoginBlocked', () => {
+  const ok = { pubkeyauthentication: 'yes', authenticationmethods: 'any', authorizedkeysfile: '.ssh/authorized_keys .ssh/authorized_keys2' };
+  it('passes only when sshd would actually accept a key from /root/.ssh/authorized_keys', () => {
+    expect(sshKeyLoginBlocked(ok, 1)).toBeNull();
+    expect(sshKeyLoginBlocked({}, 1)).toBeNull();
+    expect(sshKeyLoginBlocked(ok, 0)).toMatch(/no authorized SSH key/);
+    expect(sshKeyLoginBlocked({ ...ok, pubkeyauthentication: 'no' }, 1)).toMatch(/PubkeyAuthentication is off/);
+    expect(sshKeyLoginBlocked({ ...ok, pubkeyauthentication: 'No' }, 1)).toMatch(/PubkeyAuthentication is off/);
+    expect(sshKeyLoginBlocked({ ...ok, authenticationmethods: 'password' }, 1)).toMatch(/AuthenticationMethods/);
+    expect(sshKeyLoginBlocked({ ...ok, authenticationmethods: 'password,publickey' }, 1)).toMatch(/AuthenticationMethods/);
+    expect(sshKeyLoginBlocked({ ...ok, authenticationmethods: 'publickey,keyboard-interactive' }, 1)).toMatch(/AuthenticationMethods/);
+    expect(sshKeyLoginBlocked({ ...ok, authenticationmethods: 'publickey,password publickey' }, 1)).toBeNull();
+    expect(sshKeyLoginBlocked({ ...ok, authenticationmethods: 'publickey' }, 1)).toBeNull();
+    expect(sshKeyLoginBlocked({ ...ok, authorizedkeysfile: '/etc/ssh/authorized_keys/%u' }, 1)).toMatch(/AuthorizedKeysFile/);
+    expect(sshKeyLoginBlocked({ ...ok, authorizedkeysfile: 'none' }, 1)).toMatch(/AuthorizedKeysFile/);
+    expect(sshKeyLoginBlocked({ ...ok, authorizedkeysfile: '/etc/ssh/authorized_keys/%u %h/.ssh/authorized_keys' }, 1)).toBeNull();
+    expect(sshKeyLoginBlocked({ ...ok, authorizedkeysfile: '/root/.ssh/authorized_keys' }, 1)).toBeNull();
+  });
+});
+
 describe('GET /security/hardening aggregates one row per item with a live status', () => {
   it('lists the five items in catalogue order with status, reason and desired flag', async () => {
     const res = await get('/api/security/hardening');
@@ -147,11 +167,23 @@ describe('fail2ban', () => {
     expect(call.args.jails).toEqual(expect.arrayContaining(['whm-panel', 'sshd', 'exim', 'dovecot', 'pure-ftpd', 'apache-auth', 'apache-badbots']));
     expect(call.args.jails).not.toContain('proftpd');
     expect(call.args).toMatchObject({ bantime: 7200, findtime: 600, maxretry: 5, panelPorts: [2086, 2087] });
+    // The applying address is exempted (panel jail only) in its plain IPv4 form, never as ::ffff:a.b.c.d.
+    expect(call.args.ignoreIps).toEqual(['127.0.0.1']);
     expect(app.ctx.hardening.desired('fail2ban')).toBe(true);
     expect(app.ctx.settings.get('security.hardening.fail2ban.bantime_seconds')).toBe(7200);
     const rows = auditRows('security.hardening.apply').filter((r) => r.target === 'fail2ban');
     expect(rows).toHaveLength(1);
-    expect(JSON.parse(rows[0].args_redacted)).toMatchObject({ bantime: 7200 });
+    expect(JSON.parse(rows[0].args_redacted)).toMatchObject({ bantime: 7200, ignoreIps: ['127.0.0.1'] });
+  });
+
+  it('an explicit ignoreIps list replaces the applying address and is validated as IP/CIDR', async () => {
+    const res = await post('/api/security/hardening/fail2ban/apply', { ignoreIps: ['203.0.113.0/24', '2001:DB8::5', '203.0.113.0/24'] });
+    expect(res.status).toBe(200);
+    expect(app.agent.callsTo('hardening.jails.apply')[0].args.ignoreIps).toEqual(['203.0.113.0/24', '2001:db8::5']);
+    expect((await post('/api/security/hardening/fail2ban/apply', { ignoreIps: [] })).status).toBe(200);
+    expect(app.agent.callsTo('hardening.jails.apply')[1].args.ignoreIps).toEqual([]);
+    for (const bad of [['example.com'], ['203.0.113.5/33'], ['1.2.3.4 -j ACCEPT'], 'not-a-list']) expect((await post('/api/security/hardening/fail2ban/apply', { ignoreIps: bad })).status, JSON.stringify(bad)).toBe(422);
+    expect(app.agent.callsTo('hardening.jails.apply')).toHaveLength(2);
   });
 
   it('rejects jails outside the catalogue and bad ban times before the agent is called', async () => {
@@ -227,6 +259,43 @@ describe('ssh', () => {
     app.agent.set('sec.ssh_keys.list', () => ({ dir: '/root/.ssh', keys: [], authorized: [], keygenAvailable: true }));
   });
 
+  it('refuses while sshd would not accept root\'s key, and reports it as blocked in the status', async () => {
+    app.agent.set('sec.ssh_keys.list', () => ({ dir: '/root/.ssh', keys: [], authorized: [{ type: 'ssh-ed25519', fingerprint: 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' }], keygenAvailable: true }));
+    for (const [effective, pattern] of [
+      [{ pubkeyauthentication: 'no' }, /PubkeyAuthentication is off/],
+      [{ authenticationmethods: 'password' }, /AuthenticationMethods/],
+      [{ authorizedkeysfile: '/etc/ssh/authorized_keys/%u' }, /AuthorizedKeysFile/],
+    ]) {
+      app.agent.set('sec.sshd.get', sshdGet(effective));
+      app.agent.calls.length = 0;
+      const res = await post('/api/security/hardening/ssh/apply');
+      expect(res.status, JSON.stringify(effective)).toBe(422);
+      expect(res.body.error.fields.authorizedKeys[0]).toMatch(pattern);
+      expect(app.agent.callsTo('sec.sshd.set')).toHaveLength(0);
+      const byId = Object.fromEntries((await get('/api/security/hardening')).body.data.items.map((i) => [i.id, i]));
+      expect(byId.ssh.detail.blocked).toMatch(pattern);
+      expect(byId.ssh.detail.authorizedKeys).toBe(1);
+    }
+    app.agent.set('sec.sshd.get', sshdGet({ pubkeyauthentication: 'yes', authorizedkeysfile: '%h/.ssh/authorized_keys' }));
+    expect((await get('/api/security/hardening')).body.data.items.find((i) => i.id === 'ssh').detail.blocked).toBeNull();
+    app.agent.set('sec.sshd.get', sshdGet());
+    app.agent.set('sec.ssh_keys.list', () => ({ dir: '/root/.ssh', keys: [], authorized: [], keygenAvailable: true }));
+  });
+
+  it('keeps forced-commands-only, which prohibit-password would loosen', async () => {
+    app.agent.set('sec.ssh_keys.list', () => ({ dir: '/root/.ssh', keys: [], authorized: [{ type: 'ssh-ed25519', fingerprint: 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' }], keygenAvailable: true }));
+    app.agent.set('sec.sshd.get', sshdGet({ permitrootlogin: 'forced-commands-only' }));
+    expect((await post('/api/security/hardening/ssh/apply')).status).toBe(200);
+    expect(app.agent.callsTo('sec.sshd.set')[0].args.settings.PermitRootLogin).toBe('forced-commands-only');
+    app.agent.calls.length = 0;
+    app.agent.set('sec.sshd.get', sshdGet({ permitrootlogin: 'without-password' }));
+    expect((await post('/api/security/hardening/ssh/apply')).status).toBe(200);
+    expect(app.agent.callsTo('sec.sshd.set')[0].args.settings.PermitRootLogin).toBe('prohibit-password');
+    await post('/api/security/hardening/ssh/revert');
+    app.agent.set('sec.sshd.get', sshdGet());
+    app.agent.set('sec.ssh_keys.list', () => ({ dir: '/root/.ssh', keys: [], authorized: [], keygenAvailable: true }));
+  });
+
   it('is not applicable without sshd', async () => {
     await provision(false);
     const byId = Object.fromEntries((await get('/api/security/hardening')).body.data.items.map((i) => [i.id, i]));
@@ -262,6 +331,34 @@ describe('firewall baseline', () => {
     expect(tcp[53]).toEqual(['dns']); expect(plan.udp.map((e) => e.port)).toEqual([53]);
     expect(tcp[21]).toEqual(['ftp']); expect(tcp['49152-65534']).toEqual(['ftp passive']);
     expect(tcp[7443]).toBeUndefined();
+    expect(plan.sshSource).toBe('listening');
+    // The DHCPv6 client rule is shown but never sent as a port.
+    expect(plan.builtin).toEqual([{ port: 546, proto: 'udp', reasons: ['dhcpv6 client'], scope: 'IPv6 link-local, from port 547' }]);
+  });
+
+  it('opens DNS for a PowerDNS host as it does for BIND', async () => {
+    app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, n === 'named' ? false : n === 'pdns_server' ? true : Boolean(BIN_FULL[n])])));
+    await app.ctx.capabilities.refresh();
+    expect(app.ctx.capabilities.has('bind')).toBe(false);
+    expect(app.ctx.capabilities.has('powerdns')).toBe(true);
+    const plan = (await get('/api/security/hardening/firewall/plan')).body.data;
+    expect(plan.tcp.find((e) => e.port === 53).reasons).toEqual(['dns']);
+    expect(plan.udp.map((e) => e.port)).toEqual([53]);
+    await provision(true);
+  });
+
+  it('takes the hub port from its live listener and the SSH ports from the socket unit when that is what holds them', async () => {
+    app.agent.set('hardening.firewall.status', fwStatus({ hubUnit: true, hubPorts: [8443], sshdPorts: [2222], sshdSocket: 'ssh.socket' }));
+    const plan = (await get('/api/security/hardening/firewall/plan')).body.data;
+    const tcp = Object.fromEntries(plan.tcp.map((e) => [e.port, e.reasons]));
+    expect(tcp[8443]).toEqual(['license hub']);
+    expect(tcp[7443]).toBeUndefined();
+    expect(plan).toMatchObject({ sshPorts: [2222], sshSource: 'ssh.socket' });
+    expect(tcp[2222]).toEqual(['ssh']);
+    expect(tcp[22]).toBeUndefined();
+    app.agent.set('hardening.firewall.status', fwStatus({ hubUnit: true, hubPorts: [] }));
+    expect(Object.fromEntries((await get('/api/security/hardening/firewall/plan')).body.data.tcp.map((e) => [e.port, e.reasons]))[7443]).toEqual(['license hub']);
+    app.agent.set('hardening.firewall.status', fwStatus());
   });
 
   it('refuses to apply without the SSH port confirmation, with a wrong port, and never calls the agent', async () => {

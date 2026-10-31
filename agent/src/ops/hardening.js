@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import { z } from 'zod';
-import { exec, hasBinary } from '../exec.js';
+import { exec, hasBinary, resolveBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
 import { firewallBackend } from './sec.js';
 import { detectManager } from './pkg.js';
@@ -29,7 +29,11 @@ function exists(file) {
 }
 
 const isManaged = (text) => typeof text === 'string' && text.includes(MANAGED_TEXT);
-const origPath = (file) => `${file}.whm-orig`;
+// apt reads every file of apt.conf.d and prints a notice for any extension it
+// does not know; only .disabled/.bak/.orig/.rej/.dpkg-*/.ucf-* are skipped
+// silently, so a preserved original there ends in .disabled.
+const inAptConfDir = (file) => path.basename(path.dirname(file)) === 'apt.conf.d';
+const origPath = (file) => `${file}.whm-orig${inAptConfDir(file) ? '.disabled' : ''}`;
 
 // Writes atomically; the first time an unmanaged file is replaced its content
 // is preserved as <file>.whm-orig so a revert can restore it.
@@ -97,6 +101,12 @@ const ipOrCidr = z.string().max(64).refine((v) => {
 }, 'IP address or CIDR network');
 
 const f2bPaths = (dir) => ({ jail: path.join(dir, F2B_JAIL_FILE), filter: path.join(dir, F2B_FILTER_FILE) });
+const F2B_LOOPBACK = ['127.0.0.1/8', '::1'];
+// fail2ban's stock ban action is iptables-multiport, and fail2ban-firewalld's
+// jail.d/00-firewalld.conf switches it to firewall-cmd; both fail where that tool
+// is not the one in charge, so the jails follow the panel's own backend
+// (jail.d/*.local is read after every *.conf, so this file wins).
+const F2B_BANACTION = { iptables: ['iptables-multiport', 'iptables-allports'], nft: ['nftables-multiport', 'nftables-allports'] };
 
 // The panel logs every request as one pino JSON line on the whm-panel journal
 // unit (deploy/whm-panel.service: SyslogIdentifier=whm-panel): a failed login
@@ -117,21 +127,29 @@ export function renderFail2banPanelFilter() {
   ].join('\n');
 }
 
-export function renderFail2banJail({ jails, bantime, findtime, maxretry, panelPorts, ignoreIps = [] }) {
+export function renderFail2banJail({ jails, bantime, findtime, maxretry, panelPorts, ignoreIps = [], backend = 'iptables' }) {
   const on = new Set(jails);
+  const [banaction, banactionAllports] = F2B_BANACTION[backend] || F2B_BANACTION.iptables;
   const lines = [
     `${MANAGED}. Rewritten by Security Advisor › Hardening; put your own jails in another jail.d/*.local file.`,
     '[DEFAULT]',
     `bantime  = ${bantime}`,
     `findtime = ${findtime}`,
     `maxretry = ${maxretry}`,
-    `ignoreip = ${['127.0.0.1/8', '::1', ...ignoreIps].join(' ')}`,
+    `ignoreip = ${F2B_LOOPBACK.join(' ')}`,
+    `banaction = ${banaction}`,
+    `banaction_allports = ${banactionAllports}`,
     '',
   ];
   for (const jail of F2B_JAILS) {
     lines.push(`[${jail}]`, `enabled = ${on.has(jail) ? 'true' : 'false'}`);
     if (jail === 'sshd') lines.push('mode = aggressive');
-    if (jail === 'whm-panel') lines.push('filter = whm-panel', 'backend = systemd', 'journalmatch = SYSLOG_IDENTIFIER=whm-panel', `port = ${panelPorts.join(',')}`);
+    if (jail === 'whm-panel') {
+      lines.push('filter = whm-panel', 'backend = systemd', 'journalmatch = SYSLOG_IDENTIFIER=whm-panel', `port = ${panelPorts.join(',')}`);
+      // The operator's exemption covers the panel jail only: it keeps an apply
+      // from locking them out of the panel, not from SSH, mail or FTP bans.
+      if (ignoreIps.length) lines.push(`ignoreip = ${[...F2B_LOOPBACK, ...ignoreIps].join(' ')}`);
+    }
     lines.push('');
   }
   return lines.join('\n');
@@ -168,6 +186,19 @@ export function parseJailFile(text) {
   return enabled;
 }
 
+// The addresses the panel jail never bans (its ignoreip minus loopback).
+export function parseJailIgnoreIps(text) {
+  let section = null;
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.trim();
+    const s = line.match(/^\[([^\]]+)\]$/);
+    if (s) { section = s[1]; continue; }
+    const kv = line.match(/^ignoreip\s*=\s*(.*)$/i);
+    if (kv && section === 'whm-panel') return kv[1].split(/\s+/).filter((v) => v && !F2B_LOOPBACK.includes(v));
+  }
+  return [];
+}
+
 async function fail2banPing() {
   const { code, stdout } = await exec('fail2ban-client', ['ping'], { allowFailure: true, timeoutMs: 15_000 });
   return code === 0 && /pong/i.test(stdout);
@@ -179,7 +210,7 @@ export async function fail2banStatus({ dir = FAIL2BAN_DIR } = {}) {
   const jailText = readText(files.jail);
   const configured = isManaged(jailText) && isManaged(readText(files.filter));
   const enabledJails = configured ? parseJailFile(jailText) : [];
-  const out = { installed, configured, path: files.jail, filterPath: files.filter, running: null, unitEnabled: null, jails: [], bannedTotal: 0 };
+  const out = { installed, configured, path: files.jail, filterPath: files.filter, running: null, unitEnabled: null, jails: [], bannedTotal: 0, ignoreIps: configured ? parseJailIgnoreIps(jailText) : [] };
   if (!installed) return out;
   out.running = await fail2banPing();
   out.unitEnabled = await unitEnabled('fail2ban.service');
@@ -196,14 +227,14 @@ export async function fail2banStatus({ dir = FAIL2BAN_DIR } = {}) {
   return out;
 }
 
-export async function applyFail2ban(args, ctx, { dir = FAIL2BAN_DIR } = {}) {
+export async function applyFail2ban(args, ctx, { dir = FAIL2BAN_DIR, backend = firewallBackend() } = {}) {
   if (!hasBinary('fail2ban-client')) throw new OpError('capability_missing', 'Fail2ban is not installed on this server (install the fail2ban package)');
   const files = f2bPaths(dir);
   ctx.assertAllowedPath(files.jail, 'write');
   ctx.assertAllowedPath(files.filter, 'write');
   const previous = { jail: readText(files.jail), filter: readText(files.filter) };
   writeManaged(files.filter, renderFail2banPanelFilter());
-  writeManaged(files.jail, renderFail2banJail(args));
+  writeManaged(files.jail, renderFail2banJail({ ...args, backend: backend || 'iptables' }));
   const rollback = () => { restore(files.jail, previous.jail); restore(files.filter, previous.filter); };
   const test = await exec('fail2ban-client', ['-t'], { allowFailure: true, timeoutMs: 60_000 });
   if (test.code !== 0) {
@@ -219,7 +250,7 @@ export async function applyFail2ban(args, ctx, { dir = FAIL2BAN_DIR } = {}) {
     if (hasBinary('systemctl')) await exec('systemctl', ['restart', 'fail2ban.service'], { allowFailure: true, timeoutMs: 120_000 });
     throw new OpError('config_invalid', 'fail2ban did not come up with the new jails (check "journalctl -u fail2ban"); the previous files were restored', { enabled, reloaded });
   }
-  return { path: files.jail, filterPath: files.filter, jails: args.jails, validated: true, enabled, reloaded, status: await fail2banStatus({ dir }) };
+  return { path: files.jail, filterPath: files.filter, jails: args.jails, ignoreIps: args.ignoreIps || [], banaction: (F2B_BANACTION[backend] || F2B_BANACTION.iptables)[0], validated: true, enabled, reloaded, status: await fail2banStatus({ dir }) };
 }
 
 export async function revertFail2ban(ctx, { dir = FAIL2BAN_DIR } = {}) {
@@ -300,8 +331,11 @@ export function renderAptUnattended() {
     '  "origin=Debian,codename=${distro_codename},label=Debian-Security";',
     '  "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";',
     '  "origin=Ubuntu,archive=${distro_codename}-security,label=Ubuntu";',
-    '  "origin=UbuntuESMApps,archive=${distro_codename}-apps-security,label=Ubuntu Pro";',
-    '  "origin=UbuntuESM,archive=${distro_codename}-infra-security,label=Ubuntu Pro";',
+    // esm.ubuntu.com Release files carry no "Ubuntu Pro" label (apt-cache policy
+    // shows l=UbuntuESMApps), so origin + archive alone match, as Ubuntu's own
+    // 50unattended-upgrades does.
+    '  "origin=UbuntuESMApps,archive=${distro_codename}-apps-security";',
+    '  "origin=UbuntuESM,archive=${distro_codename}-infra-security";',
     '};',
     'Unattended-Upgrade::Automatic-Reboot "false";',
     'Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";',
@@ -590,23 +624,104 @@ const portRange = z.object({ from: port, to: port }).strict().refine((r) => r.fr
 const portList = z.array(z.union([port, portRange])).max(64);
 const policy = z.enum(['ACCEPT', 'DROP']);
 
-// `ss -ltnpH`: "LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=812,fd=3))".
-export function parseSshdPorts(stdout) {
-  const ports = new Set();
+// `ss -ltnpeH`: "LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=812,fd=3)) ino:1 sk:2 <->";
+// -e adds "uid:N" to a socket a non-root user owns (nothing for root's).
+export function parseListeners(stdout) {
+  const rows = [];
   for (const line of String(stdout || '').split('\n')) {
     const cols = line.trim().split(/\s+/);
     if (cols.length < 4 || cols[0] !== 'LISTEN') continue;
-    if (!/users:\(\("sshd"/.test(line)) continue;
-    const p = Number(cols[3].slice(cols[3].lastIndexOf(':') + 1));
+    const local = cols[3];
+    const port = Number(local.slice(local.lastIndexOf(':') + 1));
+    if (!Number.isInteger(port) || port <= 0) continue;
+    const uid = line.match(/\buid:(\d+)/);
+    rows.push({
+      port, addr: local.slice(0, local.lastIndexOf(':')).replace(/^\[|\]$/g, ''), uid: uid ? Number(uid[1]) : 0,
+      users: [...line.matchAll(/\("([^"]*)",pid=(\d+),fd=\d+\)/g)].map((m) => ({ name: m[1], pid: Number(m[2]) })),
+    });
+  }
+  return rows;
+}
+
+// The process name ss prints is whatever the process calls itself (prctl, a
+// renamed copy of nc), so a listener counts as sshd only when the pid is root's
+// and runs the installed sshd binary.
+export function isRootSshdPid(pid, { procRoot = '/proc', sshdBin = resolveBinary('sshd') } = {}) {
+  if (!sshdBin || !Number.isInteger(pid) || pid <= 0) return false;
+  const uid = (readText(path.join(procRoot, String(pid), 'status')) || '').match(/^Uid:\s+(\d+)/m);
+  if (!uid || uid[1] !== '0') return false;
+  let exe;
+  try { exe = fs.readlinkSync(path.join(procRoot, String(pid), 'exe')).replace(/ \(deleted\)$/, ''); } catch { return false; }
+  const real = (p) => { try { return fs.realpathSync(p); } catch { return p; } };
+  return real(exe) === real(sshdBin);
+}
+
+export function sshdPortsFrom(rows, isRootSshd) {
+  const ports = new Set();
+  if (typeof isRootSshd !== 'function') return [];
+  for (const row of rows || []) {
+    if (row.uid !== 0) continue;
+    const pids = row.users.filter((u) => u.name === 'sshd').map((u) => u.pid);
+    if (pids.length && pids.some((pid) => isRootSshd(pid))) ports.add(row.port);
+  }
+  return [...ports].sort((a, b) => a - b);
+}
+
+export const parseSshdPorts = (stdout, { isRootSshd } = {}) => sshdPortsFrom(parseListeners(stdout), isRootSshd);
+
+// `systemctl show -p Listen ssh.socket`: one "Listen=[::]:2222 (Stream)" per listener.
+export function parseSocketListen(stdout) {
+  const ports = new Set();
+  for (const line of String(stdout || '').split('\n')) {
+    const m = line.trim().match(/^Listen=(.+) \(Stream\)$/);
+    if (!m) continue;
+    const p = Number(m[1].slice(m[1].lastIndexOf(':') + 1));
     if (Number.isInteger(p) && p > 0) ports.add(p);
   }
   return [...ports].sort((a, b) => a - b);
 }
 
-async function sshdListeningPorts() {
+const SSHD_UNITS = ['ssh', 'sshd'];
+
+// Ubuntu 22.10+ holds the SSH listener in ssh.socket (pid 1) until the first
+// connection since boot: ss shows no sshd and Port in sshd_config is not what
+// is bound, so the socket unit's ListenStream ports count as sshd's.
+async function sshdSocketPorts() {
+  if (!hasBinary('systemctl')) return { unit: null, ports: [] };
+  for (const unit of SSHD_UNITS) {
+    const active = await exec('systemctl', ['is-active', `${unit}.socket`], { allowFailure: true, timeoutMs: 15_000 });
+    if (active.stdout.trim() !== 'active') continue;
+    const show = await exec('systemctl', ['show', '-p', 'Listen', `${unit}.socket`], { allowFailure: true, timeoutMs: 15_000 });
+    return { unit: `${unit}.socket`, ports: show.code === 0 ? parseSocketListen(show.stdout) : [] };
+  }
+  return { unit: null, ports: [] };
+}
+
+async function listeners() {
   if (!hasBinary('ss')) return null;
-  const { code, stdout } = await exec('ss', ['-ltnpH'], { allowFailure: true, timeoutMs: 15_000 });
-  return code === 0 ? parseSshdPorts(stdout) : null;
+  const { code, stdout } = await exec('ss', ['-ltnpeH'], { allowFailure: true, timeoutMs: 15_000 });
+  return code === 0 ? parseListeners(stdout) : null;
+}
+
+// Every port SSH is reachable on: root's sshd listeners plus the socket unit's.
+// ports is null when neither ss nor a socket unit could answer.
+async function sshdListeners(rows, { procRoot = '/proc', sshdBin } = {}) {
+  const out = { ports: rows ? sshdPortsFrom(rows, (pid) => isRootSshdPid(pid, { procRoot, ...(sshdBin ? { sshdBin } : {}) })) : null, socket: null };
+  const socket = await sshdSocketPorts();
+  if (socket.unit) { out.socket = socket.unit; out.ports = [...new Set([...(out.ports || []), ...socket.ports])].sort((a, b) => a - b); }
+  return out;
+}
+
+const isLoopback = (addr) => addr.startsWith('127.') || addr === '::1' || addr === '::ffff:127.0.0.1';
+
+// The hub's public port is whatever whm-hub.service's process listens on away
+// from loopback (hub.conf "port", 7443 by default; 7440 stays on loopback).
+async function hubListeningPorts(rows) {
+  if (!rows || !hasBinary('systemctl')) return [];
+  const { code, stdout } = await exec('systemctl', ['show', '-p', 'MainPID', '--value', 'whm-hub.service'], { allowFailure: true, timeoutMs: 15_000 });
+  const pid = code === 0 ? Number(stdout.trim().replace(/^MainPID=/, '')) : 0;
+  if (!Number.isInteger(pid) || pid <= 0) return [];
+  return [...new Set(rows.filter((r) => !isLoopback(r.addr) && r.users.some((u) => u.pid === pid)).map((r) => r.port))].sort((a, b) => a - b);
 }
 
 const portKey = (p) => (typeof p === 'number' ? String(p) : `${p.from}-${p.to}`);
@@ -635,9 +750,11 @@ export function parseNftBaseline(json) {
     if (item.chain && item.chain.name === NFT_CHAIN) { out.chainPresent = true; out.policy = item.chain.policy || null; }
     const rule = item.rule;
     if (!rule || rule.chain !== NFT_CHAIN) continue;
-    let proto = null; let ports = null; let accept = false;
+    let proto = null; let ports = null; let accept = false; let narrowed = false;
     for (const e of rule.expr || []) {
       const m = e.match;
+      // A rule that also matches the source port is one of the fixed rules (DHCPv6), not an allowed port.
+      if (m && m.left?.payload?.field === 'sport') narrowed = true;
       if (m && m.left?.payload?.field === 'dport') {
         proto = m.left.payload.protocol;
         const right = m.right?.set ?? [m.right];
@@ -645,14 +762,17 @@ export function parseNftBaseline(json) {
       }
       if (e.accept !== undefined) accept = true;
     }
-    if (proto && ports && accept) (proto === 'tcp' ? out.tcp : out.udp).push(...ports);
+    if (proto && ports && accept && !narrowed) (proto === 'tcp' ? out.tcp : out.udp).push(...ports);
   }
   return out;
 }
 
-export async function firewallStatus() {
+export async function firewallStatus({ procRoot = '/proc', sshdBin } = {}) {
   const backend = firewallBackend();
-  const out = { backend, applied: false, chainPresent: false, policy: null, hooked: null, families: {}, sshdPorts: await sshdListeningPorts(), hubUnit: await unitExists('whm-hub.service'), conflicts: { firewalld: await unitActive('firewalld.service'), ufw: null } };
+  const rows = await listeners();
+  const sshd = await sshdListeners(rows, { procRoot, sshdBin });
+  const hubUnit = await unitExists('whm-hub.service');
+  const out = { backend, applied: false, chainPresent: false, policy: null, hooked: null, families: {}, sshdPorts: sshd.ports, sshdSocket: sshd.socket, hubUnit, hubPorts: hubUnit ? await hubListeningPorts(rows) : [], conflicts: { firewalld: await unitActive('firewalld.service'), ufw: null } };
   if (hasBinary('ufw')) { const { code, stdout } = await exec('ufw', ['status'], { allowFailure: true, timeoutMs: 15_000 }); out.conflicts.ufw = code === 0 && /^Status:\s*active/m.test(stdout); }
   if (backend === 'iptables') {
     for (const [family, bin] of [['ipv4', 'iptables'], ['ipv6', 'ip6tables']]) {
@@ -677,8 +797,10 @@ export async function firewallStatus() {
   return out;
 }
 
-async function iptablesTeardown(bin) {
-  await exec(bin, ['-P', 'INPUT', 'ACCEPT'], { allowFailure: true });
+// The policy goes back to what was captured before the change; ACCEPT only when
+// nothing could be captured.
+async function iptablesTeardown(bin, policy = 'ACCEPT') {
+  await exec(bin, ['-P', 'INPUT', policy === 'DROP' ? 'DROP' : 'ACCEPT'], { allowFailure: true });
   for (let i = 0; i < 10; i++) if ((await exec(bin, ['-D', 'INPUT', '-j', BASELINE_CHAIN], { allowFailure: true })).code !== 0) break;
   await exec(bin, ['-F', BASELINE_CHAIN], { allowFailure: true });
   await exec(bin, ['-X', BASELINE_CHAIN], { allowFailure: true });
@@ -687,23 +809,30 @@ async function iptablesTeardown(bin) {
 const iptDport = (p) => (typeof p === 'number' ? String(p) : `${p.from}:${p.to}`);
 const nftSet = (list) => `{ ${list.map((p) => (typeof p === 'number' ? String(p) : `${p.from}-${p.to}`)).join(', ')} }`;
 
-export async function applyFirewallBaseline({ tcp, udp, sshPorts }, ctx) {
+// DHCPv6 replies (link-local, udp 547 -> 546) answer a multicast solicit, so
+// conntrack never marks them ESTABLISHED and a DROP policy would end the lease.
+export const DHCPV6_IP6TABLES = ['-p', 'udp', '-s', 'fe80::/10', '-d', 'fe80::/10', '--sport', '547', '--dport', '546', '-j', 'ACCEPT'];
+export const DHCPV6_NFT = ['ip6', 'saddr', 'fe80::/10', 'ip6', 'daddr', 'fe80::/10', 'udp', 'sport', '547', 'udp', 'dport', '546', 'accept'];
+
+export async function applyFirewallBaseline({ tcp, udp, sshPorts }, ctx, { procRoot = '/proc', sshdBin } = {}) {
   const backend = firewallBackend();
   if (!backend) throw new OpError('capability_missing', 'Neither iptables nor nftables (nft) is installed; the firewall baseline needs one of them');
   const missing = sshPorts.filter((p) => !inList(tcp, p));
   if (missing.length) throw new OpError('refused', `SSH port ${missing.join(', ')} is not in the allow list; the baseline was not applied`);
-  const live = await sshdListeningPorts();
-  const liveMissing = (live || []).filter((p) => !inList(tcp, p));
+  const live = await sshdListeners(await listeners(), { procRoot, sshdBin });
+  const liveMissing = (live.ports || []).filter((p) => !inList(tcp, p));
   if (liveMissing.length) throw new OpError('refused', `sshd is listening on port ${liveMissing.join(', ')}, which is not in the allow list; the baseline was not applied`);
   if (await unitActive('firewalld.service')) throw new OpError('refused', 'firewalld is active and owns the input policy; manage the baseline there or stop firewalld first');
   if (hasBinary('ufw')) { const { code, stdout } = await exec('ufw', ['status'], { allowFailure: true, timeoutMs: 15_000 }); if (code === 0 && /^Status:\s*active/m.test(stdout)) throw new OpError('refused', 'ufw is active and owns the input policy; manage the baseline there or disable ufw first'); }
   const applied = [];
+  const previousPolicies = {};
   let previousPolicy = 'ACCEPT';
   try {
     if (backend === 'iptables') {
       for (const bin of ['iptables', 'ip6tables'].filter(hasBinary)) {
         const before = await exec(bin, ['-S', 'INPUT'], { allowFailure: true });
-        if (bin === 'iptables' && before.code === 0) previousPolicy = parseIptablesBaseline(before.stdout, null).policy || 'ACCEPT';
+        if (before.code === 0) previousPolicies[bin] = parseIptablesBaseline(before.stdout, null).policy || 'ACCEPT';
+        if (bin === 'iptables') previousPolicy = previousPolicies[bin] || 'ACCEPT';
         applied.push(bin);
         await exec(bin, ['-N', BASELINE_CHAIN], { allowFailure: true });
         await exec(bin, ['-F', BASELINE_CHAIN]);
@@ -711,6 +840,7 @@ export async function applyFirewallBaseline({ tcp, udp, sshPorts }, ctx) {
         await exec(bin, ['-A', BASELINE_CHAIN, '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED', '-j', 'ACCEPT']);
         await exec(bin, ['-A', BASELINE_CHAIN, '-m', 'conntrack', '--ctstate', 'INVALID', '-j', 'DROP']);
         await exec(bin, ['-A', BASELINE_CHAIN, '-p', bin === 'ip6tables' ? 'ipv6-icmp' : 'icmp', '-j', 'ACCEPT']);
+        if (bin === 'ip6tables') await exec(bin, ['-A', BASELINE_CHAIN, ...DHCPV6_IP6TABLES]);
         for (const p of tcp) await exec(bin, ['-A', BASELINE_CHAIN, '-p', 'tcp', '--dport', iptDport(p), '-j', 'ACCEPT']);
         for (const p of udp) await exec(bin, ['-A', BASELINE_CHAIN, '-p', 'udp', '--dport', iptDport(p), '-j', 'ACCEPT']);
         // Appended, not inserted: WHM_BLOCK and fail2ban's chains stay ahead so a
@@ -728,18 +858,19 @@ export async function applyFirewallBaseline({ tcp, udp, sshPorts }, ctx) {
       await exec('nft', ['add', 'rule', ...NFT_TABLE, NFT_CHAIN, 'ct', 'state', 'established,related', 'accept']);
       await exec('nft', ['add', 'rule', ...NFT_TABLE, NFT_CHAIN, 'ct', 'state', 'invalid', 'drop']);
       await exec('nft', ['add', 'rule', ...NFT_TABLE, NFT_CHAIN, 'meta', 'l4proto', '{ icmp, ipv6-icmp }', 'accept']);
+      await exec('nft', ['add', 'rule', ...NFT_TABLE, NFT_CHAIN, ...DHCPV6_NFT]);
       if (tcp.length) await exec('nft', ['add', 'rule', ...NFT_TABLE, NFT_CHAIN, 'tcp', 'dport', nftSet(tcp), 'accept']);
       if (udp.length) await exec('nft', ['add', 'rule', ...NFT_TABLE, NFT_CHAIN, 'udp', 'dport', nftSet(udp), 'accept']);
       await exec('nft', ['add', 'chain', ...NFT_TABLE, NFT_CHAIN, '{ policy drop ; }']);
     }
   } catch (err) {
-    if (backend === 'iptables') for (const bin of applied) await iptablesTeardown(bin);
+    if (backend === 'iptables') for (const bin of applied) await iptablesTeardown(bin, previousPolicies[bin]);
     else await exec('nft', ['delete', 'chain', ...NFT_TABLE, NFT_CHAIN], { allowFailure: true });
     throw new OpError('config_invalid', `The firewall rejected the baseline rules; everything was taken down again: ${err.message}`, { backend });
   }
-  const status = await firewallStatus();
+  const status = await firewallStatus({ procRoot, sshdBin });
   if (!status.applied) {
-    if (backend === 'iptables') for (const bin of applied) await iptablesTeardown(bin);
+    if (backend === 'iptables') for (const bin of applied) await iptablesTeardown(bin, previousPolicies[bin]);
     else await exec('nft', ['delete', 'chain', ...NFT_TABLE, NFT_CHAIN], { allowFailure: true });
     throw new OpError('config_invalid', 'The baseline did not take effect; it was taken down again', { backend, status });
   }
@@ -763,12 +894,12 @@ export async function revertFirewallBaseline({ restorePolicy = 'ACCEPT' } = {}) 
 }
 
 defineOp('hardening.firewall.status', {
-  description: `Whether the ${BASELINE_CHAIN} chain (iptables) or inet whm baseline (nft) is in place with a default-deny input policy, the ports it allows, the ports sshd listens on and whether firewalld/ufw own the policy`,
+  description: `Whether the ${BASELINE_CHAIN} chain (iptables) or inet whm baseline (nft) is in place with a default-deny input policy, the ports it allows, the ports root's sshd (or ssh.socket) listens on, the hub's port and whether firewalld/ufw own the policy`,
   run: async () => firewallStatus(),
 });
 
 defineOp('hardening.firewall.apply', {
-  description: 'Install the default-deny input baseline: loopback, established traffic, ICMP and the given TCP/UDP ports are accepted, everything else dropped. Refused unless every port sshd listens on is in the list and no firewalld/ufw is active',
+  description: 'Install the default-deny input baseline: loopback, established traffic, ICMP, DHCPv6 client replies and the given TCP/UDP ports are accepted, everything else dropped. Refused unless every port sshd listens on is in the list and no firewalld/ufw is active',
   destructive: true,
   timeoutMs: 120_000,
   schema: z.object({ tcp: portList.min(1), udp: portList.default([]), sshPorts: z.array(port).min(1).max(8) }).strict(),

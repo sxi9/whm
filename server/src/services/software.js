@@ -233,7 +233,15 @@ export function createSoftwareService(ctx) {
       const listing = await op('pkg.list_installed', {});
       const installed = new Map(listing.packages.map((p) => [p.name, p.version]));
       const offers = await offersFor([...wanted].filter((n) => !installed.has(n)), { refresh, family: fam });
-      const packageState = (name) => ({ name, installed: installed.has(name), version: installed.get(name) ?? null, offered: installed.has(name) ? true : offers.known ? Boolean(offers.map[name]?.offered) : null, candidate: offers.map[name]?.candidate ?? null });
+      // A name the host carries under another package name (Remi's
+      // php-pecl-redis6 provides php-pecl-redis) counts as installed through
+      // the provider pkg.offers reports.
+      const packageState = (name) => {
+        const offer = offers.map[name];
+        const provider = offer?.provider && installed.has(offer.provider) ? offer.provider : null;
+        const isInstalled = installed.has(name) || Boolean(provider);
+        return { name, installed: isInstalled, version: installed.get(name) ?? installed.get(provider) ?? null, offered: isInstalled ? true : offers.known ? Boolean(offer?.offered) : null, candidate: offer?.candidate ?? null, provider: offer?.provider ?? null };
+      };
       const shape = (e) => {
         const names = packagesFor(e, fam, { phpVersions });
         const packages = names.map(packageState);
@@ -257,7 +265,7 @@ export function createSoftwareService(ctx) {
       if (!entry) throw notFound(`Catalog entry "${key}"`);
       const fam = (await family()) === 'rhel' ? 'rhel' : 'debian';
       let phpVersions = [];
-      if (entry.php && capabilities.has('php')) { try { phpVersions = (await php.versions()).versions; } catch (err) { logger.warn({ err }, 'php detection failed'); } }
+      if ((entry.php || entry.phpVersioned) && capabilities.has('php')) { try { phpVersions = (await php.versions()).versions; } catch (err) { logger.warn({ err }, 'php detection failed'); } }
       if (phpVersion && !entry.php) throw unprocessable(`"${entry.label}" is not a PHP extension; it has no per-version package`, { phpVersion: ['Leave phpVersion out for this entry'] });
       if (phpVersion && !phpVersions.some((v) => v.id === phpVersion)) throw unprocessable(`PHP "${phpVersion}" is not installed on this server`, { phpVersion: ['Pick one of the installed versions'] });
       const packages = phpVersion ? [phpExtensionPackage(entry, phpVersions.find((v) => v.id === phpVersion), fam)] : packagesFor(entry, fam, { phpVersions });
@@ -430,15 +438,24 @@ export function createSoftwareService(ctx) {
       job.progress(40, 'checking for updates');
       const pending = recordCheck(await job.agent.op('pkg.upgradable'));
       job.log(`${pending.count} pending update(s), ${pending.security} security`);
+      // An unapplied set is alerted when it appears, not on every nightly run:
+      // the alerted set is kept apart from last_check (page loads rewrite
+      // that) and the alert repeats only when a package or version joins it.
+      const alerted = new Set(S('software.updates.security_alerted', null)?.entries ?? []);
       if (pending.security > 0) {
-        const names = pending.packages.filter((p) => p.security).map((p) => p.name).sort();
-        raiseSecurityAlert({
-          kind: 'updates.security_available', title: `${pending.security} security update${pending.security === 1 ? '' : 's'} available on ${hostname()}`,
-          body: names.slice(0, 50).join(', ') + (names.length > 50 ? ', …' : ''),
-          dedupeKey: `updates.security_available:${crypto.createHash('sha256').update(names.join('\n')).digest('hex').slice(0, 16)}`, source: `software.update.check#${job.job.id}`,
-          data: { count: pending.count, security: pending.security, packages: names.slice(0, 50), rebootRequired: Boolean(pending.rebootRequired), autoApply: Boolean(S('software.updates.auto_os', false)) },
-        });
-      }
+        const security = pending.packages.filter((p) => p.security);
+        const names = security.map((p) => p.name).sort();
+        const entries = security.map((p) => `${p.name} ${p.candidate ?? ''}`.trim()).sort();
+        if (entries.some((e) => !alerted.has(e))) {
+          const r = raiseSecurityAlert({
+            kind: 'updates.security_available', title: `${pending.security} security update${pending.security === 1 ? '' : 's'} available on ${hostname()}`,
+            body: names.slice(0, 50).join(', ') + (names.length > 50 ? ', …' : ''),
+            dedupeKey: `updates.security_available:${crypto.createHash('sha256').update(names.join('\n')).digest('hex').slice(0, 16)}`, source: `software.update.check#${job.job.id}`,
+            data: { count: pending.count, security: pending.security, packages: names.slice(0, 50), rebootRequired: Boolean(pending.rebootRequired), autoApply: Boolean(S('software.updates.auto_os', false)) },
+          });
+          if (r?.raised || r?.deduped) settings.set('software.updates.security_alerted', { at: new Date().toISOString(), entries });
+        } else job.log('the same security updates were alerted before; not alerting again');
+      } else if (alerted.size) settings.set('software.updates.security_alerted', null);
       if (pending.count > 0 && S('software.updates.auto_os', false)) {
         job.log('automatic OS updates are enabled; applying');
         const run = enqueue('software.system.update', { dist: true, autoremove: true, refreshIndex: false }, null);
@@ -546,6 +563,16 @@ export function createSoftwareService(ctx) {
     } catch { return { url, headers: {} }; }
   };
   const redactUrl = (url) => (url ? splitCredentials(url).url : url);
+  // The feed check runs only while an update URL is set; a fresh schedules row
+  // is enabled by default and is aligned with the URL below. An operator's own
+  // toggle of an enabled schedule is left alone.
+  const PANEL_CHECK_SCHEDULE = 'panel-update-check';
+  const PANEL_CHECK_JOB = 'software.panel.check';
+  const panelCheckSchedule = (enabled) => { try { ctx.scheduler?.update?.(PANEL_CHECK_SCHEDULE, { enabled: Boolean(enabled) }); } catch (err) { logger.warn({ err }, 'panel update check: schedule toggle failed'); } };
+  try {
+    ctx.scheduler?.ensure?.(PANEL_CHECK_SCHEDULE, '23 6 * * *', PANEL_CHECK_JOB);
+    if (!S('software.update_url', '')) panelCheckSchedule(false);
+  } catch (err) { logger.warn({ err }, 'panel update check: schedule not registered'); }
   const panel = {
     installMethod() {
       if (fs.existsSync(path.join(REPO_ROOT, '.git'))) return 'git';
@@ -607,6 +634,16 @@ export function createSoftwareService(ctx) {
       }
       return panel.status();
     },
+    // The scheduled feed check (schedule panel-update-check): without it a
+    // panel.security_release alert waited for someone to press "Check now".
+    async checkJob(job) {
+      if (!S('software.update_url', '')) { job.log('no update URL is configured; skipping'); return { skipped: true }; }
+      job.progress(10, 'checking the release feed');
+      const status = await panel.check();
+      const check = status.lastCheck || {};
+      job.log(check.ok ? `latest ${status.latest?.version ?? '?'} (running ${ctx.version})${status.updateAvailable ? ': update available' : ''}${status.latest?.security ? ' [security release]' : ''}` : `feed check failed: ${check.error}`, check.ok ? 'info' : 'warn');
+      return { ok: Boolean(check.ok), latest: status.latest?.version ?? null, updateAvailable: Boolean(status.updateAvailable), security: Boolean(status.latest?.security), error: check.error ?? null };
+    },
     updateSettings({ url, tier, autoUpdate }, req) {
       const values = {};
       if (url !== undefined) values['software.update_url'] = url;
@@ -614,6 +651,7 @@ export function createSoftwareService(ctx) {
       if (autoUpdate !== undefined) values['updates.auto'] = autoUpdate;
       settings.setMany(values);
       req?.audit?.({ action: 'software.panel.settings', args: { ...values, ...(url !== undefined ? { 'software.update_url': redactUrl(url) } : {}) } });
+      if (url !== undefined) panelCheckSchedule(Boolean(url));
       return panel.status();
     },
   };
@@ -917,7 +955,7 @@ export function createSoftwareService(ctx) {
       if (tableExists('web_vhosts')) usage.vhosts = db.prepare('SELECT COUNT(*) AS n FROM web_vhosts WHERE php_version = ? AND domain NOT IN (SELECT domain FROM account_domains WHERE php_version = ?)').get(branch, id).n;
       if (tableExists('web_php_pools')) usage.pools = db.prepare('SELECT COUNT(*) AS n FROM web_php_pools WHERE version = ?').get(branch).n;
     }
-    usage.packages = db.prepare('SELECT name FROM packages WHERE php_version IS NOT NULL ORDER BY name').all().filter((p) => pins(p.php_version)).map((p) => p.name);
+    usage.packages = db.prepare('SELECT name, php_version FROM packages WHERE php_version IS NOT NULL ORDER BY name').all().filter((p) => pins(p.php_version)).map((p) => p.name);
     usage.accounts = db.prepare("SELECT json_extract(plan_snapshot_json, '$.php_version') AS v, COUNT(*) AS n FROM accounts GROUP BY v").all().filter((r) => r.v && pins(r.v)).reduce((n, r) => n + r.n, 0);
     const apache = ctx.web?.apache?.settings?.()?.defaultPhpVersion ?? null;
     usage.apachePin = Boolean(apache) && pins(apache);
@@ -1384,6 +1422,7 @@ export function createSoftwareService(ctx) {
     'software.pkg.update_index': (job) => pkgJob(job, 'pkg.update_index', {}, 'refreshing package index'),
     'software.system.update': (job) => update.runJob(job),
     'software.update.check': (job) => update.checkJob(job),
+    [PANEL_CHECK_JOB]: (job) => panel.checkJob(job),
     'software.rpmdb.rebuild': (job) => rpm.rebuildJob(job),
     'software.perl.install': (job) => perl.installJob(job),
     'software.module.install': (job) => modules.installJob(job),

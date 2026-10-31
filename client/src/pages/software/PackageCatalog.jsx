@@ -29,7 +29,10 @@ export function catalogEntryState(entry) {
   return { status: 'not-installed', label: 'available' };
 }
 
-export const canInstallEntry = (entry) => !entry.installed && entry.offered !== false;
+// Install stays available while any missing package is offered: the install
+// job installs that subset and reports the rest as skipped.
+export const canInstallEntry = (entry) => !entry.installed && entry.packages.some((p) => !p.installed && p.offered !== false);
+export const installLabel = (entry, perVersion) => (entry.missing?.length ? 'Install what is offered' : perVersion ? (entry.partial ? 'Install for the rest' : 'Install for all versions') : entry.partial ? 'Install the rest' : 'Install');
 
 export function CatalogEntryCard({ entry, highlight = false, onInstall, busy = false }) {
   const state = catalogEntryState(entry);
@@ -61,7 +64,7 @@ export function CatalogEntryCard({ entry, highlight = false, onInstall, busy = f
           </ul>
         )}
         <div className="row-actions" style={{ marginTop: 10, flexWrap: 'wrap', justifyContent: 'flex-start' }}>
-          {canInstallEntry(entry) && <Button variant="primary" size="sm" loading={busy} onClick={() => onInstall?.(entry)}>{perVersion ? (entry.partial ? 'Install for the rest' : 'Install for all versions') : entry.partial ? 'Install the rest' : 'Install'}</Button>}
+          {canInstallEntry(entry) && <Button variant="primary" size="sm" loading={busy} onClick={() => onInstall?.(entry)}>{installLabel(entry, perVersion)}</Button>}
           {entry.installed && entry.configure && <Link className="btn btn-sm" to={entry.configure}>Configure</Link>}
         </div>
       </div>

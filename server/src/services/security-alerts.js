@@ -10,10 +10,13 @@ import { SEVERITIES } from './server-contacts.js';
 //        -> { raised, deduped, alert, delivery } (synchronous; idempotent per
 //           dedupeKey for 24 h; nothing is recorded while the feature is off)
 //   securityAlerts.onAdvisorScan(run, { previousCritical }) (Security Advisor)
-// Admins hear about every alert through ctx.contacts.notify('security.alert');
-// hosting accounts are mailed only when security.alerts.notify_accounts is on
-// and only for kinds whose audience is "all", with the account template below,
-// never with the admin body (finding details must not reach a tenant).
+// Admins hear about every alert through ctx.contacts.notify('security.alert')
+// (root mail carries the event by default, migration 037b); an alert nobody
+// could be told about stays pending and is retried on the next flush. Hosting
+// accounts are mailed only when security.alerts.notify_accounts is on (a test
+// or notice: only when the admin asked for it, recorded on the row) and only
+// for kinds whose audience is "all", with the account template below, never
+// with the admin body (finding details must not reach a tenant).
 
 export const ALERT_EVENT = 'security.alert';
 export const JOB = 'security.alerts.deliver';
@@ -147,6 +150,7 @@ export function createSecurityAlertsService(ctx) {
     holdPending: db.prepare("UPDATE security_alerts SET state = 'held' WHERE state = 'pending'"),
     setState: db.prepare('UPDATE security_alerts SET state = ? WHERE id = ?'),
     markAdmins: db.prepare("UPDATE security_alerts SET notified_admins_at = datetime('now'), admin_result_json = ?, state = ? WHERE id = ?"),
+    markAdminsWaiting: db.prepare("UPDATE security_alerts SET admin_result_json = ?, state = 'pending' WHERE id = ?"),
     markAccounts: db.prepare("UPDATE security_alerts SET notified_accounts_at = CASE WHEN @sent THEN datetime('now') ELSE notified_accounts_at END, accounts_result_json = @result WHERE id = @id"),
     recent: db.prepare('SELECT * FROM security_alerts ORDER BY id DESC LIMIT ?'),
     stats: db.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN created_at >= datetime('now', '-1 day') THEN 1 ELSE 0 END) AS last24h, SUM(CASE WHEN state IN ('pending', 'held') THEN 1 ELSE 0 END) AS pending FROM security_alerts"),
@@ -281,10 +285,16 @@ export function createSecurityAlertsService(ctx) {
     } catch (err) {
       result = { matched: 0, sent: 0, failed: 0, error: String(err.message || err).slice(0, 300) };
     }
-    job?.log(`administrators: ${result.skipped ? `skipped (${result.skipped})` : `${result.sent} sent, ${result.failed} failed of ${result.matched} contact(s)`}${result.error ? ` — ${result.error}` : ''}`, result.error ? 'warn' : 'info');
-    const state = result.error ? 'failed' : 'sent';
-    for (const a of rows) stmts.markAdmins.run(JSON.stringify(result), state, a.id);
-    return result;
+    // Nobody matched and root mail was not sent: the alert is not delivered.
+    // It stays pending so a contact added later (or a transport installed
+    // later) still receives it on the next flush.
+    const addressed = result.matched > 0 || result.sent + result.failed > 0;
+    if (!result.error && !addressed) result.skipped = result.skipped || 'no_recipients';
+    job?.log(`administrators: ${result.skipped ? `skipped (${result.skipped})${addressed ? '' : '; the alert stays waiting until a contact subscribes to security.alert or root mail is routed'}` : `${result.sent} sent, ${result.failed} failed of ${result.matched} contact(s)`}${result.error ? ` — ${result.error}` : ''}`, result.error || !addressed ? 'warn' : 'info');
+    if (result.error) for (const a of rows) stmts.markAdmins.run(JSON.stringify(result), 'failed', a.id);
+    else if (!addressed) for (const a of rows) stmts.markAdminsWaiting.run(JSON.stringify(result), a.id);
+    else for (const a of rows) stmts.markAdmins.run(JSON.stringify(result), 'sent', a.id);
+    return { ...result, addressed };
   }
 
   async function notifyAccounts(rows, job) {
@@ -345,7 +355,25 @@ export function createSecurityAlertsService(ctx) {
     return summary;
   }
 
-  async function deliverJob(job) {
+  // A test or a notice carries the admin's own audience choice on the row, so a
+  // generic flush (boot, digest timer, "deliver now") never mails accounts a
+  // test or an admin-only notice because the global setting is on.
+  function wantsAccounts(row, params, cfg) {
+    if (kindOf(row.kind).audience !== 'all') return false;
+    if (row.kind === 'test' || row.kind === 'manual') return Boolean(params.includeAccounts ?? json.parse(row.data_json, {}).notifyAccounts);
+    return Boolean(params.includeAccounts ?? cfg.notifyAccounts);
+  }
+
+  // The job worker runs two jobs at once; deliveries are serialised so a second
+  // flush only sees rows the first one has already marked.
+  let delivering = Promise.resolve();
+  function deliverJob(job) {
+    const run = delivering.then(() => runDelivery(job));
+    delivering = run.catch(() => {});
+    return run;
+  }
+
+  async function runDelivery(job) {
     const cfg = config();
     const params = job.params || {};
     if (!cfg.enabled && !params.manual) { job.log('security notifications are disabled; nothing delivered'); return { skipped: 'disabled', delivered: 0 }; }
@@ -355,17 +383,22 @@ export function createSecurityAlertsService(ctx) {
     job.log(`${rows.length} alert(s): ${rows.map((a) => `#${a.id} ${a.kind} (${a.severity})`).join(', ')}`);
     job.progress(10, 'notifying administrators');
     const admins = await notifyAdmins(rows, job);
-    const toAccounts = params.includeAccounts ?? cfg.notifyAccounts;
-    const accountRows = rows.filter((a) => kindOf(a.kind).audience === 'all');
+    const toAccounts = Boolean(params.includeAccounts ?? cfg.notifyAccounts);
+    const accountRows = rows.filter((a) => wantsAccounts(a, params, cfg));
     let accounts = null;
     job.progress(40, 'notifying accounts');
-    if (toAccounts && accountRows.length) accounts = await notifyAccounts(accountRows, job);
-    else {
-      const reason = !toAccounts ? 'notify_accounts_off' : 'admins_only';
-      for (const a of rows) stmts.markAccounts.run({ id: a.id, sent: 0, result: JSON.stringify({ skipped: reason }) });
-      job.log(`accounts: skipped (${reason === 'notify_accounts_off' ? 'account notifications are off' : 'these alert kinds are for administrators only'})`);
+    if (accountRows.length) accounts = await notifyAccounts(accountRows, job);
+    const skippedRows = rows.filter((a) => !accountRows.includes(a));
+    if (skippedRows.length) {
+      const reasons = new Set();
+      for (const a of skippedRows) {
+        const reason = toAccounts && kindOf(a.kind).audience !== 'all' ? 'admins_only' : 'notify_accounts_off';
+        reasons.add(reason);
+        stmts.markAccounts.run({ id: a.id, sent: 0, result: JSON.stringify({ skipped: reason }) });
+      }
+      job.log(`accounts: ${accountRows.length ? `${skippedRows.length} alert(s) ` : ''}skipped (${[...reasons].map((r) => (r === 'notify_accounts_off' ? 'account notifications are off for them' : 'these alert kinds are for administrators only')).join('; ')})`);
     }
-    settings.set('security.alerts.last_delivery_at', new Date().toISOString());
+    if (admins.addressed) settings.set('security.alerts.last_delivery_at', new Date().toISOString());
     job.progress(100, 'done');
     const result = { delivered: rows.length, alertIds: rows.map((a) => a.id), admins, accounts };
     ctx.auditRecord?.(null, { action: 'security.alerts.deliver', target: rows.map((a) => a.id).join(','), args: { alerts: rows.length, admins: { sent: admins.sent, failed: admins.failed }, accounts: accounts ? { sent: accounts.sent, failed: accounts.failed } : null, manual: Boolean(params.manual) } });
@@ -387,6 +420,16 @@ export function createSecurityAlertsService(ctx) {
       return (ctx.contacts?.list?.() || []).filter((c) => c.enabled && (c.allEvents || c.events.includes(ALERT_EVENT)) && severityRank('critical') >= severityRank(c.minSeverity)).length;
     } catch { return 0; }
   }
+  const rootMailRouted = () => (settings.get('contacts.root_mail_events', []) || []).includes(ALERT_EVENT);
+
+  // Alerts that found nobody to tell wait as pending; the contacts service
+  // calls this after a contact or the root-mail routing changes so they go out
+  // as soon as somebody can receive them.
+  function recipientsChanged() {
+    if (!config().enabled || stmts.pendingCount.get().n === 0) return 'none';
+    if (subscribedContacts() === 0 && !rootMailRouted()) return 'no_recipients';
+    return scheduleDelivery();
+  }
 
   function overview() {
     const stats = stmts.stats.get();
@@ -395,7 +438,7 @@ export function createSecurityAlertsService(ctx) {
       settings: cfg,
       event: ALERT_EVENT,
       kinds: Object.entries(KINDS).map(([key, k]) => ({ key, ...k })),
-      capability: { mailTransport: ctx.contacts?.mailTransport?.() ?? null, contactsSubscribed: subscribedContacts(), rootMail: (settings.get('contacts.root_mail_events', []) || []).includes(ALERT_EVENT), accountRecipients: stmts.recipientCount.get().n },
+      capability: { mailTransport: ctx.contacts?.mailTransport?.() ?? null, contactsSubscribed: subscribedContacts(), rootMail: rootMailRouted(), accountRecipients: stmts.recipientCount.get().n },
       stats: { total: stats.total || 0, last24h: stats.last24h || 0, pending: stats.pending || 0 },
       digest: { due: digestDue(cfg), windowRemainingMs: windowRemainingMs(cfg) },
       panelUrl: panelUrl(),
@@ -425,7 +468,7 @@ export function createSecurityAlertsService(ctx) {
   function test({ includeAccounts = false } = {}, req) {
     requireEnabled();
     const host = hostname();
-    const r = raise({ kind: 'test', title: `Test security alert from ${productName()} on ${host}`, body: `Sent by ${req?.user?.username || 'the panel'} at ${new Date().toISOString()} to check how security alerts reach ${includeAccounts ? 'administrators and hosting accounts' : 'administrators'}. Nothing happened.`, dedupeKey: `test:${crypto.randomUUID()}`, source: 'contact-manager', data: { sentBy: req?.user?.username || null }, force: true, defer: true }, req);
+    const r = raise({ kind: 'test', title: `Test security alert from ${productName()} on ${host}`, body: `Sent by ${req?.user?.username || 'the panel'} at ${new Date().toISOString()} to check how security alerts reach ${includeAccounts ? 'administrators and hosting accounts' : 'administrators'}. Nothing happened.`, dedupeKey: `test:${crypto.randomUUID()}`, source: 'contact-manager', data: { sentBy: req?.user?.username || null, notifyAccounts: Boolean(includeAccounts) }, force: true, defer: true }, req);
     const job = enqueue({ alertIds: [r.alert.id], includeAccounts: Boolean(includeAccounts), manual: true, requestedBy: req?.user?.username ?? null }, req?.user?.id ?? null);
     audit(req, { action: 'security.alerts.test', target: String(r.alert.id), args: { includeAccounts: Boolean(includeAccounts), jobId: job.id } });
     return { job, alert: r.alert };
@@ -454,7 +497,7 @@ export function createSecurityAlertsService(ctx) {
 
   return {
     JOB, ALERT_EVENT, KINDS, DEDUPE_WINDOW_MS,
-    config, raise, onAdvisorScan, scheduleDelivery, deliverJob, list, overview, updateSettings, test, broadcast, deliverNow,
+    config, raise, onAdvisorScan, scheduleDelivery, recipientsChanged, deliverJob, list, overview, updateSettings, test, broadcast, deliverNow,
     renderMail: (alerts, opts = {}) => renderMail(alerts, { host: hostname(), panelUrl: panelUrl(), product: productName(), ...opts }),
     pendingCount: () => stmts.pendingCount.get().n,
     get: (id) => shape(stmts.byId.get(id)),

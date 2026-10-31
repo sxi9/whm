@@ -643,6 +643,10 @@ export function createServerContactsService(ctx) {
     };
   }
 
+  // Security alerts that found nobody to tell wait for a recipient; the alerts
+  // service is attached after this one, so it is looked up at call time.
+  const recipientsChanged = () => { try { ctx.securityAlerts?.recipientsChanged?.(); } catch (err) { logger.warn({ err }, 'security alerts: could not schedule the waiting alerts'); } };
+
   return {
     SCHEDULE, JOB, EVENTS, SEVERITIES, CHANNELS,
     normalize: normalizeNotification,
@@ -674,6 +678,7 @@ export function createServerContactsService(ctx) {
       const { display, config } = await resolveAddress(input.channel, address, mergeConfig(input.channel, input.config || {}));
       const { lastInsertRowid } = stmts.insert.run({ name: input.name?.trim() || '', channel: input.channel, address: display, events: JSON.stringify(events), enabled: input.enabled === false ? 0 : 1, config: JSON.stringify(config), min_severity: input.minSeverity || 'info' });
       audit(req, { action: 'contacts.create', target: display, args: { channel: input.channel, name: input.name, events, minSeverity: input.minSeverity || 'info' } });
+      recipientsChanged();
       return shape(stmts.byId.get(lastInsertRowid));
     },
 
@@ -686,6 +691,7 @@ export function createServerContactsService(ctx) {
       const { display, config } = await resolveAddress(channel, address, mergeConfig(channel, patch.config || {}, channel === row.channel ? json.parse(row.config_json, {}) : {}), row);
       stmts.update.run({ id: row.id, name: patch.name !== undefined ? patch.name.trim() : row.name, channel, address: display, events: JSON.stringify(events), enabled: (patch.enabled ?? Boolean(row.enabled)) ? 1 : 0, config: JSON.stringify(config), min_severity: patch.minSeverity ?? row.min_severity ?? 'info' });
       audit(req, { action: 'contacts.update', target: display, args: { ...patch, address: patch.address !== undefined ? display : undefined, config: patch.config ? Object.keys(patch.config) : undefined } });
+      recipientsChanged();
       return shape(stmts.byId.get(id));
     },
 
@@ -793,6 +799,7 @@ export function createServerContactsService(ctx) {
       }
       if (rootMailEvents !== undefined) settings.set('contacts.root_mail_events', [...new Set(rootMailEvents)]);
       audit(req, { action: 'contacts.mail_preferences', target: Object.keys(lists).join(',') || 'root', args: { forwardTo, users, rootMailEvents, rebuild: aliases?.rebuild ?? null } });
+      recipientsChanged();
       return { ...(await mailPreferences()), rebuild: aliases?.rebuild ?? null };
     },
 

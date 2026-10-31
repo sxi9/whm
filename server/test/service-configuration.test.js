@@ -24,7 +24,7 @@ const dnsCandidates = () => [
 ];
 const VHOST_WRITE = ({ domain, ssl, sslPort, phpVersion, redirects, logDir, bind }) => ({ domain, path: `/etc/apache2/sites-available/${domain}.conf`, link: `/etc/apache2/sites-enabled/${domain}.conf`, logDir, validated: true, bytes: 500, ssl: Boolean(ssl && sslPort), bind: bind ?? null, phpVersion: phpVersion ?? null, redirects: redirects?.length ?? 0, reloaded: true, unit: 'apache2' });
 // The agent's catch-all answer: the hostname bundle when one was passed, else the panel listener's pair.
-const DEFAULT_VHOST_WRITE = (args) => ({ name: '000-whm-default', path: '/etc/apache2/sites-available/000-whm-default.conf', link: '/etc/apache2/sites-enabled/000-whm-default.conf', logDir: args.logDir, validated: true, bytes: 900, ssl: args.sslPort == null ? null : args.ssl ? { cert: args.ssl.fullchain || args.ssl.cert, key: args.ssl.key, source: 'hostname', generated: false } : { cert: '/etc/whm/tls/cert.pem', key: '/etc/whm/tls/key.pem', source: 'panel', generated: false }, addresses: args.bind ? [args.bind] : args.addresses, stockSite: { disabled: true, site: '000-default', via: 'a2dissite' }, reloaded: true, unit: 'apache2' });
+const DEFAULT_VHOST_WRITE = (args) => ({ name: '000-whm-default', path: '/etc/apache2/conf-available/000-whm-default.conf', link: '/etc/apache2/conf-enabled/000-whm-default.conf', logDir: args.logDir, validated: true, bytes: 900, ssl: args.sslPort == null ? null : args.ssl ? { cert: args.ssl.fullchain || args.ssl.cert, key: args.ssl.key, source: 'hostname', generated: false } : { cert: '/etc/whm/tls/cert.pem', key: '/etc/whm/tls/key.pem', source: 'panel', generated: false }, addresses: args.bind ? [args.bind] : args.addresses, stockSite: { disabled: true, site: '000-default', via: 'a2dissite' }, reloaded: true, unit: 'apache2' });
 const CERT = '-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUQ\n-----END CERTIFICATE-----\n';
 const KEY = '-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49\n-----END PRIVATE KEY-----\n';
 
@@ -61,7 +61,7 @@ beforeAll(async () => {
     'web.vhost.write': VHOST_WRITE,
     'web.vhost.remove': ({ domain }) => ({ domain, removed: true, validated: true, reloaded: true }),
     'web.default_vhost.write': DEFAULT_VHOST_WRITE,
-    'web.default_vhost.remove': () => ({ path: '/etc/apache2/sites-available/000-whm-default.conf', removed: true, validated: true, reloaded: true, unit: 'apache2' }),
+    'web.default_vhost.remove': () => ({ path: '/etc/apache2/conf-available/000-whm-default.conf', removed: true, validated: true, reloaded: true, unit: 'apache2' }),
     'web.vhost.list': () => ({ installed: true, dir: APACHE.sitesAvailable, vhosts: [{ domain: 'legacy.example.net', path: '/etc/apache2/sites-available/legacy.example.net.conf', enabled: true, meta: { domain: 'legacy.example.net', user: 'legacy', docroot: '/home/legacy/public_html', aliases: [], ssl: false } }] }),
     'web.vhost.read': ({ domain }) => ({ domain, path: `/etc/apache2/sites-available/${domain}.conf`, exists: true, managed: true, enabled: true, meta: { domain }, content: `<VirtualHost *:80>\n  ServerName ${domain}\n</VirtualHost>\n` }),
     'web.ports.set': ({ http, https, bind }) => ({ path: '/etc/apache2/ports.conf', http, https, bind: bind ?? null, validated: true, reloaded: true, unit: 'apache2' }),
@@ -327,7 +327,7 @@ describe('cross-category helpers on ctx.web', () => {
       app.agent.calls.length = 0;
       const r = await app.ctx.web.ensureHostnameVhost(null);
       expect(r).toMatchObject({ hostname: 'panel.example.com', applied: true });
-      expect(r.defaultVhost).toMatchObject({ hostname: 'panel.example.com', applied: true, docroot: '/var/www/whm-default', path: '/etc/apache2/sites-available/000-whm-default.conf', ssl: { source: 'panel' }, stockSite: { disabled: true, site: '000-default', via: 'a2dissite' }, reload: { reloaded: true, unit: 'apache2' } });
+      expect(r.defaultVhost).toMatchObject({ hostname: 'panel.example.com', applied: true, docroot: '/var/www/whm-default', path: '/etc/apache2/conf-available/000-whm-default.conf', ssl: { source: 'panel' }, stockSite: { disabled: true, site: '000-default', via: 'a2dissite' }, reload: { reloaded: true, unit: 'apache2' } });
       const names = app.agent.calls.map((c) => c.name);
       expect(names.indexOf('web.default_vhost.write')).toBeGreaterThan(names.indexOf('web.vhost.write'));
       const write = app.agent.callsTo('web.default_vhost.write').pop().args;
@@ -337,7 +337,7 @@ describe('cross-category helpers on ctx.web', () => {
       expect(write.ssl).toBeUndefined();
       expect(write.bind).toBeUndefined();
       const page = (await get('/api/service-config/apache')).body.data;
-      expect(page.defaultVhost).toMatchObject({ ok: true, summary: { hostname: 'panel.example.com', path: '/etc/apache2/sites-available/000-whm-default.conf', ssl: { source: 'panel' }, stockSite: { disabled: true } } });
+      expect(page.defaultVhost).toMatchObject({ ok: true, summary: { hostname: 'panel.example.com', path: '/etc/apache2/conf-available/000-whm-default.conf', ssl: { source: 'panel' }, stockSite: { disabled: true } } });
       expect((await get('/api/service-config/status')).body.data.applies.default_vhost).toMatchObject({ ok: true });
       // The hostname's installed bundle is handed over for port 443.
       app.ctx.ssl = { ...originalSsl, certForDomain: (d) => (d === 'panel.example.com' ? { installed: 1 } : null) };
@@ -378,7 +378,7 @@ describe('cross-category helpers on ctx.web', () => {
       app.agent.set('web.default_vhost.write', DEFAULT_VHOST_WRITE);
       // Removal goes through the agent and is recorded.
       app.agent.calls.length = 0;
-      expect(await app.ctx.web.removeDefaultVhost(null)).toMatchObject({ removed: true, path: '/etc/apache2/sites-available/000-whm-default.conf', reload: { reloaded: true } });
+      expect(await app.ctx.web.removeDefaultVhost(null)).toMatchObject({ removed: true, path: '/etc/apache2/conf-available/000-whm-default.conf', reload: { reloaded: true } });
       expect(app.agent.callsTo('web.default_vhost.remove')).toHaveLength(1);
       expect((await get('/api/service-config/apache')).body.data.defaultVhost).toMatchObject({ ok: true, summary: { removed: true } });
     } finally {
@@ -387,6 +387,37 @@ describe('cross-category helpers on ctx.web', () => {
       app.ctx.settings.setMany({ 'basic.hostname': previousHostname, 'basic.main_ip': '', 'basic.main_ipv6': '' });
       app.ctx.settings.set('service_config.apache_ports', previousPorts);
       app.agent.set('web.default_vhost.write', DEFAULT_VHOST_WRITE);
+    }
+  });
+
+  it('a tenant still on *:80 keeps the catch-all a plain _default_; a sync binds it to the main address and the catch-all then names it', async () => {
+    const previousHostname = app.ctx.settings.get('basic.hostname');
+    app.ctx.settings.setMany({ 'basic.hostname': 'panel.example.com', 'basic.main_ip': '203.0.113.5' });
+    try {
+      // bob has no address of his own: his vhost binds to the main address, never to *.
+      expect((await app.ctx.web.ensureVhost('bob', null)).applied).toBe(true);
+      expect(app.agent.callsTo('web.vhost.write').find((c) => c.args.domain === 'bob.example.org').args.ip).toBe('203.0.113.5');
+      expect(app.ctx.web.vhostFor('bob.example.org').ip).toBe('203.0.113.5');
+      // A row written before any address was known: the catch-all must not name the address, or that tenant is never reached.
+      app.ctx.db.prepare("UPDATE web_vhosts SET ip = NULL WHERE domain = 'bob.example.org'").run();
+      app.agent.calls.length = 0;
+      const r = await app.ctx.web.ensureHostnameVhost(null);
+      expect(r.defaultVhost).toMatchObject({ applied: true, addresses: [] });
+      expect(app.agent.callsTo('web.default_vhost.write').pop().args.addresses).toEqual([]);
+      // The next sync of that account binds it, and the catch-all follows the address set.
+      app.agent.calls.length = 0;
+      expect((await app.ctx.web.ensureVhost('bob', null)).applied).toBe(true);
+      expect(app.ctx.web.vhostFor('bob.example.org').ip).toBe('203.0.113.5');
+      const names = app.agent.calls.map((c) => c.name);
+      expect(names.indexOf('web.default_vhost.write')).toBeGreaterThan(names.lastIndexOf('web.vhost.write'));
+      expect(app.agent.callsTo('web.default_vhost.write').pop().args.addresses).toEqual(expect.arrayContaining(['203.0.113.5']));
+      // Unchanged addresses: a sync does not rewrite the catch-all.
+      app.agent.calls.length = 0;
+      expect((await app.ctx.web.ensureVhost('bob', null)).applied).toBe(true);
+      expect(app.agent.callsTo('web.default_vhost.write')).toHaveLength(0);
+    } finally {
+      app.ctx.db.prepare("DELETE FROM web_vhosts WHERE type = 'server'").run();
+      app.ctx.settings.setMany({ 'basic.hostname': previousHostname, 'basic.main_ip': '' });
     }
   });
 
@@ -489,9 +520,16 @@ describe('cross-category helpers on ctx.web', () => {
     const since = app.agent.calls.slice(mark);
     expect(since.filter((c) => c.name === 'web.vhost.write').every((c) => c.args.reload === false)).toBe(true);
     expect(since.filter((c) => c.name === 'web.reload')).toHaveLength(1);
+    // The catch-all is refreshed with the new address so it keeps the bare address on it.
+    expect(v6.defaultVhost).toMatchObject({ applied: true });
+    expect(app.agent.callsTo('web.default_vhost.write').pop().args.addresses).toEqual(expect.arrayContaining(['2001:db8::10']));
     const moved = await app.ctx.web.replaceIp('203.0.113.5', '203.0.113.9', {}, null);
-    expect(moved.updated).toBe(2);
+    expect(moved.domains).toEqual(expect.arrayContaining(['example.com', 'shop.example.com']));
+    expect(moved.updated).toBe(moved.domains.length);
     expect(app.ctx.web.vhostFor('shop.example.com').ip).toBe('203.0.113.9');
+    expect(moved.defaultVhost).toMatchObject({ applied: true });
+    expect(app.agent.callsTo('web.default_vhost.write').pop().args.addresses).toEqual(expect.arrayContaining(['203.0.113.9']));
+    expect(app.agent.callsTo('web.default_vhost.write').pop().args.addresses).not.toContain('203.0.113.5');
     await app.ctx.web.setPhpVersion('example.com', 'ea-php81', null, { reload: false });
     expect(app.agent.callsTo('web.phpfpm.pool.write').pop().args.version).toBe('8.1');
     expect(app.agent.callsTo('web.vhost.write').pop().args).toMatchObject({ domain: 'example.com', reload: false });
@@ -527,10 +565,16 @@ describe('cross-category helpers on ctx.web', () => {
     expect(r).toMatchObject({ http: 8080, https: null, bind: '127.0.0.1' });
     expect(app.agent.callsTo('web.ports.set').pop().args).toEqual({ http: 8080, https: null, bind: '127.0.0.1' });
     expect(app.agent.callsTo('web.vhost.write').pop().args).toMatchObject({ port: 8080, sslPort: null, bind: '127.0.0.1' });
+    // The catch-all moves with the ports and the bind, or the first tenant on them answers the bare address.
+    expect(r.defaultVhost).toMatchObject({ applied: true, addresses: ['127.0.0.1'] });
+    expect(app.agent.callsTo('web.default_vhost.write').pop().args).toMatchObject({ bind: '127.0.0.1', port: 8080, sslPort: null });
     expect((await get('/api/service-config/apache')).body.data.ports).toEqual({ http: 8080, https: null, bind: '127.0.0.1' });
     await app.ctx.web.setListenPorts({ http: 80, https: 443 }, null);
     expect(app.agent.callsTo('web.ports.set').pop().args).toEqual({ http: 80, https: 443, bind: null });
     expect(app.agent.callsTo('web.vhost.write').pop().args.bind).toBeUndefined();
+    const back = app.agent.callsTo('web.default_vhost.write').pop().args;
+    expect(back).toMatchObject({ port: 80, sslPort: 443 });
+    expect(back.bind).toBeUndefined();
   });
 
   it('ensureVhost for a fresh account and removeAccount clean-up', async () => {
