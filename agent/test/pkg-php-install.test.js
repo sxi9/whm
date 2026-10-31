@@ -291,6 +291,7 @@ describe('Debian: packages.sury.org/php', () => {
     expect(fs.statSync(keyring).mode & 0o777).toBe(0o644);
     expect(fs.readFileSync(path.join(apt, 'sources.list.d', 'whm-sury-php.list'), 'utf8')).toBe(`deb [signed-by=${keyring}] https://packages.sury.org/php/ bookworm main\n`);
     expect(fs.readdirSync(path.join(apt, 'keyrings'))).toEqual(['whm-sury-php.gpg']);
+    expect(fs.readdirSync(path.join(apt, 'sources.list.d'))).toEqual(['whm-sury-php.list']);
     expect(calls()).toEqual([['curl', ...fetches[0]], ['apt-get', 'update', '-q']]);
     exec.mockClear();
     const again = await runOp('pkg.php.source.enable', { source: 'sury' }, ctx);
@@ -322,7 +323,7 @@ describe('Debian: packages.sury.org/php', () => {
     expect(calls()[0]).toEqual(['apt-get', ...APT_INSTALL, '--no-install-recommends', '--', 'curl', 'ca-certificates']);
   });
 
-  it('refuses to write outside the allowed roots, and the detection says so instead of offering a failing job', async () => {
+  it('refuses to write outside the allowed roots while the detection keeps the host supported; the default roots cover exactly the catalog files', async () => {
     host('debian-outside', { osRelease: DEBIAN, binaries, answer });
     process.env.WHM_APT_ROOT = '/usr/share/whm-apt-test';
     try {
@@ -330,12 +331,15 @@ describe('Debian: packages.sury.org/php', () => {
       expect(fs.existsSync('/usr/share/whm-apt-test')).toBe(false);
       expect(exec).not.toHaveBeenCalled();
       expect((await opError(runOp('pkg.php.source.rollback', { source: 'sury' }, ctx))).code).toBe('path_not_allowed');
-      const detect = await runOp('pkg.php.sources.detect', { branches: ['8.3'] }, ctx);
-      expect(detect.source).toMatchObject({ key: 'sury', configured: false, supported: false });
-      expect(detect.source.reason).toMatch(/may not write \/usr\/share\/whm-apt-test\/keyrings; add \/etc\/apt\/keyrings and \/etc\/apt\/sources.list.d/);
+      expect((await runOp('pkg.php.sources.detect', { branches: ['8.3'] }, ctx)).source).toMatchObject({ key: 'sury', configured: false, supported: true, reason: null });
     } finally { process.env.WHM_APT_ROOT = path.join(base, 'debian-outside', 'apt'); }
-    // Under an allowed root the same host is supported.
     expect((await runOp('pkg.php.sources.detect', { branches: ['8.3'] }, ctx)).source).toMatchObject({ key: 'sury', supported: true, reason: null });
+    // On a real Debian host the agent's default roots take the keyring and the
+    // list file under their catalog names and nothing else under /etc/apt.
+    const real = createContext();
+    const refused = (p) => { try { real.assertAllowedPath(p, 'write'); } catch (err) { return err.code; } return null; };
+    for (const p of ['/etc/apt/keyrings/whm-sury-php.gpg', '/etc/apt/keyrings/whm-sury-php.asc', '/etc/apt/sources.list.d/whm-sury-php.list']) expect(real.assertAllowedPath(p, 'write'), p).toBe(p);
+    for (const p of ['/etc/apt', '/etc/apt/sources.list', '/etc/apt/apt.conf', '/etc/apt/trusted.gpg', '/etc/apt/trusted.gpg.d/whm.gpg', '/etc/apt/preferences.d/whm', '/etc/apt/keyrings/../sources.list', '/etc/apt/sources.list.d/../apt.conf', '/etc/apt/keyringsx/k.gpg', '/etc/apt/sources.list.dx/x.list']) expect(refused(p), p).toBe('path_not_allowed');
   });
 
   it('removes the list file and the keyring again when the index refresh fails after enabling', async () => {

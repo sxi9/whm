@@ -190,6 +190,20 @@ test('destinations: uploads go to every configured known destination and are rec
   assert.deepEqual(r2.result.warnings.map((w) => w.code), ['upload_failed']);
 });
 
+test('destinations: a copy the host reports as encrypted at rest is recorded as such; older hosts leave the field out', async () => {
+  const h = spy({ destinations: 'offsite', scope: 'accounts', accounts: 'alice' }, (c) => ({ async upload(args) { return { ...(await c.api.backups.upload(args)), encrypted: true }; } }));
+  const r = await h.runJob('run', { source: 'manual' });
+  assert.equal(r.status, 'done');
+  const [run] = await runs(h, 'run');
+  assert.deepEqual(run.results[0].remote.map((x) => [x.destinationId, x.state, x.encrypted]), [['offsite', 'uploaded', true]]);
+  const [a] = await artefacts(h);
+  assert.deepEqual(a.remote.map((x) => [x.destinationId, x.state, x.encrypted]), [['offsite', 'uploaded', true]]);
+  const plain = await loaded({ settings: { destinations: 'offsite', scope: 'accounts', accounts: 'alice' } });
+  await plain.runJob('run', { source: 'manual' });
+  const [b] = await artefacts(plain);
+  assert.equal('encrypted' in b.remote[0], false);
+});
+
 // ---------------------------------------------------------------- retention
 
 test('retention keeps the newest archive per day/week/month bucket and deletes only local artefacts (mock backupsDeleted); remote copies are recorded as retained', async () => {

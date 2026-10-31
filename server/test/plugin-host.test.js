@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import request from 'supertest';
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { createTestApp, waitForJob } from './support/app.js';
 import { createTarGz, packageFromFiles } from './support/tar.js';
 import { loadCommonJs, REPO_ROOT } from '../src/lib/plugin-sdk.js';
@@ -772,35 +772,61 @@ describe('review round 2', () => {
     expect(rows.at(-1)).toMatchObject({ principal: `plugin:${ID}`, role: 'plugin', target: 'svc.status', result: 'error:NOT_FOUND' });
   });
 
-  it('audits ctx.api.backups.upload and echoes the requested include list from backups.create', async () => {
+  it('uploads through backup.uploadFile (plain or rclone engine per destination), records the copy layer and audits it', async () => {
     const c = pluginCtx();
     const saved = app.ctx.backup;
+    const uploadFile = vi.fn((...a) => saved.uploadFile(...a));
     const stub = {
       ...saved,
       archiveAccount: async (account, { include }) => ({ id: 78, account, path: '/backup/alice-78.tar.gz', size: 10, sha256: 'abc', created_at: '2026-01-01 00:00:00', status: 'done', components: { include } }),
-      listDestinations: () => [{ id: 5, name: 'offsite', kind: 's3' }],
-      destinationConfig: () => ({ kind: 's3', bucket: 'b', secretKey: 'shh' }),
+      listDestinations: () => [{ id: 5, name: 'offsite', kind: 's3' }, { id: 6, name: 'vault', kind: 's3' }],
+      uploadFile,
     };
     app.ctx.backup = stub;
     app.ctx.db.prepare('UPDATE backups SET local_present = 1 WHERE id = 77').run();
-    app.ctx.db.prepare("INSERT OR IGNORE INTO backup_destinations (id, name, kind) VALUES (5, 'offsite', 's3')").run();
+    const enc = (cfg) => app.ctx.crypto.encrypt(JSON.stringify(cfg));
+    app.ctx.db.prepare("INSERT OR REPLACE INTO backup_destinations (id, name, kind, config_enc) VALUES (5, 'offsite', 's3', ?)").run(enc({ bucket: 'b', accessKey: 'k', secretKey: 'shh', region: 'us-east-1' }));
+    app.ctx.db.prepare("INSERT OR REPLACE INTO backup_destinations (id, name, kind, config_enc) VALUES (6, 'vault', 's3', ?)").run(enc({ bucket: 'v', accessKey: 'k', secretKey: 'shh', region: 'us-east-1', crypt: true, cryptPassword: 'pw', cryptPassword2: 'salt', cryptSince: '2026-01-01T00:00:00Z' }));
     app.agent.set('backup.destination.upload', () => ({ remotePath: 's3://b/alice-78.tar.gz' }));
+    app.agent.set('backup.rclone.upload', () => ({ remotePath: 'whm:/alice-78.tar.gz', tokenUpdate: null }));
     try {
       const created = await c.api.backups.create({ account: 'alice', include: ['home', 'ssl', 'cron'] });
       expect(created).toMatchObject({ id: '78', account: 'alice', include: ['home', 'ssl', 'cron'], compression: 'gzip', encrypted: false });
       const all = await c.api.backups.create({ account: 'alice' });
       expect(all.include).toEqual(['home', 'mail', 'db', 'dns', 'ssl', 'cron']);
+
+      // A plain destination goes through the legacy engine, copy recorded as plaintext.
       const up = await c.api.backups.upload({ artefactId: '77', destinationId: '5' });
-      expect(up).toEqual({ ok: true, remotePath: 's3://b/alice-78.tar.gz', sha256: 'abc' });
-      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM backup_uploads WHERE backup_id = 77 AND destination_id = 5 AND status = 'done'").get().n).toBe(1);
-      const row = app.ctx.db.prepare("SELECT principal, role, target, args_redacted, result FROM audit_log WHERE action = 'plugin.backup.upload' ORDER BY id DESC LIMIT 1").get();
-      expect(row).toEqual({ principal: `plugin:${ID}`, role: 'plugin', target: '77->offsite', args_redacted: JSON.stringify({ artefactId: '77', destinationId: '5', file: '/backup/alice.tar.gz', remotePath: 's3://b/alice-78.tar.gz' }), result: 'ok' });
+      expect(up).toEqual({ ok: true, remotePath: 's3://b/alice-78.tar.gz', sha256: 'abc', encrypted: false });
+      expect(uploadFile).toHaveBeenCalledTimes(1);
+      expect(uploadFile.mock.calls[0].slice(0, 2)).toEqual([5, '/backup/alice.tar.gz']);
+      expect(app.agent.callsTo('backup.destination.upload').map((x) => x.args)).toEqual([{ config: { kind: 's3', bucket: 'b', accessKey: 'k', secretKey: 'shh', region: 'us-east-1' }, file: '/backup/alice.tar.gz' }]);
+      expect(app.agent.callsTo('backup.rclone.upload')).toEqual([]);
+      expect(app.ctx.db.prepare('SELECT status, encrypted, remote_path FROM backup_uploads WHERE backup_id = 77 AND destination_id = 5').all()).toEqual([{ status: 'done', encrypted: 0, remote_path: 's3://b/alice-78.tar.gz' }]);
+      let row = app.ctx.db.prepare("SELECT principal, role, target, args_redacted, result FROM audit_log WHERE action = 'plugin.backup.upload' ORDER BY id DESC LIMIT 1").get();
+      expect(row).toEqual({ principal: `plugin:${ID}`, role: 'plugin', target: '77->offsite', args_redacted: JSON.stringify({ artefactId: '77', destinationId: '5', file: '/backup/alice.tar.gz', remotePath: 's3://b/alice-78.tar.gz', encrypted: false }), result: 'ok' });
+
+      // An encrypted destination goes through rclone with the panel-only fields dropped, copy recorded as ciphertext.
+      const vault = await c.api.backups.upload({ artefactId: '77', destinationId: '6' });
+      expect(vault).toEqual({ ok: true, remotePath: 'whm:/alice-78.tar.gz', sha256: 'abc', encrypted: true });
+      expect(uploadFile).toHaveBeenCalledTimes(2);
+      expect(uploadFile.mock.calls[1].slice(0, 2)).toEqual([6, '/backup/alice.tar.gz']);
+      const rclone = app.agent.callsTo('backup.rclone.upload');
+      expect(rclone).toHaveLength(1);
+      expect(rclone[0].args).toEqual({ config: { kind: 's3', bucket: 'v', accessKey: 'k', secretKey: 'shh', region: 'us-east-1', crypt: true, cryptPassword: 'pw', cryptPassword2: 'salt' }, file: '/backup/alice.tar.gz' });
+      expect(app.agent.callsTo('backup.destination.upload')).toHaveLength(1);
+      expect(app.ctx.db.prepare('SELECT status, encrypted FROM backup_uploads WHERE backup_id = 77 AND destination_id = 6').all()).toEqual([{ status: 'done', encrypted: 1 }]);
+      row = app.ctx.db.prepare("SELECT target, args_redacted, result FROM audit_log WHERE action = 'plugin.backup.upload' ORDER BY id DESC LIMIT 1").get();
+      expect(row).toEqual({ target: '77->vault', args_redacted: JSON.stringify({ artefactId: '77', destinationId: '6', file: '/backup/alice.tar.gz', remotePath: 'whm:/alice-78.tar.gz', encrypted: true }), result: 'ok' });
+
       app.agent.fail('backup.destination.upload', 'command_failed', 'upload broke');
       await expect(c.api.backups.upload({ artefactId: '77', destinationId: '5' })).rejects.toMatchObject({ code: 'COMMAND_FAILED' });
       expect(app.ctx.db.prepare("SELECT result FROM audit_log WHERE action = 'plugin.backup.upload' ORDER BY id DESC LIMIT 1").get().result).toBe('error:COMMAND_FAILED');
+      await expect(c.api.backups.upload({ artefactId: '77', destinationId: '9' })).rejects.toMatchObject({ code: 'NOT_FOUND' });
     } finally {
       app.ctx.backup = saved;
       app.agent.reset('backup.destination.upload');
+      app.agent.reset('backup.rclone.upload');
     }
   });
 

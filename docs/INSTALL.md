@@ -163,6 +163,8 @@ required })`); the registry is refreshed after the agent self-check (`capabiliti
 | `glibc-locales` | `locale` | `localedef`, `locale-gen` |
 | `perl`, `cpan` (`cpanm`/`cpan`), `pecl`, `pear`, `gem`, `pip` (`pip3`/`pip`) | the named binary | Software category installers |
 | `imunifyav` (`imunify-antivirus`), `clamav` (`clamscan`), `wpcli` (`wp`) | the named binary | bundled plugins |
+| `rclone` | `rclone` | Backup › cloud storage destinations (Google Drive, OneDrive, Dropbox, S3, Azure Blob, B2) and every encrypted copy; stack component `rclone` (EPEL on the RHEL family) |
+| `fail2ban` | `fail2ban-client` | Security Advisor › Hardening (jails incl. the panel jail); stack component `fail2ban` |
 
 Other functions check for their binary at call time: `agent/src/exec.js` resolves a program name
 in `/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin` and rejects with
@@ -186,8 +188,37 @@ install prompt for the missing service instead of its controls. Features whose d
 fully. The agent also confines every path argument to an allowlist of roots
 (`DEFAULT_ALLOWED_ROOTS` in `agent/src/lib.js`: `/home`, `/var/lib/whm`, `/etc/whm`, `/var/log/whm`,
 `/etc/apache2`, `/etc/httpd`, `/etc/nginx`, `/var/www`, `/etc/bind`, `/var/named`, `/etc/exim*`,
-`/etc/dovecot`, `/etc/mysql`, `/etc/letsencrypt`, `/backup`, `/var/backups/whm`, …); it can be widened
-with `extraAllowedRoots` in `/etc/whm/agent.conf`.
+`/etc/dovecot`, `/etc/mysql`, `/etc/letsencrypt`, `/backup`, `/var/backups/whm`, `/etc/fail2ban`,
+`/etc/apt/apt.conf.d`, `/etc/apt/keyrings`, `/etc/apt/sources.list.d`, `/etc/dnf/automatic.conf`,
+`/etc/sysctl.d`, …); it can be widened with `extraAllowedRoots` in `/etc/whm/agent.conf`.
+
+**Tools the panel installs or configures on demand** (all optional; nothing is required at install time):
+
+- **rclone** (cloud storage destinations and encrypted backup copies, *Backup › Backup Configuration › Cloud
+  storage*): stack component `rclone` (`--components rclone`, the *full* profile, or the install prompt on the
+  page). On AlmaLinux / Rocky / RHEL the package comes from **EPEL** (`dnf install epel-release` first; the stack
+  installer does that itself). rclone ≥ 1.61 is preferred for Azure Blob with a custom endpoint; 1.60 (Debian 12,
+  Ubuntu 24.04) works for every other provider. The agent renders a throw-away `rclone.conf` under `/tmp/whm` per
+  call; nothing is stored in `~/.config/rclone`.
+- **PHP package sources** (*Software › MultiPHP Manager › Install a PHP version*): the installer may enable one
+  third-party source per family when you install a branch the distribution does not ship — Ubuntu and
+  derivatives `ppa:ondrej/php` (`add-apt-repository`, installing `software-properties-common` when missing),
+  Debian `packages.sury.org/php` (keyring `/etc/apt/keyrings/whm-sury-php.gpg`, list
+  `/etc/apt/sources.list.d/whm-sury-php.list`, `curl` + `ca-certificates` installed when no fetcher exists), the
+  RHEL family **Remi** (`epel-release`, `remi-release-<major>.rpm`, `crb`/`powertools`, SCL packages `php8x-php-*`
+  next to the system PHP). A refresh that fails right after the source was added removes it again. Outbound HTTPS
+  to those hosts is needed.
+- **Automatic security updates** (*Security Advisor › Hardening*): `unattended-upgrades` on the Debian family
+  (`/etc/apt/apt.conf.d/20auto-upgrades` + `52whm-unattended-upgrades`, security pockets only, no automatic
+  reboot) or `dnf-automatic` on the RHEL family (`/etc/dnf/automatic.conf`, `upgrade_type = security`); the
+  package is installed as a job when missing. Reboots are never scheduled by the panel.
+- **Fail2ban and the panel jail**: `fail2ban` (stack component or the Hardening card's *Install*). The
+  **whm-panel** jail reads the journal with `journalmatch = SYSLOG_IDENTIFIER=whm-panel` — the identifier
+  `deploy/whm-panel.service` sets (`SyslogIdentifier=whm-panel`; keep it if you edit the unit, or the jail sees
+  no failed logins). A development run (`npm run dev`) logs to the terminal and is invisible to it. **Reverse
+  proxies:** the filter bans the socket address pino-http logs (`req.ip`), so with a proxy in front of 2087 it
+  would ban the proxy itself; leave the panel jail for the panel's own listener (`WHM_HOST`) or put the
+  proxy's address in the jail's *Never banned from the panel* list.
 
 ---
 
@@ -273,7 +304,7 @@ header comment.
 | `--with-hub` | Additionally install **whm-hub** on this host (user, directories, config, keys, certificate, unit). Requires `hub/package.json` and `hub/src/index.js` in the checkout. |
 | `--skip-node` | Do not install Node.js from NodeSource; the installed `node` must still be ≥ 22. |
 | `--stack full` / `--stack web` / `--stack none` | Install a hosting-stack **profile** from the panel's own catalog (`server/src/lib/stack-catalog.js`, the same list the setup wizard and *Service Manager › Server stack* use) with the host's package manager, before the units start: **full** = everything marked recommended (Apache, PHP-FPM, MariaDB, BIND, Exim, Dovecot, SpamAssassin, pure-ftpd, ModSecurity + CRS, certbot, quota tools, firewall, AWStats/Webalizer/Analog, rsync, git, Fail2ban …); **web** = Apache, PHP, MariaDB, certbot, quota, firewall; **none** = nothing now. Also `--stack=<profile>`. Works with `--upgrade` to add software to an existing install. |
-| `--components a,b,c` | Manual selection: comma-separated component keys from the catalog (`apache, php, nginx, mysql, postgres, bind, exim, dovecot, ftp, spamassassin, clamav, modsecurity, acme, quota, firewall, awstats, webalizer, analog, mailman, rsync, git, node, python, fail2ban`); an unknown key aborts before anything is installed. |
+| `--components a,b,c` | Manual selection: comma-separated component keys from the catalog (`apache, php, nginx, mysql, postgres, bind, exim, dovecot, ftp, spamassassin, clamav, modsecurity, acme, quota, firewall, awstats, webalizer, analog, mailman, rsync, rclone, git, node, python, fail2ban`); an unknown key aborts before anything is installed. |
 | `-h`, `--help` | Print usage and exit. |
 
 Any other argument aborts with `unknown option`. Without `--stack`/`--components`, a first install
@@ -1013,6 +1044,14 @@ default from [§5.6](#56-hubconf-reference). Booleans accept `1`, `true`, `yes`.
 - The daemon is absent on this host (HTTP 501, see [§2.3](#23-daemons-the-panel-manages)). Install it
   and reload the page; the capability registry is refreshed on restart. The development container
   used to build this project has no Apache/BIND/Exim/MySQL, so every such page degrades there.
+- *Backup Configuration › Cloud storage* shows the prompt for `rclone`: install the `rclone` stack component
+  (EPEL on the RHEL family). A cloud or encrypted destination answers `501 capability_missing` until then.
+- *MultiPHP Manager › Install a PHP version* shows the source as *unavailable* on Debian: the agent may not write
+  `/etc/apt/keyrings` / `/etc/apt/sources.list.d` (both are in the default allowed roots; check
+  `extraAllowedRoots` only if you replaced the list in `/etc/whm/agent.conf`).
+- *Security Advisor › Hardening › Firewall baseline* reads *not applicable*: firewalld or ufw is active and owns
+  the input policy; the panel does not fight them. *Fail2ban* applied but the panel jail never bans: the unit
+  must log with `SyslogIdentifier=whm-panel` and the panel must run as a service (not `npm run dev`).
 
 **Login**
 - `rate_limited` — more than 20 login/2FA attempts in 15 minutes per IP+user; wait or adjust

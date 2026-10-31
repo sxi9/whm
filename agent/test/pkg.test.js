@@ -10,6 +10,7 @@ import {
   versionAtLeast, nginxHttp2Directive, nginxRejectHandshake, disableServerBlocks, restoreServerBlocks,
   parseAptRemoveSimulation, parseDnfRemoveSimulation, peclIniHint, startRun, pollRun, PKG_RUN_DIR, NGINX_SSL_ROOTS, nginxSslPath,
   packageStem, bindingBase, rankSearchResults, dedupeSearchResults, detectManager, parseAptPolicyBlocks, parseDnfList, parseProviderLines, packageOffers,
+  NGINX_DEFAULT_SSL_ROOTS, nginxDefaultSslPath, catchAllMode, parseUpdateinfoNames, flagRpmSecurity,
 } from '../src/ops/pkg.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
@@ -775,6 +776,131 @@ describe('search dedupe and ranking', () => {
       expect(raw).toMatchObject({ all: true, total: 6, shown: 4, collapsed: 0, hidden: 2, more: true, truncated: 2 });
       expect(raw.results.map((r) => r.name)).toEqual(['redis', 'redis-doc', 'redis-server', 'redis-tools']);
       expect(raw.results.every((r) => r.variantCount === 0)).toBe(true);
+    } finally { exec.mockImplementation(original); }
+  });
+});
+
+describe('nginx HTTPS catch-all proxies to Apache when the panel has a certificate pair for it', () => {
+  const domains = [{ domain: 'bob.com', aliases: ['www.bob.com'], ssl: { cert: '/etc/ssl/whm/bob.com/fullchain.pem', key: '/etc/ssl/whm/bob.com/key.pem' } }];
+  const pair = { cert: '/etc/ssl/whm/host.example.com/fullchain.pem', key: '/etc/ssl/whm/host.example.com/key.pem' };
+  const blocksOf = (conf) => conf.split(/^server \{/m).slice(1);
+  const locationOf = (block) => { const start = block.indexOf('location / {'); return block.slice(start, block.indexOf('\n  }', start) + 4); };
+
+  it('renders the :443 default_server with the pair and the very proxy location of the :80 default_server', () => {
+    const conf = renderNginxProxy({ apachePort: 8080, cache: true, cacheTtl: '2m', domains, rejectHandshake: true, defaultServer: pair, http2Directive: true });
+    const blocks = blocksOf(conf);
+    expect(blocks).toHaveLength(3);
+    expect(blocks[1]).toContain('listen 443 ssl default_server;');
+    expect(blocks[1]).toContain('listen [::]:443 ssl default_server;');
+    expect(blocks[1]).toContain('http2 on;');
+    expect(blocks[1]).toContain('server_name _;');
+    expect(blocks[1]).toContain(`ssl_certificate ${pair.cert};`);
+    expect(blocks[1]).toContain(`ssl_certificate_key ${pair.key};`);
+    expect(blocks[1]).toContain('ssl_protocols TLSv1.2 TLSv1.3;');
+    expect(blocks[1]).not.toContain('ssl_reject_handshake');
+    expect(blocks[1]).not.toContain('return 444');
+    expect(locationOf(blocks[1])).toBe(locationOf(blocks[0]));
+    expect(locationOf(blocks[1])).toContain('proxy_pass http://127.0.0.1:8080;');
+    expect(locationOf(blocks[1])).toContain('proxy_cache whm;');
+    expect(locationOf(blocks[1])).toContain('proxy_cache_valid 200 301 302 2m;');
+    expect(locationOf(blocks[1])).toContain('proxy_set_header X-Forwarded-Proto $scheme;');
+    expect(blocks[2]).toContain('server_name bob.com www.bob.com;');
+    expect(blocks[2]).not.toContain('default_server');
+    expect(parseProxyHeader(conf)).toMatchObject({ catchAll: 'proxy', domains: 1, apachePort: 8080, cache: true });
+    expect(catchAllMode({ defaultServer: pair, rejectHandshake: true })).toBe('proxy');
+    // The http2 listen flag of an older nginx applies to the catch-all like to every tenant block.
+    const old = blocksOf(renderNginxProxy({ apachePort: 8080, cache: false, domains, defaultServer: pair, http2Directive: false }))[1];
+    expect(old).toContain('listen 443 ssl http2 default_server;');
+    expect(old).not.toContain('http2 on;');
+  });
+
+  it('keeps the reject-handshake / self-signed / none catch-all without the pair and names the mode in the header', () => {
+    const reject = renderNginxProxy({ apachePort: 8080, cache: false, domains, rejectHandshake: true });
+    expect(blocksOf(reject)[1]).toContain('ssl_reject_handshake on;');
+    expect(parseProxyHeader(reject).catchAll).toBe('reject-handshake');
+    const legacy = renderNginxProxy({ apachePort: 8080, cache: false, domains, defaultCert: { cert: '/etc/nginx/whm-default/cert.pem', key: '/etc/nginx/whm-default/key.pem' } });
+    expect(blocksOf(legacy)[1]).toContain('return 444;');
+    expect(parseProxyHeader(legacy).catchAll).toBe('self-signed');
+    expect(parseProxyHeader(renderNginxProxy({ apachePort: 8080, cache: false, domains })).catchAll).toBe('none');
+    expect(parseProxyHeader('# whm-proxy: version=1 apache_port=8080 cache=off domains=0 generated=x').catchAll).toBeNull();
+    expect(catchAllMode({ rejectHandshake: true, defaultCert: { cert: 'c', key: 'k' } })).toBe('reject-handshake');
+    expect(catchAllMode({ defaultCert: { cert: 'c', key: 'k' } })).toBe('self-signed');
+    expect(catchAllMode({})).toBe('none');
+  });
+
+  it('takes the pair through the certificate-path alphabet (plus /etc/whm/tls) and refuses anything else before a command runs', async () => {
+    exec.mockClear();
+    expect(NGINX_DEFAULT_SSL_ROOTS).toEqual([...NGINX_SSL_ROOTS, '/etc/whm/tls']);
+    for (const p of ['/etc/whm/tls/cert.pem', '/etc/ssl/whm/host.example.com/fullchain.pem', '/etc/ssl/whm/service/apache/fullchain.pem', '/etc/ssl/whm/default/key.pem', '/etc/letsencrypt/live/x/privkey.pem']) expect(nginxDefaultSslPath.safeParse(p).success, p).toBe(true);
+    expect(nginxSslPath.safeParse('/etc/whm/tls/cert.pem').success).toBe(false);
+    const write = (defaultServer) => runOp('pkg.nginx.proxy.write', { defaultServer }, ctx);
+    const bad = [
+      { cert: 'relative.pem', key: '/etc/whm/tls/key.pem' },
+      { cert: '/etc/whm/tls/../whm.conf', key: '/etc/whm/tls/key.pem' },
+      { cert: '/etc/whm/tls/cert.pem', key: '/etc/whm/tls/./key.pem' },
+      { cert: '/etc/whm/tls/cert.pem', key: '/etc/whm/tls//key.pem' },
+      { cert: '/etc/whm/whm.conf', key: '/etc/whm/tls/key.pem' },
+      { cert: '/etc/whm/tlsx/cert.pem', key: '/etc/whm/tls/key.pem' },
+      { cert: '/etc/whm/tls/cert.pem', key: '/etc/shadow' },
+      { cert: '/etc/whm/tls/cert.pem', key: '/etc/ssl/private/ssl-cert-snakeoil.key' },
+      { cert: '/etc/whm/tls/cert.pem; include /etc/passwd;', key: '/etc/whm/tls/key.pem' },
+      { cert: '/etc/whm/tls/cert.pem', key: '/etc/whm/tls/key.pem\n}\nserver { listen 80; }' },
+      { cert: '/etc/whm/tls/$host.pem', key: '/etc/whm/tls/key.pem' },
+      { cert: '/etc/whm/tls/cert.pem' },
+      { key: '/etc/whm/tls/key.pem' },
+      { cert: '/etc/whm/tls/cert.pem', key: '/etc/whm/tls/key.pem', chain: '/etc/whm/tls/chain.pem' },
+      'yes',
+      null,
+    ];
+    for (const d of bad) expect((await opError(write(d))).code, JSON.stringify(d)).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+describe('RHEL security updates come from the advisories, not the repository name', () => {
+  const DNF = [
+    'Last metadata expiration check: 0:10:12 ago on Thu 31 Oct 2026 01:00:00 AM UTC.',
+    'Updates Information Summary: available',
+    '    3 Security notice(s)',
+    '        2 Important Security notice(s)',
+    'ALSA-2024:3618 Important/Sec. openssl-libs-1:3.0.7-27.el9_4.x86_64',
+    'ALSA-2024:2863 Moderate/Sec.  kernel-5.14.0-427.13.1.el9_4.x86_64',
+    'ALSA-2024:4078 Important/Sec. python3-setuptools-53.0.0-12.el9_4.noarch',
+    '',
+  ].join('\n');
+
+  it('parses the package names out of updateinfo list output (epochs, noarch, header lines)', () => {
+    expect([...parseUpdateinfoNames(DNF)]).toEqual(['openssl-libs', 'kernel', 'python3-setuptools']);
+    expect([...parseUpdateinfoNames('RHSA-2019:1234 Important/Sec. openssl-libs-1:1.0.2k-19.el7.x86_64\n')]).toEqual(['openssl-libs']);
+    expect([...parseUpdateinfoNames('ALSA-2024:1 Low/Sec. libxml2-devel-2.9.13-6.el9_4.aarch64\n')]).toEqual(['libxml2-devel']);
+    expect(parseUpdateinfoNames('')).toEqual(new Set());
+    expect(parseUpdateinfoNames(undefined)).toEqual(new Set());
+    expect(parseUpdateinfoNames('Error: No matching Packages to list\n')).toEqual(new Set());
+  });
+
+  it('marks pending updates whose name an advisory lists as security, with the dnf and yum argv', async () => {
+    const original = exec.getMockImplementation();
+    const calls = [];
+    exec.mockImplementation(async (bin, argv) => { calls.push([bin, argv]); return { code: 0, stdout: DNF, stderr: '' }; });
+    try {
+      const pending = parseDnfCheckUpdate('\nopenssl-libs.x86_64    1:3.0.7-27.el9_4    baseos\nvim-minimal.x86_64     2:8.2.2637-20.el9    baseos\nkernel.x86_64          5.14.0-427.13.1.el9_4    baseos\n');
+      expect(pending.every((p) => p.security === false)).toBe(true);
+      const dnf = await flagRpmSecurity({ manager: 'dnf', family: 'rhel', binary: 'dnf', rpm: true }, pending);
+      expect(dnf.map((p) => [p.name, p.security])).toEqual([['openssl-libs', true], ['vim-minimal', false], ['kernel', true]]);
+      expect(dnf[0]).toMatchObject({ candidate: '1:3.0.7-27.el9_4', repo: 'baseos' });
+      expect(calls).toEqual([['dnf', ['-q', 'updateinfo', 'list', '--security']]]);
+      calls.length = 0;
+      const yum = await flagRpmSecurity({ manager: 'yum', family: 'rhel', binary: 'yum', rpm: true }, pending);
+      expect(yum.filter((p) => p.security).map((p) => p.name)).toEqual(['openssl-libs', 'kernel']);
+      expect(calls).toEqual([['yum', ['updateinfo', 'list', 'security']]]);
+      // A failing updateinfo (no plugin, offline) leaves the list unflagged instead of failing the check.
+      calls.length = 0;
+      exec.mockImplementation(async (bin, argv) => { calls.push([bin, argv]); return { code: 1, stdout: '', stderr: 'Error: Failed to synchronize cache' }; });
+      expect((await flagRpmSecurity({ manager: 'dnf', family: 'rhel', binary: 'dnf', rpm: true }, pending)).every((p) => p.security === false)).toBe(true);
+      expect(calls).toHaveLength(1);
+      calls.length = 0;
+      expect(await flagRpmSecurity({ manager: 'dnf', family: 'rhel', binary: 'dnf', rpm: true }, [])).toEqual([]);
+      expect(calls).toEqual([]);
     } finally { exec.mockImplementation(original); }
   });
 });

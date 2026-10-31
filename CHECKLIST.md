@@ -8,7 +8,8 @@
 
 ## Current state
 
-- **Branch:** `claude/pensive-curie-9r0rcx` (continues `claude/trusting-cori-ifp7wy`) · **Last updated:** 2026-10-30 · **owner asks 2026-10-29:** application hosting first, then the 26-item live-server issue list (session upload), then a full audit — see *Owner's issue list* below
+- **Branch:** `claude/pensive-curie-9r0rcx` (continues `claude/trusting-cori-ifp7wy`) · **Last updated:** 2026-10-31 · **owner asks 2026-10-29:** application hosting first, then the 26-item live-server issue list (session upload), then a full audit — see *Owner's issue list* below · **owner asks 2026-10-30:** the ten-item issue list 2 (landing page, custom index, customer-side HST Panel, hostname AutoSSL, PHP installer, security alert mails, package catalog, hardening, naming, encrypted cloud storage) — see *Owner's issue list 2* below
+- **2026-10-31 (Issue-2 round + integration):** six units in the tree — V1 catch-all landing vhost (`000-whm-default` / `+whm-default`) + Domains panel on Modify an Account + Server hostname card on Manage SSL Hosts, V2 PHP version installer (ppa:ondrej / sury / Remi SCL), V3 security alert mails (`ctx.securityAlerts`, migrations 037/037b), V4 curated package catalog (`pkg.offers`), V5 Hardening card (`ctx.hardening`, migration 038, `hardening.*` ops), V6 encrypted cloud storage (`ctx.backupCloud`, rclone crypt, migration 039); 102 agents, 55 confirmed findings fixed in the fix round; the integration round closed the shared-file leftovers (allowed roots, nginx HTTPS catch-all, plugin-host uploads through `ctx.backup.uploadFile`, docs: contracts §36, manuals, INSTALL, README). Next: the customer-side HST Panel (`docs/design/hst-panel-user.md`).
 - **2026-10-30 (integration round):** platform-fixes leftovers integrated — shared-file findings closed by the integration agents; this unit added the agent op `web.module.enable` (`agent/test/web.test.js` 32 tests), `install.sh --stack full|web|none` / `--components` from the stack catalog, the panel TLS pair at `/etc/whm/tls/{cert,key}.pem` (`whm.conf.example`, legacy pair migrated on `--upgrade`), `WHM_FORCE_HTTPS` in the templates, and the manuals/INSTALL/README/contracts §34 for every round-1 unit.
 - **2026-10-29/30:** Phase-6 verifier run done (11 confirmed findings fixed, `50d0f14`); **category 31 Application Manager landed** (`81417ea`, 3 functions); platform-fixes round 1 for the issue list built (9 units: installer profiles + install-from-panel + setup wizard, HTTPS/hostname/branded pages, super admin + hidden hub + hub authenticator, external-auth presets, Cloudflare DNS, account manager + chat (Support › Account Conversations → 216 functions), terminal latency, quota page, HST Panel rename) — review + fix round in progress; screenshots refreshed with the new pages.
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
@@ -61,7 +62,8 @@ a fix round ~15 min; most categories need one fix round.
 | **Full audit bug-hunt** (lens × scope finders until dry, 3 refuters each, grouped fixes) — owner ask | done — **81 confirmed findings** (6 blocking / 47 major / 28 minor), **84 fixes by 49 grouped fixers** with tests, landed `b100fd3` (server suite 1349 green); **this integration round** closes the fixers' cross-area companions (`audit-outcome.md` NOT FIXED notes: web-server group on every docroot, SELinux at install + docs, XFS-root quota kernel args in the page/docs, hub mail default `smtp` docs, SameSite=lax docs, confined tokens in core middleware, run-row sweeps for backup/multi-account, ui_dist test) | 4 h 30 min + 1 h | 2026-10-30 12:51 (fixes) · 14:05 (integration round `06843dd`) |
 | Deploy fixes from the first live install (3.7.253.240, 30 Oct): single root `npm ci` (hub install no longer wipes the panel's packages), stack installs skip packages the release does not offer (`pkg.available`, installer `package_offered`), hub certificate SANs include every local + the public address + `public_url` host, loopback MTA self-signed certificate accepted by default, hub license key pinned automatically on a same-host install | done | 45 min | 2026-10-30 15:10 |
 | Final gate + screenshots + HANDOFF/CLAUDE.md rewrite | done — gate on `06843dd`: server 1360 (52 files) / agent 651 (34) / client 206 (32) / hub 211 / hub-ui 105 / SDK 73 / sample 13 / bundled plugins; builds; boot; Playwright flow (217 sidebar links, Restart page now shows an Install prompt while the daemon is absent); screenshots refreshed | 30 min | 2026-10-30 14:15 |
-| **Total remaining** | | **~1 h** (audit integration review, final gate) | |
+| **Issue-2 round** — the owner's second issue list as 6 units (V1 landing vhost + domains + hostname SSL, V2 PHP version installer, V3 security alert mails, V4 curated package catalog, V5 hardening, V6 encrypted cloud storage), two review lenses for root-level code, 3 refuters per finding, one fix round | done — `wf_08bc14d9-ea9` (102 agents, 55 confirmed findings fixed) + integration round for the cross-unit leftovers (allowed roots, nginx HTTPS catch-all, plugin-host uploads, docs) | — | 2026-10-31 |
+| **Total remaining** | | **~1 h** (Issue-2 integration gate) + the customer-side HST Panel build (`docs/design/hst-panel-user.md`) | |
 
 Faster option: verification can be cut to one reviewer and one fix round per category
 (~30% less time, less thorough). Not applied unless requested.
@@ -133,6 +135,23 @@ Round history: platform-fixes build (9 units) → adversarial review (two lenses
 | 26 | Hub: `licserver.hostingsignal.in` default, hidden calls, authenticator support on all dashboards | done — default URLs, server-side-only hub calls, forced TOTP enrolment (`hub.require_totp_for_admins`), login/step-up with once-per-step codes for vendor, reseller and developer portal users |
 | — | "Full audit, find more bugs" | done — `full-audit` workflow: 81 confirmed findings (6 blocking / 47 major / 28 minor), 84 fixes by 49 fixers (`b100fd3`); cross-area companions closed by the audit integration round (see the timeline row) |
 
+### Owner's issue list 2 (2026-10-30) — status
+
+Round history: six builders (V1–V6, disjoint file lists) → adversarial review (two lenses for root-level and signing code, three refuters per finding, 55 confirmed) → one fix round → integration round 2026-10-31 (shared files: agent allowed roots, nginx `:443 default_server` proxy, plugin-host uploads via `ctx.backup.uploadFile`, docs). Designs: `docs/design/domains.md`, `php-versions.md`, `security-alerts.md`, `hardening.md`, `backup-cloud.md`; seams in `docs/design/integration-contracts.md` §36.
+
+| # | Finding | Status / where |
+|---|---|---|
+| 1 | Landing page on the bare IP (ports 80 and 443) | done — V1: catch-all vhost `web.default_vhost.write` (Debian `conf-enabled/000-whm-default.conf`, RHEL `conf.d/+whm-default.conf`, stock `000-default` disabled, `ServerName default.invalid`, hostname certificate → `apache` service certificate → `/etc/whm/tls` → generated pair under `/etc/ssl/whm/default`), refreshed on every hostname/port/IP/certificate change; the integration round added the nginx HTTPS catch-all (`pkg.nginx.proxy.write { defaultServer }` proxies `https://<ip>/` to Apache instead of 444) |
+| 2 | Custom index page for every added site | done — V1: `web.docroot.ensure` creates addon/sub docroots as the account (`runuser`, `0750 user:<web group>`) and renders the `index` web template into them; Domains panel on Modify an Account (`ctx.accountFunctions.domains.*`, `/api/account-functions/domains/:username`) |
+| 3 | Customer-side HST Panel (the hosted account's own panel) | design done — `docs/design/hst-panel-user.md`; build next (waves) |
+| 4 | Hostname AutoSSL visible in the SSL host list | done — V1: Manage SSL Hosts › *Server hostname* card (`GET /api/ssl/hosts` → `serverHostname`, Reissue / Download), the hostname's host row labelled |
+| 5 | PHP version installer (and installers on the other Software pages) | done — V2: MultiPHP Manager › *Install a PHP version* (`GET /api/software/php/installable`, `POST /api/software/php/install`, `DELETE /api/software/php/versions/:id`; ops `pkg.php.sources.detect` / `source.enable` / `source.rollback` / `install` / `remove`; sources ppa:ondrej/php, packages.sury.org, Remi SCL), Module Installers install their missing tool through the shared `InstallerCard` |
+| 6 | Security alert mails ("emergency update pushed") | done — V3: `ctx.securityAlerts` (migrations 037/037b), Contact Manager › *Security notifications* card, Security Advisor › *Alerts* panel, contacts event `security.alert` (root mail by default), digest window, accounts only told about applied security updates / notices / tests |
+| 7 | Curated package catalog with the extras a hosting server needs | done — V4: `server/src/lib/package-catalog.js` (79 entries, 8 groups), Install Distro Packages opens on the Catalog tab, repository search folds variants (*Show N more variants*, *Show everything*), batch op `pkg.offers` (15 min cache), WHM Marketplace deep links `/software/install-distro-packages?entry=<key>` |
+| 8 | Stronger security side | done — V5: Security Advisor › *Hardening* card (Fail2ban incl. the panel jail, automatic security updates, SSH daemon, sysctl, firewall baseline — Apply / Revert, advisor findings per item; `ctx.hardening`, migration 038, ops `hardening.jails.*`, `hardening.updates.*`, `hardening.sysctl.*`, `hardening.firewall.*`) |
+| 9 | Naming and references (HST Panel; cPanel as the WHM-side reference, hPanel for the customer side) | naming done earlier (`client/src/brand.js`, issue list 1 item 18); the customer side follows the hPanel reference in `docs/design/hst-panel-user.md` — build next |
+| 10 | Encrypted cloud storage (Google Drive, OneDrive, Dropbox, S3, Azure Blob, Backblaze B2 …) | done — V6: Backup Configuration › *Cloud storage* (provider cards, OAuth clients with the redirect URI `https://<hostname>:2087/api/backup/destinations/oauth/<provider>/callback`, rclone crypt on by default, one-time key, *Enable encryption* on old destinations, *Copies on destinations* in the restore picker; `ctx.backupCloud` used through `ctx.backup`, op family `backup.rclone.*`, capability `rclone`, migration 039) |
+
 ## Functions — all 31 categories (216)
 
 ### 1. Server Configuration
@@ -174,7 +193,7 @@ Round history: platform-fixes build (9 units) → adversarial review (two lenses
 - [x] ModSecurity Tools
 - [x] ModSecurity Vendors
 - [x] Password Strength Configuration
-- [x] Security Advisor
+- [x] Security Advisor *(+ Hardening card: fail2ban / auto-updates / ssh / sysctl / firewall with Apply/Revert and advisor findings; + Alerts panel — Issue-2 round V5/V3)*
 - [x] Security Questions
 - [x] Shell Fork Bomb Protection
 - [x] SSH Password Authorization Tweak
@@ -182,7 +201,7 @@ Round history: platform-fixes build (9 units) → adversarial review (two lenses
 - [x] Two-Factor Authentication
 
 ### 5. Server Contacts
-- [x] Contact Manager
+- [x] Contact Manager *(+ Security notifications card: `security.alert` event, digest, test/notice, account audience — V3)*
 - [x] Edit System Mail Preferences
 
 ### 6. Resellers
@@ -219,8 +238,8 @@ Round history: platform-fixes build (9 units) → adversarial review (two lenses
 - [x] View Available Locales
 
 ### 9. Backup
-- [x] Backup Configuration
-- [x] Backup Restoration
+- [x] Backup Configuration *(+ Cloud storage: Google Drive, OneDrive, Dropbox, S3, Azure Blob, B2 via rclone, encrypted at rest by default — V6)*
+- [x] Backup Restoration *(+ Copies on destinations: list and import a destination's archives — V6)*
 - [x] Backup User Selection
 - [x] File and Directory Restoration
 
@@ -257,7 +276,7 @@ Round history: platform-fixes build (9 units) → adversarial review (two lenses
 - [x] Manage Account Suspension
 - [x] Manage Demo Mode
 - [x] Manage Shell Access
-- [x] Modify an Account
+- [x] Modify an Account *(+ Domains panel: addon/sub/parked domains with docroot, DNS, mail and AutoSSL steps — V1)*
 - [x] Password Modification
 - [x] Quota Modification
 - [x] Raw Apache Log Download
@@ -332,11 +351,11 @@ Round history: platform-fixes build (9 units) → adversarial review (two lenses
 
 ### 22. Software
 - [x] Install a Perl Module
-- [x] Install Distro Packages
-- [x] Module Installers
+- [x] Install Distro Packages *(curated catalog tab by default, repository search with folded variants — V4)*
+- [x] Module Installers *(installs a missing pecl/pear/gem/pip tool from the page — V2)*
 - [x] MultiPHP INI Editor
-- [x] MultiPHP Manager
-- [x] NGINX Manager
+- [x] MultiPHP Manager *(+ Install a PHP version: ppa:ondrej / sury / Remi SCL, remove with usage guard — V2)*
+- [x] NGINX Manager *(HTTPS catch-all proxies the bare address to Apache's landing vhost — Issue-2 integration)*
 - [x] Rebuild RPM Database
 - [x] System Update
 - [x] Update Server Software
@@ -375,7 +394,7 @@ Round history: platform-fixes build (9 units) → adversarial review (two lenses
 - [x] Generate an SSL Certificate and Signing Request
 - [x] Install an SSL Certificate on a Domain
 - [x] Manage AutoSSL
-- [x] Manage SSL Hosts
+- [x] Manage SSL Hosts *(+ Server hostname card: certificate, services covered, renewal schedule, Reissue / Download — V1)*
 - [~] Purchase and Install an SSL Certificate *(Provider list from settings market.providers (default cpstore, disabled), order flow records an ssl_orders row + generates/stores a CSR (wil)*
 - [x] SSL Storage Manager
 - [x] SSL/TLS Configuration

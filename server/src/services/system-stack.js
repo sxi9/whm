@@ -31,6 +31,19 @@ export function createSystemStackService(ctx) {
     }
   }
 
+  // Which of the names no repository offers: one batched pkg.offers call, or
+  // the per-name pkg.available probe on an agent that predates the batch op.
+  async function unofferedPackages(agent, names) {
+    try {
+      const { packages = {} } = await agent.op('pkg.offers', { packages: names });
+      return names.filter((n) => !packages[n]?.offered);
+    } catch (err) {
+      if (err?.code !== 'unknown_op') throw err;
+      const avail = await agent.op('pkg.available', { packages: names });
+      return Array.isArray(avail?.missing) ? avail.missing.filter((n) => names.includes(n)) : [];
+    }
+  }
+
   async function presentPackages(names) {
     if (!names.length || !ctx.software?.pkg?.isInstalled) return null;
     const present = {};
@@ -211,9 +224,9 @@ export function createSystemStackService(ctx) {
       let skipped = [];
       if (missing.length) {
         try {
-          const avail = await job.agent.op('pkg.available', { packages: missing });
-          if (Array.isArray(avail?.missing) && avail.missing.length) {
-            skipped = avail.missing;
+          const notOffered = await unofferedPackages(job.agent, missing);
+          if (notOffered.length) {
+            skipped = notOffered;
             missing = missing.filter((p) => !skipped.includes(p));
             job.log(`${component.label}: not offered by this distribution, skipped: ${skipped.join(' ')}`, 'warn');
           }

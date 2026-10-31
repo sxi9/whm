@@ -105,6 +105,26 @@ describe('server contacts helpers', () => {
     expect(dotStuff('a\n.b\n..c\n')).toBe('a\r\n..b\r\n...c\r\n');
   });
 
+  it('builds multipart/alternative when html is given (text first, boundary in neither part) and keeps the text-only shape otherwise', () => {
+    const plain = buildMessage({ from: 'whm@host.example.com', to: 'a@example.com', subject: 'Hi', text: 'one\ntwo' });
+    expect(plain).toMatch(/\r\nMIME-Version: 1\.0\r\nContent-Type: text\/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\nX-Mailer: WHM panel\r\n\r\none\r\ntwo\r\n$/);
+    expect(plain).not.toContain('multipart');
+    const html = '<p>two</p>\n--=_whm_notme\r\nBcc: evil@example.com\r\nSubject: injected';
+    const msg = buildMessage({ from: 'whm@host.example.com', to: ['a@example.com'], subject: 'Hi', text: 'one\ntwo', html, headers: { 'X-Priority': '1', 'Content-Type': 'text/plain' } });
+    const boundary = msg.match(/\r\nContent-Type: multipart\/alternative; boundary="([^"]+)"\r\n/)[1];
+    expect(boundary).toMatch(/^=_whm_[0-9a-f]{32}$/);
+    expect(html.includes(boundary)).toBe(false);
+    const sep = msg.indexOf('\r\n\r\n');
+    const head = msg.slice(0, sep);
+    const body = msg.slice(sep + 4);
+    expect(head).toMatch(/\r\nMIME-Version: 1\.0\r\nContent-Type: multipart\/alternative; boundary="[^"]+"\r\nContent-Transfer-Encoding: 8bit\r\nX-Mailer: WHM panel\r\nX-Priority: 1$/);
+    expect(head).not.toContain('Bcc');
+    expect(head).not.toContain('injected');
+    expect(head.match(/Subject: /g)).toHaveLength(1);
+    expect(body).toBe(`--${boundary}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\none\r\ntwo\r\n\r\n--${boundary}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n<p>two</p>\r\n--=_whm_notme\r\nBcc: evil@example.com\r\nSubject: injected\r\n\r\n--${boundary}--\r\n`);
+    expect(/\r(?!\n)|(?<!\r)\n/.test(msg)).toBe(false);
+  });
+
   it('rejects unusable addresses before opening a connection', async () => {
     await expect(sendSmtp({ host: '127.0.0.1', port: 1, from: '-r@example.com', to: ['a@example.com'], message: 'x' })).rejects.toMatchObject({ code: 'invalid_address' });
     await expect(sendSmtp({ host: '127.0.0.1', port: 1, from: 'a@example.com', to: ['b@example.com'], message: 'x', security: 'weird' })).rejects.toMatchObject({ code: 'invalid_args' });
@@ -409,6 +429,42 @@ describe('Server Contacts API', () => {
 
     app.ctx.settings.set('contacts.enabled', false);
     expect(await app.ctx.contacts.notify({ event: 'account.created', subject: 'x' })).toMatchObject({ skipped: 'disabled', sent: 0 });
+  });
+
+  it('forwards an html alternative to both transports and omits it when absent', async () => {
+    eximInstalled = true;
+    await app.ctx.capabilities.refresh();
+    const html = '<!doctype html><html><body><p>rich</p></body></html>';
+    const viaExim = await app.ctx.contacts.mail({ to: 'x@example.org', subject: 'Rich', body: 'plain text', html });
+    expect(viaExim).toMatchObject({ transport: 'exim', accepted: true });
+    await app.ctx.contacts.mail({ to: 'x@example.org', subject: 'Plain', body: 'plain text', html: '  ' });
+    expect(sentViaExim).toHaveLength(2);
+    expect(sentViaExim[0]).toMatchObject({ to: ['x@example.org'], subject: 'Rich', text: 'plain text', html });
+    expect('html' in sentViaExim[1]).toBe(false);
+    expect(auditRows('contacts.mail.send').slice(-2).map((r) => JSON.parse(r.args_redacted).html)).toEqual([true, false]);
+    // notify() carries the html to email contacts and root mail, never to SMS.
+    const contact = await post('/api/server-contacts/contacts', { name: 'Ops', channel: 'email', address: 'ops@example.com', events: ['backup.failed'] }).expect(201);
+    const sms = await post('/api/server-contacts/contacts', { name: 'Pager', channel: 'sms', address: '5551234567@txt.example.net', events: ['backup.failed'] }).expect(201);
+    app.ctx.settings.set('contacts.root_mail_events', ['backup.failed']);
+    const r = await app.ctx.contacts.notify({ event: 'backup.failed', subject: 'Run 7 failed', body: 'disk full', html: '<p>disk full</p>' });
+    expect(r).toMatchObject({ matched: 2, sent: 3, failed: 0 });
+    expect(r.html).toBeUndefined();
+    const byAddress = Object.fromEntries(sentViaExim.slice(2).map((m) => [m.to.join(','), m]));
+    expect(byAddress['ops@example.com']).toMatchObject({ text: expect.stringContaining('disk full'), html: '<p>disk full</p>' });
+    expect(byAddress['root@panel.example.com'].html).toBe('<p>disk full</p>');
+    expect('html' in byAddress['5551234567@txt.example.net']).toBe(false);
+    await del(`/api/server-contacts/contacts/${contact.body.data.id}`).expect(200);
+    await del(`/api/server-contacts/contacts/${sms.body.data.id}`).expect(200);
+
+    eximInstalled = false;
+    await app.ctx.capabilities.refresh();
+    app.ctx.settings.setMany({ 'contacts.smtp.host': '127.0.0.1', 'contacts.smtp.port': smtpPort, 'contacts.smtp.security': 'none', 'contacts.from_address': 'alerts@panel.example.com' });
+    const viaSmtp = await app.ctx.contacts.mail({ to: 'y@example.org', subject: 'Rich', body: 'plain text', html });
+    expect(viaSmtp).toMatchObject({ transport: 'smtp', accepted: true });
+    const session = smtp.sessions.at(-1);
+    expect(session.commands).toContain('RCPT TO:<y@example.org>');
+    const boundary = session.data.match(/\nContent-Type: multipart\/alternative; boundary="([^"]+)"\n/)[1];
+    expect(session.data).toContain(`\n--${boundary}\nContent-Type: text/plain; charset=utf-8\nContent-Transfer-Encoding: 8bit\n\nplain text\n\n--${boundary}\nContent-Type: text/html; charset=utf-8\nContent-Transfer-Encoding: 8bit\n\n${html}\n\n--${boundary}--\n`);
   });
 
   it('sends mail through the SMTP relay when Exim is absent, and mails root for selected events', async () => {

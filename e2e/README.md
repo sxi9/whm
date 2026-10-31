@@ -5,10 +5,30 @@ then `WHM_SERVE_CLIENT=true`). Playwright with Chromium must be installed.
 
 | Script | What it does |
 |---|---|
-| `ui-check.cjs` | Playwright flow: login → create an account through the form → core pages → search → Phase-5 pages (License tab, Manage Plugins › Marketplace, WHM Marketplace) → cleanup. `BASE=http://127.0.0.1:2086 PASSWORD='<root pw>' node e2e/ui-check.cjs` |
+| `ui-check.cjs` | Playwright flow: login → create an account through the form → core pages → search → Phase-5 pages (License tab, Manage Plugins › Marketplace, WHM Marketplace) → Application Manager (18–20) → issue-2 pages (21–27, below) → sidebar count → cleanup. `BASE=http://127.0.0.1:2086 PASSWORD='<root pw>' node e2e/ui-check.cjs` |
 | `screenshot-all.cjs` | Every one of the 212 function pages plus the core pages, labelled, with gallery READMEs. |
 | `screenshots.sh` | Runs both into `docs/screenshots/`. `BASE=… PASSWORD='…' bash e2e/screenshots.sh` |
 | `live-hub-flow.sh` | The Phase-5 end-to-end flow against a real hub and a real panel (below). |
+
+## `ui-check.cjs` steps 21–27 (issue-2 round)
+
+Each step waits for an element that exists on a host without the daemons (the card itself, or the
+install prompt a page shows instead of an action), takes a labelled shot and must add no page,
+console or 5xx error:
+
+| Shot | Page | Waits for |
+|---|---|---|
+| `21-modify-account-domains` | `/account-functions/modify-an-account?username=demo<suffix>` (the account the flow created; `AccountPicker` reads `?username=`) | the Domains panel (`.domains-panel h3`) with its rows |
+| `22-manage-ssl-hosts` | `/ssl-tls/manage-ssl-hosts` | the "Server hostname" card (or the capability notice) |
+| `23-multiphp-manager` | `/software/multiphp-manager` | the root-only "Install a PHP version" card with its branch table or install prompt |
+| `24-install-distro-packages` | `/software/install-distro-packages` | the Catalog tab (the default) with its groups |
+| `24b-install-distro-packages-search` | same page | the "Search repositories" tab clicked, its search box shown (typing a search must click that tab first) |
+| `25-contact-manager` | `/server-contacts/contact-manager` | the "Security notifications" card |
+| `26-security-advisor` | `/security-center/security-advisor` | the "Hardening" card with its item rows (every item reads not applied / not applicable here, never a 501) |
+| `27-backup-configuration` | `/backup/backup-configuration` | the "Cloud storage" card above Destinations |
+
+`screenshot-all.cjs` waits for the same cards on those pages (`PAGE_WAITS`) and lists the flow
+shots 18–27 in the gallery.
 
 ## Live hub + panel flow (`live-hub-flow.sh`)
 

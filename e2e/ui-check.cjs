@@ -20,6 +20,11 @@ const LABELS = {
   '09-tweak-settings': 'Tweak Settings', '10-wp-toolkit-plugin': 'WP Toolkit (bundled plugin page)', '11-sidebar-search': 'Sidebar search',
   '12-top-search': 'Global search', '13-restart-service': 'Restart HTTP Server (Apache)', '14-process-manager': 'Process Manager',
   '15-license-tab': 'Basic WebHost Manager Setup — License tab', '16-manage-plugins-marketplace': 'Manage Plugins — Marketplace tab', '17-whm-marketplace': 'WHM Marketplace',
+  '18-application-manager': 'Application Manager', '19-runtime-versions': 'Runtime Versions', '20-application-templates': 'Application Templates',
+  '21-modify-account-domains': 'Modify an Account — Domains panel', '22-manage-ssl-hosts': 'Manage SSL Hosts — Server hostname card',
+  '23-multiphp-manager': 'MultiPHP Manager — Install a PHP version', '24-install-distro-packages': 'Install Distro Packages — Catalog tab',
+  '24b-install-distro-packages-search': 'Install Distro Packages — Search repositories tab', '25-contact-manager': 'Contact Manager — Security notifications',
+  '26-security-advisor': 'Security Advisor — Hardening card', '27-backup-configuration': 'Backup Configuration — Cloud storage',
 };
 // Stamps a label bar at the top of the page so the screenshot explains itself.
 async function stamp(page, text) {
@@ -40,7 +45,8 @@ async function stamp(page, text) {
   // The SPA probes /api/auth/me before login; that 401 is expected, not an error.
   page.on('console', (m) => { if (m.type() === 'error' && !/status of 401/.test(m.text())) errors.push(`console: ${m.text()}`); });
   page.on('response', (r) => { if (r.status() >= 500) errors.push(`http ${r.status()} ${r.url()}`); });
-  const shot = async (name) => { await stamp(page, `WHM › ${LABELS[name] || name} · ${DATE} · ${SHA}`); await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: false }); };
+  // fullPage for the pages whose card of interest sits below the first screen.
+  const shot = async (name, { fullPage = false } = {}) => { await stamp(page, `WHM › ${LABELS[name] || name} · ${DATE} · ${SHA}`); await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage }); };
 
   await page.goto(`${BASE}/login`);
   await page.waitForSelector('#username');
@@ -140,6 +146,55 @@ async function stamp(page, text) {
     await page.waitForTimeout(600);
     await shot(`${n}-${slug}`);
   }
+
+  // Issue-2 round pages. Every wait names an element that exists on a host without the
+  // daemons (the card, or the install prompt the page shows instead of an action).
+  await page.goto(`${BASE}/account-functions/modify-an-account?username=demo${suffix}`);
+  await page.waitForSelector('.domains-panel h3:has-text("Domains")', { timeout: 20000 });
+  await page.waitForSelector('.domains-panel tbody tr, .domains-panel .banner', { timeout: 20000 });
+  await page.waitForTimeout(400);
+  await shot('21-modify-account-domains', { fullPage: true });
+
+  await page.goto(`${BASE}/ssl-tls/manage-ssl-hosts`);
+  await page.waitForSelector('h2:has-text("Server hostname"), .capability-notice', { timeout: 20000 });
+  await page.waitForTimeout(400);
+  await shot('22-manage-ssl-hosts');
+
+  await page.goto(`${BASE}/software/multiphp-manager`);
+  await page.waitForSelector('h2:has-text("Install a PHP version")', { timeout: 30000 });
+  await page.waitForSelector('h2:has-text("Install a PHP version") ~ * table, h2:has-text("Install a PHP version") ~ * .capability-notice, .card:has(h2:has-text("Install a PHP version")) table, .card:has(h2:has-text("Install a PHP version")) .capability-notice', { timeout: 30000 });
+  await page.waitForTimeout(400);
+  await shot('23-multiphp-manager');
+
+  // The Catalog tab is the default; typing into the repository search needs its own tab first.
+  await page.goto(`${BASE}/software/install-distro-packages`);
+  await page.waitForSelector('[role=tab][aria-selected="true"]:has-text("Catalog")', { timeout: 20000 });
+  await page.waitForSelector('.catalog-group, .capability-notice', { timeout: 30000 });
+  await page.waitForTimeout(400);
+  await shot('24-install-distro-packages');
+  await page.click('[role=tab]:has-text("Search repositories")');
+  await page.waitForSelector('input[placeholder^="Package name"]', { timeout: 10000 });
+  await page.waitForTimeout(300);
+  await shot('24b-install-distro-packages-search');
+
+  await page.goto(`${BASE}/server-contacts/contact-manager`);
+  await page.waitForSelector('h2:has-text("Security notifications")', { timeout: 20000 });
+  await page.waitForSelector('.card:has(h2:has-text("Security notifications")) .toggle, .card:has(h2:has-text("Security notifications")) .banner', { timeout: 20000 });
+  await page.waitForTimeout(400);
+  await shot('25-contact-manager', { fullPage: true });
+
+  // Hardening: every item reads "not applied" / "not applicable" on this container, never a 501.
+  await page.goto(`${BASE}/security-center/security-advisor`);
+  await page.waitForSelector('h2:has-text("Hardening")', { timeout: 20000 });
+  await page.waitForSelector('.card:has(h2:has-text("Hardening")) tbody tr', { timeout: 30000 });
+  await page.waitForTimeout(400);
+  await shot('26-security-advisor');
+
+  await page.goto(`${BASE}/backup/backup-configuration`);
+  await page.waitForSelector('h2:has-text("Cloud storage")', { timeout: 20000 });
+  await page.waitForSelector('.card:has(h2:has-text("Cloud storage")) .capability-notice, .card:has(h2:has-text("Cloud storage")) .provider-cards, .card:has(h2:has-text("Cloud storage")) .card-body > *', { timeout: 20000 });
+  await page.waitForTimeout(400);
+  await shot('27-backup-configuration', { fullPage: true });
 
   // Count sidebar entries after expanding all.
   await page.goto(`${BASE}/`);

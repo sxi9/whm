@@ -12,8 +12,13 @@ let phpVersions = [PHP, PHP82];
 // What /usr/bin/php resolves to; a newer branch's install moves it (alternatives auto mode) unless the panel points it back.
 let phpDefaultId = '8.3';
 // The Ubuntu host's PHP source: nothing but the stock 8.3 (and the installed 8.2) until ppa:ondrej/php is enabled.
-const phpSource = { configured: false };
+const phpSource = { configured: false, host: 'ubuntu' };
 const PHP_SOURCE_LABEL = 'Ondřej Surý PPA (ppa:ondrej/php)';
+const SURY_LABEL = 'DEB.SURY.ORG (packages.sury.org/php)';
+const PHP_HOSTS = {
+  ubuntu: { os: { id: 'ubuntu', name: 'Ubuntu 24.04.1 LTS', versionId: '24.04', codename: 'noble' }, source: { key: 'ondrej', label: PHP_SOURCE_LABEL, url: 'https://launchpad.net/~ondrej/+archive/ubuntu/php', flavor: 'ubuntu', codename: 'noble', major: null, supported: true, reason: null }, origin: 'https://ppa.launchpadcontent.net/ondrej/php/ubuntu', steps: [{ step: 'add-apt-repository ppa:ondrej/php', ok: true }] },
+  debian: { os: { id: 'debian', name: 'Debian GNU/Linux 12 (bookworm)', versionId: '12', codename: 'bookworm' }, source: { key: 'sury', label: SURY_LABEL, url: 'https://packages.sury.org/php/', flavor: 'debian', codename: 'bookworm', major: null, supported: true, reason: null }, origin: 'https://packages.sury.org/php/', steps: [{ step: 'signing key', ok: true, path: '/etc/apt/keyrings/whm-sury-php.gpg' }, { step: 'sources list', ok: true, path: '/etc/apt/sources.list.d/whm-sury-php.list' }] },
+};
 let installedPkgs = [{ name: 'apache2', version: '2.4.58', arch: 'amd64', summary: 'Apache HTTP Server' }, { name: 'php-fpm', version: '8.3', arch: 'all', summary: 'FPM' }, { name: 'curl', version: '8.5.0', arch: 'amd64', summary: 'cli' }, { name: 'libapache2-mod-evasive', version: '1.1', arch: 'amd64', summary: 'evasive' }];
 let nginxState = { installed: true, active: true, proxyConfigured: false, content: null };
 // Names the mocked repositories do not carry (pkg.offers answers offered: false).
@@ -85,11 +90,13 @@ beforeAll(async () => {
       const versions = list.map((version) => {
         const installed = phpVersions.find((v) => v.id === version);
         const offered = Boolean(installed) || version === '8.3' || (phpSource.configured && ['8.1', '8.2', '8.4'].includes(version));
-        return { version, id: version, package: `php${version}-fpm`, fpmUnit: `php${version}-fpm`, offered, installed: Boolean(installed), candidate: offered ? `${version}.1-1` : null, installedVersion: installed?.version ?? null, origin: offered ? (version === '8.3' ? 'http://archive.ubuntu.com/ubuntu' : 'https://ppa.launchpadcontent.net/ondrej/php/ubuntu') : null, source: offered ? (version === '8.3' ? 'distro' : 'ondrej') : null };
+        const host = PHP_HOSTS[phpSource.host];
+        return { version, id: version, package: `php${version}-fpm`, fpmUnit: `php${version}-fpm`, offered, installed: Boolean(installed), candidate: offered ? `${version}.1-1` : null, installedVersion: installed?.version ?? null, origin: offered ? (version === '8.3' ? 'http://archive.ubuntu.com/ubuntu' : host.origin) : null, source: offered ? (version === '8.3' ? 'distro' : host.source.key) : null };
       });
-      return { manager: 'apt', family: 'debian', os: { id: 'ubuntu', name: 'Ubuntu 24.04.1 LTS', versionId: '24.04', codename: 'noble' }, source: { key: 'ondrej', label: PHP_SOURCE_LABEL, url: 'https://launchpad.net/~ondrej/+archive/ubuntu/php', flavor: 'ubuntu', codename: 'noble', major: null, supported: true, reason: null, configured: phpSource.configured }, stock: '8.3', branches: ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5'], versions };
+      const host = PHP_HOSTS[phpSource.host];
+      return { manager: 'apt', family: 'debian', os: host.os, source: { ...host.source, configured: phpSource.configured }, stock: '8.3', branches: ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5'], versions };
     },
-    'pkg.php.source.enable': ({ source }) => { const already = phpSource.configured; phpSource.configured = true; return { source, label: PHP_SOURCE_LABEL, changed: !already, alreadyConfigured: already, steps: already ? [] : [{ step: 'add-apt-repository ppa:ondrej/php', ok: true }], output: ['Hit:1 https://ppa.launchpadcontent.net/ondrej/php/ubuntu noble InRelease'] }; },
+    'pkg.php.source.enable': ({ source }) => { const host = PHP_HOSTS[phpSource.host]; const already = phpSource.configured; phpSource.configured = true; return { source, label: host.source.label, changed: !already, alreadyConfigured: already, steps: already ? [] : host.steps, output: [`Hit:1 ${host.origin} ${host.os.codename} InRelease`] }; },
     'pkg.php.install': ({ version, extensions }) => {
       if (!phpVersions.some((v) => v.id === version)) phpVersions = [...phpVersions, { ...PHP, id: version, label: `PHP ${version}`, binary: `/usr/bin/php${version}`, version: `${version}.1`, iniPath: `/etc/php/${version}/fpm/php.ini`, poolDir: `/etc/php/${version}/fpm/pool.d`, fpmUnit: `php${version}-fpm`, isDefault: false, fpmActive: false }];
       // php8.4-cli's postinst wins the /usr/bin/php alternative over 8.3 (priority 84 > 83) in auto mode.
@@ -1076,6 +1083,28 @@ describe('Install a PHP version', () => {
     expect(app.agent.callsTo('pkg.php.default.set')).toHaveLength(sets);
   });
 
+  it('enables packages.sury.org on a Debian host the same way (the card offers it, the job writes the keyring and list through the agent)', async () => {
+    phpSource.host = 'debian';
+    try {
+      const card = (await get('/api/software/php/installable')).body.data;
+      expect(card).toMatchObject({ os: { id: 'debian', codename: 'bookworm' }, source: { key: 'sury', label: SURY_LABEL, configured: false, supported: true, reason: null } });
+      expect(card.versions.find((v) => v.version === '8.1')).toMatchObject({ installed: false, offered: false, source: null });
+      const from = app.agent.calls.length;
+      const res = await post('/api/software/php/install', { version: '8.1' });
+      expect(res.status).toBe(202);
+      const job = await waitForJob(app.ctx, res.body.data.job.id);
+      expect(job.status).toBe('done');
+      expect(job.result).toMatchObject({ version: '8.1', source: 'sury', sourceEnabled: true, fpmUnit: 'php8.1-fpm', unitEnabled: true });
+      expect(job.result.packages).toContain('php8.1-fpm');
+      expect(phpCalls(from)).toEqual(['pkg.php.versions', 'pkg.detect', 'pkg.php.versions', 'pkg.php.sources.detect', 'pkg.php.source.enable', 'pkg.php.sources.detect', 'pkg.php.install', 'svc.enable', 'web.phpfpm.detect', 'pkg.php.versions']);
+      expect(app.agent.callsTo('pkg.php.source.enable').pop().args).toEqual({ source: 'sury', wait: false });
+      expect(job.logs.some((l) => l.line.includes('signing key: ok'))).toBe(true);
+      expect(job.logs.some((l) => l.line.includes('sources list: ok'))).toBe(true);
+      expect((await get('/api/software/php/installable')).body.data).toMatchObject({ source: { key: 'sury', configured: true } });
+      expect((await get('/api/software/php/versions')).body.data.versions.map((v) => v.id)).toContain('8.1');
+    } finally { phpSource.host = 'ubuntu'; }
+  });
+
   it('removes the source entry again when the detached index refresh fails right after enabling it', async () => {
     const run = { id: 'update_index-0123456789ab', kind: 'update_index', bin: '/usr/bin/apt-get', pid: 777, startedAt: new Date().toISOString(), timeoutMs: 60_000, logPath: '/var/lib/whm/pkg-runs/update_index-0123456789ab.log' };
     let changed = true;
@@ -1375,6 +1404,60 @@ describe('NGINX Manager', () => {
       expect(ports[1].bind).toBe('127.0.0.1');
       await put('/api/software/nginx', { enabled: false });
     } finally { app.ctx.web = prevWeb; }
+  });
+
+  it('hands the HTTPS catch-all the hostname bundle, else the pair the Apache catch-all vhost resolved, and re-renders when either changes', async () => {
+    const prev = { ssl: app.ctx.ssl, web: app.ctx.web, hostname: app.ctx.settings.get('basic.hostname') };
+    app.ctx.web = undefined;
+    app.ctx.settings.set('basic.hostname', 'host.example.com');
+    const certs = new Set();
+    app.ctx.ssl = { certForDomain: (d) => (certs.has(d) ? { state: 'installed', installed: 1 } : null), bundlePaths: (d) => ({ cert: `/etc/ssl/whm/${d}/cert.pem`, fullchain: `/etc/ssl/whm/${d}/fullchain.pem`, key: `/etc/ssl/whm/${d}/key.pem` }) };
+    const applies = app.ctx.db.prepare("INSERT INTO service_config_applies (component, ok, summary, error, applied_at) VALUES ('default_vhost', ?, ?, NULL, datetime('now')) ON CONFLICT (component) DO UPDATE SET ok = excluded.ok, summary = excluded.summary");
+    const lastWrite = () => app.agent.callsTo('pkg.nginx.proxy.write').pop().args;
+    const panelPair = { cert: '/etc/whm/tls/cert.pem', key: '/etc/whm/tls/key.pem' };
+    try {
+      await put('/api/software/nginx', { enabled: false });
+      app.ctx.db.prepare("DELETE FROM service_config_applies WHERE component = 'default_vhost'").run();
+      // Nothing known: the arg stays away and the agent keeps its reject-handshake block.
+      expect((await put('/api/software/nginx', { enabled: true })).status).toBe(200);
+      expect(lastWrite()).not.toHaveProperty('defaultServer');
+      expect((await get('/api/software/nginx')).body.data).toMatchObject({ defaultServer: null, stale: false });
+      // The catch-all vhost resolved the panel listener's pair: the proxy is stale until it carries the same pair.
+      applies.run(1, JSON.stringify({ hostname: 'host.example.com', ssl: { ...panelPair, chain: null, fullchain: null, source: 'panel' } }));
+      expect((await get('/api/software/nginx')).body.data).toMatchObject({ defaultServer: panelPair, stale: true });
+      expect((await post('/api/software/nginx/sync')).status).toBe(200);
+      expect(lastWrite().defaultServer).toEqual(panelPair);
+      expect((await get('/api/software/nginx')).body.data).toMatchObject({ defaultServer: panelPair, stale: false });
+      // A fullchain wins over the leaf; a pair outside the stores the agent reads for it, or a failed apply, is never forwarded.
+      applies.run(1, JSON.stringify({ ssl: { cert: '/etc/ssl/whm/service/apache/cert.pem', fullchain: '/etc/ssl/whm/service/apache/fullchain.pem', key: '/etc/ssl/whm/service/apache/key.pem', source: 'apache-service' } }));
+      expect((await get('/api/software/nginx')).body.data.defaultServer).toEqual({ cert: '/etc/ssl/whm/service/apache/fullchain.pem', key: '/etc/ssl/whm/service/apache/key.pem' });
+      applies.run(1, JSON.stringify({ ssl: { cert: '/etc/ssl/private/snakeoil.pem', key: '/etc/ssl/private/snakeoil.key', source: 'apache-service' } }));
+      expect((await get('/api/software/nginx')).body.data.defaultServer).toBeNull();
+      applies.run(1, JSON.stringify({ ssl: { cert: '/etc/whm/tls/../whm.conf', key: panelPair.key, source: 'panel' } }));
+      expect((await get('/api/software/nginx')).body.data.defaultServer).toBeNull();
+      applies.run(0, JSON.stringify({ ssl: { ...panelPair, source: 'panel' } }));
+      expect((await get('/api/software/nginx')).body.data.defaultServer).toBeNull();
+      applies.run(1, 'null');
+      expect((await get('/api/software/nginx')).body.data.defaultServer).toBeNull();
+      // The hostname's own installed certificate comes first: its bundle's fullchain and key, picked up by the scheduled sync.
+      applies.run(1, JSON.stringify({ ssl: { ...panelPair, source: 'panel' } }));
+      certs.add('host.example.com');
+      const own = { cert: '/etc/ssl/whm/host.example.com/fullchain.pem', key: '/etc/ssl/whm/host.example.com/key.pem' };
+      expect((await get('/api/software/nginx')).body.data).toMatchObject({ defaultServer: own, stale: true });
+      const synced = await waitForJob(app.ctx, app.ctx.jobs.enqueue('software.nginx.sync', {}).id);
+      expect(synced.result).toMatchObject({ skipped: false });
+      expect(lastWrite().defaultServer).toEqual(own);
+      expect((await get('/api/software/nginx')).body.data.stale).toBe(false);
+      expect((await waitForJob(app.ctx, app.ctx.jobs.enqueue('software.nginx.sync', {}).id)).result).toMatchObject({ skipped: true, reason: 'current' });
+      // The hostname certificate goes away: back to the catch-all vhost's pair, and stale again.
+      certs.clear();
+      expect((await get('/api/software/nginx')).body.data).toMatchObject({ defaultServer: panelPair, stale: true });
+      await put('/api/software/nginx', { enabled: false });
+    } finally {
+      app.ctx.ssl = prev.ssl; app.ctx.web = prev.web;
+      app.ctx.settings.set('basic.hostname', prev.hostname ?? '');
+      app.ctx.db.prepare("DELETE FROM service_config_applies WHERE component = 'default_vhost'").run();
+    }
   });
 
   it('flags a rendered proxy that no longer matches the domains or certificates, and the scheduled sync re-renders it', async () => {

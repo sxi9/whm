@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { STACK_COMPONENTS, STACK_PROFILES, PACKAGE_FAMILIES, componentForCapability, componentForService, profileComponents } from '../src/lib/stack-catalog.js';
+import { STACK_COMPONENTS, STACK_PROFILES, PACKAGE_FAMILIES, componentByKey, componentForCapability, componentForService, profileComponents } from '../src/lib/stack-catalog.js';
 import { STACK_INSTALL_JOB } from '../src/services/system-stack.js';
 import { SERVICE_REGISTRY, DEFAULT_SETTINGS } from '../src/db/seed.js';
 import { resolveUnit } from '../src/lib/capabilities.js';
@@ -100,6 +100,7 @@ describe('Server stack API', () => {
       'pkg.list_installed': ({ prefix }) => ({ manager: 'apt', total: installedPackages.length, packages: installedPackages.filter((p) => !prefix || prefix.some((pre) => p === pre || p.startsWith(pre))).map((name) => ({ name, version: '1', arch: 'amd64', summary: '' })) }),
       'pkg.install': ({ packages }) => { installedPackages.push(...packages); return { manager: 'apt', packages, output: [`installed ${packages.join(' ')}`] }; },
       'pkg.available': ({ packages }) => ({ manager: 'apt', offered: packages.filter((p) => !unavailablePackages.includes(p)), missing: packages.filter((p) => unavailablePackages.includes(p)) }),
+      'pkg.offers': ({ packages }) => ({ manager: 'apt', packages: Object.fromEntries(packages.map((p) => { const offered = !unavailablePackages.includes(p); return [p, { installed: null, candidate: offered ? '1.0-1' : null, origin: offered ? 'http://archive.ubuntu.com/ubuntu' : null, provider: null, offered }]; })) }),
       'stack.apache_enmod': ({ modules }) => ({ skipped: false, enabled: modules, alreadyEnabled: [], failed: [], reloaded: false }),
       'stack.postgres_initdb': () => ({ skipped: false, initialised: true, dataDir: '/var/lib/pgsql/data', output: [] }),
     });
@@ -443,7 +444,7 @@ describe('Server stack API', () => {
     } finally { await other.close(); }
   });
 
-  it('skips packages the distribution does not offer instead of failing the component', async () => {
+  it('skips packages the distribution does not offer instead of failing the component, asking in one batched pkg.offers call', async () => {
     unavailablePackages = ['php-opcache'];
     try {
       const csrf = await app.login();
@@ -454,6 +455,38 @@ describe('Server stack API', () => {
       expect(installed).toContain('php-fpm');
       expect(installed).not.toContain('php-opcache');
       expect(job.logs.some((l) => /not offered by this distribution, skipped: php-opcache/.test(l.line))).toBe(true);
+      const offers = app.agent.callsTo('pkg.offers');
+      expect(offers).toHaveLength(1);
+      expect(offers[0].args.packages).toEqual(componentByKey('php').packages.debian);
+      expect(app.agent.callsTo('pkg.available')).toEqual([]);
     } finally { unavailablePackages = []; }
+  });
+
+  it('falls back to the per-name pkg.available probe on an agent that lacks pkg.offers', async () => {
+    unavailablePackages = ['php-opcache'];
+    app.agent.fail('pkg.offers', 'unknown_op', 'Unknown op "pkg.offers"');
+    try {
+      const csrf = await app.login();
+      const res = await app.http.post('/api/system/stack/install').set('X-CSRF-Token', csrf).send({ components: ['php'] }).expect(202);
+      const job = await waitForJob(app.ctx, res.body.data.job.id, 20_000);
+      expect(job.status).toBe('done');
+      const installed = app.agent.callsTo('pkg.install').flatMap((c) => c.args.packages);
+      expect(installed).toContain('php-fpm');
+      expect(installed).not.toContain('php-opcache');
+      expect(job.logs.some((l) => /not offered by this distribution, skipped: php-opcache/.test(l.line))).toBe(true);
+      expect(app.agent.callsTo('pkg.offers')).toHaveLength(1);
+      expect(app.agent.callsTo('pkg.available')).toHaveLength(1);
+      expect(app.agent.callsTo('pkg.available')[0].args.packages).toEqual(componentByKey('php').packages.debian);
+      // Any other failure of the check installs everything, as before.
+      app.agent.fail('pkg.offers', 'agent_unavailable', 'socket closed');
+      app.agent.calls.length = 0;
+      const again = await waitForJob(app.ctx, (await app.http.post('/api/system/stack/install').set('X-CSRF-Token', csrf).send({ components: ['php'] }).expect(202)).body.data.job.id, 20_000);
+      expect(again.status).toBe('done');
+      expect(app.agent.callsTo('pkg.available')).toEqual([]);
+      expect(again.logs.some((l) => /could not check package availability \(socket closed\); installing every missing package/.test(l.line))).toBe(true);
+    } finally {
+      unavailablePackages = [];
+      app.agent.set('pkg.offers', ({ packages }) => ({ manager: 'apt', packages: Object.fromEntries(packages.map((p) => { const offered = !unavailablePackages.includes(p); return [p, { installed: null, candidate: offered ? '1.0-1' : null, origin: offered ? 'http://archive.ubuntu.com/ubuntu' : null, provider: null, offered }]; })) }));
+    }
   });
 });

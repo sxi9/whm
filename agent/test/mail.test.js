@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,7 +9,7 @@ import {
   parseEximQueue, ageToSeconds, sizeToBytes, parseMainlogLine, aggregateMainlog, summarizeMail, parseAddressTest,
   parseSpamdOptions, renderSpamdOptions, parseSpamdDefaults, renderSpamdDefaults, eximLayout, spamdLayout, greylistBackend,
   parseUpdateExim4Conf, versionAtLeast, renderManagedBlock, mergeManagedBlock, readManagedBlock, renderDkimTransportFragment, assertNoSymlinks, chownDirNoFollow,
-  queueResults, blockState, renderInterfaceList, renderTransportFragment,
+  queueResults, blockState, renderInterfaceList, renderTransportFragment, renderNotification, multipartAlternative, mimeBoundary,
 } from '../src/ops/mail.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
@@ -447,5 +448,85 @@ describe('pure parsers and renderers', () => {
     expect(parseSpamdDefaults(renderSpamdDefaults({ flavor: 'debian', enabled: true, cron: false, options: '', other: parseSpamdDefaults(text).other })).other).toEqual(['# comment', 'NICE="--nicelevel 15"']);
     expect(renderSpamdDefaults({ flavor: 'rhel', options: '-d -c -m5', other: [] })).toContain('SPAMDOPTIONS="-d -c -m5"');
     expect(parseSpamdDefaults('SPAMDOPTIONS="-d -c -m5"').options).toBe('-d -c -m5');
+  });
+});
+
+describe('mail.sendmail message rendering', () => {
+  const base = { from: 'whm@host.example.com', to: ['a@example.com', 'b@example.com'], subject: 'Hello', date: 'Thu, 01 Jan 2026 00:00:00 GMT' };
+  const bareLineEnding = /\r(?!\n)|(?<!\r)\n/;
+
+  it('without html the text/plain message keeps its exact shape', () => {
+    const msg = renderNotification({ ...base, text: 'line1\nline2\n', headers: { 'X-Priority': '1', 'Content-Type': 'text/html', 'MIME-Version': '2.0' } });
+    expect(msg).toBe('From: whm@host.example.com\r\nTo: a@example.com, b@example.com\r\nSubject: Hello\r\nDate: Thu, 01 Jan 2026 00:00:00 GMT\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nX-Mailer: WHM panel\r\nX-Priority: 1\r\n\r\nline1\r\nline2\r\n\r\n');
+    expect(renderNotification({ ...base, text: 'x' })).not.toContain('multipart');
+  });
+
+  it('with html emits multipart/alternative: text first, both utf-8 8bit, CRLF throughout, boundary in neither part', () => {
+    const text = 'Plain\n.dot\n';
+    const html = '<!doctype html><html><body><p>Rich</p>\n<p>--=_whm_notme</p></body></html>';
+    const msg = renderNotification({ ...base, text, html, headers: { 'X-Priority': '1' } });
+    const boundary = msg.match(/^Content-Type: multipart\/alternative; boundary="([^"]+)"\r\n/m)[1];
+    expect(boundary).toMatch(/^=_whm_[0-9a-f]{32}$/);
+    expect(text.includes(boundary) || html.includes(boundary)).toBe(false);
+    const sep = msg.indexOf('\r\n\r\n');
+    const head = msg.slice(0, sep);
+    const body = msg.slice(sep + 4);
+    expect(head).toBe(`From: whm@host.example.com\r\nTo: a@example.com, b@example.com\r\nSubject: Hello\r\nDate: Thu, 01 Jan 2026 00:00:00 GMT\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary="${boundary}"\r\nContent-Transfer-Encoding: 8bit\r\nX-Mailer: WHM panel\r\nX-Priority: 1`);
+    expect(body).toBe(`--${boundary}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\nPlain\r\n.dot\r\n\r\n\r\n--${boundary}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n<!doctype html><html><body><p>Rich</p>\r\n<p>--=_whm_notme</p></body></html>\r\n\r\n--${boundary}--\r\n`);
+    expect(body.indexOf('text/plain')).toBeLessThan(body.indexOf('text/html'));
+    expect(bareLineEnding.test(msg)).toBe(false);
+    const parts = multipartAlternative('t', 'h');
+    expect(parts.contentType).toBe(`multipart/alternative; boundary="${parts.boundary}"`);
+    expect(parts.body.split(`--${parts.boundary}`)).toHaveLength(4);
+  });
+
+  it('picks another boundary when the random one occurs in a part', () => {
+    const clash = `=_whm_${'ab'.repeat(16)}`;
+    const spy = vi.spyOn(crypto, 'randomBytes').mockReturnValueOnce(Buffer.alloc(16, 0xab));
+    try {
+      const boundary = mimeBoundary('text', `<p>${clash}</p>`);
+      expect(boundary).not.toBe(clash);
+      expect(boundary).toMatch(/^=_whm_[0-9a-f]{32}$/);
+      expect(spy).toHaveBeenCalledTimes(2);
+    } finally { spy.mockRestore(); }
+  });
+
+  it('html can never add a header: it is a body part only, and the schema bounds it', async () => {
+    const html = '<p>x</p>\r\nBcc: victim@example.com\r\nSubject: injected\r\n\r\n--=_whm_00000000000000000000000000000000--';
+    const msg = renderNotification({ ...base, text: 't', html });
+    const head = msg.slice(0, msg.indexOf('\r\n\r\n'));
+    expect(head).not.toContain('Bcc');
+    expect(head).not.toContain('injected');
+    expect(head.match(/^Subject: /gm)).toHaveLength(1);
+    exec.mockClear();
+    const ok = { from: 'a@example.com', to: ['b@example.com'], subject: 's', text: 't' };
+    expect((await opError(runOp('mail.sendmail', { ...ok, html: 5 }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('mail.sendmail', { ...ok, html: 'x'.repeat(2 * 1024 * 1024 + 1) }, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('hands the multipart message to exim on stdin with the recipients after --', async () => {
+    if (!fs.existsSync('/etc/exim4') && !fs.existsSync('/etc/exim') && !fs.existsSync('/etc/exim.conf')) return;
+    hasBinary.mockImplementation((bin) => bin === 'exim4');
+    exec.mockReset();
+    exec.mockImplementation(async () => ({ code: 0, stdout: '', stderr: '' }));
+    try {
+      const r = await runOp('mail.sendmail', { from: 'whm@host.example.com', to: ['a@example.com', 'b@example.com'], subject: 'Hi', text: 'plain', html: '<p>rich</p>' }, ctx);
+      expect(r).toMatchObject({ accepted: true, to: ['a@example.com', 'b@example.com'] });
+      expect(exec).toHaveBeenCalledTimes(1);
+      const [bin, argv, opts] = exec.mock.calls[0];
+      expect(bin).toBe('exim4');
+      expect(argv).toEqual(['-i', '-f', 'whm@host.example.com', '--', 'a@example.com', 'b@example.com']);
+      expect(opts.input).toMatch(/^Content-Type: multipart\/alternative; boundary="=_whm_[0-9a-f]{32}"\r\n/m);
+      expect(opts.input).toContain('\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n<p>rich</p>\r\n');
+      expect(r.bytes).toBe(Buffer.byteLength(opts.input));
+      exec.mockClear();
+      await runOp('mail.sendmail', { from: 'whm@host.example.com', to: ['a@example.com'], subject: 'Hi', text: 'plain' }, ctx);
+      expect(exec.mock.calls[0][2].input).toMatch(/\r\nContent-Type: text\/plain; charset=utf-8\r\nX-Mailer: WHM panel\r\n\r\nplain\r\n$/);
+      expect(exec.mock.calls[0][2].input).not.toContain('multipart');
+    } finally {
+      hasBinary.mockRestore();
+      exec.mockReset();
+    }
   });
 });

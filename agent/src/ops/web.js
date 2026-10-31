@@ -171,23 +171,29 @@ function vhostLink(apache, domain) {
 // ships a single /etc/php-fpm.d (or Remi SCL trees under /etc/opt/remi). A
 // versioned tree counts only while its FPM binary exists: a pool.d left behind
 // by a hand `apt-get remove` is not a pool target (requireBinary: false lists it).
+// Tests point the two tree roots somewhere under the temp dir.
+const phpEtcRoot = () => process.env.WHM_PHP_ETC_ROOT || '/etc/php';
+const remiEtcRoot = () => process.env.WHM_REMI_ETC_ROOT || '/etc/opt/remi';
+
 export function phpLayout({ requireBinary = true } = {}) {
   const versions = [];
   try {
-    for (const v of fs.readdirSync('/etc/php')) {
-      if (!/^\d\.\d+$/.test(v) || !exists(`/etc/php/${v}/fpm/pool.d`)) continue;
+    for (const v of fs.readdirSync(phpEtcRoot())) {
+      const poolDir = path.join(phpEtcRoot(), v, 'fpm', 'pool.d');
+      if (!/^\d\.\d+$/.test(v) || !exists(poolDir)) continue;
       const bin = hasBinary(`php-fpm${v}`) ? `php-fpm${v}` : null;
       if (requireBinary && !bin) continue;
-      versions.push({ version: v, flavor: 'debian', poolDir: `/etc/php/${v}/fpm/pool.d`, bin, units: [`php${v}-fpm`], socketDir: '/run/php', listenOwner: 'www-data' });
+      versions.push({ version: v, flavor: 'debian', poolDir, bin, units: [`php${v}-fpm`], socketDir: '/run/php', listenOwner: 'www-data' });
     }
   } catch { /* no /etc/php */ }
   try {
-    for (const d of fs.readdirSync('/etc/opt/remi')) {
+    for (const d of fs.readdirSync(remiEtcRoot())) {
       const m = d.match(/^php(\d)(\d+)$/);
-      if (!m || !exists(`/etc/opt/remi/${d}/php-fpm.d`)) continue;
+      const poolDir = path.join(remiEtcRoot(), d, 'php-fpm.d');
+      if (!m || !exists(poolDir)) continue;
       const bin = [`${d}-php-fpm`, `/opt/remi/${d}/root/usr/sbin/php-fpm`].find(hasBinary) || null;
       if (requireBinary && !bin) continue;
-      versions.push({ version: `${m[1]}.${m[2]}`, flavor: 'remi', poolDir: `/etc/opt/remi/${d}/php-fpm.d`, bin, units: [`${d}-php-fpm`], socketDir: `/var/opt/remi/${d}/run/php-fpm`, listenOwner: 'apache' });
+      versions.push({ version: `${m[1]}.${m[2]}`, flavor: 'remi', poolDir, bin, units: [`${d}-php-fpm`], socketDir: `/var/opt/remi/${d}/run/php-fpm`, listenOwner: 'apache' });
     }
   } catch { /* no remi */ }
   if (exists('/etc/php-fpm.d')) {

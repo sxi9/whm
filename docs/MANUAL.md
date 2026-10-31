@@ -538,6 +538,19 @@ reported step by step, not rolled back; the panel's own certificate is live only
 writes the pair the listener reads (`/etc/whm/tls/cert.pem` + `key.pem`, the installer's default —
 the step says *pending* otherwise, see `docs/design/https-defaults.md`).
 
+**The bare address (`http://<ip>/`, `https://<ip>/`).** Beside the hostname vhost the panel keeps a
+**catch-all vhost** that serves the same landing page to any name or address no site answers for:
+Debian `conf-enabled/000-whm-default.conf` (the stock `000-default` site is disabled), RHEL
+`conf.d/+whm-default.conf`. It is written whenever the hostname page is, and again after a port, bind,
+IP or hostname-certificate change; on 443 it carries the hostname's certificate when one is installed,
+else the `apache` service certificate, the panel's own pair or a self-signed pair the panel generates
+once under `/etc/ssl/whm/default/` — so `https://<ip>/` shows the page behind a certificate warning
+instead of a random tenant's site or a handshake error. With NGINX in front, its `:443 default_server`
+proxies to the same page. Its state is recorded with the other Apache applies
+(`GET /api/service-config/apache` → `defaultVhost`; no page row yet); the page content is the `landing`
+web template (14.20). It never redirects to HTTPS (a redirect of `http://<ip>/` would end on a
+certificate warning) and runs no PHP.
+
 #### 3.2 Resolver Configuration
 
 DNS resolvers the server uses. **Who:** root.
@@ -721,6 +734,30 @@ invalid, a range the matcher cannot read makes that branch show as **unknown** r
 and a version whose patch level could not be read is reported as unknown too.
 **Gotchas:** scans never change anything.
 
+**Hardening card** (root; anchor `#hardening`; design `docs/design/hardening.md`). Five one-click items,
+each with a status pill (*applied*, *not applied*, *not applicable*, *unknown*), live detail lines,
+**Apply** / **Revert**, and **Apply N recommended** for the safe ones:
+
+| Item | Apply does | Revert |
+|---|---|---|
+| **Fail2ban** | writes `/etc/fail2ban/jail.d/whm.local` (sshd aggressive, Exim, Dovecot, FTP, Apache auth/badbots and the **whm-panel** jail, enabled for the daemons this host runs) + `filter.d/whm-panel.conf` (failed panel logins from the journal, identifier `whm-panel`), `fail2ban-client -t`, enable + reload. Banned addresses are listed per jail with **Unban**; *Never banned from the panel* shows the address exempted from the panel jail only (yours by default). Missing package → **Install** (stack component) | files removed, Fail2ban left running |
+| **Automatic security updates** | Debian: `20auto-upgrades` + `52whm-unattended-upgrades` (security pockets only, no automatic reboot), apt timers on; RHEL: `/etc/dnf/automatic.conf` (`upgrade_type security`, apply + download), `dnf-automatic.timer`. Missing package → a `software.pkg.install` job first (202) | originals restored, timer off |
+| **SSH daemon** | `PermitRootLogin prohibit-password`, `MaxAuthTries 4`, `LoginGraceTime 30`, `X11Forwarding no` through the sshd drop-in (a stricter value in effect is kept). Refused while root could not log in with a key (no authorized key, `PubkeyAuthentication no`, …): the card hides Apply and links to *Manage root's SSH Keys* / *SSH Password Authorization Tweak* | the previous managed values |
+| **Kernel network hardening** | `/etc/sysctl.d/90-whm-hardening.conf` (rp_filter, syncookies, no redirects/source routes, martian logging, ICMP broadcast/bogus), loaded with `sysctl -e -p` and rolled back if the kernel refuses | file removed, recorded values written back |
+| **Firewall baseline** | default-deny INPUT with the panel's backend (`WHM_BASELINE` chain or nft table `inet whm`): the plan table lists what stays open — panel ports, every port root's sshd listens on, 80/443, mail/DNS/FTP + passive range when installed, the license hub's ports, your *extra TCP/UDP* — and you must type the SSH port you are connected on and tick *I can still reach SSH on port N*. Re-applied at boot while on. **Not applicable** while firewalld or ufw is active (they own the policy) | previous INPUT policy restored, chain removed |
+
+Every apply/revert is audited (`security.hardening.*`); the scan adds one finding per item that is not
+applied. **Server:** `GET /api/security/hardening`, `GET …/hardening/firewall/plan`,
+`POST …/hardening/:item/apply|revert`, `POST …/hardening/fail2ban/unban|install`. **Gotchas:** the
+panel jail reads the journal of `whm-panel.service` (a development run logs to the terminal and is
+not seen); behind a reverse proxy it would ban the proxy's address, so leave it for the panel's own
+listener; `rp_filter = 1` is strict — a multi-homed host with asymmetric routes needs Revert.
+
+**Alerts panel.** The last security alerts the server raised (critical findings new since the previous
+scan, PHP advisories, pending and applied security updates, panel security releases, administrator
+notices) with severity and delivery state, and a link to *Contact Manager › Security notifications*
+(5.1), where delivery is configured.
+
 #### 4.15 Security Questions
 
 Recovery question policy. **Who:** root.
@@ -794,6 +831,29 @@ addresses*), *Send a test message*. **Monitoring checks**: run every 10 minutes
 `/api/server-contacts/*`; other modules call `ctx.contacts.notify(event, payload)`.
 **Needs:** Exim or an SMTP relay for e-mail/SMS; Slack/Pushover/webhooks only need outbound
 HTTPS. **Gotchas:** webhooks to private addresses are refused unless allowed.
+
+**Security notifications card** (root; design `docs/design/security-alerts.md`). What the server tells
+administrators — and, when you allow it, hosting accounts — when something security-relevant
+happens: a critical Security Advisor finding that is new since the previous scan, a PHP advisory
+matching an installed version, security updates pending or applied by *System Update*, a panel
+release flagged as a security release, or a notice you write yourself. Settings: *Raise security
+alerts* (off records nothing), *Mail hosting accounts about emergency updates* (default off), *Minimum
+severity* (alerts below it are stored as *skipped*), *Digest window (minutes)* (default 60: the first
+alert after a quiet period goes out at once, later ones inside the window are held and sent together;
+`0` sends each alert immediately); **Save** / **Reset**. Actions: **Send a test alert** (administrators
+only) and **Test with accounts too** (confirmed), **Deliver N waiting now**, **Send notice** (*Subject*,
+*Message*, *Severity*, optionally every active account — an emergency notice in your own words). The
+card warns when no administrator can receive alerts (no contact subscribed to the **Security alert**
+event and root mail not routed — a fresh install routes it to root mail) or when no mail transport
+exists; alerts nobody can receive stay *waiting* and go out as soon as a contact subscribes. The
+table lists the last alerts with their delivery state. **Audience:** accounts only ever receive
+applied-update notices (package names, no versions, "nothing is required from you"), your notices
+and tests — never finding details, pending-update lists or panel release notes; suspended accounts
+and accounts without a contact address are skipped, one mail per address. **Server:**
+`/api/server-contacts/security-alerts*` (`PUT …/settings`, `POST …/test`, `…/raise`, `…/deliver`);
+other modules call `ctx.securityAlerts.raise()`. **Gotchas:** mails are plain text today; on the RHEL
+family pending updates are not flagged as security updates yet, so only the advisor, panel-release
+and notice kinds fire there.
 
 #### 5.2 Edit System Mail Preferences
 
@@ -1127,6 +1187,31 @@ use the cPanel layout (`homedir/`, `mysql/`, `dnszones/`, `cp/`). **Needs:** `ta
 written locally first, then copied to every enabled destination; deleting a destination does
 not delete what is already uploaded there.
 
+**Cloud storage card** (design and per-provider setup steps: `docs/design/backup-cloud.md`). Provider
+cards for **Google Drive**, **Microsoft OneDrive**, **Dropbox**, **Amazon S3 / S3-compatible**
+(Wasabi, MinIO, R2, Spaces), **Azure Blob Storage** (account key or SAS token) and **Backblaze B2**;
+the existing local/FTP/SFTP/WebDAV kinds stay. Everything goes through **rclone** (capability
+`rclone`; the card shows the install prompt until it exists). Google Drive, OneDrive and Dropbox sign
+in with the provider's own consent screen: **register an OAuth client once** per provider (*Client
+ID*, *Client secret*, from the Google Cloud console / Microsoft Entra app registration / Dropbox App
+Console) with the redirect URI the card shows,
+`https://<hostname>:2087/api/backup/destinations/oauth/<provider>/callback`, and open the panel at
+that hostname when connecting. Adding a destination is three stages: the form (type, folder / bucket
+/ container, credentials, *Encrypt archives at rest (recommended)* — on by default for every kind but
+a plain local copy), then the **one-time encryption key** (password + salt, **Download key file**: it
+is shown once, never again, and is what reads the archives outside the panel with `rclone config`),
+then **Connect** (OAuth kinds) or the usual **Test**. Columns *Encryption*, *Connection* (**Connect /
+Reconnect**; *sign-in expired* when a Google/Microsoft/Dropbox grant was revoked) and *Last upload*.
+Encrypted destinations use an rclone `crypt` layer — file names and contents are ciphertext at the
+provider — and **encryption cannot be switched off once enabled**; a destination from before this
+feature keeps working unchanged and gets **Enable encryption** (new uploads only; older copies stay
+readable through the plain path). Pruned copies are deleted outright (Drive trash and B2 hidden
+versions are bypassed). **Server:** `GET /api/backup/destinations/providers`,
+`PUT /api/backup/destinations/oauth-apps/:provider`, `GET …/destinations/oauth/:provider/start`,
+`POST …/destinations/:id/encryption`. **Needs:** `rclone` (EPEL on the RHEL family). **Gotchas:** a
+Google consent screen left in *Testing* issues tokens that expire after 7 days — publish it; the
+redirect URI must match the hostname exactly.
+
 #### 9.2 Backup Restoration
 
 Restore a full account backup. **Who:** root; reseller for owned accounts.
@@ -1135,9 +1220,13 @@ Restore a full account backup. **Who:** root; reseller for owned accounts.
 users and grants*, *DNS zones* (loaded into BIND or saved for later), *Mail routing*, *Recreate
 the account if it was terminated* (Linux user, home, package, vhost). **Restore account** asks
 you to type the account name. **Import an archive** registers a hand-copied cPanel/WHM archive
-(`/backup/cpmove-user.tar.gz`, under the backup directory or `/var/backups/whm`). **Restore
+(`/backup/cpmove-user.tar.gz`, under the backup directory or `/var/backups/whm`). **Copies on
+destinations** lists the archives a destination holds for the account (encrypted and plain copies
+alike) with **Import**: the copy is downloaded and decrypted, verified against its checksum and
+registered as a pinned import you can then restore (job `backup.cloud.fetch`). **Restore
 history** shows each restore with its step outcomes. **Server:**
-`POST /api/backup/backups/:id/restore { kind: 'account' }` (job), `POST /api/backup/archives/import`.
+`POST /api/backup/backups/:id/restore { kind: 'account' }` (job), `POST /api/backup/archives/import`,
+`GET /api/backup/destinations/:id/archives`, `POST …/destinations/:id/archives/import` (202).
 **Gotchas:** database grants are replayed only for databases the account owns; untrusted
 archives never recreate device nodes. Restored files are checked for `.htaccess` `Options`
 lines the account vhost refuses (7.1): `FollowSymLinks` is rewritten to `SymLinksIfOwnerMatch`
@@ -1430,6 +1519,25 @@ Pick the account; **Basic information** (*Contact email*, *Package* — re-appli
 *Shell access*), **Privileges** (*Demo mode*, *Force password change*). **Server:**
 `PATCH /api/accounts/:username`; quota and shell changes are applied to the Linux user.
 **Gotchas:** the primary domain is not renamed here; blank limits mean unlimited.
+
+**Domains panel** (below the account summary; design `docs/design/domains.md`). Every name the account
+answers for — *main*, *addon*, *sub*, *parked* — with its document root, SSL, zone and vhost state,
+and the package limits in use (addon / sub / parked, binding for resellers). **Add domain**: *Domain*,
+*Type* (addon, sub-domain or parked), optional *Document root* (inside the home; defaults
+`public_html/<domain>` for an addon, `public_html/<label>` for a sub-domain) and *Issue an AutoSSL
+certificate when the name already resolves here*. The result shows one line per step — **docroot**
+(created as the account, `0750 user:<web group>`, with the branded `index` page from the Web Template
+Editor when the directory had none), **web** (vhost), **dns** (own zone for an addon, an `A` record in
+the containing zone for a sub-domain, parked through the DNS parking rule), **mail** (local routing)
+and **ssl** (issued only when the name already points at this server; otherwise *skipped* and picked
+up by the daily AutoSSL run) — as *applied*, *pending* (daemon absent, written at the next sync),
+*skipped* or *failed*. **Remove** (modal) optionally *also deletes the document root* (addon/sub only,
+never a directory another domain of the account lives in). **Who:** root, reseller for owned accounts
+(ACL `edit-account`): a reseller cannot claim a label under the server hostname, a name whose nearest
+hosting account is not this one, or a name whose DNS zone belongs to another account (403). **Server:**
+`GET/POST /api/account-functions/domains/:username`, `DELETE …/domains/:username/:domain?deleteFiles=true`.
+**Gotchas:** `www.` names are refused (every vhost already answers for its `www.` alias); the hostname
+and `www.<hostname>` are never claimable; restores never re-render the index page.
 
 #### 14.10 Password Modification
 

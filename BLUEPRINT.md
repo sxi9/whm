@@ -364,6 +364,19 @@ marketplace_revocations(id PRIMARY KEY, plugin_id, version, severity, action, re
               applied_at, applied_to_json, acknowledged_by, acknowledged_at)
 marketplace_state(id PRIMARY KEY CHECK(id=1), last_catalog_sync_at, last_revocation_ts, last_revocation_now,
               revocations_head_ts, last_update_check_at, pending_updates_json, fail_count, updated_at)
+
+-- Issue-2 round, 2026-10-31 (migrations 037–039; no 036 was created: addon/sub/parked domains reuse
+-- account_domains from migration 001) --------------------------------------------------------------
+security_alerts(id, kind, severity, title, body, source, data_json, dedupe_key UNIQUE,      -- 037_security-alerts.sql
+              state,                                            -- pending|held|sent|skipped|failed
+              created_at, notified_admins_at, notified_accounts_at, admin_result_json, accounts_result_json)
+security_alert_deliveries(alert_id, account_id UNIQUE together, address, status, error, sent_at)
+              -- 037b_security-alerts-root-mail.sql: appends 'security.alert' to settings contacts.root_mail_events once
+hardening_state(item PRIMARY KEY, desired, params_json, previous_json, applied_at, reverted_at, updated_at)   -- 038_hardening.sql
+backup_destinations(id, name, kind, config_enc, enabled, last_upload_at, last_upload_ok, last_upload_message, …)
+              -- 039_backup-cloud.sql: kind widened to local|ftp|sftp|webdav|s3|gdrive|onedrive|dropbox|azureblob|b2
+backup_uploads(…, encrypted)                                     -- per-copy transport: which layer wrote the copy
+backup_oauth_apps(provider PRIMARY KEY, client_id, client_secret_enc, updated_at)   -- OAuth clients for gdrive/onedrive/dropbox
 ```
 
 (Every category in §13 maps onto these tables; additional small tables are noted inline.)
@@ -406,7 +419,7 @@ string), structured result, audit entry.
 | Family | Representative ops | Real tools / files |
 |---|---|---|
 | `user` | create, modify, delete, setShell, setQuota, setPassword | `useradd/usermod/userdel`, `chpasswd`, `setquota`, `/etc/passwd`, `/home/<u>` |
-| `web` | vhost.write, vhost.remove, reload, phpfpm.pool, docroot.init | Apache `sites-available`/`conf.d`, NGINX `conf.d`, PHP-FPM pools, `apachectl -t`, reload |
+| `web` | vhost.write, vhost.remove, reload, phpfpm.pool, module.enable, **default_vhost.write/read/remove** (the catch-all landing vhost: Debian `conf-enabled/000-whm-default.conf`, RHEL `conf.d/+whm-default.conf`), **docroot.ensure/remove** (addon/sub document roots created and removed as the account through `runuser`) | Apache `sites-available`/`conf-available`/`conf.d`, NGINX `conf.d`, PHP-FPM pools, `apachectl -t`, reload |
 | `dns` | zone.create, zone.edit, record.set, reload, dnssec.sign, zonewalk | `/var/named` or `/etc/bind`, `named.conf`, `rndc reload`, `dnssec-keygen`, `dnssec-signzone` |
 | `mail` | domain.add, account.add, routing.set, dkim.gen, queue.list, queue.flush | `/etc/exim*`, Dovecot config, `exim -bp`, `exiqgrep`, `exim -Mrm`, SpamAssassin |
 | `db` | db.create, user.create, grant, repair, processes, rootpw | MySQL/MariaDB admin SQL, `mysqlcheck`, `SHOW PROCESSLIST`, PostgreSQL `psql` |
@@ -417,6 +430,9 @@ string), structured result, audit entry.
 | `sec` | hosts.allow.set, modsec.write, fail.block, fail.unblock, ssh.key | `/etc/hosts.allow`, ModSecurity conf, `iptables`, `~/.ssh/authorized_keys`, `/etc/security/limits.conf` |
 | `sys` | disk.usage, processes, meminfo, loadavg, reboot, update | `df`, `du`, `ps`, `/proc`, `apt`/`dnf`, `shutdown -r` |
 | `fs` | backup.create, backup.restore, file.restore | `tar`, `rsync`, DB dumps, destination drivers (S3/FTP/SFTP/B2) |
+| `pkg` | detect, search, install, remove, upgradable, **offers** (one `apt-cache policy` / `dnf list` call for ~150 names, the curated catalog's "offered" state), **php.sources.detect / php.source.enable / php.source.rollback / php.install / php.remove** (PHP branches from `ppa:ondrej/php`, `packages.sury.org` or Remi SCL) | `apt-get`/`apt-cache`/`add-apt-repository`, `dnf`/`yum`/`rpm`, `/etc/apt/keyrings`, `/etc/apt/sources.list.d` |
+| `hardening` | jails.status/apply/revert/unban, updates.status/apply/revert, sysctl.status/apply/revert, firewall.status/apply/revert | `/etc/fail2ban/{filter.d/whm-panel.conf,jail.d/whm.local}`, `fail2ban-client`, `/etc/apt/apt.conf.d/{20auto-upgrades,52whm-unattended-upgrades}`, `/etc/dnf/automatic.conf`, `/etc/sysctl.d/90-whm-hardening.conf`, `iptables`/`nft` chain `WHM_BASELINE` |
+| `backup` | account.archive, archive.*, destination.test/upload/download/list/remove, **rclone.test/upload/download/list/delete** (cloud destinations and every encrypted copy: rclone `crypt` over drive/onedrive/dropbox/s3/azureblob/b2/local/ftp/sftp/webdav, config rendered per call under `/tmp/whm`) | `tar`, `curl` (SigV4), `rclone` |
 
 ---
 

@@ -450,11 +450,13 @@ under `/etc/whm/release-keys`. Bundled plugins' node:test suites run from the ro
   e.g. before Apache is installed — the docroot is then `user:user` until the next write puts the group on it);
   `fs.mkdir { owner, group, mode: '0750' }` at account creation, `fs.chown { owner, group }` after a transfer
   (`transfers.shareDocroot`: rsync `--chown`, cpmove extract, addon copy; the result carries `webGroup`).
-  Addon/sub-domain docroots are **not created by the panel today** (service-configuration's vhost write only
-  validates the path; `account_domains.docroot` is recorded, never `mkdir`ed): whichever category adds that
-  creation must use the same `fs.mkdir { owner, group: accounts.webServerGroup(req), mode: '0750' }` call, never
-  `0755`. Never widen the mode instead (`0755`/`o+x` on a home lets every local user read other accounts' files),
-  and never give the web server the account's group.
+  Addon/sub-domain docroots are created by `ctx.accountFunctions.domains.add` through the agent op
+  **`web.docroot.ensure`** (§36.1; 2026-10-31 — this paragraph used to say they were not created and named
+  `fs.mkdir { owner, group, mode: '0750' }` for whoever added it): `runuser -u <user> -- mkdir -p -m 0750` as the
+  account, then root hands the directory to the web server's group through an `O_NOFOLLOW` directory descriptor
+  that must belong to the account — the resulting layout is the same `0750 <user>:<web group>` as the main
+  docroot, never `0755`. Never widen the mode instead (`0755`/`o+x` on a home lets every local user read other
+  accounts' files), and never give the web server the account's group.
 - **`.htaccess` `Options` under the hardened `AllowOverride`** (web, transfers, backup, security-center): account
   vhosts render `AllowOverride AuthConfig FileInfo Indexes Limit Options=Indexes,MultiViews,SymLinksIfOwnerMatch,
   IncludesNOEXEC` (`DOCROOT_ALLOW_OVERRIDE`, agent `web.js`), and Apache's `set_options()` refuses in a `.htaccess`
@@ -491,3 +493,233 @@ under `/etc/whm/release-keys`. Bundled plugins' node:test suites run from the ro
 - **SameSite=lax session cookie:** `app.js` sets `sameSite: 'lax'` (not `strict`) because the external-auth callback
   is a cross-site top-level navigation that must carry the session with the OIDC state/nonce; the CSRF token
   remains the mutation guard, so no route may rely on the cookie's SameSite for that.
+
+## 36. Issue-2 seams (2026-10-31; designs `docs/design/domains.md`, `php-versions.md`, `security-alerts.md`, `hardening.md`, `backup-cloud.md`; round `wf_08bc14d9-ea9`)
+
+### 36.1 Landing vhost, domains and the hostname certificate (V1; service-configuration, account-functions, ssl-tls)
+- **`ctx.web.ensureDefaultVhost(req, { hostname? })`** (never throws; records `service_config_applies.default_vhost`,
+  audit `web.vhost.default`, reported as `defaultVhost` by `GET /api/service-config/apache`) renders the **catch-all
+  vhost** through the agent op `web.default_vhost.write` (`read` / `remove` beside it): the branded landing page for
+  the bare IP. It runs at the end of every `ensureHostnameVhost` path (boot, hostname change, `landing` template
+  save, re-render job), from `applySsl`/`removeSsl` when the hostname's certificate changes, at the end of
+  `setListenPorts`, `replaceIp` and `setAccountIpv6`, and after any `ensureVhost` whose address set differs from the
+  recorded one. **`ctx.web.removeDefaultVhost(req)`** drops it; **`ctx.web.removeDomain(domain, req)`** removes a
+  domain's vhost file + row and refuses the main domain and the hostname.
+- **Files, structural load order** (`agent/src/ops/web.js`, `DEFAULT_VHOST_NAMES`): Debian
+  `conf-available/000-whm-default.conf` + its `conf-enabled/` link (`apache2.conf` includes `conf-enabled` before
+  `sites-enabled`; a copy an earlier panel left under `sites-available`/`sites-enabled` is removed on the next
+  write/remove and reported as `legacy`), the stock `000-default` site disabled with `a2dissite` (re-enabled when
+  the configtest rejects ours); RHEL `conf.d/+whm-default.conf` (`+` sorts below `-`, `.` and every digit/letter,
+  ahead of `ssl.conf`'s `_default_:443` and `welcome.conf`). `<VirtualHost _default_:80 <every tenant address>:80>`
+  plus the same on the HTTPS port inside `<IfModule ssl_module>`, **`ServerName default.invalid`** (so it never
+  steals the hostname from the hostname vhost), docroot `/var/www/whm-default`, `AllowOverride None`, no PHP, no
+  redirect. **Certificate fallback chain** on 443: the hostname's installed bundle → the `apache` service
+  certificate (`/etc/ssl/whm/service/apache/`) → the panel listener's pair (`/etc/whm/tls/`) → a self-signed pair
+  generated once with openssl under `/etc/ssl/whm/default/` (`DEFAULT_SSL_DIR`) → none: HTTP block only. Behind
+  the NGINX proxy the vhost binds to the loopback port only; software's `writeProxy` passes the same pair
+  (`defaultServerPair()`: the hostname bundle, else the pair the catch-all recorded) as `pkg.nginx.proxy.write
+  { defaultServer }` so nginx's `:443 default_server` proxies `https://<ip>/` to Apache instead of answering 444.
+- **`ctx.accountFunctions.domains.list(username, user)` / `add(username, { domain, type: addon|sub|parked,
+  docroot?, autossl? }, user, req)` / `remove(username, domain, { deleteFiles }, user, req)`**; routes
+  `GET|POST /api/account-functions/domains/:username`, `DELETE /api/account-functions/domains/:username/:domain
+  ?deleteFiles=true` (`requireReseller`, ownership re-checked, ACL `edit-account`, package limits `max_addons` /
+  `max_subdomains` / `max_parked` bind resellers). Steps `{ docroot, web, dns, mail, ssl }` each
+  `applied|pending|skipped|failed`; audit `account.domain.add|remove`. Parked names delegate to
+  `ctx.dns.parkDomain` / `unparkDomain`.
+- **Claimability rule (`assertClaimable`, run for every type before any host step; binding for anything that
+  hands a name to an account):** for a non-root caller the name must not be a label under the server hostname
+  (`ns1.<hostname>`, `mail.<hostname>` — root only), the **nearest hosting account** of the name or any parent
+  label (`accounts.domain`, `account_domains.domain`) must be the target account, and a DNS zone of **exactly**
+  that name owned by another account is never reassigned (`ensureZoneForDomain` would). Sub-domain `A` records
+  touch a containing zone only when `zoneFor(...).account_id` is the account (root excepted); otherwise the DNS
+  step is `skipped`. `ctx.web.isServerName` refuses the hostname and `www.<hostname>` everywhere. The rule lives
+  in `account-functions.js` (`accountHosting`/`assertClaimable`); exposing it as `ctx.dns.assertDomainClaimable`
+  and deduplicating with `parkDomain`'s check is open.
+- **Document roots: agent ops `web.docroot.ensure` / `web.docroot.remove`** — everything inside a home runs as the
+  account: `runuser -u <user> -- mkdir -p -m 0750 <docroot>`, then `0750 <user>:<web group>` through an
+  `O_NOFOLLOW` directory descriptor owned by the account (`assertUnderHome`: a planted link is
+  `path_not_allowed`; uid ≥ 1000; reserved directories refused); `index.html` is written as the account
+  (`runuser … tee`) only when absent, from `renderTemplate('index', { domain, username, hostname })` (≤ 512 KiB,
+  the template editor's limit). `remove` is `runuser -u <user> -- rm -rf <docroot>`, never the home,
+  `public_html`, a reserved directory or a docroot another domain of the account lives in or below
+  (`domains.remove` only passes `deleteFiles` when no other row's docroot equals or sits under it;
+  `validateDocroot` answers 409 for a docroot that *contains* another domain's). Restores and transfers never
+  re-render the index page.
+- **`GET /api/ssl/hosts`** → `{ hosts, serverHostname, … }`: `serverHostname` (root only, `ssl.hosts.server()`) =
+  the hostname's installed certificate, the `panel`/`exim`/`dovecot`/`ftp` service certificates with
+  `coversHostname`, the `hostname-certificate-renew` schedule, the AutoSSL provider + the last run entry scoped to
+  the hostname, the landing vhost and the reissue path; the hostname's own host row carries `hostname: true`.
+  Reissue is `POST /api/networking/hostname/certificate`; download reuses `GET /api/ssl/certs/:id/download`.
+
+### 36.2 PHP version installer (V2; software, agent `pkg.*`)
+- Routes (`requireRoot`): **`GET /api/software/php/installable`** (`requirePkg()` only — works with no PHP on the
+  host; rows `{ version, id, label, offered, installed, installedVersion, candidate, source, fpmUnit, layout,
+  stock, isDefault, isCliDefault, inUse, usage, inUseDetail, advisories, removable }`, `recent` = last ten jobs),
+  **`POST /api/software/php/install { version /^\d\.\d$/ }`** (202, job `software.php.install`; 422 outside
+  `PHP_BRANCHES` 7.4 … 8.5, 409 already installed, 409 while any `software.php.*` / `software.pkg.*` /
+  `software.system.update` / `software.nginx.install` / `software.ea4.build` job holds the package manager),
+  **`DELETE /api/software/php/versions/:id`** (202, job `software.php.remove`; 404 / 409 system default / 409 CLI
+  default / 409 "still used by …" / 422 non-versioned layout; the job re-runs `phpRemovalCheck` and passes
+  `purge: true`).
+- Agent ops: **`pkg.php.sources.detect { branches? }`** (os-release, source + `configured`, one `apt-cache policy`
+  / `rpm -q` + `dnf list` call for every branch's `-fpm` package and `php-fpm`, `stock` from the distribution's
+  own entry, `source.supported:false` with the reason when a path is outside the agent's roots),
+  **`pkg.php.source.enable { source: ondrej|sury|remi, wait }`** (idempotent; a refresh that fails right after the
+  entry was added undoes it and answers `refused`), **`pkg.php.source.rollback { source }`** (destructive; the
+  same undo for the detached path — the install job calls it when the failed run had `changed: true`),
+  **`pkg.php.install { version, extensions?, wait }`** (names no repository offers are skipped, missing `-fpm` →
+  `unsupported` before anything runs), **`pkg.php.remove { version, purge?, wait }`** (destructive; only a
+  `debian`/`remi` `discoverPhp()` entry, refuses the branch `/usr/bin/php` resolves to).
+- **Sources, one per family** (`PHP_SOURCES`, `agent/src/ops/pkg.js`): Ubuntu / `ID_LIKE ubuntu` →
+  `ppa:ondrej/php` via `add-apt-repository -y -n`; Debian → `packages.sury.org/php` (keyring
+  `/etc/apt/keyrings/whm-sury-php.{gpg,asc}`, list `/etc/apt/sources.list.d/whm-sury-php.list`); RHEL family →
+  Remi **SCL** packages `php8x-php-*` (`epel-release`, `remi-release-<major>.rpm`, `crb`/`powertools`,
+  `makecache`), never the modular stream (it replaces the single system PHP). **Allowed roots** added for the
+  sury path: `/etc/apt/keyrings`, `/etc/apt/sources.list.d` (`agent/src/lib.js`).
+- **Extensions come from the stack catalog** (`componentByKey('php').packages[family]` in
+  `server/src/lib/stack-catalog.js`, `php-mysql` → `mysql`, `fpm/cli/common` dropped); the agent's
+  `PHP_EXTENSIONS` is only the fallback. The install job snapshots `php.versions()` first and keeps the previous
+  default (`keepPreviousDefault`: pins `php.default_version`, `pkg.php.default.set` back when `/usr/bin/php`
+  moved). Usage (`phpUsageOf`) counts every pinning store — `account_domains.php_version`,
+  `web_vhosts.php_version`, `web_php_pools.version`, `packages.php_version`,
+  `accounts.plan_snapshot_json.php_version`, `apache.settings().defaultPhpVersion` — normalised to the branch;
+  a `ctx.web.phpVersionUsage(branch)` seam may replace the two web queries later.
+
+### 36.3 Security alerts (V3; server-contacts, security-center, software)
+- **`ctx.securityAlerts`** (`services/security-alerts.js`, created by the Server Contacts module right after
+  `ctx.contacts`; migrations **`037_security-alerts.sql`** — `security_alerts`, `security_alert_deliveries`,
+  settings `security.alerts.enabled|notify_accounts|min_severity|digest_minutes` — and
+  **`037b_security-alerts-root-mail.sql`**, which appends `security.alert` to `contacts.root_mail_events` once).
+  **`raise({ kind, severity?, title, body, dedupeKey, source?, data?, force?, defer? })`** is synchronous and
+  idempotent per `dedupeKey` for 24 h (older key retired as `<key>#<id>`), records nothing while disabled, stores
+  below-minimum alerts as `skipped`, audits `security.alerts.raise` without the body.
+  **`onAdvisorScan(run, { previousCritical })`** (called by `security-center.js advisor.scan()`, result exposed as
+  `run.alerts`, the scan never fails on it) raises one alert per critical finding new since the previous run
+  (`php.advisory.*` findings → kind `php.advisory`). `recipientsChanged()` is called by the contacts service on
+  create/update/mail-preferences so alerts that found no recipient (`skipped: no_recipients`, state stays
+  `pending`) go out once someone subscribes.
+- **Contacts event `security.alert`** (group Security, default severity critical) in `server-contacts.js`
+  `EVENTS`; admins receive one `ctx.contacts.notify('security.alert', { subject, body, severity, data: { alerts } })`
+  per delivery run. **`software.panel.status().latest.security`** is a new boolean from the release feed
+  (`security: true` or `tags: ['security']`); `software.js` raises `updates.security_available` (nightly check,
+  deduped on the sorted security set, re-alerted only when an entry is new — `software.updates.security_alerted`),
+  `updates.security_applied` (result gains `securityApplied`) and `panel.security_release` (manual check and the
+  `panel-update-check` schedule `23 6 * * *`, job `software.panel.check`, enabled only while
+  `software.update_url` is set).
+- **Routes (root):** `GET /api/server-contacts/security-alerts` (overview), `GET …/security-alerts/alerts?limit`,
+  `PUT …/security-alerts/settings`, `POST …/security-alerts/test { includeAccounts }` (202), `POST
+  …/security-alerts/raise { title, body, severity?, notifyAccounts? }` (202), `POST …/security-alerts/deliver`
+  (202; 501 `CapabilityError` when accounts are to be mailed without a transport, 422 while disabled).
+- **Audience rule (binding):** hosting accounts only ever receive `updates.security_applied`, administrator
+  notices (`manual`) and tests, each rendered with `accountText()` (package names without versions, never finding
+  details), and only when `security.alerts.notify_accounts` is on or the test/notice stored `data.notifyAccounts`;
+  a generic flush honours the per-row choice. Advisor findings, PHP advisories, pending updates and panel
+  releases are admin-only. Suspended accounts and accounts without a usable `contact_email` are skipped.
+- **Digest without a cron schedule:** the first alert after a quiet window is delivered at once; alerts raised
+  within `digest_minutes` of a delivery are `held` and flushed by an unref'd timer (pending rows re-scheduled at
+  boot by the register hook); `digest_minutes = 0` = immediate. Delivery runs (`security.alerts.deliver`) are
+  serialised in-process; the account step inserts a `security_alert_deliveries` claim row before each send
+  (unique per alert + account). Both transports still put only `text/plain` on the wire (`renderMail().html` is
+  produced but unused until `server-contacts-smtp.js buildMessage` and `mail.sendmail` accept an `html` part).
+  On the RHEL family nothing is flagged as a security update until `pkg.upgradable` consults
+  `dnf updateinfo list --security` (open).
+
+### 36.4 Curated package catalog (V4; software, agent `pkg.*`)
+- **`server/src/lib/package-catalog.js`** (`PACKAGE_GROUPS`, `PACKAGE_CATALOG`, `resolveEntry`, `packagesFor`,
+  `phpRuntimePackages`): 79 entries in 8 groups (Web, PHP extensions, Databases, Mail, Security, Tools,
+  Monitoring, Hosting services); an entry that is also a stack component links to it with `stack` and takes its
+  packages, capability, units and repository notes from `stack-catalog.js` (a package list is never maintained
+  twice); PHP extensions carry `php: { debian, rhel }` suffixes expanded per installed PHP version, `phpVersioned`
+  names the packages that mean the per-version set; every `configure` path is validated against `nav.js`.
+- **Agent op `pkg.offers { names, provides? }`** — one `apt-cache policy` / `rpm -q` + `dnf list` call for up to
+  ~150 names (`provides: true` additionally resolves RHEL Provides through `rpm -q --whatprovides` and
+  `dnf -q -C repoquery --whatprovides=`, capped at 50, answer carries `provider`). The service caches the answer
+  for **15 minutes** (`OFFERS_TTL_MS`) and drops it after every package job or `?refresh=true`. `pkg.available`
+  (one call per name) stays for `system-stack`; switching it to `pkg.offers` is open.
+- **Dedupe rules** (`pkg.search`, `dedupeSearchResults` / `pickMain`): one row per piece of software; folded
+  variants are `-dev/-devel/-dbg/-dbgsym/-debuginfo/-doc/-docs/-common/-data/-static/-source`, `:arch` and `-arch`
+  suffixes, per-version infixes (`php8.3-`, `python3.12-`, `postgresql-16`), lib so-versions and language-binding
+  prefixes/suffixes; `KIND_RANK` picks the headline (flavor < common < runtime < version < arch < dev < source <
+  doc < debug); `collapsed` counts folded variants, `hidden` the names beyond the cap; `all=true` lifts the cap.
+- **Routes (root):** `GET /api/software/pkg/catalog?q&group&refresh`, `POST /api/software/pkg/catalog/:key/install
+  { phpVersion? }` (202; the job asks `pkg.offers` first and skips names no repository carries, failing only when
+  nothing of the entry is offered). **Deep link:** `/software/install-distro-packages?entry=<key>` highlights the
+  entry (`?q=` is the search fallback); WHM Marketplace's *Add* / *Open in catalog* use `installDistroHref({ entry,
+  q })`.
+
+### 36.5 Hardening (V5; security-center, agent `hardening.*`)
+- **`ctx.hardening`** (`services/hardening.js`, created by the Security Center module after `ctx.security`;
+  migration **`038_hardening.sql`** — `hardening_state(item, desired, params_json, previous_json, …)` + the
+  `security.hardening.fail2ban.*` defaults): `status()`, `apply(item, body, req)`, `revert(item, req)`,
+  `fail2ban.unban/install`, `firewall.plan()`, `findings()` (one advisor finding per item, fix link
+  `/security-center/security-advisor#hardening`), `reconcile(job)`. Items `fail2ban`, `auto-updates`, `ssh`,
+  `sysctl`, `firewall`; states `applied | not_applied | not_applicable | unknown`. Host first, row second.
+- **Agent ops** (`agent/src/ops/hardening.js`; op names carry no digits, so Fail2ban's family is `jails`):
+  `hardening.jails.status|apply|revert|unban`, `hardening.updates.status|apply|revert`,
+  `hardening.sysctl.status|apply|revert`, `hardening.firewall.status|apply|revert`. Every revert, `unban` and
+  `firewall.apply` is `destructive`; files carry `Managed by WHM panel (Hardening)` and an unmanaged original is
+  kept as `<file>.whm-orig` (`.whm-orig.disabled` under `apt.conf.d`). **Allowed roots added:** `/etc/fail2ban`,
+  `/etc/apt/apt.conf.d`, `/etc/dnf/automatic.conf`, `/etc/sysctl.d`.
+- **Files:** `/etc/fail2ban/filter.d/whm-panel.conf` + `/etc/fail2ban/jail.d/whm.local` (the panel jail watches
+  the journal with `journalmatch = SYSLOG_IDENTIFIER=whm-panel`, the identifier `deploy/whm-panel.service` sets;
+  pino-http's `POST /api/auth/login|2fa` answered 401/403; `banaction` follows the panel's firewall backend;
+  `ignoreip` loopback only, the `[whm-panel]` exemption from `ignoreIps` or the applying address); Debian
+  `/etc/apt/apt.conf.d/20auto-upgrades` + `52whm-unattended-upgrades` (`#clear` of the origin lists, security
+  pockets only, no automatic reboot; `50unattended-upgrades` left alone); RHEL `/etc/dnf/automatic.conf` keys
+  rewritten in place; `/etc/sysctl.d/90-whm-hardening.conf` loaded with `sysctl -e -p FILE`. SSH goes through
+  the existing `sec.sshd.get/set` + `sec.ssh_keys.list` (refused 422 while root could not log in with a key).
+- **Firewall baseline** via the boot reconcile job: `WHM_BASELINE` chain appended to INPUT (iptables/ip6tables)
+  or table `inet whm` (nft), policy switched to drop last; the plan opens the panel ports, every port root's
+  real sshd listens on (`ss -ltnpeH` + `/proc` uid/exe check, socket units merged), 80/443, mail/DNS/FTP + passive
+  range, the hub's live ports, `extraTcp`/`extraUdp`. Three guards (UI confirmation typing the SSH port, API
+  `confirmSshPort` + live checks, agent re-check). `not_applicable` while **firewalld or ufw** is active.
+  Persistence = `hardening_state.desired` + job `hardening.reconcile` at boot (like `WHM_BLOCK`), never
+  iptables-persistent files. Capability `fail2ban` is registered by the Security Center module; the install goes
+  through `ctx.stack.capabilityInstall('fail2ban')`; a missing `unattended-upgrades`/`dnf-automatic` is installed
+  as a `software.pkg.install` job (202).
+- Routes (root): `GET /api/security/hardening`, `GET /api/security/hardening/firewall/plan`,
+  `POST /api/security/hardening/:item/apply` (202 when a job is returned), `POST
+  /api/security/hardening/:item/revert`, `POST /api/security/hardening/fail2ban/unban`,
+  `POST /api/security/hardening/fail2ban/install`. Audit `security.hardening.apply|revert`,
+  `security.hardening.fail2ban.unban`.
+
+### 36.6 Encrypted cloud storage (V6; backup, agent `backup.rclone.*`)
+- **`ctx.backupCloud`** (`services/backup-cloud.js`) is created by the backup category and **used only through
+  `ctx.backup`** (provider catalog, OAuth client registry, PKCE flows + code exchange, per-destination key
+  generation, `agentConfig(row, { encrypted })`, `needsRclone`). Other categories and the plugin host call
+  **`ctx.backup.uploadFile(destinationId, file, req)` → `{ remotePath, encrypted }`** (routes through
+  `backup.destination.upload` or `backup.rclone.upload`, persists rotated tokens, flags `reauthRequired`); never
+  `ctx.agent.op('backup.destination.upload', …)` with `destinationConfig()` — that carries panel-only fields the
+  strict schema rejects and fails for every cloud or encrypted destination (`unsupported`). Callers that keep an
+  upload row store **`backup_uploads.encrypted`**: listings, fetches, prunes and deletes use the transport that
+  wrote the copy.
+- **Capability `rclone`** (binary `rclone`, registered by the backup category; stack component `rclone`, EPEL on
+  the RHEL family; `CapabilityNotice` label `rclone`): every cloud kind and every encrypted destination answers
+  501 `capability_missing` with `capability: 'rclone'` without it; plain local/FTP/SFTP/WebDAV/S3 keep the
+  curl/SigV4 path. **Op family `backup.rclone.test|upload|download|list|delete`** (`delete` destructive): a
+  root-only `rclone.conf` rendered per call under `/tmp/whm/backup-rclone-<random>/` (0600, `HOME` and
+  `--cache-dir` inside it, removed in `finally`), fixed flags, exec timeout 2 h for transfers / 5 min otherwise,
+  secrets never on argv, stderr scrubbed of every configured secret (timeouts and spawn failures included),
+  `use_trash = false` (Drive) / `hard_delete = true` (B2). **`backup.destination.*` refuses rclone
+  configurations** (`unsupported`), so the service's routing is the only path; config values pass the `iniValue`
+  rule.
+- **Encryption:** rclone `crypt` remote `[whm]` wrapping `[whmbase]` (names and contents encrypted); password +
+  salt per destination (`newEncryptionKey()`), rendered in rclone's obscured form (`rcloneObscure`), returned
+  **once** (`encryptionKey` on create / enable / an update that turns it on). **On by default except a plain
+  `local` copy** (`crypt` omitted → on); **"crypt cannot be switched off once enabled" → `PUT` with
+  `crypt: false` is 409**; `POST /api/backup/destinations/:id/encryption` enables it on an old destination
+  (new uploads only). Pre-039 rows report `config.crypt: false` explicitly.
+- **OAuth (gdrive, onedrive, dropbox):** `GET /api/backup/destinations/oauth/:provider/start?destination=` (root,
+  session only; state + PKCE verifier + redirect URI in `req.session.backupOauth`, 10 min TTL) and
+  `…/oauth/:provider/callback` (constant-time state check, consumed once, server-side exchange over https with a
+  15 s timeout / no redirects / 256 KB cap, then `302 /backup/backup-configuration?cloud=connected|error`). The
+  redirect URI to register with the provider is **`https://<hostname>:2087/api/backup/destinations/oauth/<provider>/callback`**;
+  the one sent is derived from the request host, so connect from the canonical hostname. OAuth clients live in
+  `backup_oauth_apps` (`client_secret_enc`; `GET/PUT/DELETE /api/backup/destinations/oauth-apps[/:provider]`);
+  tokens never come from the browser (OAuth kinds take `folder`/`crypt` only).
+- **Migration `039_backup-cloud.sql`** rebuilds `backup_destinations` with the widened `kind` CHECK (`gdrive`,
+  `onedrive`, `dropbox`, `azureblob`, `b2` added; `backup_uploads.destination_id` and `backups.destination_id`
+  links parked across the DROP), adds `last_upload_at/ok/message`, `backup_uploads.encrypted` and
+  `backup_oauth_apps`. Routes: `GET /api/backup/destinations/providers`, `GET /api/backup/destinations/:id/archives`
+  (both layers, `encrypted` per entry), `POST …/:id/archives/import { name, encrypted }` (202, job
+  `backup.cloud.fetch`: download/decrypt, verify, register as a pinned import).

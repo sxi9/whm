@@ -85,7 +85,7 @@ export function EmptyState({ title, children, icon: Icon = Info }) {
 export const CAPABILITY_LABELS = {
   apache: 'Apache', php: 'PHP', nginx: 'NGINX', mysql: 'MariaDB', postgres: 'PostgreSQL', bind: 'BIND', exim: 'Exim', dovecot: 'Dovecot', ftp: 'Pure-FTPd',
   spamassassin: 'SpamAssassin', clamav: 'ClamAV', modsecurity: 'ModSecurity', acme: 'Certbot', quota: 'quota tools', firewall: 'the firewall', awstats: 'AWStats',
-  webalizer: 'Webalizer', analog: 'Analog', mailman: 'Mailman', rsync: 'rsync', git: 'Git', node: 'Node.js', python: 'Python', fail2ban: 'Fail2ban',
+  webalizer: 'Webalizer', analog: 'Analog', mailman: 'Mailman', rsync: 'rsync', rclone: 'rclone', git: 'Git', node: 'Node.js', python: 'Python', fail2ban: 'Fail2ban',
 };
 
 // Pages render this outside the shell in tests; the install button only needs

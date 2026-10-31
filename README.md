@@ -116,7 +116,7 @@ The agent's writable path roots can be widened in `/etc/whm/agent.conf`.
 - Privilege separation: web tier is non-root; only `whm-agentd` touches the system, through
   a fixed op catalog with zod-validated arguments; unknown ops and bad arguments are refused.
 - No shell strings anywhere; identifiers that reach `argv` are validated (no leading `-`).
-- Sessions: `httpOnly`/`sameSite=strict` cookies, CSRF token on every mutation, rate limits,
+- Sessions: `httpOnly`/`sameSite=lax` cookies (the external-auth callback is a cross-site navigation), CSRF token on every mutation, rate limits,
   brute-force blocking (cPHulk), optional TOTP two-factor authentication.
 - RBAC: `root` and `reseller` roles; resellers only see accounts they own.
 - Secrets at rest encrypted (AES-256-GCM, key in the data dir); API tokens stored hashed.
@@ -373,3 +373,18 @@ master key as `client_secret_enc`. The installer writes `hub.conf` once; `--upgr
 See [`CHECKLIST.md`](CHECKLIST.md) for the live function-by-function status and the build
 phases. All 212 WHM functions plus the Application Manager category, the plugin host and the four bundled plugins are built; the hub
 (license server + marketplace) and its panel clients are the Phase-5 work tracked there.
+
+The 2026-10-31 round (the owner's second issue list) added, for operators: a branded landing page on the
+server's bare IP over HTTP and HTTPS (a catch-all vhost that never steals a tenant's name, proxied by NGINX
+when it fronts Apache), addon/sub/parked **domains managed from Modify an Account** with the index page
+rendered into every new document root, the hostname's certificate shown and reissuable from *Manage SSL
+Hosts*, a **PHP version installer** in MultiPHP Manager (ppa:ondrej/php, packages.sury.org or Remi SCL,
+with removal guarded by usage), **security alert mails** to administrators and optionally to hosting accounts
+(critical findings, pending and applied security updates, panel security releases, your own emergency
+notices, digest window), a **curated package catalog** as the default view of Install Distro Packages (79
+entries in 8 groups, repository search with folded variants, Marketplace deep links), a **Hardening card** on
+the Security Advisor (Fail2ban with a panel jail, automatic security updates, SSH daemon, sysctl, a
+default-deny firewall baseline — each with Apply/Revert), and **encrypted cloud backup destinations**
+(Google Drive, OneDrive, Dropbox, S3-compatible, Azure Blob, Backblaze B2 through rclone, encrypted at rest
+by default with a one-time key, copies importable from the restore picker). Designs under `docs/design/`
+(`domains.md`, `php-versions.md`, `security-alerts.md`, `hardening.md`, `backup-cloud.md`).

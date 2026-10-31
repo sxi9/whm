@@ -584,10 +584,25 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
 
 - **Purpose:** install or remove OS packages.
 - **Who:** root.
-- **Screen:** detected manager; search (`GET /pkg/search`), package info, *Packages* list with install (option
-  *no recommends*) and *Remove* (option *purge*), *update index*, recent operations.
-- **Server:** `POST /pkg/install` / `/pkg/remove` / `/pkg/update-index` answer `202` with jobs.
-- **Gotchas:** package names cannot start with `-`; the agent re-validates them.
+- **Screen:** detected manager; **Catalog** tab (default) — the curated list of what a hosting server installs,
+  79 entries in 8 groups (*Web*, *PHP extensions*, *Databases*, *Mail*, *Security*, *Tools*, *Monitoring*,
+  *Hosting services*; `server/src/lib/package-catalog.js`), one card per piece of software with the real package
+  names of your family, an *installed* / *partial* badge, **Install** (**Install for PHP x.y** for an extension,
+  per installed PHP version; **Install the rest** / **Install what is offered** for a partly installed entry), a
+  *Not offered by the configured repositories* note where a name is missing (EPEL / Remi hints), and a
+  **Configure** link to the page that manages it once installed; a filter box, a group select, *Only what is not
+  installed* and *Re-check repositories* (the offered state comes from one batch query, cached 15 minutes and
+  dropped after every package job). **Search repositories** tab — `GET /pkg/search` shows one row per piece of
+  software; its `-dev`/`-doc`/`-common`, per-version, per-architecture and language-binding packages fold
+  underneath **Show N more variants**, and **Show everything** lifts the result cap; install (option *no
+  recommends*), *Remove* (option *purge*), package info. **Installed** tab, *Refresh package index*, recent
+  operations. *WHM Marketplace* › **Add** / **Open in catalog** deep-links here
+  (`/software/install-distro-packages?entry=<key>`; `?q=` opens the search).
+- **Server:** `GET /pkg/catalog`, `POST /pkg/catalog/:key/install { phpVersion? }` (`202`; names no repository
+  carries are skipped, the job fails only when nothing of the entry is offered), `POST /pkg/install` /
+  `/pkg/remove` / `/pkg/update-index` answer `202` with jobs.
+- **Gotchas:** package names cannot start with `-`; the agent re-validates them; the repository search folds
+  variants by name shape, so a flavour such as `nginx-full` keeps its own row.
 
 #### 22.3 Module Installers
 
@@ -619,6 +634,26 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
   pools*; *Applying PHP version to the web server* progress.
 - **Server:** `PUT /php/domains` calls `ctx.web.setPhpVersion` per domain (a job when more than one
   domain); `PUT /php/default` updates the default and FPM.
+- **Install a PHP version card** (root; design `docs/design/php-versions.md`): the package source for this
+  family with a pill (*enabled* / *not enabled yet* / *unavailable*) — Ubuntu and derivatives `ppa:ondrej/php`,
+  Debian `packages.sury.org/php`, the RHEL family Remi's SCL packages (`php8x-php-*`, one tree per branch next
+  to the system PHP; the modular stream is never used because it replaces the system PHP) — the OS, the package
+  manager and the distribution's own branch, then one row per branch 7.4 … 8.5 with its state (*installed* ·
+  version / *available* · candidate / *not offered*), source, *In use by* (domains, rendered vhosts, pools,
+  packages, account plans, the Apache default) and **Install** / **Remove**. Install runs as a job with the log
+  inline: it enables the source when needed (and undoes that again if the index refresh fails), installs
+  `php8.4-{fpm,cli,common}` + the stack catalog's extension set (names the source lacks are skipped), enables
+  `php8.4-fpm`, re-detects versions and pools, and **keeps the previous system/CLI default** (a newer branch
+  would otherwise take `/usr/bin/php` through alternatives). Remove is only offered for a branch that is neither
+  the system default, the CLI default nor used anywhere (the reason is shown inline); it purges the package set
+  so no empty pool directory remains. Previous installs/removals keep a *Log* button; buttons stay disabled
+  while a package job runs (a second apt/dnf would only hit the lock; the API answers 409 too). The card
+  renders even when no PHP is installed yet. **Server:** `GET /php/installable`, `POST /php/install { version }`
+  (`202`), `DELETE /php/versions/:id` (`202`); resellers get 403. **Gotchas:** on Debian the sury keyring and
+  list are written under `/etc/apt/keyrings` and `/etc/apt/sources.list.d` (agent allowed roots); a branch the
+  source does not carry for your release shows *not offered* and is refused before anything runs. The INI editor
+  (22.4) has *Re-detect versions* and a link here; Module Installers (22.3) now install a missing pecl / pear /
+  gem / pip tool from the page.
 
 #### 22.6 NGINX Manager
 
@@ -955,8 +990,16 @@ in storage are encrypted with the panel master key and every key view or downloa
 
 - **Purpose:** installed certificates and their expiry.
 - **Who:** root or reseller (own domains).
-- **Screen:** *Installed certificates* (domain, issuer, expiry, source) with *Uninstall*.
-- **Server:** `DELETE /hosts/:domain` removes the bundle and calls `ctx.web.removeSsl`.
+- **Screen:** **Server hostname** card (root): the hostname's own certificate (issuer, expiry, days left), the
+  services it is installed for (panel, Exim, Dovecot, FTP — each marked whether its copy covers the hostname),
+  the daily `hostname-certificate-renew` schedule, the AutoSSL provider and the last run touching the hostname,
+  the landing vhost, and **Reissue** (`POST /api/networking/hostname/certificate`, the same step as *Change
+  Hostname*) / **Download** (`GET /certs/:id/download`). *Installed certificates* (domain, issuer, expiry,
+  source) with *Uninstall*; the hostname's row is labelled *Hostname* instead of an account.
+- **Server:** `GET /hosts` → `{ hosts, serverHostname }` (`serverHostname` for root only; the hostname row carries
+  `hostname: true`); `DELETE /hosts/:domain` removes the bundle and calls `ctx.web.removeSsl`.
+- **Gotchas:** the hostname certificate is issued only once the hostname resolves to the server's public IPv4
+  and AutoSSL has a provider (3.1); it is also what the bare-address landing page serves on 443.
 
 #### 26.5 Purchase and Install an SSL Certificate
 

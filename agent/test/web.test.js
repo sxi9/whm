@@ -1129,3 +1129,36 @@ describe('web.docroot.ensure / remove run inside the account home as the account
     } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
 });
+
+describe('phpLayout lists a versioned FPM tree only while its binary exists', () => {
+  it('drops a pool.d a hand removal left behind and keeps it with requireBinary: false', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-php-layout-'));
+    for (const v of ['8.1', '8.3']) fs.mkdirSync(path.join(root, 'php', v, 'fpm', 'pool.d'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'php', '8.2', 'cli'), { recursive: true });
+    for (const d of ['php74', 'php82', 'notphp']) fs.mkdirSync(path.join(root, 'remi', d, 'php-fpm.d'), { recursive: true });
+    const previous = { php: process.env.WHM_PHP_ETC_ROOT, remi: process.env.WHM_REMI_ETC_ROOT };
+    process.env.WHM_PHP_ETC_ROOT = path.join(root, 'php');
+    process.env.WHM_REMI_ETC_ROOT = path.join(root, 'remi');
+    try {
+      await withBinaries(['php-fpm8.3', '/opt/remi/php82/root/usr/sbin/php-fpm'], () => ({}), async () => {
+        const strict = phpLayout().versions.filter((v) => v.flavor !== 'rhel');
+        expect(strict.map((v) => [v.version, v.flavor, v.bin, v.poolDir])).toEqual([
+          ['8.2', 'remi', '/opt/remi/php82/root/usr/sbin/php-fpm', path.join(root, 'remi', 'php82', 'php-fpm.d')],
+          ['8.3', 'debian', 'php-fpm8.3', path.join(root, 'php', '8.3', 'fpm', 'pool.d')],
+        ]);
+        const lenient = phpLayout({ requireBinary: false }).versions.filter((v) => v.flavor !== 'rhel');
+        expect(lenient.map((v) => [v.version, v.bin])).toEqual([['7.4', null], ['8.1', null], ['8.2', '/opt/remi/php82/root/usr/sbin/php-fpm'], ['8.3', 'php-fpm8.3']]);
+        // The pool write refuses the orphaned tree like a version that was never installed.
+        expect((await opError(runOp('web.phpfpm.pool.write', { user: 'root', version: '8.1' }, ctx))).code).toBe('capability_missing');
+      });
+      await withBinaries([], () => ({}), async () => {
+        expect(phpLayout().versions.filter((v) => v.flavor !== 'rhel')).toEqual([]);
+        expect(phpLayout().installed).toBe(fs.existsSync('/etc/php-fpm.d'));
+      });
+    } finally {
+      if (previous.php === undefined) delete process.env.WHM_PHP_ETC_ROOT; else process.env.WHM_PHP_ETC_ROOT = previous.php;
+      if (previous.remi === undefined) delete process.env.WHM_REMI_ETC_ROOT; else process.env.WHM_REMI_ETC_ROOT = previous.remi;
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

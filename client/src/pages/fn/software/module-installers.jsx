@@ -12,7 +12,7 @@ const RUNTIMES = [
 
 export default function ModuleInstallers({ fn }) {
   const { data, loading, error, refetch } = useApi('/software/modules/installers');
-  const runner = useJobRunner();
+  const runner = useJobRunner({ onFinished: () => refetch() });
   const present = data?.present || {};
 
   return (

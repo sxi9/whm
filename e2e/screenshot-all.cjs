@@ -40,7 +40,29 @@ const FLOW_SHOTS = [
   ['15-license-tab.png', 'Basic WebHost Manager Setup — License tab'],
   ['16-manage-plugins-marketplace.png', 'Manage Plugins — Marketplace tab'],
   ['17-whm-marketplace.png', 'WHM Marketplace'],
+  ['18-application-manager.png', 'Application Manager'],
+  ['19-runtime-versions.png', 'Runtime Versions'],
+  ['20-application-templates.png', 'Application Templates'],
+  ['21-modify-account-domains.png', 'Modify an Account — Domains panel'],
+  ['22-manage-ssl-hosts.png', 'Manage SSL Hosts — Server hostname card'],
+  ['23-multiphp-manager.png', 'MultiPHP Manager — Install a PHP version'],
+  ['24-install-distro-packages.png', 'Install Distro Packages — Catalog tab'],
+  ['24b-install-distro-packages-search.png', 'Install Distro Packages — Search repositories tab'],
+  ['25-contact-manager.png', 'Contact Manager — Security notifications'],
+  ['26-security-advisor.png', 'Security Advisor — Hardening card'],
+  ['27-backup-configuration.png', 'Backup Configuration — Cloud storage'],
 ];
+
+// Pages whose main card arrives with a second request after the header: wait for
+// it (bounded, like every settle) so the capture shows the card, not its loading line.
+const PAGE_WAITS = {
+  'ssl-tls/manage-ssl-hosts': 'h2:has-text("Server hostname"), .capability-notice',
+  'software/multiphp-manager': 'h2:has-text("Install a PHP version")',
+  'software/install-distro-packages': '.catalog-group, .capability-notice',
+  'server-contacts/contact-manager': 'h2:has-text("Security notifications")',
+  'security-center/security-advisor': '.card:has(h2:has-text("Hardening")) tbody tr',
+  'backup/backup-configuration': 'h2:has-text("Cloud storage")',
+};
 
 // Stamps a label bar at the top of the rendered page so the screenshot explains itself.
 async function stamp(page, text) {
@@ -113,6 +135,7 @@ function grid(items, perRow = 3) {
       try {
         await page.goto(`${BASE}${fn.path}`, { waitUntil: 'domcontentloaded' });
         await settle('.page-header');
+        if (PAGE_WAITS[fn.key]) await settle(PAGE_WAITS[fn.key]);
         const status = await pageStatus(page);
         statuses[fn.key] = status;
         if (status === 'live') live++;

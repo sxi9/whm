@@ -107,10 +107,15 @@ export function pickBasic(directives) {
 }
 
 // What the rendered proxy depends on; a change means whm-proxy.conf is stale.
-export function proxyFingerprint(settings, domains) {
-  const material = { apachePort: settings.apachePort, cache: settings.cache, cacheMaxSizeMb: settings.cacheMaxSizeMb, cacheTtl: settings.cacheTtl, domains: [...domains].sort((a, b) => a.domain.localeCompare(b.domain)) };
+export function proxyFingerprint(settings, domains, defaultServer = null) {
+  const material = { apachePort: settings.apachePort, cache: settings.cache, cacheMaxSizeMb: settings.cacheMaxSizeMb, cacheTtl: settings.cacheTtl, domains: [...domains].sort((a, b) => a.domain.localeCompare(b.domain)), ...(defaultServer ? { defaultServer } : {}) };
   return crypto.createHash('sha256').update(JSON.stringify(material)).digest('hex').slice(0, 32);
 }
+
+// Where the agent lets the HTTPS catch-all's certificate pair live (its
+// pkg.nginx.proxy.write schema): the panel's SSL stores and the panel listener's pair.
+export const NGINX_DEFAULT_SERVER_ROOTS = ['/etc/ssl/whm', '/etc/letsencrypt', '/etc/pki/tls/whm', '/etc/whm/tls'];
+const underDefaultServerRoots = (p) => typeof p === 'string' && /^\/[A-Za-z0-9._/-]{1,255}$/.test(p) && !p.split('/').some((seg, i) => i > 0 && (!seg || seg === '.' || seg === '..')) && NGINX_DEFAULT_SERVER_ROOTS.some((root) => p.startsWith(`${root}/`));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const MAX_RUN_LOG_LINES = 2000;
@@ -1118,10 +1123,30 @@ export function createSoftwareService(ctx) {
   // the test fails, so callers may run this before changing anything else. The
   // sync time / fingerprint are only recorded by markSynced(), once the caller
   // knows the write is not going to be rolled back.
+  // The pair the HTTPS catch-all serves https://<ip>/ with, so the request
+  // reaches Apache's own catch-all vhost: the hostname's installed bundle, else
+  // the pair the web category's catch-all vhost resolved on the host (the
+  // apache service certificate, the panel listener's pair or its generated
+  // one, in that order, existence checked by the agent). None → the agent's
+  // reject-handshake / 444 block as before.
+  function defaultServerPair() {
+    const own = installedCert(hostname());
+    if (own) return own;
+    if (!tableExists('service_config_applies')) return null;
+    try {
+      const row = db.prepare("SELECT ok, summary FROM service_config_applies WHERE component = 'default_vhost'").get();
+      if (!row?.ok) return null;
+      const ssl = JSON.parse(row.summary || 'null')?.ssl;
+      const pair = ssl ? { cert: ssl.fullchain || ssl.cert, key: ssl.key } : null;
+      return pair && underDefaultServerRoots(pair.cert) && underDefaultServerRoots(pair.key) ? pair : null;
+    } catch (err) { logger.warn({ err }, 'nginx: default vhost certificate lookup failed'); return null; }
+  }
+
   async function writeProxy(s, req) {
     const domains = proxyDomains();
-    const result = await op('pkg.nginx.proxy.write', { apachePort: s.apachePort, cache: s.cache, cacheMaxSizeMb: s.cacheMaxSizeMb, cacheTtl: s.cacheTtl, domains }, req);
-    return { ...result, fingerprint: proxyFingerprint(s, domains), syncedAt: new Date().toISOString() };
+    const defaultServer = defaultServerPair();
+    const result = await op('pkg.nginx.proxy.write', { apachePort: s.apachePort, cache: s.cache, cacheMaxSizeMb: s.cacheMaxSizeMb, cacheTtl: s.cacheTtl, domains, ...(defaultServer ? { defaultServer } : {}) }, req);
+    return { ...result, fingerprint: proxyFingerprint(s, domains, defaultServer), syncedAt: new Date().toISOString() };
   }
   const markSynced = (written) => settings.setMany({ 'software.nginx.last_sync': written.syncedAt, 'software.nginx.last_fingerprint': written.fingerprint });
 
@@ -1160,10 +1185,11 @@ export function createSoftwareService(ctx) {
       try { state = await op('pkg.nginx.status'); } catch (err) { logger.warn({ err }, 'nginx status failed'); }
       const s = nginxSettings();
       const domains = proxyDomains();
-      const fingerprint = proxyFingerprint(s, domains);
+      const defaultServer = defaultServerPair();
+      const fingerprint = proxyFingerprint(s, domains, defaultServer);
       const stale = s.enabled && (!state.proxyConfigured || fingerprint !== s.lastFingerprint);
       const bind = backendBind();
-      return { ...state, capability: capabilities.has('nginx'), settings: s, domains: domains.length, sslDomains: domains.filter((d) => d.ssl).length, stale, fingerprint, webLinked: webLinked(), backendBind: bind || 'all-interfaces', backendExposed: s.enabled && webLinked() && bind !== BACKEND_BIND, apacheCapability: capabilities.has('apache') };
+      return { ...state, capability: capabilities.has('nginx'), settings: s, domains: domains.length, sslDomains: domains.filter((d) => d.ssl).length, defaultServer, stale, fingerprint, webLinked: webLinked(), backendBind: bind || 'all-interfaces', backendExposed: s.enabled && webLinked() && bind !== BACKEND_BIND, apacheCapability: capabilities.has('apache') };
     },
     install(user, req) {
       requirePkg();
@@ -1203,7 +1229,7 @@ export function createSoftwareService(ctx) {
       let configured = true;
       try { configured = (await job.agent.op('pkg.nginx.status')).proxyConfigured; } catch (err) { job.log(`nginx status unavailable: ${err.message}`, 'warn'); }
       const domains = proxyDomains();
-      const fingerprint = proxyFingerprint(s, domains);
+      const fingerprint = proxyFingerprint(s, domains, defaultServerPair());
       if (configured && fingerprint === s.lastFingerprint) { job.log('proxy config is current'); return { skipped: true, reason: 'current', domains: domains.length }; }
       job.log(`proxy config is out of date (${domains.length} domains, ${domains.filter((d) => d.ssl).length} with HTTPS); re-rendering`);
       const result = await writeProxy(s, null);

@@ -187,6 +187,8 @@ describe('security alerts service and routes', () => {
       expect(calls[0].payload.severity).toBe('critical');
       expect(calls[0].payload.body).toContain('Expected at most 0640.');
       expect(calls[0].payload.body).toContain('Fix it from Security Advisor: http://panel.example.com:2086/security-center/security-advisor');
+      expect(calls[0].payload.html).toContain('<h1 style="margin:0 0 16px;font-size:20px">Security alert: /etc/shadow is too permissive (0644)</h1>');
+      expect(calls[0].payload.html).toContain('Expected at most 0640.');
       expect(calls[0].payload.data.alerts).toEqual([expect.objectContaining({ id: r.alert.id, kind: 'advisor.critical', severity: 'critical' })]);
       const [a] = alerts();
       expect(a).toMatchObject({ state: 'sent', admin: { matched: 1, sent: 1, failed: 0 }, accounts: { skipped: 'notify_accounts_off' } });
@@ -205,6 +207,9 @@ describe('security alerts service and routes', () => {
     expect(sent[0].to).toEqual(['ops@example.com']);
     expect(sent[0].subject).toBe('[panel.example.com] [HST Panel] Security alert: Panel security release 9.9.9 is available');
     expect(sent[0].text).toContain('Upgrade from Upgrade to Latest Version');
+    expect(sent[0].html).toMatch(/^<!doctype html>/);
+    expect(sent[0].html).toContain('Panel security release 9.9.9 is available');
+    expect(sent[0].html).toContain('Upgrade from Upgrade to Latest Version');
     expect(app.ctx.db.prepare("SELECT event, status FROM contact_deliveries WHERE event = 'security.alert'").all()).toEqual([{ event: 'security.alert', status: 'sent' }]);
   });
 
@@ -225,6 +230,13 @@ describe('security alerts service and routes', () => {
     expect(toAlice.text).toContain('that hosts alice (alice.example), carol (carol.example)');
     expect(toAlice.text).toContain('1 package (libssl3) received security fixes.');
     expect(toAlice.text).not.toContain('3.0.1 -> 3.0.2');
+    // The html alternative follows the account audience rule: the account
+    // template only, never the admin body.
+    expect(toAlice.html).toMatch(/^<!doctype html>/);
+    expect(toAlice.html).toContain('1 package (libssl3) received security fixes.');
+    expect(toAlice.html).toContain('that hosts alice (alice.example), carol (carol.example)');
+    expect(toAlice.html).not.toContain('3.0.1 -');
+    expect(toAlice.html).not.toContain('What the panel did');
     const rows = app.ctx.db.prepare('SELECT username, address, status FROM security_alert_deliveries WHERE alert_id = ? ORDER BY username').all(r.alert.id);
     expect(rows).toEqual([{ username: 'alice', address: 'alice@example.org', status: 'sent' }, { username: 'bob', address: 'bob@example.org', status: 'sent' }, { username: 'carol', address: 'alice@example.org', status: 'sent' }]);
     const [a] = alerts();

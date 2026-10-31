@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { Link } from 'react-router-dom';
 import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, KeyValue, CapabilityNotice, formatDate } from '../../../components/Common.jsx';
@@ -40,7 +41,7 @@ export default function ParkADomain({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="A parked (alias) domain shows the same site as an account's main domain. The panel records the alias, creates its DNS zone and asks the web server to add the alias to the vhost." />
+      <PageHeader fn={fn} description={<>A parked (alias) domain shows the same site as an account's main domain. The panel records the alias, creates its DNS zone and asks the web server to add the alias to the vhost. Parked domains can also be added and removed per account, next to its addon domains and subdomains, from <Link to="/account-functions/modify-an-account">Modify an Account › Domains</Link>.</>} />
       <form onSubmit={park}>
         <Card title="Park a domain">
           <CapabilityNotice error={formError} />
