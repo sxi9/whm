@@ -38,6 +38,24 @@ export function httpsRedirectTarget(req, tlsPort) {
   return `https://${bare}:${tlsPort}${url.startsWith('/') ? url : `/${url}`}`;
 }
 
+// Query values that are one-time credentials (OAuth/OIDC callbacks carry
+// code and state; token links carry the token) never reach the access log.
+const REDACTED_QUERY_KEYS = new Set(['code', 'state', 'token', 'id_token', 'access_token', 'refresh_token', 'password', 'secret']);
+export function redactUrl(url) {
+  const s = String(url ?? '');
+  const q = s.indexOf('?');
+  if (q === -1) return s;
+  const [query, ...fragment] = s.slice(q + 1).split('#');
+  const pairs = query.split('&').map((pair) => {
+    const eq = pair.indexOf('=');
+    const key = eq === -1 ? pair : pair.slice(0, eq);
+    let name;
+    try { name = decodeURIComponent(key.replace(/\+/g, ' ')); } catch { name = key; }
+    return REDACTED_QUERY_KEYS.has(name.trim().toLowerCase()) ? `${key}=[redacted]` : pair;
+  });
+  return `${s.slice(0, q + 1)}${pairs.join('&')}${fragment.length ? `#${fragment.join('#')}` : ''}`;
+}
+
 export async function createApp(ctx) {
   const { config, db, logger, crypto: cryptoSvc } = ctx;
   const app = express();
@@ -67,7 +85,7 @@ export async function createApp(ctx) {
     autoLogging: { ignore: (req) => String(req.originalUrl ?? req.url).startsWith('/api/system/jobs/') && isStreamRequest(req) },
     customLogLevel: (_req, res, err) => (err || res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info'),
     serializers: {
-      req: (req) => ({ id: req.id, method: req.method, url: req.url, ip: req.remoteAddress }),
+      req: (req) => ({ id: req.id, method: req.method, url: redactUrl(req.url), ip: req.remoteAddress }),
       res: (res) => ({ statusCode: res.statusCode }),
     },
   }));

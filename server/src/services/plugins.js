@@ -185,7 +185,7 @@ export function createPluginHost(ctx) {
     jobCancelRunning: db.prepare("UPDATE jobs SET status = 'cancelled', finished_at = datetime('now') WHERE id = ? AND status = 'running'"),
     audit: db.prepare('INSERT INTO audit_log (principal, role, ip, action, target, args_redacted, result, request_id) VALUES (?, ?, NULL, ?, ?, ?, ?, NULL)'),
     accountByUsername: db.prepare('SELECT a.*, u.username AS owner FROM accounts a JOIN users u ON u.id = a.owner_id WHERE a.username = ?'),
-    backupUpload: db.prepare('INSERT INTO backup_uploads (backup_id, destination_id, destination_name, remote_path, status, error) VALUES (?, ?, ?, ?, ?, ?)'),
+    backupUpload: db.prepare('INSERT INTO backup_uploads (backup_id, destination_id, destination_name, remote_path, status, error, encrypted) VALUES (?, ?, ?, ?, ?, ?, ?)'),
   };
 
   const live = new Map();
@@ -642,16 +642,19 @@ export function createPluginHost(ctx) {
           if (!dest) throw new E.NotFoundError('backup destination', destinationId);
           if (!b.path || b.local_present === false) throw new E.ConflictError('the archive is not on local disk');
           const target = `${artefactId}->${dest.name}`;
+          // The backup service picks the engine the destination needs (plain
+          // or rclone/encrypted) and keeps rotated provider tokens.
           let r;
           try {
-            r = await bridge(() => ctx.agent.op('backup.destination.upload', { config: backup.destinationConfig(dest.id), file: b.path }, { req }));
+            r = await bridge(() => backup.uploadFile(dest.id, b.path, req), { resource: 'backup destination', id: destinationId });
           } catch (err) {
             req.audit({ action: 'plugin.backup.upload', target, args: { artefactId, destinationId: String(dest.id), file: b.path }, result: `error:${err.code || 'failed'}` });
             throw err;
           }
-          stmts.backupUpload.run(Number(b.id), dest.id, dest.name, r.remotePath ?? null, 'done', null);
-          req.audit({ action: 'plugin.backup.upload', target, args: { artefactId, destinationId: String(dest.id), file: b.path, remotePath: r.remotePath ?? null } });
-          return { ok: true, remotePath: r.remotePath ?? null, sha256: b.sha256 ?? null };
+          const encrypted = Boolean(r.encrypted);
+          stmts.backupUpload.run(Number(b.id), dest.id, dest.name, r.remotePath ?? null, 'done', null, encrypted ? 1 : 0);
+          req.audit({ action: 'plugin.backup.upload', target, args: { artefactId, destinationId: String(dest.id), file: b.path, remotePath: r.remotePath ?? null, encrypted } });
+          return { ok: true, remotePath: r.remotePath ?? null, sha256: b.sha256 ?? null, encrypted };
         },
         async verify(artefactId) {
           gate(entry, 'backups:read', 'ctx.api.backups.verify');

@@ -20,6 +20,7 @@ export const CAPABILITY_BINARIES = {
   acme: ['certbot', 'acme.sh'],
   firewall: ['iptables', 'nft', 'ufw', 'firewall-cmd'],
   rsync: ['rsync'],
+  rclone: ['rclone'],
   tar: ['tar'],
   spamassassin: ['spamd', 'spamassassin'],
   modsecurity: [],

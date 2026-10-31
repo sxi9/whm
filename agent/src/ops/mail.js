@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
@@ -454,6 +455,41 @@ defineOp('mail.test_delivery', {
   },
 });
 
+const crlf = (s) => String(s).replace(/\r?\n/g, '\r\n');
+
+// A boundary that occurs in neither part: a line of the HTML equal to it
+// would otherwise end the part early (the HTML is a body part only, so it can
+// never add a header).
+export function mimeBoundary(...parts) {
+  for (;;) {
+    const boundary = `=_whm_${crypto.randomBytes(16).toString('hex')}`;
+    if (!parts.some((p) => String(p).includes(boundary))) return boundary;
+  }
+}
+
+export function multipartAlternative(text, html) {
+  const boundary = mimeBoundary(text, html);
+  const body = [
+    `--${boundary}`, 'Content-Type: text/plain; charset=utf-8', 'Content-Transfer-Encoding: 8bit', '', crlf(text), '',
+    `--${boundary}`, 'Content-Type: text/html; charset=utf-8', 'Content-Transfer-Encoding: 8bit', '', crlf(html), '',
+    `--${boundary}--`,
+  ].join('\r\n');
+  return { boundary, contentType: `multipart/alternative; boundary="${boundary}"`, body };
+}
+
+// The RFC 5322 message mail.sendmail hands to Exim; server-contacts-smtp.js
+// builds the same shape for the relay transport. Without html the text/plain
+// message is unchanged.
+export function renderNotification({ from, to, subject, date = new Date().toUTCString(), text, html, headers = {} }) {
+  const mime = html ? multipartAlternative(text, html) : null;
+  const lines = [`From: ${from}`, `To: ${to.join(', ')}`, `Subject: ${subject}`, `Date: ${date}`, 'MIME-Version: 1.0'];
+  if (mime) lines.push(`Content-Type: ${mime.contentType}`, 'Content-Transfer-Encoding: 8bit');
+  else lines.push('Content-Type: text/plain; charset=utf-8');
+  lines.push('X-Mailer: WHM panel');
+  for (const [k, v] of Object.entries(headers)) if (!/^(from|to|subject|date|content-type|mime-version)$/i.test(k)) lines.push(`${k}: ${v}`);
+  return `${lines.join('\r\n')}\r\n\r\n${mime ? mime.body : crlf(text)}\r\n`;
+}
+
 defineOp('mail.sendmail', {
   description: 'Hand a message to Exim for delivery (panel notifications); recipients are passed as argv after --',
   schema: z.object({
@@ -461,13 +497,12 @@ defineOp('mail.sendmail', {
     to: z.array(emailAddress).min(1).max(100),
     subject: singleLine(998),
     text: z.string().max(2 * 1024 * 1024),
+    html: z.string().max(2 * 1024 * 1024).optional(),
     headers: z.record(z.string().regex(/^[A-Za-z][A-Za-z0-9-]{0,63}$/), singleLine(998)).optional(),
   }).strict(),
-  run: async ({ from, to, subject, text, headers = {} }) => {
+  run: async ({ from, to, subject, text, html, headers = {} }) => {
     const layout = requireExim();
-    const lines = [`From: ${from}`, `To: ${to.join(', ')}`, `Subject: ${subject}`, `Date: ${new Date().toUTCString()}`, 'MIME-Version: 1.0', 'Content-Type: text/plain; charset=utf-8', 'X-Mailer: WHM panel'];
-    for (const [k, v] of Object.entries(headers)) if (!/^(from|to|subject|date|content-type|mime-version)$/i.test(k)) lines.push(`${k}: ${v}`);
-    const message = `${lines.join('\r\n')}\r\n\r\n${text.replace(/\r?\n/g, '\r\n')}\r\n`;
+    const message = renderNotification({ from, to, subject, text, html, headers });
     const { code, stdout, stderr } = await exec(layout.bin, ['-i', '-f', from, '--', ...to], { input: message, allowFailure: true, timeoutMs: 120_000 });
     if (code !== 0) throw new OpError('send_failed', `Exim did not accept the message: ${(stderr || stdout).trim().split('\n').pop() || `exit ${code}`}`, { output: `${stdout}${stderr}`.slice(-4000) });
     return { from, to, accepted: true, bytes: Buffer.byteLength(message) };

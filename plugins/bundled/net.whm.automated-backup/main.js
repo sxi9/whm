@@ -217,7 +217,7 @@ async function backupAccount(ctx, job, settings, account, destinations, runId, w
       if (job.signal.aborted) break;
       try {
         const up = await ctx.api.backups.upload({ artefactId: artefact.id, destinationId: dest.id });
-        result.remote.push({ destinationId: dest.id, remotePath: up.remotePath, sha256: up.sha256, state: 'uploaded' });
+        result.remote.push({ destinationId: dest.id, remotePath: up.remotePath, sha256: up.sha256, state: 'uploaded', ...(up.encrypted != null ? { encrypted: Boolean(up.encrypted) } : {}) });
       } catch (err) {
         result.remote.push({ destinationId: dest.id, state: 'failed', error: err.message });
         warnings.push({ code: 'upload_failed', account: account.username, destinationId: dest.id, message: `upload of ${artefact.id} to "${dest.id}" failed: ${err.message}` });

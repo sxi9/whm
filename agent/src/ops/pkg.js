@@ -761,6 +761,29 @@ defineOp('pkg.update_index', {
   },
 });
 
+// `dnf updateinfo list --security` / `yum updateinfo list security` print one
+// advisory per line ending in the package NVRA ("ALSA-2024:1234 Important/Sec.
+// openssl-libs-1:3.0.7-24.el9.x86_64"); the names are what marks an update
+// as a security one, since the repository name never does on the RHEL family.
+const RPM_ARCHES = 'noarch|x86_64|i686|aarch64|ppc64le|s390x|src';
+export function parseUpdateinfoNames(stdout) {
+  const names = new Set();
+  for (const line of String(stdout || '').split('\n')) {
+    const nvra = line.trim().split(/\s+/).pop();
+    const m = nvra && nvra.match(new RegExp(`^(.+)-[^-]+-[^-]+\\.(?:${RPM_ARCHES})$`));
+    if (m) names.add(m[1]);
+  }
+  return names;
+}
+
+export async function flagRpmSecurity(pm, packages) {
+  if (!packages.length) return packages;
+  const argv = pm.manager === 'yum' ? ['updateinfo', 'list', 'security'] : ['-q', 'updateinfo', 'list', '--security'];
+  const { stdout } = await exec(pm.binary, argv, { allowFailure: true, timeoutMs: 5 * 60_000, maxBuffer: BIG });
+  const names = parseUpdateinfoNames(stdout);
+  return packages.map((p) => ({ ...p, security: p.security || names.has(p.name) }));
+}
+
 defineOp('pkg.upgradable', {
   description: 'Packages with pending updates (simulation; changes nothing)',
   timeoutMs: 5 * 60_000,
@@ -772,7 +795,7 @@ defineOp('pkg.upgradable', {
       packages = parseAptSimulation(stdout);
     } else {
       const { stdout } = await exec(pm.binary, ['-q', '-y', 'check-update'], { allowFailure: true, timeoutMs: 5 * 60_000, maxBuffer: 64 * 1024 * 1024 });
-      packages = parseDnfCheckUpdate(stdout);
+      packages = await flagRpmSecurity(pm, parseDnfCheckUpdate(stdout));
     }
     return { manager: pm.manager, count: packages.length, security: packages.filter((p) => p.security).length, packages, rebootRequired: fs.existsSync('/var/run/reboot-required') };
   },
@@ -1341,31 +1364,17 @@ async function stockPhpBranch(pm, offers) {
   return (meta?.installed || meta?.candidate || '').match(/^(?:\d+:)?(\d\.\d)/)?.[1] ?? null;
 }
 
-// packages.sury.org is enabled by writing under /etc/apt; when those paths are
-// outside the agent's roots the card says so instead of a job failing with
-// path_not_allowed.
-function suryWriteBlocked(ctx) {
-  for (const p of [path.join(aptRoot(), 'keyrings'), path.join(aptRoot(), 'sources.list.d', SURY_LIST)]) {
-    try { ctx.assertAllowedPath(p, 'write'); } catch { return `the agent may not write ${path.dirname(p) === path.join(aptRoot(), 'sources.list.d') ? path.dirname(p) : p}; add /etc/apt/keyrings and /etc/apt/sources.list.d to its allowed roots`; }
-  }
-  return null;
-}
-
 const sourceSummary = (source) => ({ key: source.key, label: source.label, url: source.url, flavor: source.flavor ?? null, codename: source.codename ?? null, major: source.major ?? null, supported: source.supported, reason: source.reason });
 
 defineOp('pkg.php.sources.detect', {
   description: 'The catalogued PHP package source for this host (ondrej PPA / packages.sury.org / Remi), whether it is configured, the stock branch and which PHP branches the repositories offer or have installed',
   timeoutMs: 300_000,
   schema: z.object({ branches: z.array(phpBranch).max(20).optional() }).strict(),
-  run: async ({ branches }, ctx) => {
+  run: async ({ branches }) => {
     const pm = requireManager();
     const os = readOsRelease();
     const source = phpSourceFor(pm, os);
     const configured = source.key ? await phpSourceConfigured(source) : false;
-    if (source.key === 'sury' && source.supported && !configured) {
-      const blocked = suryWriteBlocked(ctx);
-      if (blocked) { source.supported = false; source.reason = blocked; }
-    }
     const list = branches?.length ? branches : PHP_BRANCHES;
     const names = list.map((v) => phpPackageNames(pm.family, v));
     const offers = await packageOffers(pm, [...names.map((n) => n.probe), 'php-fpm']);
@@ -1645,15 +1654,21 @@ function restoreStockDefaults(changed) {
 // could smuggle directives) and must live under the panel's SSL stores. The
 // API is not trusted to have produced clean paths.
 export const NGINX_SSL_ROOTS = ['/etc/ssl/whm', '/etc/letsencrypt', '/etc/pki/tls/whm'];
-export const nginxSslPath = z.string().regex(/^\/[A-Za-z0-9._/-]{1,255}$/, 'certificate path')
+const sslPathUnder = (roots) => z.string().regex(/^\/[A-Za-z0-9._/-]{1,255}$/, 'certificate path')
   .refine((p) => p.split('/').slice(1).every((seg) => seg && seg !== '.' && seg !== '..'), 'certificate path must be normalized')
-  .refine((p) => NGINX_SSL_ROOTS.some((root) => p.startsWith(`${root}/`)), `certificate path must be under ${NGINX_SSL_ROOTS.join(', ')}`);
+  .refine((p) => roots.some((root) => p.startsWith(`${root}/`)), `certificate path must be under ${roots.join(', ')}`);
+export const nginxSslPath = sslPathUnder(NGINX_SSL_ROOTS);
+// The HTTPS catch-all may also carry the panel listener's own pair (the last
+// resort of the Apache catch-all's certificate chain).
+export const NGINX_DEFAULT_SSL_ROOTS = [...NGINX_SSL_ROOTS, '/etc/whm/tls'];
+export const nginxDefaultSslPath = sslPathUnder(NGINX_DEFAULT_SSL_ROOTS);
 
 const domainEntry = z.object({
   domain: arg.hostname,
   aliases: z.array(arg.hostname).max(200).default([]),
   ssl: z.object({ cert: nginxSslPath, key: nginxSslPath }).strict().optional(),
 }).strict();
+const defaultServerEntry = z.object({ cert: nginxDefaultSslPath, key: nginxDefaultSslPath }).strict();
 
 const PROXY_HEADERS = [
   'proxy_http_version 1.1;',
@@ -1686,8 +1701,12 @@ export function hostHasIpv6(procFile = PROC_IF_INET6) {
 
 // A hostname is routed to a tenant's HTTPS block only when it is one of that
 // block's names; everything else lands on the catch-all, never on the first
-// ssl block nginx happens to find.
-export function renderNginxProxy({ apachePort, cache, cacheMaxSizeMb = 1024, cacheTtl = '10m', domains = [], httpsPort = 443, httpPort = 80, http2Directive = false, cachePath = CACHE_PATH, rejectHandshake = false, defaultCert = null, ipv6 = true }) {
+// ssl block nginx happens to find. With `defaultServer` (a certificate pair the
+// panel controls) the HTTPS catch-all proxies to Apache like the HTTP one, so
+// https://<ip>/ reaches Apache's own catch-all vhost.
+export const catchAllMode = ({ defaultServer = null, rejectHandshake = false, defaultCert = null }) => (defaultServer ? 'proxy' : rejectHandshake ? 'reject-handshake' : defaultCert ? 'self-signed' : 'none');
+
+export function renderNginxProxy({ apachePort, cache, cacheMaxSizeMb = 1024, cacheTtl = '10m', domains = [], httpsPort = 443, httpPort = 80, http2Directive = false, cachePath = CACHE_PATH, rejectHandshake = false, defaultCert = null, defaultServer = null, ipv6 = true }) {
   const ind = (lines, n = 1) => lines.map((l) => `${'  '.repeat(n)}${l}`);
   const listen = (port, flags = '') => [`listen ${port}${flags};`, ...(ipv6 ? [`listen [::]:${port}${flags};`] : [])];
   const cacheLines = cache ? [
@@ -1703,9 +1722,10 @@ export function renderNginxProxy({ apachePort, cache, cacheMaxSizeMb = 1024, cac
   ] : [];
   const location = ['location / {', ...ind([`proxy_pass http://127.0.0.1:${apachePort};`, ...PROXY_HEADERS, ...cacheLines]), '}'];
   const common = ['client_max_body_size 512m;', 'proxy_intercept_errors off;', 'server_tokens off;'];
+  const catchAll = catchAllMode({ defaultServer, rejectHandshake, defaultCert });
   const out = [
     '# Managed by WHM panel (Software > NGINX Manager). Edits are overwritten on the next sync.',
-    `# whm-proxy: version=1 apache_port=${apachePort} cache=${cache ? 'on' : 'off'} domains=${domains.length} generated=${new Date().toISOString()}`,
+    `# whm-proxy: version=1 apache_port=${apachePort} cache=${cache ? 'on' : 'off'} domains=${domains.length} catch_all=${catchAll} generated=${new Date().toISOString()}`,
     '',
     'map $http_upgrade $connection_upgrade {',
     '  default upgrade;',
@@ -1716,20 +1736,22 @@ export function renderNginxProxy({ apachePort, cache, cacheMaxSizeMb = 1024, cac
   if (cache) out.push(`proxy_cache_path ${cachePath} levels=1:2 keys_zone=whm:64m max_size=${cacheMaxSizeMb}m inactive=60m use_temp_path=off;`, '');
   out.push('server {', ...ind([...listen(httpPort, ' default_server'), 'server_name _;', ...common, ...location]), '}', '');
   const sslListen = http2Directive ? 'ssl' : 'ssl http2';
-  if (rejectHandshake) {
+  const sslBlock = (names, ssl, flags = '') => ['server {', ...ind([
+    ...listen(httpsPort, ` ${sslListen}${flags}`), ...(http2Directive ? ['http2 on;'] : []), `server_name ${names};`,
+    `ssl_certificate ${ssl.cert};`, `ssl_certificate_key ${ssl.key};`,
+    'ssl_session_cache shared:whm_ssl:10m;', 'ssl_session_timeout 1d;', 'ssl_protocols TLSv1.2 TLSv1.3;', 'ssl_prefer_server_ciphers off;',
+    ...common, ...location,
+  ]), '}', ''];
+  if (catchAll === 'proxy') {
+    out.push(...sslBlock('_', defaultServer, ' default_server'));
+  } else if (catchAll === 'reject-handshake') {
     out.push('server {', ...ind([...listen(httpsPort, ' ssl default_server'), 'server_name _;', 'ssl_reject_handshake on;']), '}', '');
-  } else if (defaultCert) {
+  } else if (catchAll === 'self-signed') {
     out.push('server {', ...ind([...listen(httpsPort, ' ssl default_server'), 'server_name _;', `ssl_certificate ${defaultCert.cert};`, `ssl_certificate_key ${defaultCert.key};`, 'ssl_protocols TLSv1.2 TLSv1.3;', 'return 444;']), '}', '');
   }
   for (const d of domains) {
     if (!d.ssl) continue;
-    const names = [...new Set([d.domain, ...(d.aliases || [])])].join(' ');
-    out.push('server {', ...ind([
-      ...listen(httpsPort, ` ${sslListen}`), ...(http2Directive ? ['http2 on;'] : []), `server_name ${names};`,
-      `ssl_certificate ${d.ssl.cert};`, `ssl_certificate_key ${d.ssl.key};`,
-      'ssl_session_cache shared:whm_ssl:10m;', 'ssl_session_timeout 1d;', 'ssl_protocols TLSv1.2 TLSv1.3;', 'ssl_prefer_server_ciphers off;',
-      ...common, ...location,
-    ]), '}', '');
+    out.push(...sslBlock([...new Set([d.domain, ...(d.aliases || [])])].join(' '), d.ssl));
   }
   return out.join('\n');
 }
@@ -1739,7 +1761,7 @@ export function parseProxyHeader(content) {
   if (!m) return null;
   const out = {};
   for (const kv of m[1].split(/\s+/)) { const [k, v] = kv.split('='); if (k) out[k] = v; }
-  return { version: Number(out.version) || null, apachePort: Number(out.apache_port) || null, cache: out.cache === 'on', domains: Number(out.domains) || 0, generatedAt: out.generated || null };
+  return { version: Number(out.version) || null, apachePort: Number(out.apache_port) || null, cache: out.cache === 'on', domains: Number(out.domains) || 0, catchAll: out.catch_all || null, generatedAt: out.generated || null };
 }
 
 // Fallback for nginx < 1.19.4: a throwaway self-signed certificate so the :443
@@ -1779,9 +1801,10 @@ defineOp('pkg.nginx.status', {
     const exists = fs.existsSync(NGINX_PROXY_CONF);
     const content = exists ? fs.readFileSync(NGINX_PROXY_CONF, 'utf8') : null;
     const state = readProxyState();
+    const proxy = content ? parseProxyHeader(content) : null;
     return {
-      installed, version, active: installed ? await unitActive('nginx') : null, enabled: null, http2Directive: nginxHttp2Directive(version), catchAll: nginxRejectHandshake(version) ? 'reject-handshake' : hasBinary('openssl') ? 'self-signed' : 'none',
-      configPath: NGINX_PROXY_CONF, proxyConfigured: exists, proxy: content ? parseProxyHeader(content) : null,
+      installed, version, active: installed ? await unitActive('nginx') : null, enabled: null, http2Directive: nginxHttp2Directive(version), catchAll: proxy?.catchAll === 'proxy' ? 'proxy' : nginxRejectHandshake(version) ? 'reject-handshake' : hasBinary('openssl') ? 'self-signed' : 'none',
+      configPath: NGINX_PROXY_CONF, proxyConfigured: exists, proxy,
       stockDefaults: { debianSite: state.debianSite ? 'disabled' : fs.existsSync(DEBIAN_DEFAULT_SITE) ? 'enabled' : 'absent', mainConf: state.mainConf ? 'disabled' : 'untouched' },
       content: includeContent ? content : undefined, confDirExists: fs.existsSync(path.dirname(NGINX_PROXY_CONF)),
     };
@@ -1816,18 +1839,28 @@ defineOp('pkg.nginx.proxy.write', {
   schema: z.object({
     apachePort: port.default(8080), cache: z.boolean().default(false), cacheMaxSizeMb: z.number().int().min(64).max(1_048_576).default(1024),
     cacheTtl: z.string().regex(/^\d{1,5}[smhd]?$/).default('10m'), httpPort: port.default(80), httpsPort: port.default(443), domains: z.array(domainEntry).max(5000).default([]),
+    defaultServer: defaultServerEntry.optional(),
   }).strict(),
   run: async (args, ctx) => {
     if (!hasBinary('nginx')) throw new OpError('capability_missing', 'nginx is not installed; use "Install NGINX" first');
     ctx.assertAllowedPath(NGINX_PROXY_CONF, 'write');
     for (const d of args.domains) if (d.ssl) { ctx.assertAllowedPath(d.ssl.cert, 'read'); ctx.assertAllowedPath(d.ssl.key, 'read'); }
+    let defaultServer = null;
+    let defaultServerSkipped = null;
+    if (args.defaultServer) {
+      ctx.assertAllowedPath(args.defaultServer.cert, 'read');
+      ctx.assertAllowedPath(args.defaultServer.key, 'read');
+      const missing = [args.defaultServer.cert, args.defaultServer.key].filter((f) => !fs.existsSync(f));
+      if (missing.length) defaultServerSkipped = `certificate file missing: ${missing.join(', ')}`;
+      else defaultServer = { cert: args.defaultServer.cert, key: args.defaultServer.key };
+    }
     const usable = args.domains.filter((d) => !d.ssl || (fs.existsSync(d.ssl.cert) && fs.existsSync(d.ssl.key)));
     if (args.cache) ensureCacheDir(ctx);
     const version = await nginxVersion();
     const rejectHandshake = nginxRejectHandshake(version);
-    const defaultCert = rejectHandshake ? null : await ensureDefaultCert(ctx);
+    const defaultCert = rejectHandshake || defaultServer ? null : await ensureDefaultCert(ctx);
     const ipv6 = hostHasIpv6();
-    const content = renderNginxProxy({ ...args, domains: usable, http2Directive: nginxHttp2Directive(version), rejectHandshake, defaultCert, ipv6 });
+    const content = renderNginxProxy({ ...args, domains: usable, http2Directive: nginxHttp2Directive(version), rejectHandshake, defaultCert, defaultServer, ipv6 });
     const backup = writeIni(NGINX_PROXY_CONF, content);
     const previousState = readProxyState();
     const changed = disableStockDefaults(ctx);
@@ -1839,7 +1872,7 @@ defineOp('pkg.nginx.proxy.write', {
     }
     ctx.assertAllowedPath(NGINX_STATE_FILE, 'write');
     writeProxyState({ ...previousState, ...changed });
-    return { path: NGINX_PROXY_CONF, bytes: Buffer.byteLength(content), nginxVersion: version, http2Directive: nginxHttp2Directive(version), ipv6, catchAll: rejectHandshake ? 'reject-handshake' : defaultCert ? 'self-signed' : 'none', domains: usable.length, sslDomains: usable.filter((d) => d.ssl).length, sslNames: usable.filter((d) => d.ssl).reduce((n, d) => n + 1 + (d.aliases?.length || 0), 0), skipped: args.domains.length - usable.length, stockDefaultsDisabled: Object.keys(changed), configtest: test };
+    return { path: NGINX_PROXY_CONF, bytes: Buffer.byteLength(content), nginxVersion: version, http2Directive: nginxHttp2Directive(version), ipv6, catchAll: catchAllMode({ defaultServer, rejectHandshake, defaultCert }), defaultServer, defaultServerSkipped, domains: usable.length, sslDomains: usable.filter((d) => d.ssl).length, sslNames: usable.filter((d) => d.ssl).reduce((n, d) => n + 1 + (d.aliases?.length || 0), 0), skipped: args.domains.length - usable.length, stockDefaultsDisabled: Object.keys(changed), configtest: test };
   },
 });
 

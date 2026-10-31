@@ -109,6 +109,10 @@ export function isPrivateAddress(address) {
 
 // Accepts notify({ event, subject, body, severity, data }) and the shorthand
 // notify('updates.available', payload) other categories use.
+// An HTML alternative rides along as a body part only (email channels); the
+// agent op caps the whole message at 2 MiB.
+const HTML_MAX = 1024 * 1024;
+
 export function normalizeNotification(eventOrMessage, payload) {
   let msg;
   if (typeof eventOrMessage === 'string') {
@@ -124,7 +128,8 @@ export function normalizeNotification(eventOrMessage, payload) {
   let body = msg.body ?? msg.text ?? msg.message;
   if (body != null && typeof body !== 'string') body = JSON.stringify(body, null, 2);
   if (body == null) body = msg.data != null ? JSON.stringify(msg.data, null, 2) : subject;
-  return { event, severity, subject, body: String(body).slice(0, 20_000), data: msg.data ?? null };
+  const html = typeof msg.html === 'string' && msg.html.trim() ? msg.html.slice(0, HTML_MAX) : null;
+  return { event, severity, subject, body: String(body).slice(0, 20_000), data: msg.data ?? null, html };
 }
 
 export function createServerContactsService(ctx) {
@@ -338,28 +343,29 @@ export function createServerContactsService(ctx) {
     return null;
   }
 
-  async function sendMail({ to, subject, body, text, from, headers }, req) {
+  async function sendMail({ to, subject, body, text, html, from, headers }, req) {
     const recipients = (Array.isArray(to) ? to : [to]).map((r) => String(r).trim());
     const bad = recipients.find((r) => !EMAIL_RE.test(r));
     if (bad) throw unprocessable(`"${bad}" is not a usable recipient address`, { to: ['Must be a full email address'] });
     const sender = from && EMAIL_RE.test(from) ? from : fromAddress();
     const cleanSubject = String(subject ?? '').replace(/[\r\n]+/g, ' ').slice(0, 998) || '(no subject)';
     const content = String(body ?? text ?? '');
+    const markup = typeof html === 'string' && html.trim() ? html.slice(0, HTML_MAX) : null;
     const transport = mailTransport();
     if (!transport) throw new CapabilityError('exim', 'Exim is not installed and no SMTP relay is configured, so the panel cannot send email. Install exim4 (Debian/Ubuntu) or exim (RHEL), or configure an SMTP relay in Contact Manager.');
     let result;
     if (transport === 'exim') {
-      result = await agent.op('mail.sendmail', { from: sender, to: recipients, subject: cleanSubject, text: content, ...(headers ? { headers } : {}) }, { req });
+      result = await agent.op('mail.sendmail', { from: sender, to: recipients, subject: cleanSubject, text: content, ...(markup ? { html: markup } : {}), ...(headers ? { headers } : {}) }, { req });
     } else {
       const smtp = smtpConfig();
       try {
-        result = await sendSmtp({ ...smtp, rejectUnauthorized: !smtp.allowSelfSigned, allowPlaintextAuth: smtp.allowPlaintextAuth, from: sender, to: recipients, message: buildMessage({ from: sender, to: recipients, subject: cleanSubject, text: content, headers }), clientName: hostname() });
+        result = await sendSmtp({ ...smtp, rejectUnauthorized: !smtp.allowSelfSigned, allowPlaintextAuth: smtp.allowPlaintextAuth, from: sender, to: recipients, message: buildMessage({ from: sender, to: recipients, subject: cleanSubject, text: content, html: markup, headers }), clientName: hostname() });
       } catch (err) {
         if (err instanceof SmtpError) throw new HttpError(err.code === 'plaintext_auth_refused' ? 422 : 502, err.code === 'plaintext_auth_refused' ? 'plaintext_auth_refused' : 'smtp_failed', `SMTP relay ${smtp.host}:${smtp.port}: ${err.message}`);
         throw err;
       }
     }
-    audit(req, { action: 'contacts.mail.send', target: recipients.join(','), args: { subject: cleanSubject, transport } });
+    audit(req, { action: 'contacts.mail.send', target: recipients.join(','), args: { subject: cleanSubject, transport, html: Boolean(markup) } });
     return { transport, from: sender, to: recipients, accepted: true, ...(transport === 'smtp' ? { response: result.response, tls: result.tls } : {}) };
   }
 
@@ -385,7 +391,7 @@ export function createServerContactsService(ctx) {
     try {
       let transport = row.channel;
       if (row.channel === 'email') {
-        const r = await sendMail({ to: row.address, subject: `[${host}] ${msg.subject}`, body: `${msg.body}${footer}` }, req);
+        const r = await sendMail({ to: row.address, subject: `[${host}] ${msg.subject}`, body: `${msg.body}${footer}`, ...(msg.html ? { html: msg.html } : {}) }, req);
         transport = r.transport;
       } else if (row.channel === 'sms') {
         const r = await sendMail({ to: row.address, subject: msg.subject.slice(0, 60), body: `${msg.severity.toUpperCase()} ${host}: ${msg.subject} — ${msg.body}`.slice(0, 300) }, req);
@@ -473,7 +479,7 @@ export function createServerContactsService(ctx) {
     const base = { contact_name: 'root (system mail)', channel: 'email', address, event: msg.event, severity: msg.severity, subject: msg.subject, test: test ? 1 : 0 };
     try {
       if (r.error) throw new HttpError(422, 'no_root_recipients', r.error);
-      const sent = await sendMail({ to: r.to, subject: `[${host}] ${msg.subject}`, body: `${msg.body}\n\n-- \nWHM on ${host} · event ${msg.event} · severity ${msg.severity}` }, req);
+      const sent = await sendMail({ to: r.to, subject: `[${host}] ${msg.subject}`, body: `${msg.body}\n\n-- \nWHM on ${host} · event ${msg.event} · severity ${msg.severity}`, ...(msg.html ? { html: msg.html } : {}) }, req);
       recordDelivery({ ...base, status: 'sent', transport: sent.transport });
       return { contactId: null, name: base.contact_name, channel: 'email', address, status: 'sent', transport: sent.transport, to: r.to };
     } catch (err) {
@@ -486,7 +492,7 @@ export function createServerContactsService(ctx) {
 
   async function notify(eventOrMessage, payload, req = null) {
     const msg = normalizeNotification(eventOrMessage, payload);
-    if (!settings.get('contacts.enabled', true)) return { ...msg, body: undefined, data: undefined, matched: 0, sent: 0, failed: 0, skipped: 'disabled', deliveries: [] };
+    if (!settings.get('contacts.enabled', true)) return { ...msg, body: undefined, data: undefined, html: undefined, matched: 0, sent: 0, failed: 0, skipped: 'disabled', deliveries: [] };
     const rows = stmts.enabled.all().filter((row) => matches(row, msg));
     const deliveries = [];
     for (const row of rows) deliveries.push(await deliver(row, msg, { req }));

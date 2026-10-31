@@ -280,7 +280,7 @@ export function createSecurityAlertsService(ctx) {
     const mail = renderMail(rows.map(shape), { audience: 'admins', host, panelUrl: panelUrl(), product: productName() });
     let result;
     try {
-      const r = await ctx.contacts?.notify?.(ALERT_EVENT, { subject: mail.subject, body: mail.text, severity: mail.severity, data: { alerts: rows.map((a) => ({ id: a.id, kind: a.kind, severity: a.severity, title: a.title, createdAt: a.created_at })), hostname: host } });
+      const r = await ctx.contacts?.notify?.(ALERT_EVENT, { subject: mail.subject, body: mail.text, html: mail.html, severity: mail.severity, data: { alerts: rows.map((a) => ({ id: a.id, kind: a.kind, severity: a.severity, title: a.title, createdAt: a.created_at })), hostname: host } });
       result = r ? { matched: r.matched ?? 0, sent: r.sent ?? 0, failed: r.failed ?? 0, skipped: r.skipped ?? null, rootMail: r.rootMail ?? null } : { matched: 0, sent: 0, failed: 0, skipped: 'no_contacts_service' };
     } catch (err) {
       result = { matched: 0, sent: 0, failed: 0, error: String(err.message || err).slice(0, 300) };
@@ -338,7 +338,7 @@ export function createSecurityAlertsService(ctx) {
         let status = 'sent';
         let error = null;
         try {
-          await ctx.contacts.mail({ to: address, subject: mail.subject, body: mail.text });
+          await ctx.contacts.mail({ to: address, subject: mail.subject, body: mail.text, html: mail.html });
           summary.sent++;
         } catch (err) {
           status = 'failed';

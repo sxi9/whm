@@ -166,6 +166,14 @@ export const STACK_COMPONENTS = [
     postInstall: [],
   },
   {
+    key: 'rclone', label: 'rclone (cloud storage client)', capability: 'rclone', service: null, recommended: true,
+    description: 'Uploads backups to cloud storage (Google Drive, OneDrive, Dropbox, Azure, Backblaze B2, S3) and encrypts them at rest (Backup › Backup Configuration › Cloud storage).',
+    packages: { debian: ['rclone'], rhel: ['rclone'] },
+    requires: { rhel: EPEL },
+    units: [],
+    postInstall: [],
+  },
+  {
     key: 'git', label: 'Git', capability: 'git', service: null, recommended: true,
     description: 'Version control for deployments and the Application Manager.',
     packages: { debian: ['git'], rhel: ['git'] },

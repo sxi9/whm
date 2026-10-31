@@ -38,6 +38,7 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/var/cache/whm',
   '/opt/whm/runtimes',
   '/etc/fail2ban', '/etc/apt/apt.conf.d', '/etc/dnf/automatic.conf', '/etc/sysctl.d',
+  '/etc/apt/keyrings', '/etc/apt/sources.list.d',
 ];
 
 export function createContext({ allowedRoots = DEFAULT_ALLOWED_ROOTS, principal = null, log = () => {} } = {}) {

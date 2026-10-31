@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import net from 'node:net';
 import tls from 'node:tls';
 import os from 'node:os';
@@ -22,20 +23,44 @@ function encodeHeader(value) {
   return /^[\x20-\x7e]*$/.test(s) ? s : `=?UTF-8?B?${Buffer.from(s, 'utf8').toString('base64')}?=`;
 }
 
-// RFC 5322 text/plain message with CRLF line endings; the same shape the
-// agent's mail.sendmail op hands to Exim so both transports look alike.
-export function buildMessage({ from, to, subject, text, headers = {} }) {
+const crlf = (s) => String(s).replace(/\r?\n/g, '\r\n');
+
+// A boundary that occurs in neither part: a line of the HTML equal to it
+// would otherwise end the part early (the HTML is a body part only, so it can
+// never add a header).
+export function mimeBoundary(...parts) {
+  for (;;) {
+    const boundary = `=_whm_${crypto.randomBytes(16).toString('hex')}`;
+    if (!parts.some((p) => String(p).includes(boundary))) return boundary;
+  }
+}
+
+export function multipartAlternative(text, html) {
+  const boundary = mimeBoundary(text, html);
+  const body = [
+    `--${boundary}`, 'Content-Type: text/plain; charset=utf-8', 'Content-Transfer-Encoding: 8bit', '', crlf(text), '',
+    `--${boundary}`, 'Content-Type: text/html; charset=utf-8', 'Content-Transfer-Encoding: 8bit', '', crlf(html), '',
+    `--${boundary}--`,
+  ].join('\r\n');
+  return { boundary, contentType: `multipart/alternative; boundary="${boundary}"`, body };
+}
+
+// RFC 5322 message with CRLF line endings; the same shape the agent's
+// mail.sendmail op hands to Exim so both transports look alike. text/plain
+// alone, or multipart/alternative (text first, then html) when html is given.
+export function buildMessage({ from, to, subject, text, html, headers = {} }) {
   const recipients = Array.isArray(to) ? to : [to];
+  const mime = html ? multipartAlternative(text, html) : null;
   const lines = [
     `From: ${from}`, `To: ${recipients.join(', ')}`, `Subject: ${encodeHeader(subject)}`, `Date: ${new Date().toUTCString()}`,
     `Message-ID: <${Date.now().toString(36)}.${Math.random().toString(36).slice(2)}@${from.split('@')[1]}>`,
-    'MIME-Version: 1.0', 'Content-Type: text/plain; charset=utf-8', 'Content-Transfer-Encoding: 8bit', 'X-Mailer: WHM panel',
+    'MIME-Version: 1.0', `Content-Type: ${mime ? mime.contentType : 'text/plain; charset=utf-8'}`, 'Content-Transfer-Encoding: 8bit', 'X-Mailer: WHM panel',
   ];
   for (const [k, v] of Object.entries(headers)) {
     if (!/^[A-Za-z][A-Za-z0-9-]{0,63}$/.test(k) || /^(from|to|subject|date|content-type|mime-version|message-id)$/i.test(k)) continue;
     lines.push(`${k}: ${encodeHeader(v)}`);
   }
-  return `${lines.join('\r\n')}\r\n\r\n${String(text).replace(/\r?\n/g, '\r\n')}\r\n`;
+  return `${lines.join('\r\n')}\r\n\r\n${mime ? mime.body : crlf(text)}\r\n`;
 }
 
 // Lines starting with "." are doubled inside DATA (RFC 5321 4.5.2).
