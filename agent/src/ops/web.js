@@ -991,17 +991,22 @@ defineOp('web.vhost.read', {
 });
 
 // ------------------------------------------------------------ default vhost ---
-// The catch-all virtual host: it is loaded before every tenant vhost (the file
-// name sorts first in sites-enabled / conf.d) and lists `_default_` plus every
-// address the tenant vhosts bind to, so a request for the bare address or for a
-// name no vhost claims lands on the landing page instead of the distribution
-// test page or whichever tenant sorts first. Port 443 uses the hostname's
-// certificate when the panel has one, otherwise the first self-signed pair the
-// panel controls (the apache service certificate, the panel listener's pair, or
-// one generated here with openssl). Debian's stock 000-default site is disabled
-// because it also claims `_default_:80`.
+// The catch-all virtual host: it is loaded before every tenant vhost and lists
+// `_default_` plus every address the tenant vhosts bind to, so a request for
+// the bare address or for a name no vhost claims lands on the landing page
+// instead of the distribution test page or whichever tenant sorts first. The
+// ordering is structural, not lexical: a tenant file such as `0-0.com.conf` or
+// `0.io.conf` sorts before any digit-led name, so on Debian the file lives in
+// conf-available/ with a conf-enabled/ link (apache2.conf includes
+// conf-enabled/*.conf before sites-enabled/*.conf), and on RHEL, where
+// conf.d/*.conf is the only glob, the name starts with '+' (0x2B), below '-',
+// '.' and every character a domain may start with. Port 443 uses the
+// hostname's certificate when the panel has one, otherwise the first
+// self-signed pair the panel controls (the apache service certificate, the
+// panel listener's pair, or one generated here with openssl). Debian's stock
+// 000-default site is disabled because it also claims `_default_:80`.
 const DEFAULT_VHOST_MARK = '# whm-default-vhost ';
-export const DEFAULT_VHOST_NAMES = { debian: '000-whm-default', rhel: '00-whm-default' };
+export const DEFAULT_VHOST_NAMES = { debian: '000-whm-default', rhel: '+whm-default' };
 export const DEFAULT_VHOST_SERVER_NAME = 'default.invalid';
 export const DEFAULT_SSL_DIR = '/etc/ssl/whm/default';
 const DEBIAN_STOCK_SITE = '000-default';
@@ -1016,8 +1021,23 @@ export const DEFAULT_SSL_FALLBACKS = [
 export function defaultVhostFile(apache) {
   const name = DEFAULT_VHOST_NAMES[apache.flavor];
   return apache.flavor === 'debian'
-    ? { file: path.join(apache.sitesAvailable, `${name}.conf`), link: path.join(apache.sitesEnabled, `${name}.conf`), name }
+    ? { file: path.join(apache.confAvailable, `${name}.conf`), link: path.join(apache.confEnabled, `${name}.conf`), name }
     : { file: path.join(apache.confD, `${name}.conf`), link: null, name };
+}
+
+// Earlier panels wrote the Debian catch-all as a site (sites-available +
+// sites-enabled); left there it would be a second `_default_` vhost, so a
+// panel-written copy goes whenever the current file is written or removed.
+function dropLegacyDefaultVhost(apache, ctx) {
+  if (apache.flavor !== 'debian' || !apache.sitesAvailable) return null;
+  const file = path.join(apache.sitesAvailable, `${DEFAULT_VHOST_NAMES.debian}.conf`);
+  const link = apache.sitesEnabled ? path.join(apache.sitesEnabled, `${DEFAULT_VHOST_NAMES.debian}.conf`) : null;
+  const text = readText(file);
+  if (text == null || !text.includes(DEFAULT_VHOST_MARK)) return null;
+  ctx.assertAllowedPath(file, 'write');
+  if (link) { ctx.assertAllowedPath(link, 'write'); try { fs.unlinkSync(link); } catch { /* no link */ } }
+  fs.unlinkSync(file);
+  return { path: file, removed: true };
 }
 
 const defaultVhostSchema = z.object({
@@ -1139,7 +1159,8 @@ export async function writeDefaultVhost(apache, v, ctx, { fallbacks = DEFAULT_SS
     await reenableStockSite(apache, stock);
     throw new OpError('config_invalid', `Apache rejected the default virtual host; the previous file was restored: ${lastLine(test.output)}`, { output: test.output, path: file });
   }
-  return { name, path: file, link, logDir, validated: test.ok === true, output: test.output, bytes: Buffer.byteLength(content), ssl: ssl ? { cert: ssl.fullchain || ssl.cert, key: ssl.key, source: ssl.source, generated: Boolean(ssl.generated) } : null, addresses: v.bind ? [v.bind] : v.addresses, stockSite: stock };
+  const legacy = dropLegacyDefaultVhost(apache, ctx);
+  return { name, path: file, link, logDir, validated: test.ok === true, output: test.output, bytes: Buffer.byteLength(content), ssl: ssl ? { cert: ssl.fullchain || ssl.cert, key: ssl.key, source: ssl.source, generated: Boolean(ssl.generated) } : null, addresses: v.bind ? [v.bind] : v.addresses, stockSite: stock, legacy };
 }
 
 export async function removeDefaultVhost(apache, ctx) {
@@ -1150,8 +1171,10 @@ export async function removeDefaultVhost(apache, ctx) {
   if (link) { ctx.assertAllowedPath(link, 'write'); try { fs.unlinkSync(link); } catch { /* none */ } }
   let removed = false;
   if (text != null) { fs.unlinkSync(file); removed = true; dropLegacyBackup(file); }
+  const legacy = dropLegacyDefaultVhost(apache, ctx);
+  if (legacy) removed = true;
   const test = removed ? await configtest(apache) : { ok: null, output: '' };
-  return { path: file, removed, validated: test.ok };
+  return { path: file, removed, validated: test.ok, legacy };
 }
 
 defineOp('web.default_vhost.write', {
@@ -1196,7 +1219,9 @@ defineOp('web.default_vhost.remove', {
 // server's group (0750 <user>:<web group>, the layout account creation uses)
 // through a descriptor that refuses to open a link and that must belong to the
 // account.
-const docrootSchema = z.object({ username: arg.username, docroot: confPath, group: groupName.optional(), index: z.string().max(256 * 1024).regex(/^[^\0]*$/s).optional() }).strict();
+// The index page is a rendered web template: the same 512 KiB the template
+// editor accepts, or a large branded template would stop every domain add.
+const docrootSchema = z.object({ username: arg.username, docroot: confPath, group: groupName.optional(), index: z.string().max(512 * 1024).regex(/^[^\0]*$/s).optional() }).strict();
 const RESERVED_HOME_DIRS = new Set(['public_html', 'mail', 'etc', 'tmp', 'logs', 'ssl', '.ssh']);
 
 function groupEntry(name) {

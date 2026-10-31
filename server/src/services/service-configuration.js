@@ -24,8 +24,8 @@ import { notFound, badRequest, conflict, unprocessable, CapabilityError } from '
 //   web.applyMailserverTls({ minProtocol, cipherList, cipherSuites, preferServerCiphers }, req)       -> ssl-tls presets for Dovecot
 //   web.ensureHostnameVhost(req, { hostname? })      -> the 'server' vhost for the server's own name (branded landing page under
 //                                                       web.landingDocroot); never throws: { applied, reason?, landingPage, defaultVhost }
-//   web.ensureDefaultVhost(req, { hostname? })       -> the catch-all vhost (000-whm-default / 00-whm-default: the landing page for the
-//                                                       bare address and names no site claims, :80 and :443); never throws
+//   web.ensureDefaultVhost(req, { hostname? })       -> the catch-all vhost (Debian conf-enabled/000-whm-default.conf, RHEL conf.d/+whm-default.conf:
+//                                                       the landing page for the bare address and names no site claims, :80 and :443); never throws
 //   web.removeDefaultVhost(req)                      -> delete the catch-all vhost file
 //   web.removeDomain(domain, req)                    -> delete one domain's vhost (file + row), never the hostname's; account-functions
 //                                                       calls it when an addon/sub domain is removed
@@ -340,7 +340,10 @@ export function createServiceConfigService(ctx) {
   // Builds the vhost specs an account needs from accounts + account_domains.
   // Only a row the same account wrote is carried over (certificate, custom
   // directives, IPv6, PHP version): another owner's row, the hostname's
-  // included, is treated as absent.
+  // included, is treated as absent. A tenant is never left on `*:80` while an
+  // address is known (shared, then main, as account creation picks it): the
+  // catch-all names every address, and Apache consults no `*` vhost for a
+  // connection whose address another vhost names.
   function specsFor(account) {
     const home = account.home_dir || `${settings.get('basic.home_root') || '/home'}/${account.username}`;
     const domains = stmts.accountDomains.all(account.id);
@@ -349,7 +352,7 @@ export function createServiceConfigService(ctx) {
     const existing = own(stmts.vhostByDomain.get(account.domain));
     const base = (domain, type, docroot, extraAliases = []) => {
       const prev = own(stmts.vhostByDomain.get(domain));
-      return { domain, accountId: account.id, username: account.username, type, docroot, aliases: extraAliases, ip: account.ip || settings.get('basic.shared_ip') || null, ipv6: prev?.ipv6 ?? existing?.ipv6 ?? null, phpVersion: prev?.php_version ?? null, ssl: json.parse(prev?.ssl_json, null), redirects: json.parse(prev?.redirects_json, []), customDirectives: prev?.custom_directives || '', logDir: domlogDir(account.username) };
+      return { domain, accountId: account.id, username: account.username, type, docroot, aliases: extraAliases, ip: account.ip || settings.get('basic.shared_ip') || settings.get('basic.main_ip') || null, ipv6: prev?.ipv6 ?? existing?.ipv6 ?? null, phpVersion: prev?.php_version ?? null, ssl: json.parse(prev?.ssl_json, null), redirects: json.parse(prev?.redirects_json, []), customDirectives: prev?.custom_directives || '', logDir: domlogDir(account.username) };
     };
     const specs = [base(account.domain, 'main', `${home}/public_html`, aliases)];
     for (const d of domains.filter((x) => ['addon', 'sub'].includes(x.type))) specs.push(base(d.domain, d.type, d.docroot || `${home}/public_html/${d.domain}`));
@@ -491,6 +494,7 @@ export function createServiceConfigService(ctx) {
       } catch (err) { results.push({ domain: spec.domain, applied: false, reason: err.code || 'error', error: err.message }); }
     }
     const reload = await reloadAfter(written, req);
+    if (written) await refreshDefaultVhostAddresses(req);
     audit(req, { action: 'web.vhost.sync', target: account.username, args: { domains: specs.map((s) => s.domain), applied: results.filter((r) => r.applied).length } });
     return { username: account.username, applied: installed && results.every((r) => r.applied), reason: !installed ? 'capability_missing' : results.find((r) => !r.applied)?.reason ?? null, phpVersion, phpVersions: Object.fromEntries(specs.map((s) => [s.domain, s.phpVersion ?? null])), poolErrors, reload, vhosts: results };
   }
@@ -545,10 +549,15 @@ export function createServiceConfigService(ctx) {
 
   // Every address a tenant vhost binds to: the catch-all must list them, since
   // Apache picks the first vhost of the most specific address set and a plain
-  // _default_ never beats an IP-specific tenant vhost for that IP.
+  // _default_ never beats an IP-specific tenant vhost for that IP. The reverse
+  // holds too: a tenant still on `*` (a row written before any address was
+  // known) is never consulted once the catch-all names the connection
+  // address, so while such a row exists the catch-all stays a plain _default_.
   function listenAddresses() {
+    const rows = stmts.vhostsAll.all();
+    if (rows.some((r) => r.type !== 'server' && !r.ip)) return [];
     const set = new Set();
-    for (const r of stmts.vhostsAll.all()) { if (r.ip) set.add(r.ip); if (r.ipv6) set.add(r.ipv6); }
+    for (const r of rows) { if (r.ip) set.add(r.ip); if (r.ipv6) set.add(r.ipv6); }
     for (const key of ['basic.main_ip', 'basic.shared_ip', 'basic.main_ipv6']) { const v = String(settings.get(key, '') || '').trim(); if (v) set.add(v); }
     try { for (const row of db.prepare('SELECT address FROM ip_addresses').all()) if (row.address) set.add(String(row.address)); } catch { /* ip table absent */ }
     return [...set].filter((a) => isIP(a) > 0).sort().slice(0, 64);
@@ -581,6 +590,18 @@ export function createServiceConfigService(ctx) {
       recordApply('default_vhost', false, { hostname: name }, err.message);
       return { hostname: name, applied: false, reason: err.code || 'error', error: err.message, docroot: LANDING_DOCROOT };
     }
+  }
+
+  // Tenant vhosts bind to addresses the catch-all must name (a dedicated IP,
+  // an IPv6, the first explicit address) or the catch-all is shadowed there,
+  // and vice versa: after a vhost write the catch-all follows its address set.
+  async function refreshDefaultVhostAddresses(req) {
+    const last = lastApply('default_vhost');
+    if (!last?.ok || last.summary?.removed || listenPorts().bind) return null;
+    const want = listenAddresses();
+    const have = Array.isArray(last.summary?.addresses) ? last.summary.addresses : [];
+    if (want.length === have.length && want.every((a) => have.includes(a))) return null;
+    return ensureDefaultVhost(req);
   }
 
   async function removeDefaultVhost(req = null) {
@@ -721,21 +742,23 @@ export function createServiceConfigService(ctx) {
     try {
       for (const s of list) { results.push(await writeSpec(s, req, { reload: false })); written++; }
     } finally { await reloadAfter(written, req); }
+    const defaultVhost = await ensureDefaultVhost(req);
     audit(req, { action: 'web.ipv6.set', target: username, args: { address } });
-    return { username, address, vhosts: results };
+    return { username, address, vhosts: results, defaultVhost };
   }
 
   async function replaceIp(from, to, { accounts } = {}, req) {
     let rows = stmts.vhostsByIp.all(from).map(shapeVhost);
     if (accounts?.length) rows = rows.filter((r) => accounts.includes(r.username));
     for (const r of rows) { r.ip = to; storeSpec(r); }
-    if (!rows.length) return { updated: 0, domains: [] };
+    if (!rows.length) return { updated: 0, domains: [], defaultVhost: await refreshDefaultVhostAddresses(req) };
     requireApache();
     let updated = 0;
     for (const r of rows) { try { await writeSpec(r, req, { reload: false }); updated++; } catch (err) { logger.warn({ err, domain: r.domain }, 'web: ip replacement failed'); } }
     await reloadAfter(updated, req);
+    const defaultVhost = await ensureDefaultVhost(req);
     audit(req, { action: 'web.ip.replace', target: `${from} -> ${to}`, args: { updated, domains: rows.map((r) => r.domain) } });
-    return { updated, domains: rows.map((r) => r.domain) };
+    return { updated, domains: rows.map((r) => r.domain), defaultVhost };
   }
 
   // `reload: false` lets a caller batching many domains (MultiPHP Manager)
@@ -763,8 +786,11 @@ export function createServiceConfigService(ctx) {
     let written = 0;
     for (const r of rows) { try { await writeSpec(r, req, { reload: false }); written++; } catch (err) { logger.warn({ err, domain: r.domain }, 'web: vhost port rewrite failed'); } }
     await reloadAfter(written, req);
+    // The catch-all binds to the same ports/address or the first tenant on
+    // them answers the bare address again.
+    const defaultVhost = await ensureDefaultVhost(req);
     audit(req, { action: 'web.ports.set', args: { http, https, bind, vhosts: rows.length } });
-    return { ...result, vhosts: rows.length };
+    return { ...result, vhosts: rows.length, defaultVhost };
   }
 
   async function syncAllJob(job) {

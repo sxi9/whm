@@ -111,7 +111,10 @@ describe('pkg op schemas reject injection before anything runs', () => {
       expect((await opError(runOp('pkg.php.remove', { version: bad }, ctx))).code, bad).toBe('invalid_args');
       expect((await opError(runOp('pkg.php.sources.detect', { branches: [bad] }, ctx))).code, bad).toBe('invalid_args');
     }
-    for (const bad of [...INJECTION, 'ppa:ondrej/php', 'https://packages.sury.org/php/', 'remi-safe', 'SURY']) expect((await opError(runOp('pkg.php.source.enable', { source: bad }, ctx))).code, bad).toBe('invalid_args');
+    for (const bad of [...INJECTION, 'ppa:ondrej/php', 'https://packages.sury.org/php/', 'remi-safe', 'SURY']) {
+      expect((await opError(runOp('pkg.php.source.enable', { source: bad }, ctx))).code, bad).toBe('invalid_args');
+      expect((await opError(runOp('pkg.php.source.rollback', { source: bad }, ctx))).code, bad).toBe('invalid_args');
+    }
     for (const bad of [...INJECTION, 'Curl', 'x'.repeat(33)]) expect((await opError(runOp('pkg.php.install', { version: '8.3', extensions: [bad] }, ctx))).code, bad).toBe('invalid_args');
     expect((await opError(runOp('pkg.php.install', { version: '8.3', purge: true }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('pkg.php.source.enable', { source: 'remi', force: true }, ctx))).code).toBe('invalid_args');

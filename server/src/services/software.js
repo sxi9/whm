@@ -21,9 +21,9 @@ import { PACKAGE_GROUPS, catalogEntries, entryByKey, packagesFor, phpExtensionPa
 //   software.php.systemDefault()                            -> { configured, detected, effective }
 //   software.php.versionForDomain(domain)                   -> { domain, phpVersion, effective, inherited } or null
 //   software.php.setDomainVersion(domains[], version|null, user, req) -> { results, job } (job when more than one domain)
-//   software.php.installable()                              -> { source, stock, versions: [{ version, id, offered, installed, isDefault, inUse, removable }] }
-//   software.php.installVersion(branch, user, req)          -> { job } (enables the family's PHP source when needed, installs, enables FPM)
-//   software.php.removeVersion(id, user, req)               -> { job } (409 for the default or a version domains still use)
+//   software.php.installable()                              -> { source, stock, versions: [{ version, id, offered, installed, isDefault, inUse, usage, removable }] }
+//   software.php.installVersion(branch, user, req)          -> { job } (enables the family's PHP source when needed, installs, enables FPM, keeps the previous default)
+//   software.php.removeVersion(id, user, req)               -> { job } (409 for the default or a version a domain, vhost, pool, package or the Apache pin still uses)
 //   software.nginx.status()                               -> install + proxy state (never throws CapabilityError); stale: true when the
 //                                                              rendered proxy no longer matches the current domains / certificates
 //   software.nginx.sync(req)                                -> re-render the reverse-proxy config from current domains and certificates;
@@ -84,6 +84,11 @@ export const EA4_CATALOG = {
   },
 };
 const EA4_PREFIXES = { debian: ['apache2', 'libapache2-', 'php', 'modsecurity'], rhel: ['httpd', 'mod_', 'php'] };
+// The branches the agent's PHP source catalog (agent/src/ops/pkg.js PHP_BRANCHES)
+// can install; the job also honours the catalog the agent reports.
+export const PHP_BRANCHES = ['7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5'];
+// Job types that take the apt/dnf lock: a second one only fails on it.
+const PACKAGE_MANAGER_JOBS = ['software.php.install', 'software.php.remove', 'software.pkg.install', 'software.pkg.remove', 'software.pkg.update_index', 'software.system.update', 'software.nginx.install', 'software.ea4.build'];
 
 export function compareVersions(a, b) {
   const pa = String(a ?? '').replace(/^v/, '').split(/[.-]/).map((x) => (/^\d+$/.test(x) ? Number(x) : x));
@@ -131,7 +136,6 @@ export function createSoftwareService(ctx) {
     accountDomain: db.prepare('SELECT d.*, a.username, a.owner_id, a.home_dir, a.suspended FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE d.domain = ?'),
     setDomainPhp: db.prepare('UPDATE account_domains SET php_version = ? WHERE domain = ?'),
     insertMainDomain: db.prepare('INSERT INTO account_domains (account_id, domain, type, docroot, php_version) VALUES (?, ?, ?, ?, ?)'),
-    phpUsage: db.prepare('SELECT php_version, COUNT(*) AS n FROM account_domains WHERE php_version IS NOT NULL GROUP BY php_version'),
     phpUsageFor: db.prepare('SELECT COUNT(*) AS n FROM account_domains WHERE php_version = ?'),
     profiles: db.prepare('SELECT * FROM ea4_profiles ORDER BY stock DESC, name'),
     profileById: db.prepare('SELECT * FROM ea4_profiles WHERE id = ?'),
@@ -187,7 +191,13 @@ export function createSoftwareService(ctx) {
     const reason = status.status === 'finished' ? `exited with status ${status.code}` : status.status === 'lost' ? status.error : status.status === 'timeout' ? status.error : status.error || status.status;
     const err = new Error(`${label} ${reason}${status.status === 'finished' ? `: ${output.filter((l) => /^E:|error|fail/i.test(l)).pop() || output[output.length - 1] || 'see the log'}` : ''}`);
     err.run = status;
+    err.started = started;
     throw err;
+  }
+
+  function assertPackageManagerFree() {
+    const active = ['running', 'queued'].flatMap((status) => ctx.jobs.list({ status, limit: 50 })).find((j) => PACKAGE_MANAGER_JOBS.includes(j.type));
+    if (active) throw conflict(`Job #${active.id} (${active.type}) is ${active.status} and holds the package manager; wait for it to finish`);
   }
 
   // --- distro packages -----------------------------------------------------
@@ -771,14 +781,17 @@ export function createSoftwareService(ctx) {
       let installed = { versions: [], defaultId: null, effectiveDefault: null };
       if (capabilities.has('php')) { try { installed = await php.versions(); } catch (err) { logger.warn({ err }, 'php detection failed'); } }
       const byId = new Map(installed.versions.map((v) => [v.id, v]));
-      const inUse = Object.fromEntries(stmts.phpUsage.all().map((r) => [r.php_version, r.n]));
       const effectiveDefault = installed.effectiveDefault ?? installed.defaultId ?? null;
-      const shape = (v, found) => ({
-        version: v.version, id: v.id, label: found?.label ?? `PHP ${v.version}`, offered: Boolean(v.offered), installed: Boolean(found) || Boolean(v.installed), installedVersion: found?.version ?? v.installedVersion ?? null,
-        candidate: v.candidate ?? null, source: v.source ?? null, fpmUnit: found?.fpmUnit ?? v.fpmUnit ?? null, layout: found?.layout ?? null, stock: Boolean(detect.stock) && detect.stock === v.version,
-        isDefault: Boolean(found) && found.id === effectiveDefault, isCliDefault: Boolean(found?.isDefault), inUse: inUse[v.id] ?? 0, advisories: found?.advisories ?? [],
-        removable: Boolean(found) && found.id !== effectiveDefault && !found.isDefault && !(inUse[v.id] ?? 0) && ['debian', 'remi'].includes(found.layout) && Boolean(branchOf(found)),
-      });
+      const shape = (v, found) => {
+        const usage = phpUsageOf(v.id, found ? branchOf(found) : v.version);
+        const blocker = found ? phpRemovalReason(found, effectiveDefault, usage) : null;
+        return {
+          version: v.version, id: v.id, label: found?.label ?? `PHP ${v.version}`, offered: Boolean(v.offered), installed: Boolean(found) || Boolean(v.installed), installedVersion: found?.version ?? v.installedVersion ?? null,
+          candidate: v.candidate ?? null, source: v.source ?? null, fpmUnit: found?.fpmUnit ?? v.fpmUnit ?? null, layout: found?.layout ?? null, stock: Boolean(detect.stock) && detect.stock === v.version,
+          isDefault: Boolean(found) && found.id === effectiveDefault, isCliDefault: Boolean(found?.isDefault), inUse: usage.total, usage, inUseDetail: usage.total ? describeUsage(usage) : null, advisories: found?.advisories ?? [],
+          removable: Boolean(found) && !blocker && ['debian', 'remi'].includes(found.layout) && Boolean(branchOf(found)),
+        };
+      };
       const versions = detect.versions.map((v) => shape(v, byId.get(v.id)));
       // Installed trees outside the branch catalog (ea-php*, rh-php*, the stock RHEL php) are listed read-only.
       for (const found of installed.versions) if (!versions.some((x) => x.id === found.id)) versions.push(shape({ version: branchOf(found) ?? found.version?.match(/^\d\.\d/)?.[0] ?? found.id, id: found.id, offered: false, installed: true }, found));
@@ -787,11 +800,13 @@ export function createSoftwareService(ctx) {
     },
     async installVersion(version, user, req) {
       requirePkg();
+      if (!PHP_BRANCHES.includes(version)) throw unprocessable(`PHP ${version} is not a branch the panel can install`, { version: [`One of ${PHP_BRANCHES.join(', ')}`] });
       if (capabilities.has('php')) {
         const [{ versions }, fam] = await Promise.all([php.versions(), family()]);
         const id = fam === 'debian' ? version : `php${version.replace('.', '')}`;
         if (versions.some((v) => v.id === id)) throw conflict(`PHP ${version} is already installed on this server (${id})`);
       }
+      assertPackageManagerFree();
       const job = enqueue('software.php.install', { version }, user);
       req?.audit?.({ action: 'software.php.install', target: version, args: { version, jobId: job.id } });
       return { job, version };
@@ -799,16 +814,33 @@ export function createSoftwareService(ctx) {
     async installJob(job) {
       const { version } = job.params;
       job.progress(3, 'checking package sources');
+      let before = null;
+      if (capabilities.has('php')) { try { before = await php.versions(); } catch (err) { job.log(`php detection before the install: ${err.message}`, 'warn'); } }
       let detect = await job.agent.op('pkg.php.sources.detect', { branches: [version] });
       const host = `${detect.os?.name || detect.family}${detect.os?.codename ? ` (${detect.os.codename})` : ''}`;
       job.log(`${host}: PHP source ${detect.source.label || 'none'} is ${detect.source.configured ? 'configured' : 'not configured'}; stock branch ${detect.stock || 'unknown'}`);
       let entry = detect.versions[0];
       let sourceEnabled = false;
       if (!entry?.offered) {
+        if (Array.isArray(detect.branches) && !detect.branches.includes(version)) throw new Error(`PHP ${version} is not a branch ${detect.source.label || 'any PHP package source'} publishes; nothing was enabled`);
         if (!detect.source.key || !detect.source.supported) throw new Error(`PHP ${version} is not offered by the configured repositories and no PHP package source is available for this host${detect.source.reason ? ` (${detect.source.reason})` : ''}`);
         if (detect.source.configured) throw new Error(`PHP ${version} is not offered by ${detect.source.label} for ${host}`);
         job.progress(10, `enabling ${detect.source.label}`);
-        const enabled = await runLongOp(job, 'pkg.php.source.enable', { source: detect.source.key }, `enable ${detect.source.label}`);
+        let enabled;
+        try {
+          enabled = await runLongOp(job, 'pkg.php.source.enable', { source: detect.source.key }, `enable ${detect.source.label}`);
+        } catch (err) {
+          // The detached refresh failed after the entry was written: apt would
+          // fail on it from now on, so the agent removes it again.
+          if (err.started?.changed) {
+            job.log(`${detect.source.label}: the package index could not be refreshed; removing its entry again`, 'warn');
+            try {
+              const rb = await job.agent.op('pkg.php.source.rollback', { source: detect.source.key });
+              for (const step of rb.steps || []) job.log(`rollback: ${step.step}${step.path ? ` (${step.path})` : ''}`);
+            } catch (rbErr) { job.log(`rollback failed: ${rbErr.message}; remove the ${detect.source.label} entry by hand`, 'error'); }
+          }
+          throw err;
+        }
         for (const step of enabled.steps || []) job.log(`${step.step}: ${step.ok ? 'ok' : `failed${step.output ? ` (${step.output})` : ''}`}`, step.ok ? 'info' : 'warn');
         sourceEnabled = Boolean(enabled.changed);
         detect = await job.agent.op('pkg.php.sources.detect', { branches: [version] });
@@ -828,31 +860,32 @@ export function createSoftwareService(ctx) {
       job.log(`${result.fpmUnit}: ${unit.enabled ? 'enabled and started' : `could not be enabled: ${unit.note}`}`, unit.enabled ? 'info' : 'warn');
       job.progress(90, 'refreshing detection');
       await refreshPhpDetection(job);
+      const defaultKept = await keepPreviousDefault(job, before);
       job.progress(100, 'done');
-      return { version, id: result.id, packages: result.packages, skipped: result.skipped ?? [], fpmUnit: result.fpmUnit, unitEnabled: unit.enabled, source: detect.source.key, sourceEnabled };
+      return { version, id: result.id, packages: result.packages, skipped: result.skipped ?? [], fpmUnit: result.fpmUnit, unitEnabled: unit.enabled, source: detect.source.key, sourceEnabled, defaultKept };
     },
     async removeVersion(id, user, req) {
       requirePkg();
-      const { versions, effectiveDefault } = await php.versions();
-      const entry = versions.find((v) => v.id === id);
+      const { entry, version, reason } = await phpRemovalCheck(id);
       if (!entry) throw notFound(`PHP version "${id}"`);
-      if (entry.id === effectiveDefault) throw conflict(`PHP ${id} is the system default; make another version the default before removing it`);
-      if (entry.isDefault) throw conflict(`PHP ${id} is what /usr/bin/php resolves to (CLI default); make another version the default before removing it`);
-      const used = stmts.phpUsageFor.get(id).n;
-      if (used) throw conflict(`PHP ${id} is still used by ${used} domain(s); move them to another version first`);
-      const version = branchOf(entry);
+      if (reason) throw conflict(reason);
       if (!version || !['debian', 'remi'].includes(entry.layout)) throw unprocessable(`PHP ${id} was not installed as a versioned package set and cannot be removed from here`, { id: ['Only php8.x-* (Debian/Ubuntu) and Remi php8x-php-* sets can be removed'] });
+      assertPackageManagerFree();
       const job = enqueue('software.php.remove', { id, version }, user);
       req?.audit?.({ action: 'software.php.remove', target: id, args: { version, jobId: job.id } });
       return { job, id, version };
     },
     async removeJob(job) {
       const { id, version } = job.params;
-      // Re-checked here: a domain may have been moved onto it since the request.
-      const used = stmts.phpUsageFor.get(id).n;
-      if (used) throw new Error(`PHP ${id} is now used by ${used} domain(s); nothing was removed`);
+      // The same guards as the request: the default or a pin may have moved
+      // onto this version while the job waited in the queue.
+      const { entry, reason } = await phpRemovalCheck(id, { recheck: true });
+      if (!entry) throw new Error(`PHP ${id} is no longer installed; nothing was removed`);
+      if (reason) throw new Error(`${reason} (nothing was removed)`);
       job.progress(10, `removing PHP ${version}`);
-      const result = await runLongOp(job, 'pkg.php.remove', { version }, `PHP ${version} removal`);
+      // purge: dpkg keeps /etc/php/X.Y/fpm/pool.d on a plain remove, and the
+      // web category would still offer that tree as a pool target.
+      const result = await runLongOp(job, 'pkg.php.remove', { version, purge: true }, `PHP ${version} removal`);
       job.log(`removed ${result.packages.length} package(s): ${result.packages.join(', ')}`);
       job.progress(90, 'refreshing detection');
       await refreshPhpDetection(job);
@@ -865,6 +898,81 @@ export function createSoftwareService(ctx) {
   function branchOf(entry) {
     const m = String(entry?.id ?? '').match(/^(\d)\.(\d)$/) || String(entry?.id ?? '').match(/^php(\d)(\d)$/);
     return m ? `${m[1]}.${m[2]}` : null;
+  }
+  // The branch a stored pin ('8.3', 'php83', 'ea-php83') renders with: the web
+  // category normalises every pin the same way before it picks the FPM tree.
+  const branchOfPin = (value) => {
+    const m = String(value ?? '').match(/^(?:ea-)?php(\d)(\d{1,2})$/) || String(value ?? '').match(/^(\d)\.(\d{1,2})$/);
+    return m ? `${m[1]}.${m[2]}` : null;
+  };
+  const tableExists = (name) => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
+  // Every store that pins a branch to something the web server renders:
+  // explicit per-domain choices, vhosts and pools the web category rendered,
+  // hosting packages and the plan snapshot accounts carry (applied by account
+  // creation and Modify Account), and Apache Configuration's web default.
+  function phpUsageOf(id, branch) {
+    const usage = { domains: stmts.phpUsageFor.get(id).n, vhosts: 0, pools: 0, packages: [], accounts: 0, apachePin: false, total: 0 };
+    const pins = (value) => value === id || (Boolean(branch) && branchOfPin(value) === branch);
+    if (branch) {
+      if (tableExists('web_vhosts')) usage.vhosts = db.prepare('SELECT COUNT(*) AS n FROM web_vhosts WHERE php_version = ? AND domain NOT IN (SELECT domain FROM account_domains WHERE php_version = ?)').get(branch, id).n;
+      if (tableExists('web_php_pools')) usage.pools = db.prepare('SELECT COUNT(*) AS n FROM web_php_pools WHERE version = ?').get(branch).n;
+    }
+    usage.packages = db.prepare('SELECT name FROM packages WHERE php_version IS NOT NULL ORDER BY name').all().filter((p) => pins(p.php_version)).map((p) => p.name);
+    usage.accounts = db.prepare("SELECT json_extract(plan_snapshot_json, '$.php_version') AS v, COUNT(*) AS n FROM accounts GROUP BY v").all().filter((r) => r.v && pins(r.v)).reduce((n, r) => n + r.n, 0);
+    const apache = ctx.web?.apache?.settings?.()?.defaultPhpVersion ?? null;
+    usage.apachePin = Boolean(apache) && pins(apache);
+    usage.total = usage.domains + usage.vhosts + usage.pools + usage.packages.length + usage.accounts + (usage.apachePin ? 1 : 0);
+    return usage;
+  }
+  function describeUsage(u) {
+    const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+    return [
+      u.domains ? plural(u.domains, 'domain') : null,
+      u.vhosts ? plural(u.vhosts, 'rendered vhost') : null,
+      u.pools ? plural(u.pools, 'PHP-FPM pool') : null,
+      u.packages.length ? `${u.packages.length === 1 ? 'package' : 'packages'} ${u.packages.slice(0, 3).map((n) => `'${n}'`).join(', ')}${u.packages.length > 3 ? ` and ${u.packages.length - 3} more` : ''}` : null,
+      u.accounts ? `${plural(u.accounts, 'account')} whose plan pins it` : null,
+      u.apachePin ? "Apache Configuration's web default" : null,
+    ].filter(Boolean).join(', ');
+  }
+  function phpRemovalReason(entry, effectiveDefault, usage, { recheck = false } = {}) {
+    if (entry.id === effectiveDefault) return `PHP ${entry.id} is the system default; make another version the default before removing it`;
+    if (entry.isDefault) return `PHP ${entry.id} is what /usr/bin/php resolves to (CLI default); make another version the default before removing it`;
+    if (usage.total) return `PHP ${entry.id} is ${recheck ? 'now' : 'still'} used by ${describeUsage(usage)}; move them to another version first`;
+    return null;
+  }
+  async function phpRemovalCheck(id, opts) {
+    const { versions, effectiveDefault } = await php.versions();
+    const entry = versions.find((v) => v.id === id);
+    if (!entry) return { entry: null, version: null, usage: null, reason: null };
+    const version = branchOf(entry);
+    const usage = phpUsageOf(id, version);
+    return { entry, version, usage, reason: phpRemovalReason(entry, effectiveDefault, usage, opts) };
+  }
+  // A newer branch's php-cli postinst registers /usr/bin/php with a higher
+  // alternatives priority, so an install in auto mode moves the CLI to it and,
+  // while php.default_version names nothing installed, the panel's effective
+  // default (new accounts, inherited domains) would follow. The branch that
+  // was the default before stays it.
+  async function keepPreviousDefault(job, before) {
+    if (!before?.effectiveDefault) return null;
+    let after;
+    try { after = await job.agent.op('pkg.php.versions'); } catch (err) { job.log(`php detection after the install: ${err.message}`, 'warn'); return null; }
+    const ids = after.versions.map((v) => v.id);
+    const out = { effectiveDefault: before.effectiveDefault, pinned: false, cliRestored: false };
+    if (!ids.includes(S('php.default_version', null)) && ids.includes(before.effectiveDefault)) {
+      settings.set('php.default_version', before.effectiveDefault);
+      out.pinned = true;
+      job.log(`system default pinned to PHP ${before.effectiveDefault} (it was only inherited from /usr/bin/php before)`);
+    }
+    if (before.defaultId && after.defaultId !== before.defaultId && ids.includes(before.defaultId)) {
+      try {
+        await job.agent.op('pkg.php.default.set', { version: before.defaultId });
+        out.cliRestored = true;
+        job.log(`/usr/bin/php moved to PHP ${after.defaultId} with the install; pointed back at PHP ${before.defaultId}`);
+      } catch (err) { job.log(`/usr/bin/php now resolves to PHP ${after.defaultId} and could not be pointed back at PHP ${before.defaultId}: ${err.message}`, 'warn'); }
+    }
+    return out;
   }
   // The stack catalog's php component, as the suffixes the agent turns into php8.3-<x> / php83-php-<x>.
   function phpExtensionsFor(fam) {

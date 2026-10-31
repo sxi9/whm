@@ -130,6 +130,8 @@ export function createAccountFunctionsService(ctx) {
     domainByName: db.prepare('SELECT * FROM account_domains WHERE domain = ?'),
     insertDomain: db.prepare('INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, ?, ?, ?)'),
     deleteDomain: db.prepare('DELETE FROM account_domains WHERE id = ?'),
+    hostedBy: db.prepare('SELECT id, username, owner_id FROM accounts WHERE domain = ? UNION SELECT a.id, a.username, a.owner_id FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE d.domain = ?'),
+    accountById: db.prepare('SELECT id, username, owner_id FROM accounts WHERE id = ?'),
     setIp: db.prepare("UPDATE accounts SET ip = ?, updated_at = datetime('now') WHERE id = ?"),
     setBandwidthLimit: db.prepare("UPDATE accounts SET bandwidth_limit_mb = ?, updated_at = datetime('now') WHERE id = ?"),
     resetBandwidth: db.prepare("UPDATE accounts SET bandwidth_used_mb = 0, updated_at = datetime('now') WHERE id = ?"),
@@ -854,10 +856,55 @@ export function createAccountFunctionsService(ctx) {
     if (!docroot.startsWith(`${home}/`)) throw unprocessable(`The document root must be inside the account home ${home}`, { docroot: [`Must start with ${home}/`] });
     const rel = docroot.slice(home.length + 1);
     if (RESERVED_SUBDIRS.includes(rel)) throw unprocessable(`${docroot} is the account's ${rel} directory; choose a directory of its own`, { docroot: ['Reserved directory'] });
-    const taken = accountDomainRows(account).find((d) => d.docroot === docroot && d.domain !== domain && !['parked', 'alias'].includes(d.type));
+    const others = accountDomainRows(account).filter((d) => d.docroot && d.domain !== domain && !['parked', 'alias'].includes(d.type));
+    const taken = others.find((d) => d.docroot === docroot);
     if (taken) throw conflict(`${docroot} is already the document root of ${taken.domain}`);
+    // A directory holding another domain's document root would serve that
+    // site's files and could never be deleted with this domain; a directory
+    // below another site's root (the public_html layout) is allowed.
+    const inside = others.find((d) => d.docroot.startsWith(`${docroot}/`));
+    if (inside) throw conflict(`${docroot} contains the document root of ${inside.domain} (${inside.docroot}); choose a directory of its own`);
     return docroot;
   }
+
+  // A name hosted by an account (its main, addon, sub or parked domain, or
+  // any label under one) is only that account's to claim, nothing under the
+  // server hostname is a tenant's, and a zone another account owns is never
+  // handed over: DNS Functions' parkDomain rule, applied to every domain type
+  // before any host step. Root may still move a name between accounts.
+  function accountHosting(domain) {
+    const labels = domain.split('.');
+    for (let i = 0; i < labels.length - 1; i++) {
+      const candidate = labels.slice(i).join('.');
+      const row = stmts.hostedBy.get(candidate, candidate);
+      if (row) return row;
+    }
+    return null;
+  }
+
+  function ownedZoneOf(domain) {
+    let zone = null;
+    try { zone = typeof ctx.dns?.zoneFor === 'function' ? ctx.dns.zoneFor(domain) : null; } catch { zone = null; }
+    return zone && zone.domain === domain && zone.account_id != null ? zone : null;
+  }
+
+  function assertClaimable(domain, account, user) {
+    if (isRoot(user)) return;
+    const host = hostname();
+    if (domain === host || domain.endsWith(`.${host}`)) throw forbidden(`${domain} is under the server hostname ${host}; only the server administrator can host names there`);
+    const hosted = accountHosting(domain);
+    if (hosted && hosted.id !== account.id) throw forbidden(hosted.owner_id !== user.id ? 'That domain belongs to another reseller\'s account' : `${domain} is under a domain hosted by account ${hosted.username}; only root can assign it to another account`);
+    const zone = ownedZoneOf(domain);
+    if (zone && zone.account_id !== account.id) {
+      const owner = stmts.accountById.get(zone.account_id);
+      throw forbidden(owner && owner.owner_id === user.id ? `The DNS zone ${domain} belongs to account ${owner.username}; only root can assign it to another account` : 'The DNS zone for that domain belongs to another reseller\'s account');
+    }
+  }
+
+  // parkDomain/unparkDomain answer web as 'applied', 'pending' or 'failed: <why>'.
+  const webStepOf = (web, webDetail, fallback) => (typeof web === 'string' && web.startsWith('failed')
+    ? { status: 'failed', detail: typeof webDetail === 'string' && webDetail ? webDetail : web.replace(/^failed:?\s*/, '') || web }
+    : { status: web === true || web === 'applied' ? 'applied' : web === false ? 'skipped' : 'pending', detail: typeof webDetail === 'string' ? webDetail : webDetail?.reason || fallback });
 
   function shapeDomain(account, row, { vhost = null } = {}) {
     let ssl = null;
@@ -896,6 +943,7 @@ export function createAccountFunctionsService(ctx) {
       if (domain.startsWith('www.')) throw unprocessable('Add the domain without "www."; every site answers for its www. name too', { domain: ['Drop the www. prefix'] });
       if (typeof ctx.web?.isServerName === 'function' ? ctx.web.isServerName(domain) : [hostname(), `www.${hostname()}`].includes(domain)) throw conflict(`${domain} is the server hostname; it cannot be hosted by an account`);
       if (db.prepare('SELECT 1 FROM account_domains WHERE domain = ? UNION SELECT 1 FROM accounts WHERE domain = ?').get(domain, domain)) throw conflict(`${domain} is already hosted on this server`);
+      assertClaimable(domain, account, user);
       const plan = json.parse(account.plan_snapshot_json, {});
       const limit = plan[LIMIT_KEY[type]];
       const used = accountDomainRows(account).filter((d) => (type === 'parked' ? ['parked', 'alias'] : [type]).includes(d.type)).length;
@@ -911,7 +959,7 @@ export function createAccountFunctionsService(ctx) {
         }
         const parked = await ctx.dns.parkDomain({ domain, account: username, createZone: true }, user, req);
         steps.dns = parked.zone ? { status: parked.zone.applied ? 'applied' : 'pending', detail: parked.zone.applied ? `zone ${domain} published` : 'zone recorded; published once BIND is installed' } : { status: 'skipped', detail: 'zone already existed' };
-        steps.web = { status: parked.web === true || parked.web === 'applied' ? 'applied' : parked.web === false ? 'skipped' : 'pending', detail: typeof parked.webDetail === 'string' ? parked.webDetail : parked.webDetail?.reason || `alias added to the ${account.domain} virtual host` };
+        steps.web = webStepOf(parked.web, parked.webDetail, `alias added to the ${account.domain} virtual host`);
         audit(req, { action: 'account.domain.add', target: domain, args: { username, type, docroot: parked.docroot, steps: Object.fromEntries(Object.entries(steps).map(([k, v]) => [k, v.status])) } });
         return { domain, type, docroot: parked.docroot, username, steps, entry: shapeDomain(account, stmts.domainByName.get(domain)) };
       }
@@ -926,7 +974,7 @@ export function createAccountFunctionsService(ctx) {
       } else steps.docroot = { status: 'skipped', detail: 'no Linux user for this account; the directory is created once it exists' };
       stmts.insertDomain.run(account.id, domain, type, docroot);
       steps.web = await stepOf(syncWeb(account, req));
-      steps.dns = await stepOf(provisionDns(account, domain, type, req));
+      steps.dns = await stepOf(provisionDns(account, domain, type, user, req));
       steps.mail = await stepOf(routeMail(domain, 'local', req));
       steps.ssl = await stepOf(issueSsl(account, domain, autossl, user, req));
       audit(req, { action: 'account.domain.add', target: domain, args: { username, type, docroot, parent, steps: Object.fromEntries(Object.entries(steps).map(([k, v]) => [k, v.status])) } });
@@ -945,7 +993,7 @@ export function createAccountFunctionsService(ctx) {
         if (typeof ctx.dns?.unparkDomain === 'function') {
           const r = await ctx.dns.unparkDomain(domain, { removeZone: true }, user, req);
           steps.dns = { status: r.zoneRemoved ? 'applied' : 'skipped', detail: r.zoneRemoved ? 'zone removed' : 'no zone to remove' };
-          steps.web = { status: r.web === true || r.web === 'applied' ? 'applied' : 'pending', detail: typeof r.webDetail === 'string' ? r.webDetail : r.webDetail?.reason || 'alias removed' };
+          steps.web = webStepOf(r.web, r.webDetail, 'alias removed');
         } else {
           stmts.deleteDomain.run(row.id);
           steps.web = await stepOf(syncWeb(account, req));
@@ -957,12 +1005,17 @@ export function createAccountFunctionsService(ctx) {
       try { cert = ctx.ssl?.certForDomain?.(domain) ?? null; } catch { cert = null; }
       if (cert && typeof ctx.ssl?.uninstall === 'function') steps.ssl = await stepOf(ctx.ssl.uninstall(domain, user, req).then((r) => ({ status: 'applied', detail: `certificate removed (${r.web})` })));
       steps.web = await stepOf(typeof ctx.web?.removeDomain === 'function' ? ctx.web.removeDomain(domain, req).then((r) => ({ status: r.applied ? 'applied' : 'pending', detail: r.removed ? 'virtual host removed' : r.recorded ? 'virtual host row removed; the file was not there' : 'nothing to remove' })) : Promise.resolve({ status: 'skipped', detail: 'Service Configuration is not loaded' }));
-      steps.dns = await stepOf(removeDns(domain, row.type, user, req));
+      steps.dns = await stepOf(removeDns(account, domain, row.type, user, req));
       steps.mail = await stepOf(routeMail(domain, 'remote', req));
       stmts.deleteDomain.run(row.id);
-      const shared = accountDomainRows(account).some((d) => d.docroot === row.docroot) || !row.docroot || row.docroot === `${homeOf(account)}/public_html`;
+      // The directory goes only when no other domain of the account lives in
+      // it: a document root equal to it or anywhere below it (rm -rf would take
+      // that site too), public_html included.
+      const mainDocroot = `${homeOf(account)}/public_html`;
+      const holds = (dir) => Boolean(row.docroot && dir && (dir === row.docroot || dir.startsWith(`${row.docroot}/`)));
+      const shared = !row.docroot || holds(mainDocroot) || accountDomainRows(account).some((d) => holds(d.docroot || (d.type === 'main' ? mainDocroot : null)));
       if (deleteFiles) {
-        if (shared) steps.files = { status: 'skipped', detail: `${row.docroot || 'the document root'} is shared with another domain of the account and was kept` };
+        if (shared) steps.files = { status: 'skipped', detail: `${row.docroot || 'the document root'} is, or holds, the document root of another domain of the account and was kept` };
         else if (account.uid == null) steps.files = { status: 'skipped', detail: 'no Linux user for this account' };
         else steps.files = await stepOf(op('web.docroot.remove', { username, docroot: row.docroot }, req).then((r) => ({ status: 'applied', detail: r.removed ? `${row.docroot} removed` : `${row.docroot} was already gone` })));
       } else steps.files = { status: 'skipped', detail: `${row.docroot || 'the document root'} was kept` };
@@ -979,12 +1032,17 @@ export function createAccountFunctionsService(ctx) {
     return { status: 'failed', detail: r.vhosts?.find((v) => !v.applied)?.error || r.reason || 'virtual host not written' };
   }
 
-  async function provisionDns(account, domain, type, req) {
+  // A record only ever lands in a zone of the same account (root may use any);
+  // a zone of that exact name another account owns is never reassigned here.
+  async function provisionDns(account, domain, type, user, req) {
     if (!ctx.dns) return { status: 'skipped', detail: 'DNS Functions is not loaded' };
     const ip = account.ip || settings.get('basic.main_ip', '') || settings.get('basic.shared_ip', '') || null;
     const nameservers = ctx.resellers?.nameserversFor?.(account.owner_id) ?? [];
-    const containing = type === 'sub' && typeof ctx.dns.zoneFor === 'function' ? ctx.dns.zoneFor(domain) : null;
-    if (containing && containing.domain !== domain) {
+    const containing = typeof ctx.dns.zoneFor === 'function' ? ctx.dns.zoneFor(domain) : null;
+    const foreign = Boolean(containing) && containing.account_id != null && containing.account_id !== account.id && !isRoot(user);
+    if (containing && containing.domain === domain && foreign) return { status: 'failed', detail: `the DNS zone ${domain} belongs to another account and was left untouched`, code: 'forbidden', zone: domain };
+    if (type === 'sub' && containing && containing.domain !== domain) {
+      if (foreign || (containing.account_id == null && !isRoot(user))) return { status: 'skipped', detail: `${domain} falls in zone ${containing.domain}, which belongs to another account and was left untouched; add the record there or create a zone for ${domain} in DNS Functions`, zone: containing.domain };
       if (!ip) return { status: 'skipped', detail: 'no IP address to publish' };
       const r = await ctx.dns.upsertRecords(containing.domain, domain, 'A', [{ value: ip }], req);
       return { status: r?.applied === false ? 'pending' : 'applied', detail: `${domain} A ${ip} in zone ${containing.domain}${r?.applied === false ? ' (published once BIND is installed)' : ''}`, zone: containing.domain };
@@ -995,12 +1053,13 @@ export function createAccountFunctionsService(ctx) {
     return { status: 'applied', detail: r.created === false ? 'zone already existed and now belongs to this account' : `zone ${domain} recorded`, zone: domain };
   }
 
-  async function removeDns(domain, type, user, req) {
+  async function removeDns(account, domain, type, user, req) {
     if (!ctx.dns) return { status: 'skipped', detail: 'DNS Functions is not loaded' };
     const containing = typeof ctx.dns.zoneFor === 'function' ? ctx.dns.zoneFor(domain) : null;
     if (!containing) return { status: 'skipped', detail: 'no zone holds this name' };
     if (containing.domain === domain) { await ctx.dns.deleteZone(domain, user, req); return { status: 'applied', detail: `zone ${domain} removed` }; }
     if (type !== 'sub') return { status: 'skipped', detail: `${domain} lives in zone ${containing.domain}, which was kept` };
+    if (containing.account_id !== account.id && !isRoot(user)) return { status: 'skipped', detail: `${domain} falls in zone ${containing.domain}, which belongs to another account and was left untouched` };
     await ctx.dns.upsertRecords(containing.domain, domain, 'A', [], req);
     return { status: 'applied', detail: `${domain} A records removed from zone ${containing.domain}` };
   }

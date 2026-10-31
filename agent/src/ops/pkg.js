@@ -1173,13 +1173,15 @@ export function phpPackageNames(family, version, extensions) {
 
 // `apt-cache policy a b c` prints one block per known package; the origin of
 // the candidate is the first repository line under its entry in the version
-// table (never the dpkg status line). Unknown packages print nothing.
+// table (never the dpkg status line), and `versions` keeps every entry of the
+// table with its first repository, highest version first as apt prints them.
+// Unknown packages print nothing.
 export function parseAptPolicyBlocks(stdout) {
   const out = {};
   let current = null; let inTable = false; let entryVersion = null;
   for (const raw of stdout.split('\n')) {
     const header = raw.match(/^(\S+):$/);
-    if (header) { current = { installed: null, candidate: null, origin: null }; out[header[1]] = current; inTable = false; entryVersion = null; continue; }
+    if (header) { current = { installed: null, candidate: null, origin: null, versions: [] }; out[header[1]] = current; inTable = false; entryVersion = null; continue; }
     if (!current) continue;
     const inst = raw.match(/^\s+Installed:\s*(.+)$/);
     if (inst) { current.installed = inst[1].trim() === '(none)' ? null : inst[1].trim(); continue; }
@@ -1190,7 +1192,9 @@ export function parseAptPolicyBlocks(stdout) {
     const entry = raw.match(/^\s+(?:\*\*\*\s+)?(\S+)\s+-?\d+\s*$/);
     if (entry) { entryVersion = entry[1]; continue; }
     const src = raw.match(/^\s+-?\d+\s+(\S+)/);
-    if (src && entryVersion === current.candidate && !current.origin && !src[1].startsWith('/')) current.origin = src[1];
+    if (!src || !entryVersion || src[1].startsWith('/')) continue;
+    if (current.versions.at(-1)?.version !== entryVersion) current.versions.push({ version: entryVersion, origin: src[1] });
+    if (entryVersion === current.candidate && !current.origin) current.origin = src[1];
   }
   return out;
 }
@@ -1260,18 +1264,19 @@ function classifyOrigin(origin, source) {
   return 'distro';
 }
 
-// Active (uncommented) lines of every apt source file; deb822 .sources included.
+// Active (uncommented) lines of every apt source file. A deb822 stanza (blank
+// line separated) is dropped as a whole when it carries `Enabled: no`, which
+// add-apt-repository and software-properties append after the URIs line.
 function aptSourcesText() {
   const files = [path.join(aptRoot(), 'sources.list'), ...safeReaddir(path.join(aptRoot(), 'sources.list.d')).map((f) => path.join(aptRoot(), 'sources.list.d', f))];
   const lines = [];
   for (const file of files) {
     let text = '';
     try { if (fs.lstatSync(file).isFile()) text = fs.readFileSync(file, 'utf8'); } catch { continue; }
-    let disabled = false;
-    for (const line of text.split('\n')) {
-      if (/^\s*Enabled:\s*no\b/i.test(line)) disabled = true;
-      if (line.trim() === '') disabled = false;
-      if (!disabled && !/^\s*#/.test(line)) lines.push(line);
+    for (const stanza of text.split(/\n\s*\n/)) {
+      const active = stanza.split('\n').filter((line) => !/^\s*#/.test(line));
+      if (active.some((line) => /^\s*Enabled:\s*no\b/i.test(line))) continue;
+      lines.push(...active);
     }
   }
   return lines.join('\n');
@@ -1283,14 +1288,28 @@ async function phpSourceConfigured(source) {
   return false;
 }
 
-// The branch the distribution's own php-fpm meta-package resolves to.
-async function stockPhpBranch(pm) {
+// The branch the distribution's own php-fpm meta-package resolves to. Once the
+// PPA / packages.sury.org is enabled its php-fpm meta-package is the candidate,
+// so the highest archive entry of the version table is resolved instead;
+// `offers` is the detect call's one policy/list query with php-fpm included.
+async function stockPhpBranch(pm, offers) {
+  const meta = offers?.['php-fpm'];
   if (pm.family === 'debian') {
-    const r = await exec('apt-cache', ['depends', '--', 'php-fpm'], { allowFailure: true, env: APT_ENV, timeoutMs: 60_000 });
-    return r.stdout.match(/Depends:\s*php(\d\.\d)-fpm/)?.[1] ?? null;
+    const depends = async (spec) => (await exec('apt-cache', ['depends', '--', spec], { allowFailure: true, env: APT_ENV, timeoutMs: 60_000 })).stdout.match(/Depends:\s*php(\d\.\d)-fpm/)?.[1] ?? null;
+    const distro = (meta?.versions || []).find((e) => classifyOrigin(e.origin) === 'distro');
+    return (distro ? await depends(`php-fpm=${distro.version}`) : null) ?? await depends('php-fpm');
   }
-  const offers = await packageOffers(pm, ['php-fpm']);
-  return (offers['php-fpm']?.installed || offers['php-fpm']?.candidate || '').match(/^(?:\d+:)?(\d\.\d)/)?.[1] ?? null;
+  return (meta?.installed || meta?.candidate || '').match(/^(?:\d+:)?(\d\.\d)/)?.[1] ?? null;
+}
+
+// packages.sury.org is enabled by writing under /etc/apt; when those paths are
+// outside the agent's roots the card says so instead of a job failing with
+// path_not_allowed.
+function suryWriteBlocked(ctx) {
+  for (const p of [path.join(aptRoot(), 'keyrings'), path.join(aptRoot(), 'sources.list.d', SURY_LIST)]) {
+    try { ctx.assertAllowedPath(p, 'write'); } catch { return `the agent may not write ${path.dirname(p) === path.join(aptRoot(), 'sources.list.d') ? path.dirname(p) : p}; add /etc/apt/keyrings and /etc/apt/sources.list.d to its allowed roots`; }
+  }
+  return null;
 }
 
 const sourceSummary = (source) => ({ key: source.key, label: source.label, url: source.url, flavor: source.flavor ?? null, codename: source.codename ?? null, major: source.major ?? null, supported: source.supported, reason: source.reason });
@@ -1299,20 +1318,24 @@ defineOp('pkg.php.sources.detect', {
   description: 'The catalogued PHP package source for this host (ondrej PPA / packages.sury.org / Remi), whether it is configured, the stock branch and which PHP branches the repositories offer or have installed',
   timeoutMs: 300_000,
   schema: z.object({ branches: z.array(phpBranch).max(20).optional() }).strict(),
-  run: async ({ branches }) => {
+  run: async ({ branches }, ctx) => {
     const pm = requireManager();
     const os = readOsRelease();
     const source = phpSourceFor(pm, os);
     const configured = source.key ? await phpSourceConfigured(source) : false;
+    if (source.key === 'sury' && source.supported && !configured) {
+      const blocked = suryWriteBlocked(ctx);
+      if (blocked) { source.supported = false; source.reason = blocked; }
+    }
     const list = branches?.length ? branches : PHP_BRANCHES;
     const names = list.map((v) => phpPackageNames(pm.family, v));
-    const offers = await packageOffers(pm, names.map((n) => n.probe));
-    const stock = await stockPhpBranch(pm);
+    const offers = await packageOffers(pm, [...names.map((n) => n.probe), 'php-fpm']);
+    const stock = await stockPhpBranch(pm, offers);
     const versions = list.map((version, i) => {
       const e = offers[names[i].probe];
       return { version, id: names[i].id, package: names[i].probe, fpmUnit: names[i].fpmUnit, offered: isOffered(e), installed: Boolean(e?.installed), candidate: e?.candidate ?? null, installedVersion: e?.installed ?? null, origin: e?.origin ?? null, source: classifyOrigin(e?.origin, source) };
     });
-    return { manager: pm.manager, family: pm.family, os: { id: os.id, name: os.name, versionId: os.versionId, codename: source.codename ?? os.codename ?? null }, source: { ...sourceSummary(source), configured }, stock, versions };
+    return { manager: pm.manager, family: pm.family, os: { id: os.id, name: os.name, versionId: os.versionId, codename: source.codename ?? os.codename ?? null }, source: { ...sourceSummary(source), configured }, stock, branches: PHP_BRANCHES, versions };
   },
 });
 
@@ -1394,22 +1417,71 @@ async function enableRemi(source, os) {
   return steps;
 }
 
+// Undoes exactly what enable adds: the PPA entry, the sury list + keyring, or
+// remi-release. Never touches another source.
+async function disablePhpSource(source, ctx) {
+  const steps = [];
+  if (source.key === 'ondrej') {
+    if (!hasBinary('add-apt-repository')) throw new OpError('unsupported', `add-apt-repository is missing; remove ${source.ppa} from /etc/apt/sources.list.d by hand`);
+    await exec('add-apt-repository', ['-r', '-y', '-n', source.ppa], { env: APT_ENV, timeoutMs: 5 * 60_000, maxBuffer: BIG });
+    steps.push({ step: `add-apt-repository -r ${source.ppa}`, ok: true });
+  } else if (source.key === 'sury') {
+    const listFile = path.join(aptRoot(), 'sources.list.d', SURY_LIST);
+    const keyrings = ['gpg', 'asc'].map((ext) => path.join(aptRoot(), 'keyrings', `${SURY_KEYRING}.${ext}`));
+    for (const p of [listFile, ...keyrings]) ctx.assertAllowedPath(p, 'write');
+    fs.rmSync(listFile, { force: true });
+    steps.push({ step: 'sources list', ok: true, path: listFile });
+    for (const k of keyrings) if (fs.existsSync(k)) { fs.rmSync(k, { force: true }); steps.push({ step: 'signing key', ok: true, path: k }); }
+  } else {
+    await exec(detectManager().binary, ['-y', '-q', 'remove', '--', source.releasePackage], { timeoutMs: LONG, maxBuffer: BIG });
+    steps.push({ step: `remove ${source.releasePackage}`, ok: true });
+  }
+  return steps;
+}
+
+function requirePhpSource(key, pm, os) {
+  const source = phpSourceFor(pm, os);
+  if (source.key !== key) throw new OpError('unsupported', `${PHP_SOURCES[key].label} is not the PHP source for this host (${os.name || pm.family}); it uses ${source.label || 'none'}`);
+  return source;
+}
+
 defineOp('pkg.php.source.enable', {
-  description: 'Enable the catalogued PHP package source for this host (ppa:ondrej/php on Ubuntu, packages.sury.org on Debian, Remi on the RHEL family) and refresh the package index; idempotent',
+  description: 'Enable the catalogued PHP package source for this host (ppa:ondrej/php on Ubuntu, packages.sury.org on Debian, Remi on the RHEL family) and refresh the package index; idempotent. A refresh that fails right after enabling removes the new entry again',
   timeoutMs: LONG,
   schema: z.object({ source: z.enum(['ondrej', 'sury', 'remi']), wait }).strict(),
   run: async ({ source: key, wait: waitFor }, ctx) => {
     const pm = requireManager();
     const os = readOsRelease();
-    const source = phpSourceFor(pm, os);
-    if (source.key !== key) throw new OpError('unsupported', `${PHP_SOURCES[key].label} is not the PHP source for this host (${os.name || pm.family}); it uses ${source.label || 'none'}`);
+    const source = requirePhpSource(key, pm, os);
     if (!source.supported) throw new OpError('unsupported', `${source.label} cannot be enabled: ${source.reason}`);
     const already = await phpSourceConfigured(source);
     let steps = [];
     if (!already) steps = key === 'ondrej' ? await enableOndrej(source) : key === 'sury' ? await enableSury(source, ctx) : await enableRemi(source, os);
     const argv = pm.family === 'debian' ? ['update', '-q'] : ['-y', '-q', 'makecache'];
-    const refresh = await runLong({ kind: 'update_index', bin: pm.binary, argv, env: APT_ENV, timeoutMs: 15 * 60_000, wait: waitFor }, ctx);
+    const refresh = await runLong({ kind: 'update_index', bin: pm.binary, argv, env: APT_ENV, timeoutMs: 15 * 60_000, wait: waitFor, allowFailure: true }, ctx);
+    if (!refresh.background && refresh.code !== 0) {
+      // apt >= 1.1 fails every later `apt-get update` on an entry without a
+      // Release file, so a source this call added is removed again at once.
+      const reason = `${pm.binary} ${argv[0] === 'update' ? 'update' : 'makecache'} exited with status ${refresh.code}: ${refresh.output.filter((l) => /^E:|error/i.test(l)).pop() || refresh.output.at(-1) || 'no output'}`;
+      if (already) throw new OpError('command_failed', `${source.label} is configured but the package index could not be refreshed (${reason})`, { steps, output: refresh.output });
+      let rolledBack = false;
+      try { steps.push(...(await disablePhpSource(source, ctx)).map((s) => ({ ...s, step: `rollback: ${s.step}` }))); rolledBack = true; } catch (err) { steps.push({ step: 'rollback', ok: false, output: err.message }); }
+      throw new OpError('refused', `${source.label} was enabled but the package index could not be refreshed (${reason}); ${rolledBack ? 'its entry was removed again' : 'its entry could not be removed, remove it by hand'}`, { steps, rolledBack, output: refresh.output });
+    }
     return { source: key, label: source.label, changed: !already, alreadyConfigured: already, steps, ...finished(refresh) };
+  },
+});
+
+defineOp('pkg.php.source.rollback', {
+  description: 'Remove the catalogued PHP package source again (the ppa:ondrej/php entry, the packages.sury.org list and keyring, or remi-release) after a detached index refresh failed; other sources are never touched',
+  destructive: true,
+  timeoutMs: LONG,
+  schema: z.object({ source: z.enum(['ondrej', 'sury', 'remi']) }).strict(),
+  run: async ({ source: key }, ctx) => {
+    const pm = requireManager();
+    const source = requirePhpSource(key, pm, readOsRelease());
+    const steps = await disablePhpSource(source, ctx);
+    return { source: key, label: source.label, steps, configured: await phpSourceConfigured(source) };
   },
 });
 

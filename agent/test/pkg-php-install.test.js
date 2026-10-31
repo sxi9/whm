@@ -74,11 +74,14 @@ describe('schemas', () => {
     expect((await opError(runOp('pkg.php.remove', { version: '8.3', extra: 1 }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('pkg.php.source.enable', { source: 'ondrej', refresh: true }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('pkg.php.sources.detect', { all: true }, ctx))).code).toBe('invalid_args');
+    for (const bad of ['ppa:ondrej/php', '', 'SURY', '../sury']) expect((await opError(runOp('pkg.php.source.rollback', { source: bad }, ctx))).code, bad).toBe('invalid_args');
+    expect((await opError(runOp('pkg.php.source.rollback', { source: 'sury', wait: false }, ctx))).code).toBe('invalid_args');
     expect(exec).not.toHaveBeenCalled();
   });
 
-  it('marks the branch removal destructive and keeps the catalog entries', () => {
+  it('marks the branch removal and the source rollback destructive and keeps the catalog entries', () => {
     expect(catalog.get('pkg.php.remove').destructive).toBe(true);
+    expect(catalog.get('pkg.php.source.rollback').destructive).toBe(true);
     expect(catalog.get('pkg.php.install').destructive).toBe(false);
     expect(catalog.get('pkg.php.source.enable').destructive).toBe(false);
     expect(catalog.get('pkg.php.sources.detect').destructive).toBe(false);
@@ -89,7 +92,7 @@ describe('schemas', () => {
 
   it('refuses every op without a package manager', async () => {
     host('nopm', { osRelease: UBUNTU, binaries: [] });
-    for (const [name, args] of [['pkg.php.sources.detect', {}], ['pkg.php.source.enable', { source: 'ondrej' }], ['pkg.php.install', { version: '8.3' }], ['pkg.php.remove', { version: '8.3' }]]) {
+    for (const [name, args] of [['pkg.php.sources.detect', {}], ['pkg.php.source.enable', { source: 'ondrej' }], ['pkg.php.source.rollback', { source: 'ondrej' }], ['pkg.php.install', { version: '8.3' }], ['pkg.php.remove', { version: '8.3' }]]) {
       expect((await opError(runOp(name, args, ctx))).code, name).toBe('capability_missing');
     }
     expect(exec).not.toHaveBeenCalled();
@@ -116,10 +119,15 @@ describe('catalog helpers', () => {
   it('parse multi-package apt-cache policy output with the candidate origin, and dnf list with wrapped names', () => {
     const text = `${policyBlock('php8.3-fpm', { installed: '8.3.6-0ubuntu0.24.04.2', origin: 'http://archive.ubuntu.com/ubuntu noble-updates/universe amd64 Packages' })}${policyBlock('php8.4-fpm', { candidate: '8.4.12-1+ubuntu24.04.1+deb.sury.org+1', origin: 'https://ppa.launchpadcontent.net/ondrej/php/ubuntu noble/main amd64 Packages' })}`;
     const parsed = parseAptPolicyBlocks(text);
-    expect(parsed['php8.3-fpm']).toEqual({ installed: '8.3.6-0ubuntu0.24.04.2', candidate: '8.3.6-0ubuntu0.24.04.2', origin: 'http://archive.ubuntu.com/ubuntu' });
-    expect(parsed['php8.4-fpm']).toEqual({ installed: null, candidate: '8.4.12-1+ubuntu24.04.1+deb.sury.org+1', origin: 'https://ppa.launchpadcontent.net/ondrej/php/ubuntu' });
+    expect(parsed['php8.3-fpm']).toEqual({ installed: '8.3.6-0ubuntu0.24.04.2', candidate: '8.3.6-0ubuntu0.24.04.2', origin: 'http://archive.ubuntu.com/ubuntu', versions: [{ version: '8.3.6-0ubuntu0.24.04.2', origin: 'http://archive.ubuntu.com/ubuntu' }] });
+    expect(parsed['php8.4-fpm']).toEqual({ installed: null, candidate: '8.4.12-1+ubuntu24.04.1+deb.sury.org+1', origin: 'https://ppa.launchpadcontent.net/ondrej/php/ubuntu', versions: [{ version: '8.4.12-1+ubuntu24.04.1+deb.sury.org+1', origin: 'https://ppa.launchpadcontent.net/ondrej/php/ubuntu' }] });
     expect(parsed['php8.5-fpm']).toBeUndefined();
-    expect(parseAptPolicyBlocks('php-opcache:\n  Installed: (none)\n  Candidate: (none)\n  Version table:\n')['php-opcache']).toEqual({ installed: null, candidate: null, origin: null });
+    expect(parseAptPolicyBlocks('php-opcache:\n  Installed: (none)\n  Candidate: (none)\n  Version table:\n')['php-opcache']).toEqual({ installed: null, candidate: null, origin: null, versions: [] });
+    // A PPA entry above the archive entry: every table entry keeps its first repository, the dpkg status line never counts.
+    expect(parseAptPolicyBlocks(PHP_FPM_META_POLICY)['php-fpm']).toEqual({
+      installed: '2:8.4+96+ubuntu24.04.1+deb.sury.org+1', candidate: '2:8.4+96+ubuntu24.04.1+deb.sury.org+1', origin: 'https://ppa.launchpadcontent.net/ondrej/php/ubuntu',
+      versions: [{ version: '2:8.4+96+ubuntu24.04.1+deb.sury.org+1', origin: 'https://ppa.launchpadcontent.net/ondrej/php/ubuntu' }, { version: '2:8.3+93ubuntu2', origin: 'http://archive.ubuntu.com/ubuntu' }],
+    });
     const dnf = ['Last metadata expiration check: 0:10:00 ago.', 'Installed Packages', 'php82-php-fpm.x86_64        8.2.24-1.el9.remi        @remi-safe', 'Available Packages', 'php83-php-fpm.x86_64        8.3.12-1.el9.remi        remi-safe', 'php84-php-pecl-zip.x86_64', '                            1.22.3-1.el9.remi.8.4     remi-safe', ''].join('\n');
     expect(parseDnfList(dnf)).toEqual({
       'php82-php-fpm': { installed: '8.2.24-1.el9.remi', candidate: null, origin: 'remi-safe' },
@@ -130,6 +138,11 @@ describe('catalog helpers', () => {
   });
 });
 
+// The php-fpm meta-package once the PPA is enabled: its build is the candidate, the archive's 8.3 build sits below it.
+const PHP_FPM_META_POLICY = ['php-fpm:', '  Installed: 2:8.4+96+ubuntu24.04.1+deb.sury.org+1', '  Candidate: 2:8.4+96+ubuntu24.04.1+deb.sury.org+1', '  Version table:',
+  ' *** 2:8.4+96+ubuntu24.04.1+deb.sury.org+1 500', '        500 https://ppa.launchpadcontent.net/ondrej/php/ubuntu noble/main amd64 Packages', '        100 /var/lib/dpkg/status',
+  '     2:8.3+93ubuntu2 500', '        500 http://archive.ubuntu.com/ubuntu noble/universe amd64 Packages', ''].join('\n');
+
 describe('Ubuntu: ppa:ondrej/php', () => {
   const binaries = ['apt-get', 'apt-cache', 'dpkg-query', 'systemctl'];
   const answer = (bin, argv) => {
@@ -138,24 +151,37 @@ describe('Ubuntu: ppa:ondrej/php', () => {
         if (name === 'php8.3-fpm') return policyBlock(name, { installed: '8.3.6-0ubuntu0.24.04.2' });
         if (name === 'php8.3-opcache' || name === 'php8.3-common' || name === 'php8.3-cli') return policyBlock(name, { candidate: '8.3.6-0ubuntu0.24.04.2' });
         if (/^php8\.[12]-/.test(name) || name === 'php8.4-fpm') return policyBlock(name, { candidate: `${name.slice(3, 6)}.1-1+ubuntu24.04.1+deb.sury.org+1`, origin: 'https://ppa.launchpadcontent.net/ondrej/php/ubuntu noble/main amd64 Packages' });
+        if (name === 'php-fpm') return PHP_FPM_META_POLICY;
         return '';
       }).join('') };
     }
-    if (bin === 'apt-cache' && argv[0] === 'depends') return { stdout: 'php-fpm\n  Depends: php8.3-fpm\n' };
+    // The PPA's meta-package depends on php8.4-fpm; the archive's build on php8.3-fpm.
+    if (bin === 'apt-cache' && argv[0] === 'depends') return { stdout: argv[2] === 'php-fpm=2:8.3+93ubuntu2' ? 'php-fpm\n  Depends: php8.3-fpm\n' : 'php-fpm\n  Depends: php8.4-fpm\n' };
     return {};
   };
 
-  it('detects the PPA from the apt sources, the stock branch and what each branch resolves to', async () => {
+  it('detects the PPA from the apt sources, the stock branch from the archive entry and what each branch resolves to', async () => {
     const root = host('ubuntu-detect', { osRelease: UBUNTU, binaries, answer });
     const before = await runOp('pkg.php.sources.detect', {}, ctx);
-    expect(before).toMatchObject({ manager: 'apt', family: 'debian', os: { id: 'ubuntu', codename: 'noble' }, source: { key: 'ondrej', configured: false, supported: true, codename: 'noble' }, stock: '8.3' });
+    expect(before).toMatchObject({ manager: 'apt', family: 'debian', os: { id: 'ubuntu', codename: 'noble' }, source: { key: 'ondrej', configured: false, supported: true, codename: 'noble' }, stock: '8.3', branches: PHP_BRANCHES });
     expect(before.versions.map((v) => [v.version, v.offered, v.installed, v.source])).toEqual([['7.4', false, false, null], ['8.0', false, false, null], ['8.1', true, false, 'ondrej'], ['8.2', true, false, 'ondrej'], ['8.3', true, true, 'distro'], ['8.4', true, false, 'ondrej'], ['8.5', false, false, null]]);
     expect(before.versions[4]).toMatchObject({ id: '8.3', package: 'php8.3-fpm', fpmUnit: 'php8.3-fpm', installedVersion: '8.3.6-0ubuntu0.24.04.2' });
-    expect(calls()).toEqual([['apt-cache', 'policy', '--', ...PHP_BRANCHES.map((v) => `php${v}-fpm`)], ['apt-cache', 'depends', '--', 'php-fpm']]);
+    // One policy call carries the meta-package too; the stock branch is resolved from its archive build, not the PPA's candidate.
+    expect(calls()).toEqual([['apt-cache', 'policy', '--', ...PHP_BRANCHES.map((v) => `php${v}-fpm`), 'php-fpm'], ['apt-cache', 'depends', '--', 'php-fpm=2:8.3+93ubuntu2']]);
+    // Without an archive entry the plain meta-package decides (the pre-PPA host).
+    exec.mockClear();
+    exec.mockImplementation(async (bin, argv) => ({ code: 0, stdout: '', stderr: '', bin, argv, ...(bin === 'apt-cache' && argv[0] === 'policy' ? { stdout: '' } : (await answer(bin, argv)) || {}) }));
+    expect((await runOp('pkg.php.sources.detect', { branches: ['8.3'] }, ctx)).stock).toBe('8.4');
+    expect(calls()[1]).toEqual(['apt-cache', 'depends', '--', 'php-fpm']);
+    exec.mockImplementation(async (bin, argv) => ({ code: 0, stdout: '', stderr: '', bin, argv, ...((await answer(bin, argv)) || {}) }));
     // A commented-out entry does not count; an active deb822 file does.
     fs.writeFileSync(path.join(root, 'apt', 'sources.list.d', 'old.list'), '# deb https://ppa.launchpadcontent.net/ondrej/php/ubuntu noble main\n');
     expect((await runOp('pkg.php.sources.detect', { branches: ['8.3'] }, ctx)).source.configured).toBe(false);
-    fs.writeFileSync(path.join(root, 'apt', 'sources.list.d', 'ondrej-ubuntu-php-noble.sources'), 'Types: deb\nURIs: https://ppa.launchpadcontent.net/ondrej/php/ubuntu/\nSuites: noble\nComponents: main\n');
+    // A stanza disabled by software-properties carries `Enabled: no` after its URIs line.
+    fs.writeFileSync(path.join(root, 'apt', 'sources.list.d', 'ondrej-ubuntu-php-noble.sources'), 'Types: deb\nURIs: https://ppa.launchpadcontent.net/ondrej/php/ubuntu/\nSuites: noble\nComponents: main\nEnabled: no\n');
+    expect((await runOp('pkg.php.sources.detect', { branches: ['8.3'] }, ctx)).source.configured).toBe(false);
+    // `# Enabled: no` is a comment, and a second active stanza in the same file counts on its own.
+    fs.writeFileSync(path.join(root, 'apt', 'sources.list.d', 'ondrej-ubuntu-php-noble.sources'), 'Types: deb\nURIs: https://example.org/other/\nSuites: noble\nComponents: main\nEnabled: no\n\nTypes: deb\n# Enabled: no\nURIs: https://ppa.launchpadcontent.net/ondrej/php/ubuntu/\nSuites: noble\nComponents: main\n');
     const after = await runOp('pkg.php.sources.detect', { branches: ['8.3'] }, ctx);
     expect(after.source.configured).toBe(true);
     expect(after.versions).toHaveLength(1);
@@ -182,6 +208,33 @@ describe('Ubuntu: ppa:ondrej/php', () => {
     expect(calls()).toEqual([['apt-get', 'update', '-q']]);
     expect((await opError(runOp('pkg.php.source.enable', { source: 'sury' }, ctx))).code).toBe('unsupported');
     expect((await opError(runOp('pkg.php.source.enable', { source: 'remi' }, ctx))).code).toBe('unsupported');
+    expect((await opError(runOp('pkg.php.source.rollback', { source: 'sury' }, ctx))).code).toBe('unsupported');
+  });
+
+  it('removes the PPA again when the index refresh fails right after enabling it, and leaves a pre-existing entry alone', async () => {
+    const root = host('ubuntu-refresh-fails', { osRelease: UBUNTU, binaries: [...binaries, 'add-apt-repository'], answer: (bin, argv) => (bin === 'apt-get' && argv[0] === 'update' ? { code: 100, stderr: 'E: The repository \'https://ppa.launchpadcontent.net/ondrej/php/ubuntu plucky Release\' does not have a Release file.\n' } : answer(bin, argv)) });
+    const err = await opError(runOp('pkg.php.source.enable', { source: 'ondrej' }, ctx));
+    expect(err.code).toBe('refused');
+    expect(err.message).toMatch(/exited with status 100: E: The repository/);
+    expect(err.message).toMatch(/entry was removed again/);
+    expect(err.details).toMatchObject({ rolledBack: true });
+    expect(err.details.steps.map((s) => s.step)).toEqual(['add-apt-repository ppa:ondrej/php', 'rollback: add-apt-repository -r ppa:ondrej/php']);
+    expect(calls()).toEqual([
+      ['add-apt-repository', '-y', '-n', 'ppa:ondrej/php'],
+      ['apt-get', 'update', '-q'],
+      ['add-apt-repository', '-r', '-y', '-n', 'ppa:ondrej/php'],
+    ]);
+    // Already configured: the failure is reported, nothing is removed.
+    fs.writeFileSync(path.join(root, 'apt', 'sources.list.d', 'ondrej-ubuntu-php-noble.list'), 'deb https://ppa.launchpadcontent.net/ondrej/php/ubuntu noble main\n');
+    exec.mockClear();
+    const existing = await opError(runOp('pkg.php.source.enable', { source: 'ondrej' }, ctx));
+    expect(existing.code).toBe('command_failed');
+    expect(calls()).toEqual([['apt-get', 'update', '-q']]);
+    // The detached path cannot roll back inside the op: the service calls the rollback op when the run fails.
+    exec.mockClear();
+    const rb = await runOp('pkg.php.source.rollback', { source: 'ondrej' }, ctx);
+    expect(rb).toMatchObject({ source: 'ondrej', steps: [{ step: 'add-apt-repository -r ppa:ondrej/php', ok: true }] });
+    expect(calls()).toEqual([['add-apt-repository', '-r', '-y', '-n', 'ppa:ondrej/php']]);
   });
 
   it('installs a branch with only the packages the repositories offer and enables its FPM unit', async () => {
@@ -269,14 +322,41 @@ describe('Debian: packages.sury.org/php', () => {
     expect(calls()[0]).toEqual(['apt-get', ...APT_INSTALL, '--no-install-recommends', '--', 'curl', 'ca-certificates']);
   });
 
-  it('refuses to write outside the allowed roots', async () => {
+  it('refuses to write outside the allowed roots, and the detection says so instead of offering a failing job', async () => {
     host('debian-outside', { osRelease: DEBIAN, binaries, answer });
     process.env.WHM_APT_ROOT = '/usr/share/whm-apt-test';
     try {
       expect((await opError(runOp('pkg.php.source.enable', { source: 'sury' }, ctx))).code).toBe('path_not_allowed');
       expect(fs.existsSync('/usr/share/whm-apt-test')).toBe(false);
       expect(exec).not.toHaveBeenCalled();
+      expect((await opError(runOp('pkg.php.source.rollback', { source: 'sury' }, ctx))).code).toBe('path_not_allowed');
+      const detect = await runOp('pkg.php.sources.detect', { branches: ['8.3'] }, ctx);
+      expect(detect.source).toMatchObject({ key: 'sury', configured: false, supported: false });
+      expect(detect.source.reason).toMatch(/may not write \/usr\/share\/whm-apt-test\/keyrings; add \/etc\/apt\/keyrings and \/etc\/apt\/sources.list.d/);
     } finally { process.env.WHM_APT_ROOT = path.join(base, 'debian-outside', 'apt'); }
+    // Under an allowed root the same host is supported.
+    expect((await runOp('pkg.php.sources.detect', { branches: ['8.3'] }, ctx)).source).toMatchObject({ key: 'sury', supported: true, reason: null });
+  });
+
+  it('removes the list file and the keyring again when the index refresh fails after enabling', async () => {
+    const root = host('debian-refresh-fails', { osRelease: DEBIAN, binaries, answer: (bin, argv) => (bin === 'apt-get' && argv[0] === 'update' ? { code: 100, stderr: 'E: The repository \'https://packages.sury.org/php/ forky Release\' does not have a Release file.\n' } : answer(bin, argv)) });
+    const apt = path.join(root, 'apt');
+    const err = await opError(runOp('pkg.php.source.enable', { source: 'sury' }, ctx));
+    expect(err.code).toBe('refused');
+    expect(err.details.steps.map((s) => s.step)).toEqual(['signing key', 'sources list', 'rollback: sources list', 'rollback: signing key']);
+    expect(fs.existsSync(path.join(apt, 'sources.list.d', 'whm-sury-php.list'))).toBe(false);
+    expect(fs.readdirSync(path.join(apt, 'keyrings'))).toEqual([]);
+    expect(calls().map((c) => c[0])).toEqual(['curl', 'apt-get']);
+    // The same host, enabled with a detached refresh: the service rolls back through the op.
+    exec.mockClear();
+    const detached = await runOp('pkg.php.source.enable', { source: 'sury', wait: false }, ctx);
+    expect(detached).toMatchObject({ changed: true, background: true });
+    expect(fs.existsSync(path.join(apt, 'sources.list.d', 'whm-sury-php.list'))).toBe(true);
+    const rb = await runOp('pkg.php.source.rollback', { source: 'sury' }, ctx);
+    expect(rb.steps.map((s) => s.step)).toEqual(['sources list', 'signing key']);
+    expect(rb.configured).toBe(false);
+    expect(fs.existsSync(path.join(apt, 'sources.list.d', 'whm-sury-php.list'))).toBe(false);
+    expect(fs.readdirSync(path.join(apt, 'keyrings'))).toEqual([]);
   });
 });
 
@@ -314,9 +394,22 @@ describe('RHEL family: Remi SCL packages', () => {
     expect(r.versions.map((v) => [v.version, v.id, v.offered, v.installed, v.source])).toEqual([['7.4', 'php74', false, false, null], ['8.0', 'php80', false, false, null], ['8.1', 'php81', true, false, 'remi'], ['8.2', 'php82', true, true, 'remi'], ['8.3', 'php83', true, false, 'remi'], ['8.4', 'php84', true, false, 'remi'], ['8.5', 'php85', false, false, null]]);
     expect(r.versions[3]).toMatchObject({ package: 'php82-php-fpm', fpmUnit: 'php82-php-fpm', installedVersion: '8.2.24-1.el9.remi' });
     expect(calls()[0]).toEqual(['rpm', '-q', '--', 'remi-release']);
-    expect(calls()[2]).toEqual(['dnf', '-q', '-y', 'list', '--', ...PHP_BRANCHES.map((v) => `php${v.replace('.', '')}-php-fpm`)]);
+    expect(calls()[2]).toEqual(['dnf', '-q', '-y', 'list', '--', ...PHP_BRANCHES.map((v) => `php${v.replace('.', '')}-php-fpm`), 'php-fpm']);
+    expect(calls()).toHaveLength(3);
     state.remi = true;
     expect((await runOp('pkg.php.sources.detect', { branches: ['8.3'] }, ctx)).source.configured).toBe(true);
+  });
+
+  it('removes remi-release again when makecache fails after enabling', async () => {
+    host('alma-refresh-fails', { osRelease: ALMA, binaries, answer: (bin, argv) => (bin === 'dnf' && argv.includes('makecache') ? { code: 1, stderr: 'Error: Failed to download metadata for repo \'remi-safe\'\n' } : answer(bin, argv)) });
+    Object.assign(state, { remi: false, epel: true, epelFromBase: true });
+    const err = await opError(runOp('pkg.php.source.enable', { source: 'remi' }, ctx));
+    expect(err.code).toBe('refused');
+    expect(err.message).toMatch(/Failed to download metadata/);
+    expect(calls().slice(-2)).toEqual([['dnf', '-y', '-q', 'makecache'], ['dnf', '-y', '-q', 'remove', '--', 'remi-release']]);
+    exec.mockClear();
+    expect(await runOp('pkg.php.source.rollback', { source: 'remi' }, ctx)).toMatchObject({ source: 'remi', steps: [{ step: 'remove remi-release', ok: true }] });
+    expect(calls()[0]).toEqual(['dnf', '-y', '-q', 'remove', '--', 'remi-release']);
   });
 
   it('enables Remi: epel-release, the remi-release RPM for the OS major, CRB, makecache; falls back to the EPEL URL on RHEL proper', async () => {
