@@ -200,8 +200,7 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   log, Install buttons, e2e steps 21–27, contracts §36. The post-integration review (22 findings) was cut off by the account's
   **spend limit** before the fix round: **9 confirmed + 12 unverified findings are open** (`HANDOFF.md` §4.1 has each with its fix).
   Fixed by hand: the `rclone` catalog entry (blocking regression) and the NGINX Manager `proxy` label. Gate: server 1488 / agent
-  774 / client 265 / hub 212 / hub-ui 105, builds, boot, 27-step Playwright flow. Screenshots not refreshed for this round unless the
-  commit after this one says so. Next: §4.1 fixes (small sequential steps), then HST Panel wave 1 from
+  774 / client 265 / hub 212 / hub-ui 105, builds, boot, 27-step Playwright flow. Screenshots refreshed in the commit after `99fe542`. Next: §4.1 fixes (small sequential steps), then HST Panel wave 1 from
   `docs/design/hst-wave1-build-plan.md`.
 - **2026-10-30: platform-fixes integration round.** Unit I4 landed the agent op `web.module.enable` (`agent/src/ops/web.js`,
   tests in `agent/test/web.test.js`), `install.sh --stack`/`--components` + the HST Panel banner, the panel TLS pair at
