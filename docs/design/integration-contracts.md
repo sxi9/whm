@@ -626,7 +626,7 @@ under `/etc/whm/release-keys`. Bundled plugins' node:test suites run from the ro
 
 ### 36.4 Curated package catalog (V4; software, agent `pkg.*`)
 - **`server/src/lib/package-catalog.js`** (`PACKAGE_GROUPS`, `PACKAGE_CATALOG`, `resolveEntry`, `packagesFor`,
-  `phpRuntimePackages`): 79 entries in 8 groups (Web, PHP extensions, Databases, Mail, Security, Tools,
+  `phpRuntimePackages`): 80 entries in 8 groups (Web, PHP extensions, Databases, Mail, Security, Tools,
   Monitoring, Hosting services); an entry that is also a stack component links to it with `stack` and takes its
   packages, capability, units and repository notes from `stack-catalog.js` (a package list is never maintained
   twice); PHP extensions carry `php: { debian, rhel }` suffixes expanded per installed PHP version, `phpVersioned`

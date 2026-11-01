@@ -585,7 +585,7 @@ proxy is on). Package-manager work runs as jobs; the installer runs detached on 
 - **Purpose:** install or remove OS packages.
 - **Who:** root.
 - **Screen:** detected manager; **Catalog** tab (default) — the curated list of what a hosting server installs,
-  79 entries in 8 groups (*Web*, *PHP extensions*, *Databases*, *Mail*, *Security*, *Tools*, *Monitoring*,
+  80 entries in 8 groups (*Web*, *PHP extensions*, *Databases*, *Mail*, *Security*, *Tools*, *Monitoring*,
   *Hosting services*; `server/src/lib/package-catalog.js`), one card per piece of software with the real package
   names of your family, an *installed* / *partial* badge, **Install** (**Install for PHP x.y** for an extension,
   per installed PHP version; **Install the rest** / **Install what is offered** for a partly installed entry), a

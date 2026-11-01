@@ -41,6 +41,7 @@ verified developers, and bundled plugins are part of the product (deferred to Ph
 | 2026-10-29 | **Super admin:** `users.superadmin` (migration `001e`) is set only by `whm-cli superadmin <user>` after the setup password verifies against `/etc/whm/superadmin.key` (bcrypt, `0600 root:root`, written by `superadmin --init` / the installer; the panel process never opens it). Only that user sees the license hub, key, activations and hub answers (License tab, marketplace client, Market Provider Manager, audit text); other roots get `403 superadmin_required` and a *managed by the panel owner* card. Panel hub default `https://licserver.hostingsignal.in` (`config.licenseHubUrl`, installer prompt default); hub portal admins must enrol TOTP (`hub.require_totp_for_admins`, default true). |
 | 2026-10-29 | **HTTPS by default:** `panel.force_https` (2086 → 301 to 2087; `WHM_FORCE_HTTPS=false` / `forceHttps` pins it off) and `web.force_https` (every vhost with a certificate redirects HTTP → HTTPS, `<IfModule mod_rewrite.c>`, ACME path exempt). The panel's TLS pair is `/etc/whm/tls/cert.pem` + `key.pem` (`whm.conf.example`, `install.sh`, agent `ssl.service_cert.install` for `panel`, `watchTlsFiles` reloads it); a hostname change publishes A/AAAA/www/MX, renders the branded landing vhost (`ctx.web.ensureHostnameVhost`, hostname never a hosted domain: `ctx.web.isServerName`) and issues the hostname certificate for panel/Exim/Dovecot/FTP with a daily renewal schedule. |
 | 2026-10-30 | **Stack installs** come from one catalog, `server/src/lib/stack-catalog.js`: the setup wizard, Service Manager › Server stack, `POST /api/system/stack/install` (`ctx.stack`) and `scripts/install.sh --stack full|web|none` / `--components …` all read it; never hard-code package lists elsewhere. |
+| 2026-10-31 | **Issue-2 seams** (contracts §36): the bare address is served by a catch-all vhost (`000-whm-default` / `+whm-default`, `ServerName default.invalid`, certificate chain hostname → `apache` service certificate → `/etc/whm/tls` → generated `/etc/ssl/whm/default`) and nginx's `:443 default_server` proxies to it; addon/sub/parked docroots are created as the account (`web.docroot.ensure`, runuser) with the `index` template; PHP versions install from one source catalog (ppa:ondrej / packages.sury.org / Remi SCL) through `pkg.php.*`; security alerts go through `ctx.securityAlerts` (accounts only hear about applied security updates, notices and tests; mails multipart/alternative); `server/src/lib/package-catalog.js` is the only curated package list (`pkg.offers` batch, 15 min cache); hardening items are apply/revert pairs recorded in `hardening_state`; cloud destinations are rclone remotes with crypt on by default (`ctx.backupCloud` used only through `ctx.backup`). |
 
 ## Non-negotiable conventions
 
@@ -189,6 +190,19 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Current state (update every push)
 
+- **2026-11-01 — Issue-2 round landed, handoff written (session `claude/pensive-curie-9r0rcx`, owner asks of 2026-10-30: issue list 2 →
+  "handoff till whatever we done till now").** V1 catch-all landing vhost + per-account Domains panel + hostname card on Manage SSL
+  Hosts, V2 PHP version installer, V3 security alert mails, V4 curated package catalog, V5 Hardening card, V6 encrypted cloud
+  storage (migrations 037–039; `972ee72` … `45685a5`; 102 agents, 55 confirmed findings fixed). Integration units J1–J4 (`e520965`,
+  `da80325`): allowed roots `/etc/apt/keyrings` + `/etc/apt/sources.list.d`, nginx `:443 default_server` proxy with the hostname /
+  catch-all pair (`pkg.nginx.proxy.write { defaultServer }`), `flagRpmSecurity`, multipart/alternative alert mails (`mail.sendmail
+  { html }`), `ctx.api.backups.upload → ctx.backup.uploadFile`, `rclone` stack component + catalog entry, `redactUrl` on the access
+  log, Install buttons, e2e steps 21–27, contracts §36. The post-integration review (22 findings) was cut off by the account's
+  **spend limit** before the fix round: **9 confirmed + 12 unverified findings are open** (`HANDOFF.md` §4.1 has each with its fix).
+  Fixed by hand: the `rclone` catalog entry (blocking regression) and the NGINX Manager `proxy` label. Gate: server 1488 / agent
+  774 / client 265 / hub 212 / hub-ui 105, builds, boot, 27-step Playwright flow. Screenshots not refreshed for this round unless the
+  commit after this one says so. Next: §4.1 fixes (small sequential steps), then HST Panel wave 1 from
+  `docs/design/hst-wave1-build-plan.md`.
 - **2026-10-30: platform-fixes integration round.** Unit I4 landed the agent op `web.module.enable` (`agent/src/ops/web.js`,
   tests in `agent/test/web.test.js`), `install.sh --stack`/`--components` + the HST Panel banner, the panel TLS pair at
   `/etc/whm/tls/{cert,key}.pem` (legacy `/etc/whm/ssl/panel.*` migrated on `--upgrade`), `WHM_FORCE_HTTPS` in the deploy
@@ -305,6 +319,8 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   integration round for cross-unit leftovers, then the full gate (`npm test`, builds, boot, `e2e/ui-check.cjs`).
   Remaining work is listed in `HANDOFF.md` §4.
 - This dev container has 4 CPUs → at most 2 concurrent subagents; plan fan-outs accordingly.
+- **Spend limit (2026-10-31):** the account's individual spend limit stopped 27 of 55 agents mid-run (verify and fix phases first).
+  Size fan-outs so the verify + fix phases fit, snapshot-commit before every phase, and keep small fixes sequential or by hand.
 - The container has `systemctl` and `useradd` but no Apache/BIND/Exim/MySQL daemons; the
   capability layer must make every page degrade gracefully here and work fully on a
   provisioned host.

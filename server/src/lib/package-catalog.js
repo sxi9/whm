@@ -99,6 +99,7 @@ export const PACKAGE_CATALOG = [
   // --- Tools -------------------------------------------------------------------
   { key: 'git', category: 'tools', stack: 'git', recommended: true },
   { key: 'rsync', category: 'tools', stack: 'rsync', recommended: true, configure: '/backup/backup-configuration' },
+  { key: 'rclone', category: 'tools', stack: 'rclone', recommended: true, configure: '/backup/backup-configuration' },
   { key: 'archivers', category: 'tools', label: 'Archive tools (zip, unzip, bzip2, xz)', description: 'What backups, application installers and site migrations unpack with.', packages: { debian: ['zip', 'unzip', 'bzip2', 'xz-utils'], rhel: ['zip', 'unzip', 'bzip2', 'xz'] }, recommended: true },
   { key: 'imagemagick', category: 'tools', label: 'ImageMagick', description: 'Image conversion suite behind the Imagick PHP extension and many CMS media pipelines.', packages: { debian: ['imagemagick'], rhel: ['ImageMagick'] }, requires: { rhel: EPEL }, recommended: true },
   { key: 'ghostscript', category: 'tools', label: 'Ghostscript', description: 'PDF and PostScript rendering for thumbnails and document previews.', packages: { debian: ['ghostscript'], rhel: ['ghostscript'] }, recommended: false },
