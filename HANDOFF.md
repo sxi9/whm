@@ -78,6 +78,11 @@ degrades to an install prompt with an *Install* button for root — by design), 
 
 ## 4. Where the previous session ended — and where to continue
 
+**Picking this up from another account (2026-11-01):** clone `github.com/sxi9/whm`, check out
+`claude/pensive-curie-9r0rcx` (last commits: `99fe542` handoff + gate, then the screenshot refresh), run §3's
+install/test commands once to confirm green, then start with §4.1 (the open review findings) — each item names the
+file, line, defect and fix. Nothing is in flight: no workflow, no scheduled check-in, no half-applied change.
+
 **Session of 2026-10-30/31 → 11-01** (owner AFK: "take all decisions, keep working"; asks: the ten-item issue
 list 2, then "handoff till whatever we done till now"). What happened, in order:
 
