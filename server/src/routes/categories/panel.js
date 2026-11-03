@@ -6,7 +6,7 @@ import { validate, z, fields, pagination } from '../../lib/validate.js';
 import { requireRole, requireRoot, requireReseller } from '../../middleware/rbac.js';
 import { HttpError } from '../../lib/errors.js';
 import { createPanelService, LOGIN_AS_TTL } from '../../services/panel.js';
-import { PANEL_SCOPES, wrap, created } from '../panel/index.js';
+import { PANEL_SCOPES, confinePanelTokens, wrap, created } from '../panel/index.js';
 
 const panelDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'panel');
 
@@ -76,6 +76,8 @@ export async function register(ctx) {
   s.subscribe();
   const backfilled = s.backfill();
   if (backfilled.created || backfilled.adopted) ctx.logger.info(backfilled, 'panel: linked account users');
+  if (ctx.confinedScopes?.prefixes) confinePanelTokens(ctx);
+  else ctx.logger.warn('panel: API tokens are not confined to /api/panel (core requireAuth has no prefix confinement yet)');
 
   const r = Router();
   r.use(requireRole('user', 'root', 'reseller'));

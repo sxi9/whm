@@ -11,6 +11,7 @@ import { PANEL_SCOPES } from '../routes/panel/index.js';
 //   panel.scope(req)                               -> the single account for this session (§3.1), or throws
 //   panel.loginAs(username, user, req) / logoutAs(req)
 //   panel.changePassword(scope, input, req)        -> §2.2 panel-side flow (host first, both stores, sessions)
+//   panel.changePasswordForUser(userId, input, req) -> the same flow for routes/auth.js (null when not an account user)
 //   panel.audit(req, entry)                        -> audit row carrying actingAs/by while impersonating
 
 export const LOGIN_AS_TTL = { min: 5, max: 480, fallback: 60 };
@@ -36,6 +37,7 @@ export function createPanelService(ctx) {
     deleteUser: db.prepare("DELETE FROM users WHERE id = ? AND role = 'user'"),
     setUserSuspended: db.prepare('UPDATE users SET suspended = ? WHERE id = ?'),
     setUserEmail: db.prepare('UPDATE users SET email = ? WHERE id = ?'),
+    stripCredentials: db.prepare('UPDATE users SET password_hash = NULL, totp_secret_enc = NULL, totp_enabled = 0 WHERE id = ?'),
     setPasswordHash: db.prepare("UPDATE users SET password_hash = ?, must_change_password = 0, password_changed_at = datetime('now') WHERE id = ?"),
     setSyncedAt: db.prepare('UPDATE account_users SET password_synced_at = ? WHERE user_id = ?'),
     clearForcePassword: db.prepare("UPDATE accounts SET force_password_change = 0, updated_at = datetime('now') WHERE id = ?"),
@@ -95,7 +97,11 @@ export function createPanelService(ctx) {
 
   // ---------------------------------------------------------------- identity
 
-  function ensureUser(target, req) {
+  // Adopting an unlinked role-user row that happens to carry the new account's
+  // username hands that account's panel to whoever holds the row's password, so
+  // credentials survive only on the boot backfill (an account that pre-dates a
+  // reseller demotion) and `suspended` is never lowered by an implicit path.
+  function ensureUser(target, req, { keepCredentials = false, alignSuspended = false, by = null } = {}) {
     const username = typeof target === 'string' ? target : target?.username;
     const account = username ? stmts.accountByUsername.get(username) : null;
     if (!account) throw notFound('Account');
@@ -107,13 +113,16 @@ export function createPanelService(ctx) {
     }
     if (existing) {
       if (stmts.linkByUser.get(existing.id)) throw conflict(`The login "${account.username}" is already linked to another account`);
+      const suspended = alignSuspended ? (account.suspended ? 1 : 0) : Math.max(existing.suspended ? 1 : 0, account.suspended ? 1 : 0);
       db.transaction(() => {
         stmts.insertLink.run(existing.id, account.id);
-        stmts.setUserSuspended.run(account.suspended ? 1 : 0, existing.id);
+        stmts.setUserSuspended.run(suspended, existing.id);
+        if (!keepCredentials) stmts.stripCredentials.run(existing.id);
         if (!existing.email && account.contact_email) stmts.setUserEmail.run(account.contact_email, existing.id);
       })();
-      audit(req, { action: 'panel.user.adopt', target: account.username, args: { userId: existing.id } });
-      return { userId: existing.id, accountId: account.id, username: account.username, created: false, adopted: true, linked: true };
+      if (!keepCredentials) ctx.sessionStore?.destroyUserSessions?.(existing.id);
+      audit(req, { action: 'panel.user.adopt', target: account.username, args: { userId: existing.id, credentialsKept: keepCredentials, suspended: Boolean(suspended), by: req?.user?.username ?? by } });
+      return { userId: existing.id, accountId: account.id, username: account.username, created: false, adopted: true, linked: true, credentialsKept: keepCredentials };
     }
     const userId = db.transaction(() => {
       const { lastInsertRowid } = stmts.insertUser.run(account.username, account.contact_email || null, account.suspended ? 1 : 0);
@@ -128,7 +137,7 @@ export function createPanelService(ctx) {
     const result = { created: 0, adopted: 0, skipped: 0 };
     for (const { username } of stmts.unlinkedAccounts.all()) {
       try {
-        const r = ensureUser(username, null);
+        const r = ensureUser(username, null, { keepCredentials: true, by: 'boot' });
         if (r.created) result.created++;
         else if (r.adopted) result.adopted++;
         else result.skipped++;
@@ -168,17 +177,12 @@ export function createPanelService(ctx) {
     return { applied: true, userId: link.user_id };
   }
 
-  // account.terminated: sessions go at the 'pre' stage while the link still
-  // exists; the orphaned role-user row goes after the cascade.
+  // account.terminated fires its 'pre' stage before accounts.terminate checks
+  // ownership, so only the 'post' stage (the account row is gone, the link has
+  // cascaded, the role-user row is still there) may touch sessions.
   function onTerminated(envelope) {
     const username = envelope?.payload?.username;
-    if (!username) return;
-    if (envelope.stage === 'pre') {
-      const account = stmts.accountByUsername.get(username);
-      const link = account ? stmts.linkByAccount.get(account.id) : null;
-      if (link) ctx.sessionStore?.destroyUserSessions?.(link.user_id);
-      return;
-    }
+    if (!username || envelope.stage !== 'post') return;
     const user = stmts.userByUsername.get(username);
     if (!user || user.role !== 'user' || stmts.linkByUser.get(user.id) || stmts.accountByUsername.get(username)) return;
     ctx.sessionStore?.destroyUserSessions?.(user.id);
@@ -189,7 +193,7 @@ export function createPanelService(ctx) {
   function subscribe(events = ctx.events) {
     if (!events?.on) return () => {};
     const offs = [
-      events.on('account.created', (e) => { if (e.stage === 'post') { try { ensureUser(e.payload?.username, null); } catch (err) { logger.warn({ err }, 'panel: ensureUser after account.created failed'); } } }),
+      events.on('account.created', (e) => { if (e.stage === 'post') { try { ensureUser(e.payload?.username, null, { by: e.principal ?? null }); } catch (err) { logger.warn({ err }, 'panel: ensureUser after account.created failed'); } } }),
       events.on('account.suspended', (e) => { if (e.stage === 'post') setSuspended(e.payload?.username, true); }),
       events.on('account.unsuspended', (e) => { if (e.stage === 'post') setSuspended(e.payload?.username, false); }),
       events.on('account.terminated', onTerminated),
@@ -215,7 +219,7 @@ export function createPanelService(ctx) {
 
   async function adminEnsureUser(username, { password } = {}, user, req) {
     ctx.accounts.get(username, user);
-    const r = ensureUser(username, req);
+    const r = ensureUser(username, req, { alignSuspended: true });
     if (!r.linked) throw conflict(`"${username}" is the login of an administrator and cannot become an account user`);
     let password_synced = false;
     if (password) { await adminSetPassword(username, password, user, req); password_synced = true; }
@@ -398,12 +402,15 @@ export function createPanelService(ctx) {
     }
   }
 
-  async function changePassword(s, { currentPassword, newPassword }, req) {
+  // `force` skips the current-password check only for a login core already
+  // flagged with must_change_password (the forced-change path of /api/auth/password).
+  async function changePassword(s, { currentPassword, newPassword, force = false }, req) {
     assertNotActing(s);
     const user = stmts.userById.get(s.actor.id);
     const link = user ? stmts.linkByUser.get(user.id) : null;
     if (!link || link.account_id !== s.accountId) throw forbidden('This login is not linked to the account');
-    if (!(await crypto.verifyPassword(currentPassword || '', user.password_hash))) throw unauthorized('Current password is incorrect');
+    const forced = Boolean(force) && Boolean(user.must_change_password);
+    if (!forced && !(await crypto.verifyPassword(currentPassword || '', user.password_hash))) throw unauthorized('Current password is incorrect');
     const strength = ctx.security?.passwordStrength?.(newPassword, 'account');
     if (strength && !strength.ok) throw unprocessable(`Password is too weak (strength ${strength.score}, minimum ${strength.minimum})`, { newPassword: ['Choose a stronger password'] });
     const host = await hostSetPassword(s, newPassword, req);
@@ -414,8 +421,23 @@ export function createPanelService(ctx) {
       stmts.clearForcePassword.run(s.accountId);
     })();
     ctx.sessionStore?.destroyUserSessions?.(user.id);
-    audit(req, { action: 'panel.password.change', target: s.username, args: { host } });
+    audit(req, { action: 'panel.password.change', target: s.username, args: { host, forced } });
     return { changed: true, host };
+  }
+
+  // Seam for routes/auth.js POST /password: a login linked to a hosting account
+  // changes its password through the §2.2 flow (host first, both stores) so the
+  // forced-change path cannot leave the Linux password behind. Returns null
+  // when the login is not an account user, and the caller keeps its own flow.
+  const linkForUser = (userId) => stmts.linkByUser.get(userId) || null;
+  async function changePasswordForUser(userId, { currentPassword, newPassword, force = false }, req) {
+    const user = stmts.userById.get(userId);
+    const link = user && user.role === 'user' ? stmts.linkByUser.get(user.id) : null;
+    if (!link) return null;
+    const row = stmts.accountById.get(link.account_id);
+    if (!row) return null;
+    const s = buildScope({ user }, row, 'user', null);
+    return changePassword(s, { currentPassword, newPassword, force }, req);
   }
 
   // After destroyUserSessions the caller's own session is gone too: give it a
@@ -442,8 +464,12 @@ export function createPanelService(ctx) {
 
   const shapeToken = (t) => ({ id: t.id, name: t.name, scopes: json.parse(t.scopes, []), prefix: t.prefix, expiresAt: t.expires_at, lastUsedAt: t.last_used_at, createdAt: t.created_at });
   const tokens = {
-    list(s) { return stmts.tokensForUser.all(s.actor.id).map(shapeToken); },
+    list(s) {
+      assertNotActing(s);
+      return stmts.tokensForUser.all(s.actor.id).map(shapeToken);
+    },
     get(s, id) {
+      assertNotActing(s);
       const row = stmts.tokenForUser.get(id, s.actor.id);
       if (!row) throw notFound('API token');
       return shapeToken(row);
@@ -502,6 +528,6 @@ export function createPanelService(ctx) {
     ensureUser, backfill, syncPassword, setSuspended, subscribe, userStatus, adminEnsureUser, adminSetPassword,
     scope, assertNotActing, loginAs, logoutAs, loginAsHistory, endImpersonation,
     me, quickLinks, counts, userPrincipal,
-    changePassword, reestablish, sessions, tokens, settings: panelSettings, audit,
+    changePassword, changePasswordForUser, linkForUser, reestablish, sessions, tokens, settings: panelSettings, audit,
   };
 }

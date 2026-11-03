@@ -8,6 +8,7 @@ describe('Customer panel scope', () => {
   let app;
   let csrf;
   let reseller;
+  let reseller2;
   let resellerHttp;
   let resellerCsrf;
   const sessions = {};
@@ -34,6 +35,10 @@ describe('Customer panel scope', () => {
     await rootPost('/api/accounts', { username: 'alice', domain: 'alice.com', contactEmail: 'alice@alice.com' }).expect(201);
     await rootPost('/api/accounts', { username: 'bob', domain: 'bob.com', owner: 'resell1', contactEmail: 'bob@bob.com' }).expect(201);
     await rootPost('/api/accounts', { username: 'carol', domain: 'carol.com', owner: 'resell1' }).expect(201);
+    // Seam S10: "login-as" is an explicit ACL (off until root grants it); resell1 has it, resell2 does not.
+    db().prepare("INSERT INTO reseller_acls (reseller_id, acl_key, value) VALUES (?, 'login-as', 1)").run(reseller.id);
+    reseller2 = await app.createUser('resell2', 'reseller');
+    await rootPost('/api/accounts', { username: 'dan', domain: 'dan.com', owner: 'resell2' }).expect(201);
     await setPassword('alice', 'Alice-Passw0rd!');
     await setPassword('bob', 'Bob-Passw0rd!!');
     resellerHttp = request.agent(app.ctx.app);
@@ -180,6 +185,13 @@ describe('Customer panel scope', () => {
     it('refuses identity actions while acting and tags panel audit rows with actingAs/by', async () => {
       const res = await rootPost('/api/panel/tokens', { name: 'while-acting' }).expect(403);
       expect(res.body.error.code).toBe('not_while_impersonating');
+      // Every /api/panel/tokens* call is refused while acting (§2.4): the admin's own tokens never render as the customer's.
+      db().prepare("INSERT INTO api_tokens (user_id, name, token_hash, scopes) VALUES (1, 'root-whm-token', ?, '[]')").run(app.ctx.crypto.hashToken(app.ctx.crypto.randomToken(32)));
+      const rootTokenId = db().prepare("SELECT id FROM api_tokens WHERE name = 'root-whm-token'").get().id;
+      expect((await app.http.get('/api/panel/tokens').expect(403)).body.error.code).toBe('not_while_impersonating');
+      expect((await app.http.get(`/api/panel/tokens/${rootTokenId}`).expect(403)).body.error.code).toBe('not_while_impersonating');
+      expect((await app.http.delete(`/api/panel/tokens/${rootTokenId}`).set('X-CSRF-Token', csrf).expect(403)).body.error.code).toBe('not_while_impersonating');
+      expect(db().prepare("SELECT COUNT(*) AS n FROM api_tokens WHERE name = 'root-whm-token'").get().n).toBe(1);
       const fake = { user: { id: 1, username: 'root', role: 'root' }, session: { panelActingAs: app.http.jar ? undefined : undefined } };
       const entries = [];
       const actingReq = { ...fake, panel: { mode: 'acting', username: 'alice', actor: { username: 'root' } }, audit: (e) => entries.push(e) };
@@ -216,6 +228,12 @@ describe('Customer panel scope', () => {
     it('a reseller may only act as its own accounts, with the login-as ACL, on unsuspended accounts', async () => {
       expect((await rPost('/api/panel/admin/login-as/alice').expect(403)).body.error.code).toBe('forbidden');
       await rPost('/api/panel/admin/login-as/ghost').expect(404);
+      // Without the explicit ACL a reseller is refused even on its own account (seam S10).
+      const r2 = request.agent(app.ctx.app);
+      const r2Login = await r2.post('/api/auth/login').send({ username: 'resell2', password: reseller2.password }).expect(200);
+      const unconfigured = await r2.post('/api/panel/admin/login-as/dan').set('X-CSRF-Token', r2Login.body.data.csrfToken).expect(403);
+      expect(unconfigured.body.error.message).toMatch(/Log in to Account Panels/);
+      expect(activeLoginAs().filter((l) => l.actor_id === reseller2.id)).toHaveLength(0);
       await rootPost('/api/accounts/carol/suspend', { reason: 'test' }).expect(200);
       expect((await rPost('/api/panel/admin/login-as/carol').expect(409)).body.error.code).toBe('account_suspended');
       await rootPost('/api/accounts/carol/unsuspend').expect(200);
@@ -312,6 +330,35 @@ describe('Customer panel scope', () => {
       for (const p of ['/api/accounts', '/api/development/tokens', '/api/panel/admin/settings', '/api/system/status']) expect((await bearer(p)).status, p).toBe(403);
       const mint = await request(app.ctx.app).post('/api/panel/tokens').set('Authorization', `Bearer ${token}`).send({ name: 'chain' }).expect(403);
       expect(mint.body.error.message).toMatch(/browser session/);
+    });
+
+    it('never stores an unrestricted scope list for a panel token', async () => {
+      const rows = db().prepare("SELECT scopes FROM api_tokens WHERE user_id = (SELECT id FROM users WHERE username = 'alice')").all();
+      expect(rows.length).toBeGreaterThan(0);
+      for (const { scopes } of rows) {
+        const list = JSON.parse(scopes);
+        expect(list.length).toBeGreaterThan(0);
+        expect(list.every((sc) => sc.startsWith('panel:'))).toBe(true);
+      }
+    });
+
+    // §3.4 confinement needs core: requireAuth matches confinement entries by exact
+    // mounted path, so register() only calls confinePanelTokens() once
+    // ctx.confinedScopes.prefixes is set by core. Until then a panel:* bearer
+    // token reaches every auth-only core route (POST /api/auth/2fa/enroll included)
+    // and this test is skipped rather than asserting the gap away.
+    it('a panel token is confined to /api/panel/* and GET /api/auth/me (§3.4)', async (t) => {
+      if (!app.ctx.confinedScopes?.get('panel:read')) return t.skip();
+      const bearer = (method, p) => request(app.ctx.app)[method](p).set('Authorization', `Bearer ${token}`);
+      await bearer('get', '/api/panel/me').expect(200);
+      await bearer('get', '/api/panel/tokens').expect(200);
+      await bearer('get', '/api/auth/me').expect(200);
+      for (const [method, p] of [['post', '/api/auth/2fa/enroll'], ['post', '/api/auth/password'], ['post', '/api/auth/logout'], ['get', '/api/themes/active'], ['get', '/api/cpanel/news/active']]) {
+        const res = await bearer(method, p).send({});
+        expect(res.status, `${method} ${p}`).toBe(403);
+        expect(res.body.error.code, `${method} ${p}`).toBe('scope_confined');
+      }
+      expect(db().prepare("SELECT totp_enabled, totp_secret_enc FROM users WHERE username = 'alice'").get()).toEqual({ totp_enabled: 0, totp_secret_enc: null });
     });
 
     it('honours apiTokensRequire2fa and the api feature, and only the owner can revoke', async () => {

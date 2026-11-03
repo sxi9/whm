@@ -13,9 +13,12 @@ import { SHADOW_HASH } from './transfer.js';
 //   /etc/dovecot/whm/passwd/<domain>            0640 root:dovecot
 //   <eximConfDir>/whm/aliases/<domain>           forwarders (local: target, target)
 //   <eximConfDir>/whm/domainfwd.lst              domain: target-domain
-//   <eximConfDir>/whm/autoresponders/<domain>/<local>.conf + .txt
-//   <eximConfDir>/whm/spam_users.lst             domain: user=… enabled=… threshold=… autodelete=…
-//   /var/lib/whm/autoreply/<domain>/             Exim autoreply "once" databases
+//   <eximConfDir>/whm/autoresponders/<domain>/<local> (body) + <local>.conf (lsearch headers)
+//   <eximConfDir>/whm/spam_users.lst             domain: user=… enabled=0|1 threshold=… autodelete=0|1
+//   /var/lib/whm/autoreply/<local>@<domain>.db   Exim autoreply "once" databases
+// The grammar of every file is the one service-configuration's whm_* fragments
+// read (renderEximVirtualRouters/Transports, renderEximSpamAcl); agent/test
+// keeps the two in parity.
 // Every value that lands in one of those files is validated here against the
 // field grammar of that file (no ':' in a passwd field, no newline anywhere, no
 // Exim expansion or pipe/file syntax in a redirect target), so a value that got
@@ -170,6 +173,22 @@ export function upsertPasswdText(previous, local, line) {
   return `${MANAGED}\n${body.join('\n')}\n`;
 }
 
+// A domain's passwd file belongs to exactly one hosting account: every line
+// must carry that account's uid. Lines of any other uid are stale (a previous
+// owner of the domain) and are dropped before the new line is added, so a
+// mailbox of this domain can never stay mapped onto another account's home.
+export function dropForeignPasswdLines(previous, uid) {
+  const body = (previous || '').split('\n').filter((l) => l !== '' && !l.startsWith('#'));
+  const purged = [];
+  const kept = body.filter((l) => {
+    const parsed = parsePasswdLine(l);
+    if (parsed && parsed.uid === uid) return true;
+    purged.push({ localPart: l.split(':')[0], uid: parsed?.uid ?? null });
+    return false;
+  });
+  return { text: kept.length ? `${MANAGED}\n${kept.join('\n')}\n` : '', purged };
+}
+
 export function removeFromPasswdText(previous, local) {
   const body = (previous || '').split('\n').filter((l) => l !== '' && !l.startsWith('#'));
   const kept = body.filter((l) => l.split(':')[0] !== local);
@@ -221,22 +240,38 @@ export function renderSpamUsers(entries) {
     if (!Number.isInteger(e.threshold) || e.threshold < 10 || e.threshold > 200) throw new OpError('invalid_args', 'Spam threshold must be 10..200 (score x10)');
     if (seen.has(e.domain)) throw new OpError('invalid_args', `${e.domain} listed twice`);
     seen.add(e.domain);
-    lines.push(`${e.domain}: user=${e.username} enabled=${e.enabled ? 'y' : 'n'} threshold=${e.threshold} autodelete=${e.autoDelete ? 'y' : 'n'}`);
+    lines.push(`${e.domain}: user=${e.username} enabled=${e.enabled ? 1 : 0} threshold=${e.threshold} autodelete=${e.autoDelete ? 1 : 0}`);
   }
   return `${lines.join('\n')}\n`;
 }
 
-// lsearch "key: value" headers for the whm_autoreply router/transport.
-export function renderAutoresponderConf({ fromName, subject, charset, intervalHours, startAt = null, stopAt = null }) {
-  for (const [k, v, max] of [['from_name', fromName, 128], ['subject', subject, 255]]) {
+// lsearch "key: value" headers for the whm_autoreply router/transport
+// (service-configuration): keys from, subject, charset, interval (hours),
+// start/stop (epoch seconds), enabled (0|1). A key whose value would be empty
+// is left out so the fragment's lookup defaults apply (Exim's numeric
+// comparisons fail on an empty string, and an empty "from" would render as
+// '"" <address>').
+export const AUTORESPONDER_KEYS = ['from', 'subject', 'charset', 'interval', 'start', 'stop', 'enabled'];
+export function renderAutoresponderConf({ fromName = '', subject, charset, intervalHours, startAt = null, stopAt = null, enabled = true }) {
+  for (const [k, v, max] of [['from', fromName, 128], ['subject', subject, 255]]) {
     if (typeof v !== 'string' || v.length > max || !SINGLE_LINE.test(v)) throw new OpError('invalid_args', `${k} must be a single line of at most ${max} characters`);
   }
   if (!CHARSET.test(charset)) throw new OpError('invalid_args', 'Invalid charset');
   if (!Number.isInteger(intervalHours) || intervalHours < 0 || intervalHours > 720) throw new OpError('invalid_args', 'interval must be 0..720 hours');
-  const epoch = (iso) => { if (iso == null) return ''; const t = Date.parse(iso); if (!Number.isFinite(t)) throw new OpError('invalid_args', 'Invalid date'); return String(Math.floor(t / 1000)); };
-  const lines = [MANAGED, `from_name: ${fromName}`, `subject: ${subject}`, `charset: ${charset}`, `interval_seconds: ${intervalHours * 3600}`, `start_epoch: ${epoch(startAt)}`, `stop_epoch: ${epoch(stopAt)}`];
+  const epoch = (iso) => { const t = Date.parse(iso); if (!Number.isFinite(t)) throw new OpError('invalid_args', 'Invalid date'); return String(Math.floor(t / 1000)); };
+  const lines = [MANAGED];
+  if (fromName !== '') lines.push(`from: ${fromName}`);
+  lines.push(`subject: ${subject}`, `charset: ${charset}`, `interval: ${intervalHours}`);
+  if (startAt != null) lines.push(`start: ${epoch(startAt)}`);
+  if (stopAt != null) lines.push(`stop: ${epoch(stopAt)}`);
+  lines.push(`enabled: ${enabled ? 1 : 0}`);
   return `${lines.join('\n')}\n`;
 }
+
+// The Exim autoreply transport's once database for one address (flat under
+// AUTOREPLY_DB_DIR, as the transport's `once =` names it); ndbm builds add
+// .pag/.dir beside it.
+export const autoreplyOnceFiles = (domain, local) => ['', '.pag', '.dir'].map((ext) => path.join(AUTOREPLY_DB_DIR, `${local}@${domain}.db${ext}`));
 
 // ------------------------------------------------------------------- ops ---
 
@@ -279,8 +314,22 @@ defineOp('vmail.passwd.set', {
     const file = ctx.assertAllowedPath(passwdFile(domain), 'write');
     const line = renderPasswdLine({ localPart: local, hash: h, uid: info.uid, gid: info.gid, home, domain, quotaBytes: quota, disabled });
     const previous = readText(file);
-    writeAtomic(file, upsertPasswdText(previous, local, line), { mode: 0o640, gid });
-    return { domain, localPart: local, path: file, uid: info.uid, gid: info.gid, home, quotaBytes: quota, disabled, replaced: Boolean(previous && previous.split('\n').some((l) => l.split(':')[0] === local)) };
+    const { text: own, purged } = dropForeignPasswdLines(previous, info.uid);
+    writeAtomic(file, upsertPasswdText(own, local, line), { mode: 0o640, gid });
+    return { domain, localPart: local, path: file, uid: info.uid, gid: info.gid, home, quotaBytes: quota, disabled, replaced: Boolean(own && own.split('\n').some((l) => l.split(':')[0] === local)), purged };
+  },
+});
+
+defineOp('vmail.passwd.purge', {
+  description: 'Delete the whole Dovecot passwd-file of a domain (every mailbox line) when the domain leaves its hosting account',
+  schema: z.object({ domain: arg.domain }).strict(),
+  destructive: true,
+  timeoutMs: 30_000,
+  run: async ({ domain }, ctx) => {
+    requireDovecotDir(ctx);
+    const file = ctx.assertAllowedPath(passwdFile(domain), 'write');
+    const users = (readText(file) || '').split('\n').map(parsePasswdLine).filter(Boolean).map((u) => u.localPart);
+    return { domain, path: file, removed: removeFile(file), users };
   },
 });
 
@@ -395,49 +444,52 @@ const autoresponderSchema = z.object({
   intervalHours: z.number().int().min(0).max(720).default(24),
   startAt: isoDate.optional(),
   stopAt: isoDate.optional(),
+  enabled: z.boolean().default(true),
 }).strict();
 
 defineOp('vmail.autoresponder.write', {
-  description: 'Write the autoresponder headers (<local>.conf, lsearch key: value) and body (<local>.txt) of an address and prepare its Exim autoreply once-database directory',
+  description: 'Write the autoresponder body (<domain>/<local>) and headers (<local>.conf, lsearch key: value) of an address and prepare the Exim autoreply once-database directory',
   schema: autoresponderSchema,
   timeoutMs: 30_000,
-  run: async ({ domain, localPart: local, fromName, subject, body, charset, intervalHours, startAt, stopAt }, ctx) => {
+  run: async ({ domain, localPart: local, fromName, subject, body, charset, intervalHours, startAt, stopAt, enabled }, ctx) => {
     const { whmDir } = eximWhmDir();
     const root = ctx.assertAllowedPath(path.join(whmDir, 'autoresponders'), 'write');
     const dir = ctx.assertAllowedPath(path.join(root, domain), 'write');
     const conf = ctx.assertAllowedPath(path.join(dir, `${local}.conf`), 'write');
-    const text = ctx.assertAllowedPath(path.join(dir, `${local}.txt`), 'write');
-    const headers = renderAutoresponderConf({ fromName, subject, charset, intervalHours, startAt: startAt ?? null, stopAt: stopAt ?? null });
+    const text = ctx.assertAllowedPath(path.join(dir, local), 'write');
+    const headers = renderAutoresponderConf({ fromName, subject, charset, intervalHours, startAt: startAt ?? null, stopAt: stopAt ?? null, enabled });
     if (body.includes('\0')) throw new OpError('invalid_args', 'The body cannot contain NUL bytes');
     ensureManagedDir(whmDir, { mode: 0o755 });
     ensureManagedDir(root, { mode: 0o755 });
     ensureManagedDir(dir, { mode: 0o755 });
     writeAtomic(text, ensureNl(body), { mode: 0o644 });
     writeAtomic(conf, headers, { mode: 0o644 });
-    // The autoreply transport keeps its "once" database here, writing as the
-    // Exim run user; the directory is root-created so a tenant cannot plant it.
+    // The autoreply transport keeps its "once" databases here (one flat file
+    // per address), writing as the Exim run user; the directory is
+    // root-created so a tenant cannot plant it.
     const onceRoot = ctx.assertAllowedPath(AUTOREPLY_DB_DIR, 'write');
-    const onceDir = ctx.assertAllowedPath(path.join(onceRoot, domain), 'write');
     const runUser = eximRunUser();
     ensureManagedDir(onceRoot, { mode: 0o750, uid: runUser?.uid ?? 0, gid: runUser?.gid ?? null });
-    ensureManagedDir(onceDir, { mode: 0o750, uid: runUser?.uid ?? 0, gid: runUser?.gid ?? null });
-    return { domain, localPart: local, conf, body: text, onceDir, onceOwner: runUser?.name ?? 'root' };
+    return { domain, localPart: local, conf, body: text, once: autoreplyOnceFiles(domain, local)[0], onceOwner: runUser?.name ?? 'root' };
   },
 });
 
 defineOp('vmail.autoresponder.remove', {
-  description: 'Remove the autoresponder files of an address',
+  description: 'Remove the autoresponder files and the Exim once-database of an address',
   schema: z.object({ domain: arg.domain, localPart }).strict(),
   destructive: true,
   run: async ({ domain, localPart: local }, ctx) => {
     const { whmDir } = eximWhmDir();
     const dir = path.join(whmDir, 'autoresponders', domain);
     const conf = ctx.assertAllowedPath(path.join(dir, `${local}.conf`), 'write');
-    const text = ctx.assertAllowedPath(path.join(dir, `${local}.txt`), 'write');
+    const text = ctx.assertAllowedPath(path.join(dir, local), 'write');
     const removed = [removeFile(conf), removeFile(text)].some(Boolean);
-    const once = ctx.assertAllowedPath(path.join(AUTOREPLY_DB_DIR, domain, `${local}.db`), 'write');
-    try { if (fs.lstatSync(once).isFile()) fs.unlinkSync(once); } catch { /* none */ }
-    return { domain, localPart: local, removed };
+    let onceRemoved = false;
+    for (const once of autoreplyOnceFiles(domain, local)) {
+      ctx.assertAllowedPath(once, 'write');
+      try { if (fs.lstatSync(once).isFile()) { fs.unlinkSync(once); onceRemoved = true; } } catch { /* none */ }
+    }
+    return { domain, localPart: local, removed, onceRemoved };
   },
 });
 

@@ -68,7 +68,9 @@ describe('FTP accounts page', () => {
     set({ data: [], meta: { ...meta, supported: false, virtualUsersEnabled: false, canEnable: true, hint: 'Enable PureDB under FTP Server Configuration' } });
     const html = render(h(FtpAccounts, { fn }));
     expect(html).toContain('Extra FTP logins are not enabled on this server');
-    expect(html).toContain('Enable PureDB under FTP Server Configuration');
+    expect(html).not.toContain('Enable PureDB under FTP Server Configuration');
+    expect(html).toContain('pure-ftpd serves the main login only.');
+    expect(html).toContain('Ask your hosting provider');
     expect(html).toContain('Create an FTP account');
     expect(html).toContain('No extra FTP accounts yet');
   });

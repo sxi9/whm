@@ -170,7 +170,7 @@ export default function FtpAccounts({ fn }) {
           {meta && meta.supported === false && (
             <div className="banner banner-warning" style={{ marginTop: 14, marginBottom: 0 }}>
               <AlertTriangle size={18} />
-              <div><strong>Extra FTP logins are not enabled on this server</strong><p>{meta.hint || `${meta.daemon} serves the main login only.`}</p><p className="muted">Your main login works as usual. Ask your hosting provider to enable per-folder FTP accounts.</p></div>
+              <div><strong>Extra FTP logins are not enabled on this server</strong>{meta.daemon && <p>{`${meta.daemon} serves the main login only.`}</p>}<p className="muted">Your main login works as usual. Ask your hosting provider to enable per-folder FTP accounts.</p></div>
             </div>
           )}
         </Card>

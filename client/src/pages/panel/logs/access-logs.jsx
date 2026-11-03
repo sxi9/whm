@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { RefreshCw, Download, ScrollText, AlertTriangle, Eye } from 'lucide-react';
 import { Card, KeyValue, EmptyState, formatBytes, formatDate } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
@@ -41,18 +41,17 @@ export default function AccessLogs({ fn }) {
   const { me } = usePanelMe();
   const [kind, setKind] = useState('apache');
   const [domain, setDomain] = useState('');
-  const [file, setFile] = useState('');
+  const [fileChoice, setFile] = useState('');
   const [bytes, setBytes] = useState('65536');
   const [live, setLive] = useState(false);
   const { data, error, loading, refetch } = usePanelApi(`/logs?kind=${kind}`);
-  const tail = usePanelApi(file ? `/logs/tail?kind=${kind}&file=${encodeURIComponent(file)}&bytes=${bytes}` : null, { enabled: Boolean(file), refreshMs: live && file ? 5000 : 0 });
   const capability = isCapabilityError(error);
-  const domains = data?.domains || [];
+  const domains = [...new Set(data?.domains || [])];
   const files = useMemo(() => filesForDomain(data?.files, domain), [data, domain]);
+  // The first file of the selection is shown until the user picks another one.
+  const file = files.some((f) => f.name === fileChoice) ? fileChoice : (files[0]?.name || '');
   const selected = files.find((f) => f.name === file) || null;
-
-  useEffect(() => { if (file && !files.some((f) => f.name === file)) setFile(''); }, [files, file]);
-  useEffect(() => { if (!file && files.length) setFile(files[0].name); }, [files, file]);
+  const tail = usePanelApi(file ? `/logs/tail?kind=${kind}&file=${encodeURIComponent(file)}&bytes=${bytes}` : null, { enabled: Boolean(file), refreshMs: live && file ? 5000 : 0 });
 
   if (isFeatureDisabled(error)) return <PanelPage fn={fn}><FeatureDisabledState fn={fn} /></PanelPage>;
 
@@ -77,7 +76,7 @@ export default function AccessLogs({ fn }) {
           </Field>
           <div className="form-grid">
             <Field label="Show" htmlFor="logs-bytes"><Select id="logs-bytes" value={bytes} onChange={setBytes} options={TAIL_SIZES} /></Field>
-            <Field label="Follow" inline><Toggle checked={live} onChange={setLive} label="Refresh every 5 seconds" disabled={!file} /></Field>
+            <Field label="Follow" htmlFor="logs-follow"><Toggle checked={live} onChange={setLive} label="Refresh every 5 seconds" description="Keeps the view current while you watch traffic" disabled={!file} /></Field>
           </div>
           <FormActions>
             <Button icon={Eye} disabled={!file} onClick={() => tail.refetch()}>Reload view</Button>

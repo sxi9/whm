@@ -10,6 +10,18 @@ import { HttpError } from '../../lib/errors.js';
 
 export const PANEL_SCOPES = ['panel:read', 'panel:files', 'panel:email', 'panel:dns', 'panel:databases', 'panel:backups', 'panel:cron'];
 
+// §3.4: a token whose scopes are all panel:* may call nothing but the panel and
+// GET /api/auth/me. middleware/auth.js matches confinement entries by exact
+// mounted path today; the prefix form below is honoured once core's requireAuth
+// accepts it and marks the registry with `prefixes = true`, which is when
+// routes/categories/panel.js registers these.
+export const PANEL_TOKEN_ROUTES = Object.freeze([{ path: '/api/panel', prefix: true }, { method: 'GET', path: '/api/auth/me' }]);
+export function confinePanelTokens(ctx) {
+  ctx.confinedScopes ??= new Map();
+  for (const scope of PANEL_SCOPES) ctx.confinedScopes.set(scope, [...PANEL_TOKEN_ROUTES]);
+  return ctx.confinedScopes;
+}
+
 // A path relative to the account's home (or public_html): no leading "/", no
 // leading "-", no ".." segment, no NUL or newline, at most 512 characters.
 export const REL_PATH_RE = /^(?!-)(?!.*(^|\/)\.\.(\/|$))[^\0\n]{1,512}$/;

@@ -67,19 +67,25 @@ describe('Customer panel identity', () => {
     expect(app.ctx.panel.backfill()).toMatchObject({ created: 0, adopted: 0 });
   });
 
-  it('adopts a demoted reseller row with the account username instead of duplicating it', async () => {
+  it('the boot backfill adopts a demoted reseller row with the account username, keeping its login', async () => {
     const hash = await app.ctx.crypto.hashPassword('Demoted-Passw0rd!');
     db().prepare("INSERT INTO users (username, role, password_hash, email) VALUES ('dave', 'user', ?, 'dave@dave.com')").run(hash);
     db().prepare("INSERT INTO accounts (username, domain, owner_id, package_name, home_dir) VALUES ('dave', 'dave.com', 1, 'default', '/home/dave')").run();
-    const r = app.ctx.panel.ensureUser('dave', null);
-    expect(r).toMatchObject({ created: false, adopted: true, linked: true, userId: userRow('dave').id });
+    // A demoted reseller whose row was suspended at reset time stays suspended after adoption.
+    db().prepare("INSERT INTO users (username, role, password_hash, suspended) VALUES ('dora', 'user', ?, 1)").run(hash);
+    db().prepare("INSERT INTO accounts (username, domain, owner_id, package_name, home_dir) VALUES ('dora', 'dora.com', 1, 'default', '/home/dora')").run();
+    expect(app.ctx.panel.backfill()).toMatchObject({ created: 0, adopted: 2 });
+    expect(link('dave')).toMatchObject({ user_id: userRow('dave').id });
     expect(db().prepare("SELECT COUNT(*) AS n FROM users WHERE username = 'dave'").get().n).toBe(1);
-    expect(auditRows('panel.user.adopt', 'dave')).toHaveLength(1);
+    expect(JSON.parse(auditRows('panel.user.adopt', 'dave')[0].args_redacted)).toMatchObject({ credentialsKept: true, by: 'boot' });
+    expect(userRow('dave').password_hash).toBe(hash);
+    expect(userRow('dora')).toMatchObject({ suspended: 1, password_hash: hash });
     // The adopted login keeps its password and can open the panel.
     const http = request.agent(app.ctx.app);
     await http.post('/api/auth/login').send({ username: 'dave', password: 'Demoted-Passw0rd!' }).expect(200);
     const me = await http.get('/api/panel/me').expect(200);
     expect(me.body.data.account.username).toBe('dave');
+    await request.agent(app.ctx.app).post('/api/auth/login').send({ username: 'dora', password: 'Demoted-Passw0rd!' }).expect(401);
   });
 
   it('never links an administrator login that shares the account username', async () => {
@@ -117,6 +123,60 @@ describe('Customer panel identity', () => {
     expect(me.body.data.account).toMatchObject({ username: 'alice', domain: 'alice.com', package: 'default', suspended: false });
     expect(me.body.data.policy.passwordSynced).toBe(true);
     expect(me.body.data.actingAs).toBeNull();
+  });
+
+  it('a refused termination by a foreign reseller never touches the account user\'s sessions', async () => {
+    const alice = request.agent(app.ctx.app);
+    await alice.post('/api/auth/login').send({ username: 'alice', password: 'Alice-Passw0rd!' }).expect(200);
+    const aliceId = userRow('alice').id;
+    const before = db().prepare('SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?').get(aliceId).n;
+    expect(before).toBeGreaterThan(0);
+    const r = request.agent(app.ctx.app);
+    const login = await r.post('/api/auth/login').send({ username: 'resell1', password: 'Test-Passw0rd!1' }).expect(200);
+    for (let i = 0; i < 3; i++) {
+      const res = await r.delete('/api/accounts/alice').set('X-CSRF-Token', login.body.data.csrfToken).expect(403);
+      expect(res.body.error.code).toBe('forbidden');
+    }
+    expect(app.agent.callsTo('user.delete')).toHaveLength(0);
+    expect(db().prepare('SELECT COUNT(*) AS n FROM accounts WHERE username = ?').get('alice').n).toBe(1);
+    expect(db().prepare('SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?').get(aliceId).n).toBe(before);
+    expect((await alice.get('/api/panel/me').expect(200)).body.data.account.username).toBe('alice');
+  });
+
+  it('adoption on account creation strips an orphan login\'s credentials and never un-suspends it', async () => {
+    const hash = await app.ctx.crypto.hashPassword('Old-Passw0rd!!');
+    const secret = app.ctx.crypto.encrypt('JBSWY3DPEHPK3PXP');
+    db().prepare("INSERT INTO users (username, role, password_hash, totp_secret_enc, totp_enabled, suspended) VALUES ('victim', 'user', ?, ?, 1, 0)").run(hash, secret);
+    db().prepare("INSERT INTO users (username, role, password_hash, suspended) VALUES ('sleeper', 'user', ?, 1)").run(hash);
+    db().prepare("INSERT INTO sessions (sid, user_id, data, expires_at) VALUES ('victim-sid', (SELECT id FROM users WHERE username = 'victim'), '{}', ?)").run(Date.now() + 3_600_000);
+    const r = request.agent(app.ctx.app);
+    const login = await r.post('/api/auth/login').send({ username: 'resell1', password: 'Test-Passw0rd!1' }).expect(200);
+    const rPost = (p, body) => r.post(p).set('X-CSRF-Token', login.body.data.csrfToken).send(body);
+    await rPost('/api/accounts', { username: 'victim', domain: 'victim.com' }).expect(201);
+    await rPost('/api/accounts', { username: 'sleeper', domain: 'sleeper.com' }).expect(201);
+    expect(link('victim')).toBeTruthy();
+    expect(userRow('victim')).toMatchObject({ role: 'user', password_hash: null, totp_secret_enc: null, totp_enabled: 0, suspended: 0 });
+    expect(userRow('sleeper')).toMatchObject({ password_hash: null, suspended: 1 });
+    expect(db().prepare("SELECT COUNT(*) AS n FROM sessions WHERE sid = 'victim-sid'").get().n).toBe(0);
+    expect(JSON.parse(auditRows('panel.user.adopt', 'victim')[0].args_redacted)).toMatchObject({ credentialsKept: false, by: 'resell1' });
+    await request.agent(app.ctx.app).post('/api/auth/login').send({ username: 'victim', password: 'Old-Passw0rd!!' }).expect(401);
+    await request.agent(app.ctx.app).post('/api/auth/login').send({ username: 'sleeper', password: 'Old-Passw0rd!!' }).expect(401);
+    // The owner sets a password through the admin endpoint; the suspended login stays suspended until the account itself is unsuspended.
+    await rPost('/api/panel/admin/accounts/sleeper/password', { password: 'Sleeper-Passw0rd!' }).expect(200);
+    expect(userRow('sleeper').suspended).toBe(1);
+    await request.agent(app.ctx.app).post('/api/auth/login').send({ username: 'sleeper', password: 'Sleeper-Passw0rd!' }).expect(401);
+  });
+
+  it('adoption through the admin endpoint replaces the credentials and aligns suspension with the account', async () => {
+    const hash = await app.ctx.crypto.hashPassword('Frank-Old-Passw0rd!');
+    db().prepare("INSERT INTO users (username, role, password_hash, suspended) VALUES ('frank', 'user', ?, 1)").run(hash);
+    db().prepare("INSERT INTO accounts (username, domain, owner_id, package_name, home_dir, uid, gid) VALUES ('frank', 'frank.com', 1, 'default', '/home/frank', 30011, 30011)").run();
+    const res = await root.post('/api/panel/admin/accounts/frank/user', { password: 'Frank-Passw0rd!!' }).expect(201);
+    expect(res.body.data).toMatchObject({ adopted: true, linked: true, passwordSynced: true, credentialsKept: false });
+    expect(userRow('frank').suspended).toBe(0);
+    expect(JSON.parse(auditRows('panel.user.adopt', 'frank')[0].args_redacted)).toMatchObject({ credentialsKept: false, by: 'root' });
+    await request.agent(app.ctx.app).post('/api/auth/login').send({ username: 'frank', password: 'Frank-Old-Passw0rd!' }).expect(401);
+    await request.agent(app.ctx.app).post('/api/auth/login').send({ username: 'frank', password: 'Frank-Passw0rd!!' }).expect(200);
   });
 
   it('syncPassword only writes the hash (the caller already set the Linux side)', async () => {
@@ -203,6 +263,30 @@ describe('Customer panel identity', () => {
       await http.get('/api/panel/me').expect(401);
       await request.agent(app.ctx.app).post('/api/auth/login').send({ username: 'alice', password: 'Alice-NewPassw0rd!' }).expect(200);
     });
+
+    it('changePasswordForUser runs the same flow for core\'s forced-change path and ignores non-account logins', async () => {
+      const user = userRow('alice');
+      db().prepare('UPDATE users SET must_change_password = 1 WHERE id = ?').run(user.id);
+      const req = fakeReq({ ...user, must_change_password: 1 });
+      // `force` only counts when the row really is flagged, and never for another login.
+      await expect(app.ctx.panel.changePasswordForUser(user.id, { currentPassword: 'wrong', newPassword: 'Alice-Forced-Passw0rd!', force: false }, req)).rejects.toMatchObject({ status: 401 });
+      const r = await app.ctx.panel.changePasswordForUser(user.id, { newPassword: 'Alice-Forced-Passw0rd!', force: true }, req);
+      expect(r).toMatchObject({ changed: true, host: { applied: true } });
+      expect(app.agent.callsTo('user.set_password').map((c) => c.args)).toEqual([{ username: 'alice', password: 'Alice-Forced-Passw0rd!' }]);
+      expect(userRow('alice').must_change_password).toBe(0);
+      expect(await app.ctx.crypto.verifyPassword('Alice-Forced-Passw0rd!', userRow('alice').password_hash)).toBe(true);
+      expect(link('alice').password_synced_at).toBeTruthy();
+      expect(req.entries.find((e) => e.action === 'panel.password.change')).toMatchObject({ target: 'alice', args: { forced: true } });
+      await expect(app.ctx.panel.changePasswordForUser(user.id, { newPassword: 'Alice-NewPassw0rd!', force: true }, req)).rejects.toMatchObject({ status: 401 });
+      expect(await app.ctx.panel.changePasswordForUser(1, { newPassword: 'Root-Passw0rd!!!', force: true }, req)).toBeNull();
+      expect(app.ctx.panel.linkForUser(1)).toBeNull();
+      await app.ctx.panel.changePasswordForUser(user.id, { currentPassword: 'Alice-Forced-Passw0rd!', newPassword: 'Alice-NewPassw0rd!' }, req);
+    });
+
+    // Integrator seam (routes/auth.js is shared): POST /api/auth/password must delegate to
+    // ctx.panel.changePasswordForUser for a linked login, otherwise the forced-change path
+    // rotates only users.password_hash and the Linux password keeps the old value.
+    it.todo('POST /api/auth/password with must_change_password=1 writes both stores for an account user');
 
     it('clears the account-level forced change and refuses a weak password when the policy says so', async () => {
       db().prepare("UPDATE accounts SET force_password_change = 1 WHERE username = 'alice'").run();

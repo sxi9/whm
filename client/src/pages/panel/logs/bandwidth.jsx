@@ -30,7 +30,7 @@ export default function Bandwidth({ fn }) {
   const peak = useMemo(() => peakOf(data?.months), [data]);
   const thisPeriod = currentPeriod();
   const current = rows.find((r) => r.period === thisPeriod) || rows[0] || null;
-  const limitMb = data?.limitMb ?? me?.account?.limits?.bandwidth_mb ?? null;
+  const limitMb = data ? data.limitMb ?? null : me?.account?.limits?.bandwidth_mb ?? null;
   const unlimited = limitMb == null || limitMb <= 0;
   const percent = current && !unlimited ? percentOf(current.usedMb, limitMb) : null;
   const total = rows.reduce((s, r) => s + (Number(r.bytes) || 0), 0);
