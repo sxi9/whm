@@ -220,7 +220,7 @@ describe('Server Contacts API', () => {
     expect(data.events.map((e) => e.key)).toEqual(expect.arrayContaining(['account.created', 'account.suspended', 'backup.failed', 'service.down', 'disk.space.low', 'login.failed.blocked', 'ssl.expiring', 'license.expiring', 'license.invalid']));
     expect(data.channels).toEqual(['email', 'sms', 'slack', 'pushover', 'webhook']);
     expect(data.capability).toMatchObject({ exim: false, smtp: false, mailTransport: null, hostname: 'panel.example.com' });
-    expect(data.settings).toMatchObject({ enabled: true, effectiveFrom: 'whm@panel.example.com', smtp: { host: '', port: 587, security: 'starttls', password: { set: false } }, check: { enabled: true, diskThresholdPercent: 90, cooldownMinutes: 360 } });
+    expect(data.settings).toMatchObject({ enabled: true, effectiveFrom: 'keel@panel.example.com', smtp: { host: '', port: 587, security: 'starttls', password: { set: false } }, check: { enabled: true, diskThresholdPercent: 90, cooldownMinutes: 360 } });
     expect(data.schedule).toMatchObject({ name: 'server-contacts-check', enabled: true });
     expect(data.stats).toEqual({ total: 0, last24h: 0, failed: 0 });
   });
@@ -463,12 +463,12 @@ describe('Server Contacts API', () => {
     await app.ctx.capabilities.refresh();
     expect(typeof app.ctx.contacts.sendMail).toBe('function');
     app.ctx.settings.set('basic.hostname', 'bare-host');
-    await expect(app.ctx.contacts.sendMail({ to: 'a@example.com', subject: 'Hi', body: 'x' })).resolves.toMatchObject({ from: 'whm@bare-host.localdomain' });
+    await expect(app.ctx.contacts.sendMail({ to: 'a@example.com', subject: 'Hi', body: 'x' })).resolves.toMatchObject({ from: 'keel@bare-host.localdomain' });
     app.ctx.settings.set('basic.hostname', 'panel.example.com');
     sentViaExim = [];
     const r = await app.ctx.contacts.sendMail({ to: 'a@example.com', subject: 'Hello', body: 'line1\nline2' });
-    expect(r).toMatchObject({ transport: 'exim', from: 'whm@panel.example.com', to: ['a@example.com'], accepted: true });
-    expect(sentViaExim).toEqual([{ from: 'whm@panel.example.com', to: ['a@example.com'], subject: 'Hello', text: 'line1\nline2' }]);
+    expect(r).toMatchObject({ transport: 'exim', from: 'keel@panel.example.com', to: ['a@example.com'], accepted: true });
+    expect(sentViaExim).toEqual([{ from: 'keel@panel.example.com', to: ['a@example.com'], subject: 'Hello', text: 'line1\nline2' }]);
     expect(auditRows('contacts.mail.send').at(-1)).toMatchObject({ target: 'a@example.com' });
     // With Exim the host's /etc/aliases does the forwarding, so root mail stays addressed to root@<fqdn> whatever the saved list says.
     app.ctx.settings.set('contacts.root_forward', ['admin@example.net']);
@@ -483,7 +483,7 @@ describe('Server Contacts API', () => {
     expect((await post('/api/server-contacts/mail-preferences/test').expect(200)).body.data).toMatchObject({ status: 'sent', transport: 'exim', address: 'root@panel.example.com' });
     expect(auditRows('contacts.mail.send').at(-1)).toMatchObject({ target: 'root@panel.example.com' });
     await expect(app.ctx.contacts.sendMail({ to: '-bounce@example.com', subject: 'x', body: 'y' })).rejects.toMatchObject({ status: 422 });
-    await expect(app.ctx.contacts.sendMail({ to: 'a@example.com', subject: 'x', body: 'y', from: '-f@example.com' })).resolves.toMatchObject({ from: 'whm@panel.example.com' });
+    await expect(app.ctx.contacts.sendMail({ to: 'a@example.com', subject: 'x', body: 'y', from: '-f@example.com' })).resolves.toMatchObject({ from: 'keel@panel.example.com' });
 
     await put('/api/server-contacts/settings', { smtp: { host: '127.0.0.1', port: smtpPort, security: 'none', prefer: true } }).expect(200);
     expect((await get('/api/server-contacts').expect(200)).body.data.capability.mailTransport).toBe('smtp');

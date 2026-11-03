@@ -56,7 +56,9 @@ export function StatusPill({ status, children }) {
     failed: 'bad', error: 'bad', down: 'bad', unknown: 'muted', 'not-installed': 'muted', disabled: 'muted', cancelled: 'muted',
   };
   const tone = map[String(status).toLowerCase()] || 'muted';
-  return <span className={`pill pill-${tone}`}>{children ?? status}</span>;
+  const text = children ?? status;
+  const label = typeof text === 'string' && text ? text[0].toUpperCase() + text.slice(1) : text;
+  return <span className={`pill pill-${tone}`}>{label}</span>;
 }
 
 export function Loading({ text = 'Loading…' }) {

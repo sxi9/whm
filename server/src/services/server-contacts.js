@@ -324,7 +324,7 @@ export function createServerContactsService(ctx) {
   // .localdomain suffix rather than failing every notification.
   function fromAddress() {
     const host = hostname();
-    const from = setting('contacts.from_address', '') || setting('mail.notification_from', '') || `whm@${FQDN_RE.test(host) ? host : `${host}.localdomain`}`;
+    const from = setting('contacts.from_address', '') || setting('mail.notification_from', '') || `keel@${FQDN_RE.test(host) ? host : `${host}.localdomain`}`;
     if (!EMAIL_RE.test(from)) throw unprocessable(`"${from}" is not a usable sender address: set a From address in Contact Manager or a fully-qualified hostname in Basic Setup`, { from: ['Must be a full email address with a dotted domain'] });
     return from;
   }
