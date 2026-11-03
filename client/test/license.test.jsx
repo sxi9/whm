@@ -44,7 +44,7 @@ describe('License tab', () => {
     expect(html).toContain('Renewal_available');
     expect(html).toContain('unlimited');
     expect(html).toContain('Hosting accounts');
-    expect(html).toContain('not included');
+    expect(html).toContain('Not included');
     expect(html).toContain(describeStatus(active));
     expect(html).not.toContain('license-unverified');
   });
