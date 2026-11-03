@@ -4,7 +4,7 @@
 // READMEs that show every screenshot inline.
 //
 //   BASE=http://127.0.0.1:2086 PASSWORD='<root password>' OUT=docs/screenshots node e2e/screenshot-all.cjs
-const { chromium } = require('playwright');
+const { chromium, request } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
@@ -122,6 +122,51 @@ function grid(items, perRow = 3) {
     }
     process.stdout.write(`${cat.label}: ${cat.functions.length}\n`);
   }
+
+  // The account panel, captured as an admin acting as a demo hosting account
+  // (created through the API when missing, like e2e/panel-check.cjs does).
+  const { PANEL_CATEGORIES } = await import(pathToFileURL(path.join(__dirname, '..', 'client', 'src', 'panel', 'nav.js')).href);
+  const panelStatuses = {};
+  let panelCount = 0;
+  try {
+    const api = await request.newContext({ baseURL: BASE });
+    const login = await (await api.post('/api/auth/login', { data: { username: 'root', password: PASSWORD } })).json();
+    const h = { 'X-CSRF-Token': login.data.csrfToken };
+    if ((await api.get('/api/accounts/demopanel')).status() === 404) {
+      await api.post('/api/accounts', { headers: h, data: { username: 'demopanel', domain: 'demopanel.example.com', password: 'Demo-Panel-Passw0rd!9', contactEmail: 'owner@demopanel.example.com' } });
+    }
+    const las = await api.post('/api/panel/admin/login-as/demopanel', { headers: h });
+    if (!las.ok()) throw new Error(`login-as failed: ${las.status()} ${await las.text()}`);
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, storageState: await api.storageState() });
+    const ppage = await ctx.newPage();
+    const pshot = async (file) => { fs.mkdirSync(path.dirname(file), { recursive: true }); await ppage.screenshot({ path: file, type: 'jpeg', quality: QUALITY }); };
+    const psettle = async (selector) => { try { await ppage.waitForSelector(selector, { timeout: 8000 }); } catch { /* capture anyway */ } await ppage.waitForTimeout(250); };
+    await ppage.goto(`${BASE}/panel`, { waitUntil: 'domcontentloaded' });
+    await psettle('.stat-grid');
+    await stamp(ppage, tag('Account panel › Home', 'live'));
+    await pshot(path.join(pagesDir, 'panel', '_core', 'home.jpg'));
+    for (const cat of PANEL_CATEGORIES) {
+      for (const fn of cat.functions) {
+        try {
+          await ppage.goto(`${BASE}${fn.path}`, { waitUntil: 'domcontentloaded' });
+          await psettle('.page-header');
+          const status = await pageStatus(ppage);
+          panelStatuses[fn.key] = status;
+          await stamp(ppage, tag(`Account panel › ${cat.label} › ${fn.label}`, status));
+          await pshot(path.join(pagesDir, 'panel', cat.slug, `${fn.slug}.jpg`));
+          panelCount++;
+        } catch (err) {
+          failures.push(`${fn.key}: ${err.message.split('\n')[0]}`);
+        }
+      }
+      process.stdout.write(`Account panel › ${cat.label}: ${cat.functions.length}\n`);
+    }
+    await api.post('/api/panel/admin/logout-as', { headers: h }).catch(() => {});
+    await ctx.close();
+    await api.dispose();
+  } catch (err) {
+    failures.push(`account panel: ${err.message.split('\n')[0]}`);
+  }
   await browser.close();
 
   // Gallery of every page, grouped by category, images inline.
@@ -131,12 +176,19 @@ function grid(items, perRow = 3) {
     const liveCount = cat.functions.filter((f) => statuses[f.key] === 'live').length;
     pagesReadme.push(`## ${cat.index}. ${cat.label} — ${liveCount}/${cat.functions.length} live`, '', grid(cat.functions.map((f) => [`${cat.slug}/${f.slug}.jpg`, f.label, statuses[f.key] || 'live'])), '');
   }
+  if (panelCount) {
+    pagesReadme.push('# The account panel', '', `What a hosting customer sees at \`/panel\` (captured as root acting as the demo account; ${panelCount} pages).`, '',
+      grid([['panel/_core/home.jpg', 'Account panel home', 'live']]), '');
+    for (const cat of PANEL_CATEGORIES) {
+      pagesReadme.push(`## Account panel · ${cat.label}`, '', grid(cat.functions.map((f) => [`panel/${cat.slug}/${f.slug}.jpg`, f.label, panelStatuses[f.key] || 'live'])), '');
+    }
+  }
   fs.writeFileSync(path.join(pagesDir, 'README.md'), pagesReadme.join('\n'));
 
   // Top-level gallery: the flow screenshots inline + link to every page.
   const flow = FLOW_SHOTS.filter(([file]) => fs.existsSync(path.join(OUT, file))).map(([file, label]) => [file, label, null]);
   const topReadme = ['# Screenshots', '', `Updated ${DATE} at commit \`${SHA}\`. All images are captured automatically (Playwright) against the built interface served by the API, and each carries a label bar naming the screen, whether it is live or a placeholder, the date and the commit. They are regenerated at every milestone (\`e2e/screenshots.sh\`).`, '',
-    `- **[Every page →](pages/README.md)** — all 212 function pages grouped by category (${live}/${count} live) plus core pages.`, '', '## Flow', '', 'Login → dashboard → creating an account through the form → lists, status pages, configuration and search.', '', grid(flow, 2), '',
+    `- **[Every page →](pages/README.md)** — all 212 admin function pages grouped by category (${live}/${count} live), the core pages, and the account panel (${panelCount} pages).`, '', '## Flow', '', 'Login → dashboard → creating an account through the form → lists, status pages, configuration and search.', '', grid(flow, 2), '',
     '## Regenerate', '', '```bash', "BASE=http://127.0.0.1:2086 PASSWORD='<root password>' bash e2e/screenshots.sh   # flow shots + every page + galleries", '```', ''];
   fs.writeFileSync(path.join(OUT, 'README.md'), topReadme.join('\n'));
 
