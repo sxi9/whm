@@ -38,7 +38,7 @@ const FLOW_SHOTS = [
   ['14-process-manager.png', 'Process Manager'],
   ['15-license-tab.png', 'Basic WebHost Manager Setup — License tab'],
   ['16-manage-plugins-marketplace.png', 'Manage Plugins — Marketplace tab'],
-  ['17-whm-marketplace.png', 'WHM Marketplace'],
+  ['17-whm-marketplace.png', 'Marketplace'],
 ];
 
 // Stamps a label bar at the top of the rendered page so the screenshot explains itself.
@@ -86,7 +86,7 @@ function grid(items, perRow = 3) {
     try { await page.waitForSelector(selector, { timeout: 8000 }); } catch { /* fall through, still capture */ }
     await page.waitForTimeout(250);
   };
-  const tag = (where, status) => `WHM › ${where} · ${status} · ${DATE} · ${SHA}`;
+  const tag = (where, status) => `Keel › ${where} · ${status} · ${DATE} · ${SHA}`;
 
   await page.goto(`${BASE}/login`);
   await settle('#username');

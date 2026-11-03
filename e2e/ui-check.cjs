@@ -18,7 +18,7 @@ const LABELS = {
   '05-list-accounts': 'List Accounts', '06-service-status': 'Service Status', '07-server-information': 'Server Information', '08-feature-manager': 'Feature Manager',
   '09-tweak-settings': 'Tweak Settings', '10-wp-toolkit-plugin': 'WP Toolkit (bundled plugin page)', '11-sidebar-search': 'Sidebar search',
   '12-top-search': 'Global search', '13-restart-service': 'Restart HTTP Server (Apache)', '14-process-manager': 'Process Manager',
-  '15-license-tab': 'Basic WebHost Manager Setup — License tab', '16-manage-plugins-marketplace': 'Manage Plugins — Marketplace tab', '17-whm-marketplace': 'WHM Marketplace',
+  '15-license-tab': 'Basic Setup — License tab', '16-manage-plugins-marketplace': 'Manage Plugins — Marketplace tab', '17-whm-marketplace': 'Marketplace',
 };
 // Stamps a label bar at the top of the page so the screenshot explains itself.
 async function stamp(page, text) {

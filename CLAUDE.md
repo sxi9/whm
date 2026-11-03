@@ -36,6 +36,8 @@ verified developers, and bundled plugins are part of the product (deferred to Ph
 | 2026-10-27 | **Signing:** `kid` = first 8 hex of sha256(raw Ed25519 public key) for license, plugin-signing and developer keys; tokens and `X-WHM-Signature` use base64url, package signatures (`SIGNATURE.json`, `DEV-SIGNATURE.json`) use standard base64 with padding — what the host decodes. `signing_keys` (with `purpose`) lives only in license.db, used through `ctx.keys`. |
 | 2026-10-27 | **Panel identity:** `ctx.license` owns the hub URL (token `iss`, bootstrap `WHM_LICENSE_HUB_URL`) and the license key (License tab only); the Market Provider `whm-hub` row is just an enable switch (`hub_mismatch` if its origin differs). Enforcement gates (degraded 423, feature gates, capacity) run only when `config.licenseEnforce` is true (default true under `NODE_ENV=production`, false in dev/tests). |
 | 2026-10-27 | **Plugins distribution:** the three monitoring/security/WordPress plugins **and the automated-backup plugin** are bundled (`plugins/bundled/*`, installed at boot, exempt from `plugins.require_signature`); the sample plugin `net.whm.sample-notes` is marketplace-distributed under the vendor developer `net.whm`. Marketplace installs go through the host's additive `install(input, { policy: { requireSigned, signers, activate: false, expectedId } })`; consent is compared against the installed, signature-verified manifest. |
+| 2026-11-03 | **Identity + UI:** the product is **Keel**; `docs/design/ui-design-system.md` is the UI contract; a renamed function keeps its key/route via the `{ slug }` override in `nav.js`; the account holder's interface is "the account panel" (`/panel`), cPanel/WHM wording only for the external product. |
+| 2026-11-03 | **zod 4:** two-argument `z.record`, `.prefault({})` for nested defaults, `patchOf()` for PATCH bodies, `fields.ipv4/ipv6/ip` keep zod-3 IPv6 parity. |
 | 2026-10-27 | `hub/ui` **copies** the panel's component kit (`hub/ui/src/components/SYNC.md` records the source commit) instead of importing across packages. Hub tests are `node --test`; hub/ui and the panel use vitest. |
 
 ## Non-negotiable conventions
@@ -183,6 +185,16 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Current state (update every push)
 
+- **2026-11-03 21:30: Phase 7 milestone 1** (user ask: "all new modern UI like iOS, not AI-looking; our own panel
+  instead of cPanel"). Product identity is **Keel** (default branding via migration `028c`; operators rename it under
+  Panel › Customization). **Design system** `docs/design/ui-design-system.md` (tokens.css/base.css rewritten; sidebar-first
+  shell with coloured icon tiles from `icons.js` `colorFor`, translucent bars, inset grouped cards, iOS switches, floating
+  row menus, sheets); all 30 categories swept by parallel agents with screenshot reviews (`74374de`). Labels renamed with
+  **stable keys** (nav.js 4th element `{ slug }`), i18n catalog and docs/server/agent/hub strings follow (external cPanel
+  references kept; legacy managed-block markers still recognised). Phase-6 verifier ran: sql_mode dump-screen bypass and
+  six smaller gaps fixed; all §4.2 deferred items closed (zod 4 `7788431`, react-router 7, temp DB import user, 2FA-disable
+  re-verify, hub `ui_dist`). Gate: server 1158 / agent 504 / client 52 / hub 184 / hub-ui 105 + SDK + plugins, builds, e2e.
+  **Next: the customer panel** from `docs/design/customer-panel.md` (see `HANDOFF.md` §4).
 - **2026-10-25:** Blueprint complete and pushed. **Phase 0 foundation works end to end**
   (`npm install` → `node server/src/index.js` boots, migrates, seeds root; login with forced
   password change; CSRF; RBAC; status/services via real agent ops; packages CRUD; account
@@ -284,6 +296,7 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   verified-IP login (new address → audit + `ctx.contacts.notify('login.new_ip')`). Public
   OIDC routes `GET /api/auth/external[/:name/start|/callback]` use `ctx.security.externalAuth`
   (state+nonce in session; `?link=1` links the current user). Tests: `server/test/auth-policy.test.js`.
+- **UI review loop:** boot the API on a side port with a scratch data dir, `npx vite --port 5173` with `WHM_API_URL`, screenshot routes through the dev server in both schemes (agents did this per category; the helper lived in the session scratchpad).
 - **Screenshots are a deliverable the user wants kept current:** after every wave/milestone run
   `BASE=… PASSWORD=… bash e2e/screenshots.sh` (needs the built client served by the API); it
   stamps a label bar on every image and rewrites the gallery READMEs under `docs/screenshots/`.
@@ -302,7 +315,7 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Resume notes
 
-- Working branch: `claude/trusting-cori-ifp7wy` (push with `git push -u origin <branch>`).
+- Working branch: `claude/kind-meitner-dlnbas` (push with `git push -u origin <branch>`).
 - A multi-agent design run for the deferred Phase 5 items was paused:
   run id `wf_7104d0c5-441`, script
   `/root/.claude/projects/-home-user-whm/0c92c5a2-840d-518f-8036-382a362911d8/workflows/scripts/whm-license-marketplace-plugins-wf_7104d0c5-441.js`

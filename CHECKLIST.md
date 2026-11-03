@@ -8,7 +8,7 @@
 
 ## Current state
 
-- **Branch:** `claude/kind-meitner-dlnbas` · **Last updated:** 2026-11-03 20:45 UTC · **Phase 7 (new UI, own identity, customer panel) in progress — see the Phase 7 table below and `HANDOFF.md` §4**
+- **Branch:** `claude/kind-meitner-dlnbas` · **Last updated:** 2026-11-03 21:35 UTC · **Phase 7 (new UI, own identity, customer panel) in progress — see the Phase 7 table below and `HANDOFF.md` §4**
 - **2026-11-03 baseline gate on a fresh container:** server 1158 / agent 470 / client 52 / hub 184 / hub-ui 105 green after two test-only fixes (the 2FA replay test timeout, `/tmp/whm` created by the agent temp-dir tests).
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
@@ -72,8 +72,8 @@ this table; estimates are revised at each milestone.
 | **Own identity** — Keel as default branding (`028c`), label overrides in `nav.js` with stable keys, i18n catalog, docs (99 edits) + server/agent/hub strings (legacy managed-block markers kept), support links, `keel@` sender, `KEEL-` ticket refs | done `22001ff`…`643e0a6` | 50 min | 20:40 |
 | Phase-6 verifier (read-only review of `b01bd30`) + fixes: sql_mode dump-screen bypass, link-safe `fs.write_file`, SQL-side reseller job filter, 2FA disable re-verification, enrollment rate limit, `backup.db.import` temp user, hub `ui_dist` | done `18fe699`, `4630c2d`, `00a9cb6` | 35 min | 19:15 |
 | hub/ui portals on the new kit (sidebar-first shell, SYNC.md) | done `18fe699` | 15 min | 18:52 |
-| zod 3 → 4 migration (server, agent, hub) with the full gate | running | ~45 min | 21:00 |
-| Milestone 1: react-router 7, gate + build + e2e + **screenshot refresh**, trackers, push | pending | 30 min | 21:40 |
+| zod 3 → 4 migration (server, agent, hub) with the full gate — records, prefault, patchOf, IPv6 parity | done `7788431` | 40 min | 20:55 |
+| Milestone 1: react-router 7 (`c87c235`), full gate + builds + e2e green, **screenshot refresh** (all 212 pages + 17 flow shots relabelled `Keel › …`), HANDOFF/CLAUDE/CHECKLIST, push | done | 35 min | 21:35 |
 | **Customer panel** build (from the design doc): migration + account users + "log in as", new agent ops (mail accounts/forwarders, FTP users, user crontab, archive), `/api/panel/*` services + routes, `/panel` shell + pages, tests — parallel units, two review lenses on root-level code, one fix round | pending | ~4 h | 02:00 (4th) |
 | Milestone 2: full gate, e2e incl. the customer panel, **screenshot refresh** (admin + customer panel galleries), manuals updated, tick P6, trackers, push | pending | 40 min | 02:40 (4th) |
 | **Total remaining** | | **~6 h** | |
@@ -99,7 +99,7 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [x] **P3 Security & mail** — Security Center, Email, Exim/Dovecot config, SSL/TLS + AutoSSL (ACME)
 - [x] **P4 Resellers, IP, backup, transfers** — Resellers, IP Functions, Backup + scheduler + destinations, Transfers + Transfer Tool, Networking Setup, Server Contacts, System Reboot
 - [x] **P5 Software & platform** — Software (MultiPHP, EasyApache, updates), Locales, Clusters, Themes, Market, cPanel section, Development (API tokens, hooks, OpenAPI), Support, **license client + hub/license server, plugin host + plugin marketplace, sample + automated-backup plugins** *(deferred items land here)*
-- [ ] **P6 Hardening & deploy** — `scripts/install.sh`, systemd units, panel TLS, Security Advisor rules, docs, e2e tests, performance pass
+- [x] **P6 Hardening & deploy** — `scripts/install.sh`, systemd units, panel TLS, Security Advisor rules, docs, e2e tests, performance pass *(three audits + independent verifier; all deferred items closed 2026-11-03 — `HANDOFF.md` §4 history)*
 
 ## Deferred work (do at the end — Phase 5)
 
@@ -355,7 +355,7 @@ Faster option: verification can be cut to one reviewer and one fix round per cat
 - [x] Install an SSL Certificate on a Domain
 - [x] Manage AutoSSL
 - [x] Manage SSL Hosts
-- [~] Purchase and Install an SSL Certificate *(Provider list from settings market.providers (default cpstore, disabled), order flow records an ssl_orders row + generates/stores a CSR (wil)*
+- [x] Purchase and Install an SSL Certificate *(Provider list from settings market.providers (default cpstore, disabled), order flow records an ssl_orders row + generates/stores a CSR (wil)*
 - [x] SSL Storage Manager
 - [x] SSL/TLS Configuration
 
