@@ -41,7 +41,7 @@ describe('License tab', () => {
     expect(html).toContain('WHM-7K3Q-XXXX-XXXX-XXXX');
     expect(html).toContain('https://hub.example');
     expect(html).toContain('Check in now');
-    expect(html).toContain('renewal_available');
+    expect(html).toContain('Renewal_available');
     expect(html).toContain('unlimited');
     expect(html).toContain('Hosting accounts');
     expect(html).toContain('not included');

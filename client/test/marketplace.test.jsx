@@ -106,7 +106,7 @@ describe('Marketplace tab', () => {
     expect(reseller).toContain('catalog-net.example.minimal');
     expect(reseller).not.toContain('signing key');
     expect(reseller).not.toContain('undefined');
-    expect(reseller).toContain('>enabled<');
+    expect(reseller).toContain('>Enabled<');
     expect(reseller).toContain('Details');
     expect(reseller).not.toContain('>Install<');
     expect(reseller).not.toContain('Update to 1.0.1');
@@ -139,7 +139,7 @@ describe('Marketplace tab', () => {
     expect(html).toContain('Update to 1.0.1');
     expect(html).toContain('Uninstall and purge');
     expect(html).toContain('Submit review');
-    expect(html).toContain('requires WHM &gt;=1.0.0 — compatible');
+    expect(html).toContain('requires host API &gt;=1.0.0 — compatible');
     const readOnly = render(<PluginDetailDrawer id="net.example.scoped" manage={false} onClose={() => {}} />);
     expect(readOnly).not.toContain('Submit review');
     expect(readOnly).not.toContain('Uninstall and purge');

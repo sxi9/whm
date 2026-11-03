@@ -241,7 +241,12 @@ export function renderMarkdown(src) {
     if (h) { const Tag = `h${h[1].length}`; out.push(<Tag key={k++}>{inline(h[2], k)}</Tag>); i++; continue; }
     if (/^\s*[-*]\s+/.test(line)) {
       const items = [];
-      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) items.push(lines[i++].replace(/^\s*[-*]\s+/, ''));
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+        let item = lines[i++].replace(/^\s*[-*]\s+/, '');
+        // Wrapped bullet text (indented or plain continuation lines) stays with its item.
+        while (i < lines.length && lines[i].trim() && !/^\s*([-*]|\d+\.)\s+|^#{1,6}\s|^```/.test(lines[i])) item += ` ${lines[i++].trim()}`;
+        items.push(item);
+      }
       out.push(<ul key={k++}>{items.map((it, j) => <li key={j}>{inline(it, `${k}-${j}`)}</li>)}</ul>);
       continue;
     }

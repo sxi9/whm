@@ -191,7 +191,7 @@ export function PluginDetailDrawer({ id, manage, onClose, onInstall, onUpdate, o
         ['Developer', `${data.developer?.display_name || '—'}${data.developer?.verified ? ' (verified)' : ''}`],
         ['Category', data.category?.name || '—'],
         ['Price', priceLabel(data.pricing)],
-        ['Compatibility', data.compatibility ? `requires WHM ${data.compatibility.engines_whm}${data.compatibility.compatible === false ? ' — not compatible with this host' : data.compatibility.compatible ? ' — compatible' : ''}` : '—'],
+        ['Compatibility', data.compatibility ? `requires host API ${data.compatibility.engines_whm}${data.compatibility.compatible === false ? ' — not compatible with this host' : data.compatibility.compatible ? ' — compatible' : ''}` : '—'],
         ['Installed', inst ? `${inst.version ? `${inst.version} ` : ''}(${inst.state}${inst.consentState === 'pending' ? ', awaiting consent' : ''})` : 'no'],
         ['Rating', data.rating_count ? `${Number(data.rating_avg).toFixed(1)} ★ from ${data.rating_count} review${data.rating_count === 1 ? '' : 's'}` : 'no reviews yet'],
         ['Links', <ExternalLinks key="l" links={[['Homepage', data.homepage], ['Support', data.support_url]]} />],

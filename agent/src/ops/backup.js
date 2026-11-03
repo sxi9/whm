@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { exec, hasBinary, resolveBinary } from '../exec.js';
 import { defineOp, arg, OpError, ensurePrivateDir } from './registry.js';
 import { renderClientCnf, classifyMysqlError, parseBatch, cloneUserStatements, parseGrant, q } from './db.js';
-import { createSqlCodeFilter, createClientCommandGuard, sqlModeRefusal, withImportUser, withClientDefaults, runSql, SYSTEM_SCHEMAS } from './transfer.js';
+import { createSqlCodeFilter, createClientCommandGuard, sqlModeRefusal, withImportUser, withClientDefaults, runSql } from './transfer.js';
 
 // Backup op family. An account archive is a cPanel-compatible tarball:
 //

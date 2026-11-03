@@ -41,7 +41,7 @@ export function PermissionList({ scopes, added = [], used = [], justifications =
                     <code>{scope}</code>
                     {added.includes(scope) ? <span className="pill pill-info">new</span> : null}
                     {used.includes(scope) ? <span className="pill pill-ok">used</span> : null}
-                    {d.sensitive ? <span className="pill pill-warn" style={{ textTransform: 'none' }}>reaches outside the plugin</span> : null}
+                    {d.sensitive ? <span className="pill pill-warn">reaches outside the plugin</span> : null}
                   </div>
                 </td>
                 <td>
