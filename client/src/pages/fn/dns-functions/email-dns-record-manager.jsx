@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, KeyValue, Loading, CapabilityNotice } from '../../../components/Common.jsx';
@@ -49,7 +50,10 @@ function SpfCard({ domain, status, onChange }) {
   return (
     <Card title="SPF" subtitle="Which hosts may send mail for this domain (TXT record at the zone apex)" actions={<StatusPill status={status.spf ? 'ok' : 'warning'}>{status.spf ? 'configured' : 'missing'}</StatusPill>}>
       <ErrorBanner error={error} />
-      <div className="form-actions"><Button size="sm" variant={mode === 'builder' ? 'primary' : 'default'} onClick={() => setMode('builder')}>Builder</Button><Button size="sm" variant={mode === 'raw' ? 'primary' : 'default'} onClick={() => { setRaw(buildSpf(form)); setMode('raw'); }}>Raw</Button></div>
+      <div className="segmented" role="tablist" style={{ marginBottom: 14 }}>
+        <button type="button" role="tab" aria-selected={mode === 'builder'} className={mode === 'builder' ? 'active' : ''} onClick={() => setMode('builder')}>Builder</button>
+        <button type="button" role="tab" aria-selected={mode === 'raw'} className={mode === 'raw' ? 'active' : ''} onClick={() => { setRaw(buildSpf(form)); setMode('raw'); }}>Raw</button>
+      </div>
       {mode === 'builder' ? (
         <>
           <Field inline><Toggle checked={form.a} onChange={set('a')} label="Allow the domain's A/AAAA addresses (+a)" /></Field>
@@ -62,7 +66,7 @@ function SpfCard({ domain, status, onChange }) {
           </div>
         </>
       ) : <Field label="SPF record"><TextInput value={raw} onChange={setRaw} /></Field>}
-      <KeyValue items={[['Will publish', <code key="v">{value}</code>], status.spf && ['Currently', <code key="c">{status.spf.value}</code>]]} />
+      <KeyValue items={[['Will publish', <code key="v" className="small">{value}</code>], status.spf && ['Currently', <code key="c" className="small">{status.spf.value}</code>]]} />
       <FormActions><Button variant="primary" loading={busy} onClick={save}>Save SPF</Button></FormActions>
     </Card>
   );
@@ -93,9 +97,9 @@ function DkimCard({ domain, status, onChange }) {
         <Field label="Selector" help="Becomes <selector>._domainkey" error={error?.fields?.selector}><TextInput value={selector} onChange={(v) => setSelector(v.toLowerCase())} /></Field>
         <Field label="Key size"><Select value={bits} onChange={setBits} options={[{ value: '1024', label: '1024 bits' }, { value: '2048', label: '2048 bits (recommended)' }, { value: '4096', label: '4096 bits' }]} /></Field>
       </div>
-      {status.dkim && <KeyValue items={[['Record', <code key="n">{status.dkim.name}.{domain}</code>], ['Key created', status.dkimKey?.createdAt], ['Public key TXT', <code key="v" style={{ wordBreak: 'break-all' }}>{status.dkim.value}</code>]]} />}
+      {status.dkim && <KeyValue items={[['Record', <code key="n">{status.dkim.name}.{domain}</code>], ['Key created', status.dkimKey?.createdAt], ['Public key TXT', <code key="v" className="small">{status.dkim.value}</code>]]} />}
       <FormActions>
-        <Button variant="primary" loading={busy} onClick={() => run(false)}>{status.dkimKey ? 'Ensure record' : 'Generate key & publish'}</Button>
+        <Button variant="primary" loading={busy} onClick={() => run(false)}>{status.dkimKey ? 'Ensure record' : 'Generate key and publish'}</Button>
         {status.dkimKey && <Button loading={busy} onClick={() => run(true)}>Rotate key</Button>}
         {status.dkimKey && <Button variant="danger" loading={busy} onClick={remove}>Remove DKIM</Button>}
       </FormActions>
@@ -145,7 +149,7 @@ export default function EmailDnsRecordManager({ fn }) {
       {domain && status && (
         <>
           <Card title="Mail exchangers">
-            {status.mx.length ? <KeyValue items={status.mx.map((m) => [`MX ${m.priority}`, <code key={m.id}>{m.value}</code>])} /> : <p className="muted">No MX records; see Email Routing Configuration.</p>}
+            {status.mx.length ? <KeyValue items={status.mx.map((m) => [`MX ${m.priority}`, <code key={m.id}>{m.value}</code>])} /> : <p className="muted">No MX records yet. Set them under <Link to="/dns-functions/email-routing-configuration">Email Routing Configuration</Link>.</p>}
           </Card>
           <SpfCard domain={domain} status={status} onChange={onChange} />
           <DkimCard domain={domain} status={status} onChange={onChange} />

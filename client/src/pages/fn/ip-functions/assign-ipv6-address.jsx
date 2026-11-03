@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
+import { Info } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { useAuth } from '../../../auth/AuthContext.jsx';
@@ -53,7 +54,7 @@ export default function AssignIpv6Address({ fn }) {
         <Card title="Assign an IPv6 address">
           <IpRequestError error={formError && !formError.fields ? formError : null} />
           <AccountPicker value={account} onChange={setAccount} label="Account" />
-          {existing && <div className="banner banner-info"><div>{account} already has <code>{existing.address}</code>{existing.range ? ` from "${existing.range}"` : ''}. Remove it below before assigning another.</div></div>}
+          {existing && <div className="banner banner-info"><Info size={18} /><div>{account} already has <code>{existing.address}</code>{existing.range ? ` from "${existing.range}"` : ''}. Remove it below before assigning another.</div></div>}
           <div className="form-grid">
             {isRoot ? (
               <Field label="Range" help={enabledRanges.length ? 'Blank uses the first enabled range mapped to the account, then any enabled range' : <>No enabled range yet — add one under <Link to="/ip-functions/ipv6-ranges">IPv6 Ranges</Link></>} error={formError?.fields?.rangeId}>
@@ -67,8 +68,8 @@ export default function AssignIpv6Address({ fn }) {
             <KeyValue items={[
               ['Account', result.account], ['Address', <code key="a">{result.address}/{result.prefix}</code>], ['Range', `${result.range} (${result.range_cidr})`], ['Interface', <code key="i">{result.interface}</code>],
               ['Bound on host', <StatusPill key="b" status={result.bound ? 'ok' : 'warning'}>{result.bound ? 'yes' : 'no'}</StatusPill>],
-              ['DNS (AAAA)', result.dns?.skipped ? <StatusPill key="d" status="unknown">DNS service unavailable</StatusPill> : <span key="d">{(result.dns?.results || []).map((r) => <StatusPill key={r.domain} status={r.status === 'updated' ? 'ok' : r.status === 'no_zone' ? 'unknown' : 'failed'}>{r.domain}: {r.status === 'no_zone' ? 'no zone here' : r.status}</StatusPill>)}</span>],
-              ['Web server', <StatusPill key="w" status={result.web === 'applied' ? 'ok' : result.web === 'failed' ? 'failed' : 'pending'}>{result.web === 'skipped' ? 'applied when the web service is installed' : result.web}</StatusPill>],
+              ['DNS (AAAA)', result.dns?.skipped ? <span key="d"><StatusPill status="unknown">skipped</StatusPill> <span className="muted">DNS service unavailable</span></span> : <span key="d">{(result.dns?.results || []).map((r) => <StatusPill key={r.domain} status={r.status === 'updated' ? 'ok' : r.status === 'no_zone' ? 'unknown' : 'failed'}>{r.domain}: {r.status === 'no_zone' ? 'no zone here' : r.status}</StatusPill>)}</span>],
+              ['Web server', <span key="w"><StatusPill status={result.web === 'applied' ? 'ok' : result.web === 'failed' ? 'failed' : 'pending'}>{result.web}</StatusPill>{result.web === 'skipped' && <span className="muted"> applied once the web service is installed</span>}</span>],
             ]} />
           )}
         </Card>
@@ -85,7 +86,7 @@ export default function AssignIpv6Address({ fn }) {
           ]}
           rows={assignments || []} loading={loading} rowKey={(r) => r.account}
           rowActions={(r) => [{ label: 'Remove', primary: true, danger: true, onClick: () => remove(r) }]}
-          emptyText="No account has an IPv6 address yet."
+          emptyText="No account has an IPv6 address yet. Assignments made above appear here."
         />
       </Card>
     </>

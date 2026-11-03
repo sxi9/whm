@@ -7,6 +7,7 @@ import { DataTable } from '../../../components/DataTable.jsx';
 import { Field, TextInput, PasswordInput, Toggle, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
+import { AlertCircle } from 'lucide-react';
 import { ToolingNotice, Warnings, RunPanel, RunHistory, PackageSelect } from '../../transfers/Shared.jsx';
 
 const EMPTY = { username: '', password: '', package: '', contactEmail: '' };
@@ -68,7 +69,7 @@ export default function ConvertAddonDomainToAccount({ fn }) {
                 { key: 'package', label: 'Package' },
                 { key: 'created_at', label: 'Added', render: (a) => formatDate(a.created_at) },
               ]}
-              rows={addons || []} loading={loading} rowKey={(a) => a.domain} dense emptyText="No addon domains on this server (or on your accounts)."
+              rows={addons || []} loading={loading} rowKey={(a) => a.domain} dense emptyText="No addon domains on this server or on your accounts. Domains added as addons appear here with a Convert action."
               rowActions={(a) => [{ label: domain === a.domain ? 'Selected' : 'Convert', primary: true, disabled: domain === a.domain, onClick: () => { setDomain(a.domain); setPreview(null); setForm((f) => ({ ...f, username: f.username || a.domain.split('.')[0].replace(/[^a-z0-9]/g, '').slice(0, 16) })); } }]}
             />
           </Card>
@@ -83,14 +84,14 @@ export default function ConvertAddonDomainToAccount({ fn }) {
                 <Field label="Contact email" help="Defaults to the current account's contact" error={error?.fields?.contactEmail}><TextInput type="email" value={form.contactEmail} onChange={set('contactEmail')} /></Field>
               </div>
               <div className="form-grid">
-                <Toggle checked={options.copyFiles} onChange={(v) => { setOptions((o) => ({ ...o, copyFiles: v, removeSource: v && o.removeSource })); setPreview(null); }} label="Copy the document root" description={`${addon.docroot} → new public_html (rsync)`} />
-                <Toggle checked={options.removeSource} disabled={!options.copyFiles} onChange={(v) => { setOptions((o) => ({ ...o, removeSource: v })); setPreview(null); }} label="Delete the files from the old account afterwards" description="Only after a successful copy; refused when the document root is the account's main site or serves another of its domains" />
-                <Toggle checked={options.moveMail} onChange={(v) => setOptions((o) => ({ ...o, moveMail: v }))} label="Move mailboxes of the domain" description="mail/<domain> and etc/<domain> are copied to the new home" />
+                <Field><Toggle checked={options.copyFiles} onChange={(v) => { setOptions((o) => ({ ...o, copyFiles: v, removeSource: v && o.removeSource })); setPreview(null); }} label="Copy the document root" description={`${addon.docroot} → new public_html (rsync)`} /></Field>
+                <Field><Toggle checked={options.removeSource} disabled={!options.copyFiles} onChange={(v) => { setOptions((o) => ({ ...o, removeSource: v })); setPreview(null); }} label="Delete the files from the old account afterwards" description="Only after a successful copy; refused when the document root is the account's main site or serves another of its domains" /></Field>
+                <Field><Toggle checked={options.moveMail} onChange={(v) => setOptions((o) => ({ ...o, moveMail: v }))} label="Move mailboxes of the domain" description="mail/<domain> and etc/<domain> are copied to the new home" /></Field>
               </div>
               {canMoveDatabases && preview?.addon.databases?.length > 0 && (
                 <Field label="Move databases to the new account" help={`Databases of ${addon.account}; moved ones are reassigned, not copied`}>
                   <div className="form-grid">
-                    {preview.addon.databases.map((name) => <Toggle key={name} checked={options.moveDatabases.includes(name)} onChange={(v) => setOptions((o) => ({ ...o, moveDatabases: v ? [...o.moveDatabases, name] : o.moveDatabases.filter((n) => n !== name) }))} label={name} />)}
+                    {preview.addon.databases.map((name) => <Field key={name}><Toggle checked={options.moveDatabases.includes(name)} onChange={(v) => setOptions((o) => ({ ...o, moveDatabases: v ? [...o.moveDatabases, name] : o.moveDatabases.filter((n) => n !== name) }))} label={name} /></Field>)}
                   </div>
                 </Field>
               )}
@@ -102,13 +103,13 @@ export default function ConvertAddonDomainToAccount({ fn }) {
           )}
           {preview && (
             <Card title="Plan">
-              {preview.issues.length > 0 && <div className="banner banner-error"><div><strong>Cannot convert</strong><ul>{preview.issues.map((i) => <li key={i}>{i}</li>)}</ul></div></div>}
+              {preview.issues.length > 0 && <div className="banner banner-error"><AlertCircle size={18} /><div><strong>Cannot convert</strong><ul>{preview.issues.map((i) => <li key={i}>{i}</li>)}</ul></div></div>}
               <Warnings warnings={preview.warnings} />
               <KeyValue items={[
                 ['From', <span key="f"><code>{preview.addon.account}</code> · {preview.addon.docroot}</span>],
                 ['To', <span key="t"><code>{preview.target.username}</code> · {preview.target.docroot} · package {preview.target.package || 'default'}</span>],
                 ['Linked subdomains', preview.addon.linkedSubdomains.length ? preview.addon.linkedSubdomains.join(', ') : 'none'],
-                ['DNS zone', preview.addon.zone ? <StatusPill key="z" status="ok">moves to the new account</StatusPill> : <StatusPill key="z" status="info">created for the new account</StatusPill>],
+                ['DNS zone', preview.addon.zone ? <span key="z"><StatusPill status="ok">existing</StatusPill> <span className="muted">moves to the new account</span></span> : <span key="z"><StatusPill status="queued">new</StatusPill> <span className="muted">created for the new account</span></span>],
                 ['Databases', canMoveDatabases ? (options.moveDatabases.length ? options.moveDatabases.join(', ') : 'none moved') : 'stay with the current account (moving them requires root)'],
               ]} />
             </Card>

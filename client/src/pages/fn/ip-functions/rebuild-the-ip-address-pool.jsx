@@ -5,7 +5,7 @@ import { PageHeader, Card, StatusPill, KeyValue, formatDate } from '../../../com
 import { DataTable } from '../../../components/DataTable.jsx';
 import { Button, FormActions } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
-import { IpRequestError, FamilyPill, AddressStatusPill, Summary, Iproute2Notice } from '../../ip/Shared.jsx';
+import { IpRequestError, FamilyPill, AddressStatusPill, Summary, Iproute2Notice, AddressList } from '../../ip/Shared.jsx';
 
 export default function RebuildTheIpAddressPool({ fn }) {
   const toast = useToast();
@@ -38,12 +38,12 @@ export default function RebuildTheIpAddressPool({ fn }) {
             <KeyValue items={[
               ['Main IP', result.main ? <code key="m">{result.main}</code> : 'not detected'],
               ['Source', result.source === 'iproute2' ? 'ip -j addr' : 'OS view'],
-              ['Imported from host', result.added.length ? result.added.map((a) => <code key={a} style={{ marginRight: 6 }}>{a}</code>) : 'none'],
-              ['Dynamic (DHCP / SLAAC / privacy), not persisted', result.unmanaged?.length ? result.unmanaged.map((a) => <code key={a} style={{ marginRight: 6 }}>{a}</code>) : 'none'],
+              ['Imported from host', <AddressList key="a" addresses={result.added} />],
+              ['Dynamic (DHCP / SLAAC / privacy), not persisted', <AddressList key="u" addresses={result.unmanaged} />],
               ['Interface/netmask refreshed', result.updated.length || 'none'],
-              ['Recorded but not on host', result.missing.length ? result.missing.map((a) => <code key={a} style={{ marginRight: 6 }}>{a}</code>) : 'none'],
-              ['Dynamic addresses that left the host (forgotten)', result.dropped?.length ? result.dropped.map((a) => <code key={a} style={{ marginRight: 6 }}>{a}</code>) : 'none'],
-              ['Boot persistence', <StatusPill key="p" status={result.persisted?.skipped ? 'disabled' : result.persisted?.enabled ? 'ok' : 'warning'}>{result.persisted?.skipped ? 'disabled' : result.persisted?.enabled ? 'whm-ips.service enabled' : result.persisted?.error || 'written'}</StatusPill>],
+              ['Recorded but not on host', <AddressList key="m" addresses={result.missing} />],
+              ['Dynamic addresses that left the host (forgotten)', <AddressList key="d" addresses={result.dropped} />],
+              ['Boot persistence', <span key="p"><StatusPill status={result.persisted?.skipped ? 'disabled' : result.persisted?.enabled ? 'ok' : 'warning'}>{result.persisted?.skipped ? 'disabled' : result.persisted?.enabled ? 'enabled' : 'written'}</StatusPill>{!result.persisted?.skipped && <span className="muted"> {result.persisted?.enabled ? 'boot unit enabled' : result.persisted?.error || 'unit written but not enabled'}</span>}</span>],
             ]} />
           </div>
         )}
@@ -61,7 +61,7 @@ export default function RebuildTheIpAddressPool({ fn }) {
             { key: 'on_system', label: 'On host', render: (r) => <StatusPill status={r.on_system ? 'up' : 'down'}>{r.on_system ? 'yes' : 'no'}</StatusPill> },
             { key: 'synced_at', label: 'Synced', render: (r) => formatDate(r.synced_at) },
           ]}
-          rows={data || []} loading={loading} rowKey={(r) => r.address} dense emptyText="The pool has not been built yet."
+          rows={data || []} loading={loading} rowKey={(r) => r.address} dense emptyText="The pool has not been built yet. Rebuild it to list every address on the host here."
         />
       </Card>
     </>

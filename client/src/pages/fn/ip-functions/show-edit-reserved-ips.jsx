@@ -42,7 +42,7 @@ export default function ShowEditReservedIps({ fn }) {
             <table>
               <thead><tr><th style={{ width: 90 }}>Reserved</th><th>Address</th><th>Family</th><th>Interface</th><th>Status</th><th>Reason</th></tr></thead>
               <tbody>
-                {data.length === 0 && <tr><td colSpan={6} className="table-state">No addresses recorded. Rebuild the IP address pool first.</td></tr>}
+                {data.length === 0 && <tr><td colSpan={6} className="table-state">No addresses recorded yet. Rebuild the IP address pool and every address appears here with its reservation.</td></tr>}
                 {data.map((row) => {
                   const d = draft.find((x) => x.address === row.address) || { reserved: row.reserved, reason: '' };
                   const res = results?.find((r) => r.address === row.address);
@@ -56,7 +56,7 @@ export default function ShowEditReservedIps({ fn }) {
                         {row.is_main ? <StatusPill status="info">main IP</StatusPill> : row.dedicated_to ? <StatusPill status="ok">dedicated: {row.dedicated_to}</StatusPill> : row.accounts ? <StatusPill status="ok">{row.accounts} account(s)</StatusPill> : row.reserved ? <StatusPill status="warning">reserved</StatusPill> : <StatusPill status="unknown">free</StatusPill>}
                         {res && !res.ok && <div className="field-message">{res.error}</div>}
                       </td>
-                      <td>{d.reserved ? <TextInput value={d.reason} onChange={(v) => update(row.address, { reason: v })} placeholder="optional note" /> : <span className="muted">{row.reserved_reason || ''}</span>}</td>
+                      <td>{d.reserved ? <TextInput value={d.reason} onChange={(v) => update(row.address, { reason: v })} placeholder="Optional note" /> : <span className="muted">{row.reserved_reason || ''}</span>}</td>
                     </tr>
                   );
                 })}

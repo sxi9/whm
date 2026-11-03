@@ -55,7 +55,7 @@ export default function SslTlsConfiguration({ fn }) {
             <Card title="Profile" subtitle="Mozilla-style presets. Switching a protocol or cipher turns the profile into Custom.">
               <Field label="Preset"><RadioGroup name="preset" value={draft.preset} onChange={choosePreset} options={[...Object.entries(data.presets).map(([k, p]) => ({ value: k, label: p.label, description: p.description })), { value: 'custom', label: 'Custom', description: 'Hand-edited protocols and cipher list below.' }]} /></Field>
               <Field label="Protocols">
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px 28px', padding: '4px 0' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '10px 16px', padding: '4px 0' }}>
                   {PROTOCOLS.map((p) => <Toggle key={p} checked={draft.protocols.includes(p)} onChange={() => toggleProtocol(p)} label={p} />)}
                 </div>
                 {draft.protocols.some((p) => p === 'TLSv1' || p === 'TLSv1.1') && <div className="banner banner-warning" style={{ marginTop: 10 }}><AlertTriangle size={18} /><div>TLS 1.0 and 1.1 are deprecated (RFC 8996) and fail PCI-DSS scans.</div></div>}

@@ -58,9 +58,13 @@ export function LicenseStatusCard({ license, onCheckin, checking }) {
         ['Enforcement', l.enforce ? 'on' : <span className="muted">off (development)</span>],
       ]} />
       {l.hasToken && l.tokenVerified === false && (
-        <p className="muted" data-testid="license-unverified" style={{ marginTop: 10 }}>
-          <AlertTriangle size={14} /> The stored license token cannot be verified against the license keys shipped with this release, so no edition, limits or features are shown and the bootstrap hub is used. Check in now or re-enter the key.
-        </p>
+        <div className="banner banner-warning" data-testid="license-unverified" style={{ marginTop: 14, marginBottom: 0 }}>
+          <AlertTriangle size={18} />
+          <div>
+            <strong>Stored token cannot be verified</strong>
+            <p>The stored license token cannot be verified against the license keys shipped with this release, so no edition, limits or features are shown and the bootstrap hub is used. Check in now or re-enter the key.</p>
+          </div>
+        </div>
       )}
       {l.messages?.length > 0 && (
         <ul className="list-plain" style={{ marginTop: 10 }}>
@@ -89,7 +93,7 @@ export function LicenseKeyForm({ hasKey, busy, error, onSubmit, replace = false 
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSubmit(key.trim() || undefined); }}>
       <Field label={replace ? 'New license key' : 'License key'} help="WHM-XXXX-XXXX-XXXX-XXXX, as issued by your vendor or reseller. The key is stored encrypted and never shown again." error={error?.fields?.key?.join(', ')}>
-        <TextInput value={key} onChange={setKey} placeholder="WHM-XXXX-XXXX-XXXX-XXXX" autoComplete="off" spellCheck={false} style={{ fontFamily: 'var(--mono)', maxWidth: 360 }} />
+        <TextInput className="input mono" value={key} onChange={setKey} placeholder="WHM-XXXX-XXXX-XXXX-XXXX" autoComplete="off" spellCheck={false} style={{ maxWidth: 360 }} />
       </Field>
       <FormActions>
         <Button type="submit" variant="primary" icon={KeyRound} loading={busy} disabled={!key.trim() && !hasKey}>{replace ? 'Replace key and activate' : hasKey ? (key.trim() ? 'Activate' : 'Activate with the stored key') : 'Activate'}</Button>
@@ -103,8 +107,8 @@ export function ActivationsCard({ activations, license, onDeactivate, onTransfer
   const { current, others, max } = activations;
   return (
     <Card title="Activations" subtitle={max != null ? `${max === -1 ? 'Unlimited' : max} server${max === 1 ? '' : 's'} allowed on this license.` : undefined}>
-      {!current && !others?.length && <p className="muted">This server is not activated.</p>}
-      <div className="table-wrap">
+      {!current && !others?.length && <p className="muted">This server is not activated. Each activation on this license appears here with its hostname and last check-in once a key is activated.</p>}
+      {(current || others?.length > 0) && <div className="table-wrap">
         <table className="table">
           <thead><tr><th>Activation</th><th>Hostname</th><th>Last check-in</th><th>Status</th><th /></tr></thead>
           <tbody>
@@ -128,7 +132,7 @@ export function ActivationsCard({ activations, license, onDeactivate, onTransfer
             ))}
           </tbody>
         </table>
-      </div>
+      </div>}
     </Card>
   );
 }
@@ -136,9 +140,9 @@ export function ActivationsCard({ activations, license, onDeactivate, onTransfer
 export function TrialCard({ onStart, busy, error, defaultEmail = '' }) {
   const [email, setEmail] = useState(defaultEmail);
   return (
-    <Card title="Start a free trial" subtitle="14 days, 5 hosting accounts, one trial per server and e-mail address. The trial converts to a paid edition without re-activation.">
+    <Card title="Start a free trial" subtitle="14 days, 5 hosting accounts, one trial per server and email address. The trial converts to a paid edition without re-activation.">
       <form onSubmit={(e) => { e.preventDefault(); onStart(email.trim()); }}>
-        <Field label="E-mail address" error={error?.fields?.email?.join(', ')}><TextInput type="email" value={email} onChange={setEmail} placeholder="ops@example.com" style={{ maxWidth: 360 }} /></Field>
+        <Field label="Email address" error={error?.fields?.email?.join(', ')}><TextInput type="email" value={email} onChange={setEmail} placeholder="ops@example.com" style={{ maxWidth: 360 }} /></Field>
         <FormActions><Button type="submit" loading={busy} disabled={!email.trim()}>Start trial</Button></FormActions>
       </form>
     </Card>
@@ -221,7 +225,7 @@ export default function LicenseTab({ fn }) {
           {!license.activationId && <TrialCard onStart={startTrial} busy={busy === 'trial'} error={actionError?.code === 'validation_failed' ? actionError : null} />}
           {license.hubUrl && <p className="muted">Renewals, upgrades and invoices: <a href={license.hubUrl} target="_blank" rel="noreferrer">open the vendor portal</a>.</p>}
           {license.events?.length > 0 && (
-            <Card title="Recent license events">
+            <Card title="Recent license events" padded={false}>
               <div className="table-wrap">
                 <table className="table">
                   <thead><tr><th>When</th><th>Event</th><th>Detail</th></tr></thead>

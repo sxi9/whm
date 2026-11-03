@@ -7,7 +7,7 @@ import { DataTable } from '../../../components/DataTable.jsx';
 import { Field, TextInput, Textarea, Toggle, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
-import { IpRequestError, InterfaceSelect } from '../../ip/Shared.jsx';
+import { IpRequestError, InterfaceSelect, AddressList } from '../../ip/Shared.jsx';
 
 const EMPTY = { name: '', range: '', interface: '', enabled: true, notes: '' };
 
@@ -54,7 +54,7 @@ export default function Ipv6Ranges({ fn }) {
             <Field label="Name" required error={formError?.fields?.name}><TextInput value={form.name} onChange={set('name')} placeholder="customers" /></Field>
             <Field label="Range (CIDR)" required help="/16 to /126; the network address is never assigned" error={formError?.fields?.range}><TextInput value={form.range} onChange={set('range')} placeholder="2001:db8:1::/64" /></Field>
             <InterfaceSelect value={form.interface} onChange={set('interface')} family={6} help="Interface addresses from this range are bound to; blank uses the IPv6 default route" error={formError?.fields?.interface} />
-            <Field label="Notes" error={formError?.fields?.notes}><TextInput value={form.notes} onChange={set('notes')} placeholder="optional" /></Field>
+            <Field label="Notes" error={formError?.fields?.notes}><TextInput value={form.notes} onChange={set('notes')} placeholder="Optional note" /></Field>
           </div>
           <Field inline><Toggle checked={form.enabled} onChange={set('enabled')} label="Enabled" description="Disabled ranges keep their assignments but hand out no new addresses" /></Field>
           <FormActions><Button type="submit" variant="primary" loading={busy} disabled={!form.name || !form.range}>Add range</Button></FormActions>
@@ -78,7 +78,7 @@ export default function Ipv6Ranges({ fn }) {
             { label: r.enabled ? 'Disable' : 'Enable', onClick: () => toggle(r) },
             { label: 'Delete', danger: true, disabled: r.assigned_count > 0, onClick: () => remove(r) },
           ]}
-          emptyText="No IPv6 ranges defined."
+          emptyText="No IPv6 ranges yet. Ranges you add above appear here."
         />
       </Card>
       <EditRangeModal range={editing} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); refetch(); }} />
@@ -114,7 +114,7 @@ function EditRangeModal({ range, onClose, onSaved }) {
       <InterfaceSelect value={form.interface} onChange={set('interface')} family={6} error={error?.fields?.interface} />
       <Field label="Notes" error={error?.fields?.notes}><Textarea value={form.notes} onChange={set('notes')} rows={3} /></Field>
       <Field inline><Toggle checked={form.enabled} onChange={set('enabled')} label="Enabled" /></Field>
-      <KeyValue items={[['First / last', <span key="fl"><code>{range.first_address}</code> … <code>{range.last_address}</code></span>], ['Size', range.size_text], ['Next free', preview ? preview.next.map((a) => <code key={a} style={{ marginRight: 6 }}>{a}</code>) : '…']]} />
+      <KeyValue items={[['First / last', <span key="fl"><code>{range.first_address}</code> … <code>{range.last_address}</code></span>], ['Size', range.size_text], ['Next free', preview ? <AddressList key="n" addresses={preview.next} /> : '…']]} />
     </Modal>
   );
 }

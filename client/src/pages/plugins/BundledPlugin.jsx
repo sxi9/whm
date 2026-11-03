@@ -103,12 +103,13 @@ export function BundledPluginShell({ fn, id, overview: Overview, tabs = [] }) {
       <Link className="btn btn-sm btn-ghost" to="/cpanel/manage-plugins">Manage Plugins</Link>
     </div>
   );
-  if (active) return <>{nav}<PluginPageView plugin={plugin} page={active} /></>;
   return (
     <>
       <PageHeader fn={fn} description={`${fn.description} ${plugin.name} ${plugin.version}.`} />
       {nav}
-      <Overview plugin={plugin} status={status} base={pluginBase(id)} reload={reload} />
+      {active
+        ? <PluginPageView plugin={plugin} page={active} header={false} />
+        : <Overview plugin={plugin} status={status} base={pluginBase(id)} reload={reload} />}
     </>
   );
 }

@@ -50,7 +50,7 @@ export default function DeleteDnsZone({ fn }) {
           selectable selected={selected} onSelectedChange={setSelected}
           rowActions={(z) => [{ label: 'Delete', primary: true, danger: true, onClick: () => remove([z.domain]) }]}
           toolbar={<Button variant="danger" disabled={!selected.length} loading={busy} onClick={() => remove(selected)}>Delete selected ({selected.length})</Button>}
-          emptyText="No DNS zones exist yet."
+          emptyText="No zones yet. Zones created with Add a DNS Zone or by account creation appear here."
         />
       </Card>
     </>

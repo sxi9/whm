@@ -3,7 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, Loading, StatusPill, formatDate } from '../../../components/Common.jsx';
-import { Button } from '../../../components/Form.jsx';
+import { Button, TextInput } from '../../../components/Form.jsx';
 import { RequestError, Markdown, DocLinks, CopyButton, downloadText } from '../../development/Shared.jsx';
 
 export default function DeveloperDocumentation({ fn }) {
@@ -57,11 +57,11 @@ export default function DeveloperDocumentation({ fn }) {
       {doc && (
         <div style={{ display: 'grid', gridTemplateColumns: doc.sections.length > 3 ? 'minmax(220px, 280px) 1fr' : '1fr', gap: 14, alignItems: 'start' }}>
           {doc.sections.length > 3 && (
-            <Card title="Sections" padded={false} className="sticky-actions">
-              <div style={{ padding: 10 }}><input className="input" placeholder="Filter sections…" value={filter} onChange={(e) => setFilter(e.target.value)} /></div>
+            <Card title="Sections" padded={false}>
+              <div style={{ padding: 10 }}><TextInput placeholder="Filter sections…" value={filter} onChange={setFilter} /></div>
               <nav style={{ maxHeight: '70vh', overflow: 'auto' }}>
-                <button className={`menu-item ${!section ? 'is-selected' : ''}`} style={{ width: '100%', textAlign: 'left' }} onClick={() => open(slug)}>Whole document</button>
-                {sections.map((s) => <button key={s.slug} className="menu-item" style={{ width: '100%', textAlign: 'left', fontWeight: section === s.slug ? 600 : 400 }} onClick={() => open(slug, s.slug)}>{s.title}</button>)}
+                <button className="menu-item" aria-current={!section ? 'true' : undefined} onClick={() => open(slug)}>{section ? 'Whole document' : <strong>Whole document</strong>}</button>
+                {sections.map((s) => <button key={s.slug} className="menu-item" aria-current={section === s.slug ? 'true' : undefined} onClick={() => open(slug, s.slug)}>{section === s.slug ? <strong>{s.title}</strong> : s.title}</button>)}
               </nav>
             </Card>
           )}

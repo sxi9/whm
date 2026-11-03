@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { AlertTriangle } from 'lucide-react';
 import { useApi } from '../../hooks/useApi.js';
 import { Card, StatusPill, formatDate, formatBytes } from '../../components/Common.jsx';
 import { DataTable } from '../../components/DataTable.jsx';
-import { Button, FormActions, Toggle } from '../../components/Form.jsx';
+import { Button, FormActions, Select, Toggle, Field } from '../../components/Form.jsx';
 import { ProgressLog } from '../../components/ProgressLog.jsx';
 import { useToast } from '../../components/Toast.jsx';
 
@@ -19,10 +20,11 @@ export function ToolingNotice({ caps, needs = [] }) {
   if (!missing.length) return null;
   return (
     <div className="banner banner-warning">
+      <AlertTriangle size={18} />
       <div>
         <strong>Missing tools on this server</strong>
         <ul>{missing.map((n) => <li key={n}>{caps[n].label}: install <code>{caps[n].packages}</code></li>)}</ul>
-        <p className="muted">Install them via <Link to="/software/install-distro-packages">Install Distro Packages</Link>; steps that need them finish as "pending" or are refused until then.</p>
+        <p className="muted">Install them under <Link to="/software/install-distro-packages">Install Distro Packages</Link>. Steps that need them finish as pending or are refused until then.</p>
       </div>
     </div>
   );
@@ -31,14 +33,19 @@ export function ToolingNotice({ caps, needs = [] }) {
 export function Options({ value, onChange, fields }) {
   return (
     <div className="form-grid">
-      {fields.map((f) => <Toggle key={f.key} checked={Boolean(value[f.key])} onChange={(v) => onChange({ ...value, [f.key]: v })} label={f.label} description={f.description} />)}
+      {fields.map((f) => <Field key={f.key}><Toggle checked={Boolean(value[f.key])} onChange={(v) => onChange({ ...value, [f.key]: v })} label={f.label} description={f.description} /></Field>)}
     </div>
   );
 }
 
 export function Warnings({ warnings }) {
   if (!warnings?.length) return null;
-  return <div className="banner banner-warning"><div><strong>Before you run</strong><ul>{warnings.map((w) => <li key={w}>{w}</li>)}</ul></div></div>;
+  return (
+    <div className="banner banner-warning">
+      <AlertTriangle size={18} />
+      <div><strong>Before you run</strong><ul>{warnings.map((w) => <li key={w}>{w}</li>)}</ul></div>
+    </div>
+  );
 }
 
 export function Totals({ items }) {
@@ -51,9 +58,18 @@ export function Totals({ items }) {
 
 export function Steps({ step, labels }) {
   return (
-    <div className="row-actions" style={{ marginBottom: 14 }}>
-      {labels.map((label, i) => <span key={label} className={`pill ${step === i + 1 ? 'pill-info' : step > i + 1 ? 'pill-ok' : 'pill-muted'}`}>{i + 1}. {label}</span>)}
-    </div>
+    <ol className="list-plain" style={{ display: 'flex', flexWrap: 'wrap', gap: 18, marginBottom: 16 }} aria-label="Progress">
+      {labels.map((label, i) => {
+        const n = i + 1;
+        const tone = step === n ? 'info' : step > n ? 'ok' : 'muted';
+        return (
+          <li key={label} className={step < n ? 'muted' : ''} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }} aria-current={step === n ? 'step' : undefined}>
+            <span className={`pill pill-${tone}`}>{n}</span>
+            {step === n ? <strong>{label}</strong> : label}
+          </li>
+        );
+      })}
+    </ol>
   );
 }
 
@@ -66,7 +82,16 @@ function StepList({ steps }) {
   }
   if (!rows.length) return <span className="muted">—</span>;
   // A zone that could not be stored (no BIND) travels with its step so it can be imported by hand.
-  return <ul style={{ margin: 0, paddingLeft: 16 }}>{rows.map((r, i) => <li key={i}><code>{r.name}</code> {stepPill(r.status)} {r.detail && <span className="muted">{r.detail}</span>}{r.extra && <span className="muted"> · {r.extra}</span>}{r.zone && <details><summary>Source zone text</summary><pre className="log" style={{ maxHeight: 240, overflow: 'auto' }}>{r.zone}</pre></details>}</li>)}</ul>;
+  return (
+    <ul style={{ margin: 0, paddingLeft: 16 }}>
+      {rows.map((r, i) => (
+        <li key={i}>
+          <code>{r.name}</code> {stepPill(r.status)} {r.detail && <span className="muted">{r.detail}</span>}{r.extra && <span className="muted"> · {r.extra}</span>}
+          {r.zone && <details><summary>Source zone text</summary><pre className="log">{r.zone}</pre></details>}
+        </li>
+      ))}
+    </ul>
+  );
 }
 
 export function RunDetail({ run }) {
@@ -85,11 +110,11 @@ export function RunDetail({ run }) {
           { key: 'steps', label: 'Steps', render: (r) => <StepList steps={r.steps} /> },
           { key: 'detail', label: 'Detail', render: (r) => r.detail || <span className="muted">—</span> },
         ]}
-        rows={run.items || []} rowKey={(r) => r.id} dense emptyText="No accounts in this run."
+        rows={run.items || []} rowKey={(r) => r.id} dense emptyText="This run has no accounts. Each account the run touches appears here with its steps."
       />
       {run.job?.logs?.length > 0 && (
         <div className="card-body">
-          <h3 style={{ marginTop: 0 }}>Job log</h3>
+          <h3 style={{ marginBottom: 10 }}>Job log</h3>
           <pre className="log">{run.job.logs.map((l) => `${l.ts}  ${l.level.toUpperCase().padEnd(5)}  ${l.line}`).join('\n')}</pre>
         </div>
       )}
@@ -140,7 +165,7 @@ export function RunHistory({ kind, refreshKey, limit = 10 }) {
             { key: 'requested_by', label: 'By', render: (r) => r.requested_by || r.created_by_name || '—' },
             { key: 'created_at', label: 'Started', render: (r) => formatDate(r.created_at) },
           ]}
-          rows={data || []} loading={loading} error={error} rowKey={(r) => r.id} dense emptyText="No runs yet."
+          rows={data || []} loading={loading} error={error} rowKey={(r) => r.id} dense emptyText="No runs yet. Runs started from this page appear here with their outcome."
           rowActions={(r) => [{ label: openId === r.id ? 'Hide' : 'Details', primary: true, onClick: () => setOpenId(openId === r.id ? null : r.id) }]}
         />
       </Card>
@@ -151,10 +176,5 @@ export function RunHistory({ kind, refreshKey, limit = 10 }) {
 
 export function PackageSelect({ value, onChange, placeholder = 'Server default package' }) {
   const { data: packages } = useApi('/packages?pageSize=500');
-  return (
-    <select className="input select" value={value ?? ''} onChange={(e) => onChange(e.target.value)}>
-      <option value="">{placeholder}</option>
-      {(packages || []).map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
-    </select>
-  );
+  return <Select value={value ?? ''} onChange={onChange} placeholder={placeholder} options={(packages || []).map((p) => ({ value: p.name, label: p.name }))} />;
 }

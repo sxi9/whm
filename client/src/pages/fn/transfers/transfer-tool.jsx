@@ -115,7 +115,7 @@ function AccountsStep({ session, caps, onBack, onStarted }) {
       <Card title={`Source: ${session.user}@${session.host}`} actions={<><Button size="sm" variant="ghost" onClick={onBack}>Change server</Button><Button size="sm" onClick={refresh} loading={refreshing}>Re-scan accounts</Button></>}>
         <KeyValue items={[
           ['System', probe.os?.name || probe.hostname || '—'],
-          ['Control panel', probe.cpanel ? 'cPanel/WHM detected' : 'none detected (plain Linux users)'],
+          ['Control panel', probe.cpanel ? 'cPanel detected' : 'none detected (plain Linux users)'],
           ['SSH user', <span key="u">{session.user} {probe.isRoot === false && <StatusPill status="warning">not root</StatusPill>}</span>],
           ['Host key', <HostKeys key="k" keys={probe.hostKeys} verbose />],
           ['Source tools', <span key="t">rsync {probe.tools?.rsync ? <StatusPill status="ok">yes</StatusPill> : <StatusPill status="failed">missing</StatusPill>} · mysqldump {probe.tools?.mysqldump ? <StatusPill status="ok">yes</StatusPill> : <StatusPill status="failed">missing</StatusPill>}</span>],
@@ -132,15 +132,15 @@ function AccountsStep({ session, caps, onBack, onStarted }) {
             { key: 'domain', label: 'Main domain', render: (a) => a.domain || <span className="muted">unknown</span> },
             { key: 'domains', label: 'Other domains', render: (a) => (a.domains?.length ? <span className="muted">{a.domains.join(', ')}</span> : '—') },
             { key: 'home', label: 'Home', render: (a) => <code>{a.home}</code> },
-            { key: 'localExists', label: 'Here', render: (a) => (a.localExists ? <StatusPill status="warning">exists ({a.localDomain})</StatusPill> : a.domainHostedBy ? <StatusPill status="warning">domain on {a.domainHostedBy}</StatusPill> : <StatusPill status="ok">new</StatusPill>) },
-            { key: 'new_username', label: 'Local username', render: (a) => <input className="input" style={{ minWidth: 120 }} value={overrides[a.username]?.username ?? ''} placeholder={a.username} onChange={(e) => setOverride(a.username, 'username')(e.target.value)} disabled={!selected.includes(a.username)} /> },
-            { key: 'new_domain', label: 'Domain', render: (a) => <input className="input" style={{ minWidth: 150 }} value={overrides[a.username]?.domain ?? ''} placeholder={a.domain || 'required'} onChange={(e) => setOverride(a.username, 'domain')(e.target.value)} disabled={!selected.includes(a.username)} /> },
+            { key: 'localExists', label: 'Here', render: (a) => (a.localExists ? <span><StatusPill status="warning">exists</StatusPill> <span className="muted">{a.localDomain}</span></span> : a.domainHostedBy ? <span><StatusPill status="warning">taken</StatusPill> <span className="muted">domain on {a.domainHostedBy}</span></span> : <StatusPill status="ok">new</StatusPill>) },
+            { key: 'new_username', label: 'Local username', render: (a) => <TextInput style={{ minWidth: 120 }} value={overrides[a.username]?.username ?? ''} placeholder={a.username} onChange={setOverride(a.username, 'username')} disabled={!selected.includes(a.username)} /> },
+            { key: 'new_domain', label: 'Domain', render: (a) => <TextInput style={{ minWidth: 150 }} value={overrides[a.username]?.domain ?? ''} placeholder={a.domain || 'required'} onChange={setOverride(a.username, 'domain')} disabled={!selected.includes(a.username)} /> },
             { key: 'package', label: 'Package', render: (a) => <PackageSelect value={overrides[a.username]?.package ?? ''} onChange={setOverride(a.username, 'package')} placeholder="default" /> },
-            { key: 'password', label: 'Password', render: (a) => <input className="input" type="password" autoComplete="new-password" style={{ minWidth: 130 }} value={overrides[a.username]?.password ?? ''} placeholder="keep source hash" title="Leave empty to copy the password hash from the source (needs root there)" onChange={(e) => setOverride(a.username, 'password')(e.target.value)} disabled={!selected.includes(a.username)} /> },
+            { key: 'password', label: 'Password', render: (a) => <TextInput type="password" autoComplete="new-password" style={{ minWidth: 130 }} value={overrides[a.username]?.password ?? ''} placeholder="keep source hash" title="Leave empty to copy the password hash from the source (needs root there)" onChange={setOverride(a.username, 'password')} disabled={!selected.includes(a.username)} /> },
           ]}
           rows={accounts} loading={loading} rowKey={(a) => a.username} selectable selected={selected} onSelectedChange={(s) => { setSelected(s); setPreview(null); }} dense
           toolbar={<><Button size="sm" onClick={() => setSelected(accounts.filter((a) => !a.localExists).map((a) => a.username))}>Select all new</Button><Button size="sm" variant="ghost" onClick={() => setSelected([])}>Clear</Button></>}
-          emptyText="No hosting accounts found on the source server."
+          emptyText="No hosting accounts found on the source server. Accounts listed in its /etc/passwd with a home directory appear here after a re-scan."
         />
       </Card>
       <Card title="Options">
@@ -179,10 +179,10 @@ function AccountsStep({ session, caps, onBack, onStarted }) {
 function HostKeys({ keys, verbose = false }) {
   if (!keys?.length) return <span className="muted">{verbose ? 'not recorded (ssh-keygen missing or first connection pending)' : '—'}</span>;
   return (
-    <span className="muted">
-      {keys.map((k) => <span key={`${k.type}:${k.fingerprint}`} title={verbose ? 'Compare with the fingerprint shown by ssh-keygen -lf on the source server' : k.fingerprint} style={{ display: 'block' }}>{k.type} <code>{verbose ? k.fingerprint : `${k.fingerprint.slice(0, 19)}…`}</code></span>)}
-      {verbose && <span style={{ display: 'block' }}>Trusted on first use; compare with the source server before transferring.</span>}
-    </span>
+    <ul className="list-plain muted">
+      {keys.map((k) => <li key={`${k.type}:${k.fingerprint}`} title={verbose ? 'Compare with the fingerprint shown by ssh-keygen -lf on the source server' : k.fingerprint}>{k.type} <code>{verbose ? k.fingerprint : `${k.fingerprint.slice(0, 19)}…`}</code></li>)}
+      {verbose && <li>Trusted on first use; compare with the source server before transferring.</li>}
+    </ul>
   );
 }
 

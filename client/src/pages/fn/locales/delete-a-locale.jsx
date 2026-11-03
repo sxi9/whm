@@ -31,7 +31,7 @@ export default function DeleteALocale({ fn }) {
       <PageHeader fn={fn} />
       <RequestError error={error} onRetry={refetch} />
       <Card title="Custom locales" subtitle="The built-in English locale cannot be deleted, and the current default must be changed under Configure Application Locales before it can go." padded={false}>
-        <DataTable loading={loading} rows={deletable} rowKey={(l) => l.code} emptyText="There are no custom locales to delete."
+        <DataTable loading={loading} rows={deletable} rowKey={(l) => l.code} emptyText="There are no custom locales to delete. Locales created by copying, importing or editing will appear here."
           columns={[
             { key: 'code', label: 'Code', width: 110, render: (l) => <code>{l.code}</code> },
             { key: 'name', label: 'Name', render: (l) => <strong>{l.name}</strong> },

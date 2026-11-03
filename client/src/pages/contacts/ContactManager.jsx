@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Plus, Send, Play, RefreshCw, AlertTriangle } from 'lucide-react';
+import { Plus, Send, Play, RefreshCw, AlertTriangle, Info } from 'lucide-react';
 import { api, queryString } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { Card, StatusPill, Loading, KeyValue, CapabilityNotice, formatDate } from '../../components/Common.jsx';
@@ -64,7 +64,7 @@ export function ContactManager() {
       )}
       <Card title="Contacts" subtitle="Each contact picks the events it receives and a minimum severity. Other parts of the panel (backups, monitoring, security) raise these events." padded={false}
         actions={<Button variant="primary" icon={Plus} size="sm" onClick={() => { setFormError(null); setEditing({}); }}>Add contact</Button>}>
-        <DataTable dense rows={data.contacts} emptyText="No contacts yet. Add one so the server can tell someone when something goes wrong."
+        <DataTable dense rows={data.contacts} emptyText="No contacts yet. Contacts you add appear here with their channel, events and last delivery."
           columns={[
             { key: 'name', label: 'Name', render: (c) => <><strong>{c.name}</strong>{!c.enabled && <> <StatusPill status="disabled">disabled</StatusPill></>}</> },
             { key: 'channel', label: 'Channel', render: (c) => CHANNEL_LABEL[c.channel]?.split(' (')[0] || c.channel },
@@ -82,7 +82,7 @@ export function ContactManager() {
         />
       </Card>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: 18, alignItems: 'start' }}>
+      <div className="grid-2" style={{ alignItems: 'start' }}>
         <NotificationSettings settings={settings} capability={capability} smtpSecurity={data.smtpSecurity} onSaved={refreshAll} />
         <ChecksCard settings={settings} schedule={data.schedule} openAlerts={data.openAlerts} onChanged={refreshAll} />
       </div>
@@ -135,10 +135,10 @@ function NotificationSettings({ settings, capability, smtpSecurity, onSaved }) {
   return (
     <Card title="Notification settings" subtitle={`Email leaves through ${capability.mailTransport === 'exim' ? 'Exim on this server' : capability.mailTransport === 'smtp' ? `the SMTP relay ${settings.smtp.host}` : 'nothing yet: install Exim or configure a relay'}.`}>
       <Field inline><Toggle checked={draft.enabled} onChange={(v) => set('enabled', v)} label="Send notifications" description="When off, events are still raised but nothing is delivered." /></Field>
-      <Field label="From address" help={`Blank uses ${settings.effectiveFrom || 'whm@<hostname>'} (mail.notification_from or whm@hostname).`} error={error?.fields?.fromAddress}><TextInput value={draft.fromAddress} onChange={(v) => set('fromAddress', v)} placeholder={settings.effectiveFrom || 'whm@host.example.com'} /></Field>
+      <Field label="From address" help={`Blank uses ${settings.effectiveFrom ? settings.effectiveFrom : 'the default sender'} (mail.notification_from, or the panel's address at this hostname).`} error={error?.fields?.fromAddress}><TextInput value={draft.fromAddress} onChange={(v) => set('fromAddress', v)} placeholder={settings.effectiveFrom || 'notifications@host.example.com'} /></Field>
       <Field label="Keep the delivery log for (days)"><NumberInput value={draft.retentionDays} onChange={(v) => set('retentionDays', v ?? 1)} min={1} max={3650} nullable={false} /></Field>
-      <h3 style={{ margin: '14px 0 6px', fontSize: 14 }}>SMTP relay</h3>
-      <p className="muted" style={{ marginTop: 0 }}>Used when Exim is not installed, or always when "prefer the relay" is on. Leave the host blank to disable.</p>
+      <h3 style={{ margin: '14px 0 6px' }}>SMTP relay</h3>
+      <p className="muted">Used when Exim is not installed, or always when “prefer the relay” is on. Leave the host blank to disable.</p>
       <div className="form-grid">
         <Field label="Host" error={error?.fields?.['smtp.host']}><TextInput value={draft.smtp.host} onChange={(v) => setSmtp('host', v)} placeholder="smtp.example.net" /></Field>
         <Field label="Port"><NumberInput value={draft.smtp.port} onChange={(v) => setSmtp('port', v ?? 587)} min={1} max={65535} nullable={false} /></Field>
@@ -158,16 +158,16 @@ function NotificationSettings({ settings, capability, smtpSecurity, onSaved }) {
       <Field inline><Toggle checked={draft.smtp.allowSelfSigned} onChange={(v) => setSmtp('allowSelfSigned', v)} label="Accept the relay's self-signed certificate" /></Field>
       <Field inline><Toggle checked={draft.smtp.allowPlaintextAuth} onChange={(v) => setSmtp('allowPlaintextAuth', v)} label="Allow plaintext authentication" description="Send the relay password over a plain connection to a non-loopback host. Only for an isolated network." /></Field>
       <Field inline><Toggle checked={draft.smtp.prefer} onChange={(v) => setSmtp('prefer', v)} label="Prefer the relay even when Exim is installed" /></Field>
-      <h3 style={{ margin: '14px 0 6px', fontSize: 14 }}>Webhooks</h3>
+      <h3 style={{ margin: '14px 0 6px' }}>Webhooks</h3>
       <Field inline><Toggle checked={draft.webhook.allowPrivate} onChange={(v) => setDraft((d) => ({ ...d, webhook: { ...d.webhook, allowPrivate: v } }))} label="Allow webhooks to private addresses" description="Loopback, link-local and RFC 1918 targets are refused unless this is on, so a contact cannot be pointed at internal services." /></Field>
       <ErrorBanner error={error} />
       <FormActions>
         <Button variant="primary" loading={saving} disabled={!dirty} onClick={save}>Save</Button>
         <Button disabled={!dirty || saving} onClick={() => setDraft(initial())}>Reset</Button>
       </FormActions>
-      <h3 style={{ margin: '14px 0 6px', fontSize: 14 }}>Send a test message</h3>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
-        <div style={{ flex: 1 }}><TextInput value={testTo} onChange={setTestTo} placeholder="you@example.com" type="email" /></div>
+      <h3 style={{ margin: '14px 0 6px' }}>Send a test message</h3>
+      <div className="input-group">
+        <TextInput value={testTo} onChange={setTestTo} placeholder="you@example.com" type="email" />
         <Button icon={Send} loading={testing} disabled={!testTo.trim() || dirty} onClick={sendTest} title={dirty ? 'Save the settings first' : undefined}>Send</Button>
       </div>
     </Card>
@@ -224,7 +224,7 @@ function ChecksCard({ settings, schedule, openAlerts, onChanged }) {
 
   const last = check.lastResult;
   return (
-    <Card title="Monitoring checks" subtitle="Every 10 minutes (Configure cPanel Cron Jobs → server-contacts-check) the panel raises service.down, service.restored, disk.space.low and ssl.expiring." actions={<StatusPill status={check.enabled && schedule?.enabled ? 'enabled' : 'disabled'}>{check.enabled && schedule?.enabled ? 'Enabled' : 'Disabled'}</StatusPill>}>
+    <Card title="Monitoring checks" subtitle="Every 10 minutes (Configure Panel Cron Jobs → server-contacts-check) the panel raises service.down, service.restored, disk.space.low and ssl.expiring." actions={<StatusPill status={check.enabled && schedule?.enabled ? 'enabled' : 'disabled'}>{check.enabled && schedule?.enabled ? 'Enabled' : 'Disabled'}</StatusPill>}>
       <KeyValue items={[
         ['Last run', check.lastRunAt ? formatDate(check.lastRunAt) : 'never'],
         ['Last result', last ? `${last.services?.checked ?? 0} service(s), ${last.disks?.checked ?? 0} filesystem(s)${last.services?.down?.length ? `, down: ${last.services.down.join(', ')}` : ''}${last.disks?.low?.length ? `, low: ${last.disks.low.map((d) => `${d.mountpoint} ${d.usedPercent}%`).join(', ')}` : ''}${last.ssl?.expiring?.length ? `, ${last.ssl.expiring.length} certificate(s) expiring` : ''}` : '—'],
@@ -244,9 +244,10 @@ function ChecksCard({ settings, schedule, openAlerts, onChanged }) {
       {jobId && running && <ProgressLog jobId={jobId} />}
       {result && (
         <div className="banner banner-info" style={{ marginTop: 12 }}>
+          <Info size={18} />
           <div>
             <strong>Checked {result.services.checked} service(s) and {result.disks.checked} filesystem(s)</strong>
-            <p style={{ margin: '4px 0' }}>{result.services.down.length ? `Down: ${result.services.down.join(', ')}. ` : 'All monitored services are active. '}{result.disks.low.length ? `Low disk: ${result.disks.low.map((d) => `${d.mountpoint} (${d.usedPercent}%)`).join(', ')}. ` : ''}{result.ssl.expiring.length ? `Expiring certificates: ${result.ssl.expiring.map((c) => (c.kind === 'service' ? `${c.domain} (service)` : c.domain)).join(', ')}.` : ''}</p>
+            <p>{result.services.down.length ? `Down: ${result.services.down.join(', ')}. ` : 'All monitored services are active. '}{result.disks.low.length ? `Low disk: ${result.disks.low.map((d) => `${d.mountpoint} (${d.usedPercent}%)`).join(', ')}. ` : ''}{result.ssl.expiring.length ? `Expiring certificates: ${result.ssl.expiring.map((c) => (c.kind === 'service' ? `${c.domain} (service)` : c.domain)).join(', ')}.` : ''}</p>
             {result.notifications.length > 0 && <ul>{result.notifications.map((n, i) => <li key={i}>{n.event}: {n.subject} — {n.sent} sent{n.failed ? `, ${n.failed} failed` : ''}</li>)}</ul>}
             {[result.services.error, result.disks.error, result.ssl.error].filter(Boolean).map((e) => <small key={e}>{e}</small>)}
           </div>
@@ -291,7 +292,7 @@ function DeliveryLog({ version, events }) {
             <Select value={event} onChange={(v) => { setEvent(v); table.setPage(1); }} options={events.map((e) => ({ value: e.key, label: e.key }))} placeholder="Any event" />
           </>
         )}
-        emptyText="Nothing has been sent yet."
+        emptyText="Nothing has been sent yet. Each delivery attempt, test or event, is listed here."
         columns={[
           { key: 'ts', label: 'When', sortable: true, render: (d) => formatDate(d.ts) },
           { key: 'event', label: 'Event', sortable: true, render: (d) => <><code>{d.event}</code>{d.test ? <> <StatusPill status="info">test</StatusPill></> : null}</> },

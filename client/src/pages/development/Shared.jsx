@@ -4,7 +4,7 @@ import { Copy, Check, Download } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { Card, StatusPill, Loading, KeyValue, formatDate } from '../../components/Common.jsx';
-import { Button, ErrorBanner } from '../../components/Form.jsx';
+import { Button, ErrorBanner, TextInput, Select } from '../../components/Form.jsx';
 import { useToast } from '../../components/Toast.jsx';
 
 export { RequestError, Tabs, isCapabilityError } from '../security/Shared.jsx';
@@ -151,12 +151,12 @@ function Block({ block, baseSlugs }) {
 
 export function curlFor(endpoint) {
   const path = endpoint.path.replace(/:([A-Za-z0-9_]+)/g, '<$1>');
-  const auth = endpoint.auth ? ' \\\n  -H "Authorization: Bearer $WHM_TOKEN"' : '';
+  const auth = endpoint.auth ? ' \\\n  -H "Authorization: Bearer $TOKEN"' : '';
   const body = ['POST', 'PUT', 'PATCH'].includes(endpoint.method) ? ' \\\n  -H "Content-Type: application/json" -d \'{}\'' : '';
   return `curl -s -X ${endpoint.method} "https://$HOST:2087${path}"${auth}${body}`;
 }
 
-// Endpoint browser shared by the WHM and cPanel OpenAPI pages.
+// Endpoint browser shared by the admin-panel and account-panel OpenAPI pages.
 export function ApiReference({ scope, note }) {
   const toast = useToast();
   const { data, loading, error, refetch } = useApi(`/development/openapi/endpoints?scope=${scope}`);
@@ -175,7 +175,7 @@ export function ApiReference({ scope, note }) {
 
   const downloadSpec = async () => {
     setDownloading(true);
-    try { const res = await api.get(`/development/openapi.json?scope=${scope}`); downloadText(`whm-openapi-${scope}.json`, JSON.stringify(res.data, null, 2), 'application/json'); } catch (err) { toast.error(err); } finally { setDownloading(false); }
+    try { const res = await api.get(`/development/openapi.json?scope=${scope}`); downloadText(`keel-openapi-${scope}.json`, JSON.stringify(res.data, null, 2), 'application/json'); } catch (err) { toast.error(err); } finally { setDownloading(false); }
   };
 
   return (
@@ -193,11 +193,11 @@ export function ApiReference({ scope, note }) {
           <Card title="Endpoints" subtitle="Generated live from the mounted Express routers: every path, method and the role it requires. Pick one for a curl example." padded={false}
             actions={<><Button size="sm" icon={Download} loading={downloading} onClick={downloadSpec}>openapi.json</Button><Button size="sm" onClick={() => refetch()}>Refresh</Button></>}>
             <div className="datatable-toolbar" style={{ padding: 12 }}>
-              <input className="input" placeholder="Filter by path…" value={q} onChange={(e) => setQ(e.target.value)} style={{ maxWidth: 320 }} />
-              <select className="input select" value={method} onChange={(e) => setMethod(e.target.value)} style={{ maxWidth: 140 }}><option value="">All methods</option>{['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].map((m) => <option key={m}>{m}</option>)}</select>
-              <select className="input select" value={role} onChange={(e) => setRole(e.target.value)} style={{ maxWidth: 180 }}><option value="">All roles</option><option value="root">root only</option><option value="reseller">root + reseller</option><option value="any">any principal</option></select>
+              <TextInput placeholder="Filter by path…" value={q} onChange={setQ} style={{ maxWidth: 320 }} />
+              <Select value={method} onChange={setMethod} placeholder="All methods" options={['GET', 'POST', 'PUT', 'PATCH', 'DELETE']} style={{ maxWidth: 140 }} />
+              <Select value={role} onChange={setRole} placeholder="All roles" options={[{ value: 'root', label: 'root only' }, { value: 'reseller', label: 'root + reseller' }, { value: 'any', label: 'any principal' }]} style={{ maxWidth: 180 }} />
             </div>
-            {groups.length === 0 && <p className="muted" style={{ padding: 14 }}>No endpoints match.</p>}
+            {groups.length === 0 && <p className="muted" style={{ padding: 14 }}>No endpoints match this filter. Clear it to see every group again.</p>}
             {groups.map((g) => (
               <div key={g.prefix} style={{ borderTop: '1px solid var(--border)' }}>
                 <button className="link-button" style={{ display: 'flex', width: '100%', justifyContent: 'space-between', padding: '10px 14px', textAlign: 'left' }} onClick={() => setOpen(open === g.prefix ? null : g.prefix)}>
@@ -236,7 +236,7 @@ export function ApiReference({ scope, note }) {
 }
 
 export function DocLinks({ docs }) {
-  if (!docs?.length) return <p className="muted">No documents are shipped with this install.</p>;
+  if (!docs?.length) return <p className="muted">No documents are shipped with this install. Design documents appear here when the install includes them.</p>;
   return (
     <div className="tool-grid">
       {docs.map((d) => (

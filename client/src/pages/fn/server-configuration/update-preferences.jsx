@@ -71,8 +71,8 @@ export default function UpdatePreferences({ fn }) {
             </Card>
             <Card title="Operating system packages">
               {data.os && !data.os.unavailable ? <KeyValue items={[['Package manager', data.os.manager], ['Pending updates', data.os.count], ['Security updates', data.os.security], ['Reboot required', data.os.rebootRequired ? <StatusPill key="r" status="warning">yes</StatusPill> : 'no'], ['Checked', formatDate(data.os.checkedAt)]]} /> : <p className="muted">{data.os?.reason || 'No package manager detected or the Software category is not loaded.'}</p>}
-              <KeyValue items={[['Daily check schedule', data.schedule ? <>{data.schedule.cron} <StatusPill status={data.schedule.enabled ? 'enabled' : 'disabled'}>{data.schedule.enabled ? 'enabled' : 'disabled'}</StatusPill></> : 'not registered'], ['Last run', formatDate(data.schedule?.lastRunAt)], ['Next run', formatDate(data.schedule?.nextRunAt)]]} />
-              <p className="muted" style={{ marginTop: 8 }}>Apply pending packages from <Link to="/software/system-update">Software › System Update</Link>; adjust the check schedule in <Link to="/server-configuration/configure-cpanel-cron-jobs">Configure cPanel Cron Jobs</Link>.</p>
+              <KeyValue items={[['Daily check schedule', data.schedule ? <span key="s" className="row-actions" style={{ gap: 8 }}><code>{data.schedule.cron}</code><StatusPill status={data.schedule.enabled ? 'enabled' : 'disabled'}>{data.schedule.enabled ? 'enabled' : 'disabled'}</StatusPill></span> : 'not registered'], ['Last run', formatDate(data.schedule?.lastRunAt)], ['Next run', formatDate(data.schedule?.nextRunAt)]]} />
+              <p className="muted" style={{ marginTop: 8 }}>Apply pending packages from <Link to="/software/system-update">Software › System Update</Link>; adjust the check schedule in <Link to="/server-configuration/configure-cpanel-cron-jobs">Configure Panel Cron Jobs</Link>.</p>
             </Card>
           </div>
           {data.lastCheck && (

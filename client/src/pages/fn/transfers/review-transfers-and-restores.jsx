@@ -17,10 +17,8 @@ function Runs() {
     <>
       <Totals items={[['Runs', rows.length], ['Accounts', sum('total')], ['Done', sum('done')], ['Pending', sum('pending')], ['Failed', sum('failed')]]} />
       <Card title="Transfers and restores" padded={false} actions={<Button size="sm" variant="ghost" onClick={() => refetch()}>Refresh</Button>}>
-        <div className="card-body">
-          <div className="form-grid">
-            <Field label="Kind"><Select value={kind} onChange={setKind} options={Object.entries(KIND_LABELS).map(([value, label]) => ({ value, label }))} placeholder="All kinds" /></Field>
-          </div>
+        <div className="card-body form-narrow">
+          <Field label="Kind"><Select value={kind} onChange={setKind} options={Object.entries(KIND_LABELS).map(([value, label]) => ({ value, label }))} placeholder="All kinds" /></Field>
         </div>
         <DataTable
           columns={[
@@ -33,7 +31,7 @@ function Runs() {
             { key: 'created_at', label: 'Started', render: (r) => formatDate(r.created_at) },
             { key: 'finished_at', label: 'Finished', render: (r) => formatDate(r.finished_at) },
           ]}
-          rows={rows} loading={loading} error={error} rowKey={(r) => r.id} dense emptyText="No transfers or restores have run yet."
+          rows={rows} loading={loading} error={error} rowKey={(r) => r.id} dense emptyText="No transfers or restores have run yet. Runs started from the Transfer Tool, Transfer or Restore an Account and Convert Addon Domain to Account appear here."
           rowActions={(r) => [{ label: openId === r.id ? 'Hide' : 'Details and log', primary: true, onClick: () => setOpenId(openId === r.id ? null : r.id) }]}
         />
       </Card>
@@ -50,10 +48,8 @@ function Jobs() {
   return (
     <>
       <Card title="Job queue entries" subtitle="Every transfer.* and restore.* job, including restores started from other tools." padded={false} actions={<Button size="sm" variant="ghost" onClick={() => refetch()}>Refresh</Button>}>
-        <div className="card-body">
-          <div className="form-grid">
-            <Field label="Status"><Select value={status} onChange={setStatus} options={['queued', 'running', 'done', 'failed', 'cancelled']} placeholder="Any status" /></Field>
-          </div>
+        <div className="card-body form-narrow">
+          <Field label="Status"><Select value={status} onChange={setStatus} options={['queued', 'running', 'done', 'failed', 'cancelled']} placeholder="Any status" /></Field>
         </div>
         <DataTable
           columns={[
@@ -67,7 +63,7 @@ function Jobs() {
             { key: 'finished_at', label: 'Finished', render: (j) => formatDate(j.finished_at) },
             { key: 'error', label: 'Error', render: (j) => j.error || <span className="muted">—</span> },
           ]}
-          rows={data || []} loading={loading} error={error} rowKey={(j) => j.id} dense emptyText="No transfer or restore jobs."
+          rows={data || []} loading={loading} error={error} rowKey={(j) => j.id} dense emptyText="No transfer or restore jobs yet. Queue entries appear here as soon as a run starts."
           rowActions={(j) => [{ label: openId === j.id ? 'Hide log' : 'Log', primary: true, onClick: () => setOpenId(openId === j.id ? null : j.id) }]}
         />
       </Card>
@@ -76,7 +72,7 @@ function Jobs() {
           {['queued', 'running'].includes(job.status)
             ? <ProgressLog jobId={job.id} />
             : <pre className="log">{(job.logs || []).map((l) => `${l.ts}  ${l.level.toUpperCase().padEnd(5)}  ${l.line}`).join('\n') || 'No log lines.'}</pre>}
-          {job.result && <pre className="log">{JSON.stringify(job.result, null, 2)}</pre>}
+          {job.result && <pre className="log" style={{ marginTop: 12 }}>{JSON.stringify(job.result, null, 2)}</pre>}
         </Card>
       )}
     </>
@@ -88,9 +84,9 @@ export default function ReviewTransfersAndRestores({ fn }) {
   return (
     <>
       <PageHeader fn={fn} description="Every transfer, cpmove restore and addon conversion with its per-account outcome, the steps that are still pending (for example zones waiting for BIND) and the full job log." />
-      <div className="row-actions" style={{ marginBottom: 14 }}>
-        <Button size="sm" variant={tab === 'runs' ? 'primary' : 'default'} onClick={() => setTab('runs')}>Runs</Button>
-        <Button size="sm" variant={tab === 'jobs' ? 'primary' : 'default'} onClick={() => setTab('jobs')}>Job log</Button>
+      <div className="segmented" role="tablist" style={{ marginBottom: 16 }}>
+        <button type="button" role="tab" aria-selected={tab === 'runs'} className={tab === 'runs' ? 'active' : ''} onClick={() => setTab('runs')}>Runs</button>
+        <button type="button" role="tab" aria-selected={tab === 'jobs'} className={tab === 'jobs' ? 'active' : ''} onClick={() => setTab('jobs')}>Job log</button>
       </div>
       {tab === 'runs' ? <Runs /> : <Jobs />}
     </>

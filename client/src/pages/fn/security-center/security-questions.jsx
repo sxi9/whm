@@ -1,10 +1,8 @@
-import { AlertTriangle } from 'lucide-react';
 import { ConfigPage } from '../../../components/ConfigPage.jsx';
 
 export default function SecurityQuestions({ fn }) {
   return (
-    <ConfigPage fn={fn} prefix="security.questions." description="Recovery questions for account users. Not enforced yet: the settings are stored for the authentication layer, which does not prompt for questions on login or password reset today."
-      extra={<div className="banner banner-warning"><AlertTriangle size={18} /><div>Enabling security questions here changes nothing for users yet. The login and password-reset flows must consume these settings before any question is asked; the Security Advisor flags the policy while it is switched on but inactive.</div></div>}
+    <ConfigPage fn={fn} prefix="security.questions." description="Recovery questions for account users. Not enforced yet: the settings are stored for the authentication layer, which does not prompt for questions on login or password reset today; the Security Advisor flags the policy while it is switched on but inactive."
       groups={[
         { title: 'Policy', fields: [
           { key: 'security.questions.enabled', label: 'Require security questions', type: 'toggle', help: 'Intended behaviour: account users set up their questions on their next login. Stored only; not enforced yet.' },

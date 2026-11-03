@@ -95,7 +95,11 @@ function InstallCard({ onInstalled }) {
     <Card title="Install a plugin" subtitle="Upload a .whmplugin package or install one already on this server">
       <div className="form-grid">
         <Field label="Package file" help="A gzip'ed tar with plugin.json and main.js at its root (max 20 MB)." htmlFor="plugin-file">
-          <input id="plugin-file" className="input" type="file" accept=".whmplugin,application/gzip" onChange={(e) => setFile(e.target.files?.[0] || null)} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+            <input id="plugin-file" type="file" accept=".whmplugin,application/gzip" hidden onChange={(e) => setFile(e.target.files?.[0] || null)} />
+            <label htmlFor="plugin-file" className="btn">Choose file</label>
+            <span className={file ? '' : 'muted'}>{file ? file.name : 'No file chosen'}</span>
+          </div>
         </Field>
         <Field label="Or a package path on this server" help="Under the data directory, /root, /home, /tmp or /opt." htmlFor="plugin-path">
           <TextInput id="plugin-path" value={path} onChange={setPath} placeholder="/root/net.example.hello-1.0.0.whmplugin" className="input mono" />

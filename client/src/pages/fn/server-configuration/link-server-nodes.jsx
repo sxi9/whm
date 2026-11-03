@@ -29,7 +29,7 @@ function NodeForm({ initial, onSubmit, onCancel, busy, error, editing }) {
       </div>
       <Field label="Roles this node serves" error={fields.roles}>
         <div className="row-actions" style={{ flexWrap: 'wrap', gap: 10 }}>
-          {ROLES.map(([value, label]) => <label key={value} className="radio" style={{ cursor: 'pointer' }}><input type="checkbox" checked={form.roles.includes(value)} onChange={() => toggleRole(value)} /><span><strong>{label}</strong></span></label>)}
+          {ROLES.map(([value, label]) => <label key={value} className="radio"><input type="checkbox" checked={form.roles.includes(value)} onChange={() => toggleRole(value)} /><span><strong>{label}</strong></span></label>)}
         </div>
       </Field>
       <Field inline><Toggle checked={form.verifyTls} onChange={set('verifyTls')} label="Verify the TLS certificate" description="Turn off only for a panel that still uses its self-signed certificate." disabled={form.scheme !== 'https'} /></Field>
@@ -75,14 +75,14 @@ export default function LinkServerNodes({ fn }) {
       <RequestError error={error} onRetry={refetch} />
       <Card padded={false}>
         <DataTable
-          rows={data || []} loading={loading} rowKey={(n) => n.id} emptyText="No linked nodes yet. Link a server node to get started."
+          rows={data || []} loading={loading} rowKey={(n) => n.id} emptyText="No linked nodes yet. Each linked server appears here with its roles and connection state; use Link a server node to add one."
           columns={[
             { key: 'name', label: 'Node', render: (n) => <><strong>{n.name}</strong>{!n.enabled && <> <StatusPill status="disabled">disabled</StatusPill></>}<br /><small className="muted"><code>{n.scheme}://{n.hostname}:{n.port}</code> as {n.username}</small></> },
-            { key: 'roles', label: 'Roles', render: (n) => (n.roles.length ? n.roles.map((r) => <span key={r} className="pill pill-info" style={{ marginRight: 4 }}>{r}</span>) : <span className="muted">—</span>) },
+            { key: 'roles', label: 'Roles', render: (n) => (n.roles.length ? <span className="row-actions" style={{ flexWrap: 'wrap' }}>{n.roles.map((r) => <StatusPill key={r} status="pending">{r}</StatusPill>)}</span> : <span className="muted">—</span>) },
             { key: 'status', label: 'Connection', render: (n) => <><StatusPill status={n.status === 'ok' ? 'ok' : n.status === 'error' ? 'failed' : 'unknown'}>{n.status === 'ok' ? 'reachable' : n.status === 'error' ? 'failed' : 'untested'}</StatusPill>{n.lastError && <><br /><small className="muted">{n.lastError}</small></>}</> },
             { key: 'remote', label: 'Remote panel', render: (n) => (n.remote ? <>{n.remote.hostname}<br /><small className="muted">v{n.remote.version} · {n.remote.profile || 'standard'} · {n.remote.accounts ?? '?'} accounts</small></> : <span className="muted">unknown until tested</span>) },
             { key: 'lastCheckedAt', label: 'Last tested', render: (n) => formatDate(n.lastCheckedAt) },
-            { key: 'hasToken', label: 'Token', render: (n) => <StatusPill status={n.hasToken ? 'ok' : 'warning'}>{n.hasToken ? 'stored (encrypted)' : 'missing'}</StatusPill> },
+            { key: 'hasToken', label: 'Token', render: (n) => <StatusPill status={n.hasToken ? 'ok' : 'warning'}>{n.hasToken ? 'stored' : 'missing'}</StatusPill> },
           ]}
           rowActions={(n) => [
             { label: testing === n.id ? 'Testing…' : 'Test connection', primary: true, disabled: testing === n.id, onClick: () => test(n) },

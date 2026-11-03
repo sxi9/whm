@@ -26,16 +26,16 @@ export default function ViewSentSummary({ fn }) {
             { key: 'messages', label: 'Messages', sortable: true, align: 'right' },
             { key: 'recipients', label: 'Recipients', sortable: true, align: 'right' },
             { key: 'delivered', label: 'Delivered', sortable: true, align: 'right' },
-            { key: 'failed', label: 'Failed', sortable: true, align: 'right', render: (r) => <span className={r.failed ? 'text-bad' : ''}>{r.failed}</span> },
+            { key: 'failed', label: 'Failed', sortable: true, align: 'right', render: (r) => r.failed ? <strong>{r.failed}</strong> : r.failed },
             { key: 'deferred', label: 'Deferred', align: 'right' },
             { key: 'bytes', label: 'Volume', sortable: true, align: 'right', render: (r) => formatBytes(r.bytes) },
             { key: 'last_seen', label: 'Last message', sortable: true, render: (r) => formatDate(r.lastSeen) },
             { key: 'hosts', label: 'From hosts', render: (r) => r.hosts.slice(0, 3).map((h) => <div key={h}><code>{h}</code></div>) },
           ]}
           rows={data || []} loading={loading} total={meta?.total ?? null} page={table.state.page} pageSize={table.state.pageSize} onPageChange={table.setPage}
-          sort={table.state.sort} dir={table.state.dir} onSortChange={table.setSort} rowKey={(r) => r.sender} dense emptyText="No outbound mail in this window."
+          sort={table.state.sort} dir={table.state.dir} onSortChange={table.setSort} rowKey={(r) => r.sender} dense emptyText="No outbound mail in this window. Senders are listed here as mail goes out."
           searchable q={table.state.q} onSearch={table.setSearch} searchPlaceholder="Filter senders"
-          toolbar={<><Field inline><Select value={auth} onChange={(v) => { setAuth(v); table.setPage(1); }} options={[{ value: 'true', label: 'Authenticated only' }, { value: 'false', label: 'Unauthenticated only' }]} placeholder="All senders" /></Field><WindowSelect value={hours} onChange={(v) => { setHours(v); table.setPage(1); }} /></>}
+          toolbar={<><Field inline><Select value={auth} onChange={(v) => { setAuth(v); table.setPage(1); }} options={[{ value: 'true', label: 'Authenticated only' }, { value: 'false', label: 'Unauthenticated only' }]} placeholder="All senders" /></Field><WindowSelect inline value={hours} onChange={(v) => { setHours(v); table.setPage(1); }} /></>}
         />
       </Card>
     </>

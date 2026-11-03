@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Plus, Trash2 } from 'lucide-react';
+import { Plus, Trash2, AlertTriangle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, KeyValue, formatDate } from '../../../components/Common.jsx';
@@ -58,9 +58,9 @@ export default function IpMigrationWizard({ fn }) {
   return (
     <>
       <PageHeader fn={fn} description="Renumbers the server: every account on an old address moves to the new one, A/AAAA records carrying the old address are rewritten and published, virtual hosts are updated through the web server service, Basic Setup and remote-service IPs follow, and new addresses are bound and persisted. Preview first, then dry-run or migrate." />
-      <div className="row-actions" style={{ marginBottom: 14 }}>
-        {['1. Map addresses', '2. Review plan', '3. Run'].map((label, i) => <span key={label} className={`pill ${step === i + 1 ? 'pill-info' : step > i + 1 ? 'pill-ok' : 'pill-muted'}`}>{label}</span>)}
-      </div>
+      <p style={{ marginBottom: 14 }} aria-label={`Step ${step} of 3`}>
+        {['Map addresses', 'Review plan', 'Run'].map((label, i) => <span key={label} className={step === i + 1 ? undefined : 'muted'}>{i > 0 && ' › '}{step === i + 1 ? <strong>{i + 1}. {label}</strong> : `${i + 1}. ${label}`}</span>)}
+      </p>
       <IpRequestError error={error} />
       {step < 3 && (
         <Card title="Address mappings" subtitle="Old address → new address. Several mappings run in order." actions={<Button size="sm" icon={Plus} onClick={() => setRows((rs) => [...rs, { from: '', to: '' }])}>Add mapping</Button>} padded={false}>
@@ -71,9 +71,7 @@ export default function IpMigrationWizard({ fn }) {
                 {rows.map((r, i) => (
                   <tr key={i}>
                     <td>
-                      <div className="input-group">
-                        <TextInput value={r.from} onChange={(v) => update(i, { from: v })} placeholder="203.0.113.10" list="whm-known-ips" />
-                      </div>
+                      <TextInput value={r.from} onChange={(v) => update(i, { from: v })} placeholder="203.0.113.10" list="ip-known-addresses" />
                     </td>
                     <td><TextInput value={r.to} onChange={(v) => update(i, { to: v })} placeholder="198.51.100.10" /></td>
                     <td><button className="btn btn-sm btn-icon btn-danger-ghost" disabled={rows.length === 1} onClick={() => { setRows((rs) => rs.filter((_r, j) => j !== i)); setPreview(null); }} aria-label="Remove mapping"><Trash2 size={14} /></button></td>
@@ -82,7 +80,7 @@ export default function IpMigrationWizard({ fn }) {
               </tbody>
             </table>
           </div>
-          <datalist id="whm-known-ips">{known.map((a) => <option key={a} value={a} />)}</datalist>
+          <datalist id="ip-known-addresses">{known.map((a) => <option key={a} value={a} />)}</datalist>
           <div className="card-body">
             <div className="form-grid">
               <Field inline><Toggle checked={options.updateDns} onChange={(v) => setOptions((o) => ({ ...o, updateDns: v }))} label="Rewrite DNS records" description="A/AAAA records carrying the old address, published through BIND" /></Field>
@@ -101,12 +99,12 @@ export default function IpMigrationWizard({ fn }) {
         <Card title="Migration plan" subtitle={preview.ok ? 'No blocking problems found' : 'Fix the problems below before running'}>
           <Summary items={[['Mappings', preview.totals.mappings], ['Accounts', preview.totals.accounts], ['DNS records', preview.totals.dnsRecords], ['New addresses to bind', preview.totals.newAddressesToBind], ['Main IP changes', preview.totals.mainIpChanges]]} />
           <KeyValue items={[
-            ['iproute2', <StatusPill key="i" status={preview.iproute2 ? 'ok' : 'failed'}>{preview.iproute2 ? 'installed' : 'missing — new addresses cannot be bound'}</StatusPill>],
+            ['iproute2', <span key="i"><StatusPill status={preview.iproute2 ? 'ok' : 'failed'}>{preview.iproute2 ? 'installed' : 'missing'}</StatusPill>{!preview.iproute2 && <span className="muted"> new addresses cannot be bound</span>}</span>],
             ['DNS service', <StatusPill key="d" status={preview.dnsService ? 'ok' : 'warning'}>{preview.dnsService ? 'available' : 'unavailable'}</StatusPill>],
-            ['Web server service', <StatusPill key="w" status={preview.web === 'available' ? 'ok' : 'warning'}>{preview.web === 'available' ? 'available' : 'not installed — vhosts unchanged'}</StatusPill>],
+            ['Web server service', <span key="w"><StatusPill status={preview.web === 'available' ? 'ok' : 'warning'}>{preview.web === 'available' ? 'available' : 'not installed'}</StatusPill>{preview.web !== 'available' && <span className="muted"> virtual hosts stay unchanged</span>}</span>],
           ]} />
-          {preview.warnings.length > 0 && <div className="banner banner-warning"><div><strong>Warnings</strong><ul>{preview.warnings.map((w) => <li key={w}>{w}</li>)}</ul></div></div>}
-          <div className="table-wrap">
+          {preview.warnings.length > 0 && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>Warnings</strong><ul>{preview.warnings.map((w) => <li key={w}>{w}</li>)}</ul></div></div>}
+          <div className="table-wrap" style={{ marginTop: 14 }}>
             <table>
               <thead><tr><th>Old</th><th>New</th><th>Accounts</th><th>DNS records</th><th>Flags</th><th>Problems</th></tr></thead>
               <tbody>
@@ -150,7 +148,7 @@ export default function IpMigrationWizard({ fn }) {
             { key: 'result', label: 'Result', render: (j) => j.result ? <span className="muted">{j.result.accounts} accounts · {j.result.dnsRecords} DNS · {j.result.bound} bound · {j.result.failed} failed</span> : j.error ? <span className="muted">{j.error}</span> : '' },
             { key: 'created_at', label: 'Started', render: (j) => formatDate(j.created_at) },
           ]}
-          rows={history || []} rowKey={(j) => j.id} dense emptyText="No migrations yet."
+          rows={history || []} rowKey={(j) => j.id} dense emptyText="No migrations yet. Dry runs and migrations appear here with their result."
         />
       </Card>
     </>

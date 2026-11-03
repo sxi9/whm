@@ -17,7 +17,7 @@ export default function ViewAvailableLocales({ fn }) {
       <PageHeader fn={fn} actions={<><Button onClick={() => refetch()}>Refresh</Button>{isRoot && <Link className="btn btn-primary" to="/locales/configure-application-locales">Configure</Link>}</>} />
       <RequestError error={error} onRetry={refetch} />
       <Card title="Installed locales" subtitle={`${locales.length} locale(s) · default "${defaultCode}" · ${baseKeys} base strings in the English catalog. Disabled locales are kept but not offered to users.`} padded={false}>
-        <DataTable loading={loading} rows={locales} rowKey={(l) => l.code} emptyText="No locales installed"
+        <DataTable loading={loading} rows={locales} rowKey={(l) => l.code} emptyText="No locales are installed yet. Installed locales appear here with their translation coverage once the English catalog has loaded."
           columns={[
             { key: 'code', label: 'Code', width: 110, render: (l) => <code>{l.code}</code> },
             { key: 'name', label: 'Name', render: (l) => <strong>{l.name}</strong> },
@@ -34,9 +34,9 @@ export default function ViewAvailableLocales({ fn }) {
           {system.data && (
             <>
               <KeyValue items={[
-                ['Locale tools (glibc)', <StatusPill key="c" status={system.data.capability ? 'installed' : 'not-installed'}>{system.data.capability ? 'locale / localedef present' : 'locale command not found'}</StatusPill>],
-                ['System language', system.data.lang ? <code>{system.data.lang}</code> : <span className="muted">not set</span>],
-                ['Config file', system.data.config ? <code>{system.data.config.path}</code> : <span className="muted">none of {system.data.files.join(', ')} is readable</span>],
+                ['Locale tools (glibc)', <StatusPill key="c" status={system.data.capability ? 'installed' : 'not-installed'}>{system.data.capability ? 'Installed' : 'Not installed'}</StatusPill>],
+                ['System language', system.data.lang ? <code key="l">{system.data.lang}</code> : <span key="l" className="muted">Not set</span>],
+                ['Config file', system.data.config ? <code key="f">{system.data.config.path}</code> : <span key="f" className="muted">None of {system.data.files.join(', ')} is readable</span>],
                 ['Panel default locale', <code key="p">{system.data.panelDefault}</code>],
               ]} />
               {system.data.config && Object.keys(system.data.config.vars).length > 1 && (

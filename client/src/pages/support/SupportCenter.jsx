@@ -11,11 +11,16 @@ import { Markdown } from '../development/Shared.jsx';
 import { SeverityPill, RequestError, CopyButton, downloadText } from './Shared.jsx';
 
 function LinkGrid({ links, external = false }) {
+  if (!links.length) return <p className="muted" style={{ margin: 0 }}>No links are configured. Resources appear here once the support settings name them.</p>;
   return (
-    <div className="tools-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 12 }}>
-      {links.map((l) => external
-        ? <a key={l.key} className="card" style={{ padding: 14, textDecoration: 'none', color: 'inherit' }} href={l.url} target="_blank" rel="noreferrer noopener"><strong style={{ display: 'flex', alignItems: 'center', gap: 6 }}>{l.label} <ExternalLink size={14} /></strong><p className="muted" style={{ margin: '6px 0 0' }}>{l.description}</p></a>
-        : <Link key={l.key} className="card" style={{ padding: 14, textDecoration: 'none', color: 'inherit' }} to={l.path}><strong>{l.label}</strong><p className="muted" style={{ margin: '6px 0 0' }}>{l.description}</p></Link>)}
+    <div className="tool-grid">
+      {links.map((l) => (
+        <div key={l.key} className="tool-card">
+          {external
+            ? <a className="tool-link" href={l.url} target="_blank" rel="noreferrer noopener"><strong>{l.label} <ExternalLink size={13} /></strong><small>{l.description}</small></a>
+            : <Link className="tool-link" to={l.path}><strong>{l.label}</strong><small>{l.description}</small></Link>}
+        </div>
+      ))}
     </div>
   );
 }
@@ -70,17 +75,14 @@ function DocReader({ docs }) {
 
   if (!slug) {
     return (
-      <Card title="Documentation shipped with this panel" subtitle="Read here, straight from the installed version.">
-        {docs.map((d) => (
-          <div key={d.slug} style={{ padding: '10px 0', borderBottom: '1px dashed var(--border)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-              <div>
-                <strong>{d.available ? <button className="link-button" onClick={() => open(d.slug)}><BookOpen size={14} /> {d.title}</button> : d.title}</strong>
-                <div className="muted">{d.summary} {d.available ? <span>· <code>{d.file}</code>{d.updatedAt ? ` · updated ${formatDate(d.updatedAt)}` : ''}</span> : <span>· not shipped with this install</span>}</div>
-              </div>
-            </div>
+      <Card title="Documentation shipped with this panel" subtitle="Read here, straight from the installed version." padded={false}>
+        {docs.length === 0 && <p className="muted" style={{ margin: 0, padding: 20 }}>No documents are shipped with this install. The README and the blueprint appear here when they are present.</p>}
+        {docs.map((d, i) => (
+          <div key={d.slug} className="card-body" style={{ borderTop: i ? '1px solid var(--border)' : 0 }}>
+            <h3>{d.available ? <button className="link-button" onClick={() => open(d.slug)}><BookOpen size={15} /> {d.title}</button> : d.title}</h3>
+            <p className="muted" style={{ margin: '4px 0 0' }}>{d.summary}{d.available ? <> · <code>{d.file}</code>{d.updatedAt ? ` · updated ${formatDate(d.updatedAt)}` : ''}</> : ' · not shipped with this install'}</p>
             {d.available && d.sections.length > 0 && (
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 10 }}>
                 {d.sections.map((s) => <button key={s.slug} className="btn btn-sm" onClick={() => open(d.slug, s.slug)}>{s.title}</button>)}
               </div>
             )}
@@ -100,7 +102,7 @@ function DocReader({ docs }) {
         <div style={{ display: 'grid', gridTemplateColumns: toc.length > 3 ? 'minmax(200px, 260px) 1fr' : '1fr', gap: 16, alignItems: 'start' }}>
           {toc.length > 3 && (
             <nav style={{ position: 'sticky', top: 12, maxHeight: '70vh', overflow: 'auto' }}>
-              {toc.map((s) => <div key={s.slug}><button className={`link-button ${s.slug === section ? 'active' : ''}`} style={{ fontWeight: s.slug === section ? 600 : 400, padding: '3px 0' }} onClick={() => open(slug, s.slug)}>{s.title}</button></div>)}
+              {toc.map((s) => <div key={s.slug}><button className={`link-button ${s.slug === section ? 'active' : ''}`} style={{ padding: '3px 0', textAlign: 'left' }} onClick={() => open(slug, s.slug)}>{s.slug === section ? <strong>{s.title}</strong> : s.title}</button></div>)}
             </nav>
           )}
           <div style={{ minWidth: 0 }}><Markdown text={doc.content} /></div>
@@ -121,7 +123,7 @@ export function SupportCenter() {
     setDownloading(true);
     try {
       const res = await api.get('/support/diagnostics');
-      downloadText(`whm-diagnostics-${res.data.generatedAt.replace(/[:.]/g, '-')}.json`, JSON.stringify(res.data, null, 2), 'application/json');
+      downloadText(`keel-diagnostics-${res.data.generatedAt.replace(/[:.]/g, '-')}.json`, JSON.stringify(res.data, null, 2), 'application/json');
       toast.success('Diagnostics bundle downloaded');
     } catch (err) { toast.error(err); } finally { setDownloading(false); }
   };
@@ -133,22 +135,22 @@ export function SupportCenter() {
       {data && (
         <>
           {isRoot && (
-            <div className="form-grid" style={{ gap: 14 }}>
+            <div className="grid-2">
               <Card title="Tickets" actions={<Link className="btn btn-sm" to="/support/create-support-ticket"><LifeBuoy size={14} /> New ticket</Link>}>
                 <KeyValue items={[['Open', data.tickets.open.length], ['Total', data.tickets.total], ['Email transport', data.mail.transport ? <StatusPill status="ok">{data.mail.transport}</StatusPill> : <StatusPill status="inactive">none</StatusPill>], ['Support address', data.mail.address || <span className="muted">not set</span>]]} />
                 {data.tickets.open.length > 0 && (
-                  <ul style={{ margin: '10px 0 0', paddingLeft: 18 }}>
+                  <ul style={{ margin: '12px 0 0', paddingLeft: 18 }}>
                     {data.tickets.open.map((t) => <li key={t.id}><Link to={`/support/create-support-ticket?ticket=${t.id}`}><code>{t.reference}</code></Link> {t.subject} <SeverityPill severity={t.severity} /> <span className="muted">{formatDate(t.createdAt)}</span></li>)}
                   </ul>
                 )}
               </Card>
               <Card title="Support access" actions={<Link className="btn btn-sm" to="/support/grant-cpanel-support-access"><KeyRound size={14} /> Manage</Link>}>
                 <KeyValue items={[['Active grants', data.access.active.length], ['Cleanup pending', data.access.cleanupPending?.length ? <StatusPill status="warning">{data.access.cleanupPending.length} (root key still on the host)</StatusPill> : 0], ['sshd', data.access.sshd ? <StatusPill status="installed">installed</StatusPill> : <StatusPill status="not-installed">not installed</StatusPill>]]} />
-                {data.access.active.length > 0 && <ul style={{ margin: '10px 0 0', paddingLeft: 18 }}>{data.access.active.map((g) => <li key={g.id}>{g.label} · until {formatDate(g.expiresAt)}{g.ssh ? ' · SSH' : ''}{g.apiToken ? ' · API' : ''}</li>)}</ul>}
+                {data.access.active.length > 0 && <ul style={{ margin: '12px 0 0', paddingLeft: 18 }}>{data.access.active.map((g) => <li key={g.id}>{g.label} · until {formatDate(g.expiresAt)}{g.ssh ? ' · SSH' : ''}{g.apiToken ? ' · API' : ''}</li>)}</ul>}
               </Card>
               <Card title="Diagnostics" subtitle="A JSON bundle to attach to a ticket by hand: the system snapshot, capabilities, services, failed jobs, schedules, non-secret settings and recent audit entries.">
                 <Button icon={Download} loading={downloading} onClick={downloadDiagnostics}>Download diagnostics</Button>
-                <p className="muted small" style={{ marginTop: 8 }}>Panel {data.panel.version} · {data.panel.mode} mode · Node {data.panel.node}</p>
+                <p className="muted" style={{ margin: '12px 0 0' }}>Panel {data.panel.version} · {data.panel.mode} mode · Node {data.panel.node}</p>
               </Card>
             </div>
           )}

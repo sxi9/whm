@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { Info } from 'lucide-react';
 import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { useAuth } from '../../../auth/AuthContext.jsx';
@@ -34,7 +35,7 @@ function ForwardingForm({ initial, onSaved, onCancel }) {
         <Field label="Type" error={error?.fields?.type}><Select value={form.type} onChange={set('type')} options={[{ value: 'permanent', label: 'Permanent (301)' }, { value: 'temporary', label: 'Temporary (302)' }]} /></Field>
       </div>
       <Field inline><Toggle checked={form.matchWww} onChange={set('matchWww')} label="Also redirect www.<domain>" /></Field>
-      <Field inline><Toggle checked={form.keepPath} onChange={set('keepPath')} label="Keep the request path" description="/page → target/page (off: everything goes to the target URL)" /></Field>
+      <Field inline><Toggle checked={form.keepPath} onChange={set('keepPath')} label="Keep the request path" description="/page becomes target/page; when off, everything goes to the target URL" /></Field>
       <FormActions><Button type="submit" variant="primary" loading={busy}>{initial ? 'Save' : 'Add redirect'}</Button>{onCancel && <Button onClick={onCancel}>Cancel</Button>}</FormActions>
     </form>
   );
@@ -64,7 +65,7 @@ export default function SetupEditDomainForwarding({ fn }) {
     <>
       <PageHeader fn={fn} description="HTTP redirects for whole domains. Redirects are stored here and applied to the web server's virtual hosts; when the web module is unavailable they wait as pending."
         actions={<><Button variant="primary" onClick={() => setEditing({})}>Add redirect</Button>{user.role === 'root' && pending > 0 && <Button loading={busy} onClick={applyAll}>Apply pending ({pending})</Button>}</>} />
-      {data && webSupported === false && <div className="banner banner-info"><div><strong>Web server integration not loaded</strong><p>Redirects are recorded and will be written to the vhosts as soon as the web server module is available.</p></div></div>}
+      {data && webSupported === false && <div className="banner banner-info"><Info size={18} /><div><strong>Web server integration not loaded</strong><p>Redirects are recorded and will be written to the vhosts as soon as the web server module is available.</p></div></div>}
       <Card padded={false}>
         <DataTable
           columns={[
@@ -81,7 +82,7 @@ export default function SetupEditDomainForwarding({ fn }) {
           sort={t.state.sort} dir={t.state.dir} onSortChange={t.setSort}
           searchable q={t.state.q} onSearch={t.setSearch}
           rowActions={(r) => [{ label: 'Edit', primary: true, onClick: () => setEditing(r) }, { label: 'Remove', danger: true, onClick: () => remove(r) }]}
-          emptyText="No domain redirects configured."
+          emptyText="No domain redirects yet. Redirects added with the button above appear here with their status."
         />
       </Card>
       <Modal open={Boolean(editing)} title={editing?.domain ? `Edit redirect for ${editing.domain}` : 'Add a domain redirect'} onClose={() => setEditing(null)}>

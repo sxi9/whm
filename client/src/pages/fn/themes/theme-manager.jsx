@@ -4,7 +4,7 @@ import { Plus } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useAuth } from '../../../auth/AuthContext.jsx';
 import { useApi } from '../../../hooks/useApi.js';
-import { PageHeader, Card, Loading, KeyValue, formatDate } from '../../../components/Common.jsx';
+import { PageHeader, Card, Loading, KeyValue, StatusPill, formatDate } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
 import { Field, TextInput, Select, Toggle, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
@@ -81,7 +81,7 @@ function ThemesTab({ state, isRoot, onEdit }) {
   ];
   return (
     <Card title="Installed themes" subtitle="Built-in themes sit on the panel's own token layer; copy one to customise colours, shape and CSS." padded={false}>
-      <DataTable columns={columns} rows={themes} loading={loading} rowKey={(t) => t.slug} emptyText="No themes"
+      <DataTable columns={columns} rows={themes} loading={loading} rowKey={(t) => t.slug} emptyText="Installed themes appear here"
         rowActions={(t) => [
           !t.builtin && isRoot && { label: 'Edit', primary: true, onClick: () => onEdit(t.slug) },
           (t.builtin || !isRoot) && { label: 'View', primary: true, onClick: () => onEdit(t.slug) },
@@ -165,7 +165,7 @@ function DefaultsTab({ state }) {
         <Field label="Default for new accounts" required error={error?.fields?.accountDefault}><ThemeSelect value={draft.accountDefault} onChange={(v) => setDraft({ ...draft, accountDefault: v })} themes={themes} filter={enabledOnly} placeholder={null} /></Field>
       </div>
       <Field label="Per-user overrides"><Toggle checked={draft.allowUserOverride} onChange={(v) => setDraft({ ...draft, allowUserOverride: v })} label={draft.allowUserOverride ? 'Resellers and users may choose their own theme' : 'Everyone except root follows the panel default'} /></Field>
-      <p className="muted">Logos and company branding are configured per account under <Link to="/cpanel/customization">cPanel › Customization</Link>.</p>
+      <p className="muted">Logos and company branding are configured per account under <Link to="/cpanel/customization">Panel › Customization</Link>.</p>
       <ErrorBanner error={error} />
       <FormActions>
         <Button variant="primary" loading={saving} onClick={save}>Save</Button>
@@ -185,17 +185,17 @@ function PackagesTab({ state }) {
     setBusy(pkg.name);
     try { await api.put(`/themes/packages/${encodeURIComponent(pkg.name)}`, { theme: slug }); toast.success(`Package "${pkg.name}" now uses "${slug}"`); refetch(); state.refetch(); } catch (err) { toast.error(err); } finally { setBusy(null); }
   };
-  const fallbackPill = (p) => <span className="pill pill-warn" style={{ marginLeft: 6 }} title="The assigned theme is disabled; new accounts record the account default instead">falls back to {p.effective}</span>;
+  const fallbackPill = (p) => <span style={{ marginLeft: 6 }} title="The assigned theme is disabled; new accounts record the account default instead"><StatusPill status="warning">falls back to {p.effective}</StatusPill></span>;
   const columns = [
     { key: 'name', label: 'Package', render: (p) => <strong>{p.name}</strong> },
     { key: 'accounts', label: 'Accounts', align: 'right' },
-    { key: 'theme', label: 'Assigned theme', render: (p) => <span>{p.theme}{!p.themeKnown && <span className="pill pill-warn" style={{ marginLeft: 6 }}>unknown</span>}{p.themeKnown && p.effective !== p.theme && fallbackPill(p)}</span> },
+    { key: 'theme', label: 'Assigned theme', render: (p) => <span>{p.theme}{!p.themeKnown && <span style={{ marginLeft: 6 }}><StatusPill status="warning">unknown</StatusPill></span>}{p.themeKnown && p.effective !== p.theme && fallbackPill(p)}</span> },
     { key: 'change', label: 'Change', render: (p) => <ThemeSelect value={p.theme} onChange={(v) => assign(p, v)} themes={themes} filter={(t) => t.enabled || t.slug === p.theme} placeholder={null} disabled={busy === p.name || !p.owned} title={p.owned ? undefined : 'Only the owner of a package can change its theme'} style={{ maxWidth: 280 }} /> },
   ];
   return (
     <Card title="Theme per package" subtitle="New accounts created from a package record its theme in their plan snapshot. Packages whose theme is disabled or missing fall back to the account default. Resellers can only retheme packages they own." padded={false}>
       <RequestError error={error} onRetry={refetch} />
-      <DataTable columns={columns} rows={data || []} loading={loading} rowKey={(p) => p.name} emptyText="No packages yet" />
+      <DataTable columns={columns} rows={data || []} loading={loading} rowKey={(p) => p.name} emptyText="Packages and their themes appear here once a package exists" />
     </Card>
   );
 }
@@ -229,13 +229,15 @@ function PreferenceTab({ state }) {
       {current && (
         <>
           <KeyValue items={[
-            ['Currently applied', <span><strong>{current.name}</strong> <code>{current.slug}</code> <ThemeSwatch theme={current} size={14} /></span>],
+            ['Currently applied', <span className="row-actions" style={{ gap: 6 }}><strong>{current.name}</strong> <code>{current.slug}</code> <ThemeSwatch theme={current} size={14} /></span>],
             ['Source', current.source === 'user' ? 'your preference' : `panel default (${defaultSlug})${current.ignoredPreference ? ` — your stored choice "${current.ignoredPreference}" is not applied` : ''}`],
             ['Per-user overrides', allowUserOverride ? 'allowed' : 'disabled by the administrator (root is exempt)'],
           ]} />
-          <Field label="Preferred theme" help={locked ? 'Overrides are disabled on this server.' : undefined}>
-            <ThemeSelect value={choice} onChange={(v) => save(v)} themes={themes} filter={(t) => t.enabled} placeholder={`Panel default (${defaultSlug})`} disabled={saving || locked} style={{ maxWidth: 360 }} />
-          </Field>
+          <div style={{ marginTop: 18 }}>
+            <Field label="Preferred theme" help={locked ? 'Overrides are disabled on this server.' : undefined}>
+              <ThemeSelect value={choice} onChange={(v) => save(v)} themes={themes} filter={(t) => t.enabled} placeholder={`Panel default (${defaultSlug})`} disabled={saving || locked} style={{ maxWidth: 360 }} />
+            </Field>
+          </div>
           <FormActions>
             {themes.filter((t) => t.enabled && t.slug !== current.slug).map((t) => (
               <Button key={t.slug} size="sm" onClick={() => preview.start({ base: t.base, scheme: t.scheme, variables: t.variables, css: '' })} title={t.hasCss ? 'Preview without the CSS override' : undefined}>Preview {t.name}</Button>

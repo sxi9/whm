@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../../../api/client.js';
-import { PageHeader, Card, Loading } from '../../../components/Common.jsx';
+import { PageHeader, Card, Loading, StatusPill } from '../../../components/Common.jsx';
 import { Field, Toggle, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useT, setPreferredLocale, preferredLocale } from '../../../i18n/useT.js';
@@ -55,9 +55,9 @@ export default function ConfigureApplicationLocales({ fn }) {
                   const forced = l.code === draft.default;
                   return (
                     <tr key={l.code}>
-                      <td><strong>{l.name}</strong> <code>{l.code}</code>{l.builtin && <span className="pill pill-info" style={{ marginLeft: 6 }}>built-in</span>}</td>
+                      <td><span className="row-actions" style={{ justifyContent: 'flex-start', gap: 6 }}><strong>{l.name}</strong> <code>{l.code}</code>{l.builtin && <StatusPill status="info">Built-in</StatusPill>}</span></td>
                       <td><TranslationProgress stats={l.stats} /></td>
-                      <td><Toggle checked={forced || draft.enabled.includes(l.code)} disabled={forced} onChange={(on) => toggle(l.code, on)} label={forced ? 'default' : draft.enabled.includes(l.code) ? 'enabled' : 'disabled'} /></td>
+                      <td><Toggle checked={forced || draft.enabled.includes(l.code)} disabled={forced} onChange={(on) => toggle(l.code, on)} label={forced ? 'Default' : draft.enabled.includes(l.code) ? 'Enabled' : 'Disabled'} /></td>
                     </tr>
                   );
                 })}

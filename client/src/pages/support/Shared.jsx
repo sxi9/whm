@@ -50,7 +50,7 @@ export function CopyButton({ text, label = 'Copy', size = 'sm' }) {
 
 // A one-time secret (private key, token) with copy and download; the page that
 // shows it is the only place it ever exists in the clear.
-export function SecretBlock({ label, value, filename, help, mono = true }) {
+export function SecretBlock({ label, value, filename, help }) {
   return (
     <div className="field">
       <div className="field-label" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8 }}>
@@ -60,7 +60,7 @@ export function SecretBlock({ label, value, filename, help, mono = true }) {
           {filename && <Button size="sm" icon={Download} onClick={() => downloadText(filename, value)}>Download</Button>}
         </span>
       </div>
-      <pre className="log" style={{ maxHeight: 220, fontFamily: mono ? undefined : 'inherit' }}>{value}</pre>
+      <pre className="log" style={{ maxHeight: 220 }}>{value}</pre>
       {help && <div className="field-help">{help}</div>}
     </div>
   );

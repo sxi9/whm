@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, formatDate } from '../../../components/Common.jsx';
@@ -21,7 +22,7 @@ export default function EditZoneTemplates({ fn }) {
   const [busy, setBusy] = useState(false);
   const current = (templates || []).find((t) => t.name === name);
 
-  useEffect(() => { if (current) { setBody(current.body); setPreview(null); setError(null); } }, [current]);
+  useEffect(() => { if (current) { setBody(current.body); setPreview(null); setError(null); } }, [current?.name]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const save = async () => {
     setBusy(true); setError(null);
@@ -60,21 +61,21 @@ export default function EditZoneTemplates({ fn }) {
       {current && (
         <Card title={`Template "${current.name}"`} subtitle={`Updated ${formatDate(current.updated_at)} · variables: ${VARIABLES.join(' ')}`}>
           <ErrorBanner error={error && !error.fields ? error : null} />
-          {error?.fields?.body && <div className="banner banner-error"><div><strong>Template does not render to a valid zone</strong><ul>{error.fields.body.map((e, i) => <li key={i}>{e}</li>)}</ul></div></div>}
+          {error?.fields?.body && <div className="banner banner-error"><AlertTriangle size={18} /><div><strong>Template does not render to a valid zone</strong><ul>{error.fields.body.map((e, i) => <li key={i}>{e}</li>)}</ul></div></div>}
           <Textarea value={body} onChange={setBody} rows={20} mono spellCheck={false} />
           <div className="form-grid" style={{ marginTop: 12 }}>
             <Field label="Preview with domain"><TextInput value={previewDomain} onChange={setPreviewDomain} placeholder="example.com" /></Field>
           </div>
           <FormActions>
             <Button variant="primary" loading={busy} onClick={save} disabled={body === current.body}>Save</Button>
-            <Button onClick={doPreview} loading={busy}>Save &amp; preview</Button>
+            <Button onClick={doPreview} loading={busy}>Save and preview</Button>
             <Button onClick={() => setBody(current.body)} disabled={body === current.body}>Reset</Button>
             {!current.builtin && <Button variant="danger" onClick={remove}>Delete template</Button>}
           </FormActions>
           {preview && (
             <>
-              <h3 style={{ marginTop: 16 }}>Rendered preview ({preview.records} records{preview.errors.length ? `, ${preview.errors.length} error(s)` : ''})</h3>
-              {preview.errors.length > 0 && <div className="banner banner-error"><div><ul>{preview.errors.map((e, i) => <li key={i}>{e}</li>)}</ul></div></div>}
+              <h3 style={{ marginTop: 16, marginBottom: 10 }}>Rendered preview ({preview.records} records{preview.errors.length ? `, ${preview.errors.length} error(s)` : ''})</h3>
+              {preview.errors.length > 0 && <div className="banner banner-error"><AlertTriangle size={18} /><div><strong>The rendered zone has errors</strong><ul>{preview.errors.map((e, i) => <li key={i}>{e}</li>)}</ul></div></div>}
               <pre className="log">{preview.body}</pre>
             </>
           )}

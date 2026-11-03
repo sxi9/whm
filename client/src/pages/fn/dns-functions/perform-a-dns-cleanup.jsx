@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
-import { PageHeader, Card, StatusPill, EmptyState, formatDate } from '../../../components/Common.jsx';
+import { PageHeader, Card, StatusPill, KeyValue, EmptyState, formatDate } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
 import { Button, ErrorBanner } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
@@ -54,7 +54,7 @@ export default function PerformADnsCleanup({ fn }) {
           rowActions={(z) => [{ label: 'Delete', primary: true, danger: true, onClick: () => run({ domains: [z.domain] }) }]}
         />
       </Card>
-      {data && !data.bindInstalled && <Card><EmptyState title="BIND is not installed">Disk checks (unmanaged and missing zone files) run only on a host with BIND.</EmptyState></Card>}
+      {data && !data.bindInstalled && <Card><EmptyState title="BIND is not installed">Once BIND is installed, this page also lists zone files on disk the panel does not know about and zones missing from disk.</EmptyState></Card>}
       {data?.bindInstalled && (
         <>
           <Card title="Zone files not known to the panel" subtitle="Imported automatically when valid; these could not be parsed or are not domains" padded={false}>
@@ -68,11 +68,11 @@ export default function PerformADnsCleanup({ fn }) {
       )}
       {last && (
         <Card title="Last cleanup">
-          <ul>
-            {last.removed.map((r) => <li key={r.domain}><code>{r.domain}</code> <StatusPill status={r.removed ? 'ok' : 'failed'}>{r.removed ? 'removed' : r.error}</StatusPill></li>)}
-            {last.republished.map((r) => <li key={r.domain}><code>{r.domain}</code> <StatusPill status={r.ok ? 'ok' : 'failed'}>{r.ok ? 'rewritten' : r.error}</StatusPill></li>)}
-            {last.skipped.map((d) => <li key={d}><code>{d}</code> <StatusPill status="info">skipped (not an orphan)</StatusPill></li>)}
-          </ul>
+          <KeyValue items={[
+            ...last.removed.map((r) => [r.domain, <StatusPill key={r.domain} status={r.removed ? 'ok' : 'failed'}>{r.removed ? 'removed' : r.error}</StatusPill>]),
+            ...last.republished.map((r) => [r.domain, <StatusPill key={r.domain} status={r.ok ? 'ok' : 'failed'}>{r.ok ? 'rewritten' : r.error}</StatusPill>]),
+            ...last.skipped.map((d) => [d, <StatusPill key={d} status="info">skipped (not an orphan)</StatusPill>]),
+          ]} />
         </Card>
       )}
     </>

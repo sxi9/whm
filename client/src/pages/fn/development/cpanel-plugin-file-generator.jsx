@@ -3,7 +3,7 @@ import { Download, Eye } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading } from '../../../components/Common.jsx';
-import { Field, TextInput, Textarea, Select, Toggle, Button, ErrorBanner } from '../../../components/Form.jsx';
+import { Field, TextInput, Textarea, Select, Toggle, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, Tabs, CopyButton, downloadBase64 } from '../../development/Shared.jsx';
 
@@ -82,16 +82,16 @@ export default function CpanelPluginFileGenerator({ fn }) {
               <Field label="Stage" help={eventDef?.payload ? `Payload: ${eventDef.payload}` : undefined}><Select value={hookStage} onChange={setHookStage} options={stages} /></Field>
             </div>
             <div className="action-row"><Button onClick={addHook}>Add hook</Button></div>
-            {form.hooks.length > 0 && <div className="row-actions" style={{ flexWrap: 'wrap' }}>{form.hooks.map((h) => <button key={`${h.event}:${h.stage}`} className="btn btn-sm" onClick={() => setForm({ ...form, hooks: form.hooks.filter((x) => x !== h) })} title="Remove"><code>{h.event}</code> <span className="muted">{h.stage}</span> ×</button>)}</div>}
+            {form.hooks.length > 0 && <div className="row-actions" style={{ flexWrap: 'wrap' }}>{form.hooks.map((h) => <Button key={`${h.event}:${h.stage}`} size="sm" onClick={() => setForm({ ...form, hooks: form.hooks.filter((x) => x !== h) })} title="Remove"><code>{h.event}</code> <span className="muted">{h.stage}</span> ×</Button>)}</div>}
           </Card>
-          <div className="action-row" style={{ display: 'flex', gap: 8 }}>
+          <FormActions>
             <Button icon={Eye} loading={busy} onClick={doPreview} disabled={!form.id.trim() || !form.name.trim() || !form.authorName.trim()}>Preview files</Button>
             <Button variant="primary" icon={Download} loading={busy} onClick={generate} disabled={!form.id.trim() || !form.name.trim() || !form.authorName.trim()}>Generate .tar.gz</Button>
-          </div>
+          </FormActions>
           <ErrorBanner error={previewError} />
           {preview && (
             <Card title={`Preview: ${preview.dirname}/`} subtitle={preview.validation.ok ? 'The manifest validates against the SDK.' : 'The manifest has validation errors; fix them before generating.'}
-              actions={<>{preview.validation.ok ? <StatusPill status="ok">valid manifest</StatusPill> : <StatusPill status="failed">{preview.validation.errors.length} error(s)</StatusPill>}{current && <CopyButton text={current.content} />}</>}>
+              actions={<>{preview.validation.ok ? <StatusPill status="ok">valid manifest</StatusPill> : <StatusPill status="failed">{preview.validation.errors.length} {preview.validation.errors.length === 1 ? 'error' : 'errors'}</StatusPill>}{current && <CopyButton text={current.content} />}</>}>
               {!preview.validation.ok && <ul className="small">{preview.validation.errors.map((e, i) => <li key={i}><code>{e.path || '(root)'}</code> {e.code}: {e.message}</li>)}</ul>}
               <Tabs value={file} onChange={setFile} tabs={preview.files.map((f) => ({ value: f.path, label: f.path }))} />
               {current && <pre className="log" style={{ maxHeight: 520 }}>{current.content}</pre>}

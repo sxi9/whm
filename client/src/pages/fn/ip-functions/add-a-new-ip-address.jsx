@@ -39,20 +39,20 @@ export default function AddANewIpAddress({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Binds one address or a consecutive range to a network interface with iproute2, records it in the panel's inventory and persists it so it is re-added at boot (whm-ips.service). New addresses start free; reserve them to keep them out of allocation." />
+      <PageHeader fn={fn} description="Binds one address or a consecutive range to a network interface with iproute2, records it in the panel's inventory and persists it so the panel's boot unit re-adds it after a restart. New addresses start free; reserve them to keep them out of allocation." />
       <Iproute2Notice meta={meta} />
       <form onSubmit={submit}>
         <Card title="New IP address">
           <IpRequestError error={error && !error.fields ? error : null} />
-          <RadioGroup name="mode" value={form.mode} onChange={set('mode')} options={[{ value: 'single', label: 'Single address', description: 'One IPv4 or IPv6 address' }, { value: 'range', label: 'Range', description: 'Every address from the first to the last (inclusive, up to 256)' }]} />
+          <Field><RadioGroup name="mode" value={form.mode} onChange={set('mode')} options={[{ value: 'single', label: 'Single address', description: 'One IPv4 or IPv6 address' }, { value: 'range', label: 'Range', description: 'Every address from the first to the last (inclusive, up to 256)' }]} /></Field>
           <div className="form-grid">
             <Field label={form.mode === 'range' ? 'First address' : 'IP address'} required error={error?.fields?.address}><TextInput value={form.address} onChange={set('address')} placeholder="203.0.113.20 or 2001:db8::20" /></Field>
             {form.mode === 'range' && <Field label="Last address" required error={error?.fields?.endAddress}><TextInput value={form.endAddress} onChange={set('endAddress')} placeholder="203.0.113.30" /></Field>}
             <Field label="Netmask / prefix" help={isV6 ? 'Blank uses /64' : 'Dotted (255.255.255.0) or prefix (/24); blank uses /24'} error={error?.fields?.netmask || error?.fields?.prefix}><TextInput value={form.netmask} onChange={set('netmask')} placeholder={isV6 ? '64' : '255.255.255.0'} /></Field>
             <InterfaceSelect value={form.interface} onChange={set('interface')} family={isV6 ? 6 : 4} error={error?.fields?.interface} />
           </div>
-          <Field inline><Toggle checked={form.reserved} onChange={set('reserved')} label="Reserve the new address(es)" description="Reserved addresses are excluded from account allocation until released" /></Field>
-          {form.reserved && <Field label="Reservation note" error={error?.fields?.reservedReason}><TextInput value={form.reservedReason} onChange={set('reservedReason')} placeholder="e.g. held for customer X" /></Field>}
+          <Field inline><Toggle checked={form.reserved} onChange={set('reserved')} label="Reserve the new addresses" description="Reserved addresses are excluded from account allocation until released" /></Field>
+          {form.reserved && <Field label="Reservation note" error={error?.fields?.reservedReason}><TextInput value={form.reservedReason} onChange={set('reservedReason')} placeholder="Held for a customer" /></Field>}
           <FormActions><Button type="submit" variant="primary" loading={busy} disabled={!form.address || (form.mode === 'range' && !form.endAddress)}>Add IP address{form.mode === 'range' ? 'es' : ''}</Button></FormActions>
         </Card>
       </form>
@@ -61,9 +61,9 @@ export default function AddANewIpAddress({ fn }) {
           <KeyValue items={[
             ['Interface', <code key="i">{result.interface}</code>], ['Prefix', `/${result.prefix}`],
             ['Added', result.added.length], ['Failed', result.failed.length],
-            ['Persisted at boot', <StatusPill key="p" status={result.persisted?.skipped ? 'disabled' : result.persisted?.enabled ? 'ok' : result.persisted?.error ? 'failed' : 'warning'}>{result.persisted?.skipped ? 'disabled in settings' : result.persisted?.enabled ? 'whm-ips.service enabled' : result.persisted?.error || 'unit written, not enabled'}</StatusPill>],
+            ['Persisted at boot', <span key="p"><StatusPill status={result.persisted?.skipped ? 'disabled' : result.persisted?.enabled ? 'ok' : result.persisted?.error ? 'failed' : 'warning'}>{result.persisted?.skipped ? 'disabled' : result.persisted?.enabled ? 'enabled' : result.persisted?.error ? 'failed' : 'not enabled'}</StatusPill> <span className="muted">{result.persisted?.skipped ? 'turned off in settings' : result.persisted?.enabled ? 'boot unit enabled' : result.persisted?.error || 'unit written but not enabled'}</span></span>],
           ]} />
-          <div className="table-wrap">
+          <div className="table-wrap" style={{ marginTop: 14 }}>
             <table>
               <thead><tr><th>Address</th><th>Family</th><th>Bound</th><th>Reserved</th><th>Note</th></tr></thead>
               <tbody>

@@ -32,11 +32,11 @@ export default function SynchronizeDnsRecords({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Pushes zones to the nameservers in your DNS cluster over their panel API, so every peer serves the same records. Synchronisation is push-only in this version: peers in the 'sync' role receive zones like 'write-only' ones, and changes made on a peer are not pulled back. The hourly run only sends zones a peer has not acknowledged at their current serial; this page pushes everything you select. Peers running a cluster-aware panel receive zones through their Clusters exchange log (/api/clusters/dns/receive); older panels fall back to the plain zone import." actions={<Button onClick={() => refetch()}>Refresh</Button>} />
+      <PageHeader fn={fn} description="Pushes zones to the nameservers in your DNS cluster over their panel API, so every peer serves the same records. Synchronization is push-only: changes made on a peer are not pulled back. The hourly run only sends zones a peer has not acknowledged at their current serial; this page pushes everything you select." actions={<Button onClick={() => refetch()}>Refresh</Button>} />
       <ErrorBanner error={error} onRetry={refetch} />
       <Card title="Cluster peers" padded={false}>
         {data && !data.clusters.length ? (
-          <EmptyState title="No DNS cluster peers configured">Add nameservers under <Link to="/clusters/dns-cluster">Clusters → DNS Cluster</Link>; each needs the peer's address and an API token for its root user.</EmptyState>
+          <EmptyState title="No DNS cluster peers configured">Peers appear here once you add nameservers under <Link to="/clusters/dns-cluster">Clusters › DNS Cluster</Link>; each needs the peer's address and an API token for its root user.</EmptyState>
         ) : (
           <DataTable
             columns={[
@@ -51,14 +51,14 @@ export default function SynchronizeDnsRecords({ fn }) {
           />
         )}
       </Card>
-      <Card title="Synchronise now">
+      <Card title="Synchronize now" subtitle="Peers running a cluster-aware panel receive zones through their Clusters exchange log; older panels fall back to the plain zone import">
         <ErrorBanner error={runError} />
         <div className="form-grid">
           <Field label="Peer" help="Blank pushes to every enabled peer"><Select value={clusterId} onChange={setClusterId} options={peers.map((c) => ({ value: String(c.id), label: `${c.name} (${c.remote_host})` }))} placeholder="All peers" /></Field>
           <Field label="Zones" help="Comma-separated; blank pushes every zone"><TextInput value={domains} onChange={setDomains} placeholder="example.com, example.net" /></Field>
         </div>
-        <FormActions><Button variant="primary" loading={busy} onClick={run} disabled={!peers.length}>Synchronise DNS records</Button></FormActions>
-        {jobId && <ProgressLog jobId={jobId} onFinished={() => { refetch(); toast.success('Synchronisation finished'); }} />}
+        <FormActions><Button variant="primary" loading={busy} onClick={run} disabled={!peers.length}>Synchronize DNS records</Button></FormActions>
+        {jobId && <ProgressLog jobId={jobId} onFinished={() => { refetch(); toast.success('Synchronization finished'); }} />}
       </Card>
       <Card title="Zone sync status" subtitle="Outcome of the last push for each zone and peer" padded={false}>
         <DataTable
@@ -72,7 +72,7 @@ export default function SynchronizeDnsRecords({ fn }) {
             { key: 'message', label: 'Message', render: (r) => r.message || '' },
             { key: 'synced_at', label: 'When', render: (r) => formatDate(r.synced_at) },
           ]}
-          rows={data?.zones || []} loading={loading} rowKey={(r) => `${r.zone_id}-${r.cluster_id}`} dense emptyText="Nothing has been synchronised yet."
+          rows={data?.zones || []} loading={loading} rowKey={(r) => `${r.zone_id}-${r.cluster_id}`} dense emptyText="Nothing has been synchronized yet. Each zone and peer appears here after the first push."
         />
       </Card>
     </>

@@ -1,20 +1,20 @@
 import { useMemo, useState } from 'react';
-import { Plus } from 'lucide-react';
+import { Plus, Info } from 'lucide-react';
 import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, KeyValue, Loading, formatDate } from '../../../components/Common.jsx';
-import { Field, TextInput, Textarea, Select, Toggle, NumberInput, Button, ErrorBanner } from '../../../components/Form.jsx';
+import { Field, TextInput, Textarea, Select, Toggle, NumberInput, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, Tabs, Stat } from '../../development/Shared.jsx';
 
 const SAMPLE_SCRIPT = `#!/bin/sh
-# WHM hook: receives the event envelope as JSON on stdin; argv is "<event> <stage>".
+# Keel hook: receives the event envelope as JSON on stdin; argv is "<event> <stage>".
 # Exit 0 to allow. For a blocking "pre" hook any other exit status rejects the
 # operation and the last line of stderr is shown to the operator.
 EVENT="$1"; STAGE="$2"
 PAYLOAD="$(cat)"
-logger -t whm-hook "$EVENT ($STAGE): $PAYLOAD"
+logger -t keel-hook "$EVENT ($STAGE): $PAYLOAD"
 exit 0
 `;
 
@@ -129,8 +129,8 @@ export default function ManageHooks({ fn }) {
               <Field label="Stage"><Select value={emit.stage} onChange={(v) => setEmit({ ...emit, stage: v })} options={stagesFor(emit.event)} /></Field>
             </div>
             <Field label="Payload (JSON)" help={eventMap[emit.event]?.payload ? `Shape: ${eventMap[emit.event].payload}` : undefined}><Textarea mono rows={5} value={emit.payload} onChange={(v) => setEmit({ ...emit, payload: v })} /></Field>
-            <div className="action-row"><Button variant="primary" onClick={doEmit}>Emit</Button></div>
-            {emitResult && <pre className="log">{JSON.stringify(emitResult, null, 2)}</pre>}
+            <FormActions><Button variant="primary" onClick={doEmit}>Emit</Button></FormActions>
+            {emitResult && <pre className="log" style={{ marginTop: 12 }}>{JSON.stringify(emitResult, null, 2)}</pre>}
           </Card>
         </>
       )}
@@ -141,7 +141,7 @@ export default function ManageHooks({ fn }) {
           <div style={{ padding: scripts.error ? 14 : 0 }}><RequestError error={scripts.error} onRetry={scripts.refetch} /></div>
           {scripts.data && !scripts.data.exists && (
             <div style={{ padding: 14 }}>
-              <div className="banner banner-info"><div><strong>The hooks directory does not exist yet.</strong><p>Create <code>{scripts.data.dir}</code> (root, 0755) and add your first script.</p></div><Button size="sm" variant="primary" onClick={initDir}>Create directory</Button></div>
+              <div className="banner banner-info"><Info size={18} /><div><strong>The hooks directory does not exist yet.</strong><p>Create <code>{scripts.data.dir}</code> (root, 0755) and add your first script.</p></div><Button size="sm" variant="primary" onClick={initDir}>Create directory</Button></div>
             </div>
           )}
           {scripts.data?.exists && (
@@ -149,11 +149,11 @@ export default function ManageHooks({ fn }) {
               <table>
                 <thead><tr><th>Script</th><th>Mode</th><th>Owner</th><th>Size</th><th>Modified</th><th>Used by</th><th>State</th><th /></tr></thead>
                 <tbody>
-                  {scripts.data.scripts.length === 0 && <tr><td colSpan={8} className="table-state">No scripts yet.</td></tr>}
+                  {scripts.data.scripts.length === 0 && <tr><td colSpan={8} className="table-state">No scripts yet. Scripts you add appear here and become selectable when you create a hook.</td></tr>}
                   {scripts.data.scripts.map((s) => (
                     <tr key={s.name}>
-                      <td><code>{s.name}</code></td><td><code>{s.mode}</code></td><td>{s.uid === 0 ? 'root' : `uid ${s.uid}`}</td><td>{s.size} B</td><td>{formatDate(s.mtime)}</td><td>{s.hooks} hook(s)</td>
-                      <td>{s.runnable ? <StatusPill status="ok">runnable</StatusPill> : <StatusPill status="failed" >refused</StatusPill>}{!s.runnable && <div className="small muted">{s.problems.join('; ')}</div>}</td>
+                      <td><code>{s.name}</code></td><td><code>{s.mode}</code></td><td>{s.uid === 0 ? 'root' : `uid ${s.uid}`}</td><td>{s.size} B</td><td>{formatDate(s.mtime)}</td><td>{s.hooks} {s.hooks === 1 ? 'hook' : 'hooks'}</td>
+                      <td>{s.runnable ? <StatusPill status="ok">runnable</StatusPill> : <StatusPill status="failed">refused</StatusPill>}{!s.runnable && <div className="small muted">{s.problems.join('; ')}</div>}</td>
                       <td className="actions-col"><div className="row-actions"><Button size="sm" onClick={() => editScript(s)}>Edit</Button><Button size="sm" variant="danger-ghost" onClick={() => removeScript(s)}>Delete</Button></div></td>
                     </tr>
                   ))}
@@ -166,8 +166,8 @@ export default function ManageHooks({ fn }) {
 
       {tab === 'runs' && (
         <Card padded={false} title="Run log" subtitle="Every hook execution with its exit status and output. Pre-stage failures that vetoed an operation show as failed."
-          actions={<><select className="input select" value={runFilter.status} onChange={(e) => setRunFilter({ ...runFilter, status: e.target.value })}><option value="">All statuses</option>{['ok', 'failed', 'error'].map((s) => <option key={s}>{s}</option>)}</select>
-            <select className="input select" value={runFilter.event} onChange={(e) => setRunFilter({ ...runFilter, event: e.target.value })}><option value="">All events</option>{(events.data || []).map((e) => <option key={e.name}>{e.name}</option>)}</select>
+          actions={<><Select value={runFilter.status} onChange={(v) => setRunFilter({ ...runFilter, status: v })} placeholder="All statuses" options={['ok', 'failed', 'error']} style={{ width: 150 }} />
+            <Select value={runFilter.event} onChange={(v) => setRunFilter({ ...runFilter, event: v })} placeholder="All events" options={(events.data || []).map((e) => e.name)} style={{ width: 220 }} />
             <Button size="sm" onClick={() => runs.refetch()}>Refresh</Button></>}>
           <RequestError error={runs.error} onRetry={runs.refetch} />
           {runs.loading && !runs.data && <Loading />}
@@ -176,7 +176,7 @@ export default function ManageHooks({ fn }) {
               <table>
                 <thead><tr><th>When</th><th>Hook</th><th>Event</th><th>Trigger</th><th>Status</th><th>Exit</th><th>Duration</th><th /></tr></thead>
                 <tbody>
-                  {runs.data.length === 0 && <tr><td colSpan={8} className="table-state">No runs recorded.</td></tr>}
+                  {runs.data.length === 0 && <tr><td colSpan={8} className="table-state">No runs recorded. Every hook execution appears here with its exit status and output.</td></tr>}
                   {runs.data.map((r) => (
                     <tr key={r.id}>
                       <td>{formatDate(r.createdAt)}</td><td>{r.hookName}</td><td><code>{r.event}</code> <span className="small muted">{r.stage}</span></td><td>{r.trigger}</td>

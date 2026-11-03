@@ -21,7 +21,7 @@ export default function DiskUsage({ fn }) {
     try {
       const res = await api.post('/system-health/disk/refresh');
       setJobId(res.data.job.id);
-      toast.info('Measuring disk usage for every account…');
+      toast.info('Measuring disk usage for every account');
     } catch (err) { toast.error(err); } finally { setBusy(false); }
   };
 
@@ -37,7 +37,7 @@ export default function DiskUsage({ fn }) {
             { key: 'sizeBytes', label: 'Size', align: 'right', render: (d) => formatBytes(d.sizeBytes) },
             { key: 'usedBytes', label: 'Used', align: 'right', render: (d) => formatBytes(d.usedBytes) },
             { key: 'availableBytes', label: 'Available', align: 'right', render: (d) => formatBytes(d.availableBytes) },
-            { key: 'usedPercent', label: 'Usage', render: (d) => <div style={{ minWidth: 160 }}>{d.usedPercent}%<div className={`meter ${d.usedPercent > 90 ? 'bad' : d.usedPercent > 75 ? 'warn' : ''}`}><span style={{ width: `${d.usedPercent}%` }} /></div></div> },
+            { key: 'usedPercent', label: 'Usage', width: 180, render: (d) => <div style={{ minWidth: 160 }}><small className="muted">{d.usedPercent}%</small><div className={`meter ${d.usedPercent > 90 ? 'bad' : d.usedPercent > 75 ? 'warn' : ''}`}><span style={{ width: `${d.usedPercent}%` }} /></div></div> },
           ]}
           rows={filesystems} loading={loading} error={error} rowKey={(d) => `${d.filesystem}:${d.mountpoint}`}
         />
@@ -45,7 +45,7 @@ export default function DiskUsage({ fn }) {
       <JobCard jobId={jobId} title="Disk usage resample" onFinished={() => { setJobId(null); refetch(); }} />
       <Card
         title="Accounts"
-        subtitle={data ? `${data.accounts.length} account(s) using ${formatMb(data.accountsTotalMb)} in total, ${sampled}. Usage is measured every 6 hours; resample to refresh it now.` : undefined}
+        subtitle={data ? `${data.accounts.length} ${data.accounts.length === 1 ? 'account' : 'accounts'} using ${formatMb(data.accountsTotalMb)} in total, ${sampled}. Usage is measured every 6 hours; resample to refresh it now.` : undefined}
         actions={data?.canResample ? <Button size="sm" icon={RefreshCw} loading={busy || Boolean(jobId)} onClick={resample}>Resample now</Button> : null}
         padded={false}
       >

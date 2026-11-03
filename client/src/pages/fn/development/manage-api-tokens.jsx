@@ -1,11 +1,11 @@
 import { useState } from 'react';
-import { KeyRound } from 'lucide-react';
+import { KeyRound, AlertTriangle } from 'lucide-react';
 import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { useAuth } from '../../../auth/AuthContext.jsx';
 import { PageHeader, Card, StatusPill, KeyValue, formatDate } from '../../../components/Common.jsx';
 import { DataTable, useTableState } from '../../../components/DataTable.jsx';
-import { Field, TextInput, Select, Button, ErrorBanner } from '../../../components/Form.jsx';
+import { Field, TextInput, Select, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, ScopePills, CopyButton } from '../../development/Shared.jsx';
@@ -97,6 +97,7 @@ export default function ManageApiTokens({ fn }) {
               {isRoot && <Field label="Issue for user" help="Leave empty for yourself (root)"><TextInput value={form.username} onChange={(v) => setForm({ ...form, username: v })} placeholder="root" /></Field>}
             </div>
             <div className="banner banner-warning">
+              <AlertTriangle size={18} />
               <div>
                 <strong>Scopes only restrict the Development API.</strong>
                 <p>Whatever you tick here, this token acts with {form.username.trim() && isRoot ? `${form.username.trim()}'s` : 'the user’s'} full role everywhere else ({(scopes.data?.unrestrictedAreas || []).join(', ') || 'accounts, DNS, mail, databases and the rest'}). Those areas are not scope-aware yet. To limit a token outside Development, issue it for a user with a narrower role.</p>
@@ -115,9 +116,9 @@ export default function ManageApiTokens({ fn }) {
       <Modal open={Boolean(issued)} title="Token created" onClose={() => setIssued(null)} footer={<Button variant="primary" onClick={() => setIssued(null)}>Done</Button>}>
         {issued && (
           <>
-            <div className="banner banner-warning"><div><strong>Copy it now.</strong><p>This is the only time the token is shown; the panel keeps only a hash.</p></div></div>
+            <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>Copy it now.</strong><p>This is the only time the token is shown; the panel keeps only a hash.</p></div></div>
             <pre className="log" style={{ wordBreak: 'break-all' }}>{issued.token}</pre>
-            <div className="action-row"><CopyButton text={issued.token} label="Copy token" size={undefined} /></div>
+            <FormActions><CopyButton text={issued.token} label="Copy token" size={undefined} /></FormActions>
             <KeyValue items={[['Name', issued.name], ['User', issued.username], ['Scopes', <ScopePills key="s" scopes={issued.scopes} />], ['Expires', issued.expiresAt ? formatDate(issued.expiresAt) : 'never']]} />
           </>
         )}
@@ -131,7 +132,7 @@ export default function ManageApiTokens({ fn }) {
             <div className="table-wrap" style={{ maxHeight: 300, overflow: 'auto' }}>
               <table><thead><tr><th>When</th><th>Action</th><th>Target</th><th>Result</th><th>IP</th></tr></thead>
                 <tbody>
-                  {usage.activity.length === 0 && <tr><td colSpan={5} className="table-state">No audited activity since the token was issued</td></tr>}
+                  {usage.activity.length === 0 && <tr><td colSpan={5} className="table-state">No audited activity since the token was issued. Requests made with it appear here.</td></tr>}
                   {usage.activity.map((a, i) => <tr key={i}><td>{formatDate(a.ts)}</td><td><code>{a.action}</code></td><td>{a.target || '—'}</td><td><StatusPill status={a.result === 'ok' ? 'ok' : 'failed'}>{a.result}</StatusPill></td><td>{a.ip || '—'}</td></tr>)}
                 </tbody></table>
             </div>

@@ -1,4 +1,5 @@
 import { Link } from 'react-router-dom';
+import { AlertTriangle } from 'lucide-react';
 import { useApi } from '../../hooks/useApi.js';
 import { StatusPill, CapabilityNotice } from '../../components/Common.jsx';
 import { Field, Select, ErrorBanner } from '../../components/Form.jsx';
@@ -36,6 +37,7 @@ export function Iproute2Notice({ meta }) {
   if (!meta || meta.iproute2 !== false) return null;
   return (
     <div className="banner banner-warning">
+      <AlertTriangle size={18} />
       <div>
         <strong>iproute2 is not installed</strong>
         <p>The <code>ip</code> command was not found, so addresses cannot be bound to or removed from interfaces. The inventory below is read-only until the <code>iproute2</code> package is installed (for example via <Link to="/software/install-distro-packages">Install Distro Packages</Link>).</p>
@@ -56,9 +58,14 @@ export function InterfaceSelect({ value, onChange, family = 4, label = 'Interfac
   );
 }
 
+export function AddressList({ addresses }) {
+  if (!addresses?.length) return 'none';
+  return addresses.map((a, i) => <span key={a}>{i > 0 && ' '}<code>{a}</code></span>);
+}
+
 export function Summary({ items }) {
   return (
-    <div className="stat-grid">
+    <div className="stat-grid" style={{ marginBottom: 18 }}>
       {items.map(([label, value]) => <div className="stat" key={label}><div className="value">{value ?? '—'}</div><div className="label">{label}</div></div>)}
     </div>
   );

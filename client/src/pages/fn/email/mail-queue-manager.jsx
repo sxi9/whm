@@ -18,9 +18,9 @@ function MessageModal({ id, onClose }) {
       {data && (
         <>
           <KeyValue items={[['Subject', data.subject], ['From', data.from], ['To', data.to]]} />
-          <h3>Headers (exim -Mvh)</h3><pre className="log">{data.headers}</pre>
-          <h3>Body (exim -Mvb){data.bodyTruncated ? ' — truncated' : ''}</h3><pre className="log">{data.body || '(empty)'}</pre>
-          <h3>Delivery log (exim -Mvl)</h3><pre className="log">{data.log || '(no log yet)'}</pre>
+          <h3 style={{ margin: '14px 0 6px' }}>Headers (exim -Mvh)</h3><pre className="log">{data.headers}</pre>
+          <h3 style={{ margin: '14px 0 6px' }}>Body (exim -Mvb){data.bodyTruncated ? ' — truncated' : ''}</h3><pre className="log">{data.body || '(empty)'}</pre>
+          <h3 style={{ margin: '14px 0 6px' }}>Delivery log (exim -Mvl)</h3><pre className="log">{data.log || '(no log yet)'}</pre>
         </>
       )}
     </Modal>
@@ -99,7 +99,7 @@ export default function MailQueueManager({ fn }) {
           rows={rows} loading={loading} total={meta?.total ?? null} page={table.state.page} pageSize={table.state.pageSize} onPageChange={table.setPage}
           sort={table.state.sort} dir={table.state.dir} onSortChange={table.setSort}
           searchable q={table.state.q} onSearch={table.setSearch} searchPlaceholder="Search id, sender or recipient"
-          selectable selected={selected} onSelectedChange={setSelected} rowKey={(m) => m.id} dense emptyText="The mail queue is empty."
+          selectable selected={selected} onSelectedChange={setSelected} rowKey={(m) => m.id} dense emptyText="The mail queue is empty. Messages waiting in the spool are listed here."
           toolbar={<Field inline><Select value={frozen} onChange={(v) => { setFrozen(v); table.setPage(1); }} options={[{ value: 'true', label: 'Frozen only' }, { value: 'false', label: 'Not frozen' }]} placeholder="All messages" /></Field>}
           rowActions={(m) => [
             { label: 'View', primary: true, onClick: () => setViewing(m.id) },

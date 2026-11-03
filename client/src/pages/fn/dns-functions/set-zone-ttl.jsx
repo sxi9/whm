@@ -46,7 +46,7 @@ export default function SetZoneTtl({ fn }) {
             { key: 'domain', label: 'Zone', sortable: true, render: (z) => <code>{z.domain}</code> },
             { key: 'account', label: 'Account', sortable: true, render: (z) => z.account || <span className="muted">—</span> },
             { key: 'ttl', label: 'Current TTL', sortable: true, align: 'right', render: (z) => `${z.ttl}s` },
-            { key: 'result', label: 'Last result', render: (z) => { const r = results?.find((x) => x.domain === z.domain); return r ? (r.error ? <StatusPill status="failed">{r.error}</StatusPill> : <StatusPill status={r.applied === false ? 'warning' : 'ok'}>{r.applied === false ? 'saved, BIND missing' : `published · ${r.serial}`}</StatusPill>) : ''; } },
+            { key: 'result', label: 'Last result', render: (z) => { const r = results?.find((x) => x.domain === z.domain); return r ? (r.error ? <StatusPill status="failed">{r.error}</StatusPill> : <StatusPill status={r.applied === false ? 'warning' : 'ok'}>{r.applied === false ? 'Not published' : `Published · ${r.serial}`}</StatusPill>) : ''; } },
           ]}
           rows={data || []} loading={loading} error={error} rowKey={(z) => z.domain}
           total={meta?.total} page={t.state.page} pageSize={t.state.pageSize} onPageChange={t.setPage}
@@ -55,7 +55,7 @@ export default function SetZoneTtl({ fn }) {
           selectable selected={selected} onSelectedChange={setSelected}
           rowActions={(z) => [{ label: `Set ${ttl}s`, primary: true, onClick: () => apply([z.domain]) }]}
           toolbar={<Button variant="primary" disabled={!selected.length} loading={busy} onClick={() => apply(selected)}>Apply to selected ({selected.length})</Button>}
-          emptyText="No zones."
+          emptyText="No zones yet. Zones appear here once one is added, with their current TTL."
         />
       </Card>
     </>

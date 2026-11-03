@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
+import { Info } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading, formatDate } from '../../../components/Common.jsx';
@@ -33,7 +34,7 @@ function DomainReport({ domain, onClose }) {
       {loading && !data && <Loading text="Resolving SPF, DKIM, DMARC, MX and PTR…" />}
       {data && (
         <>
-          {!data.zone && <div className="banner banner-info"><div>This domain's DNS is not hosted on this server (no local zone), so records can only be shown, not created. Add them at your DNS provider.</div></div>}
+          {!data.zone && <div className="banner banner-info"><Info size={18} /><div>This domain's DNS is not hosted on this server (no local zone), so records can only be shown, not created. Add them at your DNS provider.</div></div>}
           {fixable.length > 0 && <div className="form-actions"><Button variant="primary" loading={busy} onClick={() => fix(fixable)}>Fix all ({fixable.map((f) => f.toUpperCase()).join(', ')})</Button></div>}
           <div className="table-wrap">
             <table>
@@ -81,7 +82,7 @@ export default function EmailDeliverability({ fn }) {
             { key: 'zone', label: 'DNS hosted here', render: (d) => <StatusPill status={d.zone ? 'ok' : 'unknown'}>{d.zone ? 'yes' : 'no'}</StatusPill> },
             { key: 'dkimKey', label: 'DKIM key', render: (d) => <StatusPill status={d.dkimKey ? 'ok' : 'warning'}>{d.dkimKey ? 'generated' : 'none'}</StatusPill> },
           ]}
-          rows={rows} loading={loading} rowKey={(d) => d.domain} dense emptyText="No domains yet. Create an account first."
+          rows={rows} loading={loading} rowKey={(d) => d.domain} dense emptyText="No domains yet. The domains of hosted accounts are listed here once an account exists."
           searchable q={q} onSearch={setQ} searchPlaceholder="Filter domains"
           rowActions={(d) => [{ label: 'Check', primary: true, onClick: () => setDomain(d.domain) }]}
         />

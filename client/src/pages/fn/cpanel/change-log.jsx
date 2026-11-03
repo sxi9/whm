@@ -5,6 +5,25 @@ import { PageHeader, Card, Loading, EmptyState, StatusPill, KeyValue } from '../
 import { Button, ErrorBanner } from '../../../components/Form.jsx';
 import { renderMarkdown } from '../../plugins/PluginPage.jsx';
 
+const ITEM_RE = /^\s*(?:[-*]|\d+\.)\s+/;
+const BLOCK_RE = /^(?:#{1,6}\s|```|\s*[-*]\s|\s*\d+\.\s)/;
+
+function unwrapListItems(src) {
+  const lines = String(src || '').replace(/\r\n/g, '\n').split('\n');
+  const out = [];
+  let inCode = false;
+  let inItem = false;
+  for (const line of lines) {
+    if (line.startsWith('```')) { inCode = !inCode; inItem = false; out.push(line); continue; }
+    if (inCode) { out.push(line); continue; }
+    if (ITEM_RE.test(line)) { inItem = true; out.push(line); continue; }
+    if (inItem && line.trim() && !BLOCK_RE.test(line)) { out[out.length - 1] += ` ${line.trim()}`; continue; }
+    inItem = false;
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
 export default function ChangeLog({ fn }) {
   const { data, loading, error, refetch } = useApi('/cpanel/changelog');
   const [selected, setSelected] = useState(null);
@@ -27,12 +46,12 @@ export default function ChangeLog({ fn }) {
               </Card>
             )}
             {data.exists && releases.length === 0 && (
-              <Card title="Change log"><div className="markdown">{renderMarkdown(data.markdown)}</div></Card>
+              <Card title="Change log"><div className="markdown">{renderMarkdown(unwrapListItems(data.markdown))}</div></Card>
             )}
             {shown.map((r) => (
               <Card key={r.version} title={r.unreleased ? 'Unreleased' : `Version ${r.version}`} subtitle={r.date ? `Released ${r.date}` : r.unreleased ? 'Changes not yet in a tagged release' : undefined}
                 actions={r.version === data.currentRelease ? <StatusPill status="ok">running</StatusPill> : r.unreleased ? <StatusPill status="pending">upcoming</StatusPill> : null}>
-                <div className="markdown">{renderMarkdown(r.body || '_No notes for this release._')}</div>
+                <div className="markdown">{renderMarkdown(unwrapListItems(r.body || '_No notes for this release._'))}</div>
               </Card>
             ))}
           </div>

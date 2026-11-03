@@ -98,20 +98,20 @@ export default function EditALocale({ fn }) {
               { value: 'all', label: 'All', count: counts.all }, { value: 'untranslated', label: 'Untranslated', count: counts.untranslated }, { value: 'translated', label: 'Translated', count: counts.translated },
               { value: 'changed', label: 'Unsaved', count: counts.changed }, ...(counts.extra ? [{ value: 'extra', label: 'Not in catalog', count: counts.extra }] : []),
             ]} />
-            <input className="input" placeholder="Search keys, English text or translations…" value={q} onChange={(e) => { setQ(e.target.value); setPage(1); }} style={{ marginBottom: 12 }} />
+            <TextInput type="search" placeholder="Search keys, English text or translations…" value={q} onChange={(v) => { setQ(v); setPage(1); }} aria-label="Search strings" style={{ marginBottom: 12 }} />
           </div>
           <div className="table-wrap">
             <table>
               <thead><tr><th style={{ width: '28%' }}>Key</th><th style={{ width: '32%' }}>English</th><th>{locale.data.name}</th></tr></thead>
               <tbody>
-                {pageRows.length === 0 && <tr><td colSpan={3} className="table-state">No strings match{q ? ' the search' : ' this filter'}.</td></tr>}
+                {pageRows.length === 0 && <tr><td colSpan={3} className="table-state">{q ? 'No strings match the search. Matching keys, English text and translations will appear here.' : 'No strings match this filter. Strings in this group will appear here.'}</td></tr>}
                 {pageRows.map((r) => (
                   <tr key={r.key} className={r.changed ? 'is-selected' : ''}>
-                    <td><code className="small">{r.key}</code>{r.extra && <div><StatusPill status="warning">not in catalog</StatusPill></div>}</td>
+                    <td><code className="small">{r.key}</code>{r.extra && <div><StatusPill status="warning">Not in catalog</StatusPill></div>}</td>
                     <td className="small">{r.english ?? <span className="muted">—</span>}</td>
                     <td>
                       {readOnly ? <span className="small">{r.value}</span> : (
-                        <input className="input" value={r.value} placeholder={r.english || ''} onChange={(e) => setValue(r.key, e.target.value)} aria-label={`Translation for ${r.key}`} style={!r.translated ? { borderStyle: 'dashed' } : undefined} />
+                        <TextInput value={r.value} placeholder={r.english || ''} onChange={(v) => setValue(r.key, v)} aria-label={`Translation for ${r.key}`} />
                       )}
                     </td>
                   </tr>

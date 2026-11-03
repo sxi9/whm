@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { PageHeader, Card, StatusPill, KeyValue } from '../../../components/Common.jsx';
 import { Field, TextInput, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
@@ -26,8 +27,8 @@ export default function MailTroubleshooter({ fn }) {
       {state.error?.fields && <ErrorBanner error={state.error} />}
       {r && (
         <>
-          {r.hints.length > 0 && <div className="banner banner-warning"><div>{r.hints.map((h) => <p key={h}>{h}</p>)}</div></div>}
-          {r.hints.length === 0 && <div className="banner banner-info"><div>No problems found for <code>{r.address}</code>.</div></div>}
+          {r.hints.length > 0 && <div className="banner banner-warning"><AlertTriangle size={18} /><div>{r.hints.map((h) => <p key={h}>{h}</p>)}</div></div>}
+          {r.hints.length === 0 && <div className="banner banner-success"><CheckCircle2 size={18} /><div>No problems found for <code>{r.address}</code>.</div></div>}
           <Card title="Domain" actions={<StatusPill status={r.local.hosted ? 'ok' : 'unknown'}>{r.local.hosted ? 'hosted here' : 'external'}</StatusPill>}>
             <KeyValue items={[['Domain', <code key="d">{r.domain}</code>], r.local.hosted && ['Account', r.local.account], r.local.hosted && ['Email routing', r.local.routing || 'auto'], r.local.mxPointsHere != null && ['MX points to this server', <StatusPill key="m" status={r.local.mxPointsHere ? 'ok' : 'warning'}>{r.local.mxPointsHere ? 'yes' : 'no'}</StatusPill>]]} />
           </Card>
@@ -43,7 +44,7 @@ export default function MailTroubleshooter({ fn }) {
             {!r.exim.available && <p className="muted">{r.exim.reason}</p>}
             {r.exim.available && r.exim.routes && <KeyValue items={r.exim.routes.map((x, i) => [x.address || `route ${i + 1}`, x.error || `router ${x.router || '?'}, transport ${x.transport || '?'}${x.target ? ` → ${x.target}` : ''}`])} />}
             {r.exim.output && <pre className="log">{r.exim.output}</pre>}
-            {r.exim.verify && <><h3>Verification (exim -bv)</h3><StatusPill status={r.exim.verify.ok ? 'ok' : 'failed'}>{r.exim.verify.ok ? 'verified' : 'failed'}</StatusPill><pre className="log">{r.exim.verify.output || '(no output)'}</pre></>}
+            {r.exim.verify && <><h3 style={{ margin: '14px 0 6px' }}>Verification (exim -bv)</h3><StatusPill status={r.exim.verify.ok ? 'ok' : 'failed'}>{r.exim.verify.ok ? 'verified' : 'failed'}</StatusPill><pre className="log">{r.exim.verify.output || '(no output)'}</pre></>}
             {r.exim.error && <ErrorBanner error={{ message: r.exim.error }} />}
           </Card>
         </>

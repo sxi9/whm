@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import { Info, AlertTriangle } from 'lucide-react';
 import { useApi } from '../../hooks/useApi.js';
 import { Card, StatusPill, CapabilityNotice, formatBytes } from '../../components/Common.jsx';
 import { Field, Select, TextInput } from '../../components/Form.jsx';
@@ -8,8 +9,9 @@ export { RequestError, Tabs };
 
 export const WINDOWS = [{ value: '1', label: 'Last hour' }, { value: '6', label: 'Last 6 hours' }, { value: '24', label: 'Last 24 hours' }, { value: '72', label: 'Last 3 days' }, { value: '168', label: 'Last 7 days' }, { value: '720', label: 'Last 30 days' }, { value: '0', label: 'Whole log' }];
 
-export function WindowSelect({ value, onChange }) {
-  return <Field label="Time window"><Select value={String(value)} onChange={onChange} options={WINDOWS} /></Field>;
+export function WindowSelect({ value, onChange, inline = false }) {
+  const select = <Select value={String(value)} onChange={onChange} options={WINDOWS} aria-label="Time window" />;
+  return inline ? <Field inline>{select}</Field> : <Field label="Time window">{select}</Field>;
 }
 
 // GET /email/status once per page: tells the page whether Exim exists so it
@@ -27,7 +29,7 @@ export function EximNotice({ status, onRetry }) {
 // back than its first line (daily rotation on Debian), say so.
 export function LogNote({ meta }) {
   if (!meta) return null;
-  if (meta.logExists === false) return <div className="banner banner-info"><div>The Exim main log ({meta.file}) does not exist yet; nothing has been logged on this host.</div></div>;
+  if (meta.logExists === false) return <div className="banner banner-info"><Info size={18} /><div>The Exim main log ({meta.file}) does not exist yet; nothing has been logged on this host.</div></div>;
   const from = meta.logFrom ? Date.parse(`${meta.logFrom.replace(' ', 'T')}`) : null;
   const windowStart = meta.hours ? Date.now() - Number(meta.hours) * 3600_000 : null;
   const shortLog = from && (!windowStart || from > windowStart);
@@ -40,7 +42,7 @@ export function StatGrid({ stats }) {
   return (
     <div className="stat-grid" style={{ marginBottom: 14 }}>
       {stats.filter(Boolean).map(([label, value, tone]) => (
-        <div className="stat" key={label}><div className="label">{label}</div><div className={`value ${tone ? `text-${tone}` : ''}`}>{value ?? '—'}</div></div>
+        <div className="stat" key={label}><div className="label" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>{tone && <span className={`dot dot-${tone}`} />}{label}</div><div className="value">{value ?? '—'}</div></div>
       ))}
     </div>
   );
@@ -75,21 +77,39 @@ export function applyMessage(apply, verb = 'Saved') {
   return `${verb}; not applied: ${apply.reason || 'unknown error'}`;
 }
 
+function applyDetail(apply) {
+  if (!apply) return null;
+  if (apply.ok === false || apply.applied === false) return `Not applied to Exim: ${apply.error || apply.reason || 'unknown error'}.`;
+  const state = applyState(apply);
+  if (state.hooked === false) return 'The filter files were written, but the generated Exim configuration does not include them yet.';
+  if (state.selfTestFailed) return 'Applied to Exim, but the greylist lookup self-test failed.';
+  return null;
+}
+
 export function ApplyBadge({ apply }) {
   if (!apply) return null;
-  if (apply.ok === false || apply.applied === false) return <StatusPill status="warning">Not applied to Exim: {apply.error || apply.reason}</StatusPill>;
-  const state = applyState(apply);
-  if (state.notEnforced) return <StatusPill status="warning">{state.hooked === false ? 'Written, but Exim does not include the filters' : 'Applied, but the greylist lookup self-test failed'}</StatusPill>;
-  return <StatusPill status="ok">Applied to Exim{apply.at ? ` · ${new Date(apply.at.replace(' ', 'T') + 'Z').toLocaleString()}` : ''}</StatusPill>;
+  const failed = apply.ok === false || apply.applied === false;
+  const state = failed ? null : applyState(apply);
+  const label = failed ? 'Not applied' : state.notEnforced ? 'Not enforced' : 'Applied';
+  const at = !failed && !state.notEnforced && apply.at ? new Date(apply.at.replace(' ', 'T') + 'Z').toLocaleString() : null;
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+      <StatusPill status={failed || state.notEnforced ? 'warning' : 'ok'}>{label}</StatusPill>
+      {at && <span className="muted">{at}</span>}
+    </span>
+  );
 }
 
 export function IncludeHint({ apply }) {
   if (!apply) return null;
   const { warnings } = applyState(apply);
-  if (!apply.hint && !warnings.length) return null;
+  const detail = applyDetail(apply);
+  if (!apply.hint && !warnings.length && !detail) return null;
+  const warn = warnings.length || detail;
   return (
-    <div className={`banner ${warnings.length ? 'banner-warning' : 'banner-info'}`}>
-      <div>{warnings.map((w) => <p key={w}>{w}</p>)}{apply.hint && <p>{apply.hint}</p>}</div>
+    <div className={`banner ${warn ? 'banner-warning' : 'banner-info'}`}>
+      {warn ? <AlertTriangle size={18} /> : <Info size={18} />}
+      <div>{detail && <p>{detail}</p>}{warnings.map((w) => <p key={w}>{w}</p>)}{apply.hint && <p>{apply.hint}</p>}</div>
     </div>
   );
 }
@@ -103,7 +123,7 @@ export function AccountPicker({ value, onChange, accounts, label = 'Account' }) 
   return (
     <div className="form-grid">
       <Field label="Filter"><TextInput value={filter} onChange={setFilter} placeholder="Type to filter by user or domain" /></Field>
-      <Field label={label} help={`${(accounts || []).length} account(s)`}><Select value={value} onChange={onChange} options={options} placeholder={accounts?.length ? 'Select an account' : 'No accounts yet'} /></Field>
+      <Field label={label} help={`${(accounts || []).length} account(s) available`}><Select value={value} onChange={onChange} options={options} placeholder={accounts?.length ? 'Select an account' : 'No accounts yet'} /></Field>
     </div>
   );
 }

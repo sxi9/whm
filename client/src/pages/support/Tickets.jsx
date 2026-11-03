@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Send, RefreshCw, Eye } from 'lucide-react';
+import { Send, RefreshCw, Eye, Info } from 'lucide-react';
 import { api, queryString } from '../../api/client.js';
 import { useApi, useMutation } from '../../hooks/useApi.js';
 import { Card, KeyValue, Loading, StatusPill, formatDate } from '../../components/Common.jsx';
@@ -10,7 +10,8 @@ import { Modal, useConfirm } from '../../components/Modal.jsx';
 import { useToast } from '../../components/Toast.jsx';
 import { SeverityPill, DeliveryPill, RequestError, CopyButton, downloadText } from './Shared.jsx';
 
-const CATEGORIES = ['general', 'accounts', 'email', 'dns', 'databases', 'web', 'ssl', 'security', 'backups', 'performance', 'licensing', 'other'];
+const CATEGORY_LABELS = { general: 'General', accounts: 'Accounts', email: 'Email', dns: 'DNS', databases: 'Databases', web: 'Web server', ssl: 'SSL', security: 'Security', backups: 'Backups', performance: 'Performance', licensing: 'Licensing', other: 'Other' };
+const CATEGORIES = Object.keys(CATEGORY_LABELS).map((value) => ({ value, label: CATEGORY_LABELS[value] }));
 const SEVERITIES = [
   { value: 'low', label: 'Low — question or cosmetic issue' },
   { value: 'normal', label: 'Normal — something is wrong but there is a workaround' },
@@ -46,7 +47,7 @@ export function TicketForm({ onCreated }) {
   return (
     <Card title="New ticket" subtitle="Saved on this server and emailed to the support address with a redacted snapshot of the system.">
       {settings.data && !mailReady && (
-        <div className="banner banner-info"><div><strong>No support email address is configured</strong><p>The ticket will be stored here for your records but not emailed. Set the address under <Link to="/support/support-center">Support Center → Settings</Link>.</p></div></div>
+        <div className="banner banner-info"><Info size={18} /><div><strong>No support email address is configured</strong><p>The ticket will be stored here for your records but not emailed. Set the address under <Link to="/support/support-center">Support Center › Settings</Link>.</p></div></div>
       )}
       <form onSubmit={submit}>
         <ErrorBanner error={error && !fieldErrors ? error : null} />
@@ -103,7 +104,7 @@ export function TicketDetail({ id, onClose, onChanged }) {
           <KeyValue items={[
             ['Status', <StatusPill status={t.status === 'open' ? 'active' : 'done'}>{t.status}</StatusPill>],
             ['Severity', <SeverityPill severity={t.severity} />],
-            ['Area', t.category],
+            ['Area', CATEGORY_LABELS[t.category] || t.category],
             ['Opened', `${formatDate(t.createdAt)} by ${t.createdBy || '—'}`],
             t.closedAt && ['Closed', formatDate(t.closedAt)],
             ['Reply-to', t.contactEmail || '—'],
@@ -111,7 +112,7 @@ export function TicketDetail({ id, onClose, onChanged }) {
             t.delivery.detail && ['Delivery detail', t.delivery.detail],
           ]} />
           <h3 style={{ marginTop: 16 }}>Description</h3>
-          <pre className="log" style={{ fontFamily: 'inherit', maxHeight: 260 }}>{t.description}</pre>
+          <div style={{ whiteSpace: 'pre-wrap', marginTop: 8, maxHeight: 260, overflow: 'auto' }}>{t.description}</div>
           {t.hasSnapshot && (
             <details style={{ marginTop: 12 }}>
               <summary>System snapshot</summary>
@@ -132,7 +133,7 @@ export function TicketList({ refreshKey = 0, onOpen }) {
     { key: 'reference', label: 'Reference', render: (r) => <button className="link-button" onClick={() => onOpen(r.id)}><code>{r.reference}</code></button> },
     { key: 'subject', label: 'Subject', sortable: true },
     { key: 'severity', label: 'Severity', sortable: true, render: (r) => <SeverityPill severity={r.severity} /> },
-    { key: 'category', label: 'Area' },
+    { key: 'category', label: 'Area', render: (r) => CATEGORY_LABELS[r.category] || r.category },
     { key: 'status', label: 'Status', sortable: true, render: (r) => <StatusPill status={r.status === 'open' ? 'active' : 'done'}>{r.status}</StatusPill> },
     { key: 'delivery', label: 'Email', render: (r) => <DeliveryPill delivery={r.delivery} /> },
     { key: 'created_at', label: 'Opened', sortable: true, render: (r) => formatDate(r.createdAt) },
@@ -142,7 +143,7 @@ export function TicketList({ refreshKey = 0, onOpen }) {
       <RequestError error={error} onRetry={refetch} />
       <DataTable columns={columns} rows={data || []} loading={loading} total={meta?.total} page={table.state.page} pageSize={table.state.pageSize} onPageChange={table.setPage}
         sort={table.state.sort} dir={table.state.dir} onSortChange={table.setSort} searchable q={table.state.q} onSearch={table.setSearch} searchPlaceholder="Search subject or reference…"
-        emptyText="No tickets yet"
+        emptyText="No tickets yet. Tickets opened from this server will be listed here."
         toolbar={<Select value={status} onChange={(v) => { setStatus(v); table.setPage(1); }} options={[{ value: '', label: 'All statuses' }, { value: 'open', label: 'Open' }, { value: 'closed', label: 'Closed' }]} />}
         rowActions={(r) => [{ label: 'View', primary: true, onClick: () => onOpen(r.id) }]} />
     </Card>

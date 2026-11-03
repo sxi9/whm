@@ -6,7 +6,7 @@ import { Tabs } from '../../security/Shared.jsx';
 
 export const TABS = [{ value: 'settings', label: 'Settings' }, { value: 'license', label: 'License' }];
 
-// Basic WebHost Manager Setup carries the License tab: the only place a license
+// Basic Setup carries the License tab: the only place a license
 // key is entered. #license (the degraded-mode action link) opens it directly.
 export default function BasicWebhostManagerSetup({ fn }) {
   const location = useLocation();

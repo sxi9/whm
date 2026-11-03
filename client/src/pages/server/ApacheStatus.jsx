@@ -1,10 +1,11 @@
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { PageHeader, Card, KeyValue, StatusPill, Loading, formatBytes, formatDuration, formatDate } from '../../components/Common.jsx';
 import { DataTable, useTableState } from '../../components/DataTable.jsx';
-import { Button } from '../../components/Form.jsx';
+import { Button, Toggle, TextInput } from '../../components/Form.jsx';
 import { useToast } from '../../components/Toast.jsx';
 import { RequestError } from '../security/Shared.jsx';
 
@@ -87,13 +88,14 @@ function WorkerTable({ enabled, refreshMs, reason }) {
   const summary = data?.summary;
   const subtitle = !enabled ? 'Available while mod_status answers' : data?.available ? `${summary.active} of ${summary.slots} slots active · ${summary.vhosts} vhost${summary.vhosts === 1 ? '' : 's'} · ${summary.clients} client${summary.clients === 1 ? '' : 's'} being served` : 'Per-slot rows need ExtendedStatus On';
   return (
-    <Card title="Workers" subtitle={subtitle} padded={false} actions={enabled && <button className="btn btn-sm" onClick={() => refetch()}>Refresh</button>}>
+    <Card title="Workers" subtitle={subtitle} padded={false} actions={enabled && <Button size="sm" onClick={() => refetch()}>Refresh</Button>}>
       {!enabled && <div className="card-body muted">No worker table: {reason === 'module_missing' ? 'mod_status is not loaded.' : reason === 'apache_down' ? 'Apache is not running.' : 'the /server-status page did not answer.'}</div>}
       {enabled && error && <div className="card-body"><RequestError error={error} onRetry={refetch} /></div>}
       {enabled && !error && loading && !data && <div className="card-body"><Loading /></div>}
       {enabled && data && !data.available && data.instructions && (
         <div className="card-body">
           <div className="banner banner-warning" style={{ margin: 0 }}>
+            <AlertTriangle size={18} />
             <div>
               <strong>{data.instructions.title}</strong>
               <ol style={{ margin: '6px 0 0', paddingLeft: 18 }}>{data.instructions.steps.map((step, i) => <li key={i}>{step}</li>)}</ol>
@@ -105,10 +107,10 @@ function WorkerTable({ enabled, refreshMs, reason }) {
       {enabled && data?.available && (
         <DataTable
           dense columns={columns} rows={rows} rowKey={(w) => w.srv} sort={table.state.sort} dir={table.state.dir} onSortChange={table.setSort}
-          emptyText={busyOnly ? 'No busy workers right now; untick "Busy only" to list idle and open slots' : 'No worker slots reported'}
+          emptyText={busyOnly ? 'No busy workers right now. Turn off "Busy only" to list idle and open slots.' : 'No worker slots reported.'}
           toolbar={<>
-            <label className="toggle"><input type="checkbox" checked={busyOnly} onChange={(e) => setBusyOnly(e.target.checked)} /><span className="toggle-track"><span className="toggle-thumb" /></span><span className="toggle-text"><span className="toggle-label">Busy only</span></span></label>
-            <input className="input" style={{ maxWidth: 260 }} placeholder="Filter by vhost, client, request…" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Filter workers" />
+            <Toggle checked={busyOnly} onChange={setBusyOnly} label="Busy only" />
+            <TextInput style={{ maxWidth: 260 }} placeholder="Filter by vhost, client, request…" value={q} onChange={setQ} aria-label="Filter workers" />
             <span className="muted">{rows.length} of {data.workers.length} slots</span>
           </>}
         />
@@ -142,8 +144,8 @@ export default function ApacheStatus({ fn }) {
   return (
     <>
       <PageHeader fn={fn} actions={<>
-        <label className="toggle" style={{ marginRight: 8 }}><input type="checkbox" checked={live} onChange={(e) => setLive(e.target.checked)} /><span className="toggle-track"><span className="toggle-thumb" /></span><span className="toggle-text"><span className="toggle-label">Auto-refresh</span></span></label>
-        <button className="btn" onClick={() => refetch()}>Refresh</button>
+        <Toggle checked={live} onChange={setLive} label="Auto-refresh" />
+        <Button onClick={() => refetch()}>Refresh</Button>
       </>} />
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
@@ -159,6 +161,7 @@ export default function ApacheStatus({ fn }) {
 
           {data.reason && data.instructions && (
             <div className="banner banner-warning">
+              <AlertTriangle size={18} />
               <div>
                 <strong>{data.instructions.title}</strong>
                 <ol style={{ margin: '6px 0 0', paddingLeft: 18 }}>{data.instructions.steps.map((step, i) => <li key={i}>{step}</li>)}</ol>

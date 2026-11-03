@@ -53,7 +53,7 @@ export default function FilterIncomingEmailsByDomain({ fn }) {
                 { key: 'comment', label: 'Comment' },
                 { key: 'created_at', label: 'Added', render: (r) => formatDate(r.created_at) },
               ]}
-              rows={rules} loading={loading} rowKey={(r) => r.id} dense emptyText="No domain rules yet."
+              rows={rules} loading={loading} rowKey={(r) => r.id} dense emptyText="No domain rules yet. Domains you add below are listed here."
               rowActions={(r) => [{ label: r.enabled ? 'Disable' : 'Enable', primary: true, onClick: () => toggle(r) }, { label: 'Remove', danger: true, onClick: () => remove(r) }]}
             />
           </Card>

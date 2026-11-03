@@ -40,7 +40,7 @@ export default function RepairMailboxPermissions({ fn }) {
             { key: 'homeDir', label: 'Mail tree', render: (a) => <code>{a.homeDir}/mail</code> },
             { key: 'suspended', label: 'State', render: (a) => <StatusPill status={a.suspended ? 'suspended' : 'active'} /> },
           ]}
-          rows={rows} loading={loading} rowKey={(a) => a.username} dense emptyText="No accounts yet."
+          rows={rows} loading={loading} rowKey={(a) => a.username} dense emptyText="No accounts yet. Hosted accounts and their mail trees are listed here."
           searchable q={q} onSearch={setQ} searchPlaceholder="Filter accounts"
           selectable selected={selected} onSelectedChange={setSelected}
           rowActions={(a) => [{ label: 'Repair', primary: true, onClick: () => run({ usernames: [a.username] }) }]}

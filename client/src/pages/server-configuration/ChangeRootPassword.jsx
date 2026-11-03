@@ -30,13 +30,13 @@ export default function ChangeRootPassword({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Changes the operating system's root password used for SSH and console access. Your WHM login password is separate." />
+      <PageHeader fn={fn} description="Changes the operating system's root password used for SSH and console access. Your panel login password is separate." />
       <Card>
         <p className="muted">Looking for your panel login password? <Link to="/change-password">Change panel password</Link>.</p>
         <form onSubmit={submit} className="form-narrow">
           <ErrorBanner error={error} />
           <Field label="New root password" required><PasswordInput value={password} onChange={setPassword} /></Field>
-          <Field label="Confirm" required><TextInput type="password" value={confirmPw} onChange={setConfirmPw} autoComplete="new-password" /></Field>
+          <Field label="Confirm new password" required><TextInput type="password" value={confirmPw} onChange={setConfirmPw} autoComplete="new-password" /></Field>
           <FormActions><Button type="submit" variant="danger" loading={busy}>Change root password</Button></FormActions>
         </form>
       </Card>

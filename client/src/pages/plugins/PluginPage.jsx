@@ -47,9 +47,9 @@ export function PluginField({ field, value, onChange, error }) {
       break;
     case 'multiselect':
       control = (
-        <div className="checkbox-list">
+        <div className="radio-group checkbox-list">
           {(field.options || []).map((o) => (
-            <label key={o.value} className="checkbox">
+            <label key={o.value} className="radio checkbox" style={{ alignItems: 'center' }}>
               <input type="checkbox" checked={(value || []).includes(o.value)} onChange={(e) => onChange(e.target.checked ? [...(value || []), o.value] : (value || []).filter((v) => v !== o.value))} />
               <span>{o.label}</span>
             </label>
@@ -91,7 +91,7 @@ export function PluginFields({ fields, groups = [], values, onChange, errors }) 
   );
 }
 
-function SettingsPage({ plugin, page, fn }) {
+function SettingsPage({ plugin, page, fn, header = true }) {
   const toast = useToast();
   const { data, error, loading, refetch } = useApi(`/plugins/manage/${plugin.id}/settings`);
   const [values, setValues] = useState({});
@@ -104,8 +104,8 @@ function SettingsPage({ plugin, page, fn }) {
   }, [plugin.id, values, toast]));
   return (
     <>
-      <PageHeader fn={fn} title={page.title} description={page.description} />
-      <Card title={`${plugin.name} settings`}>
+      {header && <PageHeader fn={fn} title={page.title} description={page.description} />}
+      <Card title={`${plugin.name} settings`} subtitle={header ? undefined : page.description}>
         {loading && !data && <Loading />}
         <ErrorBanner error={error} onRetry={refetch} />
         {data && (
@@ -128,22 +128,24 @@ export function rowsOf(data) {
   return [];
 }
 
-function TablePage({ plugin, page, fn, baseUrl }) {
+function TablePage({ plugin, page, fn, baseUrl, header = true }) {
   const { data, error, loading, refetch } = useApi(`${baseUrl}${page.source}`);
   const rows = rowsOf(data);
   const columns = page.columns?.length ? page.columns : Object.keys(rows[0] || {}).map((k) => ({ key: k, label: k }));
   const render = (col) => ({ ...col, render: (row) => { const v = row[col.key]; return v == null ? <span className="muted">—</span> : typeof v === 'object' ? <code>{JSON.stringify(v)}</code> : String(v); } });
   return (
     <>
-      <PageHeader fn={fn} title={page.title} description={page.description} actions={<Button onClick={() => refetch()}>Refresh</Button>} />
-      <Card padded={false}>
+      {header
+        ? <PageHeader fn={fn} title={page.title} description={page.description} actions={<Button onClick={() => refetch()}>Refresh</Button>} />
+        : null}
+      <Card padded={false} title={header ? undefined : page.title} subtitle={header ? undefined : page.description} actions={header ? undefined : <Button size="sm" onClick={() => refetch()}>Refresh</Button>}>
         <DataTable columns={columns.map(render)} rows={rows} loading={loading} error={error} rowKey={(r, i) => r.id ?? r.key ?? JSON.stringify(r) ?? i} emptyText="The plugin returned no rows" />
       </Card>
     </>
   );
 }
 
-function FormPage({ plugin, page, fn, baseUrl }) {
+function FormPage({ plugin, page, fn, baseUrl, header = true }) {
   const toast = useToast();
   const [values, setValues] = useState(() => Object.fromEntries((page.fields || []).map((f) => [f.key, fieldDefault(f)])));
   const [result, setResult] = useState(null);
@@ -155,8 +157,8 @@ function FormPage({ plugin, page, fn, baseUrl }) {
   }, [baseUrl, page.source, page.title, values, toast]));
   return (
     <>
-      <PageHeader fn={fn} title={page.title} description={page.description} />
-      <Card>
+      {header && <PageHeader fn={fn} title={page.title} description={page.description} />}
+      <Card title={header ? undefined : page.title} subtitle={header ? undefined : page.description}>
         <form onSubmit={(e) => { e.preventDefault(); submit.mutate().catch(() => {}); }}>
           <PluginFields fields={page.fields || []} values={values} onChange={(k, v) => setValues((s) => ({ ...s, [k]: v }))} errors={submit.fieldErrors} />
           <ErrorBanner error={submit.error && !submit.fieldErrors ? submit.error : null} />
@@ -168,7 +170,7 @@ function FormPage({ plugin, page, fn, baseUrl }) {
   );
 }
 
-function ActionPluginPage({ plugin, page, fn }) {
+function ActionPluginPage({ plugin, page, fn, header = true }) {
   const toast = useToast();
   const confirm = useConfirm();
   const [jobId, setJobId] = useState(null);
@@ -183,8 +185,8 @@ function ActionPluginPage({ plugin, page, fn }) {
   }, [confirm, page, plugin]));
   return (
     <>
-      <PageHeader fn={fn} title={page.title} description={page.description} />
-      <Card>
+      {header && <PageHeader fn={fn} title={page.title} description={page.description} />}
+      <Card title={header ? undefined : page.title}>
         <p>{page.description || `Runs the "${page.job}" job of ${plugin.name} as a background task.`}</p>
         <div className="action-row">
           <Button variant="primary" loading={run.loading} onClick={() => run.mutate().catch((e) => toast.error(e))}>Run</Button>
@@ -261,13 +263,13 @@ function usePageFile(plugin, page, enabled) {
   return useApi(path, { enabled: Boolean(enabled && path) });
 }
 
-function MarkdownPage({ plugin, page, fn }) {
+function MarkdownPage({ plugin, page, fn, header = true }) {
   const file = usePageFile(plugin, page, !page.content);
   const content = page.content ?? file.data?.content ?? '';
   return (
     <>
-      <PageHeader fn={fn} title={page.title} description={page.description} />
-      <Card>
+      {header && <PageHeader fn={fn} title={page.title} description={page.description} />}
+      <Card title={header ? undefined : page.title} subtitle={header ? undefined : page.description}>
         {file.loading && <Loading />}
         <ErrorBanner error={file.error} onRetry={file.refetch} />
         <div className="markdown">{renderMarkdown(content)}</div>
@@ -276,12 +278,12 @@ function MarkdownPage({ plugin, page, fn }) {
   );
 }
 
-function HtmlPage({ plugin, page, fn }) {
+function HtmlPage({ plugin, page, fn, header = true }) {
   const file = usePageFile(plugin, page, true);
   return (
     <>
-      <PageHeader fn={fn} title={page.title} description={page.description} />
-      <Card padded={false}>
+      {header && <PageHeader fn={fn} title={page.title} description={page.description} />}
+      <Card padded={false} title={header ? undefined : page.title} subtitle={header ? undefined : page.description}>
         {file.loading && <Loading />}
         <ErrorBanner error={file.error} onRetry={file.refetch} />
         {file.data && <iframe title={page.title} className="plugin-frame" sandbox="" srcDoc={file.data.content} style={{ width: '100%', minHeight: '60vh', border: 0 }} />}
@@ -292,11 +294,11 @@ function HtmlPage({ plugin, page, fn }) {
 
 const KINDS = { settings: SettingsPage, table: TablePage, form: FormPage, action: ActionPluginPage, markdown: MarkdownPage, html: HtmlPage };
 
-export function PluginPageView({ plugin, page }) {
+export function PluginPageView({ plugin, page, header = true }) {
   const Kind = KINDS[page.kind];
   const fn = pluginFn(plugin, page);
   if (!Kind) return <NotFoundPage />;
-  return <Kind plugin={plugin} page={page} fn={fn} baseUrl={`/plugins/${plugin.id}`} />;
+  return <Kind plugin={plugin} page={page} fn={fn} header={header} baseUrl={`/plugins/${plugin.id}`} />;
 }
 
 export default function PluginPage() {

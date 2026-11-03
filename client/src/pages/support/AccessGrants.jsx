@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { KeyRound, RefreshCw, ShieldOff, Clock } from 'lucide-react';
+import { KeyRound, RefreshCw, ShieldOff, Clock, AlertTriangle, Info } from 'lucide-react';
 import { api, queryString } from '../../api/client.js';
 import { useApi, useMutation } from '../../hooks/useApi.js';
 import { Card, KeyValue, Loading, StatusPill, formatDate } from '../../components/Common.jsx';
@@ -25,7 +25,7 @@ export function GrantResult({ result, onClose }) {
     <Modal open={Boolean(result)} title={g ? `Access granted: ${g.label}` : ''} onClose={onClose} size="lg" footer={<Button variant="primary" onClick={onClose}>I have saved these</Button>}>
       {g && (
         <>
-          <div className="banner banner-warning"><div><strong>Shown once.</strong><p>The private key is not stored on this server and the token is kept only as a hash. Hand them to the support engineer now; both stop working at {formatDate(g.expiresAt)} or as soon as you revoke the grant. The time box is cooperative: whoever holds root can add their own persistence, so revoke the grant when the engagement ends and review the audit log and root's SSH keys afterwards.</p></div></div>
+          <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>Shown once.</strong><p>The private key is not stored on this server and the token is kept only as a hash. Hand them to the support engineer now; both stop working at {formatDate(g.expiresAt)} or as soon as you revoke the grant. The time box is cooperative: whoever holds root can add their own persistence, so revoke the grant when the engagement ends and review the audit log and root's SSH keys afterwards.</p></div></div>
           <KeyValue items={[['Expires', formatDate(g.expiresAt)], ['Granted by', g.grantedBy], result.ssh && ['Key fingerprint', <code>{result.ssh.fingerprint}</code>], result.apiToken && ['Token prefix', <code>{result.apiToken.prefix}…</code>]]} />
           {result.ssh && (
             <>
@@ -73,17 +73,17 @@ export function GrantForm({ status, onGranted }) {
 
   return (
     <Card title="Grant access" subtitle={`Creates a fresh SSH key authorized for root and an API token. The key line carries sshd's expiry-time option (OpenSSH ${status?.sshdMinVersion || '7.7'} or newer, stamped in the host's local time${status?.expiryTimeZone ? `, ${status.expiryTimeZone}` : ''}) so the daemon refuses it after the deadline, and the panel removes both when the time box ends.`}>
-      {sshdMissing && <div className="banner banner-info"><div><strong>sshd is not installed</strong><p>{status.sshdDetail} Only an API token can be issued until <Link to="/software/install-distro-packages">openssh-server</Link> is installed.</p></div></div>}
-      {sshdBlocked && <div className="banner banner-warning"><div><strong>sshd would refuse a root key</strong><p>{status.sshdPolicy.detail} {status.sshdPolicy.fix && <Link to={status.sshdPolicy.fix.path}>{status.sshdPolicy.fix.label}</Link>}</p></div></div>}
-      {status?.sshdPolicy?.known === false && <div className="banner banner-info"><div><strong>sshd configuration could not be read</strong><p>{status.sshdPolicy.detail}</p></div></div>}
-      <p className="muted small">Granting is only possible from a signed-in root session, never through an API token, so a support token cannot extend its own time box. The box itself is cooperative: root access can be made persistent by its holder, so revoke the grant as soon as the engagement ends.</p>
+      {sshdMissing && <div className="banner banner-info"><Info size={18} /><div><strong>sshd is not installed</strong><p>{status.sshdDetail} Only an API token can be issued until <Link to="/software/install-distro-packages">openssh-server</Link> is installed.</p></div></div>}
+      {sshdBlocked && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>sshd would refuse a root key</strong><p>{status.sshdPolicy.detail} {status.sshdPolicy.fix && <Link to={status.sshdPolicy.fix.path}>{status.sshdPolicy.fix.label}</Link>}</p></div></div>}
+      {status?.sshdPolicy?.known === false && <div className="banner banner-info"><Info size={18} /><div><strong>sshd configuration could not be read</strong><p>{status.sshdPolicy.detail}</p></div></div>}
+      <p className="muted">Granting is only possible from a signed-in root session, never through an API token, so a support token cannot extend its own time box. The box itself is cooperative: root access can be made persistent by its holder, so revoke the grant as soon as the engagement ends.</p>
       <form onSubmit={submit}>
         <ErrorBanner error={error && isCapabilityError(error) ? null : error && !fieldErrors ? error : null} />
         <RequestError error={isCapabilityError(error) ? error : null} />
         <Field label="Label" required error={fieldErrors?.label} help="Usually the support ticket or case number. Becomes the key comment and the token name."><TextInput value={form.label} onChange={set('label')} placeholder="case-1234567" maxLength={48} /></Field>
-        <Field label="Duration (hours)" error={fieldErrors?.hours} help={`Default ${defaultHours} h, at most ${maxHours} h. Change the limits under Support Center → Settings.`}><NumberInput value={form.hours} onChange={set('hours')} min={1} max={maxHours} placeholder={String(defaultHours)} /></Field>
+        <Field label="Duration (hours)" error={fieldErrors?.hours} help={`Default ${defaultHours} h, at most ${maxHours} h. Change the limits under Support Center › Settings.`}><NumberInput value={form.hours} onChange={set('hours')} min={1} max={maxHours} placeholder={String(defaultHours)} /></Field>
         <Field error={fieldErrors?.ssh}><Toggle checked={form.ssh && !sshUnavailable} disabled={sshUnavailable} onChange={set('ssh')} label="SSH access as root" description={sshdBlocked ? 'Unavailable until sshd accepts a root key (see above).' : 'A new ed25519 key pair; the public half is appended to /root/.ssh/authorized_keys.'} /></Field>
-        <Field error={fieldErrors?.apiToken}><Toggle checked={form.apiToken} onChange={set('apiToken')} label="API token" description="A bearer token for this panel's API with the same expiry, listed under Development → Manage API Tokens." /></Field>
+        <Field error={fieldErrors?.apiToken}><Toggle checked={form.apiToken} onChange={set('apiToken')} label="API token" description="A bearer token for this panel's API with the same expiry, listed under Development › Manage API Tokens." /></Field>
         {form.apiToken && <Field label="Token scope" error={fieldErrors?.tokenScopes}><Select value={form.scope} onChange={set('scope')} options={SCOPE_OPTIONS} /></Field>}
         <Field label="Note" error={fieldErrors?.note}><TextInput value={form.note} onChange={set('note')} placeholder="Why access is being granted" maxLength={500} /></Field>
         {fieldErrors?._ && <div className="field-message">{fieldErrors._.join(' ')}</div>}
@@ -137,19 +137,19 @@ export function GrantList({ refreshKey = 0, onChanged }) {
   ];
   return (
     <>
-      <Card title="Grants" subtitle="Active grants are checked every five minutes and ended the moment they are overdue. A grant whose key could not be removed stays in 'cleanup pending' and is retried on every run." actions={<><Button size="sm" icon={Clock} loading={busy} onClick={expireDue}>Expire overdue now</Button><Button size="sm" icon={RefreshCw} onClick={() => refetch()}>Refresh</Button></>}>
+      <Card title="Grants" subtitle="Active grants are checked every five minutes and ended the moment they are overdue. A grant whose key could not be removed stays in “cleanup pending” and is retried on every run." actions={<><Button size="sm" icon={Clock} loading={busy} onClick={expireDue}>Expire overdue now</Button><Button size="sm" icon={RefreshCw} onClick={() => refetch()}>Refresh</Button></>}>
         <RequestError error={error} onRetry={refetch} />
         <DataTable columns={columns} rows={data || []} loading={loading} total={meta?.total} page={table.state.page} pageSize={table.state.pageSize} onPageChange={table.setPage}
           sort={table.state.sort} dir={table.state.dir} onSortChange={table.setSort} searchable q={table.state.q} onSearch={table.setSearch} searchPlaceholder="Search label or fingerprint…"
-          emptyText="No support access has been granted"
+          emptyText="No grants yet. Support access you grant will be listed here."
           toolbar={<Select value={status} onChange={(v) => { setStatus(v); table.setPage(1); }} options={[{ value: '', label: 'All' }, { value: 'active', label: 'Active' }, { value: 'cleanup_pending', label: 'Cleanup pending' }, { value: 'expired', label: 'Expired' }, { value: 'revoked', label: 'Revoked' }]} />}
           rowActions={(g) => [g.status === 'active' && { label: 'Revoke', primary: true, danger: true, disabled: busy, onClick: () => revoke(g) }, g.status === 'cleanup_pending' && { label: 'Retry cleanup', primary: true, disabled: busy, onClick: () => revoke(g) }, { label: 'Details', onClick: () => setOpen(g) }]} />
       </Card>
       <Modal open={Boolean(open)} title={open ? `Grant: ${open.label}` : ''} onClose={() => setOpen(null)} footer={<>{open?.status === 'active' && <Button variant="danger" icon={ShieldOff} onClick={() => { revoke(open); setOpen(null); }}>Revoke</Button>}{open?.status === 'cleanup_pending' && <Button variant="primary" icon={RefreshCw} onClick={() => { revoke(open); setOpen(null); }}>Retry cleanup</Button>}<Button onClick={() => setOpen(null)}>Close</Button></>}>
         {open && (
           <KeyValue items={[
-            ['Status', <span><StatusPill status={GRANT_TONE[open.status]}>{grantLabel(open.status)}</StatusPill>{open.cleanupPending && <span className="muted small"> → {open.pendingStatus} once the key is removed (attempt {open.cleanup?.attempts || 1}{open.cleanup?.lastAttemptAt ? `, last ${formatDate(open.cleanup.lastAttemptAt)}` : ''})</span>}</span>],
-            ['Expires', <span>{formatDate(open.expiresAt)}{open.ssh?.expiry && <span className="muted small"> · sshd expiry-time {open.ssh.expiry} (host local time, OpenSSH 7.7+)</span>}</span>],
+            ['Status', <span><StatusPill status={GRANT_TONE[open.status]}>{grantLabel(open.status)}</StatusPill>{open.cleanupPending && <span className="muted"> → {open.pendingStatus} once the key is removed (attempt {open.cleanup?.attempts || 1}{open.cleanup?.lastAttemptAt ? `, last ${formatDate(open.cleanup.lastAttemptAt)}` : ''})</span>}</span>],
+            ['Expires', <span>{formatDate(open.expiresAt)}{open.ssh?.expiry && <span className="muted"> · sshd expiry-time {open.ssh.expiry} (host local time, OpenSSH 7.7+)</span>}</span>],
             ['Granted', `${formatDate(open.createdAt)} by ${open.grantedBy || '—'}${open.grantedIp ? ` from ${open.grantedIp}` : ''}`],
             open.note && ['Note', open.note],
             ['SSH key', open.ssh ? <span><code className="small">{open.ssh.fingerprint}</code> <CopyButton text={open.ssh.fingerprint} /></span> : 'not granted'],
@@ -172,10 +172,10 @@ export function AccessGrants() {
       <RequestError error={status.error} onRetry={status.refetch} />
       {status.loading && !status.data && <Loading />}
       {status.data?.cleanupPending?.length > 0 && (
-        <div className="banner banner-warning"><div><strong>{status.data.cleanupPending.length} grant{status.data.cleanupPending.length > 1 ? 's' : ''} waiting for cleanup</strong><p>{status.data.cleanupPending.map((g) => `${g.label} (${g.cleanup?.ssh?.error || 'key removal failed'})`).join(', ')}. The root SSH key is still in authorized_keys; the panel retries every five minutes and you can retry below. sshd refuses each key after its own deadline, or remove the line by hand under Security Center → Manage root's SSH Keys.</p></div></div>
+        <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>{status.data.cleanupPending.length} grant{status.data.cleanupPending.length > 1 ? 's' : ''} waiting for cleanup</strong><p>{status.data.cleanupPending.map((g) => `${g.label} (${g.cleanup?.ssh?.error || 'key removal failed'})`).join(', ')}. The root SSH key is still in authorized_keys; the panel retries every five minutes and you can retry below. sshd refuses each key after its own deadline, or remove the line by hand under Security Center › Manage root's SSH Keys.</p></div></div>
       )}
       {status.data?.active?.length > 0 && (
-        <div className="banner banner-warning"><div><strong>{status.data.active.length} active support grant{status.data.active.length > 1 ? 's' : ''}</strong><p>{status.data.active.map((g) => `${g.label} (until ${formatDate(g.expiresAt)})`).join(', ')}. Revoke below as soon as the engineer is done.</p></div></div>
+        <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>{status.data.active.length} active support grant{status.data.active.length > 1 ? 's' : ''}</strong><p>{status.data.active.map((g) => `${g.label} (until ${formatDate(g.expiresAt)})`).join(', ')}. Revoke below as soon as the engineer is done.</p></div></div>
       )}
       <GrantForm status={status.data} onGranted={(r) => { setResult(r); setTick((t) => t + 1); status.refetch(); }} />
       <GrantList refreshKey={tick} onChanged={() => status.refetch()} />

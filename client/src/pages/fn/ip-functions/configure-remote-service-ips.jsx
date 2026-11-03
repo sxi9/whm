@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { Info, AlertCircle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, Loading, StatusPill } from '../../../components/Common.jsx';
@@ -44,7 +45,7 @@ export default function ConfigureRemoteServiceIps({ fn }) {
       {loading && !data && <Loading />}
       {data && draft && (
         <>
-          {!data.candidates.ipv4.length && !data.candidates.ipv6.length && <div className="banner banner-info"><div>{data.candidates.live ? 'No managed addresses are bound to this server’s interfaces.' : 'No addresses are recorded yet.'} Run <Link to="/ip-functions/rebuild-the-ip-address-pool">Rebuild the IP Address Pool</Link> or <Link to="/ip-functions/add-a-new-ip-address">add an address</Link> first.</div></div>}
+          {!data.candidates.ipv4.length && !data.candidates.ipv6.length && <div className="banner banner-info"><Info size={18} /><div>{data.candidates.live ? 'No managed addresses are bound to this server’s interfaces.' : 'No addresses are recorded yet.'} Run <Link to="/ip-functions/rebuild-the-ip-address-pool">Rebuild the IP Address Pool</Link> or <Link to="/ip-functions/add-a-new-ip-address">add an address</Link> first.</div></div>}
           {data.services.map((s) => (
             <Card key={s.key} title={s.label} subtitle={s.help} className="config-fields">
               <div className="form-grid">
@@ -53,7 +54,8 @@ export default function ConfigureRemoteServiceIps({ fn }) {
               </div>
               {applied?.[s.key] && (
                 <div className="row-actions">
-                  <StatusPill status={applied[s.key] === 'applied' ? 'ok' : applied[s.key] === 'failed' ? 'failed' : 'pending'}>{applied[s.key] === 'saved' ? 'saved — applied when the service is installed' : applied[s.key]}</StatusPill>
+                  <StatusPill status={applied[s.key] === 'applied' ? 'ok' : applied[s.key] === 'failed' ? 'failed' : 'pending'}>{applied[s.key]}</StatusPill>
+                  {applied[s.key] === 'saved' && <span className="muted">applied once the service is installed</span>}
                   {applyErrors[s.key] && <span className="muted">{applyErrors[s.key]}</span>}
                 </div>
               )}
@@ -61,7 +63,7 @@ export default function ConfigureRemoteServiceIps({ fn }) {
           ))}
           <div className="sticky-actions">
             <ErrorBanner error={saveError && !saveError.fields ? saveError : null} />
-            {saveError?.fields && <div className="banner banner-error"><div>{saveError.message}</div></div>}
+            {saveError?.fields && <div className="banner banner-error"><AlertCircle size={18} /><div>{saveError.message}</div></div>}
             <FormActions>
               <Button variant="primary" loading={busy} disabled={!changedKeys.length} onClick={save}>Save</Button>
               <Button disabled={!changedKeys.length || busy} onClick={() => setDraft(toDraft(data.services))}>Reset</Button>

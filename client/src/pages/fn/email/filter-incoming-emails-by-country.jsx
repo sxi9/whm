@@ -15,7 +15,7 @@ function CidrModal({ code, onClose }) {
   return (
     <Modal open={Boolean(code)} title={`CIDR networks for ${code?.toUpperCase() || ''}`} onClose={onClose}>
       <ErrorBanner error={error} />
-      <DataTable columns={[{ key: 'cidr', label: 'Network', render: (r) => <code>{r.cidr}</code> }]} rows={data || []} loading={loading} total={meta?.total ?? null} page={page} pageSize={100} onPageChange={setPage} rowKey={(r) => r.cidr} dense emptyText="No networks uploaded yet." />
+      <DataTable columns={[{ key: 'cidr', label: 'Network', render: (r) => <code>{r.cidr}</code> }]} rows={data || []} loading={loading} total={meta?.total ?? null} page={page} pageSize={100} onPageChange={setPage} rowKey={(r) => r.cidr} dense emptyText="No networks yet. Upload or download a list to see them here." />
     </Modal>
   );
 }
@@ -77,11 +77,11 @@ export default function FilterIncomingEmailsByCountry({ fn }) {
                 { key: 'code', label: 'Country', render: (c) => <><strong>{c.code.toUpperCase()}</strong>{c.name && <span className="muted"> {c.name}</span>}</> },
                 { key: 'action', label: 'Action', render: (c) => <StatusPill status={c.action === 'block' ? 'failed' : 'ok'}>{c.action === 'block' ? 'block' : 'allow only'}</StatusPill> },
                 { key: 'enabled', label: 'Enabled', render: (c) => <StatusPill status={c.enabled ? 'enabled' : 'disabled'} /> },
-                { key: 'cidrs', label: 'Networks', render: (c) => c.cidrs ? <button className="link-button" onClick={() => setViewing(c.code)}>{c.cidrs}</button> : <span className="text-warn">none — upload or download a list</span> },
+                { key: 'cidrs', label: 'Networks', render: (c) => c.cidrs ? <button className="link-button" onClick={() => setViewing(c.code)}>{c.cidrs}</button> : <><StatusPill status="warning">none</StatusPill> <span className="muted">upload or download a list</span></> },
                 { key: 'source', label: 'Source', render: (c) => c.source ? <code style={{ wordBreak: 'break-all' }}>{c.source}</code> : <span className="muted">—</span> },
                 { key: 'updatedAt', label: 'Updated', render: (c) => formatDate(c.updatedAt) },
               ]}
-              rows={countries} loading={loading} rowKey={(c) => c.code} dense emptyText="No country filters. Add a country below."
+              rows={countries} loading={loading} rowKey={(c) => c.code} dense emptyText="No country filters yet. Countries you add below are listed here."
               rowActions={(c) => [
                 { label: 'Download list', primary: true, onClick: () => fetchList(c), disabled: busy },
                 { label: c.enabled ? 'Disable' : 'Enable', onClick: () => toggle(c, { enabled: !c.enabled }) },
@@ -102,7 +102,7 @@ export default function FilterIncomingEmailsByCountry({ fn }) {
             </Card>
             <Card title="Upload a CIDR list" subtitle={`One network per line (ipdeny .zone format); # and ; start comments. Up to ${Math.round(MAX_UPLOAD_BYTES / 1024)} KB here; use "Download list" for larger lists.`}>
               <Field label="Country"><Select value={upload.code} onChange={(v) => setUpload((u) => ({ ...u, code: v }))} options={countries.map((c) => ({ value: c.code, label: c.code.toUpperCase() }))} placeholder="Select a country" /></Field>
-              <Field label="File" help={upload.text ? `${Math.round(uploadBytes / 1024)} KB loaded${uploadBytes > MAX_UPLOAD_BYTES ? ' — too large to upload' : ''}` : undefined}><input type="file" accept=".zone,.txt,.lst,.csv,text/plain" onChange={onFile} /></Field>
+              <Field label="File" help={upload.text ? `${Math.round(uploadBytes / 1024)} KB loaded${uploadBytes > MAX_UPLOAD_BYTES ? ' — too large to upload' : ''}` : undefined}><input className="input" type="file" accept=".zone,.txt,.lst,.csv,text/plain" onChange={onFile} /></Field>
               <Field label="Or paste networks"><Textarea value={upload.text} onChange={(v) => setUpload((u) => ({ ...u, text: v }))} rows={6} mono placeholder={'203.0.113.0/24\n2001:db8::/32'} /></Field>
               <Field label="Mode"><Select value={upload.replace ? 'replace' : 'append'} onChange={(v) => setUpload((u) => ({ ...u, replace: v === 'replace' }))} options={[{ value: 'replace', label: 'Replace the existing list' }, { value: 'append', label: 'Append to the existing list' }]} /></Field>
               <FormActions><Button variant="primary" loading={busy} disabled={!upload.code || !upload.text.trim()} onClick={uploadList}>Import</Button></FormActions>

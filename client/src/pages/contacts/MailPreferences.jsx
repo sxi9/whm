@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Send, Plus, X } from 'lucide-react';
+import { Send, Plus, X, AlertTriangle, Info } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
-import { Card, Loading, KeyValue, CapabilityNotice, StatusPill } from '../../components/Common.jsx';
+import { Card, Loading, KeyValue, CapabilityNotice } from '../../components/Common.jsx';
 import { DataTable } from '../../components/DataTable.jsx';
 import { Field, TextInput, Button, FormActions, ErrorBanner } from '../../components/Form.jsx';
 import { useToast } from '../../components/Toast.jsx';
@@ -22,17 +22,20 @@ function TargetList({ label, help, value, onChange }) {
   };
   return (
     <Field label={label} help={help}>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 8 }}>
-        {value.length === 0 && <span className="muted">Not forwarded (local mailbox)</span>}
-        {value.map((t) => (
-          <span key={t} className="pill pill-info" style={{ textTransform: 'none', height: 26, gap: 6 }}>
-            {t}
-            <button type="button" className="icon-button" aria-label={`Remove ${t}`} onClick={() => onChange(value.filter((x) => x !== t))} style={{ padding: 0 }}><X size={12} /></button>
-          </span>
-        ))}
-      </div>
-      <form onSubmit={add} style={{ display: 'flex', gap: 8 }}>
-        <div style={{ flex: 1 }}><TextInput value={draft} onChange={setDraft} placeholder="admin@example.com or a local user" /></div>
+      {value.length === 0 ? (
+        <p className="muted">Not forwarded (local mailbox)</p>
+      ) : (
+        <ul className="list-plain" style={{ marginBottom: 8 }}>
+          {value.map((t) => (
+            <li key={t} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '2px 0' }}>
+              <code>{t}</code>
+              <button type="button" className="icon-button" aria-label={`Remove ${t}`} onClick={() => onChange(value.filter((x) => x !== t))}><X size={14} /></button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <form onSubmit={add} className="input-group">
+        <TextInput value={draft} onChange={setDraft} placeholder="admin@example.com or a local user" />
         <Button type="submit" icon={Plus} disabled={!draft.trim() || value.length >= 20}>Add</Button>
       </form>
     </Field>
@@ -92,9 +95,11 @@ export function MailPreferences() {
     <>
       {aliasesUnavailable && <CapabilityNotice error={{ code: 'capability_missing', message: `The agent could not read ${data.aliases?.path || '/etc/aliases'} (${data.aliasError.message}). The forwarding list below is the last one saved from this panel.` }} onRetry={refetch} />}
       {data.aliasError && !aliasesUnavailable && <ErrorBanner error={{ message: `Could not read /etc/aliases: ${data.aliasError.message}` }} onRetry={refetch} />}
-      {!data.capability.mailTransport && <div className="banner banner-warning"><div><strong>No mail transport</strong><p>Exim is not installed and no SMTP relay is configured in Contact Manager, so copies of events cannot be mailed to root yet. Forwarding in /etc/aliases is still saved for when the mail server is installed.</p></div></div>}
+      {!data.capability.mailTransport && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>No mail transport</strong><p>Exim is not installed and no SMTP relay is configured in Contact Manager, so copies of events cannot be mailed to root yet. Forwarding in /etc/aliases is still saved for when the mail server is installed.</p></div></div>}
       {data.capability.mailTransport === 'smtp' && (
-        <div className={`banner ${data.rootDelivery?.error ? 'banner-warning' : 'banner-info'}`}><div>
+        <div className={`banner ${data.rootDelivery?.error ? 'banner-warning' : 'banner-info'}`}>
+          {data.rootDelivery?.error ? <AlertTriangle size={18} /> : <Info size={18} />}
+          <div>
           <strong>Root mail goes through the SMTP relay</strong>
           <p>
             The relay configured in Contact Manager does not read /etc/aliases, so the events below are sent straight to the forwarding addresses above
@@ -105,10 +110,10 @@ export function MailPreferences() {
         </div></div>
       )}
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: 18, alignItems: 'start' }}>
+      <div className="grid-2" style={{ alignItems: 'start' }}>
         <Card title="Where root's mail goes" subtitle={`System mail for root (cron output, daemon reports, the events below) is addressed to ${data.rootAddress} and delivered according to /etc/aliases.`}>
           <KeyValue items={[
-            ['Alias file', data.aliases ? <><code>{data.aliases.path}</code> {data.aliases.exists ? '' : <StatusPill status="warning">will be created</StatusPill>}</> : <span className="muted">unavailable</span>],
+            ['Alias file', data.aliases ? <><code>{data.aliases.path}</code> {data.aliases.exists ? '' : <span className="muted">(will be created on save)</span>}</> : <span className="muted">unavailable</span>],
             ['Rebuild after saving', data.aliases?.rebuildTool === 'newaliases' ? 'newaliases (Postfix/Sendmail database)' : data.aliases?.rebuildTool === 'exim' ? 'not needed: Exim reads the file directly' : <span className="muted">no mail server detected</span>],
             ['Mail transport', data.capability.mailTransport === 'exim' ? 'Exim on this server' : data.capability.mailTransport === 'smtp' ? 'SMTP relay (Contact Manager)' : <span className="muted">none</span>],
           ]} />
@@ -120,13 +125,13 @@ export function MailPreferences() {
         </Card>
 
         <Card title="Events that also mail root" subtitle="Independently of the contacts in Contact Manager, these events are mailed to root (and therefore to the forwarding addresses above).">
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '12px 20px' }}>
             {groups.map(([group, list]) => (
               <div key={group}>
-                <div style={{ fontWeight: 600, marginBottom: 4 }}>{group}</div>
+                <strong style={{ display: 'block', marginBottom: 6 }}>{group}</strong>
                 {list.map((e) => (
-                  <label key={e.key} style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, padding: '2px 0' }}>
-                    <input type="checkbox" checked={events.includes(e.key)} onChange={() => setEvents(events.includes(e.key) ? events.filter((k) => k !== e.key) : [...events, e.key])} />
+                  <label key={e.key} className="checkbox" style={{ display: 'flex', gap: 8, alignItems: 'flex-start', padding: '3px 0' }}>
+                    <input type="checkbox" checked={events.includes(e.key)} onChange={() => setEvents(events.includes(e.key) ? events.filter((k) => k !== e.key) : [...events, e.key])} style={{ marginTop: 2 }} />
                     <span>{e.label} <small className="muted">({e.severity})</small></span>
                   </label>
                 ))}
@@ -142,7 +147,7 @@ export function MailPreferences() {
 
       {data.aliases?.entries?.length > 0 && (
         <Card title="Other aliases on this server" subtitle="Read from /etc/aliases. Only the root and nobody entries are managed by the panel; edit the rest on the server." padded={false}>
-          <DataTable dense rows={data.aliases.entries.filter((e) => !(data.managedUsers || ['root']).includes(e.name))} rowKey={(e) => e.name} emptyText="Only the managed aliases exist."
+          <DataTable dense rows={data.aliases.entries.filter((e) => !(data.managedUsers || ['root']).includes(e.name))} rowKey={(e) => e.name} emptyText="Only the root and nobody aliases exist; other entries in /etc/aliases would be listed here."
             columns={[{ key: 'name', label: 'Alias', render: (e) => <code>{e.name}</code> }, { key: 'targets', label: 'Delivers to', render: (e) => e.targets.join(', ') }]} />
         </Card>
       )}

@@ -23,8 +23,8 @@ export function LocalePills({ locale }) {
   if (!locale) return null;
   return (
     <span className="row-actions">
-      {locale.builtin && <StatusPill status="info">built-in</StatusPill>}
-      {locale.isDefault && <StatusPill status="ok">default</StatusPill>}
+      {locale.builtin && <StatusPill status="info">Built-in</StatusPill>}
+      {locale.isDefault && <StatusPill status="ok">Default</StatusPill>}
       <StatusPill status={locale.enabled ? 'enabled' : 'disabled'} />
     </span>
   );
@@ -32,10 +32,10 @@ export function LocalePills({ locale }) {
 
 export function TranslationProgress({ stats }) {
   if (!stats) return null;
-  const tone = stats.percent >= 90 ? 'var(--ok)' : stats.percent >= 40 ? 'var(--warn)' : 'var(--bad)';
+  const tone = stats.percent >= 90 ? '' : stats.percent >= 40 ? 'warn' : 'bad';
   return (
     <div title={`${stats.translated} of ${stats.total} base strings translated${stats.extra ? `, ${stats.extra} extra key(s)` : ''}`} style={{ minWidth: 140 }}>
-      <div className="strength-bar"><span style={{ width: `${stats.percent}%`, background: tone }} /></div>
+      <div className={`meter ${tone}`} style={{ marginTop: 0, marginBottom: 4 }}><span style={{ width: `${stats.percent}%` }} /></div>
       <span className="small muted">{stats.translated}/{stats.total} · {stats.percent}%</span>
     </div>
   );

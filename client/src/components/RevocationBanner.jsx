@@ -34,7 +34,7 @@ export function RevocationBanner() {
       {data.map((r) => (
         <div key={r.id} className="banner banner-error" role="alert" data-testid="revocation-banner">
           <ShieldAlert size={18} />
-          <div style={{ flex: 1 }}>
+          <div>
             <strong>Plugin revoked: {r.pluginId}{r.version ? ` ${r.version}` : ''}</strong>
             <p>{describeRevocation(r)} {r.severity === 'critical' && (r.appliedTo || []).some((a) => !a.signer) ? 'Because the revocation is critical, a same-id plugin that was not signed by the marketplace was switched off too.' : ''}</p>
             <small>Acknowledge once you have reviewed it; until then the plugin cannot be enabled again. <Link to={MANAGE_PLUGINS_PATH}>Manage Plugins</Link></small>

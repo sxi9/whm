@@ -35,7 +35,7 @@ function Triplets() {
           { key: 'firstSeen', label: 'First seen', render: (t) => formatDate(t.firstSeen) },
           { key: 'lastSeen', label: 'Last seen', render: (t) => formatDate(t.lastSeen) },
         ]}
-        rows={data?.triplets || []} loading={loading} rowKey={(t) => `${t.sender}|${t.recipient}|${t.host}`} dense emptyText="No greylist records yet."
+        rows={data?.triplets || []} loading={loading} rowKey={(t) => `${t.sender}|${t.recipient}|${t.host}`} dense emptyText="No greylist records yet. Triplets appear here as unknown senders connect."
         searchable q={q} onSearch={setQ} searchPlaceholder="Filter sender, recipient or host"
       />
     </Card>
@@ -81,7 +81,7 @@ export default function Greylisting({ fn }) {
             <KeyValue items={[
               ['Greylisting', <StatusPill key="s" status={data.settings.enabled ? 'enabled' : 'disabled'} />],
               ['Backend', be?.backend ? <span key="b"><StatusPill status="ok">{be.backend}</StatusPill> {be.dbFile && <code>{be.dbFile}</code>}{be.socket && <code>{be.socket}</code>}</span> : <span key="n"><StatusPill status="not-installed">none</StatusPill> <span className="muted">{be?.reason}</span></span>],
-              ['Exim', <ApplyBadge key="a" apply={lastApply || data.lastApply} />],
+              ['Exim', (lastApply || data.lastApply) ? <ApplyBadge key="a" apply={lastApply || data.lastApply} /> : <span key="n" className="muted">Not applied yet</span>],
             ]} />
             <IncludeHint apply={lastApply || data.lastApply} />
           </Card>
@@ -103,7 +103,7 @@ export default function Greylisting({ fn }) {
               <Card title="Trusted hosts and domains" subtitle="Never greylisted" padded={false}>
                 <DataTable
                   columns={[{ key: 'kind', label: 'Type', render: (t) => KINDS.find((k) => k.value === t.kind)?.label }, { key: 'value', label: 'Value', render: (t) => <code>{t.value}</code> }, { key: 'comment', label: 'Comment' }, { key: 'created_at', label: 'Added', render: (t) => formatDate(t.created_at) }]}
-                  rows={data.trusted} rowKey={(t) => t.id} dense emptyText="Nothing is exempt yet." rowActions={(t) => [{ label: 'Remove', primary: true, danger: true, onClick: () => removeTrusted(t) }]}
+                  rows={data.trusted} rowKey={(t) => t.id} dense emptyText="Nothing is exempt yet. Hosts and domains you add below are listed here." rowActions={(t) => [{ label: 'Remove', primary: true, danger: true, onClick: () => removeTrusted(t) }]}
                 />
               </Card>
               <Card title="Add an exemption">

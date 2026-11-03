@@ -27,7 +27,7 @@ export default function DeletePackage({ fn }) {
             { key: 'feature_list', label: 'Feature list' },
             { key: 'accounts', label: 'Accounts', align: 'right' },
           ]}
-          rows={data || []} loading={loading} error={error} rowKey={(p) => p.name}
+          rows={data || []} loading={loading} error={error} rowKey={(p) => p.name} emptyText="Packages you add under Add a package will appear here."
           rowActions={(p) => [{ label: p.accounts ? `In use (${p.accounts})` : 'Delete', primary: true, danger: true, disabled: p.accounts > 0 || p.name === 'default', onClick: () => remove(p) }]}
         />
       </Card>

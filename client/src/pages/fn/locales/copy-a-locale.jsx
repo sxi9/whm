@@ -44,7 +44,7 @@ export default function CopyALocale({ fn }) {
           <div className="form-grid">
             <Field label="Source locale" required><LocaleSelect value={from} onChange={setFrom} locales={locales} placeholder={null} /></Field>
             <Field label="New locale code" required error={code && !CODE_RE.test(normalized) ? 'Codes look like "es", "de_at" or "pt_br"' : codeTaken ? 'That code is already installed' : null} help="A two or three letter language code, optionally followed by _ and a region.">
-              <TextInput value={code} onChange={setCode} placeholder="e.g. es_mx" />
+              <TextInput value={code} onChange={setCode} placeholder="For example es_mx" />
             </Field>
             <Field label="Display name" help="Shown to users in the language picker."><TextInput value={name} onChange={setName} placeholder={source ? `${source.name} (copy)` : ''} /></Field>
           </div>

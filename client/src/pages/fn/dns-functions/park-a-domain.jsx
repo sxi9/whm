@@ -52,7 +52,7 @@ export default function ParkADomain({ fn }) {
           </div>
           <Field inline><Toggle checked={form.createZone} onChange={set('createZone')} label="Create a DNS zone for the domain" description="Turn off when DNS is hosted elsewhere" /></Field>
           <FormActions><Button type="submit" variant="primary" loading={busy} disabled={!form.account || !form.domain}>Park domain</Button></FormActions>
-          {result && <KeyValue items={[['Parked', <code key="d">{result.domain}</code>], ['Serves', result.target], ['Document root', <code key="r">{result.docroot}</code>], ['DNS zone', result.zone ? <StatusPill key="z" status={result.zone.applied === false ? 'warning' : 'ok'}>{result.zone.applied === false ? 'saved, BIND missing' : 'created & published'}</StatusPill> : 'skipped'], ['Web server alias', <StatusPill key="w" status={result.web === 'applied' ? 'ok' : result.web === 'pending' ? 'pending' : 'failed'}>{result.web}</StatusPill>]]} />}
+          {result && <KeyValue items={[['Parked', <code key="d">{result.domain}</code>], ['Serves', result.target], ['Document root', <code key="r">{result.docroot}</code>], ['DNS zone', result.zone ? <StatusPill key="z" status={result.zone.applied === false ? 'warning' : 'ok'}>{result.zone.applied === false ? 'Not published' : 'Published'}</StatusPill> : 'skipped'], ['Web server alias', <StatusPill key="w" status={result.web === 'applied' ? 'ok' : result.web === 'pending' ? 'pending' : 'failed'}>{result.web}</StatusPill>]]} />}
         </Card>
       </form>
       <Card title="Parked domains" padded={false}>
@@ -69,7 +69,7 @@ export default function ParkADomain({ fn }) {
           sort={t.state.sort} dir={t.state.dir} onSortChange={t.setSort}
           searchable q={t.state.q} onSearch={t.setSearch}
           rowActions={(r) => [{ label: 'Remove', primary: true, danger: true, onClick: () => unpark(r) }]}
-          emptyText="No parked domains."
+          emptyText="No parked domains yet. Domains parked with the form above appear here."
         />
       </Card>
     </>

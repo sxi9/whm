@@ -3,6 +3,7 @@ import { useApi } from '../../hooks/useApi.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
 import { PageHeader, Card, StatusPill, formatBytes, formatDate } from '../../components/Common.jsx';
 import { DataTable } from '../../components/DataTable.jsx';
+import { Button } from '../../components/Form.jsx';
 import { useToast } from '../../components/Toast.jsx';
 import { useConfirm } from '../../components/Modal.jsx';
 
@@ -26,7 +27,7 @@ export default function ServiceStatus({ fn }) {
   const rows = (data || []).filter((s) => s.monitored);
   return (
     <>
-      <PageHeader fn={fn} actions={<button className="btn" onClick={() => refetch()}>Refresh</button>} />
+      <PageHeader fn={fn} actions={<Button onClick={() => refetch()}>Refresh</Button>} />
       <Card padded={false}>
         <DataTable
           columns={[

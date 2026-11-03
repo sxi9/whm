@@ -48,12 +48,13 @@ export default function ServerTime({ fn }) {
         <>
           <div className="form-grid">
             <Card title="Current server time">
-              <KeyValue items={[['Server clock', <strong key="c">{serverClock}</strong>], ['System timezone', data.timezone || 'unknown'], ['NTP synchronisation', <YesNo key="n" value={data.ntp} yes="enabled" no="disabled" unknown="timedatectl missing" />], ['Clock synchronised', <YesNo key="s" value={data.ntpSynchronized} yes="synchronised" no="not synchronised" />], ['RTC in local time', <YesNo key="r" value={data.rtcLocal} yes="yes (Windows dual-boot style)" no="no (UTC, recommended)" />],
-                ['NTP service', data.ntpService ? <StatusPill key="u" status={data.ntpService.active ? 'active' : 'inactive'}>{data.ntpService.unit}: {data.ntpService.state}</StatusPill> : <span key="u" className="muted">no NTP daemon unit found (systemd-timesyncd, chrony or ntpd)</span>]]} />
+              <KeyValue items={[['Server clock', <strong key="c">{serverClock}</strong>], ['System timezone', data.timezone || 'unknown'], ['NTP synchronisation', <YesNo key="n" value={data.ntp} yes="enabled" no="disabled" unknown="timedatectl missing" />], ['Clock synchronised', <YesNo key="s" value={data.ntpSynchronized} yes="synchronised" no="not synchronised" />], ['RTC in local time', <span key="r" className="row-actions" style={{ gap: 8 }}><YesNo value={data.rtcLocal} yes="yes" no="no" />{data.rtcLocal != null && <small className="muted">{data.rtcLocal ? 'Windows dual-boot style' : 'UTC, recommended'}</small>}</span>],
+                ['NTP service', data.ntpService ? <StatusPill key="u" status={data.ntpService.active ? 'active' : 'inactive'}>{data.ntpService.unit}: {data.ntpService.state}</StatusPill> : <span key="u" className="muted">no NTP daemon unit found</span>]]} />
+              {!data.ntpService && <p className="muted" style={{ marginTop: 10 }}>None of systemd-timesyncd, chrony or ntpd is installed; the clock cannot be synchronised until one is.</p>}
             </Card>
             <Card title="Change timezone and NTP">
               {!data.timedatectl && <CapabilityNotice error={{ code: 'capability_missing', message: 'timedatectl (systemd) is not available on this server, so the timezone and NTP cannot be changed from the panel.' }} onRetry={refetch} />}
-              <Field label="Find a timezone" help="Type a city or region to filter the list"><TextInput value={filter} onChange={setFilter} placeholder="e.g. Berlin, New_York, Tokyo" /></Field>
+              <Field label="Find a timezone" help="Type a city or region to filter the list"><TextInput value={filter} onChange={setFilter} placeholder="Berlin, New_York, Tokyo" /></Field>
               <Field label="Timezone" help={offset ? `Current offset ${offset}` : undefined}><Select value={zones.includes(timezone) ? timezone : ''} onChange={setTimezone} options={zones} placeholder={zones.includes(timezone) ? undefined : `${timezone} (filtered out)`} /></Field>
               <Field inline><Toggle checked={ntp} onChange={setNtp} label="Synchronise the clock with NTP" description="timedatectl set-ntp; uses systemd-timesyncd or the installed NTP daemon." /></Field>
               <RequestError error={saveError} onRetry={() => setSaveError(null)} />

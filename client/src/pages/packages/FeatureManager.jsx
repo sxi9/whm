@@ -7,12 +7,12 @@ import { useToast } from '../../components/Toast.jsx';
 import { useConfirm } from '../../components/Modal.jsx';
 
 const FEATURE_LABELS = {
-  addondomains: 'Addon Domains', subdomains: 'Subdomains', parkeddomains: 'Aliases (Parked Domains)', filemanager: 'File Manager', ftpaccts: 'FTP Accounts',
-  emailaccts: 'Email Accounts', forwarders: 'Forwarders', autoresponders: 'Autoresponders', defaultaddress: 'Default Address', spamassassin: 'Spam Filters',
-  mysql: 'MySQL Databases', phpmyadmin: 'phpMyAdmin', postgres: 'PostgreSQL', cron: 'Cron Jobs', ssh: 'Terminal / SSH', backup: 'Backups', bandwidth: 'Bandwidth',
-  statselect: 'Metrics Editor', awstats: 'AWStats', webalizer: 'Webalizer', errlog: 'Errors', rawlog: 'Raw Access Logs', sslmanager: 'SSL/TLS', autossl: 'AutoSSL',
-  phpversion: 'PHP Version', multiphp: 'MultiPHP Manager', webdisk: 'Web Disk', api: 'API Access', passwordchange: 'Password & Security', hotlink: 'Hotlink Protection',
-  leechprotect: 'Leech Protection', indexmanager: 'Indexes', errpgs: 'Error Pages', redirects: 'Redirects', cpanelpro_support: 'Support Tickets',
+  addondomains: 'Addon domains', subdomains: 'Subdomains', parkeddomains: 'Aliases (parked domains)', filemanager: 'File manager', ftpaccts: 'FTP accounts',
+  emailaccts: 'Email accounts', forwarders: 'Forwarders', autoresponders: 'Autoresponders', defaultaddress: 'Default address', spamassassin: 'Spam filters',
+  mysql: 'MySQL databases', phpmyadmin: 'phpMyAdmin', postgres: 'PostgreSQL', cron: 'Cron jobs', ssh: 'Terminal and SSH', backup: 'Backups', bandwidth: 'Bandwidth',
+  statselect: 'Metrics editor', awstats: 'AWStats', webalizer: 'Webalizer', errlog: 'Error log', rawlog: 'Raw access logs', sslmanager: 'SSL/TLS', autossl: 'AutoSSL',
+  phpversion: 'PHP version', multiphp: 'MultiPHP manager', webdisk: 'Web disk', api: 'API access', passwordchange: 'Password and security', hotlink: 'Hotlink protection',
+  leechprotect: 'Leech protection', indexmanager: 'Indexes', errpgs: 'Error pages', redirects: 'Redirects', cpanelpro_support: 'Support tickets',
 };
 
 export default function FeatureManager({ fn }) {
@@ -37,7 +37,7 @@ export default function FeatureManager({ fn }) {
   };
   const remove = async () => {
     if (!(await confirm({ title: `Delete feature list "${name}"?`, confirmLabel: 'Delete', danger: true }))) return;
-    try { await api.delete(`/packages/feature-lists/${name}`); toast.success('Deleted'); setName('default'); refetch(); } catch (err) { toast.error(err); }
+    try { await api.delete(`/packages/feature-lists/${name}`); toast.success(`Deleted "${name}"`); setName('default'); refetch(); } catch (err) { toast.error(err); }
   };
   const setAll = (v) => setFeatures((f) => Object.fromEntries(Object.keys(f).map((k) => [k, v])));
 
@@ -47,13 +47,13 @@ export default function FeatureManager({ fn }) {
       <Card title="Feature lists">
         <div className="form-grid">
           <Field label="Edit feature list"><Select value={name} onChange={setName} options={(lists || []).map((l) => ({ value: l.name, label: `${l.name} (${l.packages} package${l.packages === 1 ? '' : 's'})` }))} /></Field>
-          <Field label="Add a new feature list" help="Starts as a copy of the list selected on the left">
+          <Field label="Add a new feature list" help="Starts as a copy of the list selected on the left.">
             <div className="input-group"><TextInput value={newName} onChange={setNewName} placeholder="e.g. Business" /><Button onClick={create} disabled={!newName}>Add</Button></div>
           </Field>
         </div>
       </Card>
       {features && (
-        <Card title={`Features in "${name}"`} actions={<><button className="link-button" onClick={() => setAll(true)}>Select all</button><button className="link-button" onClick={() => setAll(false)}>Select none</button></>}>
+        <Card title={`Features in "${name}"`} actions={<><Button variant="ghost" size="sm" onClick={() => setAll(true)}>Select all</Button><Button variant="ghost" size="sm" onClick={() => setAll(false)}>Select none</Button></>}>
           <div className="form-grid">
             {Object.keys(features).sort((a, b) => (FEATURE_LABELS[a] || a).localeCompare(FEATURE_LABELS[b] || b)).map((key) => (
               <Field key={key} inline><Toggle checked={features[key]} onChange={(v) => setFeatures((f) => ({ ...f, [key]: v }))} label={FEATURE_LABELS[key] || key} /></Field>

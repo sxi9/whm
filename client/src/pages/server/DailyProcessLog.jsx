@@ -29,7 +29,7 @@ function DayChart({ series, metrics }) {
   const [hover, setHover] = useState(null);
   const W = 760, H = 220, PL = 44, PR = 12, PT = 12, PB = 28;
   const points = series.filter((p) => metrics.some((m) => p[SERIES[m].key] != null));
-  if (points.length < 2) return <div className="muted" style={{ padding: 12 }}>At least two samples are needed to draw a chart. The sampler runs every 5 minutes.</div>;
+  if (points.length < 2) return <div className="card-body muted">The chart appears once two samples exist for this day; the sampler runs every 5 minutes.</div>;
   const t0 = new Date(points[0].at.replace(' ', 'T') + 'Z').getTime();
   const t1 = new Date(points.at(-1).at.replace(' ', 'T') + 'Z').getTime();
   const x = (p) => PL + ((new Date(p.at.replace(' ', 'T') + 'Z').getTime() - t0) / Math.max(1, t1 - t0)) * (W - PL - PR);
@@ -54,14 +54,14 @@ function DayChart({ series, metrics }) {
         {hover != null && metrics.map((m) => <circle key={m} cx={x(points[hover])} cy={y(points[hover][SERIES[m].key])} r="4" fill={SERIES[m].color} />)}
       </svg>
       {hover != null && (
-        <div className="card" style={{ position: 'absolute', top: 8, right: 8, padding: '8px 10px', fontSize: 12, pointerEvents: 'none' }}>
-          <strong>{timeOf(points[hover].at)}</strong>
-          {metrics.map((m) => <div key={m}><span style={{ display: 'inline-block', width: 8, height: 8, background: SERIES[m].color, marginRight: 6, borderRadius: 2 }} />{SERIES[m].label}: {points[hover][SERIES[m].key] == null ? '—' : `${Number(points[hover][SERIES[m].key]).toFixed(2)}${SERIES[m].unit}`}</div>)}
-          <div className="muted">{points[hover].processCount} processes · {formatBytes(points[hover].memUsedBytes)} used</div>
+        <div className="card" style={{ position: 'absolute', top: 8, right: 8, padding: '8px 10px', margin: 0, pointerEvents: 'none' }}>
+          <small style={{ display: 'block' }}><strong>{timeOf(points[hover].at)}</strong></small>
+          {metrics.map((m) => <small key={m} style={{ display: 'block' }}><span style={{ display: 'inline-block', width: 8, height: 8, background: SERIES[m].color, marginRight: 6, borderRadius: 2 }} />{SERIES[m].label}: {points[hover][SERIES[m].key] == null ? '—' : `${Number(points[hover][SERIES[m].key]).toFixed(2)}${SERIES[m].unit}`}</small>)}
+          <small className="muted" style={{ display: 'block' }}>{points[hover].processCount} processes · {formatBytes(points[hover].memUsedBytes)} used</small>
         </div>
       )}
-      <div className="row-actions" style={{ flexWrap: 'wrap', justifyContent: 'flex-start', gap: 12, padding: '8px 12px', fontSize: 12 }}>
-        {metrics.map((m) => <span key={m}><span style={{ display: 'inline-block', width: 10, height: 10, background: SERIES[m].color, marginRight: 6, borderRadius: 2, verticalAlign: 'middle' }} />{SERIES[m].label}</span>)}
+      <div className="row-actions muted" style={{ flexWrap: 'wrap', justifyContent: 'flex-start', gap: 12, padding: '8px 12px' }}>
+        {metrics.map((m) => <small key={m}><span style={{ display: 'inline-block', width: 10, height: 10, background: SERIES[m].color, marginRight: 6, borderRadius: 2, verticalAlign: 'middle' }} />{SERIES[m].label}</small>)}
       </div>
     </div>
   );
@@ -92,9 +92,9 @@ function SettingsCard({ settings, days, onSaved }) {
   return (
     <Card title="Sampler" subtitle={settings.schedule ? `${settings.schedule.cron} · next run ${settings.schedule.nextRunAt ? formatDate(settings.schedule.nextRunAt) : '—'}` : 'Schedule not registered'}>
       <ErrorBanner error={error} />
-      <Toggle checked={form.enabled} onChange={(v) => setForm({ ...form, enabled: v })} label="Record processes every 5 minutes" description="This switch is authoritative; the process-log-sampler schedule under Server Configuration > Configure cPanel Cron Jobs follows it, and scheduled runs record nothing while it is off." />
+      <Toggle checked={form.enabled} onChange={(v) => setForm({ ...form, enabled: v })} label="Record processes every 5 minutes" description="This switch is authoritative; the process-log-sampler schedule under Server Configuration › Configure Panel Cron Jobs follows it, and scheduled runs record nothing while it is off." />
       {settings.schedule && settings.schedule.enabled !== settings.enabled && (
-        <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>The process-log-sampler schedule is currently {settings.schedule.enabled ? 'enabled' : 'paused'} in Configure cPanel Cron Jobs; it is realigned to this setting on the next save or panel restart.</div>
+        <small className="muted" style={{ display: 'block', marginTop: 6 }}>The process-log-sampler schedule is currently {settings.schedule.enabled ? 'enabled' : 'paused'} in Configure Panel Cron Jobs; it is realigned to this setting on the next save or panel restart.</small>
       )}
       <div className="form-grid" style={{ marginTop: 12 }}>
         <Field label="Processes per sample" help="Top N by CPU plus top N by memory, de-duplicated."><NumberInput value={form.topN} onChange={(v) => setForm({ ...form, topN: v })} min={1} max={200} nullable={false} /></Field>
@@ -148,7 +148,7 @@ export default function DailyProcessLog({ fn }) {
     <>
       <PageHeader fn={fn} description="Every 5 minutes the panel records the busiest processes by CPU and memory. Pick a day (UTC) to see how the load developed, which programs and which users caused it. CPU figures are the %CPU column of ps: each process's lifetime average, summed, not an instantaneous reading." actions={<>
         <Button loading={sampling} onClick={sampleNow}>Sample now</Button>
-        <button className="btn" onClick={() => { days.refetch(); day.refetch(); }}>Refresh</button>
+        <Button onClick={() => { days.refetch(); day.refetch(); }}>Refresh</Button>
       </>} />
       <RequestError error={days.error} onRetry={days.refetch} />
       {days.loading && !days.data && <Loading />}
@@ -157,7 +157,7 @@ export default function DailyProcessLog({ fn }) {
           {!available.length && (
             <Card>
               <EmptyState title="No samples recorded yet">
-                {days.data.settings.enabled ? <p>The sampler runs every 5 minutes while the panel is up; the first day appears after the first run. Use "Sample now" to record one immediately.</p> : <p>The sampler is paused. Enable it below or use "Sample now".</p>}
+                {days.data.settings.enabled ? <p>The sampler runs every 5 minutes while the panel is up; the first day appears here after the first run. Use "Sample now" to record one immediately.</p> : <p>The sampler is paused. Enable it below or use "Sample now" to record one immediately.</p>}
               </EmptyState>
             </Card>
           )}
@@ -167,21 +167,21 @@ export default function DailyProcessLog({ fn }) {
                 <Field label="Day"><Select value={date} onChange={(v) => { setDate(v); setUser(''); }} options={available.map((d) => ({ value: d.day, label: `${d.day} · ${d.samples} samples · peak load ${d.peakLoad1 == null ? '—' : d.peakLoad1.toFixed(2)}` }))} /></Field>
                 <Field label="User" help="Aggregate the day for one system user."><Select value={user} onChange={setUser} placeholder="All users" options={users.map((u) => ({ value: u.user, label: `${u.user} (${u.commands} program${u.commands === 1 ? '' : 's'})` }))} /></Field>
               </div>
-              {selected && (
-                <div className="stat-grid">
-                  <div className="stat"><div className="label">Samples</div><div className="value">{selected.samples}</div><small className="muted">{selected.firstAt ? `${timeOf(selected.firstAt)} – ${timeOf(selected.lastAt)} UTC` : ''}</small></div>
-                  <div className="stat"><div className="label">Peak load (1 min)</div><div className="value">{selected.peakLoad1 == null ? '—' : selected.peakLoad1.toFixed(2)}</div><small className="muted">average {selected.avgLoad1 == null ? '—' : selected.avgLoad1.toFixed(2)}</small></div>
-                  <div className="stat"><div className="label">Peak CPU (ps %CPU)</div><div className="value">{selected.peakCpu == null ? '—' : `${selected.peakCpu.toFixed(1)}%`}</div><small className="muted">average {selected.avgCpu == null ? '—' : `${selected.avgCpu.toFixed(1)}%`}</small></div>
-                  <div className="stat"><div className="label">Peak memory</div><div className="value">{selected.peakMem == null ? '—' : `${selected.peakMem.toFixed(1)}%`}</div><small className="muted">sum of process RSS shares</small></div>
-                </div>
-              )}
             </Card>
+          )}
+          {selected && (
+            <div className="stat-grid" style={{ marginBottom: 18 }}>
+              <div className="stat"><div className="label">Samples</div><div className="value">{selected.samples}</div><small className="muted">{selected.firstAt ? `${timeOf(selected.firstAt)} – ${timeOf(selected.lastAt)} UTC` : ''}</small></div>
+              <div className="stat"><div className="label">Peak load (1 min)</div><div className="value">{selected.peakLoad1 == null ? '—' : selected.peakLoad1.toFixed(2)}</div><small className="muted">average {selected.avgLoad1 == null ? '—' : selected.avgLoad1.toFixed(2)}</small></div>
+              <div className="stat"><div className="label">Peak CPU (ps %CPU)</div><div className="value">{selected.peakCpu == null ? '—' : `${selected.peakCpu.toFixed(1)}%`}</div><small className="muted">average {selected.avgCpu == null ? '—' : `${selected.avgCpu.toFixed(1)}%`}</small></div>
+              <div className="stat"><div className="label">Peak memory</div><div className="value">{selected.peakMem == null ? '—' : `${selected.peakMem.toFixed(1)}%`}</div><small className="muted">sum of process RSS shares</small></div>
+            </div>
           )}
           {date && (
             <>
               <RequestError error={day.error} onRetry={day.refetch} />
-              <Card title={`Usage over ${date}${user ? ` · ${user}` : ''}`} padded={false} actions={<div className="row-actions" style={{ flexWrap: 'wrap' }}>
-                {['cpu', 'mem', 'load'].map((m) => <button key={m} className={`btn btn-sm ${metrics.includes(m) ? 'btn-primary' : ''}`} onClick={() => toggleMetric(m)}>{m === 'cpu' ? 'CPU' : m === 'mem' ? 'Memory' : 'Load'}</button>)}
+              <Card title={`Usage over ${date}${user ? ` · ${user}` : ''}`} padded={false} actions={<div className="segmented" role="group" aria-label="Metrics">
+                {['cpu', 'mem', 'load'].map((m) => <button key={m} type="button" className={metrics.includes(m) ? 'active' : ''} aria-pressed={metrics.includes(m)} onClick={() => toggleMetric(m)}>{m === 'cpu' ? 'CPU' : m === 'mem' ? 'Memory' : 'Load'}</button>)}
               </div>}>
                 {day.loading && !day.data ? <Loading /> : day.data ? <DayChart series={day.data.series} metrics={effectiveMetrics} /> : null}
               </Card>
@@ -192,7 +192,7 @@ export default function DailyProcessLog({ fn }) {
                 {tab === 'processes' && (
                   <DataTable
                     columns={[
-                      { key: 'command', label: 'Program', render: (p) => <><code>{p.command}</code>{p.args && <div><small className="muted">{p.args}</small></div>}</> },
+                      { key: 'command', label: 'Program', render: (p) => <div style={{ maxWidth: 420, wordBreak: 'break-all' }}><code>{p.command}</code>{p.args && <div><small className="muted">{p.args}</small></div>}</div> },
                       { key: 'user', label: 'User' },
                       { key: 'avgCpu', label: 'Avg CPU %', align: 'right', render: (p) => p.avgCpu.toFixed(1) },
                       { key: 'peakCpu', label: 'Peak CPU %', align: 'right', render: (p) => p.peakCpu.toFixed(1) },
@@ -235,7 +235,7 @@ export default function DailyProcessLog({ fn }) {
                   />
                 )}
               </Card>
-              <div className="action-row"><Button variant="danger" onClick={purge}>Delete this day's log</Button></div>
+              <div className="action-row"><Button variant="danger-ghost" onClick={purge}>Delete this day's log</Button></div>
             </>
           )}
           <SettingsCard settings={days.data.settings} days={available} onSaved={() => days.refetch(true)} />
@@ -258,11 +258,11 @@ export default function DailyProcessLog({ fn }) {
                 { key: 'memPercent', label: 'Mem %', align: 'right', render: (p) => p.memPercent.toFixed(1) },
                 { key: 'rssBytes', label: 'RSS', align: 'right', render: (p) => formatBytes(p.rssBytes) },
                 { key: 'elapsedSeconds', label: 'Running', render: (p) => formatDuration(p.elapsedSeconds) },
-                { key: 'command', label: 'Command', render: (p) => <><code>{p.command}</code> <small className="muted">{p.args}</small></> },
+                { key: 'command', label: 'Command', render: (p) => <div style={{ maxWidth: 420, wordBreak: 'break-all' }}><code>{p.command}</code> {p.args && <small className="muted">{p.args}</small>}</div> },
               ]}
               rows={open.entries} rowKey={(p) => p.pid} dense
             />
-            <p className="muted" style={{ marginTop: 10 }}>{open.entries.length ? <StatusPill status="info">historical</StatusPill> : null} Processes that are still running can be managed under System Health › Process Manager.</p>
+            <p className="muted" style={{ marginTop: 10, marginBottom: 0 }}>{open.entries.length ? <StatusPill status="info">historical</StatusPill> : null} Processes that are still running can be managed under System Health › Process Manager.</p>
           </>
         )}
       </Modal>

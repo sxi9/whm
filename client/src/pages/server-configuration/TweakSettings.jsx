@@ -1,6 +1,16 @@
+import { useApi } from '../../hooks/useApi.js';
 import { ConfigPage } from '../../components/ConfigPage.jsx';
 
+function loginThemeOptions(themes, current) {
+  const options = themes.filter((t) => t.enabled).map((t) => ({ value: t.slug, label: `${t.name} (${t.slug})${t.builtin ? ' · built-in' : ''}` }));
+  if (current && !options.some((o) => o.value === current)) options.push({ value: current, label: `${current} · not available` });
+  return options;
+}
+
 export default function TweakSettings({ fn }) {
+  const themesRes = useApi('/themes');
+  const settingsRes = useApi('/system/settings?prefix=tweak.login_theme');
+  const themeOptions = loginThemeOptions(themesRes.data || [], settingsRes.data?.['tweak.login_theme']);
   return (
     <ConfigPage fn={fn} prefix="" groups={[
       { title: 'Mail', fields: [
@@ -9,7 +19,7 @@ export default function TweakSettings({ fn }) {
       ] },
       { title: 'Accounts', fields: [
         { key: 'tweak.prevent_unlimited_bandwidth', label: 'Prevent unlimited bandwidth on new accounts', type: 'toggle' },
-        { key: 'tweak.login_theme', label: 'Login theme', type: 'select', options: ['jupiter', 'paper_lantern'] },
+        { key: 'tweak.login_theme', label: 'Login theme', type: 'select', options: themeOptions, help: 'Enabled themes from Themes › Theme Manager.' },
       ] },
       { title: 'Security', fields: [
         { key: 'security.min_password_strength', label: 'Minimum password strength', type: 'number', min: 0, max: 100, help: '0–100. Applied to account and panel passwords.' },

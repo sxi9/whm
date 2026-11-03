@@ -9,7 +9,7 @@ import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, downloadText } from '../../development/Shared.jsx';
 
 const EMPTY = { name: '', displayName: '', url: '', entryUrl: '', service: 'whm', description: '', icon: '', acls: ['all'], features: [], display: true, enabled: true, customAcl: '' };
-const SERVICES = [{ value: 'whm', label: 'WHM (administrators and resellers)' }, { value: 'cpanel', label: 'cPanel (account users)' }, { value: 'webmail', label: 'Webmail' }];
+const SERVICES = [{ value: 'whm', label: 'Admin panel (administrators and resellers)' }, { value: 'cpanel', label: 'Account panel (account users)' }, { value: 'webmail', label: 'Webmail' }];
 
 export default function AppsManagedByAppConfig({ fn }) {
   const toast = useToast();
@@ -52,7 +52,7 @@ export default function AppsManagedByAppConfig({ fn }) {
     <>
       <PageHeader fn={fn} actions={<><Button icon={Upload} onClick={() => setImportText('')}>Import .conf</Button><Button variant="primary" icon={Plus} onClick={() => openEditor(null)}>Register app</Button></>} />
       <RequestError error={apps.error} onRetry={apps.refetch} />
-      <Card padded={false} title="Registered applications" subtitle="Third-party and custom apps that appear in WHM, cPanel or Webmail. ACLs decide which resellers see a WHM app; cPanel apps can be gated by feature-list keys.">
+      <Card padded={false} title="Registered applications" subtitle="Third-party and custom apps that appear in the admin panel, the account panel or webmail. ACLs decide which resellers see an admin-panel app; account-panel apps can be gated by feature-list keys.">
         {apps.loading && !apps.data && <Loading />}
         {apps.data && (
           <div className="table-wrap">
@@ -84,7 +84,7 @@ export default function AppsManagedByAppConfig({ fn }) {
         )}
       </Card>
       <Card title="Launchable by you" subtitle="What GET /api/development/appconfig/launch returns for the current session: enabled, displayed apps whose ACLs you hold.">
-        {launch.data && (launch.data.length === 0 ? <p className="muted">Nothing to launch yet.</p> : (
+        {launch.data && (launch.data.length === 0 ? <p className="muted">Apps you can open appear here once one is registered, enabled and shown in menus.</p> : (
           <div className="tool-grid">
             {launch.data.map((a) => (
               <div key={a.id} className="tool-card">
@@ -112,7 +112,7 @@ export default function AppsManagedByAppConfig({ fn }) {
               <div className="form-grid" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(190px, 1fr))' }}>
                 {[...new Set([...(acls.data || []), ...editor.acls])].map((key) => <label key={key} className="radio"><input type="checkbox" checked={editor.acls.includes(key)} onChange={() => toggleAcl(key)} /> <span><code>{key}</code></span></label>)}
               </div>
-              <div className="input-group" style={{ marginTop: 8, maxWidth: 360 }}><input className="input" placeholder="custom-acl-key" value={editor.customAcl} onChange={(e) => setEditor({ ...editor, customAcl: e.target.value })} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addCustomAcl(); } }} /><Button onClick={addCustomAcl}>Add</Button></div>
+              <div className="input-group" style={{ marginTop: 8, maxWidth: 360 }}><TextInput placeholder="custom-acl-key" value={editor.customAcl} onChange={(v) => setEditor({ ...editor, customAcl: v })} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addCustomAcl(); } }} /><Button onClick={addCustomAcl}>Add</Button></div>
             </Field>
             {editor.service !== 'whm' && <Field label="Required feature-list keys" help="Space or comma separated, e.g. ssl filemanager"><TextInput value={editor.features.join(' ')} onChange={(v) => setEditor({ ...editor, features: v.split(/[\s,]+/).filter(Boolean) })} /></Field>}
             <Toggle checked={editor.display} onChange={(v) => setEditor({ ...editor, display: v })} label="Show in menus" description="Hidden apps stay registered for API use only." />
@@ -123,7 +123,7 @@ export default function AppsManagedByAppConfig({ fn }) {
       </Modal>
 
       <Modal open={importText !== null} title="Import an AppConfig file" onClose={() => setImportText(null)} size="lg" footer={<><Button onClick={() => setImportText(null)}>Cancel</Button><Button variant="primary" disabled={!importText?.trim()} onClick={doImport}>Parse and review</Button></>}>
-        <p className="small muted">Paste a cPanel-style <code>/var/cpanel/apps/&lt;name&gt;.conf</code>: <code>name=</code>, <code>service=</code>, <code>url=</code>, <code>displayname=</code>, <code>acls=</code>, <code>features=</code>. You review the result before it is saved.</p>
+        <p className="small muted">Paste a cPanel-compatible <code>/var/cpanel/apps/&lt;name&gt;.conf</code>: <code>name=</code>, <code>service=</code>, <code>url=</code>, <code>displayname=</code>, <code>acls=</code>, <code>features=</code>. You review the result before it is saved.</p>
         <Textarea mono rows={10} value={importText || ''} onChange={setImportText} placeholder={'name=billing\nservice=whm\nurl=/cgi/billing/index.cgi\ndisplayname=Billing Portal\nacls=list-accts,create-acct'} />
       </Modal>
     </>

@@ -55,7 +55,7 @@ export default function SpamdStartupConfiguration({ fn }) {
         <>
           <Card title="Daemon">
             <KeyValue items={[
-              ['spamd unit', data.unit ? <span key="u"><StatusPill status={data.unit.active === 'active' ? 'active' : 'inactive'}>{data.unit.name}: {data.unit.active}{data.unit.sub ? ` (${data.unit.sub})` : ''}</StatusPill></span> : <StatusPill key="n" status="unknown">no systemd unit found</StatusPill>],
+              ['spamd unit', data.unit ? <span key="u"><code>{data.unit.name}</code> <StatusPill status={data.unit.active === 'active' ? 'active' : 'inactive'}>{data.unit.active}{data.unit.sub ? ` (${data.unit.sub})` : ''}</StatusPill></span> : <span key="n"><StatusPill status="unknown">missing</StatusPill> <span className="muted">no systemd unit found</span></span>],
               ['Options file', <code key="p">{data.path}</code>],
               ['Current OPTIONS', <code key="o">{data.optionString || '(empty)'}</code>],
               data.localCf && ['Rules (local.cf)', <code key="l">{data.localCf}</code>],

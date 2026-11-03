@@ -1,6 +1,6 @@
 import { useApi } from '../../hooks/useApi.js';
 import { PageHeader, Card, KeyValue, Loading, formatBytes, formatDuration } from '../../components/Common.jsx';
-import { ErrorBanner } from '../../components/Form.jsx';
+import { Button, ErrorBanner } from '../../components/Form.jsx';
 
 function Meter({ used, total }) {
   const pct = total ? Math.round((used / total) * 100) : 0;
@@ -14,7 +14,7 @@ export default function ServerInformation({ fn }) {
   const { memory: m } = data;
   return (
     <>
-      <PageHeader fn={fn} actions={<button className="btn" onClick={() => refetch()}>Refresh</button>} />
+      <PageHeader fn={fn} actions={<Button onClick={() => refetch()}>Refresh</Button>} />
       <div className="stat-grid" style={{ marginBottom: 18 }}>
         <div className="stat"><div className="label">Load average (1 / 5 / 15 min)</div><div className="value">{data.loadAverage.map((n) => n.toFixed(2)).join(' / ')}</div></div>
         <div className="stat"><div className="label">Uptime</div><div className="value">{formatDuration(data.uptimeSeconds)}</div></div>

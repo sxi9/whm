@@ -9,10 +9,10 @@ import { useToast } from '../../../components/Toast.jsx';
 import { publishMessage } from '../../dns/ZonePicker.jsx';
 
 const ROUTING = [
-  { value: 'local', label: 'Local Mail Exchanger', description: 'This server accepts mail for the domain. MX → mail.<domain> (priority 0).' },
-  { value: 'backup', label: 'Backup Mail Exchanger', description: 'Remote servers deliver first; this server queues mail when they are down. Your MX hosts plus a lower-priority local MX.' },
-  { value: 'remote', label: 'Remote Mail Exchanger', description: 'Mail is handled elsewhere (e.g. Google Workspace). This server does not accept mail for the domain.' },
-  { value: 'auto', label: 'Automatically Detect Configuration', description: 'Decide from the MX records: local when this server is the primary MX, backup when it is a lower-priority MX, remote otherwise. MX records are left as they are.' },
+  { value: 'local', label: 'Local mail exchanger', description: 'This server accepts mail for the domain. The MX record points to mail.<domain> with priority 0.' },
+  { value: 'backup', label: 'Backup mail exchanger', description: 'Remote servers deliver first; this server queues mail when they are down. Your MX hosts plus a lower-priority local MX.' },
+  { value: 'remote', label: 'Remote mail exchanger', description: 'Mail is handled elsewhere (for example Google Workspace). This server does not accept mail for the domain.' },
+  { value: 'auto', label: 'Detect automatically', description: 'Decide from the MX records: local when this server is the primary MX, backup when it is a lower-priority MX, remote otherwise. MX records are left as they are.' },
 ];
 
 function RoutingForm({ row, onSaved, onCancel }) {
@@ -39,7 +39,9 @@ function RoutingForm({ row, onSaved, onCancel }) {
       <ErrorBanner error={error && !error.fields && error.code !== 'capability_missing' ? error : null} />
       <RadioGroup name="routing" value={routing} onChange={setRouting} options={ROUTING} />
       {needsMx && (
-        <Card title="External mail exchangers" subtitle="Lowest priority is tried first">
+        <div style={{ marginTop: 16 }}>
+          <h3>External mail exchangers</h3>
+          <p className="muted">Lowest priority is tried first.</p>
           {error?.fields?.exchanges && <div className="field-message">{error.fields.exchanges.join(', ')}</div>}
           {exchanges.map((e, i) => (
             <div className="form-grid" key={i}>
@@ -48,7 +50,7 @@ function RoutingForm({ row, onSaved, onCancel }) {
             </div>
           ))}
           <Button size="sm" onClick={() => setExchanges((l) => [...l, { priority: (l.length + 1) * 10, exchange: '' }])}>Add exchanger</Button>
-        </Card>
+        </div>
       )}
       <FormActions><Button variant="primary" loading={busy} onClick={save}>Save routing</Button><Button onClick={onCancel}>Cancel</Button></FormActions>
     </>
@@ -70,9 +72,9 @@ export default function EmailRoutingConfiguration({ fn }) {
             { key: 'account', label: 'Account', render: (r) => r.account || <span className="muted">—</span> },
             { key: 'routing', label: 'Routing', render: (r) => <StatusPill status={{ local: 'ok', remote: 'info', backup: 'warning', auto: 'unknown' }[r.routing]}>{ROUTING.find((o) => o.value === r.routing)?.label || r.routing}</StatusPill> },
             { key: 'effective', label: 'Effective', render: (r) => <StatusPill status={{ local: 'ok', remote: 'info', backup: 'warning' }[r.effective] || 'unknown'}>{r.routing === 'auto' ? `auto → ${r.effective}` : r.effective}</StatusPill> },
-            { key: 'mx', label: 'MX records', render: (r) => (r.mx.length ? <span style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>{r.mx.map((m) => `${m.priority} ${m.value}`).join(', ')}</span> : <span className="muted">none</span>) },
+            { key: 'mx', label: 'MX records', render: (r) => (r.mx.length ? <code className="small">{r.mx.map((m) => `${m.priority} ${m.value}`).join(', ')}</code> : <span className="muted">none</span>) },
           ]}
-          rows={rows} loading={loading} error={error} rowKey={(r) => r.domain} emptyText="No zones yet; add a DNS zone first."
+          rows={rows} loading={loading} error={error} rowKey={(r) => r.domain} emptyText="No zones yet. Each zone appears here with its mail routing once one is added."
           toolbar={<TextInput value={filter} onChange={setFilter} placeholder="Filter domains" style={{ width: 220 }} />}
           rowActions={(r) => [{ label: 'Configure', primary: true, onClick: () => setEditing(r) }]}
         />

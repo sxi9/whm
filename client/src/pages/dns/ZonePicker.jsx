@@ -23,10 +23,10 @@ export function ZonePicker({ value, onChange, label = 'Zone' }) {
   return (
     <div className="form-grid">
       <Field label="Filter"><TextInput value={filter} onChange={setFilter} placeholder="Type to filter by domain or account" /></Field>
-      <Field label={label} help={loading ? 'Loading zones…' : error ? error.message : `${zones.length} zone(s)`}>
+      <Field label={label} help={loading ? 'Loading zones…' : error ? error.message : zones.length ? `${zones.length} zone(s)` : 'Zones created with Add a DNS Zone appear here'}>
         <Select value={value} onChange={onChange} options={options} placeholder={zones.length ? 'Select a zone' : 'No zones yet'} />
       </Field>
-      {error && <button className="link-button" onClick={refetch}>Retry</button>}
+      {error && <div><button type="button" className="link-button" onClick={refetch}>Retry</button></div>}
     </div>
   );
 }
@@ -41,10 +41,12 @@ export function useZone(domain) {
 // host", and flag a zone whose named.conf stanza the operator wrote by hand.
 export function PublishBadge({ result }) {
   if (!result || result.applied == null) return null;
-  if (result.applied === false) return <StatusPill status="warning">Saved, not published: BIND is not installed</StatusPill>;
-  if (result.reloadError) return <StatusPill status="warning">Written (serial {result.serial}) but reload failed: {result.reloadError}</StatusPill>;
-  if (result.external) return <StatusPill status="warning">Published · serial {result.serial} · zone declared outside the panel include{result.file ? ` (${result.file})` : ''}</StatusPill>;
-  return <StatusPill status="ok">Published · serial {result.serial}</StatusPill>;
+  let pill; let detail;
+  if (result.applied === false) { pill = <StatusPill status="warning">Not published</StatusPill>; detail = 'BIND is not installed'; }
+  else if (result.reloadError) { pill = <StatusPill status="warning">Reload failed</StatusPill>; detail = `serial ${result.serial} written; ${result.reloadError}`; }
+  else if (result.external) { pill = <StatusPill status="warning">Published</StatusPill>; detail = `serial ${result.serial}, zone declared outside the panel include${result.file ? ` (${result.file})` : ''}`; }
+  else { pill = <StatusPill status="ok">Published</StatusPill>; detail = `serial ${result.serial}`; }
+  return <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>{pill}<span className="muted">{detail}</span></span>;
 }
 
 export function publishMessage(result, verb = 'saved') {

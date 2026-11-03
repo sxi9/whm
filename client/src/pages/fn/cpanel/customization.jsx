@@ -77,7 +77,11 @@ function ImageCard({ kind, descriptor, onChanged }) {
         </div>
         <div>
           <Field label={`Upload a new ${spec.label.toLowerCase()}`} htmlFor={`${kind}-file`}>
-            <input id={`${kind}-file`} className="input" type="file" accept={spec.accept} onChange={(e) => setFile(e.target.files?.[0] || null)} />
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
+              <input id={`${kind}-file`} type="file" accept={spec.accept} hidden onChange={(e) => setFile(e.target.files?.[0] || null)} />
+              <label htmlFor={`${kind}-file`} className="btn">Choose file</label>
+              <span className={file ? '' : 'muted'}>{file ? file.name : 'No file chosen'}</span>
+            </div>
           </Field>
           <div className="action-row">
             <Button variant="primary" loading={busy} disabled={!file} onClick={upload}>Upload</Button>

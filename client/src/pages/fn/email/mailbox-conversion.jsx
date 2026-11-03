@@ -1,13 +1,12 @@
 import { useState } from 'react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
-import { PageHeader, Card, KeyValue, formatBytes } from '../../../components/Common.jsx';
+import { PageHeader, Card, KeyValue, CapabilityNotice, formatBytes } from '../../../components/Common.jsx';
 import { Field, TextInput, Select, Toggle, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { ProgressLog } from '../../../components/ProgressLog.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, AccountPicker, useMailStatus } from '../../email/Shared.jsx';
-import { CapabilityNotice } from '../../../components/Common.jsx';
 
 const FORMATS = [{ value: 'maildir', label: 'Maildir (one file per message)' }, { value: 'mdbox', label: 'mdbox (Dovecot multi-message files)' }, { value: 'sdbox', label: 'sdbox (Dovecot single-message files)' }, { value: 'mbox', label: 'mbox (one file per folder)' }];
 

@@ -101,8 +101,8 @@ export function TerminalView({ session, onExit, onClosed }) {
         <span className="muted">Click the terminal and type. Ctrl+Shift+C / Ctrl+Shift+V copy and paste; Ctrl+C interrupts.</span>
       </div>
       <pre ref={boxRef} className="log terminal" tabIndex={0} role="textbox" aria-label="Terminal" aria-multiline="true" onKeyDown={onKeyDown} onPaste={onPaste} onClick={() => boxRef.current?.focus()}
-        style={{ maxHeight: 'none', height: '60vh', minHeight: 320, outline: 'none', cursor: 'text', whiteSpace: 'pre', fontSize: 13, lineHeight: '18px' }}>
-        {state.lines.join('\n')}<span style={{ background: '#d7e2ec', color: '#0b1117' }}>{status === 'exited' ? '' : ' '}</span>
+        style={{ maxHeight: 'none', height: '60vh', minHeight: 320, cursor: 'text', whiteSpace: 'pre' }}>
+        {state.lines.join('\n')}<span style={{ background: 'var(--log-text)', color: 'var(--log-bg)' }}>{status === 'exited' ? '' : ' '}</span>
         <div ref={endRef} />
       </pre>
     </div>

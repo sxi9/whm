@@ -12,8 +12,8 @@ import { RequestError, JobCard, LastJob, YesNo } from '../../server-configuratio
 function quotaState(f) {
   if (f.active.user === true) return <StatusPill status="active">active</StatusPill>;
   if (f.active.user === false) return <StatusPill status="inactive">off</StatusPill>;
-  if (!f.supported) return <StatusPill status="unknown">unsupported ({f.fstype})</StatusPill>;
-  if (f.userQuotaMounted || f.ext4QuotaFeature) return <StatusPill status="pending">ready (quotaon needed)</StatusPill>;
+  if (!f.supported) return <StatusPill status="unknown">unsupported</StatusPill>;
+  if (f.userQuotaMounted || f.ext4QuotaFeature) return <><StatusPill status="pending">ready</StatusPill><br /><small className="muted">quotaon needed</small></>;
   return <StatusPill status="warning">not configured</StatusPill>;
 }
 
@@ -53,7 +53,7 @@ export default function InitialQuotaSetup({ fn }) {
         <>
           <div className="form-grid">
             <Card title="Summary" actions={<LastJob job={data.lastJob} />}>
-              <KeyValue items={[['Account homes', <code key="h">{data.homeRoot}</code>], ['Filesystem holding homes', data.homeFilesystem ? <code key="f">{data.homeFilesystem}</code> : 'not found'], ['User quotas on that filesystem', <YesNo key="q" value={data.enabled} yes="enabled" no="not enabled" />], ['Quota tools (quotacheck, quotaon, quotaoff, repquota, setquota)', <YesNo key="t" value={data.toolsInstalled} yes="installed" no="missing" />], ['Package disk limits enforceable', <YesNo key="e" value={data.enforceable} yes="yes" no={data.enabled ? 'no: tools missing' : 'no: quotas not enabled'} />]]} />
+              <KeyValue items={[['Account homes', <code key="h">{data.homeRoot}</code>], ['Filesystem holding homes', data.homeFilesystem ? <code key="f">{data.homeFilesystem}</code> : 'not found'], ['User quotas on that filesystem', <YesNo key="q" value={data.enabled} yes="enabled" no="not enabled" />], ['Quota tools (quotacheck, quotaon, quotaoff, repquota, setquota)', <YesNo key="t" value={data.toolsInstalled} yes="installed" no="missing" />], ['Package disk limits enforceable', <span key="e" className="row-actions" style={{ gap: 8 }}><YesNo value={data.enforceable} yes="yes" no="no" />{!data.enforceable && <small className="muted">{data.enabled ? 'tools missing' : 'quotas not enabled'}</small>}</span>]]} />
               {!data.toolsInstalled && (
                 <div style={{ marginTop: 12 }}>
                   <CapabilityNotice error={{ code: 'capability_missing', message: `The quota tools are not installed. Install the "${data.installPackages.join('", "')}" package, then enable quotas below.` }} onRetry={refetch} />
@@ -76,7 +76,7 @@ export default function InitialQuotaSetup({ fn }) {
               columns={[
                 { key: 'mountpoint', label: 'Mount point', render: (f) => <><code>{f.mountpoint}</code>{f.holdsHomes && <> <StatusPill status="info">homes</StatusPill></>}<br /><small className="muted">{f.device} · {f.fstype}</small></> },
                 { key: 'state', label: 'User quota', render: quotaState },
-                { key: 'mount', label: 'Mounted with quota option', render: (f) => <YesNo value={f.userQuotaMounted || Boolean(f.ext4QuotaFeature)} yes={f.ext4QuotaFeature && !f.userQuotaMounted ? 'ext4 quota feature' : 'yes'} no="no" /> },
+                { key: 'mount', label: 'Mounted with quota option', render: (f) => <><YesNo value={f.userQuotaMounted || Boolean(f.ext4QuotaFeature)} yes="yes" no="no" />{f.ext4QuotaFeature && !f.userQuotaMounted && <><br /><small className="muted">ext4 quota feature</small></>}</> },
                 { key: 'fstab', label: '/etc/fstab', render: (f) => (f.fstab ? <YesNo value={f.fstab.hasUserQuota} yes="has usrquota" no="missing usrquota" /> : <span className="muted">no entry</span>) },
                 { key: 'files', label: 'Quota files', render: (f) => <span className="muted">{f.quotaFiles.user ? 'aquota.user' : '—'}{f.quotaFiles.group ? ', aquota.group' : ''}</span> },
               ]}
@@ -90,8 +90,8 @@ export default function InitialQuotaSetup({ fn }) {
           {data.filesystems.filter((f) => f.proposedFstabLine).length > 0 && (
             <Card title="Required /etc/fstab change" subtitle="Apply this with the button above, or edit the file yourself and remount (or reboot for XFS)">
               {data.filesystems.filter((f) => f.proposedFstabLine).map((f) => (
-                <div key={f.mountpoint} style={{ marginBottom: 10 }}>
-                  <div className="muted">{f.mountpoint} (line {f.fstab.lineNo}):</div>
+                <div key={f.mountpoint} style={{ marginBottom: 12 }}>
+                  <p className="muted">{f.mountpoint} (line {f.fstab.lineNo})</p>
                   <pre className="log">{`- ${f.fstab.line}\n+ ${f.proposedFstabLine}\n\n# then:\nmount -o remount ${f.mountpoint}\nquotacheck -cug -m -f ${f.mountpoint}\nquotaon -ug ${f.mountpoint}`}</pre>
                 </div>
               ))}

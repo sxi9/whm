@@ -9,7 +9,7 @@ const ADDRESS_FIELD = {
   sms: { label: 'Gateway address', placeholder: '5551234567@txt.example.net', help: 'Your carrier\'s email-to-SMS address for the phone. Messages are kept under 300 characters.' },
   slack: { label: 'Incoming webhook URL', placeholder: 'https://hooks.slack.com/services/T000/B000/XXXX', help: 'Create one under Slack → Apps → Incoming Webhooks. The URL is a credential: it is stored encrypted and only shown masked.' },
   pushover: { label: 'User or group key', placeholder: '30-character key from pushover.net', help: 'The application token goes in the field below and is stored encrypted.' },
-  webhook: { label: 'URL', placeholder: 'https://example.com/whm/notify', help: 'Receives a JSON POST { event, severity, subject, body, data, hostname }. With a secret, X-WHM-Signature carries an HMAC-SHA256 of the body. A URL with a query string is stored encrypted and shown masked.' },
+  webhook: { label: 'URL', placeholder: 'https://example.com/hooks/keel', help: 'Receives a JSON POST { event, severity, subject, body, data, hostname }. With a secret, X-WHM-Signature carries an HMAC-SHA256 of the body. A URL with a query string is stored encrypted and shown masked.' },
 };
 
 export function emptyContact() {
@@ -76,19 +76,19 @@ export function ContactForm({ initial, events, channels, severities, onSubmit, o
       </div>
       <Field inline><Toggle checked={draft.allEvents} onChange={(v) => set('allEvents', v)} label="Receive every event" description="Turn off to pick individual events. Events marked “not raised yet” are in the catalog for when their module is wired up." /></Field>
       {!draft.allEvents && (
-        <div className="event-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12, marginBottom: 12 }}>
+        <div className="event-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '12px 20px', marginBottom: 16 }}>
           {groups.map(([group, list]) => {
             const keys = list.map((e) => e.key);
             const checked = keys.filter((k) => draft.events.includes(k)).length;
             return (
-              <div key={group} className="card" style={{ padding: 10, marginBottom: 0 }}>
-                <label className="checkbox" style={{ display: 'flex', gap: 8, alignItems: 'center', fontWeight: 600, marginBottom: 6 }}>
+              <div key={group}>
+                <label className="checkbox" style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6 }}>
                   <input type="checkbox" checked={checked === keys.length} ref={(el) => { if (el) el.indeterminate = checked > 0 && checked < keys.length; }} onChange={() => toggleGroup(keys)} />
-                  {group}
+                  <strong>{group}</strong>
                 </label>
                 {list.map((e) => (
-                  <label key={e.key} className="checkbox" style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 13, padding: '2px 0 2px 22px' }}>
-                    <input type="checkbox" checked={draft.events.includes(e.key)} onChange={() => toggleEvent(e.key)} />
+                  <label key={e.key} className="checkbox" style={{ display: 'flex', gap: 8, alignItems: 'flex-start', padding: '3px 0 3px 25px' }}>
+                    <input type="checkbox" checked={draft.events.includes(e.key)} onChange={() => toggleEvent(e.key)} style={{ marginTop: 2 }} />
                     <span>{e.label} <small className="muted">({e.severity}{e.wired === false ? ', not raised yet' : ''})</small></span>
                   </label>
                 ))}

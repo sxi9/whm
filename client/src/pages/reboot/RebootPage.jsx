@@ -9,12 +9,12 @@ import { DataTable } from '../../components/DataTable.jsx';
 
 const MODES = {
   graceful: {
-    buttonLabel: 'Graceful Reboot',
+    buttonLabel: 'Graceful reboot',
     summary: 'systemd stops every service in dependency order (web, mail, databases, the panel itself) and then reboots. Use this unless the server is unresponsive.',
     command: 'systemctl reboot',
   },
   forceful: {
-    buttonLabel: 'Forceful Reboot',
+    buttonLabel: 'Forceful reboot',
     summary: 'Reboots immediately without waiting for services to stop. Unsaved data in running services (database writes, mail in transit) may be lost. Use only when a graceful reboot hangs.',
     command: 'systemctl reboot --force',
   },
@@ -74,7 +74,7 @@ export function RebootWatcher({ startedAt, mode, onOnline }) {
       <Icon size={18} />
       <div>
         <strong>{label}</strong>
-        <p className="muted">{mode} reboot requested {formatDate(startedAt)} · {checks} health check(s){backAt ? ` · back ${backAt.toLocaleTimeString()}` : ''}</p>
+        <p className="muted">{mode === 'forceful' ? 'Forceful' : 'Graceful'} reboot requested {formatDate(startedAt)} · {checks} health {checks === 1 ? 'check' : 'checks'}{backAt ? ` · back ${backAt.toLocaleTimeString()}` : ''}</p>
         {phase === 'online' && <button className="btn btn-sm" onClick={() => window.location.reload()}>Reload the panel</button>}
       </div>
     </div>
@@ -82,11 +82,20 @@ export function RebootWatcher({ startedAt, mode, onOnline }) {
 }
 
 function requestOutcome(r) {
-  if (r.status === 'failed') return { status: 'failed', label: 'failed' };
-  if (r.completed) return { status: 'done', label: 'completed' };
-  if (r.bootIdChanged) return { status: 'pending', label: 'boot id changed by a later reboot' };
-  if (r.status === 'requested') return { status: 'pending', label: 'requested, outcome not recorded' };
-  return { status: 'pending', label: 'triggered, not yet rebooted' };
+  if (r.status === 'failed') return { status: 'failed', label: 'Failed', detail: r.error || null };
+  if (r.completed) return { status: 'done', label: 'Completed', detail: null };
+  if (r.bootIdChanged) return { status: 'pending', label: 'Superseded', detail: 'the boot id changed with a later reboot' };
+  if (r.status === 'requested') return { status: 'pending', label: 'Requested', detail: 'outcome not recorded' };
+  return { status: 'pending', label: 'Pending', detail: 'triggered, not yet rebooted' };
+}
+
+function Outcome({ outcome }) {
+  return (
+    <>
+      <StatusPill status={outcome.status}>{outcome.label}</StatusPill>
+      {outcome.detail ? <span className="muted"> · {outcome.detail}</span> : null}
+    </>
+  );
 }
 
 export function PreflightSummary({ data, onRecheck, rechecking = false }) {
@@ -98,13 +107,13 @@ export function PreflightSummary({ data, onRecheck, rechecking = false }) {
         ['Hostname', data.hostname ? <code key="h">{data.hostname}</code> : null],
         ['Uptime', data.uptimeSeconds != null ? formatDuration(data.uptimeSeconds) : null],
         ['Load average', data.loadAverage ? data.loadAverage.map((n) => n.toFixed(2)).join(' / ') : null],
-        ['systemd', <StatusPill key="sd" status={data.capability.systemd ? 'installed' : 'not-installed'}>{data.capability.systemd ? 'systemctl available' : 'systemctl missing'}</StatusPill>],
-        ['Reboot required by updates', <span key="rr">{data.rebootRequired == null ? <span className="muted">unknown</span> : <StatusPill status={data.rebootRequired ? 'warning' : 'ok'}>{data.rebootRequired ? 'Yes — pending kernel/library updates' : 'No'}</StatusPill>}{data.rebootRequiredCheckedAt ? <span className="muted"> · checked {formatDate(data.rebootRequiredCheckedAt)}</span> : null}{onRecheck ? <> · <button type="button" className="btn btn-sm btn-ghost" disabled={rechecking} onClick={onRecheck}>{rechecking ? 'checking…' : 're-check'}</button></> : null}</span>],
+        ['systemd', <StatusPill key="sd" status={data.capability.systemd ? 'installed' : 'not-installed'}>{data.capability.systemd ? 'Available' : 'Missing'}</StatusPill>],
+        ['Reboot required by updates', <span key="rr">{data.rebootRequired == null ? <span className="muted">unknown</span> : <><StatusPill status={data.rebootRequired ? 'warning' : 'ok'}>{data.rebootRequired ? 'Yes' : 'No'}</StatusPill>{data.rebootRequired ? <span className="muted"> · pending kernel or library updates</span> : null}</>}{data.rebootRequiredCheckedAt ? <span className="muted"> · checked {formatDate(data.rebootRequiredCheckedAt)}</span> : null}{onRecheck ? <> · <button type="button" className="btn btn-sm btn-ghost" disabled={rechecking} onClick={onRecheck}>{rechecking ? 'Checking…' : 'Re-check'}</button></> : null}</span>],
         ['Running jobs', <StatusPill key="rj" status={data.jobs.running ? 'warning' : 'ok'}>{data.jobs.running}</StatusPill>],
         ['Queued jobs', <StatusPill key="qj" status={data.jobs.queued ? 'warning' : 'ok'}>{data.jobs.queued}</StatusPill>],
         ['Active transfers', data.transfers.available ? <StatusPill key="tr" status={data.transfers.count ? 'warning' : 'ok'}>{data.transfers.count}</StatusPill> : <span key="tr" className="muted">transfers module not loaded</span>],
         ['Active backups', data.backups.available ? <StatusPill key="bk" status={data.backups.count + data.restores.count ? 'warning' : 'ok'}>{data.backups.count + data.restores.count}</StatusPill> : <span key="bk" className="muted">backup module not loaded</span>],
-        data.lastRequest && ['Last panel reboot', <span key="lr">{data.lastRequest.mode} by {data.lastRequest.principal || 'unknown'} {formatDate(data.lastRequest.requested_at)} · <StatusPill status={outcome.status}>{outcome.label}</StatusPill></span>],
+        data.lastRequest && ['Last panel reboot', <span key="lr">{data.lastRequest.mode} by {data.lastRequest.principal || 'unknown'} {formatDate(data.lastRequest.requested_at)} · <Outcome outcome={outcome} /></span>],
       ]} />
       {active ? (
         <div className="banner banner-warning">
@@ -151,7 +160,7 @@ export function RebootHistory({ history, page, onPageChange }) {
           { key: 'mode', label: 'Mode', render: (r) => <StatusPill status={r.mode === 'forceful' ? 'warning' : 'info'}>{r.mode}</StatusPill> },
           { key: 'principal', label: 'By', render: (r) => r.principal || <span className="muted">—</span> },
           { key: 'reason', label: 'Reason', render: (r) => r.reason || <span className="muted">—</span> },
-          { key: 'status', label: 'Result', render: (r) => { const o = requestOutcome(r); return <StatusPill status={o.status}>{r.status === 'failed' ? `failed: ${r.error}` : o.label}</StatusPill>; } },
+          { key: 'status', label: 'Result', render: (r) => <Outcome outcome={requestOutcome(r)} /> },
           { key: 'warnings', label: 'Interrupted work', render: (r) => (r.preflight?.warnings?.length ? r.preflight.warnings.join('; ') : <span className="muted">none</span>) },
         ]}
         rows={data || []} loading={loading} error={error} rowKey={(r) => r.id}
@@ -179,7 +188,7 @@ export default function RebootPage({ fn, mode }) {
   const warnings = data?.warnings || [];
   const confirmMessage = [
     `${spec.buttonLabel.toLowerCase()} of ${data?.hostname || 'this server'} (${spec.command}). Every connection to this server will drop and the panel will be unavailable until it is back.`,
-    mode === 'forceful' ? 'Services are NOT stopped cleanly; data held in memory by running services may be lost.' : null,
+    mode === 'forceful' ? 'Services are not stopped cleanly; data held in memory by running services may be lost.' : null,
     warnings.length ? `Work in progress: ${warnings.join('; ')}.` : null,
   ].filter(Boolean).join(' ');
 
@@ -214,7 +223,7 @@ export default function RebootPage({ fn, mode }) {
               <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>The panel stopped answering while the reboot command was being sent</strong><small>This usually means the reboot started before the response could be delivered ({result.error?.message || 'network error'}). The request was recorded before the command ran; the reboot history shows it as “requested” until the panel is back.</small></div></div>
             )}
             <KeyValue items={[
-              ['Result', <StatusPill key="r" status={result.unconfirmed ? 'pending' : 'ok'}>{result.unconfirmed ? 'reboot most likely in progress' : 'reboot command accepted'}</StatusPill>],
+              ['Result', <span key="r"><StatusPill status={result.unconfirmed ? 'pending' : 'ok'}>{result.unconfirmed ? 'Rebooting' : 'Accepted'}</StatusPill><span className="muted"> · {result.unconfirmed ? 'the reboot is most likely in progress' : 'the reboot command was accepted'}</span></span>],
               ['Mode', result.mode],
               ['Command', <code key="c">{spec.command}</code>],
               result.reason && ['Reason', result.reason],

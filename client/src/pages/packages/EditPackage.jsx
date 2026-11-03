@@ -32,7 +32,7 @@ export default function EditPackage({ fn }) {
   return (
     <>
       <PageHeader fn={fn} />
-      <Card title="Select a package">
+      <Card title="Select a package" subtitle="Its limits and settings appear below once chosen.">
         <Field label="Package"><Select value={name} onChange={setName} options={(packages || []).map((p) => ({ value: p.name, label: `${p.name} (${p.accounts} account${p.accounts === 1 ? '' : 's'})` }))} placeholder="Select a package" /></Field>
       </Card>
       {form && (

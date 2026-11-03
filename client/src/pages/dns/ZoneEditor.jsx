@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
@@ -113,16 +114,19 @@ function RawEditor({ domain, onSaved }) {
   return (
     <>
       <p className="muted">Edit the zone as a BIND master file. On save it is validated (named-checkzone when BIND is installed), parsed into records and re-rendered, so comments are not preserved. The serial is bumped automatically.</p>
-      {state.inSync === false && <div className="banner banner-warning"><div><strong>The file on disk differs from the database.</strong><p>Saving (or Re-publish on the Records tab) rewrites the file from the panel's records.</p></div></div>}
+      {state.inSync === false && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>The file on disk differs from the database</strong><p>Saving (or Re-publish on the Records tab) rewrites the file from the panel's records.</p></div></div>}
       <Textarea value={state.body} onChange={(v) => { setState((s) => ({ ...s, body: v })); setCheck(null); }} rows={22} mono spellCheck={false} />
-      <ErrorBanner error={error && !error.fields ? error : null} />
-      {error?.fields?.body && <div className="banner banner-error"><div><strong>Zone text is not valid</strong><ul>{error.fields.body.map((e, i) => <li key={i}>{e}</li>)}</ul></div></div>}
+      <div style={{ marginTop: 14 }}>
+        <ErrorBanner error={error && !error.fields ? error : null} />
+        {error?.fields?.body && <div className="banner banner-error"><AlertTriangle size={18} /><div><strong>Zone text is not valid</strong><ul>{error.fields.body.map((e, i) => <li key={i}>{e}</li>)}</ul></div></div>}
+      </div>
       {check && (
         <div className={`banner ${check.ok ? 'banner-success' : 'banner-error'}`}>
+          {check.ok ? <CheckCircle2 size={18} /> : <AlertTriangle size={18} />}
           <div>
             <strong>{check.ok ? `Valid: ${check.records} record(s), serial ${check.serial ?? 'n/a'}` : 'Validation failed'}</strong>
             {check.errors.length > 0 && <ul>{check.errors.map((e, i) => <li key={i}>{e}</li>)}</ul>}
-            {check.checkzone?.output && <pre className="log">{check.checkzone.output}</pre>}
+            {check.checkzone?.output && <pre className="log" style={{ marginTop: 8 }}>{check.checkzone.output}</pre>}
             {check.checkzone === null && <p className="muted">named-checkzone is not available on this host; only the panel's parser ran.</p>}
           </div>
         </div>
@@ -145,7 +149,7 @@ function DnssecKeys({ status }) {
   if (!data) return null;
   return (
     <>
-      {!data.keys && <div className="banner banner-error"><div><strong>No DNSSEC keys found on disk</strong><p>The zone is flagged as signed but {data.keyDir || 'the key directory'} holds no KSK/ZSK. Disable and re-enable DNSSEC to generate new keys (then publish the new DS).</p></div></div>}
+      {!data.keys && <div className="banner banner-error"><AlertTriangle size={18} /><div><strong>No DNSSEC keys found on disk</strong><p>The zone is flagged as signed but {data.keyDir || 'the key directory'} holds no KSK/ZSK. Disable and re-enable DNSSEC to generate new keys (then publish the new DS).</p></div></div>}
       {data.signed && (
         <KeyValue items={[
           ['Signed zone', data.signed.exists ? <code key="p">{data.signed.path}</code> : 'not written yet'],
@@ -154,9 +158,9 @@ function DnssecKeys({ status }) {
           ['Key directory', data.keyDir ? <code key="k">{data.keyDir}</code> : null],
         ]} />
       )}
-      {data.ds.length > 0 && <><h3>DS record(s) for your registrar</h3><pre className="log">{data.ds.join('\n')}</pre></>}
-      {data.keys && data.ds.length === 0 && <p className="muted">dnssec-dsfromkey is not installed on the BIND host; derive the DS from the KSK below.</p>}
-      {data.dnskey && <><h3>DNSKEY</h3><pre className="log">{[data.dnskey.ksk, data.dnskey.zsk].filter(Boolean).join('\n')}</pre></>}
+      {data.ds.length > 0 && <><h3 style={{ marginTop: 16, marginBottom: 8 }}>DS records for your registrar</h3><pre className="log">{data.ds.join('\n')}</pre></>}
+      {data.keys && data.ds.length === 0 && <p className="muted" style={{ marginTop: 12 }}>dnssec-dsfromkey is not installed on the BIND host; derive the DS from the KSK below.</p>}
+      {data.dnskey && <><h3 style={{ marginTop: 16, marginBottom: 8 }}>DNSKEY</h3><pre className="log">{[data.dnskey.ksk, data.dnskey.zsk].filter(Boolean).join('\n')}</pre></>}
       <FormActions><Button size="sm" onClick={refetch} loading={loading}>Refresh</Button></FormActions>
     </>
   );
@@ -201,14 +205,14 @@ export function ZoneEditor({ domain, zone, loading, error, refetch, setData }) {
       <Card title={zone.domain} subtitle={`${zone.account ? `Account ${zone.account}` : 'No account owns this zone'} · updated ${formatDate(zone.updated_at)}`}
         actions={(
           <>
-            <StatusPill status={zone.published ? 'ok' : 'warning'}>{zone.published ? 'BIND installed' : 'BIND not installed'}</StatusPill>
+            <StatusPill status={zone.published ? 'ok' : 'warning'}>{zone.published ? 'Served by BIND' : 'BIND not installed'}</StatusPill>
             <PublishBadge result={lastResult} />
             <Button size="sm" onClick={republish}>Re-publish zone</Button>
           </>
         )}>
         <KeyValue items={[['Serial', <code key="s">{zone.serial}</code>], ['Default TTL', `${zone.ttl}s`], ['Records', zone.records.length], ['DNSSEC', <StatusPill key="d" status={zone.dnssec_enabled ? 'enabled' : 'disabled'}>{zone.dnssec_enabled ? 'Signed' : 'Off'}</StatusPill>]]} />
-        <div className="form-actions" style={{ marginTop: 12 }}>
-          {['records', 'soa', 'raw', 'dnssec'].map((t) => <Button key={t} size="sm" variant={tab === t ? 'primary' : 'default'} onClick={() => setTab(t)}>{{ records: 'Records', soa: 'SOA', raw: 'Raw zone file', dnssec: 'DNSSEC' }[t]}</Button>)}
+        <div className="segmented" role="tablist" style={{ marginTop: 14 }}>
+          {['records', 'soa', 'raw', 'dnssec'].map((t) => <button key={t} type="button" role="tab" aria-selected={tab === t} className={tab === t ? 'active' : ''} onClick={() => setTab(t)}>{{ records: 'Records', soa: 'SOA', raw: 'Raw zone file', dnssec: 'DNSSEC' }[t]}</button>)}
         </div>
       </Card>
 
@@ -220,15 +224,15 @@ export function ZoneEditor({ domain, zone, loading, error, refetch, setData }) {
               { key: 'ttl', label: 'TTL', width: 90, render: (r) => r.ttl ?? <span className="muted">{zone.ttl}</span> },
               { key: 'type', label: 'Type', width: 80, render: (r) => <StatusPill status="info">{r.type}</StatusPill> },
               { key: 'priority', label: 'Priority', width: 80, render: (r) => r.priority ?? '' },
-              { key: 'value', label: 'Value', render: (r) => <span style={{ wordBreak: 'break-all', fontFamily: 'var(--mono)', fontSize: 12 }}>{r.value}</span> },
+              { key: 'value', label: 'Value', render: (r) => <code className="small">{r.value}</code> },
             ]}
-            rows={rows} rowKey={(r) => r.id} emptyText="No records besides the SOA." dense
+            rows={rows} rowKey={(r) => r.id} emptyText="No records besides the SOA yet. Records added with the button above appear here." dense
             toolbar={<TextInput value={filter} onChange={setFilter} placeholder="Filter records" style={{ width: 220 }} />}
             rowActions={(r) => [{ label: 'Edit', primary: true, onClick: () => setEditing(r) }, { label: 'Delete', danger: true, onClick: () => remove(r) }]}
           />
         </Card>
       )}
-      {tab === 'soa' && <Card title="Start of Authority" subtitle={`Serial ${zone.soa.serial} is managed automatically (YYYYMMDDnn).`}><SoaForm domain={zone.domain} soa={zone.soa} onSaved={onSaved} /></Card>}
+      {tab === 'soa' && <Card title="Start of authority" subtitle={`Serial ${zone.soa.serial} is managed automatically (YYYYMMDDnn).`}><SoaForm domain={zone.domain} soa={zone.soa} onSaved={onSaved} /></Card>}
       {tab === 'raw' && <Card title="Raw zone file"><RawEditor domain={zone.domain} onSaved={onSaved} /></Card>}
       {tab === 'dnssec' && (
         <Card title="DNSSEC">

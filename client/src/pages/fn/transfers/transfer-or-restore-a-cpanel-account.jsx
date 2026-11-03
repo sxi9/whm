@@ -5,6 +5,7 @@ import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, CapabilityNotice, KeyValue, formatDate, formatBytes } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
 import { Field, TextInput, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
+import { Upload } from 'lucide-react';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { ToolingNotice, Options, Steps, RunPanel, RunHistory, PackageSelect } from '../../transfers/Shared.jsx';
@@ -81,12 +82,13 @@ function Uploader({ onInspected }) {
   };
   const pct = progress ? Math.round((progress.sent / progress.total) * 100) : 0;
   return (
-    <Card title="Upload an archive" subtitle="cpmove-<user>.tar.gz or a full cPanel backup; sent in chunks into the staging directory and resumed automatically after a hiccup.">
+    <Card title="Upload an archive" subtitle="cpmove-<user>.tar.gz or a full cPanel backup; uploaded in chunks into the staging directory and resumed automatically after a dropped connection.">
       <CapabilityNotice error={error} />
       {error && error.status !== 501 && <ErrorBanner error={error} />}
-      <input ref={inputRef} type="file" accept=".tar.gz,.tgz,.tar,application/gzip,application/x-tar" className="input" onChange={(e) => upload(e.target.files?.[0])} disabled={Boolean(progress)} />
+      <input ref={inputRef} type="file" accept=".tar.gz,.tgz,.tar,application/gzip,application/x-tar" hidden onChange={(e) => upload(e.target.files?.[0])} disabled={Boolean(progress)} />
+      <Button icon={Upload} onClick={() => inputRef.current?.click()} loading={Boolean(progress)}>Choose an archive</Button>
       {progress && (
-        <div className="progress-head" style={{ marginTop: 10 }}>
+        <div className="progress-head" style={{ marginTop: 12 }}>
           <div className="progress-bar"><span style={{ width: `${pct}%` }} /></div>
           <span className="muted">{pct}% · {formatBytes(progress.sent)} of {formatBytes(progress.total)} · {progress.name}{progress.note ? ` · ${progress.note}` : ''}</span>
         </div>
@@ -119,7 +121,7 @@ function PickArchive({ caps, onInspected }) {
             { key: 'sizeBytes', label: 'Size', align: 'right', render: (a) => formatBytes(a.sizeBytes) },
             { key: 'mtime', label: 'Modified', render: (a) => formatDate(a.mtime) },
           ]}
-          rows={data?.archives || []} loading={loading} rowKey={(a) => a.path} dense emptyText="No .tar.gz archives found. Upload one above or copy it into the staging directory."
+          rows={data?.archives || []} loading={loading} rowKey={(a) => a.path} dense emptyText="No .tar.gz archives found in these directories. Upload one above or copy it into the staging directory, then refresh."
           rowActions={(a) => [{ label: busy === a.path ? 'Inspecting…' : 'Inspect', primary: true, disabled: Boolean(busy), onClick: () => inspect(a.path) }]}
         />
         <div className="card-body">
@@ -157,12 +159,12 @@ function RestoreForm({ archive, onBack, onStarted }) {
     <>
       <Card title={`Archive: ${archive.top}`} subtitle={`${archive.path} · ${formatBytes(archive.sizeBytes)} · ${formatDate(archive.mtime)}`} actions={<Button size="sm" variant="ghost" onClick={onBack}>Choose another archive</Button>}>
         <KeyValue items={[
-          ['Account in archive', <span key="u"><code>{archive.username || '?'}</code> {archive.localExists ? <StatusPill status="warning">exists here ({archive.localDomain})</StatusPill> : <StatusPill status="ok">new</StatusPill>}</span>],
-          ['Main domain', <span key="d">{archive.config?.domain || <span className="muted">not recorded</span>} {archive.domainHostedBy && <StatusPill status="warning">hosted by {archive.domainHostedBy}</StatusPill>}</span>],
+          ['Account in archive', <span key="u"><code>{archive.username || '?'}</code> {archive.localExists ? <><StatusPill status="warning">exists</StatusPill> <span className="muted">here as {archive.localDomain}</span></> : <StatusPill status="ok">new</StatusPill>}</span>],
+          ['Main domain', <span key="d">{archive.config?.domain || <span className="muted">not recorded</span>} {archive.domainHostedBy && <><StatusPill status="warning">taken</StatusPill> <span className="muted">hosted by {archive.domainHostedBy}</span></>}</span>],
           ['Package on source', archive.config?.plan || '—'],
           ['Contact', archive.config?.contactEmail || '—'],
           ['Home directory', archive.hasHomedir ? 'present' : 'missing'],
-          ['Password', archive.hasShadow ? 'hash saved in the archive (kept unless you set a new one)' : 'not in the archive: set one below or afterwards under Password Modification'],
+          ['Password', archive.hasShadow ? 'hash saved in the archive (kept unless you set a new one)' : 'not in the archive; set one below or later under Password Modification'],
           ['Databases', archive.databases.length ? archive.databases.join(', ') : 'none'],
           ['Database users', archive.hasGrants ? 'grants saved' : 'none'],
           ['DNS zones', archive.zones.length ? archive.zones.join(', ') : 'none'],
@@ -193,7 +195,7 @@ export default function TransferOrRestoreACpanelAccount({ fn }) {
   const step = run ? 3 : archive ? 2 : 1;
   return (
     <>
-      <PageHeader fn={fn} description="Imports one account from a cPanel account archive (cpmove-<user>.tar.gz / pkgacct backup): the account is created, the home directory extracted, databases and grants imported, zones, addon and parked domains recreated. To migrate from a live server use the Transfer Tool.">
+      <PageHeader fn={fn} description="Imports one account from a cPanel account archive (cpmove-<user>.tar.gz or a pkgacct backup): the account is created, the home directory extracted, databases and grants imported, and zones, addon and parked domains recreated.">
         <p className="muted">Migrating from a running server? Use the <Link to="/transfers/transfer-tool">Transfer Tool</Link>.</p>
       </PageHeader>
       <Steps step={step} labels={['Choose archive', 'Options', 'Restore']} />

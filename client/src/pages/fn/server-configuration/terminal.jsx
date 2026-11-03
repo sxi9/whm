@@ -44,7 +44,7 @@ export default function Terminal({ fn }) {
           <div className="table-wrap"><table>
             <thead><tr><th>Session</th><th>Shell</th><th>Started</th><th>Last activity</th><th>Viewers</th><th /></tr></thead>
             <tbody>
-              {data.sessions.length === 0 && <tr><td colSpan={6} className="table-state">No open sessions.</td></tr>}
+              {data.sessions.length === 0 && <tr><td colSpan={6} className="table-state">No open sessions. Sessions you open appear here with their shell, start time and viewers.</td></tr>}
               {data.sessions.map((s) => (
                 <tr key={s.id}>
                   <td><code>{s.id.slice(0, 12)}</code> {active?.id === s.id && <StatusPill status="active">attached</StatusPill>}<br /><small className="muted">PID {s.pid}</small></td>

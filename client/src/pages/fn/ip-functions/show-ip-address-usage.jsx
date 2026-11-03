@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useApi } from '../../../hooks/useApi.js';
-import { PageHeader, Card, StatusPill } from '../../../components/Common.jsx';
+import { PageHeader, Card, StatusPill, KeyValue } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
 import { Button, Select, Field } from '../../../components/Form.jsx';
 import { IpRequestError, FamilyPill, BoundPill, AddressStatusPill, Summary } from '../../ip/Shared.jsx';
@@ -20,7 +20,7 @@ export default function ShowIpAddressUsage({ fn }) {
       <Card title="IP address usage" padded={false} actions={<Field inline><Select value={status} onChange={setStatus} options={['main', 'shared', 'dedicated', 'reserved', 'free', 'unmanaged', 'unknown'].map((v) => ({ value: v, label: v === 'unmanaged' ? 'dynamic' : v }))} placeholder="All states" /></Field>}>
         <DataTable
           columns={[
-            { key: 'address', label: 'Address', render: (r) => <><code>{r.address}</code>{r.shared_ip && <span className="pill pill-info" style={{ marginLeft: 6 }}>shared IP</span>}</> },
+            { key: 'address', label: 'Address', render: (r) => <><code>{r.address}</code>{r.shared_ip && <> <StatusPill status="info">shared IP</StatusPill></>}</> },
             { key: 'family', label: 'Family', render: (r) => <FamilyPill family={r.family} /> },
             { key: 'status', label: 'State', render: (r) => <AddressStatusPill status={r.status} /> },
             { key: 'bound', label: 'On host', render: (r) => <BoundPill bound={r.bound} /> },
@@ -28,13 +28,13 @@ export default function ShowIpAddressUsage({ fn }) {
             { key: 'account_count', label: 'Accounts', align: 'right', render: (r) => r.account_count },
             { key: 'accounts', label: 'Used by', render: (r) => r.accounts?.length ? <span className="muted">{r.accounts.slice(0, 6).map((a) => a.username).join(', ')}{r.accounts.length > 6 ? ` +${r.accounts.length - 6} more` : ''}</span> : r.reserved_reason ? <span className="muted">{r.reserved_reason}</span> : '' },
           ]}
-          rows={rows} loading={loading} rowKey={(r) => r.address} emptyText="No addresses to show."
+          rows={rows} loading={loading} rowKey={(r) => r.address} emptyText="No addresses to show. Rebuild the IP address pool to list every address and the accounts using it."
         />
       </Card>
       {(data || []).some((r) => r.unknown) && (
         <Card title="Addresses used by accounts but not in the inventory">
           <p className="muted">These accounts point at an address the panel has not recorded. If the address is bound to this host, run <Link to="/ip-functions/rebuild-the-ip-address-pool">Rebuild the IP Address Pool</Link>; otherwise move the accounts with the <Link to="/ip-functions/ip-migration-wizard">IP Migration Wizard</Link>.</p>
-          <ul>{data.filter((r) => r.unknown).map((r) => <li key={r.address}><code>{r.address}</code> — {r.accounts.map((a) => a.username).join(', ')} <StatusPill status={r.bound ? 'ok' : 'failed'}>{r.bound ? 'bound' : 'not bound'}</StatusPill></li>)}</ul>
+          <KeyValue items={data.filter((r) => r.unknown).map((r) => [r.address, <span key={r.address}>{r.accounts.map((a) => a.username).join(', ')} <StatusPill status={r.bound ? 'ok' : 'failed'}>{r.bound ? 'bound' : 'not bound'}</StatusPill></span>])} />
         </Card>
       )}
     </>

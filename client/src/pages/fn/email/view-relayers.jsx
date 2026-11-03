@@ -23,7 +23,7 @@ export default function ViewRelayers({ fn }) {
           columns={[
             { key: 'user', label: 'Authenticated as', sortable: true, render: (r) => <><code>{r.user}</code>{r.mechanism && <div className="muted">{r.mechanism}</div>}</> },
             { key: 'messages', label: 'Messages', sortable: true, align: 'right' },
-            { key: 'recipients', label: 'Recipients', sortable: true, align: 'right', render: (r) => <span className={r.recipients > 500 ? 'text-bad' : ''}>{r.recipients}</span> },
+            { key: 'recipients', label: 'Recipients', sortable: true, align: 'right', render: (r) => r.recipients > 500 ? <strong>{r.recipients}</strong> : r.recipients },
             { key: 'failed', label: 'Failed', sortable: true, align: 'right' },
             { key: 'bytes', label: 'Volume', sortable: true, align: 'right', render: (r) => formatBytes(r.bytes) },
             { key: 'firstSeen', label: 'First seen', render: (r) => formatDate(r.firstSeen) },
@@ -32,9 +32,9 @@ export default function ViewRelayers({ fn }) {
             { key: 'senders', label: 'Envelope senders', render: (r) => r.senders.slice(0, 3).map((s) => <div key={s}><code>{s}</code></div>) },
           ]}
           rows={data || []} loading={loading} total={meta?.total ?? null} page={table.state.page} pageSize={table.state.pageSize} onPageChange={table.setPage}
-          sort={table.state.sort} dir={table.state.dir} onSortChange={table.setSort} rowKey={(r) => r.user} dense emptyText="Nobody relayed mail in this window."
+          sort={table.state.sort} dir={table.state.dir} onSortChange={table.setSort} rowKey={(r) => r.user} dense emptyText="Nobody relayed mail in this window. Authenticated and local senders are listed here."
           searchable q={table.state.q} onSearch={table.setSearch} searchPlaceholder="Filter by user or sender"
-          toolbar={<WindowSelect value={hours} onChange={(v) => { setHours(v); table.setPage(1); }} />}
+          toolbar={<WindowSelect inline value={hours} onChange={(v) => { setHours(v); table.setPage(1); }} />}
         />
       </Card>
     </>

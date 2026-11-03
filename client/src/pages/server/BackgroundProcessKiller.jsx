@@ -70,10 +70,10 @@ export function BackgroundProcessKiller() {
         </div>
       )}
       {!procps && <CapabilityNotice error={{ code: 'capability_missing', message: 'The "ps" program (procps) is not installed on this server, so processes cannot be scanned or killed.' }} onRetry={() => api.post('/system/capabilities/refresh').then(refreshAll).catch(toast.error)} />}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: 18, alignItems: 'start' }}>
+      <div className="grid-2" style={{ alignItems: 'start' }}>
         <Card title="Status" actions={<StatusPill status={cfg.enabled ? 'enabled' : 'disabled'}>{cfg.enabled ? 'Enabled' : 'Disabled'}</StatusPill>}>
           <KeyValue items={[
-            ['Schedule', data.schedule ? <><code>{data.schedule.cron}</code> {data.schedule.enabled && !data.schedule.paused ? '' : <span className="muted">(paused: {PAUSED_LABEL[data.schedule.paused] || 'turned off in Configure cPanel Cron Jobs'})</span>}</> : 'not registered'],
+            ['Schedule', data.schedule ? <><code>{data.schedule.cron}</code> {data.schedule.enabled && !data.schedule.paused ? '' : <span className="muted">(paused: {PAUSED_LABEL[data.schedule.paused] || 'turned off in Configure Panel Cron Jobs'})</span>}</> : 'not registered'],
             ['Next scheduled run', data.schedule?.enabled && !data.schedule.paused ? formatDate(data.schedule.nextRunAt) : '—'],
             ['Last run', run ? <>{formatDate(run.finished_at || run.started_at)} <span className="muted">({run.trigger}{run.dry_run ? ', dry run' : ''})</span></> : 'never'],
             ['Last result', run ? (run.error ? <StatusPill status="failed">{run.error}</StatusPill> : `${run.scanned} scanned, ${run.matched} matched, ${run.killed} killed${run.failed ? `, ${run.failed} failed` : ''}`) : '—'],
@@ -100,7 +100,7 @@ export function BackgroundProcessKiller() {
               columns={[
                 { key: 'pid', label: 'PID', width: 80 },
                 { key: 'user', label: 'User' },
-                { key: 'command', label: 'Command', render: (m) => <><code>{m.command}</code> <small className="muted">{m.args}</small></> },
+                { key: 'command', label: 'Command', render: (m) => <div style={{ maxWidth: 420, wordBreak: 'break-all' }}><code>{m.command}</code> {m.args && <small className="muted">{m.args}</small>}</div> },
                 { key: 'pattern', label: 'Matched', render: (m) => <code>{m.pattern}</code> },
                 { key: 'cpuPercent', label: 'CPU %', align: 'right', render: (m) => m.cpuPercent?.toFixed?.(1) ?? m.cpuPercent },
                 { key: 'elapsedSeconds', label: 'Running', render: (m) => formatDuration(m.elapsedSeconds) },
@@ -140,7 +140,7 @@ function Settings({ config, signals, scopes, onSaved }) {
   };
 
   return (
-    <Card title="Settings" subtitle="Turning the scheduled scan on or off here pauses or resumes its schedule; the cron expression (every 10 minutes by default) can be tuned in Configure cPanel Cron Jobs, where it can also be paused independently.">
+    <Card title="Settings" subtitle="Turning the scheduled scan on or off here pauses or resumes its schedule; the cron expression (every 10 minutes by default) can be tuned in Configure Panel Cron Jobs, where it can also be paused independently.">
       <Field inline><Toggle checked={draft.enabled} onChange={(v) => set('enabled', v)} label="Enable the scheduled scan" description="When off, nothing is killed automatically; manual scans still work." /></Field>
       <Field label="Signal" help="SIGKILL cannot be caught or ignored; SIGTERM lets a process clean up.">
         <Select value={draft.signal} onChange={(v) => set('signal', v)} options={signals} />
@@ -239,7 +239,7 @@ function KillLog({ version, onCleared }) {
           { key: 'killed_at', label: 'When', sortable: true, render: (k) => formatDate(k.killed_at) },
           { key: 'pid', label: 'PID', width: 80, sortable: true },
           { key: 'user', label: 'User', sortable: true },
-          { key: 'command', label: 'Command', sortable: true, render: (k) => <><code>{k.command}</code> {k.args && <small className="muted">{k.args}</small>}</> },
+          { key: 'command', label: 'Command', sortable: true, render: (k) => <div style={{ maxWidth: 420, wordBreak: 'break-all' }}><code>{k.command}</code> {k.args && <small className="muted">{k.args}</small>}</div> },
           { key: 'pattern', label: 'Matched', sortable: true, render: (k) => <code>{k.pattern}</code> },
           { key: 'signal', label: 'Signal', width: 90 },
           { key: 'result', label: 'Result', sortable: true, render: (k) => <><StatusPill status={RESULT_STATUS[k.result] || 'unknown'}>{RESULT_LABEL[k.result] || k.result}</StatusPill>{k.error && <small className="muted"> {k.error}</small>}</> },
