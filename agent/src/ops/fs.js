@@ -50,10 +50,16 @@ defineOp('fs.write_file', {
   run: async ({ path: p, content, backup, owner, group, mode }, ctx) => {
     ctx.assertAllowedPath(p, 'write');
     fs.mkdirSync(path.dirname(p), { recursive: true });
+    // A directory link planted inside an allowed root (public_html -> /etc)
+    // would carry the write elsewhere: the parent must resolve to itself.
+    const parent = path.dirname(p);
+    if (fs.realpathSync(parent) !== parent) throw new OpError('path_not_allowed', `${parent} is a link; refusing to write through it`);
     // The backup and the temporary file are created exclusively: a link an
     // account planted under one of these names fails instead of being followed
     // by root, and the final rename replaces (never follows) whatever sits at p.
-    if (backup && fs.existsSync(p)) {
+    // Only a regular file is backed up, so a link at p never has its target copied.
+    const current = fs.lstatSync(p, { throwIfNoEntry: false });
+    if (backup && current?.isFile()) {
       const bak = `${p}.whm-bak`;
       fs.rmSync(bak, { force: true });
       fs.copyFileSync(p, bak, fs.constants.COPYFILE_EXCL);

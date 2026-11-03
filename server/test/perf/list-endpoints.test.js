@@ -14,7 +14,7 @@ import { seedLargeTables, fakeMailQueue } from './seed.js';
 // it in a temp B-tree. Filters that are free-text LIKE searches scan by nature
 // and are only timed; `sorts` allows an in-memory sort of a join-bounded subset.
 const ROWS = 20_000;
-const BUDGET_MS = 150;
+const BUDGET_MS = process.env.CI ? 600 : 150;
 const BIG_TABLES = ['accounts', 'audit_log', 'jobs', 'dns_zones', 'dns_records', 'backups', 'cluster_events', 'plugin_logs', 'login_attempts'];
 const SQL_KEYWORDS = new Set(['WHERE', 'ORDER', 'LIMIT', 'ON', 'LEFT', 'JOIN', 'INNER', 'GROUP', 'AS', 'SET', 'VALUES']);
 

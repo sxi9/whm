@@ -864,6 +864,26 @@ export function scanSql(text, options = {}) {
 // Streams the dump line by line; a rolling window of filtered code keeps
 // statements split across lines ("CREATE\nUSER", mysqldump's multi-line view
 // definitions) visible as one text.
+
+// The client only honours backslash escapes inside strings while the server's
+// sql_mode lacks NO_BACKSLASH_ESCAPES (MariaDB: and ANSI_QUOTES for "…"), and a
+// dump can change the session mode itself. A mode the screen cannot follow, a
+// mode set from anything but a literal, or a tampered @OLD_SQL_MODE (mysqldump's
+// own save/restore idiom) is refused on the raw line, before the code filter
+// strips literals.
+export function sqlModeRefusal(rawLine) {
+  if (!/\bsql_mode\b/i.test(rawLine) && !/@OLD_SQL_MODE/i.test(rawLine)) return null;
+  if (/NO_BACKSLASH_ESCAPES|ANSI_QUOTES|\bANSI\b/i.test(rawLine)) return 'the dump sets an sql_mode (NO_BACKSLASH_ESCAPES / ANSI_QUOTES / ANSI) under which it cannot be screened for mysql client commands';
+  const assignments = [...rawLine.matchAll(/\bsql_mode\s*(?::?=)\s*(\S+)/gi)];
+  for (const [, value] of assignments) {
+    if (/^['"]/.test(value) || /^@OLD_SQL_MODE\b/i.test(value)) continue;
+    return 'the dump sets sql_mode from an expression instead of a literal';
+  }
+  const saves = [...rawLine.matchAll(/@OLD_SQL_MODE\s*(?::?=)\s*(\S+)/gi)];
+  for (const [, value] of saves) if (!/^@@SQL_MODE\b/i.test(value)) return 'the dump assigns @OLD_SQL_MODE to something other than @@SQL_MODE';
+  return null;
+}
+
 async function scanDumpFile(file, options) {
   const stream = fs.createReadStream(file, { encoding: 'utf8' });
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
@@ -877,7 +897,7 @@ async function scanDumpFile(file, options) {
       lineNo++;
       const code = codeOf(line);
       window = `${window.slice(-600)}\n${code}`;
-      const reason = scanSqlCode(window, line, options) || guard(code);
+      const reason = sqlModeRefusal(line) || scanSqlCode(window, line, options) || guard(code);
       if (reason) return { ok: false, line: lineNo, reason };
       if (!definers && /\bDEFINER\s*=/i.test(code)) definers = true;
     }

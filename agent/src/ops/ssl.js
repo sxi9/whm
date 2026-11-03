@@ -104,7 +104,7 @@ async function withTempDir(fn) {
   // As root the scratch root is the agent's private /tmp/whm (never a
   // world-writable directory another user could have planted); an
   // unprivileged test run falls back to a fresh mkdtemp under the system tmp.
-  const base = exists(TMP_ROOT) || process.getuid?.() === 0 ? ensurePrivateDir(TMP_ROOT) : os.tmpdir();
+  const base = process.getuid?.() === 0 ? ensurePrivateDir(TMP_ROOT) : os.tmpdir();
   const dir = fs.mkdtempSync(path.join(base, 'ssl-'));
   fs.chmodSync(dir, 0o700);
   try {

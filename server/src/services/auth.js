@@ -59,7 +59,9 @@ export function createAuthService(ctx) {
 
   const totpFailures = new Map();
   const totpAccepted = new Map();
-  function verifyTotp(user, code) {
+  // remember=false skips the replay record: enrollment confirms a brand-new
+  // secret, and the same code may legitimately open the first login seconds later.
+  function verifyTotp(user, code, { remember = true } = {}) {
     const now = Date.now();
     const state = totpFailures.get(user.id);
     if (state && state.lockedUntil > now) throw new HttpError(429, LOCKOUT_CODE, 'Too many wrong verification codes; wait a few minutes and try again.');
@@ -68,7 +70,7 @@ export function createAuthService(ctx) {
     const reused = Boolean(last && last.code === normalized && now - last.at < TOTP_REUSE_WINDOW_MS);
     if (!reused && crypto.totp.verify(normalized, crypto.decrypt(user.totp_secret_enc))) {
       totpFailures.delete(user.id);
-      totpAccepted.set(user.id, { code: normalized, at: now });
+      if (remember) totpAccepted.set(user.id, { code: normalized, at: now });
       return true;
     }
     const inWindow = state && now - state.firstAt < TOTP_LOCK_MS;
@@ -175,7 +177,7 @@ export function createAuthService(ctx) {
     confirm2faEnrollment(userId, code) {
       const user = stmts.byId.get(userId);
       if (!user.totp_secret_enc) throw badRequest('Start enrollment first');
-      if (!crypto.totp.verify(code, crypto.decrypt(user.totp_secret_enc))) throw badRequest('Invalid verification code');
+      if (!verifyTotp(user, code, { remember: false })) throw badRequest('Invalid verification code');
       stmts.setTotp.run(user.totp_secret_enc, 1, userId);
     },
 

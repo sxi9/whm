@@ -134,9 +134,19 @@ describe('fs.write_file never follows a planted link', () => {
     expect(fs.readFileSync(bakVictim, 'utf8')).toBe('bak victim stays');
     expect(fs.lstatSync(target).isSymbolicLink()).toBe(false);
     expect(fs.readFileSync(target, 'utf8')).toBe('new content');
-    expect(fs.lstatSync(`${target}.whm-bak`).isSymbolicLink()).toBe(false);
-    expect(fs.readFileSync(`${target}.whm-bak`, 'utf8')).toBe('victim stays');
+    // A link at p is never backed up: root must not copy the link's target anywhere.
+    expect(fs.lstatSync(`${target}.whm-bak`).isSymbolicLink()).toBe(true);
+    expect(fs.readFileSync(bakVictim, 'utf8')).toBe('bak victim stays');
     expect(fs.readdirSync(root).some((n) => n.includes('.whm-tmp-'))).toBe(false);
+  });
+
+  it('refuses to write through a planted directory link', async () => {
+    const elsewhere = fs.mkdtempSync(`${TMP_ROOT}/elsewhere-`);
+    const dirLink = path.join(root, 'public_html');
+    fs.symlinkSync(elsewhere, dirLink);
+    const err = await opError(runOp('fs.write_file', { path: path.join(dirLink, '.htaccess'), content: 'x', backup: false }, ctx));
+    expect(err.code).toBe('path_not_allowed');
+    expect(fs.existsSync(path.join(elsewhere, '.htaccess'))).toBe(false);
   });
 
   it('fs.chown refuses option-shaped owners and groups before chown runs', async () => {
@@ -224,6 +234,24 @@ describe('backup.db.import screens dumps for mysql client commands', () => {
 
   it('passes a mysqldump of the target database, strings and triggers included', async () => {
     await expect(screenDumpForClientCommands(dump('clean'), { database: 'shop' })).resolves.toEqual({ ok: true, lines: header.length, definers: true });
+  });
+
+  it('refuses dumps that switch sql_mode to one the screen cannot follow, or set it from an expression', async () => {
+    const cases = [
+      ['mode-nbe', "SET SESSION sql_mode='NO_BACKSLASH_ESCAPES';", /NO_BACKSLASH_ESCAPES/],
+      ['mode-ansi', "SET sql_mode = 'ANSI';", /ANSI/],
+      ['mode-expr', 'SET SESSION sql_mode=CONCAT(@@sql_mode, 0x2c4e4f5f4241434b534c4153485f45534341504553);', /expression/],
+      ['mode-old', 'SET @OLD_SQL_MODE=0x4e4f5f4241434b534c4153485f455343415045 53;', /@OLD_SQL_MODE/],
+    ];
+    for (const [name, line, reason] of cases) {
+      const r = await screenDumpForClientCommands(dump(name, [line, "SELECT 'x\\'; \\! id > /tmp/whm-pwned; -- ';"]), { database: 'shop' });
+      expect(r.ok, name).toBe(false);
+      expect(r.line, name).toBe(header.length + 1);
+      expect(r.reason, name).toMatch(reason);
+    }
+    // mysqldump's own save/restore idiom still passes.
+    const r = await screenDumpForClientCommands(dump('mode-ok', ["/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;", '/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;']), { database: 'shop' });
+    expect(r.ok).toBe(true);
   });
 
   it('refuses system, backslash, tee and source commands and a USE of another database', async () => {
