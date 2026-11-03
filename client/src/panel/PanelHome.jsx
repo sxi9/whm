@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Star, Search, ExternalLink, RefreshCw } from 'lucide-react';
 import { useAuth } from '../auth/AuthContext.jsx';
-import { Card, StatusPill, Loading, formatMb } from '../components/Common.jsx';
+import { Card, StatusPill, Loading, formatMb, formatDate } from '../components/Common.jsx';
 import { ErrorBanner } from '../components/Form.jsx';
 import { useT } from '../i18n/useT.js';
 import { PANEL_BASE, PANEL_FUNCTION_BY_KEY, panelId, searchPanelFunctions, visibleCategories } from './nav.js';
@@ -145,7 +145,7 @@ export function PanelHome({ header = null }) {
 
       <div className="home">
         <div className="home-main">
-          <Card title={t('panel.home.usage', 'Usage')} subtitle={usageReq.data?.disk?.lastRefresh ? `Disk measured ${usageReq.data.disk.lastRefresh}` : undefined}
+          <Card title={t('panel.home.usage', 'Usage')} subtitle={usageReq.data?.disk?.lastRefresh ? `Disk measured ${formatDate(usageReq.data.disk.lastRefresh)}` : undefined}
             actions={<Link className="link-button" to={`${PANEL_BASE}/usage/usage`}><RefreshCw size={14} /> {t('panel.home.details', 'Details')}</Link>}>
             <ErrorBanner error={usageReq.error && usageReq.error.status !== 501 ? usageReq.error : null} onRetry={usageReq.refetch} />
             {me ? <UsageMeters me={me} usage={usageReq.data} /> : <Loading />}
