@@ -185,7 +185,7 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Current state (update every push)
 
-- **2026-11-03 21:30: Phase 7 milestone 1** (user ask: "all new modern UI like iOS, not AI-looking; our own panel
+- **2026-11-03 20:25: Phase 7 milestone 1** (user ask: "all new modern UI like iOS, not AI-looking; our own panel
   instead of cPanel"). Product identity is **Keel** (default branding via migration `028c`; operators rename it under
   Panel › Customization). **Design system** `docs/design/ui-design-system.md` (tokens.css/base.css rewritten; sidebar-first
   shell with coloured icon tiles from `icons.js` `colorFor`, translucent bars, inset grouped cards, iOS switches, floating

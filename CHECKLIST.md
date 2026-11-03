@@ -8,7 +8,7 @@
 
 ## Current state
 
-- **Branch:** `claude/kind-meitner-dlnbas` · **Last updated:** 2026-11-03 21:35 UTC · **Phase 7 (new UI, own identity, customer panel) in progress — see the Phase 7 table below and `HANDOFF.md` §4**
+- **Branch:** `claude/kind-meitner-dlnbas` · **Last updated:** 2026-11-03 20:25 UTC · **Phase 7 (new UI, own identity, customer panel) in progress — see the Phase 7 table below and `HANDOFF.md` §4**
 - **2026-11-03 baseline gate on a fresh container:** server 1158 / agent 470 / client 52 / hub 184 / hub-ui 105 green after two test-only fixes (the 2FA replay test timeout, `/tmp/whm` created by the agent temp-dir tests).
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
@@ -72,8 +72,8 @@ this table; estimates are revised at each milestone.
 | **Own identity** — Keel as default branding (`028c`), label overrides in `nav.js` with stable keys, i18n catalog, docs (99 edits) + server/agent/hub strings (legacy managed-block markers kept), support links, `keel@` sender, `KEEL-` ticket refs | done `22001ff`…`643e0a6` | 50 min | 20:40 |
 | Phase-6 verifier (read-only review of `b01bd30`) + fixes: sql_mode dump-screen bypass, link-safe `fs.write_file`, SQL-side reseller job filter, 2FA disable re-verification, enrollment rate limit, `backup.db.import` temp user, hub `ui_dist` | done `18fe699`, `4630c2d`, `00a9cb6` | 35 min | 19:15 |
 | hub/ui portals on the new kit (sidebar-first shell, SYNC.md) | done `18fe699` | 15 min | 18:52 |
-| zod 3 → 4 migration (server, agent, hub) with the full gate — records, prefault, patchOf, IPv6 parity | done `7788431` | 40 min | 20:55 |
-| Milestone 1: react-router 7 (`c87c235`), full gate + builds + e2e green, **screenshot refresh** (all 212 pages + 17 flow shots relabelled `Keel › …`), HANDOFF/CLAUDE/CHECKLIST, push | done | 35 min | 21:35 |
+| zod 3 → 4 migration (server, agent, hub) with the full gate — records, prefault, patchOf, IPv6 parity | done `7788431` | 40 min | 20:10 |
+| Milestone 1: react-router 7 (`c87c235`), full gate + builds + e2e green, **screenshot refresh** (all 212 pages + 17 flow shots relabelled `Keel › …`), HANDOFF/CLAUDE/CHECKLIST, push | done | 35 min | 20:25 |
 | **Customer panel** build (from the design doc): migration + account users + "log in as", new agent ops (mail accounts/forwarders, FTP users, user crontab, archive), `/api/panel/*` services + routes, `/panel` shell + pages, tests — parallel units, two review lenses on root-level code, one fix round | pending | ~4 h | 02:00 (4th) |
 | Milestone 2: full gate, e2e incl. the customer panel, **screenshot refresh** (admin + customer panel galleries), manuals updated, tick P6, trackers, push | pending | 40 min | 02:40 (4th) |
 | **Total remaining** | | **~6 h** | |

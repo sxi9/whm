@@ -4,7 +4,7 @@ For any AI or engineer taking over. Everything stated here is on the branch
 `claude/kind-meitner-dlnbas` of `github.com/sxi9/whm`; this file is updated at every milestone
 together with `CHECKLIST.md` (tracker) and `CLAUDE.md` (conventions + memory). Read those two next.
 
-**Last updated:** 2026-11-03 21:30 UTC · Phase 7 milestone 1 · checklist: all 212 functions done, P6 closed, P7 in progress
+**Last updated:** 2026-11-03 20:25 UTC · Phase 7 milestone 1 · checklist: all 212 functions done, P6 closed, P7 in progress
 
 ## 1. What this is
 
@@ -61,7 +61,7 @@ server (live source, both colour schemes) — see `docs/design/ui-design-system.
 
 ## 4. Where the previous session ended — and where to continue
 
-**Milestone 1 of Phase 7 landed 2026-11-03 ~21:30 UTC** (design system, identity, hardening close-out,
+**Milestone 1 of Phase 7 landed 2026-11-03 ~20:25 UTC** (design system, identity, hardening close-out,
 dependency bumps, screenshots). Continue with the **customer panel**:
 
 1. Read `docs/design/customer-panel.md` (design of record for the account panel: identity model,
