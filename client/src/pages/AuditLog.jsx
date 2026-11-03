@@ -12,14 +12,14 @@ export function AuditLogPage() {
       <Card padded={false}>
         <DataTable
           columns={[
-            { key: 'ts', label: 'Time', sortable: true, width: 170, render: (r) => formatDate(r.ts) },
+            { key: 'ts', label: 'Time', sortable: true, width: 170, render: (r) => <span style={{ whiteSpace: 'nowrap' }}>{formatDate(r.ts)}</span> },
             { key: 'principal', label: 'User', sortable: true, width: 120 },
             { key: 'role', label: 'Role', width: 80 },
             { key: 'ip', label: 'IP', width: 120 },
-            { key: 'action', label: 'Action', sortable: true, render: (r) => <code>{r.action}</code> },
+            { key: 'action', label: 'Action', sortable: true, width: 220, render: (r) => <code>{r.action}</code> },
             { key: 'target', label: 'Target', width: 150 },
             { key: 'result', label: 'Result', width: 90, render: (r) => <StatusPill status={r.result === 'ok' ? 'ok' : 'error'}>{r.result}</StatusPill> },
-            { key: 'args_redacted', label: 'Details', width: 260, render: (r) => r.args_redacted ? <code className="small" title={r.args_redacted}>{r.args_redacted.length > 160 ? `${r.args_redacted.slice(0, 160)}…` : r.args_redacted}</code> : null },
+            { key: 'args_redacted', label: 'Details', width: 260, render: (r) => r.args_redacted ? <code className="small" style={{ wordBreak: 'break-all' }} title={r.args_redacted}>{r.args_redacted.length > 160 ? `${r.args_redacted.slice(0, 160)}…` : r.args_redacted}</code> : null },
           ]}
           rows={data || []} loading={loading} error={error} rowKey={(r) => r.id}
           total={meta?.total} page={t.state.page} pageSize={t.state.pageSize} onPageChange={t.setPage}

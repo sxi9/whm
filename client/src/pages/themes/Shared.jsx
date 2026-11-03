@@ -183,7 +183,7 @@ export function ThemeEditor({ theme, catalog, onSaved, onClose, readOnly: forceR
       <div className="form-grid">
         <Field label="Name" required error={error?.fields?.name}><TextInput value={form.name} onChange={(v) => update({ name: v })} /></Field>
         <Field label="Base scheme" help="Dark bases start from the dark token set; tokens below override either."><Select value={form.base} onChange={(v) => update({ base: v })} options={BASES} /></Field>
-        <Field label="Availability"><Toggle checked={form.enabled} onChange={(v) => update({ enabled: v })} label={form.enabled ? 'Enabled: users and packages may pick it' : 'Disabled: hidden from users and packages'} /></Field>
+        <Field label="Availability"><Toggle checked={form.enabled} disabled={readOnly} onChange={(v) => update({ enabled: v })} label={form.enabled ? 'Enabled: users and packages may pick it' : 'Disabled: hidden from users and packages'} /></Field>
       </div>
       <h3 style={{ margin: '16px 0 4px' }}>Design tokens</h3>
       <p className="muted" style={{ marginTop: 0 }}>Leave a token empty to inherit the base scheme. Values are validated as colours (hex, rgb(), hsl() or a named colour) or pixel lengths.</p>

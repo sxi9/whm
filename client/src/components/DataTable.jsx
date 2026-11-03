@@ -20,7 +20,7 @@ export function DataTable({
     const active = sort === col.key;
     const Icon = !sortable ? null : active ? (dir === 'asc' ? ChevronUp : ChevronDown) : ChevronsUpDown;
     return (
-      <th key={col.key} style={{ width: col.width }} className={`${sortable ? 'sortable' : ''} ${col.align ? `align-${col.align}` : ''}`}
+      <th key={col.key} style={{ width: col.width, minWidth: col.width }} className={`${sortable ? 'sortable' : ''} ${col.align ? `align-${col.align}` : ''}`}
         onClick={sortable ? () => onSortChange(col.key, active && dir === 'asc' ? 'desc' : 'asc') : undefined} aria-sort={active ? (dir === 'asc' ? 'ascending' : 'descending') : undefined}>
         <span>{col.label}{Icon && <Icon size={14} className="sort-icon" />}</span>
       </th>

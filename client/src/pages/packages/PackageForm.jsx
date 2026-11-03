@@ -1,8 +1,9 @@
+import { useEffect } from 'react';
 import { useApi } from '../../hooks/useApi.js';
 import { Card } from '../../components/Common.jsx';
 import { Field, TextInput, NumberInput, Select, Toggle, ErrorBanner } from '../../components/Form.jsx';
 
-export const EMPTY_PACKAGE = { name: '', disk_mb: 10240, bandwidth_mb: 102400, max_domains: 1, max_subdomains: 10, max_addons: 0, max_parked: 0, max_db: 10, max_email: 50, max_ftp: 10, max_email_per_hour: null, quota_inodes: null, php_version: 'ea-php83', feature_list: 'default', has_shell: false, has_dedicated_ip: false, cgi: true, digest_auth: false, theme: 'jupiter' };
+export const EMPTY_PACKAGE = { name: '', disk_mb: 10240, bandwidth_mb: 102400, max_domains: 1, max_subdomains: 10, max_addons: 0, max_parked: 0, max_db: 10, max_email: 50, max_ftp: 10, max_email_per_hour: null, quota_inodes: null, php_version: 'ea-php83', feature_list: 'default', has_shell: false, has_dedicated_ip: false, cgi: true, digest_auth: false, theme: '' };
 
 export function packageToForm(pkg) {
   return { ...EMPTY_PACKAGE, ...Object.fromEntries(Object.keys(EMPTY_PACKAGE).map((k) => [k, pkg[k] ?? (k === 'feature_list' ? 'default' : EMPTY_PACKAGE[k])])), name: pkg.name };
@@ -14,9 +15,21 @@ const LIMITS = [
   ['max_parked', 'Max parked domains'], ['max_addons', 'Max addon domains'], ['quota_inodes', 'Inode quota'],
 ];
 
+function themeOptionsFor(themes, current) {
+  const options = themes.filter((t) => t.enabled).map((t) => ({ value: t.slug, label: t.name }));
+  if (current && !options.some((o) => o.value === current)) options.push({ value: current, label: `${current} · not available` });
+  return options;
+}
+
 export function PackageForm({ form, setForm, error, nameEditable = true }) {
   const { data: featureLists } = useApi('/packages/feature-lists');
+  const themesRes = useApi('/themes');
   const set = (k) => (v) => setForm((f) => ({ ...f, [k]: v }));
+  const themeOptions = themeOptionsFor(themesRes.data || [], form.theme);
+  const accountDefault = (themesRes.data || []).find((t) => t.isAccountDefault)?.slug || themesRes.meta?.accountDefault || '';
+  useEffect(() => {
+    if (!form.theme && accountDefault) setForm((f) => (f.theme ? f : { ...f, theme: accountDefault }));
+  }, [form.theme, accountDefault, setForm]);
   return (
     <>
       <Card title="Package">
@@ -36,7 +49,7 @@ export function PackageForm({ form, setForm, error, nameEditable = true }) {
         <div className="form-grid">
           <Field label="Feature list" error={error?.fields?.feature_list}><Select value={form.feature_list} onChange={set('feature_list')} options={(featureLists || []).map((f) => ({ value: f.name, label: f.name }))} /></Field>
           <Field label="PHP version" error={error?.fields?.php_version}><TextInput value={form.php_version || ''} onChange={(v) => set('php_version')(v || null)} placeholder="ea-php83" /></Field>
-          <Field label="Account panel theme" error={error?.fields?.theme}><Select value={form.theme} onChange={set('theme')} options={['jupiter', 'paper_lantern']} /></Field>
+          <Field label="Account panel theme" error={error?.fields?.theme}><Select value={form.theme} onChange={set('theme')} options={themeOptions} placeholder={themesRes.loading ? 'Loading themes…' : 'Choose a theme'} /></Field>
         </div>
         <Field inline><Toggle checked={form.has_shell} onChange={set('has_shell')} label="Shell access" description="Accounts get an interactive shell." /></Field>
         <Field inline><Toggle checked={form.has_dedicated_ip} onChange={set('has_dedicated_ip')} label="Dedicated IP" /></Field>
