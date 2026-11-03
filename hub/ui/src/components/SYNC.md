@@ -5,7 +5,7 @@ into panel-only modules (`api/client.js`, `AuthContext`, `icons.js`, `hooks/useF
 `i18n/useT.js`); a relative import across `client/` and `hub/ui/` would couple two deployables and
 break the hub whenever the panel UI moves. **Re-copy by hand, never import across packages.**
 
-Source commit: `f11d3aad99595200d75b259a6b36a6579f05f27c` (branch `claude/trusting-cori-ifp7wy`, 2026-10-27).
+Source commit: `2a83117` (branch `claude/kind-meitner-dlnbas`, 2026-11-03) — the Keel design system; the hub's `Shell.jsx` mirrors the panel's sidebar-first layout (`.app` → `.sidebar` + `.app-main`).
 
 | File | Source | Deviation from the source |
 |---|---|---|
@@ -18,6 +18,7 @@ Source commit: `f11d3aad99595200d75b259a6b36a6579f05f27c` (branch `claude/trusti
 | `ConfigPage.jsx` | `client/src/components/ConfigPage.jsx` | takes `loadPath`/`savePath`/`method` instead of the panel's fixed `/system/settings?prefix=` |
 | `ActionPage.jsx` | `client/src/components/ActionPage.jsx` | passes `crumbs`/`home` to `PageHeader` |
 | `../styles/tokens.css` | `client/src/theme/tokens.css` | byte-identical |
+| `../styles/base.css` | `client/src/theme/base.css` | identical plus the `.impersonation-banner` rules at the end; `hub.css` holds the hub-only additions |
 | `../styles/base.css` | `client/src/theme/base.css` | byte-identical (hub additions live in `../styles/hub.css`) |
 
 Hub-native code that is **not** part of the snapshot: `../api/client.js`, `../hooks/*`, `../auth/*`,
