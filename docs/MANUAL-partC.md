@@ -867,7 +867,10 @@ need a root or reseller session; they are never behind the account scope.
 
 ### C.9.1 Panel settings (root)
 
-`GET/PUT /api/panel/admin/settings`:
+The settings are edited under **Panel › Customization › Account panel** (root only; resellers see
+the Customization page without the tab, as the API is root-only). The tab holds the *Account
+panel* card (the four fields below, saved with a single PUT of the changed fields) and the *Log in
+as history* table ([C.9.4](#c94-login-as-history)). The API is `GET/PUT /api/panel/admin/settings`:
 
 | Field (setting key) | Meaning |
 |---|---|
@@ -879,8 +882,8 @@ need a root or reseller session; they are never behind the account scope.
 The answer also reports the read-only `loginAsAcl` (`panel.login_as_acl`, default `login-as`) and
 `uploadChunkBytes` (`panel.upload_chunk_bytes`, 1,310,720). Other panel keys in the settings table
 with no form: `panel.mail.default_quota_mb` (1024), `panel.mail.max_forwarders_per_domain` (200),
-`panel.ftp.port` (21). **There is no settings page for these in this version**: change them with
-the API from a root session (the change is audited as `panel.settings.update`).
+`panel.ftp.port` (21). **These three have no form**: change them with the API from a root session.
+Every change, from the page or the API, is audited as `panel.settings.update`.
 
 ### C.9.2 "Log in as" from List Accounts
 
@@ -906,8 +909,9 @@ root grants it. Root always may. The key the panel checks is `panel.login_as_acl
 
 `GET /api/panel/admin/login-as/history?page&pageSize&sort&dir` lists `panel_login_as`: actor,
 account, started, expires, ended, IP and an `active` flag. Root sees every row, a reseller only its
-own. There is no page for it in this version; the audit log (*Audit log* in the console top bar)
-carries the matching rows `panel.login_as`, `panel.logout_as` and `panel.login_as.ended`
+own. The same list is shown as the *Log in as history* table under *Panel › Customization ›
+Account panel* (when, admin, account, from, ended, status: active / ended / expired), paged by this
+endpoint. The audit log (*Audit log* in the console top bar) carries the matching rows `panel.login_as`, `panel.logout_as` and `panel.login_as.ended`
 (with `reason`), and every panel action performed while acting carries `actingAs` and `by`.
 
 ### C.9.5 Linking logins and syncing passwords

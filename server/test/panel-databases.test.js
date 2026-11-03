@@ -10,7 +10,7 @@ import { ensurePrefixed, effectiveLimit, SYSTEM_ROOT } from '../src/services/pan
 // A MariaDB-like host: databases, users (per host) and grants live in memory
 // so the panel's bookkeeping and the delegate's are checked end to end.
 function mysqlAgent() {
-  const state = { databases: new Map([['mysql', { system: true }]]), users: new Map([['root@localhost', {}]]), grants: new Map(), dumps: [] };
+  const state = { databases: new Map([['mysql', { system: true }]]), users: new Map([['root@localhost', {}]]), grants: new Map(), dumps: [], imports: [] };
   const hostsOf = (user) => [...state.users.keys()].filter((k) => k.startsWith(`${user}@`)).map((k) => k.split('@')[1]);
   const fail = (code, message) => Object.assign(new Error(message), { agentError: true, code, details: {} });
   const ops = {
@@ -35,7 +35,15 @@ function mysqlAgent() {
     'fs.chmod': ({ path }) => ({ path }),
     'fs.remove': ({ path }) => ({ path, removed: true }),
     'files.mkdir': ({ path }) => ({ path }),
-    'files.copy': ({ from, to }) => ({ from, to }),
+    // As on the real agent: files.copy only takes sources inside the home, and
+    // backup.dump.import only sources inside the account's own staging directory.
+    'files.copy': ({ username, from, to }) => { for (const p of [from, to]) if (!p.startsWith(`/home/${username}/`)) throw fail('path_not_allowed', `${p} is not inside the home directory /home/${username}`); return { from, to }; },
+    'backup.dump.import': ({ username, from, to }) => {
+      if (!from.startsWith(`/var/lib/whm/panel/dumps/${username}/`) || from.split('/').length !== 8) throw fail('path_not_allowed', `${from} is not inside the dump staging directory of ${username}`);
+      if (!to.startsWith(`/home/${username}/`)) throw fail('path_not_allowed', `${to} is not inside the home directory /home/${username}`);
+      state.imports.push({ username, from, to });
+      return { from, to, username, sizeBytes: 2048 };
+    },
   };
   const agent = createMockAgent(ops);
   agent.state = state;
@@ -264,26 +272,39 @@ describe('/api/panel/databases', () => {
     } finally { app.agent.reset('db.databases.list'); app.agent.set('db.databases.list', () => [...app.agent.state.databases].map(([name, d]) => ({ name, charset: 'utf8mb4', collation: 'utf8mb4_unicode_ci', sizeBytes: 4096, tables: 2, system: d.system }))); }
   });
 
-  it('dumps through a root staging directory and copies into the home as the account', async () => {
+  it('dumps through a root staging directory and delivers it into the home with backup.dump.import (never files.copy)', async () => {
     const res = await post('/alice_shop/dump', {});
     expect(res.body, JSON.stringify(res.body)).toHaveProperty('data.job.id');
     expect(res.status).toBe(202);
     const job = await waitForJob(app.ctx, res.body.data.job.id);
-    expect(job.status).toBe('done');
+    expect(job.status, `${job.error} ${JSON.stringify(job.logs)}`).toBe('done');
     expect(job.result.file).toMatch(/^backups\/alice_shop-\d{8}T\d{6}Z\.sql$/);
     const names = app.agent.calls.map((c) => c.name);
-    expect(names).toEqual(['fs.mkdir', 'fs.mkdir', 'db.dump', 'fs.chown', 'fs.chmod', 'files.mkdir', 'files.copy', 'fs.remove']);
+    expect(names).toEqual(['fs.mkdir', 'fs.mkdir', 'db.dump', 'files.mkdir', 'backup.dump.import', 'fs.remove']);
     const dump = app.agent.callsTo('db.dump')[0].args;
-    expect(dump.path).toMatch(/^\/var\/lib\/whm\/panel\/dumps\/alice\/alice_shop-.*\.sql$/);
+    expect(dump.path).toMatch(/^\/var\/lib\/whm\/panel\/dumps\/alice\/alice_shop-\d{8}T\d{6}Z\.sql$/);
     expect(dump.databases).toEqual(['alice_shop']);
+    expect(app.agent.callsTo('fs.mkdir')[0].args).toMatchObject({ path: '/var/lib/whm/panel/dumps', mode: '0711', owner: 'root' });
     expect(app.agent.callsTo('fs.mkdir')[1].args).toMatchObject({ path: '/var/lib/whm/panel/dumps/alice', mode: '0750', owner: 'root', group: 'alice' });
-    expect(app.agent.callsTo('fs.chown')[0].args).toMatchObject({ path: dump.path, owner: 'root', group: 'alice' });
-    expect(app.agent.callsTo('fs.chmod')[0].args).toMatchObject({ path: dump.path, mode: '0640' });
-    const copy = app.agent.callsTo('files.copy')[0].args;
-    expect(copy).toMatchObject({ username: 'alice', from: dump.path });
-    expect(copy.to).toMatch(/^\/home\/alice\/backups\/alice_shop-.*\.sql$/);
+    expect(app.agent.callsTo('files.mkdir')[0].args).toEqual({ username: 'alice', path: '/home/alice/backups', mode: '0700' });
+    const imported = app.agent.callsTo('backup.dump.import')[0].args;
+    expect(imported).toEqual({ username: 'alice', from: dump.path, to: `/home/alice/backups/${dump.path.split('/').pop()}` });
+    expect(app.agent.callsTo('files.copy')).toHaveLength(0);
     expect(app.agent.callsTo('fs.remove')[0].args.path).toBe(dump.path);
-    expect(app.ctx.db.prepare("SELECT 1 FROM audit_log WHERE action = 'panel.db.dump.done' AND target = 'alice'").get()).toBeTruthy();
+    const audit = app.ctx.db.prepare("SELECT principal FROM audit_log WHERE action = 'panel.db.dump.done' AND target = 'alice' ORDER BY id DESC LIMIT 1").get();
+    expect(audit.principal).toBe('resell1');
+  });
+
+  it('fails the dump job closed when the owner is gone or changed, before mysqldump runs', async () => {
+    const alice = app.ctx.db.prepare("SELECT id, owner_id FROM accounts WHERE username = 'alice'").get();
+    const rootId = app.ctx.db.prepare("SELECT id FROM users WHERE username = 'root'").get().id;
+    const fake = (ownerId) => ({ params: { accountId: alice.id, username: 'alice', database: 'alice_shop', ownerId, actor: 'alice' }, log() {}, progress() {} });
+    await expect(app.ctx.panelDatabases.runDump(fake(null))).rejects.toThrow(/owner .* no longer exists/);
+    await expect(app.ctx.panelDatabases.runDump(fake(987654))).rejects.toThrow(/owner .* no longer exists/);
+    expect(rootId).not.toBe(alice.owner_id);
+    await expect(app.ctx.panelDatabases.runDump(fake(rootId))).rejects.toThrow(/changed owner/);
+    expect(app.agent.callsTo('db.dump')).toHaveLength(0);
+    expect(app.agent.callsTo('backup.dump.import')).toHaveLength(0);
   });
 
   it('with a PostgreSQL profile hides hosts, requires the postgres feature and refuses access hosts', async () => {

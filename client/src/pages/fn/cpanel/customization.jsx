@@ -1,12 +1,20 @@
 import { useEffect, useMemo, useState } from 'react';
+import { useLocation } from 'react-router-dom';
 import { Image as ImageIcon } from 'lucide-react';
-import { api } from '../../../api/client.js';
+import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
-import { PageHeader, Card, Loading, KeyValue, formatBytes, formatDate } from '../../../components/Common.jsx';
-import { Field, TextInput, Textarea, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
+import { useAuth } from '../../../auth/AuthContext.jsx';
+import { PageHeader, Card, Loading, KeyValue, StatusPill, formatBytes, formatDate } from '../../../components/Common.jsx';
+import { Field, TextInput, NumberInput, Toggle, Textarea, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
+import { DataTable, useTableState } from '../../../components/DataTable.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
+import { Tabs } from '../../security/Shared.jsx';
 import { notifyBrandingChanged } from '../../cpanel/branding.js';
+
+export const TABS = [{ value: 'branding', label: 'Branding' }, { value: 'account-panel', label: 'Account panel' }];
+export const ACCOUNT_PANEL_HASH = '#account-panel';
+export const LOGIN_AS_TTL = { min: 5, max: 480 };
 
 const TEXT_FIELDS = ['companyName', 'tagline', 'primaryColor', 'chromeColor', 'helpUrl', 'docsUrl', 'supportUrl', 'loginNotice', 'footerText'];
 const KINDS = {
@@ -94,7 +102,7 @@ function ImageCard({ kind, descriptor, onChanged }) {
   );
 }
 
-export default function Customization({ fn }) {
+function BrandingTab() {
   const toast = useToast();
   const { data, loading, error, refetch } = useApi('/cpanel/branding');
   const [draft, setDraft] = useState({});
@@ -118,7 +126,6 @@ export default function Customization({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} />
       {loading && !data && <Loading />}
       <ErrorBanner error={error} onRetry={refetch} />
       {data && (
@@ -162,6 +169,136 @@ export default function Customization({ fn }) {
           </div>
         </>
       )}
+    </>
+  );
+}
+
+const PANEL_FIELDS = ['enabled', 'require2faForUsers', 'loginAsTtlMinutes', 'webmailUrl'];
+const panelDraft = (d) => ({ enabled: d.enabled !== false, require2faForUsers: Boolean(d.require2faForUsers), loginAsTtlMinutes: d.loginAsTtlMinutes ?? 60, webmailUrl: d.webmailUrl ?? '' });
+
+export function ttlError(v) {
+  if (v === null || v === undefined || v === '') return 'Enter a value in minutes';
+  if (!Number.isInteger(v) || v < LOGIN_AS_TTL.min || v > LOGIN_AS_TTL.max) return `Must be a whole number between ${LOGIN_AS_TTL.min} and ${LOGIN_AS_TTL.max}`;
+  return null;
+}
+
+export function webmailUrlError(v) {
+  if (!v) return null;
+  return /^https?:\/\/\S+$/i.test(v) ? null : 'Must be an http(s) URL, or empty to auto-detect';
+}
+
+export function AccountPanelSettingsCard() {
+  const toast = useToast();
+  const { data, loading, error, refetch } = useApi('/panel/admin/settings');
+  // The draft is derived from the loaded settings so the form renders on the
+  // first pass; a refetch drops local edits.
+  const [edits, setEdits] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState(null);
+  const base = useMemo(() => (data ? panelDraft(data) : null), [data]);
+  useEffect(() => { setEdits(null); }, [data]);
+  const draft = edits ?? base;
+  const setDraft = (updater) => setEdits((e) => (typeof updater === 'function' ? updater(e ?? base) : updater));
+  const dirty = Boolean(draft && base && PANEL_FIELDS.some((k) => draft[k] !== base[k]));
+  const errors = draft ? { loginAsTtlMinutes: ttlError(draft.loginAsTtlMinutes), webmailUrl: webmailUrlError(draft.webmailUrl) } : {};
+  const invalid = Object.values(errors).some(Boolean);
+  const set = (k) => (v) => setDraft((d) => ({ ...d, [k]: v }));
+
+  const save = async () => {
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const body = Object.fromEntries(PANEL_FIELDS.filter((k) => draft[k] !== base[k]).map((k) => [k, draft[k]]));
+      await api.put('/panel/admin/settings', body);
+      toast.success('Account panel settings saved');
+      refetch();
+    } catch (err) { setSaveError(err); toast.error(err); } finally { setSaving(false); }
+  };
+
+  return (
+    <Card title="Account panel" subtitle="How account holders sign in to their own panel and how long an administrator's “Log in as” session lasts">
+      {loading && !data && <Loading />}
+      <ErrorBanner error={error} onRetry={refetch} />
+      {draft && (
+        <>
+          <div className="form-grid">
+            <Field label="Availability">
+              <Toggle checked={draft.enabled} onChange={set('enabled')} label="Account panel enabled" description="Off: every account panel request is refused and the sign-in page says the panel is switched off. Account logins are still created and kept in sync." />
+            </Field>
+            <Field label="Two-factor authentication">
+              <Toggle checked={draft.require2faForUsers} onChange={set('require2faForUsers')} label="Require 2FA for account users" description="Account users must enrol an authenticator before using the panel and cannot disable it afterwards." />
+            </Field>
+            <Field label="Log in as window (minutes)" required error={errors.loginAsTtlMinutes} help={`How long a “Log in as” context lasts before it ends on its own (${LOGIN_AS_TTL.min}–${LOGIN_AS_TTL.max}).`}>
+              <NumberInput value={draft.loginAsTtlMinutes} onChange={set('loginAsTtlMinutes')} min={LOGIN_AS_TTL.min} max={LOGIN_AS_TTL.max} step={1} nullable />
+            </Field>
+            <Field label="Webmail URL" error={errors.webmailUrl} help="Shown as the webmail link in the account panel. Empty means auto-detect.">
+              <TextInput value={draft.webmailUrl} onChange={set('webmailUrl')} type="url" placeholder="https://webmail.example.com/" maxLength={2048} />
+            </Field>
+          </div>
+          {data?.loginAsAcl && <p className="muted">Resellers need the <code>{data.loginAsAcl}</code> privilege (Resellers › Edit Reseller Nameservers and Privileges) before they can log in to an account panel; root always may.</p>}
+          <ErrorBanner error={saveError} />
+          <FormActions>
+            <Button variant="primary" loading={saving} disabled={!dirty || invalid} onClick={save}>Save</Button>
+            <Button disabled={!dirty || saving} onClick={() => setEdits(null)}>Reset</Button>
+          </FormActions>
+        </>
+      )}
+    </Card>
+  );
+}
+
+export function loginAsStatus(row) {
+  if (row.ended_at) return { status: 'disabled', label: 'Ended' };
+  if (row.active) return { status: 'active', label: 'Active' };
+  return { status: 'warning', label: 'Expired' };
+}
+
+export function LoginAsHistoryCard() {
+  const t = useTableState({ pageSize: 25, sort: 'started_at', dir: 'desc' });
+  const { data, meta, loading, error } = useApi(`/panel/admin/login-as/history${queryString(t.state)}`);
+  return (
+    <Card title="Log in as history" subtitle="Every time an administrator opened an account's panel, with when it ended" padded={false}>
+      <DataTable
+        columns={[
+          { key: 'started_at', label: 'When', sortable: true, width: 170, render: (r) => <span style={{ whiteSpace: 'nowrap' }}>{formatDate(r.started_at)}</span> },
+          { key: 'actor', label: 'Admin', sortable: true, width: 140 },
+          { key: 'account', label: 'Account', sortable: true, width: 140 },
+          { key: 'ip', label: 'From', width: 130 },
+          { key: 'ended_at', label: 'Ended', width: 170, render: (r) => <span style={{ whiteSpace: 'nowrap' }}>{r.ended_at ? formatDate(r.ended_at) : r.active ? `Expires ${formatDate(r.expires_at)}` : formatDate(r.expires_at)}</span> },
+          { key: 'status', label: 'Status', width: 100, render: (r) => { const s = loginAsStatus(r); return <StatusPill status={s.status}>{s.label}</StatusPill>; } },
+        ]}
+        rows={data || []} loading={loading} error={error} rowKey={(r) => r.id}
+        total={meta?.total} page={t.state.page} pageSize={t.state.pageSize} onPageChange={t.setPage}
+        sort={t.state.sort} dir={t.state.dir} onSortChange={t.setSort}
+        emptyText="Nobody has logged in to an account panel yet. Use Log in as from Account Information › List Accounts." dense
+      />
+    </Card>
+  );
+}
+
+export function AccountPanelTab() {
+  return (
+    <>
+      <AccountPanelSettingsCard />
+      <LoginAsHistoryCard />
+    </>
+  );
+}
+
+// The account panel settings are root-only (the API is requireRoot), so a
+// reseller sees the branding form without tabs.
+export default function Customization({ fn }) {
+  const { user } = useAuth();
+  const location = useLocation();
+  const isRoot = user?.role === 'root';
+  const [tab, setTab] = useState(location.hash === ACCOUNT_PANEL_HASH ? 'account-panel' : 'branding');
+  useEffect(() => { if (location.hash === ACCOUNT_PANEL_HASH) setTab('account-panel'); }, [location.hash]);
+  const current = isRoot ? tab : 'branding';
+  return (
+    <>
+      <PageHeader fn={fn} />
+      {isRoot && <Tabs tabs={TABS} value={current} onChange={setTab} />}
+      {current === 'account-panel' ? <AccountPanelTab /> : <BrandingTab />}
     </>
   );
 }

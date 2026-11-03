@@ -5,7 +5,7 @@ import { createTestApp, createMockAgent } from './support/app.js';
 import { errorHandler, notFoundHandler } from '../src/middleware/error.js';
 import { HttpError } from '../src/lib/errors.js';
 import { register } from '../src/routes/panel/ftp.js';
-import { loginFor, resolveUnderHome, filezillaXml } from '../src/services/panel-ftp.js';
+import { loginFor, resolveUnderHome, filezillaXml, PROFTPD_SEPARATOR } from '../src/services/panel-ftp.js';
 
 // A host whose FTP daemon is switchable between pure-ftpd, proftpd and vsftpd;
 // virtual-user support per daemon is a flag the tests flip. Every ftp.* op
@@ -13,13 +13,16 @@ import { loginFor, resolveUnderHome, filezillaXml } from '../src/services/panel-
 function ftpAgent() {
   const state = { daemon: 'pure-ftpd', virtual: { 'pure-ftpd': true, proftpd: true }, users: new Map(), fail: null };
   const failWith = (code, message) => Object.assign(new Error(message), { agentError: true, code, details: {} });
+  // Logins the host already knows as system users: the real agent reads
+  // /etc/passwd (assertLoginFree) and answers `exists` before any tool runs.
+  const passwd = new Set(['root', 'daemon', 'alice', 'bob', 'alice_bob']);
   const ops = {
     'sys.binaries': ({ names }) => Object.fromEntries(names.map((n) => [n, ['pure-pw', 'ftpasswd', 'pure-ftpd', 'systemctl', 'useradd', 'usermod', 'userdel'].includes(n)])),
     'svc.list_units': () => [state.daemon],
     'web.service.detect': () => ({ role: 'ftp', candidates: ['pure-ftpd', 'proftpd', 'vsftpd'].map((name) => ({ name, installed: name === state.daemon, unitName: name === state.daemon ? name : null, unit: { active: name === state.daemon, enabled: name === state.daemon } })), active: [state.daemon], enabled: [state.daemon], current: state.daemon, packageManager: 'apt-get' }),
     'web.ftp.config.read': ({ server }) => ({ server, path: `/etc/${server}`, unit: { active: true }, settings: { tls: 'optional' }, raw: {} }),
     'ftp.virtual.status': ({ daemon }) => (daemon === 'vsftpd' ? { daemon, supported: false, enabled: false, hint: 'system users only' } : { daemon, supported: true, enabled: Boolean(state.virtual[daemon]), configured: Boolean(state.virtual[daemon]), passwdFile: `/etc/${daemon}/passwd`, hint: state.virtual[daemon] ? null : 'Enable PureDB' }),
-    'ftp.user.add': (args) => { if (state.fail === 'add') throw failWith('command_failed', 'pure-pw: disk full'); if (state.users.has(args.login)) throw failWith('exists', 'exists'); state.users.set(args.login, args); return { daemon: args.daemon, login: args.login, username: args.username, uid: 30001, gid: 30001, dir: args.dir, quotaMb: args.quotaMb }; },
+    'ftp.user.add': (args) => { if (passwd.has(args.login)) throw failWith('exists', `"${args.login}" is a system login on this server; a virtual FTP user cannot shadow it`); if (state.fail === 'add') throw failWith('command_failed', 'pure-pw: disk full'); if (state.users.has(args.login)) throw failWith('exists', 'exists'); state.users.set(args.login, args); return { daemon: args.daemon, login: args.login, username: args.username, uid: 30001, gid: 30001, dir: args.dir, quotaMb: args.quotaMb }; },
     'ftp.user.passwd': ({ login }) => { if (!state.users.has(login)) throw failWith('not_found', 'no such login'); return { login, changed: true }; },
     'ftp.user.set_quota': ({ daemon, login, quotaMb }) => { if (daemon !== 'pure-ftpd') throw failWith('unsupported', 'no quota on proftpd'); state.users.get(login).quotaMb = quotaMb; return { login, quotaMb }; },
     'ftp.user.remove': ({ login }) => ({ login, removed: state.users.delete(login) }),
@@ -28,6 +31,7 @@ function ftpAgent() {
   };
   const agent = createMockAgent(ops);
   agent.state = state;
+  agent.passwd = passwd;
   return agent;
 }
 
@@ -70,7 +74,14 @@ describe('panel ftp helpers', () => {
   it('derives logins per daemon and pins directories under the home', () => {
     const account = { username: 'alice', domain: 'alice.com' };
     expect(loginFor('pure-ftpd', 'shop', account)).toBe('shop@alice.com');
-    expect(loginFor('proftpd', 'shop', account)).toBe('shop_alice');
+    expect(loginFor('proftpd', 'shop', account)).toBe('shop.alice');
+    expect(PROFTPD_SEPARATOR).toBe('.');
+    // No derived login can spell a hosting username (arg.username alphabet),
+    // so a virtual user can never shadow another account's system login.
+    const USERNAME = /^[a-z][a-z0-9_-]{0,31}$/;
+    for (const [name, acct] of [['alice', { username: 'bob', domain: 'bob.com' }], ['alice_bob', { username: 'x', domain: 'x.com' }], ['a', { username: 'b', domain: 'b.c' }]]) {
+      for (const daemon of ['pure-ftpd', 'proftpd']) expect(USERNAME.test(loginFor(daemon, name, acct)), `${daemon} ${name}`).toBe(false);
+    }
     expect(resolveUnderHome('/home/alice', 'public_html/shop')).toBe('/home/alice/public_html/shop');
     expect(resolveUnderHome('/home/alice', '/public_html')).toBe('/home/alice/public_html');
     expect(resolveUnderHome('/home/alice', '.')).toBe('/home/alice');
@@ -214,16 +225,37 @@ describe('/api/panel/ftp', () => {
     expect(app.ctx.db.prepare("SELECT 1 FROM ftp_accounts WHERE name = 'broken'").get()).toBeFalsy();
   });
 
-  it('switches to proftpd logins <name>_<account> and drops the quota there', async () => {
+  it('switches to proftpd logins <name>.<account> and drops the quota there', async () => {
     app.agent.state.daemon = 'proftpd';
     try {
       const res = await post('/accounts', { ...good, login: 'pro' }).expect(201);
-      expect(res.body.data).toMatchObject({ login: 'pro_alice', daemon: 'proftpd', quotaMb: null });
-      expect(app.agent.callsTo('ftp.user.add')[0].args).toMatchObject({ daemon: 'proftpd', login: 'pro_alice', quotaMb: null });
+      expect(res.body.data).toMatchObject({ login: 'pro.alice', daemon: 'proftpd', quotaMb: null });
+      expect(app.agent.callsTo('ftp.user.add')[0].args).toMatchObject({ daemon: 'proftpd', login: 'pro.alice', quotaMb: null });
       const q = await put(`/accounts/${res.body.data.id}/quota`, { quotaMb: 5 }).expect(422);
       expect(q.body.error.code).toBe('unsupported');
       await del(`/accounts/${res.body.data.id}`).expect(200);
     } finally { app.agent.state.daemon = 'pure-ftpd'; }
+  });
+
+  it('cannot squat another account\'s system login on proftpd: the derived login never collides and a passwd hit is refused', async () => {
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'alice_bob', domain: 'alice-bob.com' }).expect(201);
+    app.agent.state.daemon = 'proftpd';
+    try {
+      // bob asks for "alice": the login is alice.bob, never the hosting account alice_bob.
+      const res = await post('/accounts', { ...good, login: 'alice' }, 'bob').expect(201);
+      expect(res.body.data.login).toBe('alice.bob');
+      expect(app.agent.callsTo('ftp.user.add')[0].args.login).toBe('alice.bob');
+      await del(`/accounts/${res.body.data.id}`, 'bob').expect(200);
+      // Were a login ever to reach the agent under a system user's name, the agent's passwd check refuses it and no row is written.
+      app.agent.passwd.add('squat.alice');
+      const refused = await post('/accounts', { ...good, login: 'squat' }).expect(409);
+      expect(refused.body.error.message).toMatch(/system login/);
+      expect(app.ctx.db.prepare("SELECT 1 FROM ftp_accounts WHERE login = 'squat.alice'").get()).toBeFalsy();
+      app.agent.passwd.delete('squat.alice');
+    } finally {
+      app.agent.state.daemon = 'pure-ftpd';
+      await app.http.delete('/api/accounts/alice_bob').set('X-CSRF-Token', csrf).send({ confirm: 'alice_bob' });
+    }
   });
 
   it('reports vsftpd as unsupported and answers 501 on create', async () => {
@@ -241,7 +273,9 @@ describe('/api/panel/ftp', () => {
     app.agent.state.virtual['pure-ftpd'] = false;
     const enable = vi.fn(async () => { app.agent.state.virtual['pure-ftpd'] = true; });
     const ftp = app.ctx.web.ftp;
+    const seam = Object.getOwnPropertyDescriptor(ftp, 'enableVirtualUsers');
     try {
+      delete ftp.enableVirtualUsers;
       const off = await get('/accounts').expect(200);
       expect(off.body.meta).toMatchObject({ supported: false, virtualUsersEnabled: false, canEnable: false });
       expect((await post('/accounts', { ...good, login: 'novirt' }).expect(501)).body.error.code).toBe('capability_missing');
@@ -250,6 +284,6 @@ describe('/api/panel/ftp', () => {
       expect(enable).toHaveBeenCalledTimes(1);
       expect(res.body.data.login).toBe('virt@alice.com');
       await del(`/accounts/${res.body.data.id}`).expect(200);
-    } finally { delete ftp.enableVirtualUsers; app.agent.state.virtual['pure-ftpd'] = true; }
+    } finally { if (seam) Object.defineProperty(ftp, 'enableVirtualUsers', seam); else delete ftp.enableVirtualUsers; app.agent.state.virtual['pure-ftpd'] = true; }
   });
 });

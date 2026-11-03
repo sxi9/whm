@@ -26,10 +26,10 @@ export function AddressList({ title, subtitle, addresses, onChange, error, max =
   };
   return (
     <Card title={title} subtitle={subtitle} actions={<span className="muted">{addresses.length} of {max}</span>}>
-      <form onSubmit={(e) => { e.preventDefault(); add(); }} className="input-group" style={{ maxWidth: 480 }}>
-        <TextInput value={draft} onChange={setDraft} type="email" placeholder="sender@example.com" aria-label={`Add to ${title.toLowerCase()}`} autoCapitalize="none" />
-        <Button type="submit" icon={Plus} disabled={!draft.trim() || addresses.length >= max}>Add</Button>
-      </form>
+      <div className="input-group" style={{ maxWidth: 480 }}>
+        <TextInput value={draft} onChange={setDraft} type="email" placeholder="sender@example.com" aria-label={`Add to ${title.toLowerCase()}`} autoCapitalize="none" onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } }} />
+        <Button icon={Plus} disabled={!draft.trim() || addresses.length >= max} onClick={add}>Add</Button>
+      </div>
       {error && <div className="field-message">{Array.isArray(error) ? error.join(', ') : String(error)}</div>}
       {addresses.length === 0 ? <p className="muted" style={{ marginTop: 12 }}>No addresses yet. Add one above and save.</p> : (
         <div className="table-wrap" style={{ marginTop: 12 }}>

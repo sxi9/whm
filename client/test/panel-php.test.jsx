@@ -100,7 +100,7 @@ describe('PHP versions', () => {
 
   it('versionOptions, versionLabel and webResult', () => {
     expect(versionOptions(versionsData, '8.3').map((o) => o.value)).toEqual([INHERIT, '8.3', '8.2']);
-    expect(versionOptions(versionsData, '8.3')[1].label).toBe('PHP 8.3 (8.3.6) · security advisory');
+    expect(versionOptions(versionsData, '8.3')[1].label).toBe('PHP 8.3 (8.3.6)');
     expect(versionOptions(null, null)[0].label).toBe('Server default');
     expect(versionLabel(versionsData.versions, '8.2')).toBe('PHP 8.2 (8.2.20)');
     expect(versionLabel([], '7.4')).toBe('PHP 7.4');

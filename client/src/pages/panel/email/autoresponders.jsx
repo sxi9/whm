@@ -67,7 +67,8 @@ export function AutoresponderForm({ domains, existing, onSubmit, onCancel, busy,
             <span className="muted" style={{ alignSelf: 'center' }}>hours apart</span>
           </div>
         </Field>
-        <div />
+      </div>
+      <div className="form-grid">
         <Field label="Start" error={fieldError(error, 'startAt')} help="Leave empty to start right away.">
           <TextInput type="datetime-local" value={startAt} onChange={setStartAt} aria-label="Start" />
         </Field>

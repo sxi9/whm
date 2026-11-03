@@ -23,7 +23,7 @@ export function versionLabel(versions, id) {
 export function versionOptions(data, systemDefault) {
   const list = data?.versions || [];
   const def = data?.defaultId || systemDefault;
-  return [{ value: INHERIT, label: `Server default${def ? ` (${versionLabel(list, def)})` : ''}` }, ...list.map((v) => ({ value: v.id, label: `${versionLabel(list, v.id)}${v.advisories?.length ? ' · security advisory' : ''}` }))];
+  return [{ value: INHERIT, label: `Server default${def ? ` (${versionLabel(list, def)})` : ''}` }, ...list.map((v) => ({ value: v.id, label: versionLabel(list, v.id) }))];
 }
 
 export default function PhpVersions({ fn }) {
