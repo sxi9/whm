@@ -13,7 +13,7 @@ const jobParam = z.object({ id: fields.id });
 export async function register(ctx) {
   const svc = createPanelFilesService(ctx);
   ctx.panelFiles = svc;
-  ctx.capabilities.register('panel-files', { binaries: ['setpriv', 'runuser'], required: ['setpriv', 'runuser'] });
+  ctx.capabilities.register('panel-files', { binaries: ['setpriv', 'runuser', 'hexdump'], required: ['setpriv', 'runuser'] });
   ctx.capabilities.register('archive', { binaries: ['zip', 'unzip', 'tar', 'gzip'], required: ['zip', 'tar'] });
   ctx.jobs.register(JOB_ARCHIVE, (job) => svc.runArchiveJob(job));
   ctx.jobs.register(JOB_EXTRACT, (job) => svc.runExtractJob(job));

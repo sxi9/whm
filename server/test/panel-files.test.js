@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { relPath, UPLOAD_TTL_MS } from '../src/services/panel-files.js';
+import { relPath, UPLOAD_TTL_MS, DOWNLOAD_CHUNK_BYTES, createGate, sshWriteAllowed } from '../src/services/panel-files.js';
 
 // A tiny fake home tree the mock agent answers from. Paths are absolute, as the
 // service sends them; the mock records every call for the assertions.
@@ -13,8 +13,11 @@ function fakeFs() {
   file('/home/alice/public_html/index.html', '<h1>alice</h1>\n');
   file('/home/alice/public_html/logo.bin', Buffer.from([0x89, 0x50, 0x00, 0x47]));
   file('/home/alice/notes.txt', 'abcdefghijklmnopqrstuvwxyz0123456789');
-  dir('/home/bob'); file('/home/bob/secret.txt', 'bob only');
-  return { tree, dir, file };
+  file('/home/alice/site.zip', 'zipdata');
+  dir('/home/bob'); file('/home/bob/secret.txt', 'bob only'); file('/home/bob/b.zip', 'zipdata');
+  // When set, the mock's archive / chunk_read answers wait on it so jobs and
+  // downloads can be observed while they are in flight.
+  return { tree, dir, file, block: null, readBlock: null };
 }
 
 const BINS = { setpriv: true, runuser: true, zip: true, unzip: true, tar: true, gzip: true, useradd: true, usermod: true, userdel: true, chpasswd: true };
@@ -41,7 +44,8 @@ function hostAgent(fs) {
       return { path, size: e.content.length, bytes: Math.min(maxBytes, e.content.length), truncated: e.content.length > maxBytes, binary, content: binary ? null : e.content.subarray(0, maxBytes).toString(), mtime: 'x', mode: e.mode };
     },
     // Answers at most 5 bytes per call so a download must loop until eof.
-    'files.chunk_read': ({ path, offset, length }) => {
+    'files.chunk_read': async ({ path, offset, length }) => {
+      if (fs.readBlock) await fs.readBlock;
       const e = fs.tree.get(path);
       const slice = e.content.subarray(offset, offset + Math.min(length, 5));
       return { path, size: e.content.length, offset, length: slice.length, data: slice.toString('base64'), eof: offset + slice.length >= e.content.length };
@@ -59,10 +63,56 @@ function hostAgent(fs) {
     'files.remove': ({ paths }) => { for (const p of paths) fs.tree.delete(p); return { removed: paths }; },
     'files.chmod': ({ path, mode, recursive }) => ({ path, mode, recursive }),
     'files.du': ({ path, depth }) => ({ path, depth, totalKb: 1234, entries: [{ path: 'public_html', kb: 1000 }], partial: false }),
-    'files.archive': ({ dest, format, paths }) => { fs.file(dest, 'zipdata'); return { dest, format, members: paths.length, size: 7 }; },
+    'files.archive': async ({ dest, format, paths }) => { if (fs.block) await fs.block; fs.file(dest, 'zipdata'); return { dest, format, members: paths.length, size: 7 }; },
     'files.extract': ({ archive, dest }) => ({ archive, dest, format: 'zip', warnings: [] }),
   });
 }
+
+describe('createGate', () => {
+  it('bounds work per key and overall, serves waiters in arrival order and refuses a key with too many waiters', async () => {
+    const gate = createGate({ perKey: () => 2, total: () => 3, maxWaiting: () => 2 });
+    const running = new Map();
+    let peak = 0;
+    const peakPer = new Map();
+    const order = [];
+    const releases = [];
+    const task = (key, name) => gate.run(key, async () => {
+      order.push(name);
+      running.set(key, (running.get(key) ?? 0) + 1);
+      peak = Math.max(peak, [...running.values()].reduce((a, b) => a + b, 0));
+      peakPer.set(key, Math.max(peakPer.get(key) ?? 0, running.get(key)));
+      await new Promise((r) => releases.push(r));
+      running.set(key, running.get(key) - 1);
+    });
+    const all = [task(1, 'a1'), task(1, 'a2'), task(1, 'a3'), task(2, 'b1'), task(2, 'b2'), task(1, 'a4')];
+    await new Promise((r) => setImmediate(r));
+    expect(order).toEqual(['a1', 'a2', 'b1']);
+    expect(gate.stats()).toMatchObject({ active: 3, waiting: 3 });
+    await expect(gate.run(1, async () => 'never')).rejects.toMatchObject({ status: 409, code: 'busy' });
+    while (releases.length) { releases.shift()(); await new Promise((r) => setImmediate(r)); }
+    await Promise.all(all);
+    expect(order).toEqual(['a1', 'a2', 'b1', 'a3', 'b2', 'a4']);
+    expect(peak).toBeLessThanOrEqual(3);
+    expect(peakPer.get(1)).toBeLessThanOrEqual(2);
+    expect(gate.stats()).toEqual({ active: 0, waiting: 0, keys: {} });
+    await expect(gate.run(1, async () => { throw new Error('boom'); })).rejects.toThrow('boom');
+    expect(gate.stats().active).toBe(0);
+  });
+});
+
+describe('sshWriteAllowed', () => {
+  it('mirrors the SSH-key gate: ssh feature, shell access, a session login and no impersonation', () => {
+    const scope = { accountId: 1, username: 'a', mode: 'user', features: {}, account: { plan: { has_shell: true } } };
+    expect(sshWriteAllowed(scope, { auth: { via: 'session' } })).toBe(true);
+    expect(sshWriteAllowed(scope, {})).toBe(true);
+    expect(sshWriteAllowed({ ...scope, features: { ssh: false } }, {})).toBe(false);
+    expect(sshWriteAllowed({ ...scope, account: { plan: { has_shell: false } } }, {})).toBe(false);
+    expect(sshWriteAllowed({ ...scope, account: { plan: {} } }, {})).toBe(false);
+    expect(sshWriteAllowed(scope, { auth: { via: 'token' } })).toBe(false);
+    expect(sshWriteAllowed({ ...scope, mode: 'acting', actingAs: { by: 1 } }, {})).toBe(false);
+    expect(sshWriteAllowed(null, {})).toBe(false);
+  });
+});
 
 describe('relPath', () => {
   it('accepts plain relative paths and refuses "..", leading "-", NUL, absolute paths and over-long paths', () => {
@@ -148,7 +198,7 @@ describe('Panel files API', () => {
       const root = await get('/list');
       expect(root.status).toBe(200);
       expect(root.body.data.path).toBe('.');
-      expect(root.body.data.entries.map((e) => e.name).sort()).toEqual(['.ssh', 'notes.txt', 'public_html']);
+      expect(root.body.data.entries.map((e) => e.name).sort()).toEqual(['.ssh', 'notes.txt', 'public_html', 'site.zip']);
       expect(app.agent.callsTo('files.list')[0].args).toEqual({ username: 'alice', path: '/home/alice', limit: 2000 });
       const sub = await get('/list?path=public_html&limit=1');
       expect(sub.body.data).toMatchObject({ path: 'public_html', total: 2, truncated: true });
@@ -295,7 +345,7 @@ describe('Panel files API', () => {
       expect(res.status).toBe(202);
       const job = await waitForJob(app.ctx, res.body.data.job.id);
       expect(job.status).toBe('done');
-      expect(app.agent.callsTo('files.extract')[0].args).toEqual({ username: 'alice', archive: '/home/alice/backup.zip', dest: '/home/alice/restored' });
+      expect(app.agent.callsTo('files.extract')[0].args).toEqual({ username: 'alice', archive: '/home/alice/backup.zip', dest: '/home/alice/restored', allowSshDir: false });
       expect((await post('/extract', { archive: 'notes.txt', dest: 'x' })).status).toBe(422);
       expect((await post('/extract', { archive: 'missing.zip', dest: 'x' })).status).toBe(404);
     });
@@ -308,6 +358,199 @@ describe('Panel files API', () => {
         expect(res.status).toBe(501);
         expect(res.body.error.code).toBe('capability_missing');
       } finally { BINS.zip = true; app.ctx.capabilities.snapshot().at = 0; }
+    });
+  });
+
+  describe('.ssh is reserved for the SSH-key feature', () => {
+    const setPlan = (username, key, value) => db().prepare(`UPDATE accounts SET plan_snapshot_json = json_set(plan_snapshot_json, '$.${key}', json(?)) WHERE username = ?`).run(JSON.stringify(value), username);
+    const attempts = () => [
+      ['put', '/write', { path: '.ssh/authorized_keys', content: 'ssh-ed25519 AAAA x\n', mode: '0600' }],
+      ['post', '/mkdir', { path: '.ssh', mode: '0700' }],
+      ['post', '/mkdir', { path: '.ssh/sub' }],
+      ['post', '/rename', { from: 'notes.txt', to: '.ssh/authorized_keys' }],
+      ['post', '/rename', { from: '.ssh', to: 'ssh-old' }],
+      ['post', '/copy', { from: 'notes.txt', to: '.ssh/authorized_keys' }],
+      ['post', '/chmod', { path: '.ssh', mode: '0777' }],
+      ['delete', '', { paths: ['notes.txt', '.ssh'] }],
+      ['post', '/uploads', { path: '.ssh', name: 'authorized_keys', size: 3 }],
+      ['post', '/uploads', { path: '', name: '.ssh', size: 3 }],
+      ['post', '/archive', { paths: ['notes.txt'], dest: '.ssh/a.zip', format: 'zip' }],
+      ['post', '/extract', { archive: 'site.zip', dest: '.ssh' }],
+    ];
+
+    it('refuses every write into .ssh for an account without shell access, before the agent is called', async () => {
+      for (const [method, p, body] of attempts()) {
+        const res = await ({ get, put, post, delete: del })[method](p, body);
+        expect(res.status, `${method} ${p} ${JSON.stringify(body)}`).toBe(403);
+        expect(res.body.error.code).toBe('ssh_managed');
+      }
+      expect(app.agent.calls.filter((c) => c.name.startsWith('files.'))).toHaveLength(0);
+      expect((await get('/list?path=.ssh')).status).toBe(200);
+      expect((await put('/write', { path: 'public_html/.ssh/x', content: 'not the home .ssh' })).status).toBe(200);
+      expect((await put('/write', { path: '.sshx', content: 'different name' })).status).toBe(200);
+      expect(app.agent.callsTo('files.write').map((c) => c.args.path)).toEqual(['/home/alice/public_html/.ssh/x', '/home/alice/.sshx']);
+    });
+
+    it('extracts into the home with .ssh members refused by the agent, and lets the agent allow them only when the request could write .ssh itself', async () => {
+      let res = await post('/extract', { archive: 'site.zip', dest: '' });
+      expect(res.status).toBe(202);
+      expect((await waitForJob(app.ctx, res.body.data.job.id)).status).toBe('done');
+      expect(app.agent.callsTo('files.extract').at(-1).args).toEqual({ username: 'alice', archive: '/home/alice/site.zip', dest: '/home/alice', allowSshDir: false });
+      setPlan('alice', 'has_shell', true);
+      setPlan('alice', 'features.ssh', true);
+      try {
+        res = await post('/extract', { archive: 'site.zip', dest: 'again' });
+        expect(res.status).toBe(202);
+        await waitForJob(app.ctx, res.body.data.job.id);
+        expect(app.agent.callsTo('files.extract').at(-1).args.allowSshDir).toBe(true);
+        expect((await put('/write', { path: '.ssh/config', content: 'Host x\n' })).status).toBe(200);
+        expect(app.agent.callsTo('files.write').at(-1).args.path).toBe('/home/alice/.ssh/config');
+        setPlan('alice', 'features.ssh', false);
+        expect((await put('/write', { path: '.ssh/config', content: 'Host y\n' })).body.error.code).toBe('ssh_managed');
+        setPlan('alice', 'features.ssh', true);
+      } finally { setPlan('alice', 'has_shell', false); setPlan('alice', 'features.ssh', true); }
+    });
+
+    it('is refused over an API token and while an admin acts as the account even when the plan allows ssh', async () => {
+      setPlan('alice', 'has_shell', true);
+      try {
+        const minted = (await alice.post('/api/panel/tokens').set('X-CSRF-Token', aliceCsrf).send({ name: 'files', scopes: ['panel:files'] })).body.data.token;
+        const bearer = request(app.ctx.app);
+        expect((await bearer.put('/api/panel/files/write').set('Authorization', `Bearer ${minted}`).send({ path: 'public_html/ok.txt', content: 'x' })).status).toBe(200);
+        const viaToken = await bearer.put('/api/panel/files/write').set('Authorization', `Bearer ${minted}`).send({ path: '.ssh/authorized_keys', content: 'ssh-ed25519 AAAA x\n' });
+        expect(viaToken.status).toBe(403);
+        expect(viaToken.body.error.code).toBe('ssh_managed');
+        const tokenExtract = await bearer.post('/api/panel/files/extract').set('Authorization', `Bearer ${minted}`).send({ archive: 'site.zip', dest: '' });
+        expect(tokenExtract.status).toBe(202);
+        await waitForJob(app.ctx, tokenExtract.body.data.job.id);
+        expect(app.agent.callsTo('files.extract').at(-1).args.allowSshDir).toBe(false);
+        await rootPost('/api/panel/admin/login-as/alice').expect(200);
+        try {
+          const acting = await rootPost('/api/panel/files/mkdir', { path: '.ssh', mode: '0700' });
+          expect(acting.status).toBe(403);
+          expect(acting.body.error.code).toBe('ssh_managed');
+          const actingExtract = await rootPost('/api/panel/files/extract', { archive: 'site.zip', dest: 'x' });
+          expect(actingExtract.status).toBe(202);
+          await waitForJob(app.ctx, actingExtract.body.data.job.id);
+          expect(app.agent.callsTo('files.extract').at(-1).args.allowSshDir).toBe(false);
+        } finally { await rootPost('/api/panel/admin/logout-as').expect(200); }
+        expect(app.agent.callsTo('files.write').map((c) => c.args.path)).toEqual(['/home/alice/public_html/ok.txt']);
+        expect(app.agent.callsTo('files.mkdir')).toHaveLength(0);
+      } finally { setPlan('alice', 'has_shell', false); }
+    });
+  });
+
+  describe('job caps and the account job reader', () => {
+    const setting = (k, v) => app.ctx.settings.set(k, v);
+    const release = () => { const r = fs.release; fs.block = null; fs.release = null; r?.(); };
+    const hold = () => { fs.block = new Promise((r) => { fs.release = r; }); };
+    const poll = async (fn, ms = 2000) => { const t = Date.now(); while (!fn()) { if (Date.now() - t > ms) throw new Error('condition not met'); await new Promise((r) => setTimeout(r, 20)); } };
+
+    it('caps queued + running jobs per account, reuses an identical request and answers 409 busy beyond the cap', async () => {
+      setting('panel.files.max_active_jobs_per_account', 2);
+      hold();
+      try {
+        const a1 = await post('/archive', { paths: ['notes.txt'], dest: 'cap1.zip', format: 'zip' });
+        const a2 = await post('/archive', { paths: ['notes.txt'], dest: 'cap2.tar.gz', format: 'tar.gz' });
+        expect([a1.status, a2.status]).toEqual([202, 202]);
+        expect(a1.body.data.reused).toBe(false);
+        const a3 = await post('/archive', { paths: ['notes.txt'], dest: 'cap3.zip', format: 'zip' });
+        expect(a3.status).toBe(409);
+        expect(a3.body.error.code).toBe('busy');
+        const x = await post('/extract', { archive: 'site.zip', dest: 'cap-x' });
+        expect(x.status).toBe(409);
+        const again = await post('/archive', { paths: ['public_html'], dest: 'cap1.zip', format: 'zip' });
+        expect(again.status).toBe(202);
+        expect(again.body.data).toMatchObject({ job: { id: a1.body.data.job.id }, reused: true });
+        expect(app.agent.callsTo('files.archive').length).toBeLessThanOrEqual(2);
+        // Another account is not held back by alice's queue.
+        await rootPost('/api/panel/admin/login-as/bob').expect(200);
+        try { expect((await rootPost('/api/panel/files/archive', { paths: ['secret.txt'], dest: 'bob1.zip', format: 'zip' })).status).toBe(202); } finally { await rootPost('/api/panel/admin/logout-as').expect(200); }
+        release();
+        for (const id of [a1.body.data.job.id, a2.body.data.job.id]) expect((await waitForJob(app.ctx, id)).status).toBe('done');
+        await poll(() => app.ctx.jobs.list({ status: 'running' }).length === 0 && app.ctx.jobs.list({ status: 'queued' }).length === 0);
+        expect((await post('/archive', { paths: ['notes.txt'], dest: 'cap3.zip', format: 'zip' })).status).toBe(202);
+      } finally { release(); setting('panel.files.max_active_jobs_per_account', 3); }
+    });
+
+    it('caps the files jobs of the whole server', async () => {
+      await poll(() => app.ctx.jobs.list({ status: 'running' }).length === 0 && app.ctx.jobs.list({ status: 'queued' }).length === 0);
+      setting('panel.files.max_active_jobs', 1);
+      hold();
+      try {
+        const a = await post('/archive', { paths: ['notes.txt'], dest: 'global1.zip', format: 'zip' });
+        expect(a.status).toBe(202);
+        await rootPost('/api/panel/admin/login-as/bob').expect(200);
+        try {
+          const b = await rootPost('/api/panel/files/archive', { paths: ['secret.txt'], dest: 'bob-global.zip', format: 'zip' });
+          expect(b.status).toBe(409);
+          expect(b.body.error.code).toBe('busy');
+        } finally { await rootPost('/api/panel/admin/logout-as').expect(200); }
+        release();
+        expect((await waitForJob(app.ctx, a.body.data.job.id)).status).toBe('done');
+      } finally { release(); setting('panel.files.max_active_jobs', 24); }
+    });
+
+    it('lets the account read and stream its own jobs only, without the absolute paths the agent received', async () => {
+      await poll(() => app.ctx.jobs.list({ status: 'running' }).length === 0 && app.ctx.jobs.list({ status: 'queued' }).length === 0);
+      const mine = await get('/jobs');
+      expect(mine.status).toBe(200);
+      expect(mine.body.data.length).toBeGreaterThan(0);
+      expect(mine.body.data.every((j) => ['panel.files.archive', 'panel.files.extract'].includes(j.type))).toBe(true);
+      expect(JSON.stringify(mine.body.data)).not.toContain('/home/');
+      const one = await get(`/jobs/${mine.body.data[0].id}`);
+      expect(one.status).toBe(200);
+      expect(one.body.data).toMatchObject({ id: mine.body.data[0].id, status: 'done', logs: expect.any(Array), params: { username: 'alice' } });
+      expect(one.body.data.params.op).toBeUndefined();
+      const stream = await get(`/jobs/${mine.body.data[0].id}/stream`).buffer(true).parse((r, cb) => { let t = ''; r.on('data', (c) => { t += c; }); r.on('end', () => cb(null, t)); });
+      expect(stream.status).toBe(200);
+      expect(stream.headers['content-type']).toMatch(/text\/event-stream/);
+      expect(stream.body).toContain('"type":"snapshot"');
+      const bobsJob = app.ctx.jobs.list({ type: 'panel.files.archive', limit: 200 }).find((j) => j.params.username === 'bob');
+      expect(bobsJob).toBeTruthy();
+      expect((await get(`/jobs/${bobsJob.id}`)).status).toBe(404);
+      expect((await get(`/jobs/${bobsJob.id}/stream`)).status).toBe(404);
+      expect((await get('/jobs/999999')).status).toBe(404);
+      expect((await get('/jobs/abc')).status).toBe(422);
+      expect((await carolHttp.get('/api/panel/files/jobs')).status).toBe(403);
+      expect((await app.http.get(`/api/panel/files/jobs/${mine.body.data[0].id}`)).status).toBe(403);
+    });
+  });
+
+  describe('agent ops in flight per account', () => {
+    const setting = (k, v) => app.ctx.settings.set(k, v);
+    const poll = async (fn, ms = 2000) => { const t = Date.now(); while (!fn()) { if (Date.now() - t > ms) throw new Error('condition not met'); await new Promise((r) => setTimeout(r, 10)); } };
+    // superagent sends only once a request is awaited, so each download is started explicitly.
+    const download = () => get('/download?path=notes.txt').buffer(true).parse((r, cb) => { const chunks = []; r.on('data', (c) => chunks.push(c)); r.on('end', () => cb(null, Buffer.concat(chunks))); }).then((r) => r);
+
+    it('reads downloads in ranges no larger than 2 MiB', () => {
+      expect(DOWNLOAD_CHUNK_BYTES).toBeLessThanOrEqual(2 * 1024 * 1024);
+    });
+
+    it('lets at most N ops of one account reach the agent at once, queues the next request and refuses a flood', async () => {
+      setting('panel.files.max_inflight_per_account', 1);
+      setting('panel.files.max_waiting_per_account', 1);
+      let release;
+      fs.readBlock = new Promise((r) => { release = r; });
+      try {
+        const first = download();
+        await poll(() => app.agent.callsTo('files.chunk_read').length === 1);
+        const second = download();
+        await poll(() => app.ctx.panelFiles._inflight.stats().waiting === 1);
+        expect(app.agent.callsTo('files.chunk_read')).toHaveLength(1);
+        const third = await get('/list');
+        expect(third.status).toBe(409);
+        expect(third.body.error.code).toBe('busy');
+        expect(app.ctx.panelFiles._inflight.stats()).toMatchObject({ active: 1, waiting: 1 });
+        fs.readBlock = null;
+        release();
+        const [a, b] = await Promise.all([first, second]);
+        expect(a.status).toBe(200);
+        expect(b.status).toBe(200);
+        expect(a.body.toString()).toBe('abcdefghijklmnopqrstuvwxyz0123456789');
+        expect(b.body.toString()).toBe('abcdefghijklmnopqrstuvwxyz0123456789');
+        expect(app.ctx.panelFiles._inflight.stats()).toEqual({ active: 0, waiting: 0, keys: {} });
+      } finally { fs.readBlock = null; release?.(); setting('panel.files.max_inflight_per_account', 2); setting('panel.files.max_waiting_per_account', 64); }
     });
   });
 

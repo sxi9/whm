@@ -144,6 +144,17 @@ describe('Panel security API', () => {
   });
 
   describe('ssh keys', () => {
+    it('cannot be planted through the file manager while the account has no shell access', async () => {
+      const files = (p, body) => alice.put(`/api/panel/files${p}`).set('X-CSRF-Token', aliceCsrf).send(body);
+      const res = await files('/write', { path: '.ssh/authorized_keys', content: `${ED25519}\n`, mode: '0600' });
+      expect(res.status).toBe(403);
+      expect(res.body.error.code).toBe('ssh_managed');
+      const mk = await alice.post('/api/panel/files/mkdir').set('X-CSRF-Token', aliceCsrf).send({ path: '.ssh', mode: '0700' });
+      expect(mk.body.error.code).toBe('ssh_managed');
+      expect(app.agent.calls.filter((c) => c.name.startsWith('files.'))).toHaveLength(0);
+      expect(state.files['/home/alice/.ssh/authorized_keys']).toBeUndefined();
+    });
+
     it('is gated by the ssh feature and by shell access', async () => {
       let res = await get('/ssh-keys');
       expect(res.status).toBe(403);
@@ -183,6 +194,21 @@ describe('Panel security API', () => {
       expect(lastAudit('panel.ssh_key.remove')).toMatchObject({ target: 'alice' });
       expect((await del(`/ssh-keys/${id}`)).status).toBe(404);
       expect((await del('/ssh-keys/not-hex')).status).toBe(422);
+    });
+
+    it('opens .ssh to the file manager under exactly the same gate: session login with shell access, never a token', async () => {
+      const ok = await alice.put('/api/panel/files/write').set('X-CSRF-Token', aliceCsrf).send({ path: '.ssh/config', content: 'Host example\n' });
+      expect(ok.status).toBe(200);
+      expect(app.agent.callsTo('files.write').at(-1).args.path).toBe('/home/alice/.ssh/config');
+      const minted = (await alice.post('/api/panel/tokens').set('X-CSRF-Token', aliceCsrf).send({ name: 'files', scopes: ['panel:files'] })).body.data.token;
+      const viaToken = await request(app.ctx.app).put('/api/panel/files/write').set('Authorization', `Bearer ${minted}`).send({ path: '.ssh/authorized_keys', content: `${ECDSA}\n` });
+      expect(viaToken.status).toBe(403);
+      expect(viaToken.body.error.code).toBe('ssh_managed');
+      setPlan('alice', 'has_shell', false);
+      const noShell = await alice.put('/api/panel/files/write').set('X-CSRF-Token', aliceCsrf).send({ path: '.ssh/authorized_keys', content: `${ECDSA}\n` });
+      expect(noShell.body.error.code).toBe('ssh_managed');
+      setPlan('alice', 'has_shell', true);
+      expect(state.files['/home/alice/.ssh/authorized_keys']).toBe(`# keep me\n${RSA}\n`);
     });
   });
 

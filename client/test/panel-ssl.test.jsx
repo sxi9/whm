@@ -121,7 +121,7 @@ describe('SSL status', () => {
   it('RequestError puts the 501 state on a card unless inline', () => {
     expect(renderToStaticMarkup(<RequestError error={NO_DAEMON} />)).toMatch(/^<section class="card ">/);
     expect(renderToStaticMarkup(<RequestError error={NO_DAEMON} inline />)).toMatch(/^<div class="empty-state/);
-    expect(renderToStaticMarkup(<RequestError error={FEATURE_OFF} fn={fns.status} />)).toContain('Not included in your plan');
+    expect(render(<RequestError error={FEATURE_OFF} fn={fns.status} />)).toContain('Not included in your plan');
     expect(renderToStaticMarkup(<RequestError error={{ status: 500, message: 'boom' }} />)).toContain('boom');
     expect(renderToStaticMarkup(<RequestError error={null} />)).toBe('');
   });

@@ -155,15 +155,17 @@ export function createPanelFilesService(ctx) {
     const { op: _op, ...params } = job.params ?? {};
     return { id: job.id, type: job.type, status: job.status, progress: job.progress, message: job.message, params, result: job.result ?? null, error: job.error ?? null, errorCode: job.error_code ?? null, createdAt: job.created_at, startedAt: job.started_at, finishedAt: job.finished_at, ...(job.logs ? { logs: job.logs } : {}) };
   }
-  // Refuses a new job when the account (or the server) already has enough
-  // files jobs queued or running; returns the account's active jobs so an
-  // identical request can reuse one instead of queueing a duplicate.
-  function assertJobCapacity(scope) {
+  // An identical request reuses the job already queued or running for it;
+  // otherwise a new job is refused when the account (or the server) already
+  // has enough files jobs active.
+  function existingOrCapacity(scope, same) {
     const all = activeJobs();
     const mine = all.filter((j) => j.params?.accountId === scope.accountId);
+    const found = mine.find(same);
+    if (found) return found;
     if (mine.length >= limit('active_jobs_per_account')) throw new HttpError(409, 'busy', `${mine.length} file operation(s) of this account are already queued or running; wait for one to finish`);
     if (all.length >= limit('active_jobs')) throw new HttpError(409, 'busy', 'The server is busy with other file operations right now; try again in a moment');
-    return mine;
+    return null;
   }
   const jobOf = (scope, id) => {
     const job = jobs.get(id);
@@ -389,7 +391,7 @@ export function createPanelFilesService(ctx) {
       const members = paths.map((p) => resolve(scope, p));
       if (members.some((m) => m.rel === '.')) throw unprocessable('Request validation failed', { paths: ['The home directory itself cannot be archived'] });
       guardSsh(scope, out, req);
-      const same = assertJobCapacity(scope).find((j) => j.type === JOB_ARCHIVE && j.params.dest === out.rel);
+      const same = existingOrCapacity(scope, (j) => j.type === JOB_ARCHIVE && j.params.dest === out.rel);
       if (same) return { job: { id: same.id, type: same.type, status: same.status }, reused: true };
       const existing = await op(scope, 'files.stat', { username: scope.username, path: out.abs }, req);
       if (existing.exists) throw new HttpError(409, 'exists', `${out.rel} already exists`);
@@ -406,7 +408,7 @@ export function createPanelFilesService(ctx) {
       if (!bin) throw unprocessable('Request validation failed', { archive: ['Only .zip, .tar, .tar.gz and .tgz archives can be extracted'] });
       await requireBinary(bin, 'extract archives');
       guardSsh(scope, out, req);
-      const same = assertJobCapacity(scope).find((j) => j.type === JOB_EXTRACT && j.params.archive === src.rel && j.params.dest === out.rel);
+      const same = existingOrCapacity(scope, (j) => j.type === JOB_EXTRACT && j.params.archive === src.rel && j.params.dest === out.rel);
       if (same) return { job: { id: same.id, type: same.type, status: same.status }, reused: true };
       const st = await op(scope, 'files.stat', { username: scope.username, path: src.abs }, req);
       if (!st.exists) throw notFound(src.rel);
