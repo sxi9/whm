@@ -8,7 +8,7 @@
 
 ## Current state
 
-- **Branch:** `claude/kind-meitner-dlnbas` · **Last updated:** 2026-11-03 20:25 UTC · **Phase 7 (new UI, own identity, customer panel) in progress — see the Phase 7 table below and `HANDOFF.md` §4**
+- **Branch:** `claude/kind-meitner-dlnbas` · **Last updated:** 2026-11-03 20:40 UTC · **Phase 7 (new UI, own identity, customer panel) in progress — see the Phase 7 table below and `HANDOFF.md` §4**
 - **2026-11-03 baseline gate on a fresh container:** server 1158 / agent 470 / client 52 / hub 184 / hub-ui 105 green after two test-only fixes (the 2FA replay test timeout, `/tmp/whm` created by the agent temp-dir tests).
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
@@ -66,7 +66,7 @@ this table; estimates are revised at each milestone.
 | Step | Status | Took / estimate | Done at / ETA |
 |---|---|---|---|
 | Baseline gate on a fresh container + two test-environment fixes | done | 15 min | 18:40 |
-| Backend map for the customer panel (6 parallel readers) → `docs/design/customer-panel.md` + critic pass | running (first run stalled at 18:33 and was relaunched 19:58) | ~60 min | 21:00 |
+| Backend map for the customer panel (6 parallel readers) → `docs/design/customer-panel.md` (886 lines) + critic pass (22 claims verified, 14 corrections, 8 scoping gaps closed in the doc) | done `dd50a14` (first run stalled and was relaunched) | 41 min | 20:30 |
 | **Design system** — new tokens/base CSS, shell (top bar, sidebar with coloured icon tiles, large titles), Home, Login, shared components (cards as inset grouped lists, iOS switches, tinted buttons, sheets, banners, tables); light + dark; `docs/design/ui-design-system.md` | done `2a83117` | 25 min | 18:45 |
 | Page sweep — every one of the 212 pages checked against the new system, by category in parallel (3 workflows × 2 agents after the single run proved too slow) + UI reviewer with screenshots per category, one fix round; 232 findings, 46 majors fixed in-round, shared-file items closed by hand (pills, floating row menus, file inputs, sticky bar, i18n labels) | done `74374de` | 1 h 50 min | 20:35 |
 | **Own identity** — Keel as default branding (`028c`), label overrides in `nav.js` with stable keys, i18n catalog, docs (99 edits) + server/agent/hub strings (legacy managed-block markers kept), support links, `keel@` sender, `KEEL-` ticket refs | done `22001ff`…`643e0a6` | 50 min | 20:40 |
@@ -74,9 +74,10 @@ this table; estimates are revised at each milestone.
 | hub/ui portals on the new kit (sidebar-first shell, SYNC.md) | done `18fe699` | 15 min | 18:52 |
 | zod 3 → 4 migration (server, agent, hub) with the full gate — records, prefault, patchOf, IPv6 parity | done `7788431` | 40 min | 20:10 |
 | Milestone 1: react-router 7 (`c87c235`), full gate + builds + e2e green, **screenshot refresh** (all 212 pages + 17 flow shots relabelled `Keel › …`), HANDOFF/CLAUDE/CHECKLIST, push | done | 35 min | 20:25 |
-| **Customer panel** build (from the design doc): migration + account users + "log in as", new agent ops (mail accounts/forwarders, FTP users, user crontab, archive), `/api/panel/*` services + routes, `/panel` shell + pages, tests — parallel units, two review lenses on root-level code, one fix round | pending | ~4 h | 02:00 (4th) |
-| Milestone 2: full gate, e2e incl. the customer panel, **screenshot refresh** (admin + customer panel galleries), manuals updated, tick P6, trackers, push | pending | 40 min | 02:40 (4th) |
-| **Total remaining** | | **~6 h** | |
+| **Customer panel** build: units U0 core / U1 files+cron / U2 mail / U3 domains-dns-ssl-php-logs / U4 databases-ftp-backups-usage / U5 client shell in two parallel workflows (builder → lens A adversarial tenant + lens B authorization → fix → re-review), seams S1–S11 by an integrator agent in parallel | running since 20:35 | ~2 h 30 min | 23:05 |
+| Customer panel: U6 client pages (6 groups in parallel), integrator wiring (router/Login/Layout, admin "Log in as"), integration critic, gate, `e2e/panel-check.cjs` | pending | ~1 h 30 min | 00:35 (4th) |
+| Milestone 2: full gate, e2e incl. the customer panel, **screenshot refresh** (admin + customer panel galleries), manuals updated, trackers, push | pending | 40 min | 01:15 (4th) |
+| **Total remaining** | | **~4 h 40 min** | |
 
 Faster option: verification can be cut to one reviewer and one fix round per category
 (~30% less time, less thorough). Not applied unless requested.
