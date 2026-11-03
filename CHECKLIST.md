@@ -8,7 +8,7 @@
 
 ## Current state
 
-- **Branch:** `claude/kind-meitner-dlnbas` · **Last updated:** 2026-11-03 18:40 UTC · **Phase 7 (new UI, own identity, customer panel) in progress — see the Phase 7 table below and `HANDOFF.md` §4**
+- **Branch:** `claude/kind-meitner-dlnbas` · **Last updated:** 2026-11-03 20:45 UTC · **Phase 7 (new UI, own identity, customer panel) in progress — see the Phase 7 table below and `HANDOFF.md` §4**
 - **2026-11-03 baseline gate on a fresh container:** server 1158 / agent 470 / client 52 / hub 184 / hub-ui 105 green after two test-only fixes (the 2FA replay test timeout, `/tmp/whm` created by the agent temp-dir tests).
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
@@ -66,16 +66,17 @@ this table; estimates are revised at each milestone.
 | Step | Status | Took / estimate | Done at / ETA |
 |---|---|---|---|
 | Baseline gate on a fresh container + two test-environment fixes | done | 15 min | 18:40 |
-| Backend map for the customer panel (6 parallel readers) → `docs/design/customer-panel.md` + critic pass | running | ~40 min | 19:20 |
-| **Design system** — new tokens/base CSS, shell (top bar, sidebar with coloured icon tiles, large titles), Home, Login, shared components (cards as inset grouped lists, iOS switches, tinted buttons, sheets, banners, tables); light + dark | pending | ~1 h 30 min | 20:15 |
-| Page sweep — every one of the 212 pages checked against the new system (hard-coded colours, inline layout, headers), by category in parallel + UI reviewer with screenshots, one fix round | pending | ~1 h 30 min | 21:45 |
-| **Own identity** — product name as default branding, label overrides in `nav.js` with stable keys (cPanel category and cPanel/WHM wording gone from the UI), title/login/footer, docs wording sweep | pending | ~45 min | 22:30 |
-| Milestone 1: gate + build + e2e + **screenshot refresh**, trackers, push | pending | 20 min | 22:50 |
-| **Customer panel** build (from the design doc): migration + account users + "log in as", new agent ops (mail accounts/forwarders, FTP users, user crontab, archive), `/api/panel/*` services + routes, `/panel` shell + pages, tests — parallel units, two review lenses on root-level code, one fix round | pending | ~4 h | 03:00 (4th) |
-| hub/ui portals restyled with the same kit (SYNC.md updated) | pending | ~40 min | 03:40 |
-| HANDOFF §4.2 deferred items (zod 4, react-router 7, root lockfile, `backup.db.import` temp user, 2FA-disable re-verify, hub `ui_dist`) | pending | ~1 h 15 min | 04:55 |
-| Milestone 2: full gate, e2e incl. the customer panel, **screenshot refresh** (admin + customer panel galleries), manuals updated, tick P6, trackers, push | pending | 40 min | 05:35 |
-| **Total remaining** | | **~11 h** | |
+| Backend map for the customer panel (6 parallel readers) → `docs/design/customer-panel.md` + critic pass | running (first run stalled at 18:33 and was relaunched 19:58) | ~60 min | 21:00 |
+| **Design system** — new tokens/base CSS, shell (top bar, sidebar with coloured icon tiles, large titles), Home, Login, shared components (cards as inset grouped lists, iOS switches, tinted buttons, sheets, banners, tables); light + dark; `docs/design/ui-design-system.md` | done `2a83117` | 25 min | 18:45 |
+| Page sweep — every one of the 212 pages checked against the new system, by category in parallel (3 workflows × 2 agents after the single run proved too slow) + UI reviewer with screenshots per category, one fix round; 232 findings, 46 majors fixed in-round, shared-file items closed by hand (pills, floating row menus, file inputs, sticky bar, i18n labels) | done `74374de` | 1 h 50 min | 20:35 |
+| **Own identity** — Keel as default branding (`028c`), label overrides in `nav.js` with stable keys, i18n catalog, docs (99 edits) + server/agent/hub strings (legacy managed-block markers kept), support links, `keel@` sender, `KEEL-` ticket refs | done `22001ff`…`643e0a6` | 50 min | 20:40 |
+| Phase-6 verifier (read-only review of `b01bd30`) + fixes: sql_mode dump-screen bypass, link-safe `fs.write_file`, SQL-side reseller job filter, 2FA disable re-verification, enrollment rate limit, `backup.db.import` temp user, hub `ui_dist` | done `18fe699`, `4630c2d`, `00a9cb6` | 35 min | 19:15 |
+| hub/ui portals on the new kit (sidebar-first shell, SYNC.md) | done `18fe699` | 15 min | 18:52 |
+| zod 3 → 4 migration (server, agent, hub) with the full gate | running | ~45 min | 21:00 |
+| Milestone 1: react-router 7, gate + build + e2e + **screenshot refresh**, trackers, push | pending | 30 min | 21:40 |
+| **Customer panel** build (from the design doc): migration + account users + "log in as", new agent ops (mail accounts/forwarders, FTP users, user crontab, archive), `/api/panel/*` services + routes, `/panel` shell + pages, tests — parallel units, two review lenses on root-level code, one fix round | pending | ~4 h | 02:00 (4th) |
+| Milestone 2: full gate, e2e incl. the customer panel, **screenshot refresh** (admin + customer panel galleries), manuals updated, tick P6, trackers, push | pending | 40 min | 02:40 (4th) |
+| **Total remaining** | | **~6 h** | |
 
 Faster option: verification can be cut to one reviewer and one fix round per category
 (~30% less time, less thorough). Not applied unless requested.
