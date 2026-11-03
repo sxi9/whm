@@ -6,7 +6,7 @@ import { createDevelopmentService, wireCoreEvents, EVENT_NAME_RE, HOOK_SCRIPT_RE
 const idParam = z.object({ id: fields.id });
 const label = z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9 ._()\/-]{0,63}$/, 'Letters, digits, spaces, "." "_" "-" "(" ")" or "/"; max 64 chars');
 const shortText = z.string().max(300).regex(/^[^\0]*$/).nullable();
-const scope = z.enum(ENFORCED_SCOPES, { errorMap: () => ({ message: `Only enforced scopes can be granted: ${ENFORCED_SCOPES.join(', ')}` }) });
+const scope = z.enum(ENFORCED_SCOPES, { error: () => `Only enforced scopes can be granted: ${ENFORCED_SCOPES.join(', ')}` });
 const eventName = z.string().regex(EVENT_NAME_RE, 'Event names look like account.created');
 const stage = z.enum(['pre', 'post']);
 const scriptName = z.string().regex(HOOK_SCRIPT_RE, 'Lowercase letters, digits, ".", "_" or "-"; max 64 chars');
@@ -36,8 +36,8 @@ const appBody = z.object({
 const pluginBody = z.object({
   id: z.string().max(128).regex(/^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*){2,}$/, 'Reverse-DNS id with at least three segments, e.g. com.example.hello'),
   name: z.string().trim().min(1).max(80), version: z.string().regex(/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/, 'Semantic version such as 1.0.0').default('1.0.0'),
-  description: z.string().trim().min(1).max(500), authorName: z.string().trim().min(1).max(80), authorEmail: z.string().email().max(254).optional(), authorUrl: z.string().url().max(512).optional(),
-  homepage: z.string().url().max(512).optional(), license: z.string().regex(/^[A-Za-z0-9.+-]{1,40}$/).default('MIT'), category: z.string().max(40).optional(),
+  description: z.string().trim().min(1).max(500), authorName: z.string().trim().min(1).max(80), authorEmail: z.email().max(254).optional(), authorUrl: z.url().max(512).optional(),
+  homepage: z.url().max(512).optional(), license: z.string().regex(/^[A-Za-z0-9.+-]{1,40}$/).default('MIT'), category: z.string().max(40).optional(),
   permissions: z.array(z.string().max(120).regex(/^[a-z][a-z0-9:*._-]*$/)).max(40).default([]),
   hooks: z.array(z.object({ event: eventName, stage: stage.default('post') }).strict()).max(40).default([]),
   withSettings: z.boolean().default(false), withJob: z.boolean().default(false), withPage: z.boolean().default(true),
@@ -107,7 +107,7 @@ export async function register(ctx) {
   r.get('/plugin-generator/vocabulary', requireRoot, read, wrap(() => s.pluginGen.vocabulary()));
   r.post('/plugin-generator/preview', requireRoot, read, validate({ body: pluginBody }), wrap((req) => s.pluginGen.preview(req.body)));
   r.post('/plugin-generator/generate', requireRoot, write, validate({ body: pluginBody }), wrap((req) => s.pluginGen.generate(req.body, req)));
-  r.post('/plugin-generator/validate', requireRoot, read, validate({ body: z.object({ manifest: z.record(z.any()) }).strict() }), wrap((req) => s.pluginGen.validate(req.body.manifest)));
+  r.post('/plugin-generator/validate', requireRoot, read, validate({ body: z.object({ manifest: z.record(z.string(), z.any()) }).strict() }), wrap((req) => s.pluginGen.validate(req.body.manifest)));
 
   // OpenAPI Documentation for WHM / cPanel
   r.get('/openapi.json', requireReseller, read, validate({ query: z.object({ scope: specScope }) }), wrap((req) => s.openapi.spec(req.query.scope)));

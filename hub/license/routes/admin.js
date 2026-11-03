@@ -174,7 +174,7 @@ export function adminRoutes(ctx) {
 
   const productBody = z.object({
     sku: fields.sku, name: z.string().trim().min(1).max(100), edition: z.enum(EDITIONS), rank: z.number().int().min(0).max(1000), term: z.enum(['days', 'monthly', 'annual', 'contract']), term_days: z.number().int().min(1).max(3650).nullable().optional(),
-    limits: z.record(z.number().int()).optional(), features: z.record(z.boolean()).optional(), price_cents: fields.cents.optional(), currency: z.string().length(3).optional(), active: z.boolean().optional(),
+    limits: z.record(z.string(), z.number().int()).optional(), features: z.record(z.string(), z.boolean()).optional(), price_cents: fields.cents.optional(), currency: z.string().length(3).optional(), active: z.boolean().optional(),
   }).strict();
   r.get('/products', read, (_req, res) => res.json({ data: ctx.products.list() }));
   r.post('/products', write, validate({ body: productBody }), (req, res) => res.status(201).json({ data: ctx.products.create(req.body) }));
@@ -182,12 +182,12 @@ export function adminRoutes(ctx) {
 
   customerRoutes(ctx, r, { scope: unscoped, scopes: { read: 'admin:read', write: 'admin:write' } });
 
-  const resellerBody = z.object({ name: z.string().trim().min(1).max(200), email: fields.email, quota: z.record(z.enum(EDITIONS), z.number().int().min(-1)).optional(), pricing: z.record(z.enum(EDITIONS), z.record(z.number().int().min(0))).optional(), brand: z.record(z.string().max(500)).optional() }).strict();
+  const resellerBody = z.object({ name: z.string().trim().min(1).max(200), email: fields.email, quota: z.partialRecord(z.enum(EDITIONS), z.number().int().min(-1)).optional(), pricing: z.partialRecord(z.enum(EDITIONS), z.record(z.string(), z.number().int().min(0))).optional(), brand: z.record(z.string(), z.string().max(500)).optional() }).strict();
   r.get('/resellers', read, validate({ query: pagination }), (req, res) => res.json(ctx.resellers.list(req.query)));
   r.post('/resellers', write, validate({ body: resellerBody }), (req, res) => res.status(201).json({ data: ctx.resellers.create(req.body) }));
   r.get('/resellers/:id', read, validate({ params: idParam }), (req, res) => res.json({ data: { ...ctx.resellers.get(req.params.id), quota_left: ctx.resellers.quotaLeft(req.params.id) } }));
-  r.patch('/resellers/:id', write, validate({ params: idParam, body: z.object({ name: z.string().trim().min(1).max(200).optional(), status: z.enum(['active', 'suspended', 'closed']).optional(), brand: z.record(z.string().max(500)).optional() }).strict() }), (req, res) => res.json({ data: ctx.resellers.update(req.params.id, req.body) }));
-  r.put('/resellers/:id/quota', write, validate({ params: idParam, body: z.object({ quota: z.record(z.enum(EDITIONS), z.number().int().min(-1)).optional(), pricing: z.record(z.enum(EDITIONS), z.record(z.number().int().min(0))).optional() }).strict() }), (req, res) => {
+  r.patch('/resellers/:id', write, validate({ params: idParam, body: z.object({ name: z.string().trim().min(1).max(200).optional(), status: z.enum(['active', 'suspended', 'closed']).optional(), brand: z.record(z.string(), z.string().max(500)).optional() }).strict() }), (req, res) => res.json({ data: ctx.resellers.update(req.params.id, req.body) }));
+  r.put('/resellers/:id/quota', write, validate({ params: idParam, body: z.object({ quota: z.partialRecord(z.enum(EDITIONS), z.number().int().min(-1)).optional(), pricing: z.partialRecord(z.enum(EDITIONS), z.record(z.string(), z.number().int().min(0))).optional() }).strict() }), (req, res) => {
     req.audit({ action: 'reseller.quota', target: req.params.id, args: req.body });
     res.json({ data: ctx.resellers.setQuota(req.params.id, req.body) });
   });
@@ -210,7 +210,7 @@ export function adminRoutes(ctx) {
     customer: z.object({ email: fields.email, name: z.string().trim().min(1).max(200).optional(), company: z.string().max(200).optional(), country: z.string().max(2).optional() }).strict().optional(),
     customer_id: fields.id.optional(), reseller_id: fields.id.optional(), term_months: fields.termMonths.optional(), notes: z.string().max(1000).optional(), external_ref: z.string().max(200).optional(),
     starts_at: z.string().datetime().optional(), max_activations: z.number().int().min(1).max(1000).optional(), grace_days: z.number().int().min(0).max(365).optional(),
-    limits: z.record(z.number().int()).optional(), features: z.record(z.boolean()).optional(),
+    limits: z.record(z.string(), z.number().int()).optional(), features: z.record(z.string(), z.boolean()).optional(),
   }).strict().refine((b) => b.customer || b.customer_id, { message: 'customer or customer_id is required', path: ['customer'] });
   r.get('/licenses', read, validate({ query: pagination.extend({ status: z.string().optional(), edition: z.string().optional(), customer_id: fields.id.optional(), expiring_within: z.coerce.number().int().min(1).max(365).optional() }) }), (req, res) => res.json(ctx.licenses.list(req.query)));
   r.post('/licenses', write, validate({ body: issueBody }), (req, res) => {
@@ -290,7 +290,7 @@ export function adminRoutes(ctx) {
   r.post('/messages', write, validate({ body: z.object({ level: z.enum(['info', 'warning', 'critical']).default('info'), code: z.string().regex(/^[a-z_]{2,40}$/), text: z.string().min(1).max(500), all: z.literal(true) }).strict() }), (req, res) => res.status(201).json({ data: ctx.activations.pushMessage({ all: true }, req.body) }));
   r.get('/schedules', read, (_req, res) => res.json({ data: ctx.scheduler.list() }));
   r.post('/schedules/:name/run', write, validate({ params: z.object({ name: z.string().regex(/^[a-z-]{2,40}$/) }) }), wrap(async (req, res) => res.json({ data: await ctx.scheduler.run(req.params.name) })));
-  r.post('/ip-blocks/:ip/unblock', write, validate({ params: z.object({ ip: z.string().ip() }) }), (req, res) => res.json({ data: { unblocked: ctx.licenses.lookupGuard.unblock(req.params.ip) } }));
+  r.post('/ip-blocks/:ip/unblock', write, validate({ params: z.object({ ip: fields.ip }) }), (req, res) => res.json({ data: { unblocked: ctx.licenses.lookupGuard.unblock(req.params.ip) } }));
   jobRoutes(ctx, r, { scope: JOB_SCOPES.vendor });
   return r;
 }

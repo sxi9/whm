@@ -2,6 +2,9 @@ import { z } from 'zod';
 import { unprocessable } from './errors.js';
 
 const HEX64 = /^[0-9a-f]{64}$/;
+// zod 3's IPv6 validator, kept verbatim so the accepted set is unchanged (zone ids allowed,
+// embedded IPv4 only after "::" or "h:h:h:h::"), where zod 4's z.ipv6() does the opposite.
+const IPV6_RE = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$/;
 
 export const fields = {
   email: z.string().trim().toLowerCase().email().max(254),
@@ -26,7 +29,8 @@ export const fields = {
   token: z.string().regex(/^WHMT1\.[A-Za-z0-9_-]{16,16384}\.[A-Za-z0-9_-]{80,100}$/, 'Malformed token'),
   reason: z.string().trim().max(500).optional(),
   termMonths: z.number().int().min(1).max(120),
-  url: z.string().url().max(2048).refine((u) => u.startsWith('https://'), 'Must be an https URL'),
+  ip: z.union([z.ipv4(), z.string().regex(IPV6_RE)], { error: 'Invalid IP address' }),
+  url: z.url().max(2048).refine((u) => u.startsWith('https://'), 'Must be an https URL'),
   cents: z.number().int().min(0).max(1e9),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(500).default(50),

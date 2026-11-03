@@ -42,7 +42,7 @@ export default function NginxManager({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} actions={data && <StatusPill status={!data.installed ? 'not-installed' : data.settings.enabled ? (data.active ? 'active' : 'warning') : 'disabled'}>{!data.installed ? 'nginx not installed' : data.settings.enabled ? (data.active ? 'proxy active' : 'proxy enabled · nginx down') : 'proxy disabled'}</StatusPill>} />
+      <PageHeader fn={fn} actions={data && <StatusPill status={!data.installed ? 'not-installed' : data.settings.enabled ? (data.active ? 'active' : 'warning') : 'disabled'}>{!data.installed ? 'NGINX not installed' : data.settings.enabled ? (data.active ? 'proxy active' : 'proxy enabled · NGINX down') : 'proxy disabled'}</StatusPill>} />
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
       {data && !data.installed && (

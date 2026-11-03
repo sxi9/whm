@@ -8,7 +8,7 @@ export default function WebDiskConfiguration({ fn }) {
   const { data, draft, set } = form;
   return (
     <>
-      <PageHeader fn={fn} description="Settings for the Web Disk (WebDAV) service accounts will use to mount their home directory. The panel does not ship a WebDAV daemon yet: the values are stored here and picked up by the Web Disk service once it exists; nothing on the host changes today." />
+      <PageHeader fn={fn} title={fn.label} description="Settings for the Web Disk (WebDAV) service accounts will use to mount their home directory. The panel does not ship a WebDAV daemon yet: the values are stored here and picked up by the Web Disk service once it exists; nothing on the host changes today." />
       <RequestError error={form.error} onRetry={form.refetch} />
       {form.loading && !data && <Loading />}
       {data && draft && (

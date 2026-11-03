@@ -26,7 +26,7 @@ const sshdSettings = z.object({
 // non-addresses and firewall records match what iptables/nft print back.
 const ipOrCidr = z.string().max(64).transform((v, c) => {
   const n = normalizeIpOrCidr(v);
-  if (n === null) { c.addIssue({ code: z.ZodIssueCode.custom, message: 'IP address or CIDR network' }); return z.NEVER; }
+  if (n === null) { c.addIssue({ code: 'custom', message: 'IP address or CIDR network' }); return z.NEVER; }
   return n;
 });
 // libwrap separates fields with ":" and needs IPv6 in brackets; the agent renders
@@ -151,7 +151,7 @@ export async function register(ctx) {
   r.put('/modsec/rules/:id', validate({ params: z.object({ id: fields.id }), body: z.object({ disabled: z.boolean(), reason: z.string().max(200).optional() }).strict() }), wrap((req) => s.modsec.setRuleDisabled(req.params.id, req.body.disabled, req.body.reason, req)));
   r.get('/modsec/hits', validate({ query: z.object({ limit: z.coerce.number().int().min(1).max(5000).default(500) }) }), wrap((req) => s.modsec.hits(req.query.limit)));
   r.get('/modsec/vendors', wrap(() => s.modsec.vendors()));
-  r.post('/modsec/vendors', validate({ body: z.object({ name: vendorName, url: z.string().url().max(2048).startsWith('https://', 'Only https:// URLs'), enabled: z.boolean().optional() }).strict() }), accepted((req) => s.modsec.addVendor(req.body, req.user, req)));
+  r.post('/modsec/vendors', validate({ body: z.object({ name: vendorName, url: z.url().max(2048).startsWith('https://', 'Only https:// URLs'), enabled: z.boolean().optional() }).strict() }), accepted((req) => s.modsec.addVendor(req.body, req.user, req)));
   r.post('/modsec/vendors/:name/update', validate({ params: z.object({ name: vendorName }) }), accepted((req) => s.modsec.updateVendor(req.params.name, req.user, req)));
   r.patch('/modsec/vendors/:name', validate({ params: z.object({ name: vendorName }), body: z.object({ enabled: z.boolean() }).strict() }), wrap((req) => s.modsec.setVendorEnabled(req.params.name, req.body.enabled, req)));
   r.delete('/modsec/vendors/:name', validate({ params: z.object({ name: vendorName }) }), wrap((req) => s.modsec.removeVendor(req.params.name, req)));
@@ -161,12 +161,12 @@ export async function register(ctx) {
   r.post('/password-strength', validate({ body: z.object({ password: z.string().max(256), context: z.enum(['account', 'email', 'ftp', 'mysql', 'panel', 'ssh']).default('account') }).strict() }), wrap((req) => s.passwordStrength(req.body.password, req.body.context)));
   r.get('/external-auth', wrap(() => s.externalAuth.list()));
   r.post('/external-auth', validate({ body: z.object({
-    name: providerName, displayName: z.string().min(1).max(64), issuerUrl: z.string().url().max(512).startsWith('https://', 'Issuer must use https://'), clientId: z.string().min(1).max(256),
+    name: providerName, displayName: z.string().min(1).max(64), issuerUrl: z.url().max(512).startsWith('https://', 'Issuer must use https://'), clientId: z.string().min(1).max(256),
     clientSecret: z.string().max(1024).optional(), scopes: z.string().regex(/^[A-Za-z0-9_.:\/ -]{1,200}$/).optional(), enabled: z.boolean().optional(),
   }).strict() }), (req, res, next) => Promise.resolve(s.externalAuth.create(req.body, req)).then((data) => res.status(201).json({ data })).catch(next));
   r.get('/external-auth/:name', validate({ params: z.object({ name: providerName }) }), wrap((req) => s.externalAuth.get(req.params.name)));
   r.put('/external-auth/:name', validate({ params: z.object({ name: providerName }), body: z.object({
-    displayName: z.string().min(1).max(64).optional(), issuerUrl: z.string().url().max(512).startsWith('https://').optional(), clientId: z.string().min(1).max(256).optional(),
+    displayName: z.string().min(1).max(64).optional(), issuerUrl: z.url().max(512).startsWith('https://').optional(), clientId: z.string().min(1).max(256).optional(),
     clientSecret: z.string().max(1024).optional(), scopes: z.string().regex(/^[A-Za-z0-9_.:\/ -]{1,200}$/).optional(), enabled: z.boolean().optional(),
   }).strict() }), wrap((req) => s.externalAuth.update(req.params.name, req.body, req)));
   r.delete('/external-auth/:name', validate({ params: z.object({ name: providerName }) }), wrap((req) => s.externalAuth.remove(req.params.name, req)));

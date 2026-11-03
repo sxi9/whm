@@ -74,7 +74,7 @@ export default function SetupEditDomainForwarding({ fn }) {
             { key: 'type', label: 'Type', render: (r) => (r.type === 'permanent' ? '301' : '302') },
             { key: 'match_www', label: 'www', render: (r) => (r.match_www ? 'yes' : 'no') },
             { key: 'account', label: 'Account', sortable: true, render: (r) => r.account || <span className="muted">—</span> },
-            { key: 'status', label: 'Status', sortable: true, render: (r) => <StatusPill status={r.status === 'applied' ? 'ok' : r.status}>{r.status}{r.last_error ? `: ${r.last_error}` : ''}</StatusPill> },
+            { key: 'status', label: 'Status', sortable: true, render: (r) => <><StatusPill status={r.status === 'applied' ? 'ok' : r.status}>{r.status}</StatusPill>{r.last_error && <span className="muted"> {r.last_error}</span>}</> },
             { key: 'updated_at', label: 'Updated', sortable: true, render: (r) => formatDate(r.updated_at) },
           ]}
           rows={data || []} loading={loading} error={error} rowKey={(r) => r.domain}

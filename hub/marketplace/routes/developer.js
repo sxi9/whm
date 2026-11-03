@@ -72,7 +72,7 @@ export function developerRoutes(m) {
 
   // Profile and namespaces.
   r.get('/profile', portal, (req, res) => res.json({ data: m.developers.publicView(req.developer) }));
-  const profileBody = z.object({ display_name: z.string().trim().min(2).max(80).optional(), company: z.string().max(120).nullable().optional(), website: fields.url.nullable().optional(), country: z.string().length(2).nullable().optional(), support_email: fields.email.nullable().optional(), support_url: fields.url.nullable().optional(), email: fields.email.optional(), payout: z.record(z.unknown()).nullable().optional() }).strict();
+  const profileBody = z.object({ display_name: z.string().trim().min(2).max(80).optional(), company: z.string().max(120).nullable().optional(), website: fields.url.nullable().optional(), country: z.string().length(2).nullable().optional(), support_email: fields.email.nullable().optional(), support_url: fields.url.nullable().optional(), email: fields.email.optional(), payout: z.record(z.string(), z.unknown()).nullable().optional() }).strict();
   r.patch('/profile', portal, validate({ body: profileBody }), (req, res, next) => {
     const patch = hideBody(req, 'payout');
     if (patch.email !== undefined || patch.payout !== undefined) return stepUp(req, res, (err) => (err ? next(err) : res.json({ data: m.developers.updateProfile(req.developer, patch, ip(req)) })));

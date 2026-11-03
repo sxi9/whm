@@ -17,7 +17,7 @@ const certName = z.string().toLowerCase().regex(new RegExp(`^(\\*\\.)?${HOST}$`)
 const subjectValue = z.string().regex(/^(?![-\s])[A-Za-z0-9 .,'&()@_:-]{1,64}$/, 'Letters, digits, spaces and . , \' & ( ) @ _ : - only');
 const subject = z.object({
   O: subjectValue.optional(), OU: subjectValue.optional(), L: subjectValue.optional(), ST: subjectValue.optional(),
-  C: z.string().regex(/^[A-Z]{2}$/, 'Two-letter ISO country code').optional(), emailAddress: z.string().email().max(128).optional(),
+  C: z.string().regex(/^[A-Z]{2}$/, 'Two-letter ISO country code').optional(), emailAddress: z.email().max(128).optional(),
 }).strict();
 const keySpec = z.object({ type: z.enum(['rsa', 'ec']).optional(), bits: z.number().int().refine((b) => [2048, 3072, 4096].includes(b), 'RSA keys must be 2048, 3072 or 4096 bits').optional(), curve: z.enum(['prime256v1', 'secp384r1']).optional() }).strict();
 const generateBody = z.object({ account: fields.username.optional(), domain: fields.hostname, sans: z.array(certName).max(100).default([]), key: keySpec.default({}), subject: subject.default({}) }).strict();
@@ -63,7 +63,7 @@ export async function register(ctx) {
   // AutoSSL (server-wide)
   r.get('/autossl', requireRoot, wrap(() => s.autossl.status()));
   r.put('/autossl/settings', requireRoot, validate({ body: z.object({
-    provider: z.enum(['disabled', 'certbot', 'acme.sh']).optional(), email: z.union([z.literal(''), z.string().email().max(254).regex(/^[^-\s]/, 'May not start with "-"')]).optional(), method: z.enum(['webroot', 'standalone']).optional(),
+    provider: z.enum(['disabled', 'certbot', 'acme.sh']).optional(), email: z.union([z.literal(''), z.email().max(254).regex(/^[^-\s]/, 'May not start with "-"')]).optional(), method: z.enum(['webroot', 'standalone']).optional(),
     staging: z.boolean().optional(), keyType: z.enum(['rsa', 'ecdsa']).optional(), renewDays: z.number().int().min(1).max(89).optional(), includeWww: z.boolean().optional(), replaceCustom: z.boolean().optional(),
   }).strict() }), wrap((req) => s.autossl.updateSettings(req.body, req)));
   r.post('/autossl/exclusions', requireRoot, validate({ body: z.object({ kind: z.enum(['account', 'domain']), value: z.string().max(253), reason: z.string().max(200).optional() }).strict().refine((v) => (v.kind === 'account' ? fields.username.safeParse(v.value).success : fields.hostname.safeParse(v.value).success), { message: 'Must be a valid username or hostname', path: ['value'] }) }),

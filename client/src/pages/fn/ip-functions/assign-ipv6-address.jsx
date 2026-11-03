@@ -68,7 +68,7 @@ export default function AssignIpv6Address({ fn }) {
             <KeyValue items={[
               ['Account', result.account], ['Address', <code key="a">{result.address}/{result.prefix}</code>], ['Range', `${result.range} (${result.range_cidr})`], ['Interface', <code key="i">{result.interface}</code>],
               ['Bound on host', <StatusPill key="b" status={result.bound ? 'ok' : 'warning'}>{result.bound ? 'yes' : 'no'}</StatusPill>],
-              ['DNS (AAAA)', result.dns?.skipped ? <span key="d"><StatusPill status="unknown">skipped</StatusPill> <span className="muted">DNS service unavailable</span></span> : <span key="d">{(result.dns?.results || []).map((r) => <StatusPill key={r.domain} status={r.status === 'updated' ? 'ok' : r.status === 'no_zone' ? 'unknown' : 'failed'}>{r.domain}: {r.status === 'no_zone' ? 'no zone here' : r.status}</StatusPill>)}</span>],
+              ['DNS (AAAA)', result.dns?.skipped ? <span key="d"><StatusPill status="unknown">skipped</StatusPill> <span className="muted">DNS service unavailable</span></span> : <span key="d">{(result.dns?.results || []).map((r, i) => <span key={r.domain}>{i > 0 && ' '}<code>{r.domain}</code> <StatusPill status={r.status === 'updated' ? 'ok' : r.status === 'no_zone' ? 'unknown' : 'failed'}>{r.status === 'no_zone' ? 'no zone here' : r.status}</StatusPill></span>)}</span>],
               ['Web server', <span key="w"><StatusPill status={result.web === 'applied' ? 'ok' : result.web === 'failed' ? 'failed' : 'pending'}>{result.web}</StatusPill>{result.web === 'skipped' && <span className="muted"> applied once the web service is installed</span>}</span>],
             ]} />
           )}

@@ -46,7 +46,7 @@ export const marketplaceConfigSchema = z.object({
   revenue_share_pct: z.number().int().min(0).max(100).default(70),
   payout_min_cents: z.number().int().min(0).default(5000),
   currencies: z.array(z.string().length(3)).min(1).default(['USD', 'EUR']),
-  github_oauth: z.object({ client_id: z.string().optional(), client_secret: z.string().optional(), client_secret_enc: z.string().optional(), redirect_url: z.string().url().optional() }).nullable().default(null),
+  github_oauth: z.object({ client_id: z.string().optional(), client_secret: z.string().optional(), client_secret_enc: z.string().optional(), redirect_url: z.url().optional() }).nullable().default(null),
   public_suffix_list: z.string().optional(),
   reserved_namespaces: z.array(z.string()).default([]),
   reserved_brands: z.array(z.string()).default([]),

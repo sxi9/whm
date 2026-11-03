@@ -6,7 +6,7 @@ import { PageHeader, Card, StatusPill, Loading, KeyValue } from '../../../compon
 import { Field, TextInput, Textarea, Toggle, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
-import { RequestError, Tabs, ManagerBadge, CodeList, useJobRunner, JobPanel, JobHistory } from '../../software/Shared.jsx';
+import { RequestError, Tabs, ManagerBadge, CodeList, CodeListRow, countPackages, useJobRunner, JobPanel, JobHistory } from '../../software/Shared.jsx';
 
 const EMPTY = { name: '', description: '', packages: { debian: [], rhel: [] } };
 
@@ -107,11 +107,18 @@ export default function EasyApache4({ fn }) {
           {diff && (
             <>
               <KeyValue items={[
-                ['To install', diff.install.length ? <CodeList key="i" names={diff.install} /> : 'nothing'],
+                ['To install', diff.install.length ? countPackages(diff.install.length) : 'nothing'],
                 ['Already installed', `${diff.unchanged.length} of ${diff.total}`],
-                ['Managed packages not in profile', diff.remove.length ? <CodeList key="r" names={diff.remove} /> : 'none'],
-                diff.remove.length > 0 && ['Removed with them (dependents)', diff.simulationError ? <span key="e" className="muted">simulation failed: {diff.simulationError}</span> : collateral.length ? <CodeList key="c" names={collateral.map((p) => p.name)} /> : 'none (checked with the package manager)'],
+                ['Managed packages not in profile', diff.remove.length ? countPackages(diff.remove.length) : 'none'],
+                diff.remove.length > 0 && ['Removed with them (dependents)', diff.simulationError ? <span key="e" className="muted">simulation failed: {diff.simulationError}</span> : collateral.length ? countPackages(collateral.length) : 'none (checked with the package manager)'],
               ]} />
+              {(diff.install.length > 0 || diff.remove.length > 0) && (
+                <div style={{ marginTop: 16 }}>
+                  <CodeListRow label="To install" names={diff.install} />
+                  <CodeListRow label="Managed packages not in profile" names={diff.remove} />
+                  <CodeListRow label="Removed with them (dependents)" names={collateral.map((p) => p.name)} />
+                </div>
+              )}
               {diff.remove.length > 0 && <Toggle checked={removeExtras} onChange={setRemoveExtras} label={`Remove the ${diff.remove.length} package(s) other profiles manage but this one omits`} description="Only packages that appear in some profile are selected for removal, but apt/dnf also remove whatever depends on them. The removal is simulated first and refused if it would take anything else with it, unless you accept the dependents below." />}
               {removeExtras && diff.remove.length > 0 && collateral.length > 0 && (
                 <div className="banner banner-warning">

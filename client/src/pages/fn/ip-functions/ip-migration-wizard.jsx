@@ -114,7 +114,7 @@ export default function IpMigrationWizard({ fn }) {
                     <td><code>{p.to}</code> <StatusPill status={p.toBound ? 'ok' : 'pending'}>{p.toBound ? 'bound' : 'will bind'}</StatusPill></td>
                     <td>{p.accounts.length ? p.accounts.join(', ') : <span className="muted">none</span>}</td>
                     <td>{p.dns.length ? <span className="muted">{[...new Set(p.dns.map((d) => d.domain))].join(', ')} ({p.dns.length})</span> : <span className="muted">none</span>}</td>
-                    <td>{p.isMain && <StatusPill status="info">main IP</StatusPill>} {p.isShared && <StatusPill status="info">shared IP</StatusPill>} {p.ipv6Account && <StatusPill status="info">IPv6 of {p.ipv6Account}</StatusPill>} {!p.fromBound && <StatusPill status="warning">old not bound</StatusPill>}</td>
+                    <td>{p.isMain && <StatusPill status="info">main IP</StatusPill>} {p.isShared && <StatusPill status="info">shared IP</StatusPill>} {p.ipv6Account && <><StatusPill status="info">account IPv6</StatusPill> <span className="muted">{p.ipv6Account}</span></>} {!p.fromBound && <StatusPill status="warning">old not bound</StatusPill>}</td>
                     <td>{p.issues.length ? p.issues.map((i) => <div key={i} className="field-message">{i}</div>) : <StatusPill status="ok">ok</StatusPill>}</td>
                   </tr>
                 ))}

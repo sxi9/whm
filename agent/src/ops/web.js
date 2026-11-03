@@ -1717,7 +1717,7 @@ defineOp('web.wp.install', {
   destructive: true,
   timeoutMs: 1_800_000,
   schema: z.object({
-    ...wpSiteArgs, url: wpUrl, title: wpTitle, adminUser: wpUser, adminEmail: z.string().email().max(254), adminPassword: wpSecret,
+    ...wpSiteArgs, url: wpUrl, title: wpTitle, adminUser: wpUser, adminEmail: z.email().max(254), adminPassword: wpSecret,
     dbName: z.string().regex(/^[A-Za-z0-9_]{1,64}$/), dbUser: z.string().regex(/^[A-Za-z0-9_]{1,80}$/), dbPassword: wpSecret, dbHost: arg.mysqlHost.default('localhost'), tablePrefix: z.string().regex(/^[a-z0-9_]{1,20}_$/).default('wp_'), locale: wpLocale,
   }).strict(),
   run: async ({ username, path: p, url, title, adminUser, adminEmail, adminPassword, dbName, dbUser, dbPassword, dbHost, tablePrefix, locale }, ctx) => {

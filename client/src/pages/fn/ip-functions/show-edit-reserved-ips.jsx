@@ -53,7 +53,7 @@ export default function ShowEditReservedIps({ fn }) {
                       <td><FamilyPill family={row.family} /></td>
                       <td>{row.interface || <span className="muted">—</span>}</td>
                       <td>
-                        {row.is_main ? <StatusPill status="info">main IP</StatusPill> : row.dedicated_to ? <StatusPill status="ok">dedicated: {row.dedicated_to}</StatusPill> : row.accounts ? <StatusPill status="ok">{row.accounts} account(s)</StatusPill> : row.reserved ? <StatusPill status="warning">reserved</StatusPill> : <StatusPill status="unknown">free</StatusPill>}
+                        {row.is_main ? <StatusPill status="info">main IP</StatusPill> : row.dedicated_to ? <><StatusPill status="ok">dedicated</StatusPill> <span className="muted">{row.dedicated_to}</span></> : row.accounts ? <><StatusPill status="ok">shared</StatusPill> <span className="muted">{row.accounts} account(s)</span></> : row.reserved ? <StatusPill status="warning">reserved</StatusPill> : <StatusPill status="unknown">free</StatusPill>}
                         {res && !res.ok && <div className="field-message">{res.error}</div>}
                       </td>
                       <td>{d.reserved ? <TextInput value={d.reason} onChange={(v) => update(row.address, { reason: v })} placeholder="Optional note" /> : <span className="muted">{row.reserved_reason || ''}</span>}</td>

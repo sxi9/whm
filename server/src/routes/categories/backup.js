@@ -10,7 +10,7 @@ const remotePath = z.string().max(512).regex(/^(?!.*(^|\/)\.\.(\/|$))[A-Za-z0-9.
 const hostField = fields.hostname.or(fields.ip);
 const secret = z.string().max(256).regex(/^[^\n\r\0]*$/);
 const nonEmpty = z.string().min(1).max(256).regex(/^[^\n\r\0]+$/);
-const url = z.string().url().max(2048).refine((u) => /^https?:\/\//.test(u), 'http(s) URL required');
+const url = z.url().max(2048).refine((u) => /^https?:\/\//.test(u), 'http(s) URL required');
 const port = z.number().int().min(1).max(65535);
 
 // Mirrors the agent's destinationConfig so a bad configuration fails here with
@@ -27,7 +27,7 @@ const destinationSchema = (mode) => {
     z.object({ kind: z.literal('s3'), endpoint: url.optional(), region: z.string().regex(/^[a-z0-9-]{1,32}$/).default('us-east-1'), bucket: z.string().regex(/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/), prefix: remotePath.default(''), accessKey: nonEmpty, secretKey: mode === 'update' ? secret : nonEmpty, pathStyle: z.boolean().default(false), insecure: z.boolean().default(false) }).strict(),
   ]).superRefine((c, issues) => {
     // Without a pinned host key an SFTP login verifies nothing on a host that has no known_hosts yet.
-    if (c.kind === 'sftp' && !c.hostKeySha256 && !c.insecure) issues.addIssue({ code: z.ZodIssueCode.custom, path: ['hostKeySha256'], message: 'Pin the server host key (SHA-256 fingerprint) or explicitly skip host key verification' });
+    if (c.kind === 'sftp' && !c.hostKeySha256 && !c.insecure) issues.addIssue({ code: 'custom', path: ['hostKeySha256'], message: 'Pin the server host key (SHA-256 fingerprint) or explicitly skip host key verification' });
   });
 };
 const destinationConfig = destinationSchema('create');

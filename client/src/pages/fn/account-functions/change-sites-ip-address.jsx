@@ -15,7 +15,8 @@ const WEB_REASONS = {
   php_missing: 'vhosts rewritten; PHP-FPM is not installed, so .php files are static until it is',
   php_pool_failed: 'vhosts rewritten; the PHP-FPM pool could not be written (see Service Configuration)',
 };
-const webStatus = (web) => (web?.applied ? `vhosts rewritten${web.updated != null ? ` (${web.updated} address${web.updated === 1 ? '' : 'es'} replaced)` : ''}${web.domains?.length ? `: ${web.domains.join(', ')}` : ''}` : WEB_REASONS[web?.reason] || web?.reason || 'not applied');
+const webDetail = (web) => (web?.applied ? `vhosts rewritten${web.updated != null ? `, ${web.updated} address${web.updated === 1 ? '' : 'es'} replaced` : ''}${web.domains?.length ? `: ${web.domains.join(', ')}` : ''}` : WEB_REASONS[web?.reason] || web?.reason || 'not applied');
+const detail = (text) => (text ? <span className="muted" style={{ marginLeft: 8 }}>{text}</span> : null);
 
 export default function ChangeSitesIpAddress({ fn }) {
   const toast = useToast();
@@ -70,11 +71,11 @@ export default function ChangeSitesIpAddress({ fn }) {
           <KeyValue items={[
             ['Previous address', <code key="p">{result.previousIp || '—'}</code>], ['New address', <code key="n">{result.ip}</code>],
             ['Dedicated', result.dedicated ? 'yes' : 'no (shared address)'],
-            ['Web server', <StatusPill key="w" status={result.web?.applied ? 'ok' : 'pending'}>{webStatus(result.web)}</StatusPill>],
+            ['Web server', <span key="w"><StatusPill status={result.web?.applied ? 'ok' : 'pending'}>{result.web?.applied ? 'applied' : 'pending'}</StatusPill>{detail(webDetail(result.web))}</span>],
           ]} />
           {result.dns.length > 0 && (
             <ul className="list-plain" style={{ marginTop: 12, display: 'grid', gap: 6 }}>
-              {result.dns.map((d, i) => <li key={i}><code>{d.name ? `${d.name === '@' ? '' : `${d.name}.`}${d.domain}` : d.domain}</code> <StatusPill status={d.applied ? 'ok' : 'pending'}>{d.applied ? (d.name ? 'A record updated' : d.reason) : d.reason || 'saved; published once BIND runs'}</StatusPill></li>)}
+              {result.dns.map((d, i) => <li key={i}><code>{d.name ? `${d.name === '@' ? '' : `${d.name}.`}${d.domain}` : d.domain}</code> <StatusPill status={d.applied ? 'ok' : 'pending'}>{d.applied ? 'applied' : 'pending'}</StatusPill>{detail(d.applied ? (d.name ? 'A record updated' : d.reason) : d.reason || 'saved; published once BIND runs')}</li>)}
             </ul>
           )}
         </Card>

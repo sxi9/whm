@@ -58,7 +58,7 @@ export function systemRoutes({ system, serviceManager, jobs, scheduler, settings
 
   // Configure cPanel Cron Jobs ----------------------------------------------------
   r.get('/schedules', requireRoot, wrap(() => scheduler.list()));
-  r.patch('/schedules/:name', requireRoot, validate({ params: z.object({ name: z.string().regex(/^[a-z0-9._-]{1,60}$/) }), body: z.object({ cron: fields.cron.optional(), enabled: z.boolean().optional(), params: z.record(z.any()).optional() }).strict() }),
+  r.patch('/schedules/:name', requireRoot, validate({ params: z.object({ name: z.string().regex(/^[a-z0-9._-]{1,60}$/) }), body: z.object({ cron: fields.cron.optional(), enabled: z.boolean().optional(), params: z.record(z.string(), z.any()).optional() }).strict() }),
     wrap((req) => scheduler.update(req.params.name, req.body)));
 
   // Settings (Basic Setup, Tweak Settings, ...) -----------------------------------

@@ -30,7 +30,7 @@ export default function ModuleInstallers({ fn }) {
                   <tr key={r.key}>
                     <td><strong>{r.label}</strong></td>
                     <td>{present[r.key] ? data.versions[r.key] || 'installed' : <StatusPill status="not-installed">not installed</StatusPill>}</td>
-                    <td>{r.tools.map((t) => <StatusPill key={t} status={present[t] ? 'ok' : 'not-installed'}>{t}</StatusPill>)}</td>
+                    <td>{r.tools.map((t) => <StatusPill key={t} status={present[t] ? 'ok' : 'not-installed'}><span>{t}</span></StatusPill>)}</td>
                     <td className="muted">{r.tools.some((t) => present[t]) ? '—' : <>Install <code>{r.hint}</code> via <Link to="/software/install-distro-packages">Install Distro Packages</Link></>}</td>
                   </tr>
                 ))}

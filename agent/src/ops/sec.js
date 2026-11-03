@@ -1170,7 +1170,7 @@ async function extractArchive(archive, staging) {
 defineOp('sec.modsec.vendor.install', {
   description: 'Download a rule set archive (.tar.gz, .tar.bz2, .tar.xz, .tar or .zip over https) into the vendors directory',
   timeoutMs: 600_000,
-  schema: z.object({ name: vendorName, url: z.string().url().max(2048).refine((u) => u.startsWith('https://'), 'Only https:// URLs are accepted') }).strict(),
+  schema: z.object({ name: vendorName, url: z.url().max(2048).refine((u) => u.startsWith('https://'), 'Only https:// URLs are accepted') }).strict(),
   run: async ({ name, url }, ctx) => {
     const layout = requireModsec();
     const dir = path.join(layout.vendorsDir, name);

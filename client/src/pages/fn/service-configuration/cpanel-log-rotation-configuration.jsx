@@ -24,7 +24,7 @@ export default function LogRotationConfiguration({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Rotation policy for panel, account and web server logs, written as managed files under /etc/logrotate.d (whm-panel, whm-accounts, whm-webserver) and validated with logrotate -d before they are kept." />
+      <PageHeader fn={fn} title={fn.label} description="Rotation policy for panel, account and web server logs, written as managed files under /etc/logrotate.d (whm-panel, whm-accounts, whm-webserver) and validated with logrotate -d before they are kept." />
       <RequestError error={form.error} onRetry={form.refetch} />
       {form.loading && !data && <Loading />}
       {data && draft && (

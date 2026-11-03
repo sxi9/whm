@@ -72,9 +72,9 @@ export function packageRoutes({ packages }) {
   r.get('/', requireReseller, validate({ query: pagination }), wrap((req) => packages.list(req.query, req.user)));
   r.post('/', requireReseller, validate({ body: z.object({ name: fields.packageName, ...limits }).strict() }), (req, res, next) => Promise.resolve(packages.create(req.body, req.user)).then((data) => res.status(201).json({ data })).catch(next));
   r.get('/feature-lists', requireReseller, wrap(() => packages.featureLists.list()));
-  r.post('/feature-lists', requireRoot, validate({ body: z.object({ name: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/), features: z.record(z.boolean()) }).strict() }), wrap((req) => packages.featureLists.create(req.body.name, req.body.features)));
+  r.post('/feature-lists', requireRoot, validate({ body: z.object({ name: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/), features: z.record(z.string(), z.boolean()) }).strict() }), wrap((req) => packages.featureLists.create(req.body.name, req.body.features)));
   r.get('/feature-lists/:name', requireReseller, validate({ params: z.object({ name: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/) }) }), wrap((req) => packages.featureLists.get(req.params.name)));
-  r.put('/feature-lists/:name', requireRoot, validate({ params: z.object({ name: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/) }), body: z.object({ features: z.record(z.boolean()) }).strict() }), wrap((req) => packages.featureLists.update(req.params.name, req.body.features)));
+  r.put('/feature-lists/:name', requireRoot, validate({ params: z.object({ name: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/) }), body: z.object({ features: z.record(z.string(), z.boolean()) }).strict() }), wrap((req) => packages.featureLists.update(req.params.name, req.body.features)));
   r.delete('/feature-lists/:name', requireRoot, validate({ params: z.object({ name: z.string().regex(/^[A-Za-z0-9_-]{1,64}$/) }) }), wrap((req) => { packages.featureLists.remove(req.params.name); return { deleted: true }; }));
   r.get('/:name', requireReseller, validate({ params: nameParam }), wrap((req) => packages.get(req.params.name, req.user)));
   r.put('/:name', requireReseller, validate({ params: nameParam, body: z.object({ newName: fields.packageName.optional(), ...limits }).strict() }), wrap((req) => packages.update(req.params.name, req.body, req.user)));

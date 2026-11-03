@@ -69,10 +69,24 @@ export function RebootBanner({ required }) {
   );
 }
 
-// Inline list of package or file names.
+// Wrapping list of package or file names; a name never breaks across lines.
 export function CodeList({ names }) {
   if (!names?.length) return null;
-  return <>{names.map((n, i) => <span key={n}>{i > 0 && ' '}<code>{n}</code></span>)}</>;
+  return (
+    <span className="code-list" style={{ display: 'inline-flex', flexWrap: 'wrap', gap: 6, verticalAlign: 'middle' }}>
+      {names.map((n) => <code key={n} style={{ whiteSpace: 'nowrap' }}>{n}</code>)}
+    </span>
+  );
+}
+
+// Left-aligned, labelled package list for rows too long for a KeyValue value.
+export function CodeListRow({ label, names }) {
+  if (!names?.length) return null;
+  return <Field label={label}><CodeList names={names} /></Field>;
+}
+
+export function countPackages(n) {
+  return `${n} package${n === 1 ? '' : 's'}`;
 }
 
 export function PhpVersionPill({ version, inherited }) {

@@ -6,7 +6,7 @@ import { z } from 'zod';
 const rateLimit = (max, windowMs) => z.object({ max: z.number().int().min(1).default(max), windowMs: z.number().int().min(1000).default(windowMs) }).default({ max, windowMs });
 
 const schema = z.object({
-  public_url: z.string().url().default('https://localhost:7443'),
+  public_url: z.url().default('https://localhost:7443'),
   serve_ui: z.boolean().default(false),
   ui_dist: z.string().optional(),
   host: z.string().default('0.0.0.0'),
@@ -56,9 +56,9 @@ const schema = z.object({
       portal_login: rateLimit(10, 15 * 60_000),
       public: rateLimit(600, 3600_000),
     }).default({}),
-    vendor: z.object({ name: z.string().default('Keel Vendor'), support_email: z.string().email().optional(), portal_url: z.string().url().optional() }).default({}),
+    vendor: z.object({ name: z.string().default('Keel Vendor'), support_email: z.email().optional(), portal_url: z.url().optional() }).default({}),
   }).default({}).refine((l) => l.nonce_ttl_s >= 2 * l.max_skew_s, { message: 'nonce_ttl_s must be at least 2 × max_skew_s or a pruned nonce could be replayed', path: ['nonce_ttl_s'] }),
-  marketplace: z.record(z.unknown()).default({}),
+  marketplace: z.record(z.string(), z.unknown()).default({}),
 });
 
 const ENV_MAP = {

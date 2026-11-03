@@ -57,7 +57,7 @@ export function adminRoutes(m) {
   // Plugin review queue.
   r.get('/reviews', read, validate({ query: pagination.extend({ risk: z.enum(['normal', 'high']).optional() }) }), (req, res) => res.json(m.review.queue(req.query)));
   r.get('/reviews/:id', read, validate({ params: z.object({ id: idField }) }), (req, res) => res.json({ data: m.review.detail(req.params.id) }));
-  r.post('/reviews/:id/approve', market('review'), stepUp, validate({ params: z.object({ id: idField }), body: z.object({ notes: z.string().max(5000).optional(), checklist: z.record(z.boolean()).optional() }).strict() }), (req, res) => res.json({ data: m.review.approve(req.params.id, { ...actor(req), notes: req.body.notes, checklist: req.body.checklist || {} }) }));
+  r.post('/reviews/:id/approve', market('review'), stepUp, validate({ params: z.object({ id: idField }), body: z.object({ notes: z.string().max(5000).optional(), checklist: z.record(z.string(), z.boolean()).optional() }).strict() }), (req, res) => res.json({ data: m.review.approve(req.params.id, { ...actor(req), notes: req.body.notes, checklist: req.body.checklist || {} }) }));
   r.post('/reviews/:id/request-changes', market('review'), stepUp, validate({ params: z.object({ id: idField }), body: z.object({ reasons, notes: z.string().max(5000).optional() }).strict() }), (req, res) => res.json({ data: m.review.requestChanges(req.params.id, { ...req.body, ...actor(req) }) }));
   r.post('/reviews/:id/reject', market('review'), stepUp, validate({ params: z.object({ id: idField }), body: z.object({ reasons, notes: z.string().max(5000).optional() }).strict() }), (req, res) => res.json({ data: m.review.reject(req.params.id, { ...req.body, ...actor(req) }) }));
 

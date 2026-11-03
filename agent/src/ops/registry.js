@@ -43,6 +43,11 @@ export async function runOp(name, args, ctx) {
   }
 }
 
+// zod 3's IPv6 validator, kept verbatim so the accepted set is unchanged: it allows a
+// link-local zone id (fe80::1%eth0) and takes an embedded IPv4 tail only after "::" or
+// "h:h:h:h::", where zod 4's z.ipv6() does the opposite on both counts.
+const IPV6_RE = /^(([0-9a-fA-F]{1,4}:){7,7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:)|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9])\.){3,3}(25[0-5]|(2[0-4]|1{0,1}[0-9]){0,1}[0-9]))$/;
+
 // Shared argument schemas. These mirror server/src/lib/validate.js on purpose:
 // the agent must not trust that the API validated anything.
 export const arg = {
@@ -52,9 +57,9 @@ export const arg = {
   // A unit name never starts with "-": it is placed after the systemctl verb and
   // would otherwise be read as an option.
   unit: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9@._-]{0,79}$/),
-  ipv4: z.string().ip({ version: 'v4' }),
-  ipv6: z.string().ip({ version: 'v6' }),
-  ip: z.string().ip(),
+  ipv4: z.ipv4(),
+  ipv6: z.string().regex(IPV6_RE, 'Invalid IPv6 address'),
+  ip: z.union([z.ipv4(), z.string().regex(IPV6_RE)], { error: 'Invalid IP address' }),
   iface: z.string().regex(/^[a-zA-Z0-9._-]{1,15}$/),
   absPath: z.string().regex(/^\/(?!(?:.*\/)?\.\.(?:\/|$))[^\0]*$/s),
   shell: z.enum(['/bin/bash', '/bin/sh', '/usr/sbin/nologin', '/usr/local/bin/jailshell']),

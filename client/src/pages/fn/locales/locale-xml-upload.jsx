@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { AlertTriangle } from 'lucide-react';
+import { useRef, useState } from 'react';
+import { AlertTriangle, Upload } from 'lucide-react';
 import { Link, useNavigate } from 'react-router-dom';
 import { api } from '../../../api/client.js';
 import { PageHeader, Card, KeyValue, StatusPill } from '../../../components/Common.jsx';
@@ -21,6 +21,7 @@ export default function LocaleXmlUpload({ fn }) {
   const navigate = useNavigate();
   const { reload } = useT();
   const { locales, error, refetch } = useLocales();
+  const fileRef = useRef(null);
   const [xml, setXml] = useState('');
   const [fileName, setFileName] = useState('');
   const [code, setCode] = useState('');
@@ -65,7 +66,8 @@ export default function LocaleXmlUpload({ fn }) {
       <Card title="Import a locale from XML" subtitle="Accepts the format produced by Locale XML Download. The file is validated before anything is written; the built-in English locale cannot be overwritten.">
         <div className="form-grid">
           <Field label="Locale file" help="A .xml file up to 2 MB, or paste the document below.">
-            <input className="input" type="file" accept=".xml,application/xml,text/xml" onChange={(e) => onFile(e.target.files?.[0])} />
+            <input ref={fileRef} type="file" accept=".xml,application/xml,text/xml" hidden onChange={(e) => { onFile(e.target.files?.[0]); e.target.value = ''; }} />
+            <div><Button icon={Upload} onClick={() => fileRef.current?.click()}>Choose .xml file</Button></div>
             {fileName && <div className="field-help">Loaded {fileName} ({xml.length.toLocaleString()} characters)</div>}
           </Field>
           <Field label="Locale code (optional)" help="Overrides the code attribute in the file, for example to import as a different locale."><TextInput value={code} onChange={(v) => { setCode(v); setPreview(null); }} placeholder="From the file" /></Field>

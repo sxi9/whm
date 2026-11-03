@@ -8,7 +8,7 @@ export default function WebServicesConfiguration({ fn }) {
   const { data, draft, set } = form;
   return (
     <>
-      <PageHeader fn={fn} description="Intended tuning for the panel's own HTTP services (ports 2086/2087 and the JSON API): token and session lifetimes, request limits, CORS origins and logging. These values are stored only; the API server does not read them yet, so saving changes nothing about how the panel behaves today." />
+      <PageHeader fn={fn} title={fn.label} description="Intended tuning for the panel's own HTTP services (ports 2086/2087 and the JSON API): token and session lifetimes, request limits, CORS origins and logging. These values are stored only; the API server does not read them yet, so saving changes nothing about how the panel behaves today." />
       <RequestError error={form.error} onRetry={form.refetch} />
       {form.loading && !data && <Loading />}
       {data && draft && (

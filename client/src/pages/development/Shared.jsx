@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { Fragment, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Copy, Check, Download } from 'lucide-react';
 import { api } from '../../api/client.js';
@@ -156,6 +156,21 @@ export function curlFor(endpoint) {
   return `curl -s -X ${endpoint.method} "https://$HOST:2087${path}"${auth}${body}`;
 }
 
+function EndpointDetail({ endpoint }) {
+  const curl = curlFor(endpoint);
+  return (
+    <div onClick={(ev) => ev.stopPropagation()} style={{ cursor: 'default' }}>
+      <KeyValue items={[['Access', <RolePill key="r" role={endpoint.role} />], ['Authentication', endpoint.auth ? 'Session cookie + X-CSRF-Token, or Authorization: Bearer <api token>' : 'None (public)'], ['Path parameters', endpoint.path.match(/:([A-Za-z0-9_]+)/g)?.map((p) => p.slice(1)).join(', ') || 'none'], ['Envelope', '{ data, meta } on success · { error: { code, message, fields? } } on failure']]} />
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12 }}>
+        <strong>curl example</strong>
+        <CopyButton text={curl} label="Copy curl" />
+      </div>
+      <pre className="log" style={{ marginTop: 8 }}>{curl}</pre>
+      <p className="small muted" style={{ marginTop: 8 }}>Create a token under <Link to="/development/manage-api-tokens">Manage API Tokens</Link>. Long operations answer <code>202</code> with a job id you can follow in the Task Queue Monitor.</p>
+    </div>
+  );
+}
+
 // Endpoint browser shared by the admin-panel and account-panel OpenAPI pages.
 export function ApiReference({ scope, note }) {
   const toast = useToast();
@@ -190,7 +205,7 @@ export function ApiReference({ scope, note }) {
             {Object.entries(data.byMethod).map(([m, n]) => <Stat key={m} label={m} value={n} />)}
             <Stat label="Groups" value={data.groups.length} />
           </div>
-          <Card title="Endpoints" subtitle="Generated live from the mounted Express routers: every path, method and the role it requires. Pick one for a curl example." padded={false}
+          <Card title="Endpoints" subtitle="Generated live from the mounted Express routers: every path, method and the role it requires. Pick one to expand a curl example under it." padded={false}
             actions={<><Button size="sm" icon={Download} loading={downloading} onClick={downloadSpec}>openapi.json</Button><Button size="sm" onClick={() => refetch()}>Refresh</Button></>}>
             <div className="datatable-toolbar" style={{ padding: 12 }}>
               <TextInput placeholder="Filter by path…" value={q} onChange={setQ} style={{ maxWidth: 320 }} />
@@ -209,11 +224,20 @@ export function ApiReference({ scope, note }) {
                     <table>
                       <tbody>
                         {g.endpoints.map((e) => (
-                          <tr key={`${e.method} ${e.path}`} className={selected === e ? 'is-selected' : ''} onClick={() => setSelected(selected === e ? null : e)} style={{ cursor: 'pointer' }}>
-                            <td style={{ width: 90 }}><MethodPill method={e.method} /></td>
-                            <td><code>{e.path}</code></td>
-                            <td style={{ width: 160 }}><RolePill role={e.role} /></td>
-                          </tr>
+                          <Fragment key={`${e.method} ${e.path}`}>
+                            <tr className={selected === e ? 'is-selected' : ''} onClick={() => setSelected(selected === e ? null : e)} style={{ cursor: 'pointer' }}>
+                              <td style={{ width: 90 }}><MethodPill method={e.method} /></td>
+                              <td><code>{e.path}</code></td>
+                              <td style={{ width: 160 }}><RolePill role={e.role} /></td>
+                            </tr>
+                            {selected === e && (
+                              <tr>
+                                <td colSpan={3} style={{ padding: '4px 14px 16px' }}>
+                                  <EndpointDetail endpoint={e} />
+                                </td>
+                              </tr>
+                            )}
+                          </Fragment>
                         ))}
                       </tbody>
                     </table>
@@ -222,13 +246,6 @@ export function ApiReference({ scope, note }) {
               </div>
             ))}
           </Card>
-          {selected && (
-            <Card title={<><MethodPill method={selected.method} /> <code>{selected.path}</code></>} actions={<CopyButton text={curlFor(selected)} label="Copy curl" />}>
-              <KeyValue items={[['Access', <RolePill key="r" role={selected.role} />], ['Authentication', selected.auth ? 'Session cookie + X-CSRF-Token, or Authorization: Bearer <api token>' : 'None (public)'], ['Path parameters', selected.path.match(/:([A-Za-z0-9_]+)/g)?.map((p) => p.slice(1)).join(', ') || 'none'], ['Envelope', '{ data, meta } on success · { error: { code, message, fields? } } on failure']]} />
-              <pre className="log" style={{ marginTop: 10 }}>{curlFor(selected)}</pre>
-              <p className="small muted" style={{ marginTop: 8 }}>Create a token under <Link to="/development/manage-api-tokens">Manage API Tokens</Link>. Long operations answer <code>202</code> with a job id you can follow in the Task Queue Monitor.</p>
-            </Card>
-          )}
         </>
       )}
     </>

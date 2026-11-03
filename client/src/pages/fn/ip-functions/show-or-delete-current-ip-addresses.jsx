@@ -59,7 +59,7 @@ export default function ShowOrDeleteCurrentIpAddresses({ fn }) {
             { key: 'netmask', label: 'Netmask', render: (r) => r.family === 4 ? r.netmask : `/${r.prefix}` },
             { key: 'interface', label: 'Interface', render: (r) => <>{r.interface || <span className="muted">—</span>}{r.live_interface && r.live_interface !== r.interface ? <span className="muted"> (live: {r.live_interface})</span> : null}</> },
             { key: 'bound', label: 'On host', render: (r) => <BoundPill bound={r.bound} /> },
-            { key: 'role', label: 'Role', render: (r) => r.is_main ? <StatusPill status="info">main IP</StatusPill> : r.reserved ? <StatusPill status="warning">reserved</StatusPill> : r.dedicated_to ? <StatusPill status="ok">dedicated: {r.dedicated_to}</StatusPill> : !r.managed ? <StatusPill status="warning">dynamic — not persisted</StatusPill> : <span className="muted">{r.accounts ? 'shared' : 'free'}</span> },
+            { key: 'role', label: 'Role', render: (r) => r.is_main ? <StatusPill status="info">main IP</StatusPill> : r.reserved ? <StatusPill status="warning">reserved</StatusPill> : r.dedicated_to ? <><StatusPill status="ok">dedicated</StatusPill> <span className="muted">{r.dedicated_to}</span></> : !r.managed ? <><StatusPill status="warning">dynamic</StatusPill> <span className="muted">not persisted</span></> : <span className="muted">{r.accounts ? 'shared' : 'free'}</span> },
             { key: 'accounts', label: 'Accounts', align: 'right', render: (r) => r.accounts ? <Link to={`/ip-functions/show-ip-address-usage`}>{r.accounts}</Link> : <span className="muted">0</span> },
           ]}
           rows={data || []} loading={loading} rowKey={(r) => r.address}

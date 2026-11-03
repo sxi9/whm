@@ -57,6 +57,8 @@ export function SupportSettings({ settings, onSaved }) {
   );
 }
 
+const DOC_TABLE_CSS = '.support-doc .markdown th { white-space: normal; } .support-doc .markdown th code, .support-doc .markdown td code { overflow-wrap: anywhere; }';
+
 function DocReader({ docs }) {
   const [params, setParams] = useSearchParams();
   const slug = params.get('doc');
@@ -105,7 +107,7 @@ function DocReader({ docs }) {
               {toc.map((s) => <div key={s.slug}><button className={`link-button ${s.slug === section ? 'active' : ''}`} style={{ padding: '3px 0', textAlign: 'left' }} onClick={() => open(slug, s.slug)}>{s.slug === section ? <strong>{s.title}</strong> : s.title}</button></div>)}
             </nav>
           )}
-          <div style={{ minWidth: 0 }}><Markdown text={doc.content} /></div>
+          <div className="support-doc" style={{ minWidth: 0 }}><style>{DOC_TABLE_CSS}</style><Markdown text={doc.content} /></div>
         </div>
       )}
     </Card>

@@ -33,7 +33,7 @@ const grantBody = z.object({
 const settingsBody = z.object({
   email: z.union([z.literal(''), email]).optional(),
   providerName: singleLine(80).optional(),
-  portalUrl: z.union([z.literal(''), z.string().url().max(500).refine((u) => /^https?:\/\//.test(u), 'Must be an http(s) URL')]).optional(),
+  portalUrl: z.union([z.literal(''), z.url().max(500).refine((u) => /^https?:\/\//.test(u), 'Must be an http(s) URL')]).optional(),
   access: z.object({ defaultHours: z.number().int().min(1).max(8760).optional(), maxHours: z.number().int().min(1).max(8760).optional() }).strict().optional(),
 }).strict().refine((b) => Object.keys(b).length > 0, { message: 'Nothing to change', path: ['_'] });
 

@@ -49,7 +49,7 @@ const credentials = z.object({
   user: mysqlUser.optional(),
   password: z.string().max(256).regex(/^[^\n\r\0]*$/).optional(),
   socket: arg.absPath.optional(),
-  bindAddress: z.string().ip().optional(),
+  bindAddress: arg.ip.optional(),
 }).strict().optional();
 
 // ------------------------------------------------------------------ helpers ---
@@ -726,8 +726,8 @@ defineOp('backup.staging.remove', {
 // ----------------------------------------------------------- destinations ---
 
 const remotePath = z.string().max(512).regex(/^(?!.*(^|\/)\.\.(\/|$))[A-Za-z0-9._~/-]*$/, 'Remote path: letters, digits, "._~/-", no ".."');
-const hostField = arg.hostname.or(z.string().ip());
-const urlField = z.string().url().max(2048).refine((u) => /^https?:\/\//.test(u), 'http(s) URL required');
+const hostField = arg.hostname.or(arg.ip);
+const urlField = z.url().max(2048).refine((u) => /^https?:\/\//.test(u), 'http(s) URL required');
 const nonEmpty = z.string().min(1).max(256).regex(/^[^\n\r\0]+$/);
 const secretField = z.string().max(256).regex(/^[^\n\r\0]*$/);
 
@@ -735,7 +735,7 @@ const secretField = z.string().max(256).regex(/^[^\n\r\0]*$/);
 // known_hosts yet, so the fingerprint is required unless verification is
 // explicitly skipped.
 const requireSftpHostKey = (c, issues) => {
-  if (c.kind === 'sftp' && !c.hostKeySha256 && !c.insecure) issues.addIssue({ code: z.ZodIssueCode.custom, path: ['hostKeySha256'], message: 'Pin the server host key (SHA-256 fingerprint from ssh-keyscan | ssh-keygen -lf -) or explicitly skip host key verification' });
+  if (c.kind === 'sftp' && !c.hostKeySha256 && !c.insecure) issues.addIssue({ code: 'custom', path: ['hostKeySha256'], message: 'Pin the server host key (SHA-256 fingerprint from ssh-keyscan | ssh-keygen -lf -) or explicitly skip host key verification' });
 };
 
 export const destinationConfig = z.discriminatedUnion('kind', [

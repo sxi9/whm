@@ -50,7 +50,7 @@ export const certName = z.string().regex(new RegExp(`^(\\*\\.)?${HOST}$`), 'Must
 // (fields.hostname), so a name that passes the route also passes here.
 export const bundleDomain = z.string().regex(/^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/, 'Must be a lower-case hostname such as example.com');
 // Goes into argv after -m / --accountemail, so it may not start with "-".
-const acmeEmail = z.string().email().max(254).regex(/^[^-\s]/, 'May not start with "-"');
+const acmeEmail = z.email().max(254).regex(/^[^-\s]/, 'May not start with "-"');
 // Subject attribute values go into -subj "/CN=…/O=…"; the separators / \ and
 // leading "-" are refused rather than escaped so no element can be misread.
 const subjectValue = z.string().regex(/^(?![-\s])[A-Za-z0-9 .,'&()@_:-]{1,64}$/, 'Letters, digits, spaces and . , \' & ( ) @ _ : - only');
@@ -62,7 +62,7 @@ const subject = z.object({
   L: subjectValue.optional(),
   ST: subjectValue.optional(),
   C: countryCode.optional(),
-  emailAddress: z.string().email().max(128).regex(/^[^\s/\\]+$/).optional(),
+  emailAddress: z.email().max(128).regex(/^[^\s/\\]+$/).optional(),
 }).strict();
 const sans = z.array(certName).max(100).default([]);
 const keySpec = z.object({

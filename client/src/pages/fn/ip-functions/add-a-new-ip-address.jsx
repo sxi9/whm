@@ -68,7 +68,7 @@ export default function AddANewIpAddress({ fn }) {
               <thead><tr><th>Address</th><th>Family</th><th>Bound</th><th>Reserved</th><th>Note</th></tr></thead>
               <tbody>
                 {result.added.map((a) => <tr key={a.address}><td><code>{a.address}</code></td><td><FamilyPill family={a.family} /></td><td><StatusPill status={a.bound ? 'ok' : 'warning'}>{a.alreadyBound ? 'already bound' : a.bound ? 'bound' : 'not bound'}</StatusPill></td><td>{a.reserved ? <StatusPill status="warning">reserved</StatusPill> : 'no'}</td><td className="muted">{a.reserved_reason || ''}</td></tr>)}
-                {result.failed.map((f) => <tr key={f.address}><td><code>{f.address}</code></td><td colSpan={4}><StatusPill status="failed">{f.code}</StatusPill> {f.error}</td></tr>)}
+                {result.failed.map((f) => <tr key={f.address}><td><code>{f.address}</code></td><td colSpan={4}><StatusPill status="failed">failed</StatusPill> <span className="muted"><code>{f.code}</code> {f.error}</span></td></tr>)}
               </tbody>
             </table>
           </div>
@@ -81,7 +81,7 @@ export default function AddANewIpAddress({ fn }) {
             { key: 'family', label: 'Family', render: (r) => <FamilyPill family={r.family} /> },
             { key: 'netmask', label: 'Netmask', render: (r) => r.family === 4 ? r.netmask : `/${r.prefix}` },
             { key: 'interface', label: 'Interface' },
-            { key: 'is_main', label: 'Role', render: (r) => r.is_main ? <StatusPill status="info">main</StatusPill> : r.reserved ? <StatusPill status="warning">reserved</StatusPill> : r.dedicated_to ? <StatusPill status="ok">dedicated: {r.dedicated_to}</StatusPill> : <span className="muted">{r.accounts ? `${r.accounts} account(s)` : 'free'}</span> },
+            { key: 'is_main', label: 'Role', render: (r) => r.is_main ? <StatusPill status="info">main</StatusPill> : r.reserved ? <StatusPill status="warning">reserved</StatusPill> : r.dedicated_to ? <><StatusPill status="ok">dedicated</StatusPill> <span className="muted">{r.dedicated_to}</span></> : <span className="muted">{r.accounts ? `${r.accounts} account(s)` : 'free'}</span> },
           ]}
           rows={current || []} rowKey={(r) => r.address} dense emptyText="No addresses recorded yet. Rebuild the IP address pool to import the host's current addresses."
         />
