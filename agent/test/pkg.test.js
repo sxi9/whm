@@ -117,6 +117,7 @@ describe('pkg op schemas reject injection before anything runs', () => {
 // /tmp/whm is an allowed root, so these exercise the real filesystem checks the
 // way a hostile account would see them.
 describe('.user.ini ops never follow links planted in an account docroot', () => {
+  fs.mkdirSync('/tmp/whm', { recursive: true });
   const base = fs.mkdtempSync('/tmp/whm/pkg-userini-');
   afterAll(() => fs.rmSync(base, { recursive: true, force: true }));
 
@@ -177,6 +178,7 @@ describe('.user.ini ops never follow links planted in an account docroot', () =>
 // started detached and polled, so a 45-minute dist-upgrade never has to fit in
 // one socket round trip. perl stands in for the package manager here.
 describe('background package runs', () => {
+  fs.mkdirSync('/tmp/whm', { recursive: true });
   const dir = fs.mkdtempSync('/tmp/whm/pkg-runs-');
   const previous = process.env.WHM_PKG_RUN_DIR;
   process.env.WHM_PKG_RUN_DIR = dir;
@@ -331,6 +333,7 @@ describe('nginx proxy rendering is valid for every supported nginx', () => {
   });
 
   it.skipIf(!hasBinary('nginx'))('passes nginx -t on this host for plain and TLS domains', () => {
+    fs.mkdirSync('/tmp/whm', { recursive: true });
     const dir = fs.mkdtempSync('/tmp/whm/pkg-nginx-');
     try {
       const domains = [{ domain: 'plain.example.net', aliases: [] }];

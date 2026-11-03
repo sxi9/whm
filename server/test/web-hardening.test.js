@@ -98,7 +98,7 @@ describe('second-factor brute force', () => {
     expect((await b.post('/api/auth/2fa').send({ code: authenticator.generate(otherSecret) })).status).toBe(200);
   });
 
-  it('never accepts the same code twice', async () => {
+  it('never accepts the same code twice', { timeout: 20_000 }, async () => {
     const user = await app.createUser('replayer', 'reseller');
     const secret = enable('replayer');
     await freshStep();

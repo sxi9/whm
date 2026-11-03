@@ -106,6 +106,7 @@ describe('stats ops', () => {
     resolveBinary.mockImplementation((name) => (name === 'awstats.pl' ? '/usr/bin/true' : null));
     const existingUser = fs.readFileSync('/etc/passwd', 'utf8').split('\n').map((l) => l.split(':')[0]).find((u) => /^[a-z][a-z0-9_-]{0,31}$/.test(u));
     fs.mkdirSync('/tmp/whm', { recursive: true });
+    fs.mkdirSync('/tmp/whm', { recursive: true });
     const work = fs.mkdtempSync('/tmp/whm/stats-test-');
     const statsRoot = path.join(work, 'stats');
     const target = path.join(work, 'victim');

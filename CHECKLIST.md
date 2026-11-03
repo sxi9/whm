@@ -8,7 +8,8 @@
 
 ## Current state
 
-- **Branch:** `claude/trusting-cori-ifp7wy` · **Last updated:** 2026-10-27 09:00 UTC · **the building session ended here — continue from `HANDOFF.md` §4**
+- **Branch:** `claude/kind-meitner-dlnbas` · **Last updated:** 2026-11-03 18:40 UTC · **Phase 7 (new UI, own identity, customer panel) in progress — see the Phase 7 table below and `HANDOFF.md` §4**
+- **2026-11-03 baseline gate on a fresh container:** server 1158 / agent 470 / client 52 / hub 184 / hub-ui 105 green after two test-only fixes (the 2FA replay test timeout, `/tmp/whm` created by the agent temp-dir tests).
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
 - **Tests (06:50 on the 27th):** server 1135 / agent 462 / client 48 / hub 177 / hub-ui 97 / SDK 73 / sample plugin 13 / bundled plugins ×4 — all green (`npm test` runs every workspace, the SDK, the sample plugin and the bundled plugins); both builds (client, hub/ui), boot and Playwright pass.
@@ -55,6 +56,26 @@ a fix round ~15 min; most categories need one fix round.
 | **P6** — hardening: three audits done (36 findings: 21 fixed with tests, 8 accepted risks, 7 deferred — list in `HANDOFF.md` §4); Security Advisor PHP-advisory rule (CVE-2026-109618/109619) + perf indexes landed `b01bd30` | audits done 08:50; full gate green 09:05; **verifier not run — session ended** | 30 min | 09:05 (27th) |
 | Remaining (next session): verify the Phase-6 fixes with the full gate, close the 7 deferred items, tick P6 | pending | ~2 h | — |
 | **Total remaining** | | **~2 h** of ordinary engineering (see `HANDOFF.md` §4) | |
+
+### Phase 7 — new UI, own identity, customer panel (user ask 2026-11-03: "all new modern UI like iOS, must not look AI-made; our own panel instead of cPanel")
+
+Times are UTC on 2026-11-03. Same container limits (2 concurrent agents). Every milestone commits,
+refreshes the labelled screenshots (`e2e/screenshots.sh`, label bar = page · date · commit) and updates
+this table; estimates are revised at each milestone.
+
+| Step | Status | Took / estimate | Done at / ETA |
+|---|---|---|---|
+| Baseline gate on a fresh container + two test-environment fixes | done | 15 min | 18:40 |
+| Backend map for the customer panel (6 parallel readers) → `docs/design/customer-panel.md` + critic pass | running | ~40 min | 19:20 |
+| **Design system** — new tokens/base CSS, shell (top bar, sidebar with coloured icon tiles, large titles), Home, Login, shared components (cards as inset grouped lists, iOS switches, tinted buttons, sheets, banners, tables); light + dark | pending | ~1 h 30 min | 20:15 |
+| Page sweep — every one of the 212 pages checked against the new system (hard-coded colours, inline layout, headers), by category in parallel + UI reviewer with screenshots, one fix round | pending | ~1 h 30 min | 21:45 |
+| **Own identity** — product name as default branding, label overrides in `nav.js` with stable keys (cPanel category and cPanel/WHM wording gone from the UI), title/login/footer, docs wording sweep | pending | ~45 min | 22:30 |
+| Milestone 1: gate + build + e2e + **screenshot refresh**, trackers, push | pending | 20 min | 22:50 |
+| **Customer panel** build (from the design doc): migration + account users + "log in as", new agent ops (mail accounts/forwarders, FTP users, user crontab, archive), `/api/panel/*` services + routes, `/panel` shell + pages, tests — parallel units, two review lenses on root-level code, one fix round | pending | ~4 h | 03:00 (4th) |
+| hub/ui portals restyled with the same kit (SYNC.md updated) | pending | ~40 min | 03:40 |
+| HANDOFF §4.2 deferred items (zod 4, react-router 7, root lockfile, `backup.db.import` temp user, 2FA-disable re-verify, hub `ui_dist`) | pending | ~1 h 15 min | 04:55 |
+| Milestone 2: full gate, e2e incl. the customer panel, **screenshot refresh** (admin + customer panel galleries), manuals updated, tick P6, trackers, push | pending | 40 min | 05:35 |
+| **Total remaining** | | **~11 h** | |
 
 Faster option: verification can be cut to one reviewer and one fix round per category
 (~30% less time, less thorough). Not applied unless requested.

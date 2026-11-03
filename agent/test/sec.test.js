@@ -236,6 +236,7 @@ describe('pure renderers and parsers', () => {
     // /tmp is sticky and world-writable: any local user can pre-create a subdir there.
     expect(() => privateTempDir('/tmp', 'whm-test-')).toThrow(OpError);
     expect(() => privateTempDir('/nonexistent-whm-dir', 'x-')).toThrow(OpError);
+    fs.mkdirSync('/tmp/whm', { recursive: true });
     const base = fs.mkdtempSync('/tmp/whm/sec-tmpdir-');
     try {
       fs.chmodSync(base, 0o700);
