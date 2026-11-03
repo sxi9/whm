@@ -48,9 +48,18 @@ export function LimitNotice({ count, limit, noun }) {
   return null;
 }
 
+// Plan limits as the server enforces them (assertLimit): null is unlimited, 0 is
+// a closed door, any other value is the cap.
 export function usageText(count, limit, noun) {
   if (limit == null) return `${count} ${noun} · no plan limit`;
+  if (limit === 0) return `No ${noun} in your plan`;
   return `${count} of ${limit} ${noun}`;
+}
+
+export function allowedText(limit) {
+  if (limit == null) return 'no plan limit';
+  if (limit === 0) return 'none in your plan';
+  return `of ${limit} allowed`;
 }
 
 export function WarningsBanner({ warnings }) {

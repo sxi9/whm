@@ -1,10 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
 import {
-  renderPasswdLine, parsePasswdLine, upsertPasswdText, removeFromPasswdText, renderAliases, renderDomainForwards,
-  renderSpamUsers, renderAutoresponderConf, parseDoveadmQuota, LOCAL_PART, EMAIL_TARGET, HOME_FIELD, MANAGED,
+  renderPasswdLine, parsePasswdLine, upsertPasswdText, removeFromPasswdText, dropForeignPasswdLines, renderAliases, renderDomainForwards,
+  renderSpamUsers, renderAutoresponderConf, autoreplyOnceFiles, parseDoveadmQuota, LOCAL_PART, EMAIL_TARGET, HOME_FIELD, MANAGED,
+  AUTORESPONDER_KEYS, DOVECOT_PASSWD_DIR, AUTOREPLY_DB_DIR,
 } from '../src/ops/vmail.js';
 import { SHADOW_HASH } from '../src/ops/transfer.js';
+import { renderEximVirtualRouters, renderEximVirtualTransports, renderEximSpamAcl, VMAIL_NAMES } from '../../server/src/services/service-configuration.js';
 
 // exec/hasBinary are spied so a test can prove that a refused op never ran a
 // program. No file under /etc/dovecot or /etc/exim4 is ever written: every op
@@ -33,10 +35,10 @@ async function invalid(name, args) {
 
 describe('vmail op catalog', () => {
   it('registers the family with the destructive flags of the design', () => {
-    const ops = ['vmail.hash', 'vmail.passwd.set', 'vmail.passwd.remove', 'vmail.passwd.list', 'vmail.quota.get', 'vmail.aliases.write', 'vmail.aliases.remove', 'vmail.domainfwd.write', 'vmail.autoresponder.write', 'vmail.autoresponder.remove', 'vmail.spam_users.write', 'vmail.render.check'];
+    const ops = ['vmail.hash', 'vmail.passwd.set', 'vmail.passwd.remove', 'vmail.passwd.purge', 'vmail.passwd.list', 'vmail.quota.get', 'vmail.aliases.write', 'vmail.aliases.remove', 'vmail.domainfwd.write', 'vmail.autoresponder.write', 'vmail.autoresponder.remove', 'vmail.spam_users.write', 'vmail.render.check'];
     for (const name of ops) expect(catalog.has(name), name).toBe(true);
-    for (const name of ['vmail.passwd.remove', 'vmail.aliases.remove', 'vmail.autoresponder.remove']) expect(catalog.get(name).destructive, name).toBe(true);
-    for (const name of ops.filter((n) => !n.endsWith('.remove'))) expect(catalog.get(name).destructive, name).toBe(false);
+    for (const name of ['vmail.passwd.remove', 'vmail.passwd.purge', 'vmail.aliases.remove', 'vmail.autoresponder.remove']) expect(catalog.get(name).destructive, name).toBe(true);
+    for (const name of ops.filter((n) => !n.endsWith('.remove') && !n.endsWith('.purge'))) expect(catalog.get(name).destructive, name).toBe(false);
     expect(catalog.get('vmail.render.check').timeoutMs).toBe(120_000);
   });
 
@@ -85,6 +87,15 @@ describe('vmail.passwd.* schemas', () => {
   it('rejects local parts that would break the passwd line or the maildir path', async () => {
     for (const bad of ['', 'Info', '.hidden', '-x', 'a:b', 'a b', 'a/b', 'a\nb', '../x', 'a${b}', 'x'.repeat(65), '*']) await invalid('vmail.passwd.set', { ...good, localPart: bad });
     for (const bad of ['Info', 'a:b', '*']) await invalid('vmail.passwd.remove', { domain: 'alice.com', localPart: bad });
+    for (const bad of ['alice', 'alice.com/..', 'ALICE.COM', '']) await invalid('vmail.passwd.purge', { domain: bad });
+    await invalid('vmail.passwd.purge', { domain: 'alice.com', localPart: 'x' });
+  });
+
+  it('purge never executes a program and refuses outside Dovecot', async () => {
+    exec.mockClear();
+    const err = await opError(runOp('vmail.passwd.purge', { domain: 'alice.com' }, ctx));
+    expect(['capability_missing', 'path_not_allowed']).toContain(err.code);
+    expect(exec).not.toHaveBeenCalled();
   });
 
   it('rejects hashes that are not crypt(3) or carry a field separator', async () => {
@@ -147,6 +158,22 @@ describe('passwd line rendering', () => {
     expect(removeFromPasswdText(r.text, 'b')).toMatchObject({ removed: true, empty: true, text: '' });
     expect(removeFromPasswdText(r.text, 'zz')).toMatchObject({ removed: false, empty: false });
   });
+
+  it('drops every line that carries another account\'s uid before a new line is added (stale previous owner)', () => {
+    const mine = renderPasswdLine({ ...base, localPart: 'info' });
+    const foreign = renderPasswdLine({ ...base, localPart: 'ceo', uid: 1002, gid: 1002, home: '/home/mallory' });
+    const foreignGid = renderPasswdLine({ ...base, localPart: 'cfo', uid: 1003 });
+    const text = `${MANAGED}\n${foreign}\n${mine}\n${foreignGid}\n`;
+    const r = dropForeignPasswdLines(text, 1001);
+    expect(r.purged).toEqual([{ localPart: 'ceo', uid: 1002 }, { localPart: 'cfo', uid: 1003 }]);
+    expect(r.text.split('\n').filter(Boolean)).toEqual([MANAGED, mine]);
+    const next = upsertPasswdText(r.text, 'sales', renderPasswdLine({ ...base, localPart: 'sales' }));
+    expect(next.split('\n').filter(Boolean).map((l) => (l.startsWith('#') ? l : l.split(':')[0]))).toEqual([MANAGED, 'info', 'sales']);
+    expect(next.split('\n').filter((l) => l && !l.startsWith('#')).every((l) => parsePasswdLine(l).uid === 1001)).toBe(true);
+    expect(dropForeignPasswdLines(null, 1001)).toEqual({ text: '', purged: [] });
+    expect(dropForeignPasswdLines(`${MANAGED}\ngarbage-line\n`, 1001).purged).toEqual([{ localPart: 'garbage-line', uid: null }]);
+    expect(dropForeignPasswdLines(text, 1002).text.split('\n').filter(Boolean)).toEqual([MANAGED, foreign]);
+  });
 });
 
 describe('vmail.aliases.write', () => {
@@ -191,7 +218,7 @@ describe('vmail.domainfwd.write / vmail.spam_users.write', () => {
       await invalid('vmail.spam_users.write', { entries: [bad] });
     }
     expect(renderSpamUsers([entry, { ...entry, domain: 'shop.alice.com', enabled: false, autoDelete: true, threshold: 80 }]).split('\n').filter((l) => l && !l.startsWith('#')))
-      .toEqual(['alice.com: user=alice enabled=y threshold=50 autodelete=n', 'shop.alice.com: user=alice enabled=n threshold=80 autodelete=y']);
+      .toEqual(['alice.com: user=alice enabled=1 threshold=50 autodelete=0', 'shop.alice.com: user=alice enabled=0 threshold=80 autodelete=1']);
     expect(() => renderSpamUsers([entry, entry])).toThrow(/twice/);
   });
 });
@@ -211,11 +238,68 @@ describe('vmail.autoresponder.*', () => {
     await invalid('vmail.autoresponder.remove', { domain: 'alice.com', localPart: '../info' });
   });
 
-  it('renders lsearch headers with epoch bounds', () => {
+  it('renders the lsearch headers the whm_autoreply fragment reads (hours, epochs, enabled 0|1; empty keys left out)', async () => {
     const text = renderAutoresponderConf({ fromName: 'Alice', subject: 'Away', charset: 'utf-8', intervalHours: 2, startAt: '2026-01-01T00:00:00Z', stopAt: null });
-    expect(text.split('\n').filter((l) => l && !l.startsWith('#'))).toEqual(['from_name: Alice', 'subject: Away', 'charset: utf-8', 'interval_seconds: 7200', 'start_epoch: 1767225600', 'stop_epoch: ']);
+    expect(text.split('\n').filter((l) => l && !l.startsWith('#'))).toEqual(['from: Alice', 'subject: Away', 'charset: utf-8', 'interval: 2', 'start: 1767225600', 'enabled: 1']);
+    const bare = renderAutoresponderConf({ fromName: '', subject: 'Away', charset: 'utf-8', intervalHours: 0, enabled: false, stopAt: '2026-02-01T00:00:00Z' });
+    expect(bare.split('\n').filter((l) => l && !l.startsWith('#'))).toEqual(['subject: Away', 'charset: utf-8', 'interval: 0', 'stop: 1769904000', 'enabled: 0']);
+    for (const line of [...text.split('\n'), ...bare.split('\n')].filter((l) => l && !l.startsWith('#'))) expect(AUTORESPONDER_KEYS).toContain(line.split(':')[0]);
     expect(() => renderAutoresponderConf({ fromName: 'A\nB', subject: 'x', charset: 'utf-8', intervalHours: 1 })).toThrow(OpError);
     expect(() => renderAutoresponderConf({ fromName: 'A', subject: 'x', charset: 'utf-8', intervalHours: 1, startAt: 'nope' })).toThrow(OpError);
+    expect(autoreplyOnceFiles('alice.com', 'info')[0]).toBe(`${AUTOREPLY_DB_DIR}/info@alice.com.db`);
+    await invalid('vmail.autoresponder.write', { ...good, enabled: 'yes' });
+  });
+});
+
+// The files vmail.* write are read by the Exim fragments service-configuration
+// renders (seam S4). The renderer is the source of truth for names and keys;
+// this keeps the two from drifting apart silently.
+describe('parity with service-configuration\'s virtual-mail fragments', () => {
+  const layout = { whmDir: '/etc/exim4/whm', vmail: { passwdDir: DOVECOT_PASSWD_DIR, aliasesDir: '/etc/exim4/whm/aliases', domainForward: '/etc/exim4/whm/domainfwd.lst', autorespondersDir: '/etc/exim4/whm/autoresponders', spamUsers: '/etc/exim4/whm/spam_users.lst', autoreplyOnceDir: AUTOREPLY_DB_DIR, dovecotBaseDir: '/var/run/dovecot' } };
+  const routers = renderEximVirtualRouters(layout);
+  const transports = renderEximVirtualTransports(layout);
+  const acl = renderEximSpamAcl(layout).join('\n');
+
+  it('autoresponder: body is <dir>/<domain>/<local>, headers <local>.conf with the keys the fragment looks up, once-db flat <local>@<domain>.db', () => {
+    const dir = layout.vmail.autorespondersDir;
+    expect(transports).toContain(`file = ${dir}/$domain_data/$local_part_data\n`);
+    expect(routers).toContain(`local_parts = \${if exists{${dir}/$domain_data}{dsearch;${dir}/$domain_data}{}}`);
+    expect(transports).not.toContain('.txt');
+    const conf = `${dir}/$domain_data/$local_part_data.conf`;
+    const looked = new Set([...`${routers}\n${transports}`.matchAll(/\$\{lookup\{(\w+)\}lsearch\{([^}]+)\}/g)].filter((m) => m[2] === conf).map((m) => m[1]));
+    expect([...looked].sort()).toEqual(['charset', 'enabled', 'from', 'interval', 'start', 'stop', 'subject']);
+    for (const key of looked) expect(AUTORESPONDER_KEYS, key).toContain(key);
+    expect(routers).toMatch(/lookup\{enabled\}lsearch\{[^}]+\}\{\$value\}\{1\}\}\}\{0\}/);
+    expect(transports).toMatch(/once_repeat = \$\{lookup\{interval\}lsearch\{[^}]+\}\{\$\{if eq\{\$value\}\{0\}\{1s\}\{\$\{value\}h\}\}\}/);
+    const once = transports.match(/once = (\S+)/)[1];
+    expect(once).toBe(`${AUTOREPLY_DB_DIR}/$local_part_data@$domain_data.db`);
+    expect(autoreplyOnceFiles('alice.com', 'info')[0]).toBe(once.replace('$local_part_data', 'info').replace('$domain_data', 'alice.com'));
+    const rendered = renderAutoresponderConf({ fromName: 'A', subject: 's', charset: 'utf-8', intervalHours: 3, startAt: '2026-01-01T00:00:00Z', stopAt: '2026-02-01T00:00:00Z' });
+    expect(rendered.split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.split(':')[0]).sort()).toEqual([...looked].sort());
+  });
+
+  it('spam_users.lst: the DATA ACL extracts user/enabled/threshold/autodelete and compares the flags to 1', () => {
+    expect(acl).toContain(`lsearch{${layout.vmail.spamUsers}}`);
+    const extracted = new Set([...acl.matchAll(/extract\{(\w+)\}\{\$acl_m_whm_spam\}/g)].map((m) => m[1]));
+    expect([...extracted].sort()).toEqual(['autodelete', 'enabled', 'threshold', 'user']);
+    expect(acl).toContain('${if eq{${extract{enabled}{$acl_m_whm_spam}}}{1}}');
+    expect(acl).toContain('${if eq{${extract{autodelete}{$acl_m_whm_spam}}}{1}}');
+    const line = renderSpamUsers([{ domain: 'alice.com', username: 'alice', enabled: true, threshold: 45, autoDelete: true }]).split('\n').find((l) => l.startsWith('alice.com: '));
+    const pairs = Object.fromEntries(line.slice('alice.com: '.length).split(' ').map((kv) => kv.split('=')));
+    expect(Object.keys(pairs).sort()).toEqual([...extracted].sort());
+    expect(pairs).toEqual({ user: 'alice', enabled: '1', threshold: '45', autodelete: '1' });
+  });
+
+  it('passwd, aliases and domainfwd files are where the routers look', () => {
+    expect(routers).toContain(`dsearch;${DOVECOT_PASSWD_DIR}}`);
+    expect(routers).toContain(`lsearch;${DOVECOT_PASSWD_DIR}/$domain_data}`);
+    expect(routers).toContain(`lsearch;${layout.vmail.domainForward}}`);
+    expect(routers).toContain(`lsearch;${layout.vmail.aliasesDir}/$domain_data}`);
+    expect(routers).toContain(`lookup{*}lsearch{${layout.vmail.aliasesDir}/$domain_data}`);
+    expect(routers).toContain(`${VMAIL_NAMES.router}:`);
+    expect(transports).toContain(`${VMAIL_NAMES.transport}:`);
+    expect(renderAliases('alice.com', [{ localPart: '*', targets: [':fail:'] }])).toMatch(/^\*: :fail:/m);
+    expect(renderDomainForwards([{ domain: 'alice.com', target: 'b.com' }])).toMatch(/^alice\.com: b\.com$/m);
   });
 });
 

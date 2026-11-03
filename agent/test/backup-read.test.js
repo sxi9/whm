@@ -112,6 +112,35 @@ describe('backup.archive.read_range on disk', () => {
   });
 });
 
+// A staging layout as scripts/install.sh leaves it: the directory holding the
+// dump is root-owned 0750 and the dump root-owned 0600, so the account can
+// neither search the directory nor read the file. The hand-over must not
+// depend on either (and must not loosen them).
+function stageDump(content = 'CREATE TABLE t (id INT);\n') {
+  const staging = stagingDirFor(USER);
+  const existed = fs.existsSync(staging);
+  const name = `${USER.replace(/[^a-z0-9_]/g, '_')}_t${crypto.randomBytes(2).toString('hex')}-20261103T120000Z.sql`;
+  const from = `${staging}/${name}`;
+  fs.mkdirSync(staging, { recursive: true, mode: 0o750 });
+  fs.chownSync(staging, 0, 0);
+  fs.chmodSync(staging, 0o750);
+  fs.writeFileSync(from, content, { mode: 0o600 });
+  fs.chownSync(from, 0, 0);
+  const outDir = `${HOME}/backups-${crypto.randomBytes(3).toString('hex')}`;
+  const to = `${outDir}/${name}`;
+  const cleanup = () => {
+    fs.rmSync(from, { force: true });
+    if (!existed) fs.rmSync(staging, { recursive: true, force: true });
+    fs.rmSync(outDir, { recursive: true, force: true });
+  };
+  const unchanged = () => {
+    const dir = fs.statSync(staging);
+    const file = fs.statSync(from);
+    return { dir: { uid: dir.uid, gid: dir.gid, mode: dir.mode & 0o777 }, file: { uid: file.uid, gid: file.gid, mode: file.mode & 0o777 } };
+  };
+  return { staging, name, from, outDir, to, cleanup, unchanged };
+}
+
 describe('backup.dump.import', () => {
   const dump = `alice_shop-20261103T120000Z.sql`;
   const good = { username: 'alice', from: `${DUMP_STAGING_ROOT}/alice/${dump}`, to: `/home/alice/backups/${dump}` };
@@ -162,39 +191,147 @@ describe('backup.dump.import', () => {
     expect(exec).not.toHaveBeenCalled();
   });
 
-  it.skipIf(!USER || !IS_ROOT)('hands the staging file to the account gid and copies it under the account uid (cp never executed)', async () => {
-    const staging = stagingDirFor(USER);
-    const existed = fs.existsSync(staging);
-    const name = `${USER.replace(/[^a-z0-9_]/g, '_')}_t${crypto.randomBytes(2).toString('hex')}-20261103T120000Z.sql`;
-    const from = `${staging}/${name}`;
-    const to = `${HOME}/backups-${crypto.randomBytes(3).toString('hex')}/${name}`;
-    fs.mkdirSync(staging, { recursive: true, mode: 0o750 });
-    fs.writeFileSync(from, 'CREATE TABLE t (id INT);\n', { mode: 0o600 });
+  it.skipIf(!USER || !IS_ROOT)('opens the staging file root-side and writes it under the account uid from stdin, leaving the staging tree root-only (dd never executed)', async () => {
+    const staged = stageDump();
+    const { staging, from, to } = staged;
     const [, , uidS, gidS] = MANAGED;
-    hasBinary.mockImplementation((n) => ['setpriv', 'cp'].includes(n));
-    exec.mockResolvedValueOnce({ code: 0, stdout: '', stderr: '', bin: 'x', argv: [] });
+    hasBinary.mockImplementation((n) => ['setpriv', 'dd', 'chmod', 'rm'].includes(n));
+    exec.mockResolvedValue({ code: 0, stdout: '', stderr: '', bin: 'x', argv: [] });
     try {
       expect((await opError(runOp('backup.dump.import', { username: USER, from: `${staging}/missing-20261103T120000Z.sql`, to }, ctx))).code).toBe('not_found');
       expect(exec).not.toHaveBeenCalled();
       const r = await runOp('backup.dump.import', { username: USER, from, to }, ctx);
-      expect(r).toMatchObject({ from, to, username: USER, sizeBytes: 25 });
-      const st = fs.statSync(from);
-      expect(st.uid).toBe(0);
-      expect(st.gid).toBe(Number(gidS));
-      expect(st.mode & 0o777).toBe(0o640);
-      expect(fs.statSync(staging).gid).toBe(Number(gidS));
-      expect(fs.statSync(staging).mode & 0o777).toBe(0o750);
-      const [bin, argv] = exec.mock.calls.at(-1);
+      expect(r).toMatchObject({ from, to, username: USER, sizeBytes: 25, mode: '0600' });
+      expect(staged.unchanged()).toEqual({ dir: { uid: 0, gid: 0, mode: 0o750 }, file: { uid: 0, gid: 0, mode: 0o600 } });
+      expect(exec).toHaveBeenCalledTimes(2);
+      const [bin, argv, opts] = exec.mock.calls[0];
       expect(bin).toBe('setpriv');
       expect(argv.slice(0, 7)).toEqual(['--reuid', uidS, '--regid', gidS, '--clear-groups', '--no-new-privs', '--']);
-      expect(argv[7]).toMatch(/\/cp$/);
-      expect(argv.slice(8)).toEqual(['--no-dereference', '--', from, to]);
+      expect(argv[7]).toMatch(/\/dd$/);
+      expect(argv.slice(8)).toEqual([`of=${to}`, 'bs=1M', 'status=none', 'conv=excl']);
+      expect(argv).not.toContain(from);
+      expect(typeof opts.input.pipe).toBe('function');
+      expect(opts.input.destroyed).toBe(true);
+      const [bin2, argv2] = exec.mock.calls[1];
+      expect(bin2).toBe('setpriv');
+      expect(argv2[7]).toMatch(/\/chmod$/);
+      expect(argv2.slice(8)).toEqual(['--', '0600', to]);
       expect(fs.existsSync(to)).toBe(false);
     } finally {
       hasBinary.mockReset(); hasBinary.mockImplementation((await vi.importActual('../src/exec.js')).hasBinary);
       exec.mockReset(); exec.mockImplementation((await vi.importActual('../src/exec.js')).exec);
-      fs.rmSync(from, { force: true });
-      if (!existed) fs.rmSync(staging, { recursive: true, force: true });
+      staged.cleanup();
+    }
+  });
+
+  it.skipIf(!USER || !IS_ROOT)('removes a partial target when the write fails, but never a file that made dd refuse with "File exists"', async () => {
+    const staged = stageDump();
+    const { from, to } = staged;
+    hasBinary.mockImplementation((n) => ['setpriv', 'dd', 'chmod', 'rm'].includes(n));
+    try {
+      exec.mockResolvedValueOnce({ code: 1, stdout: '', stderr: `dd: error writing '${to}': Disk quota exceeded\n`, bin: 'x', argv: [] });
+      exec.mockResolvedValueOnce({ code: 0, stdout: '', stderr: '', bin: 'x', argv: [] });
+      expect((await opError(runOp('backup.dump.import', { username: USER, from, to }, ctx))).code).toBe('refused');
+      expect(exec).toHaveBeenCalledTimes(2);
+      expect(exec.mock.calls[1][1][7]).toMatch(/\/rm$/);
+      expect(exec.mock.calls[1][1].slice(8)).toEqual(['-f', '--', to]);
+      exec.mockClear();
+      exec.mockResolvedValueOnce({ code: 1, stdout: '', stderr: `dd: failed to open '${to}': File exists\n`, bin: 'x', argv: [] });
+      expect((await opError(runOp('backup.dump.import', { username: USER, from, to }, ctx))).code).toBe('exists');
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(staged.unchanged()).toEqual({ dir: { uid: 0, gid: 0, mode: 0o750 }, file: { uid: 0, gid: 0, mode: 0o600 } });
+    } finally {
+      hasBinary.mockReset(); hasBinary.mockImplementation((await vi.importActual('../src/exec.js')).hasBinary);
+      exec.mockReset(); exec.mockImplementation((await vi.importActual('../src/exec.js')).exec);
+      staged.cleanup();
+    }
+  });
+});
+
+// The real hand-over: no stubs, setpriv + dd + chmod run as the managed
+// account against a root-only staging tree. Needs root (setpriv) and a managed
+// account with a home under /home; skipped elsewhere.
+const CAN_RUN_AS_USER = IS_ROOT && Boolean(USER) && Boolean(HOME) && fs.existsSync(HOME ?? '') && ['setpriv', 'dd', 'chmod', 'rm'].every((b) => fs.existsSync(`/usr/bin/${b}`) || fs.existsSync(`/bin/${b}`));
+
+describe('backup.dump.import on disk (as the account)', () => {
+  it.skipIf(!CAN_RUN_AS_USER)('delivers a dump the account cannot reach itself, owned by the account, 0600, byte-identical', async () => {
+    const [, , uidS, gidS] = MANAGED;
+    // Larger than one dd block and than any pipe buffer, with every byte value.
+    const content = Buffer.alloc(3 * 1024 * 1024 + 12345);
+    for (let i = 0; i < content.length; i++) content[i] = (i * 7 + (i >> 8)) & 0xff;
+    const staged = stageDump(content);
+    const { from, to, outDir } = staged;
+    fs.mkdirSync(outDir, { mode: 0o700 });
+    fs.chownSync(outDir, Number(uidS), Number(gidS));
+    try {
+      const r = await runOp('backup.dump.import', { username: USER, from, to }, ctx);
+      expect(r).toEqual({ from, to, username: USER, sizeBytes: content.length, mode: '0600' });
+      const st = fs.statSync(to);
+      expect(st.isFile()).toBe(true);
+      expect(st.uid).toBe(Number(uidS));
+      expect(st.gid).toBe(Number(gidS));
+      expect(st.mode & 0o777).toBe(0o600);
+      expect(st.size).toBe(content.length);
+      expect(fs.readFileSync(to).equals(content)).toBe(true);
+      expect(staged.unchanged()).toEqual({ dir: { uid: 0, gid: 0, mode: 0o750 }, file: { uid: 0, gid: 0, mode: 0o600 } });
+      // A second import onto the same name is refused and leaves the file alone.
+      expect((await opError(runOp('backup.dump.import', { username: USER, from, to }, ctx))).code).toBe('exists');
+      expect(fs.readFileSync(to).equals(content)).toBe(true);
+    } finally {
+      staged.cleanup();
+    }
+  });
+
+  it.skipIf(!CAN_RUN_AS_USER)('refuses a symlink the account planted at the target before the write and leaves its target untouched', async () => {
+    const [, , uidS, gidS] = MANAGED;
+    const staged = stageDump();
+    const { from, to, outDir } = staged;
+    fs.mkdirSync(outDir, { mode: 0o700 });
+    fs.chownSync(outDir, Number(uidS), Number(gidS));
+    const victim = `${outDir}/victim.txt`;
+    fs.writeFileSync(victim, 'keep', { mode: 0o600 });
+    fs.chownSync(victim, Number(uidS), Number(gidS));
+    fs.symlinkSync(victim, to);
+    fs.lchownSync(to, Number(uidS), Number(gidS));
+    try {
+      expect((await opError(runOp('backup.dump.import', { username: USER, from, to }, ctx))).code).toBe('exists');
+      expect(fs.readFileSync(victim, 'utf8')).toBe('keep');
+      expect(fs.lstatSync(to).isSymbolicLink()).toBe(true);
+    } finally {
+      staged.cleanup();
+    }
+  });
+});
+
+describe('exec input: string, Buffer and Readable stream', () => {
+  it('writes a string or Buffer whole (unchanged behaviour) and pipes a stream without buffering it', async () => {
+    const { exec: realExec } = await vi.importActual('../src/exec.js');
+    expect((await realExec('cat', [], { input: 'héllo\n' })).stdout).toBe('héllo\n');
+    expect((await realExec('wc', ['-c'], { input: Buffer.from([0, 1, 2, 255]) })).stdout.trim()).toBe('4');
+    const big = Buffer.alloc(2 * 1024 * 1024 + 7, 0x41);
+    const file = `${dir ?? '/tmp'}/exec-input-${crypto.randomBytes(4).toString('hex')}.bin`;
+    fs.writeFileSync(file, big, { mode: 0o600 });
+    try {
+      const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      const stream = fs.createReadStream('', { fd, autoClose: true });
+      const r = await realExec('wc', ['-c'], { input: stream });
+      expect(r.code).toBe(0);
+      expect(r.stdout.trim()).toBe(String(big.length));
+      expect(stream.destroyed).toBe(true);
+    } finally { fs.rmSync(file, { force: true }); }
+  });
+
+  it('kills the child and rejects with input_failed when the stream errors, and rejects other input types', async () => {
+    const { exec: realExec, ExecError } = await vi.importActual('../src/exec.js');
+    const { Readable } = await import('node:stream');
+    const broken = new Readable({ read() { this.push('partial'); this.destroy(new Error('read error')); } });
+    const err = await realExec('cat', [], { input: broken }).then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(ExecError);
+    expect(err.code).toBe('input_failed');
+    expect(err.message).toContain('read error');
+    for (const input of [42, {}, [], true, { pipe: 1 }]) {
+      const bad = await realExec('cat', [], { input }).then(() => null, (e) => e);
+      expect(bad?.code, JSON.stringify(input)).toBe('bad_argument');
     }
   });
 });

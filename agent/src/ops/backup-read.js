@@ -14,8 +14,11 @@ import { assertManaged, accountPath, asUser, failureOf, lstatOrNull } from './as
 // backup.dump.import is the other half of the panel's database dumps: mysqldump
 // writes into a root-owned staging directory (never into the home, where a
 // planted symlink could redirect --result-file), and this op hands the file to
-// the account by making it group-readable and copying it under the account's
-// own uid, so files.copy's home-only rule stays intact.
+// the account by opening it root-side and feeding that descriptor to a writer
+// running under the account's own uid, so files.copy's home-only rule stays
+// intact. The account never needs to reach the staging tree itself: on a
+// production host /var/lib/whm is 0750 whmpanel:whmpanel, so a copy run as the
+// account would fail on the first directory it cannot search.
 
 // Verbatim copy of READ_NAME in backup.js (private there); agent/test/backup-read.test.js
 // keeps the two in step through backup.js's exported readableName schema.
@@ -63,8 +66,10 @@ export function stagingDirFor(username) {
   return `${DUMP_STAGING_ROOT}/${username}`;
 }
 
+export const DUMP_MODE = '0600';
+
 defineOp('backup.dump.import', {
-  description: 'Copy a database dump from the panel staging directory into the account home as the account (the staging file becomes root:<account gid> 0640 first)',
+  description: 'Copy a database dump from the panel staging directory into the account home: the staging file is opened root-side and written under the account uid (dd conv=excl from stdin, then chmod 0600), so the staging tree stays root-only',
   timeoutMs: 600_000,
   schema: z.object({ username: arg.username, from: dumpPath, to: dumpPath }).strict(),
   run: async ({ username, from, to }, ctx) => {
@@ -79,13 +84,34 @@ defineOp('backup.dump.import', {
     assertRealPath(source, ctx, 'read');
     const dst = accountPath(username, to, ctx, 'write');
     if (dst.target === dst.home) throw new OpError('refused', 'backup.dump.import refuses to write the home directory itself');
-    if (lstatOrNull(dst.target)) throw new OpError('exists', `${path.relative(dst.home, dst.target)} already exists`);
-    fs.chownSync(staging, 0, info.gid);
-    fs.chmodSync(staging, 0o750);
-    fs.chownSync(source, 0, info.gid);
-    fs.chmodSync(source, 0o640);
-    const r = await asUser(info, 'cp', ['--no-dereference', '--', source, dst.target], { allowFailure: true, timeoutMs: 600_000 });
-    if (r.code !== 0) throw failureOf(r, `import ${path.basename(source)}`);
-    return { from: source, to: dst.target, username, sizeBytes: st.size };
+    const rel = path.relative(dst.home, dst.target);
+    if (lstatOrNull(dst.target)) throw new OpError('exists', `${rel} already exists`);
+    const fd = fs.openSync(source, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const stream = fs.createReadStream('', { fd, autoClose: true });
+    try {
+      const open = fs.fstatSync(fd);
+      if (!open.isFile() || open.ino !== st.ino || open.dev !== st.dev) throw new OpError('refused', `${from} changed while it was being checked`);
+      // conv=excl creates the target with O_CREAT|O_EXCL: a file or link the
+      // account slipped in after the check above fails the write instead of
+      // being overwritten or followed. A partial file (quota, short read) is
+      // removed as the account; an `exists` failure created nothing to remove.
+      let r;
+      try {
+        r = await asUser(info, 'dd', [`of=${dst.target}`, 'bs=1M', 'status=none', 'conv=excl'], { input: stream, allowFailure: true, timeoutMs: 600_000 });
+      } catch (err) {
+        await asUser(info, 'rm', ['-f', '--', dst.target], { allowFailure: true, timeoutMs: 30_000 }).catch(() => {});
+        throw err;
+      }
+      if (r.code !== 0) {
+        const err = failureOf(r, `import ${rel}`);
+        if (err.code !== 'exists') await asUser(info, 'rm', ['-f', '--', dst.target], { allowFailure: true, timeoutMs: 30_000 }).catch(() => {});
+        throw err;
+      }
+      const c = await asUser(info, 'chmod', ['--', DUMP_MODE, dst.target], { allowFailure: true, timeoutMs: 30_000 });
+      if (c.code !== 0) throw failureOf(c, `chmod ${DUMP_MODE} ${rel}`);
+    } finally {
+      stream.destroy();
+    }
+    return { from: source, to: dst.target, username, sizeBytes: st.size, mode: DUMP_MODE };
   },
 });

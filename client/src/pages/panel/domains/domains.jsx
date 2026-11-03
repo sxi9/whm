@@ -5,12 +5,12 @@ import { Card, StatusPill, formatDate } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
 import { PanelPage, PanelCapabilityState } from '../../../panel/PanelPage.jsx';
 import { usePanelMe } from '../../../panel/hooks/usePanel.js';
-import { useDomains, typeLabel, isParked, VhostPill, SslPill, DocrootCode } from './parts/shared.jsx';
+import { useDomains, typeLabel, isParked, allowedText, VhostPill, SslPill, DocrootCode } from './parts/shared.jsx';
 
 const FILTERS = [['all', 'All'], ['main', 'Main'], ['addon', 'Addon'], ['sub', 'Subdomains'], ['parked', 'Parked']];
 const PAGE_OF = { addon: '/panel/domains/addon-domains', sub: '/panel/domains/subdomains', parked: '/panel/domains/parked-domains', alias: '/panel/domains/parked-domains' };
 
-export const allowedText = (limit) => (limit == null ? 'no plan limit' : `of ${limit} allowed`);
+export { allowedText };
 
 export function filterDomains(rows, filter, q) {
   const needle = q.trim().toLowerCase();
@@ -47,13 +47,12 @@ export default function Domains({ fn }) {
     )}>
       {counts && (
         <div className="stat-grid" style={{ marginBottom: 16 }}>
-          <div className="stat"><div className="label">Main domain</div><div className="value">{me?.account?.domain || '—'}</div></div>
           <div className="stat"><div className="label">Addon domains</div><div className="value">{counts.addon}</div><div className="muted">{allowedText(limits?.max_addons)}</div></div>
           <div className="stat"><div className="label">Subdomains</div><div className="value">{counts.sub}</div><div className="muted">{allowedText(limits?.max_subdomains)}</div></div>
           <div className="stat"><div className="label">Parked domains</div><div className="value">{counts.parked}</div><div className="muted">{allowedText(limits?.max_parked)}</div></div>
         </div>
       )}
-      <Card title="Domains on this account" subtitle="Where each name is served from, and whether the web server and SSL are in place." padded={false}>
+      <Card title="Domains on this account" subtitle={`${me?.account?.domain ? `${me.account.domain} is the main domain. ` : ''}Where each name is served from, and whether the web server and SSL are in place.`} padded={false}>
         <PanelCapabilityState error={error} onRetry={refetch} />
         <DataTable
           columns={columns} rows={visible} loading={loading} error={error && error.status !== 501 ? error : null}

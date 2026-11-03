@@ -33,9 +33,16 @@ export function resolveBinary(name) {
 
 export const hasBinary = (name) => Boolean(resolveBinary(name));
 
+const isReadable = (v) => v != null && typeof v === 'object' && typeof v.pipe === 'function' && typeof v.on === 'function';
+
 // The single choke point for running programs. `argv` is passed to execFile as an
 // array, so no element is ever interpreted by a shell. Callers validate every
 // element with a schema before it reaches here; this layer only enforces types.
+// `input` is written to the child's stdin: a string or Buffer is written whole,
+// a Readable stream is piped (nothing is buffered, so a multi-GB file the
+// caller opened root-side can feed a program running as an account); a stream
+// that errors before it ends kills the child and rejects with `input_failed`,
+// so a short read never passes as a successful run.
 export function exec(name, argv = [], { timeoutMs = 60_000, input, env, cwd, allowFailure = false, maxBuffer = 16 * 1024 * 1024 } = {}) {
   const bin = resolveBinary(name);
   if (!bin) return Promise.reject(new ExecError('binary_not_found', `Required program "${name}" is not installed on this server`, { bin: name }));
@@ -44,7 +51,11 @@ export function exec(name, argv = [], { timeoutMs = 60_000, input, env, cwd, all
       return Promise.reject(new ExecError('bad_argument', 'Command arguments must be NUL-free strings', { bin: name }));
     }
   }
+  if (input != null && typeof input !== 'string' && !Buffer.isBuffer(input) && !(input instanceof Uint8Array) && !isReadable(input)) {
+    return Promise.reject(new ExecError('bad_argument', 'Command input must be a string, a Buffer or a Readable stream', { bin: name }));
+  }
   return new Promise((resolve, reject) => {
+    let inputError = null;
     const child = execFile(bin, argv, {
       timeout: timeoutMs,
       maxBuffer,
@@ -53,6 +64,9 @@ export function exec(name, argv = [], { timeoutMs = 60_000, input, env, cwd, all
       windowsHide: true,
     }, (err, stdout, stderr) => {
       const code = err && typeof err.code === 'number' ? err.code : err ? null : 0;
+      if (inputError) {
+        return reject(new ExecError('input_failed', `Could not feed "${name}" its input: ${inputError.message}`, { bin, argv, stderr: String(stderr).slice(-4000) }));
+      }
       if (err && err.killed) {
         return reject(new ExecError('timeout', `"${name}" did not finish within ${timeoutMs}ms`, { bin, argv, stderr: String(stderr).slice(-4000) }));
       }
@@ -67,9 +81,18 @@ export function exec(name, argv = [], { timeoutMs = 60_000, input, env, cwd, all
       }
       resolve(result);
     });
-    if (input != null) {
-      child.stdin.on('error', () => {});
+    if (input == null) return;
+    child.stdin.on('error', () => {});
+    if (!isReadable(input)) {
       child.stdin.end(input);
+      return;
     }
+    input.once('error', (err) => {
+      inputError = err;
+      input.unpipe(child.stdin);
+      child.stdin.destroy();
+      child.kill('SIGKILL');
+    });
+    input.pipe(child.stdin);
   });
 }

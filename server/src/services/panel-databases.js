@@ -236,11 +236,13 @@ export function createPanelDatabasesService(ctx) {
     return { installed: Boolean(r.installed), url: featureEnabled ? r.url ?? null : null, featureEnabled, version: r.version ?? null, users };
   }
 
-  // Dumps go through a root-owned staging directory under /var/lib/whm (never a
+  // Dumps go through a root-only staging directory under /var/lib/whm (never a
   // path inside the home: mysqldump --result-file follows a symlink the tenant
-  // planted at ~/backups), then backup.dump.import hands the file to the
-  // account (root:<gid> 0640) and copies it into the home under the account's
-  // uid; files.copy only accepts sources inside the home and is not used here.
+  // planted at ~/backups), then backup.dump.import opens the file root-side and
+  // writes it into the home under the account's uid from that descriptor, so
+  // the account never needs to search /var/lib/whm (0750 whmpanel on a
+  // production host); files.copy only accepts sources inside the home and is
+  // not used here.
   function enqueueDump(scope, name, req) {
     requireFeature(scope);
     if (isPg()) throw new CapabilityError('mysql', 'Dumps from the panel are available for MySQL/MariaDB only');
@@ -274,7 +276,7 @@ export function createPanelDatabasesService(ctx) {
     const target = `${home}/backups/${name}-${stamp}.sql`;
     job.log(`Dumping ${name} for ${username}`);
     await ctx.agent.op('fs.mkdir', { path: DUMP_STAGING_ROOT, mode: '0711', owner: 'root' });
-    await ctx.agent.op('fs.mkdir', { path: staging, mode: '0750', owner: 'root', group: username });
+    await ctx.agent.op('fs.mkdir', { path: staging, mode: '0700', owner: 'root' });
     try {
       const dumped = await ctx.databases.dump({ path: file, databases: [name] }, req);
       await ctx.agent.op('files.mkdir', { username, path: `${home}/backups`, mode: '0700' });

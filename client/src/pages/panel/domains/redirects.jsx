@@ -91,10 +91,16 @@ export default function Redirects({ fn }) {
   }, []);
   const names = useMemo(() => domains.map((d) => d.domain), [domains]);
   useEffect(() => { load(names); }, [names, load]);
+  // The ?domain= deep link opens the form only once that domain's redirect has
+  // been fetched, so an existing redirect lands in edit mode with its target.
   useEffect(() => {
     const wanted = params.get('domain');
-    if (wanted && names.includes(wanted) && !editing) { setEditing({ domain: wanted, ...(redirects.byDomain[wanted] || {}) }); setParams({}, { replace: true }); }
-  }, [params, names, redirects.byDomain, editing, setParams]);
+    if (!wanted || editing) return;
+    if (!domainsLoading && names.length && !names.includes(wanted)) { setParams({}, { replace: true }); return; }
+    if (!Object.hasOwn(redirects.byDomain, wanted)) return;
+    setEditing({ domain: wanted, ...(redirects.byDomain[wanted] || {}) });
+    setParams({}, { replace: true });
+  }, [params, names, domainsLoading, redirects.byDomain, editing, setParams]);
 
   const disabled = useFeatureGate(fn, domainsError, redirects.error);
   if (disabled) return <PanelPage fn={fn}><FeatureDisabledState fn={fn} /></PanelPage>;
@@ -133,7 +139,7 @@ export default function Redirects({ fn }) {
           emptyText={onlyRedirected ? 'No domain redirects anywhere yet. Choose a domain and add a redirect to send its visitors to another address.' : 'Your domains appear here once the account is provisioned'}
           onEdit={(r) => setEditing({ domain: r.domain, ...(r.redirect || {}) })} onRemove={remove} />
       </Card>
-      {editing && <RedirectForm open domains={free.length ? free : names} domain={editing.domain} initial={editing.targetUrl ? editing : null} onClose={() => setEditing(null)} onSaved={onSaved} />}
+      {editing && <RedirectForm open domains={[...new Set([editing.domain, ...(free.length ? free : names)].filter(Boolean))]} domain={editing.domain} initial={editing.targetUrl ? editing : null} onClose={() => setEditing(null)} onSaved={onSaved} />}
     </PanelPage>
   );
 }

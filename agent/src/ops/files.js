@@ -8,8 +8,9 @@ import { accountPath, asUser, failureOf, lstatOrNull } from './as-user.js';
 // File manager ops for the account panel. Every command runs under the
 // account's own uid (as-user.js), so permissions and quota are the kernel's
 // verdict and root never opens anything inside the home tree: file contents
-// travel in on the command's stdin (dd) and out on its stdout as hex (od), so
-// no scratch file has to be shared between root and the account.
+// travel in on the command's stdin (dd) and out on its stdout as hex (hexdump,
+// or od where util-linux lacks it), so no scratch file has to be shared
+// between root and the account.
 
 const MiB = 1024 * 1024;
 const FIND_FORMAT = '%y\t%s\t%T@\t%m\t%u\t%f\0';
@@ -17,6 +18,13 @@ const TYPES = { d: 'dir', f: 'file', l: 'symlink', b: 'other', c: 'other', p: 'o
 const STAT_TYPES = { 'regular file': 'file', 'regular empty file': 'file', directory: 'dir', 'symbolic link': 'symlink' };
 const ARCHIVE_FORMATS = { zip: { ext: /\.zip$/i, bins: ['zip'] }, 'tar.gz': { ext: /\.(tar\.gz|tgz)$/i, bins: ['tar', 'gzip'] } };
 const EXTRACT_EXT = /\.(zip|tar|tar\.gz|tgz)$/i;
+// One in-flight range read costs the agent roughly five times its length
+// (hex on stdout, the decoded Buffer, base64 and the JSON frame), so the
+// ceiling is what bounds memory whatever the caller asks for.
+export const CHUNK_READ_MAX = 2 * MiB;
+// The account's .ssh directory is written only by the SSH-key feature, whose
+// gates (shell access, session login, no impersonation) an archive would bypass.
+export const SSH_DIR = '.ssh';
 
 const base = { username: arg.username };
 const pathArg = arg.absPath;
@@ -45,9 +53,17 @@ function requireBins(bins, what) {
   for (const b of bins) if (!hasBinary(b)) throw new OpError('capability_missing', `${b} is not installed on this server; it is required to ${what}`);
 }
 
+// The hex dumper for a range read: hexdump emits two characters per byte,
+// od (the fallback) three.
+export function readRangeArgv(target, offset, length, tool = hasBinary('hexdump') ? 'hexdump' : 'od') {
+  if (tool === 'hexdump') return ['hexdump', ['-v', '-e', '1/1 "%02x"', '-s', String(offset), '-n', String(length), '--', target], 2 * length + MiB];
+  return ['od', ['-An', '-v', '-tx1', '-w4096', '-j', String(offset), '-N', String(length), '--', target], 3 * length + MiB];
+}
+
 // Reads `length` bytes from `offset` as the account and returns them raw.
 async function readRange(info, target, offset, length) {
-  const r = await asUser(info, 'od', ['-An', '-v', '-tx1', '-w4096', '-j', String(offset), '-N', String(length), '--', target], { allowFailure: true, timeoutMs: 120_000, maxBuffer: 4 * length + MiB });
+  const [bin, argv, maxBuffer] = readRangeArgv(target, offset, Math.min(length, CHUNK_READ_MAX));
+  const r = await asUser(info, bin, argv, { allowFailure: true, timeoutMs: 120_000, maxBuffer });
   if (r.code !== 0) throw failureOf(r, `read ${target}`);
   return hexToBuffer(r.stdout);
 }
@@ -121,7 +137,7 @@ defineOp('files.read', {
 
 defineOp('files.chunk_read', {
   description: 'Read a byte range of a regular file in an account home as the account (base64), for downloads',
-  schema: z.object({ ...base, path: pathArg, offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0), length: z.number().int().min(1).max(8 * MiB).default(8 * MiB) }).strict(),
+  schema: z.object({ ...base, path: pathArg, offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0), length: z.number().int().min(1).max(CHUNK_READ_MAX).default(CHUNK_READ_MAX) }).strict(),
   run: async ({ username, path: p, offset, length }, ctx) => {
     const { info, target } = accountPath(username, p, ctx, 'read');
     const st = regularFile(target, 'the download');
@@ -321,11 +337,70 @@ defineOp('files.archive', {
   },
 });
 
+// `tar --list --verbose` and `unzip -Z` (zipinfo) lines, reduced to what the
+// member check needs: the entry type, its name and, for tar symlinks, the
+// target. Lines that are not entries (zipinfo's header and trailer) are skipped.
+const TAR_LIST_RE = /^([-dlhbcps])[-rwxsStT]{9}\s+\S+\s+\d+\s+\d{4}-\d\d-\d\d\s+\d\d:\d\d(?::\d\d)?\s+(.*)$/;
+const ZIP_LIST_RE = /^([-dl])\S+\s+\d+\.\d+\s+\S+\s+\d+\s+\S\S\s+\S+\s+\S+\s+\S+\s+(.*)$/;
+export function parseTarListing(stdout) {
+  const members = [];
+  for (const line of String(stdout).split('\n')) {
+    const m = line.match(TAR_LIST_RE);
+    if (!m) continue;
+    let name = m[2];
+    let target = null;
+    if (m[1] === 'l') {
+      const at = name.lastIndexOf(' -> ');
+      if (at >= 0) { target = name.slice(at + 4); name = name.slice(0, at); }
+    }
+    members.push({ type: m[1] === 'l' ? 'symlink' : m[1] === 'd' ? 'dir' : 'file', name, target });
+  }
+  return members;
+}
+export function parseZipListing(stdout) {
+  const members = [];
+  for (const line of String(stdout).split('\n')) {
+    const m = line.match(ZIP_LIST_RE);
+    if (!m) continue;
+    members.push({ type: m[1] === 'l' ? 'symlink' : m[1] === 'd' ? 'dir' : 'file', name: m[2], target: null });
+  }
+  return members;
+}
+
+const underDir = (p, dir) => p === dir || p.startsWith(`${dir}/`);
+const hasDotDot = (name) => name.split('/').includes('..');
+const landsInSsh = (abs, home) => underDir(abs, path.join(home, SSH_DIR));
+
+// Refuses an archive whose members would leave the destination (absolute or
+// ".." names, symlinks pointing out of it) or land in the home's .ssh
+// directory; a zip symlink's target is not listed, so it is refused outright
+// while .ssh is protected.
+export function checkArchiveMembers(members, { home, dest, allowSshDir = false }) {
+  for (const m of members) {
+    const name = m.name.replace(/\/+$/, '');
+    if (!name || name === '.') continue;
+    if (name.startsWith('/') || hasDotDot(name)) throw new OpError('refused', `the archive member "${m.name}" would be written outside the destination`);
+    const abs = path.resolve(dest, name);
+    if (!underDir(abs, dest)) throw new OpError('refused', `the archive member "${m.name}" would be written outside the destination`);
+    if (!allowSshDir && landsInSsh(abs, home)) throw new OpError('refused', `the archive member "${m.name}" would be written into ${SSH_DIR}, which only the SSH-key feature may change`);
+    if (m.type !== 'symlink') continue;
+    if (m.target == null) {
+      if (!allowSshDir) throw new OpError('refused', `the archive member "${m.name}" is a symbolic link; zip archives with links cannot be extracted for this account`);
+      continue;
+    }
+    if (m.target.startsWith('/') || hasDotDot(m.target) || !underDir(path.resolve(path.dirname(abs), m.target), dest)) throw new OpError('refused', `the archive member "${m.name}" is a symbolic link pointing outside the destination`);
+    if (!allowSshDir && landsInSsh(path.resolve(path.dirname(abs), m.target), home)) throw new OpError('refused', `the archive member "${m.name}" is a symbolic link into ${SSH_DIR}`);
+  }
+  return members.length;
+}
+
+export const listArchiveArgv = (zip, archive) => (zip ? ['unzip', ['-Z', '--', archive]] : ['tar', ['--list', '--verbose', '--file', archive]]);
+
 defineOp('files.extract', {
-  description: 'Extract a zip or tar archive of an account home into a directory of that home, as the account at low priority',
+  description: 'Extract a zip or tar archive of an account home into a directory of that home, as the account at low priority (members are listed first; those leaving the destination or landing in .ssh are refused)',
   timeoutMs: 1_800_000,
-  schema: z.object({ ...base, archive: pathArg, dest: pathArg }).strict(),
-  run: async ({ username, archive, dest }, ctx) => {
+  schema: z.object({ ...base, archive: pathArg, dest: pathArg, allowSshDir: z.boolean().default(false) }).strict(),
+  run: async ({ username, archive, dest, allowSshDir }, ctx) => {
     const src = accountPath(username, archive, ctx, 'read');
     const out = accountPath(username, dest, ctx, 'write');
     const m = path.basename(src.target).match(EXTRACT_EXT);
@@ -333,6 +408,11 @@ defineOp('files.extract', {
     const zip = m[1].toLowerCase() === 'zip';
     requireBins(zip ? ['unzip'] : ['tar'], 'extract archives');
     regularFile(src.target, 'extract');
+    const [listBin, listArgv] = listArchiveArgv(zip, src.target);
+    const listing = await asUser(out.info, listBin, listArgv, { allowFailure: true, timeoutMs: 600_000, maxBuffer: 64 * MiB, nice: true });
+    if (listing.code !== 0 && !(zip && listing.code === 1)) throw failureOf(listing, `read ${path.basename(src.target)}`);
+    const members = zip ? parseZipListing(listing.stdout) : parseTarListing(listing.stdout);
+    checkArchiveMembers(members, { home: out.home, dest: out.target, allowSshDir });
     const mk = await asUser(out.info, 'mkdir', ['-p', '--', out.target], { allowFailure: true, timeoutMs: 60_000 });
     if (mk.code !== 0) throw failureOf(mk, `create ${path.relative(out.home, out.target) || '.'}`);
     const r = zip
@@ -340,6 +420,6 @@ defineOp('files.extract', {
       : await asUser(out.info, 'tar', ['--extract', '--file', src.target, '-C', out.target, '--no-same-owner', '--warning=no-unknown-keyword'], { cwd: out.target, allowFailure: true, timeoutMs: 1_800_000, nice: true });
     const warnings = r.stderr.split('\n').filter((l) => l.trim()).slice(0, 50);
     if (r.code !== 0 && !(zip && r.code === 1)) throw failureOf(r, `extract ${path.basename(src.target)}`);
-    return { archive: src.target, dest: out.target, format: zip ? 'zip' : 'tar', warnings };
+    return { archive: src.target, dest: out.target, format: zip ? 'zip' : 'tar', members: members.length, warnings };
   },
 });

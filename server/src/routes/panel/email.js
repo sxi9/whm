@@ -63,14 +63,15 @@ export async function register(ctx) {
   ctx.panelEmail = createPanelEmailService(ctx);
   const s = ctx.panelEmail;
 
-  const r = panelRouter(ctx, 'email');
+  // Seam S4 (ctx.web.applyVirtualMail) is a root-level Exim/Dovecot rewrite:
+  // the integrator calls ctx.panelEmail.ensureVirtualMail() from boot code
+  // after capabilities.refresh, never from a customer request. Domains that
+  // leave an account (addon/sub/parked removal in U3) are released with
+  // ctx.panelEmail.releaseDomain(domain, accountId, req); termination is
+  // handled by the account.terminated listener subscribed here.
+  s.subscribe();
 
-  // Seam S4: the Dovecot/Exim virtual-mail wiring is applied once per process,
-  // lazily (capabilities are only detected after every category registered).
-  r.use((req, _res, next) => {
-    if (['POST', 'PUT', 'PATCH'].includes(req.method) && req.path.startsWith('/accounts')) s.ensureVirtualMail(req).catch(() => {}).finally(next);
-    else next();
-  });
+  const r = panelRouter(ctx, 'email');
 
   r.get('/accounts', validate({ query: listQuery }), wrap((req) => s.accounts.list(req.panel, req.query)));
   r.post('/accounts', validate({ body: createAccountBody }), createdWithMeta((req) => s.accounts.create(req.panel, req.body, req)));

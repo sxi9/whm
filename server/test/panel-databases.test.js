@@ -285,7 +285,7 @@ describe('/api/panel/databases', () => {
     expect(dump.path).toMatch(/^\/var\/lib\/whm\/panel\/dumps\/alice\/alice_shop-\d{8}T\d{6}Z\.sql$/);
     expect(dump.databases).toEqual(['alice_shop']);
     expect(app.agent.callsTo('fs.mkdir')[0].args).toMatchObject({ path: '/var/lib/whm/panel/dumps', mode: '0711', owner: 'root' });
-    expect(app.agent.callsTo('fs.mkdir')[1].args).toMatchObject({ path: '/var/lib/whm/panel/dumps/alice', mode: '0750', owner: 'root', group: 'alice' });
+    expect(app.agent.callsTo('fs.mkdir')[1].args).toEqual({ path: '/var/lib/whm/panel/dumps/alice', mode: '0700', owner: 'root' });
     expect(app.agent.callsTo('files.mkdir')[0].args).toEqual({ username: 'alice', path: '/home/alice/backups', mode: '0700' });
     const imported = app.agent.callsTo('backup.dump.import')[0].args;
     expect(imported).toEqual({ username: 'alice', from: dump.path, to: `/home/alice/backups/${dump.path.split('/').pop()}` });

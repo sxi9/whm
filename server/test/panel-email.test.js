@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent } from './support/app.js';
 import { renderUserPrefs, auditArgs, limitOf } from '../src/services/panel-email.js';
@@ -13,6 +13,7 @@ const OVERRIDES = {
     'vmail.hash': () => ({ hash: HASH, scheme: 'SHA512-CRYPT', tool: 'openssl' }),
     'vmail.passwd.set': ({ domain, localPart }) => ({ domain, localPart, replaced: false }),
     'vmail.passwd.remove': ({ domain, localPart }) => ({ domain, localPart, removed: true }),
+    'vmail.passwd.purge': ({ domain }) => ({ domain, removed: true, users: [] }),
     'vmail.quota.get': ({ user }) => ({ user, bytes: 4096, limitBytes: 1073741824, messages: 3 }),
     'vmail.aliases.write': ({ domain, entries }) => ({ domain, entries: entries.length }),
     'vmail.aliases.remove': ({ domain }) => ({ domain, removed: true }),
@@ -113,6 +114,25 @@ describe('Customer panel: email', () => {
         setFeature(app, 'alice', feature, true);
       }
       expect(names().filter((n) => n.startsWith('vmail.') || n.startsWith('files.'))).toEqual([]);
+    });
+
+    it('never runs the root-level virtual-mail apply from a customer request (invalid body, feature off, acting-as)', async () => {
+      const before = app.ctx.settings.get('service_config.virtual_mail', null);
+      const original = app.ctx.web.applyVirtualMail;
+      const seen = [];
+      app.ctx.web.applyVirtualMail = async (...a) => { seen.push(a); return { applied: true }; };
+      try {
+        expect((await alice.post('/email/accounts', {})).status).toBe(422);
+        setFeature(app, 'alice', 'emailaccts', false);
+        expect((await alice.post('/email/accounts', { localPart: 'x', domain: 'alice.com', password: 'Str0ng-Passw0rd!' })).status).toBe(403);
+        setFeature(app, 'alice', 'emailaccts', true);
+        expect((await alice.put('/email/accounts/1/password', { password: 'Str0ng-Passw0rd!' })).status).toBe(404);
+        expect((await alice.patch('/email/accounts/1', { suspended: true })).status).toBe(404);
+      } finally { app.ctx.web.applyVirtualMail = original; }
+      expect(seen).toEqual([]);
+      expect(names().filter((n) => n.startsWith('web.') || n.startsWith('vmail.') || n.startsWith('mail.'))).toEqual([]);
+      expect(app.ctx.settings.get('service_config.virtual_mail', null)).toEqual(before);
+      expect(rows("SELECT id FROM audit_log WHERE action LIKE 'virtual_mail.%'")).toEqual([]);
     });
 
     it('returns 501 capability_missing without Dovecot before any op runs', async () => {
@@ -359,7 +379,7 @@ describe('Customer panel: email', () => {
       const res = await alice.post('/email/autoresponders', { address: 'away@alice.com', subject: 'Out of office', fromName: 'Alice', body: 'Back soon', intervalHours: 12, startAt: '2026-01-01T00:00:00Z' });
       expect(res.status, JSON.stringify(res.body)).toBe(201);
       expect(res.body.data).toMatchObject({ address: 'away@alice.com', subject: 'Out of office', intervalHours: 12, enabled: true });
-      expect(app.agent.callsTo('vmail.autoresponder.write')[0].args).toEqual({ domain: 'alice.com', localPart: 'away', fromName: 'Alice', subject: 'Out of office', body: 'Back soon', charset: 'utf-8', intervalHours: 12, startAt: '2026-01-01T00:00:00Z' });
+      expect(app.agent.callsTo('vmail.autoresponder.write')[0].args).toEqual({ domain: 'alice.com', localPart: 'away', fromName: 'Alice', subject: 'Out of office', body: 'Back soon', charset: 'utf-8', intervalHours: 12, startAt: '2026-01-01T00:00:00Z', enabled: true });
       const id = res.body.data.id;
       const dup = await alice.post('/email/autoresponders', { address: 'away@alice.com', subject: 'x', body: 'b' });
       expect(dup.status).toBe(409);
@@ -489,21 +509,181 @@ describe('Customer panel: email', () => {
       } finally { app.ctx.mail.reports.delivery = orig.delivery; app.ctx.mail.stats.summary = orig.summary; }
     });
 
-    it('reports the S4 wiring as advisor findings and applies the seam idempotently', async () => {
+    it('reports the S4 wiring as advisor findings and applies the seam idempotently, as the panel, from boot code only', async () => {
       const findings = await app.ctx.panelEmail.advisorFindings();
       expect(findings.map((f) => [f.id, f.grade])).toEqual([['panel.mail.router', 'warning'], ['panel.mail.auth', 'ok']]);
-      const real = await app.ctx.panelEmail.ensureVirtualMail(null, { force: true });
-      expect(typeof real.applied).toBe('boolean');
+      const before = app.ctx.settings.get('service_config.virtual_mail', null);
       const original = app.ctx.web.applyVirtualMail;
       const seen = [];
-      app.ctx.web.applyVirtualMail = async (input) => { seen.push(input); return { enabled: input.enabled, rendered: true }; };
+      app.ctx.web.applyVirtualMail = async (input, req) => { seen.push([input, req]); return { enabled: input.enabled, rendered: true }; };
       try {
-        expect(await app.ctx.panelEmail.ensureVirtualMail(null, { force: true })).toMatchObject({ applied: true, enabled: true, rendered: true });
+        app.ctx.settings.set('panel.enabled', false);
+        expect(await app.ctx.panelEmail.ensureVirtualMail({ user: { username: 'alice' } }, { force: true })).toMatchObject({ applied: false, reason: expect.stringMatching(/panel\.enabled/) });
+        app.ctx.settings.set('panel.enabled', true);
+        app.ctx.settings.set('service_config.virtual_mail', { enabled: false, spamdAddress: '127.0.0.1 783' });
+        expect(await app.ctx.panelEmail.ensureVirtualMail(null, { force: true })).toMatchObject({ applied: false, reason: expect.stringMatching(/Service Configuration/) });
+        expect(seen).toEqual([]);
+        app.ctx.settings.set('service_config.virtual_mail', null);
+        expect(await app.ctx.panelEmail.ensureVirtualMail({ user: { username: 'alice' } }, { force: true })).toMatchObject({ applied: true, enabled: true, rendered: true });
         expect(await app.ctx.panelEmail.ensureVirtualMail(null)).toMatchObject({ applied: true });
-        expect(seen).toEqual([{ enabled: true }]);
+        expect(seen).toEqual([[{ enabled: true }, null]]);
+        app.ctx.web.applyVirtualMail = async () => { seen.push('fail'); throw new Error('exim -bV failed'); };
+        expect(await app.ctx.panelEmail.ensureVirtualMail(null, { force: true })).toMatchObject({ applied: false, reason: 'exim -bV failed' });
+        expect(await app.ctx.panelEmail.ensureVirtualMail(null)).toMatchObject({ applied: false, reason: 'exim -bV failed' });
+        expect(await app.ctx.panelEmail.ensureVirtualMail(null)).toMatchObject({ applied: false });
+        expect(seen.filter((s) => s === 'fail')).toHaveLength(1);
         app.ctx.web.applyVirtualMail = undefined;
         expect(await app.ctx.panelEmail.ensureVirtualMail(null, { force: true })).toMatchObject({ applied: false });
-      } finally { app.ctx.web.applyVirtualMail = original; }
+      } finally { app.ctx.web.applyVirtualMail = original; app.ctx.settings.set('service_config.virtual_mail', before); }
+    });
+
+    it('warns the customer when the operator switched virtual mail off, without touching it', async () => {
+      const before = app.ctx.settings.get('service_config.virtual_mail', null);
+      app.ctx.settings.set('service_config.virtual_mail', { enabled: false, spamdAddress: '127.0.0.1 783' });
+      try {
+        const res = await alice.post('/email/accounts', { localPart: 'warned', domain: 'alice.com', password: 'Str0ng-Passw0rd!' });
+        expect(res.status, JSON.stringify(res.body)).toBe(201);
+        expect(res.body.meta.warnings.map((w) => w.code)).toEqual(['virtual_mail_disabled']);
+        expect(app.ctx.settings.get('service_config.virtual_mail', null)).toEqual({ enabled: false, spamdAddress: '127.0.0.1 783' });
+        expect(names().filter((n) => n.startsWith('web.'))).toEqual([]);
+        await alice.del(`/email/accounts/${res.body.data.id}`).expect(200);
+      } finally { app.ctx.settings.set('service_config.virtual_mail', before); }
+    });
+  });
+
+  describe('domains leaving an account', () => {
+    const D = 'shop.alice.com';
+    const vmailOps = () => names().filter((n) => n.startsWith('vmail.') || n.startsWith('files.'));
+    const rehome = (domain, from, to) => {
+      db().prepare('DELETE FROM account_domains WHERE domain = ? AND account_id = ?').run(domain, accountId(from));
+      db().prepare("INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, ?, 'addon', ?)").run(accountId(to), domain, `/home/${to}/public_html/shop`);
+    };
+
+    it('caps autoresponders per domain', async () => {
+      app.ctx.settings.set('panel.mail.max_autoresponders_per_domain', 1);
+      try {
+        const first = await alice.post('/email/autoresponders', { address: `one@${D}`, subject: 'x', body: 'b' });
+        expect(first.status, JSON.stringify(first.body)).toBe(201);
+        const second = await alice.post('/email/autoresponders', { address: `two@${D}`, subject: 'x', body: 'b' });
+        expect(second.status).toBe(409);
+        expect(second.body.error.code).toBe('limit_reached');
+        expect(app.agent.callsTo('vmail.autoresponder.write')).toHaveLength(1);
+        expect((await alice.get('/email/autoresponders').expect(200)).body.meta.maxPerDomain).toBe(1);
+        await alice.del(`/email/autoresponders/${first.body.data.id}`).expect(200);
+      } finally { app.ctx.settings.set('panel.mail.max_autoresponders_per_domain', 50); }
+    });
+
+    it('refuses to write next to a previous owner\'s leftovers (409 domain_stale) until root releases them', async () => {
+      db().prepare("INSERT INTO mail_forwarders (account_id, domain, local_part, destination) VALUES (?, ?, 'old', 'a@attacker.example')").run(accountId('bob'), D);
+      try {
+        for (const call of [
+          () => alice.post('/email/accounts', { localPart: 'ceo', domain: D, password: 'Str0ng-Passw0rd!' }),
+          () => alice.post('/email/forwarders', { domain: D, localPart: 'x', destination: 'x@example.org' }),
+          () => alice.put(`/email/domains/${D}/default`, { action: 'blackhole' }),
+          () => alice.put(`/email/domains/${D}/forward`, { targetDomain: 'example.org' }),
+          () => alice.post('/email/autoresponders', { address: `x@${D}`, subject: 'x', body: 'b' }),
+        ]) {
+          const res = await call();
+          expect(res.status).toBe(409);
+          expect(res.body.error.code).toBe('domain_stale');
+        }
+        expect(vmailOps()).toEqual([]);
+        expect((await alice.get(`/email/forwarders?domain=${D}`).expect(200)).body.data).toEqual([]);
+        const released = await app.ctx.panelEmail.releaseDomain(D, accountId('bob'), null, { username: 'bob' });
+        expect(released).toMatchObject({ released: true, rows: { forwarders: 1 } });
+      } finally { db().prepare('DELETE FROM mail_forwarders WHERE domain = ? AND account_id = ?').run(D, accountId('bob')); }
+      expect(row('SELECT id FROM mail_forwarders WHERE domain = ?', D)).toBeUndefined();
+      expect((await alice.put(`/email/domains/${D}/forward`, { targetDomain: 'example.org' })).status).toBe(200);
+      await alice.del(`/email/domains/${D}/forward`).expect(200);
+    });
+
+    it('by-id mutations are 404 once the row\'s domain left the account, and never render its files', async () => {
+      const fwd = await alice.post('/email/forwarders', { domain: D, localPart: 'sales', destination: 'sales@example.org' });
+      expect(fwd.status, JSON.stringify(fwd.body)).toBe(201);
+      const ar = await alice.post('/email/autoresponders', { address: `away@${D}`, subject: 'Away', body: 'b' });
+      expect(ar.status, JSON.stringify(ar.body)).toBe(201);
+      const mb = await alice.post('/email/accounts', { localPart: 'ceo', domain: D, password: 'Str0ng-Passw0rd!' });
+      expect(mb.status, JSON.stringify(mb.body)).toBe(201);
+      rehome(D, 'alice', 'bob');
+      app.agent.calls.length = 0;
+      try {
+        for (const call of [
+          () => alice.del(`/email/forwarders/${fwd.body.data.id}`),
+          () => alice.put(`/email/autoresponders/${ar.body.data.id}`, { subject: 'hijack' }),
+          () => alice.del(`/email/autoresponders/${ar.body.data.id}`),
+          () => alice.put(`/email/accounts/${mb.body.data.id}/password`, { password: 'Another-Passw0rd!' }),
+          () => alice.put(`/email/accounts/${mb.body.data.id}/quota`, { quotaMb: 1 }),
+          () => alice.patch(`/email/accounts/${mb.body.data.id}`, { suspended: true }),
+          () => alice.del(`/email/accounts/${mb.body.data.id}?removeMail=true`),
+          () => alice.get(`/email/accounts/${mb.body.data.id}`),
+        ]) {
+          const res = await call();
+          expect(res.status).toBe(404);
+        }
+        expect(vmailOps()).toEqual([]);
+        expect(row('SELECT id FROM mail_forwarders WHERE id = ?', fwd.body.data.id)).toBeTruthy();
+        expect((await bob.put(`/email/domains/${D}/forward`, { targetDomain: 'example.org' })).body.error.code).toBe('domain_stale');
+      } finally { rehome(D, 'bob', 'alice'); }
+    });
+
+    it('releaseDomain empties the host state and the rows so the next owner starts clean', async () => {
+      await alice.put(`/email/domains/${D}/default`, { action: 'forward', destination: 'catch@attacker.example' }).expect(200);
+      await alice.put(`/email/domains/${D}/forward`, { targetDomain: 'attacker.example' }).expect(200);
+      expect(rows('SELECT id FROM mail_forwarders WHERE domain = ?', D)).toHaveLength(2);
+      app.agent.calls.length = 0;
+      app.agent.fail('vmail.passwd.purge', 'command_failed', 'disk full');
+      const kept = await app.ctx.panelEmail.releaseDomain(D, accountId('alice'), null, { username: 'alice' });
+      expect(kept).toMatchObject({ released: false, rows: null, errors: [{ op: 'vmail.passwd.purge' }] });
+      expect(rows('SELECT id FROM mail_forwarders WHERE domain = ?', D)).toHaveLength(2);
+      expect(row('SELECT id FROM mail_autoresponders WHERE domain = ?', D)).toBeTruthy();
+      expect(names()).not.toContain('vmail.aliases.remove');
+      restoreAgent(app.agent);
+
+      const released = await app.ctx.panelEmail.releaseDomain(D, accountId('alice'), null, { username: 'alice' });
+      expect(released).toMatchObject({ released: true, autoresponders: 1, passwdPurged: true, aliases: true, domainForward: true, rows: { forwarders: 2, domainForward: 1, autoresponders: 1, mailDomain: 1 } });
+      expect(app.agent.callsTo('vmail.autoresponder.remove').map((c) => c.args)).toEqual([{ domain: D, localPart: 'away' }]);
+      expect(app.agent.callsTo('vmail.passwd.purge').map((c) => c.args)).toEqual([{ domain: D }]);
+      expect(app.agent.callsTo('vmail.aliases.remove').map((c) => c.args)).toEqual([{ domain: D }]);
+      expect(app.agent.callsTo('vmail.domainfwd.write').pop().args).toEqual({ entries: [] });
+      expect(app.agent.callsTo('vmail.spam_users.write')).toHaveLength(1);
+      for (const table of ['mail_forwarders', 'mail_domain_forwarders', 'mail_autoresponders', 'mail_domains']) expect(rows(`SELECT * FROM ${table} WHERE domain = ?`, D), table).toEqual([]);
+      expect(rows("SELECT * FROM mail_accounts WHERE local_part = 'ceo'")).toEqual([]);
+      expect(rows("SELECT target FROM audit_log WHERE action = 'panel.email.domain.release' ORDER BY id").map((r) => r.target)).toEqual(['bob', 'alice', 'alice']);
+      expect(await app.ctx.panelEmail.releaseDomain(D, accountId('alice'), null)).toMatchObject({ released: true, rows: { forwarders: 0, domainForward: 0, autoresponders: 0, mailDomain: 0 } });
+
+      rehome(D, 'alice', 'bob');
+      app.agent.calls.length = 0;
+      try {
+        const fwd = await bob.put(`/email/domains/${D}/forward`, { targetDomain: 'bob.example' });
+        expect(fwd.status, JSON.stringify(fwd.body)).toBe(200);
+        expect(app.agent.callsTo('vmail.domainfwd.write').pop().args).toEqual({ entries: [{ domain: D, target: 'bob.example' }] });
+        const f = await bob.post('/email/forwarders', { domain: D, localPart: 'hello', destination: 'hello@bob.example' });
+        expect(f.status, JSON.stringify(f.body)).toBe(201);
+        expect(app.agent.callsTo('vmail.aliases.write').pop().args).toEqual({ domain: D, entries: [{ localPart: 'hello', targets: ['hello@bob.example'] }] });
+        const mb = await bob.post('/email/accounts', { localPart: 'ceo', domain: D, password: 'Str0ng-Passw0rd!' });
+        expect(mb.status, JSON.stringify(mb.body)).toBe(201);
+        expect(row('SELECT account_id FROM mail_domains WHERE domain = ?', D).account_id).toBe(accountId('bob'));
+        expect(app.agent.callsTo('vmail.passwd.set').pop().args).toMatchObject({ domain: D, localPart: 'ceo', username: 'bob' });
+        expect(await app.ctx.panelEmail.releaseDomain(D, accountId('bob'), null, { username: 'bob' })).toMatchObject({ released: true, rows: { forwarders: 1, domainForward: 1, mailDomain: 1 } });
+      } finally { rehome(D, 'bob', 'alice'); }
+    });
+
+    it('terminating an account releases every domain after the cascade', async () => {
+      await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'carol', domain: 'carol.com', ip: '203.0.113.7', provision: { mail: false } }).expect(201);
+      db().prepare("INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, 'blog.carol.com', 'sub', '/home/carol/public_html/blog')").run(accountId('carol'));
+      const carol = await panelLogin(app, 'carol');
+      expect((await carol.post('/email/accounts', { localPart: 'me', domain: 'carol.com', password: 'Str0ng-Passw0rd!' })).status).toBe(201);
+      expect((await carol.put('/email/domains/carol.com/forward', { targetDomain: 'attacker.example' })).status).toBe(200);
+      expect((await carol.post('/email/autoresponders', { address: 'me@blog.carol.com', subject: 'x', body: 'b' })).status).toBe(201);
+      expect((await carol.post('/email/forwarders', { domain: 'blog.carol.com', localPart: 'x', destination: 'x@attacker.example' })).status).toBe(201);
+      app.agent.calls.length = 0;
+      await app.http.delete('/api/accounts/carol').set('X-CSRF-Token', csrf).expect(200);
+      await vi.waitFor(() => expect(app.agent.callsTo('vmail.passwd.purge').map((c) => c.args.domain).sort()).toEqual(['blog.carol.com', 'carol.com']), { timeout: 5000 });
+      expect(app.agent.callsTo('vmail.autoresponder.remove').map((c) => c.args)).toEqual([{ domain: 'blog.carol.com', localPart: 'me' }]);
+      expect(app.agent.callsTo('vmail.aliases.remove').map((c) => c.args.domain).sort()).toEqual(['blog.carol.com', 'carol.com']);
+      expect(app.agent.callsTo('vmail.domainfwd.write').pop().args).toEqual({ entries: [] });
+      expect(rows("SELECT target FROM audit_log WHERE action = 'panel.email.domain.release' AND target = 'carol'")).toHaveLength(2);
+      for (const table of ['mail_forwarders', 'mail_domain_forwarders', 'mail_autoresponders', 'mail_domains']) expect(rows(`SELECT * FROM ${table} WHERE domain LIKE '%carol.com'`), table).toEqual([]);
     });
   });
 

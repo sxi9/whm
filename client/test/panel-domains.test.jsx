@@ -51,8 +51,10 @@ describe('shared parts', () => {
     expect(limitReached(2, 2)).toBe(true);
     expect(usageText(1, 2, 'addon domains')).toBe('1 of 2 addon domains');
     expect(usageText(4, null, 'subdomains')).toContain('no plan limit');
+    expect(usageText(0, 0, 'addon domains')).toBe('No addon domains in your plan');
     expect(allowedText(null)).toBe('no plan limit');
     expect(allowedText(5)).toBe('of 5 allowed');
+    expect(allowedText(0)).toBe('none in your plan');
     const closed = renderToStaticMarkup(h(LimitNotice, { count: 0, limit: 0, noun: 'addon domains' }));
     expect(closed).toContain('Your plan does not include addon domains');
     expect(closed).toContain('plan that includes them');
@@ -102,6 +104,8 @@ describe('Domains overview', () => {
     expect(html).toContain('Shows demo.example.com');
     expect(html).toContain('~/public_html/shop');
     expect(html).toContain('Main domain');
+    expect(html).toContain('demo.example.com is the main domain.');
+    expect(html).not.toContain('<div class="value">demo.example.com</div>');
     expect(html).toContain('Addon domain');
     expect(html).toContain('Serving');
     expect(html).toContain('Pending');
@@ -110,6 +114,14 @@ describe('Domains overview', () => {
     expect(html).toContain('href="/panel/domains/addon-domains"');
     expect(html).toContain('href="/panel/domains/parked-domains"');
     expect(html).toContain('role="tablist"');
+  });
+
+  it('a plan limit of 0 reads as not included, like the server that refuses the create', () => {
+    fixtures['/panel/domains'] = { ...listFixture, meta: { ...listFixture.meta, limits: { max_addons: 0, max_subdomains: null, max_parked: 0 } } };
+    const html = page('panel:domains/domains');
+    expect(html).toContain('none in your plan');
+    expect(html).not.toContain('of 0 allowed');
+    expect(page('panel:domains/addon-domains')).toContain('No addon domains in your plan');
   });
 
   it('hides the add links of features the plan turned off', () => {
@@ -248,6 +260,7 @@ describe('Redirects', () => {
     expect(edit).toContain('Edit the redirect of second.example.org');
     expect(edit).toContain('value="https://www.example.org/"');
     expect(edit).toContain('Save redirect');
+    expect(edit).toContain('https://www.example.org/');
     expect(edit).toContain('disabled=""');
   });
 });

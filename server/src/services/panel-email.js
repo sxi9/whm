@@ -1,5 +1,6 @@
 import { HttpError, notFound, conflict, unprocessable, CapabilityError } from '../lib/errors.js';
 import { json, paginate } from '../db/index.js';
+import { fields } from '../lib/validate.js';
 import { assertFeature, limitReached } from '../routes/panel/index.js';
 
 // Customer panel: email of one hosting account (design §4.6). Every method takes
@@ -107,6 +108,18 @@ export function createPanelEmailService(ctx) {
 
     zoneOwned: db.prepare('SELECT id, domain FROM dns_zones WHERE domain = ? AND account_id = ?'),
     dkimKey: db.prepare('SELECT domain, selector, created_at FROM dkim_keys WHERE domain = ?'),
+
+    accountByUsername: db.prepare('SELECT id, username, domain FROM accounts WHERE username = ?'),
+    autoresponderCountOfDomain: db.prepare('SELECT COUNT(*) AS n FROM mail_autoresponders WHERE domain = ? AND account_id = ?'),
+    staleOwners: db.prepare(`SELECT account_id FROM mail_forwarders WHERE domain = @domain AND account_id <> @accountId
+      UNION SELECT account_id FROM mail_domain_forwarders WHERE domain = @domain AND account_id <> @accountId
+      UNION SELECT account_id FROM mail_autoresponders WHERE domain = @domain AND account_id <> @accountId`),
+    forwarderRowsOfDomainAny: db.prepare('SELECT * FROM mail_forwarders WHERE domain = ? ORDER BY local_part, id'),
+    autorespondersOfDomain: db.prepare('SELECT domain, local_part FROM mail_autoresponders WHERE domain = ? AND account_id = ?'),
+    releaseForwarders: db.prepare('DELETE FROM mail_forwarders WHERE domain = ? AND account_id = ?'),
+    releaseDomainForward: db.prepare('DELETE FROM mail_domain_forwarders WHERE domain = ? AND account_id = ?'),
+    releaseAutoresponders: db.prepare('DELETE FROM mail_autoresponders WHERE domain = ? AND account_id = ?'),
+    releaseMailDomain: db.prepare('DELETE FROM mail_domains WHERE domain = ? AND account_id = ?'),
   };
 
   const audit = (req, scope, action, args = {}) => {
@@ -149,9 +162,21 @@ export function createPanelEmailService(ctx) {
     return row;
   }
 
+  // Mail objects are keyed by domain. Rows of another account for this domain
+  // are leftovers of a previous owner that releaseDomain() did not get to run
+  // for; writing next to them would merge two accounts' routing into one host
+  // file, so every write path refuses until root releases them.
+  function assertDomainClean(scope, domain) {
+    const stale = stmts.staleOwners.all({ domain, accountId: scope.accountId });
+    if (stale.length) throw new HttpError(409, 'domain_stale', `Mail settings of a previous owner of ${domain} still exist; ask your provider to release the domain`);
+    const md = stmts.mailDomain.get(domain);
+    if (md && md.account_id != null && md.account_id !== scope.accountId) throw conflict(`The mail domain ${domain} belongs to another account`);
+  }
+
   // Seam S3: ctx.mail.ensureMailDomain(domain, accountId, req) owns the row;
   // the local fallback carries the same rule (never re-point another account's row).
   function ensureMailDomain(scope, domain, req) {
+    assertDomainClean(scope, domain);
     if (typeof ctx.mail?.ensureMailDomain === 'function') {
       ctx.mail.ensureMailDomain(domain, scope.accountId, req);
     } else {
@@ -206,9 +231,12 @@ export function createPanelEmailService(ctx) {
     }
   }
 
+  // A row found by id is only usable while its domain is still one of the
+  // account's: a domain that was moved away leaves the row to root cleanup.
   function loadMailbox(scope, id) {
     const row = stmts.mailbox.get(id, scope.accountId);
     if (!row) throw notFound('Mailbox');
+    assertDomain(scope, row.domain);
     return row;
   }
 
@@ -263,6 +291,7 @@ export function createPanelEmailService(ctx) {
         throw err;
       }
       await routeLocally(d.domain, warnings, req);
+      if (virtualMailDisabledByOperator()) warnings.push({ code: 'virtual_mail_disabled', message: 'Virtual mailboxes are switched off under Service Configuration; the mailbox is saved but Exim/Dovecot do not serve it until the operator enables them' });
       audit(req, scope, 'panel.email.account.create', { address: `${localPart}@${d.domain}`, quotaMb: quota, warnings: warnings.map((w) => w.code) });
       return { data: shapeMailbox({ ...loadMailbox(scope, id) }), meta: { warnings } };
     },
@@ -392,6 +421,7 @@ export function createPanelEmailService(ctx) {
         return defaultAddress.set(scope, d.domain, { action, destination: action === 'forward' ? destination : undefined }, req);
       }
       if (destination.toLowerCase() === `${localPart}@${d.domain}`) throw unprocessable('A forwarder cannot point at itself', { destination: ['Same as the forwarded address'] });
+      assertDomainClean(scope, d.domain);
       const max = Number(settings.get('panel.mail.max_forwarders_per_domain') ?? 200);
       if (stmts.forwarderCountOfDomain.get(d.domain, scope.accountId).n >= max) throw new HttpError(409, 'limit_reached', `At most ${max} forwarders per domain`);
       if (stmts.forwarderExists.get(d.domain, localPart, destination)) throw conflict(`${localPart}@${d.domain} already forwards to ${destination}`);
@@ -404,6 +434,7 @@ export function createPanelEmailService(ctx) {
       assertFeature(scope, 'forwarders');
       const row = stmts.forwarder.get(id, scope.accountId);
       if (!row) throw notFound('Forwarder');
+      assertDomain(scope, row.domain);
       await withAliasRender(scope, row.domain, () => stmts.deleteForwarder.run(row.id, scope.accountId), req);
       audit(req, scope, 'panel.email.forwarder.delete', { address: row.local_part == null ? `*@${row.domain}` : `${row.local_part}@${row.domain}`, destination: row.destination });
       return { id: row.id, removed: true };
@@ -424,6 +455,7 @@ export function createPanelEmailService(ctx) {
       assertFeature(scope, 'defaultaddress');
       const d = assertDomain(scope, domain);
       if (action === 'forward' && !destination) throw unprocessable('A destination is required to forward the default address', { destination: ['Required when action is "forward"'] });
+      assertDomainClean(scope, d.domain);
       const value = action === 'forward' ? destination : `:${action}:`;
       await withAliasRender(scope, d.domain, () => {
         stmts.deleteCatchAll.run(d.domain, scope.accountId);
@@ -451,6 +483,7 @@ export function createPanelEmailService(ctx) {
       assertFeature(scope, 'forwarders');
       const d = assertDomain(scope, domain);
       if (targetDomain === d.domain) throw unprocessable('A domain cannot forward to itself', { targetDomain: ['Same as the domain'] });
+      assertDomainClean(scope, d.domain);
       const before = stmts.domainForward.get(d.domain, scope.accountId);
       const info = stmts.upsertDomainForward.run(scope.accountId, d.domain, targetDomain);
       if (info.changes === 0) throw conflict(`The domain forwarder for ${d.domain} belongs to another account`);
@@ -478,7 +511,8 @@ export function createPanelEmailService(ctx) {
 
   const shapeAutoresponder = (r) => ({ id: r.id, address: `${r.local_part}@${r.domain}`, domain: r.domain, localPart: r.local_part, fromName: r.from_name, subject: r.subject, body: r.body, charset: r.charset, intervalHours: r.interval_hours, startAt: r.start_at, stopAt: r.stop_at, enabled: Boolean(r.enabled), createdAt: r.created_at, updatedAt: r.updated_at });
 
-  const autoresponderOpArgs = (r) => ({ domain: r.domain, localPart: r.local_part, fromName: r.from_name ?? '', subject: r.subject, body: r.body, charset: r.charset || 'utf-8', intervalHours: r.interval_hours, ...(r.start_at ? { startAt: r.start_at } : {}), ...(r.stop_at ? { stopAt: r.stop_at } : {}) });
+  const autoresponderOpArgs = (r) => ({ domain: r.domain, localPart: r.local_part, fromName: r.from_name ?? '', subject: r.subject, body: r.body, charset: r.charset || 'utf-8', intervalHours: r.interval_hours, ...(r.start_at ? { startAt: r.start_at } : {}), ...(r.stop_at ? { stopAt: r.stop_at } : {}), enabled: true });
+  const maxAutoresponders = () => Number(settings.get('panel.mail.max_autoresponders_per_domain') ?? 50);
 
   async function applyAutoresponder(row, req) {
     if (row.enabled) return op('vmail.autoresponder.write', autoresponderOpArgs(row), req, 'exim');
@@ -488,7 +522,7 @@ export function createPanelEmailService(ctx) {
   const autoresponders = {
     list(scope) {
       assertFeature(scope, 'autoresponders');
-      return { data: stmts.autoresponders.all(scope.accountId).map(shapeAutoresponder), meta: { domains: domainNames(scope) } };
+      return { data: stmts.autoresponders.all(scope.accountId).map(shapeAutoresponder), meta: { domains: domainNames(scope), maxPerDomain: maxAutoresponders() } };
     },
 
     get(scope, id) {
@@ -503,6 +537,11 @@ export function createPanelEmailService(ctx) {
       const { localPart, domain } = splitAddress(input.address);
       if (!LOCAL_PART.test(localPart)) throw unprocessable('Invalid address', { address: ['Local part: lowercase letters, digits, ".", "_" or "-"'] });
       const d = assertDomain(scope, domain);
+      assertDomainClean(scope, d.domain);
+      // Each autoresponder is a body on the root filesystem outside the
+      // account's quota, so the count per domain is bounded.
+      const max = maxAutoresponders();
+      if (stmts.autoresponderCountOfDomain.get(d.domain, scope.accountId).n >= max) throw new HttpError(409, 'limit_reached', `At most ${max} autoresponders per domain`);
       if (stmts.autoresponderByAddress.get(d.domain, localPart)) throw conflict(`${localPart}@${d.domain} already has an autoresponder`);
       if (input.startAt && input.stopAt && new Date(input.stopAt) <= new Date(input.startAt)) throw unprocessable('The stop time must be after the start time', { stopAt: ['Must be after startAt'] });
       const row = { account_id: scope.accountId, domain: d.domain, local_part: localPart, from_name: input.fromName ?? '', subject: input.subject, body: input.body, charset: input.charset || 'utf-8', interval_hours: input.intervalHours ?? 24, start_at: input.startAt ?? null, stop_at: input.stopAt ?? null, enabled: input.enabled === false ? 0 : 1 };
@@ -521,6 +560,7 @@ export function createPanelEmailService(ctx) {
       assertFeature(scope, 'autoresponders');
       const current = stmts.autoresponder.get(id, scope.accountId);
       if (!current) throw notFound('Autoresponder');
+      assertDomain(scope, current.domain);
       if (patch.address !== undefined) {
         const { localPart, domain } = splitAddress(patch.address);
         if (localPart !== current.local_part || domain !== current.domain) throw unprocessable('The address of an autoresponder cannot be changed; delete it and create a new one', { address: ['Read-only'] });
@@ -543,6 +583,7 @@ export function createPanelEmailService(ctx) {
       assertFeature(scope, 'autoresponders');
       const row = stmts.autoresponder.get(id, scope.accountId);
       if (!row) throw notFound('Autoresponder');
+      assertDomain(scope, row.domain);
       await op('vmail.autoresponder.remove', { domain: row.domain, localPart: row.local_part }, req, 'exim');
       stmts.deleteAutoresponder.run(row.id, scope.accountId);
       audit(req, scope, 'panel.email.autoresponder.delete', { address: `${row.local_part}@${row.domain}` });
@@ -704,24 +745,136 @@ export function createPanelEmailService(ctx) {
     };
   }
 
+  // ------------------------------------------------- releasing a domain ---
+
+  // The domains an account answers for, from its id (the scope is not
+  // available while an account is being terminated).
+  function domainsOfAccountId(accountId, mainDomain) {
+    const names = new Set(stmts.domainsOfAccount.all(accountId).map((d) => d.domain));
+    if (mainDomain) names.add(mainDomain);
+    return [...names];
+  }
+
+  // An agent answer that means "there is nothing on the host for this": the
+  // daemon is not installed or the file never existed.
+  const nothingOnHost = (err) => ['capability_missing', 'binary_not_found', 'not_found'].includes(err?.code) || (err instanceof CapabilityError);
+
+  // Seam for U3 (addon/sub/parked removal) and the account.terminated
+  // listener below: every mail object of `domain` that belongs to `accountId`
+  // leaves the host and the panel DB, so the next account that registers the
+  // domain starts from an empty passwd/alias/domainfwd/autoresponder state.
+  // Host first: a host write that fails for another reason than "nothing
+  // there" keeps the rows, which then block the next owner (409
+  // domain_stale) until root re-runs the release. `snapshot` carries the rows
+  // of an account whose DB rows are already gone (termination cascade).
+  async function releaseDomain(domain, accountId, req = null, { snapshot = null, username = null } = {}) {
+    domain = String(domain || '').toLowerCase();
+    if (!fields.domain.safeParse(domain).success || !Number.isInteger(accountId)) throw unprocessable('A domain and an account id are required');
+    const errors = [];
+    const hostOp = async (name, args) => {
+      try { await agent().op(name, args, { req }); return true; } catch (err) {
+        if (nothingOnHost(err)) return true;
+        errors.push({ op: name, code: err.code ?? null, message: err.message });
+        return false;
+      }
+    };
+    const autoresponders = snapshot?.autoresponders ?? stmts.autorespondersOfDomain.all(domain, accountId);
+    const result = { domain, accountId, autoresponders: 0, passwdPurged: false, aliases: false, domainForward: false, released: true, errors };
+    for (const r of autoresponders) { if (await hostOp('vmail.autoresponder.remove', { domain, localPart: r.local_part })) result.autoresponders++; }
+    // The passwd file is the domain's, whoever wrote it; it goes unless the
+    // mail domain already belongs to another account (the file is theirs now,
+    // and vmail.passwd.set drops any foreign-uid line it still carries).
+    const md = stmts.mailDomain.get(domain);
+    const ownedElsewhere = md && md.account_id != null && md.account_id !== accountId;
+    if (!ownedElsewhere) result.passwdPurged = await hostOp('vmail.passwd.purge', { domain });
+    const record = (rows) => {
+      const entry = { action: 'panel.email.domain.release', target: username ?? String(accountId), args: { domain, accountId, rows, autoresponders: result.autoresponders, passwdPurged: result.passwdPurged, errors: errors.map((e) => `${e.op}: ${e.message}`) } };
+      if (req?.audit) req.audit(entry); else ctx.auditRecord?.(null, entry);
+      if (errors.length) logger.warn({ domain, accountId, errors }, 'panel-email: domain release left host files behind');
+    };
+    if (errors.length) { result.released = false; result.rows = null; record(null); return result; }
+    const rowsRemoved = db.transaction(() => ({ forwarders: stmts.releaseForwarders.run(domain, accountId).changes, domainForward: stmts.releaseDomainForward.run(domain, accountId).changes, autoresponders: stmts.releaseAutoresponders.run(domain, accountId).changes, mailDomain: ownedElsewhere ? 0 : stmts.releaseMailDomain.run(domain, accountId).changes }))();
+    // The alias file follows what is left for the domain (the new owner's
+    // rows when it was re-homed first), the server-wide lists are re-rendered.
+    const remaining = new Map();
+    for (const r of stmts.forwarderRowsOfDomainAny.all(domain)) {
+      const key = r.local_part == null ? '*' : r.local_part;
+      if (!remaining.has(key)) remaining.set(key, []);
+      remaining.get(key).push(r.destination);
+    }
+    result.aliases = remaining.size
+      ? await hostOp('vmail.aliases.write', { domain, entries: [...remaining.entries()].map(([localPart, targets]) => ({ localPart, targets })) })
+      : await hostOp('vmail.aliases.remove', { domain });
+    result.domainForward = await hostOp('vmail.domainfwd.write', { entries: stmts.domainForwards.all().map((r) => ({ domain: r.domain, target: r.target_domain })) });
+    await hostOp('vmail.spam_users.write', { entries: spamEntries() });
+    result.released = errors.length === 0;
+    result.rows = rowsRemoved;
+    record(rowsRemoved);
+    return result;
+  }
+
+  // account.terminated: the rows go with the account (ON DELETE CASCADE), so
+  // what the host has to forget is read at the 'pre' stage and released after
+  // the account is gone. Nothing here can veto a termination.
+  const terminating = new Map();
+  async function onTerminated(envelope) {
+    const username = envelope?.payload?.username;
+    if (!username) return;
+    if (envelope.stage === 'pre') {
+      const account = stmts.accountByUsername.get(username);
+      if (!account) return;
+      const domains = domainsOfAccountId(account.id, account.domain);
+      terminating.set(username, { accountId: account.id, domains, autoresponders: Object.fromEntries(domains.map((d) => [d, stmts.autorespondersOfDomain.all(d, account.id)])) });
+      return;
+    }
+    const snap = terminating.get(username);
+    terminating.delete(username);
+    if (!snap) return;
+    if (stmts.accountByUsername.get(username)) return;
+    for (const domain of snap.domains) {
+      try { await releaseDomain(domain, snap.accountId, null, { snapshot: { autoresponders: snap.autoresponders[domain] || [] }, username }); } catch (err) { logger.warn({ err, domain, username }, 'panel-email: release after termination failed'); }
+    }
+  }
+
+  function subscribe(events = ctx.events) {
+    if (!events?.on) return () => {};
+    const off = events.on('account.terminated', onTerminated);
+    return () => off?.();
+  }
+
   // --------------------------------------------------- seam S4 + advisor ---
 
-  // ctx.web.applyVirtualMail({ enabled }, req) (service-configuration) renders
-  // the Dovecot drop-in and the Exim router/transport/auth slots. Idempotent, so
-  // it is retried on the next call when it is absent or fails.
+  // The operator's switch under Service Configuration. An absent row means the
+  // feature was never configured and the panel may wire it in at boot; an
+  // explicit false was set by the operator and is never overridden here.
+  const virtualMailDisabledByOperator = () => settings.get('service_config.virtual_mail', null)?.enabled === false;
+
+  // ctx.web.applyVirtualMail({ enabled }, req) (service-configuration) is a
+  // server-wide root-level rewrite of Exim/Dovecot. It runs from the
+  // integrator's boot code (after capabilities.refresh) and from the admin
+  // side, never from a customer request: there is no request principal, the
+  // audit row names the panel, and a failure is memoised with a backoff so a
+  // broken host is not re-applied in a loop.
+  const APPLY_RETRY_MS = 10 * 60_000;
   let virtualMailApplied = null;
-  async function ensureVirtualMail(req = null, { force = false } = {}) {
+  let virtualMailFailure = null;
+  async function ensureVirtualMail(_req = null, { force = false } = {}) {
     if (virtualMailApplied && !force) return virtualMailApplied;
+    if (virtualMailFailure && !force && Date.now() - virtualMailFailure.at < APPLY_RETRY_MS) return virtualMailFailure.result;
+    const fail = (reason) => { virtualMailApplied = null; virtualMailFailure = { at: Date.now(), result: { applied: false, reason } }; return virtualMailFailure.result; };
+    if (!settings.get('panel.enabled')) return { applied: false, reason: 'the customer panel is disabled (panel.enabled)' };
+    if (virtualMailDisabledByOperator()) return { applied: false, reason: 'virtual mail is switched off under Service Configuration' };
     const apply = ctx.web?.applyVirtualMail;
     if (typeof apply !== 'function') return { applied: false, reason: 'service-configuration does not provide applyVirtualMail yet' };
-    if (!capabilities.has('exim') && !capabilities.has('dovecot')) return { applied: false, reason: 'neither Exim nor Dovecot is installed' };
+    if (!capabilities.has('exim') || !capabilities.has('dovecot')) return { applied: false, reason: 'Exim and Dovecot are both needed' };
     try {
-      const r = await apply({ enabled: true }, req);
+      const r = await apply({ enabled: true }, null);
+      virtualMailFailure = null;
       virtualMailApplied = { applied: true, ...(r || {}) };
       return virtualMailApplied;
     } catch (err) {
       logger.warn({ err }, 'panel-email: applyVirtualMail failed');
-      return { applied: false, reason: err.message };
+      return fail(err.message);
     }
   }
 
@@ -753,7 +906,7 @@ export function createPanelEmailService(ctx) {
 
   return {
     LOCAL_PART, SYSTEM_ROOT,
-    domainsOf, assertDomain, ensureMailDomain,
+    domainsOf, assertDomain, assertDomainClean, ensureMailDomain, releaseDomain, subscribe,
     accounts, forwarders, defaultAddress, domainForward, autoresponders, spam, deliverability, dkim, webmail, usage,
     ensureVirtualMail, renderCheck, advisorFindings,
   };
