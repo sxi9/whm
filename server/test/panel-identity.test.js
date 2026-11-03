@@ -283,10 +283,37 @@ describe('Customer panel identity', () => {
       await app.ctx.panel.changePasswordForUser(user.id, { currentPassword: 'Alice-Forced-Passw0rd!', newPassword: 'Alice-NewPassw0rd!' }, req);
     });
 
-    // Integrator seam (routes/auth.js is shared): POST /api/auth/password must delegate to
-    // ctx.panel.changePasswordForUser for a linked login, otherwise the forced-change path
-    // rotates only users.password_hash and the Linux password keeps the old value.
-    it.todo('POST /api/auth/password with must_change_password=1 writes both stores for an account user');
+    it('POST /api/auth/password with must_change_password=1 writes both stores for an account user', async () => {
+      const user = userRow('alice');
+      db().prepare('UPDATE users SET must_change_password = 1 WHERE id = ?').run(user.id);
+      const http = request.agent(app.ctx.app);
+      const login = await http.post('/api/auth/login').send({ username: 'alice', password: 'Alice-NewPassw0rd!' }).expect(200);
+      expect(login.body.data.user.mustChangePassword).toBe(true);
+      expect((await http.get('/api/panel/me')).status).toBe(403);
+      const forced = await http.post('/api/auth/password').set('X-CSRF-Token', login.body.data.csrfToken).send({ newPassword: 'Alice-Routed-Passw0rd!' }).expect(200);
+      expect(forced.body.data.user).toMatchObject({ username: 'alice', mustChangePassword: false });
+      expect(app.agent.callsTo('user.set_password').map((c) => c.args)).toEqual([{ username: 'alice', password: 'Alice-Routed-Passw0rd!' }]);
+      expect(userRow('alice').must_change_password).toBe(0);
+      expect(await app.ctx.crypto.verifyPassword('Alice-Routed-Passw0rd!', userRow('alice').password_hash)).toBe(true);
+      expect(auditRows('panel.password.change', 'alice').length).toBeGreaterThan(0);
+      expect(JSON.parse(auditRows('panel.password.change', 'alice').at(-1).args_redacted)).toMatchObject({ forced: true, host: { applied: true } });
+      expect(auditRows('auth.password.change', 'alice').length).toBeGreaterThan(0);
+      // The route re-established this session; the panel opens on it.
+      await http.get('/api/panel/me').expect(200);
+      // An ordinary change through the same route also goes through the panel (host first).
+      const wrong = await http.post('/api/auth/password').set('X-CSRF-Token', forced.body.data.csrfToken).send({ currentPassword: 'nope', newPassword: 'Alice-NewPassw0rd!' });
+      expect(wrong.status).toBe(401);
+      expect(app.agent.callsTo('user.set_password')).toHaveLength(1);
+      const back = await http.post('/api/auth/password').set('X-CSRF-Token', forced.body.data.csrfToken).send({ currentPassword: 'Alice-Routed-Passw0rd!', newPassword: 'Alice-NewPassw0rd!' }).expect(200);
+      expect(app.agent.callsTo('user.set_password').map((c) => c.args.password)).toEqual(['Alice-Routed-Passw0rd!', 'Alice-NewPassw0rd!']);
+      await http.get('/api/panel/me').set('X-CSRF-Token', back.body.data.csrfToken).expect(200);
+      // Root is not an account user: core's own flow, no host op.
+      const rotated = await root.post('/api/auth/password', { currentPassword: 'Test-Passw0rd!1', newPassword: 'Root-Rotated-Passw0rd!1' }).expect(200);
+      csrf = rotated.body.data.csrfToken;
+      expect(app.agent.callsTo('user.set_password')).toHaveLength(2);
+      const restored = await root.post('/api/auth/password', { currentPassword: 'Root-Rotated-Passw0rd!1', newPassword: 'Test-Passw0rd!1' }).expect(200);
+      csrf = restored.body.data.csrfToken;
+    });
 
     it('clears the account-level forced change and refuses a weak password when the policy says so', async () => {
       db().prepare("UPDATE accounts SET force_password_change = 1 WHERE username = 'alice'").run();

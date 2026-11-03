@@ -483,7 +483,8 @@ describe('accounts', () => {
     const res = await mutate(root, 'delete', '/api/accounts/web01', undefined, csrf);
     expect(res.status).toBe(200);
     expect(res.body.data).toEqual({ username: 'web01', domain: 'web01.example.com', terminated: true });
-    expect(agent.calls).toEqual([{ name: 'user.delete', args: { username: 'web01', removeHome: true } }]);
+    // The account panel's mail unit also tears the account's virtual mail down on termination.
+    expect(agent.calls.filter((c) => !c.name.startsWith('vmail.'))).toEqual([{ name: 'user.delete', args: { username: 'web01', removeHome: true } }]);
     expect((await root.get('/api/accounts/web01')).status).toBe(404);
     expect((await mutate(root, 'delete', '/api/accounts/web01', undefined, csrf)).status).toBe(404);
     expect(ctx.db.prepare('SELECT COUNT(*) AS n FROM account_domains WHERE domain = ?').get('web01.example.com').n).toBe(0);

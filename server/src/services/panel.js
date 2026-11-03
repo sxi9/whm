@@ -56,10 +56,18 @@ export function createPanelService(ctx) {
     insertToken: db.prepare('INSERT INTO api_tokens (user_id, name, token_hash, scopes, expires_at, prefix, created_ip) VALUES (?, ?, ?, ?, ?, ?, ?)'),
     deleteToken: db.prepare('DELETE FROM api_tokens WHERE id = ? AND user_id = ?'),
     sessionsForUser: db.prepare('SELECT sid, expires_at FROM sessions WHERE user_id = ? AND expires_at >= ?'),
+    hostingAccountOf: db.prepare('SELECT account_id FROM account_domains WHERE domain = ? UNION SELECT id AS account_id FROM accounts WHERE domain = ?'),
+    usernameOfAccount: db.prepare('SELECT username FROM accounts WHERE id = ?'),
   };
 
   // Tables owned by the mail and FTP units may not exist on this tree yet.
   const tableExists = (name) => Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
+  // Accounts with mail rows for a domain (tables of the mail unit, 033b, may be absent).
+  const mailHoldersOf = (domain) => {
+    const tables = ['mail_domains', 'mail_forwarders', 'mail_domain_forwarders', 'mail_autoresponders'].filter(tableExists);
+    if (!tables.length) return [];
+    return db.prepare(tables.map((t) => `SELECT account_id FROM ${t} WHERE domain = ? AND account_id IS NOT NULL`).join(' UNION ')).all(...tables.map(() => domain)).map((r) => r.account_id);
+  };
   const optionalCount = (table, column = 'account_id') => {
     let stmt = null;
     let checked = false;
@@ -440,6 +448,28 @@ export function createPanelService(ctx) {
     return changePassword(s, { currentPassword, newPassword, force }, req);
   }
 
+  // Root's answer to a 409 domain_stale: the mail rows and host files of
+  // `domain` that accounts other than its current owner left behind are
+  // released; when no other account holds any, the current (or last) owner's
+  // are. Every release is audited by the mail unit itself.
+  async function releaseMailDomain(domain, req) {
+    if (typeof ctx.panelEmail?.releaseDomain !== 'function') throw new HttpError(503, 'service_unavailable', 'The panel mail unit is not loaded');
+    const current = stmts.hostingAccountOf.get(domain, domain)?.account_id ?? null;
+    const holders = [...new Set(mailHoldersOf(domain))];
+    let targets = holders.filter((id) => id !== current);
+    if (!targets.length && current != null) targets = [current];
+    if (!targets.length) throw notFound(`Mail settings of ${domain}`);
+    const results = [];
+    for (const accountId of targets) {
+      const username = stmts.usernameOfAccount.get(accountId)?.username ?? null;
+      const r = await ctx.panelEmail.releaseDomain(domain, accountId, req, { username });
+      results.push({ accountId, username, released: Boolean(r.released), rows: r.rows ?? null, autoresponders: r.autoresponders, passwdPurged: r.passwdPurged, errors: (r.errors || []).map((e) => ({ op: e.op, code: e.code ?? null, message: e.message })) });
+    }
+    const released = results.every((r) => r.released);
+    audit(req, { action: 'panel.admin.domain.release_mail', target: domain, args: { accounts: results.map((r) => r.username ?? r.accountId), currentAccountId: current, released } });
+    return { domain, currentAccountId: current, released, results };
+  }
+
   // After destroyUserSessions the caller's own session is gone too: give it a
   // fresh id bound to the same user, the way routes/auth.js re-creates sessions.
   function reestablish(req) {
@@ -528,6 +558,6 @@ export function createPanelService(ctx) {
     ensureUser, backfill, syncPassword, setSuspended, subscribe, userStatus, adminEnsureUser, adminSetPassword,
     scope, assertNotActing, loginAs, logoutAs, loginAsHistory, endImpersonation,
     me, quickLinks, counts, userPrincipal,
-    changePassword, changePasswordForUser, linkForUser, reestablish, sessions, tokens, settings: panelSettings, audit,
+    changePassword, changePasswordForUser, linkForUser, reestablish, sessions, tokens, settings: panelSettings, audit, releaseMailDomain,
   };
 }

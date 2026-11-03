@@ -5,7 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
 import { assertUnderHome, asUserArgv, assertManaged, accountPath, SYSTEM_USERS } from '../src/ops/as-user.js';
-import { CHUNK_READ_MAX, readRangeArgv, parseTarListing, parseZipListing, checkArchiveMembers, listArchiveArgv } from '../src/ops/files.js';
+import { CHUNK_READ_MAX, FIND_FORMAT, parseFind, readRangeArgv, parseTarListing, parseZipListing, checkArchiveMembers, listArchiveArgv } from '../src/ops/files.js';
 
 // exec is spied with the real implementation behind it so every test proves an
 // op refused before any program ran. No files.* op is ever executed here: each
@@ -55,6 +55,25 @@ describe('files op catalog', () => {
     for (const name of OPS.filter((n) => n !== 'files.remove')) expect(catalog.get(name).destructive, name).toBe(false);
     expect(catalog.get('files.archive').timeoutMs).toBe(1_800_000);
     expect(catalog.get('files.extract').timeoutMs).toBe(1_800_000);
+  });
+});
+
+describe('files.list record format', () => {
+  it('passes exec()\'s NUL check and still yields NUL-separated records (names may hold newlines and tabs)', async () => {
+    expect(FIND_FORMAT.includes('\0')).toBe(false);
+    expect(FIND_FORMAT.endsWith('\\0')).toBe(true);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-find-'));
+    try {
+      fs.mkdirSync(path.join(dir, 'sub'));
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
+      fs.writeFileSync(path.join(dir, 'odd\tname\nhere'), 'yy');
+      const r = await exec('find', ['-P', dir, '-mindepth', '1', '-maxdepth', '1', '-printf', FIND_FORMAT]);
+      expect(r.stdout.split('\0').filter(Boolean)).toHaveLength(3);
+      const entries = parseFind(r.stdout);
+      expect(entries.map((e) => [e.name, e.type, e.size])).toEqual([['sub', 'dir', entries[0].size], ['a.txt', 'file', 1], ['odd\tname\nhere', 'file', 2]]);
+      expect(entries[1].mode).toMatch(/^0[0-7]{3}$/);
+      expect(entries[1].mtime).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });
 

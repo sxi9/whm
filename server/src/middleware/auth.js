@@ -2,14 +2,24 @@ import { unauthorized, forbidden, HttpError } from '../lib/errors.js';
 
 const USER_COLUMNS = 'id, username, email, role, totp_enabled, must_change_password, suspended';
 
-// A category that hands tokens to other machines registers the scope it puts
-// on them in ctx.confinedScopes (scope -> [{ method, path }], paths as mounted
-// under /api). A token whose scopes are all confined can call those routes
-// and nothing else, whatever the role of the user it belongs to.
+// A category that hands tokens to other machines (or to account users)
+// registers the scope it puts on them in ctx.confinedScopes (scope ->
+// [{ method?, path, prefix? }], paths as mounted under /api). A token whose
+// scopes are all confined can call those routes and nothing else, whatever the
+// role of the user it belongs to. An entry without `prefix` matches its path
+// exactly; with `prefix: true` it matches the path and everything below it.
 export function confinementOf(registry, scopes) {
   if (!registry?.size || !Array.isArray(scopes) || !scopes.length || scopes.includes('*')) return null;
   if (!scopes.every((s) => registry.has(s))) return null;
   return scopes.flatMap((s) => registry.get(s));
+}
+
+const routeAllows = (r, method, mounted) => (!r.method || r.method === method) && (r.prefix ? mounted === r.path || mounted.startsWith(`${r.path}/`) : r.path === mounted);
+const describeRoute = (r) => `${r.method || 'ANY'} ${r.path}${r.prefix ? '/*' : ''}`;
+function confinementError(confined, req) {
+  const mounted = req.baseUrl + req.path;
+  if (!confined || confined.some((r) => routeAllows(r, req.method, mounted))) return null;
+  return new HttpError(403, 'scope_confined', `This API token is confined to ${confined.map(describeRoute).join(', ')}`);
 }
 
 // Resolves the principal for a request from either the session cookie or an
@@ -37,7 +47,9 @@ export function attachUser(ctx) {
       const list = JSON.parse(scopes || '[]');
       req.user = user;
       req.auth = { via: 'token', tokenId: token_id, scopes: list, confinedTo: confinementOf(ctx.confinedScopes, list) };
-      return next();
+      // Confinement holds on every /api path, the public ones (branding,
+      // logout) included, so it is applied as soon as the token is known.
+      return next(confinementError(req.auth.confinedTo, req) || undefined);
     }
     if (req.session?.userId) {
       const user = byId.get(req.session.userId);
@@ -61,10 +73,8 @@ export function attachUser(ctx) {
 export function requireAuth(req, _res, next) {
   if (!req.user) return next(unauthorized());
   const mounted = req.baseUrl + req.path;
-  const confined = req.auth?.confinedTo;
-  if (confined && !confined.some((r) => r.path === mounted && (!r.method || r.method === req.method))) {
-    return next(new HttpError(403, 'scope_confined', `This API token is confined to ${confined.map((r) => `${r.method || 'ANY'} ${r.path}`).join(', ')}`));
-  }
+  const confinedErr = confinementError(req.auth?.confinedTo, req);
+  if (confinedErr) return next(confinedErr);
   // Users who must change their password or enrol in 2FA may only use the auth
   // endpoints until they have. req.path is relative to the current router, so
   // the mounted path is used.

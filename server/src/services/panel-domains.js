@@ -143,6 +143,22 @@ export function createPanelDomainsService(ctx) {
     }
   }
 
+  // The hostname's mail objects (forwarders, autoresponders, passwd/alias
+  // files) leave with it. A host write that fails keeps the rows, which then
+  // block the next owner (409 domain_stale) until root releases them; that is
+  // reported, never a reason to keep the domain.
+  async function releaseMail(scope, domain, req, warnings) {
+    if (typeof ctx.panelEmail?.releaseDomain !== 'function') return { released: false, reason: 'email_unavailable' };
+    try {
+      const r = await ctx.panelEmail.releaseDomain(domain, scope.accountId, req, { username: scope.username });
+      if (!r.released) warnings.push(`Mail: the settings of ${domain} were not fully removed from the server (${(r.errors || []).map((e) => e.op).join(', ') || 'host error'}); ask your provider to release the domain`);
+      return { released: Boolean(r.released), errors: (r.errors || []).map((e) => ({ op: e.op, code: e.code ?? null, message: e.message })) };
+    } catch (err) {
+      warnings.push(`Mail: ${err.message}`);
+      return { released: false, reason: err.code ?? 'error', errors: [{ op: null, code: err.code ?? null, message: err.message }] };
+    }
+  }
+
   async function dnsRecordsFor(scope, fqdn, values, req, warnings) {
     const zone = ctx.dns?.zoneFor?.(fqdn);
     if (!zone || zone.account_id !== scope.accountId) { warnings.push(`No DNS zone of this account contains ${fqdn}; add the records yourself`); return { applied: false, reason: 'no_zone' }; }
@@ -223,13 +239,14 @@ export function createPanelDomainsService(ctx) {
       if (stmts.forwarding.get(domain, scope.accountId) && typeof ctx.dns?.removeForwarding === 'function') {
         try { await ctx.dns.removeForwarding(domain, scope.ownerPrincipal, req); } catch (err) { warnings.push(`Redirect: ${err.message}`); }
       }
+      const mail = await releaseMail(scope, domain, req, warnings);
       db.transaction(() => { stmts.remove.run(row.id, scope.accountId); stmts.deleteMailDomain.run(domain, scope.accountId); })();
       let docroot = { removed: false };
       if (removeDocroot && row.docroot) {
         try { docroot = await removeDocrootAsUser(scope, row.docroot, req); } catch (err) { warnings.push(`Document root: ${err.message}`); }
       }
-      audit(req, { action: 'panel.domains.addon.remove', target: scope.username, args: auditArgs(scope, { domain, removeZone, removeDocroot, zoneRemoved: zone.removed, docrootRemoved: docroot.removed }) });
-      return { data: { domain, removed: true, zone, web, ssl: ssl ? { removed: ssl.removed } : null, docroot }, meta: { warnings } };
+      audit(req, { action: 'panel.domains.addon.remove', target: scope.username, args: auditArgs(scope, { domain, removeZone, removeDocroot, zoneRemoved: zone.removed, docrootRemoved: docroot.removed, mailReleased: mail.released }) });
+      return { data: { domain, removed: true, zone, web, ssl: ssl ? { removed: ssl.removed } : null, docroot, mail }, meta: { warnings } };
     },
 
     async addSub(scope, { label, parent, docroot: rel }, req) {
@@ -256,13 +273,14 @@ export function createPanelDomainsService(ctx) {
       const warnings = [];
       const web = await dropVhost(scope, domain, req, warnings);
       const dns = await dnsRecordsFor(scope, domain, { ipv4: [], ipv6: [] }, req, warnings);
-      stmts.remove.run(row.id, scope.accountId);
+      const mail = await releaseMail(scope, domain, req, warnings);
+      db.transaction(() => { stmts.remove.run(row.id, scope.accountId); stmts.deleteMailDomain.run(domain, scope.accountId); })();
       let docroot = { removed: false };
       if (removeDocroot && row.docroot) {
         try { docroot = await removeDocrootAsUser(scope, row.docroot, req); } catch (err) { warnings.push(`Document root: ${err.message}`); }
       }
-      audit(req, { action: 'panel.domains.sub.remove', target: scope.username, args: auditArgs(scope, { domain, removeDocroot, docrootRemoved: docroot.removed }) });
-      return { data: { domain, removed: true, dns, web, docroot }, meta: { warnings } };
+      audit(req, { action: 'panel.domains.sub.remove', target: scope.username, args: auditArgs(scope, { domain, removeDocroot, docrootRemoved: docroot.removed, mailReleased: mail.released }) });
+      return { data: { domain, removed: true, dns, web, docroot, mail }, meta: { warnings } };
     },
 
     async addParked(scope, { domain, createZone = true }, req) {
@@ -278,9 +296,13 @@ export function createPanelDomainsService(ctx) {
     async removeParked(scope, domain, { removeZone = true } = {}, req) {
       assertFeature(scope, 'parkeddomains');
       assertDomain(scope, domain, ['parked', 'alias']);
+      if (typeof ctx.dns?.unparkDomain !== 'function') throw new HttpError(503, 'service_unavailable', 'The DNS category is not loaded');
+      const warnings = [];
+      const mail = await releaseMail(scope, domain, req, warnings);
       const result = await ctx.dns.unparkDomain(domain, { removeZone }, scope.ownerPrincipal, req);
-      audit(req, { action: 'panel.domains.parked.remove', target: scope.username, args: auditArgs(scope, { domain, removeZone, zoneRemoved: result.zoneRemoved }) });
-      return { domain, removed: true, zoneRemoved: result.zoneRemoved, web: result.web };
+      stmts.deleteMailDomain.run(domain, scope.accountId);
+      audit(req, { action: 'panel.domains.parked.remove', target: scope.username, args: auditArgs(scope, { domain, removeZone, zoneRemoved: result.zoneRemoved, mailReleased: mail.released }) });
+      return { data: { domain, removed: true, zoneRemoved: result.zoneRemoved, web: result.web, mail }, meta: { warnings } };
     },
 
     getRedirect(scope, domain) {

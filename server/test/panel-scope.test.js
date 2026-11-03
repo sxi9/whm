@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import request from 'supertest';
 import { createTestApp } from './support/app.js';
 import { forbidden } from '../src/lib/errors.js';
+import { PANEL_SCOPES } from '../src/routes/panel/index.js';
 
 // Scope resolution, impersonation and the per-request gates of the customer panel.
 describe('Customer panel scope', () => {
@@ -163,6 +164,29 @@ describe('Customer panel scope', () => {
       await resellerHttp.get('/api/panel/admin/settings').expect(403);
       await resellerHttp.put('/api/panel/admin/settings').set('X-CSRF-Token', resellerCsrf).send({ enabled: false }).expect(403);
       expect(app.ctx.settings.get('panel.enabled')).toBe(true);
+    });
+
+    it('root releases the mail leftovers of a previous owner (409 domain_stale); resellers cannot', async () => {
+      const accountId = (u) => db().prepare('SELECT id FROM accounts WHERE username = ?').get(u).id;
+      db().prepare("INSERT INTO mail_forwarders (account_id, domain, local_part, destination) VALUES (?, 'alice.com', 'old', 'old@bob.example')").run(accountId('bob'));
+      db().prepare("INSERT INTO mail_forwarders (account_id, domain, local_part, destination) VALUES (?, 'alice.com', 'mine', 'me@alice.example')").run(accountId('alice'));
+      await rPost('/api/panel/admin/domains/alice.com/release-mail').expect(403);
+      expect((await rootPost('/api/panel/admin/domains/not a domain/release-mail')).status).toBe(422);
+      expect((await rootPost('/api/panel/admin/domains/nobody.example/release-mail')).status).toBe(404);
+      const res = await rootPost('/api/panel/admin/domains/alice.com/release-mail').expect(200);
+      expect(res.body.data).toMatchObject({ domain: 'alice.com', currentAccountId: accountId('alice'), released: true });
+      expect(res.body.data.results).toEqual([expect.objectContaining({ accountId: accountId('bob'), username: 'bob', released: true, rows: expect.objectContaining({ forwarders: 1 }) })]);
+      // Only the previous owner's rows went; the current owner keeps its own.
+      expect(db().prepare("SELECT account_id FROM mail_forwarders WHERE domain = 'alice.com'").all()).toEqual([{ account_id: accountId('alice') }]);
+      // The passwd file is the current owner's now, so the stale release leaves it alone.
+      expect(app.agent.callsTo('vmail.passwd.purge')).toEqual([]);
+      expect(audit('panel.admin.domain.release_mail', 'alice.com')).toHaveLength(1);
+      expect(audit('panel.email.domain.release', 'bob')).toHaveLength(1);
+      // With no other holder the current owner's own leftovers are released.
+      const own = await rootPost('/api/panel/admin/domains/alice.com/release-mail').expect(200);
+      expect(own.body.data.results.map((r) => r.username)).toEqual(['alice']);
+      expect(app.agent.callsTo('vmail.passwd.purge').map((c) => c.args)).toEqual([{ domain: 'alice.com' }]);
+      expect(db().prepare("SELECT COUNT(*) AS n FROM mail_forwarders WHERE domain = 'alice.com'").get().n).toBe(0);
     });
   });
 
@@ -342,22 +366,31 @@ describe('Customer panel scope', () => {
       }
     });
 
-    // §3.4 confinement needs core: requireAuth matches confinement entries by exact
-    // mounted path, so register() only calls confinePanelTokens() once
-    // ctx.confinedScopes.prefixes is set by core. Until then a panel:* bearer
-    // token reaches every auth-only core route (POST /api/auth/2fa/enroll included)
-    // and this test is skipped rather than asserting the gap away.
-    it('a panel token is confined to /api/panel/* and GET /api/auth/me (§3.4)', async (t) => {
-      if (!app.ctx.confinedScopes?.get('panel:read')) return t.skip();
+    it('a panel token is confined to /api/panel/* and GET /api/auth/me (§3.4)', async () => {
+      expect(app.ctx.confinedScopes.prefixes).toBe(true);
+      for (const scope of PANEL_SCOPES) expect(app.ctx.confinedScopes.get(scope), scope).toEqual([{ path: '/api/panel', prefix: true }, { method: 'GET', path: '/api/auth/me' }]);
       const bearer = (method, p) => request(app.ctx.app)[method](p).set('Authorization', `Bearer ${token}`);
       await bearer('get', '/api/panel/me').expect(200);
       await bearer('get', '/api/panel/tokens').expect(200);
       await bearer('get', '/api/auth/me').expect(200);
-      for (const [method, p] of [['post', '/api/auth/2fa/enroll'], ['post', '/api/auth/password'], ['post', '/api/auth/logout'], ['get', '/api/themes/active'], ['get', '/api/cpanel/news/active']]) {
+      for (const [method, p] of [['post', '/api/auth/2fa/enroll'], ['post', '/api/auth/password'], ['post', '/api/auth/logout'], ['get', '/api/themes/active'], ['get', '/api/cpanel/news/active'], ['get', '/api/branding'], ['get', '/api/health'], ['get', '/api/panels'], ['get', '/api/auth/csrf']]) {
         const res = await bearer(method, p).send({});
         expect(res.status, `${method} ${p}`).toBe(403);
         expect(res.body.error.code, `${method} ${p}`).toBe('scope_confined');
+        expect(res.body.error.message, `${method} ${p}`).toMatch(/confined to ANY \/api\/panel\/\*, GET \/api\/auth\/me/);
       }
+      // A group scope reaches its own router (and panel:read is enough for reads).
+      const alice = sessions.alice;
+      const domains = (await alice.post('/api/panel/tokens', { name: 'domains', scopes: ['panel:domains'] }).expect(201)).body.data;
+      expect(domains.scopes).toEqual(['panel:domains']);
+      const asDomains = (method, p) => request(app.ctx.app)[method](p).set('Authorization', `Bearer ${domains.token}`);
+      await asDomains('get', '/api/panel/domains').expect(200);
+      expect((await asDomains('get', '/api/panel/me').expect(200)).body.data.account.username).toBe('alice');
+      expect((await asDomains('post', '/api/panel/domains/sub').send({ label: '!!', parent: 'alice.com' })).status).toBe(422);
+      expect((await asDomains('get', '/api/accounts')).body.error.code).toBe('scope_confined');
+      const readOnly = (await alice.post('/api/panel/tokens', { name: 'ro', scopes: ['panel:read'] }).expect(201)).body.data.token;
+      await request(app.ctx.app).get('/api/panel/domains').set('Authorization', `Bearer ${readOnly}`).expect(200);
+      expect((await request(app.ctx.app).post('/api/panel/domains/sub').set('Authorization', `Bearer ${readOnly}`).send({ label: '!!', parent: 'alice.com' })).status).toBe(403);
       expect(db().prepare("SELECT totp_enabled, totp_secret_enc FROM users WHERE username = 'alice'").get()).toEqual({ totp_enabled: 0, totp_secret_enc: null });
     });
 

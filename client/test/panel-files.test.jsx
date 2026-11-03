@@ -2,6 +2,8 @@ import { describe, it, expect, vi } from 'vitest';
 import React, { createElement as h } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const fixtures = vi.hoisted(() => ({ responses: new Map() }));
 
@@ -19,6 +21,8 @@ const { PANEL_FUNCTION_BY_KEY } = await import('../src/panel/nav.js');
 const { default: FileManager, entryIcon, typeText } = await import('../src/pages/panel/files/file-manager.jsx');
 const { default: DiskUsage, shapeRows } = await import('../src/pages/panel/files/disk-usage.jsx');
 const paths = await import('../src/pages/panel/files/parts/paths.js');
+const { CompressModal, ExtractModal } = await import('../src/pages/panel/files/parts/ArchiveModals.jsx');
+const { JobProgress, jobStreamPath } = await import('../src/pages/panel/files/parts/JobProgress.jsx');
 
 React.useLayoutEffect = React.useEffect;
 
@@ -117,6 +121,37 @@ describe('File manager page', () => {
     expect(html).toContain('The folder could not be read.');
   });
 
+  it('shows the home prefix of the go-to and copy fields as text, not as a second input', () => {
+    fixtures.responses.clear();
+    fixtures.responses.set('/panel/files/list?path=', { loading: false, data: { path: '.', entries, total: entries.length, truncated: false } });
+    const html = render(h(FileManager, { fn: fmFn }), fmFn.path);
+    expect(html).toContain('<span class="muted" aria-hidden="true"><code>~/</code></span>');
+    expect(html).not.toContain('value="~/"');
+    expect(html).not.toContain('aria-label="Home directory"');
+    const extract = renderToStaticMarkup(h(ToastProvider, null, h(ExtractModal, { archive: 'site-backup.tar.gz', onClose: () => {} })));
+    expect(extract).toContain('<span class="muted" aria-hidden="true"><code>~/</code></span>');
+    expect(extract).not.toContain('value="~/"');
+    expect(extract).toContain('id="extract-dest"');
+  });
+
+  it('follows archive jobs on the panel job stream, never the reseller-only /system/jobs', () => {
+    expect(jobStreamPath('abc')).toBe('/panel/files/jobs/abc/stream');
+    const dir = path.resolve(__dirname, '../src/pages/panel/files');
+    const sources = ['parts/ArchiveModals.jsx', 'parts/JobProgress.jsx', 'file-manager.jsx'].map((f) => fs.readFileSync(path.join(dir, f), 'utf8'));
+    for (const src of sources) {
+      expect(src).not.toContain('/system/jobs');
+      expect(src).not.toContain('components/ProgressLog.jsx');
+    }
+    expect(sources[0]).toContain('JobProgress');
+    const html = renderToStaticMarkup(h(JobProgress, { jobId: 'job1' }));
+    expect(html).toContain('data-job="job1"');
+    expect(html).toContain('progress-log');
+    expect(renderToStaticMarkup(h(JobProgress, { jobId: null }))).toBe('');
+    const compress = renderToStaticMarkup(h(ToastProvider, null, h(CompressModal, { paths: ['notes.txt'], dir: '', onClose: () => {} })));
+    expect(compress).toContain('Compress notes.txt');
+    expect(compress).toContain('id="archive-name"');
+  });
+
   it('helpers: icons, type text and the path utilities', () => {
     expect(typeText(entries[0])).toBe('Folder');
     expect(typeText(entries[2])).toBe('Archive');
@@ -167,7 +202,11 @@ describe('Disk usage page', () => {
     expect(html).toContain('2.00 GB');
     expect(html).toContain('of 10.0 GB');
     expect(html).toContain('width:20%');
-    expect(html).toContain('keeps these figures for five minutes');
+    expect(html).toContain('the figures are kept for five minutes');
+    expect(html).toContain('<time dateTime="2026-11-03T10:00:00.000Z">');
+    expect(html).toContain('Sub-folders');
+    expect(html).toContain('data-stat="measured"><div class="label">Sub-folders</div><div class="value">3</div>');
+    expect(html).not.toContain('font-size:17px');
     expect(html).toContain('One level');
     expect(html).toContain('Two levels');
     const first = html.indexOf(' public_html</a>'), second = html.indexOf(' mail</a>'), third = html.indexOf(' tmp</a>');
@@ -191,7 +230,8 @@ describe('Disk usage page', () => {
     expect(html).toContain(' wp-content/uploads</a>');
     expect(html).toContain('padding-left:18px');
     expect(html).toContain('Some folders could not be measured');
-    expect(html).toContain('Fresh figures from the server.');
+    expect(html).toContain('Measured <time');
+    expect(html).not.toContain('kept for five minutes');
   });
 
   it('renders 501 and 403 states', () => {
@@ -205,11 +245,16 @@ describe('Disk usage page', () => {
     expect(html).toContain('Not included in your plan');
   });
 
-  it('shapeRows makes entries relative, computes shares and sorts', () => {
+  it('shapeRows makes entries relative, computes shares, sorts and keeps children under their parent', () => {
     const rows = shapeRows([{ path: 'a/b', kb: 10 }, { path: 'a/c', kb: 30 }, { path: 'a/c/d', kb: 5 }, { path: 'z', kb: 99 }], 'a', 40);
-    expect(rows.map((r) => r.name)).toEqual(['c', 'b', 'c/d']);
+    expect(rows.map((r) => r.name)).toEqual(['c', 'c/d', 'b']);
     expect(rows[0].percent).toBe(75);
-    expect(rows[2].depth).toBe(2);
+    expect(rows[1].depth).toBe(2);
     expect(shapeRows([{ path: '.', kb: 1 }], '', 0)).toEqual([]);
+    const two = shapeRows([{ path: 'logs', kb: 8 }, { path: 'public_html', kb: 100 }, { path: 'public_html/review', kb: 4 }, { path: 'public_html/assets', kb: 60 }, { path: 'mail', kb: 20 }, { path: 'mail/new', kb: 20 }], '', 200);
+    expect(two.map((r) => r.name)).toEqual(['public_html', 'public_html/assets', 'public_html/review', 'mail', 'mail/new', 'logs']);
+    expect(two.map((r) => r.depth)).toEqual([1, 2, 2, 1, 2, 1]);
+    const orphan = shapeRows([{ path: 'x/y', kb: 3 }, { path: 'w', kb: 1 }], '', 4);
+    expect(orphan.map((r) => r.name)).toEqual(['w', 'x/y']);
   });
 });

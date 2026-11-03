@@ -10,13 +10,27 @@ import { RequestError, PathBar } from './parts/common.jsx';
 import { normalizeRel, duPath, managerHref, diskUsageHref, isCapabilityError, isFeatureDisabled, baseName } from './parts/paths.js';
 
 // du reports every entry relative to the home; the table shows them relative to
-// the folder being looked at, largest first, with its share of the folder.
+// the folder being looked at, largest first, with its share of the folder. At
+// depth 2 each parent's children follow it directly, largest first, so the
+// indentation always sits under the folder the row belongs to.
 export function shapeRows(entries, dir, totalKb) {
   const prefix = dir ? `${dir}/` : '';
-  return (entries || [])
+  const rows = (entries || [])
     .filter((e) => e.path && e.path !== '.' && (!prefix || e.path.startsWith(prefix)))
     .map((e) => ({ path: e.path, name: prefix ? e.path.slice(prefix.length) : e.path, kb: e.kb || 0, percent: totalKb > 0 ? Math.min(100, Math.round(((e.kb || 0) / totalKb) * 1000) / 10) : null, depth: e.path.split('/').length - (dir ? dir.split('/').length : 0) }))
     .sort((a, b) => b.kb - a.kb);
+  const children = new Map();
+  for (const r of rows.filter((r) => r.depth > 1)) {
+    const parent = r.path.slice(0, r.path.lastIndexOf('/'));
+    if (!children.has(parent)) children.set(parent, []);
+    children.get(parent).push(r);
+  }
+  const placed = new Set();
+  const out = [];
+  const place = (r) => { if (placed.has(r.path)) return; placed.add(r.path); out.push(r); for (const c of children.get(r.path) || []) place(c); };
+  for (const r of rows.filter((r) => r.depth <= 1)) place(r);
+  for (const r of rows) place(r);
+  return out;
 }
 
 export default function DiskUsage({ fn }) {
@@ -52,9 +66,9 @@ export default function DiskUsage({ fn }) {
           <div className="muted small" style={{ marginTop: 6 }}>{usage.diskQuotaMb ? `of ${formatMb(usage.diskQuotaMb)} · includes mail and databases` : 'Unlimited · includes mail and databases'}</div>
         </div>
         <div className="stat" data-stat="measured">
-          <div className="label">Measured</div>
-          <div className="value" style={{ fontSize: 17 }}>{data?.measuredAt ? formatDate(data.measuredAt) : '—'}</div>
-          <div className="muted small" style={{ marginTop: 6 }}>{data?.cached ? 'The server keeps these figures for five minutes before measuring again.' : data ? 'Fresh figures from the server.' : 'Measuring…'}</div>
+          <div className="label">Sub-folders</div>
+          <div className="value">{data ? rows.filter((r) => r.depth <= 1).length : '—'}</div>
+          <div className="muted small" style={{ marginTop: 6 }}>{data?.measuredAt ? <>Measured <time dateTime={data.measuredAt}>{formatDate(data.measuredAt)}</time>{data.cached ? '; the figures are kept for five minutes' : ''}</> : data ? 'Fresh figures from the server' : 'Measuring…'}</div>
         </div>
       </div>
 

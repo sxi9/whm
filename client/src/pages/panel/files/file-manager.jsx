@@ -173,8 +173,8 @@ export default function FileManager({ fn }) {
           <Button size="sm" icon={ArrowUp} onClick={() => navigate(parentOf(dir))} disabled={!dir} aria-label="Up one level" title="Up one level" />
           <PathBar path={dir} onNavigate={navigate} homeDir={me?.account?.homeDir} />
           <form style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center' }} onSubmit={(e) => { e.preventDefault(); navigate(goTo); }}>
-            <div className="input-group" style={{ width: 300 }}>
-              <input className="input" value="~/" readOnly tabIndex={-1} aria-label="Home directory" style={{ flex: '0 0 auto', width: 'calc(2ch + 32px)' }} />
+            <div className="input-group" style={{ width: 300, alignItems: 'center' }}>
+              <span className="muted" aria-hidden="true"><code>~/</code></span>
               <TextInput value={goTo} onChange={setGoTo} placeholder="Go to a folder" aria-label="Go to folder" spellCheck={false} />
             </div>
             <Button size="sm" type="submit">Go</Button>
@@ -224,8 +224,8 @@ export default function FileManager({ fn }) {
         <PanelCapabilityState error={modalError} />
         <RequestError error={modalError} />
         <Field label="Copy to" required help="The full destination path relative to your home directory, including the new name" error={modalError?.fields?.to} htmlFor="copy-to">
-          <div className="input-group">
-            <input className="input" value="~/" readOnly tabIndex={-1} aria-label="Home directory" style={{ flex: '0 0 auto', width: 'calc(2ch + 32px)' }} />
+          <div className="input-group" style={{ alignItems: 'center' }}>
+            <span className="muted" aria-hidden="true"><code>~/</code></span>
             <TextInput id="copy-to" value={copyTo} onChange={(v) => setModal((m) => ({ ...m, copyTo: v }))} spellCheck={false} autoFocus />
           </div>
         </Field>

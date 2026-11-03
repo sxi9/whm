@@ -16,7 +16,7 @@ const { ShellContext, PANEL_SHELL } = await import('../src/panel/ShellContext.js
 const { ToastProvider } = await import('../src/components/Toast.jsx');
 const { ConfirmProvider } = await import('../src/components/Modal.jsx');
 const { PANEL_FUNCTION_BY_KEY } = await import('../src/panel/nav.js');
-const { default: CronJobs, describeSchedule, presetFor, mailtoOf, withMailto, splitSchedule, PRESETS } = await import('../src/pages/panel/cron/cron-jobs.jsx');
+const { default: CronJobs, JobForm, chooseSchedule, isCustomSchedule, describeSchedule, presetFor, mailtoOf, withMailto, splitSchedule, PRESETS } = await import('../src/pages/panel/cron/cron-jobs.jsx');
 
 React.useLayoutEffect = React.useEffect;
 
@@ -78,6 +78,27 @@ describe('Cron jobs page', () => {
     expect(html).toContain('Leave empty to use the mailbox of demo');
     expect(html).not.toContain('Remove crontab');
     expect(html).not.toContain('id="cron-new-minute"');
+  });
+
+  it('shows the five raw fields once "Custom…" is chosen, even from a schedule that is also a preset', () => {
+    const start = { schedule: '0 0 * * *', command: '', custom: false };
+    expect(isCustomSchedule(start)).toBe(false);
+    const custom = chooseSchedule(start, 'custom');
+    expect(custom).toEqual({ schedule: '0 0 * * *', command: '', custom: true });
+    expect(isCustomSchedule(custom)).toBe(true);
+    const html = renderToStaticMarkup(h(JobForm, { value: custom, onChange: () => {}, idPrefix: 'cron-new' }));
+    for (const f of ['minute', 'hour', 'day', 'month', 'weekday']) expect(html).toContain(`id="cron-new-${f}"`);
+    expect(html).toContain('<option value="custom" selected="">Custom…</option>');
+    expect(html).toContain('Minute 0–59');
+    const before = renderToStaticMarkup(h(JobForm, { value: start, onChange: () => {}, idPrefix: 'cron-new' }));
+    expect(before).not.toContain('id="cron-new-minute"');
+    expect(before).toContain('<option value="0 0 * * *" selected="">Once a day (00:00)</option>');
+    expect(chooseSchedule(custom, '*/5 * * * *')).toEqual({ schedule: '*/5 * * * *', command: '', custom: false });
+    expect(chooseSchedule({ schedule: '@reboot', command: 'x' }, 'custom').schedule).toBe('0 0 * * *');
+    expect(isCustomSchedule({ schedule: '7 7 * * *' })).toBe(true);
+    const edited = renderToStaticMarkup(h(JobForm, { value: { schedule: '7 7 * * *', command: 'x' }, onChange: () => {}, idPrefix: 'cron-edit' }));
+    expect(edited).toContain('id="cron-edit-hour"');
+    expect(edited).toContain('value="7"');
   });
 
   it('renders the capability state on 501 with the forms still present', () => {

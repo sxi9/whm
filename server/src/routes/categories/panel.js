@@ -26,6 +26,7 @@ const settingsBody = z.object({
 }).strict().refine((b) => Object.keys(b).length > 0, 'Nothing to update');
 const adminUserBody = z.object({ password: fields.password.optional() }).strict();
 const adminPasswordBody = z.object({ password: fields.password }).strict();
+const domainParam = z.object({ domain: fields.domain });
 
 // Runs scope() once per request and applies the §2.3–§2.5 gates. Only the
 // paths listed stay reachable while a gate is closed.
@@ -97,6 +98,7 @@ export async function register(ctx) {
   admin.get('/accounts/:username/user', validate({ params: nameParam }), wrap((req) => s.userStatus(req.params.username, req.user)));
   admin.post('/accounts/:username/user', validate({ params: nameParam, body: adminUserBody }), created((req) => s.adminEnsureUser(req.params.username, req.body, req.user, req)));
   admin.post('/accounts/:username/password', validate({ params: nameParam, body: adminPasswordBody }), wrap((req) => s.adminSetPassword(req.params.username, req.body.password, req.user, req)));
+  admin.post('/domains/:domain/release-mail', requireRoot, validate({ params: domainParam }), wrap((req) => s.releaseMailDomain(req.params.domain, req)));
   r.use('/admin', admin);
 
   // --- Scoped (one account per session) ---------------------------------------------------

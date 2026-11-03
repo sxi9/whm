@@ -43,6 +43,9 @@ export async function bootstrap(overrides = {}) {
   const settings = createSettingsService({ db });
 
   const ctx = { config, logger, db, crypto, agent, capabilities, jobs, scheduler, settings, version, events: new PanelEvents(logger) };
+  // Token confinement registry (middleware/auth.js); `prefixes` tells a
+  // category that `{ path, prefix: true }` entries are honoured.
+  ctx.confinedScopes = Object.assign(new Map(), { prefixes: true });
   ctx.sessionStore = new SqliteSessionStore(db, { ttlMs: config.sessionTtlMs });
   ctx.auth = createAuthService(ctx);
   ctx.packages = createPackagesService(ctx);

@@ -75,7 +75,11 @@ export function authRoutes(ctx) {
 
   r.post('/password', requireAuth, validate({ body: z.object({ currentPassword: z.string().max(256).optional(), newPassword: fields.password }).strict() }), async (req, res, next) => {
     try {
-      await auth.changePassword(req.user.id, { ...req.body, force: Boolean(req.user.must_change_password) });
+      // A login linked to a hosting account changes both stores (host first)
+      // through the panel; the panel answers null for every other login.
+      const input = { ...req.body, force: Boolean(req.user.must_change_password) };
+      const r = await ctx.panel?.changePasswordForUser?.(req.user.id, input, req);
+      if (!r) await auth.changePassword(req.user.id, input);
       req.audit({ action: 'auth.password.change', target: req.user.username });
       // Sessions were invalidated; re-establish this one.
       res.json({ data: await establish(req, { user: auth.publicUser({ ...req.user, must_change_password: 0 }), mustEnroll2fa: req.session.mustEnroll2fa }) });

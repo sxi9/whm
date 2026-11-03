@@ -8,13 +8,11 @@ import { HttpError } from '../../lib/errors.js';
 // routes/categories/panel.js behind the panelScope middleware, so every handler
 // finds the pinned account in req.panel.
 
-export const PANEL_SCOPES = ['panel:read', 'panel:files', 'panel:email', 'panel:dns', 'panel:databases', 'panel:backups', 'panel:cron'];
+export const PANEL_SCOPES = ['panel:read', 'panel:files', 'panel:email', 'panel:dns', 'panel:databases', 'panel:backups', 'panel:cron', 'panel:domains', 'panel:ssl', 'panel:php', 'panel:logs'];
 
 // §3.4: a token whose scopes are all panel:* may call nothing but the panel and
-// GET /api/auth/me. middleware/auth.js matches confinement entries by exact
-// mounted path today; the prefix form below is honoured once core's requireAuth
-// accepts it and marks the registry with `prefixes = true`, which is when
-// routes/categories/panel.js registers these.
+// GET /api/auth/me (middleware/auth.js honours the prefix entry when the
+// registry is marked `prefixes = true`, which core does at bootstrap).
 export const PANEL_TOKEN_ROUTES = Object.freeze([{ path: '/api/panel', prefix: true }, { method: 'GET', path: '/api/auth/me' }]);
 export function confinePanelTokens(ctx) {
   ctx.confinedScopes ??= new Map();

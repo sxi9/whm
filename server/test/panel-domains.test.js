@@ -160,14 +160,40 @@ describe('Customer panel: domains', () => {
     });
 
     it('deletes the row, the zone and (on request) the docroot as the account', async () => {
+      db().prepare("INSERT INTO mail_forwarders (account_id, domain, local_part, destination) VALUES ((SELECT id FROM accounts WHERE username = 'alice'), 'shop.example', 'sales', 'me@example.org')").run();
       const res = await alice.del('/domains/addon/shop.example?removeDocroot=true&removeZone=true');
       expect(res.status, JSON.stringify(res.body)).toBe(200);
-      expect(res.body.data).toMatchObject({ domain: 'shop.example', removed: true, zone: { removed: true }, docroot: { removed: true } });
+      expect(res.body.data).toMatchObject({ domain: 'shop.example', removed: true, zone: { removed: true }, docroot: { removed: true }, mail: { released: true, errors: [] } });
+      expect(res.body.meta.warnings).toEqual([]);
+      // Mail leaves with the hostname: host files first, then the rows.
+      expect(app.agent.callsTo('vmail.passwd.purge').map((c) => c.args)).toEqual([{ domain: 'shop.example' }]);
+      expect(names().indexOf('vmail.passwd.purge')).toBeLessThan(names().indexOf('files.remove'));
+      expect(row('SELECT 1 AS x FROM mail_forwarders WHERE domain = ?', 'shop.example')).toBeUndefined();
+      expect(row('SELECT 1 AS x FROM mail_domains WHERE domain = ?', 'shop.example')).toBeUndefined();
+      expect(rows("SELECT * FROM audit_log WHERE action = 'panel.email.domain.release' AND target = 'alice' AND args_redacted LIKE '%shop.example%'")).toHaveLength(1);
       expect(row('SELECT 1 AS x FROM account_domains WHERE domain = ?', 'shop.example')).toBeUndefined();
       expect(row('SELECT 1 AS x FROM dns_zones WHERE domain = ?', 'shop.example')).toBeUndefined();
       expect(app.agent.callsTo('files.remove')[0].args).toEqual({ username: 'alice', paths: ['/home/alice/public_html/shop.example'] });
       expect(names()).not.toContain('fs.remove');
       expect(rows("SELECT * FROM audit_log WHERE action = 'panel.domains.addon.remove' AND target = 'alice' AND args_redacted LIKE '%shop.example%'")).toHaveLength(1);
+    });
+
+    it('a mail release that fails on the host is a warning, and the rows stay for root to release', async () => {
+      await alice.post('/domains/addon', { domain: 'mailfail.example' }).expect(201);
+      db().prepare("INSERT INTO mail_forwarders (account_id, domain, local_part, destination) VALUES ((SELECT id FROM accounts WHERE username = 'alice'), 'mailfail.example', 'x', 'me@example.org')").run();
+      app.agent.fail('vmail.passwd.purge', 'command_failed', 'disk full');
+      try {
+        const res = await alice.del('/domains/addon/mailfail.example').expect(200);
+        expect(res.body.data).toMatchObject({ domain: 'mailfail.example', removed: true, mail: { released: false } });
+        expect(res.body.data.mail.errors).toEqual([{ op: 'vmail.passwd.purge', code: 'command_failed', message: 'disk full' }]);
+        expect(res.body.meta.warnings).toEqual([expect.stringMatching(/^Mail: .*mailfail\.example.*vmail\.passwd\.purge.*release the domain$/)]);
+        expect(row('SELECT 1 AS x FROM account_domains WHERE domain = ?', 'mailfail.example')).toBeUndefined();
+        expect(row('SELECT account_id FROM mail_forwarders WHERE domain = ?', 'mailfail.example')).toBeTruthy();
+        expect(JSON.parse(rows("SELECT args_redacted FROM audit_log WHERE action = 'panel.domains.addon.remove' AND args_redacted LIKE '%mailfail.example%'")[0].args_redacted)).toMatchObject({ mailReleased: false });
+      } finally {
+        app.agent.reset('vmail.passwd.purge');
+        db().prepare('DELETE FROM mail_forwarders WHERE domain = ?').run('mailfail.example');
+      }
     });
   });
 
@@ -199,8 +225,12 @@ describe('Customer panel: domains', () => {
 
     it('removes the record and the row; a foreign subdomain is not found', async () => {
       expect((await bob.del('/domains/sub/blog.alice.com')).status).toBe(404);
+      db().prepare("INSERT INTO mail_autoresponders (account_id, domain, local_part, subject, body) VALUES ((SELECT id FROM accounts WHERE username = 'alice'), 'blog.alice.com', 'hello', 'Away', 'Back soon')").run();
       const res = await alice.del('/domains/sub/blog.alice.com?removeDocroot=true').expect(200);
-      expect(res.body.data).toMatchObject({ domain: 'blog.alice.com', removed: true, docroot: { removed: true } });
+      expect(res.body.data).toMatchObject({ domain: 'blog.alice.com', removed: true, docroot: { removed: true }, mail: { released: true } });
+      expect(app.agent.callsTo('vmail.autoresponder.remove').map((c) => c.args)).toEqual([{ domain: 'blog.alice.com', localPart: 'hello' }]);
+      expect(app.agent.callsTo('vmail.passwd.purge').map((c) => c.args)).toEqual([{ domain: 'blog.alice.com' }]);
+      expect(row('SELECT 1 AS x FROM mail_autoresponders WHERE domain = ?', 'blog.alice.com')).toBeUndefined();
       expect(row('SELECT 1 AS x FROM account_domains WHERE domain = ?', 'blog.alice.com')).toBeUndefined();
       expect(row('SELECT 1 AS x FROM dns_records WHERE zone_id = (SELECT id FROM dns_zones WHERE domain = ?) AND name = ?', 'alice.com', 'blog')).toBeUndefined();
     });
@@ -227,8 +257,12 @@ describe('Customer panel: domains', () => {
       expect(row('SELECT account_id FROM dns_zones WHERE domain = ?', 'park.example').account_id).toBe(row('SELECT id FROM accounts WHERE username = ?', 'alice').id);
       expect((await alice.post('/domains/parked', { domain: 'bob.com' })).body.error.code).toBe('exists');
       expect((await bob.del('/domains/parked/park.example')).status).toBe(404);
+      db().prepare("INSERT INTO mail_domain_forwarders (account_id, domain, target_domain) VALUES ((SELECT id FROM accounts WHERE username = 'alice'), 'park.example', 'alice.com')").run();
       const gone = await alice.del('/domains/parked/park.example?removeZone=true').expect(200);
-      expect(gone.body.data).toMatchObject({ removed: true, zoneRemoved: true });
+      expect(gone.body.data).toMatchObject({ removed: true, zoneRemoved: true, mail: { released: true } });
+      expect(gone.body.meta.warnings).toEqual([]);
+      expect(app.agent.callsTo('vmail.passwd.purge').map((c) => c.args)).toEqual([{ domain: 'park.example' }]);
+      expect(row('SELECT 1 AS x FROM mail_domain_forwarders WHERE domain = ?', 'park.example')).toBeUndefined();
       expect(row('SELECT 1 AS x FROM account_domains WHERE domain = ?', 'park.example')).toBeUndefined();
     });
   });

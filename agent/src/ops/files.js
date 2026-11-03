@@ -13,7 +13,9 @@ import { accountPath, asUser, failureOf, lstatOrNull } from './as-user.js';
 // between root and the account.
 
 const MiB = 1024 * 1024;
-const FIND_FORMAT = '%y\t%s\t%T@\t%m\t%u\t%f\0';
+// find expands the two characters "\0" to NUL itself: exec() refuses an argv
+// element that carries a real NUL, and a name may contain anything but NUL.
+export const FIND_FORMAT = '%y\t%s\t%T@\t%m\t%u\t%f\\0';
 const TYPES = { d: 'dir', f: 'file', l: 'symlink', b: 'other', c: 'other', p: 'other', s: 'other' };
 const STAT_TYPES = { 'regular file': 'file', 'regular empty file': 'file', directory: 'dir', 'symbolic link': 'symlink' };
 const ARCHIVE_FORMATS = { zip: { ext: /\.zip$/i, bins: ['zip'] }, 'tar.gz': { ext: /\.(tar\.gz|tgz)$/i, bins: ['tar', 'gzip'] } };
@@ -36,7 +38,7 @@ function isUtf8(buf) {
   try { new TextDecoder('utf-8', { fatal: true }).decode(buf); return true; } catch { return false; }
 }
 
-function parseFind(stdout) {
+export function parseFind(stdout) {
   const entries = [];
   for (const record of stdout.split('\0')) {
     if (!record) continue;

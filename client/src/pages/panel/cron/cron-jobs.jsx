@@ -87,17 +87,30 @@ export function withMailto(env, value) {
   return value == null ? rest : [{ key: 'MAILTO', value }, ...rest];
 }
 
-function JobForm({ value, onChange, errors, idPrefix }) {
+// `custom` is kept in the form state because a schedule such as the default
+// '0 0 * * *' is also a preset: without the flag, choosing "Custom…" would
+// map straight back to the preset and the five fields would never appear.
+export function isCustomSchedule(value) {
+  return Boolean(value?.custom) || presetFor(value?.schedule) === 'custom';
+}
+
+export function chooseSchedule(value, preset) {
+  if (preset === 'custom') return { ...value, custom: true, schedule: splitSchedule(value.schedule) ? value.schedule : '0 0 * * *' };
+  return { ...value, custom: false, schedule: preset };
+}
+
+export function JobForm({ value, onChange, errors, idPrefix }) {
   const fields = splitSchedule(value.schedule) || ['*', '*', '*', '*', '*'];
-  const preset = presetFor(value.schedule);
-  const setField = (i, v) => { const f = [...fields]; f[i] = v.replace(/\s+/g, ''); onChange({ ...value, schedule: f.join(' ') }); };
-  const choose = (p) => onChange({ ...value, schedule: p === 'custom' ? (splitSchedule(value.schedule) ? value.schedule : '0 0 * * *') : p });
+  const custom = isCustomSchedule(value);
+  const preset = custom ? 'custom' : presetFor(value.schedule);
+  const setField = (i, v) => { const f = [...fields]; f[i] = v.replace(/\s+/g, ''); onChange({ ...value, custom: true, schedule: f.join(' ') }); };
+  const choose = (p) => onChange(chooseSchedule(value, p));
   return (
     <>
       <Field label="Schedule" required htmlFor={`${idPrefix}-preset`} help={<>{describeSchedule(value.schedule)} · <code>{value.schedule || '—'}</code></>} error={errors?.schedule}>
         <Select id={`${idPrefix}-preset`} value={preset} onChange={choose} options={PRESETS} />
       </Field>
-      {preset === 'custom' && (
+      {custom && (
         <div className="form-grid" style={{ gridTemplateColumns: 'repeat(5, 1fr)', gap: '0 10px' }}>
           {FIELD_NAMES.map((name, i) => (
             <Field key={name} label={name[0].toUpperCase() + name.slice(1)} htmlFor={`${idPrefix}-${name}`}>
@@ -120,7 +133,7 @@ function RequestError({ error, onRetry }) {
   return <ErrorBanner error={error} onRetry={onRetry} />;
 }
 
-const EMPTY_JOB = { schedule: '0 0 * * *', command: '' };
+const EMPTY_JOB = { schedule: '0 0 * * *', command: '', custom: false };
 
 export default function CronJobs({ fn }) {
   const toast = useToast();
