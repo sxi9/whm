@@ -37,6 +37,7 @@ verified developers, and bundled plugins are part of the product (deferred to Ph
 | 2026-10-27 | **Panel identity:** `ctx.license` owns the hub URL (token `iss`, bootstrap `WHM_LICENSE_HUB_URL`) and the license key (License tab only); the Market Provider `whm-hub` row is just an enable switch (`hub_mismatch` if its origin differs). Enforcement gates (degraded 423, feature gates, capacity) run only when `config.licenseEnforce` is true (default true under `NODE_ENV=production`, false in dev/tests). |
 | 2026-10-27 | **Plugins distribution:** the three monitoring/security/WordPress plugins **and the automated-backup plugin** are bundled (`plugins/bundled/*`, installed at boot, exempt from `plugins.require_signature`); the sample plugin `net.whm.sample-notes` is marketplace-distributed under the vendor developer `net.whm`. Marketplace installs go through the host's additive `install(input, { policy: { requireSigned, signers, activate: false, expectedId } })`; consent is compared against the installed, signature-verified manifest. |
 | 2026-11-03 | **Identity + UI:** the product is **Keel**; `docs/design/ui-design-system.md` is the UI contract; a renamed function keeps its key/route via the `{ slug }` override in `nav.js`; the account holder's interface is "the account panel" (`/panel`), cPanel/WHM wording only for the external product. |
+| 2026-11-03 | **Account panel conventions:** one account per session via `ctx.panel.scope(req)`; services take the pinned scope and delegate to existing services with `scope.ownerPrincipal` (never `SYSTEM_ROOT` on a mutating path); account-tree work runs as the account uid through `agent/src/ops/as-user.js`; plan limits: `null` = unlimited, `0` = none; panel pages use only the shared kit (`client/src/panel/README.md`). |
 | 2026-11-03 | **zod 4:** two-argument `z.record`, `.prefault({})` for nested defaults, `patchOf()` for PATCH bodies, `fields.ipv4/ipv6/ip` keep zod-3 IPv6 parity. |
 | 2026-10-27 | `hub/ui` **copies** the panel's component kit (`hub/ui/src/components/SYNC.md` records the source commit) instead of importing across packages. Hub tests are `node --test`; hub/ui and the panel use vitest. |
 
@@ -185,6 +186,15 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Current state (update every push)
 
+- **2026-11-04 00:15: Phase 7 milestone 2 — the account panel is live.** `/panel` is our own customer-facing panel
+  (the cPanel replacement): design `docs/design/customer-panel.md`, seams in `docs/design/integration-contracts.md`
+  §33–40, manual `docs/MANUAL-partC.md`. Server: `services/panel.js` (`ctx.panel`: account users linked by
+  `account_users`, `scope(req)`, time-boxed audited "Log in as", password sync, panel API tokens confined by prefix in
+  `middleware/auth.js`), `routes/categories/panel.js` + `routes/panel/*.js`, `services/panel-*.js`, migrations 033/033b/033c.
+  Agent: `as-user.js` (setpriv/runuser), `files`, `cron`, `vmail`, `webmail`, `ftp`, `backup-read`. Client: `client/src/panel/`
+  shell (own nav/registry/routes), `pages/panel/<group>/`, `auth/home.js` landing, shell-aware `PageHeader`. Admin side:
+  "Log in as" row action, Panel › Customization › Account panel. Built as 6 units + 6 page groups by parallel workflows,
+  two adversarial lenses on root-level code, integration critics, real as-root tests for extraction and dump hand-over.
 - **2026-11-03 20:25: Phase 7 milestone 1** (user ask: "all new modern UI like iOS, not AI-looking; our own panel
   instead of cPanel"). Product identity is **Keel** (default branding via migration `028c`; operators rename it under
   Panel › Customization). **Design system** `docs/design/ui-design-system.md` (tokens.css/base.css rewritten; sidebar-first
@@ -315,7 +325,7 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Resume notes
 
-- Working branch: `claude/kind-meitner-dlnbas` (push with `git push -u origin <branch>`).
+- Working branch: `claude/kind-meitner-dlnbas` (push with `git push -u origin <branch>`). Phase 7 complete; next is provisioned-host verification (`HANDOFF.md` §4).
 - A multi-agent design run for the deferred Phase 5 items was paused:
   run id `wf_7104d0c5-441`, script
   `/root/.claude/projects/-home-user-whm/0c92c5a2-840d-518f-8036-382a362911d8/workflows/scripts/whm-license-marketplace-plugins-wf_7104d0c5-441.js`

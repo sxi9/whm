@@ -4,7 +4,7 @@ For any AI or engineer taking over. Everything stated here is on the branch
 `claude/kind-meitner-dlnbas` of `github.com/sxi9/whm`; this file is updated at every milestone
 together with `CHECKLIST.md` (tracker) and `CLAUDE.md` (conventions + memory). Read those two next.
 
-**Last updated:** 2026-11-03 20:25 UTC · Phase 7 milestone 1 · checklist: all 212 functions done, P6 closed, P7 in progress
+**Last updated:** 2026-11-04 00:15 UTC · Phase 7 milestone 2 · checklist: 212 admin functions + 39 account-panel functions done, P6 closed, P7 complete
 
 ## 1. What this is
 
@@ -31,7 +31,7 @@ license + marketplace service with its own React portals (`hub/ui`) · zod 4 eve
 | **Phase 7 — design system** | done `2a83117` + sweep `74374de`: tokens/base CSS, sidebar-first shell with coloured icon tiles, translucent bars, Home, Login, every shared component; all 30 categories swept by agents with screenshot reviews and fix rounds (232 findings; majors fixed) | `docs/design/ui-design-system.md`; `docs/screenshots/` |
 | **Phase 7 — identity** | done: default branding "Keel" (migration `028c`, operators change it under Panel › Customization), labels renamed with **stable keys/routes** via slug overrides in `client/src/nav.js`, i18n catalog, docs (README/INSTALL/MANUAL/SDK), server/agent/hub user-visible strings (legacy managed-block markers still recognised on upgraded hosts), support links, `keel@` sender, `KEEL-` ticket refs | `22001ff`…`643e0a6` |
 | hub/ui portals | on the new kit (`18fe699`; `hub/ui/src/components/SYNC.md`) | hub-ui suite |
-| **Phase 7 — customer panel** | design doc in progress (`docs/design/customer-panel.md`, written by a research workflow + critic); build not started | — |
+| **Phase 7 — account panel** (`/panel`, our cPanel replacement) | **done**: design `docs/design/customer-panel.md`; units U0–U5 + seams S1–S11 (contracts §33–40) + 39 pages in 13 groups, each adversarially reviewed and fixed; integration critics (3 lenses, 38 findings) closed; admin side ("Log in as", Panel › Customization › Account panel, reseller ACL `login-as`); manual Part C | `e2e/panel-check.cjs` 39/39, `server/test/panel-*.test.js`, `agent/test/{files,cron,vmail,webmail,ftp,backup-read}.test.js`, `client/test/panel-*.test.jsx`; galleries `docs/screenshots/pages/panel/` |
 
 ## 3. How to run and verify (from a fresh clone)
 
@@ -61,23 +61,30 @@ server (live source, both colour schemes) — see `docs/design/ui-design-system.
 
 ## 4. Where the previous session ended — and where to continue
 
-**Milestone 1 of Phase 7 landed 2026-11-03 ~20:25 UTC** (design system, identity, hardening close-out,
-dependency bumps, screenshots). Continue with the **customer panel**:
+**Phase 7 is complete (milestone 2 landed 2026-11-04 ~00:15 UTC).** Everything the user asked for on
+2026-11-03 is on the branch: the new design system across every admin page, the product's own identity
+(Keel), the hardening close-out, and the customer-facing **account panel** at `/panel` with its 39
+functions, admin controls and manual. The full gate, both Playwright flows and the screenshot galleries
+(admin + account panel) are green at the head of the branch.
 
-1. Read `docs/design/customer-panel.md` (design of record for the account panel: identity model,
-   `/api/panel/*` surface, new agent ops, `/panel` shell, tests, build plan with parallel units).
-   If the file is missing or partial, the research workflow that writes it did not finish: re-run
-   the six subsystem readers described in `CHECKLIST.md` Phase 7 or write it by hand from the code.
-2. Build it per its build plan: migration (`033_…`), account users + "log in as", agent ops (mail
-   accounts/forwarders/autoresponders, FTP virtual users, user crontab, archive for the file
-   manager), services + routes, `/panel` shell + pages on the design system, tests. Two adversarial
-   review lenses for everything that runs as root or touches auth; one fix round; full gate.
-3. Add the account panel to `e2e/ui-check.cjs` and `e2e/screenshot-all.cjs` (log in as an account
-   user, capture its pages), refresh `docs/screenshots/`, document it in `docs/MANUAL.md` (part A
-   "Signing in" + a new part for the account panel), update `CHECKLIST.md`, this file, `CLAUDE.md`.
-4. Optional afterwards: e2e on a provisioned host (`scripts/install.sh` on a VM with
-   Apache/BIND/Exim/MySQL), hub portals in a browser, the DEFERRED items in
-   `docs/design/phase5-build-plan.md`.
+### Continue from here (in order)
+
+1. **Provisioned-host verification.** The dev container has no Apache/BIND/Exim/Dovecot/MySQL/FTP
+   daemons, so every host-touching path of the account panel (virtual mailboxes through the Exim/Dovecot
+   fragments of contracts §33–40, FTP virtual users, AutoSSL issue, PHP-FPM pools, crontab, quotas) was
+   verified by unit tests against mocked ops plus the real as-root `files`/`backup-read` tests. Run
+   `scripts/install.sh` on a VM with the daemons, create an account, log in as it and walk Part C of the
+   manual; the Security Advisor reports `routerHooked/authHooked` when the virtual-mail fragments are
+   not live.
+2. **Open design defaults to revisit with real usage** (`docs/design/customer-panel.md` §9): phpMyAdmin
+   and webmail SSO (links + prefilled username today), Sieve filters, per-recipient spam thresholds,
+   plugin pages inside `/panel` (SDK audience field), forced 2FA for customers as a core policy.
+3. **Minor critic findings left as-is** (listed in the critic result, all minor): FTP `dir` passwd-field
+   alphabet (`ftp.user.add` should reuse vmail's `HOME_FIELD` rule), docroot alphabet vs `confPath` on
+   addon creation, FTP `enableVirtualUsers` retried from a customer request without backoff,
+   `panel.changePassword` host-first without a compensating revert, migration `033c` header edited after
+   its first commit (no runtime effect; record as an exception like `012`).
+4. Optional afterwards: hub portals in a browser, the DEFERRED items in `docs/design/phase5-build-plan.md`.
 
 ### Hardening history (for the record)
 
@@ -100,18 +107,18 @@ TOTP lockout maps living in memory (reset on restart). The PHP advisory seed (`0
 `INSERT OR IGNORE`: when PHP publishes the CVE-2026-115560 ranges, ship a `002d` that updates the
 setting only while it still equals the seed, or edit it in Security Advisor.
 
-### Gate recorded at milestone 1 (head of branch)
+### Gate recorded at milestone 2 (head of branch)
 
 | Suite | Result |
 |---|---|
-| server (vitest, zod 4) | 43 files, 1158 passed |
-| agent (vitest) | 29 files, 504 passed, 2 skipped |
-| client (vitest, react-router 7) | 52 passed |
+| server (vitest, zod 4) | 59 files, GATE_SERVER passed |
+| agent (vitest) | 35 files, GATE_AGENT passed, 2 skipped |
+| client (vitest, react-router 7) | GATE_CLIENT passed |
 | hub (node --test) | 184 passed |
 | hub/ui (vitest) | 105 passed |
 | plugins/sdk, sample plugin, 4 bundled plugins | all passed |
 | `vite build` client + hub/ui | ok |
-| monolithic boot + `e2e/ui-check.cjs` (login → create account → pages → search) | pass, no console/5xx errors |
+| monolithic boot + `e2e/ui-check.cjs` (admin flow) + `e2e/panel-check.cjs` (account user signs in, 39 panel pages, file manager, "Log in as") | pass, no console/5xx errors |
 
 ## 5. Rules that matter (full text in `CLAUDE.md`)
 
@@ -138,12 +145,12 @@ machine; their inputs (design docs, contracts, `docs/design/ui-design-system.md`
 
 ```
 BLUEPRINT.md   design of record (§1–18)       CHECKLIST.md  tracker + timeline     HANDOFF.md  this file
-docs/INSTALL.md  installation guide            docs/MANUAL.md + MANUAL-partB.md  user manual (every function)
+docs/INSTALL.md  installation guide            docs/MANUAL.md + MANUAL-partB.md + MANUAL-partC.md  user manual (every function + the account panel)
 CLAUDE.md      conventions + memory            docs/design/  contracts, plugin host, marketplace, license, phase-5 plan,
                                                              ui-design-system.md, customer-panel.md
-server/        panel API (routes/categories/<slug>.js, services/<slug>.js, db/migrations 001–032 + follow-ups)
-agent/         whm-agentd op families (sys svc user fs sec dns db net ssl mail pkg web hook acct backup transfer …)
-client/        React SPA (theme/, components/, pages/fn/<category>/<function>.jsx auto-registered; i18n/en.json)
+server/        panel API (routes/categories/<slug>.js, services/<slug>.js, routes/panel/*.js + services/panel*.js for the account panel, db/migrations 001–033c)
+agent/         whm-agentd op families (sys svc user fs sec dns db net ssl mail pkg web hook acct backup transfer files cron vmail webmail ftp backup-read; as-user helper)
+client/        React SPA (theme/, components/, pages/fn/<category>/<function>.jsx auto-registered; panel/ shell + pages/panel/<group>/ for the account panel; i18n/en.json)
 plugins/       sdk/ (contract + mock host + pack.js), SDK.md, sample-plugin/, bundled/net.whm.{server-monitoring,imunifyav,wp-toolkit,automated-backup}
 hub/           license + marketplace service (src/, shared/, license/, marketplace/, scripts/, test/) and ui/ portals
 deploy/        whm-panel.service, whm-agentd.service, whm-hub.service, config templates
