@@ -4,8 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { assertUnderHome, asUserArgv, assertManaged, accountPath, SYSTEM_USERS } from '../src/ops/as-user.js';
-import { CHUNK_READ_MAX, FIND_FORMAT, parseFind, readRangeArgv, parseTarListing, parseZipListing, checkArchiveMembers, listArchiveArgv } from '../src/ops/files.js';
+import { assertUnderHome, resolveUnderHome, landsInSshDir, asUserArgv, assertManaged, accountPath, SYSTEM_USERS } from '../src/ops/as-user.js';
+import { CHUNK_READ_MAX, FIND_FORMAT, parseFind, readRangeArgv, parseTarListing, parseZipListing, checkArchiveMembers, listArchiveArgv, resolveMemberPath, diskLinkReader, sshFingerprint, sshChanges } from '../src/ops/files.js';
 
 // exec is spied with the real implementation behind it so every test proves an
 // op refused before any program ran. No files.* op is ever executed here: each
@@ -126,6 +126,9 @@ describe('files.* schemas reject injection, traversal and option smuggling befor
       ['files.chunk_read', { ...validArgs('files.chunk_read'), length: CHUNK_READ_MAX + 1 }],
       ['files.chunk_read', { ...validArgs('files.chunk_read'), length: 8 * MiB }],
       ['files.extract', { ...validArgs('files.extract'), allowSshDir: 'yes' }],
+      ['files.write', { ...validArgs('files.write'), protectSshDir: 'yes' }],
+      ['files.remove', { ...validArgs('files.remove'), protectSshDir: 1 }],
+      ['files.move', { ...validArgs('files.move'), protectSshDir: null }],
       ['files.chunk_read', { ...validArgs('files.chunk_read'), offset: -1 }],
       ['files.write', { ...validArgs('files.write'), mode: '0778' }],
       ['files.write', { ...validArgs('files.write'), mode: 'u+x' }],
@@ -192,7 +195,7 @@ describe('archive member inspection before extraction', () => {
       { type: 'dir', name: 'site/', target: null },
       { type: 'file', name: 'site/index.html', target: null },
       { type: 'symlink', name: 'site/current', target: './index.html' },
-      { type: 'file', name: 'site/copy.html link to site/index.html', target: null },
+      { type: 'hardlink', name: 'site/copy.html', target: 'site/index.html' },
       { type: 'file', name: 'with space.txt', target: null },
     ]);
     expect(parseZipListing(ZIP)).toEqual([
@@ -242,6 +245,82 @@ describe('archive member inspection before extraction', () => {
     expect(checkArchiveMembers([{ type: 'file', name: '.sshx/k', target: null }, { type: 'file', name: 'a/.ssh/k', target: null }], { home, dest: home })).toBe(2);
   });
 
+  it('follows link chains the way tar writes them: a later member through an earlier link, or through a link already on disk', () => {
+    // GNU tar creates `x -> .` and `y -> x/.ssh` as it reads them, then opens
+    // y/authorized_keys through them: that lands in <home>/.ssh.
+    const chain = parseTarListing([
+      'lrwxrwxrwx alice/alice 0 2026-11-01 10:00 x -> .',
+      'lrwxrwxrwx alice/alice 0 2026-11-01 10:00 y -> x/.ssh',
+      '-rw------- alice/alice 100 2026-11-01 10:00 y/authorized_keys',
+    ].join('\n'));
+    expect(() => checkArchiveMembers(chain, { home, dest: home })).toThrow(/\.ssh/);
+    expect(checkArchiveMembers(chain, { home, dest: home, allowSshDir: true })).toBe(3);
+    // A link to the destination itself (the home) is a link to .ssh's parent.
+    expect(() => checkArchiveMembers([{ type: 'symlink', name: 'x', target: '.' }], { home, dest: home })).toThrow(/parent directory/);
+    expect(checkArchiveMembers([{ type: 'symlink', name: 'x', target: '.' }], { home, dest: `${home}/public_html` })).toBe(1);
+    // ".." after a link is resolved against the link's target, not the name.
+    const upThrough = [{ type: 'symlink', name: 'x', target: '.' }, { type: 'symlink', name: 'y', target: 'x/..' }, { type: 'file', name: 'y/.ssh/authorized_keys', target: null }];
+    expect(() => checkArchiveMembers(upThrough, { home, dest: `${home}/sub` })).toThrow(/outside the destination/);
+    expect(resolveMemberPath('y/.ssh/k', { dest: `${home}/sub`, links: new Map([['x', '.'], ['y', 'x/..']]) })).toBe(`${home}/.ssh/k`);
+    expect(() => checkArchiveMembers([{ type: 'symlink', name: 'y', target: 'x/..' }, { type: 'file', name: 'y/.ssh/k', target: null }], { home, dest: `${home}/sub`, readLink: (abs) => (abs === `${home}/sub/x` ? '.' : null) })).toThrow(/outside the destination/);
+    // A hard link into .ssh, or out of the destination, is refused too.
+    expect(() => checkArchiveMembers(parseTarListing('hrw------- alice/alice 0 2026-11-01 10:00 k link to .ssh/authorized_keys'), { home, dest: home })).toThrow(/hard link into \.ssh/);
+    expect(() => checkArchiveMembers([{ type: 'hardlink', name: 'k', target: '../etc/passwd' }], { home, dest: `${home}/x` })).toThrow(/hard link pointing outside/);
+    expect(checkArchiveMembers([{ type: 'hardlink', name: 'k', target: 'site/index.html' }], { home, dest: home })).toBe(1);
+    // Links already on disk (readLink) are followed the same way.
+    const onDisk = (abs) => (abs === `${home}/lnk` ? '.' : abs === `${home}/out` ? '/etc' : null);
+    expect(() => checkArchiveMembers([{ type: 'file', name: 'lnk/.ssh/authorized_keys', target: null }], { home, dest: home, readLink: onDisk })).toThrow(/\.ssh through a symbolic link/);
+    expect(() => checkArchiveMembers([{ type: 'file', name: 'out/cron.d/x', target: null }], { home, dest: home, readLink: onDisk })).toThrow(/outside the home directory/);
+    expect(checkArchiveMembers([{ type: 'file', name: 'lnk/public_html/x', target: null }], { home, dest: home, readLink: onDisk })).toBe(1);
+    expect(checkArchiveMembers([{ type: 'file', name: 'lnk/.ssh/k', target: null }], { home, dest: home, readLink: onDisk, allowSshDir: true })).toBe(1);
+    // A link loop cannot spin the check.
+    expect(() => checkArchiveMembers([{ type: 'symlink', name: 'a', target: 'b' }, { type: 'symlink', name: 'b', target: 'a' }, { type: 'file', name: 'a/x', target: null }], { home, dest: home })).toThrow(/too many symbolic links/);
+    // The file member whose own name is a link is written at its name (tar unlinks first), not through the link.
+    expect(checkArchiveMembers([{ type: 'symlink', name: 'cur', target: './index.html' }, { type: 'file', name: 'cur', target: null }], { home, dest: home })).toBe(2);
+  });
+
+  it('reads on-disk links without following them and fingerprints .ssh so an extraction that reached it is detected', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-ssh-'));
+    try {
+      const home = path.join(root, 'home');
+      fs.mkdirSync(home);
+      fs.symlinkSync('.', path.join(home, 'lnk'));
+      fs.writeFileSync(path.join(home, 'file'), 'x');
+      const readLink = diskLinkReader();
+      expect(readLink(path.join(home, 'lnk'))).toBe('.');
+      expect(readLink(path.join(home, 'file'))).toBeNull();
+      expect(readLink(path.join(home, 'missing'))).toBeNull();
+      expect(() => checkArchiveMembers([{ type: 'file', name: 'lnk/.ssh/authorized_keys', target: null }], { home, dest: home, readLink })).toThrow(/\.ssh/);
+      const absent = sshFingerprint(home);
+      expect(absent).toMatchObject({ exists: false });
+      expect(sshChanges(absent, absent)).toEqual({ remove: [], mode: null });
+      fs.mkdirSync(path.join(home, '.ssh'), { mode: 0o700 });
+      fs.writeFileSync(path.join(home, '.ssh', 'authorized_keys'), 'ssh-ed25519 AAAA a\n', { mode: 0o600 });
+      const created = sshFingerprint(home);
+      expect(sshChanges(absent, created)).toEqual({ remove: ['.'], mode: null });
+      expect(sshChanges(created, created)).toEqual({ remove: [], mode: null });
+      fs.writeFileSync(path.join(home, '.ssh', 'authorized_keys'), 'ssh-ed25519 AAAA attacker\n');
+      fs.mkdirSync(path.join(home, '.ssh', 'd'));
+      fs.writeFileSync(path.join(home, '.ssh', 'd', 'k'), 'k');
+      const changed = sshFingerprint(home);
+      expect(sshChanges(created, changed).remove.sort()).toEqual(['authorized_keys', 'd']);
+      fs.chmodSync(path.join(home, '.ssh'), 0o755);
+      expect(sshChanges(changed, sshFingerprint(home))).toEqual({ remove: [], mode: '700' });
+      fs.rmSync(path.join(home, '.ssh'), { recursive: true });
+      fs.symlinkSync('/etc', path.join(home, '.ssh'));
+      expect(sshChanges(changed, sshFingerprint(home))).toEqual({ remove: ['.'], mode: null });
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('is run by files.extract before anything is extracted and .ssh is checked again afterwards', () => {
+    const src = fs.readFileSync(new URL('../src/ops/files.js', import.meta.url), 'utf8');
+    const run = src.slice(src.indexOf("defineOp('files.extract'"));
+    expect(run.indexOf('sshFingerprint(')).toBeGreaterThan(-1);
+    expect(run.indexOf('sshFingerprint(')).toBeLessThan(run.indexOf("'--extract'"));
+    expect(run.indexOf('revertSshChanges(')).toBeGreaterThan(run.indexOf("'--extract'"));
+    expect(run).toContain('readLink: diskLinkReader()');
+  });
+
   it('is run by files.extract before anything is extracted', () => {
     const src = fs.readFileSync(new URL('../src/ops/files.js', import.meta.url), 'utf8');
     const run = src.slice(src.indexOf("defineOp('files.extract'"));
@@ -287,6 +366,21 @@ describe('assertUnderHome', () => {
     fs.symlinkSync('/tmp', path.join(home, 'tmp'));
     expect(() => assertUnderHome(home, `${home}/tmp/new/file.txt`)).toThrow(/escapes the home directory/);
     expect(() => assertUnderHome(`${root}/nobody-here`, `${root}/nobody-here/x`)).toThrow(/does not exist/);
+  });
+
+  it('reports where a path really lands so a write into .ssh through a link is refused', () => {
+    const home = path.join(root, 'erin');
+    fs.mkdirSync(path.join(home, 'public_html'), { recursive: true });
+    fs.symlinkSync('.', path.join(home, 'lnk'));
+    fs.symlinkSync('public_html', path.join(home, 'www'));
+    const r = resolveUnderHome(home, `${home}/lnk/.ssh/authorized_keys`);
+    expect(r).toEqual({ resolved: `${home}/lnk/.ssh/authorized_keys`, real: `${fs.realpathSync(home)}/.ssh/authorized_keys`, realHome: fs.realpathSync(home) });
+    expect(landsInSshDir(r.real, r.realHome)).toBe(true);
+    expect(landsInSshDir(`${r.realHome}/.ssh`, r.realHome)).toBe(true);
+    expect(landsInSshDir(`${r.realHome}/.sshx/k`, r.realHome)).toBe(false);
+    expect(landsInSshDir(`${r.realHome}/public_html/.ssh/k`, r.realHome)).toBe(false);
+    const w = resolveUnderHome(home, `${home}/www/.ssh/k`);
+    expect(landsInSshDir(w.real, w.realHome)).toBe(false);
   });
 
   it('refuses a home that is itself relocated by a tenant link when the path escapes it', () => {

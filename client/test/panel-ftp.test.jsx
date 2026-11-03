@@ -112,6 +112,23 @@ describe('FTP accounts page', () => {
     expect(html).toMatch(/<button type="submit"[^>]*disabled=""/);
   });
 
+  it('treats a plan limit of 0 as "not included" and disables the form (the server refuses creation at 0)', () => {
+    fixtures.responses.clear();
+    set({ data: [], meta: { ...meta, quota: { max: 0, used: 0, remaining: 0 } } });
+    const html = render(h(FtpAccounts, { fn }));
+    expect(html).toContain('Your plan does not include FTP accounts');
+    expect(html).toContain('not included in your plan');
+    expect(html).not.toContain('Your plan allows 0 FTP accounts');
+    expect(html).not.toContain('class="meter');
+    expect(html).toMatch(/id="ftp-login"[^>]*disabled=""/);
+    expect(html).toMatch(/<button type="submit"[^>]*disabled=""/);
+    // null stays unlimited: no cap text, form enabled.
+    set({ data: [], meta: { ...meta, quota: { max: null, used: 3, remaining: null } } });
+    const unlimited = render(h(FtpAccounts, { fn }));
+    expect(unlimited).not.toContain('not included');
+    expect(unlimited).not.toMatch(/id="ftp-login"[^>]*disabled=""/);
+  });
+
   it('helpers: loginSuffix, homePrefix, relativeDir, encryptionText, filterAccounts', () => {
     expect(loginSuffix('pure-ftpd', me.account)).toBe('@demo.example.com');
     expect(loginSuffix('proftpd', me.account)).toBe('_demo');

@@ -57,16 +57,18 @@ export function NameField({ label, prefix, value, onChange, placeholder, maxLeng
   );
 }
 
-// "3 of 10" with a meter; unlimited plans show the count alone.
+// "3 of 10" with a meter; unlimited plans (null) show the count alone and a plan
+// limit of 0 says the object is not included (the server's assertLimit convention).
 export function QuotaStat({ label, used, max, noun }) {
-  const unlimited = max == null || max < 0 || max === 0;
-  const percent = unlimited ? null : percentOf(used, max);
+  const unlimited = max == null;
+  const notIncluded = max === 0;
+  const percent = unlimited || notIncluded ? null : percentOf(used, max);
   return (
     <div className="stat">
       <div className="label">{label}</div>
-      <div className="value">{used ?? 0}{!unlimited && <span className="muted" style={{ fontSize: 15, fontWeight: 500 }}> of {max}</span>}</div>
-      <div className="muted small">{unlimited ? `No limit on ${noun} in this plan` : percent >= 100 ? `Plan limit reached` : `${Math.max(0, max - (used ?? 0))} more allowed by the plan`}</div>
-      {!unlimited && <div className={`meter ${meterTone(percent)}`}><span style={{ width: `${percent}%` }} /></div>}
+      <div className="value">{used ?? 0}{!unlimited && !notIncluded && <span className="muted" style={{ fontSize: 15, fontWeight: 500 }}> of {max}</span>}</div>
+      <div className="muted small">{unlimited ? `No limit on ${noun} in this plan` : notIncluded ? `No ${noun} in your plan` : percent >= 100 ? `Plan limit reached` : `${Math.max(0, max - (used ?? 0))} more allowed by the plan`}</div>
+      {percent != null && <div className={`meter ${meterTone(percent)}`}><span style={{ width: `${percent}%` }} /></div>}
     </div>
   );
 }

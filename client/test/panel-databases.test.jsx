@@ -94,6 +94,24 @@ describe('Databases page', () => {
     expect(html).toMatch(/<button type="submit"[^>]*disabled=""/);
   });
 
+  it('treats a plan limit of 0 as "not included" (the server refuses creation at 0), null as unlimited', () => {
+    reset();
+    set('/databases', { data: [], meta: { ...dbMeta, quota: { max: 0, used: 0, remaining: 0 } } });
+    const html = render(h(Databases, { fn: fn('panel:databases/databases') }), '/panel/databases/databases');
+    expect(html).toContain('No databases in your plan');
+    expect(html).toContain('Your plan does not include databases');
+    expect(html).not.toContain('No limit on databases in this plan');
+    expect(html).not.toContain('Your plan allows 0 databases');
+    expect(html).not.toContain('of 0');
+    expect(html).toMatch(/id="db-name"[^>]*disabled=""/);
+    expect(html).toMatch(/<button type="submit"[^>]*disabled=""/);
+    set('/databases', { data: [], meta: { ...dbMeta, quota: { max: null, used: 4, remaining: null } } });
+    const unlimited = render(h(Databases, { fn: fn('panel:databases/databases') }), '/panel/databases/databases');
+    expect(unlimited).toContain('No limit on databases in this plan');
+    expect(unlimited).not.toContain('not include');
+    expect(unlimited).not.toMatch(/id="db-name"[^>]*disabled=""/);
+  });
+
   it('shows the engine warning and the empty state wording', () => {
     reset();
     set('/databases', { data: [], meta: { ...dbMeta, quota: { max: null, used: 0, remaining: null }, engineError: { code: 'timeout', message: 'Connection refused.' } } });

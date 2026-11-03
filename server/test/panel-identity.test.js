@@ -239,6 +239,8 @@ describe('Customer panel identity', () => {
   });
 
   describe('panel-side password change (§2.2)', () => {
+    // The login rate limit allows few logins per suite; later tests reuse this session.
+    let aliceSession = null;
     const fakeReq = (user, extra = {}) => {
       const entries = [];
       return { user, ip: '127.0.0.1', auth: { via: 'session' }, session: null, audit: (e) => entries.push(e), entries, ...extra };
@@ -307,12 +309,55 @@ describe('Customer panel identity', () => {
       const back = await http.post('/api/auth/password').set('X-CSRF-Token', forced.body.data.csrfToken).send({ currentPassword: 'Alice-Routed-Passw0rd!', newPassword: 'Alice-NewPassw0rd!' }).expect(200);
       expect(app.agent.callsTo('user.set_password').map((c) => c.args.password)).toEqual(['Alice-Routed-Passw0rd!', 'Alice-NewPassw0rd!']);
       await http.get('/api/panel/me').set('X-CSRF-Token', back.body.data.csrfToken).expect(200);
+      aliceSession = { http, csrf: back.body.data.csrfToken };
       // Root is not an account user: core's own flow, no host op.
       const rotated = await root.post('/api/auth/password', { currentPassword: 'Test-Passw0rd!1', newPassword: 'Root-Rotated-Passw0rd!1' }).expect(200);
       csrf = rotated.body.data.csrfToken;
       expect(app.agent.callsTo('user.set_password')).toHaveLength(2);
       const restored = await root.post('/api/auth/password', { currentPassword: 'Root-Rotated-Passw0rd!1', newPassword: 'Test-Passw0rd!1' }).expect(200);
       csrf = restored.body.data.csrfToken;
+    });
+
+    it('POST /api/auth/password honours demo mode, suspension, the passwordchange feature and the 2FA policy for account users', async () => {
+      const user = userRow('alice');
+      const { http, csrf: aliceCsrf } = aliceSession;
+      const change = (body) => http.post('/api/auth/password').set('X-CSRF-Token', aliceCsrf).send(body);
+      const plan = () => JSON.parse(db().prepare("SELECT plan_snapshot_json FROM accounts WHERE username = 'alice'").get().plan_snapshot_json || '{}');
+      const setPlan = (p) => db().prepare("UPDATE accounts SET plan_snapshot_json = ? WHERE username = 'alice'").run(JSON.stringify(p));
+      const original = plan();
+      try {
+        db().prepare("UPDATE accounts SET demo_mode = 1 WHERE username = 'alice'").run();
+        let res = await change({ currentPassword: 'Alice-NewPassw0rd!', newPassword: 'Alice-Hijack-Passw0rd!' });
+        expect(res.status).toBe(403);
+        expect(res.body.error.code).toBe('demo_mode');
+        db().prepare("UPDATE accounts SET demo_mode = 0 WHERE username = 'alice'").run();
+        setPlan({ ...original, features: { ...(original.features || {}), passwordchange: false } });
+        res = await change({ currentPassword: 'Alice-NewPassw0rd!', newPassword: 'Alice-Hijack-Passw0rd!' });
+        expect(res.status).toBe(403);
+        expect(res.body.error.code).toBe('feature_disabled');
+        // Core's forced change still goes through: the login cannot be stuck behind the package.
+        db().prepare('UPDATE users SET must_change_password = 1 WHERE id = ?').run(user.id);
+        const forced = await change({ newPassword: 'Alice-Forced2-Passw0rd!' });
+        expect(forced.status, JSON.stringify(forced.body)).toBe(200);
+        const change2 = (body) => http.post('/api/auth/password').set('X-CSRF-Token', forced.body.data.csrfToken).send(body);
+        setPlan(original);
+        app.ctx.settings.set('panel.require_2fa_for_users', true);
+        res = await change2({ currentPassword: 'Alice-Forced2-Passw0rd!', newPassword: 'Alice-Hijack-Passw0rd!' });
+        expect(res.status).toBe(403);
+        expect(res.body.error.code).toBe('two_factor_required');
+        app.ctx.settings.set('panel.require_2fa_for_users', false);
+        db().prepare("UPDATE accounts SET suspended = 1 WHERE username = 'alice'").run();
+        res = await change2({ currentPassword: 'Alice-Forced2-Passw0rd!', newPassword: 'Alice-Hijack-Passw0rd!' });
+        expect(res.status).toBe(423);
+        db().prepare("UPDATE accounts SET suspended = 0 WHERE username = 'alice'").run();
+        expect(app.agent.callsTo('user.set_password').map((c) => c.args.password)).toEqual(['Alice-Forced2-Passw0rd!']);
+        expect(await app.ctx.crypto.verifyPassword('Alice-Forced2-Passw0rd!', userRow('alice').password_hash)).toBe(true);
+        await change2({ currentPassword: 'Alice-Forced2-Passw0rd!', newPassword: 'Alice-NewPassw0rd!' }).expect(200);
+      } finally {
+        setPlan(original);
+        db().prepare("UPDATE accounts SET demo_mode = 0, suspended = 0 WHERE username = 'alice'").run();
+        app.ctx.settings.set('panel.require_2fa_for_users', false);
+      }
     });
 
     it('clears the account-level forced change and refuses a weak password when the policy says so', async () => {

@@ -41,7 +41,8 @@ const isMissing = (err) => err && (err.code === 'ENOENT' || err.code === 'ENOTDI
 // normalised here anyway), then real containment: every existing component of
 // the path is resolved and the not-yet-existing tail is appended, so a symlink
 // anywhere on the way that leaves the (resolved) home refuses the path.
-export function assertUnderHome(home, p) {
+// Returns the lexical path and where it really lands.
+export function resolveUnderHome(home, p) {
   const resolved = path.resolve(p);
   const homeResolved = path.resolve(home);
   if (resolved !== homeResolved && !resolved.startsWith(`${homeResolved}/`)) throw new OpError('path_not_allowed', `${p} is not inside the home directory ${home}`);
@@ -63,19 +64,34 @@ export function assertUnderHome(home, p) {
   }
   real = path.join(real, ...tail);
   if (real !== realHome && !real.startsWith(`${realHome}/`)) throw new OpError('path_not_allowed', `${p} escapes the home directory through a symbolic link`);
-  return resolved;
+  return { resolved, real, realHome };
+}
+
+export function assertUnderHome(home, p) {
+  return resolveUnderHome(home, p).resolved;
+}
+
+// The account's .ssh directory is written only by the SSH-key feature (its
+// gates: shell access, session login, no impersonation). A write that really
+// lands there, through whatever link the tenant planted, is refused when the
+// caller may not write .ssh.
+export const SSH_DIR = '.ssh';
+export function landsInSshDir(real, realHome) {
+  const dir = path.join(realHome, SSH_DIR);
+  return real === dir || real.startsWith(`${dir}/`);
 }
 
 // Resolves a caller-supplied absolute path against the account whose name was
 // given: the home comes from /etc/passwd, the path must sit under it (lexically
 // and through symlinks) and under an allowed root.
-export function accountPath(username, p, ctx, mode = 'read') {
+export function accountPath(username, p, ctx, mode = 'read', { protectSshDir = false } = {}) {
   const info = assertManaged(username);
   const home = path.resolve(info.home);
   ctx.assertAllowedPath(home, mode);
-  const target = assertUnderHome(home, p);
+  const { resolved: target, real, realHome } = resolveUnderHome(home, p);
   ctx.assertAllowedPath(target, mode);
-  return { info, home, target };
+  if (protectSshDir && mode === 'write' && landsInSshDir(real, realHome)) throw new OpError('refused', `${path.relative(home, target)} lands in ${SSH_DIR}, which only the SSH-key feature may change`);
+  return { info, home, target, real, realHome };
 }
 
 export function privilegeTool() {

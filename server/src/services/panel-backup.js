@@ -3,6 +3,7 @@ import crypto from 'node:crypto';
 import { json } from '../db/index.js';
 import { notFound, conflict, forbidden, badRequest, unprocessable, HttpError, CapabilityError } from '../lib/errors.js';
 import { featureDisabled } from './panel-databases.js';
+import { sshWriteAllowed, SSH_DIR } from './panel-files.js';
 
 // Customer panel: backups of one hosting account. Rows are read with the
 // panel's own statements pinned to the account (never ctx.backup.listBackups);
@@ -299,13 +300,22 @@ export function createPanelBackupService(ctx) {
     return { sent, aborted: false };
   }
 
+  // The same .ssh gate as the file manager (panel-files.sshWriteAllowed): a
+  // restore may bring .ssh back only for a session login of an account with
+  // shell access and the ssh feature; otherwise the paths may not name it and
+  // the agent keeps the archive's homedir/.ssh (and every link) out.
   function restore(scope, id, { paths, overwrite = false }, req) {
     requireFeature(scope);
     const row = owned(scope, id);
     if (row.status !== 'done') throw conflict('Only completed backups can be restored');
     if (!paths?.length) throw badRequest('Choose at least one file or directory to restore');
-    const r = backup().enqueueRestore({ backupId: row.id, kind: 'files', options: { paths, overwrite: Boolean(overwrite) } }, scope.ownerPrincipal, req);
-    audit(req, scope, { action: 'panel.backup.restore', args: { backupId: row.id, paths: paths.length, overwrite: Boolean(overwrite), job: r.job.id } });
+    const allowSsh = sshWriteAllowed(scope, req);
+    if (!allowSsh) {
+      const touchesSsh = (p) => { const clean = String(p).replace(/\/+$/, ''); return clean === '' || clean === '.' || clean.split('/')[0] === SSH_DIR; };
+      if (paths.some(touchesSsh)) throw new HttpError(403, 'ssh_managed', `${SSH_DIR} is managed from Security › SSH keys and cannot be restored here; choose the files or directories to restore`);
+    }
+    const r = backup().enqueueRestore({ backupId: row.id, kind: 'files', options: { paths, overwrite: Boolean(overwrite), excludeSshDir: !allowSsh } }, scope.ownerPrincipal, req);
+    audit(req, scope, { action: 'panel.backup.restore', args: { backupId: row.id, paths: paths.length, overwrite: Boolean(overwrite), excludeSshDir: !allowSsh, job: r.job.id } });
     return { job: { id: r.job.id }, restore: r.restore };
   }
 

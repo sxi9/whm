@@ -879,7 +879,7 @@ export function createBackupService(ctx) {
       if (restore.kind === 'files') {
         if (!account) throw new Error(`account ${restore.account_name} does not exist`);
         jobCtx.progress(30, 'restoring files');
-        const r = await op('backup.files.restore', { archive, username: account.username, homeDir: homeOf(account), paths: options.paths, overwrite: options.overwrite !== false }, req);
+        const r = await op('backup.files.restore', { archive, username: account.username, homeDir: homeOf(account), paths: options.paths, overwrite: options.overwrite !== false, excludeSshDir: options.excludeSshDir === true }, req);
         step('files', { status: r.missing.length && !r.restored.length ? 'failed' : 'done', detail: `${r.restored.length} path(s) restored${r.missing.length ? `, not in archive: ${r.missing.join(', ')}` : ''}`, restored: r.restored, missing: r.missing });
       } else {
         staging = `${localDir()}/.restore-${restore.id}`;

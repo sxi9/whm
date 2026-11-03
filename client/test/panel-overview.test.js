@@ -30,16 +30,18 @@ const ctx = { me, loading: false, error: null, reload: () => {}, hasFeature: (k)
 const render = (el, path = '/panel') => renderToStaticMarkup(h(MemoryRouter, { initialEntries: [path] }, h(ShellContext.Provider, { value: PANEL_SHELL }, h(PanelContext.Provider, { value: ctx }, el))));
 
 describe('usage meters', () => {
-  it('pair used/limit per object and treat null, 0 and -1 as unlimited', () => {
+  it('pair used/limit per object, treat null as unlimited and 0 as not included (the server convention)', () => {
     const meters = usageMeters(me, null);
     const byKey = Object.fromEntries(meters.map((m) => [m.key, m]));
     expect(byKey.disk).toMatchObject({ percent: 50, text: '512 MB of 1.00 GB' });
     expect(byKey.bandwidth.percent).toBe(null);
     expect(byKey.bandwidth.text).toContain('unlimited');
     expect(byKey.mailboxes).toMatchObject({ used: 9, limit: 10, percent: 90, text: '9 of 10' });
-    expect(byKey.databases.percent).toBe(null);
-    expect(byKey.ftp.percent).toBe(null);
+    expect(byKey.databases).toMatchObject({ limit: 0, percent: null, text: 'Not included in your plan' });
+    expect(byKey.databases.text).not.toContain('unlimited');
+    expect(byKey.ftp).toMatchObject({ limit: -1, percent: null, text: '0 of -1' });
     expect(byKey.addons).toMatchObject({ percent: 0, text: '0 of 2' });
+    expect(Object.fromEntries(usageMeters(me, { counts: me.counts, limits: { max_email: 0 } }).map((m) => [m.key, m])).mailboxes.text).toBe('Not included in your plan');
     const refined = usageMeters(me, { disk: { usedMb: 1000, quotaMb: 1024 }, counts: me.counts, limits: { max_email: 20 } });
     expect(Object.fromEntries(refined.map((m) => [m.key, m])).disk.percent).toBe(98);
     expect(Object.fromEntries(refined.map((m) => [m.key, m])).mailboxes.text).toBe('9 of 20');
@@ -99,7 +101,7 @@ describe('PanelHome / dashboard', () => {
 });
 
 describe('Account details page', () => {
-  it('shows identity, limits with Unlimited for null/0/-1, feature rows and sign-in facts', () => {
+  it('shows identity, limits (Unlimited for null, Not included for 0), feature rows and sign-in facts', () => {
     const fn = PANEL_FUNCTION_BY_KEY['panel:overview/account'];
     const html = render(h(AccountDetails, { fn }), fn.path);
     expect(html).toContain('<h1>Account details</h1>');
@@ -109,6 +111,7 @@ describe('Account details page', () => {
     expect(html).toContain('Disk space');
     expect(html).toContain('1.00 GB');
     expect(html).toContain('Unlimited');
+    expect(html).toContain('Not included');
     expect(html).toContain('Included features');
     expect(html).toContain('<code>cron</code>');
     expect(html).toContain('<code>filemanager</code>');
@@ -119,8 +122,9 @@ describe('Account details page', () => {
 
   it('limitText and featureRows', () => {
     expect(limitText(null)).toBe('Unlimited');
-    expect(limitText(0)).toBe('Unlimited');
-    expect(limitText(-1)).toBe('Unlimited');
+    expect(limitText(undefined)).toBe('Unlimited');
+    expect(limitText(0)).toBe('Not included');
+    expect(limitText(0, (v) => `${v} MB`)).toBe('Not included');
     expect(limitText(5)).toBe('5');
     expect(limitText(2048, (v) => `${v} MB`)).toBe('2048 MB');
     const rows = featureRows({ cron: false, custom_flag: true });

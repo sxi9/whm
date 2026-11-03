@@ -1,9 +1,10 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import { hasBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
-import { accountPath, asUser, failureOf, lstatOrNull } from './as-user.js';
+import { accountPath, asUser, failureOf, lstatOrNull, SSH_DIR } from './as-user.js';
 
 // File manager ops for the account panel. Every command runs under the
 // account's own uid (as-user.js), so permissions and quota are the kernel's
@@ -25,10 +26,14 @@ const EXTRACT_EXT = /\.(zip|tar|tar\.gz|tgz)$/i;
 // ceiling is what bounds memory whatever the caller asks for.
 export const CHUNK_READ_MAX = 2 * MiB;
 // The account's .ssh directory is written only by the SSH-key feature, whose
-// gates (shell access, session login, no impersonation) an archive would bypass.
-export const SSH_DIR = '.ssh';
+// gates (shell access, session login, no impersonation) a file write or an
+// archive would bypass: every writing op takes protectSshDir (default on) and
+// the agent refuses a write whose real path lands there, whatever link the
+// tenant planted on the way.
+export { SSH_DIR };
 
 const base = { username: arg.username };
+const protect = { protectSshDir: z.boolean().default(true) };
 const pathArg = arg.absPath;
 const pathList = (max) => z.array(arg.absPath).min(1).max(max);
 const toIso = (epoch) => (Number.isFinite(epoch) ? new Date(epoch * 1000).toISOString() : null);
@@ -170,9 +175,9 @@ async function stagedWrite(info, home, target, data, mode) {
 
 defineOp('files.write', {
   description: 'Write a whole text file into an account home as the account (staged, then renamed into place; symlink targets refused)',
-  schema: z.object({ ...base, path: pathArg, content: arg.text, mode: arg.mode.optional() }).strict(),
-  run: async ({ username, path: p, content, mode }, ctx) => {
-    const { info, home, target } = accountPath(username, p, ctx, 'write');
+  schema: z.object({ ...base, ...protect, path: pathArg, content: arg.text, mode: arg.mode.optional() }).strict(),
+  run: async ({ username, path: p, content, mode, protectSshDir }, ctx) => {
+    const { info, home, target } = accountPath(username, p, ctx, 'write', { protectSshDir });
     assertNotHome(target, home, 'files.write');
     const existing = rejectSymlinkTarget(target);
     const finalMode = mode ?? (existing ? (existing.mode & 0o777).toString(8).padStart(4, '0') : '0644');
@@ -185,9 +190,9 @@ defineOp('files.write', {
 
 defineOp('files.chunk_write', {
   description: 'Append a base64 chunk to a file in an account home as the account (truncate starts the file over)',
-  schema: z.object({ ...base, path: pathArg, data: z.string().min(1).max(3 * MiB).regex(/^[A-Za-z0-9+/=]+$/), truncate: z.boolean().default(false) }).strict(),
-  run: async ({ username, path: p, data, truncate }, ctx) => {
-    const { info, home, target } = accountPath(username, p, ctx, 'write');
+  schema: z.object({ ...base, ...protect, path: pathArg, data: z.string().min(1).max(3 * MiB).regex(/^[A-Za-z0-9+/=]+$/), truncate: z.boolean().default(false) }).strict(),
+  run: async ({ username, path: p, data, truncate, protectSshDir }, ctx) => {
+    const { info, home, target } = accountPath(username, p, ctx, 'write', { protectSshDir });
     assertNotHome(target, home, 'files.chunk_write');
     rejectSymlinkTarget(target);
     const buf = Buffer.from(data, 'base64');
@@ -201,9 +206,9 @@ defineOp('files.chunk_write', {
 
 defineOp('files.mkdir', {
   description: 'Create a directory (and parents) inside an account home as the account',
-  schema: z.object({ ...base, path: pathArg, mode: arg.mode.default('0755') }).strict(),
-  run: async ({ username, path: p, mode }, ctx) => {
-    const { info, home, target } = accountPath(username, p, ctx, 'write');
+  schema: z.object({ ...base, ...protect, path: pathArg, mode: arg.mode.default('0755') }).strict(),
+  run: async ({ username, path: p, mode, protectSshDir }, ctx) => {
+    const { info, home, target } = accountPath(username, p, ctx, 'write', { protectSshDir });
     assertNotHome(target, home, 'files.mkdir');
     assertPlainMode(mode);
     const r = await asUser(info, 'mkdir', ['-p', '-m', mode, '--', target], { allowFailure: true, timeoutMs: 60_000 });
@@ -214,10 +219,10 @@ defineOp('files.mkdir', {
 
 defineOp('files.move', {
   description: 'Rename or move a path inside an account home as the account (never overwrites unless asked)',
-  schema: z.object({ ...base, from: pathArg, to: pathArg, overwrite: z.boolean().default(false) }).strict(),
-  run: async ({ username, from, to, overwrite }, ctx) => {
-    const src = accountPath(username, from, ctx, 'write');
-    const dst = accountPath(username, to, ctx, 'write');
+  schema: z.object({ ...base, ...protect, from: pathArg, to: pathArg, overwrite: z.boolean().default(false) }).strict(),
+  run: async ({ username, from, to, overwrite, protectSshDir }, ctx) => {
+    const src = accountPath(username, from, ctx, 'write', { protectSshDir });
+    const dst = accountPath(username, to, ctx, 'write', { protectSshDir });
     assertNotHome(src.target, src.home, 'files.move');
     assertNotHome(dst.target, dst.home, 'files.move');
     if (dst.target === src.target || dst.target.startsWith(`${src.target}/`)) throw new OpError('refused', 'A path cannot be moved into itself');
@@ -232,10 +237,10 @@ defineOp('files.move', {
 defineOp('files.copy', {
   description: 'Copy a path inside an account home as the account (archive mode, symlinks kept as links)',
   timeoutMs: 600_000,
-  schema: z.object({ ...base, from: pathArg, to: pathArg }).strict(),
-  run: async ({ username, from, to }, ctx) => {
+  schema: z.object({ ...base, ...protect, from: pathArg, to: pathArg }).strict(),
+  run: async ({ username, from, to, protectSshDir }, ctx) => {
     const src = accountPath(username, from, ctx, 'read');
-    const dst = accountPath(username, to, ctx, 'write');
+    const dst = accountPath(username, to, ctx, 'write', { protectSshDir });
     assertNotHome(src.target, src.home, 'files.copy');
     assertNotHome(dst.target, dst.home, 'files.copy');
     if (dst.target === src.target || dst.target.startsWith(`${src.target}/`)) throw new OpError('refused', 'A path cannot be copied into itself');
@@ -250,13 +255,13 @@ defineOp('files.remove', {
   description: 'Delete paths inside an account home as the account (recursive, one file system; the home itself is refused)',
   destructive: true,
   timeoutMs: 600_000,
-  schema: z.object({ ...base, paths: pathList(200) }).strict(),
-  run: async ({ username, paths }, ctx) => {
+  schema: z.object({ ...base, ...protect, paths: pathList(200) }).strict(),
+  run: async ({ username, paths, protectSshDir }, ctx) => {
     const targets = [];
     let info;
     let home;
     for (const p of paths) {
-      const r = accountPath(username, p, ctx, 'write');
+      const r = accountPath(username, p, ctx, 'write', { protectSshDir });
       ({ info, home } = r);
       assertNotHome(r.target, home, 'files.remove');
       if (ctx.allowedRoots.includes(r.target)) throw new OpError('refused', `${p} is a managed root and is never deleted`);
@@ -271,9 +276,9 @@ defineOp('files.remove', {
 defineOp('files.chmod', {
   description: 'Change permissions inside an account home as the account (recursion never follows symlinks)',
   timeoutMs: 600_000,
-  schema: z.object({ ...base, path: pathArg, mode: arg.mode, recursive: z.boolean().default(false) }).strict(),
-  run: async ({ username, path: p, mode, recursive }, ctx) => {
-    const { info, home, target } = accountPath(username, p, ctx, 'write');
+  schema: z.object({ ...base, ...protect, path: pathArg, mode: arg.mode, recursive: z.boolean().default(false) }).strict(),
+  run: async ({ username, path: p, mode, recursive, protectSshDir }, ctx) => {
+    const { info, home, target } = accountPath(username, p, ctx, 'write', { protectSshDir });
     assertPlainMode(mode);
     const r = recursive
       ? await asUser(info, 'find', ['-P', target, '!', '-type', 'l', '-exec', 'chmod', mode, '--', '{}', '+'], { allowFailure: true, timeoutMs: 600_000 })
@@ -319,11 +324,11 @@ function relativeMembers(home, targets) {
 defineOp('files.archive', {
   description: 'Compress paths of an account home into a zip or tar.gz archive, as the account at low priority',
   timeoutMs: 1_800_000,
-  schema: z.object({ ...base, paths: pathList(500), dest: pathArg, format: z.enum(['zip', 'tar.gz']) }).strict(),
-  run: async ({ username, paths, dest, format }, ctx) => {
+  schema: z.object({ ...base, ...protect, paths: pathList(500), dest: pathArg, format: z.enum(['zip', 'tar.gz']) }).strict(),
+  run: async ({ username, paths, dest, format, protectSshDir }, ctx) => {
     const spec = ARCHIVE_FORMATS[format];
     requireBins(spec.bins, `create ${format} archives`);
-    const out = accountPath(username, dest, ctx, 'write');
+    const out = accountPath(username, dest, ctx, 'write', { protectSshDir });
     assertNotHome(out.target, out.home, 'files.archive');
     if (!spec.ext.test(out.target)) throw new OpError('invalid_args', `The destination must end in .${format}`);
     if (lstatOrNull(out.target)) throw new OpError('exists', `${path.relative(out.home, out.target)} already exists`);
@@ -354,8 +359,11 @@ export function parseTarListing(stdout) {
     if (m[1] === 'l') {
       const at = name.lastIndexOf(' -> ');
       if (at >= 0) { target = name.slice(at + 4); name = name.slice(0, at); }
+    } else if (m[1] === 'h') {
+      const at = name.lastIndexOf(' link to ');
+      if (at >= 0) { target = name.slice(at + 9); name = name.slice(0, at); }
     }
-    members.push({ type: m[1] === 'l' ? 'symlink' : m[1] === 'd' ? 'dir' : 'file', name, target });
+    members.push({ type: m[1] === 'l' ? 'symlink' : m[1] === 'h' ? 'hardlink' : m[1] === 'd' ? 'dir' : 'file', name, target });
   }
   return members;
 }
@@ -372,12 +380,43 @@ export function parseZipListing(stdout) {
 const underDir = (p, dir) => p === dir || p.startsWith(`${dir}/`);
 const hasDotDot = (name) => name.split('/').includes('..');
 const landsInSsh = (abs, home) => underDir(abs, path.join(home, SSH_DIR));
+const components = (p) => p.split('/').filter((c) => c && c !== '.');
+const MAX_LINK_HOPS = 40;
+
+// Where a member name really lands once tar has written it: GNU tar creates
+// a symlink member as soon as it is read (only absolute and ".." targets are
+// deferred), so a later member can be written through it, and through any
+// link already on disk under the destination. Components are resolved left to
+// right the way the kernel does, substituting the archive's own links
+// (`links`, name -> target) and the on-disk ones (`readLink(abs)`).
+export function resolveMemberPath(name, { dest, links, readLink = () => null }) {
+  let cur = dest;
+  let parts = components(name);
+  let hops = 0;
+  while (parts.length) {
+    const part = parts.shift();
+    if (part === '..') { cur = path.dirname(cur); continue; }
+    const next = path.join(cur, part);
+    const target = links.get(path.relative(dest, next)) ?? readLink(next);
+    if (target == null) { cur = next; continue; }
+    if (++hops > MAX_LINK_HOPS) throw new OpError('refused', `the archive member "${name}" goes through too many symbolic links`);
+    if (target.startsWith('/')) cur = '/';
+    parts = [...components(target), ...parts];
+  }
+  return cur;
+}
 
 // Refuses an archive whose members would leave the destination (absolute or
-// ".." names, symlinks pointing out of it) or land in the home's .ssh
-// directory; a zip symlink's target is not listed, so it is refused outright
-// while .ssh is protected.
-export function checkArchiveMembers(members, { home, dest, allowSshDir = false }) {
+// ".." names, links pointing out of it, directly or through other links) or
+// land in the home's .ssh directory, the one place the file manager never
+// writes unless the caller could write it directly; a zip symlink's target is
+// not listed, so it is refused outright while .ssh is protected. `readLink`
+// answers the target of a symlink already on disk (null for anything else).
+export function checkArchiveMembers(members, { home, dest, allowSshDir = false, readLink = () => null }) {
+  const links = new Map();
+  for (const m of members) if (m.type === 'symlink' && m.target != null) links.set(components(m.name).join('/'), m.target);
+  const opts = { dest, links, readLink };
+  const sshParent = (p) => p === home || home.startsWith(`${p}/`);
   for (const m of members) {
     const name = m.name.replace(/\/+$/, '');
     if (!name || name === '.') continue;
@@ -385,22 +424,92 @@ export function checkArchiveMembers(members, { home, dest, allowSshDir = false }
     const abs = path.resolve(dest, name);
     if (!underDir(abs, dest)) throw new OpError('refused', `the archive member "${m.name}" would be written outside the destination`);
     if (!allowSshDir && landsInSsh(abs, home)) throw new OpError('refused', `the archive member "${m.name}" would be written into ${SSH_DIR}, which only the SSH-key feature may change`);
-    if (m.type !== 'symlink') continue;
+    // tar writes a file or link member at its own name (an existing entry is
+    // unlinked first) but descends into an existing directory, link or not.
+    const real = m.type === 'dir' ? resolveMemberPath(name, opts) : path.join(resolveMemberPath(path.dirname(name), opts), path.basename(name));
+    if (!underDir(real, home)) throw new OpError('refused', `the archive member "${m.name}" would be written outside the home directory through a symbolic link`);
+    if (!allowSshDir && landsInSsh(real, home)) throw new OpError('refused', `the archive member "${m.name}" would be written into ${SSH_DIR} through a symbolic link`);
+    if (m.type !== 'symlink' && m.type !== 'hardlink') continue;
     if (m.target == null) {
       if (!allowSshDir) throw new OpError('refused', `the archive member "${m.name}" is a symbolic link; zip archives with links cannot be extracted for this account`);
       continue;
     }
-    const linked = path.resolve(path.dirname(abs), m.target);
-    if (!underDir(linked, dest)) throw new OpError('refused', `the archive member "${m.name}" is a symbolic link pointing outside the destination`);
-    if (!allowSshDir && landsInSsh(linked, home)) throw new OpError('refused', `the archive member "${m.name}" is a symbolic link into ${SSH_DIR}`);
+    // A hard link names another member (relative to the destination); a
+    // symlink's target is relative to the link's own directory.
+    const linked = m.type === 'hardlink'
+      ? (m.target.startsWith('/') || hasDotDot(m.target) ? '/' : resolveMemberPath(m.target, opts))
+      : (m.target.startsWith('/') ? '/' : resolveMemberPath(`${path.dirname(name)}/${m.target}`, opts));
+    if (!underDir(linked, dest)) throw new OpError('refused', `the archive member "${m.name}" is a ${m.type === 'hardlink' ? 'hard' : 'symbolic'} link pointing outside the destination`);
+    if (!allowSshDir && (landsInSsh(linked, home) || (m.type === 'symlink' && sshParent(linked)))) throw new OpError('refused', `the archive member "${m.name}" is a ${m.type === 'hardlink' ? 'hard' : 'symbolic'} link into ${SSH_DIR}${m.type === 'symlink' && sshParent(linked) ? "'s parent directory" : ''}`);
   }
   return members.length;
+}
+
+// The on-disk links under a destination, read root-side without following
+// anything (lstat + readlink): what tar would write through.
+export function diskLinkReader() {
+  return (abs) => {
+    const st = lstatOrNull(abs);
+    if (!st?.isSymbolicLink()) return null;
+    try { return fs.readlinkSync(abs); } catch { return null; }
+  };
+}
+
+// A metadata fingerprint of the home's .ssh directory (lstat of the directory
+// and of everything inside it, two levels deep). Taken before and after an
+// extraction while .ssh is protected: a difference means a member reached
+// .ssh regardless of the pre-extraction listing (a swap of the archive in
+// between, a link the check did not model), and the entries that changed are
+// removed as the account before the op fails.
+const FINGERPRINT_MAX = 500;
+const statSig = (st) => `${st.ino}:${(st.mode & 0o7777).toString(8)}:${st.size}:${st.mtimeMs}:${st.ctimeMs}:${st.isSymbolicLink() ? 'l' : st.isDirectory() ? 'd' : 'f'}`;
+export function sshFingerprint(home) {
+  const dir = path.join(home, SSH_DIR);
+  const entries = new Map();
+  const st = lstatOrNull(dir);
+  if (!st) return { exists: false, self: null, entries };
+  const walk = (base, depth) => {
+    let names = [];
+    try { names = fs.readdirSync(base); } catch { return; }
+    for (const name of names.sort()) {
+      if (entries.size >= FINGERPRINT_MAX) return;
+      const abs = path.join(base, name);
+      const s = lstatOrNull(abs);
+      if (!s) continue;
+      entries.set(path.relative(dir, abs), statSig(s));
+      if (s.isDirectory() && depth < 2) walk(abs, depth + 1);
+    }
+  };
+  if (st.isDirectory()) walk(dir, 1);
+  return { exists: true, self: { ino: st.ino, mode: (st.mode & 0o7777).toString(8), type: st.isSymbolicLink() ? 'l' : st.isDirectory() ? 'd' : 'f' }, entries };
+}
+
+// What changed between two fingerprints: `remove` lists the new or replaced
+// entries ('.' when .ssh itself appeared or was replaced), `mode` the previous
+// mode of .ssh when only its permissions changed.
+export function sshChanges(before, after) {
+  if (!after.exists) return { remove: [], mode: null };
+  if (!before.exists || before.self.ino !== after.self.ino || before.self.type !== after.self.type) return { remove: ['.'], mode: null };
+  const changed = [];
+  for (const [name, sig] of after.entries) if (before.entries.get(name) !== sig) changed.push(name);
+  // Nested changes are covered by their top-level entry.
+  const remove = changed.filter((n) => !changed.some((o) => o !== n && n.startsWith(`${o}/`)));
+  return { remove, mode: before.self.mode !== after.self.mode ? before.self.mode : null };
+}
+
+async function revertSshChanges(info, home, before) {
+  const { remove, mode } = sshChanges(before, sshFingerprint(home));
+  if (!remove.length && mode == null) return null;
+  const dir = path.join(home, SSH_DIR);
+  if (remove.length) await asUser(info, 'rm', ['-rf', '--one-file-system', '--', ...remove.map((n) => (n === '.' ? dir : path.join(dir, n)))], { allowFailure: true, timeoutMs: 60_000 }).catch(() => {});
+  if (mode != null && !remove.includes('.')) await asUser(info, 'chmod', ['--', mode.padStart(4, '0'), dir], { allowFailure: true, timeoutMs: 30_000 }).catch(() => {});
+  return [...remove, ...(mode != null ? [`mode ${mode}`] : [])];
 }
 
 export const listArchiveArgv = (zip, archive) => (zip ? ['unzip', ['-Z', '--', archive]] : ['tar', ['--list', '--verbose', '--file', archive]]);
 
 defineOp('files.extract', {
-  description: 'Extract a zip or tar archive of an account home into a directory of that home, as the account at low priority (members are listed first; those leaving the destination or landing in .ssh are refused)',
+  description: 'Extract a zip or tar archive of an account home into a directory of that home, as the account at low priority (members are listed first; those leaving the destination or landing in .ssh, directly or through links, are refused; .ssh is checked again afterwards)',
   timeoutMs: 1_800_000,
   schema: z.object({ ...base, archive: pathArg, dest: pathArg, allowSshDir: z.boolean().default(false) }).strict(),
   run: async ({ username, archive, dest, allowSshDir }, ctx) => {
@@ -415,12 +524,17 @@ defineOp('files.extract', {
     const listing = await asUser(out.info, listBin, listArgv, { allowFailure: true, timeoutMs: 600_000, maxBuffer: 64 * MiB, nice: true });
     if (listing.code !== 0 && !(zip && listing.code === 1)) throw failureOf(listing, `read ${path.basename(src.target)}`);
     const members = zip ? parseZipListing(listing.stdout) : parseTarListing(listing.stdout);
-    checkArchiveMembers(members, { home: out.home, dest: out.target, allowSshDir });
+    checkArchiveMembers(members, { home: out.home, dest: out.target, allowSshDir, readLink: diskLinkReader() });
     const mk = await asUser(out.info, 'mkdir', ['-p', '--', out.target], { allowFailure: true, timeoutMs: 60_000 });
     if (mk.code !== 0) throw failureOf(mk, `create ${path.relative(out.home, out.target) || '.'}`);
+    const before = allowSshDir ? null : sshFingerprint(out.home);
     const r = zip
       ? await asUser(out.info, 'unzip', ['-o', '-q', src.target, '-d', out.target], { cwd: out.target, allowFailure: true, timeoutMs: 1_800_000, nice: true })
       : await asUser(out.info, 'tar', ['--extract', '--file', src.target, '-C', out.target, '--no-same-owner', '--warning=no-unknown-keyword'], { cwd: out.target, allowFailure: true, timeoutMs: 1_800_000, nice: true });
+    if (before) {
+      const reverted = await revertSshChanges(out.info, out.home, before);
+      if (reverted) throw new OpError('refused', `the archive changed ${SSH_DIR} while it was extracted (${reverted.join(', ')}); those changes were removed`);
+    }
     const warnings = r.stderr.split('\n').filter((l) => l.trim()).slice(0, 50);
     if (r.code !== 0 && !(zip && r.code === 1)) throw failureOf(r, `extract ${path.basename(src.target)}`);
     return { archive: src.target, dest: out.target, format: zip ? 'zip' : 'tar', members: members.length, warnings };

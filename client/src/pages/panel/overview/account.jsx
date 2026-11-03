@@ -11,8 +11,11 @@ const LIMIT_LABELS = [
   ['max_parked', 'Parked domains'], ['max_email', 'Mailboxes'], ['max_sql', 'Databases'], ['max_ftp', 'FTP accounts'], ['max_email_per_hour', 'Outgoing mail per hour'], ['quota_inodes', 'Files (inodes)'],
 ];
 
+// Plan limits as the server enforces them (assertLimit): null is unlimited, 0 is
+// a closed door, any other value is the cap.
 export function limitText(value, format) {
-  if (value == null || value < 0 || value === 0) return 'Unlimited';
+  if (value == null) return 'Unlimited';
+  if (value === 0) return 'Not included';
   return format ? format(value) : String(value);
 }
 

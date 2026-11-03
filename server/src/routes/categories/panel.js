@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Router } from 'express';
 import { validate, z, fields, pagination } from '../../lib/validate.js';
-import { requireRole, requireRoot, requireReseller } from '../../middleware/rbac.js';
+import { requireRole, requireRoot, requireReseller, requireScope } from '../../middleware/rbac.js';
 import { HttpError } from '../../lib/errors.js';
 import { createPanelService, LOGIN_AS_TTL } from '../../services/panel.js';
 import { PANEL_SCOPES, confinePanelTokens, wrap, created } from '../panel/index.js';
@@ -105,10 +105,13 @@ export async function register(ctx) {
   r.use(panelScope(ctx));
   r.get('/me', wrap((req) => s.me(req)));
   r.get('/overview/quick-links', wrap((req) => s.quickLinks(req)));
-  r.get('/tokens', wrap((req) => s.tokens.list(req.panel)));
-  r.post('/tokens', validate({ body: tokenBody }), created((req) => s.tokens.create(req.panel, req.body, req)));
-  r.get('/tokens/:id', validate({ params: idParam }), wrap((req) => s.tokens.get(req.panel, req.params.id)));
-  r.delete('/tokens/:id', validate({ params: idParam }), wrap((req) => s.tokens.remove(req.panel, req.params.id, req)));
+  // /tokens* is the browser's credential manager (§2.4, §4.13): a token may
+  // read the list with panel:read but never mint or revoke tokens.
+  const sessionOnly = (req, _res, next) => (req.auth?.via === 'token' ? next(new HttpError(403, 'session_required', 'API tokens can only be managed from a browser session')) : next());
+  r.get('/tokens', requireScope('panel:read'), wrap((req) => s.tokens.list(req.panel)));
+  r.post('/tokens', sessionOnly, validate({ body: tokenBody }), created((req) => s.tokens.create(req.panel, req.body, req)));
+  r.get('/tokens/:id', requireScope('panel:read'), validate({ params: idParam }), wrap((req) => s.tokens.get(req.panel, req.params.id)));
+  r.delete('/tokens/:id', sessionOnly, validate({ params: idParam }), wrap((req) => s.tokens.remove(req.panel, req.params.id, req)));
 
   for (const mount of await loadSubRouters(ctx)) {
     r.use(mount.path, mount.router);

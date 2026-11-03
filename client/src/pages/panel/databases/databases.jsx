@@ -42,7 +42,9 @@ export default function Databases({ fn }) {
   const engine = meta?.engine || 'mysql';
   const isPg = engine === 'postgres';
   const quota = quotaOf(meta, me);
-  const limitReached = quota.max != null && quota.max > 0 && quota.used >= quota.max;
+  // Server convention (panel-databases create): null is unlimited, 0 means the plan has no databases.
+  const notIncluded = quota.max === 0;
+  const limitReached = quota.max != null && quota.used >= quota.max;
   const rows = useMemo(() => filterRows(data || [], q), [data, q]);
   const capability = isCapabilityError(error);
 
@@ -106,7 +108,7 @@ export default function Databases({ fn }) {
         <Card title="Create a database" subtitle="Choose a short name; the prefix is added for you.">
           <PanelCapabilityState error={isCapabilityError(formError) ? formError : null} />
           <RequestError error={formError} />
-          {limitReached && <InfoNote>Your plan allows {quota.max} database{quota.max === 1 ? '' : 's'} and all of them are in use. Delete one you no longer need or ask your hosting provider about a larger plan.</InfoNote>}
+          {limitReached && <InfoNote>{notIncluded ? 'Your plan does not include databases. Ask your hosting provider about a plan that includes them.' : `Your plan allows ${quota.max} database${quota.max === 1 ? '' : 's'} and all of them are in use. Delete one you no longer need or ask your hosting provider about a larger plan.`}</InfoNote>}
           <div className="form-grid">
             <NameField id="db-name" label="Database name" prefix={prefix} value={form.name} onChange={(v) => setForm((f) => ({ ...f, name: v }))} placeholder="shop" maxLength={54} error={formError?.fields?.name} disabled={limitReached} />
             {!isPg && (

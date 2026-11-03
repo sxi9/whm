@@ -147,6 +147,9 @@ export function createPanelFilesService(ctx) {
     if (firstSegment(target.rel) !== SSH_DIR) return;
     if (!sshWriteAllowed(scope, req)) throw new HttpError(403, 'ssh_managed', `${SSH_DIR} is managed from Security › SSH keys and cannot be changed here`);
   }
+  // The lexical gate above is the quick answer; the agent re-checks where the
+  // write really lands (through any link on disk) with this flag.
+  const protect = (scope, req) => ({ protectSshDir: !sshWriteAllowed(scope, req) });
 
   function activeJobs() {
     return JOB_TYPES.flatMap((type) => ACTIVE.flatMap((status) => jobs.list({ type, status, limit: 500 })));
@@ -210,7 +213,7 @@ export function createPanelFilesService(ctx) {
       const existing = await op(scope, 'files.stat', { username: scope.username, path: file.abs }, req);
       if (existing.exists && (!overwrite || existing.type !== 'file')) throw new HttpError(409, 'exists', `${file.rel} already exists`);
       const id = crypto.randomBytes(12).toString('hex');
-      uploads.set(id, { id, accountId: scope.accountId, username: scope.username, abs: file.abs, rel: file.rel, name, size, received: 0, chunks: 0, started: false, touched: Date.now(), createdBy: req?.user?.id ?? null });
+      uploads.set(id, { id, accountId: scope.accountId, username: scope.username, abs: file.abs, rel: file.rel, name, size, received: 0, chunks: 0, started: false, touched: Date.now(), createdBy: req?.user?.id ?? null, protect: protect(scope, req) });
       return shapeUpload(uploads.get(id));
     },
     status(scope, id) {
@@ -224,7 +227,7 @@ export function createPanelFilesService(ctx) {
       const bytes = Buffer.byteLength(data, 'base64');
       if (bytes > chunkBytes()) throw unprocessable('Request validation failed', { data: [`A chunk carries at most ${chunkBytes()} bytes`] });
       if (u.received + bytes > u.size) throw unprocessable('More data than announced', { data: ['Upload exceeds the declared size'] });
-      await op(u, 'files.chunk_write', { username: u.username, path: u.abs, data, truncate: !u.started }, req);
+      await op(u, 'files.chunk_write', { username: u.username, path: u.abs, data, truncate: !u.started, ...(u.protect || {}) }, req);
       u.started = true; u.received += bytes; u.chunks += 1; u.touched = Date.now();
       return shapeUpload(u);
     },
@@ -241,7 +244,7 @@ export function createPanelFilesService(ctx) {
       gate(scope);
       const u = loadUpload(scope, id);
       uploads.delete(id);
-      if (u.started) await op(u, 'files.remove', { username: u.username, paths: [u.abs] }, req).catch(() => {});
+      if (u.started) await op(u, 'files.remove', { username: u.username, paths: [u.abs], ...(u.protect || {}) }, req).catch(() => {});
       audit(req, scope, 'panel.files.upload_abort', { path: u.rel, bytes: u.received });
       return { id, aborted: true };
     },
@@ -280,7 +283,7 @@ export function createPanelFilesService(ctx) {
       const target = resolve(scope, p);
       if (Buffer.byteLength(content, 'utf8') > MAX_TEXT_BYTES) throw unprocessable('Request validation failed', { content: ['At most 4 MiB'] });
       guardSsh(scope, target, req);
-      const r = await op(scope, 'files.write', { username: scope.username, path: target.abs, content, ...(mode ? { mode } : {}) }, req);
+      const r = await op(scope, 'files.write', { username: scope.username, path: target.abs, content, ...(mode ? { mode } : {}), ...protect(scope, req) }, req);
       duCache.clear();
       audit(req, scope, 'panel.files.write', { path: target.rel, bytes: r.bytes, created: r.created });
       return { path: target.rel, bytes: r.bytes, mode: r.mode };
@@ -291,7 +294,7 @@ export function createPanelFilesService(ctx) {
       const target = resolve(scope, p);
       if (target.rel === '.') throw unprocessable('Request validation failed', { path: ['Name the directory to create'] });
       guardSsh(scope, target, req);
-      await op(scope, 'files.mkdir', { username: scope.username, path: target.abs, mode }, req);
+      await op(scope, 'files.mkdir', { username: scope.username, path: target.abs, mode, ...protect(scope, req) }, req);
       audit(req, scope, 'panel.files.mkdir', { path: target.rel, mode });
       return { path: target.rel, mode };
     },
@@ -303,7 +306,7 @@ export function createPanelFilesService(ctx) {
       if (src.rel === '.' || dst.rel === '.') throw unprocessable('Request validation failed', { from: ['The home directory itself cannot be moved'] });
       guardSsh(scope, src, req);
       guardSsh(scope, dst, req);
-      await op(scope, 'files.move', { username: scope.username, from: src.abs, to: dst.abs, overwrite }, req);
+      await op(scope, 'files.move', { username: scope.username, from: src.abs, to: dst.abs, overwrite, ...protect(scope, req) }, req);
       duCache.clear();
       audit(req, scope, 'panel.files.rename', { from: src.rel, to: dst.rel, overwrite });
       return { from: src.rel, to: dst.rel };
@@ -315,7 +318,7 @@ export function createPanelFilesService(ctx) {
       const dst = resolve(scope, to);
       if (src.rel === '.' || dst.rel === '.') throw unprocessable('Request validation failed', { from: ['The home directory itself cannot be copied'] });
       guardSsh(scope, dst, req);
-      await op(scope, 'files.copy', { username: scope.username, from: src.abs, to: dst.abs }, req, 600_000 + LONG_OP_GRACE_MS);
+      await op(scope, 'files.copy', { username: scope.username, from: src.abs, to: dst.abs, ...protect(scope, req) }, req, 600_000 + LONG_OP_GRACE_MS);
       duCache.clear();
       audit(req, scope, 'panel.files.copy', { from: src.rel, to: dst.rel });
       return { from: src.rel, to: dst.rel };
@@ -325,7 +328,7 @@ export function createPanelFilesService(ctx) {
       gate(scope);
       const target = resolve(scope, p);
       guardSsh(scope, target, req);
-      await op(scope, 'files.chmod', { username: scope.username, path: target.abs, mode, recursive }, req, 600_000 + LONG_OP_GRACE_MS);
+      await op(scope, 'files.chmod', { username: scope.username, path: target.abs, mode, recursive, ...protect(scope, req) }, req, 600_000 + LONG_OP_GRACE_MS);
       audit(req, scope, 'panel.files.chmod', { path: target.rel, mode, recursive });
       return { path: target.rel, mode, recursive };
     },
@@ -335,7 +338,7 @@ export function createPanelFilesService(ctx) {
       const targets = paths.map((p) => resolve(scope, p));
       if (targets.some((t) => t.rel === '.')) throw unprocessable('Request validation failed', { paths: ['The home directory itself cannot be deleted'] });
       for (const t of targets) guardSsh(scope, t, req);
-      const r = await op(scope, 'files.remove', { username: scope.username, paths: targets.map((t) => t.abs) }, req, 600_000 + LONG_OP_GRACE_MS);
+      const r = await op(scope, 'files.remove', { username: scope.username, paths: targets.map((t) => t.abs), ...protect(scope, req) }, req, 600_000 + LONG_OP_GRACE_MS);
       duCache.clear();
       audit(req, scope, 'panel.files.remove', { paths: targets.map((t) => t.rel) });
       return { removed: r.removed ?? targets.map((t) => t.rel) };
@@ -395,7 +398,7 @@ export function createPanelFilesService(ctx) {
       if (same) return { job: { id: same.id, type: same.type, status: same.status }, reused: true };
       const existing = await op(scope, 'files.stat', { username: scope.username, path: out.abs }, req);
       if (existing.exists) throw new HttpError(409, 'exists', `${out.rel} already exists`);
-      const job = jobs.enqueue(JOB_ARCHIVE, { accountId: scope.accountId, username: scope.username, dest: out.rel, paths: members.map((m) => m.rel), format, op: { username: scope.username, paths: members.map((m) => m.abs), dest: out.abs, format } }, { userId: req?.user?.id ?? null });
+      const job = jobs.enqueue(JOB_ARCHIVE, { accountId: scope.accountId, username: scope.username, dest: out.rel, paths: members.map((m) => m.rel), format, op: { username: scope.username, paths: members.map((m) => m.abs), dest: out.abs, format, ...protect(scope, req) } }, { userId: req?.user?.id ?? null });
       audit(req, scope, 'panel.files.archive', { dest: out.rel, paths: members.length, format, jobId: job.id });
       return { job: { id: job.id, type: job.type, status: job.status }, reused: false };
     },

@@ -124,6 +124,43 @@ describe('Customer panel: domains', () => {
       expect(names()).not.toContain('dns.zone.write');
     });
 
+    it('refuses a hostname inside another account\'s zone or under another account\'s domain (no DNS/web/mail hijack)', async () => {
+      setPlan(app, 'bob', { max_addons: 5, max_parked: 5 });
+      setPlan(app, 'alice', { max_addons: 5, max_parked: 5 });
+      for (const domain of ['www.alice.com', 'mail.alice.com', 'deep.sub.alice.com']) {
+        const res = await bob.post('/domains/addon', { domain: 'x.shop.example' });
+        expect(res.status, 'x.shop.example').toBe(409);
+        const addon = await bob.post('/domains/addon', { domain });
+        expect(addon.status, domain).toBe(409);
+        expect(addon.body.error.code).toBe('exists');
+      }
+      // alice holds the zone shop.example (addon) and bob.com is bob's main domain: bob may not host under alice's, alice not under bob's.
+      expect((await alice.post('/domains/addon', { domain: 'www.bob.com' })).status).toBe(409);
+      expect((await alice.post('/domains/parked', { domain: 'mail.bob.com' })).body.error.code).toBe('exists');
+      expect((await bob.post('/domains/parked', { domain: 'cdn.shop.example' })).body.error.code).toBe('exists');
+      // The owner of the namespace may still add names inside it.
+      const own = await alice.post('/domains/addon', { domain: 'www.shop.example' });
+      expect(own.status, JSON.stringify(own.body)).toBe(201);
+      await alice.del('/domains/addon/www.shop.example?removeZone=true').expect(200);
+      db().prepare("DELETE FROM audit_log WHERE args_redacted LIKE '%www.shop.example%'").run();
+      expect(names().filter((n) => n === 'dns.zone.write')).toHaveLength(1);
+      expect(row('SELECT 1 AS x FROM account_domains WHERE domain LIKE ? OR domain LIKE ?', '%.bob.com', '%.alice.com')).toBeUndefined();
+      expect(row('SELECT 1 AS x FROM dns_zones WHERE domain IN (?, ?, ?, ?)', 'www.bob.com', 'mail.bob.com', 'www.alice.com', 'mail.alice.com')).toBeUndefined();
+      expect(row('SELECT 1 AS x FROM mail_domains WHERE domain LIKE ? OR domain LIKE ?', '%.bob.com', '%.alice.com')).toBeUndefined();
+      // The WHM delegate refuses the same for a non-root principal.
+      const resellerUser = { id: 999, username: 'resell-x', role: 'reseller' };
+      await expect(app.ctx.dns.ensureZoneForDomain('ftp.bob.com', { accountId: row('SELECT id FROM accounts WHERE username = ?', 'alice').id }, { user: resellerUser })).rejects.toMatchObject({ status: 409 });
+    });
+
+    it('explains a web server that is not installed in plain words', async () => {
+      const res = await alice.post('/domains/addon', { domain: 'copy.example' });
+      expect(res.status, JSON.stringify(res.body)).toBe(201);
+      expect(res.body.data.web).toMatchObject({ applied: false, reason: 'capability_missing' });
+      expect(res.body.meta.warnings).toContain('The web server is not installed on this server yet; the site is served as soon as it is.');
+      expect(res.body.meta.warnings.join(' ')).not.toMatch(/capability_missing|php_missing|php_pool_failed/);
+      await alice.del('/domains/addon/copy.example?removeZone=true').expect(200);
+    });
+
     it('pins the document root under the home', async () => {
       for (const docroot of ['../etc', '/etc/passwd', '-rf', 'a/../../b', 'x\0y']) {
         const res = await alice.post('/domains/addon', { domain: 'pin.example', docroot });

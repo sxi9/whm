@@ -445,6 +445,18 @@ export function createPanelService(ctx) {
     const row = stmts.accountById.get(link.account_id);
     if (!row) return null;
     const s = buildScope({ user }, row, 'user', null);
+    // The gates of routes/categories/panel.js (panelScope) and of the panel's
+    // own password route, which this seam bypasses: a demo account's shared
+    // credentials never change, a suspended account changes nothing, the
+    // package may withhold password changes, and the 2FA policy holds; only
+    // core's forced change (must_change_password) gets through the last two.
+    if (s.account.demo_mode) throw new HttpError(403, 'demo_mode', 'This account is in demo mode; changes are not saved');
+    if (s.account.suspended) throw new HttpError(423, 'account_suspended', 'This account is suspended');
+    const forced = Boolean(force) && Boolean(user.must_change_password);
+    if (!forced) {
+      if (s.features?.passwordchange === false) throw new HttpError(403, 'feature_disabled', 'Your hosting package does not include password changes');
+      if (settings.get('panel.require_2fa_for_users') && !user.totp_enabled) throw new HttpError(403, 'two_factor_required', 'Two-factor authentication is required for your account. Set it up to continue.');
+    }
     return changePassword(s, { currentPassword, newPassword, force }, req);
   }
 

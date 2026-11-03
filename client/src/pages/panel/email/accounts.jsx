@@ -168,7 +168,9 @@ export default function EmailAccounts({ fn }) {
 
   const used = meta?.used ?? (data?.length || 0);
   const limit = meta?.limits?.max_email;
-  const atLimit = limit != null && limit > 0 && used >= limit;
+  // Server convention (assertLimit): null is unlimited, 0 means the plan has no mailboxes.
+  const notIncluded = limit === 0;
+  const atLimit = limit != null && used >= limit;
   const defaultQuotaMb = meta?.defaultQuotaMb ?? 1024;
 
   const open = (kind, row = null) => { setMutationError(null); setDialog({ kind, row }); };
@@ -218,19 +220,21 @@ export default function EmailAccounts({ fn }) {
   const featureOff = error && error.status === 403 && error.code === 'feature_disabled';
 
   return (
-    <PanelPage fn={fn} actions={!featureOff && <Button variant="primary" icon={Plus} onClick={() => open('create')} disabled={atLimit || !domains.length} title={atLimit ? 'Your plan limit for mailboxes is reached' : undefined}>Create mailbox</Button>}>
+    <PanelPage fn={fn} actions={!featureOff && <Button variant="primary" icon={Plus} onClick={() => open('create')} disabled={atLimit || !domains.length} title={notIncluded ? 'Mailboxes are not included in your plan' : atLimit ? 'Your plan limit for mailboxes is reached' : undefined}>Create mailbox</Button>}>
       {featureOff ? <PanelRequestError error={error} fn={fn} /> : (
         <>
           <div className="stat-grid" style={{ marginBottom: 18 }}>
             <div className="stat">
               <div className="label">Mailboxes</div>
-              <div className="value">{limit != null && limit > 0 ? `${used} of ${limit}` : `${used}`}</div>
-              <div className={`meter ${meterTone(percentOf(used, limit))}`} aria-hidden={limit == null || limit <= 0}><span style={{ width: `${percentOf(used, limit) ?? 0}%` }} /></div>
+              <div className="value">{notIncluded ? 'Not included in your plan' : limit != null ? `${used} of ${limit}` : `${used}`}</div>
+              <div className={`meter ${meterTone(percentOf(used, limit))}`} aria-hidden={limit == null || notIncluded}><span style={{ width: `${percentOf(used, limit) ?? 0}%` }} /></div>
             </div>
             <div className="stat"><div className="label">Domains with mail</div><div className="value">{domains.length}</div></div>
             <div className="stat"><div className="label">Default quota</div><div className="value">{quotaText(defaultQuotaMb)}</div></div>
           </div>
-          {atLimit && <div className="banner banner-warning"><Mail size={18} /><div><strong>Plan limit reached</strong><p>Your plan allows {limit} mailbox{limit === 1 ? '' : 'es'}. Delete one you no longer need, or ask your hosting provider about a larger plan.</p></div></div>}
+          {atLimit && (notIncluded
+            ? <div className="banner banner-warning"><Mail size={18} /><div><strong>Mailboxes are not included in your plan</strong><p>Ask your hosting provider about a plan that includes them.</p></div></div>
+            : <div className="banner banner-warning"><Mail size={18} /><div><strong>Plan limit reached</strong><p>Your plan allows {limit} mailbox{limit === 1 ? '' : 'es'}. Delete one you no longer need, or ask your hosting provider about a larger plan.</p></div></div>)}
           <Card padded={false}>
             <PanelRequestError error={error} fn={fn} onRetry={refetch} />
             {!error && (

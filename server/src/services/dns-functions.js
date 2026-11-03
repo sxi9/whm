@@ -125,6 +125,26 @@ export function createDnsService(ctx) {
     return null;
   }
 
+  // The account that serves the zone containing `domain` or a domain above
+  // it, when it is not `accountId`: a non-root principal may not create a
+  // zone or park a name inside another account's namespace (www.victim.com).
+  function foreignParentOf(domain, accountId) {
+    const zone = zoneContaining(domain);
+    if (zone && zone.account_id !== accountId) return zone.domain;
+    const labels = domain.split('.');
+    for (let i = 1; i < labels.length - 1; i++) {
+      const parent = labels.slice(i).join('.');
+      const row = stmts.accountByDomain.get(parent) || stmts.accountByAnyDomain.get(parent);
+      if (row && row.id !== accountId) return parent;
+    }
+    return null;
+  }
+  function assertNotInsideForeign(domain, accountId, user) {
+    if (isRoot(user)) return;
+    const parent = foreignParentOf(domain, accountId);
+    if (parent) throw conflict(`${domain} is part of ${parent}, which is hosted by another account on this server`);
+  }
+
   function loadAccount(username, user) {
     const account = stmts.accountByUsername.get(username);
     if (!account) throw notFound('Account');
@@ -1032,6 +1052,7 @@ export function createDnsService(ctx) {
       const { domain, createZone = true } = input;
       const account = loadAccount(input.account, user);
       if (stmts.domainHosted.get(domain, domain)) throw conflict(`${domain} is already hosted on this server`);
+      assertNotInsideForeign(domain, account.id, user);
       if (createZone) assertPublishable();
       if (account.suspended) throw conflict('That account is suspended');
       const limit = json.parse(account.plan_snapshot_json, {}).max_parked;
@@ -1285,6 +1306,7 @@ export function createDnsService(ctx) {
         if (accountId && existing.account_id !== accountId) db.transaction(() => { bump(existing, { account_id: accountId }); })();
         return { ...shapeZone(stmts.zoneByDomain.get(domain)), created: false };
       }
+      if (accountId) assertNotInsideForeign(domain, accountId, req?.user);
       if (!bindAvailable() && strict()) return { domain, created: false, applied: false, reason: 'capability_missing' };
       return { ...(await createZoneInternal({ domain, ip, template: template || 'standard', accountId: accountId ?? accountForDomain(domain)?.id ?? null, nameservers }, req)), created: true };
     },

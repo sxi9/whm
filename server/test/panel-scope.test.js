@@ -416,6 +416,23 @@ describe('Customer panel scope', () => {
       await request(app.ctx.app).get('/api/panel/me').set('Authorization', `Bearer ${token}`).expect(401);
       expect(audit('panel.token.revoke', 'alice')).toHaveLength(1);
     });
+
+    it('a token may list tokens with panel:read but never revoke one; tokens without panel:read see nothing (§2.4)', async () => {
+      const alice = sessions.alice;
+      const victim = await alice.post('/api/panel/tokens', { name: 'victim', scopes: ['panel:files'] }).expect(201);
+      const reader = await alice.post('/api/panel/tokens', { name: 'reader-only', scopes: ['panel:read'] }).expect(201);
+      const bearer = (method, p, tok) => request(app.ctx.app)[method](p).set('Authorization', `Bearer ${tok}`);
+      expect((await bearer('get', '/api/panel/tokens', reader.body.data.token)).status).toBe(200);
+      const revoke = await bearer('delete', `/api/panel/tokens/${victim.body.data.id}`, reader.body.data.token);
+      expect(revoke.status).toBe(403);
+      expect(revoke.body.error.code).toBe('session_required');
+      expect(db().prepare("SELECT COUNT(*) AS n FROM api_tokens WHERE name = 'victim'").get().n).toBe(1);
+      expect((await bearer('get', '/api/panel/tokens', victim.body.data.token)).status).toBe(403);
+      expect((await bearer('get', `/api/panel/tokens/${reader.body.data.id}`, victim.body.data.token)).status).toBe(403);
+      expect((await bearer('post', '/api/panel/tokens', victim.body.data.token).send({ name: 'x' })).status).toBe(403);
+      await alice.del(`/api/panel/tokens/${victim.body.data.id}`).expect(200);
+      await alice.del(`/api/panel/tokens/${reader.body.data.id}`).expect(200);
+    });
   });
 
   describe('scope() service contract (§3.1)', () => {

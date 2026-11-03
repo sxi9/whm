@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
+import fs from 'node:fs';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { parseTarListing, foldChildren, archiveTop, archiveUser, buildArchiveName, freeArchiveName, tarExcludeArgs, parseCpUserFile, cpmoveMetadata, unsafeMembers, grantDatabase, signS3, s3Target, parseS3Listing, remoteUrl, destinationConfig, createDatabaseStatement } from '../src/ops/backup.js';
+import { parseTarListing, foldChildren, archiveTop, archiveUser, buildArchiveName, freeArchiveName, tarExcludeArgs, parseCpUserFile, cpmoveMetadata, unsafeMembers, restoreExcludeArgs, homedirMembers, grantDatabase, signS3, s3Target, parseS3Listing, remoteUrl, destinationConfig, createDatabaseStatement } from '../src/ops/backup.js';
 
 // exec is spied with the real implementation behind it so tests can prove an op
 // refused before any program ran. No test here archives, extracts, imports or
@@ -90,6 +91,7 @@ describe('backup schemas reject injection and traversal before anything runs', (
       expect(err.details.fields['paths.0']).toBeDefined();
     }
     expect((await opError(runOp('backup.files.restore', { ...base, username: 'root;x' }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('backup.files.restore', { ...base, excludeSshDir: 'yes' }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('backup.files.restore', { ...base, homeDir: '/etc' }, ctx))).code).toBe('path_not_allowed');
     expect((await opError(runOp('backup.files.restore', { ...base, archive: '/root/backup-10.26.2026_02-00-00_alice.tar.gz' }, ctx))).code).toBe('path_not_allowed');
     expect((await opError(runOp('backup.archive.extract', { archive: ARCHIVE, dest: '/root/x' }, ctx))).code).toBe('path_not_allowed');
@@ -242,6 +244,55 @@ describe('pure helpers', () => {
     expect(cpmoveMetadata('PLAN=gold\n', 'alice')).toBeNull();
     expect(cpmoveMetadata('DNS=not a domain\n', 'alice')).toBeNull();
     expect(cpmoveMetadata('DNS=alice.com\n', 'alice', { addons: 'bad domain=x\n', pds: '../etc\n' }).domains).toEqual([]);
+  });
+
+  it('keeps .ssh and every link out of a restore that may not write .ssh (excludeSshDir)', () => {
+    const entries = parseTarListing([
+      '-rw-r--r-- alice/alice 10 2026-10-26 02:00 cpmove-alice/homedir/public_html/index.html',
+      'lrwxrwxrwx alice/alice 0 2026-10-26 02:00 cpmove-alice/homedir/x -> .',
+      'lrwxrwxrwx alice/alice 0 2026-10-26 02:00 cpmove-alice/homedir/y -> x/.ssh',
+      '-rw------- alice/alice 100 2026-10-26 02:00 cpmove-alice/homedir/y/authorized_keys',
+      'hrw-r--r-- alice/alice 0 2026-10-26 02:00 cpmove-alice/homedir/k link to cpmove-alice/homedir/.ssh/authorized_keys',
+      '-rw------- alice/alice 100 2026-10-26 02:00 cpmove-alice/homedir/.ssh/authorized_keys',
+      'drwx------ alice/alice 0 2026-10-26 02:00 cpmove-alice/homedir/.ssh/',
+    ].join('\n'));
+    expect(entries.find((e) => e.name === 'cpmove-alice/homedir/k')).toMatchObject({ type: 'hardlink', target: 'cpmove-alice/homedir/.ssh/authorized_keys' });
+    expect(unsafeMembers(entries)).toEqual([]);
+    expect(unsafeMembers(entries, { excludeSshDir: true }).map((m) => [m.name, m.reason])).toEqual([
+      ['cpmove-alice/homedir/x', 'symbolic link (.ssh is protected for this restore)'],
+      ['cpmove-alice/homedir/y', 'symbolic link (.ssh is protected for this restore)'],
+      ['cpmove-alice/homedir/k', 'hard link (.ssh is protected for this restore)'],
+      ['cpmove-alice/homedir/.ssh/authorized_keys', '.ssh is managed by the SSH-key feature'],
+      ['cpmove-alice/homedir/.ssh', '.ssh is managed by the SSH-key feature'],
+    ]);
+    expect(homedirMembers(entries, 'cpmove-alice')).toEqual([
+      { type: 'file', name: 'public_html/index.html', target: null },
+      { type: 'symlink', name: 'x', target: '.' },
+      { type: 'symlink', name: 'y', target: 'x/.ssh' },
+      { type: 'file', name: 'y/authorized_keys', target: null },
+      { type: 'hardlink', name: 'k', target: '.ssh/authorized_keys' },
+      { type: 'file', name: '.ssh/authorized_keys', target: null },
+      { type: 'dir', name: '.ssh', target: null },
+    ]);
+    expect(restoreExcludeArgs('cpmove-alice')).toEqual(['--anchored', '--exclude=cpmove-alice/homedir/.ssh', '--exclude=cpmove-alice/homedir/.ssh/*']);
+    const src = fs.readFileSync(new URL('../src/ops/backup.js', import.meta.url), 'utf8');
+    const run = src.slice(src.indexOf("defineOp('backup.files.restore'"));
+    for (const step of ['unsafeMembers(entries, { excludeSshDir })', 'checkArchiveMembers(homedirMembers(entries, top)', 'sshFingerprint(home)', 'restoreExcludeArgs(top)']) expect(run.indexOf(step), step).toBeGreaterThan(-1);
+    expect(run.indexOf('checkArchiveMembers(')).toBeLessThan(run.indexOf('extractMembers(file, home'));
+    expect(run.indexOf('sshChanges(')).toBeGreaterThan(run.indexOf('extractMembers(file, home'));
+  });
+
+  it('refuses a restore of .ssh (or the whole home) outright when excludeSshDir is set, before tar runs', async () => {
+    exec.mockClear();
+    hasBinary.mockImplementation((b) => b === 'tar' || b === 'setpriv');
+    try {
+      for (const paths of [['.ssh'], ['.ssh/authorized_keys'], ['public_html', '.ssh/'], ['.'], []]) {
+        const err = await opError(runOp('backup.files.restore', { archive: ARCHIVE, username: 'alice', homeDir: '/home/alice', paths, excludeSshDir: true }, ctx));
+        expect(err.code, JSON.stringify(paths)).toBe('refused');
+        expect(err.message).toMatch(/\.ssh is managed/);
+      }
+      expect(exec).not.toHaveBeenCalled();
+    } finally { hasBinary.mockRestore(); }
   });
 
   it('names the archive members a restore refuses: device nodes, absolute names and ".." segments', () => {

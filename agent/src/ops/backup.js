@@ -7,6 +7,8 @@ import readline from 'node:readline';
 import { z } from 'zod';
 import { exec, hasBinary, resolveBinary } from '../exec.js';
 import { defineOp, arg, OpError, ensurePrivateDir } from './registry.js';
+import { getent, asUser, SSH_DIR } from './as-user.js';
+import { checkArchiveMembers, diskLinkReader, sshFingerprint, sshChanges } from './files.js';
 import { renderClientCnf, classifyMysqlError, parseBatch, cloneUserStatements, parseGrant, q } from './db.js';
 import { createSqlCodeFilter, createClientCommandGuard, sqlModeRefusal, withImportUser, withClientDefaults, runSql } from './transfer.js';
 
@@ -171,12 +173,32 @@ export function cpmoveMetadata(cpText, username, { pds = '', addons = '', sds2 =
 // Members an archive may never carry into a home: device nodes, absolute
 // names and ".." segments. The panel's own archives have none; an imported
 // one is refused before tar extracts anything.
-export function unsafeMembers(entries) {
+export function unsafeMembers(entries, { excludeSshDir = false } = {}) {
   const out = [];
   for (const e of entries) {
     if (/^[bc]/.test(e.mode || '')) out.push({ name: e.name, reason: 'device node' });
     else if (e.name.startsWith('/')) out.push({ name: e.name, reason: 'absolute path' });
     else if (/(^|\/)\.\.(\/|$)/.test(e.name)) out.push({ name: e.name, reason: '".." segment' });
+    else if (excludeSshDir && (e.type === 'link' || e.type === 'hardlink')) out.push({ name: e.name, reason: `${e.type === 'link' ? 'symbolic' : 'hard'} link (${SSH_DIR} is protected for this restore)` });
+    else if (excludeSshDir && /(^|\/)homedir\/\.ssh(\/|$)/.test(e.name)) out.push({ name: e.name, reason: `${SSH_DIR} is managed by the SSH-key feature` });
+  }
+  return out;
+}
+
+// tar exclusions that keep an archive's homedir/.ssh out of a restore (the
+// patterns are anchored at the member name's start; `*` spans slashes).
+export function restoreExcludeArgs(top) {
+  return ['--anchored', `--exclude=${top}/homedir/${SSH_DIR}`, `--exclude=${top}/homedir/${SSH_DIR}/*`];
+}
+
+// The homedir/ members of a restore listing in the shape files.js checks:
+// names relative to the home, links with their targets.
+export function homedirMembers(entries, top) {
+  const prefix = `${top}/homedir/`;
+  const out = [];
+  for (const e of entries) {
+    if (!e.name.startsWith(prefix)) continue;
+    out.push({ type: e.type === 'link' ? 'symlink' : e.type === 'hardlink' ? 'hardlink' : e.type, name: e.name.slice(prefix.length), target: e.type === 'hardlink' && e.target != null && e.target.startsWith(prefix) ? e.target.slice(prefix.length) : e.target });
   }
   return out;
 }
@@ -202,12 +224,13 @@ export function parseTarListing(stdout) {
   const out = [];
   for (const raw of stdout.split('\n')) {
     const line = raw.replace(/\r$/, '');
-    const m = line.match(/^([-dlcbps][-rwxsStT]{9})\s+(\S+)\s+(\d+(?:,\d+)?)\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?)\s+(.*)$/);
+    const m = line.match(/^([-dlhcbps][-rwxsStT]{9})\s+(\S+)\s+(\d+(?:,\d+)?)\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?)\s+(.*)$/);
     if (!m) continue;
     let name = m[5];
     let target = null;
-    const type = m[1][0] === 'd' ? 'dir' : m[1][0] === 'l' ? 'link' : m[1][0] === '-' ? 'file' : 'other';
+    const type = m[1][0] === 'd' ? 'dir' : m[1][0] === 'l' ? 'link' : m[1][0] === 'h' ? 'hardlink' : m[1][0] === '-' ? 'file' : 'other';
     if (type === 'link') { const i = name.indexOf(' -> '); if (i >= 0) { target = name.slice(i + 4); name = name.slice(0, i); } }
+    if (type === 'hardlink') { const i = name.lastIndexOf(' link to '); if (i >= 0) { target = name.slice(i + 9); name = name.slice(0, i); } }
     if (type === 'dir') name = name.replace(/\/$/, '');
     const [owner, group] = m[2].split('/');
     out.push({ name, type, mode: m[1], owner, group, size: m[3].includes(',') ? 0 : Number(m[3]), mtime: m[4], target });
@@ -482,8 +505,8 @@ defineOp('backup.archive.inspect', {
 // account planted (public_html -> /etc) cannot turn a restore into a root file
 // write, whatever tar version the host has. The root-only archive stays
 // readable through an ambient CAP_DAC_READ_SEARCH, which grants no write access.
-async function extractMembers(file, destDir, members, { strip, overwrite = true, as = null }) {
-  const argv = ['--extract', '--file', file, '-C', destDir, '--no-same-owner', `--strip-components=${strip}`, '--warning=no-unknown-keyword'];
+async function extractMembers(file, destDir, members, { strip, overwrite = true, as = null, exclude = [] }) {
+  const argv = ['--extract', '--file', file, '-C', destDir, '--no-same-owner', `--strip-components=${strip}`, '--warning=no-unknown-keyword', ...exclude];
   if (as) argv.push('--preserve-permissions');
   if (!overwrite) argv.push('--skip-old-files');
   argv.push('--', ...members);
@@ -535,26 +558,42 @@ defineOp('backup.archive.extract', {
 });
 
 defineOp('backup.files.restore', {
-  description: 'Restore paths from an archive homedir/ into an account home, extracting as the account user (whole home when paths is empty)',
+  description: 'Restore paths from an archive homedir/ into an account home, extracting as the account user (whole home when paths is empty; excludeSshDir keeps .ssh and every link out of it)',
   destructive: true,
   timeoutMs: 7_200_000,
-  schema: z.object({ archive: archivePath, username: arg.username, homeDir: arg.absPath, paths: z.array(relPath).max(500).default([]), overwrite: z.boolean().default(true) }).strict(),
-  run: async ({ archive, username, homeDir, paths, overwrite }, ctx) => {
+  schema: z.object({ archive: archivePath, username: arg.username, homeDir: arg.absPath, paths: z.array(relPath).max(500).default([]), overwrite: z.boolean().default(true), excludeSshDir: z.boolean().default(false) }).strict(),
+  run: async ({ archive, username, homeDir, paths, overwrite, excludeSshDir }, ctx) => {
     requireTar();
     if (!hasBinary('setpriv')) throw new OpError('capability_missing', 'setpriv (util-linux) is not installed on this server; it is required to restore files with the account\'s privileges');
     const file = ctx.assertAllowedPath(archive, 'read');
     const home = ctx.assertAllowedPath(homeDir, 'write');
+    const rel = paths.map((p) => p.replace(/\/+$/, ''));
+    if (excludeSshDir && (!rel.length || rel.some((p) => p === '.' || p === SSH_DIR || p.startsWith(`${SSH_DIR}/`)))) throw new OpError('refused', `${SSH_DIR} is managed by the SSH-key feature and is not restored for this account; name the files or directories to restore`);
     const { uid, gid } = ownership(username);
     if (uid === 0) throw new OpError('refused', `Files are never restored for uid 0 (${username})`);
     if (!exists(file)) throw new OpError('not_found', `${archive} does not exist`);
     const top = archiveTop(file);
     if (!exists(home)) { fs.mkdirSync(home, { recursive: true, mode: 0o711 }); fs.chownSync(home, uid, gid); }
-    const rel = paths.map((p) => p.replace(/\/+$/, ''));
     const members = rel.length ? rel.map((p) => `${top}/homedir/${p}`) : [`${top}/homedir`];
     const listing = await exec('tar', ['--list', '--verbose', '--absolute-names', '--file', file, '--', ...members], { allowFailure: true, timeoutMs: 7_200_000, maxBuffer: 256 * 1024 * 1024 });
-    const unsafe = unsafeMembers(parseTarListing(listing.stdout));
+    const entries = parseTarListing(listing.stdout);
+    const unsafe = unsafeMembers(entries, { excludeSshDir });
     if (unsafe.length) throw new OpError('invalid_archive', `${path.basename(file)} carries members that are never restored: ${unsafe.slice(0, 5).map((m) => `${m.name} (${m.reason})`).join(', ')}${unsafe.length > 5 ? ', …' : ''}`, { unsafe: unsafe.slice(0, 50) });
-    const { missing, warnings } = await extractMembers(file, home, members, { strip: 2, overwrite, as: { uid, gid } });
+    // Links already in the home (a shell user's) could carry a member into
+    // .ssh; the members are resolved through them the way tar writes.
+    if (excludeSshDir) checkArchiveMembers(homedirMembers(entries, top), { home, dest: home, allowSshDir: false, readLink: diskLinkReader() });
+    const before = excludeSshDir ? sshFingerprint(home) : null;
+    const { missing, warnings } = await extractMembers(file, home, members, { strip: 2, overwrite, as: { uid, gid }, exclude: excludeSshDir ? restoreExcludeArgs(top) : [] });
+    if (before) {
+      const { remove, mode } = sshChanges(before, sshFingerprint(home));
+      if (remove.length || mode != null) {
+        const info = getent(username);
+        const dir = path.join(home, SSH_DIR);
+        if (info && remove.length) await asUser(info, 'rm', ['-rf', '--one-file-system', '--', ...remove.map((n) => (n === '.' ? dir : path.join(dir, n)))], { allowFailure: true, timeoutMs: 60_000 }).catch(() => {});
+        if (info && mode != null && !remove.includes('.')) await asUser(info, 'chmod', ['--', mode.padStart(4, '0'), dir], { allowFailure: true, timeoutMs: 30_000 }).catch(() => {});
+        throw new OpError('refused', `the archive changed ${SSH_DIR} while it was restored (${[...remove, ...(mode != null ? [`mode ${mode}`] : [])].join(', ')}); those changes were removed`);
+      }
+    }
     const restored = [];
     for (const p of rel.length ? rel : ['.']) {
       let st = null;

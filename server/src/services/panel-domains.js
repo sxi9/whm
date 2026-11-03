@@ -62,6 +62,9 @@ export function createPanelDomainsService(ctx) {
     hosted: db.prepare(`SELECT 1 FROM accounts WHERE domain = @domain
       UNION SELECT 1 FROM account_domains WHERE domain = @domain
       UNION SELECT 1 FROM dns_zones WHERE domain = @domain AND (account_id IS NULL OR account_id <> @accountId)`),
+    // A hostname of another account (main or any row): names under it are refused.
+    foreignDomain: db.prepare(`SELECT 1 FROM accounts WHERE domain = @domain AND id <> @accountId
+      UNION SELECT 1 FROM account_domains WHERE domain = @domain AND account_id <> @accountId`),
     insert: db.prepare('INSERT INTO account_domains (account_id, domain, type, docroot) VALUES (?, ?, ?, ?)'),
     remove: db.prepare('DELETE FROM account_domains WHERE id = ? AND account_id = ?'),
     zoneOf: db.prepare('SELECT id, domain, account_id FROM dns_zones WHERE domain = ? AND account_id = ?'),
@@ -103,11 +106,38 @@ export function createPanelDomainsService(ctx) {
     return { removed: true };
   }
 
+  // A hostname inside another account's zone or under another account's
+  // domain (www.victim.com) is that account's to serve: BIND would answer the
+  // more specific zone, Apache the new vhost and Exim the new mail route.
+  const foreignParent = (scope, domain) => {
+    const zone = typeof ctx.dns?.zoneFor === 'function' ? ctx.dns.zoneFor(domain) : null;
+    if (zone && zone.account_id !== scope.accountId) return zone.domain;
+    const labels = domain.split('.');
+    for (let i = 1; i < labels.length - 1; i += 1) {
+      const parent = labels.slice(i).join('.');
+      if (stmts.foreignDomain.get({ domain: parent, accountId: scope.accountId })) return parent;
+    }
+    return null;
+  };
+  function assertNotHosted(scope, domain) {
+    if (domain === scope.account.domain || stmts.hosted.get({ domain, accountId: scope.accountId })) throw new HttpError(409, 'exists', `${domain} is already hosted on this server`);
+    const parent = foreignParent(scope, domain);
+    if (parent) throw new HttpError(409, 'exists', `${domain} is part of ${parent}, which is hosted by another account on this server`);
+  }
+
+  // ctx.web.ensureVhost answers with reason codes; the customer reads sentences.
+  const WEB_REASONS = {
+    capability_missing: 'The web server is not installed on this server yet; the site is served as soon as it is.',
+    php_missing: 'PHP is not installed; the site is served without PHP until it is.',
+    php_pool_failed: 'The PHP pool for this site could not be started; ask your hosting provider.',
+  };
+  const webReason = (code) => WEB_REASONS[code] || 'The web server has not applied the change yet; it is retried automatically.';
+
   async function syncWeb(scope, req, warnings) {
     if (typeof ctx.web?.ensureVhost !== 'function') { warnings.push('The web server category is not loaded; the vhost is written once it is'); return { applied: false, reason: 'web_unavailable' }; }
     try {
       const r = await ctx.web.ensureVhost(scope.username, req);
-      if (!r.applied && r.reason) warnings.push(`Web server: ${r.reason}`);
+      if (!r.applied && r.reason) warnings.push(webReason(r.reason));
       return { applied: Boolean(r.applied), reason: r.reason ?? null };
     } catch (err) {
       logger.warn({ err, username: scope.username }, 'panel: vhost sync failed');
@@ -198,7 +228,7 @@ export function createPanelDomainsService(ctx) {
     async addAddon(scope, { domain, docroot: rel, createZone = true }, req) {
       assertFeature(scope, 'addondomains');
       assertLimit(scope, 'max_addons', stmts.countType.get(scope.accountId, 'addon').n, 'addon domain(s)');
-      if (domain === scope.account.domain || stmts.hosted.get({ domain, accountId: scope.accountId })) throw new HttpError(409, 'exists', `${domain} is already hosted on this server`);
+      assertNotHosted(scope, domain);
       const docroot = resolveDocroot(ctx, scope.account, rel || domain);
       const warnings = [];
       let zone = null;
@@ -286,7 +316,7 @@ export function createPanelDomainsService(ctx) {
     async addParked(scope, { domain, createZone = true }, req) {
       assertFeature(scope, 'parkeddomains');
       assertLimit(scope, 'max_parked', stmts.countParked.get(scope.accountId).n, 'parked domain(s)');
-      if (domain === scope.account.domain || stmts.hosted.get({ domain, accountId: scope.accountId })) throw new HttpError(409, 'exists', `${domain} is already hosted on this server`);
+      assertNotHosted(scope, domain);
       if (typeof ctx.dns?.parkDomain !== 'function') throw new HttpError(503, 'service_unavailable', 'The DNS category is not loaded');
       const result = await ctx.dns.parkDomain({ domain, account: scope.username, createZone }, scope.ownerPrincipal, req);
       audit(req, { action: 'panel.domains.parked.add', target: scope.username, args: auditArgs(scope, { domain, createZone, web: result.web }) });

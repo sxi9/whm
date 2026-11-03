@@ -95,6 +95,11 @@ async function logout(page) {
     await page.waitForSelector('.page-header h1', { timeout: 15000 });
     const h1 = (await page.textContent('.page-header h1')).trim();
     if (!h1) errors.push(`${fn.path}: empty title`);
+    // The placeholder PanelFunctionPage renders the same header: a missing or
+    // misnamed page file under pages/panel/<group>/ must not pass as "visited".
+    const body = (await page.textContent('main')) || '';
+    if (body.includes('This screen is on its way')) errors.push(`${fn.path}: placeholder rendered (no page registered)`);
+    if (await page.$('.panel-disabled')) errors.push(`${fn.path}: panel disabled state rendered`);
     visited += 1;
   }
   note('visited panel function pages:', visited, 'of', PANEL_FUNCTIONS.length);

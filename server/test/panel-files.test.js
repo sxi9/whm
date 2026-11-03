@@ -216,7 +216,7 @@ describe('Panel files API', () => {
       expect(bin.body.error.code).toBe('binary');
       const w = await put('/write', { path: 'public_html/new.txt', content: 'hello', mode: '0600' });
       expect(w.status).toBe(200);
-      expect(app.agent.callsTo('files.write')[0].args).toEqual({ username: 'alice', path: '/home/alice/public_html/new.txt', content: 'hello', mode: '0600' });
+      expect(app.agent.callsTo('files.write')[0].args).toEqual({ username: 'alice', path: '/home/alice/public_html/new.txt', content: 'hello', mode: '0600', protectSshDir: true });
       expect(lastAudit('panel.files.write')).toMatchObject({ principal: 'alice', role: 'user', target: 'alice' });
       expect(JSON.parse(lastAudit('panel.files.write').args_redacted)).toMatchObject({ path: 'public_html/new.txt', bytes: 5 });
       expect((await put('/write', { path: 'x', content: 'y', mode: '0778' })).status).toBe(422);
@@ -224,15 +224,15 @@ describe('Panel files API', () => {
 
     it('creates, renames, copies, chmods and deletes with the agent receiving absolute paths only', async () => {
       expect((await post('/mkdir', { path: 'public_html/img' })).status).toBe(201);
-      expect(app.agent.callsTo('files.mkdir')[0].args).toEqual({ username: 'alice', path: '/home/alice/public_html/img', mode: '0755' });
+      expect(app.agent.callsTo('files.mkdir')[0].args).toEqual({ username: 'alice', path: '/home/alice/public_html/img', mode: '0755', protectSshDir: true });
       expect((await post('/rename', { from: 'public_html/new.txt', to: 'public_html/img/new.txt' })).status).toBe(200);
-      expect(app.agent.callsTo('files.move')[0].args).toEqual({ username: 'alice', from: '/home/alice/public_html/new.txt', to: '/home/alice/public_html/img/new.txt', overwrite: false });
+      expect(app.agent.callsTo('files.move')[0].args).toEqual({ username: 'alice', from: '/home/alice/public_html/new.txt', to: '/home/alice/public_html/img/new.txt', overwrite: false, protectSshDir: true });
       expect((await post('/copy', { from: 'notes.txt', to: 'notes2.txt' })).status).toBe(200);
       expect((await post('/chmod', { path: 'notes2.txt', mode: '0600', recursive: true })).status).toBe(200);
-      expect(app.agent.callsTo('files.chmod')[0].args).toEqual({ username: 'alice', path: '/home/alice/notes2.txt', mode: '0600', recursive: true });
+      expect(app.agent.callsTo('files.chmod')[0].args).toEqual({ username: 'alice', path: '/home/alice/notes2.txt', mode: '0600', recursive: true, protectSshDir: true });
       const rm = await del('', { paths: ['notes2.txt', 'public_html/img'] });
       expect(rm.status).toBe(200);
-      expect(app.agent.callsTo('files.remove')[0].args).toEqual({ username: 'alice', paths: ['/home/alice/notes2.txt', '/home/alice/public_html/img'] });
+      expect(app.agent.callsTo('files.remove')[0].args).toEqual({ username: 'alice', paths: ['/home/alice/notes2.txt', '/home/alice/public_html/img'], protectSshDir: true });
       expect(JSON.parse(lastAudit('panel.files.remove').args_redacted).paths).toEqual(['notes2.txt', 'public_html/img']);
       // The home itself is never a target.
       expect((await del('', { paths: ['.'] })).status).toBe(422);
@@ -307,7 +307,7 @@ describe('Panel files API', () => {
       expect(fin.status).toBe(422);
       const abort = await post(`/uploads/${b.body.data.id}/abort`);
       expect(abort.body.data.aborted).toBe(true);
-      expect(app.agent.callsTo('files.remove').at(-1).args).toEqual({ username: 'alice', paths: ['/home/alice/half.txt'] });
+      expect(app.agent.callsTo('files.remove').at(-1).args).toEqual({ username: 'alice', paths: ['/home/alice/half.txt'], protectSshDir: true });
       expect(lastAudit('panel.files.upload_abort')).toMatchObject({ target: 'alice' });
     });
 
@@ -332,7 +332,7 @@ describe('Panel files API', () => {
       const job = await waitForJob(app.ctx, res.body.data.job.id);
       expect(job.status).toBe('done');
       expect(job.result).toMatchObject({ dest: 'backup.zip', members: 2 });
-      expect(app.agent.callsTo('files.archive')[0].args).toEqual({ username: 'alice', paths: ['/home/alice/public_html', '/home/alice/notes.txt'], dest: '/home/alice/backup.zip', format: 'zip' });
+      expect(app.agent.callsTo('files.archive')[0].args).toEqual({ username: 'alice', paths: ['/home/alice/public_html', '/home/alice/notes.txt'], dest: '/home/alice/backup.zip', format: 'zip', protectSshDir: true });
       expect(JSON.parse(lastAudit('panel.files.archive').args_redacted)).toMatchObject({ dest: 'backup.zip', paths: 2, format: 'zip' });
       expect((await post('/archive', { paths: ['notes.txt'], dest: 'backup.zip', format: 'zip' })).status).toBe(409);
       expect((await post('/archive', { paths: ['notes.txt'], dest: 'backup.zip', format: 'tar.gz' })).status).toBe(422);
@@ -409,6 +409,33 @@ describe('Panel files API', () => {
         expect((await put('/write', { path: '.ssh/config', content: 'Host y\n' })).body.error.code).toBe('ssh_managed');
         setPlan('alice', 'features.ssh', true);
       } finally { setPlan('alice', 'has_shell', false); setPlan('alice', 'features.ssh', true); }
+    });
+
+    it('tells the agent to refuse a write that really lands in .ssh through a link (protectSshDir) unless this request may write .ssh', async () => {
+      // 'lnk/.ssh/authorized_keys' passes the lexical gate; the agent resolves the
+      // real path and refuses it while protectSshDir is set.
+      fs.dir('/home/alice/lnk');
+      fs.file('/home/alice/scratch.txt', 'scratch');
+      expect((await put('/write', { path: 'lnk/.ssh/authorized_keys', content: 'ssh-ed25519 AAAA x\n', mode: '0600' })).status).toBe(200);
+      expect(app.agent.callsTo('files.write').at(-1).args).toMatchObject({ path: '/home/alice/lnk/.ssh/authorized_keys', protectSshDir: true });
+      const u = await post('/uploads', { path: 'lnk', name: 'keys', size: 3 });
+      expect(u.status).toBe(201);
+      await put(`/uploads/${u.body.data.id}/chunks`, { data: Buffer.from('abc').toString('base64') }).expect(200);
+      expect(app.agent.callsTo('files.chunk_write').at(-1).args).toMatchObject({ path: '/home/alice/lnk/keys', protectSshDir: true });
+      for (const [method, p, body] of [['post', '/mkdir', { path: 'lnk/.ssh' }], ['post', '/rename', { from: 'scratch.txt', to: 'lnk/k' }], ['post', '/copy', { from: 'lnk/k', to: 'lnk/k2' }], ['post', '/chmod', { path: 'lnk', mode: '0700' }], ['delete', '', { paths: ['lnk/k'] }], ['post', '/archive', { paths: ['lnk/k2'], dest: 'lnk/a.zip', format: 'zip' }]]) {
+        const res = await (method === 'delete' ? del(p, body) : post(p, body));
+        expect([200, 201, 202], `${method} ${p}`).toContain(res.status);
+      }
+      for (const name of ['files.mkdir', 'files.move', 'files.copy', 'files.chmod', 'files.remove']) expect(app.agent.callsTo(name).at(-1).args.protectSshDir, name).toBe(true);
+      await waitForJob(app.ctx, (await get('/jobs')).body.data[0].id);
+      expect(app.agent.callsTo('files.archive').at(-1).args.protectSshDir).toBe(true);
+      setPlan('alice', 'has_shell', true);
+      try {
+        expect((await put('/write', { path: 'lnk/.ssh/authorized_keys', content: 'ok\n' })).status).toBe(200);
+        expect(app.agent.callsTo('files.write').at(-1).args.protectSshDir).toBe(false);
+        expect((await post('/mkdir', { path: 'lnk/.ssh2' })).status).toBe(201);
+        expect(app.agent.callsTo('files.mkdir').at(-1).args.protectSshDir).toBe(false);
+      } finally { setPlan('alice', 'has_shell', false); }
     });
 
     it('is refused over an API token and while an admin acts as the account even when the plan allows ssh', async () => {

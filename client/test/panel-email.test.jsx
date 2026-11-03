@@ -91,6 +91,18 @@ describe('Email accounts', () => {
     expect(full).toMatch(/<button[^>]*disabled[^>]*>[^<]*<svg[\s\S]*?Create mailbox/);
   });
 
+  it('treats max_email 0 as "not included" and disables creation (assertLimit refuses at 0); null stays unlimited', () => {
+    const none = withFixtures({ '/email/accounts': { data: [], meta: { page: 1, pageSize: 25, total: 0, used: 0, limits: { max_email: 0 }, domains: ['demo.example.com'], defaultQuotaMb: 512 } } }, () => page(Accounts, 'accounts'));
+    expect(none).toContain('Mailboxes are not included in your plan');
+    expect(none).toContain('Not included in your plan');
+    expect(none).not.toContain('Plan limit reached');
+    expect(none).not.toContain('0 of 0');
+    expect(none).toMatch(/<button[^>]*disabled[^>]*>[^<]*<svg[\s\S]*?Create mailbox/);
+    const unlimited = withFixtures({ '/email/accounts': { data: mailboxes, meta: { page: 1, pageSize: 25, total: 2, used: 2, limits: { max_email: null }, domains: ['demo.example.com'], defaultQuotaMb: 512 } } }, () => page(Accounts, 'accounts'));
+    expect(unlimited).not.toContain('not included');
+    expect(unlimited).not.toMatch(/<button[^>]*disabled[^>]*>[^<]*<svg[\s\S]*?Create mailbox/);
+  });
+
   it('renders the 403 and 501 states', () => {
     const off = withFixtures({ '/email/accounts': { error: featureOff } }, () => page(Accounts, 'accounts'));
     expect(off).toContain('Not included in your plan');

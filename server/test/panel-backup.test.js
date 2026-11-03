@@ -252,6 +252,35 @@ describe('/api/panel/backups', () => {
     expect(app.ctx.db.prepare("SELECT 1 FROM audit_log WHERE action = 'panel.backup.download' AND target = 'alice'").get()).toBeTruthy();
   });
 
+  it('keeps .ssh out of a restore unless the request could write it directly (the file-manager gate)', async () => {
+    const row = app.ctx.db.prepare("SELECT id FROM backups WHERE account_name = 'alice' AND retention_class = 'panel' ORDER BY id DESC LIMIT 1").get();
+    // No shell access: .ssh (and the whole home, which contains it) cannot be named, over a session or a token.
+    for (const paths of [['.ssh/authorized_keys'], ['.ssh'], ['.ssh/'], ['public_html', '.ssh/id_ed25519'], ['.']]) {
+      const res = await post(`/${row.id}/restore`, { paths, overwrite: true });
+      expect(res.status, JSON.stringify(paths)).toBe(403);
+      expect(res.body.error.code).toBe('ssh_managed');
+    }
+    expect((await post(`/${row.id}/restore`, { paths: ['.ssh/authorized_keys'] }).set('X-Token-Scopes', 'panel:backups')).body.error.code).toBe('ssh_managed');
+    expect(app.agent.callsTo('backup.files.restore')).toHaveLength(0);
+    expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM backup_restores WHERE account_name = 'alice'").get().n).toBe(0);
+    // Shell access + ssh feature + session login: .ssh may be restored and the agent is told so.
+    setPlan(app, 'alice', (plan) => ({ ...plan, has_shell: true, features: { ...(plan.features || {}), ssh: true } }));
+    try {
+      const viaToken = await post(`/${row.id}/restore`, { paths: ['.ssh/authorized_keys'] }).set('X-Token-Scopes', 'panel:backups');
+      expect(viaToken.status).toBe(403);
+      const ok = await post(`/${row.id}/restore`, { paths: ['.ssh/authorized_keys'] }).expect(202);
+      const job = await waitForJob(app.ctx, ok.body.data.job.id);
+      expect(job.status, `${job.error}`).toBe('done');
+      expect(app.agent.callsTo('backup.files.restore').at(-1).args).toMatchObject({ username: 'alice', paths: ['.ssh/authorized_keys'], excludeSshDir: false });
+      const plain = await post(`/${row.id}/restore`, { paths: ['public_html'] }).set('X-Token-Scopes', 'panel:backups').expect(202);
+      await waitForJob(app.ctx, plain.body.data.job.id);
+      expect(app.agent.callsTo('backup.files.restore').at(-1).args).toMatchObject({ paths: ['public_html'], excludeSshDir: true });
+    } finally {
+      setPlan(app, 'alice', (plan) => ({ ...plan, has_shell: false }));
+      app.ctx.db.prepare("DELETE FROM backup_restores WHERE account_name = 'alice'").run();
+    }
+  });
+
   it('restores files only (never a whole account) with relative paths', async () => {
     const row = app.ctx.db.prepare("SELECT id FROM backups WHERE account_name = 'alice' AND retention_class = 'panel' ORDER BY id DESC LIMIT 1").get();
     for (const paths of [[], ['../etc'], ['/etc/passwd'], ['-rf'], ['a\nb']]) await post(`/${row.id}/restore`, { paths }).expect(422);
@@ -259,10 +288,10 @@ describe('/api/panel/backups', () => {
     const res = await post(`/${row.id}/restore`, { paths: ['public_html', 'mail/alice.com'], overwrite: true }).expect(202);
     const restore = app.ctx.db.prepare('SELECT * FROM backup_restores WHERE id = ?').get(res.body.data.restore.id);
     expect(restore).toMatchObject({ kind: 'files', account_name: 'alice', started_by: 'resell1' });
-    expect(JSON.parse(restore.options_json)).toEqual({ paths: ['public_html', 'mail/alice.com'], overwrite: true });
+    expect(JSON.parse(restore.options_json)).toEqual({ paths: ['public_html', 'mail/alice.com'], overwrite: true, excludeSshDir: true });
     const job = await waitForJob(app.ctx, res.body.data.job.id);
     expect(job.status, `${job.error} ${JSON.stringify(job.logs)}`).toBe('done');
-    expect(app.agent.callsTo('backup.files.restore')[0].args).toMatchObject({ username: 'alice', paths: ['public_html', 'mail/alice.com'] });
+    expect(app.agent.callsTo('backup.files.restore')[0].args).toMatchObject({ username: 'alice', paths: ['public_html', 'mail/alice.com'], excludeSshDir: true });
     const restores = await get('/restores').expect(200);
     expect(restores.body.data.map((r) => r.kind)).toEqual(['files']);
     expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM backup_restores WHERE kind = 'account'").get().n).toBe(0);

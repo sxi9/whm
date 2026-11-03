@@ -113,8 +113,10 @@ export default function FtpAccounts({ fn }) {
   const daemon = meta?.daemon || 'pure-ftpd';
   const suffix = loginSuffix(daemon, account);
   const quota = meta?.quota || { max: account?.plan?.max_ftp ?? null, used: me?.counts?.ftp ?? 0 };
-  const limitReached = quota.max != null && quota.max > 0 && quota.used >= quota.max;
-  const percent = quota.max > 0 ? percentOf(quota.used, quota.max) : null;
+  // Server convention (panel-ftp create): null is unlimited, 0 means the plan has no FTP accounts.
+  const notIncluded = quota.max === 0;
+  const limitReached = quota.max != null && quota.used >= quota.max;
+  const percent = quota.max == null || notIncluded ? null : percentOf(quota.used, quota.max);
   const quotasSupported = daemon === 'pure-ftpd';
   const rows = useMemo(() => filterAccounts(data || [], q), [data, q]);
   const home = homePrefix(account);
@@ -164,7 +166,7 @@ export default function FtpAccounts({ fn }) {
             ['Encryption', encryptionText(meta?.encryption)],
             ['Main login', <code key="m">{meta?.mainLogin || account?.username || '—'}</code>],
             ['Main password', 'Your account password'],
-            ['Extra logins', `${quota.used ?? 0}${quota.max > 0 ? ` of ${quota.max}` : ''}`],
+            ['Extra logins', `${quota.used ?? 0}${quota.max == null ? '' : notIncluded ? ' · not included in your plan' : ` of ${quota.max}`}`],
           ]} />
           {percent != null && <div className={`meter ${meterTone(percent)}`}><span style={{ width: `${percent}%` }} /></div>}
           {meta && meta.supported === false && (
@@ -179,7 +181,7 @@ export default function FtpAccounts({ fn }) {
           <Card title="Create an FTP account" subtitle="A login limited to one folder, for a designer, a developer or a device.">
             <PanelCapabilityState error={isCapabilityError(formError) ? formError : null} />
             <RequestError error={formError} />
-            {limitReached && <div className="banner banner-info"><Info size={18} /><div>Your plan allows {quota.max} FTP account{quota.max === 1 ? '' : 's'} and all of them exist. Delete one you no longer need or ask your hosting provider about a larger plan.</div></div>}
+            {limitReached && <div className="banner banner-info"><Info size={18} /><div>{notIncluded ? 'Your plan does not include FTP accounts. Ask your hosting provider about a plan that includes them.' : `Your plan allows ${quota.max} FTP account${quota.max === 1 ? '' : 's'} and all of them exist. Delete one you no longer need or ask your hosting provider about a larger plan.`}</div></div>}
             <Field label="Login" required error={formError?.fields?.login} help={form.login ? <>Signs in as <code>{form.login}{suffix}</code></> : 'Lowercase letters, digits, ".", "_" or "-"'} htmlFor="ftp-login">
               <SuffixedInput id="ftp-login" value={form.login} onChange={(v) => setForm((f) => ({ ...f, login: v }))} suffix={suffix} placeholder="designer" disabled={limitReached} />
             </Field>

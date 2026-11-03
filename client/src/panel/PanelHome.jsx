@@ -18,10 +18,11 @@ export function usageMeters(me, usage) {
   const u = me?.usage || {};
   const counts = usage?.counts || me?.counts || {};
   const limits = usage?.limits || me?.account?.limits || {};
-  const unlimited = (v) => v == null || v < 0 || v === 0;
+  // Server convention (assertLimit): null is unlimited, 0 means the plan does not include the object.
+  const unlimited = (v) => v == null;
   const row = (key, label, used, limit, format = (v) => (v == null ? '—' : String(v))) => ({
-    key, label, used, limit: unlimited(limit) ? null : limit, percent: unlimited(limit) ? null : percentOf(used, limit),
-    text: unlimited(limit) ? `${format(used)} · unlimited` : `${format(used)} of ${format(limit)}`,
+    key, label, used, limit: unlimited(limit) ? null : limit, percent: unlimited(limit) || limit === 0 ? null : percentOf(used, limit),
+    text: unlimited(limit) ? `${format(used)} · unlimited` : limit === 0 ? 'Not included in your plan' : `${format(used)} of ${format(limit)}`,
   });
   return [
     row('disk', 'Disk', usage?.disk?.usedMb ?? u.diskUsedMb ?? 0, usage?.disk?.quotaMb ?? u.diskQuotaMb, formatMb),
