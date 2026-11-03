@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { Info } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { Card, StatusPill, CapabilityNotice, formatDate } from '../../components/Common.jsx';
@@ -20,9 +21,9 @@ export function RequestError({ error, onRetry }) {
 
 export function Tabs({ tabs, value, onChange }) {
   return (
-    <div className="row-actions" role="tablist" style={{ marginBottom: 14, flexWrap: 'wrap' }}>
+    <div className="segmented" role="tablist" style={{ marginBottom: 14, flexWrap: 'wrap' }}>
       {tabs.map((t) => (
-        <button key={t.value} role="tab" aria-selected={value === t.value} className={`btn btn-sm ${value === t.value ? 'btn-primary' : ''}`} onClick={() => onChange(t.value)}>
+        <button key={t.value} type="button" role="tab" aria-selected={value === t.value} className={value === t.value ? 'active' : ''} onClick={() => onChange(t.value)}>
           {t.label}{t.count != null && <span className="pill pill-muted" style={{ marginLeft: 6 }}>{t.count}</span>}
         </button>
       ))}
@@ -109,7 +110,7 @@ export function Preview({ title = 'Generated configuration', text, path, note })
 
 export function Hints({ hints }) {
   if (!hints?.length) return null;
-  return <div className="banner banner-info"><div><strong>Manual step required on this layout</strong><ul>{hints.map((h) => <li key={h}><code>{h}</code></li>)}</ul></div></div>;
+  return <div className="banner banner-info"><Info size={18} /><div><strong>Manual step required on this layout</strong><ul>{hints.map((h) => <li key={h}><code>{h}</code></li>)}</ul></div></div>;
 }
 
 export function TriSelect({ label, help, value, onChange, options }) {
@@ -118,9 +119,9 @@ export function TriSelect({ label, help, value, onChange, options }) {
 
 export function ToggleList({ options, value = [], onChange }) {
   return (
-    <div className="row-actions" style={{ flexWrap: 'wrap', gap: 10 }}>
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px 28px' }}>
       {options.map((o) => (
-        <label key={o.value} className="radio" style={{ cursor: 'pointer' }}>
+        <label key={o.value} className="radio">
           <input type="checkbox" checked={value.includes(o.value)} onChange={() => onChange(value.includes(o.value) ? value.filter((x) => x !== o.value) : [...value, o.value])} />
           <span><strong>{o.label}</strong>{o.description && <small>{o.description}</small>}</span>
         </label>
@@ -148,6 +149,7 @@ export function DaemonSelector({ candidates, current, selected, onSelect, busy, 
   const chosen = candidates.find((c) => c.name === choice);
   const needsInstall = chosen && !chosen.unitName;
   const pm = (packageManager || 'apt-get').replace('-get', '');
+  const pkg = (c) => c.packages?.[pm] || c.packages?.apt;
   return (
     <div>
       <div className="radio-group">
@@ -155,8 +157,8 @@ export function DaemonSelector({ candidates, current, selected, onSelect, busy, 
           <label key={c.name} className="radio">
             <input type="radio" name="daemon" checked={choice === c.name} onChange={() => setChoice(c.name)} />
             <span>
-              <strong>{c.label} {c.unit?.active && <StatusPill status="active">running</StatusPill>} {!c.unit?.active && c.unitName && <StatusPill status="inactive">installed</StatusPill>} {!c.unitName && <StatusPill status="not-installed">not installed · package {c.packages?.[pm] || c.packages?.apt}</StatusPill>}</strong>
-              <small>{c.unitName ? `systemd unit ${c.unitName}${c.unit?.enabled ? ', starts at boot' : ''}` : 'Not present on this server'}</small>
+              <strong style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>{c.label} {c.unit?.active ? <StatusPill status="active">running</StatusPill> : c.unitName ? <StatusPill status="inactive">installed</StatusPill> : <StatusPill status="not-installed">not installed</StatusPill>}</strong>
+              <small>{c.unitName ? `systemd unit ${c.unitName}${c.unit?.enabled ? ', starts at boot' : ''}` : `Not present on this server; package ${pkg(c)}`}</small>
             </span>
           </label>
         ))}
@@ -166,11 +168,13 @@ export function DaemonSelector({ candidates, current, selected, onSelect, busy, 
         </label>
       </div>
       {needsInstall && (
-        <Field inline>
-          <label className="toggle"><input type="checkbox" checked={install} onChange={(e) => setInstall(e.target.checked)} disabled={!pkgAvailable} /><span className="toggle-track"><span className="toggle-thumb" /></span>
-            <span className="toggle-text"><span className="toggle-label">Install {chosen.label} first ({chosen.packages?.[pm] || chosen.packages?.apt})</span><span className="toggle-description">{pkgAvailable ? 'Queues a package-manager job; select again once it finishes.' : 'The Software category is not loaded; install the package manually.'}</span></span>
-          </label>
-        </Field>
+        <div style={{ marginTop: 16 }}>
+          <Field inline>
+            <label className="toggle"><input type="checkbox" checked={install} onChange={(e) => setInstall(e.target.checked)} disabled={!pkgAvailable} /><span className="toggle-track"><span className="toggle-thumb" /></span>
+              <span className="toggle-text"><span className="toggle-label">Install {chosen.label} first ({pkg(chosen)})</span><span className="toggle-description">{pkgAvailable ? 'Queues a package-manager job; select again once it finishes.' : 'The Software category is not loaded; install the package manually.'}</span></span>
+            </label>
+          </Field>
+        </div>
       )}
       <FormActions>
         <Button variant="primary" loading={busy} disabled={choice === (current || 'disabled') && !needsInstall} onClick={() => onSelect(choice, install)}>{needsInstall && install ? `Install and select ${chosen.label}` : choice === 'disabled' ? disabledLabel : `Use ${chosen?.label || choice}`}</Button>
@@ -190,5 +194,5 @@ export function JobCard({ jobId, title = 'Installation job', onFinished }) {
 
 export function StepList({ steps }) {
   if (!steps?.length) return null;
-  return <ul className="small">{steps.map((s, i) => <li key={i}><code>systemctl {s.action} {s.unit}</code> — {s.ok ? <StatusPill status="ok">ok</StatusPill> : <StatusPill status="failed">{s.error}</StatusPill>}</li>)}</ul>;
+  return <ul className="list-plain">{steps.map((s, i) => <li key={i} style={{ padding: '4px 0' }}><code>systemctl {s.action} {s.unit}</code> {s.ok ? <StatusPill status="ok">ok</StatusPill> : <StatusPill status="failed">{s.error}</StatusPill>}</li>)}</ul>;
 }

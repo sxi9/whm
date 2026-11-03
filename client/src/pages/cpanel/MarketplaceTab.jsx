@@ -14,6 +14,10 @@ import { LICENSE_PATH } from '../server-configuration/LicenseTab.jsx';
 import { ConsentModal, PermissionList, TrustNotice } from './ConsentModal.jsx';
 
 export const PROVIDER_PATH = '/market/market-provider-manager';
+
+function SectionTitle({ children }) {
+  return <h3 style={{ margin: '22px 0 10px' }}>{children}</h3>;
+}
 export const MANAGE_PLUGINS_PATH = '/cpanel/manage-plugins';
 
 // Catalog links come from the public, unsigned catalog: only https:// reaches an anchor.
@@ -32,7 +36,7 @@ export function MarketplaceDisabledNotice() {
     <div className="banner banner-info" data-testid="marketplace-disabled">
       <Store size={18} />
       <div>
-        <strong>The WHM marketplace hub is not enabled</strong>
+        <strong>The Keel marketplace hub is not enabled</strong>
         <p>Enable the <code>whm-hub</code> provider in <Link to={PROVIDER_PATH}>Market Provider Manager</Link> to browse and install plugins from the hub. The license key itself is entered under <Link to={LICENSE_PATH}>Basic Setup → License</Link>.</p>
       </div>
     </div>
@@ -95,28 +99,26 @@ function InstalledPill({ installed }) {
 function PluginCard({ entry, manage, onDetails, onInstall, onUpdate, onUninstall }) {
   const inst = entry.installed;
   return (
-    <section className="card" style={{ margin: 0 }} data-testid={`catalog-${entry.id}`}>
-      <div className="card-body">
-        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'flex-start' }}>
-          <div>
-            <h3 style={{ margin: 0 }}>{entry.name}</h3>
-            <small className="muted">{entry.developer?.display_name || 'unknown developer'}{entry.developer?.verified ? <span title="Verified developer"> <ShieldCheck size={12} /></span> : null}{entry.category?.name ? ` · ${entry.category.name}` : ''}</small>
-          </div>
-          <InstalledPill installed={inst} />
+    <article className="stat" style={{ display: 'flex', flexDirection: 'column', gap: 8 }} data-testid={`catalog-${entry.id}`}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'flex-start' }}>
+        <div>
+          <h3>{entry.name}</h3>
+          <div className="muted" style={{ display: 'flex', alignItems: 'center', gap: 4 }}>{entry.developer?.display_name || 'unknown developer'}{entry.developer?.verified ? <span title="Verified developer"><ShieldCheck size={13} /></span> : null}{entry.category?.name ? ` · ${entry.category.name}` : ''}</div>
         </div>
-        <p style={{ margin: '8px 0' }}>{entry.summary}</p>
-        <div className="muted" style={{ fontSize: 12 }}>
-          {priceLabel(entry.pricing)} · v{entry.latest?.version || '—'} · {entry.install_count ?? 0} installs{entry.rating_count ? ` · ${Number(entry.rating_avg).toFixed(1)} ★ (${entry.rating_count})` : ''}
-        </div>
-        <div className="row-actions" style={{ marginTop: 10, flexWrap: 'wrap' }}>
-          <Button size="sm" onClick={() => onDetails(entry)}>Details</Button>
-          {manage && !inst && <Button size="sm" variant="primary" icon={Download} onClick={() => onInstall(entry)}>Install</Button>}
-          {manage && inst?.marketplace && inst.update && <Button size="sm" variant="primary" icon={RefreshCw} onClick={() => onUpdate(entry)}>Update to {inst.update.latest}</Button>}
-          {manage && inst?.marketplace && <Button size="sm" onClick={() => onUninstall(entry)}>Uninstall</Button>}
-          {inst && !inst.marketplace && <Link className="btn btn-sm" to={MANAGE_PLUGINS_PATH}>{inst.source === 'bundled' ? 'Bundled' : 'Sideloaded'}</Link>}
-        </div>
+        <InstalledPill installed={inst} />
       </div>
-    </section>
+      <p style={{ margin: 0, flex: 1 }}>{entry.summary}</p>
+      <div className="muted">
+        {priceLabel(entry.pricing)} · v{entry.latest?.version || '—'} · {entry.install_count ?? 0} installs{entry.rating_count ? ` · ${Number(entry.rating_avg).toFixed(1)} ★ (${entry.rating_count})` : ''}
+      </div>
+      <div className="row-actions" style={{ justifyContent: 'flex-start', flexWrap: 'wrap', gap: 6 }}>
+        <Button size="sm" onClick={() => onDetails(entry)}>Details</Button>
+        {manage && !inst && <Button size="sm" variant="primary" icon={Download} onClick={() => onInstall(entry)}>Install</Button>}
+        {manage && inst?.marketplace && inst.update && <Button size="sm" variant="primary" icon={RefreshCw} onClick={() => onUpdate(entry)}>Update to {inst.update.latest}</Button>}
+        {manage && inst?.marketplace && <Button size="sm" onClick={() => onUninstall(entry)}>Uninstall</Button>}
+        {inst && !inst.marketplace && <Link className="btn btn-sm" to={MANAGE_PLUGINS_PATH}>{inst.source === 'bundled' ? 'Bundled' : 'Sideloaded'}</Link>}
+      </div>
+    </article>
   );
 }
 
@@ -132,10 +134,10 @@ function InstallModal({ entry, detail, loading, onClose, onConfirm, busy }) {
       {loading && !detail ? <Loading /> : (
         <>
           <p>{entry?.summary}</p>
-          <KeyValue items={[['Developer', `${detail?.developer?.display_name || entry?.developer?.display_name || '—'}${detail?.developer?.verified ? ' (verified)' : ''}`], ['Price', priceLabel(detail?.pricing || entry?.pricing)], ['Requires WHM', detail?.compatibility?.engines_whm || entry?.latest?.engines_whm || '—'], ['Signed by', 'the marketplace signing key pinned from your license activation']]} />
-          <h3>Permissions requested</h3>
+          <KeyValue items={[['Developer', `${detail?.developer?.display_name || entry?.developer?.display_name || '—'}${detail?.developer?.verified ? ' (verified)' : ''}`], ['Price', priceLabel(detail?.pricing || entry?.pricing)], ['Requires host API', detail?.compatibility?.engines_whm || entry?.latest?.engines_whm || '—'], ['Signed by', 'the marketplace signing key pinned from your license activation']]} />
+          <SectionTitle>Permissions requested</SectionTitle>
           <PermissionList scopes={scopes} justifications={justifications} />
-          <TrustNotice />
+          <div style={{ marginTop: 14 }}><TrustNotice /></div>
         </>
       )}
     </Modal>
@@ -195,17 +197,17 @@ export function PluginDetailDrawer({ id, manage, onClose, onInstall, onUpdate, o
         ['Links', <ExternalLinks key="l" links={[['Homepage', data.homepage], ['Support', data.support_url]]} />],
       ]} />
       {manage && (
-        <div className="row-actions" style={{ marginTop: 10, flexWrap: 'wrap' }}>
+        <div className="row-actions" style={{ marginTop: 14, justifyContent: 'flex-start', flexWrap: 'wrap', gap: 6 }}>
           {!inst && <Button variant="primary" icon={Download} onClick={() => onInstall(data)} disabled={data.compatibility?.compatible === false}>Install</Button>}
           {inst?.marketplace && inst.update && <Button variant="primary" icon={RefreshCw} onClick={() => onUpdate(data)}>Update to {inst.update.latest}</Button>}
           {inst?.marketplace && <Button onClick={() => onUninstall(data, false)}>Uninstall (keep data)</Button>}
           {inst?.marketplace && <Button variant="danger" onClick={() => onUninstall(data, true)}>Uninstall and purge</Button>}
         </div>
       )}
-      {data.description_md && <div className="markdown" style={{ marginTop: 12 }}>{renderMarkdown(data.description_md)}</div>}
-      <h3>Permissions</h3>
+      {data.description_md && <div className="markdown" style={{ marginTop: 16 }}>{renderMarkdown(data.description_md)}</div>}
+      <SectionTitle>Permissions</SectionTitle>
       <PermissionList scopes={scopes} justifications={justifications} />
-      <h3>Versions</h3>
+      <SectionTitle>Versions</SectionTitle>
       {versions.length === 0 ? <p className="muted">No published versions.</p> : (
         <div className="table-wrap">
           <table>
@@ -216,22 +218,22 @@ export function PluginDetailDrawer({ id, manage, onClose, onInstall, onUpdate, o
       )}
       {data.changelog?.length > 0 && (
         <>
-          <h3>Changelog</h3>
-          {data.changelog.filter((c) => c.changelog_md).slice(0, 5).map((c) => <div key={c.version} className="markdown"><strong>{c.version}</strong>{renderMarkdown(c.changelog_md)}</div>)}
+          <SectionTitle>Changelog</SectionTitle>
+          {data.changelog.filter((c) => c.changelog_md).slice(0, 5).map((c) => <div key={c.version} className="markdown" style={{ marginBottom: 10 }}><strong>{c.version}</strong>{renderMarkdown(c.changelog_md)}</div>)}
         </>
       )}
-      <h3>Reviews</h3>
-      {!data.reviews?.length ? <p className="muted">No published reviews.</p> : (
-        <ul>{data.reviews.map((r) => <li key={r.id}><strong>{'★'.repeat(r.rating || 0)}</strong> {r.title ? <strong>{r.title}</strong> : null} <span className="muted small">{r.created_at ? formatDate(r.created_at) : ''}</span>{r.body ? <div className="small">{r.body}</div> : null}{r.developer_reply ? <div className="small muted">Developer: {r.developer_reply}</div> : null}</li>)}</ul>
+      <SectionTitle>Reviews</SectionTitle>
+      {!data.reviews?.length ? <p className="muted">No published reviews yet; reviews appear here once the marketplace moderates them.</p> : (
+        <ul className="list-plain">{data.reviews.map((r) => <li key={r.id} style={{ padding: '8px 0', borderBottom: '1px solid var(--border)' }}><strong>{'★'.repeat(r.rating || 0)}</strong> {r.title ? <strong>{r.title}</strong> : null} <span className="muted">{r.created_at ? formatDate(r.created_at) : ''}</span>{r.body ? <div>{r.body}</div> : null}{r.developer_reply ? <div className="muted">Developer: {r.developer_reply}</div> : null}</li>)}</ul>
       )}
-      {manage && inst?.marketplace && <ReviewForm pluginId={data.id} />}
+      {manage && inst?.marketplace && <><SectionTitle>Write a review</SectionTitle><ReviewForm pluginId={data.id} /></>}
     </Card>
   );
 }
 
 // Catalog grid, search and category filter, detail drawer and the install /
 // update / uninstall actions (root only; resellers get the read-only view on
-// WHM Marketplace). Installs run as jobs; a `pending_consent` result opens the
+// the Marketplace page). Installs run as jobs; a `pending_consent` result opens the
 // consent screen with the scopes of the installed package.
 export function MarketplaceTab({ manage = true, status: statusProp = null }) {
   const toast = useToast();
@@ -327,18 +329,18 @@ export function MarketplaceTab({ manage = true, status: statusProp = null }) {
         </Card>
       )}
       <Card padded={false}>
-        <div className="datatable-toolbar" style={{ padding: 12, flexWrap: 'wrap', gap: 8 }}>
+        <div className="datatable-toolbar">
           <TextInput value={q} onChange={setQ} placeholder="Search plugins…" style={{ maxWidth: 280 }} />
           <Select value={category} onChange={setCategory} options={(categories.data || []).map((c) => ({ value: c.slug, label: `${c.name}${c.count != null ? ` (${c.count})` : ''}` }))} placeholder="All categories" style={{ maxWidth: 240 }} />
-          <span className="muted">{catalog.meta?.total ?? rows.length} plugin{(catalog.meta?.total ?? rows.length) === 1 ? '' : 's'} · hub {status.hubUrl?.replace(/^https:\/\//, '')}{Array.isArray(status.hubKids) ? ` · ${status.hubKids.length} signing key${status.hubKids.length === 1 ? '' : 's'} pinned` : ''}</span>
+          <span className="muted" style={{ flex: 1 }}>{catalog.meta?.total ?? rows.length} plugin{(catalog.meta?.total ?? rows.length) === 1 ? '' : 's'} · hub {status.hubUrl?.replace(/^https:\/\//, '')}{Array.isArray(status.hubKids) ? ` · ${status.hubKids.length} signing key${status.hubKids.length === 1 ? '' : 's'} pinned` : ''}</span>
           {manage && <Button size="sm" icon={RefreshCw} onClick={checkUpdates}>Check for updates</Button>}
           <Button size="sm" onClick={refreshAll}>Refresh</Button>
         </div>
         <ErrorBanner error={catalog.error} onRetry={catalog.refetch} />
         {catalog.loading && !catalog.data && <Loading />}
-        {catalog.data && rows.length === 0 && <EmptyState icon={Store} title="No plugins match">Try a different search or category.</EmptyState>}
+        {catalog.data && rows.length === 0 && <EmptyState icon={Store} title="No plugins match">Plugins from the hub catalog appear here; try a different search or category.</EmptyState>}
         {rows.length > 0 && (
-          <div className="stat-grid" style={{ padding: 12 }}>
+          <div className="stat-grid" style={{ padding: 16, gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))' }}>
             {rows.map((entry) => <PluginCard key={entry.id} entry={entry} manage={manage} onDetails={(e) => setSelected(e.id)} onInstall={install} onUpdate={update} onUninstall={(e) => uninstall(e, false)} />)}
           </div>
         )}

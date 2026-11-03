@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { Info } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, formatDate } from '../../../components/Common.jsx';
@@ -56,7 +57,7 @@ export default function RepairDatabases({ fn }) {
       <EngineBanner status={status.data} loading={status.loading} error={status.error} onRetry={status.refetch} />
       <Card title="Run">
         <RequestError error={runError} />
-        {engine === 'postgres' && <div className="banner banner-info"><div>PostgreSQL profile: check runs <code>VACUUM (ANALYZE)</code>, optimize runs <code>VACUUM (FULL, ANALYZE)</code> per database.</div></div>}
+        {engine === 'postgres' && <div className="banner banner-info"><Info size={18} /><div>PostgreSQL profile: check runs <code>VACUUM (ANALYZE)</code>, optimize runs <code>VACUUM (FULL, ANALYZE)</code> per database.</div></div>}
         <div className="form-grid">
           <Field label="Operation"><Select value={action} onChange={setAction} options={ACTIONS} /></Field>
           {action === 'check' && engine !== 'postgres' && <Field inline><Toggle checked={autoRepair} onChange={setAutoRepair} label="Repair tables found corrupt (--auto-repair)" /></Field>}
@@ -66,9 +67,9 @@ export default function RepairDatabases({ fn }) {
             <Button size="sm" onClick={() => setSelected(candidates.map((d) => d.name))}>Select all</Button>
             <Button size="sm" onClick={() => setSelected([])}>Clear</Button>
           </div>
-          <div className="form-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))' }}>
+          <div className="form-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: '8px 20px' }}>
             {candidates.map((d) => <label key={d.name} className="radio"><input type="checkbox" checked={selected.includes(d.name)} onChange={() => setSelected((s) => (s.includes(d.name) ? s.filter((x) => x !== d.name) : [...s, d.name]))} /><span><strong><code>{d.name}</code></strong>{d.account && <small>{d.account}</small>}</span></label>)}
-            {candidates.length === 0 && <span className="muted">No databases listed.</span>}
+            {candidates.length === 0 && <span className="muted">Databases on the active server appear here once it is reachable.</span>}
           </div>
         </Field>
         <FormActions><Button variant={action === 'check' ? 'primary' : 'danger'} loading={busy} onClick={run}>Run {action}</Button></FormActions>
@@ -94,12 +95,12 @@ export default function RepairDatabases({ fn }) {
           columns={[
             { key: 'created_at', label: 'Started', render: (r) => formatDate(r.created_at) },
             { key: 'action', label: 'Operation' },
-            { key: 'databases', label: 'Databases', render: (r) => (r.databases.length ? r.databases.map((d) => <code key={d} style={{ marginRight: 6 }}>{d}</code>) : <em>all</em>) },
+            { key: 'databases', label: 'Databases', render: (r) => (r.databases.length ? r.databases.map((d) => <code key={d}>{d}</code>).reduce((acc, el) => (acc.length ? [...acc, ' ', el] : [el]), []) : <span className="muted">all</span>) },
             { key: 'job_status', label: 'Job', render: (r) => <StatusPill status={r.job_status || 'unknown'} /> },
             { key: 'summary', label: 'Result', render: (r) => (r.summary ? `${r.summary.tables} tables · ${r.summary.ok} ok · ${r.summary.repaired} repaired · ${r.summary.errors} errors` : '—') },
             { key: 'started_by', label: 'By' },
           ]}
-          rows={data?.runs || []} loading={loading} error={error} rowKey={(r) => r.id} dense emptyText="No runs yet."
+          rows={data?.runs || []} loading={loading} error={error} rowKey={(r) => r.id} dense emptyText="No runs yet. Finished checks and repairs appear here."
         />
       </Card>
     </>

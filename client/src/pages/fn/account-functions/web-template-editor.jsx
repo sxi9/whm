@@ -45,7 +45,7 @@ export default function WebTemplateEditor({ fn }) {
   const meta = list?.templates.find((t) => t.name === name);
   return (
     <>
-      <PageHeader fn={fn} description={`Edits the HTML page templates kept under ${list?.dir || '/etc/whm/templates'}. Today only the default site page is served: it is written into public_html when an account is created. The suspended, moved and 4xx pages are saved and written to the template directory but are not referenced by the web server configuration yet.`} />
+      <PageHeader fn={fn} description={`Edits the HTML page templates kept under ${list?.dir || 'the template directory'}. Today only the default site page is served: it is written into public_html when an account is created. The suspended, moved and 4xx pages are saved and written to the template directory but are not referenced by the web server configuration yet.`} />
       <Card title="Template">
         <div className="form-grid">
           <Field label="Page"><Select value={name} onChange={setName} options={(list?.templates || Object.keys(LABELS).map((n) => ({ name: n }))).map((t) => ({ value: t.name, label: `${LABELS[t.name] || t.name}${t.customised ? ' (customised)' : ''}${t.served === false ? ' (not yet served)' : ''}` }))} /></Field>
@@ -65,7 +65,7 @@ export default function WebTemplateEditor({ fn }) {
       </Card>
       {preview != null && (
         <Card title="Preview" subtitle="Rendered with sample values">
-          <iframe title="Template preview" srcDoc={preview} sandbox="" style={{ width: '100%', height: 420, border: '1px solid var(--border)', borderRadius: 6, background: '#fff' }} />
+          <iframe title="Template preview" srcDoc={preview} sandbox="" style={{ width: '100%', height: 420, border: '1px solid var(--border)', borderRadius: 'var(--radius)', background: 'var(--surface)' }} />
         </Card>
       )}
     </>

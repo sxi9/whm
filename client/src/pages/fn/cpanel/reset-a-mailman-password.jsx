@@ -56,8 +56,11 @@ export default function ResetMailmanPassword({ fn }) {
       {data && (
         <>
           <Card title="Mailing lists" subtitle={data.flavor === 'mailman3' ? 'Mailman 3: list administration is per user; per-list passwords do not exist' : 'Every Mailman 2 list on this server, advertised or not (list_lists)'} padded={false}>
-            <DataTable columns={columns} rows={lists} loading={loading} rowActions={rowActions} rowKey={(l) => l.name} emptyText="No mailing lists exist" />
-            {lists.length === 0 && !loading && <div className="card-body"><EmptyState icon={Mails} title="No mailing lists"><p>Lists are created from a hosting account's cPanel (Mailing Lists) or with Mailman's <code>newlist</code> tool.</p></EmptyState></div>}
+            {lists.length === 0 && !loading ? (
+              <EmptyState icon={Mails} title="No mailing lists yet"><p>Every list on this server appears here once it exists. Lists are created from the account panel (Mailing Lists) or with Mailman's <code>newlist</code> tool.</p></EmptyState>
+            ) : (
+              <DataTable columns={columns} rows={lists} loading={loading} rowActions={rowActions} rowKey={(l) => l.name} emptyText="No mailing lists exist" />
+            )}
           </Card>
           <Card title="Reset a list administrator password" subtitle="Runs Mailman's change_pw for the selected list">
             {data.canResetPassword === false ? (

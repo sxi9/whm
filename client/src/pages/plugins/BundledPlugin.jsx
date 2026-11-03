@@ -48,9 +48,10 @@ export function EnablePrompt({ fn, id, status, error, checking, onChanged }) {
         {error && error.status !== 404 && <ErrorBanner error={error} />}
         <EmptyState icon={state === 'errored' ? AlertTriangle : Puzzle} title={state === 'errored' ? 'The plugin failed to start' : state === 'not-installed' ? 'The bundled plugin is not installed' : 'The plugin is not enabled'}>
           <p>{status?.description || fn.description}</p>
-          {status?.lastError && <p className="banner banner-error" style={{ display: 'block' }}><strong>{status.lastError.code || 'error'}</strong>: {status.lastError.message}</p>}
+          {status?.lastError && <div className="banner banner-error" style={{ textAlign: 'left' }}><AlertTriangle size={18} /><div><strong>{status.lastError.code || 'error'}</strong>: {status.lastError.message}</div></div>}
+
           {checking ? null : canManage ? (
-            <div className="action-row" style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
+            <div className="form-actions" style={{ justifyContent: 'center' }}>
               {state !== 'not-installed' && <Button variant="primary" loading={action.loading} onClick={() => action.mutate('enable').catch(() => {})}>Enable plugin</Button>}
               <Button loading={action.loading} onClick={() => action.mutate('reinstall').catch(() => {})}>{state === 'not-installed' ? 'Install bundled plugin' : 'Repair (reinstall and enable)'}</Button>
             </div>
@@ -94,10 +95,12 @@ export function BundledPluginShell({ fn, id, overview: Overview, tabs = [] }) {
   const pages = (plugin.pages || []).filter((p) => tabs.includes(p.route) && (canManage || p.route !== '/settings'));
   const active = tab === 'overview' ? null : pages.find((p) => p.route === tab);
   const nav = (
-    <div className="action-row" style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }} role="tablist">
-      <Button size="sm" variant={tab === 'overview' ? 'primary' : 'default'} onClick={() => setTab('overview')}>Overview</Button>
-      {pages.map((p) => <Button key={p.route} size="sm" variant={tab === p.route ? 'primary' : 'default'} onClick={() => setTab(p.route)}>{p.title}</Button>)}
-      <Link className="btn btn-sm btn-ghost" to={`/cpanel/manage-plugins`}>Manage Plugins</Link>
+    <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginBottom: 16 }}>
+      <div className="segmented" role="tablist">
+        <button type="button" role="tab" aria-selected={tab === 'overview'} className={tab === 'overview' ? 'active' : ''} onClick={() => setTab('overview')}>Overview</button>
+        {pages.map((p) => <button key={p.route} type="button" role="tab" aria-selected={tab === p.route} className={tab === p.route ? 'active' : ''} onClick={() => setTab(p.route)}>{p.title}</button>)}
+      </div>
+      <Link className="btn btn-sm btn-ghost" to="/cpanel/manage-plugins">Manage Plugins</Link>
     </div>
   );
   if (active) return <>{nav}<PluginPageView plugin={plugin} page={active} /></>;

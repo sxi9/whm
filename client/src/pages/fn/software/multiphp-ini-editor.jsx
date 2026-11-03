@@ -6,7 +6,7 @@ import { useAuth } from '../../../auth/AuthContext.jsx';
 import { PageHeader, Card, StatusPill, Loading } from '../../../components/Common.jsx';
 import { Field, Select, TextInput, Textarea, Toggle, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
-import { RequestError, Tabs } from '../../software/Shared.jsx';
+import { RequestError, Tabs, CodeList } from '../../software/Shared.jsx';
 
 const BOOL_OPTIONS = [{ value: '', label: '(unset)' }, { value: 'On', label: 'On' }, { value: 'Off', label: 'Off' }];
 
@@ -66,10 +66,11 @@ export default function MultiPhpIniEditor({ fn }) {
           {scope === 'domain' && <Field label="Domain"><Select value={domain} onChange={setDomain} options={domainOptions} placeholder={domains.data ? 'Select a domain…' : 'Loading…'} /></Field>}
         </div>
         <RequestError error={versions.error || domains.error} onRetry={() => { versions.refetch(); domains.refetch(); }} />
-        {scope === 'version' && isRoot && ini.data?.sapis && (
-          <p className="muted small">Editing <code>{ini.data.path}</code>. Other SAPI copies: {Object.entries(ini.data.sapis).filter(([, p]) => p && p !== ini.data.path).map(([s, p]) => <code key={s} style={{ marginRight: 6 }}>{p}</code>)}</p>
-        )}
-        {scope === 'domain' && ini.data && <p className="muted small"><code>{ini.data.path}</code> {ini.data.exists ? '' : '(does not exist yet; saving creates it)'} — PHP-FPM re-reads .user.ini every user_ini.cache_ttl seconds (300 by default).</p>}
+        {scope === 'version' && isRoot && ini.data?.sapis && (() => {
+          const others = Object.entries(ini.data.sapis).filter(([, p]) => p && p !== ini.data.path).map(([, p]) => p);
+          return <p className="muted">Editing <code>{ini.data.path}</code>{others.length > 0 && <>. Other SAPI copies: <CodeList names={others} /></>}</p>;
+        })()}
+        {scope === 'domain' && ini.data && <p className="muted"><code>{ini.data.path}</code> {ini.data.exists ? '' : '(does not exist yet; saving creates it)'} — PHP-FPM re-reads .user.ini every user_ini.cache_ttl seconds (300 by default).</p>}
       </Card>
       {path && (
         <Card title={mode === 'basic' ? 'Basic mode' : 'Editor mode'} subtitle={scope === 'version' ? 'Server-wide defaults for this PHP version.' : 'Overrides for this domain only. Only PHP_INI_PERDIR and PHP_INI_USER directives take effect here.'}
@@ -95,7 +96,7 @@ export default function MultiPhpIniEditor({ fn }) {
               <FormActions>
                 <Button variant="primary" loading={saving} disabled={!dirty} onClick={save}>Save</Button>
                 <Button disabled={!dirty || saving} onClick={() => { setDraft(ini.data.basic || {}); setContent(ini.data.content || ''); }}>Reset</Button>
-                {mode === 'basic' && <span className="muted small">{Object.keys(changed).length} directive(s) changed; empty = remove the directive.</span>}
+                {mode === 'basic' && <span className="muted">{Object.keys(changed).length} directive(s) changed; empty = remove the directive.</span>}
               </FormActions>
             </div>
           )}

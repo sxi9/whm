@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { useAuth } from '../../../auth/AuthContext.jsx';
@@ -39,15 +40,15 @@ export default function ViewResellerUsageAndManageAccountStatus({ fn }) {
           <ErrorBanner error={overview.error} onRetry={overview.refetch} />
           <DataTable
             columns={[
-              { key: 'username', label: 'Reseller', render: (r) => <button type="button" className="btn btn-sm btn-ghost" onClick={() => setPicked(r.username)}><code>{r.username}</code></button> },
-              { key: 'accounts', label: 'Accounts', render: (r) => <span style={r.usage.over_accounts ? { color: 'var(--bad)', fontWeight: 600 } : undefined}>{r.usage.accounts}{r.limits.max_accounts != null ? ` / ${r.limits.max_accounts}` : ''}{r.usage.suspended ? <small className="muted"> ({r.usage.suspended} suspended)</small> : null}</span> },
+              { key: 'username', label: 'Reseller', render: (r) => <Button variant="ghost" size="sm" onClick={() => setPicked(r.username)}>{r.username}</Button> },
+              { key: 'accounts', label: 'Accounts', render: (r) => { const n = `${r.usage.accounts}${r.limits.max_accounts != null ? ` / ${r.limits.max_accounts}` : ''}`; return <>{r.usage.over_accounts ? <StatusPill status="error">{n}</StatusPill> : n}{r.usage.suspended ? <small className="muted"> ({r.usage.suspended} suspended)</small> : null}</>; } },
               { key: 'disk', label: 'Disk allocated', render: (r) => r.limits.max_disk_mb != null ? <UsageBar used={r.usage.disk_allocated_mb} max={r.limits.max_disk_mb} /> : `${formatMb(r.usage.disk_allocated_mb)} / unlimited` },
               { key: 'disk_used', label: 'Disk used', align: 'right', render: (r) => formatMb(r.usage.disk_used_mb) },
               { key: 'bw', label: 'Bandwidth allocated', render: (r) => r.limits.max_bandwidth_mb != null ? <UsageBar used={r.usage.bandwidth_allocated_mb} max={r.limits.max_bandwidth_mb} /> : `${formatMb(r.usage.bandwidth_allocated_mb)} / unlimited` },
               { key: 'bw_used', label: 'Bandwidth used', align: 'right', render: (r) => formatMb(r.usage.bandwidth_used_mb) },
               { key: 'status', label: 'Status', render: (r) => <ResellerStatusPill reseller={r} /> },
             ]}
-            rows={overview.data || []} loading={overview.loading} rowKey={(r) => r.username} emptyText="No resellers yet."
+            rows={overview.data || []} loading={overview.loading} rowKey={(r) => r.username} emptyText="Resellers and their usage will be listed here once added in Reseller Center."
           />
         </Card>
       )}
@@ -56,7 +57,7 @@ export default function ViewResellerUsageAndManageAccountStatus({ fn }) {
       {data && (
         <>
           <Card title={`${data.reseller}: usage against limits`} actions={isRoot && <Link className="btn btn-sm" to={`/resellers/reseller-center`}>Edit limits</Link>}>
-            {data.suspended && <div className="banner banner-warning"><div><strong>Reseller privileges are suspended.</strong> The hosting accounts below still run.</div></div>}
+            {data.suspended && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>Reseller privileges are suspended.</strong> The hosting accounts below still run.</div></div>}
             <Summary items={[['Accounts', `${data.usage.accounts}${data.limits.max_accounts != null ? ` / ${data.limits.max_accounts}` : ''}`], ['Suspended accounts', data.usage.suspended], ['Disk used', formatMb(data.usage.disk_used_mb)], ['Bandwidth used', formatMb(data.usage.bandwidth_used_mb)]]} />
             <KeyValue items={[
               ['Disk allocated', <UsageBar key="d" used={data.usage.disk_allocated_mb} max={data.limits.max_disk_mb} />],
@@ -79,7 +80,7 @@ export default function ViewResellerUsageAndManageAccountStatus({ fn }) {
               rowActions={(a) => [a.suspended
                 ? { label: 'Unsuspend', primary: true, disabled: busy === a.username, onClick: () => unsuspend(a) }
                 : { label: 'Suspend', primary: true, danger: true, disabled: busy === a.username, onClick: () => suspend(a) }]}
-              emptyText={`${data.reseller} owns no accounts.`}
+              emptyText={`Accounts owned by ${data.reseller} will be listed here.`}
             />
             <div className="card-body"><Button size="sm" onClick={() => refetch()}>Refresh</Button></div>
           </Card>

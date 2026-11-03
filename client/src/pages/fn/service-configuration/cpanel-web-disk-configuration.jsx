@@ -1,3 +1,4 @@
+import { Info, AlertTriangle } from 'lucide-react';
 import { PageHeader, Card, Loading, formatDate } from '../../../components/Common.jsx';
 import { Field, NumberInput, Select, Toggle } from '../../../components/Form.jsx';
 import { useSettingsForm, SaveBar, RequestError } from '../../service-config/Shared.jsx';
@@ -12,7 +13,7 @@ export default function WebDiskConfiguration({ fn }) {
       {form.loading && !data && <Loading />}
       {data && draft && (
         <>
-          {data.live === false && <div className="banner banner-info"><div><strong>Stored for a service that is not built yet.</strong> No WebDAV listener runs on this server and no login is accepted or refused by these settings; they only seed the Web Disk service when it ships.</div></div>}
+          {data.live === false && <div className="banner banner-info"><Info size={18} /><div><strong>Stored for a service that is not built yet.</strong> No WebDAV listener runs on this server and no login is accepted or refused by these settings; they only seed the Web Disk service when it ships.</div></div>}
           <Card title="Service" className="config-fields" subtitle={data.lastUpdate ? `Last changed ${formatDate(data.lastUpdate)}` : undefined}>
             <Field inline><Toggle checked={draft.enabled} onChange={set('enabled')} label="Enable Web Disk" description="Whether the Web Disk service should accept logins once it exists" /></Field>
             <div className="form-grid">
@@ -27,7 +28,7 @@ export default function WebDiskConfiguration({ fn }) {
             <Field inline><Toggle checked={draft.requireSsl} onChange={set('requireSsl')} label="Require SSL" description="Plain-text WebDAV sends passwords in the clear; only disable for clients that cannot do TLS" /></Field>
             <Field inline><Toggle checked={draft.allowDigestAuth} onChange={set('allowDigestAuth')} label="Allow Digest authentication" description="Needed by Windows clients over plain HTTP; Basic auth is always available over SSL" /></Field>
             <Field inline><Toggle checked={draft.allowAnonymousDiscovery} onChange={set('allowAnonymousDiscovery')} label="Answer unauthenticated OPTIONS/PROPFIND" description="Lets clients discover the server before logging in" /></Field>
-            {!draft.requireSsl && <div className="banner banner-warning"><div>With SSL not required, credentials would travel unencrypted on port {draft.port} once the service runs.</div></div>}
+            {!draft.requireSsl && <div className="banner banner-warning"><AlertTriangle size={18} /><div>With SSL not required, credentials would travel unencrypted on port {draft.port} once the service runs.</div></div>}
           </Card>
           <SaveBar form={form} label="Save settings" />
         </>

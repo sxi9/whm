@@ -1,9 +1,10 @@
 import { useState } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
-import { PageHeader, Card, StatusPill, Loading } from '../../../components/Common.jsx';
+import { PageHeader, Card, StatusPill, KeyValue, Loading } from '../../../components/Common.jsx';
 import { DataTable, useTableState } from '../../../components/DataTable.jsx';
-import { Button, ErrorBanner } from '../../../components/Form.jsx';
+import { TextInput, Button, ErrorBanner } from '../../../components/Form.jsx';
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, Tabs, ManagerBadge, RebootBanner, useJobRunner, JobPanel, JobHistory } from '../../software/Shared.jsx';
@@ -35,7 +36,7 @@ export default function InstallDistroPackages({ fn }) {
 
   const columns = [
     { key: 'name', label: 'Package', render: (p) => <button className="link-button" onClick={() => showInfo(p.name)}><code>{p.name}</code></button> },
-    { key: 'summary', label: 'Summary', render: (p) => <span className="small">{p.summary || '—'}</span> },
+    { key: 'summary', label: 'Summary', render: (p) => <span className="muted">{p.summary || '—'}</span> },
     { key: 'installed', label: 'Installed', render: (p) => (p.installed || p.version ? <StatusPill status="installed">{p.installedVersion || p.version || 'yes'}</StatusPill> : <StatusPill status="not-installed">no</StatusPill>) },
   ];
   const rowActions = (p) => [
@@ -48,14 +49,14 @@ export default function InstallDistroPackages({ fn }) {
     <>
       <PageHeader fn={fn} actions={<ManagerBadge detect={detect.data} />} />
       <RequestError error={detect.error} onRetry={detect.refetch} />
-      {detect.data && !detect.data.capability && <div className="banner banner-warning"><div><strong>No supported package manager</strong><p>This host has neither apt-get nor dnf/yum; package management is unavailable.</p></div></div>}
+      {detect.data && !detect.data.capability && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>No supported package manager</strong><p>This host has neither apt-get nor dnf/yum; package management is unavailable.</p></div></div>}
       <RebootBanner required={detect.data?.rebootRequired} />
       <Card title="Packages" actions={<Button onClick={() => runner.start(() => api.post('/software/pkg/update-index'), 'Refresh package index')} loading={runner.busy}>Refresh package index</Button>}>
         <Tabs value={tab} onChange={setTab} tabs={[{ value: 'search', label: 'Search repositories' }, { value: 'installed', label: 'Installed packages', count: installed.meta?.installedTotal }, { value: 'history', label: 'History', count: recent.data?.length }]} />
         {tab === 'search' && (
           <>
             <form className="search" onSubmit={doSearch} style={{ marginBottom: 12 }}>
-              <input className="input" placeholder="Package name, e.g. imagemagick, php-redis, nginx" value={q} onChange={(e) => setQ(e.target.value)} />
+              <TextInput placeholder="Package name, e.g. imagemagick, php-redis, nginx" value={q} onChange={setQ} />
               <Button type="submit" variant="primary" disabled={!q.trim()}>Search</Button>
             </form>
             <RequestError error={search.error} onRetry={search.refetch} />
@@ -77,19 +78,19 @@ export default function InstallDistroPackages({ fn }) {
               rowActions={(p) => [{ label: 'Remove', danger: true, primary: true, onClick: () => remove([p.name]) }, { label: 'Details', onClick: () => showInfo(p.name) }]} />
           </>
         )}
-        {tab === 'history' && <JobHistory jobs={recent.data} emptyText="No package jobs have run yet" onSelect={(id) => runner.setJobId(id)} />}
+        {tab === 'history' && <JobHistory jobs={recent.data} emptyText="No package jobs have run yet; installs and removals appear here with their logs" onSelect={(id) => runner.setJobId(id)} />}
       </Card>
       <ErrorBanner error={runner.error} />
       <JobPanel runner={runner} />
       <Modal open={Boolean(info)} title={info?.name} onClose={() => setInfo(null)} footer={<Button variant="primary" onClick={() => setInfo(null)}>Close</Button>}>
         {info?.loading ? <Loading /> : info && (
-          <dl className="kv">
-            <div><dt>Installed</dt><dd>{info.installed ? <StatusPill status="installed">{info.installed}</StatusPill> : <StatusPill status="not-installed">no</StatusPill>}</dd></div>
-            <div><dt>Candidate</dt><dd>{info.candidate || '—'}</dd></div>
-            <div><dt>Section / repo</dt><dd>{info.section || '—'}</dd></div>
-            <div><dt>Summary</dt><dd>{info.summary || '—'}</dd></div>
-            {info.homepage && <div><dt>Homepage</dt><dd><a href={info.homepage} target="_blank" rel="noreferrer">{info.homepage}</a></dd></div>}
-          </dl>
+          <KeyValue items={[
+            ['Installed', info.installed ? <StatusPill key="i" status="installed">{info.installed}</StatusPill> : <StatusPill key="i" status="not-installed">no</StatusPill>],
+            ['Candidate', info.candidate || '—'],
+            ['Section / repo', info.section || '—'],
+            ['Summary', info.summary || '—'],
+            info.homepage && ['Homepage', <a key="h" href={info.homepage} target="_blank" rel="noreferrer">{info.homepage}</a>],
+          ]} />
         )}
       </Modal>
     </>

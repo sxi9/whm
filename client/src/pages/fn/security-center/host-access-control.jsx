@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ArrowUp, ArrowDown, Trash2, Plus } from 'lucide-react';
+import { ArrowUp, ArrowDown, Trash2, Plus, Info, AlertTriangle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, Loading } from '../../../components/Common.jsx';
@@ -38,14 +38,14 @@ export default function HostAccessControl({ fn }) {
       {loading && !data && <Loading />}
       {data && (
         <>
-          {data.files && !data.files.supported && <div className="banner banner-info"><div>libwrap was not detected on this host; the files are still written but only daemons linked against TCP wrappers honour them.</div></div>}
-          {data.files && data.files.denyManaged === false && <div className="banner banner-warning"><div><strong>/etc/hosts.deny contains rules the panel did not write.</strong> They keep applying after every save here (the panel only rewrites that file once it manages it). Review them below and move them into this list if they should be managed from the panel.</div></div>}
+          {data.files && !data.files.supported && <div className="banner banner-info"><Info size={18} /><div>libwrap was not detected on this host; the files are still written but only daemons linked against TCP wrappers honour them.</div></div>}
+          {data.files && data.files.denyManaged === false && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>/etc/hosts.deny contains rules the panel did not write.</strong> They keep applying after every save here (the panel only rewrites that file once it manages it). Review them below and move them into this list if they should be managed from the panel.</div></div>}
           <Card title="Rules" actions={<Button size="sm" icon={Plus} onClick={() => setRules((rs) => [...rs, { ...EMPTY }])}>Add rule</Button>} padded={false}>
             <div className="table-wrap">
               <table>
-                <thead><tr><th style={{ width: 160 }}>Daemon</th><th>Access list (host, IP, network/mask, ALL, LOCAL…)</th><th style={{ width: 120 }}>Action</th><th>Comment</th><th style={{ width: 130 }} /></tr></thead>
+                <thead><tr><th style={{ width: 160 }}>Daemon</th><th>Access list (host, IP, network/mask, ALL, LOCAL)</th><th style={{ width: 120 }}>Action</th><th>Comment</th><th style={{ width: 130 }} /></tr></thead>
                 <tbody>
-                  {rules.length === 0 && <tr><td colSpan={5} className="table-state">No rules. Every connection is allowed.</td></tr>}
+                  {rules.length === 0 && <tr><td colSpan={5} className="table-state">No rules yet, so every connection is allowed. Rules you add appear here in matching order.</td></tr>}
                   {rules.map((r, i) => (
                     <tr key={i}>
                       <td><TextInput value={r.service} onChange={(v) => update(i, { service: v })} list="whm-known-services" /></td>
@@ -54,9 +54,9 @@ export default function HostAccessControl({ fn }) {
                       <td><TextInput value={r.comment} onChange={(v) => update(i, { comment: v })} placeholder="optional" /></td>
                       <td>
                         <div className="row-actions">
-                          <button className="btn btn-sm btn-icon" disabled={i === 0} onClick={() => move(i, -1)} aria-label="Move up"><ArrowUp size={14} /></button>
-                          <button className="btn btn-sm btn-icon" disabled={i === rules.length - 1} onClick={() => move(i, 1)} aria-label="Move down"><ArrowDown size={14} /></button>
-                          <button className="btn btn-sm btn-icon btn-danger-ghost" onClick={() => remove(i)} aria-label="Remove"><Trash2 size={14} /></button>
+                          <button type="button" className="btn btn-sm btn-icon" disabled={i === 0} onClick={() => move(i, -1)} aria-label="Move up"><ArrowUp size={14} /></button>
+                          <button type="button" className="btn btn-sm btn-icon" disabled={i === rules.length - 1} onClick={() => move(i, 1)} aria-label="Move down"><ArrowDown size={14} /></button>
+                          <button type="button" className="btn btn-sm btn-icon btn-danger-ghost" onClick={() => remove(i)} aria-label="Remove"><Trash2 size={14} /></button>
                         </div>
                       </td>
                     </tr>
@@ -75,9 +75,9 @@ export default function HostAccessControl({ fn }) {
             </div>
           </Card>
           <Card title="Current files">
-            <div className="form-grid">
-              <div><h3>/etc/hosts.allow</h3><pre className="log">{data.files?.allow ?? '(missing)'}</pre></div>
-              <div><h3>/etc/hosts.deny</h3><pre className="log">{data.files?.deny ?? '(missing)'}</pre></div>
+            <div className="grid-2">
+              <div><h3 style={{ marginBottom: 8 }}>/etc/hosts.allow</h3><pre className="log">{data.files?.allow ?? '(missing)'}</pre></div>
+              <div><h3 style={{ marginBottom: 8 }}>/etc/hosts.deny</h3><pre className="log">{data.files?.deny ?? '(missing)'}</pre></div>
             </div>
           </Card>
         </>

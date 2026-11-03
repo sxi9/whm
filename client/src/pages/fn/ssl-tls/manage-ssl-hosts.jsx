@@ -45,18 +45,17 @@ export default function ManageSslHosts({ fn }) {
       {loading && !data && <Loading />}
       {data && (
         <Card padded={false} title="Installed certificates" subtitle={`Bundles live under ${data.bundleRoot}/<domain>/. ${data.webLinked ? 'Vhost changes are applied by the web server category.' : 'The web server category is not loaded: files are written and vhosts are updated once it is.'}`}>
-          <div style={{ padding: '12px 16px 0' }}>
-            <Tabs value={filter} onChange={setFilter} tabs={[{ value: 'all', label: 'All', count: counts.all }, { value: 'expiring', label: 'Expiring ≤ 30d', count: counts.expiring }, { value: 'autossl', label: 'AutoSSL', count: counts.autossl }, { value: 'pending', label: 'Pending / unmanaged', count: counts.pending }]} />
-          </div>
-          <DataTable dense searchable q={q} onSearch={setQ} searchPlaceholder="Filter by domain or account" columns={[
+          <DataTable dense searchable q={q} onSearch={setQ} searchPlaceholder="Filter by domain or account"
+            toolbar={<Tabs value={filter} onChange={setFilter} tabs={[{ value: 'all', label: 'All', count: counts.all }, { value: 'expiring', label: 'Expiring ≤ 30d', count: counts.expiring }, { value: 'autossl', label: 'AutoSSL', count: counts.autossl }, { value: 'pending', label: 'Pending / unmanaged', count: counts.pending }]} />}
+            columns={[
             { key: 'domain', label: 'Domain', render: (h) => <code>{h.domain}</code> },
             { key: 'account', label: 'Account', render: (h) => h.account || <span className="muted">—</span> },
-            { key: 'issuer', label: 'Issuer', render: (h) => (h.selfSigned ? <StatusPill status="warning">self-signed</StatusPill> : <span className="small">{(h.issuer || '—').replace(/^CN=/, '').split(',')[0]}</span>) },
+            { key: 'issuer', label: 'Issuer', render: (h) => (h.selfSigned ? <StatusPill status="warning">self-signed</StatusPill> : <span className="muted">{(h.issuer || '—').replace(/^CN=/, '').split(',')[0]}</span>) },
             { key: 'notAfter', label: 'Expires', render: (h) => <ExpiryPill notAfter={h.notAfter} daysRemaining={h.daysRemaining} /> },
             { key: 'autossl', label: 'Source', render: (h) => <StatusPill status={h.autossl ? 'ok' : 'inactive'}>{h.autossl ? 'AutoSSL' : 'manual'}</StatusPill> },
             { key: 'state', label: 'State', render: (h) => <StatePill state={h.state} /> },
             { key: 'files', label: 'Files', render: (h) => (h.files?.present == null ? <span className="muted" title={data.bundlesListed === false ? 'The bundle directory could not be listed' : ''}>—</span> : <StatusPill status={h.files.present ? 'ok' : 'warning'}>{h.files.present ? `on disk${h.files.hasKey ? '' : ', key missing'}` : 'missing on disk'}</StatusPill>) },
-          ]} rows={hosts} rowKey={(h) => h.domain} emptyText="No certificates are installed. Install one or enable AutoSSL."
+          ]} rows={hosts} rowKey={(h) => h.domain} emptyText="Installed certificates appear here. Install one or enable AutoSSL."
             rowActions={(h) => [
               { label: 'Details', primary: true, onClick: () => view(h) },
               { label: 'Uninstall', danger: true, onClick: () => uninstall(h) },
@@ -66,7 +65,7 @@ export default function ManageSslHosts({ fn }) {
       <Modal open={Boolean(viewing)} title={`Certificate on ${viewing?.host.domain}`} onClose={() => setViewing(null)} size="lg" footer={<Button variant="primary" onClick={() => setViewing(null)}>Close</Button>}>
         {viewing && (
           <>
-            <p className="muted small">{viewing.files?.exists ? <>Files: <code>{viewing.files.paths?.dir}/</code>{viewing.files.hasChain ? ' (with chain)' : ''}</> : viewing.files?.error ? `Bundle not readable: ${viewing.files.error}` : 'No bundle files on disk; showing the stored certificate.'}</p>
+            <p className="muted">{viewing.files?.exists ? <>Files: <code>{viewing.files.paths?.dir}/</code>{viewing.files.hasChain ? ' (with chain)' : ''}</> : viewing.files?.error ? `Bundle not readable: ${viewing.files.error}` : 'No bundle files on disk; showing the stored certificate.'}</p>
             <CertificateSummary certificate={viewing.certificate} chain={viewing.chain} />
           </>
         )}

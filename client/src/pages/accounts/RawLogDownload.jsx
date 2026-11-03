@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useApi } from '../../hooks/useApi.js';
 import { PageHeader, Card, CapabilityNotice, EmptyState, formatBytes, formatDate, DownloadLink } from '../../components/Common.jsx';
 import { DataTable } from '../../components/DataTable.jsx';
-import { ErrorBanner } from '../../components/Form.jsx';
+import { Button, ErrorBanner } from '../../components/Form.jsx';
 import { AccountPicker } from './AccountPicker.jsx';
 
 // Shared by Raw Apache Log Download and Raw NGINX Log Download. Files are
@@ -16,7 +16,7 @@ export function RawLogDownload({ fn, kind, description }) {
       <PageHeader fn={fn} description={description} />
       <Card title="Select an account"><AccountPicker value={username} onChange={setUsername} /></Card>
       {username && (
-        <Card title={`${kind === 'nginx' ? 'NGINX' : 'Apache'} logs for ${username}`} subtitle={data ? `Looked in ${data.dirs.join(' and ')}` : undefined} padded={false} actions={<button className="btn btn-sm" onClick={() => refetch()}>Refresh</button>}>
+        <Card title={`${kind === 'nginx' ? 'NGINX' : 'Apache'} logs for ${username}`} subtitle={data ? `Looked in ${data.dirs.join(' and ')}` : undefined} padded={!data?.files?.length} actions={<Button size="sm" onClick={() => refetch()}>Refresh</Button>}>
           <CapabilityNotice error={error} onRetry={refetch} />
           {error && error.status !== 501 && <ErrorBanner error={error} onRetry={refetch} />}
           {data?.warnings?.length > 0 && <ErrorBanner error={{ message: `Some log directories were not read: ${data.warnings.join('; ')}` }} />}

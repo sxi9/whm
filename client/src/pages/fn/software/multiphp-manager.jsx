@@ -5,7 +5,7 @@ import { useApi } from '../../../hooks/useApi.js';
 import { useAuth } from '../../../auth/AuthContext.jsx';
 import { PageHeader, Card, StatusPill, Loading } from '../../../components/Common.jsx';
 import { DataTable, useTableState } from '../../../components/DataTable.jsx';
-import { Field, Select, Button, ErrorBanner } from '../../../components/Form.jsx';
+import { Field, Select, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, PhpVersionPill, useJobRunner, JobPanel } from '../../software/Shared.jsx';
@@ -97,7 +97,7 @@ export default function MultiPhpManager({ fn }) {
                 {installed.length === 0 && <tr><td colSpan={5} className="table-state">No PHP installation found. Add one with <Link to="/software/easyapache-4">EasyApache 4</Link> or Install Distro Packages.</td></tr>}
                 {installed.map((v) => (
                   <tr key={v.id}>
-                    <td><strong>{v.label || v.id}</strong> <span className="muted small">{v.version}</span> <PhpAdvisoryBadge advisories={v.advisories} /></td>
+                    <td><strong>{v.label || v.id}</strong> <span className="muted">{v.version}</span> <PhpAdvisoryBadge advisories={v.advisories} /></td>
                     <td><code className="small">{v.binary}</code></td>
                     <td>{v.fpmInstalled ? <StatusPill status={v.fpmActive ? 'active' : v.fpmActive === false ? 'inactive' : 'unknown'}>{v.fpmUnit}{v.fpmActive === false ? ' · stopped' : ''}</StatusPill> : <StatusPill status="not-installed">no FPM</StatusPill>}</td>
                     <td><code className="small">{v.iniPath || '—'}</code></td>
@@ -108,11 +108,11 @@ export default function MultiPhpManager({ fn }) {
             </table>
           </div>
           {isRoot && installed.length > 0 && (
-            <div className="form-grid" style={{ marginTop: 14, alignItems: 'end' }}>
+            <div className="form-narrow" style={{ marginTop: 16 }}>
               <Field label="System default PHP version" help="Used by every domain that does not override it.">
                 <Select value={defaultDraft || current || ''} onChange={setDefaultDraft} options={options} />
               </Field>
-              <div className="action-row"><Button variant="primary" loading={busy} disabled={(defaultDraft || current) === current} onClick={setDefault}>Apply default</Button></div>
+              <FormActions><Button variant="primary" loading={busy} disabled={(defaultDraft || current) === current} onClick={setDefault}>Apply default</Button></FormActions>
             </div>
           )}
           <ErrorBanner error={error} />
@@ -122,7 +122,7 @@ export default function MultiPhpManager({ fn }) {
       <Card title="PHP version per domain" subtitle={domains.data ? `${domains.meta?.total ?? domains.data.domains.length} domains · system default ${domains.data.systemDefault.effective || 'not set'}` : undefined} padded={false}>
         <RequestError error={domains.error} onRetry={domains.refetch} />
         {selected.length > 0 && (
-          <div className="action-row" style={{ padding: '12px 16px 0', display: 'flex', gap: 8, alignItems: 'center' }}>
+          <div className="datatable-actions" style={{ padding: '12px 16px 0' }}>
             <Select value={bulkVersion} onChange={setBulkVersion} options={[{ value: '', label: 'Inherit system default' }, ...options]} />
             <Button variant="primary" loading={busy} onClick={() => apply(selected, bulkVersion)}>Apply to {selected.length} selected</Button>
           </div>
@@ -140,7 +140,7 @@ export default function MultiPhpManager({ fn }) {
       </Card>
       {isRoot && pools.data && (
         <Card title="PHP-FPM pools" subtitle="Pool files found in each version's pool directory.">
-          {pools.data.pools.length === 0 ? <p className="muted">No pool files found.</p> : (
+          {pools.data.pools.length === 0 ? <p className="muted">No pool files found; pools appear here once a PHP-FPM version is installed.</p> : (
             <div className="table-wrap">
               <table>
                 <thead><tr><th>Version</th><th>Pool</th><th>User</th><th>Listen</th><th>pm</th><th>max_children</th></tr></thead>

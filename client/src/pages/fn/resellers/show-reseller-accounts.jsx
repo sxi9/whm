@@ -39,9 +39,9 @@ export default function ShowResellerAccounts({ fn }) {
               { key: 'suspended', label: 'Status', sortable: true, render: (r) => <StatusPill status={r.suspended ? 'suspended' : 'active'}>{r.suspended ? 'Suspended' : 'Active'}</StatusPill> },
             ]}
             rows={data || []} loading={loading} rowKey={(r) => r.username} total={meta?.total} page={t.state.page} pageSize={t.state.pageSize} onPageChange={t.setPage}
-            sort={t.state.sort} dir={t.state.dir} onSortChange={t.setSort} searchable q={t.state.q} onSearch={t.setSearch} searchPlaceholder="Search user, domain or email…"
+            sort={t.state.sort} dir={t.state.dir} onSortChange={t.setSort} searchable q={t.state.q} onSearch={t.setSearch} searchPlaceholder="Search user, domain or email"
             rowActions={(r) => [{ label: 'Modify', primary: true, onClick: () => navigate(`/account-functions/modify-an-account?username=${r.username}`) }, { label: 'Change owner', onClick: () => navigate(`/resellers/change-ownership-of-an-account?username=${r.username}`) }]}
-            emptyText={`${username} owns no accounts${suspended ? ' matching this filter' : ''}.`}
+            emptyText={`Accounts owned by ${username}${suspended ? ' matching this filter' : ''} will be listed here.`}
           />
         </Card>
       )}

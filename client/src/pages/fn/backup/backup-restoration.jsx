@@ -73,15 +73,15 @@ export default function BackupRestoration({ fn }) {
             <KeyValue items={[
               ['Archive', <code>{backup.name}</code>],
               ['Created', `${formatDate(backup.created_at)} · ${formatBytes(backup.size)}`],
-              ['Home directory', info.data.components.home ? 'included' : 'not in archive'],
-              ['Databases', info.data.components.mysql.length ? info.data.components.mysql.map((m) => m.database).join(', ') : 'none'],
-              ['DNS zones', info.data.components.dnszones.length ? info.data.components.dnszones.join(', ') : 'none'],
-              ['Metadata', info.data.metadata ? `${info.data.metadata.account?.domain || ''} · package ${info.data.metadata.account?.package_name || '—'} · owner ${info.data.metadata.account?.owner || '—'}${info.data.metadata.source === 'cpmove' ? ' · from cPanel cp/<user>' : ''}` : 'none (the account must already exist)'],
-              ['Other domains', info.data.metadata?.domains?.length ? info.data.metadata.domains.map((d) => `${d.domain} (${d.type})`).join(', ') : 'none'],
-              ['sha256', <code style={{ fontSize: 11 }}>{backup.sha256}</code>],
+              ['Home directory', info.data.components.home ? 'Included' : 'Not in archive'],
+              ['Databases', info.data.components.mysql.length ? info.data.components.mysql.map((m) => m.database).join(', ') : 'None'],
+              ['DNS zones', info.data.components.dnszones.length ? info.data.components.dnszones.join(', ') : 'None'],
+              ['Metadata', info.data.metadata ? `${info.data.metadata.account?.domain || ''} · package ${info.data.metadata.account?.package_name || '—'} · owner ${info.data.metadata.account?.owner || '—'}${info.data.metadata.source === 'cpmove' ? ' · from cPanel cp/<user>' : ''}` : 'None (the account must already exist)'],
+              ['Other domains', info.data.metadata?.domains?.length ? info.data.metadata.domains.map((d) => `${d.domain} (${d.type})`).join(', ') : 'None'],
+              ['SHA-256', <code className="small">{backup.sha256}</code>],
             ]} />
           )}
-          <div className="form-grid" style={{ marginTop: 12 }}>
+          <div className="form-grid" style={{ marginTop: 16 }}>
             <Field inline><Toggle checked={options.files} onChange={setOpt('files')} label="Home directory and mail" description="Archived files are written over the current ones with the account's ownership." /></Field>
             <Field inline><Toggle checked={options.overwrite} onChange={setOpt('overwrite')} label="Overwrite files that exist" description="Off: only files missing from the home directory are restored." disabled={!options.files} /></Field>
             <Field inline><Toggle checked={options.databases} onChange={setOpt('databases')} label="Databases, users and grants" description="Each schema is created if missing, then its dump is imported inside it (works for cPanel per-database dumps too); users keep their original passwords." /></Field>
@@ -99,7 +99,7 @@ export default function BackupRestoration({ fn }) {
       )}
       {!backup && jobId && <Card title="Progress"><ProgressLog jobId={jobId} onFinished={finished} /></Card>}
       {isRoot && (
-        <Card title="Import an archive" subtitle="Register a cPanel or WHM account archive copied onto this server by hand (e.g. /backup/cpmove-user.tar.gz), then restore it above.">
+        <Card title="Import an archive" subtitle="Register a Keel account archive or a cPanel cpmove archive copied onto this server by hand (for example /backup/cpmove-user.tar.gz), then restore it above.">
           <div className="form-grid">
             <Field label="Archive path" help="Must be under the backup directory or /var/backups/whm (move files out of account homes as root first); the file name identifies the account."><TextInput value={importPath} onChange={setImportPath} placeholder="/backup/cpmove-alice.tar.gz" /></Field>
           </div>
@@ -112,13 +112,13 @@ export default function BackupRestoration({ fn }) {
           columns={[
             { key: 'created_at', label: 'Requested', render: (r) => formatDate(r.created_at) },
             { key: 'account_name', label: 'Account' },
-            { key: 'kind', label: 'Kind', render: (r) => (r.kind === 'account' ? 'full account' : 'files') },
+            { key: 'kind', label: 'Kind', render: (r) => (r.kind === 'account' ? 'Full account' : 'Files') },
             { key: 'status', label: 'Status', render: (r) => <StatusPill status={r.status} /> },
-            { key: 'steps', label: 'Steps', render: (r) => Object.entries(r.summary?.steps || {}).map(([k, v]) => <span key={k} className={`pill pill-${v.status === 'done' ? 'ok' : v.status === 'failed' ? 'bad' : v.status === 'pending' ? 'warn' : 'muted'}`} style={{ marginRight: 4 }} title={v.detail}>{k}</span>) },
+            { key: 'steps', label: 'Steps', render: (r) => Object.entries(r.summary?.steps || {}).map(([k, v]) => <span key={k}> <span className={`pill pill-${v.status === 'done' ? 'ok' : v.status === 'failed' ? 'bad' : v.status === 'pending' ? 'warn' : 'muted'}`} title={v.detail}>{k}</span></span>) },
             { key: 'error', label: 'Error', render: (r) => r.error || '' },
             { key: 'started_by', label: 'By' },
           ]}
-          rows={restores.data || []} loading={restores.loading} error={restores.error} rowKey={(r) => r.id} dense emptyText="No restores yet."
+          rows={restores.data || []} loading={restores.loading} error={restores.error} rowKey={(r) => r.id} dense emptyText="Account and file restores will appear here."
         />
       </Card>
     </>

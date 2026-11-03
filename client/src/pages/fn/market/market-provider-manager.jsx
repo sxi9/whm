@@ -62,23 +62,29 @@ export default function MarketProviderManager({ fn }) {
       {providers.loading && !providers.data && <Loading />}
       {providers.data && (
         <>
-          <Card title="Overview" subtitle="Providers supply certificates for Purchase and Install an SSL Certificate and plugins for the WHM Marketplace. ACME clients are reflected from Manage AutoSSL.">
+          <Card title="Overview" subtitle="Providers supply certificates for Purchase and Install an SSL Certificate and plugins for the Marketplace. ACME clients are reflected from Manage AutoSSL.">
             <KeyValue items={[
               ['SSL providers', `${summary.ssl.length} (${summary.ssl.filter((p) => p.enabled).length} enabled)`],
               ['Plugin providers', `${summary.plugin.length} (${summary.plugin.filter((p) => p.enabled).length} enabled)`],
               ['Needing configuration', summary.attention ? `${summary.attention}` : 'none'],
-              ['AutoSSL', (() => { const a = rows.find((p) => p.readOnly && p.enabled); return a ? <span>{a.displayName} · <Link to={a.manageAt}>Manage AutoSSL</Link></span> : <span className="muted">no ACME provider selected · <Link to="/ssl-tls/manage-autossl">Manage AutoSSL</Link></span>; })()],
+              ['AutoSSL', (() => { const a = rows.find((p) => p.readOnly && p.enabled); return a ? <span>{a.displayName} · <Link to={a.manageAt}>Manage AutoSSL</Link></span> : <span className="muted">No ACME provider selected · <Link to="/ssl-tls/manage-autossl">Manage AutoSSL</Link></span>; })()],
             ]} />
           </Card>
           <TestResultCard result={lastResult} />
           <Card title="Providers" padded={false}>
             <DataTable dense rows={rows} rowKey={(p) => p.name} columns={[
-              { key: 'displayName', label: 'Provider', render: (p) => <span><strong>{p.displayName}</strong><br /><code className="muted">{p.name}</code></span> },
+              { key: 'displayName', label: 'Provider', render: (p) => (
+                <div>
+                  <strong>{p.displayName}</strong>
+                  <div className="muted"><code>{p.name}</code> · {p.adapterLabel}</div>
+                  {p.url && <a href={p.url} target="_blank" rel="noreferrer">{p.url.replace(/^https:\/\//, '')}</a>}
+                </div>
+              ) },
               { key: 'type', label: 'Type', render: (p) => TYPE_LABELS[p.type] || p.type },
-              { key: 'adapter', label: 'Adapter', render: (p) => p.adapterLabel },
               { key: 'enabled', label: 'Status', render: (p) => <ProviderStatus p={p} /> },
-              { key: 'url', label: 'URL', render: (p) => (p.url ? <a href={p.url} target="_blank" rel="noreferrer">{p.url.replace(/^https:\/\//, '')}</a> : <span className="muted">—</span>) },
-              { key: 'products', label: isRoot ? 'Products (resale)' : 'Products', render: (p) => (p.type === 'ssl' ? (p.products.length ? p.products.map((x) => `${x.name} (${money(x.price, x.currency)})`).join(' · ') : <span className="muted">none</span>) : <span className="muted">catalog from hub{p.adapter === 'hub' && <> · <Link to={LICENSE_PATH}>License key is entered under Basic Setup → License</Link></>}</span>) },
+              { key: 'products', label: isRoot ? 'Products (resale)' : 'Products', render: (p) => (p.type === 'ssl'
+                ? (p.products.length ? <ul className="list-plain">{p.products.map((x) => <li key={x.id || x.name}>{x.name} <span className="muted">{money(x.price, x.currency)}</span></li>)}</ul> : <span className="muted">None</span>)
+                : <span className="muted">Catalog from the hub{p.adapter === 'hub' && <><br /><Link to={LICENSE_PATH}>License key is entered under Basic Setup → License</Link></>}</span>) },
               ...(isRoot ? [
                 { key: 'commissionPercent', label: 'Commission', align: 'right', render: (p) => (p.readOnly ? '—' : `${p.commissionPercent}%`) },
                 { key: 'orders', label: 'Orders', align: 'right', render: (p) => (p.orders == null ? '—' : p.orders) },
@@ -94,9 +100,9 @@ export default function MarketProviderManager({ fn }) {
               isRoot && { label: 'Edit', onClick: () => setForm({ open: true, provider: p }) },
               isRoot && p.hasProducts && { label: 'Sync products', onClick: () => sync(p) },
               isRoot && !p.builtin && { label: 'Delete', danger: true, onClick: () => remove(p) },
-            ])} emptyText="No providers." />
+            ])} emptyText="No providers yet. Providers you add appear here next to the built-in marketplace hub and the ACME clients." />
           </Card>
-          {!isRoot && <p className="muted">Only the server administrator can enable or configure providers. Enabled SSL providers are available under SSL/TLS → Purchase and Install an SSL Certificate.</p>}
+          {!isRoot && <p className="muted">Only the server administrator can enable or configure providers. Enabled SSL providers are available under SSL/TLS › Purchase and Install an SSL Certificate.</p>}
         </>
       )}
       <ProviderFormModal open={form.open} provider={form.provider} adapters={adapters.data} onClose={() => setForm({ open: false, provider: null })} onSaved={() => { setForm({ open: false, provider: null }); refetch(); }} />

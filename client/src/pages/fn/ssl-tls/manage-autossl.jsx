@@ -62,13 +62,15 @@ export default function ManageAutossl({ fn }) {
       {data && draft && (
         <>
           <div className="stat-grid">
-            {[['Domains', data.summary.domains], ['Secured', data.summary.secured], ['Via AutoSSL', data.summary.autossl], ['Expiring soon', data.summary.expiring], ['Excluded', data.summary.excluded]].map(([k, v]) => <div className="stat" key={k}><span className="muted">{k}</span><strong>{v}</strong></div>)}
+            {[['Domains', data.summary.domains], ['Secured', data.summary.secured], ['Via AutoSSL', data.summary.autossl], ['Expiring soon', data.summary.expiring], ['Excluded', data.summary.excluded]].map(([k, v]) => <div className="stat" key={k}><div className="label">{k}</div><div className="value">{v}</div></div>)}
           </div>
-          <Tabs value={tab} onChange={setTab} tabs={[{ value: 'providers', label: 'Providers' }, { value: 'options', label: 'Options' }, { value: 'coverage', label: 'Manage domains', count: data.coverage.length }, { value: 'exclusions', label: 'Exclusions', count: data.exclusions.length }, { value: 'log', label: 'Runs & log', count: runs.data?.length }]} />
+          <div style={{ margin: '18px 0 14px' }}>
+            <Tabs value={tab} onChange={setTab} tabs={[{ value: 'providers', label: 'Providers' }, { value: 'options', label: 'Options' }, { value: 'coverage', label: 'Manage domains', count: data.coverage.length }, { value: 'exclusions', label: 'Exclusions', count: data.exclusions.length }, { value: 'log', label: 'Runs and log', count: runs.data?.length }]} />
+          </div>
 
           {tab === 'providers' && (
             <Card title="Provider" subtitle={data.detect.providers.length ? `Installed ACME clients: ${data.detect.providers.join(', ')}.` : 'No ACME client is installed. Install certbot (apt install certbot / dnf install certbot) or acme.sh, then select it here.'}>
-              <RadioGroup name="provider" value={draft.provider} onChange={(v) => setDraft({ ...draft, provider: v })} options={providerOptions} />
+              <Field label="ACME client"><RadioGroup name="provider" value={draft.provider} onChange={(v) => setDraft({ ...draft, provider: v })} options={providerOptions} /></Field>
               <Field label="Account email" help="Expiry notices from the CA go here. Optional for certbot (registered without email) and acme.sh."><TextInput type="email" value={draft.email} onChange={(v) => setDraft({ ...draft, email: v })} placeholder="hostmaster@example.com" /></Field>
               <KeyValue items={[
                 ['Daily schedule', data.schedule ? <span key="s"><code>{data.schedule.cron}</code> <StatusPill status={data.schedule.enabled ? 'enabled' : 'disabled'} /> {data.schedule.nextRunAt ? `next ${formatDate(data.schedule.nextRunAt)}` : ''}</span> : '—'],
@@ -107,7 +109,7 @@ export default function ManageAutossl({ fn }) {
                   if (d.certificate?.autossl && d.certificate.daysRemaining > Number(data.settings.renewDays)) return <StatusPill status="ok">valid</StatusPill>;
                   return <StatusPill status="pending">{d.certificate ? 'renew' : 'issue'}</StatusPill>;
                 } },
-              ]} rows={data.coverage} rowKey={(d) => d.domain} emptyText="No accounts yet." rowActions={(d) => [
+              ]} rows={data.coverage} rowKey={(d) => d.domain} emptyText="Domains appear here once an account exists." rowActions={(d) => [
                 { label: 'Run for this domain', primary: true, disabled: data.settings.provider === 'disabled', onClick: () => { setRunFor(d.domain); runNow(false, d.domain); } },
                 !d.excluded && { label: 'Exclude', onClick: () => api.post('/ssl/autossl/exclusions', { kind: 'domain', value: d.domain }).then(refetch).catch(toast.error) },
               ]} />
@@ -122,7 +124,7 @@ export default function ManageAutossl({ fn }) {
                   { key: 'value', label: 'Value', render: (e) => <code>{e.value}</code> },
                   { key: 'reason', label: 'Reason' },
                   { key: 'created_at', label: 'Since', render: (e) => formatDate(e.created_at) },
-                ]} rows={data.exclusions} emptyText="Nothing is excluded." rowActions={(e) => [{ label: 'Include again', primary: true, onClick: () => removeExclusion(e) }]} />
+                ]} rows={data.exclusions} emptyText="Excluded accounts and domains appear here." rowActions={(e) => [{ label: 'Include again', primary: true, onClick: () => removeExclusion(e) }]} />
               </Card>
               <Card title="Add an exclusion">
                 <Field label="Kind"><Select value={exclusion.kind} onChange={(v) => setExclusion({ ...exclusion, kind: v })} options={[{ value: 'domain', label: 'Domain (and its subdomains)' }, { value: 'account', label: 'Account (all its domains)' }]} /></Field>
@@ -150,12 +152,12 @@ export default function ManageAutossl({ fn }) {
                   { key: 'provider', label: 'Provider' },
                   { key: 'status', label: 'Status', render: (r) => <StatusPill status={r.status} /> },
                   { key: 'summary', label: 'Result', render: (r) => (r.status === 'skipped' ? r.summary.reason : `checked ${r.summary.checked ?? 0} · issued ${r.summary.issued ?? 0} · renewed ${r.summary.renewed ?? 0} · skipped ${r.summary.skipped ?? 0} · failed ${r.summary.failed ?? 0}`) },
-                ]} rows={runs.data || []} emptyText="AutoSSL has not run yet." rowActions={(r) => [{ label: openRun === r.id ? 'Hide details' : 'Details', primary: true, onClick: () => setOpenRun(openRun === r.id ? null : r.id) }]} />
+                ]} rows={runs.data || []} emptyText="Runs appear here once AutoSSL has run." rowActions={(r) => [{ label: openRun === r.id ? 'Hide details' : 'Details', primary: true, onClick: () => setOpenRun(openRun === r.id ? null : r.id) }]} />
                 {openRun && runs.data?.find((r) => r.id === openRun) && (
-                  <div className="table-wrap" style={{ borderTop: '1px solid var(--border)' }}>
+                  <div className="table-wrap">
                     <table>
                       <thead><tr><th>Domain</th><th>Account</th><th>Action</th><th>Message</th></tr></thead>
-                      <tbody>{runs.data.find((r) => r.id === openRun).entries.map((e) => <tr key={e.domain}><td><code>{e.domain}</code></td><td>{e.account}</td><td><StatusPill status={e.action === 'failed' ? 'failed' : e.action === 'skip' ? 'inactive' : 'ok'}>{e.action}</StatusPill></td><td className="small">{e.message}</td></tr>)}</tbody>
+                      <tbody>{runs.data.find((r) => r.id === openRun).entries.map((e) => <tr key={e.domain}><td><code>{e.domain}</code></td><td>{e.account}</td><td><StatusPill status={e.action === 'failed' ? 'failed' : e.action === 'skip' ? 'inactive' : 'ok'}>{e.action}</StatusPill></td><td className="muted">{e.message}</td></tr>)}</tbody>
                     </table>
                   </div>
                 )}

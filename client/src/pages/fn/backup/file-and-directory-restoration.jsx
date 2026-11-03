@@ -41,7 +41,7 @@ export default function FileAndDirectoryRestoration({ fn }) {
   const restore = async () => {
     if (!backup || !selected.length) return;
     const ok = await confirm({
-      title: `Restore ${selected.length} item(s) into ${homeLabel}?`,
+      title: `Restore ${selected.length} ${selected.length === 1 ? 'item' : 'items'} into ${homeLabel}?`,
       message: `${overwrite ? 'Existing files with the same names are overwritten' : 'Only files that do not exist yet are written'}; ownership is set to ${backup.account}. ${selected.slice(0, 5).map(rel).join(', ')}${selected.length > 5 ? ', …' : ''}`,
       danger: overwrite, confirmLabel: 'Restore',
     });
@@ -71,7 +71,7 @@ export default function FileAndDirectoryRestoration({ fn }) {
           <nav className="breadcrumbs" aria-label="Archive path">
             {crumbs.map((c, i) => {
               const p = crumbs.slice(0, i + 1).join('/');
-              return <span key={p}>{i > 0 && <span>› </span>}{i === crumbs.length - 1 ? <span className="current">{i === 0 ? homeLabel : c}</span> : <a href="#" onClick={(e) => { e.preventDefault(); setPrefix(p); }}>{i === 0 ? homeLabel : c}</a>}</span>;
+              return <span key={p}>{i > 0 && <span>› </span>}{i === crumbs.length - 1 ? <span className="current">{i === 0 ? homeLabel : c}</span> : <button type="button" className="link-button" onClick={() => setPrefix(p)}>{i === 0 ? homeLabel : c}</button>}</span>;
             })}
           </nav>
           <div className="form-grid">
@@ -80,16 +80,16 @@ export default function FileAndDirectoryRestoration({ fn }) {
           <RequestError error={listing.error} onRetry={listing.refetch} />
           <div className="table-wrap">
             <table>
-              <thead><tr><th style={{ width: 32 }} /><th>Name</th><th>Size</th><th>Files</th><th>Modified</th><th>Owner</th><th>Mode</th></tr></thead>
+              <thead><tr><th className="select-col" /><th>Name</th><th>Size</th><th>Files</th><th>Modified</th><th>Owner</th><th>Mode</th></tr></thead>
               <tbody>
-                {prefix !== ROOT && <tr><td /><td colSpan={6}><a href="#" onClick={(e) => { e.preventDefault(); setPrefix(prefix.split('/').slice(0, -1).join('/')); }}><CornerLeftUp size={14} /> ..</a></td></tr>}
+                {prefix !== ROOT && <tr><td /><td colSpan={6}><button type="button" className="link-button" onClick={() => setPrefix(prefix.split('/').slice(0, -1).join('/'))}><CornerLeftUp size={14} /> ..</button></td></tr>}
                 {listing.loading && !listing.data && <tr><td colSpan={7} className="table-state"><span className="spinner" /> Reading the archive…</td></tr>}
                 {entries.map((e) => (
                   <tr key={e.path} className={selected.includes(e.path) ? 'is-selected' : ''}>
                     <td><input type="checkbox" checked={selected.includes(e.path)} onChange={() => toggle(e.path)} aria-label={`Select ${e.name}`} /></td>
                     <td>
                       {e.type === 'dir' ? <Folder size={14} /> : e.type === 'link' ? <Link2 size={14} /> : <File size={14} />}{' '}
-                      {e.type === 'dir' ? <a href="#" onClick={(ev) => { ev.preventDefault(); setPrefix(e.path); }}>{e.name}</a> : e.name}
+                      {e.type === 'dir' ? <button type="button" className="link-button" onClick={() => setPrefix(e.path)}>{e.name}</button> : e.name}
                       {e.target && <span className="muted"> → {e.target}</span>}
                     </td>
                     <td>{formatBytes(e.size)}</td>
@@ -99,16 +99,15 @@ export default function FileAndDirectoryRestoration({ fn }) {
                     <td><code>{e.mode}</code></td>
                   </tr>
                 ))}
-                {listing.data && entries.length === 0 && <tr><td colSpan={7} className="table-state">Empty directory.</td></tr>}
+                {listing.data && entries.length === 0 && <tr><td colSpan={7} className="table-state">This directory is empty.</td></tr>}
               </tbody>
             </table>
           </div>
           {listing.data?.truncated && <p className="muted">Only the first {listing.data.entries.length} of {listing.data.total} entries are shown; use the filter or open a subdirectory.</p>}
           {selected.length > 0 && (
-            <div style={{ marginTop: 12 }}>
-              <strong>Selected</strong>
-              <ul>{selected.map((p) => <li key={p}><code>{rel(p)}</code> <button className="btn btn-sm btn-ghost" onClick={() => toggle(p)}>remove</button></li>)}</ul>
-            </div>
+            <Field label="Selected for restore">
+              <ul className="list-plain">{selected.map((p) => <li key={p}><code>{rel(p)}</code> <Button size="sm" variant="ghost" onClick={() => toggle(p)}>Remove</Button></li>)}</ul>
+            </Field>
           )}
           <div className="form-grid">
             <Field inline><Toggle checked={overwrite} onChange={setOverwrite} label="Overwrite existing files" description="Off: files already present in the home directory are kept (tar --skip-old-files)." /></Field>
@@ -124,12 +123,12 @@ export default function FileAndDirectoryRestoration({ fn }) {
           columns={[
             { key: 'created_at', label: 'Requested', render: (r) => formatDate(r.created_at) },
             { key: 'account_name', label: 'Account' },
-            { key: 'paths', label: 'Paths', render: (r) => (r.options?.paths || []).slice(0, 4).map((p) => <code key={p} style={{ marginRight: 6 }}>{p}</code>) },
+            { key: 'paths', label: 'Paths', render: (r) => (r.options?.paths || []).slice(0, 4).map((p, i) => <span key={p}>{i > 0 && ' '}<code>{p}</code></span>) },
             { key: 'status', label: 'Status', render: (r) => <StatusPill status={r.status} /> },
             { key: 'detail', label: 'Result', render: (r) => r.summary?.steps?.files?.detail || r.error || '' },
             { key: 'started_by', label: 'By' },
           ]}
-          rows={(restores.data || []).filter((r) => r.kind === 'files')} loading={restores.loading} error={restores.error} rowKey={(r) => r.id} dense emptyText="No file restores yet."
+          rows={(restores.data || []).filter((r) => r.kind === 'files')} loading={restores.loading} error={restores.error} rowKey={(r) => r.id} dense emptyText="File restores will appear here."
         />
       </Card>
     </>

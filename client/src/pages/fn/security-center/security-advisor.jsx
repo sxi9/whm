@@ -24,9 +24,11 @@ export function FindingRow({ finding: f }) {
           </div>
         )}
       </td>
-      <td style={{ width: 240, textAlign: 'right' }}>
-        {f.url && <a className="btn btn-sm" href={f.url} target="_blank" rel="noreferrer noopener" style={{ marginRight: 6 }}>{f.advisory || 'Advisory'}</a>}
-        <FixLink fix={f.fix} />
+      <td className="actions-col">
+        <div className="row-actions">
+          {f.url && <a className="btn btn-sm" href={f.url} target="_blank" rel="noreferrer noopener">{f.advisory || 'Advisory'}</a>}
+          <FixLink fix={f.fix} />
+        </div>
       </td>
     </tr>
   );
@@ -85,13 +87,13 @@ export default function SecurityAdvisor({ fn }) {
       <PageHeader fn={fn} actions={<Button variant="primary" loading={busy} onClick={scan}>{data ? 'Scan again' : 'Scan now'}</Button>} description="Read-only probes of SSH, firewall, cPHulk, ModSecurity, file permissions, package updates, PHP advisories and panel settings, graded with links to the page that fixes each finding. A scheduled scan runs nightly." />
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
-      {!loading && !data && !error && <Card><EmptyState title="No scan has run yet">Run a scan to grade this server. Scans never change anything.</EmptyState></Card>}
+      {!loading && !data && !error && <Card><EmptyState title="No scan has run yet">Graded findings appear here after the first scan. Scans only read; they never change anything.</EmptyState></Card>}
       {data && (
         <>
-          <div className="stat-grid" style={{ marginBottom: 14 }}>
+          <div className="stat-grid">
             {ORDER.map((g) => <div key={g} className="stat"><div className="label">{TITLES[g]}</div><div className="value">{data.summary[g] ?? 0}</div></div>)}
-            <div className="stat"><div className="label">Last scan</div><div className="value" style={{ fontSize: 14 }}>{formatDate(data.finishedAt)} <span className="muted">({data.trigger})</span></div></div>
           </div>
+          <p className="muted" style={{ margin: '10px 0 18px' }}>Last scan {formatDate(data.finishedAt)} ({data.trigger}).</p>
           {ORDER.map((grade) => {
             const rows = findings.filter((f) => f.grade === grade);
             if (!rows.length) return null;

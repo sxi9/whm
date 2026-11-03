@@ -1,3 +1,4 @@
+import { AlertTriangle } from 'lucide-react';
 import { ConfigPage } from '../../../components/ConfigPage.jsx';
 
 const NOT_ENFORCED = 'Stored for the authentication layer; not enforced yet.';
@@ -5,7 +6,7 @@ const NOT_ENFORCED = 'Stored for the authentication layer; not enforced yet.';
 export default function ConfigureSecurityPolicies({ fn }) {
   return (
     <ConfigPage fn={fn} prefix="security." description="Policies that govern how users log in to the panel. Not enforced yet: these values are stored for the authentication layer, which does not read them on login or session checks today. Only the minimum password strength is applied."
-      extra={<div className="banner banner-warning"><div>Saving these switches does not harden the server yet. Enforcement of verified-IP login, session timeout, concurrent sessions, password age and the two-factor requirements is pending in the authentication layer; the Security Advisor lists any policy that is switched on but inactive.</div></div>}
+      extra={<div className="banner banner-warning"><AlertTriangle size={18} /><div>Saving these switches does not harden the server yet. Enforcement of verified-IP login, session timeout, concurrent sessions, password age and the two-factor requirements is pending in the authentication layer; the Security Advisor lists any policy that is switched on but inactive.</div></div>}
       groups={[
         { title: 'Two-factor authentication', fields: [
           { key: 'security.2fa.required_for_root', label: 'Require two-factor authentication for root', type: 'toggle', help: NOT_ENFORCED },

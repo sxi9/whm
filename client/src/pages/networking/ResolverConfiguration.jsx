@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { Info, AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { Card, StatusPill, Loading, KeyValue, CapabilityNotice, formatDate } from '../../components/Common.jsx';
@@ -31,14 +32,14 @@ function TestResults({ test }) {
       <p className="muted">{test.healthy} of {test.total} resolver{test.total === 1 ? '' : 's'} answered every lookup ({test.names.join(', ')}).</p>
       <div className="table-wrap">
         <table>
-          <thead><tr><th>Resolver</th><th>Status</th><th>Lookups</th><th style={{ textAlign: 'right' }}>Avg time</th></tr></thead>
+          <thead><tr><th>Resolver</th><th>Status</th><th>Lookups</th><th className="align-right">Avg time</th></tr></thead>
           <tbody>
             {test.servers.map((s) => (
               <tr key={s.server}>
                 <td><code>{s.server}</code></td>
                 <td><StatusPill status={s.ok ? 'ok' : s.reachable ? 'warning' : 'failed'}>{s.ok ? 'healthy' : s.reachable ? 'partial' : 'unreachable'}</StatusPill></td>
                 <td>{s.lookups.map((l) => <div key={l.name}><code>{l.name}</code> → {l.ok ? l.answers.join(', ') : <span className="muted">{l.error || 'no answer'}</span>} <span className="muted">({l.ms} ms)</span></div>)}</td>
-                <td style={{ textAlign: 'right' }}>{s.avgMs != null ? `${s.avgMs} ms` : '—'}</td>
+                <td className="align-right">{s.avgMs != null ? `${s.avgMs} ms` : '—'}</td>
               </tr>
             ))}
           </tbody>
@@ -123,12 +124,15 @@ export function ResolverConfiguration() {
       <ErrorBanner error={error} onRetry={refetch} />
       {data && (
         <Card title="Current configuration" subtitle={`Read from ${data.path}`} actions={<Button size="sm" onClick={() => { refetch(); setTest(null); }}>Refresh</Button>}>
-          <div className={`banner banner-${manager.tone === 'ok' ? 'info' : manager.tone}`}><div>{manager.text}</div></div>
+          <div className={`banner banner-${manager.tone === 'ok' ? 'success' : manager.tone}`}>
+            {manager.tone === 'ok' ? <CheckCircle2 size={16} /> : manager.tone === 'warning' ? <AlertTriangle size={16} /> : <Info size={16} />}
+            <div>{manager.text}</div>
+          </div>
           <KeyValue items={[
             ['Nameservers in use', data.nameservers.length ? data.nameservers.map((n) => <code key={n} style={{ marginRight: 6 }}>{n}</code>) : <StatusPill status="warning">none — resolution is broken</StatusPill>],
             data.search.length > 0 && ['Search domains', data.search.join(' ')],
             data.options.length > 0 && ['Options', data.options.join(' ')],
-            ['Managed by', <code key="m">{data.managedBy}</code>],
+            ['Managed by', data.managedBy === 'whm' ? 'this panel' : <code key="m">{data.managedBy}</code>],
             ['Panel writes to', <code key="w">{data.writePath}</code>],
             data.resolved?.installed && ['systemd-resolved', <StatusPill key="r" status={data.resolved.active ? 'active' : 'inactive'}>{data.resolved.active ? 'running' : 'stopped'}</StatusPill>],
             data.resolved?.upstream && ['Upstream servers (resolvectl)', data.resolved.upstream.servers.length ? <span key="u">{data.resolved.upstream.servers.map((n) => <code key={n} style={{ marginRight: 6 }}>{n}</code>)}{data.resolved.upstream.links?.some((l) => l.servers.length) && <span className="muted">(per-link: {data.resolved.upstream.links.filter((l) => l.servers.length).map((l) => `${l.name}: ${l.servers.join(' ')}`).join('; ')})</span>}</span> : <StatusPill key="u" status="warning">none configured</StatusPill>],
@@ -172,6 +176,7 @@ export function ResolverConfiguration() {
           <ErrorBanner error={testError} />
           {saved && (
             <div className="banner banner-info" style={{ marginTop: 12 }}>
+              <Info size={16} />
               <div>
                 <strong>Written to <code>{saved.path}</code></strong>
                 {saved.target === 'resolved' && <div>systemd-resolved {saved.restarted ? 'restarted' : 'was not restarted'}.</div>}
@@ -194,7 +199,7 @@ export function ResolverConfiguration() {
             { key: 'after', label: 'After', render: (r) => <code>{(r.after?.nameservers || []).join(', ')}</code> },
             { key: 'detail', label: 'Target', render: (r) => r.detail || '—' },
           ]}
-          rows={history || []} rowKey={(r) => r.id} emptyText="No resolver changes recorded yet" dense
+          rows={history || []} rowKey={(r) => r.id} emptyText="Resolver changes applied from this page will appear here" dense
         />
       </Card>
     </>

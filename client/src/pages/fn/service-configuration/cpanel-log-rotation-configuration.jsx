@@ -6,7 +6,7 @@ import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useSettingsForm, SaveBar, RequestError, DaemonNotice, LastApply } from '../../service-config/Shared.jsx';
 
-const POLICY_LABELS = { panel: ['Panel logs', 'panelLogs', '/var/log/whm/*.log — the WHM panel and agent logs'], accounts: ['Account logs', 'accountLogs', '/var/log/whm/domlogs/<user>/*.log — per-domain Apache access/error logs, rotated as root in a root-owned tree — plus one stanza per account for /home/<user>/logs/*.log (the PHP-FPM error log), rotated as that account (su <user>) because the directory belongs to the tenant'], webserver: ['Web server logs', 'webServerLogs', '/var/log/apache2, /var/log/httpd and /var/log/nginx — leave off when the distribution already ships a policy for them'] };
+const POLICY_LABELS = { panel: ['Panel logs', 'panelLogs', 'The panel and agent logs under /var/log/whm'], accounts: ['Account logs', 'accountLogs', 'Per-domain Apache logs, rotated as root, plus one stanza per account for /home/<user>/logs (the PHP-FPM error log), rotated as that account because the directory belongs to the tenant'], webserver: ['Web server logs', 'webServerLogs', 'Apache and NGINX server logs; leave off when the distribution already ships a policy for them'] };
 
 export default function LogRotationConfiguration({ fn }) {
   const toast = useToast();
@@ -43,19 +43,21 @@ export default function LogRotationConfiguration({ fn }) {
             <Field inline><Toggle checked={draft.dateext} onChange={set('dateext')} label="Date suffix instead of numbers (dateext)" /></Field>
             <Field inline><Toggle checked={draft.postrotateWeb} onChange={set('postrotateWeb')} label="Reload Apache after rotating account/web logs" description="postrotate: systemctl reload apache2|httpd" /></Field>
           </Card>
-          <Card title="Managed policies" subtitle={`Files under ${data.managed?.dir || '/etc/logrotate.d'}`}>
+          <Card title="Managed policies" subtitle={`Files under ${data.managed?.dir || '/etc/logrotate.d'}`} padded={false}>
             <div className="table-wrap">
               <table>
                 <thead><tr><th>Policy</th><th>Paths</th><th>Enabled</th><th>On disk</th><th /></tr></thead>
                 <tbody>
                   {data.policies.map((p) => {
                     const [label, key, help] = POLICY_LABELS[p.name];
+                    const paths = p.perAccount ? p.preview.stanzas[0].paths : p.paths;
                     return (
                       <tr key={p.name}>
-                        <td><strong>{label}</strong><div className="small muted">{help}</div></td>
+                        <td style={{ maxWidth: 420 }}><strong>{label}</strong><div className="muted">{help}</div></td>
                         <td>
-                          <code className="small">{p.perAccount ? `${p.preview.stanzas[0].paths.join(' ')} + ${Math.max(0, p.preview.stanzas.length - 1)} account stanza(s)` : p.paths.length ? p.paths.join(' ') : '(nothing left to rotate)'}</code>
-                          {p.coveredBy?.length > 0 && <div className="small muted">Already rotated by the distribution: {p.coveredBy.join(', ')}{p.paths.length ? ' (those logs are left out)' : ' (no file is written)'}</div>}
+                          {paths.length ? paths.map((path) => <div key={path}><code>{path}</code></div>) : <span className="muted">Nothing left to rotate</span>}
+                          {p.perAccount && <div className="muted">+ {Math.max(0, p.preview.stanzas.length - 1)} account stanza(s)</div>}
+                          {p.coveredBy?.length > 0 && <div className="muted">Already rotated by the distribution: {p.coveredBy.join(', ')}{p.paths.length ? ' (those logs are left out)' : ' (no file is written)'}</div>}
                         </td>
                         <td><Toggle checked={draft[key]} onChange={set(key)} /></td>
                         <td>{p.file?.exists ? <StatusPill status="ok">whm-{p.name}</StatusPill> : <StatusPill status="pending">not written</StatusPill>}</td>
@@ -66,7 +68,7 @@ export default function LogRotationConfiguration({ fn }) {
                 </tbody>
               </table>
             </div>
-            {output && <div style={{ marginTop: 12 }}><StatusPill status={output.ok ? 'ok' : 'failed'}>logrotate {output.name}{output.force ? ' (forced)' : ''}</StatusPill><pre className="log" style={{ marginTop: 8 }}>{output.output || '(no output)'}</pre></div>}
+            {output && <div className="card-body"><StatusPill status={output.ok ? 'ok' : 'failed'}>logrotate {output.name}{output.force ? ' (forced)' : ''}</StatusPill><pre className="log" style={{ marginTop: 8 }}>{output.output || '(no output)'}</pre></div>}
           </Card>
           <Card title="Preview">
             {data.policies.filter((p) => draft[POLICY_LABELS[p.name][1]]).map((p) => <details key={p.name} open={p.name === 'accounts'}><summary>whm-{p.name}</summary><pre className="log">{renderPreview(p.preview, draft)}</pre></details>)}

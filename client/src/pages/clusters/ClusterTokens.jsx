@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { KeyRound, Copy } from 'lucide-react';
+import { KeyRound, Copy, AlertTriangle } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { Card, formatDate } from '../../components/Common.jsx';
 import { DataTable } from '../../components/DataTable.jsx';
@@ -54,9 +54,9 @@ export function ClusterTokens({ tokens, hostname, purpose = 'dns', onChanged }) 
     <>
       <Card title={p.title} subtitle={`A peer that wants to ${p.can} ${hostname || 'this server'} authenticates with one of these. Issue one per peer so each can be revoked on its own. A ${p.label} token is confined to ${p.endpoints}; every other API, including the other cluster's endpoints, answers it with 403.${purpose === 'dns' ? ' Tokens issued before the split (marked legacy) keep pushing zones only; reissue them when convenient.' : ''}`} padded={false}
         actions={<Button size="sm" icon={KeyRound} onClick={() => { setIssued(null); setError(null); setOpen(true); }}>Issue token</Button>}>
-        <DataTable dense rows={tokens || []} rowKey={(t) => t.id} emptyText="No cluster tokens issued. A peer needs one before it can push to this server."
+        <DataTable dense rows={tokens || []} rowKey={(t) => t.id} emptyText="No tokens issued yet. Each token you issue appears here with the peer it acts as, when it was last used and when it expires."
           columns={[
-            { key: 'name', label: 'Name', render: (t) => <><strong>{t.name}</strong><br /><code style={{ fontSize: 12 }}>{t.prefix}…</code></> },
+            { key: 'name', label: 'Name', render: (t) => <><strong>{t.name}</strong><br /><code className="small">{t.prefix}…</code></> },
             { key: 'username', label: 'Acts as', render: (t) => <>{t.username}<br /><small className="muted" title={(t.allowed || []).join('\n')}>{PURPOSE[t.purpose]?.label || t.purpose} endpoints only{t.legacy ? ' (legacy token)' : ''}</small></> },
             { key: 'lastUsedAt', label: 'Last used', render: (t) => formatDate(t.lastUsedAt) },
             { key: 'expiresAt', label: 'Expires', render: (t) => (t.expiresAt ? formatDate(t.expiresAt) : <span className="muted">never</span>) },
@@ -68,14 +68,14 @@ export function ClusterTokens({ tokens, hostname, purpose = 'dns', onChanged }) 
       <Modal open={open} title={issued ? 'Token issued' : 'Issue a cluster token'} onClose={() => setOpen(false)} size="md">
         {issued ? (
           <>
-            <div className="banner banner-warning"><div><strong>Copy it now.</strong><p>This is the only time the token is shown; only its hash is stored here.</p></div></div>
+            <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>Copy it now</strong><p>This is the only time the token is shown; only its hash is stored here.</p></div></div>
             <Field label={`Token for ${issued.name}`}>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <input className="input mono" readOnly value={issued.token} onFocus={(e) => e.target.select()} style={{ flex: 1 }} />
+              <div className="input-group">
+                <TextInput className="input mono" readOnly value={issued.token} onChange={() => {}} onFocus={(e) => e.target.select()} />
                 <Button icon={Copy} onClick={copy}>Copy</Button>
               </div>
             </Field>
-            <p className="muted">On the remote panel, add {hostname || 'this server'} as a peer and paste the token as its API token. It can call only: {(issued.allowed || []).map((a) => <code key={a} style={{ fontSize: 12, marginRight: 6 }}>{a}</code>)}</p>
+            <p className="muted">On the remote panel, add {hostname || 'this server'} as a peer and paste the token as its API token. It can call only: {(issued.allowed || []).map((a) => <code key={a} className="small" style={{ marginRight: 6 }}>{a}</code>)}</p>
             {purpose === 'config' && <p className="muted">Settings arrive here only while "Accept settings pushed by peers" is on, and only for the groups this server shares.</p>}
             <FormActions><Button variant="primary" onClick={() => setOpen(false)}>Done</Button></FormActions>
           </>

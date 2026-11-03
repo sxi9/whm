@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, KeyValue, Loading, formatDate } from '../../../components/Common.jsx';
@@ -47,7 +48,7 @@ export default function NginxManager({ fn }) {
       {data && !data.installed && (
         <Card title="Install NGINX">
           <p>NGINX is not installed on this server. Installing it adds the distro <code>nginx</code> package and enables its unit; it stays idle until the proxy is switched on here.</p>
-          {!data.apacheCapability && <div className="banner banner-warning"><div><strong>Apache is not installed either.</strong><p>The reverse proxy fronts Apache; build a web stack with <Link to="/software/easyapache-4">EasyApache 4</Link> first.</p></div></div>}
+          {!data.apacheCapability && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>Apache is not installed either</strong><p>The reverse proxy fronts Apache; build a web stack with <Link to="/software/easyapache-4">EasyApache 4</Link> first.</p></div></div>}
           <div className="action-row"><Button variant="primary" loading={runner.busy} onClick={() => runner.start(() => api.post('/software/nginx/install'), 'Install NGINX')}>Install NGINX</Button></div>
           <ErrorBanner error={runner.error} />
         </Card>
@@ -55,15 +56,17 @@ export default function NginxManager({ fn }) {
       <JobPanel runner={runner} title="Install log" />
       {data?.stale && data.installed && (
         <div className="banner banner-warning">
+          <AlertTriangle size={18} />
           <div>
             <strong>The rendered proxy config is out of date</strong>
-            <p>Domains or certificates changed since whm-proxy.conf was written ({data.domains} domains, {data.sslDomains} with HTTPS now). The hourly scheduled sync catches up on its own; re-sync now to apply it immediately.</p>
+            <p>Domains or certificates changed since the managed config was written ({data.domains} domains, {data.sslDomains} with HTTPS now). The hourly scheduled sync catches up on its own; re-sync now to apply it immediately.</p>
           </div>
           <Button size="sm" variant="primary" loading={busy === 'sync'} onClick={() => action('sync', () => api.post('/software/nginx/sync'))}>Re-sync now</Button>
         </div>
       )}
       {data?.backendExposed && (
         <div className="banner banner-warning">
+          <AlertTriangle size={18} />
           <div>
             <strong>Apache still listens on all interfaces</strong>
             <p>The backend ports are reachable from outside, so the proxy can be bypassed and X-Forwarded-For forged. Save the settings below once to pin Apache to 127.0.0.1.</p>
@@ -120,7 +123,7 @@ export default function NginxManager({ fn }) {
           </Card>
         </>
       )}
-      <Modal open={config != null} title="whm-proxy.conf" onClose={() => setConfig(null)} size="lg" footer={<Button variant="primary" onClick={() => setConfig(null)}>Close</Button>}>
+      <Modal open={config != null} title={data?.configPath || 'Managed config'} onClose={() => setConfig(null)} size="lg" footer={<Button variant="primary" onClick={() => setConfig(null)}>Close</Button>}>
         <pre className="log" style={{ maxHeight: '60vh' }}>{config}</pre>
       </Modal>
     </>

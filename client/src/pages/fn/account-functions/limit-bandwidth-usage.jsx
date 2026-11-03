@@ -45,9 +45,9 @@ export default function LimitBandwidthUsage({ fn }) {
           <Card title={`${account.domain} (${account.username})`}>
             <KeyValue items={[['Used this month', formatMb(account.bandwidth_used_mb)], ['Current limit', formatMb(account.bandwidth_limit_mb)], ['Package default', formatMb(account.plan?.bandwidth_mb)], ['Status', <StatusPill key="s" status={account.suspended ? 'suspended' : 'active'}>{account.suspended ? `Suspended${account.suspend_reason ? `: ${account.suspend_reason}` : ''}` : 'Active'}</StatusPill>]]} />
             <ErrorBanner error={error} />
-            <div className="form-grid" style={{ marginTop: 14 }}>
-              <Field inline><Toggle checked={unlimited} onChange={setUnlimited} label="Unlimited bandwidth" /></Field>
-              {!unlimited && <Field label="Monthly limit (MB)" error={error?.fields?.limitMb} help="1024 MB = 1 GB"><NumberInput value={limit} onChange={setLimit} min={0} nullable={false} /></Field>}
+            <div style={{ marginTop: 14 }}>
+              <Field inline><Toggle checked={unlimited} onChange={setUnlimited} label="Unlimited bandwidth" description="No monthly cap; usage is still counted" /></Field>
+              {!unlimited && <div className="form-grid"><Field label="Monthly limit (MB)" error={error?.fields?.limitMb} help="1024 MB = 1 GB"><NumberInput value={limit} onChange={setLimit} min={0} nullable={false} /></Field></div>}
             </div>
             <FormActions><Button type="submit" variant="primary" loading={busy}>Save limit</Button></FormActions>
           </Card>
@@ -65,7 +65,7 @@ export default function LimitBandwidthUsage({ fn }) {
             { key: 'domain', label: 'Domain' },
             { key: 'bandwidth_used_mb', label: 'Used', align: 'right', render: (r) => formatMb(r.bandwidth_used_mb) },
             { key: 'bandwidth_limit_mb', label: 'Limit', align: 'right', render: (r) => formatMb(r.bandwidth_limit_mb) },
-            { key: 'bandwidth_percent', label: 'Usage', render: (r) => (r.bandwidth_percent == null ? <span className="muted">unlimited</span> : <StatusPill status={r.over_bandwidth ? 'failed' : r.bandwidth_percent >= 80 ? 'warning' : 'ok'}>{r.bandwidth_percent}%</StatusPill>) },
+            { key: 'bandwidth_percent', label: 'Usage', render: (r) => (r.bandwidth_percent == null ? <span className="muted">Unlimited</span> : <StatusPill status={r.over_bandwidth ? 'failed' : r.bandwidth_percent >= 80 ? 'warning' : 'ok'}>{r.bandwidth_percent}%</StatusPill>) },
           ]}
           rows={all || []} rowKey={(r) => r.username} dense
           rowActions={(r) => [{ label: 'Edit', primary: true, onClick: () => setUsername(r.username) }]}

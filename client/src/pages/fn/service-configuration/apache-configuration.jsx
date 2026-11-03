@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { AlertTriangle, CheckCircle2, XCircle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { PageHeader, Card, Loading, StatusPill, KeyValue, formatBytes, formatDuration } from '../../../components/Common.jsx';
 import { Field, TextInput, NumberInput, Select, Toggle, Textarea, Button, FormActions } from '../../../components/Form.jsx';
@@ -56,13 +57,13 @@ export default function ApacheConfiguration({ fn }) {
               ['Version', data.status?.version || data.detect?.version || '—'],
               ['Layout', data.detect?.flavor ? `${data.detect.flavor} (${data.detect.root})` : '—'],
               ['Running MPM', data.status?.mpm || data.detect?.mpm || '—'],
-              ['Listening on', data.ports ? <span key="p"><code>{data.ports.bind ? `${data.ports.bind}:` : ''}{data.ports.http}</code>{data.ports.https ? <> and <code>{data.ports.bind ? `${data.ports.bind}:` : ''}{data.ports.https}</code> (TLS)</> : <> only; HTTPS is terminated by the reverse proxy</>}{data.ports.bind && <span className="small muted"> — bound behind the NGINX proxy (Software › NGINX Manager); every virtual host uses this address</span>}</span> : '—'],
-              ['Domain logs', <span key="l"><code>{data.domlogsRoot || '/var/log/whm/domlogs'}/&lt;user&gt;/</code> <span className="small muted">root-owned, readable by the account</span></span>],
+              ['Listening on', data.ports ? <span key="p"><code>{data.ports.bind ? `${data.ports.bind}:` : ''}{data.ports.http}</code>{data.ports.https ? <> and <code>{data.ports.bind ? `${data.ports.bind}:` : ''}{data.ports.https}</code> (TLS)</> : <> only; HTTPS is terminated by the reverse proxy</>}{data.ports.bind && <span className="muted"> — bound behind the NGINX proxy (Software › NGINX Manager); every virtual host uses this address</span>}</span> : '—'],
+              ['Domain logs', <span key="l"><code>{data.domlogsRoot || '/var/log/whm/domlogs'}/&lt;user&gt;/</code> <span className="muted">root-owned, readable by the account</span></span>],
               ['Managed include', data.include?.path ? <span key="i"><code>{data.include.path}</code> {data.include.exists ? <StatusPill status="ok">present{data.include.enabled ? ', enabled' : ', not enabled'}</StatusPill> : <StatusPill status="pending">not written yet</StatusPill>}</span> : '—'],
               ['Virtual hosts', <span key="v">{data.vhosts.total} total · {data.vhosts.applied} applied · {data.vhosts.pending} pending · {data.vhosts.failed} failed <Button size="sm" onClick={syncVhosts} loading={busy === 'sync'} disabled={!data.installed}>Re-render all</Button></span>],
               ['PHP-FPM', data.php?.versions?.length ? data.php.versions.map((v) => `${v.version} (${v.poolDir})`).join(', ') : 'no PHP-FPM trees found'],
               data.status?.serverStatus && ['mod_status', <span key="s">{data.status.serverStatus.busyWorkers} busy / {data.status.serverStatus.idleWorkers} idle workers · {data.status.serverStatus.requestsPerSecond?.toFixed?.(2) ?? data.status.serverStatus.requestsPerSecond} req/s · {formatBytes((data.status.serverStatus.totalKBytes || 0) * 1024)} served · up {formatDuration(data.status.serverStatus.uptimeSeconds)}</span>],
-              data.status?.modules?.length && ['Loaded modules', <span key="m" className="small">{data.status.modules.map((m) => m.name).join(', ')}</span>],
+              data.status?.modules?.length && ['Loaded modules', <span key="m" className="muted">{data.status.modules.map((m) => m.name).join(', ')}</span>],
             ]} />
           </Card>
           {draft && (
@@ -102,7 +103,7 @@ export default function ApacheConfiguration({ fn }) {
                     {threaded && <Field label="MaxSpareThreads"><NumberInput value={draft.mpm.maxSpareThreads} onChange={setMpm('maxSpareThreads')} min={1} nullable={false} /></Field>}
                     {threaded && <Field label="ThreadsPerChild"><NumberInput value={draft.mpm.threadsPerChild} onChange={setMpm('threadsPerChild')} min={1} nullable={false} /></Field>}
                   </div>
-                  {threaded && data.status?.modules?.some((m) => /^php\d/.test(m.name)) && <div className="banner banner-warning"><div>mod_php is loaded; the {draft.mpm.module} MPM cannot be enabled until PHP runs through PHP-FPM.</div></div>}
+                  {threaded && data.status?.modules?.some((m) => /^php\d/.test(m.name)) && <div className="banner banner-warning"><AlertTriangle size={18} /><div>mod_php is loaded; the {draft.mpm.module} MPM cannot be enabled until PHP runs through PHP-FPM.</div></div>}
                 </Card>
               )}
               {tab === 'include' && (
@@ -112,7 +113,7 @@ export default function ApacheConfiguration({ fn }) {
                     <Button onClick={runTest} loading={testing} disabled={!data.installed}>Test configuration</Button>
                   </FormActions>
                   {test && (
-                    <div className={`banner ${test.ok ? 'banner-info' : 'banner-error'}`}><div><strong>{test.ok ? 'Syntax OK' : 'Configuration rejected'}</strong><pre className="log" style={{ marginTop: 8 }}>{test.output}</pre></div></div>
+                    <div className={`banner ${test.ok ? 'banner-success' : 'banner-error'}`}>{test.ok ? <CheckCircle2 size={18} /> : <XCircle size={18} />}<div><strong>{test.ok ? 'Syntax OK' : 'Configuration rejected'}</strong><pre className="log" style={{ marginTop: 8 }}>{test.output}</pre></div></div>
                   )}
                   {data.include?.content && <details style={{ marginTop: 12 }}><summary>Current managed include on disk</summary><pre className="log">{data.include.content}</pre></details>}
                 </Card>

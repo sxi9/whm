@@ -54,7 +54,7 @@ export default function ResetAccountBandwidthLimit({ fn }) {
           )}
         />
       </Card>
-      {last && <Card title="Last reset"><p>Period <code>{last.period}</code>: reset {last.reset.length} account(s){last.unsuspended.length ? `; unsuspended ${last.unsuspended.join(', ')}` : ''}{last.missing.length ? `; not found: ${last.missing.join(', ')}` : ''}.</p></Card>}
+      {last && <Card title="Last reset"><p>Period <code>{last.period}</code>: reset {last.reset.length} {last.reset.length === 1 ? 'account' : 'accounts'}{last.unsuspended.length ? `; unsuspended ${last.unsuspended.join(', ')}` : ''}{last.missing.length ? `; not found: ${last.missing.join(', ')}` : ''}.</p></Card>}
     </>
   );
 }

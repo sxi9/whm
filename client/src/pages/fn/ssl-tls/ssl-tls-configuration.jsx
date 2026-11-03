@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, Loading, StatusPill, KeyValue } from '../../../components/Common.jsx';
@@ -52,12 +53,12 @@ export default function SslTlsConfiguration({ fn }) {
         <>
           <div className="form-grid">
             <Card title="Profile" subtitle="Mozilla-style presets. Switching a protocol or cipher turns the profile into Custom.">
-              <RadioGroup name="preset" value={draft.preset} onChange={choosePreset} options={[...Object.entries(data.presets).map(([k, p]) => ({ value: k, label: p.label, description: p.description })), { value: 'custom', label: 'Custom', description: 'Hand-edited protocols and cipher list below.' }]} />
+              <Field label="Preset"><RadioGroup name="preset" value={draft.preset} onChange={choosePreset} options={[...Object.entries(data.presets).map(([k, p]) => ({ value: k, label: p.label, description: p.description })), { value: 'custom', label: 'Custom', description: 'Hand-edited protocols and cipher list below.' }]} /></Field>
               <Field label="Protocols">
-                <div className="row-actions" style={{ flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px 28px', padding: '4px 0' }}>
                   {PROTOCOLS.map((p) => <Toggle key={p} checked={draft.protocols.includes(p)} onChange={() => toggleProtocol(p)} label={p} />)}
                 </div>
-                {draft.protocols.some((p) => p === 'TLSv1' || p === 'TLSv1.1') && <div className="banner banner-warning" style={{ marginTop: 8 }}><div>TLS 1.0/1.1 are deprecated (RFC 8996) and fail PCI-DSS scans.</div></div>}
+                {draft.protocols.some((p) => p === 'TLSv1' || p === 'TLSv1.1') && <div className="banner banner-warning" style={{ marginTop: 10 }}><AlertTriangle size={18} /><div>TLS 1.0 and 1.1 are deprecated (RFC 8996) and fail PCI-DSS scans.</div></div>}
               </Field>
               <Field label="Cipher list (TLS ≤ 1.2)" help="OpenSSL cipher string syntax. Applied to Apache SSLCipherSuite, Exim tls_require_ciphers and Dovecot ssl_cipher_list."><Textarea value={draft.ciphers} onChange={(v) => setDraft({ ...draft, preset: 'custom', ciphers: v })} rows={4} mono /></Field>
               <Field label="TLS 1.3 cipher suites" help="Colon-separated TLS_* names; leave empty for the library default."><Textarea value={draft.ciphersuites} onChange={(v) => setDraft({ ...draft, preset: 'custom', ciphersuites: v })} rows={2} mono /></Field>
@@ -101,11 +102,11 @@ export default function SslTlsConfiguration({ fn }) {
               <div className="action-result">
                 <KeyValue items={Object.entries(applied.results).map(([svc, r]) => [svc, r.pending
                   ? <StatusPill key={svc} status="pending">{r.note || 'pending'}</StatusPill>
-                  : <span key={svc}>{r.path && <code className="small">{r.path}</code>} {r.via && <StatusPill status="neutral">via Service Configuration</StatusPill>} {r.validated ? <StatusPill status="ok">validated</StatusPill> : null} {r.library ? <StatusPill status="neutral">{r.library}</StatusPill> : null} <StatusPill status={r.reload?.reloaded ? 'ok' : 'warning'}>{r.reload?.reloaded ? `${r.reload.unit} reloaded` : r.reload?.error || r.note || 'not reloaded'}</StatusPill>{r.legacyRemoved && <span className="muted small"> (old include removed)</span>}</span>])} />
+                  : <span key={svc}>{r.path && <code className="small">{r.path}</code>} {r.via && <StatusPill status="neutral">via Service Configuration</StatusPill>} {r.validated ? <StatusPill status="ok">validated</StatusPill> : null} {r.library ? <StatusPill status="neutral">{r.library}</StatusPill> : null} <StatusPill status={r.reload?.reloaded ? 'ok' : 'warning'}>{r.reload?.reloaded ? `${r.reload.unit} reloaded` : r.reload?.error || r.note || 'not reloaded'}</StatusPill>{r.legacyRemoved && <span className="muted"> (old include removed)</span>}</span>])} />
               </div>
             )}
             {Object.entries(data.status || {}).filter(([svc, s]) => s.content && (svc === 'apache' || !data.delegated?.[svc])).map(([svc, s]) => (
-              <details key={svc} style={{ marginTop: 10 }}><summary className="muted">Current managed include for {svc}: <code>{s.path}</code></summary><pre className="log">{s.content}</pre></details>
+              <details key={svc} style={{ marginTop: 10 }}><summary className="muted">Current managed include for {svc}: <code>{s.path}</code></summary><pre className="log" style={{ marginTop: 8 }}>{s.content}</pre></details>
             ))}
           </Card>
         </>

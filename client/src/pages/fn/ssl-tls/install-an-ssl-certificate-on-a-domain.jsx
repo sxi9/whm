@@ -86,7 +86,7 @@ export default function InstallCertificate({ fn }) {
       <Card>
         <FormActions>
           <Button variant="primary" loading={busy} disabled={!form.domain || (!form.certId && !form.certPem.trim())} onClick={install}>Install</Button>
-          <Link className="btn" to="/ssl-tls/manage-ssl-hosts">Manage SSL Hosts</Link>
+          <Link className="btn" to="/ssl-tls/manage-ssl-hosts">Manage SSL hosts</Link>
         </FormActions>
         {error && error.status === 422 && !error.fields?.domain && !error.fields?.certPem && !error.fields?.keyPem && <ErrorBanner error={error} />}
         {error && error.status !== 422 && <RequestError error={error} />}

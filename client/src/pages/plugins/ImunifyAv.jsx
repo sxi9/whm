@@ -55,22 +55,22 @@ export function ImunifyAvOverview({ base }) {
             <div className="stat">
               <div className="label">ImunifyAV</div>
               <div className="value"><StatusPill status={s.imunify?.installed ? 'installed' : 'not-installed'}>{s.imunify?.installed ? `installed ${s.imunify.version || ''}` : 'not installed'}</StatusPill></div>
-              {s.imunifyStatus && <div className="muted" style={{ fontSize: 12 }}>on-demand scanner: {s.imunifyStatus.status}{s.imunifyStatus.path ? ` (${s.imunifyStatus.path})` : ''}</div>}
+              {s.imunifyStatus && <div className="label">on-demand scanner: {s.imunifyStatus.status}{s.imunifyStatus.path ? ` (${s.imunifyStatus.path})` : ''}</div>}
             </div>
             <div className="stat">
               <div className="label">ClamAV fallback</div>
               <div className="value"><StatusPill status={s.clamav?.installed ? 'installed' : 'not-installed'}>{s.clamav?.installed ? `clamscan ${s.clamav.version || ''}` : 'not installed'}</StatusPill></div>
-              {s.clamav?.installed && <div className="muted" style={{ fontSize: 12 }}>{s.clamav.signatures ? `${s.clamav.signatures} signatures · ` : ''}database {s.clamav.databaseAgeSec == null ? 'missing (run freshclam)' : `updated ${formatDuration(s.clamav.databaseAgeSec)} ago`}</div>}
+              {s.clamav?.installed && <div className="label">{s.clamav.signatures ? `${s.clamav.signatures} signatures · ` : ''}database {s.clamav.databaseAgeSec == null ? 'missing (run freshclam)' : `updated ${formatDuration(s.clamav.databaseAgeSec)} ago`}</div>}
             </div>
             <div className="stat">
               <div className="label">Active scanner</div>
               <div className="value">{s.scanner === 'imunifyav' ? 'ImunifyAV' : s.scanner === 'clamav' ? 'ClamAV' : 'none'}</div>
-              <div className="muted" style={{ fontSize: 12 }}>{s.lastScan ? `last scan ${when(s.lastScan.at)}${s.lastScan.infected != null ? ` · ${s.lastScan.infected} infected` : ''}` : 'no scan recorded'}</div>
+              <div className="label">{s.lastScan ? `last scan ${when(s.lastScan.at)}${s.lastScan.infected != null ? ` · ${s.lastScan.infected} infected` : ''}` : 'no scan recorded'}</div>
             </div>
             <div className="stat">
               <div className="label">Recorded findings</div>
               <div className="value">{s.findings}</div>
-              {s.running && <div className="muted" style={{ fontSize: 12 }}>a ClamAV scan is running</div>}
+              {s.running && <div className="label">a ClamAV scan is running</div>}
             </div>
           </div>
         )}
@@ -92,7 +92,7 @@ export function ImunifyAvOverview({ base }) {
                 <Field label="Directory to scan" htmlFor="imav-path"><TextInput id="imav-path" value={path} onChange={setPath} className="input mono" /></Field>
               </div>
             )}
-            <div className="action-row" style={{ display: 'flex', gap: 8 }}>
+            <div className="form-actions" style={{ flexWrap: 'wrap' }}>
               {s.imunify?.installed && <Button variant="primary" loading={scan.loading} onClick={() => scan.mutate('imunifyav').catch((e) => toast.error(e))}>Start ImunifyAV scan</Button>}
               <Button variant={s.imunify?.installed ? 'default' : 'primary'} loading={scan.loading} disabled={!s.clamav?.installed} onClick={() => scan.mutate('clamav').catch((e) => toast.error(e))}>Scan all accounts with ClamAV</Button>
             </div>
@@ -103,11 +103,11 @@ export function ImunifyAvOverview({ base }) {
       </Card>
       <Card title="Malicious files" subtitle={results.data ? `${results.data.total} recorded by ${results.data.scanner === 'imunifyav' ? 'ImunifyAV' : 'ClamAV'}` : undefined} padded={false}
         actions={results.data?.scanner === 'clamav' && results.data.total > 0 ? <Button size="sm" variant="danger" loading={clear.loading} onClick={() => clear.mutate().catch((e) => toast.error(e))}>Clear findings</Button> : null}>
-        <DataTable columns={findingColumns} rows={results.data?.items || []} loading={results.loading} error={results.error} rowKey={(r, i) => r.id ?? `${r.file}-${i}`} emptyText="No infected files have been found" />
+        <DataTable columns={findingColumns} rows={results.data?.items || []} loading={results.loading} error={results.error} rowKey={(r, i) => r.id ?? `${r.file}-${i}`} emptyText="Infected files reported by a scan appear here" />
       </Card>
       <Card title="Quarantine" subtitle={quarantine.data?.note} padded={false}>
         {quarantine.data?.items?.length === 0 && quarantine.data.scanner !== 'imunifyav' ? <div className="card-body"><EmptyState title="Quarantine needs ImunifyAV">ClamAV only reports infected files; clean them up by hand or install ImunifyAV.</EmptyState></div>
-          : <DataTable columns={findingColumns} rows={quarantine.data?.items || []} loading={quarantine.loading} error={quarantine.error} rowKey={(r, i) => r.id ?? `${r.file}-${i}`} emptyText="Nothing is quarantined" />}
+          : <DataTable columns={findingColumns} rows={quarantine.data?.items || []} loading={quarantine.loading} error={quarantine.error} rowKey={(r, i) => r.id ?? `${r.file}-${i}`} emptyText="Files ImunifyAV moves to quarantine appear here" />}
       </Card>
     </>
   );

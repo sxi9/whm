@@ -41,7 +41,7 @@ export default function EditResellerNameserversAndPrivileges({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Choose which privileges a reseller has, grouped as in WHM, and the nameservers recorded for its accounts. Account creation, suspension, termination, passwords, modification, quotas, bandwidth, packages and IP assignment are enforced by the panel; the other keys are stored for the categories that check them. An empty selection denies everything. Save a selection as an ACL list to reuse it." />
+      <PageHeader fn={fn} description="Choose which privileges a reseller has, grouped by area, and the nameservers recorded for its accounts. Account creation, suspension, termination, passwords, modification, quotas, bandwidth, packages and IP assignment are enforced by the panel; the other keys are stored for the categories that check them. An empty selection denies everything. Save a selection as an ACL list to reuse it." />
       <Card title="Reseller"><ResellerPicker value={username} onChange={setUsername} /></Card>
       <ErrorBanner error={loadError || catalog.error} onRetry={() => { refetch(); catalog.refetch(); }} />
       {reseller && (
@@ -49,7 +49,7 @@ export default function EditResellerNameserversAndPrivileges({ fn }) {
           <Card title={`${reseller.username}`} subtitle={reseller.account ? `Hosting account ${reseller.account.domain}` : 'Standalone reseller login'}>
             <KeyValue items={[['Status', <ResellerStatusPill key="s" reseller={reseller} />], ['Accounts', reseller.usage.accounts], ['Current privileges', reseller.acls.length], ['Current nameservers', reseller.limits.nameservers.join(', ') || `server defaults (${(catalog.data?.defaultNameservers || []).join(', ')})`]]} />
           </Card>
-          <Card title="Nameservers" subtitle="Blank entries fall back to the server's nameservers from Basic WebHost Manager Setup">
+          <Card title="Nameservers" subtitle="Blank entries fall back to the server's nameservers from Basic Setup">
             <NameserversEditor value={nameservers} onChange={setNameservers} owns={owns} onOwnsChange={setOwns} defaults={catalog.data?.defaultNameservers || []} />
           </Card>
           <Card title="Privileges">

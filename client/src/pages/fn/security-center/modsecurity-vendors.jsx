@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading, formatDate } from '../../../components/Common.jsx';
@@ -24,7 +25,7 @@ export default function ModsecurityVendors({ fn }) {
 
   const install = async () => {
     setBusy(true);
-    try { const { data: d } = await api.post('/security/modsec/vendors', { name: form.name.trim(), url: form.url.trim() }); setJobId(d.job.id); toast.info(`Installing ${form.name}…`); setForm({ name: '', url: '' }); } catch (err) { toast.error(err); } finally { setBusy(false); }
+    try { const { data: d } = await api.post('/security/modsec/vendors', { name: form.name.trim(), url: form.url.trim() }); setJobId(d.job.id); toast.info(`Installing ${form.name}`); setForm({ name: '', url: '' }); } catch (err) { toast.error(err); } finally { setBusy(false); }
   };
   const update = async (v) => { try { const { data: d } = await api.post(`/security/modsec/vendors/${v.name}/update`); setJobId(d.job.id); } catch (err) { toast.error(err); } };
   const toggle = async (v, enabled) => { try { await api.patch(`/security/modsec/vendors/${v.name}`, { enabled }); toast.success(`${v.name} ${enabled ? 'enabled' : 'disabled'}; Apache reloaded`); refetch(); } catch (err) { toast.error(err); } };
@@ -47,13 +48,14 @@ export default function ModsecurityVendors({ fn }) {
               { key: 'url', label: 'Source', render: (v) => <a href={v.url} target="_blank" rel="noreferrer" className="small">{v.url}</a> },
               { key: 'installed_at', label: 'Installed / updated', render: (v) => formatDate(v.installed_at) },
               { key: 'enabled', label: 'Enabled', render: (v) => <Toggle checked={v.enabled} onChange={(on) => toggle(v, on)} /> },
-            ]} rows={data.vendors} rowKey={(v) => v.name} emptyText="No vendor rule sets installed. Add the OWASP Core Rule Set below."
+            ]} rows={data.vendors} rowKey={(v) => v.name} emptyText="Installed vendor rule sets appear here. Add the OWASP Core Rule Set below to start."
               rowActions={(v) => [{ label: 'Update', primary: true, onClick: () => update(v) }, { label: 'Remove', danger: true, onClick: () => remove(v) }]} />
           </Card>
           {jobId && <Card title="Installation progress"><ProgressLog jobId={jobId} onFinished={() => refetch()} /></Card>}
           <Card title="Add a vendor" subtitle="A .tar.gz, .tar.bz2, .tar.xz, .tar or .zip archive over https containing the rule files (a rules/ directory and optional crs-setup.conf). Downloaded, extracted and validated with apachectl -t before Apache is reloaded.">
             {data.layout?.distroCrs?.active && (
-              <div className="banner banner-warning" style={{ marginBottom: 10 }}>
+              <div className="banner banner-warning">
+                <AlertTriangle size={18} />
                 <div>
                   <strong>The distribution's OWASP Core Rule Set is already loaded</strong> by <code>{data.layout.distroCrs.file}</code> (<code>{data.layout.distroCrs.directive}</code>). Installing the OWASP CRS preset as a vendor would define the same rule ids twice, so <code>apachectl -t</code> rejects it and the install is rolled back. Disable that include first (on Debian: comment it out in <code>security2.conf</code>), or add only vendors that do not duplicate the packaged CRS.
                 </div>
@@ -64,10 +66,10 @@ export default function ModsecurityVendors({ fn }) {
             </div>
             <div className="form-grid">
               <Field label="Name" required help="Lowercase identifier"><TextInput value={form.name} onChange={(v) => setForm({ ...form, name: v })} placeholder="owasp-crs" /></Field>
-              <Field label="Archive URL (https)" required><TextInput value={form.url} onChange={(v) => setForm({ ...form, url: v })} placeholder="https://…/rules.tar.gz" /></Field>
+              <Field label="Archive URL (https)" required><TextInput value={form.url} onChange={(v) => setForm({ ...form, url: v })} placeholder="https://example.com/rules.tar.gz" /></Field>
             </div>
             <FormActions><Button variant="primary" loading={busy} disabled={!form.name.trim() || !form.url.trim()} onClick={install}>Install</Button></FormActions>
-            <p className="muted">Engine status: <StatusPill status={data.effective.SecRuleEngine === 'On' ? 'ok' : 'warning'}>{data.effective.SecRuleEngine || 'Off'}</StatusPill></p>
+            <p className="muted" style={{ marginTop: 12 }}>Engine status: <StatusPill status={data.effective.SecRuleEngine === 'On' ? 'ok' : 'warning'}>{data.effective.SecRuleEngine || 'Off'}</StatusPill></p>
           </Card>
         </>
       )}

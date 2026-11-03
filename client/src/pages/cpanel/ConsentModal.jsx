@@ -21,26 +21,39 @@ export function TrustNotice() {
   );
 }
 
-// One scope line: the SDK description, the developer's justification and a
-// flag for scopes that reach outside the plugin.
-export function PermissionList({ scopes, added = [], justifications = {} }) {
+// One row per scope: the SDK description, the developer's justification and
+// flags for scopes that are new in this version, already used, or reach
+// outside the plugin.
+export function PermissionList({ scopes, added = [], used = [], justifications = {} }) {
   if (!scopes?.length) return <p className="muted">This plugin declares no permissions.</p>;
   return (
-    <ul className="permission-list">
-      {scopes.map((scope) => {
-        const d = describePermission(scope);
-        const justification = justifications?.[scope];
-        return (
-          <li key={scope}>
-            <code>{scope}</code>
-            {added.includes(scope) ? <span className="pill pill-info" style={{ marginLeft: 8 }}>new</span> : null}
-            {d.sensitive ? <span className="pill pill-warn" style={{ marginLeft: 8 }}>reaches outside the plugin</span> : null}
-            <div className="muted small">{d.text}</div>
-            {justification ? <div className="small"><em>Developer:</em> {justification}</div> : null}
-          </li>
-        );
-      })}
-    </ul>
+    <div className="table-wrap">
+      <table className="permission-list">
+        <thead><tr><th>Permission</th><th>What it allows</th></tr></thead>
+        <tbody>
+          {scopes.map((scope) => {
+            const d = describePermission(scope);
+            const justification = justifications?.[scope];
+            return (
+              <tr key={scope}>
+                <td>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
+                    <code>{scope}</code>
+                    {added.includes(scope) ? <span className="pill pill-info">new</span> : null}
+                    {used.includes(scope) ? <span className="pill pill-ok">used</span> : null}
+                    {d.sensitive ? <span className="pill pill-warn" style={{ textTransform: 'none' }}>reaches outside the plugin</span> : null}
+                  </div>
+                </td>
+                <td>
+                  <div>{d.text}</div>
+                  {justification ? <div className="muted"><em>Developer:</em> {justification}</div> : null}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
   );
 }
 
@@ -72,7 +85,7 @@ export function ConsentModal({ open, pluginId, pluginName, version, required = [
           : 'The package was installed and verified but is held disabled until you grant the permissions it declares.'}
       </p>
       <PermissionList scopes={required} added={added} justifications={justifications} />
-      <TrustNotice />
+      <div style={{ marginTop: 14 }}><TrustNotice /></div>
       <ErrorBanner error={error} />
     </Modal>
   );

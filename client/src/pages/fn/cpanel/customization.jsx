@@ -14,14 +14,24 @@ const KINDS = {
   favicon: { label: 'Favicon', help: 'ICO, PNG or SVG up to 128 KB.', accept: '.ico,.png,.svg,image/x-icon,image/png,image/svg+xml' },
 };
 
-function ColorField({ label, value, onChange, help }) {
+// A native colour picker only accepts #rrggbb, so the theme's accent is read
+// from the token when the field is empty.
+function themeToken(name) {
+  try {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return /^#[0-9a-f]{6}$/i.test(v) ? v : '';
+  } catch { return ''; }
+}
+
+function ColorField({ label, value, onChange, help, token }) {
   const valid = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(value || '');
+  const fallback = useMemo(() => themeToken(token), [token]);
   return (
     <Field label={label} help={help}>
       <div className="input-group">
-        <input type="color" aria-label={`${label} picker`} value={valid && value.length === 7 ? value : '#1b8fc9'} onChange={(e) => onChange(e.target.value)} style={{ width: 44, height: 36, padding: 2, border: '1px solid var(--border)', borderRadius: 'var(--radius)', background: 'transparent' }} />
+        <input type="color" className="input" aria-label={`${label} picker`} value={valid && value.length === 7 ? value : fallback} onChange={(e) => onChange(e.target.value)} style={{ width: 48, flex: 'none', padding: 4 }} />
         <TextInput value={value} onChange={onChange} placeholder="#rrggbb (empty = theme default)" className="input mono" />
-        {value && <button type="button" className="btn btn-sm" onClick={() => onChange('')}>Clear</button>}
+        {value && <Button size="sm" onClick={() => onChange('')}>Clear</Button>}
       </div>
     </Field>
   );
@@ -46,7 +56,7 @@ function ImageCard({ kind, descriptor, onChanged }) {
     } catch (err) { setError(err); } finally { setBusy(false); }
   };
   const remove = async () => {
-    if (!(await confirm({ title: `Remove the ${spec.label.toLowerCase()}?`, message: 'The default WHM mark is shown until a new image is uploaded.', confirmLabel: 'Remove', danger: true }))) return;
+    if (!(await confirm({ title: `Remove the ${spec.label.toLowerCase()}?`, message: 'The default Keel mark is shown until a new image is uploaded.', confirmLabel: 'Remove', danger: true }))) return;
     setBusy(true);
     try { await api.delete(`/cpanel/branding/${kind}`); toast.success(`${spec.label} removed`); onChanged(); } catch (err) { toast.error(err); } finally { setBusy(false); }
   };
@@ -56,12 +66,14 @@ function ImageCard({ kind, descriptor, onChanged }) {
         <div>
           {descriptor ? (
             <>
-              <div style={{ padding: 12, background: 'var(--surface-2)', borderRadius: 'var(--radius)', display: 'inline-block', marginBottom: 10 }}>
+              <div className="stat" style={{ display: 'inline-block', marginBottom: 12 }}>
                 <img src={descriptor.url} alt={`Current ${spec.label.toLowerCase()}`} style={{ maxHeight: kind === 'logo' ? 64 : 32, maxWidth: 320, display: 'block' }} />
               </div>
               <KeyValue items={[['Type', descriptor.mime], ['Size', formatBytes(descriptor.size)], ['Updated', formatDate(descriptor.updatedAt)]]} />
             </>
-          ) : <p className="muted"><ImageIcon size={16} /> No {spec.label.toLowerCase()} uploaded; the built-in WHM mark is used.</p>}
+          ) : (
+            <p className="muted" style={{ display: 'flex', alignItems: 'center', gap: 8 }}><ImageIcon size={16} /> No {spec.label.toLowerCase()} uploaded; the built-in Keel mark is used.</p>
+          )}
         </div>
         <div>
           <Field label={`Upload a new ${spec.label.toLowerCase()}`} htmlFor={`${kind}-file`}>
@@ -110,19 +122,21 @@ export default function Customization({ fn }) {
           <Card title="Company" subtitle="Shown in the top bar, the browser title and the login page">
             <div className="form-grid">
               <Field label="Company name" required><TextInput value={draft.companyName} onChange={set('companyName')} maxLength={80} /></Field>
-              <Field label="Tagline" help="Replaces “WebHost Manager” next to the logo."><TextInput value={draft.tagline} onChange={set('tagline')} maxLength={120} /></Field>
+              <Field label="Tagline" help="Shown under the company name next to the logo."><TextInput value={draft.tagline} onChange={set('tagline')} maxLength={120} /></Field>
               <Field label="Footer text" help="Shown in the footer of every page; empty keeps the default."><TextInput value={draft.footerText} onChange={set('footerText')} maxLength={200} /></Field>
             </div>
           </Card>
+          <ImageCard kind="logo" descriptor={data.logo} onChanged={changed} />
+          <ImageCard kind="favicon" descriptor={data.favicon} onChanged={changed} />
           <Card title="Colours" subtitle="Applied on top of the active theme; a theme that sets the same token wins (Themes › Theme Manager)">
             <div className="form-grid">
-              <ColorField label="Primary colour" value={draft.primaryColor} onChange={set('primaryColor')} help="Buttons, links and the active sidebar item." />
-              <ColorField label="Chrome colour" value={draft.chromeColor} onChange={set('chromeColor')} help="Top bar and sidebar background." />
+              <ColorField label="Primary colour" token="--primary" value={draft.primaryColor} onChange={set('primaryColor')} help="Buttons, links and the active sidebar item." />
+              <ColorField label="Chrome colour" token="--chrome-active" value={draft.chromeColor} onChange={set('chromeColor')} help="Top bar and sidebar background." />
             </div>
-            <div style={{ display: 'flex', gap: 10, alignItems: 'center', marginTop: 8 }}>
-              <span className="muted small">Preview:</span>
-              <span className="btn btn-primary" style={draft.primaryColor ? { background: draft.primaryColor, borderColor: draft.primaryColor } : undefined}>Primary button</span>
-              <span style={{ padding: '6px 12px', borderRadius: 'var(--radius)', background: draft.chromeColor || 'var(--chrome)', color: '#fff' }}>Chrome</span>
+            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+              <span className="muted">Preview</span>
+              <span className="btn btn-primary" style={draft.primaryColor ? { background: draft.primaryColor } : undefined}>Primary button</span>
+              <span className="btn" style={{ background: draft.chromeColor || 'var(--chrome)', color: draft.chromeColor ? 'var(--primary-text)' : 'var(--chrome-text)', boxShadow: '0 0 0 1px var(--border) inset' }}>Chrome</span>
             </div>
           </Card>
           <Card title="Help and documentation links" subtitle="Linked from the top bar user menu and the login page when set">
@@ -142,8 +156,6 @@ export default function Customization({ fn }) {
               <Button disabled={!dirty || saving} onClick={() => setDraft(Object.fromEntries(TEXT_FIELDS.map((k) => [k, data[k] ?? ''])))}>Reset</Button>
             </FormActions>
           </div>
-          <ImageCard kind="logo" descriptor={data.logo} onChanged={changed} />
-          <ImageCard kind="favicon" descriptor={data.favicon} onChanged={changed} />
         </>
       )}
     </>

@@ -59,7 +59,7 @@ export default function UnsuspendBandwidthExceeders({ fn }) {
       </Card>
       {last && (
         <Card title="Last run">
-          <ul>
+          <ul className="list-plain" style={{ display: 'grid', gap: 6 }}>
             {last.unsuspended.map((u) => <li key={u}><code>{u}</code> <StatusPill status="ok">unsuspended</StatusPill></li>)}
             {last.failed.map((f) => <li key={f.username}><code>{f.username}</code> <StatusPill status="failed">{f.error}</StatusPill></li>)}
           </ul>

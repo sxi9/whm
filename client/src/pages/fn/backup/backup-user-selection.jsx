@@ -61,7 +61,7 @@ export default function BackupUserSelection({ fn }) {
               <Button disabled={!selected.length} loading={busy} onClick={() => apply(selected, false)}>Exclude selected</Button>
             </>
           )}
-          emptyText="No accounts."
+          emptyText="Accounts matching the search and filter will appear here."
         />
       </Card>
     </>

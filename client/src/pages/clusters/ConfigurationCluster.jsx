@@ -27,7 +27,7 @@ export function ConfigurationCluster() {
       <PeerTable peers={data.peers} loading={overview.loading} onChanged={refreshAll} focus="config"
         subtitle={`Peers with "Receives config" on get the shared settings of ${data.hostname} when you push. A peer that should push settings here, or that this server pulls from, needs a settings token issued below and this server must accept pushes for its shared groups.`} />
       <GroupSelection groups={data.groups} settings={data.settings} schedule={data.schedule} keyCount={data.keyCount} onSaved={refreshAll} />
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: 18, alignItems: 'start' }}>
+      <div className="grid-2">
         <PushCard peers={data.peers} groups={data.groups} selected={data.selectedGroups} onFinished={refreshAll} />
         <PullCard peers={data.peers} groups={data.groups} selected={data.selectedGroups} onApplied={refreshAll} />
       </div>
@@ -42,8 +42,8 @@ function KeyList({ keys }) {
   if (!keys?.length) return <span className="muted">—</span>;
   const shown = open ? keys : keys.slice(0, 3);
   return (
-    <span style={{ fontSize: 12 }}>
-      <code style={{ fontSize: 12, wordBreak: 'break-all' }}>{shown.join(', ')}</code>
+    <span>
+      <code className="small">{shown.join(', ')}</code>
       {keys.length > 3 && <> <button type="button" className="link-button" onClick={() => setOpen((v) => !v)}>{open ? 'fewer' : `+${keys.length - 3} more`}</button></>}
     </span>
   );
@@ -57,11 +57,11 @@ function ApplyResults({ results }) {
   const rows = Object.entries(results || {}).map(([key, r]) => ({ key, ...r }));
   if (!rows.length) return null;
   return (
-    <DataTable dense rows={rows} rowKey={(r) => r.key} emptyText="Nothing applied."
+    <DataTable dense rows={rows} rowKey={(r) => r.key} emptyText="No settings were applied."
       columns={[
-        { key: 'key', label: 'Setting', render: (r) => <code style={{ fontSize: 12 }}>{r.key}</code> },
+        { key: 'key', label: 'Setting', render: (r) => <code className="small">{r.key}</code> },
         { key: 'status', label: 'Outcome', render: (r) => <StatusPill status={RESULT_STATUS[r.status] || r.status}>{RESULT_LABEL[r.status] || r.status}</StatusPill> },
-        { key: 'via', label: 'Through', render: (r) => (r.via ? <code style={{ fontSize: 12 }}>{r.via}</code> : <span className="muted">settings database</span>) },
+        { key: 'via', label: 'Through', render: (r) => (r.via ? <code className="small">{r.via}</code> : <span className="muted">settings database</span>) },
         { key: 'note', label: 'Details', render: (r) => <span style={{ wordBreak: 'break-word' }}>{r.note || (r.stored ? 'saved' : '—')}</span> },
       ]}
     />
@@ -200,12 +200,12 @@ function PullCard({ peers, groups, selected, onApplied }) {
         {preview && (
           <>
             <p className="muted">{preview.received} settings received for {preview.groups.join(', ')}; {preview.changes.length} differ from this server{preview.rejected.length ? `; ${preview.rejected.length} refused: ${preview.rejected.map((k) => `${k} (${preview.rejections?.[k] || 'not shared'})`).join(', ')}` : ''}. Applying hands each change to the module that owns it; values a daemon cannot take yet are stored until it is installed.</p>
-            <DataTable dense rows={preview.changes} rowKey={(c) => c.key} emptyText="Already identical."
+            <DataTable dense rows={preview.changes} rowKey={(c) => c.key} emptyText="No differences. The peer's shared settings already match this server."
               columns={[
-                { key: 'key', label: 'Setting', render: (c) => <code style={{ fontSize: 12 }}>{c.key}</code> },
-                { key: 'local', label: 'Here', render: (c) => <code style={{ fontSize: 12 }}>{JSON.stringify(c.local)}</code> },
-                { key: 'remote', label: 'Peer', render: (c) => <code style={{ fontSize: 12 }}>{JSON.stringify(c.remote)}</code> },
-                { key: 'apply', label: 'Applied through', render: (c) => (c.apply ? <code style={{ fontSize: 12 }}>{c.apply}</code> : <span className="muted">settings database</span>) },
+                { key: 'key', label: 'Setting', render: (c) => <code className="small">{c.key}</code> },
+                { key: 'local', label: 'Here', render: (c) => <code className="small">{JSON.stringify(c.local)}</code> },
+                { key: 'remote', label: 'Peer', render: (c) => <code className="small">{JSON.stringify(c.remote)}</code> },
+                { key: 'apply', label: 'Applied through', render: (c) => (c.apply ? <code className="small">{c.apply}</code> : <span className="muted">settings database</span>) },
               ]}
             />
           </>

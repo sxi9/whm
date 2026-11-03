@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading, KeyValue, formatDate } from '../../../components/Common.jsx';
+import { DataTable } from '../../../components/DataTable.jsx';
 import { Button, Toggle, ErrorBanner } from '../../../components/Form.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
@@ -31,7 +32,6 @@ export default function SystemUpdate({ fn }) {
   const setAuto = async (autoApply) => {
     try { await api.put('/software/update/auto', { autoApply }); toast.success(autoApply ? 'Nightly automatic updates enabled' : 'Automatic updates disabled'); refetch(); } catch (err) { toast.error(err); }
   };
-  const toggleAll = () => setSelected(selected.length === data.packages.length ? [] : data.packages.map((p) => p.name));
 
   return (
     <>
@@ -59,22 +59,13 @@ export default function SystemUpdate({ fn }) {
             </div>
             <ErrorBanner error={runner.error} />
             {data.packages.length > 0 && (
-              <div className="table-wrap">
-                <table>
-                  <thead><tr><th className="select-col"><input type="checkbox" checked={selected.length === data.packages.length} onChange={toggleAll} aria-label="Select all" /></th><th>Package</th><th>Installed</th><th>Available</th><th>Repository</th></tr></thead>
-                  <tbody>
-                    {data.packages.map((p) => (
-                      <tr key={p.name}>
-                        <td className="select-col"><input type="checkbox" checked={selected.includes(p.name)} onChange={() => setSelected(selected.includes(p.name) ? selected.filter((n) => n !== p.name) : [...selected, p.name])} aria-label={`Select ${p.name}`} /></td>
-                        <td><code>{p.name}</code>{p.security && <StatusPill status="warning">security</StatusPill>}</td>
-                        <td className="small">{p.current || '—'}</td>
-                        <td className="small">{p.candidate}</td>
-                        <td className="small">{p.repo}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+              <DataTable dense selectable selected={selected} onSelectedChange={setSelected} rowKey={(p) => p.name} rows={data.packages}
+                columns={[
+                  { key: 'name', label: 'Package', render: (p) => <><code>{p.name}</code>{p.security && <> <StatusPill status="warning">security</StatusPill></>}</> },
+                  { key: 'current', label: 'Installed', render: (p) => <span className="muted">{p.current || '—'}</span> },
+                  { key: 'candidate', label: 'Available' },
+                  { key: 'repo', label: 'Repository', render: (p) => <span className="muted">{p.repo}</span> },
+                ]} />
             )}
           </Card>
         </>

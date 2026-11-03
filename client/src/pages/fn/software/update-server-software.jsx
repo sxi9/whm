@@ -42,7 +42,7 @@ export default function UpdateServerSoftware({ fn }) {
               ['Install method', data.installMethod === 'git' ? `git checkout at ${data.repoRoot}` : data.installMethod],
               data.latest?.publishedAt && ['Published', formatDate(data.latest.publishedAt)],
             ]} />
-            {data.latest?.notes && <><h3 style={{ marginTop: 14 }}>Release notes</h3><pre className="log">{data.latest.notes}</pre></>}
+            {data.latest?.notes && <div className="action-result"><h3>Release notes</h3><pre className="log">{data.latest.notes}</pre></div>}
           </Card>
           <Card title={data.updateAvailable ? `How to upgrade to ${data.latest.version}` : 'How upgrades are applied'} subtitle={data.selfUpdate.reason}>
             <ol>
@@ -54,7 +54,7 @@ export default function UpdateServerSoftware({ fn }) {
           <Card title="Update settings">
             <div className="form-grid">
               <Field label="Update feed URL" help='JSON document with { "version": "x.y.z", "url": "...", "notes": "..." } or { "tiers": { "stable": {...}, "edge": {...} } }'>
-                <TextInput value={form.url} onChange={(v) => setForm({ ...form, url: v })} placeholder="https://updates.example.com/whm/latest.json" />
+                <TextInput value={form.url} onChange={(v) => setForm({ ...form, url: v })} placeholder="https://updates.example.com/keel/latest.json" />
               </Field>
               <Field label="Release tier"><Select value={form.tier} onChange={(v) => setForm({ ...form, tier: v })} options={[{ value: 'stable', label: 'Stable' }, { value: 'release', label: 'Release' }, { value: 'edge', label: 'Edge (pre-release)' }]} /></Field>
             </div>

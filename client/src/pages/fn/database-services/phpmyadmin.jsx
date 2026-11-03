@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { ExternalLink } from 'lucide-react';
+import { ExternalLink, AlertTriangle, Info } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading, KeyValue } from '../../../components/Common.jsx';
@@ -39,6 +39,7 @@ export default function PhpMyAdmin({ fn }) {
             ]} />
             {!data.installed && (
               <div className="banner banner-warning" style={{ marginTop: 12 }}>
+                <AlertTriangle size={18} />
                 <div>
                   <strong>phpMyAdmin is not installed</strong>
                   <p>Install it with the distribution package{data.packageHint ? <> (<code>{data.packageHint}</code>)</> : ''} via <Link to="/software/install-distro-packages">Install Distro Packages</Link>, or unpack a release into one of the detected locations and add an alias in the web server. Checked: {data.candidates?.join(', ')}.</p>
@@ -46,11 +47,11 @@ export default function PhpMyAdmin({ fn }) {
               </div>
             )}
             {data.installed && !data.urlPath && !data.urlOverride && (
-              <div className="banner banner-info" style={{ marginTop: 12 }}><div>phpMyAdmin files exist but no Apache/nginx alias serves them. Enable the shipped web config (<code>a2enconf phpmyadmin</code> on Debian) or set the URL below.</div></div>
+              <div className="banner banner-info" style={{ marginTop: 12 }}><Info size={18} /><div>phpMyAdmin files exist but no Apache/nginx alias serves them. Enable the shipped web config (<code>a2enconf phpmyadmin</code> on Debian) or set the URL below.</div></div>
             )}
           </Card>
           {data.webConfigs?.length > 0 && (
-            <Card title="Web server configuration">
+            <Card title="Web server configuration" padded={false}>
               <div className="table-wrap"><table><thead><tr><th>File</th><th>Server</th><th>Alias</th><th>Enabled</th></tr></thead><tbody>
                 {data.webConfigs.map((w) => <tr key={w.path}><td><code>{w.path}</code></td><td>{w.server}</td><td>{w.urlPath ? <code>{w.urlPath}</code> : '—'}</td><td><StatusPill status={w.enabled ? 'enabled' : 'disabled'}>{w.enabled ? 'yes' : 'no'}</StatusPill></td></tr>)}
               </tbody></table></div>

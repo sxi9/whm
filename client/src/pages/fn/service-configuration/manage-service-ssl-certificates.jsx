@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, Loading, StatusPill, formatDate } from '../../../components/Common.jsx';
-import { Field, Textarea, NumberInput, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
+import { Field, Textarea, NumberInput, Button, ErrorBanner } from '../../../components/Form.jsx';
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { RequestError, DaemonNotice } from '../../service-config/Shared.jsx';
@@ -40,7 +40,7 @@ export default function ManageServiceSslCertificates({ fn }) {
       {data && (
         <>
           <DaemonNotice installed={data.openssl} message="openssl is not installed on this server; certificates cannot be inspected or generated until the openssl package is installed." onRetry={refetch} />
-          <Card title="Service certificates" subtitle={`Server hostname: ${data.hostname}. Stored under /etc/ssl/whm/service/<service>/ and wired into each daemon's configuration.`} actions={<Field label="Self-signed validity (days)"><NumberInput value={days} onChange={(v) => setDays(v || 365)} min={1} max={3650} nullable={false} /></Field>}>
+          <Card title="Service certificates" subtitle={`Server hostname: ${data.hostname}. Stored under /etc/ssl/whm/service/<service>/ and wired into each daemon's configuration.`} padded={false} actions={<label className="muted" style={{ display: 'flex', alignItems: 'center', gap: 8, whiteSpace: 'nowrap' }}>Self-signed validity (days)<NumberInput value={days} onChange={(v) => setDays(v || 365)} min={1} max={3650} nullable={false} style={{ width: 90 }} /></label>}>
             <div className="table-wrap">
               <table>
                 <thead><tr><th>Service</th><th>Daemon</th><th>Certificate</th><th>Expires</th><th>Issuer</th><th /></tr></thead>
@@ -49,11 +49,11 @@ export default function ManageServiceSslCertificates({ fn }) {
                     const days = s.daysRemaining;
                     return (
                       <tr key={s.service}>
-                        <td><strong>{s.label}</strong><div className="small muted">{s.paths?.dir}</div></td>
+                        <td><strong>{s.label}</strong><div className="muted"><code>{s.paths?.dir}</code></div></td>
                         <td>{s.daemonPresent == null ? <StatusPill status="unknown">—</StatusPill> : s.daemonPresent ? <StatusPill status="installed">installed</StatusPill> : <StatusPill status="not-installed">not installed</StatusPill>}</td>
-                        <td>{s.hasCertificate ? <span><StatusPill status={s.selfSigned ? 'warning' : 'ok'}>{s.selfSigned ? 'self-signed' : 'signed'}</StatusPill> <span className="small">{s.subject}</span></span> : <StatusPill status="pending">none installed</StatusPill>}</td>
+                        <td>{s.hasCertificate ? <span><StatusPill status={s.selfSigned ? 'warning' : 'ok'}>{s.selfSigned ? 'self-signed' : 'signed'}</StatusPill> <span className="muted">{s.subject}</span></span> : <StatusPill status="pending">none installed</StatusPill>}</td>
                         <td>{s.notAfter ? <StatusPill status={days < 0 ? 'failed' : days <= 14 ? 'warning' : 'ok'}>{days < 0 ? `expired ${-days}d ago` : `${days}d · ${formatDate(s.notAfter).split(',')[0]}`}</StatusPill> : '—'}</td>
-                        <td className="small">{s.issuer || '—'}</td>
+                        <td className="muted">{s.issuer || '—'}</td>
                         <td className="actions-col">
                           <div className="row-actions">
                             <Button size="sm" onClick={() => { setEditing(s); setFormError(null); }} disabled={!data.openssl}>Install</Button>
@@ -66,14 +66,14 @@ export default function ManageServiceSslCertificates({ fn }) {
                 </tbody>
               </table>
             </div>
-            <p className="muted" style={{ marginTop: 10 }}>Per-domain website certificates are managed under <Link to="/ssl-tls/manage-ssl-hosts">Manage SSL Hosts</Link>{data.sslCategory ? '' : ' (SSL/TLS category not loaded; installs go straight to the agent)'}. The panel certificate needs WHM_TLS_CERT/WHM_TLS_KEY pointed at /etc/whm/tls and a panel restart.</p>
+            <p className="muted card-body" style={{ margin: 0 }}>Per-domain website certificates are managed under <Link to="/ssl-tls/manage-ssl-hosts">Manage SSL Hosts</Link>{data.sslCategory ? '' : ' (SSL/TLS category not loaded; installs go straight to the agent)'}. The panel certificate needs <code>WHM_TLS_CERT</code>/<code>WHM_TLS_KEY</code> pointed at /etc/whm/tls and a panel restart.</p>
           </Card>
           <Modal open={Boolean(editing)} title={editing ? `Install certificate for ${editing.label}` : ''} onClose={() => setEditing(null)} size="lg" footer={<><Button onClick={() => setEditing(null)}>Cancel</Button><Button variant="primary" loading={busy === 'install'} disabled={!pems.certPem.trim() || !pems.keyPem.trim()} onClick={install}>Install</Button></>}>
             <ErrorBanner error={formError} />
             <Field label="Certificate (PEM)" required><Textarea value={pems.certPem} onChange={(v) => setPems({ ...pems, certPem: v })} rows={7} mono placeholder="-----BEGIN CERTIFICATE-----" /></Field>
             <Field label="Private key (PEM)" required help="Must match the certificate; stored 0600 and encrypted in the panel database"><Textarea value={pems.keyPem} onChange={(v) => setPems({ ...pems, keyPem: v })} rows={7} mono placeholder="-----BEGIN PRIVATE KEY-----" /></Field>
             <Field label="CA bundle / chain (PEM, optional)"><Textarea value={pems.chainPem} onChange={(v) => setPems({ ...pems, chainPem: v })} rows={5} mono /></Field>
-            <FormActions><span className="muted small">The daemon is reloaded after the files are written.</span></FormActions>
+            <p className="muted">The daemon is reloaded after the files are written.</p>
           </Modal>
         </>
       )}

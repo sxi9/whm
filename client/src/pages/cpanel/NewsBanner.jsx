@@ -10,7 +10,7 @@ const readDismissed = () => { try { return JSON.parse(localStorage.getItem(DISMI
 
 const TONE = { info: 'banner-info', warning: 'banner-warning', critical: 'banner-error' };
 
-// Active news items (cPanel › Modify cPanel & WHM News) for the signed-in role.
+// Active news items (Panel › Modify Panel News) for the signed-in role.
 // Dismissals are per browser; critical items cannot be dismissed.
 export function NewsBanner() {
   const { user } = useAuth();
@@ -24,7 +24,7 @@ export function NewsBanner() {
       {items.map((n) => (
         <div key={n.id} className={`banner ${TONE[n.severity] || 'banner-info'}`} role={n.severity === 'critical' ? 'alert' : 'status'}>
           <Megaphone size={18} />
-          <div style={{ flex: 1 }}>
+          <div>
             <strong>{n.title}</strong>
             {n.body && <div className="markdown">{renderMarkdown(n.body)}</div>}
             {(user?.role === 'root' || (user?.role === 'reseller' && n.audience === 'own')) && <small><Link to="/cpanel/modify-cpanel-and-whm-news">Edit news</Link></small>}

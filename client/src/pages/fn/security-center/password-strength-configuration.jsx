@@ -5,7 +5,7 @@ import { Card } from '../../../components/Common.jsx';
 import { Field, PasswordInput, Select, Button, FormActions } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 
-const CONTEXTS = [['account', 'Hosting account passwords'], ['panel', 'Panel (WHM) logins'], ['email', 'Email accounts'], ['ftp', 'FTP accounts'], ['mysql', 'Database users'], ['ssh', 'SSH / shell users']];
+const CONTEXTS = [['account', 'Hosting account passwords'], ['panel', 'Panel logins'], ['email', 'Email accounts'], ['ftp', 'FTP accounts'], ['mysql', 'Database users'], ['ssh', 'SSH / shell users']];
 
 function StrengthTester() {
   const toast = useToast();
@@ -23,7 +23,7 @@ function StrengthTester() {
       </div>
       <FormActions><Button onClick={check} disabled={!password}>Check</Button></FormActions>
       {result && (
-        <div className={`strength strength-${result.ok ? 'good' : 'weak'}`} style={{ marginTop: 8 }}>
+        <div className={`strength strength-${result.ok ? 'good' : 'weak'}`}>
           <div className="strength-bar"><span style={{ width: `${result.score}%` }} /></div>
           <span className="strength-text">Score {result.score} / minimum {result.minimum} for {result.context}: {result.ok ? 'accepted' : 'rejected'}</span>
         </div>

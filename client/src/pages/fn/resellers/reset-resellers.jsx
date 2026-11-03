@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
-import { PageHeader, Card, formatMb } from '../../../components/Common.jsx';
+import { PageHeader, Card, StatusPill, formatMb } from '../../../components/Common.jsx';
 import { DataTable } from '../../../components/DataTable.jsx';
 import { Button, ErrorBanner } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
@@ -54,15 +54,22 @@ export default function ResetResellers({ fn }) {
               <Button variant="danger-ghost" disabled={!rows.length} loading={busy} onClick={() => reset([], true)}>Reset all resellers</Button>
             </>
           )}
-          emptyText="There are no resellers to reset."
+          emptyText="Resellers will be listed here once added in Reseller Center."
         />
       </Card>
       {last && (
-        <Card title="Last reset">
-          <ul>
-            {last.results.map((r) => <li key={r.username}><code>{r.username}</code>: {r.reset ? `reset; ${r.accounts_moved.length} account(s) moved to ${last.moved_to}${r.ips_released.length ? `, released ${r.ips_released.join(', ')}` : ''}${r.login_suspended ? '; login suspended (no hosting account)' : ''}` : r.reason}</li>)}
-            {last.missing.map((u) => <li key={u}><code>{u}</code>: not a reseller</li>)}
-          </ul>
+        <Card title="Last reset" subtitle={`Accounts moved to ${last.moved_to}`} padded={false}>
+          <DataTable
+            dense
+            columns={[
+              { key: 'username', label: 'Reseller', render: (r) => <code>{r.username}</code> },
+              { key: 'result', label: 'Result', render: (r) => <StatusPill status={r.reset ? 'done' : 'failed'}>{r.reset ? 'Reset' : r.missing ? 'Not a reseller' : 'Not reset'}</StatusPill> },
+              { key: 'details', label: 'Details', render: (r) => r.reset
+                ? `${r.accounts_moved.length} account(s) moved to ${last.moved_to}${r.ips_released.length ? `, released ${r.ips_released.join(', ')}` : ''}${r.login_suspended ? '; login suspended (no hosting account)' : ''}`
+                : (r.reason || <span className="muted">—</span>) },
+            ]}
+            rows={[...last.results, ...last.missing.map((u) => ({ username: u, missing: true }))]} rowKey={(r) => r.username}
+          />
         </Card>
       )}
     </>

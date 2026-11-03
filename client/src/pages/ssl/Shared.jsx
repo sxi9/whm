@@ -18,9 +18,9 @@ export function RequestError({ error, onRetry }) {
 
 export function Tabs({ tabs, value, onChange }) {
   return (
-    <div className="row-actions" role="tablist" style={{ marginBottom: 14, flexWrap: 'wrap' }}>
+    <div className="segmented" role="tablist">
       {tabs.map((t) => (
-        <button key={t.value} type="button" role="tab" aria-selected={value === t.value} className={`btn btn-sm ${value === t.value ? 'btn-primary' : ''}`} onClick={() => onChange(t.value)}>
+        <button key={t.value} type="button" role="tab" aria-selected={value === t.value} className={value === t.value ? 'active' : ''} onClick={() => onChange(t.value)}>
           {t.label}{t.count != null && <span className="pill pill-muted" style={{ marginLeft: 6 }}>{t.count}</span>}
         </button>
       ))}
@@ -92,7 +92,7 @@ export function CertificateSummary({ certificate, chain }) {
 }
 
 // Picks one of the domains the caller may manage (accounts' main, addon, sub and parked domains).
-export function DomainSelect({ value, onChange, allowCustom = true, placeholder = 'Select a domain…', help }) {
+export function DomainSelect({ value, onChange, allowCustom = true, placeholder = 'Select a domain', help }) {
   const { data } = useApi('/ssl/domains');
   const [custom, setCustom] = useState(false);
   const options = (data || []).map((d) => ({ value: d.domain, label: `${d.domain} (${d.account}${d.type !== 'main' ? `, ${d.type}` : ''})${d.certificate ? ' · has certificate' : ''}` }));
@@ -100,14 +100,14 @@ export function DomainSelect({ value, onChange, allowCustom = true, placeholder 
     return (
       <>
         <TextInput value={value} onChange={onChange} placeholder="hostname.example.com" />
-        <div className="field-help">{help || 'Any hostname this server answers for (root only).'} <button type="button" className="btn btn-sm btn-ghost" onClick={() => setCustom(false)}>Pick from accounts</button></div>
+        <div className="field-help">{help || 'Any hostname this server answers for (root only).'} <Button variant="ghost" size="sm" onClick={() => setCustom(false)}>Pick from accounts</Button></div>
       </>
     );
   }
   return (
     <>
       <Select value={value} onChange={onChange} options={options} placeholder={placeholder} />
-      {allowCustom && <div className="field-help">{help} <button type="button" className="btn btn-sm btn-ghost" onClick={() => setCustom(true)}>Type another hostname</button></div>}
+      {allowCustom && <div className="field-help">{help} <Button variant="ghost" size="sm" onClick={() => setCustom(true)}>Type another hostname</Button></div>}
     </>
   );
 }

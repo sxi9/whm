@@ -41,7 +41,7 @@ export default function ShowDatabaseProcesses({ fn }) {
             ]}
             rows={rows} loading={loading && !data} rowKey={(p) => p.id} dense
             rowActions={(p) => [p.info ? { label: 'Kill query', primary: true, danger: true, onClick: () => kill(p, true) } : null, { label: 'Kill connection', danger: true, primary: !p.info, onClick: () => kill(p, false) }]}
-            emptyText="No client connections."
+            emptyText="No client connections right now. Open connections and running statements appear here."
           />
         </Card>
       )}

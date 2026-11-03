@@ -54,11 +54,11 @@ export default function ChangeOwnershipOfMultipleAccounts({ fn }) {
           toolbar={(
             <>
               <Field inline><Select value={ownerFilter} onChange={setOwnerFilter} options={owners.map((o) => ({ value: o.username, label: `owned by ${o.username}` }))} placeholder="Any current owner" /></Field>
-              <Field inline><Select value={owner} onChange={setOwner} options={owners.map((o) => ({ value: o.username, label: `${o.username} (${o.role})` }))} placeholder="New owner…" /></Field>
+              <Field inline><Select value={owner} onChange={setOwner} options={owners.map((o) => ({ value: o.username, label: `${o.username} (${o.role})` }))} placeholder="New owner" /></Field>
               <Button variant="primary" disabled={!selected.length || !owner} loading={busy} onClick={apply}>Move {selected.length} to {owner || '…'}</Button>
             </>
           )}
-          emptyText="No accounts match."
+          emptyText="Hosting accounts matching the filter will be listed here."
         />
       </Card>
       {last && (

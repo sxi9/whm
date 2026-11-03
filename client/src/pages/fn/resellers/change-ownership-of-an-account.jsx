@@ -43,7 +43,7 @@ export default function ChangeOwnershipOfAnAccount({ fn }) {
             <KeyValue items={[['Current owner', <code key="o">{account.owner}</code>], ['Package', account.package_name], ['IP', account.ip], ['Status', account.suspended ? 'Suspended' : 'Active']]} />
             <ErrorBanner error={error} />
             <div className="form-grid" style={{ marginTop: 12 }}>
-              <Field label="New owner" required help="root or a reseller"><Select value={owner} onChange={setOwner} options={owners.map((o) => ({ value: o.username, label: `${o.username} (${o.role})` }))} placeholder="Select an owner" /></Field>
+              <Field label="New owner" required help="Root or a reseller"><Select value={owner} onChange={setOwner} options={owners.map((o) => ({ value: o.username, label: `${o.username} (${o.role})` }))} placeholder="Select an owner" /></Field>
             </div>
             <FormActions><Button type="submit" variant="primary" loading={busy} disabled={!owner}>Change ownership</Button></FormActions>
           </Card>

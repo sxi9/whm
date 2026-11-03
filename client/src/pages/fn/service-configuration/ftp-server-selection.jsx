@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { PageHeader, Card, Loading, StatusPill, KeyValue } from '../../../components/Common.jsx';
 import { Field, NumberInput, Select, Toggle, TextInput } from '../../../components/Form.jsx';
@@ -39,7 +40,7 @@ export default function FtpServerSelection({ fn }) {
             <KeyValue items={[['Selected in panel', data.selected], ['Running now', activeName ? <StatusPill key="a" status="active">{activeName}</StatusPill> : <StatusPill key="a" status="inactive">none</StatusPill>], ['Package manager', data.detect?.packageManager || 'none detected']]} />
             <RequestError error={capError} onRetry={() => setCapError(null)} />
             <DaemonSelector candidates={data.detect?.candidates || []} current={data.active} selected={data.selected} onSelect={select} busy={busy} pkgAvailable={data.pkgAvailable} disabledLabel="Disable FTP" packageManager={data.detect?.packageManager} />
-            {result && <div style={{ marginTop: 12 }}><StepList steps={result.steps} />{result.config?.error && <div className="banner banner-warning"><div>Daemon switched, but applying the saved settings failed: {result.config.error}</div></div>}</div>}
+            {result && <div style={{ marginTop: 12 }}><StepList steps={result.steps} />{result.config?.error && <div className="banner banner-warning"><AlertTriangle size={18} /><div>Daemon switched, but applying the saved settings failed: {result.config.error}</div></div>}</div>}
           </Card>
           <JobCard jobId={jobId} title="Package installation" onFinished={() => { form.refetch(); toast.info('Installation finished; select the daemon again to enable it'); }} />
           <Card title="Daemon settings" className="config-fields" subtitle={data.config?.path ? `Applied to ${data.config.path}${data.config.unit?.unit ? ` and ${data.config.unit.unit} is restarted` : ''}` : 'Saved in the panel and written to whichever daemon is active'}>

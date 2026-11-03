@@ -1,3 +1,4 @@
+import { Info } from 'lucide-react';
 import { PageHeader, Card, Loading, formatDate } from '../../../components/Common.jsx';
 import { Field, NumberInput, Toggle } from '../../../components/Form.jsx';
 import { useSettingsForm, SaveBar, RequestError, ListEditor } from '../../service-config/Shared.jsx';
@@ -12,7 +13,7 @@ export default function WebServicesConfiguration({ fn }) {
       {form.loading && !data && <Loading />}
       {data && draft && (
         <>
-          {data.live === false && <div className="banner banner-info"><div><strong>Not wired to the running panel.</strong> Session and token lifetimes, rate limits, CORS, compression and the listen address are still governed by the panel's own configuration file; this page records the intended values for when the API server consumes them.</div></div>}
+          {data.live === false && <div className="banner banner-info"><Info size={18} /><div><strong>Not wired to the running panel.</strong> Session and token lifetimes, rate limits, CORS, compression and the listen address are still governed by the panel's own configuration file; this page records the intended values for when the API server consumes them.</div></div>}
           <Card title="API" className="config-fields" subtitle={data.lastUpdate ? `Last changed ${formatDate(data.lastUpdate)}` : undefined}>
             <Field inline><Toggle checked={draft.apiEnabled} onChange={set('apiEnabled')} label="JSON API for API tokens" description="Intended setting; API tokens keep working regardless of this value for now" /></Field>
             <div className="form-grid">

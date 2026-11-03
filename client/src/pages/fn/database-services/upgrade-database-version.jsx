@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
+import { AlertTriangle, Info } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading, KeyValue, formatDate } from '../../../components/Common.jsx';
@@ -38,18 +39,18 @@ export default function UpgradeDatabaseVersion({ fn }) {
       {data && (
         <>
           <Card title="Current server">
-            {data.error && <div className="banner banner-warning"><div><strong>Server not reachable</strong><p>{data.error.message}</p></div></div>}
+            {data.error && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>Server not reachable</strong><p>{data.error.message}</p></div></div>}
             <KeyValue items={[
               ['Profile', data.profile ? `${data.profile.profile_name} (${engineLabel(data.profile.engine)}${data.local ? ', local' : ', remote'})` : '—'],
               ['Running version', data.version ? `${data.version.version} ${data.version.comment ? `— ${data.version.comment}` : ''}` : '—'],
-              ['Package manager', <StatusPill key="p" status={data.installerAvailable ? 'ok' : 'warning'}>{data.installerAvailable ? `${data.packageManager} — packages are installed through it` : 'not detected — no package can be installed from this panel'}</StatusPill>],
+              ['Package manager', <span key="p"><StatusPill status={data.installerAvailable ? 'ok' : 'warning'}>{data.installerAvailable ? data.packageManager : 'not detected'}</StatusPill> <span className="muted">{data.installerAvailable ? 'packages are installed through it' : 'no package can be installed from the panel'}</span></span>],
               ['Installed server packages', data.packages?.installed?.length ? data.packages.installed.map((p) => `${p.name} ${p.version}`).join(', ') : 'none detected'],
               ['Pre-upgrade backups', <code key="b">{data.backupDir}</code>],
             ]} />
           </Card>
           <Card title="Upgrade">
             <RequestError error={runError} />
-            {!data.local && <div className="banner banner-info"><div>The active profile is a remote server; upgrade it on that host. Switch to the local profile under <Link to="/database-services/manage-database-profiles">Manage Database Profiles</Link> to upgrade this server.</div></div>}
+            {!data.local && <div className="banner banner-info"><Info size={18} /><div>The active profile is a remote server; upgrade it on that host. Switch to the local profile under <Link to="/database-services/manage-database-profiles">Manage Database Profiles</Link> to upgrade this server.</div></div>}
             <div className="form-grid">
               <Field label="Target package" help={options.length ? 'Candidates offered by the package manager' : 'No candidate found; enter the package name'}>
                 <Select value={target || options[0]?.value || '__custom'} onChange={setTarget} options={[...options, { value: '__custom', label: 'Other package…' }]} />
@@ -68,7 +69,7 @@ export default function UpgradeDatabaseVersion({ fn }) {
                 { key: 'status', label: 'Job', render: (j) => <StatusPill status={j.status} /> },
                 { key: 'result', label: 'Result', render: (j) => (j.error ? <span className="muted">{j.error}</span> : j.result ? (j.result.available === false ? <span className="muted">not available: no package manager</span> : j.result.alreadyCurrent ? <span className="muted">already current ({j.result.versionBefore || '?'}); server not restarted</span> : `${j.result.versionBefore || '?'} → ${j.result.versionAfter || '?'}${j.result.backup ? ` · backup ${j.result.backup.path}` : ''}`) : '—') },
               ]}
-              rows={data.recentJobs || []} rowKey={(j) => j.id} dense emptyText="No upgrade jobs yet."
+              rows={data.recentJobs || []} rowKey={(j) => j.id} dense emptyText="No upgrade jobs yet. Started upgrades appear here."
             />
           </Card>
         </>

@@ -40,9 +40,10 @@ export default function ManageResellersSharedIp({ fn }) {
       {data && (
         <form onSubmit={save}>
           <Card title={`Shared IP for ${username}`} actions={<Link className="btn btn-sm" to={`/resellers/manage-resellers-ip-delegation?username=${username}`}>Delegate addresses</Link>}>
-            <KeyValue items={[['Current', data.shared_ip || 'server default'], ['Server shared IP', data.server_shared_ip || 'not set (Basic WebHost Manager Setup)'], ['Delegated addresses', data.delegated.join(', ') || 'none']]} />
+            <KeyValue items={[['Current', data.shared_ip || 'server default'], ['Server shared IP', data.server_shared_ip || 'not set (see Basic Setup)'], ['Delegated addresses', data.delegated.join(', ') || 'none']]} />
             <ErrorBanner error={saveError} />
-            <Field label="Use" help="Delegated or free addresses can be chosen; reserved and dedicated ones cannot">
+            <div style={{ marginTop: 14 }} />
+            <Field label="Use" htmlFor="shared-ip" help="Delegated or free addresses can be chosen; reserved and dedicated ones cannot">
               <RadioGroup name="shared-ip" value={choice} onChange={setChoice} options={options} />
             </Field>
             <FormActions><Button type="submit" variant="primary" loading={busy} disabled={choice === (data.shared_ip || '')}>Save shared IP</Button></FormActions>

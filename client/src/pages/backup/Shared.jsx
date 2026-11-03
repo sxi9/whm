@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
 import { CapabilityNotice, StatusPill, formatBytes, formatDate } from '../../components/Common.jsx';
-import { Field, Select, TextInput, NumberInput, Toggle, Textarea, PasswordInput, ErrorBanner } from '../../components/Form.jsx';
+import { Field, Select, TextInput, NumberInput, Toggle, Textarea, PasswordInput, ErrorBanner, Button } from '../../components/Form.jsx';
 
 export function isCapabilityError(error) {
   return Boolean(error) && (error.status === 501 || error.code === 'capability_missing' || error.code === 'binary_not_found');
@@ -53,13 +54,13 @@ export function BackupPicker({ account, onAccountChange, backup, onBackupChange,
 
   const options = useMemo(() => (accounts.data || [])
     .filter((a) => !filter || `${a.username} ${a.domain || ''} ${a.owner || ''}`.toLowerCase().includes(filter.toLowerCase()))
-    .map((a) => ({ value: a.username, label: `${a.username}${a.domain ? ` — ${a.domain}` : ''}${a.exists ? '' : ' (account no longer exists)'} · ${a.backups} backup(s)` })), [accounts.data, filter]);
+    .map((a) => ({ value: a.username, label: `${a.username}${a.domain ? ` — ${a.domain}` : ''}${a.exists ? '' : ' (account no longer exists)'} · ${a.backups} ${a.backups === 1 ? 'backup' : 'backups'}` })), [accounts.data, filter]);
 
   return (
     <>
       <div className="form-grid">
         <Field label="Filter"><TextInput value={filter} onChange={setFilter} placeholder="Type to filter by user, domain or owner" /></Field>
-        <Field label="Account" help={accounts.loading ? 'Loading accounts…' : `${(accounts.data || []).length} account(s) with or without backups`}>
+        <Field label="Account" help={accounts.loading ? 'Loading accounts…' : `${(accounts.data || []).length} ${(accounts.data || []).length === 1 ? 'account' : 'accounts'}, with or without backups`}>
           <Select value={account || ''} onChange={(v) => { onAccountChange(v); onBackupChange(null); }} options={options} placeholder={options.length ? 'Select an account' : 'No accounts'} />
         </Field>
       </div>
@@ -69,24 +70,24 @@ export function BackupPicker({ account, onAccountChange, backup, onBackupChange,
           <RequestError error={backups.error} onRetry={backups.refetch} />
           <div className="table-wrap">
             <table>
-              <thead><tr><th style={{ width: 32 }} /><th>Backup date</th><th>Archive</th><th>Size</th><th>Class</th><th>Copies</th></tr></thead>
+              <thead><tr><th className="select-col" /><th>Backup date</th><th>Archive</th><th>Size</th><th>Class</th><th>Copies</th></tr></thead>
               <tbody>
                 {(backups.data || []).map((b) => (
                   <tr key={b.id} className={backup?.id === b.id ? 'is-selected' : ''} onClick={() => onBackupChange(b)} style={{ cursor: 'pointer' }}>
                     <td><input type="radio" name="backup" checked={backup?.id === b.id} onChange={() => onBackupChange(b)} aria-label={`Select backup ${b.id}`} /></td>
                     <td>{formatDate(b.created_at)}</td>
-                    <td><code>{b.name}</code>{b.pinned && <span className="pill pill-info" style={{ marginLeft: 6 }}>pinned</span>}</td>
+                    <td><code>{b.name}</code>{b.pinned && <> <span className="pill pill-info">pinned</span></>}</td>
                     <td>{formatBytes(b.size)}</td>
                     <td><span className="pill pill-muted">{b.retention_class}</span></td>
-                    <td>{b.local_present ? <span className="pill pill-ok">local</span> : <span className="pill pill-warn">remote only</span>}{' '}{b.uploads?.filter((u) => u.status === 'done').map((u) => <span key={u.id} className="pill pill-info" style={{ marginLeft: 4 }}>{u.destination}</span>)}</td>
+                    <td>{b.local_present ? <span className="pill pill-ok">local</span> : <span className="pill pill-warn">remote only</span>}{' '}{b.uploads?.filter((u) => u.status === 'done').map((u) => <span key={u.id}> <span className="pill pill-info">{u.destination}</span></span>)}</td>
                   </tr>
                 ))}
-                {!backups.loading && (backups.data || []).length === 0 && <tr><td colSpan={6} className="table-state">No completed backups for this account yet. <Link to="/backup/backup-configuration">Run a backup</Link> first.</td></tr>}
+                {!backups.loading && (backups.data || []).length === 0 && <tr><td colSpan={6} className="table-state">Completed backups of this account will be listed here. <Link to="/backup/backup-configuration">Run a backup</Link> first.</td></tr>}
                 {backups.loading && !backups.data && <tr><td colSpan={6} className="table-state"><span className="spinner" /> Loading…</td></tr>}
               </tbody>
             </table>
           </div>
-          {requireLocal && backup && !backup.local_present && <div className="banner banner-warning"><div>This archive is not on local disk. Fetch it from a destination before browsing or restoring it.</div></div>}
+          {requireLocal && backup && !backup.local_present && <div className="banner banner-warning"><AlertTriangle size={18} /><div>This archive is not on local disk. Fetch it from a destination before browsing or restoring it.</div></div>}
         </>
       )}
     </>
@@ -103,7 +104,7 @@ export function FetchButton({ backup, onQueued }) {
   };
   return (
     <>
-      <button className="btn" disabled={busy} onClick={fetchIt}>{busy ? 'Queuing…' : 'Fetch archive from destination'}</button>
+      <Button loading={busy} onClick={fetchIt}>{busy ? 'Queuing…' : 'Fetch archive from destination'}</Button>
       <RequestError error={error} />
     </>
   );
@@ -134,7 +135,7 @@ export function DestinationFields({ value, onChange, errors = {}, editing = fals
   return (
     <div className="form-grid">
       <Field label="Type" required><Select value={value.kind} onChange={(kind) => onChange(emptyDestination(kind))} options={Object.entries(KIND_LABELS).map(([k, label]) => ({ value: k, label }))} disabled={editing} /></Field>
-      {value.kind === 'local' && <Field label="Directory" required error={err('dir')} help="A second local copy, e.g. a mounted drive under /backup or /var/backups/whm"><TextInput value={value.dir} onChange={(v) => set('dir', v)} /></Field>}
+      {value.kind === 'local' && <Field label="Directory" required error={err('dir')} help="A second local copy, for example a mounted drive under /backup or /var/backups/whm"><TextInput value={value.dir} onChange={(v) => set('dir', v)} /></Field>}
       {(value.kind === 'ftp' || value.kind === 'sftp') && (
         <>
           <Field label="Host" required error={err('host')}><TextInput value={value.host} onChange={(v) => set('host', v.trim().toLowerCase())} placeholder="backup.example.com" /></Field>
@@ -154,13 +155,13 @@ export function DestinationFields({ value, onChange, errors = {}, editing = fals
       {value.kind === 'sftp' && (
         <>
           <Field label="Private key (PEM, optional)" error={err('privateKey')} help={secretHelp || 'Used instead of, or in addition to, the password'}><Textarea value={value.privateKey} onChange={(v) => set('privateKey', v)} rows={4} mono /></Field>
-          <Field label="Host key SHA-256" required={!value.insecure} error={err('hostKeySha256')} help="Base64 fingerprint as printed by ssh-keyscan host | ssh-keygen -lf -. Pins the server identity; required unless verification is skipped below."><TextInput value={value.hostKeySha256} onChange={(v) => set('hostKeySha256', v.trim())} /></Field>
+          <Field label="Host key SHA-256" required={!value.insecure} error={err('hostKeySha256')} help="Base64 fingerprint as printed by ssh-keyscan host | ssh-keygen -lf -. Pins the server identity; required unless verification is skipped below"><TextInput value={value.hostKeySha256} onChange={(v) => set('hostKeySha256', v.trim())} /></Field>
           <Field inline><Toggle checked={value.insecure} onChange={(v) => set('insecure', v)} label="Skip host key verification" description="Not recommended: the connection can be intercepted. Ignored when a fingerprint is set." /></Field>
         </>
       )}
       {value.kind === 'webdav' && (
         <>
-          <Field label="URL" required error={err('url')} help="Collection the archives are uploaded into, e.g. https://cloud.example.com/remote.php/dav/files/user/backups"><TextInput value={value.url} onChange={(v) => set('url', v.trim())} /></Field>
+          <Field label="URL" required error={err('url')} help="Collection the archives are uploaded into, for example https://cloud.example.com/remote.php/dav/files/user/backups"><TextInput value={value.url} onChange={(v) => set('url', v.trim())} /></Field>
           <Field label="Username" error={err('username')}><TextInput value={value.username} onChange={(v) => set('username', v)} autoComplete="off" /></Field>
           <Field label="Password" error={err('password')} help={secretHelp}><PasswordInput value={value.password} onChange={(v) => set('password', v)} showStrength={false} allowGenerate={false} autoComplete="new-password" /></Field>
           <Field inline><Toggle checked={value.insecure} onChange={(v) => set('insecure', v)} label="Skip TLS certificate verification" /></Field>
@@ -170,8 +171,8 @@ export function DestinationFields({ value, onChange, errors = {}, editing = fals
         <>
           <Field label="Bucket" required error={err('bucket')}><TextInput value={value.bucket} onChange={(v) => set('bucket', v.trim())} /></Field>
           <Field label="Region" error={err('region')}><TextInput value={value.region} onChange={(v) => set('region', v.trim())} placeholder="us-east-1" /></Field>
-          <Field label="Endpoint (optional)" error={err('endpoint')} help="Leave empty for AWS; e.g. https://s3.us-west-004.backblazeb2.com for B2, http://minio.local:9000 for MinIO"><TextInput value={value.endpoint} onChange={(v) => set('endpoint', v.trim())} /></Field>
-          <Field label="Key prefix (folder)" error={err('prefix')}><TextInput value={value.prefix} onChange={(v) => set('prefix', v.trim())} placeholder="whm/" /></Field>
+          <Field label="Endpoint (optional)" error={err('endpoint')} help="Leave empty for AWS; for example https://s3.us-west-004.backblazeb2.com for B2 or http://minio.local:9000 for MinIO"><TextInput value={value.endpoint} onChange={(v) => set('endpoint', v.trim())} /></Field>
+          <Field label="Key prefix (folder)" error={err('prefix')}><TextInput value={value.prefix} onChange={(v) => set('prefix', v.trim())} placeholder="keel/" /></Field>
           <Field label="Access key" required error={err('accessKey')}><TextInput value={value.accessKey} onChange={(v) => set('accessKey', v.trim())} autoComplete="off" /></Field>
           <Field label="Secret key" required={!editing} error={err('secretKey')} help={secretHelp}><PasswordInput value={value.secretKey} onChange={(v) => set('secretKey', v)} showStrength={false} allowGenerate={false} autoComplete="new-password" /></Field>
           <Field inline><Toggle checked={value.pathStyle} onChange={(v) => set('pathStyle', v)} label="Path-style addressing" description="Required by MinIO and some self-hosted gateways" /></Field>

@@ -61,7 +61,7 @@ export default function ManageDatabaseProfiles({ fn }) {
       <Card title="Profiles" padded={false}>
         <DataTable
           columns={[
-            { key: 'profile_name', label: 'Profile', render: (p) => <><strong>{p.profile_name}</strong>{p.is_active && <StatusPill status="ok"> active</StatusPill>}</> },
+            { key: 'profile_name', label: 'Profile', render: (p) => <><strong>{p.profile_name}</strong>{p.is_active && <> <StatusPill status="ok">active</StatusPill></>}</> },
             { key: 'engine', label: 'Engine', render: (p) => engineLabel(p.engine) },
             { key: 'host', label: 'Server', render: (p) => <><code>{p.host}:{p.port}</code> <span className="muted">{p.is_local ? 'local' : 'remote'}</span></> },
             { key: 'admin_user', label: 'Credentials', render: (p) => (p.admin_user ? <>{p.admin_user} <StatusPill status={p.has_password ? 'ok' : 'warning'}>{p.has_password ? 'password stored' : 'no password'}</StatusPill></> : <span className="muted">/root/.my.cnf or socket</span>) },
@@ -74,7 +74,7 @@ export default function ManageDatabaseProfiles({ fn }) {
             { label: 'Edit', onClick: () => open(p) },
             !p.is_active && { label: 'Delete', danger: true, onClick: () => remove(p) },
           ]}
-          emptyText="No profiles. Add one to start managing databases."
+          emptyText="No profiles yet. Add one and it appears here; the active profile is the server every database function uses."
         />
       </Card>
       <Modal open={Boolean(editing)} title={editing === 'new' ? 'Add database profile' : `Edit ${editing?.profile_name}`} onClose={() => setEditing(null)}

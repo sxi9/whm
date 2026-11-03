@@ -14,7 +14,7 @@ export const PERMISSION_DESCRIPTIONS = {
   schedule: "Register cron schedules for the plugin's jobs (ctx.schedule)",
   jobs: 'Run background jobs and query their status (ctx.jobs)',
   'events:emit': "Emit events in the plugin's own namespace (ctx.events.emit)",
-  'ui:sidebar': 'Add entries to the WHM sidebar and register UI pages (ctx.ui)',
+  'ui:sidebar': 'Add entries to the panel sidebar and register UI pages (ctx.ui)',
   'api:routes': 'Expose HTTP routes under /api/plugins/<id>/ (ctx.http)',
   'contacts:notify': 'Send notifications through the Contact Manager (ctx.api.contacts.notify)',
   'system:read': 'Read host/system information and service status (ctx.api.system / services)',

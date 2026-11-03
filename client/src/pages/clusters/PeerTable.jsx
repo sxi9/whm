@@ -47,18 +47,18 @@ export function PeerTable({ peers, roles, loading, onChanged, focus = 'dns', tit
   };
 
   const columns = [
-    { key: 'name', label: 'Peer', render: (p) => <><strong>{p.name}</strong>{!p.enabled && <> <StatusPill status="disabled">disabled</StatusPill></>}<br /><code style={{ fontSize: 12 }}>{p.host}</code></> },
+    { key: 'name', label: 'Peer', render: (p) => <><strong>{p.name}</strong>{!p.enabled && <> <StatusPill status="disabled">disabled</StatusPill></>}<br /><code className="small">{p.host}</code></> },
     { key: 'status', label: 'Reachable', render: (p) => (p.status === 'unknown' ? <span className="muted">not tested</span> : <span title={p.lastError || ''}><StatusPill status={p.status === 'ok' ? 'ok' : 'failed'}>{p.status === 'ok' ? 'yes' : 'no'}</StatusPill> <small className="muted">{formatDate(p.lastCheckedAt)}</small>{p.lastError && <><br /><small className="muted">{p.lastError.slice(0, 80)}</small></>}</span>) },
   ];
   if (focus === 'dns') {
     columns.push(
       { key: 'role', label: 'DNS role', render: (p) => <StatusPill status={p.role === 'standalone' ? 'disabled' : 'info'}>{p.role}</StatusPill> },
-      { key: 'zones', label: 'Zones pushed', render: (p) => (p.role === 'standalone' ? <span className="muted">—</span> : <>{p.zones.ok} ok{p.zones.failed ? <>, <span style={{ color: 'var(--bad)' }}>{p.zones.failed} failed</span></> : null}<br /><small className="muted">{formatDate(p.lastSyncAt)}</small></>) },
+      { key: 'zones', label: 'Zones pushed', render: (p) => (p.role === 'standalone' ? <span className="muted">—</span> : <>{p.zones.ok} ok{p.zones.failed ? <>, <StatusPill status="failed">{p.zones.failed} failed</StatusPill></> : null}<br /><small className="muted">{formatDate(p.lastSyncAt)}</small></>) },
     );
   } else {
     columns.push(
       { key: 'configEnabled', label: 'Receives config', render: (p) => <StatusPill status={p.configEnabled ? 'enabled' : 'disabled'}>{p.configEnabled ? 'yes' : 'no'}</StatusPill> },
-      { key: 'remote', label: 'Peer panel', render: (p) => (p.remote ? <>{p.remote.hostname || '—'}{p.remote.version && <small className="muted"> v{p.remote.version}</small>}{p.remote.clusterAware === false && <><br /><small className="muted">no Clusters module</small></>}{p.remote.accepts && !p.remote.accepts.config && <><br /><small style={{ color: 'var(--warn)' }}>does not accept config pushes</small></>}</> : <span className="muted">—</span>) },
+      { key: 'remote', label: 'Peer panel', render: (p) => (p.remote ? <>{p.remote.hostname || '—'}{p.remote.version && <small className="muted"> v{p.remote.version}</small>}{p.remote.clusterAware === false && <><br /><small className="muted">no Clusters module</small></>}{p.remote.accepts && !p.remote.accepts.config && <><br /><StatusPill status="warning">does not accept config pushes</StatusPill></>}</> : <span className="muted">—</span>) },
     );
   }
   columns.push({ key: 'hasToken', label: 'Token', render: (p) => <StatusPill status={p.hasToken ? 'ok' : 'warning'}>{p.hasToken ? 'set' : 'missing'}</StatusPill> });
@@ -67,7 +67,7 @@ export function PeerTable({ peers, roles, loading, onChanged, focus = 'dns', tit
     <>
       <Card title={title} subtitle={subtitle} padded={false} actions={<Button variant="primary" icon={Plus} size="sm" onClick={() => { setFormError(null); setEditing({}); }}>Add peer</Button>}>
         <DataTable dense rows={peers || []} loading={loading} rowKey={(p) => p.id} columns={columns}
-          emptyText="No peers yet. Add another server running this panel, with an API token it issued."
+          emptyText="No peers yet. Add another server running this panel with a token it issued, and it appears here with its reachability and role."
           rowActions={(p) => [
             { label: testing === p.id ? 'Testing…' : 'Test', primary: true, disabled: testing != null, onClick: () => test(p) },
             { label: 'Edit', onClick: () => { setFormError(null); setEditing(p); } },

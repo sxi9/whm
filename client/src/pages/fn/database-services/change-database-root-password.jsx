@@ -39,10 +39,10 @@ export default function ChangeDatabaseRootPassword({ fn }) {
       <form onSubmit={submit}>
         <Card title={`New ${superuser} password`}>
           <RequestError error={error} />
-          <ProfileSummary profile={profile} />
+          <div style={{ marginBottom: 16 }}><ProfileSummary profile={profile} /></div>
           <Field label="New password" required help="Minimum strength 65; use the generator for a random password."><PasswordInput value={password} onChange={setPassword} /></Field>
           <FormActions><Button type="submit" variant="danger" loading={busy} disabled={!password || !profile}>Change {superuser} password</Button></FormActions>
-          {result && <KeyValue items={[['Result', <StatusPill key="r" status="ok">changed</StatusPill>], ['Hosts updated', result.hosts?.join(', ')], ['/root/.my.cnf', result.myCnfUpdated ? 'rewritten (0600)' : 'not changed'], ['Stored profile credentials', result.profileUpdated ? 'updated' : 'not applicable']]} />}
+          {result && <div style={{ marginTop: 16 }}><KeyValue items={[['Result', <StatusPill key="r" status="ok">changed</StatusPill>], ['Hosts updated', result.hosts?.join(', ')], ['/root/.my.cnf', result.myCnfUpdated ? 'rewritten (0600)' : 'not changed'], ['Stored profile credentials', result.profileUpdated ? 'updated' : 'not applicable']]} /></div>}
         </Card>
       </form>
     </>

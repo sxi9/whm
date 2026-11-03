@@ -22,7 +22,7 @@ const FIELDS = [
   { key: 'owner', label: 'Owner', rootOnly: true },
 ];
 const fmt = (field, v) => (v == null ? (field === 'contactEmail' ? '—' : ['diskQuotaMb', 'bandwidthLimitMb'].includes(field) ? 'unlimited' : '—') : typeof v === 'boolean' ? (v ? 'on' : 'off') : ['diskQuotaMb', 'bandwidthLimitMb'].includes(field) ? formatMb(v) : String(v));
-const describeItem = (r) => (r.steps?.plan?.changes?.length ? <ul style={{ margin: 0, paddingLeft: 16 }}>{r.steps.plan.changes.map((c) => <li key={c.field}>{c.label}: {fmt(c.field, c.from)} → <strong>{fmt(c.field, c.to)}</strong></li>)}</ul> : null);
+const describeItem = (r) => (r.steps?.plan?.changes?.length ? <ul className="list-plain">{r.steps.plan.changes.map((c) => <li key={c.field}>{c.label}: {fmt(c.field, c.from)} → <strong>{fmt(c.field, c.to)}</strong></li>)}</ul> : null);
 
 export default function ModifyUpgradeMultipleAccounts({ fn }) {
   const toast = useToast();
@@ -128,7 +128,7 @@ export default function ModifyUpgradeMultipleAccounts({ fn }) {
               { key: 'domain', label: 'Domain' },
               { key: 'owner', label: 'Owner' },
               { key: 'status', label: 'Status', render: (r) => <ItemStatus status={r.status} /> },
-              { key: 'changes', label: 'Changes', render: (r) => (r.changes.length ? <ul style={{ margin: 0, paddingLeft: 16 }}>{r.changes.map((c) => <li key={c.field}>{c.label}: {fmt(c.field, c.from)} → <strong>{fmt(c.field, c.to)}</strong></li>)}</ul> : r.issues.length ? r.issues.map((i) => <div key={i} className="field-message">{i}</div>) : <span className="muted">already has these values</span>) },
+              { key: 'changes', label: 'Changes', render: (r) => (r.changes.length ? <ul className="list-plain">{r.changes.map((c) => <li key={c.field}>{c.label}: {fmt(c.field, c.from)} → <strong>{fmt(c.field, c.to)}</strong></li>)}</ul> : r.issues.length ? r.issues.map((i) => <div key={i} className="field-message">{i}</div>) : <span className="muted">already has these values</span>) },
             ]}
             rows={preview.items} rowKey={(r) => r.username} dense
           />

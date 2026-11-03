@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
+import { AlertTriangle } from 'lucide-react';
 import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill } from '../../../components/Common.jsx';
@@ -75,8 +76,8 @@ export default function ManageDatabaseUsers({ fn }) {
             <Field label="Password" required error={formError?.fields?.password}><PasswordInput value={form.password} onChange={(v) => setForm((f) => ({ ...f, password: v }))} /></Field>
             {isRoot && !form.account && engine !== 'postgres' && <Field label="Hosts" help="Comma-separated; blank means localhost only" error={formError?.fields?.hosts}><TextInput value={form.hosts} onChange={(v) => setForm((f) => ({ ...f, hosts: v }))} placeholder="localhost, 203.0.113.%" /></Field>}
           </div>
-          <Field label="Grant ALL PRIVILEGES on" help={grantable.length ? 'Fine-tune privileges afterwards with "Privileges"' : form.account ? 'This account has no databases yet' : 'Select an account to see its databases'}>
-            <div className="form-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
+          <Field label="Grant all privileges on" help={grantable.length ? 'Fine-tune privileges afterwards with "Privileges"' : form.account ? 'This account has no databases yet' : 'Select an account to see its databases'}>
+            <div className="form-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '8px 20px' }}>
               {grantable.map((d) => <label key={d.name} className="radio"><input type="checkbox" checked={form.databases.includes(d.name)} onChange={() => toggleDb(d.name)} /><span><strong><code>{d.name}</code></strong></span></label>)}
             </div>
           </Field>
@@ -86,9 +87,9 @@ export default function ManageDatabaseUsers({ fn }) {
       <Card title="Database users" padded={false}>
         <DataTable
           columns={[
-            { key: 'name', label: 'User', sortable: true, render: (r) => <><code>{r.name}</code>{r.system && <StatusPill status="info"> system</StatusPill>}</> },
+            { key: 'name', label: 'User', sortable: true, render: (r) => <><code>{r.name}</code>{r.system && <> <StatusPill status="info">system</StatusPill></>}</> },
             { key: 'account', label: 'Account', sortable: true, render: (r) => (r.account ? r.account : <span className="muted">{isRoot ? <Link to="/database-services/database-map-tool">unmapped</Link> : '—'}</span>) },
-            { key: 'hosts', label: 'Hosts', render: (r) => (r.hosts?.length ? r.hosts.map((h) => <code key={h} style={{ marginRight: 6 }}>{h}</code>) : <span className="muted">—</span>) },
+            { key: 'hosts', label: 'Hosts', render: (r) => (r.hosts?.length ? r.hosts.map((h) => <code key={h}>{h}</code>).reduce((acc, el) => (acc.length ? [...acc, ' ', el] : [el]), []) : <span className="muted">—</span>) },
             { key: 'grants', label: 'Privileges', render: (r) => (r.grants?.length ? r.grants.map((g) => <div key={g.database}><code>{g.database}</code> <span className="muted">{g.privileges.join(', ')}</span></div>) : <span className="muted">{r.mapped ? 'none recorded' : '—'}</span>) },
             { key: 'onServer', label: 'State', render: (r) => <StatusPill status={r.onServer === false ? 'failed' : r.onServer === null ? 'unknown' : 'ok'}>{r.onServer === false ? 'missing on server' : r.onServer === null ? 'server unreachable' : 'present'}</StatusPill> },
           ]}
@@ -102,9 +103,9 @@ export default function ManageDatabaseUsers({ fn }) {
             { label: 'Change password', onClick: () => { setPwFor(r); setPw(''); setPwError(null); } },
             { label: 'Drop', danger: true, onClick: () => drop(r) },
           ])}
-          emptyText={error ? 'Could not load users.' : 'No database users yet.'}
+          emptyText={error ? 'Could not load users.' : 'No database users yet. Users you create or map to accounts appear here.'}
         />
-        {meta?.engineError && <div className="card-body"><div className="banner banner-warning"><div><strong>Server unreachable</strong><p>{meta.engineError.message} Showing the panel's records only.</p></div></div></div>}
+        {meta?.engineError && <div className="card-body"><div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>Server unreachable</strong><p>{meta.engineError.message} Showing the panel's records only.</p></div></div></div>}
       </Card>
       <GrantsModal user={grantsFor} engine={engine} onClose={() => setGrantsFor(null)} onSaved={(res) => { toast.success(`Privileges saved for ${res.name} (${res.changes.length} change${res.changes.length === 1 ? '' : 's'})`); refetch(); }} />
       <Modal open={Boolean(pwFor)} title={`Change password for ${pwFor?.name}`} onClose={() => setPwFor(null)} size="sm" footer={<><Button onClick={() => setPwFor(null)}>Cancel</Button><Button variant="primary" loading={busy} onClick={changePassword} disabled={!pw}>Change password</Button></>}>

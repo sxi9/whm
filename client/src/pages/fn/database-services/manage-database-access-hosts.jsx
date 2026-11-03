@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
+import { Info, CheckCircle2 } from 'lucide-react';
 import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, formatDate } from '../../../components/Common.jsx';
@@ -45,8 +46,8 @@ export default function ManageDatabaseAccessHosts({ fn }) {
     <>
       <PageHeader fn={fn} description="Remote hosts that may connect to an account's databases. Each host becomes a user@host entry with the same password and privileges as the localhost user, so applications on other servers can connect. Make sure the server listens on a reachable address (bind_address) and the firewall allows port 3306." actions={<Button onClick={() => refetch()}>Refresh</Button>} />
       <EngineBanner status={status.data} loading={status.loading} error={status.error} onRetry={status.refetch} />
-      {meta && meta.supported === false && <div className="banner banner-info"><div>The active profile is PostgreSQL: hosts are recorded here but client access is controlled by <code>pg_hba.conf</code>, which the panel does not manage.</div></div>}
-      {!isRoot && (data || []).some((r) => r.scope === 'global') && <div className="banner banner-info"><div>Hosts marked <em>all accounts</em> were allowed server-wide by the administrator; your database users are provisioned at them too, but only root can remove them.</div></div>}
+      {meta && meta.supported === false && <div className="banner banner-info"><Info size={18} /><div>The active profile is PostgreSQL: hosts are recorded here but client access is controlled by <code>pg_hba.conf</code>, which the panel does not manage.</div></div>}
+      {!isRoot && (data || []).some((r) => r.scope === 'global') && <div className="banner banner-info"><Info size={18} /><div>Hosts marked <em>all accounts</em> were allowed server-wide by the administrator; your database users are provisioned at them too, but only root can remove them.</div></div>}
       <form onSubmit={add}>
         <Card title="Allow a remote host">
           <RequestError error={formError && !formError.fields ? formError : null} />
@@ -57,7 +58,7 @@ export default function ManageDatabaseAccessHosts({ fn }) {
           </div>
           <FormActions><Button type="submit" variant="primary" loading={busy} disabled={!host || (!isRoot && !account)}>Allow host</Button></FormActions>
           {result && (
-            <div className="banner banner-info"><div>
+            <div className="banner banner-success"><CheckCircle2 size={18} /><div>
               <strong>{result.host} added ({result.scope})</strong>
               <p>{result.supported ? `${result.applied.length} user(s) cloned to the new host${result.failed.length ? `; ${result.failed.length} failed: ${result.failed.map((f) => `${f.user} (${f.error})`).join(', ')}` : ''}.` : 'Recorded only (PostgreSQL profile).'} Need the server to accept remote connections? Set <code>bind_address</code> under <Link to="/database-services/edit-database-configuration">Edit Database Configuration</Link>.</p>
             </div></div>
@@ -73,7 +74,7 @@ export default function ManageDatabaseAccessHosts({ fn }) {
           ]}
           rows={data || []} loading={loading} error={error} rowKey={(r) => r.id}
           rowActions={(r) => [{ label: 'Remove', primary: true, danger: true, onClick: () => remove(r), disabled: r.editable === false || (r.scope === 'global' && !isRoot) }]}
-          emptyText="No remote hosts allowed; only localhost can connect."
+          emptyText="No remote hosts yet; only localhost can connect. Hosts you allow appear here."
         />
       </Card>
     </>

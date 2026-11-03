@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Plus, Trash2 } from 'lucide-react';
+import { Plus, Trash2, CheckCircle2, AlertCircle } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { StatusPill, formatDate } from '../../components/Common.jsx';
@@ -19,16 +19,16 @@ export function useProviders({ isRoot = false } = {}) {
 
 export function ProviderStatus({ p }) {
   if (p.readOnly) {
-    if (!p.installed) return <StatusPill status="not-installed">not installed</StatusPill>;
-    return <StatusPill status={p.enabled ? 'enabled' : 'inactive'}>{p.enabled ? 'AutoSSL provider' : 'installed'}</StatusPill>;
+    if (!p.installed) return <StatusPill status="not-installed">Not installed</StatusPill>;
+    return <StatusPill status={p.enabled ? 'enabled' : 'inactive'}>{p.enabled ? 'AutoSSL provider' : 'Installed'}</StatusPill>;
   }
-  if (p.enabled) return <StatusPill status="enabled" />;
-  return <StatusPill status={p.configured ? 'disabled' : 'pending'}>{p.configured ? 'disabled' : 'needs configuration'}</StatusPill>;
+  if (p.enabled) return <StatusPill status="enabled">Enabled</StatusPill>;
+  return <StatusPill status={p.configured ? 'disabled' : 'pending'}>{p.configured ? 'Disabled' : 'Needs configuration'}</StatusPill>;
 }
 
 export function LastTest({ p }) {
-  if (!p.lastTest) return <span className="muted">never</span>;
-  return <span title={p.lastTest.message}><StatusPill status={p.lastTest.ok ? 'ok' : 'failed'}>{p.lastTest.ok ? 'passed' : 'failed'}</StatusPill> <small className="muted">{formatDate(p.lastTest.at)}</small></span>;
+  if (!p.lastTest) return <span className="muted">Never</span>;
+  return <span title={p.lastTest.message}><StatusPill status={p.lastTest.ok ? 'ok' : 'failed'}>{p.lastTest.ok ? 'Passed' : 'Failed'}</StatusPill> <small className="muted">{formatDate(p.lastTest.at)}</small></span>;
 }
 
 const emptyProduct = () => ({ id: '', name: '', price: null, currency: 'USD', termMonths: 12, wildcard: false });
@@ -42,7 +42,7 @@ export function ProductsEditor({ value, onChange, commissionPercent = 0 }) {
       <table className="dense">
         <thead><tr><th>ID</th><th>Name</th><th>Vendor price</th><th>Currency</th><th>Months</th><th>Wildcard</th><th>Resale</th><th /></tr></thead>
         <tbody>
-          {list.length === 0 && <tr><td colSpan={8} className="table-state">No products. Add one or synchronise from the vendor.</td></tr>}
+          {list.length === 0 && <tr><td colSpan={8} className="table-state">No products yet. Products you add here, or synchronise from the vendor, are offered for purchase.</td></tr>}
           {list.map((p, i) => (
             <tr key={i}>
               <td><TextInput value={p.id} onChange={(v) => set(i, { id: v })} placeholder="dv" style={{ width: 110 }} /></td>
@@ -107,11 +107,11 @@ export function ProviderFormModal({ open, provider, adapters, onClose, onSaved }
       footer={<><Button onClick={onClose}>Cancel</Button><Button variant="primary" loading={busy} disabled={!form.displayName.trim() || (!editing && !form.name.trim())} onClick={save}>{editing ? 'Save' : 'Add provider'}</Button></>}>
       <ErrorBanner error={error} />
       <div className="form-grid">
-        <Field label="Identifier" required={!editing} help="Lowercase letters, digits, - and _. Used in orders and the API."><TextInput value={form.name} onChange={(v) => setForm({ ...form, name: v.toLowerCase() })} disabled={editing} placeholder="sectigo" /></Field>
+        <Field label="Identifier" required={!editing} help="Lowercase letters, digits, hyphen and underscore. Used in orders and the API."><TextInput value={form.name} onChange={(v) => setForm({ ...form, name: v.toLowerCase() })} disabled={editing} placeholder="sectigo" /></Field>
         <Field label="Display name" required><TextInput value={form.displayName} onChange={(v) => setForm({ ...form, displayName: v })} placeholder="Sectigo" /></Field>
-        <Field label="Type" help={!editing && typeOptions.length < Object.keys(TYPE_LABELS).length ? 'The plugin marketplace hub is built in: configure "WHM Marketplace (plugin hub)" in the list instead.' : undefined}><Select value={form.type} onChange={(v) => { const next = addable.find((a) => a.types.includes(v)); setForm({ ...form, type: v, adapter: next?.id || form.adapter }); }} disabled={editing} options={typeOptions} /></Field>
+        <Field label="Type" help={!editing && typeOptions.length < Object.keys(TYPE_LABELS).length ? 'The plugin marketplace hub is built in: configure the Marketplace hub row in the list instead.' : undefined}><Select value={form.type} onChange={(v) => { const next = addable.find((a) => a.types.includes(v)); setForm({ ...form, type: v, adapter: next?.id || form.adapter }); }} disabled={editing} options={typeOptions} /></Field>
         <Field label="Adapter" help={adapter?.configFields?.length ? `Credentials (${adapter.configFields.map((f) => f.label).join(', ')}) are entered under Configure.` : 'No credentials needed.'}><Select value={form.adapter} onChange={(v) => setForm({ ...form, adapter: v })} disabled={editing} options={creatable.map((a) => ({ value: a.id, label: a.label }))} /></Field>
-        <Field label={form.type === 'plugin' ? 'Hub URL' : 'Vendor URL'} required={adapter?.requiresUrl} help="https:// only"><TextInput value={form.url} onChange={(v) => setForm({ ...form, url: v })} placeholder="https://" /></Field>
+        <Field label={form.type === 'plugin' ? 'Hub URL' : 'Vendor URL'} required={adapter?.requiresUrl} help="Must start with https://"><TextInput value={form.url} onChange={(v) => setForm({ ...form, url: v })} placeholder="https://" /></Field>
         <Field label="Commission (%)" help="Added on top of the vendor price when the product is offered to resellers and accounts."><NumberInput value={form.commissionPercent} onChange={(v) => setForm({ ...form, commissionPercent: v })} nullable={false} min={0} max={100} step="0.5" /></Field>
       </div>
       {hasProducts && (
@@ -160,7 +160,7 @@ export function ConfigureModal({ open, provider, adapters, onClose, onSaved }) {
       footer={<><Button onClick={onClose}>Cancel</Button><Button variant="primary" loading={busy} onClick={save}>Save</Button></>}>
       <ErrorBanner error={error} />
       <p className="muted">{adapter?.label}. Credentials are stored encrypted and never shown again.</p>
-      <Field label={provider.type === 'plugin' ? 'Hub URL' : 'Vendor URL'} required={adapter?.requiresUrl} help="https:// only"><TextInput value={url} onChange={setUrl} placeholder="https://" /></Field>
+      <Field label={provider.type === 'plugin' ? 'Hub URL' : 'Vendor URL'} required={adapter?.requiresUrl} help="Must start with https://"><TextInput value={url} onChange={setUrl} placeholder="https://" /></Field>
       {(adapter?.configFields || []).map((f) => (
         <Field key={f.key} label={f.label} required={f.required} help={f.help}>
           {f.secret ? (
@@ -180,7 +180,8 @@ export function TestResultCard({ result }) {
   if (!result) return null;
   return (
     <div className={`banner ${result.result.ok ? 'banner-success' : 'banner-error'}`} role="status">
-      <div><strong>{result.provider.displayName}: {result.result.ok ? 'test passed' : 'test failed'}</strong><p>{result.result.message}</p></div>
+      {result.result.ok ? <CheckCircle2 size={18} /> : <AlertCircle size={18} />}
+      <div><strong>{result.provider.displayName}: {result.result.ok ? 'Test passed' : 'Test failed'}</strong><p>{result.result.message}</p></div>
     </div>
   );
 }

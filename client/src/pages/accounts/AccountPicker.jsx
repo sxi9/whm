@@ -23,7 +23,7 @@ export function AccountPicker({ value, onChange, label = 'Account', suspendedOnl
   return (
     <div className="form-grid">
       <Field label="Filter"><TextInput value={filter} onChange={setFilter} placeholder="Type to filter by user, domain or owner" /></Field>
-      <Field label={label} help={loading ? 'Loading accounts…' : `${accounts.length} account(s)`}>
+      <Field label={label} help={loading ? 'Loading accounts…' : `${accounts.length} ${accounts.length === 1 ? 'account' : 'accounts'}`}>
         <Select value={value} onChange={onChange} options={options} placeholder={accounts.length ? 'Select an account' : 'No accounts yet'} />
       </Field>
     </div>

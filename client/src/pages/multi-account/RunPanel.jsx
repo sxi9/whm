@@ -18,7 +18,7 @@ function StepList({ steps }) {
     else rows.push({ name, status: 'done', detail: String(value) });
   }
   if (!rows.length) return <span className="muted">—</span>;
-  return <ul style={{ margin: 0, paddingLeft: 16 }}>{rows.map((r, i) => <li key={i}><code>{r.name}</code> <StatusPill status={r.status === 'applied' ? 'ok' : r.status === 'recorded' ? 'info' : r.status === 'skipped' ? 'disabled' : r.status}>{r.status}</StatusPill> {r.detail && <span className="muted">{r.detail}</span>}</li>)}</ul>;
+  return <ul className="list-plain">{rows.map((r, i) => <li key={i}><code>{r.name}</code> <StatusPill status={r.status === 'applied' ? 'ok' : r.status === 'recorded' ? 'info' : r.status === 'skipped' ? 'disabled' : r.status}>{r.status}</StatusPill> {r.detail && <span className="muted">{r.detail}</span>}</li>)}</ul>;
 }
 
 // Live progress of a bulk job, then the per-account outcome with the report links.
@@ -64,7 +64,7 @@ export function RunDetail({ run, describeItem }) {
           { key: 'steps', label: 'Steps', render: (r) => <StepList steps={r.steps} /> },
           { key: 'detail', label: 'Detail', render: (r) => r.detail || <span className="muted">—</span> },
         ]}
-        rows={run.items || []} rowKey={(r) => r.id} dense emptyText="No accounts in this run."
+        rows={run.items || []} rowKey={(r) => r.id} dense emptyText="The accounts of this run appear here with their outcome."
       />
     </Card>
   );
@@ -87,7 +87,7 @@ export function RunHistory({ kind, describeItem, refreshKey }) {
             { key: 'requested_by', label: 'By', render: (r) => r.requested_by || r.created_by_name || '—' },
             { key: 'created_at', label: 'Started', render: (r) => formatDate(r.created_at) },
           ]}
-          rows={data || []} loading={loading} error={error} rowKey={(r) => r.id} dense emptyText="No runs yet."
+          rows={data || []} loading={loading} error={error} rowKey={(r) => r.id} dense emptyText="Runs started from this page appear here with their result and report downloads."
           rowActions={(r) => [
             { label: openId === r.id ? 'Hide' : 'Details', primary: true, onClick: () => setOpenId(openId === r.id ? null : r.id) },
             { label: 'CSV report', onClick: () => { window.location.href = reportHref(r.id, 'csv'); } },

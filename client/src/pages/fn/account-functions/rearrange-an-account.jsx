@@ -55,7 +55,7 @@ export default function RearrangeAnAccount({ fn }) {
       {account && (
         <form onSubmit={submit}>
           <Card title={`${account.domain} (${account.username})`}>
-            <KeyValue items={[['Current home', <code key="h">{account.home_dir}</code>], ['Partition', <code key="p">{currentRoot || 'unknown'}</code>], ['Linux user', <StatusPill key="u" status={account.systemUser ? 'ok' : 'warning'}>{account.systemUser ? `uid ${account.uid}` : 'not provisioned'}</StatusPill>]]} />
+            <KeyValue items={[['Current home', <code key="h">{account.home_dir}</code>], ['Partition', <code key="p">{currentRoot || 'unknown'}</code>], ['Linux user', <StatusPill key="u" status={account.systemUser ? 'ok' : 'warning'}>{account.systemUser ? `UID ${account.uid}` : 'not provisioned'}</StatusPill>]]} />
             <CapabilityNotice error={error} />
             {error && error.status !== 501 && <ErrorBanner error={error} />}
             <div className="form-grid" style={{ marginTop: 14 }}>

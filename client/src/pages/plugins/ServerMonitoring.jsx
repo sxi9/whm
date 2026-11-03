@@ -1,4 +1,5 @@
 import { useCallback, useState } from 'react';
+import { AlertTriangle, Info } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi, useMutation } from '../../hooks/useApi.js';
 import { Card, StatusPill, Loading, EmptyState, formatDate, formatDuration } from '../../components/Common.jsx';
@@ -72,7 +73,7 @@ export function Sparkline({ series, threshold, format = (v) => String(v), unit =
         {lists.length > 1 && lists.map((s, i) => <text key={s.key} x={PAD.left + i * 70} y={PAD.top - 3} fontSize="10" fill="var(--text-muted)">{i === 0 ? '━' : '┄'} {s.label}</text>)}
       </svg>
       {hovered && (
-        <div className="card" style={{ position: 'absolute', top: 2, left: `${(x(hovered.ts) / W) * 100}%`, transform: `translateX(${x(hovered.ts) > W / 2 ? '-105%' : '5%'})`, padding: '6px 10px', fontSize: 12, pointerEvents: 'none', boxShadow: 'var(--shadow)' }}>
+        <div className="card" style={{ position: 'absolute', top: 2, left: `${(x(hovered.ts) / W) * 100}%`, transform: `translateX(${x(hovered.ts) > W / 2 ? '-105%' : '5%'})`, padding: '6px 10px', margin: 0, pointerEvents: 'none' }}>
           <strong>{new Date(hovered.ts).toLocaleString()}</strong>
           {lists.map((s) => <div key={s.key}>{s.label}: {s.points[hover]?.v == null ? '—' : `${format(s.points[hover].v)}${unit}`}</div>)}
         </div>
@@ -86,7 +87,7 @@ function Tile({ label, value, over, sub }) {
     <div className="stat">
       <div className="label">{label}</div>
       <div className="value">{value ?? '—'} {over && <StatusPill status="warning">over threshold</StatusPill>}</div>
-      {sub && <div className="muted" style={{ fontSize: 12 }}>{sub}</div>}
+      {sub && <div className="label">{sub}</div>}
     </div>
   );
 }
@@ -123,22 +124,23 @@ export function ServerMonitoringOverview({ base, status }) {
         </div>
         {s?.activeAlerts?.length > 0 && (
           <div className="banner banner-warning" style={{ marginTop: 14 }}>
+            <AlertTriangle size={18} />
             <div>
               <strong>{s.activeAlerts.length} active alert{s.activeAlerts.length === 1 ? '' : 's'}</strong>
               <ul>{s.activeAlerts.map((a) => <li key={a.key}>{a.metric} above {a.threshold}{a.unit} since {formatDate(new Date(a.since).toISOString())}</li>)}</ul>
             </div>
           </div>
         )}
-        {s && !s.enabled && <p className="banner banner-info" style={{ display: 'block', marginTop: 14 }}>Sampling is switched off in the plugin settings; the timer is stopped and nothing is collected.</p>}
-        {s?.enabled && s.collector && !s.collector.running && <p className="banner banner-warning" style={{ display: 'block', marginTop: 14 }}>The sampling timer is not running; disable and re-enable the plugin to restart it.</p>}
-        {s?.collector?.lastError && <p className="banner banner-warning" style={{ display: 'block', marginTop: 14 }}>Last sample failed: {s.collector.lastError.message}</p>}
+        {s && !s.enabled && <div className="banner banner-info" style={{ marginTop: 14 }}><Info size={18} /><div>Sampling is switched off in the plugin settings; the timer is stopped and nothing is collected.</div></div>}
+        {s?.enabled && s.collector && !s.collector.running && <div className="banner banner-warning" style={{ marginTop: 14 }}><AlertTriangle size={18} /><div>The sampling timer is not running; disable and re-enable the plugin to restart it.</div></div>}
+        {s?.collector?.lastError && <div className="banner banner-warning" style={{ marginTop: 14 }}><AlertTriangle size={18} /><div>Last sample failed: {s.collector.lastError.message}</div></div>}
         {jobId && <ProgressLog jobId={jobId} onFinished={(ev) => { if (ev.type === 'done') { toast.success('Sample recorded'); metrics.refetch(); live.refetch(); } else toast.error(ev.error || 'Sampling failed'); }} />}
       </Card>
-      <Card title="History" actions={<div style={{ display: 'flex', gap: 6 }}>{RANGES.map(([k, l]) => <Button key={k} size="sm" variant={range === k ? 'primary' : 'default'} onClick={() => setRange(k)}>{l}</Button>)}</div>}>
+      <Card title="History" actions={<div className="segmented" role="tablist">{RANGES.map(([k, l]) => <button key={k} type="button" role="tab" aria-selected={range === k} className={range === k ? 'active' : ''} onClick={() => setRange(k)}>{l}</button>)}</div>}>
         {metrics.loading && !d && <Loading />}
-        {d && points.length === 0 && <EmptyState title="No samples in this range">The first sample appears within one sampling interval of enabling the plugin; use "Sample now" to take one immediately.</EmptyState>}
+        {d && points.length === 0 && <EmptyState title="No samples in this range">Load, memory, disk and network charts appear here once the plugin has sampled the host; use Sample now to take the first sample immediately.</EmptyState>}
         {d && points.length > 0 && (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 20 }}>
+          <div className="grid-2">
             <div><h3>Load (1 min)</h3><Sparkline label="1-minute load" series={[{ key: 'load1', label: 'load', points: seriesOf('load1') }]} threshold={th.load1} format={(v) => v.toFixed(1)} from={d.from} to={d.to} /></div>
             <div><h3>Memory used</h3><Sparkline label="Memory used" series={[{ key: 'memPct', label: 'memory', points: seriesOf('memPct') }]} threshold={th.memPct} format={(v) => Math.round(v)} unit="%" from={d.from} to={d.to} /></div>
             <div><h3>Disk used</h3><Sparkline label="Disk used" series={[{ key: 'diskPct', label: 'disk', points: seriesOf('diskPct') }]} threshold={th.diskPct} format={(v) => Math.round(v)} unit="%" from={d.from} to={d.to} /></div>

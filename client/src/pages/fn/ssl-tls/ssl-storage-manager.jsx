@@ -61,19 +61,15 @@ export default function SslStorageManager({ fn }) {
       {loading && !data && <Loading />}
       {data && (
         <Card padded={false} title="Stored items" subtitle="Keys are encrypted at rest with the panel master key; viewing or downloading a key is audited.">
-          <div style={{ padding: '12px 16px 0', display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
-            <Tabs value={kind} onChange={setKind} tabs={[{ value: 'all', label: 'All', count: data.items.length }, { value: 'key', label: 'Keys', count: data.counts.key }, { value: 'csr', label: 'CSRs', count: data.counts.csr }, { value: 'cert', label: 'Certificates', count: data.counts.cert }]} />
-            <div style={{ minWidth: 240, marginBottom: 14 }}><AccountSelect value={account} onChange={setAccount} placeholder="All accounts" /></div>
-          </div>
-          <DataTable dense columns={[
+          <DataTable dense toolbar={<><Tabs value={kind} onChange={setKind} tabs={[{ value: 'all', label: 'All', count: data.items.length }, { value: 'key', label: 'Keys', count: data.counts.key }, { value: 'csr', label: 'CSRs', count: data.counts.csr }, { value: 'cert', label: 'Certificates', count: data.counts.cert }]} /><div style={{ minWidth: 220 }}><AccountSelect value={account} onChange={setAccount} placeholder="All accounts" /></div></>} columns={[
             { key: 'kind', label: 'Type', render: (i) => <StatusPill status={i.kind === 'key' ? 'warning' : i.kind === 'cert' ? 'ok' : 'pending'}>{KIND_LABEL[i.kind]}</StatusPill> },
             { key: 'domain', label: 'Domain', render: (i) => <code>{i.domain}</code> },
             { key: 'account', label: 'Account', render: (i) => i.account || <span className="muted">server</span> },
-            { key: 'subject', label: 'Subject / issuer', render: (i) => <span className="small">{i.kind === 'cert' ? (i.selfSigned ? 'self-signed' : (i.issuer || '—').replace(/^CN=/, '')) : (i.subject || '—')}</span> },
+            { key: 'subject', label: 'Subject / issuer', render: (i) => <span className="muted">{i.kind === 'cert' ? (i.selfSigned ? 'self-signed' : (i.issuer || '—').replace(/^CN=/, '')) : (i.subject || '—')}</span> },
             { key: 'notAfter', label: 'Expires', render: (i) => (i.kind === 'cert' ? <ExpiryPill notAfter={i.notAfter} daysRemaining={i.daysRemaining} /> : <span className="muted">—</span>) },
             { key: 'state', label: 'State', render: (i) => (i.kind === 'csr' ? <span className="muted">—</span> : <StatePill state={i.state} />) },
             { key: 'createdAt', label: 'Created', render: (i) => formatDate(i.createdAt) },
-          ]} rows={items} rowKey={(i) => i.itemId} emptyText="Nothing stored yet. Generate a CSR or upload a certificate."
+          ]} rows={items} rowKey={(i) => i.itemId} emptyText="Stored keys, signing requests and certificates appear here. Generate a CSR or upload a certificate to start."
             rowActions={(i) => [
               { label: 'View', primary: true, onClick: () => view(i) },
               { label: 'Download', onClick: () => download(i) },

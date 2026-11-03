@@ -81,7 +81,7 @@ export default function ChangeMultipleSitesIpAddresses({ fn }) {
                 { key: 'ip', label: 'Current IP', render: (r) => (r.ip ? <code>{r.ip}</code> : <span className="muted">unset</span>) },
                 { key: 'target', label: 'New IP', render: (r) => <Select value={targets[r.username] || ''} onChange={(v) => { setTargets((t) => ({ ...t, [r.username]: v })); setPreview(null); }} options={optionsFor(r.username).filter((o) => o.value !== r.ip)} placeholder={bulkIp ? `Same as all (${bulkIp})` : 'Choose an address'} /> },
               ]}
-              rows={sel.selectedRows} rowKey={(r) => r.username} dense emptyText="No accounts selected."
+              rows={sel.selectedRows} rowKey={(r) => r.username} dense emptyText="Selected accounts appear here with their current and new address."
             />
             <div className="card-body">
               <FormActions>

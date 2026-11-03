@@ -1,3 +1,4 @@
+import { Info } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, KeyValue, Loading, formatDate } from '../../../components/Common.jsx';
@@ -23,6 +24,7 @@ export default function RebuildRpmDatabase({ fn }) {
         <PageHeader fn={fn} />
         <Card title="Not applicable on this server">
           <div className="banner banner-info">
+            <Info size={18} />
             <div>
               <strong>This is not an RPM-based system</strong>
               <p>The RPM database only exists on RHEL-family distributions (AlmaLinux, Rocky Linux, CloudLinux, CentOS, Fedora). This host uses <code>{data.manager || 'an unknown package manager'}</code>{data.family === 'debian' ? ' (dpkg), whose database does not need rebuilding; dpkg --configure -a runs as part of System Update when needed.' : '.'}</p>

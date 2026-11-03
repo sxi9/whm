@@ -32,9 +32,11 @@ export default function UpgradeDowngrade({ fn }) {
       {account && (
         <Card title={`Current package: ${account.package_name || 'none'}`}>
           <KeyValue items={[['Disk', formatMb(account.plan?.disk_mb)], ['Bandwidth', formatMb(account.plan?.bandwidth_mb)], ['Addon domains', account.plan?.max_addons ?? 'Unlimited'], ['Databases', account.plan?.max_db ?? 'Unlimited'], ['Email accounts', account.plan?.max_email ?? 'Unlimited'], ['Shell', account.plan?.has_shell ? 'Yes' : 'No']]} />
-          <Field label="New package" style={{ marginTop: 16 }}>
-            <Select value={target} onChange={setTarget} options={(packages || []).filter((p) => p.name !== account.package_name).map((p) => ({ value: p.name, label: p.name }))} placeholder="Select a package" />
-          </Field>
+          <div className="form-grid" style={{ marginTop: 14 }}>
+            <Field label="New package" help="The new package's limits are applied to the account immediately">
+              <Select value={target} onChange={setTarget} options={(packages || []).filter((p) => p.name !== account.package_name).map((p) => ({ value: p.name, label: p.name }))} placeholder="Select a package" />
+            </Field>
+          </div>
           {pkg && <KeyValue items={[['Disk', formatMb(pkg.disk_mb)], ['Bandwidth', formatMb(pkg.bandwidth_mb)], ['Addon domains', pkg.max_addons ?? 'Unlimited'], ['Databases', pkg.max_db ?? 'Unlimited'], ['Email accounts', pkg.max_email ?? 'Unlimited'], ['Shell', pkg.has_shell ? 'Yes' : 'No']]} />}
           <FormActions><Button variant="primary" disabled={!target} loading={busy} onClick={apply}>Upgrade/Downgrade</Button></FormActions>
         </Card>

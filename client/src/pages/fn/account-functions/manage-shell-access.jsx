@@ -53,7 +53,7 @@ export default function ManageShellAccess({ fn }) {
             { key: 'domain', label: 'Domain' },
             { key: 'owner', label: 'Owner' },
             { key: 'shell', label: 'Current shell', render: (r) => <><StatusPill status={r.shell === '/usr/sbin/nologin' ? 'disabled' : 'enabled'}>{label(r.shell)}</StatusPill> <code className="muted">{r.shell}</code></> },
-            { key: 'systemUser', label: 'Linux user', render: (r) => <StatusPill status={r.systemUser ? 'ok' : 'warning'}>{r.systemUser ? `uid ${r.uid}` : 'not provisioned'}</StatusPill> },
+            { key: 'systemUser', label: 'Linux user', render: (r) => <StatusPill status={r.systemUser ? 'ok' : 'warning'}>{r.systemUser ? `UID ${r.uid}` : 'not provisioned'}</StatusPill> },
           ]}
           rows={data || []} loading={loading} rowKey={(r) => r.username} selectable selected={selected} onSelectedChange={setSelected}
           rowActions={(r) => [{ label: `Set ${label(shell)}`, primary: true, disabled: r.shell === shell, onClick: () => apply([r.username]) }]}

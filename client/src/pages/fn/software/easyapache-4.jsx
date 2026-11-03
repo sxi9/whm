@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading, KeyValue } from '../../../components/Common.jsx';
 import { Field, TextInput, Textarea, Toggle, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
-import { RequestError, Tabs, ManagerBadge, useJobRunner, JobPanel, JobHistory } from '../../software/Shared.jsx';
+import { RequestError, Tabs, ManagerBadge, CodeList, useJobRunner, JobPanel, JobHistory } from '../../software/Shared.jsx';
 
 const EMPTY = { name: '', description: '', packages: { debian: [], rhel: [] } };
 
@@ -82,7 +83,7 @@ export default function EasyApache4({ fn }) {
                 {profiles.data.profiles.map((p) => (
                   <tr key={p.id} className={selectedId === p.id ? 'is-selected' : ''}>
                     <td><strong>{p.name}</strong>{p.stock && <StatusPill status="info">stock</StatusPill>}</td>
-                    <td className="small">{p.description}</td>
+                    <td className="muted">{p.description}</td>
                     <td>{(p.packages[hostFamily] || []).length}</td>
                     <td>{p.active && <StatusPill status="ok">currently provisioned</StatusPill>}</td>
                     <td className="actions-col">
@@ -106,14 +107,15 @@ export default function EasyApache4({ fn }) {
           {diff && (
             <>
               <KeyValue items={[
-                ['To install', diff.install.length ? diff.install.map((p) => <code key={p} style={{ marginRight: 6 }}>{p}</code>) : 'nothing'],
+                ['To install', diff.install.length ? <CodeList key="i" names={diff.install} /> : 'nothing'],
                 ['Already installed', `${diff.unchanged.length} of ${diff.total}`],
-                ['Managed packages not in profile', diff.remove.length ? diff.remove.map((p) => <code key={p} style={{ marginRight: 6 }}>{p}</code>) : 'none'],
-                diff.remove.length > 0 && ['Removed with them (dependents)', diff.simulationError ? <span key="e" className="muted">simulation failed: {diff.simulationError}</span> : collateral.length ? collateral.map((p) => <code key={p.name} style={{ marginRight: 6 }}>{p.name}</code>) : 'none (checked with the package manager)'],
+                ['Managed packages not in profile', diff.remove.length ? <CodeList key="r" names={diff.remove} /> : 'none'],
+                diff.remove.length > 0 && ['Removed with them (dependents)', diff.simulationError ? <span key="e" className="muted">simulation failed: {diff.simulationError}</span> : collateral.length ? <CodeList key="c" names={collateral.map((p) => p.name)} /> : 'none (checked with the package manager)'],
               ]} />
               {diff.remove.length > 0 && <Toggle checked={removeExtras} onChange={setRemoveExtras} label={`Remove the ${diff.remove.length} package(s) other profiles manage but this one omits`} description="Only packages that appear in some profile are selected for removal, but apt/dnf also remove whatever depends on them. The removal is simulated first and refused if it would take anything else with it, unless you accept the dependents below." />}
               {removeExtras && diff.remove.length > 0 && collateral.length > 0 && (
                 <div className="banner banner-warning">
+                  <AlertTriangle size={18} />
                   <div>
                     <strong>Removing {diff.remove.join(', ')} also removes {collateral.map((p) => p.name).join(', ')}</strong>
                     <p>Keep those packages in the profile (Customise) or accept that they go too.</p>
@@ -121,7 +123,7 @@ export default function EasyApache4({ fn }) {
                   </div>
                 </div>
               )}
-              {removeExtras && diff.remove.length > 0 && diff.simulationError && <div className="banner banner-error"><div><strong>The removal could not be simulated</strong><p>{diff.simulationError}. Nothing is removed until the package manager can say what the removal would take with it; retry the preview or provision without removing extras.</p></div></div>}
+              {removeExtras && diff.remove.length > 0 && diff.simulationError && <div className="banner banner-error"><AlertTriangle size={18} /><div><strong>The removal could not be simulated</strong><p>{diff.simulationError}. Nothing is removed until the package manager can say what the removal would take with it; retry the preview or provision without removing extras.</p></div></div>}
               <div className="action-row"><Button variant="primary" loading={runner.busy} disabled={removalBlocked || (!diff.install.length && !(removeExtras && diff.remove.length))} onClick={build}>{diff.install.length || (removeExtras && diff.remove.length) ? 'Provision' : 'Nothing to do'}</Button></div>
               <ErrorBanner error={runner.error} />
             </>
@@ -134,11 +136,11 @@ export default function EasyApache4({ fn }) {
         {installed.data && (installed.data.packages.length === 0 ? <p className="muted">No Apache or PHP packages are installed. Pick a profile above and provision it.</p> : (
           <div className="table-wrap" style={{ maxHeight: 320, overflow: 'auto' }}>
             <table><thead><tr><th>Package</th><th>Version</th><th>Summary</th></tr></thead>
-              <tbody>{installed.data.packages.map((p) => <tr key={p.name}><td><code>{p.name}</code></td><td className="small">{p.version}</td><td className="small">{p.summary}</td></tr>)}</tbody></table>
+              <tbody>{installed.data.packages.map((p) => <tr key={p.name}><td><code>{p.name}</code></td><td>{p.version}</td><td className="muted">{p.summary}</td></tr>)}</tbody></table>
           </div>
         ))}
       </Card>
-      <Card title="Build history"><JobHistory jobs={builds.data} emptyText="No builds yet" onSelect={(id) => runner.setJobId(id)} /></Card>
+      <Card title="Build history"><JobHistory jobs={builds.data} emptyText="No builds yet; each profile build appears here with its log" onSelect={(id) => runner.setJobId(id)} /></Card>
 
       <Modal open={Boolean(editor)} title={editor?.mode === 'create' ? 'New profile' : editor?.mode === 'copy' ? `Customise ${editor.name}` : `Edit ${editor?.name}`} onClose={() => setEditor(null)} size="lg"
         footer={<><Button onClick={() => setEditor(null)}>Cancel</Button><Button variant="primary" loading={saving} disabled={!editor?.name.trim()} onClick={saveProfile}>Save profile</Button></>}>
@@ -150,18 +152,17 @@ export default function EasyApache4({ fn }) {
             </div>
             <Tabs value={family} onChange={setFamily} tabs={[{ value: 'debian', label: 'Debian / Ubuntu packages', count: editor.packages.debian.length }, { value: 'rhel', label: 'RHEL family packages', count: editor.packages.rhel.length }]} />
             {catalog.data && Object.entries(catalog.data[family] || {}).map(([group, names]) => (
-              <div key={group} style={{ marginBottom: 12 }}>
-                <h3 style={{ margin: '8px 0' }}>{group}</h3>
-                <div className="form-grid" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))' }}>
+              <Field key={group} label={group}>
+                <div className="form-grid" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 8 }}>
                   {names.map((n) => <label key={n} className="radio"><input type="checkbox" checked={editor.packages[family].includes(n)} onChange={() => togglePkg(n)} /> <span><code>{n}</code></span></label>)}
                 </div>
-              </div>
+              </Field>
             ))}
             <Field label="Additional packages" help="Any other distro package names, separated by spaces or commas (press Enter or Add)">
               <Textarea rows={2} mono value={custom} onChange={setCustom} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addCustom(custom); } }} placeholder="libapache2-mod-rpaf php8.3-xdebug" />
               <div className="action-row"><Button size="sm" disabled={!custom.trim()} onClick={() => addCustom(custom)}>Add to {family === 'rhel' ? 'RHEL' : 'Debian'} list</Button></div>
             </Field>
-            <p className="small">Selected for {family}: {editor.packages[family].length ? editor.packages[family].map((p) => <code key={p} style={{ marginRight: 6 }}>{p}</code>) : <span className="muted">nothing yet</span>}</p>
+            <p className="muted">Selected for {family}: {editor.packages[family].length ? <CodeList names={editor.packages[family]} /> : 'nothing yet'}</p>
             <ErrorBanner error={saveError} />
           </>
         )}

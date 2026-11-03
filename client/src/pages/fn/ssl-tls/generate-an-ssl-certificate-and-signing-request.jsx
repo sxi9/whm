@@ -79,10 +79,10 @@ export default function GenerateCsr({ fn }) {
           <DataTable dense columns={[
             { key: 'domain', label: 'Domain', render: (r) => <code>{r.domain}</code> },
             { key: 'account', label: 'Account' },
-            { key: 'subject', label: 'Subject', render: (r) => <span className="small">{r.subject || '—'}</span> },
+            { key: 'subject', label: 'Subject', render: (r) => <span className="muted">{r.subject || '—'}</span> },
             { key: 'hasKey', label: 'Key', render: (r) => (r.hasKey ? 'stored' : '—') },
             { key: 'createdAt', label: 'Created', render: (r) => formatDate(r.createdAt) },
-          ]} rows={recent.data} emptyText="No CSRs yet." rowActions={(r) => [
+          ]} rows={recent.data} emptyText="Signing requests generated here appear in this list." rowActions={(r) => [
             { label: 'Download CSR', primary: true, onClick: () => downloadFromStore(r, 'csr') },
             r.hasKey && { label: 'Download key', onClick: () => downloadFromStore(r, 'key') },
           ]} />

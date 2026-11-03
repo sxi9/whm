@@ -44,15 +44,15 @@ export default function QuotaModification({ fn }) {
             <KeyValue items={[['Used', live ? formatMb(live.usedMb) : formatMb(account.disk_used_mb)], ['Current quota', formatMb(account.disk_quota_mb)], live && ['Live limits (repquota)', `${formatMb(live.softMb)} soft / ${formatMb(live.hardMb)} hard`], ['Package default', formatMb(account.plan?.disk_mb)], ['Home', <code key="h">{account.home_dir}</code>]]} />
             <CapabilityNotice error={error} />
             {error && error.status !== 501 && <ErrorBanner error={error} />}
-            <div className="form-grid" style={{ marginTop: 14 }}>
-              <Field inline><Toggle checked={unlimited} onChange={setUnlimited} label="Unlimited disk space" /></Field>
-              {!unlimited && <Field label="Disk quota (MB)" error={error?.fields?.diskQuotaMb} help="1024 MB = 1 GB"><NumberInput value={quota} onChange={setQuota} min={0} nullable={false} /></Field>}
+            <div style={{ marginTop: 14 }}>
+              <Field inline><Toggle checked={unlimited} onChange={setUnlimited} label="Unlimited disk space" description="No quota on the filesystem; usage is still measured" /></Field>
+              {!unlimited && <div className="form-grid"><Field label="Disk quota (MB)" error={error?.fields?.diskQuotaMb} help="1024 MB = 1 GB"><NumberInput value={quota} onChange={setQuota} min={0} nullable={false} /></Field></div>}
             </div>
             <FormActions><Button type="submit" variant="primary" loading={busy}>Save quota</Button></FormActions>
           </Card>
         </form>
       )}
-      <Card title="Quota report" subtitle="Live usage from repquota next to the panel's record" padded={false} actions={<Button size="sm" onClick={() => refetchReport()}>Refresh</Button>}>
+      <Card title="Quota report" subtitle="Live usage from repquota next to the panel's record" padded={Boolean(reportError)} actions={<Button size="sm" onClick={() => refetchReport()}>Refresh</Button>}>
         <CapabilityNotice error={reportError} onRetry={refetchReport} />
         {reportError && reportError.status !== 501 && <ErrorBanner error={reportError} onRetry={refetchReport} />}
         {!reportError && (

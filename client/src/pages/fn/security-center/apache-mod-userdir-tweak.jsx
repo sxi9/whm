@@ -26,7 +26,7 @@ export default function ApacheModUserdirTweak({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="mod_userdir serves http://host/~user/ from each account's public_html. Because those URLs share the server's main domain they bypass per-domain bandwidth accounting and SSL, so WHM disables them by default." />
+      <PageHeader fn={fn} description="mod_userdir serves http://host/~user/ from each account's public_html. Because those URLs share the server's main domain they bypass per-domain bandwidth accounting and SSL, so the panel disables them by default." />
       <RequestError error={error} onRetry={refetch} />
       {loading && !data && <Loading />}
       {data && !data.installed && <CapabilityNotice error={{ code: 'capability_missing', message: 'Apache is not installed on this server, so mod_userdir cannot be configured.' }} onRetry={refetch} />}
@@ -46,7 +46,7 @@ export default function ApacheModUserdirTweak({ fn }) {
               <Field label="Exclude these accounts" help="Accounts with their own domain rarely need ~user access.">
                 <div className="form-grid">
                   {(data.accounts || []).map((u) => <Field key={u} inline><Toggle checked={excluded.includes(u)} onChange={() => toggleUser(u)} label={u} /></Field>)}
-                  {!data.accounts?.length && <p className="muted">No hosting accounts yet.</p>}
+                  {!data.accounts?.length && <p className="muted">Hosting accounts appear here once one is created.</p>}
                 </div>
               </Field>
             )}

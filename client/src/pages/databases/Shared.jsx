@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
@@ -60,7 +61,7 @@ export function AccountSelect({ value, onChange, label = 'Account', allowNone = 
   useEffect(() => { if (!isRoot && !value && accounts.length === 1) onChange(accounts[0].username); }, [isRoot, accounts, value, onChange]);
   const options = accounts.map((a) => ({ value: a.username, label: `${a.username} — ${a.domain}${a.suspended ? ' (suspended)' : ''}` }));
   return (
-    <Field label={label} help={help || (loading ? 'Loading accounts…' : `${accounts.length} account(s)`)}>
+    <Field label={label} help={help || (loading ? 'Loading accounts…' : `${accounts.length} ${accounts.length === 1 ? 'account' : 'accounts'}`)}>
       <Select value={value} onChange={onChange} options={options} placeholder={allowNone && isRoot ? noneLabel : accounts.length ? 'Select an account' : 'No accounts yet'} />
     </Field>
   );
@@ -76,9 +77,9 @@ export function PrivilegesEditor({ value = [], onChange, engine = 'mysql' }) {
     onChange([...next]);
   };
   return (
-    <div className="form-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))' }}>
+    <div className="form-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))', gap: '8px 20px' }}>
       {list.map((p) => (
-        <label key={p} className="radio" style={{ padding: '4px 0' }}>
+        <label key={p} className="radio">
           <input type="checkbox" checked={all ? true : value.includes(p)} disabled={all && p !== 'ALL PRIVILEGES'} onChange={() => toggle(p)} />
           <span><strong>{p}</strong></span>
         </label>
@@ -116,9 +117,9 @@ export function GrantsModal({ user, engine, onClose, onSaved }) {
       <ErrorBanner error={saveError} />
       {current && (
         <>
-          {current.hosts?.length > 0 && <p className="muted">Applied at hosts: {current.hosts.map((h) => <code key={h} style={{ marginRight: 6 }}>{h}</code>)}</p>}
-          {current.grants?.some((g) => g.mixed) && <div className="banner banner-warning"><div>Some privileges differ between hosts (shown with <em>differs per host</em>). Saving applies the same set at every host.</div></div>}
-          {grants.length === 0 && <p className="muted">This user has no database privileges yet.</p>}
+          {current.hosts?.length > 0 && <p className="muted">Applied at hosts: {current.hosts.map((h) => <code key={h}>{h}</code>).reduce((acc, el) => (acc.length ? [...acc, ' ', el] : [el]), [])}</p>}
+          {current.grants?.some((g) => g.mixed) && <div className="banner banner-warning"><AlertTriangle size={18} /><div>Some privileges differ between hosts (shown with <em>differs per host</em>). Saving applies the same set at every host.</div></div>}
+          {grants.length === 0 && <p className="muted">This user has no database privileges yet. Add a database below and its privileges appear here.</p>}
           {grants.map((g) => (
             <Card key={g.database} title={<><code>{g.database}</code>{g.mixed && <StatusPill status="warning">differs per host{g.hosts?.length ? `: ${g.hosts.join(', ')}` : ''}</StatusPill>}</>} actions={<Button size="sm" variant="danger-ghost" onClick={() => setGrants((gs) => gs.filter((x) => x.database !== g.database))}>Remove</Button>}>
               <PrivilegesEditor value={g.privileges} onChange={(p) => setPrivs(g.database, p)} engine={engine} />
@@ -143,7 +144,7 @@ export function DbUserSelect({ value, onChange, label = 'Database user', include
   return (
     <>
       <RequestError error={error} onRetry={refetch} />
-      <Field label={label} help={loading ? 'Loading users…' : `${users.length} user(s)`}>
+      <Field label={label} help={loading ? 'Loading users…' : `${users.length} ${users.length === 1 ? 'user' : 'users'}`}>
         <Select value={value} onChange={onChange} options={users.map((u) => ({ value: u.name, label: `${u.name}${u.account ? ` — ${u.account}` : ''}${u.onServer === false ? ' (missing on server)' : ''}` }))} placeholder={users.length ? 'Select a user' : 'No database users yet'} />
       </Field>
     </>

@@ -36,7 +36,7 @@ export function BulkFlagPage({ fn, flag, endpoint, onLabel, offLabel, descriptio
   return (
     <>
       <PageHeader fn={fn} description={description} />
-      <div className="stat-grid" style={{ marginBottom: 14 }}>
+      <div className="stat-grid" style={{ marginBottom: 18 }}>
         <div className="stat"><div className="label">Accounts</div><div className="value">{data ? data.length : '—'}</div></div>
         <div className="stat"><div className="label">{columnLabel}</div><div className="value">{data ? on : '—'}</div></div>
         <div className="stat"><div className="label">Selected</div><div className="value">{selected.length}</div></div>
@@ -61,7 +61,7 @@ export function BulkFlagPage({ fn, flag, endpoint, onLabel, offLabel, descriptio
               <Button variant="ghost" loading={busy} disabled={!data?.length} onClick={() => apply(true, [], true)}>{onLabel} for all</Button>
             </>
           )}
-          emptyText="No accounts match."
+          emptyText="No accounts match this filter."
         />
       </Card>
       {last && (

@@ -1,9 +1,10 @@
 import { useCallback, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { Card, StatusPill, KeyValue, formatDate } from '../../components/Common.jsx';
-import { Button, ErrorBanner } from '../../components/Form.jsx';
+import { Field, TextInput, Button, ErrorBanner } from '../../components/Form.jsx';
 import { ProgressLog } from '../../components/ProgressLog.jsx';
 import { useToast } from '../../components/Toast.jsx';
 
@@ -42,7 +43,7 @@ export function useJobRunner({ onFinished } = {}) {
 export function JobPanel({ runner, title = 'Progress' }) {
   if (!runner.jobId) return null;
   return (
-    <Card title={title} subtitle={`Job #${runner.jobId} · also visible under Server Status > Task Queue Monitor`}>
+    <Card title={title} subtitle={`Job #${runner.jobId} · also visible under Server Status › Task Queue Monitor`}>
       <ProgressLog jobId={runner.jobId} onFinished={runner.finished} />
     </Card>
   );
@@ -59,6 +60,7 @@ export function RebootBanner({ required }) {
   if (!required) return null;
   return (
     <div className="banner banner-warning">
+      <AlertTriangle size={18} />
       <div>
         <strong>Reboot required</strong>
         <p>The kernel or a core library was updated. Schedule a <Link to="/system-reboot/graceful-server-reboot">graceful reboot</Link> to finish applying it.</p>
@@ -67,13 +69,19 @@ export function RebootBanner({ required }) {
   );
 }
 
+// Inline list of package or file names.
+export function CodeList({ names }) {
+  if (!names?.length) return null;
+  return <>{names.map((n, i) => <span key={n}>{i > 0 && ' '}<code>{n}</code></span>)}</>;
+}
+
 export function PhpVersionPill({ version, inherited }) {
   if (!version) return <span className="muted">—</span>;
   return <StatusPill status={inherited ? 'inactive' : 'ok'}>{version}{inherited ? ' (inherited)' : ''}</StatusPill>;
 }
 
 // Renders the recent jobs of some type(s) as a compact history table.
-export function JobHistory({ jobs, emptyText = 'No runs yet', onSelect }) {
+export function JobHistory({ jobs, emptyText = 'No runs yet; each run appears here with its status and log', onSelect }) {
   if (!jobs?.length) return <p className="muted">{emptyText}</p>;
   return (
     <div className="table-wrap">
@@ -86,7 +94,7 @@ export function JobHistory({ jobs, emptyText = 'No runs yet', onSelect }) {
               <td><code>{j.type}</code></td>
               <td><StatusPill status={j.status} /></td>
               <td>{formatDate(j.started_at || j.created_at)}</td>
-              <td className="small">{j.error || j.message || (j.result ? summarizeResult(j.result) : '—')}</td>
+              <td className="muted">{j.error || j.message || (j.result ? summarizeResult(j.result) : '—')}</td>
               {onSelect && <td className="actions-col"><Button size="sm" onClick={() => onSelect(j.id)}>Log</Button></td>}
             </tr>
           ))}
@@ -119,20 +127,20 @@ export function InstallerCard({ title, subtitle, kind, listPath, installPath, na
       {present && (
         <>
           <div className="form-grid">
-            <label className="field"><span className="field-label">{nameLabel}</span><input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder={namePlaceholder} /></label>
-            {allowVersion && <label className="field"><span className="field-label">Version (optional)</span><input className="input" value={version} onChange={(e) => setVersion(e.target.value)} placeholder="latest" /></label>}
+            <Field label={nameLabel}><TextInput value={name} onChange={setName} placeholder={namePlaceholder} /></Field>
+            {allowVersion && <Field label="Version (optional)"><TextInput value={version} onChange={setVersion} placeholder="latest" /></Field>}
           </div>
           <div className="action-row"><Button variant="primary" loading={runner.busy} disabled={!name.trim()} onClick={install}>Install with {kind}</Button> <Button onClick={() => refetch()}>Refresh list</Button></div>
           <ErrorBanner error={error} onRetry={refetch} />
           {loading && !data && <p className="muted">Loading installed {kind} items…</p>}
           {data && (
             <>
-              <input className="input" placeholder={`Filter ${items.length ? `${data.items.length} installed` : 'installed'}…`} value={q} onChange={(e) => setQ(e.target.value)} style={{ marginBottom: 8 }} />
+              <TextInput placeholder={`Filter ${items.length ? `${data.items.length} installed` : 'installed'}…`} value={q} onChange={setQ} style={{ marginBottom: 8 }} />
               <div className="table-wrap" style={{ maxHeight: 320, overflow: 'auto' }}>
                 <table>
                   <thead><tr><th>Name</th><th>Version</th></tr></thead>
                   <tbody>
-                    {items.length === 0 && <tr><td colSpan={2} className="table-state">Nothing installed{q ? ' matching the filter' : ''}</td></tr>}
+                    {items.length === 0 && <tr><td colSpan={2} className="table-state">{q ? 'Nothing installed matches the filter' : `Nothing installed yet; items installed with ${kind} appear here`}</td></tr>}
                     {items.slice(0, 500).map((i) => <tr key={i.name}><td><code>{i.name}</code></td><td>{i.version || i.state || '—'}</td></tr>)}
                   </tbody>
                 </table>

@@ -42,7 +42,7 @@ export default function WebLogRetention({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Per-account policy for the raw Apache logs: whether a monthly archive is kept in the account's ~/logs/archive and for how long. Rotation of the live logs is configured under Service Configuration → cPanel Log Rotation Configuration. The archive job runs on the 1st of each month." actions={<Button variant="primary" loading={busy} onClick={() => archiveNow()}>Archive now (all enabled)</Button>} />
+      <PageHeader fn={fn} description="Per-account policy for the raw Apache logs: whether a monthly archive is kept in the account's ~/logs/archive and for how long. Rotation of the live logs is configured under Service Configuration › Log Rotation Configuration. The archive job runs on the 1st of each month." actions={<Button variant="primary" loading={busy} onClick={() => archiveNow()}>Archive now (all enabled)</Button>} />
       <CapabilityNotice error={runError} />
       <Card padded={false}>
         <ErrorBanner error={error} onRetry={refetch} />
@@ -52,7 +52,7 @@ export default function WebLogRetention({ fn }) {
             { key: 'domain', label: 'Domain' },
             { key: 'owner', label: 'Owner' },
             { key: 'archive_logs', label: 'Archive', render: (r) => <StatusPill status={r.archive_logs ? 'enabled' : 'disabled'}>{r.archive_logs ? 'monthly' : 'off'}</StatusPill> },
-            { key: 'retain_months', label: 'Keep', render: (r) => (r.archive_logs ? `${r.retain_months} month(s)${r.remove_old_archives ? '' : ' (never pruned)'}` : <span className="muted">—</span>) },
+            { key: 'retain_months', label: 'Keep', render: (r) => (r.archive_logs ? `${r.retain_months} ${r.retain_months === 1 ? 'month' : 'months'}${r.remove_old_archives ? '' : ' (never pruned)'}` : <span className="muted">—</span>) },
             { key: 'last_archived_at', label: 'Last archived', render: (r) => formatDate(r.last_archived_at) },
             { key: 'configured', label: 'Source', render: (r) => <span className="muted">{r.configured ? 'account setting' : 'server default'}</span> },
           ]}

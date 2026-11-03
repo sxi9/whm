@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { api } from '../../api/client.js';
-import { PageHeader, Card, KeyValue, StatusPill } from '../../components/Common.jsx';
+import { PageHeader, Card, KeyValue, StatusPill, formatDate } from '../../components/Common.jsx';
 import { Field, Textarea, Button, FormActions } from '../../components/Form.jsx';
 import { useToast } from '../../components/Toast.jsx';
 import { useConfirm } from '../../components/Modal.jsx';
@@ -39,11 +39,11 @@ export default function ManageSuspension({ fn }) {
       <Card title="Select an account"><AccountPicker value={username} onChange={setUsername} /></Card>
       {account && (
         <Card title={`${account.domain} (${account.username})`}>
-          <KeyValue items={[['Status', <StatusPill key="s" status={account.suspended ? 'suspended' : 'active'}>{account.suspended ? 'Suspended' : 'Active'}</StatusPill>], account.suspended && ['Reason', account.suspend_reason || '—'], account.suspended && ['Suspended at', account.suspended_at]]} />
+          <KeyValue items={[['Status', <StatusPill key="s" status={account.suspended ? 'suspended' : 'active'}>{account.suspended ? 'Suspended' : 'Active'}</StatusPill>], account.suspended && ['Reason', account.suspend_reason || '—'], account.suspended && ['Suspended at', formatDate(account.suspended_at)]]} />
           <p className="muted" style={{ marginTop: 10 }}>Suspending locks the Linux user (SSH, FTP and mailbox logins that authenticate against it stop working). The web sites keep their content until the web server integration switches them to the suspended page; the result of each action says what was applied.</p>
           {!account.suspended ? (
             <>
-              <Field label="Reason (shown to the account owner)" style={{ marginTop: 14 }}><Textarea value={reason} onChange={setReason} rows={3} placeholder="e.g. Non-payment, abuse report #123" /></Field>
+              <div style={{ marginTop: 14 }}><Field label="Reason (shown to the account owner)"><Textarea value={reason} onChange={setReason} rows={3} placeholder="e.g. Non-payment, abuse report #123" /></Field></div>
               <FormActions><Button variant="danger" loading={busy} onClick={() => run('suspend')}>Suspend account</Button></FormActions>
             </>
           ) : (

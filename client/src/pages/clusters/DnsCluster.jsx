@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
-import { RefreshCw } from 'lucide-react';
+import { RefreshCw, Info } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { Card, StatusPill, Loading, KeyValue, CapabilityNotice, formatDate } from '../../components/Common.jsx';
@@ -26,17 +26,17 @@ export function DnsCluster() {
     <>
       {!data.dnsModule && <CapabilityNotice error={{ code: 'capability_missing', message: 'The DNS Functions module is not loaded on this panel, so zones can be neither pushed nor received. Peers and tokens can still be managed.' }} onRetry={refreshAll} />}
       {data.dnsModule && !data.bind && (
-        <div className="banner banner-info"><div><strong>BIND is not installed here.</strong><p>Zones live in the panel database and are still pushed to peers; this server starts serving them itself once BIND is installed (<Link to="/software/install-distro-packages">Install Distro Packages</Link>).</p></div></div>
+        <div className="banner banner-info"><Info size={18} /><div><strong>BIND is not installed here</strong><p>Zones live in the panel database and are still pushed to peers; this server starts serving them itself once BIND is installed (<Link to="/software/install-distro-packages">Install Distro Packages</Link>).</p></div></div>
       )}
       <PeerTable peers={data.peers} roles={data.roles} loading={overview.loading} onChanged={refreshAll} focus="dns"
         subtitle={`Other servers running this panel. ${data.hostname} pushes its zones to every enabled write-only or sync peer over the peer's own API.`} />
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(380px, 1fr))', gap: 18, alignItems: 'start' }}>
+      <div className="grid-2">
         <SyncNow peers={data.peers} onStarted={refreshAll} />
         <DnsSettings settings={data.settings} schedule={data.schedule} dnsModule={data.dnsModule} onSaved={refreshAll} />
       </div>
       <ClusterTokens tokens={data.tokens} hostname={data.hostname} purpose="dns" onChanged={refreshAll} />
       <Card title="Zone status per peer" subtitle="The serial each peer last acknowledged. Stale zones are re-sent by the hourly run; a failed push shows the peer's answer. Pushes replicate existing zones only: a zone deleted here stays on the peers until it is removed there, and a sync peer's zones reach this server only when that peer pushes them." padded={false}>
-        <DataTable dense rows={data.zones} rowKey={(r) => `${r.zone_id}-${r.cluster_id}`} emptyText="Nothing has been pushed yet."
+        <DataTable dense rows={data.zones} rowKey={(r) => `${r.zone_id}-${r.cluster_id}`} emptyText="No zones pushed yet. Each zone sent to a peer appears here with the serial the peer acknowledged."
           columns={[
             { key: 'domain', label: 'Zone' },
             { key: 'cluster', label: 'Peer' },

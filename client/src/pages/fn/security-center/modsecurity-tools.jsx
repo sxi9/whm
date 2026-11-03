@@ -3,7 +3,7 @@ import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading } from '../../../components/Common.jsx';
 import { DataTable, useTableState } from '../../../components/DataTable.jsx';
-import { Toggle } from '../../../components/Form.jsx';
+import { Toggle, Button } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { Tabs, RequestError } from '../../security/Shared.jsx';
@@ -11,7 +11,7 @@ import { Tabs, RequestError } from '../../security/Shared.jsx';
 function Hits({ onDisable }) {
   const { data, loading, error, refetch } = useApi('/security/modsec/hits?limit=500', { refreshMs: 30_000 });
   return (
-    <Card title="Recent hits" subtitle={data ? `Parsed from ${data.file}${data.available ? '' : ' (log not readable)'}` : undefined} padded={false} actions={<button className="btn btn-sm" onClick={() => refetch()}>Refresh</button>}>
+    <Card title="Recent hits" subtitle={data ? `Parsed from ${data.file}${data.available ? '' : ' (log not readable)'}` : undefined} padded={false} actions={<Button size="sm" onClick={() => refetch()}>Refresh</Button>}>
       <DataTable dense columns={[
         { key: 'ts', label: 'Time' },
         { key: 'client', label: 'Client', render: (h) => <code>{h.client}</code> },
@@ -21,7 +21,7 @@ function Hits({ onDisable }) {
         { key: 'msg', label: 'Message' },
         { key: 'severity', label: 'Severity', render: (h) => <StatusPill status={/CRITICAL|EMERGENCY|ALERT/.test(h.severity || '') ? 'failed' : /ERROR|WARNING/.test(h.severity || '') ? 'warning' : 'unknown'}>{h.severity || '—'}</StatusPill> },
         { key: 'action', label: 'Action' },
-      ]} rows={data?.hits || []} loading={loading} error={error} rowKey={(h) => `${h.uniqueId || h.ts}-${h.id}-${h.client}`} emptyText="No ModSecurity events in the error log tail."
+      ]} rows={data?.hits || []} loading={loading} error={error} rowKey={(h) => `${h.uniqueId || h.ts}-${h.id}-${h.client}`} emptyText="Blocked and logged requests appear here as ModSecurity records them in the error log."
         rowActions={(h) => (h.id ? [{ label: 'Disable rule', primary: true, onClick: () => onDisable(h.id) }] : [])} />
     </Card>
   );
@@ -48,8 +48,8 @@ function Rules() {
         { key: 'disabled', label: 'Enabled', render: (r) => <Toggle checked={!r.disabled} onChange={() => toggle(r)} /> },
       ]} rows={data || []} loading={loading} error={error} rowKey={(r) => `${r.id}-${r.file}`}
         total={meta?.total} page={t.state.page} pageSize={t.state.pageSize} onPageChange={t.setPage}
-        searchable q={t.state.q} onSearch={t.setSearch} searchPlaceholder="Search id, message, tag or file…"
-        toolbar={<Toggle checked={disabledOnly} onChange={(v) => { setDisabledOnly(v); t.setPage(1); }} label="Disabled only" />} emptyText="No rules found." dense />
+        searchable q={t.state.q} onSearch={t.setSearch} searchPlaceholder="Search id, message, tag or file"
+        toolbar={<Toggle checked={disabledOnly} onChange={(v) => { setDisabledOnly(v); t.setPage(1); }} label="Disabled only" />} emptyText="Rules from the base and vendor files appear here. Nothing matches right now." dense />
     </Card>
   );
 }

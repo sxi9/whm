@@ -20,9 +20,9 @@ export function RequestError({ error, onRetry }) {
 
 export function Tabs({ tabs, value, onChange }) {
   return (
-    <div className="row-actions" role="tablist" style={{ marginBottom: 14, flexWrap: 'wrap' }}>
+    <div className="segmented" role="tablist" style={{ marginBottom: 14, flexWrap: 'wrap' }}>
       {tabs.map((t) => (
-        <button key={t.value} role="tab" aria-selected={value === t.value} className={`btn btn-sm ${value === t.value ? 'btn-primary' : ''}`} onClick={() => onChange(t.value)}>
+        <button key={t.value} type="button" role="tab" aria-selected={value === t.value} className={value === t.value ? 'active' : ''} onClick={() => onChange(t.value)}>
           {t.label}{t.count != null && <span className="pill pill-muted" style={{ marginLeft: 6 }}>{t.count}</span>}
         </button>
       ))}
@@ -69,7 +69,10 @@ export function ToggleFeaturePage({ fn, path, field, onLabel = 'Enable', offLabe
         <Card title="Current state">
           {notInstalled && notInstalled(data) ? notInstalled(data) : (
             <>
-              <KeyValue items={[['Status', <StatusPill key="s" status={on ? 'enabled' : 'disabled'}>{renderStatus ? renderStatus(data, on) : on ? 'Enabled' : 'Disabled'}</StatusPill>]]} />
+              <KeyValue items={[
+                ['Status', <StatusPill key="s" status={on ? 'enabled' : 'disabled'}>{on ? 'Enabled' : 'Disabled'}</StatusPill>],
+                ...(renderStatus ? [['Effect', renderStatus(data, on)]] : []),
+              ]} />
               <FormActions>
                 {!on && <Button variant="primary" loading={busy} onClick={() => set(true)}>{onLabel}</Button>}
                 {on && <Button variant="danger" loading={busy} onClick={() => set(false)}>{offLabel}</Button>}
@@ -77,9 +80,9 @@ export function ToggleFeaturePage({ fn, path, field, onLabel = 'Enable', offLabe
               </FormActions>
             </>
           )}
-          {renderDetails && renderDetails(data)}
         </Card>
       )}
+      {data && renderDetails && renderDetails(data)}
     </>
   );
 }
@@ -88,14 +91,14 @@ export function ToggleFeaturePage({ fn, path, field, onLabel = 'Enable', offLabe
 export function BinaryTable({ binaries }) {
   if (!binaries?.length) return null;
   return (
-    <div className="table-wrap" style={{ marginTop: 12 }}>
+    <div className="table-wrap">
       <table>
         <thead><tr><th>Binary</th><th>Also reached via</th><th>Mode</th><th>Everyone may run</th></tr></thead>
         <tbody>
           {binaries.map((b) => (
             <tr key={b.realPath}>
               <td><code>{b.realPath}</code></td>
-              <td>{b.paths.filter((p) => p !== b.realPath).map((p) => <code key={p} style={{ marginRight: 6 }}>{p}</code>)}</td>
+              <td><div className="row-actions" style={{ justifyContent: 'flex-start', gap: 6, flexWrap: 'wrap' }}>{b.paths.filter((p) => p !== b.realPath).map((p) => <code key={p}>{p}</code>)}</div></td>
               <td><code>{b.mode}</code></td>
               <td><StatusPill status={b.othersCanExecute ? 'warning' : 'ok'}>{b.othersCanExecute ? 'yes' : 'no'}</StatusPill></td>
             </tr>

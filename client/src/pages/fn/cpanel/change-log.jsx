@@ -20,9 +20,9 @@ export default function ChangeLog({ fn }) {
         <div className="home">
           <div className="home-main">
             {!data.exists && (
-              <Card title="No change log on this server">
-                <EmptyState icon={FileText} title="CHANGELOG.md is missing">
-                  <p>The panel renders <code>CHANGELOG.md</code> from its install directory (<code className="mono">{data.path}</code>). Releases built from the official archives ship it; add the file to show release notes here.</p>
+              <Card title="Change log">
+                <EmptyState icon={FileText} title="No release notes on this server">
+                  <p>Release notes are read from <code>CHANGELOG.md</code> in the install directory (<code className="mono">{data.path}</code>). Releases built from the official archives ship it; once the file is present, each release appears here as a card.</p>
                 </EmptyState>
               </Card>
             )}
@@ -46,14 +46,17 @@ export default function ChangeLog({ fn }) {
             </Card>
             {releases.length > 0 && (
               <Card title="Releases" padded={false}>
-                <ul className="service-dots">
-                  <li><button className={`link-button ${selected ? '' : 'active'}`} onClick={() => setSelected(null)}>All releases</button></li>
-                  {releases.map((r) => (
-                    <li key={r.version}>
-                      <button className="link-button" onClick={() => setSelected(r.version)}><strong>{r.unreleased ? 'Unreleased' : r.version}</strong></button>
-                      <small className="muted">{r.date || ''}</small>
-                    </li>
-                  ))}
+                <ul className="service-dots" style={{ padding: '4px 20px' }}>
+                  <li><button className="link-button" aria-pressed={!selected} onClick={() => setSelected(null)}>{selected ? 'All releases' : <strong>All releases</strong>}</button></li>
+                  {releases.map((r) => {
+                    const label = r.unreleased ? 'Unreleased' : r.version;
+                    return (
+                      <li key={r.version}>
+                        <button className="link-button" aria-pressed={selected === r.version} onClick={() => setSelected(r.version)}>{selected === r.version ? <strong>{label}</strong> : label}</button>
+                        <small className="muted">{r.date || ''}</small>
+                      </li>
+                    );
+                  })}
                 </ul>
               </Card>
             )}

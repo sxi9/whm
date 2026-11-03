@@ -44,7 +44,7 @@ export function useResellerCatalog() {
   return useApi('/resellers/catalog');
 }
 
-// Grouped ACL checkboxes like WHM's privilege editor, with preset lists.
+// Grouped ACL checkboxes with preset lists.
 export function AclEditor({ groups = [], lists = [], value = [], onChange, onSaveList, onDeleteList }) {
   const [listName, setListName] = useState('');
   const [newList, setNewList] = useState('');
@@ -71,23 +71,28 @@ export function AclEditor({ groups = [], lists = [], value = [], onChange, onSav
           </Field>
         )}
       </div>
-      <p className="muted" style={{ margin: '4px 0 10px' }}>{value.length} privilege(s) selected{value.includes('all') ? ' — "All Features" grants root-level access to this reseller' : ''}.</p>
+      <p className="muted" style={{ margin: '0 0 12px' }}>{value.length} privilege(s) selected{value.includes('all') ? ' — "All Features" grants root-level access to this reseller' : ''}.</p>
       {groups.map((g) => (
-        <fieldset key={g.key} className="acl-group" style={{ border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: '10px 14px', marginBottom: 12 }}>
-          <legend style={{ fontWeight: 600, padding: '0 6px' }}>{g.label}</legend>
-          <div style={{ display: 'flex', gap: 8, marginBottom: 6 }}>
-            <button type="button" className="btn btn-sm btn-ghost" onClick={() => setGroup(g, true)}>Select all</button>
-            <button type="button" className="btn btn-sm btn-ghost" onClick={() => setGroup(g, false)}>Clear</button>
+        <div key={g.key} className="acl-group" style={{ marginBottom: 18 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+            <h3>{g.label}</h3>
+            <span className="row-actions">
+              <Button variant="ghost" size="sm" onClick={() => setGroup(g, true)}>Select all</Button>
+              <Button variant="ghost" size="sm" onClick={() => setGroup(g, false)}>Clear</Button>
+            </span>
           </div>
           <div className="form-grid">
             {g.acls.map((a) => (
-              <label key={a.key} className="checkbox" style={{ display: 'flex', gap: 8, alignItems: 'flex-start', padding: '4px 0' }}>
-                <input type="checkbox" checked={has(a.key)} onChange={() => toggle(a.key)} style={{ marginTop: 3 }} />
-                <span><strong style={{ fontWeight: 500 }}>{a.label}</strong> <code className="muted" style={{ fontSize: 11 }}>{a.key}</code>{a.help && <small className="muted" style={{ display: 'block' }}>{a.help}</small>}</span>
+              <label key={a.key} className="checkbox" style={{ display: 'flex', gap: 10, alignItems: 'flex-start', padding: '5px 0' }}>
+                <input type="checkbox" checked={has(a.key)} onChange={() => toggle(a.key)} style={{ marginTop: 2 }} />
+                <span>
+                  {a.label}
+                  <small className="muted" style={{ display: 'block', marginTop: 2 }}><code className="small">{a.key}</code>{a.help ? ` ${a.help}` : ''}</small>
+                </span>
               </label>
             ))}
           </div>
-        </fieldset>
+        </div>
       ))}
     </div>
   );
@@ -101,7 +106,7 @@ export function NameserversEditor({ value = [], onChange, owns, onOwnsChange, de
       <div className="form-grid">
         {rows.map((n, i) => <Field key={i} label={`Nameserver ${i + 1}`} help={i < defaults.length && !n ? `Server default: ${defaults[i]}` : undefined}><TextInput value={n} onChange={(v) => set(i, v)} placeholder={defaults[i] || `ns${i + 1}.example.com`} /></Field>)}
       </div>
-      <p className="muted" style={{ margin: '4px 0 8px' }}>Stored with the reseller and passed to DNS Functions whenever a zone is created for one of its accounts. Partial: DNS Functions does not yet read that option, so new zones still advertise the server's nameservers until it does; existing zones are never rewritten.</p>
+      <p className="muted" style={{ margin: '0 0 12px' }}>Stored with the reseller and passed to DNS Functions whenever a zone is created for one of its accounts. Existing zones are never rewritten.</p>
       {onOwnsChange && <Field inline><Toggle checked={owns} onChange={onOwnsChange} label="Reseller operates these nameservers" description="Informational: the hosts are run by the reseller rather than by this server" /></Field>}
     </div>
   );
@@ -110,9 +115,9 @@ export function NameserversEditor({ value = [], onChange, owns, onOwnsChange, de
 export function LimitsFields({ form, set, fieldErr }) {
   return (
     <div className="form-grid">
-      <Field label="Maximum accounts" help="Blank = unlimited" error={fieldErr('maxAccounts')}><NumberInput value={form.maxAccounts} onChange={set('maxAccounts')} min={0} /></Field>
-      <Field label="Disk space (MB)" help="Total quota the reseller may allocate; blank = unlimited" error={fieldErr('maxDiskMb')}><NumberInput value={form.maxDiskMb} onChange={set('maxDiskMb')} min={0} /></Field>
-      <Field label="Bandwidth (MB / month)" help="Total bandwidth the reseller may allocate; blank = unlimited" error={fieldErr('maxBandwidthMb')}><NumberInput value={form.maxBandwidthMb} onChange={set('maxBandwidthMb')} min={0} /></Field>
+      <Field label="Maximum accounts" help="Blank means unlimited" error={fieldErr('maxAccounts')}><NumberInput value={form.maxAccounts} onChange={set('maxAccounts')} min={0} /></Field>
+      <Field label="Disk space (MB)" help="Total quota the reseller may allocate; blank means unlimited" error={fieldErr('maxDiskMb')}><NumberInput value={form.maxDiskMb} onChange={set('maxDiskMb')} min={0} /></Field>
+      <Field label="Bandwidth (MB per month)" help="Total bandwidth the reseller may allocate; blank means unlimited" error={fieldErr('maxBandwidthMb')}><NumberInput value={form.maxBandwidthMb} onChange={set('maxBandwidthMb')} min={0} /></Field>
       <Field inline><Toggle checked={form.oversellDisk} onChange={set('oversellDisk')} label="Allow disk overselling" description="Allocated quotas may exceed the limit; only real usage counts" /></Field>
       <Field inline><Toggle checked={form.oversellBandwidth} onChange={set('oversellBandwidth')} label="Allow bandwidth overselling" /></Field>
     </div>
@@ -126,12 +131,12 @@ export function PackagePicker({ packages = [], value = [], onChange }) {
       <p className="muted" style={{ marginTop: 0 }}>{value.length ? `${value.length} package(s) allowed, plus any the reseller creates.` : 'No restriction: the reseller may use every global package it has the privilege to see.'}</p>
       <div className="form-grid">
         {packages.map((p) => (
-          <label key={p.name} className="checkbox" style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '3px 0' }}>
+          <label key={p.name} className="checkbox" style={{ display: 'flex', gap: 10, alignItems: 'center', padding: '4px 0' }}>
             <input type="checkbox" checked={value.includes(p.name)} onChange={() => toggle(p.name)} />
             <span>{p.name} <small className="muted">({p.owner})</small></span>
           </label>
         ))}
-        {!packages.length && <span className="muted">No packages defined yet.</span>}
+        {!packages.length && <span className="muted">Packages created under Packages › Add a Package will be listed here.</span>}
       </div>
     </div>
   );
@@ -139,9 +144,10 @@ export function PackagePicker({ packages = [], value = [], onChange }) {
 
 export function UsageBar({ used, max, label }) {
   const pct = max > 0 ? Math.min(100, Math.round((used / max) * 100)) : null;
+  const tone = pct >= 100 ? 'bad' : pct >= 80 ? 'warn' : '';
   return (
-    <div className="usage-bar" title={label}>
-      <div className="progress-bar" style={{ height: 6 }}><span style={{ width: `${pct ?? 0}%`, background: pct >= 100 ? 'var(--bad)' : pct >= 80 ? 'var(--warn)' : undefined }} /></div>
+    <div className="usage-bar" title={label} style={{ minWidth: 150 }}>
+      <div className={`meter ${tone}`} style={{ marginTop: 0 }}><span style={{ width: `${pct ?? 0}%` }} /></div>
       <small className="muted">{formatMb(used)} / {formatMb(max)}{pct != null ? ` (${pct}%)` : ''}</small>
     </div>
   );
@@ -149,7 +155,7 @@ export function UsageBar({ used, max, label }) {
 
 export function ResellerStatusPill({ reseller }) {
   if (reseller.suspended) return <StatusPill status="suspended">Privileges suspended</StatusPill>;
-  if (!reseller.configured) return <StatusPill status="unknown">Not configured</StatusPill>;
+  if (reseller.configured === false) return <StatusPill status="unknown">Not configured</StatusPill>;
   return <StatusPill status="active">Active</StatusPill>;
 }
 

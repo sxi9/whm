@@ -1,8 +1,9 @@
 import { useState } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading } from '../../../components/Common.jsx';
-import { Field, Textarea, Toggle, Button, ErrorBanner } from '../../../components/Form.jsx';
+import { Field, TextInput, Textarea, Toggle, Button, ErrorBanner } from '../../../components/Form.jsx';
 import { RequestError, useJobRunner, JobPanel, JobHistory } from '../../software/Shared.jsx';
 
 const MODULE_RE = /^[A-Za-z][A-Za-z0-9_]*(::[A-Za-z0-9_]+)*$/;
@@ -27,7 +28,7 @@ export default function InstallAPerlModule({ fn }) {
     <>
       <PageHeader fn={fn} actions={installers.data && <StatusPill status={installer ? 'ok' : 'not-installed'}>{installer ? `installer: ${installer}${installers.data.versions.perl ? ` · perl ${installers.data.versions.perl}` : ''}` : 'no CPAN client'}</StatusPill>} />
       <Card title="Install from CPAN" subtitle="Modules are built and installed non-interactively as a background job (cpanm when available, otherwise cpan with default answers).">
-        {installers.data && !installer && <div className="banner banner-warning"><div><strong>No CPAN client</strong><p>Install <code>cpanminus</code> (Debian/Ubuntu) or <code>perl-App-cpanminus</code> (RHEL) from Install Distro Packages first.</p></div></div>}
+        {installers.data && !installer && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>No CPAN client</strong><p>Install <code>cpanminus</code> (Debian/Ubuntu) or <code>perl-App-cpanminus</code> (RHEL) from Install Distro Packages first.</p></div></div>}
         <Field label="Module names" help="One per line or separated by spaces, e.g. DBD::mysql, JSON::XS, LWP::UserAgent" error={invalid.length ? [`Not a Perl module name: ${invalid.join(', ')}`] : null} required>
           <Textarea value={text} onChange={setText} rows={4} mono placeholder={'DBD::mysql\nJSON::XS'} />
         </Field>
@@ -41,12 +42,12 @@ export default function InstallAPerlModule({ fn }) {
         {loading && !data && <Loading />}
         {data && (
           <>
-            <input className="input" placeholder="Filter modules…" value={q} onChange={(e) => setQ(e.target.value)} style={{ marginBottom: 8 }} />
+            <TextInput placeholder="Filter modules…" value={q} onChange={setQ} style={{ marginBottom: 8 }} />
             <div className="table-wrap" style={{ maxHeight: 400, overflow: 'auto' }}>
               <table>
                 <thead><tr><th>Module</th><th>Version</th></tr></thead>
                 <tbody>
-                  {items.length === 0 && <tr><td colSpan={2} className="table-state">No modules match</td></tr>}
+                  {items.length === 0 && <tr><td colSpan={2} className="table-state">{q ? 'No modules match the filter' : 'No modules are registered yet; modules installed from CPAN appear here'}</td></tr>}
                   {items.slice(0, 1000).map((m) => <tr key={m.name}><td><code>{m.name}</code></td><td>{m.version || '—'}</td></tr>)}
                 </tbody>
               </table>

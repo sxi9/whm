@@ -75,7 +75,7 @@ export default function ManageExternalAuthentications({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} actions={<Button variant="primary" icon={Plus} onClick={() => setModal({ mode: 'create' })}>Add provider</Button>} description="OpenID Connect providers (Okta, Azure AD, Keycloak, Google Workspace…) that panel users may link to their account and sign in with." />
+      <PageHeader fn={fn} actions={<Button variant="primary" icon={Plus} onClick={() => setModal({ mode: 'create' })}>Add provider</Button>} description="OpenID Connect providers (Okta, Azure AD, Keycloak, Google Workspace and others) that panel users may link to their account and sign in with." />
       <RequestError error={error} onRetry={refetch} />
       {settings && (
         <Card title="Policy">
@@ -93,7 +93,7 @@ export default function ManageExternalAuthentications({ fn }) {
             { key: 'discovery', label: 'Discovery', render: (p) => (p.discovery ? <StatusPill status="ok">fetched {formatDate(p.discovery.fetchedAt)}</StatusPill> : <StatusPill status="warning">not run</StatusPill>) },
             { key: 'links', label: 'Linked users', align: 'right' },
             { key: 'enabled', label: 'Status', render: (p) => <StatusPill status={p.enabled ? 'enabled' : 'disabled'} /> },
-          ]} rows={data} rowKey={(p) => p.name} emptyText="No identity providers configured."
+          ]} rows={data} rowKey={(p) => p.name} emptyText="Identity providers you add appear here."
             rowActions={(p) => [
               { label: 'Discover', primary: true, onClick: () => discover(p) },
               { label: 'Edit', onClick: () => setModal({ mode: 'edit', provider: p }) },

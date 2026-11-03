@@ -73,7 +73,7 @@ export default function ChangeSitesIpAddress({ fn }) {
             ['Web server', <StatusPill key="w" status={result.web?.applied ? 'ok' : 'pending'}>{webStatus(result.web)}</StatusPill>],
           ]} />
           {result.dns.length > 0 && (
-            <ul style={{ marginTop: 12 }}>
+            <ul className="list-plain" style={{ marginTop: 12, display: 'grid', gap: 6 }}>
               {result.dns.map((d, i) => <li key={i}><code>{d.name ? `${d.name === '@' ? '' : `${d.name}.`}${d.domain}` : d.domain}</code> <StatusPill status={d.applied ? 'ok' : 'pending'}>{d.applied ? (d.name ? 'A record updated' : d.reason) : d.reason || 'saved; published once BIND runs'}</StatusPill></li>)}
             </ul>
           )}

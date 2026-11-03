@@ -8,11 +8,10 @@ import { PageHeader, Card, StatusPill, Loading, KeyValue, EmptyState, formatDate
 import { DataTable } from '../../../components/DataTable.jsx';
 import { Button, Toggle, TextInput, Field, ErrorBanner, FormActions } from '../../../components/Form.jsx';
 import { PluginFields, fieldDefault } from '../../plugins/PluginPage.jsx';
-import { describePermission } from '../../cpanel/pluginPermissions.js';
 import { useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { Tabs } from '../../security/Shared.jsx';
-import { TrustNotice } from '../../cpanel/ConsentModal.jsx';
+import { TrustNotice, PermissionList } from '../../cpanel/ConsentModal.jsx';
 import { MarketplaceTab } from '../../cpanel/MarketplaceTab.jsx';
 
 export { TrustNotice };
@@ -21,6 +20,10 @@ const REQUIRE_SIGNATURE = 'plugins.require_signature';
 const DEVELOPER_MODE = 'plugins.developer_mode';
 const SETTINGS_PREFIX = 'plugins.';
 export const TABS = [{ value: 'installed', label: 'Installed' }, { value: 'marketplace', label: 'Marketplace' }];
+
+function SectionTitle({ children }) {
+  return <h3 style={{ margin: '22px 0 10px' }}>{children}</h3>;
+}
 
 export function sourceLabel(source) {
   if (source === 'marketplace') return 'Marketplace';
@@ -135,7 +138,7 @@ function PluginSettingsForm({ id, settings }) {
   };
   return (
     <>
-      <h3>Settings</h3>
+      <SectionTitle>Settings</SectionTitle>
       <form onSubmit={save}>
         <PluginFields fields={settings.fields} groups={settings.groups || []} values={values} onChange={(k, v) => setValues((s) => ({ ...s, [k]: v }))} errors={error?.fields} />
         <ErrorBanner error={error && !error.fields ? error : null} />
@@ -167,8 +170,8 @@ export function RestoreTokenForm({ id }) {
   };
   return (
     <>
-      <h3>Issue restore token</h3>
-      <p className="muted small">A plugin that restores backups needs a token you issue here for one artefact and one account; it expires after a few minutes.</p>
+      <SectionTitle>Issue restore token</SectionTitle>
+      <p className="muted">A plugin that restores backups needs a token you issue here for one artefact and one account; it expires after a few minutes.</p>
       <form onSubmit={issue}>
         <div className="form-grid">
           <Field label="Backup artefact id" htmlFor={`rt-art-${id}`}><TextInput id={`rt-art-${id}`} value={artefactId} onChange={setArtefactId} placeholder="42" className="input mono" /></Field>
@@ -201,28 +204,14 @@ function PluginDetail({ id, onClose }) {
         ['Code / data', <span key="d" className="mono small">{data.dir} · {data.dataDir}</span>],
       ]} />
 
-      <h3>Permissions</h3>
-      <p className="muted small">Declared in plugin.json. Checked on every ctx call and recorded below, but an in-process plugin could bypass them: treat the list as a statement of intent from code you trust.</p>
-      {data.permissions.length === 0 ? <p className="muted">None declared.</p> : (
-        <ul className="permission-list">
-          {data.permissions.map((p) => {
-            const d = describePermission(p);
-            return (
-              <li key={p}>
-                <code>{p}</code>
-                {data.permissionsUsed.includes(p) ? <span className="pill pill-ok" style={{ marginLeft: 8 }}>used</span> : null}
-                {d.sensitive ? <span className="pill pill-warn" style={{ marginLeft: 8 }}>reaches outside the plugin</span> : null}
-                <div className="muted small">{d.text}</div>
-              </li>
-            );
-          })}
-        </ul>
-      )}
+      <SectionTitle>Permissions</SectionTitle>
+      <p className="muted">Declared in plugin.json. Checked on every ctx call and recorded below, but an in-process plugin could bypass them: treat the list as a statement of intent from code you trust.</p>
+      <PermissionList scopes={data.permissions} used={data.permissionsUsed} />
 
       {data.settings?.fields?.length > 0 && <PluginSettingsForm id={data.id} settings={data.settings} />}
       <RestoreTokenForm id={data.id} />
       {data.permissionDenials.length > 0 && (
-        <div className="banner banner-warning">
+        <div className="banner banner-warning" style={{ marginTop: 16 }}>
           <AlertTriangle size={18} />
           <div>
             <strong>Denied calls</strong>
@@ -245,14 +234,14 @@ function PluginDetail({ id, onClose }) {
 
       {sidebar.length > 0 && (
         <>
-          <h3>Pages</h3>
-          <ul>{sidebar.map((s) => <li key={s.route}>{data.state === 'enabled' ? <Link to={`/plugins/${data.id}${s.route === '/' ? '' : s.route}`}>{s.label}</Link> : s.label} <span className="muted small">({s.category})</span></li>)}</ul>
+          <SectionTitle>Pages</SectionTitle>
+          <ul className="list-plain">{sidebar.map((s) => <li key={s.route} style={{ padding: '4px 0' }}>{data.state === 'enabled' ? <Link to={`/plugins/${data.id}${s.route === '/' ? '' : s.route}`}>{s.label}</Link> : s.label} <span className="muted">({s.category})</span></li>)}</ul>
         </>
       )}
 
       {data.schedules.length > 0 && (
         <>
-          <h3>Schedules</h3>
+          <SectionTitle>Schedules</SectionTitle>
           <div className="table-wrap">
             <table>
               <thead><tr><th>Name</th><th>Job</th><th>Cron</th><th>Source</th><th>Next run</th></tr></thead>
@@ -264,18 +253,18 @@ function PluginDetail({ id, onClose }) {
 
       {data.jobs.length > 0 && (
         <>
-          <h3>Recent jobs</h3>
+          <SectionTitle>Recent jobs</SectionTitle>
           <div className="table-wrap">
             <table>
               <thead><tr><th>Job</th><th>Status</th><th>Trigger</th><th>Started</th><th>Error</th></tr></thead>
-              <tbody>{data.jobs.map((j) => <tr key={j.id}><td><code>{j.name}</code> #{j.id}</td><td><StatusPill status={j.status} /></td><td>{j.trigger}</td><td>{j.startedAt ? formatDate(j.startedAt) : '—'}</td><td className="small">{j.error ? `${j.error.code}: ${j.error.message}` : '—'}</td></tr>)}</tbody>
+              <tbody>{data.jobs.map((j) => <tr key={j.id}><td><code>{j.name}</code> #{j.id}</td><td><StatusPill status={j.status} /></td><td>{j.trigger}</td><td>{j.startedAt ? formatDate(j.startedAt) : '—'}</td><td className="muted">{j.error ? `${j.error.code}: ${j.error.message}` : '—'}</td></tr>)}</tbody>
             </table>
           </div>
         </>
       )}
 
-      <h3>Log</h3>
-      {data.logs.length === 0 ? <p className="muted">No log lines yet.</p> : (
+      <SectionTitle>Log</SectionTitle>
+      {data.logs.length === 0 ? <p className="muted">Nothing logged yet; lines the plugin writes with ctx.log appear here.</p> : (
         <pre className="log">{data.logs.slice(0, 40).map((l) => `${l.ts} [${l.level}] ${l.msg}${l.fields ? ' ' + JSON.stringify(l.fields) : ''}`).join('\n')}</pre>
       )}
     </Card>
@@ -352,9 +341,10 @@ export default function ManagePlugins({ fn }) {
           </Card>
           <InstallCard onInstalled={refreshAll} />
           <Card title="Installed plugins" padded={false}>
-            <DataTable columns={columns} rows={list.data || []} loading={list.loading} error={list.error} rowActions={rowActions} emptyText="No plugins are installed" />
-            {!list.loading && !list.error && (list.data || []).length === 0 && (
-              <div className="card-body"><EmptyState icon={Puzzle} title="No plugins yet"><p>Install a package above, browse the <button className="btn btn-sm btn-ghost" onClick={() => setTab('marketplace')}>Marketplace</button>, or scaffold one with the <Link to="/development/cpanel-plugin-file-generator">plugin file generator</Link>.</p></EmptyState></div>
+            {!list.loading && !list.error && (list.data || []).length === 0 ? (
+              <EmptyState icon={Puzzle} title="No plugins installed yet"><p>Installed plugins are listed here with their state, package signature and permissions. Install a package above, browse the <button className="link-button" onClick={() => setTab('marketplace')}>Marketplace</button>, or scaffold one with the <Link to="/development/cpanel-plugin-file-generator">plugin file generator</Link>.</p></EmptyState>
+            ) : (
+              <DataTable columns={columns} rows={list.data || []} loading={list.loading} error={list.error} rowActions={rowActions} emptyText="No plugins are installed" />
             )}
           </Card>
           {selected && <PluginDetail id={selected} onClose={() => setSelected(null)} />}

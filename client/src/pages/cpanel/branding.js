@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../../api/client.js';
 
-// Branding from GET /api/branding (cPanel › Customization): company name, colours,
+// Branding from GET /api/branding (Panel › Customization): company name, colours,
 // help links, login notice and the logo/favicon descriptors. The endpoint is
 // public, so the login page reads it before a session exists; a cached copy only
 // avoids a flash of defaults while the request is in flight.

@@ -46,9 +46,11 @@ export default function NameserverSelection({ fn }) {
               ['Zones in panel', data.zones ?? '—'],
               ['Package manager', data.detect?.packageManager || 'none detected'],
             ]} />
-            <Field label="Role" help="master answers authoritatively for the panel's zones; slave pulls zones from a master; standalone serves local zones only">
-              <Select value={currentRole} onChange={setRole} options={[{ value: 'master', label: 'Master (authoritative)' }, { value: 'slave', label: 'Slave (secondary)' }, { value: 'standalone', label: 'Standalone' }]} />
-            </Field>
+            <div style={{ marginTop: 16 }}>
+              <Field label="Role" help="master answers authoritatively for the panel's zones; slave pulls zones from a master; standalone serves local zones only">
+                <Select value={currentRole} onChange={setRole} options={[{ value: 'master', label: 'Master (authoritative)' }, { value: 'slave', label: 'Slave (secondary)' }, { value: 'standalone', label: 'Standalone' }]} />
+              </Field>
+            </div>
             <RequestError error={capError} onRetry={() => setCapError(null)} />
             <DaemonSelector candidates={data.detect?.candidates || []} current={data.active} selected={data.settings.server} onSelect={select} busy={busy} pkgAvailable={data.pkgAvailable} disabledLabel="Disable DNS service" packageManager={data.detect?.packageManager} />
             {result && <div style={{ marginTop: 12 }}><StepList steps={result.steps} /></div>}

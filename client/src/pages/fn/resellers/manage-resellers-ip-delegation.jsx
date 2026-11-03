@@ -50,7 +50,7 @@ export default function ManageResellersIpDelegation({ fn }) {
                 { key: 'delegated', label: 'Delegated', render: (a) => <StatusPill status={a.delegated ? 'enabled' : 'disabled'}>{a.delegated ? 'Yes' : 'No'}</StatusPill> },
               ]}
               rows={rows} loading={loading} rowKey={(a) => a.address} selectable selected={selected} onSelectedChange={setSelected}
-              emptyText="No free addresses. Add some under IP Functions → Add a New IP Address."
+              emptyText="Free addresses will be listed here once added under IP Functions › Add a New IP Address."
             />
             <div className="card-body">
               <ErrorBanner error={saveError} />

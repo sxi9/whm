@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Plus } from 'lucide-react';
+import { Plus, CheckCircle2 } from 'lucide-react';
 import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, KeyValue, formatMb, formatDate } from '../../../components/Common.jsx';
 import { DataTable, useTableState } from '../../../components/DataTable.jsx';
-import { Field, TextInput, PasswordInput, Select, Toggle, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
+import { Field, TextInput, PasswordInput, Select, Toggle, Button, ErrorBanner } from '../../../components/Form.jsx';
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { AclEditor, NameserversEditor, LimitsFields, PackagePicker, UsageBar, ResellerStatusPill, Summary, useResellerCatalog } from '../../resellers/Shared.jsx';
@@ -44,7 +44,7 @@ export default function ResellerCenter({ fn }) {
     { label: 'Usage', onClick: () => navigate(`/resellers/view-reseller-usage-and-manage-account-status?username=${r.username}`) },
     r.suspended
       ? { label: 'Restore privileges', onClick: () => act(`${r.username}: reseller privileges restored`, () => api.post(`/resellers/${r.username}/unsuspend`)) }
-      : { label: 'Suspend privileges', danger: true, onClick: async () => { if (await confirm({ title: `Suspend ${r.username}'s reseller privileges?`, message: 'The reseller can no longer log in to WHM or use the API. Its hosting accounts keep running.', confirmLabel: 'Suspend', danger: true })) act(`${r.username}: reseller privileges suspended`, () => api.post(`/resellers/${r.username}/suspend`, { reason: 'Suspended from Reseller Center' })); } },
+      : { label: 'Suspend privileges', danger: true, onClick: async () => { if (await confirm({ title: `Suspend ${r.username}'s reseller privileges?`, message: 'The reseller can no longer sign in to the panel or use the API. Its hosting accounts keep running.', confirmLabel: 'Suspend', danger: true })) act(`${r.username}: reseller privileges suspended`, () => api.post(`/resellers/${r.username}/suspend`, { reason: 'Suspended from Reseller Center' })); } },
     { label: 'Remove reseller status', danger: true, onClick: async () => { if (await confirm({ title: `Remove reseller status from ${r.username}?`, message: `Privileges, limits and delegated IPs are removed and ${r.usage.accounts} account(s) move to root. The login stays.`, confirmLabel: 'Reset reseller', danger: true, typeToConfirm: r.username })) act(`${r.username} is no longer a reseller`, () => api.post('/resellers/reset', { usernames: [r.username] })); } },
   ];
 
@@ -56,7 +56,7 @@ export default function ResellerCenter({ fn }) {
         <ErrorBanner error={error} onRetry={refetch} />
         <DataTable columns={columns} rows={rows} loading={loading} rowKey={(r) => r.username} total={meta?.total} page={t.state.page} pageSize={t.state.pageSize} onPageChange={t.setPage}
           sort={t.state.sort} dir={t.state.dir} onSortChange={t.setSort} searchable q={t.state.q} onSearch={t.setSearch} searchPlaceholder="Search reseller or email…" rowActions={rowActions}
-          emptyText="No resellers yet. Add one from an existing account or as a standalone login." />
+          emptyText="Resellers will be listed here. Add one from an existing account or as a standalone login." />
       </Card>
       <CreateResellerModal open={creating} onClose={() => setCreating(false)} catalog={catalog.data} onCreated={() => { setCreating(false); refetch(); catalog.refetch(); }} />
       {editing && <EditResellerModal username={editing} catalog={catalog.data} onClose={() => setEditing(null)} onSaved={() => { refetch(); }} />}
@@ -95,20 +95,20 @@ function CreateResellerModal({ open, onClose, catalog, onCreated }) {
     <Modal open={open} title="Add a reseller" onClose={onClose} size="lg" footer={result?.initialPassword ? <Button variant="primary" onClick={onCreated}>Done</Button> : <><Button onClick={onClose}>Cancel</Button><Button variant="primary" loading={busy} onClick={submit} disabled={!form.username}>Create reseller</Button></>}>
       {result?.initialPassword ? (
         <div>
-          <div className="banner banner-success"><div><strong>{result.username} created.</strong> No password was given, so one was generated. It is shown once; the reseller must change it at first login.</div></div>
+          <div className="banner banner-success"><CheckCircle2 size={18} /><div><strong>{result.username} created.</strong> No password was given, so one was generated. It is shown once; the reseller must change it at first login.</div></div>
           <KeyValue items={[['Username', <code key="u">{result.username}</code>], ['Initial password', <code key="p">{result.initialPassword}</code>], ['Privileges', result.acls.length], ['Owned accounts', result.usage.accounts]]} />
         </div>
       ) : (
         <form onSubmit={submit}>
           <ErrorBanner error={error} />
-          <Field inline><Toggle checked={form.fromAccount} onChange={(v) => setForm((f) => ({ ...f, fromAccount: v, username: '' }))} label="Create from an existing hosting account" description="The account becomes owned by itself and its contact email is used; otherwise a standalone WHM login is created" /></Field>
+          <Field inline><Toggle checked={form.fromAccount} onChange={(v) => setForm((f) => ({ ...f, fromAccount: v, username: '' }))} label="Create from an existing hosting account" description="The account becomes owned by itself and its contact email is used; otherwise a standalone panel login is created" /></Field>
           <div className="form-grid">
             {form.fromAccount
               ? <Field label="Account" required error={fieldErr('username')}><Select value={form.username} onChange={set('username')} options={candidates.map((a) => ({ value: a.username, label: `${a.username} — ${a.domain}` }))} placeholder={candidates.length ? 'Select an account' : 'Every account is already a reseller'} /></Field>
               : <Field label="Username" required error={fieldErr('username')} help="Lowercase, starts with a letter"><TextInput value={form.username} onChange={set('username')} placeholder="reseller1" /></Field>}
             <Field label="Email" error={fieldErr('email')} help={form.fromAccount ? 'Blank uses the account contact email' : undefined}><TextInput type="email" value={form.email} onChange={set('email')} /></Field>
             <Field label="Password" required={!form.fromAccount} error={fieldErr('password')} help={form.fromAccount ? 'Blank generates one, shown once after creation' : undefined}><PasswordInput value={form.password} onChange={set('password')} /></Field>
-            <Field label="Privileges (ACL list)" help="Fine-tune later under Edit Reseller Nameservers and Privileges"><Select value={form.aclList} onChange={set('aclList')} options={(catalog?.aclLists || []).map((l) => ({ value: l.name, label: `${l.name} — ${l.acls.length} privilege(s)` }))} placeholder="None" /></Field>
+            <Field label="Privileges (ACL list)" help="Adjust later under Edit Reseller Nameservers and Privileges"><Select value={form.aclList} onChange={set('aclList')} options={(catalog?.aclLists || []).map((l) => ({ value: l.name, label: `${l.name} — ${l.acls.length} privilege(s)` }))} placeholder="None" /></Field>
             <Field label="Shared IP" help="Blank uses the server's shared IP" error={fieldErr('sharedIp')}><Select value={form.sharedIp} onChange={set('sharedIp')} options={(catalog?.addresses || []).filter((a) => !a.reserved).map((a) => ({ value: a.address, label: `${a.address}${a.is_main ? ' (main)' : ''}${a.server_shared ? ' (server shared)' : ''}` }))} placeholder="Server default" /></Field>
           </div>
           <h3 style={{ margin: '14px 0 6px' }}>Limits</h3>
@@ -166,7 +166,7 @@ function EditResellerModal({ username, catalog, onClose, onSaved }) {
           <PackagePicker packages={catalog?.packages || []} value={form.allowedPackages} onChange={set('allowedPackages')} />
           <h3 style={{ margin: '14px 0 6px' }}>Privileges</h3>
           <AclEditor groups={catalog?.aclGroups || []} lists={catalog?.aclLists || []} value={form.acls} onChange={set('acls')} />
-          <FormActions><span className="muted">Changes apply on Save.</span></FormActions>
+          <p className="muted" style={{ margin: '8px 0 0' }}>Changes apply when you save.</p>
         </>
       )}
     </Modal>

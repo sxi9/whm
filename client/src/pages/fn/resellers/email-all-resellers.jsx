@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, CapabilityNotice, KeyValue, StatusPill, formatDate } from '../../../components/Common.jsx';
+import { DataTable } from '../../../components/DataTable.jsx';
 import { Field, TextInput, Textarea, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { ProgressLog } from '../../../components/ProgressLog.jsx';
 import { useToast } from '../../../components/Toast.jsx';
@@ -16,7 +17,7 @@ export default function EmailAllResellers({ fn }) {
   const [job, setJob] = useState(null);
   const [outcome, setOutcome] = useState(null);
   const set = (k) => (v) => setForm((f) => ({ ...f, [k]: v }));
-  const { data: who, error: whoError, refetch } = useApi('/resellers/email/recipients');
+  const { data: who, loading: whoLoading, error: whoError, refetch } = useApi('/resellers/email/recipients');
   const history = useApi('/resellers/email/history');
 
   const submit = async (e) => {
@@ -32,18 +33,26 @@ export default function EmailAllResellers({ fn }) {
     } catch (err) { setError(err); } finally { setBusy(false); }
   };
 
+  const recipientsSubtitle = who
+    ? `${who.recipients.length} reseller(s) with an email address${who.withoutEmail ? `; ${who.withoutEmail} without one are skipped (set it in Reseller Center)` : ''}`
+    : undefined;
+
   return (
     <>
       <PageHeader fn={fn} description="Sends a plain-text message to every reseller's email address. {{username}}, {{accounts}} and {{hostname}} are replaced per recipient. Delivery goes through this server's mail server." />
       <form onSubmit={submit}>
-        <Card title="Recipients" padded>
+        <Card title="Recipients" subtitle={recipientsSubtitle} padded={false}>
           <ErrorBanner error={whoError} onRetry={refetch} />
-          {who && (
-            <>
-              <p className="muted" style={{ marginTop: 0 }}>{who.recipients.length} reseller(s) with an email address{who.withoutEmail ? `; ${who.withoutEmail} without one are skipped (set it in Reseller Center)` : ''}.</p>
-              {who.recipients.length > 0 && <div className="table-wrap"><table><thead><tr><th>Reseller</th><th>Email</th><th>Accounts</th></tr></thead><tbody>{who.recipients.map((r) => <tr key={r.username}><td><code>{r.username}</code>{r.suspended ? ' (suspended)' : ''}</td><td>{r.email}</td><td>{r.accounts}</td></tr>)}</tbody></table></div>}
-            </>
-          )}
+          <DataTable
+            dense
+            columns={[
+              { key: 'username', label: 'Reseller', render: (r) => <><code>{r.username}</code>{r.suspended ? <span className="muted"> (suspended)</span> : null}</> },
+              { key: 'email', label: 'Email' },
+              { key: 'accounts', label: 'Accounts', align: 'right' },
+            ]}
+            rows={who?.recipients || []} loading={whoLoading} rowKey={(r) => r.username}
+            emptyText="Resellers with an email address will be listed here. Set one in Reseller Center."
+          />
         </Card>
         <Card title="Message">
           <CapabilityNotice error={error} />
@@ -62,22 +71,22 @@ export default function EmailAllResellers({ fn }) {
           {outcome?.result && <KeyValue items={[['Sent', outcome.result.sent.length], ['Failed', outcome.result.failed.length], outcome.result.failed.length > 0 && ['Failures', outcome.result.failed.map((f) => `${f.username}: ${f.error}`).join('; ')]]} />}
         </Card>
       )}
-      <Card title="Recent broadcasts" subtitle="Messages and addresses are kept here, visible to root only; the job queue shows counts">
+      <Card title="Recent broadcasts" subtitle="Messages and addresses are kept here, visible to root only; the job queue shows counts" padded={false}>
         <ErrorBanner error={history.error} onRetry={history.refetch} />
-        {history.data?.length === 0 && <p className="muted" style={{ margin: 0 }}>Nothing has been sent yet.</p>}
-        {history.data?.length > 0 && (
-          <div className="table-wrap"><table>
-            <thead><tr><th>Sent</th><th>Subject</th><th>From</th><th>By</th><th>Status</th><th>Delivered</th><th>Failed</th></tr></thead>
-            <tbody>{history.data.map((b) => (
-              <tr key={b.id}>
-                <td>{formatDate(b.created_at)}</td><td>{b.subject}</td><td>{b.from}</td><td><code>{b.requested_by}</code></td>
-                <td><StatusPill status={b.status === 'partial' ? 'warning' : b.status}>{b.status}</StatusPill></td>
-                <td>{b.sent.length}</td>
-                <td>{b.failed.length ? b.failed.map((f) => `${f.username} <${f.email}>: ${f.error}`).join('; ') : '0'}</td>
-              </tr>
-            ))}</tbody>
-          </table></div>
-        )}
+        <DataTable
+          dense
+          columns={[
+            { key: 'created_at', label: 'Sent', render: (b) => formatDate(b.created_at) },
+            { key: 'subject', label: 'Subject' },
+            { key: 'from', label: 'From' },
+            { key: 'requested_by', label: 'By', render: (b) => <code>{b.requested_by}</code> },
+            { key: 'status', label: 'Status', render: (b) => <StatusPill status={b.status === 'partial' ? 'warning' : b.status}>{b.status}</StatusPill> },
+            { key: 'sent', label: 'Delivered', align: 'right', render: (b) => b.sent.length },
+            { key: 'failed', label: 'Failed', render: (b) => b.failed.length ? b.failed.map((f) => `${f.username} <${f.email}>: ${f.error}`).join('; ') : '0' },
+          ]}
+          rows={history.data || []} loading={history.loading} rowKey={(b) => b.id}
+          emptyText="Messages sent from this page will be listed here."
+        />
       </Card>
     </>
   );

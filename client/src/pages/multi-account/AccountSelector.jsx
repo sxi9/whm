@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { queryString } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { Card, StatusPill, formatMb } from '../../components/Common.jsx';
@@ -58,7 +59,7 @@ export function AccountSelector({ sel, title = 'Select accounts', extraColumns =
             {Object.values(filter).some(Boolean) && <Button size="sm" variant="ghost" onClick={resetFilter}>Reset filters</Button>}
           </>
         )}
-        emptyText="No accounts match these filters."
+        emptyText="No accounts match these filters. Matching accounts appear here with their package, address and status."
       />
     </Card>
   );
@@ -66,9 +67,14 @@ export function AccountSelector({ sel, title = 'Select accounts', extraColumns =
 
 export function Steps({ step, labels }) {
   return (
-    <div className="row-actions" style={{ marginBottom: 14 }}>
-      {labels.map((label, i) => <span key={label} className={`pill ${step === i + 1 ? 'pill-info' : step > i + 1 ? 'pill-ok' : 'pill-muted'}`}>{i + 1}. {label}</span>)}
-    </div>
+    <ol className="list-plain" style={{ display: 'flex', flexWrap: 'wrap', gap: '8px 20px', marginBottom: 14 }}>
+      {labels.map((label, i) => (
+        <li key={label} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+          <span className={`pill ${step === i + 1 ? 'pill-info' : step > i + 1 ? 'pill-ok' : 'pill-muted'}`}>{i + 1}</span>
+          <span className={step === i + 1 ? undefined : 'muted'}>{label}</span>
+        </li>
+      ))}
+    </ol>
   );
 }
 
@@ -82,7 +88,7 @@ export function Totals({ items }) {
 
 export function Warnings({ warnings }) {
   if (!warnings?.length) return null;
-  return <div className="banner banner-warning"><div><strong>Before you run</strong><ul>{warnings.map((w) => <li key={w}>{w}</li>)}</ul></div></div>;
+  return <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>Before you run</strong><ul>{warnings.map((w) => <li key={w}>{w}</li>)}</ul></div></div>;
 }
 
 export const ITEM_TONE = { done: 'done', pending: 'pending', failed: 'failed', skipped: 'disabled', unchanged: 'unknown', queued: 'queued', running: 'running', change: 'info', blocked: 'failed' };

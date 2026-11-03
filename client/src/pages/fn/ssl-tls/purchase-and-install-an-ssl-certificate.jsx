@@ -61,19 +61,18 @@ export default function PurchaseAndInstall({ fn }) {
       {providers.loading && !providers.data && <Loading />}
       {providers.data && (
         <>
-          <Card title="Providers" subtitle="Certificate vendors come from the Market category. Enable one and add its credentials in Market → Market Provider Manager; this page records orders against it." padded={false}>
+          <Card title="Providers" subtitle="Certificate vendors come from the Market category. Enable one and add its credentials in Market Provider Manager; this page records orders against it." padded={false} actions={<Link className="btn btn-sm" to="/market/market-provider-manager">Market Provider Manager</Link>}>
             <DataTable dense columns={[
               { key: 'displayName', label: 'Provider' },
               { key: 'enabled', label: 'Status', render: (p) => <StatusPill status={p.enabled ? 'enabled' : 'disabled'} /> },
               { key: 'products', label: 'Products', render: (p) => p.products.map((x) => `${x.name} (${money(x.price, x.currency)}/${x.termMonths}mo)`).join(' · ') || '—' },
               { key: 'url', label: 'Site', render: (p) => (p.url ? <a href={p.url} target="_blank" rel="noreferrer">{p.url}</a> : '—') },
-            ]} rows={providers.data} rowKey={(p) => p.name} emptyText="No providers are configured. Add one in Market Provider Manager." />
-            <div style={{ padding: '0 16px 12px' }}><Link className="btn btn-sm" to="/market/market-provider-manager">Market Provider Manager</Link></div>
+            ]} rows={providers.data} rowKey={(p) => p.name} emptyText="Providers added in Market Provider Manager appear here." />
           </Card>
           <div className="form-grid">
             <Card title="Order a certificate" subtitle={enabled.length ? 'A key and CSR are generated and stored for the domain; the CSR is what you submit to the provider.' : 'Enable a provider first.'}>
-              <Field label="Provider"><Select value={form.provider} onChange={(v) => setForm({ ...form, provider: v, product: '' })} placeholder="Select…" options={(providers.data || []).map((p) => ({ value: p.name, label: `${p.displayName}${p.enabled ? '' : ' (disabled)'}`, disabled: !p.enabled }))} /></Field>
-              <Field label="Product"><Select value={form.product} onChange={(v) => setForm({ ...form, product: v })} placeholder="Select…" options={(provider?.products || []).map((x) => ({ value: x.id, label: `${x.name} — ${money(x.price, x.currency)} / ${x.termMonths} months` }))} /></Field>
+              <Field label="Provider"><Select value={form.provider} onChange={(v) => setForm({ ...form, provider: v, product: '' })} placeholder="Select a provider" options={(providers.data || []).map((p) => ({ value: p.name, label: `${p.displayName}${p.enabled ? '' : ' (disabled)'}`, disabled: !p.enabled }))} /></Field>
+              <Field label="Product"><Select value={form.product} onChange={(v) => setForm({ ...form, product: v })} placeholder="Select a product" options={(provider?.products || []).map((x) => ({ value: x.id, label: `${x.name} — ${money(x.price, x.currency)} / ${x.termMonths} months` }))} /></Field>
               <Field label="Domain" required><DomainSelect value={form.domain} onChange={(v) => setForm({ ...form, domain: v })} /></Field>
               {provider?.products.find((x) => x.id === form.product)?.wildcard && <p className="muted">Wildcard product: the CSR covers {form.domain || 'example.com'} and *.{form.domain || 'example.com'}.</p>}
             </Card>
@@ -102,7 +101,7 @@ export default function PurchaseAndInstall({ fn }) {
           { key: 'price', label: 'Price', render: (o) => money(o.price, o.currency) },
           { key: 'status', label: 'Status', render: (o) => <StatusPill status={o.status === 'installed' ? 'ok' : o.status === 'cancelled' ? 'cancelled' : 'pending'}>{o.status}</StatusPill> },
           { key: 'createdAt', label: 'Placed', render: (o) => formatDate(o.createdAt) },
-        ]} rows={orders.data || []} emptyText="No orders yet." rowActions={(o) => [
+        ]} rows={orders.data || []} emptyText="Orders recorded here appear in this list." rowActions={(o) => [
           ['pending', 'submitted', 'issued'].includes(o.status) && { label: 'Install certificate', primary: true, onClick: () => setCompleting(o) },
           o.certId && o.status !== 'installed' && { label: 'Show CSR', onClick: () => csrFor(o) },
           o.status !== 'installed' && o.status !== 'cancelled' && { label: 'Cancel', danger: true, onClick: () => cancel(o) },

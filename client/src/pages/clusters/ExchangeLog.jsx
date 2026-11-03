@@ -28,7 +28,7 @@ export function ExchangeLog({ kinds, version = 0 }) {
             <Select value={status} onChange={(v) => { setStatus(v); table.setPage(1); }} placeholder="Any outcome" options={[{ value: 'ok', label: 'OK' }, { value: 'failed', label: 'Failed' }]} />
           </>
         )}
-        emptyText="Nothing exchanged yet."
+        emptyText="No exchanges yet. Connectivity tests, pushes and what peers send here appear in this log, newest first."
         columns={[
           { key: 'ts', label: 'When', width: 160, render: (e) => formatDate(e.ts) },
           { key: 'kind', label: 'Kind', render: (e) => <>{KIND_LABEL[e.kind] || e.kind} <small className="muted">{e.direction === 'in' ? '← in' : '→ out'}</small></> },

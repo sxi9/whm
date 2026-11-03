@@ -55,7 +55,7 @@ export default function ManageRootsSshKeys({ fn }) {
               { key: 'comment', label: 'Comment' },
               { key: 'authorized', label: 'Authorized', render: (k) => <StatusPill status={k.authorized ? 'ok' : 'inactive'}>{k.authorized ? 'yes' : 'no'}</StatusPill> },
               { key: 'createdAt', label: 'Created', render: (k) => formatDate(k.createdAt) },
-            ]} rows={data.keys} rowKey={(k) => k.name} dense emptyText="No key pairs yet. Generate one below."
+            ]} rows={data.keys} rowKey={(k) => k.name} dense emptyText="Key pairs appear here. Generate one below to get started."
               rowActions={(k) => [
                 k.authorized ? { label: 'De-authorize', primary: true, onClick: () => deauthorize(k) } : { label: 'Authorize', primary: true, onClick: () => run('Key authorized', () => api.post(`/security/ssh/keys/${k.name}/authorize`)) },
                 k.hasPrivateKey && { label: 'View private key', onClick: () => view(k) },
@@ -72,7 +72,7 @@ export default function ManageRootsSshKeys({ fn }) {
             ]} rows={data.authorized} rowKey={(k) => `${k.index}-${k.fingerprint}`} dense emptyText="No key is authorized. Keep password authentication on until one is."
               rowActions={(k) => [{ label: 'De-authorize', danger: true, primary: true, onClick: () => deauthorize(k) }]} />
           </Card>
-          <div className="form-grid">
+          <div className="grid-2">
             <Card title="Generate a new key" subtitle={data.keygenAvailable ? 'Uses ssh-keygen on the server.' : 'ssh-keygen is not installed on this server.'}>
               <Field label="Name" required><TextInput value={gen.name} onChange={(v) => setGen({ ...gen, name: v })} /></Field>
               <Field label="Type"><Select value={gen.type} onChange={(v) => setGen({ ...gen, type: v, bits: '' })} options={[{ value: 'ed25519', label: 'Ed25519 (recommended)' }, { value: 'rsa', label: 'RSA' }, { value: 'ecdsa', label: 'ECDSA' }]} /></Field>
@@ -83,7 +83,7 @@ export default function ManageRootsSshKeys({ fn }) {
               <FormActions><Button variant="primary" loading={busy} disabled={!gen.name || !data.keygenAvailable} onClick={generate}>Generate key</Button></FormActions>
             </Card>
             <Card title="Import a public key" subtitle="Paste one OpenSSH public key line to authorize it for root.">
-              <Field label="Public key"><Textarea value={imported} onChange={setImported} rows={4} mono placeholder="ssh-ed25519 AAAA… user@laptop" /></Field>
+              <Field label="Public key"><Textarea value={imported} onChange={setImported} rows={4} mono placeholder="ssh-ed25519 AAAA... user@laptop" /></Field>
               <FormActions><Button variant="primary" loading={busy} disabled={!imported.trim()} onClick={importKey}>Authorize key</Button></FormActions>
             </Card>
           </div>

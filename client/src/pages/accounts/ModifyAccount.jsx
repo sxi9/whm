@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { api } from '../../api/client.js';
 import { useApi } from '../../hooks/useApi.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
-import { PageHeader, Card, KeyValue, StatusPill, formatMb, Loading } from '../../components/Common.jsx';
+import { PageHeader, Card, KeyValue, StatusPill, formatMb, formatDate, Loading } from '../../components/Common.jsx';
 import { Field, TextInput, NumberInput, Select, Toggle, Button, FormActions, ErrorBanner } from '../../components/Form.jsx';
 import { useToast } from '../../components/Toast.jsx';
 import { AccountPicker, useSelectedAccount } from './AccountPicker.jsx';
@@ -45,7 +45,7 @@ export default function ModifyAccount({ fn }) {
       {username && loading && !account && <Loading />}
       {account && form && (
         <form onSubmit={save}>
-          <Card title={`${account.domain} (${account.username})`} subtitle={`Owner ${account.owner} · created ${account.created_at}`}>
+          <Card title={`${account.domain} (${account.username})`} subtitle={`Owner ${account.owner} · created ${formatDate(account.created_at)}`}>
             <KeyValue items={[['Status', <StatusPill key="s" status={account.suspended ? 'suspended' : 'active'}>{account.suspended ? 'Suspended' : 'Active'}</StatusPill>], ['Home', <code key="h">{account.home_dir}</code>], ['Disk used', `${formatMb(account.disk_used_mb)} of ${formatMb(account.disk_quota_mb)}`], ['Bandwidth used', `${formatMb(account.bandwidth_used_mb)} of ${formatMb(account.bandwidth_limit_mb)}`]]} />
           </Card>
           <Card title="Basic information">
@@ -70,7 +70,7 @@ export default function ModifyAccount({ fn }) {
             <Field inline><Toggle checked={form.demoMode} onChange={set('demoMode')} label="Demo mode" description="Read-only account for demonstrations" /></Field>
             <Field inline><Toggle checked={form.forcePasswordChange} onChange={set('forcePasswordChange')} label="Force password change" description="User must set a new password at next login" /></Field>
           </Card>
-          <FormActions><Button type="submit" variant="primary" loading={saving}>Save</Button></FormActions>
+          <div className="sticky-actions"><FormActions><Button type="submit" variant="primary" loading={saving}>Save</Button></FormActions></div>
         </form>
       )}
     </>

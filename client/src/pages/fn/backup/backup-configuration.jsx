@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { AlertTriangle, CheckCircle2 } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, KeyValue, Loading, formatBytes, formatDate } from '../../../components/Common.jsx';
@@ -58,12 +59,18 @@ export default function BackupConfiguration({ fn }) {
         <Card title="Status">
           <div className="stat-grid">
             <div className="stat"><div className="label">Backups</div><div className="value"><StatusPill status={data.settings['backup.enabled'] ? 'enabled' : 'disabled'} /></div></div>
-            <div className="stat"><div className="label">Next scheduled run</div><div className="value" style={{ fontSize: 14 }}>{status.schedule?.enabled ? formatDate(status.schedule.next_run_at) : 'not scheduled'}</div></div>
             <div className="stat"><div className="label">Accounts included</div><div className="value">{status.includedAccounts} / {status.totalAccounts}</div></div>
-            <div className="stat"><div className="label">Local directory</div><div className="value" style={{ fontSize: 14 }}><code>{status.localDir.path}</code> {status.localDir.exists === false && <span className="pill pill-warn">created on first run</span>}</div></div>
-            <div className="stat"><div className="label">Last run</div><div className="value" style={{ fontSize: 14 }}>{status.lastRun ? <><StatusPill status={status.lastRun.status} /> {status.lastRun.accounts_ok} ok / {status.lastRun.accounts_failed} failed · {formatBytes(status.lastRun.bytes)}</> : 'never'}</div></div>
+            <div className="stat"><div className="label">Last run</div><div className="value">{status.lastRun ? <StatusPill status={status.lastRun.status} /> : <span className="muted">never</span>}</div></div>
           </div>
-          <p className="muted" style={{ marginTop: 10 }}>Tools: {Object.entries(status.capability.binaries).map(([b, ok]) => <span key={b} className={`pill ${ok ? 'pill-ok' : 'pill-muted'}`} style={{ marginRight: 4 }}>{b}</span>)} — mysqldump is needed to include databases, curl for FTP/SFTP/WebDAV destinations. Choose which accounts are archived under <Link to="/backup/backup-user-selection">Backup User Selection</Link>.</p>
+          <div style={{ marginTop: 14 }}>
+          <KeyValue items={[
+            ['Next scheduled run', status.schedule?.enabled ? formatDate(status.schedule.next_run_at) : 'Not scheduled'],
+            ['Local directory', <><code>{status.localDir.path}</code>{status.localDir.exists === false && <span className="muted"> (created on first run)</span>}</>],
+            ['Last run result', status.lastRun ? `${status.lastRun.accounts_ok} ok, ${status.lastRun.accounts_failed} failed · ${formatBytes(status.lastRun.bytes)}` : 'No run yet'],
+            ['Tools', Object.entries(status.capability.binaries).map(([b, ok], i) => <span key={b}>{i > 0 && ' '}<code>{b}</code>{!ok && <span className="muted"> (missing)</span>}</span>)],
+          ]} />
+          </div>
+          <p className="muted">mysqldump is needed to include databases, curl for FTP, SFTP and WebDAV destinations. Choose which accounts are archived under <Link to="/backup/backup-user-selection">Backup User Selection</Link>.</p>
           {jobId && <ProgressLog jobId={jobId} onFinished={(e) => { if (e.type === 'done') toast.success(`Backup run finished: ${e.result?.ok ?? 0} ok, ${e.result?.failed ?? 0} failed`); else toast.error(e.error || 'Backup run failed'); refetch(); runs.refetch(); }} />}
         </Card>
       )}
@@ -127,7 +134,7 @@ export default function BackupConfiguration({ fn }) {
             { key: 'error', label: 'Error', render: (r) => r.error || '' },
             { key: 'started_by', label: 'By' },
           ]}
-          rows={runs.data || []} loading={runs.loading} error={runs.error} rowKey={(r) => r.id} dense emptyText="No runs yet."
+          rows={runs.data || []} loading={runs.loading} error={runs.error} rowKey={(r) => r.id} dense emptyText="Scheduled and manual runs will appear here."
         />
       </Card>
     </>
@@ -196,7 +203,7 @@ function Destinations() {
           { key: 'enabled', label: 'Enabled', render: (d) => <StatusPill status={d.enabled ? 'enabled' : 'disabled'} /> },
           { key: 'lastTest', label: 'Last test', render: (d) => (d.lastTest ? <><StatusPill status={d.lastTest.ok ? 'ok' : 'failed'} /> <span className="muted">{formatDate(d.lastTest.at)} — {d.lastTest.message}</span></> : <span className="muted">never</span>) },
         ]}
-        rows={data || []} loading={loading} error={error} rowKey={(d) => d.id} dense emptyText="No destinations. Archives stay in the local directory only."
+        rows={data || []} loading={loading} error={error} rowKey={(d) => d.id} dense emptyText="Destinations you add will appear here. Until then archives stay in the local directory."
         rowActions={(d) => [
           { label: busy === `test-${d.id}` ? 'Testing…' : 'Test', primary: true, disabled: Boolean(busy), onClick: () => test(d) },
           { label: 'Edit', onClick: () => open(d) },
@@ -213,7 +220,7 @@ function Destinations() {
           </>
         )}>
         <ErrorBanner error={formError} />
-        {testResult && <div className={`banner ${testResult.ok ? 'banner-info' : 'banner-error'}`}><div>{testResult.message} ({testResult.ms} ms)</div></div>}
+        {testResult && <div className={`banner ${testResult.ok ? 'banner-success' : 'banner-error'}`}>{testResult.ok ? <CheckCircle2 size={18} /> : <AlertTriangle size={18} />}<div>{testResult.message} ({testResult.ms} ms)</div></div>}
         <div className="form-grid">
           <Field label="Name" required error={formError?.fields?.name}><TextInput value={name} onChange={setName} placeholder="offsite-s3" /></Field>
           <Field inline><Toggle checked={enabled} onChange={setEnabled} label="Enabled" /></Field>

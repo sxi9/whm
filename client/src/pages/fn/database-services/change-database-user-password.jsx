@@ -36,7 +36,7 @@ export default function ChangeDatabaseUserPassword({ fn }) {
           <DbUserSelect value={user} onChange={setUser} />
           <Field label="New password" required><PasswordInput value={password} onChange={setPassword} /></Field>
           <FormActions><Button type="submit" variant="primary" loading={busy} disabled={!user || !password}>Change password</Button></FormActions>
-          {result && <KeyValue items={[['Result', <StatusPill key="r" status="ok">changed</StatusPill>], ['User', <code key="u">{result.name}</code>], ['Hosts', result.hosts?.length ? result.hosts.join(', ') : 'server-wide'], result.account && ['Account', result.account]]} />}
+          {result && <div style={{ marginTop: 16 }}><KeyValue items={[['Result', <StatusPill key="r" status="ok">changed</StatusPill>], ['User', <code key="u">{result.name}</code>], ['Hosts', result.hosts?.length ? result.hosts.join(', ') : 'server-wide'], result.account && ['Account', result.account]]} /></div>}
         </Card>
       </form>
     </>

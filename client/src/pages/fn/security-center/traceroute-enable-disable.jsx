@@ -1,4 +1,4 @@
-import { EmptyState } from '../../../components/Common.jsx';
+import { EmptyState, Card } from '../../../components/Common.jsx';
 import { ToggleFeaturePage, BinaryTable } from '../../security/Shared.jsx';
 
 export default function TracerouteEnableDisable({ fn }) {
@@ -9,12 +9,11 @@ export default function TracerouteEnableDisable({ fn }) {
       confirmOff="Hosting accounts will no longer be able to run traceroute, tracepath or mtr. Root keeps access."
       renderStatus={(d, on) => (on ? 'Traceroute available to all users' : 'Traceroute restricted to privileged users')}
       notInstalled={(d) => (!d.installed ? <EmptyState title="No traceroute tools are installed">traceroute, tracepath and mtr were not found on this server.</EmptyState> : null)}
-      renderDetails={(d) => (
-        <>
-          <p className="muted">Disabling sets the binaries to mode 0750 so unprivileged users cannot probe your network topology; enabling restores 0755.</p>
+      renderDetails={(d) => (d.binaries?.length ? (
+        <Card title="Affected binaries" subtitle="Disabling sets the binaries to mode 0750 so unprivileged users cannot probe your network topology; enabling restores 0755." padded={false}>
           <BinaryTable binaries={d.binaries} />
-        </>
-      )}
+        </Card>
+      ) : null)}
     />
   );
 }

@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
 import { PageHeader, Card, StatusPill, KeyValue } from '../../components/Common.jsx';
@@ -42,8 +43,11 @@ export default function TwoFactor({ fn }) {
       <PageHeader fn={fn} />
       {user.mustEnroll2fa && (
         <div className="banner banner-warning" role="alert">
-          <strong>Two-factor authentication is required for your role.</strong>
-          <p>The server security policy requires it before you can use the rest of the panel. Set it up below to continue.</p>
+          <AlertTriangle size={18} />
+          <div>
+            <strong>Two-factor authentication is required for your role.</strong>
+            <p>The server security policy requires it before you can use the rest of the panel. Set it up below to continue.</p>
+          </div>
         </div>
       )}
       <Card title="Your account" subtitle={`Signed in as ${user.username}`}>
@@ -52,7 +56,7 @@ export default function TwoFactor({ fn }) {
         {user.totpEnabled && <FormActions><Button variant="danger" onClick={disable}>Disable</Button></FormActions>}
         {enrollment && (
           <form onSubmit={confirmCode} className="form-narrow" style={{ marginTop: 14 }}>
-            <p>Add this key to your authenticator app (Google Authenticator, Authy, 1Password…), then enter the current 6-digit code to finish.</p>
+            <p>Add this key to your authenticator app (Google Authenticator, Authy, 1Password and similar), then enter the current 6-digit code to finish.</p>
             <KeyValue items={[['Secret key', <code key="k">{enrollment.secret}</code>], ['Account', user.username]]} />
             <p className="muted" style={{ marginTop: 8 }}>Or paste this URI into an app that supports it: <code className="small">{enrollment.otpauthUrl}</code></p>
             <ErrorBanner error={error} />

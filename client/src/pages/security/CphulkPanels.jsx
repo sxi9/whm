@@ -17,7 +17,7 @@ export function CphulkStatus({ overview, refetch }) {
   const dirty = JSON.stringify(draft) !== JSON.stringify(overview.settings);
   const save = async () => {
     setBusy(true);
-    try { await api.put('/security/cphulk/settings', draft); toast.success('cPHulk settings saved'); refetch(); } catch (err) { toast.error(err); } finally { setBusy(false); }
+    try { await api.put('/security/cphulk/settings', draft); toast.success('Brute force protection settings saved'); refetch(); } catch (err) { toast.error(err); } finally { setBusy(false); }
   };
   const s = overview.stats;
   return (
@@ -82,7 +82,7 @@ export function CphulkBlocks({ blocks, refetch }) {
           { key: 'reason', label: 'Reason' },
           { key: 'created_at', label: 'Blocked', render: (b) => formatDate(b.created_at) },
           { key: 'expires_at', label: 'Expires', render: (b) => (b.permanent ? <StatusPill status="warning">permanent</StatusPill> : formatDate(b.expires_at)) },
-        ]} rows={blocks} rowKey={(b) => b.id} emptyText="No address is blocked right now." rowActions={(b) => [{ label: 'Unblock', primary: true, onClick: () => unblock(b) }]} />
+        ]} rows={blocks} rowKey={(b) => b.id} emptyText="Blocked addresses appear here. None is blocked right now." rowActions={(b) => [{ label: 'Unblock', primary: true, onClick: () => unblock(b) }]} />
       </Card>
     </>
   );
@@ -102,7 +102,7 @@ export function CphulkHistory() {
       ]} rows={data || []} loading={loading} error={error} rowKey={(r) => r.id}
         total={meta?.total} page={t.state.page} pageSize={t.state.pageSize} onPageChange={t.setPage} sort={t.state.sort} dir={t.state.dir} onSortChange={t.setSort}
         searchable q={t.state.q} onSearch={t.setSearch} searchPlaceholder="Search address or user…"
-        toolbar={<Toggle checked={failedOnly} onChange={(v) => { setFailedOnly(v); t.setPage(1); }} label="Failures only" />} emptyText="No login attempts recorded." dense />
+        toolbar={<Toggle checked={failedOnly} onChange={(v) => { setFailedOnly(v); t.setPage(1); }} label="Failures only" />} emptyText="Login attempts appear here as soon as someone signs in." dense />
     </Card>
   );
 }
@@ -136,7 +136,7 @@ export function CphulkLists() {
         <FormActions><Button variant="primary" disabled={!form.ip.trim()} onClick={add}>Add</Button></FormActions>
       </Card>
       {table('allow', 'Add your office or VPN addresses so a typo never locks you out.')}
-      {table('deny', 'No denylisted addresses or networks.')}
+      {table('deny', 'Denylisted addresses and networks appear here.')}
     </>
   );
 }

@@ -49,7 +49,7 @@ export function AccountsTable({ suspendedOnly = false, toolbar }) {
       sort={t.state.sort} dir={t.state.dir} onSortChange={t.setSort}
       searchable q={t.state.q} onSearch={t.setSearch} searchPlaceholder="Search user, domain, owner or email…"
       rowActions={rowActions} toolbar={toolbar}
-      emptyText={suspendedOnly ? 'No suspended accounts.' : 'No accounts yet. Create one to get started.'}
+      emptyText={suspendedOnly ? 'No suspended accounts. Accounts you suspend appear here.' : 'No accounts yet. Accounts you create appear here.'}
     />
   );
 }

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../api/client.js';
 import { useApi, useMutation } from '../../hooks/useApi.js';
 import { Card, StatusPill, Loading, KeyValue, formatDate } from '../../components/Common.jsx';
@@ -54,8 +55,8 @@ function SiteDetail({ base, site, onClose, onChanged, install }) {
             ['WordPress', insp?.version || site.version], ['Site URL', insp?.siteUrl], ['Core update', insp?.coreUpdates?.length ? `${insp.coreUpdates[0].version} available` : 'current'],
             ['Maintenance mode', insp?.maintenance == null ? 'unknown' : insp.maintenance ? 'on' : 'off'], ['Administrators', insp?.admins?.map((a) => a.user_login).join(', ') || '—'], ['Database', site.dbName], ['Inspected', when(insp?.inspectedAt)],
           ]} />
-          {insp?.errors && Object.keys(insp.errors).length > 0 && <div className="banner banner-warning"><div><strong>WP-CLI reported problems</strong><ul>{Object.entries(insp.errors).map(([k, v]) => <li key={k}><code>{k}</code>: {v}</li>)}</ul></div></div>}
-          <div className="action-row" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          {insp?.errors && Object.keys(insp.errors).length > 0 && <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>WP-CLI reported problems</strong><ul>{Object.entries(insp.errors).map(([k, v]) => <li key={k}><code>{k}</code>: {v}</li>)}</ul></div></div>}
+          <div className="form-actions" style={{ flexWrap: 'wrap', alignItems: 'center', margin: '14px 0' }}>
             <Button variant="primary" disabled={!insp?.coreUpdates?.length} loading={update.loading} onClick={() => update.mutate('core', null, false).catch((e) => toast.error(e))}>Update core</Button>
             <Button loading={update.loading} onClick={() => update.mutate('plugin', null, true).catch((e) => toast.error(e))}>Update all plugins</Button>
             <Button loading={update.loading} onClick={() => update.mutate('theme', null, true).catch((e) => toast.error(e))}>Update all themes</Button>
@@ -63,18 +64,18 @@ function SiteDetail({ base, site, onClose, onChanged, install }) {
           </div>
           <ErrorBanner error={update.error || maintenance.error} />
           {jobId && <ProgressLog jobId={jobId} onFinished={(ev) => { if (ev.type === 'done') { toast.success('Update finished'); detail.refetch(); onChanged?.(); } else toast.error(ev.error || 'Update failed'); }} />}
-          <h3>Plugins</h3>
+          <h3 style={{ marginTop: 18 }}>Plugins</h3>
           <DataTable dense columns={listColumns('plugin')} rows={insp?.plugins || []} rowKey={(r) => r.name} emptyText="No plugins listed" />
-          <h3>Themes</h3>
+          <h3 style={{ marginTop: 18 }}>Themes</h3>
           <DataTable dense columns={listColumns('theme')} rows={insp?.themes || []} rowKey={(r) => r.name} emptyText="No themes listed" />
-          <h3>Hardening {harden.data && <span className="muted">({harden.data.score}/{harden.data.total} checks pass)</span>}</h3>
+          <h3 style={{ marginTop: 18 }}>Hardening {harden.data && <span className="muted">({harden.data.score}/{harden.data.total} checks pass)</span>}</h3>
           <PluginCapabilityNotice error={harden.error} install={install} onRetry={harden.refetch} />
           <DataTable dense columns={[
             { key: 'ok', label: 'Result', render: (r) => <StatusPill status={r.ok === true ? 'ok' : r.ok === false ? 'warning' : 'unknown'}>{r.ok === true ? 'pass' : r.ok === false ? 'fix' : 'unknown'}</StatusPill> },
             { key: 'label', label: 'Check' }, { key: 'detail', label: 'Detail', render: (r) => <code>{r.detail}</code> },
             { key: 'fix', label: '', render: (r) => (r.ok === false && r.fix ? <Button size="sm" loading={fix.loading} onClick={() => fix.mutate([r.fix]).catch((e) => toast.error(e))}>Fix</Button> : null) },
           ]} rows={harden.data?.checks || []} loading={harden.loading} rowKey={(r) => r.id} emptyText="No checks" />
-          {fixable.length > 1 && <div className="action-row"><Button loading={fix.loading} onClick={() => fix.mutate(fixable).catch((e) => toast.error(e))}>Apply all {fixable.length} fixes</Button></div>}
+          {fixable.length > 1 && <div className="form-actions"><Button loading={fix.loading} onClick={() => fix.mutate(fixable).catch((e) => toast.error(e))}>Apply all {fixable.length} fixes</Button></div>}
           <ErrorBanner error={fix.error} />
         </>
       )}
@@ -140,13 +141,14 @@ export function WpToolkitOverview({ base }) {
         {s && (
           <div className="stat-grid">
             <div className="stat"><div className="label">WP-CLI</div><div className="value"><StatusPill status={s.wpcli?.installed ? 'installed' : 'not-installed'}>{s.wpcli?.installed ? `wp ${s.wpcli.version || ''}` : 'not installed'}</StatusPill></div></div>
-            <div className="stat"><div className="label">WordPress sites</div><div className="value">{s.sites}</div><div className="muted" style={{ fontSize: 12 }}>{s.lastDiscovery ? `discovered ${when(s.lastDiscovery.at)}` : 'not discovered yet'}</div></div>
+            <div className="stat"><div className="label">WordPress sites</div><div className="value">{s.sites}</div><div className="label">{s.lastDiscovery ? `discovered ${when(s.lastDiscovery.at)}` : 'not discovered yet'}</div></div>
             <div className="stat"><div className="label">Core updates pending</div><div className="value">{s.outdated}</div></div>
             <div className="stat"><div className="label">Accounts</div><div className="value">{s.accounts?.length ?? 0}</div></div>
           </div>
         )}
         {s && !s.wpcli?.installed && (
           <div className="banner banner-warning" style={{ marginTop: 14 }}>
+            <AlertTriangle size={18} />
             <div>
               <strong>WP-CLI is not installed</strong>
               <p>Sites are still discovered from wp-config.php, but versions, updates, maintenance mode, hardening and one-click installs need WP-CLI. {s.errors?.wpcli}</p>
@@ -171,7 +173,7 @@ export function WpToolkitOverview({ base }) {
           { key: 'coreUpdate', label: 'Updates', render: (r) => (r.inspectedAt ? <>{r.coreUpdate ? <StatusPill status="warning">core {r.coreUpdate}</StatusPill> : <StatusPill status="ok">core current</StatusPill>} {r.pluginUpdates ? `${r.pluginUpdates} plugin(s)` : ''} {r.themeUpdates ? `${r.themeUpdates} theme(s)` : ''}</> : <span className="muted">not inspected</span>) },
           { key: 'maintenance', label: 'Maintenance', render: (r) => (r.maintenance == null ? <span className="muted">—</span> : r.maintenance ? <StatusPill status="warning">on</StatusPill> : 'off') },
           { key: 'id', label: '', render: (r) => <Button size="sm" onClick={() => setSelected(r.id)}>Manage</Button> },
-        ]} rows={sites.data || []} loading={sites.loading} error={sites.error} rowKey={(r) => r.id} emptyText="No WordPress installation found yet. Click Discover sites." />
+        ]} rows={sites.data || []} loading={sites.loading} error={sites.error} rowKey={(r) => r.id} emptyText="WordPress installations found under the account web roots appear here; use Discover sites to search them" />
       </Card>
       {installs.data?.length > 0 && (
         <Card title="Recent installs" padded={false}>

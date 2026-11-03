@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { Info } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading, KeyValue, formatDuration } from '../../../components/Common.jsx';
@@ -47,7 +48,7 @@ export default function EditDatabaseConfiguration({ fn }) {
     <>
       <PageHeader fn={fn} description="Tune the local MySQL/MariaDB server through a panel-managed include file that overrides the distribution defaults. Changes are validated with the server binary and rolled back if rejected; a restart applies them." actions={<><Button onClick={() => refetch()}>Refresh</Button><Button variant="danger" onClick={restartNow} loading={busy}>Restart server</Button></>} />
       {error?.code === 'unsupported_engine'
-        ? <div className="banner banner-info"><div><strong>Not available for the active profile</strong><p>{error.message} <Link to="/database-services/manage-database-profiles">Manage Database Profiles</Link></p></div></div>
+        ? <div className="banner banner-info"><Info size={18} /><div><strong>Not available for the active profile</strong><p>{error.message} <Link to="/database-services/manage-database-profiles">Manage Database Profiles</Link></p></div></div>
         : <RequestError error={error} onRetry={refetch} />}
       {loading && !data && <Loading />}
       {data && (
@@ -56,7 +57,7 @@ export default function EditDatabaseConfiguration({ fn }) {
             <div className="stat-grid">
               <div className="stat"><div className="label">Unit</div><div className="value">{data.unit?.unit ? <StatusPill status={data.unit.state === 'active' ? 'active' : 'down'}>{data.unit.unit} · {data.unit.state}</StatusPill> : <span className="muted">unknown</span>}</div></div>
               <div className="stat"><div className="label">Uptime</div><div className="value">{data.runtime?.status?.Uptime != null ? formatDuration(data.runtime.status.Uptime) : '—'}</div></div>
-              <div className="stat"><div className="label">Connections</div><div className="value">{data.runtime?.status?.Threads_connected ?? '—'}<span className="muted" style={{ fontSize: 13 }}> / max used {data.runtime?.status?.Max_used_connections ?? '—'}</span></div></div>
+              <div className="stat"><div className="label">Connections</div><div className="value">{data.runtime?.status?.Threads_connected ?? '—'}</div><div className="muted">max used {data.runtime?.status?.Max_used_connections ?? '—'}</div></div>
               <div className="stat"><div className="label">Slow queries</div><div className="value">{data.runtime?.status?.Slow_queries ?? '—'}</div></div>
             </div>
             {data.runtime?.error && <p className="muted">Live values unavailable: {data.runtime.error}</p>}
@@ -101,13 +102,13 @@ export default function EditDatabaseConfiguration({ fn }) {
             </div>
           </Card>
           <Card title="Managed include contents">
-            <pre className="log">{data.raw ?? `(not created yet — will be written to ${data.path})`}</pre>
+            <pre className="log">{data.raw ?? `Not created yet. The include is written to ${data.path} when you save.`}</pre>
           </Card>
           {data.files?.length > 0 && (
             <Card title="Distribution [mysqld] settings" subtitle="What the server reads before the managed include; overrides above win.">
               {data.files.map((f) => (
-                <div key={f.path} style={{ marginBottom: 10 }}>
-                  <h3><code>{f.path}</code></h3>
+                <div key={f.path} style={{ marginBottom: 14 }}>
+                  <h3 style={{ marginBottom: 4 }}><code>{f.path}</code></h3>
                   {Object.keys(f.mysqld).length ? <KeyValue items={Object.entries(f.mysqld).map(([k, v]) => [k, v || '(flag)'])} /> : <p className="muted">no [mysqld] options</p>}
                 </div>
               ))}

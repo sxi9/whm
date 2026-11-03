@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
+import { AlertTriangle } from 'lucide-react';
 import { api, queryString } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, formatBytes } from '../../../components/Common.jsx';
@@ -45,7 +46,7 @@ export default function ManageDatabases({ fn }) {
 
   return (
     <>
-      <PageHeader fn={fn} description="Create and drop databases on the active database server. Databases created for an account are prefixed with the account name (cPanel style) and count against the package's database limit." actions={<Button onClick={() => { refetch(); status.refetch(); }}>Refresh</Button>} />
+      <PageHeader fn={fn} description="Create and drop databases on the active database server. Databases created for an account are prefixed with the account name and count against the package's database limit." actions={<Button onClick={() => { refetch(); status.refetch(); }}>Refresh</Button>} />
       <EngineBanner status={status.data} loading={status.loading} error={status.error} onRetry={status.refetch} />
       <form onSubmit={create}>
         <Card title="Create a database">
@@ -62,9 +63,9 @@ export default function ManageDatabases({ fn }) {
       <Card title="Databases" padded={false}>
         <DataTable
           columns={[
-            { key: 'name', label: 'Database', sortable: true, render: (r) => <><code>{r.name}</code>{r.system && <StatusPill status="info"> system</StatusPill>}</> },
+            { key: 'name', label: 'Database', sortable: true, render: (r) => <><code>{r.name}</code>{r.system && <> <StatusPill status="info">system</StatusPill></>}</> },
             { key: 'account', label: 'Account', sortable: true, render: (r) => (r.account ? <Link to={`/account-information/list-accounts?q=${r.account}`}>{r.account}</Link> : <span className="muted">{isRoot ? <Link to="/database-services/database-map-tool">unmapped</Link> : '—'}</span>) },
-            { key: 'users', label: 'Users with access', render: (r) => (r.users?.length ? r.users.map((u) => <code key={u} style={{ marginRight: 6 }}>{u}</code>) : <span className="muted">none</span>) },
+            { key: 'users', label: 'Users with access', render: (r) => (r.users?.length ? r.users.map((u) => <code key={u}>{u}</code>).reduce((acc, el) => (acc.length ? [...acc, ' ', el] : [el]), []) : <span className="muted">none</span>) },
             { key: 'sizeBytes', label: 'Size', sortable: true, align: 'right', render: (r) => (r.sizeBytes == null ? '—' : formatBytes(r.sizeBytes)) },
             { key: 'tables', label: 'Tables', align: 'right', render: (r) => r.tables ?? '—' },
             { key: 'charset', label: 'Charset', render: (r) => (r.charset ? `${r.charset}${r.collation ? ` / ${r.collation}` : ''}` : '—') },
@@ -76,9 +77,9 @@ export default function ManageDatabases({ fn }) {
           searchable q={t.state.q} onSearch={t.setSearch} searchPlaceholder="Search databases or accounts"
           toolbar={isRoot && <Toggle checked={showSystem} onChange={setShowSystem} label="Show system databases" />}
           rowActions={(r) => [r.system ? null : { label: 'Drop', primary: true, danger: true, onClick: () => drop(r) }]}
-          emptyText={error ? 'Could not load databases.' : 'No databases yet.'}
+          emptyText={error ? 'Could not load databases.' : 'No databases yet. Databases you create or map to accounts appear here.'}
         />
-        {meta?.engineError && <div className="card-body"><div className="banner banner-warning"><div><strong>Server unreachable</strong><p>{meta.engineError.message} Showing the panel's records only.</p></div></div></div>}
+        {meta?.engineError && <div className="card-body"><div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>Server unreachable</strong><p>{meta.engineError.message} Showing the panel's records only.</p></div></div></div>}
         {engine === 'postgres' && <div className="card-body muted">PostgreSQL profile: databases are created with the account's user as owner once a user is granted ALL PRIVILEGES.</div>}
       </Card>
     </>

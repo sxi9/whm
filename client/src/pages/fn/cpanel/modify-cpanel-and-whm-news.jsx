@@ -101,14 +101,15 @@ export default function ModifyNews({ fn }) {
   return (
     <>
       <PageHeader fn={fn} actions={<Button variant="primary" onClick={() => setEditing(null)}>New item</Button>}>
-        <p className="muted small">{isRoot ? 'Items appear at the top of the Home dashboard for the chosen audience while they are enabled and inside their time window.' : 'Items appear at the top of the Home dashboard of the accounts you own while they are enabled and inside their time window (Modify News privilege).'} Users can dismiss information and warnings per browser; critical items stay until you hide them.</p>
+        <p className="muted">{isRoot ? 'Items appear at the top of the Home dashboard for the chosen audience while they are enabled and inside their time window.' : 'Items appear at the top of the Home dashboard of the accounts you own while they are enabled and inside their time window (Modify News privilege).'} Users can dismiss information and warnings per browser; critical items stay until you hide them.</p>
       </PageHeader>
       <Card padded={false} title="News items" actions={(
         <Select value={status} onChange={setStatus} options={[{ value: 'active', label: 'Active' }, { value: 'scheduled', label: 'Scheduled' }, { value: 'expired', label: 'Expired' }, { value: 'disabled', label: 'Disabled' }]} placeholder="All statuses" />
       )}>
-        <DataTable columns={columns} rows={rows} loading={list.loading} error={list.error} rowActions={rowActions} searchable q={q} onSearch={setQ} searchPlaceholder="Search title or body" emptyText="No news items" />
-        {!list.loading && !list.error && rows.length === 0 && !q && !status && (
-          <div className="card-body"><EmptyState icon={Megaphone} title="Nothing published yet"><p>Create an item to announce maintenance windows, policy changes or new features to resellers and users.</p></EmptyState></div>
+        {!list.loading && !list.error && rows.length === 0 && !q && !status ? (
+          <EmptyState icon={Megaphone} title="Nothing published yet"><p>Items you publish are listed here with their audience, severity and time window. Create one to announce maintenance windows, policy changes or new features to resellers and users.</p></EmptyState>
+        ) : (
+          <DataTable columns={columns} rows={rows} loading={list.loading} error={list.error} rowActions={rowActions} searchable q={q} onSearch={setQ} searchPlaceholder="Search title or body" emptyText="No news items match this filter" />
         )}
       </Card>
       {editing !== undefined && <Editor item={editing} isRoot={isRoot} onClose={() => setEditing(undefined)} onSaved={() => { setEditing(undefined); list.refetch(); }} />}

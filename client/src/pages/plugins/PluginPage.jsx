@@ -82,10 +82,10 @@ export function PluginFields({ fields, groups = [], values, onChange, errors }) 
   return (
     <>
       {[...byGroup.entries()].map(([gid, list]) => list.length === 0 ? null : (
-        <fieldset key={gid || '_'} className="field-group">
-          {gid && <legend>{groups.find((g) => g.id === gid)?.label || gid}</legend>}
+        <div key={gid || '_'} className="field-group">
+          {gid && <h3 style={{ marginBottom: 12 }}>{groups.find((g) => g.id === gid)?.label || gid}</h3>}
           {list.map((f) => <PluginField key={f.key} field={f} value={values[f.key]} onChange={(v) => onChange(f.key, v)} error={errors?.[f.key]} />)}
-        </fieldset>
+        </div>
       ))}
     </>
   );
@@ -313,7 +313,7 @@ export default function PluginPage() {
         <>
           <PageHeader title={plugin.name} description={`Version ${plugin.version}`} />
           <Card title="Pages">
-            <ul>{plugin.pages.map((p) => <li key={p.route}><Link to={pluginFn(plugin, p).path}>{p.title}</Link></li>)}</ul>
+            <ul className="list-plain">{plugin.pages.map((p) => <li key={p.route} style={{ padding: '6px 0' }}><Link to={pluginFn(plugin, p).path}>{p.title}</Link></li>)}</ul>
           </Card>
         </>
       );

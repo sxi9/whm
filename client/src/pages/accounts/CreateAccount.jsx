@@ -48,14 +48,14 @@ export default function CreateAccount({ fn }) {
     return (
       <>
         <PageHeader fn={fn} />
-        <Card title="Account created" actions={<button className="btn" onClick={() => { setResult(null); setForm({ domain: '', username: '', password: '', contactEmail: '', package: '', ip: '', owner: '' }); }}>Create another</button>}>
+        <Card title="Account created" actions={<Button size="sm" onClick={() => { setResult(null); setForm({ domain: '', username: '', password: '', contactEmail: '', package: '', ip: '', owner: '' }); }}>Create another</Button>}>
           <KeyValue items={[
             ['Domain', result.domain], ['Username', <code key="u">{result.username}</code>], ['Package', result.package_name], ['IP address', result.ip || 'shared'], ['Home directory', <code key="h">{result.home_dir}</code>],
             ['Linux user', <StatusPill key="s" status={result.provisioning?.systemUser ? 'ok' : 'warning'}>{result.provisioning?.systemUser ? 'created' : 'not created (development mode)'}</StatusPill>],
             step('web', 'Web vhost'), step('dns', 'DNS zone'), step('mail', 'Mail routing'), step('database', 'Databases'),
           ]} />
           <p className="muted" style={{ marginTop: 10 }}>Pending steps are applied automatically once the missing service is installed and the account is synced; failed steps keep the account and are listed in the audit log.</p>
-          <p style={{ marginTop: 14 }}><Link to="/account-information/list-accounts">Go to List Accounts</Link></p>
+          <FormActions><Link className="btn" to="/account-information/list-accounts">Go to List Accounts</Link></FormActions>
         </Card>
       </>
     );
@@ -91,7 +91,7 @@ export default function CreateAccount({ fn }) {
           <Field inline><Toggle checked={provision.dns} onChange={(v) => setProvision((p) => ({ ...p, dns: v }))} label="DNS zone" description="Zone from the standard template (A, MX, SPF) pointing at the account's IP" /></Field>
           <Field inline><Toggle checked={provision.mail} onChange={(v) => setProvision((p) => ({ ...p, mail: v }))} label="Local mail routing" description="Adds the domain to Exim's local domains" /></Field>
         </Card>
-        <FormActions><Button type="submit" variant="primary" loading={loading}>Create</Button></FormActions>
+        <div className="sticky-actions"><FormActions><Button type="submit" variant="primary" loading={loading}>Create</Button></FormActions></div>
       </form>
     </>
   );

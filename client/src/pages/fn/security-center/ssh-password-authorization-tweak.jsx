@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { AlertTriangle } from 'lucide-react';
 import { api } from '../../../api/client.js';
 import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, StatusPill, Loading, KeyValue } from '../../../components/Common.jsx';
@@ -54,15 +55,16 @@ export default function SshPasswordAuthorizationTweak({ fn }) {
               ['Password authentication', <StatusPill key="p" status={draft.PasswordAuthentication === 'no' ? 'ok' : 'warning'}>{data.effective.passwordauthentication || 'yes (default)'}</StatusPill>],
               ['Root login', <StatusPill key="r" status={(data.effective.permitrootlogin || 'yes') === 'yes' ? 'warning' : 'ok'}>{data.effective.permitrootlogin || 'yes (default)'}</StatusPill>],
               ['Authorized root keys', <Link key="k" to="/security-center/manage-roots-ssh-keys">{data.authorizedKeyCount} key{data.authorizedKeyCount === 1 ? '' : 's'}</Link>],
-              ['Drop-in include active', data.includeActive ? 'yes' : 'no — it is added automatically on save'],
+              ['Drop-in include active', data.includeActive ? 'yes' : 'no (it is added automatically on save)'],
             ]} />
             <ManagedFileNote path={data.managedPath} />
             {data.legacyPath && <p className="muted">The older drop-in <code>{data.legacyPath}</code> is still in place; it is moved to <code>{data.managedPath}</code> on the next save so it sorts before distribution files.</p>}
             {data.shadowed?.length > 0 && (
               <div className="banner banner-warning" style={{ marginTop: 10 }}>
+                <AlertTriangle size={18} />
                 <div>
                   <strong>Some panel settings are not in effect.</strong> sshd keeps the first value it reads, and another file sets these before the panel drop-in:
-                  <ul style={{ margin: '6px 0 0 18px' }}>
+                  <ul>
                     {data.shadowed.map((s) => <li key={s.key}><code>{s.key} {s.managed}</code> is overridden by <code>{s.effective}</code>{s.by ? <> from <code>{s.by}</code></> : null}</li>)}
                   </ul>
                   Remove or change the directive in that file (and keep the Include line at the top of <code>/etc/ssh/sshd_config</code>), then save again.

@@ -39,7 +39,7 @@ export default function ShellForkBombProtection({ fn }) {
           </Card>
           <Card title="Limits for shell users" subtitle="Hard limits applied to every PAM login session except root and the exempt groups.">
             <div className="form-grid">
-              <Field label="Maximum processes (nproc)" help="WHM's classic default is 35."><NumberInput value={draft.maxProcesses} onChange={(v) => setDraft({ ...draft, maxProcesses: v })} min={1} nullable={false} /></Field>
+              <Field label="Maximum processes (nproc)" help="The classic default is 35."><NumberInput value={draft.maxProcesses} onChange={(v) => setDraft({ ...draft, maxProcesses: v })} min={1} nullable={false} /></Field>
               <Field label="Maximum open files (nofile)"><NumberInput value={draft.maxOpenFiles} onChange={(v) => setDraft({ ...draft, maxOpenFiles: v })} min={16} nullable={false} /></Field>
               <Field label="Maximum virtual memory (MB)"><NumberInput value={draft.maxMemoryMb} onChange={(v) => setDraft({ ...draft, maxMemoryMb: v })} min={16} nullable={false} /></Field>
               <Field label="Exempt groups" help="Comma-separated. Members keep unlimited resources (e.g. wheel, sudo)."><TextInput value={draft.excludeGroups.join(', ')} onChange={(v) => setDraft({ ...draft, excludeGroups: v.split(',').map((s) => s.trim()).filter(Boolean) })} /></Field>

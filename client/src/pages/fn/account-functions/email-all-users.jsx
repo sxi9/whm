@@ -46,14 +46,14 @@ export default function EmailAllUsers({ fn }) {
             {user.role === 'root' && <Field label="Owned by" help="Limit to one reseller's accounts (blank = everyone)"><TextInput value={form.owner} onChange={set('owner')} placeholder="reseller username" /></Field>}
             <Field label="From address" help="Blank uses the server's notification sender"><TextInput type="email" value={form.from} onChange={set('from')} placeholder={`root@${window.location.hostname}`} /></Field>
           </div>
-          {who && <p className="muted" style={{ marginTop: 8 }}>{who.recipients.length} recipient(s){who.withoutEmail ? `; ${who.withoutEmail} account(s) have no contact email and are skipped` : ''}.</p>}
+          {who && <p className="muted">{who.recipients.length} {who.recipients.length === 1 ? 'recipient' : 'recipients'}{who.withoutEmail ? `; ${who.withoutEmail} ${who.withoutEmail === 1 ? 'account has' : 'accounts have'} no contact email and ${who.withoutEmail === 1 ? 'is' : 'are'} skipped` : ''}.</p>}
         </Card>
         <Card title="Message">
           <CapabilityNotice error={error} />
           <ErrorBanner error={error && error.status !== 501 ? error : null} />
           <Field label="Subject" required error={error?.fields?.subject}><TextInput value={form.subject} onChange={set('subject')} placeholder="Scheduled maintenance on {{hostname}}" /></Field>
           <Field label="Body" required error={error?.fields?.text}><Textarea value={form.text} onChange={set('text')} rows={12} placeholder={'Hello {{username}},\n\nYour site {{domain}} …'} /></Field>
-          <FormActions><Button type="submit" variant="primary" loading={busy} disabled={!form.subject || !form.text || !who?.recipients.length}>Send to {who?.recipients.length ?? 0} recipient(s)</Button></FormActions>
+          <FormActions><Button type="submit" variant="primary" loading={busy} disabled={!form.subject || !form.text || !who?.recipients.length}>Send to {who?.recipients.length ?? 0} {who?.recipients.length === 1 ? 'recipient' : 'recipients'}</Button></FormActions>
         </Card>
       </form>
       {job && (
