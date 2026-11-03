@@ -651,6 +651,7 @@
   "panel.shell.favorites": "Favorites",
   "panel.shell.force_password_text": "Choose a new password before using the rest of the panel.",
   "panel.shell.force_password_title": "A new password is required",
+  "panel.shell.force_password_acting_text": "The account owner must choose a new password at their next login; passwords cannot be changed while logged in as the account.",
   "panel.shell.help": "Help",
   "panel.shell.login_as_ended_text": "Start it again from the console to keep viewing this account.",
   "panel.shell.login_as_ended_title": "The \"Log in as\" session has ended",

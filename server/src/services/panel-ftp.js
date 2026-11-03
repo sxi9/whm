@@ -4,16 +4,24 @@ import { effectiveLimit, featureDisabled, limitReached } from './panel-databases
 
 // Customer panel: FTP virtual users of one hosting account. The daemon-side
 // login is derived here (design §9.12: <name>@<main domain> on pure-ftpd,
-// <name>_<account> on proftpd); the agent derives uid/gid/home from /etc/passwd
+// <name>.<account> on proftpd); the agent derives uid/gid/home from /etc/passwd
 // and pins the login directory under that home, so nothing a customer sends
 // can map a login onto another account's tree. vsftpd has no virtual users.
+//
+// The separator is one no hosting username can contain ("@" and "." are both
+// outside arg.username), so a virtual login can never spell another account's
+// system login: on proftpd mod_auth_file answers before mod_auth_unix and such
+// a login would shadow that account's own FTP access. The agent refuses any
+// login present in /etc/passwd as well.
 
 export const FTP_NAME = /^[a-z0-9][a-z0-9._-]{0,31}$/;
 export const REL_PATH = /^(?!-)(?!.*(^|\/)\.\.(\/|$))[^\0\n]{1,512}$/;
 export const SUPPORTED_DAEMONS = ['pure-ftpd', 'proftpd'];
 
+export const PROFTPD_SEPARATOR = '.';
+
 export function loginFor(daemon, name, account) {
-  return daemon === 'pure-ftpd' ? `${name}@${account.domain}` : `${name}_${account.username}`;
+  return daemon === 'pure-ftpd' ? `${name}@${account.domain}` : `${name}${PROFTPD_SEPARATOR}${account.username}`;
 }
 
 // A path relative to the home (or absolute inside it) resolved and pinned under it.
@@ -41,6 +49,7 @@ export function createPanelFtpService(ctx) {
     byId: db.prepare('SELECT * FROM ftp_accounts WHERE id = ? AND account_id = ?'),
     byName: db.prepare('SELECT id FROM ftp_accounts WHERE account_id = ? AND name = ?'),
     byLogin: db.prepare('SELECT id FROM ftp_accounts WHERE login = ?'),
+    accountNamed: db.prepare('SELECT id FROM accounts WHERE username = ?'),
     count: db.prepare('SELECT COUNT(*) AS n FROM ftp_accounts WHERE account_id = ?'),
     insert: db.prepare('INSERT INTO ftp_accounts (account_id, name, login, daemon, dir, quota_mb) VALUES (?, ?, ?, ?, ?, ?)'),
     setQuota: db.prepare("UPDATE ftp_accounts SET quota_mb = ?, updated_at = datetime('now') WHERE id = ?"),
@@ -141,6 +150,7 @@ export function createPanelFtpService(ctx) {
     const info = await requireVirtualUsers(req);
     const login = loginFor(info.daemon, input.login, scope.account);
     if (stmts.byLogin.get(login)) throw conflict(`FTP login "${login}" already exists`);
+    if (stmts.accountNamed.get(login)) throw conflict(`FTP login "${login}" is the login of a hosting account`);
     const home = homeOf(scope);
     const dir = resolveUnderHome(home, input.dir || `public_html`);
     const quotaMb = info.daemon === 'pure-ftpd' ? input.quotaMb ?? null : null;

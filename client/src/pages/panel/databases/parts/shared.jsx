@@ -18,7 +18,7 @@ export function isFeatureDisabled(error) {
 }
 
 export function isLimitReached(error) {
-  return Boolean(error) && (error.code === 'limit_reached' || error.status === 409 && /allows/.test(error.message || ''));
+  return Boolean(error) && (error.code === 'limit_reached' || (error.status === 409 && /allows/.test(error.message || '')));
 }
 
 // Errors a form shows itself: plan limits as an info notice, validation with
@@ -42,7 +42,7 @@ export function RequestError({ error, onRetry }) {
 export function PrefixedInput({ prefix, value, onChange, placeholder, maxLength, id, disabled }) {
   return (
     <div className="input-group">
-      <input className="input" value={prefix} readOnly tabIndex={-1} aria-label="Fixed prefix" style={{ flex: '0 0 auto', width: `${Math.max(4, prefix.length + 1)}ch`, textAlign: 'right' }} />
+      <input className="input" value={prefix} readOnly tabIndex={-1} aria-label="Fixed prefix" style={{ flex: '0 0 auto', width: `calc(${prefix.length}ch + 32px)` }} />
       <TextInput id={id} value={value} onChange={(v) => onChange(v.toLowerCase().replace(/[^a-z0-9_]/g, ''))} placeholder={placeholder} maxLength={maxLength} disabled={disabled} autoCapitalize="none" spellCheck={false} />
     </div>
   );

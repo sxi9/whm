@@ -13,6 +13,7 @@ import { PanelDisabledPage } from './PanelDisabled.jsx';
 import { PANEL_PATHS } from './nav.js';
 
 const COLLAPSED_KEY = 'whm.panel.sidebar.collapsed';
+const ADMIN_PASSWORD_PATH = '/change-password';
 const PASSWORD_PATHS = [PANEL_PATHS.password, PANEL_PATHS.changePassword];
 const TWO_FACTOR_PATHS = [...PASSWORD_PATHS, PANEL_PATHS.twoFactor];
 
@@ -21,8 +22,13 @@ const TWO_FACTOR_PATHS = [...PASSWORD_PATHS, PANEL_PATHS.twoFactor];
 export function panelRedirect(user, me, pathname) {
   if (!user) return { to: '/login', state: { from: pathname } };
   if (user.role !== 'user' && me && !me.actingAs) return { to: '/' };
+  // users.must_change_password belongs to the principal's own row: an admin changes it on the
+  // admin route, and the panel's password endpoint refuses an impersonating admin anyway.
+  if (user.mustChangePassword && user.role !== 'user') return { to: ADMIN_PASSWORD_PATH };
   if (!me) return null;
-  if ((me.account?.forcePasswordChange || user.mustChangePassword) && !PASSWORD_PATHS.includes(pathname)) return { to: PANEL_PATHS.password };
+  // The server closes the force_password_change gate only for mode 'user' (routes/categories/panel.js).
+  const forced = Boolean(me.account?.forcePasswordChange) && !me.actingAs;
+  if ((forced || user.mustChangePassword) && !PASSWORD_PATHS.includes(pathname)) return { to: PANEL_PATHS.password };
   if (me.policy?.require2fa && !user.totpEnabled && !me.actingAs && !TWO_FACTOR_PATHS.includes(pathname)) return { to: PANEL_PATHS.twoFactor };
   return null;
 }

@@ -41,6 +41,11 @@ describe('panelRedirect (design §6.2 gate)', () => {
     ['forced password change → the password page', user, { ...me, account: { ...me.account, forcePasswordChange: 1 } }, '/panel', { to: '/panel/security/password' }],
     ['forced password change on the password page stays', user, { ...me, account: { ...me.account, forcePasswordChange: 1 } }, '/panel/security/password', null],
     ['mustChangePassword on the users row → the password page', { ...user, mustChangePassword: true }, me, '/panel', { to: '/panel/security/password' }],
+    ['forced password change on the account does not loop an admin acting as it (server only gates mode user)', root, { ...me, account: { ...me.account, forcePasswordChange: 1 }, actingAs: { account: 'demo', by: 'root', expiresAt: '2099-01-01T00:00:00Z' } }, '/panel/files/file-manager', null],
+    ['forced password change on the account keeps a reseller acting as it on any page', { ...root, role: 'reseller' }, { ...me, account: { ...me.account, forcePasswordChange: 1 }, actingAs: { account: 'demo', by: 'res1', expiresAt: '2099-01-01T00:00:00Z' } }, '/panel', null],
+    ['admin with its own mustChangePassword → the admin change-password route, not the panel one', { ...root, mustChangePassword: true }, { ...me, actingAs: { account: 'demo', by: 'root', expiresAt: '2099-01-01T00:00:00Z' } }, '/panel', { to: '/change-password' }],
+    ['admin with its own mustChangePassword leaves even before /me answered', { ...root, mustChangePassword: true }, null, '/panel', { to: '/change-password' }],
+    ['role user with mustChangePassword never goes to the admin route', { ...user, mustChangePassword: true }, me, '/panel/security/password', null],
     ['required 2FA without enrolment → the two-factor page', user, { ...me, policy: { require2fa: true } }, '/panel', { to: '/panel/security/two-factor' }],
     ['required 2FA on the two-factor page stays', user, { ...me, policy: { require2fa: true } }, '/panel/security/two-factor', null],
     ['required 2FA already enrolled stays', { ...user, totpEnabled: true }, { ...me, policy: { require2fa: true } }, '/panel', null],
@@ -118,6 +123,17 @@ describe('scope banners (design §2.3–§2.5)', () => {
     expect(minutesLeft(null)).toBe(null);
     expect(minutesLeft('garbage')).toBe(null);
     expect(scopeBanners({ ...me, user: { ...me.user, mustChangePassword: true } }).map((b) => b.kind)).toEqual(['force-password']);
+    expect(scopeBanners({ ...me, account: { ...me.account, forcePasswordChange: 1 } })[0]).toMatchObject({ kind: 'force-password', actionable: true });
+    expect(all[2]).toMatchObject({ kind: 'force-password', actionable: false });
+  });
+
+  it('does not link an acting admin to the panel password page the server refuses (not_while_impersonating)', () => {
+    currentUser = { id: 1, username: 'root', role: 'root' };
+    const acting = { ...me, actingAs: { account: 'demo', by: 'root', expiresAt: '2099-01-01T00:00:00Z' }, account: { ...me.account, forcePasswordChange: 1 } };
+    const html = render(h(PanelBanners), { value: { me: acting, loading: false, error: null, reload: () => {}, hasFeature: () => true } });
+    expect(html).toContain('A new password is required');
+    expect(html).toContain('at their next login');
+    expect(html).not.toContain('href="/panel/security/password"');
   });
 
   it('renders each notice with its tone', () => {

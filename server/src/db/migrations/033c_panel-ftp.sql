@@ -1,6 +1,7 @@
 -- Customer panel: FTP virtual users (pure-ftpd PureDB / proftpd AuthUserFile).
--- `login` is the daemon-side name (<name>@<domain> on pure-ftpd, <name>_<account>
--- on proftpd); `name` is what the customer typed. The uid/gid/home of the system
+-- `login` is the daemon-side name (<name>@<domain> on pure-ftpd, <name>.<account>
+-- on proftpd; both separators are outside the hosting-username alphabet, so a
+-- virtual login never spells a system login); `name` is what the customer typed. The uid/gid/home of the system
 -- user behind a virtual login are derived by the agent from /etc/passwd at every
 -- call and never stored here.
 

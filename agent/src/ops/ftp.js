@@ -10,6 +10,9 @@ import { passwdHome, assertUnderHome } from './web.js';
 // hosting account: its uid, gid and home are read from /etc/passwd here, never
 // taken from the caller, and the login directory must resolve inside that home.
 // Passwords travel on stdin only; nothing secret is ever an argv element.
+// A virtual login that names an existing system user is refused for both
+// daemons: proftpd's mod_auth_file answers before mod_auth_unix, so such a
+// login would shadow (and break) that user's own FTP access.
 //
 // Enabling PureDB / AuthUserFile in the daemon configuration belongs to
 // service-configuration (ctx.web.ftp.enableVirtualUsers); ftp.virtual.status
@@ -39,6 +42,13 @@ function getent(username) {
     const [name, , uid, gid, gecos, home, shell] = line.split(':');
     return { username: name, uid: Number(uid), gid: Number(gid), gecos, home, shell };
   } catch { return null; }
+}
+
+// The panel derives logins with a separator no system username can carry
+// ("@" on pure-ftpd, "." on proftpd); this is the agent's own check that the
+// name is still free in /etc/passwd whatever the caller sent.
+export function assertLoginFree(name) {
+  if (SYSTEM_USERS.has(name) || getent(name)) throw new OpError('exists', `"${name}" is a system login on this server; a virtual FTP user cannot shadow it`);
 }
 
 export function assertManaged(username) {
@@ -95,6 +105,7 @@ defineOp('ftp.user.add', {
   description: 'Create an FTP virtual user bound to a hosting account (uid/gid/home from /etc/passwd, directory inside that home), password on stdin',
   schema: z.object({ daemon, login, password, username: arg.username, dir: arg.absPath, quotaMb: quotaMb.default(null) }).strict(),
   run: async ({ daemon: which, login: name, password: pw, username, dir, quotaMb: mb }, ctx) => {
+    assertLoginFree(name);
     const info = assertManaged(username);
     const home = passwdHome(username);
     const target = assertFtpDir(home, dir, ctx);

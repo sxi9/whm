@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { assertFtpDir, parsePurePwList, login, PURE_PASSWD, PURE_PDB, PROFTPD_PASSWD } from '../src/ops/ftp.js';
+import { assertFtpDir, assertLoginFree, parsePurePwList, login, PURE_PASSWD, PURE_PDB, PROFTPD_PASSWD } from '../src/ops/ftp.js';
 
 // exec/hasBinary are spied so a test can prove an op refused before any
 // program ran, or hand pure-pw/ftpasswd a canned success to inspect the argv
@@ -101,6 +101,22 @@ describe('ftp.* schemas refuse injection before anything runs', () => {
     expect((await opError(runOp('ftp.user.add', { ...good, username: 'daemon' }, ctx))).code).toBe('refused');
     const ghost = `nouser${crypto.randomBytes(3).toString('hex')}`;
     expect((await opError(runOp('ftp.user.add', { ...good, username: ghost, dir: `/home/${ghost}/pub` }, ctx))).code).toBe('not_found');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('refuses a virtual login that names a system user on either daemon, before any tool runs', async () => {
+    exec.mockClear();
+    for (const name of ['root', 'daemon', 'nobody', 'www-data', 'mysql']) {
+      expect(() => assertLoginFree(name), name).toThrow(/system login/);
+      for (const which of ['pure-ftpd', 'proftpd']) {
+        const err = await opError(runOp('ftp.user.add', { ...good, daemon: which, login: name }, ctx));
+        expect(err.code, `${which} ${name}`).toBe('exists');
+      }
+    }
+    const [firstPasswdUser] = fs.readFileSync('/etc/passwd', 'utf8').split('\n').map((l) => l.split(':')[0]).filter((n) => /^[a-z][a-z0-9._@-]{0,63}$/.test(n));
+    if (firstPasswdUser) expect((await opError(runOp('ftp.user.add', { ...good, login: firstPasswdUser }, ctx))).code).toBe('exists');
+    expect(() => assertLoginFree(`free${crypto.randomBytes(3).toString('hex')}`)).not.toThrow();
+    expect(() => assertLoginFree('shop@alice.com')).not.toThrow();
     expect(exec).not.toHaveBeenCalled();
   });
 

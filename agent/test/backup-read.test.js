@@ -2,14 +2,22 @@ import { describe, it, expect, vi, afterAll } from 'vitest';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { READ_NAME, ARCHIVE_ROOTS, MAX_RANGE, underArchiveRoot } from '../src/ops/backup-read.js';
+import { READ_NAME, ARCHIVE_ROOTS, MAX_RANGE, DUMP_STAGING_ROOT, DUMP_NAME, underArchiveRoot, stagingDirFor } from '../src/ops/backup-read.js';
 import { readableName } from '../src/ops/backup.js';
+import { SYSTEM_USERS } from '../src/ops/as-user.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
-  return { ...mod, exec: vi.fn(mod.exec) };
+  return { ...mod, exec: vi.fn(mod.exec), hasBinary: vi.fn(mod.hasBinary) };
 });
-const { exec } = await import('../src/exec.js');
+const { exec, hasBinary } = await import('../src/exec.js');
+
+// A hosting account the dump import may name: its home sits under /home and
+// nothing inside it is touched (exec is stubbed before cp would run).
+const MANAGED = fs.readFileSync('/etc/passwd', 'utf8').split('\n').map((l) => l.split(':')).find(([name, , uid, , , home]) => Number(uid) >= 1000 && Number(uid) < 65534 && /^\/home\//.test(home || '') && !SYSTEM_USERS.has(name));
+const USER = MANAGED?.[0] ?? null;
+const HOME = MANAGED?.[5] ?? null;
+const IS_ROOT = typeof process.getuid === 'function' && process.getuid() === 0;
 
 const ctx = createContext();
 
@@ -101,5 +109,92 @@ describe('backup.archive.read_range on disk', () => {
     expect(past).toMatchObject({ length: 0, data: '', eof: true });
     expect((await opError(runOp('backup.archive.read_range', { archive: `${dir}/linked/cpmove-bob.tar.gz` }, ctx))).code).toBe('refused');
     expect((await opError(runOp('backup.archive.read_range', { archive: `${dir}/dirlink/cpmove-alice.tar.gz` }, ctx))).code).toBe('refused');
+  });
+});
+
+describe('backup.dump.import', () => {
+  const dump = `alice_shop-20261103T120000Z.sql`;
+  const good = { username: 'alice', from: `${DUMP_STAGING_ROOT}/alice/${dump}`, to: `/home/alice/backups/${dump}` };
+
+  it('is registered with a bounded timeout and a staging root under /var/lib/whm', () => {
+    expect(catalog.has('backup.dump.import')).toBe(true);
+    expect(catalog.get('backup.dump.import').destructive).toBe(false);
+    expect(catalog.get('backup.dump.import').timeoutMs).toBe(600_000);
+    expect(DUMP_STAGING_ROOT).toBe('/var/lib/whm/panel/dumps');
+    expect(stagingDirFor('alice')).toBe('/var/lib/whm/panel/dumps/alice');
+    for (const n of ['alice_shop-20261103T120000Z.sql', 'a-20261103T120000Z.sql']) expect(DUMP_NAME.test(n), n).toBe(true);
+    for (const n of ['alice_shop.sql', 'Alice-20261103T120000Z.sql', '-x-20261103T120000Z.sql', 'alice_shop-20261103T120000Z.sql.gz', 'x'.repeat(65) + '-20261103T120000Z.sql', '']) expect(DUMP_NAME.test(n), n).toBe(false);
+  });
+
+  it('rejects malformed names, relative paths, traversal and extra keys before anything runs', async () => {
+    exec.mockClear();
+    const bad = [
+      { ...good, from: `var/lib/whm/panel/dumps/alice/${dump}` },
+      { ...good, from: `${DUMP_STAGING_ROOT}/alice/../bob/${dump}` },
+      { ...good, from: `${DUMP_STAGING_ROOT}/alice/shadow` },
+      { ...good, from: `${DUMP_STAGING_ROOT}/alice/${dump}\0` },
+      { ...good, to: `backups/${dump}` },
+      { ...good, to: `/home/alice/../bob/${dump}` },
+      { ...good, to: '/home/alice/.ssh/authorized_keys' },
+      { ...good, username: '-alice' },
+      { ...good, username: 'Alice' },
+      { ...good, uid: 0 },
+      { ...good, gid: 0 },
+      { ...good, mode: '0777' },
+      {},
+    ];
+    for (const args of bad) {
+      const err = await opError(runOp('backup.dump.import', args, ctx));
+      expect(err.code, JSON.stringify(args)).toBe('invalid_args');
+    }
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('refuses a source outside the account\'s own staging directory, whoever the account is', async () => {
+    exec.mockClear();
+    for (const from of [`${DUMP_STAGING_ROOT}/bob/${dump}`, `${DUMP_STAGING_ROOT}/${dump}`, `/var/lib/whm/${dump}`, `/home/alice/${dump}`, `/backup/${dump}`, `${DUMP_STAGING_ROOT}/alice/deeper/${dump}`]) {
+      const err = await opError(runOp('backup.dump.import', { ...good, from }, ctx));
+      expect(err.code, from).toBe('path_not_allowed');
+    }
+    const ghost = `ghost${crypto.randomBytes(3).toString('hex')}`;
+    expect((await opError(runOp('backup.dump.import', { username: ghost, from: `${DUMP_STAGING_ROOT}/${ghost}/${dump}`, to: `/home/${ghost}/${dump}` }, ctx))).code).toBe('not_found');
+    for (const sys of ['root', 'daemon']) expect((await opError(runOp('backup.dump.import', { username: sys, from: `${DUMP_STAGING_ROOT}/${sys}/${dump}`, to: `/home/${sys}/${dump}` }, ctx))).code, sys).toBe('refused');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(!USER || !IS_ROOT)('hands the staging file to the account gid and copies it under the account uid (cp never executed)', async () => {
+    const staging = stagingDirFor(USER);
+    const existed = fs.existsSync(staging);
+    const name = `${USER.replace(/[^a-z0-9_]/g, '_')}_t${crypto.randomBytes(2).toString('hex')}-20261103T120000Z.sql`;
+    const from = `${staging}/${name}`;
+    const to = `${HOME}/backups-${crypto.randomBytes(3).toString('hex')}/${name}`;
+    fs.mkdirSync(staging, { recursive: true, mode: 0o750 });
+    fs.writeFileSync(from, 'CREATE TABLE t (id INT);\n', { mode: 0o600 });
+    const [, , uidS, gidS] = MANAGED;
+    hasBinary.mockImplementation((n) => ['setpriv', 'cp'].includes(n));
+    exec.mockResolvedValueOnce({ code: 0, stdout: '', stderr: '', bin: 'x', argv: [] });
+    try {
+      expect((await opError(runOp('backup.dump.import', { username: USER, from: `${staging}/missing-20261103T120000Z.sql`, to }, ctx))).code).toBe('not_found');
+      expect(exec).not.toHaveBeenCalled();
+      const r = await runOp('backup.dump.import', { username: USER, from, to }, ctx);
+      expect(r).toMatchObject({ from, to, username: USER, sizeBytes: 25 });
+      const st = fs.statSync(from);
+      expect(st.uid).toBe(0);
+      expect(st.gid).toBe(Number(gidS));
+      expect(st.mode & 0o777).toBe(0o640);
+      expect(fs.statSync(staging).gid).toBe(Number(gidS));
+      expect(fs.statSync(staging).mode & 0o777).toBe(0o750);
+      const [bin, argv] = exec.mock.calls.at(-1);
+      expect(bin).toBe('setpriv');
+      expect(argv.slice(0, 7)).toEqual(['--reuid', uidS, '--regid', gidS, '--clear-groups', '--no-new-privs', '--']);
+      expect(argv[7]).toMatch(/\/cp$/);
+      expect(argv.slice(8)).toEqual(['--no-dereference', '--', from, to]);
+      expect(fs.existsSync(to)).toBe(false);
+    } finally {
+      hasBinary.mockReset(); hasBinary.mockImplementation((await vi.importActual('../src/exec.js')).hasBinary);
+      exec.mockReset(); exec.mockImplementation((await vi.importActual('../src/exec.js')).exec);
+      fs.rmSync(from, { force: true });
+      if (!existed) fs.rmSync(staging, { recursive: true, force: true });
+    }
   });
 });

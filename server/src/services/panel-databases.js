@@ -50,6 +50,7 @@ export function createPanelDatabasesService(ctx) {
     userByName: db.prepare('SELECT * FROM db_users WHERE name = ? AND account_id = ?'),
     countUsers: db.prepare('SELECT COUNT(*) AS n FROM db_users WHERE account_id = ?'),
     accessHostById: db.prepare('SELECT * FROM db_access_hosts WHERE id = ? AND account_id = ?'),
+    ownerById: db.prepare('SELECT id, username, role FROM users WHERE id = ?'),
   };
 
   const databases = () => {
@@ -237,7 +238,9 @@ export function createPanelDatabasesService(ctx) {
 
   // Dumps go through a root-owned staging directory under /var/lib/whm (never a
   // path inside the home: mysqldump --result-file follows a symlink the tenant
-  // planted at ~/backups), then are copied into the home as the account.
+  // planted at ~/backups), then backup.dump.import hands the file to the
+  // account (root:<gid> 0640) and copies it into the home under the account's
+  // uid; files.copy only accepts sources inside the home and is not used here.
   function enqueueDump(scope, name, req) {
     requireFeature(scope);
     if (isPg()) throw new CapabilityError('mysql', 'Dumps from the panel are available for MySQL/MariaDB only');
@@ -247,13 +250,23 @@ export function createPanelDatabasesService(ctx) {
     return { job: { id: job.id }, database: name };
   }
 
+  // The job acts as the account's owner, read back at run time; a missing or
+  // changed owner fails the job instead of falling back to a root principal.
+  function ownerRequest(params, account) {
+    const owner = params.ownerId != null ? stmts.ownerById.get(params.ownerId) : null;
+    if (!owner) throw new Error(`The owner of account "${params.username}" no longer exists; request the dump again`);
+    if (account.owner_id !== owner.id) throw new Error(`Account "${params.username}" changed owner since the dump was requested; request it again`);
+    const req = { user: { id: owner.id, username: owner.username, role: owner.role }, ip: null, id: null };
+    req.audit = (entry) => ctx.auditRecord?.(req, entry);
+    return req;
+  }
+
   async function runDump(job) {
     const { accountId, username, database: name } = job.params;
-    const account = db.prepare('SELECT id, username, home_dir, uid, gid FROM accounts WHERE id = ? AND username = ?').get(accountId, username);
+    const account = db.prepare('SELECT id, username, owner_id, home_dir, uid, gid FROM accounts WHERE id = ? AND username = ?').get(accountId, username);
     if (!account) throw new Error(`Account "${username}" no longer exists`);
     if (!stmts.dbByName.get(name, account.id)) throw new Error(`Database "${name}" no longer belongs to ${username}`);
-    const req = { user: { id: job.params.ownerId, username: job.params.actor || username, role: 'root' }, ip: null, id: null };
-    req.audit = (entry) => ctx.auditRecord?.(req, entry);
+    const req = ownerRequest(job.params, account);
     const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
     const staging = `${DUMP_STAGING_ROOT}/${username}`;
     const file = `${staging}/${name}-${stamp}.sql`;
@@ -264,10 +277,8 @@ export function createPanelDatabasesService(ctx) {
     await ctx.agent.op('fs.mkdir', { path: staging, mode: '0750', owner: 'root', group: username });
     try {
       const dumped = await ctx.databases.dump({ path: file, databases: [name] }, req);
-      await ctx.agent.op('fs.chown', { path: file, owner: 'root', group: username });
-      await ctx.agent.op('fs.chmod', { path: file, mode: '0640' });
       await ctx.agent.op('files.mkdir', { username, path: `${home}/backups`, mode: '0700' });
-      await ctx.agent.op('files.copy', { username, from: file, to: target });
+      await ctx.agent.op('backup.dump.import', { username, from: file, to: target });
       job.log(`Dump copied to ${target}`);
       req.audit({ action: 'panel.db.dump.done', target: username, args: { database: name, file: `backups/${name}-${stamp}.sql`, sizeBytes: dumped?.sizeBytes ?? null } });
       return { database: name, file: `backups/${name}-${stamp}.sql`, sizeBytes: dumped?.sizeBytes ?? null };

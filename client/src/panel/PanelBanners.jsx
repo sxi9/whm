@@ -43,7 +43,15 @@ export function PanelBanners() {
       {banners.map((b) => {
         if (b.kind === 'acting') return <ActingAsBanner key={b.kind} banner={b} />;
         if (b.kind === 'suspended') return <div key={b.kind} className="banner banner-error" role="alert"><Ban size={18} /><div><strong>{t('panel.shell.suspended_title', 'This account is suspended')}</strong><p>{t('panel.shell.suspended_text', 'Changes are refused until your hosting provider lifts the suspension.')}</p></div></div>;
-        if (b.kind === 'force-password') return <div key={b.kind} className="banner banner-warning" role="alert"><KeyRound size={18} /><div><strong>{t('panel.shell.force_password_title', 'A new password is required')}</strong><p>{t('panel.shell.force_password_text', 'Choose a new password before using the rest of the panel.')} <Link to={PANEL_PATHS.password}>{t('panel.shell.change_password', 'Change password')}</Link></p></div></div>;
+        if (b.kind === 'force-password') {
+          return (
+            <div key={b.kind} className="banner banner-warning" role="alert"><KeyRound size={18} /><div><strong>{t('panel.shell.force_password_title', 'A new password is required')}</strong>
+              {b.actionable
+                ? <p>{t('panel.shell.force_password_text', 'Choose a new password before using the rest of the panel.')} <Link to={PANEL_PATHS.password}>{t('panel.shell.change_password', 'Change password')}</Link></p>
+                : <p>{t('panel.shell.force_password_acting_text', 'The account owner must choose a new password at their next login; passwords cannot be changed while logged in as the account.')}</p>}
+            </div></div>
+          );
+        }
         if (b.kind === 'demo') return <div key={b.kind} className="banner banner-warning" role="status"><Info size={18} /><div><strong>{t('panel.shell.demo_title', 'Demo mode')}</strong><p>{t('panel.shell.demo_text', 'This account is read-only: every change is refused.')}</p></div></div>;
         return null;
       })}

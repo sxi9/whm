@@ -1,5 +1,5 @@
 import { AlertTriangle, Info } from 'lucide-react';
-import { ErrorBanner, Field, Select } from '../../../../components/Form.jsx';
+import { ErrorBanner, Field, Select, TextInput } from '../../../../components/Form.jsx';
 import { formatBytes } from '../../../../components/Common.jsx';
 import { PanelCapabilityState, FeatureDisabledState } from '../../../../panel/PanelPage.jsx';
 import { usePanelMe } from '../../../../panel/hooks/usePanel.js';
@@ -71,7 +71,7 @@ export function AddressInput({ localPart, domain, domains, onLocalPart, onDomain
   return (
     <Field label="Address" required error={error} help={help}>
       <div className="input-group">
-        <input className="input" value={localPart} onChange={(e) => onLocalPart(e.target.value.toLowerCase())} placeholder="name" autoCapitalize="none" autoCorrect="off" spellCheck={false} aria-label="Local part" disabled={disabled} autoFocus={autoFocus} />
+        <TextInput value={localPart} onChange={(v) => onLocalPart(v.toLowerCase())} placeholder="name" autoCapitalize="none" autoCorrect="off" spellCheck={false} aria-label="Local part" disabled={disabled} autoFocus={autoFocus} />
         <span className="muted" style={{ alignSelf: 'center' }}>@</span>
         <Select value={domain} onChange={onDomain} options={domains.map((d) => ({ value: d, label: d }))} aria-label="Domain" disabled={disabled} style={{ flex: 1 }} />
       </div>

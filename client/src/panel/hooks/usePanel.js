@@ -64,7 +64,7 @@ export function scopeBanners(me, now = Date.now()) {
   if (!me) return out;
   if (me.actingAs) out.push({ kind: 'acting', tone: 'info', account: me.actingAs.account || me.account?.username, by: me.actingAs.by, expiresAt: me.actingAs.expiresAt, minutesLeft: minutesLeft(me.actingAs.expiresAt, now) });
   if (me.account?.suspended) out.push({ kind: 'suspended', tone: 'error' });
-  if (me.account?.forcePasswordChange || me.user?.mustChangePassword) out.push({ kind: 'force-password', tone: 'warning' });
+  if (me.account?.forcePasswordChange || me.user?.mustChangePassword) out.push({ kind: 'force-password', tone: 'warning', actionable: !me.actingAs });
   if (me.account?.demoMode) out.push({ kind: 'demo', tone: 'warning' });
   return out;
 }
