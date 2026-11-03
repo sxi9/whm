@@ -3,6 +3,7 @@ import { api } from '../../api/client.js';
 import { useAuth } from '../../auth/AuthContext.jsx';
 import { PageHeader, Card, StatusPill, KeyValue } from '../../components/Common.jsx';
 import { Field, TextInput, Button, FormActions, ErrorBanner, Toggle } from '../../components/Form.jsx';
+import { Modal } from '../../components/Modal.jsx';
 import { useApi } from '../../hooks/useApi.js';
 import { useToast } from '../../components/Toast.jsx';
 import { useConfirm } from '../../components/Modal.jsx';
@@ -16,6 +17,7 @@ export default function TwoFactor({ fn }) {
   const [code, setCode] = useState('');
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [disabling, setDisabling] = useState(null);
 
   const enroll = async () => { setBusy(true); try { const { data } = await api.post('/auth/2fa/enroll'); setEnrollment(data); } catch (err) { toast.error(err); } finally { setBusy(false); } };
   const confirmCode = async (e) => {
@@ -24,8 +26,14 @@ export default function TwoFactor({ fn }) {
     try { await api.post('/auth/2fa/confirm', { code }); toast.success('Two-factor authentication enabled'); setEnrollment(null); setCode(''); await refresh(); } catch (err) { setError(err); } finally { setBusy(false); }
   };
   const disable = async () => {
-    if (!(await confirm({ title: 'Disable two-factor authentication?', message: 'Your account will be protected by password only.', confirmLabel: 'Disable', danger: true }))) return;
-    try { await api.post('/auth/2fa/disable'); toast.success('Two-factor authentication disabled'); await refresh(); } catch (err) { toast.error(err); }
+    if (!(await confirm({ title: 'Disable two-factor authentication?', message: 'Your account will be protected by password only.', confirmLabel: 'Continue', danger: true }))) return;
+    setDisabling({ password: '', code: '', error: null });
+  };
+  const submitDisable = async (e) => {
+    e.preventDefault();
+    const body = disabling.code ? { code: disabling.code } : { password: disabling.password };
+    setBusy(true);
+    try { await api.post('/auth/2fa/disable', body); toast.success('Two-factor authentication disabled'); setDisabling(null); await refresh(); } catch (err) { setDisabling((d) => ({ ...d, error: err })); } finally { setBusy(false); }
   };
   const setPolicy = async (v) => { try { await api.put('/system/settings', { 'security.2fa.required_for_root': v }); toast.success('Policy saved'); refetch(); } catch (err) { toast.error(err); } };
 
@@ -53,6 +61,15 @@ export default function TwoFactor({ fn }) {
           </form>
         )}
       </Card>
+      <Modal open={Boolean(disabling)} title="Confirm it is you" onClose={() => setDisabling(null)} size="sm"
+        footer={<><Button onClick={() => setDisabling(null)}>Cancel</Button><Button variant="danger" loading={busy} onClick={submitDisable} disabled={!disabling?.password && !disabling?.code}>Disable</Button></>}>
+        <form onSubmit={submitDisable}>
+          <p className="muted">Turning the second factor off needs your current password or a code from your authenticator app.</p>
+          <ErrorBanner error={disabling?.error} />
+          <Field label="Current password"><TextInput type="password" autoComplete="current-password" value={disabling?.password || ''} onChange={(v) => setDisabling((d) => ({ ...d, password: v }))} autoFocus /></Field>
+          <Field label="Or a 6-digit code"><TextInput inputMode="numeric" value={disabling?.code || ''} onChange={(v) => setDisabling((d) => ({ ...d, code: v.replace(/\D/g, '').slice(0, 6) }))} /></Field>
+        </form>
+      </Modal>
       {user.role === 'root' && settings && (
         <Card title="Server policy">
           <Field inline><Toggle checked={Boolean(settings['security.2fa.required_for_root'])} onChange={setPolicy} label="Require two-factor authentication for the root user" description="Root cannot log in without an authenticator once enabled." /></Field>
