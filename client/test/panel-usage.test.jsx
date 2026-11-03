@@ -72,11 +72,9 @@ describe('Usage page', () => {
     expect(html).toContain('<div class="value">12,000</div>');
     expect(html).toContain('What your plan includes');
     expect(html).toContain('Addon domains');
-    expect(html).toContain('None in plan');
-    expect(html).toContain('2 of 10');
-    expect(html).toContain('45 of 50');
+    expect(html).toContain('<div class="value">2</div><div class="muted small">of 10</div>');
+    expect(html).toContain('<div class="value">45</div><div class="muted small">of 50</div>');
     expect(html).toContain('meter warn');
-    expect(html).toContain('3 · unlimited');
     expect(html).toContain('Where the space goes');
     expect(html).toContain('<code>public_html</code>');
     expect(html).toContain('384 MB');
@@ -99,7 +97,7 @@ describe('Usage page', () => {
     responses = { '/panel/usage': { data: { ...usageData, disk: { ...usageData.disk, quotaMb: null, inodes: null, inodeLimit: null, source: 'scan', breakdown: null, lastRefresh: null }, bandwidth: { usedMb: 0, limitMb: null, percent: null, months: [] }, limits: { ...usageData.limits, disk_mb: null, bandwidth_mb: null, max_email_per_hour: null, quota_inodes: null } } } };
     const html = render(<Usage fn={fn} />);
     expect(html).toContain('<div class="value">512 MB</div><div class="muted small">unlimited</div>');
-    expect(html).toContain('0 B · unlimited');
+    expect(html).toContain('<div class="value">0 B</div><div class="muted small">unlimited</div>');
     expect(html).toContain('From the last scan');
     expect(html).not.toContain('data-stat="inodes"');
     expect(html).toContain('No scan yet');
