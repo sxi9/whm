@@ -8,7 +8,7 @@
 
 ## Current state
 
-- **Branch:** `claude/kind-meitner-dlnbas` · **Last updated:** 2026-11-03 23:40 UTC · **Phase 7 (new UI, own identity, customer panel) in progress — see the Phase 7 table below and `HANDOFF.md` §4**
+- **Branch:** `claude/kind-meitner-dlnbas` · **Last updated:** 2026-11-04 00:20 UTC · **Phase 7 complete (new UI, Keel identity, account panel) — see the Phase 7 table and `HANDOFF.md` §4**
 - **2026-11-03 baseline gate on a fresh container:** server 1158 / agent 470 / client 52 / hub 184 / hub-ui 105 green after two test-only fixes (the 2FA replay test timeout, `/tmp/whm` created by the agent temp-dir tests).
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
@@ -76,8 +76,8 @@ this table; estimates are revised at each milestone.
 | Milestone 1: react-router 7 (`c87c235`), full gate + builds + e2e green, **screenshot refresh** (all 212 pages + 17 flow shots relabelled `Keel › …`), HANDOFF/CLAUDE/CHECKLIST, push | done | 35 min | 20:25 |
 | **Customer panel** build: units U0 core / U1 files+cron / U2 mail / U3 domains-dns-ssl-php-logs / U4 databases-ftp-backups-usage / U5 client shell in two parallel workflows (builder → lens A adversarial tenant + lens B authorization → fix → re-review; 24 findings, 3 left for the integrator), seams S1–S11 by an integrator agent in parallel (contracts §33–40) | done `6722c95`, `1b97968` | 1 h 50 min | 22:25 |
 | Customer panel: U6 client pages (6 groups, 39 pages, screenshot reviews + fix rounds), integrator wiring (router/Login/Layout, admin "Log in as", token confinement, forced password flow, mail release), admin settings tab, manual Part C, integration critics (3 lenses: 38 findings, 14 non-minor fixed, 3 residuals closed with real as-root tests), `e2e/panel-check.cjs` 39/39 pages | done `f111b42` | 2 h 10 min | 23:35 |
-| Milestone 2: full gate, e2e incl. the customer panel, **screenshot refresh** (admin + account-panel galleries), trackers, push | running | 40 min | 00:15 (4th) |
-| **Total remaining** | | **~40 min** | |
+| Milestone 2: full gate green (server 1402 / agent 615 / client 268 / hub 184 / hub-ui 105 + SDK + plugins), both e2e flows, **screenshot refresh** (212 admin + 39 account-panel pages + flows), trackers, push | done | 45 min | 00:20 (4th) |
+| **Total remaining** | | **0 — Phase 7 complete; next is provisioned-host verification (HANDOFF §4)** | |
 
 Faster option: verification can be cut to one reviewer and one fix round per category
 (~30% less time, less thorough). Not applied unless requested.

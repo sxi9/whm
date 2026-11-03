@@ -1,6 +1,6 @@
 # Every page
 
-Captured 2026-11-03 at commit `c87c235` with `e2e/screenshot-all.cjs` (1280×800). **212 of 212 function pages are live**; the rest show the placeholder for their build phase. Each image carries its label bar. Click any thumbnail for full size.
+Captured 2026-11-03 at commit `55559f9` with `e2e/screenshot-all.cjs` (1280×800). **212 of 212 function pages are live**; the rest show the placeholder for their build phase. Each image carries its label bar. Click any thumbnail for full size.
 
 ## Core pages
 
@@ -180,3 +180,70 @@ Captured 2026-11-03 at commit `c87c235` with `e2e/screenshot-all.cjs` (1280×800
 ## 30. Plugins — 3/3 live
 
 <table><tr><td align="center" valign="top" width="33%"><a href="plugins/imunifyav.jpg"><img src="plugins/imunifyav.jpg" width="400" alt="ImunifyAV"></a><br><sub><b>ImunifyAV</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="plugins/server-monitoring.jpg"><img src="plugins/server-monitoring.jpg" width="400" alt="Server Monitoring"></a><br><sub><b>Server Monitoring</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="plugins/wp-toolkit.jpg"><img src="plugins/wp-toolkit.jpg" width="400" alt="WP Toolkit"></a><br><sub><b>WP Toolkit</b></sub> <sub>✅ live</sub></td></tr></table>
+
+# The account panel
+
+What a hosting customer sees at `/panel` (captured as root acting as the demo account; 39 pages).
+
+<table><tr><td align="center" valign="top" width="33%"><a href="panel/_core/home.jpg"><img src="panel/_core/home.jpg" width="400" alt="Account panel home"></a><br><sub><b>Account panel home</b></sub> <sub>✅ live</sub></td></tr></table>
+
+## Account panel · Overview
+
+<table><tr><td align="center" valign="top" width="33%"><a href="panel/overview/dashboard.jpg"><img src="panel/overview/dashboard.jpg" width="400" alt="Dashboard"></a><br><sub><b>Dashboard</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/overview/account.jpg"><img src="panel/overview/account.jpg" width="400" alt="Account details"></a><br><sub><b>Account details</b></sub> <sub>✅ live</sub></td></tr></table>
+
+## Account panel · Domains
+
+<table><tr><td align="center" valign="top" width="33%"><a href="panel/domains/domains.jpg"><img src="panel/domains/domains.jpg" width="400" alt="Domains"></a><br><sub><b>Domains</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/domains/addon-domains.jpg"><img src="panel/domains/addon-domains.jpg" width="400" alt="Addon domains"></a><br><sub><b>Addon domains</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/domains/subdomains.jpg"><img src="panel/domains/subdomains.jpg" width="400" alt="Subdomains"></a><br><sub><b>Subdomains</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="panel/domains/parked-domains.jpg"><img src="panel/domains/parked-domains.jpg" width="400" alt="Parked domains"></a><br><sub><b>Parked domains</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/domains/redirects.jpg"><img src="panel/domains/redirects.jpg" width="400" alt="Redirects"></a><br><sub><b>Redirects</b></sub> <sub>✅ live</sub></td></tr></table>
+
+## Account panel · DNS
+
+<table><tr><td align="center" valign="top" width="33%"><a href="panel/dns/zone-editor.jpg"><img src="panel/dns/zone-editor.jpg" width="400" alt="Zone editor"></a><br><sub><b>Zone editor</b></sub> <sub>✅ live</sub></td></tr></table>
+
+## Account panel · SSL
+
+<table><tr><td align="center" valign="top" width="33%"><a href="panel/ssl/status.jpg"><img src="panel/ssl/status.jpg" width="400" alt="SSL status"></a><br><sub><b>SSL status</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/ssl/install.jpg"><img src="panel/ssl/install.jpg" width="400" alt="Install certificate"></a><br><sub><b>Install certificate</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/ssl/certificates.jpg"><img src="panel/ssl/certificates.jpg" width="400" alt="Certificates"></a><br><sub><b>Certificates</b></sub> <sub>✅ live</sub></td></tr></table>
+
+## Account panel · Files
+
+<table><tr><td align="center" valign="top" width="33%"><a href="panel/files/file-manager.jpg"><img src="panel/files/file-manager.jpg" width="400" alt="File manager"></a><br><sub><b>File manager</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/files/disk-usage.jpg"><img src="panel/files/disk-usage.jpg" width="400" alt="Disk usage"></a><br><sub><b>Disk usage</b></sub> <sub>✅ live</sub></td></tr></table>
+
+## Account panel · Email
+
+<table><tr><td align="center" valign="top" width="33%"><a href="panel/email/accounts.jpg"><img src="panel/email/accounts.jpg" width="400" alt="Email accounts"></a><br><sub><b>Email accounts</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/email/forwarders.jpg"><img src="panel/email/forwarders.jpg" width="400" alt="Forwarders"></a><br><sub><b>Forwarders</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/email/default-address.jpg"><img src="panel/email/default-address.jpg" width="400" alt="Default address"></a><br><sub><b>Default address</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="panel/email/autoresponders.jpg"><img src="panel/email/autoresponders.jpg" width="400" alt="Autoresponders"></a><br><sub><b>Autoresponders</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/email/spam.jpg"><img src="panel/email/spam.jpg" width="400" alt="Spam filters"></a><br><sub><b>Spam filters</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/email/deliverability.jpg"><img src="panel/email/deliverability.jpg" width="400" alt="Deliverability"></a><br><sub><b>Deliverability</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="panel/email/webmail.jpg"><img src="panel/email/webmail.jpg" width="400" alt="Webmail"></a><br><sub><b>Webmail</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/email/usage.jpg"><img src="panel/email/usage.jpg" width="400" alt="Mail usage"></a><br><sub><b>Mail usage</b></sub> <sub>✅ live</sub></td></tr></table>
+
+## Account panel · Databases
+
+<table><tr><td align="center" valign="top" width="33%"><a href="panel/databases/databases.jpg"><img src="panel/databases/databases.jpg" width="400" alt="Databases"></a><br><sub><b>Databases</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/databases/users.jpg"><img src="panel/databases/users.jpg" width="400" alt="Database users"></a><br><sub><b>Database users</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/databases/remote-hosts.jpg"><img src="panel/databases/remote-hosts.jpg" width="400" alt="Remote hosts"></a><br><sub><b>Remote hosts</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="panel/databases/phpmyadmin.jpg"><img src="panel/databases/phpmyadmin.jpg" width="400" alt="phpMyAdmin"></a><br><sub><b>phpMyAdmin</b></sub> <sub>✅ live</sub></td></tr></table>
+
+## Account panel · FTP
+
+<table><tr><td align="center" valign="top" width="33%"><a href="panel/ftp/accounts.jpg"><img src="panel/ftp/accounts.jpg" width="400" alt="FTP accounts"></a><br><sub><b>FTP accounts</b></sub> <sub>✅ live</sub></td></tr></table>
+
+## Account panel · Cron
+
+<table><tr><td align="center" valign="top" width="33%"><a href="panel/cron/cron-jobs.jpg"><img src="panel/cron/cron-jobs.jpg" width="400" alt="Cron jobs"></a><br><sub><b>Cron jobs</b></sub> <sub>✅ live</sub></td></tr></table>
+
+## Account panel · Backups
+
+<table><tr><td align="center" valign="top" width="33%"><a href="panel/backups/backups.jpg"><img src="panel/backups/backups.jpg" width="400" alt="Backups"></a><br><sub><b>Backups</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/backups/restore.jpg"><img src="panel/backups/restore.jpg" width="400" alt="Restore"></a><br><sub><b>Restore</b></sub> <sub>✅ live</sub></td></tr></table>
+
+## Account panel · Logs
+
+<table><tr><td align="center" valign="top" width="33%"><a href="panel/logs/access-logs.jpg"><img src="panel/logs/access-logs.jpg" width="400" alt="Access logs"></a><br><sub><b>Access logs</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/logs/bandwidth.jpg"><img src="panel/logs/bandwidth.jpg" width="400" alt="Bandwidth"></a><br><sub><b>Bandwidth</b></sub> <sub>✅ live</sub></td></tr></table>
+
+## Account panel · PHP
+
+<table><tr><td align="center" valign="top" width="33%"><a href="panel/php/versions.jpg"><img src="panel/php/versions.jpg" width="400" alt="PHP versions"></a><br><sub><b>PHP versions</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/php/ini.jpg"><img src="panel/php/ini.jpg" width="400" alt="PHP settings"></a><br><sub><b>PHP settings</b></sub> <sub>✅ live</sub></td></tr></table>
+
+## Account panel · Security
+
+<table><tr><td align="center" valign="top" width="33%"><a href="panel/security/password.jpg"><img src="panel/security/password.jpg" width="400" alt="Password"></a><br><sub><b>Password</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/security/two-factor.jpg"><img src="panel/security/two-factor.jpg" width="400" alt="Two-factor authentication"></a><br><sub><b>Two-factor authentication</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/security/ssh-keys.jpg"><img src="panel/security/ssh-keys.jpg" width="400" alt="SSH keys"></a><br><sub><b>SSH keys</b></sub> <sub>✅ live</sub></td></tr>
+<tr><td align="center" valign="top" width="33%"><a href="panel/security/sessions.jpg"><img src="panel/security/sessions.jpg" width="400" alt="Sessions"></a><br><sub><b>Sessions</b></sub> <sub>✅ live</sub></td><td align="center" valign="top" width="33%"><a href="panel/security/tokens.jpg"><img src="panel/security/tokens.jpg" width="400" alt="API tokens"></a><br><sub><b>API tokens</b></sub> <sub>✅ live</sub></td></tr></table>
+
+## Account panel · Usage
+
+<table><tr><td align="center" valign="top" width="33%"><a href="panel/usage/usage.jpg"><img src="panel/usage/usage.jpg" width="400" alt="Usage"></a><br><sub><b>Usage</b></sub> <sub>✅ live</sub></td></tr></table>

@@ -1,8 +1,8 @@
 # Screenshots
 
-Updated 2026-11-03 at commit `c87c235`. All images are captured automatically (Playwright) against the built interface served by the API, and each carries a label bar naming the screen, whether it is live or a placeholder, the date and the commit. They are regenerated at every milestone (`e2e/screenshots.sh`).
+Updated 2026-11-03 at commit `55559f9`. All images are captured automatically (Playwright) against the built interface served by the API, and each carries a label bar naming the screen, whether it is live or a placeholder, the date and the commit. They are regenerated at every milestone (`e2e/screenshots.sh`).
 
-- **[Every page →](pages/README.md)** — all 212 function pages grouped by category (212/212 live) plus core pages.
+- **[Every page →](pages/README.md)** — all 212 admin function pages grouped by category (212/212 live), the core pages, and the account panel (39 pages).
 
 ## Flow
 
@@ -17,6 +17,10 @@ Login → dashboard → creating an account through the form → lists, status p
 <tr><td align="center" valign="top" width="33%"><a href="12-top-search.png"><img src="12-top-search.png" width="400" alt="Global search"></a><br><sub><b>Global search</b></sub></td><td align="center" valign="top" width="33%"><a href="13-restart-service.png"><img src="13-restart-service.png" width="400" alt="Restart HTTP Server (Apache)"></a><br><sub><b>Restart HTTP Server (Apache)</b></sub></td></tr>
 <tr><td align="center" valign="top" width="33%"><a href="14-process-manager.png"><img src="14-process-manager.png" width="400" alt="Process Manager"></a><br><sub><b>Process Manager</b></sub></td><td align="center" valign="top" width="33%"><a href="15-license-tab.png"><img src="15-license-tab.png" width="400" alt="Basic WebHost Manager Setup — License tab"></a><br><sub><b>Basic WebHost Manager Setup — License tab</b></sub></td></tr>
 <tr><td align="center" valign="top" width="33%"><a href="16-manage-plugins-marketplace.png"><img src="16-manage-plugins-marketplace.png" width="400" alt="Manage Plugins — Marketplace tab"></a><br><sub><b>Manage Plugins — Marketplace tab</b></sub></td><td align="center" valign="top" width="33%"><a href="17-whm-marketplace.png"><img src="17-whm-marketplace.png" width="400" alt="Marketplace"></a><br><sub><b>Marketplace</b></sub></td></tr></table>
+
+## Account panel flow
+
+Captured by `e2e/panel-check.cjs` under [`panel-flow/`](panel-flow/): an account user signing in, every panel group, the file manager and cron APIs, then an admin opening the account through "Log in as".
 
 ## Regenerate
 

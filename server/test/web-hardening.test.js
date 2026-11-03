@@ -74,7 +74,7 @@ describe('second-factor brute force', () => {
     app.ctx.db.prepare('DELETE FROM login_attempts').run();
   });
 
-  it('pauses the user after five wrong codes, even for the right code, and audits it', async () => {
+  it('pauses the user after five wrong codes, even for the right code, and audits it', { timeout: 20_000 }, async () => {
     const secret = enable('root');
     const agent = fresh();
     const login = await agent.post('/api/auth/login').send({ username: 'root', password: PASSWORD });

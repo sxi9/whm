@@ -111,9 +111,9 @@ setting only while it still equals the seed, or edit it in Security Advisor.
 
 | Suite | Result |
 |---|---|
-| server (vitest, zod 4) | 59 files, GATE_SERVER passed |
-| agent (vitest) | 35 files, GATE_AGENT passed, 2 skipped |
-| client (vitest, react-router 7) | GATE_CLIENT passed |
+| server (vitest, zod 4) | 59 files, 1402 passed |
+| agent (vitest) | 35 files, 615 passed, 2 skipped |
+| client (vitest, react-router 7) | 268 passed |
 | hub (node --test) | 184 passed |
 | hub/ui (vitest) | 105 passed |
 | plugins/sdk, sample plugin, 4 bundled plugins | all passed |
