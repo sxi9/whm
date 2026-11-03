@@ -16,7 +16,7 @@ import { defineOp, arg, OpError, ensurePrivateDir } from './registry.js';
 
 const TMP_DIR = '/tmp/whm';
 const ROOT_MY_CNF = '/root/.my.cnf';
-const MANAGED = '# Managed by WHM panel';
+const MANAGED = '# Managed by Keel';
 
 const CLIENT_BINS = ['mysql', 'mariadb'];
 const SERVER_BINS = ['mysqld', 'mariadbd'];

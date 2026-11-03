@@ -14,7 +14,10 @@ import { eximBaseLayout, includesFile, EXIM_WHM_FILES } from './exim-layout.js';
 // includes. Every write is validated with the daemon's own config test and
 // rolled back when it is rejected, then the unit is reloaded.
 
-const MANAGED = '# Managed by WHM panel';
+const MANAGED = '# Managed by Keel';
+// Files written before the rename start with the old marker.
+const LEGACY_MANAGED = '# Managed by WHM panel';
+const isManagedLine = (l) => l.startsWith(MANAGED) || l.startsWith(LEGACY_MANAGED);
 const VHOST_MARK = '# whm-vhost ';
 // Apache opens its log files as root and follows symlinks, so per-domain logs
 // never live in a directory the account can write to: root-owned, group = the
@@ -215,7 +218,7 @@ export function dovecotLayout() {
 // configuration proves the slot is really read (a file Exim never loads passes
 // update-exim4.conf and exim -bV trivially).
 export const EXIM_SENTINEL_MACRO = 'WHM_SERVICE_CONFIG';
-const EXIM_BLOCK = { begin: '# BEGIN WHM panel (Service Configuration: Exim main options) - managed block, edits inside are overwritten', end: '# END WHM panel (Service Configuration: Exim main options)' };
+const EXIM_BLOCK = { begin: '# BEGIN Keel (Service Configuration: Exim main options) - managed block, edits inside are overwritten', end: '# END Keel (Service Configuration: Exim main options)' };
 
 // Where the Exim main options live per layout (shared detection in
 // exim-layout.js decides the Debian config mode from dc_use_split_config):
@@ -253,29 +256,37 @@ export function eximLayout(io) {
 
 // The managed block the unsplit-Debian main slot occupies inside localmacros,
 // next to the admin's lines and the other categories' blocks.
+// Blocks written before the rename carry the old markers; both are recognised.
+const LEGACY_EXIM_BLOCK = { begin: '# BEGIN WHM panel (Service Configuration: Exim main options) - managed block, edits inside are overwritten', end: '# END WHM panel (Service Configuration: Exim main options)' };
+function findEximBlock(text) {
+  for (const { begin, end } of [EXIM_BLOCK, LEGACY_EXIM_BLOCK]) {
+    const start = text.indexOf(begin);
+    const stop = text.indexOf(end);
+    if (start !== -1 && stop !== -1 && stop >= start) return { start, stop, beginLength: begin.length, endLength: end.length };
+  }
+  return null;
+}
+
 export function mergeEximBlock(previous, content) {
   const block = `${EXIM_BLOCK.begin}\n${String(content).trimEnd()}\n${EXIM_BLOCK.end}\n`;
   const text = previous || '';
-  const start = text.indexOf(EXIM_BLOCK.begin);
-  const stop = text.indexOf(EXIM_BLOCK.end);
-  if (start !== -1 && stop !== -1 && stop >= start) return `${text.slice(0, start)}${block}${text.slice(stop + EXIM_BLOCK.end.length).replace(/^\n/, '')}`;
+  const found = findEximBlock(text);
+  if (found) return `${text.slice(0, found.start)}${block}${text.slice(found.stop + found.endLength).replace(/^\n/, '')}`;
   return `${text.length && !text.endsWith('\n') ? `${text}\n` : text}${block}`;
 }
 
 export function readEximBlock(text) {
   const t = text || '';
-  const start = t.indexOf(EXIM_BLOCK.begin);
-  const stop = t.indexOf(EXIM_BLOCK.end);
-  if (start === -1 || stop === -1 || stop < start) return null;
-  return t.slice(start + EXIM_BLOCK.begin.length, stop).replace(/^\n/, '');
+  const found = findEximBlock(t);
+  if (!found) return null;
+  return t.slice(found.start + found.beginLength, found.stop).replace(/^\n/, '');
 }
 
 export function stripEximBlock(text) {
   const t = text || '';
-  const start = t.indexOf(EXIM_BLOCK.begin);
-  const stop = t.indexOf(EXIM_BLOCK.end);
-  if (start === -1 || stop === -1 || stop < start) return t;
-  return `${t.slice(0, start)}${t.slice(stop + EXIM_BLOCK.end.length).replace(/^\n/, '')}`;
+  const found = findEximBlock(t);
+  if (!found) return t;
+  return `${t.slice(0, found.start)}${t.slice(found.stop + found.endLength).replace(/^\n/, '')}`;
 }
 
 // What a slot holds right now: a block slot reads its block, a file slot the file.
@@ -525,7 +536,7 @@ export function renderLogrotate(l) {
 export function mergeKeyValueFile(current, settings, { sep = '=' } = {}) {
   const keys = Object.keys(settings);
   const owned = (l) => keys.some((k) => new RegExp(`^\\s*(?:#\\s*)?${k}(?:\\s*=|\\s)`).test(l));
-  const lines = (current || '').split('\n').filter((l) => !owned(l) && !l.startsWith(MANAGED));
+  const lines = (current || '').split('\n').filter((l) => !owned(l) && !isManagedLine(l));
   while (lines.length && lines[lines.length - 1] === '') lines.pop();
   lines.push(`${MANAGED} (FTP Server Configuration). Values below override anything above.`, ...Object.entries(settings).filter(([, v]) => v != null).map(([k, v]) => `${k}${sep === ' ' ? ' ' : sep}${v}`));
   return `${lines.join('\n')}\n`;
@@ -847,7 +858,7 @@ defineOp('web.mpm.set', {
 // lines only. A bind address pins every listener to it; a null https releases
 // 443 so the proxy can terminate TLS.
 export function rewriteListen(text, { http, https, bind = null }) {
-  const lines = (text || '').split('\n').filter((l) => !l.startsWith(MANAGED)).map((l) => (/^\s*Listen\s+/.test(l) ? `#${l.replace(/^#+/, '')}` : l));
+  const lines = (text || '').split('\n').filter((l) => !isManagedLine(l)).map((l) => (/^\s*Listen\s+/.test(l) ? `#${l.replace(/^#+/, '')}` : l));
   while (lines.length && lines[lines.length - 1] === '') lines.pop();
   const addr = (port) => (bind ? listenAddr(bind, port) : String(port));
   lines.push(`${MANAGED} (Apache ports${bind ? `, bound to ${bind}` : ''})`, `Listen ${addr(http)}`);

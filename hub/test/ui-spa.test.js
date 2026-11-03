@@ -13,7 +13,7 @@ import { uiDistDir, isSpaPath } from '../src/app.js';
 function fakeDist() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-hub-ui-'));
   fs.mkdirSync(path.join(dir, 'assets'));
-  fs.writeFileSync(path.join(dir, 'index.html'), '<!doctype html><html><head><title>WHM Hub</title></head><body><div id="root"></div><script type="module" src="/assets/index-abc123.js"></script></body></html>');
+  fs.writeFileSync(path.join(dir, 'index.html'), '<!doctype html><html><head><title>Keel Hub</title></head><body><div id="root"></div><script type="module" src="/assets/index-abc123.js"></script></body></html>');
   fs.writeFileSync(path.join(dir, 'assets', 'index-abc123.js'), 'console.log("hub ui")');
   return dir;
 }

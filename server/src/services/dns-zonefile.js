@@ -149,7 +149,7 @@ export function soaValue({ primary, hostmaster, refresh, retry, expire, minimum 
 }
 
 // zone: { domain, ttl, serial }; records: SOA (optional) + resource records.
-export function renderZone(zone, records, { generatedBy = 'WHM panel' } = {}) {
+export function renderZone(zone, records, { generatedBy = 'Keel' } = {}) {
   const domain = zone.domain;
   const soaRec = records.find((r) => r.type === 'SOA');
   const soa = parseSoaValue(soaRec?.value, domain);

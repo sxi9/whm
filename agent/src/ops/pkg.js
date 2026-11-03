@@ -1095,7 +1095,7 @@ export function renderNginxProxy({ apachePort, cache, cacheMaxSizeMb = 1024, cac
   const location = ['location / {', ...ind([`proxy_pass http://127.0.0.1:${apachePort};`, ...PROXY_HEADERS, ...cacheLines]), '}'];
   const common = ['client_max_body_size 512m;', 'proxy_intercept_errors off;', 'server_tokens off;'];
   const out = [
-    '# Managed by WHM panel (Software > NGINX Manager). Edits are overwritten on the next sync.',
+    '# Managed by Keel (Software > NGINX Manager). Edits are overwritten on the next sync.',
     `# whm-proxy: version=1 apache_port=${apachePort} cache=${cache ? 'on' : 'off'} domains=${domains.length} generated=${new Date().toISOString()}`,
     '',
     'map $http_upgrade $connection_upgrade {',

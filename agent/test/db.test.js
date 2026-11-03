@@ -283,7 +283,7 @@ describe('SQL quoting and parsers', () => {
 
   it('renders and parses the managed cnf include', () => {
     const text = renderCnf({ 'max-connections': '300', 'skip-name-resolve': '', 'innodb-buffer-pool-size': '1G', dropped: null });
-    expect(text.startsWith('# Managed by WHM panel')).toBe(true);
+    expect(text.startsWith('# Managed by Keel')).toBe(true);
     expect(text).toContain('[mysqld]\ninnodb-buffer-pool-size=1G\nmax-connections=300\nskip-name-resolve\n');
     expect(text).not.toContain('dropped');
     expect(parseCnf(text).mysqld).toEqual({ 'innodb-buffer-pool-size': '1G', 'max-connections': '300', 'skip-name-resolve': '' });

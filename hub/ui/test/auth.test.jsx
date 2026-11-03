@@ -127,7 +127,7 @@ describe('shell and routes', () => {
     expect(branded).toContain('Acme Hosting Licenses');
     expect(branded).toContain('src="https://acme.test/logo.png"');
     expect(branded).toContain('href="https://acme.test/support"');
-    expect(branded).not.toContain('WHM Hub');
+    expect(branded).not.toContain('Keel Hub');
     auth.value = SESSIONS.developer;
     const dev = render(<Shell area="dev" />);
     expect(dev).toContain('Developer portal');

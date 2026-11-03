@@ -110,7 +110,7 @@ export function createAuthService(ctx) {
     stmts.touchLogin.run(ip, user.id);
     if (newIp) {
       logger.warn({ username: user.username, ip }, 'login from an address not seen before');
-      Promise.resolve(ctx.contacts?.notify?.({ event: 'login.new_ip', subject: `New login address for ${user.username}`, body: `${user.username} logged in to WHM from ${ip}, an address not used in the last 90 days.`, severity: 'warning' })).catch(() => {});
+      Promise.resolve(ctx.contacts?.notify?.({ event: 'login.new_ip', subject: `New login address for ${user.username}`, body: `${user.username} logged in to Keel from ${ip}, an address not used in the last 90 days.`, severity: 'warning' })).catch(() => {});
     }
     return { user: publicUser(user), mustEnroll2fa: needsEnrollment(user, p), newIp, via, policy: { sessionTimeoutMinutes: p.sessionTimeoutMinutes, disallowConcurrentSessions: p.disallowConcurrentSessions } };
   }
@@ -168,7 +168,7 @@ export function createAuthService(ctx) {
     begin2faEnrollment(userId) {
       const user = stmts.byId.get(userId);
       const secret = crypto.totp.generateSecret();
-      const issuer = `WHM (${settings.get('basic.hostname')})`;
+      const issuer = `Keel (${settings.get('basic.hostname')})`;
       // Stored encrypted but not yet enabled until the user proves they can generate a code.
       stmts.setTotp.run(crypto.encrypt(secret), 0, userId);
       return { secret, otpauthUrl: crypto.totp.keyUri(user.username, issuer, secret) };

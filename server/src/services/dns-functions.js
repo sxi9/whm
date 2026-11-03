@@ -768,7 +768,7 @@ export function createDnsService(ctx) {
       assertPublishable();
       const status = await service.hostnameStatus();
       const hostname = status.hostname;
-      if (!hostname.includes('.')) throw badRequest('Set a fully-qualified hostname in Basic WebHost Manager Setup first');
+      if (!hostname.includes('.')) throw badRequest('Set a fully-qualified hostname in Basic Setup first');
       const ip = input.ip || status.ip;
       if (!ip) throw badRequest('No IP address is configured for this server; set the main IP in Basic Setup');
       let zone = zoneContaining(hostname);

@@ -162,7 +162,7 @@ describe('pure renderers and parsers', () => {
   it('renders hosts.allow with ordered ALLOW/DENY', () => {
     const text = renderHostsAllow([{ service: 'sshd', source: '192.0.2.0/24', action: 'allow', comment: 'office' }, { service: 'ALL', source: 'ALL', action: 'deny' }]);
     expect(text).toContain('# office\nsshd: 192.0.2.0/24: ALLOW\nALL: ALL: DENY\n');
-    expect(text.startsWith('# Managed by WHM panel')).toBe(true);
+    expect(text.startsWith('# Managed by Keel')).toBe(true);
   });
 
   it('brackets IPv6 sources the way libwrap parses them', () => {
@@ -183,6 +183,7 @@ describe('pure renderers and parsers', () => {
     expect(hostsDenyManaged('')).toBe(true);
     expect(hostsDenyManaged('# comment only\n\n')).toBe(true);
     expect(hostsDenyManaged('# Managed by WHM panel (Host Access Control).\n')).toBe(true);
+    expect(hostsDenyManaged('# Managed by Keel (Host Access Control).\n')).toBe(true);
     expect(hostsDenyManaged('# distro default\nALL: PARANOID\n')).toBe(false);
   });
 

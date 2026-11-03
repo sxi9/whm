@@ -29,7 +29,7 @@ export function buildMessage({ from, to, subject, text, headers = {} }) {
   const lines = [
     `From: ${from}`, `To: ${recipients.join(', ')}`, `Subject: ${encodeHeader(subject)}`, `Date: ${new Date().toUTCString()}`,
     `Message-ID: <${Date.now().toString(36)}.${Math.random().toString(36).slice(2)}@${from.split('@')[1]}>`,
-    'MIME-Version: 1.0', 'Content-Type: text/plain; charset=utf-8', 'Content-Transfer-Encoding: 8bit', 'X-Mailer: WHM panel',
+    'MIME-Version: 1.0', 'Content-Type: text/plain; charset=utf-8', 'Content-Transfer-Encoding: 8bit', 'X-Mailer: Keel',
   ];
   for (const [k, v] of Object.entries(headers)) {
     if (!/^[A-Za-z][A-Za-z0-9-]{0,63}$/.test(k) || /^(from|to|subject|date|content-type|mime-version|message-id)$/i.test(k)) continue;

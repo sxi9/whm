@@ -219,7 +219,7 @@ export function createAccountsService(ctx) {
       const undo = [];
       let sysUser = null;
       try {
-        sysUser = await tryOp('user.create', { username, homeDir, shell, comment: `WHM account ${input.domain}` }, req, undo,
+        sysUser = await tryOp('user.create', { username, homeDir, shell, comment: `Keel account ${input.domain}` }, req, undo,
           () => agent.op('user.delete', { username, removeHome: true }, { req }));
         if (sysUser) {
           for (const sub of ['public_html', 'mail', 'etc', 'tmp', 'logs', 'ssl']) {

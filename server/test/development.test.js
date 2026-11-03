@@ -575,7 +575,7 @@ describe('OpenAPI documentation', () => {
     expect(res.status).toBe(200);
     const spec = res.body.data;
     expect(spec.openapi).toBe('3.0.3');
-    expect(spec.info.title).toBe('WHM API');
+    expect(spec.info.title).toBe('Keel admin API');
     expect(spec.paths['/accounts'].get['x-whm-role']).toBe('reseller');
     expect(spec.paths['/accounts'].post['x-whm-role']).toBe('reseller');
     expect(spec.paths['/system/info'].get['x-whm-role']).toBe('root');
@@ -594,7 +594,7 @@ describe('OpenAPI documentation', () => {
 
   it('filters the cPanel reference to account-scoped endpoints', async () => {
     const res = await get('/api/development/openapi.json?scope=cpanel');
-    expect(res.body.data.info.title).toBe('cPanel (account) API');
+    expect(res.body.data.info.title).toBe('Keel account panel API');
     const ops = Object.values(res.body.data.paths).flatMap((p) => Object.values(p));
     expect(ops.length).toBeGreaterThan(10);
     expect(ops.every((op) => op['x-whm-role'] !== 'root')).toBe(true);

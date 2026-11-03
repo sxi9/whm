@@ -16,9 +16,12 @@ export const ALIASES_WORKDIR = '/var/lib/whm/contacts';
 // WHM manages mail for root, the panel's own service user and nobody (the
 // web server user, whose cron and PHP mail lands there).
 export const MANAGED_USERS = ['root', 'nobody'];
-const managedMark = (user) => `# ${user} alias managed by WHM panel (Edit System Mail Preferences)`;
+const managedMark = (user) => `# ${user} alias managed by Keel (Edit System Mail Preferences)`;
+// Files written before the rename carry the old marker; both are recognised.
+const legacyManagedMark = (user) => `# ${user} alias managed by WHM panel (Edit System Mail Preferences)`;
+const isManagedMark = (line, user) => line === managedMark(user) || line === legacyManagedMark(user);
 const MANAGED_MARK = managedMark('root');
-const MANAGED_MARK_RE = /^# [a-z]+ alias managed by WHM panel \(Edit System Mail Preferences\)$/;
+const MANAGED_MARK_RE = /^# [a-z]+ alias managed by (?:Keel|WHM panel) \(Edit System Mail Preferences\)$/;
 
 // A target is a local account or a full address; a local part may not start
 // with "-" so nothing option-shaped ever reaches a mail tool's argv.
@@ -64,7 +67,7 @@ export function renderUserAlias(text, user, targets) {
   for (const line of lines) {
     if (skipping && /^\s/.test(line)) continue;
     skipping = false;
-    if (line === managedMark(user)) continue;
+    if (isManagedMark(line, user)) continue;
     if (entryRe.test(line)) { skipping = true; continue; }
     out.push(line);
   }

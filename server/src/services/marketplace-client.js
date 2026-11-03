@@ -103,7 +103,7 @@ export function createMarketplaceClient(ctx) {
   // hub. A pure read: catalog GETs go through it, so nothing is written here.
   function requireHub() {
     const s = status();
-    if (!s.enabled) throw new HttpError(422, 'marketplace_disabled', 'The WHM marketplace hub is disabled: enable the whm-hub provider in Market Provider Manager');
+    if (!s.enabled) throw new HttpError(422, 'marketplace_disabled', 'The Keel marketplace hub is disabled: enable the whm-hub provider in Market Provider Manager');
     if (s.hubMismatch) throw new HttpError(409, 'hub_mismatch', `The whm-hub provider points at ${s.url || 'no URL'} but this panel's license was issued by ${s.hubUrl || 'no hub'}; the two must share an origin`);
     return s;
   }

@@ -418,7 +418,7 @@ defineOp('cpanel.upgrade.extract', {
       await exec('tar', ['--no-same-owner', '--no-same-permissions', '-xzf', staged, '-C', stageDir], { timeoutMs: 10 * 60 * 1000 });
       await exec('chmod', ['-R', 'go-w', stageDir]);
       const sourceDir = findReleaseRoot(stageDir);
-      if (!sourceDir) throw new OpError('invalid_package', 'The archive is not a WHM release: package.json, server/ and scripts/install.sh are missing');
+      if (!sourceDir) throw new OpError('invalid_package', 'The archive is not a Keel release: package.json, server/ and scripts/install.sh are missing');
       const pkg = JSON.parse(fs.readFileSync(path.join(sourceDir, 'package.json'), 'utf8'));
       const record = { version, stageDir, sourceDir, sha256: digestHex, signer, signatureState, at: new Date().toISOString(), name: pkg.name ?? null, packageVersion: typeof pkg.version === 'string' ? pkg.version : null };
       fs.writeFileSync(marker, JSON.stringify(record), { mode: 0o644 });
@@ -448,7 +448,7 @@ export function verifyStagedRelease(version) {
   if (sourceDir !== stageDir) assertPrivate(sourceDir, 'Release root');
   assertPrivate(path.join(sourceDir, 'scripts'), 'Installer directory');
   assertPrivate(path.join(sourceDir, 'scripts', 'install.sh'), 'Installer', { dir: false });
-  if (!isReleaseDir(sourceDir)) throw new OpError('invalid_package', `${sourceDir} is not an unpacked WHM release`);
+  if (!isReleaseDir(sourceDir)) throw new OpError('invalid_package', `${sourceDir} is not an unpacked Keel release`);
   return { ...m, stageDir, sourceDir };
 }
 

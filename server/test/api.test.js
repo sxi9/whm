@@ -391,7 +391,7 @@ describe('accounts', () => {
     expect(res.body.data.provisioning.systemUser).toBe(true);
 
     expect(agent.names()).toEqual(['user.create', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.write_file', 'user.set_password']);
-    expect(agent.calls[0].args).toEqual({ username: 'web01', homeDir: '/home/web01', shell: '/usr/sbin/nologin', comment: 'WHM account web01.example.com' });
+    expect(agent.calls[0].args).toEqual({ username: 'web01', homeDir: '/home/web01', shell: '/usr/sbin/nologin', comment: 'Keel account web01.example.com' });
     expect(agent.calls.slice(1, 7).map((c) => c.args.path)).toEqual(['public_html', 'mail', 'etc', 'tmp', 'logs', 'ssl'].map((s) => `/home/web01/${s}`));
     expect(agent.calls.slice(1, 7).map((c) => c.args.mode)).toEqual(['0750', '0700', '0700', '0700', '0700', '0700']);
     expect(agent.calls.slice(1, 7).every((c) => c.args.owner === 'web01')).toBe(true);

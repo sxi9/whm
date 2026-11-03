@@ -325,7 +325,7 @@ export function createServerContactsService(ctx) {
   function fromAddress() {
     const host = hostname();
     const from = setting('contacts.from_address', '') || setting('mail.notification_from', '') || `whm@${FQDN_RE.test(host) ? host : `${host}.localdomain`}`;
-    if (!EMAIL_RE.test(from)) throw unprocessable(`"${from}" is not a usable sender address: set a From address in Contact Manager or a fully-qualified hostname in Basic WebHost Manager Setup`, { from: ['Must be a full email address with a dotted domain'] });
+    if (!EMAIL_RE.test(from)) throw unprocessable(`"${from}" is not a usable sender address: set a From address in Contact Manager or a fully-qualified hostname in Basic Setup`, { from: ['Must be a full email address with a dotted domain'] });
     return from;
   }
 
@@ -365,7 +365,7 @@ export function createServerContactsService(ctx) {
   async function postJson(url, payload, { headers = {}, timeoutMs = 10_000 } = {}) {
     let res;
     try {
-      res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'User-Agent': 'WHM-panel-notifier/1.0', ...headers }, body: JSON.stringify(payload), signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' });
+      res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'User-Agent': 'Keel-notifier/1.0', ...headers }, body: JSON.stringify(payload), signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' });
     } catch (err) {
       throw new HttpError(502, 'delivery_failed', `${new URL(url).host}: ${err.cause?.message || err.message}`);
     }
@@ -380,7 +380,7 @@ export function createServerContactsService(ctx) {
     const config = decryptConfig(row);
     const base = { contact_id: row.id, contact_name: row.name || row.address, channel: row.channel, address: row.address, event: msg.event, severity: msg.severity, subject: msg.subject, test: test ? 1 : 0 };
     const host = hostname();
-    const footer = `\n\n-- \nWHM on ${host} · event ${msg.event} · severity ${msg.severity}`;
+    const footer = `\n\n-- \nKeel on ${host} · event ${msg.event} · severity ${msg.severity}`;
     try {
       let transport = row.channel;
       if (row.channel === 'email') {
@@ -472,7 +472,7 @@ export function createServerContactsService(ctx) {
     const base = { contact_name: 'root (system mail)', channel: 'email', address, event: msg.event, severity: msg.severity, subject: msg.subject, test: test ? 1 : 0 };
     try {
       if (r.error) throw new HttpError(422, 'no_root_recipients', r.error);
-      const sent = await sendMail({ to: r.to, subject: `[${host}] ${msg.subject}`, body: `${msg.body}\n\n-- \nWHM on ${host} · event ${msg.event} · severity ${msg.severity}` }, req);
+      const sent = await sendMail({ to: r.to, subject: `[${host}] ${msg.subject}`, body: `${msg.body}\n\n-- \nKeel on ${host} · event ${msg.event} · severity ${msg.severity}` }, req);
       recordDelivery({ ...base, status: 'sent', transport: sent.transport });
       return { contactId: null, name: base.contact_name, channel: 'email', address, status: 'sent', transport: sent.transport, to: r.to };
     } catch (err) {
@@ -699,7 +699,7 @@ export function createServerContactsService(ctx) {
     // (501 when no mail transport exists) so the page can explain it.
     async test(id, req) {
       const row = load(id);
-      const msg = normalizeNotification({ event: 'test', subject: `Test notification from WHM on ${hostname()}`, body: `This is a test message for the ${row.channel} contact "${row.name || row.address}" sent by ${req?.user?.username || 'the panel'} at ${new Date().toISOString()}. If you can read this, the channel works.`, severity: 'info' });
+      const msg = normalizeNotification({ event: 'test', subject: `Test notification from Keel on ${hostname()}`, body: `This is a test message for the ${row.channel} contact "${row.name || row.address}" sent by ${req?.user?.username || 'the panel'} at ${new Date().toISOString()}. If you can read this, the channel works.`, severity: 'info' });
       const result = await deliver(row, msg, { req, test: true });
       audit(req, { action: 'contacts.test', target: row.address, args: { channel: row.channel, status: result.status, error: result.error } });
       if (result.status === 'failed') {
@@ -766,7 +766,7 @@ export function createServerContactsService(ctx) {
 
     // Relay check without a contact: a message to the given address.
     async sendTest(to, req) {
-      const r = await sendMail({ to, subject: `Test message from WHM on ${hostname()}`, body: `This test message was sent by ${req?.user?.username || 'the panel'} at ${new Date().toISOString()} through the ${mailTransport() || 'configured'} transport.` }, req);
+      const r = await sendMail({ to, subject: `Test message from Keel on ${hostname()}`, body: `This test message was sent by ${req?.user?.username || 'the panel'} at ${new Date().toISOString()} through the ${mailTransport() || 'configured'} transport.` }, req);
       audit(req, { action: 'contacts.mail.test', target: to, args: { transport: r.transport } });
       return r;
     },
@@ -799,7 +799,7 @@ export function createServerContactsService(ctx) {
     // where root mail really ends up with the current transport.
     async testRootMail(req) {
       if (!mailTransport()) throw new CapabilityError('exim', 'Exim is not installed and no SMTP relay is configured, so the panel cannot send email. Install exim4 (Debian/Ubuntu) or exim (RHEL), or configure an SMTP relay in Contact Manager.');
-      const msg = normalizeNotification({ event: 'test', subject: `Test message for root from WHM on ${hostname()}`, body: `This test message was sent by ${req?.user?.username || 'the panel'} at ${new Date().toISOString()} the way events selected under Edit System Mail Preferences are mailed to root.`, severity: 'info' });
+      const msg = normalizeNotification({ event: 'test', subject: `Test message for root from Keel on ${hostname()}`, body: `This test message was sent by ${req?.user?.username || 'the panel'} at ${new Date().toISOString()} the way events selected under Edit System Mail Preferences are mailed to root.`, severity: 'info' });
       const result = await mailRoot(msg, req, { test: true });
       audit(req, { action: 'contacts.mail.test', target: result.address, args: { transport: result.transport ?? mailTransport(), status: result.status, error: result.error } });
       if (result.status === 'failed') {

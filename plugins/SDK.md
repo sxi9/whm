@@ -1,7 +1,7 @@
-# WHM Plugin SDK — developer reference
+# Keel Plugin SDK — developer reference
 
 This is the reference for writing, testing, packaging, signing and submitting a plugin for the
-WHM panel. It is written against the committed SDK in `plugins/sdk/` (`validate-manifest.js`,
+Keel panel. It is written against the committed SDK in `plugins/sdk/` (`validate-manifest.js`,
 `mock-host.js`, `errors.js`, `semver.js`, `cron.js`, `pack.js`, `index.js`, `manifest.schema.json`)
 and the real in-process host, `server/src/services/plugins.js` (design: `docs/design/plugin-host.md`).
 The constants quoted here are the SDK's; when this document and the code disagree, the code wins
@@ -133,7 +133,7 @@ Manage Plugins detail page; the consent screen shows the text below for each sco
 | `schedule` | Register cron schedules for the plugin's jobs (ctx.schedule) |
 | `jobs` | Run background jobs and query their status (ctx.jobs) |
 | `events:emit` | Emit events in the plugin's own namespace (ctx.events.emit) |
-| `ui:sidebar` | Add entries to the WHM sidebar and register UI pages (ctx.ui) |
+| `ui:sidebar` | Add entries to the panel sidebar and register UI pages (ctx.ui) |
 | `api:routes` | Expose HTTP routes under /api/plugins/<id>/ (ctx.http) |
 | `contacts:notify` | Send notifications through the Contact Manager (ctx.api.contacts.notify) |
 | `system:read` | Read host/system information and service status (ctx.api.system / services) |
@@ -406,7 +406,7 @@ vocabulary; the host rows use `installed | enabled | disabled | errored`.
 
 ## 7. Pages and the sidebar
 
-`ui.sidebar[]` entries (`{ category, label, route, icon }`) appear in the named WHM category (one of
+`ui.sidebar[]` entries (`{ category, label, route, icon }`) appear in the named panel category (one of
 the 30 in `CATEGORIES`; unknown → *Plugins*), the Tools grid and search; each `route` must have a
 matching `ui.pages[]` entry. Routes are relative to `/plugins/<id>` and match
 `UI_ROUTE_PATTERN = /^\/(?:[a-z0-9][a-z0-9_-]*(?:\/[a-z0-9][a-z0-9_-]*)*)?$/`; icons are lucide names

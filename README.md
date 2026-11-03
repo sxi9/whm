@@ -1,14 +1,14 @@
-# WHM — WebHost Manager control panel
+# Keel — hosting control panel
 
-A production-grade, self-hostable **WHM-compatible hosting control panel**: the complete
-WHM administrative interface (30 categories, 212 functions) that manages a **real Linux
-server** — Linux users and quotas, Apache/NGINX and PHP-FPM, BIND DNS, Exim/Dovecot mail,
+**Keel** is a production-grade, self-hostable hosting control panel. It is WHM-compatible and
+reproduces the full WHM administrative surface (30 categories, 212 functions), managing a **real
+Linux server** — Linux users and quotas, Apache/NGINX and PHP-FPM, BIND DNS, Exim/Dovecot mail,
 MySQL/MariaDB, FTP, SSL/ACME, systemd services, IPs, security, backups, transfers and
 resellers — built on Node.js 22, Express, React and SQLite.
 
 - Design of record: [`BLUEPRINT.md`](BLUEPRINT.md) · Progress: [`CHECKLIST.md`](CHECKLIST.md) · Conventions: [`CLAUDE.md`](CLAUDE.md) · Screenshots: [`docs/screenshots/`](docs/screenshots/README.md)
 
-![WHM home dashboard](docs/screenshots/02-dashboard.png)
+![Keel home dashboard](docs/screenshots/02-dashboard.png)
 
 ## Documentation
 
@@ -214,14 +214,14 @@ Editions (`products` rows: `whm-trial`, `whm-solo-*`, `whm-pro-*`, `whm-reseller
 `whm-enterprise`) carry limits (`max_accounts`, `max_resellers`, `max_activations`) and feature
 flags (`api`, `transfers`, `clusters`, `marketplace_paid`, `white_label`, …).
 
-- **Trial** — on the panel, *Server Configuration › Basic WebHost Manager Setup › License › Start free
+- **Trial** — on the panel, *Server Configuration › Basic Setup › License › Start free
   trial* (e-mail only: `POST /v1/trial`, 14 days, one per server fingerprint and per e-mail). Converting
   it (`POST /v1/admin/trials/:id/convert { sku }`, or the portal) keeps the activation, so the panel
   simply receives a Solo/Pro token at its next check-in.
 - **Reseller** — create the reseller in the admin portal (quota per edition + wholesale prices) and an
   API key with `license:issue`; the reseller issues within quota through the reseller portal or
   `POST /v1/reseller/licenses { sku, customer, term_months }` (bulk: `…/bulk` → job + CSV).
-- **Where the panel enters the key** — only under *Basic WebHost Manager Setup › License* (enter/replace
+- **Where the panel enters the key** — only under *Basic Setup › License* (enter/replace
   key, *Check in now*, edition/limits/features, activations with *Deactivate*/*Transfer*, vendor portal
   link). The Market Provider Manager's `whm-hub` row holds no key: it is the marketplace enable switch.
   Activation binds the key to a server fingerprint (hashes of machine-id, default-route MAC, root
@@ -256,8 +256,8 @@ flags (`api`, `transfers`, `clusters`, `marketplace_paid`, `white_label`, …).
    `SIGNATURE.json` with its active plugin key and repacks deterministically.
 8. **Publish** — to `stable` or `beta` (`POST …/versions/:v/publish`). Yank hides a version; admins
    can revoke (panels disable it through the signed revocation feed) or take a plugin down.
-9. **Install from WHM** — enable the `whm-hub` row in *Market › Market Provider Manager*, then
-   *cPanel › Manage Plugins › Marketplace* (or *Server Configuration › WHM Marketplace*): install
+9. **Install from the panel** — enable the `whm-hub` row in *Market › Market Provider Manager*, then
+   *Panel › Manage Plugins › Marketplace* (or *Server Configuration › Marketplace*): install
    opens a **consent screen** listing every scope with its description and the developer's
    justification; the package is downloaded through a signed single-use URL, its sha256 and
    `SIGNATURE.json` verified against the hub-pinned keys, then enabled. Updates that add scopes are

@@ -20,7 +20,7 @@ export default function Register() {
   return (
     <div className="login-page">
       <form className="login-card" onSubmit={submit}>
-        <div className="login-brand"><ShieldCheck size={20} /> <span>WHM Marketplace</span></div>
+        <div className="login-brand"><ShieldCheck size={20} /> <span>Keel Marketplace</span></div>
         <h1>Register as a developer</h1>
         {done ? (
           <>

@@ -1656,7 +1656,7 @@ export function createPluginHost(ctx) {
       try { manifest = JSON.parse(fs.readFileSync(path.join(root, 'plugin.json'), 'utf8')); } catch (err) { throw err422('invalid_manifest', `plugin.json is not valid JSON: ${err.message}`); }
       const vr = V.validateManifest(manifest);
       if (!vr.ok) throw err422('invalid_manifest', `plugin.json is invalid: ${vr.errors.map((e) => `${e.path}: ${e.message}`).join('; ')}`, vr.errors);
-      if (!semver.satisfies(HOST_API_VERSION, manifest.engines.whm)) throw err422('incompatible_host', `Plugin "${manifest.id}" requires WHM ${manifest.engines.whm} but this host provides ${HOST_API_VERSION}`);
+      if (!semver.satisfies(HOST_API_VERSION, manifest.engines.whm)) throw err422('incompatible_host', `Plugin "${manifest.id}" requires Keel ${manifest.engines.whm} but this host provides ${HOST_API_VERSION}`);
       // Refused before any signature check or rename: a package the caller
       // requested under one id never touches a plugin installed under another.
       if (typeof policy?.expectedId === 'string' && manifest.id !== policy.expectedId) throw err422('plugin_id_mismatch', `The package declares plugin id ${manifest.id}, not ${policy.expectedId}`);

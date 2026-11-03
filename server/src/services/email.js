@@ -33,7 +33,7 @@ const LISTS = {
   localDomains: 'local_domains.lst', relayDomains: 'relay_domains.lst',
 };
 const GREYLIST_DB = '/var/lib/whm/greylist/greylist.db';
-const MANAGED = '# Managed by WHM panel';
+const MANAGED = '# Managed by Keel';
 
 export function isCidr(value) {
   const [addr, prefix] = String(value).split('/');
@@ -85,15 +85,15 @@ export function renderAcl({ dir, country, domain, greylist }) {
   // (non-TCP) submissions.
   const loopback = (file) => `<; ; 127.0.0.1 ; ::1 ; /${dir}/${file}`;
   if (country.blockCount > 0) {
-    lines.push('# Filter Incoming Emails by Country: blocked countries', 'deny    !authenticated = *', `        hosts = /${dir}/${LISTS.countryBlock}`, `        message = ${country.message}`, '        log_message = WHM country filter (blocked country)', '');
+    lines.push('# Filter Incoming Emails by Country: blocked countries', 'deny    !authenticated = *', `        hosts = /${dir}/${LISTS.countryBlock}`, `        message = ${country.message}`, '        log_message = Keel country filter (blocked country)', '');
   }
   if (country.allowCount > 0) {
-    lines.push('# Filter Incoming Emails by Country: only allowed countries may send', 'deny    !authenticated = *', `        !hosts = ${loopback(LISTS.countryAllow)}`, `        message = ${country.message}`, '        log_message = WHM country filter (country not allowed)', '');
+    lines.push('# Filter Incoming Emails by Country: only allowed countries may send', 'deny    !authenticated = *', `        !hosts = ${loopback(LISTS.countryAllow)}`, `        message = ${country.message}`, '        log_message = Keel country filter (country not allowed)', '');
   }
   if (domain.blockCount > 0) {
     lines.push('# Filter Incoming Emails by Domain: blocked sender domains', 'deny    !authenticated = *');
     if (domain.allowCount > 0) lines.push(`        !senders = /${dir}/${LISTS.domainAllow}`);
-    lines.push(`        senders = /${dir}/${LISTS.domainBlock}`, `        message = ${domain.message}`, '        log_message = WHM domain filter', '');
+    lines.push(`        senders = /${dir}/${LISTS.domainBlock}`, `        message = ${domain.message}`, '        log_message = Keel domain filter', '');
   }
   if (greylist.enabled && greylist.backend) {
     const delay = greylist.initialDelayMinutes * 60;
@@ -117,12 +117,12 @@ export function renderAcl({ dir, country, domain, greylist }) {
         'warn    condition = ${if eq{$acl_m_whmgrey}{pass}}',
         `        set acl_m_whmgrey_db = \${lookup sqlite {${db}UPDATE greylist SET last_seen = \${tod_epoch}, passed = 1, count = count + 1 WHERE ${triplet}}{ok}{failed}}`,
         'defer   condition = ${if or{{eq{$acl_m_whmgrey}{new}}{eq{$acl_m_whmgrey}{defer}}{eq{$acl_m_whmgrey}{reset}}}}',
-        `        message = ${greylist.message}`, '        log_message = WHM greylisting', '');
+        `        message = ${greylist.message}`, '        log_message = Keel greylisting', '');
     } else {
       lines.push('# Greylisting (greylistd)', ...skip,
         'defer   condition = ${if eq{$acl_m_whmgrey}{check}}',
         '        condition = ${if eq {${readsocket{/var/run/greylistd/socket}{--grey $sender_host_address $sender_address $local_part@$domain}{5s}{}{}}}{grey}}',
-        `        message = ${greylist.message}`, '        log_message = WHM greylisting (greylistd)', '');
+        `        message = ${greylist.message}`, '        log_message = Keel greylisting (greylistd)', '');
     }
   }
   if (lines.length === 3) lines.push('# No filters are enabled.', '');

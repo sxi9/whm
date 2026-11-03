@@ -35,7 +35,7 @@ export function LoginForm({ title, subtitle, onLogin, footer }) {
   return (
     <div className="login-page">
       <form className="login-card" onSubmit={submit}>
-        <div className="login-brand"><ShieldCheck size={20} /> <span>WHM Hub</span></div>
+        <div className="login-brand"><ShieldCheck size={20} /> <span>Keel Hub</span></div>
         <h1>{title}</h1>
         {subtitle && <p className="muted">{subtitle}</p>}
         <ErrorBanner error={error} />
@@ -72,7 +72,7 @@ export function DeveloperLoginPage() {
   const location = useLocation();
   if (ready && session) return <Navigate to={nextOf(location.search, homeOf(session))} replace />;
   return (
-    <LoginForm title="Developer portal" subtitle="Publish plugins to the WHM Marketplace."
+    <LoginForm title="Developer portal" subtitle="Publish plugins to the Keel Marketplace."
       onLogin={loginDeveloper}
       footer={<p className="muted">No account yet? <Link to="/dev/register">Register as a developer</Link> · <Link to="/dev/password-reset">Forgot password</Link> · <Link to="/login">Vendor portal</Link></p>} />
   );

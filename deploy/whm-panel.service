@@ -1,5 +1,5 @@
 [Unit]
-Description=WHM control panel (API + web interface)
+Description=Keel control panel (API + web interface)
 Documentation=file:///opt/whm/BLUEPRINT.md
 After=network.target whm-agentd.service
 Requires=whm-agentd.service

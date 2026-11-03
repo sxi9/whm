@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WHM control panel installer for systemd-based Linux (Ubuntu/Debian, RHEL/Alma/Rocky).
+# Keel control panel installer for systemd-based Linux (Ubuntu/Debian, RHEL/Alma/Rocky).
 #
 #   sudo bash scripts/install.sh                 # install from this checkout into /opt/whm
 #   sudo bash scripts/install.sh --upgrade       # redeploy code, keep data/config, restart
@@ -59,7 +59,7 @@ die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo)"
 command -v systemctl >/dev/null || die "systemd is required"
 SRC_DIR=$(cd "$(dirname "$0")/.." && pwd)
-[ -f "$SRC_DIR/package.json" ] && [ -d "$SRC_DIR/server" ] || die "run this script from a WHM checkout (scripts/install.sh)"
+[ -f "$SRC_DIR/package.json" ] && [ -d "$SRC_DIR/server" ] || die "run this script from a Keel checkout (scripts/install.sh)"
 if [ "$WITH_HUB" -eq 1 ]; then
   [ -f "$SRC_DIR/hub/package.json" ] && [ -f "$SRC_DIR/hub/src/index.js" ] || die "--with-hub needs the hub/ workspace in this checkout"
 fi
@@ -185,7 +185,7 @@ if [ ! -f "$ETC_DIR/panel.env" ]; then
   if [ -n "${WHM_ADMIN_PASSWORD:-}" ]; then printf 'WHM_ADMIN_PASSWORD=%s\n' "$WHM_ADMIN_PASSWORD" >> "$ETC_DIR/panel.env"; fi
 fi
 
-# License hub for the panel (Basic WebHost Manager Setup > License). Non-interactive via
+# License hub for the panel (Basic Setup > License). Non-interactive via
 # WHM_LICENSE_HUB_URL; --with-hub defaults to the hub installed on this host; otherwise ask
 # once on a terminal. An existing WHM_LICENSE_HUB_URL line in panel.env is never changed.
 if ! grep -q '^WHM_LICENSE_HUB_URL=' "$ETC_DIR/panel.env"; then
@@ -332,7 +332,7 @@ systemctl restart whm-panel
 sleep 2
 if systemctl is-active --quiet whm-panel; then
   IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-  log "WHM is running"
+  log "Keel is running"
   echo
   echo "  URL:       https://${IP:-<server-ip>}:2087/   (HTTP: http://${IP:-<server-ip>}:2086/)"
   echo "  Login:     root"
@@ -345,7 +345,7 @@ if systemctl is-active --quiet whm-panel; then
   echo "  Logs:      journalctl -u whm-panel -u whm-agentd -f"
   echo "  Firewall:  allow TCP 2086 and 2087"
   if grep -q '^WHM_LICENSE_HUB_URL=' "$ETC_DIR/panel.env"; then
-    echo "  License:   hub $(sed -n 's/^WHM_LICENSE_HUB_URL=//p' "$ETC_DIR/panel.env" | head -1) — enter the key under Server Configuration › Basic WebHost Manager Setup › License"
+    echo "  License:   hub $(sed -n 's/^WHM_LICENSE_HUB_URL=//p' "$ETC_DIR/panel.env" | head -1) — enter the key under Server Configuration › Basic Setup › License"
   fi
 else
   die "whm-panel failed to start; see: journalctl -u whm-panel -n 50"

@@ -84,7 +84,7 @@ export function PasswordResetPage() {
   return (
     <div className="login-page">
       <div className="login-card">
-        <div className="login-brand"><ShieldCheck size={20} /> <span>WHM Marketplace</span></div>
+        <div className="login-brand"><ShieldCheck size={20} /> <span>Keel Marketplace</span></div>
         <h1>{token ? 'Choose a new password' : 'Reset your password'}</h1>
         <ErrorBanner error={error} />
         {done && <div className="banner banner-success"><div>{token ? 'Password reset. Sign in with the new password.' : 'If that address exists, a reset link is on its way (valid 15 minutes).'}</div></div>}

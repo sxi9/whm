@@ -28,7 +28,7 @@ export function inspectResolvConf(p = RESOLV_CONF) {
 }
 
 export function renderResolvConf({ nameservers, search = [] }) {
-  const lines = ['# Managed by WHM panel (Resolver Configuration)'];
+  const lines = ['# Managed by Keel (Resolver Configuration)'];
   if (search.length) lines.push(`search ${search.join(' ')}`);
   for (const ns of nameservers) lines.push(`nameserver ${ns}`);
   return lines.join('\n') + '\n';

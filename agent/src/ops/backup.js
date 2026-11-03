@@ -36,8 +36,8 @@ const CREATED_NAME = /^backup-\d{2}\.\d{2}\.\d{4}_\d{2}-\d{2}-\d{2}_[a-z][a-z0-9
 const READ_NAME = /^(backup-\d{2}\.\d{2}\.\d{4}_\d{2}-\d{2}-\d{2}_|cpmove-)?[a-z][a-z0-9_-]{0,31}\.tar(\.gz)?$/;
 
 export const archiveName = z.string().regex(CREATED_NAME, 'Archive name must look like backup-MM.DD.YYYY_HH-MM-SS_<user>.tar.gz');
-export const readableName = z.string().regex(READ_NAME, 'Not a WHM/cPanel account archive name');
-const archivePath = arg.absPath.refine((p) => READ_NAME.test(path.basename(p)), 'Not a WHM/cPanel account archive');
+export const readableName = z.string().regex(READ_NAME, 'Not a cPanel-compatible account archive name');
+const archivePath = arg.absPath.refine((p) => READ_NAME.test(path.basename(p)), 'Not a cPanel-compatible account archive');
 // A path inside the archive: relative, no traversal, no leading dash (argv) and no newline.
 export const relPath = z.string().min(1).max(1024).regex(/^(?![-/])(?!.*(^|\/)\.\.(\/|$))[^\0\n\r]+$/, 'Relative path without ".." segments');
 const dbName = z.string().regex(/^[a-z0-9_]{1,64}$/);
@@ -953,7 +953,7 @@ defineOp('backup.destination.test', {
     const started = Date.now();
     const name = `whm-backup-test-${crypto.randomBytes(6).toString('hex')}.txt`;
     const probe = path.join(tmpDir(ctx), name);
-    fs.writeFileSync(probe, `WHM backup destination test ${new Date().toISOString()}\n`, { mode: 0o600 });
+    fs.writeFileSync(probe, `Keel backup destination test ${new Date().toISOString()}\n`, { mode: 0o600 });
     try {
       if (config.kind === 'local') {
         const dir = ctx.assertAllowedPath(config.dir, 'write');

@@ -409,7 +409,7 @@ describe('Server Contacts API', () => {
     expect(session.commands).toContain('MAIL FROM:<alerts@panel.example.com>');
     expect(session.commands).toContain('RCPT TO:<ops@example.com>');
     expect(session.data).toMatch(/^From: alerts@panel\.example\.com\n/);
-    expect(session.data).toContain('Subject: [panel.example.com] Test notification from WHM on panel.example.com');
+    expect(session.data).toContain('Subject: [panel.example.com] Test notification from Keel on panel.example.com');
     expect(session.data).toContain('This is a test message for the email contact "Ops"');
     expect(auditRows('contacts.test').at(-1).target).toBe('ops@example.com');
 

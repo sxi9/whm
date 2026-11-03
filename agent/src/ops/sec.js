@@ -12,7 +12,10 @@ import { defineOp, arg, OpError } from './registry.js';
 // is atomic, backed up and, where a validator exists (sshd -t, apachectl -t),
 // rolled back when the validator rejects it.
 
-const MANAGED = '# Managed by WHM panel';
+const MANAGED = '# Managed by Keel';
+// Files written before the rename start with the old marker.
+const LEGACY_MANAGED = '# Managed by WHM panel';
+const isManaged = (text) => text.startsWith(MANAGED) || text.startsWith(LEGACY_MANAGED);
 
 // ---------------------------------------------------------------- helpers ---
 
@@ -149,7 +152,7 @@ export function renderHostsAllow(rules) {
 // rules; a distro or hand-written deny file keeps applying and is reported as such.
 export function hostsDenyManaged(text) {
   if (text == null) return true;
-  if (text.startsWith(MANAGED)) return true;
+  if (isManaged(text)) return true;
   return !text.split('\n').some((l) => l.trim() && !l.trim().startsWith('#'));
 }
 

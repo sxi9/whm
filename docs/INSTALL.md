@@ -1,6 +1,6 @@
-# WHM — Installation guide
+# Keel — Installation guide
 
-This guide covers installing, upgrading, backing up and removing the WHM control panel (the
+This guide covers installing, upgrading, backing up and removing the Keel control panel (the
 panel + its root agent) and the optional **whm-hub** (license server + plugin marketplace).
 Every path, flag, port and variable below is taken from the code in this repository:
 [`scripts/install.sh`](../scripts/install.sh), [`server/src/config.js`](../server/src/config.js),
@@ -59,7 +59,7 @@ Related documents: [`README.md`](../README.md) (overview), [`BLUEPRINT.md`](../B
 
 | Component | Code | Runs as | What it is |
 |---|---|---|---|
-| **Panel** (`whm-panel`) | `server/` (Express API, services, SQLite) + `client/` (React SPA built to `client/dist`) | `whmpanel` (unprivileged) in production | The WHM web interface and its API: 30 categories, 212 functions, sessions, RBAC, audit log, jobs, scheduler, plugin host, license client and marketplace client. Keeps its own state in `whm.db` (SQLite, WAL) under the data directory. |
+| **Panel** (`whm-panel`) | `server/` (Express API, services, SQLite) + `client/` (React SPA built to `client/dist`) | `whmpanel` (unprivileged) in production | The Keel web interface and its API: 30 categories, 212 functions, sessions, RBAC, audit log, jobs, scheduler, plugin host, license client and marketplace client. Keeps its own state in `whm.db` (SQLite, WAL) under the data directory. |
 | **Agent** (`whm-agentd`) | `agent/` | root | A small daemon listening on a Unix socket (`/run/whm-agent.sock`) that executes an **allowlisted catalog of named operations** (create a Linux user, write a vhost, reload BIND, …). It only ever runs programs with `execFile(bin, argv[])`; there is deliberately no "run this command" op. |
 | **Hub** (`whm-hub`, optional) | `hub/` (API) + `hub/ui/` (vendor-admin, reseller and developer portal) | `whmhub` | The **license server** (keys, activations, check-ins, trials, resellers, billing webhooks) and the **plugin marketplace** (developer verification, signed packages, catalog, revocations, entitlements). Only a vendor who resells the panel runs one; panels only *pull* from it, so a hub outage never affects a running panel. |
 
@@ -351,8 +351,8 @@ means the socket could not be opened (see [§8](#8-troubleshooting)).
    Then delete `initial-admin-password.txt`.
 4. Enrol TOTP under *Security Center › Two-Factor Authentication* (required once
    `security.2fa.required_for_root` is enabled there).
-5. If a hub was configured, enter the license key under *Server Configuration › Basic WebHost Manager
-   Setup › License* ([§5.5](#55-connecting-a-panel-to-the-hub)).
+5. If a hub was configured, enter the license key under *Server Configuration › Basic Setup ›
+   License* ([§5.5](#55-connecting-a-panel-to-the-hub)).
 
 Lost password later: `sudo node /opt/whm/scripts/whm-cli.js reset-password root` (prompts when the
 password is omitted). Other commands: `create-admin <user> [pw]`, `list-users`, `unlock-ip <ip>`
@@ -491,7 +491,7 @@ From the portal: *Admin › Licenses* (`/admin/licenses`; API `POST /v1/admin/li
 3. **Pin the license key** in the panel release (`server/src/services/license-keys.json`) or with
    `WHM_LICENSE_KEYS_FILE=/etc/whm/license-keys.json` ([§5.2](#52-keys-what-gen-keyjs-generates-and-what-to-pin-where)).
    Without a usable key the panel logs `no usable license keys are pinned; activation is impossible`.
-4. **Restart** `whm-panel`, then open *Server Configuration › Basic WebHost Manager Setup › License*
+4. **Restart** `whm-panel`, then open *Server Configuration › Basic Setup › License*
    (`/server-configuration/basic-webhost-manager-setup#license`). The tab shows the status, hub, edition,
    limits and features, and offers:
    - **Activate with a license key** — enter `WHM-XXXX-XXXX-XXXX-XXXX` (`POST /api/license/key`). If the
@@ -513,7 +513,7 @@ From the portal: *Admin › Licenses* (`/admin/licenses`; API `POST /v1/admin/li
 
 The marketplace is a separate switch: enable the `whm-hub` row under *Market › Market Provider
 Manager* (it holds no key; it answers `hub_mismatch` if its origin differs from the license hub), then
-install plugins from *cPanel › Manage Plugins › Marketplace* or *Server Configuration › WHM Marketplace*.
+install plugins from *Panel › Manage Plugins › Marketplace* or *Server Configuration › Marketplace*.
 
 Development hub next to a development panel:
 
@@ -884,7 +884,7 @@ default from [§5.6](#56-hubconf-reference). Booleans accept `1`, `true`, `yes`.
   the hub rotated to a key this panel does not pin; ship the key and check in again.
 - `423 license_degraded` on every change — the license lapsed, was revoked, the fingerprint drifted,
   or the token cannot be verified; the panel is read-only until a valid key is activated
-  (*Basic WebHost Manager Setup › License*). Set `WHM_LICENSE_ENFORCE=false` only on a panel that is
+  (*Basic Setup › License*). Set `WHM_LICENSE_ENFORCE=false` only on a panel that is
   not resold.
 
 **Hub**

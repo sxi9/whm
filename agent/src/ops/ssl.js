@@ -12,7 +12,10 @@ import { defineOp, arg, OpError, ensurePrivateDir } from './registry.js';
 // certbot or acme.sh, and the TLS policy includes (protocols/ciphers/HSTS).
 // PEM material only ever travels through stdin or files, never argv.
 
-const MANAGED = '# Managed by WHM panel';
+const MANAGED = '# Managed by Keel';
+// Files written before the rename start with the old marker.
+const LEGACY_MANAGED = '# Managed by WHM panel';
+const isManaged = (text) => text.startsWith(MANAGED) || text.startsWith(LEGACY_MANAGED);
 const BUNDLE_ROOT = '/etc/ssl/whm';
 const SERVICE_ROOT = `${BUNDLE_ROOT}/service`;
 const TMP_ROOT = '/tmp/whm';
@@ -297,34 +300,39 @@ export function eximLayout({ debianDir = '/etc/exim4', rhelDir = '/etc/exim' } =
 
 // Managed blocks let several panel features share exim4.conf.localmacros with
 // whatever the admin wrote there; the markers differ from the Email category's.
-const eximBlockMarkers = (name) => ({ begin: `# BEGIN WHM panel (SSL/TLS: ${name}) - managed block, edits inside are overwritten`, end: `# END WHM panel (SSL/TLS: ${name})` });
+const eximBlockMarkers = (name) => ({ begin: `# BEGIN Keel (SSL/TLS: ${name}) - managed block, edits inside are overwritten`, end: `# END Keel (SSL/TLS: ${name})` });
+// Blocks written before the rename carry the old markers; both are recognised.
+const legacyEximBlockMarkers = (name) => ({ begin: `# BEGIN WHM panel (SSL/TLS: ${name}) - managed block, edits inside are overwritten`, end: `# END WHM panel (SSL/TLS: ${name})` });
+function findEximBlock(text, name) {
+  for (const { begin, end } of [eximBlockMarkers(name), legacyEximBlockMarkers(name)]) {
+    const start = text.indexOf(begin);
+    const stop = text.indexOf(end);
+    if (start !== -1 && stop !== -1 && stop >= start) return { start, stop, beginLength: begin.length, endLength: end.length };
+  }
+  return null;
+}
 
 export function mergeEximBlock(previous, name, content) {
   const { begin, end } = eximBlockMarkers(name);
   const block = `${begin}\n${String(content).trimEnd()}\n${end}\n`;
   const text = previous || '';
-  const start = text.indexOf(begin);
-  const stop = text.indexOf(end);
-  if (start !== -1 && stop !== -1 && stop >= start) return `${text.slice(0, start)}${block}${text.slice(stop + end.length).replace(/^\n/, '')}`;
+  const found = findEximBlock(text, name);
+  if (found) return `${text.slice(0, found.start)}${block}${text.slice(found.stop + found.endLength).replace(/^\n/, '')}`;
   return `${text.length && !text.endsWith('\n') ? `${text}\n` : text}${block}`;
 }
 
 export function readEximBlock(text, name) {
-  const { begin, end } = eximBlockMarkers(name);
   const t = text || '';
-  const start = t.indexOf(begin);
-  const stop = t.indexOf(end);
-  if (start === -1 || stop === -1 || stop < start) return null;
-  return t.slice(start + begin.length, stop).replace(/^\n/, '');
+  const found = findEximBlock(t, name);
+  if (!found) return null;
+  return t.slice(found.start + found.beginLength, found.stop).replace(/^\n/, '');
 }
 
 export function stripEximBlock(text, name) {
-  const { begin, end } = eximBlockMarkers(name);
   const t = text || '';
-  const start = t.indexOf(begin);
-  const stop = t.indexOf(end);
-  if (start === -1 || stop === -1 || stop < start) return t;
-  return `${t.slice(0, start)}${t.slice(stop + end.length).replace(/^\n/, '')}`;
+  const found = findEximBlock(t, name);
+  if (!found) return t;
+  return `${t.slice(0, found.start)}${t.slice(found.stop + found.endLength).replace(/^\n/, '')}`;
 }
 
 // Resolves the first existing group of `names` from /etc/group.
@@ -400,7 +408,7 @@ function removeManagedFiles(files, ctx) {
   for (const f of files) {
     const target = ctx.assertAllowedPath(f, 'write');
     const text = readText(target);
-    if (text == null || !text.startsWith(MANAGED)) continue;
+    if (text == null || !isManaged(text)) continue;
     fs.unlinkSync(target);
     removed.push(target);
   }
@@ -880,7 +888,7 @@ async function removeEximTlsFragment(exim, ctx) {
     const written = await writeEximInclude(exim, file, stripEximBlock(previous, exim.tlsBlock));
     return { ...written, removed: true };
   }
-  if (!previous.startsWith(MANAGED)) return { path: file, removed: false, validated: false };
+  if (!isManaged(previous)) return { path: file, removed: false, validated: false };
   fs.unlinkSync(file);
   if (exim.validate) {
     const [bin, argv] = exim.validate;

@@ -1,5 +1,5 @@
 [Unit]
-Description=WHM hub (license server + plugin marketplace)
+Description=Keel hub (license server + plugin marketplace)
 Documentation=file:///opt/whm/BLUEPRINT.md
 After=network.target
 

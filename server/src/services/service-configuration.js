@@ -42,7 +42,7 @@ export const DEFAULTS = {
 export const FTP_SERVERS = ['pure-ftpd', 'proftpd', 'vsftpd', 'disabled'];
 export const DNS_SERVERS = ['bind', 'powerdns', 'disabled'];
 export const SSL_SERVICES = ['exim', 'dovecot', 'apache', 'ftp', 'panel'];
-const MANAGED = '# Managed by WHM panel';
+const MANAGED = '# Managed by Keel';
 // Apache writes per-domain logs as root, so they live in a root-owned tree the
 // account can only read; /home/<user>/logs keeps the PHP-FPM error log the pool
 // writes as the account.
@@ -169,19 +169,19 @@ export function renderEximRcptAcl(s, support = { spf: true, dkim: true }, layout
   const unauth = ['        !authenticated = *', '        !hosts = : 127.0.0.1 : ::1'];
   if (s.dictionaryAttackProtection) {
     lines.push('# Dictionary attack protection: slow down and then drop clients that keep guessing recipients',
-      `drop    condition = \${if > {$rcpt_fail_count}{${s.rcptFailLimit}}}`, '        message = Too many invalid recipients from your host', `        delay = ${s.rcptFailDelay}s`, '        log_message = WHM dictionary attack protection ($rcpt_fail_count failed recipients)',
+      `drop    condition = \${if > {$rcpt_fail_count}{${s.rcptFailLimit}}}`, '        message = Too many invalid recipients from your host', `        delay = ${s.rcptFailDelay}s`, '        log_message = Keel dictionary attack protection ($rcpt_fail_count failed recipients)',
       `warn    condition = \${if > {$rcpt_fail_count}{${Math.max(1, Math.floor(s.rcptFailLimit / 2))}}}`, `        delay = ${Math.max(1, Math.floor(s.rcptFailDelay / 2))}s`, '');
   }
-  if (s.requireHelo) lines.push('# HELO/EHLO must precede MAIL FROM', 'deny', ...unauth, '        condition = ${if def:sender_helo_name{no}{yes}}', '        message = HELO/EHLO is required before MAIL FROM', '        log_message = WHM no HELO', '');
-  if (s.rblEnabled && s.rbls.length) lines.push('# Realtime blackhole lists', 'deny', ...unauth, `        dnslists = ${s.rbls.join(' : ')}`, '        message = Rejected: $sender_host_address is listed at $dnslist_domain ($dnslist_text)', '        log_message = WHM RBL $dnslist_domain', '');
-  if (s.domainRblEnabled && s.domainRbls.length) lines.push('# Domain blackhole lists', 'deny', ...unauth, `        dnslists = ${s.domainRbls.map((d) => `${d}/$sender_address_domain`).join(' : ')}`, '        message = Rejected: sender domain is listed at $dnslist_domain', '        log_message = WHM domain RBL $dnslist_domain', '');
-  if (s.reverseDnsRequired) lines.push('# Require a reverse DNS entry for the sending host', 'deny', ...unauth, '        !verify = reverse_host_lookup', '        message = Your host has no reverse DNS (PTR) record', '        log_message = WHM no reverse DNS', '');
-  if (s.verifySender) lines.push('# Sender address must be routable', 'deny', ...unauth, '        !verify = sender', '        message = Sender verification failed', '        log_message = WHM sender verify failed', '');
+  if (s.requireHelo) lines.push('# HELO/EHLO must precede MAIL FROM', 'deny', ...unauth, '        condition = ${if def:sender_helo_name{no}{yes}}', '        message = HELO/EHLO is required before MAIL FROM', '        log_message = Keel no HELO', '');
+  if (s.rblEnabled && s.rbls.length) lines.push('# Realtime blackhole lists', 'deny', ...unauth, `        dnslists = ${s.rbls.join(' : ')}`, '        message = Rejected: $sender_host_address is listed at $dnslist_domain ($dnslist_text)', '        log_message = Keel RBL $dnslist_domain', '');
+  if (s.domainRblEnabled && s.domainRbls.length) lines.push('# Domain blackhole lists', 'deny', ...unauth, `        dnslists = ${s.domainRbls.map((d) => `${d}/$sender_address_domain`).join(' : ')}`, '        message = Rejected: sender domain is listed at $dnslist_domain', '        log_message = Keel domain RBL $dnslist_domain', '');
+  if (s.reverseDnsRequired) lines.push('# Require a reverse DNS entry for the sending host', 'deny', ...unauth, '        !verify = reverse_host_lookup', '        message = Your host has no reverse DNS (PTR) record', '        log_message = Keel no reverse DNS', '');
+  if (s.verifySender) lines.push('# Sender address must be routable', 'deny', ...unauth, '        !verify = sender', '        message = Sender verification failed', '        log_message = Keel sender verify failed', '');
   if (s.spfVerify && !support.spf) lines.push('# SPF verification is enabled in the panel but this Exim build has no SPF support (exim4-daemon-light);', '# the spf conditions are left out so the configuration stays valid. Install exim4-daemon-heavy to enforce SPF.', '');
   else if (s.spfVerify) {
     lines.push('# SPF' + (s.spfReject ? ': reject on fail, tag softfail' : ': verify only, fail/softfail are tagged and logged'));
-    if (s.spfReject) lines.push('deny', ...unauth, '        spf = fail', '        message = SPF check failed: $spf_smtp_comment', '        log_message = WHM SPF fail');
-    lines.push('warn', ...unauth, `        spf = ${s.spfReject ? 'softfail' : 'fail : softfail'}`, '        add_header = $spf_received', '        log_message = WHM SPF $spf_result', '');
+    if (s.spfReject) lines.push('deny', ...unauth, '        spf = fail', '        message = SPF check failed: $spf_smtp_comment', '        log_message = Keel SPF fail');
+    lines.push('warn', ...unauth, `        spf = ${s.spfReject ? 'softfail' : 'fail : softfail'}`, '        add_header = $spf_received', '        log_message = Keel SPF $spf_result', '');
   }
   if (lines.length === 1) lines.push('# No RCPT protections are enabled.');
   lines.push('# Email filters (country / domain blocks, greylisting) are written by the Email category into this file:', `.include_if_exists ${emailAcl}`);
@@ -195,8 +195,8 @@ export function renderEximDataAcl(s, support = { spf: true, dkim: true }) {
   if (s.dkimVerify && !support.dkim) lines.push('# DKIM verification is enabled in the panel but this Exim build has no DKIM support; the dkim conditions are left out.');
   else if (s.dkimVerify) {
     lines.push('# DKIM verification results', 'warn    dkim_status = pass', '        add_header = :at_start:X-WHM-DKIM: pass (signers $dkim_signers)',
-      'warn    dkim_status = fail', '        add_header = :at_start:X-WHM-DKIM: fail (signers $dkim_signers)', '        log_message = WHM DKIM fail for $dkim_signers');
-    if (s.dkimReject) lines.push('deny    !authenticated = *', '        dkim_status = fail', '        message = DKIM signature verification failed for $dkim_signers', '        log_message = WHM DKIM reject');
+      'warn    dkim_status = fail', '        add_header = :at_start:X-WHM-DKIM: fail (signers $dkim_signers)', '        log_message = Keel DKIM fail for $dkim_signers');
+    if (s.dkimReject) lines.push('deny    !authenticated = *', '        dkim_status = fail', '        message = DKIM signature verification failed for $dkim_signers', '        log_message = Keel DKIM reject');
   } else lines.push('# DKIM verification is disabled.');
   return `${lines.join('\n')}\n`;
 }
@@ -1006,7 +1006,7 @@ export function createServiceConfigService(ctx) {
         const files = await op('ssl.service_cert.status').catch(() => ({}));
         rows = SSL_SERVICES.map((service) => ({ service, ...(files[service] || { daemonPresent: null, hasCertificate: false, certificate: null }), stored: null, daysRemaining: files[service]?.certificate?.daysRemaining ?? null }));
       }
-      const labels = { exim: 'Exim (SMTP)', dovecot: 'Dovecot (IMAP/POP3)', apache: 'Apache (default SSL vhost)', ftp: 'FTP server', panel: 'WHM panel (2087)' };
+      const labels = { exim: 'Exim (SMTP)', dovecot: 'Dovecot (IMAP/POP3)', apache: 'Apache (default SSL vhost)', ftp: 'FTP server', panel: 'Keel panel (2087)' };
       return { openssl: capabilities.has('ssl'), sslCategory: Boolean(ctx.ssl), hostname: hostname(), services: rows.map((r) => ({ ...r, label: labels[r.service] || r.service, selfSigned: r.certificate?.selfSigned ?? null, expired: r.certificate?.expired ?? null, notAfter: r.certificate?.notAfter ?? r.stored?.notAfter ?? null, subject: r.certificate?.subjectText ?? null, issuer: r.certificate?.issuerText ?? null })) };
     },
     async install(service, pems, req) {
@@ -1025,7 +1025,7 @@ export function createServiceConfigService(ctx) {
       const host = hostname().toLowerCase();
       const labels = host.split('.');
       const sans = [...new Set([host, `www.${host}`, ...(labels.length >= 3 ? [`mail.${labels.slice(1).join('.')}`] : [])].filter((n) => /^[a-z0-9.-]+$/.test(n)))];
-      const generated = await op('ssl.selfsigned.generate', { key: { type: 'rsa', bits: 2048 }, subject: { CN: host, O: 'WHM panel' }, sans, days }, req);
+      const generated = await op('ssl.selfsigned.generate', { key: { type: 'rsa', bits: 2048 }, subject: { CN: host, O: 'Keel' }, sans, days }, req);
       const result = await certs.install(service, { certPem: generated.certPem, keyPem: generated.keyPem }, req);
       audit(req, { action: 'service_ssl.reset_self_signed', target: service, args: { days, host } });
       return { ...result, selfSigned: true, days };

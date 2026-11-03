@@ -336,13 +336,18 @@ describe('Exim layout detection', () => {
     expect(readEximBlock(once, 'TLS policy')).toBe('tls_require_ciphers = NORMAL\n');
     expect(readEximBlock(once, 'STARTTLS')).toBeNull();
     const twice = mergeEximBlock(mergeEximBlock(once, 'STARTTLS', '.ifndef MAIN_TLS_ENABLE\nMAIN_TLS_ENABLE = true\n.endif'), 'TLS policy', 'tls_require_ciphers = SECURE256\n');
-    expect(twice.match(/BEGIN WHM panel \(SSL\/TLS: TLS policy\)/g)).toHaveLength(1);
+    expect(twice.match(/BEGIN Keel \(SSL\/TLS: TLS policy\)/g)).toHaveLength(1);
     expect(readEximBlock(twice, 'TLS policy')).toBe('tls_require_ciphers = SECURE256\n');
     expect(readEximBlock(twice, 'STARTTLS')).toBe('.ifndef MAIN_TLS_ENABLE\nMAIN_TLS_ENABLE = true\n.endif\n');
     expect(twice).toContain('CHECK_RCPT_LOCAL_ACL_FILE = /etc/exim4/whm/acl_rcpt.conf');
     expect(twice.startsWith('MAIN_TLS_ENABLE = true\n')).toBe(true);
-    expect(mergeEximBlock(null, 'STARTTLS', 'MAIN_TLS_ENABLE = true')).toBe('# BEGIN WHM panel (SSL/TLS: STARTTLS) - managed block, edits inside are overwritten\nMAIN_TLS_ENABLE = true\n# END WHM panel (SSL/TLS: STARTTLS)\n');
+    expect(mergeEximBlock(null, 'STARTTLS', 'MAIN_TLS_ENABLE = true')).toBe('# BEGIN Keel (SSL/TLS: STARTTLS) - managed block, edits inside are overwritten\nMAIN_TLS_ENABLE = true\n# END Keel (SSL/TLS: STARTTLS)\n');
     expect(mergeEximBlock('no trailing newline', 'STARTTLS', 'x')).toMatch(/^no trailing newline\n# BEGIN/);
+    // A block written under the pre-rename markers is replaced, not duplicated.
+    const legacy = 'A = 1\n# BEGIN WHM panel (SSL/TLS: STARTTLS) - managed block, edits inside are overwritten\nold = 1\n# END WHM panel (SSL/TLS: STARTTLS)\nB = 2\n';
+    expect(readEximBlock(legacy, 'STARTTLS')).toBe('old = 1\n');
+    expect(mergeEximBlock(legacy, 'STARTTLS', 'new = 1')).toBe('A = 1\n# BEGIN Keel (SSL/TLS: STARTTLS) - managed block, edits inside are overwritten\nnew = 1\n# END Keel (SSL/TLS: STARTTLS)\nB = 2\n');
+    expect(stripEximBlock(legacy, 'STARTTLS')).toBe('A = 1\nB = 2\n');
     // Stripping one block leaves everything else byte for byte.
     const stripped = stripEximBlock(twice, 'TLS policy');
     expect(readEximBlock(stripped, 'TLS policy')).toBeNull();

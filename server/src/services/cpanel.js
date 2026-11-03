@@ -442,9 +442,9 @@ export function createCpanelService(ctx) {
       } finally { fs.closeSync(fd); }
     } catch { return null; }
   };
-  // The installer prints "==> WHM is running" when done and "error: ..." when it
+  // The installer prints "==> Keel is running" (older releases: "WHM is running") when done and "error: ..." when it
   // dies; a transient unit that is gone without either is not a success.
-  const logOutcome = (log) => (/WHM is running/.test(log || '') ? 'succeeded' : /(^|\n)(\x1b\[[0-9;]*m)?error:/.test(log || '') ? 'failed' : null);
+  const logOutcome = (log) => (/(?:Keel|WHM) is running/.test(log || '') ? 'succeeded' : /(^|\n)(\x1b\[[0-9;]*m)?error:/.test(log || '') ? 'failed' : null);
   const unitOutcome = (st, log) => {
     if (!st) return null;
     if (st.installed && st.state === 'failed') return 'failed';

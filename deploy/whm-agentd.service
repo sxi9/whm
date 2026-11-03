@@ -1,5 +1,5 @@
 [Unit]
-Description=WHM privileged agent (allowlisted system operations over a Unix socket)
+Description=Keel privileged agent (allowlisted system operations over a Unix socket)
 Documentation=file:///opt/whm/BLUEPRINT.md
 After=network.target
 

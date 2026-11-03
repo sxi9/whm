@@ -184,9 +184,9 @@ const persistedAddress = z.object({ address: arg.ip, prefix: bindPrefix, iface, 
 
 export function renderUnit(addresses, ipBin = '/sbin/ip') {
   const lines = [
-    '# Managed by WHM panel (IP Functions). Edit through the panel; manual changes are overwritten.',
+    '# Managed by Keel (IP Functions). Edit through the panel; manual changes are overwritten.',
     '[Unit]',
-    'Description=WHM panel: re-add managed IP addresses at boot',
+    'Description=Keel: re-add managed IP addresses at boot',
     'After=network.target',
     'Before=network-online.target',
     '',

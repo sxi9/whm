@@ -118,7 +118,7 @@ export function updateHostsFile(text, { ip, hostname, previous = null, ipv6 = nu
 // Where /etc/resolv.conf comes from decides where the panel must write.
 export function detectResolverManager(text) {
   const t = String(text ?? '');
-  if (/Managed by WHM panel/i.test(t)) return 'whm';
+  if (/Managed by (?:Keel|WHM panel)/i.test(t)) return 'whm';
   if (/127\.0\.0\.53|stub-resolv\.conf|systemd-resolved/i.test(t)) return 'systemd-resolved';
   if (/NetworkManager/i.test(t)) return 'networkmanager';
   if (/resolvconf/i.test(t)) return 'resolvconf';
@@ -143,7 +143,7 @@ export function parseResolvConf(text) {
 }
 
 export function renderResolvedDropIn({ nameservers, search = [] }) {
-  const lines = ['# Managed by WHM panel (Resolver Configuration); edit there, not here.', '[Resolve]', `DNS=${nameservers.join(' ')}`];
+  const lines = ['# Managed by Keel (Resolver Configuration); edit there, not here.', '[Resolve]', `DNS=${nameservers.join(' ')}`];
   if (search.length) lines.push(`Domains=${search.join(' ')}`);
   return lines.join('\n') + '\n';
 }

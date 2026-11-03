@@ -221,7 +221,7 @@ export const ADAPTERS = {
   // the key's display prefix, from io.licensePrefix(), is sent).
   hub: {
     id: 'hub',
-    label: 'WHM plugin marketplace hub',
+    label: 'Keel plugin marketplace hub',
     types: ['plugin'],
     singleton: true,
     configFields: [],

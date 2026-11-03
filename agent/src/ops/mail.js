@@ -12,7 +12,10 @@ export { parseUpdateExim4Conf };
 // back when Exim rejects them), SpamAssassin daemon options, DKIM key install,
 // and mailbox maintenance (permissions, doveadm conversion).
 
-const MANAGED = '# Managed by WHM panel';
+const MANAGED = '# Managed by Keel';
+// Files written before the rename carry the old marker; both are recognised.
+const LEGACY_MANAGED = '# Managed by WHM panel';
+const isManaged = (text) => text.includes(MANAGED) || text.includes(LEGACY_MANAGED);
 
 // ---------------------------------------------------------------- helpers ---
 
@@ -465,7 +468,7 @@ defineOp('mail.sendmail', {
   }).strict(),
   run: async ({ from, to, subject, text, headers = {} }) => {
     const layout = requireExim();
-    const lines = [`From: ${from}`, `To: ${to.join(', ')}`, `Subject: ${subject}`, `Date: ${new Date().toUTCString()}`, 'MIME-Version: 1.0', 'Content-Type: text/plain; charset=utf-8', 'X-Mailer: WHM panel'];
+    const lines = [`From: ${from}`, `To: ${to.join(', ')}`, `Subject: ${subject}`, `Date: ${new Date().toUTCString()}`, 'MIME-Version: 1.0', 'Content-Type: text/plain; charset=utf-8', 'X-Mailer: Keel'];
     for (const [k, v] of Object.entries(headers)) if (!/^(from|to|subject|date|content-type|mime-version)$/i.test(k)) lines.push(`${k}: ${v}`);
     const message = `${lines.join('\r\n')}\r\n\r\n${text.replace(/\r?\n/g, '\r\n')}\r\n`;
     const { code, stdout, stderr } = await exec(layout.bin, ['-i', '-f', from, '--', ...to], { input: message, allowFailure: true, timeoutMs: 120_000 });
@@ -488,8 +491,18 @@ async function regenerateDebianConfig(layout) {
   return { ok: code === 0, output: `${stdout}${stderr}`.trim() };
 }
 
-const BLOCK_BEGIN = '# BEGIN WHM panel (Email filters) - managed block, edits inside are overwritten';
-const BLOCK_END = '# END WHM panel (Email filters)';
+const BLOCK_BEGIN = '# BEGIN Keel (Email filters) - managed block, edits inside are overwritten';
+const BLOCK_END = '# END Keel (Email filters)';
+const LEGACY_BLOCK = { begin: '# BEGIN WHM panel (Email filters) - managed block, edits inside are overwritten', end: '# END WHM panel (Email filters)' };
+// Locates the managed block under the current or the pre-rename markers.
+function findManagedBlock(text) {
+  for (const m of [{ begin: BLOCK_BEGIN, end: BLOCK_END }, LEGACY_BLOCK]) {
+    const start = text.indexOf(m.begin);
+    const end = text.indexOf(m.end);
+    if (start !== -1 && end !== -1 && end >= start) return { start, end, endLength: m.end.length };
+  }
+  return null;
+}
 
 // Exim string expansions the stock Debian remote_smtp transport signs with
 // (DKIM_* macros) and that a RHEL transport can .include as dkim_* options.
@@ -559,10 +572,9 @@ export function renderTransportFragment(layout, outbound) {
 // greylist state (routing lists), the ACL ownership or the outbound address
 // keeps those lines as they are.
 export function readManagedBlock(text) {
-  const start = (text || '').indexOf(BLOCK_BEGIN);
-  const end = (text || '').indexOf(BLOCK_END);
-  if (start === -1 || end === -1 || end < start) return { present: false, sqliteDbfile: null, aclMacro: null, outbound: null };
-  const body = text.slice(start, end);
+  const found = findManagedBlock(text || '');
+  if (!found) return { present: false, sqliteDbfile: null, aclMacro: null, outbound: null };
+  const body = text.slice(found.start, found.end);
   const iface = body.match(/^REMOTE_SMTP_INTERFACE = <; (.+)$/m)?.[1];
   const ips = iface ? iface.split(';').map((s) => s.trim()).filter(Boolean) : [];
   return {
@@ -577,11 +589,10 @@ export function readManagedBlock(text) {
 // around it.
 export function mergeManagedBlock(previous, block) {
   const text = previous || '';
-  const start = text.indexOf(BLOCK_BEGIN);
-  const end = text.indexOf(BLOCK_END);
-  if (start !== -1 && end !== -1 && end >= start) {
-    const before = text.slice(0, start);
-    const after = text.slice(end + BLOCK_END.length).replace(/^\n/, '');
+  const found = findManagedBlock(text);
+  if (found) {
+    const before = text.slice(0, found.start);
+    const after = text.slice(found.end + found.endLength).replace(/^\n/, '');
     return `${before}${block}\n${after}`;
   }
   const body = text.replace(/\s+$/, '');
@@ -759,10 +770,10 @@ defineOp('mail.config.include.write', {
       ctx.assertAllowedPath(target, 'write');
       const previousBlockFile = readText(target);
       const wanted = layout.includeMode === 'debian-macro' ? mergeManagedBlock(previousBlockFile, block) : `${MANAGED} (Email filters). Main-section options; .include this file from the main section of exim.conf.\n${block}\n`;
-      if (previousBlockFile !== wanted) { writeAtomic(target, wanted); rollback.push(() => restore(target, previousBlockFile)); hookAdded = previousBlockFile == null || !previousBlockFile.includes(BLOCK_BEGIN); }
+      if (previousBlockFile !== wanted) { writeAtomic(target, wanted); rollback.push(() => restore(target, previousBlockFile)); hookAdded = previousBlockFile == null || !findManagedBlock(previousBlockFile); }
       // Earlier panel versions wrote the macro to conf.d/main, which only an
       // unsplit layout ignores and a split one would now define twice.
-      if (layout.legacyMacroFile && exists(layout.legacyMacroFile) && (readText(layout.legacyMacroFile) || '').includes(MANAGED)) {
+      if (layout.legacyMacroFile && exists(layout.legacyMacroFile) && isManaged(readText(layout.legacyMacroFile) || '')) {
         ctx.assertAllowedPath(layout.legacyMacroFile, 'write');
         const legacy = readText(layout.legacyMacroFile);
         fs.unlinkSync(layout.legacyMacroFile);
@@ -770,7 +781,7 @@ defineOp('mail.config.include.write', {
       }
       // ... and the filters ACL under its old name (acl_rcpt.conf), which the
       // ACL chain never includes.
-      if (layout.legacyAclFile && layout.legacyAclFile !== layout.aclFile && exists(layout.legacyAclFile) && (readText(layout.legacyAclFile) || '').includes(MANAGED)) {
+      if (layout.legacyAclFile && layout.legacyAclFile !== layout.aclFile && exists(layout.legacyAclFile) && isManaged(readText(layout.legacyAclFile) || '')) {
         ctx.assertAllowedPath(layout.legacyAclFile, 'write');
         const legacy = readText(layout.legacyAclFile);
         fs.unlinkSync(layout.legacyAclFile);
@@ -1111,7 +1122,7 @@ export function parseSpamdDefaults(text) {
   const out = { enabled: null, cron: null, options: '', other: [] };
   for (const raw of (text || '').split('\n')) {
     const line = raw.trim();
-    if (!line || line.startsWith(MANAGED)) continue;
+    if (!line || line.startsWith(MANAGED) || line.startsWith(LEGACY_MANAGED)) continue;
     if (line.startsWith('#')) { out.other.push(raw); continue; }
     const m = line.match(/^(?:export\s+)?([A-Z_]+)=(.*)$/);
     if (!m) { out.other.push(raw); continue; }

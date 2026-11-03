@@ -70,8 +70,8 @@ describe('resolver op catalog', () => {
 
 describe('resolver helpers', () => {
   it('renders a panel-managed resolv.conf', () => {
-    expect(renderResolvConf({ nameservers: ['1.1.1.1', '1.0.0.1'], search: ['example.com'] })).toBe('# Managed by WHM panel (Resolver Configuration)\nsearch example.com\nnameserver 1.1.1.1\nnameserver 1.0.0.1\n');
-    expect(renderResolvConf({ nameservers: ['9.9.9.9'] })).toBe('# Managed by WHM panel (Resolver Configuration)\nnameserver 9.9.9.9\n');
+    expect(renderResolvConf({ nameservers: ['1.1.1.1', '1.0.0.1'], search: ['example.com'] })).toBe('# Managed by Keel (Resolver Configuration)\nsearch example.com\nnameserver 1.1.1.1\nnameserver 1.0.0.1\n');
+    expect(renderResolvConf({ nameservers: ['9.9.9.9'] })).toBe('# Managed by Keel (Resolver Configuration)\nnameserver 9.9.9.9\n');
   });
 
   it('tells a regular file, a systemd-resolved stub symlink and a missing file apart', () => {

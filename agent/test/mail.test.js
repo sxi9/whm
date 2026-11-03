@@ -335,12 +335,18 @@ describe('pure parsers and renderers', () => {
     expect(renderTransportFragment(rhel, { ipv4: '203.0.113.5', ipv6: '2001:db8::1' })).toContain('\ninterface = <; 203.0.113.5 ; 2001:db8::1\n');
     expect(renderTransportFragment(rhel, null)).not.toContain('interface =');
     const merged = mergeManagedBlock('MAIN_TLS_ENABLE = yes\n', block);
-    expect(merged.startsWith('MAIN_TLS_ENABLE = yes\n\n# BEGIN WHM panel')).toBe(true);
-    expect(merged.endsWith('# END WHM panel (Email filters)\n')).toBe(true);
+    expect(merged.startsWith('MAIN_TLS_ENABLE = yes\n\n# BEGIN Keel')).toBe(true);
+    expect(merged.endsWith('# END Keel (Email filters)\n')).toBe(true);
     const replaced = mergeManagedBlock(`${merged}LOCAL_AFTER = 1\n`, renderManagedBlock(layout));
     expect(replaced).toBe(`MAIN_TLS_ENABLE = yes\n\n${renderManagedBlock(layout)}\nLOCAL_AFTER = 1\n`);
-    expect(replaced.match(/BEGIN WHM panel/g)).toHaveLength(1);
+    expect(replaced.match(/BEGIN Keel/g)).toHaveLength(1);
     expect(mergeManagedBlock(null, block)).toBe(`${block}\n`);
+    // A block written under the pre-rename markers is replaced, not duplicated.
+    const legacy = 'MAIN_TLS_ENABLE = yes\n\n# BEGIN WHM panel (Email filters) - managed block, edits inside are overwritten\nsqlite_dbfile = /old.db\n# END WHM panel (Email filters)\nLOCAL_AFTER = 1\n';
+    expect(readManagedBlock(legacy)).toMatchObject({ present: true, sqliteDbfile: '/old.db' });
+    const upgraded = mergeManagedBlock(legacy, block);
+    expect(upgraded).toBe(`MAIN_TLS_ENABLE = yes\n\n${block}\nLOCAL_AFTER = 1\n`);
+    expect(upgraded).not.toContain('WHM panel');
   });
 
   it('only carries the DKIM macros once a key (and so the selector index) is installed', () => {

@@ -33,7 +33,8 @@ function requireLayout() {
 const zoneFile = (layout, domain) => path.join(layout.zoneDir, `${domain}.db`);
 const keyDir = (layout, domain) => path.join(layout.zoneDir, 'keys', domain);
 const marker = (domain, end = false) => `// ${end ? 'END' : 'BEGIN'} whm zone ${domain}`;
-const HEADER = '// Managed by WHM panel. Do not edit: the panel rewrites this file when zones change.\n';
+const HEADER = '// Managed by Keel. Do not edit: the panel rewrites this file when zones change.\n';
+const LEGACY_HEADER = '// Managed by WHM panel. Do not edit: the panel rewrites this file when zones change.\n';
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 export function stanza(domain, file, allowTransfer = []) {
@@ -182,7 +183,7 @@ function ensureStanza(layout, domain, file, allowTransfer, ctx) {
   const fresh = stanza(domain, file, allowTransfer);
   const stanzaAdded = previous == null;
   const stanzaChanged = previous != null && previous !== fresh;
-  const body = stripStanza(current.replace(HEADER, ''), domain).trim();
+  const body = stripStanza(current.replace(HEADER, '').replace(LEGACY_HEADER, ''), domain).trim();
   const next = `${HEADER}${body ? `${body}\n` : ''}${fresh}`;
   if (next !== current) writeAtomic(layout.includeFile, next);
   const mainConf = readText(layout.mainConf);

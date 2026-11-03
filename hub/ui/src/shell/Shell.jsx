@@ -37,7 +37,7 @@ export function Shell({ area }) {
   const identity = session?.kind === 'developer' ? session.developer?.email : session?.user?.email;
   const role = session?.kind === 'developer' ? session.developer?.status : session?.user?.role;
   const reseller = session?.kind === 'portal' && session.user?.reseller_id ? session.brand || {} : null;
-  const brand = reseller ? reseller.name || 'Reseller portal' : 'WHM Hub';
+  const brand = reseller ? reseller.name || 'Reseller portal' : 'Keel Hub';
   const stepUp = stepUpIndicator(session);
   const impersonating = impersonationText(session);
 

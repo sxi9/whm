@@ -267,7 +267,7 @@ describe('renderers produce the expected daemon syntax', () => {
 
   it('renders logrotate policies with a fixed postrotate vocabulary', () => {
     const text = renderLogrotate({ name: 'accounts', paths: ['/home/*/logs/*.log'], frequency: 'daily', rotate: 14, compress: true, delaycompress: true, missingok: true, notifempty: true, dateext: false, copytruncate: false, maxSize: '100M', su: { user: 'root', group: 'root' }, postrotate: 'apache-reload', sharedscripts: true });
-    expect(text).toMatch(/^# Managed by WHM panel/);
+    expect(text).toMatch(/^# Managed by Keel/);
     expect(text).toContain('/home/*/logs/*.log {');
     expect(text).toContain('    su root root');
     expect(text).toContain('    daily');
@@ -318,7 +318,7 @@ describe('renderers produce the expected daemon syntax', () => {
     expect(merged.match(/^anonymous_enable=/gm)).toHaveLength(1);
     expect(merged).toContain('anonymous_enable=NO');
     expect(merged).not.toContain('#pasv_min_port=1');
-    expect(merged).toContain('# Managed by WHM panel (FTP Server Configuration)');
+    expect(merged).toContain('# Managed by Keel (FTP Server Configuration)');
     const pureConf = mergeKeyValueFile('ChrootEveryone no\nVerboseLog yes\n', pureFtpdSettings(s), { sep: ' ' });
     expect(pureConf).toContain('VerboseLog yes');
     expect(pureConf).toContain('ChrootEveryone yes');
@@ -362,7 +362,7 @@ describe('renderers produce the expected daemon syntax', () => {
       expect(unsplit).toMatchObject({ flavor: 'debian', splitConfig: false, mainConf: '/etc/exim4/exim4.conf.template', rcptAclSource: '/etc/exim4/exim4.conf.template' });
       expect(unsplit.slots.main.path).toBe('/etc/exim4/exim4.conf.localmacros');
       expect(unsplit.slots.main.hookable).toBe(true);
-      expect(unsplit.slots.main.block).toMatch(/^# BEGIN WHM panel \(Service Configuration/);
+      expect(unsplit.slots.main.block).toMatch(/^# BEGIN Keel \(Service Configuration/);
       expect(unsplit.slots.acl_rcpt).toMatchObject({ path: '/etc/exim4/whm/acl-rcpt-local.conf', macro: 'CHECK_RCPT_LOCAL_ACL_FILE' });
     }
     const rhel = eximLayout(hostIo({ dirs: ['/etc/exim'], files: { '/etc/exim/exim.conf': '' }, binaries: ['exim'] }));
@@ -378,14 +378,20 @@ describe('renderers produce the expected daemon syntax', () => {
     expect(once.startsWith(admin)).toBe(true);
     expect(readEximBlock(once)).toBe('WHM_SERVICE_CONFIG = 1\nsmtp_accept_max = 100\n');
     const twice = mergeEximBlock(once, 'WHM_SERVICE_CONFIG = 1\nsmtp_accept_max = 50');
-    expect(twice.match(/BEGIN WHM panel \(Service Configuration/g)).toHaveLength(1);
+    expect(twice.match(/BEGIN Keel \(Service Configuration/g)).toHaveLength(1);
     expect(twice).toContain('smtp_accept_max = 50');
     expect(twice).not.toContain('smtp_accept_max = 100');
     expect(twice).toContain('sqlite_dbfile = /var/lib/whm/greylist/greylist.db');
     expect(stripEximBlock(twice)).toBe(admin);
     expect(readEximBlock(admin)).toBeNull();
     expect(stripEximBlock(null)).toBe('');
-    expect(mergeEximBlock(null, 'x')).toMatch(/^# BEGIN WHM panel \(Service Configuration: Exim main options\)[^\n]*\nx\n# END WHM panel \(Service Configuration: Exim main options\)\n$/);
+    expect(mergeEximBlock(null, 'x')).toMatch(/^# BEGIN Keel \(Service Configuration: Exim main options\)[^\n]*\nx\n# END Keel \(Service Configuration: Exim main options\)\n$/);
+    // A block written under the pre-rename markers is replaced, not duplicated.
+    const legacy = 'A = 1\n# BEGIN WHM panel (Service Configuration: Exim main options) - managed block, edits inside are overwritten\nold = 1\n# END WHM panel (Service Configuration: Exim main options)\nB = 2\n';
+    expect(readEximBlock(legacy)).toBe('old = 1\n');
+    const upgraded = mergeEximBlock(legacy, 'new = 1');
+    expect(upgraded).toBe('A = 1\n# BEGIN Keel (Service Configuration: Exim main options) - managed block, edits inside are overwritten\nnew = 1\n# END Keel (Service Configuration: Exim main options)\nB = 2\n');
+    expect(stripEximBlock(legacy)).toBe('A = 1\nB = 2\n');
     expect(eximTlsLibrary(['crypteq', 'GnuTLS', 'DKIM'])).toBe('gnutls');
     expect(eximTlsLibrary(['TLS=GnuTLS'])).toBe('gnutls');
     expect(eximTlsLibrary(['OpenSSL'])).toBe('openssl');

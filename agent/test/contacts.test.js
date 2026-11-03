@@ -101,7 +101,7 @@ describe('alias file parsing and rendering', () => {
     expect(next.match(/^root:/gm)).toHaveLength(1);
     expect(parseAliases(next).find((e) => e.name === 'root').targets).toEqual(['admin@example.net']);
     const again = renderRootAlias(next, ['a@example.com', 'b@example.com']);
-    expect(again.match(/managed by WHM panel/g)).toHaveLength(1);
+    expect(again.match(/managed by Keel/g)).toHaveLength(1);
     expect(parseAliases(again).find((e) => e.name === 'root').targets).toEqual(['a@example.com', 'b@example.com']);
   });
 
@@ -112,16 +112,16 @@ describe('alias file parsing and rendering', () => {
     const rootChanged = renderRootAlias(withNobody, ['admin@example.net']);
     expect(parseAliases(rootChanged).find((e) => e.name === 'nobody').targets).toEqual(['root']);
     expect(parseAliases(rootChanged).find((e) => e.name === 'root').targets).toEqual(['admin@example.net']);
-    expect(rootChanged.match(/alias managed by WHM panel/g)).toHaveLength(2);
+    expect(rootChanged.match(/alias managed by Keel/g)).toHaveLength(2);
     const cleared = renderUserAlias(rootChanged, 'nobody', []);
     expect(parseAliases(cleared).some((e) => e.name === 'nobody')).toBe(false);
-    expect(cleared.match(/alias managed by WHM panel/g)).toHaveLength(1);
+    expect(cleared.match(/alias managed by Keel/g)).toHaveLength(1);
     expect(() => renderUserAlias(sample, 'www-data', ['root'])).toThrow(OpError);
   });
 
   it('an empty target list removes the forwarding entry; a missing file starts from scratch', () => {
     expect(parseAliases(renderRootAlias(sample, [])).some((e) => e.name === 'root')).toBe(false);
-    expect(renderRootAlias(null, ['ops@example.com'])).toBe('# root alias managed by WHM panel (Edit System Mail Preferences)\nroot: ops@example.com\n');
+    expect(renderRootAlias(null, ['ops@example.com'])).toBe('# root alias managed by Keel (Edit System Mail Preferences)\nroot: ops@example.com\n');
   });
 
   it('contacts.aliases.read reports the host file without failing when it is absent', async () => {

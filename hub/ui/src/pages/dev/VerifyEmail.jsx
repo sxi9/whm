@@ -19,7 +19,7 @@ export default function VerifyEmail() {
   return (
     <div className="login-page">
       <div className="login-card">
-        <div className="login-brand"><ShieldCheck size={20} /> <span>WHM Marketplace</span></div>
+        <div className="login-brand"><ShieldCheck size={20} /> <span>Keel Marketplace</span></div>
         <h1>E-mail verification</h1>
         {!token && <div className="banner banner-warning"><div>This page needs the <code>token</code> from your verification mail.</div></div>}
         {state.busy && <Loading text="Verifying…" />}
