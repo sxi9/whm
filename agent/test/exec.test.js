@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { exec, ExecError, hasBinary, resolveBinary } from '../src/exec.js';
 
 async function execError(promise) {
@@ -71,6 +74,34 @@ describe('exec', () => {
     const result = await exec('sh', ['-c', 'echo "$LANG|$WHM_TEST_VAR|${HOME:-unset}"'], { env: { WHM_TEST_VAR: 'yes' } });
     expect(result.stdout).toBe('C|yes|unset\n');
     expect((await exec('sh', ['-c', 'pwd'], { cwd: '/tmp' })).stdout).toBe('/tmp\n');
+  });
+
+  it('hands the child inherited descriptors as stdin / stdout instead of pipes, with the same outcome mapping', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-exec-fd-'));
+    const open = (name, flags, mode) => fs.openSync(path.join(dir, name), flags, mode);
+    try {
+      fs.writeFileSync(path.join(dir, 'in.txt'), 'from fd');
+      let fd = open('in.txt', 'r');
+      expect((await exec('cat', [], { stdinFd: fd })).stdout).toBe('from fd');
+      fs.closeSync(fd);
+      // A program that reopens its input by name (unzip does, to seek) finds the same file behind /dev/fd/0.
+      fd = open('in.txt', 'r');
+      expect((await exec('cat', ['/dev/fd/0'], { stdinFd: fd })).stdout).toBe('from fd');
+      fs.closeSync(fd);
+      const wfd = open('out.txt', 'w', 0o600);
+      const w = await exec('echo', ['to fd'], { stdoutFd: wfd });
+      fs.closeSync(wfd);
+      expect(w).toMatchObject({ code: 0, stdout: '', stderr: '' });
+      expect(fs.readFileSync(path.join(dir, 'out.txt'), 'utf8')).toBe('to fd\n');
+      fd = open('in.txt', 'r');
+      expect((await execError(exec('cat', [], { stdinFd: 'no' }))).code).toBe('bad_argument');
+      expect((await execError(exec('cat', [], { stdinFd: fd, input: 'both' }))).code).toBe('bad_argument');
+      expect((await execError(exec('false', [], { stdinFd: fd }))).code).toBe('command_failed');
+      expect((await exec('false', [], { stdinFd: fd, allowFailure: true })).code).toBe(1);
+      expect((await execError(exec('sleep', ['2'], { stdinFd: fd, timeoutMs: 100 }))).code).toBe('timeout');
+      expect((await execError(exec('yes', [], { stdinFd: fd, maxBuffer: 4096 }))).code).toBe('spawn_failed');
+      fs.closeSync(fd);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('kills the process and rejects with timeout when it runs too long', async () => {

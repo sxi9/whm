@@ -132,11 +132,11 @@ export function asUserArgv(info, bin, argv, { tool = 'setpriv', nice = false } =
   return [exe, args];
 }
 
-export async function asUser(info, bin, argv, { timeoutMs = 120_000, input, cwd, allowFailure = false, maxBuffer, nice = false, env = {} } = {}) {
+export async function asUser(info, bin, argv, { timeoutMs = 120_000, input, cwd, allowFailure = false, maxBuffer, nice = false, env = {}, stdinFd, stdoutFd } = {}) {
   const tool = requireAsUser();
   const [exe, args] = asUserArgv(info, bin, argv, { tool, nice });
   if (nice && !hasBinary('nice')) throw new OpError('binary_not_found', 'Required program "nice" is not installed on this server', { bin: 'nice' });
-  return exec(exe, args, { timeoutMs, input, cwd, allowFailure, maxBuffer, env: { HOME: info.home, USER: info.username, LOGNAME: info.username, ...env } });
+  return exec(exe, args, { timeoutMs, input, cwd, allowFailure, maxBuffer, stdinFd, stdoutFd, env: { HOME: info.home, USER: info.username, LOGNAME: info.username, ...env } });
 }
 
 export const lastLine = (r) => (r.stderr || r.stdout || '').trim().split('\n').pop() || `exit ${r.code}`;

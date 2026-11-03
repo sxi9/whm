@@ -5,12 +5,13 @@ export function DataTable({
   columns, rows = [], loading = false, error = null, emptyText = 'No records to show yet',
   total = null, page = 1, pageSize = 50, onPageChange, sort, dir = 'asc', onSortChange,
   searchable = false, q = '', onSearch, searchPlaceholder = 'Search…',
-  rowKey = (r) => r.id, rowActions, selectable = false, selected = [], onSelectedChange, toolbar, dense = false,
+  rowKey = (r) => r.id, rowActions, selectable = false, selected = [], onSelectedChange, canSelect = () => true, toolbar, dense = false,
 }) {
   const [draftQ, setDraftQ] = useState(q);
   const pageCount = total != null ? Math.max(1, Math.ceil(total / pageSize)) : null;
-  const allKeys = rows.map(rowKey);
-  const allSelected = selectable && rows.length > 0 && allKeys.every((k) => selected.includes(k));
+  // Rows canSelect() refuses show a disabled box and stay out of "select all".
+  const allKeys = rows.filter(canSelect).map(rowKey);
+  const allSelected = selectable && allKeys.length > 0 && allKeys.every((k) => selected.includes(k));
 
   const toggleAll = () => onSelectedChange?.(allSelected ? selected.filter((k) => !allKeys.includes(k)) : [...new Set([...selected, ...allKeys])]);
   const toggleOne = (k) => onSelectedChange?.(selected.includes(k) ? selected.filter((x) => x !== k) : [...selected, k]);
@@ -59,7 +60,7 @@ export function DataTable({
               const k = rowKey(row);
               return (
                 <tr key={k} className={selected.includes(k) ? 'is-selected' : ''}>
-                  {selectable && <td className="select-col"><input type="checkbox" checked={selected.includes(k)} onChange={() => toggleOne(k)} aria-label={`Select ${k}`} /></td>}
+                  {selectable && <td className="select-col"><input type="checkbox" checked={selected.includes(k)} onChange={() => toggleOne(k)} disabled={!canSelect(row)} aria-label={`Select ${k}`} /></td>}
                   {columns.map((col) => <td key={col.key} className={col.align ? `align-${col.align}` : ''}>{col.render ? col.render(row) : row[col.key] ?? <span className="muted">—</span>}</td>)}
                   {rowActions && <td className="actions-col"><RowActions actions={rowActions(row)} /></td>}
                 </tr>

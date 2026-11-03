@@ -5,7 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
 import { assertUnderHome, resolveUnderHome, landsInSshDir, asUserArgv, assertManaged, accountPath, SYSTEM_USERS } from '../src/ops/as-user.js';
-import { CHUNK_READ_MAX, FIND_FORMAT, parseFind, readRangeArgv, parseTarListing, parseZipListing, checkArchiveMembers, listArchiveArgv, resolveMemberPath, diskLinkReader, sshFingerprint, sshChanges } from '../src/ops/files.js';
+import { CHUNK_READ_MAX, FIND_FORMAT, EXTRACT_MAX_BYTES, STDIN_ARCHIVE, parseFind, readRangeArgv, parseTarListing, parseZipListing, checkArchiveMembers, listArchiveArgv, resolveMemberPath, diskLinkReader, sshFingerprint, sshChanges } from '../src/ops/files.js';
 
 // exec is spied with the real implementation behind it so every test proves an
 // op refused before any program ran. No files.* op is ever executed here: each
@@ -327,6 +327,130 @@ describe('archive member inspection before extraction', () => {
     expect(run.indexOf('checkArchiveMembers(')).toBeGreaterThan(-1);
     expect(run.indexOf('checkArchiveMembers(')).toBeLessThan(run.indexOf("'--extract'"));
     expect(run.indexOf('checkArchiveMembers(')).toBeLessThan(run.indexOf("'-o', '-q'"));
+  });
+
+  it('lists and extracts from the root-held copy, never from the file in the home, and removes the copy', () => {
+    const src = fs.readFileSync(new URL('../src/ops/files.js', import.meta.url), 'utf8');
+    const run = src.slice(src.indexOf("defineOp('files.extract'"));
+    expect(STDIN_ARCHIVE).toEqual({ zip: '/dev/fd/0', tar: '-' });
+    expect(EXTRACT_MAX_BYTES).toBe(4 * 1024 * MiB);
+    // The copy is made by the account (dd onto root's descriptor) before the listing, bounded in size.
+    expect(run.indexOf("'dd', [`if=${src.target}`")).toBeGreaterThan(-1);
+    expect(run.indexOf("'dd', [`if=${src.target}`")).toBeLessThan(run.indexOf('listArchiveArgv('));
+    expect(run).toContain('`count=${EXTRACT_MAX_BYTES + 1}`');
+    expect(run).toContain('stdoutFd: scratch.fd');
+    // Neither the listing nor the extraction names the home path; both read an inherited descriptor of the copy.
+    expect(run).toContain('listArchiveArgv(zip, zip ? STDIN_ARCHIVE.zip : STDIN_ARCHIVE.tar)');
+    expect(run).toContain("'--extract', '--file', STDIN_ARCHIVE.tar");
+    expect(run).toContain("'-o', '-q', STDIN_ARCHIVE.zip");
+    expect(run.match(/stdinFd: fd/g)).toHaveLength(3);
+    expect(run.slice(run.indexOf('listArchiveArgv(zip'))).not.toContain(', src.target');
+    expect(run.indexOf('fs.unlinkSync(scratch.file)')).toBeGreaterThan(run.indexOf('finally {'));
+  });
+});
+
+// A real extraction as the managed account (root only): the archive in the home
+// is swapped between the listing and the extraction, as a tenant could do, and
+// what lands in the destination must be what was listed.
+describe('files.extract against a swapped archive', () => {
+  const canRun = Boolean(USER) && typeof process.getuid === 'function' && process.getuid() === 0 && ['setpriv', 'tar', 'dd', 'nice'].every(hasBinary) && fs.existsSync(HOME || '/nonexistent');
+  let actual;
+  let info;
+  let dir;
+  let stage;
+  let outside;
+  beforeAll(async () => {
+    actual = await vi.importActual('../src/exec.js');
+    if (!canRun) return;
+    info = assertManaged(USER);
+    dir = fs.mkdtempSync(path.join(HOME, '.whm-extract-test-'));
+    stage = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-extract-stage-'));
+    outside = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-extract-outside-'));
+    fs.chmodSync(outside, 0o777);
+    fs.chownSync(dir, info.uid, info.gid);
+  });
+  afterAll(() => {
+    exec.mockImplementation(actual.exec);
+    for (const d of [dir, stage, outside]) if (d) fs.rmSync(d, { recursive: true, force: true });
+  });
+
+  const own = (p) => fs.chownSync(p, info.uid, info.gid);
+  const swapOnExtract = (evil, target, marker) => {
+    exec.mockImplementation(async (bin, argv, opts) => {
+      if (argv.includes(marker)) { fs.copyFileSync(evil, target); own(target); }
+      return actual.exec(bin, argv, opts);
+    });
+  };
+  const scratchFiles = () => { try { return fs.readdirSync('/tmp/whm').filter((n) => n.startsWith('extract-')); } catch { return []; } };
+
+  it.skipIf(!canRun)('tar: extracts only the listed members and leaves the swapped archive\'s link escape unused', async () => {
+    const good = path.join(stage, 'good');
+    fs.mkdirSync(good);
+    fs.writeFileSync(path.join(good, 'a.txt'), 'listed');
+    const archive = path.join(dir, 'site.tar');
+    await actual.exec('tar', ['-cf', archive, '-C', good, 'a.txt']);
+    own(archive);
+    // evil.tar: a symlink member to a world-writable directory outside the home, then a file through it.
+    const evilA = path.join(stage, 'evil-a');
+    const evilB = path.join(stage, 'evil-b');
+    fs.mkdirSync(evilA); fs.symlinkSync(outside, path.join(evilA, 'lnk'));
+    fs.mkdirSync(path.join(evilB, 'lnk'), { recursive: true }); fs.writeFileSync(path.join(evilB, 'lnk', 'pwned.txt'), 'escaped');
+    const evil = path.join(stage, 'evil.tar');
+    await actual.exec('tar', ['-cf', evil, '-C', evilA, 'lnk']);
+    await actual.exec('tar', ['-rf', evil, '-C', evilB, 'lnk/pwned.txt']);
+    expect(parseTarListing((await actual.exec('tar', ['--list', '--verbose', '--file', evil])).stdout).map((m) => m.type)).toEqual(['symlink', 'file']);
+    swapOnExtract(evil, archive, '--extract');
+    exec.mockClear();
+    const res = await runOp('files.extract', { username: USER, archive, dest: `${dir}/out` }, ctx);
+    expect(res).toMatchObject({ format: 'tar', members: 1 });
+    expect(fs.readdirSync(`${dir}/out`)).toEqual(['a.txt']);
+    expect(fs.readFileSync(`${dir}/out/a.txt`, 'utf8')).toBe('listed');
+    expect(fs.existsSync(path.join(outside, 'pwned.txt'))).toBe(false);
+    expect(fs.existsSync(`${dir}/out/lnk`)).toBe(false);
+    const tarCalls = exec.mock.calls.filter(([, argv]) => argv.includes('--file'));
+    expect(tarCalls).toHaveLength(2);
+    for (const [, argv, opts] of tarCalls) { expect(argv[argv.indexOf('--file') + 1]).toBe('-'); expect(opts.stdinFd).toBeTypeOf('number'); }
+    expect(exec.mock.calls.some(([, argv]) => argv.includes(`if=${archive}`))).toBe(true);
+    expect(scratchFiles()).toEqual([]);
+  });
+
+  it.skipIf(!canRun || !hasBinary('zip') || !hasBinary('unzip'))('zip: the same, through /dev/fd/0', async () => {
+    const good = path.join(stage, 'good-zip');
+    fs.mkdirSync(good);
+    fs.writeFileSync(path.join(good, 'b.txt'), 'listed');
+    const archive = path.join(dir, 'site.zip');
+    await actual.exec('zip', ['-q', '-j', archive, path.join(good, 'b.txt')]);
+    own(archive);
+    const evilDir = path.join(stage, 'evil-zip');
+    fs.mkdirSync(evilDir);
+    fs.writeFileSync(path.join(evilDir, 'pwned.txt'), 'swapped');
+    const evil = path.join(stage, 'evil.zip');
+    await actual.exec('zip', ['-q', '-j', evil, path.join(evilDir, 'pwned.txt')]);
+    swapOnExtract(evil, archive, '-o');
+    exec.mockClear();
+    const res = await runOp('files.extract', { username: USER, archive, dest: `${dir}/out-zip` }, ctx);
+    expect(res).toMatchObject({ format: 'zip', members: 1 });
+    expect(fs.readdirSync(`${dir}/out-zip`)).toEqual(['b.txt']);
+    const unzipCalls = exec.mock.calls.filter(([, argv]) => argv.some((a) => /\/unzip$/.test(a)));
+    expect(unzipCalls).toHaveLength(2);
+    for (const [, argv, opts] of unzipCalls) { expect(argv).toContain('/dev/fd/0'); expect(argv).not.toContain(archive); expect(opts.stdinFd).toBeTypeOf('number'); }
+    expect(scratchFiles()).toEqual([]);
+  });
+
+  it.skipIf(!canRun)('refuses an archive above the size bound before copying anything', async () => {
+    const archive = path.join(dir, 'huge.tar');
+    const fd = fs.openSync(archive, 'w', 0o644);
+    fs.ftruncateSync(fd, EXTRACT_MAX_BYTES + 1);
+    fs.closeSync(fd);
+    own(archive);
+    exec.mockImplementation(actual.exec);
+    exec.mockClear();
+    const err = await opError(runOp('files.extract', { username: USER, archive, dest: `${dir}/out-huge` }, ctx));
+    expect(err.code).toBe('refused');
+    expect(err.message).toMatch(/larger than/);
+    expect(exec).not.toHaveBeenCalled();
+    expect(scratchFiles()).toEqual([]);
+    fs.unlinkSync(archive);
   });
 });
 

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 
 const SEARCH_DIRS = ['/usr/sbin', '/usr/bin', '/sbin', '/bin', '/usr/local/sbin', '/usr/local/bin'];
 const resolved = new Map();
@@ -43,7 +43,11 @@ const isReadable = (v) => v != null && typeof v === 'object' && typeof v.pipe ==
 // caller opened root-side can feed a program running as an account); a stream
 // that errors before it ends kills the child and rejects with `input_failed`,
 // so a short read never passes as a successful run.
-export function exec(name, argv = [], { timeoutMs = 60_000, input, env, cwd, allowFailure = false, maxBuffer = 16 * 1024 * 1024 } = {}) {
+// `stdinFd` / `stdoutFd` hand the child an already-open descriptor as its
+// stdin or stdout instead of a pipe: a file root opened is then read or
+// written by a program running as an account without the account ever being
+// able to reach it by path. With `stdoutFd` the result's stdout is empty.
+export function exec(name, argv = [], { timeoutMs = 60_000, input, env, cwd, allowFailure = false, maxBuffer = 16 * 1024 * 1024, stdinFd, stdoutFd } = {}) {
   const bin = resolveBinary(name);
   if (!bin) return Promise.reject(new ExecError('binary_not_found', `Required program "${name}" is not installed on this server`, { bin: name }));
   for (const a of argv) {
@@ -54,6 +58,12 @@ export function exec(name, argv = [], { timeoutMs = 60_000, input, env, cwd, all
   if (input != null && typeof input !== 'string' && !Buffer.isBuffer(input) && !(input instanceof Uint8Array) && !isReadable(input)) {
     return Promise.reject(new ExecError('bad_argument', 'Command input must be a string, a Buffer or a Readable stream', { bin: name }));
   }
+  const isFd = (v) => Number.isInteger(v) && v >= 0;
+  if ((stdinFd != null && !isFd(stdinFd)) || (stdoutFd != null && !isFd(stdoutFd)) || (stdinFd != null && input != null)) {
+    return Promise.reject(new ExecError('bad_argument', 'stdinFd and stdoutFd must be open descriptors, and stdinFd excludes input', { bin: name }));
+  }
+  const options = { timeoutMs, env, cwd, allowFailure, maxBuffer };
+  if (stdinFd != null || stdoutFd != null) return execWithFds(name, bin, argv, { ...options, stdinFd, stdoutFd });
   return new Promise((resolve, reject) => {
     let inputError = null;
     const child = execFile(bin, argv, {
@@ -94,5 +104,54 @@ export function exec(name, argv = [], { timeoutMs = 60_000, input, env, cwd, all
       child.kill('SIGKILL');
     });
     input.pipe(child.stdin);
+  });
+}
+
+// execFile never forwards `stdio`, so a run with inherited descriptors goes
+// through spawn with the same outcome mapping as above: timeout, spawn_failed,
+// command_failed (unless allowFailure), and maxBuffer kills the child.
+function execWithFds(name, bin, argv, { timeoutMs, env, cwd, allowFailure, maxBuffer, stdinFd, stdoutFd }) {
+  return new Promise((resolve, reject) => {
+    let child;
+    try {
+      child = spawn(bin, argv, {
+        cwd,
+        env: { PATH: SEARCH_DIRS.join(':'), LANG: 'C', LC_ALL: 'C', ...env },
+        stdio: [stdinFd ?? 'ignore', stdoutFd ?? 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+    } catch (err) {
+      return reject(new ExecError('spawn_failed', `Could not run "${name}": ${err.message}`, { bin, argv }));
+    }
+    const out = [];
+    const errOut = [];
+    let killedBy = null;
+    let settled = false;
+    const timer = setTimeout(() => { killedBy = 'timeout'; child.kill('SIGTERM'); }, timeoutMs);
+    const collect = (chunks, len) => (chunk) => {
+      if (len.n + chunk.length > maxBuffer) { killedBy = killedBy || 'maxBuffer'; child.kill('SIGKILL'); return; }
+      len.n += chunk.length;
+      chunks.push(chunk);
+    };
+    const outCount = { n: 0 };
+    const errCount = { n: 0 };
+    child.stdout?.on('data', collect(out, outCount));
+    child.stderr?.on('data', collect(errOut, errCount));
+    const finish = (fn) => { if (settled) return; settled = true; clearTimeout(timer); fn(); };
+    child.on('error', (err) => finish(() => reject(new ExecError('spawn_failed', `Could not run "${name}": ${err.message}`, { bin, argv }))));
+    child.on('close', (code, signal) => finish(() => {
+      const stdout = Buffer.concat(out).toString();
+      const stderr = Buffer.concat(errOut).toString();
+      if (killedBy === 'timeout') return reject(new ExecError('timeout', `"${name}" did not finish within ${timeoutMs}ms`, { bin, argv, stderr: stderr.slice(-4000) }));
+      if (killedBy === 'maxBuffer') return reject(new ExecError('spawn_failed', `Could not run "${name}": stdout maxBuffer length exceeded`, { bin, argv }));
+      if (code === null) return reject(new ExecError('spawn_failed', `Could not run "${name}": killed by ${signal}`, { bin, argv }));
+      const result = { code, stdout, stderr, bin, argv };
+      if (code !== 0 && !allowFailure) {
+        return reject(new ExecError('command_failed', `"${name}" exited with status ${code}: ${stderr.trim().split('\n').pop() || 'no error output'}`, {
+          ...result, stdout: stdout.slice(-4000), stderr: stderr.slice(-4000),
+        }));
+      }
+      resolve(result);
+    }));
   });
 }

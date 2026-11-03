@@ -125,23 +125,27 @@ export function createDnsService(ctx) {
     return null;
   }
 
-  // The account that serves the zone containing `domain` or a domain above
-  // it, when it is not `accountId`: a non-root principal may not create a
-  // zone or park a name inside another account's namespace (www.victim.com).
-  function foreignParentOf(domain, accountId) {
+  // The zone containing `domain`, or a hosted domain above it, that neither
+  // belongs to `accountId` nor to an account the principal owns (ownsRow: a
+  // reseller owns the accounts it resells, a role-user principal only its
+  // own): a reseller may create client.resellerbrand.com under its own
+  // hosted domain, nobody may create a name inside a stranger's namespace
+  // (www.victim.com). Root is exempt from the check altogether.
+  function foreignParentOf(domain, accountId, user) {
+    const mine = (row, id) => id === accountId || ownsRow(user, row, { accountId: id });
     const zone = zoneContaining(domain);
-    if (zone && zone.account_id !== accountId) return zone.domain;
+    if (zone && !mine(zone, zone.account_id)) return zone.domain;
     const labels = domain.split('.');
     for (let i = 1; i < labels.length - 1; i++) {
       const parent = labels.slice(i).join('.');
       const row = stmts.accountByDomain.get(parent) || stmts.accountByAnyDomain.get(parent);
-      if (row && row.id !== accountId) return parent;
+      if (row && !mine(row, row.id)) return parent;
     }
     return null;
   }
   function assertNotInsideForeign(domain, accountId, user) {
     if (isRoot(user)) return;
-    const parent = foreignParentOf(domain, accountId);
+    const parent = foreignParentOf(domain, accountId, user);
     if (parent) throw conflict(`${domain} is part of ${parent}, which is hosted by another account on this server`);
   }
 

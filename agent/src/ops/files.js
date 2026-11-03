@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import { hasBinary } from '../exec.js';
-import { defineOp, arg, OpError } from './registry.js';
+import { defineOp, arg, OpError, ensurePrivateDir } from './registry.js';
 import { accountPath, asUser, failureOf, lstatOrNull, SSH_DIR } from './as-user.js';
 
 // File manager ops for the account panel. Every command runs under the
@@ -11,7 +11,9 @@ import { accountPath, asUser, failureOf, lstatOrNull, SSH_DIR } from './as-user.
 // verdict and root never opens anything inside the home tree: file contents
 // travel in on the command's stdin (dd) and out on its stdout as hex (hexdump,
 // or od where util-linux lacks it), so no scratch file has to be shared
-// between root and the account.
+// between root and the account. The one scratch file, the copy of an archive
+// files.extract works from, is written by the account onto a descriptor root
+// holds and never has a path the account can reach.
 
 const MiB = 1024 * 1024;
 // find expands the two characters "\0" to NUL itself: exec() refuses an argv
@@ -508,35 +510,82 @@ async function revertSshChanges(info, home, before) {
 
 export const listArchiveArgv = (zip, archive) => (zip ? ['unzip', ['-Z', '--', archive]] : ['tar', ['--list', '--verbose', '--file', archive]]);
 
+// The member check and the extraction must see the same bytes, and the file
+// in the home is the account's to replace at any moment. So the account's own
+// dd (its permissions decide what it may read) copies the archive once onto a
+// descriptor of a 0600 scratch file root created under /tmp/whm, and the
+// listing and the extraction both read that copy through an inherited
+// descriptor: the account never has a path to it. tar reads "-" straight from
+// fd 0; unzip has to reopen its archive to seek, which /dev/fd/0 only allows
+// when the inode is readable to it, so a zip copy is root:<account gid> 0640
+// (still unreachable by path and unwritable). The copy is bounded in size and
+// removed whatever happens.
+const EXTRACT_TMP_DIR = '/tmp/whm';
+export const EXTRACT_MAX_BYTES = 4 * 1024 * MiB;
+export const STDIN_ARCHIVE = { zip: '/dev/fd/0', tar: '-' };
+const { O_RDONLY, O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW } = fs.constants;
+
+function scratchArchive(ctx) {
+  ctx.assertAllowedPath(EXTRACT_TMP_DIR, 'write');
+  const dir = ensurePrivateDir(EXTRACT_TMP_DIR);
+  const file = path.join(dir, `extract-${process.pid}-${crypto.randomBytes(8).toString('hex')}`);
+  const fd = fs.openSync(file, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
+  return { file, fd };
+}
+
+async function withScratchFd(file, fn) {
+  const fd = fs.openSync(file, O_RDONLY | O_NOFOLLOW);
+  try { return await fn(fd); } finally { fs.closeSync(fd); }
+}
+
 defineOp('files.extract', {
-  description: 'Extract a zip or tar archive of an account home into a directory of that home, as the account at low priority (members are listed first; those leaving the destination or landing in .ssh, directly or through links, are refused; .ssh is checked again afterwards)',
+  description: 'Extract a zip or tar archive of an account home into a directory of that home, as the account at low priority, from a copy root holds for the whole run (members are listed first; those leaving the destination or landing in .ssh, directly or through links, are refused; .ssh is checked again afterwards)',
   timeoutMs: 1_800_000,
   schema: z.object({ ...base, archive: pathArg, dest: pathArg, allowSshDir: z.boolean().default(false) }).strict(),
   run: async ({ username, archive, dest, allowSshDir }, ctx) => {
     const src = accountPath(username, archive, ctx, 'read');
     const out = accountPath(username, dest, ctx, 'write');
-    const m = path.basename(src.target).match(EXTRACT_EXT);
-    if (!m) throw new OpError('unsupported', `${path.basename(src.target)} is not a .zip, .tar, .tar.gz or .tgz archive`);
+    const name = path.basename(src.target);
+    const m = name.match(EXTRACT_EXT);
+    if (!m) throw new OpError('unsupported', `${name} is not a .zip, .tar, .tar.gz or .tgz archive`);
     const zip = m[1].toLowerCase() === 'zip';
-    requireBins(zip ? ['unzip'] : ['tar'], 'extract archives');
-    regularFile(src.target, 'extract');
-    const [listBin, listArgv] = listArchiveArgv(zip, src.target);
-    const listing = await asUser(out.info, listBin, listArgv, { allowFailure: true, timeoutMs: 600_000, maxBuffer: 64 * MiB, nice: true });
-    if (listing.code !== 0 && !(zip && listing.code === 1)) throw failureOf(listing, `read ${path.basename(src.target)}`);
-    const members = zip ? parseZipListing(listing.stdout) : parseTarListing(listing.stdout);
-    checkArchiveMembers(members, { home: out.home, dest: out.target, allowSshDir, readLink: diskLinkReader() });
-    const mk = await asUser(out.info, 'mkdir', ['-p', '--', out.target], { allowFailure: true, timeoutMs: 60_000 });
-    if (mk.code !== 0) throw failureOf(mk, `create ${path.relative(out.home, out.target) || '.'}`);
-    const before = allowSshDir ? null : sshFingerprint(out.home);
-    const r = zip
-      ? await asUser(out.info, 'unzip', ['-o', '-q', src.target, '-d', out.target], { cwd: out.target, allowFailure: true, timeoutMs: 1_800_000, nice: true })
-      : await asUser(out.info, 'tar', ['--extract', '--file', src.target, '-C', out.target, '--no-same-owner', '--warning=no-unknown-keyword'], { cwd: out.target, allowFailure: true, timeoutMs: 1_800_000, nice: true });
-    if (before) {
-      const reverted = await revertSshChanges(out.info, out.home, before);
-      if (reverted) throw new OpError('refused', `the archive changed ${SSH_DIR} while it was extracted (${reverted.join(', ')}); those changes were removed`);
+    requireBins([zip ? 'unzip' : 'tar', 'dd'], 'extract archives');
+    const st = regularFile(src.target, 'extract');
+    const tooLarge = () => new OpError('refused', `${name} is larger than ${EXTRACT_MAX_BYTES / MiB} MiB, the most an archive extracted here may be`);
+    if (st.size > EXTRACT_MAX_BYTES) throw tooLarge();
+    const scratch = scratchArchive(ctx);
+    try {
+      const copy = await asUser(out.info, 'dd', [`if=${src.target}`, 'bs=1M', 'status=none', 'iflag=count_bytes', `count=${EXTRACT_MAX_BYTES + 1}`], { stdoutFd: scratch.fd, allowFailure: true, timeoutMs: 1_800_000, nice: true });
+      if (copy.code !== 0) throw failureOf(copy, `read ${name}`);
+      const copied = fs.fstatSync(scratch.fd);
+      if (!copied.isFile()) throw new OpError('refused', `${name} could not be copied for extraction`);
+      if (copied.size > EXTRACT_MAX_BYTES) throw tooLarge();
+      if (zip) {
+        try { fs.fchownSync(scratch.fd, 0, out.info.gid); fs.fchmodSync(scratch.fd, 0o640); } catch (err) { throw new OpError('refused', `the copy of ${name} could not be shared with ${username} (${err.code})`); }
+      }
+      fs.closeSync(scratch.fd);
+      scratch.fd = null;
+      const [listBin, listArgv] = listArchiveArgv(zip, zip ? STDIN_ARCHIVE.zip : STDIN_ARCHIVE.tar);
+      const listing = await withScratchFd(scratch.file, (fd) => asUser(out.info, listBin, listArgv, { stdinFd: fd, allowFailure: true, timeoutMs: 600_000, maxBuffer: 64 * MiB, nice: true }));
+      if (listing.code !== 0 && !(zip && listing.code === 1)) throw failureOf(listing, `read ${name}`);
+      const members = zip ? parseZipListing(listing.stdout) : parseTarListing(listing.stdout);
+      checkArchiveMembers(members, { home: out.home, dest: out.target, allowSshDir, readLink: diskLinkReader() });
+      const mk = await asUser(out.info, 'mkdir', ['-p', '--', out.target], { allowFailure: true, timeoutMs: 60_000 });
+      if (mk.code !== 0) throw failureOf(mk, `create ${path.relative(out.home, out.target) || '.'}`);
+      const before = allowSshDir ? null : sshFingerprint(out.home);
+      const r = await withScratchFd(scratch.file, (fd) => (zip
+        ? asUser(out.info, 'unzip', ['-o', '-q', STDIN_ARCHIVE.zip, '-d', out.target], { stdinFd: fd, cwd: out.target, allowFailure: true, timeoutMs: 1_800_000, nice: true })
+        : asUser(out.info, 'tar', ['--extract', '--file', STDIN_ARCHIVE.tar, '-C', out.target, '--no-same-owner', '--warning=no-unknown-keyword'], { stdinFd: fd, cwd: out.target, allowFailure: true, timeoutMs: 1_800_000, nice: true })));
+      if (before) {
+        const reverted = await revertSshChanges(out.info, out.home, before);
+        if (reverted) throw new OpError('refused', `the archive changed ${SSH_DIR} while it was extracted (${reverted.join(', ')}); those changes were removed`);
+      }
+      const warnings = r.stderr.split('\n').filter((l) => l.trim()).slice(0, 50);
+      if (r.code !== 0 && !(zip && r.code === 1)) throw failureOf(r, `extract ${name}`);
+      return { archive: src.target, dest: out.target, format: zip ? 'zip' : 'tar', members: members.length, warnings };
+    } finally {
+      if (scratch.fd != null) { try { fs.closeSync(scratch.fd); } catch { /* closed */ } }
+      try { fs.unlinkSync(scratch.file); } catch { /* gone */ }
     }
-    const warnings = r.stderr.split('\n').filter((l) => l.trim()).slice(0, 50);
-    if (r.code !== 0 && !(zip && r.code === 1)) throw failureOf(r, `extract ${path.basename(src.target)}`);
-    return { archive: src.target, dest: out.target, format: zip ? 'zip' : 'tar', members: members.length, warnings };
   },
 });

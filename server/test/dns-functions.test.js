@@ -844,6 +844,49 @@ describe('DNS Functions API (BIND installed via mock agent)', () => {
     expect(imported.body.data.serial).toBe(2099123199);
     await del('/zones/floor.example').expect(200);
   });
+
+  it('containment is ownership-aware: a reseller hosts under its own accounts, nobody under a stranger, root anywhere', async () => {
+    const resell2 = await app.createUser('resell2', 'reseller');
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'alice2', domain: 'alice2.com', owner: 'resell1', provision: { dns: false, mail: false } }).expect(201);
+    await app.http.post('/api/accounts').set('X-CSRF-Token', csrf).send({ username: 'carol', domain: 'carol.com', owner: 'resell2', provision: { dns: false, mail: false } }).expect(201);
+    const alice2 = app.ctx.db.prepare('SELECT id FROM accounts WHERE username = ?').get('alice2');
+    const carol = app.ctx.db.prepare('SELECT id FROM accounts WHERE username = ?').get('carol');
+    app.ctx.db.prepare("UPDATE accounts SET plan_snapshot_json = json_set(COALESCE(plan_snapshot_json, '{}'), '$.max_parked', 5) WHERE username = 'alice2'").run();
+    const resell1 = { id: reseller.id, username: 'resell1', role: 'reseller' };
+    const other = { id: resell2.id, username: 'resell2', role: 'reseller' };
+    const roleUser = { id: 9999, username: 'alice2', role: 'user', accountId: alice2.id };
+    const conflictOf = async (promise) => { try { await promise; } catch (err) { expect(err).toBeInstanceOf(HttpError); expect(err.status).toBe(409); return err; } throw new Error('expected a 409'); };
+
+    // The reseller's sub-account lives under its own other account's domain (alice.com is resell1's).
+    const sub = await app.ctx.dns.ensureZoneForDomain('client.alice.com', { ip: '203.0.113.31', accountId: alice2.id }, { user: resell1 });
+    expect(sub.created).toBe(true);
+    const parked = await resellerHttp.post('/api/dns/parked').set('X-CSRF-Token', resellerCsrf).send({ domain: 'shop.alice.com', account: 'alice2' });
+    expect(parked.status, JSON.stringify(parked.body)).toBe(201);
+    expect(parked.body.data).toMatchObject({ domain: 'shop.alice.com', account: 'alice2' });
+    // ...but not under another reseller's account, by zone (bob.com is root's) or by hosted domain (carol.com).
+    expect((await resellerHttp.post('/api/dns/parked').set('X-CSRF-Token', resellerCsrf).send({ domain: 'shop.carol.com', account: 'alice2' }).expect(409)).body.error.message).toMatch(/part of carol\.com/);
+    await resellerHttp.post('/api/dns/parked').set('X-CSRF-Token', resellerCsrf).send({ domain: 'shop.bob.com', account: 'alice2' }).expect(409);
+    await conflictOf(app.ctx.dns.ensureZoneForDomain('mail.carol.com', { ip: '203.0.113.31', accountId: alice2.id }, { user: resell1 }));
+    await conflictOf(app.ctx.dns.ensureZoneForDomain('mail.alice.com', { ip: '203.0.113.31', accountId: carol.id }, { user: other }));
+    // A role-user principal may only build under its own account's names.
+    await conflictOf(app.ctx.dns.ensureZoneForDomain('x.alice.com', { ip: '203.0.113.31', accountId: alice2.id }, { user: roleUser }));
+    await conflictOf(app.ctx.dns.ensureZoneForDomain('x.carol.com', { ip: '203.0.113.31', accountId: alice2.id }, { user: roleUser }));
+    const own = await app.ctx.dns.ensureZoneForDomain('x.alice2.com', { ip: '203.0.113.31', accountId: alice2.id }, { user: roleUser });
+    expect(own.created).toBe(true);
+    // Root is never contained.
+    await post('/parked', { domain: 'root.carol.com', account: 'bob' }).expect(201);
+    const rootZone = await app.ctx.dns.ensureZoneForDomain('root.alice.com', { ip: '203.0.113.31', accountId: carol.id }, { user: { id: 1, username: 'root', role: 'root' } });
+    expect(rootZone.created).toBe(true);
+    // A sub-account created by the reseller itself under its own hosted domain provisions its zone.
+    const resellerAcct = await resellerHttp.post('/api/accounts').set('X-CSRF-Token', resellerCsrf).send({ username: 'client1', domain: 'client1.alice.com', provision: { web: false, mail: false } });
+    expect(resellerAcct.status, JSON.stringify(resellerAcct.body)).toBe(201);
+    expect(resellerAcct.body.data.provisioning?.steps?.dns?.status ?? resellerAcct.body.data.provisioning?.dns?.status).not.toBe('failed');
+    expect(app.ctx.db.prepare('SELECT account_id FROM dns_zones WHERE domain = ?').get('client1.alice.com')?.account_id).toBe(app.ctx.db.prepare('SELECT id FROM accounts WHERE username = ?').get('client1').id);
+
+    for (const d of ['shop.alice.com', 'root.carol.com']) await del(`/parked/${d}?removeZone=true`).expect(200);
+    for (const d of ['client.alice.com', 'x.alice2.com', 'root.alice.com', 'client1.alice.com']) await del(`/zones/${d}`).expect(200);
+    for (const u of ['client1', 'alice2', 'carol']) await app.http.delete(`/api/accounts/${u}`).set('X-CSRF-Token', csrf);
+  });
 });
 
 describe('DNS Functions API without BIND', () => {

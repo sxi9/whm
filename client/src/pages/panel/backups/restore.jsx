@@ -27,6 +27,29 @@ export function relativeToHome(archivePath) {
   return String(archivePath || '').replace(/^homedir\//, '');
 }
 
+// The server's restore gate (panel-backup.restore / panel-files.sshWriteAllowed):
+// .ssh comes back only for a session login of an account with shell access
+// and the ssh feature, never while an admin acts as the account. The dialog
+// mirrors it so the box is never offered; the server's 403 stays the backstop.
+export const SSH_NOTE = 'SSH keys are managed under Security › SSH keys and are not restored here';
+export function sshRestoreAllowed(me) {
+  if (!me?.account) return false;
+  const features = me.account.features ?? me.features ?? {};
+  if (features.ssh === false) return false;
+  if (!me.account.plan?.has_shell) return false;
+  if (me.actingAs) return false;
+  return true;
+}
+// Whether an archive path names .ssh, something under it, or the whole home (which contains it).
+export function touchesSsh(archivePath) {
+  const rel = relativeToHome(archivePath).replace(/\/+$/, '');
+  return rel === '' || rel === '.' || rel === ROOT_PREFIX || rel.split('/')[0] === '.ssh';
+}
+export function restorablePaths(paths, allowSsh) {
+  return allowSsh ? paths : paths.filter((p) => !touchesSsh(p));
+}
+const insideSsh = (archivePath) => relativeToHome(archivePath).split('/')[0] === '.ssh';
+
 export function restoreSummary(summary) {
   if (!summary || typeof summary !== 'object') return '—';
   const parts = [];
@@ -103,6 +126,8 @@ export default function Restore({ fn }) {
   const browse = usePanelApi(current ? `/backups/${current.id}/browse?prefix=${encodeURIComponent(prefix)}` : null, { enabled: Boolean(current) });
   const actingAs = me?.actingAs;
   const capability = isCapabilityError(backups.error);
+  const allowSsh = sshRestoreAllowed(me);
+  const restorable = restorablePaths(selected, allowSsh);
 
   useEffect(() => { setPrefix(ROOT_PREFIX); setSelected([]); }, [selectedId]);
 
@@ -111,18 +136,20 @@ export default function Restore({ fn }) {
   const choose = (id) => setParams(id ? { backup: id } : {}, { replace: true });
   const entries = browse.data?.entries || [];
   const crumbs = prefixCrumbs(prefix);
+  const selectableRow = (r) => allowSsh || !touchesSsh(r.path);
+  const sshBlocked = !allowSsh && Boolean(current) && (insideSsh(prefix) || entries.some((r) => insideSsh(r.path)));
 
   const runRestore = async () => {
-    if (!current || !selected.length) return;
+    if (!current || !restorable.length) return;
     const ok = await confirm({
-      title: `Restore ${selected.length} item${selected.length === 1 ? '' : 's'} from ${current.name}?`,
+      title: `Restore ${restorable.length} item${restorable.length === 1 ? '' : 's'} from ${current.name}?`,
       message: overwrite ? 'Files that exist on the account with the same names are replaced by the copies in the archive.' : 'Files that already exist on the account are kept; only missing files are put back.',
       confirmLabel: 'Restore', danger: overwrite,
     });
     if (!ok) return;
     setBusy(true); setRestoreError(null);
     try {
-      const { data: res } = await panelApi.post(`/backups/${current.id}/restore`, { paths: selected.map(relativeToHome), overwrite });
+      const { data: res } = await panelApi.post(`/backups/${current.id}/restore`, { paths: restorable.map(relativeToHome), overwrite });
       setJob(res.job.id);
       setSelected([]);
       toast.info('Restore started');
@@ -151,7 +178,7 @@ export default function Restore({ fn }) {
           )}
           <RequestError error={restoreError} />
           <FormActions>
-            <Button variant="primary" icon={RotateCcw} loading={busy} disabled={busy || !current || !selected.length || Boolean(actingAs)} onClick={runRestore}>Restore {selected.length ? `${selected.length} selected` : 'selected'}</Button>
+            <Button variant="primary" icon={RotateCcw} loading={busy} disabled={busy || !current || !restorable.length || Boolean(actingAs)} onClick={runRestore}>Restore {restorable.length ? `${restorable.length} selected` : 'selected'}</Button>
             {!current && <Link className="btn" to="/panel/backups/backups">Generate a backup</Link>}
           </FormActions>
           {job && (
@@ -178,17 +205,18 @@ export default function Restore({ fn }) {
         {current && (
           <DataTable
             columns={[
-              { key: 'name', label: 'Name', render: (r) => (r.type === 'dir' ? <button className="btn btn-sm btn-ghost" onClick={() => setPrefix(r.path)}><FolderOpen size={14} /> {r.name}</button> : <code>{r.name}</code>) },
+              { key: 'name', label: 'Name', render: (r) => <>{r.type === 'dir' ? <button className="btn btn-sm btn-ghost" onClick={() => setPrefix(r.path)}><FolderOpen size={14} /> {r.name}</button> : <code>{r.name}</code>}{!selectableRow(r) && <span className="muted small"> · managed under Security › SSH keys</span>}</>},
               { key: 'type', label: 'Type', render: (r) => ({ dir: 'Folder', file: 'File', symlink: 'Link' }[r.type] || r.type) },
               { key: 'files', label: 'Files', align: 'right', render: (r) => (r.type === 'dir' ? r.files : <span className="muted">—</span>) },
               { key: 'size', label: 'Size', align: 'right', render: (r) => sizeText(r.size) },
               { key: 'mtime', label: 'Modified', render: (r) => (r.mtime ? formatDate(r.mtime) : <span className="muted">—</span>) },
             ]}
             rows={entries} loading={browse.loading} error={isCapabilityError(browse.error) ? null : browse.error} rowKey={(r) => r.path}
-            selectable selected={selected} onSelectedChange={setSelected} dense
+            selectable selected={selected} onSelectedChange={(keys) => setSelected(restorablePaths(keys, allowSsh))} canSelect={selectableRow} dense
             emptyText={browse.loading ? 'Reading the archive…' : 'This folder is empty in the archive.'}
           />
         )}
+        {sshBlocked && <div className="card-body muted small" data-testid="ssh-note"><Info size={12} /> {SSH_NOTE}.</div>}
         {current && browse.data?.truncated && <div className="card-body muted small">Only the first {entries.length} entries of this folder are shown.</div>}
         {current && selected.length > 0 && <div className="card-body muted small">{selected.length} selected: {selected.slice(0, 6).map((p) => <code key={p}>{relativeToHome(p)}</code>).reduce((acc, el, i) => (i ? [...acc, ' ', el] : [el]), [])}{selected.length > 6 ? ' …' : ''}</div>}
       </Card>

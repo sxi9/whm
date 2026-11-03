@@ -17,7 +17,7 @@ const { ToastProvider } = await import('../src/components/Toast.jsx');
 const { ConfirmProvider } = await import('../src/components/Modal.jsx');
 const { PANEL_FUNCTION_BY_KEY } = await import('../src/panel/nav.js');
 const { default: Backups } = await import('../src/pages/panel/backups/backups.jsx');
-const { default: Restore, restorableBackups, relativeToHome, restoreSummary, backupOptionLabel } = await import('../src/pages/panel/backups/restore.jsx');
+const { default: Restore, restorableBackups, relativeToHome, restoreSummary, backupOptionLabel, sshRestoreAllowed, touchesSsh, restorablePaths, SSH_NOTE } = await import('../src/pages/panel/backups/restore.jsx');
 const { filterBackups, prefixCrumbs, joinPrefix, kindLabel, toBase64 } = await import('../src/pages/panel/backups/parts/shared.jsx');
 
 React.useLayoutEffect = React.useEffect;
@@ -166,6 +166,45 @@ describe('Restore page', () => {
     html = render(h(Restore, { fn: fnRestore }), fnRestore.path);
     expect(html).toContain('Not included in your plan');
     expect(html).not.toContain('Upload an archive');
+  });
+
+  const withSsh = { ...browse, total: 3, entries: [...browse.entries, { name: '.ssh', path: 'homedir/.ssh', type: 'dir', size: 4096, files: 2, mtime: '2026-10-30T10:00:00Z', mode: '0700', owner: 'demo:demo', target: null }] };
+  const shellMe = { account: { ...me.account, plan: { has_shell: true }, features: { backup: true } } };
+  const renderWithSsh = (over) => {
+    fixtures.responses.clear();
+    set('/panel/backups?page=1&pageSize=200', { data: rows, meta });
+    set('/panel/backups/restores', { data: restores });
+    set('/panel/backups/3/browse?prefix=homedir', { data: withSsh });
+    return render(h(Restore, { fn: fnRestore }), `${fnRestore.path}?backup=3`, ctxFor(over));
+  };
+
+  it('keeps .ssh out of the selection and says why when the account could not restore it (no shell, ssh feature off, or acting as)', () => {
+    for (const over of [{}, { account: { ...me.account, plan: { has_shell: true }, features: { ssh: false } } }, { ...shellMe, actingAs: { account: 'demo', by: 'root', expiresAt: null } }]) {
+      const html = renderWithSsh(over);
+      expect(html).toContain(SSH_NOTE);
+      expect(html).toContain('disabled="" aria-label="Select homedir/.ssh"');
+      expect(html).toContain('<input type="checkbox" aria-label="Select homedir/public_html"/>');
+      expect(html).toContain('managed under Security › SSH keys');
+    }
+  });
+
+  it('offers .ssh to a session login with shell access and the ssh feature', () => {
+    const html = renderWithSsh(shellMe);
+    expect(html).not.toContain(SSH_NOTE);
+    expect(html).not.toContain('managed under Security › SSH keys');
+    expect(html).toContain('<input type="checkbox" aria-label="Select homedir/.ssh"/>');
+  });
+
+  it('helpers: sshRestoreAllowed, touchesSsh, restorablePaths mirror the server gate', () => {
+    expect(sshRestoreAllowed(me)).toBe(false);
+    expect(sshRestoreAllowed({ ...me, ...shellMe })).toBe(true);
+    expect(sshRestoreAllowed({ ...me, account: { ...shellMe.account, features: { ssh: false } } })).toBe(false);
+    expect(sshRestoreAllowed({ ...me, ...shellMe, actingAs: { account: 'demo', by: 'root' } })).toBe(false);
+    expect(sshRestoreAllowed(null)).toBe(false);
+    for (const p of ['homedir/.ssh', 'homedir/.ssh/', 'homedir/.ssh/authorized_keys', 'homedir', 'homedir/', '', '.']) expect(touchesSsh(p), p).toBe(true);
+    for (const p of ['homedir/public_html', 'homedir/.sshx', 'homedir/a/.ssh/k', 'homedir/.bashrc']) expect(touchesSsh(p), p).toBe(false);
+    expect(restorablePaths(['homedir/.ssh', 'homedir/public_html', 'homedir'], false)).toEqual(['homedir/public_html']);
+    expect(restorablePaths(['homedir/.ssh', 'homedir/public_html'], true)).toEqual(['homedir/.ssh', 'homedir/public_html']);
   });
 
   it('helpers: restorableBackups, relativeToHome, restoreSummary, backupOptionLabel', () => {
