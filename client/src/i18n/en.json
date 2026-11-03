@@ -305,7 +305,7 @@
   "fn.transfers/review-transfers-and-restores.label": "Review Transfers and Restores",
   "fn.transfers/review-transfers-and-restores.description": "History and logs of transfer jobs.",
   "fn.transfers/transfer-or-restore-a-cpanel-account.label": "Transfer or Restore an Account",
-  "fn.transfers/transfer-or-restore-a-cpanel-account.description": "Import an account from a backup or remote server.",
+  "fn.transfers/transfer-or-restore-a-cpanel-account.description": "Import an account from a backup, a cPanel server or another Keel server.",
   "fn.transfers/transfer-tool.label": "Transfer Tool",
   "fn.transfers/transfer-tool.description": "Migrate many accounts from another server.",
   "fn.themes/theme-manager.label": "Theme Manager",

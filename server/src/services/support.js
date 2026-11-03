@@ -20,12 +20,12 @@ export const JOB_EXPIRE = 'support.expire_access';
 export const SCHEDULE_EXPIRE = 'support-access-expiry';
 
 export const SUPPORT_LINKS = [
-  { key: 'docs', label: 'cPanel & WHM documentation', url: 'https://docs.cpanel.net/', description: 'Reference documentation for every WHM and cPanel interface.' },
-  { key: 'forums', label: 'cPanel community forums', url: 'https://forums.cpanel.net/', description: 'Community help from other administrators.' },
-  { key: 'support', label: 'Open a ticket with cPanel Support', url: 'https://support.cpanel.net/', description: 'Direct support for licensed servers.' },
-  { key: 'status', label: 'cPanel service status', url: 'https://status.cpanel.net/', description: 'Outages affecting licensing, mirrors and updates.' },
-  { key: 'security', label: 'Security advisories', url: 'https://news.cpanel.com/category/security/', description: 'Announcements about vulnerabilities and patches.' },
-  { key: 'api', label: 'API documentation', url: 'https://api.docs.cpanel.net/', description: 'WHM API 1, UAPI and cPanel API 2 references.' },
+  { key: 'docs', label: 'Keel documentation', url: 'https://github.com/sxi9/whm/blob/main/docs/MANUAL.md', description: 'The user manual: every function of the panel, licensing, plugins and the marketplace.' },
+  { key: 'install', label: 'Installation and upgrade guide', url: 'https://github.com/sxi9/whm/blob/main/docs/INSTALL.md', description: 'Requirements, the installer, the hub, upgrades, backups and every configuration variable.' },
+  { key: 'support', label: 'Open a ticket with your provider', url: 'https://github.com/sxi9/whm/issues', description: 'Support for licensed servers; your provider can replace this link under Panel › Customization.' },
+  { key: 'security', label: 'Security advisories', url: 'https://github.com/sxi9/whm/security/advisories', description: 'Announcements about vulnerabilities and patches.' },
+  { key: 'api', label: 'API documentation', url: '/development/openapi-documentation-for-whm', description: 'The admin and account-panel OpenAPI references served by this panel.' },
+  { key: 'sdk', label: 'Plugin developer reference', url: 'https://github.com/sxi9/whm/blob/main/plugins/SDK.md', description: 'Manifest, host API, packaging and signing for plugins.' },
 ];
 
 // The blueprint describes the privilege-separation design and allowed roots,
@@ -254,7 +254,7 @@ export function createSupportService(ctx) {
 
   function ticketReference() {
     const day = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    return `WHM-${day}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+    return `KEEL-${day}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
   }
 
   function renderTicketMail(t, snap) {

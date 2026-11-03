@@ -124,7 +124,7 @@ describe('Support API', () => {
       const res = await get('/api/support/center');
       expect(res.status).toBe(200);
       const d = res.body.data;
-      expect(d.links.some((l) => l.url === 'https://docs.cpanel.net/')).toBe(true);
+      expect(d.links.some((l) => l.url === 'https://github.com/sxi9/whm/blob/main/docs/MANUAL.md')).toBe(true);
       expect(d.inApp.find((l) => l.key === 'api').path).toBe('/development/openapi-documentation-for-whm');
       expect(d.docs.map((x) => x.slug)).toEqual(['readme', 'blueprint']);
       expect(d.docs.every((x) => x.available && x.sections.length > 0)).toBe(true);
@@ -257,7 +257,7 @@ describe('Support API', () => {
       expect(res.status).toBe(201);
       const t = res.body.data;
       ticketId = t.id;
-      expect(t.reference).toMatch(/^WHM-\d{8}-[0-9A-F]{6}$/);
+      expect(t.reference).toMatch(/^KEEL-\d{8}-[0-9A-F]{6}$/);
       expect(t).toMatchObject({ status: 'open', severity: 'high', category: 'email', createdBy: 'root', hasSnapshot: true, contactEmail: 'admin@example.net' });
       expect(t.delivery.status).toBe('not_sent');
       expect(t.delivery.detail).toMatch(/no mail transport/i);
@@ -299,7 +299,7 @@ describe('Support API', () => {
       expect(res.body.data.delivery.at).toMatch(/Z$/);
       expect(sent).toHaveLength(1);
       expect(sent[0].to).toEqual(['support@example.net']);
-      expect(sent[0].subject).toMatch(/^\[WHM-\d{8}-[0-9A-F]{6}\] Exim queue grows \(high\)$/);
+      expect(sent[0].subject).toMatch(/^\[KEEL-\d{8}-[0-9A-F]{6}\] Exim queue grows \(high\)$/);
       expect(sent[0].headers).toEqual({ 'Reply-To': 'admin@example.net' });
       expect(sent[0].text).toContain('4000 frozen messages');
       expect(sent[0].text).toContain(`"hostname": "${host()}"`);
