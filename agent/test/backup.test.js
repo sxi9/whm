@@ -119,7 +119,7 @@ describe('backup schemas reject injection and traversal before anything runs', (
     expect((await opError(runOp('backup.db.restore_users', { users: [{ user: 'a b', host: 'localhost' }] }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('backup.db.restore_users', { users: [{ user: 'app', host: 'localhost', hashHex: 'zz' }] }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('backup.db.restore_users', { users: [{ user: 'app', host: 'localhost', grants: ['DROP TABLE x'] }] }, ctx))).code).toBe('invalid_args');
-    expect((await opError(runOp('backup.db.import', { file: '/etc/x.sql' }, ctx))).code).toMatch(/capability_missing|path_not_allowed/);
+    expect((await opError(runOp('backup.db.import', { file: '/etc/x.sql', database: 'shop' }, ctx))).code).toMatch(/capability_missing|path_not_allowed/);
     expect(exec).not.toHaveBeenCalled();
   });
 

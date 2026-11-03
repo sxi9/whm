@@ -41,42 +41,53 @@ export function Shell({ area }) {
   const stepUp = stepUpIndicator(session);
   const impersonating = impersonationText(session);
 
+  const nav = (
+    <nav className="sidebar-nav" aria-label="Portal navigation">
+      {(NAV_BY_AREA[area] || []).map((group) => (
+        <div className="nav-category" key={group.title}>
+          <div className="nav-category-head"><span>{group.title}</span></div>
+          <ul>
+            {group.items.map((item) => (
+              <li key={item.to}><NavLink to={item.to} end={item.end} onClick={() => setMobileOpen(false)} className={({ isActive }) => (isActive ? 'active' : '')}>{item.label}</NavLink></li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </nav>
+  );
+  const brandBlock = (
+    <div className="brand">
+      {reseller?.logo_url ? <img src={reseller.logo_url} alt="" className="brand-logo" style={{ height: 34, width: 'auto', maxWidth: 160 }} /> : <span className="brand-mark" aria-hidden="true"><ShieldCheck size={18} /></span>}
+      <span className="brand-text"><span className="brand-name">{brand}</span><span className="brand-sub">{AREA_LABELS[area]}</span></span>
+    </div>
+  );
+
   return (
     <div className={`app ${mobileOpen ? 'mobile-open' : ''}`}>
-      {impersonating && (
-        <div className="impersonation-banner" role="status">
-          <UserCog size={14} /> <span>{impersonating} — every action is audited under your vendor identity.</span>
-          <button type="button" className="btn btn-sm" onClick={async () => { await endImpersonation?.(); navigate('/admin/resellers'); }}>End impersonation</button>
-        </div>
-      )}
-      <header className="topbar">
-        <button className="icon-button topbar-menu" onClick={() => setMobileOpen((o) => !o)} aria-label="Menu"><Menu size={20} /></button>
-        <div className="brand">{reseller?.logo_url ? <img src={reseller.logo_url} alt="" className="brand-logo" style={{ height: 20, width: 'auto' }} /> : <ShieldCheck size={18} />} <strong>{brand}</strong> <span className="brand-sub muted">{AREA_LABELS[area]}</span></div>
-        <div className="topbar-right">
-          {session?.kind !== 'developer' && <span className="topbar-host" title="Two-factor step-up status"><KeyRound size={12} /> {stepUp}</span>}
-          <span className="topbar-host">{identity} · {role}</span>
-          <button className="icon-button" onClick={async () => { await logout(); navigate(area === 'dev' ? '/dev/login' : '/login'); }} aria-label="Sign out" title="Sign out"><LogOut size={18} /></button>
-        </div>
-      </header>
-      <div className="app-body">
-        {mobileOpen && <div className="sidebar-scrim" onClick={() => setMobileOpen(false)} />}
-        <aside className="sidebar">
-          <nav className="sidebar-nav" aria-label="Portal navigation">
-            {(NAV_BY_AREA[area] || []).map((group) => (
-              <div className="nav-category" key={group.title}>
-                <div className="nav-category-head"><span>{group.title}</span></div>
-                <ul>
-                  {group.items.map((item) => (
-                    <li key={item.to}><NavLink to={item.to} end={item.end} onClick={() => setMobileOpen(false)} className={({ isActive }) => (isActive ? 'active' : '')}>{item.label}</NavLink></li>
-                  ))}
-                </ul>
-              </div>
-            ))}
-          </nav>
-        </aside>
+      <aside className="sidebar">
+        <div className="sidebar-brand">{brandBlock}</div>
+        {nav}
+      </aside>
+      {mobileOpen && <div className="sidebar-scrim" onClick={() => setMobileOpen(false)} />}
+      <div className="app-main">
+        {impersonating && (
+          <div className="impersonation-banner" role="status">
+            <UserCog size={14} /> <span>{impersonating} — every action is audited under your vendor identity.</span>
+            <button type="button" className="btn btn-sm" onClick={async () => { await endImpersonation?.(); navigate('/admin/resellers'); }}>End impersonation</button>
+          </div>
+        )}
+        <header className="topbar">
+          <button className="icon-button topbar-menu" onClick={() => setMobileOpen((o) => !o)} aria-label="Menu"><Menu size={20} /></button>
+          <div className="topbar-brand">{brandBlock}</div>
+          <div className="topbar-right">
+            {session?.kind !== 'developer' && <span className="topbar-host" title="Two-factor step-up status"><KeyRound size={12} /> {stepUp}</span>}
+            <span className="topbar-host">{identity} · {role}</span>
+            <button className="icon-button" onClick={async () => { await logout(); navigate(area === 'dev' ? '/dev/login' : '/login'); }} aria-label="Sign out" title="Sign out"><LogOut size={18} /></button>
+          </div>
+        </header>
         <main className="content"><Outlet /></main>
+        <footer className="app-footer"><span>{reseller ? brand : 'whm-hub'} · {AREA_LABELS[area]}</span><span className="muted">{reseller?.support_url ? <a href={reseller.support_url} target="_blank" rel="noreferrer noopener">Support</a> : 'Every mutation is audited'}</span></footer>
       </div>
-      <footer className="app-footer"><span>{reseller ? brand : 'whm-hub'} · {AREA_LABELS[area]}</span><span className="muted">{reseller?.support_url ? <a href={reseller.support_url} target="_blank" rel="noreferrer noopener">Support</a> : 'Every mutation is audited'}</span></footer>
     </div>
   );
 }

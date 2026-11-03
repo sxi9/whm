@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { exec, hasBinary, resolveBinary } from '../exec.js';
 import { defineOp, arg, OpError, ensurePrivateDir } from './registry.js';
 import { renderClientCnf, classifyMysqlError, parseBatch, cloneUserStatements, parseGrant, q } from './db.js';
-import { createSqlCodeFilter, createClientCommandGuard } from './transfer.js';
+import { createSqlCodeFilter, createClientCommandGuard, withImportUser, withClientDefaults, runSql, SYSTEM_SCHEMAS } from './transfer.js';
 
 // Backup op family. An account archive is a cPanel-compatible tarball:
 //
@@ -587,48 +587,61 @@ export async function screenDumpForClientCommands(file, { database } = {}) {
   const codeOf = createSqlCodeFilter();
   const guard = createClientCommandGuard({ database });
   let lineNo = 0;
+  let definers = false;
   try {
     for await (const line of rl) {
       lineNo++;
-      const reason = guard(codeOf(line));
+      const code = codeOf(line);
+      const reason = guard(code);
       if (reason) return { ok: false, line: lineNo, reason };
+      if (!definers && /\bDEFINER\s*=/i.test(code)) definers = true;
     }
   } finally { rl.close(); stream.destroy(); }
-  return { ok: true, lines: lineNo };
+  return { ok: true, lines: lineNo, definers };
 }
 
 defineOp('backup.db.import', {
-  description: 'Import a mysqldump file through the client (source <file>); with `database`, the schema is created first (mysql/<db>.create charset honoured) and the dump is sourced inside it',
+  description: 'Import a mysqldump file into one database: the schema is created first with admin credentials (mysql/<db>.create charset honoured), then the dump is sourced by a temporary user that holds privileges on that database only',
   destructive: true,
   timeoutMs: 7_200_000,
   // The file name is placed on the client's `source` line, so it is kept to a plain character set.
-  schema: z.object({ file: arg.absPath.refine((p) => /^[A-Za-z0-9._/-]+\.sql$/.test(p), 'Dump path: letters, digits, "._/-" ending in .sql'), database: dbName.optional(), credentials, force: z.boolean().default(false) }).strict(),
+  schema: z.object({ file: arg.absPath.refine((p) => /^[A-Za-z0-9._/-]+\.sql$/.test(p), 'Dump path: letters, digits, "._/-" ending in .sql'), database: dbName, credentials, force: z.boolean().default(false) }).strict(),
   run: async ({ file, database, credentials: creds, force }, ctx) => {
     const bin = findBin(CLIENT_BINS);
     if (!bin) throw new OpError('capability_missing', 'The MySQL/MariaDB client (mysql or mariadb) is not installed on this server');
+    if (SYSTEM_SCHEMAS.has(database)) throw new OpError('refused', `"${database}" is a system database`);
     const sql = ctx.assertAllowedPath(file, 'read');
     if (!/\.sql$/.test(sql) || !exists(sql)) throw new OpError('not_found', `${file} is not an existing .sql dump`);
     const screen = await screenDumpForClientCommands(sql, { database });
     if (!screen.ok) throw new OpError('refused', `${path.basename(sql)} line ${screen.line}: ${screen.reason}; review the dump and import it by hand if it is legitimate`);
-    let created = false;
-    if (database) {
-      let createText = '';
-      try { createText = fs.readFileSync(`${sql.slice(0, -4)}.create`, 'utf8').slice(0, 4096); } catch { /* panel archives carry no .create file */ }
-      const before = await mysqlQuery(`SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ${q.str(database)}`, creds, ctx, { headers: false });
-      await mysqlQuery(createDatabaseStatement(database, createText), creds, ctx);
-      created = before.length === 0;
-    }
-    const defaults = defaultsFor(creds, ctx);
-    try {
-      const argv = [...defaults.argv, '--batch', '--no-auto-rehash', '--connect-timeout=10'];
-      if (force) argv.push('--force');
-      if (database) argv.push('--database', database);
-      // `source` makes the client stream the file itself, so dumps of any size never pass through this process.
-      argv.push('--execute', `source ${sql}`);
-      const { code, stderr } = await exec(bin, argv, { allowFailure: true, timeoutMs: 7_200_000 });
-      if (code !== 0) { const err = classifyMysqlError(stderr); throw new OpError(err.code, `MySQL: ${err.message}`, { errno: err.errno }); }
-      return { file: sql, database: database ?? null, created, sizeBytes: fs.statSync(sql).size, warnings: stderr.trim() ? stderr.trim().split('\n').slice(-5) : [] };
-    } finally { defaults.cleanup(); }
+    const [sqlMode = '', socket = '', port = ''] = (await runSql(bin, 'SELECT @@GLOBAL.sql_mode, @@socket, @@port', creds)).trim().split('\t');
+    // Under NO_BACKSLASH_ESCAPES the client tokenises strings differently from
+    // the screen above, which would let "\!" hide inside a literal.
+    if (/\bNO_BACKSLASH_ESCAPES\b/i.test(sqlMode)) throw new OpError('refused', 'The MySQL server runs with sql_mode NO_BACKSLASH_ESCAPES, under which dumps cannot be screened for mysql client commands; import the dump by hand');
+    let createText = '';
+    try { createText = fs.readFileSync(`${sql.slice(0, -4)}.create`, 'utf8').slice(0, 4096); } catch { /* panel archives carry no .create file */ }
+    const before = await mysqlQuery(`SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ${q.str(database)}`, creds, ctx, { headers: false });
+    await mysqlQuery(createDatabaseStatement(database, createText), creds, ctx);
+    const created = before.length === 0;
+    // The dump itself runs as a throw-away user confined to this database, so a
+    // statement the screen did not catch is refused by the server rather than
+    // executed with admin rights.
+    return withImportUser(bin, creds, database, { definers: screen.definers }, async (login) => {
+      const client = { user: login.user, password: login.password };
+      if (creds?.host) { client.host = creds.host; if (creds.port) client.port = creds.port; } else if (creds?.socket) client.socket = creds.socket;
+      else if (socket && socket !== 'NULL') client.socket = socket;
+      else if (port && port !== 'NULL') { client.host = '127.0.0.1'; client.port = Number(port); }
+      return withClientDefaults(client, async (defaults) => {
+        const argv = [...defaults, '--batch', '--no-auto-rehash', '--connect-timeout=10'];
+        if (force) argv.push('--force');
+        argv.push('--database', database);
+        // `source` makes the client stream the file itself, so dumps of any size never pass through this process.
+        argv.push('--execute', `source ${sql}`);
+        const { code, stderr } = await exec(bin, argv, { allowFailure: true, timeoutMs: 7_200_000 });
+        if (code !== 0) { const err = classifyMysqlError(stderr); throw new OpError(err.code, `MySQL: ${err.message}`, { errno: err.errno }); }
+        return { file: sql, database, created, sizeBytes: fs.statSync(sql).size, importUser: login.user, definerPrivilege: login.definerPrivilege, warnings: stderr.trim() ? stderr.trim().split('\n').slice(-5) : [] };
+      }, { exclusive: true });
+    });
   },
 });
 

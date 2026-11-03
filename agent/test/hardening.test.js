@@ -223,7 +223,7 @@ describe('backup.db.import screens dumps for mysql client commands', () => {
   const dump = (name, extra = []) => { const f = path.join(root, `${name}.sql`); fs.writeFileSync(f, [...header, ...extra].join('\n') + '\n'); return f; };
 
   it('passes a mysqldump of the target database, strings and triggers included', async () => {
-    await expect(screenDumpForClientCommands(dump('clean'), { database: 'shop' })).resolves.toEqual({ ok: true, lines: header.length });
+    await expect(screenDumpForClientCommands(dump('clean'), { database: 'shop' })).resolves.toEqual({ ok: true, lines: header.length, definers: true });
   });
 
   it('refuses system, backslash, tee and source commands and a USE of another database', async () => {
@@ -246,6 +246,39 @@ describe('backup.db.import screens dumps for mysql client commands', () => {
       expect(err.message).toMatch(/line 14: the dump contains a backslash command/);
       expect(exec).not.toHaveBeenCalled();
     } finally {
+      hasBinary.mockImplementation(original);
+    }
+  });
+
+  it('backup.db.import sources the dump as a temporary user confined to the database, never as the admin', async () => {
+    const original = hasBinary.getMockImplementation();
+    hasBinary.mockImplementation((n) => n === 'mysql' || original(n));
+    const calls = [];
+    exec.mockImplementation(async (bin, argv, opts = {}) => {
+      calls.push({ argv, input: opts.input || '' });
+      if (/@@GLOBAL\.sql_mode/.test(opts.input || '')) return { code: 0, stdout: 'STRICT_TRANS_TABLES\t/run/mysqld/mysqld.sock\t3306\n', stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    });
+    try {
+      const file = dump('import-clean');
+      const result = await runOp('backup.db.import', { file, database: 'shop' }, ctx);
+      expect(result.importUser).toMatch(/^whm_import_[0-9a-f]{12}$/);
+      const source = calls.find((c) => c.argv.some((a) => a === `source ${file}`));
+      expect(source, 'the dump is sourced').toBeTruthy();
+      expect(source.argv.some((a) => a.startsWith('--defaults-file='))).toBe(true);
+      expect(source.argv.some((a) => a.startsWith('--defaults-extra-file=') || a === '/root/.my.cnf')).toBe(false);
+      expect(source.argv).toContain('--database');
+      const sql = calls.map((c) => c.input).join('\n');
+      expect(sql).toMatch(new RegExp(`CREATE USER '${result.importUser}'@'localhost' IDENTIFIED BY`));
+      expect(sql).toMatch(new RegExp(`GRANT ALL PRIVILEGES ON \`shop\`\\.\\* TO '${result.importUser}'@'localhost'`));
+      expect(sql).toMatch(new RegExp(`DROP USER IF EXISTS '${result.importUser}'@'localhost'`));
+      expect(sql).not.toMatch(/GRANT ALL PRIVILEGES ON \*\.\*/);
+      const order = ['CREATE USER', `source ${file}`, 'DROP USER'].map((needle) => calls.findIndex((c) => c.input.includes(needle) || c.argv.includes(needle)));
+      expect(order[0]).toBeLessThan(order[1]);
+      expect(order[1]).toBeLessThan(order[2]);
+    } finally {
+      exec.mockReset();
+      exec.mockImplementation((await vi.importActual('../src/exec.js')).exec);
       hasBinary.mockImplementation(original);
     }
   });

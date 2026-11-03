@@ -179,9 +179,16 @@ export function createAuthService(ctx) {
       stmts.setTotp.run(user.totp_secret_enc, 1, userId);
     },
 
-    disable2fa(userId) {
+    // Turning the second factor off is itself a sensitive change: it needs the
+    // current password or a code from the authenticator, so a hijacked session
+    // cannot strip the account's protection.
+    async disable2fa(userId, { password, code } = {}) {
       const user = stmts.byId.get(userId);
       if (user && needsEnrollment({ ...user, totp_enabled: 0 }, policy())) throw forbidden('Two-factor authentication is required for your role by the server security policy');
+      if (!user) throw forbidden('Unknown user');
+      const byCode = code && user.totp_secret_enc ? verifyTotp(user, code) : false;
+      const byPassword = !byCode && password ? await crypto.verifyPassword(password, user.password_hash) : false;
+      if (!byCode && !byPassword) throw forbidden('Confirm with your current password or a code from your authenticator app');
       stmts.setTotp.run(null, 0, userId);
     },
   };

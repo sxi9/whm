@@ -551,7 +551,7 @@ environment (deep-merged on top) → defaults. An invalid file aborts with
 |---|---|---|
 | `public_url` | `https://localhost:7443` | URL panels and portals use; `iss` of every token. |
 | `serve_ui` | `false` (template: `true`) | Serve `hub/ui/dist` at `/` with SPA fallback for `/login`, `/admin/*`, `/reseller/*`, `/dev/*`. Logs `serve_ui is set but hub/ui/dist is missing` when the build is absent. |
-| `ui_dist` | *(unset)* | Alternative build directory. The server reads the `WHM_HUB_UI_DIST` environment variable for this (`uiDistDir()` in `hub/src/app.js`). |
+| `ui_dist` | *(unset)* | Alternative build directory for the portals (`WHM_HUB_UI_DIST` overrides it). |
 | `host` | `0.0.0.0` | Bind address. |
 | `port` | `7443` | Public listener (1–65535). |
 | `loopback_port` | `7440` | `127.0.0.1` listener for `/healthz` and `/metrics`; `0` disables it. |
@@ -783,7 +783,7 @@ default from [§5.6](#56-hubconf-reference). Booleans accept `1`, `true`, `yes`.
 | `WHM_HUB_CONFIG` | *(path of hub.conf; default `/etc/whm-hub/hub.conf`)* |
 | `WHM_HUB_PUBLIC_URL` | `public_url` |
 | `WHM_HUB_SERVE_UI` | `serve_ui` (bool) |
-| `WHM_HUB_UI_DIST` | `ui_dist` — also read directly by the SPA server |
+| `WHM_HUB_UI_DIST` | `ui_dist` (the variable wins over the file) |
 | `WHM_HUB_HOST` | `host` |
 | `WHM_HUB_PORT` | `port` (int) |
 | `WHM_HUB_LOOPBACK_PORT` | `loopback_port` (int) |

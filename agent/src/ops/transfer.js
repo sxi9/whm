@@ -599,14 +599,14 @@ defineOp('transfer.cpmove.extract', {
 
 // ------------------------------------------------------------- mysql/upload ---
 
-function findClient() {
+export function findClient() {
   return CLIENT_BINS.find(hasBinary) || null;
 }
 
 // Runs fn(defaultsArgv) with the credentials in a short-lived 0600 option file
 // (or /root/.my.cnf when none were given). `exclusive` makes that file the
 // only option file the client reads.
-async function withClientDefaults(creds, fn, { exclusive = false } = {}) {
+export async function withClientDefaults(creds, fn, { exclusive = false } = {}) {
   let dir = null;
   const defaults = [];
   if (creds && Object.keys(creds).length) {
@@ -619,7 +619,7 @@ async function withClientDefaults(creds, fn, { exclusive = false } = {}) {
   try { return await fn(defaults); } finally { if (dir) fs.rmSync(dir, { recursive: true, force: true }); }
 }
 
-async function runSql(bin, sql, creds, { timeoutMs = 120_000 } = {}) {
+export async function runSql(bin, sql, creds, { timeoutMs = 120_000 } = {}) {
   return withClientDefaults(creds, async (defaults) => {
     const { code, stdout, stderr } = await exec(bin, [...defaults, '--batch', '--skip-column-names', '--no-auto-rehash', '--connect-timeout=10'], { input: `${sql}\n`, timeoutMs, allowFailure: true });
     if (code !== 0) {
@@ -631,7 +631,7 @@ async function runSql(bin, sql, creds, { timeoutMs = 120_000 } = {}) {
 }
 
 const belongsTo = (name, prefix) => name === prefix || name.startsWith(`${prefix}_`);
-const SYSTEM_SCHEMAS = new Set(['mysql', 'sys', 'information_schema', 'performance_schema']);
+export const SYSTEM_SCHEMAS = new Set(['mysql', 'sys', 'information_schema', 'performance_schema']);
 
 // Statements a dump of one account's database never needs. The import runs as
 // a temporary user limited to the target database, so the server refuses them
@@ -907,7 +907,7 @@ async function grantDefinerPrivilege(bin, accounts, creds) {
 // database and nothing else, so cross-schema statements, SET GLOBAL, FILE
 // operations and the like are refused by the server itself, whatever the
 // scanner missed. The user is dropped when fn settles.
-async function withImportUser(bin, creds, database, { definers }, fn) {
+export async function withImportUser(bin, creds, database, { definers }, fn) {
   const user = `whm_import_${crypto.randomBytes(6).toString('hex')}`;
   const password = crypto.randomBytes(24).toString('base64url');
   const hosts = !creds?.host ? ['localhost'] : LOCAL_HOSTS.has(creds.host) ? [...LOCAL_HOSTS] : ['%'];

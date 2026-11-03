@@ -67,11 +67,12 @@ test('serve_ui: index.html for portal routes, static assets, API and health unto
   }
 });
 
-test('uiDistDir: only WHM_HUB_UI_DIST overrides the bundled dist (hub.conf has no ui_dist key)', () => {
+test('uiDistDir: hub.conf ui_dist overrides the bundled dist; WHM_HUB_UI_DIST overrides both', () => {
   const saved = process.env.WHM_HUB_UI_DIST;
   delete process.env.WHM_HUB_UI_DIST;
   try {
-    assert.equal(uiDistDir({ ui_dist: '/elsewhere' }), path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../ui/dist'));
+    assert.equal(uiDistDir({}), path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../ui/dist'));
+    assert.equal(uiDistDir({ ui_dist: '/elsewhere' }), '/elsewhere');
     process.env.WHM_HUB_UI_DIST = '/from-env';
     assert.equal(uiDistDir({ ui_dist: '/elsewhere' }), '/from-env');
   } finally {
