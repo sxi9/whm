@@ -4,7 +4,7 @@ import http from 'node:http';
 import os from 'node:os';
 import { json, paginate } from '../db/index.js';
 import { notFound, conflict, forbidden, badRequest, unprocessable, CapabilityError } from '../lib/errors.js';
-import { isRoot } from '../middleware/rbac.js';
+import { isRoot, ownsRow } from '../middleware/rbac.js';
 import {
   RECORD_TYPES, ZoneError, nextSerial, normalizeRecord, renderZone, renderTemplate, parseZone, parseSoaValue, soaValue, checkConflicts,
 } from './dns-zonefile.js';
@@ -94,7 +94,7 @@ export function createDnsService(ctx) {
   }
 
   function visible(zone, user) {
-    if (!isRoot(user) && zone.owner_id !== user.id) throw forbidden('That zone belongs to another reseller');
+    if (!ownsRow(user, zone)) throw forbidden('That zone belongs to another reseller');
     return zone;
   }
 
@@ -128,7 +128,7 @@ export function createDnsService(ctx) {
   function loadAccount(username, user) {
     const account = stmts.accountByUsername.get(username);
     if (!account) throw notFound('Account');
-    if (!isRoot(user) && account.owner_id !== user.id) throw forbidden('That account belongs to another reseller');
+    if (!ownsRow(user, account, { accountId: account.id })) throw forbidden('That account belongs to another reseller');
     return account;
   }
 
@@ -1060,7 +1060,7 @@ export function createDnsService(ctx) {
     async unparkDomain(domain, { removeZone = true } = {}, user, req) {
       const parked = stmts.parkedByDomain.get(domain);
       if (!parked) throw notFound(`Parked domain ${domain}`);
-      if (!isRoot(user) && parked.owner_id !== user.id) throw forbidden('That domain belongs to another reseller\'s account');
+      if (!ownsRow(user, parked)) throw forbidden('That domain belongs to another reseller\'s account');
       stmts.deleteParked.run(parked.id);
       const zone = stmts.zoneByDomain.get(domain);
       if (removeZone && zone) await removeZoneInternal(zone, req);
@@ -1145,7 +1145,7 @@ export function createDnsService(ctx) {
     async setForwarding(domain, input, user, req) {
       const account = accountForDomain(domain);
       if (!account && !isRoot(user)) throw forbidden('Resellers can only forward domains hosted on their accounts');
-      if (account && !isRoot(user) && account.owner_id !== user.id) throw forbidden('That domain belongs to another reseller\'s account');
+      if (account && !ownsRow(user, account, { accountId: account.id })) throw forbidden('That domain belongs to another reseller\'s account');
       let url;
       try { url = new URL(input.targetUrl); } catch { throw unprocessable('Target must be an absolute URL', { targetUrl: ['e.g. https://www.example.com/'] }); }
       if (!['http:', 'https:'].includes(url.protocol)) throw unprocessable('Target must use http or https', { targetUrl: ['Only http:// and https:// targets are allowed'] });
@@ -1159,7 +1159,7 @@ export function createDnsService(ctx) {
     async removeForwarding(domain, user, req) {
       const row = stmts.forwarding.get(domain);
       if (!row) throw notFound(`Forwarding for ${domain}`);
-      if (!isRoot(user) && row.owner_id !== user.id) throw forbidden('That domain belongs to another reseller\'s account');
+      if (!ownsRow(user, row)) throw forbidden('That domain belongs to another reseller\'s account');
       stmts.deleteForwarding.run(domain);
       const { web, webDetail } = await applyWeb(domain, async () => {
         if (typeof ctx.web?.setRedirects !== 'function') return false;

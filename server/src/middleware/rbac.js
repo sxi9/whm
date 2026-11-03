@@ -15,6 +15,19 @@ export const requireReseller = requireRole('root', 'reseller');
 
 export const isRoot = (user) => user?.role === 'root';
 
+// Row-level ownership for category services: root sees every row, a reseller
+// the rows whose owner_id is its own user id, and a role-`user` principal only
+// the rows of the single account it is pinned to (`user.accountId`, set by the
+// account panel's scope). For that role nothing else counts: a users row never
+// owns accounts, and username equality is not ownership. `accountId` names the
+// row's account column (default account_id); pass `row.id` for an accounts row.
+export function ownsRow(user, row, { accountId = row?.account_id } = {}) {
+  if (!user || !row) return false;
+  if (isRoot(user)) return true;
+  if (user.role === 'user') return user.accountId != null && accountId != null && accountId === user.accountId;
+  return row.owner_id === user.id;
+}
+
 // API tokens may carry scopes narrower than the user's role. A token with no
 // scopes inherits the role; otherwise the route's scope must be listed.
 export function requireScope(scope) {

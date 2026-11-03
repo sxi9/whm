@@ -548,10 +548,11 @@ describe('Exim Configuration Manager', () => {
     const s = DEFAULTS.exim;
     const light = { ...EXIM_LAYOUT, features: ['crypteq', 'iconv()', 'IPv6', 'GnuTLS', 'DKIM', 'DNSSEC'], support: { spf: false, dkim: true, dmarc: false } };
     const heavy = { ...EXIM_LAYOUT, features: ['crypteq', 'DKIM', 'SPF', 'DMARC'], support: { spf: true, dkim: true, dmarc: true } };
-    expect(eximSupport(light)).toEqual({ spf: false, dkim: true });
-    expect(eximSupport(heavy)).toEqual({ spf: true, dkim: true });
-    expect(eximSupport(EXIM_LAYOUT)).toEqual({ spf: true, dkim: true });
-    expect(eximSupport(null)).toEqual({ spf: true, dkim: true });
+    expect(eximSupport(light)).toEqual({ spf: false, dkim: true, contentScan: false });
+    expect(eximSupport(heavy)).toEqual({ spf: true, dkim: true, contentScan: false });
+    expect(eximSupport(EXIM_LAYOUT)).toEqual({ spf: true, dkim: true, contentScan: false });
+    expect(eximSupport({ ...EXIM_LAYOUT, features: [...EXIM_LAYOUT.features, 'Content_Scanning'] }).contentScan).toBe(true);
+    expect(eximSupport(null)).toEqual({ spf: true, dkim: true, contentScan: true });
     const acl = renderEximRcptAcl({ ...s, spfReject: true }, eximSupport(light));
     expect(acl).not.toMatch(/^\s+spf = /m);
     expect(acl).toContain('no SPF support (exim4-daemon-light)');
@@ -569,7 +570,7 @@ describe('Exim Configuration Manager', () => {
     expect(res.body.data.installed).toBe(true);
     expect(res.body.data.layout.slots.main.path).toBe(EXIM_LAYOUT.slots.main.path);
     expect(Object.keys(res.body.data.preview)).toEqual(['main', 'acl_rcpt', 'acl_data']);
-    expect(res.body.data.support).toEqual({ spf: true, dkim: true, tls: 'gnutls' });
+    expect(res.body.data.support).toEqual({ spf: true, dkim: true, contentScan: false, tls: 'gnutls' });
     expect(res.body.data.chain).toEqual({ path: CHAIN, emailAclFile: EMAIL_ACL, includesEmailFilters: false, hooked: false, claimedBy: '/etc/exim4/whm/acl_rcpt.conf' });
     expect(res.body.data.inactive).toEqual(['acl_rcpt']);
     const save = await put('/api/service-config/exim', { rbls: ['zen.spamhaus.org'], maxMessageSizeMb: 25, dictionaryAttackProtection: true, rcptFailLimit: 6, logSelector: ['+subject'] }).expect(200);

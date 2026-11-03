@@ -1,6 +1,6 @@
 import { json, paginate } from '../db/index.js';
 import { notFound, conflict, badRequest, forbidden, unprocessable, CapabilityError } from '../lib/errors.js';
-import { isRoot } from '../middleware/rbac.js';
+import { isRoot, ownsRow } from '../middleware/rbac.js';
 
 // SSL/TLS. Attached as ctx.ssl; other categories may call:
 //   ssl.certForDomain(domain)                         -> installed ssl_certs row (shaped) or null
@@ -133,7 +133,7 @@ export function createSslService(ctx) {
 
   function visible(row, user) {
     if (!row) throw notFound('Certificate');
-    if (!isRoot(user) && row.owner_id !== user.id) throw forbidden('That certificate belongs to another reseller');
+    if (!ownsRow(user, row)) throw forbidden('That certificate belongs to another reseller');
     return row;
   }
 
@@ -141,7 +141,7 @@ export function createSslService(ctx) {
     if (!username) return null;
     const account = stmts.accountByUsername.get(username);
     if (!account) throw notFound(`Account "${username}"`);
-    if (!isRoot(user) && account.owner_id !== user.id) throw forbidden('That account belongs to another reseller');
+    if (!ownsRow(user, account, { accountId: account.id })) throw forbidden('That account belongs to another reseller');
     return account;
   }
 
@@ -150,12 +150,12 @@ export function createSslService(ctx) {
   function resolveDomain(domain, user) {
     const main = stmts.accountByDomain.get(domain);
     if (main) {
-      if (!isRoot(user) && main.owner_id !== user.id) throw forbidden('That domain belongs to another reseller');
+      if (!ownsRow(user, main, { accountId: main.id })) throw forbidden('That domain belongs to another reseller');
       return { domain, account: main, accountId: main.id, docroot: `${main.home_dir || `/home/${main.username}`}/public_html`, type: 'main' };
     }
     const sub = stmts.accountDomain.get(domain);
     if (sub) {
-      if (!isRoot(user) && sub.owner_id !== user.id) throw forbidden('That domain belongs to another reseller');
+      if (!ownsRow(user, sub)) throw forbidden('That domain belongs to another reseller');
       return { domain, account: stmts.accountByUsername.get(sub.username), accountId: sub.account_id, docroot: sub.docroot || `${sub.home_dir || `/home/${sub.username}`}/public_html`, type: sub.type };
     }
     if (!isRoot(user)) throw notFound(`Domain "${domain}"`);
@@ -578,6 +578,15 @@ export function createSslService(ctx) {
     },
     runs(limit = 20) {
       return stmts.runs.all(limit).map((r) => ({ id: r.id, trigger: r.trigger, provider: r.provider, jobId: r.job_id, startedAt: r.started_at, finishedAt: r.finished_at, status: r.status, summary: json.parse(r.summary_json, {}), entries: json.parse(r.entries_json, []) }));
+    },
+    // The most recent AutoSSL run entry for one hostname (newest run first;
+    // runs are pruned to the last 50), or null when no run ever looked at it.
+    lastEntryFor(domain) {
+      for (const r of stmts.runs.all(50)) {
+        const entry = json.parse(r.entries_json, []).find((e) => e && e.domain === domain);
+        if (entry) return { runId: r.id, trigger: r.trigger, provider: r.provider, startedAt: r.started_at, finishedAt: r.finished_at, status: r.status, action: entry.action ?? null, message: entry.message ?? '' };
+      }
+      return null;
     },
     getRun(id) {
       const r = stmts.runById.get(id);

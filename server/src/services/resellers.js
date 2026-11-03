@@ -52,6 +52,7 @@ export const ACL_GROUPS = [
     { key: 'rearrange-accts', label: 'Rearrange Accounts', help: 'Move home directories between partitions' },
     { key: 'add-pkg-ip', label: 'Assign Dedicated IP Addresses' },
     { key: 'add-pkg-shell', label: 'Grant Shell Access' },
+    { key: 'login-as', label: 'Log in to Account Panels', help: 'Open the customer panel of an owned account as that customer (time-boxed, audited). Off until granted here.' },
   ] },
   { key: 'packages', label: 'Package Privileges', acls: [
     { key: 'add-pkg', label: 'Add / Remove Packages' },
@@ -92,6 +93,10 @@ export const ACL_GROUPS = [
 ];
 export const ACL_KEYS = ACL_GROUPS.flatMap((g) => g.acls.map((a) => a.key));
 const ACL_SET = new Set(ACL_KEYS);
+// Privileges a reseller only has once root granted them explicitly: an
+// unconfigured reseller (no privilege editor save yet) gets everything else by
+// ownership alone, never these.
+export const EXPLICIT_ACLS = new Set(['login-as']);
 
 const EMPTY_LIMITS = { max_accounts: null, max_disk_mb: null, max_bandwidth_mb: null, owns_nameservers: 0, nameservers: '[]', shared_ip: null, allowed_packages: '[]', oversell_disk: 0, oversell_bandwidth: 0, privileges_suspended: 0, suspended_reason: null, account_id: null, notes: null };
 
@@ -608,7 +613,7 @@ export function createResellersService(ctx) {
     if (isRoot(user)) return true;
     if (user.role !== 'reseller') return false;
     const { configured, granted } = aclState(user.id);
-    return !configured || granted.has('all') || granted.has(key);
+    return granted.has('all') || granted.has(key) || (!configured && !EXPLICIT_ACLS.has(key));
   }
   const ACL_LABELS = Object.fromEntries(ACL_GROUPS.flatMap((g) => g.acls.map((a) => [a.key, a.label])));
   function assertAcl(user, key) {

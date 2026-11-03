@@ -7,7 +7,7 @@ import { runOp, createContext, OpError } from '../src/lib.js';
 import {
   renderVhost, parseVhostMeta, renderRedirects, renderGlobalInclude, renderPhpPool, renderLogrotate, mergeKeyValueFile, renderProftpd, vsftpdSettings, pureFtpdSettings,
   ftpSettingsFrom, parseServerStatus, parseApacheVersion, parseModules, parseDoveconf, rewriteListen, apacheLayout, eximLayout, phpLayout, SERVICE_ROLES, hintsFor, ensureRootLogDir, confPath, parseEximVersion,
-  mergeEximBlock, readEximBlock, stripEximBlock, eximTlsLibrary, primaryGroupName, EXIM_SENTINEL_MACRO,
+  mergeEximBlock, readEximBlock, stripEximBlock, eximTlsLibrary, primaryGroupName, EXIM_SENTINEL_MACRO, DOVECOT_INCLUDES, EXIM_VMAIL, FTP_VIRTUAL, dovecotLayout,
 } from '../src/ops/web.js';
 
 // Fake host for the layout detection: which paths exist, what they contain, which binaries resolve.
@@ -113,6 +113,7 @@ describe('web op schemas reject injection and traversal before anything runs', (
     const bad = [
       { server: 'wu-ftpd', settings: {} }, { server: 'pure-ftpd; id', settings: {} }, { server: 'vsftpd', settings: { passivePortMin: 80 } }, { server: 'vsftpd', settings: { passivePortMin: 60000, passivePortMax: 50000 } },
       { server: 'vsftpd', settings: { passiveAddress: '1.2.3.4\nanonymous_enable=YES' } }, { server: 'proftpd', settings: { tls: 'maybe' } }, { server: 'proftpd', settings: { maxClients: 'many' } }, { server: 'pure-ftpd', settings: { idleTimeoutMinutes: 0 } }, { server: 'pure-ftpd', settings: { rm: true } },
+      { server: 'pure-ftpd', settings: { virtualUsers: 'yes' } }, { server: 'proftpd', settings: { virtualUsers: '/etc/passwd' } },
     ];
     for (const args of bad) expect((await opError(runOp('web.ftp.config.write', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
     expect((await opError(runOp('web.ftp.config.read', { server: '../vsftpd' }, ctx))).code).toBe('invalid_args');
@@ -148,6 +149,32 @@ describe('web op schemas reject injection and traversal before anything runs', (
     expect((await opError(runOp('web.exim.include.write', { slot: '../main', content: 'x' }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('web.exim.include.remove', { slot: 'main', force: true }, ctx))).code).toBe('invalid_args');
     expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('virtual-mail seams (panel contract §36): include names, driver slots and host preparation take only the allowlisted values', async () => {
+    // The Dovecot drop-in name is an enum of the two panel files: no path, no other conf.d file.
+    for (const name of ['../10-auth.conf', '10-auth.conf', '/etc/dovecot/conf.d/98-whm-virtual-auth.conf', '98-whm-virtual-auth.conf\n', 'whm.conf', '']) {
+      expect((await opError(runOp('web.dovecot.include.write', { name, content: 'x' }, ctx))).code, name).toBe('invalid_args');
+      expect((await opError(runOp('web.dovecot.include.remove', { name }, ctx))).code, name).toBe('invalid_args');
+    }
+    expect((await opError(runOp('web.dovecot.include.remove', { name: DOVECOT_INCLUDES.virtualAuth, force: true }, ctx))).code).toBe('invalid_args');
+    // Only the three driver slots were added; plurals, sections and paths are still refused.
+    for (const slot of ['routers', 'transports', 'auths', 'authenticators', 'conf.d/router/350_x', 'main;router', 'retry', 'rewrite']) {
+      expect((await opError(runOp('web.exim.include.write', { slot, content: 'x' }, ctx))).code, slot).toBe('invalid_args');
+      expect((await opError(runOp('web.exim.include.remove', { slot }, ctx))).code, slot).toBe('invalid_args');
+    }
+    for (const bad of [{ enabled: 'yes' }, { enabled: true, user: 'root' }, { enabled: true, group: 'shadow' }, { enabled: 1 }]) {
+      expect((await opError(runOp('web.vmail.prepare', bad, ctx))).code, JSON.stringify(bad)).toBe('invalid_args');
+    }
+    // Without Exim+Dovecot every one of them stops at the capability check, never at a file or gpasswd.
+    const dc = dovecotLayout();
+    if (!dc?.installed) {
+      for (const name of Object.values(DOVECOT_INCLUDES)) expect((await opError(runOp('web.dovecot.include.write', { name, content: 'passdb {}' }, ctx))).code).toBe('capability_missing');
+      expect((await opError(runOp('web.vmail.prepare', { enabled: true }, ctx))).code).toBe('capability_missing');
+    }
+    if (!eximLayout()?.installed) for (const slot of ['router', 'transport', 'auth']) expect((await opError(runOp('web.exim.include.write', { slot, content: 'x' }, ctx))).code).toBe('capability_missing');
+    expect(exec).not.toHaveBeenCalledWith('gpasswd', expect.anything(), expect.anything());
+    expect(exec).not.toHaveBeenCalledWith('gpasswd', expect.anything());
   });
 
   it('daemon-backed ops report capability_missing on a host without the daemon', async () => {
@@ -431,6 +458,68 @@ describe('renderers produce the expected daemon syntax', () => {
     expect(none).toHaveLength(3);
     expect(none[1]).toContain('.include /etc/exim/whm/acl-rcpt-local.conf');
     expect(none[1]).toContain('/etc/exim/exim.conf');
+  });
+
+  it('virtual-mail layout: driver slots sort before Debian\'s local routers when split, are manual files otherwise, and name the Exim user', () => {
+    const passwd = 'root:x:0:0:root:/root:/bin/bash\nDebian-exim:x:101:105::/var/spool/exim4:/usr/sbin/nologin\n';
+    const group = 'root:x:0:\nDebian-exim:x:105:\ndovecot:x:106:\n';
+    const split = eximLayout(hostIo({ dirs: ['/etc/exim4', '/etc/exim4/conf.d'], files: { '/etc/exim4/update-exim4.conf.conf': "dc_use_split_config='true'\n", '/etc/passwd': passwd, '/etc/group': group }, binaries: ['exim4', 'update-exim4.conf'] }));
+    expect(split.slots.router).toMatchObject({ path: '/etc/exim4/conf.d/router/350_whm_virtual_mail', hookable: true, probe: { list: 'router_list', name: EXIM_VMAIL.router }, section: 'routers' });
+    expect(split.slots.transport).toMatchObject({ path: '/etc/exim4/conf.d/transport/30_whm_virtual_mail', hookable: true, probe: { list: 'transport_list', name: EXIM_VMAIL.transport } });
+    expect(split.slots.auth).toMatchObject({ path: '/etc/exim4/conf.d/auth/25_whm_dovecot', hookable: true, probe: { list: 'authenticator_list', name: EXIM_VMAIL.auth }, section: 'authenticators' });
+    // 350_ sorts after 300_real_local and before 400_system_aliases/600_userforward/900_local_user.
+    const order = ['200_exim4-config_dnslookup', '300_exim4-config_real_local', '350_whm_virtual_mail', '400_exim4-config_system_aliases', '600_exim4-config_userforward', '900_exim4-config_local_user'];
+    expect([...order].sort()).toEqual(order);
+    expect(split.user).toBe('Debian-exim');
+    expect(split.group).toBe('Debian-exim');
+    expect(split.vmail).toEqual({ passwdDir: '/etc/dovecot/whm/passwd', aliasesDir: '/etc/exim4/whm/aliases', domainForward: '/etc/exim4/whm/domainfwd.lst', autorespondersDir: '/etc/exim4/whm/autoresponders', spamUsers: '/etc/exim4/whm/spam_users.lst', autoreplyOnceDir: '/var/lib/whm/autoreply', dovecotBaseDir: '/var/run/dovecot' });
+    const unsplit = eximLayout(hostIo({ dirs: ['/etc/exim4', '/etc/exim4/conf.d'], files: { '/etc/exim4/update-exim4.conf.conf': "dc_use_split_config='false'\n" }, binaries: ['exim4'] }));
+    expect(unsplit.slots.router).toMatchObject({ path: '/etc/exim4/whm/router_whm_virtual_mail.conf', hookable: false });
+    expect(unsplit.user).toBe('Debian-exim');
+    const rhel = eximLayout(hostIo({ dirs: ['/etc/exim'], files: { '/etc/exim/exim.conf': '' }, binaries: ['exim'] }));
+    expect(rhel.slots.router).toMatchObject({ path: '/etc/exim/whm/router_whm_virtual_mail.conf', hookable: false });
+    expect(rhel.slots.auth).toMatchObject({ path: '/etc/exim/whm/auth_whm_dovecot.conf', hookable: false });
+    expect(rhel.user).toBe('exim');
+    expect(rhel.vmail.aliasesDir).toBe('/etc/exim/whm/aliases');
+    // The main/ACL slots are unchanged by the additions.
+    expect(split.slots.main).toEqual({ path: '/etc/exim4/conf.d/main/001_whm_service_config', hookable: true, block: null });
+    expect(EXIM_VMAIL.after).toContain('local_user');
+    expect(EXIM_VMAIL.after).toContain('userforward');
+  });
+
+  it('virtual-mail hints: only a written-but-unloaded driver fragment or a misordered router needs a manual step', () => {
+    const base = { splitConfig: false, mainConf: '/etc/exim/exim.conf', rcptAclSource: '/etc/exim/exim.conf', slots: { main: { path: '/etc/exim/whm/service_config.conf', hookable: false }, acl_rcpt: { path: '/etc/exim/whm/acl-rcpt-local.conf', hookable: false }, acl_data: { path: '/etc/exim/whm/acl_data_whm.conf', hookable: false } } };
+    const live = { main: { ...base.slots.main, hooked: true }, acl_rcpt: { ...base.slots.acl_rcpt, hooked: true }, acl_data: { ...base.slots.acl_data, hooked: true } };
+    const router = { path: '/etc/exim/whm/router_whm_virtual_mail.conf', hookable: false, section: 'routers' };
+    expect(hintsFor(base, live)).toEqual([]);
+    expect(hintsFor(base, { ...live, router: { ...router, exists: false, hooked: false } })).toEqual([]);
+    const manual = hintsFor(base, { ...live, router: { ...router, exists: true, hooked: false } });
+    expect(manual).toHaveLength(1);
+    expect(manual[0]).toContain('.include /etc/exim/whm/router_whm_virtual_mail.conf');
+    expect(manual[0]).toMatch(/before the local_user\/userforward routers/);
+    const misordered = hintsFor(base, { ...live, router: { ...router, exists: true, hooked: true, precedes: false } });
+    expect(misordered).toHaveLength(1);
+    expect(misordered[0]).toContain(EXIM_VMAIL.router);
+    const split = { ...base, splitConfig: true, mainConf: null };
+    const stale = hintsFor(split, { ...live, transport: { path: '/etc/exim4/conf.d/transport/30_whm_virtual_mail', hookable: true, section: 'transports', exists: true, hooked: false } });
+    expect(stale).toHaveLength(1);
+    expect(stale[0]).toMatch(/update-exim4.conf/);
+  });
+
+  it('ftp virtual users (panel contract §37): PureDB and AuthUserFile+AuthOrder are rendered only when asked and read back', () => {
+    expect(pureFtpdSettings({ virtualUsers: true })).toEqual({ PureDB: FTP_VIRTUAL.pureDb });
+    expect(pureFtpdSettings({ virtualUsers: false })).toEqual({});
+    expect(pureFtpdSettings({ tls: 'optional' })).not.toHaveProperty('PureDB');
+    const pro = renderProftpd({ chroot: true, virtualUsers: true });
+    expect(pro).toContain(`AuthUserFile ${FTP_VIRTUAL.proftpdPasswd}`);
+    expect(pro).toContain('AuthOrder mod_auth_file.c mod_auth_unix.c');
+    expect(renderProftpd({ chroot: true })).not.toContain('AuthUserFile');
+    expect(ftpSettingsFrom('pure-ftpd', { PureDB: '/etc/pure-ftpd/pureftpd.pdb' }).virtualUsers).toBe(true);
+    expect(ftpSettingsFrom('pure-ftpd', {}).virtualUsers).toBe(false);
+    expect(ftpSettingsFrom('proftpd', { AuthUserFile: '/etc/proftpd/ftpd.passwd' }).virtualUsers).toBe(true);
+    expect(ftpSettingsFrom('proftpd', {}).virtualUsers).toBe(false);
+    expect(vsftpdSettings({ virtualUsers: true })).not.toHaveProperty('PureDB');
+    expect(FTP_VIRTUAL).toEqual({ purePasswd: '/etc/pure-ftpd/pureftpd.passwd', pureDb: '/etc/pure-ftpd/pureftpd.pdb', proftpdPasswd: '/etc/proftpd/ftpd.passwd' });
   });
 
   it('role table covers ftp and dns daemons with package names per manager', () => {

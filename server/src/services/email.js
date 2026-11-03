@@ -2,7 +2,7 @@ import dns from 'node:dns';
 import net from 'node:net';
 import { json, paginate } from '../db/index.js';
 import { notFound, conflict, badRequest, forbidden, unprocessable, CapabilityError, HttpError } from '../lib/errors.js';
-import { isRoot } from '../middleware/rbac.js';
+import { isRoot, ownsRow } from '../middleware/rbac.js';
 
 // Email category. Attached as ctx.mail; other categories may call:
 //   mail.sendNotification({ to, subject, text, from? }, req)   -> hands a message to Exim (throws CapabilityError without Exim)
@@ -163,13 +163,16 @@ export function createEmailService(ctx) {
     pruneApplies: db.prepare('DELETE FROM mail_filter_applies WHERE id NOT IN (SELECT id FROM mail_filter_applies ORDER BY id DESC LIMIT 50)'),
     accounts: db.prepare('SELECT a.id, a.username, a.domain, a.owner_id, a.home_dir, a.suspended, u.username AS owner FROM accounts a JOIN users u ON u.id = a.owner_id ORDER BY a.username'),
     accountByUsername: db.prepare('SELECT * FROM accounts WHERE username = ?'),
-    visibleDomains: db.prepare(`SELECT d.domain, d.type, a.username AS account, a.owner_id, a.ip FROM account_domains d JOIN accounts a ON a.id = d.account_id
-      UNION SELECT a.domain, 'main' AS type, a.username AS account, a.owner_id, a.ip FROM accounts a
-      UNION SELECT m.domain, 'mail' AS type, a.username AS account, a.owner_id, a.ip FROM mail_domains m LEFT JOIN accounts a ON a.id = m.account_id ORDER BY 1`),
+    accountById: db.prepare('SELECT id FROM accounts WHERE id = ?'),
+    visibleDomains: db.prepare(`SELECT d.domain, d.type, a.username AS account, a.owner_id, a.ip, a.id AS account_id FROM account_domains d JOIN accounts a ON a.id = d.account_id
+      UNION SELECT a.domain, 'main' AS type, a.username AS account, a.owner_id, a.ip, a.id AS account_id FROM accounts a
+      UNION SELECT m.domain, 'mail' AS type, a.username AS account, a.owner_id, a.ip, a.id AS account_id FROM mail_domains m LEFT JOIN accounts a ON a.id = m.account_id ORDER BY 1`),
     dkimKey: db.prepare('SELECT domain, selector, public_key, created_at FROM dkim_keys WHERE domain = ?'),
     mailDomain: db.prepare('SELECT * FROM mail_domains WHERE domain = ?'),
     upsertMailDomain: db.prepare(`INSERT INTO mail_domains (domain, account_id, routing) VALUES (@domain, @account_id, @routing) ON CONFLICT (domain) DO UPDATE SET routing = excluded.routing, account_id = COALESCE(excluded.account_id, account_id)`),
     mailDomainsAll: db.prepare('SELECT domain, routing FROM mail_domains ORDER BY domain'),
+    insertMailDomain: db.prepare("INSERT INTO mail_domains (domain, account_id, routing) VALUES (?, ?, 'auto')"),
+    claimMailDomain: db.prepare('UPDATE mail_domains SET account_id = ? WHERE id = ? AND account_id IS NULL'),
   };
 
   const eximMissing = 'Exim is not installed on this server. Install exim4 (Debian/Ubuntu) or exim (RHEL) and refresh.';
@@ -376,7 +379,7 @@ export function createEmailService(ctx) {
 
   function visibleDomains(user) {
     const rows = stmts.visibleDomains.all();
-    const filtered = isRoot(user) ? rows : rows.filter((r) => r.owner_id === user.id);
+    const filtered = isRoot(user) ? rows : rows.filter((r) => ownsRow(user, r));
     const seen = new Map();
     for (const r of filtered) if (!seen.has(r.domain)) seen.set(r.domain, r);
     return [...seen.values()];
@@ -384,7 +387,7 @@ export function createEmailService(ctx) {
   function assertDomain(domain, user) {
     const row = stmts.visibleDomains.all().find((r) => r.domain === domain);
     if (!row) throw notFound(`Domain ${domain}`);
-    if (!isRoot(user) && row.owner_id !== user.id) throw forbidden('That domain belongs to another reseller');
+    if (!ownsRow(user, row)) throw forbidden('That domain belongs to another reseller');
     return row;
   }
 
@@ -823,6 +826,27 @@ export function createEmailService(ctx) {
     return { applied: true, ipv4, ipv6, hooked: result.hooked, file: result.file, reloaded: result.reloaded };
   }
 
+  // The account panel's hook before it creates a mailbox: the mail_domains row
+  // for the domain belongs to that account (routing 'auto' when created). A row
+  // that already belongs to another account is a conflict and is never
+  // re-pointed; an unowned row (routed by root before the account existed) is
+  // claimed. The routing itself is left alone.
+  function ensureMailDomain(domain, accountId, req = null) {
+    if (!Number.isInteger(accountId) || accountId <= 0) throw badRequest('ensureMailDomain needs the account id');
+    if (!stmts.accountById.get(accountId)) throw notFound('Account');
+    const existing = stmts.mailDomain.get(domain);
+    if (existing && existing.account_id != null && existing.account_id !== accountId) throw conflict(`The mail domain ${domain} belongs to another account`);
+    if (existing && existing.account_id === accountId) return { domain, accountId, routing: existing.routing, created: false, claimed: false };
+    let created = false;
+    db.transaction(() => {
+      if (existing) stmts.claimMailDomain.run(accountId, existing.id);
+      else { stmts.insertMailDomain.run(domain, accountId); created = true; }
+    })();
+    const row = stmts.mailDomain.get(domain);
+    audit(req, { action: 'mail.domain.ensure', target: domain, args: { accountId, created, claimed: !created } });
+    return { domain, accountId, routing: row.routing, created, claimed: !created };
+  }
+
   async function setRouting(domain, routing, req) {
     const account = stmts.visibleDomains.all().find((d) => d.domain === domain);
     stmts.upsertMailDomain.run({ domain, account_id: account ? stmts.accountByUsername.get(account.account)?.id ?? null : null, routing });
@@ -852,7 +876,7 @@ export function createEmailService(ctx) {
 
   return {
     detect, status, queue, reports, stats, troubleshoot, useBannerProber, deliverability, filters, greylist, mailbox, spamd,
-    sendNotification, installDkimKey, removeDkimKey, setRouting, setOutboundAddresses, routingLists,
+    sendNotification, installDkimKey, removeDkimKey, setRouting, ensureMailDomain, setOutboundAddresses, routingLists,
     renderAcl: () => renderAcl({ dir: 'etc/exim4/whm', ...filterSummary() }),
   };
 }

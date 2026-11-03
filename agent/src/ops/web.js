@@ -208,10 +208,20 @@ export function ftpLayout() {
   return out;
 }
 
+// The two panel-managed conf.d drop-ins: 97- (Mailserver Configuration) and
+// 98- (the account panel's virtual mailboxes, rendered by service-configuration
+// through ctx.web.applyVirtualMail). Nothing else under conf.d is ever written.
+export const DOVECOT_INCLUDES = { mailserver: '97-whm-mailserver.conf', virtualAuth: '98-whm-virtual-auth.conf' };
+export const DOVECOT_PASSWD_DIR = '/etc/dovecot/whm/passwd';
 export function dovecotLayout() {
   const installed = hasBinary('dovecot');
   if (!installed && !exists('/etc/dovecot')) return null;
-  return { installed, bin: installed ? 'dovecot' : null, confDir: '/etc/dovecot', dropinDir: '/etc/dovecot/conf.d', include: '/etc/dovecot/conf.d/97-whm-mailserver.conf', doveconf: hasBinary('doveconf'), units: ['dovecot'] };
+  const dropinDir = '/etc/dovecot/conf.d';
+  return {
+    installed, bin: installed ? 'dovecot' : null, confDir: '/etc/dovecot', dropinDir, include: `${dropinDir}/${DOVECOT_INCLUDES.mailserver}`,
+    includes: { mailserver: `${dropinDir}/${DOVECOT_INCLUDES.mailserver}`, virtualAuth: `${dropinDir}/${DOVECOT_INCLUDES.virtualAuth}` },
+    whmDir: '/etc/dovecot/whm', passwdDir: DOVECOT_PASSWD_DIR, baseDir: '/var/run/dovecot', doveconf: hasBinary('doveconf'), units: ['dovecot'],
+  };
 }
 
 // The main slot starts with this macro so `exim -bP macro` on the generated
@@ -230,6 +240,14 @@ const EXIM_BLOCK = { begin: '# BEGIN Keel (Service Configuration: Exim main opti
 // on (acl-rcpt-local.conf): Debian reaches it through CHECK_RCPT_LOCAL_ACL_FILE,
 // defined by the main slot, and it ends with an include of the Email category's
 // filters file so one macro serves both.
+// The driver names the account panel's virtual-mail fragments define; the
+// router must sort before Debian's 400_ system_aliases / 600_ userforward /
+// 900_ local_user fragments (split config), hence the 350_ prefix. On an
+// unsplit Debian host or a RHEL-style monolithic exim.conf there is no hook
+// for extra drivers, so those slots are whole files the admin .include's once
+// in the matching section (hints from detect say where).
+export const EXIM_VMAIL = { router: 'whm_virtual_user', transport: 'whm_dovecot_lmtp', auth: 'dovecot_plain', after: ['system_aliases', 'userforward', 'procmail', 'maildrop', 'lowuid', 'local_user', 'localuser', 'virtual_user'] };
+const EXIM_RUN_USERS = ['Debian-exim', 'exim', 'mail', 'mailnull'];
 export function eximLayout(io) {
   const base = eximBaseLayout(io);
   if (!base.flavor && !base.installed) return null;
@@ -242,14 +260,26 @@ export function eximLayout(io) {
   const main = debian
     ? (base.splitConfig ? { path: '/etc/exim4/conf.d/main/001_whm_service_config', hookable: true, block: null } : { path: base.macroFile, hookable: true, block: EXIM_BLOCK.begin })
     : { path: `${whmDir}/service_config.conf`, hookable: false, block: null };
+  const split = debian && base.splitConfig;
+  const driver = (kind, prefix, name, section) => (split
+    ? { path: `/etc/exim4/conf.d/${kind}/${prefix}_${name}`, hookable: true, block: null, probe: { list: `${kind === 'auth' ? 'authenticator' : kind}_list`, name: EXIM_VMAIL[kind] }, section }
+    : { path: `${whmDir}/${kind}_${name}.conf`, hookable: false, block: null, probe: { list: `${kind === 'auth' ? 'authenticator' : kind}_list`, name: EXIM_VMAIL[kind] }, section });
+  const readPw = io?.readText ? (f) => io.readText(f) : readText;
+  const runUser = EXIM_RUN_USERS.find((u) => (readPw('/etc/passwd') || '').split('\n').some((l) => l.startsWith(`${u}:`))) || (debian ? 'Debian-exim' : 'exim');
   return {
     installed: base.installed, bin: base.bin, flavor, confDir, whmDir, splitConfig: base.splitConfig, mainConf, updateConf: base.updateConf, macroFile: base.macroFile,
     rcptAclSource: base.rcptAclSource || mainConf, emailAclFile, sentinel: EXIM_SENTINEL_MACRO,
     units: debian ? ['exim4', 'exim'] : ['exim', 'exim4'],
+    user: runUser, group: primaryGroupName(runUser, { passwd: readPw('/etc/passwd'), group: readPw('/etc/group') }) || runUser,
+    // Files the account panel's vmail ops write and the virtual-mail fragments read.
+    vmail: { passwdDir: DOVECOT_PASSWD_DIR, aliasesDir: `${whmDir}/aliases`, domainForward: `${whmDir}/domainfwd.lst`, autorespondersDir: `${whmDir}/autoresponders`, spamUsers: `${whmDir}/spam_users.lst`, autoreplyOnceDir: '/var/lib/whm/autoreply', dovecotBaseDir: '/var/run/dovecot' },
     slots: {
       main,
       acl_rcpt: { path: base.aclChainFile || `${whmDir}/${EXIM_WHM_FILES.aclChain}`, hookable: debian, macro: debian ? 'CHECK_RCPT_LOCAL_ACL_FILE' : null, block: null, includes: emailAclFile },
       acl_data: { path: `${whmDir}/acl_data_whm.conf`, hookable: debian, macro: debian ? 'CHECK_DATA_LOCAL_ACL_FILE' : null, block: null },
+      router: driver('router', '350', 'whm_virtual_mail', 'routers'),
+      transport: driver('transport', '30', 'whm_virtual_mail', 'transports'),
+      auth: driver('auth', '25', 'whm_dovecot', 'authenticators'),
     },
   };
 }
@@ -352,6 +382,7 @@ const ftpSettings = z.object({
   passivePortMin: z.number().int().min(1024).max(65535).optional(), passivePortMax: z.number().int().min(1024).max(65535).optional(), passiveAddress: arg.ipv4.nullable().optional(),
   tls: z.enum(['off', 'optional', 'required']).optional(), maxClients: z.number().int().min(1).max(100_000).optional(), maxPerIp: z.number().int().min(1).max(10_000).optional(),
   anonymous: z.boolean().optional(), idleTimeoutMinutes: z.number().int().min(1).max(1440).optional(), chroot: z.boolean().optional(),
+  virtualUsers: z.boolean().optional(),
 }).strict().refine((s) => s.passivePortMin == null || s.passivePortMax == null || s.passivePortMin <= s.passivePortMax, { message: 'passivePortMin must not exceed passivePortMax', path: ['passivePortMax'] });
 
 const groupName = z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/);
@@ -551,8 +582,15 @@ export function renderProftpd(s) {
   if (s.idleTimeoutMinutes != null) lines.push(`TimeoutIdle ${s.idleTimeoutMinutes * 60}`);
   if (s.chroot != null) lines.push(s.chroot ? 'DefaultRoot ~' : '# DefaultRoot not enforced');
   if (s.tls) lines.push('<IfModule mod_tls.c>', `  TLSEngine ${s.tls === 'off' ? 'off' : 'on'}`, `  TLSRequired ${s.tls === 'required' ? 'on' : 'off'}`, '</IfModule>');
+  // Virtual FTP logins of the account panel (ftpasswd-managed file); AuthOrder
+  // keeps the hosting accounts' system logins working next to them.
+  if (s.virtualUsers) lines.push(`AuthUserFile ${FTP_VIRTUAL.proftpdPasswd}`, 'AuthOrder mod_auth_file.c mod_auth_unix.c');
   return `${lines.join('\n')}\n`;
 }
+
+// Where the virtual-user databases live (the panel's ftp.* ops use the same
+// defaults: pure-pw's and ftpasswd's stock file locations).
+export const FTP_VIRTUAL = { purePasswd: '/etc/pure-ftpd/pureftpd.passwd', pureDb: '/etc/pure-ftpd/pureftpd.pdb', proftpdPasswd: '/etc/proftpd/ftpd.passwd' };
 
 export function vsftpdSettings(s) {
   const out = {};
@@ -579,6 +617,8 @@ export function pureFtpdSettings(s) {
   if (s.anonymous != null) out.NoAnonymous = s.anonymous ? 'no' : 'yes';
   if (s.idleTimeoutMinutes != null) out.MaxIdleTime = String(s.idleTimeoutMinutes);
   if (s.chroot != null) out.ChrootEveryone = s.chroot ? 'yes' : 'no';
+  // Only ever switched on from here: an admin's hand-enabled PureDB stays.
+  if (s.virtualUsers) out.PureDB = FTP_VIRTUAL.pureDb;
   return out;
 }
 
@@ -963,12 +1003,14 @@ export function ftpSettingsFrom(name, raw) {
     s.maxClients = num(raw.MaxClientsNumber); s.maxPerIp = num(raw.MaxClientsPerIP);
     s.anonymous = raw.NoAnonymous != null ? !/^(yes|1|true)$/i.test(raw.NoAnonymous) : null;
     s.idleTimeoutMinutes = num(raw.MaxIdleTime); s.chroot = raw.ChrootEveryone != null ? /^(yes|1|true)$/i.test(raw.ChrootEveryone) : null;
+    s.virtualUsers = Boolean(raw.PureDB);
   } else if (name === 'proftpd') {
     const range = (raw.PassivePorts || '').split(/\s+/);
     if (range.length === 2) { s.passivePortMin = num(range[0]); s.passivePortMax = num(range[1]); }
     s.passiveAddress = raw.MasqueradeAddress || null; s.maxClients = num(raw.MaxInstances); s.maxPerIp = num(raw.MaxClientsPerHost);
     s.idleTimeoutMinutes = raw.TimeoutIdle != null ? Math.round(num(raw.TimeoutIdle) / 60) : null; s.chroot = raw.DefaultRoot != null ? true : null;
     s.tls = raw.TLSEngine ? (raw.TLSEngine === 'off' ? 'off' : raw.TLSRequired === 'on' ? 'required' : 'optional') : null;
+    s.virtualUsers = Boolean(raw.AuthUserFile);
   } else if (name === 'vsftpd') {
     s.passivePortMin = num(raw.pasv_min_port); s.passivePortMax = num(raw.pasv_max_port); s.passiveAddress = raw.pasv_address || null;
     s.tls = raw.ssl_enable ? (raw.ssl_enable === 'NO' ? 'off' : raw.force_local_logins_ssl === 'YES' ? 'required' : 'optional') : null;
@@ -1008,6 +1050,7 @@ defineOp('web.ftp.config.write', {
     const keep = (file) => { previous.push({ file, content: readText(file) }); written.push(file); return file; };
     let validated = null;
     let includeHint = null;
+    if (settings.virtualUsers && server !== 'vsftpd') await ensureFtpVirtualFiles(server, ctx);
     if (server === 'pure-ftpd') {
       const values = pureFtpdSettings(settings);
       if (d.style === 'debian-dir') {
@@ -1046,6 +1089,25 @@ defineOp('web.ftp.config.write', {
     return { server, written, validated, hint: includeHint, ...result };
   },
 });
+
+// pure-ftpd-wrapper refuses a PureDB that does not exist and proftpd refuses an
+// AuthUserFile it cannot open, so the (empty) databases are created before the
+// daemon restarts with the setting. 0600 root: ftpasswd/pure-pw rewrite them.
+async function ensureFtpVirtualFiles(server, ctx) {
+  if (server === 'pure-ftpd') {
+    const passwd = ctx.assertAllowedPath(FTP_VIRTUAL.purePasswd, 'write');
+    const db = ctx.assertAllowedPath(FTP_VIRTUAL.pureDb, 'write');
+    if (!exists(passwd)) { fs.writeFileSync(passwd, '', { mode: 0o600 }); fs.chmodSync(passwd, 0o600); }
+    if (!exists(db)) {
+      if (!hasBinary('pure-pw')) throw new OpError('capability_missing', 'pure-pw is not installed, so the PureDB database cannot be created');
+      await exec('pure-pw', ['mkdb', db, '-f', passwd], { timeoutMs: 60_000 });
+    }
+    return { passwd, db };
+  }
+  const passwd = ctx.assertAllowedPath(FTP_VIRTUAL.proftpdPasswd, 'write');
+  if (!exists(passwd)) { fs.writeFileSync(passwd, '', { mode: 0o600 }); fs.chmodSync(passwd, 0o600); }
+  return { passwd };
+}
 
 // ------------------------------------------------------- daemon selection ---
 
@@ -1207,17 +1269,23 @@ defineOp('web.dovecot.detect', {
     let configOk = null;
     if (dc.installed) { const v = await exec('dovecot', ['--version'], { allowFailure: true, timeoutMs: 30_000 }); version = v.stdout.trim().split(/\s+/)[0] || null; }
     if (dc.doveconf) { const c = await exec('doveconf', ['-n'], { allowFailure: true, timeoutMs: 60_000 }); configOk = c.code === 0; effective = parseDoveconf(c.stdout); }
-    return { ...dc, version, configOk, effective: { protocols: effective.protocols ?? null, ssl: effective.ssl ?? null, ssl_min_protocol: effective.ssl_min_protocol ?? null, mail_location: effective.mail_location ?? null, mail_max_userip_connections: effective.mail_max_userip_connections ?? null, default_process_limit: effective.default_process_limit ?? null, default_client_limit: effective.default_client_limit ?? null, disable_plaintext_auth: effective.disable_plaintext_auth ?? null, login_greeting: effective.login_greeting ?? null }, include: { path: dc.include, exists: exists(dc.include), content: readText(dc.include) }, unit: await unitState(await firstUnit(dc.units)) };
+    const includeState = (file) => { ctx.assertAllowedPath(file, 'read'); return { path: file, exists: exists(file), content: readText(file) }; };
+    return { ...dc, version, configOk, effective: { protocols: effective.protocols ?? null, ssl: effective.ssl ?? null, ssl_min_protocol: effective.ssl_min_protocol ?? null, mail_location: effective.mail_location ?? null, mail_max_userip_connections: effective.mail_max_userip_connections ?? null, default_process_limit: effective.default_process_limit ?? null, default_client_limit: effective.default_client_limit ?? null, disable_plaintext_auth: effective.disable_plaintext_auth ?? null, login_greeting: effective.login_greeting ?? null }, include: includeState(dc.include), includes: { mailserver: includeState(dc.includes.mailserver), virtualAuth: includeState(dc.includes.virtualAuth) }, passwdDirExists: exists(dc.passwdDir), unit: await unitState(await firstUnit(dc.units)) };
   },
 });
 
+const dovecotIncludeName = z.enum([DOVECOT_INCLUDES.mailserver, DOVECOT_INCLUDES.virtualAuth]).default(DOVECOT_INCLUDES.mailserver);
+
 defineOp('web.dovecot.include.write', {
-  description: 'Write the panel-managed Dovecot include (conf.d/97-whm-mailserver.conf), validate with doveconf -n (rolled back on error) and reload',
-  schema: z.object({ content: freeText, reload: z.boolean().default(true) }).strict(),
-  run: async ({ content, reload }, ctx) => {
+  description: 'Write a panel-managed Dovecot include (conf.d/97-whm-mailserver.conf, or 98-whm-virtual-auth.conf for the account panel), validate with doveconf -n (rolled back on error) and reload',
+  schema: z.object({ name: dovecotIncludeName, content: freeText, reload: z.boolean().default(true) }).strict(),
+  run: async ({ name, content, reload }, ctx) => {
     const dc = dovecotLayout();
     if (!dc?.installed) throw new OpError('capability_missing', 'Dovecot is not installed on this server');
-    const file = ctx.assertAllowedPath(dc.include, 'write');
+    const file = ctx.assertAllowedPath(path.join(dc.dropinDir, name), 'write');
+    // The passwd-file passdb/userdb in the virtual-auth include name a
+    // per-domain file under this directory; Dovecot only needs it to exist.
+    if (name === DOVECOT_INCLUDES.virtualAuth) ensureOwnedDir(ctx.assertAllowedPath(dc.passwdDir, 'write'), { mode: 0o750, group: 'dovecot' });
     const previous = readText(file);
     writeAtomic(file, ensureNl(content));
     let validated = null;
@@ -1227,26 +1295,81 @@ defineOp('web.dovecot.include.write', {
       if (!validated) { restore(file, previous); throw new OpError('config_invalid', `Dovecot rejected the settings; the previous file was restored: ${lastLine(stderr || stdout)}`, { output: `${stderr}`.trim() }); }
     }
     const result = reload ? await reloadUnit(dc.units) : { reloaded: false, unit: null };
-    return { path: file, validated, bytes: Buffer.byteLength(content), ...result };
+    return { name, path: file, validated, bytes: Buffer.byteLength(content), ...result };
   },
 });
 
 defineOp('web.dovecot.include.remove', {
-  description: 'Remove the panel-managed Dovecot include and reload',
+  description: 'Remove a panel-managed Dovecot include and reload',
   destructive: true,
-  run: async (_args, ctx) => {
+  schema: z.object({ name: dovecotIncludeName }).strict(),
+  run: async ({ name }, ctx) => {
     const dc = dovecotLayout();
     if (!dc) return { removed: false };
-    const file = ctx.assertAllowedPath(dc.include, 'write');
+    const file = ctx.assertAllowedPath(path.join(dc.dropinDir, name), 'write');
     const existed = exists(file);
     if (existed) fs.unlinkSync(file);
-    return { path: file, removed: existed, ...(existed ? await reloadUnit(dc.units) : { reloaded: false, unit: null }) };
+    return { name, path: file, removed: existed, ...(existed ? await reloadUnit(dc.units) : { reloaded: false, unit: null }) };
+  },
+});
+
+// A root-owned directory for the virtual-mail files (never a symlink).
+function ensureOwnedDir(dir, { mode = 0o755, owner = 'root', group = 'root' } = {}) {
+  const uid = owner === 'root' ? 0 : passwdEntry(owner)?.uid;
+  const gid = group === 'root' ? 0 : groupEntry(group)?.gid;
+  if (uid == null || gid == null) throw new OpError('not_found', `Cannot create ${dir}: user "${owner}" or group "${group}" does not exist`);
+  let st = null;
+  try { st = fs.lstatSync(dir); } catch { st = null; }
+  if (!st) { fs.mkdirSync(dir, { recursive: true, mode }); }
+  else if (st.isSymbolicLink() || !st.isDirectory()) throw new OpError('refused', `${dir} is not a directory`);
+  fs.chmodSync(dir, mode);
+  fs.chownSync(dir, uid, gid);
+  return dir;
+}
+
+function groupEntry(name) {
+  const line = (readText('/etc/group') || '').split('\n').find((l) => l.startsWith(`${name}:`));
+  return line ? { name, gid: Number(line.split(':')[2]), members: (line.split(':')[3] || '').split(',').filter(Boolean) } : null;
+}
+
+// What the account panel's virtual mailboxes need on the host besides the
+// rendered fragments: the directories its vmail ops write into (under allowed
+// roots, root-owned; the autoreply once-database is written by Exim's
+// autoreply transport, so that one belongs to the Exim user) and read access
+// for Exim's routers to the per-domain passwd files, which are root:dovecot
+// 0640 because Dovecot's auth process reads them. Routing (and recipient
+// verification at RCPT time, which runs as the Exim user) looks a local part
+// up in that file, so the Exim user joins group dovecot while the feature is
+// on. Idempotent; `enabled: false` undoes the group membership only.
+defineOp('web.vmail.prepare', {
+  description: 'Prepare the host for the account panel\'s virtual mailboxes: create the vmail directories and give the Exim user read access to the Dovecot passwd files (group dovecot); enabled:false removes that access',
+  schema: z.object({ enabled: z.boolean().default(true) }).strict(),
+  run: async ({ enabled }, ctx) => {
+    const layout = requireExim();
+    const dc = dovecotLayout();
+    if (!dc?.installed) throw new OpError('capability_missing', 'Dovecot is not installed on this server');
+    const eximUser = passwdEntry(layout.user);
+    if (!eximUser) throw new OpError('not_found', `The Exim user "${layout.user}" does not exist`);
+    const dovecot = groupEntry('dovecot');
+    if (!dovecot) throw new OpError('not_found', 'The "dovecot" group does not exist');
+    const dirs = [];
+    if (enabled) {
+      dirs.push(ensureOwnedDir(ctx.assertAllowedPath(dc.passwdDir, 'write'), { mode: 0o750, group: 'dovecot' }));
+      dirs.push(ensureOwnedDir(ctx.assertAllowedPath(layout.vmail.aliasesDir, 'write'), { mode: 0o755 }));
+      dirs.push(ensureOwnedDir(ctx.assertAllowedPath(layout.vmail.autorespondersDir, 'write'), { mode: 0o755 }));
+      dirs.push(ensureOwnedDir(ctx.assertAllowedPath(layout.vmail.autoreplyOnceDir, 'write'), { mode: 0o750, owner: layout.user, group: layout.group }));
+    }
+    const member = dovecot.members.includes(layout.user);
+    let changed = false;
+    if (enabled && !member) { await exec('gpasswd', ['-a', layout.user, 'dovecot']); changed = true; }
+    if (!enabled && member) { await exec('gpasswd', ['-d', layout.user, 'dovecot']); changed = true; }
+    return { enabled, eximUser: layout.user, eximGroup: layout.group, dovecotGroupMember: enabled, changed, dirs, passwdDir: dc.passwdDir, authSocket: `${dc.baseDir}/auth-client`, lmtpSocket: `${dc.baseDir}/lmtp` };
   },
 });
 
 // ------------------------------------------------------------------- exim ---
 
-const eximSlot = z.enum(['main', 'acl_rcpt', 'acl_data']);
+const eximSlot = z.enum(['main', 'acl_rcpt', 'acl_data', 'router', 'transport', 'auth']);
 
 function requireExim() {
   const layout = eximLayout();
@@ -1278,6 +1401,7 @@ async function eximHook(layout, slot) {
     if (value !== undefined) return { hooked: value != null, claimedBy: null };
     return { hooked: s.hookable ? (eximSlotContent(s) || '').includes(`${EXIM_SENTINEL_MACRO} =`) : includedByMain(), claimedBy: null };
   }
+  if (s.probe) return eximDriverHook(layout, s);
   if (s.macro) {
     let value = await eximMacro(layout, s.macro);
     if (value === undefined) {
@@ -1287,6 +1411,36 @@ async function eximHook(layout, slot) {
     return { hooked: value === s.path, claimedBy: value && value !== s.path ? value : null };
   }
   return { hooked: includedByMain(), claimedBy: null };
+}
+
+// Driver slots are proven by `exim -bP router_list` (transport_list,
+// authenticator_list): the names in the configuration Exim would load, in
+// configuration order, which also shows whether the virtual-user router comes
+// before the distribution's local_user/userforward routers (it must, or those
+// claim the address first). Without the binary a live split-config fragment
+// counts as hooked when it exists; a manual-include file when the main
+// configuration includes it.
+async function eximDriverHook(layout, s) {
+  const names = await eximNameList(layout, s.probe.list);
+  if (names === null) {
+    const hooked = s.hookable ? exists(s.path) : includesFile(readText(layout.mainConf || '') || '', s.path, (f) => (/^\/etc\/exim/.test(f) ? readText(f) : null)).hooked;
+    return { hooked, claimedBy: null, precedes: null };
+  }
+  const at = names.indexOf(s.probe.name);
+  const hooked = at !== -1;
+  let precedes = null;
+  if (hooked && s.probe.list === 'router_list') {
+    const laterLocals = names.filter((n, i) => EXIM_VMAIL.after.includes(n) && i < at);
+    precedes = laterLocals.length === 0;
+  }
+  return { hooked, claimedBy: null, precedes, order: hooked ? at : null };
+}
+
+async function eximNameList(layout, list) {
+  if (!layout.installed) return null;
+  const { code, stdout } = await exec(layout.bin, ['-bP', list], { allowFailure: true, timeoutMs: 30_000 });
+  if (code !== 0) return null;
+  return stdout.split('\n').map((l) => l.trim()).filter((l) => /^[A-Za-z0-9_]+$/.test(l));
 }
 
 // `exim -bV` names the compiled-in features ("Support for: ... DKIM ... SPF");
@@ -1352,6 +1506,13 @@ export function hintsFor(layout, slots) {
     if (slots.acl_data.claimedBy) h.push(`CHECK_DATA_LOCAL_ACL_FILE already points at ${slots.acl_data.claimedBy}; remove that definition from ${layout.macroFile || 'the Exim configuration'} or add ".include ${slots.acl_data.path}" inside acl_check_data for DKIM verification handling.`);
     else if (!slots.acl_data.hookable) h.push(`Add ".include ${slots.acl_data.path}" inside acl_check_data in ${layout.mainConf} for DKIM verification handling.`);
   }
+  for (const k of ['router', 'transport', 'auth']) {
+    const s = slots[k];
+    if (!s?.exists || s.hooked !== false) continue;
+    if (!s.hookable) h.push(`Add ".include ${s.path}" in the ${s.section} section of ${layout.mainConf}${k === 'router' ? ' before the local_user/userforward routers' : ''} so the account panel's virtual mailboxes ${k === 'router' ? 'are routed to Dovecot' : k === 'transport' ? 'can be delivered' : 'can authenticate for SMTP'}.`);
+    else h.push(`Exim's generated configuration does not contain the account panel's ${k} fragment ${s.path}: run update-exim4.conf and reload Exim.`);
+  }
+  if (slots.router?.hooked && slots.router.precedes === false) h.push(`The ${EXIM_VMAIL.router} router is loaded after a local-delivery router (${EXIM_VMAIL.after.join('/')}); move ".include ${slots.router.path}" above those routers or virtual mailboxes are never reached.`);
   return h;
 }
 

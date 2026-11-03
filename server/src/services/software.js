@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { json, paginate } from '../db/index.js';
 import { notFound, conflict, badRequest, forbidden, unprocessable, CapabilityError } from '../lib/errors.js';
-import { isRoot } from '../middleware/rbac.js';
+import { isRoot, ownsRow } from '../middleware/rbac.js';
 
 // Software. Attached as ctx.software; other categories may call:
 //   software.pkg.detect()                                   -> { manager: 'apt'|'dnf'|'yum'|null, family, rpm, capability }
@@ -138,7 +138,7 @@ export function createSoftwareService(ctx) {
     const sub = main ? null : stmts.accountDomain.get(domain);
     const row = main ? { ...main, type: 'main', username: main.username, docroot: null } : sub;
     if (!row) throw notFound(`Domain "${domain}"`);
-    if (!isRoot(user) && row.owner_id !== user.id) throw forbidden('That domain belongs to another reseller');
+    if (!ownsRow(user, row, { accountId: main ? main.id : sub.account_id })) throw forbidden('That domain belongs to another reseller');
     return { domain, type: row.type, username: row.username, accountId: main ? main.id : sub.account_id, ownerId: row.owner_id, docroot: docrootOf(row), phpVersion: main ? (stmts.accountDomain.get(domain)?.php_version ?? null) : sub.php_version, hasRow: !main || Boolean(stmts.accountDomain.get(domain)) };
   }
 

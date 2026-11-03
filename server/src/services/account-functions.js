@@ -1,5 +1,5 @@
 import { notFound, conflict, forbidden, unprocessable, CapabilityError } from '../lib/errors.js';
-import { isRoot } from '../middleware/rbac.js';
+import { isRoot, ownsRow } from '../middleware/rbac.js';
 
 // Account Functions. Attached as ctx.accountFunctions; other categories may call:
 //   accountFunctions.renderTemplate(name, vars)        -> HTML of a site/error page template ('index' | 'suspended' | 'moved' | 'error-4xx')
@@ -108,7 +108,7 @@ export function createAccountFunctionsService(ctx) {
   function load(username, user) {
     const row = stmts.byUsername.get(username);
     if (!row) throw notFound('Account');
-    if (!isRoot(user) && row.owner_id !== user.id) throw forbidden('That account belongs to another reseller');
+    if (!ownsRow(user, row, { accountId: row.id })) throw forbidden('That account belongs to another reseller');
     return row;
   }
   const visibleAccounts = (user) => (isRoot(user) ? stmts.all.all() : stmts.byOwner.all(user.id));

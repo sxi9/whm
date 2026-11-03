@@ -364,3 +364,107 @@ registers `clustering:dns`, `clustering:config` and the legacy `clustering`.
 `own` keyed on `accounts.owner_id`), `ctx.cpanel.upgrade.status()` reads the release only through
 `ctx.software.panel.status()` (which keeps the feed's `sha256`/`signature`/`keyId`); release keys live
 under `/etc/whm/release-keys`. Bundled plugins' node:test suites run from the root `npm test`.
+
+## 33. Customer panel: vhost seams (service-configuration)
+- `ctx.web.removeVhost(domain, req)` → `{ domain, username, type, hadRow, removed, path?, reloaded? }`. Host first
+  (`web.vhost.remove { domain, reload: true }` when Apache is present; a domain without a `web_vhosts` row is still
+  tried on the host so a stale file goes too), then the row, then audit `web.vhost.remove`. Without Apache the row
+  is dropped and `{ removed: false, reason: 'capability_missing' }` comes back (never a throw). A `main` vhost whose
+  account still exists is refused with 409: only `removeAccount` drops it. The panel calls it for addon/sub domains
+  after its own `account_domains.account_id` check.
+- `ctx.web.vhostsForAccount(username)` → the account's `web_vhosts` rows shaped like `vhostFor`.
+
+## 34. Customer panel: the `account_id` ownership branch (`ownsRow`)
+`server/src/middleware/rbac.js` exports `ownsRow(user, row, { accountId = row.account_id })`: root sees every row,
+a reseller the rows whose `owner_id` is its id, a role-`user` principal only rows whose account id equals
+`user.accountId` (the pin the panel's `scope()` puts on the principal) — never through `owner_id`, username
+equality or a missing pin. It is the check in dns-functions (`visible`, `loadAccount`, unpark, forwarding
+set/remove), ssl-tls (`visible`, `resolveAccount`, `resolveDomain`), software (`resolveDomain`),
+account-functions (`load`) and email (`assertDomain`, `visibleDomains` — whose statement now carries
+`account_id`). Root/reseller behaviour is byte-identical. Any new ownership check in a category service uses
+`ownsRow`, with `{ accountId: row.id }` for an accounts row.
+
+## 35. Customer panel: `ctx.mail.ensureMailDomain(domain, accountId, req?)`
+Upserts the `mail_domains` row for a mailbox domain: creates it with routing `auto` for `accountId`, claims an
+unowned row (`account_id IS NULL`) without touching its routing, returns `{ domain, accountId, routing, created,
+claimed }` and audits `mail.domain.ensure` when a row was created or claimed. A row that belongs to another
+account is a 409 and is **never re-pointed**; an unknown account is 404. The panel verifies the domain is the
+account's before calling (the row is not proof of ownership for anything else).
+
+## 36. Customer panel: virtual mail (`ctx.web.applyVirtualMail({ enabled }, req)`)
+Service-configuration owns every file Exim/Dovecot load for the panel's mailboxes; the panel's `vmail.*` ops own
+the data files. Setting `service_config.virtual_mail = { enabled, spamdAddress }`; `ctx.web.virtualMail.status()`
+reports slots/hooks/`live`.
+- **Agent layout (`web.exim.detect`)** gains `user`/`group` (the Exim run user, `Debian-exim`/`exim`), `vmail`
+  (`passwdDir /etc/dovecot/whm/passwd`, `aliasesDir <whmDir>/aliases`, `domainForward <whmDir>/domainfwd.lst`,
+  `autorespondersDir <whmDir>/autoresponders`, `spamUsers <whmDir>/spam_users.lst`, `autoreplyOnceDir
+  /var/lib/whm/autoreply`, `dovecotBaseDir /var/run/dovecot`) and three driver slots: `router`
+  (`conf.d/router/350_whm_virtual_mail`), `transport` (`conf.d/transport/30_whm_virtual_mail`), `auth`
+  (`conf.d/auth/25_whm_dovecot`) on split Debian (live by file order: 350 sorts after `300_real_local`, before
+  `400_system_aliases`/`600_userforward`/`900_local_user`); whole files `<whmDir>/{router,transport,auth}_*.conf`
+  the admin `.include`s once on unsplit Debian and RHEL (detect's `hints` say where; Debian's unsplit template has
+  no driver hook, and localmacros is the main section). A slot is **hooked** when `exim -bP
+  router_list|transport_list|authenticator_list` lists `whm_virtual_user`/`whm_dovecot_lmtp`/`dovecot_plain`;
+  the router slot also reports `precedes` (false when a local-delivery router comes first, which is a hint and
+  makes the apply not live). `web.exim.include.write/remove` take the three new slot names; `web.dovecot.include.*`
+  take `name` ∈ {`97-whm-mailserver.conf`, `98-whm-virtual-auth.conf`} (an enum, no paths).
+- **Rendering (service, exported for tests):** `renderDovecotVirtualAuth` (passwd-file passdb/userdb on
+  `<passwdDir>/%d`, `username_filter = *@*`, `result_success = return-ok` / `result_failure = continue`; the
+  stock system passdb/userdb of `10-auth.conf` run first because conf.d sorts `98-` after it and fall through on
+  failure, so Linux accounts never reach the passwd files and virtual addresses never reach PAM successfully;
+  `mail_plugins quota` with rules from `userdb_quota_rule`; `service auth { unix_listener auth-client }` and
+  `service lmtp { unix_listener lmtp }` opened 0660 to the Exim user/group), `renderEximVirtualRouters`
+  (`whm_domain_forward` → `whm_aliases_copy` (unseen, mailbox exists) → `whm_aliases` → `whm_autoreply` (unseen,
+  no-loop conditions) → `whm_virtual_user` → `whm_aliases_default`; every `domains`/`local_parts` list is
+  `${if exists{FILE}{lookup;FILE}{}}` because an unopenable lookup file in a list is fatal in Exim, and every file
+  name is built from `$domain_data`/`$local_part_data` (dsearch/lsearch results, untainted) — never from
+  `$domain`/`$local_part`; redirects carry `forbid_pipe forbid_file allow_fail allow_defer`),
+  `renderEximVirtualTransports` (`whm_dovecot_lmtp` lmtp over `<dovecotBaseDir>/lmtp`, `whm_autoreply` with
+  `once = <autoreplyOnceDir>/<local>@<domain>.db`), `renderEximVirtualAuths` (`dovecot_plain`/`dovecot_login`,
+  `server_advertise_condition` only when Exim Configuration Manager's `requireTlsForAuth` is on — the auth slot is
+  rewritten by every `exim.apply` while virtual mail is enabled). `renderEximMain` adds `spamd_address` and
+  defines `CHECK_DATA_LOCAL_ACL_FILE` regardless of DKIM; `renderEximDataAcl` appends `renderEximSpamAcl` — both
+  only on an Exim with `Content_Scanning` (`eximSupport().contentScan`; exim4-daemon-light gets a warning).
+- **Apply order:** `web.vmail.prepare { enabled: true }` (creates the four directories — passwd dir 0750
+  root:dovecot, aliases/autoresponders 0755 root, once-db dir 0750 owned by the Exim user — and adds the Exim user
+  to group `dovecot` with `gpasswd -a`, because routing and RCPT-time recipient verification run as the Exim user
+  and must read the root:dovecot 0640 passwd files; `{ enabled: false }` removes the membership) → Dovecot include
+  (validated with `doveconf -n`, rolled back on error) → Exim `transport`, `router` (no reload) → `exim.apply`
+  (`acl_data`, `acl_rcpt`, `auth`, `main`; reload on main). Fragments identical to what the host has are not
+  rewritten (the panel calls this at every boot); `web.vmail.prepare` always runs. Disable removes the three slots,
+  re-renders main/data ACL without spam, removes the Dovecot include. Audit `virtual_mail.apply` + `virtual_mail.applied`;
+  `service_config_applies.virtual_mail` records `live`. Missing Exim/Dovecot: CapabilityError (501) when enabling,
+  `{ applied: false, reason: 'capability_missing' }` when disabling; the switch is saved either way.
+- **File formats the fragments read** (the panel's `vmail.*` ops write them; all under `<whmDir>/` must be readable
+  by the Exim user, 0644): `aliases/<domain>` lsearch `local: a@b, :fail:, :blackhole:` with `*` as the default
+  address; `domainfwd.lst` lsearch `domain: target-domain`; `autoresponders/<domain>/<local>` = body,
+  `<local>.conf` = lsearch keys `from` (display name), `subject`, `charset`, `interval` (hours, 0 = every message),
+  `start`/`stop` (epoch seconds), `enabled` (0/1); `spam_users.lst` lsearch `domain: user=<account> enabled=0|1
+  threshold=<score×10> autodelete=0|1` (first recipient's domain decides; spamd must run so that `spam = <user>`
+  can read `~/.spamassassin/user_prefs`). The Dovecot passwd line is the design's (§5.3 of customer-panel.md).
+
+## 37. Customer panel: virtual FTP users (`ctx.web.ftp.enableVirtualUsers(req)`)
+Setting `service_config.ftp.virtualUsers` (default false) rendered by `web.ftp.config.write` as pure-ftpd
+`PureDB /etc/pure-ftpd/pureftpd.pdb` (conf/PureDB on Debian; only ever switched **on** from here so a hand-enabled
+PureDB stays) or proftpd `AuthUserFile /etc/proftpd/ftpd.passwd` + `AuthOrder mod_auth_file.c mod_auth_unix.c` in
+`conf.d/whm.conf`; `ftpSettingsFrom` reads it back. The agent creates the empty passwd file (0600 root) and runs
+`pure-pw mkdb` before the restart because pure-ftpd-wrapper/proftpd refuse a missing database; a daemon that does
+not come back gets the previous files restored as for any other setting. Returns `{ daemon, enabled, live,
+unchanged? }`, audits `ftp.virtual_users.enable`; vsftpd → `CapabilityError('ftp-virtual')` (501). The panel's
+`ftp.*` ops use the same stock file locations (`FTP_VIRTUAL` in `agent/src/ops/web.js`).
+
+## 38. Customer panel: password sync (`ctx.panel.syncPassword`)
+`accounts.create` (when `input.password` and the Linux user was created) and `accounts.setPassword` call
+`ctx.panel?.syncPassword(username, password)` **after** `user.set_password` succeeded, through a wrapper that
+tolerates an absent panel and logs (never propagates) a sync failure: the host change is the truth, the bcrypt
+copy follows. `account.created` still carries no password.
+
+## 39. Customer panel: AutoSSL history (`ctx.ssl.autossl.lastEntryFor(domain)`)
+Newest `ssl_autossl_runs` entry naming the hostname → `{ runId, trigger, provider, startedAt, finishedAt, status,
+action, message }` or null (runs are pruned to 50, so the scan is bounded).
+
+## 40. Customer panel: reseller ACL `login-as`
+Key `login-as` ("Log in to Account Panels") in the Account Management group. It is in `EXPLICIT_ACLS`: an
+unconfigured reseller (no privilege save yet) still gets every other privilege by ownership but not this one;
+root always has it. Package features the panel gates on all exist in `DEFAULT_FEATURES` (no `zoneedit` key: the
+zone editor is gated by ownership only).

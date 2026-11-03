@@ -171,6 +171,15 @@ export function createAccountsService(ctx) {
     }
   }
 
+  // The account panel keeps a bcrypt copy of the account password for its own
+  // login (contract §38): written only after the Linux password was set. The
+  // panel may be absent (category disabled) or refuse (no linked user yet);
+  // neither undoes the host change.
+  async function syncPanelPassword(username, password) {
+    if (typeof ctx.panel?.syncPassword !== 'function') return null;
+    try { return await ctx.panel.syncPassword(username, password); } catch (err) { logger.warn({ err, username }, 'panel password sync failed'); return null; }
+  }
+
   return {
     list(query, user) {
       const where = [];
@@ -244,6 +253,7 @@ export function createAccountsService(ctx) {
         })();
 
         undo.push(() => Promise.resolve(stmts.remove.run(account.id)));
+        if (input.password && sysUser) await syncPanelPassword(username, input.password);
         const provisioning = await provision(account, { ip, user, req, undo, want: { web: true, dns: true, mail: true, ...(input.provision || {}) } });
         audit(req, { action: 'account.create', target: username, args: { domain: input.domain, package: pkgName, owner: ownerId, ip, provisioning: Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])) } });
         return { ...shape(stmts.byUsername.get(username)), domains: stmts.domains.all(account.id), provisioning: { systemUser: Boolean(sysUser), ...Object.fromEntries(Object.entries(provisioning.steps).map(([k, v]) => [k, v.status])), steps: provisioning.steps } };
@@ -294,6 +304,7 @@ export function createAccountsService(ctx) {
       const account = load(username, user);
       ctx.resellers?.assertAcl?.(user, 'passwd');
       if (account.uid != null) await tryOp('user.set_password', { username, password }, req, []);
+      await syncPanelPassword(username, password);
       db.prepare("UPDATE accounts SET force_password_change = 0, updated_at = datetime('now') WHERE id = ?").run(account.id);
       audit(req, { action: 'account.password', target: username });
       return { username };
