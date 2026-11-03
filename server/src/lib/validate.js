@@ -38,6 +38,15 @@ export const pagination = z.object({
   dir: fields.sortDir,
 });
 
+// A PATCH body derived from a create schema. zod 4's .partial() keeps a field's
+// .default(), which would turn an absent key into the default and overwrite the
+// stored value, so defaults are removed before the fields become optional.
+export function patchOf(schema) {
+  const shape = {};
+  for (const [key, field] of Object.entries(schema.shape)) shape[key] = field instanceof z.ZodDefault ? field.removeDefault() : field;
+  return schema.extend(shape).partial();
+}
+
 function formatIssues(error) {
   const out = {};
   for (const issue of error.issues) {

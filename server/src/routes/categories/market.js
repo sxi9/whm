@@ -30,7 +30,7 @@ const listQuery = pagination.extend({ type: type.optional() });
 const createBody = z.object({ name, displayName, type, adapter, url: url.optional(), commissionPercent: commission.optional(), products: products.optional(), config: config.optional() }).strict();
 const updateBody = z.object({ displayName: displayName.optional(), url: url.nullable().optional(), commissionPercent: commission.optional(), products: products.optional() }).strict()
   .refine((b) => Object.keys(b).length > 0, { message: 'Provide at least one field', path: ['displayName'] });
-const configureBody = z.object({ url: url.nullable().optional(), config: config.default({}) }).strict();
+const configureBody = z.object({ url: url.nullable().optional(), config: config.prefault({}) }).strict();
 
 export async function register(ctx) {
   ctx.market = createMarketService(ctx);

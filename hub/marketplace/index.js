@@ -41,8 +41,8 @@ export const marketplaceConfigSchema = z.object({
   max_package_bytes: z.number().int().min(1024).default(20 * 1024 * 1024),
   download_url_ttl_s: z.number().int().min(60).default(900),
   download_hmac_file: z.string().optional(),
-  scan: z.object({ av_command: z.array(z.string().min(1)).nullable().default(null) }).default({}),
-  review: z.object({ require_two_reviewers_for_high_risk: z.boolean().default(true) }).default({}),
+  scan: z.object({ av_command: z.array(z.string().min(1)).nullable().default(null) }).prefault({}),
+  review: z.object({ require_two_reviewers_for_high_risk: z.boolean().default(true) }).prefault({}),
   revenue_share_pct: z.number().int().min(0).max(100).default(70),
   payout_min_cents: z.number().int().min(0).default(5000),
   currencies: z.array(z.string().length(3)).min(1).default(['USD', 'EUR']),
@@ -65,7 +65,7 @@ export const marketplaceConfigSchema = z.object({
     feed: rateLimit(30, 3600_000),
     catalog: rateLimit(600, 3600_000),
     dev_login: rateLimit(30, 15 * 60_000),
-  }).default({}),
+  }).prefault({}),
 });
 
 export function loadMarketplaceConfig(ctx) {

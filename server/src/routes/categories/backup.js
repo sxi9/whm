@@ -58,7 +58,7 @@ const settingsBody = z.object({
 
 const usernames = z.array(fields.username).min(1).max(1000);
 const restoreBody = z.discriminatedUnion('kind', [
-  z.object({ kind: z.literal('account'), options: z.object({ files: z.boolean().optional(), databases: z.boolean().optional(), dns: z.boolean().optional(), mail: z.boolean().optional(), overwrite: z.boolean().optional(), createAccount: z.boolean().optional(), package: fields.packageName.optional() }).strict().default({}) }).strict(),
+  z.object({ kind: z.literal('account'), options: z.object({ files: z.boolean().optional(), databases: z.boolean().optional(), dns: z.boolean().optional(), mail: z.boolean().optional(), overwrite: z.boolean().optional(), createAccount: z.boolean().optional(), package: fields.packageName.optional() }).strict().prefault({}) }).strict(),
   z.object({ kind: z.literal('files'), options: z.object({ paths: z.array(relPath).min(1).max(500), overwrite: z.boolean().optional() }).strict() }).strict(),
 ]);
 

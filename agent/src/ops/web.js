@@ -323,7 +323,7 @@ const vhostSchema = z.object({
   ip: arg.ipv4.nullable().optional(), ipv6: arg.ipv6.nullable().optional(), bind: arg.ip.nullable().optional(), port: z.number().int().min(1).max(65535).default(80), sslPort: z.number().int().min(1).max(65535).nullable().default(443),
   phpVersion: phpVersion.nullable().optional(), ssl: sslPaths.nullable().optional(), redirects: z.array(redirect).max(100).default([]),
   customDirectives: freeText.default(''), logDir: confPath.optional(), serverAdmin: emailAddress.optional(), options: z.string().regex(/^[A-Za-z +-]{0,200}$/).optional(),
-  meta: z.record(z.string().regex(/^[A-Za-z0-9_]{1,32}$/), metaValue).default({}), reload: z.boolean().default(true),
+  meta: z.record(z.string().regex(/^[A-Za-z0-9_]{1,32}$/), metaValue).prefault({}), reload: z.boolean().default(true),
 }).strict();
 
 const mpmSchema = z.object({

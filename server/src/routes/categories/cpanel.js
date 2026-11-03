@@ -1,5 +1,5 @@
 import express, { Router } from 'express';
-import { validate, z, fields } from '../../lib/validate.js';
+import { validate, z, fields, patchOf } from '../../lib/validate.js';
 import { requireRoot, requireReseller } from '../../middleware/rbac.js';
 import { HttpError } from '../../lib/errors.js';
 import { createCpanelService, AUDIENCES, SEVERITIES, IMAGE_KINDS, UPGRADE_JOB } from '../../services/cpanel.js';
@@ -29,7 +29,7 @@ const newsBody = z.object({
   startsAt: isoDate,
   endsAt: isoDate,
 }).strict();
-const newsPatch = newsBody.partial().refine((b) => Object.keys(b).length > 0, { message: 'Provide at least one field', path: ['title'] });
+const newsPatch = patchOf(newsBody).refine((b) => Object.keys(b).length > 0, { message: 'Provide at least one field', path: ['title'] });
 const idParam = z.object({ id: fields.id });
 const listName = z.string().trim().toLowerCase().regex(/^[a-z0-9][a-z0-9_.-]{0,63}$/, 'Mailing list names use lowercase letters, digits, ".", "_" and "-"');
 const listPassword = z.string().min(8, 'At least 8 characters').max(128).regex(/^[^\s-][^\0-\x1f\x7f]*$/, 'Passwords must not start with "-" or contain control characters');
@@ -97,7 +97,7 @@ export async function register(ctx) {
   // Upgrade to Latest Version
   r.get('/upgrade', requireRoot, wrap(() => s.upgrade.status()));
   r.post('/upgrade/check', requireRoot, wrap((req) => s.upgrade.check(req)));
-  r.post('/upgrade/start', requireRoot, validate({ body: z.object({ allowUnverified: z.boolean().default(false), skipNode: z.boolean().default(false) }).strict().default({}) }), status(202, (req) => s.upgrade.start(req.body, req.user, req)));
+  r.post('/upgrade/start', requireRoot, validate({ body: z.object({ allowUnverified: z.boolean().default(false), skipNode: z.boolean().default(false) }).strict().prefault({}) }), status(202, (req) => s.upgrade.start(req.body, req.user, req)));
   r.get('/upgrade/log', requireRoot, wrap(() => s.upgrade.log()));
   r.get('/upgrade/keys', requireRoot, wrap(() => s.releaseKeys.list()));
   r.post('/upgrade/keys', requireRoot, validate({ body: z.object({ kid, pem: z.string().max(4096).regex(/-----BEGIN PUBLIC KEY-----/, 'Paste a PEM public key') }).strict() }), status(201, (req) => s.releaseKeys.add(req.body.kid, req.body.pem, req)));

@@ -47,16 +47,16 @@ afterAll(() => {
 // Unwraps refinements, defaults and unions down to the object schemas and
 // reports whether every one of them refuses unknown keys.
 function isStrict(schema) {
-  const def = schema?._def;
+  const def = schema?._zod?.def;
   if (!def) return false;
-  switch (def.typeName) {
-    case 'ZodObject': return def.unknownKeys === 'strict';
-    case 'ZodEffects': return isStrict(def.schema);
-    case 'ZodDefault': case 'ZodOptional': case 'ZodNullable': return isStrict(def.innerType);
-    case 'ZodUnion': return def.options.every(isStrict);
-    case 'ZodDiscriminatedUnion': return [...def.options.values()].every(isStrict);
-    case 'ZodIntersection': return isStrict(def.left) && isStrict(def.right);
-    case 'ZodPipeline': return isStrict(def.in);
+  switch (def.type) {
+    case 'object': return def.catchall?._zod.def.type === 'never';
+    case 'default': case 'prefault': case 'optional': case 'nullable': case 'readonly': return isStrict(def.innerType);
+    case 'union': return def.options.every(isStrict);
+    case 'intersection': return isStrict(def.left) && isStrict(def.right);
+    // .transform() pipes the object into a transform; z.preprocess() pipes a transform into the object.
+    case 'pipe': return def.in._zod.def.type === 'transform' ? isStrict(def.out) : isStrict(def.in);
+    case 'lazy': return isStrict(def.getter());
     default: return false;
   }
 }

@@ -20,7 +20,7 @@ const subject = z.object({
   C: z.string().regex(/^[A-Z]{2}$/, 'Two-letter ISO country code').optional(), emailAddress: z.email().max(128).optional(),
 }).strict();
 const keySpec = z.object({ type: z.enum(['rsa', 'ec']).optional(), bits: z.number().int().refine((b) => [2048, 3072, 4096].includes(b), 'RSA keys must be 2048, 3072 or 4096 bits').optional(), curve: z.enum(['prime256v1', 'secp384r1']).optional() }).strict();
-const generateBody = z.object({ account: fields.username.optional(), domain: fields.hostname, sans: z.array(certName).max(100).default([]), key: keySpec.default({}), subject: subject.default({}) }).strict();
+const generateBody = z.object({ account: fields.username.optional(), domain: fields.hostname, sans: z.array(certName).max(100).default([]), key: keySpec.prefault({}), subject: subject.prefault({}) }).strict();
 const idParam = z.object({ id: fields.id });
 const part = z.enum(['cert', 'key', 'csr', 'chain', 'fullchain']);
 const boolQuery = z.enum(['true', 'false']).transform((v) => v === 'true').optional();
@@ -77,7 +77,7 @@ export async function register(ctx) {
   // Purchase flow
   r.get('/market/providers', requireReseller, wrap(() => s.market.providers()));
   r.get('/market/orders', requireReseller, wrap((req) => s.market.orders(req.user)));
-  r.post('/market/orders', requireReseller, validate({ body: z.object({ provider: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/), product: z.string().regex(/^[A-Za-z0-9_.-]{1,64}$/), domain: fields.hostname, account: fields.username.optional(), certId: fields.id.optional(), subject: subject.default({}) }).strict() }), created((req) => s.market.createOrder(req.body, req.user, req)));
+  r.post('/market/orders', requireReseller, validate({ body: z.object({ provider: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/), product: z.string().regex(/^[A-Za-z0-9_.-]{1,64}$/), domain: fields.hostname, account: fields.username.optional(), certId: fields.id.optional(), subject: subject.prefault({}) }).strict() }), created((req) => s.market.createOrder(req.body, req.user, req)));
   r.post('/market/orders/:id/complete', requireReseller, validate({ params: idParam, body: z.object({ certPem, chainPem: chainPem.optional(), orderRef: z.string().max(128).optional() }).strict() }), wrap((req) => s.market.completeOrder(req.params.id, req.body, req.user, req)));
   r.delete('/market/orders/:id', requireReseller, validate({ params: idParam }), wrap((req) => s.market.cancelOrder(req.params.id, req.user, req)));
 

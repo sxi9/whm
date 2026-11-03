@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { validate, z, fields, pagination } from '../../lib/validate.js';
+import { validate, z, fields, pagination, patchOf } from '../../lib/validate.js';
 import { requireRoot, requireReseller } from '../../middleware/rbac.js';
 import { createDnsService } from '../../services/dns-functions.js';
 
@@ -65,7 +65,7 @@ export async function register(ctx) {
   // Records -------------------------------------------------------------------
   r.post('/zones/:domain/records', requireReseller, validate({ params: domainParam, body: recordBody.strict() }),
     wrap((req) => dns().addRecord(req.params.domain, req.body, req.user, req), 201));
-  r.put('/zones/:domain/records/:id', requireReseller, validate({ params: recordParam, body: recordBody.partial().strict() }),
+  r.put('/zones/:domain/records/:id', requireReseller, validate({ params: recordParam, body: patchOf(recordBody).strict() }),
     wrap((req) => dns().updateRecord(req.params.domain, req.params.id, req.body, req.user, req)));
   r.delete('/zones/:domain/records/:id', requireReseller, validate({ params: recordParam }),
     wrap((req) => dns().deleteRecord(req.params.domain, req.params.id, req.user, req)));

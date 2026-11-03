@@ -256,7 +256,7 @@ const includeSchema = z.object({
   dbs: z.boolean().default(true),
   dns: z.boolean().default(true),
   metadata: z.boolean().default(true),
-}).strict().default({});
+}).strict().prefault({});
 
 defineOp('backup.account.archive', {
   description: 'Build a cPanel-compatible account archive (home, MySQL dumps, DNS zones, metadata) as tar.gz with sha256',

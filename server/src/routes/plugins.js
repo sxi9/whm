@@ -35,7 +35,7 @@ export function pluginRoutes(ctx) {
   r.get('/manage/:id/settings', requireRoot, validate({ params: idParam }), wrap((req) => host().settings(req.params.id)));
   r.put('/manage/:id/settings', requireRoot, validate({ params: idParam, body: z.record(z.string().regex(/^[a-z][a-zA-Z0-9_]*$/), z.unknown()) }), wrap((req) => host().updateSettings(req.params.id, req.body, req)));
   r.get('/manage/:id/logs', requireRoot, validate({ params: idParam, query: z.object({ limit: z.coerce.number().int().min(1).max(1000).default(100) }) }), wrap((req) => host().logs(req.params.id, req.query.limit)));
-  r.post('/manage/:id/jobs/:name', requireRoot, validate({ params: idParam.extend({ name: jobName }), body: z.object({ params: z.record(z.string(), z.unknown()).default({}) }).default({}) }),
+  r.post('/manage/:id/jobs/:name', requireRoot, validate({ params: idParam.extend({ name: jobName }), body: z.object({ params: z.record(z.string(), z.unknown()).prefault({}) }).prefault({}) }),
     status(202, (req) => ({ job: host().runJob(req.params.id, req.params.name, req.body.params, req.user, req) })));
   r.post('/manage/:id/restore-token', requireRoot, validate({ params: idParam, body: z.object({ artefactId: z.union([z.string().regex(/^\d{1,12}$/), z.number().int().positive()]), account: fields.username }).strict() }),
     wrap((req) => host().issueRestoreToken(req.params.id, String(req.body.artefactId), req.body.account, req.user)));

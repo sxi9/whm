@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { validate, z, fields, pagination } from '../../lib/validate.js';
+import { validate, z, fields, pagination, patchOf } from '../../lib/validate.js';
 import { requireRoot, requireReseller, requireScope } from '../../middleware/rbac.js';
 import { createDevelopmentService, wireCoreEvents, EVENT_NAME_RE, HOOK_SCRIPT_RE, ENFORCED_SCOPES, APP_NAME_RE, ACL_RE } from '../../services/development.js';
 
@@ -78,7 +78,7 @@ export async function register(ctx) {
   r.put('/hooks/settings', requireRoot, write, validate({ body: z.object({ enabled: z.boolean().optional(), defaultTimeoutSec: z.number().int().min(1).max(600).optional(), keepRuns: z.number().int().min(10).max(100000).optional() }).strict() }), wrap((req) => s.hooks.updateSettings(req.body, req)));
   r.get('/hooks/runs', requireRoot, read, validate({ query: pagination.extend({ hookId: fields.id.optional(), event: eventName.optional(), status: z.enum(['ok', 'failed', 'error', 'skipped']).optional() }) }), wrap((req) => s.hooks.runs(req.query)));
   r.get('/hooks/recent-events', requireRoot, read, wrap(() => s.hooks.recentEvents()));
-  r.post('/hooks/emit', requireRoot, write, validate({ body: z.object({ event: eventName, stage: stage.default('post'), payload: payload.default({}) }).strict() }), wrap((req) => s.hooks.emit(req.body.event, req.body.stage, req.body.payload, req)));
+  r.post('/hooks/emit', requireRoot, write, validate({ body: z.object({ event: eventName, stage: stage.default('post'), payload: payload.prefault({}) }).strict() }), wrap((req) => s.hooks.emit(req.body.event, req.body.stage, req.body.payload, req)));
   r.get('/hooks/scripts', requireRoot, read, wrap(() => s.hooks.scripts.list()));
   r.post('/hooks/scripts/init', requireRoot, write, wrap((req) => s.hooks.scripts.init(req)));
   r.get('/hooks/scripts/:name', requireRoot, read, validate({ params: z.object({ name: scriptName }) }), wrap((req) => s.hooks.scripts.read(req.params.name)));
@@ -87,7 +87,7 @@ export async function register(ctx) {
   r.get('/hooks', requireRoot, read, wrap(() => s.hooks.list()));
   r.post('/hooks', requireRoot, write, validate({ body: hookBody }), created((req) => s.hooks.create(req.body, req)));
   r.get('/hooks/:id', requireRoot, read, validate({ params: idParam }), wrap((req) => s.hooks.get(req.params.id)));
-  r.put('/hooks/:id', requireRoot, write, validate({ params: idParam, body: hookBody.partial() }), wrap((req) => s.hooks.update(req.params.id, req.body, req)));
+  r.put('/hooks/:id', requireRoot, write, validate({ params: idParam, body: patchOf(hookBody) }), wrap((req) => s.hooks.update(req.params.id, req.body, req)));
   r.patch('/hooks/:id', requireRoot, write, validate({ params: idParam, body: z.object({ enabled: z.boolean() }).strict() }), wrap((req) => s.hooks.setEnabled(req.params.id, req.body.enabled, req)));
   r.post('/hooks/:id/test', requireRoot, write, validate({ params: idParam, body: z.object({ payload: payload.optional() }).strict() }), wrap((req) => s.hooks.test(req.params.id, req.body.payload, req)));
   r.delete('/hooks/:id', requireRoot, write, validate({ params: idParam }), wrap((req) => s.hooks.remove(req.params.id, req)));
@@ -100,7 +100,7 @@ export async function register(ctx) {
   r.post('/appconfig', requireRoot, write, validate({ body: appBody }), created((req) => s.appconfig.create(req.body, req)));
   r.get('/appconfig/:id', requireRoot, read, validate({ params: idParam }), wrap((req) => s.appconfig.get(req.params.id)));
   r.get('/appconfig/:id/export', requireRoot, read, validate({ params: idParam }), wrap((req) => s.appconfig.export(req.params.id)));
-  r.put('/appconfig/:id', requireRoot, write, validate({ params: idParam, body: appBody.partial() }), wrap((req) => s.appconfig.update(req.params.id, req.body, req)));
+  r.put('/appconfig/:id', requireRoot, write, validate({ params: idParam, body: patchOf(appBody) }), wrap((req) => s.appconfig.update(req.params.id, req.body, req)));
   r.delete('/appconfig/:id', requireRoot, write, validate({ params: idParam }), wrap((req) => s.appconfig.remove(req.params.id, req)));
 
   // cPanel Plugin File Generator
