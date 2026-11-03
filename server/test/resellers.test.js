@@ -538,10 +538,12 @@ describe('Resellers API', () => {
       await put('/resell1/ips', { addresses: ['203.0.113.12'] }).expect(200);
       const res = await post('/reset', { usernames: ['resell1', 'carol', 'ghost'] }).expect(200);
       expect(res.body.data.moved_to).toBe('root');
-      // carol is a hosting account, not a panel user, so it is "missing" like ghost.
-      expect(res.body.data.missing).toEqual(['carol', 'ghost']);
+      // carol is a hosting account: the account panel gives it a role-user login, which is
+      // not a reseller and is reported as such; ghost does not exist at all.
+      expect(res.body.data.missing).toEqual(['ghost']);
+      expect(res.body.data.results.find((r) => r.username === 'carol')).toMatchObject({ reset: false });
       expect(res.body.data.results.find((r) => r.username === 'resell1')).toMatchObject({ reset: true, accounts_moved: ['bob', 'dave'], ips_released: ['203.0.113.12'], login_suspended: true });
-      expect(res.body.data.results).toHaveLength(1);
+      expect(res.body.data.results).toHaveLength(2);
       const user = app.ctx.db.prepare('SELECT role, suspended FROM users WHERE id = ?').get(reseller.id);
       // resell1 has no hosting account, so the orphaned login cannot be used.
       expect(user).toMatchObject({ role: 'user', suspended: 1 });

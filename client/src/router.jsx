@@ -8,6 +8,7 @@ import { ChangePasswordPage } from './pages/ChangePassword.jsx';
 import { FunctionPage, NotFoundPage } from './pages/FunctionPage.jsx';
 import { AuditLogPage } from './pages/AuditLog.jsx';
 import PluginPage from './pages/plugins/PluginPage.jsx';
+import { panelRoutes } from './panel/routes.jsx';
 
 // One route per function, generated from nav.js. A registered page gets its
 // component; everything else renders the generic FunctionPage.
@@ -18,6 +19,7 @@ const functionRoutes = FUNCTIONS.map((fn) => {
 
 export const router = createBrowserRouter([
   { path: '/login', element: <LoginPage /> },
+  ...panelRoutes,
   {
     path: '/',
     element: <Layout />,

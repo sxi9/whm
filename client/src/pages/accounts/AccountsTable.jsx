@@ -35,6 +35,7 @@ export function AccountsTable({ suspendedOnly = false, toolbar }) {
     r.suspended
       ? { label: 'Unsuspend', onClick: () => act(`Unsuspended ${r.username}`, () => api.post(`/accounts/${r.username}/unsuspend`)) }
       : { label: 'Suspend', onClick: async () => { if (await confirm({ title: `Suspend ${r.username}?`, message: 'The account\'s login is locked. Websites and mail are disabled until unsuspended.', confirmLabel: 'Suspend', danger: true })) act(`Suspended ${r.username}`, () => api.post(`/accounts/${r.username}/suspend`, { reason: 'Suspended from List Accounts' })); } },
+    { label: 'Log in as', onClick: () => act(`Opened the account panel as ${r.username}`, async () => { await api.post(`/panel/admin/login-as/${encodeURIComponent(r.username)}`); window.open('/panel', '_blank', 'noopener'); }) },
     { label: 'Change password', onClick: () => navigate(`/account-functions/password-modification?username=${r.username}`) },
     { label: 'Upgrade/Downgrade', onClick: () => navigate(`/account-functions/upgrade-downgrade-an-account?username=${r.username}`) },
     { label: 'Bandwidth usage', onClick: () => navigate(`/account-information/view-bandwidth-usage?username=${r.username}`) },

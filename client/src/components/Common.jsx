@@ -2,18 +2,20 @@ import { Link } from 'react-router-dom';
 import { Star, AlertTriangle, Download, Info } from 'lucide-react';
 import { useFavorites } from '../hooks/useFavorites.js';
 import { useT } from '../i18n/useT.js';
+import { useShell } from '../panel/ShellContext.js';
 
 export function PageHeader({ fn, title, description, actions, children }) {
   const { isFavorite, toggle } = useFavorites();
   const { t } = useT();
-  const heading = title || (fn && t(`fn.${fn.key}.label`, fn.label));
-  const text = description || (fn && t(`fn.${fn.key}.description`, fn.description));
+  const shell = useShell();
+  const heading = title || (fn && t(`${shell.i18nPrefix}.${fn.key}.label`, fn.label));
+  const text = description || (fn && t(`${shell.i18nPrefix}.${fn.key}.description`, fn.description));
   return (
     <header className="page-header">
       <div className="page-header-main">
         <nav className="breadcrumbs" aria-label="Breadcrumb">
-          <Link to="/">{t('common.home', 'Home')}</Link>
-          {fn && <><span>›</span><span>{t(`category.${fn.categorySlug}`, fn.category)}</span></>}
+          <Link to={shell.home}>{t('common.home', 'Home')}</Link>
+          {fn && <><span>›</span><span>{t(`${shell.categoryPrefix}.${fn.categorySlug}`, fn.category)}</span></>}
           {heading && <><span>›</span><span className="current">{heading}</span></>}
         </nav>
         <div className="page-title-row">

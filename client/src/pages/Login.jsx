@@ -5,6 +5,7 @@ import { api } from '../api/client.js';
 import { Field, TextInput, Button, ErrorBanner } from '../components/Form.jsx';
 import { useBranding } from '../pages/cpanel/branding.js';
 import { BrandMark } from '../components/Brand.jsx';
+import { landingFor } from '../auth/home.js';
 import { renderMarkdown } from '../pages/plugins/PluginPage.jsx';
 
 const EXTERNAL_ERRORS = {
@@ -35,20 +36,22 @@ export function LoginPage() {
     api.get('/auth/external').then(({ data }) => setProviders(data.providers || [])).catch(() => setProviders([]));
   }, []);
 
-  if (ready && user) return <Navigate to={location.state?.from || '/'} replace />;
+  if (ready && user) return <Navigate to={landingFor(user, location.state?.from)} replace />;
 
   const submit = async (e) => {
     e.preventDefault();
     setLoading(true);
     setError(null);
     try {
+      let signedIn;
       if (stage === 'credentials') {
         const result = await login(username.trim(), password);
         if (result.requires2fa) { setStage('2fa'); return; }
+        signedIn = result.user;
       } else {
-        await verify2fa(code.trim());
+        signedIn = await verify2fa(code.trim());
       }
-      navigate(location.state?.from || '/', { replace: true });
+      navigate(landingFor(signedIn, location.state?.from), { replace: true });
     } catch (err) {
       setError(err);
     } finally {
