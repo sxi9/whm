@@ -4,22 +4,27 @@ import { RefreshCw, HardDrive, Activity } from 'lucide-react';
 import { Card, KeyValue, EmptyState, Loading, formatBytes, formatMb, formatDate } from '../../../components/Common.jsx';
 import { Button, ErrorBanner } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
-import { ProgressLog } from '../../../components/ProgressLog.jsx';
 import { PanelPage, PanelCapabilityState, FeatureDisabledState } from '../../../panel/PanelPage.jsx';
 import { usePanelApi, panelApi, percentOf, meterTone } from '../../../panel/hooks/usePanel.js';
 import { PANEL_FUNCTION_BY_KEY } from '../../../panel/nav.js';
+import { JobProgress } from './parts/JobProgress.jsx';
 
 const DISK_USAGE_PATH = PANEL_FUNCTION_BY_KEY['panel:files/disk-usage']?.path || '/panel/files/disk-usage';
 const OBJECT_LABELS = { addons: 'Addon domains', subdomains: 'Subdomains', parked: 'Parked domains', mailboxes: 'Mailboxes', databases: 'Databases', ftp: 'FTP accounts' };
 
 const isCapability = (e) => Boolean(e) && (e.status === 501 || e.code === 'capability_missing' || e.code === 'binary_not_found');
 
-// Plan counters: null = unlimited, 0 = not part of the plan, otherwise used of limit.
-export function objectText(o) {
-  const used = o.used == null ? '—' : String(o.used);
-  if (o.limit == null) return `${used} · unlimited`;
-  if (o.limit === 0) return o.used ? `${used} · none in plan` : 'None in plan';
-  return `${used} of ${o.limit}`;
+// Plan counters for a stat tile: null limit = unlimited, 0 = not part of the plan,
+// otherwise the number as the value and the allowance below it.
+export function objectParts(o) {
+  const value = o.used == null ? '—' : String(o.used);
+  if (o.limit == null) return { value, sub: 'unlimited' };
+  if (o.limit === 0) return { value, sub: 'none in plan' };
+  return { value, sub: `of ${o.limit}` };
+}
+
+export function quotaParts(used, limit, format) {
+  return { value: format(used), sub: limit ? `of ${format(limit)}` : 'unlimited' };
 }
 
 export function meterFor(used, limit) {
@@ -32,11 +37,12 @@ export function Meter({ used, limit, name }) {
   return <div className={`meter ${tone}`} data-meter={name} aria-hidden={percent == null}><span style={{ width: `${percent ?? 0}%` }} /></div>;
 }
 
-export function Stat({ name, label, value, used, limit, note }) {
+export function Stat({ name, label, value, sub, used, limit, note }) {
   return (
     <div className="stat" data-stat={name}>
       <div className="label">{label}</div>
-      <div className="value" style={{ fontSize: 17 }}>{value}</div>
+      <div className="value">{value}</div>
+      {sub && <div className="muted small">{sub}</div>}
       <Meter used={used} limit={limit} name={name} />
       {note && <div className="muted small" style={{ marginTop: 6 }}>{note}</div>}
     </div>
@@ -78,30 +84,32 @@ export default function Usage({ fn }) {
   const d = data?.disk;
   const b = data?.bandwidth;
   const l = data?.limits || {};
+  const unavailable = isCapability(error);
+  const inodes = d && d.inodes != null ? quotaParts(d.inodes, d.inodeLimit, (n) => n.toLocaleString()) : null;
 
   return (
-    <PanelPage fn={fn} actions={<Button icon={RefreshCw} loading={busy} disabled={Boolean(job)} onClick={refresh}>Refresh figures</Button>}>
+    <PanelPage fn={fn} actions={<Button icon={RefreshCw} loading={busy} disabled={unavailable} onClick={refresh}>Refresh figures</Button>}>
       {error && error.status === 403 && error.code === 'feature_disabled' && <FeatureDisabledState fn={fn} />}
-      {error && isCapability(error) && <PanelCapabilityState error={error} onRetry={refetch} />}
-      {error && !isCapability(error) && !(error.status === 403 && error.code === 'feature_disabled') && <ErrorBanner error={error} onRetry={refetch} />}
-      {refreshError && <PanelCapabilityState error={refreshError} onRetry={() => setRefreshError(null)} />}
+      {unavailable && <Card><PanelCapabilityState error={error} onRetry={refetch} /></Card>}
+      {error && !unavailable && !(error.status === 403 && error.code === 'feature_disabled') && <ErrorBanner error={error} onRetry={refetch} />}
+      {refreshError && <Card><PanelCapabilityState error={refreshError} onRetry={() => setRefreshError(null)} /></Card>}
       {job && (
         <Card title="Scanning disk usage" actions={<button className="btn btn-sm" onClick={() => { setJob(null); refetch(); }}>Close</button>}>
-          <ProgressLog jobId={job} onFinished={() => refetch()} />
+          <JobProgress jobId={job} onFinished={refetch} message="Disk scan started; the figures update in a minute." />
         </Card>
       )}
       {loading && !data && <Loading />}
       {data && (
         <>
           <div className="stat-grid" style={{ marginBottom: 18 }}>
-            <Stat name="disk" label="Disk space" value={d.quotaMb ? `${formatMb(d.usedMb)} of ${formatMb(d.quotaMb)}` : `${formatMb(d.usedMb)} · unlimited`} used={d.usedMb} limit={d.quotaMb} note={d.source === 'repquota' ? 'From the file system quota' : 'From the last scan'} />
-            <Stat name="bandwidth" label="Bandwidth this month" value={b.limitMb ? `${formatMb(b.usedMb)} of ${formatMb(b.limitMb)}` : `${formatMb(b.usedMb)} · unlimited`} used={b.usedMb} limit={b.limitMb} />
-            {d.inodes != null && <Stat name="inodes" label="Files (inodes)" value={d.inodeLimit ? `${d.inodes.toLocaleString()} of ${d.inodeLimit.toLocaleString()}` : `${d.inodes.toLocaleString()} · unlimited`} used={d.inodes} limit={d.inodeLimit} />}
+            <Stat name="disk" label="Disk space" {...quotaParts(d.usedMb, d.quotaMb, formatMb)} used={d.usedMb} limit={d.quotaMb} note={d.source === 'repquota' ? 'From the file system quota' : 'From the last scan'} />
+            <Stat name="bandwidth" label="Bandwidth this month" {...quotaParts(b.usedMb, b.limitMb, formatMb)} used={b.usedMb} limit={b.limitMb} />
+            {inodes && <Stat name="inodes" label="Files (inodes)" {...inodes} used={d.inodes} limit={d.inodeLimit} />}
           </div>
 
           <Card title="What your plan includes" subtitle="How much of each allowance is in use.">
             <div className="stat-grid">
-              {(data.objects || []).map((o) => <Stat key={o.key} name={o.key} label={OBJECT_LABELS[o.key] || o.key} value={objectText(o)} used={o.used} limit={o.limit} />)}
+              {(data.objects || []).map((o) => <Stat key={o.key} name={o.key} label={OBJECT_LABELS[o.key] || o.key} {...objectParts(o)} used={o.used} limit={o.limit} />)}
             </div>
           </Card>
 

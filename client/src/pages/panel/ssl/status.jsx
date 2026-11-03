@@ -5,11 +5,10 @@ import { Card, KeyValue, StatusPill, EmptyState, Loading, formatDate } from '../
 import { DataTable } from '../../../components/DataTable.jsx';
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
-import { ProgressLog } from '../../../components/ProgressLog.jsx';
 import { PanelPage, PendingPill } from '../../../panel/PanelPage.jsx';
 import { usePanelApi, panelApi } from '../../../panel/hooks/usePanel.js';
 import { PANEL_FUNCTION_BY_KEY } from '../../../panel/nav.js';
-import { RequestError, ExpiryPill, StatePill, TypePill, CertificateSummary, isCapabilityError, webResult } from './parts/Shared.jsx';
+import { RequestError, JobProgress, ExpiryPill, StatePill, TypePill, CertificateSummary, isCapabilityError, webResult } from './parts/Shared.jsx';
 
 const INSTALL_PATH = PANEL_FUNCTION_BY_KEY['panel:ssl/install']?.path || '/panel/ssl/install';
 const CERTS_PATH = PANEL_FUNCTION_BY_KEY['panel:ssl/certificates']?.path || '/panel/ssl/certificates';
@@ -40,7 +39,7 @@ function DomainDetails({ domain, onClose }) {
     <Modal open={Boolean(domain)} title={domain || ''} onClose={onClose} size="md">
       {loading && !data && <Loading />}
       {error && error.status === 404 && <EmptyState icon={Info} title="No certificate installed"><p>Nothing is installed on {domain} yet.</p><p><Link className="btn btn-sm" to={`${INSTALL_PATH}?domain=${encodeURIComponent(domain)}`}>Install a certificate</Link></p></EmptyState>}
-      {error && error.status !== 404 && <RequestError error={error} onRetry={refetch} />}
+      {error && error.status !== 404 && <RequestError error={error} onRetry={refetch} inline />}
       {data && (
         <>
           <KeyValue items={[
@@ -108,8 +107,12 @@ export default function SslStatus({ fn }) {
     { key: 'autossl', label: 'Last AutoSSL run', render: (r) => <AutoSslPill entry={r.autossl} /> },
   ];
 
+  const unavailable = isCapabilityError(error);
+
   return (
-    <PanelPage fn={fn} actions={<Link className="btn btn-primary" to={INSTALL_PATH}><ShieldCheck size={16} /> Install certificate</Link>}>
+    <PanelPage fn={fn} actions={unavailable
+      ? <button type="button" className="btn btn-primary" disabled><ShieldCheck size={16} /> Install certificate</button>
+      : <Link className="btn btn-primary" to={INSTALL_PATH}><ShieldCheck size={16} /> Install certificate</Link>}>
       {error && <RequestError error={error} fn={fn} onRetry={refetch} />}
       {!error && (
         <>
@@ -134,7 +137,7 @@ export default function SslStatus({ fn }) {
 
           {job && (
             <Card title={`Issuing a certificate for ${job.domain}`} actions={<button className="btn btn-sm" onClick={() => { setJob(null); refetch(); }}>Close</button>}>
-              <ProgressLog jobId={job.id} onFinished={() => refetch()} />
+              <JobProgress jobId={job.id} onFinished={refetch} message={`Issuing a certificate for ${job.domain}; the table updates in a minute.`} />
             </Card>
           )}
 

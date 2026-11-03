@@ -24,7 +24,7 @@ React.useLayoutEffect = React.useEffect;
 
 const me = {
   user: { id: 7, username: 'demo', role: 'user' },
-  account: { username: 'demo', domain: 'demo.example.com', homeDir: '/home/demo', package: 'starter', plan: {}, features: { rawlog: true }, limits: { bandwidth_mb: 10240 }, domains: [] },
+  account: { username: 'demo', domain: 'demo.example.com', homeDir: '/home/demo', package: 'starter', plan: { bandwidth_mb: 102400 }, features: { rawlog: true }, limits: {}, domains: [] },
   usage: {}, counts: {}, actingAs: null, policy: {}, hostname: 'srv1.example', csrfToken: 't',
 };
 const ctx = { me, loading: false, error: null, reload: () => {}, hasFeature: () => true };
@@ -74,7 +74,22 @@ describe('Access logs page', () => {
     expect(html).toContain('Not available on this server');
     expect(html).toContain('Apache is not installed on this server');
     expect(html).toContain('id="logs-kind"');
-    expect(html).toContain('once the web server is available');
+    expect(html).toContain('once Apache is available');
+  });
+
+  it('treats a listing that reports the chosen server as absent like a missing subsystem', () => {
+    fixtures.responses.clear();
+    set('/panel/logs?kind=apache', { data: { kind: 'apache', domains: ['demo.example.com'], files: [], warnings: [], apache: false, nginx: false } });
+    set('/panel/logs/retention', { data: retention });
+    const html = render(h(AccessLogs, { fn: fnLogs }), fnLogs.path);
+    expect(html).toContain('Apache (not installed)');
+    expect(html).toContain('NGINX (not installed)');
+    expect(html).toContain('Not available on this server');
+    expect(html).toContain('Apache is not installed on this server');
+    expect(html).toContain('once Apache is available');
+    expect(html).not.toContain('Nothing selected');
+    expect(html).not.toContain('writes the first lines when a visitor');
+    expect(html).toContain('id="logs-kind"');
   });
 
   it('renders the plan state on 403 feature_disabled', () => {
@@ -144,6 +159,37 @@ describe('Bandwidth page', () => {
     expect(html).toContain('No monthly limit in this plan');
     expect(html).toContain('No traffic recorded yet');
     expect(html).toContain('No logs read yet');
+  });
+
+  it('keeps the plan limit and hides the tiles until the history has loaded', () => {
+    fixtures.responses.clear();
+    const loading = render(h(Bandwidth, { fn: fnBw }), fnBw.path);
+    expect(loading).toContain('Loading…');
+    expect(loading).not.toContain('Unlimited');
+    expect(loading).not.toContain('Relative to the busiest month');
+    expect(loading).toContain('Of the monthly limit');
+    set('/panel/logs/bandwidth?months=12', { error: { status: 501, code: 'capability_missing', message: 'no web server' } });
+    const missing = render(h(Bandwidth, { fn: fnBw }), fnBw.path);
+    expect(missing).not.toContain('Unlimited');
+    expect(missing).not.toContain('Traffic is not capped');
+    expect(missing).not.toContain('Monthly limit');
+    expect(missing).toContain('Of the monthly limit');
+  });
+
+  it('gives every log source its own row key', () => {
+    fixtures.responses.clear();
+    set('/panel/logs/bandwidth?months=12', { data: { ...data, sources: [
+      { path: '/var/log/apache2/domlogs/demo/demo.example.com', bytes: 123456, lastSeenAt: '2026-11-03T08:00:00Z' },
+      { path: '/var/log/apache2/domlogs/demo/shop.demo.example.com', bytes: 2048, lastSeenAt: null },
+    ] } });
+    const errors = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((...args) => errors.push(args.join(' ')));
+    const html = render(h(Bandwidth, { fn: fnBw }), fnBw.path);
+    spy.mockRestore();
+    expect(errors.filter((e) => /same key/.test(e))).toEqual([]);
+    expect(html).toContain('<code class="small">/var/log/apache2/domlogs/demo/demo.example.com</code>');
+    expect(html).toContain('<code class="small">/var/log/apache2/domlogs/demo/shop.demo.example.com</code>');
+    expect(html).toContain('2.00 KB processed');
   });
 
   it('renders 501, 503 and 403 states', () => {

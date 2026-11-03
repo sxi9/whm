@@ -388,8 +388,9 @@ export function checkArchiveMembers(members, { home, dest, allowSshDir = false }
       if (!allowSshDir) throw new OpError('refused', `the archive member "${m.name}" is a symbolic link; zip archives with links cannot be extracted for this account`);
       continue;
     }
-    if (m.target.startsWith('/') || hasDotDot(m.target) || !underDir(path.resolve(path.dirname(abs), m.target), dest)) throw new OpError('refused', `the archive member "${m.name}" is a symbolic link pointing outside the destination`);
-    if (!allowSshDir && landsInSsh(path.resolve(path.dirname(abs), m.target), home)) throw new OpError('refused', `the archive member "${m.name}" is a symbolic link into ${SSH_DIR}`);
+    const linked = path.resolve(path.dirname(abs), m.target);
+    if (!underDir(linked, dest)) throw new OpError('refused', `the archive member "${m.name}" is a symbolic link pointing outside the destination`);
+    if (!allowSshDir && landsInSsh(linked, home)) throw new OpError('refused', `the archive member "${m.name}" is a symbolic link into ${SSH_DIR}`);
   }
   return members.length;
 }

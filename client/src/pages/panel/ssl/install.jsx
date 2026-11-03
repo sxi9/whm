@@ -4,11 +4,10 @@ import { Sparkles, Upload } from 'lucide-react';
 import { Card, KeyValue, StatusPill } from '../../../components/Common.jsx';
 import { Field, Select, Textarea, Button, FormActions, ErrorBanner } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
-import { ProgressLog } from '../../../components/ProgressLog.jsx';
 import { PanelPage, PanelCapabilityState } from '../../../panel/PanelPage.jsx';
 import { usePanelApi, panelApi } from '../../../panel/hooks/usePanel.js';
 import { PANEL_FUNCTION_BY_KEY } from '../../../panel/nav.js';
-import { RequestError, ExpiryPill, StatePill, CertificateSummary, WebStatus, isCapabilityError, pem } from './parts/Shared.jsx';
+import { RequestError, JobProgress, ExpiryPill, StatePill, CertificateSummary, WebStatus, isCapabilityError, pem } from './parts/Shared.jsx';
 
 const STATUS_PATH = PANEL_FUNCTION_BY_KEY['panel:ssl/status']?.path || '/panel/ssl/status';
 const CERTS_PATH = PANEL_FUNCTION_BY_KEY['panel:ssl/certificates']?.path || '/panel/ssl/certificates';
@@ -99,7 +98,7 @@ export default function InstallCertificate({ fn }) {
           <Card title="Free certificate" subtitle={autossl?.enabled ? `Issued by ${autossl.provider} and renewed automatically. The domain must already point at this server.` : 'Automatic certificates are not enabled on this server; ask your hosting provider, or install your own certificate below.'}
             actions={<Button variant="primary" icon={Sparkles} loading={busy && !job} disabled={!domain || !autossl?.enabled} onClick={issue}>Issue now</Button>}>
             {issueError && <PanelCapabilityState error={issueError} onRetry={() => setIssueError(null)} />}
-            {job && <ProgressLog jobId={job.id} onFinished={() => domains.refetch()} />}
+            {job && <JobProgress jobId={job.id} onFinished={domains.refetch} message={`Issuing a free certificate for ${job.domain}; the current certificate above updates in a minute.`} />}
             {!job && !issueError && <p className="muted">{autossl?.enabled ? 'Issuing takes about a minute. Progress shows here.' : 'Nothing to do here until AutoSSL is enabled on the server.'}</p>}
           </Card>
 

@@ -96,6 +96,7 @@ describe('PHP versions', () => {
     const missing = render(<PhpVersions fn={fns.versions} />);
     expect(missing).toContain('Not available on this server');
     expect(missing).toContain('PHP is not installed');
+    expect(missing).toMatch(/<section class="card[^"]*"><div class="card-body"><div class="empty-state/);
   });
 
   it('versionOptions, versionLabel and webResult', () => {
@@ -147,6 +148,7 @@ describe('PHP settings (.user.ini)', () => {
     const missing = render(<PhpSettings fn={fns.ini} />, '/panel/php/ini?domain=demo.example.com');
     expect(missing).toContain('Not available on this server');
     expect(missing).toContain('PHP is not installed');
+    expect(missing).toMatch(/<section class="card[^"]*"><div class="card-body"><div class="empty-state/);
   });
 
   it('otherDirectives, changedDirectives and the directive table', () => {

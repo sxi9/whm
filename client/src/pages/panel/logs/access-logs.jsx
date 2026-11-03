@@ -55,7 +55,10 @@ export default function AccessLogs({ fn }) {
 
   if (isFeatureDisabled(error)) return <PanelPage fn={fn}><FeatureDisabledState fn={fn} /></PanelPage>;
 
-  const kindOptions = KINDS.map((k) => ({ ...k, label: k.value === 'nginx' && data && data.nginx === false ? 'NGINX (not installed)' : k.label }));
+  const kindOptions = KINDS.map((k) => ({ ...k, label: data && data[k.value] === false ? `${k.label} (not installed)` : k.label }));
+  const kindLabel = KINDS.find((k) => k.value === kind)?.label || kind;
+  // A 200 listing can still report the chosen server as absent (`apache:false`).
+  const missing = capability ? error : data && data[kind] === false ? { status: 501, code: 'capability_missing', message: `${kindLabel} is not installed on this server, so there are no ${kindLabel} logs to show.` } : null;
   const lines = tail.data?.content ? tail.data.content.split('\n').filter((l, i, a) => l !== '' || i < a.length - 1) : [];
 
   return (
@@ -65,7 +68,7 @@ export default function AccessLogs({ fn }) {
       )}
       <div className="grid-2">
         <Card title="Choose a log" subtitle="Raw web server logs for the domains on this account.">
-          <PanelCapabilityState error={error} onRetry={refetch} />
+          <PanelCapabilityState error={missing} onRetry={refetch} />
           <RequestError error={error} onRetry={refetch} />
           <div className="form-grid">
             <Field label="Web server" htmlFor="logs-kind"><Select id="logs-kind" value={kind} onChange={(v) => { setKind(v); setFile(''); }} options={kindOptions} /></Field>
@@ -88,9 +91,9 @@ export default function AccessLogs({ fn }) {
 
       <Card title={file ? `Tail of ${file}` : 'Log view'} subtitle={tail.data ? `${tail.data.truncated ? 'Last' : 'All'} ${formatBytes(tail.data.length)} of ${formatBytes(tail.data.size)}${tail.data.mtime ? ` · updated ${formatDate(tail.data.mtime)}` : ''}` : undefined}
         actions={tail.data && <span className="muted small">{lines.length} line{lines.length === 1 ? '' : 's'}{live ? ' · following' : ''}</span>}>
-        <PanelCapabilityState error={tail.error} onRetry={tail.refetch} />
+        <PanelCapabilityState error={missing || tail.error} onRetry={missing ? refetch : tail.refetch} />
         <RequestError error={tail.error} onRetry={tail.refetch} />
-        {!file && !capability && (
+        {!file && !missing && (
           <EmptyState icon={ScrollText} title="Nothing selected"><p>Choose a domain and a log file above. The last part of the file shows here and can be followed live.</p>{data && !data.files?.length && <p className="muted">No log files exist yet. The web server writes the first lines when a visitor opens one of your domains.</p>}</EmptyState>
         )}
         {file && tail.data && tail.data.size === 0 && <EmptyState icon={ScrollText} title="This log is empty"><p>Requests appear here as soon as the web server records them.</p></EmptyState>}
@@ -112,7 +115,7 @@ export default function AccessLogs({ fn }) {
             { label: 'View', primary: true, onClick: () => { setFile(f.name); window.scrollTo({ top: 0, behavior: 'smooth' }); } },
             { label: 'Download', onClick: () => { window.location.href = downloadHref(kind, f.name); } },
           ]}
-          emptyText={capability ? 'Log files appear here once the web server is available on this server.' : 'No log files yet. The web server creates one per domain once it has served a request; archived months land in your logs folder.'}
+          emptyText={missing ? `Log files appear here once ${kindLabel} is available on this server.` : 'No log files yet. The web server creates one per domain once it has served a request; archived months land in your logs folder.'}
         />
       </Card>
     </PanelPage>

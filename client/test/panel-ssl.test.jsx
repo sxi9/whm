@@ -22,7 +22,7 @@ const { PANEL_FUNCTION_BY_KEY } = await import('../src/panel/nav.js');
 const { default: SslStatus, sslSummary } = await import('../src/pages/panel/ssl/status.jsx');
 const { default: InstallCertificate, certificateCandidates } = await import('../src/pages/panel/ssl/install.jsx');
 const { default: Certificates, generateBody } = await import('../src/pages/panel/ssl/certificates.jsx');
-const { webResult, accountDomains, parseSans, pem } = await import('../src/pages/panel/ssl/parts/Shared.jsx');
+const { webResult, accountDomains, parseSans, pem, JobProgress, canStreamJobs, RequestError } = await import('../src/pages/panel/ssl/parts/Shared.jsx');
 
 React.useLayoutEffect = React.useEffect;
 
@@ -33,9 +33,10 @@ const me = {
 };
 const ctx = { me, loading: false, error: null, reload: () => {}, hasFeature: () => true };
 const fns = { status: PANEL_FUNCTION_BY_KEY['panel:ssl/status'], install: PANEL_FUNCTION_BY_KEY['panel:ssl/install'], certificates: PANEL_FUNCTION_BY_KEY['panel:ssl/certificates'] };
-const render = (el, path = '/panel/ssl/status') => renderToStaticMarkup(
-  <ToastProvider><ConfirmProvider><MemoryRouter initialEntries={[path]}><ShellContext.Provider value={PANEL_SHELL}><PanelContext.Provider value={ctx}>{el}</PanelContext.Provider></ShellContext.Provider></MemoryRouter></ConfirmProvider></ToastProvider>,
+const render = (el, path = '/panel/ssl/status', panel = ctx) => renderToStaticMarkup(
+  <ToastProvider><ConfirmProvider><MemoryRouter initialEntries={[path]}><ShellContext.Provider value={PANEL_SHELL}><PanelContext.Provider value={panel}>{el}</PanelContext.Provider></ShellContext.Provider></MemoryRouter></ConfirmProvider></ToastProvider>,
 );
+const actingCtx = { ...ctx, me: { ...me, user: { id: 1, username: 'root', role: 'root' }, actingAs: { account: 'demo', by: 'root', expiresAt: null } } };
 
 const soon = new Date(Date.now() + 20 * 86_400_000).toISOString();
 const installed = { id: 3, domain: 'demo.example.com', state: 'installed', installed: 1, subject: 'CN=demo.example.com', issuer: "C=US, O=Let's Encrypt, CN=R11", notBefore: '2026-10-01T00:00:00Z', notAfter: soon, daysRemaining: 20, expired: false, autossl: true, selfSigned: false, files: { present: true } };
@@ -96,6 +97,33 @@ describe('SSL status', () => {
     expect(missing).toContain('Not available on this server');
     expect(missing).toContain('openssl is not installed');
     expect(missing).toContain('Re-check');
+    expect(missing).toMatch(/<section class="card[^"]*"><div class="card-body"><div class="empty-state/);
+    expect(missing).toMatch(/<button type="button" class="btn btn-primary" disabled=""><svg[^]*?Install certificate<\/button>/);
+    expect(missing).not.toContain('href="/panel/ssl/install"');
+  });
+
+  it('job progress: a customer gets a notice instead of the admin-only job stream, an admin logged in as the account gets the live log', () => {
+    expect(canStreamJobs(me)).toBe(false);
+    expect(canStreamJobs(actingCtx.me)).toBe(true);
+    expect(canStreamJobs({ user: { role: 'reseller' } })).toBe(true);
+    expect(canStreamJobs(null)).toBe(false);
+    const customer = render(<JobProgress jobId={12} onFinished={() => {}} message="Issuing; the table updates in a minute." />);
+    expect(customer).toContain('banner banner-info');
+    expect(customer).toContain('data-job="12"');
+    expect(customer).toContain('Issuing; the table updates in a minute.');
+    expect(customer).not.toContain('progress-log');
+    const admin = render(<JobProgress jobId={12} onFinished={() => {}} />, '/panel/ssl/status', actingCtx);
+    expect(admin).toContain('progress-log');
+    expect(admin).not.toContain('banner-info');
+    expect(render(<JobProgress jobId={null} />)).not.toContain('banner');
+  });
+
+  it('RequestError puts the 501 state on a card unless inline', () => {
+    expect(renderToStaticMarkup(<RequestError error={NO_DAEMON} />)).toMatch(/^<section class="card ">/);
+    expect(renderToStaticMarkup(<RequestError error={NO_DAEMON} inline />)).toMatch(/^<div class="empty-state/);
+    expect(renderToStaticMarkup(<RequestError error={FEATURE_OFF} fn={fns.status} />)).toContain('Not included in your plan');
+    expect(renderToStaticMarkup(<RequestError error={{ status: 500, message: 'boom' }} />)).toContain('boom');
+    expect(renderToStaticMarkup(<RequestError error={null} />)).toBe('');
   });
 
   it('sslSummary counts secured, expiring and unsecured domains', () => {
@@ -184,7 +212,10 @@ describe('Certificates', () => {
     responses = { '/panel/ssl/certs': { error: FEATURE_OFF }, '/panel/ssl/certs/storage': { error: FEATURE_OFF } };
     expect(render(<Certificates fn={fns.certificates} />, '/panel/ssl/certificates')).toContain('Not included in your plan');
     responses = { '/panel/ssl/certs': { error: NO_DAEMON }, '/panel/ssl/certs/storage': { error: NO_DAEMON } };
-    expect(render(<Certificates fn={fns.certificates} />, '/panel/ssl/certificates')).toContain('Not available on this server');
+    const missing = render(<Certificates fn={fns.certificates} />, '/panel/ssl/certificates');
+    expect(missing).toContain('Not available on this server');
+    expect(missing).toMatch(/<section class="card[^"]*"><div class="card-body"><div class="empty-state/);
+    expect(missing.match(/<button class="btn[^"]*" disabled=""/g)).toHaveLength(3);
   });
 
   it('generateBody builds the API body for a CSR', () => {

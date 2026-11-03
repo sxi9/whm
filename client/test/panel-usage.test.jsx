@@ -19,7 +19,8 @@ vi.mock('../src/hooks/useApi.js', () => ({
 const { PanelContext } = await import('../src/panel/hooks/usePanel.js');
 const { ShellContext, PANEL_SHELL } = await import('../src/panel/ShellContext.js');
 const { PANEL_FUNCTION_BY_KEY } = await import('../src/panel/nav.js');
-const { default: Usage, objectText, meterFor } = await import('../src/pages/panel/usage/usage.jsx');
+const { default: Usage, objectParts, quotaParts, meterFor } = await import('../src/pages/panel/usage/usage.jsx');
+const { JobProgress, canStreamJobs } = await import('../src/pages/panel/usage/parts/JobProgress.jsx');
 
 React.useLayoutEffect = React.useEffect;
 
@@ -30,9 +31,10 @@ const me = {
 };
 const ctx = { me, loading: false, error: null, reload: () => {}, hasFeature: () => true };
 const fn = PANEL_FUNCTION_BY_KEY['panel:usage/usage'];
-const render = (el) => renderToStaticMarkup(
-  <ToastProvider><ConfirmProvider><MemoryRouter initialEntries={[fn.path]}><ShellContext.Provider value={PANEL_SHELL}><PanelContext.Provider value={ctx}>{el}</PanelContext.Provider></ShellContext.Provider></MemoryRouter></ConfirmProvider></ToastProvider>,
+const render = (el, panel = ctx) => renderToStaticMarkup(
+  <ToastProvider><ConfirmProvider><MemoryRouter initialEntries={[fn.path]}><ShellContext.Provider value={PANEL_SHELL}><PanelContext.Provider value={panel}>{el}</PanelContext.Provider></ShellContext.Provider></MemoryRouter></ConfirmProvider></ToastProvider>,
 );
+const actingCtx = { ...ctx, me: { ...me, user: { id: 1, username: 'root', role: 'root' }, actingAs: { account: 'demo', by: 'root', expiresAt: null } } };
 
 const usageData = {
   account: { username: 'demo', domain: 'demo.example.com', package: 'starter', home: '/home/demo' },
@@ -54,7 +56,12 @@ describe('Usage page', () => {
     expect(html).toContain('<h1>Usage</h1>');
     expect(html).toContain('Refresh figures');
     expect(html).toContain('data-stat="disk"');
-    expect(html).toContain('512 MB of 1.00 GB');
+    expect(html).toContain('<div class="value">512 MB</div><div class="muted small">of 1.00 GB</div>');
+    expect(html).toContain('<div class="value">12,000</div><div class="muted small">of 100,000</div>');
+    expect(html).toContain('<div class="value">3</div><div class="muted small">unlimited</div>');
+    expect(html).toContain('<div class="value">0</div><div class="muted small">none in plan</div>');
+    expect(html).not.toContain('font-size');
+    expect(html).not.toMatch(/Refresh figures<\/button>[^]*disabled/);
     expect(html).toContain('data-meter="disk"');
     expect(html).toContain('width:50%');
     expect(html).toContain('From the file system quota');
@@ -62,7 +69,7 @@ describe('Usage page', () => {
     expect(html).toContain('meter bad');
     expect(html).toContain('width:96%');
     expect(html).toContain('data-stat="inodes"');
-    expect(html).toContain('12,000 of 100,000');
+    expect(html).toContain('<div class="value">12,000</div>');
     expect(html).toContain('What your plan includes');
     expect(html).toContain('Addon domains');
     expect(html).toContain('None in plan');
@@ -91,7 +98,7 @@ describe('Usage page', () => {
   it('shows empty states for the breakdown and months, and unlimited disk and bandwidth', () => {
     responses = { '/panel/usage': { data: { ...usageData, disk: { ...usageData.disk, quotaMb: null, inodes: null, inodeLimit: null, source: 'scan', breakdown: null, lastRefresh: null }, bandwidth: { usedMb: 0, limitMb: null, percent: null, months: [] }, limits: { ...usageData.limits, disk_mb: null, bandwidth_mb: null, max_email_per_hour: null, quota_inodes: null } } } };
     const html = render(<Usage fn={fn} />);
-    expect(html).toContain('512 MB · unlimited');
+    expect(html).toContain('<div class="value">512 MB</div><div class="muted small">unlimited</div>');
     expect(html).toContain('0 B · unlimited');
     expect(html).toContain('From the last scan');
     expect(html).not.toContain('data-stat="inodes"');
@@ -110,16 +117,31 @@ describe('Usage page', () => {
     const missing = render(<Usage fn={fn} />);
     expect(missing).toContain('Not available on this server');
     expect(missing).toContain('Disk usage is not available');
+    expect(missing).toMatch(/<section class="card[^"]*"><div class="card-body"><div class="empty-state/);
+    expect(missing).toMatch(/<button [^>]*disabled=""[^>]*>[^]*?Refresh figures<\/button>/);
     responses = { '/panel/usage': { error: { status: 502, code: 'agent_unavailable', message: 'The agent is not reachable' } } };
     expect(render(<Usage fn={fn} />)).toContain('The agent is not reachable');
   });
 
-  it('objectText and meterFor treat null as unlimited and 0 as none in plan', () => {
-    expect(objectText({ used: 3, limit: null })).toBe('3 · unlimited');
-    expect(objectText({ used: 0, limit: 0 })).toBe('None in plan');
-    expect(objectText({ used: 2, limit: 0 })).toBe('2 · none in plan');
-    expect(objectText({ used: 4, limit: 10 })).toBe('4 of 10');
-    expect(objectText({ used: null, limit: 10 })).toBe('— of 10');
+  it('job progress: a customer gets a notice instead of the admin-only job stream, an admin logged in as the account gets the live log', () => {
+    expect(canStreamJobs(me)).toBe(false);
+    expect(canStreamJobs(actingCtx.me)).toBe(true);
+    const customer = render(<JobProgress jobId={4} onFinished={() => {}} message="Disk scan started; the figures update in a minute." />);
+    expect(customer).toContain('banner banner-info');
+    expect(customer).toContain('Disk scan started; the figures update in a minute.');
+    expect(customer).not.toContain('progress-log');
+    const admin = render(<JobProgress jobId={4} onFinished={() => {}} />, actingCtx);
+    expect(admin).toContain('progress-log');
+    expect(admin).not.toContain('banner-info');
+  });
+
+  it('objectParts, quotaParts and meterFor treat null as unlimited and 0 as none in plan', () => {
+    expect(objectParts({ used: 3, limit: null })).toEqual({ value: '3', sub: 'unlimited' });
+    expect(objectParts({ used: 0, limit: 0 })).toEqual({ value: '0', sub: 'none in plan' });
+    expect(objectParts({ used: 4, limit: 10 })).toEqual({ value: '4', sub: 'of 10' });
+    expect(objectParts({ used: null, limit: 10 })).toEqual({ value: '—', sub: 'of 10' });
+    expect(quotaParts(512, 1024, (n) => `${n} MB`)).toEqual({ value: '512 MB', sub: 'of 1024 MB' });
+    expect(quotaParts(512, null, (n) => `${n} MB`)).toEqual({ value: '512 MB', sub: 'unlimited' });
     expect(meterFor(4, 10)).toEqual({ percent: 40, tone: '' });
     expect(meterFor(9, 10)).toEqual({ percent: 90, tone: 'warn' });
     expect(meterFor(10, 10)).toEqual({ percent: 100, tone: 'bad' });

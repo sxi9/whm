@@ -1,4 +1,4 @@
-import { StatusPill } from '../../../../components/Common.jsx';
+import { Card, StatusPill } from '../../../../components/Common.jsx';
 import { ErrorBanner } from '../../../../components/Form.jsx';
 import { PanelCapabilityState, FeatureDisabledState, PendingPill } from '../../../../panel/PanelPage.jsx';
 
@@ -6,10 +6,14 @@ export function isCapabilityError(error) {
   return Boolean(error) && (error.status === 501 || error.code === 'capability_missing' || error.code === 'binary_not_found');
 }
 
-export function RequestError({ error, fn, onRetry }) {
+// The 501 state sits on its own card surface unless `inline` (already inside a card).
+export function RequestError({ error, fn, onRetry, inline = false }) {
   if (!error) return null;
   if (error.status === 403 && error.code === 'feature_disabled') return <FeatureDisabledState fn={fn} />;
-  if (isCapabilityError(error)) return <PanelCapabilityState error={error} onRetry={onRetry} />;
+  if (isCapabilityError(error)) {
+    const state = <PanelCapabilityState error={error} onRetry={onRetry} />;
+    return inline ? state : <Card>{state}</Card>;
+  }
   return <ErrorBanner error={error} onRetry={onRetry} />;
 }
 

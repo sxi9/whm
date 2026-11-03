@@ -211,6 +211,7 @@ export default function Certificates({ fn }) {
   };
 
   const pageError = certs.error && (certs.error.status === 403 || isCapabilityError(certs.error)) ? certs.error : null;
+  const unavailable = isCapabilityError(certs.error);
   const rows = certs.data || [];
   const empty = !certs.loading && !certs.error && rows.length === 0 && !table.state.q && !kind;
 
@@ -226,9 +227,9 @@ export default function Certificates({ fn }) {
   return (
     <PanelPage fn={fn} actions={(
       <>
-        <button className="btn" onClick={() => setModal('csr')}><FilePlus size={16} /> Generate signing request</button>
-        <button className="btn" onClick={() => setModal('self-signed')}><ShieldCheck size={16} /> Self-signed certificate</button>
-        <button className="btn btn-primary" onClick={() => setModal('upload')}><Upload size={16} /> Upload</button>
+        <button className="btn" disabled={unavailable} onClick={() => setModal('csr')}><FilePlus size={16} /> Generate signing request</button>
+        <button className="btn" disabled={unavailable} onClick={() => setModal('self-signed')}><ShieldCheck size={16} /> Self-signed certificate</button>
+        <button className="btn btn-primary" disabled={unavailable} onClick={() => setModal('upload')}><Upload size={16} /> Upload</button>
       </>
     )}>
       {pageError && <RequestError error={pageError} fn={fn} onRetry={reload} />}

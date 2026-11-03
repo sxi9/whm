@@ -1,8 +1,10 @@
-import { useState } from 'react';
-import { Copy, Download } from 'lucide-react';
-import { StatusPill, KeyValue, formatDate } from '../../../../components/Common.jsx';
+import { useEffect, useRef, useState } from 'react';
+import { Copy, Download, Clock } from 'lucide-react';
+import { Card, StatusPill, KeyValue, formatDate } from '../../../../components/Common.jsx';
 import { ErrorBanner } from '../../../../components/Form.jsx';
+import { ProgressLog } from '../../../../components/ProgressLog.jsx';
 import { PanelCapabilityState, FeatureDisabledState, PendingPill } from '../../../../panel/PanelPage.jsx';
+import { usePanelMe } from '../../../../panel/hooks/usePanel.js';
 
 export function isCapabilityError(error) {
   return Boolean(error) && (error.status === 501 || error.code === 'capability_missing' || error.code === 'binary_not_found');
@@ -13,11 +15,50 @@ export function isFeatureDisabled(error) {
 }
 
 // One error display for a panel request: plan gate, missing daemon, or a plain failure.
-export function RequestError({ error, fn, onRetry }) {
+// The 501 state sits on its own card surface unless `inline` (already inside a card or modal).
+export function RequestError({ error, fn, onRetry, inline = false }) {
   if (!error) return null;
   if (isFeatureDisabled(error)) return <FeatureDisabledState fn={fn} />;
-  if (isCapabilityError(error)) return <PanelCapabilityState error={error} onRetry={onRetry} />;
+  if (isCapabilityError(error)) {
+    const state = <PanelCapabilityState error={error} onRetry={onRetry} />;
+    return inline ? state : <Card>{state}</Card>;
+  }
   return <ErrorBanner error={error} onRetry={onRetry} />;
+}
+
+// The job stream (/api/system/jobs/:id/stream) answers 403 for role `user`, so a
+// customer gets a notice and periodic refetches instead of the live log.
+export function canStreamJobs(me) {
+  const role = me?.user?.role;
+  return role === 'root' || role === 'reseller';
+}
+
+export function JobProgress({ jobId, onFinished, message = 'Started; this screen updates in a minute.', pollMs = 5000, polls = 12 }) {
+  const { me } = usePanelMe();
+  const streaming = canStreamJobs(me);
+  const finishedRef = useRef(onFinished);
+  useEffect(() => { finishedRef.current = onFinished; }, [onFinished]);
+  useEffect(() => {
+    if (!jobId || streaming) return undefined;
+    let n = 0;
+    const timer = setInterval(() => {
+      n += 1;
+      finishedRef.current?.();
+      if (n >= polls) clearInterval(timer);
+    }, pollMs);
+    return () => clearInterval(timer);
+  }, [jobId, streaming, pollMs, polls]);
+  if (!jobId) return null;
+  if (streaming) return <ProgressLog jobId={jobId} onFinished={onFinished} />;
+  return (
+    <div className="banner banner-info" data-job={jobId}>
+      <Clock size={18} />
+      <div>
+        <strong>{message}</strong>
+        <p className="muted">The server is working on it in the background; there is nothing else to do here.</p>
+      </div>
+    </div>
+  );
 }
 
 export const WEB_TYPES = ['main', 'addon', 'sub', 'parked', 'alias'];

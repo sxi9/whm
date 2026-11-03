@@ -107,7 +107,7 @@ export default function PhpSettings({ fn }) {
                   <button type="button" role="tab" aria-selected={mode === 'all'} className={mode === 'all' ? 'active' : ''} onClick={() => setMode('all')}>All directives</button>
                 </div>
               )}>
-              <RequestError error={ini.error} onRetry={ini.refetch} />
+              <RequestError error={ini.error} onRetry={ini.refetch} inline />
               {ini.loading && !ini.data && <Loading />}
               {ini.data && mode === 'basic' && (
                 <div className="form-grid">

@@ -1,4 +1,4 @@
-import { validate, z } from '../../lib/validate.js';
+import { validate, z, fields } from '../../lib/validate.js';
 import { panelRouter, wrap, created, accepted, relPath, requireFeature } from './index.js';
 import { createPanelFilesService, relPathOrRoot, fileName, fileMode, archiveFormat, JOB_ARCHIVE, JOB_EXTRACT, MAX_TEXT_BYTES, MAX_UPLOAD_BYTES } from '../../services/panel-files.js';
 
@@ -8,6 +8,7 @@ import { createPanelFilesService, relPathOrRoot, fileName, fileMode, archiveForm
 const pathQuery = z.object({ path: relPathOrRoot });
 const uploadParam = z.object({ id: z.string().regex(/^[a-f0-9]{24}$/) });
 const chunkBody = z.object({ data: z.string().min(1).max(1_800_000).regex(/^[A-Za-z0-9+/=]+$/, 'Chunk must be base64') }).strict();
+const jobParam = z.object({ id: fields.id });
 
 export async function register(ctx) {
   const svc = createPanelFilesService(ctx);
@@ -43,6 +44,12 @@ export async function register(ctx) {
   r.post('/archive', validate({ body: z.object({ paths: z.array(relPath).min(1).max(500), dest: relPath, format: archiveFormat }).strict() }), accepted((req) => svc.enqueueArchive(req.panel, req.body, req)));
   r.post('/extract', validate({ body: z.object({ archive: relPath, dest: relPathOrRoot }).strict() }), accepted((req) => svc.enqueueExtract(req.panel, req.body, req)));
   r.get('/du', validate({ query: pathQuery.extend({ depth: z.coerce.number().int().min(0).max(2).default(1) }) }), wrap((req) => svc.du(req.panel, req.query, req)));
+
+  // The account's archive/extract jobs (/api/system/jobs is reseller-only, so
+  // a role-user principal follows its 202 jobs here).
+  r.get('/jobs', wrap((req) => svc.listJobs(req.panel)));
+  r.get('/jobs/:id', validate({ params: jobParam }), wrap((req) => svc.getJob(req.panel, req.params.id)));
+  r.get('/jobs/:id/stream', validate({ params: jobParam }), (req, res, next) => { try { svc.streamJob(req.panel, req.params.id, req, res); } catch (err) { next(err); } });
 
   return { path: '/files', router: r };
 }
