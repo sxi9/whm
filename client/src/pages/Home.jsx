@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Star, Search } from 'lucide-react';
-import { iconFor } from '../icons.js';
+import { iconFor, colorFor } from '../icons.js';
 import { useApi } from '../hooks/useApi.js';
 import { useAuth } from '../auth/AuthContext.jsx';
 import { FUNCTION_BY_KEY } from '../nav.js';
@@ -25,18 +25,26 @@ export function HomePage() {
   const mem = server?.memory;
   const rootDisk = server?.disks?.find((d) => d.mountpoint === '/') || server?.disks?.[0];
 
+  const hour = new Date().getHours();
+  const greeting = hour < 5 ? 'Good night' : hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
   return (
     <div className="home">
       <div className="home-main">
+        <div className="home-hero">
+          <div>
+            <h1>{greeting}, {user.username}</h1>
+            <p>{status ? `${status.hostname} · ${status.counts.accounts} accounts · load ${server.loadAverage[0].toFixed(2)}` : 'Loading server status…'}</p>
+          </div>
+        </div>
         <NewsBanner />
         <MarketplaceUpdatesNotice />
-        <Card title="Favorites" subtitle={favoriteFns.length ? 'Your pinned tools' : 'Click the star on any tool to pin it here.'}>
-          {favoriteFns.length > 0 && (
+        {favoriteFns.length > 0 && (
+          <Card title="Favorites" subtitle="Your pinned tools">
             <div className="tool-grid">
               {favoriteFns.map((f) => <ToolCard key={f.key} fn={f} favorite onToggle={() => toggle(f.key)} />)}
             </div>
-          )}
-        </Card>
+          </Card>
+        )}
 
         <Card title="Tools" actions={(
           <div className="search inline">
@@ -50,7 +58,7 @@ export function HomePage() {
             const Icon = iconFor(cat.icon);
             return (
               <section key={cat.slug} className="tool-section">
-                <h3><Icon size={18} /> {cat.label} <span className="count">{fns.length}</span></h3>
+                <h3><span className="nav-tile" style={{ '--tile': colorFor(cat.slug) }}><Icon size={14} strokeWidth={2.25} /></span> {cat.label} <span className="count">{fns.length}</span></h3>
                 <div className="tool-grid">
                   {fns.map((f) => <ToolCard key={f.key} fn={f} favorite={favorites.includes(f.key)} onToggle={() => toggle(f.key)} />)}
                 </div>
@@ -79,7 +87,7 @@ export function HomePage() {
               rootDisk && ['Disk (/)', `${formatBytes(rootDisk.usedBytes)} used of ${formatBytes(rootDisk.sizeBytes)} (${rootDisk.usedPercent}%)`],
               ['Accounts', `${status.counts.accounts} (${status.counts.suspended} suspended)`],
               ['Resellers', status.counts.resellers],
-              ['Panel', `WHM ${status.panel.version} · ${status.panel.mode}`],
+              ['Panel', `${status.panel.name} ${status.panel.version} · ${status.panel.mode}`],
               ['License', <StatusPill key="lic" status={status.license.status === 'unlicensed' ? 'warning' : 'ok'}>{status.license.status}</StatusPill>],
             ]} />
           )}

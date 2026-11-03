@@ -39,7 +39,7 @@ async function stamp(page, text) {
   // The SPA probes /api/auth/me before login; that 401 is expected, not an error.
   page.on('console', (m) => { if (m.type() === 'error' && !/status of 401/.test(m.text())) errors.push(`console: ${m.text()}`); });
   page.on('response', (r) => { if (r.status() >= 500) errors.push(`http ${r.status()} ${r.url()}`); });
-  const shot = async (name) => { await stamp(page, `WHM › ${LABELS[name] || name} · ${DATE} · ${SHA}`); await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: false }); };
+  const shot = async (name) => { await stamp(page, `Keel › ${LABELS[name] || name} · ${DATE} · ${SHA}`); await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: false }); };
 
   await page.goto(`${BASE}/login`);
   await page.waitForSelector('#username');
@@ -51,7 +51,7 @@ async function stamp(page, text) {
   await page.waitForSelector('.home', { timeout: 15000 });
   await page.waitForSelector('.kv', { timeout: 15000 });
   await shot('02-dashboard');
-  await stamp(page, `WHM › Home dashboard (full page) · ${DATE} · ${SHA}`);
+  await stamp(page, `Keel › Home dashboard (full page) · ${DATE} · ${SHA}`);
   await page.screenshot({ path: path.join(OUT, '02-dashboard-full.png'), fullPage: true });
 
   // Create an account through the real form (unique domain per run; removed at the end).

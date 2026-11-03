@@ -1,4 +1,4 @@
-// Single source of truth for the WHM navigation: 30 categories, 212 functions.
+// Single source of truth for the admin navigation: 30 categories, 212 functions.
 // The sidebar, the Tools grid, the router and the function registry are all
 // derived from this file — never add a route anywhere else.
 
@@ -14,10 +14,10 @@ export function slugify(label) {
 // [label, description, phase]
 const CATEGORY_DEFS = [
   ['Server Configuration', 'Settings', [
-    ['Basic WebHost Manager Setup', 'Contact details, main and shared IPs, nameservers and account defaults.', 1],
+    ['Basic Setup', 'Contact details, main and shared IPs, nameservers and account defaults.', 1, { slug: 'basic-webhost-manager-setup' }],
     ['Change Root Password', 'Rotate the server\'s root password.', 1],
-    ['Configure cPanel Analytics', 'Opt in or out of anonymous interface analytics.', 5],
-    ['Configure cPanel Cron Jobs', 'Schedules for the panel\'s own maintenance tasks.', 1],
+    ['Configure Analytics', 'Opt in or out of anonymous interface analytics.', 5, { slug: 'configure-cpanel-analytics' }],
+    ['Configure Panel Cron Jobs', 'Schedules for the panel\'s own maintenance tasks.', 1, { slug: 'configure-cpanel-cron-jobs' }],
     ['Initial Quota Setup', 'Enable and verify filesystem disk quotas.', 2],
     ['Link Server Nodes', 'Register linked servers for distributed workloads.', 5],
     ['Server Profile', 'Choose which roles this server fulfils.', 5],
@@ -26,11 +26,11 @@ const CATEGORY_DEFS = [
     ['Terminal', 'In-browser root shell.', 5],
     ['Tweak Settings', 'Hundreds of server-wide behaviour switches.', 1],
     ['Update Preferences', 'Release tier and automatic update policy.', 5],
-    ['WHM Marketplace', 'Browse and install add-ons and plugins.', 5],
+    ['Marketplace', 'Browse and install add-ons and plugins.', 5, { slug: 'whm-marketplace' }],
   ]],
   ['Support', 'LifeBuoy', [
     ['Create Support Ticket', 'Open a support request with a system snapshot.', 5],
-    ['Grant cPanel Support Access', 'Time-boxed access for support engineers.', 5],
+    ['Grant Support Access', 'Time-boxed access for support engineers.', 5, { slug: 'grant-cpanel-support-access' }],
     ['Support Center', 'Documentation, forums and support resources.', 5],
   ]],
   ['Networking Setup', 'Network', [
@@ -76,9 +76,9 @@ const CATEGORY_DEFS = [
   ]],
   ['Service Configuration', 'Server', [
     ['Apache Configuration', 'Global web server directives and includes.', 2],
-    ['cPanel Log Rotation Configuration', 'Log rotation policy.', 2],
-    ['cPanel Web Disk Configuration', 'WebDAV service settings.', 5],
-    ['cPanel Web Services Configuration', 'Panel web service tuning.', 5],
+    ['Log Rotation Configuration', 'Log rotation policy.', 2, { slug: 'cpanel-log-rotation-configuration' }],
+    ['Web Disk Configuration', 'WebDAV service settings.', 5, { slug: 'cpanel-web-disk-configuration' }],
+    ['Panel Web Services Configuration', 'Panel web service tuning.', 5, { slug: 'cpanel-web-services-configuration' }],
     ['Exim Configuration Manager', 'Mail server configuration.', 3],
     ['FTP Server Selection', 'Choose the FTP daemon.', 2],
     ['Mailserver Configuration', 'IMAP/POP server settings.', 3],
@@ -154,7 +154,7 @@ const CATEGORY_DEFS = [
   ['Transfers', 'ArrowLeftRight', [
     ['Convert Addon Domain to Account', 'Promote an addon domain to its own account.', 4],
     ['Review Transfers and Restores', 'History and logs of transfer jobs.', 4],
-    ['Transfer or Restore a cPanel Account', 'Import an account from a backup or remote server.', 4],
+    ['Transfer or Restore an Account', 'Import an account from a backup, a cPanel server or another Keel server.', 4, { slug: 'transfer-or-restore-a-cpanel-account' }],
     ['Transfer Tool', 'Migrate many accounts from another server.', 4],
   ]],
   ['Themes', 'Palette', [
@@ -164,7 +164,7 @@ const CATEGORY_DEFS = [
     ['Add a Package', 'Create a hosting plan.', 1],
     ['Delete a Package', 'Remove an unused plan.', 1],
     ['Edit a Package', 'Change plan limits and features.', 1],
-    ['Feature Manager', 'Which cPanel features each plan includes.', 1],
+    ['Feature Manager', 'Which account-panel features each plan includes.', 1],
   ]],
   ['DNS Functions', 'Globe', [
     ['Add a DNS Zone', 'Create a zone from a template.', 2],
@@ -240,14 +240,14 @@ const CATEGORY_DEFS = [
     ['Show Current Disk Usage', 'Filesystem usage.', 1],
     ['Show Current Running Processes', 'Snapshot of running processes.', 1],
   ]],
-  ['cPanel', 'LayoutDashboard', [
+  ['Panel', 'LayoutDashboard', [
     ['Change Log', 'What changed in each release.', 5],
     ['Customization', 'Branding, logos and help links.', 5],
     ['Manage Plugins', 'Install and enable plugins.', 5],
-    ['Modify cPanel & WHM News', 'News shown to users.', 5],
+    ['Modify Panel News', 'News shown to users.', 5, { slug: 'modify-cpanel-and-whm-news' }],
     ['Reset a Mailman Password', 'Mailing list admin password.', 5],
     ['Upgrade to Latest Version', 'Upgrade the panel.', 5],
-  ]],
+  ], { slug: 'cpanel' }],
   ['SSL/TLS', 'Lock', [
     ['Generate an SSL Certificate and Signing Request', 'Create a key and CSR.', 3],
     ['Install an SSL Certificate on a Domain', 'Deploy a certificate.', 3],
@@ -271,11 +271,11 @@ const CATEGORY_DEFS = [
     ['SSH Server (OpenSSH)', 'Restart the SSH daemon.', 1],
   ]],
   ['Development', 'Code', [
-    ['OpenAPI Documentation for cPanel', 'User-side API reference.', 5],
-    ['OpenAPI Documentation for WHM', 'Admin API reference.', 5],
+    ['OpenAPI Documentation for the Account Panel', 'User-side API reference.', 5, { slug: 'openapi-documentation-for-cpanel' }],
+    ['OpenAPI Documentation for the Admin Panel', 'Admin API reference.', 5, { slug: 'openapi-documentation-for-whm' }],
     ['Apps Managed by AppConfig', 'Registered integration apps.', 5],
-    ['cPanel Development Forum', 'Developer community.', 5],
-    ['cPanel Plugin File Generator', 'Scaffold a plugin.', 5],
+    ['Development Forum', 'Developer community.', 5, { slug: 'cpanel-development-forum' }],
+    ['Plugin File Generator', 'Scaffold a plugin.', 5, { slug: 'cpanel-plugin-file-generator' }],
     ['Developer Documentation', 'Developer guides.', 5],
     ['Manage API Tokens', 'Create and revoke API tokens.', 5],
     ['Manage Hooks', 'Event hooks for automation.', 5],
@@ -299,15 +299,17 @@ export const RESTART_SERVICE_MAP = {
   'ssh-server-openssh': 'sshd',
 };
 
-export const CATEGORIES = CATEGORY_DEFS.map(([label, icon, fns], index) => {
-  const slug = slugify(label);
+// A fourth element `{ slug }` on a category or function pins its slug when the label
+// is renamed, so routes, page files, API prefixes and docs keep their keys.
+export const CATEGORIES = CATEGORY_DEFS.map(([label, icon, fns, opts], index) => {
+  const slug = opts?.slug || slugify(label);
   return {
     index: index + 1,
     label,
     slug,
     icon,
-    functions: fns.map(([fnLabel, description, phase]) => {
-      const fnSlug = slugify(fnLabel);
+    functions: fns.map(([fnLabel, description, phase, fnOpts]) => {
+      const fnSlug = fnOpts?.slug || slugify(fnLabel);
       return { label: fnLabel, description, phase, slug: fnSlug, key: `${slug}/${fnSlug}`, path: `/${slug}/${fnSlug}`, category: label, categorySlug: slug };
     }),
   };

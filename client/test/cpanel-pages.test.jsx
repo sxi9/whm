@@ -45,6 +45,6 @@ describe('cPanel pages', () => {
     expect(logoSrc({ logo: { url: '/api/branding/logo?v=1', mime: 'image/png', size: 72 } })).toBe('/api/branding/logo?v=1');
     expect(logoSrc({ logo: null })).toBeNull();
     expect(logoSrc(null)).toBeNull();
-    expect(DEFAULT_BRANDING).toMatchObject({ companyName: 'WHM', tagline: 'WebHost Manager', logo: null });
+    expect(DEFAULT_BRANDING).toMatchObject({ companyName: 'Keel', tagline: 'Hosting control panel', logo: null });
   });
 });

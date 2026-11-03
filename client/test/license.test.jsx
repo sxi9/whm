@@ -22,14 +22,14 @@ const active = {
 };
 
 describe('License tab', () => {
-  it('is reachable from Basic WebHost Manager Setup and opens on #license', () => {
+  it('is reachable from Basic Setup and opens on #license', () => {
     const fn = FUNCTION_BY_KEY['server-configuration/basic-webhost-manager-setup'];
     expect(fn).toBeTruthy();
     expect(TABS.map((t) => t.value)).toEqual(['settings', 'license']);
     expect(LICENSE_PATH).toBe(`${fn.path}#license`);
     const settings = render(<BasicWebhostManagerSetup fn={fn} />, { initialEntries: [fn.path] });
     expect(settings).toContain('aria-selected="true"');
-    expect(settings).toContain('Basic WebHost Manager Setup');
+    expect(settings).toContain('Basic Setup');
     expect(settings).not.toContain('The key is entered only here');
     const license = render(<BasicWebhostManagerSetup fn={fn} />, { initialEntries: [`${fn.path}#license`] });
     expect(license).toContain('The key is entered only here');

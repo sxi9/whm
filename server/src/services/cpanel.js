@@ -194,7 +194,8 @@ export function createCpanelService(ctx) {
     get() {
       const out = {};
       for (const [k, key] of Object.entries(BRANDING_KEYS)) out[k] = S(key, '') ?? '';
-      out.companyName ||= 'WHM';
+      out.companyName ||= 'Keel';
+      out.tagline ||= 'Hosting control panel';
       for (const kind of Object.keys(IMAGE_KINDS)) {
         const meta = imageMeta(kind);
         if (!meta || !fs.existsSync(imageFile(kind, meta))) { out[kind] = null; continue; }

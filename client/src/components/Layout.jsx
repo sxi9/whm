@@ -20,7 +20,7 @@ export function Layout() {
   useEffect(() => { localStorage.setItem('whm.sidebar.collapsed', collapsed ? '1' : '0'); }, [collapsed]);
   useEffect(() => { setMobileOpen(false); }, [location.pathname]);
 
-  if (!ready) return <div className="app-loading"><Loading text="Starting WHM…" /></div>;
+  if (!ready) return <div className="app-loading"><Loading text="Starting…" /></div>;
   if (!user) return <Navigate to="/login" state={{ from: location.pathname }} replace />;
   if (user.mustChangePassword && location.pathname !== '/change-password') return <Navigate to="/change-password" replace />;
   if (user.mustEnroll2fa && !['/security-center/two-factor-authentication', '/change-password'].includes(location.pathname)) {
@@ -30,10 +30,10 @@ export function Layout() {
   return (
     <PluginNavProvider enabled={!user.mustChangePassword && !user.mustEnroll2fa}>
     <div className={`app ${collapsed ? 'sidebar-collapsed' : ''} ${mobileOpen ? 'mobile-open' : ''}`}>
-      <TopBar onMenu={() => setMobileOpen((o) => !o)} />
-      <div className="app-body">
-        <Sidebar collapsed={collapsed} onToggle={() => setCollapsed((c) => !c)} />
-        {mobileOpen && <div className="sidebar-scrim" onClick={() => setMobileOpen(false)} />}
+      <Sidebar collapsed={collapsed} onToggle={() => setCollapsed((c) => !c)} />
+      {mobileOpen && <div className="sidebar-scrim" onClick={() => setMobileOpen(false)} />}
+      <div className="app-main">
+        <TopBar onMenu={() => setMobileOpen((o) => !o)} />
         <main className="content" id="main">
           <LicenseBanner license={user.license} />
           <RevocationBanner />
@@ -41,11 +41,11 @@ export function Layout() {
             <Outlet />
           </Suspense>
         </main>
+        <footer className="app-footer">
+          <span>{branding.footerText || `${branding.companyName} · ${branding.tagline}`}</span>
+          <span>Signed in as {user.username} · {user.role}</span>
+        </footer>
       </div>
-      <footer className="app-footer">
-        <span>{branding.footerText || `${branding.companyName} · ${branding.tagline}`}</span>
-        <span className="muted">Signed in as {user.username} ({user.role})</span>
-      </footer>
     </div>
     </PluginNavProvider>
   );

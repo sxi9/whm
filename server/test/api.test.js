@@ -183,7 +183,7 @@ describe('login', () => {
   it('GET /api/system/status works once authenticated', async () => {
     const res = await root.get('/api/system/status');
     expect(res.status).toBe(200);
-    expect(res.body.data.panel).toMatchObject({ name: 'WHM', mode: 'monolithic', node: process.version });
+    expect(res.body.data.panel).toMatchObject({ name: 'Keel', mode: 'monolithic', node: process.version });
     expect(res.body.data.server.hostname).toBe('test-host');
     expect(res.body.data.mainIp).toBe('10.0.0.5');
     expect(res.body.data.counts).toMatchObject({ accounts: 0, suspended: 0, resellers: 0, domains: 0 });

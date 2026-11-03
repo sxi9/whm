@@ -3,12 +3,12 @@ import { Link, useNavigate } from 'react-router-dom';
 import { Search, Bell, ChevronDown, LogOut, KeyRound, ShieldCheck, ScrollText, Menu, LifeBuoy } from 'lucide-react';
 import { useAuth } from '../auth/AuthContext.jsx';
 import { useSearch } from '../hooks/usePluginNav.js';
-import { useBranding, logoSrc } from '../pages/cpanel/branding.js';
+import { useBranding } from '../pages/cpanel/branding.js';
+import { Brand } from './Brand.jsx';
 
 export function TopBar({ onMenu }) {
   const { user, hostname, logout } = useAuth();
   const branding = useBranding();
-  const logo = logoSrc(branding);
   const navigate = useNavigate();
   const [q, setQ] = useState('');
   const [openMenu, setOpenMenu] = useState(false);
@@ -30,19 +30,17 @@ export function TopBar({ onMenu }) {
   return (
     <header className="topbar">
       <button className="icon-button topbar-menu" onClick={onMenu} aria-label="Toggle navigation"><Menu size={20} /></button>
-      <Link to="/" className="brand" aria-label={`${branding.companyName} home`}>
-        {logo ? <img src={logo} alt={branding.companyName} style={{ height: 28, maxWidth: 160, objectFit: 'contain', alignSelf: 'center' }} /> : <span className="brand-mark">{branding.companyName === 'WHM' ? 'WHM' : branding.companyName}</span>}
-        <span className="brand-sub">{branding.tagline}</span>
-      </Link>
+      <Brand withText={false} />
       <div className="topbar-search" role="search">
         <Search size={16} />
-        <input ref={inputRef} value={q} placeholder="Search functions (Alt + /)" onChange={(e) => { setQ(e.target.value); setHighlight(0); }}
+        <input ref={inputRef} value={q} placeholder="Search functions" onChange={(e) => { setQ(e.target.value); setHighlight(0); }}
           onKeyDown={(e) => {
             if (e.key === 'ArrowDown') { e.preventDefault(); setHighlight((h) => Math.min(h + 1, results.length - 1)); }
             if (e.key === 'ArrowUp') { e.preventDefault(); setHighlight((h) => Math.max(h - 1, 0)); }
             if (e.key === 'Enter') go(results[highlight]);
             if (e.key === 'Escape') setQ('');
           }} aria-label="Search functions" />
+        {!q && <kbd>Alt /</kbd>}
         {results.length > 0 && (
           <ul className="search-results" role="listbox">
             {results.map((f, i) => (

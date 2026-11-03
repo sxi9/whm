@@ -35,7 +35,7 @@ export function createSystemService(ctx) {
       const info = await agent.op('sys.info');
       const snapshot = await capabilities.ensureFresh();
       return {
-        panel: { name: 'WHM', version: pkg.version, mode: config.mode, env: config.env, node: process.version, pid: process.pid, uptimeSeconds: Math.floor(process.uptime()) },
+        panel: { name: 'Keel', version: pkg.version, mode: config.mode, env: config.env, node: process.version, pid: process.pid, uptimeSeconds: Math.floor(process.uptime()) },
         server: info,
         hostname: settings.get('basic.hostname') || info.hostname,
         mainIp: settings.get('basic.main_ip') || info.interfaces.flatMap((i) => i.addresses).find((a) => a.family === 'IPv4')?.address || null,

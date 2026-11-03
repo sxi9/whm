@@ -4,7 +4,8 @@ import { ChevronDown, ChevronRight, Search, Star, Home, ChevronsDownUp, Chevrons
 import { FUNCTION_BY_KEY } from '../nav.js';
 import { useMergedCategories, useSearch } from '../hooks/usePluginNav.js';
 import { useFavorites } from '../hooks/useFavorites.js';
-import { iconFor } from '../icons.js';
+import { iconFor, colorFor } from '../icons.js';
+import { Brand } from './Brand.jsx';
 
 export function Sidebar({ collapsed, onToggle }) {
   const location = useLocation();
@@ -30,23 +31,24 @@ export function Sidebar({ collapsed, onToggle }) {
 
   return (
     <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`}>
+      <div className="sidebar-brand"><Brand /></div>
       <div className="sidebar-search">
         <Search size={16} />
-        <input placeholder="Search (Alt + /)" value={filter} onChange={(e) => setFilter(e.target.value)} id="sidebar-search" aria-label="Search functions" />
+        <input placeholder="Search" value={filter} onChange={(e) => setFilter(e.target.value)} id="sidebar-search" aria-label="Search functions" />
         {filter && <button className="icon-button" onClick={() => setFilter('')} aria-label="Clear search"><X size={14} /></button>}
       </div>
       <div className="sidebar-tools">
         <button className="link-button" onClick={() => setAll(true)} title="Expand all"><ChevronsUpDown size={14} /> Expand all</button>
         <button className="link-button" onClick={() => setAll(false)} title="Collapse all"><ChevronsDownUp size={14} /> Collapse all</button>
       </div>
-      <nav className="sidebar-nav" aria-label="WHM functions">
+      <nav className="sidebar-nav" aria-label="Functions">
         <NavLink to="/" end className={({ isActive }) => `nav-home ${isActive ? 'active' : ''}`}><Home size={16} /> <span>Home</span></NavLink>
 
         {!matches && favoriteFns.length > 0 && (
           <div className="nav-category">
             <button className="nav-category-head" onClick={() => setOpen((o) => ({ ...o, __favorites: !o.__favorites }))}>
               {open.__favorites === false ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
-              <Star size={16} /> <span>Favorites</span><span className="count">{favoriteFns.length}</span>
+              <span className="nav-tile" style={{ '--tile': '#ff9f0a' }}><Star size={14} strokeWidth={2.25} /></span> <span>Favorites</span><span className="count">{favoriteFns.length}</span>
             </button>
             {open.__favorites !== false && (
               <ul>{favoriteFns.map((f) => <li key={f.key}><NavLink to={f.path} className={({ isActive }) => (isActive ? 'active' : '')}>{f.label}</NavLink></li>)}</ul>
@@ -63,7 +65,7 @@ export function Sidebar({ collapsed, onToggle }) {
             <div key={cat.slug} className={`nav-category ${isOpen ? 'open' : ''}`}>
               <button className="nav-category-head" onClick={() => setOpen((o) => ({ ...o, [cat.slug]: !o[cat.slug] }))} aria-expanded={isOpen}>
                 {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                <Icon size={16} />
+                <span className="nav-tile" style={{ '--tile': colorFor(cat.slug) }}><Icon size={14} strokeWidth={2.25} /></span>
                 <span>{cat.label}</span>
                 <span className="count">{fns.length}</span>
               </button>

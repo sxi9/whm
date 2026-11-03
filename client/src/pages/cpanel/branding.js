@@ -9,7 +9,7 @@ import { api } from '../../api/client.js';
 const CACHE_KEY = 'whm.branding';
 const STYLE_ID = 'whm-branding-css';
 const EVENT = 'whm:branding-changed';
-export const DEFAULT_BRANDING = { companyName: 'WHM', tagline: 'WebHost Manager', primaryColor: '', chromeColor: '', helpUrl: '', docsUrl: '', supportUrl: '', loginNotice: '', footerText: '', logo: null, favicon: null };
+export const DEFAULT_BRANDING = { companyName: 'Keel', tagline: 'Hosting control panel', primaryColor: '', chromeColor: '', helpUrl: '', docsUrl: '', supportUrl: '', loginNotice: '', footerText: '', logo: null, favicon: null };
 
 let current = null;
 let inflight = null;
@@ -37,7 +37,7 @@ export function applyBranding(branding) {
   let style = document.getElementById(STYLE_ID);
   if (!style) { style = document.createElement('style'); style.id = STYLE_ID; document.head.appendChild(style); }
   style.textContent = rules.length ? `:root { ${rules.join(' ')} }` : '';
-  if (branding.companyName) document.title = branding.companyName === 'WHM' ? 'WHM' : `${branding.companyName} · WHM`;
+  if (branding.companyName) document.title = branding.companyName;
   let link = document.querySelector('link[rel="icon"][data-branding]');
   if (branding.favicon?.url) {
     if (!link) { link = document.createElement('link'); link.rel = 'icon'; link.dataset.branding = '1'; document.head.appendChild(link); }

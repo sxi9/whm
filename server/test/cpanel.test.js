@@ -97,19 +97,19 @@ describe('Change Log', () => {
 describe('Customization (branding)', () => {
   it('serves /api/branding to anyone (the login page) and /api/cpanel/branding to every signed-in role', async () => {
     const anon = await request(app.ctx.app).get('/api/branding').expect(200);
-    expect(anon.body.data).toMatchObject({ companyName: 'WHM', tagline: 'WebHost Manager', logo: null, favicon: null, loginNotice: '' });
+    expect(anon.body.data).toMatchObject({ companyName: 'Keel', tagline: 'Hosting control panel', logo: null, favicon: null, loginNotice: '' });
     expect(anon.body.data.links).toEqual({ help: '', docs: '', support: '' });
     expect(Object.keys(anon.body.data).sort()).toEqual(['chromeColor', 'companyName', 'docsUrl', 'favicon', 'footerText', 'helpUrl', 'links', 'loginNotice', 'logo', 'primaryColor', 'supportUrl', 'tagline']);
     const res = await get('/api/branding').expect(200);
     expect(res.body.data).toEqual(anon.body.data);
     const r2 = await plainUser.get('/api/cpanel/branding').expect(200);
-    expect(r2.body.data.companyName).toBe('WHM');
+    expect(r2.body.data.companyName).toBe('Keel');
     await request(app.ctx.app).get('/api/branding/logo').expect(404);
     // The public mount is read-only: nothing else answers there.
     for (const r of [await request(app.ctx.app).put('/api/branding').send({ companyName: 'x' }), await request(app.ctx.app).post('/api/branding/logo').set('Content-Type', 'image/png').send(PNG), await request(app.ctx.app).delete('/api/branding/logo')]) {
       expect([401, 403]).toContain(r.status);
     }
-    expect((await request(app.ctx.app).get('/api/branding').expect(200)).body.data.companyName).toBe('WHM');
+    expect((await request(app.ctx.app).get('/api/branding').expect(200)).body.data.companyName).toBe('Keel');
     await request(app.ctx.app).get('/api/cpanel/branding').expect(401);
   });
 
