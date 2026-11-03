@@ -12,6 +12,9 @@ Companion documents: [`README.md`](../README.md) (install, hub, configuration re
 [`plugins/SDK.md`](../plugins/SDK.md) (writing plugins), and the design notes under
 [`docs/design/`](design/).
 
+The customer-facing **account panel** (`/panel`, what a hosting-account owner uses) is documented in
+**Part C**: [MANUAL-partC.md](MANUAL-partC.md) — who gets a login, "Log in as", every panel function, settings.
+
 ## Table of contents
 
 - [Part A — Getting around](#part-a--getting-around)
@@ -40,6 +43,7 @@ Companion documents: [`README.md`](../README.md) (install, hub, configuration re
   Database Services, IP Functions, Software, Email, System Health, Panel, SSL/TLS, Market,
   Restart Services, Development, Plugins; licensing, marketplace, developer, hub-portal and
   troubleshooting appendices): [MANUAL-partB.md](MANUAL-partB.md).
+- Part C — The account panel (customer side, `/panel`): [MANUAL-partC.md](MANUAL-partC.md).
 
 ---
 
@@ -172,7 +176,7 @@ revocation banner.
 |---|---|---|
 | `root` | Every category and function (minus those hidden by the Server Profile). | Everything. All server-wide configuration, anything touching other owners' accounts, every destructive action. |
 | `reseller` | The same sidebar. Account lists, usage, backups, locales and status pages are filtered to **accounts the reseller owns**; server-wide pages answer `403 forbidden` from the API, and the page shows that error. | Account operations on owned accounts, each gated by an **ACL** granted under *Resellers › Edit Reseller Nameservers and Privileges* (`create-acct`, `suspend-acct`, `kill-acct`, `passwd`, `quota`, `limit-bandwidth`, `add-pkg-shell`, `demo-setup`, `edit-account`, `upgrade-account`, `list-accts`, `news`, …). Missing ACL → 403. |
-| `user` | Not implemented in this panel version: hosting-account owners have no panel login (`BLUEPRINT.md` §10 lists it as phase 2). | — |
+| `user` | A hosting account's own login. It lands in the **account panel** (`/panel`) and sees nothing but its account — see [Part C](MANUAL-partC.md). | the account panel only |
 
 Each function block below says **Root** or **Root, reseller** and names the ACL a reseller
 needs where the service checks one. "Root, reseller (own accounts)" means the reseller sees
