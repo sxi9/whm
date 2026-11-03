@@ -66,16 +66,16 @@ export default function ShowAccountsOverQuota({ fn }) {
         </div>
       )}
       {quota && !quota.installed && (
-        <div className="banner banner-info"><HardDrive size={18} /><div><strong>Disk quotas are not enforced on this server</strong><p className="muted">The quota package is missing, so usage is measured with du and accounts over their allowance keep writing files. Install quota tools and run Initial Quota Setup to enforce limits; this list keeps working either way.</p></div></div>
+        <div className="banner banner-info"><HardDrive size={18} /><div><strong>Disk quotas are not enforced on this server</strong><div className="muted">The quota package is missing, so usage is measured with du and accounts over their allowance keep writing files. Install quota tools and run Initial Quota Setup to enforce limits; this list keeps working either way.</div></div></div>
       )}
       <JobCard jobId={jobId} title="Disk usage refresh" onFinished={() => refetch()} />
       <Card padded={false}>
-        <div style={{ padding: '12px 14px 0' }}><Tabs tabs={SCOPES} value={scope} onChange={(v) => { setScope(v); t.setPage(1); }} /></div>
         <DataTable columns={columns} rows={data || []} loading={loading} error={null} rowKey={(r) => r.username}
+          toolbar={<Tabs tabs={SCOPES} value={scope} onChange={(v) => { setScope(v); t.setPage(1); }} />}
           total={meta?.total} page={t.state.page} pageSize={t.state.pageSize} onPageChange={t.setPage}
           sort={t.state.sort} dir={t.state.dir} onSortChange={t.setSort}
           searchable q={t.state.q} onSearch={t.setSearch} searchPlaceholder="Search account, domain or owner…"
-          rowActions={rowActions} emptyText={scope === 'over' ? 'No account is over its disk quota.' : scope === 'warn' ? 'No account is near its quota.' : 'No accounts yet.'} />
+          rowActions={rowActions} emptyText={scope === 'over' ? 'No account is over its disk quota. Accounts that reach their quota appear here after the next measurement.' : scope === 'warn' ? 'No account is near its quota. Accounts above the warn threshold appear here.' : 'No accounts yet. Every account and its measured disk usage appears here.'} />
       </Card>
       {isRoot && (
         <Card title="System quota report" subtitle="Raw repquota figures for every Linux user on the filesystem, including users the panel does not manage" actions={<Button size="sm" onClick={() => { setShowReport(true); if (showReport) report.refetch(); }}>{showReport ? 'Reload' : 'Load report'}</Button>}>

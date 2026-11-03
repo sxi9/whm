@@ -63,7 +63,7 @@ export default function ViewBandwidthUsage({ fn }) {
   const overCount = (data || []).filter((r) => r.over).length;
   return (
     <>
-      <PageHeader fn={fn} description="Monthly transfer per account, parsed hourly from each site's Apache access logs (/var/log/whm/domlogs/<user>/*-access.log). Whether accounts that pass their limit are suspended is decided under Account Functions › Limit Bandwidth Usage."
+      <PageHeader fn={fn} description="Monthly transfer per account, parsed hourly from each site's access logs in the panel's domlog directory (<user>/<domain>-access.log). Whether accounts that pass their limit are suspended is decided under Account Functions › Limit Bandwidth Usage."
         actions={isRoot && <Button icon={Activity} loading={busy} onClick={collect}>Collect now</Button>} />
       <RequestError error={error} onRetry={refetch} />
       {meta && (
@@ -76,17 +76,17 @@ export default function ViewBandwidthUsage({ fn }) {
       )}
       <JobCard jobId={jobId} title="Bandwidth collection" onFinished={() => { refetch(); history.refetch(); }} />
       <Card padded={false}>
-        <div style={{ padding: '12px 14px 0', display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-start' }}>
-          <Tabs tabs={SCOPES} value={scope} onChange={(v) => { setScope(v); t.setPage(1); }} />
-          <div style={{ marginLeft: 'auto', minWidth: 180 }}>
-            <Select value={period || meta?.period || ''} onChange={(v) => { setPeriod(v); t.setPage(1); }} options={(meta?.periods || []).map((p) => ({ value: p, label: periodLabel(p) }))} aria-label="Month" />
-          </div>
-        </div>
         <DataTable columns={columns} rows={data || []} loading={loading} error={null} rowKey={(r) => r.username}
+          toolbar={<>
+            <Tabs tabs={SCOPES} value={scope} onChange={(v) => { setScope(v); t.setPage(1); }} />
+            <div style={{ minWidth: 160 }}>
+              <Select value={period || meta?.period || ''} onChange={(v) => { setPeriod(v); t.setPage(1); }} options={(meta?.periods || []).map((p) => ({ value: p, label: periodLabel(p) }))} aria-label="Month" />
+            </div>
+          </>}
           total={meta?.total} page={t.state.page} pageSize={t.state.pageSize} onPageChange={t.setPage}
           sort={t.state.sort} dir={t.state.dir} onSortChange={t.setSort}
           searchable q={t.state.q} onSearch={t.setSearch} searchPlaceholder="Search account, domain or owner…"
-          rowActions={rowActions} emptyText={scope === 'all' ? 'No accounts yet.' : scope === 'over' ? 'No account is over its bandwidth limit.' : 'No account is near its limit.'} />
+          rowActions={rowActions} emptyText={scope === 'all' ? 'No accounts yet. Every account and its monthly transfer appears here.' : scope === 'over' ? 'No account is over its bandwidth limit. Accounts that pass their limit appear here after the next collection.' : 'No account is near its limit. Accounts above the warn threshold appear here.'} />
       </Card>
       {selected && (
         <Card title={`Bandwidth history: ${selected}`} subtitle="Last 12 months" actions={<><Button size="sm" variant="danger-ghost" onClick={() => reset(selected, true)}>Clear history</Button><Button size="sm" onClick={() => select(null)}>Close</Button></>}>
@@ -106,7 +106,7 @@ function AccountHistory({ data }) {
     <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 2fr) minmax(260px, 1fr)', gap: 20 }}>
       <div>
         <BandwidthChart months={data.months} limitMb={data.limitMb} />
-        {overMonths.length > 0 && <p className="muted" style={{ fontSize: 12 }}>Over the limit in: {overMonths.join(', ')}</p>}
+        {overMonths.length > 0 && <p className="muted">Over the limit in: {overMonths.join(', ')}</p>}
       </div>
       <div>
         <KeyValue items={[['Domain', data.domain], ['Owner', data.owner], ['Monthly limit', formatMb(data.limitMb)], ['Status', data.suspended ? <StatusPill key="s" status="suspended">Suspended{data.suspend_reason ? `: ${data.suspend_reason}` : ''}</StatusPill> : <StatusPill key="s" status="active">Active</StatusPill>]]} />
@@ -121,8 +121,8 @@ function AccountHistory({ data }) {
         {data.sources.length > 0 && (
           <details style={{ marginTop: 10 }}>
             <summary>Log files parsed ({data.sources.length})</summary>
-            <ul className="small" style={{ paddingLeft: 18 }}>
-              {data.sources.map((s) => <li key={s.path}><code className="small">{s.path}</code> — {formatBytes(s.bytes_processed)} of {formatBytes(s.size)} parsed, {s.lines} line(s), {formatDate(s.last_seen_at)}</li>)}
+            <ul className="list-plain muted" style={{ marginTop: 8 }}>
+              {data.sources.map((s) => <li key={s.path} style={{ marginBottom: 6 }}><code className="small">{s.path}</code> — {formatBytes(s.bytes_processed)} of {formatBytes(s.size)} parsed, {s.lines} line(s), {formatDate(s.last_seen_at)}</li>)}
             </ul>
           </details>
         )}
@@ -156,13 +156,13 @@ function BandwidthSettings({ onSaved }) {
       {data && (
         <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginBottom: 12 }}>
           <StatusPill status={data.enforcement?.enabled ? 'ok' : 'warning'}>{data.enforcement?.enabled ? 'Automatic suspension on' : 'Automatic suspension off'}</StatusPill>
-          <span className="muted small">
+          <span className="muted">
             {data.enforcement?.enabled ? `Accounts over their limit are suspended by the hourly account-bandwidth-enforce schedule with the reason “${data.enforcement.reason || 'bandwidth: monthly transfer limit exceeded'}”; Unsuspend Bandwidth Exceeders lifts them in bulk.` : 'Accounts over their limit are only flagged.'} Configured under Account Functions.
           </span>
           <Button size="sm" onClick={() => navigate('/account-functions/limit-bandwidth-usage')}>Limit Bandwidth Usage</Button>
         </div>
       )}
-      {data?.schedule && !data.schedule.enabled && <p className="muted small">The hourly collection schedule is parked because no web server (Apache or NGINX) is installed and no extra log directories are configured; it resumes by itself once one is. “Collect now” still works.</p>}
+      {data?.schedule && !data.schedule.enabled && <p className="muted">The hourly collection schedule is parked because no web server (Apache or NGINX) is installed and no extra log directories are configured; it resumes by itself once one is. “Collect now” still works.</p>}
       {draft && (
         <>
           <div className="form-grid">

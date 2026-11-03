@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { formatBytes } from '../../components/Common.jsx';
+import { StatusPill, formatBytes } from '../../components/Common.jsx';
 import { periodLabel } from './Shared.jsx';
 
 const W = 720;
@@ -33,7 +33,7 @@ export function BandwidthChart({ months = [], limitMb }) {
     const label = i === months.length - 1 || i === maxIndex;
     return (
       <g key={m.period} onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)}>
-        <rect x={PAD.left + i * slot} y={PAD.top} width={slot} height={plotH} fill="transparent" />
+        <rect x={PAD.left + i * slot} y={PAD.top} width={slot} height={plotH} fill="none" pointerEvents="all" />
         {path && <path d={path} fill={over ? 'var(--bad)' : 'var(--primary)'} opacity={hover == null || hover === i ? 1 : 0.55} />}
         {h === 0 && <rect x={x} y={bottom - 1} width={barW} height={1} fill="var(--border-strong)" />}
         {label && m.bytes > 0 && <text x={x + barW / 2} y={top - 5} textAnchor="middle" fontSize="11" fill="var(--text-muted)">{formatBytes(m.bytes)}</text>}
@@ -49,7 +49,7 @@ export function BandwidthChart({ months = [], limitMb }) {
         {ticks.map((v) => (
           <g key={v}>
             <line x1={PAD.left} x2={W - PAD.right} y1={y(v)} y2={y(v)} stroke="var(--border)" strokeWidth="1" />
-            <text x={PAD.left - 8} y={y(v) + 4} textAnchor="end" fontSize="11" fill="var(--text-faint)">{formatBytes(v)}</text>
+            <text x={PAD.left - 8} y={y(v) + 4} textAnchor="end" fontSize="11" fill="var(--text-muted)">{formatBytes(v)}</text>
           </g>
         ))}
         {limitBytes > 0 && (
@@ -62,10 +62,12 @@ export function BandwidthChart({ months = [], limitMb }) {
         <line x1={PAD.left} x2={W - PAD.right} y1={PAD.top + plotH} y2={PAD.top + plotH} stroke="var(--border-strong)" strokeWidth="1" />
       </svg>
       {hovered && (
-        <div className="card" style={{ position: 'absolute', top: 4, left: `${((PAD.left + hover * slot + slot / 2) / W) * 100}%`, transform: 'translateX(-50%)', padding: '6px 10px', fontSize: 12, pointerEvents: 'none', boxShadow: 'var(--shadow)' }}>
-          <strong>{periodLabel(hovered.period)}</strong><br />
-          {formatBytes(hovered.bytes)}{limitMb > 0 && <span className="muted"> · {hovered.percent}% of limit</span>}
-          {limitBytes > 0 && hovered.bytes >= limitBytes && <><br /><span style={{ color: 'var(--bad)' }}>Over limit</span></>}
+        <div className="card" style={{ position: 'absolute', top: 4, left: `${((PAD.left + hover * slot + slot / 2) / W) * 100}%`, transform: 'translateX(-50%)', margin: 0, padding: '6px 10px', pointerEvents: 'none', whiteSpace: 'nowrap' }}>
+          <small>
+            <strong>{periodLabel(hovered.period)}</strong><br />
+            {formatBytes(hovered.bytes)}{limitMb > 0 && <span className="muted"> · {hovered.percent}% of limit</span>}
+            {limitBytes > 0 && hovered.bytes >= limitBytes && <><br /><StatusPill status="failed">Over limit</StatusPill></>}
+          </small>
         </div>
       )}
     </div>

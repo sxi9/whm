@@ -30,7 +30,7 @@ export default function ManageAccountEnhancements({ fn }) {
   };
 
   const columns = [
-    { key: 'name', label: 'Name', sortable: true, render: (e) => <><strong>{e.name}</strong>{e.description && <div className="muted" style={{ fontSize: 12 }}>{e.description}</div>}</> },
+    { key: 'name', label: 'Name', sortable: true, render: (e) => <><strong>{e.name}</strong>{e.description && <small className="muted" style={{ display: 'block' }}>{e.description}</small>}</> },
     { key: 'id', label: 'ID', sortable: true, render: (e) => <code>{e.id}</code> },
     { key: 'limits', label: 'Limits', render: (e) => <LimitChips limits={e.limits} /> },
     { key: 'assigned', label: 'Accounts', sortable: true, align: 'right' },
@@ -53,7 +53,7 @@ export default function ManageAccountEnhancements({ fn }) {
           total={meta?.total} page={t.state.page} pageSize={t.state.pageSize} onPageChange={t.setPage}
           sort={t.state.sort} dir={t.state.dir} onSortChange={t.setSort}
           searchable q={t.state.q} onSearch={t.setSearch} searchPlaceholder="Search enhancements…"
-          rowActions={rowActions} emptyText={isRoot ? 'No enhancements defined yet. Create one to start assigning add-ons.' : 'No enhancements have been defined by the server administrator.'} />
+          rowActions={rowActions} emptyText={isRoot ? 'No enhancements yet. Create one and it appears here, ready to assign to accounts.' : 'No enhancements have been defined by the server administrator.'} />
       </Card>
       <AssignCard enhancements={data || []} refreshKey={refreshKey} />
       <EnhancementModal value={editing} onClose={() => setEditing(null)} onSaved={() => { setEditing(null); refetch(); setRefreshKey((k) => k + 1); }} />
@@ -64,7 +64,7 @@ export default function ManageAccountEnhancements({ fn }) {
 function LimitChips({ limits }) {
   const entries = Object.entries(limits || {});
   if (!entries.length) return <span className="muted">none</span>;
-  return <span style={{ display: 'inline-flex', gap: 4, flexWrap: 'wrap' }}>{entries.map(([k, v]) => <span key={k} className="pill pill-muted" style={{ textTransform: 'none' }}>{k}: {String(v)}</span>)}</span>;
+  return <span style={{ display: 'inline-flex', gap: 4, flexWrap: 'wrap' }}>{entries.map(([k, v]) => <code key={k}>{k}: {String(v)}</code>)}</span>;
 }
 
 function toRows(limits) { return Object.entries(limits || {}).map(([key, value]) => ({ key, type: typeof value === 'number' ? 'number' : typeof value === 'boolean' ? 'boolean' : 'text', value })); }
@@ -182,9 +182,9 @@ function AssignCard({ enhancements, refreshKey }) {
                 </FormActions>
               </div>
               <div>
-                <h3 style={{ margin: '0 0 6px', fontSize: 14 }}>Effective extra limits</h3>
-                <p className="muted" style={{ fontSize: 12, marginTop: 0 }}>Merged across the saved, enabled enhancements; applied on top of the package.</p>
-                {effective.data && Object.keys(effective.data).length === 0 && <p className="muted">None.</p>}
+                <h3>Effective extra limits</h3>
+                <p className="muted" style={{ margin: '4px 0 10px' }}>Merged across the saved, enabled enhancements; applied on top of the package.</p>
+                {effective.data && Object.keys(effective.data).length === 0 && <p className="muted">None yet. Limits appear here once an enabled enhancement is assigned and saved.</p>}
                 {effective.data && Object.keys(effective.data).length > 0 && <KeyValue items={Object.entries(effective.data).map(([k, v]) => [k, String(v)])} />}
               </div>
             </div>
