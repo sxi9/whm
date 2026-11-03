@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Regenerates every screenshot in docs/screenshots (flow shots + all 212 pages) with
+# Regenerates every screenshot in docs/screenshots (flow shots, the account-panel flow, all 212 admin
+# pages and every account-panel page) with
 # label bars, and the gallery READMEs. Needs a running panel serving the built client.
 #
 #   BASE=http://127.0.0.1:2086 PASSWORD='<root password>' bash e2e/screenshots.sh
@@ -11,5 +12,6 @@ export GIT_SHA=${GIT_SHA:-$(git rev-parse --short HEAD 2>/dev/null || echo worki
 OUT=docs/screenshots
 curl -sf "$BASE/api/health" >/dev/null || { echo "panel not reachable at $BASE (start it with WHM_SERVE_CLIENT=true after npm run build)" >&2; exit 1; }
 OUT="$OUT" node e2e/ui-check.cjs
+OUT="$OUT/panel-flow" node e2e/panel-check.cjs
 OUT="$OUT" node e2e/screenshot-all.cjs
 echo "screenshots updated in $OUT (label: $GIT_SHA)"

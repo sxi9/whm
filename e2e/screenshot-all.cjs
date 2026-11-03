@@ -189,7 +189,7 @@ function grid(items, perRow = 3) {
   const flow = FLOW_SHOTS.filter(([file]) => fs.existsSync(path.join(OUT, file))).map(([file, label]) => [file, label, null]);
   const topReadme = ['# Screenshots', '', `Updated ${DATE} at commit \`${SHA}\`. All images are captured automatically (Playwright) against the built interface served by the API, and each carries a label bar naming the screen, whether it is live or a placeholder, the date and the commit. They are regenerated at every milestone (\`e2e/screenshots.sh\`).`, '',
     `- **[Every page →](pages/README.md)** — all 212 admin function pages grouped by category (${live}/${count} live), the core pages, and the account panel (${panelCount} pages).`, '', '## Flow', '', 'Login → dashboard → creating an account through the form → lists, status pages, configuration and search.', '', grid(flow, 2), '',
-    '## Regenerate', '', '```bash', "BASE=http://127.0.0.1:2086 PASSWORD='<root password>' bash e2e/screenshots.sh   # flow shots + every page + galleries", '```', ''];
+    '## Account panel flow', '', 'Captured by `e2e/panel-check.cjs` under [`panel-flow/`](panel-flow/): an account user signing in, every panel group, the file manager and cron APIs, then an admin opening the account through "Log in as".', '', '## Regenerate', '', '```bash', "BASE=http://127.0.0.1:2086 PASSWORD='<root password>' bash e2e/screenshots.sh   # flow shots + every page + galleries", '```', ''];
   fs.writeFileSync(path.join(OUT, 'README.md'), topReadme.join('\n'));
 
   console.log(`captured ${count} function pages (${live} live) into ${pagesDir}`);
