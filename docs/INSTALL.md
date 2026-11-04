@@ -109,7 +109,7 @@ In both modes the ops, their argument schemas and the allowed path roots are ide
 
 | Port | Process | Bound to | Purpose |
 |---|---|---|---|
-| **2086/tcp** | whm-panel | `WHM_HOST` (default `0.0.0.0`) | HTTP interface and API. Always opened. |
+| **2086/tcp** | whm-panel | `WHM_HOST` (default `0.0.0.0`) | HTTP interface and API. Always opened. With TLS configured (and `httpRedirect` left on) it only redirects browsers to 2087 and refuses API calls with `426 tls_required`; `GET /api/health` keeps answering. |
 | **2087/tcp** | whm-panel | `WHM_HOST` | HTTPS interface; opened only when both `WHM_TLS_CERT` and `WHM_TLS_KEY` (or `tlsCert`/`tlsKey` in `whm.conf`) are set. Minimum TLS 1.2. |
 | **7443/tcp** | whm-hub | `host` (default `0.0.0.0`) | Hub HTTPS: `/v1/*` license API, `/v1/market/*`, `/v1/dev/*`, `/v1/admin/*`, `/v1/reseller/*`, `/v1/portal/*`, and the portal SPA at `/` when `serve_ui` is on. |
 | **7440/tcp** | whm-hub | `127.0.0.1` only | `/healthz` and `/metrics`. `loopback_port: 0` disables it. Never expose it. |
@@ -217,7 +217,7 @@ Tests and checks:
 ```bash
 npm test                                        # all workspaces (server, agent, client, hub, hub/ui) + SDK, sample and bundled plugins
 cd hub && npm test                              # hub suite alone (node --test)
-BASE=http://127.0.0.1:2086 PASSWORD='<root password>' node e2e/ui-check.cjs   # Playwright end-to-end against a served build
+BASE=https://127.0.0.1:2087 PASSWORD='<root password>' node e2e/ui-check.cjs  # Playwright end-to-end against a served build (BASE=http://127.0.0.1:2086 without TLS)
 ```
 
 To run a development hub next to a development panel, see [§5.5](#55-connecting-a-panel-to-the-hub)
@@ -343,7 +343,7 @@ means the socket could not be opened (see [§8](#8-troubleshooting)).
 
 ### 4.7 First login
 
-1. Open `https://<server-ip>:2087/` (or `http://…:2086/`). Accept the self-signed certificate.
+1. Open `https://<server-ip>:2087/` (`http://…:2086/` redirects there). Accept the self-signed certificate.
 2. Log in as **`root`** with the password the installer printed — generated ones are in
    `/var/lib/whm/initial-admin-password.txt` (`awk '/^password:/{print $2}' …`). With
    `WHM_ADMIN_PASSWORD` the file does not exist.
@@ -450,10 +450,16 @@ characters) and printed once. `hub-cli.js` boots the hub services in-process, so
 `--keys-dir`, `--json`. After a CLI run as root, restore ownership:
 `chown -R whmhub:whmhub /var/lib/whm-hub` (the installer does this itself).
 
-Log in at `https://<hub>:7443/login` (`POST /v1/portal/login { email, password, totp? }`). After the
-first login enrol TOTP under *Security*: the portal warns until you do, and the hub refuses signing-key,
-API-key, portal-user and marketplace actions (TOTP step-up, `license.stepup_max_age_s`) until 2FA is
-enabled.
+Log in at `https://<hub>:7443/login` (`POST /v1/portal/login { email, password, totp? }`). A
+`vendor_admin` without TOTP still signs in, but with `license.require_admin_totp` (default `true`) the
+hub holds that session at enrolment: every API answers `403 totp_enrol_required` except
+`/v1/portal/me`, `/csrf`, `/2fa/enroll`, `/2fa/confirm`, `/password` and `/logout`, and the portal
+opens *Security & 2FA* only. Enrol there (scan the secret, confirm a code); the same session is
+released as soon as the code is confirmed. Keep the authenticator safe: there are no recovery codes,
+so a lost device means `hub-cli.js` / `license.db` access to reset the user. Other roles are not
+held at login, but the hub still refuses signing-key, API-key, portal-user and marketplace actions
+(TOTP step-up, `license.stepup_max_age_s`) until 2FA is enabled. Set `require_admin_totp: false`
+(or `WHM_HUB_REQUIRE_ADMIN_TOTP=false`) only for a throwaway dev hub.
 
 ### 5.4 Issuing the first license
 
@@ -576,6 +582,7 @@ environment (deep-merged on top) → defaults. An invalid file aborts with
 | `license.max_skew_s` | `300` | Accepted clock skew. |
 | `license.session_ttl_hours` | `12` | Portal session lifetime. |
 | `license.stepup_max_age_s` | `300` | TOTP step-up freshness (min 30). |
+| `license.require_admin_totp` | `true` | A `vendor_admin` session without TOTP is held at enrolment (`403 totp_enrol_required` everywhere but the 2FA/password/logout endpoints) until a code is confirmed. `WHM_HUB_REQUIRE_ADMIN_TOTP`. |
 | `license.checkin_retention_days` | `90` | `checkins` rows pruned after this. |
 | `license.lookup_block` | `{ "failures": 20, "windowMs": 3600000, "blockMs": 86400000 }` | Failed key lookups per IP before a block. |
 | `license.backup_dir` | `/var/backups/whm-hub` | Hourly `license.db` backup target; `null` disables. |
@@ -736,6 +743,7 @@ Precedence (`loadConfig()` in `server/src/config.js`): environment variables →
 | `WHM_TLS_PORT` | `tlsPort` | `2087` | HTTPS port (only with cert + key). |
 | `WHM_TLS_CERT` | `tlsCert` | `null` | PEM certificate; HTTPS is enabled when both cert and key are set. |
 | `WHM_TLS_KEY` | `tlsKey` | `null` | PEM private key. |
+| `WHM_HTTP_REDIRECT` | `httpRedirect` | `true` | Only with cert + key: the HTTP port answers `GET`/`HEAD` navigations with a `301` to `https://<host>:<tlsPort><path>` and everything under `/api` (except `GET /api/health`) or non-GET with `426 { error: { code: 'tls_required' } }`. `false`/`0`/`no`/`off` serves the full panel on both ports; any other value (including a typo) keeps the redirect on. Cluster peers must then be addressed as `https://host:2087`. |
 | `WHM_DATA_DIR` | `dataDir` | `/var/lib/whm` (prod) / `./data` (dev, relative to cwd) | Data directory: `whm.db`, `session.secret`, `master.key`, plugin dirs. Created `0750` at boot. |
 | `WHM_MODE` | `mode` | `monolithic` | `split` or `monolithic` ([§1.2](#12-deployment-modes-split-and-monolithic)). |
 | `WHM_AGENT_SOCKET` | `agentSocket` | `/run/whm-agent.sock` | Agent socket path (split mode). |
@@ -844,7 +852,13 @@ default from [§5.6](#56-hubconf-reference). Booleans accept `1`, `true`, `yes`.
 **TLS**
 - The panel starts HTTPS only when **both** `WHM_TLS_CERT` and `WHM_TLS_KEY` (or `tlsCert`/`tlsKey`)
   are set and readable by `whmpanel`; otherwise only HTTP 2086 is open. Files under `/etc/whm/ssl` are
-  `0640 root:whmpanel`.
+  `0640 root:whmpanel`. If they are set but unreadable the unit exits with `panel TLS certificate or key
+  cannot be read` in the journal (fix the files, then `systemctl restart whm-panel`).
+- A replaced `panel.crt`/`panel.key` pair is picked up without a restart: the listener reloads it on
+  `systemctl kill -s HUP whm-panel` and within a few seconds of the files changing; a broken pair is
+  logged and the previous certificate stays in use.
+- `http://…:2086/api/...` answering `426 tls_required` is the HTTP redirect guard (`WHM_HTTP_REDIRECT`):
+  use `https://…:2087`. Only `GET /api/health` is served in clear, for monitors.
 - Browser warning: the installer's certificate is self-signed (`CN=<hostname>`, 3 years). Replace it
   via *SSL/TLS › Manage Service SSL Certificates* or by overwriting `panel.crt`/`panel.key`.
 - The hub refuses to start with `TLS is required: set tls.cert/tls.key in hub.conf (or insecure_http:

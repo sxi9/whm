@@ -77,6 +77,14 @@ describe('Customer panel: logs and bandwidth', () => {
     expect(app.agent.callsTo('acct.list_logs').find((c) => c.args.path === '/home/alice/logs').args.owner).toBe('alice');
   });
 
+  it('lists the main domain once even when it also has an account_domains row', async () => {
+    const aliceId = row('SELECT id FROM accounts WHERE username = ?', 'alice').id;
+    db().prepare("INSERT OR IGNORE INTO account_domains (account_id, domain, type, docroot) VALUES (?, 'alice.com', 'main', '/home/alice/public_html')").run(aliceId);
+    const res = await alice.get('/logs?kind=apache').expect(200);
+    expect(res.body.data.domains).toEqual(['alice.com']);
+    expect(res.body.data.files.map((f) => f.name).sort()).toEqual(['alice.com-access_log', 'alice.com-error_log', 'custom.log', 'alice.com-bytes_log'].sort());
+  });
+
   it('tails from the listed path as the account, with offset math from the listed size', async () => {
     const res = await alice.get('/logs/tail?kind=apache&file=alice.com-access_log&bytes=15').expect(200);
     const call = app.agent.callsTo('acct.read_range')[0];

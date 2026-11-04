@@ -51,9 +51,11 @@ The customer-facing **account panel** (`/panel`, what a hosting-account owner us
 
 ## Signing in
 
-The panel listens on **http://server:2086** and, when a certificate is configured,
-**https://server:2087** (the installer generates a self-signed one and enables both). Open
-the address in a browser; the login card shows the vendor branding set under
+The panel listens on **https://server:2087** (the installer generates a self-signed
+certificate; see Part B for replacing it). Plain **http://server:2086** only redirects the
+browser to 2087 once a certificate is configured, so sign in at `https://server:2087/login`.
+Without a certificate (development) the panel is served on 2086 itself. Open the address in
+a browser; the login card shows the vendor branding set under
 *Panel › Customization* and, if one is configured, a login notice.
 
 ### Username and password

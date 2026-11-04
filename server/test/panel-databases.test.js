@@ -295,6 +295,42 @@ describe('/api/panel/databases', () => {
     expect(audit.principal).toBe('resell1');
   });
 
+  it('lets the account follow its own check and dump jobs under /jobs, and nobody else\'s', async () => {
+    const sse = (p, user = 'alice') => get(p, user).buffer(true).parse((res, cb) => { let text = ''; res.on('data', (d) => { text += d; }); res.on('end', () => cb(null, text)); });
+    const check = await post('/alice_shop/check', { action: 'check' }).expect(202);
+    const checkId = check.body.data.job.id;
+    await waitForJob(app.ctx, checkId);
+    const dump = await post('/alice_shop/dump', {}).expect(202);
+    const dumpId = dump.body.data.job.id;
+    await waitForJob(app.ctx, dumpId);
+    const job = await get(`/jobs/${checkId}`).expect(200);
+    expect(job.body.data).toMatchObject({ id: checkId, type: 'db.repair', status: 'done', params: { databases: ['alice_shop'] } });
+    expect(job.body.data.params).not.toHaveProperty('profileId');
+    expect(job.body.data.logs).toBeInstanceOf(Array);
+    const dumped = await get(`/jobs/${dumpId}`).expect(200);
+    expect(dumped.body.data).toMatchObject({ type: 'panel.db.dump', status: 'done', params: { database: 'alice_shop' } });
+    expect(dumped.body.data.params).not.toHaveProperty('ownerId');
+    expect(dumped.body.data.result.file).toMatch(/^backups\//);
+    const stream = await sse(`/jobs/${checkId}/stream`).expect(200);
+    expect(stream.headers['content-type']).toMatch(/^text\/event-stream/);
+    expect(stream.body).toContain('"type":"snapshot"');
+    expect(stream.body).toContain('"type":"db.repair"');
+    for (const id of [checkId, dumpId]) {
+      expect((await get(`/jobs/${id}`, 'bob')).status, `job ${id}`).toBe(404);
+      expect((await sse(`/jobs/${id}/stream`, 'bob')).status, `stream ${id}`).toBe(404);
+    }
+    expect((await get('/jobs/abc')).status).toBe(422);
+    expect((await get('/jobs/999999')).status).toBe(404);
+    app.ctx.jobs.register('test.noop', async () => ({ ok: true }));
+    const other = app.ctx.jobs.enqueue('test.noop', { databases: ['alice_shop'], accountId: app.ctx.db.prepare("SELECT id FROM accounts WHERE username = 'alice'").get().id });
+    await waitForJob(app.ctx, other.id);
+    expect((await get(`/jobs/${other.id}`)).status).toBe(404);
+    expect((await sse(`/jobs/${other.id}/stream`)).status).toBe(404);
+    const live = app.ctx.jobs.enqueue('db.repair', { action: 'check', databases: ['alice_shop', 'bob_other'] }, { userId: null });
+    expect((await get(`/jobs/${live.id}`)).status).toBe(404);
+    await waitForJob(app.ctx, live.id);
+  });
+
   it('fails the dump job closed when the owner is gone or changed, before mysqldump runs', async () => {
     const alice = app.ctx.db.prepare("SELECT id, owner_id FROM accounts WHERE username = 'alice'").get();
     const rootId = app.ctx.db.prepare("SELECT id FROM users WHERE username = 'root'").get().id;

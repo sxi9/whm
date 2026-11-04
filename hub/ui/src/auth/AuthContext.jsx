@@ -60,7 +60,7 @@ export function impersonationOf(data) {
 }
 
 function portalSession(data) {
-  return { kind: 'portal', user: data.user, totpVerifiedAt: data.totp_verified_at || null, totpEnabled: !!data.user?.totp_enabled, brand: data.user?.reseller_id ? brandOf(data) : null, impersonating: impersonationOf(data) };
+  return { kind: 'portal', user: data.user, totpVerifiedAt: data.totp_verified_at || null, totpEnabled: !!data.user?.totp_enabled, totpEnrolRequired: !!data.totp_enrol_required, brand: data.user?.reseller_id ? brandOf(data) : null, impersonating: impersonationOf(data) };
 }
 function developerSession(data) {
   return { kind: 'developer', developer: data.developer, scopes: data.scopes || ['*'], totpVerifiedAt: data.totp_verified_at || null, totpEnabled: !!data.developer?.totp_enabled };
@@ -135,7 +135,7 @@ export function AuthProvider({ children, initialPath = typeof window !== 'undefi
       try { await api.post('/portal/impersonate/end', {}); } finally { await refresh(); }
     },
     markTotpEnabled(enabled) {
-      setSession((s) => (s ? { ...s, totpEnabled: enabled, totpVerifiedAt: enabled ? Date.now() : null } : s));
+      setSession((s) => (s ? { ...s, totpEnabled: enabled, totpVerifiedAt: enabled ? Date.now() : null, totpEnrolRequired: enabled ? false : s.totpEnrolRequired } : s));
     },
   }), [session, ready, refresh]);
 

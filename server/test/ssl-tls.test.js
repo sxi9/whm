@@ -56,6 +56,9 @@ beforeAll(async () => {
     'ssl.service_cert.status': () => ({ exim: { service: 'exim', daemonPresent: true, hasCertificate: false, paths: PATHS('service/exim'), certificate: null } }),
   });
   app = await createTestApp({ agent });
+  // Every name resolves to this server unless a test says otherwise: AutoSSL
+  // checks www.<domain> before ordering, and tests never touch real DNS.
+  app.ctx.ssl.autossl.resolveAddresses = async () => ['10.0.0.5'];
   csrf = await app.login();
   const r = await app.createUser('resell1', 'reseller');
   reseller = request.agent(app.ctx.app);
@@ -329,17 +332,37 @@ describe('install on a domain, hosts and storage', () => {
     const before = app.ctx.db.prepare('SELECT COUNT(*) AS n FROM ssl_certs WHERE key_enc IS NOT NULL').get().n;
     const wildcard = (await post('/api/ssl/certs/upload', { certPem: CERT, keyPem: KEY, domain: 'bob.com' })).body.data.cert.id;
     expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM ssl_certs WHERE key_enc IS NOT NULL').get().n).toBe(before + 1);
-    const res = await post('/api/ssl/install', { domain: 'shop.bob.com', certId: wildcard, force: true });
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body.data.cert.id).toBe(wildcard);
-    // shop.bob.com is no account's domain, so root installs it as a server hostname (no account).
-    expect(res.body.data.cert).toMatchObject({ domain: 'shop.bob.com', account: null, installed: 2 });
-    expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM ssl_certs WHERE key_enc IS NOT NULL').get().n).toBe(before + 1);
-    // Once it is installed somewhere, a second hostname needs its own row.
-    const second = await post('/api/ssl/install', { domain: 'mail.bob.com', certId: wildcard, force: true });
-    expect(second.body.data.cert.id).not.toBe(wildcard);
-    await del('/api/ssl/hosts/shop.bob.com');
-    await del('/api/ssl/hosts/mail.bob.com');
+    const applied = [];
+    app.ctx.web = { applySsl: async (domain) => { applied.push(domain); return {}; } };
+    app.agent.calls.length = 0;
+    const hostnameBefore = app.ctx.settings.get('basic.hostname');
+    app.ctx.settings.set('basic.hostname', 'shop.bob.com');
+    try {
+      const res = await post('/api/ssl/install', { domain: 'shop.bob.com', certId: wildcard, force: true });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.data.cert.id).toBe(wildcard);
+      // shop.bob.com is the configured server hostname (no account): the bundle goes to the
+      // service certificates (panel first), never to a vhost.
+      expect(res.body.data.cert).toMatchObject({ domain: 'shop.bob.com', account: null, installed: 1 });
+      expect(res.body.data.web).toMatch(/^services: panel/);
+      expect(app.agent.callsTo('ssl.service_cert.install').map((c) => c.args.service)[0]).toBe('panel');
+      expect(app.agent.callsTo('ssl.service_cert.install').map((c) => c.args.service)).toEqual(expect.arrayContaining(['exim', 'dovecot', 'apache']));
+      expect(applied).toEqual([]);
+      expect(app.ctx.db.prepare('SELECT COUNT(*) AS n FROM ssl_certs WHERE key_enc IS NOT NULL').get().n).toBe(before + 1);
+      // Once it is installed somewhere, a second hostname needs its own row; an unowned name
+      // that is not the server hostname stays a plain web host and never touches the daemons.
+      const services = app.agent.callsTo('ssl.service_cert.install').length;
+      const second = await post('/api/ssl/install', { domain: 'mail.bob.com', certId: wildcard, force: true });
+      expect(second.body.data.cert.id).not.toBe(wildcard);
+      expect(applied).toEqual(['mail.bob.com']);
+      expect(app.agent.callsTo('ssl.service_cert.install').length).toBe(services);
+      await del('/api/ssl/hosts/shop.bob.com');
+      await del('/api/ssl/hosts/mail.bob.com');
+    } finally {
+      app.ctx.settings.set('basic.hostname', hostnameBefore);
+      app.ctx.web = undefined;
+      app.ctx.db.prepare('DELETE FROM ssl_service_certs').run();
+    }
   });
 
   it('refuses a certificate that does not cover the domain unless forced', async () => {
@@ -524,6 +547,108 @@ describe('AutoSSL', () => {
     expect(result.entries[0].action).toBe('failed');
     expect(app.agent.callsTo('ssl.acme.issue').length).toBe(issue + 3);
     app.agent.set('ssl.acme.issue', ({ provider, domains }) => ({ provider, domains, primary: domains[0], renewed: true, paths: PATHS(domains[0]), certPem: CERT, keyPem: KEY, chainPem: CHAIN, certificate: { ...certInfo, commonName: domains[0], sans: domains }, output: '' }));
+  });
+
+  it('leaves www out of the order up front when it has no DNS record or points at another host', async () => {
+    const resolve = app.ctx.ssl.autossl.resolveAddresses;
+    const runFor = async () => {
+      const before = app.agent.callsTo('ssl.acme.issue').length;
+      const result = await app.ctx.ssl.autossl.run({ params: { trigger: 'manual', domain: 'bob.com', force: true }, log() {}, progress() {} });
+      return { entry: result.entries[0], orders: app.agent.callsTo('ssl.acme.issue').slice(before).map((c) => c.args.domains) };
+    };
+    try {
+      // No A/AAAA record at all: one single-name order, no wasted multi-name attempt.
+      app.ctx.ssl.autossl.resolveAddresses = async (name) => (name.startsWith('www.') ? null : ['10.0.0.5']);
+      let r = await runFor();
+      expect(r.orders).toEqual([['bob.com']]);
+      expect(r.entry.action).toBe('renewed');
+      expect(r.entry.message).toMatch(/www\.bob\.com has no DNS record and was left out/);
+      // A www record that points at another host would fail HTTP-01 here as well.
+      app.ctx.ssl.autossl.resolveAddresses = async (name) => (name.startsWith('www.') ? ['192.0.2.9'] : ['10.0.0.5']);
+      r = await runFor();
+      expect(r.orders).toEqual([['bob.com']]);
+      expect(r.entry.message).toMatch(/www\.bob\.com resolves to 192\.0\.2\.9, not to this server/);
+      // Same addresses (CNAME to the apex, or both proxied): www is covered.
+      app.ctx.ssl.autossl.resolveAddresses = async () => ['2001:db8::1', '10.0.0.5'];
+      r = await runFor();
+      expect(r.orders).toEqual([['bob.com', 'www.bob.com']]);
+      expect(r.entry.message).not.toMatch(/left out/);
+      // A resolver failure (timeout, SERVFAIL) is not a verdict: the name is ordered and the retry path covers it.
+      app.ctx.ssl.autossl.resolveAddresses = async () => { throw Object.assign(new Error('queryA ETIMEOUT'), { code: 'ETIMEOUT' }); };
+      r = await runFor();
+      expect(r.orders).toEqual([['bob.com', 'www.bob.com']]);
+      // Subdomains and www.* names never get a www prefix, so nothing is resolved for them.
+      const resolved = [];
+      app.ctx.ssl.autossl.resolveAddresses = async (name) => { resolved.push(name); return ['10.0.0.5']; };
+      expect(await app.ctx.ssl.autossl.wwwSkipReason('bob.com')).toBeNull();
+      expect(resolved).toEqual(['www.bob.com', 'bob.com']);
+    } finally { app.ctx.ssl.autossl.resolveAddresses = resolve; }
+  });
+
+  it('covers the server hostname for root only and installs the result on the services, not a vhost', async () => {
+    const saved = app.ctx.settings.get('basic.hostname');
+    const applied = [];
+    app.ctx.web = { applySsl: async (domain) => { applied.push(domain); return {}; } };
+    try {
+      // A bare label (os.hostname() default) is not a certificate name.
+      app.ctx.settings.set('basic.hostname', 'nova');
+      expect((await get('/api/ssl/autossl')).body.data.coverage.find((d) => d.type === 'server')).toBeUndefined();
+      app.ctx.settings.set('basic.hostname', 'Nova.Example.COM');
+      const status = await get('/api/ssl/autossl');
+      const row = status.body.data.coverage.find((d) => d.domain === 'nova.example.com');
+      expect(row).toMatchObject({ type: 'server', account: null, accountId: null, docroot: '/var/www/html', suspended: false, certificate: null });
+      expect((await get('/api/ssl/domains')).body.data.some((d) => d.domain === 'nova.example.com')).toBe(true);
+      expect((await reseller.get('/api/ssl/domains')).body.data.some((d) => d.domain === 'nova.example.com')).toBe(false);
+      expect((await mutate(reseller, 'post', '/api/ssl/autossl/issue', { domain: 'nova.example.com' }, resellerCsrf)).status).toBe(404);
+      // An account that owns the hostname keeps its own row (no duplicate server entry).
+      app.ctx.settings.set('basic.hostname', 'bob.com');
+      expect((await get('/api/ssl/autossl')).body.data.coverage.filter((d) => d.domain === 'bob.com').map((d) => d.type)).toEqual(['main']);
+      app.ctx.settings.set('basic.hostname', 'nova.example.com');
+
+      app.agent.calls.length = 0;
+      const res = await post('/api/ssl/autossl/run', { domain: 'nova.example.com' });
+      expect(res.status, JSON.stringify(res.body)).toBe(202);
+      app.ctx.jobs.start();
+      const job = await waitForJob(app.ctx, res.body.data.job.id, 10_000);
+      app.ctx.jobs.stop();
+      expect(job.status, JSON.stringify(job)).toBe('done');
+      expect(job.result.checked).toBe(1);
+      expect(job.result.entries[0]).toMatchObject({ domain: 'nova.example.com', account: null, action: 'issued' });
+      expect(job.result.entries[0].message).toMatch(/\(services: panel/);
+      // One name only (no www for the hostname), validated from the default docroot.
+      const order = app.agent.callsTo('ssl.acme.issue');
+      expect(order).toHaveLength(1);
+      expect(order[0].args).toMatchObject({ domains: ['nova.example.com'], method: 'webroot', webroot: '/var/www/html' });
+      // The bundle went to the service certificates (panel first, then the daemons present), never to a vhost.
+      const services = app.agent.callsTo('ssl.service_cert.install').map((c) => c.args.service);
+      expect(services[0]).toBe('panel');
+      expect(services).toEqual(expect.arrayContaining(['exim', 'dovecot', 'apache']));
+      expect(services).not.toContain('ftp');
+      expect(applied).toEqual([]);
+      expect(app.ctx.db.prepare('SELECT service FROM ssl_service_certs WHERE cert_pem IS NOT NULL ORDER BY service').all().map((r) => r.service)).toEqual(expect.arrayContaining(['panel', 'exim']));
+      expect(app.ctx.ssl.certForDomain('nova.example.com')).toMatchObject({ account: null, accountId: null, autossl: true, state: 'installed' });
+      // Renewals go to the services that already hold a certificate only.
+      app.ctx.db.prepare('DELETE FROM ssl_service_certs WHERE service NOT IN (?, ?)').run('panel', 'dovecot');
+      app.agent.calls.length = 0;
+      const again = await app.ctx.ssl.issueFor('nova.example.com', { role: 'root' }, null, { force: true });
+      expect(again.web).toBe('services: panel, dovecot');
+      expect(app.agent.callsTo('ssl.service_cert.install').map((c) => c.args.service).sort()).toEqual(['dovecot', 'panel']);
+      // A service that rejects the bundle is reported and does not stop the others.
+      app.agent.set('ssl.service_cert.install', ({ service }) => { if (service === 'dovecot') throw agentError('config_invalid', 'Dovecot rejected the certificate drop-in'); return { service, paths: PATHS(`service/${service}`), applied: [], removed: [], reload: { reloaded: false, unit: null }, certificate: certInfo, note: null }; });
+      const partial = await app.ctx.ssl.issueFor('nova.example.com', { role: 'root' }, null, { force: true });
+      expect(partial.web).toBe('services: panel');
+      expect(partial.webDetail).toMatch(/dovecot: Dovecot rejected/);
+      app.agent.set('ssl.service_cert.install', ({ service }) => ({ service, paths: PATHS(`service/${service}`), applied: [`/etc/${service}/whm`], removed: [], reload: { reloaded: true, unit: service }, certificate: certInfo, note: null }));
+      // Uninstalling the hostname never calls the vhost hook.
+      const removed = [];
+      app.ctx.web = { removeSsl: async (domain) => { removed.push(domain); } };
+      expect((await del('/api/ssl/hosts/nova.example.com')).body.data.web).toBe('skipped');
+      expect(removed).toEqual([]);
+      app.ctx.db.prepare('DELETE FROM ssl_service_certs').run();
+    } finally {
+      app.ctx.web = undefined;
+      app.ctx.settings.set('basic.hostname', saved);
+    }
   });
 
   it('counts a pass the client kept the old certificate on as skipped, not renewed', async () => {

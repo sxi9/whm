@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
-import { hasBinary } from '../exec.js';
+import { exec, hasBinary } from '../exec.js';
 import { defineOp, arg, OpError, ensurePrivateDir } from './registry.js';
 import { accountPath, asUser, failureOf, lstatOrNull, SSH_DIR } from './as-user.js';
 
@@ -206,16 +206,65 @@ defineOp('files.chunk_write', {
   },
 });
 
+// The argv guard for getent: the schema admits the same names.
+export const GROUP_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
+
+// getent answers from every NSS source (LDAP, SSSD...), so /etc/group is read
+// directly only on a host without it.
+export async function groupId(name, { groupFile = '/etc/group' } = {}) {
+  if (!GROUP_NAME.test(name)) throw new OpError('invalid_args', `Invalid group name "${name}"`);
+  let line = null;
+  if (hasBinary('getent')) {
+    const r = await exec('getent', ['group', '--', name], { allowFailure: true, timeoutMs: 30_000 });
+    if (r.code === 0) line = r.stdout.split('\n').find((l) => l.startsWith(`${name}:`)) ?? null;
+  } else {
+    let text = '';
+    try { text = fs.readFileSync(groupFile, 'utf8'); } catch { text = ''; }
+    line = text.split('\n').find((l) => l.startsWith(`${name}:`)) ?? null;
+  }
+  const gid = line ? Number(line.split(':')[2]) : NaN;
+  if (!Number.isInteger(gid) || gid < 0) throw new OpError('not_found', `Unknown group "${name}"`);
+  return gid;
+}
+
+// The account cannot hand its directory to a group it is not a member of
+// (the web server's), so that one step is root's: the leaf is opened without
+// following links and only a directory the account owns changes group.
+export function setGroup(target, info, gid) {
+  let fd;
+  try { fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW); } catch (err) {
+    throw new OpError('refused', `${target} is not a plain directory; its group was not changed (${err.code})`);
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    if (st.uid !== info.uid) throw new OpError('refused', `${target} is not owned by ${info.username}; its group was not changed`);
+    fs.fchownSync(fd, st.uid, gid);
+  } finally { fs.closeSync(fd); }
+}
+
+// A directory the op just created is the account's by construction, so a
+// refused hand-over there is an error; a leaf that already existed (a restored
+// docroot root owns) keeps its owner and the refusal is returned as a note.
+export function handOverGroup(target, info, gid, { existed = false } = {}) {
+  try { setGroup(target, info, gid); return null; } catch (err) {
+    if (!existed || !(err instanceof OpError) || err.code !== 'refused' || !lstatOrNull(target)?.isDirectory()) throw err;
+    return err.message;
+  }
+}
+
 defineOp('files.mkdir', {
-  description: 'Create a directory (and parents) inside an account home as the account',
-  schema: z.object({ ...base, ...protect, path: pathArg, mode: arg.mode.default('0755') }).strict(),
-  run: async ({ username, path: p, mode, protectSshDir }, ctx) => {
+  description: 'Create a directory (and parents) inside an account home as the account; optionally hand the leaf to a group such as the web server\'s',
+  schema: z.object({ ...base, ...protect, path: pathArg, mode: arg.mode.default('0755'), group: z.string().regex(GROUP_NAME).optional() }).strict(),
+  run: async ({ username, path: p, mode, group, protectSshDir }, ctx) => {
     const { info, home, target } = accountPath(username, p, ctx, 'write', { protectSshDir });
     assertNotHome(target, home, 'files.mkdir');
     assertPlainMode(mode);
+    const gid = group ? await groupId(group) : null;
+    const existed = Boolean(lstatOrNull(target)?.isDirectory());
     const r = await asUser(info, 'mkdir', ['-p', '-m', mode, '--', target], { allowFailure: true, timeoutMs: 60_000 });
     if (r.code !== 0) throw failureOf(r, `create ${path.relative(home, target)}`);
-    return { path: target, mode };
+    const note = gid != null ? handOverGroup(target, info, gid, { existed }) : null;
+    return { path: target, mode, group: note ? null : group ?? null, note };
   },
 });
 

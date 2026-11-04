@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import request from 'supertest';
-import { createTestApp, createMockAgent } from './support/app.js';
+import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
 import { renderUserPrefs, auditArgs, limitOf } from '../src/services/panel-email.js';
 
 const HASH = '$6$zbsfcWrdKw0VR0wa$A0rw1A7d4PBa2YN/z1nATzFjoYngcI/Kpt3Ih5IWolea1/ANnjhx8YxtNUdCS5bDEjG80Yb.rvLa4CkZj2/pR1';
@@ -174,7 +174,10 @@ describe('Customer panel: email', () => {
       const res = await alice.post('/email/accounts', { localPart: 'info', domain: 'alice.com', password: 'Str0ng-Passw0rd!', quotaMb: 512 });
       expect(res.status, JSON.stringify(res.body)).toBe(201);
       expect(res.body.data).toMatchObject({ address: 'info@alice.com', localPart: 'info', domain: 'alice.com', quotaMb: 512, suspended: false });
-      expect(res.body.meta.warnings).toEqual([]);
+      // The wiring was never applied on this host: the customer is told, and the apply is queued as a panel job, not run here.
+      expect(res.body.meta.warnings.map((w) => w.code)).toEqual(['virtual_mail_not_live']);
+      expect(app.ctx.jobs.list({ type: 'panel.virtual_mail.ensure' }).filter((j) => j.status === 'queued')).toHaveLength(1);
+      expect(names().filter((n) => n.startsWith('web.'))).toEqual([]);
       const order = names();
       const i = (n) => order.indexOf(n);
       expect(i('vmail.hash')).toBeGreaterThanOrEqual(0);
@@ -197,7 +200,9 @@ describe('Customer panel: email', () => {
       db().prepare("UPDATE mail_domains SET routing = 'auto' WHERE domain = 'alice.com'").run();
       const res = await alice.post('/email/accounts', { localPart: 'sales', domain: 'alice.com', password: 'Str0ng-Passw0rd!' });
       expect(res.status, JSON.stringify(res.body)).toBe(201);
-      expect(res.body.meta.warnings.map((w) => w.code)).toEqual(['routing_not_applied']);
+      expect(res.body.meta.warnings.map((w) => w.code)).toEqual(['routing_not_applied', 'virtual_mail_not_live']);
+      // A second create while the first apply is still queued does not queue another.
+      expect(app.ctx.jobs.list({ type: 'panel.virtual_mail.ensure' }).filter((j) => j.status === 'queued')).toHaveLength(1);
       expect(row('SELECT local_part FROM mail_accounts WHERE local_part = ?', 'sales')).toBeTruthy();
       expect(res.body.data.quotaMb).toBe(1024);
     });
@@ -267,8 +272,17 @@ describe('Customer panel: email', () => {
     it('client settings come from the mailserver profile and hostname', async () => {
       const id = row("SELECT id FROM mail_accounts WHERE local_part = 'info'").id;
       const res = await alice.get(`/email/accounts/${id}/client-settings`).expect(200);
-      expect(res.body.data).toMatchObject({ username: 'info@alice.com', imap: { port: 993, ssl: true }, pop3: { port: 995 }, smtp: { port: 465, alternative: { port: 587, starttls: true } } });
+      // Only what Exim really listens on: port 25 with STARTTLS until the operator enables the submission ports, and no AUTH until the wiring is live.
+      expect(res.body.data).toMatchObject({ username: 'info@alice.com', imap: { port: 993, ssl: true }, pop3: { port: 995 }, smtp: { port: 25, ssl: false, starttls: true, alternative: null, auth: null, submissionPorts: false } });
       expect(res.body.data.hostname).toBeTruthy();
+      const exim = app.ctx.settings.get('service_config.exim', null);
+      app.ctx.settings.set('service_config.exim', { ...(exim || {}), submissionPorts: true, tls: null });
+      try {
+        // Submission ports without the Exim TLS preset: 587/STARTTLS only, 465 is not listening.
+        expect((await alice.get(`/email/accounts/${id}/client-settings`).expect(200)).body.data.smtp).toMatchObject({ port: 587, ssl: false, starttls: true, alternative: null, submissionPorts: true });
+        app.ctx.settings.set('service_config.exim', { ...(exim || {}), submissionPorts: true, tls: { minProtocol: 'TLSv1.2', protocols: ['TLSv1.2', 'TLSv1.3'], cipherList: '', cipherSuites: '', preferServerCiphers: false } });
+        expect((await alice.get(`/email/accounts/${id}/client-settings`).expect(200)).body.data.smtp).toMatchObject({ port: 465, ssl: true, alternative: { port: 587, starttls: true }, submissionPorts: true });
+      } finally { app.ctx.settings.set('service_config.exim', exim); }
     });
 
     it('deletes the passwd line and the row, removing the maildir only when asked (as the account)', async () => {
@@ -535,6 +549,63 @@ describe('Customer panel: email', () => {
         app.ctx.web.applyVirtualMail = undefined;
         expect(await app.ctx.panelEmail.ensureVirtualMail(null, { force: true })).toMatchObject({ applied: false });
       } finally { app.ctx.web.applyVirtualMail = original; app.ctx.settings.set('service_config.virtual_mail', before); }
+    });
+
+    it('runs the apply as the panel job queued at boot / by a mailbox create, and stops warning once the wiring is live', async () => {
+      expect(app.ctx.jobs.types()).toContain('panel.virtual_mail.ensure');
+      const original = app.ctx.web.applyVirtualMail;
+      const seen = [];
+      app.ctx.web.applyVirtualMail = async (input, req) => { seen.push([input, req]); return { enabled: true, applied: true, live: false, lastApply: { ok: false, error: 'written, but Exim does not load /etc/exim4/whm/router_whm_virtual_mail.conf' }, manualIncludes: [{ slot: 'router', line: '.include_if_exists /etc/exim4/whm/router_whm_virtual_mail.conf' }] }; };
+      const queued = app.ctx.jobs.list({ type: 'panel.virtual_mail.ensure' }).find((j) => j.status === 'queued');
+      expect(queued).toBeTruthy();
+      try {
+        app.ctx.jobs.start();
+        // The job queued by the create above runs as the panel; the memoised failure of the previous test is still inside its backoff, so it is a no-op.
+        expect((await waitForJob(app.ctx, queued.id)).status).toBe('done');
+        expect(seen).toEqual([]);
+        const forced = app.ctx.jobs.enqueue('panel.virtual_mail.ensure', { trigger: 'boot', force: true });
+        const done = await waitForJob(app.ctx, forced.id);
+        expect(done.status).toBe('done');
+        expect(done.result).toMatchObject({ applied: true, live: false, manualIncludes: [{ slot: 'router' }] });
+        expect(seen).toEqual([[{ enabled: true }, null]]);
+        expect(app.ctx.panelEmail.virtualMailLive()).toBe(false);
+        // Not live and inside the backoff: a create still warns but queues nothing new.
+        const res = await alice.post('/email/accounts', { localPart: 'later', domain: 'alice.com', password: 'Str0ng-Passw0rd!' });
+        expect(res.status, JSON.stringify(res.body)).toBe(201);
+        expect(res.body.meta.warnings.map((w) => w.code)).toEqual(['virtual_mail_not_live']);
+        expect(app.ctx.jobs.list({ type: 'panel.virtual_mail.ensure' }).filter((j) => ['queued', 'running'].includes(j.status))).toHaveLength(0);
+        expect((await alice.get('/email/accounts').expect(200)).body.meta.warnings.map((w) => w.code)).toEqual(['virtual_mail_not_live']);
+        await alice.del(`/email/accounts/${res.body.data.id}`).expect(200);
+        // The admin apply made it live (service-configuration records the outcome): no warning, no job.
+        app.ctx.web.applyVirtualMail = async () => ({ enabled: true, applied: true, live: true });
+        expect(await app.ctx.panelEmail.ensureVirtualMail(null, { force: true })).toMatchObject({ applied: true, live: true });
+        expect(app.ctx.panelEmail.virtualMailLive()).toBe(true);
+        const ok = await alice.post('/email/accounts', { localPart: 'live', domain: 'alice.com', password: 'Str0ng-Passw0rd!' });
+        expect(ok.status, JSON.stringify(ok.body)).toBe(201);
+        expect(ok.body.meta.warnings).toEqual([]);
+        expect(app.ctx.jobs.list({ type: 'panel.virtual_mail.ensure' }).filter((j) => ['queued', 'running'].includes(j.status))).toHaveLength(0);
+        expect((await alice.get(`/email/accounts/${ok.body.data.id}/client-settings`).expect(200)).body.data.smtp.auth).toBe('password');
+        await alice.del(`/email/accounts/${ok.body.data.id}`).expect(200);
+      } finally { app.ctx.jobs.stop(); app.ctx.web.applyVirtualMail = original; }
+    });
+
+    it('the boot request queues nothing without the panel, without both daemons, or while an apply is already queued', async () => {
+      const { jobs, settings, panelEmail } = app.ctx;
+      const pending = () => jobs.list({ type: 'panel.virtual_mail.ensure' }).filter((j) => ['queued', 'running'].includes(j.status));
+      for (const j of pending()) jobs.cancel(j.id);
+      settings.set('panel.enabled', false);
+      try { expect(panelEmail.requestVirtualMail('boot')).toBeNull(); } finally { settings.set('panel.enabled', true); }
+      expect(pending()).toHaveLength(0);
+      app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, PRESENT.has(n) && n !== 'dovecot'])));
+      await app.ctx.capabilities.refresh();
+      try { expect(panelEmail.requestVirtualMail('boot')).toBeNull(); } finally { restoreAgent(app.agent); await app.ctx.capabilities.refresh(); }
+      expect(pending()).toHaveLength(0);
+      // Panel on, both daemons present, memo live from the previous test: exactly one job, tagged with its trigger, and none while it waits.
+      const job = panelEmail.requestVirtualMail('boot');
+      expect(job).toMatchObject({ type: 'panel.virtual_mail.ensure', status: 'queued', params: { trigger: 'boot' } });
+      expect(panelEmail.requestVirtualMail('boot')).toBeNull();
+      expect(pending()).toHaveLength(1);
+      jobs.cancel(job.id);
     });
 
     it('warns the customer when the operator switched virtual mail off, without touching it', async () => {

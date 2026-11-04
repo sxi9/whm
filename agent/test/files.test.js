@@ -5,16 +5,17 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
 import { assertUnderHome, resolveUnderHome, landsInSshDir, asUserArgv, assertManaged, accountPath, SYSTEM_USERS } from '../src/ops/as-user.js';
-import { CHUNK_READ_MAX, FIND_FORMAT, EXTRACT_MAX_BYTES, STDIN_ARCHIVE, parseFind, readRangeArgv, parseTarListing, parseZipListing, checkArchiveMembers, listArchiveArgv, resolveMemberPath, diskLinkReader, sshFingerprint, sshChanges } from '../src/ops/files.js';
+import { CHUNK_READ_MAX, FIND_FORMAT, EXTRACT_MAX_BYTES, STDIN_ARCHIVE, parseFind, readRangeArgv, parseTarListing, parseZipListing, checkArchiveMembers, listArchiveArgv, resolveMemberPath, diskLinkReader, sshFingerprint, sshChanges, groupId, setGroup, handOverGroup } from '../src/ops/files.js';
 
 // exec is spied with the real implementation behind it so every test proves an
 // op refused before any program ran. No files.* op is ever executed here: each
 // would run a command under a real account's uid.
 vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
-  return { ...mod, exec: vi.fn(mod.exec) };
+  return { ...mod, exec: vi.fn(mod.exec), hasBinary: vi.fn(mod.hasBinary) };
 });
 const { exec, hasBinary } = await import('../src/exec.js');
+const realExec = await vi.importActual('../src/exec.js');
 
 const ctx = createContext();
 const MiB = 1024 * 1024;
@@ -137,6 +138,11 @@ describe('files.* schemas reject injection, traversal and option smuggling befor
       ['files.chunk_write', { ...validArgs('files.chunk_write'), data: '' }],
       ['files.mkdir', { ...validArgs('files.mkdir'), mode: '0778' }],
       ['files.mkdir', { ...validArgs('files.mkdir'), mode: '-p' }],
+      ['files.mkdir', { ...validArgs('files.mkdir'), group: 'www data' }],
+      ['files.mkdir', { ...validArgs('files.mkdir'), group: '-g' }],
+      ['files.mkdir', { ...validArgs('files.mkdir'), group: 'Root' }],
+      ['files.mkdir', { ...validArgs('files.mkdir'), group: '' }],
+      ['files.mkdir', { ...validArgs('files.mkdir'), group: 'a'.repeat(33) }],
       ['files.chmod', { ...validArgs('files.chmod'), mode: '0778' }],
       ['files.chmod', { ...validArgs('files.chmod'), mode: '-R' }],
       ['files.chmod', { ...validArgs('files.chmod'), recursive: 'yes' }],
@@ -151,6 +157,91 @@ describe('files.* schemas reject injection, traversal and option smuggling befor
     ];
     for (const [op, args] of cases) expect((await opError(runOp(op, args, ctx))).code, `${op} ${JSON.stringify(args).slice(0, 80)}`).toBe('invalid_args');
     expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+// A docroot is created as the account, whose own group the web server is not
+// in; the leaf alone is handed to the web group, by root, after an ownership
+// check through a descriptor that never follows a link.
+describe('files.mkdir group hand-over', () => {
+  const me = { uid: process.getuid(), username: os.userInfo().username };
+
+  it('resolves group names through getent (argv, never a shell) and refuses unknown ones', async () => {
+    exec.mockClear();
+    expect(await groupId('root')).toBe(0);
+    expect(exec).toHaveBeenCalledWith('getent', ['group', '--', 'root'], expect.objectContaining({ allowFailure: true }));
+    exec.mockResolvedValueOnce({ code: 0, stdout: 'www-data:x:33:\n', stderr: '' });
+    expect(await groupId('www-data')).toBe(33);
+    exec.mockResolvedValueOnce({ code: 2, stdout: '', stderr: '' });
+    expect((await opError(groupId('nogroup'))).code).toBe('not_found');
+    exec.mockResolvedValueOnce({ code: 0, stdout: 'odd:x:notanumber:\n', stderr: '' });
+    expect((await opError(groupId('odd'))).code).toBe('not_found');
+    expect((await opError(groupId('../etc'))).code).toBe('invalid_args');
+    expect((await opError(groupId('-flag'))).code).toBe('invalid_args');
+    expect(exec.mock.calls.every(([bin, argv]) => bin === 'getent' && argv[0] === 'group' && argv[1] === '--')).toBe(true);
+  });
+
+  it('scans the group file only when getent is missing', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-files-group-'));
+    const file = path.join(dir, 'group');
+    fs.writeFileSync(file, 'root:x:0:\nwww-data:x:33:\n');
+    hasBinary.mockImplementation((bin) => bin !== 'getent' && realExec.hasBinary(bin));
+    exec.mockClear();
+    try {
+      expect(await groupId('www-data', { groupFile: file })).toBe(33);
+      expect((await opError(groupId('nope', { groupFile: file }))).code).toBe('not_found');
+      expect((await opError(groupId('root', { groupFile: path.join(dir, 'missing') }))).code).toBe('not_found');
+      expect(exec).not.toHaveBeenCalled();
+    } finally {
+      hasBinary.mockImplementation(realExec.hasBinary);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(!USER)('refuses an unknown group before any command runs as the account', async () => {
+    exec.mockClear();
+    const err = await opError(runOp('files.mkdir', { username: USER, path: `${HOME}/public_html/site`, mode: '0750', group: `nogroup${crypto.randomBytes(3).toString('hex')}` }, ctx));
+    expect(err.code).toBe('not_found');
+    expect(exec.mock.calls.map(([bin]) => bin)).toEqual(['getent']);
+  });
+
+  it('changes the group of a directory the account owns only, never through a link', () => {
+    const refuses = (fn) => { try { fn(); } catch (err) { expect(err).toBeInstanceOf(OpError); expect(err.code).toBe('refused'); return; } throw new Error('expected setGroup to refuse'); };
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-group-'));
+    try {
+      const leaf = path.join(dir, 'site');
+      fs.mkdirSync(leaf, { mode: 0o750 });
+      setGroup(leaf, me, process.getgid());
+      expect(fs.statSync(leaf).gid).toBe(process.getgid());
+      expect(fs.statSync(leaf).mode & 0o777).toBe(0o750);
+      refuses(() => setGroup(leaf, { ...me, uid: me.uid + 1 }, process.getgid()));
+      fs.symlinkSync(leaf, path.join(dir, 'link'));
+      refuses(() => setGroup(path.join(dir, 'link'), me, process.getgid()));
+      fs.writeFileSync(path.join(dir, 'file'), '');
+      refuses(() => setGroup(path.join(dir, 'file'), me, process.getgid()));
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a refused hand-over is an error for a directory the op created and a note for one that already existed', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-group-'));
+    try {
+      const leaf = path.join(dir, 'site');
+      fs.mkdirSync(leaf, { mode: 0o750 });
+      const gid = process.getgid();
+      const foreign = { ...me, uid: me.uid + 1, username: 'other' };
+      expect(handOverGroup(leaf, me, gid, { existed: true })).toBeNull();
+      expect(handOverGroup(leaf, me, gid)).toBeNull();
+      expect(handOverGroup(leaf, foreign, gid, { existed: true })).toBe(`${leaf} is not owned by other; its group was not changed`);
+      expect(fs.statSync(leaf).gid).toBe(gid);
+      const refuses = (fn) => { try { fn(); } catch (err) { expect(err).toBeInstanceOf(OpError); expect(err.code).toBe('refused'); return; } throw new Error('expected handOverGroup to refuse'); };
+      refuses(() => handOverGroup(leaf, foreign, gid));
+      refuses(() => handOverGroup(leaf, foreign, gid, { existed: false }));
+      // Only the ownership refusal is softened: a link or a file under the name still fails.
+      fs.symlinkSync(leaf, path.join(dir, 'link'));
+      refuses(() => handOverGroup(path.join(dir, 'link'), me, gid, { existed: true }));
+      fs.writeFileSync(path.join(dir, 'file'), '');
+      refuses(() => handOverGroup(path.join(dir, 'file'), me, gid, { existed: true }));
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });
 

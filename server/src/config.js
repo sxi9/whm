@@ -4,6 +4,10 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const isProd = process.env.NODE_ENV === 'production';
+// The HTTP→HTTPS guard fails safe: only an explicit "off" value disables it,
+// a typo or an unexpected type keeps it on.
+const REDIRECT_OFF = /^(false|0|no|off)$/i;
+export const httpRedirectEnabled = (value) => !REDIRECT_OFF.test(String(value ?? '').trim());
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 const defaults = {
@@ -13,6 +17,9 @@ const defaults = {
   tlsPort: 2087,
   tlsCert: null,
   tlsKey: null,
+  // With TLS on, the plain listener only redirects (GET/HEAD) or refuses (426);
+  // GET /api/health stays reachable. Ignored without a certificate.
+  httpRedirect: true,
   dataDir: isProd ? '/var/lib/whm' : path.resolve(process.cwd(), 'data'),
   mode: 'monolithic',
   agentSocket: '/run/whm-agent.sock',
@@ -63,6 +70,7 @@ function envOverrides() {
   if (e.WHM_TLS_PORT) out.tlsPort = Number(e.WHM_TLS_PORT);
   if (e.WHM_TLS_CERT) out.tlsCert = e.WHM_TLS_CERT;
   if (e.WHM_TLS_KEY) out.tlsKey = e.WHM_TLS_KEY;
+  if (e.WHM_HTTP_REDIRECT) out.httpRedirect = httpRedirectEnabled(e.WHM_HTTP_REDIRECT);
   if (e.WHM_DATA_DIR) out.dataDir = path.resolve(e.WHM_DATA_DIR);
   if (e.WHM_MODE) out.mode = e.WHM_MODE;
   if (e.WHM_AGENT_SOCKET) out.agentSocket = e.WHM_AGENT_SOCKET;
@@ -103,6 +111,7 @@ export function loadConfig(overrides = {}) {
   cfg.sessionSecret ||= persistedSecret(cfg.dataDir, 'session.secret');
   cfg.masterKeyHex = persistedSecret(cfg.dataDir, 'master.key');
   cfg.tls = Boolean(cfg.tlsCert && cfg.tlsKey);
+  cfg.httpRedirect = httpRedirectEnabled(cfg.httpRedirect);
   cfg.pluginsDir = path.resolve(cfg.pluginsDir || path.join(cfg.dataDir, 'plugins'));
   cfg.pluginDataDir = path.resolve(cfg.pluginDataDir || path.join(cfg.dataDir, 'plugin-data'));
   return cfg;

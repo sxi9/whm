@@ -1,15 +1,15 @@
 import { describe, it, expect, vi } from 'vitest';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { q, parseBatch, parseGrant, parseMysqlcheck, parseCnf, renderCnf, renderClientCnf, renderRootMyCnf, classifyMysqlError, detectEngine, detectLayout, phpMyAdminVersion, cloneUserStatements, pickPgUnit, PRIVILEGES, validateServerConfig, classifyProbeOutput, clientWarnings } from '../src/ops/db.js';
+import { q, parseBatch, parseGrant, parseMysqlcheck, parseCnf, renderCnf, renderClientCnf, renderRootMyCnf, classifyMysqlError, detectEngine, detectLayout, phpMyAdminVersion, cloneUserStatements, revokeStatements, pickPgUnit, PRIVILEGES, validateServerConfig, classifyProbeOutput, clientWarnings } from '../src/ops/db.js';
 
 // exec is spied with the real implementation behind it so tests can prove an op
 // refused before any program ran. This dev box has no mysql client: every op
 // that would talk to a server must stop at capability_missing or invalid_args.
 vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
-  return { ...mod, exec: vi.fn(mod.exec) };
+  return { ...mod, exec: vi.fn(mod.exec), hasBinary: vi.fn(mod.hasBinary) };
 });
-const { exec } = await import('../src/exec.js');
+const { exec, hasBinary } = await import('../src/exec.js');
 
 const ctx = createContext();
 const noMysql = !detectEngine().installed;
@@ -362,6 +362,43 @@ describe('SQL quoting and parsers', () => {
       expect(exec).not.toHaveBeenCalled();
     } finally {
       exec.mockImplementation(original);
+    }
+  });
+
+  it('db.revoke sends the database-level forms MariaDB and MySQL accept, one statement at a time, and tolerates a missing grant', async () => {
+    expect(revokeStatements('app', 'shop', 'localhost')).toEqual(["REVOKE ALL PRIVILEGES ON `shop`.* FROM 'app'@'localhost'", "REVOKE GRANT OPTION ON `shop`.* FROM 'app'@'localhost'"]);
+    const originalExec = exec.getMockImplementation();
+    const originalHasBinary = hasBinary.getMockImplementation();
+    const inputs = [];
+    hasBinary.mockImplementation((bin) => bin === 'mysql');
+    exec.mockImplementation(async (bin, argv, opts) => {
+      inputs.push({ bin, argv, sql: String(opts.input).trim() });
+      if (/^REVOKE GRANT OPTION .* FROM 'app'@'10\.0\.0\.1'$/.test(inputs.at(-1).sql)) return { code: 1, stdout: '', stderr: "ERROR 1141 (42000) at line 1: There is no such grant defined for user 'app' on host '10.0.0.1'\n" };
+      return { code: 0, stdout: '', stderr: '' };
+    });
+    try {
+      const r = await runOp('db.revoke', { user: 'app', database: 'shop', hosts: ['localhost', '10.0.0.1'] }, ctx);
+      expect(r).toEqual({ user: 'app', database: 'shop', hosts: ['localhost', '10.0.0.1'], revoked: true });
+      expect(inputs.map((i) => i.sql)).toEqual([
+        "REVOKE ALL PRIVILEGES ON `shop`.* FROM 'app'@'localhost'",
+        "REVOKE GRANT OPTION ON `shop`.* FROM 'app'@'localhost'",
+        "REVOKE ALL PRIVILEGES ON `shop`.* FROM 'app'@'10.0.0.1'",
+        "REVOKE GRANT OPTION ON `shop`.* FROM 'app'@'10.0.0.1'",
+        'FLUSH PRIVILEGES',
+      ]);
+      for (const { bin, argv, sql } of inputs) {
+        expect(bin).toBe('mysql');
+        expect(argv).toContain('--batch');
+        expect(sql).not.toMatch(/, GRANT OPTION ON/);
+      }
+      // Anything but 1141 still fails the op.
+      exec.mockImplementation(async () => ({ code: 1, stdout: '', stderr: 'ERROR 1064 (42000) at line 1: You have an error in your SQL syntax\n' }));
+      const err = await opError(runOp('db.revoke', { user: 'app', database: 'shop' }, ctx));
+      expect(err.code).toBe('db_error');
+      expect(err.details.errno).toBe(1064);
+    } finally {
+      exec.mockImplementation(originalExec);
+      hasBinary.mockImplementation(originalHasBinary);
     }
   });
 

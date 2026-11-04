@@ -5,6 +5,7 @@
   "tlsPort": 2087,
   "tlsCert": "/etc/whm/ssl/panel.crt",
   "tlsKey": "/etc/whm/ssl/panel.key",
+  "httpRedirect": true,
   "dataDir": "/var/lib/whm",
   "mode": "split",
   "agentSocket": "/run/whm-agent.sock",

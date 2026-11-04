@@ -45,6 +45,24 @@ const REQUIRED = {
   perl: ['perl'],
 };
 
+// Debian/Ubuntu ship one unit per PHP branch (php8.5-fpm) and new branches
+// appear faster than a seeded candidate list can follow; when no listed
+// candidate exists the newest php<major>.<minor>-fpm unit on the host is used.
+const UNIT_PATTERNS = { 'php-fpm': /^php(\d+)\.(\d+)-fpm$/ };
+
+export function newestUnitMatching(pattern, present) {
+  const found = [...present].map((u) => u.match(pattern)).filter(Boolean)
+    .sort((a, b) => (Number(b[1]) - Number(a[1])) || (Number(b[2]) - Number(a[2])));
+  return found[0]?.[0] ?? null;
+}
+
+export function resolveUnit(name, candidates, present) {
+  const listed = candidates.find((u) => present.has(u));
+  if (listed) return listed;
+  const pattern = UNIT_PATTERNS[name];
+  return pattern ? newestUnitMatching(pattern, present) : null;
+}
+
 export function createCapabilities({ agent, db, logger }) {
   let snapshot = { at: 0, binaries: {}, capabilities: {}, units: {} };
 
@@ -62,7 +80,7 @@ export function createCapabilities({ agent, db, logger }) {
     try {
       const present = new Set(await agent.op('svc.list_units'));
       for (const row of db.prepare('SELECT name, unit_candidates FROM services').all()) {
-        units[row.name] = JSON.parse(row.unit_candidates).find((u) => present.has(u)) || null;
+        units[row.name] = resolveUnit(row.name, JSON.parse(row.unit_candidates), present);
       }
     } catch (err) {
       logger.warn({ err }, 'could not list systemd units');

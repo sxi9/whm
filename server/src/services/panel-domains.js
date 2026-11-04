@@ -91,10 +91,27 @@ export function createPanelDomainsService(ctx) {
 
   const systemUser = (scope) => scope.account.uid != null;
 
-  async function mkdirAsUser(scope, dir, req) {
+  // Created as the account, so its group would be the account's own and Apache
+  // could not traverse it (403): the leaf is handed to the web server's run
+  // user like public_html (accounts.js). It is opened to "other" only when the
+  // capability layer knows no web server at all; a failed detection keeps it
+  // closed and is reported, so a transient agent error never widens a docroot.
+  async function mkdirAsUser(scope, dir, req, warnings) {
     if (!systemUser(scope)) return { created: false, reason: 'no_system_user' };
-    await agent().op('files.mkdir', { username: scope.username, path: dir, mode: '0750' }, { req });
-    return { created: true };
+    const webInstalled = ctx.capabilities ? Boolean(ctx.capabilities.has('apache') || ctx.capabilities.has('nginx')) : true;
+    let webGroup = null;
+    let detectError = null;
+    try { webGroup = (await agent().op('web.detect', {}, { req }))?.apache?.runUser || null; } catch (err) { if (!isCapabilityMissing(err)) detectError = err; }
+    const open = !webGroup && !webInstalled && !detectError;
+    if (!webGroup && !open) warnings.push(detectError ? `The web server's run user could not be detected (${detectError.message}); ${dir} stays readable by the account only until the web server category re-syncs it` : `${dir} stays readable by the account only: the web server's run user is unknown`);
+    const mode = open ? '0755' : '0750';
+    // A docroot that already existed under another owner keeps its group: the
+    // op answers { group: null, note } instead of failing, and the customer
+    // must hear why the web server may not be able to traverse it.
+    const made = await agent().op('files.mkdir', { username: scope.username, path: dir, mode, ...(webGroup ? { group: webGroup } : {}) }, { req });
+    const note = typeof made?.note === 'string' && made.note.trim() ? made.note.trim() : null;
+    if (note) warnings.push(`${dir}: ${note}`);
+    return { created: true, group: webGroup && made?.group === null ? null : webGroup, mode, note };
   }
 
   async function removeDocrootAsUser(scope, docroot, req) {
@@ -238,7 +255,7 @@ export function createPanelDomainsService(ctx) {
       }
       let dir;
       try {
-        dir = await mkdirAsUser(scope, docroot, req);
+        dir = await mkdirAsUser(scope, docroot, req, warnings);
         stmts.insert.run(scope.accountId, domain, 'addon', docroot);
       } catch (err) {
         if (zone?.created && typeof ctx.dns?.deleteZone === 'function') {
@@ -289,7 +306,7 @@ export function createPanelDomainsService(ctx) {
       if (stmts.hosted.get({ domain: fqdn, accountId: scope.accountId })) throw new HttpError(409, 'exists', `${fqdn} already exists`);
       const docroot = resolveDocroot(ctx, scope.account, rel || label);
       const warnings = [];
-      const dir = await mkdirAsUser(scope, docroot, req);
+      const dir = await mkdirAsUser(scope, docroot, req, warnings);
       stmts.insert.run(scope.accountId, fqdn, 'sub', docroot);
       const dns = await dnsRecordsFor(scope, fqdn, { ipv4: scope.account.ip ? [{ value: scope.account.ip }] : [], ipv6: scope.account.ipv6 ? [{ value: scope.account.ipv6 }] : null }, req, warnings);
       const web = await syncWeb(scope, req, warnings);
@@ -302,7 +319,7 @@ export function createPanelDomainsService(ctx) {
       const row = assertDomain(scope, domain, ['sub']);
       const warnings = [];
       const web = await dropVhost(scope, domain, req, warnings);
-      const dns = await dnsRecordsFor(scope, domain, { ipv4: [], ipv6: [] }, req, warnings);
+      const dns = await dnsRecordsFor(scope, domain, { ipv4: [], ipv6: scope.account.ipv6 ? [] : null }, req, warnings);
       const mail = await releaseMail(scope, domain, req, warnings);
       db.transaction(() => { stmts.remove.run(row.id, scope.accountId); stmts.deleteMailDomain.run(domain, scope.accountId); })();
       let docroot = { removed: false };

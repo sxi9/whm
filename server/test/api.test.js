@@ -33,6 +33,7 @@ function createMockAgent() {
       agentUid: 0,
     }),
     'user.create': ({ username, homeDir, shell }) => ({ username, uid: 30001, gid: 30001, home: homeDir, shell, gecos: '' }),
+    'web.detect': () => ({ apache: { installed: true, flavor: 'debian', runUser: 'www-data' } }),
     'svc.status': ({ unit }) => ({ unit, installed: true, active: true, state: 'active', subState: 'running', enabled: true, pid: 4242, memoryBytes: 1024, restarts: 0 }),
   };
   const agent = {
@@ -390,14 +391,16 @@ describe('accounts', () => {
     expect(res.body.data.domains).toEqual([expect.objectContaining({ domain: 'web01.example.com', type: 'main', docroot: '/home/web01/public_html' })]);
     expect(res.body.data.provisioning.systemUser).toBe(true);
 
-    expect(agent.names()).toEqual(['user.create', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.write_file', 'user.set_password']);
+    expect(agent.names()).toEqual(['user.create', 'web.detect', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.mkdir', 'fs.write_file', 'user.set_password']);
     expect(agent.calls[0].args).toEqual({ username: 'web01', homeDir: '/home/web01', shell: '/usr/sbin/nologin', comment: 'Keel account web01.example.com' });
-    expect(agent.calls.slice(1, 7).map((c) => c.args.path)).toEqual(['public_html', 'mail', 'etc', 'tmp', 'logs', 'ssl'].map((s) => `/home/web01/${s}`));
-    expect(agent.calls.slice(1, 7).map((c) => c.args.mode)).toEqual(['0750', '0700', '0700', '0700', '0700', '0700']);
-    expect(agent.calls.slice(1, 7).every((c) => c.args.owner === 'web01')).toBe(true);
-    expect(agent.calls[7].args).toMatchObject({ path: '/home/web01/public_html/index.html', owner: 'web01', mode: '0644', backup: false });
-    expect(agent.calls[7].args.content).toContain('web01.example.com');
-    expect(agent.calls[8].args).toEqual({ username: 'web01', password: ACCOUNT_PASSWORD });
+    expect(agent.calls.slice(2, 8).map((c) => c.args.path)).toEqual(['public_html', 'mail', 'etc', 'tmp', 'logs', 'ssl'].map((s) => `/home/web01/${s}`));
+    expect(agent.calls.slice(2, 8).map((c) => c.args.mode)).toEqual(['0750', '0700', '0700', '0700', '0700', '0700']);
+    expect(agent.calls.slice(2, 8).every((c) => c.args.owner === 'web01')).toBe(true);
+    // public_html is readable by the web server's run user; the private directories keep the account's group.
+    expect(agent.calls.slice(2, 8).map((c) => c.args.group ?? null)).toEqual(['www-data', null, null, null, null, null]);
+    expect(agent.calls[8].args).toMatchObject({ path: '/home/web01/public_html/index.html', owner: 'web01', mode: '0644', backup: false });
+    expect(agent.calls[8].args.content).toContain('web01.example.com');
+    expect(agent.calls[9].args).toEqual({ username: 'web01', password: ACCOUNT_PASSWORD });
   });
 
   it('skips the password op when no password is given', async () => {
@@ -498,8 +501,8 @@ describe('rollback', () => {
     const res = await mutate(root, 'post', '/api/accounts', { username: 'rollback1', domain: 'rollback1.example.com', password: ACCOUNT_PASSWORD }, csrf);
     expect(res.status).toBeGreaterThanOrEqual(400);
     expect(res.body.error.code).toBe('command_failed');
-    expect(agent.names()).toEqual(['user.create', 'fs.mkdir', 'user.delete']);
-    expect(agent.calls[2].args).toEqual({ username: 'rollback1', removeHome: true });
+    expect(agent.names()).toEqual(['user.create', 'web.detect', 'fs.mkdir', 'user.delete']);
+    expect(agent.calls[3].args).toEqual({ username: 'rollback1', removeHome: true });
     expect(ctx.db.prepare('SELECT 1 FROM accounts WHERE username = ?').get('rollback1')).toBeUndefined();
     expect(ctx.db.prepare('SELECT 1 FROM account_domains WHERE domain = ?').get('rollback1.example.com')).toBeUndefined();
     expect((await root.get('/api/accounts/rollback1')).status).toBe(404);

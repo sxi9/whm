@@ -1,13 +1,17 @@
 # e2e — browser flows, screenshots and the live hub + panel flow
 
 All scripts run against a panel that serves the built client (`npm run build --workspace client`,
-then `WHM_SERVE_CLIENT=true`). Playwright with Chromium must be installed.
+then `WHM_SERVE_CLIENT=true`). Playwright with Chromium must be installed. With TLS on, the plain
+port (2086) only redirects (301) or refuses (426), so `BASE` defaults to the TLS listener
+`https://127.0.0.1:2087`; the installer's certificate is self-signed, which the scripts accept
+(`ignoreHTTPSErrors`, `curl -k`). Set `BASE=http://127.0.0.1:2086` for a panel running without TLS.
 
 | Script | What it does |
 |---|---|
-| `ui-check.cjs` | Playwright flow: login → create an account through the form → core pages → search → Phase-5 pages (License tab, Manage Plugins › Marketplace, WHM Marketplace) → cleanup. `BASE=http://127.0.0.1:2086 PASSWORD='<root pw>' node e2e/ui-check.cjs` |
+| `ui-check.cjs` | Playwright flow: login → create an account through the form → core pages → search → Phase-5 pages (License tab, Manage Plugins › Marketplace, WHM Marketplace) → cleanup. `BASE=https://127.0.0.1:2087 PASSWORD='<root pw>' node e2e/ui-check.cjs` |
+| `panel-check.cjs` | The account panel end to end: root creates an account and its panel login, the user visits every panel function, file and cron APIs, "Log in as". `BASE=https://127.0.0.1:2087 PASSWORD='<root pw>' node e2e/panel-check.cjs` |
 | `screenshot-all.cjs` | Every one of the 212 function pages plus the core pages, labelled, with gallery READMEs. |
-| `screenshots.sh` | Runs both into `docs/screenshots/`. `BASE=… PASSWORD='…' bash e2e/screenshots.sh` |
+| `screenshots.sh` | Runs all three into `docs/screenshots/`. `BASE=… PASSWORD='…' bash e2e/screenshots.sh` |
 | `live-hub-flow.sh` | The Phase-5 end-to-end flow against a real hub and a real panel (below). |
 
 ## Live hub + panel flow (`live-hub-flow.sh`)

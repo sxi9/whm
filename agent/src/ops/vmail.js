@@ -116,8 +116,12 @@ export function dovecotPresent() {
   return hasBinary('dovecot') || hasBinary('doveconf') || exists('/etc/dovecot');
 }
 
-function requireDovecotDir(ctx) {
+function requireDovecot() {
   if (!dovecotPresent()) throw new OpError('capability_missing', 'Dovecot is not installed on this server (no dovecot binary and no /etc/dovecot)');
+}
+
+function requireDovecotDir(ctx) {
+  requireDovecot();
   ctx.assertAllowedPath(DOVECOT_PASSWD_DIR, 'write');
   ensureManagedDir(path.dirname(DOVECOT_PASSWD_DIR), { mode: 0o755 });
   const gid = groupGid('dovecot');
@@ -137,19 +141,44 @@ export function eximRunUser() {
 
 // --------------------------------------------------------- passwd rendering ---
 
+// Dovecot 2.4 renamed the userdb fields the passwd line carries (mail ->
+// mail_driver + mail_path, quota_rule -> quota_storage_size); the key stays
+// local@domain on every version. Probed once per agent process.
+export const PASSWD_FORMATS = ['legacy', 'v24'];
+let dovecotFormatCache = null;
+export function dovecotFormatFromVersion(stdout) {
+  const m = String(stdout || '').trim().match(/^(\d+)\.(\d+)/);
+  return m && (Number(m[1]) > 2 || (Number(m[1]) === 2 && Number(m[2]) >= 4)) ? 'v24' : 'legacy';
+}
+export async function dovecotFormat() {
+  if (dovecotFormatCache) return dovecotFormatCache;
+  if (!hasBinary('dovecot')) return 'legacy';
+  const r = await exec('dovecot', ['--version'], { allowFailure: true, timeoutMs: 30_000 });
+  if (r.code !== 0) return 'legacy';
+  dovecotFormatCache = dovecotFormatFromVersion(r.stdout);
+  return dovecotFormatCache;
+}
+export const resetDovecotFormat = () => { dovecotFormatCache = null; };
+
+// The local part a passwd line is keyed by: "local@domain" today, a bare
+// local part in files written before the key carried the domain.
+export const passwdKeyLocal = (line) => String(line || '').split(':')[0].split('@')[0];
+
 // One Dovecot passwd-file line. Every field is re-validated here against the
 // file grammar, whatever the schema already checked, because this is the last
 // step before the bytes land on disk.
-export function renderPasswdLine({ localPart: local, hash: h, uid, gid, home, domain, quotaBytes: quota = null, disabled = false }) {
+export function renderPasswdLine({ localPart: local, hash: h, uid, gid, home, domain, quotaBytes: quota = null, disabled = false, format = 'legacy' }) {
   if (!LOCAL_PART.test(local)) throw new OpError('invalid_args', 'Invalid mailbox local part');
   if (!SHADOW_HASH.test(h) || h.includes(':')) throw new OpError('invalid_args', 'Invalid password hash');
   if (!Number.isInteger(uid) || uid < 0 || !Number.isInteger(gid) || gid < 0) throw new OpError('invalid_args', 'Invalid uid/gid');
   if (!HOME_FIELD.test(home)) throw new OpError('invalid_args', `Home directory "${home}" cannot be used in a passwd file`);
   if (!arg.domain.safeParse(domain).success) throw new OpError('invalid_args', 'Invalid domain');
-  const extra = [`userdb_mail=maildir:~/mail/${domain}/${local}`];
-  if (quota != null && quota > 0) extra.push(`userdb_quota_rule=*:bytes=${quota}`);
+  if (!PASSWD_FORMATS.includes(format)) throw new OpError('invalid_args', 'Unknown passwd format');
+  const v24 = format === 'v24';
+  const extra = v24 ? ['userdb_mail_driver=maildir', `userdb_mail_path=~/mail/${domain}/${local}`] : [`userdb_mail=maildir:~/mail/${domain}/${local}`];
+  if (quota != null && quota > 0) extra.push(v24 ? `userdb_quota_storage_size=${quota}` : `userdb_quota_rule=*:bytes=${quota}`);
   if (disabled) extra.push('nologin=y');
-  const line = `${local}:{SHA512-CRYPT}${h}:${uid}:${gid}::${home}::${extra.join(' ')}`;
+  const line = `${local}@${domain}:{SHA512-CRYPT}${h}:${uid}:${gid}::${home}::${extra.join(' ')}`;
   if (!SINGLE_LINE.test(line)) throw new OpError('invalid_args', 'Passwd line would span lines');
   return line;
 }
@@ -158,17 +187,17 @@ export function parsePasswdLine(line) {
   if (!line || line.startsWith('#')) return null;
   const parts = line.split(':');
   if (parts.length < 8) return null;
-  const [local, , uid, gid, , home] = parts;
+  const [key, , uid, gid, , home] = parts;
   const extra = parts.slice(7).join(':');
   const fields = Object.fromEntries(extra.split(/\s+/).filter(Boolean).map((kv) => { const i = kv.indexOf('='); return i < 0 ? [kv, true] : [kv.slice(0, i), kv.slice(i + 1)]; }));
-  const quota = fields.userdb_quota_rule?.match(/bytes=(\d+)/);
-  return { localPart: local, uid: Number(uid), gid: Number(gid), home, quotaBytes: quota ? Number(quota[1]) : null, disabled: fields.nologin === 'y' };
+  const quota = fields.userdb_quota_rule?.match(/bytes=(\d+)/) || fields.userdb_quota_storage_size?.match(/^(\d+)B?$/);
+  return { localPart: key.split('@')[0], uid: Number(uid), gid: Number(gid), home, quotaBytes: quota ? Number(quota[1]) : null, disabled: fields.nologin === 'y' };
 }
 
 export function upsertPasswdText(previous, local, line) {
   const lines = (previous || '').split('\n').filter((l) => l !== '');
   const body = lines.filter((l) => !l.startsWith('#'));
-  const idx = body.findIndex((l) => l.split(':')[0] === local);
+  const idx = body.findIndex((l) => passwdKeyLocal(l) === local);
   if (idx >= 0) body[idx] = line; else body.push(line);
   return `${MANAGED}\n${body.join('\n')}\n`;
 }
@@ -183,7 +212,7 @@ export function dropForeignPasswdLines(previous, uid) {
   const kept = body.filter((l) => {
     const parsed = parsePasswdLine(l);
     if (parsed && parsed.uid === uid) return true;
-    purged.push({ localPart: l.split(':')[0], uid: parsed?.uid ?? null });
+    purged.push({ localPart: passwdKeyLocal(l), uid: parsed?.uid ?? null });
     return false;
   });
   return { text: kept.length ? `${MANAGED}\n${kept.join('\n')}\n` : '', purged };
@@ -191,8 +220,52 @@ export function dropForeignPasswdLines(previous, uid) {
 
 export function removeFromPasswdText(previous, local) {
   const body = (previous || '').split('\n').filter((l) => l !== '' && !l.startsWith('#'));
-  const kept = body.filter((l) => l.split(':')[0] !== local);
+  const kept = body.filter((l) => passwdKeyLocal(l) !== local);
   return { text: kept.length ? `${MANAGED}\n${kept.join('\n')}\n` : '', removed: kept.length !== body.length, empty: kept.length === 0 };
+}
+
+// A line written before the key carried the domain (a bare local part) matches
+// neither Dovecot's lookup nor the Exim routers any more; it is re-keyed in
+// place as local@<file name>, with the quota/maildir fields renamed on
+// Dovecot 2.4. Lines already keyed by an address, comments and garbage are
+// left as they are, so a second pass changes nothing.
+export function rekeyPasswdText(previous, domain, format = 'legacy') {
+  const lines = (previous || '').split('\n').filter((l) => l !== '');
+  let changed = 0;
+  const out = lines.map((l) => {
+    const i = l.indexOf(':');
+    if (l.startsWith('#') || i <= 0) return l;
+    const key = l.slice(0, i);
+    if (key.includes('@') || !LOCAL_PART.test(key)) return l;
+    let rest = l.slice(i + 1);
+    if (format === 'v24') {
+      rest = rest.replace(/(^|[\s:])userdb_quota_rule=\*:bytes=(\d+)(?=\s|$)/, '$1userdb_quota_storage_size=$2');
+      rest = rest.replace(/(^|[\s:])userdb_mail=maildir:(\S+)/, '$1userdb_mail_driver=maildir userdb_mail_path=$2');
+    }
+    changed += 1;
+    return `${key}@${domain}:${rest}`;
+  });
+  return { text: out.length ? `${out.join('\n')}\n` : '', changed };
+}
+
+export function rekeyPasswdDir(dir, { format = 'legacy', gid = null, dryRun = false } = {}) {
+  const files = [];
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (err) {
+    if (err.code === 'ENOENT') return { dir, files, changed: 0 };
+    throw err;
+  }
+  for (const e of entries) {
+    // Only <domain> files: the .whm-bak/.whm-tmp-* neighbours writeAtomic leaves are skipped.
+    if (!e.isFile() || e.name.includes('.whm-') || !arg.domain.safeParse(e.name).success) continue;
+    const file = path.join(dir, e.name);
+    const previous = readText(file);
+    if (previous == null) continue;
+    const { text, changed } = rekeyPasswdText(previous, e.name, format);
+    if (changed && !dryRun) writeAtomic(file, text, { mode: 0o640, gid });
+    files.push({ domain: e.name, path: file, changed });
+  }
+  return { dir, files, changed: files.reduce((n, f) => n + f.changed, 0) };
 }
 
 const passwdFile = (domain) => path.join(DOVECOT_PASSWD_DIR, domain);
@@ -312,13 +385,31 @@ defineOp('vmail.passwd.set', {
     const home = path.resolve(info.home);
     ctx.assertAllowedPath(home, 'read');
     const file = ctx.assertAllowedPath(passwdFile(domain), 'write');
-    const line = renderPasswdLine({ localPart: local, hash: h, uid: info.uid, gid: info.gid, home, domain, quotaBytes: quota, disabled });
+    const format = await dovecotFormat();
+    const line = renderPasswdLine({ localPart: local, hash: h, uid: info.uid, gid: info.gid, home, domain, quotaBytes: quota, disabled, format });
     const previous = readText(file);
     const { text: own, purged } = dropForeignPasswdLines(previous, info.uid);
     writeAtomic(file, upsertPasswdText(own, local, line), { mode: 0o640, gid });
-    return { domain, localPart: local, path: file, uid: info.uid, gid: info.gid, home, quotaBytes: quota, disabled, replaced: Boolean(own && own.split('\n').some((l) => l.split(':')[0] === local)), purged };
+    return { domain, localPart: local, path: file, uid: info.uid, gid: info.gid, home, quotaBytes: quota, disabled, format, replaced: Boolean(own && own.split('\n').some((l) => !l.startsWith('#') && passwdKeyLocal(l) === local)), purged };
   },
 });
+
+defineOp('vmail.passwd.rekey', {
+  description: 'Re-key every Dovecot passwd-file line still keyed by a bare local part to local@domain (one-time upgrade; already-keyed lines are untouched, dryRun only counts)',
+  schema: z.object({ dryRun: z.boolean().default(false) }).strict(),
+  timeoutMs: 60_000,
+  run: async (args, ctx) => rekeyPasswd(args, ctx),
+});
+
+// A dry run only counts: it neither creates the passwd directory nor touches
+// its ownership, so a host without one is left exactly as found.
+export async function rekeyPasswd({ dryRun }, ctx, { dir: passwdDir = DOVECOT_PASSWD_DIR } = {}) {
+  let gid = null;
+  if (dryRun) requireDovecot(); else ({ gid } = requireDovecotDir(ctx));
+  const dir = ctx.assertAllowedPath(passwdDir, dryRun ? 'read' : 'write');
+  const format = await dovecotFormat();
+  return { format, dryRun, ...rekeyPasswdDir(dir, { format, gid, dryRun }) };
+}
 
 defineOp('vmail.passwd.purge', {
   description: 'Delete the whole Dovecot passwd-file of a domain (every mailbox line) when the domain leaves its hosting account',
@@ -522,7 +613,8 @@ defineOp('vmail.render.check', {
   schema: z.object({}).strict(),
   timeoutMs: 120_000,
   run: async () => {
-    const out = { dovecot: { installed: false, configOk: null, output: null }, exim: { installed: false, configOk: null, output: null }, routerHooked: false, transportHooked: false, authHooked: false, hint: null };
+    const out = { dovecot: { installed: false, version: null, configOk: null, output: null }, exim: { installed: false, configOk: null, output: null }, routerHooked: false, transportHooked: false, authHooked: false, hint: null };
+    if (hasBinary('dovecot')) { const v = await exec('dovecot', ['--version'], { allowFailure: true, timeoutMs: 30_000 }); out.dovecot.version = v.code === 0 ? v.stdout.trim().split(/\s+/)[0] || null : null; }
     if (hasBinary('doveconf')) {
       out.dovecot.installed = true;
       const r = await exec('doveconf', ['-n'], { allowFailure: true, timeoutMs: 60_000 });

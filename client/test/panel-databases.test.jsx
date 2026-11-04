@@ -2,6 +2,8 @@ import { describe, it, expect, vi } from 'vitest';
 import React, { createElement as h } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
+import fs from 'node:fs';
+import path from 'node:path';
 
 const fixtures = vi.hoisted(() => ({ responses: new Map() }));
 
@@ -21,7 +23,8 @@ const { default: Users, summarizeGrants, filterUsers } = await import('../src/pa
 const { default: RemoteHosts, describeHost } = await import('../src/pages/panel/databases/remote-hosts.jsx');
 const { default: PhpMyAdmin, loginUrl } = await import('../src/pages/panel/databases/phpmyadmin.jsx');
 const { PrivilegeGrid, buildMatrix, togglePrivilege, toPayload } = await import('../src/pages/panel/databases/parts/GrantsEditor.jsx');
-const { PRIVILEGES } = await import('../src/pages/panel/databases/parts/shared.jsx');
+const { PRIVILEGES, jobStreamPath } = await import('../src/pages/panel/databases/parts/shared.jsx');
+const { systemJobStreamPath } = await import('../src/components/ProgressLog.jsx');
 
 React.useLayoutEffect = React.useEffect;
 
@@ -119,6 +122,14 @@ describe('Databases page', () => {
     expect(html).toContain('Database server unreachable');
     expect(html).toContain('No databases yet. Create one above');
     expect(html).toContain('No limit on databases in this plan');
+  });
+
+  it('follows check and dump jobs on the panel job stream, never the reseller-only /system/jobs', () => {
+    expect(jobStreamPath('abc')).toBe('/panel/databases/jobs/abc/stream');
+    expect(systemJobStreamPath('abc')).toBe('/system/jobs/abc/stream');
+    const src = fs.readFileSync(path.resolve(__dirname, '../src/pages/panel/databases/parts/shared.jsx'), 'utf8');
+    expect(src).not.toMatch(/system\/jobs\/\$\{/);
+    expect(src).toContain('streamPath={jobStreamPath}');
   });
 
   it('quotaOf falls back to the session and filterRows matches names and users', () => {

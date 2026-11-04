@@ -70,8 +70,8 @@ destroying its sessions (`panel.user.remove` in the audit log).
 
 ## C.2 Signing in and where it lands
 
-Account users sign in on the **same login page** as administrators (`http://server:2086/login`,
-`https://server:2087/login` when TLS is configured, see Part A *Signing in*) with the account
+Account users sign in on the **same login page** as administrators (`https://server:2087/login`;
+`http://server:2086` only redirects there once TLS is configured, see Part A *Signing in*) with the account
 username and password. After a successful login a role-`user` session lands on **`/panel`**
 (`client/src/auth/home.js` `landingFor`); a remembered location is honoured only when it is inside
 `/panel`, so a user is never sent to a console route and an administrator is never bounced into
@@ -313,7 +313,8 @@ that before delegating.
 - **Server:** `POST /domains/addon` → `409 exists` if the domain is hosted anywhere on this server
   (another account's main domain, addon, subdomain or zone); otherwise the zone is created with the
   account's IP and the owner's nameservers (*DNS Functions*), the document root is created as the
-  account (`0750`), the row is stored, mail routing is set to *local* and the account's vhosts are
+  account (`0750` with the web server's run user as its group, like `public_html`; `0755` when no
+  web server is detected), the row is stored, mail routing is set to *local* and the account's vhosts are
   regenerated. `DELETE /domains/addon/:domain?removeZone&removeDocroot` uninstalls the certificate
   if one is installed, removes the vhost, deletes the zone and any redirect, drops the row and the
   mail domain, and optionally removes the document root **as the account** (the home and
@@ -332,7 +333,8 @@ that before delegating.
 - **Screen:** *Label* (letters, digits and `-`, 63 characters), *Parent* (the main domain or one of
   your addon domains), *Document root* (default `public_html/<label>`). *Remove* with *Remove the
   document root*.
-- **Server:** `POST /domains/sub` creates the directory as the account, stores the row, adds an
+- **Server:** `POST /domains/sub` creates the directory as the account (same mode and group as an
+  addon document root), stores the row, adds an
   `A` record (and `AAAA` when the account has an IPv6 address) for the full name to the parent's
   zone **when this account owns that zone**, and regenerates the vhosts. `DELETE /domains/sub/:fqdn`
   removes the vhost, clears those records and the row.
@@ -464,12 +466,27 @@ Routes under `/files` (`services/panel-files.js`); the whole group needs the pla
 
 Routes under `/email` (`services/panel-email.js`); agent ops `vmail.*` (capabilities `dovecot`
 and `exim`). Mailboxes are **virtual users**: a Dovecot passwd-file per domain under
-`/etc/dovecot/whm/passwd/`, maildirs under `~/mail/<domain>/<local>/` owned by the account, and
-Exim alias, forwarding, autoresponder and spam lists under the Exim configuration directory. The
-first mailbox mutation on a server also applies the Dovecot/Exim virtual-mail wiring through
-*Service Configuration* (the `whm_virtual_user` router and the `dovecot_plain` authenticator);
-when Exim is installed but still ignores the panel's lists the answer carries the warning
-`routing_not_applied` with a hint for the administrator.
+`/etc/dovecot/whm/passwd/<domain>` (root:dovecot 0640; one line per mailbox **keyed by
+`local@domain`**, with the account's uid/gid/home and the maildir and quota fields in the form the
+installed Dovecot reads — `userdb_mail=maildir:…` / `userdb_quota_rule=*:bytes=N` on 2.3,
+`userdb_mail_driver` / `userdb_mail_path` / `userdb_quota_storage_size=N` on 2.4, detected with
+`dovecot --version`), maildirs under `~/mail/<domain>/<local>/` owned by the account, and
+Exim alias, forwarding, autoresponder and spam lists under the Exim configuration directory.
+The Dovecot/Exim wiring (the `98-whm-virtual-auth.conf` include, the `whm_virtual_user` router,
+the `whm_dovecot_lmtp` transport and the `dovecot_plain` authenticator) is applied by *Service
+Configuration* as the job **`panel.virtual_mail.ensure`**: queued once at boot when the panel is
+enabled and both daemons exist, and again by the first mailbox creation that finds the wiring not
+live; the apply also re-keys, once, any passwd line a release before this one wrote with a bare
+local part (`vmail.passwd.rekey`, idempotent). Administrators see and trigger it under
+`GET /api/service-config/virtual-mail` and `POST /api/service-config/virtual-mail/apply
+{ enabled }` (*Service Configuration › Exim Configuration Manager*). When Exim is installed but
+still ignores the panel's lists the answer carries the warning `routing_not_applied` with a hint
+for the administrator; on an **unsplit Debian** template or a monolithic RHEL config the agent
+cannot hook the three driver files itself and the status lists the one-time lines to add by hand
+(`.include_if_exists /etc/exim4/whm/router_whm_virtual_mail.conf` after `begin routers` and before
+the local-delivery routers, the transport and authenticator lines after their `begin` sections —
+`.include_if_exists` so Exim stays valid when the feature is switched off and the files are
+removed), followed by `update-exim4.conf` and a reload.
 
 #### 6.1 Email accounts
 
@@ -481,8 +498,11 @@ when Exim is installed but still ignores the panel's lists the answer carries th
   (strength policy, `email` context), *Quota* in MB (default `panel.mail.default_quota_mb`, 1024;
   `0` or blank for unlimited); per mailbox *Change password*, *Change quota*, *Suspend/Unsuspend*
   (login disabled, mail still delivered), *Delete* with *Also delete the mail*, and **Client
-  settings** (IMAP 993 / 143, POP3 995 / 110 as the Dovecot protocols allow, SMTP 465 or 587 with
-  STARTTLS, the server hostname, the webmail URL).
+  settings** (IMAP 993 / 143, POP3 995 / 110 as the Dovecot protocols allow, SMTP as Exim really
+  listens: 25 with STARTTLS by default, 587 with STARTTLS once the administrator enabled the
+  Exim setting **`submissionPorts`**, and 465 with TLS on connect (587 as the alternative) only when
+  a TLS preset from *SSL/TLS Configuration* is also applied to Exim; password authentication is
+  advertised only while the virtual-mail wiring is live; the server hostname, the webmail URL).
 - **Server:** `GET /email/accounts`, `POST /email/accounts` (the mail domain is claimed for this
   account — `409` when it belongs to another account —, the password is hashed as SHA512-CRYPT by
   `doveadm pw` or `openssl passwd -6` with the secret on stdin, the maildir is created as the
@@ -981,9 +1001,13 @@ per-field hints. Console-wide codes (`validation_failed`, `agent_unavailable`, `
   mutation came back `applied: false`; the panel record exists and the host change is made once the
   daemon is present (the password change does not tolerate this under `NODE_ENV=production`).
 - **Mailboxes exist but cannot log in over IMAP/SMTP.** Exim or Dovecot still ignore the panel's
-  virtual-user files: the first mailbox mutation applies the wiring through *Service
-  Configuration*; the Security Advisor and the `routing_not_applied` warning say which part is
-  missing (`routerHooked`, `authHooked` from `vmail.render.check`).
+  virtual-user files: the job `panel.virtual_mail.ensure` (boot, first mailbox creation) or
+  `POST /api/service-config/virtual-mail/apply` applies the wiring through *Service
+  Configuration*; the Security Advisor, the `routing_not_applied` warning and the status route's
+  `manualIncludes` say which part is missing (`routerHooked`, `authHooked` from
+  `vmail.render.check`) and which `.include_if_exists` line an unsplit Debian host still needs.
+  Mailboxes created by a release whose passwd lines were keyed by the bare local part start
+  working again after that apply (`vmail.passwd.rekey` rewrites them as `local@domain`).
 - **"Log in as" opens the panel and immediately shows "The session has ended".** The TTL elapsed
   before the tab loaded (raise `loginAsTtlMinutes`), the reseller lost `login-as`, or the account
   was suspended between the click and the first request.

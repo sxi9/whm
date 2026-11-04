@@ -408,17 +408,24 @@ reports slots/hooks/`live`.
   the router slot also reports `precedes` (false when a local-delivery router comes first, which is a hint and
   makes the apply not live). `web.exim.include.write/remove` take the three new slot names; `web.dovecot.include.*`
   take `name` ∈ {`97-whm-mailserver.conf`, `98-whm-virtual-auth.conf`} (an enum, no paths).
-- **Rendering (service, exported for tests):** `renderDovecotVirtualAuth` (passwd-file passdb/userdb on
-  `<passwdDir>/%d`, `username_filter = *@*`, `result_success = return-ok` / `result_failure = continue`; the
-  stock system passdb/userdb of `10-auth.conf` run first because conf.d sorts `98-` after it and fall through on
-  failure, so Linux accounts never reach the passwd files and virtual addresses never reach PAM successfully;
-  `mail_plugins quota` with rules from `userdb_quota_rule`; `service auth { unix_listener auth-client }` and
-  `service lmtp { unix_listener lmtp }` opened 0660 to the Exim user/group), `renderEximVirtualRouters`
+- **Rendering (service, exported for tests):** `renderDovecotVirtualAuth({ passwdDir, eximUser, eximGroup, version })`
+  (passwd-file passdb/userdb on `<passwdDir>/%d` — `passwd_file_path = <passwdDir>/%{user | domain}` in the
+  named-section syntax of Dovecot 2.4, chosen by `dovecotIsV24(version)` from `web.dovecot.detect` —,
+  `username_filter = *@*`, `result_success = return-ok` / `result_failure = continue`, no `username_format`: every
+  passwd line is **keyed by `local@domain`**, the login name on both versions; the stock system passdb/userdb of
+  `10-auth.conf` run first because conf.d sorts `98-` after it and fall through on failure, so Linux accounts
+  never reach the passwd files and virtual addresses never reach PAM successfully; `mail_plugins quota` with the
+  limit from the passwd line — `userdb_quota_rule=*:bytes=N` with `userdb_mail=maildir:~/mail/<domain>/<local>`
+  on 2.3, `userdb_quota_storage_size=N` with `userdb_mail_driver=maildir userdb_mail_path=…` on 2.4, written by
+  `vmail.passwd.set` after one `dovecot --version` probe per agent process (`dovecotFormat()`); `service auth {
+  unix_listener auth-client }` and `service lmtp { unix_listener lmtp }` opened 0660 to the Exim user/group),
+  `renderEximVirtualRouters`
   (`whm_domain_forward` → `whm_aliases_copy` (unseen, mailbox exists) → `whm_aliases` → `whm_autoreply` (unseen,
   no-loop conditions) → `whm_virtual_user` → `whm_aliases_default`; every `domains`/`local_parts` list is
   `${if exists{FILE}{lookup;FILE}{}}` because an unopenable lookup file in a list is fatal in Exim, and every file
   name is built from `$domain_data`/`$local_part_data` (dsearch/lsearch results, untainted) — never from
-  `$domain`/`$local_part`; redirects carry `forbid_pipe forbid_file allow_fail allow_defer`),
+  `$domain`/`$local_part`; a mailbox is found with `lookup{$local_part@$domain_data}lsearch{<passwdDir>/$domain_data}`,
+  the same key the passwd line carries; redirects carry `forbid_pipe forbid_file allow_fail allow_defer`),
   `renderEximVirtualTransports` (`whm_dovecot_lmtp` lmtp over `<dovecotBaseDir>/lmtp`, `whm_autoreply` with
   `once = <autoreplyOnceDir>/<local>@<domain>.db`), `renderEximVirtualAuths` (`dovecot_plain`/`dovecot_login`,
   `server_advertise_condition` only when Exim Configuration Manager's `requireTlsForAuth` is on — the auth slot is
@@ -428,13 +435,38 @@ reports slots/hooks/`live`.
 - **Apply order:** `web.vmail.prepare { enabled: true }` (creates the four directories — passwd dir 0750
   root:dovecot, aliases/autoresponders 0755 root, once-db dir 0750 owned by the Exim user — and adds the Exim user
   to group `dovecot` with `gpasswd -a`, because routing and RCPT-time recipient verification run as the Exim user
-  and must read the root:dovecot 0640 passwd files; `{ enabled: false }` removes the membership) → Dovecot include
+  and must read the root:dovecot 0640 passwd files; `{ enabled: false }` removes the membership) →
+  `vmail.passwd.rekey {}` (one-time upgrade of every `<passwdDir>/<domain>` file: a line still keyed by a bare
+  local part — written before the key carried the domain — becomes `local@<domain>:…`, with the 2.3 maildir/quota
+  fields renamed on a 2.4 host; already-keyed lines, the header and anything unparseable are untouched, so a second
+  run reports `changed: 0`; atomic write 0640 root:dovecot; `{ dryRun: true }` only counts; an agent without the
+  op does not block the apply, the result carries `rekeyed.error` and a warning) → Dovecot include
   (validated with `doveconf -n`, rolled back on error) → Exim `transport`, `router` (no reload) → `exim.apply`
   (`acl_data`, `acl_rcpt`, `auth`, `main`; reload on main). Fragments identical to what the host has are not
-  rewritten (the panel calls this at every boot); `web.vmail.prepare` always runs. Disable removes the three slots,
+  rewritten; `web.vmail.prepare` and the re-key always run. Disable removes the three slots,
   re-renders main/data ACL without spam, removes the Dovecot include. Audit `virtual_mail.apply` + `virtual_mail.applied`;
-  `service_config_applies.virtual_mail` records `live`. Missing Exim/Dovecot: CapabilityError (501) when enabling,
-  `{ applied: false, reason: 'capability_missing' }` when disabling; the switch is saved either way.
+  `service_config_applies.virtual_mail` records `live` (`ctx.web.virtualMail.lastApplied()`). Missing Exim/Dovecot:
+  CapabilityError (501) when enabling, `{ applied: false, reason: 'capability_missing' }` when disabling; the switch
+  is saved either way.
+- **Who calls it:** never a customer request. The panel runs it as the job `panel.virtual_mail.ensure`
+  (`ctx.panelEmail.ensureVirtualMail(null, { force })`, memoised with a 10-minute backoff): queued once at boot by
+  `routes/panel/email.js` through `ctx.panelEmail.requestVirtualMail('boot')` after the capability snapshot exists,
+  and again by the first mailbox mutation that finds the wiring not live (`requestVirtualMail('mailbox')`); the
+  request queues nothing when `panel.enabled` is off, Exim or Dovecot is missing, or a queued/running job of that
+  type exists. Root triggers it from Service Configuration: `GET /api/service-config/virtual-mail` (status: slots,
+  hooks, `live`, `check` from `vmail.render.check`, `manualIncludes`, `submissionPorts`, `lastApply`) and
+  `POST /api/service-config/virtual-mail/apply { enabled }`.
+- **Driver slots the agent cannot hook** (unsplit Debian template, monolithic RHEL config): `status().exim.manualIncludes`
+  / `apply().manualIncludes` list `{ slot, section, file, line, where }` with `line = ".include_if_exists <slot
+  file>"`, to be added once by the operator after `begin routers|transports|authenticators` (the router before the
+  local-delivery routers), then `update-exim4.conf` and reload; `.include_if_exists` rather than `.include` because
+  disabling the feature unlinks the slot files (`web.exim.include.remove`) and Exim must stay valid. `web.exim.detect`'s
+  `hints` say the same.
+- **Exim `submissionPorts`** (`service_config.exim`, default false): `renderEximMain` adds `daemon_smtp_ports = 25 : 587`
+  (STARTTLS), and `25 : 465 : 587` + `tls_on_connect_ports = 465` only once `exim.tls` (the preset from
+  `applyEximTls`) exists — TLS on connect without a certificate would refuse every connection. The panel's
+  `GET /email/accounts/:id/client-settings` advertises exactly that: 25/STARTTLS, 587/STARTTLS, or 465 with 587 as the
+  alternative; `auth: 'password'` only while the wiring is live.
 - **File formats the fragments read** (the panel's `vmail.*` ops write them; all under `<whmDir>/` must be readable
   by the Exim user, 0644): `aliases/<domain>` lsearch `local: a@b, :fail:, :blackhole:` with `*` as the default
   address; `domainfwd.lst` lsearch `domain: target-domain`; `autoresponders/<domain>/<local>` = body,

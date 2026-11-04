@@ -3,8 +3,12 @@ import { runOp, createContext, OpError, catalog } from '../src/lib.js';
 import {
   renderPasswdLine, parsePasswdLine, upsertPasswdText, removeFromPasswdText, dropForeignPasswdLines, renderAliases, renderDomainForwards,
   renderSpamUsers, renderAutoresponderConf, autoreplyOnceFiles, parseDoveadmQuota, LOCAL_PART, EMAIL_TARGET, HOME_FIELD, MANAGED,
-  AUTORESPONDER_KEYS, DOVECOT_PASSWD_DIR, AUTOREPLY_DB_DIR,
+  AUTORESPONDER_KEYS, DOVECOT_PASSWD_DIR, AUTOREPLY_DB_DIR, dovecotFormat, dovecotFormatFromVersion, resetDovecotFormat, passwdKeyLocal,
+  rekeyPasswdText, rekeyPasswdDir, rekeyPasswd,
 } from '../src/ops/vmail.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { SHADOW_HASH } from '../src/ops/transfer.js';
 import { renderEximVirtualRouters, renderEximVirtualTransports, renderEximSpamAcl, VMAIL_NAMES } from '../../server/src/services/service-configuration.js';
 
@@ -35,7 +39,7 @@ async function invalid(name, args) {
 
 describe('vmail op catalog', () => {
   it('registers the family with the destructive flags of the design', () => {
-    const ops = ['vmail.hash', 'vmail.passwd.set', 'vmail.passwd.remove', 'vmail.passwd.purge', 'vmail.passwd.list', 'vmail.quota.get', 'vmail.aliases.write', 'vmail.aliases.remove', 'vmail.domainfwd.write', 'vmail.autoresponder.write', 'vmail.autoresponder.remove', 'vmail.spam_users.write', 'vmail.render.check'];
+    const ops = ['vmail.hash', 'vmail.passwd.set', 'vmail.passwd.remove', 'vmail.passwd.purge', 'vmail.passwd.list', 'vmail.passwd.rekey', 'vmail.quota.get', 'vmail.aliases.write', 'vmail.aliases.remove', 'vmail.domainfwd.write', 'vmail.autoresponder.write', 'vmail.autoresponder.remove', 'vmail.spam_users.write', 'vmail.render.check'];
     for (const name of ops) expect(catalog.has(name), name).toBe(true);
     for (const name of ['vmail.passwd.remove', 'vmail.passwd.purge', 'vmail.aliases.remove', 'vmail.autoresponder.remove']) expect(catalog.get(name).destructive, name).toBe(true);
     for (const name of ops.filter((n) => !n.endsWith('.remove') && !n.endsWith('.purge'))) expect(catalog.get(name).destructive, name).toBe(false);
@@ -49,6 +53,8 @@ describe('vmail op catalog', () => {
     await invalid('vmail.aliases.write', { domain: 'alice.com', entries: [], reload: true });
     await invalid('vmail.render.check', { verbose: true });
     await invalid('vmail.quota.get', { user: 'a@alice.com', force: true });
+    await invalid('vmail.passwd.rekey', { dryRun: 'yes' });
+    await invalid('vmail.passwd.rekey', { domain: 'alice.com' });
   });
 });
 
@@ -121,17 +127,115 @@ describe('vmail.passwd.* schemas', () => {
     expect(['capability_missing', 'refused', 'not_found', 'path_not_allowed']).toContain(err.code);
     expect(exec).not.toHaveBeenCalled();
   });
+
+});
+
+describe('passwd re-key (lines written before the key carried the domain)', () => {
+  const legacy = (local, extra = '') => `${local}:{SHA512-CRYPT}${HASH}:1001:1001::/home/alice::userdb_mail=maildir:~/mail/alice.com/${local}${extra}`;
+  const keyed = `info@alice.com:{SHA512-CRYPT}${HASH}:1001:1001::/home/alice::userdb_mail=maildir:~/mail/alice.com/info userdb_quota_rule=*:bytes=2048`;
+
+  it('re-keys only bare local parts, keeps the header, and is a no-op the second time', () => {
+    const text = `${MANAGED}\n${keyed}\n${legacy('sales', ' userdb_quota_rule=*:bytes=4096 nologin=y')}\n`;
+    const r = rekeyPasswdText(text, 'alice.com');
+    expect(r.changed).toBe(1);
+    expect(r.text.split('\n').filter(Boolean)).toEqual([MANAGED, keyed, `sales@alice.com:{SHA512-CRYPT}${HASH}:1001:1001::/home/alice::userdb_mail=maildir:~/mail/alice.com/sales userdb_quota_rule=*:bytes=4096 nologin=y`]);
+    expect(parsePasswdLine(r.text.split('\n')[2])).toEqual({ localPart: 'sales', uid: 1001, gid: 1001, home: '/home/alice', quotaBytes: 4096, disabled: true });
+    expect(rekeyPasswdText(r.text, 'alice.com')).toEqual({ text: r.text, changed: 0 });
+    expect(rekeyPasswdText('', 'alice.com')).toEqual({ text: '', changed: 0 });
+    expect(rekeyPasswdText(null, 'alice.com')).toEqual({ text: '', changed: 0 });
+    // Garbage is neither re-keyed nor dropped.
+    expect(rekeyPasswdText(`${MANAGED}\ngarbage-line\nIn fo:x\n`, 'alice.com')).toEqual({ text: `${MANAGED}\ngarbage-line\nIn fo:x\n`, changed: 0 });
+  });
+
+  it('renames the maildir and quota fields on Dovecot 2.4 while re-keying', () => {
+    const r = rekeyPasswdText(`${MANAGED}\n${legacy('sales', ' userdb_quota_rule=*:bytes=4096')}\n${keyed}\n`, 'alice.com', 'v24');
+    expect(r.changed).toBe(1);
+    expect(r.text.split('\n')[1]).toBe(`sales@alice.com:{SHA512-CRYPT}${HASH}:1001:1001::/home/alice::userdb_mail_driver=maildir userdb_mail_path=~/mail/alice.com/sales userdb_quota_storage_size=4096`);
+    expect(r.text.split('\n')[2]).toBe(keyed);
+    expect(parsePasswdLine(r.text.split('\n')[1])).toMatchObject({ localPart: 'sales', quotaBytes: 4096 });
+  });
+
+  it('rewrites every <domain> file of a directory in place with counts, skipping backups and already-keyed files', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-vmail-rekey-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'alice.com'), `${MANAGED}\n${legacy('info')}\n${legacy('sales')}\n`);
+      fs.writeFileSync(path.join(dir, 'bob.com'), `${MANAGED}\n${keyed.replace('alice.com', 'bob.com')}\n`);
+      fs.writeFileSync(path.join(dir, 'alice.com.whm-bak'), `${MANAGED}\n${legacy('old')}\n`);
+      const dry = rekeyPasswdDir(dir, { dryRun: true });
+      expect(dry).toMatchObject({ dir, changed: 2, files: [{ domain: 'alice.com', changed: 2 }, { domain: 'bob.com', changed: 0 }] });
+      expect(fs.readFileSync(path.join(dir, 'alice.com'), 'utf8')).toContain(`\n${legacy('info')}\n`);
+      const r = rekeyPasswdDir(dir);
+      expect(r.changed).toBe(2);
+      const after = fs.readFileSync(path.join(dir, 'alice.com'), 'utf8');
+      expect(after.split('\n').filter(Boolean).map((l) => (l.startsWith('#') ? l : l.split(':')[0]))).toEqual([MANAGED, 'info@alice.com', 'sales@alice.com']);
+      if (process.platform !== 'win32') expect(fs.statSync(path.join(dir, 'alice.com')).mode & 0o777).toBe(0o640);
+      expect(fs.readFileSync(path.join(dir, 'alice.com.whm-bak'), 'utf8')).toContain(`\n${legacy('info')}\n`);
+      expect(rekeyPasswdDir(dir)).toMatchObject({ changed: 0, files: [{ domain: 'alice.com', changed: 0 }, { domain: 'bob.com', changed: 0 }] });
+      expect(fs.readFileSync(path.join(dir, 'alice.com'), 'utf8')).toBe(after);
+      expect(rekeyPasswdDir(path.join(dir, 'missing'))).toEqual({ dir: path.join(dir, 'missing'), files: [], changed: 0 });
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('a dry run of the op has no side effects: a missing passwd directory is neither created nor claimed', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-vmail-rekey-dry-'));
+    const dir = path.join(base, 'dovecot', 'whm', 'passwd');
+    const real = (await vi.importActual('../src/exec.js')).hasBinary;
+    hasBinary.mockImplementation((bin) => bin === 'dovecot' || real(bin));
+    exec.mockClear();
+    try {
+      resetDovecotFormat();
+      exec.mockImplementationOnce(async () => ({ code: 0, stdout: '2.3.21\n', stderr: '' }));
+      const r = await rekeyPasswd({ dryRun: true }, createContext({ allowedRoots: [base] }), { dir });
+      expect(r).toEqual({ format: 'legacy', dryRun: true, dir, files: [], changed: 0 });
+      expect(fs.existsSync(dir)).toBe(false);
+      expect(fs.existsSync(path.dirname(dir))).toBe(false);
+      expect(fs.readdirSync(base)).toEqual([]);
+      expect(exec.mock.calls.map(([bin]) => bin)).toEqual(['dovecot']);
+      // Outside the allowed roots a dry run is still refused, and never as a write.
+      expect((await opError(rekeyPasswd({ dryRun: true }, createContext({ allowedRoots: ['/nowhere'] }), { dir }))).code).toBe('path_not_allowed');
+      expect(fs.readdirSync(base)).toEqual([]);
+    } finally {
+      resetDovecotFormat();
+      hasBinary.mockImplementation(real);
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('passwd line rendering', () => {
   const base = { localPart: 'info', hash: HASH, uid: 1001, gid: 1001, home: '/home/alice', domain: 'alice.com' };
 
-  it('renders the Dovecot passwd-file line with maildir, quota and nologin fields', () => {
+  it('renders the Dovecot passwd-file line keyed by the full address with maildir, quota and nologin fields', () => {
     const line = renderPasswdLine({ ...base, quotaBytes: 2048, disabled: true });
-    expect(line).toBe(`info:{SHA512-CRYPT}${HASH}:1001:1001::/home/alice::userdb_mail=maildir:~/mail/alice.com/info userdb_quota_rule=*:bytes=2048 nologin=y`);
+    expect(line).toBe(`info@alice.com:{SHA512-CRYPT}${HASH}:1001:1001::/home/alice::userdb_mail=maildir:~/mail/alice.com/info userdb_quota_rule=*:bytes=2048 nologin=y`);
     expect(renderPasswdLine({ ...base, quotaBytes: null })).not.toContain('quota_rule');
     expect(renderPasswdLine({ ...base, quotaBytes: 0 })).not.toContain('quota_rule');
     expect(parsePasswdLine(line)).toEqual({ localPart: 'info', uid: 1001, gid: 1001, home: '/home/alice', quotaBytes: 2048, disabled: true });
+    // Dovecot 2.4 field names; the parser reads both formats and legacy lines keyed by the bare local part.
+    const v24 = renderPasswdLine({ ...base, quotaBytes: 2048, disabled: true, format: 'v24' });
+    expect(v24).toBe(`info@alice.com:{SHA512-CRYPT}${HASH}:1001:1001::/home/alice::userdb_mail_driver=maildir userdb_mail_path=~/mail/alice.com/info userdb_quota_storage_size=2048 nologin=y`);
+    expect(renderPasswdLine({ ...base, format: 'v24' })).not.toContain('quota');
+    expect(parsePasswdLine(v24)).toEqual({ localPart: 'info', uid: 1001, gid: 1001, home: '/home/alice', quotaBytes: 2048, disabled: true });
+    expect(parsePasswdLine(`info:{SHA512-CRYPT}${HASH}:1001:1001::/home/alice::userdb_mail=maildir:~/mail/alice.com/info`)).toMatchObject({ localPart: 'info', quotaBytes: null, disabled: false });
+    expect(() => renderPasswdLine({ ...base, format: 'v25' })).toThrow(OpError);
+    expect([dovecotFormatFromVersion('2.4.2 (0962ed2104)'), dovecotFormatFromVersion('2.3.21 (47349e2482)'), dovecotFormatFromVersion('3.0.0'), dovecotFormatFromVersion('')]).toEqual(['v24', 'legacy', 'v24', 'legacy']);
+    expect([passwdKeyLocal(v24), passwdKeyLocal('sales:x'), passwdKeyLocal('')]).toEqual(['info', 'sales', '']);
+  });
+
+  it('dovecotFormat() asks dovecot --version once and answers legacy without the binary', async () => {
+    resetDovecotFormat();
+    hasBinary.mockImplementationOnce(() => false);
+    exec.mockClear();
+    expect(await dovecotFormat()).toBe('legacy');
+    expect(exec).not.toHaveBeenCalled();
+    hasBinary.mockImplementationOnce(() => true);
+    exec.mockImplementationOnce(async () => ({ code: 0, stdout: '2.4.2 (0962ed2104)\n', stderr: '' }));
+    expect(await dovecotFormat()).toBe('v24');
+    expect(exec).toHaveBeenCalledWith('dovecot', ['--version'], expect.objectContaining({ allowFailure: true }));
+    exec.mockClear();
+    expect(await dovecotFormat()).toBe('v24');
+    expect(exec).not.toHaveBeenCalled();
+    resetDovecotFormat();
   });
 
   it('refuses every field that could become a second field, line or expansion', () => {
@@ -149,6 +253,10 @@ describe('passwd line rendering', () => {
     const b = renderPasswdLine({ ...base, localPart: 'b' });
     const text = upsertPasswdText(upsertPasswdText(null, 'a', a), 'b', b);
     expect(text.split('\n').filter(Boolean)).toEqual([MANAGED, a, b]);
+    // A line written before the key carried the domain is replaced, not duplicated.
+    const legacy = `a:{SHA512-CRYPT}${HASH}:1001:1001::/home/alice::userdb_mail=maildir:~/mail/alice.com/a`;
+    expect(upsertPasswdText(`${MANAGED}\n${legacy}\n${b}\n`, 'a', a).split('\n').filter(Boolean)).toEqual([MANAGED, a, b]);
+    expect(removeFromPasswdText(`${MANAGED}\n${legacy}\n${b}\n`, 'a')).toMatchObject({ removed: true, empty: false });
     const a2 = renderPasswdLine({ ...base, localPart: 'a', disabled: true });
     const replaced = upsertPasswdText(text, 'a', a2);
     expect(replaced.split('\n').filter(Boolean)).toEqual([MANAGED, a2, b]);
@@ -168,7 +276,7 @@ describe('passwd line rendering', () => {
     expect(r.purged).toEqual([{ localPart: 'ceo', uid: 1002 }, { localPart: 'cfo', uid: 1003 }]);
     expect(r.text.split('\n').filter(Boolean)).toEqual([MANAGED, mine]);
     const next = upsertPasswdText(r.text, 'sales', renderPasswdLine({ ...base, localPart: 'sales' }));
-    expect(next.split('\n').filter(Boolean).map((l) => (l.startsWith('#') ? l : l.split(':')[0]))).toEqual([MANAGED, 'info', 'sales']);
+    expect(next.split('\n').filter(Boolean).map((l) => (l.startsWith('#') ? l : passwdKeyLocal(l)))).toEqual([MANAGED, 'info', 'sales']);
     expect(next.split('\n').filter((l) => l && !l.startsWith('#')).every((l) => parsePasswdLine(l).uid === 1001)).toBe(true);
     expect(dropForeignPasswdLines(null, 1001)).toEqual({ text: '', purged: [] });
     expect(dropForeignPasswdLines(`${MANAGED}\ngarbage-line\n`, 1001).purged).toEqual([{ localPart: 'garbage-line', uid: null }]);
@@ -292,7 +400,10 @@ describe('parity with service-configuration\'s virtual-mail fragments', () => {
 
   it('passwd, aliases and domainfwd files are where the routers look', () => {
     expect(routers).toContain(`dsearch;${DOVECOT_PASSWD_DIR}}`);
-    expect(routers).toContain(`lsearch;${DOVECOT_PASSWD_DIR}/$domain_data}`);
+    // The routers look a mailbox up by the same key the passwd line carries: local@domain.
+    expect(routers).toContain(`lookup{$local_part@$domain_data}lsearch{${DOVECOT_PASSWD_DIR}/$domain_data}`);
+    expect(routers).not.toContain(`lsearch;${DOVECOT_PASSWD_DIR}`);
+    expect(renderPasswdLine({ localPart: 'info', hash: HASH, uid: 1001, gid: 1001, home: '/home/alice', domain: 'alice.com' }).split(':')[0]).toBe('info@alice.com');
     expect(routers).toContain(`lsearch;${layout.vmail.domainForward}}`);
     expect(routers).toContain(`lsearch;${layout.vmail.aliasesDir}/$domain_data}`);
     expect(routers).toContain(`lookup{*}lsearch{${layout.vmail.aliasesDir}/$domain_data}`);

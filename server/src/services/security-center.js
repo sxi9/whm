@@ -1050,6 +1050,28 @@ export function createSecurityCenterService(ctx) {
     },
   };
 
+  // Debian/Ubuntu and RHEL backport CVE fixes into the packaged release without
+  // bumping PHP_VERSION, so a version-range hit on a distro package is checked
+  // against the package changelog (agent op pkg.php.backports, read-only). A
+  // hit is only marked backported when that changelog names one of the
+  // advisory's CVE ids; other layouts, missing changelogs and agent errors
+  // keep the version-based verdict.
+  const cveIds = (adv) => [...new Set(`${adv.id} ${adv.title || ''}`.match(/CVE-\d{4}-\d{4,}/g) || [adv.id])];
+  async function markDistroBackports(matches, versions) {
+    const byId = new Map((versions || []).map((v) => [v.id, v]));
+    for (const m of matches) {
+      const ids = cveIds(m.advisory);
+      for (const h of m.versions) {
+        const layout = byId.get(h.id)?.layout;
+        if (h.unknown || !['debian', 'rhel'].includes(layout)) continue;
+        try {
+          const r = await op('pkg.php.backports', { version: h.id, ids });
+          if (r?.checked && Array.isArray(r.mentioned) && r.mentioned.length) h.backported = { package: r.package, installed: r.installed ?? null, mentioned: r.mentioned, source: r.source ?? null };
+        } catch (err) { logger.debug({ err, version: h.id }, 'advisor: php backport check failed'); }
+      }
+    }
+  }
+
   // Read-only scanner. Every probe is isolated so one failing check never hides
   // the rest; "fix" links point at the panel's own pages.
   const advisor = {
@@ -1167,14 +1189,24 @@ export function createSecurityCenterService(ctx) {
         const { versions } = await ctx.software.php.versions();
         if (!versions.length) { add({ id: 'php.advisories', grade: 'info', title: 'No PHP installation found', detail: 'MultiPHP Manager detected no PHP version; the advisory list was not applied.' }); return; }
         const { matches, unversioned } = matchPhpAdvisories(advisories, versions);
+        await markDistroBackports(matches, versions);
         const fix = { label: 'MultiPHP Manager', path: '/software/multiphp-manager' };
         for (const { advisory, versions: hits } of matches) {
-          const names = hits.map((h) => `${h.version || `${h.minor}.x`}${h.isDefault ? ' (default)' : ''}`);
-          const lines = hits.map((h) => `PHP ${h.version || `${h.minor} (patch level unknown)`}: ${h.fixedIn ? `update to ${h.fixedIn}` : 'no packaged fix for this branch; move its sites to a supported version'}`);
-          add({ id: `php.advisory.${advisory.id}`, grade: advisoryGrade(advisory.severity), title: `PHP ${names.join(', ')} ${hits.length === 1 ? 'is' : 'are'} affected by ${advisory.id}`, detail: [advisory.title, ...lines, advisory.note].filter(Boolean).join('\n'), url: advisory.url, advisory: advisory.id, versions: hits, fix });
+          const fixed = hits.filter((h) => h.backported);
+          const open = hits.filter((h) => !h.backported);
+          if (fixed.length) add({ id: `php.advisory.${advisory.id}.backported`, grade: 'ok', title: `PHP ${fixed.map((h) => `${h.version}${h.isDefault ? ' (default)' : ''}`).join(', ')} carr${fixed.length === 1 ? 'ies' : 'y'} the distribution fix for ${advisory.id}`, detail: [advisory.title, ...fixed.map((h) => `${h.backported.package} ${h.backported.installed || ''}: the package changelog records ${h.backported.mentioned.join(', ')} (upstream ${h.fixedIn || 'fix'} backported, PHP_VERSION stays ${h.version})`)].filter(Boolean).join('\n'), url: advisory.url, advisory: advisory.id, versions: fixed });
+          if (!open.length) continue;
+          const names = open.map((h) => `${h.version || `${h.minor}.x`}${h.isDefault ? ' (default)' : ''}`);
+          const lines = open.map((h) => `PHP ${h.version || `${h.minor} (patch level unknown)`}: ${h.fixedIn ? `update to ${h.fixedIn}` : 'no packaged fix for this branch; move its sites to a supported version'}`);
+          add({ id: `php.advisory.${advisory.id}`, grade: advisoryGrade(advisory.severity), title: `PHP ${names.join(', ')} ${open.length === 1 ? 'is' : 'are'} affected by ${advisory.id}`, detail: [advisory.title, ...lines, advisory.note].filter(Boolean).join('\n'), url: advisory.url, advisory: advisory.id, versions: open, fix });
         }
         for (const advisory of unversioned) add({ id: `php.advisory.${advisory.id}`, grade: 'info', title: `${advisory.id} has no fixed release yet`, detail: [advisory.title, advisory.note].filter(Boolean).join('\n'), url: advisory.url, advisory: advisory.id, versions: [] });
-        if (!matches.length) add({ id: 'php.advisories', grade: 'ok', title: `Installed PHP ${versions.map((v) => v.version || v.id).join(', ')} not affected by ${advisories.length - unversioned.length} listed advisor${advisories.length - unversioned.length === 1 ? 'y' : 'ies'}` });
+        if (!matches.some((m) => m.versions.some((h) => !h.backported))) add({ id: 'php.advisories', grade: 'ok', title: `Installed PHP ${versions.map((v) => v.version || v.id).join(', ')} not affected by ${advisories.length - unversioned.length} listed advisor${advisories.length - unversioned.length === 1 ? 'y' : 'ies'}` });
+      });
+
+      await probe('panel.mail', 'account-panel mail wiring', async () => {
+        if (typeof ctx.panelEmail?.advisorFindings !== 'function') return;
+        for (const f of await ctx.panelEmail.advisorFindings()) add(f);
       });
 
       await probe('filesystem', 'filesystem permissions', async () => {

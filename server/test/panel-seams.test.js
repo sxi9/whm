@@ -3,7 +3,7 @@ import { createTestApp, createMockAgent } from './support/app.js';
 import { ownsRow } from '../src/middleware/rbac.js';
 import { ACL_KEYS, EXPLICIT_ACLS } from '../src/services/resellers.js';
 import { DEFAULT_FEATURES } from '../src/db/seed.js';
-import { renderDovecotVirtualAuth, renderEximVirtualRouters, renderEximVirtualTransports, renderEximVirtualAuths, renderEximDataAcl, renderEximMain, renderEximSpamAcl, DEFAULTS, SPAMD_ADDRESS_RE } from '../src/services/service-configuration.js';
+import { renderDovecotVirtualAuth, renderEximVirtualRouters, renderEximVirtualTransports, renderEximVirtualAuths, renderEximDataAcl, renderEximMain, renderEximSpamAcl, dovecotIsV24, DEFAULTS, SPAMD_ADDRESS_RE } from '../src/services/service-configuration.js';
 
 // The integration seams the customer panel relies on (contracts §33–§40),
 // exercised through the owning categories' services with the mock agent.
@@ -46,6 +46,7 @@ let bob;
 let eximState;
 let dovecotState;
 let ftpCurrent = 'pure-ftpd';
+let ftpVirtual = false;
 const entries = [];
 const req = { audit: (e) => entries.push(e), user: { id: 1, username: 'root', role: 'root' } };
 const ROOT = { id: 1, username: 'root', role: 'root' };
@@ -65,10 +66,12 @@ function agent() {
     'web.dovecot.detect': () => dovecotState,
     'web.dovecot.include.write': ({ name, content, reload }) => { const key = name === '98-whm-virtual-auth.conf' ? 'virtualAuth' : 'mailserver'; dovecotState.includes[key] = { ...dovecotState.includes[key], exists: true, content }; if (key === 'virtualAuth') dovecotState.passwdDirExists = true; return { name, path: dovecotState.includes[key].path, validated: true, bytes: content.length, reloaded: reload, unit: 'dovecot' }; },
     'web.dovecot.include.remove': ({ name }) => { const key = name === '98-whm-virtual-auth.conf' ? 'virtualAuth' : 'mailserver'; const existed = dovecotState.includes[key].exists; dovecotState.includes[key] = { ...dovecotState.includes[key], exists: false, content: null }; return { name, path: dovecotState.includes[key].path, removed: existed, reloaded: existed, unit: 'dovecot' }; },
+    'vmail.passwd.rekey': ({ dryRun }) => ({ format: 'legacy', dryRun: Boolean(dryRun), dir: VMAIL.passwdDir, files: [{ domain: 'alice.com', path: `${VMAIL.passwdDir}/alice.com`, changed: 1 }], changed: 1 }),
     'web.vmail.prepare': ({ enabled }) => ({ enabled, eximUser: 'Debian-exim', eximGroup: 'Debian-exim', dovecotGroupMember: enabled, changed: true, dirs: enabled ? [VMAIL.passwdDir, VMAIL.aliasesDir, VMAIL.autorespondersDir, VMAIL.autoreplyOnceDir] : [], passwdDir: VMAIL.passwdDir, authSocket: '/var/run/dovecot/auth-client', lmtpSocket: '/var/run/dovecot/lmtp' }),
     'web.service.detect': ({ role }) => ({ role, candidates: ftpCandidates(ftpCurrent), active: [ftpCurrent], enabled: [ftpCurrent], current: ftpCurrent, packageManager: 'apt-get' }),
     'web.ftp.config.read': ({ server }) => ({ server, path: '/etc/pure-ftpd/conf/', unit: unit(server), settings: {}, raw: {} }),
-    'web.ftp.config.write': ({ server, settings }) => ({ server, written: ['/etc/pure-ftpd/conf/PureDB'], validated: null, settings, reloaded: true, unit: server, verb: 'restart' }),
+    'web.ftp.config.write': ({ server, settings }) => { ftpVirtual = Boolean(settings?.virtualUsers); return { server, written: ['/etc/pure-ftpd/conf/PureDB'], validated: null, settings, reloaded: true, unit: server, verb: 'restart' }; },
+    'ftp.virtual.status': ({ daemon }) => (daemon === 'vsftpd' ? { daemon, supported: false, enabled: false } : { daemon, supported: true, configured: ftpVirtual, enabled: ftpVirtual, passwdFile: '/etc/pure-ftpd/pureftpd.passwd' }),
   });
 }
 
@@ -276,8 +279,10 @@ describe('S5: ctx.web.ftp.enableVirtualUsers', () => {
 describe('S4: ctx.web.applyVirtualMail', () => {
   it('renders Dovecot and Exim fragments that read the vmail files and keep the system users first', () => {
     const layout = eximLayout();
-    const dc = renderDovecotVirtualAuth({ passwdDir: VMAIL.passwdDir, eximUser: 'Debian-exim', eximGroup: 'Debian-exim' });
-    expect(dc).toContain('args = scheme=SHA512-CRYPT username_format=%n /etc/dovecot/whm/passwd/%d');
+    const dc = renderDovecotVirtualAuth({ passwdDir: VMAIL.passwdDir, eximUser: 'Debian-exim', eximGroup: 'Debian-exim', version: '2.3.21' });
+    // Lines are keyed by the full address on every version (no username_format), so the lookup key is the login name.
+    expect(dc).toContain('args = scheme=SHA512-CRYPT /etc/dovecot/whm/passwd/%d');
+    expect(dc).not.toContain('username_format');
     expect(dc).toContain('username_filter = *@*');
     expect(dc.indexOf('passdb {')).toBeLessThan(dc.indexOf('userdb {'));
     expect(dc).toMatch(/passdb \{[^}]*result_success = return-ok[^}]*result_failure = continue/s);
@@ -286,6 +291,17 @@ describe('S4: ctx.web.applyVirtualMail', () => {
     expect(dc).toContain('unix_listener lmtp');
     expect(dc).toContain('mail_plugins = $mail_plugins quota');
     expect(renderDovecotVirtualAuth({})).toContain('keep their defaults');
+    // Dovecot 2.4 (named sections, no args/%n/%d, mail_plugins block, count quota driver), validated with doveconf -n on a 2.4.2 host.
+    const dc24 = renderDovecotVirtualAuth({ passwdDir: VMAIL.passwdDir, eximUser: 'Debian-exim', eximGroup: 'Debian-exim', version: '2.4.2' });
+    expect(dc24).toContain('passdb passwd-file {\n  passwd_file_path = /etc/dovecot/whm/passwd/%{user | domain}\n  default_password_scheme = SHA512-CRYPT');
+    expect(dc24).toContain('userdb passwd-file {\n  passwd_file_path = /etc/dovecot/whm/passwd/%{user | domain}');
+    expect(dc24).toContain('passdb passwd-file {\n  passwd_file_path = /etc/dovecot/whm/passwd/%{user | domain}\n  default_password_scheme = SHA512-CRYPT\n  username_filter = *@*\n  result_success = return-ok\n  result_failure = continue\n  result_internalfail = continue\n}');
+    expect(dc24).toContain('mail_plugins {\n  quota = yes\n}');
+    expect(dc24).toContain('quota_driver = count');
+    expect(dc24).toContain('protocol imap {\n  mail_plugins {\n    imap_quota = yes');
+    expect(dc24).toContain('unix_listener auth-client {\n    mode = 0660\n    user = Debian-exim');
+    for (const legacy of ['driver = passwd-file', 'args =', 'username_format', '%n', '%d', 'plugin {', '$mail_plugins']) expect(dc24, legacy).not.toContain(legacy);
+    expect([dovecotIsV24('2.4.2'), dovecotIsV24('2.4.0'), dovecotIsV24('3.0.0'), dovecotIsV24('2.3.21'), dovecotIsV24(null), dovecotIsV24('')]).toEqual([true, true, true, false, false, false]);
     const routers = renderEximVirtualRouters(layout);
     const names = [...routers.matchAll(/^([a-z_]+):$/gm)].map((m) => m[1]);
     expect(names).toEqual(['whm_domain_forward', 'whm_aliases_copy', 'whm_aliases', 'whm_autoreply', 'whm_virtual_user', 'whm_aliases_default']);
@@ -294,6 +310,11 @@ describe('S4: ctx.web.applyVirtualMail', () => {
     expect(routers).not.toMatch(/\/\$local_part\b/);
     for (const m of routers.matchAll(/^\s+(domains|local_parts) = (.*)$/gm)) expect(m[2], m[0]).toMatch(/^\$\{if exists\{/);
     expect(routers).toContain(`domains = \${if exists{${VMAIL.passwdDir}}{dsearch;${VMAIL.passwdDir}}{}}`);
+    // Mailbox lookups use the full address as the lsearch key (the passwd line key), the file name only from $domain_data.
+    expect(routers).toContain(`whm_virtual_user:\n  driver = accept\n  domains = \${if exists{${VMAIL.passwdDir}}{dsearch;${VMAIL.passwdDir}}{}}\n  condition = \${if exists{${VMAIL.passwdDir}/$domain_data}{\${lookup{$local_part@$domain_data}lsearch{${VMAIL.passwdDir}/$domain_data}{yes}{no}}}{no}}\n  transport = whm_dovecot_lmtp`);
+    expect(routers.match(/lookup\{\$local_part@\$domain_data\}lsearch\{\/etc\/dovecot\/whm\/passwd\/\$domain_data\}/g)).toHaveLength(3);
+    expect(routers).not.toMatch(/lookup\{\$local_part\}lsearch\{\/etc\/dovecot/);
+    expect(routers).not.toMatch(/local_parts = [^\n]*passwd/);
     expect(routers).toContain('transport = whm_dovecot_lmtp');
     expect(routers).toMatch(/whm_aliases:\n(?:.*\n)*?  forbid_pipe\n  forbid_file/);
     expect(routers).not.toMatch(/allow_pipe|allow_file|\${run/);
@@ -327,7 +348,10 @@ describe('S4: ctx.web.applyVirtualMail', () => {
     expect(r).toMatchObject({ enabled: true, applied: true, live: true, warnings: [] });
     expect(ctx.web.virtualMail.settings().enabled).toBe(true);
     const names = app.agent.calls.map((c) => c.name).filter((n) => /vmail|include\.(write|remove)/.test(n));
-    expect(names[0]).toBe('web.vmail.prepare');
+    // Host preparation, then the one-time passwd re-key (pre-upgrade lines keyed by a bare local part), before Dovecot gets the include.
+    expect(names.slice(0, 3)).toEqual(['web.vmail.prepare', 'vmail.passwd.rekey', 'web.dovecot.include.write']);
+    expect(app.agent.callsTo('vmail.passwd.rekey').map((c) => c.args)).toEqual([{}]);
+    expect(r.rekeyed).toMatchObject({ changed: 1, files: [{ domain: 'alice.com', changed: 1 }] });
     const order = app.agent.calls.filter((c) => c.name === 'web.exim.include.write').map((c) => c.args.slot);
     expect(order).toEqual(['transport', 'router', 'acl_data', 'acl_rcpt', 'auth', 'main']);
     expect(app.agent.callsTo('web.exim.include.write').map((c) => c.args.reload)).toEqual([false, false, false, false, false, true]);
@@ -348,7 +372,14 @@ describe('S4: ctx.web.applyVirtualMail', () => {
     expect(app.agent.callsTo('web.exim.include.write').map((c) => c.args.slot)).toEqual(['acl_data', 'acl_rcpt', 'auth', 'main']);
     expect(app.agent.callsTo('web.vmail.prepare').map((c) => c.args)).toEqual([{ enabled: true }]);
     const status = await ctx.web.virtualMail.status();
-    expect(status).toMatchObject({ enabled: true, installed: true, live: true, exim: { slots: { router: { hooked: true, precedes: true } } }, dovecot: { include: { exists: true } } });
+    expect(status).toMatchObject({ enabled: true, installed: true, live: true, exim: { slots: { router: { hooked: true, precedes: true } }, manualIncludes: [] }, dovecot: { include: { exists: true }, version: '2.3.21' }, submissionPorts: { enabled: false, port465: false, port587: false, tls: false } });
+    expect(ctx.web.virtualMail.lastApplied()).toMatchObject({ ok: true });
+    // The Dovecot fragment follows the detected version.
+    dovecotState = dovecotDetect({ version: '2.4.2' });
+    const v24 = await ctx.web.applyVirtualMail({ enabled: true }, req);
+    expect(v24.live).toBe(true);
+    expect(app.agent.callsTo('web.dovecot.include.write').pop().args.content).toContain('passdb passwd-file {');
+    dovecotState = dovecotDetect({ includes: { ...dovecotState.includes } });
     // Exim Configuration Manager saves keep the auth fragment in step with requireTlsForAuth.
     await ctx.web.exim.update({ requireTlsForAuth: false }, req);
     expect(written.auth).not.toContain('server_advertise_condition');

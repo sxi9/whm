@@ -924,6 +924,17 @@ in storage are encrypted with the panel master key and every key view or downloa
 - **Server:** `POST /autossl/run` → `202` job `ssl.autossl.run`; the job calls the ACME client through
   the agent and installs the result as in 26.2. Account creation also issues a certificate synchronously
   through `ssl.issueFor`.
+- **Server hostname:** when *Basic Setup → hostname* is a fully qualified name that no account owns, it is
+  listed as a `server` domain for root. Its order is validated from Apache's default document root
+  (`/var/www/html`, so the hostname must resolve to this server and the default vhost must answer on
+  port 80) and the result is installed as a service certificate rather than on a vhost: on the panel
+  (`/etc/whm/ssl/panel.crt` / `panel.key`, `root:whmpanel 0640`; restart `whm-panel` to serve it) and on
+  every service that already holds a panel-installed certificate, or, before any does, on each mail/web
+  daemon present. Renewals follow the same path, so the daemons never go stale. The hub (`:7443`) is
+  not covered.
+- **Gotchas:** before `www.<domain>` is added to an order it is resolved; a name with no address record,
+  or one pointing at another host, is left out (the run log says why) so the first order does not fail
+  validation and count against the CA's rate limits.
 
 #### 26.4 Manage SSL Hosts
 
@@ -960,7 +971,11 @@ in storage are encrypted with the panel master key and every key view or downloa
   preload); service certificates for `exim`, `dovecot`, `apache`, `ftp` and `panel`.
 - **Server:** Apache gets a managed include from this page; Exim and Dovecot are rendered by Service
   Configuration, which receives the protocol floor and ciphers; every daemon's configuration is validated and
-  rolled back if rejected. `POST /service-certs/:service` installs a certificate for that service.
+  rolled back if rejected. `POST /service-certs/:service` installs a certificate for that service: Dovecot
+  gets `conf.d/90-whm-ssl-cert.conf` in the syntax of the installed version (`ssl_server_cert_file` /
+  `ssl_server_key_file` on 2.4+, `ssl_cert = <` / `ssl_key = <` on 2.3), validated with `doveconf -n`;
+  `panel` replaces `/etc/whm/ssl/panel.crt` and `panel.key` (`root:whmpanel 0640`, the files
+  `WHM_TLS_CERT`/`WHM_TLS_KEY` point at by default) and needs `systemctl restart whm-panel`.
 - **Gotchas:** enable HSTS only once every site on the server works over HTTPS.
 
 ---

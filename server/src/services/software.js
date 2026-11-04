@@ -227,6 +227,12 @@ export function createSoftwareService(ctx) {
     job.log(`${label}: ${JSON.stringify(args.packages || args)}`);
     job.progress(5, label);
     const result = await runLongOp(job, opName, args, label);
+    // A package can bring or take away a program a capability depends on
+    // (ruby → gem, php-pear → pecl); re-detect now rather than answering 501
+    // until the periodic re-detection.
+    if (opName === 'pkg.install' || opName === 'pkg.remove') {
+      await capabilities.refresh().catch((err) => { logger.warn({ err }, 'capability refresh after package change failed'); job.log(`capability re-detection failed: ${err.message}`, 'warn'); });
+    }
     job.progress(100, 'finished');
     return { manager: result.manager, packages: result.packages, purge: result.purge, lines: result.output?.length ?? 0 };
   }
@@ -354,17 +360,23 @@ export function createSoftwareService(ctx) {
       try { detected = await op('pkg.module.detect'); } catch (err) { logger.warn({ err }, 'module detection failed'); }
       return { ...detected, capabilities: { perl: capabilities.has('perl'), cpan: capabilities.has('cpan'), pecl: capabilities.has('pecl'), pear: capabilities.has('pear'), gem: capabilities.has('gem'), pip: capabilities.has('pip') } };
     },
+    // An installer added outside the panel (apt on a shell) gets one bounded
+    // re-detection before the install prompt, so the page follows the host.
+    async requireInstaller(kind, cap) {
+      if (!capabilities.has(cap)) await capabilities.ensureFresh(30 * 1000).catch((err) => logger.warn({ err, kind }, 'capability refresh failed'));
+      capabilities.require(cap, `${kind} is not installed on this server`);
+    },
     async list(kind) {
       const [listOp, , cap, , plural] = MODULE_OPS[kind];
-      capabilities.require(cap, `${kind} is not installed on this server`);
+      await modules.requireInstaller(kind, cap);
       const result = await op(listOp);
       return { kind, items: result[plural] || [] };
     },
-    install(kind, { name, version }, user, req) {
+    async install(kind, { name, version }, user, req) {
       const [, installOp, cap, argName] = MODULE_OPS[kind];
       const [pattern, hint] = MODULE_NAMES[kind];
       if (!pattern.test(name)) throw unprocessable(`"${name}" is not a valid ${kind} name`, { name: [hint] });
-      capabilities.require(cap, `${kind} is not installed on this server`);
+      await modules.requireInstaller(kind, cap);
       const job = enqueue('software.module.install', { kind, op: installOp, args: { [argName]: name, ...(version && kind !== 'pecl' && kind !== 'pear' ? { version } : {}) } }, user);
       req?.audit?.({ action: `software.module.install.${kind}`, target: name, args: { version: version ?? null, jobId: job.id } });
       return { job };

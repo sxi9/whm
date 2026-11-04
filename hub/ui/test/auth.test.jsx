@@ -46,6 +46,10 @@ describe('session areas', () => {
     expect(guardDecision(SESSIONS.developer, 'dev')).toBe('ok');
     expect(guardDecision(SESSIONS.developer, 'admin')).toBe('login');
     expect(guardDecision(SESSIONS.vendor, 'dev')).toBe('login');
+    const held = { ...SESSIONS.vendor, totpEnabled: false, totpVerifiedAt: null, totpEnrolRequired: true };
+    expect(guardDecision(held, 'admin', AREA_ROLES.admin, '/admin/licenses')).toBe('enrol');
+    expect(guardDecision(held, 'admin', AREA_ROLES.admin, '/admin/security')).toBe('ok');
+    expect(guardDecision({ ...held, totpEnrolRequired: false }, 'admin', AREA_ROLES.admin, '/admin/licenses')).toBe('ok');
   });
 
   it('RequireArea renders the children for the right area and the forbidden page for the wrong role', () => {
@@ -56,6 +60,9 @@ describe('session areas', () => {
     auth.value = SESSIONS.developer;
     expect(render(<RequireArea area="admin" roles={AREA_ROLES.admin}><p>admin-home</p></RequireArea>)).not.toContain('admin-home');
     expect(render(<ForbiddenPage />)).toContain('vendor administrator');
+    auth.value = { ...SESSIONS.vendor, totpEnabled: false, totpVerifiedAt: null, totpEnrolRequired: true };
+    expect(render(<RequireArea area="admin" roles={AREA_ROLES.admin}><p>admin-home</p></RequireArea>, { url: '/admin/licenses' })).not.toContain('admin-home');
+    expect(render(<RequireArea area="admin" roles={AREA_ROLES.admin}><p>security-page</p></RequireArea>, { url: '/admin/security' })).toContain('security-page');
     auth.value = SESSIONS.vendor;
   });
 });

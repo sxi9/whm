@@ -1,7 +1,7 @@
 import express from 'express';
 import { z, validate, fields, pagination, wrap } from '../../shared/validate.js';
 import { HttpError, unauthorized } from '../../shared/errors.js';
-import { issueCsrfToken, requireRole, requireStepUp, PORTAL_ROLES } from '../../shared/auth.js';
+import { issueCsrfToken, requireRole, requireStepUp, totpEnrolmentRequired, PORTAL_ROLES } from '../../shared/auth.js';
 
 // Portal sessions for hub/ui: password + TOTP login, step-up, 2FA enrolment,
 // password change and (vendor_admin) portal user management. Vendor users then
@@ -16,7 +16,7 @@ export function portalRoutes(ctx) {
     const user = ctx.portalUsers.publicView(ctx.portalUsers.get(req.principal.userId));
     const imp = req.principal.impersonation || null;
     const resellerId = imp?.reseller_id || user.reseller_id || null;
-    const out = { user: imp ? { ...user, role: 'reseller_admin', reseller_id: imp.reseller_id } : user, totp_verified_at: req.session.totpVerifiedAt || null, csrfToken: issueCsrfToken(req, ctx.crypto), impersonating: imp ? { reseller_id: imp.reseller_id, by: imp.by, expires_at: new Date(imp.expires_at).toISOString() } : null };
+    const out = { user: imp ? { ...user, role: 'reseller_admin', reseller_id: imp.reseller_id } : user, totp_verified_at: req.session.totpVerifiedAt || null, totp_enrol_required: totpEnrolmentRequired(ctx.config, req.principal), csrfToken: issueCsrfToken(req, ctx.crypto), impersonating: imp ? { reseller_id: imp.reseller_id, by: imp.by, expires_at: new Date(imp.expires_at).toISOString() } : null };
     if (resellerId) { try { const rs = ctx.resellers.get(resellerId); out.reseller = { id: rs.id, name: rs.name, brand: rs.brand || {} }; } catch { out.reseller = null; } }
     return out;
   };
@@ -34,7 +34,7 @@ export function portalRoutes(ctx) {
     req.session.totpVerifiedAt = user.totp_enabled ? ctx.clock.now() : null;
     req.principal = { type: 'portal', userId: user.id };
     ctx.audit.record({ principal: `portal:${user.id}`, ip: req.ip, action: 'portal.login', target: user.id, args: null, result: 'ok' });
-    res.json({ data: { user: ctx.portalUsers.publicView(user), csrfToken: issueCsrfToken(req, ctx.crypto), totp_verified_at: req.session.totpVerifiedAt } });
+    res.json({ data: { user: ctx.portalUsers.publicView(user), csrfToken: issueCsrfToken(req, ctx.crypto), totp_verified_at: req.session.totpVerifiedAt, totp_enrol_required: totpEnrolmentRequired(ctx.config, { role: user.role, totpEnabled: !!user.totp_enabled }) } });
   }));
   r.post('/logout', requireSession, (req, res) => {
     req.session.destroy(() => res.json({ data: { loggedOut: true } }));

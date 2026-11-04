@@ -231,8 +231,12 @@ export function createAccountsService(ctx) {
         sysUser = await tryOp('user.create', { username, homeDir, shell, comment: `Keel account ${input.domain}` }, req, undo,
           () => agent.op('user.delete', { username, removeHome: true }, { req }));
         if (sysUser) {
+          // public_html is 0750, so its group is the web server's run user (www-data on Debian,
+          // apache on RHEL); with the account's own group Apache cannot read the site (403).
+          const webGroup = await agent.op('web.detect', {}, { req }).then((w) => w.apache?.runUser || null, () => null);
           for (const sub of ['public_html', 'mail', 'etc', 'tmp', 'logs', 'ssl']) {
-            await agent.op('fs.mkdir', { path: `${homeDir}/${sub}`, owner: username, mode: sub === 'public_html' ? '0750' : '0700' }, { req });
+            const group = sub === 'public_html' && webGroup ? { group: webGroup } : {};
+            await agent.op('fs.mkdir', { path: `${homeDir}/${sub}`, owner: username, ...group, mode: sub === 'public_html' ? '0750' : '0700' }, { req });
           }
           await agent.op('fs.write_file', { path: `${homeDir}/public_html/index.html`, content: indexHtml(input.domain, username), owner: username, mode: '0644', backup: false }, { req });
           if (input.password) await agent.op('user.set_password', { username, password: input.password }, { req });

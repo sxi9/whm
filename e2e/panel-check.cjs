@@ -4,13 +4,15 @@
 // §4 contract, then root opens the account through "Log in as". Console errors,
 // page errors and 5xx responses fail the run.
 //
-// Usage: BASE=http://127.0.0.1:2086 PASSWORD='<root password>' node e2e/panel-check.cjs
+// Usage: BASE=https://127.0.0.1:2087 PASSWORD='<root password>' node e2e/panel-check.cjs
 // (needs the built client served by the API with the /panel routes wired, and playwright installed)
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-const BASE = process.env.BASE || 'http://127.0.0.1:2086';
+// The plain port only redirects (301) or refuses (426) once TLS is on, so the
+// default is the TLS listener; the installer's certificate is self-signed.
+const BASE = process.env.BASE || 'https://127.0.0.1:2087';
 const OUT = process.env.OUT || path.join(__dirname, 'shots', 'panel');
 const PASSWORD = process.env.PASSWORD || 'Sm0ke-Test-Passw0rd!';
 const USER_PASSWORD = process.env.PANEL_USER_PASSWORD || 'Demo-Panel-Passw0rd!7';
@@ -52,7 +54,7 @@ async function logout(page) {
 (async () => {
   const { PANEL_FUNCTIONS, PANEL_CATEGORIES } = await import('../client/src/panel/nav.js');
   const browser = await chromium.launch();
-  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, ignoreHTTPSErrors: true });
   page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
   // The SPA probes /api/auth/me before login (401) and the panel probes features that may answer 403/501 on a bare host; those are not errors.
   page.on('console', (m) => { if (m.type() === 'error' && !/status of (401|403|423|501)/.test(m.text())) errors.push(`console: ${m.text()}`); });

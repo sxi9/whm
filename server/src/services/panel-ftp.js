@@ -83,10 +83,15 @@ export function createPanelFtpService(ctx) {
     const selected = ftp?.selected?.() ?? 'pure-ftpd';
     let installed = false;
     let active = null;
+    // tls stays null (unknown) when the probe itself fails; a probe that reads
+    // no conf/TLS or finds no certificate answers 'off'.
+    let tls = null;
     try {
       const d = await ftp.get();
       installed = Boolean(d?.installed);
       active = d?.active ?? null;
+      tls = d?.config?.settings?.tls ?? 'off';
+      if (d?.config?.tlsCertificate?.present === false) tls = 'off';
     } catch { /* degraded: selected only */ }
     const daemon = active || selected;
     const supportedDaemon = SUPPORTED_DAEMONS.includes(daemon);
@@ -95,12 +100,18 @@ export function createPanelFtpService(ctx) {
       try { virtual = await agent.op('ftp.virtual.status', { daemon }); } catch (err) { virtual = { daemon, enabled: false, error: err.message }; }
     }
     const enabled = Boolean(virtual?.enabled);
-    return { daemon, selected, active, installed, supportedDaemon, enabled, supported: supportedDaemon && enabled, virtual, canEnable: supportedDaemon && !enabled && typeof ftp?.enableVirtualUsers === 'function' };
+    return { daemon, selected, active, installed, supportedDaemon, enabled, supported: supportedDaemon && enabled, virtual, tls, canEnable: supportedDaemon && !enabled && typeof ftp?.enableVirtualUsers === 'function' };
   }
 
+  // Customers get the daemon's effective TLS mode, never the saved setting:
+  // pure-ftpd only negotiates TLS once conf/TLS and a certificate exist, and
+  // an unreadable or missing daemon config counts as off. A failed probe
+  // leaves it null (unknown) rather than promising or denying TLS.
   function connection(scope, info) {
-    const tls = ctx.web?.ftp?.settings?.()?.tls ?? 'optional';
-    return { host: settings.get('basic.hostname', '') || scope.account.domain, port: Number(settings.get('panel.ftp.port', 21)) || 21, protocol: 'ftp', encryption: tls, daemon: info.daemon };
+    const configured = ctx.web?.ftp?.settings?.()?.tls ?? 'optional';
+    const encryption = info.tls ?? null;
+    const encryptionHint = encryption != null && encryption !== configured ? `FTP is configured for TLS "${configured}" but the daemon is running with "${encryption}"; install a certificate for the FTP service under SSL/TLS to enable it.` : null;
+    return { host: settings.get('basic.hostname', '') || scope.account.domain, port: Number(settings.get('panel.ftp.port', 21)) || 21, protocol: 'ftp', encryption, encryptionConfigured: configured, encryptionHint, daemon: info.daemon };
   }
 
   const shape = (r) => ({ id: r.id, name: r.name, login: r.login, daemon: r.daemon, dir: r.dir, quotaMb: r.quota_mb, created_at: r.created_at, updated_at: r.updated_at });

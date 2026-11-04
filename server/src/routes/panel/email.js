@@ -63,13 +63,32 @@ export async function register(ctx) {
   ctx.panelEmail = createPanelEmailService(ctx);
   const s = ctx.panelEmail;
 
-  // Seam S4 (ctx.web.applyVirtualMail) is a root-level Exim/Dovecot rewrite:
-  // the integrator calls ctx.panelEmail.ensureVirtualMail() from boot code
-  // after capabilities.refresh, never from a customer request. Domains that
-  // leave an account (addon/sub/parked removal in U3) are released with
+  // Seam S4 (ctx.web.applyVirtualMail) is a root-level Exim/Dovecot rewrite
+  // that only ever runs as a panel job: queued here once per boot (the worker
+  // starts after capabilities.refresh, so the job never delays listen and a
+  // missing daemon is a no-op), re-queued by a mailbox mutation that finds the
+  // wiring not live, and triggered by root through Service Configuration.
+  // Never from a customer request. Domains that leave an account
+  // (addon/sub/parked removal in U3) are released with
   // ctx.panelEmail.releaseDomain(domain, accountId, req); termination is
   // handled by the account.terminated listener subscribed here.
   s.subscribe();
+  ctx.jobs.register(s.VIRTUAL_MAIL_JOB, async (job) => {
+    const r = await s.ensureVirtualMail(null, { force: job.params?.force === true });
+    job.log(r.applied ? (r.live === false ? `applied but not live: ${r.lastApply?.error || 'see Service Configuration > virtual mail'}` : 'applied') : `not applied: ${r.reason}`, r.applied && r.live !== false ? 'info' : 'warn');
+    return { applied: Boolean(r.applied), live: r.live ?? null, reason: r.reason ?? null, manualIncludes: r.manualIncludes ?? [] };
+  });
+  // Capabilities are detected after the routes register (bootstrap refreshes
+  // once every module is in), so the boot request waits for that snapshot;
+  // without one (agent unreachable) the first mailbox mutation queues it instead.
+  if (ctx.config.env !== 'test') {
+    let attempts = 0;
+    const bootRequest = () => {
+      if (ctx.capabilities.snapshot().at === 0 && attempts++ < 60) { setTimeout(bootRequest, 2_000).unref(); return; }
+      s.requestVirtualMail('boot');
+    };
+    bootRequest();
+  }
 
   const r = panelRouter(ctx, 'email');
 

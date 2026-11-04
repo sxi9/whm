@@ -1,5 +1,6 @@
+import dns from 'node:dns';
 import { json, paginate } from '../db/index.js';
-import { notFound, conflict, badRequest, forbidden, unprocessable, CapabilityError } from '../lib/errors.js';
+import { HttpError, notFound, conflict, badRequest, forbidden, unprocessable, CapabilityError } from '../lib/errors.js';
 import { isRoot, ownsRow } from '../middleware/rbac.js';
 
 // SSL/TLS. Attached as ctx.ssl; other categories may call:
@@ -39,6 +40,11 @@ export const TLS_PRESETS = {
 
 export const SSL_SERVICES = ['exim', 'dovecot', 'apache', 'ftp', 'panel'];
 const BUNDLE_ROOT = '/etc/ssl/whm';
+// Where HTTP-01 for the server's own hostname is answered: Apache's default
+// vhost document root, which has no account and no vhost spec of its own.
+const SERVER_DOCROOT = '/var/www/html';
+const FQDN = /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+const NO_RECORD = new Set(['ENOTFOUND', 'ENODATA']);
 const AUTOSSL_DEFAULTS = { provider: 'disabled', email: '', method: 'webroot', staging: false, key_type: 'ecdsa', renew_days: 30, include_www: true, replace_custom: false };
 const INSTALL_STATE = { 0: 'stored', 1: 'installed', 2: 'pending' };
 
@@ -159,7 +165,10 @@ export function createSslService(ctx) {
       return { domain, account: stmts.accountByUsername.get(sub.username), accountId: sub.account_id, docroot: sub.docroot || `${sub.home_dir || `/home/${sub.username}`}/public_html`, type: sub.type };
     }
     if (!isRoot(user)) throw notFound(`Domain "${domain}"`);
-    return { domain, account: null, accountId: null, docroot: null, type: 'server' };
+    // Only the configured server hostname reaches the panel/daemon certificates;
+    // any other unowned name root addresses stays a plain web host.
+    const server = domain === serverHostname();
+    return { domain, account: null, accountId: null, docroot: server ? SERVER_DOCROOT : null, type: server ? 'server' : 'host' };
   }
 
   function bundlePaths(domain) {
@@ -279,7 +288,16 @@ export function createSslService(ctx) {
     },
   };
 
+  // The server's own hostname (panel, mail services) when it is a real FQDN;
+  // seed.js defaults basic.hostname to os.hostname(), which can be a bare label.
+  function serverHostname() {
+    const host = String(settings.get('basic.hostname', '') || '').trim().toLowerCase();
+    return FQDN.test(host) ? host : null;
+  }
+
   // Domains the caller may install certificates on, with their current state.
+  // The server hostname is a root-only entry no account owns: its certificate
+  // feeds the service certificates (type 'server'), not a vhost.
   function domains(user) {
     const seen = new Set();
     const out = [];
@@ -290,7 +308,32 @@ export function createSslService(ctx) {
       const cert = shape(stmts.installedByDomain.get(d.domain));
       out.push({ domain: d.domain, account: d.username, accountId: d.account_id, type: d.type, suspended: Boolean(d.suspended), docroot: d.docroot || `${d.home_dir || `/home/${d.username}`}/public_html`, certificate: cert });
     }
+    const host = serverHostname();
+    if (host && isRoot(user) && !seen.has(host)) {
+      out.push({ domain: host, account: null, accountId: null, type: 'server', suspended: false, docroot: SERVER_DOCROOT, certificate: shape(stmts.installedByDomain.get(host)) });
+    }
     return out;
+  }
+
+  // A server-hostname certificate goes to every service that already carries a
+  // panel-installed certificate, or, before any does, to the panel and each
+  // daemon present, so renewals keep reaching the daemons.
+  async function applyServices(result, req) {
+    const stored = stmts.serviceCerts.all().filter((r) => r.has_cert).map((r) => r.service);
+    const targets = [...new Set(['panel', ...stored, ...(stored.length ? [] : SSL_SERVICES.filter((svc) => svc !== 'panel' && capabilities.has(svc)))])];
+    const applied = [];
+    const failed = [];
+    for (const service of targets) {
+      try {
+        await installServiceCert(service, { certPem: result.certPem, keyPem: result.keyPem, chainPem: result.chainPem }, req);
+        applied.push(service);
+      } catch (err) {
+        logger.warn({ err, service }, 'ssl: service certificate apply failed');
+        failed.push(`${service}: ${err.message}`);
+      }
+    }
+    if (!applied.length) return { state: 2, web: 'pending', detail: failed.join('; ') || 'no service accepted the certificate' };
+    return { state: 1, web: `services: ${applied.join(', ')}`, detail: failed.length ? failed.join('; ') : null };
   }
 
   async function install({ domain, certId, certPem, keyPem, chainPem, force = false }, user, req) {
@@ -318,7 +361,7 @@ export function createSslService(ctx) {
     if (!certCovers(certificate, domain) && !force) throw unprocessable(`The certificate is issued for ${[certificate.commonName, ...certificate.sans].filter(Boolean).join(', ')}, not ${domain}`, { domain: ['Not covered by the certificate; set force=true to install anyway'] });
     if (certificate.expired && !force) throw unprocessable(`The certificate expired on ${certificate.notAfter}`, { certPem: ['Expired; set force=true to install anyway'] });
     const written = await pemOp('ssl.bundle.install_for_domain', { domain, certPem, keyPem, ...(chainPem ? { chainPem } : {}) }, req);
-    const web = await applyWeb(domain, written.paths, req);
+    const web = target.type === 'server' ? await applyServices({ certPem, keyPem, chainPem }, req) : await applyWeb(domain, written.paths, req);
     const record = certRecord(certificate, { domain, accountId: target.accountId, certPem, keyPem, chainPem, csrPem: source?.csr_pem ?? null, autossl: source?.autossl ?? 0, installed: web.state });
     // A stored row holding this very certificate follows the install (it moves
     // to the target domain and account) unless it is installed elsewhere, so the
@@ -346,11 +389,13 @@ export function createSslService(ctx) {
   // reseller's stored certificate on someone else's hostname and that reseller
   // must not be able to strip it again.
   async function uninstall(domain, user, req) {
-    resolveDomain(domain, user);
+    const target = resolveDomain(domain, user);
     const row = stmts.installedByDomain.get(domain);
     const removed = await op('ssl.bundle.remove_for_domain', { domain }, req);
     let web = 'skipped';
-    if (typeof ctx.web?.removeSsl === 'function') {
+    // A hostname no account owns has no vhost to strip; its service copies stay
+    // until Manage Service SSL Certificates replaces them.
+    if (target.type !== 'server' && typeof ctx.web?.removeSsl === 'function') {
       try { await ctx.web.removeSsl(domain, req); web = 'applied'; } catch (err) { logger.warn({ err, domain }, 'ssl: web removal failed'); web = `failed: ${err.message}`; }
     }
     const acme = row?.autossl ? await forgetAcme(domain, req) : null;
@@ -397,7 +442,7 @@ export function createSslService(ctx) {
         certificate = inspected.certificate;
         chain = chain || inspected.chain;
       }
-      if (!row && !files.exists) throw notFound(`No certificate is installed on ${domain}`);
+      if (!row && !files.exists) throw new HttpError(404, 'not_found', `No certificate is installed on ${domain}`);
       return { domain, cert: shape(row), state: row ? INSTALL_STATE[row.installed] : 'unmanaged', files, certificate: certificate ?? null, chain };
     },
     uninstall,
@@ -535,7 +580,7 @@ export function createSslService(ctx) {
             summary.skipped++;
           } else {
             entry.action = current ? 'renewed' : 'issued';
-            entry.message = `${result.certificate.issuerCommonName || s.provider} until ${result.certificate.notAfter} (${result.web})${result.droppedNames?.length ? `; ${result.droppedNames.join(', ')} failed validation and was left out` : ''}`;
+            entry.message = `${result.certificate.issuerCommonName || s.provider} until ${result.certificate.notAfter} (${result.web})${result.droppedNames?.length ? `; ${result.droppedNames.join(', ')} ${result.droppedReason} and was left out` : ''}`;
             summary[current ? 'renewed' : 'issued']++;
           }
           job?.log?.(`${d.domain}: ${entry.action} — ${entry.message}`);
@@ -549,16 +594,47 @@ export function createSslService(ctx) {
       job?.log?.(`AutoSSL done: ${JSON.stringify(summary)}`);
       return finish(summary.failed && !summary.issued && !summary.renewed && list.length === summary.failed ? 'failed' : 'done', summary);
     },
+    // A/AAAA addresses of a name through the system resolver (short timeout);
+    // null when the name has no address record at all. Other resolver errors
+    // propagate. Overridable so tests never touch DNS.
+    async resolveAddresses(name) {
+      const resolver = new dns.promises.Resolver({ timeout: 3000, tries: 1 });
+      const out = [];
+      let missing = 0;
+      for (const kind of ['resolve4', 'resolve6']) {
+        try { out.push(...await resolver[kind](name)); } catch (err) { if (NO_RECORD.has(err.code)) missing++; else throw err; }
+      }
+      return out.length === 0 && missing === 2 ? null : out;
+    },
+    // Why www.<domain> must be left out of an order before it is placed: an
+    // order with a name that has no record (or one pointing at another host)
+    // fails validation as a whole, and every failed order counts against the
+    // CA's rate limits. A resolver failure keeps the name: the retry below
+    // still covers it.
+    async wwwSkipReason(domain) {
+      const www = `www.${domain}`;
+      let addresses;
+      try { addresses = await autossl.resolveAddresses(www); } catch (err) { logger.warn({ domain: www, err: err.message }, 'ssl: could not resolve the www name; ordering it anyway'); return null; }
+      if (addresses === null) return 'has no DNS record';
+      let primary = [];
+      try { primary = (await autossl.resolveAddresses(domain)) || []; } catch { return null; }
+      if (primary.length && !addresses.some((a) => primary.includes(a))) return `resolves to ${addresses.join(', ')}, not to this server like ${domain}`;
+      return null;
+    },
     // One issuance for a domain row from domains(); stores and applies the result.
     async issue(d, s = autossl.settings(), { force = false, req } = {}) {
       const names = [d.domain];
-      if (s.includeWww && d.type !== 'sub' && !d.domain.startsWith('www.')) names.push(`www.${d.domain}`);
+      let droppedNames = [];
+      let droppedReason = 'failed validation';
+      if (s.includeWww && d.type !== 'sub' && d.type !== 'server' && !d.domain.startsWith('www.')) {
+        const reason = await autossl.wwwSkipReason(d.domain);
+        if (reason) { droppedNames = [`www.${d.domain}`]; droppedReason = reason; logger.info({ domain: d.domain, reason }, 'ssl: www name left out of the order'); } else names.push(`www.${d.domain}`);
+      }
       const issueArgs = (domains) => ({
         provider: s.provider, domains, method: s.method, ...(s.method === 'webroot' ? { webroot: d.docroot } : {}),
         ...(s.email ? { email: s.email } : {}), staging: Boolean(s.staging), keyType: s.keyType || 'ecdsa', force,
       });
       let result;
-      let droppedNames = [];
       try {
         result = await op('ssl.acme.issue', issueArgs(names), req);
       } catch (err) {
@@ -568,13 +644,13 @@ export function createSslService(ctx) {
         result = await op('ssl.acme.issue', issueArgs([d.domain]), req);
         droppedNames = names.slice(1);
       }
-      const web = await applyWeb(d.domain, result.paths, req);
+      const web = d.type === 'server' ? await applyServices(result, req) : await applyWeb(d.domain, result.paths, req);
       const record = certRecord(result.certificate, { domain: d.domain, accountId: d.accountId, certPem: result.certPem, keyPem: result.keyPem, chainPem: result.chainPem, autossl: 1, installed: web.state });
       const existing = stmts.installedByDomain.get(d.domain);
       let id;
       if (existing?.autossl) { stmts.updateCert.run({ ...record, id: existing.id }); id = existing.id; } else id = Number(stmts.insertCert.run(record).lastInsertRowid);
       stmts.supersede.run(d.domain, id);
-      return { cert: shape(stmts.certById.get(id)), certificate: result.certificate, renewed: result.renewed, droppedNames, paths: result.paths, web: web.web, output: result.output };
+      return { cert: shape(stmts.certById.get(id)), certificate: result.certificate, renewed: result.renewed, droppedNames, droppedReason, paths: result.paths, web: web.web, webDetail: web.detail, output: result.output };
     },
     runs(limit = 20) {
       return stmts.runs.all(limit).map((r) => ({ id: r.id, trigger: r.trigger, provider: r.provider, jobId: r.job_id, startedAt: r.started_at, finishedAt: r.finished_at, status: r.status, summary: json.parse(r.summary_json, {}), entries: json.parse(r.entries_json, []) }));

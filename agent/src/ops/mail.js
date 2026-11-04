@@ -620,7 +620,7 @@ async function verifyDkim(layout) {
 async function verifyDomainLists(layout) {
   const out = {};
   for (const [name, file] of [['local_domains', layout.localDomainsFile], ['relay_to_domains', layout.relayDomainsFile]]) {
-    const { code, stdout } = await exec(layout.bin, ['-bP', 'domainlist', name], { allowFailure: true, timeoutMs: 30_000 });
+    const { code, stdout } = await exec(layout.bin, ['-bP', `+${name}`], { allowFailure: true, timeoutMs: 30_000 });
     out[name] = code === 0 && stdout.includes(file);
   }
   const hooked = out.local_domains && out.relay_to_domains;

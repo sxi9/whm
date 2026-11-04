@@ -1,10 +1,85 @@
 import { useState } from 'react';
 import { AlertTriangle } from 'lucide-react';
+import { api } from '../../../api/client.js';
+import { useApi } from '../../../hooks/useApi.js';
 import { PageHeader, Card, Loading, StatusPill, KeyValue } from '../../../components/Common.jsx';
-import { Field, NumberInput, Toggle } from '../../../components/Form.jsx';
-import { useSettingsForm, SaveBar, RequestError, DaemonNotice, LastApply, UnitPill, Tabs, ListEditor, Hints, ToggleList } from '../../service-config/Shared.jsx';
+import { Field, NumberInput, Toggle, Button } from '../../../components/Form.jsx';
+import { useConfirm } from '../../../components/Modal.jsx';
+import { useToast } from '../../../components/Toast.jsx';
+import { useSettingsForm, SaveBar, RequestError, DaemonNotice, LastApply, UnitPill, Tabs, ListEditor, Hints, ToggleList, isCapabilityError } from '../../service-config/Shared.jsx';
 
 const LOG_ITEMS = [{ value: '+smtp_connection', label: 'SMTP connections' }, { value: '+subject', label: 'Subjects' }, { value: '+tls_cipher', label: 'TLS cipher' }, { value: '+received_recipients', label: 'Received recipients' }, { value: '+sender_on_delivery', label: 'Sender on delivery' }, { value: '+smtp_incomplete_transaction', label: 'Incomplete transactions' }, { value: '+all_parents', label: 'All parents' }, { value: '+arguments', label: 'Command arguments' }, { value: '+smtp_protocol_error', label: 'Protocol errors' }, { value: '+smtp_syntax_error', label: 'Syntax errors' }];
+
+const yesNo = (v) => (v == null ? <StatusPill status="unknown">unknown</StatusPill> : v ? <StatusPill status="ok">yes</StatusPill> : <StatusPill status="warning">no</StatusPill>);
+
+const submissionPortsLabel = (p) => (!p?.enabled ? <StatusPill status="warning">off</StatusPill> : p.port465 ? <StatusPill status="ok">465 + 587</StatusPill> : <span><StatusPill status="ok">587 only</StatusPill> <span className="muted">(no Exim TLS preset)</span></span>);
+
+// POST /service-config/virtual-mail/apply after the operator confirms; every
+// warning the apply reports becomes its own toast.
+export async function applyVirtualMail({ enabled, confirm, toast, refetch }) {
+  const ok = await confirm(enabled
+    ? { title: 'Apply virtual mailboxes?', message: 'Writes the Dovecot passdb/userdb include and the Exim router, transport and authenticator fragments, validates them and reloads both daemons. Panel-created mailboxes are delivered and authenticated once Exim loads the fragments.', confirmLabel: 'Apply' }
+    : { title: 'Disable virtual mailboxes?', message: 'Removes the Exim fragments and the Dovecot include and reloads both daemons. Panel-created mailboxes stop receiving mail and their logins stop working until virtual mail is applied again.', confirmLabel: 'Disable', danger: true });
+  if (!ok) return null;
+  try {
+    const { data: d } = await api.post('/service-config/virtual-mail/apply', { enabled });
+    if (!enabled) toast.success('Virtual mailboxes disabled');
+    else if (d.live) toast.success('Virtual mailboxes are live');
+    else toast.warning(`Virtual mail written but not live${d.lastApply?.error ? `: ${d.lastApply.error}` : ''}`);
+    for (const w of d.warnings || []) toast.warning(w);
+    await refetch?.();
+    return d;
+  } catch (err) {
+    if (isCapabilityError(err)) toast.warning(err.message); else toast.error(err);
+    await refetch?.();
+    return null;
+  }
+}
+
+export function VirtualMailCard() {
+  const confirm = useConfirm();
+  const toast = useToast();
+  const { data, loading, error, refetch } = useApi('/service-config/virtual-mail');
+  const [busy, setBusy] = useState(null);
+  const run = async (enabled) => { setBusy(enabled ? 'apply' : 'disable'); try { await applyVirtualMail({ enabled, confirm, toast, refetch }); } finally { setBusy(null); } };
+  const slots = data?.exim?.slots || {};
+  const manual = data?.exim?.manualIncludes || [];
+  return (
+    <Card title="Virtual mailboxes" subtitle="Exim and Dovecot wiring for panel-created mailboxes: Dovecot passdb/userdb include, Exim router, transport and authenticators." actions={data && (
+      <>
+        <LastApply apply={data.lastApply} />
+        <Button variant="primary" size="sm" loading={busy === 'apply'} disabled={Boolean(busy)} onClick={() => run(true)}>Apply</Button>
+        <Button variant="danger" size="sm" loading={busy === 'disable'} disabled={Boolean(busy) || data.enabled === false} onClick={() => run(false)}>Disable</Button>
+      </>
+    )}>
+      <RequestError error={error} onRetry={refetch} />
+      {loading && !data && <Loading />}
+      {data && (
+        <>
+          <KeyValue items={[
+            ['Live', yesNo(data.live)],
+            ['Enabled', yesNo(data.enabled)],
+            ['Dovecot', data.dovecot?.installed ? <span key="d"><StatusPill status="ok">installed</StatusPill> {data.dovecot.version ? `version ${data.dovecot.version}` : ''}</span> : <StatusPill key="d" status="not-installed">not installed</StatusPill>],
+            ...['router', 'transport', 'auth'].map((k) => [`Exim ${k} fragment`, slots[k] ? <span key={k}><code>{slots[k].path}</code> {slots[k].hooked ? <StatusPill status="ok">hooked</StatusPill> : <StatusPill status="warning">not hooked</StatusPill>}{k === 'router' && slots[k].precedes === false ? <> <StatusPill status="warning">after a local-delivery router</StatusPill></> : null}</span> : '—']),
+            data.check && ['Rendered check', <span key="c">router {yesNo(data.check.routerHooked)} · auth {yesNo(data.check.authHooked)} · transport {yesNo(data.check.transportHooked)}</span>],
+            ['Submission ports', submissionPortsLabel(data.submissionPorts)],
+          ]} />
+          {(data.warnings || []).map((w) => <div key={w} className="banner banner-warning"><AlertTriangle size={18} /><div>{w}</div></div>)}
+          {manual.length > 0 && (
+            <div className="banner banner-info">
+              <AlertTriangle size={18} />
+              <div>
+                <strong>Manual include lines required on this layout</strong>
+                <p>On unsplit Debian hosts (and monolithic RHEL configs) Exim builds its configuration from <code>{manual[0].file || data.exim?.mainConf || 'exim4.conf.template'}</code>, which the panel never edits. Add these {manual.length === 1 ? 'line' : `${manual.length} lines`} once, then run <code>update-exim4.conf</code> (Debian) and reload Exim:</p>
+                <pre className="log">{manual.map((m) => `${m.line}    # ${m.where}`).join('\n')}</pre>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}
 
 export default function EximConfigurationManager({ fn }) {
   const [tab, setTab] = useState('filters');
@@ -22,7 +97,7 @@ export default function EximConfigurationManager({ fn }) {
       <PageHeader fn={fn} description="Server-wide Exim policy: RBLs, SPF/DKIM verification, connection and rate limits, dictionary attack protection, message size and SMTP AUTH. Rendered into panel-managed fragments, validated with exim -bV (rolled back on error) and reloaded." />
       <RequestError error={form.error} onRetry={form.refetch} />
       {form.loading && !data && <Loading />}
-      {data && draft && (
+      {data && (
         <>
           <DaemonNotice installed={data.installed} message="Exim is not installed on this server. Install exim4 (Debian/Ubuntu) or exim (RHEL); the policy you save here is kept and rendered once it is." onRetry={form.refetch} />
           <Card title="Mail server" actions={<LastApply apply={data.lastApply} />}>
@@ -39,8 +114,13 @@ export default function EximConfigurationManager({ fn }) {
               ['Email category', data.emailCategory ? <span key="e"><StatusPill status="ok">loaded</StatusPill> <span className="muted">filters, greylisting and DKIM keys are managed there</span></span> : <StatusPill key="e" status="muted">not loaded</StatusPill>],
             ]} />
           </Card>
+          <VirtualMailCard />
           <Hints hints={hints} />
           {(data.warnings || []).map((w) => <div key={w} className="banner banner-warning"><AlertTriangle size={18} /><div>{w}</div></div>)}
+        </>
+      )}
+      {data && draft && (
+        <>
           <Tabs value={tab} onChange={setTab} tabs={[{ value: 'filters', label: 'RBLs and verification' }, { value: 'limits', label: 'Limits and rate limiting' }, { value: 'attack', label: 'Dictionary attack protection' }, { value: 'auth', label: 'Auth, size and logging' }, { value: 'preview', label: 'Generated config' }]} />
           {(tab === 'filters' || tab === 'attack') && data.installed && !rcptLive && (
             <div className="banner banner-warning"><AlertTriangle size={18} /><div><strong>Rejection rules are not in force.</strong> They live in the RCPT ACL chain, which Exim does not include on this host{slot('acl_rcpt')?.hookable && !slot('acl_rcpt')?.claimedBy ? ' until the next save hooks it in' : slot('acl_rcpt')?.claimedBy ? ' because another definition of its hook macro came first (save the Email filters page once, or see the step above)' : ' (see the manual step above)'}. Saving writes the chain but reports the apply as not ok until Exim includes it; until then the RBL, reverse-DNS, HELO, sender-verification and dictionary-attack settings only tag messages.</div></div>
@@ -94,6 +174,7 @@ export default function EximConfigurationManager({ fn }) {
             <Card className="config-fields">
               <Field label="Maximum message size (MB)" help="message_size_limit"><NumberInput value={draft.maxMessageSizeMb} onChange={set('maxMessageSizeMb')} min={1} max={2048} nullable={false} /></Field>
               <Field inline><Toggle checked={draft.requireTlsForAuth} onChange={set('requireTlsForAuth')} label="Only advertise SMTP AUTH over TLS" description="Prevents passwords being sent in clear text on port 25/587 before STARTTLS" /></Field>
+              <Field inline><Toggle checked={draft.submissionPorts} onChange={set('submissionPorts')} label="Submission ports 465/587" description="Adds daemon_smtp_ports = 25 : 465 : 587 with TLS on connect for 465. Port 465 needs the Exim TLS preset applied under SSL/TLS Configuration, and both ports must be opened in the firewall." /></Field>
               <Field label="Extra log selectors" help="Added to log_selector"><ToggleList options={LOG_ITEMS} value={draft.logSelector} onChange={set('logSelector')} /></Field>
             </Card>
           )}

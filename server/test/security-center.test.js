@@ -961,6 +961,28 @@ describe('security advisor', () => {
   });
 });
 
+describe('account-panel mail wiring in the advisor', () => {
+  it('reports routerHooked/authHooked from vmail.render.check and isolates a failing check', async () => {
+    await provision(true);
+    app.agent.set('vmail.render.check', () => ({ dovecot: { installed: true, version: '2.4.2', configOk: true }, exim: { installed: true, configOk: true }, routerHooked: false, transportHooked: false, authHooked: false, hint: 'Exim has no "whm_virtual_user" router' }));
+    try {
+      let byId = Object.fromEntries((await post('/api/security/advisor/scan')).body.data.findings.map((f) => [f.id, f]));
+      expect(byId['panel.mail.router']).toMatchObject({ grade: 'warning', title: 'Exim has no virtual-mailbox router', fix: { path: '/service-configuration/exim-configuration-manager' } });
+      expect(byId['panel.mail.router'].detail).toMatch(/never applied on this server/);
+      expect(byId['panel.mail.auth']).toMatchObject({ grade: 'warning', title: 'Exim has no Dovecot authenticator' });
+      app.agent.set('vmail.render.check', () => ({ dovecot: { installed: true, configOk: true }, exim: { installed: true, configOk: true }, routerHooked: true, transportHooked: true, authHooked: true, hint: null }));
+      byId = Object.fromEntries((await post('/api/security/advisor/scan')).body.data.findings.map((f) => [f.id, f]));
+      expect(byId['panel.mail.router'].grade).toBe('ok');
+      expect(byId['panel.mail.auth'].grade).toBe('ok');
+      expect(byId['panel.mail.submission']).toMatchObject({ grade: 'info', title: 'SMTP submission ports 465/587 are not enabled' });
+      app.agent.fail('vmail.render.check', 'timeout', 'agent timed out');
+      byId = Object.fromEntries((await post('/api/security/advisor/scan')).body.data.findings.map((f) => [f.id, f]));
+      expect(byId['panel.mail.check']).toMatchObject({ grade: 'info', title: 'Could not check the virtual-mail configuration' });
+      expect(byId['panel.mail.router']).toBeUndefined();
+    } finally { app.agent.reset('vmail.render.check'); }
+  });
+});
+
 describe('PHP advisories', () => {
   const PHP = (id, version, extra = {}) => ({ id, label: `PHP ${id}`, binary: `/usr/bin/php${id}`, layout: 'debian', version, iniPath: `/etc/php/${id}/fpm/php.ini`, poolDir: `/etc/php/${id}/fpm/pool.d`, fpmUnit: `php${id}-fpm`, isDefault: false, fpmInstalled: true, fpmActive: true, ...extra });
   const withPhp = async (versions) => {
@@ -1047,6 +1069,38 @@ describe('PHP advisories', () => {
       expect(fixed['php.advisory.CVE-2026-109619']).toBeUndefined();
       expect(fixed['php.advisories']).toMatchObject({ grade: 'ok', title: 'Installed PHP 8.3.36, 8.2.35 not affected by 1 listed advisory' });
     } finally { app.agent.reset('pkg.php.versions'); }
+  });
+
+  it('a distro package whose changelog records the CVE is reported as fixed by the distribution, never silently on other layouts or errors', async () => {
+    await provision(true);
+    await withPhp([PHP('8.5', '8.5.4', { isDefault: true }), PHP('8.3', '8.3.35'), PHP('ea-php82', '8.2.10', { layout: 'ea4' })]);
+    const calls = [];
+    app.agent.set('pkg.php.backports', ({ version, ids }) => {
+      calls.push({ version, ids });
+      if (version === '8.5') return { version, package: 'php8.5-fpm', layout: 'debian', checked: true, installed: '8.5.4-0ubuntu1.5', source: '/usr/share/doc/php8.5-fpm/changelog.Debian.gz', mentioned: ['CVE-2026-109619'] };
+      return { version, package: 'php8.3-fpm', layout: 'debian', checked: true, installed: '8.3.35-1', source: '/usr/share/doc/php8.3-fpm/changelog.Debian.gz', mentioned: [] };
+    });
+    try {
+      const byId = await scanById();
+      // Only the distro layouts are asked, with every CVE id the advisory names.
+      expect(calls.map((c) => c.version).sort()).toEqual(['8.3', '8.5']);
+      expect(calls[0].ids).toEqual(expect.arrayContaining(['CVE-2026-109619']));
+      expect(byId['php.advisory.CVE-2026-109619.backported']).toMatchObject({ grade: 'ok', title: 'PHP 8.5.4 (default) carries the distribution fix for CVE-2026-109619' });
+      expect(byId['php.advisory.CVE-2026-109619.backported'].detail).toContain('php8.5-fpm 8.5.4-0ubuntu1.5: the package changelog records CVE-2026-109619');
+      expect(byId['php.advisory.CVE-2026-109619']).toMatchObject({ grade: 'critical', title: 'PHP 8.3.35, 8.2.10 are affected by CVE-2026-109619' });
+      expect(byId['php.advisory.CVE-2026-109619'].versions.map((v) => v.version)).toEqual(['8.3.35', '8.2.10']);
+      // Every hit backported: no critical finding, the ok summary appears.
+      await withPhp([PHP('8.5', '8.5.4', { isDefault: true })]);
+      const fixed = await scanById();
+      expect(fixed['php.advisory.CVE-2026-109619']).toBeUndefined();
+      expect(fixed['php.advisory.CVE-2026-109619.backported'].grade).toBe('ok');
+      expect(fixed['php.advisories']).toMatchObject({ grade: 'ok' });
+      // A changelog that cannot be read, or an agent failure, keeps the version verdict (fail closed).
+      app.agent.set('pkg.php.backports', ({ version }) => ({ version, package: 'php8.5-fpm', layout: 'debian', checked: false, installed: null, source: null, mentioned: [] }));
+      expect((await scanById())['php.advisory.CVE-2026-109619']).toMatchObject({ grade: 'critical' });
+      app.agent.fail('pkg.php.backports', 'command_failed', 'dpkg-query exploded');
+      expect((await scanById())['php.advisory.CVE-2026-109619']).toMatchObject({ grade: 'critical' });
+    } finally { app.agent.reset('pkg.php.backports'); app.agent.reset('pkg.php.versions'); }
   });
 
   it('reports no PHP as informational and an empty or broken list as something to update', async () => {

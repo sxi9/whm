@@ -152,26 +152,24 @@ rsync -a --delete \
   "$SRC_DIR"/ "$APP_DIR"/
 
 log "Installing dependencies and building the web interface"
-( cd "$APP_DIR" && npm ci --no-audit --no-fund && npm run build --workspace client && npm prune --omit=dev --no-audit --no-fund )
+# hub and hub/ui are root workspaces, so this one npm ci installs their dependencies too. An npm ci
+# run inside a workspace directory rebuilds the root node_modules for that workspace alone and
+# drops the panel's packages (better-sqlite3 among them).
+( cd "$APP_DIR" && npm ci --no-audit --no-fund && npm run build --workspace client )
 if [ "$WITH_HUB" -eq 1 ]; then
-  log "Installing hub dependencies"
-  ( cd "$APP_DIR/hub" && npm ci --omit=dev --no-audit --no-fund )
-  # The portal is its own npm package (not a root workspace): npm ci with a lockfile, npm install
-  # without one. Build tooling is removed after the build; serve_ui only needs hub/ui/dist.
+  # Build tooling is removed by the prune below; serve_ui only needs hub/ui/dist.
   if [ "${HUB_SKIP_UI:-0}" = "1" ]; then
     log "HUB_SKIP_UI=1: hub/ui is not built; set serve_ui to false in hub.conf or build it later"
   elif [ -f "$APP_DIR/hub/ui/package.json" ] && grep -q '"build"' "$APP_DIR/hub/ui/package.json"; then
     log "Building the hub portal (hub/ui)"
-    if [ -f "$APP_DIR/hub/ui/package-lock.json" ]; then HUB_UI_INSTALL=(npm ci --no-audit --no-fund); else HUB_UI_INSTALL=(npm install --no-audit --no-fund); fi
-    if ( cd "$APP_DIR/hub/ui" && "${HUB_UI_INSTALL[@]}" && npm run build ); then
-      rm -rf "$APP_DIR/hub/ui/node_modules"
-    else
+    if ! ( cd "$APP_DIR" && npm run build --workspace hub/ui ); then
       log "hub/ui build failed; the hub API still runs, the portal is served once hub/ui/dist exists (set serve_ui accordingly)"
     fi
   else
     log "hub/ui has no build script in this checkout; the hub API runs without the portal (set serve_ui to false if the warning bothers you)"
   fi
 fi
+( cd "$APP_DIR" && npm prune --omit=dev --no-audit --no-fund )
 chown -R root:root "$APP_DIR"
 chmod -R o-w "$APP_DIR"
 

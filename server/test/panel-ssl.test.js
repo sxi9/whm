@@ -77,6 +77,15 @@ describe('Customer panel: SSL', () => {
     expect((await alice.get('/ssl/domains/bob.com')).status).toBe(404);
   });
 
+  it('says plainly when an own hostname has no certificate installed', async () => {
+    const res = await alice.get('/ssl/domains/alice.com');
+    expect(res.status).toBe(404);
+    expect(res.body.error).toMatchObject({ code: 'not_found', message: 'No certificate is installed on alice.com' });
+    expect(res.body.error.message).not.toMatch(/not found/);
+    const foreign = await alice.get('/ssl/domains/bob.com');
+    expect(foreign.body.error.message).toBe('Domain "bob.com" not found');
+  });
+
   it('answers 501 for "issue now" while AutoSSL is disabled, then enqueues a never-forced job', async () => {
     const off = await alice.post('/ssl/domains/alice.com/issue', {});
     expect(off.status).toBe(501);

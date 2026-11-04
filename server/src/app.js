@@ -12,7 +12,9 @@ import { attachUser } from './middleware/auth.js';
 import { csrfProtection } from './middleware/csrf.js';
 import { createAudit } from './middleware/audit.js';
 import { errorHandler, notFoundHandler } from './middleware/error.js';
+import { tlsRedirect } from './middleware/tls-redirect.js';
 import { apiRouter } from './routes/index.js';
+import { requestLogLevel, requestLogMessage, requestLogObject } from './lib/request-log.js';
 
 // A caller may name its request for log correlation, but only with a short
 // plain id; anything else is replaced so logs and error bodies stay clean.
@@ -21,6 +23,13 @@ export const acceptedRequestId = (value) => (typeof value === 'string' && REQUES
 // Streams are matched on the path alone: a query string is never consulted,
 // so "?x=/stream" cannot opt a request out of the limiter or the access log.
 export const isStreamRequest = (req) => /\/stream$/i.test(String(req.originalUrl ?? req.url ?? '').split('?')[0]);
+// Job streams (system and the account panel's) are long-lived SSE responses
+// that would log one access line per open tab; they are kept out of the log.
+const JOB_STREAM_RE = /\/jobs\/[^/]+\/stream$/i;
+export const skipsAccessLog = (req) => {
+  const url = String(req.originalUrl ?? req.url ?? '').split('?')[0];
+  return isStreamRequest(req) && (url.startsWith('/api/system/jobs/') || JOB_STREAM_RE.test(url));
+};
 
 export async function createApp(ctx) {
   const { config, db, logger, crypto: cryptoSvc } = ctx;
@@ -32,13 +41,16 @@ export async function createApp(ctx) {
   app.use(pinoHttp({
     logger,
     genReqId: (req) => req.id,
-    autoLogging: { ignore: (req) => String(req.originalUrl ?? req.url).startsWith('/api/system/jobs/') && isStreamRequest(req) },
-    customLogLevel: (_req, res, err) => (err || res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info'),
+    autoLogging: { ignore: skipsAccessLog },
+    customLogLevel: (_req, res, err) => requestLogLevel(res, err),
+    customErrorMessage: (_req, res, err) => requestLogMessage(res, err),
+    customErrorObject: (_req, res, err, obj) => requestLogObject(res, err, obj),
     serializers: {
       req: (req) => ({ id: req.id, method: req.method, url: req.url, ip: req.remoteAddress }),
       res: (res) => ({ statusCode: res.statusCode }),
     },
   }));
+  if (config.tls && config.httpRedirect !== false) app.use(tlsRedirect(config));
   app.use(helmet({
     contentSecurityPolicy: {
       directives: {

@@ -37,7 +37,7 @@ export const DEFAULTS = {
   webdisk: { enabled: true, port: 2077, sslPort: 2078, requireSsl: true, allowDigestAuth: true, allowAnonymousDiscovery: false, maxUploadMb: 2048, idleTimeoutMinutes: 30, allowedAccounts: 'all' },
   webservices: { apiEnabled: true, tokenLifetimeMinutes: 1440, sessionTimeoutMinutes: 60, maxConcurrentRequests: 200, rateLimitPerMinute: 600, allowedOrigins: [], enableCompression: true, requestLogRetentionDays: 30, exposeVersion: false, ipv6Listen: true },
   // `tls` is null until SSL/TLS Configuration hands a preset over (applyEximTls); nothing TLS-related is rendered before that.
-  exim: { rblEnabled: true, rbls: ['zen.spamhaus.org', 'bl.spamcop.net'], domainRblEnabled: false, domainRbls: ['dbl.spamhaus.org'], spfVerify: true, spfReject: false, dkimVerify: true, dkimReject: false, reverseDnsRequired: false, verifySender: true, requireHelo: true, maxMessageSizeMb: 50, smtpAcceptMax: 100, smtpAcceptMaxPerHost: 10, smtpAcceptQueuePerConnection: 10, ratelimitEnabled: true, ratelimitMailThreshold: 10, ratelimitMailDelay: 1, ratelimitRcptThreshold: 50, ratelimitRcptDelay: 1, dictionaryAttackProtection: true, maxUnknownCommands: 3, rcptFailLimit: 4, rcptFailDelay: 10, recipientsMax: 100, recipientsMaxReject: true, requireTlsForAuth: true, logSelector: ['+smtp_connection', '+subject', '+tls_cipher'], tls: null },
+  exim: { rblEnabled: true, rbls: ['zen.spamhaus.org', 'bl.spamcop.net'], domainRblEnabled: false, domainRbls: ['dbl.spamhaus.org'], spfVerify: true, spfReject: false, dkimVerify: true, dkimReject: false, reverseDnsRequired: false, verifySender: true, requireHelo: true, maxMessageSizeMb: 50, smtpAcceptMax: 100, smtpAcceptMaxPerHost: 10, smtpAcceptQueuePerConnection: 10, ratelimitEnabled: true, ratelimitMailThreshold: 10, ratelimitMailDelay: 1, ratelimitRcptThreshold: 50, ratelimitRcptDelay: 1, dictionaryAttackProtection: true, maxUnknownCommands: 3, rcptFailLimit: 4, rcptFailDelay: 10, recipientsMax: 100, recipientsMaxReject: true, requireTlsForAuth: true, submissionPorts: false, logSelector: ['+smtp_connection', '+subject', '+tls_cipher'], tls: null },
   mailserver: { protocols: ['imap', 'pop3', 'lmtp'], maxUserIpConnections: 20, processLimit: 1000, clientLimit: 1000, ssl: 'required', sslMinProtocol: 'TLSv1.2', sslCipherList: '', sslCipherSuites: '', sslPreferServerCiphers: false, disablePlaintextAuth: true, loginGreeting: '', imapIdleNotifyIntervalMinutes: 2, pop3UidlFormat: '%08Xu%08Xv', mailLocation: 'maildir:~/mail', mailboxFormat: 'maildir' },
   ftp: { passivePortMin: 49152, passivePortMax: 65534, passiveAddress: '', tls: 'optional', maxClients: 50, maxPerIp: 8, anonymous: false, idleTimeoutMinutes: 15, chroot: true, virtualUsers: false },
   nameserver: { server: 'bind', role: 'master' },
@@ -164,6 +164,12 @@ export function renderEximMain(s, layout, support = eximSupport(layout), vm = DE
   if (s.ratelimitEnabled) lines.push('smtp_ratelimit_hosts = *', `smtp_ratelimit_mail = ${s.ratelimitMailThreshold},${s.ratelimitMailDelay}s,1.5,30s`, `smtp_ratelimit_rcpt = ${s.ratelimitRcptThreshold},${s.ratelimitRcptDelay}s,1.5,30s`);
   if (s.dictionaryAttackProtection) lines.push(`smtp_max_unknown_commands = ${s.maxUnknownCommands}`, `recipients_max = ${s.recipientsMax}`, `recipients_max_reject = ${s.recipientsMaxReject ? 'true' : 'false'}`);
   if (s.tls) lines.push(...renderEximTls(s.tls, eximTlsLibrary(layout)));
+  // Listening ports only change when the operator enabled the submission
+  // ports: 587 (STARTTLS) next to 25, and 465 (implicit TLS) only once the
+  // TLS preset exists, since tls_on_connect without a certificate rejects
+  // every connection on that port.
+  if (s.submissionPorts && s.tls) lines.push('# Submission ports for mail clients (Exim Configuration Manager): 587 with STARTTLS, 465 with TLS on connect.', 'daemon_smtp_ports = 25 : 465 : 587', 'tls_on_connect_ports = 465');
+  else if (s.submissionPorts) lines.push('# Submission port for mail clients (Exim Configuration Manager): 587 with STARTTLS; 465 is added once SSL/TLS Configuration applies a TLS preset to Exim.', 'daemon_smtp_ports = 25 : 587');
   if (spam) lines.push('# SpamAssassin for the account panel\'s mailboxes (DATA ACL); only built-in to content-scanning Exim builds.', `spamd_address = ${vm.spamdAddress || DEFAULTS.virtual_mail.spamdAddress}`);
   return `${lines.join('\n')}\n`;
 }
@@ -243,45 +249,83 @@ export function renderEximSpamAcl(layout, support = { contentScan: true }) {
   ];
 }
 
+// Dovecot 2.4 renamed most settings and requires named passdb/userdb sections;
+// the renderers below branch on the detected version.
+export function dovecotIsV24(version) {
+  const m = String(version || '').match(/^(\d+)\.(\d+)/);
+  return Boolean(m) && (Number(m[1]) > 2 || (Number(m[1]) === 2 && Number(m[2]) >= 4));
+}
+
 // Dovecot conf.d/98-whm-virtual-auth.conf: the account panel's mailboxes.
 // Dovecot consults passdbs/userdbs in configuration order, and conf.d sorts
 // this file after 10-auth.conf, so the stock system passdb/userdb answer first
 // for the Linux accounts and fall through (their result_failure is `continue`)
 // for addresses they do not know; username_filter keeps a system user from
 // ever being looked up in a passwd file, and result_success = return-ok stops
-// the chain once a mailbox matched. Exim reaches Dovecot through the
-// auth-client socket (SMTP AUTH) and the lmtp socket (delivery), both opened to
-// the Exim user. Quota rules come from the passwd file (userdb_quota_rule), so
-// system users, who have none, stay unlimited.
-export function renderDovecotVirtualAuth({ passwdDir = '/etc/dovecot/whm/passwd', eximUser = null, eximGroup = null } = {}) {
+// the chain once a mailbox matched. Passwd lines are keyed by the full
+// address (the lookup key is the login name on both versions; 2.4 has no
+// username_format). Exim reaches Dovecot through the auth-client socket
+// (SMTP AUTH) and the lmtp socket (delivery), both opened to the Exim user.
+// Quota limits come from the passwd file (userdb_quota_rule on 2.3,
+// userdb_quota_storage_size on 2.4), so system users stay unlimited.
+export function renderDovecotVirtualAuth({ passwdDir = '/etc/dovecot/whm/passwd', eximUser = null, eximGroup = null, version = null } = {}) {
+  const v24 = dovecotIsV24(version);
   const lines = [
     `${MANAGED} (Customer panel: virtual mailboxes). Rendered by Service Configuration for the account panel; manual changes are overwritten.`,
-    `# Mailboxes live in ${passwdDir}/<domain> (root:dovecot 0640): one passwd-file line per mailbox with the hosting account's uid/gid/home`,
-    '# and userdb_mail / userdb_quota_rule fields. The system passdb/userdb from 10-auth.conf run first (conf.d order) and continue on failure;',
-    '# only logins with a domain part reach the passwd files below.',
+    `# Mailboxes live in ${passwdDir}/<domain> (root:dovecot 0640): one passwd-file line per mailbox, keyed by local@domain, with the hosting`,
+    `# account's uid/gid/home and the ${v24 ? 'userdb_mail_driver / userdb_mail_path / userdb_quota_storage_size' : 'userdb_mail / userdb_quota_rule'} fields. The system passdb/userdb from 10-auth.conf`,
+    '# run first (conf.d order) and continue on failure; only logins with a domain part reach the passwd files below.',
     'auth_mechanisms = plain login',
-    'passdb {',
-    '  driver = passwd-file',
-    `  args = scheme=SHA512-CRYPT username_format=%n ${passwdDir}/%d`,
-    '  username_filter = *@*',
-    '  result_success = return-ok',
-    '  result_failure = continue',
-    '  result_internalfail = continue',
-    '}',
-    'userdb {',
-    '  driver = passwd-file',
-    `  args = username_format=%n ${passwdDir}/%d`,
-    '  result_success = return-ok',
-    '  result_failure = continue',
-    '}',
-    '# Per-mailbox quota from the passwd file; no rule means unlimited.',
-    'mail_plugins = $mail_plugins quota',
-    'plugin {',
-    '  quota = maildir:User quota',
-    '}',
-    'protocol imap {',
-    '  mail_plugins = $mail_plugins imap_quota',
-    '}',
+    ...(v24 ? [
+      'passdb passwd-file {',
+      `  passwd_file_path = ${passwdDir}/%{user | domain}`,
+      '  default_password_scheme = SHA512-CRYPT',
+      '  username_filter = *@*',
+      '  result_success = return-ok',
+      '  result_failure = continue',
+      '  result_internalfail = continue',
+      '}',
+      'userdb passwd-file {',
+      `  passwd_file_path = ${passwdDir}/%{user | domain}`,
+      '  result_success = return-ok',
+      '  result_failure = continue',
+      '}',
+      '# Per-mailbox quota from the passwd file (userdb_quota_storage_size); no field means unlimited.',
+      'mail_plugins {',
+      '  quota = yes',
+      '}',
+      'quota_driver = count',
+      'quota "User quota" {',
+      '}',
+      'protocol imap {',
+      '  mail_plugins {',
+      '    imap_quota = yes',
+      '  }',
+      '}',
+    ] : [
+      'passdb {',
+      '  driver = passwd-file',
+      `  args = scheme=SHA512-CRYPT ${passwdDir}/%d`,
+      '  username_filter = *@*',
+      '  result_success = return-ok',
+      '  result_failure = continue',
+      '  result_internalfail = continue',
+      '}',
+      'userdb {',
+      '  driver = passwd-file',
+      `  args = ${passwdDir}/%d`,
+      '  result_success = return-ok',
+      '  result_failure = continue',
+      '}',
+      '# Per-mailbox quota from the passwd file; no rule means unlimited.',
+      'mail_plugins = $mail_plugins quota',
+      'plugin {',
+      '  quota = maildir:User quota',
+      '}',
+      'protocol imap {',
+      '  mail_plugins = $mail_plugins imap_quota',
+      '}',
+    ]),
   ];
   if (eximUser) {
     lines.push('# Exim: SMTP AUTH through the dovecot authenticators and delivery through LMTP.',
@@ -319,7 +363,7 @@ export function renderEximVirtualRouters(layout) {
     '  unseen',
     `  domains = \${if exists{${v.aliasesDir}}{dsearch;${v.aliasesDir}}{}}`,
     `  local_parts = \${if exists{${v.aliasesDir}/$domain_data}{lsearch;${v.aliasesDir}/$domain_data}{}}`,
-    `  condition = \${if and{{exists{${v.passwdDir}/$domain_data}}{!eq{\${lookup{$local_part}lsearch{${v.passwdDir}/$domain_data}{found}{}}}{}}}}`,
+    `  condition = \${if and{{exists{${v.passwdDir}/$domain_data}}{!eq{\${lookup{$local_part@$domain_data}lsearch{${v.passwdDir}/$domain_data}{found}{}}}{}}}}`,
     '  data = $local_part_data',
     '  allow_fail',
     '  allow_defer',
@@ -331,7 +375,7 @@ export function renderEximVirtualRouters(layout) {
     '  driver = redirect',
     `  domains = \${if exists{${v.aliasesDir}}{dsearch;${v.aliasesDir}}{}}`,
     `  local_parts = \${if exists{${v.aliasesDir}/$domain_data}{lsearch;${v.aliasesDir}/$domain_data}{}}`,
-    `  condition = \${if or{{!exists{${v.passwdDir}/$domain_data}}{eq{\${lookup{$local_part}lsearch{${v.passwdDir}/$domain_data}{found}{}}}{}}}}`,
+    `  condition = \${if or{{!exists{${v.passwdDir}/$domain_data}}{eq{\${lookup{$local_part@$domain_data}lsearch{${v.passwdDir}/$domain_data}{found}{}}}{}}}}`,
     '  data = $local_part_data',
     '  allow_fail',
     '  allow_defer',
@@ -358,11 +402,11 @@ export function renderEximVirtualRouters(layout) {
     '    }}',
     '  transport = whm_autoreply',
     '',
-    '# Mailboxes: the local part is a line of the domain\'s passwd file.',
+    '# Mailboxes: the address (local@domain) is a line of the domain\'s passwd file.',
     `${VMAIL_NAMES.router}:`,
     '  driver = accept',
     `  domains = \${if exists{${v.passwdDir}}{dsearch;${v.passwdDir}}{}}`,
-    `  local_parts = \${if exists{${v.passwdDir}/$domain_data}{lsearch;${v.passwdDir}/$domain_data}{}}`,
+    `  condition = \${if exists{${v.passwdDir}/$domain_data}{\${lookup{$local_part@$domain_data}lsearch{${v.passwdDir}/$domain_data}{yes}{no}}}{no}}`,
     `  transport = ${VMAIL_NAMES.transport}`,
     '',
     '# Default address of a domain ("*" in its forwarders file), for anything no mailbox or forwarder took.',
@@ -438,17 +482,34 @@ export function dovecotSupportsCipherSuites(version) {
   return maj > 2 || (maj === 2 && (min > 3 || (min === 3 && pat >= 15)));
 }
 
+// 2.4 replaced the %-letter variables of pop3_uidl_format with %{...}
+// expressions; only the stock 2.3 format is translated, anything else keeps
+// Dovecot's own default rather than risk a rejected file.
+const POP3_UIDL_V24 = { '%08Xu%08Xv': '%{uid | hex(8)}%{uidvalidity | hex(8)}', '%v-%u': '%{uidvalidity}-%{uid}', '%v.%u': '%{uidvalidity}.%{uid}' };
+
 export function renderDovecot(s, { version = null } = {}) {
+  const v24 = dovecotIsV24(version);
   const lines = [`${MANAGED} (Mailserver Configuration). Protocols, limits, ssl= and ciphers live here; certificate paths come from 90-whm-ssl-cert.conf. Edit through the panel.`, `protocols = ${s.protocols.join(' ')}`];
-  lines.push(`ssl = ${s.ssl}`, `ssl_min_protocol = ${s.sslMinProtocol}`, `disable_plaintext_auth = ${s.disablePlaintextAuth ? 'yes' : 'no'}`);
+  lines.push(`ssl = ${s.ssl}`, `ssl_min_protocol = ${s.sslMinProtocol}`, v24 ? `auth_allow_cleartext = ${s.disablePlaintextAuth ? 'no' : 'yes'}` : `disable_plaintext_auth = ${s.disablePlaintextAuth ? 'yes' : 'no'}`);
   if (s.sslCipherList) lines.push(`ssl_cipher_list = ${s.sslCipherList}`);
   if (s.sslCipherSuites && dovecotSupportsCipherSuites(version)) lines.push(`ssl_cipher_suites = ${s.sslCipherSuites}`);
-  lines.push(`ssl_prefer_server_ciphers = ${s.sslPreferServerCiphers ? 'yes' : 'no'}`);
+  lines.push(v24 ? `ssl_server_prefer_ciphers = ${s.sslPreferServerCiphers ? 'server' : 'client'}` : `ssl_prefer_server_ciphers = ${s.sslPreferServerCiphers ? 'yes' : 'no'}`);
   lines.push(`mail_max_userip_connections = ${s.maxUserIpConnections}`, `default_process_limit = ${s.processLimit}`, `default_client_limit = ${s.clientLimit}`);
-  if (s.mailLocation) lines.push(`mail_location = ${s.mailLocation}`);
+  if (s.mailLocation) {
+    if (v24) {
+      // mail_location "driver:path[:extras]" became mail_driver + mail_path; the extras have no 2.4 equivalent here.
+      const [driver, mailPath] = s.mailLocation.split(':');
+      if (driver && mailPath) lines.push(`mail_driver = ${driver}`, `mail_path = ${mailPath}`);
+    } else lines.push(`mail_location = ${s.mailLocation}`);
+  }
   if (s.loginGreeting) lines.push(`login_greeting = ${s.loginGreeting}`);
   if (s.protocols.includes('imap')) lines.push('protocol imap {', `  mail_max_userip_connections = ${s.maxUserIpConnections}`, `  imap_idle_notify_interval = ${s.imapIdleNotifyIntervalMinutes} mins`, '}');
-  if (s.protocols.includes('pop3')) lines.push('protocol pop3 {', `  mail_max_userip_connections = ${Math.max(1, Math.ceil(s.maxUserIpConnections / 2))}`, `  pop3_uidl_format = ${s.pop3UidlFormat}`, '}');
+  if (s.protocols.includes('pop3')) {
+    const uidl = v24 ? (/%\{/.test(s.pop3UidlFormat) ? s.pop3UidlFormat : POP3_UIDL_V24[s.pop3UidlFormat] ?? null) : s.pop3UidlFormat;
+    lines.push('protocol pop3 {', `  mail_max_userip_connections = ${Math.max(1, Math.ceil(s.maxUserIpConnections / 2))}`, ...(uidl ? [`  pop3_uidl_format = ${uidl}`] : []), '}');
+  }
+  // The stock managesieve configuration also listens on the pre-RFC port 2000; only 4190 stays open.
+  if (s.protocols.includes('sieve')) lines.push('service managesieve-login {', '  inet_listener sieve_deprecated {', '    port = 0', '  }', '}');
   return `${lines.join('\n')}\n`;
 }
 
@@ -1142,7 +1203,21 @@ export function createServiceConfigService(ctx) {
   const virtualMail = {
     settings: () => getConf('virtual_mail'),
     renderDovecot(layout, dovecot) {
-      return renderDovecotVirtualAuth({ passwdDir: dovecot?.passwdDir || VMAIL_PATHS(layout).passwdDir, eximUser: layout?.installed === false ? null : layout?.user || null, eximGroup: layout?.group || null });
+      return renderDovecotVirtualAuth({ passwdDir: dovecot?.passwdDir || VMAIL_PATHS(layout).passwdDir, eximUser: layout?.installed === false ? null : layout?.user || null, eximGroup: layout?.group || null, version: dovecot?.version || null });
+    },
+    // The persisted outcome of the last apply (boot job, mailbox trigger or the
+    // admin route): `ok` is whether Exim and Dovecot actually serve the mailboxes.
+    lastApplied: () => lastApply('virtual_mail'),
+    // Driver slots the agent cannot hook itself (unsplit Debian template,
+    // monolithic RHEL config) need a one-time include by the operator; the
+    // panel never edits those files. `.include_if_exists` keeps Exim valid
+    // while the feature is switched off (the slot files are removed then).
+    manualIncludes(layout) {
+      const slots = layout?.slots || {};
+      return ['router', 'transport', 'auth'].filter((k) => slots[k] && !slots[k].hookable).map((k) => ({
+        slot: k, section: slots[k].section, file: layout.mainConf, line: `.include_if_exists ${slots[k].path}`,
+        where: k === 'router' ? `directly after "begin ${slots[k].section}" (before the local-delivery routers)` : `after "begin ${slots[k].section}"`,
+      }));
     },
     render(layout, dovecot) {
       return { dovecot: virtualMail.renderDovecot(layout, dovecot), router: renderEximVirtualRouters(layout), transport: renderEximVirtualTransports(layout), auth: renderEximVirtualAuths(layout, { requireTls: getConf('exim').requireTlsForAuth }) };
@@ -1160,8 +1235,26 @@ export function createServiceConfigService(ctx) {
       const s = getConf('virtual_mail');
       const slots = Object.fromEntries(['router', 'transport', 'auth'].map((k) => [k, layout.slots?.[k] ? { path: layout.slots[k].path, exists: layout.slots[k].exists, hooked: layout.slots[k].hooked ?? null, precedes: layout.slots[k].precedes ?? null, hookable: layout.slots[k].hookable } : null]));
       const installed = capabilities.has('exim') && layout.installed !== false && capabilities.has('dovecot') && dovecot.installed !== false;
-      const live = installed && s.enabled && Object.values(slots).every((x) => x?.hooked) && slots.router.precedes !== false && Boolean(dovecot.includes?.virtualAuth?.exists);
-      return { enabled: s.enabled, installed, exim: { installed: capabilities.has('exim') && layout.installed !== false, slots, hints: layout.hints || [] }, dovecot: { installed: capabilities.has('dovecot') && dovecot.installed !== false, include: dovecot.includes?.virtualAuth ?? null, passwdDirExists: dovecot.passwdDirExists ?? null }, live, warnings: installed ? virtualMail.warnings(layout) : [], lastApply: lastApply('virtual_mail') };
+      const live = installed && s.enabled && Object.values(slots).every((x) => x?.hooked) && slots.router?.precedes !== false && Boolean(dovecot.includes?.virtualAuth?.exists);
+      const manualIncludes = installed ? virtualMail.manualIncludes(layout) : [];
+      const pending = manualIncludes.filter((m) => !slots[m.slot]?.hooked);
+      let check = null;
+      if (installed && typeof ctx.panelEmail?.renderCheck === 'function') { try { check = await ctx.panelEmail.renderCheck(); } catch { check = null; } }
+      const ex = getConf('exim');
+      const submission = Boolean(ex.submissionPorts);
+      return {
+        enabled: s.enabled, installed,
+        exim: { installed: capabilities.has('exim') && layout.installed !== false, flavor: layout.flavor ?? null, splitConfig: layout.splitConfig ?? null, mainConf: layout.mainConf ?? null, slots, hints: layout.hints || [], manualIncludes },
+        dovecot: { installed: capabilities.has('dovecot') && dovecot.installed !== false, version: dovecot.version ?? null, include: dovecot.includes?.virtualAuth ?? null, passwdDirExists: dovecot.passwdDirExists ?? null },
+        live, check,
+        // The effective listeners, as renderEximMain writes them: 465 needs the TLS preset.
+        submissionPorts: { enabled: submission, port465: submission && Boolean(ex.tls), port587: submission, tls: Boolean(ex.tls) },
+        warnings: [
+          ...(installed ? virtualMail.warnings(layout) : []),
+          ...(pending.length ? [`Exim does not load ${pending.map((m) => m.slot).join(', ')} from ${layout.mainConf || 'its configuration'}: add ${pending.map((m) => `"${m.line}" ${m.where}`).join('; ')}, then run update-exim4.conf (Debian) and reload Exim. The panel never edits that file.`] : []),
+        ],
+        lastApply: lastApply('virtual_mail'),
+      };
     },
     async apply({ enabled } = {}, req) {
       const current = getConf('virtual_mail');
@@ -1183,6 +1276,10 @@ export function createServiceConfigService(ctx) {
       try {
         if (next.enabled) {
           result.prepared = await op('web.vmail.prepare', { enabled: true }, req);
+          // Passwd lines from before the key carried the domain are re-keyed
+          // before Dovecot reads the files under the new include; an agent
+          // without the op (split mode, not yet upgraded) must not block the apply.
+          result.rekeyed = await op('vmail.passwd.rekey', {}, req).catch((err) => { ctx.logger?.warn?.({ err }, 'virtual mail: passwd re-key skipped'); return { error: err.message, changed: 0, files: [] }; });
           const dcInclude = dovecot.includes?.virtualAuth;
           result.dovecot = dcInclude?.exists && dcInclude.content === rendered.dovecot
             ? { path: dcInclude.path, unchanged: true, validated: true, reloaded: false }
@@ -1199,11 +1296,13 @@ export function createServiceConfigService(ctx) {
           result.exim.auth = main.applied.auth;
           result.exim.acl_data = { path: main.applied.acl_data.path, hooked: main.applied.acl_data.hooked ?? null, live: !main.inactive.includes('acl_data') };
           result.warnings = virtualMail.warnings(layout);
+          if (result.rekeyed.error) result.warnings.push(`Mailbox passwd files could not be checked for pre-upgrade lines: ${result.rekeyed.error}`);
           result.hints = (await exim.layout()).hints || [];
           const unhooked = ['router', 'transport', 'auth'].filter((k) => !result.exim[k]?.hooked);
           const ordered = result.exim.router?.precedes !== false;
           result.live = unhooked.length === 0 && ordered && result.dovecot.validated !== false;
-          const error = unhooked.length ? `written, but Exim does not load ${unhooked.map((k) => result.exim[k]?.path).join(', ')}` : !ordered ? `the ${VMAIL_NAMES.router} router is loaded after a local-delivery router` : null;
+          result.manualIncludes = virtualMail.manualIncludes(layout).filter((m) => unhooked.includes(m.slot));
+          const error = unhooked.length ? `written, but Exim does not load ${unhooked.map((k) => result.exim[k]?.path).join(', ')}${result.manualIncludes.length ? ` (add ${result.manualIncludes.map((m) => `"${m.line}" ${m.where}`).join('; ')} in ${layout.mainConf}, then update-exim4.conf and reload Exim)` : ''}` : !ordered ? `the ${VMAIL_NAMES.router} router is loaded after a local-delivery router` : null;
           recordApply('virtual_mail', result.live, { exim: Object.fromEntries(Object.entries(result.exim).map(([k, v]) => [k, { path: v.path, hooked: v.hooked ?? null }])), dovecot: result.dovecot.path }, error);
         } else {
           for (const slot of ['router', 'transport', 'auth']) result.exim[slot] = await op('web.exim.include.remove', { slot }, req);
@@ -1278,7 +1377,10 @@ export function createServiceConfigService(ctx) {
       const d = capabilities.has('ftp') ? await op('web.service.detect', { role: 'ftp' }).catch(() => ({ candidates: [], current: null })) : { candidates: [], current: null };
       const target = d.candidates.find((c) => c.name === (d.current || ftp.selected()) && c.installed);
       if (target?.name === 'vsftpd' || (!target && ftp.selected() === 'vsftpd')) throw new CapabilityError('ftp-virtual', 'vsftpd serves system users only; select pure-ftpd or proftpd under FTP Server Selection for per-account FTP logins');
-      if (getConf('ftp').virtualUsers && target && lastApply('ftp')?.ok) return { daemon: target.name, enabled: true, unchanged: true, lastApply: lastApply('ftp') };
+      // The saved setting alone is not proof: a Debian host may hold conf/PureDB
+      // without the auth/ link the wrapper needs, so the daemon's own view decides.
+      const live = target ? await op('ftp.virtual.status', { daemon: target.name }).catch(() => null) : null;
+      if (getConf('ftp').virtualUsers && target && lastApply('ftp')?.ok && live?.enabled) return { daemon: target.name, enabled: true, unchanged: true, lastApply: lastApply('ftp') };
       const r = await ftp.updateSettings({ virtualUsers: true }, req);
       audit(req, { action: 'ftp.virtual_users.enable', target: target?.name ?? ftp.selected(), args: { live: r.live } });
       return { daemon: target?.name ?? ftp.selected(), enabled: true, ...r };

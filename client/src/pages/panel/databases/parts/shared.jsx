@@ -87,12 +87,15 @@ export function InfoNote({ children }) {
   return <div className="banner banner-info"><Info size={18} /><div>{children}</div></div>;
 }
 
+// The account follows its own database jobs here: /api/system/jobs is reseller-only.
+export const jobStreamPath = (id) => `/panel/databases/jobs/${id}/stream`;
+
 // A 202 job followed live; closes on request, the parent refetches on finish.
 export function JobModal({ job, title, onClose, onFinished, children }) {
   return (
     <Modal open={Boolean(job)} title={title} onClose={onClose} size="lg" footer={<button className="btn btn-primary" onClick={onClose}>Close</button>}>
       {children}
-      {job && <ProgressLog jobId={job.id} onFinished={onFinished} />}
+      {job && <ProgressLog jobId={job.id} onFinished={onFinished} streamPath={jobStreamPath} />}
     </Modal>
   );
 }

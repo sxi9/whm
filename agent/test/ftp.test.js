@@ -2,7 +2,8 @@ import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { assertFtpDir, assertLoginFree, parsePurePwList, login, PURE_PASSWD, PURE_PDB, PROFTPD_PASSWD } from '../src/ops/ftp.js';
+import { assertFtpDir, assertLoginFree, parsePurePwList, pureFtpdVirtualStatus, login, PURE_PASSWD, PURE_PDB, PROFTPD_PASSWD } from '../src/ops/ftp.js';
+import { pureFtpdAuthLink, PURE_FTPD_AUTH_LINK } from '../src/ops/web.js';
 
 // exec/hasBinary are spied so a test can prove an op refused before any
 // program ran, or hand pure-pw/ftpasswd a canned success to inspect the argv
@@ -212,6 +213,43 @@ describe('read-only helpers', () => {
     expect(parsePurePwList('shop@alice.com      /home/alice/pub/./\nblog@alice.com   /home/alice/blog\n\n')).toEqual([
       { login: 'shop@alice.com', dir: '/home/alice/pub' }, { login: 'blog@alice.com', dir: '/home/alice/blog' },
     ]);
+  });
+
+  // Debian's pure-ftpd-wrapper loads an auth backend only through a symlink in
+  // auth/ whose target basename names it; conf/PureDB alone (as shipped) is not
+  // enough, so the status must not call it enabled.
+  it('pure-ftpd PureDB counts as enabled only with a live auth/ link pointing at conf/PureDB', () => {
+    const confDir = `${root}/pure-ftpd`;
+    fs.mkdirSync(`${confDir}/conf`, { recursive: true });
+    fs.mkdirSync(`${confDir}/auth`, { recursive: true });
+    fs.writeFileSync(`${confDir}/conf/PureDB`, '/etc/pure-ftpd/pureftpd.pdb\n');
+    fs.writeFileSync(`${confDir}/conf/PAMAuthentication`, 'yes\n');
+    fs.symlinkSync('../conf/PAMAuthentication', `${confDir}/auth/70pam`);
+    expect(pureFtpdAuthLink(confDir)).toBeNull();
+    let s = pureFtpdVirtualStatus(confDir);
+    expect(s).toMatchObject({ daemon: 'pure-ftpd', configured: false, enabled: false, authLink: null });
+    expect(s.hint).toMatch(/auth\/50puredb/);
+    // A dangling link is not a backend the wrapper can load.
+    fs.symlinkSync('../conf/Missing', `${confDir}/auth/40missing`);
+    expect(pureFtpdAuthLink(confDir)).toBeNull();
+    // An admin's own link under Debian's README name counts (matched by target, not name).
+    fs.symlinkSync('../conf/PureDB', `${confDir}/auth/50pure`);
+    expect(pureFtpdAuthLink(confDir)).toBe(`${confDir}/auth/50pure`);
+    s = pureFtpdVirtualStatus(confDir);
+    expect(s).toMatchObject({ configured: true, dbFile: '/etc/pure-ftpd/pureftpd.pdb', authLink: `${confDir}/auth/50pure`, hint: null });
+    expect(s.enabled).toBe(hasBinary('pure-pw'));
+    fs.unlinkSync(`${confDir}/auth/50pure`);
+    // A regular file named like the link is not a symlink and does not count.
+    fs.writeFileSync(`${confDir}/auth/${PURE_FTPD_AUTH_LINK}`, '../conf/PureDB\n');
+    expect(pureFtpdAuthLink(confDir)).toBeNull();
+    expect(pureFtpdVirtualStatus(confDir).configured).toBe(false);
+    // No auth dir at all (non-Debian layout) is simply "no link".
+    expect(pureFtpdAuthLink(`${root}/nowhere`)).toBeNull();
+    // The single-file layout keeps reading the PureDB directive.
+    const fileLayout = `${root}/pure-file`;
+    fs.mkdirSync(fileLayout, { recursive: true });
+    fs.writeFileSync(`${fileLayout}/pure-ftpd.conf`, '# comment\nPureDB /etc/pure-ftpd/pureftpd.pdb\n');
+    expect(pureFtpdVirtualStatus(fileLayout, `${fileLayout}/pure-ftpd.conf`)).toMatchObject({ configured: true, dbFile: '/etc/pure-ftpd/pureftpd.pdb', authLink: null });
   });
 
   it('ftp.virtual.status reports every daemon and marks vsftpd unsupported', async () => {

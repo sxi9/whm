@@ -13,7 +13,7 @@ export const SERVICE_REGISTRY = [
   { name: 'imap', display_name: 'IMAP Server (Dovecot)', units: ['dovecot'], position: 40 },
   { name: 'exim', display_name: 'Mail Server (Exim)', units: ['exim4', 'exim'], position: 50 },
   { name: 'mailman', display_name: 'Mailing List Manager (Mailman)', units: ['mailman3', 'mailman'], position: 60, monitored: 0 },
-  { name: 'php-fpm', display_name: 'PHP-FPM service for Apache', units: ['php-fpm', 'php8.3-fpm', 'php8.2-fpm', 'php8.1-fpm'], position: 70 },
+  { name: 'php-fpm', display_name: 'PHP-FPM service for Apache', units: ['php-fpm', 'php8.5-fpm', 'php8.4-fpm', 'php8.3-fpm', 'php8.2-fpm', 'php8.1-fpm'], position: 70 },
   { name: 'sshd', display_name: 'SSH Server (OpenSSH)', units: ['ssh', 'sshd'], position: 80 },
   { name: 'ftpd', display_name: 'FTP Server', units: ['pure-ftpd', 'proftpd', 'vsftpd'], position: 90 },
   { name: 'cron', display_name: 'Cron Daemon', units: ['cron', 'crond'], position: 100 },

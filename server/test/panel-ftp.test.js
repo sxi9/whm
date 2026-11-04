@@ -219,6 +219,44 @@ describe('/api/panel/ftp', () => {
     expect(app.ctx.db.prepare('SELECT 1 FROM ftp_accounts WHERE id = ?').get(row.id)).toBeFalsy();
   });
 
+  it('advertises the daemon\'s effective TLS, never the saved setting', async () => {
+    const row = (await post('/accounts', { ...good, login: 'tls' }).expect(201)).body.data;
+    const read = ({ server }) => ({ server, path: `/etc/${server}`, unit: { active: true }, settings: { tls: 'optional' }, raw: {} });
+    app.agent.set('web.ftp.config.read', ({ server }) => ({ server, path: `/etc/${server}`, unit: { active: true }, settings: { tls: null }, raw: {} }));
+    try {
+      // Service Configuration says "optional" but conf/TLS is absent: plain FTP.
+      const list = await get('/accounts').expect(200);
+      expect(list.body.meta).toMatchObject({ encryption: 'off', encryptionConfigured: 'optional' });
+      expect(list.body.meta.encryptionHint).toMatch(/configured for TLS "optional".*running with "off"/);
+      const cfg = await get(`/accounts/${row.id}/client-config`).expect(200);
+      expect(cfg.body.data.encryption).toBe('off');
+      expect(cfg.body.data.filezilla).toContain('<Encryption>0</Encryption>');
+      // TLS=1 without a certificate the daemon can load is off as well.
+      app.agent.set('web.ftp.config.read', ({ server }) => ({ server, path: `/etc/${server}`, unit: { active: true }, settings: { tls: 'optional' }, raw: { TLS: '1' }, tlsCertificate: { path: '/etc/ssl/private/pure-ftpd.pem', present: false } }));
+      expect((await get('/accounts').expect(200)).body.meta.encryption).toBe('off');
+      // With the certificate in place the daemon's mode is reported and the hint goes away.
+      app.agent.set('web.ftp.config.read', ({ server }) => ({ server, path: `/etc/${server}`, unit: { active: true }, settings: { tls: 'optional' }, raw: { TLS: '1' }, tlsCertificate: { path: '/etc/ssl/private/pure-ftpd.pem', present: true } }));
+      const on = await get('/accounts').expect(200);
+      expect(on.body.meta).toMatchObject({ encryption: 'optional', encryptionHint: null });
+      expect((await get(`/accounts/${row.id}/client-config`).expect(200)).body.data.filezilla).toContain('<Encryption>1</Encryption>');
+      // An unreadable daemon config is not a promise of TLS either.
+      app.agent.fail('web.ftp.config.read', 'command_failed', 'cannot read');
+      expect((await get('/accounts').expect(200)).body.meta.encryption).toBe('off');
+      app.agent.set('web.ftp.config.read', read);
+      // When the probe itself fails the mode is unknown: no claim, no hint.
+      const probe = app.ctx.web.ftp.get;
+      app.ctx.web.ftp.get = async () => { throw new Error('probe failed'); };
+      try {
+        const unknown = await get('/accounts').expect(200);
+        expect(unknown.body.meta).toMatchObject({ encryption: null, encryptionConfigured: 'optional', encryptionHint: null, daemon: 'pure-ftpd' });
+        expect((await get(`/accounts/${row.id}/client-config`).expect(200)).body.data.filezilla).toContain('<Encryption>0</Encryption>');
+      } finally { app.ctx.web.ftp.get = probe; }
+    } finally {
+      app.agent.set('web.ftp.config.read', read);
+      await del(`/accounts/${row.id}`).expect(200);
+    }
+  });
+
   it('leaves no row behind when the daemon refuses the login', async () => {
     app.agent.state.fail = 'add';
     await post('/accounts', { ...good, login: 'broken' }).expect(500);

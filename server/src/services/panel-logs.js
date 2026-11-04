@@ -21,9 +21,12 @@ export function createPanelLogsService(ctx) {
   async function listing(scope, kind) {
     const result = await accountFunctions().logs.list(scope.username, kind, scope.ownerPrincipal);
     const home = `${homeOf(ctx, scope.account)}/logs`;
-    const patterns = [...new Set([...(result.domains || []), ...ownDomains(scope)])].map((d) => domainLogFile(d));
+    // The delegate lists the main domain once from the account and again from
+    // its account_domains row when one exists.
+    const domains = [...new Set([...(result.domains || []), ...ownDomains(scope)])];
+    const patterns = domains.map((d) => domainLogFile(d));
     const files = (result.files || []).filter((f) => f.dir === home || patterns.some((p) => p.test(f.name)));
-    return { ...result, files };
+    return { ...result, domains, files };
   }
 
   return {

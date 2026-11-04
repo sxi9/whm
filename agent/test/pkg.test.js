@@ -65,7 +65,29 @@ describe('pkg op schemas reject injection before anything runs', () => {
     for (const bad of [...INJECTION, 'x'.repeat(65), '*']) expect((await opError(runOp('pkg.search', { q: bad }, ctx))).code, bad).toBe('invalid_args');
     expect((await opError(runOp('pkg.search', { q: 'curl', limit: 0 }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('pkg.list_installed', { q: 'a;b' }, ctx))).code).toBe('invalid_args');
+    for (const bad of [...INJECTION, 'x'.repeat(65), '*', 'php mysql']) expect((await opError(runOp('pkg.search', { q: ['curl', bad] }, ctx))).code, bad).toBe('invalid_args');
+    expect((await opError(runOp('pkg.search', { q: [] }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('pkg.search', { q: ['a', 'b', 'c', 'd', 'e'] }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('pkg.search', { q: [['curl']] }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('pkg.search', { q: 'php mysql' }, ctx))).code).toBe('invalid_args');
     expect(exec).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(!hasBinary('apt-get'))('passes each search word as its own argv token, never a joined string', async () => {
+    exec.mockClear();
+    exec.mockResolvedValueOnce({ code: 0, stdout: 'php-mysql - MySQL module for PHP\nphp8.3-mysql - MySQL module for PHP 8.3\n', stderr: '' });
+    exec.mockResolvedValueOnce({ code: 0, stdout: 'php-mysql\t2:8.3+93\tall\tii\tMySQL module for PHP\n', stderr: '' });
+    const res = await runOp('pkg.search', { q: ['php', 'mysql'], limit: 10 }, ctx);
+    expect(exec).toHaveBeenCalledWith('apt-cache', ['search', '--names-only', '--', 'php', 'mysql'], expect.objectContaining({ allowFailure: true }));
+    expect(res.q).toBe('php mysql');
+    expect(res.results.map((r) => r.name)).toEqual(['php-mysql', 'php8.3-mysql']);
+    expect(res.results[0]).toMatchObject({ installed: true, installedVersion: '2:8.3+93' });
+    exec.mockClear();
+    exec.mockResolvedValueOnce({ code: 0, stdout: 'curl - command line tool\n', stderr: '' });
+    exec.mockResolvedValueOnce({ code: 0, stdout: '', stderr: '' });
+    const one = await runOp('pkg.search', { q: 'curl' }, ctx);
+    expect(exec).toHaveBeenCalledWith('apt-cache', ['search', '--names-only', '--', 'curl'], expect.anything());
+    expect(one.q).toBe('curl');
   });
 
   it('module installer names', async () => {

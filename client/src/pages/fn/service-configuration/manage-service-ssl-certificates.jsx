@@ -66,7 +66,7 @@ export default function ManageServiceSslCertificates({ fn }) {
                 </tbody>
               </table>
             </div>
-            <p className="muted card-body" style={{ margin: 0 }}>Per-domain website certificates are managed under <Link to="/ssl-tls/manage-ssl-hosts">Manage SSL Hosts</Link>{data.sslCategory ? '' : ' (SSL/TLS category not loaded; installs go straight to the agent)'}. The panel certificate needs <code>WHM_TLS_CERT</code>/<code>WHM_TLS_KEY</code> pointed at /etc/whm/tls and a panel restart.</p>
+            <p className="muted card-body" style={{ margin: 0 }}>Per-domain website certificates are managed under <Link to="/ssl-tls/manage-ssl-hosts">Manage SSL Hosts</Link>{data.sslCategory ? '' : ' (SSL/TLS category not loaded; installs go straight to the agent)'}. The panel certificate replaces <code>/etc/whm/ssl/panel.crt</code> and <code>panel.key</code> (what <code>WHM_TLS_CERT</code>/<code>WHM_TLS_KEY</code> point at by default) and takes effect after <code>systemctl restart whm-panel</code>.</p>
           </Card>
           <Modal open={Boolean(editing)} title={editing ? `Install certificate for ${editing.label}` : ''} onClose={() => setEditing(null)} size="lg" footer={<><Button onClick={() => setEditing(null)}>Cancel</Button><Button variant="primary" loading={busy === 'install'} disabled={!pems.certPem.trim() || !pems.keyPem.trim()} onClick={install}>Install</Button></>}>
             <ErrorBanner error={formError} />

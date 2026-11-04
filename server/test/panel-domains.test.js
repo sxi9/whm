@@ -14,8 +14,10 @@ function hostAgent() {
     'dns.zone.write': ({ domain }) => ({ domain, path: `/etc/bind/zones/${domain}.db`, stanzaAdded: true, includeAdded: false }),
     'dns.zone.remove': ({ domain }) => ({ domain, removed: [`/etc/bind/zones/${domain}.db`], stanzaRemoved: true }),
     'dns.reload': ({ domain }) => ({ method: 'rndc', domain: domain ?? null, output: '' }),
+    'web.detect': webDetect,
   });
 }
+const webDetect = () => ({ apache: { installed: true, flavor: 'debian', runUser: 'www-data' } });
 
 async function panelLogin(app, username, password = 'Panel-Passw0rd!1') {
   const hash = await app.ctx.crypto.hashPassword(password);
@@ -105,7 +107,8 @@ describe('Customer panel: domains', () => {
       expect(order.indexOf('dns.zone.write')).toBeGreaterThanOrEqual(0);
       expect(order.indexOf('dns.zone.write')).toBeLessThan(order.indexOf('files.mkdir'));
       const mkdir = app.agent.callsTo('files.mkdir')[0];
-      expect(mkdir.args).toEqual({ username: 'alice', path: '/home/alice/public_html/shop.example', mode: '0750' });
+      // Apache (www-data) must traverse the docroot: the leaf is handed to its group, as public_html is.
+      expect(mkdir.args).toEqual({ username: 'alice', path: '/home/alice/public_html/shop.example', mode: '0750', group: 'www-data' });
       expect(names()).not.toContain('fs.mkdir');
       const alicee = row('SELECT id, ip FROM accounts WHERE username = ?', 'alice');
       expect(row('SELECT * FROM account_domains WHERE domain = ?', 'shop.example')).toMatchObject({ account_id: alicee.id, type: 'addon', docroot: '/home/alice/public_html/shop.example' });
@@ -239,10 +242,69 @@ describe('Customer panel: domains', () => {
       const res = await alice.post('/domains/sub', { label: 'Blog', parent: 'alice.com' });
       expect(res.status, JSON.stringify(res.body)).toBe(201);
       expect(res.body.data).toMatchObject({ domain: 'blog.alice.com', type: 'sub', docroot: '/home/alice/public_html/blog', parent: 'alice.com', dns: { zone: 'alice.com', applied: true } });
-      expect(app.agent.callsTo('files.mkdir')[0].args).toEqual({ username: 'alice', path: '/home/alice/public_html/blog', mode: '0750' });
+      expect(app.agent.callsTo('files.mkdir')[0].args).toEqual({ username: 'alice', path: '/home/alice/public_html/blog', mode: '0750', group: 'www-data' });
       expect(row('SELECT docroot FROM account_domains WHERE domain = ?', 'blog.alice.com')).toEqual({ docroot: '/home/alice/public_html/blog' });
       expect(row('SELECT value FROM dns_records WHERE zone_id = (SELECT id FROM dns_zones WHERE domain = ?) AND type = ? AND name = ?', 'alice.com', 'A', 'blog')).toEqual({ value: '203.0.113.5' });
       expect(row('SELECT type FROM web_vhosts WHERE domain = ?', 'blog.alice.com')).toEqual({ type: 'sub' });
+    });
+
+    it('opens the docroot to "other" only when the capability layer knows no web server', async () => {
+      expect(app.ctx.capabilities.has('apache') || app.ctx.capabilities.has('nginx')).toBe(false);
+      app.agent.fail('web.detect', 'capability_missing', 'no web server');
+      try {
+        const res = await alice.post('/domains/sub', { label: 'noweb', parent: 'alice.com' });
+        expect(res.status, JSON.stringify(res.body)).toBe(201);
+        expect(app.agent.callsTo('files.mkdir')[0].args).toEqual({ username: 'alice', path: '/home/alice/public_html/noweb', mode: '0755' });
+        expect(res.body.meta.warnings.some((w) => /readable by the account only/.test(w))).toBe(false);
+      } finally {
+        app.agent.set('web.detect', webDetect);
+        await alice.del('/domains/sub/noweb.alice.com').expect(200);
+      }
+    });
+
+    it('surfaces the agent\'s note when a pre-existing docroot keeps its foreign group', async () => {
+      app.agent.set('files.mkdir', ({ path, mode }) => ({ path, mode, group: null, note: 'the directory already existed and is not owned by alice; its group was not changed' }));
+      try {
+        const res = await alice.post('/domains/sub', { label: 'kept', parent: 'alice.com' });
+        expect(res.status, JSON.stringify(res.body)).toBe(201);
+        expect(app.agent.callsTo('files.mkdir')[0].args).toEqual({ username: 'alice', path: '/home/alice/public_html/kept', mode: '0750', group: 'www-data' });
+        expect(res.body.data.docrootCreated).toBe(true);
+        expect(res.body.meta.warnings).toContain('/home/alice/public_html/kept: the directory already existed and is not owned by alice; its group was not changed');
+      } finally {
+        app.agent.reset('files.mkdir');
+        await alice.del('/domains/sub/kept.alice.com').expect(200);
+      }
+    });
+
+    it('keeps the docroot closed (0750, no group) and warns when web.detect fails transiently', async () => {
+      app.agent.fail('web.detect', 'agent_unavailable', 'socket closed');
+      try {
+        const res = await alice.post('/domains/sub', { label: 'flaky', parent: 'alice.com' });
+        expect(res.status, JSON.stringify(res.body)).toBe(201);
+        expect(app.agent.callsTo('files.mkdir')[0].args).toEqual({ username: 'alice', path: '/home/alice/public_html/flaky', mode: '0750' });
+        expect(res.body.meta.warnings.some((w) => /run user could not be detected/.test(w) && w.includes('socket closed'))).toBe(true);
+      } finally {
+        app.agent.set('web.detect', webDetect);
+        await alice.del('/domains/sub/flaky.alice.com').expect(200);
+      }
+    });
+
+    it('keeps the docroot closed and warns when a web server is installed but its run user is unknown', async () => {
+      app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, ['apache2ctl', 'named', 'rndc', 'named-checkzone'].includes(n)])));
+      await app.ctx.capabilities.refresh();
+      expect(app.ctx.capabilities.has('apache')).toBe(true);
+      app.agent.fail('web.detect', 'capability_missing', 'apache binaries missing');
+      try {
+        const res = await alice.post('/domains/sub', { label: 'nouser', parent: 'alice.com' });
+        expect(res.status, JSON.stringify(res.body)).toBe(201);
+        expect(app.agent.callsTo('files.mkdir')[0].args).toEqual({ username: 'alice', path: '/home/alice/public_html/nouser', mode: '0750' });
+        expect(res.body.meta.warnings.some((w) => /run user is unknown/.test(w))).toBe(true);
+      } finally {
+        app.agent.set('web.detect', webDetect);
+        app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, ['named', 'rndc', 'named-checkzone', 'named-checkconf'].includes(n)])));
+        await app.ctx.capabilities.refresh();
+        await alice.del('/domains/sub/nouser.alice.com').expect(200);
+      }
     });
 
     it('rejects foreign parents, bad labels, the plan limit and the feature flag', async () => {
@@ -270,6 +332,9 @@ describe('Customer panel: domains', () => {
       expect(row('SELECT 1 AS x FROM mail_autoresponders WHERE domain = ?', 'blog.alice.com')).toBeUndefined();
       expect(row('SELECT 1 AS x FROM account_domains WHERE domain = ?', 'blog.alice.com')).toBeUndefined();
       expect(row('SELECT 1 AS x FROM dns_records WHERE zone_id = (SELECT id FROM dns_zones WHERE domain = ?) AND name = ?', 'alice.com', 'blog')).toBeUndefined();
+      // No IPv6 on the account: only the A record was written, so the zone is published once.
+      expect(app.agent.callsTo('dns.zone.write')).toHaveLength(1);
+      expect(app.agent.callsTo('dns.reload')).toHaveLength(1);
     });
   });
 

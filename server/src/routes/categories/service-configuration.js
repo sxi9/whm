@@ -48,7 +48,7 @@ const eximBody = z.object({
   maxMessageSizeMb: int(1, 2048).optional(), smtpAcceptMax: int(1, 100_000).optional(), smtpAcceptMaxPerHost: int(1, 10_000).optional(), smtpAcceptQueuePerConnection: int(0, 10_000).optional(),
   ratelimitEnabled: z.boolean().optional(), ratelimitMailThreshold: int(1, 100_000).optional(), ratelimitMailDelay: int(1, 300).optional(), ratelimitRcptThreshold: int(1, 100_000).optional(), ratelimitRcptDelay: int(1, 300).optional(),
   dictionaryAttackProtection: z.boolean().optional(), maxUnknownCommands: int(0, 100).optional(), rcptFailLimit: int(1, 1000).optional(), rcptFailDelay: int(1, 300).optional(), recipientsMax: int(1, 100_000).optional(), recipientsMaxReject: z.boolean().optional(),
-  requireTlsForAuth: z.boolean().optional(), logSelector: z.array(z.string().regex(/^[+-][a-z_]{1,40}$/, 'log_selector item such as +subject')).max(40).optional(),
+  requireTlsForAuth: z.boolean().optional(), submissionPorts: z.boolean().optional(), logSelector: z.array(z.string().regex(/^[+-][a-z_]{1,40}$/, 'log_selector item such as +subject')).max(40).optional(),
   // Normally handed over by SSL/TLS Configuration (ctx.web.applyEximTls); null drops the TLS options from the rendered file.
   tls: z.object({ minProtocol: z.enum(TLS_VERSIONS).optional(), protocols: z.array(z.enum(TLS_VERSIONS)).min(1).max(4).optional(), cipherList: cipherList.optional(), cipherSuites: cipherSuites.optional(), preferServerCiphers: z.boolean().optional() }).strict().nullable().optional(),
 }).strict();
@@ -64,6 +64,8 @@ const ftpBody = z.object({
   passivePortMin: int(1024, 65535).optional(), passivePortMax: int(1024, 65535).optional(), passiveAddress: z.union([z.literal(''), fields.ipv4]).optional(), tls: z.enum(['off', 'optional', 'required']).optional(),
   maxClients: int(1, 100_000).optional(), maxPerIp: int(1, 10_000).optional(), anonymous: z.boolean().optional(), idleTimeoutMinutes: int(1, 1440).optional(), chroot: z.boolean().optional(),
 }).strict();
+
+const virtualMailBody = z.object({ enabled: z.boolean() }).strict();
 
 const policyName = z.enum(['panel', 'accounts', 'webserver']);
 const serviceName = z.enum(SSL_SERVICES);
@@ -110,6 +112,10 @@ export async function register(ctx) {
   // Mailserver Configuration (Dovecot)
   r.get('/mailserver', requireRoot, wrap(() => w().mailserver.get()));
   r.put('/mailserver', requireRoot, validate({ body: mailserverBody }), wrap((req) => w().mailserver.update(req.body, req)));
+
+  // Account panel virtual mailboxes (contract §36): Dovecot passwd-file auth + Exim router/transport/auth slots
+  r.get('/virtual-mail', requireRoot, wrap(() => w().virtualMail.status()));
+  r.post('/virtual-mail/apply', requireRoot, validate({ body: virtualMailBody }), wrap((req) => w().applyVirtualMail(req.body, req)));
 
   // FTP Server Selection (+ daemon settings)
   r.get('/ftp', requireRoot, wrap(() => w().ftp.get()));

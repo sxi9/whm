@@ -78,13 +78,39 @@ export async function start() {
   const { config, logger, app, jobs, scheduler } = ctx;
 
   const servers = [];
+  let stopTlsWatch = () => {};
   if (config.tls) {
-    const tlsServer = https.createServer({ cert: fs.readFileSync(config.tlsCert), key: fs.readFileSync(config.tlsKey), minVersion: 'TLSv1.2' }, app);
+    const readPair = () => ({ cert: fs.readFileSync(config.tlsCert), key: fs.readFileSync(config.tlsKey), minVersion: 'TLSv1.2' });
+    let pair;
+    try {
+      pair = readPair();
+    } catch (err) {
+      // The app was built TLS-only (Secure cookies, http redirect), so serving
+      // plain http instead would leave the panel unusable; fail loudly instead.
+      logger.fatal({ err, cert: config.tlsCert, key: config.tlsKey }, 'panel TLS certificate or key cannot be read; fix the files named by tlsCert/tlsKey (WHM_TLS_CERT/WHM_TLS_KEY) and restart whm-panel');
+      throw err;
+    }
+    const tlsServer = https.createServer(pair, app);
     tlsServer.listen(config.tlsPort, config.host, () => logger.info({ port: config.tlsPort }, 'WHM panel listening (https)'));
     servers.push(tlsServer);
+    // Certificate installs and AutoSSL renewals replace the pair in place; the
+    // listener picks it up on SIGHUP or when the files change, no restart needed.
+    const reloadTls = (reason) => {
+      try {
+        tlsServer.setSecureContext(readPair());
+        logger.info({ reason }, 'panel TLS certificate reloaded');
+      } catch (err) {
+        logger.error({ err, reason }, 'panel TLS certificate reload failed; keeping the previous certificate');
+      }
+    };
+    process.on('SIGHUP', () => reloadTls('SIGHUP'));
+    let timer = null;
+    const onChange = () => { clearTimeout(timer); timer = setTimeout(() => reloadTls('file change'), 2_000); timer.unref(); };
+    for (const file of [config.tlsCert, config.tlsKey]) fs.watchFile(file, { interval: 5_000, persistent: false }, onChange);
+    stopTlsWatch = () => { clearTimeout(timer); for (const file of [config.tlsCert, config.tlsKey]) fs.unwatchFile(file, onChange); };
   }
   const httpServer = http.createServer(app);
-  httpServer.listen(config.port, config.host, () => logger.info({ port: config.port, mode: config.mode, env: config.env, dataDir: config.dataDir }, 'WHM panel listening (http)'));
+  httpServer.listen(config.port, config.host, () => logger.info({ port: config.port, mode: config.mode, env: config.env, dataDir: config.dataDir, httpRedirect: config.tls && config.httpRedirect }, 'WHM panel listening (http)'));
   servers.push(httpServer);
 
   // Plugins load once the panel listens, so a slow activation never keeps the
@@ -98,6 +124,7 @@ export async function start() {
     logger.info({ signal }, 'shutting down');
     jobs.stop();
     scheduler.stop();
+    stopTlsWatch();
     ctx.sessionStore?.close();
     Promise.all([ctx.plugins.stopAll().catch(() => {}), ...servers.map((s) => new Promise((r) => s.close(r)))]).then(() => { ctx.db.close(); process.exit(0); });
     setTimeout(() => process.exit(1), 10_000).unref();

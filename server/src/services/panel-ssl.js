@@ -53,7 +53,12 @@ export function createPanelSslService(ctx) {
     async get(scope, domain) {
       assertFeature(scope, 'sslmanager');
       domains().assertDomain(scope, domain);
-      return ssl().hosts.get(domain, scope.ownerPrincipal);
+      try {
+        return await ssl().hosts.get(domain, scope.ownerPrincipal);
+      } catch (err) {
+        if (err instanceof HttpError && err.status === 404) throw new HttpError(404, 'not_found', `No certificate is installed on ${domain}`);
+        throw err;
+      }
     },
 
     async issue(scope, domain, req) {

@@ -109,7 +109,7 @@ describe('module registration', () => {
   });
 
   it('every route is root-only (403 for resellers)', async () => {
-    for (const url of ['/api/service-config/status', '/api/service-config/apache', '/api/service-config/apache/vhosts', '/api/service-config/logrotate', '/api/service-config/webdisk', '/api/service-config/webservices', '/api/service-config/exim', '/api/service-config/mailserver', '/api/service-config/ftp', '/api/service-config/nameserver', '/api/service-config/service-certs']) {
+    for (const url of ['/api/service-config/status', '/api/service-config/apache', '/api/service-config/apache/vhosts', '/api/service-config/logrotate', '/api/service-config/webdisk', '/api/service-config/webservices', '/api/service-config/exim', '/api/service-config/mailserver', '/api/service-config/virtual-mail', '/api/service-config/ftp', '/api/service-config/nameserver', '/api/service-config/service-certs']) {
       const res = await reseller.get(url);
       expect(res.status, url).toBe(403);
       expect(res.body.error.code).toBe('forbidden');
@@ -515,6 +515,21 @@ describe('Exim Configuration Manager', () => {
     expect(reject).toContain('        spf = fail\n        message = SPF check failed');
     expect(reject).toContain('        spf = softfail\n        add_header');
     expect(renderEximRcptAcl({ ...s, requireHelo: false, rblEnabled: false, verifySender: false, spfVerify: false, dictionaryAttackProtection: false })).toContain('No RCPT protections are enabled');
+    // Listening ports never change unless the operator enabled the submission ports.
+    expect(DEFAULTS.exim.submissionPorts).toBe(false);
+    for (const text of [deb, unsplit, rhel]) { expect(text).not.toContain('daemon_smtp_ports'); expect(text).not.toContain('tls_on_connect_ports'); }
+    // 465 (TLS on connect) only exists once SSL/TLS Configuration handed a TLS preset over; 587 is STARTTLS and needs nothing.
+    const tls = { minProtocol: 'TLSv1.2', protocols: ['TLSv1.2', 'TLSv1.3'], cipherList: '', cipherSuites: '', preferServerCiphers: false };
+    for (const layout of [EXIM_LAYOUT, EXIM_UNSPLIT, { flavor: 'rhel', splitConfig: false, slots: EXIM_LAYOUT.slots }]) {
+      const withPorts = renderEximMain({ ...s, submissionPorts: true }, layout);
+      expect(withPorts).toContain('daemon_smtp_ports = 25 : 587\n');
+      expect(withPorts).not.toContain(': 465');
+      expect(withPorts).not.toContain('tls_on_connect_ports');
+      const withTls = renderEximMain({ ...s, submissionPorts: true, tls }, layout);
+      expect(withTls).toContain('daemon_smtp_ports = 25 : 465 : 587');
+      expect(withTls).toContain('tls_on_connect_ports = 465');
+      expect(renderEximMain({ ...s, tls }, layout)).not.toContain('daemon_smtp_ports');
+    }
     const data = renderEximDataAcl({ ...s, dkimReject: true });
     expect(data).toContain('dkim_status = fail');
     expect(data).toContain('deny    !authenticated = *');
@@ -687,6 +702,50 @@ describe('Mailserver Configuration', () => {
     expect(renderDovecot(ciphers, { version: '2.3.4' })).not.toContain('ssl_cipher_suites');
     expect(renderDovecot(ciphers)).not.toContain('ssl_cipher_suites');
     expect([dovecotSupportsCipherSuites('2.3.15'), dovecotSupportsCipherSuites('2.4.0'), dovecotSupportsCipherSuites('2.3.14'), dovecotSupportsCipherSuites(null)]).toEqual([true, true, false, false]);
+    // Dovecot 2.4 renamed the settings this file owns (validated with doveconf -n on a 2.4.2 host).
+    const v24 = renderDovecot({ ...ciphers, protocols: ['imap', 'pop3', 'lmtp', 'sieve'] }, { version: '2.4.2' });
+    expect(v24).toContain('protocols = imap pop3 lmtp sieve');
+    expect(v24).toContain('auth_allow_cleartext = no');
+    expect(v24).toContain('ssl_server_prefer_ciphers = server');
+    expect(v24).toContain('mail_driver = maildir\nmail_path = ~/mail');
+    expect(v24).toContain('pop3_uidl_format = %{uid | hex(8)}%{uidvalidity | hex(8)}');
+    expect(v24).toContain('ssl_cipher_suites = TLS_AES_256_GCM_SHA384');
+    expect(v24).toContain('service managesieve-login {\n  inet_listener sieve_deprecated {\n    port = 0\n  }\n}');
+    for (const legacy of ['disable_plaintext_auth', 'ssl_prefer_server_ciphers', 'mail_location', '%08Xu']) expect(v24, legacy).not.toContain(legacy);
+    expect(renderDovecot({ ...DEFAULTS.mailserver, sslPreferServerCiphers: false, pop3UidlFormat: '%{uid}' }, { version: '2.4.0' })).toContain('ssl_server_prefer_ciphers = client');
+    expect(renderDovecot({ ...DEFAULTS.mailserver, pop3UidlFormat: '%{uid}' }, { version: '2.4.0' })).toContain('pop3_uidl_format = %{uid}');
+    // A 2.3-style format with no known 2.4 translation is left to Dovecot's default instead of being rejected.
+    expect(renderDovecot({ ...DEFAULTS.mailserver, pop3UidlFormat: '%u-%v' }, { version: '2.4.0' })).not.toContain('pop3_uidl_format');
+    expect(renderDovecot({ ...DEFAULTS.mailserver, protocols: ['imap', 'sieve'] }, { version: '2.3.21' })).toContain('inet_listener sieve_deprecated');
+    expect(text).not.toContain('sieve_deprecated');
+  });
+
+  it('saving Exim settings with submissionPorts renders the ports into the main slot; the virtual-mail status/apply routes are root-only', async () => {
+    const before = app.ctx.settings.get('service_config.exim', null);
+    const save = await put('/api/service-config/exim', { submissionPorts: true }).expect(200);
+    expect(save.body.data.settings.submissionPorts).toBe(true);
+    const lastMain = () => app.agent.callsTo('web.exim.include.write').filter((w) => w.args.slot === 'main').pop().args.content;
+    const ports = async () => (await get('/api/service-config/virtual-mail').expect(200)).body.data.submissionPorts;
+    try {
+      // No TLS preset yet: 587 only; the preset from SSL/TLS Configuration adds 465.
+      expect(lastMain()).toContain('daemon_smtp_ports = 25 : 587');
+      expect(lastMain()).not.toContain('tls_on_connect_ports');
+      expect(await ports()).toEqual({ enabled: true, port465: false, port587: true, tls: false });
+      await app.ctx.web.applyEximTls({ minProtocol: 'TLSv1.2', protocols: ['TLSv1.2', 'TLSv1.3'] }, null);
+      expect(lastMain()).toContain('daemon_smtp_ports = 25 : 465 : 587');
+      expect(lastMain()).toContain('tls_on_connect_ports = 465');
+      expect(await ports()).toEqual({ enabled: true, port465: true, port587: true, tls: true });
+      await put('/api/service-config/exim', { submissionPorts: false }).expect(200);
+      expect(lastMain()).not.toContain('daemon_smtp_ports');
+    } finally { app.ctx.settings.set('service_config.exim', before); }
+    expect((await put('/api/service-config/exim', { submissionPorts: 'yes' })).status).toBe(422);
+    expect((await reseller.get('/api/service-config/virtual-mail')).status).toBe(403);
+    expect((await mutate(reseller, 'post', '/api/service-config/virtual-mail/apply', { enabled: true }, resellerCsrf)).status).toBe(403);
+    expect((await post('/api/service-config/virtual-mail/apply', { enabled: 'yes' })).status).toBe(422);
+    expect((await post('/api/service-config/virtual-mail/apply', { enabled: true, spamdAddress: 'x' })).status).toBe(422);
+    const status = await get('/api/service-config/virtual-mail').expect(200);
+    expect(status.body.data).toMatchObject({ enabled: false, installed: true, live: false, submissionPorts: { enabled: false, port465: false, port587: false }, exim: { installed: true }, dovecot: { installed: true, version: '2.3.21' } });
+    expect(status.body.data.lastApply).toBeNull();
   });
 
   it('applyMailserverTls (SSL/TLS Configuration hook) stores the preset here and re-renders the file', async () => {
@@ -775,6 +834,33 @@ describe('FTP Server Selection', () => {
       app.ctx.settings.set('service_config.ftp_server', 'pure-ftpd');
       app.agent.set('web.service.detect', ({ role }) => (role === 'ftp' ? { role, candidates: ftpCandidates(), active: ['pure-ftpd'], enabled: ['pure-ftpd'], current: 'pure-ftpd', packageManager: 'apt-get' } : { role, candidates: dnsCandidates(), active: ['bind'], enabled: ['bind'], current: 'bind', packageManager: 'apt-get' }));
       await put('/api/service-config/ftp/settings', { maxClients: 50 }).expect(200);
+    }
+  });
+
+  it('enableVirtualUsers trusts the daemon, not the saved setting: a stale "enabled" is re-applied', async () => {
+    let live = false;
+    app.agent.set('ftp.virtual.status', ({ daemon }) => ({ daemon, supported: true, configured: live, enabled: live, passwdFile: '/etc/pure-ftpd/pureftpd.passwd' }));
+    try {
+      app.agent.calls.length = 0;
+      const first = await app.ctx.web.ftp.enableVirtualUsers(null);
+      expect(first).toMatchObject({ daemon: 'pure-ftpd', enabled: true, live: true });
+      expect(app.agent.callsTo('web.ftp.config.write').pop().args).toMatchObject({ server: 'pure-ftpd', settings: { virtualUsers: true }, restart: true });
+      expect(app.ctx.web.ftp.settings().virtualUsers).toBe(true);
+      // Setting saved and last apply ok, but the host lost it (Debian: conf/PureDB
+      // without the auth/ link): the panel must write again, not short-circuit.
+      app.agent.calls.length = 0;
+      const again = await app.ctx.web.ftp.enableVirtualUsers(null);
+      expect(again).toMatchObject({ enabled: true, live: true });
+      expect(again.unchanged).toBeUndefined();
+      expect(app.agent.callsTo('web.ftp.config.write')).toHaveLength(1);
+      // Once the daemon reports it, the call is a no-op.
+      live = true;
+      app.agent.calls.length = 0;
+      expect(await app.ctx.web.ftp.enableVirtualUsers(null)).toMatchObject({ daemon: 'pure-ftpd', enabled: true, unchanged: true });
+      expect(app.agent.callsTo('web.ftp.config.write')).toHaveLength(0);
+    } finally {
+      app.agent.set('ftp.virtual.status', () => { throw Object.assign(new Error('unknown op'), { agentError: true, code: 'unknown_op' }); });
+      await app.ctx.web.ftp.updateSettings({ virtualUsers: false }, null);
     }
   });
 

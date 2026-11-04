@@ -87,7 +87,12 @@ export default function FileManager({ fn }) {
     setParams(clean ? { path: clean } : {});
   }, [setParams, toast]);
 
-  const entries = data?.entries || [];
+  // The hook keeps the previous listing while the next one loads; a click on
+  // one of those rows (the second half of a double-click) would otherwise be
+  // resolved against the folder just navigated to (public_html/public_html).
+  const listingDir = data ? normalizeRel(data.path) ?? data.path : null;
+  const listing = data && listingDir === dir ? data : null;
+  const entries = listing?.entries || [];
   const names = useMemo(() => entries.map((e) => e.name), [entries]);
   const rows = useMemo(() => sortEntries(filterEntries(entries, q, showHidden), sort.key, sort.dir), [entries, q, showHidden, sort]);
   const hiddenCount = useMemo(() => entries.filter((e) => e.name.startsWith('.')).length, [entries]);
@@ -183,7 +188,7 @@ export default function FileManager({ fn }) {
         </div>
         {capability && <div className="card-body"><PanelCapabilityState error={error} onRetry={refetch} /></div>}
         {!capability && error && <div className="card-body" style={{ paddingBottom: 0 }}><RequestError error={error} onRetry={refetch} /></div>}
-        {data?.truncated && <div className="card-body"><div className="banner banner-warning" style={{ marginBottom: 0 }}><AlertTriangle size={18} /><div><strong>Only the first {entries.length.toLocaleString()} of {data.total.toLocaleString()} entries are shown</strong><p>Use the search to find the rest, or split this folder up.</p></div></div></div>}
+        {listing?.truncated && <div className="card-body"><div className="banner banner-warning" style={{ marginBottom: 0 }}><AlertTriangle size={18} /><div><strong>Only the first {entries.length.toLocaleString()} of {listing.total.toLocaleString()} entries are shown</strong><p>Use the search to find the rest, or split this folder up.</p></div></div></div>}
         <DataTable
           dense
           columns={[
@@ -192,7 +197,7 @@ export default function FileManager({ fn }) {
             { key: 'mtime', label: 'Modified', sortable: true, render: (r) => formatDate(r.mtime) },
             { key: 'mode', label: 'Permissions', render: (r) => <code>{r.mode}</code> },
           ]}
-          rows={rows} loading={loading} error={null} rowKey={(r) => r.name}
+          rows={rows} loading={loading || (Boolean(data) && !listing && !error)} error={null} rowKey={(r) => r.name}
           sort={sort.key} dir={sort.dir} onSortChange={(key, d) => setSort({ key, dir: d })}
           selectable selected={selected} onSelectedChange={setSelected}
           searchable={entries.length > 0} q={q} onSearch={setQ} searchPlaceholder="Filter this folder"
@@ -211,7 +216,7 @@ export default function FileManager({ fn }) {
           emptyText={capability ? 'Files appear here once the file manager is available on this server.' : error ? 'The folder could not be read.' : q ? 'Nothing in this folder matches the filter.' : dir ? 'This folder is empty. Upload files or create a new file or folder with the buttons above.' : 'Your home directory is empty. Upload files or create a folder with the buttons above; public_html is where your website lives.'}
         />
         <div className="card-body muted small" style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-          <span>{data ? `${rows.length === entries.length ? entries.length : `${rows.length} of ${entries.length}`} item${entries.length === 1 ? '' : 's'}` : ''}{!showHidden && hiddenCount ? ` · ${hiddenCount} hidden` : ''}</span>
+          <span>{listing ? `${rows.length === entries.length ? entries.length : `${rows.length} of ${entries.length}`} item${entries.length === 1 ? '' : 's'}` : ''}{!showHidden && hiddenCount ? ` · ${hiddenCount} hidden` : ''}</span>
           <span><Link to={diskUsageHref(dir)}><HardDrive size={12} style={{ verticalAlign: '-2px' }} /> Disk usage of this folder</Link></span>
         </div>
       </Card>

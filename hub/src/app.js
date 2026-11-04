@@ -5,7 +5,7 @@ import express from 'express';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import pinoHttp from 'pino-http';
-import { attachPrincipal, portalSession, csrf } from '../shared/auth.js';
+import { attachPrincipal, portalSession, csrf, requireTotpEnrolment } from '../shared/auth.js';
 import { createAudit } from '../shared/audit.js';
 import { HttpError } from '../shared/errors.js';
 import { ZodError } from 'zod';
@@ -166,6 +166,7 @@ export function createApp(ctx) {
   app.use(portalSession(ctx));
   app.use(attachPrincipal(ctx));
   app.use(csrf({ exempt: ['/v1/portal/login', '/v1/portal/csrf'] }));
+  app.use(requireTotpEnrolment(ctx));
   const audit = createAudit({ db: ctx.dbs.license, logger, now: () => ctx.clock.now() });
   app.use(audit.middleware);
 

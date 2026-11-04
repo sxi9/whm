@@ -499,25 +499,28 @@ defineOp('pkg.list_installed', {
   },
 });
 
+// Several words are separate argv tokens: apt-cache search and dnf/yum search
+// list the packages matching every one of them.
 defineOp('pkg.search', {
   description: 'Search the package repositories by name',
   timeoutMs: 120_000,
-  schema: z.object({ q: searchTerm, limit: z.number().int().min(1).max(500).default(100) }).strict(),
+  schema: z.object({ q: z.union([searchTerm, z.array(searchTerm).min(1).max(4)]), limit: z.number().int().min(1).max(500).default(100) }).strict(),
   run: async ({ q, limit }) => {
     const pm = requireManager();
+    const terms = Array.isArray(q) ? q : [q];
     let results;
     if (pm.family === 'debian') {
-      const { stdout } = await exec('apt-cache', ['search', '--names-only', '--', q], { allowFailure: true, env: APT_ENV });
+      const { stdout } = await exec('apt-cache', ['search', '--names-only', '--', ...terms], { allowFailure: true, env: APT_ENV });
       results = parseAptSearch(stdout);
     } else {
-      const { stdout } = await exec(pm.binary, ['-q', '-y', 'search', '--', q], { allowFailure: true, timeoutMs: 120_000 });
+      const { stdout } = await exec(pm.binary, ['-q', '-y', 'search', '--', ...terms], { allowFailure: true, timeoutMs: 120_000 });
       results = parseDnfSearch(stdout);
     }
-    const needle = q.toLowerCase();
+    const needle = terms[0].toLowerCase();
     results.sort((a, b) => (a.name.toLowerCase() === needle ? -1 : b.name.toLowerCase() === needle ? 1 : a.name.toLowerCase().startsWith(needle) === b.name.toLowerCase().startsWith(needle) ? a.name.localeCompare(b.name) : a.name.toLowerCase().startsWith(needle) ? -1 : 1));
     results = results.slice(0, limit);
     const installed = new Map((await installedPackages()).packages.map((p) => [p.name, p.version]));
-    return { manager: pm.manager, q, results: results.map((r) => ({ ...r, installed: installed.has(r.name), installedVersion: installed.get(r.name) ?? null })) };
+    return { manager: pm.manager, q: terms.join(' '), results: results.map((r) => ({ ...r, installed: installed.has(r.name), installedVersion: installed.get(r.name) ?? null })) };
   },
 });
 

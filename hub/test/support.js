@@ -31,7 +31,7 @@ export async function bootHub({ config = {}, now, fetch, webhookFetch, keys = tr
       cookie_secure: false,
       keys: { dir: keysDir, active_kid: { license: KIDS.licenseA, plugin: KIDS.pluginA } },
       license: {
-        mail: { transport: 'none' }, backup_dir: null,
+        mail: { transport: 'none' }, backup_dir: null, require_admin_totp: false,
         billing: { stripe: { secret: 'whsec_test' }, whmcs: { secret: 'whmcs_test' }, paddle: { secret: 'pdl_test' } },
         rate_limits: { activate: { max: 1000, windowMs: 3600_000 }, checkin: { max: 1000, windowMs: 3600_000 }, trial: { max: 1000, windowMs: 3600_000 }, recover: { max: 1000, windowMs: 3600_000 }, reseller: { max: 10000, windowMs: 3600_000 }, admin: { max: 10000, windowMs: 3600_000 }, portal_login: { max: 100, windowMs: 60_000 }, public: { max: 10000, windowMs: 3600_000 } },
       },

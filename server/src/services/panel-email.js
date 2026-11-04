@@ -211,6 +211,18 @@ export function createPanelEmailService(ctx) {
     if (r && r.ok === false) throw unprocessable(`The password is too weak (strength ${r.score}, minimum ${r.minimum})`, { password: [`Strength ${r.score} is below the required ${r.minimum}`] });
   }
 
+  // Mirrors what Exim Configuration Manager renders into daemon_smtp_ports:
+  // without the submission ports only 25 with STARTTLS listens, 465 exists only
+  // with the Exim TLS preset, and SMTP AUTH only once the virtual-mail wiring
+  // is live.
+  function smtpSettings(host) {
+    const ex = ctx.web?.exim?.settings?.() || {};
+    const auth = virtualMailLive() ? 'password' : null;
+    if (!ex.submissionPorts) return { host, port: 25, ssl: false, starttls: true, alternative: null, auth, submissionPorts: false };
+    if (!ex.tls) return { host, port: 587, ssl: false, starttls: true, alternative: null, auth, submissionPorts: true };
+    return { host, port: 465, ssl: true, alternative: { port: 587, starttls: true }, auth, submissionPorts: true };
+  }
+
   const shapeMailbox = (row, usage = null) => ({
     id: row.id, address: `${row.local_part}@${row.domain}`, localPart: row.local_part, domain: row.domain,
     quotaMb: row.quota_mb, suspended: Boolean(row.suspended), routing: row.routing ?? null, createdAt: row.created_at, usage,
@@ -256,7 +268,9 @@ export function createPanelEmailService(ctx) {
       const withUsage = query.usage !== false;
       const data = await Promise.all(page.data.map(async (row) => shapeMailbox(row, withUsage ? await mailboxUsage(scope, row) : null)));
       const limit = limitOf(scope, 'max_email');
-      return { data, meta: { ...page.meta, limits: { max_email: limit }, used: stmts.mailboxCount.get(scope.accountId).n, domains: domainNames(scope), defaultQuotaMb: Number(settings.get('panel.mail.default_quota_mb') ?? 1024) } };
+      const warnings = [];
+      if (data.length) virtualMailWarning(warnings);
+      return { data, meta: { ...page.meta, limits: { max_email: limit }, used: stmts.mailboxCount.get(scope.accountId).n, domains: domainNames(scope), defaultQuotaMb: Number(settings.get('panel.mail.default_quota_mb') ?? 1024), warnings } };
     },
 
     async get(scope, id) {
@@ -291,7 +305,7 @@ export function createPanelEmailService(ctx) {
         throw err;
       }
       await routeLocally(d.domain, warnings, req);
-      if (virtualMailDisabledByOperator()) warnings.push({ code: 'virtual_mail_disabled', message: 'Virtual mailboxes are switched off under Service Configuration; the mailbox is saved but Exim/Dovecot do not serve it until the operator enables them' });
+      virtualMailWarning(warnings, { request: true });
       audit(req, scope, 'panel.email.account.create', { address: `${localPart}@${d.domain}`, quotaMb: quota, warnings: warnings.map((w) => w.code) });
       return { data: shapeMailbox({ ...loadMailbox(scope, id) }), meta: { warnings } };
     },
@@ -359,7 +373,7 @@ export function createPanelEmailService(ctx) {
         address: `${row.local_part}@${row.domain}`, username: `${row.local_part}@${row.domain}`, hostname: host,
         imap: protocols.includes('imap') ? srv(993, 143) : null,
         pop3: protocols.includes('pop3') ? srv(995, 110) : null,
-        smtp: { host, port: 465, ssl: true, alternative: { port: 587, starttls: true }, auth: 'password' },
+        smtp: smtpSettings(host),
         webmail: settings.get('panel.webmail_url') || null,
       };
     },
@@ -850,16 +864,18 @@ export function createPanelEmailService(ctx) {
   const virtualMailDisabledByOperator = () => settings.get('service_config.virtual_mail', null)?.enabled === false;
 
   // ctx.web.applyVirtualMail({ enabled }, req) (service-configuration) is a
-  // server-wide root-level rewrite of Exim/Dovecot. It runs from the
-  // integrator's boot code (after capabilities.refresh) and from the admin
-  // side, never from a customer request: there is no request principal, the
-  // audit row names the panel, and a failure is memoised with a backoff so a
+  // server-wide root-level rewrite of Exim/Dovecot. It runs as the panel from
+  // the VIRTUAL_MAIL_JOB (queued at boot by the route module and again by a
+  // mailbox mutation that finds the wiring not live) and from the admin route,
+  // never inside a customer request: there is no request principal, the audit
+  // row names the panel, and every outcome is memoised with a backoff so a
   // broken host is not re-applied in a loop.
   const APPLY_RETRY_MS = 10 * 60_000;
+  const VIRTUAL_MAIL_JOB = 'panel.virtual_mail.ensure';
   let virtualMailApplied = null;
   let virtualMailFailure = null;
   async function ensureVirtualMail(_req = null, { force = false } = {}) {
-    if (virtualMailApplied && !force) return virtualMailApplied;
+    if (virtualMailApplied && !force && (virtualMailApplied.live !== false || Date.now() - virtualMailApplied.at < APPLY_RETRY_MS)) return virtualMailApplied;
     if (virtualMailFailure && !force && Date.now() - virtualMailFailure.at < APPLY_RETRY_MS) return virtualMailFailure.result;
     const fail = (reason) => { virtualMailApplied = null; virtualMailFailure = { at: Date.now(), result: { applied: false, reason } }; return virtualMailFailure.result; };
     if (!settings.get('panel.enabled')) return { applied: false, reason: 'the customer panel is disabled (panel.enabled)' };
@@ -870,7 +886,8 @@ export function createPanelEmailService(ctx) {
     try {
       const r = await apply({ enabled: true }, null);
       virtualMailFailure = null;
-      virtualMailApplied = { applied: true, ...(r || {}) };
+      virtualMailApplied = { applied: true, ...(r || {}), at: Date.now() };
+      if (virtualMailApplied.live === false) logger.warn({ error: virtualMailApplied.lastApply?.error ?? null, manualIncludes: virtualMailApplied.manualIncludes ?? null }, 'panel-email: virtual mail is written but not live; panel mailboxes are not served yet');
       return virtualMailApplied;
     } catch (err) {
       logger.warn({ err }, 'panel-email: applyVirtualMail failed');
@@ -878,28 +895,63 @@ export function createPanelEmailService(ctx) {
     }
   }
 
+  // Whether Exim and Dovecot serve the panel's mailboxes, from the persisted
+  // outcome of the last apply (shared with the admin route) or this process's
+  // memo; never from a host probe on the request path.
+  const virtualMailLive = () => {
+    if (virtualMailDisabledByOperator()) return false;
+    const last = ctx.web?.virtualMail?.lastApplied?.();
+    if (last) return last.ok === true;
+    return virtualMailApplied?.live === true;
+  };
+
+  function virtualMailWarning(warnings, { request = false } = {}) {
+    if (virtualMailDisabledByOperator()) { warnings.push({ code: 'virtual_mail_disabled', message: 'Virtual mailboxes are switched off under Service Configuration; the mailbox is saved but Exim/Dovecot do not serve it until the operator enables them' }); return; }
+    if (virtualMailLive()) return;
+    warnings.push({ code: 'virtual_mail_not_live', message: 'Exim/Dovecot are not yet wired for virtual mailboxes; the mailbox is saved but mail is not delivered or authenticated until the operator applies the virtual-mail configuration under Service Configuration' });
+    if (request) requestVirtualMail();
+  }
+
+  // Queues the root-level apply as a panel job instead of running it here: the
+  // worker has no customer principal and the memo above throttles retries.
+  // Nothing is queued on a host without the panel or without both daemons, or
+  // while a queued/running apply exists, so a mail-less host never accumulates
+  // a job row per restart.
+  function requestVirtualMail(trigger = 'mailbox') {
+    const jobs = ctx.jobs;
+    if (!jobs?.types?.().includes(VIRTUAL_MAIL_JOB)) return null;
+    if (!settings.get('panel.enabled') || !capabilities.has('exim') || !capabilities.has('dovecot')) return null;
+    if (virtualMailFailure && Date.now() - virtualMailFailure.at < APPLY_RETRY_MS) return null;
+    if (virtualMailApplied?.live === false && Date.now() - virtualMailApplied.at < APPLY_RETRY_MS) return null;
+    if (jobs.list({ type: VIRTUAL_MAIL_JOB, limit: 5 }).some((j) => j.status === 'queued' || j.status === 'running')) return null;
+    try { return jobs.enqueue(VIRTUAL_MAIL_JOB, { trigger }); } catch (err) { logger.warn({ err }, 'panel-email: could not queue the virtual-mail apply'); return null; }
+  }
+
   async function renderCheck() {
     try { return await agent().op('vmail.render.check', {}); } catch (err) { return { error: err.message, dovecot: { installed: false }, exim: { installed: false }, routerHooked: false, authHooked: false, transportHooked: false }; }
   }
 
-  // Security Advisor findings for the virtual-mail wiring (seam S4): the
-  // integrator calls this from security-center's advisor.scan.
+  // Security Advisor findings for the virtual-mail wiring (seam S4), called
+  // from security-center's advisor.scan.
   async function advisorFindings() {
     if (!settings.get('panel.enabled')) return [];
     const r = await renderCheck();
     const fix = { label: 'Exim Configuration Manager', path: '/service-configuration/exim-configuration-manager' };
     const findings = [];
     if (r.error) return [{ id: 'panel.mail.check', grade: 'info', title: 'Could not check the virtual-mail configuration', detail: r.error }];
-    if (!r.exim.installed || !r.dovecot.installed) return [{ id: 'panel.mail.daemons', grade: 'info', title: 'Virtual mailboxes need Exim and Dovecot', detail: r.hint || 'Install both to let account users create mailboxes.' }];
+    if (!r.exim?.installed || !r.dovecot?.installed) return [{ id: 'panel.mail.daemons', grade: 'info', title: 'Virtual mailboxes need Exim and Dovecot', detail: r.hint || 'Install both to let account users create mailboxes.' }];
     if (r.exim.configOk === false) findings.push({ id: 'panel.mail.exim', grade: 'critical', title: 'Exim rejects its configuration', detail: r.exim.output || 'exim -bV failed', fix });
     if (r.dovecot.configOk === false) findings.push({ id: 'panel.mail.dovecot', grade: 'critical', title: 'Dovecot rejects its configuration', detail: r.dovecot.output || 'doveconf -n failed', fix: { label: 'Mailserver Configuration', path: '/service-configuration/mailserver-configuration' } });
     if (r.exim.configOk !== false) {
+      const last = ctx.web?.virtualMail?.lastApplied?.() ?? null;
+      const applied = last ? ` The last apply (${last.at}) ${last.ok ? 'succeeded' : `was not live: ${last.error || 'see Service Configuration'}`}.` : ' The virtual-mail configuration was never applied on this server.';
       findings.push(r.routerHooked
         ? { id: 'panel.mail.router', grade: 'ok', title: 'Exim delivers to virtual mailboxes (whm_virtual_user router present)' }
-        : { id: 'panel.mail.router', grade: 'warning', title: 'Exim has no virtual-mailbox router', detail: 'Mail for panel-created mailboxes is not delivered until the whm_virtual_user router and whm_dovecot_lmtp transport are applied.', fix });
+        : { id: 'panel.mail.router', grade: 'warning', title: 'Exim has no virtual-mailbox router', detail: `Mail for panel-created mailboxes is not delivered until the whm_virtual_user router and whm_dovecot_lmtp transport are loaded.${applied}${r.hint ? ` ${r.hint}.` : ''}`, fix });
       findings.push(r.authHooked
         ? { id: 'panel.mail.auth', grade: 'ok', title: 'SMTP authentication uses Dovecot (dovecot_plain authenticator present)' }
-        : { id: 'panel.mail.auth', grade: 'warning', title: 'Exim has no Dovecot authenticator', detail: 'Mailbox users cannot authenticate to send mail until the dovecot_plain/dovecot_login authenticators are applied.', fix });
+        : { id: 'panel.mail.auth', grade: 'warning', title: 'Exim has no Dovecot authenticator', detail: `Mailbox users cannot authenticate to send mail until the dovecot_plain/dovecot_login authenticators are loaded.${applied}`, fix });
+      if (r.routerHooked && r.authHooked && !ctx.web?.exim?.settings?.()?.submissionPorts) findings.push({ id: 'panel.mail.submission', grade: 'info', title: 'SMTP submission ports 465/587 are not enabled', detail: 'Mail clients can only submit through port 25 with STARTTLS; enable the submission ports under Exim Configuration Manager.', fix });
     }
     return findings;
   }
@@ -908,6 +960,6 @@ export function createPanelEmailService(ctx) {
     LOCAL_PART, SYSTEM_ROOT,
     domainsOf, assertDomain, assertDomainClean, ensureMailDomain, releaseDomain, subscribe,
     accounts, forwarders, defaultAddress, domainForward, autoresponders, spam, deliverability, dkim, webmail, usage,
-    ensureVirtualMail, renderCheck, advisorFindings,
+    ensureVirtualMail, renderCheck, advisorFindings, virtualMailLive, requestVirtualMail, VIRTUAL_MAIL_JOB,
   };
 }

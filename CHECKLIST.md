@@ -8,7 +8,8 @@
 
 ## Current state
 
-- **Branch:** `claude/kind-meitner-dlnbas` · **Last updated:** 2026-11-04 00:20 UTC · **Phase 7 complete (new UI, Keel identity, account panel) — see the Phase 7 table and `HANDOFF.md` §4**
+- **Branch:** `claude/kind-meitner-dlnbas` · **Last updated:** 2026-11-05 · **Phase 7 complete; live-host verification on `nova.hostingsignal.in` done, fixes in the working tree awaiting gate + commit + deploy — see the live-host table and `HANDOFF.md` §4**
+- **2026-11-04/05 live-host verification** (production install, Ubuntu 26.04, EC2): 10 probe areas, 29 confirmed findings (18 with a code component, 11 host-only; 1 refuted), adversarially verified; all code findings fixed in three rounds under two review lenses (virtual-mail wiring applied by the panel with Dovecot 2.4 support and a passwd re-key, Exim submission ports + dovecot auth, Apache-readable sub/addon docroots, valid `db.revoke`, PureDB auth link, php-fpm unit discovery, capability refresh + log levels, HTTP→HTTPS on 2086, panel/Dovecot service certs, AutoSSL www check + hostname issuance, role-user job streams, hub mandatory admin TOTP, advisor mail flags + PHP backport check). Host fixes applied: AutoSSL live for `testuser.hostingsignal.in`, ManageSieve 2000 off, fail2ban jails, `50puredb` link, Cloudflare nameservers. Gate: to be recorded at deploy.
 - **2026-11-03 baseline gate on a fresh container:** server 1158 / agent 470 / client 52 / hub 184 / hub-ui 105 green after two test-only fixes (the 2FA replay test timeout, `/tmp/whm` created by the agent temp-dir tests).
 - **Done:** full blueprint; license-server design (`docs/design/license-server.md`); plugin SDK reference code (`plugins/sdk/`, 56 tests passing); **Phase 0 foundation runs end-to-end** (boot → migrate → seed → login/forced password change → CSRF → status/services → packages CRUD → create a real Linux account → suspend/unsuspend/modify → terminate → audit).
 - **Phase 1 shell is live:** React SPA with WHM-style top bar, searchable collapsible sidebar listing **all 212 functions in 30 categories**, home dashboard (Statistics + Tools grid + Favorites + service dots), login/2FA/forced-password-change, audit-log viewer, shared components (DataTable, forms, ConfigPage, ActionPage, ProgressLog, modals, toasts). 29 functions have real pages wired to the API (marked `[x]` below); the other 183 route to a placeholder page that names their build phase. Verified end to end with Playwright (login → create account via the form → lists/status/config pages → search).
@@ -77,7 +78,25 @@ this table; estimates are revised at each milestone.
 | **Customer panel** build: units U0 core / U1 files+cron / U2 mail / U3 domains-dns-ssl-php-logs / U4 databases-ftp-backups-usage / U5 client shell in two parallel workflows (builder → lens A adversarial tenant + lens B authorization → fix → re-review; 24 findings, 3 left for the integrator), seams S1–S11 by an integrator agent in parallel (contracts §33–40) | done `6722c95`, `1b97968` | 1 h 50 min | 22:25 |
 | Customer panel: U6 client pages (6 groups, 39 pages, screenshot reviews + fix rounds), integrator wiring (router/Login/Layout, admin "Log in as", token confinement, forced password flow, mail release), admin settings tab, manual Part C, integration critics (3 lenses: 38 findings, 14 non-minor fixed, 3 residuals closed with real as-root tests), `e2e/panel-check.cjs` 39/39 pages | done `f111b42` | 2 h 10 min | 23:35 |
 | Milestone 2: full gate green (server 1402 / agent 615 / client 268 / hub 184 / hub-ui 105 + SDK + plugins), both e2e flows, **screenshot refresh** (212 admin + 39 account-panel pages + flows), trackers, push | done | 45 min | 00:20 (4th) |
-| **Total remaining** | | **0 — Phase 7 complete; next is provisioned-host verification (HANDOFF §4)** | |
+| **Total remaining** | | **0 — Phase 7 complete; the provisioned-host verification ran on the real host (next table)** | |
+
+### Live-host verification + fixes (2026-11-04/05, production install `nova.hostingsignal.in` — the "provisioned-host verification" HANDOFF §4.1 asked for)
+
+Ubuntu 26.04 on EC2, installed with `scripts/install.sh`, one hosting account `testuser`; Dovecot 2.4.2, Exim unsplit
+Debian layout, MariaDB 11.8, pure-ftpd, BIND (public DNS at Cloudflare), certbot. Probes ran against the live
+panel (root login-as `testuser`), every finding was re-verified adversarially, then fixed per area with two review
+lenses and a re-review. Nothing is committed yet; the fixed tree is mirrored to `~/whm` on the host.
+
+| Step | Status | Outcome |
+|---|---|---|
+| Audit: 10 probe areas — mail, FTP, MySQL, web/PHP/DNS, SSL readiness, backups/cron/quota, admin API walk (300 GETs, 0 5xx), account-panel API walk (52 GETs), security posture, log-derived bugs | done | 29 confirmed findings (18 code, 11 host-only), 1 refuted (`mail-exim-unsplit-slots-need-manual-include` — documented behaviour: the panel never edits `exim4.conf.template`); works-as-designed: quota, cron, panel backups, DB provisioning, main site + PHP-as-account, sub provisioning mechanics |
+| Fix round 1 (6 fixers: web/db, mail, services, ssl, http, client/panel) + 2 review lenses | done | all round-1 findings closed; reviewers raised 2 majors (passwd re-key for existing mailboxes; hub TOTP gate blocked the SPA shell), 5 minors, 5 nits |
+| Fix round 2 (mail, hub, fs/ssl ops, server, client) + re-review | done | `vmail.passwd.rekey`, 465 only with the Exim TLS preset, boot enqueue gated, `getent` group lookups, panel pair never written empty, `WHM_HTTP_REDIRECT` fail-safe, SSE access-log skip, versioned php-fpm binaries, docs, Exim Configuration Manager "Virtual mailboxes" card + "Submission ports" switch, e2e scripts on `https://127.0.0.1:2087`; re-review: 2 majors (case-insensitive `/v1` gate; legacy `/etc/whm/tls` pair) |
+| Fix round 3 (the two majors) | fixes in the tree; re-review result not yet read | hub gate normalises the path before comparing; `writePanelPair` keeps/overwrites the legacy pair while `panel.env`/`whm.conf` still reference it |
+| Host-side fixes applied on nova | done | AutoSSL (certbot, `admin@hostingsignal.in`, `includeWww: false`) + production certificate live for `testuser.hostingsignal.in`; ManageSieve 2000 disabled; fail2ban exim/dovecot/pure-ftpd (`/etc/fail2ban/jail.d/keel.local`); `/etc/pure-ftpd/auth/50puredb`; `basic.nameservers` = Cloudflare + zone NS/SOA; `basic.contact_email` |
+| Full gate on the fixed tree, commit, push | pending | numbers to be recorded at deploy |
+| Deploy `scripts/install.sh --upgrade`, then the host steps (virtual-mail job + 3 `.include_if_exists` lines + apply, `submissionPorts` + SG 465/587, AutoSSL for `nova.hostingsignal.in` + service certs, root 2FA + hub admin TOTP) | pending | `HANDOFF.md` §4 items 2–6 |
+| Left to the operator (not applied by design): ModSecurity/CRS, scheduled backups, DNS delegation to BIND, PHP pool `open_basedir`/`disable_functions`, SMTP restrictions, Apache `ServerTokens` | operator decision | `HANDOFF.md` §4 item 7 |
 
 Faster option: verification can be cut to one reviewer and one fix round per category
 (~30% less time, less thorough). Not applied unless requested.

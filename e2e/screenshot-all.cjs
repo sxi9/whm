@@ -3,14 +3,16 @@
 // (category › function · live/placeholder · date · commit), and writes gallery
 // READMEs that show every screenshot inline.
 //
-//   BASE=http://127.0.0.1:2086 PASSWORD='<root password>' OUT=docs/screenshots node e2e/screenshot-all.cjs
+//   BASE=https://127.0.0.1:2087 PASSWORD='<root password>' OUT=docs/screenshots node e2e/screenshot-all.cjs
 const { chromium, request } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 const { pathToFileURL } = require('url');
 
-const BASE = process.env.BASE || 'http://127.0.0.1:2086';
+// The plain port only redirects (301) or refuses (426) once TLS is on, so the
+// default is the TLS listener; the installer's certificate is self-signed.
+const BASE = process.env.BASE || 'https://127.0.0.1:2087';
 const OUT = path.resolve(process.env.OUT || path.join(__dirname, 'shots'));
 const PASSWORD = process.env.PASSWORD;
 const QUALITY = Number(process.env.QUALITY || 85);
@@ -79,7 +81,7 @@ function grid(items, perRow = 3) {
   fs.mkdirSync(pagesDir, { recursive: true });
 
   const browser = await chromium.launch();
-  const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  const page = await browser.newPage({ viewport: { width: 1280, height: 800 }, ignoreHTTPSErrors: true });
   const failures = [];
   const shot = async (file) => { fs.mkdirSync(path.dirname(file), { recursive: true }); await page.screenshot({ path: file, type: 'jpeg', quality: QUALITY }); };
   const settle = async (selector) => {
@@ -129,7 +131,7 @@ function grid(items, perRow = 3) {
   const panelStatuses = {};
   let panelCount = 0;
   try {
-    const api = await request.newContext({ baseURL: BASE });
+    const api = await request.newContext({ baseURL: BASE, ignoreHTTPSErrors: true });
     const login = await (await api.post('/api/auth/login', { data: { username: 'root', password: PASSWORD } })).json();
     const h = { 'X-CSRF-Token': login.data.csrfToken };
     if ((await api.get('/api/accounts/demopanel')).status() === 404) {
@@ -137,7 +139,7 @@ function grid(items, perRow = 3) {
     }
     const las = await api.post('/api/panel/admin/login-as/demopanel', { headers: h });
     if (!las.ok()) throw new Error(`login-as failed: ${las.status()} ${await las.text()}`);
-    const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, storageState: await api.storageState() });
+    const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, ignoreHTTPSErrors: true, storageState: await api.storageState() });
     const ppage = await ctx.newPage();
     const pshot = async (file) => { fs.mkdirSync(path.dirname(file), { recursive: true }); await ppage.screenshot({ path: file, type: 'jpeg', quality: QUALITY }); };
     const psettle = async (selector) => { try { await ppage.waitForSelector(selector, { timeout: 8000 }); } catch { /* capture anyway */ } await ppage.waitForTimeout(250); };
@@ -189,7 +191,7 @@ function grid(items, perRow = 3) {
   const flow = FLOW_SHOTS.filter(([file]) => fs.existsSync(path.join(OUT, file))).map(([file, label]) => [file, label, null]);
   const topReadme = ['# Screenshots', '', `Updated ${DATE} at commit \`${SHA}\`. All images are captured automatically (Playwright) against the built interface served by the API, and each carries a label bar naming the screen, whether it is live or a placeholder, the date and the commit. They are regenerated at every milestone (\`e2e/screenshots.sh\`).`, '',
     `- **[Every page →](pages/README.md)** — all 212 admin function pages grouped by category (${live}/${count} live), the core pages, and the account panel (${panelCount} pages).`, '', '## Flow', '', 'Login → dashboard → creating an account through the form → lists, status pages, configuration and search.', '', grid(flow, 2), '',
-    '## Account panel flow', '', 'Captured by `e2e/panel-check.cjs` under [`panel-flow/`](panel-flow/): an account user signing in, every panel group, the file manager and cron APIs, then an admin opening the account through "Log in as".', '', '## Regenerate', '', '```bash', "BASE=http://127.0.0.1:2086 PASSWORD='<root password>' bash e2e/screenshots.sh   # flow shots + every page + galleries", '```', ''];
+    '## Account panel flow', '', 'Captured by `e2e/panel-check.cjs` under [`panel-flow/`](panel-flow/): an account user signing in, every panel group, the file manager and cron APIs, then an admin opening the account through "Log in as".', '', '## Regenerate', '', '```bash', "BASE=https://127.0.0.1:2087 PASSWORD='<root password>' bash e2e/screenshots.sh   # flow shots + every page + galleries", '```', ''];
   fs.writeFileSync(path.join(OUT, 'README.md'), topReadme.join('\n'));
 
   console.log(`captured ${count} function pages (${live} live) into ${pagesDir}`);

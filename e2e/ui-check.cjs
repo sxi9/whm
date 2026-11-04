@@ -3,9 +3,11 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 
-const BASE = process.env.BASE || 'http://127.0.0.1:2086';
+// The plain port only redirects (301) or refuses (426) once TLS is on, so the
+// default is the TLS listener; the installer's certificate is self-signed.
+const BASE = process.env.BASE || 'https://127.0.0.1:2087';
 const OUT = process.env.OUT || path.join(__dirname, 'shots');
-// Usage: BASE=http://127.0.0.1:2086 PASSWORD='<root password>' node e2e/ui-check.cjs  (needs the built client served by the API and playwright installed)
+// Usage: BASE=https://127.0.0.1:2087 PASSWORD='<root password>' node e2e/ui-check.cjs  (needs the built client served by the API and playwright installed)
 const PASSWORD = process.env.PASSWORD || 'Sm0ke-Test-Passw0rd!';
 fs.mkdirSync(OUT, { recursive: true });
 
@@ -34,7 +36,7 @@ async function stamp(page, text) {
 }
 (async () => {
   const browser = await chromium.launch();
-  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, ignoreHTTPSErrors: true });
   page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
   // The SPA probes /api/auth/me before login; that 401 is expected, not an error.
   page.on('console', (m) => { if (m.type() === 'error' && !/status of 401/.test(m.text())) errors.push(`console: ${m.text()}`); });

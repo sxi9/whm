@@ -7,6 +7,9 @@ import { createSoftwareService } from '../../services/software.js';
 // before any op call, and the agent refuses them again regardless.
 const pkgName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9+._-]{0,99}$/, 'Package names use letters, digits, "+", ".", "_" and "-" and cannot start with "-"');
 const searchTerm = z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9+._-]{0,63}$/, 'Search with letters, digits, "+", ".", "_" or "-"');
+// Up to four space-separated words; the agent receives them as separate argv
+// tokens (apt-cache / dnf search match packages matching every word).
+const searchWords = z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9+._-]{0,63}( +[A-Za-z0-9][A-Za-z0-9+._-]{0,63}){0,3}$/, 'Search with up to four words of letters, digits, "+", ".", "_" or "-"').transform((s) => s.split(/ +/));
 const perlModule = z.string().max(128).regex(/^[A-Za-z][A-Za-z0-9_]*(::[A-Za-z0-9_]+)*$/, 'Perl module names look like Foo::Bar');
 const moduleKind = z.enum(['pecl', 'pear', 'gem', 'pip']);
 const moduleName = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/, 'Letters, digits, ".", "_" and "-" only');
@@ -42,7 +45,9 @@ export async function register(ctx) {
   s.nginx.alignSchedule();
   ctx.capabilities.register('pkg', { binaries: ['apt-get', 'dnf', 'yum', 'dpkg-query', 'rpm'], required: ['apt-get', 'dnf', 'yum'] });
   ctx.capabilities.register('rpm', { binaries: ['rpm'], required: ['rpm'] });
-  ctx.capabilities.register('php', { binaries: ['php', 'php-fpm'], required: ['php'] });
+  // Debian names the FPM binary per branch (/usr/sbin/php-fpm8.5); the
+  // candidates mirror the php-fpm unit list in db/seed.js.
+  ctx.capabilities.register('php', { binaries: ['php', 'php-fpm', 'php-fpm8.5', 'php-fpm8.4', 'php-fpm8.3', 'php-fpm8.2', 'php-fpm8.1'], required: ['php'] });
   ctx.capabilities.register('nginx', { binaries: ['nginx'], required: ['nginx'] });
   ctx.capabilities.register('perl', { binaries: ['perl'], required: ['perl'] });
   ctx.capabilities.register('cpan', { binaries: ['cpanm', 'cpan'], required: ['cpanm', 'cpan'] });
@@ -61,7 +66,7 @@ export async function register(ctx) {
   // Install Distro Packages
   r.get('/pkg/detect', requireRoot, wrap(() => s.pkg.detect()));
   r.get('/pkg/installed', requireRoot, validate({ query: pagination.extend({ q: searchTerm.optional() }) }), wrap((req) => s.pkg.installed(req.query)));
-  r.get('/pkg/search', requireRoot, validate({ query: z.object({ q: searchTerm, limit: z.coerce.number().int().min(1).max(500).default(100) }) }), wrap((req) => s.pkg.search(req.query.q, req.query.limit)));
+  r.get('/pkg/search', requireRoot, validate({ query: z.object({ q: searchWords, limit: z.coerce.number().int().min(1).max(500).default(100) }) }), wrap((req) => s.pkg.search(req.query.q, req.query.limit)));
   r.get('/pkg/info/:name', requireRoot, validate({ params: z.object({ name: pkgName }) }), wrap((req) => s.pkg.info(req.params.name)));
   r.get('/pkg/recent', requireRoot, wrap(() => s.pkg.recent()));
   r.post('/pkg/install', requireRoot, validate({ body: packagesBody.extend({ noRecommends: z.boolean().default(false) }).strict() }), accepted((req) => s.pkg.install(req.body.packages, req.user, req, { noRecommends: req.body.noRecommends })));

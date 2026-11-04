@@ -556,18 +556,29 @@ defineOp('db.grant', {
   },
 });
 
+export function revokeStatements(user, database, h) {
+  return [`REVOKE ALL PRIVILEGES ON ${q.id(database)}.* FROM ${q.account(user, h)}`, `REVOKE GRANT OPTION ON ${q.id(database)}.* FROM ${q.account(user, h)}`];
+}
+
 defineOp('db.revoke', {
   description: 'REVOKE ALL PRIVILEGES on a database from user@host',
   destructive: true,
   schema: withCreds({ user: mysqlUser, database: dbName, hosts: z.array(host).min(1).max(50).default(['localhost']) }),
   run: async ({ user, database, hosts, credentials: creds }, ctx) => {
-    const sql = hosts.map((h) => `REVOKE ALL PRIVILEGES, GRANT OPTION ON ${q.id(database)}.* FROM ${q.account(user, h)};`).join('\n');
-    try {
-      await mysql(`${sql}\nFLUSH PRIVILEGES;`, creds, ctx);
-    } catch (err) {
-      // 1141: there is no such grant defined; nothing to revoke.
-      if (err.details?.errno !== 1141) throw err;
+    // "REVOKE ALL PRIVILEGES, GRANT OPTION" exists only without an ON clause
+    // (MariaDB and MySQL alike); a database-level revoke takes one statement
+    // per privilege set, each on its own so that 1141 (no such grant) at one
+    // host or set does not abort the others.
+    for (const h of hosts) {
+      for (const sql of revokeStatements(user, database, h)) {
+        try {
+          await mysql(sql, creds, ctx);
+        } catch (err) {
+          if (err.details?.errno !== 1141) throw err;
+        }
+      }
     }
+    await mysql('FLUSH PRIVILEGES', creds, ctx);
     return { user, database, hosts, revoked: true };
   },
 });

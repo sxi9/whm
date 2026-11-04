@@ -86,6 +86,20 @@ describe('File manager page', () => {
     expect(html).not.toMatch(/aria-label="Up one level"[^>]*disabled=""/);
   });
 
+  it('does not show the previous folder\'s rows once the path has changed (double-click safety)', () => {
+    fixtures.responses.clear();
+    fixtures.responses.set('/panel/files/list?path=public_html&limit=10000', { loading: true, data: { path: '.', entries, total: 5, truncated: true } });
+    const html = render(h(FileManager, { fn: fmFn }), '/panel/files/file-manager?path=public_html');
+    expect(html).not.toContain('notes.txt');
+    expect(html).not.toContain('site-backup.tar.gz');
+    expect(html).not.toContain('This folder is empty');
+    expect(html).not.toContain('entries are shown');
+    fixtures.responses.set('/panel/files/list?path=public_html&limit=10000', { loading: false, data: { path: 'public_html', entries, total: 5, truncated: false } });
+    const fresh = render(h(FileManager, { fn: fmFn }), '/panel/files/file-manager?path=public_html');
+    expect(fresh).toContain('notes.txt');
+    expect(fresh).toContain('5 items');
+  });
+
   it('warns when the listing is truncated', () => {
     fixtures.responses.clear();
     fixtures.responses.set('/panel/files/list?path=&limit=10000', { loading: false, data: { path: '.', entries, total: 12000, truncated: true } });

@@ -2,8 +2,11 @@ import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client.js';
 import { StatusPill } from './Common.jsx';
 
-// Live view of a background job via the SSE stream.
-export function ProgressLog({ jobId, onFinished }) {
+// Live view of a background job via the SSE stream. The system stream is
+// reseller-only; account-panel pages pass the path of their own scoped stream.
+export const systemJobStreamPath = (id) => `/system/jobs/${id}/stream`;
+
+export function ProgressLog({ jobId, onFinished, streamPath = systemJobStreamPath }) {
   const [job, setJob] = useState(null);
   const [lines, setLines] = useState([]);
   const [progress, setProgress] = useState({ pct: 0, message: null });
@@ -12,7 +15,7 @@ export function ProgressLog({ jobId, onFinished }) {
   useEffect(() => {
     if (!jobId) return undefined;
     setLines([]);
-    const close = api.stream(`/system/jobs/${jobId}/stream`, (event) => {
+    const close = api.stream(streamPath(jobId), (event) => {
       if (event.type === 'snapshot') {
         setJob(event.job);
         setProgress({ pct: event.job.progress, message: event.job.message });
@@ -27,7 +30,7 @@ export function ProgressLog({ jobId, onFinished }) {
       }
     });
     return close;
-  }, [jobId, onFinished]);
+  }, [jobId, onFinished, streamPath]);
 
   useEffect(() => { endRef.current?.scrollIntoView({ block: 'nearest' }); }, [lines]);
 

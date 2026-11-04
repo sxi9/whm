@@ -76,7 +76,8 @@ export default function PortalSecurity({ home = '/admin' }) {
   return (
     <>
       <PageHeader title="Security" description="Two-factor authentication and password for this portal account. Sensitive actions re-prompt for a code." home={home} />
-      {!session?.totpEnabled && <div className="banner banner-warning"><div>Two-factor authentication is off. Enrol below before signing keys, API keys, portal users or marketplace decisions: the hub refuses those actions until a code is confirmed.</div></div>}
+      {session?.totpEnrolRequired && <div className="banner banner-error" role="alert"><div><strong>Two-factor authentication is required for your role.</strong> Enrol below to continue: every other page and action stays closed until a code is confirmed.</div></div>}
+      {!session?.totpEnabled && !session?.totpEnrolRequired && <div className="banner banner-warning"><div>Two-factor authentication is off. Enrol below before signing keys, API keys, portal users or marketplace decisions: the hub refuses those actions until a code is confirmed.</div></div>}
       <div className="two-col">
         <Card title="Two-factor authentication"><PortalTotpPanel /></Card>
         <Card title="Password"><PortalPasswordPanel home={home} /></Card>

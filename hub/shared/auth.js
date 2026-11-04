@@ -167,6 +167,33 @@ export function requireStepUp(maxAgeS = 300, now = () => Date.now()) {
   };
 }
 
+// license.require_admin_totp: a vendor_admin without TOTP still signs in, but
+// the session is held at enrolment (mirroring the panel's mustEnroll2fa) so an
+// unenrolled admin on a live hub is never locked out of enrolling. The user's
+// own role decides: impersonation needs a step-up, which needs TOTP already.
+export function totpEnrolmentRequired(config, { role, totpEnabled, impersonation = null }) {
+  if (!config.license.require_admin_totp || totpEnabled) return false;
+  return role === 'vendor_admin' || Boolean(impersonation);
+}
+
+const ENROL_PATHS = new Set(['/v1/portal/logout', '/v1/portal/csrf', '/v1/portal/me', '/v1/portal/2fa/enroll', '/v1/portal/2fa/confirm', '/v1/portal/password']);
+// Only the API is held: the SPA shell (index.html, /assets/*) must still load
+// so a held admin can reach the enrolment page after a reload or deep link.
+// Express mounts match case-insensitively and req.path is not percent-decoded,
+// so the gate compares the decoded, lower-cased path; a path that cannot be
+// decoded is refused rather than let through.
+export function requireTotpEnrolment(ctx) {
+  return (req, _res, next) => {
+    const p = req.principal;
+    if (!p || p.type !== 'portal' || !totpEnrolmentRequired(ctx.config, p)) return next();
+    let pathname;
+    try { pathname = decodeURIComponent(req.path).toLowerCase(); } catch { pathname = null; }
+    if (pathname !== null && !/^\/v1(\/|$)/.test(pathname)) return next();
+    if (pathname !== null && ENROL_PATHS.has(pathname)) return next();
+    next(new HttpError(403, 'totp_enrol_required', 'Enable two-factor authentication to continue'));
+  };
+}
+
 export function issueCsrfToken(req, crypto) {
   if (!req.session.csrfToken) req.session.csrfToken = crypto.randomToken(24);
   return req.session.csrfToken;

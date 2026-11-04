@@ -335,12 +335,24 @@ export function stripEximBlock(text, name) {
   return `${t.slice(0, found.start)}${t.slice(found.stop + found.endLength).replace(/^\n/, '')}`;
 }
 
-// Resolves the first existing group of `names` from /etc/group.
-export function groupId(names, groupFile = '/etc/group') {
-  const text = readText(groupFile) || '';
-  for (const name of names) {
-    const m = text.match(new RegExp(`^${name}:[^:]*:(\\d+):`, 'm'));
-    if (m) return { name, gid: Number(m[1]) };
+// The argv guard for getent; daemon groups such as Debian-exim carry capitals.
+const GROUP_NAME = /^[A-Za-z_][A-Za-z0-9_-]{0,31}$/;
+
+async function groupLine(name, groupFile) {
+  if (hasBinary('getent')) {
+    const r = await exec('getent', ['group', '--', name], { allowFailure: true, timeoutMs: 30_000 });
+    return r.code === 0 ? r.stdout.split('\n').find((l) => l.startsWith(`${name}:`)) ?? null : null;
+  }
+  return (readText(groupFile) || '').split('\n').find((l) => l.startsWith(`${name}:`)) ?? null;
+}
+
+// Resolves the first existing group of `names`: getent answers from every NSS
+// source, so the group file is scanned directly only on a host without it.
+export async function groupId(names, groupFile = '/etc/group') {
+  for (const name of names.filter((n) => GROUP_NAME.test(n))) {
+    const line = await groupLine(name, groupFile);
+    const gid = line ? Number(line.split(':')[2]) : NaN;
+    if (Number.isInteger(gid) && gid >= 0) return { name, gid };
   }
   return null;
 }
@@ -395,9 +407,31 @@ export function dovecotLayout() {
   return { confDir: '/etc/dovecot', dropinDir: '/etc/dovecot/conf.d', sslInclude: '/etc/dovecot/conf.d/90-whm-ssl-cert.conf', legacyIncludes: ['/etc/dovecot/conf.d/98-whm-tls.conf', '/etc/dovecot/conf.d/99-whm-ssl.conf'], units: ['dovecot'] };
 }
 
-export function renderDovecotCertInclude(paths, { hasChain = false } = {}) {
-  const lines = [`${MANAGED} (Manage Service SSL Certificates). Certificate files only: ssl=, protocols and ciphers live in 97-whm-mailserver.conf (Mailserver Configuration).`, `ssl_cert = <${paths.fullchain}`, `ssl_key = <${paths.key}`];
-  if (hasChain) lines.push(`ssl_ca = <${paths.chain}`);
+// Dovecot 2.4 renamed ssl_cert/ssl_key/ssl_ca to ssl_server_cert_file/_key_file/
+// _ca_file (plain paths, no "<") and rejects the old names as unknown settings;
+// 2.3 does not know the new ones, so the drop-in follows the installed version.
+export function parseDovecotVersion(text) {
+  const m = String(text || '').match(/(\d+)\.(\d+)/);
+  return m ? { major: Number(m[1]), minor: Number(m[2]) } : null;
+}
+
+export function dovecotUsesFileSettings(version) {
+  return Boolean(version && (version.major > 2 || (version.major === 2 && version.minor >= 4)));
+}
+
+async function detectDovecotVersion() {
+  if (!hasBinary('dovecot')) return null;
+  try {
+    const { stdout } = await exec('dovecot', ['--version'], { allowFailure: true, timeoutMs: 30_000 });
+    return parseDovecotVersion(stdout);
+  } catch { return null; }
+}
+
+export function renderDovecotCertInclude(paths, { hasChain = false, dovecotVersion = null } = {}) {
+  const header = `${MANAGED} (Manage Service SSL Certificates). Certificate files only: ssl=, protocols and ciphers live in 97-whm-mailserver.conf (Mailserver Configuration).`;
+  const lines = dovecotUsesFileSettings(dovecotVersion)
+    ? [header, `ssl_server_cert_file = ${paths.fullchain}`, `ssl_server_key_file = ${paths.key}`, ...(hasChain ? [`ssl_server_ca_file = ${paths.chain}`] : [])]
+    : [header, `ssl_cert = <${paths.fullchain}`, `ssl_key = <${paths.key}`, ...(hasChain ? [`ssl_ca = <${paths.chain}`] : [])];
   return `${lines.join('\n')}\n`;
 }
 
@@ -603,7 +637,7 @@ defineOp('ssl.bundle.list', {
 
 // The file set that wires a service bundle into its daemon. `layouts` lets tests
 // describe a host without touching /etc; production calls detect the real one.
-export function serviceCopies(svc, paths, layouts = {}, { hasChain = false } = {}) {
+export function serviceCopies(svc, paths, layouts = {}, { hasChain = false, dovecotVersion = null } = {}) {
   const layout = (key, detect) => (key in layouts ? layouts[key] : detect());
   const copies = [];
   if (svc === 'exim') {
@@ -612,7 +646,7 @@ export function serviceCopies(svc, paths, layouts = {}, { hasChain = false } = {
     if (exim) copies.push({ from: paths.fullchain, to: exim.cert, mode: 0o644 }, { from: paths.key, to: exim.key, mode: 0o640, groups: exim.groups });
   } else if (svc === 'dovecot') {
     const dc = layout('dovecot', dovecotLayout);
-    if (dc) copies.push({ remove: dc.legacyIncludes }, { include: dc.sslInclude, content: renderDovecotCertInclude(paths, { hasChain }), mode: 0o644, validate: 'dovecot' });
+    if (dc) copies.push({ remove: dc.legacyIncludes }, { include: dc.sslInclude, content: renderDovecotCertInclude(paths, { hasChain, dovecotVersion }), mode: 0o644, validate: 'dovecot' });
   } else if (svc === 'apache') {
     const apache = layout('apache', apacheLayout);
     if (apache) copies.push({ apacheInclude: `${apache.includeDir}/zz-whm-service-ssl.conf`, content: `${MANAGED} (Manage Service SSL Certificates). Default certificate for SSL vhosts that set none.\n<IfModule ssl_module>\n  SSLCertificateFile ${paths.fullchain}\n  SSLCertificateKeyFile ${paths.key}\n</IfModule>\n` });
@@ -628,6 +662,78 @@ export function serviceCopies(svc, paths, layouts = {}, { hasChain = false } = {
     if (ftp?.flavor === 'vsftpd') copies.push({ vsftpd: ftp.confFile });
   }
   return copies;
+}
+
+// The panel runs as its own unprivileged user (deploy/whm-panel.service:
+// User=whmpanel, ReadOnlyPaths=/etc/whm), so the pair replaces install.sh's
+// self-signed /etc/whm/ssl/panel.{crt,key} with the same root:whmpanel 0640
+// layout; the running process serves it after a restart.
+const PANEL_TLS_DIR = '/etc/whm/ssl';
+// Earlier builds wrote cert.pem/key.pem here and told the admin to point
+// WHM_TLS_CERT/WHM_TLS_KEY at them.
+const LEGACY_PANEL_TLS_DIR = '/etc/whm/tls';
+const PANEL_ENV = '/etc/whm/panel.env';
+const PANEL_CONF = '/etc/whm/whm.conf';
+const PANEL_GROUPS = ['whmpanel', 'whm-panel'];
+
+// panel.env is a systemd EnvironmentFile: KEY=value lines, optional quotes.
+export function parseEnvFile(text) {
+  const out = {};
+  for (const raw of (text || '').split('\n')) {
+    const m = raw.trim().match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+    if (m) out[m[1]] = m[2].trim().replace(/^(['"])(.*)\1$/, '$2');
+  }
+  return out;
+}
+
+// The panel resolves its pair from WHM_TLS_CERT/WHM_TLS_KEY in panel.env or
+// tlsCert/tlsKey in the JSON file WHM_CONFIG names (server/src/config.js) and
+// refuses to start when that pair is unreadable, so an install still pointed
+// at the legacy directory must keep its files. Returns the file that does.
+export function legacyPanelTlsReference(legacyDir, { envFile = PANEL_ENV, defaultConfig = PANEL_CONF } = {}) {
+  const inLegacy = (p) => typeof p === 'string' && (p === legacyDir || p.startsWith(`${legacyDir}/`));
+  const env = parseEnvFile(readText(envFile));
+  if (inLegacy(env.WHM_TLS_CERT) || inLegacy(env.WHM_TLS_KEY)) return envFile;
+  const confFile = env.WHM_CONFIG || defaultConfig;
+  let conf = null;
+  try { conf = JSON.parse(readText(confFile) || 'null'); } catch { conf = null; }
+  if (conf && typeof conf === 'object' && (inLegacy(conf.tlsCert) || inLegacy(conf.tlsKey))) return confFile;
+  return null;
+}
+
+export function writePanelPair(paths, dest, { group = null, legacyDir = LEGACY_PANEL_TLS_DIR, envFile = PANEL_ENV, defaultConfig = PANEL_CONF } = {}) {
+  const files = [[paths.fullchain, 'panel.crt', 'cert.pem'], [paths.key, 'panel.key', 'key.pem']].map(([from, name, legacyName]) => ({ from, to: path.join(dest, name), legacy: path.join(legacyDir, legacyName), content: readText(from) }));
+  const broken = files.find((f) => !f.content || !f.content.trim());
+  if (broken) throw new OpError('not_found', `${broken.from} is missing or empty; the panel pair under ${dest} was left unchanged`);
+  // The panel runs as its service user with /etc/whm read-only: a root-only key would stop it from starting.
+  if (!group) throw new OpError('refused', `none of the groups ${PANEL_GROUPS.join(', ')} exist; the panel pair under ${dest} was left unchanged`);
+  const applied = [];
+  const removed = [];
+  const updated = [];
+  const notes = [];
+  const own = (target) => {
+    try { fs.lchownSync(target, -1, group.gid); } catch (err) { notes.push(`${target} could not be handed to group ${group.name}: ${err.message}`); }
+  };
+  const legacyEntry = (target) => { try { return fs.lstatSync(target); } catch { return null; } };
+  const referencedBy = legacyPanelTlsReference(legacyDir, { envFile, defaultConfig });
+  fs.mkdirSync(dest, { recursive: true, mode: 0o750 });
+  own(dest);
+  for (const f of files) {
+    writeAtomic(f.to, f.content, 0o640);
+    own(f.to);
+    applied.push(f.to);
+  }
+  for (const f of files) {
+    if (referencedBy) {
+      try { writeAtomic(f.legacy, f.content, 0o640); own(f.legacy); updated.push(f.legacy); } catch (err) { notes.push(`${f.legacy} could not be updated: ${err.message}`); }
+    } else if (legacyEntry(f.legacy)) {
+      try { fs.unlinkSync(f.legacy); removed.push(f.legacy); } catch (err) { notes.push(`${f.legacy} could not be removed: ${err.message}`); }
+    }
+  }
+  if (removed.length) notes.push(`The legacy ${removed.join(' and ')} were removed.`);
+  if (updated.length) notes.push(`${referencedBy} still points the panel at ${legacyDir}, so the legacy ${updated.join(' and ')} were overwritten with the new pair instead of removed; point WHM_TLS_CERT/WHM_TLS_KEY (or tlsCert/tlsKey) at ${dest}/panel.crt and ${dest}/panel.key, then remove ${legacyDir}.`);
+  notes.push(`Written to ${dest}/panel.crt and panel.key, the pair WHM_TLS_CERT/WHM_TLS_KEY point at by default; if they were changed in ${PANEL_ENV} they must point at ${dest}. Run systemctl restart whm-panel for the panel to serve it.`);
+  return { applied, removed, updated, legacy: updated.length ? 'updated' : removed.length ? 'removed' : null, notes };
 }
 
 function applyVsftpd(file, paths) {
@@ -648,14 +754,16 @@ async function installServiceCert(svc, { certPem, keyPem, chainPem }, ctx) {
   const removed = [];
   const notes = [];
   let validated = null;
-  const copies = serviceCopies(svc, paths, {}, { hasChain: Boolean(chainPem) });
+  let legacy = null;
+  const dovecotVersion = svc === 'dovecot' ? await detectDovecotVersion() : null;
+  const copies = serviceCopies(svc, paths, {}, { hasChain: Boolean(chainPem), dovecotVersion });
   for (const c of copies) {
     if (c.remove) { removed.push(...removeManagedFiles(c.remove, ctx)); }
     else if (c.combine) { ctx.assertAllowedPath(c.combine, 'write'); writeAtomic(c.combine, `${readText(paths.fullchain)}${readText(paths.key)}`, c.mode); applied.push(c.combine); }
     else if (c.to) {
       ctx.assertAllowedPath(c.to, 'write'); fs.mkdirSync(path.dirname(c.to), { recursive: true }); fs.copyFileSync(c.from, c.to); fs.chmodSync(c.to, c.mode);
       if (c.groups) {
-        const group = groupId(c.groups);
+        const group = await groupId(c.groups);
         if (!group) notes.push(`${c.to} is readable by root only: none of the groups ${c.groups.join(', ')} exist, so the daemon cannot load the key.`);
         else { try { fs.chownSync(c.to, 0, group.gid); } catch (err) { notes.push(`${c.to} could not be handed to group ${group.name}: ${err.message}`); } }
       }
@@ -687,15 +795,14 @@ async function installServiceCert(svc, { certPem, keyPem, chainPem }, ctx) {
     } else if (exim) notes.push(`Set tls_advertise_hosts = *, tls_certificate = ${exim.cert} and tls_privatekey = ${exim.key} in the main section of the Exim configuration.`);
   }
   if (svc === 'panel') {
-    const dest = ctx.assertAllowedPath('/etc/whm/tls', 'write');
-    fs.mkdirSync(dest, { recursive: true, mode: 0o750 });
-    fs.copyFileSync(paths.fullchain, path.join(dest, 'cert.pem')); fs.chmodSync(path.join(dest, 'cert.pem'), 0o644);
-    fs.copyFileSync(paths.key, path.join(dest, 'key.pem')); fs.chmodSync(path.join(dest, 'key.pem'), 0o600);
-    applied.push(path.join(dest, 'cert.pem'), path.join(dest, 'key.pem'));
-    notes.push('Point WHM_TLS_CERT/WHM_TLS_KEY at /etc/whm/tls/cert.pem and key.pem and restart whm-panel.');
+    const written = writePanelPair(paths, ctx.assertAllowedPath(PANEL_TLS_DIR, 'write'), { group: await groupId(PANEL_GROUPS), legacyDir: ctx.assertAllowedPath(LEGACY_PANEL_TLS_DIR, 'write') });
+    applied.push(...written.applied, ...written.updated);
+    removed.push(...written.removed);
+    legacy = written.legacy;
+    notes.push(...written.notes);
   } else if (!copies.length) notes.push(`No ${svc} daemon configuration was found on this server; the bundle was stored under ${dir} only.`);
   const reload = copies.length ? await reloadUnit(SERVICE_UNITS[svc]) : { reloaded: false, unit: null };
-  return { service: svc, paths, applied, removed, validated, reload, certificate: await inspectCert(certPem), note: notes.length ? notes.join(' ') : null };
+  return { service: svc, paths, applied, removed, ...(legacy ? { legacy } : {}), validated, reload, certificate: await inspectCert(certPem), note: notes.length ? notes.join(' ') : null };
 }
 
 defineOp('ssl.service_cert.install', {

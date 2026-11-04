@@ -78,7 +78,7 @@ cp .env.example .env         # monolithic mode, ./data, port 2086
 npm run dev                  # API with --watch on :2086 + Vite dev server on :5173 (proxies /api)
 npm test                     # vitest: server + agent + client; node:test: SDK, sample + bundled plugins (hub: cd hub && npm test)
 npm run build && WHM_SERVE_CLIENT=true npm start    # production-style single process
-BASE=http://127.0.0.1:2086 PASSWORD='<root password>' node e2e/ui-check.cjs   # browser end-to-end check (needs playwright)
+BASE=https://127.0.0.1:2087 PASSWORD='<root password>' node e2e/ui-check.cjs   # browser end-to-end check (needs playwright)
 ```
 
 In development the API runs in **monolithic mode** (the op catalog executes in-process, so
@@ -90,7 +90,11 @@ boot writes `data/initial-admin-password.txt`.
 Precedence: environment variables → `/etc/whm/whm.conf` (or `WHM_CONFIG`) → defaults.
 See [`.env.example`](.env.example) and [`deploy/whm.conf.example`](deploy/whm.conf.example).
 Key settings: `WHM_MODE` (`split` in production, `monolithic` for dev), `WHM_DATA_DIR`,
-`WHM_PORT`/`WHM_TLS_PORT`, `WHM_TLS_CERT`/`WHM_TLS_KEY`, `WHM_SERVE_CLIENT`.
+`WHM_PORT`/`WHM_TLS_PORT`, `WHM_TLS_CERT`/`WHM_TLS_KEY`, `WHM_HTTP_REDIRECT`, `WHM_SERVE_CLIENT`.
+With a certificate configured, port 2086 only redirects browsers to 2087 and refuses API
+calls with `426 tls_required`; `GET /api/health` stays reachable in clear for monitors.
+`WHM_HTTP_REDIRECT=false` (or `"httpRedirect": false` in `whm.conf`) serves the full panel
+on both ports; any other value keeps the redirect on.
 The agent's writable path roots can be widened in `/etc/whm/agent.conf`.
 
 ## Security model (summary)

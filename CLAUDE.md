@@ -39,6 +39,7 @@ verified developers, and bundled plugins are part of the product (deferred to Ph
 | 2026-11-03 | **Identity + UI:** the product is **Keel**; `docs/design/ui-design-system.md` is the UI contract; a renamed function keeps its key/route via the `{ slug }` override in `nav.js`; the account holder's interface is "the account panel" (`/panel`), cPanel/WHM wording only for the external product. |
 | 2026-11-03 | **Account panel conventions:** one account per session via `ctx.panel.scope(req)`; services take the pinned scope and delegate to existing services with `scope.ownerPrincipal` (never `SYSTEM_ROOT` on a mutating path); account-tree work runs as the account uid through `agent/src/ops/as-user.js`; plan limits: `null` = unlimited, `0` = none; panel pages use only the shared kit (`client/src/panel/README.md`). |
 | 2026-11-03 | **zod 4:** two-argument `z.record`, `.prefault({})` for nested defaults, `patchOf()` for PATCH bodies, `fields.ipv4/ipv6/ip` keep zod-3 IPv6 parity. |
+| 2026-11-05 | **Live-host rules:** with TLS configured, port 2086 only redirects pages (301) and refuses `/api` (426 `tls_required`, `GET /api/health` excepted); the panel applies the virtual-mail wiring itself (job + admin route) but never edits `exim4.conf.template` — on unsplit Debian/RHEL the operator adds the `.include_if_exists` lines once; Dovecot passwd lines are keyed `local@domain` on every version; host-config findings (ModSecurity, backups, DNS delegation, PHP pool hardening, SMTP restrictions, Apache tokens) are operator decisions, not panel defaults. |
 | 2026-10-27 | `hub/ui` **copies** the panel's component kit (`hub/ui/src/components/SYNC.md` records the source commit) instead of importing across packages. Hub tests are `node --test`; hub/ui and the panel use vitest. |
 
 ## Non-negotiable conventions
@@ -186,6 +187,25 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Current state (update every push)
 
+- **2026-11-05: live-host verification done on the production install** (`nova.hostingsignal.in`, Ubuntu 26.04 on EC2;
+  the provisioned-host step `HANDOFF.md` §4.1 asked for). 10 probe areas, 29 confirmed findings (18 with a code component,
+  11 host-only; 1 refuted), each adversarially verified; fixes in three rounds with two review lenses, all code findings
+  closed. Main code changes (uncommitted in the working tree until the deploy commit): virtual-mail wiring is now applied
+  by the panel job `panel.virtual_mail.ensure` at boot / first mailbox / `POST /api/service-config/virtual-mail/apply`,
+  with Dovecot 2.3/2.4-aware fragments, passwd lines keyed `local@domain` + a one-time `vmail.passwd.rekey`, and the
+  Exim `submissionPorts` setting + dovecot authenticators (465 only with the TLS preset); sub/addon docroots handed to the
+  web group (`files.mkdir { group }`, 0750); `db.revoke` emits valid SQL; FTP PureDB auth-link detection/creation and
+  the daemon's effective TLS state; php-fpm unit discovery (migration `001d`); capability refresh after package jobs and
+  501/4xx log levels (`lib/request-log.js`); HTTP→HTTPS on 2086 (`middleware/tls-redirect.js`, `WHM_HTTP_REDIRECT`,
+  426 for `/api`, cert reload on SIGHUP/file change); panel service cert written readable by `whmpanel` under
+  `/etc/whm/ssl` with legacy `/etc/whm/tls` handling; Dovecot 2.4 service-cert drop-in; AutoSSL www DNS pre-check and
+  server-hostname issuance pushed to the services; panel job streams for role users; file-manager double-click; pkg
+  multi-word search; Security Advisor mail-wiring flags + PHP distro-backport check (`pkg.php.backports`); hub
+  `license.require_admin_totp` (default on); e2e scripts default to `https://127.0.0.1:2087` with `ignoreHTTPSErrors`.
+  Host-side changes already applied on nova: AutoSSL on (certbot, production cert live for `testuser.hostingsignal.in`),
+  ManageSieve 2000 off, fail2ban exim/dovecot/pure-ftpd jails, `/etc/pure-ftpd/auth/50puredb`, Cloudflare nameservers +
+  contact e-mail in Basic Setup. Gate numbers: to be recorded at deploy. **Next: deploy and the host steps in
+  `HANDOFF.md` §4.**
 - **2026-11-04 00:15: Phase 7 milestone 2 — the account panel is live.** `/panel` is our own customer-facing panel
   (the cPanel replacement): design `docs/design/customer-panel.md`, seams in `docs/design/integration-contracts.md`
   §33–40, manual `docs/MANUAL-partC.md`. Server: `services/panel.js` (`ctx.panel`: account users linked by
@@ -325,7 +345,14 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Resume notes
 
-- Working branch: `claude/kind-meitner-dlnbas` (push with `git push -u origin <branch>`). Phase 7 complete; next is provisioned-host verification (`HANDOFF.md` §4).
+- Working branch: `claude/kind-meitner-dlnbas` (push with `git push -u origin <branch>`). Phase 7 complete; the
+  provisioned-host verification ran on the real host (2026-11-04/05) and its fixes sit uncommitted in the working tree —
+  run the full gate, commit, then deploy with `scripts/install.sh --upgrade` and finish the host steps in `HANDOFF.md` §4.
+  Audit findings and fix reports live only in that session's scratchpad; the trackers carry what matters.
+- Live-host facts: the deploy clone is `~/whm` on the host (copied from this Windows checkout — strip CRLF before
+  deploying, or deploy from a git checkout); the Exim config is unsplit Debian (`dc_use_split_config=false`), so the
+  three driver slots need the operator's one-time `.include_if_exists` lines (the panel never edits
+  `exim4.conf.template`); Dovecot is 2.4.2; public DNS for `hostingsignal.in` stays at Cloudflare.
 - A multi-agent design run for the deferred Phase 5 items was paused:
   run id `wf_7104d0c5-441`, script
   `/root/.claude/projects/-home-user-whm/0c92c5a2-840d-518f-8036-382a362911d8/workflows/scripts/whm-license-marketplace-plugins-wf_7104d0c5-441.js`

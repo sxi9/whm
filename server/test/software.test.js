@@ -39,7 +39,7 @@ beforeAll(async () => {
       if (prefix) list = list.filter((p) => prefix.some((pre) => p.name === pre || p.name.startsWith(pre)));
       return { manager: 'apt', total: installedPkgs.length, packages: list };
     },
-    'pkg.search': ({ q, limit }) => ({ manager: 'apt', q, results: [{ name: q, summary: `the ${q} package`, installed: installedPkgs.some((p) => p.name === q), installedVersion: null }, { name: `lib${q}`, summary: 'library', installed: false, installedVersion: null }].slice(0, limit) }),
+    'pkg.search': ({ q, limit }) => { const term = Array.isArray(q) ? q.join('-') : q; return { manager: 'apt', q: Array.isArray(q) ? q.join(' ') : q, results: [{ name: term, summary: `the ${term} package`, installed: installedPkgs.some((p) => p.name === term), installedVersion: null }, { name: `lib${term}`, summary: 'library', installed: false, installedVersion: null }].slice(0, limit) }; },
     'pkg.info': ({ name }) => ({ manager: 'apt', name, installed: null, candidate: '1.0', summary: 'info', section: 'web', homepage: null, size: null }),
     'pkg.install': ({ packages }) => { installedPkgs = [...installedPkgs, ...packages.filter((p) => !installedPkgs.some((i) => i.name === p)).map((name) => ({ name, version: '1.0', arch: 'amd64', summary: 'installed by test' }))]; return { manager: 'apt', packages, output: [`Setting up ${packages.join(' ')}`] }; },
     'pkg.remove': ({ packages, purge }) => { installedPkgs = installedPkgs.filter((p) => !packages.includes(p.name)); return { manager: 'apt', packages, purge, output: [`Removing ${packages.join(' ')}`] }; },
@@ -203,6 +203,8 @@ describe('validation (422)', () => {
     }
     expect((await get('/api/software/pkg/search?q=a;b')).status).toBe(422);
     expect((await get('/api/software/pkg/search')).status).toBe(422);
+    for (const q of ['php;%20mysql', 'php%20$(id)', 'php%20-r', 'a%20b%20c%20d%20e', '%20', 'php%0Amysql']) expect((await get(`/api/software/pkg/search?q=${q}`)).status, q).toBe(422);
+    expect(app.agent.callsTo('pkg.search')).toHaveLength(0);
     expect((await get('/api/software/pkg/info/-r')).status).toBe(422);
     expect((await post('/api/software/update/run', { packages: ['$(id)'] })).status).toBe(422);
     expect((await put('/api/software/update/auto', { autoApply: 'yes' })).status).toBe(422);
@@ -313,6 +315,11 @@ describe('Install Distro Packages', () => {
     expect(installed.body.meta).toMatchObject({ page: 1, pageSize: 10, total: 2, manager: 'apt' });
     const search = await get('/api/software/pkg/search?q=curl');
     expect(search.body.data.results[0]).toMatchObject({ name: 'curl', installed: true });
+    expect(app.agent.callsTo('pkg.search').at(-1).args).toEqual({ q: ['curl'], limit: 100 });
+    const words = await get('/api/software/pkg/search?q=%20php%20%20mysql%20&limit=5');
+    expect(words.status).toBe(200);
+    expect(app.agent.callsTo('pkg.search').at(-1).args).toEqual({ q: ['php', 'mysql'], limit: 5 });
+    expect(words.body.data.q).toBe('php mysql');
     const info = await get('/api/software/pkg/info/curl');
     expect(info.body.data).toMatchObject({ name: 'curl', candidate: '1.0' });
   });
@@ -336,6 +343,34 @@ describe('Install Distro Packages', () => {
     expect(recent.body.data.length).toBeGreaterThanOrEqual(3);
     const audit = app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'software.pkg.install'").get().n;
     expect(audit).toBeGreaterThanOrEqual(1);
+  });
+
+  it('re-detects capabilities after a package install and before refusing a module list', async () => {
+    await provision(true, { gem: false });
+    expect((await get('/api/software/modules/gem')).status).toBe(501);
+    expect((await post('/api/software/modules/gem/install', { name: 'rails' })).status).toBe(501);
+    // The ruby package lands and the binary appears; the panel must notice without waiting for the periodic re-detection.
+    app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, Boolean(BIN_FULL[n])])));
+    const before = app.agent.callsTo('sys.binaries').length;
+    const res = await post('/api/software/pkg/install', { packages: ['ruby'] });
+    expect(res.status).toBe(202);
+    expect((await waitForJob(app.ctx, res.body.data.job.id)).status).toBe('done');
+    expect(app.agent.callsTo('sys.binaries').length).toBeGreaterThan(before);
+    expect((await get('/api/software/modules/gem')).status).toBe(200);
+    expect((await get('/api/software/modules/installers')).body.data.capabilities.gem).toBe(true);
+  });
+
+  it('re-detects once before a 501 when the installer arrived outside the panel', async () => {
+    await provision(true, { gem: false });
+    expect((await get('/api/software/modules/gem')).status).toBe(501);
+    app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, Boolean(BIN_FULL[n])])));
+    // Still 501 while the snapshot is fresh: concurrent cards must not each trigger a detection.
+    const detections = app.agent.callsTo('sys.binaries').length;
+    expect((await get('/api/software/modules/gem')).status).toBe(501);
+    expect(app.agent.callsTo('sys.binaries').length).toBe(detections);
+    app.ctx.capabilities.snapshot().at -= 60 * 1000;
+    expect((await get('/api/software/modules/gem')).status).toBe(200);
+    expect((await post('/api/software/modules/gem/install', { name: 'rails' })).status).toBe(202);
   });
 
   it('polls a detached installer run, streams its log and fails the job on a non-zero exit', async () => {

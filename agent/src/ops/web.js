@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import { z } from 'zod';
 import { exec, hasBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
@@ -442,8 +443,16 @@ export function renderRedirects(redirects, indent = '  ') {
   return lines;
 }
 
+// Addresses configured on this host's interfaces (web.vhost.write passes this as ownAddress).
+function hostHasAddress(ip) {
+  return Object.values(os.networkInterfaces()).flat().some((a) => a?.address === ip);
+}
 function vhostBlock(v, { ssl, port }) {
-  const addrs = v.bind ? [listenAddr(v.bind, port)] : [v.ip ? `${v.ip}:${port}` : null, v.ipv6 ? `[${v.ipv6}]:${port}` : null].filter(Boolean);
+  // Behind 1:1 NAT (EC2 and most clouds) the account IP is the public address and connections
+  // arrive on the private one, so a <VirtualHost> bound to an address the host does not hold
+  // never matches; such an IP falls back to the wildcard.
+  const own = v.ownAddress || (() => true);
+  const addrs = v.bind ? [listenAddr(v.bind, port)] : [v.ip && own(v.ip) ? `${v.ip}:${port}` : null, v.ipv6 && own(v.ipv6) ? `[${v.ipv6}]:${port}` : null].filter(Boolean);
   const listen = addrs.length ? addrs.join(' ') : `*:${port}`;
   const logDir = v.logDir || domlogDir(v.user);
   const names = [...new Set([`www.${v.domain}`, ...v.aliases].filter((a) => a !== v.domain))];
@@ -758,7 +767,7 @@ defineOp('web.vhost.write', {
     if (link) ctx.assertAllowedPath(link, 'write');
     ensureRootLogDir(logDir, passwdEntry(v.user)?.gid);
     if (v.ssl) { for (const f of [v.ssl.cert, v.ssl.key]) if (!exists(f)) throw new OpError('not_found', `Certificate file ${f} does not exist`); }
-    const content = renderVhost({ ...v, logDir });
+    const content = renderVhost({ ...v, logDir, ownAddress: hostHasAddress });
     const written = await writeApacheFile(apache, file, content, { link });
     const reload = v.reload ? await reloadUnit(apache.units) : { reloaded: false, unit: null };
     return { domain: v.domain, ...written, link, logDir, bytes: Buffer.byteLength(content), ssl: Boolean(v.ssl && v.sslPort), bind: v.bind ?? null, phpVersion: v.phpVersion ?? null, ...reload };
@@ -992,6 +1001,38 @@ function ftpDaemon(name) {
   return d;
 }
 
+// Debian's pure-ftpd-wrapper passes `-l puredb:<file>` only when a symlink in
+// auth/ points at conf/PureDB (any name; the auth type is the link target's
+// basename), and the stock package ships conf/PureDB without one. Returns the
+// link path, or null when no live link points at PureDB.
+export const PURE_FTPD_AUTH_LINK = '50puredb';
+export function pureFtpdAuthLink(confDir = '/etc/pure-ftpd') {
+  const dir = path.join(confDir, 'auth');
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      const p = path.join(dir, f);
+      try {
+        if (fs.lstatSync(p).isSymbolicLink() && path.basename(fs.readlinkSync(p)).toLowerCase() === 'puredb' && exists(p)) return p;
+      } catch { /* vanished */ }
+    }
+  } catch { /* no auth dir: not the debian-dir layout */ }
+  return null;
+}
+
+// Only a symbolic link (stale or dangling) is replaced under the panel's link
+// name: a regular file or directory there is somebody's and is never unlinked.
+export function createPureFtpdAuthLink(link) {
+  fs.mkdirSync(path.dirname(link), { recursive: true });
+  let st = null;
+  try { st = fs.lstatSync(link); } catch { /* absent */ }
+  if (st && !st.isSymbolicLink()) throw new OpError('refused', `${link} exists and is not a symbolic link`);
+  if (st) fs.unlinkSync(link);
+  fs.symlinkSync('../conf/PureDB', link);
+  return link;
+}
+
+const PURE_FTPD_DEFAULT_CERT = '/etc/ssl/private/pure-ftpd.pem';
+
 export function ftpSettingsFrom(name, raw) {
   const s = {};
   const num = (v) => (v != null && v !== '' && !Number.isNaN(Number(v)) ? Number(v) : null);
@@ -1036,7 +1077,14 @@ defineOp('web.ftp.config.read', {
       file = ctx.assertAllowedPath(d.confFile, 'read');
       raw = parseKeyValue(readText(file));
     }
-    return { server, path: file, unit: await unitState(await firstUnit(d.units)), settings: ftpSettingsFrom(server, raw), raw };
+    const settings = ftpSettingsFrom(server, raw);
+    let tlsCertificate;
+    if (server === 'pure-ftpd') {
+      if (d.style === 'debian-dir') settings.virtualUsers = Boolean(raw.PureDB) && Boolean(pureFtpdAuthLink(d.confDir));
+      const certFile = raw.CertFile || PURE_FTPD_DEFAULT_CERT;
+      tlsCertificate = { path: certFile, present: exists(certFile) };
+    }
+    return { server, path: file, unit: await unitState(await firstUnit(d.units)), settings, raw, ...(tlsCertificate ? { tlsCertificate } : {}) };
   },
 });
 
@@ -1050,6 +1098,8 @@ defineOp('web.ftp.config.write', {
     const keep = (file) => { previous.push({ file, content: readText(file) }); written.push(file); return file; };
     let validated = null;
     let includeHint = null;
+    let createdLink = null;
+    const rollback = () => { restoreAll(previous); if (createdLink) { try { fs.unlinkSync(createdLink); } catch { /* none */ } } };
     if (settings.virtualUsers && server !== 'vsftpd') await ensureFtpVirtualFiles(server, ctx);
     if (server === 'pure-ftpd') {
       const values = pureFtpdSettings(settings);
@@ -1058,6 +1108,14 @@ defineOp('web.ftp.config.write', {
           const file = keep(ctx.assertAllowedPath(path.join(d.confDir, 'conf', k), 'write'));
           if (v == null) { try { fs.unlinkSync(file); } catch { /* none */ } } else writeAtomic(file, `${v}\n`);
           dropLegacyBackup(file);
+        }
+        // Like PureDB itself the link is only ever created here, never removed:
+        // an admin's own link (under any name) stays.
+        if (settings.virtualUsers && !pureFtpdAuthLink(d.confDir)) {
+          const link = ctx.assertAllowedPath(path.join(d.confDir, 'auth', PURE_FTPD_AUTH_LINK), 'write');
+          try { createPureFtpdAuthLink(link); } catch (err) { rollback(); throw err; }
+          createdLink = link;
+          written.push(link);
         }
       } else {
         const file = keep(ctx.assertAllowedPath(d.confFile, 'write'));
@@ -1070,7 +1128,7 @@ defineOp('web.ftp.config.write', {
       if (d.bin && d.confFile) {
         const { code, stdout, stderr } = await exec('proftpd', ['-t', '-c', d.confFile], { allowFailure: true, timeoutMs: 60_000 });
         validated = code === 0;
-        if (!validated) { restoreAll(previous); throw new OpError('config_invalid', `ProFTPD rejected the settings; the previous file was restored: ${lastLine(stderr || stdout)}`, { output: `${stdout}${stderr}`.trim() }); }
+        if (!validated) { rollback(); throw new OpError('config_invalid', `ProFTPD rejected the settings; the previous file was restored: ${lastLine(stderr || stdout)}`, { output: `${stdout}${stderr}`.trim() }); }
       }
     } else {
       const file = keep(ctx.assertAllowedPath(d.confFile, 'write'));
@@ -1081,12 +1139,12 @@ defineOp('web.ftp.config.write', {
     // not come back after the restart gets its previous files back.
     const result = restart ? await reloadUnit(d.units, 'restart') : { reloaded: false, unit: null };
     if (restart && result.unit && !result.reloaded) {
-      restoreAll(previous);
+      rollback();
       await reloadUnit(d.units, 'restart');
       throw new OpError('config_invalid', `${server} failed to start with the new settings; the previous configuration was restored: ${result.error}`, { server, written });
     }
     if (restart && result.unit) validated = result.reloaded;
-    return { server, written, validated, hint: includeHint, ...result };
+    return { server, written, validated, hint: includeHint, authLinkCreated: createdLink, ...result };
   },
 });
 
@@ -1509,10 +1567,10 @@ export function hintsFor(layout, slots) {
   for (const k of ['router', 'transport', 'auth']) {
     const s = slots[k];
     if (!s?.exists || s.hooked !== false) continue;
-    if (!s.hookable) h.push(`Add ".include ${s.path}" in the ${s.section} section of ${layout.mainConf}${k === 'router' ? ' before the local_user/userforward routers' : ''} so the account panel's virtual mailboxes ${k === 'router' ? 'are routed to Dovecot' : k === 'transport' ? 'can be delivered' : 'can authenticate for SMTP'}.`);
+    if (!s.hookable) h.push(`Add ".include_if_exists ${s.path}" in the ${s.section} section of ${layout.mainConf}${k === 'router' ? ' before the local_user/userforward routers' : ''} so the account panel's virtual mailboxes ${k === 'router' ? 'are routed to Dovecot' : k === 'transport' ? 'can be delivered' : 'can authenticate for SMTP'}.`);
     else h.push(`Exim's generated configuration does not contain the account panel's ${k} fragment ${s.path}: run update-exim4.conf and reload Exim.`);
   }
-  if (slots.router?.hooked && slots.router.precedes === false) h.push(`The ${EXIM_VMAIL.router} router is loaded after a local-delivery router (${EXIM_VMAIL.after.join('/')}); move ".include ${slots.router.path}" above those routers or virtual mailboxes are never reached.`);
+  if (slots.router?.hooked && slots.router.precedes === false) h.push(`The ${EXIM_VMAIL.router} router is loaded after a local-delivery router (${EXIM_VMAIL.after.join('/')}); move ".include_if_exists ${slots.router.path}" above those routers or virtual mailboxes are never reached.`);
   return h;
 }
 

@@ -3,7 +3,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { exec, hasBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
-import { passwdHome, assertUnderHome } from './web.js';
+import { passwdHome, assertUnderHome, pureFtpdAuthLink } from './web.js';
 
 // FTP virtual users for the customer panel: pure-ftpd's PureDB (pure-pw) and
 // proftpd's AuthUserFile (ftpasswd). Every virtual login is pinned to a managed
@@ -230,19 +230,23 @@ function readText(file) {
   try { return fs.readFileSync(file, 'utf8'); } catch { return null; }
 }
 
-function pureFtpdVirtualStatus() {
-  const installed = fs.existsSync('/etc/pure-ftpd') || hasBinary('pure-ftpd') || hasBinary('pure-pw');
+export function pureFtpdVirtualStatus(confDir = path.dirname(PURE_CONF_DIR), confFile = PURE_CONF_FILE) {
+  const installed = fs.existsSync(confDir) || hasBinary('pure-ftpd') || hasBinary('pure-pw');
   let configured = false;
   let dbFile = null;
-  if (fs.existsSync(PURE_CONF_DIR)) {
-    const v = (readText(path.join(PURE_CONF_DIR, 'PureDB')) || '').trim();
-    if (v) { configured = true; dbFile = v; }
+  let authLink = null;
+  const dir = path.join(confDir, 'conf');
+  if (fs.existsSync(dir)) {
+    // Debian ships conf/PureDB; the wrapper loads it only through a link in auth/.
+    const v = (readText(path.join(dir, 'PureDB')) || '').trim();
+    authLink = pureFtpdAuthLink(confDir);
+    if (v && authLink) { configured = true; dbFile = v; }
   } else {
-    const text = readText(PURE_CONF_FILE) || '';
+    const text = readText(confFile) || '';
     const m = text.split('\n').map((l) => l.trim()).find((l) => /^PureDB\s+\S/.test(l));
     if (m) { configured = true; dbFile = m.replace(/^PureDB\s+/, '').trim(); }
   }
-  return { daemon: 'pure-ftpd', installed, supported: true, tool: hasBinary('pure-pw'), configured, enabled: configured && hasBinary('pure-pw'), passwdFile: PURE_PASSWD, dbFile: dbFile || PURE_PDB, hint: configured ? null : 'Enable PureDB (conf/PureDB or "PureDB /etc/pure-ftpd/pureftpd.pdb") under FTP Server Configuration' };
+  return { daemon: 'pure-ftpd', installed, supported: true, tool: hasBinary('pure-pw'), configured, enabled: configured && hasBinary('pure-pw'), passwdFile: PURE_PASSWD, dbFile: dbFile || PURE_PDB, authLink, hint: configured ? null : 'Enable virtual FTP users under FTP Server Configuration (conf/PureDB plus the auth/50puredb symlink on Debian, or "PureDB /etc/pure-ftpd/pureftpd.pdb")' };
 }
 
 function proftpdVirtualStatus() {

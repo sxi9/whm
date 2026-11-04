@@ -4,17 +4,20 @@ import path from 'node:path';
 import { describe, it, expect, vi } from 'vitest';
 import { exec, hasBinary } from '../src/exec.js';
 import { runOp, createContext, OpError } from '../src/lib.js';
-import { parseDn, parseSans, parseX509Fields, parseOpensslDate, renderApacheTls, renderEximTls, renderDovecotCertInclude, serviceCopies, bundlePaths, groupId, parseEximTlsLibrary, writeEximInclude, eximLayout, parseUpdateExim4Conf, mergeEximBlock, readEximBlock, stripEximBlock, writeEximFragment, dovecotLayout, ACME_OP_TIMEOUT_MS } from '../src/ops/ssl.js';
+import { parseDn, parseSans, parseX509Fields, parseOpensslDate, renderApacheTls, renderEximTls, renderDovecotCertInclude, parseDovecotVersion, dovecotUsesFileSettings, writePanelPair, parseEnvFile, legacyPanelTlsReference, serviceCopies, bundlePaths, groupId, parseEximTlsLibrary, writeEximInclude, eximLayout, parseUpdateExim4Conf, mergeEximBlock, readEximBlock, stripEximBlock, writeEximFragment, dovecotLayout, ACME_OP_TIMEOUT_MS } from '../src/ops/ssl.js';
 import { catalog } from '../src/ops/index.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
   const mod = await importOriginal();
-  return { ...mod, exec: vi.fn(mod.exec) };
+  return { ...mod, exec: vi.fn(mod.exec), hasBinary: vi.fn(mod.hasBinary) };
 });
+const realExec = await vi.importActual('../src/exec.js');
 
 const ctx = createContext();
 const KEY = '-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n-----END PRIVATE KEY-----\n';
 const CERT = '-----BEGIN CERTIFICATE-----\nMIIDtestcertificatebody\n-----END CERTIFICATE-----\n';
+// writePanelPair refuses to run without a panel group; the test user's own group stands in for whmpanel.
+const PANEL_GROUP = { name: 'self', gid: process.getgid?.() ?? 0 };
 const CHAIN = `${CERT}${CERT}`;
 
 async function opError(promise) {
@@ -187,6 +190,36 @@ describe('parsers and renderers', () => {
     if (fs.existsSync('/etc/dovecot')) expect(dovecotLayout().sslInclude).toBe(dc.sslInclude); else expect(dovecotLayout()).toBeNull();
   });
 
+  it('renders the Dovecot 2.4 setting names once the installed version is 2.4 or newer', () => {
+    expect(parseDovecotVersion('2.4.2 (0962ed2104)')).toEqual({ major: 2, minor: 4 });
+    expect(parseDovecotVersion('2.3.21 (47349e2482)')).toEqual({ major: 2, minor: 3 });
+    expect(parseDovecotVersion('')).toBeNull();
+    expect(parseDovecotVersion(null)).toBeNull();
+    expect(dovecotUsesFileSettings({ major: 2, minor: 4 })).toBe(true);
+    expect(dovecotUsesFileSettings({ major: 2, minor: 10 })).toBe(true);
+    expect(dovecotUsesFileSettings({ major: 3, minor: 0 })).toBe(true);
+    expect(dovecotUsesFileSettings({ major: 2, minor: 3 })).toBe(false);
+    expect(dovecotUsesFileSettings(null)).toBe(false);
+    const paths = bundlePaths('/etc/ssl/whm/service/dovecot');
+    const directivesOf = (text) => text.trim().split('\n').filter((l) => !l.startsWith('#')).map((l) => l.split(' = ')[0]);
+    const modern = renderDovecotCertInclude(paths, { hasChain: true, dovecotVersion: { major: 2, minor: 4 } });
+    expect(directivesOf(modern)).toEqual(['ssl_server_cert_file', 'ssl_server_key_file', 'ssl_server_ca_file']);
+    expect(modern).toContain(`ssl_server_cert_file = ${paths.fullchain}\n`);
+    expect(modern).toContain(`ssl_server_key_file = ${paths.key}\n`);
+    expect(modern).toContain(`ssl_server_ca_file = ${paths.chain}\n`);
+    expect(modern).not.toContain('= <');
+    expect(modern).not.toMatch(/^ssl_cert|^ssl_key|^ssl_ca/m);
+    expect(directivesOf(renderDovecotCertInclude(paths, { dovecotVersion: { major: 2, minor: 4 } }))).toEqual(['ssl_server_cert_file', 'ssl_server_key_file']);
+    // 2.3 and an undetected version keep the legacy names.
+    expect(directivesOf(renderDovecotCertInclude(paths, { hasChain: true, dovecotVersion: { major: 2, minor: 3 } }))).toEqual(['ssl_cert', 'ssl_key', 'ssl_ca']);
+    expect(directivesOf(renderDovecotCertInclude(paths, { hasChain: true }))).toEqual(['ssl_cert', 'ssl_key', 'ssl_ca']);
+    const dc = { confDir: '/etc/dovecot', dropinDir: '/etc/dovecot/conf.d', sslInclude: '/etc/dovecot/conf.d/90-whm-ssl-cert.conf', legacyIncludes: [], units: ['dovecot'] };
+    const copies = serviceCopies('dovecot', paths, { dovecot: dc }, { hasChain: true, dovecotVersion: { major: 2, minor: 4 } });
+    expect(copies[1]).toMatchObject({ include: dc.sslInclude, validate: 'dovecot' });
+    expect(copies[1].content).toContain('ssl_server_cert_file = ');
+    expect(copies[1].content).not.toContain('ssl_cert = <');
+  });
+
   it('renders only real Exim main options, for OpenSSL and GnuTLS builds', () => {
     // Exim's readconf aborts on an unknown main option and the reload then kills the MTA,
     // so every non-comment line must be one of the options Exim actually has.
@@ -219,15 +252,42 @@ describe('parsers and renderers', () => {
     expect(parseEximTlsLibrary('')).toBeNull();
   });
 
-  it('resolves the daemon group from a group file', () => {
+  it('resolves the daemon group through getent (argv, never a shell)', async () => {
+    exec.mockClear();
+    exec.mockResolvedValueOnce({ code: 2, stdout: '', stderr: '' });
+    exec.mockResolvedValueOnce({ code: 0, stdout: 'exim:x:93:mail\n', stderr: '' });
+    expect(await groupId(['nope', 'exim'])).toEqual({ name: 'exim', gid: 93 });
+    expect(exec.mock.calls).toEqual([
+      ['getent', ['group', '--', 'nope'], expect.objectContaining({ allowFailure: true })],
+      ['getent', ['group', '--', 'exim'], expect.objectContaining({ allowFailure: true })],
+    ]);
+    exec.mockResolvedValueOnce({ code: 0, stdout: 'Debian-exim:x:113:\n', stderr: '' });
+    expect(await groupId(['Debian-exim', 'exim'])).toEqual({ name: 'Debian-exim', gid: 113 });
+    exec.mockResolvedValueOnce({ code: 2, stdout: '', stderr: '' });
+    expect(await groupId(['nope'])).toBeNull();
+    // A name that would not survive as a plain argv element never reaches getent.
+    exec.mockClear();
+    expect(await groupId(['-x', '../etc', 'a b'])).toBeNull();
+    expect(exec).not.toHaveBeenCalled();
+    expect(await groupId(['root'])).toEqual({ name: 'root', gid: 0 });
+  });
+
+  it('scans the group file only when getent is missing', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-ssl-group-'));
     const file = path.join(dir, 'group');
     fs.writeFileSync(file, 'root:x:0:\nDebian-exim:x:113:\nexim:x:93:mail\n');
-    expect(groupId(['Debian-exim', 'exim'], file)).toEqual({ name: 'Debian-exim', gid: 113 });
-    expect(groupId(['nope', 'exim'], file)).toEqual({ name: 'exim', gid: 93 });
-    expect(groupId(['nope'], file)).toBeNull();
-    expect(groupId(['exim'], path.join(dir, 'missing'))).toBeNull();
-    fs.rmSync(dir, { recursive: true, force: true });
+    hasBinary.mockImplementation((bin) => bin !== 'getent' && realExec.hasBinary(bin));
+    exec.mockClear();
+    try {
+      expect(await groupId(['Debian-exim', 'exim'], file)).toEqual({ name: 'Debian-exim', gid: 113 });
+      expect(await groupId(['nope', 'exim'], file)).toEqual({ name: 'exim', gid: 93 });
+      expect(await groupId(['nope'], file)).toBeNull();
+      expect(await groupId(['exim'], path.join(dir, 'missing'))).toBeNull();
+      expect(exec).not.toHaveBeenCalled();
+    } finally {
+      hasBinary.mockImplementation(realExec.hasBinary);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -261,6 +321,156 @@ describe('service certificate wiring', () => {
       { from: eximPaths.key, to: '/etc/exim4/exim.key', mode: 0o640, groups: ['Debian-exim', 'exim'] },
     ]);
     expect(serviceCopies('exim', eximPaths, { exim: null })).toEqual([]);
+  });
+
+  it('the panel pair replaces /etc/whm/ssl/panel.{crt,key} group-readable (0640) and says to restart whm-panel', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-ssl-panel-'));
+    const bundle = path.join(dir, 'bundle');
+    fs.mkdirSync(bundle);
+    const paths = bundlePaths(bundle);
+    fs.writeFileSync(paths.fullchain, `${CERT}${CERT}`);
+    fs.writeFileSync(paths.key, KEY, { mode: 0o600 });
+    const dest = path.join(dir, 'ssl');
+    const legacyDir = path.join(dir, 'tls');
+    // No panel group at all: the pair is left alone rather than written root-only.
+    try { writePanelPair(paths, dest, { group: null, legacyDir }); throw new Error('expected a refusal'); } catch (err) { expect(err).toBeInstanceOf(OpError); expect(err.code).toBe('refused'); }
+    expect(fs.existsSync(path.join(dest, 'panel.key'))).toBe(false);
+    const result = writePanelPair(paths, dest, { group: PANEL_GROUP, legacyDir });
+    expect(result.applied).toEqual([path.join(dest, 'panel.crt'), path.join(dest, 'panel.key')]);
+    expect(result.removed).toEqual([]);
+    expect(fs.readFileSync(path.join(dest, 'panel.crt'), 'utf8')).toBe(`${CERT}${CERT}`);
+    expect(fs.readFileSync(path.join(dest, 'panel.key'), 'utf8')).toBe(KEY);
+    if (process.platform !== 'win32') {
+      expect(fs.statSync(path.join(dest, 'panel.key')).mode & 0o777).toBe(0o640);
+      expect(fs.statSync(path.join(dest, 'panel.crt')).mode & 0o777).toBe(0o640);
+      expect(fs.statSync(dest).mode & 0o777).toBe(0o750);
+    }
+    const note = result.notes.join(' ');
+    expect(note).toContain('systemctl restart whm-panel');
+    expect(note).toContain(`${dest}/panel.crt`);
+    expect(note).toContain('WHM_TLS_CERT/WHM_TLS_KEY');
+    expect(note).toContain('/etc/whm/panel.env');
+    expect(note).not.toContain('/etc/whm/tls');
+    expect(note).not.toContain(legacyDir);
+    // Handing the files to a group the test user belongs to leaves the owner alone.
+    const gid = process.getgid?.();
+    if (gid != null) {
+      const owned = writePanelPair(paths, dest, { group: { name: 'self', gid }, legacyDir });
+      expect(owned.notes.join(' ')).not.toMatch(/readable by root only|could not be handed/);
+      expect(fs.statSync(path.join(dest, 'panel.key')).gid).toBe(gid);
+      expect(fs.statSync(path.join(dest, 'panel.key')).uid).toBe(process.getuid());
+    }
+    // An existing pair (install.sh's self-signed one) is replaced in place.
+    expect(fs.readdirSync(dest).sort()).toEqual(['panel.crt', 'panel.key']);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('the panel pair removes the legacy /etc/whm/tls cert.pem and key.pem and reports them', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-ssl-panel-'));
+    const bundle = path.join(dir, 'bundle');
+    fs.mkdirSync(bundle);
+    const paths = bundlePaths(bundle);
+    fs.writeFileSync(paths.fullchain, CERT);
+    fs.writeFileSync(paths.key, KEY, { mode: 0o600 });
+    const legacyDir = path.join(dir, 'tls');
+    fs.mkdirSync(legacyDir);
+    fs.writeFileSync(path.join(legacyDir, 'cert.pem'), CERT);
+    fs.writeFileSync(path.join(legacyDir, 'key.pem'), KEY);
+    fs.writeFileSync(path.join(legacyDir, 'other.pem'), CERT);
+    const dest = path.join(dir, 'ssl');
+    // Nothing in the panel configuration names the legacy directory.
+    const envFile = path.join(dir, 'panel.env');
+    fs.writeFileSync(envFile, `WHM_TLS_CERT=${dest}/panel.crt\nWHM_TLS_KEY=${dest}/panel.key\n`);
+    const result = writePanelPair(paths, dest, { group: PANEL_GROUP, legacyDir, envFile, defaultConfig: path.join(dir, 'whm.conf') });
+    expect(result.removed).toEqual([path.join(legacyDir, 'cert.pem'), path.join(legacyDir, 'key.pem')]);
+    expect(result.updated).toEqual([]);
+    expect(result.legacy).toBe('removed');
+    expect(fs.readdirSync(legacyDir)).toEqual(['other.pem']);
+    expect(result.notes.join(' ')).toContain(`The legacy ${path.join(legacyDir, 'cert.pem')} and ${path.join(legacyDir, 'key.pem')} were removed.`);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('the panel pair overwrites the legacy files in place while panel.env or whm.conf still points at them', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-ssl-panel-'));
+    const bundle = path.join(dir, 'bundle');
+    fs.mkdirSync(bundle);
+    const paths = bundlePaths(bundle);
+    fs.writeFileSync(paths.fullchain, CHAIN);
+    fs.writeFileSync(paths.key, KEY, { mode: 0o600 });
+    const legacyDir = path.join(dir, 'tls');
+    fs.mkdirSync(legacyDir);
+    fs.writeFileSync(path.join(legacyDir, 'cert.pem'), 'old cert\n');
+    fs.writeFileSync(path.join(legacyDir, 'key.pem'), 'old key\n');
+    const dest = path.join(dir, 'ssl');
+    const envFile = path.join(dir, 'panel.env');
+    const conf = path.join(dir, 'whm.conf');
+    const expectUpdated = (result, by) => {
+      expect(result.legacy).toBe('updated');
+      expect(result.removed).toEqual([]);
+      expect(result.updated).toEqual([path.join(legacyDir, 'cert.pem'), path.join(legacyDir, 'key.pem')]);
+      expect(fs.readFileSync(path.join(legacyDir, 'cert.pem'), 'utf8')).toBe(CHAIN);
+      expect(fs.readFileSync(path.join(legacyDir, 'key.pem'), 'utf8')).toBe(KEY);
+      expect(fs.readFileSync(path.join(dest, 'panel.key'), 'utf8')).toBe(KEY);
+      if (process.platform !== 'win32') expect(fs.statSync(path.join(legacyDir, 'key.pem')).mode & 0o777).toBe(0o640);
+      const note = result.notes.join(' ');
+      expect(note).toContain(`${by} still points the panel at ${legacyDir}`);
+      expect(note).toContain(`${dest}/panel.crt and ${dest}/panel.key`);
+      expect(note).not.toContain('were removed');
+    };
+    // WHM_TLS_KEY in panel.env (quoted, as install.sh writes it).
+    fs.writeFileSync(envFile, `WHM_PORT=2086\nWHM_TLS_CERT="${legacyDir}/cert.pem"\nWHM_TLS_KEY='${legacyDir}/key.pem'\n`);
+    expect(legacyPanelTlsReference(legacyDir, { envFile, defaultConfig: conf })).toBe(envFile);
+    expectUpdated(writePanelPair(paths, dest, { group: PANEL_GROUP, legacyDir, envFile, defaultConfig: conf }), envFile);
+    // tlsCert/tlsKey in the JSON config WHM_CONFIG names.
+    const named = path.join(dir, 'custom.conf');
+    fs.writeFileSync(envFile, `WHM_CONFIG=${named}\n`);
+    fs.writeFileSync(named, JSON.stringify({ tlsCert: `${legacyDir}/cert.pem`, tlsKey: `${legacyDir}/key.pem` }));
+    fs.writeFileSync(path.join(legacyDir, 'key.pem'), 'old key\n');
+    expect(legacyPanelTlsReference(legacyDir, { envFile, defaultConfig: conf })).toBe(named);
+    expectUpdated(writePanelPair(paths, dest, { group: PANEL_GROUP, legacyDir, envFile, defaultConfig: conf }), named);
+    // The default config file when panel.env names none.
+    fs.rmSync(envFile);
+    fs.writeFileSync(conf, JSON.stringify({ tlsKey: `${legacyDir}/key.pem` }));
+    expect(legacyPanelTlsReference(legacyDir, { envFile, defaultConfig: conf })).toBe(conf);
+    // Neither file names the directory (or the config is unreadable): back to removal.
+    fs.writeFileSync(conf, '{ not json');
+    expect(legacyPanelTlsReference(legacyDir, { envFile, defaultConfig: conf })).toBeNull();
+    fs.writeFileSync(conf, JSON.stringify({ tlsCert: `${dest}/panel.crt`, tlsKey: `${dest}/panel.key` }));
+    expect(legacyPanelTlsReference(legacyDir, { envFile, defaultConfig: conf })).toBeNull();
+    // A sibling such as /etc/whm/tlsx never counts as the legacy directory.
+    fs.writeFileSync(conf, JSON.stringify({ tlsCert: `${legacyDir}x/cert.pem` }));
+    expect(legacyPanelTlsReference(legacyDir, { envFile, defaultConfig: conf })).toBeNull();
+    const removed = writePanelPair(paths, dest, { group: PANEL_GROUP, legacyDir, envFile, defaultConfig: conf });
+    expect(removed.legacy).toBe('removed');
+    expect(fs.readdirSync(legacyDir)).toEqual([]);
+    expect(parseEnvFile('export A=1\n# c\nB="two words"\nC=\'x\'\nbad line\n')).toEqual({ A: '1', B: 'two words', C: 'x' });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('the panel pair is never replaced by an empty or missing bundle file', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-ssl-panel-'));
+    const bundle = path.join(dir, 'bundle');
+    fs.mkdirSync(bundle);
+    const paths = bundlePaths(bundle);
+    const dest = path.join(dir, 'ssl');
+    const legacyDir = path.join(dir, 'tls');
+    fs.mkdirSync(dest);
+    fs.writeFileSync(path.join(dest, 'panel.crt'), CERT);
+    fs.writeFileSync(path.join(dest, 'panel.key'), KEY);
+    const refuses = (fn) => { try { fn(); } catch (err) { expect(err).toBeInstanceOf(OpError); expect(err.code).toBe('not_found'); return; } throw new Error('expected writePanelPair to refuse'); };
+    fs.writeFileSync(paths.fullchain, CERT);
+    refuses(() => writePanelPair(paths, dest, { group: PANEL_GROUP, legacyDir }));
+    fs.writeFileSync(paths.key, '');
+    refuses(() => writePanelPair(paths, dest, { group: PANEL_GROUP, legacyDir }));
+    fs.writeFileSync(paths.key, '  \n');
+    refuses(() => writePanelPair(paths, dest, { group: PANEL_GROUP, legacyDir }));
+    fs.writeFileSync(paths.key, KEY);
+    fs.writeFileSync(paths.fullchain, '');
+    refuses(() => writePanelPair(paths, dest, { group: PANEL_GROUP, legacyDir }));
+    expect(fs.readFileSync(path.join(dest, 'panel.crt'), 'utf8')).toBe(CERT);
+    expect(fs.readFileSync(path.join(dest, 'panel.key'), 'utf8')).toBe(KEY);
+    expect(fs.readdirSync(dest).sort()).toEqual(['panel.crt', 'panel.key']);
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('writeEximInclude validates the configuration and restores the previous file on rejection', async () => {

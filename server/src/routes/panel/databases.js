@@ -51,6 +51,12 @@ export function register(ctx) {
   r.post('/access-hosts', validate({ body: hostBody }), wrap((scope, req) => svc().addAccessHost(scope, req.body.host, req), 201));
   r.delete('/access-hosts/:id', validate({ params: idParam }), wrap((scope, req) => svc().removeAccessHost(scope, req.params.id, req)));
   r.get('/phpmyadmin', wrap((scope) => svc().phpMyAdmin(scope)));
+  // The account's check/repair/optimize and dump jobs (/api/system/jobs is
+  // reseller-only). The stream writes SSE itself, so it stays outside wrap().
+  r.get('/jobs/:id', validate({ params: idParam }), wrap((scope, req) => svc().getJob(scope, req.params.id)));
+  r.get('/jobs/:id/stream', validate({ params: idParam }), (req, res, next) => {
+    scopeOf(ctx, req).then((scope) => svc().streamJob(scope, req.params.id, req, res)).catch(next);
+  });
   r.delete('/:name', validate({ params: nameParam }), wrap((scope, req) => svc().drop(scope, req.params.name, req)));
   r.post('/:name/check', validate({ params: nameParam, body: checkBody }), wrap((scope, req) => svc().check(scope, req.params.name, req.body.action, req), 202));
   r.post('/:name/dump', validate({ params: nameParam, body: z.object({}).strict() }), wrap((scope, req) => svc().enqueueDump(scope, req.params.name, req), 202));

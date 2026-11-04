@@ -18,6 +18,9 @@ export const SYSTEM_ROOT = Object.freeze({ id: null, username: 'panel', role: 'r
 
 const DB_NAME_MAX = 64;
 const DB_USER_MAX = 32;
+export const JOB_TYPES = ['db.repair', 'panel.db.dump'];
+const ACTIVE_JOB = ['queued', 'running'];
+const FINISHED_JOB = ['done', 'failed', 'cancelled'];
 
 export function ensurePrefixed(username, name) {
   const prefix = `${username}_`;
@@ -252,6 +255,43 @@ export function createPanelDatabasesService(ctx) {
     return { job: { id: job.id }, database: name };
   }
 
+  // The account's own check/repair/optimize and dump jobs (/api/system/jobs is
+  // reseller-only). A db.repair job carries no accountId and its created_by is
+  // the owner's principal, so it is the account's when every database it names
+  // belongs to the account; anything else is 404 so job ids stay unguessable.
+  function jobOf(scope, id) {
+    const job = ctx.jobs.get(id);
+    const p = job.params ?? {};
+    const mine = job.type === 'panel.db.dump'
+      ? p.accountId === scope.accountId
+      : job.type === 'db.repair' && Array.isArray(p.databases) && p.databases.length > 0 && p.databases.every((n) => typeof n === 'string' && Boolean(stmts.dbByName.get(n, scope.accountId)));
+    if (!JOB_TYPES.includes(job.type) || !mine) throw notFound('Job');
+    return job;
+  }
+
+  function shapeJob(job) {
+    const { profileId: _p, ownerId: _o, ...params } = job.params ?? {};
+    return { id: job.id, type: job.type, status: job.status, progress: job.progress, message: job.message, params, result: job.result ?? null, error: job.error ?? null, errorCode: job.error_code ?? null, createdAt: job.created_at, startedAt: job.started_at, finishedAt: job.finished_at, ...(job.logs ? { logs: job.logs } : {}) };
+  }
+
+  function getJob(scope, id) {
+    requireFeature(scope);
+    return shapeJob(jobOf(scope, id));
+  }
+
+  function streamJob(scope, id, req, res) {
+    requireFeature(scope);
+    const job = shapeJob(jobOf(scope, id));
+    res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+    res.flushHeaders();
+    const send = (event) => res.write(`data: ${JSON.stringify(event)}\n\n`);
+    send({ type: 'snapshot', job });
+    if (!ACTIVE_JOB.includes(job.status)) { res.end(); return; }
+    const unsubscribe = ctx.jobs.subscribe(job.id, (event) => { send(event); if (FINISHED_JOB.includes(event.type)) { unsubscribe(); res.end(); } });
+    const heartbeat = setInterval(() => res.write(': ping\n\n'), 15_000);
+    req.on('close', () => { clearInterval(heartbeat); unsubscribe(); });
+  }
+
   // The job acts as the account's owner, read back at run time; a missing or
   // changed owner fails the job instead of falling back to a root principal.
   function ownerRequest(params, account) {
@@ -293,6 +333,6 @@ export function createPanelDatabasesService(ctx) {
     engine, list, create, drop, check,
     listUsers, createUser, setUserPassword, dropUser, grantsFor, setGrants,
     listAccessHosts, addAccessHost, removeAccessHost,
-    phpMyAdmin, enqueueDump, runDump, quota, ensurePrefixed,
+    phpMyAdmin, enqueueDump, runDump, getJob, streamJob, quota, ensurePrefixed,
   };
 }

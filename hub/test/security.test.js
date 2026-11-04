@@ -1,5 +1,8 @@
 import { test, after, before } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import request from 'supertest';
 import { authenticator } from 'otplib';
 import { bootHub } from './support.js';
@@ -238,6 +241,100 @@ test('portal: login with password + TOTP, step-up gate, CSRF, lockout, 2FA enrol
     assert.equal((await lockHub.http.post('/v1/portal/login').send({ email: 'lock@vendor.test', password: 'Lock-Pass-1234' })).status, 200);
   } finally {
     await lockHub.close();
+  }
+});
+
+test('license.require_admin_totp (default on) holds a vendor_admin session at enrolment until TOTP is confirmed', async () => {
+  const { loadConfig } = await import('../src/config.js');
+  assert.equal(loadConfig({ file: '/nonexistent/hub.conf', env: {} }).license.require_admin_totp, true, 'on by default');
+  assert.equal(loadConfig({ file: '/nonexistent/hub.conf', env: { WHM_HUB_REQUIRE_ADMIN_TOTP: 'false' } }).license.require_admin_totp, false);
+  await freshTotpStep();
+  const strict = await bootHub({ config: { license: { require_admin_totp: true } } });
+  try {
+    await strict.ctx.portalUsers.create({ email: 'enrol@vendor.test', password: 'Vendor-Pass-123', role: 'vendor_admin' });
+    await strict.ctx.portalUsers.create({ email: 'ro@vendor.test', password: 'Support-Pass-123', role: 'vendor_support' });
+    const rs = strict.ctx.resellers.create({ name: 'Tenant', email: 'tenant@reseller.test' });
+    await strict.ctx.portalUsers.create({ email: 'rs@reseller.test', password: 'Reseller-Pass-12', role: 'reseller_admin', reseller_id: rs.id });
+    const agent = request.agent(strict.ctx.app);
+    const login = await agent.post('/v1/portal/login').send({ email: 'enrol@vendor.test', password: 'Vendor-Pass-123' });
+    assert.equal(login.status, 200, 'an unenrolled admin still signs in');
+    assert.equal(login.body.data.totp_enrol_required, true);
+    const csrf = login.body.data.csrfToken;
+    const me = await agent.get('/v1/portal/me');
+    assert.equal(me.status, 200);
+    assert.equal(me.body.data.totp_enrol_required, true);
+    assert.equal((await agent.get('/v1/portal/csrf')).status, 200);
+    const leaving = request.agent(strict.ctx.app);
+    const leavingCsrf = (await leaving.post('/v1/portal/login').send({ email: 'enrol@vendor.test', password: 'Vendor-Pass-123' })).body.data.csrfToken;
+    assert.equal((await leaving.post('/v1/portal/logout').set('X-CSRF-Token', leavingCsrf)).status, 200, 'a held session can still sign out');
+    assert.equal((await leaving.get('/v1/portal/me')).status, 401);
+    for (const [method, url] of [['get', '/v1/admin/licenses'], ['get', '/v1/admin/market/plugins'], ['get', '/v1/portal/users'], ['post', '/v1/admin/customers'], ['post', '/v1/portal/stepup'], ['post', '/v1/portal/impersonate/end']]) {
+      const res = await agent[method](url).set('X-CSRF-Token', csrf).send(method === 'post' ? { name: 'x', email: 'x@x.test', totp: '000000' } : undefined);
+      assert.equal(res.status, 403, `${method} ${url}: ${JSON.stringify(res.body)}`);
+      assert.equal(res.body.error.code, 'totp_enrol_required', url);
+    }
+    // Express mounts match case-insensitively, so a mixed-case admin path must be held too.
+    for (const url of ['/V1/admin/licenses', '/v1/ADMIN/licenses', '/v1/Admin/Market/Plugins', '/V1/portal/users', '/v1/admin/%ZZ', '/v1/portal/me/']) {
+      const res = await agent.get(url);
+      assert.equal(res.status, 403, `${url}: ${JSON.stringify(res.body)}`);
+      assert.equal(res.body.error.code, 'totp_enrol_required', url);
+    }
+    assert.equal((await agent.get('/V1/portal/ME')).status, 200, 'mixed-case exemptions follow the router');
+    const mixedEnroll = await agent.post('/v1/portal/2FA/enroll').set('X-CSRF-Token', csrf).send({});
+    assert.equal(mixedEnroll.status, 200, JSON.stringify(mixedEnroll.body));
+    const enroll = await agent.post('/v1/portal/2fa/enroll').set('X-CSRF-Token', csrf).send({});
+    assert.equal(enroll.status, 200, JSON.stringify(enroll.body));
+    const secret = enroll.body.data.secret;
+    assert.equal((await agent.post('/v1/portal/2fa/confirm').set('X-CSRF-Token', csrf).send({ code: '000000' })).body.error.code, 'totp_invalid');
+    assert.equal((await agent.get('/v1/admin/licenses')).body.error.code, 'totp_enrol_required', 'a pending secret does not open the session');
+    const confirm = await agent.post('/v1/portal/2fa/confirm').set('X-CSRF-Token', csrf).send({ code: authenticator.generate(secret) });
+    assert.equal(confirm.status, 200, JSON.stringify(confirm.body));
+    assert.equal((await agent.get('/v1/admin/licenses')).status, 200, 'the same session is open once TOTP is confirmed');
+    assert.equal((await agent.get('/v1/portal/me')).body.data.totp_enrol_required, false);
+    assert.equal((await agent.post('/v1/admin/customers').set('X-CSRF-Token', csrf).send({ name: 'x', email: 'ok@x.test' })).status, 201);
+    const logout = request.agent(strict.ctx.app);
+    await logout.post('/v1/portal/login').send({ email: 'ro@vendor.test', password: 'Support-Pass-123' });
+    assert.equal((await logout.get('/v1/admin/licenses')).status, 200, 'vendor_support is not gated');
+    const reseller = request.agent(strict.ctx.app);
+    const rl = await reseller.post('/v1/portal/login').send({ email: 'rs@reseller.test', password: 'Reseller-Pass-12' });
+    assert.equal(rl.body.data.totp_enrol_required, false);
+    assert.equal((await reseller.get('/v1/reseller/licenses')).status, 200, 'reseller portals are not gated');
+  } finally {
+    await strict.close();
+  }
+  await h.ctx.portalUsers.create({ email: 'off@vendor.test', password: 'Vendor-Pass-123', role: 'vendor_admin' });
+  const lax = await request.agent(h.ctx.app).post('/v1/portal/login').send({ email: 'off@vendor.test', password: 'Vendor-Pass-123' });
+  assert.equal(lax.body.data.totp_enrol_required, false, 'require_admin_totp: false keeps password-only admin sessions');
+});
+
+test('a held vendor_admin session still loads the SPA shell and its assets; only the API is gated', async () => {
+  const dist = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-hub-held-ui-'));
+  fs.mkdirSync(path.join(dist, 'assets'));
+  fs.writeFileSync(path.join(dist, 'index.html'), '<!doctype html><html><body><div id="root"></div><script type="module" src="/assets/x.js"></script></body></html>');
+  fs.writeFileSync(path.join(dist, 'assets', 'x.js'), 'console.log("hub ui")');
+  const strict = await bootHub({ config: { serve_ui: true, ui_dist: dist, license: { require_admin_totp: true } } });
+  try {
+    await strict.ctx.portalUsers.create({ email: 'held@vendor.test', password: 'Vendor-Pass-123', role: 'vendor_admin' });
+    const agent = request.agent(strict.ctx.app);
+    const login = await agent.post('/v1/portal/login').send({ email: 'held@vendor.test', password: 'Vendor-Pass-123' });
+    assert.equal(login.status, 200);
+    assert.equal(login.body.data.totp_enrol_required, true);
+    for (const route of ['/admin/security', '/admin', '/login']) {
+      const res = await agent.get(route);
+      assert.equal(res.status, 200, `${route}: ${res.text}`);
+      assert.match(res.headers['content-type'], /text\/html/, route);
+      assert.match(res.text, /id="root"/, route);
+    }
+    const asset = await agent.get('/assets/x.js');
+    assert.equal(asset.status, 200, asset.text);
+    assert.match(asset.headers['content-type'], /javascript/);
+    const api = await agent.get('/v1/admin/licenses');
+    assert.equal(api.status, 403);
+    assert.equal(api.body.error.code, 'totp_enrol_required');
+    assert.equal((await agent.get('/v1/portal/me')).body.data.totp_enrol_required, true);
+  } finally {
+    await strict.close();
+    fs.rmSync(dist, { recursive: true, force: true });
   }
 });
 

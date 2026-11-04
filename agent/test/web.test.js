@@ -8,6 +8,7 @@ import {
   renderVhost, parseVhostMeta, renderRedirects, renderGlobalInclude, renderPhpPool, renderLogrotate, mergeKeyValueFile, renderProftpd, vsftpdSettings, pureFtpdSettings,
   ftpSettingsFrom, parseServerStatus, parseApacheVersion, parseModules, parseDoveconf, rewriteListen, apacheLayout, eximLayout, phpLayout, SERVICE_ROLES, hintsFor, ensureRootLogDir, confPath, parseEximVersion,
   mergeEximBlock, readEximBlock, stripEximBlock, eximTlsLibrary, primaryGroupName, EXIM_SENTINEL_MACRO, DOVECOT_INCLUDES, EXIM_VMAIL, FTP_VIRTUAL, dovecotLayout,
+  pureFtpdAuthLink, createPureFtpdAuthLink, PURE_FTPD_AUTH_LINK,
 } from '../src/ops/web.js';
 
 // Fake host for the layout detection: which paths exist, what they contain, which binaries resolve.
@@ -122,6 +123,35 @@ describe('web op schemas reject injection and traversal before anything runs', (
     expect((await opError(runOp('web.service.select', { role: 'ftp', server: '../x' }, ctx))).code).toBe('invalid_args');
     expect((await opError(runOp('web.service.select', { role: 'dns', server: 'unbound' }, ctx))).code).toBe('invalid_args');
     expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('the pure-ftpd auth link replaces only a symbolic link, never a file or directory under its name', () => {
+    const confDir = fs.mkdtempSync(path.join(os.tmpdir(), 'whm-ftp-link-'));
+    const link = `${confDir}/auth/${PURE_FTPD_AUTH_LINK}`;
+    try {
+      fs.mkdirSync(`${confDir}/conf`);
+      fs.writeFileSync(`${confDir}/conf/PureDB`, '/etc/pure-ftpd/pureftpd.pdb\n');
+      // No auth/ yet: created along with the link.
+      expect(createPureFtpdAuthLink(link)).toBe(link);
+      expect(fs.readlinkSync(link)).toBe('../conf/PureDB');
+      expect(pureFtpdAuthLink(confDir)).toBe(link);
+      // A dangling link under the name is replaced.
+      fs.unlinkSync(link);
+      fs.symlinkSync('../conf/Missing', link);
+      expect(createPureFtpdAuthLink(link)).toBe(link);
+      expect(fs.readlinkSync(link)).toBe('../conf/PureDB');
+      // A regular file or a directory is somebody's and is refused untouched.
+      fs.unlinkSync(link);
+      fs.writeFileSync(link, '../conf/PureDB\n');
+      const refuses = (fn) => { try { fn(); } catch (err) { expect(err).toBeInstanceOf(OpError); expect(err.code).toBe('refused'); expect(err.message).toBe(`${link} exists and is not a symbolic link`); return; } throw new Error('expected a refusal'); };
+      refuses(() => createPureFtpdAuthLink(link));
+      expect(fs.lstatSync(link).isFile()).toBe(true);
+      expect(fs.readFileSync(link, 'utf8')).toBe('../conf/PureDB\n');
+      fs.unlinkSync(link);
+      fs.mkdirSync(link);
+      refuses(() => createPureFtpdAuthLink(link));
+      expect(fs.lstatSync(link).isDirectory()).toBe(true);
+    } finally { fs.rmSync(confDir, { recursive: true, force: true }); }
   });
 
   it('logrotate policies stay inside /etc/logrotate.d and only reference log paths', async () => {
@@ -495,11 +525,13 @@ describe('renderers produce the expected daemon syntax', () => {
     expect(hintsFor(base, { ...live, router: { ...router, exists: false, hooked: false } })).toEqual([]);
     const manual = hintsFor(base, { ...live, router: { ...router, exists: true, hooked: false } });
     expect(manual).toHaveLength(1);
-    expect(manual[0]).toContain('.include /etc/exim/whm/router_whm_virtual_mail.conf');
+    // Driver slots are unlinked when the feature is switched off, so the manual line must be .include_if_exists.
+    expect(manual[0]).toContain('".include_if_exists /etc/exim/whm/router_whm_virtual_mail.conf"');
     expect(manual[0]).toMatch(/before the local_user\/userforward routers/);
     const misordered = hintsFor(base, { ...live, router: { ...router, exists: true, hooked: true, precedes: false } });
     expect(misordered).toHaveLength(1);
     expect(misordered[0]).toContain(EXIM_VMAIL.router);
+    expect(misordered[0]).toContain('".include_if_exists /etc/exim/whm/router_whm_virtual_mail.conf"');
     const split = { ...base, splitConfig: true, mainConf: null };
     const stale = hintsFor(split, { ...live, transport: { path: '/etc/exim4/conf.d/transport/30_whm_virtual_mail', hookable: true, section: 'transports', exists: true, hooked: false } });
     expect(stale).toHaveLength(1);
