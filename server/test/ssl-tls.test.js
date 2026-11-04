@@ -803,6 +803,25 @@ describe('TLS configuration and service certificates', () => {
     expect(status.body.data.map((s) => s.service)).toEqual(['exim', 'dovecot', 'apache', 'ftp', 'panel']);
   });
 
+  it('an Apache service certificate refreshes the server-hostname site (contract §41) and a failure there never fails the install', async () => {
+    const savedWeb = app.ctx.web;
+    const seen = [];
+    app.ctx.web = { hostname: { ensure: async (req) => { seen.push(req?.user?.username ?? null); return { hostname: 'panel.example.com', written: true, changed: true, reloaded: true, ssl: true, warnings: [] }; } } };
+    try {
+      const res = await post('/api/ssl/service-certs/apache', { certPem: CERT, keyPem: KEY });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.data.hostnameSite).toMatchObject({ written: true, ssl: true });
+      expect(seen).toEqual(['root']);
+      expect((await post('/api/ssl/service-certs/exim', { certPem: CERT, keyPem: KEY })).body.data.hostnameSite).toBeUndefined();
+      expect(seen).toHaveLength(1);
+      app.ctx.web = { hostname: { ensure: async () => { throw new Error('Apache rejected the new configuration'); } } };
+      const failed = await post('/api/ssl/service-certs/apache', { certPem: CERT, keyPem: KEY });
+      expect(failed.status).toBe(200);
+      expect(failed.body.data.hostnameSite).toEqual({ written: false, error: 'Apache rejected the new configuration' });
+      expect(app.ctx.db.prepare('SELECT service FROM ssl_service_certs WHERE service = ?').get('apache')).toBeTruthy();
+    } finally { app.ctx.web = savedWeb; }
+  });
+
   it('removeAccountCerts uninstalls every installed bundle (files, vhost, ACME client) before purging rows', async () => {
     const bobId = app.ctx.db.prepare('SELECT id FROM accounts WHERE username = ?').get('bob').id;
     await post('/api/accounts', { username: 'bob', domain: 'bob.com' }).catch(() => {});

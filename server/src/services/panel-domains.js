@@ -222,6 +222,21 @@ export function createPanelDomainsService(ctx) {
 
   const shapeForwarding = (r) => (r ? { domain: r.domain, targetUrl: r.target_url, type: r.type, matchWww: Boolean(r.match_www), keepPath: Boolean(r.keep_path), status: r.status, lastError: r.last_error, updatedAt: r.updated_at } : null);
 
+  // Where the public DNS of a hostname lives (ctx.panelDns.delegation): null when
+  // the DNS group is not loaded or the lookup failed, never a reason to refuse.
+  const delegationOf = async (domain) => (typeof ctx.panelDns?.delegationOrNull === 'function' ? ctx.panelDns.delegationOrNull(domain) : null);
+  const managedAt = (delegation) => (delegation?.delegatedNs?.length ? delegation.delegatedNs.join(', ') : 'another DNS provider');
+  // The address records a hostname needs wherever its DNS is published.
+  const addressRecords = (scope, names) => names.flatMap((name) => [
+    ...(scope.account.ip ? [{ name, type: 'A', value: scope.account.ip }] : []),
+    ...(scope.account.ipv6 ? [{ name, type: 'AAAA', value: scope.account.ipv6 }] : []),
+  ]);
+  function warnNotDelegated(warnings, domain, delegation, records) {
+    if (delegation?.delegatedHere !== false) return;
+    const copy = records.map((r) => `${r.name} ${r.type} ${r.value}`).join('; ');
+    warnings.push(`DNS for ${domain} is managed at ${managedAt(delegation)}; records added here are not published — add ${copy || 'the records'} there as well`);
+  }
+
   function shapeDomain(row) {
     const vhost = typeof ctx.web?.vhostFor === 'function' ? ctx.web.vhostFor(row.domain) : null;
     const cert = typeof ctx.ssl?.certForDomain === 'function' ? ctx.ssl.certForDomain(row.domain) : null;
@@ -236,10 +251,11 @@ export function createPanelDomainsService(ctx) {
     allDomains,
     assertDomain,
 
-    list(scope, { type } = {}) {
+    async list(scope, { type } = {}) {
       const rows = allDomains(scope).filter((r) => !type || (type === 'parked' ? ['parked', 'alias'].includes(r.type) : r.type === type));
       const counts = { main: 1, addon: stmts.countType.get(scope.accountId, 'addon').n, sub: stmts.countType.get(scope.accountId, 'sub').n, parked: stmts.countParked.get(scope.accountId).n };
-      return { data: rows.map(shapeDomain), meta: { counts, limits: { max_addons: limitOf(scope, 'max_addons'), max_subdomains: limitOf(scope, 'max_subdomains'), max_parked: limitOf(scope, 'max_parked') } } };
+      const data = await Promise.all(rows.map(async (row) => ({ ...shapeDomain(row), delegation: await delegationOf(row.domain) })));
+      return { data, meta: { counts, limits: { max_addons: limitOf(scope, 'max_addons'), max_subdomains: limitOf(scope, 'max_subdomains'), max_parked: limitOf(scope, 'max_parked') } } };
     },
 
     async addAddon(scope, { domain, docroot: rel, createZone = true }, req) {
@@ -265,8 +281,11 @@ export function createPanelDomainsService(ctx) {
       }
       const mail = await setRouting(domain, req, warnings);
       const web = await syncWeb(scope, req, warnings);
-      audit(req, { action: 'panel.domains.addon.add', target: scope.username, args: auditArgs(scope, { domain, docroot, createZone, zone: zone ? { created: zone.created, applied: zone.applied } : null, web: web.applied, mail: mail.applied }) });
-      return { data: { ...shapeDomain(stmts.rowOf.get(domain, scope.accountId)), zone: zone ? { domain, created: Boolean(zone.created), applied: Boolean(zone.applied), reason: zone.reason ?? null } : null, docrootCreated: dir.created, web, mail }, meta: { warnings } };
+      const delegation = await delegationOf(domain);
+      const records = addressRecords(scope, [domain, `www.${domain}`]);
+      warnNotDelegated(warnings, domain, delegation, records);
+      audit(req, { action: 'panel.domains.addon.add', target: scope.username, args: auditArgs(scope, { domain, docroot, createZone, zone: zone ? { created: zone.created, applied: zone.applied } : null, web: web.applied, mail: mail.applied, delegatedHere: delegation?.delegatedHere ?? null }) });
+      return { data: { ...shapeDomain(stmts.rowOf.get(domain, scope.accountId)), zone: zone ? { domain, created: Boolean(zone.created), applied: Boolean(zone.applied), reason: zone.reason ?? null } : null, docrootCreated: dir.created, web, mail, delegation, records }, meta: { warnings } };
     },
 
     async removeAddon(scope, domain, { removeZone = true, removeDocroot = false } = {}, req) {
@@ -310,8 +329,12 @@ export function createPanelDomainsService(ctx) {
       stmts.insert.run(scope.accountId, fqdn, 'sub', docroot);
       const dns = await dnsRecordsFor(scope, fqdn, { ipv4: scope.account.ip ? [{ value: scope.account.ip }] : [], ipv6: scope.account.ipv6 ? [{ value: scope.account.ipv6 }] : null }, req, warnings);
       const web = await syncWeb(scope, req, warnings);
-      audit(req, { action: 'panel.domains.sub.add', target: scope.username, args: auditArgs(scope, { domain: fqdn, parent, docroot, dns: dns.applied, web: web.applied }) });
-      return { data: { ...shapeDomain(stmts.rowOf.get(fqdn, scope.accountId)), parent, docrootCreated: dir.created, dns, web }, meta: { warnings } };
+      // A new name has no delegation of its own: the parent's says where its record must go.
+      const delegation = await delegationOf(parent);
+      const records = addressRecords(scope, [fqdn]);
+      warnNotDelegated(warnings, parent, delegation, records);
+      audit(req, { action: 'panel.domains.sub.add', target: scope.username, args: auditArgs(scope, { domain: fqdn, parent, docroot, dns: dns.applied, web: web.applied, delegatedHere: delegation?.delegatedHere ?? null }) });
+      return { data: { ...shapeDomain(stmts.rowOf.get(fqdn, scope.accountId)), parent, docrootCreated: dir.created, dns: { ...dns, delegation, records }, web }, meta: { warnings } };
     },
 
     async removeSub(scope, domain, { removeDocroot = false } = {}, req) {

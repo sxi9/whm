@@ -22,7 +22,7 @@ const OVERRIDES = {
     'vmail.autoresponder.remove': ({ domain, localPart }) => ({ domain, localPart, removed: true }),
     'vmail.spam_users.write': ({ entries }) => ({ entries: entries.length }),
     'vmail.render.check': () => ({ dovecot: { installed: true, configOk: true }, exim: { installed: true, configOk: true }, routerHooked: false, transportHooked: false, authHooked: true, hint: 'apply' }),
-    'web.webmail.detect': () => ({ installed: true, flavor: 'roundcube', path: '/var/lib/roundcube', version: '1.6.6', configured: true, apacheAlias: '/roundcube' }),
+    'web.webmail.detect': () => ({ installed: true, flavor: 'roundcube', path: '/var/lib/roundcube', root: '/var/lib/roundcube/public_html', version: '1.6.6', configured: true, apacheAlias: '/webmail', published: { alias: '/webmail', file: '/etc/apache2/keel-host.d/webmail.conf', managed: true, source: 'keel-host' }, globalAlias: null, config: { path: '/etc/roundcube/config.inc.php', exists: true, ok: null, managed: null } }),
     'files.mkdir': ({ path }) => ({ path }),
     'files.write': ({ path }) => ({ path }),
     'files.remove': ({ paths }) => ({ removed: paths }),
@@ -273,16 +273,49 @@ describe('Customer panel: email', () => {
       const id = row("SELECT id FROM mail_accounts WHERE local_part = 'info'").id;
       const res = await alice.get(`/email/accounts/${id}/client-settings`).expect(200);
       // Only what Exim really listens on: port 25 with STARTTLS until the operator enables the submission ports, and no AUTH until the wiring is live.
-      expect(res.body.data).toMatchObject({ username: 'info@alice.com', imap: { port: 993, ssl: true }, pop3: { port: 995 }, smtp: { port: 25, ssl: false, starttls: true, alternative: null, auth: null, submissionPorts: false } });
+      expect(res.body.data).toMatchObject({ username: 'info@alice.com', imap: { port: 993, ssl: true }, pop3: { port: 995 }, smtp: { port: 25, ssl: false, starttls: true, alternative: null, auth: null, submissionPorts: false, ports: { enabled: false, port465: false, port587: false } } });
       expect(res.body.data.hostname).toBeTruthy();
+      // The sheet carries the wiring state, the password rule and the service certificate (none installed here).
+      expect(res.body.data.virtualMailLive).toBe(false);
+      expect(res.body.data.warnings.map((w) => w.code)).toEqual(['virtual_mail_not_live']);
+      expect(res.body.data.passwordPolicy).toEqual({ context: 'email', minLength: 8, minStrength: expect.any(Number) });
+      expect(res.body.data.certificate).toEqual({ dovecot: null, exim: null });
       const exim = app.ctx.settings.get('service_config.exim', null);
       app.ctx.settings.set('service_config.exim', { ...(exim || {}), submissionPorts: true, tls: null });
       try {
         // Submission ports without the Exim TLS preset: 587/STARTTLS only, 465 is not listening.
-        expect((await alice.get(`/email/accounts/${id}/client-settings`).expect(200)).body.data.smtp).toMatchObject({ port: 587, ssl: false, starttls: true, alternative: null, submissionPorts: true });
+        expect((await alice.get(`/email/accounts/${id}/client-settings`).expect(200)).body.data.smtp).toMatchObject({ port: 587, ssl: false, starttls: true, alternative: null, submissionPorts: true, ports: { enabled: true, port465: false, port587: true } });
         app.ctx.settings.set('service_config.exim', { ...(exim || {}), submissionPorts: true, tls: { minProtocol: 'TLSv1.2', protocols: ['TLSv1.2', 'TLSv1.3'], cipherList: '', cipherSuites: '', preferServerCiphers: false } });
-        expect((await alice.get(`/email/accounts/${id}/client-settings`).expect(200)).body.data.smtp).toMatchObject({ port: 465, ssl: true, alternative: { port: 587, starttls: true }, submissionPorts: true });
+        expect((await alice.get(`/email/accounts/${id}/client-settings`).expect(200)).body.data.smtp).toMatchObject({ port: 465, ssl: true, alternative: { port: 587, starttls: true }, submissionPorts: true, ports: { enabled: true, port465: true, port587: true } });
       } finally { app.ctx.settings.set('service_config.exim', exim); }
+    });
+
+    it('names the hostname certificate the mail daemons present and flags a name mismatch', async () => {
+      const id = row("SELECT id FROM mail_accounts WHERE local_part = 'info'").id;
+      const host = app.ctx.settings.get('basic.hostname');
+      const cert = (cn, sans) => ({ daemonPresent: true, hasCertificate: true, paths: {}, certificate: { commonName: cn, sans, issuerOrganization: "Let's Encrypt", issuerCommonName: 'R11', selfSigned: false, notAfter: '2027-01-01T00:00:00.000Z' } });
+      const original = app.ctx.ssl.serviceCertStatus;
+      app.ctx.ssl.serviceCertStatus = async () => [{ service: 'dovecot', ...cert(host, [host]) }, { service: 'exim', ...cert('other.example', ['other.example']) }];
+      try {
+        // A fresh service is memoised per minute: force it by calling through a new service instance.
+        const { createPanelEmailService } = await import('../src/services/panel-email.js');
+        const fresh = createPanelEmailService(app.ctx);
+        const scope = app.ctx.panel.scope({ user: app.ctx.db.prepare("SELECT * FROM users WHERE username = 'alice'").get(), panel: null });
+        const data = await fresh.accounts.clientSettings(scope, id);
+        expect(data.certificate.dovecot).toMatchObject({ name: host, issuer: "Let's Encrypt", selfSigned: false, matchesHostname: true });
+        expect(data.certificate.exim).toMatchObject({ name: 'other.example', matchesHostname: false });
+      } finally { app.ctx.ssl.serviceCertStatus = original; }
+    });
+
+    it('lists the wiring warning and the password policy even before the first mailbox exists', async () => {
+      const res = await bob.get('/email/accounts').expect(200);
+      expect(res.body.data).toEqual([]);
+      expect(res.body.meta.warnings.map((w) => w.code)).toEqual(['virtual_mail_not_live']);
+      expect(res.body.meta.passwordPolicy).toEqual({ context: 'email', minLength: 8, minStrength: expect.any(Number) });
+      // The policy follows Security Center's email context, then the server-wide minimum.
+      const before = app.ctx.settings.get('security.password.strength.email', null);
+      app.ctx.settings.set('security.password.strength.email', 90);
+      try { expect((await bob.get('/email/accounts').expect(200)).body.meta.passwordPolicy.minStrength).toBe(90); } finally { app.ctx.settings.set('security.password.strength.email', before); }
     });
 
     it('deletes the passwd line and the row, removing the maildir only when asked (as the account)', async () => {
@@ -424,7 +457,8 @@ describe('Customer panel: email', () => {
       const res = await alice.put('/email/spam', { enabled: true, requiredScore: 4.5, autoDelete: true, autoDeleteScore: 12, whitelist: ['Friend@Example.org'], blacklist: ['spam@evil.test'] });
       expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(res.body.data).toMatchObject({ enabled: true, requiredScore: 4.5, autoDelete: true, autoDeleteScore: 12, whitelist: ['friend@example.org'], blacklist: ['spam@evil.test'], configured: true });
-      expect(names()).toEqual(['files.mkdir', 'files.write', 'vmail.spam_users.write']);
+      // The availability probe runs before anything is written.
+      expect(names()).toEqual(['web.exim.detect', 'mail.spamd.config.read', 'web.exim.detect', 'mail.spamd.config.read', 'files.mkdir', 'files.write', 'vmail.spam_users.write']);
       expect(app.agent.callsTo('files.mkdir')[0].args).toEqual({ username: 'alice', path: '/home/alice/.spamassassin', mode: '0700' });
       const write = app.agent.callsTo('files.write')[0].args;
       expect(write).toMatchObject({ username: 'alice', path: '/home/alice/.spamassassin/user_prefs', mode: '0600' });
@@ -435,6 +469,43 @@ describe('Customer panel: email', () => {
       ]));
       const lower = await alice.put('/email/spam', { autoDeleteScore: 2 });
       expect(lower.status).toBe(422);
+    });
+
+    it('reports available:false and refuses saves on a light Exim build (501) or a stopped spamd (422)', async () => {
+      const heavy = { installed: true, flavor: 'debian', version: '4.97', features: ['DKIM', 'SPF', 'Content_Scanning'], slots: {} };
+      app.agent.set('web.exim.detect', () => ({ ...heavy, features: ['DKIM', 'SPF'] }));
+      try {
+        // A save re-probes the host before anything is written; the read that follows reuses that answer.
+        const light = await alice.put('/email/spam', { requiredScore: 6 });
+        expect(light.status).toBe(501);
+        expect(light.body.error.message).toMatch(/content scanning/);
+        expect(names()).not.toContain('files.write');
+        expect(row('SELECT required_score FROM mail_spam_settings WHERE account_id = ?', accountId('alice')).required_score).toBe(4.5);
+        const get = await alice.get('/email/spam').expect(200);
+        expect(get.body.data).toMatchObject({ available: false, reason: 'exim_no_content_scan', requiredScore: 4.5, exim: { installed: true, contentScan: false, version: '4.97' } });
+        expect(get.body.data.detail).toMatch(/exim4-daemon-heavy/);
+        // The advisor seam counts the accounts whose saved settings depend on it.
+        expect(await app.ctx.panelEmail.spamStatus()).toMatchObject({ available: false, reason: 'exim_no_content_scan', configuredAccounts: 1 });
+        const scan = await app.http.post('/api/security/advisor/scan').set('X-CSRF-Token', csrf);
+        expect(scan.status, JSON.stringify(scan.body)).toBe(200);
+        expect(scan.body.data.findings.find((f) => f.id === 'panel.spam.scanning')).toMatchObject({ grade: 'warning', title: expect.stringMatching(/no content scanning while 1 account has spam settings/), fix: { path: '/service-configuration/exim-configuration-manager' } });
+
+        app.agent.set('web.exim.detect', () => heavy);
+        app.agent.set('mail.spamd.config.read', () => ({ installed: true, unit: { name: 'spamd', active: 'inactive', enabled: 'enabled' } }));
+        const stopped = await alice.put('/email/spam', { requiredScore: 6 });
+        expect(stopped.status).toBe(422);
+        expect(stopped.body.error.code).toBe('spamd_not_running');
+        expect((await alice.get('/email/spam').expect(200)).body.data).toMatchObject({ available: false, reason: 'spamd_not_running', spamd: { installed: true, active: false, unit: { name: 'spamd' } } });
+        expect(scan.status).toBe(200);
+        const again = await app.http.post('/api/security/advisor/scan').set('X-CSRF-Token', csrf);
+        expect(again.body.data.findings.find((f) => f.id === 'panel.spam.scanning')).toMatchObject({ grade: 'warning', fix: { path: '/email/spamd-startup-configuration' } });
+
+        app.agent.set('mail.spamd.config.read', () => ({ installed: true, unit: { name: 'spamd', active: 'active', enabled: 'enabled' } }));
+        expect((await alice.put('/email/spam', { requiredScore: 6 })).status).toBe(200);
+        expect((await alice.get('/email/spam').expect(200)).body.data).toMatchObject({ available: true, reason: null, requiredScore: 6, exim: { contentScan: true }, spamd: { active: true } });
+        expect((await app.http.post('/api/security/advisor/scan').set('X-CSRF-Token', csrf)).body.data.findings.find((f) => f.id === 'panel.spam.scanning')).toMatchObject({ grade: 'ok' });
+        await alice.put('/email/spam', { requiredScore: 4.5 }).expect(200);
+      } finally { app.agent.reset('web.exim.detect'); app.agent.reset('mail.spamd.config.read'); await app.ctx.web.spamScanning({ fresh: true }); }
     });
 
     it('rolls the row back when the host write fails and 501s without SpamAssassin', async () => {
@@ -471,6 +542,47 @@ describe('Customer panel: email', () => {
       } finally { app.ctx.mail.deliverability.check = original; }
     });
 
+    it('hands the SPF/DKIM/DMARC records back to copy instead of writing BIND when public DNS is elsewhere', async () => {
+      const originals = { check: app.ctx.mail.deliverability.check, fix: app.ctx.mail.deliverability.fix };
+      const report = { domain: 'alice.com', zone: true, score: 20, items: [
+        { id: 'spf', label: 'SPF', status: 'missing', current: [], expected: 'v=spf1 +mx ~all', fixable: true },
+        { id: 'dkim', label: 'DKIM', selector: 'default', status: 'missing', current: [], expected: null, fixable: true },
+        { id: 'dmarc', label: 'DMARC', status: 'ok', current: ['v=DMARC1; p=none'], expected: 'v=DMARC1; p=none; rua=mailto:postmaster@alice.com', fixable: true },
+      ] };
+      let fixCalls = 0;
+      app.ctx.mail.deliverability.check = async () => report;
+      app.ctx.mail.deliverability.fix = async () => { fixCalls += 1; return { domain: 'alice.com', results: {}, status: report }; };
+      app.agent.set('dns.resolve', ({ name, type }) => ({ name, type, servers: [], answers: type === 'NS' && name === 'alice.com' ? ['ns1.cloud.example.'] : type === 'A' && name === 'ns1.cloud.example' ? ['198.51.100.9'] : [], error: null }));
+      try {
+        await app.ctx.panelDns.delegation('alice.com', { fresh: true });
+        const check = await alice.get('/email/deliverability/alice.com').expect(200);
+        expect(check.body.data.delegation).toMatchObject({ delegatedHere: false, delegatedNs: ['ns1.cloud.example'] });
+        expect(check.body.data.records).toEqual([
+          { id: 'spf', name: 'alice.com', type: 'TXT', value: 'v=spf1 +mx ~all', status: 'missing' },
+          { id: 'dmarc', name: '_dmarc.alice.com', type: 'TXT', value: 'v=DMARC1; p=none; rua=mailto:postmaster@alice.com', status: 'ok' },
+        ]);
+        app.agent.calls.length = 0;
+        const fix = await alice.post('/email/deliverability/alice.com/fix', { items: ['spf', 'dkim'] });
+        expect(fix.status, JSON.stringify(fix.body)).toBe(200);
+        expect(fix.body.data).toMatchObject({ applied: false, reason: 'not_delegated', results: { spf: { ok: true, applied: false, reason: 'not_delegated', record: { name: 'alice.com', type: 'TXT', value: 'v=spf1 +mx ~all' } }, dkim: { ok: false } } });
+        expect(fix.body.data.results.dkim.error).toMatch(/Generate the DKIM key first/);
+        expect(fixCalls).toBe(0);
+        expect(names()).not.toContain('dns.zone.write');
+        expect(row("SELECT args_redacted FROM audit_log WHERE action = 'panel.email.deliverability.fix' AND target = 'alice' ORDER BY id DESC LIMIT 1").args_redacted).toContain('"written":false');
+        // Delegated here: the delegate writes the zone as before.
+        app.agent.set('dns.resolve', ({ name, type }) => ({ name, type, servers: [], answers: type === 'NS' && name === 'alice.com' ? ['ns1.here.example.'] : type === 'A' && name === 'ns1.here.example' ? ['203.0.113.5'] : [], error: null }));
+        await app.ctx.panelDns.delegation('alice.com', { fresh: true });
+        const here = await alice.post('/email/deliverability/alice.com/fix', { items: ['spf'] }).expect(200);
+        expect(here.body.data).toMatchObject({ applied: true, delegation: { delegatedHere: true } });
+        expect(fixCalls).toBe(1);
+      } finally {
+        app.ctx.mail.deliverability.check = originals.check;
+        app.ctx.mail.deliverability.fix = originals.fix;
+        app.agent.reset('dns.resolve');
+        await app.ctx.panelDns.delegation('alice.com', { fresh: true });
+      }
+    });
+
     it('DKIM needs the account\'s own zone and delegates with the owner principal', async () => {
       const seen = [];
       const orig = { ensure: app.ctx.dns.ensureDkim, remove: app.ctx.dns.removeDkim };
@@ -490,15 +602,23 @@ describe('Customer panel: email', () => {
       } finally { app.ctx.dns.ensureDkim = orig.ensure; app.ctx.dns.removeDkim = orig.remove; }
     });
 
-    it('webmail link from detection or the panel setting, prefilled with one of the account\'s mailboxes', async () => {
-      const res = await alice.get('/email/webmail?user=info@alice.com').expect(200);
-      expect(res.body.data).toMatchObject({ installed: true, flavor: 'roundcube', prefillUser: 'info@alice.com' });
-      expect(res.body.data.url).toMatch(/^https:\/\/.+\/roundcube\/$/);
-      const foreign = await alice.get('/email/webmail?user=info@bob.com').expect(200);
-      expect(foreign.body.data.prefillUser).toBe('info@alice.com');
-      app.ctx.settings.set('panel.webmail_url', 'https://mail.example.test/');
-      expect((await alice.get('/email/webmail').expect(200)).body.data.url).toBe('https://mail.example.test/');
-      app.ctx.settings.set('panel.webmail_url', '');
+    it('webmail link from the alias published under the FQDN hostname site or the panel setting, prefilled with one of the account\'s mailboxes; the home quick link follows it', async () => {
+      const previousHost = app.ctx.settings.get('basic.hostname');
+      app.ctx.settings.set('basic.hostname', 'Nova.Example.test');
+      try {
+        const res = await alice.get('/email/webmail?user=info@alice.com').expect(200);
+        expect(res.body.data).toMatchObject({ installed: true, flavor: 'roundcube', version: '1.6.6', url: 'https://nova.example.test/webmail/', alias: '/webmail', published: true, configuredUrl: null, prefillUser: 'info@alice.com' });
+        const foreign = await alice.get('/email/webmail?user=info@bob.com').expect(200);
+        expect(foreign.body.data.prefillUser).toBe('info@alice.com');
+        expect((await alice.get('/overview/quick-links').expect(200)).body.data.webmailUrl).toBe('https://nova.example.test/webmail/');
+        app.ctx.settings.set('panel.webmail_url', 'https://mail.example.test/');
+        expect((await alice.get('/email/webmail').expect(200)).body.data).toMatchObject({ url: 'https://mail.example.test/', configuredUrl: 'https://mail.example.test/', published: false });
+        expect((await alice.get('/overview/quick-links').expect(200)).body.data.webmailUrl).toBe('https://mail.example.test/');
+        app.ctx.settings.set('panel.webmail_url', '');
+        // A bare hostname cannot carry the site; the raw setting is still the only name to offer.
+        app.ctx.settings.set('basic.hostname', 'nova');
+        expect((await alice.get('/email/webmail').expect(200)).body.data.url).toBe('https://nova/webmail/');
+      } finally { app.ctx.settings.set('panel.webmail_url', ''); app.ctx.settings.set('basic.hostname', previousHost); }
     });
 
     it('usage is post-filtered to the account\'s exact domains and mailboxes', async () => {

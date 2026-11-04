@@ -8,10 +8,22 @@ import { useToast } from '../../../components/Toast.jsx';
 import { PanelPage, PanelCapabilityState, FeatureDisabledState } from '../../../panel/PanelPage.jsx';
 import { usePanelMe, panelApi } from '../../../panel/hooks/usePanel.js';
 import { useDomains, useFeatureGate, limitReached, usageText, LimitNotice, RequestError, VhostPill, SslPill, DocrootCode, AppliedPill, CreateResult, RemoveDomainModal } from './parts/shared.jsx';
+import { DelegationBanners, RecordList, managedAt, notDelegatedHere } from '../../../panel/DelegationBanner.jsx';
 
 const LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
-export function SubdomainForm({ open, parents, onClose, onCreated }) {
+// What the create answer says about the subdomain's address record: added to a
+// zone here, to be copied to the parent's DNS provider, or neither.
+export function DnsRecordResult({ dns }) {
+  if (!dns) return <span className="muted">—</span>;
+  if (notDelegatedHere(dns.delegation)) {
+    return <span><span className="muted">Add at {managedAt(dns.delegation)}:</span><RecordList records={dns.records} /></span>;
+  }
+  if (dns.zone) return <AppliedPill result={dns} okLabel={`Added to ${dns.zone}`} />;
+  return <span className="muted">No zone of yours contains this name; add the A record where its DNS is hosted</span>;
+}
+
+export function SubdomainForm({ open, parents, delegations = {}, onClose, onCreated }) {
   const [form, setForm] = useState({ label: '', parent: parents[0] || '', docroot: '' });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
@@ -35,7 +47,7 @@ export function SubdomainForm({ open, parents, onClose, onCreated }) {
           <Field label="Name" required help={label ? `Becomes ${label}.${form.parent}` : 'The part before the domain, e.g. shop'} error={error?.fields?.label}>
             <TextInput value={form.label} onChange={set('label')} placeholder="shop" autoFocus spellCheck={false} />
           </Field>
-          <Field label="Under" required error={error?.fields?.parent}>
+          <Field label="Under" required error={error?.fields?.parent} help={notDelegatedHere(delegations[form.parent]) ? `DNS for ${form.parent} is managed at ${managedAt(delegations[form.parent])}; the A record is shown for you to add there` : undefined}>
             <Select value={form.parent} onChange={set('parent')} options={parents} />
           </Field>
         </div>
@@ -59,7 +71,9 @@ export default function Subdomains({ fn }) {
 
   const homeDir = me?.account?.homeDir;
   const subs = rows.filter((r) => r.type === 'sub');
-  const parents = rows.filter((r) => r.type === 'main' || r.type === 'addon').map((r) => r.domain);
+  const parentRows = rows.filter((r) => r.type === 'main' || r.type === 'addon');
+  const parents = parentRows.map((r) => r.domain);
+  const delegations = Object.fromEntries(parentRows.map((r) => [r.domain, r.delegation || null]));
   const count = counts?.sub ?? subs.length;
   const limit = limits?.max_subdomains ?? null;
   const full = limitReached(count, limit);
@@ -90,10 +104,11 @@ export default function Subdomains({ fn }) {
   return (
     <PanelPage fn={fn} actions={<Button variant="primary" icon={Plus} onClick={() => setAdding(true)} disabled={full || !parents.length}>Add subdomain</Button>}>
       <LimitNotice count={count} limit={limit} noun="subdomains" />
+      <DelegationBanners domains={parentRows} title="Subdomains are not published from here" />
       {last && (
         <CreateResult title={`${last.data.domain} is set up`} warnings={last.warnings} onDismiss={() => setLast(null)} items={[
           ['Document root', <DocrootCode key="d" docroot={last.data.docroot} homeDir={homeDir} />],
-          ['DNS record', last.data.dns?.zone ? <AppliedPill key="z" result={last.data.dns} okLabel={`Added to ${last.data.dns.zone}`} /> : <span key="n" className="muted">No zone of yours contains this name; add the A record where its DNS is hosted</span>],
+          ['DNS record', <DnsRecordResult key="z" dns={last.data.dns} />],
           ['Web server', <AppliedPill key="w" result={last.data.web} okLabel="Configured" />],
         ]} />
       )}
@@ -104,7 +119,7 @@ export default function Subdomains({ fn }) {
           rowKey={(r) => r.domain}
           rowActions={(r) => [{ label: 'Remove', primary: true, danger: true, onClick: () => setRemoving(r) }]} />
       </Card>
-      {adding && <SubdomainForm open parents={parents} onClose={() => setAdding(false)} onCreated={onCreated} />}
+      {adding && <SubdomainForm open parents={parents} delegations={delegations} onClose={() => setAdding(false)} onCreated={onCreated} />}
       {removing && (
         <RemoveDomainModal open domain={removing.domain} title={`Remove ${removing.domain}?`} onClose={() => setRemoving(null)} onConfirm={remove} options={[
           { key: 'removeDocroot', label: 'Delete the document root', description: `Removes ${removing.docroot} and every file in it. This cannot be undone.`, default: false },

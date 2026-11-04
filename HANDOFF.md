@@ -173,6 +173,39 @@ work); `basic.nameservers` = `roman/betty.ns.cloudflare.com` and the testuser zo
    list: the minor critic findings from milestone 2, hub portals in a browser, the DEFERRED items in
    `docs/design/phase5-build-plan.md`.
 
+### Phase 8 P0 host steps (after the next `install.sh --upgrade` from the Phase 8 commit)
+
+Phase 8 P0 (plan `docs/design/phase8-account-panel.md`, trackers in `CHECKLIST.md`) is built and reviewed in the working
+tree: the server-hostname site (contract §41), Roundcube + phpMyAdmin published under it, truthful mail client settings,
+DNS-delegation banners (§42) and the lockout paths (§43, migration `034_panel-recovery.sql`). On nova, in this order
+(`keel-ops` session from `/root/keel-ops.env` for the API calls; every POST needs the CSRF token from `GET /api/auth/csrf`):
+
+1. **Packages (done on 2026-11-05 while the units were built):** `apt install roundcube roundcube-core roundcube-mysql
+   phpmyadmin dovecot-sieve goaccess` — dbconfig created the `roundcube` and `phpmyadmin` databases on MariaDB. If they are
+   missing on another host, install them first; the publish steps answer `501 capability_missing` without them.
+2. **Hostname site:** `POST /api/service-config/hostname/apply {}` → `written:true, ssl:true` (the Apache service certificate
+   for `nova.hostingsignal.in` is already installed). `GET /api/service-config/hostname` must show `inSync:true, ssl:true`.
+   `curl -vI https://nova.hostingsignal.in/` shows the hostname certificate and the Keel landing page (the first customer
+   vhost no longer answers for the hostname).
+3. **Publish webmail:** `POST /api/service-config/webmail/publish {}` → `url: "https://nova.hostingsignal.in/webmail/"`,
+   `config.validated:true` (the Keel block in `/etc/roundcube/config.inc.php` points IMAP at `ssl://nova…:993` and SMTP at
+   `tls://nova…:587`). Verify: `curl -vI https://nova.hostingsignal.in/webmail/` → 200 with the hostname certificate;
+   `curl -sI https://nova.hostingsignal.in/webmail/bin/` and `…/webmail/SQL/` → 403 (or 404 on the Debian web-root layout);
+   `GET /api/panel/email/webmail` as `testuser` → `installed:true, url` set with `panel.webmail_url` empty; log in to Roundcube
+   with a panel-created mailbox. Debian's own `/etc/roundcube/apache.conf` keeps its Alias lines commented out — nothing
+   edits it.
+4. **Publish phpMyAdmin:** `POST /api/databases/phpmyadmin/publish {}` → `url: "https://nova.hostingsignal.in/phpmyadmin/"`,
+   `globalAlias.disabled:true` (`a2disconf phpmyadmin`: the distro's global Alias stops answering on customer sites). Verify:
+   `curl -sI https://nova.hostingsignal.in/phpmyadmin/` → 200; `curl -sI https://nova.hostingsignal.in/phpmyadmin/setup/` →
+   403; `curl -sI https://testuser.hostingsignal.in/phpmyadmin/` → 404; `GET /api/panel/databases/phpmyadmin` as `testuser`
+   → `installed:true, url` = the hostname URL; logging in with a user created in `/panel/databases/users` shows only
+   `testuser_*` databases.
+5. **Security Advisor** rescan: `hostname.site` and `phpmyadmin.global_alias` are green; the `panel.mail.*` flags stay green.
+6. **Lockout paths:** with `basic.contact_email` set on `testuser` (*Modify an Account*), the login page shows *Forgot
+   password?*; request a reset for `testuser`, open the mailed link, set a new password, log in to `/panel`, FTP main login
+   works (`password_synced_at` set). The admin side: *Reset 2FA* in the accounts row menu (audit `panel.admin.2fa.reset`).
+7. Trackers: record the gate numbers of the deploy commit in `CLAUDE.md` Current state and `CHECKLIST.md`.
+
 ### Hardening history (for the record)
 
 The Phase-6 verifier (read-only, 2026-11-03) confirmed every audit fix as real, minimal and tested,

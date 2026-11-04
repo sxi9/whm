@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
-import { q, parseBatch, parseGrant, parseMysqlcheck, parseCnf, renderCnf, renderClientCnf, renderRootMyCnf, classifyMysqlError, detectEngine, detectLayout, phpMyAdminVersion, cloneUserStatements, revokeStatements, pickPgUnit, PRIVILEGES, validateServerConfig, classifyProbeOutput, clientWarnings } from '../src/ops/db.js';
+import { q, parseBatch, parseGrant, parseMysqlcheck, parseCnf, renderCnf, renderClientCnf, renderRootMyCnf, classifyMysqlError, detectEngine, detectLayout, phpMyAdminVersion, phpMyAdminPublished, classifyPhpMyAdminWebConf, cloneUserStatements, revokeStatements, pickPgUnit, PRIVILEGES, validateServerConfig, classifyProbeOutput, clientWarnings, PMA_DIRS, PMA_CONFIGS } from '../src/ops/db.js';
 
 // exec is spied with the real implementation behind it so tests can prove an op
 // refused before any program ran. This dev box has no mysql client: every op
@@ -25,13 +25,13 @@ async function opError(promise) {
   throw new Error('expected the op to reject');
 }
 
-const MYSQL_OPS = ['db.detect', 'db.version', 'db.ping', 'db.databases.list', 'db.database.create', 'db.database.drop', 'db.users.list', 'db.user.create', 'db.user.drop', 'db.user.set_password', 'db.user.add_host', 'db.grants.list', 'db.grant', 'db.revoke', 'db.processlist', 'db.kill', 'db.check', 'db.root_password.set', 'db.variables.get', 'db.config.read', 'db.config.write', 'db.restart', 'db.unit', 'db.dump', 'db.packages', 'db.upgrade_tables', 'db.phpmyadmin.detect'];
+const MYSQL_OPS = ['db.detect', 'db.version', 'db.ping', 'db.databases.list', 'db.database.create', 'db.database.drop', 'db.users.list', 'db.user.create', 'db.user.drop', 'db.user.set_password', 'db.user.add_host', 'db.grants.list', 'db.grant', 'db.revoke', 'db.processlist', 'db.kill', 'db.check', 'db.root_password.set', 'db.variables.get', 'db.config.read', 'db.config.write', 'db.restart', 'db.unit', 'db.dump', 'db.packages', 'db.upgrade_tables', 'db.phpmyadmin.detect', 'db.phpmyadmin.global_conf.disable'];
 const PG_OPS = ['pg.version', 'pg.ping', 'pg.databases.list', 'pg.database.create', 'pg.database.drop', 'pg.users.list', 'pg.user.create', 'pg.user.drop', 'pg.user.set_password', 'pg.grants.list', 'pg.grant', 'pg.revoke', 'pg.processlist', 'pg.kill', 'pg.check', 'pg.root_password.set', 'pg.variables.get', 'pg.unit', 'pg.restart'];
 
 describe('db op catalog', () => {
   it('registers the whole family with destructive flags on drops, kills, revokes and restarts', () => {
     for (const name of [...MYSQL_OPS, ...PG_OPS]) expect(catalog.has(name), name).toBe(true);
-    for (const name of ['db.database.drop', 'db.user.drop', 'db.revoke', 'db.kill', 'db.restart', 'pg.database.drop', 'pg.user.drop', 'pg.revoke', 'pg.kill', 'pg.restart']) expect(catalog.get(name).destructive, name).toBe(true);
+    for (const name of ['db.database.drop', 'db.user.drop', 'db.revoke', 'db.kill', 'db.restart', 'pg.database.drop', 'pg.user.drop', 'pg.revoke', 'pg.kill', 'pg.restart', 'db.phpmyadmin.global_conf.disable']) expect(catalog.get(name).destructive, name).toBe(true);
     for (const name of ['db.database.create', 'db.user.create', 'db.grant', 'db.check', 'db.config.write', 'db.dump']) expect(catalog.get(name).destructive, name).toBe(false);
   });
 
@@ -159,6 +159,32 @@ describe('db ops on a host without MySQL', () => {
     expect(typeof pma.installed).toBe('boolean');
     expect(Array.isArray(pma.webConfigs)).toBe(true);
     expect(Array.isArray(pma.candidates)).toBe(true);
+    expect(typeof pma.dbConfigured).toBe('boolean');
+    expect(pma.globalAlias).toMatchObject({ enabled: expect.any(Boolean), a2disconf: expect.any(Boolean) });
+    expect(pma.published === null || typeof pma.published.managed === 'boolean').toBe(true);
+    for (const w of pma.webConfigs) expect(typeof w.global).toBe('boolean');
+  });
+
+  // The disable op runs a2disconf on a real Debian host, so it is only ever
+  // driven here through paths that stop before exec: bad args and a missing
+  // Apache/a2disconf.
+  it('db.phpmyadmin.global_conf.disable rejects unknown or malformed args before anything runs', async () => {
+    exec.mockClear();
+    for (const args of [{ name: 'phpmyadmin' }, { reload: 'yes' }, { reload: true, extra: 1 }, { path: '/etc/apache2/conf-enabled/phpmyadmin.conf' }]) {
+      expect((await opError(runOp('db.phpmyadmin.global_conf.disable', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
+    }
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('db.phpmyadmin.global_conf.disable stops at capability_missing without a2disconf', async () => {
+    exec.mockClear();
+    const real = hasBinary.getMockImplementation();
+    hasBinary.mockImplementation((name) => name !== 'a2disconf' && real(name));
+    try {
+      const err = await opError(runOp('db.phpmyadmin.global_conf.disable', { reload: false }, ctx));
+      expect(['capability_missing', 'unsupported']).toContain(err.code);
+    } finally { hasBinary.mockImplementation(real); }
+    expect(exec).not.toHaveBeenCalled();
   });
 
   it('db.packages answers with a structure even without a known package manager', async () => {
@@ -412,6 +438,30 @@ describe('SQL quoting and parsers', () => {
 
   it('reads phpMyAdmin versions from the usual files', () => {
     expect(phpMyAdminVersion('/nonexistent-dir')).toBeNull();
+  });
+
+  it('tells a global phpMyAdmin alias (loaded outside any VirtualHost) from one scoped to a site', () => {
+    const debian = classifyPhpMyAdminWebConf('/etc/apache2/conf-enabled/phpmyadmin.conf', '# phpMyAdmin default Apache configuration\n\nAlias /phpmyadmin /usr/share/phpmyadmin\n\n<Directory /usr/share/phpmyadmin>\n    Options SymLinksIfOwnerMatch\n</Directory>\n');
+    expect(debian).toMatchObject({ enabled: true, server: 'apache', urlPath: '/phpmyadmin', global: true });
+    expect(classifyPhpMyAdminWebConf('/etc/apache2/conf-available/phpmyadmin.conf', 'Alias /phpmyadmin /usr/share/phpmyadmin\n')).toMatchObject({ enabled: false, global: true });
+    expect(classifyPhpMyAdminWebConf('/etc/httpd/conf.d/phpMyAdmin.conf', '<VirtualHost *:443>\n  Alias /phpMyAdmin /usr/share/phpMyAdmin\n</VirtualHost>\n')).toMatchObject({ urlPath: '/phpMyAdmin', global: false });
+    expect(classifyPhpMyAdminWebConf('/etc/nginx/conf.d/phpmyadmin.conf', 'location /phpmyadmin {\n  root /usr/share;\n}\n')).toMatchObject({ server: 'nginx', urlPath: '/phpmyadmin', global: false });
+    expect(classifyPhpMyAdminWebConf('/etc/apache2/conf-enabled/phpmyadmin.conf', '# Alias /phpmyadmin /usr/share/phpmyadmin\n')).toMatchObject({ urlPath: null, global: false });
+  });
+
+  it('every phpMyAdmin install root and config the detector probes (but the cPanel one) is under an allowed root, so publish works on Debian, RHEL and tarball installs', () => {
+    const ctx = createContext();
+    for (const dir of PMA_DIRS.filter((d) => !d.startsWith('/usr/local/cpanel'))) expect(ctx.assertAllowedPath(dir, 'read'), dir).toBe(dir);
+    for (const file of PMA_CONFIGS) expect(ctx.assertAllowedPath(file, 'read'), file).toBe(file);
+    expect(PMA_DIRS).toContain('/usr/share/phpMyAdmin');
+    expect(PMA_CONFIGS).toContain('/etc/phpMyAdmin/config.inc.php');
+  });
+
+  it('reads the panel-published keel-host.d/phpmyadmin.conf by its spec marker', () => {
+    const files = { '/etc/apache2/keel-host.d/phpmyadmin.conf': '# Managed by Keel (server hostname site: application "phpmyadmin").\n# keel-host-app {"name":"phpmyadmin","alias":"/phpmyadmin","root":"/usr/share/phpmyadmin","php":true}\n\nAlias /phpmyadmin /usr/share/phpmyadmin\n' };
+    expect(phpMyAdminPublished({ readText: (f) => files[f] ?? null })).toEqual({ path: '/etc/apache2/keel-host.d/phpmyadmin.conf', managed: true, alias: '/phpmyadmin', root: '/usr/share/phpmyadmin', php: true });
+    expect(phpMyAdminPublished({ readText: () => null })).toBeNull();
+    expect(phpMyAdminPublished({ readText: (f) => (f.startsWith('/etc/httpd') ? 'Alias /phpmyadmin /usr/share/phpmyadmin\n' : null) })).toEqual({ path: '/etc/httpd/keel-host.d/phpmyadmin.conf', managed: false, alias: null, root: null, php: null });
   });
 
   it('exports the grantable privilege list used by the panel', () => {

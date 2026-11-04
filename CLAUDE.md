@@ -187,6 +187,21 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Current state (update every push)
 
+- **2026-11-05 (later): Phase 8 P0 landed in the working tree** (`docs/design/phase8-account-panel.md`, P0-1..P0-6, built as
+  parallel units with two review lenses and one fix round; uncommitted until the deploy commit). Server-hostname site
+  `keel-host.conf` + `keel-host.d/<app>.conf` drop-ins with the Apache service certificate (`ctx.web.hostname.ensure/status`,
+  `ctx.web.hostApps.publish/unpublish/list`, agent `web.host.*`, contract §41; re-rendered from Basic Setup, Networking Setup ›
+  Change Hostname and the Apache service-cert install; Security Advisor `hostname.site`); Roundcube from the distro published as
+  `/webmail` under it with the Keel block in `config.inc.php` (`ctx.web.webmail.*`, `GET|POST|DELETE /api/service-config/webmail[/publish]`,
+  `GET /api/service-config/hostname` + `POST …/hostname/apply`, §41.1; `allowOverride: 'All'` keeps Roundcube's `.htaccess` rules and
+  `bin/SQL/vendor/installer/tests` are denied); phpMyAdmin from the distro published the same way (`ctx.databases.phpmyadmin.*`,
+  `GET|POST|DELETE /api/databases/phpmyadmin/publish`, `db.phpmyadmin.global_conf.disable` = `a2disconf phpmyadmin`, `setup/` denied,
+  advisor `phpmyadmin.global_alias`); truthful mail client settings (`auth`/`submissionPorts` flags, content-scanning check for spam);
+  DNS delegation awareness in the account panel (`ctx.panelDns.delegation`, §42, `DelegationBanner`); lockout paths: forgot-password
+  by e-mail (`ctx.panel.recovery`, public `POST /api/auth/reset/request|confirm`, `GET /api/auth/reset`, migration
+  `034_panel-recovery.sql` — the 202 never waits for the mail; P1 migrations continue at `034b`) and the admin 2FA reset
+  (`POST /api/panel/admin/accounts/:username/2fa/reset`, §43). Host steps for nova are in `HANDOFF.md` §4 ("Phase 8 P0 host steps");
+  gate numbers are recorded there at the deploy commit (the fix round ran only its own test files on the host clone).
 - **2026-11-05: live-host verification done on the production install** (`nova.hostingsignal.in`, Ubuntu 26.04 on EC2;
   the provisioned-host step `HANDOFF.md` §4.1 asked for). 10 probe areas, 29 confirmed findings (18 with a code component,
   11 host-only; 1 refuted), each adversarially verified; fixes in three rounds with two review lenses, all code findings

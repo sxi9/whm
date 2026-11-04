@@ -29,7 +29,8 @@ function mysqlAgent() {
     'db.revoke': ({ user, database, hosts }) => { for (const h of hosts) state.grants.get(`${user}@${h}`)?.delete(database); return { user, database, hosts, revoked: true }; },
     'db.check': ({ action, databases }) => ({ action, databases, exitCode: 0, results: databases.map((d) => ({ table: `${d}.t`, status: 'ok', messages: [] })), summary: { tables: databases.length, ok: databases.length, repaired: 0, warnings: 0, errors: 0 }, stderr: '' }),
     'db.dump': ({ path, databases }) => { state.dumps.push({ path, databases }); return { path, sizeBytes: 2048, databases }; },
-    'db.phpmyadmin.detect': () => ({ installed: true, dir: '/usr/share/phpmyadmin', version: '5.2.1', configFile: '/etc/phpmyadmin/config.inc.php', webConfigs: [{ path: '/etc/apache2/conf-enabled/phpmyadmin.conf', enabled: true, server: 'apache', urlPath: '/phpmyadmin' }], urlPath: '/phpmyadmin', php: true, candidates: [], packageHint: 'apt-get install phpmyadmin' }),
+    // Published under the hostname site (P0-5); the distro's global alias is already disabled.
+    'db.phpmyadmin.detect': () => ({ installed: true, dir: '/usr/share/phpmyadmin', version: '5.2.1', configFile: '/etc/phpmyadmin/config.inc.php', webConfigs: [{ path: '/etc/apache2/conf-available/phpmyadmin.conf', enabled: false, server: 'apache', urlPath: '/phpmyadmin', global: true }], urlPath: '/phpmyadmin', php: true, candidates: [], dbConfigured: true, globalAlias: { enabled: false, path: '/etc/apache2/conf-available/phpmyadmin.conf', urlPath: null, a2disconf: false }, published: { path: '/etc/apache2/keel-host.d/phpmyadmin.conf', managed: true, alias: '/phpmyadmin', root: '/usr/share/phpmyadmin', php: true }, packageHint: 'apt-get install phpmyadmin' }),
     'fs.mkdir': ({ path }) => ({ path }),
     'fs.chown': ({ path }) => ({ path }),
     'fs.chmod': ({ path }) => ({ path }),
@@ -47,6 +48,7 @@ function mysqlAgent() {
   };
   const agent = createMockAgent(ops);
   agent.state = state;
+  agent.ops = ops;
   return agent;
 }
 
@@ -238,10 +240,20 @@ describe('/api/panel/databases', () => {
     expect(app.ctx.db.prepare('SELECT 1 FROM db_access_hosts WHERE id = ?').get(added.body.data.id)).toBeFalsy();
   });
 
-  it('returns a trimmed phpMyAdmin shape (no paths) honouring the feature and setting', async () => {
-    const res = await get('/phpmyadmin').expect(200);
-    expect(res.body.data).toEqual({ installed: true, url: expect.stringMatching(/^https:\/\/[^/]+\/phpmyadmin$/), featureEnabled: true, version: '5.2.1', users: ['alice_app'] });
-    for (const key of ['dir', 'configFile', 'webConfigs', 'candidates', 'packageHint']) expect(res.body.data).not.toHaveProperty(key);
+  it('returns a trimmed phpMyAdmin shape (no paths) with the hostname-site address, honouring the feature and setting', async () => {
+    const previousHostname = app.ctx.settings.get('basic.hostname');
+    app.ctx.settings.set('basic.hostname', 'panel.example.com');
+    try {
+      const res = await get('/phpmyadmin').expect(200);
+      expect(res.body.data).toEqual({ installed: true, url: 'https://panel.example.com/phpmyadmin/', featureEnabled: true, version: '5.2.1', users: ['alice_app'] });
+      for (const key of ['dir', 'configFile', 'webConfigs', 'candidates', 'packageHint', 'published', 'globalAlias']) expect(res.body.data).not.toHaveProperty(key);
+      // Not published and no hostname site: the global alias alone is not an address the panel advertises.
+      app.agent.set('db.phpmyadmin.detect', () => ({ installed: true, dir: '/usr/share/phpmyadmin', version: '5.2.1', configFile: null, webConfigs: [], urlPath: '/phpmyadmin', php: true, candidates: [], dbConfigured: true, globalAlias: { enabled: true, path: '/etc/apache2/conf-enabled/phpmyadmin.conf', urlPath: '/phpmyadmin', a2disconf: true }, published: null, packageHint: null }));
+      try { expect((await get('/phpmyadmin').expect(200)).body.data).toMatchObject({ installed: true, url: null }); } finally { app.agent.set('db.phpmyadmin.detect', app.agent.ops['db.phpmyadmin.detect']); }
+      // A bare hostname cannot carry a trusted address either.
+      app.ctx.settings.set('basic.hostname', 'nova');
+      expect((await get('/phpmyadmin').expect(200)).body.data).toMatchObject({ installed: true, url: null });
+    } finally { app.ctx.settings.set('basic.hostname', previousHostname); }
     app.ctx.settings.set('db.phpmyadmin.enabled', false);
     try {
       const off = await get('/phpmyadmin').expect(200);

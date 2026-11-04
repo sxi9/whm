@@ -231,7 +231,7 @@ export function AccountPanelSettingsCard() {
             <Field label="Log in as window (minutes)" required error={errors.loginAsTtlMinutes} help={`How long a “Log in as” context lasts before it ends on its own (${LOGIN_AS_TTL.min}–${LOGIN_AS_TTL.max}).`}>
               <NumberInput value={draft.loginAsTtlMinutes} onChange={set('loginAsTtlMinutes')} min={LOGIN_AS_TTL.min} max={LOGIN_AS_TTL.max} step={1} nullable />
             </Field>
-            <Field label="Webmail URL" error={errors.webmailUrl} help="Shown as the webmail link in the account panel. Empty means auto-detect.">
+            <Field label="Webmail URL" error={errors.webmailUrl} help="Shown as the webmail link in the account panel. Empty means the webmail published below (or detected on this server).">
               <TextInput value={draft.webmailUrl} onChange={set('webmailUrl')} type="url" placeholder="https://webmail.example.com/" maxLength={2048} />
             </Field>
           </div>
@@ -243,6 +243,68 @@ export function AccountPanelSettingsCard() {
           </FormActions>
         </>
       )}
+    </Card>
+  );
+}
+
+// What the Publish webmail card says about GET /service-config/webmail.
+export function webmailState(s) {
+  if (!s) return null;
+  if (!s.installed) return { status: 'not-installed', label: 'Not installed', detail: 'No webmail application was found. Install Roundcube from the distribution (Debian/Ubuntu: roundcube roundcube-core roundcube-mysql) and publish it here.' };
+  if (!s.apache) return { status: 'warning', label: 'Apache missing', detail: 'Apache is not installed, so the webmail cannot be published under the server hostname.' };
+  if (!s.fqdn) return { status: 'warning', label: 'Hostname not qualified', detail: `"${s.hostname || '(unset)'}" is not a fully-qualified hostname; set one in Basic Setup before publishing.` };
+  if (!s.published) return { status: 'pending', label: 'Not published', detail: `${s.flavor}${s.version ? ` ${s.version}` : ''} is installed but no web alias serves it. Publish it to make https://${s.hostname}/webmail/ answer with the hostname certificate.` };
+  if (!s.published.managed) return { status: 'warning', label: 'Published by the distribution', detail: `${s.published.file} serves it as ${s.published.alias}; publish it here to pin it to the hostname site (then disable the distribution fragment with a2disconf).` };
+  if (s.site && (!s.site.exists || !s.site.enabled)) return { status: 'warning', label: 'Hostname site missing', detail: 'The drop-in exists but the hostname site is absent or disabled; apply the hostname site (Manage Service SSL Certificates).' };
+  if (s.site && !s.site.ssl) return { status: 'warning', label: 'Published without HTTPS', detail: 'The hostname site has no service certificate yet; install one (AutoSSL for the hostname) and publish again.' };
+  if (s.config && s.config.exists && !s.config.inSync) return { status: 'warning', label: 'Mail hosts out of date', detail: 'config.inc.php does not carry the current hostname or company name; publish again to rewrite the Keel block.' };
+  return { status: 'active', label: 'Published', detail: null };
+}
+
+export function WebmailPublishCard() {
+  const toast = useToast();
+  const confirm = useConfirm();
+  const { data, loading, error, refetch } = useApi('/service-config/webmail');
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState(null);
+  const state = webmailState(data);
+  const run = async (fn, done) => {
+    setBusy(true);
+    setActionError(null);
+    try { const r = await fn(); toast.success(done(r.data)); refetch(); } catch (err) { setActionError(err); toast.error(err); } finally { setBusy(false); }
+  };
+  const publish = () => run(() => api.post('/service-config/webmail/publish', {}), (d) => `Webmail published at ${d.url}`);
+  const unpublish = async () => {
+    if (!(await confirm({ title: 'Unpublish webmail?', message: `${data?.url || 'The webmail URL'} stops answering and the Keel block is removed from config.inc.php; the application stays installed.`, confirmLabel: 'Unpublish', danger: true }))) return;
+    return run(() => api.delete('/service-config/webmail'), () => 'Webmail unpublished');
+  };
+  const canPublish = Boolean(data?.installed && data?.apache && data?.fqdn);
+  return (
+    <Card title="Webmail" subtitle="Roundcube installed from the distribution, published as /webmail under the server hostname site with its certificate; the account panel links to it unless a Webmail URL is set above"
+      actions={data && (
+        <div className="action-row">
+          {data.published?.managed && <Button variant="danger" disabled={busy} onClick={unpublish}>Unpublish</Button>}
+          <Button variant="primary" loading={busy} disabled={!canPublish} onClick={publish}>{data.published?.managed ? 'Publish again' : 'Publish webmail'}</Button>
+        </div>
+      )}>
+      {loading && !data && <Loading />}
+      <ErrorBanner error={error} onRetry={refetch} />
+      {data && state && (
+        <>
+          <KeyValue items={[
+            ['Status', <StatusPill key="s" status={state.status}>{state.label}</StatusPill>],
+            ['Application', data.installed ? `${data.flavor}${data.version ? ` ${data.version}` : ''} (${data.root || data.path})` : '—'],
+            ['Address', data.url ? <a key="u" href={data.url} target="_blank" rel="noopener noreferrer">{data.url}</a> : '—'],
+            data.published && ['Apache', <code key="f">{data.published.file}</code>],
+            data.config && ['Mail hosts', data.config.exists ? (data.config.managed ? `${data.config.managed.imapHost} · ${data.config.managed.smtpHost} · "${data.config.managed.productName}"` : 'Distribution defaults (localhost:143, no TLS)') : 'config.inc.php missing'],
+            data.lastApply && ['Last publish', `${formatDate(data.lastApply.at)}${data.lastApply.ok ? '' : ` — failed: ${data.lastApply.error}`}`],
+          ]} />
+          {state.detail && <p className="muted">{state.detail}</p>}
+          {data.globalAlias && <p className="muted">The distribution also serves it as <code>{data.globalAlias.alias}</code> on every site (<code>{data.globalAlias.file}</code>); run <code>a2disconf</code> on that fragment so customer sites do not answer for it.</p>}
+          {data.config?.ok === false && <p className="muted">PHP reports a syntax error in <code>{data.config.path}</code>; the webmail cannot start until it is fixed.</p>}
+        </>
+      )}
+      <ErrorBanner error={actionError} />
     </Card>
   );
 }
@@ -280,6 +342,7 @@ export function AccountPanelTab() {
   return (
     <>
       <AccountPanelSettingsCard />
+      <WebmailPublishCard />
       <LoginAsHistoryCard />
     </>
   );

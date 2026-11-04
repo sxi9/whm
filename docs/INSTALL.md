@@ -328,6 +328,36 @@ under *SSL/TLS › Manage Service SSL Certificates*, or by overwriting the two f
 
 Browsers warn about the self-signed certificate until it is replaced; HTTP on 2086 stays available.
 
+The server hostname's own web site (`https://<hostname>/`, where webmail and phpMyAdmin are published)
+is not created by the installer: it is written by the panel as `sites-available/keel-host.conf` with
+the Apache service certificate the first time *Basic Setup* saves a fully-qualified hostname, an
+Apache service certificate is installed (AutoSSL for the hostname does this), or
+`POST /api/service-config/hostname/apply` is called (MANUAL.md §7.11). It answers ACME HTTP-01 from
+`/var/www/html`, the webroot AutoSSL uses for the hostname, so the stock default vhost may stay enabled.
+
+**Webmail.** Install Roundcube from the distribution — Debian/Ubuntu
+`apt install roundcube roundcube-core roundcube-mysql` (dbconfig creates the `roundcube` database on
+the local MariaDB; keep the shipped `/etc/roundcube/apache.conf` with its `Alias` commented out),
+RHEL `roundcubemail` — then, as root in the panel, *Panel › Customization › Account panel › Webmail ›
+Publish webmail* (or `POST /api/service-config/webmail/publish`). The panel publishes
+`/var/lib/roundcube/public_html` (Debian) or the install root as `https://<hostname>/webmail/`
+through `keel-host.d/webmail.conf` under the hostname site and appends a managed block to
+`/etc/roundcube/config.inc.php` pointing `imap_host` at `ssl://<hostname>:993` and `smtp_host` at
+`tls://<hostname>:587` (the names on the service certificate), with the branding company name as
+`product_name`; the file is linted with `php -l` before it is replaced. The account panel's Webmail
+page and home quick link then show that URL unless *Webmail URL* is set. Needs the hostname site
+with its certificate (above), `php-cli` (a Roundcube dependency) and the virtual-mail wiring for
+mailbox logins (MANUAL-partC §6.7). Never enable the distribution's global alias (`a2enconf
+roundcube` with the alias uncommented): it would answer on every customer site.
+
+**phpMyAdmin** comes from the distribution: `apt install phpmyadmin` (choose *apache2*, let dbconfig-common
+create the control user — it writes `/etc/phpmyadmin/config-db.php`). The package enables a *global*
+`conf-enabled/phpmyadmin.conf`, which serves `/phpmyadmin` on every customer site with that site's certificate;
+do not leave it that way. In the console open *Database Services › phpMyAdmin* and publish (or
+`POST /api/databases/phpmyadmin/publish`): the panel writes `keel-host.d/phpmyadmin.conf` under the hostname
+site, validates and reloads Apache, then runs `a2disconf phpmyadmin`. The account panel links to
+`https://<hostname>/phpmyadmin/` only once that is done (MANUAL-partB.md §20.9).
+
 ### 4.6 Post-install checks
 
 ```bash

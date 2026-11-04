@@ -1,3 +1,4 @@
+import { isIP } from 'node:net';
 import { json } from '../db/index.js';
 import { notFound, conflict, badRequest, unprocessable, CapabilityError } from '../lib/errors.js';
 
@@ -25,6 +26,10 @@ import { notFound, conflict, badRequest, unprocessable, CapabilityError } from '
 //   web.vhostsForAccount(username)                  -> the account's web_vhosts rows, shaped
 //   web.applyVirtualMail({ enabled }, req)          -> account panel (contract §36): Dovecot 98-whm-virtual-auth.conf + Exim router/transport/auth slots + spam DATA ACL
 //   web.ftp.enableVirtualUsers(req)                 -> account panel (contract §37): pure-ftpd PureDB / proftpd AuthUserFile in the managed config
+//   web.hostname.ensure(req, { reload, strict })    -> server-hostname site (contract §41): keel-host.conf with the Apache service certificate; idempotent
+//   web.hostname.status()                           -> { hostname, fqdn, exists, enabled, inSync, ssl, certificate, apps, lastApply }
+//   web.hostApps.publish({ name, alias, root, php, … }, req) / unpublish(name, req) / list()   -> keel-host.d/<name>.conf under that site only
+//   web.webmail.status() / publish(req, { reload }) / unpublish(req)   -> Roundcube as /webmail under that site + the Keel block in /etc/roundcube/config.inc.php (contract §41 addendum)
 // The ones that change a live vhost/daemon persist the change first and then throw
 // CapabilityError('apache' | 'ftp') when the daemon is missing; consumers map that
 // to 'pending' / 'saved' (dns-functions, ip-functions, ssl-tls all do) and the next
@@ -546,6 +551,8 @@ export function createServiceConfigService(ctx) {
     accountByUsername: db.prepare('SELECT * FROM accounts WHERE username = ?'),
     accountByDomain: db.prepare('SELECT * FROM accounts WHERE domain = ?'),
     accounts: db.prepare('SELECT * FROM accounts ORDER BY username'),
+    accountIps: db.prepare('SELECT DISTINCT ip FROM accounts WHERE ip IS NOT NULL ORDER BY ip'),
+    accountIpv6: db.prepare('SELECT DISTINCT address FROM ipv6_assignments ORDER BY address'),
     accountDomains: db.prepare('SELECT * FROM account_domains WHERE account_id = ? ORDER BY type, domain'),
     accountDomain: db.prepare('SELECT d.*, a.username FROM account_domains d JOIN accounts a ON a.id = d.account_id WHERE d.domain = ?'),
     applies: db.prepare('SELECT * FROM service_config_applies'),
@@ -734,6 +741,11 @@ export function createServiceConfigService(ctx) {
           results.push({ ...result, applied: false, reason: 'php_missing', error });
         } else results.push(result);
       } catch (err) { results.push({ domain: spec.domain, applied: false, reason: err.code || 'error', error: err.message }); }
+    }
+    // An account IP the hostname site is not bound to yet would shadow it on that address
+    // (contract §41); the re-render is idempotent and only applies once the site was ever applied.
+    if (installed && written && account.ip && lastApply('hostname_vhost')?.ok) {
+      try { if ((await hostnameSite.ensure(req, { reload: false })).changed) written++; } catch (err) { logger.warn({ err, username: account.username }, 'web: hostname site refresh after vhost sync failed'); }
     }
     const reload = await reloadAfter(written, req);
     audit(req, { action: 'web.vhost.sync', target: account.username, args: { domains: specs.map((s) => s.domain), applied: results.filter((r) => r.applied).length } });
@@ -1484,6 +1496,194 @@ export function createServiceConfigService(ctx) {
     },
   };
 
+  // ------------------------------------------------- server hostname site ---
+
+  // seed.js defaults basic.hostname to os.hostname(), which can be a bare label.
+  const FQDN = /^(?=.{1,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+  const rawHostname = () => String(settings.get('basic.hostname', '') || '').trim();
+  const serverHostname = () => { const h = rawHostname().toLowerCase(); return FQDN.test(h) ? h : null; };
+  const panelPort = () => Number(ctx.config?.tlsPort) || 2087;
+  // Customer vhosts bind to their account IP when the host holds it (web.vhost.write), and Apache
+  // only falls back to wildcard vhosts for addresses no vhost is bound to; the hostname site is
+  // therefore bound to the same addresses (the agent drops the ones no interface holds).
+  const hostnameSiteIps = () => {
+    const ips = [settings.get('basic.main_ip', ''), settings.get('basic.main_ipv6', ''), ...stmts.accountIps.all().map((r) => r.ip), ...stmts.accountIpv6.all().map((r) => r.address)];
+    return [...new Set(ips.map((ip) => String(ip || '').trim().toLowerCase()).filter((ip) => isIP(ip)))].slice(0, 64);
+  };
+  const shapeHostApp = (host) => (a) => ({ name: a.name, alias: a.alias ?? null, root: a.root ?? null, php: a.php ?? null, managed: a.managed ?? true, path: a.path, url: host && a.alias ? `https://${host}${a.alias}/` : null, updatedAt: a.mtime ?? null });
+
+  const hostnameSite = {
+    hostname: serverHostname,
+    // Called from the hooks (Basic Setup save, Apache service-cert install) with
+    // strict=false: a bare hostname or a missing Apache is reported, never thrown.
+    async ensure(req, { reload = true, strict = false } = {}) {
+      const host = serverHostname();
+      if (!host) {
+        const message = `"${rawHostname() || '(unset)'}" is not a fully-qualified hostname; set one in Basic Setup (or Networking Setup › Change Hostname) first.`;
+        if (strict) throw unprocessable(message, { hostname: ['Must be a fully-qualified domain name'] });
+        return { hostname: rawHostname() || null, written: false, changed: false, reloaded: false, warnings: [{ code: 'hostname_not_fqdn', message }] };
+      }
+      if (!capabilities.has('apache')) {
+        if (strict) requireApache();
+        return { hostname: host, written: false, changed: false, reloaded: false, reason: 'capability_missing', warnings: [{ code: 'capability_missing', message: 'Apache is not installed on this server.' }] };
+      }
+      const ports = listenPorts();
+      const args = { hostname: host, port: ports.http, sslPort: ports.https, panelPort: panelPort(), ips: hostnameSiteIps(), reload };
+      if (ports.bind) args.bind = ports.bind;
+      try {
+        const r = await op('web.host.ensure', args, req);
+        const warnings = r.warnings || [];
+        recordApply('hostname_vhost', true, { hostname: host, path: r.path, ssl: r.ssl, changed: r.changed, warnings: warnings.map((w) => w.code) });
+        if (r.changed) audit(req, { action: 'hostname_vhost.ensure', target: host, args: { path: r.path, ssl: r.ssl, phpSocket: r.phpSocket, reloaded: Boolean(r.reloaded), warnings: warnings.map((w) => w.code) } });
+        return { hostname: host, url: `https://${host}/`, written: true, changed: Boolean(r.changed), reloaded: Boolean(r.reloaded), validated: r.validated ?? null, ssl: Boolean(r.ssl), path: r.path, docroot: r.docroot, phpSocket: r.phpSocket ?? null, warnings };
+      } catch (err) {
+        recordApply('hostname_vhost', false, { hostname: host }, err.message);
+        throw err;
+      }
+    },
+    async status() {
+      await capabilities.ensureFresh();
+      const host = serverHostname();
+      const apache = capabilities.has('apache');
+      const st = apache ? await op('web.host.status').catch((err) => ({ installed: false, error: err.message })) : { installed: false };
+      return {
+        hostname: rawHostname() || null, fqdn: Boolean(host), apache, url: host ? `https://${host}/` : null, panelUrl: host ? `https://${host}:${panelPort()}/` : null,
+        exists: Boolean(st.exists), enabled: Boolean(st.enabled), managed: st.managed ?? null, current: st.hostname ?? null, inSync: Boolean(st.exists && host && st.hostname === host), ssl: Boolean(st.ssl),
+        certificate: st.certificate ?? null, docroot: st.docroot ?? null, phpSocket: st.phpSocket ?? null, path: st.path ?? null, appsDir: st.appsDir ?? null, apps: (st.apps || []).map(shapeHostApp(host)),
+        lastApply: lastApply('hostname_vhost'), error: st.error ?? null,
+      };
+    },
+  };
+
+  const hostApps = {
+    async publish(spec, req) {
+      requireApache();
+      const site = await hostnameSite.ensure(req, { reload: false, strict: true });
+      const r = await op('web.host.app.write', spec, req);
+      const reloaded = Boolean(r.reloaded) || (site.changed ? Boolean((await reloadAfter(true, req)).reloaded) : false);
+      audit(req, { action: 'host_app.publish', target: spec.name, args: { alias: r.alias, root: r.root, php: spec.php ?? true, changed: Boolean(r.changed), reloaded } });
+      return { name: spec.name, alias: r.alias, root: r.root, url: `https://${site.hostname}${r.alias}/`, path: r.path, changed: Boolean(r.changed), reloaded, validated: r.validated ?? null, warnings: [...site.warnings, ...(r.warnings || [])] };
+    },
+    async unpublish(name, req) {
+      requireApache();
+      const r = await op('web.host.app.remove', { name }, req);
+      audit(req, { action: 'host_app.unpublish', target: name, args: { removed: Boolean(r.removed), reloaded: Boolean(r.reloaded) } });
+      return { name, removed: Boolean(r.removed), reloaded: Boolean(r.reloaded), path: r.path };
+    },
+    async list() {
+      await capabilities.ensureFresh();
+      const host = serverHostname();
+      if (!capabilities.has('apache')) return { installed: false, hostname: host, appsDir: null, vhostPresent: false, apps: [] };
+      const r = await op('web.host.app.list');
+      return { installed: true, hostname: host, appsDir: r.appsDir ?? null, vhostPresent: Boolean(r.vhostPresent), apps: (r.apps || []).map(shapeHostApp(host)) };
+    },
+  };
+
+  // ------------------------------------------------------------- webmail ---
+
+  // Roundcube (or another distro webmail) published as /webmail under the
+  // hostname site (contract §41 addendum) plus the Keel block in its
+  // config.inc.php pointing IMAP/SMTP at the hostname certificate's name.
+  // AllowOverride All keeps Roundcube's shipped .htaccess rules in force (they
+  // hide bin/, SQL/, vendor/, *.md, composer.json...), and the directories that
+  // must never be served are denied outright for a layout without them.
+  const WEBMAIL_APP = { name: 'webmail', alias: '/webmail', php: true, allowOverride: 'All', denyDirs: ['config', 'temp', 'logs', 'bin', 'SQL', 'vendor', 'installer', 'tests'] };
+  const WEBMAIL_MAIL = { imapScheme: 'ssl', imapPort: 993, smtpScheme: 'tls', smtpPort: 587 };
+  const webmailProductName = () => {
+    let name = '';
+    try { name = String(ctx.cpanel?.branding?.get?.()?.companyName ?? settings.get('branding.company_name', '') ?? ''); } catch { name = ''; }
+    name = name.replace(/[\0-\x1f\x7f]/g, ' ').trim().slice(0, 80);
+    return name || 'Keel';
+  };
+  const webmailHostUri = (scheme, host, port) => (scheme === 'plain' ? `${host}:${port}` : `${scheme}://${host}:${port}`);
+  const webmailExpected = (host) => (host ? { imapHost: webmailHostUri(WEBMAIL_MAIL.imapScheme, host, WEBMAIL_MAIL.imapPort), smtpHost: webmailHostUri(WEBMAIL_MAIL.smtpScheme, host, WEBMAIL_MAIL.smtpPort), productName: webmailProductName() } : null);
+
+  const webmail = {
+    detect: (lint = false) => op('web.webmail.detect', lint ? { lint: true } : {}),
+    async status() {
+      await capabilities.ensureFresh();
+      const host = serverHostname();
+      const apache = capabilities.has('apache');
+      const d = await webmail.detect(true).catch((err) => ({ installed: false, error: err.message }));
+      const site = apache ? await hostnameSite.status().catch(() => null) : null;
+      const published = d.published ? { alias: d.published.alias, file: d.published.file, managed: Boolean(d.published.managed), source: d.published.source, url: host ? `https://${host}${d.published.alias}/` : null } : null;
+      const expected = webmailExpected(host);
+      const managed = d.config?.managed ?? null;
+      const config = d.config ? { path: d.config.path, exists: Boolean(d.config.exists), ok: d.config.ok ?? null, managed, expected, inSync: Boolean(managed && expected && managed.imapHost === expected.imapHost && managed.smtpHost === expected.smtpHost && managed.productName === expected.productName) } : null;
+      return {
+        installed: Boolean(d.installed), flavor: d.flavor ?? null, version: d.version ?? null, path: d.path ?? null, root: d.root ?? null,
+        hostname: rawHostname() || null, fqdn: Boolean(host), apache,
+        site: site ? { exists: site.exists, enabled: site.enabled, ssl: site.ssl, inSync: site.inSync, url: site.url } : null,
+        published, url: published?.url ?? null, globalAlias: d.globalAlias ?? null, config,
+        lastApply: lastApply('webmail'), error: d.error ?? null,
+      };
+    },
+    async publish(req, { reload = true } = {}) {
+      requireApache();
+      const d = await webmail.detect();
+      if (!d.installed) throw new CapabilityError('webmail', 'No webmail application is installed on this server. Install Roundcube from the distribution (Debian/Ubuntu: roundcube roundcube-core roundcube-mysql; RHEL: roundcubemail) and publish again.');
+      try {
+        const app = await hostApps.publish({ ...WEBMAIL_APP, root: d.root, reload }, req);
+        let config = null;
+        if (d.flavor === 'roundcube' && d.config?.exists) {
+          const r = await op('web.webmail.config.write', { hostname: serverHostname(), ...WEBMAIL_MAIL, productName: webmailProductName() }, req);
+          config = { path: r.path, changed: Boolean(r.changed), validated: r.validated ?? null, values: r.values ?? null };
+        }
+        recordApply('webmail', true, { flavor: d.flavor, alias: app.alias, root: app.root, url: app.url, changed: app.changed, config: config ? { changed: config.changed } : null, warnings: (app.warnings || []).map((w) => w.code) });
+        audit(req, { action: 'webmail.publish', target: app.url, args: { flavor: d.flavor, version: d.version, root: app.root, alias: app.alias, path: app.path, changed: app.changed, reloaded: app.reloaded, config: config ? { path: config.path, changed: config.changed, validated: config.validated } : null } });
+        return { installed: true, flavor: d.flavor, version: d.version, root: app.root, alias: app.alias, url: app.url, path: app.path, changed: app.changed, reloaded: app.reloaded, validated: app.validated, config, warnings: app.warnings };
+      } catch (err) {
+        recordApply('webmail', false, { flavor: d.flavor, root: d.root }, err.message);
+        throw err;
+      }
+    },
+    async unpublish(req) {
+      requireApache();
+      const r = await hostApps.unpublish(WEBMAIL_APP.name, req);
+      let config = null;
+      const d = await webmail.detect().catch(() => null);
+      if (d?.flavor === 'roundcube' && d.config?.managed) {
+        const c = await op('web.webmail.config.remove', {}, req);
+        config = { path: c.path, removed: Boolean(c.changed), validated: c.validated ?? null };
+      }
+      recordApply('webmail', true, { unpublished: true, removed: r.removed, config: config ? { removed: config.removed } : null });
+      audit(req, { action: 'webmail.unpublish', target: WEBMAIL_APP.name, args: { removed: r.removed, reloaded: r.reloaded, path: r.path, config } });
+      return { ...r, config };
+    },
+  };
+
+  // ------------------------------------------------- spam scanning (panel) ---
+
+  // Whether the mailboxes' spam filtering can take effect: `spam = <user>` in
+  // the DATA ACL exists only in a content-scanning Exim build (`exim -bV` lists
+  // Content_Scanning; Debian's exim4-daemon-heavy, not -light, which passes the
+  // capability check and silently ignores the condition) and needs a running
+  // spamd. Memoised briefly: the panel's spam page reads it on every load.
+  let spamScanningMemo = { at: 0, value: null };
+  async function spamScanning({ fresh = false } = {}) {
+    if (!fresh && spamScanningMemo.value && Date.now() - spamScanningMemo.at < 60_000) return spamScanningMemo.value;
+    await capabilities.ensureFresh();
+    const layout = capabilities.has('exim') ? await exim.layout() : { installed: false };
+    const eximInstalled = capabilities.has('exim') && layout.installed !== false;
+    const contentScan = eximInstalled ? eximSupport(layout).contentScan : false;
+    const spamdInstalled = capabilities.has('spamassassin');
+    let unit = null;
+    if (spamdInstalled) unit = (await op('mail.spamd.config.read').catch(() => ({}))).unit ?? null;
+    // No unit on the host (no systemd, or spamd started another way) is unknown, not stopped.
+    const spamdActive = unit ? unit.active === 'active' : null;
+    const result = {
+      exim: { installed: eximInstalled, contentScan, version: layout.version ?? null, features: Array.isArray(layout.features) ? layout.features : null, flavor: layout.flavor ?? null },
+      spamd: { installed: spamdInstalled, active: spamdActive, unit: unit ? { name: unit.name, active: unit.active, enabled: unit.enabled ?? null } : null },
+    };
+    if (!eximInstalled) Object.assign(result, { available: false, reason: 'exim_missing', detail: 'Exim is not installed on this server, so incoming mail is not scanned.' });
+    else if (!contentScan) Object.assign(result, { available: false, reason: 'exim_no_content_scan', detail: `This Exim build (${layout.version ? `exim ${layout.version}` : 'exim'}${layout.flavor === 'debian' ? ', exim4-daemon-light' : ''}) has no content scanning, so spam settings are saved but never applied; install a content-scanning build (Debian: exim4-daemon-heavy) and apply the virtual-mail configuration again.` });
+    else if (!spamdInstalled) Object.assign(result, { available: false, reason: 'spamd_missing', detail: 'SpamAssassin (spamd) is not installed on this server, so incoming mail is not scored.' });
+    else if (spamdActive === false) Object.assign(result, { available: false, reason: 'spamd_not_running', detail: `SpamAssassin's daemon (${unit.name}) is not running, so incoming mail is not scored until it is started.` });
+    else Object.assign(result, { available: true, reason: null, detail: null });
+    spamScanningMemo = { at: Date.now(), value: result };
+    return result;
+  }
+
   // -------------------------------------------------------------- status ---
 
   async function status() {
@@ -1507,6 +1707,7 @@ export function createServiceConfigService(ctx) {
     reload: (req) => apache.reload(req), restart: (req) => apache.restart(req), configtest: () => op('web.configtest'),
     vhostFor: (domain) => shapeVhost(stmts.vhostByDomain.get(domain)) ?? null, syncAllJob, removeVhost, vhostsForAccount,
     ensureEximAclChain: (req) => exim.ensureEximAclChain(req), applyEximTls: (preset, req) => exim.applyEximTls(preset, req), applyMailserverTls: (preset, req) => mailserver.applyMailserverTls(preset, req),
-    virtualMail, applyVirtualMail: (input, req) => virtualMail.apply(input, req),
+    virtualMail, applyVirtualMail: (input, req) => virtualMail.apply(input, req), spamScanning,
+    hostname: hostnameSite, hostApps, webmail,
   };
 }

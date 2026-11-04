@@ -826,6 +826,281 @@ defineOp('web.vhost.read', {
   },
 });
 
+// ------------------------------------------------- server hostname site ---
+
+// The panel-managed site for the server's own hostname: https://<hostname>/
+// with the Apache service certificate (Manage Service SSL Certificates), a
+// landing page linking to the panel, PHP through the distribution's www pool,
+// and a drop-in directory where web applications (webmail, phpMyAdmin) are
+// published under that one name only — never on every customer vhost.
+export const HOST_VHOST = { name: 'keel-host', docroot: '/var/www/keel-host', acmeRoot: '/var/www/html', certDir: '/etc/ssl/whm/service/apache', appsDirName: 'keel-host.d' };
+const HOST_MARK = '# keel-host ';
+const HOST_APP_MARK = '# keel-host-app ';
+
+export const hostCertPaths = () => ({ fullchain: `${HOST_VHOST.certDir}/fullchain.pem`, key: `${HOST_VHOST.certDir}/key.pem` });
+
+function hostLayout(apache) {
+  const debian = apache.flavor === 'debian';
+  return {
+    file: path.join(debian ? apache.sitesAvailable : apache.confD, `${HOST_VHOST.name}.conf`),
+    link: debian ? path.join(apache.sitesEnabled, `${HOST_VHOST.name}.conf`) : null,
+    appsDir: path.join(apache.root, HOST_VHOST.appsDirName),
+    logDir: apache.logDir,
+  };
+}
+
+// The distribution's own www pool (Debian php<ver>-fpm.sock, RHEL/Remi
+// www.sock), newest PHP first; tenant pools are never used for the hostname site.
+export function wwwPoolSocket(layout = phpLayout(), io = { exists }) {
+  const candidates = [...layout.versions].reverse().map((v) => (v.flavor === 'debian' ? `${v.socketDir}/php${v.version}-fpm.sock` : `${v.socketDir}/www.sock`));
+  return candidates.find((s) => io.exists(s)) || null;
+}
+
+const hostAppName = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/, 'lowercase name such as webmail');
+const hostAppAlias = z.string().max(128).regex(/^\/(?!(?:.*\/)?\.{1,2}(?:\/|$))[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*\/?$/, 'URL path such as /webmail');
+const hostAppOption = z.enum(['+Indexes', '-Indexes', '+FollowSymLinks', '-FollowSymLinks', '+SymLinksIfOwnerMatch', '-SymLinksIfOwnerMatch', '+MultiViews', '-MultiViews', 'None']);
+const dirName = z.string().regex(/^(?!\.{1,2}$)[A-Za-z0-9._-]{1,64}$/, 'directory name');
+const ipOrCidr = z.string().max(64).refine((v) => { const [ip, bits, ...rest] = v.split('/'); return !rest.length && arg.ip.safeParse(ip).success && (bits === undefined || (/^\d{1,3}$/.test(bits) && Number(bits) <= (ip.includes(':') ? 128 : 32))); }, 'IP address or CIDR');
+const hostAppSchema = z.object({
+  name: hostAppName, alias: hostAppAlias, root: confPath, php: z.boolean().default(true),
+  access: z.enum(['all', 'local', 'list']).default('all'), allowFrom: z.array(ipOrCidr).max(50).default([]),
+  options: z.array(hostAppOption).min(1).max(6).default(['-Indexes', '+FollowSymLinks']),
+  directoryIndex: z.array(z.string().regex(/^[A-Za-z0-9._-]{1,64}$/)).max(10).optional(),
+  allowOverride: z.enum(['None', 'All', 'AuthConfig', 'FileInfo', 'Indexes', 'Limit', 'Options']).default('None'),
+  denyDirs: z.array(dirName).max(20).default([]),
+  reload: z.boolean().default(true),
+}).strict().refine((a) => a.access !== 'list' || a.allowFrom.length > 0, { message: 'allowFrom is required when access is "list"', path: ['allowFrom'] });
+
+const hostVhostSchema = z.object({
+  hostname: arg.domain, docroot: confPath.default(HOST_VHOST.docroot), port: z.number().int().min(1).max(65535).default(80), sslPort: z.number().int().min(1).max(65535).nullable().default(443),
+  bind: arg.ip.nullable().optional(), ips: z.array(arg.ip).max(64).default([]), php: z.boolean().default(true), panelPort: z.number().int().min(1).max(65535).default(2087), serverAdmin: emailAddress.optional(), reload: z.boolean().default(true),
+}).strict();
+
+const hostPhpLines = (socket, indent = '  ') => [`${indent}<IfModule proxy_fcgi_module>`, `${indent}  SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1`, `${indent}  <FilesMatch "\\.ph(ar|p|tml)$">`, `${indent}    SetHandler "proxy:unix:${socket}|fcgi://localhost"`, `${indent}  </FilesMatch>`, `${indent}</IfModule>`];
+
+export function renderHostVhost(h) {
+  // Apache answers a request from the vhosts bound to the connection's address and
+  // consults the wildcard set only when none is; with customer vhosts bound to the
+  // account IPs (vhostBlock) the hostname site must sit in each of those sets too.
+  const own = h.ownAddress || (() => true);
+  const bound = [...new Set(h.ips || [])].filter(own);
+  const listen = (port) => (h.bind ? listenAddr(h.bind, port) : [...bound.map((ip) => listenAddr(ip, port)), `*:${port}`].join(' '));
+  const ssl = h.ssl && h.sslPort ? h.ssl : null;
+  const block = (tls, port) => {
+    const lines = [`<VirtualHost ${listen(port)}>`, `  ServerName ${h.hostname}`, `  ServerAdmin ${h.serverAdmin || `webmaster@${h.hostname}`}`, `  DocumentRoot ${q(h.docroot)}`, '  UseCanonicalName Off'];
+    lines.push(`  CustomLog ${q(`${h.logDir}/${HOST_VHOST.name}${tls ? '-ssl' : ''}-access.log`)} combined`, `  ErrorLog ${q(`${h.logDir}/${HOST_VHOST.name}${tls ? '-ssl' : ''}-error.log`)}`);
+    lines.push('  <IfModule mod_userdir.c>', '    UserDir disabled', '  </IfModule>');
+    lines.push(`  <Directory ${q(h.docroot)}>`, '    Options -Indexes +FollowSymLinks', '    AllowOverride None', '    Require all granted', '  </Directory>');
+    if (!tls) {
+      // HTTP-01 for the hostname is answered from the stock webroot (certbot
+      // --webroot -w /var/www/html, see ssl-tls SERVER_DOCROOT); Redirect wins
+      // over Alias in mod_alias, hence the lookahead that keeps it reachable.
+      lines.push(`  Alias "/.well-known/acme-challenge/" ${q(`${h.acmeRoot}/.well-known/acme-challenge/`)}`, `  <Directory ${q(`${h.acmeRoot}/.well-known/acme-challenge`)}>`, '    Options None', '    AllowOverride None', '    Require all granted', '  </Directory>');
+      if (ssl) lines.push(`  RedirectMatch 301 "^/(?!\\.well-known/acme-challenge/)(.*)$" "https://${h.hostname}/$1"`);
+    }
+    if (h.phpSocket) lines.push(...hostPhpLines(h.phpSocket));
+    if (tls) lines.push('  SSLEngine on', `  SSLCertificateFile ${q(ssl.fullchain)}`, `  SSLCertificateKeyFile ${q(ssl.key)}`);
+    lines.push(`  IncludeOptional ${q(`${h.appsDir}/*.conf`)}`, '</VirtualHost>');
+    return lines;
+  };
+  const meta = { hostname: h.hostname, docroot: h.docroot, appsDir: h.appsDir, ssl: Boolean(ssl), phpSocket: h.phpSocket || null, port: h.port, sslPort: ssl ? h.sslPort : null, bind: h.bind ?? null, ips: h.bind ? [] : bound, panelPort: h.panelPort ?? null };
+  const lines = [`${MANAGED} (server hostname site ${h.hostname}). Edit through the panel; manual changes are overwritten.`, `${HOST_MARK}${JSON.stringify(meta)}`, ''];
+  lines.push(...block(false, h.port));
+  if (ssl) lines.push('', '<IfModule ssl_module>', ...block(true, h.sslPort), '</IfModule>');
+  return `${lines.join('\n')}\n`;
+}
+
+export function renderHostIndex(hostname, panelPort = 2087) {
+  const panel = `https://${hostname}:${panelPort}`;
+  return ['<!doctype html>', '<html lang="en">', '<head>', '<meta charset="utf-8">', '<meta name="viewport" content="width=device-width, initial-scale=1">', '<meta name="robots" content="noindex">', `<title>${hostname}</title>`,
+    '<style>body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#f4f5f7;color:#1c1c1e;display:flex;min-height:100vh;align-items:center;justify-content:center}main{background:#fff;border-radius:16px;padding:40px 48px;box-shadow:0 8px 30px rgba(0,0,0,.06);max-width:440px;text-align:center}h1{font-size:22px;margin:0 0 8px}p{margin:0 0 24px;color:#6e6e73}a{display:inline-block;margin:4px;padding:10px 18px;border-radius:10px;background:#0a84ff;color:#fff;text-decoration:none}a.alt{background:#e5e5ea;color:#1c1c1e}</style>',
+    '</head>', '<body>', '<main>', `<h1>${hostname}</h1>`, '<p>This server is managed by Keel.</p>', `<a href="${panel}/panel">Account panel</a>`, `<a class="alt" href="${panel}/">Administration</a>`, '</main>', '</body>', '</html>', ''].join('\n');
+}
+
+export function renderHostApp(a) {
+  const alias = a.alias.length > 1 ? a.alias.replace(/\/+$/, '') : a.alias;
+  const meta = { name: a.name, alias, root: a.root, php: a.php, phpSocket: a.php ? a.phpSocket || null : null, access: a.access, allowFrom: a.allowFrom, options: a.options, directoryIndex: a.directoryIndex ?? null, allowOverride: a.allowOverride, denyDirs: a.denyDirs };
+  const lines = [`${MANAGED} (server hostname site: application "${a.name}"). Rendered from a structured spec; manual changes are overwritten.`, `${HOST_APP_MARK}${JSON.stringify(meta)}`, ''];
+  lines.push(`Alias ${q(alias)} ${q(a.root)}`);
+  lines.push(`<Directory ${q(a.root)}>`, `  Options ${a.options.join(' ')}`, `  AllowOverride ${a.allowOverride}`);
+  if (a.directoryIndex?.length) lines.push(`  DirectoryIndex ${a.directoryIndex.join(' ')}`);
+  if (a.access === 'local') lines.push('  Require local');
+  else if (a.access === 'list') lines.push(`  Require ip ${a.allowFrom.join(' ')}`);
+  else lines.push('  Require all granted');
+  if (a.php && a.phpSocket) lines.push(...hostPhpLines(a.phpSocket));
+  else if (!a.php) lines.push('  <FilesMatch "\\.ph(ar|p|tml)$">', '    Require all denied', '  </FilesMatch>');
+  lines.push('</Directory>');
+  for (const d of a.denyDirs) lines.push(`<Directory ${q(`${a.root}/${d}`)}>`, '  Require all denied', '</Directory>');
+  return `${lines.join('\n')}\n`;
+}
+
+export function parseHostMeta(text, mark = HOST_MARK) {
+  const line = (text || '').split('\n').find((l) => l.startsWith(mark));
+  if (!line) return null;
+  try { return JSON.parse(line.slice(mark.length)); } catch { return null; }
+}
+
+function isDirectory(p) {
+  try { return fs.statSync(p).isDirectory(); } catch { return false; }
+}
+
+// The landing page is written once; an operator's own index.html is kept.
+function ensureHostDocroot(docroot, hostname, panelPort) {
+  let st = null;
+  try { st = fs.lstatSync(docroot); } catch { st = null; }
+  if (st && (st.isSymbolicLink() || !st.isDirectory())) throw new OpError('refused', `${docroot} exists and is not a directory`);
+  if (!st) { fs.mkdirSync(docroot, { recursive: true, mode: 0o755 }); fs.chmodSync(docroot, 0o755); }
+  const index = path.join(docroot, 'index.html');
+  const indexWritten = !exists(index);
+  if (indexWritten) writeAtomic(index, renderHostIndex(hostname, panelPort));
+  return { created: !st, indexWritten };
+}
+
+function listHostApps(appsDir) {
+  let files = [];
+  try { files = fs.readdirSync(appsDir).filter((f) => f.endsWith('.conf')); } catch { files = []; }
+  return files.map((f) => {
+    const file = path.join(appsDir, f);
+    const text = readText(file) || '';
+    const meta = parseHostMeta(text, HOST_APP_MARK);
+    return { name: f.replace(/\.conf$/, ''), path: file, managed: text.includes(HOST_APP_MARK), alias: meta?.alias ?? null, root: meta?.root ?? null, php: meta?.php ?? null, meta, mtime: fs.statSync(file).mtime.toISOString() };
+  }).sort((x, y) => x.name.localeCompare(y.name));
+}
+
+function hostVhostPresent(layout) {
+  const text = readText(layout.file);
+  return text != null && text.includes(HOST_MARK) && (layout.link ? exists(layout.link) : true);
+}
+
+defineOp('web.host.ensure', {
+  description: 'Render and install the server-hostname site (keel-host.conf: :80 with ACME passthrough + redirect, :443 with the Apache service certificate, PHP via the www pool, IncludeOptional keel-host.d/*.conf; bound to every held account IP in ips plus the wildcard), validate with configtest (rolled back on error) and reload; idempotent',
+  schema: hostVhostSchema,
+  run: async (h, ctx) => {
+    const docroot = ctx.assertAllowedPath(h.docroot, 'write');
+    const cert = hostCertPaths();
+    for (const f of [cert.fullchain, cert.key]) ctx.assertAllowedPath(f, 'read');
+    ctx.assertAllowedPath(HOST_VHOST.acmeRoot, 'read');
+    const apache = requireApache();
+    const layout = hostLayout(apache);
+    const file = ctx.assertAllowedPath(layout.file, 'write');
+    if (layout.link) ctx.assertAllowedPath(layout.link, 'write');
+    const appsDir = ctx.assertAllowedPath(layout.appsDir, 'write');
+    ctx.assertAllowedPath(layout.logDir, 'write');
+    const existing = readText(file);
+    if (existing != null && !existing.includes(HOST_MARK)) throw new OpError('refused', `${file} was not written by the panel; refusing to overwrite it`);
+    const warnings = [];
+    const docrootState = ensureHostDocroot(docroot, h.hostname, h.panelPort);
+    fs.mkdirSync(appsDir, { recursive: true, mode: 0o755 });
+    const certPresent = exists(cert.fullchain) && exists(cert.key);
+    const ssl = h.sslPort && certPresent ? cert : null;
+    if (h.sslPort && !certPresent) warnings.push({ code: 'certificate_missing', message: `No Apache service certificate under ${HOST_VHOST.certDir}; https://${h.hostname}/ is served once one is installed (Manage Service SSL Certificates or AutoSSL for the hostname).` });
+    const phpSocket = h.php ? wwwPoolSocket() : null;
+    if (h.php && !phpSocket) warnings.push({ code: 'php_missing', message: 'No PHP-FPM www pool socket was found; PHP applications under the hostname site are not executed.' });
+    const content = renderHostVhost({ ...h, docroot, appsDir, logDir: layout.logDir, acmeRoot: HOST_VHOST.acmeRoot, phpSocket, ssl, ownAddress: hostHasAddress });
+    const base = { hostname: h.hostname, path: file, link: layout.link, docroot, docrootCreated: docrootState.created, indexWritten: docrootState.indexWritten, appsDir, phpSocket, ssl: Boolean(ssl), certificate: { ...cert, present: certPresent }, bytes: Buffer.byteLength(content), warnings };
+    if (existing === content && (!layout.link || exists(layout.link))) return { ...base, changed: false, validated: null, reloaded: false, unit: null };
+    const written = await writeApacheFile(apache, file, content, { link: layout.link });
+    const reload = h.reload ? await reloadUnit(apache.units) : { reloaded: false, unit: null };
+    return { ...base, changed: true, validated: written.validated, output: written.output, ...reload };
+  },
+});
+
+defineOp('web.host.status', {
+  description: 'The server-hostname site: file, enabled state, metadata, service certificate presence, www pool socket and the published applications',
+  run: async (_args, ctx) => {
+    const cert = hostCertPaths();
+    ctx.assertAllowedPath(HOST_VHOST.docroot, 'read');
+    const certificate = { ...cert, present: exists(cert.fullchain) && exists(cert.key) };
+    const apache = apacheLayout();
+    if (!apache) return { installed: false, exists: false, enabled: false, managed: false, hostname: null, meta: null, ssl: false, certificate, docroot: HOST_VHOST.docroot, docrootExists: isDirectory(HOST_VHOST.docroot), phpSocket: wwwPoolSocket(), appsDir: null, apps: [] };
+    const layout = hostLayout(apache);
+    const file = ctx.assertAllowedPath(layout.file, 'read');
+    const appsDir = ctx.assertAllowedPath(layout.appsDir, 'read');
+    const text = readText(file);
+    const meta = parseHostMeta(text);
+    return {
+      installed: Boolean(apache.bin), flavor: apache.flavor, path: file, link: layout.link, exists: text != null, managed: text != null && text.includes(HOST_MARK), enabled: layout.link ? exists(layout.link) : text != null,
+      hostname: meta?.hostname ?? null, meta, ssl: Boolean(meta?.ssl), certificate, docroot: meta?.docroot ?? HOST_VHOST.docroot, docrootExists: isDirectory(meta?.docroot ?? HOST_VHOST.docroot), phpSocket: wwwPoolSocket(), appsDir, apps: listHostApps(appsDir),
+    };
+  },
+});
+
+defineOp('web.host.remove', {
+  description: 'Remove the server-hostname site file and its sites-enabled link (published application drop-ins are kept), then reload',
+  destructive: true,
+  schema: z.object({ reload: z.boolean().default(true) }).strict(),
+  run: async ({ reload }, ctx) => {
+    const apache = requireApache();
+    const layout = hostLayout(apache);
+    const file = ctx.assertAllowedPath(layout.file, 'write');
+    const text = readText(file);
+    if (text != null && !text.includes(HOST_MARK)) throw new OpError('refused', `${file} was not written by the panel; refusing to delete it`);
+    if (layout.link) { try { fs.unlinkSync(layout.link); } catch { /* none */ } }
+    let removed = false;
+    if (text != null) { fs.unlinkSync(file); removed = true; dropLegacyBackup(file); }
+    const test = await configtest(apache);
+    const result = reload && removed ? await reloadUnit(apache.units) : { reloaded: false, unit: null };
+    return { path: file, removed, validated: test.ok, ...result };
+  },
+});
+
+defineOp('web.host.app.write', {
+  description: 'Publish a web application under the server-hostname site from a structured spec (Alias + Directory rendered by the agent) as keel-host.d/<name>.conf, validate with configtest (rolled back on error) and reload',
+  schema: hostAppSchema,
+  run: async (a, ctx) => {
+    const root = ctx.assertAllowedPath(a.root, 'read');
+    const apache = requireApache();
+    const layout = hostLayout(apache);
+    const appsDir = ctx.assertAllowedPath(layout.appsDir, 'write');
+    const file = ctx.assertAllowedPath(path.join(appsDir, `${a.name}.conf`), 'write');
+    if (!isDirectory(root)) throw new OpError('not_found', `${root} does not exist or is not a directory`);
+    const previous = readText(file);
+    if (previous != null && !previous.includes(HOST_APP_MARK)) throw new OpError('refused', `${file} was not written by the panel; refusing to overwrite it`);
+    const warnings = [];
+    const phpSocket = a.php ? wwwPoolSocket() : null;
+    if (a.php && !phpSocket) warnings.push({ code: 'php_missing', message: 'No PHP-FPM www pool socket was found; the application is published without a PHP handler.' });
+    const vhostPresent = hostVhostPresent(layout);
+    if (!vhostPresent) warnings.push({ code: 'hostname_vhost_missing', message: `${layout.file} is absent or disabled, so ${appsDir}/${a.name}.conf is not loaded until the hostname site exists.` });
+    fs.mkdirSync(appsDir, { recursive: true, mode: 0o755 });
+    const content = renderHostApp({ ...a, root, phpSocket });
+    const alias = parseHostMeta(content, HOST_APP_MARK).alias;
+    const base = { name: a.name, alias, root, path: file, phpSocket, vhostPresent, bytes: Buffer.byteLength(content), warnings };
+    if (previous === content) return { ...base, changed: false, validated: null, reloaded: false, unit: null };
+    const written = await writeApacheFile(apache, file, content);
+    const reload = a.reload ? await reloadUnit(apache.units) : { reloaded: false, unit: null };
+    return { ...base, changed: true, validated: written.validated, output: written.output, ...reload };
+  },
+});
+
+defineOp('web.host.app.remove', {
+  description: 'Unpublish a web application from the server-hostname site (remove keel-host.d/<name>.conf) and reload',
+  destructive: true,
+  schema: z.object({ name: hostAppName, reload: z.boolean().default(true) }).strict(),
+  run: async ({ name, reload }, ctx) => {
+    const apache = requireApache();
+    const layout = hostLayout(apache);
+    const file = ctx.assertAllowedPath(path.join(layout.appsDir, `${name}.conf`), 'write');
+    const text = readText(file);
+    if (text != null && !text.includes(HOST_APP_MARK)) throw new OpError('refused', `${file} was not written by the panel; refusing to delete it`);
+    let removed = false;
+    if (text != null) { fs.unlinkSync(file); removed = true; dropLegacyBackup(file); }
+    const test = removed ? await configtest(apache) : { ok: null };
+    const result = reload && removed ? await reloadUnit(apache.units) : { reloaded: false, unit: null };
+    return { name, path: file, removed, validated: test.ok, ...result };
+  },
+});
+
+defineOp('web.host.app.list', {
+  description: 'Applications published under the server-hostname site (keel-host.d/*.conf with their spec metadata)',
+  run: async (_args, ctx) => {
+    const apache = apacheLayout();
+    if (!apache) return { installed: false, appsDir: null, vhostPresent: false, apps: [] };
+    const layout = hostLayout(apache);
+    const appsDir = ctx.assertAllowedPath(layout.appsDir, 'read');
+    return { installed: Boolean(apache.bin), appsDir, vhostPresent: hostVhostPresent(layout), apps: listHostApps(appsDir) };
+  },
+});
+
 // ------------------------------------------------------------ global include ---
 
 defineOp('web.global.read', {

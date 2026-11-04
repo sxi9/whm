@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import rateLimit from 'express-rate-limit';
 import { validate, z, fields } from '../lib/validate.js';
 import { requireAuth } from '../middleware/auth.js';
 import { issueCsrfToken } from '../middleware/csrf.js';
@@ -100,6 +101,32 @@ export function authRoutes(ctx) {
       await auth.disable2fa(req.user.id, req.body);
       req.audit({ action: 'auth.2fa.disable', target: req.user.username, args: { via: req.body.code ? 'code' : 'password' } });
       res.json({ data: { enabled: false } });
+    } catch (err) { next(err); }
+  });
+
+  // Forgot-password for account users (customer panel, ctx.panel.recovery).
+  // Public; the browser fetches /csrf first like any session-less mutation.
+  // The request answers 202 whatever happened, so it cannot be used to
+  // enumerate logins; the limiter mirrors the login one.
+  const recovery = () => ctx.panel?.recovery || null;
+  const resetLimiter = rateLimit({ windowMs: ctx.config.loginRateLimit.windowMs, limit: ctx.config.loginRateLimit.max, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: { code: 'rate_limited', message: 'Too many password reset attempts, please wait' } } });
+  const resetRequestBody = z.object({ username: fields.username.optional(), email: fields.email.optional() }).strict()
+    .refine((b) => Boolean(b.username) !== Boolean(b.email), 'Enter your username or your e-mail address');
+  const resetConfirmBody = z.object({ token: z.string().regex(/^[A-Za-z0-9_-]{32,128}$/, 'Malformed reset token'), password: fields.password }).strict();
+
+  r.get('/reset', (_req, res) => res.json({ data: { enabled: Boolean(recovery()?.available()) } }));
+  r.post('/reset/request', resetLimiter, validate({ body: resetRequestBody }), async (req, res, next) => {
+    try {
+      const rc = recovery();
+      if (rc) await rc.request(req.body, req);
+      res.status(202).json({ data: { accepted: true } });
+    } catch (err) { next(err); }
+  });
+  r.post('/reset/confirm', resetLimiter, validate({ body: resetConfirmBody }), async (req, res, next) => {
+    try {
+      const rc = recovery();
+      if (!rc) throw notFound('Password reset');
+      res.json({ data: await rc.confirm(req.body, req) });
     } catch (err) { next(err); }
   });
 

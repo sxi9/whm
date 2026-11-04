@@ -1209,6 +1209,42 @@ export function createSecurityCenterService(ctx) {
         for (const f of await ctx.panelEmail.advisorFindings()) add(f);
       });
 
+      // Spam settings saved by account users only act in a content-scanning
+      // Exim build with spamd running; a light build passes the capability
+      // check and ignores the `spam =` condition without a word.
+      await probe('panel.spam', 'account-panel spam filtering', async () => {
+        if (!settings.get('panel.enabled') || typeof ctx.panelEmail?.spamStatus !== 'function') return;
+        const st = await ctx.panelEmail.spamStatus();
+        if (!st.configuredAccounts) return;
+        const fix = { label: 'Exim Configuration Manager', path: '/service-configuration/exim-configuration-manager' };
+        if (st.available) add({ id: 'panel.spam.scanning', grade: 'ok', title: `Spam filtering for ${st.configuredAccounts} account${st.configuredAccounts === 1 ? '' : 's'} is active (content-scanning Exim, spamd running)` });
+        else if (st.reason === 'exim_no_content_scan') add({ id: 'panel.spam.scanning', grade: 'warning', title: `Exim has no content scanning while ${st.configuredAccounts} account${st.configuredAccounts === 1 ? ' has' : 's have'} spam settings`, detail: st.detail, fix });
+        else add({ id: 'panel.spam.scanning', grade: 'warning', title: `Spam settings of ${st.configuredAccounts} account${st.configuredAccounts === 1 ? '' : 's'} are not applied (${String(st.reason || 'unavailable').replace(/_/g, ' ')})`, detail: st.detail, fix: st.reason === 'spamd_not_running' ? { label: 'Spamd Startup Configuration', path: '/email/spamd-startup-configuration' } : fix });
+      });
+
+      await probe('hostname.site', 'server hostname site', async () => {
+        if (!capabilities.has('apache') || typeof ctx.web?.hostname?.status !== 'function') return;
+        const st = await ctx.web.hostname.status();
+        if (!st.fqdn) return;
+        const fix = { label: 'Manage Service SSL Certificates', path: '/service-configuration/manage-service-ssl-certificates' };
+        if (!st.exists || !st.enabled) {
+          if (st.certificate?.present) add({ id: 'hostname.site', grade: 'warning', title: `No web site serves the server hostname ${st.hostname}`, detail: `An Apache service certificate is installed but no virtual host answers for https://${st.hostname}/, so webmail, phpMyAdmin and the mail client settings land on the first customer site with a mismatched certificate. Apply the hostname site (POST /api/service-config/hostname/apply).`, fix });
+          else add({ id: 'hostname.site', grade: 'info', title: `No web site serves the server hostname ${st.hostname}`, detail: 'Install a certificate for the hostname (AutoSSL or Manage Service SSL Certificates) and apply the hostname site so webmail and phpMyAdmin can be published under it.', fix });
+        } else if (!st.ssl) add({ id: 'hostname.site', grade: 'warning', title: `The hostname site ${st.hostname} is served without HTTPS`, detail: 'No Apache service certificate was present when the site was written. Install one for the hostname and apply the site again.', fix });
+        else if (!st.inSync) add({ id: 'hostname.site', grade: 'warning', title: `The hostname site still answers for ${st.current}, not ${st.hostname}`, detail: 'basic.hostname changed after the site was written. Apply the hostname site again.', fix });
+        else add({ id: 'hostname.site', grade: 'ok', title: `https://${st.hostname}/ is served with the hostname certificate` });
+      });
+
+      await probe('phpmyadmin.alias', 'phpMyAdmin web alias', async () => {
+        if (!capabilities.has('apache') || typeof ctx.databases?.phpmyadmin?.status !== 'function') return;
+        const st = await ctx.databases.phpmyadmin.status({ id: null, username: 'security-advisor', role: 'root' });
+        if (!st.installed) return;
+        const fix = { label: 'phpMyAdmin', path: '/database-services/phpmyadmin' };
+        if (st.globalAlias?.enabled) add({ id: 'phpmyadmin.global_alias', grade: 'warning', title: `phpMyAdmin answers on every customer web site (${st.globalAlias.urlPath})`, detail: `${st.globalAlias.path} is loaded outside any virtual host, so https://<any customer domain>${st.globalAlias.urlPath} serves the database console with that site's certificate. Publish phpMyAdmin under the server hostname; the panel then disables the global include (a2disconf phpmyadmin).`, fix });
+        else if (st.published) add({ id: 'phpmyadmin.global_alias', grade: 'ok', title: `phpMyAdmin is published only under the server hostname (${st.url || st.hostname})` });
+        else add({ id: 'phpmyadmin.global_alias', grade: 'info', title: 'phpMyAdmin is installed but not published', detail: 'No web alias serves it. Publish it under the server hostname so customers get a trusted address.', fix });
+      });
+
       await probe('filesystem', 'filesystem permissions', async () => {
         const fsScan = await op('sec.scan.filesystem', { root: settings.get('basic.home_root') || '/home', limit: 25 });
         for (const f of fsScan.sensitive) if (!f.ok) add({ id: `fs.${f.path}`, grade: 'critical', title: `${f.path} is too permissive (${f.mode})`, detail: `Expected at most ${f.maxMode}.` });

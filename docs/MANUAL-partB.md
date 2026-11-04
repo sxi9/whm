@@ -417,14 +417,34 @@ panel's own data lives in SQLite, so these pages work even when MySQL is down.
 
 #### 20.9 phpMyAdmin
 
-- **Purpose:** find or point at a phpMyAdmin installation.
-- **Who:** root or reseller reads the status; the override is root.
-- **Screen:** *Status* (installed, version, PHP available, URL); *Web server configuration* (the detected alias);
-  *URL override* (absolute `http(s)://` URL or a path on this server; blank uses the detected alias on the
-  server hostname).
-- **Server:** `GET /phpmyadmin` runs the agent's `db.phpmyadmin.detect`; `PUT /phpmyadmin` stores
-  `db.phpmyadmin.url`.
-- **Gotchas:** a protocol-relative `//host/...` value is refused so resellers cannot be sent to a foreign origin.
+- **Purpose:** find a phpMyAdmin installation and publish it under the server hostname.
+- **Who:** root or reseller reads the status; publishing and the override are root.
+- **Screen:** *Status* (installed, version, PHP available, URL); *Web server configuration* (the detected
+  files: the distribution's global alias and the panel's `keel-host.d/phpmyadmin.conf`); *URL override*
+  (absolute `http(s)://` URL or a path on this server; blank uses the published address).
+- **Server:** `GET /phpmyadmin` runs the agent's `db.phpmyadmin.detect` (install directory, version,
+  `/etc/phpmyadmin/config-db.php` from dbconfig-common, `globalAlias` = Debian's `conf-enabled/phpmyadmin.conf`
+  or any Apache `Alias` loaded outside a virtual host, `published` = the hostname-site drop-in);
+  `PUT /phpmyadmin` stores `db.phpmyadmin.url`. `GET /phpmyadmin/publish` (root) adds the hostname site's state
+  and `hints`; `POST /phpmyadmin/publish { disableGlobal?: true }` publishes through the hostname site
+  (`ctx.web.hostApps.publish({ name: 'phpmyadmin', alias: '/phpmyadmin', root, php: true, options:
+  ['+SymLinksIfOwnerMatch'], directoryIndex: ['index.php'], denyDirs: ['libraries', 'templates', 'setup'] })` — `setup/`
+  (the wizard Debian gates behind an empty htpasswd) is denied outright,
+  contract §41 — the site is written first when missing) and then runs `a2disconf phpmyadmin`
+  (`db.phpmyadmin.global_conf.disable`, Debian only; elsewhere a `global_alias_kept` warning says what to move by
+  hand); `DELETE /phpmyadmin/publish` removes the drop-in (the global include stays disabled). Audit
+  `db.phpmyadmin.publish` / `db.phpmyadmin.unpublish` next to `host_app.*`.
+- **The address the panels show:** the override if set; otherwise `https://<hostname>/phpmyadmin/` only when the
+  drop-in is published (or, before publishing, when the global alias is enabled *and* the hostname site already
+  answers with its certificate). A bare hostname, a missing hostname site or the global alias alone yield no
+  address — the account panel then says "no address yet" instead of sending customers to the first customer vhost.
+- **Security Advisor:** `phpmyadmin.global_alias` warns while the distribution's global include is enabled (the
+  console answers on every customer domain with that domain's certificate), is `ok` once only the hostname site
+  serves it, `info` when installed but unpublished.
+- **Gotchas:** a protocol-relative `//host/...` value is refused so resellers cannot be sent to a foreign origin;
+  the drop-in uses the distribution's PHP-FPM www pool (Debian's `apache.conf` only sets `open_basedir`/`upload_tmp_dir`
+  for mod_php, so neither applies under FPM — phpMyAdmin's `TempDir` stays `/var/lib/phpmyadmin/tmp`); phpMyAdmin 5
+  ignores `?pma_username=` (POST only), so there is no prefilled login.
 
 #### 20.10 Repair Databases
 
@@ -838,8 +858,16 @@ Sidebar category 25. API prefix `/api/cpanel`; the branding read endpoints are a
   uploads: logo (up to 512 KB) and favicon (up to 128 KB) with *Remove*.
 - **Server:** `PUT /branding` stores the fields; `POST /branding/:kind` takes raw image bytes
   (`image/*`), stored under `$WHM_DATA_DIR/branding/` and served with an ETag.
+- **Account panel tab (root):** the account-panel settings (MANUAL-partC appendix C.2), the *Webmail* card —
+  status of the distribution's Roundcube and *Publish webmail* / *Unpublish*, which publish it as
+  `https://<hostname>/webmail/` under the server hostname site and write the Keel block in its
+  `config.inc.php` (MANUAL-partC §6.7; `GET/POST/DELETE /api/service-config/webmail…`) — and the
+  *Log in as* history. With the panel on, the login page also offers *Forgot password?* to account users
+  (MANUAL-partC C.2; mail to the account's contact address) and *List Accounts* gains *Reset 2FA*
+  (Part A §13.1).
 - **Gotchas:** `white_label`/`custom_branding_builder` are license flags in the edition catalog, but the only
-  branding route gated on an enforcing panel is Theme Manager's `PUT /themes/config`.
+  branding route gated on an enforcing panel is Theme Manager's `PUT /themes/config`. The company name is
+  also Roundcube's `product_name` once webmail is published; publish again after renaming.
 
 #### 25.3 Manage Plugins
 
@@ -931,7 +959,9 @@ in storage are encrypted with the panel master key and every key view or downloa
   (`/etc/whm/ssl/panel.crt` / `panel.key`, `root:whmpanel 0640`; restart `whm-panel` to serve it) and on
   every service that already holds a panel-installed certificate, or, before any does, on each mail/web
   daemon present. Renewals follow the same path, so the daemons never go stale. The hub (`:7443`) is
-  not covered.
+  not covered. The Apache copy also (re)writes the **server hostname site** (`keel-host.conf`, Part A
+  §7.11) so `https://<hostname>/` answers with this certificate; the install result carries
+  `hostnameSite`.
 - **Gotchas:** before `www.<domain>` is added to an order it is resolved; a name with no address record,
   or one pointing at another host, is left out (the run log says why) so the first order does not fail
   validation and count against the CA's rate limits.

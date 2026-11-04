@@ -3,7 +3,8 @@ import { validate, z, fields } from '../lib/validate.js';
 import { requireRoot, requireReseller, isRoot } from '../middleware/rbac.js';
 import { notFound } from '../lib/errors.js';
 
-export function systemRoutes({ system, serviceManager, jobs, scheduler, settings, audit }) {
+export function systemRoutes(ctx) {
+  const { system, serviceManager, jobs, scheduler, settings, audit, logger } = ctx;
   const r = Router();
   const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res)).then((data) => data !== undefined && res.json(data?.meta ? data : { data })).catch(next);
   // A reseller follows the jobs it started and nothing else: another
@@ -63,7 +64,13 @@ export function systemRoutes({ system, serviceManager, jobs, scheduler, settings
 
   // Settings (Basic Setup, Tweak Settings, ...) -----------------------------------
   r.get('/settings', requireRoot, validate({ query: z.object({ prefix: z.string().regex(/^[a-z0-9_.]{0,40}$/).default('') }) }), wrap((req) => settings.getPrefix(req.query.prefix)));
-  r.put('/settings', requireRoot, validate({ body: z.record(z.string().regex(/^[a-z0-9_.]{1,60}$/), z.any()) }), wrap((req) => { settings.setMany(req.body); req.audit({ action: 'settings.update', args: req.body }); return settings.getPrefix(''); }));
+  r.put('/settings', requireRoot, validate({ body: z.record(z.string().regex(/^[a-z0-9_.]{1,60}$/), z.any()) }), wrap(async (req) => {
+    settings.setMany(req.body);
+    req.audit({ action: 'settings.update', args: req.body });
+    // A new server hostname re-renders the hostname site (service-configuration, contract §41); never a reason to fail the save.
+    if ('basic.hostname' in req.body && typeof ctx.web?.hostname?.ensure === 'function') await ctx.web.hostname.ensure(req).catch((err) => logger?.warn({ err }, 'settings: hostname site refresh failed'));
+    return settings.getPrefix('');
+  }));
 
   // Audit log --------------------------------------------------------------------
   r.get('/audit', requireRoot, validate({ query: z.object({ page: fields.page, pageSize: fields.pageSize, q: z.string().max(200).optional(), principal: z.string().max(64).optional(), action: z.string().max(80).optional(), result: z.string().max(20).optional(), sort: z.string().optional(), dir: fields.sortDir.optional() }) }),

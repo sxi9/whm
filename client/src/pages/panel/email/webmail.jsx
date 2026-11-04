@@ -18,7 +18,7 @@ export function WebmailCard({ info, onRetry }) {
     return (
       <Card>
         <EmptyState icon={MailOpen} title="Webmail is not set up on this server">
-          <p>No webmail application is installed yet, so mail can only be read with a mail app. Ask your hosting provider to enable webmail.</p>
+          <p>{info.installed ? `${info.flavor || 'A webmail application'} is installed but not published yet, so mail can only be read with a mail app. Ask your hosting provider to publish webmail.` : 'No webmail application is installed yet, so mail can only be read with a mail app. Ask your hosting provider to enable webmail.'}</p>
           <p className="muted">Use the connection settings under <Link to="/panel/email/accounts">Email accounts</Link> to set up your mail app.</p>
           {onRetry && <p><button className="btn btn-sm" onClick={onRetry}>Re-check</button></p>}
         </EmptyState>

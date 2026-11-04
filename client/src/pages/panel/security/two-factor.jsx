@@ -101,7 +101,7 @@ export default function TwoFactor({ fn }) {
         <Card title="How it works">
           <KeyValue items={[
             ['At sign-in', 'Password first, then the current code from your app'],
-            ['If you lose the app', 'Your hosting provider can reset the second factor after checking who you are'],
+            ['If you lose the app', 'Your hosting provider can reset the second factor from its console (List Accounts › Reset 2FA) after checking who you are; you then sign in with your password and enrol again'],
             ['API tokens', 'Scripts keep working; tokens do not ask for a code'],
             ['Administrators', 'Cannot change this setting while logged in as you'],
           ]} />

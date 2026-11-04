@@ -16,6 +16,8 @@ export const LOCAL_PART = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 export const SPECIAL_DESTINATIONS = [':fail:', ':blackhole:'];
 export const DEFAULT_ACTIONS = ['fail', 'blackhole', 'forward'];
 export const SYSTEM_ROOT = Object.freeze({ id: null, username: 'panel', role: 'root' });
+// Mirrors fields.password in lib/validate.js (zod's min has no public getter).
+export const PASSWORD_MIN_LENGTH = 8;
 
 const MB = 1024 * 1024;
 
@@ -211,6 +213,31 @@ export function createPanelEmailService(ctx) {
     if (r && r.ok === false) throw unprocessable(`The password is too weak (strength ${r.score}, minimum ${r.minimum})`, { password: [`Strength ${r.score} is below the required ${r.minimum}`] });
   }
 
+  // What a mailbox password must satisfy, so the forms show the server's rule:
+  // the route's length floor (fields.password) and Security Center's effective
+  // minimum for the `email` context (security.password.strength.email, else
+  // security.min_password_strength).
+  function passwordPolicy() {
+    const fn = ctx.security?.passwordStrength;
+    const minStrength = typeof fn === 'function' ? Number(fn('', 'email')?.minimum) || 0 : 0;
+    return { context: 'email', minLength: PASSWORD_MIN_LENGTH, minStrength };
+  }
+
+  // The service certificate the mail daemons present, so the Connect sheet can
+  // name what a mail app will see; one agent read per minute at most.
+  let serviceCertMemo = { at: 0, value: null };
+  async function mailCertificate(host) {
+    if (typeof ctx.ssl?.serviceCertStatus !== 'function') return null;
+    if (!serviceCertMemo.value || Date.now() - serviceCertMemo.at > 60_000) {
+      let rows = [];
+      try { rows = await ctx.ssl.serviceCertStatus(); } catch (err) { logger.debug({ err }, 'panel-email: service certificate status unavailable'); }
+      serviceCertMemo = { at: Date.now(), value: rows };
+    }
+    const pick = (service) => serviceCertMemo.value.find((r) => r.service === service);
+    const shape = (r) => (r?.hasCertificate && r.certificate ? { name: r.certificate.commonName ?? null, sans: r.certificate.sans ?? [], issuer: r.certificate.issuerOrganization ?? r.certificate.issuerCommonName ?? null, selfSigned: Boolean(r.certificate.selfSigned), notAfter: r.certificate.notAfter ?? null, matchesHostname: [r.certificate.commonName, ...(r.certificate.sans || [])].filter(Boolean).includes(host) } : null);
+    return { dovecot: shape(pick('dovecot')), exim: shape(pick('exim')) };
+  }
+
   // Mirrors what Exim Configuration Manager renders into daemon_smtp_ports:
   // without the submission ports only 25 with STARTTLS listens, 465 exists only
   // with the Exim TLS preset, and SMTP AUTH only once the virtual-mail wiring
@@ -218,9 +245,10 @@ export function createPanelEmailService(ctx) {
   function smtpSettings(host) {
     const ex = ctx.web?.exim?.settings?.() || {};
     const auth = virtualMailLive() ? 'password' : null;
-    if (!ex.submissionPorts) return { host, port: 25, ssl: false, starttls: true, alternative: null, auth, submissionPorts: false };
-    if (!ex.tls) return { host, port: 587, ssl: false, starttls: true, alternative: null, auth, submissionPorts: true };
-    return { host, port: 465, ssl: true, alternative: { port: 587, starttls: true }, auth, submissionPorts: true };
+    const ports = (enabled, tls) => ({ enabled, port465: enabled && tls, port587: enabled });
+    if (!ex.submissionPorts) return { host, port: 25, ssl: false, starttls: true, alternative: null, auth, submissionPorts: false, ports: ports(false, false) };
+    if (!ex.tls) return { host, port: 587, ssl: false, starttls: true, alternative: null, auth, submissionPorts: true, ports: ports(true, false) };
+    return { host, port: 465, ssl: true, alternative: { port: 587, starttls: true }, auth, submissionPorts: true, ports: ports(true, true) };
   }
 
   const shapeMailbox = (row, usage = null) => ({
@@ -268,9 +296,11 @@ export function createPanelEmailService(ctx) {
       const withUsage = query.usage !== false;
       const data = await Promise.all(page.data.map(async (row) => shapeMailbox(row, withUsage ? await mailboxUsage(scope, row) : null)));
       const limit = limitOf(scope, 'max_email');
+      // The wiring warning also matters before the first mailbox exists: the
+      // empty state tells the customer what a new mailbox will and will not do.
       const warnings = [];
-      if (data.length) virtualMailWarning(warnings);
-      return { data, meta: { ...page.meta, limits: { max_email: limit }, used: stmts.mailboxCount.get(scope.accountId).n, domains: domainNames(scope), defaultQuotaMb: Number(settings.get('panel.mail.default_quota_mb') ?? 1024), warnings } };
+      virtualMailWarning(warnings);
+      return { data, meta: { ...page.meta, limits: { max_email: limit }, used: stmts.mailboxCount.get(scope.accountId).n, domains: domainNames(scope), defaultQuotaMb: Number(settings.get('panel.mail.default_quota_mb') ?? 1024), passwordPolicy: passwordPolicy(), warnings } };
     },
 
     async get(scope, id) {
@@ -360,7 +390,7 @@ export function createPanelEmailService(ctx) {
       return { id: row.id, address: `${row.local_part}@${row.domain}`, removed: true, mailRemoved };
     },
 
-    clientSettings(scope, id) {
+    async clientSettings(scope, id) {
       assertFeature(scope, 'emailaccts');
       const row = loadMailbox(scope, id);
       const ms = ctx.web?.mailserver?.settings?.() || {};
@@ -369,11 +399,17 @@ export function createPanelEmailService(ctx) {
       const tls = ms.ssl !== 'no';
       const plainAllowed = ms.ssl === 'no' || ms.disablePlaintextAuth === false;
       const srv = (securePort, plainPort) => ({ host, port: securePort, ssl: true, alternative: tls ? { port: plainPort, starttls: true, plainAllowed } : { port: plainPort, starttls: false, plainAllowed: true } });
+      const warnings = [];
+      virtualMailWarning(warnings);
       return {
         address: `${row.local_part}@${row.domain}`, username: `${row.local_part}@${row.domain}`, hostname: host,
         imap: protocols.includes('imap') ? srv(993, 143) : null,
         pop3: protocols.includes('pop3') ? srv(995, 110) : null,
         smtp: smtpSettings(host),
+        certificate: await mailCertificate(host),
+        virtualMailLive: virtualMailLive(),
+        warnings,
+        passwordPolicy: passwordPolicy(),
         webmail: settings.get('panel.webmail_url') || null,
       };
     },
@@ -621,15 +657,42 @@ export function createPanelEmailService(ctx) {
     return entries;
   }
 
+  // Whether saved spam settings take effect on this host (ctx.web.spamScanning:
+  // content-scanning Exim build + running spamd); without service-configuration
+  // only the SpamAssassin binary is known.
+  async function spamAvailability({ fresh = false } = {}) {
+    if (typeof ctx.web?.spamScanning === 'function') {
+      try { return await ctx.web.spamScanning({ fresh }); } catch (err) { logger.debug({ err }, 'panel-email: spam scanning status unavailable'); }
+    }
+    const installed = capabilities.has('spamassassin');
+    return { available: installed, reason: installed ? null : 'spamd_missing', detail: installed ? null : 'SpamAssassin is not installed on this server, so incoming mail is not scored.', exim: null, spamd: { installed, active: null, unit: null } };
+  }
+
+  // Seam for the Security Advisor (security-center): the host state plus how
+  // many accounts have saved settings that depend on it.
+  async function spamStatus() {
+    const st = await spamAvailability();
+    return { ...st, configuredAccounts: stmts.spamAll.all().length };
+  }
+
   const spam = {
-    get(scope) {
+    async get(scope) {
       assertFeature(scope, 'spamassassin');
-      return { ...shapeSpam(stmts.spam.get(scope.accountId)), available: capabilities.has('spamassassin') };
+      const st = await spamAvailability();
+      return { ...shapeSpam(stmts.spam.get(scope.accountId)), available: st.available, reason: st.reason, detail: st.detail, exim: st.exim, spamd: st.spamd };
     },
 
     async set(scope, input, req) {
       assertFeature(scope, 'spamassassin');
       capabilities.require('spamassassin', 'SpamAssassin is not installed on this server, so spam settings cannot be applied yet');
+      // Settings that cannot take effect are refused rather than stored as if
+      // they filtered anything: a missing build is an install prompt (501), a
+      // stopped daemon an operator action (422).
+      const st = await spamAvailability({ fresh: true });
+      if (!st.available) {
+        if (st.reason === 'spamd_not_running') throw new HttpError(422, 'spamd_not_running', st.detail);
+        throw new CapabilityError(st.reason === 'spamd_missing' ? 'spamassassin' : 'exim', st.detail);
+      }
       const before = stmts.spam.get(scope.accountId);
       const current = shapeSpam(before);
       const next = {
@@ -661,17 +724,39 @@ export function createPanelEmailService(ctx) {
   const requireMail = () => { if (!ctx.mail?.deliverability) throw new HttpError(503, 'service_unavailable', 'The Email category is not loaded'); return ctx.mail; };
   const requireDns = () => { if (!ctx.dns) throw new HttpError(503, 'service_unavailable', 'The DNS category is not loaded'); return ctx.dns; };
 
+  // Public DNS may be delegated elsewhere (ctx.panelDns.delegation): the
+  // records are then handed back to copy instead of written into BIND, which
+  // nobody would read. `records` names where each suggested record goes.
+  const delegationOf = async (domain) => (typeof ctx.panelDns?.delegationOrNull === 'function' ? ctx.panelDns.delegationOrNull(domain) : null);
+  const RECORD_NAMES = { spf: (domain) => domain, dkim: (domain, item) => `${item.selector || 'default'}._domainkey.${domain}`, dmarc: (domain) => `_dmarc.${domain}` };
+  const copyRecords = (status) => (status?.items || [])
+    .filter((i) => RECORD_NAMES[i.id] && i.expected)
+    .map((i) => ({ id: i.id, name: RECORD_NAMES[i.id](status.domain, i), type: 'TXT', value: i.expected, status: i.status }));
+  const withDelegation = (status, delegation) => ({ ...status, delegation, records: copyRecords(status) });
+
   const deliverability = {
     async check(scope, domain) {
       const d = assertDomain(scope, domain);
-      return requireMail().deliverability.check(d.domain, scope.ownerPrincipal);
+      const [status, delegation] = await Promise.all([requireMail().deliverability.check(d.domain, scope.ownerPrincipal), delegationOf(d.domain)]);
+      return withDelegation(status, delegation);
     },
     async fix(scope, domain, { items }, req) {
       const d = assertDomain(scope, domain);
       if (!stmts.zoneOwned.get(d.domain, scope.accountId)) throw notFound(`DNS zone for "${d.domain}"`);
+      const delegation = await delegationOf(d.domain);
+      if (delegation?.delegatedHere === false) {
+        const status = withDelegation(await requireMail().deliverability.check(d.domain, scope.ownerPrincipal), delegation);
+        const results = Object.fromEntries(items.map((item) => {
+          const record = status.records.find((r) => r.id === item) || null;
+          if (record) return [item, { ok: true, applied: false, reason: 'not_delegated', record }];
+          return [item, { ok: false, error: item === 'dkim' ? 'Generate the DKIM key first; its record then appears here to copy' : `No ${item.toUpperCase()} record could be suggested` }];
+        }));
+        audit(req, scope, 'panel.email.deliverability.fix', { domain: d.domain, items, delegatedHere: false, written: false });
+        return { domain: d.domain, applied: false, reason: 'not_delegated', delegation, records: status.records, results, status };
+      }
       const result = await requireMail().deliverability.fix(d.domain, items, scope.ownerPrincipal, req);
-      audit(req, scope, 'panel.email.deliverability.fix', { domain: d.domain, items });
-      return result;
+      audit(req, scope, 'panel.email.deliverability.fix', { domain: d.domain, items, delegatedHere: delegation?.delegatedHere ?? null });
+      return { ...result, applied: true, delegation, status: withDelegation(result.status, delegation) };
     },
   };
 
@@ -708,10 +793,27 @@ export function createPanelEmailService(ctx) {
     return value;
   }
 
+  // The operator's panel.webmail_url wins; otherwise the alias the agent found
+  // (the Keel drop-in under the hostname site, or a distro fragment) under the
+  // FQDN hostname the site and its certificate carry. Invalidated after a
+  // publish/unpublish by the next detection (60 s) at most.
+  function webmailUrlFrom(detected) {
+    const configured = String(settings.get('panel.webmail_url') || '').trim();
+    if (configured) return { url: configured, configuredUrl: configured, alias: null, published: false };
+    const alias = detected.published?.alias ?? detected.apacheAlias ?? null;
+    const host = ctx.web?.hostname?.hostname?.() || hostname();
+    const url = detected.installed && alias ? `https://${host}${alias.replace(/\/?$/, '/')}` : null;
+    return { url, configuredUrl: null, alias, published: Boolean(url) };
+  }
+
+  // The panel home's quick link: the same URL the Webmail page shows, with no scope needed.
+  async function webmailUrl() {
+    return webmailUrlFrom(await detectWebmail()).url;
+  }
+
   async function webmail(scope, query = {}) {
     const detected = await detectWebmail();
-    const configured = String(settings.get('panel.webmail_url') || '').trim();
-    const url = configured || (detected.installed && detected.apacheAlias ? `https://${hostname()}${detected.apacheAlias.replace(/\/?$/, '/')}` : null);
+    const { url, configuredUrl: configured, alias, published } = webmailUrlFrom(detected);
     let prefillUser = null;
     if (query.user) {
       const { localPart, domain } = splitAddress(query.user);
@@ -719,7 +821,7 @@ export function createPanelEmailService(ctx) {
       if (d && stmts.mailboxByAddress.get(domain, localPart, scope.accountId)) prefillUser = `${localPart}@${domain}`;
     }
     if (!prefillUser) { const first = stmts.mailboxesOf.get(scope.accountId); prefillUser = first ? `${first.local_part}@${first.domain}` : null; }
-    return { installed: Boolean(detected.installed), flavor: detected.flavor ?? null, version: detected.version ?? null, url, configuredUrl: configured || null, prefillUser, hostname: hostname() };
+    return { installed: Boolean(detected.installed), flavor: detected.flavor ?? null, version: detected.version ?? null, url, configuredUrl: configured || null, alias, published, prefillUser, hostname: hostname() };
   }
 
   // ---------------------------------------------------------------- usage ---
@@ -959,7 +1061,7 @@ export function createPanelEmailService(ctx) {
   return {
     LOCAL_PART, SYSTEM_ROOT,
     domainsOf, assertDomain, assertDomainClean, ensureMailDomain, releaseDomain, subscribe,
-    accounts, forwarders, defaultAddress, domainForward, autoresponders, spam, deliverability, dkim, webmail, usage,
-    ensureVirtualMail, renderCheck, advisorFindings, virtualMailLive, requestVirtualMail, VIRTUAL_MAIL_JOB,
+    accounts, forwarders, defaultAddress, domainForward, autoresponders, spam, deliverability, dkim, webmail, webmailUrl, usage,
+    ensureVirtualMail, renderCheck, advisorFindings, virtualMailLive, requestVirtualMail, VIRTUAL_MAIL_JOB, spamStatus, passwordPolicy,
   };
 }

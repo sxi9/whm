@@ -394,6 +394,17 @@ export function createNetworkingSetupService(ctx) {
       settings.set('basic.hostname', fqdn);
       steps.push({ step: 'settings', ok: true, detail: 'basic.hostname updated' });
 
+      // The hostname site (contract §41) must follow every basic.hostname change,
+      // not only a certificate reissue; like routes/system.js it never fails the change.
+      if (typeof ctx.web?.hostname?.ensure === 'function') {
+        try {
+          const r = await ctx.web.hostname.ensure(req);
+          steps.push({ step: 'hostname_site', ok: true, detail: r.written ? (r.changed ? 'hostname site rewritten' : 'hostname site unchanged') : (r.warnings?.[0]?.message || 'skipped') });
+        } catch (err) {
+          steps.push({ step: 'hostname_site', ok: false, error: err.message, code: err.code ?? null });
+        }
+      }
+
       steps.push(await refreshServiceCerts(fqdn, reissueServiceCerts, req));
 
       if (addDnsRecord) {

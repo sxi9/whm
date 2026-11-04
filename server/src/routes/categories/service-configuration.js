@@ -117,6 +117,16 @@ export async function register(ctx) {
   r.get('/virtual-mail', requireRoot, wrap(() => w().virtualMail.status()));
   r.post('/virtual-mail/apply', requireRoot, validate({ body: virtualMailBody }), wrap((req) => w().applyVirtualMail(req.body, req)));
 
+  // Server hostname site (contract §41): https://<hostname>/ with the Apache service certificate; webmail/phpMyAdmin publish under it
+  r.get('/hostname', requireRoot, wrap(() => w().hostname.status()));
+  r.post('/hostname/apply', requireRoot, validate({ body: z.object({ reload: z.boolean().default(true) }).strict() }), wrap((req) => w().hostname.ensure(req, { reload: req.body.reload, strict: true })));
+  r.get('/host-apps', requireRoot, wrap(() => w().hostApps.list()));
+
+  // Webmail (Phase 8 P0-1): Roundcube published as /webmail under the hostname site + its Keel config block
+  r.get('/webmail', requireRoot, wrap(() => w().webmail.status()));
+  r.post('/webmail/publish', requireRoot, validate({ body: z.object({ reload: z.boolean().default(true) }).strict() }), wrap((req) => w().webmail.publish(req, { reload: req.body.reload })));
+  r.delete('/webmail', requireRoot, wrap((req) => w().webmail.unpublish(req)));
+
   // FTP Server Selection (+ daemon settings)
   r.get('/ftp', requireRoot, wrap(() => w().ftp.get()));
   r.put('/ftp/server', requireRoot, validate({ body: z.object({ server: z.enum(FTP_SERVERS), install: z.boolean().default(false) }).strict() }), accepted((req) => w().ftp.select(req.body, req.user, req)));

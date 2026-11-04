@@ -6,8 +6,9 @@ import { DataTable } from '../../../components/DataTable.jsx';
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { PanelPage, PendingPill } from '../../../panel/PanelPage.jsx';
-import { usePanelApi, panelApi } from '../../../panel/hooks/usePanel.js';
+import { usePanelApi, usePanelMe, panelApi } from '../../../panel/hooks/usePanel.js';
 import { PANEL_FUNCTION_BY_KEY } from '../../../panel/nav.js';
+import { DelegationBanners } from '../../../panel/DelegationBanner.jsx';
 import { RequestError, JobProgress, ExpiryPill, StatePill, TypePill, CertificateSummary, isCapabilityError, webResult } from './parts/Shared.jsx';
 
 const INSTALL_PATH = PANEL_FUNCTION_BY_KEY['panel:ssl/install']?.path || '/panel/ssl/install';
@@ -59,6 +60,12 @@ export default function SslStatus({ fn }) {
   const confirm = useConfirm();
   const navigate = useNavigate();
   const { data, error, loading, refetch } = usePanelApi('/ssl/domains');
+  const { me } = usePanelMe();
+  // Where each hostname's public DNS lives (from /domains): a certificate can only
+  // be issued once the name resolves to this server from the outside.
+  const hostnames = usePanelApi('/domains');
+  const delegated = hostnames.data || [];
+  const addressRecords = (d) => [d.domain, ...(d.type === 'main' || d.type === 'addon' ? [`www.${d.domain}`] : [])].flatMap((name) => [...(me?.account?.ip ? [{ name, type: 'A', value: me.account.ip }] : []), ...(me?.account?.ipv6 ? [{ name, type: 'AAAA', value: me.account.ipv6 }] : [])]);
   const [q, setQ] = useState('');
   const [details, setDetails] = useState(null);
   const [job, setJob] = useState(null);
@@ -132,6 +139,8 @@ export default function SslStatus({ fn }) {
               </div>
             </div>
           )}
+
+          <DelegationBanners domains={delegated} recordsFor={addressRecords} title="Certificates need the name to resolve to this server" />
 
           {issueError && <RequestError error={issueError} onRetry={() => setIssueError(null)} />}
 

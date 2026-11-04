@@ -8,6 +8,11 @@ import { useToast } from '../../../components/Toast.jsx';
 import { PanelPage, PendingPill } from '../../../panel/PanelPage.jsx';
 import { usePanelApi, panelApi } from '../../../panel/hooks/usePanel.js';
 import { PanelRequestError, MutationError, useAccountDomains } from './parts/Shared.jsx';
+import { DelegationBanner, managedAt, notDelegatedHere } from '../../../panel/DelegationBanner.jsx';
+
+// The records a report says are still to be published: what the banner lists
+// when the domain's DNS is managed elsewhere.
+export const pendingRecords = (report) => (report?.records || []).filter((r) => r.status !== 'ok');
 
 const TONE = { ok: 'ok', warning: 'warning', missing: 'failed', unknown: 'unknown' };
 const STATUS_TEXT = { ok: 'OK', warning: 'Needs attention', missing: 'Missing', unknown: 'Unknown' };
@@ -25,6 +30,7 @@ export function scoreTone(score) {
 }
 
 export function DeliverabilityTable({ report, onFix, busy, pending }) {
+  const elsewhere = notDelegatedHere(report.delegation);
   return (
     <div className="table-wrap">
       <table>
@@ -41,7 +47,8 @@ export function DeliverabilityTable({ report, onFix, busy, pending }) {
               <td>{i.current.length ? i.current.map((c) => <div key={c}><code style={{ wordBreak: 'break-all' }}>{c}</code></div>) : <span className="muted">None</span>}{i.detail && <div className="muted" style={{ marginTop: 4 }}>{i.detail}</div>}{i.signing === false && i.signingHint && <div className="muted" style={{ marginTop: 4 }}>{i.signingHint}</div>}</td>
               <td>{i.expected ? <code style={{ wordBreak: 'break-all' }}>{i.expected}</code> : <span className="muted">—</span>}</td>
               <td className="actions-col">
-                {i.fixable && i.status !== 'ok' && report.zone && <Button size="sm" variant="primary" loading={busy} onClick={() => onFix([i.id])}>Fix</Button>}
+                {i.fixable && i.status !== 'ok' && report.zone && !elsewhere && <Button size="sm" variant="primary" loading={busy} onClick={() => onFix([i.id])}>Fix</Button>}
+                {i.fixable && i.status !== 'ok' && report.zone && elsewhere && (i.expected ? <span className="muted">Copy to {managedAt(report.delegation)}</span> : i.id === 'dkim' ? <Button size="sm" loading={busy} onClick={() => onFix([i.id])}>Prepare record</Button> : null)}
                 {i.id === 'ptr' && i.status !== 'ok' && <span className="muted">Ask your provider</span>}
               </td>
             </tr>
@@ -111,15 +118,21 @@ function DomainReport({ domain }) {
   const [mutationError, setMutationError] = useState(null);
   const [pending, setPending] = useState({});
   const [dkimKey, setDkimKey] = useState(0);
+  const elsewhere = notDelegatedHere(data?.delegation);
   const fix = async (items) => {
     const names = items.map((i) => i.toUpperCase()).join(', ');
-    if (!(await confirm({ title: `Create the ${names} record${items.length > 1 ? 's' : ''}?`, message: `The suggested record${items.length > 1 ? 's are' : ' is'} written into the DNS zone of ${domain} and published. An existing SPF or DMARC record is replaced; DKIM generates a key when none exists.`, confirmLabel: 'Fix' }))) return;
+    const question = elsewhere
+      ? { title: `Prepare the ${names} record${items.length > 1 ? 's' : ''}?`, message: `DNS for ${domain} is managed at ${managedAt(data.delegation)}, so nothing is written here: the record${items.length > 1 ? 's are' : ' is'} shown for you to add there. DKIM generates a key when none exists.`, confirmLabel: 'Prepare' }
+      : { title: `Create the ${names} record${items.length > 1 ? 's' : ''}?`, message: `The suggested record${items.length > 1 ? 's are' : ' is'} written into the DNS zone of ${domain} and published. An existing SPF or DMARC record is replaced; DKIM generates a key when none exists.`, confirmLabel: 'Fix' };
+    if (!(await confirm(question))) return;
     setBusy(true); setMutationError(null);
     try {
       const { data: res } = await panelApi.post(`/email/deliverability/${domain}/fix`, { items });
       const failed = Object.entries(res.results).filter(([, r]) => !r.ok);
-      const waiting = Object.entries(res.results).filter(([, r]) => r.ok && r.applied === false);
+      const copy = Object.entries(res.results).filter(([, r]) => r.ok && r.reason === 'not_delegated');
+      const waiting = Object.entries(res.results).filter(([, r]) => r.ok && r.applied === false && r.reason !== 'not_delegated');
       if (failed.length) toast.warning(failed.map(([k, r]) => `${k.toUpperCase()}: ${r.error}`).join('; '));
+      else if (copy.length) toast.warning(`${copy.map(([k]) => k.toUpperCase()).join(', ')}: not published from here — add the record${copy.length > 1 ? 's' : ''} at ${managedAt(res.delegation)}`);
       else if (waiting.length) toast.info(`${waiting.map(([k]) => k.toUpperCase()).join(', ')} saved; publishing waits for the DNS server`);
       else toast.success(`${names} created and published`);
       setPending((p) => ({ ...p, ...Object.fromEntries(waiting.map(([k, r]) => [k, r])) }));
@@ -132,7 +145,7 @@ function DomainReport({ domain }) {
   return (
     <>
       <Card title={domain} subtitle={data ? `Checked ${formatDate(data.checkedAt)}` : 'Looking up SPF, DKIM, DMARC, MX and reverse DNS…'} padded={false}
-        actions={<><Button size="sm" icon={RefreshCw} onClick={() => refetch()} loading={loading && Boolean(data)}>Re-check</Button>{fixable.length > 0 && data?.zone && <Button size="sm" variant="primary" loading={busy} onClick={() => fix(fixable)}>Fix all ({fixable.map((f) => f.toUpperCase()).join(', ')})</Button>}</>}>
+        actions={<><Button size="sm" icon={RefreshCw} onClick={() => refetch()} loading={loading && Boolean(data)}>Re-check</Button>{fixable.length > 0 && data?.zone && !elsewhere && <Button size="sm" variant="primary" loading={busy} onClick={() => fix(fixable)}>Fix all ({fixable.map((f) => f.toUpperCase()).join(', ')})</Button>}</>}>
         <div className="card-body">
           <PanelRequestError error={error} onRetry={refetch} />
           <MutationError error={mutationError} />
@@ -145,6 +158,7 @@ function DomainReport({ domain }) {
                 <div className="stat"><div className="label">DNS hosted here</div><div className="value" style={{ fontSize: 17 }}>{data.zone ? 'Yes' : 'No'}</div></div>
               </div>
               {!data.zone && <div className="banner banner-info" style={{ marginTop: 12 }}><Info size={18} /><div>The DNS of this domain is not hosted on this server, so records can only be suggested here. Add them at your DNS provider.</div></div>}
+              <div style={{ marginTop: 12 }}><DelegationBanner domain={domain} delegation={data.delegation} records={pendingRecords(data)} title="Mail records are not published from here" /></div>
             </>
           )}
         </div>

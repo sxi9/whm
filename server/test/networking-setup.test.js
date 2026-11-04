@@ -278,7 +278,9 @@ describe('Networking Setup API', () => {
     const res = await post('/api/networking/hostname', { hostname: 'new.example.com', addDnsRecord: false }).expect(200);
     const { data } = res.body;
     expect(data).toMatchObject({ ok: true, hostname: 'new.example.com', previous: 'old.example.com', ip: '10.0.0.5', restartHint: ['exim', 'imap', 'httpd'] });
-    expect(data.steps.map((s) => [s.step, s.ok])).toEqual([['hostname', true], ['hosts', true], ['settings', true], ['certs', true]]);
+    expect(data.steps.map((s) => [s.step, s.ok])).toEqual([['hostname', true], ['hosts', true], ['settings', true], ['hostname_site', true], ['certs', true]]);
+    // No Apache in the test app: the hostname site reports why it was skipped instead of failing the change.
+    expect(data.steps.find((s) => s.step === 'hostname_site').detail).toMatch(/Apache is not installed/);
     expect(data.steps.find((s) => s.step === 'certs')).toMatchObject({ reissued: [], manual: [], failed: [] });
     expect(app.agent.callsTo('sys.hostname.set')[0].args).toEqual({ hostname: 'new.example.com' });
     const write = app.agent.callsTo('fs.write_file')[0];
@@ -311,6 +313,26 @@ describe('Networking Setup API', () => {
     expect(failed.steps.find((s) => s.step === 'hosts')).toMatchObject({ ok: false, code: 'path_not_allowed' });
     expect(app.ctx.settings.get('basic.hostname')).toBe('b.example.com');
     app.agent.set('fs.write_file', ({ path, content }) => { files[path] = content; return { path, bytes: content.length }; });
+  });
+
+  it('POST /hostname re-renders the hostname site after the setting changed, with the reissue off too, and a failure there is a step, not an error', async () => {
+    const ensured = [];
+    const original = app.ctx.web.hostname;
+    app.ctx.web.hostname = { ...original, ensure: async (req) => { ensured.push({ hostname: app.ctx.settings.get('basic.hostname'), hasReq: Boolean(req) }); return { hostname: 'j.example.com', written: true, changed: true, reloaded: true, warnings: [] }; } };
+    try {
+      const { data } = (await post('/api/networking/hostname', { hostname: 'j.example.com', reissueServiceCerts: false, addDnsRecord: false }).expect(200)).body;
+      expect(data.ok).toBe(true);
+      expect(ensured).toEqual([{ hostname: 'j.example.com', hasReq: true }]);
+      expect(data.steps.map((s) => s.step)).toEqual(['hostname', 'hosts', 'settings', 'hostname_site', 'certs']);
+      expect(data.steps.find((s) => s.step === 'hostname_site')).toMatchObject({ ok: true, detail: 'hostname site rewritten' });
+
+      app.ctx.web.hostname = { ...original, ensure: async () => { throw Object.assign(new Error('apachectl rejected keel-host.conf'), { code: 'config_invalid' }); } };
+      const failed = (await post('/api/networking/hostname', { hostname: 'k.example.com', reissueServiceCerts: false }).expect(200)).body.data;
+      expect(failed.ok).toBe(false);
+      expect(failed.steps.find((s) => s.step === 'hostname_site')).toMatchObject({ ok: false, code: 'config_invalid', error: 'apachectl rejected keel-host.conf' });
+      expect(hostname).toBe('k.example.com');
+      expect(app.ctx.settings.get('basic.hostname')).toBe('k.example.com');
+    } finally { app.ctx.web.hostname = original; }
   });
 
   it('POST /hostname re-issues self-signed service certificates that name the old host and reports CA-issued ones', async () => {

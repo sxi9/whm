@@ -248,6 +248,25 @@ describe('Customer panel: domains', () => {
       expect(row('SELECT type FROM web_vhosts WHERE domain = ?', 'blog.alice.com')).toEqual({ type: 'sub' });
     });
 
+    it('hands back the A record to copy when the parent\'s public DNS is managed elsewhere', async () => {
+      const cloud = { 'alice.com': ['ns1.cloud.example.'], 'ns1.cloud.example': ['198.51.100.9'] };
+      app.agent.set('dns.resolve', ({ name, type }) => ({ name, type, servers: [], answers: (type === 'NS' && name === 'alice.com') || (type === 'A' && name === 'ns1.cloud.example') ? cloud[name] : [], error: null }));
+      try {
+        await app.ctx.panelDns.delegation('alice.com', { fresh: true });
+        const res = await alice.post('/domains/sub', { label: 'away', parent: 'alice.com' });
+        expect(res.status, JSON.stringify(res.body)).toBe(201);
+        expect(res.body.data.dns).toMatchObject({ zone: 'alice.com', applied: true, delegation: { delegatedHere: false, delegatedNs: ['ns1.cloud.example'] }, records: [{ name: 'away.alice.com', type: 'A', value: '203.0.113.5' }] });
+        expect(res.body.meta.warnings.some((w) => w.includes('managed at ns1.cloud.example') && w.includes('away.alice.com A 203.0.113.5'))).toBe(true);
+        const list = await alice.get('/domains').expect(200);
+        expect(list.body.data.find((d) => d.domain === 'alice.com').delegation).toMatchObject({ delegatedHere: false });
+        expect(row("SELECT args_redacted FROM audit_log WHERE action = 'panel.domains.sub.add' AND args_redacted LIKE '%away.alice.com%'").args_redacted).toContain('"delegatedHere":false');
+      } finally {
+        app.agent.reset('dns.resolve');
+        await app.ctx.panelDns.delegation('alice.com', { fresh: true });
+        await alice.del('/domains/sub/away.alice.com').expect(200);
+      }
+    });
+
     it('opens the docroot to "other" only when the capability layer knows no web server', async () => {
       expect(app.ctx.capabilities.has('apache') || app.ctx.capabilities.has('nginx')).toBe(false);
       app.agent.fail('web.detect', 'capability_missing', 'no web server');

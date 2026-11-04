@@ -8,9 +8,18 @@ import { useToast } from '../../../components/Toast.jsx';
 import { PanelPage, PanelCapabilityState, FeatureDisabledState } from '../../../panel/PanelPage.jsx';
 import { usePanelMe, panelApi } from '../../../panel/hooks/usePanel.js';
 import { useDomains, useFeatureGate, limitReached, usageText, LimitNotice, RequestError, VhostPill, SslPill, DocrootCode, AppliedPill, CreateResult, RemoveDomainModal } from './parts/shared.jsx';
+import { DelegationBanner, managedAt, notDelegatedHere } from '../../../panel/DelegationBanner.jsx';
 
-export function AddonForm({ open, onClose, onCreated }) {
-  const [form, setForm] = useState({ domain: '', docroot: '', createZone: true });
+// The zone toggle defaults off when the account's main domain is not delegated
+// to this server: its DNS is evidently published elsewhere, and a zone here
+// would only look like it worked.
+export function defaultCreateZone(rows) {
+  const main = (rows || []).find((r) => r.type === 'main');
+  return !notDelegatedHere(main?.delegation);
+}
+
+export function AddonForm({ open, onClose, onCreated, createZoneDefault = true, mainDomain = null }) {
+  const [form, setForm] = useState({ domain: '', docroot: '', createZone: createZoneDefault });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const set = (k) => (v) => setForm((f) => ({ ...f, [k]: v }));
@@ -33,7 +42,7 @@ export function AddonForm({ open, onClose, onCreated }) {
         <Field label="Document root" help={`Folder under public_html; blank uses public_html/${form.domain.trim().toLowerCase() || '<domain>'}`} error={error?.fields?.docroot}>
           <TextInput value={form.docroot} onChange={set('docroot')} placeholder={form.domain.trim().toLowerCase() || 'example.org'} spellCheck={false} />
         </Field>
-        <Toggle checked={form.createZone} onChange={set('createZone')} label="Create a DNS zone" description="Standard A, MX and SPF records for the new domain. Turn off when DNS is hosted elsewhere." />
+        <Toggle checked={form.createZone} onChange={set('createZone')} label="Create a DNS zone" description={createZoneDefault ? 'Standard A, MX and SPF records for the new domain. Turn off when DNS is hosted elsewhere.' : `Off because DNS for ${mainDomain ? `${mainDomain.domain} is managed at ${managedAt(mainDomain.delegation)}` : 'your main domain is managed elsewhere'}; turn on only when the new domain's nameservers point at this server.`} />
       </form>
     </Modal>
   );
@@ -51,6 +60,8 @@ export default function AddonDomains({ fn }) {
 
   const homeDir = me?.account?.homeDir;
   const addons = rows.filter((r) => r.type === 'addon');
+  const main = rows.find((r) => r.type === 'main') || null;
+  const zoneDefault = defaultCreateZone(rows);
   const count = counts?.addon ?? addons.length;
   const limit = limits?.max_addons ?? null;
   const full = limitReached(count, limit);
@@ -81,6 +92,7 @@ export default function AddonDomains({ fn }) {
   return (
     <PanelPage fn={fn} actions={<Button variant="primary" icon={Plus} onClick={() => setAdding(true)} disabled={full}>Add addon domain</Button>}>
       <LimitNotice count={count} limit={limit} noun="addon domains" />
+      {last && <DelegationBanner domain={last.data.domain} delegation={last.data.delegation} records={last.data.records} title={`${last.data.domain} is not published from here`} />}
       {last && (
         <CreateResult title={`${last.data.domain} is set up`} warnings={last.warnings} onDismiss={() => setLast(null)} items={[
           ['Document root', <DocrootCode key="d" docroot={last.data.docroot} homeDir={homeDir} />],
@@ -96,7 +108,7 @@ export default function AddonDomains({ fn }) {
           rowKey={(r) => r.domain}
           rowActions={(r) => [{ label: 'Remove', primary: true, danger: true, onClick: () => setRemoving(r) }]} />
       </Card>
-      {adding && <AddonForm open onClose={() => setAdding(false)} onCreated={onCreated} />}
+      {adding && <AddonForm open onClose={() => setAdding(false)} onCreated={onCreated} createZoneDefault={zoneDefault} mainDomain={zoneDefault ? null : main} />}
       {removing && (
         <RemoveDomainModal open domain={removing.domain} title={`Remove ${removing.domain}?`} onClose={() => setRemoving(null)} onConfirm={remove} options={[
           { key: 'removeZone', label: 'Delete its DNS zone', description: 'The records of this domain on this server are removed.', default: true },

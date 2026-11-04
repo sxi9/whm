@@ -9,6 +9,7 @@ import {
   ftpSettingsFrom, parseServerStatus, parseApacheVersion, parseModules, parseDoveconf, rewriteListen, apacheLayout, eximLayout, phpLayout, SERVICE_ROLES, hintsFor, ensureRootLogDir, confPath, parseEximVersion,
   mergeEximBlock, readEximBlock, stripEximBlock, eximTlsLibrary, primaryGroupName, EXIM_SENTINEL_MACRO, DOVECOT_INCLUDES, EXIM_VMAIL, FTP_VIRTUAL, dovecotLayout,
   pureFtpdAuthLink, createPureFtpdAuthLink, PURE_FTPD_AUTH_LINK,
+  renderHostVhost, renderHostApp, renderHostIndex, parseHostMeta, wwwPoolSocket, hostCertPaths, HOST_VHOST,
 } from '../src/ops/web.js';
 
 // Fake host for the layout detection: which paths exist, what they contain, which binaries resolve.
@@ -573,5 +574,165 @@ describe('renderers produce the expected daemon syntax', () => {
     expect(Array.isArray(v.vhosts)).toBe(true);
     const e = await runOp('web.exim.detect', {}, ctx);
     expect(typeof e.installed).toBe('boolean');
+  });
+});
+
+// The server-hostname site (contract §41): keel-host.conf + keel-host.d/<app>.conf.
+describe('server hostname site', () => {
+  const HOST = { hostname: 'nova.example.com', docroot: '/var/www/keel-host', appsDir: '/etc/apache2/keel-host.d', logDir: '/var/log/apache2', acmeRoot: '/var/www/html', phpSocket: '/run/php/php8.5-fpm.sock', ssl: hostCertPaths(), port: 80, sslPort: 443, panelPort: 2087 };
+  const APP = { name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true };
+
+  it('renders :80 (ACME passthrough + redirect) and :443 with the service certificate, the www pool handler and the drop-in include', () => {
+    const text = renderHostVhost(HOST);
+    expect(text.startsWith('# Managed by Keel (server hostname site nova.example.com)')).toBe(true);
+    expect(parseHostMeta(text)).toMatchObject({ hostname: 'nova.example.com', docroot: '/var/www/keel-host', ssl: true, phpSocket: '/run/php/php8.5-fpm.sock', port: 80, sslPort: 443, panelPort: 2087 });
+    expect(text).toContain('<VirtualHost *:80>');
+    expect(text).toContain('<IfModule ssl_module>\n<VirtualHost *:443>');
+    expect(text.match(/ServerName nova\.example\.com/g)).toHaveLength(2);
+    expect(text).toContain('Alias "/.well-known/acme-challenge/" "/var/www/html/.well-known/acme-challenge/"');
+    expect(text).toContain('RedirectMatch 301 "^/(?!\\.well-known/acme-challenge/)(.*)$" "https://nova.example.com/$1"');
+    expect(text).toContain('SSLCertificateFile "/etc/ssl/whm/service/apache/fullchain.pem"');
+    expect(text).toContain('SSLCertificateKeyFile "/etc/ssl/whm/service/apache/key.pem"');
+    expect(text.match(/SetHandler "proxy:unix:\/run\/php\/php8\.5-fpm\.sock\|fcgi:\/\/localhost"/g)).toHaveLength(2);
+    expect(text.match(/IncludeOptional "\/etc\/apache2\/keel-host\.d\/\*\.conf"/g)).toHaveLength(2);
+    expect(text).toContain('CustomLog "/var/log/apache2/keel-host-ssl-access.log" combined');
+    expect(text).toContain('AllowOverride None');
+    expect(text).toContain('UserDir disabled');
+    // Deterministic: the same spec renders byte-identical, which is what makes web.host.ensure idempotent.
+    expect(renderHostVhost(HOST)).toBe(text);
+  });
+
+  it('without a certificate: plain :80, no redirect, no TLS block; without PHP: no handler; bind pins the address', () => {
+    const plain = renderHostVhost({ ...HOST, ssl: null, phpSocket: null });
+    expect(plain).not.toContain('RedirectMatch');
+    expect(plain).not.toContain('SSLEngine');
+    expect(plain).not.toContain('SetHandler');
+    expect(plain).toContain('Alias "/.well-known/acme-challenge/"');
+    expect(parseHostMeta(plain)).toMatchObject({ ssl: false, sslPort: null, phpSocket: null });
+    const noTls = renderHostVhost({ ...HOST, sslPort: null });
+    expect(noTls).not.toContain('<VirtualHost *:443>');
+    expect(noTls).not.toContain('RedirectMatch');
+    const bound = renderHostVhost({ ...HOST, bind: '127.0.0.1', port: 8080, sslPort: 8443 });
+    expect(bound).toContain('<VirtualHost 127.0.0.1:8080>');
+    expect(bound).toContain('<VirtualHost 127.0.0.1:8443>');
+    expect(renderHostVhost({ ...HOST, bind: '::1' })).toContain('<VirtualHost [::1]:80>');
+  });
+
+  it('binds both blocks to every account IP the host holds plus the wildcard, so IP-bound customer vhosts never shadow the hostname site', () => {
+    const held = new Set(['203.0.113.5', '2001:db8::5']);
+    const ips = ['203.0.113.5', '203.0.113.5', '198.51.100.9', '2001:db8::5'];
+    const text = renderHostVhost({ ...HOST, ips, ownAddress: (ip) => held.has(ip) });
+    expect(text).toContain('<VirtualHost 203.0.113.5:80 [2001:db8::5]:80 *:80>');
+    expect(text).toContain('<IfModule ssl_module>\n<VirtualHost 203.0.113.5:443 [2001:db8::5]:443 *:443>');
+    expect(text).not.toContain('198.51.100.9');
+    expect(parseHostMeta(text)).toMatchObject({ bind: null, ips: ['203.0.113.5', '2001:db8::5'] });
+    expect(renderHostVhost({ ...HOST, ips, ownAddress: (ip) => held.has(ip) })).toBe(text);
+    // Behind NAT none of the account IPs is on an interface: wildcard only, as before.
+    const nat = renderHostVhost({ ...HOST, ips, ownAddress: () => false });
+    expect(nat).toContain('<VirtualHost *:80>');
+    expect(nat).toContain('<VirtualHost *:443>');
+    expect(parseHostMeta(nat).ips).toEqual([]);
+    // An explicit bind address still wins over the account list.
+    const bound = renderHostVhost({ ...HOST, ips, bind: '127.0.0.1', ownAddress: () => true });
+    expect(bound).toContain('<VirtualHost 127.0.0.1:80>');
+    expect(bound).not.toContain('203.0.113.5');
+    expect(parseHostMeta(bound)).toMatchObject({ bind: '127.0.0.1', ips: [] });
+    expect(renderHostVhost({ ...HOST, ips: [] })).toContain('<VirtualHost *:80>');
+  });
+
+  it('the landing page links the panel and the account panel on the panel port only', () => {
+    const html = renderHostIndex('nova.example.com', 2087);
+    expect(html).toContain('<title>nova.example.com</title>');
+    expect(html).toContain('href="https://nova.example.com:2087/panel"');
+    expect(html).toContain('href="https://nova.example.com:2087/"');
+    expect(html).toContain('<meta name="robots" content="noindex">');
+    expect(html).not.toContain('<script');
+  });
+
+  it('renders an application drop-in from the structured spec only', () => {
+    const text = renderHostApp({ ...APP, phpSocket: '/run/php/php8.5-fpm.sock', access: 'all', allowFrom: [], options: ['-Indexes', '+FollowSymLinks'], allowOverride: 'None', denyDirs: ['config', 'temp', 'logs'] });
+    expect(text.startsWith('# Managed by Keel (server hostname site: application "webmail")')).toBe(true);
+    expect(parseHostMeta(text, '# keel-host-app ')).toMatchObject({ name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, phpSocket: '/run/php/php8.5-fpm.sock', denyDirs: ['config', 'temp', 'logs'] });
+    expect(text).toContain('Alias "/webmail" "/var/lib/roundcube/public_html"');
+    expect(text).toContain('<Directory "/var/lib/roundcube/public_html">\n  Options -Indexes +FollowSymLinks\n  AllowOverride None\n  Require all granted');
+    expect(text).toContain('SetHandler "proxy:unix:/run/php/php8.5-fpm.sock|fcgi://localhost"');
+    expect(text).toContain('<Directory "/var/lib/roundcube/public_html/config">\n  Require all denied\n</Directory>');
+    expect(text).toContain('<Directory "/var/lib/roundcube/public_html/temp">\n  Require all denied');
+    // Trailing slash on the alias is dropped (Alias /webmail/ would not match /webmail).
+    expect(renderHostApp({ ...APP, alias: '/webmail/', phpSocket: null, access: 'all', allowFrom: [], options: ['None'], allowOverride: 'None', denyDirs: [] })).toContain('Alias "/webmail" "/var/lib/roundcube/public_html"');
+    // Access variants, DirectoryIndex, AllowOverride and php:false (PHP files are refused, no handler).
+    const local = renderHostApp({ ...APP, php: false, phpSocket: '/run/php/php8.5-fpm.sock', access: 'local', allowFrom: [], options: ['None'], directoryIndex: ['index.php', 'index.html'], allowOverride: 'All', denyDirs: [] });
+    expect(local).toContain('  Require local\n');
+    expect(local).toContain('  DirectoryIndex index.php index.html\n');
+    expect(local).toContain('  AllowOverride All\n');
+    expect(local).not.toContain('SetHandler');
+    expect(local).toContain('<FilesMatch "\\.ph(ar|p|tml)$">\n    Require all denied');
+    const list = renderHostApp({ ...APP, phpSocket: null, access: 'list', allowFrom: ['203.0.113.0/24', '2001:db8::1'], options: ['None'], allowOverride: 'None', denyDirs: [] });
+    expect(list).toContain('  Require ip 203.0.113.0/24 2001:db8::1\n');
+    expect(list).not.toContain('Require all granted');
+  });
+
+  it('refuses every injection into the application spec before anything runs', async () => {
+    exec.mockClear();
+    const bad = [
+      { ...APP, name: '../evil' }, { ...APP, name: 'Web Mail' }, { ...APP, name: 'webmail;id' }, { ...APP, name: '-x' }, { ...APP, name: '' }, { ...APP, name: 'a'.repeat(33) },
+      { ...APP, alias: 'webmail' }, { ...APP, alias: '/' }, { ...APP, alias: '/web mail' }, { ...APP, alias: '/webmail"\nAlias /x /etc' }, { ...APP, alias: '/web/../mail' }, { ...APP, alias: '/webmail?x=1' }, { ...APP, alias: '/webmail#' },
+      { ...APP, root: 'relative/path' }, { ...APP, root: '/var/lib/roundcube/../../etc' }, { ...APP, root: '/var/lib/round cube' }, { ...APP, root: '/var/lib/roundcube"\n</Directory>\n<Directory /' }, { ...APP, root: '/var/lib/roundcube\0' }, { ...APP, root: '/var/lib/roundcube:x' },
+      { ...APP, php: 'yes' }, { ...APP, access: 'everyone' }, { ...APP, access: 'all granted' }, { ...APP, access: 'list' }, { ...APP, access: 'list', allowFrom: ['203.0.113.0/24 all'] }, { ...APP, access: 'list', allowFrom: ['203.0.113.5/33'] }, { ...APP, access: 'list', allowFrom: ['2001:db8::/129'] }, { ...APP, access: 'list', allowFrom: ['localhost'] }, { ...APP, allowFrom: ['10.0.0.0/8\nRequire all granted'] },
+      { ...APP, options: ['Indexes'] }, { ...APP, options: ['+ExecCGI'] }, { ...APP, options: ['+Includes'] }, { ...APP, options: [] }, { ...APP, options: '+FollowSymLinks' },
+      { ...APP, directoryIndex: ['index.php; id'] }, { ...APP, directoryIndex: ['../index.php'] }, { ...APP, directoryIndex: ['a b'] },
+      { ...APP, allowOverride: 'None Options=All' }, { ...APP, allowOverride: 'all' },
+      { ...APP, denyDirs: ['..'] }, { ...APP, denyDirs: ['.'] }, { ...APP, denyDirs: ['config/../..'] }, { ...APP, denyDirs: ['con fig'] }, { ...APP, denyDirs: ['x"\n<Directory /'] },
+      { ...APP, reload: 'yes' }, { ...APP, extra: true }, { ...APP, content: 'Alias / /' },
+    ];
+    for (const args of bad) expect((await opError(runOp('web.host.app.write', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
+    for (const name of ['../x', 'UPPER', 'a b', 'x;y', '']) expect((await opError(runOp('web.host.app.remove', { name }, ctx))).code, name).toBe('invalid_args');
+    expect((await opError(runOp('web.host.app.remove', { name: 'webmail', force: true }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('web.host.app.list', { dir: '/etc' }, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('refuses every injection into the hostname site spec before anything runs', async () => {
+    exec.mockClear();
+    const ok = { hostname: 'nova.example.com' };
+    const bad = [
+      { hostname: 'nova' }, { hostname: 'Nova.Example.com' }, { hostname: 'nova.example.com; id' }, { hostname: '-nova.example.com' }, { hostname: 'nova.example.com\nServerAlias evil' }, {},
+      { ...ok, docroot: 'relative' }, { ...ok, docroot: '/var/www/../../etc' }, { ...ok, docroot: '/var/www/keel host' }, { ...ok, docroot: '/var/www/x"\nAlias / /' },
+      { ...ok, port: 0 }, { ...ok, port: '80' }, { ...ok, sslPort: 70000 }, { ...ok, bind: 'localhost' }, { ...ok, bind: '127.0.0.1:443' },
+      { ...ok, ips: '203.0.113.5' }, { ...ok, ips: ['203.0.113.5:80'] }, { ...ok, ips: ['*'] }, { ...ok, ips: ['203.0.113.5 *'] }, { ...ok, ips: ['203.0.113.5\nServerAlias x'] }, { ...ok, ips: Array.from({ length: 65 }, (_, i) => `203.0.113.${i % 200}`) },
+      { ...ok, php: 'www' }, { ...ok, panelPort: 0 }, { ...ok, serverAdmin: 'root' }, { ...ok, serverAdmin: 'a@b.c\nServerAlias x' }, { ...ok, reload: 1 }, { ...ok, ssl: { cert: '/etc/ssl/whm/x.pem' } }, { ...ok, certDir: '/etc/ssl' }, { ...ok, appsDir: '/etc' },
+    ];
+    for (const args of bad) expect((await opError(runOp('web.host.ensure', args, ctx))).code, JSON.stringify(args)).toBe('invalid_args');
+    expect((await opError(runOp('web.host.remove', { name: 'keel-host' }, ctx))).code).toBe('invalid_args');
+    expect((await opError(runOp('web.host.status', { path: '/etc' }, ctx))).code).toBe('invalid_args');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('pins paths to the allowed roots before Apache is even consulted', async () => {
+    exec.mockClear();
+    // The application root is read by Apache, so it must sit under an allowed root (distro webmail/phpMyAdmin trees are listed).
+    expect((await opError(runOp('web.host.app.write', { ...APP, root: '/etc/shadow' }, ctx))).code).toBe('path_not_allowed');
+    expect((await opError(runOp('web.host.app.write', { ...APP, root: '/root/.bash_history' }, ctx))).code).toBe('path_not_allowed');
+    expect((await opError(runOp('web.host.app.write', { ...APP, root: '/usr/share/doc' }, ctx))).code).toBe('path_not_allowed');
+    expect((await opError(runOp('web.host.ensure', { hostname: 'nova.example.com', docroot: '/etc/apache2x' }, ctx))).code).toBe('path_not_allowed');
+    expect((await opError(runOp('web.host.ensure', { hostname: 'nova.example.com', docroot: '/srv/www' }, ctx))).code).toBe('path_not_allowed');
+    // A context without the web roots refuses even the defaults.
+    const narrow = createContext({ allowedRoots: ['/home'] });
+    expect((await opError(runOp('web.host.ensure', { hostname: 'nova.example.com' }, narrow))).code).toBe('path_not_allowed');
+    expect((await opError(runOp('web.host.app.write', APP, narrow))).code).toBe('path_not_allowed');
+    expect((await opError(runOp('web.host.status', {}, narrow))).code).toBe('path_not_allowed');
+    expect(exec).not.toHaveBeenCalled();
+    for (const p of ['/usr/share/roundcube', '/var/lib/roundcube/public_html', '/usr/share/phpmyadmin', '/var/www/keel-host']) expect(() => ctx.assertAllowedPath(p, 'read'), p).not.toThrow();
+  });
+
+  it('picks the distribution www pool socket, newest PHP first, never a tenant pool', () => {
+    const layout = { versions: [{ version: '8.1', flavor: 'debian', socketDir: '/run/php' }, { version: '8.5', flavor: 'debian', socketDir: '/run/php' }] };
+    const io = (present) => ({ exists: (p) => present.includes(p) });
+    expect(wwwPoolSocket(layout, io(['/run/php/php8.1-fpm.sock', '/run/php/php8.5-fpm.sock', '/run/php/php8.5-fpm-testuser.sock']))).toBe('/run/php/php8.5-fpm.sock');
+    expect(wwwPoolSocket(layout, io(['/run/php/php8.1-fpm.sock', '/run/php/php8.5-fpm-testuser.sock']))).toBe('/run/php/php8.1-fpm.sock');
+    expect(wwwPoolSocket(layout, io(['/run/php/php8.5-fpm-testuser.sock']))).toBeNull();
+    expect(wwwPoolSocket({ versions: [{ version: '8.3', flavor: 'rhel', socketDir: '/run/php-fpm' }] }, io(['/run/php-fpm/www.sock']))).toBe('/run/php-fpm/www.sock');
+    expect(wwwPoolSocket({ versions: [] }, io([]))).toBeNull();
+    expect(HOST_VHOST).toMatchObject({ name: 'keel-host', docroot: '/var/www/keel-host', certDir: '/etc/ssl/whm/service/apache' });
   });
 });

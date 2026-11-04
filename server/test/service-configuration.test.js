@@ -22,6 +22,8 @@ const dnsCandidates = () => [
   { name: 'bind', label: 'BIND (named)', binaries: ['named'], units: ['named', 'bind9'], packages: { apt: 'bind9', dnf: 'bind' }, installed: true, unitName: 'named', unit: unit('named') },
   { name: 'powerdns', label: 'PowerDNS Authoritative Server', binaries: ['pdns_server'], units: ['pdns'], packages: { apt: 'pdns-server', dnf: 'pdns' }, installed: false, unitName: null, unit: { unit: null, present: false, active: false } },
 ];
+const HOST_ENSURE = ({ hostname, reload = true }) => ({ hostname, path: '/etc/apache2/sites-available/keel-host.conf', link: '/etc/apache2/sites-enabled/keel-host.conf', docroot: '/var/www/keel-host', docrootCreated: false, indexWritten: false, appsDir: '/etc/apache2/keel-host.d', phpSocket: '/run/php/php8.5-fpm.sock', ssl: true, certificate: { fullchain: '/etc/ssl/whm/service/apache/fullchain.pem', key: '/etc/ssl/whm/service/apache/key.pem', present: true }, changed: true, validated: true, reloaded: reload, unit: reload ? 'apache2' : null, warnings: [] });
+const HOST_APP_WRITE = ({ name, alias, root, reload = true }) => ({ name, alias: alias.length > 1 ? alias.replace(/\/+$/, '') : alias, root, path: `/etc/apache2/keel-host.d/${name}.conf`, phpSocket: '/run/php/php8.5-fpm.sock', vhostPresent: true, changed: true, validated: true, reloaded: reload, unit: reload ? 'apache2' : null, warnings: [] });
 const CERT = '-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUQ\n-----END CERTIFICATE-----\n';
 const KEY = '-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49\n-----END PRIVATE KEY-----\n';
 
@@ -76,6 +78,11 @@ beforeAll(async () => {
     'web.service.select': ({ role, server }) => ({ role, server, steps: [{ unit: role === 'ftp' ? 'pure-ftpd' : 'named', action: 'disable --now', ok: true, error: null }, ...(server !== 'disabled' ? [{ unit: server === 'vsftpd' ? 'vsftpd' : server === 'bind' ? 'named' : server, action: 'enable --now', ok: true, error: null }] : [])], candidates: role === 'ftp' ? ftpCandidates(server) : dnsCandidates() }),
     'web.ftp.config.read': ({ server }) => ({ server, path: '/etc/pure-ftpd/conf/', unit: unit('pure-ftpd'), settings: { passivePortMin: 30000, passivePortMax: 35000, tls: 'optional' }, raw: { PassivePortRange: '30000 35000', TLS: '1' } }),
     'web.ftp.config.write': ({ server, settings }) => ({ server, written: server === 'pure-ftpd' ? ['/etc/pure-ftpd/conf/PassivePortRange', '/etc/pure-ftpd/conf/TLS'] : ['/etc/vsftpd.conf'], validated: null, settings, reloaded: true, unit: server, verb: 'restart' }),
+    'web.host.ensure': HOST_ENSURE,
+    'web.host.status': () => ({ installed: true, flavor: 'debian', path: '/etc/apache2/sites-available/keel-host.conf', link: '/etc/apache2/sites-enabled/keel-host.conf', exists: true, managed: true, enabled: true, hostname: 'panel.example.com', meta: { hostname: 'panel.example.com', ssl: true }, ssl: true, certificate: { fullchain: '/etc/ssl/whm/service/apache/fullchain.pem', key: '/etc/ssl/whm/service/apache/key.pem', present: true }, docroot: '/var/www/keel-host', docrootExists: true, phpSocket: '/run/php/php8.5-fpm.sock', appsDir: '/etc/apache2/keel-host.d', apps: [{ name: 'webmail', path: '/etc/apache2/keel-host.d/webmail.conf', managed: true, alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, meta: {}, mtime: '2026-11-05T00:00:00.000Z' }] }),
+    'web.host.app.write': HOST_APP_WRITE,
+    'web.host.app.remove': ({ name }) => ({ name, path: `/etc/apache2/keel-host.d/${name}.conf`, removed: true, validated: true, reloaded: true, unit: 'apache2' }),
+    'web.host.app.list': () => ({ installed: true, appsDir: '/etc/apache2/keel-host.d', vhostPresent: true, apps: [{ name: 'phpmyadmin', path: '/etc/apache2/keel-host.d/phpmyadmin.conf', managed: true, alias: '/phpmyadmin', root: '/usr/share/phpmyadmin', php: true, meta: {}, mtime: '2026-11-05T00:00:00.000Z' }, { name: 'legacy', path: '/etc/apache2/keel-host.d/legacy.conf', managed: false, alias: null, root: null, php: null, meta: null, mtime: '2026-11-05T00:00:00.000Z' }] }),
     'ssl.service_cert.status': () => ({ exim: { service: 'exim', daemonPresent: true, hasCertificate: true, paths: { dir: '/etc/ssl/whm/service/exim' }, certificate: { subjectText: 'CN=mail.example.com', issuerText: 'CN=mail.example.com', notAfter: '2027-01-01T00:00:00.000Z', daysRemaining: 400, selfSigned: true, expired: false } } }),
     'ssl.service_cert.install': ({ service }) => ({ service, paths: { dir: `/etc/ssl/whm/service/${service}` }, applied: ['/etc/dovecot/conf.d/90-whm-ssl-cert.conf'], reload: { reloaded: true, unit: 'dovecot' }, certificate: { subjectText: 'CN=mail.example.com', issuerText: 'CN=R3', notAfter: '2027-01-01T00:00:00.000Z', selfSigned: false } }),
     'ssl.key.matches': () => ({ matches: true }),
@@ -109,7 +116,7 @@ describe('module registration', () => {
   });
 
   it('every route is root-only (403 for resellers)', async () => {
-    for (const url of ['/api/service-config/status', '/api/service-config/apache', '/api/service-config/apache/vhosts', '/api/service-config/logrotate', '/api/service-config/webdisk', '/api/service-config/webservices', '/api/service-config/exim', '/api/service-config/mailserver', '/api/service-config/virtual-mail', '/api/service-config/ftp', '/api/service-config/nameserver', '/api/service-config/service-certs']) {
+    for (const url of ['/api/service-config/status', '/api/service-config/apache', '/api/service-config/apache/vhosts', '/api/service-config/logrotate', '/api/service-config/webdisk', '/api/service-config/webservices', '/api/service-config/exim', '/api/service-config/mailserver', '/api/service-config/virtual-mail', '/api/service-config/ftp', '/api/service-config/nameserver', '/api/service-config/service-certs', '/api/service-config/hostname', '/api/service-config/host-apps']) {
       const res = await reseller.get(url);
       expect(res.status, url).toBe(403);
       expect(res.body.error.code).toBe('forbidden');
@@ -118,6 +125,7 @@ describe('module registration', () => {
     expect((await mutate(reseller, 'put', '/api/service-config/exim', { rblEnabled: false }, resellerCsrf)).status).toBe(403);
     expect((await mutate(reseller, 'put', '/api/service-config/ftp/server', { server: 'vsftpd' }, resellerCsrf)).status).toBe(403);
     expect((await mutate(reseller, 'post', '/api/service-config/service-certs/exim/self-signed', {}, resellerCsrf)).status).toBe(403);
+    expect((await mutate(reseller, 'post', '/api/service-config/hostname/apply', {}, resellerCsrf)).status).toBe(403);
     expect((await mutate(reseller, 'post', '/api/service-config/apache/restart', {}, resellerCsrf)).status).toBe(403);
   });
 
@@ -944,9 +952,134 @@ describe('Manage Service SSL Certificates', () => {
   });
 });
 
+describe('server hostname site (contract §41)', () => {
+  const audits = (action) => app.ctx.db.prepare('SELECT COUNT(*) AS n FROM audit_log WHERE action = ?').get(action).n;
+
+  it('GET /hostname reports the site, its certificate, the published apps with URLs and the last apply', async () => {
+    const res = await get('/api/service-config/hostname').expect(200);
+    expect(res.body.data).toMatchObject({ hostname: 'panel.example.com', fqdn: true, apache: true, url: 'https://panel.example.com/', exists: true, enabled: true, inSync: true, ssl: true, certificate: { present: true }, docroot: '/var/www/keel-host', phpSocket: '/run/php/php8.5-fpm.sock', path: '/etc/apache2/sites-available/keel-host.conf' });
+    expect(res.body.data.panelUrl).toMatch(/^https:\/\/panel\.example\.com:\d+\/$/);
+    expect(res.body.data.apps).toEqual([expect.objectContaining({ name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, url: 'https://panel.example.com/webmail/' })]);
+  });
+
+  it('POST /hostname/apply renders the site for basic.hostname with the Apache listen ports, records and audits the apply', async () => {
+    app.agent.calls.length = 0;
+    const res = await post('/api/service-config/hostname/apply', {}).expect(200);
+    expect(res.body.data).toMatchObject({ hostname: 'panel.example.com', url: 'https://panel.example.com/', written: true, changed: true, reloaded: true, ssl: true, path: '/etc/apache2/sites-available/keel-host.conf', warnings: [] });
+    const call = app.agent.callsTo('web.host.ensure').pop().args;
+    expect(call).toMatchObject({ hostname: 'panel.example.com', port: 80, sslPort: 443, reload: true, ips: ['203.0.113.5'] });
+    expect(call.panelPort).toEqual(expect.any(Number));
+    expect(call.bind).toBeUndefined();
+    expect(audits('hostname_vhost.ensure')).toBe(1);
+    expect((await get('/api/service-config/hostname')).body.data.lastApply).toMatchObject({ ok: true, summary: { hostname: 'panel.example.com', ssl: true } });
+    // An unchanged render is not audited again; reload:false is passed through.
+    app.agent.set('web.host.ensure', ({ hostname, reload }) => ({ hostname, path: '/etc/apache2/sites-available/keel-host.conf', ssl: true, changed: false, reloaded: false, validated: null, warnings: [{ code: 'php_missing', message: 'no www pool' }] }));
+    try {
+      const again = await post('/api/service-config/hostname/apply', { reload: false }).expect(200);
+      expect(again.body.data).toMatchObject({ written: true, changed: false, reloaded: false, warnings: [{ code: 'php_missing' }] });
+      expect(app.agent.callsTo('web.host.ensure').pop().args.reload).toBe(false);
+      expect(audits('hostname_vhost.ensure')).toBe(1);
+    } finally { app.agent.set('web.host.ensure', HOST_ENSURE); }
+    expect((await post('/api/service-config/hostname/apply', { force: true })).status).toBe(422);
+  });
+
+  it('a bare hostname is reported by the hook form of ensure and refused (422) by the route; a bind address pins the listeners', async () => {
+    app.ctx.settings.set('basic.hostname', 'nova');
+    try {
+      const hook = await app.ctx.web.hostname.ensure(null);
+      expect(hook).toMatchObject({ hostname: 'nova', written: false, changed: false, warnings: [{ code: 'hostname_not_fqdn' }] });
+      const res = await post('/api/service-config/hostname/apply', {});
+      expect(res.status).toBe(422);
+      expect(res.body.error.fields.hostname).toBeDefined();
+      expect((await get('/api/service-config/hostname').expect(200)).body.data).toMatchObject({ hostname: 'nova', fqdn: false, url: null, inSync: false });
+      await expect(app.ctx.web.hostApps.publish({ name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html' }, null)).rejects.toMatchObject({ status: 422 });
+    } finally { app.ctx.settings.set('basic.hostname', 'panel.example.com'); }
+    app.ctx.settings.set('service_config.apache_ports', { http: 8080, https: 8443, bind: '127.0.0.1' });
+    try {
+      await post('/api/service-config/hostname/apply', {}).expect(200);
+      expect(app.agent.callsTo('web.host.ensure').pop().args).toMatchObject({ hostname: 'panel.example.com', port: 8080, sslPort: 8443, bind: '127.0.0.1' });
+    } finally { app.ctx.settings.set('service_config.apache_ports', null); }
+  });
+
+  it('forwards the main IPs and every account IPv4/IPv6 (validated, deduplicated) so the agent can bind the site next to the customer vhosts; a vhost sync re-ensures the site', async () => {
+    const bobId = app.ctx.db.prepare("SELECT id FROM accounts WHERE username = 'bob'").get().id;
+    app.ctx.settings.set('basic.main_ip', '198.51.100.1');
+    app.ctx.settings.set('basic.main_ipv6', '2001:DB8::1');
+    app.ctx.db.prepare("UPDATE accounts SET ip = '203.0.113.5 ' WHERE username = 'bob'").run();
+    app.ctx.db.prepare('INSERT OR IGNORE INTO ipv6_assignments (account_id, address) VALUES (?, ?)').run(bobId, '2001:db8::5');
+    app.ctx.db.prepare("INSERT INTO accounts (username, domain, owner_id, home_dir, ip) VALUES ('dave', 'dave.example.org', 1, '/home/dave', 'not-an-ip')").run();
+    try {
+      await post('/api/service-config/hostname/apply', {}).expect(200);
+      expect(app.agent.callsTo('web.host.ensure').pop().args.ips).toEqual(['198.51.100.1', '2001:db8::1', '203.0.113.5', '2001:db8::5']);
+      // Syncing an account after the site was applied renders it again without a second reload.
+      app.agent.calls.length = 0;
+      const sync = await app.ctx.web.ensureVhost('alice', null);
+      expect(sync.applied).toBe(true);
+      const names = app.agent.calls.map((c) => c.name);
+      expect(names.filter((n) => n === 'web.host.ensure')).toHaveLength(1);
+      expect(names.indexOf('web.host.ensure')).toBeGreaterThan(names.lastIndexOf('web.vhost.write'));
+      expect(app.agent.callsTo('web.host.ensure')[0].args).toMatchObject({ reload: false, ips: expect.arrayContaining(['203.0.113.5']) });
+      expect(names.filter((n) => n === 'web.reload')).toHaveLength(1);
+    } finally {
+      app.ctx.settings.set('basic.main_ip', '');
+      app.ctx.settings.set('basic.main_ipv6', '');
+      app.ctx.db.prepare("UPDATE accounts SET ip = NULL WHERE username = 'bob'").run();
+      app.ctx.db.prepare('DELETE FROM ipv6_assignments WHERE account_id = ?').run(bobId);
+      app.ctx.db.prepare("DELETE FROM accounts WHERE username = 'dave'").run();
+    }
+  });
+
+  it('an agent failure is recorded as a failed apply and surfaces as the mapped error', async () => {
+    app.agent.fail('web.host.ensure', 'config_invalid', 'Apache rejected the new configuration');
+    try {
+      const res = await post('/api/service-config/hostname/apply', {});
+      expect(res.status).toBe(422);
+      expect(res.body.error.code).toBe('config_invalid');
+      expect((await get('/api/service-config/hostname')).body.data.lastApply).toMatchObject({ ok: false, error: 'Apache rejected the new configuration' });
+    } finally { app.agent.set('web.host.ensure', HOST_ENSURE); }
+  });
+
+  it('hostApps.publish ensures the site first, writes the drop-in from the structured spec and returns the URL; unpublish and list', async () => {
+    app.agent.calls.length = 0;
+    const audited = [];
+    const req = { audit: (e) => audited.push(e) };
+    const pub = await app.ctx.web.hostApps.publish({ name: 'webmail', alias: '/webmail/', root: '/var/lib/roundcube/public_html', php: true, denyDirs: ['config', 'temp'] }, req);
+    expect(pub).toMatchObject({ name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html', url: 'https://panel.example.com/webmail/', path: '/etc/apache2/keel-host.d/webmail.conf', changed: true, reloaded: true, warnings: [] });
+    expect(app.agent.calls.map((c) => c.name).filter((n) => n.startsWith('web.host'))).toEqual(['web.host.ensure', 'web.host.app.write']);
+    expect(app.agent.callsTo('web.host.ensure')[0].args.reload).toBe(false);
+    expect(app.agent.callsTo('web.host.app.write')[0].args).toEqual({ name: 'webmail', alias: '/webmail/', root: '/var/lib/roundcube/public_html', php: true, denyDirs: ['config', 'temp'] });
+    expect(audited.map((e) => e.action)).toEqual(['hostname_vhost.ensure', 'host_app.publish']);
+    expect(audited[1]).toMatchObject({ target: 'webmail', args: { alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, changed: true, reloaded: true } });
+    // The site changed but the drop-in did not: Apache is still reloaded once so the new vhost is live.
+    app.agent.set('web.host.app.write', ({ name, alias, root }) => ({ name, alias, root, path: `/etc/apache2/keel-host.d/${name}.conf`, changed: false, reloaded: false, warnings: [] }));
+    try {
+      const same = await app.ctx.web.hostApps.publish({ name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html' }, null);
+      expect(same).toMatchObject({ changed: false, reloaded: true });
+      expect(app.agent.callsTo('web.reload')).toHaveLength(1);
+    } finally { app.agent.set('web.host.app.write', HOST_APP_WRITE); }
+    const list = await get('/api/service-config/host-apps').expect(200);
+    expect(list.body.data).toMatchObject({ installed: true, hostname: 'panel.example.com', appsDir: '/etc/apache2/keel-host.d', vhostPresent: true });
+    expect(list.body.data.apps).toEqual([expect.objectContaining({ name: 'phpmyadmin', alias: '/phpmyadmin', url: 'https://panel.example.com/phpmyadmin/', managed: true }), expect.objectContaining({ name: 'legacy', managed: false, url: null })]);
+    expect(await app.ctx.web.hostApps.list()).toMatchObject({ installed: true, hostname: 'panel.example.com' });
+    const gone = await app.ctx.web.hostApps.unpublish('webmail', req);
+    expect(gone).toMatchObject({ name: 'webmail', removed: true, reloaded: true, path: '/etc/apache2/keel-host.d/webmail.conf' });
+    expect(app.agent.callsTo('web.host.app.remove').pop().args).toEqual({ name: 'webmail' });
+    expect(audited.pop()).toMatchObject({ action: 'host_app.unpublish', target: 'webmail', args: { removed: true, reloaded: true } });
+  });
+});
+
 describe('capability-missing paths (no daemons installed)', () => {
   beforeAll(async () => { app.agent.set('web.detect', detectWith(false)); await provision(false); });
   afterAll(async () => { app.agent.set('web.detect', detectWith(true)); await provision(true); });
+
+  it('the hostname site degrades: status without Apache, 501 on apply, the hook form never throws', async () => {
+    expect((await get('/api/service-config/hostname').expect(200)).body.data).toMatchObject({ hostname: 'panel.example.com', fqdn: true, apache: false, exists: false, enabled: false, apps: [] });
+    expect((await post('/api/service-config/hostname/apply', {})).body.error).toMatchObject({ code: 'capability_missing', capability: 'apache' });
+    expect(await app.ctx.web.hostname.ensure(null)).toMatchObject({ hostname: 'panel.example.com', written: false, changed: false, reason: 'capability_missing' });
+    expect((await get('/api/service-config/host-apps').expect(200)).body.data).toMatchObject({ installed: false, apps: [] });
+    await expect(app.ctx.web.hostApps.publish({ name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html' }, null)).rejects.toMatchObject({ status: 501, capability: 'apache' });
+    await expect(app.ctx.web.hostApps.unpublish('webmail', null)).rejects.toMatchObject({ status: 501 });
+  });
 
   it('GET pages still render with installed:false', async () => {
     expect((await get('/api/service-config/apache').expect(200)).body.data.installed).toBe(false);
@@ -984,6 +1117,111 @@ describe('capability-missing paths (no daemons installed)', () => {
     await expect(app.ctx.web.applySsl('example.com', { cert: '/etc/ssl/whm/example.com/cert.pem', key: '/etc/ssl/whm/example.com/key.pem' }, null)).rejects.toMatchObject({ status: 501, capability: 'apache' });
     await expect(app.ctx.web.setRedirects('example.com', [], null)).rejects.toMatchObject({ status: 501 });
     expect(app.ctx.web.vhostFor('example.com').ssl).toMatchObject({ cert: '/etc/ssl/whm/example.com/cert.pem' });
+  });
+});
+
+describe('webmail published under the hostname site (P0-1)', () => {
+  const DETECT = { installed: true, flavor: 'roundcube', path: '/var/lib/roundcube', root: '/var/lib/roundcube/public_html', version: '1.6.11', configured: true, apacheAlias: null, published: null, globalAlias: null, config: { path: '/etc/roundcube/config.inc.php', exists: true, ok: true, managed: null } };
+  const PUBLISHED = { ...DETECT, apacheAlias: '/webmail', published: { alias: '/webmail', file: '/etc/apache2/keel-host.d/webmail.conf', managed: true, source: 'keel-host' }, config: { ...DETECT.config, managed: { imapHost: 'ssl://panel.example.com:993', smtpHost: 'tls://panel.example.com:587', productName: 'Keel' } } };
+  const CONFIG_WRITE = ({ hostname, imapScheme, imapPort, smtpScheme, smtpPort, productName }) => ({ path: '/etc/roundcube/config.inc.php', changed: true, validated: true, values: { imapHost: `${imapScheme}://${hostname}:${imapPort}`, smtpHost: `${smtpScheme}://${hostname}:${smtpPort}`, productName } });
+  const audits = (action) => app.ctx.db.prepare('SELECT COUNT(*) AS n FROM audit_log WHERE action = ?').get(action).n;
+  beforeAll(() => {
+    app.agent.set('web.webmail.detect', () => DETECT);
+    app.agent.set('web.webmail.config.write', CONFIG_WRITE);
+    app.agent.set('web.webmail.config.remove', () => ({ path: '/etc/roundcube/config.inc.php', changed: true, validated: true }));
+  });
+  afterAll(() => { for (const name of ['web.webmail.detect', 'web.webmail.config.write', 'web.webmail.config.remove']) app.agent.reset(name); });
+
+  it('routes are root-only', async () => {
+    expect((await reseller.get('/api/service-config/webmail')).status).toBe(403);
+    expect((await mutate(reseller, 'post', '/api/service-config/webmail/publish', {}, resellerCsrf)).status).toBe(403);
+    expect((await mutate(reseller, 'delete', '/api/service-config/webmail', undefined, resellerCsrf)).status).toBe(403);
+  });
+
+  it('GET /webmail reports the install, the hostname site, no publication and the expected mail hosts; detection runs the PHP lint', async () => {
+    app.agent.calls.length = 0;
+    const res = await get('/api/service-config/webmail').expect(200);
+    expect(res.body.data).toMatchObject({ installed: true, flavor: 'roundcube', version: '1.6.11', root: '/var/lib/roundcube/public_html', hostname: 'panel.example.com', fqdn: true, apache: true, site: { exists: true, enabled: true, ssl: true, inSync: true }, published: null, url: null, globalAlias: null, config: { exists: true, ok: true, managed: null, expected: { imapHost: 'ssl://panel.example.com:993', smtpHost: 'tls://panel.example.com:587', productName: 'Keel' }, inSync: false }, lastApply: null });
+    expect(app.agent.callsTo('web.webmail.detect').pop().args).toEqual({ lint: true });
+  });
+
+  it('POST /webmail/publish writes the drop-in through hostApps with the Debian web root and the Roundcube block, records and audits', async () => {
+    app.agent.calls.length = 0;
+    const res = await post('/api/service-config/webmail/publish', {}).expect(200);
+    expect(res.body.data).toMatchObject({ installed: true, flavor: 'roundcube', root: '/var/lib/roundcube/public_html', alias: '/webmail', url: 'https://panel.example.com/webmail/', path: '/etc/apache2/keel-host.d/webmail.conf', changed: true, reloaded: true, config: { path: '/etc/roundcube/config.inc.php', changed: true, validated: true, values: { imapHost: 'ssl://panel.example.com:993', smtpHost: 'tls://panel.example.com:587', productName: 'Keel' } }, warnings: [] });
+    expect(app.agent.calls.map((c) => c.name).filter((n) => /^web\.(host|webmail)/.test(n))).toEqual(['web.webmail.detect', 'web.host.ensure', 'web.host.app.write', 'web.webmail.config.write']);
+    // Debian's own fragment relies on Roundcube's .htaccess (AllowOverride All); the source/schema/vendor trees are denied outright as well.
+    expect(app.agent.callsTo('web.host.app.write').pop().args).toEqual({ name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html', php: true, allowOverride: 'All', denyDirs: ['config', 'temp', 'logs', 'bin', 'SQL', 'vendor', 'installer', 'tests'], reload: true });
+    expect(app.agent.callsTo('web.webmail.config.write').pop().args).toEqual({ hostname: 'panel.example.com', imapScheme: 'ssl', imapPort: 993, smtpScheme: 'tls', smtpPort: 587, productName: 'Keel' });
+    expect(audits('webmail.publish')).toBe(1);
+    expect(audits('host_app.publish')).toBeGreaterThanOrEqual(1);
+    app.agent.set('web.webmail.detect', () => PUBLISHED);
+    const status = (await get('/api/service-config/webmail').expect(200)).body.data;
+    expect(status).toMatchObject({ published: { alias: '/webmail', managed: true, source: 'keel-host', url: 'https://panel.example.com/webmail/' }, url: 'https://panel.example.com/webmail/', config: { inSync: true }, lastApply: { ok: true, summary: { alias: '/webmail', url: 'https://panel.example.com/webmail/' } } });
+    // The company name follows the branding; a changed hostname or name shows as out of sync.
+    app.ctx.settings.set('branding.company_name', "O'Brien Hosting");
+    try {
+      expect((await get('/api/service-config/webmail').expect(200)).body.data.config).toMatchObject({ inSync: false, expected: { productName: "O'Brien Hosting" } });
+      await post('/api/service-config/webmail/publish', { reload: false }).expect(200);
+      expect(app.agent.callsTo('web.webmail.config.write').pop().args.productName).toBe("O'Brien Hosting");
+      expect(app.agent.callsTo('web.host.app.write').pop().args.reload).toBe(false);
+    } finally { app.ctx.settings.set('branding.company_name', ''); }
+    expect((await post('/api/service-config/webmail/publish', { force: true })).status).toBe(422);
+  });
+
+  it('DELETE /webmail removes the drop-in and the Roundcube block, audited', async () => {
+    app.agent.calls.length = 0;
+    const res = await app.http.delete('/api/service-config/webmail').set('X-CSRF-Token', csrf).expect(200);
+    expect(res.body.data).toMatchObject({ name: 'webmail', removed: true, reloaded: true, path: '/etc/apache2/keel-host.d/webmail.conf', config: { path: '/etc/roundcube/config.inc.php', removed: true } });
+    expect(app.agent.callsTo('web.host.app.remove').pop().args).toEqual({ name: 'webmail' });
+    expect(app.agent.callsTo('web.webmail.config.remove')).toHaveLength(1);
+    expect(audits('webmail.unpublish')).toBe(1);
+    // Without a Keel block there is nothing to strip.
+    app.agent.set('web.webmail.detect', () => DETECT);
+    app.agent.calls.length = 0;
+    expect((await app.http.delete('/api/service-config/webmail').set('X-CSRF-Token', csrf).expect(200)).body.data.config).toBeNull();
+    expect(app.agent.callsTo('web.webmail.config.remove')).toHaveLength(0);
+  });
+
+  it('refuses to publish without a webmail install (501 webmail), a bare hostname (422) or when Apache rejects the drop-in (422, failed apply recorded)', async () => {
+    app.agent.set('web.webmail.detect', () => ({ installed: false, flavor: null, path: null, root: null, version: null, configured: null, apacheAlias: null, published: null, globalAlias: null, config: null }));
+    try {
+      const res = await post('/api/service-config/webmail/publish', {});
+      expect(res.status).toBe(501);
+      expect(res.body.error).toMatchObject({ code: 'capability_missing', capability: 'webmail' });
+      expect((await get('/api/service-config/webmail').expect(200)).body.data).toMatchObject({ installed: false, url: null, config: null });
+    } finally { app.agent.set('web.webmail.detect', () => DETECT); }
+    app.ctx.settings.set('basic.hostname', 'nova');
+    const configWrites = app.agent.callsTo('web.webmail.config.write').length;
+    try {
+      expect((await post('/api/service-config/webmail/publish', {})).status).toBe(422);
+      expect(app.agent.callsTo('web.webmail.config.write').length).toBe(configWrites);
+      expect((await get('/api/service-config/webmail').expect(200)).body.data).toMatchObject({ fqdn: false, config: { expected: null } });
+    } finally { app.ctx.settings.set('basic.hostname', 'panel.example.com'); }
+    app.agent.fail('web.host.app.write', 'config_invalid', 'Apache rejected the new configuration');
+    try {
+      const res = await post('/api/service-config/webmail/publish', {});
+      expect(res.status).toBe(422);
+      expect(res.body.error.code).toBe('config_invalid');
+      expect((await get('/api/service-config/webmail').expect(200)).body.data.lastApply).toMatchObject({ ok: false, error: 'Apache rejected the new configuration' });
+    } finally { app.agent.set('web.host.app.write', HOST_APP_WRITE); }
+    // A rejected config.inc.php after the alias went live is the agent's config_invalid too.
+    app.agent.fail('web.webmail.config.write', 'config_invalid', 'php -l rejected the new config.inc.php');
+    try {
+      const res = await post('/api/service-config/webmail/publish', {});
+      expect(res.status).toBe(422);
+      expect(res.body.error.message).toMatch(/php -l/);
+    } finally { app.agent.set('web.webmail.config.write', CONFIG_WRITE); }
+  });
+
+  it('degrades without Apache: status still answers, publish and unpublish are 501', async () => {
+    app.agent.set('web.detect', detectWith(false));
+    await provision(false);
+    try {
+      expect((await get('/api/service-config/webmail').expect(200)).body.data).toMatchObject({ installed: true, apache: false, site: null, published: null });
+      expect((await post('/api/service-config/webmail/publish', {})).body.error).toMatchObject({ code: 'capability_missing', capability: 'apache' });
+      expect((await app.http.delete('/api/service-config/webmail').set('X-CSRF-Token', csrf)).status).toBe(501);
+    } finally { app.agent.set('web.detect', detectWith(true)); await provision(true); }
   });
 });
 

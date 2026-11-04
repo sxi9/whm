@@ -98,6 +98,7 @@ export async function register(ctx) {
   admin.get('/accounts/:username/user', validate({ params: nameParam }), wrap((req) => s.userStatus(req.params.username, req.user)));
   admin.post('/accounts/:username/user', validate({ params: nameParam, body: adminUserBody }), created((req) => s.adminEnsureUser(req.params.username, req.body, req.user, req)));
   admin.post('/accounts/:username/password', validate({ params: nameParam, body: adminPasswordBody }), wrap((req) => s.adminSetPassword(req.params.username, req.body.password, req.user, req)));
+  admin.post('/accounts/:username/2fa/reset', validate({ params: nameParam }), wrap((req) => s.adminReset2fa(req.params.username, req.user, req)));
   admin.post('/domains/:domain/release-mail', requireRoot, validate({ params: domainParam }), wrap((req) => s.releaseMailDomain(req.params.domain, req)));
   r.use('/admin', admin);
 

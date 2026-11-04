@@ -12,9 +12,16 @@ import { PANEL_SCOPES } from '../routes/panel/index.js';
 //   panel.loginAs(username, user, req) / logoutAs(req)
 //   panel.changePassword(scope, input, req)        -> §2.2 panel-side flow (host first, both stores, sessions)
 //   panel.changePasswordForUser(userId, input, req) -> the same flow for routes/auth.js (null when not an account user)
+//   panel.recovery.request({ username | email }, req) / confirm({ token, password }, req)
+//                                                  -> forgot-password by e-mail (routes/auth.js, public)
+//   panel.adminReset2fa(username, user, req)       -> clear the account login's authenticator (console)
 //   panel.audit(req, entry)                        -> audit row carrying actingAs/by while impersonating
 
 export const LOGIN_AS_TTL = { min: 5, max: 480, fallback: 60 };
+export const RESET_TOKEN_TTL_MS = 30 * 60_000;
+// Requests per login per hour beyond which further mails are silently skipped
+// (the address limiter in routes/auth.js bounds the rest).
+const RESET_MAX_PER_HOUR = 3;
 const SETTING_KEYS = ['panel.enabled', 'panel.require_2fa_for_users', 'panel.login_as_ttl_minutes', 'panel.login_as_acl', 'panel.webmail_url', 'panel.upload_chunk_bytes'];
 const SOFT_OP_CODES = new Set(['capability_missing', 'binary_not_found', 'path_not_allowed', 'command_failed', 'spawn_failed']);
 
@@ -58,6 +65,16 @@ export function createPanelService(ctx) {
     sessionsForUser: db.prepare('SELECT sid, expires_at FROM sessions WHERE user_id = ? AND expires_at >= ?'),
     hostingAccountOf: db.prepare('SELECT account_id FROM account_domains WHERE domain = ? UNION SELECT id AS account_id FROM accounts WHERE domain = ?'),
     usernameOfAccount: db.prepare('SELECT username FROM accounts WHERE id = ?'),
+    accountUserByUsername: db.prepare("SELECT u.*, a.contact_email AS account_email, a.suspended AS account_suspended FROM users u JOIN account_users au ON au.user_id = u.id JOIN accounts a ON a.id = au.account_id WHERE u.role = 'user' AND u.username = ?"),
+    accountUsersByEmail: db.prepare("SELECT u.*, a.contact_email AS account_email, a.suspended AS account_suspended FROM users u JOIN account_users au ON au.user_id = u.id JOIN accounts a ON a.id = au.account_id WHERE u.role = 'user' AND lower(a.contact_email) = lower(?) ORDER BY u.id LIMIT 5"),
+    recentResets: db.prepare("SELECT COUNT(*) AS n FROM password_reset_tokens WHERE user_id = ? AND created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 hour')"),
+    voidOtherResets: db.prepare('UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL AND id <> ?'),
+    insertReset: db.prepare('INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, requested_ip) VALUES (?, ?, ?, ?)'),
+    deleteReset: db.prepare('DELETE FROM password_reset_tokens WHERE id = ?'),
+    resetByHash: db.prepare('SELECT * FROM password_reset_tokens WHERE token_hash = ?'),
+    burnReset: db.prepare('UPDATE password_reset_tokens SET used_at = ? WHERE id = ? AND used_at IS NULL'),
+    purgeResets: db.prepare("DELETE FROM password_reset_tokens WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 day')"),
+    clearTotp: db.prepare("UPDATE users SET totp_secret_enc = NULL, totp_enabled = 0 WHERE id = ? AND role = 'user'"),
   };
 
   // Tables owned by the mail and FTP units may not exist on this tree yet.
@@ -384,14 +401,19 @@ export function createPanelService(ctx) {
   }
 
   const userPrincipal = (s) => ({ id: s.mode === 'user' ? s.actor.id : null, username: s.username, role: 'user' });
-  function quickLinks(req) {
+  async function quickLinks(req) {
     const s = req.panel || scope(req);
     const principal = userPrincipal(s);
     const safe = (fn) => { try { return fn() || []; } catch (err) { logger.debug({ err }, 'panel quick links source failed'); return []; } };
+    // The operator's URL, else the webmail the agent found published under the hostname site (panel-email.webmailUrl).
+    let webmailUrl = settings.get('panel.webmail_url') || '';
+    if (!webmailUrl && typeof ctx.panelEmail?.webmailUrl === 'function') {
+      try { webmailUrl = (await ctx.panelEmail.webmailUrl()) || ''; } catch (err) { logger.debug({ err }, 'panel quick links: webmail detection failed'); }
+    }
     return {
       apps: safe(() => ctx.development?.appconfig?.listFor?.(principal, 'cpanel')),
       news: safe(() => ctx.cpanel?.news?.active?.(principal)),
-      webmailUrl: settings.get('panel.webmail_url') || '',
+      webmailUrl,
     };
   }
 
@@ -411,14 +433,16 @@ export function createPanelService(ctx) {
   }
 
   // `force` skips the current-password check only for a login core already
-  // flagged with must_change_password (the forced-change path of /api/auth/password).
-  async function changePassword(s, { currentPassword, newPassword, force = false }, req) {
+  // flagged with must_change_password (the forced-change path of /api/auth/password);
+  // `recovery` is the e-mailed reset token, already burned by recovery.confirm.
+  // Neither reaches here from a request body (strict schemas).
+  async function changePassword(s, { currentPassword, newPassword, force = false, recovery = false }, req) {
     assertNotActing(s);
     const user = stmts.userById.get(s.actor.id);
     const link = user ? stmts.linkByUser.get(user.id) : null;
     if (!link || link.account_id !== s.accountId) throw forbidden('This login is not linked to the account');
     const forced = Boolean(force) && Boolean(user.must_change_password);
-    if (!forced && !(await crypto.verifyPassword(currentPassword || '', user.password_hash))) throw unauthorized('Current password is incorrect');
+    if (!forced && !recovery && !(await crypto.verifyPassword(currentPassword || '', user.password_hash))) throw unauthorized('Current password is incorrect');
     const strength = ctx.security?.passwordStrength?.(newPassword, 'account');
     if (strength && !strength.ok) throw unprocessable(`Password is too weak (strength ${strength.score}, minimum ${strength.minimum})`, { newPassword: ['Choose a stronger password'] });
     const host = await hostSetPassword(s, newPassword, req);
@@ -429,7 +453,7 @@ export function createPanelService(ctx) {
       stmts.clearForcePassword.run(s.accountId);
     })();
     ctx.sessionStore?.destroyUserSessions?.(user.id);
-    audit(req, { action: 'panel.password.change', target: s.username, args: { host, forced } });
+    audit(req, { action: 'panel.password.change', target: s.username, args: { host, forced, recovery: Boolean(recovery) } });
     return { changed: true, host };
   }
 
@@ -438,7 +462,7 @@ export function createPanelService(ctx) {
   // forced-change path cannot leave the Linux password behind. Returns null
   // when the login is not an account user, and the caller keeps its own flow.
   const linkForUser = (userId) => stmts.linkByUser.get(userId) || null;
-  async function changePasswordForUser(userId, { currentPassword, newPassword, force = false }, req) {
+  async function changePasswordForUser(userId, { currentPassword, newPassword, force = false, recovery = false }, req) {
     const user = stmts.userById.get(userId);
     const link = user && user.role === 'user' ? stmts.linkByUser.get(user.id) : null;
     if (!link) return null;
@@ -449,15 +473,126 @@ export function createPanelService(ctx) {
     // own password route, which this seam bypasses: a demo account's shared
     // credentials never change, a suspended account changes nothing, the
     // package may withhold password changes, and the 2FA policy holds; only
-    // core's forced change (must_change_password) gets through the last two.
+    // core's forced change (must_change_password) and a mailed reset (a
+    // lockout path: the user may have no authenticator left) get through the last two.
     if (s.account.demo_mode) throw new HttpError(403, 'demo_mode', 'This account is in demo mode; changes are not saved');
     if (s.account.suspended) throw new HttpError(423, 'account_suspended', 'This account is suspended');
-    const forced = Boolean(force) && Boolean(user.must_change_password);
+    const forced = (Boolean(force) && Boolean(user.must_change_password)) || Boolean(recovery);
     if (!forced) {
       if (s.features?.passwordchange === false) throw new HttpError(403, 'feature_disabled', 'Your hosting package does not include password changes');
       if (settings.get('panel.require_2fa_for_users') && !user.totp_enabled) throw new HttpError(403, 'two_factor_required', 'Two-factor authentication is required for your account. Set it up to continue.');
     }
-    return changePassword(s, { currentPassword, newPassword, force }, req);
+    return changePassword(s, { currentPassword, newPassword, force, recovery }, req);
+  }
+
+  // ---------------------------------------------------------------- recovery
+
+  // Forgot-password for account users (routes/auth.js, public). A request
+  // never says whether the login exists: the outcome lives only in the audit
+  // row, and the response never waits for the token or the mail transport
+  // (hundreds of ms through Exim or a relay) — only the lookups run before the
+  // 202, the rest continues detached, so an unknown login and a real one
+  // answer alike. Tokens are random, stored hashed, valid RESET_TOKEN_TTL_MS,
+  // single-use; a delivered request voids the login's earlier unused ones.
+  const panelUrl = () => {
+    const host = settings.get('basic.hostname') || 'localhost';
+    return config.tls ? `https://${host}:${config.tlsPort}` : `http://${host}:${config.port}`;
+  };
+  const companyName = () => {
+    try { return ctx.cpanel?.branding?.get?.()?.companyName || 'Keel'; } catch { return 'Keel'; }
+  };
+  // The new link is stored before the mail leaves and the earlier unused ones
+  // are voided only once it did: a failed transport leaves the previous link
+  // working and the attempt does not count toward RESET_MAX_PER_HOUR.
+  async function deliverResets(users, req) {
+    stmts.purgeResets.run();
+    const sentTo = [];
+    let reason = null;
+    for (const user of users) {
+      if (stmts.recentResets.get(user.id).n >= RESET_MAX_PER_HOUR) { reason = 'throttled'; continue; }
+      const token = crypto.randomToken(32);
+      const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MS).toISOString();
+      const id = Number(stmts.insertReset.run(user.id, crypto.hashToken(token), expiresAt, req?.ip ?? null).lastInsertRowid);
+      const company = companyName();
+      const host = settings.get('basic.hostname') || 'this server';
+      const body = [
+        `Hello ${user.username},`,
+        '',
+        `Someone asked to reset the password of the ${company} account "${user.username}" on ${host}. If that was you, open this link within ${RESET_TOKEN_TTL_MS / 60_000} minutes:`,
+        '',
+        `${panelUrl()}/login/reset/${token}`,
+        '',
+        'If you did not ask for a reset, ignore this message; your password stays unchanged.',
+      ].join('\n');
+      try {
+        await ctx.contacts.sendMail({ to: user.account_email, subject: `[${company}] Reset the password of ${user.username}`, body }, req);
+        stmts.voidOtherResets.run(nowIso(), user.id, id);
+        sentTo.push(user.username);
+      } catch (err) {
+        stmts.deleteReset.run(id);
+        reason = 'mail_failed';
+        logger.warn({ err, username: user.username }, 'panel recovery: reset mail not sent');
+      }
+    }
+    return { sentTo, reason };
+  }
+
+  let resetsInFlight = Promise.resolve();
+  const recovery = {
+    available: () => panelSettings.enabled() && Boolean(ctx.contacts?.sendMail),
+    // Settles once every detached request so far has written its audit row (tests, shutdown).
+    pending: () => resetsInFlight,
+
+    request({ username, email }, req) {
+      const via = username ? 'username' : 'email';
+      const target = username || String(email).toLowerCase();
+      const done = (sent, reason, extra = {}) => {
+        audit(req, { action: 'auth.reset.request', target, args: { via, sent, reason, ...extra }, result: sent ? 'ok' : 'skipped' });
+        return { accepted: true };
+      };
+      if (!recovery.available()) return done(false, panelSettings.enabled() ? 'mail_unavailable' : 'panel_disabled');
+      const candidates = username ? [stmts.accountUserByUsername.get(username)].filter(Boolean) : stmts.accountUsersByEmail.all(email);
+      const users = candidates.filter((u) => !u.suspended && !u.account_suspended && u.account_email);
+      if (!users.length) return done(false, candidates.length ? 'not_eligible' : 'unknown');
+      const work = deliverResets(users, req).then(
+        ({ sentTo, reason }) => done(sentTo.length > 0, sentTo.length ? null : reason, { users: sentTo }),
+        (err) => { logger.warn({ err, target }, 'panel recovery: reset request failed'); done(false, 'error'); },
+      );
+      resetsInFlight = Promise.allSettled([resetsInFlight, work]).then(() => undefined);
+      return { accepted: true };
+    },
+
+    async confirm({ token, password }, req) {
+      const invalid = () => new HttpError(400, 'reset_token_invalid', 'This reset link is invalid, has expired or was already used. Request a new one.');
+      const row = stmts.resetByHash.get(crypto.hashToken(token));
+      if (!row || row.used_at || new Date(row.expires_at).getTime() <= Date.now()) throw invalid();
+      if (!panelSettings.enabled()) throw new HttpError(403, 'panel_disabled', 'The account panel is disabled on this server');
+      const user = stmts.userById.get(row.user_id);
+      if (!user || user.role !== 'user' || user.suspended) throw invalid();
+      // Burned before the password is written: a token that raced a second
+      // submit, or one whose host write failed, is spent either way.
+      if (stmts.burnReset.run(nowIso(), row.id).changes !== 1) throw invalid();
+      const r = await changePasswordForUser(user.id, { newPassword: password, recovery: true }, req);
+      if (!r) throw invalid();
+      audit(req, { action: 'auth.reset.confirm', target: user.username, args: { host: r.host } });
+      return { username: user.username, changed: true };
+    },
+  };
+
+  // The console's answer to a customer who lost the authenticator: the
+  // account login's TOTP secret is dropped and its sessions end. Resellers may
+  // do it for the accounts they own (ctx.accounts.get checks ownership), the
+  // same bar as setting the account's password.
+  function adminReset2fa(username, user, req) {
+    const account = ctx.accounts.get(username, user);
+    const link = stmts.linkByAccount.get(account.id);
+    const row = link ? stmts.userById.get(link.user_id) : null;
+    if (!row) throw notFound('Account login');
+    const wasEnabled = Boolean(row.totp_enabled);
+    stmts.clearTotp.run(row.id);
+    ctx.sessionStore?.destroyUserSessions?.(row.id);
+    audit(req, { action: 'panel.admin.2fa.reset', target: username, args: { userId: row.id, wasEnabled } });
+    return { username, totpEnabled: false, wasEnabled, enrollmentRequired: Boolean(settings.get('panel.require_2fa_for_users')) };
   }
 
   // Root's answer to a 409 domain_stale: the mail rows and host files of
@@ -567,7 +702,7 @@ export function createPanelService(ctx) {
 
   return {
     SYSTEM_ROOT,
-    ensureUser, backfill, syncPassword, setSuspended, subscribe, userStatus, adminEnsureUser, adminSetPassword,
+    ensureUser, backfill, syncPassword, setSuspended, subscribe, userStatus, adminEnsureUser, adminSetPassword, adminReset2fa, recovery,
     scope, assertNotActing, loginAs, logoutAs, loginAsHistory, endImpersonation,
     me, quickLinks, counts, userPrincipal,
     changePassword, changePasswordForUser, linkForUser, reestablish, sessions, tokens, settings: panelSettings, audit, releaseMailDomain,

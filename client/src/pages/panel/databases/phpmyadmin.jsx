@@ -6,14 +6,9 @@ import { PanelPage, PanelCapabilityState, FeatureDisabledState } from '../../../
 import { usePanelApi, usePanelMe } from '../../../panel/hooks/usePanel.js';
 import { RequestError, InfoNote, isCapabilityError, isFeatureDisabled } from './parts/shared.jsx';
 
-// phpMyAdmin pre-fills the login form from `pma_username`; the password is never
-// put in a link.
-export function loginUrl(base, user) {
-  if (!base) return null;
-  if (!user) return base;
-  return `${base}${base.includes('?') ? '&' : '?'}pma_username=${encodeURIComponent(user)}`;
-}
-
+// phpMyAdmin's cookie authentication reads pma_username from the POSTed login
+// form only, so nothing in the link can prefill the user name; the page lists
+// the names to type instead. The password is never put in a link.
 export default function PhpMyAdmin({ fn }) {
   const { me } = usePanelMe();
   const { data, loading, error, refetch } = usePanelApi('/databases/phpmyadmin');
@@ -24,7 +19,7 @@ export default function PhpMyAdmin({ fn }) {
   const ready = Boolean(data?.installed && data?.featureEnabled && data?.url);
   const users = data?.users || [];
   const open = ready && (
-    <a className="btn btn-primary" href={loginUrl(data.url, users[0])} target="_blank" rel="noopener noreferrer"><ExternalLink size={16} /> Open phpMyAdmin</a>
+    <a className="btn btn-primary" href={data.url} target="_blank" rel="noopener noreferrer"><ExternalLink size={16} /> Open phpMyAdmin</a>
   );
 
   return (
@@ -35,7 +30,7 @@ export default function PhpMyAdmin({ fn }) {
       {data && (
         <div className="grid-2">
           <Card title="How it works" subtitle="A web interface for your databases: browse tables, run SQL, import and export.">
-            <p>phpMyAdmin opens in a new tab and asks for a database user and its password. The link from this page fills in the user name; type the password you set when you created the user.</p>
+            <p>phpMyAdmin opens in a new tab and asks for a database user and its password. Type one of the user names listed here and the password you set when you created that user.</p>
             <p className="muted">Your account password does not work there. Database users and their passwords are managed under <Link to="/panel/databases/users">Database users</Link>.</p>
             <KeyValue items={[
               ['Status', <StatusPill key="s" status={data.engine === 'postgres' ? 'disabled' : !data.installed ? 'not-installed' : !data.featureEnabled ? 'disabled' : data.url ? 'installed' : 'warning'}>{data.engine === 'postgres' ? 'not for PostgreSQL' : !data.installed ? 'not installed' : !data.featureEnabled ? 'turned off by the provider' : data.url ? 'available' : 'no address yet'}</StatusPill>],
@@ -48,9 +43,9 @@ export default function PhpMyAdmin({ fn }) {
             {data.installed && data.featureEnabled && !data.url && <InfoNote>phpMyAdmin is installed but has no web address yet. Ask your hosting provider to publish it.</InfoNote>}
             {data.engine === 'postgres' && <InfoNote>This account uses PostgreSQL, which phpMyAdmin does not manage.</InfoNote>}
           </Card>
-          <Card title="Sign in as" subtitle="Each link opens phpMyAdmin with the user name filled in." padded={false}>
+          <Card title="Sign in as" subtitle="Your database users; phpMyAdmin asks for one of these names and its password." padded={false}>
             {users.length === 0 ? (
-              <EmptyState icon={Database} title="No database users yet"><p>Create a user under <Link to="/panel/databases/users">Database users</Link>; it is listed here with a sign-in link.</p></EmptyState>
+              <EmptyState icon={Database} title="No database users yet"><p>Create a user under <Link to="/panel/databases/users">Database users</Link>; it is listed here.</p></EmptyState>
             ) : (
               <div className="table-wrap">
                 <table>
@@ -60,7 +55,7 @@ export default function PhpMyAdmin({ fn }) {
                       <tr key={u}>
                         <td><code>{u}</code></td>
                         <td className="align-right">
-                          {ready ? <a className="btn btn-sm" href={loginUrl(data.url, u)} target="_blank" rel="noopener noreferrer"><ExternalLink size={14} /> phpMyAdmin</a> : <span className="muted">not available</span>}
+                          {ready ? <a className="btn btn-sm" href={data.url} target="_blank" rel="noopener noreferrer"><ExternalLink size={14} /> phpMyAdmin</a> : <span className="muted">not available</span>}
                         </td>
                       </tr>
                     ))}

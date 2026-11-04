@@ -45,7 +45,17 @@ function QuotaFields({ quotaMb, onChange, defaultQuotaMb, error }) {
   );
 }
 
-export function CreateMailboxForm({ domains, defaultQuotaMb, onSubmit, onCancel, busy, error }) {
+// The server's rule for mailbox passwords (meta.passwordPolicy): the length
+// floor plus the Security Center minimum for the `email` context.
+export function passwordHelp(policy) {
+  const minLength = policy?.minLength || 8;
+  const strength = Number(policy?.minStrength) || 0;
+  const base = `At least ${minLength} characters`;
+  if (strength <= 0) return `${base}; use the generator for a strong one.`;
+  return `${base} and a strength of ${strength} out of 100 (length, upper and lower case, digits and symbols all count); use the generator for a strong one.`;
+}
+
+export function CreateMailboxForm({ domains, defaultQuotaMb, onSubmit, onCancel, busy, error, passwordPolicy = null }) {
   const [localPart, setLocalPart] = useState('');
   const [domain, setDomain] = useState(domains[0] || '');
   const [password, setPassword] = useState('');
@@ -55,7 +65,7 @@ export function CreateMailboxForm({ domains, defaultQuotaMb, onSubmit, onCancel,
     <form onSubmit={submit}>
       <MutationError error={error} />
       <AddressInput localPart={localPart} domain={domain} domains={domains} onLocalPart={setLocalPart} onDomain={setDomain} error={fieldError(error, 'localPart') || fieldError(error, 'domain')} help="Lowercase letters, digits, dots, underscores and hyphens." autoFocus />
-      <Field label="Password" required error={fieldError(error, 'password')} help="At least 8 characters; use the generator for a strong one.">
+      <Field label="Password" required error={fieldError(error, 'password')} help={passwordHelp(passwordPolicy)}>
         <PasswordInput value={password} onChange={setPassword} />
       </Field>
       <QuotaFields quotaMb={quotaMb} onChange={setQuotaMb} defaultQuotaMb={defaultQuotaMb} error={fieldError(error, 'quotaMb')} />
@@ -67,13 +77,13 @@ export function CreateMailboxForm({ domains, defaultQuotaMb, onSubmit, onCancel,
   );
 }
 
-export function PasswordForm({ address, onSubmit, onCancel, busy, error }) {
+export function PasswordForm({ address, onSubmit, onCancel, busy, error, passwordPolicy = null }) {
   const [password, setPassword] = useState('');
   return (
     <form onSubmit={(e) => { e.preventDefault(); onSubmit({ password }); }}>
       <MutationError error={error} />
       <p>New password for <strong>{address}</strong>. Mail apps signed in with the old password stop syncing until they are updated.</p>
-      <Field label="New password" required error={fieldError(error, 'password')}>
+      <Field label="New password" required error={fieldError(error, 'password')} help={passwordHelp(passwordPolicy)}>
         <PasswordInput value={password} onChange={setPassword} />
       </Field>
       <FormActions align="right"><Button onClick={onCancel}>Cancel</Button><Button type="submit" variant="primary" loading={busy} disabled={!password}>Change password</Button></FormActions>
@@ -111,20 +121,54 @@ function ServerRow({ label, srv }) {
   if (!srv) return null;
   return [label, (
     <span key={label}>
-      <code>{srv.host}</code> port <strong>{srv.port}</strong> ({srv.ssl ? 'SSL/TLS' : 'plain'})
+      <code>{srv.host}</code> port <strong>{srv.port}</strong> ({srv.ssl ? 'SSL/TLS' : srv.starttls ? 'STARTTLS' : 'plain'})
       {srv.alternative && <span className="muted"> · or port {srv.alternative.port}{srv.alternative.starttls ? ' with STARTTLS' : ''}</span>}
     </span>
   )];
 }
 
+// The certificate a mail app is shown when it connects (the hostname's service
+// certificate), so a name mismatch is explained before the app warns about it.
+function certificateText(cert, hostname) {
+  if (!cert) return 'The server certificate could not be read; your mail app shows it when you connect.';
+  const name = cert.name || cert.sans?.[0] || hostname;
+  const bits = [cert.issuer ? `issued by ${cert.issuer}` : null, cert.selfSigned ? 'self-signed' : null].filter(Boolean);
+  const mismatch = cert.matchesHostname === false ? ` It does not name ${hostname}, so mail apps warn about it; ask your provider.` : '';
+  return `${name}${bits.length ? ` (${bits.join(', ')})` : ''}.${mismatch}`;
+}
+
+// The SMTP listeners exactly as the server reports them (smtp.ports from the
+// API: 587 with STARTTLS and 465 with TLS exist only once the operator enabled
+// the submission ports; 25 is what is left otherwise).
+export function smtpPortsText(smtp) {
+  if (!smtp) return [];
+  const ports = smtp.ports || { enabled: Boolean(smtp.submissionPorts), port587: Boolean(smtp.submissionPorts), port465: Boolean(smtp.submissionPorts) && smtp.port === 465 };
+  const out = [];
+  if (ports.port587) out.push('587 with STARTTLS');
+  if (ports.port465) out.push('465 with TLS');
+  if (!out.length) out.push('25 with STARTTLS');
+  return out;
+}
+
 export function ClientSettings({ settings }) {
   if (!settings) return null;
+  const smtp = settings.smtp;
+  const sendingOff = !smtp || smtp.auth == null;
+  const submissionOff = Boolean(smtp) && smtp.submissionPorts === false;
+  const ports = smtpPortsText(smtp);
   return (
     <>
+      {sendingOff && (
+        <div className="banner banner-warning" role="status">
+          <Mail size={18} />
+          <div><strong>Sending is not enabled yet — ask your provider</strong><p>The mail server does not accept this mailbox's password for sending yet. Receiving and reading mail work once the mailbox is served.</p></div>
+        </div>
+      )}
       <KeyValue items={[
         ['Username', <code key="u">{settings.username}</code>],
         ['Password', 'The mailbox password'],
         ['Mail server', <code key="h">{settings.hostname}</code>],
+        ['Certificate', certificateText(settings.certificate?.dovecot || settings.certificate?.exim || null, settings.hostname)],
       ]} />
       <h3 style={{ marginTop: 16 }}>Incoming mail</h3>
       <KeyValue items={[
@@ -134,9 +178,16 @@ export function ClientSettings({ settings }) {
       ]} />
       <h3 style={{ marginTop: 16 }}>Outgoing mail</h3>
       <KeyValue items={[
-        ServerRow({ label: 'SMTP', srv: settings.smtp }),
-        ['Authentication', 'Required — same username and password'],
+        ServerRow({ label: 'SMTP', srv: smtp }),
+        ['Ports', ports.join(' or ')],
+        ['Authentication', sendingOff ? 'Not enabled yet — mail apps cannot send through this server until your provider enables it' : 'Required — same username and password'],
       ]} />
+      {submissionOff && (
+        <div className="banner banner-warning" style={{ marginTop: 12 }} role="status">
+          <Mail size={18} />
+          <div><strong>Only port 25 is open for sending</strong><p>Most ISPs and mobile networks block port 25, so mail apps on those networks cannot send. Ask your provider to enable the submission ports 587 and 465.</p></div>
+        </div>
+      )}
       {settings.webmail && <p style={{ marginTop: 12 }}><a className="btn btn-sm" href={settings.webmail} target="_blank" rel="noopener noreferrer">Open webmail</a></p>}
     </>
   );
@@ -172,6 +223,10 @@ export default function EmailAccounts({ fn }) {
   const notIncluded = limit === 0;
   const atLimit = limit != null && used >= limit;
   const defaultQuotaMb = meta?.defaultQuotaMb ?? 1024;
+  const passwordPolicy = meta?.passwordPolicy ?? null;
+  // The wiring state comes with every list, rows or not, so the empty state
+  // says what a new mailbox will do.
+  const wiringWarning = (meta?.warnings || []).find((w) => w.code === 'virtual_mail_not_live' || w.code === 'virtual_mail_disabled') || null;
 
   const open = (kind, row = null) => { setMutationError(null); setDialog({ kind, row }); };
   const close = () => { setDialog(null); setMutationError(null); };
@@ -235,6 +290,12 @@ export default function EmailAccounts({ fn }) {
           {atLimit && (notIncluded
             ? <div className="banner banner-warning"><Mail size={18} /><div><strong>Mailboxes are not included in your plan</strong><p>Ask your hosting provider about a plan that includes them.</p></div></div>
             : <div className="banner banner-warning"><Mail size={18} /><div><strong>Plan limit reached</strong><p>Your plan allows {limit} mailbox{limit === 1 ? '' : 'es'}. Delete one you no longer need, or ask your hosting provider about a larger plan.</p></div></div>)}
+          {wiringWarning && (
+            <div className="banner banner-warning" role="status">
+              <Mail size={18} />
+              <div><strong>{wiringWarning.code === 'virtual_mail_disabled' ? 'Mailboxes are switched off on this server' : 'Mailboxes are not served yet'}</strong><p>{used ? 'Your mailboxes are saved, but mail is not delivered to them and mail apps cannot sign in until your hosting provider finishes the mail server setup.' : 'A mailbox you create is saved, but mail is not delivered to it and mail apps cannot sign in until your hosting provider finishes the mail server setup.'}</p></div>
+            </div>
+          )}
           <Card padded={false}>
             <PanelRequestError error={error} fn={fn} onRetry={refetch} />
             {!error && (
@@ -260,10 +321,10 @@ export default function EmailAccounts({ fn }) {
       )}
 
       <Modal open={dialog?.kind === 'create'} title="Create mailbox" onClose={close}>
-        {dialog?.kind === 'create' && <CreateMailboxForm domains={domains} defaultQuotaMb={defaultQuotaMb} onSubmit={create} onCancel={close} busy={busy} error={mutationError} />}
+        {dialog?.kind === 'create' && <CreateMailboxForm domains={domains} defaultQuotaMb={defaultQuotaMb} passwordPolicy={passwordPolicy} onSubmit={create} onCancel={close} busy={busy} error={mutationError} />}
       </Modal>
       <Modal open={dialog?.kind === 'password'} title="Change password" onClose={close} size="sm">
-        {dialog?.kind === 'password' && <PasswordForm address={dialog.row.address} onSubmit={(b) => setPassword(dialog.row, b)} onCancel={close} busy={busy} error={mutationError} />}
+        {dialog?.kind === 'password' && <PasswordForm address={dialog.row.address} passwordPolicy={passwordPolicy} onSubmit={(b) => setPassword(dialog.row, b)} onCancel={close} busy={busy} error={mutationError} />}
       </Modal>
       <Modal open={dialog?.kind === 'quota'} title="Change quota" onClose={close} size="sm">
         {dialog?.kind === 'quota' && <QuotaForm row={dialog.row} defaultQuotaMb={defaultQuotaMb} onSubmit={(b) => setQuota(dialog.row, b)} onCancel={close} busy={busy} error={mutationError} />}

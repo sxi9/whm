@@ -100,6 +100,36 @@ Administrators (root, resellers) **cannot browse `/panel` as themselves**: the o
 "Log in as" (C.5). That is deliberate — every administrator view of a customer panel is time-boxed
 and audited.
 
+### Forgot password
+
+The login card shows **Forgot password?** (`/login/reset`) while the account panel is on and the
+server can send mail (`GET /api/auth/reset` → `{ enabled }`; mail leaves through Contact Manager's
+transport, Exim or the SMTP relay). It is for account users only — administrators are reset with
+`whm-cli reset-password` (Part B, E.4). The person enters the account username or the account's
+**contact e-mail address** (*Modify an Account › Contact email*):
+
+1. `POST /api/auth/reset/request { username | email }` answers **202 whatever happened** (unknown
+   login, administrator, suspended login or account, no contact address, panel off, mail not sent),
+   so the form cannot be used to find out which logins exist. The outcome is only in the audit row
+   `auth.reset.request` (`sent`, `reason`: `unknown`, `not_eligible`, `throttled`, `panel_disabled`,
+   `mail_unavailable`, `mail_failed`). The 202 is sent before the mail leaves (the token and the
+   transport run afterwards), so the response time gives nothing away either. Per address the login
+   rate limit applies (20 per 15 minutes, shared with the confirm step); per login at most three
+   delivered links an hour, and a delivered link voids the earlier unused ones — when the mail
+   cannot leave, the earlier link keeps working and the attempt does not count.
+2. The mail (`[<company>] Reset the password of <username>`, sent to the contact address) carries
+   `https://<hostname>:2087/login/reset/<token>`. The token is random, stored only as its SHA-256
+   (`password_reset_tokens`), valid **30 minutes**, **single-use**, and never written to the audit log.
+3. `POST /api/auth/reset/confirm { token, password }` runs the same flow as a password change
+   (C.3): strength policy for the `account` context, Linux password through the agent first, then the
+   panel hash and `password_synced_at`, then **every session of the login ends**; audited
+   `auth.reset.confirm`. A spent, expired or unknown token answers `400 reset_token_invalid` and the
+   page offers a new request. Demo mode and suspension still refuse; the `passwordchange` plan feature
+   and the *Require 2FA for account users* gate do not block a reset, since it is a lockout path.
+
+The login page then says *Your password was changed* and the new password also works for FTP and
+SSH, like any panel-side change.
+
 ## C.3 Password and two-factor rules
 
 - **Changing the password** is done on *Security › Password* (`/panel/security/password`;
@@ -122,6 +152,11 @@ and audited.
   (`panel.require_2fa_for_users`). While it is on and the login has no authenticator, every panel
   request except `/me` and the two-factor pages answers `403 two_factor_required` and the shell
   redirects to the enrolment page; disabling 2FA is refused.
+- **Lost authenticator.** The provider resets it from the console: *List Accounts › Reset 2FA*
+  (`POST /api/panel/admin/accounts/:username/2fa/reset`, root or the owning reseller, audited
+  `panel.admin.2fa.reset`). The secret is dropped and every session of the login ends; the customer
+  signs in with the password alone and enrols again (at once when *Require 2FA for account users* is on).
+  A lost password goes through *Forgot password?* on the login page (C.2).
 - **API tokens** (*Security › API tokens*) are subject to the console's *API tokens require 2FA*
   security policy: with it on, a login without an authenticator cannot create one.
 - Credentials are changed from a browser session only: an API token that reaches the password,
@@ -325,6 +360,15 @@ that before delegating.
   addon.
 - **Gotchas:** the document root must stay under `public_html` (`422`); a symlink planted there
   cannot be followed because the directory is created as the account.
+- **Public DNS elsewhere (P0-4):** every row of `GET /domains` carries `delegation` — `{ delegatedHere:
+  true|false|null, delegatedNs[], checkedDomain, nameservers[{ host, addresses, here }], checkedAt, error }`
+  from the public NS set of the domain (or of the nearest parent that has one), resolved through the
+  server's resolvers and compared with this host's addresses and names; cached ten minutes, `null` when
+  nothing could be resolved (never a false alarm). The form's *Create DNS zone* defaults **off** when the
+  main domain is not delegated here, and the answer of `POST /domains/addon` carries `delegation` plus
+  `records` (the `A`/`AAAA` records for the domain and `www.`) with a `meta.warnings` line "DNS for … is
+  managed at …; records added here are not published — add … there as well". The page shows that as a
+  persistent banner with the records to copy.
 
 #### 2.3 Subdomains
 
@@ -339,7 +383,12 @@ that before delegating.
   zone **when this account owns that zone**, and regenerates the vhosts. `DELETE /domains/sub/:fqdn`
   removes the vhost, clears those records and the row.
 - **Gotchas:** when the parent's zone is not on this account the answer carries the warning *No
-  DNS zone of this account contains <name>; add the records yourself*.
+  DNS zone of this account contains <name>; add the records yourself*. When the **parent's public
+  DNS is managed elsewhere** (its `delegation.delegatedHere` is `false`, see §2.2) the record is still
+  written to the local zone but `data.dns` carries `delegation` and `records` (`<fqdn> A <ip>`, plus
+  `AAAA`) and a warning names the provider; the page shows a banner per such parent, the form says so
+  under *Under*, and the create result prints the record to add at that provider instead of "Added to
+  <zone>".
 
 #### 2.4 Parked domains
 
@@ -379,6 +428,12 @@ that before delegating.
 - **Gotchas:** NS and SOA records answer `422 protected_record` ("managed by the server
   administrator"); changing the zone TTL or SOA, editing raw zone text, DNSSEC and zone templates
   are console functions and are not available here.
+- **Public DNS elsewhere:** every zone of `GET /dns/zones` and the answer of `GET /dns/zones/:domain`
+  and of each record write carry `delegation` (§2.2 shape). A *Public DNS* tile reads *Delegated here*,
+  *Managed elsewhere* or *Unknown*; with `delegatedHere:false` a persistent banner says "DNS for
+  <domain> is managed at <ns>; records you add here are not published — add them there as well" and a
+  saved record is confirmed with the same reminder instead of "published". The records are still written
+  to BIND (the server may become authoritative later); nothing is refused.
 
 ## 4. SSL
 
@@ -392,7 +447,10 @@ certificate id is checked against `ssl_certs.account_id` before *SSL/TLS* is ask
 - **Screen:** every domain of the account (main, addon, sub, parked) with the installed certificate
   (subject, issuer, valid from/until, days remaining, expired, AutoSSL or self-signed), the last
   AutoSSL attempt for the domain when the server records one, the AutoSSL provider state and
-  whether the web server is linked. *Uninstall* per domain.
+  whether the web server is linked. *Uninstall* per domain. The page also reads `GET /domains` for
+  the delegation of each hostname (§2.2): a domain whose public DNS is managed elsewhere gets a banner
+  "Certificates need the name to resolve to this server" with the `A`/`AAAA` records (domain and
+  `www.` for main and addon domains) to add at that provider before *Issue now* can validate.
 - **Server:** `GET /ssl/domains`, `GET /ssl/domains/:domain`, `DELETE /ssl/domains/:domain`.
 
 #### 4.2 Install certificate
@@ -501,8 +559,18 @@ removed), followed by `update-exim4.conf` and a reload.
   settings** (IMAP 993 / 143, POP3 995 / 110 as the Dovecot protocols allow, SMTP as Exim really
   listens: 25 with STARTTLS by default, 587 with STARTTLS once the administrator enabled the
   Exim setting **`submissionPorts`**, and 465 with TLS on connect (587 as the alternative) only when
-  a TLS preset from *SSL/TLS Configuration* is also applied to Exim; password authentication is
-  advertised only while the virtual-mail wiring is live; the server hostname, the webmail URL).
+  a TLS preset from *SSL/TLS Configuration* is also applied to Exim; the sheet lists the listeners
+  exactly as reported in `smtp.ports` — *587 with STARTTLS*, *465 with TLS*, else *25 with STARTTLS* —
+  and warns that port 25 is blocked by most ISPs while the submission ports are off; password
+  authentication (`smtp.auth = 'password'`) is advertised only while the virtual-mail wiring is
+  live, otherwise the sheet says **"Sending is not enabled yet — ask your provider"**; the server
+  hostname and the **certificate** the mail daemons present (`certificate.dovecot` / `.exim`:
+  name, issuer, self-signed, `matchesHostname` — a name mismatch is explained before the mail app
+  warns about it); the webmail URL). The list (`meta.warnings`) carries `virtual_mail_not_live` /
+  `virtual_mail_disabled` whether or not mailboxes exist, so the empty state says what a new
+  mailbox will and will not do. The password help text shows the server's rule from
+  `meta.passwordPolicy` (`{ minLength: 8, minStrength }`, the `email` context of *Password Strength
+  Configuration*, else the server-wide minimum) instead of a fixed "8 characters".
 - **Server:** `GET /email/accounts`, `POST /email/accounts` (the mail domain is claimed for this
   account — `409` when it belongs to another account —, the password is hashed as SHA512-CRYPT by
   `doveadm pw` or `openssl passwd -6` with the secret on stdin, the maildir is created as the
@@ -557,8 +625,20 @@ removed), followed by `update-exim4.conf` and a reload.
   *Allow list* and *Block list* (up to 200 addresses each).
 - **Server:** `GET/PUT /email/spam` → `~/.spamassassin/user_prefs` written **as the account**
   (`0600`, key/value lines only) and the Exim per-domain spam list (threshold ×10, auto-delete).
-- **Needs:** SpamAssassin and Exim with the panel's DATA ACL.
-- **Gotchas:** per-recipient thresholds are not available in this version.
+  `GET` answers `available`, `reason` and `detail`: `available:false` with `exim_missing`,
+  `exim_no_content_scan` (Exim was built without content scanning — Debian's
+  `exim4-daemon-light`; `exim -bV` must list `Content_Scanning`, which `exim4-daemon-heavy` does),
+  `spamd_missing` or `spamd_not_running` (the `spamd` unit is not active), plus the probe result
+  under `exim` / `spamd`. The screen then shows the reason instead of the form, and `PUT` refuses:
+  `501` (install prompt) for a missing daemon or build, `422 spamd_not_running` for a stopped
+  daemon — settings are never stored as if they filtered anything. The probe
+  (`ctx.web.spamScanning()`, memoised for a minute; a save re-probes) reads `web.exim.detect` and
+  `mail.spamd.config.read`.
+- **Needs:** SpamAssassin running and a **content-scanning** Exim with the panel's DATA ACL.
+- **Gotchas:** per-recipient thresholds are not available in this version. The Security Advisor
+  reports `panel.spam.scanning` (warning) when accounts have saved spam settings that the host
+  cannot apply — *Exim without content scanning while N accounts have spam settings* — and `ok`
+  when they are active.
 
 #### 6.6 Deliverability
 
@@ -570,6 +650,16 @@ removed), followed by `update-exim4.conf` and a reload.
   (*Email › Email Deliverability*), `GET/POST/DELETE /email/dkim/:domain` (*DNS Functions* DKIM).
 - **Needs:** the DNS zone of the domain on this account (`zone: false` otherwise), BIND, Exim's
   DKIM signing.
+- **Public DNS elsewhere:** the report carries `delegation` (§2.2 shape) and `records` — every
+  suggested record as `{ id, name, type: 'TXT', value, status }` (`<domain>` for SPF,
+  `<selector>._domainkey.<domain>` for DKIM, `_dmarc.<domain>` for DMARC). With
+  `delegatedHere:false` the page replaces *Fix* with the records to copy ("Mail records are not
+  published from here") and `POST …/fix` writes **nothing**: it answers `{ applied: false, reason:
+  'not_delegated', delegation, records, results: { <item>: { ok: true, applied: false, reason:
+  'not_delegated', record } | { ok: false, error } }, status }` — DKIM without a key says *Generate the
+  DKIM key first* (the key itself is made on the DKIM card, whose zone write is harmless). When the
+  domain is delegated here (or the lookup is inconclusive) the fix writes BIND as before and the answer
+  gains `applied: true` and `delegation`. The audit row records `delegatedHere` / `written:false`.
 
 #### 6.7 Webmail
 
@@ -578,10 +668,40 @@ removed), followed by `update-exim4.conf` and a reload.
 - **Screen:** a link to the webmail with the mailbox name prefilled (the chosen mailbox when it is
   yours, else your first mailbox), or a notice that none is installed.
 - **Server:** `GET /email/webmail?user=` → the agent probes the usual Roundcube, RainLoop and
-  SnappyMail locations (read-only, cached 60 s); the URL is `panel.webmail_url` when the operator
-  set one, else `https://<hostname>/<alias>/` from the detected Apache alias.
+  SnappyMail locations (`web.webmail.detect`, read-only, cached 60 s; Debian's split install —
+  program under `/usr/share/roundcube`, web root `/var/lib/roundcube/public_html` — counts as one
+  install, and an `Alias` pointing at any of its roots is recognised, inside a `<VirtualHost>` or
+  not). The URL is `panel.webmail_url` when the operator set one, else
+  `https://<basic.hostname><alias>/` from the alias found first in the panel's own
+  `keel-host.d/webmail.conf`, then the distribution fragments and the enabled `conf-enabled` /
+  `sites-enabled` files; the answer carries `alias` and `published`. The home page's quick link
+  (`GET /overview/quick-links` → `webmailUrl`) uses the same URL.
+- **Operator side (Panel › Customization › Account panel › Webmail, root):** `GET
+  /api/service-config/webmail` reports the install (`flavor`, `version`, `root`), the hostname
+  site, the publication (`published.{alias,file,managed,source,url}`), a distribution alias that is
+  still global (`globalAlias`, hint to `a2disconf`) and the state of Roundcube's `config.inc.php`
+  (`config.{exists,ok,managed,expected,inSync}`, `ok` from `php -l`). *Publish webmail* (`POST
+  /api/service-config/webmail/publish { reload? }`) runs `ctx.web.hostApps.publish({ name:
+  'webmail', alias: '/webmail', root: <web root>, php: true, allowOverride: 'All', denyDirs:
+  ['config','temp','logs','bin','SQL','vendor','installer','tests'] })` (Roundcube's own `.htaccess` rules stay in
+  force, as in Debian's fragment)
+  — the hostname site is ensured first, the drop-in `keel-host.d/webmail.conf` is configtest-validated
+  and rolled back on error — then appends the Keel block to `/etc/roundcube/config.inc.php`
+  (`imap_host = 'ssl://<hostname>:993'`, `smtp_host = 'tls://<hostname>:587'`, `product_name` =
+  the branding company name; `des_key` and the Debian database include are untouched; the new file
+  is linted with `php -l` before it replaces the old one, owner and mode preserved, previous copy
+  under `/var/lib/whm/backups/config`). *Unpublish* (`DELETE /api/service-config/webmail`) removes
+  the drop-in and strips the block. Audit `webmail.publish` / `webmail.unpublish`; last result in
+  `service_config_applies.webmail`.
+- **Needs:** Roundcube from the distribution (`apt install roundcube roundcube-core roundcube-mysql`
+  — dbconfig creates the `roundcube` database; `501 webmail` otherwise), Apache (`501 apache`), a
+  fully-qualified `basic.hostname` (`422`) with its service certificate so the IMAP/SMTP names in
+  the block verify, and the virtual-mail wiring live for the mailboxes to sign in.
 - **Gotchas:** link and prefilled username only — single sign-on into the webmail is not
-  available in this version.
+  available in this version. The distribution's own alias file (`/etc/roundcube/apache.conf`,
+  symlinked as `conf-enabled/roundcube.conf`, alias commented out on Debian) is never edited; if an
+  operator uncommented it, the status says so and `a2disconf roundcube` keeps the webmail off the
+  customer sites.
 
 #### 6.8 Mail usage
 
@@ -644,10 +764,15 @@ prefix when it is missing, regardless of the console's `db.prefixing` setting.
 
 - **Purpose:** open the database administration tool.
 - **Who:** feature `phpmyadmin`; also while acting.
-- **Screen:** a link when phpMyAdmin is installed and enabled in the console
-  (`db.phpmyadmin.enabled`), with your database user names to log in with.
-- **Server:** `GET /databases/phpmyadmin`.
-- **Gotchas:** link only, no single sign-on; nothing is offered on a PostgreSQL profile.
+- **Screen:** a link when phpMyAdmin is installed, enabled in the console
+  (`db.phpmyadmin.enabled`) and published under the server hostname
+  (`https://<hostname>/phpmyadmin/`, MANUAL-partB §20.9), with your database user names to
+  log in with. "No address yet" means the provider has not published it.
+- **Server:** `GET /databases/phpmyadmin` → `{ installed, url, featureEnabled, version, users }`;
+  `url` is the published address (or the console's URL override), never a guess.
+- **Gotchas:** link only, no single sign-on, and no prefilled user name — phpMyAdmin's cookie
+  login only reads the name from its own form, so type one of the listed users; nothing is
+  offered on a PostgreSQL profile.
 
 ## 8. FTP
 
@@ -897,7 +1022,7 @@ as history* table ([C.9.4](#c94-login-as-history)). The API is `GET/PUT /api/pan
 | `enabled` (`panel.enabled`, default `true`) | Off: every `/api/panel/*` request except this one answers `403 panel_disabled` and `/panel` shows *The account panel is switched off*. Account logins are still created and kept in sync, so turning it on later needs no backfill. |
 | `require2faForUsers` (`panel.require_2fa_for_users`, default `false`) | Force account users to enrol an authenticator before using the panel ([C.3](#c3-password-and-two-factor-rules)); also blocks them from disabling it. |
 | `loginAsTtlMinutes` (`panel.login_as_ttl_minutes`, default 60, 5–480) | How long a "Log in as" context lasts. |
-| `webmailUrl` (`panel.webmail_url`, default empty) | An `http(s)` URL shown as the webmail link and in client settings; empty means auto-detect. |
+| `webmailUrl` (`panel.webmail_url`, default empty) | An `http(s)` URL shown as the webmail link and in client settings; empty means the webmail published under the hostname site (or otherwise detected, [6.7](#67-webmail)). |
 
 The answer also reports the read-only `loginAsAcl` (`panel.login_as_acl`, default `login-as`) and
 `uploadChunkBytes` (`panel.upload_chunk_bytes`, 1,310,720). Other panel keys in the settings table
@@ -941,6 +1066,7 @@ endpoint. The audit log (*Audit log* in the console top bar) carries the matchin
 | `GET /api/panel/admin/accounts/:username/user` | link status: `linked`, `passwordSet`, `passwordSyncedAt`, `totpEnabled`, `suspended`, `lastLoginAt`, `lastLoginIp`, `warnings` (`password_not_synced`). |
 | `POST /api/panel/admin/accounts/:username/user { password? }` | create or adopt the login (idempotent) and, with a password, set it in both stores. |
 | `POST /api/panel/admin/accounts/:username/password { password }` | set the Linux password and the panel hash together (audited `panel.password.admin_set`). |
+| `POST /api/panel/admin/accounts/:username/2fa/reset` | drop the login's authenticator and end its sessions (*List Accounts › Reset 2FA*; audited `panel.admin.2fa.reset`; answers `wasEnabled`, `enrollmentRequired`). |
 
 In normal use none of these is needed: *Create a New Account* with a password and *Account
 Functions › Password Modification* already write the panel hash after the Linux password
@@ -970,6 +1096,7 @@ per-field hints. Console-wide codes (`validation_failed`, `agent_unavailable`, `
 | `demo_mode` (403) | the account is in demo mode. | *Account Functions › Manage Demo Mode*. |
 | `password_change_required` (403) | a forced password change is pending. | Change the password on *Security › Password*. |
 | `two_factor_required` (403) | the panel policy requires 2FA (or the token policy does) and the login has none. | Enrol on *Security › Two-factor authentication*. |
+| `reset_token_invalid` (400) | the forgot-password link is unknown, spent, voided by a newer request or older than 30 minutes. | Request a new link from the login page (C.2). |
 | `feature_disabled` (403) | the package sets the named feature to `false`. | Change the package's feature list in *Packages › Feature Manager*, or upgrade the account. |
 | `limit_reached` (409) | a plan `max_*` is used up (`max_addons`, `max_subdomains`, `max_parked`, `max_email`, `max_ftp`, `max_sql`, forwarders per domain). | Remove something or raise the limit in the package. |
 | `exists` (409) | the domain is hosted elsewhere on the server, the mailbox/forwarder/FTP login/file already exists. | Pick another name, or *Overwrite* for files. |

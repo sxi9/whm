@@ -120,13 +120,58 @@ describe('Email accounts', () => {
     expect(form).toContain('type="password"');
     expect(form).toContain('Storage quota');
     expect(form).toContain('Local part: lowercase letters');
-    const settings = render(h(Accounts.ClientSettings, { settings: { address: 'info@demo.example.com', username: 'info@demo.example.com', hostname: 'srv1.example', imap: { host: 'srv1.example', port: 993, ssl: true, alternative: { port: 143, starttls: true, plainAllowed: false } }, pop3: null, smtp: { host: 'srv1.example', port: 465, ssl: true, alternative: { port: 587, starttls: true }, auth: 'password' }, webmail: 'https://srv1.example/webmail/' } }));
+    const settings = render(h(Accounts.ClientSettings, { settings: { address: 'info@demo.example.com', username: 'info@demo.example.com', hostname: 'srv1.example', imap: { host: 'srv1.example', port: 993, ssl: true, alternative: { port: 143, starttls: true, plainAllowed: false } }, pop3: null, smtp: { host: 'srv1.example', port: 465, ssl: true, alternative: { port: 587, starttls: true }, auth: 'password', submissionPorts: true, ports: { enabled: true, port465: true, port587: true } }, certificate: { dovecot: { name: 'srv1.example', sans: ['srv1.example'], issuer: "Let's Encrypt", selfSigned: false, notAfter: '2027-01-01T00:00:00Z', matchesHostname: true }, exim: null }, webmail: 'https://srv1.example/webmail/' } }));
     expect(settings).toContain('993');
-    expect(settings).toContain('587');
+    expect(settings).toContain('587 with STARTTLS or 465 with TLS');
     expect(settings).toContain('IMAP');
     expect(settings).toContain('Open webmail');
+    expect(settings).toContain('Required — same username and password');
+    expect(settings).toContain('issued by Let&#x27;s Encrypt');
+    expect(settings).not.toContain('Sending is not enabled yet');
+    expect(settings).not.toContain('Only port 25 is open');
     expect(Accounts.usageOf(mailboxes[1]).text).toBe('Unlimited');
     expect(Accounts.usageOf({ quotaMb: 10, usage: null }).text).toBe('Up to 10.0 MB');
+  });
+
+  it('the Connect sheet tells the truth: no AUTH while the wiring is not live, port 25 only without submission ports, 587 alone without TLS, a mismatched certificate', () => {
+    const base = { address: 'info@demo.example.com', username: 'info@demo.example.com', hostname: 'srv1.example', imap: { host: 'srv1.example', port: 993, ssl: true, alternative: { port: 143, starttls: true, plainAllowed: false } }, pop3: null, webmail: null };
+    const notLive = render(h(Accounts.ClientSettings, { settings: { ...base, smtp: { host: 'srv1.example', port: 25, ssl: false, starttls: true, alternative: null, auth: null, submissionPorts: false, ports: { enabled: false, port465: false, port587: false } }, certificate: { dovecot: null, exim: null } } }));
+    expect(notLive).toContain('Sending is not enabled yet — ask your provider');
+    expect(notLive).toContain('Not enabled yet');
+    expect(notLive).not.toContain('Required — same username and password');
+    expect(notLive).toContain('Only port 25 is open for sending');
+    expect(notLive).toContain('>25 with STARTTLS<');
+    expect(notLive).not.toContain('587 with STARTTLS');
+    expect(notLive).toContain('port <strong>25</strong> (STARTTLS)');
+    expect(notLive).toContain('certificate could not be read');
+    const starttlsOnly = render(h(Accounts.ClientSettings, { settings: { ...base, smtp: { host: 'srv1.example', port: 587, ssl: false, starttls: true, alternative: null, auth: 'password', submissionPorts: true, ports: { enabled: true, port465: false, port587: true } }, certificate: { dovecot: { name: 'other.example', sans: [], issuer: null, selfSigned: true, notAfter: null, matchesHostname: false }, exim: null } } }));
+    expect(starttlsOnly).toContain('>587 with STARTTLS<');
+    expect(starttlsOnly).not.toContain('465');
+    expect(starttlsOnly).not.toContain('Only port 25');
+    expect(starttlsOnly).toContain('Required — same username and password');
+    expect(starttlsOnly).toContain('other.example (self-signed)');
+    expect(starttlsOnly).toContain('does not name srv1.example');
+    expect(Accounts.smtpPortsText({ port: 465, submissionPorts: true })).toEqual(['587 with STARTTLS', '465 with TLS']);
+    expect(Accounts.smtpPortsText({ port: 25, submissionPorts: false })).toEqual(['25 with STARTTLS']);
+  });
+
+  it('shows the wiring warning in the empty state and the server password rule in the forms', () => {
+    const warn = { code: 'virtual_mail_not_live', message: 'Exim/Dovecot are not yet wired' };
+    const empty = withFixtures({ '/email/accounts': { data: [], meta: { page: 1, pageSize: 25, total: 0, used: 0, limits: { max_email: 10 }, domains: ['demo.example.com'], defaultQuotaMb: 512, passwordPolicy: { context: 'email', minLength: 8, minStrength: 65 }, warnings: [warn] } } }, () => page(Accounts, 'accounts'));
+    expect(empty).toContain('No mailboxes yet');
+    expect(empty).toContain('Mailboxes are not served yet');
+    expect(empty).toContain('A mailbox you create is saved');
+    const rows = withFixtures({ '/email/accounts': { data: mailboxes, meta: { page: 1, pageSize: 25, total: 2, used: 2, limits: { max_email: 10 }, domains: ['demo.example.com'], defaultQuotaMb: 512, warnings: [{ code: 'virtual_mail_disabled', message: 'off' }] } } }, () => page(Accounts, 'accounts'));
+    expect(rows).toContain('Mailboxes are switched off on this server');
+    expect(rows).toContain('Your mailboxes are saved');
+    const quiet = withFixtures({ '/email/accounts': { data: [], meta: { page: 1, pageSize: 25, total: 0, used: 0, limits: { max_email: 10 }, domains: ['demo.example.com'], defaultQuotaMb: 512, warnings: [] } } }, () => page(Accounts, 'accounts'));
+    expect(quiet).not.toContain('not served yet');
+    expect(Accounts.passwordHelp(null)).toBe('At least 8 characters; use the generator for a strong one.');
+    expect(Accounts.passwordHelp({ minLength: 8, minStrength: 65 })).toContain('strength of 65 out of 100');
+    const form = render(h(Accounts.CreateMailboxForm, { domains: ['demo.example.com'], defaultQuotaMb: 1024, passwordPolicy: { minLength: 8, minStrength: 65 }, onSubmit() {}, onCancel() {}, busy: false, error: null }));
+    expect(form).toContain('At least 8 characters and a strength of 65 out of 100');
+    const change = render(h(Accounts.PasswordForm, { address: 'info@demo.example.com', passwordPolicy: { minLength: 8, minStrength: 40 }, onSubmit() {}, onCancel() {}, busy: false, error: null }));
+    expect(change).toContain('strength of 40 out of 100');
   });
 });
 
@@ -238,10 +283,19 @@ describe('Spam filters', () => {
     expect(html).toContain('Last saved');
     expect(html).not.toContain('not available on this server');
   });
-  it('warns when SpamAssassin is missing but keeps the form; 403 and 501', () => {
-    const html = withFixtures({ '/email/spam': { data: { ...settings, available: false, enabled: false, configured: false, updatedAt: null } } }, () => page(Spam, 'spam'));
+  it('withholds the form with the reason when filtering cannot take effect; 403 and 501', () => {
+    const html = withFixtures({ '/email/spam': { data: { ...settings, available: false, reason: 'spamd_missing', detail: null, enabled: false, configured: false, updatedAt: null } } }, () => page(Spam, 'spam'));
     expect(html).toContain('Spam filtering is not available on this server');
-    expect(html).toContain('Spam threshold');
+    expect(html).toContain('SpamAssassin is not installed');
+    expect(html).toContain('Ask your hosting provider');
+    expect(html).toContain('Re-check');
+    expect(html).not.toContain('Spam threshold');
+    const light = withFixtures({ '/email/spam': { data: { ...settings, available: false, reason: 'exim_no_content_scan', detail: 'This Exim build (exim 4.97, exim4-daemon-light) has no content scanning' } } }, () => page(Spam, 'spam'));
+    expect(light).toContain('built without content scanning');
+    expect(light).toContain('exim4-daemon-light');
+    expect(light).not.toContain('Save spam settings');
+    expect(withFixtures({ '/email/spam': { data: { ...settings, available: false, reason: 'spamd_not_running' } } }, () => page(Spam, 'spam'))).toContain('daemon is not running');
+    expect(Spam.unavailableText('exim_missing')).toMatch(/not installed/);
     expect(withFixtures({ '/email/spam': { error: featureOff } }, () => page(Spam, 'spam'))).toContain('Not included in your plan');
     expect(withFixtures({ '/email/spam': { error: noDaemon } }, () => page(Spam, 'spam'))).toContain('Not available on this server');
     expect(Spam.scoreHint(2)).toMatch(/strict/);

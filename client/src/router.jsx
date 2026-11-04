@@ -4,6 +4,8 @@ import { FUNCTIONS } from './nav.js';
 import { PAGE_REGISTRY } from './pages/registry.js';
 import { HomePage } from './pages/Home.jsx';
 import { LoginPage } from './pages/Login.jsx';
+import { ResetRequestPage } from './pages/auth/ResetRequest.jsx';
+import { ResetConfirmPage } from './pages/auth/ResetConfirm.jsx';
 import { ChangePasswordPage } from './pages/ChangePassword.jsx';
 import { FunctionPage, NotFoundPage } from './pages/FunctionPage.jsx';
 import { AuditLogPage } from './pages/AuditLog.jsx';
@@ -19,6 +21,8 @@ const functionRoutes = FUNCTIONS.map((fn) => {
 
 export const router = createBrowserRouter([
   { path: '/login', element: <LoginPage /> },
+  { path: '/login/reset', element: <ResetRequestPage /> },
+  { path: '/login/reset/:token', element: <ResetConfirmPage /> },
   ...panelRoutes,
   {
     path: '/',

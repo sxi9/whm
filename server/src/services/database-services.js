@@ -15,7 +15,11 @@ import { isRoot } from '../middleware/rbac.js';
 //   databases.dump({ databases, path }, req)        -> mysqldump to a file under an allowed root (backups)
 //   databases.quotaFor(account)                     -> { max, used, remaining }
 //   databases.hostsFor(accountId)                   -> hosts a per-account user is provisioned at
-//   databases.phpMyAdmin(user)                      -> install status and URL (paths root-only)
+//   databases.phpMyAdmin(user)                      -> install status and URL (paths root-only); the URL is the
+//                                                      hostname-site publication (or the root override), never a guess
+//   databases.phpmyadmin.status(user) / publish(user, req, { disableGlobal }) / unpublish(user, req)
+//                                                   -> root: publish under the hostname site via ctx.web.hostApps
+//                                                      (contract §41) and disable the distro's global alias
 //   databases.setClientAddresses({ ipv4, ipv6 }, req) -> source address for connections to remote
 //                                                      profiles (Configure Remote Service IPs)
 
@@ -1016,17 +1020,90 @@ export function createDatabaseServicesService(ctx) {
 
   // ----------------------------------------------------------- phpMyAdmin ---
 
+  const PMA_APP = { name: 'phpmyadmin', alias: '/phpmyadmin' };
+
+  // The hostname site (contract §41) is the only place the panel advertises:
+  // the distro's global alias answers on every customer site with that site's
+  // certificate, so it only counts as an address once the hostname site exists.
+  async function hostnameSite() {
+    if (typeof ctx.web?.hostname?.status !== 'function') return null;
+    try { return await ctx.web.hostname.status(); } catch (err) { logger?.warn?.({ err }, 'phpmyadmin: hostname site status failed'); return null; }
+  }
+
+  function phpMyAdminUrl({ detect, override, hostname, site }) {
+    if (override) return override;
+    if (!hostname) return null;
+    const published = detect.published?.managed && detect.published.alias ? detect.published.alias : null;
+    if (published) return `https://${hostname}${published}/`;
+    if (detect.globalAlias?.enabled && detect.globalAlias.urlPath && site?.exists && site.enabled && site.inSync && site.ssl) return `https://${hostname}${detect.globalAlias.urlPath}/`;
+    return null;
+  }
+
   async function phpMyAdmin(user) {
     let detect;
     try { detect = await agent.op('db.phpmyadmin.detect'); } catch (err) { detect = { installed: false, error: err.message }; }
     const override = settings.get('db.phpmyadmin.url', '') || '';
-    const hostname = settings.get('basic.hostname', '') || '';
-    const url = override || (detect.urlPath ? `https://${hostname}${detect.urlPath}` : null);
+    const hostname = ctx.web?.hostname?.hostname?.() ?? null;
+    const site = detect.installed && !override && !detect.published?.managed ? await hostnameSite() : null;
+    const url = phpMyAdminUrl({ detect, override, hostname, site });
     const common = { installed: Boolean(detect.installed), version: detect.version ?? null, url, php: Boolean(detect.php), featureEnabled: Boolean(settings.get('db.phpmyadmin.enabled', true)) };
     // Install directories, config files and web-server files are root's business.
     if (user && !isRoot(user)) return common;
-    return { ...detect, ...common, urlOverride: override, hostname };
+    return { ...detect, ...common, urlOverride: override, hostname: settings.get('basic.hostname', '') || '', fqdn: Boolean(hostname), published: detect.published ?? null, globalAlias: detect.globalAlias ?? null };
   }
+
+  function requirePhpMyAdmin(detect) {
+    if (!detect.installed) throw new CapabilityError('phpmyadmin', `phpMyAdmin is not installed on this server${detect.packageHint ? ` (${detect.packageHint})` : ''}`);
+  }
+
+  function requireHostApps() {
+    if (typeof ctx.web?.hostApps?.publish !== 'function') throw new CapabilityError('apache', 'Apache is not managed on this server; the hostname site cannot publish phpMyAdmin');
+  }
+
+  const phpmyadmin = {
+    async status(user) {
+      assertRoot(user, 'Inspecting the phpMyAdmin publication');
+      const r = await phpMyAdmin(user);
+      const site = await hostnameSite();
+      const published = Boolean(r.published?.managed);
+      const hints = [];
+      if (r.installed && !r.fqdn) hints.push({ code: 'hostname_not_fqdn', message: 'Set a fully-qualified server hostname in Basic Setup before publishing phpMyAdmin.' });
+      if (r.installed && !published && site && site.fqdn && !site.exists) hints.push({ code: 'hostname_site_missing', message: `No site answers for ${site.url}; publishing writes it first (it needs the Apache service certificate for a trusted address).` });
+      if (r.globalAlias?.enabled) hints.push({ code: 'global_alias', message: `${r.globalAlias.path} serves ${r.globalAlias.urlPath} on every customer web site; publishing disables it.` });
+      if (r.installed && !r.dbConfigured) hints.push({ code: 'db_not_configured', message: 'No /etc/phpmyadmin/config-db.php (dbconfig-common): bookmarks and relations are unavailable until "dpkg-reconfigure phpmyadmin" runs.' });
+      return { ...r, published, site: site ? { hostname: site.hostname, fqdn: site.fqdn, url: site.url, exists: site.exists, enabled: site.enabled, inSync: site.inSync, ssl: site.ssl, certificate: site.certificate } : null, hints };
+    },
+    async publish(user, req, { disableGlobal = true } = {}) {
+      assertRoot(user, 'Publishing phpMyAdmin');
+      requireHostApps();
+      const detect = await agent.op('db.phpmyadmin.detect');
+      requirePhpMyAdmin(detect);
+      // Debian's own apache.conf shape: templates/ and libraries/ are never served, setup/ sits behind
+      // an (empty) htpasswd there and is denied here; symlinks only when owned alike.
+      const app = await ctx.web.hostApps.publish({ ...PMA_APP, root: detect.dir, php: true, options: ['+SymLinksIfOwnerMatch'], directoryIndex: ['index.php'], denyDirs: ['libraries', 'templates', 'setup'] }, req);
+      const warnings = [...(app.warnings || [])];
+      let globalAlias = { enabled: Boolean(detect.globalAlias?.enabled), disabled: false, path: detect.globalAlias?.path ?? null };
+      if (disableGlobal && detect.globalAlias?.enabled) {
+        if (detect.globalAlias.a2disconf) {
+          try {
+            const r = await agent.op('db.phpmyadmin.global_conf.disable', {}, { req });
+            globalAlias = { ...globalAlias, enabled: false, disabled: Boolean(r.changed), reloaded: Boolean(r.reloaded) };
+          } catch (err) {
+            warnings.push({ code: 'global_alias_kept', message: `The global ${detect.globalAlias.path} could not be disabled: ${err.message}` });
+          }
+        } else warnings.push({ code: 'global_alias_kept', message: `${detect.globalAlias.path} is a distribution file outside Debian's a2disconf; disable it by hand so /phpmyadmin stops answering on customer sites.` });
+      }
+      req?.audit?.({ action: 'db.phpmyadmin.publish', target: app.url, args: { root: detect.dir, path: app.path, changed: app.changed, reloaded: app.reloaded, globalAlias, warnings: warnings.map((w) => w.code) } });
+      return { published: true, url: app.url, path: app.path, alias: app.alias, root: app.root, changed: Boolean(app.changed), reloaded: Boolean(app.reloaded), validated: app.validated ?? null, globalAlias, warnings };
+    },
+    async unpublish(user, req) {
+      assertRoot(user, 'Unpublishing phpMyAdmin');
+      requireHostApps();
+      const r = await ctx.web.hostApps.unpublish(PMA_APP.name, req);
+      req?.audit?.({ action: 'db.phpmyadmin.unpublish', target: PMA_APP.alias, args: { path: r.path, removed: r.removed, reloaded: r.reloaded } });
+      return { published: false, removed: Boolean(r.removed), reloaded: Boolean(r.reloaded), path: r.path };
+    },
+  };
 
   function setPhpMyAdminUrl(url, user, req) {
     assertRoot(user, 'Configuring phpMyAdmin');
@@ -1124,7 +1201,7 @@ export function createDatabaseServicesService(ctx) {
     enqueueRepair, runRepair, repairHistory,
     processes, kill,
     upgradeStatus, enqueueUpgrade, runUpgrade,
-    phpMyAdmin, setPhpMyAdminUrl,
+    phpMyAdmin, setPhpMyAdminUrl, phpmyadmin,
     forAccount, removeAccountData, dump,
     PRIVILEGES, PG_PRIVILEGES, KNOWN_TUNABLES,
   };

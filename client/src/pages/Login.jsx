@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useLocation, useNavigate, Navigate, useSearchParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, Navigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext.jsx';
 import { api } from '../api/client.js';
 import { Field, TextInput, Button, ErrorBanner } from '../components/Form.jsx';
@@ -25,6 +25,10 @@ export function LoginPage() {
   const [code, setCode] = useState('');
   const [stage, setStage] = useState(params.get('stage') === '2fa' ? '2fa' : 'credentials');
   const [providers, setProviders] = useState([]);
+  // Forgot-password exists only for account users, and only while the account
+  // panel is on and the server can send mail (GET /api/auth/reset).
+  const [resetEnabled, setResetEnabled] = useState(false);
+  const resetDone = params.get('reset') === 'done';
   const [error, setError] = useState(() => {
     const key = params.get('error');
     return key ? { message: [EXTERNAL_ERRORS[key] || 'Sign-in failed.', params.get('message')].filter(Boolean).join(' ') } : null;
@@ -34,6 +38,7 @@ export function LoginPage() {
 
   useEffect(() => {
     api.get('/auth/external').then(({ data }) => setProviders(data.providers || [])).catch(() => setProviders([]));
+    api.get('/auth/reset').then(({ data }) => setResetEnabled(Boolean(data.enabled))).catch(() => setResetEnabled(false));
   }, []);
 
   if (ready && user) return <Navigate to={landingFor(user, location.state?.from)} replace />;
@@ -68,6 +73,7 @@ export function LoginPage() {
         </div>
         <h1>{stage === 'credentials' ? 'Sign in' : 'Two-factor authentication'}</h1>
         {branding.loginNotice && <div className="banner banner-info login-notice"><div className="markdown">{renderMarkdown(branding.loginNotice)}</div></div>}
+        {resetDone && stage === 'credentials' && !error && <div className="banner banner-info">Your password was changed. Sign in with the new one.</div>}
         <ErrorBanner error={error} />
         {stage === 'credentials' ? (
           <>
@@ -81,6 +87,7 @@ export function LoginPage() {
         )}
         <Button type="submit" variant="primary" loading={loading} style={{ width: '100%', marginTop: 6 }}>{stage === 'credentials' ? 'Sign in' : 'Verify'}</Button>
         {stage === '2fa' && <button type="button" className="link-button" onClick={() => { setStage('credentials'); setCode(''); setError(null); }}>Back</button>}
+        {stage === 'credentials' && resetEnabled && <div className="login-foot"><Link to="/login/reset">Forgot password?</Link></div>}
         {stage === 'credentials' && providers.length > 0 && (
           <div className="login-external">
             <div className="login-divider"><span>or</span></div>

@@ -35,6 +35,12 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/etc/aliases',
   '/etc/resolv.conf',
   '/var/cache/whm',
+  // Web applications published under the server-hostname site (web.host.app.*) and their distro
+  // configuration: Debian names, then the RHEL/Remi packages and the bare-tarball locations that
+  // webmail.js WEBMAIL_CANDIDATES and db.js PMA_DIRS / PMA_CONFIGS probe (keep the lists in step).
+  '/usr/share/roundcube', '/var/lib/roundcube', '/etc/roundcube', '/usr/share/phpmyadmin', '/var/lib/phpmyadmin', '/etc/phpmyadmin',
+  '/usr/share/roundcubemail', '/etc/roundcubemail', '/usr/share/phpMyAdmin', '/etc/phpMyAdmin', '/opt/phpmyadmin', '/srv/phpmyadmin',
+  '/usr/share/nginx/html/roundcube', '/usr/share/rainloop', '/usr/share/snappymail',
 ];
 
 export function createContext({ allowedRoots = DEFAULT_ALLOWED_ROOTS, principal = null, log = () => {} } = {}) {

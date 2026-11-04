@@ -87,8 +87,9 @@ function ToolCard({ fn, favorite, onToggle, label, description }) {
   );
 }
 
-// Quick links: the operator's app shortcuts, news and webmail (GET /overview/quick-links).
-export function QuickLinks({ links, webmailUrl }) {
+// Quick links: the operator's app shortcuts, news and webmail (GET /overview/quick-links;
+// webmailUrl there is the operator's setting or the webmail published under the hostname site).
+export function QuickLinks({ links, webmailUrl = null }) {
   const apps = links?.apps || [];
   const news = links?.news || [];
   const webmail = links?.webmailUrl || webmailUrl;
@@ -142,7 +143,7 @@ export function PanelHome({ header = null }) {
       </div>
       )}
 
-      <QuickLinks links={linksReq.data} webmailUrl={null} />
+      <QuickLinks links={linksReq.data} />
 
       <div className="home">
         <div className="home-main">

@@ -4,7 +4,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { z } from 'zod';
 import { exec, hasBinary } from '../exec.js';
-import { defineOp, arg, OpError, ensurePrivateDir } from './registry.js';
+import { defineOp, arg, OpError, ensurePrivateDir, runOp } from './registry.js';
+import { apacheLayout, HOST_VHOST, parseHostMeta } from './web.js';
 
 // Database Services op family. MySQL/MariaDB administration goes through the
 // mysql CLI with --defaults-extra-file pointing at a 0600 temp file that holds the
@@ -849,8 +850,10 @@ defineOp('db.upgrade_tables', {
 
 // ----------------------------------------------------------- phpMyAdmin ---
 
-const PMA_DIRS = ['/usr/share/phpmyadmin', '/usr/share/phpMyAdmin', '/var/www/html/phpmyadmin', '/var/www/phpmyadmin', '/opt/phpmyadmin', '/srv/phpmyadmin', '/usr/local/cpanel/base/3rdparty/phpMyAdmin', '/var/lib/whm/phpmyadmin'];
-const PMA_CONFIGS = ['/etc/phpmyadmin/config.inc.php', '/etc/phpMyAdmin/config.inc.php'];
+// Every entry but the cPanel one is under DEFAULT_ALLOWED_ROOTS (lib.js), which web.host.app.write
+// pins the published root against.
+export const PMA_DIRS = ['/usr/share/phpmyadmin', '/usr/share/phpMyAdmin', '/var/www/html/phpmyadmin', '/var/www/phpmyadmin', '/opt/phpmyadmin', '/srv/phpmyadmin', '/usr/local/cpanel/base/3rdparty/phpMyAdmin', '/var/lib/whm/phpmyadmin'];
+export const PMA_CONFIGS = ['/etc/phpmyadmin/config.inc.php', '/etc/phpMyAdmin/config.inc.php'];
 const PMA_WEB_CONFS = ['/etc/apache2/conf-enabled/phpmyadmin.conf', '/etc/apache2/conf-available/phpmyadmin.conf', '/etc/httpd/conf.d/phpMyAdmin.conf', '/etc/httpd/conf.d/phpmyadmin.conf', '/etc/nginx/conf.d/phpmyadmin.conf', '/etc/nginx/snippets/phpmyadmin.conf', '/etc/nginx/sites-enabled/phpmyadmin'];
 
 export function phpMyAdminVersion(dir) {
@@ -863,8 +866,37 @@ export function phpMyAdminVersion(dir) {
   return version;
 }
 
+// Debian's conf-enabled/phpmyadmin.conf (and RHEL's conf.d/phpMyAdmin.conf) is
+// loaded outside any <VirtualHost>, so its Alias answers on every customer
+// site. The panel publishes phpMyAdmin under the hostname site instead
+// (web.host.app.write) and reports the global file so it can be disabled.
+const PMA_GLOBAL_CONF = { name: 'phpmyadmin', available: '/etc/apache2/conf-available/phpmyadmin.conf', enabled: '/etc/apache2/conf-enabled/phpmyadmin.conf' };
+const PMA_PUBLISHED_CONFS = ['/etc/apache2', '/etc/httpd'].map((root) => path.join(root, HOST_VHOST.appsDirName, 'phpmyadmin.conf'));
+const HOST_APP_MARK = '# keel-host-app ';
+
+export function classifyPhpMyAdminWebConf(file, text) {
+  const alias = text.match(/^\s*Alias\s+(\S+)\s+(\S+)/mi) || text.match(/^\s*location\s+(\S+)\s*\{/mi);
+  const server = file.includes('nginx') ? 'nginx' : 'apache';
+  const inVhost = /<VirtualHost\b/i.test(text);
+  return {
+    path: file, enabled: !file.includes('conf-available'), server, urlPath: alias?.[1] || null,
+    // An Apache Alias outside a <VirtualHost> block applies to every site.
+    global: server === 'apache' && Boolean(alias) && !inVhost,
+  };
+}
+
+export function phpMyAdminPublished(io = { readText }) {
+  for (const file of PMA_PUBLISHED_CONFS) {
+    const text = io.readText(file);
+    if (text == null) continue;
+    const meta = parseHostMeta(text, HOST_APP_MARK);
+    return { path: file, managed: text.includes(HOST_APP_MARK), alias: meta?.alias ?? null, root: meta?.root ?? null, php: meta?.php ?? null };
+  }
+  return null;
+}
+
 defineOp('db.phpmyadmin.detect', {
-  description: 'Whether phpMyAdmin is installed, its version, config file and the web server alias that serves it',
+  description: 'Whether phpMyAdmin is installed, its version, config file, the distro web-server alias (global = served on every site) and the panel-published keel-host.d/phpmyadmin.conf',
   run: async () => {
     const dir = PMA_DIRS.find((d) => exists(path.join(d, 'index.php'))) || null;
     const configFile = PMA_CONFIGS.find(exists) || (dir && exists(path.join(dir, 'config.inc.php')) ? path.join(dir, 'config.inc.php') : null);
@@ -872,15 +904,38 @@ defineOp('db.phpmyadmin.detect', {
     for (const f of PMA_WEB_CONFS) {
       const text = readText(f);
       if (text == null) continue;
-      const alias = text.match(/^\s*Alias\s+(\S+)\s+(\S+)/mi) || text.match(/^\s*location\s+(\S+)\s*\{/mi);
-      web.push({ path: f, enabled: !f.includes('conf-available'), server: f.includes('nginx') ? 'nginx' : 'apache', urlPath: alias?.[1] || null });
+      web.push(classifyPhpMyAdminWebConf(f, text));
     }
-    const active = web.find((w) => w.enabled && w.urlPath) || null;
+    const published = phpMyAdminPublished();
+    const globalEnabled = web.find((w) => w.enabled && w.global) || null;
+    const active = (published?.managed && published.alias ? { urlPath: published.alias } : null) || web.find((w) => w.enabled && w.urlPath) || null;
     return {
       installed: Boolean(dir), dir, version: dir ? phpMyAdminVersion(dir) : null, configFile, webConfigs: web, urlPath: active?.urlPath || null,
       php: hasBinary('php'), candidates: PMA_DIRS,
+      // dbconfig-common writes config-db.php (control user + pma database); without it phpMyAdmin still works, minus bookmarks/relations.
+      dbConfigured: exists('/etc/phpmyadmin/config-db.php'),
+      globalAlias: { enabled: Boolean(globalEnabled), path: globalEnabled?.path ?? (exists(PMA_GLOBAL_CONF.available) ? PMA_GLOBAL_CONF.available : null), urlPath: globalEnabled?.urlPath ?? null, a2disconf: hasBinary('a2disconf') && exists(PMA_GLOBAL_CONF.enabled) },
+      published,
       packageHint: hasBinary('apt-get') ? 'apt-get install phpmyadmin' : hasBinary('dnf') ? 'dnf install phpMyAdmin' : hasBinary('yum') ? 'yum install phpMyAdmin' : null,
     };
+  },
+});
+
+defineOp('db.phpmyadmin.global_conf.disable', {
+  description: "Disable the distribution's global phpMyAdmin Apache include (a2disconf phpmyadmin on Debian), so the /phpmyadmin alias stops answering on every customer site; validates and reloads Apache",
+  destructive: true,
+  schema: z.object({ reload: z.boolean().default(true) }).strict(),
+  run: async ({ reload }, ctx) => {
+    const apache = apacheLayout();
+    if (!apache?.bin) throw new OpError('capability_missing', 'Apache is not installed on this server');
+    if (apache.flavor !== 'debian') throw new OpError('unsupported', `The global phpMyAdmin include is a distribution file (${apache.confD}/phpMyAdmin.conf); move its Alias into a virtual host by hand`);
+    if (!hasBinary('a2disconf')) throw new OpError('capability_missing', 'a2disconf is not available on this server');
+    const link = ctx.assertAllowedPath(PMA_GLOBAL_CONF.enabled, 'write');
+    if (!exists(link)) return { path: link, disabled: true, changed: false, reloaded: false, validated: null };
+    const r = await exec('a2disconf', ['-q', PMA_GLOBAL_CONF.name], { allowFailure: true, timeoutMs: 60_000 });
+    if (r.code !== 0 || exists(link)) throw new OpError('refused', `a2disconf ${PMA_GLOBAL_CONF.name} failed: ${`${r.stderr}\n${r.stdout}`.trim().split('\n').pop()}`);
+    const result = reload ? await runOp('web.reload', {}, ctx) : { validated: null, reloaded: false };
+    return { path: link, disabled: true, changed: true, reloaded: Boolean(result.reloaded), validated: result.validated ?? null, unit: result.unit ?? null };
   },
 });
 

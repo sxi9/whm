@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Plus, X, ShieldOff } from 'lucide-react';
-import { Card, StatusPill, formatDate } from '../../../components/Common.jsx';
+import { Card, EmptyState, StatusPill, formatDate } from '../../../components/Common.jsx';
 import { Field, TextInput, NumberInput, Toggle, Button, FormActions } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { PanelPage, PendingPill } from '../../../panel/PanelPage.jsx';
@@ -92,6 +92,32 @@ export function SpamSettingsForm({ current, onSubmit, busy, error, pending }) {
   );
 }
 
+// Why saved settings would not act on this server (GET /email/spam reason).
+export function unavailableText(reason) {
+  switch (reason) {
+    case 'exim_no_content_scan': return 'The mail server was built without content scanning, so it cannot hand incoming mail to SpamAssassin.';
+    case 'spamd_not_running': return 'SpamAssassin is installed but its daemon is not running, so incoming mail is not scored.';
+    case 'exim_missing': return 'The mail server (Exim) is not installed, so there is no incoming mail to filter.';
+    case 'spamd_missing':
+    default: return 'SpamAssassin is not installed, so incoming mail is not scored.';
+  }
+}
+
+// Settings cannot take effect: the form is withheld rather than saved as if
+// it filtered anything (the API refuses the save with 501/422 as well).
+export function SpamUnavailable({ reason, detail, onRetry }) {
+  return (
+    <Card>
+      <EmptyState icon={ShieldOff} title="Spam filtering is not available on this server">
+        <p>{unavailableText(reason)}</p>
+        {detail && <p className="muted">{detail}</p>}
+        <p className="muted">Ask your hosting provider to enable it. Your other mail settings keep working.</p>
+        {onRetry && <p><button className="btn btn-sm" onClick={onRetry}>Re-check</button></p>}
+      </EmptyState>
+    </Card>
+  );
+}
+
 export default function SpamFilters({ fn }) {
   const toast = useToast();
   const { data, error, loading, refetch, setData } = usePanelApi('/email/spam');
@@ -113,10 +139,8 @@ export default function SpamFilters({ fn }) {
         <>
           {error && <Card><PanelRequestError error={error} fn={fn} onRetry={refetch} /></Card>}
           {loading && !data && !error && <Card><p className="muted">Loading…</p></Card>}
-          {data && data.available === false && (
-            <div className="banner banner-warning"><ShieldOff size={18} /><div><strong>Spam filtering is not available on this server</strong><p>SpamAssassin is not installed, so these settings cannot take effect yet. Ask your hosting provider to enable it.</p></div></div>
-          )}
-          {data && <SpamSettingsForm current={data} onSubmit={save} busy={busy} error={mutationError} pending={pending} />}
+          {data && data.available === false && <SpamUnavailable reason={data.reason} detail={data.detail} onRetry={refetch} />}
+          {data && data.available !== false && <SpamSettingsForm current={data} onSubmit={save} busy={busy} error={mutationError} pending={pending} />}
         </>
       )}
     </PanelPage>

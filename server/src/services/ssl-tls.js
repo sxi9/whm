@@ -824,6 +824,8 @@ export function createSslService(ctx) {
     const result = await pemOp('ssl.service_cert.install', { service, certPem, keyPem, ...(chainPem ? { chainPem } : {}) }, req);
     stmts.upsertServiceCert.run({ service, cert_pem: certPem, key_enc: crypto.encrypt(keyPem), chain_pem: chainPem ?? null, not_after: result.certificate?.notAfter ?? null });
     req?.audit?.({ action: 'ssl.service_cert.install', target: service, args: { issuer: result.certificate?.issuerText, notAfter: result.certificate?.notAfter, applied: result.applied, removed: result.removed, reload: result.reload } });
+    // The server-hostname site carries the Apache copy (contract §41); a failure there is reported, never a failed install.
+    if (service === 'apache' && typeof ctx.web?.hostname?.ensure === 'function') result.hostnameSite = await ctx.web.hostname.ensure(req).catch((err) => { logger.warn({ err }, 'ssl: hostname site refresh failed'); return { written: false, error: err.message }; });
     return result;
   }
 

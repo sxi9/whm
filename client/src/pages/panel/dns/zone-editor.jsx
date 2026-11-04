@@ -8,6 +8,7 @@ import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { PanelPage, PanelCapabilityState, PendingPill } from '../../../panel/PanelPage.jsx';
 import { usePanelApi, panelApi } from '../../../panel/hooks/usePanel.js';
+import { DelegationBanner, notDelegatedHere } from '../../../panel/DelegationBanner.jsx';
 
 export const RECORD_TYPES = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'SRV', 'CAA'];
 const HOST_TYPES = new Set(['CNAME', 'MX']);
@@ -156,11 +157,14 @@ export default function ZoneEditor({ fn }) {
   const typeCounts = useMemo(() => records.reduce((acc, r) => ({ ...acc, [r.type]: (acc[r.type] || 0) + 1 }), {}), [records]);
   const summary = list.find((z) => z.domain === selected);
   const types = zones.data?.types || RECORD_TYPES;
+  const delegation = zone.data?.delegation || summary?.delegation || null;
+  const elsewhere = notDelegatedHere(delegation);
 
   const onSaved = (data) => {
     setEditing(null);
     setLast(data);
-    toast.success(data.applied === false ? 'Record saved; it is published once DNS is available on this server' : `Record saved and published (serial ${data.serial})`);
+    if (elsewhere) toast.warning(`Record saved here, but DNS for ${selected} is managed elsewhere: add it there as well`);
+    else toast.success(data.applied === false ? 'Record saved; it is published once DNS is available on this server' : `Record saved and published (serial ${data.serial})`);
     zone.refetch();
     zones.refetch();
   };
@@ -211,11 +215,13 @@ export default function ZoneEditor({ fn }) {
             <div className="stat"><div className="label">Serial</div><div className="value">{summary?.serial ?? '—'}</div></div>
             <div className="stat"><div className="label">Last change</div><div className="value" style={{ fontSize: 15 }}>{summary?.updatedAt ? formatDate(summary.updatedAt) : '—'}</div></div>
             <div className="stat"><div className="label">DNS server</div><div className="value" style={{ fontSize: 15 }}>{zone.data ? (zone.data.published ? <StatusPill status="ok">Serving this zone</StatusPill> : <StatusPill status="pending">Not yet publishing</StatusPill>) : '—'}{summary?.dnssecEnabled && <> <StatusPill status="enabled">DNSSEC</StatusPill></>}</div></div>
+            <div className="stat"><div className="label">Public DNS</div><div className="value" style={{ fontSize: 15 }}>{delegation ? (delegation.delegatedHere === true ? <StatusPill status="ok">Delegated here</StatusPill> : delegation.delegatedHere === false ? <StatusPill status="warning">Managed elsewhere</StatusPill> : <StatusPill status="unknown">Unknown</StatusPill>) : '—'}</div></div>
             {summary?.sync?.length > 0 && <div className="stat"><div className="label">Cluster sync</div><div className="value" style={{ fontSize: 15 }}>{summary.sync.map((x) => `${x.cluster}: ${x.status}`).join(', ')}</div></div>}
           </div>
         </Card>
       )}
-      {zone.data && zone.data.published === false && (
+      {selected && <DelegationBanner domain={selected} delegation={delegation} />}
+      {zone.data && zone.data.published === false && !elsewhere && (
         <div className="banner banner-info"><Info size={18} /><div><strong>Changes are saved, not yet served</strong><p>The DNS server on this host is not running, so records are kept here and published as soon as it is. Ask your hosting provider if this persists.</p></div></div>
       )}
       {selected && (

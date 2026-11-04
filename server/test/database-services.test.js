@@ -48,9 +48,18 @@ function mysqlAgent() {
     'db.packages': () => ({ manager: 'apt', installed: [{ name: 'mariadb-server', version: '1:10.11.6-0+deb12u1', installed: true }], available: [{ name: 'mariadb-server', candidate: '1:10.11.8-0+deb12u1', installed: '1:10.11.6-0+deb12u1' }], engine: 'mariadb' }),
     'db.upgrade_tables': () => ({ ran: true, tool: 'mariadb-upgrade', exitCode: 0, output: 'OK' }),
     'db.dump': ({ path }) => ({ path, sizeBytes: 2048, databases: 'all' }),
-    'db.phpmyadmin.detect': () => ({ installed: true, dir: '/usr/share/phpmyadmin', version: '5.2.1', configFile: '/etc/phpmyadmin/config.inc.php', webConfigs: [{ path: '/etc/apache2/conf-enabled/phpmyadmin.conf', enabled: true, server: 'apache', urlPath: '/phpmyadmin' }], urlPath: '/phpmyadmin', php: true, candidates: [], packageHint: 'apt-get install phpmyadmin' }),
+    // Freshly apt-installed: Debian's global alias is enabled, nothing published yet.
+    'db.phpmyadmin.detect': () => ({ installed: true, dir: '/usr/share/phpmyadmin', version: '5.2.1', configFile: '/etc/phpmyadmin/config.inc.php', webConfigs: [{ path: '/etc/apache2/conf-enabled/phpmyadmin.conf', enabled: true, server: 'apache', urlPath: '/phpmyadmin', global: true }], urlPath: '/phpmyadmin', php: true, candidates: [], dbConfigured: true, globalAlias: { enabled: true, path: '/etc/apache2/conf-enabled/phpmyadmin.conf', urlPath: '/phpmyadmin', a2disconf: true }, published: null, packageHint: 'apt-get install phpmyadmin' }),
+    'db.phpmyadmin.global_conf.disable': () => { state.globalAliasDisabled = true; return { path: '/etc/apache2/conf-enabled/phpmyadmin.conf', disabled: true, changed: true, reloaded: true, validated: true, unit: 'apache2' }; },
+    'web.host.ensure': ({ hostname, reload = true }) => ({ hostname, path: '/etc/apache2/sites-available/keel-host.conf', link: '/etc/apache2/sites-enabled/keel-host.conf', docroot: '/var/www/keel-host', docrootCreated: false, indexWritten: false, appsDir: '/etc/apache2/keel-host.d', phpSocket: '/run/php/php8.5-fpm.sock', ssl: true, certificate: { fullchain: '/etc/ssl/whm/service/apache/fullchain.pem', key: '/etc/ssl/whm/service/apache/key.pem', present: true }, changed: false, validated: null, reloaded: false, unit: reload ? 'apache2' : null, warnings: [] }),
+    'web.host.status': () => ({ installed: true, flavor: 'debian', path: '/etc/apache2/sites-available/keel-host.conf', link: '/etc/apache2/sites-enabled/keel-host.conf', exists: true, managed: true, enabled: true, hostname: 'panel.example.com', meta: { hostname: 'panel.example.com', ssl: true }, ssl: true, certificate: { fullchain: '/etc/ssl/whm/service/apache/fullchain.pem', key: '/etc/ssl/whm/service/apache/key.pem', present: true }, docroot: '/var/www/keel-host', docrootExists: true, phpSocket: '/run/php/php8.5-fpm.sock', appsDir: '/etc/apache2/keel-host.d', apps: [] }),
+    'web.host.app.write': ({ name, alias, root, reload = true }) => { state.hostApps.set(name, { alias, root }); return { name, alias: alias.replace(/\/+$/, ''), root, path: `/etc/apache2/keel-host.d/${name}.conf`, phpSocket: '/run/php/php8.5-fpm.sock', vhostPresent: true, changed: true, validated: true, reloaded: reload, unit: reload ? 'apache2' : null, warnings: [] }; },
+    'web.host.app.remove': ({ name }) => { const removed = state.hostApps.delete(name); return { name, path: `/etc/apache2/keel-host.d/${name}.conf`, removed, validated: removed ? true : null, reloaded: removed, unit: removed ? 'apache2' : null }; },
+    'web.host.app.list': () => ({ installed: true, appsDir: '/etc/apache2/keel-host.d', vhostPresent: true, apps: [...state.hostApps].map(([name, a]) => ({ name, path: `/etc/apache2/keel-host.d/${name}.conf`, managed: true, alias: a.alias, root: a.root, php: true, meta: {}, mtime: '2026-11-05T00:00:00.000Z' })) }),
     'pkg.install': ({ packages }) => { state.installed.push(...packages); return { manager: 'apt', packages, output: packages.map((p) => `Setting up ${p} (1:10.11.8-0+deb12u1) ...`) }; },
   };
+  state.hostApps = new Map();
+  state.globalAliasDisabled = false;
   const agent = createMockAgent(ops);
   agent.state = state;
   agent.ops = ops;
@@ -667,21 +676,119 @@ describe('Database Services API (MariaDB via mock agent)', () => {
   });
 
   describe('phpMyAdmin', () => {
-    it('detects the install and builds the URL, with a root-only override', async () => {
+    let previousHostname;
+    const PUBLISHED = { path: '/etc/apache2/keel-host.d/phpmyadmin.conf', managed: true, alias: '/phpmyadmin', root: '/usr/share/phpmyadmin', php: true };
+    const detectWith = (patch) => app.agent.set('db.phpmyadmin.detect', () => ({ ...app.agent.ops['db.phpmyadmin.detect'](), ...patch }));
+    // agent.reset() falls back to the bare mock, not to this suite's ops.
+    const restore = (name) => app.agent.set(name, app.agent.ops[name]);
+    // The hostname site needs Apache (contract §41): provision apache2ctl for this block only.
+    beforeAll(async () => {
+      previousHostname = app.ctx.settings.get('basic.hostname');
+      app.ctx.settings.set('basic.hostname', 'panel.example.com');
+      app.agent.set('sys.binaries', ({ names }) => Object.fromEntries(names.map((n) => [n, ['mysql', 'mysqld', 'mysqlcheck', 'mysqldump', 'mariadb-upgrade', 'systemctl', 'apache2ctl'].includes(n)])));
+      await app.ctx.capabilities.refresh();
+    });
+    afterAll(async () => {
+      app.ctx.settings.set('basic.hostname', previousHostname);
+      restore('sys.binaries');
+      restore('db.phpmyadmin.detect');
+      await app.ctx.capabilities.refresh();
+    });
+
+    it('detects the install and only advertises an address the hostname site really serves, with a root-only override', async () => {
       const res = await get('/phpmyadmin').expect(200);
-      expect(res.body.data).toMatchObject({ installed: true, version: '5.2.1', urlPath: '/phpmyadmin' });
-      expect(res.body.data.url).toMatch(/^https:\/\/.+\/phpmyadmin$/);
+      // Global alias + hostname site in sync: the address works, but it is the global file that serves it.
+      expect(res.body.data).toMatchObject({ installed: true, version: '5.2.1', urlPath: '/phpmyadmin', url: 'https://panel.example.com/phpmyadmin/', fqdn: true, published: null, globalAlias: { enabled: true, a2disconf: true } });
       expect(res.body.data.configFile).toBe('/etc/phpmyadmin/config.inc.php');
+      // No hostname site: the global alias alone lands on a customer vhost, so no address is advertised.
+      app.agent.set('web.host.status', () => ({ installed: true, exists: false, enabled: false, managed: null, hostname: null, ssl: false, certificate: { present: true }, apps: [] }));
+      try { expect((await rGet('/phpmyadmin').expect(200)).body.data.url).toBeNull(); } finally { restore('web.host.status'); }
       await put('/phpmyadmin', { url: 'https://pma.example.com/' }).expect(200);
       const mine = await rGet('/phpmyadmin').expect(200);
       expect(mine.body.data).toEqual({ installed: true, version: '5.2.1', url: 'https://pma.example.com/', php: true, featureEnabled: true });
-      expect(JSON.stringify(mine.body.data)).not.toMatch(/\/usr\/share|\/etc\/|webConfigs|candidates|packageHint/);
+      expect(JSON.stringify(mine.body.data)).not.toMatch(/\/usr\/share|\/etc\/|webConfigs|candidates|packageHint|published|globalAlias/);
       await rPut('/phpmyadmin', { url: '' }).expect(403);
       await put('/phpmyadmin', { url: 'javascript:alert(1)' }).expect(422);
       await put('/phpmyadmin', { url: '//evil.example/pma' }).expect(422);
       await put('/phpmyadmin', { url: 'https:///nohost' }).expect(422);
       await put('/phpmyadmin', { url: '/pma' }).expect(200);
       await put('/phpmyadmin', { url: '' }).expect(200);
+    });
+
+    it('publishes under the hostname site, disables the global alias and unpublishes again (root only, audited)', async () => {
+      const status = await get('/phpmyadmin/publish').expect(200);
+      expect(status.body.data).toMatchObject({ installed: true, published: false, site: { hostname: 'panel.example.com', fqdn: true, exists: true, inSync: true, ssl: true } });
+      expect(status.body.data.hints.map((h) => h.code)).toContain('global_alias');
+      for (const [method, path] of [['get', '/phpmyadmin/publish'], ['post', '/phpmyadmin/publish'], ['delete', '/phpmyadmin/publish']]) {
+        expect((await resellerHttp[method](`/api/databases${path}`).set('X-CSRF-Token', resellerCsrf).send({})).status).toBe(403);
+      }
+      await post('/phpmyadmin/publish', { disableGlobal: 'yes' }).expect(422);
+
+      const res = await post('/phpmyadmin/publish', {}).expect(200);
+      expect(res.body.data).toMatchObject({ published: true, url: 'https://panel.example.com/phpmyadmin/', path: '/etc/apache2/keel-host.d/phpmyadmin.conf', alias: '/phpmyadmin', root: '/usr/share/phpmyadmin', changed: true, reloaded: true, globalAlias: { enabled: false, disabled: true }, warnings: [] });
+      const write = app.agent.callsTo('web.host.app.write');
+      expect(write).toHaveLength(1);
+      // Never weaker than Debian's fragment: setup/ (the wizard, htpasswd-gated there) is denied with libraries/ and templates/.
+      expect(write[0].args).toEqual({ name: 'phpmyadmin', alias: '/phpmyadmin', root: '/usr/share/phpmyadmin', php: true, options: ['+SymLinksIfOwnerMatch'], directoryIndex: ['index.php'], denyDirs: ['libraries', 'templates', 'setup'] });
+      expect(write[0].args.denyDirs).toContain('setup');
+      expect(app.agent.callsTo('web.host.ensure')).toHaveLength(1);
+      expect(app.agent.callsTo('db.phpmyadmin.global_conf.disable')).toHaveLength(1);
+      expect(app.agent.state.globalAliasDisabled).toBe(true);
+      const audit = app.ctx.db.prepare("SELECT action, target FROM audit_log WHERE action IN ('db.phpmyadmin.publish', 'host_app.publish') ORDER BY id").all();
+      expect(audit.map((a) => a.action)).toEqual(['host_app.publish', 'db.phpmyadmin.publish']);
+      expect(audit[1].target).toBe('https://panel.example.com/phpmyadmin/');
+
+      // Once published, the address comes from the drop-in, whatever the hostname site reports.
+      detectWith({ published: PUBLISHED, globalAlias: { enabled: false, path: '/etc/apache2/conf-available/phpmyadmin.conf', urlPath: null, a2disconf: false } });
+      app.agent.calls.length = 0;
+      const after = await get('/phpmyadmin/publish').expect(200);
+      expect(after.body.data).toMatchObject({ published: true, url: 'https://panel.example.com/phpmyadmin/', globalAlias: { enabled: false } });
+      expect(after.body.data.hints.map((h) => h.code)).not.toContain('global_alias');
+      expect((await rGet('/phpmyadmin').expect(200)).body.data.url).toBe('https://panel.example.com/phpmyadmin/');
+      expect(app.agent.callsTo('web.host.status')).toHaveLength(1);
+
+      // Publishing again with the global alias already off touches no include.
+      app.agent.calls.length = 0;
+      await post('/phpmyadmin/publish', {}).expect(200);
+      expect(app.agent.callsTo('db.phpmyadmin.global_conf.disable')).toEqual([]);
+
+      const gone = await del('/phpmyadmin/publish').expect(200);
+      expect(gone.body.data).toMatchObject({ published: false, removed: true, reloaded: true, path: '/etc/apache2/keel-host.d/phpmyadmin.conf' });
+      expect(app.agent.callsTo('web.host.app.remove').map((c) => c.args)).toEqual([{ name: 'phpmyadmin' }]);
+      expect(app.ctx.db.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'db.phpmyadmin.unpublish'").get().n).toBe(1);
+      restore('db.phpmyadmin.detect');
+    });
+
+    it('Security Advisor flags the global alias and clears once only the hostname site serves phpMyAdmin', async () => {
+      const findingsOf = async () => Object.fromEntries((await app.ctx.security.advisor.scan('manual')).findings.map((f) => [f.id, f]));
+      let f = (await findingsOf())['phpmyadmin.global_alias'];
+      expect(f).toMatchObject({ grade: 'warning', fix: { path: '/database-services/phpmyadmin' } });
+      expect(f.title).toMatch(/every customer web site/);
+      detectWith({ published: PUBLISHED, globalAlias: { enabled: false, path: '/etc/apache2/conf-available/phpmyadmin.conf', urlPath: null, a2disconf: false } });
+      try {
+        f = (await findingsOf())['phpmyadmin.global_alias'];
+        expect(f.grade).toBe('ok');
+        expect(f.title).toContain('https://panel.example.com/phpmyadmin/');
+        detectWith({ published: null, globalAlias: { enabled: false, path: null, urlPath: null, a2disconf: false } });
+        expect((await findingsOf())['phpmyadmin.global_alias'].grade).toBe('info');
+        detectWith({ installed: false, dir: null, published: null, globalAlias: { enabled: false, path: null, urlPath: null, a2disconf: false } });
+        expect((await findingsOf())['phpmyadmin.global_alias']).toBeUndefined();
+      } finally { restore('db.phpmyadmin.detect'); }
+    }, 20_000);
+
+    it('answers 501 when phpMyAdmin is not installed, keeps the global alias on request and reports a disable failure as a warning', async () => {
+      detectWith({ installed: false, dir: null, version: null, published: null });
+      try { expect((await post('/phpmyadmin/publish', {}).expect(501)).body.error.code).toBe('capability_missing'); } finally { restore('db.phpmyadmin.detect'); }
+      app.agent.calls.length = 0;
+      expect((await post('/phpmyadmin/publish', { disableGlobal: false }).expect(200)).body.data.globalAlias).toMatchObject({ enabled: true, disabled: false });
+      expect(app.agent.callsTo('db.phpmyadmin.global_conf.disable')).toEqual([]);
+      app.agent.set('db.phpmyadmin.global_conf.disable', () => { throw Object.assign(new Error('a2disconf phpmyadmin failed: ERROR: Conf phpmyadmin does not exist!'), { agentError: true, code: 'refused', details: {} }); });
+      try {
+        const res = await post('/phpmyadmin/publish', {}).expect(200);
+        expect(res.body.data.globalAlias).toMatchObject({ enabled: true, disabled: false });
+        expect(res.body.data.warnings.map((w) => w.code)).toEqual(['global_alias_kept']);
+      } finally { restore('db.phpmyadmin.global_conf.disable'); }
+      await del('/phpmyadmin/publish').expect(200);
     });
   });
 

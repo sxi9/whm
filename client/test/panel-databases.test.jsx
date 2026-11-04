@@ -21,7 +21,7 @@ const { PANEL_FUNCTION_BY_KEY } = await import('../src/panel/nav.js');
 const { default: Databases, quotaOf, filterRows } = await import('../src/pages/panel/databases/databases.jsx');
 const { default: Users, summarizeGrants, filterUsers } = await import('../src/pages/panel/databases/users.jsx');
 const { default: RemoteHosts, describeHost } = await import('../src/pages/panel/databases/remote-hosts.jsx');
-const { default: PhpMyAdmin, loginUrl } = await import('../src/pages/panel/databases/phpmyadmin.jsx');
+const { default: PhpMyAdmin } = await import('../src/pages/panel/databases/phpmyadmin.jsx');
 const { PrivilegeGrid, buildMatrix, togglePrivilege, toPayload } = await import('../src/pages/panel/databases/parts/GrantsEditor.jsx');
 const { PRIVILEGES, jobStreamPath } = await import('../src/pages/panel/databases/parts/shared.jsx');
 const { systemJobStreamPath } = await import('../src/components/ProgressLog.jsx');
@@ -255,14 +255,17 @@ describe('Remote hosts page', () => {
 });
 
 describe('phpMyAdmin page', () => {
-  it('links to phpMyAdmin with the user name prefilled when it is available', () => {
+  it('links to the published address and lists the user names to type (no prefill: phpMyAdmin only reads pma_username from POST)', () => {
     reset();
-    set('/databases/phpmyadmin', { data: { installed: true, url: 'https://srv1.example/phpmyadmin', featureEnabled: true, version: '5.2.1', users: ['demo_app', 'demo_ro'] } });
+    set('/databases/phpmyadmin', { data: { installed: true, url: 'https://srv1.example/phpmyadmin/', featureEnabled: true, version: '5.2.1', users: ['demo_app', 'demo_ro'] } });
     const html = render(h(PhpMyAdmin, { fn: fn('panel:databases/phpmyadmin') }), '/panel/databases/phpmyadmin');
     expect(html).toContain('<h1>phpMyAdmin</h1>');
     expect(html).toContain('Open phpMyAdmin');
-    expect(html).toContain('href="https://srv1.example/phpmyadmin?pma_username=demo_app"');
-    expect(html).toContain('href="https://srv1.example/phpmyadmin?pma_username=demo_ro"');
+    expect(html).toContain('href="https://srv1.example/phpmyadmin/"');
+    expect(html).not.toContain('pma_username');
+    expect(html).not.toContain('fills in');
+    expect(html).toContain('demo_app');
+    expect(html).toContain('demo_ro');
     expect(html).toContain('rel="noopener noreferrer"');
     expect(html).toContain('5.2.1');
     expect(html).toContain('Available');
@@ -286,9 +289,4 @@ describe('phpMyAdmin page', () => {
     expect(html).toContain('phpMyAdmin is not part of the hosting plan');
   });
 
-  it('loginUrl', () => {
-    expect(loginUrl(null, 'x')).toBe(null);
-    expect(loginUrl('https://a/pma', null)).toBe('https://a/pma');
-    expect(loginUrl('https://a/pma?x=1', 'demo_app')).toBe('https://a/pma?x=1&pma_username=demo_app');
-  });
 });

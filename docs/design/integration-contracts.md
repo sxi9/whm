@@ -474,6 +474,18 @@ reports slots/hooks/`live`.
   `start`/`stop` (epoch seconds), `enabled` (0/1); `spam_users.lst` lsearch `domain: user=<account> enabled=0|1
   threshold=<score×10> autodelete=0|1` (first recipient's domain decides; spamd must run so that `spam = <user>`
   can read `~/.spamassassin/user_prefs`). The Dovecot passwd line is the design's (§5.3 of customer-panel.md).
+- **Spam availability** (`ctx.web.spamScanning({ fresh })` → `{ available, reason, detail, exim: { installed,
+  contentScan, version, features, flavor }, spamd: { installed, active, unit } }`, memoised 60 s unless `fresh`):
+  `spam = <user>` only exists in a content-scanning Exim (`exim -bV` lists `Content_Scanning`; Debian's
+  `exim4-daemon-heavy`, while `-light` passes the capability check and ignores the condition) and needs the spamd
+  unit active (`mail.spamd.config.read`; no unit on the host is unknown, not stopped). Reasons: `exim_missing`,
+  `exim_no_content_scan`, `spamd_missing`, `spamd_not_running`. panel-email's `spam.get` returns it, `spam.set`
+  refuses with 501 (`CapabilityError`) or 422 `spamd_not_running` after a fresh probe, and
+  `ctx.panelEmail.spamStatus()` (`{ ...spamScanning, configuredAccounts }`) feeds the Security Advisor finding
+  `panel.spam.scanning`. The Connect sheet (`accounts.clientSettings`) adds `smtp.ports { enabled, port465,
+  port587 }`, `certificate { dovecot, exim }` from `ctx.ssl.serviceCertStatus()` (memoised 60 s), `virtualMailLive`,
+  `warnings` and `passwordPolicy { context: 'email', minLength: 8, minStrength }` (also `meta.passwordPolicy` of the
+  mailbox list, which now carries the wiring warning with or without rows).
 
 ## 37. Customer panel: virtual FTP users (`ctx.web.ftp.enableVirtualUsers(req)`)
 Setting `service_config.ftp.virtualUsers` (default false) rendered by `web.ftp.config.write` as pure-ftpd
@@ -500,3 +512,186 @@ Key `login-as` ("Log in to Account Panels") in the Account Management group. It 
 unconfigured reseller (no privilege save yet) still gets every other privilege by ownership but not this one;
 root always has it. Package features the panel gates on all exist in `DEFAULT_FEATURES` (no `zoneedit` key: the
 zone editor is gated by ownership only).
+
+## 41. Server hostname site and published applications (`ctx.web.hostname`, `ctx.web.hostApps`)
+Service-configuration owns the Apache virtual host for `basic.hostname` and the drop-in directory where web
+applications are published under that one name (Phase 8 P0-2; webmail = P0-1, phpMyAdmin = P0-5 are its callers).
+Nothing is ever added to customer vhosts; the distro's global aliases (`conf-enabled/phpmyadmin.conf`,
+`/etc/roundcube/apache.conf`) are the operator's to disable (`a2disconf`) — the panel never edits them.
+- **Agent (`agent/src/ops/web.js`):**
+  - `web.host.ensure { hostname (FQDN, lowercase), docroot='/var/www/keel-host', port=80, sslPort=443|null, bind?, ips=[] (≤64
+    addresses), php=true, panelPort=2087, serverAdmin?, reload=true }` → `{ hostname, path, link, docroot, docrootCreated,
+    indexWritten, appsDir, phpSocket, ssl, certificate: { fullchain, key, present }, changed, validated, reloaded, unit,
+    warnings: [{ code, message }] }`.
+    Renders `renderHostVhost()` into `sites-available/keel-host.conf` (+ `sites-enabled` link; RHEL `conf.d/keel-host.conf`).
+    Both blocks open `<VirtualHost <ip>:<port> … *:<port>>` with every `ips` entry an interface holds (same `hostHasAddress`
+    test as customer vhosts; behind NAT none qualifies and only the wildcard remains) — Apache serves a request from the vhosts
+    bound to the connection's address and falls back to `*:port` only when none is, so without this the first IP-bound
+    customer vhost would answer `https://<hostname>/` with its own certificate. `bind` replaces the whole list; the meta line
+    records `ips` as bound. Contents:
+    `:80` = ACME passthrough `Alias /.well-known/acme-challenge/ → /var/www/html/.well-known/acme-challenge/` (the webroot
+    ssl-tls uses for the hostname) + `RedirectMatch 301` to https for everything else (only once a certificate is present);
+    `:443` = `SSLCertificateFile /etc/ssl/whm/service/apache/fullchain.pem` + `key.pem` (the Manage Service SSL Certificates
+    bundle; when either is missing the TLS block is left out and `warnings` carries `certificate_missing`); both blocks carry
+    the www-pool PHP handler (`wwwPoolSocket()`: Debian `/run/php/php<ver>-fpm.sock`, RHEL/Remi `www.sock`, newest PHP first,
+    never a tenant pool; `php_missing` warning otherwise) and `IncludeOptional <root>/keel-host.d/*.conf`. The docroot is
+    created 0755 with a landing page (`renderHostIndex`) linking `https://<hostname>:<panelPort>/` and `/panel`; an existing
+    `index.html` is kept. Idempotent: identical content → `changed:false`, no configtest, no reload. A file without the
+    `# keel-host ` marker is never overwritten (`refused`). Every path is pinned (`/var/www`, `/etc/apache2|httpd`,
+    `/etc/ssl/whm`, `/var/log/apache2|httpd`) before Apache is consulted.
+  - `web.host.status {}` → `{ installed, flavor, path, link, exists, managed, enabled, hostname, meta, ssl, certificate,
+    docroot, docrootExists, phpSocket, appsDir, apps }`; `web.host.remove { reload }` (destructive; drop-ins are kept).
+  - `web.host.app.write { name /^[a-z][a-z0-9-]{0,31}$/, alias (URL path, no `..`), root (confPath under an allowed root —
+    `/usr/share/roundcube`, `/var/lib/roundcube`, `/usr/share/phpmyadmin`, `/var/lib/phpmyadmin` plus `/etc/roundcube`,
+    `/etc/phpmyadmin`, and the RHEL / tarball locations `/usr/share/roundcubemail`, `/etc/roundcubemail`,
+    `/usr/share/phpMyAdmin`, `/etc/phpMyAdmin`, `/opt/phpmyadmin`, `/srv/phpmyadmin`, `/usr/share/nginx/html/roundcube`,
+    `/usr/share/rainloop`, `/usr/share/snappymail` were added to `DEFAULT_ALLOWED_ROOTS`;
+    every `PMA_DIRS`/`PMA_CONFIGS`/`WEBMAIL_CANDIDATES` entry except the cPanel one must stay under it — tests assert this),
+    php=true, access='all'|'local'|'list', allowFrom[] (ip or
+    cidr, required for `list`), options[] (signed `Indexes`/`FollowSymLinks`/`SymLinksIfOwnerMatch`/`MultiViews` or `None`;
+    default `['-Indexes','+FollowSymLinks']`), directoryIndex[]?, allowOverride='None'|'All'|…, denyDirs[] (subdirectories
+    answered `Require all denied`), reload=true }` → `{ name, alias (trailing slash dropped), root, path, phpSocket,
+    vhostPresent, changed, validated, reloaded, unit, warnings }`. Renders `renderHostApp()` (`Alias` + `<Directory>`; `php:false`
+    denies `*.php` instead of a handler) into `<root>/keel-host.d/<name>.conf`, validated with configtest and rolled back on
+    error; `not_found` when `root` is not a directory; `hostname_vhost_missing` warning when the site is absent. Never raw text.
+  - `web.host.app.remove { name, reload }` (destructive), `web.host.app.list {}` → `{ installed, appsDir, vhostPresent, apps[] }`.
+- **Service (`ctx.web`, `server/src/services/service-configuration.js`):**
+  - `ctx.web.hostname.ensure(req, { reload = true, strict = false })` → `{ hostname, url, written, changed, reloaded,
+    validated, ssl, path, docroot, phpSocket, warnings }`. Non-strict (the hook form) never throws for a bare hostname
+    (`written:false`, warning `hostname_not_fqdn`) or a missing Apache (`reason:'capability_missing'`); strict (the route and
+    `hostApps.publish`) throws 422 / `CapabilityError('apache')`. Uses `service_config.apache_ports` (`port`, `sslPort`,
+    `bind`) and `config.tlsPort`; passes `ips` = `basic.main_ip`, `basic.main_ipv6`, every distinct `accounts.ip` and every
+    `ipv6_assignments.address` (validated, deduplicated, ≤64); records `service_config_applies.hostname_vhost`; audits
+    `hostname_vhost.ensure` only when the file changed. `ensureVhost` re-runs it (non-strict, `reload:false`, one reload
+    for both) after writing an account's vhosts whenever the site was applied before, so a newly assigned account IP never
+    shadows the hostname site.
+  - `ctx.web.hostname.status()` → `{ hostname, fqdn, apache, url, panelUrl, exists, enabled, managed, current, inSync, ssl,
+    certificate, docroot, phpSocket, path, appsDir, apps[{ name, alias, root, php, managed, path, url, updatedAt }],
+    lastApply, error }`.
+  - `ctx.web.hostApps.publish({ name, alias, root, php?, access?, allowFrom?, options?, directoryIndex?, allowOverride?,
+    denyDirs? }, req)` → `{ name, alias, root, url: 'https://<hostname><alias>/', path, changed, reloaded, validated,
+    warnings }`: `hostname.ensure(strict, reload:false)` first, then `web.host.app.write`, then one `web.reload` when the
+    site changed but the drop-in did not; audits `host_app.publish`. `ctx.web.hostApps.unpublish(name, req)` → `{ name,
+    removed, reloaded, path }` (audit `host_app.unpublish`); `ctx.web.hostApps.list()` → `{ installed, hostname, appsDir,
+    vhostPresent, apps[] }`. The spec is passed to the agent as given: an unknown or malformed field is `invalid_args` (422).
+- **Who calls `ensure`:** `PUT /api/system/settings` when the body carries `basic.hostname` (Basic Setup; a failure is logged,
+  never a failed save), `ctx.ssl.installServiceCert('apache', …)` after the bundle is written (so AutoSSL renewals, Manage
+  Service SSL Certificates installs and self-signed resets keep the site current; the result carries `hostnameSite`), and
+  root through `POST /api/service-config/hostname/apply { reload? }`. `GET /api/service-config/hostname` and
+  `GET /api/service-config/host-apps` are `requireRoot`. Networking Setup › Change Hostname reaches it only through the
+  service-cert reissue it triggers; call `ctx.web.hostname.ensure(req)` after `settings.set('basic.hostname', …)` if a
+  path sets the hostname without reissuing.
+- **Security Advisor:** probe `hostname.site` (finding id `hostname.site`): warning when a hostname certificate exists but no
+  site answers for it, when the site is served without HTTPS, or when it still names an old hostname; info when neither
+  site nor certificate exists; ok otherwise.
+- **For webmail (U2) / phpMyAdmin (U3):** `publish({ name: 'webmail', alias: '/webmail', root: '/var/lib/roundcube/public_html',
+  allowOverride: 'All', denyDirs: ['config','temp','logs','bin','SQL','vendor','installer','tests'] })` (never weaker than Debian's
+  fragment: `AllowOverride All` keeps Roundcube's shipped `.htaccess` rules, the source/schema/vendor trees are denied outright for a
+  layout that has them under the web root) and `publish({ name: 'phpmyadmin', alias: '/phpmyadmin', root: '/usr/share/phpmyadmin',
+  options: ['+SymLinksIfOwnerMatch'], denyDirs: ['libraries','templates','setup'] })` (`setup/` is htpasswd-gated in Debian's
+  fragment and denied here) were configtest-verified on nova; the returned
+  `url` is what the panel should advertise instead of guessing `https://<hostname><alias>/`. Neither distro alias file is
+  edited. phpMyAdmin (U3, `ctx.databases.phpmyadmin.publish/unpublish/status`, routes `GET|POST|DELETE
+  /api/databases/phpmyadmin/publish`, root) publishes with `directoryIndex: ['index.php']` added and then disables Debian's
+  global include through the agent op `db.phpmyadmin.global_conf.disable` (`a2disconf -q phpmyadmin` + `web.reload`;
+  destructive; `unsupported` on RHEL where `conf.d/phpMyAdmin.conf` is a distro file) — the symlink is removed, never the
+  file. `db.phpmyadmin.detect` reports `globalAlias { enabled, path, urlPath, a2disconf }`, `published` (the drop-in's spec
+  marker) and `dbConfigured`; Security Advisor finding `phpmyadmin.global_alias`. Roundcube's global alias stays an
+  operator step the Webmail status hints at while it is enabled.
+
+### 41.1 Webmail addendum (`ctx.web.webmail`, P0-1)
+- **Agent (`agent/src/ops/webmail.js`):**
+  - `web.webmail.detect { lint = false }` → `{ installed, flavor, path (install root), root (web root: Debian
+    `/var/lib/roundcube/public_html`, else the install root), version, configured, apacheAlias, published: { alias, file,
+    managed, source: 'keel-host'|'distro' }|null, globalAlias: { alias, file }|null, config: { path, exists, ok, managed:
+    { imapHost, smtpHost, productName }|null }|null }`. `WEBMAIL_CANDIDATES` lists `/var/lib/roundcube` (Debian, web root
+    `public_html`, related `/usr/share/roundcube`) before `/usr/share/roundcube`, then RHEL's `/usr/share/roundcubemail`
+    (config `/etc/roundcubemail/config.inc.php`; `config.write`/`remove` edit the detected install's config); `aliasesIn(text, roots)` matches an
+    uncommented `Alias` (quoted or not) whose target resolves — symlinks followed — to any of the install's roots, and
+    flags `global` for a line outside every `<VirtualHost>`. Sources, first match wins: `<apache root>/keel-host.d/*.conf`
+    (`managed` when it carries the `# keel-host-app ` marker), the known distro fragments, then `conf-enabled/*.conf` +
+    `sites-enabled/*.conf` (RHEL `conf.d/*.conf`), capped at 200 files / 256 KB each; `globalAlias` is a global match in a
+    `conf-enabled`/`conf.d` fragment. `config.managed` is parsed from the Keel block only; `ok` is `php -n -l` of
+    `config.inc.php` when `lint` is true (the only program the op ever runs). No exec otherwise.
+  - `web.webmail.config.write { hostname (lowercase FQDN), imapScheme='ssl', imapPort=993, smtpScheme='tls', smtpPort=587,
+    productName (1–80 chars, no control characters) }` → `{ path, changed, validated, values }`: merges
+    `// BEGIN Keel (Webmail) … // END Keel (Webmail)` (`$config['imap_host']`, `$config['smtp_host']`,
+    `$config['product_name']`, single-quoted with `\` and `'` escaped) at the end of `/etc/roundcube/config.inc.php` —
+    in front of a trailing `?>` if there is one, replaced in place on later runs — then writes a sibling temp file, runs
+    `php -n -l` on it and only then renames it over the original with the original owner and mode (`root:www-data 0640`
+    on Debian), previous copy `0600` under `/var/lib/whm/backups/config/etc/roundcube/`. `not_found` when the file is
+    missing (Roundcube not configured), `refused` for a symlink or a file that does not start with `<?php`,
+    `capability_missing` (501) without `php`, `config_invalid` (422) when the lint fails (temp file removed, original kept).
+    The only path it touches is `/etc/roundcube/config.inc.php` (+ the temp sibling and the backup); nothing else in the
+    file — `des_key`, the Debian `include("/etc/roundcube/debian-db-roundcube.php")` — is parsed or rewritten.
+  - `web.webmail.config.remove {}` (destructive) → `{ path, changed, validated }` strips the block the same way.
+- **Service (`ctx.web.webmail`, service-configuration):**
+  - `status()` → `{ installed, flavor, version, path, root, hostname, fqdn, apache, site: { exists, enabled, ssl, inSync,
+    url }|null, published: { alias, file, managed, source, url }|null, url, globalAlias, config: { path, exists, ok,
+    managed, expected: { imapHost, smtpHost, productName }|null, inSync }|null, lastApply, error }`; never throws for a
+    missing install or Apache. `expected` is what a publish would write now (`ssl://<hostname>:993`, `tls://<hostname>:587`,
+    branding `companyName` or `Keel`), so `inSync:false` means "publish again".
+  - `publish(req, { reload = true })` → `{ installed, flavor, version, root, alias, url, path, changed, reloaded,
+    validated, config: { path, changed, validated, values }|null, warnings }`: `CapabilityError('webmail')` (501) when
+    nothing is installed, then `hostApps.publish({ name: 'webmail', alias: '/webmail', root, php: true, allowOverride: 'All',
+    denyDirs: ['config','temp','logs','bin','SQL','vendor','installer','tests'], reload })` (so 501 apache / 422 non-FQDN / 422
+    config_invalid come from there), then
+    `web.webmail.config.write` for a Roundcube with `config.inc.php`. Records `service_config_applies.webmail`, audits
+    `webmail.publish` (target = the URL) after `host_app.publish`. Idempotent: an unchanged drop-in and block are
+    `changed:false`.
+  - `unpublish(req)` → `{ name, removed, reloaded, path, config: { path, removed, validated }|null }`: `hostApps.unpublish
+    ('webmail')` then `web.webmail.config.remove` only when a Keel block is present; audits `webmail.unpublish`.
+- **Routes (`/api/service-config`, requireRoot):** `GET /webmail`, `POST /webmail/publish { reload? }`, `DELETE /webmail`.
+- **Consumers:** `ctx.panelEmail.webmail(scope, query)` builds the account panel's URL from `panel.webmail_url` or
+  `https://<ctx.web.hostname.hostname() ?? basic.hostname><published.alias ?? apacheAlias>/` and answers `{ …, alias,
+  published }`; `ctx.panelEmail.webmailUrl()` (no scope) feeds `ctx.panel.quickLinks` → `webmailUrl`, so the home quick
+  link and the Webmail page always agree. Detection stays cached 60 s in panel-email; a publish shows there within that.
+  Panel › Customization › Account panel renders the status and the Publish/Unpublish actions (`WebmailPublishCard`).
+- **Not done here:** SSO (P1-1); the installer never installs Roundcube; the distro `roundcube.conf` fragment is never
+  disabled by the panel (its alias ships commented out on Debian, unlike phpMyAdmin's).
+
+## 42. Customer panel: DNS delegation awareness (`ctx.panelDns.delegation`)
+Public DNS for a hosted domain may be served elsewhere (the live host's zones are at Cloudflare while BIND answers only
+locally), so a record written here is not published. `services/panel-dns.js` owns the check; nothing else resolves NS sets
+for the panel.
+- `ctx.panelDns.delegation(domain, { fresh = false })` → `{ domain, checkedDomain, delegatedHere: true|false|null,
+  delegatedNs: string[], nameservers: [{ host, addresses, here }], checkedAt, error }`. Reads `dns.resolve` (NS, then A/AAAA
+  of up to four nameservers, `timeoutMs: 3000`, `dns.resolvers` when set) for the name and, on ENODATA/ENOTFOUND, for
+  each parent down to two labels (`checkedDomain` is the one that answered). A nameserver is "here" when one of its
+  addresses is `basic.main_ip`/`basic.main_ipv6`, an account IP or a public interface address from `sys.info`, or when it
+  carries `basic.hostname`/one of `basic.nameservers` and cannot be resolved (offline hosts). `delegatedHere:null` when
+  nothing resolved (no banner anywhere: unknown is never an alarm). Memoised per name: ten minutes, one minute for null.
+  `delegationOrNull(domain)` swallows errors for listings.
+- **Carried on:** `GET /api/panel/dns/zones[/:domain]` and record writes (`delegation`), `GET /api/panel/domains` rows,
+  `POST /api/panel/domains/{sub,addon}` (`dns.delegation` + `dns.records` / `delegation` + `records`, a `meta.warnings`
+  line), `GET /api/panel/email/deliverability/:domain` (`delegation`, `records`), whose `/fix` writes nothing and answers
+  `applied:false, reason:'not_delegated'` when `delegatedHere === false`.
+- **Client:** `client/src/panel/DelegationBanner.jsx` (`DelegationBanner`, `DelegationBanners`, `RecordList`,
+  `notDelegatedHere`, `managedAt`, `delegationText`) is the one rendering; pages pass the records to copy.
+
+## 43. Customer panel: lockout paths (`ctx.panel.recovery`, `ctx.panel.adminReset2fa`)
+Account users lose passwords and authenticators; neither recovery may widen what the console or the panel already allow.
+- `ctx.panel.recovery.available()` → `panel.enabled && Boolean(ctx.contacts.sendMail)`; `GET /api/auth/reset` publishes it and
+  `Login.jsx` shows *Forgot password?* only then.
+- `ctx.panel.recovery.request({ username | email }, req)` (public `POST /api/auth/reset/request`, 202 always, the login
+  limiter per address): matches role-`user` logins by username or by `accounts.contact_email` (case-insensitive, at most 5),
+  skips suspended logins/accounts and accounts without a contact address, then **returns** — the token and the mail continue
+  detached so the response time never tells a real login from an unknown one (`recovery.pending()` settles once that work
+  and its audit row are done). Detached: three links per login per hour, insert `password_reset_tokens` (sha256 only,
+  `expires_at` now + `RESET_TOKEN_TTL_MS` = 30 min, `requested_ip`), send through `ctx.contacts.sendMail({ to:
+  contact_email, subject, body })` with `https://<basic.hostname>:<tlsPort>/login/reset/<token>` (http + `port` without TLS),
+  and only after a delivered send void the login's earlier unused tokens; a failed send deletes the row just inserted (the
+  earlier link keeps working, the attempt does not count toward the hourly limit). Audit `auth.reset.request` (`via`,
+  `sent`, `reason`, `users`); the token never reaches a log.
+- `ctx.panel.recovery.confirm({ token, password }, req)` (public `POST /api/auth/reset/confirm`): unknown, spent or
+  expired → `400 reset_token_invalid`; panel off → `403 panel_disabled`; the row is burned (`used_at`, one `UPDATE … WHERE
+  used_at IS NULL`) before the write, then `changePasswordForUser(userId, { newPassword, recovery: true })` — the §2.2 flow
+  (host first, both stores, `password_synced_at`, sessions destroyed) with the demo/suspended gates kept and the
+  `passwordchange` feature and `require_2fa_for_users` gates skipped. Audit `auth.reset.confirm`.
+- `recovery`/`force` on `changePassword` never come from a request body (strict schemas on `/api/auth/password` and
+  `/api/panel/security/password`).
+- `ctx.panel.adminReset2fa(username, user, req)` (`POST /api/panel/admin/accounts/:username/2fa/reset`, `requireReseller` +
+  `ctx.accounts.get` ownership, the bar of the admin password set): clears `totp_secret_enc`/`totp_enabled` on the linked
+  role-`user` row only, destroys its sessions, audits `panel.admin.2fa.reset` (`userId`, `wasEnabled`); answers
+  `{ username, totpEnabled:false, wasEnabled, enrollmentRequired }`. 404 when the account has no login row.
+- Migration `034_panel-recovery.sql` (`password_reset_tokens`); rows older than a day past expiry are purged on the next request.

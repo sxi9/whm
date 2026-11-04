@@ -103,6 +103,10 @@ export async function register(ctx) {
   // origin, so the path form must start with exactly one slash.
   r.put('/phpmyadmin', requireRoot, validate({ body: z.object({ url: z.string().trim().max(2048).regex(/^(https?:\/\/[^\s/][^\s]*|\/(?!\/)[^\s]*|)$/, 'Absolute http(s) URL or a path on this server') }).strict() }),
     wrap((req) => dbs().setPhpMyAdminUrl(req.body.url, req.user, req)));
+  r.get('/phpmyadmin/publish', requireRoot, wrap((req) => dbs().phpmyadmin.status(req.user)));
+  r.post('/phpmyadmin/publish', requireRoot, validate({ body: z.object({ disableGlobal: z.boolean().optional() }).strict() }),
+    wrap((req) => dbs().phpmyadmin.publish(req.user, req, { disableGlobal: req.body.disableGlobal ?? true })));
+  r.delete('/phpmyadmin/publish', requireRoot, wrap((req) => dbs().phpmyadmin.unpublish(req.user, req)));
 
   return { path: '/databases', router: r };
 }

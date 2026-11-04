@@ -74,6 +74,7 @@ What the login path enforces (`server/src/services/auth.js`, `routes/auth.js`):
 | Session | Cookie session, `httpOnly`, `sameSite=strict`, `secure` when served over TLS; 8 h lifetime by default (`sessionTtlMs`), shortened by the *idle session timeout* policy. |
 | One session per user | When *One active session per user* is on, a new login destroys the user's other sessions. |
 | Password age | When *Maximum password age* is set and the password is older, the login succeeds but the user is forced to change it before anything else. |
+| Forgot password | Account users only (Part C C.2): a link shown while the account panel is on and mail can leave; administrators use `whm-cli reset-password` (Part B, E.4). |
 
 ### Two-factor authentication (TOTP)
 
@@ -921,6 +922,40 @@ Table (service, unit or the candidate units looked for, status, *Start at boot*,
 loop restarts failed monitored services and raises `service.down`/`service.restored`.
 **Gotchas:** the monitored set follows the *Server Profile*.
 
+#### 7.11 Server hostname site
+
+`https://<hostname>/` served by a panel-managed Apache virtual host carrying the Apache service
+certificate, so webmail, phpMyAdmin and the mail client settings never land on the first customer
+site with a mismatched certificate. **Who:** root; no page yet — API and automatic hooks.
+**What it writes:** `sites-available/keel-host.conf` (+ `sites-enabled` link; `conf.d/keel-host.conf`
+on RHEL) with a `:80` block that answers ACME HTTP-01 from `/var/www/html/.well-known/acme-challenge/`
+(the webroot AutoSSL uses for the hostname) and redirects everything else to HTTPS, and a `:443`
+block using `/etc/ssl/whm/service/apache/fullchain.pem` + `key.pem` (*Manage Service SSL
+Certificates*); document root `/var/www/keel-host` (created with a landing page linking to
+`https://<hostname>:2087/` and `/panel`; an existing `index.html` is kept); PHP through the
+distribution's www pool (`/run/php/php<ver>-fpm.sock` / `/run/php-fpm/www.sock`, newest first,
+never a tenant pool); `IncludeOptional /etc/apache2/keel-host.d/*.conf` in both blocks, where web
+applications are published (see below). Both blocks are bound to the main IPs and every account IP
+the server actually holds (`<VirtualHost 203.0.113.5:443 *:443>`), because customer sites are bound
+to their account IP and Apache would otherwise hand `https://<hostname>/` to the first customer
+site on that address; behind NAT (EC2 and most clouds) only the wildcard remains, and an account
+sync re-renders the site when a new IP appears. Without a service certificate the `:80` block is written
+alone (no redirect) and the apply reports `certificate_missing`; the site is rewritten as soon as
+one is installed. **When it runs:** saving `basic.hostname` in *Basic Setup*, installing or
+resetting the Apache service certificate (AutoSSL for the hostname included), and
+`POST /api/service-config/hostname/apply { reload? }`; `GET /api/service-config/hostname` reports
+`{ hostname, fqdn, exists, enabled, inSync, ssl, certificate.present, docroot, phpSocket, apps,
+lastApply }`. Idempotent: an unchanged render is neither rewritten nor reloaded nor audited
+(`hostname_vhost.ensure`). **Published applications:** `keel-host.d/<name>.conf` files rendered by
+the agent from a structured spec (`alias`, filesystem `root`, `php`, `access` all/local/list +
+`allowFrom`, `options`, `directoryIndex`, `allowOverride`, `denyDirs`) — never raw text; written by
+the Webmail and phpMyAdmin functions through `ctx.web.hostApps.publish`, listed by
+`GET /api/service-config/host-apps`. Every write is validated with `apache2ctl -t` and rolled back
+when rejected (`config_invalid`, 422). **Needs:** Apache (501 otherwise), a fully-qualified
+`basic.hostname` (422 on apply). **Gotchas:** a hand-written `keel-host.conf` or drop-in without the
+panel marker is never overwritten (`refused`); the Security Advisor warns when a hostname
+certificate exists but the site is absent, served without HTTPS, or still names an old hostname.
+
 ## 8. Locales
 
 Routes under `/api/locales/*`. Viewing, keys and XML download are open to resellers; configuring,
@@ -1146,8 +1181,11 @@ definitions are **root only**.
 
 Search, inspect and act on hosting accounts. **Who:** root, reseller (own accounts).
 Searchable, sortable table (domain, user, owner, package, IP, disk used/quota, contact,
-created, status) with row actions **Modify**, **Suspend/Unsuspend**, **Change password**,
-**Upgrade/Downgrade**, **Bandwidth usage**, **Enhancements**, **Terminate** (confirmed).
+created, status) with row actions **Modify**, **Suspend/Unsuspend**, **Log in as** (opens the
+account panel, Part C C.5), **Reset 2FA** (confirmed: drops the account login's authenticator and ends
+its sessions, `POST /api/panel/admin/accounts/:username/2fa/reset`, audited `panel.admin.2fa.reset`;
+Part C C.3), **Change password**, **Upgrade/Downgrade**, **Bandwidth usage**, **Enhancements**,
+**Terminate** (confirmed).
 **Server:** `GET /api/accounts?page&pageSize&q&sort&dir`; actions call the account routes with
 the ACL checks listed under Account Functions.
 
