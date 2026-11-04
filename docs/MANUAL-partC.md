@@ -469,7 +469,7 @@ and `exim`). Mailboxes are **virtual users**: a Dovecot passwd-file per domain u
 `/etc/dovecot/whm/passwd/<domain>` (root:dovecot 0640; one line per mailbox **keyed by
 `local@domain`**, with the account's uid/gid/home and the maildir and quota fields in the form the
 installed Dovecot reads — `userdb_mail=maildir:…` / `userdb_quota_rule=*:bytes=N` on 2.3,
-`userdb_mail_driver` / `userdb_mail_path` / `userdb_quota_storage_size=N` on 2.4, detected with
+`userdb_mail_driver` / `userdb_mail_path` / `userdb_mail_inbox_path` / `userdb_quota_storage_size=N` on 2.4, detected with
 `dovecot --version`), maildirs under `~/mail/<domain>/<local>/` owned by the account, and
 Exim alias, forwarding, autoresponder and spam lists under the Exim configuration directory.
 The Dovecot/Exim wiring (the `98-whm-virtual-auth.conf` include, the `whm_virtual_user` router,

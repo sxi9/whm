@@ -149,10 +149,15 @@ describe('passwd re-key (lines written before the key carried the domain)', () =
 
   it('renames the maildir and quota fields on Dovecot 2.4 while re-keying', () => {
     const r = rekeyPasswdText(`${MANAGED}\n${legacy('sales', ' userdb_quota_rule=*:bytes=4096')}\n${keyed}\n`, 'alice.com', 'v24');
-    expect(r.changed).toBe(1);
-    expect(r.text.split('\n')[1]).toBe(`sales@alice.com:{SHA512-CRYPT}${HASH}:1001:1001::/home/alice::userdb_mail_driver=maildir userdb_mail_path=~/mail/alice.com/sales userdb_quota_storage_size=4096`);
-    expect(r.text.split('\n')[2]).toBe(keyed);
+    // On 2.4 an already-keyed line still carrying 2.3 field names (or no INBOX path) is translated too.
+    expect(r.changed).toBe(2);
+    expect(r.text.split('\n')[1]).toBe(`sales@alice.com:{SHA512-CRYPT}${HASH}:1001:1001::/home/alice::userdb_mail_driver=maildir userdb_mail_path=~/mail/alice.com/sales userdb_mail_inbox_path=~/mail/alice.com/sales userdb_quota_storage_size=4096`);
+    expect(r.text.split('\n')[2]).toBe(`info@alice.com:{SHA512-CRYPT}${HASH}:1001:1001::/home/alice::userdb_mail_driver=maildir userdb_mail_path=~/mail/alice.com/info userdb_mail_inbox_path=~/mail/alice.com/info userdb_quota_storage_size=2048`);
     expect(parsePasswdLine(r.text.split('\n')[1])).toMatchObject({ localPart: 'sales', quotaBytes: 4096 });
+    // A second pass changes nothing.
+    expect(rekeyPasswdText(r.text, 'alice.com', 'v24').changed).toBe(0);
+    // Under the 2.3 format a keyed line is left exactly as it is.
+    expect(rekeyPasswdText(`${keyed}\n`, 'alice.com', 'legacy')).toEqual({ text: `${keyed}\n`, changed: 0 });
   });
 
   it('rewrites every <domain> file of a directory in place with counts, skipping backups and already-keyed files', () => {
@@ -213,7 +218,7 @@ describe('passwd line rendering', () => {
     expect(parsePasswdLine(line)).toEqual({ localPart: 'info', uid: 1001, gid: 1001, home: '/home/alice', quotaBytes: 2048, disabled: true });
     // Dovecot 2.4 field names; the parser reads both formats and legacy lines keyed by the bare local part.
     const v24 = renderPasswdLine({ ...base, quotaBytes: 2048, disabled: true, format: 'v24' });
-    expect(v24).toBe(`info@alice.com:{SHA512-CRYPT}${HASH}:1001:1001::/home/alice::userdb_mail_driver=maildir userdb_mail_path=~/mail/alice.com/info userdb_quota_storage_size=2048 nologin=y`);
+    expect(v24).toBe(`info@alice.com:{SHA512-CRYPT}${HASH}:1001:1001::/home/alice::userdb_mail_driver=maildir userdb_mail_path=~/mail/alice.com/info userdb_mail_inbox_path=~/mail/alice.com/info userdb_quota_storage_size=2048 nologin=y`);
     expect(renderPasswdLine({ ...base, format: 'v24' })).not.toContain('quota');
     expect(parsePasswdLine(v24)).toEqual({ localPart: 'info', uid: 1001, gid: 1001, home: '/home/alice', quotaBytes: 2048, disabled: true });
     expect(parsePasswdLine(`info:{SHA512-CRYPT}${HASH}:1001:1001::/home/alice::userdb_mail=maildir:~/mail/alice.com/info`)).toMatchObject({ localPart: 'info', quotaBytes: null, disabled: false });

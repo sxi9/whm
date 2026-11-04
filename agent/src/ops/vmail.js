@@ -175,7 +175,9 @@ export function renderPasswdLine({ localPart: local, hash: h, uid, gid, home, do
   if (!arg.domain.safeParse(domain).success) throw new OpError('invalid_args', 'Invalid domain');
   if (!PASSWD_FORMATS.includes(format)) throw new OpError('invalid_args', 'Unknown passwd format');
   const v24 = format === 'v24';
-  const extra = v24 ? ['userdb_mail_driver=maildir', `userdb_mail_path=~/mail/${domain}/${local}`] : [`userdb_mail=maildir:~/mail/${domain}/${local}`];
+  // Dovecot 2.4 keeps a global mail_inbox_path for system users' mbox INBOX (/var/mail/%{user} on
+  // Debian); a virtual Maildir user must point INBOX at its own Maildir or deliveries hit /var/mail.
+  const extra = v24 ? ['userdb_mail_driver=maildir', `userdb_mail_path=~/mail/${domain}/${local}`, `userdb_mail_inbox_path=~/mail/${domain}/${local}`] : [`userdb_mail=maildir:~/mail/${domain}/${local}`];
   if (quota != null && quota > 0) extra.push(v24 ? `userdb_quota_storage_size=${quota}` : `userdb_quota_rule=*:bytes=${quota}`);
   if (disabled) extra.push('nologin=y');
   const line = `${local}@${domain}:{SHA512-CRYPT}${h}:${uid}:${gid}::${home}::${extra.join(' ')}`;
@@ -236,14 +238,18 @@ export function rekeyPasswdText(previous, domain, format = 'legacy') {
     const i = l.indexOf(':');
     if (l.startsWith('#') || i <= 0) return l;
     const key = l.slice(0, i);
-    if (key.includes('@') || !LOCAL_PART.test(key)) return l;
+    const keyed = key.includes('@');
+    if (!LOCAL_PART.test(keyed ? key.split('@')[0] : key)) return l;
     let rest = l.slice(i + 1);
     if (format === 'v24') {
       rest = rest.replace(/(^|[\s:])userdb_quota_rule=\*:bytes=(\d+)(?=\s|$)/, '$1userdb_quota_storage_size=$2');
       rest = rest.replace(/(^|[\s:])userdb_mail=maildir:(\S+)/, '$1userdb_mail_driver=maildir userdb_mail_path=$2');
+      // Lines written before INBOX was pinned inside the Maildir get the field too (see renderPasswdLine).
+      if (!/(^|[\s:])userdb_mail_inbox_path=/.test(rest)) rest = rest.replace(/(^|[\s:])userdb_mail_path=(\S+)/, '$1userdb_mail_path=$2 userdb_mail_inbox_path=$2');
     }
-    changed += 1;
-    return `${key}@${domain}:${rest}`;
+    const next = keyed ? `${key}:${rest}` : `${key}@${domain}:${rest}`;
+    if (next !== l) changed += 1;
+    return next;
   });
   return { text: out.length ? `${out.join('\n')}\n` : '', changed };
 }

@@ -416,7 +416,7 @@ reports slots/hooks/`live`.
   `10-auth.conf` run first because conf.d sorts `98-` after it and fall through on failure, so Linux accounts
   never reach the passwd files and virtual addresses never reach PAM successfully; `mail_plugins quota` with the
   limit from the passwd line — `userdb_quota_rule=*:bytes=N` with `userdb_mail=maildir:~/mail/<domain>/<local>`
-  on 2.3, `userdb_quota_storage_size=N` with `userdb_mail_driver=maildir userdb_mail_path=…` on 2.4, written by
+  on 2.3, `userdb_quota_storage_size=N` with `userdb_mail_driver=maildir userdb_mail_path=… userdb_mail_inbox_path=…` on 2.4 (the INBOX path is pinned inside the Maildir because Debian's 2.4 `mail_inbox_path` defaults to `/var/mail/%{user}`), written by
   `vmail.passwd.set` after one `dovecot --version` probe per agent process (`dovecotFormat()`); `service auth {
   unix_listener auth-client }` and `service lmtp { unix_listener lmtp }` opened 0660 to the Exim user/group),
   `renderEximVirtualRouters`
