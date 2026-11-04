@@ -4,7 +4,7 @@ For any AI or engineer taking over. Everything stated here is on the branch
 `claude/kind-meitner-dlnbas` of `github.com/sxi9/whm`; this file is updated at every milestone
 together with `CHECKLIST.md` (tracker) and `CLAUDE.md` (conventions + memory). Read those two next.
 
-**Last updated:** 2026-11-05 · live-host verification on `nova.hostingsignal.in` done, fixes in the working tree (not yet committed/deployed) · checklist: 212 admin functions + 39 account-panel functions done, P6 closed, P7 complete
+**Last updated:** 2026-11-05 · live-host verification on `nova.hostingsignal.in` done, fixes committed (`813d367`, `f6038d8`, `6ed13e9`) and deployed, host steps applied · checklist: 212 admin functions + 39 account-panel functions done, P6 closed, P7 complete · next: Phase 8 (`docs/design/phase8-account-panel.md`)
 
 ## 1. What this is
 
@@ -71,11 +71,20 @@ log-derived bugs), each finding was re-verified adversarially (29 confirmed, 1 r
 were fixed in three rounds (fixers per area, two review lenses, re-review). The findings and fix reports live
 only in that session's scratchpad; what matters is recorded here and in `CHECKLIST.md`/`CHANGELOG.md`.
 
-**State of the tree:** the fixes are in the working tree of the local clone (`D:\claude\whm`, 79 modified +
-10 new files) and mirrored to `~/whm` on the host (CRLF-stripped copies), **not committed and not deployed**:
-`/opt/whm` on nova still runs the milestone-2 build. Round 3's re-review had not reported when this file was
-written; its two majors (hub TOTP gate compares the `/v1` path case-insensitively; the panel-cert op keeps the
-legacy `/etc/whm/tls` pair while `panel.env`/`whm.conf` still reference it) are in the tree.
+**State of the tree:** committed as `813d367` (the audit fixes, 93 files), `f6038d8` and `6ed13e9` (two defects
+only the real Dovecot 2.4 / Debian pure-ftpd showed, found while verifying the deploy), and **deployed to
+`/opt/whm` with `scripts/install.sh --upgrade`**; `~/whm` on the host is the same branch (applied with `git am`, so
+its commit ids differ until it is reset to `origin`). Gate on the host clone before the deploy: server 1442 /
+agent 635 (+3 cases that only fail because the binary they assume absent exists there) / client 277 / hub 186 /
+hub-ui 105 / SDK 73 / plugins 48; both Playwright flows green before and after. Round 3's re-review raised one
+more major, fixed by hand: `ssl-tls.js resolveDomain` treats only the configured `basic.hostname` as the server
+(any other unowned name root addresses stays a web host, so a stranger's certificate can never reach the
+panel/daemons); `writePanelPair` refuses without a panel group and uses `lstat`/`lchown` on the legacy entries.
+Live-found and fixed afterwards: Dovecot 2.4 strips the domain for LMTP by default (`protocol lmtp {
+auth_username_format = %{user | lower} }` in the fragment); Debian's 2.4 `mail_inbox_path = /var/mail/%{user}`
+makes a virtual Maildir user try to create `/var/mail/<address>` (`userdb_mail_inbox_path` on every passwd line,
+re-key adds it); Debian's `pure-ftpd-wrapper` has no `CertFile` directive and refused to start (the combined PEM
+now goes to the compiled-in `/etc/ssl/private/pure-ftpd.pem`, only `conf/TLS` is written).
 
 ### What was found and fixed (code)
 
@@ -124,47 +133,45 @@ Dovecot's deprecated ManageSieve port 2000 disabled; fail2ban jails exim/dovecot
 work); `basic.nameservers` = `roman/betty.ns.cloudflare.com` and the testuser zone's NS/SOA updated;
 `basic.contact_email` set.
 
-### Continue from here (in order)
+### Done on the host after the deploy (2026-11-04 19:40–20:00 UTC)
 
-1. **Gate + commit.** Run the full gate on the working tree (`npm test`, both builds, the e2e flows over
-   `https://127.0.0.1:2087`), record the numbers in the table below, commit the fixes and push.
-2. **Deploy** on nova with `scripts/install.sh --upgrade` (restarts `whm-agentd` and `whm-panel`; migration
-   `001d` applies at panel start). Deploy from a git checkout or strip CRLF from `~/whm` first.
-3. **Virtual mail on the host:** the boot job writes the Dovecot drop-in and the Exim slot files and ends
-   `live:false` on this unsplit host. Then the one-time operator edit (back up first): add
-   `.include_if_exists /etc/exim4/whm/router_whm_virtual_mail.conf` after `begin routers`,
-   `.include_if_exists /etc/exim4/whm/transport_whm_virtual_mail.conf` after `begin transports`,
-   `.include_if_exists /etc/exim4/whm/auth_whm_dovecot.conf` after `begin authenticators` in
-   `/etc/exim4/exim4.conf.template`; `update-exim4.conf && exim4 -bV && systemctl reload exim4`; then
-   `POST /api/service-config/virtual-mail/apply {"enabled":true}` (or the card's Apply) → `live:true`;
-   rescan the Security Advisor. Verify once with a mailbox login and `doveadm quota get -u <mailbox>`.
-4. **Submission ports:** enable `submissionPorts` in Exim Configuration Manager (465 needs the Exim TLS
-   preset + certificate; 587 works at once) and open 465/587 in the EC2 security group.
-5. **Service certificates:** run AutoSSL for the server hostname `nova.hostingsignal.in`
-   (`POST /api/ssl/autossl/run {"domain":"nova.hostingsignal.in"}`), which installs it on panel, exim,
-   dovecot and apache; `systemctl restart whm-panel` (or wait for the file watch); FTP via
-   `POST /api/ssl/service-certs/ftp`; the hub (`:7443`) by hand (`/etc/whm-hub/ssl/hub.{crt,key}`).
-6. **2FA:** enrol root and switch on `security.2fa.required_for_root`; enrol the hub vendor admin's TOTP
-   (the hub now holds every `/v1` call until enrolment).
+1. Gate, commit, deploy — see "State of the tree" above.
+2. **Virtual mail is live:** the three `.include_if_exists` lines were added to `/etc/exim4/exim4.conf.template`
+   (backup `exim4.conf.template.bak-vmail-*`), `update-exim4.conf`/`exim4 -bV`/reload, then
+   `POST /api/service-config/virtual-mail/apply` → `routerHooked/transportHooked/authHooked: true`. Verified with
+   a throwaway mailbox: `doveadm auth test`, IMAPS LIST, SMTP AUTH on 587 (STARTTLS) and 465 (TLS), inbound
+   LMTP delivery, IMAPS read-back, `doveadm quota get`, panel usage; relay from a foreign IP refused (`exim -bh`).
+3. **Submission ports:** `submissionPorts` on, Exim + Dovecot TLS preset applied → 25/465/587 listening.
+   **Still to do by the operator: open 465 and 587 (and 25 inbound, if this server is to receive internet
+   mail) in the EC2 security group — they time out from outside today.**
+4. **Service certificates:** AutoSSL for `nova.hostingsignal.in` issued and installed on panel, exim, dovecot,
+   apache and ftp (`/etc/ssl/private/pure-ftpd.pem`); the hub got the same pair by hand
+   (`/etc/whm-hub/ssl/hub.{crt,key}` 0640 root:whmhub) and `WHM_LICENSE_HUB_CA` was commented out of
+   `panel.env` (the chain validates with the system CAs; license check-in green). `/etc/whm` and `/etc/whm-hub`
+   were backed up to `/root/etc-whm*.bak-*` before the deploy.
+5. **2FA:** `security.2fa.required_for_root` is on — root must enrol an authenticator at the next login. An
+   automation admin `keel-ops` (role root, TOTP enrolled) exists for scripted verification; its password and TOTP
+   secret are in `/root/keel-ops.env` (0600). The hub vendor admin still has to enrol in the portal (held until
+   then).
+6. Security Advisor after the rescan: only root-2FA (now enforced), 3 pending security package updates
+   (unattended-upgrades), and the two deferred items below remain.
 7. **Deliberately not applied — operator decisions:** ModSecurity/OWASP CRS (`DetectionOnly` first, then
    `On`), scheduled backups (`backup.enabled` + a destination), delegating DNS to BIND (public DNS stays at
    Cloudflare, so every panel-created subdomain must also be added there), PHP-FPM pool
    `open_basedir`/`disable_functions`, SMTP restrictions, Apache `ServerTokens`/`ServerSignature`.
-8. **Known leftovers from the reviews (minor, not blocking):** the MultiPHP Manager badge still flags a
-   backported PHP version (synchronous `phpAdvisories.forVersion`); manual `install()` for a `type: 'server'`
-   row still goes through `applyWeb`; `virtualMail.status().submissionPorts` reports the setting, not the
-   rendered ports; `files.mkdir { group }` on a pre-existing foreign-owned directory is refused rather than
-   skipped; `vmail.passwd.rekey --dryRun` still creates the managed dir; the panel is not restarted
-   automatically after a panel-cert install (file watch covers it within seconds); `trust proxy 'loopback'`
-   lets a local process spoof `X-Forwarded-Proto` past the redirect. Pre-existing on the host clone, not a
-   regression: `agent/test/vmail.test.js` "purge never executes a program" and `web.test.js` "per-domain log
-   directories" fail when run as a non-root user on a host that has Dovecot.
-9. **Then the earlier list:** open design defaults (`docs/design/customer-panel.md` §9: phpMyAdmin/webmail
-   SSO, Sieve filters, per-recipient spam thresholds, plugin pages in `/panel`, forced 2FA for customers),
-   the minor critic findings from milestone 2 (FTP `dir` passwd-field alphabet, docroot alphabet vs `confPath`,
-   `enableVirtualUsers` retry backoff, `panel.changePassword` compensating revert, migration `033c` header
-   exception), hub portals in a browser, the DEFERRED items in `docs/design/phase5-build-plan.md`. Webmail
-   and phpMyAdmin are not installed on nova (the panel shows the empty states by design).
+8. **Known leftovers (minor, not blocking):** the MultiPHP Manager badge still flags a backported PHP version
+   (synchronous `phpAdvisories.forVersion`); the panel is not restarted automatically after a panel-cert
+   install (the file watch covers it within seconds). Pre-existing on the host clone, not a regression:
+   `agent/test/vmail.test.js` "purge never executes a program", `web.test.js` "per-domain log directories",
+   `dns.test.js` `$INCLUDE` and `resolver.test.js` "missing resolvectl" fail on a host where the binary they
+   assume absent exists (run the agent suite as root there: `sudo npx vitest run`).
+9. **Next: Phase 8 — the account panel on a real host**, planned in `docs/design/phase8-account-panel.md`
+   (P0: server-hostname vhost, Roundcube + phpMyAdmin from the distro packages published under it, truthful
+   mail client settings, DNS-delegation awareness, password/2FA recovery; P1: webmail/phpMyAdmin SSO, Sieve
+   filters, mail routing, visitor stats, the `.htaccess` family, WordPress installer, preferences, 2FA UX,
+   i18n, mobile). Use `keel-ops` (`/root/keel-ops.env`) for scripted verification on nova. Then the earlier
+   list: the minor critic findings from milestone 2, hub portals in a browser, the DEFERRED items in
+   `docs/design/phase5-build-plan.md`.
 
 ### Hardening history (for the record)
 

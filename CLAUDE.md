@@ -204,8 +204,14 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   `license.require_admin_totp` (default on); e2e scripts default to `https://127.0.0.1:2087` with `ignoreHTTPSErrors`.
   Host-side changes already applied on nova: AutoSSL on (certbot, production cert live for `testuser.hostingsignal.in`),
   ManageSieve 2000 off, fail2ban exim/dovecot/pure-ftpd jails, `/etc/pure-ftpd/auth/50puredb`, Cloudflare nameservers +
-  contact e-mail in Basic Setup. Gate numbers: to be recorded at deploy. **Next: deploy and the host steps in
-  `HANDOFF.md` §4.**
+  contact e-mail in Basic Setup. Gate (host clone): server 1442 / agent 635 (+3 host-env) / client 277 / hub 186 /
+  hub-ui 105 / SDK 73 / plugins 48; e2e flows green before and after. Deployed with `install.sh --upgrade` (commits
+  `813d367`, `f6038d8`, `6ed13e9`); the host steps are done (virtual mail live, 25/465/587, hostname certificate on every
+  service incl. the hub, root 2FA required, automation admin `keel-ops`). Two defects only a real Dovecot 2.4 showed:
+  LMTP strips the domain by default (`protocol lmtp { auth_username_format }` in the fragment) and `mail_inbox_path`
+  defaults to `/var/mail/%{user}` (`userdb_mail_inbox_path` on every passwd line); Debian's `pure-ftpd-wrapper` has no
+  `CertFile` directive (the combined PEM goes to `/etc/ssl/private/pure-ftpd.pem`). **Next: Phase 8 — the account
+  panel on a real host, `docs/design/phase8-account-panel.md` (P0 first).**
 - **2026-11-04 00:15: Phase 7 milestone 2 — the account panel is live.** `/panel` is our own customer-facing panel
   (the cPanel replacement): design `docs/design/customer-panel.md`, seams in `docs/design/integration-contracts.md`
   §33–40, manual `docs/MANUAL-partC.md`. Server: `services/panel.js` (`ctx.panel`: account users linked by
