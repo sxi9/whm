@@ -187,8 +187,16 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Current state (update every push)
 
-- **2026-11-05 (later): Phase 8 P0 landed in the working tree** (`docs/design/phase8-account-panel.md`, P0-1..P0-6, built as
-  parallel units with two review lenses and one fix round; uncommitted until the deploy commit). Server-hostname site
+- **2026-11-05 (later): Phase 8 P0 deployed to nova** (`docs/design/phase8-account-panel.md`, P0-1..P0-6, built as
+  parallel units with two review lenses and one fix round). Gate on the host clone at the deploy commit: server 1483 /
+  client 292 / agent 655 (+3 known host-env) / hub 186 / hub-ui 105 / SDK 73 / plugins green; `install.sh --upgrade` applied
+  migration 034; host steps 2–6 of `HANDOFF.md` §4 run and verified (hostname site, `/webmail` and `/phpmyadmin` published,
+  Roundcube and phpMyAdmin logins with panel-created objects, advisor green, reset mail queued). Two host facts found there
+  and handled on the host, to be codified in P1: Ubuntu 26.04's Roundcube 1.6.11 fatals on PHP 8.5 (`array_first()` is a
+  builtin now — the polyfill in `bootstrap.php` was guarded by hand; the publish step should probe the URL and report the
+  HTTP status), and Exim on a host without a global IPv6 route tried AAAA MX targets first (`disable_ipv6 = true` appended
+  outside the managed blocks of `exim4.conf.localmacros`); EC2 blocks outbound port 25, so reset mails stay queued until the
+  owner lifts the restriction or sets a smarthost. Server-hostname site
   `keel-host.conf` + `keel-host.d/<app>.conf` drop-ins with the Apache service certificate (`ctx.web.hostname.ensure/status`,
   `ctx.web.hostApps.publish/unpublish/list`, agent `web.host.*`, contract §41; re-rendered from Basic Setup, Networking Setup ›
   Change Hostname and the Apache service-cert install; Security Advisor `hostname.site`); Roundcube from the distro published as
@@ -200,8 +208,7 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   DNS delegation awareness in the account panel (`ctx.panelDns.delegation`, §42, `DelegationBanner`); lockout paths: forgot-password
   by e-mail (`ctx.panel.recovery`, public `POST /api/auth/reset/request|confirm`, `GET /api/auth/reset`, migration
   `034_panel-recovery.sql` — the 202 never waits for the mail; P1 migrations continue at `034b`) and the admin 2FA reset
-  (`POST /api/panel/admin/accounts/:username/2fa/reset`, §43). Host steps for nova are in `HANDOFF.md` §4 ("Phase 8 P0 host steps");
-  gate numbers are recorded there at the deploy commit (the fix round ran only its own test files on the host clone).
+  (`POST /api/panel/admin/accounts/:username/2fa/reset`, §43). Host steps for nova are in `HANDOFF.md` §4 ("Phase 8 P0 host steps").
 - **2026-11-05: live-host verification done on the production install** (`nova.hostingsignal.in`, Ubuntu 26.04 on EC2;
   the provisioned-host step `HANDOFF.md` §4.1 asked for). 10 probe areas, 29 confirmed findings (18 with a code component,
   11 host-only; 1 refuted), each adversarially verified; fixes in three rounds with two review lenses, all code findings

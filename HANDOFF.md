@@ -173,12 +173,27 @@ work); `basic.nameservers` = `roman/betty.ns.cloudflare.com` and the testuser zo
    list: the minor critic findings from milestone 2, hub portals in a browser, the DEFERRED items in
    `docs/design/phase5-build-plan.md`.
 
-### Phase 8 P0 host steps (after the next `install.sh --upgrade` from the Phase 8 commit)
+### Phase 8 P0 host steps (done on nova 2026-11-05 after `install.sh --upgrade` from the Phase 8 commit)
 
-Phase 8 P0 (plan `docs/design/phase8-account-panel.md`, trackers in `CHECKLIST.md`) is built and reviewed in the working
-tree: the server-hostname site (contract §41), Roundcube + phpMyAdmin published under it, truthful mail client settings,
-DNS-delegation banners (§42) and the lockout paths (§43, migration `034_panel-recovery.sql`). On nova, in this order
-(`keel-ops` session from `/root/keel-ops.env` for the API calls; every POST needs the CSRF token from `GET /api/auth/csrf`):
+Phase 8 P0 (plan `docs/design/phase8-account-panel.md`, trackers in `CHECKLIST.md`) is deployed: the server-hostname site
+(contract §41), Roundcube + phpMyAdmin published under it, truthful mail client settings, DNS-delegation banners (§42) and
+the lockout paths (§43, migration `034_panel-recovery.sql`). Steps 2–6 below were run and verified on nova (a panel-created
+mailbox logged in to `https://nova.hostingsignal.in/webmail/`, a panel-created DB user logged in to `/phpmyadmin/` and saw
+only its database; the advisor shows `hostname.site` and `phpmyadmin.global_alias` ok). **Found on the host while doing so:**
+
+- Ubuntu 26.04 ships Roundcube 1.6.11 with PHP 8.5, where `array_first()` is a builtin: `/webmail/` answered 500
+  ("Cannot redeclare function array_first() in program/lib/Roundcube/bootstrap.php"). The polyfill was wrapped in
+  `if (!function_exists('array_first'))` by hand (backup `bootstrap.php.bak-keel-20261105`; a package upgrade will
+  overwrite the fix, which the upstream 1.6.12+ package no longer needs). P1 should make the publish step probe the URL
+  and surface the HTTP status / the PHP fatal in the admin card instead of reporting success from `php -l` alone.
+- Exim tried the Outlook MX's AAAA targets first ("Network is unreachable") on a host with no global IPv6 route:
+  `disable_ipv6 = true` was appended to `/etc/exim4/exim4.conf.localmacros` *outside* the Keel managed blocks (the file is
+  shared; never overwrite it — a Keel copy sits in `/var/lib/whm/backups/config/etc/exim4/`). EC2 also blocks outbound
+  port 25, so the reset mail for `testuser` stays in the queue: the owner must lift the restriction with AWS or configure
+  a smarthost (P1 mail-routing unit: `ipv6` and `smarthost` settings in Exim Configuration Manager).
+
+The original order (`keel-ops` session from `/root/keel-ops.env` for the API calls; every POST needs the CSRF token from
+`GET /api/auth/csrf`) for another host:
 
 1. **Packages (done on 2026-11-05 while the units were built):** `apt install roundcube roundcube-core roundcube-mysql
    phpmyadmin dovecot-sieve goaccess` — dbconfig created the `roundcube` and `phpmyadmin` databases on MariaDB. If they are
@@ -204,7 +219,7 @@ DNS-delegation banners (§42) and the lockout paths (§43, migration `034_panel-
 6. **Lockout paths:** with `basic.contact_email` set on `testuser` (*Modify an Account*), the login page shows *Forgot
    password?*; request a reset for `testuser`, open the mailed link, set a new password, log in to `/panel`, FTP main login
    works (`password_synced_at` set). The admin side: *Reset 2FA* in the accounts row menu (audit `panel.admin.2fa.reset`).
-7. Trackers: record the gate numbers of the deploy commit in `CLAUDE.md` Current state and `CHECKLIST.md`.
+7. Trackers: gate numbers of the deploy commit are in `CLAUDE.md` Current state and `CHECKLIST.md`.
 
 ### Hardening history (for the record)
 
