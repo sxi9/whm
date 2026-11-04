@@ -294,15 +294,16 @@ describe('parsers and renderers', () => {
 describe('service certificate wiring', () => {
   const paths = bundlePaths('/etc/ssl/whm/service/ftp');
 
-  it('pure-ftpd gets a combined cert+key PEM and CertFile points at it', () => {
+  it('pure-ftpd gets a combined cert+key PEM at its compiled-in path and only TLS is switched on', () => {
     const copies = serviceCopies('ftp', paths, { ftp: { flavor: 'pure-ftpd', confDir: '/etc/pure-ftpd', units: ['pure-ftpd'] } });
     const combined = copies.find((c) => c.combine);
-    expect(combined).toEqual({ combine: '/etc/ssl/whm/service/ftp/pure-ftpd.pem', mode: 0o600 });
-    const certFile = copies.find((c) => c.include === '/etc/pure-ftpd/conf/CertFile');
-    expect(certFile.content).toBe('/etc/ssl/whm/service/ftp/pure-ftpd.pem\n');
-    expect(copies.indexOf(combined)).toBeLessThan(copies.indexOf(certFile));
-    expect(copies.find((c) => c.include === '/etc/pure-ftpd/conf/TLS').content).toBe('1\n');
+    expect(combined).toEqual({ combine: '/etc/ssl/private/pure-ftpd.pem', mode: 0o600 });
+    // Debian's pure-ftpd-wrapper refuses to start on an unknown conf/ directive such as CertFile.
+    expect(copies.some((c) => c.include === '/etc/pure-ftpd/conf/CertFile')).toBe(false);
     expect(copies.some((c) => c.include === '/etc/pure-ftpd/conf/KeyFile')).toBe(false);
+    const tls = copies.find((c) => c.include === '/etc/pure-ftpd/conf/TLS');
+    expect(tls.content).toBe('1\n');
+    expect(copies.indexOf(combined)).toBeLessThan(copies.indexOf(tls));
   });
 
   it('proftpd and vsftpd keep separate cert and key files', () => {

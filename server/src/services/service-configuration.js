@@ -302,6 +302,11 @@ export function renderDovecotVirtualAuth({ passwdDir = '/etc/dovecot/whm/passwd'
       '    imap_quota = yes',
       '  }',
       '}',
+      '# Dovecot 2.4 strips the domain from LMTP recipients by default (auth_username_format = %{user | username}),',
+      '# which would never reach the per-domain passwd files; deliveries keep the full address.',
+      'protocol lmtp {',
+      '  auth_username_format = %{user | lower}',
+      '}',
     ] : [
       'passdb {',
       '  driver = passwd-file',

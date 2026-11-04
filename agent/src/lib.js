@@ -12,7 +12,7 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/etc/exim', '/etc/exim4', '/etc/dovecot', '/var/spool/exim', '/var/spool/exim4', '/var/log/exim', '/var/log/exim4', '/var/log/mail.log',
   '/etc/mysql', '/etc/my.cnf', '/etc/my.cnf.d', '/var/lib/mysql-files',
   '/etc/pure-ftpd', '/etc/proftpd', '/etc/vsftpd.conf',
-  '/etc/ssl/whm', '/etc/letsencrypt', '/etc/pki/tls/whm',
+  '/etc/ssl/whm', '/etc/letsencrypt', '/etc/pki/tls/whm', '/etc/ssl/private/pure-ftpd.pem',
   '/etc/php', '/etc/opt/remi', '/etc/php-fpm.d',
   '/etc/hosts.allow', '/etc/hosts.deny', '/etc/hosts', '/etc/ssh/sshd_config', '/etc/ssh/sshd_config.d', '/root/.ssh',
   '/etc/security/limits.conf', '/etc/security/limits.d', '/etc/logrotate.d', '/etc/cron.d', '/var/spool/cron',

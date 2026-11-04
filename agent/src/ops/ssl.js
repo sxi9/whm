@@ -635,6 +635,8 @@ defineOp('ssl.bundle.list', {
 
 // ------------------------------------------------------ service certificates ---
 
+const PURE_FTPD_CERT = '/etc/ssl/private/pure-ftpd.pem';
+
 // The file set that wires a service bundle into its daemon. `layouts` lets tests
 // describe a host without touching /etc; production calls detect the real one.
 export function serviceCopies(svc, paths, layouts = {}, { hasChain = false, dovecotVersion = null } = {}) {
@@ -653,10 +655,11 @@ export function serviceCopies(svc, paths, layouts = {}, { hasChain = false, dove
   } else if (svc === 'ftp') {
     const ftp = layout('ftp', ftpLayout);
     if (ftp?.flavor === 'pure-ftpd') {
-      // pure-ftpd's CertFile must hold the certificate chain AND the private key
-      // in one PEM (a separate KeyFile only exists from 1.0.47 on).
-      const combined = path.join(paths.dir, 'pure-ftpd.pem');
-      copies.push({ combine: combined, mode: 0o600 }, { include: `${ftp.confDir}/conf/CertFile`, content: `${combined}\n`, mode: 0o644 }, { include: `${ftp.confDir}/conf/TLS`, content: '1\n', mode: 0o644 });
+      // pure-ftpd reads the certificate chain AND the private key from one PEM at its
+      // compiled-in path (a separate KeyFile only exists from 1.0.47 on). Debian's
+      // pure-ftpd-wrapper has no CertFile directive and refuses to start when one is
+      // present under conf/, so only TLS is switched on there.
+      copies.push({ combine: PURE_FTPD_CERT, mode: 0o600 }, { include: `${ftp.confDir}/conf/TLS`, content: '1\n', mode: 0o644 });
     }
     if (ftp?.flavor === 'proftpd') copies.push({ include: `${ftp.confDir}/conf.d/whm-tls.conf`, content: `${MANAGED} (Manage Service SSL Certificates)\n<IfModule mod_tls.c>\n  TLSEngine on\n  TLSRSACertificateFile ${paths.fullchain}\n  TLSRSACertificateKeyFile ${paths.key}\n</IfModule>\n`, mode: 0o644 });
     if (ftp?.flavor === 'vsftpd') copies.push({ vsftpd: ftp.confFile });

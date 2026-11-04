@@ -299,8 +299,10 @@ describe('S4: ctx.web.applyVirtualMail', () => {
     expect(dc24).toContain('mail_plugins {\n  quota = yes\n}');
     expect(dc24).toContain('quota_driver = count');
     expect(dc24).toContain('protocol imap {\n  mail_plugins {\n    imap_quota = yes');
+    // LMTP must look the full address up, or the per-domain passwd file is never found (2.4 default strips the domain).
+    expect(dc24).toContain('protocol lmtp {\n  auth_username_format = %{user | lower}\n}');
     expect(dc24).toContain('unix_listener auth-client {\n    mode = 0660\n    user = Debian-exim');
-    for (const legacy of ['driver = passwd-file', 'args =', 'username_format', '%n', '%d', 'plugin {', '$mail_plugins']) expect(dc24, legacy).not.toContain(legacy);
+    for (const legacy of ['driver = passwd-file', 'args =', 'username_format=%n', '%n', '%d', 'plugin {', '$mail_plugins']) expect(dc24, legacy).not.toContain(legacy);
     expect([dovecotIsV24('2.4.2'), dovecotIsV24('2.4.0'), dovecotIsV24('3.0.0'), dovecotIsV24('2.3.21'), dovecotIsV24(null), dovecotIsV24('')]).toEqual([true, true, true, false, false, false]);
     const routers = renderEximVirtualRouters(layout);
     const names = [...routers.matchAll(/^([a-z_]+):$/gm)].map((m) => m[1]);
