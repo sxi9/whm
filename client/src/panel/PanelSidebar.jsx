@@ -6,6 +6,7 @@ import { useT } from '../i18n/useT.js';
 import { PANEL_BASE, PANEL_FUNCTION_BY_KEY, panelId, searchPanelFunctions, visibleCategories } from './nav.js';
 import { panelIconFor, panelColorFor } from './icons.js';
 import { usePanelFavorites, usePanelMe } from './hooks/usePanel.js';
+import { usePanelPlugins, withPluginEntries, searchPluginEntries } from './hooks/usePanelPlugins.js';
 
 const OPEN_KEY = 'whm.panel.sidebar.open';
 
@@ -23,7 +24,8 @@ export function PanelSidebar({ collapsed, onToggle }) {
   const [filter, setFilter] = useState('');
   const [open, setOpen] = useState(readOpen);
   const { favorites } = usePanelFavorites();
-  const categories = useMemo(() => visibleCategories(features), [features]);
+  const { entries: pluginEntries } = usePanelPlugins();
+  const categories = useMemo(() => withPluginEntries(visibleCategories(features), pluginEntries), [features, pluginEntries]);
 
   useEffect(() => { try { localStorage.setItem(OPEN_KEY, JSON.stringify(open)); } catch { /* storage unavailable */ } }, [open]);
   useEffect(() => {
@@ -31,8 +33,8 @@ export function PanelSidebar({ collapsed, onToggle }) {
     if (cat && !open[cat.slug]) setOpen((o) => ({ ...o, [cat.slug]: true }));
   }, [location.pathname]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const matches = useMemo(() => (filter.trim() ? new Set(searchPanelFunctions(filter, features).map((f) => f.key)) : null), [filter, features]);
-  const favoriteFns = favorites.map((k) => PANEL_FUNCTION_BY_KEY[k]).filter(Boolean);
+  const matches = useMemo(() => (filter.trim() ? new Set([...searchPanelFunctions(filter, features), ...searchPluginEntries(pluginEntries, filter)].map((f) => f.key)) : null), [filter, features, pluginEntries]);
+  const favoriteFns = favorites.map((k) => PANEL_FUNCTION_BY_KEY[k] || pluginEntries.find((e) => e.key === k)).filter(Boolean);
   const label = (fn) => t(`panel.${panelId(fn)}.label`, fn.label);
 
   return (

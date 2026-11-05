@@ -29,13 +29,15 @@ export const api = {
     return api.parse(res, path);
   },
 
-  // Binary upload (plugin packages): the body is sent as-is under `contentType`.
-  async postRaw(path, body, contentType) {
+  // Binary bodies (plugin packages, upload chunks): sent as-is under `contentType`.
+  async sendRaw(method, path, body, contentType) {
     const headers = { Accept: 'application/json', 'Content-Type': contentType };
     if (csrfToken) headers['X-CSRF-Token'] = csrfToken;
-    const res = await fetch(`/api${path}`, { method: 'POST', headers, body, credentials: 'same-origin' });
+    const res = await fetch(`/api${path}`, { method, headers, body, credentials: 'same-origin' });
     return api.parse(res, path);
   },
+  postRaw: (path, body, contentType) => api.sendRaw('POST', path, body, contentType),
+  putRaw: (path, body, contentType) => api.sendRaw('PUT', path, body, contentType),
 
   async parse(res, path) {
     let json = null;

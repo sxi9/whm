@@ -120,6 +120,57 @@ async function logout(page) {
   await page.waitForSelector('.kv');
   await shot('02-account-details');
 
+  // 3c. accessibility (P2-12, contract §59): the user menu is a WAI-ARIA menu that closes on
+  // Escape and on a click outside, every usage bar is a progressbar, the domain-type tabs
+  // point at their panel, and the home page links a domain as https only when the API
+  // reports a live certificate on it.
+  await page.goto(`${BASE}/panel`);
+  await page.waitForSelector('.panel-meters .stat');
+  await page.click('.user-menu');
+  await page.waitForSelector('[role="menu"]', { timeout: 5000 });
+  const menuRoles = await page.evaluate(() => {
+    const menu = document.querySelector('[role="menu"]');
+    const items = [...menu.querySelectorAll('.menu-item')];
+    return { button: document.querySelector('.user-menu').getAttribute('aria-expanded'), items: items.length, menuitems: items.filter((el) => el.getAttribute('role') === 'menuitem').length, labelled: Boolean(menu.getAttribute('aria-labelledby')) };
+  });
+  if (menuRoles.button !== 'true') errors.push(`user menu button aria-expanded=${menuRoles.button} while open`);
+  if (!menuRoles.items || menuRoles.menuitems !== menuRoles.items) errors.push(`user menu: ${menuRoles.menuitems} of ${menuRoles.items} entries have role=menuitem`);
+  if (!menuRoles.labelled) errors.push('user menu has no aria-labelledby');
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(200);
+  if (await page.$('[role="menu"]')) errors.push('user menu stays open after Escape');
+  if (!(await page.evaluate(() => document.activeElement?.classList.contains('user-menu')))) errors.push('focus did not return to the user menu button after Escape');
+  await page.click('.user-menu');
+  await page.waitForSelector('[role="menu"]', { timeout: 5000 });
+  await page.mouse.click(8, 400);
+  await page.waitForTimeout(200);
+  if (await page.$('[role="menu"]')) errors.push('user menu stays open after a click outside');
+  for (const target of ['/panel', '/panel/usage/usage', '/panel/email/accounts']) {
+    await page.goto(`${BASE}${target}`);
+    await page.waitForSelector('.page-header h1, .home-hero h1', { timeout: 15000 });
+    await page.waitForTimeout(500);
+    const meters = await page.evaluate(() => [...document.querySelectorAll('.meter')].map((el) => ({ role: el.getAttribute('role'), hidden: el.getAttribute('aria-hidden'), now: el.getAttribute('aria-valuenow'), label: el.getAttribute('aria-label') })));
+    for (const m of meters) {
+      if (m.role !== 'progressbar') errors.push(`${target}: a .meter without role=progressbar`);
+      else if (m.hidden !== 'true' && (m.now == null || !m.label)) errors.push(`${target}: a visible progressbar without aria-valuenow or aria-label`);
+    }
+    if (target === '/panel' && !meters.length) errors.push('home page rendered no usage meters');
+  }
+  await page.goto(`${BASE}/panel/domains/domains`);
+  await page.waitForSelector('[role="tablist"] [role="tab"]', { timeout: 15000 });
+  const tabs = await page.evaluate(() => [...document.querySelectorAll('[role="tablist"] [role="tab"]')].map((el) => ({ controls: el.getAttribute('aria-controls'), exists: Boolean(el.getAttribute('aria-controls') && document.getElementById(el.getAttribute('aria-controls'))), selected: el.getAttribute('aria-selected') })));
+  if (!tabs.length) errors.push('domains page: no tabs');
+  for (const tb of tabs) if (!tb.exists) errors.push(`domains page: a tab with aria-controls="${tb.controls}" pointing at nothing`);
+  if (tabs.filter((tb) => tb.selected === 'true').length !== 1) errors.push('domains page: exactly one tab must be selected');
+  const sslRows = await call(page, 'GET', '/api/panel/domains');
+  const mainSsl = (sslRows.body?.data || []).find((d) => d.domain === domain)?.ssl || null;
+  const expectScheme = mainSsl && mainSsl.installed && mainSsl.state !== 'stored' && !mainSsl.expired && (mainSsl.daysRemaining == null || mainSsl.daysRemaining > 0) ? 'https' : 'http';
+  await page.goto(`${BASE}/panel`);
+  await page.waitForSelector('.home-side table a[href]', { timeout: 15000 });
+  const homeHref = await page.evaluate((d) => [...document.querySelectorAll('.home-side table a[href]')].map((a) => a.getAttribute('href')).find((href) => href.endsWith(`://${d}`)), domain);
+  if (homeHref !== `${expectScheme}://${domain}`) errors.push(`home page links ${domain} as ${homeHref}, expected ${expectScheme}:// (API ssl: ${JSON.stringify(mainSsl)})`);
+  note('home link for', domain, '→', homeHref);
+
   // 3b. phone pass (plan P1-11): the home page and every function page at 390×844 must not
   // scroll sideways, the header actions must stay inside the viewport and the keyboard
   // hint is hidden. Tables scroll inside .table-wrap, so that subtree is not an overflow.

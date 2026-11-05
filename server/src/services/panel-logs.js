@@ -20,6 +20,27 @@ const REPORT_CHUNK = 2 * 1024 * 1024;
 
 export const statsPaths = (home, domain) => ({ html: `${home}/.keel/stats/${domain}.html`, summary: `${home}/.keel/stats/${domain}.summary.json` });
 
+// Errors (design P2-5): only the live error logs, never rotated or archived
+// copies; the range read per file is sized from the line budget.
+export const ERRORS_DEFAULT_LINES = 300;
+export const ERRORS_MAX_LINES = 1000;
+const ERRORS_BYTES_PER_LINE = 256;
+export const ERROR_LOG = /[._-](ssl[._-]?)?error(_log|\.log)?$/i;
+
+export const domainOfLog = (name, domains) => (domains || []).filter((d) => domainLogFile(d).test(name)).sort((a, b) => b.length - a.length)[0] || null;
+
+async function tailEntry(ctx, scope, entry, bytes, req) {
+  const file = entry.name;
+  const want = Math.min(Math.max(1, bytes), MAX_TAIL_BYTES);
+  const size = Number(entry.size) || 0;
+  if (size === 0) return { file, size: 0, offset: 0, length: 0, truncated: false, content: '', mtime: entry.mtime ?? null };
+  const offset = Math.max(0, size - want);
+  const part = await ctx.agent.op('acct.read_range', { path: entry.path, owner: scope.username, offset, length: Math.min(want, size - offset) }, { req });
+  let content = Buffer.from(part.data || '', 'base64').toString('utf8');
+  if (offset > 0) { const nl = content.indexOf('\n'); if (nl >= 0) content = content.slice(nl + 1); }
+  return { file, size: part.size, offset, length: part.length, truncated: offset > 0, content, mtime: part.mtime ?? entry.mtime ?? null };
+}
+
 // Raw web logs and bandwidth history for one account (design §4.11). A file is
 // only ever addressed by the name the listing produced; the agent reads the
 // listed path with the account as owner, so a planted symlink or a foreign
@@ -57,14 +78,45 @@ export function createPanelLogsService(ctx) {
       const result = await listing(scope, kind);
       const entry = result.files.find((f) => f.name === file);
       if (!entry) throw notFound(`Log file "${file}"`);
-      const want = Math.min(Math.max(1, bytes), MAX_TAIL_BYTES);
-      const size = Number(entry.size) || 0;
-      if (size === 0) return { file, size: 0, offset: 0, length: 0, truncated: false, content: '', mtime: entry.mtime ?? null };
-      const offset = Math.max(0, size - want);
-      const part = await ctx.agent.op('acct.read_range', { path: entry.path, owner: scope.username, offset, length: Math.min(want, size - offset) }, { req });
-      let content = Buffer.from(part.data || '', 'base64').toString('utf8');
-      if (offset > 0) { const nl = content.indexOf('\n'); if (nl >= 0) content = content.slice(nl + 1); }
-      return { file, size: part.size, offset, length: part.length, truncated: offset > 0, content, mtime: part.mtime ?? entry.mtime ?? null };
+      return tailEntry(ctx, scope, entry, bytes, req);
+    },
+
+    // Errors (design P2-5): the newest lines of every error log of the
+    // account's domains, from both web servers when both exist, each read with
+    // the same bounded range as the tail.
+    async errors(scope, { lines = ERRORS_DEFAULT_LINES, domain = null } = {}, req) {
+      assertFeature(scope, 'errlog');
+      const want = Math.min(Math.max(1, lines), ERRORS_MAX_LINES);
+      const bytes = Math.min(MAX_TAIL_BYTES, Math.max(64 * 1024, want * ERRORS_BYTES_PER_LINE));
+      const listings = [];
+      const warnings = [];
+      const servers = {};
+      for (const kind of ['apache', 'nginx']) {
+        try {
+          const result = await listing(scope, kind);
+          listings.push({ kind, result });
+          warnings.push(...(result.warnings ?? []));
+          servers[kind] = result[kind] !== false;
+        } catch (err) {
+          if (err instanceof CapabilityError || err?.code === 'capability_missing') { servers[kind] = false; continue; }
+          throw err;
+        }
+      }
+      const domains = [...new Set(listings.flatMap((l) => l.result.domains))];
+      if (domain && !domains.includes(domain)) throw notFound(`Domain "${domain}"`);
+      const entries = listings.flatMap(({ kind, result }) => result.files
+        .filter((f) => ERROR_LOG.test(f.name))
+        .map((f) => ({ kind, entry: f, domain: domainOfLog(f.name, domains) }))
+        .filter((f) => !domain || f.domain === domain));
+      const files = await Promise.all(entries.map(async ({ kind, entry, domain: d }) => {
+        const part = await tailEntry(ctx, scope, entry, bytes, req);
+        const all = part.content.split('\n');
+        if (all.length && all[all.length - 1] === '') all.pop();
+        const shown = all.slice(-want).reverse();
+        return { name: entry.name, kind, domain: d, location: shapeFile(scope, entry).location, size: part.size, mtime: part.mtime, lines: shown, truncated: part.truncated || all.length > shown.length };
+      }));
+      files.sort((a, b) => (Date.parse(b.mtime || 0) || 0) - (Date.parse(a.mtime || 0) || 0) || a.name.localeCompare(b.name));
+      return { lines: want, domain, domains, files, warnings, apache: servers.apache === true, nginx: servers.nginx === true };
     },
 
     async download(scope, { kind = 'apache', file }, req, res) {

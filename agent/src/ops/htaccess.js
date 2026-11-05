@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { defineOp, arg, OpError } from './registry.js';
 import { accountPath, assertManaged, asUser, failureOf, lstatOrNull } from './as-user.js';
 import { GROUP_NAME, groupId, stagedWrite } from './files.js';
+import { webSchemaShape, renderWeb, WEB_GRAMMAR, emptyWeb, parseWebLine, finishWeb } from './htaccess-web.js';
 
 // Every path here is a Linux path, whatever platform renders the block.
 const path = nodePath.posix;
@@ -61,6 +62,7 @@ export const blockSchema = z.object({
   errorDocuments: z.partialRecord(z.enum(ERROR_CODES), z.string().regex(ERROR_DOC)).default({}),
   indexes: z.enum(['inherit', 'off', 'on']).default('inherit'),
   auth: z.object({ realm: z.string().regex(REALM), userFile: arg.absPath }).strict().nullable().default(null),
+  ...webSchemaShape,
 }).strict();
 
 const base = { username: arg.username };
@@ -130,6 +132,7 @@ export function renderBlock(spec, { home }) {
   } else if (s.auth) {
     lines.push(grant);
   }
+  lines.push(...renderWeb(s));
   lines.push(END);
   return lines;
 }
@@ -146,6 +149,7 @@ const GRAMMAR = [
   (l) => l === '<RequireAll>' || l === '</RequireAll>',
   (l) => /^ {0,2}Require (valid-user|all granted)$/.test(l),
   (l) => { const m = l.match(/^ {0,2}Require not ip((?: \S+)+)$/); return Boolean(m && m[1].trim().split(' ').every((ip) => parseCidr(ip) !== null)); },
+  ...WEB_GRAMMAR,
 ];
 
 export function validateBlock(lines) {
@@ -170,7 +174,8 @@ export function locateBlock(lines) {
 // Reads the structured spec back out of a block; lines that are not in the
 // grammar are counted so the panel can say the block was edited by hand.
 export function parseBlock(lines) {
-  const spec = { denyIps: [], errorDocuments: {}, indexes: 'inherit', auth: null };
+  const spec = { denyIps: [], errorDocuments: {}, indexes: 'inherit', auth: null, deflate: null, hotlink: null };
+  const web = emptyWeb();
   let realm = null;
   let userFile = null;
   let foreign = 0;
@@ -183,10 +188,13 @@ export function parseBlock(lines) {
     else if ((m = line.match(/^AuthName "(.*)"$/)) && REALM.test(m[1])) realm = m[1];
     else if ((m = line.match(/^AuthUserFile "(.*)"$/))) userFile = m[1];
     else if ((m = line.match(/^ {0,2}Require not ip((?: \S+)+)$/))) spec.denyIps.push(...m[1].trim().split(' ').filter((ip) => parseCidr(ip) !== null));
-    else foreign += 1;
+    else if (!parseWebLine(line, web)) foreign += 1;
   }
   if (realm != null && userFile != null) spec.auth = { realm, userFile };
-  return { spec, foreign };
+  const w = finishWeb(web);
+  spec.deflate = w.deflate;
+  spec.hotlink = w.hotlink;
+  return { spec, foreign: foreign + w.foreign };
 }
 
 export function splitLines(content) {

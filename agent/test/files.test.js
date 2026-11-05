@@ -5,7 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { runOp, createContext, OpError, catalog } from '../src/lib.js';
 import { assertUnderHome, resolveUnderHome, landsInSshDir, asUserArgv, assertManaged, accountPath, SYSTEM_USERS } from '../src/ops/as-user.js';
-import { CHUNK_READ_MAX, FIND_FORMAT, EXTRACT_MAX_BYTES, STDIN_ARCHIVE, parseFind, readRangeArgv, parseTarListing, parseZipListing, checkArchiveMembers, listArchiveArgv, resolveMemberPath, diskLinkReader, sshFingerprint, sshChanges, groupId, setGroup, handOverGroup } from '../src/ops/files.js';
+import { CHUNK_READ_MAX, FIND_FORMAT, EXTRACT_MAX_BYTES, STDIN_ARCHIVE, parseFind, readRangeArgv, chunkWriteArgv, parseTarListing, parseZipListing, checkArchiveMembers, listArchiveArgv, resolveMemberPath, diskLinkReader, sshFingerprint, sshChanges, groupId, setGroup, handOverGroup } from '../src/ops/files.js';
 
 // exec is spied with the real implementation behind it so every test proves an
 // op refused before any program ran. No files.* op is ever executed here: each
@@ -136,6 +136,10 @@ describe('files.* schemas reject injection, traversal and option smuggling befor
       ['files.write', { ...validArgs('files.write'), content: 'x'.repeat(4 * MiB + 1) }],
       ['files.chunk_write', { ...validArgs('files.chunk_write'), data: 'not base64!' }],
       ['files.chunk_write', { ...validArgs('files.chunk_write'), data: '' }],
+      ['files.chunk_write', { ...validArgs('files.chunk_write'), offset: -1 }],
+      ['files.chunk_write', { ...validArgs('files.chunk_write'), offset: 1.5 }],
+      ['files.chunk_write', { ...validArgs('files.chunk_write'), offset: '0' }],
+      ['files.chunk_write', { ...validArgs('files.chunk_write'), data: 'x'.repeat(3 * MiB + 4) }],
       ['files.mkdir', { ...validArgs('files.mkdir'), mode: '0778' }],
       ['files.mkdir', { ...validArgs('files.mkdir'), mode: '-p' }],
       ['files.mkdir', { ...validArgs('files.mkdir'), group: 'www data' }],
@@ -252,6 +256,14 @@ describe('range reads are bounded and dumped without a shell', () => {
     expect(schema.safeParse({ username: 'alice', path: '/home/alice/x', length: CHUNK_READ_MAX }).success).toBe(true);
     expect(schema.safeParse({ username: 'alice', path: '/home/alice/x', length: CHUNK_READ_MAX + 1 }).success).toBe(false);
     expect(schema.parse({ username: 'alice', path: '/home/alice/x' }).length).toBe(CHUNK_READ_MAX);
+  });
+
+  it('writes a chunk at its byte offset: the first (truncating) one cuts the file at the offset, later ones keep the rest', () => {
+    expect(chunkWriteArgv('/home/alice/big.bin', 0, true)).toEqual(['of=/home/alice/big.bin', 'bs=1M', 'seek=0', 'oflag=seek_bytes', 'status=none']);
+    expect(chunkWriteArgv('/home/alice/big.bin', 2 * MiB, true)).toEqual(['of=/home/alice/big.bin', 'bs=1M', `seek=${2 * MiB}`, 'oflag=seek_bytes', 'status=none']);
+    expect(chunkWriteArgv('/home/alice/-dash', 1310720, false)).toEqual(['of=/home/alice/-dash', 'bs=1M', 'seek=1310720', 'oflag=seek_bytes', 'conv=notrunc', 'status=none']);
+    expect(catalog.get('files.chunk_write').schema.parse(validArgs('files.chunk_write'))).toMatchObject({ offset: 0, truncate: false });
+    expect(catalog.get('files.chunk_write').schema.parse({ ...validArgs('files.chunk_write'), offset: 4096 }).offset).toBe(4096);
   });
 
   it('builds the hexdump argv (two characters per byte) and the od fallback, with a stdout buffer sized to the range', () => {

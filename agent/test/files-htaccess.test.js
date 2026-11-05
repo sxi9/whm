@@ -151,7 +151,7 @@ describe('merge and parse', () => {
     const next = ht.renderBlock({ indexes: 'on' }, { home: HOME });
     const twice = ht.mergeBlock(edited, next);
     expect(twice).toBe(`${user}\n${next.join('\n')}\n${tail}`);
-    expect(ht.parseFile(twice)).toEqual({ managed: true, spec: { denyIps: [], errorDocuments: {}, indexes: 'on', auth: null }, foreign: 0 });
+    expect(ht.parseFile(twice)).toEqual({ managed: true, spec: { denyIps: [], errorDocuments: {}, indexes: 'on', auth: null, deflate: null, hotlink: null }, foreign: 0 });
     expect(ht.mergeBlock(twice, null)).toBe(`${user}${tail}`);
     expect(ht.mergeBlock(ht.mergeBlock('', block), null)).toBe('');
     expect(ht.mergeBlock('', null)).toBe('');
@@ -161,7 +161,7 @@ describe('merge and parse', () => {
   it('round-trips a full spec and counts hand-edited lines inside the markers', () => {
     const spec = { denyIps: ['203.0.113.9', '10.0.0.0/8'], errorDocuments: { 403: '/errors/403.html' }, indexes: 'off', auth: { realm: 'Staff', userFile: USERFILE } };
     const text = ht.mergeBlock('', ht.renderBlock(spec, { home: HOME }));
-    expect(ht.parseFile(text).spec).toEqual(spec);
+    expect(ht.parseFile(text).spec).toEqual({ ...spec, deflate: null, hotlink: null });
     const tampered = text.replace('Options -Indexes', 'Options -Indexes\nphp_value auto_prepend_file /tmp/x');
     expect(ht.parseFile(tampered)).toMatchObject({ managed: true, foreign: 1 });
     expect(() => ht.parseFile(`${ht.BEGIN}\nOptions -Indexes\n`)).toThrow(/without/);

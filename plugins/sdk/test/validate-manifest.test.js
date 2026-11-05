@@ -215,6 +215,26 @@ test('ui: category must be one of the 30 categories; sidebar routes must match a
   }
 });
 
+test('ui.pages[].audience: admin by default, panel only for table/form/markdown/html, never on a sidebar entry', () => {
+  const ui = (sidebar, pages, perms = ['ui:sidebar', 'api:routes', 'jobs']) => minimalManifest({ permissions: perms, jobs: { sync: { label: 'Sync' } }, ui: { sidebar, pages } });
+  assert.deepEqual(V.PAGE_AUDIENCES, ['admin', 'panel']);
+  assert.deepEqual(V.PANEL_PAGE_KINDS, ['table', 'form', 'markdown', 'html']);
+  // a 1.0 manifest without the key stays valid
+  assert.ok(V.validateManifest(ui([], [{ route: '/', title: 'Home', kind: 'markdown', content: '# hi' }])).ok);
+  assert.ok(V.validateManifest(ui([], [{ route: '/', title: 'Home', kind: 'markdown', content: '# hi', audience: 'admin' }])).ok);
+  for (const kind of [['table', { source: '/rows' }], ['form', { source: '/rows', fields: [{ key: 'a', type: 'text', label: 'A' }] }], ['markdown', { content: 'x' }], ['html', { file: 'pages/x.html' }]]) {
+    assert.ok(V.validateManifest(ui([], [{ route: '/p', title: 'P', kind: kind[0], audience: 'panel', ...kind[1] }])).ok, kind[0]);
+  }
+  expectError(ui([], [{ route: '/p', title: 'P', kind: 'markdown', content: 'x', audience: 'customers' }]), 'ui.pages[0].audience', 'UNKNOWN_AUDIENCE');
+  expectError(ui([], [{ route: '/p', title: 'P', kind: 'action', job: 'sync', audience: 'panel' }]), 'ui.pages[0].audience', 'AUDIENCE_KIND');
+  expectError(ui([], [{ route: '/p', title: 'P', kind: 'settings', audience: 'panel' }]), 'ui.pages[0].audience', 'AUDIENCE_KIND');
+  expectError(ui([{ category: 'Plugins', label: 'x', route: '/p', icon: 'zap' }], [{ route: '/p', title: 'P', kind: 'markdown', content: 'x', audience: 'panel' }]), 'ui.sidebar[0].route', 'AUDIENCE');
+  // ctx.ui.registerPage() uses the same descriptor rules
+  const c = { errors: [], add(p, code, message) { this.errors.push({ path: p, code, message }); } };
+  V.validatePageDescriptor({ route: '/p', title: 'P', kind: 'action', job: 'sync', audience: 'panel' }, 'page', c, { jobs: ['sync'] });
+  assert.deepEqual(c.errors.map((e) => e.code), ['AUDIENCE_KIND']);
+});
+
 test('unknown top-level keys, isolation, i18n, keywords', () => {
   expectError(minimalManifest({ bogus: true }), '.bogus', 'UNKNOWN_KEY');
   expectError(minimalManifest({ isolation: 'vm' }), 'isolation', 'UNKNOWN_ISOLATION');
@@ -247,6 +267,7 @@ test('manifest.schema.json enums match the validator constants', () => {
   assert.deepEqual(defs.hostEvent.enum, [...V.EVENT_NAMES]);
   assert.deepEqual(defs.settingType.enum, [...V.SETTING_TYPES]);
   assert.deepEqual(defs.pageKind.enum, [...V.PAGE_KINDS]);
+  assert.deepEqual(defs.pageAudience.enum, [...V.PAGE_AUDIENCES]);
   assert.deepEqual(schema.properties.isolation.enum, [...V.ISOLATION_MODES]);
   assert.deepEqual(defs.hookStage.enum, [...V.HOOK_STAGES]);
   assert.equal(defs.agentOpPermission.pattern, V.AGENT_OP_SCOPE_PATTERN.source);

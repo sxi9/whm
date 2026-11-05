@@ -6,6 +6,7 @@ import { useBranding, useBrandingLoader } from '../pages/cpanel/branding.js';
 import { useT } from '../i18n/useT.js';
 import { ShellContext, PANEL_SHELL } from './ShellContext.js';
 import { PanelContext, usePanelMeLoader } from './hooks/usePanel.js';
+import { PanelPluginProvider } from './hooks/usePanelPlugins.js';
 import { PanelSidebar } from './PanelSidebar.jsx';
 import { PanelTopBar } from './PanelTopBar.jsx';
 import { PanelBanners } from './PanelBanners.jsx';
@@ -70,7 +71,8 @@ export function PanelShell({ me, children }) {
 }
 
 // Auth gate + ShellContext + PanelContext for every /panel route (design §6.2):
-// no PluginNavProvider, no license or revocation banners, no audit-log link.
+// no admin PluginNavProvider (the panel has its own, audience 'panel', gated by
+// the `plugins` plan feature), no license or revocation banners, no audit-log link.
 export function PanelLayout() {
   const { user, ready } = useAuth();
   const location = useLocation();
@@ -88,7 +90,9 @@ export function PanelLayout() {
   return (
     <ShellContext.Provider value={PANEL_SHELL}>
       <PanelContext.Provider value={loader}>
-        <PanelShell me={me} />
+        <PanelPluginProvider enabled={loader.hasFeature('plugins')}>
+          <PanelShell me={me} />
+        </PanelPluginProvider>
       </PanelContext.Provider>
     </ShellContext.Provider>
   );

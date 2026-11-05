@@ -215,6 +215,14 @@ module.exports = {
       res.json(doc);
     });
 
+    // The account panel page (audience "panel"): the host only routes a panel
+    // call to a route that lists the 'user' role and pins the account as
+    // req.panel, so the handler never trusts a username from the request.
+    router.get('/my-notes', { roles: ['user'] }, async (req, res) => {
+      const rows = await notesOf(ctx).find({ account: req.panel.username }, { sort: { createdAt: -1 }, limit: 200 });
+      res.json(rows.map((n) => ({ id: n.id, title: n.title, category: n.category, createdAt: n.createdAtIso || new Date(n.createdAt).toISOString() })));
+    });
+
     router.delete('/notes/:id', async (req, res) => {
       const removed = await notesOf(ctx).remove({ id: req.params.id });
       if (!removed) throw new ctx.errors.NotFoundError('note', req.params.id);

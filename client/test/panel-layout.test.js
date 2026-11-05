@@ -199,6 +199,11 @@ describe('PanelPage chrome', () => {
     }
     expect(render(h(PanelCapabilityState, { error: { status: 501, code: 'capability_missing', message: 'pure-ftpd is not installed' } }))).toContain('pure-ftpd is not installed');
     expect(render(h(PanelCapabilityState, { error: { status: 404, code: 'not_found' } }))).toBe('');
+    // A plan setting answered with 501 (shell access) is worded as the plan, not the server (P2-12).
+    const plan = render(h(PanelCapabilityState, { error: { status: 501, code: 'shell_disabled', message: 'This account has no shell access' }, onRetry: () => {} }));
+    expect(plan).toContain('Not included in your plan');
+    expect(plan).toContain('no shell access');
+    expect(plan).not.toContain('Not available on this server');
     expect(render(h(PendingPill, { result: { applied: false, reason: 'capability_missing' } }))).toContain('Pending');
     expect(render(h(PendingPill, { result: { applied: true } }))).toBe('');
   });

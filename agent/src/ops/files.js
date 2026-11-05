@@ -190,16 +190,23 @@ defineOp('files.write', {
   },
 });
 
+// A chunk lands at a byte offset (dd seek=, oflag=seek_bytes): without
+// conv=notrunc dd first truncates the file to that offset, which is how the
+// first chunk of an upload starts the file over whichever index it carries;
+// every later chunk keeps what the others wrote.
+export function chunkWriteArgv(target, offset = 0, truncate = false) {
+  return [`of=${target}`, 'bs=1M', `seek=${offset}`, 'oflag=seek_bytes', ...(truncate ? [] : ['conv=notrunc']), 'status=none'];
+}
+
 defineOp('files.chunk_write', {
-  description: 'Append a base64 chunk to a file in an account home as the account (truncate starts the file over)',
-  schema: z.object({ ...base, ...protect, path: pathArg, data: z.string().min(1).max(3 * MiB).regex(/^[A-Za-z0-9+/=]+$/), truncate: z.boolean().default(false) }).strict(),
-  run: async ({ username, path: p, data, truncate, protectSshDir }, ctx) => {
+  description: 'Write a base64 chunk at a byte offset of a file in an account home as the account (truncate starts the file over)',
+  schema: z.object({ ...base, ...protect, path: pathArg, data: z.string().min(1).max(3 * MiB).regex(/^[A-Za-z0-9+/=]+$/), offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0), truncate: z.boolean().default(false) }).strict(),
+  run: async ({ username, path: p, data, offset, truncate, protectSshDir }, ctx) => {
     const { info, home, target } = accountPath(username, p, ctx, 'write', { protectSshDir });
     assertNotHome(target, home, 'files.chunk_write');
     rejectSymlinkTarget(target);
     const buf = Buffer.from(data, 'base64');
-    const argv = truncate ? [`of=${target}`, 'bs=1M', 'status=none'] : [`of=${target}`, 'bs=1M', 'conv=notrunc', 'oflag=append', 'status=none'];
-    const r = await asUser(info, 'dd', argv, { input: buf, allowFailure: true, timeoutMs: 120_000 });
+    const r = await asUser(info, 'dd', chunkWriteArgv(target, offset, truncate), { input: buf, allowFailure: true, timeoutMs: 120_000 });
     if (r.code !== 0) throw failureOf(r, `write ${path.relative(home, target)}`);
     const st = lstatOrNull(target);
     return { path: target, bytes: buf.length, size: st?.isFile() ? st.size : null, truncated: truncate };

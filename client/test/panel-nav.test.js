@@ -16,7 +16,7 @@ const GROUPS = ['overview', 'domains', 'dns', 'ssl', 'files', 'email', 'database
 describe('panel/nav.js is the single source of truth for /panel', () => {
   it('lists the v1 groups of design §1.2 in order with unique keys and paths', () => {
     expect(PANEL_CATEGORIES.map((c) => c.slug)).toEqual(GROUPS);
-    expect(PANEL_FUNCTIONS).toHaveLength(49);
+    expect(PANEL_FUNCTIONS).toHaveLength(57);
     expect(new Set(PANEL_FUNCTIONS.map((f) => f.key)).size).toBe(PANEL_FUNCTIONS.length);
     expect(new Set(PANEL_FUNCTIONS.map((f) => f.path)).size).toBe(PANEL_FUNCTIONS.length);
     for (const f of PANEL_FUNCTIONS) {
@@ -32,10 +32,10 @@ describe('panel/nav.js is the single source of truth for /panel', () => {
   it('carries every page file of design §6.1', () => {
     const expected = [
       'overview/dashboard', 'overview/account', 'overview/preferences', 'domains/domains', 'domains/addon-domains', 'domains/subdomains', 'domains/parked-domains', 'domains/redirects',
-      'dns/zone-editor', 'ssl/status', 'ssl/install', 'ssl/certificates', 'files/file-manager', 'files/disk-usage', 'files/directory-privacy', 'files/indexes', 'email/accounts', 'email/forwarders',
+      'dns/zone-editor', 'dns/dynamic-dns', 'dns/track', 'ssl/status', 'ssl/install', 'ssl/certificates', 'files/file-manager', 'files/disk-usage', 'files/directory-privacy', 'files/indexes', 'email/accounts', 'email/forwarders',
       'email/default-address', 'email/autoresponders', 'email/filters', 'email/global-filters', 'email/spam', 'email/deliverability', 'email/routing', 'email/webmail', 'email/usage', 'databases/databases', 'databases/users',
-      'databases/remote-hosts', 'databases/phpmyadmin', 'ftp/accounts', 'cron/cron-jobs', 'backups/backups', 'backups/restore', 'logs/access-logs', 'logs/bandwidth', 'logs/visitors',
-      'php/versions', 'php/ini', 'security/password', 'security/two-factor', 'security/ssh-keys', 'security/sessions', 'security/tokens', 'security/ip-blocker', 'usage/usage', 'advanced/error-pages', 'software/wordpress',
+      'databases/remote-hosts', 'databases/phpmyadmin', 'databases/wizard', 'ftp/accounts', 'cron/cron-jobs', 'backups/backups', 'backups/restore', 'logs/access-logs', 'logs/bandwidth', 'logs/visitors', 'logs/errors',
+      'php/versions', 'php/ini', 'security/password', 'security/two-factor', 'security/ssh-keys', 'security/sessions', 'security/tokens', 'security/ip-blocker', 'security/virus-scanner', 'usage/usage', 'advanced/error-pages', 'advanced/optimize-website', 'advanced/hotlink-protection', 'software/wordpress', 'software/plugins',
     ];
     expect(PANEL_FUNCTIONS.map(panelId)).toEqual(expected);
     expect(PANEL_PATHS.password).toBe('/panel/security/password');
@@ -67,7 +67,8 @@ describe('panel/nav.js is the single source of truth for /panel', () => {
     expect(children[0].index).toBe(true);
     expect(children[1].path).toBe('change-password');
     expect(children.at(-1).path).toBe('*');
-    expect(children).toHaveLength(PANEL_FUNCTIONS.length + 3);
+    // index, change-password, plugins/:pluginId/* and the catch-all
+    expect(children).toHaveLength(PANEL_FUNCTIONS.length + 4);
   });
 
   it('gates functions by plan feature (missing keys mean enabled) and searches label, group and description', () => {

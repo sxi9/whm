@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import request from 'supertest';
 import { createTestApp, createMockAgent, waitForJob } from './support/app.js';
-import { relPath, UPLOAD_TTL_MS, DOWNLOAD_CHUNK_BYTES, createGate, sshWriteAllowed } from '../src/services/panel-files.js';
+import { relPath, UPLOAD_TTL_MS, DOWNLOAD_CHUNK_BYTES, MAX_CHUNK_BYTES, createGate, sshWriteAllowed } from '../src/services/panel-files.js';
 
 // A tiny fake home tree the mock agent answers from. Paths are absolute, as the
 // service sends them; the mock records every call for the assertions.
@@ -51,11 +51,16 @@ function hostAgent(fs) {
       return { path, size: e.content.length, offset, length: slice.length, data: slice.toString('base64'), eof: offset + slice.length >= e.content.length };
     },
     'files.write': ({ path, content, mode }) => { const existed = fs.tree.has(path); fs.file(path, content); return { path, bytes: Buffer.byteLength(content), mode: mode ?? '0644', created: !existed }; },
-    'files.chunk_write': ({ path, data, truncate }) => {
+    // dd semantics: the file is truncated to the offset unless notrunc, then the
+    // chunk lands at the offset (a sparse gap stays zero-filled).
+    'files.chunk_write': ({ path, data, offset = 0, truncate }) => {
       const buf = Buffer.from(data, 'base64');
-      const prev = !truncate && fs.tree.get(path)?.content ? fs.tree.get(path).content : Buffer.alloc(0);
-      fs.file(path, Buffer.concat([prev, buf]));
-      return { path, bytes: buf.length, size: fs.tree.get(path).content.length, truncated: truncate };
+      const prev = fs.tree.get(path)?.content ?? Buffer.alloc(0);
+      const base = truncate ? prev.subarray(0, Math.min(prev.length, offset)) : prev;
+      const out = Buffer.alloc(Math.max(base.length, offset + buf.length));
+      base.copy(out); buf.copy(out, offset);
+      fs.file(path, out);
+      return { path, bytes: buf.length, size: out.length, truncated: truncate };
     },
     'files.mkdir': ({ path, mode }) => { fs.dir(path); return { path, mode }; },
     'files.move': ({ from, to }) => { const e = fs.tree.get(from); fs.tree.delete(from); fs.tree.set(to, e); return { from, to }; },
@@ -272,41 +277,111 @@ describe('Panel files API', () => {
   });
 
   describe('uploads', () => {
-    const chunk = (s) => Buffer.from(s).toString('base64');
+    // Raw octet-stream chunks by index (§57); the pinned chunk size is lowered
+    // through the setting so a short file spans several chunks.
+    const chunk = (id, index, bytes) => alice.put(`/api/panel/files/uploads/${id}/chunks/${index}`).set('X-CSRF-Token', aliceCsrf).set('Content-Type', 'application/octet-stream').send(Buffer.from(bytes));
+    const setChunkBytes = (n) => app.ctx.settings.setMany({ 'panel.upload_chunk_bytes': n });
+    afterAll(() => setChunkBytes(null));
 
-    it('begins, appends chunks, finishes and audits once', async () => {
+    it('pins the chunk size per upload, clamped between 1 KiB and the raw ceiling', async () => {
       const begin = await post('/uploads', { path: 'public_html', name: 'upload.txt', size: 10 });
       expect(begin.status).toBe(201);
       const { id } = begin.body.data;
-      expect(begin.body.data).toMatchObject({ path: 'public_html/upload.txt', received: 0, chunkBytes: 1310720 });
-      expect((await put(`/uploads/${id}/chunks`, { data: chunk('hello') })).body.data.received).toBe(5);
-      expect((await put(`/uploads/${id}/chunks`, { data: chunk('world') })).body.data.received).toBe(10);
+      expect(begin.body.data).toMatchObject({ path: 'public_html/upload.txt', received: 0, chunkBytes: 1310720, chunkCount: 1, receivedChunks: [] });
+      setChunkBytes(4);
+      expect((await get(`/uploads/${id}`)).body.data.chunkBytes).toBe(1310720);
+      await post(`/uploads/${id}/abort`).expect(200);
+      expect((await post('/uploads', { path: 'public_html', name: 'upload.txt', size: 3000 })).body.data).toMatchObject({ chunkBytes: 1024, chunkCount: 3 });
+      setChunkBytes(64 * 1024 * 1024);
+      expect((await post('/uploads', { path: 'public_html', name: 'upload2.txt', size: 10 })).body.data.chunkBytes).toBe(MAX_CHUNK_BYTES);
+      setChunkBytes(null);
+      for (const u of [...app.ctx.panelFiles._uploads.values()]) await post(`/uploads/${u.id}/abort`);
+    });
+
+    it('spans several chunks, written at their offsets, in any order and idempotently', async () => {
+      setChunkBytes(1024);
+      const size = 2500;
+      const bytes = Buffer.alloc(size, 0); for (let i = 0; i < size; i += 1) bytes[i] = i % 251;
+      const begin = await post('/uploads', { path: 'public_html', name: 'big.bin', size });
+      const { id } = begin.body.data;
+      expect(begin.body.data).toMatchObject({ chunkBytes: 1024, chunkCount: 3, receivedChunks: [] });
+      const part = (i) => bytes.subarray(i * 1024, Math.min(size, (i + 1) * 1024));
+      expect((await chunk(id, 2, part(2))).body.data).toMatchObject({ received: 452, chunks: 1, receivedChunks: [2] });
+      expect((await chunk(id, 0, part(0))).body.data).toMatchObject({ received: 1476, receivedChunks: [0, 2] });
+      // A retried chunk is written again but counted once; the wrong length is refused.
+      expect((await chunk(id, 0, part(0))).body.data).toMatchObject({ received: 1476, chunks: 2, receivedChunks: [0, 2] });
+      expect((await chunk(id, 1, part(1).subarray(0, 100))).status).toBe(422);
+      expect((await chunk(id, 3, part(2))).status).toBe(422);
+      expect((await chunk(id, 1, Buffer.alloc(0))).status).toBe(422);
+      const fin0 = await post(`/uploads/${id}/finish`);
+      expect(fin0.status).toBe(422);
+      expect(fin0.body.error.fields.data[0]).toContain('missing: 1');
+      expect((await get(`/uploads/${id}`)).body.data).toMatchObject({ receivedChunks: [0, 2], chunkCount: 3 });
+      expect((await chunk(id, 1, part(1))).body.data).toMatchObject({ received: size, receivedChunks: [0, 1, 2] });
       const writes = app.agent.callsTo('files.chunk_write');
-      expect(writes.map((w) => [w.args.path, w.args.truncate])).toEqual([['/home/alice/public_html/upload.txt', true], ['/home/alice/public_html/upload.txt', false]]);
-      expect((await put(`/uploads/${id}/chunks`, { data: chunk('!') })).status).toBe(422);
-      const auto = app.ctx.db.prepare("SELECT args_redacted FROM audit_log WHERE action LIKE 'PUT /api/panel/files/uploads/%' ORDER BY id DESC LIMIT 1").get();
+      expect(writes.map((w) => [w.args.offset, w.args.truncate])).toEqual([[2048, true], [0, false], [0, false], [1024, false]]);
+      expect(writes.every((w) => w.args.path === '/home/alice/public_html/big.bin' && w.args.protectSshDir === true)).toBe(true);
+      const auto = app.ctx.db.prepare("SELECT args_redacted, target FROM audit_log WHERE action LIKE 'PUT /api/panel/files/uploads/%' ORDER BY id DESC LIMIT 1").get();
       expect(auto.args_redacted).toBeNull();
+      expect(auto.target).toBe(`${id}/1`);
       expect(lastAudit('panel.files.upload')).toBeUndefined();
       const fin = await post(`/uploads/${id}/finish`);
       expect(fin.status).toBe(200);
-      expect(fin.body.data).toEqual({ id, path: 'public_html/upload.txt', bytes: 10 });
-      expect(JSON.parse(lastAudit('panel.files.upload').args_redacted)).toMatchObject({ path: 'public_html/upload.txt', bytes: 10, chunks: 2 });
-      expect(fs.tree.get('/home/alice/public_html/upload.txt').content.toString()).toBe('helloworld');
+      expect(fin.body.data).toEqual({ id, path: 'public_html/big.bin', bytes: size });
+      expect(JSON.parse(lastAudit('panel.files.upload').args_redacted)).toMatchObject({ path: 'public_html/big.bin', bytes: size, chunks: 3 });
+      expect(fs.tree.get('/home/alice/public_html/big.bin').content.equals(bytes)).toBe(true);
       expect((await get(`/uploads/${id}`)).status).toBe(404);
+      setChunkBytes(null);
+    });
+
+    it('truncates once even when two chunks are in flight at the same time', async () => {
+      setChunkBytes(1024);
+      const size = 2048;
+      const bytes = Buffer.alloc(size, 0); for (let i = 0; i < size; i += 1) bytes[i] = (i * 7) % 251;
+      const { id } = (await post('/uploads', { path: 'public_html', name: 'race.bin', size })).body.data;
+      const [a, b] = await Promise.all([chunk(id, 0, bytes.subarray(0, 1024)), chunk(id, 1, bytes.subarray(1024))]);
+      expect([a.status, b.status]).toEqual([200, 200]);
+      const flags = app.agent.callsTo('files.chunk_write').map((w) => w.args.truncate);
+      expect(flags.filter(Boolean)).toHaveLength(1);
+      expect(flags[0]).toBe(true);
+      await post(`/uploads/${id}/finish`).expect(200);
+      expect(fs.tree.get('/home/alice/public_html/race.bin').content.equals(bytes)).toBe(true);
+      setChunkBytes(null);
+    });
+
+    it('takes only an octet-stream body within the pinned ceiling', async () => {
+      const b = await post('/uploads', { path: '', name: 'raw.bin', size: 3 });
+      const { id } = b.body.data;
+      expect((await put(`/uploads/${id}/chunks/0`, { data: 'YWJj' })).status).toBe(415);
+      expect((await alice.put(`/api/panel/files/uploads/${id}/chunks/0`).set('X-CSRF-Token', aliceCsrf).set('Content-Type', 'text/plain').send('abc')).status).toBe(415);
+      expect((await chunk(id, -1, 'abc')).status).toBe(422);
+      expect((await chunk(id, 'x', 'abc')).status).toBe(422);
+      const big = await alice.put(`/api/panel/files/uploads/${id}/chunks/0`).set('X-CSRF-Token', aliceCsrf).set('Content-Type', 'application/octet-stream').send(Buffer.alloc(MAX_CHUNK_BYTES + 1));
+      expect(big.status).toBe(413);
+      expect(app.agent.callsTo('files.chunk_write')).toHaveLength(0);
+      expect((await chunk(id, 0, 'abc')).body.data).toMatchObject({ received: 3, receivedChunks: [0] });
+      expect((await post(`/uploads/${id}/finish`)).status).toBe(200);
     });
 
     it('refuses an incomplete finish, an existing target without overwrite, a missing directory and bad names', async () => {
+      fs.file('/home/alice/public_html/upload.txt', 'old');
       expect((await post('/uploads', { path: 'public_html', name: 'upload.txt', size: 3 })).status).toBe(409);
       expect((await post('/uploads', { path: 'public_html', name: 'upload.txt', size: 3, overwrite: true })).status).toBe(201);
       expect((await post('/uploads', { path: 'nowhere', name: 'a.txt', size: 3 })).status).toBe(404);
       expect((await post('/uploads', { path: 'notes.txt', name: 'a.txt', size: 3 })).status).toBe(422);
       for (const name of ['..', '.', 'a/b', '', 'x'.repeat(256), 'a\nb']) expect((await post('/uploads', { path: '', name, size: 3 })).status, name).toBe(422);
       const b = await post('/uploads', { path: '', name: 'half.txt', size: 4 });
-      await put(`/uploads/${b.body.data.id}/chunks`, { data: chunk('ab') });
+      expect((await chunk(b.body.data.id, 0, 'ab')).status).toBe(422);
       const fin = await post(`/uploads/${b.body.data.id}/finish`);
       expect(fin.status).toBe(422);
+      expect(app.agent.callsTo('files.chunk_write')).toHaveLength(0);
       const abort = await post(`/uploads/${b.body.data.id}/abort`);
       expect(abort.body.data.aborted).toBe(true);
+      // Nothing was written, so nothing is removed; a started upload is.
+      expect(app.agent.callsTo('files.remove')).toHaveLength(0);
+      const c = await post('/uploads', { path: '', name: 'half.txt', size: 4 });
+      await chunk(c.body.data.id, 0, 'abcd').expect(200);
+      await post(`/uploads/${c.body.data.id}/abort`).expect(200);
       expect(app.agent.callsTo('files.remove').at(-1).args).toEqual({ username: 'alice', paths: ['/home/alice/half.txt'], protectSshDir: true });
       expect(lastAudit('panel.files.upload_abort')).toMatchObject({ target: 'alice' });
     });
@@ -320,7 +395,7 @@ describe('Panel files API', () => {
       await rootPost('/api/panel/admin/login-as/bob').expect(200);
       try {
         expect((await app.http.get(`/api/panel/files/uploads/${c.body.data.id}`)).status).toBe(404);
-        expect((await app.http.put(`/api/panel/files/uploads/${c.body.data.id}/chunks`).set('X-CSRF-Token', rootCsrf).send({ data: chunk('ab') })).status).toBe(404);
+        expect((await app.http.put(`/api/panel/files/uploads/${c.body.data.id}/chunks/0`).set('X-CSRF-Token', rootCsrf).set('Content-Type', 'application/octet-stream').send(Buffer.from('abcd'))).status).toBe(404);
       } finally { await rootPost('/api/panel/admin/logout-as').expect(200); }
     });
   });
@@ -420,7 +495,7 @@ describe('Panel files API', () => {
       expect(app.agent.callsTo('files.write').at(-1).args).toMatchObject({ path: '/home/alice/lnk/.ssh/authorized_keys', protectSshDir: true });
       const u = await post('/uploads', { path: 'lnk', name: 'keys', size: 3 });
       expect(u.status).toBe(201);
-      await put(`/uploads/${u.body.data.id}/chunks`, { data: Buffer.from('abc').toString('base64') }).expect(200);
+      await alice.put(`/api/panel/files/uploads/${u.body.data.id}/chunks/0`).set('X-CSRF-Token', aliceCsrf).set('Content-Type', 'application/octet-stream').send(Buffer.from('abc')).expect(200);
       expect(app.agent.callsTo('files.chunk_write').at(-1).args).toMatchObject({ path: '/home/alice/lnk/keys', protectSshDir: true });
       for (const [method, p, body] of [['post', '/mkdir', { path: 'lnk/.ssh' }], ['post', '/rename', { from: 'scratch.txt', to: 'lnk/k' }], ['post', '/copy', { from: 'lnk/k', to: 'lnk/k2' }], ['post', '/chmod', { path: 'lnk', mode: '0700' }], ['delete', '', { paths: ['lnk/k'] }], ['post', '/archive', { paths: ['lnk/k2'], dest: 'lnk/a.zip', format: 'zip' }]]) {
         const res = await (method === 'delete' ? del(p, body) : post(p, body));

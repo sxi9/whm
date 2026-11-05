@@ -52,12 +52,28 @@ export function PanelPage({ fn, title, description, actions, children }) {
   );
 }
 
+// Error codes that describe a setting of the hosting plan rather than a missing
+// daemon: the server answers them with 501 (shell access) or 403 (feature list),
+// but for the customer they all mean "not included in your plan".
+export const PLAN_SETTING_CODES = ['shell_disabled', 'feature_disabled', 'plan_disabled'];
+export const isPlanSettingError = (error) => Boolean(error) && PLAN_SETTING_CODES.includes(error.code);
+export const isCapabilityError = (error) => Boolean(error) && !isPlanSettingError(error) && (error.status === 501 || error.code === 'capability_missing' || error.code === 'binary_not_found');
+
 // 501 from the API: the daemon behind this screen is not installed on the server.
-// Customers cannot install anything, so the prompt tells them whom to ask.
+// Customers cannot install anything, so the prompt tells them whom to ask. A plan
+// setting (`shell_disabled` and the other PLAN_SETTING_CODES) is worded as such.
 export function PanelCapabilityState({ error, onRetry }) {
   const { t } = useT();
   if (!error) return null;
-  if (error.status !== 501 && error.code !== 'capability_missing' && error.code !== 'binary_not_found') return null;
+  if (isPlanSettingError(error)) {
+    return (
+      <EmptyState icon={AlertTriangle} title={t('panel.shell.feature_disabled_title', 'Not included in your plan')}>
+        <p>{error.message || t('panel.shell.feature_disabled_generic', 'This feature is not part of the hosting plan on this account.')}</p>
+        <p className="muted">{t('panel.shell.feature_disabled_help', 'Ask your hosting provider about upgrading the plan.')}</p>
+      </EmptyState>
+    );
+  }
+  if (!isCapabilityError(error)) return null;
   return (
     <EmptyState icon={PackageX} title={t('panel.shell.capability_title', 'Not available on this server')}>
       <p>{error.message || t('panel.shell.capability_text', 'The service behind this screen is not installed.')}</p>

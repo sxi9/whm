@@ -9,6 +9,70 @@ not for the commit log.
 ## [Unreleased]
 
 ### Added
+- **Account panel › Logs › Errors (P2-5):** the newest lines of every error log of the account's domains (Apache and
+  NGINX, server-side and own-folder, live files only) in one page, newest first, with a domain filter, 100–1000 lines and a
+  10 s follow; feature `errlog`, `GET /api/panel/logs/errors?lines&domain` over the existing owner-checked range read
+  (contract §62, manual C §11.4).
+- **Review fixes (P2):** chunk uploads decide `truncate` before the agent call so two chunks in flight never wipe each
+  other; the DDNS limiter counts only the public update (the panel page is never 429 behind a shared address), `POST`/
+  `DELETE` are session-only, `GET /api/panel/dns/ddns/update` takes the token as the HTTP basic password and the request log
+  redacts path tokens (DDNS and SSO); Track DNS refuses loopback, private, link-local and multicast targets (422);
+  Feature Manager labels `traceroute`, `dbwizard`, `plugins`; contract sections renumbered 53–62 in order.
+- **Account panel › DNS › Track DNS (P2-7):** record lookups (`dig +short`, A/AAAA/MX/NS/TXT/CNAME/SOA/PTR) and route
+  traces (`traceroute -n -w 2 -m 20`, 60 s cap, one at a time per account) from the server, read-only, with the target
+  pinned by the route, the agent schema and the argv (`GET /api/panel/dns/track/lookup?name=&type=`,
+  `GET /api/panel/dns/track/trace?host=`, agent `dns.lookup` / `dns.trace`). Feature `traceroute` (new in the default
+  feature list); needs `dnsutils` and `traceroute` on the host (501 with the package otherwise). Contract §60, manual C §3.3.
+- **Account panel wording and accessibility (P2-12):** `501 shell_disabled` and the other plan-setting codes
+  (`PLAN_SETTING_CODES` in `panel/PanelPage.jsx`) read "Not included in your plan" instead of "Not available on this server";
+  the user menu is a real `role="menu"` with `menuitem` entries that closes on Escape and on a click outside; every usage bar
+  is a `progressbar` with its percentage and figure (`panel/Meter.jsx`); the domain-type tabs on *Domains* carry
+  `aria-controls` and arrow-key movement; the home page links a domain as `https://` when a valid certificate is installed on
+  it (from `GET /api/panel/domains`). `e2e/panel-check.cjs` asserts all of it (step 3c). Contract §59, manual C.6.
+- **Account panel › Databases › Database wizard (P2-4):** a three-step page (database → user → privileges) that
+  composes the existing `POST /api/panel/databases`, `POST /api/panel/databases/users` and
+  `PUT /api/panel/databases/users/:name/grants` calls — no new routes; every step is saved as it is taken and the final
+  card shows the connection details. Nav `databases/wizard`, plan feature `dbwizard` (new in the default feature list,
+  on; the calls stay gated by `mysql`/`postgres`), i18n `panel.databases.wizard_*`. Contract §61, manual C §7.5.
+- **Account panel › Usage quota source note (P2-13):** when disk figures come from the scan rather than `repquota`, a
+  banner above the meters states the scan age and time, warns past a day (and before any scan) with the *Refresh
+  figures* hint, and the disk tile reads *From the last scan, {age}*. No new route or feature (contract §58, manual C §14.1).
+- **Account panel › Email › Spam filters, thresholds documented (P2-2):** a *How spam scoring works* card on the page
+  and manual C §6.5 explain per-account thresholds the cPanel way (one `required_score` per account, auto-delete as a
+  second higher score, allow/block lists overriding the score) and that the threshold only acts once the mail server
+  hands mail to a scanner — a host on the light Exim build without content scanning (nova) delivers mail unscored and
+  the page says so instead of saving; no PRDR / per-recipient thresholds. Text only (i18n `panel.email.spam.how_*`,
+  `panel.email.spam.no_scan_thresholds`); existing feature `spamassassin`.
+- **Optimize website and Hotlink protection in the account panel (P2-6):** two pages under *Advanced*. Optimize website
+  (feature `optimizews`, new in the default feature list) writes an `<IfModule mod_deflate.c>` block with
+  `AddOutputFilterByType DEFLATE` for a pinned MIME catalogue (all or a chosen subset) into a folder's panel-managed `.htaccess`
+  block; Hotlink protection (feature `hotlink`) writes referer rules into `public_html/.htaccess` — the account's own domains are
+  always allowed, extra hosts, a pinned extension catalogue, "allow direct requests" and an optional 302 target that may not be a
+  protected type itself. Both go through the grammar-checked block with the loopback probe and rollback
+  (`GET|PUT /api/panel/advanced/optimize`, `GET|PUT /api/panel/advanced/hotlink`, contract §54, manual C §15.2–15.3).
+- **Plugin pages in the account panel (P2-1):** a plugin page may declare `audience: "panel"` (SDK 1.1.0, `HOST_API_VERSION`
+  1.1.0; table, form, markdown and html pages only; pages without the key stay administration pages) and then appears under
+  *Software › Plugins* in the account panel at `/panel/plugins/<id>/<route>`, fed by `GET /api/panel/plugins/ui`,
+  `GET /api/panel/plugins/ui/:id/file` and `ANY /api/panel/plugins/:id/*`, which only reach routes with `roles: ['user']` and hand
+  the handler the pinned account as `req.panel`; admin pages and admin-only handlers never answer through the panel, and an
+  account login can no longer call `/api/plugins/<id>/*` directly. Plan feature `plugins` (default on). The sample plugin ships
+  one panel page (`/my-notes`). Contract §53.
+- **Account panel › Files › File manager upload transport (P2-11):** chunks travel raw
+  (`PUT /api/panel/files/uploads/:id/chunks/:index`, `application/octet-stream`, `express.raw` pinned to 2 MiB) instead of
+  base64 JSON; the chunk size is pinned per upload and every chunk is written at its offset as the account (agent
+  `files.chunk_write { offset }`), so an upload interrupted by a connection loss resumes from the server's
+  `receivedChunks` list instead of starting over; files can be dropped onto the listing or the upload dialog (folders are
+  skipped with a note). Contract §57; tests `server/test/panel-files.test.js`, `client/test/panel-upload-transport.test.jsx`,
+  `agent/test/files.test.js`.
+- **Account panel › Security › Virus scanner (P2-9):** on-demand ClamAV scans of the home, `mail/` or `public_html/`
+  run as the account itself (`clamdscan --fdpass`, agent `sec.clamav.scan_as`, 15-minute cap, job `panel.clamav.scan`
+  followed on the page); infected files are listed with their signature and can be deleted through the file manager's
+  own path checks. `GET /api/panel/virus-scanner`, `POST …/scans { scope }` (202), `GET …/scans/:id[/stream]`,
+  `POST …/infected/remove`. Feature `virusscan`; needs `clamav-daemon` on the host (contract §56).
+- **Account panel › DNS › Dynamic DNS (P2-8):** a private update URL per A/AAAA record
+  (`GET /api/panel/dns/ddns/:token?ip=`, public, rate-limited, token stored hashed; `GET|POST /api/panel/dns/ddns`,
+  `DELETE …/:id` behind the panel scope; feature `ddns`; migration `034e`; contract §55). Refused for zones whose public
+  DNS is managed elsewhere.
 - **Ports mirror cPanel:** the account panel is served on **2083** (HTTPS, `WHM_PANEL_PORT` / `panelPort`) and
   **2082** (plain, `WHM_PANEL_HTTP_PORT` / `panelHttpPort`); the administration shell stays on 2087/2086. The TLS
   panel listener opens only with a certificate and shares the certificate reload (SIGHUP / file change) with 2087;

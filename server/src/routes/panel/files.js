@@ -1,6 +1,8 @@
+import express from 'express';
 import { validate, z, fields } from '../../lib/validate.js';
+import { HttpError } from '../../lib/errors.js';
 import { panelRouter, wrap, created, accepted, relPath, requireFeature } from './index.js';
-import { createPanelFilesService, relPathOrRoot, fileName, fileMode, archiveFormat, JOB_ARCHIVE, JOB_EXTRACT, MAX_TEXT_BYTES, MAX_UPLOAD_BYTES } from '../../services/panel-files.js';
+import { createPanelFilesService, relPathOrRoot, fileName, fileMode, archiveFormat, JOB_ARCHIVE, JOB_EXTRACT, MAX_TEXT_BYTES, MAX_UPLOAD_BYTES, MAX_CHUNK_BYTES } from '../../services/panel-files.js';
 import { createPanelHtaccessService, dirPath, REALM, HTPASSWD_USER } from '../../services/panel-htaccess.js';
 
 // /api/panel/files — mounted by routes/categories/panel.js behind panelScope,
@@ -8,7 +10,10 @@ import { createPanelHtaccessService, dirPath, REALM, HTPASSWD_USER } from '../..
 
 const pathQuery = z.object({ path: relPathOrRoot });
 const uploadParam = z.object({ id: z.string().regex(/^[a-f0-9]{24}$/) });
-const chunkBody = z.object({ data: z.string().min(1).max(1_800_000).regex(/^[A-Za-z0-9+/=]+$/, 'Chunk must be base64') }).strict();
+const chunkParam = uploadParam.extend({ index: z.coerce.number().int().min(0).max(1_000_000) });
+// Only an octet-stream body is parsed, to the pinned ceiling (413 past it);
+// express.json has already left any other content type untouched.
+const rawChunk = express.raw({ type: 'application/octet-stream', limit: MAX_CHUNK_BYTES });
 const jobParam = z.object({ id: fields.id });
 
 export async function register(ctx) {
@@ -52,8 +57,13 @@ export async function register(ctx) {
   r.post('/uploads', validate({ body: z.object({ path: relPathOrRoot, name: fileName, size: z.number().int().min(1).max(MAX_UPLOAD_BYTES), overwrite: z.boolean().default(false) }).strict() }), created((req) => svc.uploads.begin(req.panel, req.body, req)));
   r.get('/uploads/:id', validate({ params: uploadParam }), wrap((req) => svc.uploads.status(req.panel, req.params.id)));
   // The chunk body is dropped before the response so the automatic audit row
-  // of this PUT carries the upload id only, never 1.8 MB of base64.
-  r.put('/uploads/:id/chunks', validate({ params: uploadParam, body: chunkBody }), wrap((req) => { const { data } = req.body; req.body = {}; return svc.uploads.chunk(req.panel, req.params.id, data, req); }));
+  // of this PUT carries the upload id and index only, never the bytes.
+  r.put('/uploads/:id/chunks/:index', validate({ params: chunkParam }), rawChunk, wrap((req) => {
+    const buf = req.body;
+    req.body = {};
+    if (!Buffer.isBuffer(buf)) throw new HttpError(415, 'unsupported_media_type', 'Send the chunk as application/octet-stream');
+    return svc.uploads.chunk(req.panel, req.params.id, req.params.index, buf, req);
+  }));
   r.post('/uploads/:id/finish', validate({ params: uploadParam }), wrap((req) => svc.uploads.finish(req.panel, req.params.id, req)));
   r.post('/uploads/:id/abort', validate({ params: uploadParam }), wrap((req) => svc.uploads.abort(req.panel, req.params.id, req)));
 

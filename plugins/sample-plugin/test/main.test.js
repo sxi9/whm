@@ -36,7 +36,8 @@ test('manifest is valid and declares one of every extension point', () => {
   assert.deepEqual(validateManifest(manifest), { ok: true, errors: [] });
   assert.equal(manifest.id, 'net.whm.sample-notes');
   assert.deepEqual([...new Set(manifest.settings.fields.map((f) => f.type))].sort(), [...SETTING_TYPES].sort(), 'every settings field type');
-  assert.deepEqual(manifest.ui.pages.map((p) => p.kind).sort(), [...PAGE_KINDS].sort(), 'every page kind');
+  assert.deepEqual([...new Set(manifest.ui.pages.map((p) => p.kind))].sort(), [...PAGE_KINDS].sort(), 'every page kind');
+  assert.deepEqual(manifest.ui.pages.filter((p) => p.audience === 'panel').map((p) => [p.route, p.kind, p.source]), [['/my-notes', 'table', '/my-notes']], 'one account-panel page');
   assert.deepEqual(manifest.hooks.map((h) => `${h.stage}:${h.event}`), ['pre:account.created', 'post:account.created', 'post:account.terminated']);
   assert.equal(manifest.jobs.digest.cancellable, true);
   assert.equal(manifest.jobs.housekeeping.cancellable, false);
@@ -56,9 +57,9 @@ test('load activates: runtime page, exports dir, installedAt, both schedules; de
   assert.equal(await h.ctx.fs.exists('exports'), true);
   const runtimePage = h.state.pages.find((p) => p.route === '/schedules');
   assert.deepEqual([runtimePage.kind, runtimePage.origin], ['markdown', 'runtime']);
-  assert.deepEqual(h.state.pages.filter((p) => p.kind === 'table' || p.kind === 'form').map((p) => [p.route, p.source, p.origin]), [['/', '/notes', 'manifest'], ['/new', '/notes', 'manifest']]);
+  assert.deepEqual(h.state.pages.filter((p) => p.kind === 'table' || p.kind === 'form').map((p) => [p.route, p.source, p.origin]), [['/', '/notes', 'manifest'], ['/new', '/notes', 'manifest'], ['/my-notes', '/my-notes', 'manifest']]);
   assert.match(runtimePage.content, /daily-digest.*0 8 \* \* \*/);
-  assert.equal(h.state.pages.length, 7);
+  assert.equal(h.state.pages.length, 8);
   const sched = await h.ctx.schedule.list();
   assert.deepEqual(sched.map((s) => [s.name, s.expr, s.source]), [['daily-digest', '0 8 * * *', 'manifest'], ['nightly-housekeeping', '30 3 * * *', 'manifest']]);
   assert.equal(sched[0].nextRunAt, NOW + 8 * H);
@@ -238,9 +239,10 @@ test('cron: the setting-bound digest fires at 08:00 UTC and the fixed housekeepi
 test('routes: roles per route, validation, reseller scoping, 404s, export and the digest trigger', async () => {
   const h = await loaded();
   assert.deepEqual(h.state.routes.map((r) => `${r.method} ${r.path} ${r.roles.join(',')}`), [
-    'GET /notes root,reseller', 'POST /notes root,reseller', 'GET /notes/:id root,reseller', 'DELETE /notes/:id root', 'GET /status root', 'GET /schedules root,reseller', 'GET /export root', 'POST /digest root',
+    'GET /notes root,reseller', 'POST /notes root,reseller', 'GET /notes/:id root,reseller', 'GET /my-notes user', 'DELETE /notes/:id root', 'GET /status root', 'GET /schedules root,reseller', 'GET /export root', 'POST /digest root',
   ]);
   assert.equal((await h.callRoute('GET', '/notes', { user: plainUser })).status, 403);
+  assert.equal((await h.callRoute('GET', '/my-notes')).status, 403, 'root without a panel scope is refused like any other principal');
   const bad = await post(h, '/notes', { title: '', category: 'nope' });
   assert.equal(bad.status, 400);
   assert.deepEqual(bad.body.error.details.fields.map((f) => f.path), ['title', 'category']);
@@ -299,6 +301,27 @@ test('every declared permission is exercised and nothing undeclared is needed', 
   await post(h, '/digest', {});
   await h.flush();
   assert.equal((await h.callRoute('GET', '/status')).status, 200);
+});
+
+test('account panel page: /my-notes answers only through a panel scope and only the pinned account notes', async () => {
+  const h = await loaded();
+  await post(h, '/notes', { title: 'alice one', account: 'alice', category: 'billing' });
+  await h.advance(1000);
+  await post(h, '/notes', { title: 'bob one', account: 'bob' });
+  await h.advance(1000);
+  await post(h, '/notes', { title: 'alice two', account: 'alice' });
+  await post(h, '/notes', { title: 'unattached' });
+  const mine = await h.callRoute('GET', '/my-notes', { panel: { username: 'alice', domain: 'alice.test' } });
+  assert.equal(mine.status, 200);
+  assert.deepEqual(mine.body.data.map((n) => [n.title, n.category]), [['alice two', 'ops'], ['alice one', 'billing']]);
+  assert.ok(mine.body.data.every((n) => n.account === undefined && typeof n.createdAt === 'string'));
+  assert.deepEqual((await h.callRoute('GET', '/my-notes', { panel: { username: 'carol' } })).body.data, []);
+  // an administrator logged in as the account goes through the same scope
+  const acting = await h.callRoute('GET', '/my-notes', { user: { id: 1, username: 'root', role: 'root' }, panel: { username: 'bob', mode: 'acting', actingAs: { by: 'root' } } });
+  assert.deepEqual(acting.body.data.map((n) => n.title), ['bob one']);
+  // admin-only routes stay closed to a panel call whoever the principal is
+  assert.equal((await h.callRoute('GET', '/notes', { user: { id: 1, username: 'root', role: 'root' }, panel: { username: 'alice' } })).status, 403);
+  assert.equal((await h.callRoute('GET', '/my-notes', { user: plainUser })).status, 403, 'a role-user principal without the panel scope sees nothing');
   assert.deepEqual(h.unusedPermissions(), []);
   assert.deepEqual(h.deniedPermissions(), []);
   assert.deepEqual(h.state.permissionDenials, []);

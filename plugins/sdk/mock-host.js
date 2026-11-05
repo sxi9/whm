@@ -119,7 +119,7 @@ function hkdfKey(pluginId) {
  * @param {object} [opts.locales]       { en: { key: 'text' } } for ctx.i18n
  * @param {string} [opts.locale]        active locale (default "en")
  * @param {number|string|Date} [opts.now] initial clock (default 2026-01-01T00:00:00Z)
- * @param {string} [opts.hostVersion]   default "1.0.0"
+ * @param {string} [opts.hostVersion]   default "1.1.0"
  * @param {object} [opts.user]          default principal for callRoute (default root)
  * @param {boolean} [opts.strictEngines] check engines.whm on load (default true)
  */
@@ -130,7 +130,7 @@ function createMockHost(opts = {}) {
     throw new ValidationError(`invalid manifest: ${vr.errors.map((e) => `${e.path}: ${e.message}`).join('; ')}`, vr.errors);
   }
   const pluginId = manifest.id;
-  const hostVersion = opts.hostVersion || '1.0.0';
+  const hostVersion = opts.hostVersion || '1.1.0';
   const locale = opts.locale || (manifest.i18n && manifest.i18n.default) || 'en';
   const locales = opts.locales || {};
   const defaultUser = opts.user || { id: 1, username: 'root', role: 'root' };
@@ -783,15 +783,22 @@ function createMockHost(opts = {}) {
     delete: (p, a, b) => register('DELETE', p, a, b),
   };
 
-  async function callRoute(method, routePath, { params = {}, query = {}, body, user, headers = {} } = {}) {
+  // `panel` = the account scope of a call made through the account panel
+  // (/api/panel/plugins/<id>/…): { username, accountId?, domain?, mode?, actingAs? }.
+  // Such a call reaches only routes that list the 'user' role, whoever the
+  // principal is (the real host does the same for an administrator logged in as
+  // the account); the handler then finds it as req.panel. Without `panel` a
+  // role-user principal is refused, as on the real host, so req.panel is
+  // always present when req.user.role is 'user'.
+  async function callRoute(method, routePath, { params = {}, query = {}, body, user, headers = {}, panel } = {}) {
     const m = String(method).toUpperCase();
     const route = routeTable.find((r) => r.method === m && r.re.test(routePath));
     const res = { statusCode: 200, headers: {}, body: undefined, sent: false };
     const send = (status, payload) => { res.statusCode = status; res.body = payload; res.sent = true; };
     if (!route) { send(404, { error: { code: 'NOT_FOUND', message: `no route ${m} ${routePath}` } }); return { status: 404, body: res.body, headers: {} }; }
-    const principal = user || defaultUser;
-    if (!route.roles.includes(principal.role)) {
-      send(403, { error: { code: 'FORBIDDEN', message: `role "${principal.role}" may not call ${m} ${routePath}` } });
+    const principal = user || (panel ? { id: 0, username: panel.username, role: 'user' } : defaultUser);
+    if (panel ? !route.roles.includes('user') : (principal.role === 'user' || !route.roles.includes(principal.role))) {
+      send(403, { error: { code: 'FORBIDDEN', message: panel ? `${m} ${routePath} is not open to account holders` : principal.role === 'user' ? 'account holders call plugin routes through /api/panel/plugins/<id>/' : `role "${principal.role}" may not call ${m} ${routePath}` } });
       return { status: 403, body: res.body, headers: {} };
     }
     const match = route.re.exec(routePath);
@@ -800,6 +807,7 @@ function createMockHost(opts = {}) {
     const req = {
       method: m, path: routePath, params: { ...params, ...pathParams }, query: clone(query) || {},
       body: clone(body), user: clone(principal), headers: clone(headers) || {}, requestId: nextId('req'), plugin: pluginId,
+      ...(panel ? { panel: { username: String(panel.username), accountId: panel.accountId ?? null, domain: panel.domain ?? null, mode: panel.mode || 'user', actingAs: panel.actingAs || null } } : {}),
     };
     const resApi = {
       status(code) { if (!Number.isInteger(code) || code < 100 || code > 599) throw new ValidationError('invalid status code'); res.statusCode = code; return resApi; },

@@ -8,7 +8,9 @@ import { useT } from '../i18n/useT.js';
 import { fill, untranslated } from '../i18n/fill.js';
 import { PANEL_BASE, PANEL_FUNCTION_BY_KEY, panelId, searchPanelFunctions, visibleCategories } from './nav.js';
 import { panelIconFor, panelColorFor } from './icons.js';
-import { meterTone, percentOf, usePanelApi, usePanelFavorites, usePanelMe } from './hooks/usePanel.js';
+import { percentOf, usePanelApi, usePanelFavorites, usePanelMe } from './hooks/usePanel.js';
+import { usePanelPlugins, withPluginEntries, searchPluginEntries } from './hooks/usePanelPlugins.js';
+import { Meter, siteUrl } from './Meter.jsx';
 
 const GREETINGS = { good_night: 'Good night', good_morning: 'Good morning', good_afternoon: 'Good afternoon', good_evening: 'Good evening' };
 
@@ -49,14 +51,16 @@ export function UsageMeters({ me, usage }) {
         <div className="stat" key={m.key} data-meter={m.key}>
           <div className="label">{m.label}</div>
           <div className="value" style={{ fontSize: 17 }}>{m.text}</div>
-          <div className={`meter ${meterTone(m.percent)}`} aria-hidden={m.percent == null}><span style={{ width: `${m.percent ?? 0}%` }} /></div>
+          <Meter percent={m.percent} label={m.label} text={m.text} name={m.key} />
         </div>
       ))}
     </div>
   );
 }
 
-export function DomainsList({ account }) {
+// `ssl` maps a domain to its `ssl` entry from GET /api/panel/domains: a live
+// certificate turns the site link into https.
+export function DomainsList({ account, ssl = {} }) {
   const { t } = useT();
   const domains = account?.domains || [];
   const main = account?.domain;
@@ -69,7 +73,7 @@ export function DomainsList({ account }) {
         <tbody>
           {rows.map((d) => (
             <tr key={`${d.type}:${d.domain}`}>
-              <td><a href={`http://${d.domain}`} target="_blank" rel="noopener noreferrer">{d.domain} <ExternalLink size={12} /></a></td>
+              <td><a href={siteUrl(d.domain, ssl[d.domain])} target="_blank" rel="noopener noreferrer">{d.domain} <ExternalLink size={12} aria-hidden="true" /></a></td>
               <td><StatusPill status={d.type === 'main' ? 'ok' : 'info'}>{t(`panel.home.domain_type_${d.type}`, d.type)}</StatusPill></td>
               <td className="muted">{d.docroot || (d.type === 'main' ? `${account?.homeDir || ''}/public_html` : '—')}</td>
             </tr>
@@ -127,12 +131,15 @@ export function PanelHome({ header = null }) {
   const { t } = useT();
   const usageReq = usePanelApi('/usage');
   const linksReq = usePanelApi('/overview/quick-links');
+  const domainsReq = usePanelApi('/domains');
+  const sslByDomain = useMemo(() => Object.fromEntries((Array.isArray(domainsReq.data) ? domainsReq.data : []).map((d) => [d.domain, d.ssl || null])), [domainsReq.data]);
   const { favorites, toggle } = usePanelFavorites();
   const [q, setQ] = useState('');
   const features = me?.account?.features;
-  const categories = useMemo(() => visibleCategories(features), [features]);
-  const matches = useMemo(() => (q.trim() ? new Set(searchPanelFunctions(q, features).map((f) => f.key)) : null), [q, features]);
-  const favoriteFns = favorites.map((k) => PANEL_FUNCTION_BY_KEY[k]).filter(Boolean);
+  const { entries: pluginEntries } = usePanelPlugins();
+  const categories = useMemo(() => withPluginEntries(visibleCategories(features), pluginEntries), [features, pluginEntries]);
+  const matches = useMemo(() => (q.trim() ? new Set([...searchPanelFunctions(q, features), ...searchPluginEntries(pluginEntries, q)].map((f) => f.key)) : null), [q, features, pluginEntries]);
+  const favoriteFns = favorites.map((k) => PANEL_FUNCTION_BY_KEY[k] || pluginEntries.find((e) => e.key === k)).filter(Boolean);
   const account = me?.account;
   const label = (fn) => t(`panel.${panelId(fn)}.label`, fn.label);
   const description = (fn) => t(`panel.${panelId(fn)}.description`, fn.description);
@@ -196,7 +203,7 @@ export function PanelHome({ header = null }) {
 
         <aside className="home-side">
           <Card title={t('panel.home.domains', 'Domains')} actions={hasFeature('addondomains') ? <Link className="link-button" to={`${PANEL_BASE}/domains/domains`}>{t('panel.home.manage', 'Manage')}</Link> : null} padded={false}>
-            <DomainsList account={account} />
+            <DomainsList account={account} ssl={sslByDomain} />
           </Card>
           <Card title={t('panel.home.account', 'Account')}>
             <dl className="kv">

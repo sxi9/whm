@@ -334,6 +334,11 @@ td { font-variant-numeric: tabular-nums; }
 .fm-path-go { width: 300px; align-items: center; }
 .fm-actions-full { display: contents; }
 .fm-actions-compact { display: none; }
+.fm-droptarget { position: relative; border-radius: var(--radius-xl); }
+.fm-droptarget.active { outline: 2px dashed var(--primary); outline-offset: 4px; }
+.fm-drop-hint { position: absolute; inset: 0; z-index: 2; display: flex; align-items: center; justify-content: center; gap: 10px; border-radius: inherit; background: color-mix(in srgb, var(--primary) 12%, var(--surface)); color: var(--primary); font-weight: 600; pointer-events: none; }
+.fm-dropzone { border: 1px dashed var(--border); border-radius: var(--radius-lg); padding: 12px; }
+.fm-dropzone.active { border-color: var(--primary); background: color-mix(in srgb, var(--primary) 8%, var(--surface)); }
 
 /* Login */
 .login-page { min-height: 100%; display: grid; place-items: center; background: var(--bg); padding: 24px 16px; }

@@ -54,6 +54,7 @@ describe('File manager page', () => {
     expect(html).toContain('New folder');
     expect(html).toContain('Upload');
     expect(html).toContain('aria-label="Folder path"');
+    expect(html).toContain('data-testid="fm-droptarget"');
     expect(html).toContain('title="/home/demo"');
     expect(html).toContain('aria-label="Go to folder"');
     expect(html).toContain('aria-label="Select all"');

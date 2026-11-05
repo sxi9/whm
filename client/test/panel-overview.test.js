@@ -53,6 +53,17 @@ describe('usage meters', () => {
     expect(html).toContain('meter warn');
     expect(html).toContain('width:50%');
     expect(html).toContain('Mailboxes');
+    // Every meter is a progressbar (P2-12): a known percentage carries its value, an unlimited one is decorative.
+    expect(html).toContain('role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50" aria-valuetext="512 MB of 1.00 GB" aria-label="Disk: 512 MB of 1.00 GB"');
+    expect(html).toMatch(/data-meter="bandwidth" role="progressbar" aria-hidden="true"/);
+    expect((html.match(/role="progressbar"/g) || []).length).toBe((html.match(/class="meter/g) || []).length);
+  });
+
+  it('home domain links are https when GET /domains reports a live certificate, http otherwise', () => {
+    const secured = render(h(DomainsList, { account: me.account, ssl: { 'demo.example.com': { installed: true, state: 'installed', daysRemaining: 58 } } }));
+    expect(secured).toContain('href="https://demo.example.com"');
+    expect(secured).toContain('href="http://shop.demo.example.com"');
+    expect(render(h(DomainsList, { account: me.account }))).toContain('href="http://demo.example.com"');
   });
 });
 
