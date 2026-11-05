@@ -155,16 +155,17 @@ describe('stats.goaccess (Visitors)', () => {
 
   it('builds the goaccess argv with the HTML file and the JSON report on stdout', () => {
     const logs = ['/var/log/whm/domlogs/alice/example.com-access.log', '/var/log/whm/domlogs/alice/example.com-ssl-access.log'];
-    expect(goaccessArgv(logs, '/home/alice/.keel/stats/example.com.html')).toEqual(['--no-global-config', '--log-format=COMBINED', '--output=/home/alice/.keel/stats/example.com.html', '--output=json', ...logs]);
+    expect(goaccessArgv(logs, '/home/alice/.keel/stats/example.com.html', '/home/alice/.keel/stats/example.com.json')).toEqual(['--no-global-config', '--log-format=COMBINED', '--output=/home/alice/.keel/stats/example.com.html', '--output=/home/alice/.keel/stats/example.com.json', ...logs]);
     expect(goaccessOutputs('/home/alice', 'example.com')).toEqual({ dir: `/home/alice/${STATS_DIR}`, html: '/home/alice/.keel/stats/example.com.html', summary: '/home/alice/.keel/stats/example.com.summary.json' });
-    // goaccess 1.9 rejects an output file without a .html/.json/.csv extension ("Invalid filename extension").
-    expect(goaccessStaging('/home/alice/.keel/stats/example.com.html')).toBe('/home/alice/.keel/stats/example.com.tmp.html');
+    // goaccess 1.9 rejects an output file without a .html/.json/.csv extension ("Invalid filename extension")
+    // and checks `--output=json` as a path in the working directory, so the JSON goes to a staging file too.
+    expect(goaccessStaging('/home/alice/.keel/stats/example.com.html')).toEqual({ html: '/home/alice/.keel/stats/example.com.tmp.html', json: '/home/alice/.keel/stats/example.com.tmp.json' });
   });
 
   it('wraps the as-user command in ionice when it exists and passes it through otherwise', () => {
     const info = { uid: 1001, gid: 1001, username: 'alice', home: '/home/alice' };
     resolveBinary.mockImplementation((name) => (name === 'goaccess' ? '/usr/bin/goaccess' : name === 'nice' ? '/usr/bin/nice' : actualExec.resolveBinary(name)));
-    const [exe, args] = asUserArgv(info, 'goaccess', goaccessArgv(['/var/log/whm/domlogs/alice/example.com-access.log'], '/home/alice/.keel/stats/example.com.html'), { tool: 'setpriv', nice: true });
+    const [exe, args] = asUserArgv(info, 'goaccess', goaccessArgv(['/var/log/whm/domlogs/alice/example.com-access.log'], '/home/alice/.keel/stats/example.com.html', '/home/alice/.keel/stats/example.com.json'), { tool: 'setpriv', nice: true });
     expect(exe).toBe('nice');
     expect(args.slice(0, 3)).toEqual(['-n', '10', '--']);
     expect(args).toContain('--reuid');

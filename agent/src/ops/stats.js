@@ -229,9 +229,13 @@ const TOP = 10;
 
 export const goaccessOutputs = (home, domain) => ({ dir: path.join(home, STATS_DIR), html: path.join(home, STATS_DIR, `${domain}.html`), summary: path.join(home, STATS_DIR, `${domain}.summary.json`) });
 
-export const goaccessStaging = (outHtml) => outHtml.replace(/\.html$/, '.tmp.html');
-export function goaccessArgv(logFiles, outHtml) {
-  return ['--no-global-config', '--log-format=COMBINED', `--output=${outHtml}`, '--output=json', ...logFiles];
+// goaccess insists on a .html/.json/.csv extension for every --output, and
+// `--output=json` (JSON on stdout) is checked as a path in the working
+// directory first ("Invalid or unwritable path" as the account), so the JSON
+// report goes to a sibling staging file that the op reads and removes.
+export const goaccessStaging = (outHtml) => ({ html: outHtml.replace(/\.html$/, '.tmp.html'), json: outHtml.replace(/\.html$/, '.tmp.json') });
+export function goaccessArgv(logFiles, outHtml, outJson) {
+  return ['--no-global-config', '--log-format=COMBINED', `--output=${outHtml}`, `--output=${outJson}`, ...logFiles];
 }
 
 // The lowest CPU and I/O priority the host offers around the as-user wrapper.
@@ -309,11 +313,15 @@ defineOp('stats.goaccess.run', {
     // the panel never serves a half-written file (goaccess insists on a
     // .html/.json/.csv extension for its output file, so the staging name keeps it).
     const staging = goaccessStaging(out.html);
-    const run = await runAs(bin, goaccessArgv(logs, staging), { nice: true, timeoutMs: 120_000, maxBuffer: 256 * MiB });
-    if (run.code !== 0) { await runAs('rm', ['-f', '--', staging], { timeoutMs: 30_000 }).catch(() => {}); throw failureOf(run, `goaccess for ${domain}`); }
+    const dropStaging = () => runAs('rm', ['-f', '--', staging.html, staging.json], { timeoutMs: 30_000 }).catch(() => {});
+    const run = await runAs(bin, goaccessArgv(logs, staging.html, staging.json), { nice: true, timeoutMs: 120_000, maxBuffer: 256 * MiB });
+    if (run.code !== 0) { await dropStaging(); throw failureOf(run, `goaccess for ${domain}`); }
+    // The JSON report is read back as the account (root never opens files in the home) and dropped.
+    const json = await runAs('cat', ['--', staging.json], { timeoutMs: 60_000, maxBuffer: 256 * MiB });
     let report;
-    try { report = JSON.parse(run.stdout); } catch { throw new OpError('command_failed', `goaccess for ${domain} produced no JSON report`, { stderr: run.stderr.slice(-4000) }); }
-    const moved = await runAs('mv', ['-f', '-T', '--', staging, out.html], { timeoutMs: 30_000 });
+    try { if (json.code !== 0) throw new Error(json.stderr); report = JSON.parse(json.stdout); } catch { await dropStaging(); throw new OpError('command_failed', `goaccess for ${domain} produced no JSON report`, { stderr: run.stderr.slice(-4000) }); }
+    await runAs('rm', ['-f', '--', staging.json], { timeoutMs: 30_000 }).catch(() => {});
+    const moved = await runAs('mv', ['-f', '-T', '--', staging.html, out.html], { timeoutMs: 30_000 });
     if (moved.code !== 0) throw failureOf(moved, `replace ${path.relative(home, out.html)}`);
     const summary = summarizeGoaccess(report, { domain, logFiles: logs });
     await stagedWrite(info, home, out.summary, JSON.stringify(summary), '0640');

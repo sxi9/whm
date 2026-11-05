@@ -13,8 +13,12 @@ import { createContext, runOp, listOps, OpError, DEFAULT_ALLOWED_ROOTS } from '.
 
 // Outbound fetches (WordPress packages, mail/HTTP probes) try IPv4 first: a
 // host whose only IPv6 address is link-local (EC2 without an IPv6 allocation)
-// otherwise waits on the AAAA target until the connect times out.
+// otherwise waits on the AAAA target until the connect times out. Node's
+// happy-eyeballs connect gives each address 250 ms by default, which is less
+// than one round trip from some regions to wordpress.org (ETIMEDOUT after
+// 300 ms on nova); 2.5 s per attempt keeps the fallback and makes it reliable.
 dns.setDefaultResultOrder('ipv4first');
+net.setDefaultAutoSelectFamilyAttemptTimeout(2500);
 
 const SOCKET = process.env.WHM_AGENT_SOCKET || '/run/whm-agent.sock';
 const GROUP = process.env.WHM_AGENT_GROUP || 'whmpanel';

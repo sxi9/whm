@@ -103,7 +103,7 @@ describe('sievePaths', () => {
     const m = sievePaths('/home/alice', 'mailbox', 'info@alice.com');
     expect(m).toEqual({
       dir: '/home/alice/mail/alice.com/info/sieve', script: `/home/alice/mail/alice.com/info/sieve/${SIEVE_SCRIPT}`, binary: `/home/alice/mail/alice.com/info/sieve/${SIEVE_BINARY}`,
-      maildir: '/home/alice/mail/alice.com/info', active: '/home/alice/mail/alice.com/.info.sieve', activeTarget: `info/sieve/${SIEVE_SCRIPT}`,
+      maildir: '/home/alice/mail/alice.com/info', active: '/home/alice/mail/alice.com/.info.sieve', activeBinary: '/home/alice/mail/alice.com/.info.svbin', activeTarget: `info/sieve/${SIEVE_SCRIPT}`,
     });
     const g = sievePaths('/home/alice', 'account');
     expect(g.script).toBe(`/home/alice/${SIEVE_GLOBAL_DIR}/${SIEVE_SCRIPT}`);

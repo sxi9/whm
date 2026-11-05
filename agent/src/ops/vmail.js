@@ -722,13 +722,15 @@ const sieveScript = z.string().max(SIEVE_MAX_BYTES).refine((s) => !s.includes('\
 export function sievePaths(home, scope, mailbox = null) {
   if (scope === 'account') {
     const dir = path.join(home, SIEVE_GLOBAL_DIR);
-    return { dir, script: path.join(dir, SIEVE_SCRIPT), binary: path.join(dir, SIEVE_BINARY), maildir: null, active: null, activeTarget: null };
+    return { dir, script: path.join(dir, SIEVE_SCRIPT), binary: path.join(dir, SIEVE_BINARY), maildir: null, active: null, activeBinary: null, activeTarget: null };
   }
   if (!EMAIL_ADDRESS.test(mailbox || '')) throw new OpError('invalid_args', 'A mailbox address is required');
   const [local, domain] = mailbox.split('@');
   const maildir = path.join(home, 'mail', domain, local);
   const dir = path.join(maildir, SIEVE_MAILBOX_DIR);
-  return { dir, script: path.join(dir, SIEVE_SCRIPT), binary: path.join(dir, SIEVE_BINARY), maildir, active: path.join(home, 'mail', domain, sieveActiveName(local)), activeTarget: `${local}/${SIEVE_MAILBOX_DIR}/${SIEVE_SCRIPT}` };
+  const active = path.join(home, 'mail', domain, sieveActiveName(local));
+  // Pigeonhole compiles the active script beside the link it reads (.<local>.svbin); it goes with the link.
+  return { dir, script: path.join(dir, SIEVE_SCRIPT), binary: path.join(dir, SIEVE_BINARY), maildir, active, activeBinary: active.replace(/\.sieve$/, '.svbin'), activeTarget: `${local}/${SIEVE_MAILBOX_DIR}/${SIEVE_SCRIPT}` };
 }
 
 // sievec reports "<name>: line N: error: …" per problem; doveconf warnings
@@ -857,9 +859,12 @@ defineOp('vmail.sieve.remove', {
     if (t.active) {
       const st = lstatOrNull(t.active);
       if (st?.isSymbolicLink() && fs.readlinkSync(t.active) === t.activeTarget) {
-        const r = await runAs(t.info, 'rm', ['-f', '--', t.active]);
+        const r = await runAs(t.info, 'rm', ['-f', '--', t.active, t.activeBinary]);
         if (r.code !== 0) throw failureOf(r, `remove ${SIEVE_ACTIVE}`);
         deactivated = true;
+      } else if (!st && lstatOrNull(t.activeBinary)?.isFile()) {
+        // Link already gone (last rule removed earlier): Dovecot's compiled copy is all that is left.
+        await runAs(t.info, 'rm', ['-f', '--', t.activeBinary]).catch(() => {});
       }
     }
     const existed = Boolean(lstatOrNull(t.script));
