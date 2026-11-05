@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { z } from 'zod';
 import { exec, hasBinary, resolveBinary } from '../exec.js';
 import { defineOp, arg, OpError } from './registry.js';
-import { PHP_MINORS } from '../lib.js';
+import { PHP_MINORS } from '../managed-paths.js';
 
 // Software: distro packages (apt / dnf / yum), language module installers,
 // PHP versions + ini files, PHP-FPM pools and the NGINX reverse proxy. Every
