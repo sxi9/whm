@@ -33,6 +33,7 @@ license + marketplace service with its own React portals (`hub/ui`) · zod 4 eve
 | **Phase 7 — identity** | done: default branding "Keel" (migration `028c`, operators change it under Panel › Customization), labels renamed with **stable keys/routes** via slug overrides in `client/src/nav.js`, i18n catalog, docs (README/INSTALL/MANUAL/SDK), server/agent/hub user-visible strings (legacy managed-block markers still recognised on upgraded hosts), support links, `keel@` sender, `KEEL-` ticket refs | `22001ff`…`643e0a6` |
 | hub/ui portals | on the new kit (`18fe699`; `hub/ui/src/components/SYNC.md`) | hub-ui suite |
 | **Provisioned-host verification** (`nova.hostingsignal.in`, Ubuntu 26.04, EC2) | **done 2026-11-04/05**: 10 probe areas (mail, FTP, MySQL, web/PHP/DNS, SSL, backups/cron/quota, admin API walk, account-panel API walk, security posture, log-derived bugs), 29 confirmed findings (1 refuted), each adversarially verified; every finding with a code component fixed in three rounds under two review lenses; host-side fixes applied (AutoSSL live, ManageSieve 2000 off, fail2ban jails, PureDB auth link, Cloudflare nameservers); the code fixes are **uncommitted and not yet deployed** — §4 lists the deploy and the remaining host steps | `server/test/{http-redirect,request-log,capabilities,services}.test.js`, `agent/test/pkg-backports.test.js`, `client/test/exim-virtual-mail.test.jsx`, extended panel-*/service-configuration/ssl-tls/security-center/vmail/ftp/db/files suites; `https://testuser.hostingsignal.in` serves a Let's Encrypt certificate |
+| **2026-11-06 software + ports** | **done and live on nova**: Install Software (one-click runtimes/tools, inline installs, contract §51), PHP Version Manager (§52, offered list, panel Set all domains), account panel on 2083/2082 with the admin shell on 2087/2086 (`middleware/shell.js`, `wrong_port` policy); §4 "2026-11-06" has the verification | `server/test/{software,panel-php,shell-ports}.test.js`, `agent/test/pkg-runtime.test.js`, `client/test/{install-software,panel-php,login-shell}.test.jsx` |
 | **Phase 8 — account panel on the real host** (`docs/design/phase8-account-panel.md`) | **P0 + P1 done and live on nova 2026-11-05**: hostname site with `/webmail` + `/phpmyadmin`, delegation banners, lockout paths (P0); Roundcube/phpMyAdmin SSO, Sieve filters, mail routing + relay/IPv6, `.htaccess` family, Visitors, WordPress installer, preferences/2FA/folders, phone layout, i18n (P1); three live-found fixes after the P1 deploy (§4) | `CHECKLIST.md` Phase 8 table; §4 host steps; `server/test/panel-{sso,me,email-filters,htaccess,software,logs-stats}.test.js`, `agent/test/{vmail-sieve,files-htaccess,wp-install,stats,db,webmail,mail}.test.js`, `client/test/panel-{i18n-*,mobile,preferences,visitors,wordpress,htaccess,webmail-sso}.test.jsx` |
 | **Phase 7 — account panel** (`/panel`, our cPanel replacement) | **done**: design `docs/design/customer-panel.md`; units U0–U5 + seams S1–S11 (contracts §33–40) + 39 pages in 13 groups, each adversarially reviewed and fixed; integration critics (3 lenses, 38 findings) closed; admin side ("Log in as", Panel › Customization › Account panel, reseller ACL `login-as`); manual Part C | `e2e/panel-check.cjs` 39/39, `server/test/panel-*.test.js`, `agent/test/{files,cron,vmail,webmail,ftp,backup-read}.test.js`, `client/test/panel-*.test.jsx`; galleries `docs/screenshots/pages/panel/` |
 
@@ -86,6 +87,56 @@ auth_username_format = %{user | lower} }` in the fragment); Debian's 2.4 `mail_i
 makes a virtual Maildir user try to create `/var/mail/<address>` (`userdb_mail_inbox_path` on every passwd line,
 re-key adds it); Debian's `pure-ftpd-wrapper` has no `CertFile` directive and refused to start (the combined PEM
 now goes to the compiled-in `/etc/ssl/private/pure-ftpd.pem`, only `conf/TLS` is written).
+
+### 2026-11-06: Install Software, PHP Version Manager and the account panel on port 2083 (deployed `d724062`)
+
+The owner's ask: no more detours to the distro package page when a PHP, Node or Python version is needed, a PHP
+version manager where every version is listed and accounts pick what they prefer, and cPanel-style ports (accounts on
+2083, admin on 2087). Three workflow rounds (runtime installs, PHP Version Manager, port split), each with security +
+correctness review lenses and one fix round; gate on the host clone at the deploy: server 1601 / client 481 / agent 761
+(+3 known host-env) / hub 186 / hub-ui 105 / SDK green / client build green.
+
+- **Install Software** (`/software/install-distro-packages`, relabelled; contract §51): tabs Runtimes (PHP 8.5–7.4,
+  Node.js 24/22/20/18 as official nodejs.org builds under `/opt/keel/node/<major>` with `node<major>`/`npm<major>`/
+  `npx<major>` links, Python 3.13–3.9, Ruby, Go, Composer), Tools, Search, Installed, History. Job
+  `software.runtime.install` = `pkg.repo.ensure` → `pkg.update_index` (only when a repo was added) → `pkg.install` /
+  `pkg.node.install` → PHP CLI default restored → capabilities refresh → `pkg.runtime.detect`. Every page that used to
+  link to the distro page installs inline (`InstallPackages.jsx`, `RuntimeInstaller`); Module Installers shows the packages
+  per installer. **Ubuntu PPA rule:** `pkg.repo.ensure` probes `https://ppa.launchpadcontent.net/<ppa>/ubuntu/dists/<codename>/InRelease`
+  first and answers `unsupported` on 404 — `ppa:ondrej/php` has no series for 26.04 "resolute" (deadsnakes has), so on
+  nova PHP 8.4/8.3/… show as "not available for this OS" and an install job fails with that message without touching
+  `/etc/apt/sources.list.d`. Only the versioned `/usr/local/bin/{node,npm,npx}<16–30>` links are agent-writable, never
+  `/usr/local/bin` itself (`NODE_LINK_PATHS` in `agent/src/lib.js`).
+- **PHP Version Manager** (`/software/multiphp-manager`, relabelled; contract §52): `GET /api/software/php/catalog`
+  (every catalog version with state installed/available/unsupported/unknown, FPM, defaults, domain/vhost/plan counts,
+  `repoStatus`), `POST /api/software/php/remove` (job `software.php.remove` → agent `pkg.php.remove`; refused for the
+  system or CLI default, the only version, a version pinned on a domain, vhost, plan or in Apache Configuration — and
+  re-checked when the job runs), `PUT /api/software/php/offered` (setting `php.offered_versions`; the account panel offers
+  only those, a version a domain already runs stays listed as "no longer offered"), Set as default (existing flow).
+  Account panel › PHP versions: *Recommended* pill, *Your domains* counts, *Set all domains* (`PUT /api/panel/php/domains
+  { version, domains? }`, `202` with a job for several domains, audit `panel.php.version_all`).
+- **Ports** (`server/src/middleware/shell.js`, `server/test/shell-ports.test.js`): `panelPort` 2083 (TLS, shares the
+  certificate reload with 2087) and `panelHttpPort` 2082 (301 → 2083, 426 for `/api`) next to 2087/2086; `req.shell` is
+  decided by the socket's local port, never a header. On the panel shell only `/api/health`, `/api/auth/*`, `/api/branding*`,
+  `/api/panel/*` (minus `/api/panel/admin/*`), `/api/locales/active` and `/api/themes/active` are served, everything else
+  answers `403 wrong_port`; any page other than `/panel*`/`/login*` redirects to `/panel`; an administrator or reseller login
+  there (password, 2FA, OIDC) creates no session and answers `403 wrong_port` with `adminUrl` (the login page shows the link;
+  branding carries `shell` and `adminUrl`); an admin cookie minted on 2087 may only read and log out on 2083 unless it is an
+  audited "Log in as" session. `GET /api/auth/me` gives admins `panelUrl` (`https://<hostname>:2083/`), which is also the
+  password-reset mail base. `install.sh` prints both URLs and the firewall list 2082/2083/2086/2087; `e2e/panel-check.cjs`
+  takes `PANEL_BASE`. A panel port that collides with an admin port is disabled with a warning; a bind failure on
+  2082/2083 never takes 2087 down.
+- **Verified on nova (2026-11-06):** `https://nova.hostingsignal.in:2083/` → 302 `/panel`, `/api/accounts` there → 403
+  `wrong_port`, keel-ops login on 2083 → 403 with the 2087 link and no cookie, 2082 → 301 to 2083 and 426 for `/api`,
+  2086 → 2087 unchanged; catalog: 8.5 installed (system + CLI default, 2 domains), 8.4–7.4 unsupported with the resolute
+  note; Node 20 installed through the panel (`/opt/keel/node/20`, `node20` v20.20.2, `npm20` 10.8.2, `/usr/bin/node`
+  still v22.23.4) and removed again (links and tree gone); PHP 8.4 install job failed with the PPA message and no sources
+  file was added; removing 8.5 refused; offered list round trip; Log in as testuser reads `/api/panel/php/versions`
+  (recommended 8.5, usage `{8.5: 1}`) and `/php/domains` on 2083 while `/api/accounts` and `login-as` stay refused there.
+  The EC2 security group already passes 2082/2083 (connections were refused, not dropped, before the deploy).
+- **Open for the owner:** nothing new. PHP versions other than 8.5 become installable on nova as soon as
+  `ppa:ondrej/php` publishes a resolute series (the catalog re-probes on every load); until then the Ubuntu LTS path
+  (noble) is the one that offers 8.4/8.3/…
 
 ### What was found and fixed (code)
 

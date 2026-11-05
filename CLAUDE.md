@@ -187,7 +187,30 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Current state (update every push)
 
-- **2026-11-05 (latest): Phase 8 P1 deployed to nova** (plan §P1, 11 builder units in three waves, security +
+- **2026-11-06 (latest): Install Software, PHP Version Manager and the 2083/2087 port split deployed to nova**
+  (commits `d8333a3`, `d724062`; built as three workflow rounds — runtime installs, PHP Version Manager, port split — each with
+  two review lenses and one fix round). Software › Install Software (the former Install Distro Packages page, same URL)
+  offers one-click PHP, Node.js, Python, Ruby, Go, Composer and a tool grid (`ctx.software.runtimes`,
+  `server/src/services/software-runtimes.js`, agent `pkg.repo.ensure` / `pkg.repo.status` / `pkg.node.*` /
+  `pkg.runtime.detect`, contract §51) and every "install it from Install Distro Packages" link in the admin shell is now an
+  inline install (`client/src/components/InstallPackages.jsx`). Software › PHP Version Manager (the former MultiPHP Manager,
+  slug kept) lists every catalog version with its state, Install / Remove / Set default and an "offered to accounts"
+  switch (`GET /api/software/php/catalog`, `POST …/php/remove`, `PUT …/php/offered`, agent `pkg.php.remove`, contract §52);
+  the account panel's PHP versions page adds Recommended, usage counts and Set all domains (`PUT /api/panel/php/domains`).
+  **Ports mirror cPanel:** the account panel is served on 2083 (TLS) / 2082 (redirect), the administration shell on
+  2087 / 2086 (`server/src/middleware/shell.js`: shell by socket port, panel-only API allow-list, `wrong_port` login
+  policy, both TLS listeners share the certificate reload; `WHM_PANEL_PORT` / `WHM_PANEL_HTTP_PORT`). Node.js builds
+  live under `/opt/keel/node/<major>` with only the versioned `/usr/local/bin/node<major>` links writable. Gate on the
+  host clone: server 1601 / client 481 / agent 761 (+3 known host-env) / hub 186 / hub-ui 105 / SDK green / build green.
+  Verified on nova: `https://nova.hostingsignal.in:2083/` → `/panel`, admin API 403 `wrong_port` there, admin login
+  refused on 2083 with the 2087 link, 2082→2083 and 2086→2087 redirects; Node 20 installed (`/opt/keel/node/20`,
+  `node20` v20.20.2, system node v22 untouched) and removed through the panel; PHP 8.4 refused cleanly because
+  `ppa:ondrej/php` has no series for Ubuntu 26.04 "resolute" (probed before `add-apt-repository`, nothing added), so on
+  nova the catalog shows 8.5 installed and the other versions "unsupported" until the PPA ships resolute; removing the
+  system default refused; Log in as testuser reads the account's PHP page on 2083. EC2 security group already passes
+  2082/2083. Fixed after the gate: `/usr/local/bin` is no longer an allowed root (hooks guard test), one load-sensitive
+  panel-me case got 20 s.
+- **2026-11-05: Phase 8 P1 deployed to nova** (plan §P1, 11 builder units in three waves, security +
   correctness review lenses, one fix round that closed the blocker — the phpMyAdmin SSO wildcard grant crossed tenants
   whose usernames share a `_` prefix; now explicit per-database grants on a user dropped and recreated at every
   sign-on — and both majors: Roundcube SSO logs in by mailbox with the master user as SASL authorization identity so
