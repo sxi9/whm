@@ -33,6 +33,7 @@ license + marketplace service with its own React portals (`hub/ui`) · zod 4 eve
 | **Phase 7 — identity** | done: default branding "Keel" (migration `028c`, operators change it under Panel › Customization), labels renamed with **stable keys/routes** via slug overrides in `client/src/nav.js`, i18n catalog, docs (README/INSTALL/MANUAL/SDK), server/agent/hub user-visible strings (legacy managed-block markers still recognised on upgraded hosts), support links, `keel@` sender, `KEEL-` ticket refs | `22001ff`…`643e0a6` |
 | hub/ui portals | on the new kit (`18fe699`; `hub/ui/src/components/SYNC.md`) | hub-ui suite |
 | **Provisioned-host verification** (`nova.hostingsignal.in`, Ubuntu 26.04, EC2) | **done 2026-11-04/05**: 10 probe areas (mail, FTP, MySQL, web/PHP/DNS, SSL, backups/cron/quota, admin API walk, account-panel API walk, security posture, log-derived bugs), 29 confirmed findings (1 refuted), each adversarially verified; every finding with a code component fixed in three rounds under two review lenses; host-side fixes applied (AutoSSL live, ManageSieve 2000 off, fail2ban jails, PureDB auth link, Cloudflare nameservers); the code fixes are **uncommitted and not yet deployed** — §4 lists the deploy and the remaining host steps | `server/test/{http-redirect,request-log,capabilities,services}.test.js`, `agent/test/pkg-backports.test.js`, `client/test/exim-virtual-mail.test.jsx`, extended panel-*/service-configuration/ssl-tls/security-center/vmail/ftp/db/files suites; `https://testuser.hostingsignal.in` serves a Let's Encrypt certificate |
+| **2026-11-06 PHP source builds + Phase 8 P2** | **done and live on nova**: every catalog PHP version installable (source builds into `/opt/keel/php`, contracts §51/§52), and P2 — plugin pages in /panel, Database Wizard, Errors, Optimize/Hotlink, Track DNS, Dynamic DNS, Virus Scanner, raw-chunk uploads, a11y/wording, quota note, spam docs (contracts §53–§62, migration 034e); §4 "Phase 8 P2 host steps" | `agent/test/{pkg-runtime,ops-imports,dns-track,files-htaccess-web,sec-clamav-as}.test.js`, `server/test/panel-{plugins,ddns,virus,htaccess-web,logs-errors,dns-track}.test.js`, `client/test/panel-{a11y,database-wizard,ddns,dns-track,htaccess-web,logs-errors,upload-transport,usage-scan-note,virus,plugins}.test.jsx` |
 | **2026-11-06 software + ports** | **done and live on nova**: Install Software (one-click runtimes/tools, inline installs, contract §51), PHP Version Manager (§52, offered list, panel Set all domains), account panel on 2083/2082 with the admin shell on 2087/2086 (`middleware/shell.js`, `wrong_port` policy); §4 "2026-11-06" has the verification | `server/test/{software,panel-php,shell-ports}.test.js`, `agent/test/pkg-runtime.test.js`, `client/test/{install-software,panel-php,login-shell}.test.jsx` |
 | **Phase 8 — account panel on the real host** (`docs/design/phase8-account-panel.md`) | **P0 + P1 done and live on nova 2026-11-05**: hostname site with `/webmail` + `/phpmyadmin`, delegation banners, lockout paths (P0); Roundcube/phpMyAdmin SSO, Sieve filters, mail routing + relay/IPv6, `.htaccess` family, Visitors, WordPress installer, preferences/2FA/folders, phone layout, i18n (P1); three live-found fixes after the P1 deploy (§4) | `CHECKLIST.md` Phase 8 table; §4 host steps; `server/test/panel-{sso,me,email-filters,htaccess,software,logs-stats}.test.js`, `agent/test/{vmail-sieve,files-htaccess,wp-install,stats,db,webmail,mail}.test.js`, `client/test/panel-{i18n-*,mobile,preferences,visitors,wordpress,htaccess,webmail-sso}.test.jsx` |
 | **Phase 7 — account panel** (`/panel`, our cPanel replacement) | **done**: design `docs/design/customer-panel.md`; units U0–U5 + seams S1–S11 (contracts §33–40) + 39 pages in 13 groups, each adversarially reviewed and fixed; integration critics (3 lenses, 38 findings) closed; admin side ("Log in as", Panel › Customization › Account panel, reseller ACL `login-as`); manual Part C | `e2e/panel-check.cjs` 39/39, `server/test/panel-*.test.js`, `agent/test/{files,cron,vmail,webmail,ftp,backup-read}.test.js`, `client/test/panel-*.test.jsx`; galleries `docs/screenshots/pages/panel/` |
@@ -87,6 +88,27 @@ auth_username_format = %{user | lower} }` in the fragment); Debian's 2.4 `mail_i
 makes a virtual Maildir user try to create `/var/mail/<address>` (`userdb_mail_inbox_path` on every passwd line,
 re-key adds it); Debian's `pure-ftpd-wrapper` has no `CertFile` directive and refused to start (the combined PEM
 now goes to the compiled-in `/etc/ssl/private/pure-ftpd.pem`, only `conf/TLS` is written).
+
+### Phase 8 P2 host steps + PHP source builds (done on nova 2026-11-06, deployed `a3d9b8f`)
+
+- **Host packages added:** `clamav-daemon` (enabled; note it only starts once `freshclam` has fetched the databases),
+  `dnsutils`, `traceroute`. Apache `deflate` and `rewrite` were already enabled. Migration `034e_panel-ddns.sql` applied by
+  `install.sh --upgrade`.
+- **PHP source builds:** the first panel-driven build (PHP 8.4.27) took 29 minutes on the 2-vCPU host; the build
+  dependencies (`build-essential` and the `-dev` libraries, ~25 packages) stay installed. A build leaves
+  `/opt/keel/php/<minor>`, `/etc/systemd/system/keel-php<minor>-fpm.service`, `/usr/local/bin/php<minor>`; removal through
+  the panel takes all three away. Two lessons from the deploy: an op module must never import `agent/src/lib.js`
+  (top-level-await deadlock → whm-agentd exit 13 → the panel's dependency failed; `agent/test/ops-imports.test.js`), and a
+  domain set back to "inherit" must be rendered with the resolved default handler (it served `.php` as source for a minute
+  on testuser until restored).
+- **Acceptance run as keel-ops → Log in as testuser** (scripts lived in the session scratchpad; probe objects removed,
+  `public_html` back to the owner's files): Errors page, Track DNS (+422 cases), DDNS `not_delegated`, wizard calls,
+  Optimize/Hotlink over HTTPS, Virus Scanner with EICAR, 2 MB raw-chunk upload with sha256 match, usage source `repquota`,
+  live Let's Encrypt certificate on the domain. Not exercised: a plugin panel page (reinstall `net.whm.sample-notes` from the
+  regenerated signed fixture to see *Software › Plugins › Notes about my account*), `e2e/panel-check.cjs` (root TOTP).
+- **Known host-environment test cases on nova (4):** agent `dns.test.js` `$INCLUDE`, `resolver.test.js` upstream,
+  `vmail.test.js` purge, and since P2 `sec-malware.test.js` "no scanner" plus server `plugins.test.js` "capability detection"
+  — both assume ClamAV is absent.
 
 ### 2026-11-06: Install Software, PHP Version Manager and the account panel on port 2083 (deployed `d724062`)
 

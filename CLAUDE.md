@@ -187,7 +187,45 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Current state (update every push)
 
-- **2026-11-06 (latest): Install Software, PHP Version Manager and the 2083/2087 port split deployed to nova**
+- **2026-11-06 (latest): PHP source builds + Phase 8 P2 deployed to nova** (commits `0b186a4`…`a3d9b8f`, merge `c251093`).
+  **PHP installs work on every host now:** a catalog version no repository offers (Ubuntu 26.04 "resolute" has no
+  `ppa:ondrej/php` series) is `available` with `method: 'source'`; the install job installs the build dependencies
+  (`PHP_BUILD_DEPS` in `software-runtimes.js`), agent `pkg.php.build` downloads the release named by php.net's JSON index
+  (https only, sha256 verified), extracts with `--no-same-owner` and runs the static `agent/src/ops/php-build.sh` (parameters by
+  environment only, one build per minor behind an exclusive lock, marker with the run id) into `/opt/keel/php/<minor>`;
+  `pkg.php.build.finish` writes the `keel-php<minor>-fpm` unit (sockets under `/run/keel-php`), the `/usr/local/bin/php<minor>`
+  link and registers it; the build is a first-class version (layout `keel` in `discoverPhp` and `phpLayout`, per-domain pools,
+  INI editor, CLI default, `pkg.php.remove`). 8.1–8.5 are source-buildable (`PHP_SOURCE_MINORS`; 7.4/8.0 no longer compile against
+  current libxml2/ICU). Shared installer paths live in `agent/src/managed-paths.js` — **an op module must never import `lib.js`**
+  (it imports `ops/index.js`, whose top-level await then deadlocks the agent; `agent/test/ops-imports.test.js` guards it; this
+  took whm-agentd down once on nova until the fix). Also fixed: a domain set back to "inherit" is rendered with the resolved
+  default handler (it served `.php` as source before); the seed no longer configures `ea-php83`. Verified on nova: PHP 8.4.27
+  built through the panel in 29 min, `keel-php8.4-fpm` active, testuser switched to 8.4 served `probe:8.4.27`, switched back,
+  INI read, removed cleanly (unit, link, prefix gone).
+  **Phase 8 P2 live** (plan §P2, two waves of builders in a worktree, security + correctness lenses, one fix round; contracts
+  §53–§62; migration `034e_panel-ddns.sql`; `HOST_API_VERSION` 1.1.0): plugin pages in `/panel` (`ui.pages[].audience`,
+  `GET /api/panel/plugins/ui`, `/panel/plugins/<id>/<route>`), Database Wizard (`databases/wizard`), Logs › Errors
+  (`GET /api/panel/logs/errors`), Advanced › Optimize Website + Hotlink Protection (`GET|PUT /api/panel/advanced/optimize|hotlink`,
+  agent `htaccess-web.js`), DNS › Track DNS (`GET /api/panel/dns/track/lookup|trace`, agent `dns-track.js`, refuses loopback /
+  private / link-local targets), Dynamic DNS (`ctx.panelDdns`, public `GET /api/panel/dns/ddns/:token?ip=` rate-limited, tokens
+  hashed, request log redacts them; refused `not_delegated` when the zone is managed elsewhere), Virus Scanner (`ctx.panelVirus`,
+  agent `sec.clamav.scan_as` with `clamdscan --fdpass` as the account, job `panel.clamav.scan`), raw octet-stream chunk uploads
+  with drag-and-drop and resume (`PUT /api/panel/files/uploads/:id/chunks/:index`), wording/a11y (`PLAN_SETTING_CODES`,
+  `panel/Meter.jsx` progressbars, menu roles, `https://` home links with a live certificate), quota scan note, spam-threshold
+  docs. Gate on the host clone (merged tree): server 1659 (3 non-regressions: host_api 1.1.0 expectation and a 5 s bcrypt case,
+  both fixed in `a3d9b8f`; `plugins.test.js` expects no ClamAV, now installed for P2) / client 552 / agent 814 (+4 host-env:
+  dns `$INCLUDE`, resolver.upstream, vmail purge, sec-malware "no scanner" — ClamAV is installed now) / hub 186 / hub-ui 105 /
+  SDK 74 / build green. Verified on nova as testuser (Log in as): Errors page lists the domain's Apache error log lines; Track
+  DNS resolves and traces `testuser.hostingsignal.in`, injection and `127.0.0.1` answer 422; DDNS answers `not_delegated`
+  (Cloudflare holds the zone — the token path is covered by `server/test/panel-ddns.test.js`); wizard calls create / grant /
+  drop `testuser_probe`; Optimize writes the deflate block (`Content-Encoding: gzip`; Debian's `deflate.conf` compresses html
+  anyway, so "off" still gzips html); Hotlink: foreign Referer 403, own 200, off 200; Virus Scanner found the EICAR probe in 3 s
+  (ClamAV 1.5.4, 28174 signatures); a 2 MB raw-chunk upload finished with a matching sha256; usage reports `repquota` (scan note
+  only shows for scan-sourced figures); the domain carries a live Let's Encrypt certificate (https home links). Not verified
+  live: a plugin panel page (the sample plugin on nova predates `audience: 'panel'`; `server/test/panel-plugins.test.js` covers it),
+  `e2e/panel-check.cjs` (root TOTP not enrolled). Host packages added for P2: `clamav-daemon` (active, signatures fetched),
+  `dnsutils`, `traceroute`.
+- **2026-11-06: Install Software, PHP Version Manager and the 2083/2087 port split deployed to nova**
   (commits `d8333a3`, `d724062`; built as three workflow rounds — runtime installs, PHP Version Manager, port split — each with
   two review lenses and one fix round). Software › Install Software (the former Install Distro Packages page, same URL)
   offers one-click PHP, Node.js, Python, Ruby, Go, Composer and a tool grid (`ctx.software.runtimes`,
