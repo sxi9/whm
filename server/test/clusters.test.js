@@ -496,7 +496,7 @@ describe('Clusters API', () => {
       expect(app.ctx.settings.get('ssl.autossl.provider')).toBe('disabled');
       // A PHP version this host does not have is refused by Software.
       expect(results['php.default_version']).toMatchObject({ status: 'failed', stored: false, via: 'phpDefault' });
-      expect(app.ctx.settings.get('php.default_version')).toBe('ea-php83');
+      expect(app.ctx.settings.get('php.default_version')).toBeNull();
       // Backup rewrote its schedule row; system health and contacts stored their policy.
       expect(results['backup.schedule']).toMatchObject({ status: 'applied', via: 'backup' });
       expect(app.ctx.scheduler.list().find((x) => x.name === 'backup-run').cron).toBe('15 3 * * *');

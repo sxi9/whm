@@ -982,12 +982,18 @@ export function createServiceConfigService(ctx) {
     const version = versionInput == null ? null : phpVersionId(versionInput);
     if (versionInput != null && !version) throw badRequest(`"${versionInput}" is not a PHP version`);
     requireApache();
-    if (version) await ensurePool(stmts.accountByUsername.get(spec.username), version, req);
+    const account = stmts.accountByUsername.get(spec.username);
+    // "Inherit" is stored as null but rendered with the resolved default: a vhost
+    // without a handler would serve .php files as source.
+    const effective = version ?? await resolvePhpVersion(account);
+    if (effective) await ensurePool(account, effective, req);
+    const result = await writeSpec({ ...spec, phpVersion: effective }, req, { reload });
+    // writeSpec stores what it rendered; the record keeps "inherit" (null) so the next sync re-resolves it.
     spec.phpVersion = version;
     storeSpec(spec);
-    const result = await writeSpec(spec, req, { reload });
-    audit(req, { action: 'web.php.set', target: domain, args: { version } });
-    return result;
+    if (!effective) stmts.setVhostStatus.run('failed', 'PHP-FPM is not installed; .php files are served as static content until a PHP-FPM tree exists', result.path ?? null, domain);
+    audit(req, { action: 'web.php.set', target: domain, args: { version, effective } });
+    return { ...result, effective };
   }
 
   // `bind` (e.g. 127.0.0.1 behind the Software category's nginx proxy) moves

@@ -268,6 +268,12 @@ describe('cross-category helpers on ctx.web', () => {
     await app.ctx.web.setPhpVersion('example.com', 'ea-php81', null);
     expect(app.agent.callsTo('web.vhost.write').pop().args.reload).toBe(true);
     await expect(app.ctx.web.setPhpVersion('example.com', 'ea-php56', null)).rejects.toMatchObject({ status: 501, capability: 'php' });
+    // "Inherit" keeps null in the record but the vhost is rendered with the resolved default handler.
+    const inherit = await app.ctx.web.setPhpVersion('example.com', null, null, { reload: false });
+    expect(inherit.effective).toBeTruthy();
+    expect(app.agent.callsTo('web.vhost.write').pop().args.phpVersion).toBe(inherit.effective);
+    expect(app.ctx.web.vhostFor('example.com').phpVersion).toBeNull();
+    await app.ctx.web.setPhpVersion('example.com', 'ea-php81', null, { reload: false });
     await expect(app.ctx.web.writePhpPool('nobody', '8.3', {}, null)).rejects.toMatchObject({ status: 404 });
     const ports = await app.ctx.web.setListenPorts({ http: 8080, https: 8443 }, null);
     expect(ports.http).toBe(8080);

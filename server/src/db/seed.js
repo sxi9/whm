@@ -45,7 +45,7 @@ export const DEFAULT_SETTINGS = {
   'backup.retention_weekly': 4,
   'backup.retention_monthly': 3,
   'dns.default_ttl': 14400,
-  'php.default_version': 'ea-php83',
+  'php.default_version': null,
   'updates.tier': 'stable',
   'updates.auto': true,
   'analytics.enabled': false,
