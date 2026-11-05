@@ -1627,7 +1627,7 @@ defineOp('pkg.node.install', {
     const root = nodeDir();
     const binDir = localBinDir();
     ctx.assertAllowedPath(root, 'write');
-    ctx.assertAllowedPath(binDir, 'write');
+    for (const name of NODE_LINKS) ctx.assertAllowedPath(path.join(binDir, `${name}${major}`), 'write');
     fs.mkdirSync(root, { recursive: true, mode: 0o755 });
     const output = [];
     const tmpdir = fs.mkdtempSync(path.join(root, '.tmp-'));
@@ -1676,7 +1676,7 @@ defineOp('pkg.node.remove', {
     const root = nodeDir();
     const binDir = localBinDir();
     ctx.assertAllowedPath(root, 'write');
-    ctx.assertAllowedPath(binDir, 'write');
+    for (const name of NODE_LINKS) ctx.assertAllowedPath(path.join(binDir, `${name}${major}`), 'write');
     const target = path.join(root, String(major));
     const symlinks = [];
     for (const name of NODE_LINKS) {

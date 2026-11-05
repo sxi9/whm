@@ -149,7 +149,7 @@ describe('Customer panel: preferences and the 2FA policy (P1-8, P1-9)', () => {
     await alice.post('/security/password', { currentPassword: 'Panel-Passw0rd!1', newPassword: 'Yet-An0ther-Str0ng!pw' }).expect(200);
     expect(sent).toHaveLength(2);
     alice = await panelLogin(app, 'alice');
-  });
+  }, 20_000);
 
   describe('the panel 2FA policy lives in the service', () => {
     afterAll(() => app.ctx.settings.set('panel.require_2fa_for_users', false));

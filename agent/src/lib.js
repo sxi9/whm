@@ -9,6 +9,9 @@ const deployDirOf = (app) => path.resolve(path.dirname(fileURLToPath(import.meta
 // Paths the agent may read or write. Everything the panel manages lives under one
 // of these; anything else is refused even for root. Operators can extend the list
 // in the agent config, never the API.
+export const NODE_LINK_MAJORS = { min: 16, max: 30 };
+export const NODE_LINK_PATHS = Array.from({ length: NODE_LINK_MAJORS.max - NODE_LINK_MAJORS.min + 1 }, (_, i) => NODE_LINK_MAJORS.min + i).flatMap((m) => ['node', 'npm', 'npx'].map((n) => `/usr/local/bin/${n}${m}`));
+
 export const DEFAULT_ALLOWED_ROOTS = [
   '/home', '/var/lib/whm', '/etc/whm', '/var/log/whm',
   '/etc/apache2', '/etc/httpd', '/etc/nginx', '/var/www',
@@ -40,7 +43,9 @@ export const DEFAULT_ALLOWED_ROOTS = [
   '/etc/resolv.conf',
   '/var/cache/whm',
   // Curated repositories and side-by-side Node.js builds (pkg.repo.ensure, pkg.node.*).
-  '/etc/apt/sources.list.d', '/etc/apt/keyrings', '/etc/yum.repos.d', '/opt/keel/node', '/usr/local/bin',
+  '/etc/apt/sources.list.d', '/etc/apt/keyrings', '/etc/yum.repos.d', '/opt/keel/node',
+  // Only the versioned links the Node.js installer manages, never /usr/local/bin itself.
+  ...NODE_LINK_PATHS,
   // Web applications published under the server-hostname site (web.host.app.*) and their distro
   // configuration: Debian names, then the RHEL/Remi packages and the bare-tarball locations that
   // webmail.js WEBMAIL_CANDIDATES and db.js PMA_DIRS / PMA_CONFIGS probe (keep the lists in step).

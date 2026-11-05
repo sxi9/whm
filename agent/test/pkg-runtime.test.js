@@ -97,7 +97,11 @@ describe('runtime op schemas reject anything but the enum and the integer range'
     expect(catalog.get('pkg.node.remove').destructive).toBe(true);
     expect(catalog.get('pkg.node.install').destructive).toBe(false);
     expect(catalog.get('pkg.node.install').timeoutMs).toBe(15 * 60_000);
-    expect([APT_SOURCES_DIR, APT_KEYRINGS_DIR, YUM_REPOS_DIR, NODE_DIR, LOCAL_BIN_DIR].every((p) => DEFAULT_ALLOWED_ROOTS.includes(p))).toBe(true);
+    expect([APT_SOURCES_DIR, APT_KEYRINGS_DIR, YUM_REPOS_DIR, NODE_DIR].every((p) => DEFAULT_ALLOWED_ROOTS.includes(p))).toBe(true);
+    // Only the versioned links are writable, never the directory: a hook or any other op must not reach /usr/local/bin/sh.
+    expect(DEFAULT_ALLOWED_ROOTS).not.toContain(LOCAL_BIN_DIR);
+    for (const m of [16, 20, 30]) for (const n of ['node', 'npm', 'npx']) expect(DEFAULT_ALLOWED_ROOTS).toContain(`${LOCAL_BIN_DIR}/${n}${m}`);
+    expect(DEFAULT_ALLOWED_ROOTS).not.toContain(`${LOCAL_BIN_DIR}/node31`);
   });
 });
 

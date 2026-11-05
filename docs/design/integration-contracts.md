@@ -1156,7 +1156,7 @@ Reports are the account's own files, rendered and read back as the account; noth
   packages; `single` runtimes ignore `version`), `reposFor`, `packagesFor`, `runtimeNote` and `detectedVersion` exported
   for tests.
 - **Agent ops** (`ops/pkg.js`; `DEFAULT_ALLOWED_ROOTS` gains `/etc/apt/sources.list.d`, `/etc/apt/keyrings`,
-  `/etc/yum.repos.d`, `/opt/keel/node`, `/usr/local/bin`; test overrides `WHM_APT_SOURCES_DIR` / `WHM_APT_KEYRINGS_DIR` /
+  `/etc/yum.repos.d`, `/opt/keel/node` and only the versioned links `/usr/local/bin/node<major>` / `npm<major>` / `npx<major>` for majors 16–30 (`NODE_LINK_PATHS` in `agent/src/lib.js`; never `/usr/local/bin` itself); test overrides `WHM_APT_SOURCES_DIR` / `WHM_APT_KEYRINGS_DIR` /
   `WHM_YUM_REPOS_DIR` / `WHM_NODE_DIR` must stay under an allowed root, as `PKG_RUN_DIR` does):
   `pkg.os.release` (read-only) → `{ id, idLike, versionId, codename, family: 'debian' | 'rhel' | null }` from
   `/etc/os-release` (pure `parseOsRelease(text)`).
