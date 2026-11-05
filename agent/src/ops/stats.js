@@ -4,7 +4,7 @@ import readline from 'node:readline';
 import { finished } from 'node:stream/promises';
 import { z } from 'zod';
 import { exec, hasBinary, resolveBinary } from '../exec.js';
-import { defineOp, arg, OpError } from './registry.js';
+import { defineOp, arg, OpError, ensurePrivateDir } from './registry.js';
 import { DOMLOGS_ROOT } from './web.js';
 import { assertManaged, accountPath, asUserArgv, requireAsUser, failureOf, lstatOrNull } from './as-user.js';
 import { stagedWrite } from './files.js';
@@ -20,6 +20,7 @@ export const STATS_ROOT = '/var/lib/whm/stats';
 const AWSTATS_CANDIDATES = ['awstats.pl', '/usr/lib/cgi-bin/awstats.pl', '/usr/share/awstats/wwwroot/cgi-bin/awstats.pl', '/usr/local/awstats/wwwroot/cgi-bin/awstats.pl', '/var/www/awstats/awstats.pl'];
 const AWSTATS_STATIC = ['awstats_buildstaticpages.pl', '/usr/share/awstats/tools/awstats_buildstaticpages.pl', '/usr/share/doc/awstats/examples/awstats_buildstaticpages.pl', '/usr/local/awstats/tools/awstats_buildstaticpages.pl'];
 const MERGED_LOG = 'access-merged.log';
+const GOACCESS_SCRATCH = '/tmp/whm';
 const MONTHS = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
 
 const statsRoot = () => process.env.WHM_STATS_ROOT || STATS_ROOT;
@@ -303,7 +304,7 @@ defineOp('stats.goaccess.run', {
     const runAs = (program, argv, opts) => {
       const [exe, args] = asUserArgv(info, program, argv, { tool, nice: opts.nice && hasBinary('nice') });
       const [wrapped, wrappedArgs] = opts.nice ? ioniceArgv(exe, args) : [exe, args];
-      return exec(wrapped, wrappedArgs, { timeoutMs: opts.timeoutMs, maxBuffer: opts.maxBuffer, allowFailure: true, env: { HOME: info.home, USER: info.username, LOGNAME: info.username } });
+      return exec(wrapped, wrappedArgs, { timeoutMs: opts.timeoutMs, maxBuffer: opts.maxBuffer, stdinFd: opts.stdinFd, allowFailure: true, env: { HOME: info.home, USER: info.username, LOGNAME: info.username } });
     };
     const keel = await runAs('mkdir', ['-p', '-m', '0711', '--', path.dirname(dir)], { timeoutMs: 30_000 });
     if (keel.code !== 0) throw failureOf(keel, `create ${path.relative(home, path.dirname(dir))}`);
@@ -314,7 +315,23 @@ defineOp('stats.goaccess.run', {
     // .html/.json/.csv extension for its output file, so the staging name keeps it).
     const staging = goaccessStaging(out.html);
     const dropStaging = () => runAs('rm', ['-f', '--', staging.html, staging.json], { timeoutMs: 30_000 }).catch(() => {});
-    const run = await runAs(bin, goaccessArgv(logs, staging.html, staging.json), { nice: true, timeoutMs: 120_000, maxBuffer: 256 * MiB });
+    // The domlogs live under /var/log/whm, which the account cannot traverse
+    // (0750 whmpanel), so root opens the log — merged in time order when a
+    // domain has both the plain and the TLS log — and goaccess, running as the
+    // account, reads it from stdin (`-`); nothing under /var/log is opened by
+    // the account and nothing in the home is opened by root.
+    ctx.assertAllowedPath(GOACCESS_SCRATCH, 'write');
+    const scratch = fs.mkdtempSync(path.join(ensurePrivateDir(GOACCESS_SCRATCH), 'goaccess-'));
+    let fd = null;
+    let run;
+    try {
+      const source = logs.length === 1 ? logs[0] : (await mergeAccessLogs(logs, path.join(scratch, 'access.log'))).dest;
+      fd = fs.openSync(source, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      run = await runAs(bin, goaccessArgv(['-'], staging.html, staging.json), { nice: true, timeoutMs: 120_000, maxBuffer: 256 * MiB, stdinFd: fd });
+    } finally {
+      if (fd !== null) fs.closeSync(fd);
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
     if (run.code !== 0) { await dropStaging(); throw failureOf(run, `goaccess for ${domain}`); }
     // The JSON report is read back as the account (root never opens files in the home) and dropped.
     const json = await runAs('cat', ['--', staging.json], { timeoutMs: 60_000, maxBuffer: 256 * MiB });

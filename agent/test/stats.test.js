@@ -156,6 +156,8 @@ describe('stats.goaccess (Visitors)', () => {
   it('builds the goaccess argv with the HTML file and the JSON report on stdout', () => {
     const logs = ['/var/log/whm/domlogs/alice/example.com-access.log', '/var/log/whm/domlogs/alice/example.com-ssl-access.log'];
     expect(goaccessArgv(logs, '/home/alice/.keel/stats/example.com.html', '/home/alice/.keel/stats/example.com.json')).toEqual(['--no-global-config', '--log-format=COMBINED', '--output=/home/alice/.keel/stats/example.com.html', '--output=/home/alice/.keel/stats/example.com.json', ...logs]);
+    // The op itself hands goaccess the root-opened log on stdin: the account cannot traverse /var/log/whm.
+    expect(goaccessArgv(['-'], '/home/alice/.keel/stats/example.com.html', '/home/alice/.keel/stats/example.com.json').at(-1)).toBe('-');
     expect(goaccessOutputs('/home/alice', 'example.com')).toEqual({ dir: `/home/alice/${STATS_DIR}`, html: '/home/alice/.keel/stats/example.com.html', summary: '/home/alice/.keel/stats/example.com.summary.json' });
     // goaccess 1.9 rejects an output file without a .html/.json/.csv extension ("Invalid filename extension")
     // and checks `--output=json` as a path in the working directory, so the JSON goes to a staging file too.

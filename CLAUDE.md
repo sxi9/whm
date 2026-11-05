@@ -187,6 +187,36 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
 
 ## Current state (update every push)
 
+- **2026-11-05 (latest): Phase 8 P1 deployed to nova** (plan §P1, 11 builder units in three waves, security +
+  correctness review lenses, one fix round that closed the blocker — the phpMyAdmin SSO wildcard grant crossed tenants
+  whose usernames share a `_` prefix; now explicit per-database grants on a user dropped and recreated at every
+  sign-on — and both majors: Roundcube SSO logs in by mailbox with the master user as SASL authorization identity so
+  password and SSO logins share one Roundcube profile; the contact/recovery address needs the current password and the
+  old address is told). Gate on the host clone at the deploy commits: server 1570 / client 456 / agent 725 (+3 known
+  host-env) / hub 186 / hub-ui 105 / client build green; `install.sh --upgrade` applied migrations 034b/034c/034d. What is
+  live: Roundcube SSO (`keel_sso` plugin from `deploy/roundcube`, `POST /api/panel/email/webmail/sso`, admin switch
+  `PUT /api/panel/admin/webmail/sso`), phpMyAdmin SSO (hidden `<account>_pma@localhost`, `/keel/pma-signon.php` from
+  `deploy/phpmyadmin`, `PUT /api/databases/phpmyadmin/sso`), Sieve mail filters (`ctx.panelEmail.filters`, agent
+  `vmail.sieve.*`, Dovecot wiring gated on the `sieve` capability), per-domain mail routing + Exim relay/IPv6 settings
+  (`PUT /api/service-config/exim { ipv6, smarthost }`, agent `mail.smarthost.*`, `mail.outbound.probe`), webmail/phpMyAdmin
+  publish with an HTTP probe, the `.htaccess` family (IP blocker, directory privacy, indexes, error pages;
+  `ctx.panelHtaccess`, agent `files.htaccess.*`), Visitors (GoAccess, `panel.stats.generate` nightly), WordPress
+  installer (web path without WP-CLI; `ctx.panelSoftware`, agent `web.wp.*`), preferences/locale/2FA QR/mailbox
+  folders + usage messages, phone layout (panel-check 390×844 pass), panel i18n catalogue (`panel.*` keys,
+  pseudo-locale tests). Contracts §44–§50. **Found on the live host after the deploy and fixed (three commits after the
+  feature commit):** Dovecot 2.4 took the `.dovecot.sieve` link in the maildir root for a Maildir++ folder and every
+  filtered LMTP delivery failed 451 — the active link now lives beside the maildir as `~/mail/<domain>/.<local>.sieve`
+  (and its `.svbin` goes with it); goaccess 1.9.4 refuses an output file without `.html/.json/.csv` and checks
+  `--output=json` as a path in the working directory, so both reports go to `.tmp.html/.tmp.json` staging files; the
+  agent resolves IPv4 first and gives each connect attempt 2.5 s (Node's 250 ms happy-eyeballs attempt is shorter than
+  one round trip from nova to wordpress.org, so the package download failed by design). Verified on nova: Roundcube and
+  phpMyAdmin opened from the panel without a login form (tokens single-use, replay 404/403), a filter delivered to Junk
+  while plain mail hit INBOX, Empty folder expunged it, directory privacy 401→200, IP blocker + custom 404 served by
+  Apache, WordPress 7.1.4 installed at `/p1blog` and removed with its database, relay/IPv6 block re-applied with
+  `exim -bV` clean. Host step added: `.include_if_exists /etc/exim4/whm/router_whm_smarthost.conf` after the virtual-mail
+  include in `exim4.conf.template` (operator line; the panel never edits the template). Not run: `e2e/panel-check.cjs`
+  (logs in as root, whose TOTP is not enrolled). Open for the owner: outbound 25 at EC2 (or a relay in Exim
+  Configuration Manager › Outbound relay now that the slot exists), TOTP enrolment for root and the hub admin.
 - **2026-11-05 (later): Phase 8 P0 deployed to nova** (`docs/design/phase8-account-panel.md`, P0-1..P0-6, built as
   parallel units with two review lenses and one fix round). Gate on the host clone at the deploy commit: server 1483 /
   client 292 / agent 655 (+3 known host-env) / hub 186 / hub-ui 105 / SDK 73 / plugins green; `install.sh --upgrade` applied

@@ -33,6 +33,7 @@ license + marketplace service with its own React portals (`hub/ui`) · zod 4 eve
 | **Phase 7 — identity** | done: default branding "Keel" (migration `028c`, operators change it under Panel › Customization), labels renamed with **stable keys/routes** via slug overrides in `client/src/nav.js`, i18n catalog, docs (README/INSTALL/MANUAL/SDK), server/agent/hub user-visible strings (legacy managed-block markers still recognised on upgraded hosts), support links, `keel@` sender, `KEEL-` ticket refs | `22001ff`…`643e0a6` |
 | hub/ui portals | on the new kit (`18fe699`; `hub/ui/src/components/SYNC.md`) | hub-ui suite |
 | **Provisioned-host verification** (`nova.hostingsignal.in`, Ubuntu 26.04, EC2) | **done 2026-11-04/05**: 10 probe areas (mail, FTP, MySQL, web/PHP/DNS, SSL, backups/cron/quota, admin API walk, account-panel API walk, security posture, log-derived bugs), 29 confirmed findings (1 refuted), each adversarially verified; every finding with a code component fixed in three rounds under two review lenses; host-side fixes applied (AutoSSL live, ManageSieve 2000 off, fail2ban jails, PureDB auth link, Cloudflare nameservers); the code fixes are **uncommitted and not yet deployed** — §4 lists the deploy and the remaining host steps | `server/test/{http-redirect,request-log,capabilities,services}.test.js`, `agent/test/pkg-backports.test.js`, `client/test/exim-virtual-mail.test.jsx`, extended panel-*/service-configuration/ssl-tls/security-center/vmail/ftp/db/files suites; `https://testuser.hostingsignal.in` serves a Let's Encrypt certificate |
+| **Phase 8 — account panel on the real host** (`docs/design/phase8-account-panel.md`) | **P0 + P1 done and live on nova 2026-11-05**: hostname site with `/webmail` + `/phpmyadmin`, delegation banners, lockout paths (P0); Roundcube/phpMyAdmin SSO, Sieve filters, mail routing + relay/IPv6, `.htaccess` family, Visitors, WordPress installer, preferences/2FA/folders, phone layout, i18n (P1); three live-found fixes after the P1 deploy (§4) | `CHECKLIST.md` Phase 8 table; §4 host steps; `server/test/panel-{sso,me,email-filters,htaccess,software,logs-stats}.test.js`, `agent/test/{vmail-sieve,files-htaccess,wp-install,stats,db,webmail,mail}.test.js`, `client/test/panel-{i18n-*,mobile,preferences,visitors,wordpress,htaccess,webmail-sso}.test.jsx` |
 | **Phase 7 — account panel** (`/panel`, our cPanel replacement) | **done**: design `docs/design/customer-panel.md`; units U0–U5 + seams S1–S11 (contracts §33–40) + 39 pages in 13 groups, each adversarially reviewed and fixed; integration critics (3 lenses, 38 findings) closed; admin side ("Log in as", Panel › Customization › Account panel, reseller ACL `login-as`); manual Part C | `e2e/panel-check.cjs` 39/39, `server/test/panel-*.test.js`, `agent/test/{files,cron,vmail,webmail,ftp,backup-read}.test.js`, `client/test/panel-*.test.jsx`; galleries `docs/screenshots/pages/panel/` |
 
 ## 3. How to run and verify (from a fresh clone)
@@ -172,6 +173,43 @@ work); `basic.nameservers` = `roman/betty.ns.cloudflare.com` and the testuser zo
    i18n, mobile). Use `keel-ops` (`/root/keel-ops.env`) for scripted verification on nova. Then the earlier
    list: the minor critic findings from milestone 2, hub portals in a browser, the DEFERRED items in
    `docs/design/phase5-build-plan.md`.
+
+### Phase 8 P1 host steps (done on nova 2026-11-05 after `install.sh --upgrade` from the P1 commits)
+
+P1 (SSO, Sieve filters, routing + relay, `.htaccess` family, Visitors, WordPress, preferences, phone layout, i18n;
+contracts §44–§50, migrations `034b`–`034d`) is deployed and verified on nova. Order for another host (`keel-ops`
+session, CSRF token on every write):
+
+1. `install.sh --upgrade` (rsyncs `deploy/roundcube` + `deploy/phpmyadmin`, applies the migrations, restarts the units;
+   the boot job re-renders `98-whm-virtual-auth.conf` with the Sieve lines when `sievec` is present and reloads Dovecot).
+2. **Exim:** add `.include_if_exists /etc/exim4/whm/router_whm_smarthost.conf` right after the virtual-mail include under
+   `begin routers` in `/etc/exim4/exim4.conf.template` (operator line, the panel never edits the template), then
+   `update-exim4.conf && exim4 -bV && systemctl reload exim4`. Save the Exim Configuration Manager once
+   (`PUT /api/service-config/exim {"ipv6":"auto"}`): the Keel main block then carries `disable_ipv6 = true` on a host
+   without a global IPv6 route and the agent drops a hand-added duplicate outside the blocks (Exim refuses a second
+   definition). `grep -c '^disable_ipv6' /etc/exim4/exim4.conf.localmacros` → 1.
+3. **Webmail SSO:** `PUT /api/panel/admin/webmail/sso {"enabled":true}` → master user `keel-master` in
+   `/etc/dovecot/whm/master-users`, plugin in `/var/lib/roundcube/plugins/keel_sso`, `keel_sso` + `keel_sso_endpoint` in the
+   Keel block of `config.inc.php`. `loginAs` stays off (an administrator acting as the account cannot open mailboxes).
+4. **phpMyAdmin SSO:** `PUT /api/databases/phpmyadmin/sso {"enabled":true}` → `keel-host.d/keel-signon.conf` (`/keel`),
+   `/etc/phpmyadmin/conf.d/keel-signon.php` (server 1 signon, server 2 cookie login), `curl -sI …/keel/pma-signon.php` → 200.
+5. Acceptance as `testuser` (login-as): `POST /api/panel/email/webmail/sso {mailbox}` → URL → 302 into `_task=mail`
+   (replay of the link lands on the login form; `SELECT username FROM users` in the `roundcube` database shows the
+   mailbox only); `POST /api/panel/databases/phpmyadmin/sso {}` → 302 to `index.php?server=1`, `SHOW GRANTS FOR
+   'testuser_pma'@'localhost'` lists the account's databases only, replay 403; a filter with `fileinto Junk` then
+   `exim4 -odf` two local messages → `.Junk/new` 1, `new` 1 (`journalctl -u dovecot` shows `sieve: … stored mail into
+   mailbox 'Junk'`); `POST …/folders/Junk/empty` removes it; directory privacy 401 → 200 with the user; IP blocker and a
+   custom 404 appear in `public_html/.htaccess` and Apache serves the page; `POST /api/panel/logs/stats/<domain>/generate`
+   → report 200 within ~30 s (10 min cooldown per domain); `POST /api/panel/software/wordpress` → job done, `/p1blog/` 200
+   with the site title, removed with `database=true`. Scratchpad scripts of this session: `live/p1-accept.sh`, `p1-accept2.sh`.
+6. Not run on nova: `e2e/panel-check.cjs` (phone + pseudo-locale passes) — it logs in as root, whose TOTP is not enrolled.
+
+**Found on the host and fixed in code (commits after the P1 feature commit):** the `.dovecot.sieve` active link in the
+maildir root is a Maildir++ "folder" to Dovecot 2.4 (LMTP 451 "Not a directory" on every filtered delivery) → the link is
+`~/mail/<domain>/.<local>.sieve` now; goaccess 1.9.4 wants `.html/.json/.csv` output names and checks `--output=json` as
+a path in the working directory → staging files `<domain>.tmp.html/.tmp.json`; the agent's `fetch` lost the race
+between Node's 250 ms happy-eyeballs attempt and a 238 ms round trip to wordpress.org → `ipv4first` + 2.5 s attempts
+in `agent/src/index.js`.
 
 ### Phase 8 P0 host steps (done on nova 2026-11-05 after `install.sh --upgrade` from the Phase 8 commit)
 

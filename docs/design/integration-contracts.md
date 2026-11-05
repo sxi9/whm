@@ -992,8 +992,12 @@ Reports are the account's own files, rendered and read back as the account; noth
   `<home>/.keel/stats/` (`accountPath` pins it under the home through symlinks; `.keel` `0711`, `stats` `0750`, both
   `mkdir -p` **as the account**); goaccess runs as the account through `asUserArgv` + `nice -n 10` wrapped in
   `ionice -c 2 -n 7` (`ioniceArgv`, skipped when absent), 120 s, `--no-global-config --log-format=COMBINED
-  --output=<html>.tmp --output=json <logs…>` (`goaccessArgv`): the HTML is renamed into `<domain>.html` only when the run
-  succeeded, the JSON report arrives on stdout (256 MiB cap) and only its summary (`summarizeGoaccess`: `version 1`,
+  --output=<domain>.tmp.html --output=<domain>.tmp.json -` (`goaccessArgv`; goaccess 1.9 insists on `.html/.json/.csv`
+  output names and checks `--output=json` as a path in the working directory): the log is opened **by root** (the
+  account cannot traverse `/var/log/whm`, 0750 whmpanel) — both logs merged in time order into a private `/tmp/whm`
+  scratch file when a domain has the plain and the TLS log — and handed to goaccess as stdin (`stdinFd`); the HTML is
+  renamed into `<domain>.html` only when the run succeeded, the JSON staging file is read back as the account and
+  removed (256 MiB cap) and only its summary (`summarizeGoaccess`: `version 1`,
   `period`, `totals { requests, validRequests, failedRequests, visitors, files, notFound, referrers, bandwidth, logBytes }`,
   `days` ≤ 31 newest, and the top ten `pages`, `staticFiles`, `notFound`, `referrers`, `countries`, `statusCodes`,
   `browsers`, `os` as `{ label, hits, visitors, bytes }`; never the hosts panel) is written as
