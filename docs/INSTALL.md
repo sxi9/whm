@@ -387,7 +387,7 @@ identity, so SMTP AUTH through Exim must reach Dovecot (the virtual-mail `doveco
 **Mail filters (Sieve).** The account panel's *Email filters* need Pigeonhole: `apt install
 dovecot-sieve` (RHEL: `dovecot-pigeonhole`). While `sievec` is present the virtual-mail fragment
 `98-whm-virtual-auth.conf` loads the `sieve` plugin for LMTP and points Dovecot at
-`~/mail/<domain>/<local>/sieve/` (active `.dovecot.sieve`) and the account-wide
+`~/mail/<domain>/<local>/sieve/` (active link `~/mail/<domain>/.<local>.sieve`, beside the maildir) and the account-wide
 `~/mail/sieve-global/keel.sieve` (`sieve_before`); without it the fragment carries no Sieve lines at
 all (Dovecot would otherwise refuse every LMTP delivery for the missing plugin). So re-apply the
 wiring after installing the package (*Service Configuration › Exim Configuration Manager › virtual

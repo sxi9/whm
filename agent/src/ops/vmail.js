@@ -696,8 +696,11 @@ defineOp('vmail.render.check', {
 // the account's home and is written as the account uid (as-user.js), where
 // service-configuration's Dovecot fragment looks for it: the personal script
 // of a mailbox in ~/mail/<domain>/<local>/sieve/ with the active symlink
-// ~/mail/<domain>/<local>/.dovecot.sieve, the account-wide script
-// (sieve_before) at ~/mail/sieve-global/keel.sieve. The script text is
+// ~/mail/<domain>/.<local>.sieve (beside the maildir, never inside it: Dovecot's
+// Maildir++ listing takes every dot-prefixed entry of the maildir root for a
+// folder and a symlink there fails LMTP with "Not a directory"; a local part
+// never starts with a dot, so the name cannot collide with a maildir), the
+// account-wide script (sieve_before) at ~/mail/sieve-global/keel.sieve. The script text is
 // rendered by the panel from structured rules; the agent never interprets it,
 // it only compiles it: a staged copy goes through sievec first and replaces
 // the live script (and is activated) only after a clean compile, so a script
@@ -705,7 +708,8 @@ defineOp('vmail.render.check', {
 export const SIEVE_SCRIPT = 'keel.sieve';
 export const SIEVE_BINARY = 'keel.svbin';
 export const SIEVE_MAILBOX_DIR = 'sieve';
-export const SIEVE_ACTIVE = '.dovecot.sieve';
+export const sieveActiveName = (local) => `.${local}.sieve`;
+export const SIEVE_ACTIVE = sieveActiveName('<local>');
 export const SIEVE_GLOBAL_DIR = 'mail/sieve-global';
 export const SIEVE_MAX_BYTES = 256 * 1024;
 
@@ -724,7 +728,7 @@ export function sievePaths(home, scope, mailbox = null) {
   const [local, domain] = mailbox.split('@');
   const maildir = path.join(home, 'mail', domain, local);
   const dir = path.join(maildir, SIEVE_MAILBOX_DIR);
-  return { dir, script: path.join(dir, SIEVE_SCRIPT), binary: path.join(dir, SIEVE_BINARY), maildir, active: path.join(maildir, SIEVE_ACTIVE), activeTarget: `${SIEVE_MAILBOX_DIR}/${SIEVE_SCRIPT}` };
+  return { dir, script: path.join(dir, SIEVE_SCRIPT), binary: path.join(dir, SIEVE_BINARY), maildir, active: path.join(home, 'mail', domain, sieveActiveName(local)), activeTarget: `${local}/${SIEVE_MAILBOX_DIR}/${SIEVE_SCRIPT}` };
 }
 
 // sievec reports "<name>: line N: error: …" per problem; doveconf warnings
@@ -791,7 +795,7 @@ function sieveCompileError(r) {
 }
 
 defineOp('vmail.sieve.write', {
-  description: 'Install a Sieve script for a mailbox (personal script + .dovecot.sieve symlink) or account-wide (sieve_before) as the account: staged, compiled with sievec, moved into place and activated only after a clean compile',
+  description: 'Install a Sieve script for a mailbox (personal script + the .<local>.sieve active symlink beside the maildir) or account-wide (sieve_before) as the account: staged, compiled with sievec, moved into place and activated only after a clean compile',
   schema: z.object({ ...sieveTarget, script: sieveScript }).strict().refine(sieveTargetRule, SIEVE_TARGET_MESSAGE),
   timeoutMs: 180_000,
   run: async (args, ctx) => {
@@ -843,7 +847,7 @@ defineOp('vmail.sieve.test', {
 });
 
 defineOp('vmail.sieve.remove', {
-  description: 'Remove the panel-managed Sieve script (and its compiled binary) of a mailbox or the account; the .dovecot.sieve symlink is removed only when it points at that script',
+  description: 'Remove the panel-managed Sieve script (and its compiled binary) of a mailbox or the account; the active symlink is removed only when it points at that script',
   schema: z.object(sieveTarget).strict().refine(sieveTargetRule, SIEVE_TARGET_MESSAGE),
   destructive: true,
   timeoutMs: 60_000,

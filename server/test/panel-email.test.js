@@ -322,7 +322,9 @@ describe('Customer panel: email', () => {
       const id = row("SELECT id FROM mail_accounts WHERE local_part = 'sales'").id;
       const res = await alice.del(`/email/accounts/${id}?removeMail=true`).expect(200);
       expect(res.body.data).toMatchObject({ removed: true, mailRemoved: true });
-      expect(names()).toEqual(['vmail.passwd.remove', 'files.remove']);
+      // The active Sieve link beside the maildir goes with the mail (best effort), then the maildir itself.
+      expect(names()).toEqual(['vmail.passwd.remove', 'vmail.sieve.remove', 'files.remove']);
+      expect(app.agent.callsTo('vmail.sieve.remove')[0].args).toEqual({ username: 'alice', scope: 'mailbox', mailbox: 'sales@alice.com' });
       expect(app.agent.callsTo('files.remove')[0].args).toEqual({ username: 'alice', paths: ['/home/alice/mail/alice.com/sales'] });
       expect(row('SELECT id FROM mail_accounts WHERE id = ?', id)).toBeUndefined();
       const again = await alice.del(`/email/accounts/${id}`);

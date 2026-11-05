@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import dns from 'node:dns';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
@@ -9,6 +10,11 @@ import { createContext, runOp, listOps, OpError, DEFAULT_ALLOWED_ROOTS } from '.
 // and answers
 //   { id, ok: true, result }  |  { id, ok: false, error: { code, message, details } }
 // Only the op catalog is reachable; there is deliberately no "run this command" op.
+
+// Outbound fetches (WordPress packages, mail/HTTP probes) try IPv4 first: a
+// host whose only IPv6 address is link-local (EC2 without an IPv6 allocation)
+// otherwise waits on the AAAA target until the connect times out.
+dns.setDefaultResultOrder('ipv4first');
 
 const SOCKET = process.env.WHM_AGENT_SOCKET || '/run/whm-agent.sock';
 const GROUP = process.env.WHM_AGENT_GROUP || 'whmpanel';

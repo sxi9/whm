@@ -310,7 +310,10 @@ export function dovecotIsV24(version) {
 // unconditional line would stop every LMTP delivery on a host without it.
 // Dovecot 2.4 replaced the plugin { sieve = … } settings with named
 // sieve_script sections.
-export const SIEVE_PATHS = { mailboxDir: 'sieve', active: '.dovecot.sieve', globalScript: 'mail/sieve-global/keel.sieve' };
+// The active symlink sits beside the maildir (~/mail/<domain>/.<local>.sieve),
+// never inside it: Maildir++ takes every dot entry of the maildir root for a
+// folder, and a symlink there made LMTP fail with "Not a directory" on 2.4.
+export const SIEVE_PATHS = { mailboxDir: 'sieve', active: (local) => `.${local}.sieve`, globalScript: 'mail/sieve-global/keel.sieve' };
 export function renderDovecotSieve(v24) {
   const header = '# Account panel mail filters (Sieve): the personal script of a mailbox under its maildir, the account-wide script before it.';
   if (v24) {
@@ -319,7 +322,7 @@ export function renderDovecotSieve(v24) {
       'sieve_script personal {',
       '  type = personal',
       `  path = ~/mail/%{user | domain}/%{user | username}/${SIEVE_PATHS.mailboxDir}`,
-      `  active_path = ~/mail/%{user | domain}/%{user | username}/${SIEVE_PATHS.active}`,
+      `  active_path = ~/mail/%{user | domain}/${SIEVE_PATHS.active('%{user | username}')}`,
       '}',
       'sieve_script keel_account {',
       '  type = before',
@@ -330,7 +333,7 @@ export function renderDovecotSieve(v24) {
   return [
     header,
     'plugin {',
-    `  sieve = file:~/mail/%d/%n/${SIEVE_PATHS.mailboxDir};active=~/mail/%d/%n/${SIEVE_PATHS.active}`,
+    `  sieve = file:~/mail/%d/%n/${SIEVE_PATHS.mailboxDir};active=~/mail/%d/${SIEVE_PATHS.active('%n')}`,
     `  sieve_before = ~/${SIEVE_PATHS.globalScript}`,
     '}',
   ];

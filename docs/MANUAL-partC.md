@@ -863,7 +863,7 @@ removed), followed by `update-exim4.conf` and a reload.
   targets plain addresses, at most 4 redirects per rule) and hands it to **`vmail.sieve.write`**,
   which, as the account uid, stages the script beside its final name, compiles it with `sievec`,
   and only then replaces `~/mail/<domain>/<local>/sieve/keel.sieve` (+ `keel.svbin`) and swaps the
-  `.dovecot.sieve` symlink — or, for the account scope, `~/mail/sieve-global/keel.sieve` (Dovecot's
+  `~/mail/<domain>/.<local>.sieve` active symlink (beside the maildir, never inside it) — or, for the account scope, `~/mail/sieve-global/keel.sieve` (Dovecot's
   `sieve_before`). A rule that does not compile is `422 sieve_compile_failed` with the compiler
   lines and the previous script stays active; the last rule of a scope removed deletes the script
   (`vmail.sieve.remove`). Rows live in `panel_mail_filters` (migration `034c`); deleting a mailbox

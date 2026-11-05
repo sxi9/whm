@@ -229,6 +229,7 @@ const TOP = 10;
 
 export const goaccessOutputs = (home, domain) => ({ dir: path.join(home, STATS_DIR), html: path.join(home, STATS_DIR, `${domain}.html`), summary: path.join(home, STATS_DIR, `${domain}.summary.json`) });
 
+export const goaccessStaging = (outHtml) => outHtml.replace(/\.html$/, '.tmp.html');
 export function goaccessArgv(logFiles, outHtml) {
   return ['--no-global-config', '--log-format=COMBINED', `--output=${outHtml}`, '--output=json', ...logFiles];
 }
@@ -305,8 +306,9 @@ defineOp('stats.goaccess.run', {
     const made = await runAs('mkdir', ['-p', '-m', '0750', '--', dir], { timeoutMs: 30_000 });
     if (made.code !== 0) throw failureOf(made, `create ${path.relative(home, dir)}`);
     // The report is rendered beside its final name and renamed into place, so
-    // the panel never serves a half-written file.
-    const staging = `${out.html}.tmp`;
+    // the panel never serves a half-written file (goaccess insists on a
+    // .html/.json/.csv extension for its output file, so the staging name keeps it).
+    const staging = goaccessStaging(out.html);
     const run = await runAs(bin, goaccessArgv(logs, staging), { nice: true, timeoutMs: 120_000, maxBuffer: 256 * MiB });
     if (run.code !== 0) { await runAs('rm', ['-f', '--', staging], { timeoutMs: 30_000 }).catch(() => {}); throw failureOf(run, `goaccess for ${domain}`); }
     let report;

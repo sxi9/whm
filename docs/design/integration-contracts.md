@@ -848,11 +848,13 @@ Structured rules in the panel's own table, Sieve rendered by the panel, compiled
   passes `capabilities.has('sieve')` (sievec present ⇒ Pigeonhole installed); without it the fragment carries no `sieve`
   token at all, because Dovecot loads plugins at delivery time, not in `doveconf -n`, and an unconditional line would
   fail every LMTP delivery on a host without dovecot-sieve (re-apply the wiring after installing the package): 2.4 `sieve_script personal { type = personal; path = ~/mail/%{user | domain}/
-  %{user | username}/sieve; active_path = …/.dovecot.sieve }` + `sieve_script keel_account { type = before; path =
-  ~/mail/sieve-global/keel.sieve }`; 2.3 `plugin { sieve = file:~/mail/%d/%n/sieve;active=~/mail/%d/%n/.dovecot.sieve;
+  %{user | username}/sieve; active_path = ~/mail/%{user | domain}/.%{user | username}.sieve }` + `sieve_script keel_account { type = before; path =
+  ~/mail/sieve-global/keel.sieve }`; 2.3 `plugin { sieve = file:~/mail/%d/%n/sieve;active=~/mail/%d/.%n.sieve;
   sieve_before = ~/mail/sieve-global/keel.sieve }`. `SIEVE_PATHS` names the pieces; `agent/src/ops/vmail.js`
   `sievePaths(home, scope, mailbox)` builds the same paths (`agent/test/vmail-sieve.test.js` keeps them in step).
-  A missing script is skipped by Pigeonhole, so mailboxes without rules cost nothing. ManageSieve stays off.
+  A missing script is skipped by Pigeonhole, so mailboxes without rules cost nothing. ManageSieve stays off. The active link
+  sits beside the maildir, never inside it: Maildir++ takes every dot entry of the maildir root for a folder, and a symlink
+  there failed LMTP with "Not a directory" on nova (Dovecot 2.4.2); `panel.email.account.delete` with `removeMail` drops it.
 - **Agent ops** (`vmail.sieve.write { username, scope: 'mailbox'|'account', mailbox?, script }`, `vmail.sieve.test` same
   args, `vmail.sieve.remove { username, scope, mailbox? }`, destructive): the home comes from `/etc/passwd`
   (`assertManaged`), paths are pinned with `accountPath` (lexical + symlink containment under `/home`), a mailbox must have

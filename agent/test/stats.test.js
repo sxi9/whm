@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { exec, resolveBinary } from '../src/exec.js';
 import { runOp, createContext, OpError } from '../src/lib.js';
-import { renderAwstatsConfig, detectGenerators, GENERATORS, STATS_ROOT, domainLogFiles, logTimestamp, mergeAccessLogs, goaccessArgv, goaccessOutputs, ioniceArgv, summarizeGoaccess, STATS_DIR, SUMMARY_VERSION } from '../src/ops/stats.js';
+import { renderAwstatsConfig, detectGenerators, GENERATORS, STATS_ROOT, domainLogFiles, logTimestamp, mergeAccessLogs, goaccessArgv, goaccessOutputs, goaccessStaging, ioniceArgv, summarizeGoaccess, STATS_DIR, SUMMARY_VERSION } from '../src/ops/stats.js';
 import { asUserArgv } from '../src/ops/as-user.js';
 
 vi.mock('../src/exec.js', async (importOriginal) => {
@@ -157,6 +157,8 @@ describe('stats.goaccess (Visitors)', () => {
     const logs = ['/var/log/whm/domlogs/alice/example.com-access.log', '/var/log/whm/domlogs/alice/example.com-ssl-access.log'];
     expect(goaccessArgv(logs, '/home/alice/.keel/stats/example.com.html')).toEqual(['--no-global-config', '--log-format=COMBINED', '--output=/home/alice/.keel/stats/example.com.html', '--output=json', ...logs]);
     expect(goaccessOutputs('/home/alice', 'example.com')).toEqual({ dir: `/home/alice/${STATS_DIR}`, html: '/home/alice/.keel/stats/example.com.html', summary: '/home/alice/.keel/stats/example.com.summary.json' });
+    // goaccess 1.9 rejects an output file without a .html/.json/.csv extension ("Invalid filename extension").
+    expect(goaccessStaging('/home/alice/.keel/stats/example.com.html')).toBe('/home/alice/.keel/stats/example.com.tmp.html');
   });
 
   it('wraps the as-user command in ionice when it exists and passes it through otherwise', () => {

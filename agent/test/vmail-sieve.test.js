@@ -103,7 +103,7 @@ describe('sievePaths', () => {
     const m = sievePaths('/home/alice', 'mailbox', 'info@alice.com');
     expect(m).toEqual({
       dir: '/home/alice/mail/alice.com/info/sieve', script: `/home/alice/mail/alice.com/info/sieve/${SIEVE_SCRIPT}`, binary: `/home/alice/mail/alice.com/info/sieve/${SIEVE_BINARY}`,
-      maildir: '/home/alice/mail/alice.com/info', active: `/home/alice/mail/alice.com/info/${SIEVE_ACTIVE}`, activeTarget: `sieve/${SIEVE_SCRIPT}`,
+      maildir: '/home/alice/mail/alice.com/info', active: '/home/alice/mail/alice.com/.info.sieve', activeTarget: `info/sieve/${SIEVE_SCRIPT}`,
     });
     const g = sievePaths('/home/alice', 'account');
     expect(g.script).toBe(`/home/alice/${SIEVE_GLOBAL_DIR}/${SIEVE_SCRIPT}`);
@@ -112,15 +112,18 @@ describe('sievePaths', () => {
     expect(() => sievePaths('/home/alice', 'mailbox', 'a/../b@c.com')).toThrow(OpError);
     // service-configuration points Dovecot at the same places (2.3 and 2.4 syntax).
     expect(SIEVE_PATHS.globalScript).toBe(`${SIEVE_GLOBAL_DIR}/${SIEVE_SCRIPT}`);
-    expect(SIEVE_PATHS.active).toBe(SIEVE_ACTIVE);
+    // The active link lives beside the maildir (a dot entry inside it would be taken for a folder).
+    expect(SIEVE_ACTIVE).toBe('.<local>.sieve');
+    expect(SIEVE_PATHS.active('%n')).toBe('.%n.sieve');
+    expect(m.active.startsWith(`${m.maildir}/`)).toBe(false);
     const v24 = renderDovecotVirtualAuth({ version: '2.4.2', sieve: true });
     expect(v24).toContain('protocol lmtp {\n  auth_username_format = %{user | lower}\n  mail_plugins {\n    sieve = yes\n  }\n}');
-    expect(v24).toContain(`sieve_script personal {\n  type = personal\n  path = ~/mail/%{user | domain}/%{user | username}/sieve\n  active_path = ~/mail/%{user | domain}/%{user | username}/${SIEVE_ACTIVE}\n}`);
+    expect(v24).toContain('sieve_script personal {\n  type = personal\n  path = ~/mail/%{user | domain}/%{user | username}/sieve\n  active_path = ~/mail/%{user | domain}/.%{user | username}.sieve\n}');
     expect(v24).toContain(`sieve_script keel_account {\n  type = before\n  path = ~/${SIEVE_GLOBAL_DIR}/${SIEVE_SCRIPT}\n}`);
     const v23 = renderDovecotVirtualAuth({ version: '2.3.21', sieve: true });
     expect(renderDovecotVirtualAuth({ version: '2.4.2' })).not.toMatch(/sieve/i);
     expect(v23).toContain('protocol lmtp {\n  mail_plugins = $mail_plugins sieve\n}');
-    expect(v23).toContain(`  sieve = file:~/mail/%d/%n/sieve;active=~/mail/%d/%n/${SIEVE_ACTIVE}`);
+    expect(v23).toContain('  sieve = file:~/mail/%d/%n/sieve;active=~/mail/%d/.%n.sieve');
     expect(v23).toContain(`  sieve_before = ~/${SIEVE_GLOBAL_DIR}/${SIEVE_SCRIPT}`);
     expect(renderDovecotSieve(true).join('\n')).not.toMatch(/plugin \{|%d|%n/);
   });

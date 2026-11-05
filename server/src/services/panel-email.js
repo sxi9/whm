@@ -496,6 +496,8 @@ export function createPanelEmailService(ctx) {
       stmts.deleteMailbox.run(row.id);
       let mailRemoved = false;
       if (removeMail) {
+        // The active Sieve link sits beside the maildir; drop it with the mail (best effort: no script, no link).
+        try { await op('vmail.sieve.remove', { username: scope.username, scope: 'mailbox', mailbox: `${row.local_part}@${row.domain}` }, req); } catch { /* nothing to remove */ }
         await op('files.remove', { username: scope.username, paths: [maildirOf(scope, row.domain, row.local_part)] }, req, 'panel-files');
         mailRemoved = true;
       }
