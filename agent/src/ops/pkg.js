@@ -388,7 +388,8 @@ function sweepRuns() {
 function runAlive(state) {
   try {
     const cmdline = fs.readFileSync(`/proc/${state.pid}/cmdline`, 'utf8').split('\0').filter(Boolean);
-    return cmdline.length > 0 && path.basename(cmdline[0]) === path.basename(state.bin);
+    // A process may rewrite argv[0] as a title ("node (vitest 1)"); the binary name is its first word.
+    return cmdline.length > 0 && path.basename(cmdline[0].split(' ')[0]) === path.basename(state.bin);
   } catch { return false; }
 }
 

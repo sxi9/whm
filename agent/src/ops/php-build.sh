@@ -25,7 +25,7 @@ rm -f "$KEEL_PHP_PREFIX/.keel-build-ok"
 trap 'rc=$?; if [ $rc -ne 0 ] && [ $fresh = 1 ]; then rm -rf -- "$KEEL_PHP_PREFIX"; fi; exit $rc' EXIT
 
 cd "$KEEL_PHP_SRC"
-echo "== configure PHP $KEEL_PHP_MINOR for $KEEL_PHP_PREFIX ($KEEL_PHP_JOBS jobs)"
+echo "== configure PHP" "$KEEL_PHP_MINOR" "for" "$KEEL_PHP_PREFIX" "($KEEL_PHP_JOBS jobs)"
 ./configure \
   --prefix="$KEEL_PHP_PREFIX" \
   --with-config-file-path="$KEEL_PHP_PREFIX/lib" \

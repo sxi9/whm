@@ -787,8 +787,8 @@ describe('pkg.php.build', () => {
     fs.mkdirSync(dirs.WHM_PKG_RUN_DIR, { recursive: true });
     const live = path.join(dirs.WHM_KEEL_PHP_DIR, '.build-live');
     fs.mkdirSync(live);
-    fs.writeFileSync(path.join(live, 'keel-build.json'), JSON.stringify({ minor: '8.4', startedAt: new Date(Date.now() - 5 * 3600_000).toISOString(), runId: 'run-live' }));
-    fs.writeFileSync(path.join(dirs.WHM_PKG_RUN_DIR, 'run-live.json'), JSON.stringify({ id: 'run-live', bin: process.execPath, pid: process.pid, status: 'running', startedAt: new Date().toISOString(), timeoutMs: 90 * 60_000 }));
+    fs.writeFileSync(path.join(live, 'keel-build.json'), JSON.stringify({ minor: '8.4', startedAt: new Date(Date.now() - 5 * 3600_000).toISOString(), runId: 'build-0123456789ab' }));
+    fs.writeFileSync(path.join(dirs.WHM_PKG_RUN_DIR, 'build-0123456789ab.json'), JSON.stringify({ id: 'build-0123456789ab', bin: process.execPath, pid: process.pid, status: 'running', startedAt: new Date().toISOString(), timeoutMs: 90 * 60_000 }));
     if (linux) {
       expect((await opError(runOp('pkg.php.build', { minor: '8.4' }, ctx))).code).toBe('in_use');
       expect((await opError(runOp('pkg.php.build.finish', { minor: '8.4' }, ctx))).code).toBe('build_failed');
@@ -796,8 +796,8 @@ describe('pkg.php.build', () => {
       expect(exec).not.toHaveBeenCalled();
     }
     // The run finished: the marker is stale however young it is.
-    fs.writeFileSync(path.join(dirs.WHM_PKG_RUN_DIR, 'run-live.json'), JSON.stringify({ id: 'run-live', bin: process.execPath, pid: process.pid, status: 'finished', code: 2, startedAt: new Date().toISOString(), timeoutMs: 90 * 60_000 }));
-    fs.writeFileSync(path.join(live, 'keel-build.json'), JSON.stringify({ minor: '8.4', startedAt: new Date().toISOString(), runId: 'run-live' }));
+    fs.writeFileSync(path.join(dirs.WHM_PKG_RUN_DIR, 'build-0123456789ab.json'), JSON.stringify({ id: 'build-0123456789ab', bin: process.execPath, pid: process.pid, status: 'finished', code: 2, startedAt: new Date().toISOString(), timeoutMs: 90 * 60_000 }));
+    fs.writeFileSync(path.join(live, 'keel-build.json'), JSON.stringify({ minor: '8.4', startedAt: new Date().toISOString(), runId: 'build-0123456789ab' }));
     exec.mockImplementation(buildMock({}));
     await runOp('pkg.php.build', { minor: '8.4' }, ctx);
     expect(fs.existsSync(live)).toBe(false);
