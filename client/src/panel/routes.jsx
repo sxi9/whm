@@ -2,6 +2,7 @@ import { Navigate } from 'react-router-dom';
 import { PanelLayout } from './PanelLayout.jsx';
 import { PanelHome } from './PanelHome.jsx';
 import { PanelFunctionPage, PanelNotFoundPage } from './PanelPage.jsx';
+import { PanelPluginPage } from './PanelPluginPage.jsx';
 import { PANEL_FUNCTIONS, PANEL_PATHS } from './nav.js';
 import { PANEL_PAGE_REGISTRY } from './registry.js';
 
@@ -22,6 +23,9 @@ export const panelRoutes = [
       { index: true, element: <PanelHome /> },
       { path: 'change-password', element: <Navigate to={PANEL_PATHS.password} replace /> },
       ...panelFunctionRoutes,
+      // Pages of enabled plugins with audience 'panel' (contract §53); one dynamic
+      // route serves them all, as plugins/:pluginId/* does in the admin shell.
+      { path: 'plugins/:pluginId/*', element: <PanelPluginPage /> },
       { path: '*', element: <PanelNotFoundPage /> },
     ],
   },

@@ -1306,3 +1306,309 @@ Reports are the account's own files, rendered and read back as the account; noth
   version is never removed; the offered list is a panel-only filter — root and reseller listings (`GET /php/versions`)
   are unchanged; a PPA is added only after its series answered 200 (or the probe could not run); `pkg.repo.status` never
   writes; every package name on the removal argv came from the package manager's own listing under a fixed glob.
+
+## 53. Plugin pages in the account panel (`ui.pages[].audience`, `ctx.plugins.uiCatalog({ audience })`, `/api/panel/plugins`) (P2-1)
+- **SDK (`plugins/sdk/validate-manifest.js`, `HOST_API_VERSION` 1.1.0):** `ui.pages[]` and `ctx.ui.registerPage()` descriptors take
+  `audience: 'admin' | 'panel'` (`PAGE_AUDIENCES`); a missing key means `'admin'`, so every 1.0 manifest keeps its meaning and
+  `engines.whm: "^1.0.0"` still satisfies the host. Only `PANEL_PAGE_KINDS = table | form | markdown | html` may be panel pages
+  (`AUDIENCE_KIND`: settings and action pages drive root-only manage routes); a `ui.sidebar[]` entry may not point at a panel page
+  (`AUDIENCE`: the admin sidebar is admin-only, the panel lists its pages itself). `manifest.schema.json` mirrors the enum.
+- **Host (`server/src/services/plugins.js`):** `uiCatalog({ audience = 'admin' })` — admin: `[{ id, name, version, sidebar, pages }]`
+  with only admin pages; panel: `[{ id, name, version, pages }]` with only panel pages, plugins without one omitted. `pageFile(id, rel,
+  { audience = 'admin' })` only serves a file declared by a page of that audience (404 otherwise). `dispatch(id, req, res, { panel })`:
+  with a panel scope the route must list the `'user'` role whoever the principal is (an administrator logged in as the account
+  included; 403 `FORBIDDEN` otherwise) and the handler gets `req.panel = { username, accountId, domain, mode: 'user' | 'acting',
+  actingAs: { by, expiresAt } | null }`; without a scope (the `/api/plugins/<id>` path) a role-user principal is refused outright, so
+  `req.panel` is always present when `req.user.role === 'user'`. The mock host (`callRoute(method, path, { panel })`) does the same.
+- **Routes (`server/src/routes/panel/plugins.js`, behind `panelScope`, feature `plugins`, no `panel:*` token scope — reads with
+  `panel:read`, mutations session-only):** `GET /api/panel/plugins/ui` → the panel catalog; `GET /api/panel/plugins/ui/:id/file?path=`
+  → `{ kind, content }`; `ANY /api/panel/plugins/:id/*` → `dispatch` with `req.panel`. 501 `capability_missing` without the host,
+  403 `feature_disabled` when the plan turns `plugins` off (seeded `true`), 404 for a disabled plugin.
+- **Client:** `panel/hooks/usePanelPlugins.js` (`PanelPluginProvider` in `PanelLayout`, enabled by `hasFeature('plugins')`;
+  `panelPluginEntries` → function-like entries `{ key: 'panel-plugin:<id>:<route>', path: '/panel/plugins/<id><route>',
+  categorySlug: 'software' }` appended to the Software group by `withPluginEntries` for the sidebar, the home grid and search),
+  `panel/PanelPluginPage.jsx` on route `plugins/:pluginId/*` (reuses `pages/plugins/PluginPage.jsx`'s `PluginPageView` with
+  `baseUrl=/panel/plugins/<id>` and `uiBase=/panel/plugins/ui`), nav function `panel:software/plugins` (`/panel/software/plugins`,
+  feature `plugins`) listing every panel page per plugin. The admin shell is unchanged (`GET /api/plugins/ui` carries admin pages only).
+- **Sample plugin:** `net.whm.sample-notes` ships `/my-notes` (`audience: 'panel'`, table over `GET /my-notes` with `roles: ['user']`,
+  filtered by `req.panel.username`); the signed fixture was regenerated.
+- **Invariants:** an admin page or an admin-only handler is never reachable through the panel scope; a panel handler never trusts a
+  username from the request; a page's data and files come only from the panel endpoints, which never answer without a pinned account.
+- Tests: `plugins/sdk/test/validate-manifest.test.js`, `plugins/sample-plugin/test/main.test.js`, `server/test/panel-plugins.test.js`,
+  `client/test/panel-plugins.test.jsx`.
+
+## 54. Customer panel: Optimize website and Hotlink protection (`ctx.panelHtaccess.optimize/hotlink`, agent grammar in `htaccess-web.js`) (P2-6)
+Both are new fields of the one panel-managed `.htaccess` block of §47; nothing is stored in SQLite and no new agent op exists.
+- **Agent** (`agent/src/ops/htaccess-web.js`, imported by `htaccess.js`): `blockSchema` gains `deflate: { types: [DEFLATE_TYPES…] ≥ 1 } | null`
+  and `hotlink: { hosts: [hostname] 1..100, extensions: [HOTLINK_EXTENSIONS…] ≥ 1, allowBlank = true, redirect: url | null } | null`.
+  `DEFLATE_TYPES` is the pinned MIME catalogue (HTML, plain/XML text, CSS, JavaScript, JSON, XML feeds, SVG, fonts — never
+  images, video or archives); `HOTLINK_EXTENSIONS` the pinned extension catalogue (image, audio/video, pdf/zip/rar/7z — never a
+  script extension). `renderBlock` emits, inside `<IfModule mod_deflate.c>`, `  AddOutputFilterByType DEFLATE <types>` (catalogue
+  order, six per line) and, inside `<IfModule mod_rewrite.c>`, `  RewriteEngine On`, `  RewriteCond %{HTTP_REFERER} !^$` (only when
+  `allowBlank`), one `  RewriteCond %{HTTP_REFERER} !^https?://(www\.)?<host with dots escaped>(:[0-9]+)?(/|$) [NC]` per host and
+  `  RewriteRule \.(ext|…)$ - [F,NC,L]` or `  RewriteRule \.(ext|…)$ <redirect> [R=302,NC,L]`. The grammar (`WEB_GRAMMAR`, part of
+  `validateBlock`) accepts exactly those lines: a host must round-trip through the escape, extensions must be catalogue members
+  without repeats, the target is `-` for `F` and a `HOTLINK_REDIRECT` URL for `R=302`. `HOTLINK_REDIRECT` is `http(s)://<hostname>[:port][/path][?query]`
+  over `[A-Za-z0-9._~!*'(),:@&=+;/-]` only — no whitespace, quote, backslash, `$`, `%`, `#` or brackets, so no back-reference, variable
+  expansion or flag can be smuggled into the substitution — and a target whose path ends in a protected extension is refused
+  (`redirectLoops`) so the redirect cannot loop. `parseBlock` reads the fields back; a rule without any host line counts as `foreign`.
+  Hosts are stored as given (the service strips `www.`); the rule allows both forms.
+- **Service** `ctx.panelHtaccess` (`services/panel-htaccess.js`, which now resolves paths with `path.posix`):
+  `optimize.get(scope, { path })` → `{ path, domain, mode: off|all|custom, types, available, managed }`;
+  `optimize.set(scope, { path, mode, types })` (feature `optimizews`, folder pinned by `resolveDir`, `custom` with no catalogue
+  type → 422; audit `panel.optimize.set`). `hotlink.get(scope)` → `{ path: 'public_html', domain, enabled, hosts (extra only),
+  extensions, allowBlank, redirect, domains (the account's own hostnames without www., main first), available, defaults, max, managed }`;
+  `hotlink.set(scope, { enabled, hosts, extensions, allowBlank, redirect })` (feature `hotlink`; always `public_html`, so addon and
+  subdomain folders inherit; the account's own domains from `ctx.panelDomains.allDomains` — main, addon, sub, parked — are always
+  allowed and the body's `hosts` are the extras, `www.` stripped, deduplicated, 100 in all; `enabled` with no extension or a looping
+  redirect → 422; audit `panel.hotlink.set` with counts, never the host list). Both write through the §47 `patch` → `files.htaccess.set`
+  path with the loopback probe (`config_invalid` → 422, file restored). `service.constants` exposes the catalogues to the route.
+- **Routes** (`routes/panel/advanced.js`, no token scope → mutations session-only): `GET /api/panel/advanced/optimize?path=`,
+  `PUT /api/panel/advanced/optimize { path, mode, types? }`, `GET /api/panel/advanced/hotlink`, `PUT /api/panel/advanced/hotlink
+  { enabled, hosts?, extensions?, allowBlank?, redirect? }` (hosts `fields.hostname`, extensions from the catalogue, redirect
+  `HOTLINK_REDIRECT`).
+- **Client:** `pages/panel/advanced/optimize-website.jsx` (FolderPicker, three modes, grouped type picker) and
+  `pages/panel/advanced/hotlink-protection.jsx` (status, own domains, extra hosts, direct-request switch, grouped extensions, redirect);
+  nav `advanced/optimize-website` (feature `optimizews`, new in `DEFAULT_FEATURES`) and `advanced/hotlink-protection` (feature `hotlink`,
+  already seeded); keys `panel.advanced.*`.
+- **Host:** `mod_deflate` and `mod_rewrite` enabled (Debian's default set has deflate; rewrite is what WordPress permalinks already
+  need); both blocks are `IfModule`-guarded so a host without them serves the site unchanged. Verify with
+  `curl -sI -H 'Accept-Encoding: gzip' https://<domain>/` → `Content-Encoding: gzip`, and an image with `-H 'Referer: https://evil.example/'`
+  → 403 while the own referer → 200.
+- Tests: `agent/test/files-htaccess-web.test.js`, `server/test/panel-htaccess-web.test.js`, `client/test/panel-htaccess-web.test.jsx`.
+
+## 55. Customer panel: Dynamic DNS (`ctx.panelDdns`, public `GET /api/panel/dns/ddns/:token`) (P2-8)
+A per-record credential that moves one A/AAAA record of the account's own zone to the caller's address without a
+session. `services/panel-ddns.js` owns tokens and the public call; the record write goes through `ctx.dns.updateRecord`
+with the account's `ownerPrincipal`, so the zone-editor rules (ownership, protected types, publish, `delegation`) apply.
+- **Storage (migration `034e_panel-ddns.sql`):** `panel_ddns_tokens(id, account_id, zone_id, record_id, label, token_hash
+  UNIQUE, last_ip, last_used_at, updates, created_at)` — every foreign key cascades, so a token dies with its record
+  (zone rewrite, record deleted) or account. The token is `crypto.randomToken(32)` (43 base64url chars), stored as
+  `crypto.hashToken` (SHA-256 hex), looked up by hash and confirmed with `constantTimeEqual`; the plain value leaves the
+  server once, in the `create` answer.
+- **Scoped routes (`routes/panel/ddns.js`, `panelRouter(ctx, 'dns')`, feature `ddns`, scope `panel:dns`):**
+  `GET /api/panel/dns/ddns` → `{ tokens: [{ id, label, zone, recordId, name, host, type, value, lastIp, lastUsedAt,
+  updates, createdAt }], zones: [{ domain, delegation, records: [{ id, name, type, value, host }] }], baseUrl, max }` (the
+  zones come from `ctx.panelDns.zones`, `records` are the zone's A/AAAA rows only, `max` = 20 per account);
+  `POST /api/panel/dns/ddns { domain: hostname, recordId, label?: ≤64 }` → 201 `{ token, secret, url, delegation }` —
+  404 for a zone or record not of this account, 422 for a record that is not A/AAAA, 422 `not_delegated` when
+  `delegation.delegatedHere === false` (a record written here would not be published), 409 `limit_reached` at 20;
+  `DELETE /api/panel/dns/ddns/:id` → `{ revoked: true, id }`. Audit `panel.dns.ddns.create` / `panel.dns.ddns.revoke`.
+  `POST` and `DELETE` are `sessionOnly` (403 `session_required` over an API token, as for `/panel/tokens`: a token never
+  mints a credential that outlives it); `GET` stays readable with `panel:read`/`panel:dns`.
+- **Public route (mounted before `requireAuth`, like `/panel/sso`; a `routes/panel/*.js` mount marked `public: true`
+  is lifted to `/panel<path>` by `routes/categories/panel.js`):** `GET /api/panel/dns/ddns/:token[?ip=][&format=text]`,
+  express-rate-limit 60 calls / 15 min per address, attached to the public handlers only (the scoped list/create/revoke
+  share the prefix and are never counted). `GET /api/panel/dns/ddns/update[?ip=][&format=text]` is the same call with the
+  token as the HTTP basic password, any user name (`routes/panel/ddns.js` `headerToken`), for clients that keep secrets
+  out of paths; `update` cannot collide with a token (not 43 chars). Not `Bearer`: `attachUser` reads every Bearer
+  header as an API token and answers 401 for an unknown one before the public mounts run. The pino request serializer
+  redacts the token of both path forms (`app.js` `redactLoggedUrl`, also for `/panel/sso/:kind/:token`).
+  The token must match `^[A-Za-z0-9_-]{43}$` and exist, else
+  `404 token_unknown` (malformed, unknown and revoked look alike); a suspended account answers 423. `ip` is the
+  query value or, absent that, `req.ip` with Node's `::ffff:` prefix stripped; it must be an IPv4 for an A record and an
+  IPv6 for an AAAA record (`fields.ipv4` / `fields.ipv6`), else 422 with `fields.ip`. An unchanged value writes
+  nothing (`changed:false`); otherwise `ctx.dns.updateRecord(domain, recordId, { value }, owner, req)` runs and the
+  answer carries its `serial` and `applied`. Answer `{ zone, host, type, ip, changed, serial, applied }`, or with
+  `format=text` the ddclient-style `good <ip>` / `nochg <ip>` line. `last_ip`/`last_used_at`/`updates` are kept per
+  token; audit `panel.dns.ddns.update` (target = account username, args carry the caller address).
+- **Client:** `pages/panel/dns/dynamic-dns.jsx` (nav `dns/dynamic-dns`, feature `ddns`, i18n `panel.ddns.*`): the
+  token table with revoke, a create modal (zone → A/AAAA record → label; zones with `delegatedHere === false` are
+  listed disabled) and the one-time URL modal with a cron example; a `DelegationBanner` per zone served elsewhere.
+- **Invariants:** no session, cookie or CSRF on the public call — the token is the whole credential and it is never
+  echoed by any listing; the write path is the zone editor's (NS/SOA stay unreachable because only A/AAAA rows can be
+  bound); a zone whose public DNS is elsewhere never gets a token; the rate limiter is per caller address and separate
+  from the login limiter.
+
+## 56. Customer panel: Virus scanner (`ctx.panelVirus`, agent `sec.clamav.scan_as`) (P2-9)
+- **Agent** (`agent/src/ops/sec-clamav-as.js`, its own family file so `sec.js` never imports `as-user.js`):
+  `sec.clamav.scan_as { username, path, maxDurationSec ≤ 900 }` → `accountPath()` (home from `/etc/passwd`, lexical + real
+  containment, allowed roots) then `clamdscan --fdpass --no-summary --infected --stdout -- <real path>` through `asUser()`
+  (`setpriv`/`runuser`, `nice -n 10`), so the account opens every file itself and clamd scans by descriptor: nothing the
+  account cannot read is scanned and a planted symlink reaches only what the account may already reach. `timeoutMs`
+  15 min at the op (`CLAMAV_AS_TIMEOUT_MS`) and the exec; a timeout is `OpError('timeout')`. Output parsed with
+  `parseClamscanOutput` (`FOUND` / `ERROR` lines kept apart); exit 2 with nothing parsed → `capability_missing` when clamd
+  is not reachable, `not_found` for a missing path, else `command_failed`. Returns
+  `{ username, home, path, infected: [{ file, signature }], errors: [{ file, error }], exitCode, durationMs }`.
+- **Service** `ctx.panelVirus` (`services/panel-virus.js`, created by `routes/panel/virus.js`, feature `virusscan`):
+  `status(scope, req)` → `{ scanner: { installed, version, signatures, databaseAgeSec } (sec.clamav.detect; absent agent
+  op → installed:false), scopes, active, history }`; `start(scope, { scope: 'home' | 'mail' | 'public_html' }, req)` pins
+  the folder under `account.home_dir` (`targetOf`, 422 otherwise), `501 CapabilityError('clamav')` without the engine,
+  `409 scan_running` (fields.job) while this account has a `panel.clamav.scan` job queued or running, then enqueues
+  `panel.clamav.scan { accountId, username, ownerId, actor, scope, path, rel }` (audit `panel.clamav.scan`). The job
+  (`run`) acts for the owner read back at run time (`jobScope`, as WordPress), re-derives the path from the account row,
+  calls `sec.clamav.scan_as` with a 15 min + 30 s client timeout, logs each finding, and returns
+  `{ scope, path, infected: [{ file (relative to the home), signature }], errors, exitCode, durationMs, finishedAt }`
+  (audit `.done` / `.failed`). `removeInfected(scope, { paths }, req)` delegates to `ctx.panelFiles.remove` (its pinning,
+  `.ssh` guard, `filemanager` gate and audit) and audits `panel.clamav.remove`. `getJob/streamJob/history` restricted to
+  `JOB_TYPES` with `params.accountId === scope.accountId`; `shapeJob` strips `ownerId`, `accountId` and the absolute `path`.
+- **Routes** (`/api/panel/virus-scanner`, `panelRouter(ctx, 'virus-scanner')` — no token scope, mutations session-only):
+  `GET /`, `POST /scans` (202), `GET /scans/:id[/stream]`, `POST /infected/remove { paths: relPath[1..200] }`.
+- **Shared edits:** `DEFAULT_FEATURES.virusscan = true` (+ FeatureManager label), nav *Security › Virus scanner*
+  (`slug: 'virus-scanner'`, phase 2), `panel.security/virus-scanner.*` + `panel.virus.*` in `en.json`.
+- **Host:** `clamav-daemon` running with its socket reachable by account users (Debian default `LocalSocketMode 666`,
+  `/var/run/clamav/clamd.ctl`) and a signature database fetched by `freshclam`; `setpriv` (present). Not changed: the
+  root-side `sec.clamav.scan/targets` ops used by the ImunifyAV plugin.
+
+## 57. Customer panel: upload transport — raw chunks by index, resume from the received list (P2-11)
+- **Replaces** the JSON `PUT /api/panel/files/uploads/:id/chunks { data: <base64> }` appender (no other caller used it;
+  the backups and transfers upload routes keep their own JSON chunk bodies and are not touched).
+- **Begin** `POST /api/panel/files/uploads { path, name, size, overwrite }` → `201 { id, path, name, size, received, chunks,
+  chunkBytes, chunkCount, receivedChunks: [], expiresAt }`. `chunkBytes` is **pinned per upload** when it begins
+  (`panel.upload_chunk_bytes`, default 1,310,720, clamped to 1 KiB … `MAX_CHUNK_BYTES` = 2 MiB so the base64 form stays
+  under the agent's 3 MiB `chunk_write` bound); `chunkCount = ceil(size / chunkBytes)`. Chunk *i* is the bytes
+  `[i·chunkBytes, min((i+1)·chunkBytes, size))`.
+- **Chunk** `PUT /api/panel/files/uploads/:id/chunks/:index` with `Content-Type: application/octet-stream` and the raw bytes
+  (`express.raw`, limit `MAX_CHUNK_BYTES` → `413 too_large` past it; any other content type → `415 unsupported_media_type`;
+  empty body, an index ≥ `chunkCount` or a length other than the chunk's → `422`). The server writes it at its offset as
+  the account (`files.chunk_write { offset, truncate }`: the first chunk written truncates the file to its offset, every
+  later one keeps the rest, so chunks arrive in any order) and answers the status shape with `receivedChunks` (sorted
+  indices) and `received` (bytes). A chunk sent twice (a retry whose first answer was lost) is written again and counted
+  once. `req.body` is replaced by `{}` before the response so the automatic audit row carries `<id>/<index>` as target and
+  no args. Quota stays the kernel's verdict (a failed `dd` surfaces as the agent error).
+- **Resume** `GET /api/panel/files/uploads/:id` → the same shape; the client sends `missingChunks(chunkCount,
+  receivedChunks)` and nothing else. **Finish** `POST …/finish` needs every chunk (`422` with the first missing indices in
+  `fields.data`), audits `panel.files.upload { path, bytes, chunks }` once; **abort** removes the part if anything was
+  written.
+- **Client** (`files/parts/UploadModal.jsx`): `uploadFile()` sends chunks sequentially with `api.putRaw` (`api.sendRaw(method,…)`
+  in `api/client.js`); a transport failure (fetch rejected, 408/429/502/503/504) waits `RESUME_DELAYS_MS` (1 s … 30 s, 8
+  tries), re-reads the status and continues with what is missing; any other error aborts. Drag-and-drop: the file list
+  (`fm-droptarget`, `filesOfDrop()` keeps files, counts folders) and the upload dialog both accept a drop; folders are
+  reported, never uploaded. No new page: the transport ships under the existing *Files › File manager* nav entry and the
+  `filemanager` feature; i18n keys `panel.files.drop_here|drop_to_upload|upload_reconnecting|folders_skipped_one|_other`.
+- **Agent:** `files.chunk_write` gains `offset` (int ≥ 0, default 0); argv `dd of=<target> bs=1M seek=<offset>
+  oflag=seek_bytes [conv=notrunc] status=none` (`chunkWriteArgv`), GNU coreutils ≥ 8.20. No host step.
+- Tests: `server/test/panel-files.test.js` (uploads), `client/test/panel-upload-transport.test.jsx`,
+  `agent/test/files.test.js` (offset schema + argv).
+
+## 58. Customer panel: quota source note on the Usage page (P2-13)
+- **No new route, op, migration, nav entry or feature flag.** `GET /api/panel/usage` is unchanged: `disk.source` is
+  `'repquota'` when the quota capability answered for the account, else `'scan'`, and `disk.lastRefresh` is the
+  server-wide `account_info.disk_refreshed_at` setting (ISO string, SQLite `YYYY-MM-DD HH:MM:SS` or `null`). The page
+  ships under the existing *Usage › Usage* entry and the `usage` feature.
+- **Client (`client/src/pages/panel/usage/usage.jsx`):** `scanAge(lastRefresh, now)` → `null` without a parsable
+  timestamp, else `{ ms, tone }` with `tone` `ok` under 24 h (`SCAN_STALE_MS`), `warn` from 24 h, `bad` from 7 days
+  (`SCAN_OLD_MS`); `ageLabel(ms, t)` renders *just now / {n} minutes ago / {n} hours ago / {n} days ago*.
+  `ScanSourceNote({ disk, now, t })` renders nothing when `disk.source !== 'scan'`; otherwise a kit banner above the stat
+  grid (`data-scan-source="ok|warn|bad|never"`): `banner-info` + `role="status"` for a fresh scan, `banner-warning` +
+  `role="alert"` with the *Refresh figures* hint when stale or when there was never a scan (then the disk value is
+  called out as the plan figure, not a measurement). The disk tile's note becomes *From the last scan, {age}*.
+- i18n keys `panel.usage.age_just_now|age_minutes|age_hours|age_days`, `panel.usage.scan_source_title|scan_source_text|
+  scan_source_never|scan_source_never_text|scan_source_hint`. Tests: `client/test/panel-usage-scan-note.test.jsx`.
+
+## 59. Customer panel: wording and accessibility (`PLAN_SETTING_CODES`, `panel/Meter.jsx`, menu/tabs ARIA, https home links) (P2-12)
+
+- **Plan-setting errors by code, not status.** `client/src/panel/PanelPage.jsx` exports `PLAN_SETTING_CODES`
+  (`shell_disabled`, `feature_disabled`, `plan_disabled`), `isPlanSettingError(error)` and `isCapabilityError(error)` (501 /
+  `capability_missing` / `binary_not_found` **minus** the plan codes). `PanelCapabilityState` renders a plan code as
+  *Not included in your plan* (`panel.shell.feature_disabled_title`, the server's `message`, `feature_disabled_help`) and
+  only a real capability error as *Not available on this server*. A server route that refuses because of a plan setting
+  keeps its status (`501 shell_disabled` from `routes/panel/security.js`) but must use one of the listed codes; a new plan
+  code is added to `PLAN_SETTING_CODES`, never matched by status.
+- **Meters.** `client/src/panel/Meter.jsx` exports `Meter({ percent, label, text, name, tone, style })`: `role="progressbar"`
+  with `aria-valuemin/max/now` (clamped 0–100, rounded), `aria-valuetext` = the figure shown and `aria-label` =
+  `panel.shell.meter_value` (`{label}: {text}`); with `percent == null` it is `aria-hidden`. Every panel bar goes through it
+  (`PanelHome.UsageMeters`, `usage/usage.jsx` `Meter` → `Stat` passes `label` and `value + sub`, `email/accounts.jsx` quota and
+  plan meters). `.meter` markup (`<div class="meter tone"><span style="width:n%">`) and `data-meter` are unchanged.
+- **User menu.** `PanelTopBar.jsx`: the button carries `aria-haspopup="menu"`, `aria-expanded`, `aria-controls="panel-user-menu"`
+  and `aria-label` (`panel.shell.user_menu`); the popup is `role="menu"` `id="panel-user-menu"` `aria-labelledby`, every entry
+  `role="menuitem"` (the meta row is `presentation`); while open, **Escape** closes and refocuses the button, `mousedown` /
+  `touchstart` outside the `.menu` closes. The `onMouseLeave` close is gone.
+- **Domain tabs.** `domains/domains.jsx`: the segmented filter is `role="tablist"` (`aria-label` `panel.domains.filter_label`),
+  each button `role="tab"` `id="panel-domains-tab-<key>"` `aria-controls="panel-domains-list"` with roving `tabIndex` and
+  ArrowLeft/ArrowRight; the table sits in `<div id="panel-domains-list" role="tabpanel" aria-labelledby=…>`.
+- **https home links.** `Meter.jsx` exports `sslLive(ssl)` (`installed && state !== 'stored' && !expired && (daysRemaining == null
+  || > 0)`) and `siteUrl(domain, ssl)`. `PanelHome` loads `GET /api/panel/domains` (the list the Domains page uses; not gated by
+  `sslmanager`) and hands `DomainsList` a `{ [domain]: rows[].ssl }` map; the link is `https://<domain>` when live, else `http://`.
+  The decision uses that endpoint rather than `/ssl/domains` because it needs no plan feature and already carries the trimmed
+  certificate per hostname.
+- i18n keys `panel.shell.meter_value`, `panel.shell.user_menu`, `panel.domains.filter_label`. No route, migration, nav entry or
+  feature flag. Tests: `client/test/panel-a11y.test.jsx`, additions in `panel-layout.test.js`, `panel-overview.test.js`;
+  `e2e/panel-check.cjs` step 3c (menu roles + Escape + click-outside, progressbars, `aria-controls`, https link vs the API's `ssl`).
+
+
+## 60. Customer panel: Track DNS (`ctx.panelDnsTrack`, agent `dns.lookup` / `dns.trace`) (P2-7)
+Two read-only probes run on this server for the account: a record lookup with `dig` and a route trace with
+`traceroute`. Nothing is written and nothing is scoped to the account's own zones (any public name may be looked up, as in
+cPanel's Track DNS); the only caller input is one name or address, pinned by three schemas in a row (route, agent op,
+`exec` argv) so it can never become an option or a shell token. A literal address must be public (`isPublicAddress` in
+`services/panel-dns-track.js`, mirrored in the agent op): loopback, unspecified, 10/8, 172.16/12, 192.168/16, 100.64/10,
+169.254/16, 224/4, 240/4, ::1, fc00::/7, fe80::/10, ff00::/8 and the v4-mapped forms answer 422, and the agent also refuses
+the bare label `localhost`, so the host is never used to map its own network or probe a metadata endpoint.
+- **Agent ops (`agent/src/ops/dns-track.js`):** `dns.lookup { name: hostname | IPv6, type: A|AAAA|MX|NS|TXT|CNAME|SOA|PTR =
+  'A' }` runs `dig +short +time=3 +tries=1 <name> <type>` (for `PTR` with a literal address: `dig +short +time=3 +tries=1
+  -x <ip>`), 15 s cap, `allowFailure`, → `{ name, type, answers: [line], notes: [';;' diagnostics], error: null | 'timeout' |
+  'failed', exitCode, output }`. `dns.trace { host: hostname | IPv6 }` runs `traceroute -n -w 2 -m 20 <host>`, 60 s cap, →
+  `{ host, header, target: ip | null, hops: [{ hop, address, addresses[], rtts[ms], timeouts }], reached, error: null |
+  'unknown_host' | 'timeout' | 'failed', exitCode, output }`; a run killed by the cap answers `error: 'timeout'` with no
+  hops instead of throwing. A missing program throws `capability_missing` with `details.package` = `dnsutils` /
+  `traceroute` (the hint the operator installs; `bind-utils` on RHEL). The agent hostname regex refuses a leading `-`,
+  spaces, `/`, upper case and anything over 253 characters; an IPv4 matches it, an IPv6 goes through `arg.ipv6`.
+- **Service (`services/panel-dns-track.js`, `ctx.panelDnsTrack`):** `lookup(scope, { name, type }, req)` → `{ name, type,
+  answers, notes, error, checkedAt }`; `trace(scope, { host }, req)` → `{ host, target, hops, reached, error, output,
+  checkedAt }`. Both require the scope (`panel_scope_required` 403) and feature `traceroute` (403 `feature_disabled`;
+  seeded `true` in the default list). One trace at a time per account: a second call while one runs answers
+  `409 busy`. An agent `capability_missing` / `binary_not_found` becomes `CapabilityError(<package>)` (501, `capability`
+  = `dnsutils` or `traceroute`).
+- **Routes (`routes/panel/dns-track.js`, `panelRouter(ctx, 'dns')`, scope `panel:dns`, reads so `panel:read` tokens pass):**
+  `GET /api/panel/dns/track/lookup?name=&type=` and `GET /api/panel/dns/track/trace?host=`; `name` / `host` must be
+  `fields.hostname` (lower-cased, at least one dot) or `fields.ip`, `type` one of the eight; anything else is 422
+  `validation_failed` with `fields.name` / `fields.host` / `fields.type` before the agent is called. No audit rows: nothing
+  changes.
+- **Client (`pages/panel/dns/track.jsx`, nav `dns/track`, feature `traceroute`, i18n `panel.dnstrack.*`):** two cards
+  (*Domain lookup*: name defaulted to the account's main domain + type select; *Trace route*: host), results as tables
+  (`data-lookup="<name>"` / `data-trace="<host>"`), 501 → `PanelCapabilityState`, 403 `feature_disabled` →
+  `FeatureDisabledState`, other errors in `ErrorBanner`. Exports `LookupResult`, `TraceResult`, `isTarget`, `LOOKUP_TYPES`.
+- **Invariants:** no shell, a pinned argv with the target as the last element (after `-x` for reverse lookups), no name
+  ever starts with `-`; read-only, no DB access; the feature gate and the panel scope stay in front of every call; the
+  60 s trace cap is the agent's, the API waits 65 s for it. Tests: `agent/test/dns-track.test.js` (schemas refuse
+  injection before `exec`, argv pinning, parsers, capability hint), `server/test/panel-dns-track.test.js` (422 on
+  injection, feature gate, 501 with the package capability, 409 busy, shapes), `client/test/panel-dns-track.test.jsx`
+  (nav/feature/catalogue, forms, result tables, 501/403 states). Host packages: `dnsutils`, `traceroute`.
+## 61. Customer panel: Database wizard (`pages/panel/databases/wizard.jsx` over `ctx.panelDatabases`) (P2-4)
+A guided three-step page, client-side only: it composes the existing panel database calls and adds no route, service
+method, migration or agent op. Every step is a real write, so a run abandoned after step 1 or 2 leaves a database (and a
+user) that the Databases / Database users pages manage as usual — the wizard never holds unsaved state across a reload.
+- **Step 1 (database):** `POST /api/panel/databases { name, charset? }` (MySQL only shows the charset; PostgreSQL sends
+  the name alone) → `201 { name }`. The page reads `GET /api/panel/databases` for `meta.prefix`, `meta.engine` and
+  `meta.quota` and applies the Databases page rules (`quotaOf`): `max === 0` → "not included", `used >= max` → the form
+  is disabled with the plan notice, 501 → `PanelCapabilityState` above the form, 403 `feature_disabled` →
+  `FeatureDisabledState`.
+- **Step 2 (user):** `POST /api/panel/databases/users { name, password }` → `201 { name, hosts, grants: [] }`. The name
+  is prefilled with the short database name; the password must reach `passwordStrength ≥ 65` as on the users page and is
+  never kept after the call. No `databases` array is sent: access is granted in step 3 so the customer sees and may trim
+  it. A link to Database users lets the customer leave here and attach an existing user instead.
+- **Step 3 (grants):** `PUT /api/panel/databases/users/:user/grants { grants: toPayload(matrix) }` with the
+  `PrivilegeGrid` of `parts/GrantsEditor.jsx` over a one-column matrix (`initialMatrix(database)` = `ALL PRIVILEGES`
+  ticked; the engine's privilege list from `parts/shared.jsx`). An empty set sends `grants: []` ("Finish without
+  access"). The answer's `changes` count is toasted.
+- **Done:** a `KeyValue` card with database, user, host `localhost` and the privilege summary (`summarizePrivileges`),
+  plus "Create another" (resets every field) and links to the two management pages.
+- **Nav / feature / i18n:** `databases/wizard` (`panel:databases/wizard`, label *Database wizard*) with plan feature
+  `dbwizard` (seeded `true` in `DEFAULT_FEATURES`; it only hides the entry — the API calls stay gated by `mysql` /
+  `postgres` as before, so a plan without databases still answers 403 here). Keys `panel.databases/wizard.*` and
+  `panel.databases.wizard_*`; shared strings reuse the `panel.databases.*` keys of the other pages.
+- **Invariants:** nothing on this page bypasses the per-call checks of `panel-databases.js` (prefixing, ownership of the
+  database named in the grants, plan limits, audit rows `panel.db.create` / `panel.db.user.create` /
+  `panel.db.grants`); the wizard sends only names the server already returned. Tests:
+  `client/test/panel-database-wizard.test.jsx` (nav/feature/catalogue, the three states of step 1, 501/403, helpers).
+
+## 62. Customer panel: Errors page (`ctx.panelLogs.errors`, `GET /api/panel/logs/errors`) (P2-5)
+No new agent op, table or setting: the page is a second reader over the listing and range read that the Access logs tail
+already uses (§4.11 of the customer-panel design).
+- **Service:** `ctx.panelLogs.errors(scope, { lines = 300, domain = null }, req)` → `{ lines, domain, domains, files, warnings,
+  apache, nginx }`; `files: [{ name, kind: 'apache'|'nginx', domain | null, location: 'server'|'home', size, mtime,
+  lines: [string… newest first], truncated }]`, newest `mtime` first. The feature is `errlog` (not `rawlog`: cPanel gates the
+  Errors page separately). Both web servers are listed through the existing `listing(scope, kind)`; an absent NGINX
+  (`CapabilityError`) is skipped and reported as `nginx: false`, never as an error. A file qualifies when its name matches
+  `ERROR_LOG` = `/[._-](ssl[._-]?)?error(_log|\.log)?$/i` — the live log only, never a rotated `.1` or archived `.gz` copy — and
+  its `domain` is the longest own hostname whose `domainLogFile` pattern matches (null for a file under `~/logs`). The
+  range read per file is `min(MAX_TAIL_BYTES, max(64 KiB, lines × 256))` bytes from the end through the same `acct.read_range`
+  with the account as owner; `lines` is capped at `ERRORS_MAX_LINES` (1000); `truncated` is true when the read started
+  inside the file or more lines were read than returned. `domain` must be one of the account's own hostnames (404 otherwise).
+- **Route:** `GET /api/panel/logs/errors?lines=1..1000&domain=` (`fields.domain`, optional), 403 `feature_disabled`,
+  501 when no web server is installed at all (the Apache listing's own capability error passes through).
+- **Client:** `pages/panel/logs/errors.jsx` (key `panel:logs/errors`, nav *Logs › Errors*, feature `errlog`): domain filter,
+  100/300/500/1000 lines, follow every 10 s, one card per file with the lines newest first. Keys `panel.logs/errors.*` and
+  `panel.logs.errors_*`; shared strings reuse `panel.logs.*`.
+- Tests: `server/test/panel-logs-errors.test.js`, `client/test/panel-logs-errors.test.jsx`.

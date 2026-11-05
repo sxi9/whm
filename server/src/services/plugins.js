@@ -17,7 +17,10 @@ import { PanelEvents } from '../lib/events.js';
 // return shape; only the storage behind it differs (SQLite, the panel services,
 // the agent, the data directory).
 
-export const HOST_API_VERSION = '1.0.0';
+export const HOST_API_VERSION = '1.1.0';
+// Where a page is served (SDK ui.pages[].audience); a page without the key is
+// an administration-shell page, so every 1.0 manifest keeps its meaning.
+export const pageAudience = (page) => page?.audience || 'admin';
 export const MAX_STORE_VALUE_BYTES = 1024 * 1024;
 export const MAX_FS_BYTES = 100 * 1024 * 1024;
 export const MAX_PACKAGE_BYTES = 20 * 1024 * 1024;
@@ -991,7 +994,12 @@ export function createPluginHost(ctx) {
   }
 
   // Express handler for /api/plugins/:id/* (mounted after requireAuth).
-  async function dispatch(id, req, res) {
+  // `panel` is the account scope when the call came through /api/panel/plugins/<id>/…:
+  // only routes that list the 'user' role answer there, whoever the principal is
+  // (an administrator logged in as the account included), and the handler finds
+  // the pinned account as req.panel. Through /api/plugins/<id>/… a role-user
+  // principal is refused outright, so a 'user' route always carries req.panel.
+  async function dispatch(id, req, res, { panel = null } = {}) {
     const entry = live.get(id);
     const m = String(req.method).toUpperCase();
     const routePath = req.path || '/';
@@ -999,7 +1007,11 @@ export function createPluginHost(ctx) {
     const route = entry.routes.find((r) => r.method === m && r.re.test(routePath));
     if (!route) { res.status(404).json({ error: { code: 'NOT_FOUND', message: `no route ${m} ${routePath}` } }); return; }
     const principal = req.user;
-    if (!route.roles.includes(principal.role)) { res.status(403).json({ error: { code: 'FORBIDDEN', message: `role "${principal.role}" may not call ${m} ${routePath}` } }); return; }
+    if (panel) {
+      if (!route.roles.includes('user')) { res.status(403).json({ error: { code: 'FORBIDDEN', message: `${m} ${routePath} is not open to account holders` } }); return; }
+    } else if (principal.role === 'user') {
+      res.status(403).json({ error: { code: 'FORBIDDEN', message: 'account holders call plugin routes through /api/panel/plugins/<id>/' } }); return;
+    } else if (!route.roles.includes(principal.role)) { res.status(403).json({ error: { code: 'FORBIDDEN', message: `role "${principal.role}" may not call ${m} ${routePath}` } }); return; }
     const match = route.re.exec(routePath);
     const pathParams = {};
     try {
@@ -1012,6 +1024,7 @@ export function createPluginHost(ctx) {
     const facadeReq = {
       method: m, path: routePath, params: pathParams, query: clone(req.query) || {}, body: Buffer.isBuffer(req.body) ? req.body : clone(req.body),
       user: { id: principal.id, username: principal.username, role: principal.role }, headers: clone(headers) || {}, requestId: req.id, plugin: entry.id, ip: req.ip,
+      ...(panel ? { panel: { username: panel.username, accountId: panel.accountId, domain: panel.account?.domain ?? null, mode: panel.mode, actingAs: panel.actingAs ? { by: panel.actingAs.by, expiresAt: panel.actingAs.expiresAt } : null } } : {}),
     };
     const state = { statusCode: 200, sent: false };
     const send = (status, payload) => {
@@ -1785,14 +1798,22 @@ export function createPluginHost(ctx) {
     return { token, expiresAt: new Date(expiresAt).toISOString() };
   }
 
-  function uiCatalog() {
-    return [...live.values()].filter((e) => e.state === 'enabled').map((e) => ({ id: e.id, name: e.manifest.name, version: e.manifest.version, sidebar: e.manifest.ui?.sidebar || [], pages: e.pages.slice() }));
+  // The administration catalog carries the sidebar entries and the admin pages;
+  // the account-panel catalog only the panel pages (no sidebar: the panel lists
+  // them under its own group). A plugin without a page for the audience is left out.
+  function uiCatalog({ audience = 'admin' } = {}) {
+    if (!['admin', 'panel'].includes(audience)) throw new HttpError(422, 'validation_failed', `unknown audience "${audience}"`);
+    return [...live.values()].filter((e) => e.state === 'enabled').map((e) => {
+      const pages = e.pages.filter((p) => pageAudience(p) === audience);
+      if (audience === 'admin') return { id: e.id, name: e.manifest.name, version: e.manifest.version, sidebar: e.manifest.ui?.sidebar || [], pages };
+      return pages.length ? { id: e.id, name: e.manifest.name, version: e.manifest.version, pages } : null;
+    }).filter(Boolean);
   }
 
-  function pageFile(id, rel) {
+  function pageFile(id, rel, { audience = 'admin' } = {}) {
     const entry = live.get(id);
     if (!entry || entry.state !== 'enabled') throw notFound(`Plugin "${id}"`);
-    const page = entry.pages.find((p) => p.file === rel);
+    const page = entry.pages.find((p) => p.file === rel && pageAudience(p) === audience);
     if (!page) throw notFound('Page file');
     const abs = path.resolve(entry.dir, rel);
     const realDir = fs.realpathSync(entry.dir);

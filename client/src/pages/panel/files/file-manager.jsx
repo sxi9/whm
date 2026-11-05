@@ -13,7 +13,7 @@ import { useT, translate } from '../../../i18n/useT.js';
 import { fill, plural } from '../../../i18n/fill.js';
 import { RequestError, PathBar } from './parts/common.jsx';
 import { FileEditor } from './parts/FileEditor.jsx';
-import { UploadModal } from './parts/UploadModal.jsx';
+import { UploadModal, filesOfDrop } from './parts/UploadModal.jsx';
 import { PermissionsModal } from './parts/PermissionsModal.jsx';
 import { CompressModal, ExtractModal } from './parts/ArchiveModals.jsx';
 import { normalizeRel, joinRel, parentOf, listPath, downloadHref, diskUsageHref, isArchiveName, isEditable, looksLikeText, filterEntries, sortEntries, isCapabilityError, isFeatureDisabled, MAX_TEXT_BYTES } from './parts/paths.js';
@@ -82,8 +82,24 @@ export default function FileManager({ fn }) {
   const [compress, setCompress] = useState(null);
   const [extract, setExtract] = useState(null);
   const [uploading, setUploading] = useState(false);
+  const [dropped, setDropped] = useState(null);
+  // Counted, not boolean: every child the pointer crosses fires enter/leave.
+  const [dragDepth, setDragDepth] = useState(0);
 
   useEffect(() => { setSelected([]); setQ(''); setGoTo(dir); }, [dir]);
+
+  const dragFiles = (e) => Array.from(e.dataTransfer?.types || []).includes('Files');
+  const onDragEnter = (e) => { if (!dragFiles(e)) return; e.preventDefault(); setDragDepth((d) => d + 1); };
+  const onDragLeave = (e) => { if (!dragFiles(e)) return; setDragDepth((d) => Math.max(0, d - 1)); };
+  const onDragOver = (e) => { if (!dragFiles(e)) return; e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; };
+  const onDrop = (e) => {
+    if (!dragFiles(e)) return;
+    e.preventDefault(); setDragDepth(0);
+    const { files, folders } = filesOfDrop(e.dataTransfer);
+    if (folders && !files.length) { toast.error(t('panel.files.folders_not_uploadable', 'Folders cannot be uploaded as such: compress them first and extract the archive here.')); return; }
+    if (!files.length) return;
+    setDropped(files); setUploading(true);
+  };
 
   const navigate = useCallback((to) => {
     const clean = normalizeRel(to);
@@ -199,6 +215,8 @@ export default function FileManager({ fn }) {
         </span>
       </>
     )}>
+      <div className={`fm-droptarget${dragDepth ? ' active' : ''}`} onDragEnter={onDragEnter} onDragLeave={onDragLeave} onDragOver={onDragOver} onDrop={onDrop} data-testid="fm-droptarget">
+      {dragDepth > 0 && <div className="fm-drop-hint" aria-live="polite"><Upload size={20} aria-hidden="true" /> {fill(t('panel.files.drop_to_upload', 'Drop files to upload them to {dir}'), { dir: dir ? `~/${dir}` : '~' })}</div>}
       <Card padded={false}>
         <div className="card-body" style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <Button size="sm" icon={ArrowUp} onClick={() => navigate(parentOf(dir))} disabled={!dir} aria-label={t('panel.files.up_one_level', 'Up one level')} title={t('panel.files.up_one_level', 'Up one level')} />
@@ -246,6 +264,7 @@ export default function FileManager({ fn }) {
           <span><Link to={diskUsageHref(dir)}><HardDrive size={12} style={{ verticalAlign: '-2px' }} /> {t('panel.files.disk_usage_of_folder', 'Disk usage of this folder')}</Link></span>
         </div>
       </Card>
+      </div>
 
       <NameModal open={modal?.kind === 'new-folder'} title={t('panel.files.new_folder', 'New folder')} label={t('panel.files.folder_name', 'Folder name')} help={<>{t('panel.files.created_in', 'Created in')} {here} {t('panel.files.with_mode_0755', 'with mode 0755')}</>} confirmLabel={t('panel.files.create_folder', 'Create folder')} busy={busy} error={modalError} onClose={closeModal} onSubmit={createFolder} existing={names} />
       <NameModal open={modal?.kind === 'new-file'} title={t('panel.files.new_file', 'New file')} label={t('panel.files.file_name', 'File name')} help={<>{t('panel.files.empty_file_in', 'An empty file in')} {here}{t('panel.files.open_afterwards', '; open it afterwards to add content')}</>} confirmLabel={t('panel.files.create_file', 'Create file')} busy={busy} error={modalError} onClose={closeModal} onSubmit={createFile} existing={names} />
@@ -263,7 +282,7 @@ export default function FileManager({ fn }) {
       </Modal>
 
       <FileEditor path={editing} open={Boolean(editing)} confirmDiscard={confirm} onClose={() => setEditing(null)} onSaved={(res) => { toast.success(fill(t('panel.files.saved_name', '{path} saved'), { path: res.path })); refetch(); }} />
-      <UploadModal open={uploading} dir={dir} onClose={() => setUploading(false)} onDone={(n) => { if (n) toast.success(plural(t, 'panel.files.files_uploaded', n, '{count} file uploaded', '{count} files uploaded')); refetch(); }} />
+      <UploadModal open={uploading} dir={dir} initialFiles={dropped} onClose={() => { setUploading(false); setDropped(null); }} onDone={(n) => { if (n) toast.success(plural(t, 'panel.files.files_uploaded', n, '{count} file uploaded', '{count} files uploaded')); refetch(); }} />
       <PermissionsModal entry={permFor} path={permFor ? relOf(permFor) : ''} onClose={() => setPermFor(null)} onSaved={(res) => { toast.success(fill(t('panel.files.mode_now', '{name} is now {mode}'), { name: permFor.name, mode: res.mode })); setPermFor(null); refetch(); }} />
       <CompressModal paths={compress} dir={dir} onClose={() => setCompress(null)} onFinished={(ev) => jobFinished(ev, t('panel.files.compressing', 'Compressing'))} />
       <ExtractModal archive={extract} onClose={() => setExtract(null)} onFinished={(ev) => jobFinished(ev, t('panel.files.extracting', 'Extracting'))} />

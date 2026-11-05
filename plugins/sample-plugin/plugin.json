@@ -78,7 +78,10 @@
       { "route": "/settings", "title": "Settings", "kind": "settings" },
       { "route": "/digest", "title": "Send digest now", "kind": "action", "job": "digest", "confirm": true, "description": "Runs the digest job immediately." },
       { "route": "/about", "title": "About", "kind": "markdown", "file": "pages/about.md" },
-      { "route": "/widget", "title": "Widget", "kind": "html", "file": "pages/widget.html" }
+      { "route": "/widget", "title": "Widget", "kind": "html", "file": "pages/widget.html" },
+      { "route": "/my-notes", "title": "Notes about my account", "kind": "table", "audience": "panel", "icon": "notebook", "description": "Notes your hosting provider attached to this account.", "source": "/my-notes", "columns": [
+        { "key": "title", "label": "Title" }, { "key": "category", "label": "Category" }, { "key": "createdAt", "label": "Created" }
+      ] }
     ]
   },
   "i18n": { "default": "en", "dir": "locales" }

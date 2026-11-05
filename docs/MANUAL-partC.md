@@ -236,6 +236,18 @@ account's **owner** ([C.7](#c7-how-the-panel-keeps-to-one-account)).
   mention counts as enabled (cPanel semantics). Favourites are stored in the browser
   (`localStorage` key `whm.panel.favorites`, separate from the console's) and the collapsed state
   under `whm.panel.sidebar.*`.
+- **Accessibility and wording (P2-12):** the user menu is a WAI-ARIA menu (`role="menu"`, every
+  entry a `menuitem`; **Escape** closes it and returns focus to its button, as does a click or tap
+  anywhere outside it); every usage bar (home tiles, *Usage*, mailbox quotas, the mailbox plan
+  meter) is a `progressbar` whose value is the percentage and whose value text is the figure shown
+  ("512 MB of 1.00 GB"); a bar without a percentage (unlimited, or not in the plan) is hidden from
+  assistive technology; the type filter on *Domains › Domains* is a tab list whose tabs point at
+  the list (`aria-controls`) and move with the arrow keys; the domain links on the home page open
+  `https://` when a certificate is installed and still valid on the domain (the per-domain `ssl`
+  entry of `GET /api/panel/domains`), `http://` otherwise. A `501 shell_disabled` and every
+  other plan-setting code (`feature_disabled`, `plan_disabled`) is worded **"Not included in your
+  plan"** with the server's message and *Ask your hosting provider about upgrading the plan*; only a
+  missing daemon or tool says *Not available on this server*.
 - **Top bar:** a search over the panel functions (**Alt /** focuses it; eight best matches by
   label, group and description), the account chip and the user menu (*Change password*,
   *Two-factor authentication*, the help/documentation/support links from *Panel › Customization*,
@@ -476,6 +488,62 @@ that before delegating.
   saved record is confirmed with the same reminder instead of "published". The records are still written
   to BIND (the server may become authoritative later); nothing is refused.
 
+#### 3.2 Dynamic DNS
+
+- **Purpose:** keep an A or AAAA record pointed at a connection whose address changes (a home or office
+  line, a NAS, a camera) through a private update URL that a router or a cron job opens.
+- **Who:** plans with the `ddns` feature (on by default); also while acting.
+- **Screen:** the account's update URLs (record, label, current value, last update with the caller's
+  address, number of updates) with *Revoke*; *Create update URL* picks a zone, one of its A/AAAA
+  records and an optional label (up to 64 characters), then shows the URL **once** with *Copy* and a
+  ready-made cron line (`*/5 * * * * curl -fsS '<url>?format=text'`). At most 20 URLs per account.
+- **Using the URL:** `GET <url>` sets the record to the address the call came from;
+  `GET <url>?ip=203.0.113.9` sets it to that address (an IPv4 for an A record, an IPv6 for an AAAA
+  record). The answer is JSON (`{ zone, host, type, ip, changed, serial, applied }`) or, with
+  `?format=text`, the ddclient-style line `good 203.0.113.9` / `nochg 203.0.113.9`. Most routers'
+  "custom dynamic DNS" setting takes the URL as is; the username and password fields stay empty.
+- **Keeping the token out of URLs:** a client that would rather not put the secret in a path (web-server
+  access logs keep paths) calls `GET /api/panel/dns/ddns/update` with HTTP basic authentication where the
+  password is the token and the user name is anything (`curl -fsS -u router:<token>
+  '<base>/update?format=text'`; in a router's custom dynamic DNS form: URL `<base>/update`, user name
+  `router`, password the token). A `Bearer` header is the panel's API-token credential and is refused
+  (401). The panel's own request log never records the token either way.
+- **Server:** `GET|POST /dns/ddns`, `DELETE /dns/ddns/:id` behind the panel login (creating and revoking
+  needs a browser session: an API token cannot mint another credential); the update URL
+  `GET /api/panel/dns/ddns/<token>` (or `/update` with the header) needs no login — the token (43 random
+  characters, stored only as a hash) is the credential. 60 update calls per 15 minutes per caller address;
+  the panel page itself is not counted.
+- **Needs:** BIND (`named`), as for the zone editor; without it the record is saved and published later.
+- **Gotchas:** a wrong address family answers `422` (`ip`); an unknown, revoked or mistyped token answers
+  `404 token_unknown`; a record you delete in the zone editor takes its URL with it. Anyone holding the
+  URL can move the record: keep it private and revoke it when the device is retired (the panel never shows
+  it again). **Zones whose public DNS is managed elsewhere** (the banner of §3.1) cannot get an update URL
+  (`422 not_delegated`): the record changed here would not be published; use the dynamic DNS of that
+  provider instead.
+
+#### 3.3 Track DNS
+
+- **Purpose:** look up the records of any domain as this server's resolvers see them, and trace the path
+  packets take from this server to a host — the first things to check when "the site does not open".
+- **Who:** plans with the `traceroute` feature (on by default); also while acting.
+- **Screen:** *Domain lookup* — *Domain or host* (your main domain is filled in) and *Record type* (A, AAAA, MX,
+  NS, TXT, CNAME, SOA, PTR; for PTR enter the IP address), *Look up* lists the answers one per row ("No records of
+  this type were found" when the name exists without that type, "No name server answered in time" after 3 s).
+  *Trace route* — *Host or IP address*, *Trace* shows one row per hop (number, address, up to three round-trip
+  times; `*` for a probe that got no reply, "no reply" for a hop that answered nothing) and whether the host was
+  reached within 20 hops. A trace can take up to a minute; only one runs at a time per account.
+- **Server:** `GET /dns/track/lookup?name=&type=` (`dig +short`, 3 s per try, one try) and
+  `GET /dns/track/trace?host=` (`traceroute -n -w 2 -m 20`, 60 s cap). Read-only: nothing is written and nothing
+  is logged in the audit. A literal address must be public: loopback, private (10/8, 172.16/12, 192.168/16,
+  fc00::/7), carrier-grade NAT, link-local, multicast and `localhost` answer `422` — the tool looks outward,
+  never into the server's own network.
+- **Needs:** `dig` (`dnsutils` on Debian/Ubuntu, `bind-utils` on RHEL) and `traceroute`; without one of them the
+  card answers `501` ("Not available on this server") and names the package in `capability`.
+- **Gotchas:** the name must be a hostname with at least one dot or an IP address — an option, a space or a
+  shell character answers `422` with `fields.name` / `fields.host`; a second trace while one runs answers
+  `409 busy`; the lookup asks this server's resolvers, so a record you just changed may still show the old value
+  until its TTL passes (the zone editor's *Public DNS* tile tells you where the zone is served).
+
 ## 4. SSL
 
 Routes under `/ssl` (`services/panel-ssl.js`), all behind the plan feature `sslmanager`. Every
@@ -536,15 +604,20 @@ Routes under `/files` (`services/panel-files.js`); the whole group needs the pla
 - **Who:** feature `filemanager`; also while acting.
 - **Screen:** a directory listing (name, type, size, modified, mode, owner; up to 10,000 entries
   per directory, 2,000 by default, with a *truncated* notice), **New folder** (mode, default
-  `0755`), **Upload** (any size up to 20 GiB, sent in chunks of `panel.upload_chunk_bytes` —
-  1,310,720 bytes — with *Overwrite*), **Download**, **Edit** (text files up to 4 MiB in the
+  `0755`), **Upload** (any size up to 20 GiB, sent as raw chunks of `panel.upload_chunk_bytes` —
+  1,310,720 bytes, at most 2 MiB — with *Overwrite*; files can also be **dragged onto the listing**
+  or onto the upload dialog, folders are skipped with a note; an upload interrupted by a connection
+  loss **resumes where it stopped** — the dialog shows *connection lost, retrying* and retries for
+  about two minutes before giving up), **Download**, **Edit** (text files up to 4 MiB in the
   editor; a file containing a NUL byte is refused as *binary*), **Rename/Move** (with
   *Overwrite*), **Copy**, **Permissions** (octal mode, *Recursive*), **Delete** (1–200 paths),
   **Compress** (1–500 paths into a `.zip` or `.tar.gz`) and **Extract** (into a folder) — the last
   two as jobs with a progress log.
 - **Server:** `GET /files/list|stat|read|download`, `PUT /files/write`, `POST /files/mkdir|rename|
-  copy|chmod`, `DELETE /files`, `POST /files/uploads` → `PUT /files/uploads/:id/chunks` →
-  `POST /files/uploads/:id/finish|abort`, `POST /files/archive|extract` (`202`). Writes go through a
+  copy|chmod`, `DELETE /files`, `POST /files/uploads` → `PUT /files/uploads/:id/chunks/:index`
+  (`application/octet-stream`, chunk *index* at its offset; `GET /files/uploads/:id` lists
+  `receivedChunks` for a resume) → `POST /files/uploads/:id/finish|abort`, `POST /files/archive|extract`
+  (`202`). Writes go through a
   private temporary file and an atomic rename; downloads are streamed in 8 MiB ranges.
 - **Needs:** `setpriv`/`runuser` (capability `panel-files`); `zip`, `unzip`, `tar`, `gzip` for
   compress/extract (capability `archive`). A home directory must exist (`409 no_home` otherwise).
@@ -716,7 +789,29 @@ removed), followed by `update-exim4.conf` and a reload.
 - **Purpose:** scoring thresholds, allow and block lists.
 - **Who:** feature `spamassassin`; also while acting.
 - **Screen:** *Enabled*, *Required score* (1–20, one decimal), *Auto-delete* above a score,
-  *Allow list* and *Block list* (up to 200 addresses each).
+  *Allow list* and *Block list* (up to 200 addresses each), and a *How spam scoring works* card
+  with the text below.
+- **How thresholds work (per account, as in cPanel's Spam Filters):** every incoming message is
+  given a score by SpamAssassin — the more spam-like its sender, links and wording, the higher the
+  number. The *spam threshold* (cPanel's *required score*, `required_score` in
+  `~/.spamassassin/user_prefs`) is the score at which a message is marked as spam for **this account
+  only**: each account on the server keeps its own threshold and lists, and nothing here changes
+  another account's filtering or the server defaults. `5` is the usual starting point; lower values
+  catch more spam and also more newsletters and notifications, higher values let more through (the
+  screen shows a strict / balanced / lenient hint next to the field). *Auto-delete* uses a second,
+  higher score (never below the threshold) so that only obvious spam is discarded and borderline mail
+  still reaches the junk folder. The *Allow list* and *Block list* override the score for the senders
+  named (`whitelist_from` / `blacklist_from`). The server stores both thresholds also in Exim's
+  per-domain spam list, where the DATA ACL reads them (score ×10).
+- **When the threshold applies:** only when the mail server hands incoming mail to a scanner. A
+  host that runs the **light Exim build without content scanning** (Debian/Ubuntu's
+  `exim4-daemon-light` — the build on `nova`) delivers mail unscored: the page shows *Spam filtering
+  is not available on this server* with the reason, explains that a per-account threshold would have
+  nothing to compare against, and refuses to save, so a threshold is never stored as if it filtered
+  anything. The threshold takes effect once the operator installs the content-scanning build and
+  SpamAssassin (MANUAL-partB, mail setup); until then the other mail settings keep working. The
+  threshold is per account, not per mailbox: Exim PRDR (per-recipient scanning) is not used, so all
+  addresses of the account share one score.
 - **Server:** `GET/PUT /email/spam` → `~/.spamassassin/user_prefs` written **as the account**
   (`0600`, key/value lines only) and the Exim per-domain spam list (threshold ×10, auto-delete).
   `GET` answers `available`, `reason` and `detail`: `available:false` with `exim_missing`,
@@ -981,6 +1076,27 @@ prefix when it is missing, regardless of the console's `db.prefixing` setting.
   profile, and on MySQL (user names of 32 characters at most) an account name longer than 28
   characters answers `409 sso_unavailable`.
 
+#### 7.5 Database wizard
+
+- **Purpose:** create a database, a user for it and the user's privileges in three guided steps —
+  what a new site needs before its installer asks for connection details.
+- **Who:** feature `dbwizard` (on by default) shows the page; the calls themselves still need
+  `mysql`/`postgres` and count against `max_sql` like the other pages; also while acting.
+- **Screen:** a step list (*Database → User → Privileges*). **Step 1** is the create form of
+  §7.1 (name with the fixed prefix, character set on MySQL); **Step 2** creates the user (name
+  prefilled with the database's short name, password with the generator — it is shown only now;
+  *Skip* leads to Database users if you would rather attach an existing user); **Step 3** is the
+  privilege grid of §7.2 for that one database with *All privileges* ticked — untick to narrow it
+  or clear everything and *Finish without access*. The final card lists database, user, host
+  (`localhost`) and the privilege summary; *Create another* starts again, *Start over* in the
+  header does the same from any step.
+- **Server:** the same calls as §7.1–7.2 in order: `POST /databases`, `POST /databases/users`
+  (without `databases`), `PUT /databases/users/:name/grants`. Nothing new.
+- **Gotchas:** every step is saved when you press *Next step*. If you leave after step 1 or 2 the
+  database (and user) already exist and show up on the other pages — delete them there if you do
+  not want them. A reload returns to step 1 (there is no draft); the plan-limit and "not included"
+  notices of §7.1 apply to step 1.
+
 ## 8. FTP
 
 #### 8.1 FTP accounts
@@ -1114,6 +1230,21 @@ only the archives generated or uploaded from the panel** (`retention_class = pan
 - **Needs:** `goaccess` installed (`501` with an install prompt otherwise — `apt install goaccess`,
   RHEL `goaccess` from EPEL); `setpriv`/`runuser`. Without visitors there is nothing to generate: the
   page says so until the first request reaches the site.
+
+#### 11.4 Errors
+
+- **Purpose:** the newest lines of every error log of your domains, in one place.
+- **Who:** feature `errlog`; also while acting.
+- **Screen:** pick a domain (or *All domains*) and how many lines (100, 300, 500 or 1000; default 300);
+  one card per error log — Apache and NGINX, the server-side `<domain>-error.log` / `-ssl_error_log` and
+  any `*error.log` in your own logs folder — with the newest line at the top, the file size and when it
+  was last written. *Refresh every 10 seconds* keeps it current while you reproduce a problem; "older
+  lines not shown" means the file holds more than the chosen number. Rotated (`.1`) and archived (`.gz`)
+  copies stay on the Access logs page.
+- **Server:** `GET /logs/errors?lines=&domain=` → `{ lines, domain, domains, files: [{ name, kind, domain,
+  location, size, mtime, lines, truncated }], warnings, apache, nginx }`; each file is read from its end
+  through the same owner-checked range op as the tail, never more than 1 MiB per file.
+- **Needs:** a web server writing per-domain error logs; without one the page says so (contract §62).
 
 ## 12. PHP
 
@@ -1255,6 +1386,31 @@ Routes under `/security` and `/tokens`. Mutations here are **session-only** (an 
   own address locks you out of the website, not out of the panel; the loopback probe always comes
   from `127.0.0.1`, so it cannot tell you whether your own address is blocked.
 
+#### 13.7 Virus scanner
+
+- **Purpose:** scan your files for malware with ClamAV and delete what it flags.
+- **Who:** feature `virusscan`; also while acting; starting a scan and deleting files are
+  session-only (`403 session_required` over a token; the status is readable with `panel:read`).
+- **Screen:** the engine version and the age of its signature database; *What to scan* — the
+  entire home directory, *Mail* (`mail/`) or *Websites* (`public_html/`); **Scan now** opens the
+  progress view of the scan; *Recent scans* lists the last ten with their result (clean, N infected,
+  failed) and opens the infected list of each. An infected file is shown with its path and the
+  signature that matched; *Delete* removes one, *Delete all infected files* every one of them.
+- **Server:** `GET /virus-scanner` (scanner state, scopes, the active job, the last ten scans), `POST /virus-scanner/scans { scope: home | mail | public_html }` (`202`, job
+  `panel.clamav.scan`; `409 scan_running` while one of yours is queued or running; `501` when ClamAV is
+  not installed), `GET /virus-scanner/scans/:id` and `…/stream` (your own jobs only, anything else
+  `404`), `POST /virus-scanner/infected/remove { paths[] }` (the file manager's own removal, so the
+  same path rules apply). The scan runs **as your account** (`clamdscan --fdpass`, niced): the files
+  are opened by your user and handed to the ClamAV daemon by descriptor, so nothing your account
+  cannot read is ever scanned and the daemon needs no access to your home. One scan is capped at
+  **15 minutes**; a bigger tree times out (`failed`) — scan `public_html/` or `mail/` on their own.
+  Audit `panel.clamav.scan` (+ `.done` / `.failed`), `panel.clamav.remove`.
+- **Gotchas:** the scan changes nothing by itself — quarantine is deleting from the list; a flagged
+  plugin or theme is better reinstalled from its source than deleted on its own; files the account
+  cannot read are counted as skipped, not as infected; the signature database is updated by the
+  server (`freshclam`), so "updated N days ago" is your provider's job; on a server without
+  `clamav-daemon` the page says so and the API answers `501`.
+
 ## 14. Usage
 
 #### 14.1 Usage
@@ -1266,7 +1422,11 @@ Routes under `/security` and `/tokens`. Mutations here are **session-only** (an 
   the time of the last server-wide disk refresh), **Bandwidth** (this month against the limit and
   the monthly history), **Objects** (domains, subdomains, addon and parked domains, mailboxes,
   forwarders, databases, FTP accounts against their limits), the effective limits of the plan;
-  **Refresh** asks the server to re-measure disk usage.
+  **Refresh** asks the server to re-measure disk usage. When the server has no quota tools the disk
+  figure is only as fresh as the last scan, so a note above the meters says how old it is (*Disk
+  figures are from a scan 3 hours ago*, with the exact time); past a day it turns into a warning
+  with the refresh hint, and before any scan it tells you the number is the plan figure, not a
+  measurement.
 - **Server:** `GET /usage`; `POST /usage/refresh` → `202` (reuses *Account Information*'s
   server-wide disk-refresh job, a running one is reused).
 - **Gotchas:** a refresh is accepted once per account every 10 minutes (`429 rate_limited`);
@@ -1296,6 +1456,49 @@ group, so its mutations are session-only.
 - **Gotchas:** a file in `errors/` the panel did not write is listed as *managed: false* and left
   untouched (only the `ErrorDocument` line is managed); `401` pages are shown after a failed sign-in
   to a protected folder; the probe after a change hits the document root, not the error page.
+
+#### 15.2 Optimize website
+
+- **Purpose:** send pages, styles, scripts, feeds, SVG and fonts compressed (gzip) so visitors on
+  slow connections get them sooner.
+- **Who:** feature `optimizews`; also while acting.
+- **Screen:** pick a folder (`public_html` by default; the rule applies to it and everything
+  below it, so `public_html` covers the main site and every addon or subdomain folder under it);
+  choose *Disabled*, *Compress all content* or *Compress the selected types* with a grouped list
+  of content types (pages and feeds, styles/scripts/SVG, fonts). Photos, video and archives are
+  never on the list: they are already compressed and would only cost CPU.
+- **Server:** `GET /advanced/optimize?path=`, `PUT /advanced/optimize { path, mode, types }`.
+  The agent writes an `<IfModule mod_deflate.c>` block with `AddOutputFilterByType DEFLATE
+  <types>` into the folder's managed `.htaccess` block (grammar-checked, probe + rollback as in
+  §5.3). Audit `panel.optimize.set`.
+- **Gotchas:** check the result with a tool that shows response headers
+  (`curl -sI -H 'Accept-Encoding: gzip' https://example.com/` → `Content-Encoding: gzip`); a browser
+  always asks for compression, so there is nothing to switch on client-side. If the server has no
+  `mod_deflate`, the block is skipped by Apache and the site serves uncompressed files.
+
+#### 15.3 Hotlink protection
+
+- **Purpose:** stop other websites from embedding your images and files directly (and using your
+  bandwidth).
+- **Who:** feature `hotlink`; also while acting.
+- **Screen:** *Status* shows whether protection is on, the account's own domains (always allowed,
+  `www.` implied, addon/sub/parked included) and the folder (`public_html`, which every site of the
+  account inherits); the *Block hotlinking* switch; under *Rules*: other sites allowed to embed your
+  files (partner sites, a CDN — hostnames, `www.` is stripped), *Allow direct requests* (a request
+  without a `Referer` — typed address, bookmark, privacy settings, feed readers — is let through;
+  on by default), the protected file types grouped as images, audio/video, documents/archives
+  (default: jpg, jpeg, jpe, png, gif, webp, bmp), and *Send blocked requests to*: empty answers
+  `403 Forbidden`, an `http(s)` address redirects (302) instead.
+- **Server:** `GET /advanced/hotlink`, `PUT /advanced/hotlink { enabled, hosts, extensions,
+  allowBlank, redirect }`. The agent writes an `<IfModule mod_rewrite.c>` block: one
+  `RewriteCond %{HTTP_REFERER}` per allowed host and one `RewriteRule \.(ext|…)$` with `[F]` or
+  `[R=302]`, grammar-checked like the rest of the family. Audit `panel.hotlink.set` (counts only).
+- **Gotchas:** the redirect target must not be one of the protected file types itself (the panel
+  refuses it, otherwise the "no hotlinking" image would be blocked too); a page of your own site
+  that is opened through a privacy proxy stripping the Referer is blocked only when *Allow direct
+  requests* is off; Google Images and similar previews stop working for the protected types, which
+  is usually the point; the rules live in `public_html/.htaccess` between the panel's markers and
+  WordPress or other rewrite rules above them are kept.
 
 ---
 
@@ -1345,6 +1548,23 @@ group, so installs, updates and removals are session-only; the list is readable 
   lacks WP-CLI and `php-mysql` + `unzip`, the page says what to ask your provider for and the API answers
   `501`; only `en_US` is downloaded without WP-CLI (`locale` is passed to the installer, which installs
   the language pack later from the dashboard).
+
+#### 16.2 Plugins
+
+- **Purpose:** pages that plugins your hosting provider installed expose to account holders.
+- **Who:** feature `plugins`; also while acting.
+- **Screen:** one card per plugin with its pages; each page opens at `/panel/plugins/<plugin id>/<page>`
+  inside the account panel (a table, a form, a help text or an embedded widget — never a plugin's
+  settings or a job trigger, which belong to the administrator). The pages also appear in the
+  *Software* group of the sidebar, in the home tool grid and in search, and can be pinned as favorites.
+- **Server:** `GET /plugins/ui` (the pages marked for the account panel), `GET /plugins/ui/:id/file?path=`
+  (a page's markdown or html file), and `/plugins/<id>/…` for the data a table reads or a form sends.
+  Every call runs for this account only: the plugin sees the account's username, never one you type,
+  and a page or call the plugin keeps for administrators answers `403`/`404` here.
+- **Needs:** the plugin host; without it the page answers `501`. An empty page means no installed
+  plugin has a page for account holders.
+- **Gotchas:** a plugin that is disabled by the administrator disappears at once (`404` on its pages);
+  API tokens may read the catalog with `panel:read` but a form submission is a browser-session action.
 
 ---
 

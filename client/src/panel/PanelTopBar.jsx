@@ -29,9 +29,24 @@ export function PanelTopBar({ onMenu }) {
     return () => document.removeEventListener('keydown', onKey);
   }, []);
 
+  // The user menu closes on Escape (focus returns to its button) and on a click
+  // or tap anywhere outside it; the items are a WAI-ARIA menu.
+  const menuRef = useRef(null);
+  const menuButtonRef = useRef(null);
+  useEffect(() => {
+    if (!openMenu) return undefined;
+    const onKey = (e) => { if (e.key === 'Escape') { e.preventDefault(); setOpenMenu(false); menuButtonRef.current?.focus(); } };
+    const onPointer = (e) => { if (menuRef.current && !menuRef.current.contains(e.target)) setOpenMenu(false); };
+    document.addEventListener('keydown', onKey);
+    document.addEventListener('mousedown', onPointer);
+    document.addEventListener('touchstart', onPointer);
+    return () => { document.removeEventListener('keydown', onKey); document.removeEventListener('mousedown', onPointer); document.removeEventListener('touchstart', onPointer); };
+  }, [openMenu]);
+
   const go = (fn) => { if (fn) { navigate(fn.path); setQ(''); setHighlight(0); } };
   const account = me?.account;
   const shownName = account?.username || user?.username;
+  const closeMenu = () => setOpenMenu(false);
 
   return (
     <header className="topbar panel-topbar">
@@ -59,22 +74,22 @@ export function PanelTopBar({ onMenu }) {
       </div>
       <div className="topbar-right">
         {account?.domain && <Link to={`${PANEL_BASE}/overview/account`} className="topbar-host" title={t('panel.shell.account', 'Account')}>{account.domain}</Link>}
-        <div className="menu" onMouseLeave={() => setOpenMenu(false)}>
-          <button className="user-menu" onClick={() => setOpenMenu((o) => !o)} aria-haspopup="menu" aria-expanded={openMenu}>
-            <span className="avatar">{shownName?.[0]?.toUpperCase()}</span>
+        <div className="menu" ref={menuRef}>
+          <button ref={menuButtonRef} id="panel-user-menu-button" className="user-menu" onClick={() => setOpenMenu((o) => !o)} aria-haspopup="menu" aria-expanded={openMenu} aria-controls="panel-user-menu" aria-label={t('panel.shell.user_menu', 'Account menu')}>
+            <span className="avatar" aria-hidden="true">{shownName?.[0]?.toUpperCase()}</span>
             <span className="user-name">{shownName}</span>
-            <ChevronDown size={14} />
+            <ChevronDown size={14} aria-hidden="true" />
           </button>
           {openMenu && (
-            <div className="menu-items right" role="menu">
-              <div className="menu-meta"><strong>{shownName}</strong><small>{me?.actingAs ? t('panel.shell.acting_as_short', 'viewed by {by}').replace('{by}', me.actingAs.by || '') : (account?.package || t('panel.shell.account', 'Account'))}</small></div>
-              <Link className="menu-item" to={`${PANEL_BASE}/overview/account`} onClick={() => setOpenMenu(false)}><UserRound size={14} /> {t('panel.overview/account.label', 'Account details')}</Link>
-              {!me?.actingAs && <Link className="menu-item" to={PANEL_PATHS.password} onClick={() => setOpenMenu(false)}><KeyRound size={14} /> {t('panel.shell.change_password', 'Change password')}</Link>}
-              {!me?.actingAs && <Link className="menu-item" to={PANEL_PATHS.twoFactor} onClick={() => setOpenMenu(false)}><ShieldCheck size={14} /> {t('panel.security/two-factor.label', 'Two-factor authentication')}</Link>}
+            <div className="menu-items right" role="menu" id="panel-user-menu" aria-labelledby="panel-user-menu-button">
+              <div className="menu-meta" role="presentation"><strong>{shownName}</strong><small>{me?.actingAs ? t('panel.shell.acting_as_short', 'viewed by {by}').replace('{by}', me.actingAs.by || '') : (account?.package || t('panel.shell.account', 'Account'))}</small></div>
+              <Link className="menu-item" role="menuitem" to={`${PANEL_BASE}/overview/account`} onClick={closeMenu}><UserRound size={14} aria-hidden="true" /> {t('panel.overview/account.label', 'Account details')}</Link>
+              {!me?.actingAs && <Link className="menu-item" role="menuitem" to={PANEL_PATHS.password} onClick={closeMenu}><KeyRound size={14} aria-hidden="true" /> {t('panel.shell.change_password', 'Change password')}</Link>}
+              {!me?.actingAs && <Link className="menu-item" role="menuitem" to={PANEL_PATHS.twoFactor} onClick={closeMenu}><ShieldCheck size={14} aria-hidden="true" /> {t('panel.security/two-factor.label', 'Two-factor authentication')}</Link>}
               {[[t('panel.shell.help', 'Help'), branding.helpUrl], [t('panel.shell.documentation', 'Documentation'), branding.docsUrl], [t('panel.shell.support', 'Support'), branding.supportUrl]].filter(([, url]) => url).map(([label, url]) => (
-                <a key={label} className="menu-item" href={url} target="_blank" rel="noopener noreferrer"><LifeBuoy size={14} /> {label}</a>
+                <a key={label} className="menu-item" role="menuitem" href={url} target="_blank" rel="noopener noreferrer" onClick={closeMenu}><LifeBuoy size={14} aria-hidden="true" /> {label}</a>
               ))}
-              <button className="menu-item" onClick={() => logout().then(() => navigate('/login'))}><LogOut size={14} /> {t('panel.shell.sign_out', 'Sign out')}</button>
+              <button className="menu-item" role="menuitem" onClick={() => logout().then(() => navigate('/login'))}><LogOut size={14} aria-hidden="true" /> {t('panel.shell.sign_out', 'Sign out')}</button>
             </div>
           )}
         </div>

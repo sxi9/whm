@@ -60,6 +60,8 @@ export const PANEL_CATEGORY_DEFS = [
   ]],
   ['DNS', 'Network', [
     ['Zone editor', 'A, AAAA, CNAME, MX, TXT, SRV and CAA records for your domains.', 1, { slug: 'zone-editor' }],
+    ['Dynamic DNS', 'Keep an A or AAAA record pointed at a changing address with a private update URL.', 1, { slug: 'dynamic-dns', feature: 'ddns' }],
+    ['Track DNS', 'Look up the records of any domain and trace the route from this server to a host.', 1, { slug: 'track', feature: 'traceroute' }],
   ]],
   ['SSL', 'Lock', [
     ['SSL status', 'Certificates installed on each domain.', 1, { slug: 'status', feature: 'sslmanager' }],
@@ -90,6 +92,7 @@ export const PANEL_CATEGORY_DEFS = [
     ['Database users', 'Users and the privileges they hold on each database.', 1, { slug: 'users', feature: 'mysql' }],
     ['Remote hosts', 'Hosts allowed to connect to your databases from outside.', 1, { slug: 'remote-hosts', feature: 'mysql' }],
     ['phpMyAdmin', 'Open the database administration tool.', 1, { slug: 'phpmyadmin', feature: 'phpmyadmin' }],
+    ['Database wizard', 'Create a database, its user and the user\'s privileges in three steps.', 1, { slug: 'wizard', feature: 'dbwizard' }],
   ]],
   ['FTP', 'HardDriveUpload', [
     ['FTP accounts', 'Extra logins limited to a folder of your account.', 1, { slug: 'accounts', feature: 'ftpaccts' }],
@@ -105,6 +108,7 @@ export const PANEL_CATEGORY_DEFS = [
     ['Access logs', 'Web server access and error logs for your domains.', 1, { feature: 'rawlog' }],
     ['Bandwidth', 'Traffic per month against your plan.', 1],
     ['Visitors', 'Who visits your sites: visitors, pages, referrers and the full report.', 1, { feature: 'webstats' }],
+    ['Errors', 'The newest lines of every error log of your domains.', 2, { feature: 'errlog' }],
   ]],
   ['PHP', 'Code', [
     ['PHP versions', 'The PHP version each domain runs.', 1, { slug: 'versions', feature: 'phpversion' }],
@@ -117,15 +121,19 @@ export const PANEL_CATEGORY_DEFS = [
     ['Sessions', 'Where this account is signed in.', 1],
     ['API tokens', 'Tokens for scripts that use the panel API.', 1, { slug: 'tokens', feature: 'api' }],
     ['IP blocker', 'Keep addresses and ranges away from your sites.', 1, { feature: 'ipblocker' }],
+    ['Virus scanner', 'Scan your files, mail and websites for malware.', 2, { slug: 'virus-scanner', feature: 'virusscan' }],
   ]],
   ['Usage', 'Gauge', [
     ['Usage', 'Disk, bandwidth and object counts against your plan.', 1],
   ]],
   ['Advanced', 'Wrench', [
     ['Error pages', 'Your own pages for 404 and the other error responses.', 1, { feature: 'errpgs' }],
+    ['Optimize website', 'Compress pages, styles and scripts before they are sent to visitors.', 1, { feature: 'optimizews' }],
+    ['Hotlink protection', 'Stop other sites from embedding your images and files.', 1, { feature: 'hotlink' }],
   ]],
   ['Software', 'Package', [
     ['WordPress', 'Install, update and remove WordPress on your domains.', 1, { feature: 'wordpress' }],
+    ['Plugins', 'Extra tools your hosting provider installed for your account.', 1, { feature: 'plugins' }],
   ]],
 ];
 

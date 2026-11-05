@@ -1,5 +1,7 @@
 import crypto from 'node:crypto';
-import path from 'node:path';
+// Home trees are POSIX paths whatever the panel runs on (the Windows dev box
+// included), so the lexical pinning never sees a drive letter or backslash.
+import { posix as path } from 'node:path';
 import { z } from 'zod';
 import { HttpError, notFound, conflict, unprocessable, CapabilityError } from '../lib/errors.js';
 
@@ -21,6 +23,9 @@ import { HttpError, notFound, conflict, unprocessable, CapabilityError } from '.
 // tenant cannot fill the job queue ahead of server-wide work.
 
 export const UPLOAD_CHUNK_BYTES = 1_310_720;
+// The ceiling of panel.upload_chunk_bytes and the body limit of the raw chunk
+// route: its base64 form must stay under the agent's 3 MiB chunk_write bound.
+export const MAX_CHUNK_BYTES = 2 * 1024 * 1024;
 export const MAX_TEXT_BYTES = 4 * 1024 * 1024;
 export const DOWNLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
 export const MAX_UPLOAD_BYTES = 20 * 1024 * 1024 * 1024;
@@ -119,7 +124,7 @@ export function createPanelFilesService(ctx) {
   };
   // `who` is the scope or an upload record: anything that carries the accountId.
   const op = (who, name, args, req, timeoutMs) => inflight.run(who.accountId, () => agent.op(name, args, timeoutMs ? { req, timeoutMs } : { req }));
-  const chunkBytes = () => Math.max(1024, Number(settings.get('panel.upload_chunk_bytes', UPLOAD_CHUNK_BYTES)) || UPLOAD_CHUNK_BYTES);
+  const chunkBytes = () => Math.min(MAX_CHUNK_BYTES, Math.max(1024, Number(settings.get('panel.upload_chunk_bytes', UPLOAD_CHUNK_BYTES)) || UPLOAD_CHUNK_BYTES));
 
   function gate(scope) {
     if (!scope?.username || !scope.accountId) throw new HttpError(403, 'panel_scope_required', 'No hosting account is bound to this session');
@@ -181,8 +186,14 @@ export function createPanelFilesService(ctx) {
     if (!capabilities.snapshot().binaries?.[bin]) throw new CapabilityError('archive', `${bin} is not installed on this server; it is required to ${what}`);
   }
 
+  // Chunk i of an upload is the bytes [i * chunkBytes, min((i + 1) * chunkBytes, size)):
+  // the size is pinned when the upload begins so a client that resumes after a
+  // reconnect (or after the setting changed) still addresses the same bytes.
+  const chunkLength = (u, index) => Math.min(u.chunkBytes, u.size - index * u.chunkBytes);
+  const receivedBytes = (u) => [...u.got].reduce((n, i) => n + chunkLength(u, i), 0);
+
   function shapeUpload(u) {
-    return { id: u.id, path: u.rel, name: u.name, size: u.size, received: u.received, chunks: u.chunks, chunkBytes: chunkBytes(), expiresAt: new Date(u.touched + UPLOAD_TTL_MS).toISOString() };
+    return { id: u.id, path: u.rel, name: u.name, size: u.size, received: receivedBytes(u), chunks: u.got.size, chunkBytes: u.chunkBytes, chunkCount: u.chunkCount, receivedChunks: [...u.got].sort((a, b) => a - b), expiresAt: new Date(u.touched + UPLOAD_TTL_MS).toISOString() };
   }
 
   function pruneUploads() {
@@ -213,42 +224,63 @@ export function createPanelFilesService(ctx) {
       const existing = await op(scope, 'files.stat', { username: scope.username, path: file.abs }, req);
       if (existing.exists && (!overwrite || existing.type !== 'file')) throw new HttpError(409, 'exists', `${file.rel} already exists`);
       const id = crypto.randomBytes(12).toString('hex');
-      uploads.set(id, { id, accountId: scope.accountId, username: scope.username, abs: file.abs, rel: file.rel, name, size, received: 0, chunks: 0, started: false, touched: Date.now(), createdBy: req?.user?.id ?? null, protect: protect(scope, req) });
+      const pinned = chunkBytes();
+      uploads.set(id, { id, accountId: scope.accountId, username: scope.username, abs: file.abs, rel: file.rel, name, size, chunkBytes: pinned, chunkCount: Math.ceil(size / pinned), got: new Set(), started: false, touched: Date.now(), createdBy: req?.user?.id ?? null, protect: protect(scope, req) });
       return shapeUpload(uploads.get(id));
     },
     status(scope, id) {
       gate(scope);
       return shapeUpload(loadUpload(scope, id));
     },
-    // No semantic audit per chunk: the finish entry carries the whole upload.
-    async chunk(scope, id, data, req) {
+    // One raw chunk by index, written at its offset as the account; a chunk sent
+    // twice (a retry whose first answer was lost) is written again and counted
+    // once. No semantic audit per chunk: the finish entry carries the whole upload.
+    async chunk(scope, id, index, buf, req) {
       gate(scope);
       const u = loadUpload(scope, id);
-      const bytes = Buffer.byteLength(data, 'base64');
-      if (bytes > chunkBytes()) throw unprocessable('Request validation failed', { data: [`A chunk carries at most ${chunkBytes()} bytes`] });
-      if (u.received + bytes > u.size) throw unprocessable('More data than announced', { data: ['Upload exceeds the declared size'] });
-      await op(u, 'files.chunk_write', { username: u.username, path: u.abs, data, truncate: !u.started, ...(u.protect || {}) }, req);
-      u.started = true; u.received += bytes; u.chunks += 1; u.touched = Date.now();
+      if (!Buffer.isBuffer(buf) || !buf.length) throw unprocessable('Request validation failed', { body: ['A chunk is a non-empty application/octet-stream body'] });
+      if (index >= u.chunkCount) throw unprocessable('Request validation failed', { index: [`This upload has ${u.chunkCount} chunks`] });
+      const want = chunkLength(u, index);
+      if (buf.length !== want) throw unprocessable('Request validation failed', { body: [`Chunk ${index} carries ${want} bytes, not ${buf.length}`] });
+      // The truncate decision is taken before the await: two chunks in flight
+      // at once (the per-account gate allows it) must not both open the file
+      // without notrunc, or the second one wipes the first one's bytes.
+      const first = !u.started;
+      u.started = true;
+      try {
+        await op(u, 'files.chunk_write', { username: u.username, path: u.abs, data: buf.toString('base64'), offset: index * u.chunkBytes, truncate: first, ...(u.protect || {}) }, req);
+      } catch (err) {
+        if (first && !u.got.size) u.started = false;
+        throw err;
+      }
+      u.got.add(index); u.touched = Date.now();
       return shapeUpload(u);
     },
     async finish(scope, id, req) {
       gate(scope);
       const u = loadUpload(scope, id);
-      if (u.received !== u.size) throw unprocessable(`Received ${u.received} of ${u.size} bytes`, { data: ['Upload is incomplete'] });
+      const received = receivedBytes(u);
+      if (u.got.size !== u.chunkCount) throw unprocessable(`Received ${received} of ${u.size} bytes`, { data: [`Upload is incomplete; chunks still missing: ${missingChunks(u).join(', ')}`] });
       uploads.delete(id);
       duCache.clear();
-      audit(req, scope, 'panel.files.upload', { path: u.rel, bytes: u.received, chunks: u.chunks });
-      return { id, path: u.rel, bytes: u.received };
+      audit(req, scope, 'panel.files.upload', { path: u.rel, bytes: received, chunks: u.got.size });
+      return { id, path: u.rel, bytes: received };
     },
     async abort(scope, id, req) {
       gate(scope);
       const u = loadUpload(scope, id);
       uploads.delete(id);
       if (u.started) await op(u, 'files.remove', { username: u.username, paths: [u.abs], ...(u.protect || {}) }, req).catch(() => {});
-      audit(req, scope, 'panel.files.upload_abort', { path: u.rel, bytes: u.received });
+      audit(req, scope, 'panel.files.upload_abort', { path: u.rel, bytes: receivedBytes(u) });
       return { id, aborted: true };
     },
   };
+  // The first 50 missing indices, enough for a client to see where to resume.
+  function missingChunks(u) {
+    const out = [];
+    for (let i = 0; i < u.chunkCount && out.length < 50; i += 1) if (!u.got.has(i)) out.push(i);
+    return out;
+  }
 
   const service = {
     relPath,

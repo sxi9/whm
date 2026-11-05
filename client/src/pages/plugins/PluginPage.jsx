@@ -263,13 +263,13 @@ export function renderMarkdown(src) {
   return out;
 }
 
-function usePageFile(plugin, page, enabled) {
-  const path = page.file ? `/plugins/ui/${plugin.id}/file?path=${encodeURIComponent(page.file)}` : null;
+function usePageFile(plugin, page, enabled, uiBase = '/plugins/ui') {
+  const path = page.file ? `${uiBase}/${plugin.id}/file?path=${encodeURIComponent(page.file)}` : null;
   return useApi(path, { enabled: Boolean(enabled && path) });
 }
 
-function MarkdownPage({ plugin, page, fn, header = true }) {
-  const file = usePageFile(plugin, page, !page.content);
+function MarkdownPage({ plugin, page, fn, header = true, uiBase }) {
+  const file = usePageFile(plugin, page, !page.content, uiBase);
   const content = page.content ?? file.data?.content ?? '';
   return (
     <>
@@ -283,8 +283,8 @@ function MarkdownPage({ plugin, page, fn, header = true }) {
   );
 }
 
-function HtmlPage({ plugin, page, fn, header = true }) {
-  const file = usePageFile(plugin, page, true);
+function HtmlPage({ plugin, page, fn, header = true, uiBase }) {
+  const file = usePageFile(plugin, page, true, uiBase);
   return (
     <>
       {header && <PageHeader fn={fn} title={page.title} description={page.description} />}
@@ -299,11 +299,14 @@ function HtmlPage({ plugin, page, fn, header = true }) {
 
 const KINDS = { settings: SettingsPage, table: TablePage, form: FormPage, action: ActionPluginPage, markdown: MarkdownPage, html: HtmlPage };
 
-export function PluginPageView({ plugin, page, header = true }) {
+// `baseUrl` is where table/form pages fetch and post, `uiBase` where page files
+// come from: the administration shell's defaults, or the account panel's
+// /panel/plugins/<id> and /panel/plugins/ui (panel/PanelPluginPage.jsx).
+export function PluginPageView({ plugin, page, header = true, baseUrl = `/plugins/${plugin.id}`, uiBase = '/plugins/ui' }) {
   const Kind = KINDS[page.kind];
   const fn = pluginFn(plugin, page);
   if (!Kind) return <NotFoundPage />;
-  return <Kind plugin={plugin} page={page} fn={fn} header={header} baseUrl={`/plugins/${plugin.id}`} />;
+  return <Kind plugin={plugin} page={page} fn={fn} header={header} baseUrl={baseUrl} uiBase={uiBase} />;
 }
 
 export default function PluginPage() {

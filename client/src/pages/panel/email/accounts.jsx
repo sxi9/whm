@@ -8,9 +8,10 @@ import { Field, NumberInput, PasswordInput, Toggle, Button, FormActions } from '
 import { Modal, useConfirm } from '../../../components/Modal.jsx';
 import { useToast } from '../../../components/Toast.jsx';
 import { PanelPage, PendingPill } from '../../../panel/PanelPage.jsx';
-import { usePanelApi, panelApi, percentOf, meterTone } from '../../../panel/hooks/usePanel.js';
+import { usePanelApi, panelApi, percentOf } from '../../../panel/hooks/usePanel.js';
 import { PanelRequestError, MutationError, AddressInput, useAccountDomains, fieldError, quotaText, useEmailT, tr } from './parts/Shared.jsx';
 import { WebmailOpenButton } from './webmail.jsx';
+import { Meter } from '../../../panel/Meter.jsx';
 
 export function usageOf(row) {
   const u = row.usage;
@@ -29,7 +30,7 @@ export function QuotaMeter({ row }) {
   return (
     <div style={{ minWidth: 160 }}>
       <div style={{ fontSize: 13 }}>{u.text}{u.messages != null && <span className="muted"> · {t('panel.email.accounts.messages_count', '{count} messages', { count: u.messages })}</span>}</div>
-      <div className={`meter ${meterTone(u.percent)}`} aria-hidden={u.percent == null} style={{ marginTop: 5 }}><span style={{ width: `${u.percent ?? 0}%` }} /></div>
+      <Meter percent={u.percent} label={row.address} text={u.text} name="mailbox-quota" style={{ marginTop: 5 }} />
     </div>
   );
 }
@@ -294,7 +295,7 @@ export default function EmailAccounts({ fn }) {
             <div className="stat">
               <div className="label">{t('panel.email.common.mailboxes', 'Mailboxes')}</div>
               <div className="value">{notIncluded ? t('panel.email.accounts.not_included', 'Not included in your plan') : limit != null ? t('panel.email.common.n_of_m', '{n} of {m}', { n: used, m: limit }) : `${used}`}</div>
-              <div className={`meter ${meterTone(percentOf(used, limit))}`} aria-hidden={limit == null || notIncluded}><span style={{ width: `${percentOf(used, limit) ?? 0}%` }} /></div>
+              <Meter percent={notIncluded ? null : percentOf(used, limit)} label={t('panel.email.common.mailboxes', 'Mailboxes')} text={limit != null && !notIncluded ? t('panel.email.common.n_of_m', '{n} of {m}', { n: used, m: limit }) : undefined} name="mailboxes" />
             </div>
             <div className="stat"><div className="label">{t('panel.email.accounts.domains_with_mail', 'Domains with mail')}</div><div className="value">{domains.length}</div></div>
             <div className="stat"><div className="label">{t('panel.email.accounts.default_quota', 'Default quota')}</div><div className="value">{quotaText(defaultQuotaMb)}</div></div>

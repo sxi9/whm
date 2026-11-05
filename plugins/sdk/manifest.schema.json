@@ -421,6 +421,14 @@
         "html"
       ]
     },
+    "pageAudience": {
+      "type": "string",
+      "enum": [
+        "admin",
+        "panel"
+      ],
+      "description": "Who sees the page: the administration shell (default) or the account panel. Only table, form, markdown and html pages may be panel pages."
+    },
     "page": {
       "type": "object",
       "additionalProperties": false,
@@ -439,6 +447,9 @@
         },
         "kind": {
           "$ref": "#/$defs/pageKind"
+        },
+        "audience": {
+          "$ref": "#/$defs/pageAudience"
         },
         "icon": {
           "type": "string",

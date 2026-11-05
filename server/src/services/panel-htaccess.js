@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import path from 'node:path';
+import nodePath from 'node:path';
 import { z } from 'zod';
 import { HttpError, notFound, conflict, unprocessable } from '../lib/errors.js';
 import { assertFeature, auditArgs } from './panel-domains.js';
@@ -16,7 +16,12 @@ import { assertFeature, auditArgs } from './panel-domains.js';
 //   panelHtaccess.indexes.get / set                       (feature indexmanager)
 //   panelHtaccess.privacy.get / set / addUser / removeUser (feature dirprivacy)
 //   panelHtaccess.errorPages.list / set / remove           (feature errpgs)
+//   panelHtaccess.optimize.get / set                      (feature optimizews)
+//   panelHtaccess.hotlink.get / set                       (feature hotlink)
 //   panelHtaccess.probe(scope, { path })
+
+// Home directories and document roots are Linux paths whatever platform runs the tests.
+const path = nodePath.posix;
 
 export const WEB_TYPES = ['main', 'addon', 'sub'];
 export const ERROR_CODES = ['400', '401', '403', '404', '500', '503'];
@@ -25,6 +30,28 @@ export const HTPASSWD_USER = /^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$/;
 export const MAX_DENY_IPS = 500;
 export const MAX_PRIVACY_USERS = 200;
 export const DEFAULT_REALM = 'Restricted area';
+// Mirrors agent/src/ops/htaccess-web.js (the agent refuses anything else).
+export const DEFLATE_TYPES = [
+  'text/html', 'text/plain', 'text/xml', 'text/css', 'text/javascript',
+  'application/javascript', 'application/x-javascript', 'application/json', 'application/xml',
+  'application/rss+xml', 'application/atom+xml', 'application/xhtml+xml', 'image/svg+xml',
+  'font/ttf', 'font/otf', 'font/woff', 'font/woff2', 'application/vnd.ms-fontobject',
+];
+export const HOTLINK_EXTENSIONS = [
+  'jpg', 'jpeg', 'jpe', 'png', 'gif', 'webp', 'avif', 'svg', 'bmp', 'ico', 'tif', 'tiff',
+  'mp4', 'webm', 'mov', 'mp3', 'ogg', 'wav', 'pdf', 'zip', 'rar', '7z',
+];
+export const DEFAULT_HOTLINK_EXTENSIONS = ['jpg', 'jpeg', 'jpe', 'png', 'gif', 'webp', 'bmp'];
+export const MAX_HOTLINK_HOSTS = 100;
+export const HOTLINK_REDIRECT = /^https?:\/\/(?=.{1,2000}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?::\d{1,5})?(?:\/[A-Za-z0-9._~!*'(),:@&=+;/-]*)?(?:\?[A-Za-z0-9._~!*'(),:@&=+;/-]*)?$/;
+export const OPTIMIZE_MODES = ['off', 'all', 'custom'];
+// A hostname without a leading "www." (the rule allows both forms of every host).
+export const bareHost = (h) => String(h).trim().toLowerCase().replace(/^www\./, '');
+export function redirectLoops(redirect, extensions) {
+  let pathname;
+  try { pathname = new URL(redirect).pathname.toLowerCase(); } catch { return true; }
+  return extensions.some((e) => pathname.endsWith(`.${e}`));
+}
 const REL = /^(?![-/])(?!.*(^|\/)\.\.(\/|$))[^\0\n\r]*$/;
 const REL_MESSAGE = 'A path relative to the home directory: not absolute, without ".." and not starting with "-"';
 export const dirPath = z.string().max(512).regex(REL, REL_MESSAGE).default('');
@@ -94,12 +121,12 @@ export function createPanelHtaccessService(ctx) {
     try { return (await op('web.detect', {}, req))?.apache?.runUser || null; } catch { return null; }
   }
 
-  const emptySpec = () => ({ denyIps: [], errorDocuments: {}, indexes: 'inherit', auth: null });
-  const isEmpty = (spec) => !spec.denyIps.length && !Object.keys(spec.errorDocuments).length && spec.indexes === 'inherit' && !spec.auth;
+  const emptySpec = () => ({ denyIps: [], errorDocuments: {}, indexes: 'inherit', auth: null, deflate: null, hotlink: null });
+  const isEmpty = (spec) => !spec.denyIps.length && !Object.keys(spec.errorDocuments).length && spec.indexes === 'inherit' && !spec.auth && !spec.deflate && !spec.hotlink;
 
   async function read(scope, dir, req) {
     const r = await op('files.htaccess.get', { username: scope.username, path: dir.abs }, req);
-    return { ...r, spec: r.spec ?? emptySpec() };
+    return { ...r, spec: { ...emptySpec(), ...(r.spec ?? {}) } };
   }
 
   // Host first: the patched spec is written with a loopback probe so a block
@@ -122,6 +149,7 @@ export function createPanelHtaccessService(ctx) {
   const service = {
     dirPath,
     resolveDir,
+    constants: { OPTIMIZE_MODES, DEFLATE_TYPES, HOTLINK_EXTENSIONS, DEFAULT_HOTLINK_EXTENSIONS, MAX_HOTLINK_HOSTS, HOTLINK_REDIRECT },
 
     async get(scope, { path: rel = '' } = {}, req) {
       requireScopeShape(scope);
@@ -284,7 +312,78 @@ export function createPanelHtaccessService(ctx) {
         return { domain: dir.domain, code, active: false, deleted, probe: shapeProbe(result.probe) };
       },
     },
+
+    // Optimize website (feature optimizews): mod_deflate for a pinned MIME
+    // list in the managed block of one folder (public_html by default).
+    optimize: {
+      async get(scope, { path: rel = '' } = {}, req) {
+        requireScopeShape(scope);
+        assertFeature(scope, 'optimizews');
+        const dir = resolveDir(scope, rel || 'public_html');
+        const r = await read(scope, dir, req);
+        return { path: dir.rel, domain: dir.domain, ...optimizeOf(r.spec), available: DEFLATE_TYPES, managed: r.managed };
+      },
+      async set(scope, { path: rel, mode, types = [] }, req) {
+        requireScopeShape(scope);
+        assertFeature(scope, 'optimizews');
+        const dir = resolveDir(scope, rel || 'public_html');
+        const chosen = mode === 'all' ? DEFLATE_TYPES : mode === 'custom' ? DEFLATE_TYPES.filter((t) => types.includes(t)) : [];
+        if (mode === 'custom' && !chosen.length) throw unprocessable('Request validation failed', { types: ['Choose at least one content type to compress'] });
+        const deflate = chosen.length ? { types: chosen } : null;
+        const { result } = await patch(scope, dir, (s) => ({ ...s, deflate }), req);
+        audit(req, scope, 'panel.optimize.set', { path: dir.rel, mode, types: chosen.length });
+        return { path: dir.rel, domain: dir.domain, ...optimizeOf({ deflate }), probe: shapeProbe(result.probe) };
+      },
+    },
+
+    // Hotlink protection (feature hotlink): referer rules in public_html, so
+    // every site of the account (addon and subdomain folders inherit the file)
+    // is covered. The account's own domains are always allowed; `hosts` are
+    // the extra ones the customer adds.
+    hotlink: {
+      async get(scope, req) {
+        requireScopeShape(scope);
+        assertFeature(scope, 'hotlink');
+        const dir = resolveDir(scope, 'public_html');
+        const r = await read(scope, dir, req);
+        const own = ownHosts(scope);
+        return { path: dir.rel, domain: dir.domain, ...hotlinkOf(r.spec, own), domains: own, available: HOTLINK_EXTENSIONS, defaults: DEFAULT_HOTLINK_EXTENSIONS, max: MAX_HOTLINK_HOSTS, managed: r.managed };
+      },
+      async set(scope, { enabled, hosts = [], extensions = DEFAULT_HOTLINK_EXTENSIONS, allowBlank = true, redirect = null }, req) {
+        requireScopeShape(scope);
+        assertFeature(scope, 'hotlink');
+        const dir = resolveDir(scope, 'public_html');
+        const own = ownHosts(scope);
+        const extra = [...new Set(hosts.map(bareHost))].filter((h) => !own.includes(h));
+        const all = [...own, ...extra];
+        if (all.length > MAX_HOTLINK_HOSTS) throw unprocessable('Request validation failed', { hosts: [`At most ${MAX_HOTLINK_HOSTS} hosts including your own domains`] });
+        const exts = HOTLINK_EXTENSIONS.filter((e) => extensions.includes(e));
+        if (enabled && !exts.length) throw unprocessable('Request validation failed', { extensions: ['Choose at least one file type to protect'] });
+        if (enabled && redirect && redirectLoops(redirect, exts)) throw unprocessable('Request validation failed', { redirect: ['The redirect target must not be one of the protected file types'] });
+        const hotlink = enabled ? { hosts: all, extensions: exts, allowBlank: Boolean(allowBlank), redirect: redirect || null } : null;
+        const { result } = await patch(scope, dir, (s) => ({ ...s, hotlink }), req);
+        audit(req, scope, 'panel.hotlink.set', { enabled, hosts: all.length, extensions: exts.length, allowBlank: Boolean(allowBlank), redirect: hotlink?.redirect ?? null });
+        return { path: dir.rel, domain: dir.domain, ...hotlinkOf({ hotlink }, own), domains: own, probe: shapeProbe(result.probe) };
+      },
+    },
   };
+
+  function optimizeOf(spec) {
+    const types = spec.deflate?.types ?? [];
+    const mode = !types.length ? 'off' : DEFLATE_TYPES.every((t) => types.includes(t)) ? 'all' : 'custom';
+    return { mode, types };
+  }
+  function hotlinkOf(spec, own) {
+    const h = spec.hotlink;
+    if (!h) return { enabled: false, hosts: [], extensions: DEFAULT_HOTLINK_EXTENSIONS, allowBlank: true, redirect: null };
+    return { enabled: true, hosts: h.hosts.filter((x) => !own.includes(x)), extensions: h.extensions, allowBlank: h.allowBlank, redirect: h.redirect };
+  }
+  // Every hostname of the account (main, addon, sub, parked), without "www.".
+  function ownHosts(scope) {
+    const main = bareHost(scope.account.domain);
+    const rest = domains().allDomains(scope).map((r) => bareHost(r.domain)).filter((h) => h !== main).sort();
+    return [...new Set([main, ...rest])];
+  }
 
   function siteOf(scope, domain) {
     const site = webDomains(scope).find((d) => d.domain === domain);

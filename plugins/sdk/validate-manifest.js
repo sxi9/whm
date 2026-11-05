@@ -142,6 +142,15 @@ const SETTING_TYPES = Object.freeze([
 
 const PAGE_KINDS = Object.freeze(['settings', 'table', 'form', 'action', 'markdown', 'html']);
 
+/**
+ * Who a page is served to. 'admin' (the default, so every pre-1.1 manifest keeps
+ * its meaning) is the administration shell; 'panel' is the account panel, where a
+ * logged-in account holder sees it. Only kinds that need no root operation may
+ * be panel pages: settings and action pages drive root-only manage routes.
+ */
+const PAGE_AUDIENCES = Object.freeze(['admin', 'panel']);
+const PANEL_PAGE_KINDS = Object.freeze(['table', 'form', 'markdown', 'html']);
+
 const ISOLATION_MODES = Object.freeze(['in-process', 'process']);
 
 const SEVERITIES = Object.freeze(['info', 'warning', 'critical']);
@@ -182,7 +191,7 @@ const SETTING_FIELD_KEYS = Object.freeze([
 
 const PAGE_KEYS = Object.freeze([
   'route', 'title', 'kind', 'icon', 'description', 'source', 'columns', 'fields', 'job',
-  'confirm', 'content', 'file',
+  'confirm', 'content', 'file', 'audience',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -397,6 +406,13 @@ function validatePageDescriptor(page, path, c, refs = {}) {
   if (!PAGE_KINDS.includes(page.kind)) {
     c.add(`${path}.kind`, 'UNKNOWN_PAGE_KIND', `kind must be one of ${PAGE_KINDS.join(', ')}`);
     return;
+  }
+  if (page.audience !== undefined) {
+    if (!PAGE_AUDIENCES.includes(page.audience)) {
+      c.add(`${path}.audience`, 'UNKNOWN_AUDIENCE', `audience must be one of ${PAGE_AUDIENCES.join(', ')}`);
+    } else if (page.audience === 'panel' && !PANEL_PAGE_KINDS.includes(page.kind)) {
+      c.add(`${path}.audience`, 'AUDIENCE_KIND', `a panel page must be one of ${PANEL_PAGE_KINDS.join(', ')} (${page.kind} pages run root-only operations)`);
+    }
   }
   const needSource = () => {
     if (!isStr(page.source) || !API_ROUTE_PATTERN.test(page.source)) {
@@ -634,6 +650,7 @@ function validateManifest(manifest) {
     else {
       checkUnknownKeys(manifest.ui, ['sidebar', 'pages'], 'ui', c);
       const pageRoutes = [];
+      const panelRoutes = [];
       if (manifest.ui.pages !== undefined) {
         if (!Array.isArray(manifest.ui.pages)) c.add('ui.pages', 'TYPE', 'ui.pages must be an array');
         else {
@@ -642,6 +659,7 @@ function validateManifest(manifest) {
             if (isObj(pg) && isStr(pg.route)) {
               if (pageRoutes.includes(pg.route)) c.add(`ui.pages[${i}].route`, 'DUPLICATE', `duplicate page route "${pg.route}"`);
               pageRoutes.push(pg.route);
+              if (pg.audience === 'panel') panelRoutes.push(pg.route);
               if ((pg.kind === 'table' || pg.kind === 'form') && pg.source !== undefined) requirePerm('api:routes', `ui.pages[${i}]`, `a ${pg.kind} page backed by a plugin route`);
               if (pg.kind === 'action') requirePerm('jobs', `ui.pages[${i}]`, 'an action page');
             }
@@ -659,6 +677,7 @@ function validateManifest(manifest) {
             if (!isNonEmptyStr(e.label)) c.add(`${p}.label`, 'REQUIRED', 'label is required');
             if (!isStr(e.route) || !UI_ROUTE_PATTERN.test(e.route)) c.add(`${p}.route`, 'PATTERN', `route must match ${UI_ROUTE_PATTERN}`);
             else if (!pageRoutes.includes(e.route)) c.add(`${p}.route`, 'UNKNOWN_ROUTE', `sidebar route "${e.route}" has no matching ui.pages entry`);
+            else if (panelRoutes.includes(e.route)) c.add(`${p}.route`, 'AUDIENCE', `sidebar entries belong to the administration shell; the panel page "${e.route}" is listed in the account panel on its own`);
             if (!isStr(e.icon) || !ICON_PATTERN.test(e.icon)) c.add(`${p}.icon`, 'PATTERN', 'icon must be a lucide icon name (kebab-case)');
           });
           if (manifest.ui.sidebar.length > 0) requirePerm('ui:sidebar', 'ui.sidebar', 'sidebar entries');
@@ -706,6 +725,8 @@ module.exports = {
   ID_MAX_LENGTH,
   SETTING_TYPES,
   PAGE_KINDS,
+  PAGE_AUDIENCES,
+  PANEL_PAGE_KINDS,
   ISOLATION_MODES,
   SEVERITIES,
   BACKUP_COMPONENTS,

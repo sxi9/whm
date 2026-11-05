@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { RefreshCw, HardDrive, Activity } from 'lucide-react';
+import { RefreshCw, HardDrive, Activity, Clock, AlertTriangle } from 'lucide-react';
 import { Card, KeyValue, EmptyState, Loading, formatBytes, formatMb, formatDate } from '../../../components/Common.jsx';
 import { Button, ErrorBanner } from '../../../components/Form.jsx';
 import { useToast } from '../../../components/Toast.jsx';
@@ -10,6 +10,7 @@ import { PanelPage, PanelCapabilityState, FeatureDisabledState } from '../../../
 import { usePanelApi, panelApi, percentOf, meterTone } from '../../../panel/hooks/usePanel.js';
 import { PANEL_FUNCTION_BY_KEY } from '../../../panel/nav.js';
 import { JobProgress } from './parts/JobProgress.jsx';
+import { Meter as A11yMeter } from '../../../panel/Meter.jsx';
 
 const DISK_USAGE_PATH = PANEL_FUNCTION_BY_KEY['panel:files/disk-usage']?.path || '/panel/files/disk-usage';
 const OBJECT_LABELS = { addons: 'Addon domains', subdomains: 'Subdomains', parked: 'Parked domains', mailboxes: 'Mailboxes', databases: 'Databases', ftp: 'FTP accounts' };
@@ -29,14 +30,53 @@ export function quotaParts(used, limit, format, t = untranslated) {
   return { value: format(used), sub: limit ? fill(t('panel.usage.of_limit', 'of {limit}'), { limit: format(limit) }) : t('panel.usage.unlimited_lower', 'unlimited') };
 }
 
+// Age of the figures when they come from the disk scan rather than repquota:
+// null when there was never a scan, otherwise the elapsed time and a tone that
+// turns warn past a day and bad past a week, so a stale number is not read as live.
+export const SCAN_STALE_MS = 24 * 3600 * 1000;
+export const SCAN_OLD_MS = 7 * SCAN_STALE_MS;
+export function scanAge(lastRefresh, now = Date.now()) {
+  if (!lastRefresh) return null;
+  const d = new Date(/^\d{4}-\d{2}-\d{2} /.test(lastRefresh) ? lastRefresh.replace(' ', 'T') + 'Z' : lastRefresh);
+  if (Number.isNaN(d.getTime())) return null;
+  const ms = Math.max(0, now - d.getTime());
+  return { ms, tone: ms >= SCAN_OLD_MS ? 'bad' : ms >= SCAN_STALE_MS ? 'warn' : 'ok' };
+}
+
+export function ageLabel(ms, t = untranslated) {
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 1) return t('panel.usage.age_just_now', 'just now');
+  if (minutes < 60) return fill(t('panel.usage.age_minutes', '{n} minutes ago'), { n: minutes });
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return fill(t('panel.usage.age_hours', '{n} hours ago'), { n: hours });
+  return fill(t('panel.usage.age_days', '{n} days ago'), { n: Math.floor(hours / 24) });
+}
+
+export function ScanSourceNote({ disk, now = Date.now(), t = untranslated }) {
+  if (!disk || disk.source !== 'scan') return null;
+  const age = scanAge(disk.lastRefresh, now);
+  const stale = !age || age.tone !== 'ok';
+  const Icon = stale ? AlertTriangle : Clock;
+  return (
+    <div className={`banner ${stale ? 'banner-warning' : 'banner-info'}`} role={stale ? 'alert' : 'status'} data-scan-source={age ? age.tone : 'never'} style={{ marginBottom: 14 }}>
+      <Icon size={18} />
+      <div>
+        <strong>{age ? fill(t('panel.usage.scan_source_title', 'Disk figures are from a scan {age}'), { age: ageLabel(age.ms, t) }) : t('panel.usage.scan_source_never', 'Disk figures have not been measured yet')}</strong>
+        <p>{age ? fill(t('panel.usage.scan_source_text', 'Measured {date}; files added or removed since then are not counted.'), { date: formatDate(disk.lastRefresh) }) : t('panel.usage.scan_source_never_text', 'The disk space shown is the plan figure, not a measurement.')}</p>
+        {stale && <p className="muted">{t('panel.usage.scan_source_hint', 'Use "Refresh figures" for a current number.')}</p>}
+      </div>
+    </div>
+  );
+}
+
 export function meterFor(used, limit) {
   const percent = limit == null || limit <= 0 ? null : percentOf(used, limit);
   return { percent, tone: meterTone(percent) };
 }
 
-export function Meter({ used, limit, name }) {
+export function Meter({ used, limit, name, label, text }) {
   const { percent, tone } = meterFor(used, limit);
-  return <div className={`meter ${tone}`} data-meter={name} aria-hidden={percent == null}><span style={{ width: `${percent ?? 0}%` }} /></div>;
+  return <A11yMeter percent={percent} tone={tone} name={name} label={label} text={text} />;
 }
 
 export function Stat({ name, label, value, sub, used, limit, note }) {
@@ -45,7 +85,7 @@ export function Stat({ name, label, value, sub, used, limit, note }) {
       <div className="label">{label}</div>
       <div className="value">{value}</div>
       {sub && <div className="muted small">{sub}</div>}
-      <Meter used={used} limit={limit} name={name} />
+      <Meter used={used} limit={limit} name={name} label={label} text={sub ? `${value} ${sub}` : value} />
       {note && <div className="muted small" style={{ marginTop: 6 }}>{note}</div>}
     </div>
   );
@@ -106,8 +146,9 @@ export default function Usage({ fn }) {
       {loading && !data && <Loading text={t('common.loading', 'Loading…')} />}
       {data && (
         <>
+          <ScanSourceNote disk={d} t={t} />
           <div className="stat-grid" style={{ marginBottom: 18 }}>
-            <Stat name="disk" label={t('panel.usage.disk_space', 'Disk space')} {...quotaParts(d.usedMb, d.quotaMb, formatMb, t)} used={d.usedMb} limit={d.quotaMb} note={d.source === 'repquota' ? t('panel.usage.source_quota', 'From the file system quota') : t('panel.usage.source_scan', 'From the last scan')} />
+            <Stat name="disk" label={t('panel.usage.disk_space', 'Disk space')} {...quotaParts(d.usedMb, d.quotaMb, formatMb, t)} used={d.usedMb} limit={d.quotaMb} note={d.source === 'repquota' ? t('panel.usage.source_quota', 'From the file system quota') : `${t('panel.usage.source_scan', 'From the last scan')}${scanAge(d.lastRefresh) ? `, ${ageLabel(scanAge(d.lastRefresh).ms, t)}` : ''}`} />
             <Stat name="bandwidth" label={t('panel.usage.bandwidth_month', 'Bandwidth this month')} {...quotaParts(b.usedMb, b.limitMb, formatMb, t)} used={b.usedMb} limit={b.limitMb} />
             {inodes && <Stat name="inodes" label={t('panel.usage.inodes', 'Files (inodes)')} {...inodes} used={d.inodes} limit={d.inodeLimit} />}
           </div>
@@ -131,7 +172,7 @@ export default function Usage({ fn }) {
                         <tr key={e.path}>
                           <td><code>{e.path}</code></td>
                           <td className="align-right">{formatBytes((e.kb || 0) * 1024)}</td>
-                          <td><div className="meter" style={{ marginTop: 0 }}><span style={{ width: `${breakdown.total ? Math.min(100, Math.round(((e.kb || 0) / breakdown.total) * 100)) : 0}%` }} /></div></td>
+                          <td><A11yMeter percent={breakdown.total ? Math.min(100, Math.round(((e.kb || 0) / breakdown.total) * 100)) : null} tone="" label={e.path} text={formatBytes((e.kb || 0) * 1024)} name="share" style={{ marginTop: 0 }} /></td>
                         </tr>
                       ))}
                     </tbody>
@@ -154,7 +195,7 @@ export default function Usage({ fn }) {
                         <tr key={m.period}>
                           <td>{m.period}</td>
                           <td className="align-right">{formatMb(m.mb)}</td>
-                          <td><div className="meter" style={{ marginTop: 0 }}><span style={{ width: `${months.max ? Math.round(((m.mb || 0) / months.max) * 100) : 0}%` }} /></div></td>
+                          <td><A11yMeter percent={months.max ? Math.round(((m.mb || 0) / months.max) * 100) : null} tone="" label={m.period} text={formatMb(m.mb)} name="month" style={{ marginTop: 0 }} /></td>
                         </tr>
                       ))}
                     </tbody>

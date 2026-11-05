@@ -10,7 +10,8 @@ deliberately boring: every feature exists to show one extension point of `plugin
 | Jobs, cancellable and not | `jobs.digest` (`cancellable: true`), `jobs.housekeeping` (`cancellable: false`) |
 | Cron, setting-bound and fixed | `cron[0].schedule = "setting:digestSchedule"`, `cron[1].schedule = "30 3 * * *"` |
 | Pages of every kind | `ui.pages`: table (`/`), form (`/new`), settings, action (`/digest`), markdown (`/about`), html (`/widget`); `/schedules` (markdown) is registered at runtime with `ctx.ui.registerPage` |
-| Routes with roles | `routes()`: `GET/POST /notes` and `GET /notes/:id` for root and resellers (resellers are scoped to accounts they own on every route: the list filters, the single-note read answers 404 for anything else), `DELETE /notes/:id`, `/status`, `/export`, `POST /digest` root only |
+| An account-panel page | `ui.pages[]` `/my-notes` with `audience: "panel"`: a table the account holder sees in the account panel (`/panel/plugins/net.whm.sample-notes/my-notes`), fed by `GET /my-notes` (`roles: ['user']`), which reads `req.panel.username` — the account the host pinned — never a username from the request |
+| Routes with roles | `routes()`: `GET/POST /notes` and `GET /notes/:id` for root and resellers (resellers are scoped to accounts they own on every route: the list filters, the single-note read answers 404 for anything else), `DELETE /notes/:id`, `/status`, `/export`, `POST /digest` root only; `GET /my-notes` account holders only |
 | Store | kv entries (`installedAt`, `digest:last`, `webhook:token`) and the `notes` collection |
 | fs | `exports/latest-digest.json` in the plugin data directory |
 | crypto | the webhook token mirrored into the store with `ctx.crypto.encrypt` |

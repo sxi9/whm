@@ -94,6 +94,20 @@ export function SpamSettingsForm({ current, onSubmit, busy, error, pending }) {
   );
 }
 
+// What a threshold is and when it acts, in the cPanel wording customers know:
+// one score per account, applied only once the mail server hands mail to a scanner.
+export function ThresholdHelp() {
+  const { t } = useEmailT();
+  return (
+    <Card title={t('panel.email.spam.how_title', 'How spam scoring works')}>
+      <p>{t('panel.email.spam.how_scoring', 'Every incoming message is given a score: the more spam-like its sender, links and wording, the higher the number. The spam threshold is the score at which a message is marked as spam. It applies to this account only; every account on the server keeps its own threshold and lists.')}</p>
+      <p>{t('panel.email.spam.how_threshold', 'A threshold of 5 is the usual starting point. Lower values catch more spam but also more newsletters and notifications; higher values let more through. Auto-delete uses a second, higher score so that only obvious spam is discarded and nothing borderline is lost.')}</p>
+      <p>{t('panel.email.spam.how_lists', 'The allow list and block list override the score for the senders you name, so a wanted sender is never flagged and a known spammer always is.')}</p>
+      <p className="muted">{t('panel.email.spam.how_scanner', 'Scores only exist when the mail server hands incoming mail to a scanner. On a server whose mail server runs without content scanning, mail is delivered unscored and the threshold has no effect until your hosting provider installs the scanning build and SpamAssassin.')}</p>
+    </Card>
+  );
+}
+
 // Why saved settings would not act on this server (GET /email/spam reason).
 export function unavailableText(reason) {
   switch (reason) {
@@ -114,6 +128,7 @@ export function SpamUnavailable({ reason, detail, onRetry }) {
       <EmptyState icon={ShieldOff} title={t('panel.email.spam.unavailable_title', 'Spam filtering is not available on this server')}>
         <p>{unavailableText(reason)}</p>
         {detail && <p className="muted">{detail}</p>}
+        {reason === 'exim_no_content_scan' && <p className="muted">{t('panel.email.spam.no_scan_thresholds', 'Incoming mail is delivered unscored, so a per-account threshold would have nothing to compare against; the settings cannot be saved here until the scanning build is installed.')}</p>}
         <p className="muted">{t('panel.email.spam.unavailable_text', 'Ask your hosting provider to enable it. Your other mail settings keep working.')}</p>
         {onRetry && <p><button className="btn btn-sm" onClick={onRetry}>{t('panel.email.common.recheck', 'Re-check')}</button></p>}
       </EmptyState>
@@ -145,6 +160,7 @@ export default function SpamFilters({ fn }) {
           {loading && !data && !error && <Card><p className="muted">{t('panel.email.common.loading', 'Loading…')}</p></Card>}
           {data && data.available === false && <SpamUnavailable reason={data.reason} detail={data.detail} onRetry={refetch} />}
           {data && data.available !== false && <SpamSettingsForm current={data} onSubmit={save} busy={busy} error={mutationError} pending={pending} />}
+          {data && <ThresholdHelp />}
         </>
       )}
     </PanelPage>

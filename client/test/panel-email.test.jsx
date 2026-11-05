@@ -282,6 +282,19 @@ describe('Spam filters', () => {
     expect(html).toContain('1 of 200');
     expect(html).toContain('Last saved');
     expect(html).not.toContain('not available on this server');
+    expect(html).toContain('How spam scoring works');
+    expect(html).toContain('applies to this account only');
+    expect(html).toContain('without content scanning');
+    expect(html).not.toContain('nothing to compare against');
+  });
+  it('explains per-account thresholds and the light Exim build when no scanner runs', () => {
+    const light = withFixtures({ '/email/spam': { data: { ...settings, available: false, reason: 'exim_no_content_scan', detail: 'exim4-daemon-light' } } }, () => page(Spam, 'spam'));
+    expect(light).toContain('How spam scoring works');
+    expect(light).toContain('nothing to compare against');
+    expect(light).toContain('cannot be saved here until the scanning build is installed');
+    const stopped = withFixtures({ '/email/spam': { data: { ...settings, available: false, reason: 'spamd_not_running' } } }, () => page(Spam, 'spam'));
+    expect(stopped).toContain('How spam scoring works');
+    expect(stopped).not.toContain('nothing to compare against');
   });
   it('withholds the form with the reason when filtering cannot take effect; 403 and 501', () => {
     const html = withFixtures({ '/email/spam': { data: { ...settings, available: false, reason: 'spamd_missing', detail: null, enabled: false, configured: false, updatedAt: null } } }, () => page(Spam, 'spam'));

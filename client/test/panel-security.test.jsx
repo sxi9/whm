@@ -137,11 +137,12 @@ describe('SSH keys page', () => {
     expect(html).toContain('>Remove<');
   });
 
-  it('renders the capability state on 501 shell_disabled and the plan state on 403', () => {
+  it('renders 501 shell_disabled as a plan setting (P2-12) and the plan state on 403', () => {
     fixtures.responses.clear();
     set('/panel/security/ssh-keys', { error: { status: 501, code: 'shell_disabled', message: 'This account has no shell access, so SSH keys cannot be used' } });
     let html = render(h(SshKeys, { fn: fn('ssh-keys') }), fn('ssh-keys').path);
-    expect(html).toContain('Not available on this server');
+    expect(html).toContain('Not included in your plan');
+    expect(html).not.toContain('Not available on this server');
     expect(html).toContain('no shell access');
     expect(html).toContain('once shell access is enabled');
     expect(html).toMatch(/id="ssh-key"[^>]*disabled=""/);

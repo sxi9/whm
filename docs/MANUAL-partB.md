@@ -1489,6 +1489,11 @@ provider it is a read-only preview.
   `createMockHost`, submitting, versioning. The scaffold from *Development › Plugin File Generator*
   (29.5) validates against the same contract; `plugins/sample-plugin` (`net.whm.sample-notes`) is a complete
   worked example with tests.
+- **Pages for account holders (host 1.1.0):** a `ui.pages[]` entry with `audience: "panel"` (table, form,
+  markdown or html only) is served in the account panel under *Software › Plugins* instead of the
+  administration shell, and its data route must list `roles: ['user']` — the host then passes the pinned
+  account as `req.panel`. Admin pages and admin-only routes never answer through the panel; the plan
+  feature `plugins` (Feature Manager) hides the whole group. See `plugins/SDK.md` §7 and `MANUAL-partC.md` §16.2.
 - **Build:** `node scripts/build-plugin.js <dir> [--out file.whmplugin] [--sign <private.pem> [--dev]] [--kid <kid>]
   [--exclude <pattern>]... [--include-tests] [--allow-secrets] [--json]`. The packer is deterministic (same
   input, same bytes). `--sign <pem> --dev` writes `DEV-SIGNATURE.json` (what a marketplace upload must carry);

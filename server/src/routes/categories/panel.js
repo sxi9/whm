@@ -140,10 +140,14 @@ export async function register(ctx) {
   r.get('/tokens/:id', requireScope('panel:read'), validate({ params: idParam }), wrap((req) => s.tokens.get(req.panel, req.params.id)));
   r.delete('/tokens/:id', sessionOnly, validate({ params: idParam }), wrap((req) => s.tokens.remove(req.panel, req.params.id, req)));
 
+  // A sub-router mount marked `public: true` (the dynamic DNS update URL) is
+  // served like /panel/sso: before requireAuth, with its own credential.
+  const publicMounts = [];
   for (const mount of await loadSubRouters(ctx)) {
+    if (mount.public) { publicMounts.push({ path: `/panel${mount.path}`, router: mount.router, public: true }); continue; }
     r.use(mount.path, mount.router);
     ctx.logger.debug({ file: mount.file, path: `/panel${mount.path}` }, 'mounted panel router');
   }
 
-  return [{ path: '/panel/sso', router: sso, public: true }, { path: '/panel', router: r }];
+  return [{ path: '/panel/sso', router: sso, public: true }, ...publicMounts, { path: '/panel', router: r }];
 }

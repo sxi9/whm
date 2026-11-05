@@ -58,13 +58,14 @@ export default function Domains({ fn }) {
       )}
       <Card title={t('panel.domains.list_title', 'Domains on this account')} subtitle={`${me?.account?.domain ? `${fill(t('panel.domains.is_main', '{domain} is the main domain.'), { domain: me.account.domain })} ` : ''}${t('panel.domains.list_help', 'Where each name is served from, and whether the web server and SSL are in place.')}`} padded={false}>
         <PanelCapabilityState error={error} onRetry={refetch} />
+        <div id="panel-domains-list" role="tabpanel" aria-labelledby={`panel-domains-tab-${filter}`}>
         <DataTable
           columns={columns} rows={visible} loading={loading} error={error && error.status !== 501 ? error : null}
           emptyText={q || filter !== 'all' ? t('panel.domains.empty_filter', 'No domains match this filter') : t('panel.domains.empty', 'Your main domain appears here once the account is provisioned')}
           searchable q={q} onSearch={setQ} searchPlaceholder={t('panel.domains.search', 'Search domains…')}
           toolbar={(
-            <div className="segmented" role="tablist">
-              {FILTERS.map(([key, label]) => <button key={key} type="button" role="tab" aria-selected={filter === key} className={filter === key ? 'active' : ''} onClick={() => setFilter(key)}>{t(`panel.domains.filter_${key}`, label)}</button>)}
+            <div className="segmented" role="tablist" aria-label={t('panel.domains.filter_label', 'Filter by type')}>
+              {FILTERS.map(([key, label]) => <button key={key} id={`panel-domains-tab-${key}`} type="button" role="tab" aria-selected={filter === key} aria-controls="panel-domains-list" tabIndex={filter === key ? 0 : -1} className={filter === key ? 'active' : ''} onClick={() => setFilter(key)} onKeyDown={(e) => { const i = FILTERS.findIndex(([k]) => k === key); const next = e.key === 'ArrowRight' ? FILTERS[(i + 1) % FILTERS.length] : e.key === 'ArrowLeft' ? FILTERS[(i - 1 + FILTERS.length) % FILTERS.length] : null; if (next) { e.preventDefault(); setFilter(next[0]); document.getElementById(`panel-domains-tab-${next[0]}`)?.focus(); } }}>{t(`panel.domains.filter_${key}`, label)}</button>)}
             </div>
           )}
           rowKey={(r) => r.domain}
@@ -74,6 +75,7 @@ export default function Domains({ fn }) {
             PAGE_OF[r.type] && { label: manageLabel[r.type], onClick: () => navigate(PAGE_OF[r.type]) },
           ]}
         />
+        </div>
       </Card>
     </PanelPage>
   );

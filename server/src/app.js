@@ -32,6 +32,11 @@ export const skipsAccessLog = (req) => {
   return isStreamRequest(req) && (url.startsWith('/api/system/jobs/') || JOB_STREAM_RE.test(url));
 };
 
+// A DDNS update token and an SSO exchange token travel in the path; the
+// request log must not keep them (the DDNS one stays valid until revoked).
+const PATH_SECRET_RE = /(\/panel\/(?:dns\/ddns|sso\/[a-z]+)\/)[A-Za-z0-9_-]{32,128}(?=[/?#]|$)/;
+export const redactLoggedUrl = (url) => String(url ?? '').replace(PATH_SECRET_RE, '$1[redacted]');
+
 export async function createApp(ctx) {
   const { config, db, logger, crypto: cryptoSvc } = ctx;
   const app = express();
@@ -47,7 +52,7 @@ export async function createApp(ctx) {
     customErrorMessage: (_req, res, err) => requestLogMessage(res, err),
     customErrorObject: (_req, res, err, obj) => requestLogObject(res, err, obj),
     serializers: {
-      req: (req) => ({ id: req.id, method: req.method, url: req.url, ip: req.remoteAddress }),
+      req: (req) => ({ id: req.id, method: req.method, url: redactLoggedUrl(req.url), ip: req.remoteAddress }),
       res: (res) => ({ statusCode: res.statusCode }),
     },
   }));

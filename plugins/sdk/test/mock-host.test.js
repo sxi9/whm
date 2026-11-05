@@ -268,7 +268,7 @@ test('ctx.api.accounts / packages / dns / services / system', async () => {
   assert.deepEqual(await ctx.api.services.status('apache2'), { name: 'apache2', active: true, enabled: true, pid: 42, since: null });
   await assert.rejects(ctx.api.services.status('named'), NotFoundError);
   const info = await ctx.api.system.info();
-  assert.equal(info.panelVersion, '1.0.0');
+  assert.equal(info.panelVersion, '1.1.0');
   assert.ok(info.hostname);
 });
 

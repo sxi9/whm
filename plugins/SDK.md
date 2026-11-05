@@ -15,7 +15,7 @@ Two complete plugins ship with the panel as worked examples:
 
 ```
 SDK_VERSION        1.0.0          plugins/sdk/index.js
-HOST_API_VERSION   1.0.0          server/src/services/plugins.js (what engines.whm is matched against)
+HOST_API_VERSION   1.1.0          server/src/services/plugins.js (what engines.whm is matched against; 1.1 added ui.pages[].audience)
 ```
 
 ## 1. Anatomy of a plugin
@@ -328,13 +328,22 @@ during `routes()`/`activate()` (`LifecycleError` later); paths match `API_ROUTE_
 (`/items/:id` style parameters); a duplicate method+path is a `ConflictError`.
 
 Handlers are `async (req, res)` with `req = { method, path, params, query, body, user: { id,
-username, role }, headers, requestId, plugin }` and `res.status(code).json(data)` (wrapped as
+username, role }, headers, requestId, plugin, panel? }` and `res.status(code).json(data)` (wrapped as
 `{ data }`; a status ≥ 400 is sent as given), `res.send(text)`, `res.set(name, value)` and
 `res.error(code, message, status = 400)`. Nothing sent → `204`. A thrown `PluginError` becomes
 `{ error: { code, message, details? } }` with its `status`; any other error is `500 INTERNAL` plus a
 plugin log line. The panel's auth and CSRF apply (routes sit behind `requireAuth`); the host refuses
 `Set-Cookie`, `Access-Control-*`, `Content-Security-Policy`, `Strict-Transport-Security` and
 `X-Frame-Options` headers and only allows `text/plain` or `application/json` content types.
+
+**Account-panel calls (host ≥ 1.1.0).** A route that lists the `'user'` role is what the account panel
+calls through `/api/panel/plugins/<id>/…`; the host attaches the pinned account as
+`req.panel = { username, accountId, domain, mode: 'user' | 'acting', actingAs: { by, expiresAt } | null }`
+and lets only `'user'` routes answer there, whoever the principal is (an administrator logged in as
+the account included, with `req.user.role` still `'root'`). Through `/api/plugins/<id>/…` an account
+login is refused outright, so `req.panel` is always present when `req.user.role === 'user'`: scope every
+query by `req.panel.username` and never by a username from the body or query. The mock host's
+`callRoute(method, path, { panel: { username, … } })` does the same.
 
 ### 5.11 `ctx.ui.registerPage(descriptor)` (gate `ui:sidebar`)
 
@@ -410,7 +419,7 @@ vocabulary; the host rows use `installed | enabled | disabled | errored`.
 the 30 in `CATEGORIES`; unknown → *Plugins*), the Tools grid and search; each `route` must have a
 matching `ui.pages[]` entry. Routes are relative to `/plugins/<id>` and match
 `UI_ROUTE_PATTERN = /^\/(?:[a-z0-9][a-z0-9_-]*(?:\/[a-z0-9][a-z0-9_-]*)*)?$/`; icons are lucide names
-(kebab-case). Every page has `route`, `title`, `kind`, optional `icon`, `description`, and per kind:
+(kebab-case). Every page has `route`, `title`, `kind`, optional `icon`, `description`, `audience` (§7.1), and per kind:
 
 | `kind` | Extra keys | Rendered as |
 |---|---|---|
@@ -426,6 +435,28 @@ depends on the route `roles` (§5.10).
 
 The served catalog carries each page as declared plus `origin: 'manifest' | 'runtime'` (§5.11);
 the `source` of `table` and `form` pages is the plugin route path the panel fetches or posts to.
+
+### 7.1 `audience`: pages for account holders (host ≥ 1.1.0)
+
+```
+PAGE_AUDIENCES   = admin | panel        (default admin)
+PANEL_PAGE_KINDS = table | form | markdown | html
+```
+
+`audience: "panel"` puts the page in the **account panel** (the customer's `/panel`, under
+*Software › Plugins* and at `/panel/plugins/<id><route>`) instead of the administration shell; a page
+without the key is an administration page, so every 1.0 manifest keeps its meaning. Only the kinds
+above may be panel pages (`AUDIENCE_KIND`): `settings` and `action` pages drive root-only manage
+routes. A `ui.sidebar[]` entry may not point at a panel page (`AUDIENCE`): the panel lists its pages
+itself, with the page `title`, `description` and `icon`. The two catalogs never mix: `GET /api/plugins/ui`
+carries admin pages, `GET /api/panel/plugins/ui` panel pages (`[{ id, name, version, pages }]`, no
+sidebar), and a page file is served only to its own audience.
+
+A panel `table`/`form` page's `source` route must list `roles: ['user']` and read `req.panel` (§5.10);
+the panel fetches it at `/api/panel/plugins/<id><source>`. Markdown and html pages come from
+`/api/panel/plugins/ui/<id>/file`, rendered exactly as in the administration shell (safe markdown, a
+fully sandboxed iframe). The administrator can hide the whole group with the plan feature `plugins`.
+The sample plugin's `/my-notes` page is the worked example.
 
 ## 8. Jobs and cron
 

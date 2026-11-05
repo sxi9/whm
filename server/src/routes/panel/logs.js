@@ -1,6 +1,6 @@
 import { validate, z, fields } from '../../lib/validate.js';
 import { panelRouter, wrap, accepted } from './index.js';
-import { createPanelLogsService, MAX_TAIL_BYTES, STATS_JOB, STATS_SCHEDULE } from '../../services/panel-logs.js';
+import { createPanelLogsService, MAX_TAIL_BYTES, ERRORS_DEFAULT_LINES, ERRORS_MAX_LINES, STATS_JOB, STATS_SCHEDULE } from '../../services/panel-logs.js';
 
 const statsDomain = z.object({ domain: fields.domain });
 
@@ -15,6 +15,7 @@ export async function register(ctx) {
   const r = panelRouter(ctx, 'logs');
   r.get('/', validate({ query: z.object({ kind }) }), wrap((req) => s.list(req.panel, req.query)));
   r.get('/tail', validate({ query: z.object({ kind, file: fileName, bytes: z.coerce.number().int().min(1).max(MAX_TAIL_BYTES).default(64 * 1024) }) }), wrap((req) => s.tail(req.panel, req.query, req)));
+  r.get('/errors', validate({ query: z.object({ lines: z.coerce.number().int().min(1).max(ERRORS_MAX_LINES).default(ERRORS_DEFAULT_LINES), domain: fields.domain.optional() }) }), wrap((req) => s.errors(req.panel, req.query, req)));
   // The delegate streams the file itself; the JSON envelope is only used for errors raised before headers go out.
   r.get('/download', validate({ query: z.object({ kind, file: fileName }) }), (req, res, next) => s.download(req.panel, req.query, req, res).catch(next));
   r.get('/bandwidth', validate({ query: z.object({ months: z.coerce.number().int().min(1).max(24).default(12) }) }), wrap((req) => s.bandwidth(req.panel, req.query)));
