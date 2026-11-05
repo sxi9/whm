@@ -306,7 +306,7 @@ describe('install flow', () => {
     expect(installRow('net.example.minimal')).toMatchObject({ version: '1.0.0', consent_state: 'consented', consented_by: 'root', hub_kid: PLUGIN_KID_A, package_sha256: hub.packages.get('net.example.minimal')[0].sha256 });
     expect(fs.existsSync(path.join(app.ctx.marketplace.cacheDir, 'net.example.minimal-1.0.0.whmplugin'))).toBe(false);
     const dl = hub.calls.find((c) => c.url === `${HUB}/v1/market/download`);
-    expect(dl.body).toMatchObject({ plugin_id: 'net.example.minimal', token: expect.stringMatching(/^WHMT1\./), fingerprint: fpOf(FP), host_api: '1.0.0', channel: 'stable' });
+    expect(dl.body).toMatchObject({ plugin_id: 'net.example.minimal', token: expect.stringMatching(/^WHMT1\./), fingerprint: fpOf(FP), host_api: '1.1.0', channel: 'stable' });
     expect(dl.headers['X-WHM-Nonce']).toBe(dl.body.nonce);
     expect(audits('plugin.marketplace.install').at(-1)).toMatchObject({ principal: 'root', target: 'net.example.minimal' });
     expect(JSON.parse(audits('plugin.marketplace.install').at(-1).args_redacted)).toMatchObject({ consent: 'consented', kid: PLUGIN_KID_A });

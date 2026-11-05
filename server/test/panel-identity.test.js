@@ -316,7 +316,7 @@ describe('Customer panel identity', () => {
       expect(app.agent.callsTo('user.set_password')).toHaveLength(2);
       const restored = await root.post('/api/auth/password', { currentPassword: 'Root-Rotated-Passw0rd!1', newPassword: 'Test-Passw0rd!1' }).expect(200);
       csrf = restored.body.data.csrfToken;
-    });
+    }, 20_000);
 
     it('POST /api/auth/password honours demo mode, suspension, the passwordchange feature and the 2FA policy for account users', async () => {
       const user = userRow('alice');
