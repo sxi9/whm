@@ -192,8 +192,8 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   whose usernames share a `_` prefix; now explicit per-database grants on a user dropped and recreated at every
   sign-on — and both majors: Roundcube SSO logs in by mailbox with the master user as SASL authorization identity so
   password and SSO logins share one Roundcube profile; the contact/recovery address needs the current password and the
-  old address is told). Gate on the host clone at the deploy commits: server 1570 / client 456 / agent 725 (+3 known
-  host-env) / hub 186 / hub-ui 105 / client build green; `install.sh --upgrade` applied migrations 034b/034c/034d. What is
+  old address is told). Gate on the host clone at the final deploy commit: server 1570 / client 456 / agent 726 (+3 known
+  host-env cases) / hub 186 / hub-ui 105 / SDK + plugins green / client build green; `install.sh --upgrade` applied migrations 034b/034c/034d. What is
   live: Roundcube SSO (`keel_sso` plugin from `deploy/roundcube`, `POST /api/panel/email/webmail/sso`, admin switch
   `PUT /api/panel/admin/webmail/sso`), phpMyAdmin SSO (hidden `<account>_pma@localhost`, `/keel/pma-signon.php` from
   `deploy/phpmyadmin`, `PUT /api/databases/phpmyadmin/sso`), Sieve mail filters (`ctx.panelEmail.filters`, agent
@@ -207,8 +207,9 @@ generated into `$WHM_DATA_DIR/initial-admin-password.txt`.
   feature commit):** Dovecot 2.4 took the `.dovecot.sieve` link in the maildir root for a Maildir++ folder and every
   filtered LMTP delivery failed 451 — the active link now lives beside the maildir as `~/mail/<domain>/.<local>.sieve`
   (and its `.svbin` goes with it); goaccess 1.9.4 refuses an output file without `.html/.json/.csv` and checks
-  `--output=json` as a path in the working directory, so both reports go to `.tmp.html/.tmp.json` staging files; the
-  agent resolves IPv4 first and gives each connect attempt 2.5 s (Node's 250 ms happy-eyeballs attempt is shorter than
+  `--output=json` as a path in the working directory, so both reports go to `.tmp.html/.tmp.json` staging files, and the
+  account cannot traverse `/var/log/whm` (0750 whmpanel), so root opens (and merges) the domlog and goaccess reads it on
+  stdin; the agent resolves IPv4 first and gives each connect attempt 2.5 s (Node's 250 ms happy-eyeballs attempt is shorter than
   one round trip from nova to wordpress.org, so the package download failed by design). Verified on nova: Roundcube and
   phpMyAdmin opened from the panel without a login form (tokens single-use, replay 404/403), a filter delivered to Junk
   while plain mail hit INBOX, Empty folder expunged it, directory privacy 401→200, IP blocker + custom 404 served by

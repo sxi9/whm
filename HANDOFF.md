@@ -207,7 +207,8 @@ session, CSRF token on every write):
 **Found on the host and fixed in code (commits after the P1 feature commit):** the `.dovecot.sieve` active link in the
 maildir root is a Maildir++ "folder" to Dovecot 2.4 (LMTP 451 "Not a directory" on every filtered delivery) → the link is
 `~/mail/<domain>/.<local>.sieve` now; goaccess 1.9.4 wants `.html/.json/.csv` output names and checks `--output=json` as
-a path in the working directory → staging files `<domain>.tmp.html/.tmp.json`; the agent's `fetch` lost the race
+a path in the working directory → staging files `<domain>.tmp.html/.tmp.json`, and the account cannot traverse
+`/var/log/whm` (0750 whmpanel) → root opens/merges the domlog and goaccess reads it on stdin; the agent's `fetch` lost the race
 between Node's 250 ms happy-eyeballs attempt and a 238 ms round trip to wordpress.org → `ipv4first` + 2.5 s attempts
 in `agent/src/index.js`.
 
